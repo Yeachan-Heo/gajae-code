@@ -2,11 +2,14 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { deflateSync } from "node:zlib";
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
 import packageJson from "../package.json" with { type: "json" };
 import { AcpAgent, acpSkillInvocation } from "../src/modes/acp/acp-agent";
 import { brokerProcessIncarnation, writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { SessionIndex } from "../src/sdk/broker/session-index";
+import { PromptImageUploadStore } from "../src/sdk/host/prompt-image-upload";
+import { SessionRouter } from "../src/sdk/router/session-router";
 
 type TestServer = {
 	port: number | undefined;
@@ -36,6 +39,46 @@ async function bounded<T>(promise: Promise<T>, label: string, timeoutMs = 15_000
 		Bun.sleep(timeoutMs).then(() => {
 			throw new Error(`Timed out waiting for ${label}`);
 		}),
+	]);
+}
+
+function originalImagePng(): Buffer {
+	const chunk = (name: string, data = Buffer.alloc(0)): Buffer => {
+		const type = Buffer.from(name, "ascii");
+		let crc = 0xffffffff;
+		for (const byte of Buffer.concat([type, data])) {
+			crc ^= byte;
+			for (let bit = 0; bit < 8; bit++) crc = crc & 1 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
+		}
+		const length = Buffer.alloc(4);
+		length.writeUInt32BE(data.length);
+		const checksum = Buffer.alloc(4);
+		checksum.writeUInt32BE((crc ^ 0xffffffff) >>> 0);
+		return Buffer.concat([length, type, data, checksum]);
+	};
+	const width = 400;
+	const height = 300;
+	const header = Buffer.alloc(13);
+	header.writeUInt32BE(width, 0);
+	header.writeUInt32BE(height, 4);
+	header[8] = 8;
+	header[9] = 2;
+	const pixels = Buffer.alloc(height * (width * 3 + 1));
+	let state = 0x31415926;
+	for (let row = 0; row < height; row++) {
+		const start = row * (width * 3 + 1);
+		for (let column = 1; column <= width * 3; column++) {
+			state ^= state << 13;
+			state ^= state >>> 17;
+			state ^= state << 5;
+			pixels[start + column] = state & 255;
+		}
+	}
+	return Buffer.concat([
+		Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+		chunk("IHDR", header),
+		chunk("IDAT", deflateSync(pixels)),
+		chunk("IEND"),
 	]);
 }
 
@@ -284,8 +327,28 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	const skillInputs: Record<string, unknown>[] = [];
 	const controlOperations: string[] = [];
 	const controlInputs: Array<{ operation: string; input: Record<string, unknown> }> = [];
+	const imageUploads = new PromptImageUploadStore(() => true);
+	const imageFrameBytes: number[] = [];
+	const redeemedImages: Buffer[] = [];
+	const connections = new WeakMap<object, string>();
+	let imageEchoPresentAtDispatch = false;
+	let imageEchoStartIndex = 0;
+	let originalImageBase64 = "";
+	let corruptNextImageBeginAck = false;
+	let malformedBeginId: string | undefined;
+	let holdNextImageBeginAck = false;
+	let releaseImageBeginAck: (() => void) | undefined;
+	let holdNextUploadAck: "turn.image.append" | "turn.image.finish" | undefined;
+	let releaseUploadAck: (() => void) | undefined;
 	const abortFrames: Record<string, unknown>[] = [];
 	const updates: SessionNotification[] = [];
+	const expectNewDiscardedLease = (since: number): void => {
+		const discards = controlInputs.slice(since).filter(entry => entry.operation === "turn.image.discard");
+		expect(discards).toHaveLength(1);
+		expect(() => imageUploads.redeem("acp-contract-reconnected", [{ id: discards[0]!.input.id }])).toThrow(
+			expect.objectContaining({ code: "resource_gone" }),
+		);
+	};
 	const providerRegistrations: Array<Record<string, unknown>> = [];
 	let closeSessionTransport: (() => void) | undefined;
 	let reconnectingSessionTransport = false;
@@ -317,6 +380,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		websocket: {
 			open(socket) {
 				const connectionId = reconnectingSessionTransport ? "acp-contract-reconnected" : "acp-contract";
+				connections.set(socket, connectionId);
 				reconnectingSessionTransport = false;
 				socket.send(JSON.stringify({ type: "hello", connectionId }));
 			},
@@ -561,6 +625,58 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 					if (typeof frame.operation === "string") controlOperations.push(frame.operation);
 					if (typeof frame.operation === "string" && frame.input && typeof frame.input === "object")
 						controlInputs.push({ operation: frame.operation, input: frame.input as Record<string, unknown> });
+					if (typeof frame.operation === "string" && frame.operation.startsWith("turn.image.")) {
+						imageFrameBytes.push(Buffer.byteLength(String(raw)));
+						const owner = connections.get(socket);
+						void (async () => {
+							try {
+								const result =
+									frame.operation === "turn.image.begin"
+										? imageUploads.begin(owner, frame.input)
+										: frame.operation === "turn.image.append"
+											? imageUploads.append(owner, frame.input)
+											: frame.operation === "turn.image.finish"
+												? await imageUploads.finish(owner, frame.input)
+												: imageUploads.discard(owner, frame.input);
+								if (frame.operation === "turn.image.begin" && holdNextImageBeginAck) {
+									holdNextImageBeginAck = false;
+									releaseImageBeginAck = () =>
+										socket.send(JSON.stringify({ type: "control_response", id: frame.id, ok: true, result }));
+									return;
+								}
+								if (frame.operation === holdNextUploadAck) {
+									holdNextUploadAck = undefined;
+									releaseUploadAck = () =>
+										socket.send(JSON.stringify({ type: "control_response", id: frame.id, ok: true, result }));
+									return;
+								}
+								if (frame.operation === "turn.image.begin" && corruptNextImageBeginAck) {
+									corruptNextImageBeginAck = false;
+									malformedBeginId = (result as { id: string }).id;
+									socket.send(
+										JSON.stringify({
+											type: "control_response",
+											id: frame.id,
+											ok: true,
+											result: { ...result, nextSequence: 1 },
+										}),
+									);
+								} else
+									socket.send(JSON.stringify({ type: "control_response", id: frame.id, ok: true, result }));
+							} catch (error) {
+								const failure = error as Error & { code?: string };
+								socket.send(
+									JSON.stringify({
+										type: "control_response",
+										id: frame.id,
+										ok: false,
+										error: { code: failure.code ?? "internal", message: failure.message },
+									}),
+								);
+							}
+						})();
+						return;
+					}
 					if (frame.operation === "turn.abort") abortFrames.push(frame);
 					if (frame.operation === "model.profile.set") {
 						const input = frame.input as Record<string, unknown>;
@@ -581,6 +697,35 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 						if (typeof input.id === "string") activeModelPreset = input.id;
 					}
 					if (frame.operation === "turn.prompt") {
+						const stagedImages = (frame.input as { stagedImages?: Array<{ id: string }> }).stagedImages;
+						if (stagedImages) {
+							imageFrameBytes.push(Buffer.byteLength(String(raw)));
+							imageEchoPresentAtDispatch = updates
+								.slice(imageEchoStartIndex)
+								.some(
+									update =>
+										update.update.sessionUpdate === "user_message_chunk" &&
+										(update.update as { content?: { type?: string; data?: string } }).content?.type ===
+											"image" &&
+										(update.update as { content?: { data?: string } }).content?.data === originalImageBase64,
+								);
+							try {
+								const accepted = imageUploads.redeem(connections.get(socket), stagedImages);
+								for (const image of accepted.images) redeemedImages.push(Buffer.from(image.data, "base64"));
+								accepted.release();
+							} catch (error) {
+								const failure = error as Error & { code?: string };
+								socket.send(
+									JSON.stringify({
+										type: "control_response",
+										id: frame.id,
+										ok: false,
+										error: { code: failure.code ?? "internal", message: failure.message },
+									}),
+								);
+								return;
+							}
+						}
 						promptInputs.push(frame.input as Record<string, unknown>);
 						promptSocket = socket;
 						// This real-host activity frame precedes acknowledgement, so it must
@@ -846,7 +991,10 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	reconnectingSessionTransport = true;
 	closeSessionTransport!();
 	await waitFor(
-		() => providerRegistrations.length > initialProviderRegistrationCount,
+		() =>
+			providerRegistrations
+				.slice(initialProviderRegistrationCount)
+				.some(registration => registration.connectionId === "acp-contract-reconnected"),
 		"ACP provider re-registration after transport reconnect",
 	);
 	await index.refresh();
@@ -935,13 +1083,15 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	expect(controlOperations).not.toContain("mode.plan.set");
 	expect(lifecycleInputs).toEqual([expect.objectContaining({ cwd, modelPreset: "codex-medium" })]);
 
+	const smallImageBase64 =
+		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZYAAAAASUVORK5CYII=";
 	let firstSettled = false;
 	const firstPrompt = agent
 		.prompt({
 			sessionId: created.sessionId,
 			prompt: [
 				{ type: "resource_link", name: "README", uri: "file:///workspace/README.md" },
-				{ type: "image", data: "image-bytes", mimeType: "image/png" },
+				{ type: "image", data: smallImageBase64, mimeType: "image/png" },
 			],
 		})
 		.then(value => {
@@ -951,7 +1101,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	await waitFor(() => promptInputs.length === 1 && promptSocket !== undefined, "first prompt delivery");
 	expect(promptInputs[0]).toEqual({
 		text: "[Resource: README]\nURI: file:///workspace/README.md",
-		images: [{ data: "image-bytes", mimeType: "image/png" }],
+		images: [{ data: smallImageBase64, mimeType: "image/png" }],
 		clientRef: expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/),
 	});
 	expect(promptInputs[0].clientRef).not.toBe(skillInputs[0].clientRef);
@@ -1550,5 +1700,204 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 			}),
 		]),
 	);
+	const original = originalImagePng();
+	expect(original.length).toBeGreaterThan(256 * 1024);
+	originalImageBase64 = original.toString("base64");
+	const publicControlCount = controlOperations.length;
+	for (const operation of ["turn.image.begin", "turn.image.append", "turn.image.finish", "turn.image.discard"]) {
+		const denied = await agent.extMethod("_gjc/sdk/control", {
+			sessionId: created.sessionId,
+			operation,
+			input: { mimeType: "image/png", byteLength: original.length, sha256: "0".repeat(64) },
+		});
+		expect(denied).toMatchObject({
+			ok: false,
+			error: { code: "invalid_input", message: expect.stringContaining("machine-local") },
+		});
+	}
+	expect(controlOperations).toHaveLength(publicControlCount);
+
+	const imageBlock = (data: string) => ({ type: "image" as const, mimeType: "image/png", data });
+	const base64Bytes = (length: number) =>
+		"AAAA".repeat(Math.floor(length / 3)) + (length % 3 === 1 ? "AA==" : length % 3 === 2 ? "AAA=" : "");
+	const beforeInvalidImages = controlOperations.length;
+	await expect(
+		agent.prompt({ sessionId: created.sessionId, prompt: Array.from({ length: 17 }, () => imageBlock("AA==")) }),
+	).rejects.toMatchObject({ code: "invalid_input", message: expect.stringContaining("16 images") });
+	await expect(
+		agent.prompt({ sessionId: created.sessionId, prompt: [imageBlock(base64Bytes(20 * 1024 * 1024 + 1))] }),
+	).rejects.toMatchObject({ code: "invalid_input", message: expect.stringContaining("20 MiB") });
+	const maximumImage = base64Bytes(20 * 1024 * 1024);
+	await expect(
+		agent.prompt({ sessionId: created.sessionId, prompt: Array.from({ length: 4 }, () => imageBlock(maximumImage)) }),
+	).rejects.toMatchObject({ code: "invalid_input", message: expect.stringContaining("64 MiB") });
+	await expect(agent.prompt({ sessionId: created.sessionId, prompt: [imageBlock("AB==")] })).rejects.toMatchObject({
+		code: "invalid_input",
+		message: expect.stringContaining("canonical base64"),
+	});
+	expect(controlOperations).toHaveLength(beforeInvalidImages);
+
+	let beforeImagePrompt = promptInputs.length;
+	const routerPreparation = Promise.withResolvers<void>();
+	const releaseRouterPreparation = Promise.withResolvers<void>();
+	const originalRequest = SessionRouter.prototype.request;
+	let holdNextPromptInRouter = true;
+	SessionRouter.prototype.request = async function (
+		this: SessionRouter,
+		...args: Parameters<SessionRouter["request"]>
+	) {
+		if (holdNextPromptInRouter && args[1].operation === "turn.prompt") {
+			holdNextPromptInRouter = false;
+			routerPreparation.resolve();
+			await releaseRouterPreparation.promise;
+		}
+		return await originalRequest.apply(this, args);
+	};
+	const beforeRouterInputs = controlInputs.length;
+	try {
+		const beforeRouterAbort = abortFrames.length;
+		const heldPrompt = agent.prompt({ sessionId: created.sessionId, prompt: [imageBlock(originalImageBase64)] });
+		await bounded(routerPreparation.promise, "staged prompt held before Router send");
+		await bounded(agent.cancel({ sessionId: created.sessionId }), "cancel during Router preparation");
+		expect(await bounded(heldPrompt, "cancelled Router-prepared image prompt")).toEqual({ stopReason: "cancelled" });
+		expect(abortFrames).toHaveLength(beforeRouterAbort);
+		expect(promptInputs).toHaveLength(beforeImagePrompt);
+	} finally {
+		releaseRouterPreparation.resolve();
+		SessionRouter.prototype.request = originalRequest;
+	}
+	await waitFor(() => controlOperations.at(-1) === "turn.image.discard", "Router-held image lease discard");
+	expectNewDiscardedLease(beforeRouterInputs);
+	expect(promptInputs).toHaveLength(beforeImagePrompt);
+	for (const operation of ["turn.image.append", "turn.image.finish"] as const) {
+		const beforeCancelAbort = abortFrames.length;
+		const beforeCancelUpload = controlOperations.length;
+		const beforeCancelInputs = controlInputs.length;
+		holdNextUploadAck = operation;
+		const pendingUpload = agent.prompt({ sessionId: created.sessionId, prompt: [imageBlock(originalImageBase64)] });
+		await waitFor(() => releaseUploadAck !== undefined, `held ${operation} acknowledgement`);
+		await bounded(agent.cancel({ sessionId: created.sessionId }), `cancel during ${operation}`);
+		expect(await bounded(pendingUpload, `cancelled ${operation} prompt`)).toEqual({ stopReason: "cancelled" });
+		expect(abortFrames).toHaveLength(beforeCancelAbort);
+		releaseUploadAck!();
+		releaseUploadAck = undefined;
+		await waitFor(
+			() => controlOperations.slice(beforeCancelUpload).includes("turn.image.discard"),
+			`${operation} lease discard`,
+		);
+		expectNewDiscardedLease(beforeCancelInputs);
+		expect(promptInputs).toHaveLength(beforeImagePrompt);
+	}
+	const beforeCancelledUpload = controlOperations.length;
+	const beforeCancelledInputs = controlInputs.length;
+	const beforeCancelledAbort = abortFrames.length;
+	holdNextImageBeginAck = true;
+	const cancelledImagePrompt = agent.prompt({
+		sessionId: created.sessionId,
+		prompt: [imageBlock(originalImageBase64)],
+	});
+	await waitFor(() => releaseImageBeginAck !== undefined, "held image begin acknowledgement");
+	await bounded(agent.cancel({ sessionId: created.sessionId }), "cancel before image dispatch");
+	expect(await bounded(cancelledImagePrompt, "cancelled staged image prompt")).toEqual({ stopReason: "cancelled" });
+	expect(abortFrames).toHaveLength(beforeCancelledAbort);
+	releaseImageBeginAck!();
+	releaseImageBeginAck = undefined;
+	await waitFor(
+		() => controlOperations.slice(beforeCancelledUpload).includes("turn.image.discard"),
+		"late image begin lease discard",
+	);
+	expectNewDiscardedLease(beforeCancelledInputs);
+	expect(promptInputs).toHaveLength(beforeImagePrompt);
+
+	// SdkClient adds a UUID id and Router stamps the nonempty connectionId.
+	// The old staged-only estimate omitted that stamp and sent a frame just over 256 KiB.
+	const stagedEnvelope = {
+		type: "control_request",
+		operation: "turn.prompt",
+		id: "00000000-0000-4000-8000-000000000000",
+		input: {
+			text: "",
+			stagedImages: [{ id: "00000000-0000-4000-8000-000000000000" }],
+			clientRef: "00000000-0000-4000-8000-000000000000",
+		},
+		connectionId: "acp-contract-reconnected",
+	};
+	const boundaryText = "x".repeat(256 * 1024 - Buffer.byteLength(JSON.stringify(stagedEnvelope)) + 1);
+	const beforeOversizeUpload = controlOperations.length;
+	await expect(
+		bounded(
+			agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: boundaryText }, imageBlock(originalImageBase64)],
+			}),
+			"staged frame above transport limit",
+		),
+	).rejects.toMatchObject({ code: "invalid_input", message: expect.stringContaining("transport limit") });
+	expect(promptInputs).toHaveLength(beforeImagePrompt);
+	await waitFor(
+		() => controlOperations.slice(beforeOversizeUpload).includes("turn.image.discard"),
+		"oversize staged image discard",
+	);
+	const boundaryPrompt = agent.prompt({
+		sessionId: created.sessionId,
+		prompt: [{ type: "text", text: boundaryText.slice(1) }, imageBlock(originalImageBase64)],
+	});
+	await waitFor(() => promptInputs.length === beforeImagePrompt + 1, "exact 256 KiB staged prompt");
+	expect(imageFrameBytes.at(-1)).toBe(256 * 1024);
+	promptSocket!.send(
+		JSON.stringify({
+			type: "agent_end",
+			sessionId: created.sessionId,
+			...currentPromptCorrelation(),
+			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+		}),
+	);
+	expect(await bounded(boundaryPrompt, "exact-limit staged image prompt completion")).toEqual({
+		stopReason: "end_turn",
+	});
+	beforeImagePrompt = promptInputs.length;
+
+	corruptNextImageBeginAck = true;
+	const beforeMalformedBegin = controlOperations.length;
+	await expect(
+		bounded(
+			agent.prompt({ sessionId: created.sessionId, prompt: [imageBlock(originalImageBase64)] }),
+			"malformed image begin acknowledgement",
+		),
+	).rejects.toMatchObject({ code: "invalid_prompt_acknowledgement" });
+	await waitFor(
+		() => controlOperations.slice(beforeMalformedBegin).includes("turn.image.discard"),
+		"malformed image begin lease discard",
+	);
+	expect(malformedBeginId).toEqual(expect.any(String));
+	expect(() => imageUploads.redeem("acp-contract-reconnected", [{ id: malformedBeginId! }])).toThrow(
+		expect.objectContaining({ code: "resource_gone" }),
+	);
+	imageEchoStartIndex = updates.length;
+	imageEchoPresentAtDispatch = false;
+	const imagePrompt = agent.prompt({
+		sessionId: created.sessionId,
+		prompt: [{ type: "image", mimeType: "image/png", data: originalImageBase64 }],
+	});
+	await waitFor(() => promptInputs.length === beforeImagePrompt + 1, "staged image-only ACP prompt");
+	expect(imageEchoPresentAtDispatch).toBe(true);
+	expect(promptInputs.at(-1)).toMatchObject({ text: "", stagedImages: [{ id: expect.any(String) }] });
+	expect(promptInputs.at(-1)).not.toHaveProperty("images");
+	expect(redeemedImages).toHaveLength(2);
+	expect(redeemedImages[0]?.equals(original)).toBe(true);
+	expect(redeemedImages[1]?.equals(original)).toBe(true);
+	expect(controlOperations.filter(operation => operation === "turn.image.append").length).toBeGreaterThan(1);
+	expect(imageFrameBytes.length).toBeGreaterThan(4);
+	expect(imageFrameBytes.every(bytes => bytes <= 256 * 1024)).toBe(true);
+	promptSocket!.send(
+		JSON.stringify({
+			type: "agent_end",
+			sessionId: created.sessionId,
+			...currentPromptCorrelation(),
+			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+		}),
+	);
+	expect(await bounded(imagePrompt, "image-only ACP prompt completion")).toEqual({ stopReason: "end_turn" });
+	imageUploads.close();
 	controller.abort();
 }, 30_000);

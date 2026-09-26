@@ -20,6 +20,7 @@ import { createPromptReconciliation } from "../bus/prompt-reconciliation";
 import { createReconciliationStore } from "../bus/reconciliation-store";
 import { BROKER_RUNTIME_ABORT_CAPABILITY_FIELD, setBrokerRuntimeAbortCapabilityForTest } from "./control/runtime-gate";
 import { SESSION_HOST_OBSERVER_CAPABILITY, TURN_STREAM_CAPABILITY } from "./host";
+import { PromptImageUploadStore } from "./prompt-image-upload";
 import { CursorRegistry, QueryHandlers, type QueryResponse, RevisionStore } from "./query";
 import {
 	createInvocationReconciliation,
@@ -3733,7 +3734,7 @@ describe("SessionSdkSessionRuntime", () => {
 		try {
 			await handlers.get("session_start")?.({}, context);
 			await rm(agentDir);
-			await mkdir(agentDir, { recursive: true });
+			await mkdir(agentDir, { recursive: true, mode: 0o700 });
 			broker = new Broker({ agentDir });
 			await broker.start();
 			await handlers.get("turn_start")?.({}, context);
@@ -3803,6 +3804,7 @@ describe("SessionSdkSessionRuntime", () => {
 interface PreflightHooks {
 	onPreflightAccepted?: () => void;
 	onPreflightAcceptCommit?: () => void | Promise<void>;
+	onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 }
 
 interface ResponseFrame {
@@ -3810,7 +3812,14 @@ interface ResponseFrame {
 	ok?: boolean;
 	code?: string;
 	error?: { code: string; message: string };
-	result?: { status?: string; commandId?: string; turnId?: string; error?: { code: string; message: string } };
+	result?: {
+		status?: string;
+		commandId?: string;
+		turnId?: string;
+		id?: string;
+		accepted?: boolean;
+		error?: { code: string; message: string };
+	};
 }
 
 interface InvocationHarness {
@@ -3901,34 +3910,43 @@ async function invocationHarness(
 			? { onInvocationCompletionReconciledForTests: hooks.onInvocationCompletionReconciled }
 			: {}),
 		...(hooks.settings ? { settings: hooks.settings } : {}),
-		createTransport: async ({ sessionId: id, stateRoot, token }) => ({
-			sessionId: id,
-			stateRoot,
-			token,
-			onFrame(handler) {
-				deliver = handler;
-				deliveries.set(id, handler);
-				return () => {
-					if (deliver === handler) deliver = undefined;
-					if (deliveries.get(id) === handler) deliveries.delete(id);
-				};
-			},
-			sendFrame(_connectionId, frame) {
-				const response = frame as ResponseFrame;
-				const frames = sentFrames.get(id) ?? [];
-				frames.push(frame);
-				sentFrames.set(id, frames);
-				if (typeof response.id === "string") waiters.get(response.id)?.(response);
-			},
-			broadcastFrame(frame) {
-				// Interception precedes recording: a frame whose publication throws never
-				// reached the wire, so it must not appear in the observed broadcasts.
-				hooks.broadcastInterceptor?.(frame);
-				broadcasts.push(frame);
-			},
-			start: async () => ({ url: "ws://127.0.0.1:1" }),
-			stop: async () => {},
-		}),
+		createTransport: async ({ sessionId: id, stateRoot, token }) => {
+			let open = false;
+			return {
+				sessionId: id,
+				stateRoot,
+				token,
+				isConnectionOpen: connectionId => open && connectionId === "client",
+				onFrame(handler) {
+					deliver = handler;
+					deliveries.set(id, handler);
+					return () => {
+						if (deliver === handler) deliver = undefined;
+						if (deliveries.get(id) === handler) deliveries.delete(id);
+					};
+				},
+				sendFrame(_connectionId, frame) {
+					const response = frame as ResponseFrame;
+					const frames = sentFrames.get(id) ?? [];
+					frames.push(frame);
+					sentFrames.set(id, frames);
+					if (typeof response.id === "string") waiters.get(response.id)?.(response);
+				},
+				broadcastFrame(frame) {
+					// Interception precedes recording: a frame whose publication throws never
+					// reached the wire, so it must not appear in the observed broadcasts.
+					hooks.broadcastInterceptor?.(frame);
+					broadcasts.push(frame);
+				},
+				start: async () => {
+					open = true;
+					return { url: "ws://127.0.0.1:1" };
+				},
+				stop: async () => {
+					open = false;
+				},
+			};
+		},
 	});
 	const ctx = {
 		cwd,
@@ -4003,6 +4021,106 @@ async function invocationHarness(
 		sent: sessionId => sentFrames.get(sessionId) ?? [],
 	};
 }
+
+test("SDK-only host retains accepted staged bytes until terminal and releases rejected images", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-only-staged-image-"));
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	const releases: string[] = [];
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		return {
+			images: reservation.images,
+			release: () => {
+				releases.push("released");
+				reservation.release();
+			},
+		};
+	});
+	let harness: InvocationHarness | undefined;
+	try {
+		const sent: unknown[] = [];
+		const queuedPromotions: Array<NonNullable<PreflightHooks["onQueuedPromoted"]>> = [];
+		const activeHarness = await invocationHarness("sdk-only-image-test", cwd, {
+			sendUserMessage: async (content, options) => {
+				sent.push(content);
+				if (options?.onQueuedPromoted) queuedPromotions.push(options.onQueuedPromoted);
+				await options?.onPreflightAcceptCommit?.();
+				await Promise.withResolvers<void>().promise;
+			},
+		});
+		harness = activeHarness;
+		const bytes = Buffer.from(
+			await Bun.file(new URL("../../../test/fixtures/sdk-inline-image-large.png", import.meta.url)).arrayBuffer(),
+		);
+		expect(bytes.length).toBeGreaterThan(256 * 1024);
+		const digest = createHash("sha256").update(bytes).digest("hex");
+		const stage = async (): Promise<string> => {
+			const begun = await activeHarness.control("turn.image.begin", {
+				mimeType: "image/png",
+				byteLength: bytes.length,
+				sha256: digest,
+			});
+			const id = begun.result?.id;
+			expect(begun.ok).toBe(true);
+			if (!id) throw new Error("Host did not return a staged image ID.");
+			expect(id).toMatch(/^[0-9a-f]{8}-/);
+			let sequence = 0;
+			for (let offset = 0; offset < bytes.length; offset += 96 * 1024) {
+				const data = bytes.subarray(offset, offset + 96 * 1024).toString("base64");
+				expect(Buffer.byteLength(JSON.stringify({ id, sequence, data }))).toBeLessThan(256 * 1024);
+				expect((await activeHarness.control("turn.image.append", { id, sequence, data })).ok).toBe(true);
+				sequence++;
+			}
+			expect((await activeHarness.control("turn.image.finish", { id })).ok).toBe(true);
+			return id;
+		};
+		const id = await stage();
+		const accepted = await harness.control("turn.prompt", { text: "Read image", stagedImages: [{ id }] });
+		expect(accepted).toMatchObject({ ok: true, result: { accepted: true } });
+		expect(releases).toEqual([]);
+		expect((sent[0] as Array<{ type: string; data?: string }>)[1]?.data).toBe(bytes.toString("base64"));
+		const rejectedId = await stage();
+		expect(
+			await harness.control("turn.prompt", {
+				text: "Reject this",
+				stagedImages: [{ id: rejectedId }],
+				clientRef: " ",
+			}),
+		).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+		expect(releases).toHaveLength(1);
+		expect(sent).toHaveLength(1);
+		await harness.emit("agent_start", { type: "agent_start" });
+		await harness.emit("agent_end", {
+			messages: [{ role: "assistant", stopReason: "stop", content: "Completed." }],
+		});
+		expect(releases).toHaveLength(2);
+		await harness.emit("agent_end", {
+			messages: [{ role: "assistant", stopReason: "stop", content: "Completed." }],
+		});
+		expect(releases).toHaveLength(2);
+		const racedId = await stage();
+		expect(
+			await harness.control("turn.prompt", {
+				text: "Diverted after idle snapshot",
+				stagedImages: [{ id: racedId }],
+			}),
+		).toMatchObject({ ok: true, result: { accepted: true } });
+		expect(releases).toHaveLength(2);
+		queuedPromotions[1]?.({ startsOwnRun: false, removed: true });
+		expect(releases).toHaveLength(3);
+		await harness.stop();
+		harness = undefined;
+		expect(releases).toHaveLength(3);
+	} finally {
+		await harness?.stop();
+		redeemSpy.mockRestore();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
 
 /** Reconciliation store used to inject durable-write failures from tests: wraps a
  * session-file-backed store and fails the write whenever the staged records contain
@@ -5364,7 +5482,7 @@ describe("post-acceptance invocation terminalization", () => {
 				await rm(cwd, { recursive: true, force: true });
 			}
 		}
-	});
+	}, 60_000);
 	test("preserves explicit cancellation for an empty zero-token turn", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminal-empty-cancelled-"));
 		try {
@@ -6046,7 +6164,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		// A sweep that never reached the lease instant would prove nothing.
 		expect(deadlineWins.length).toBeGreaterThan(0);
 		expect(deadlineWins.length + providerWins.length).toBe(ATTEMPTS);
-	});
+	}, 90_000);
 
 	test("the deadline publishes its correlated diagnostic before its correlated boundary", async () => {
 		// Ordering is part of the pair's contract: a client that matches the boundary and

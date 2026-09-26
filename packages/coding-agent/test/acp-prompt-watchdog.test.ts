@@ -83,6 +83,8 @@ type Fixture = {
 	/** Correlation the fixture host acknowledged for the turn currently in flight. */
 	correlation(): { commandId: string; turnId: string };
 	promptDeliveryCount(): number;
+	imageUploadCount(): number;
+	abortCount(): number;
 	/** Sends one raw frame down the session socket, correlation included or omitted verbatim. */
 	send(frame: Record<string, unknown>): void;
 	sendAssistantText(text: string): void;
@@ -146,6 +148,7 @@ type FixtureOptions = {
 	deferFirstPromptAcknowledgement?: boolean;
 	cancelSettlementGraceMs?: number;
 	preflightCancelAcknowledgement?: boolean;
+	imageEchoGate?: { started: () => void; release: Promise<void> };
 };
 
 async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
@@ -158,6 +161,8 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 	const clock = new VirtualClock();
 	const abort = new AbortController();
 	let turnCount = 0;
+	let imageUploadCount = 0;
+	let abortCount = 0;
 	let commandId = "";
 	let turnId = "";
 	let promptSocket: TestSocket | undefined;
@@ -291,6 +296,8 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 					return;
 				}
 				if (frame.type !== "control_request") return;
+				if (typeof frame.operation === "string" && frame.operation.startsWith("turn.image.")) imageUploadCount++;
+				if (frame.operation === "turn.abort") abortCount++;
 				if (frame.operation === "turn.prompt") {
 					promptSocket = socket;
 					turnCount += 1;
@@ -369,7 +376,18 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 	});
 	const agent = new AcpAgent(
 		{
-			sessionUpdate: async (update: SessionNotification) => updates.push(update),
+			sessionUpdate: async (update: SessionNotification) => {
+				const chunk = update.update as { sessionUpdate?: string; content?: { type?: string } };
+				if (
+					chunk.sessionUpdate === "user_message_chunk" &&
+					chunk.content?.type === "image" &&
+					options.imageEchoGate
+				) {
+					options.imageEchoGate.started();
+					await options.imageEchoGate.release;
+				}
+				updates.push(update);
+			},
 			signal: abort.signal,
 			closed: Promise.withResolvers<void>().promise,
 		} as unknown as AgentSideConnection,
@@ -391,6 +409,8 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 		clock,
 		correlation: () => ({ commandId, turnId }),
 		promptDeliveryCount: () => turnCount,
+		imageUploadCount: () => imageUploadCount,
+		abortCount: () => abortCount,
 		send,
 		sendAssistantText,
 		sendStopped,
@@ -490,6 +510,226 @@ test("a prompt awaiting the model past the inference bound is rejected instead o
 		expect(idleUpdates(fixture.updates)).toBe(idleBefore);
 		expect(workingUpdates(fixture.updates)).toBeGreaterThan(0);
 	} finally {
+		fixture.dispose();
+	}
+});
+
+test("a stalled image echo cannot hold a settled prompt or dispatch after late publication", async () => {
+	const echoStarted = Promise.withResolvers<void>();
+	const echoGate = Promise.withResolvers<void>();
+	const fixture = await createFixture({ imageEchoGate: { started: echoStarted.resolve, release: echoGate.promise } });
+	try {
+		const image = Buffer.from(
+			await Bun.file(path.join(import.meta.dir, "fixtures/sdk-inline-image-large.png")).arrayBuffer(),
+		);
+		expect(image.length).toBeGreaterThan(256 * 1024);
+		const pending = fixture.agent.prompt({
+			sessionId: fixture.sessionId,
+			prompt: [{ type: "image", mimeType: "image/png", data: image.toString("base64") }],
+		} as PromptRequest);
+		let settlements = 0;
+		void pending.then(
+			() => settlements++,
+			() => settlements++,
+		);
+		await bounded(echoStarted.promise, "image echo publication");
+		expect(fixture.promptDeliveryCount()).toBe(0);
+		expect(fixture.imageUploadCount()).toBe(0);
+		expect(fixture.clock.pending).toBe(1);
+
+		fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS + 1);
+		await expect(bounded(pending, "stalled image echo watchdog")).rejects.toMatchObject({
+			code: "prompt_abandoned",
+		});
+		expect(settlements).toBe(1);
+		expect(fixture.promptDeliveryCount()).toBe(0);
+		expect(fixture.imageUploadCount()).toBe(0);
+		await expect(prompt(fixture, "after abandoned echo")).rejects.toMatchObject({ code: "not_found" });
+
+		echoGate.resolve();
+		await Bun.sleep(20);
+		expect(settlements).toBe(1);
+		expect(fixture.promptDeliveryCount()).toBe(0);
+		expect(fixture.imageUploadCount()).toBe(0);
+	} finally {
+		echoGate.resolve();
+		fixture.dispose();
+	}
+});
+
+test("cancelling before image echo completes settles locally without aborting a host turn", async () => {
+	const echoStarted = Promise.withResolvers<void>();
+	const echoGate = Promise.withResolvers<void>();
+	const fixture = await createFixture({ imageEchoGate: { started: echoStarted.resolve, release: echoGate.promise } });
+	try {
+		const image = Buffer.from(
+			await Bun.file(path.join(import.meta.dir, "fixtures/sdk-inline-image-large.png")).arrayBuffer(),
+		);
+		const pending = fixture.agent.prompt({
+			sessionId: fixture.sessionId,
+			prompt: [{ type: "image", mimeType: "image/png", data: image.toString("base64") }],
+		} as PromptRequest);
+		await bounded(echoStarted.promise, "image echo publication before cancel");
+		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "local pre-dispatch cancel");
+		expect(await bounded(pending, "cancelled image echo")).toEqual({ stopReason: "cancelled" });
+		expect(fixture.abortCount()).toBe(0);
+		expect(fixture.promptDeliveryCount()).toBe(0);
+		expect(fixture.imageUploadCount()).toBe(0);
+		expect(fixture.clock.pending).toBe(1);
+		const followUp = prompt(fixture, "after cancelled image echo");
+		await Bun.sleep(20);
+		expect(fixture.promptDeliveryCount()).toBe(0);
+		echoGate.resolve();
+		await waitFor(() => fixture.promptDeliveryCount() === 1, "follow-up after delayed image echo");
+		expect(fixture.imageUploadCount()).toBe(0);
+		const userEchoes = fixture.updates.filter(update => update.update.sessionUpdate === "user_message_chunk");
+		expect(userEchoes.map(update => (update.update as { content: { type: string } }).content.type)).toEqual([
+			"image",
+			"text",
+		]);
+		fixture.sendStopped("end_turn");
+		expect(await bounded(followUp, "follow-up after cancelled image echo")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		echoGate.resolve();
+		fixture.dispose();
+	}
+});
+
+test("a reentrant cancel during a throwing prompt socket send never aborts unrelated host work", async () => {
+	const fixture = await createFixture();
+	const send = WebSocket.prototype.send;
+	let cancelTask: Promise<void> | undefined;
+	let intercepted = false;
+	try {
+		WebSocket.prototype.send = function (this: WebSocket, data: string | ArrayBufferLike | Blob | ArrayBufferView) {
+			if (typeof data === "string" && JSON.parse(data).operation === "turn.prompt") {
+				intercepted = true;
+				cancelTask = fixture.agent.cancel({ sessionId: fixture.sessionId });
+				throw new Error("simulated synchronous send failure");
+			}
+			send.call(this, data as string);
+		};
+		const pending = prompt(fixture, "unsent prompt");
+		expect(await bounded(pending, "cancelled unsent prompt")).toEqual({ stopReason: "cancelled" });
+		await bounded(cancelTask ?? Promise.reject(new Error("Cancel never entered socket send")), "reentrant cancel");
+		expect(intercepted).toBe(true);
+		expect(fixture.promptDeliveryCount()).toBe(0);
+		expect(fixture.abortCount()).toBe(0);
+	} finally {
+		WebSocket.prototype.send = send;
+		fixture.dispose();
+	}
+});
+
+test("Router pre-send cancellation still settles locally without emitting abort or prompt", async () => {
+	const fixture = await createFixture();
+	const originalPrompt = AcpSdkAdapter.prototype.prompt;
+	let cancelTask: Promise<void> | undefined;
+	try {
+		AcpSdkAdapter.prototype.prompt = function (params, beforeDispatch, onDispatch) {
+			return originalPrompt.call(
+				this,
+				params,
+				context => {
+					cancelTask = fixture.agent.cancel({ sessionId: fixture.sessionId });
+					beforeDispatch?.(context);
+				},
+				onDispatch,
+			);
+		};
+		const pending = prompt(fixture, "cancel at Router pre-send boundary");
+		expect(await bounded(pending, "Router pre-send cancelled prompt")).toEqual({ stopReason: "cancelled" });
+		await bounded(cancelTask ?? Promise.reject(new Error("Router pre-send hook was not entered")), "pre-send cancel");
+		expect(fixture.promptDeliveryCount()).toBe(0);
+		expect(fixture.abortCount()).toBe(0);
+	} finally {
+		AcpSdkAdapter.prototype.prompt = originalPrompt;
+		fixture.dispose();
+	}
+});
+
+test("a reentrant cancel during a successful prompt socket send waits for dispatch before aborting", async () => {
+	const fixture = await createFixture();
+	const send = WebSocket.prototype.send;
+	let cancelTask: Promise<void> | undefined;
+	try {
+		WebSocket.prototype.send = function (this: WebSocket, data: string | ArrayBufferLike | Blob | ArrayBufferView) {
+			if (typeof data === "string" && JSON.parse(data).operation === "turn.prompt") {
+				cancelTask = fixture.agent.cancel({ sessionId: fixture.sessionId });
+			}
+			send.call(this, data as string);
+		};
+		const pending = prompt(fixture, "sent prompt");
+		await waitFor(() => fixture.abortCount() === 1, "abort after successful send");
+		await bounded(cancelTask ?? Promise.reject(new Error("Cancel never entered socket send")), "reentrant cancel");
+		expect(fixture.promptDeliveryCount()).toBe(1);
+		fixture.sendStopped("cancelled");
+		expect(await bounded(pending, "cancelled sent prompt")).toEqual({ stopReason: "cancelled" });
+	} finally {
+		WebSocket.prototype.send = send;
+		fixture.dispose();
+	}
+});
+
+test("a cancelled image echo that never completes bounds the waiting successor and tears down the session", async () => {
+	const echoStarted = Promise.withResolvers<void>();
+	const echoGate = Promise.withResolvers<void>();
+	const fixture = await createFixture({ imageEchoGate: { started: echoStarted.resolve, release: echoGate.promise } });
+	try {
+		const image = Buffer.from(
+			await Bun.file(path.join(import.meta.dir, "fixtures/sdk-inline-image-large.png")).arrayBuffer(),
+		);
+		const cancelled = fixture.agent.prompt({
+			sessionId: fixture.sessionId,
+			prompt: [{ type: "image", mimeType: "image/png", data: image.toString("base64") }],
+		} as PromptRequest);
+		await bounded(echoStarted.promise, "stalled image echo before cancel");
+		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel stalled image echo");
+		expect(await bounded(cancelled, "cancelled stalled image echo")).toEqual({ stopReason: "cancelled" });
+		const successor = prompt(fixture, "after permanently stalled echo");
+		await Bun.sleep(0);
+		expect(fixture.clock.pending).toBe(1);
+		fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS + 1);
+		await expect(bounded(successor, "bounded successor after stalled echo")).rejects.toMatchObject({
+			code: "connection_closed",
+		});
+		expect(fixture.promptDeliveryCount()).toBe(0);
+		expect(fixture.abortCount()).toBe(0);
+		echoGate.resolve();
+		await Bun.sleep(0);
+		expect(fixture.promptDeliveryCount()).toBe(0);
+		await expect(prompt(fixture, "after echo teardown")).rejects.toMatchObject({ code: "not_found" });
+	} finally {
+		echoGate.resolve();
+		fixture.dispose();
+	}
+});
+
+test("a rejected cancelled image echo tears down the session and does not strand a successor", async () => {
+	const echoStarted = Promise.withResolvers<void>();
+	const echoGate = Promise.withResolvers<void>();
+	const fixture = await createFixture({ imageEchoGate: { started: echoStarted.resolve, release: echoGate.promise } });
+	try {
+		const image = Buffer.from(
+			await Bun.file(path.join(import.meta.dir, "fixtures/sdk-inline-image-large.png")).arrayBuffer(),
+		);
+		const cancelled = fixture.agent.prompt({
+			sessionId: fixture.sessionId,
+			prompt: [{ type: "image", mimeType: "image/png", data: image.toString("base64") }],
+		} as PromptRequest);
+		await bounded(echoStarted.promise, "image echo before rejected publication");
+		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel before echo rejection");
+		expect(await bounded(cancelled, "cancelled rejected echo")).toEqual({ stopReason: "cancelled" });
+		const successor = prompt(fixture, "after rejected echo");
+		echoGate.reject(new Error("client publication rejected"));
+		await expect(bounded(successor, "successor after echo rejection")).rejects.toMatchObject({
+			code: "connection_closed",
+		});
+		expect(fixture.clock.pending).toBe(0);
+		expect(fixture.promptDeliveryCount()).toBe(0);
+		await expect(prompt(fixture, "after rejected echo teardown")).rejects.toMatchObject({ code: "not_found" });
+	} finally {
+		echoGate.resolve();
 		fixture.dispose();
 	}
 });

@@ -15,6 +15,10 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal marketplace lifecycle refresh for the session skill catalog; not an independent SDK ingress operation",
 	"agent_session:getTerminalTurnEpoch":
 		"internal terminal-abort bus seam (epoch only), threaded via terminalAbortSeams; not a user-facing SDK control seam",
+	"agent_session:getTerminalRunOwnerForEvent":
+		"internal Agent-claimed event ownership proof, read only through the terminalAbortSeams bus capability; not a public SDK operation",
+	"agent_session:getRunOwnerDomain":
+		"internal run-resource ledger domain lookup for accepted-image quota ownership; not a public SDK operation",
 	"agent_session:cancelPendingPreflightForTerminalAbort":
 		"internal terminal-abort bus seam, threaded via terminalAbortSeams; not a user-facing SDK control seam",
 	"agent_session:abortPromptAndWaitWithTerminal":

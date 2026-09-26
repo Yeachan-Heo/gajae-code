@@ -242,7 +242,19 @@ function invoke(
 ): Promise<ControlValue> | ControlValue {
 	switch (operation) {
 		case "turn.prompt":
-			return surface.prompt(text(input), input.images, input.clientRef as string | undefined);
+			return surface.prompt(text(input), input.images, input.clientRef as string | undefined, input.stagedImages);
+		case "turn.image.begin":
+			if (!surface.imageBegin) invalidInput("Image uploads are not installed for this session.");
+			return surface.imageBegin(input);
+		case "turn.image.append":
+			if (!surface.imageAppend) invalidInput("Image uploads are not installed for this session.");
+			return surface.imageAppend(input);
+		case "turn.image.finish":
+			if (!surface.imageFinish) invalidInput("Image uploads are not installed for this session.");
+			return surface.imageFinish(input);
+		case "turn.image.discard":
+			if (!surface.imageDiscard) invalidInput("Image uploads are not installed for this session.");
+			return surface.imageDiscard(input);
 		case "turn.steer":
 			return surface.steer(text(input), typeof input.clientRef === "string" ? input.clientRef : undefined);
 		case "turn.follow_up":

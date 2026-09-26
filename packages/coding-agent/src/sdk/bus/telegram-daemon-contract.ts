@@ -296,8 +296,10 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * so generation-191 owners cannot reap hosts with queued or promoted work.
  * Generation 193 gates streamed content on negotiated observer capabilities,
  * so existing owners are replaced before exposing the new observer path.
+ * Generation 195 releases staged image capacity when a queued SDK prompt is
+ * removed, so a pre-fix owner cannot retain that capacity until session close.
  */
-export const DAEMON_GENERATION = 194;
+export const DAEMON_GENERATION = 195;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

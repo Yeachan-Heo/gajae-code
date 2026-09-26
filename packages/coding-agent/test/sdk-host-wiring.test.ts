@@ -5,7 +5,14 @@ import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
-import { Agent, type AgentTool, type RunSettlementProof } from "@gajae-code/agent-core";
+import {
+	Agent,
+	type AgentTerminalOwnerContext,
+	type AgentTool,
+	createRunResourceLedger,
+	type RunSettlementProof,
+	setAgentTerminalOwnerContext,
+} from "@gajae-code/agent-core";
 import { type AssistantMessage, closeModelCache, getBundledModel } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { NotificationServer } from "@gajae-code/natives";
@@ -21,6 +28,7 @@ import type {
 	ExtensionContextActions,
 	ExtensionUIContext,
 } from "../src/extensibility/extensions/types";
+import { PromptImageUploadStore } from "../src/sdk/host/prompt-image-upload";
 
 test("extension API cannot set the private recovery bypass", () => {
 	const api = undefined as ExtensionAPI | undefined;
@@ -76,6 +84,7 @@ import { reconciliationStorePath } from "../src/sdk/bus/reconciliation-store";
 import type { NotificationSessionController } from "../src/sdk/bus/session-control";
 import { SdkClient } from "../src/sdk/client";
 import { SESSION_HOST_OBSERVER_CAPABILITY, SessionSdkHost } from "../src/sdk/host";
+import { TypedControlError } from "../src/sdk/host/control";
 import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 import { type SessionAttachment, SessionRouter } from "../src/sdk/router/session-router";
 import { createAgentSession } from "../src/sdk/session";
@@ -315,6 +324,18 @@ function start(
 					ensureProviderDaemon,
 					controller,
 					terminalAbortSeams: {
+						getTerminalRunOwnerForEvent: event =>
+							(
+								ctx as {
+									getTerminalRunOwnerForEvent?: (event: object) => AgentTerminalOwnerContext | undefined;
+								}
+							).getTerminalRunOwnerForEvent?.(event),
+						getRunOwnerDomain: handle =>
+							(
+								ctx as {
+									getRunOwnerDomain?: (handle: string) => AgentTerminalOwnerContext["domain"] | undefined;
+								}
+							).getRunOwnerDomain?.(handle),
 						getTerminalTurnEpoch: () =>
 							(ctx as { getTerminalTurnEpoch?: () => number | undefined }).getTerminalTurnEpoch?.(),
 						cancelPendingPreflightForTerminalAbort: () =>
@@ -2297,75 +2318,868 @@ test("SDK host preserves positioned live order and replay parity for every attac
 });
 
 test("SDK host preserves ordered prompt image blocks in the host payload", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-images-"));
-	dirs.push(cwd);
-	const sessionId = `sdk-prompt-images-${Date.now()}`;
-	const sent: CapturedSendCall[] = [];
-	const sessionContext = context(cwd, sessionId);
-	const handlers = start(sessionContext, undefined, (...args) => {
-		captureInternalSend(sent, args[0], args[1]);
+	const releases: string[] = [];
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		return {
+			images: reservation.images,
+			release: () => {
+				releases.push("released");
+				reservation.release();
+			},
+		};
 	});
-	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
-	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
-	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
-	const frames: Record<string, unknown>[] = [];
-	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
-	sockets.push(socket);
-	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
-	await new Promise<void>((resolve, reject) => {
-		socket.addEventListener("open", () => resolve(), { once: true });
-		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
-	});
+	try {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-images-"));
+		dirs.push(cwd);
+		const sessionId = `sdk-prompt-images-${Date.now()}`;
+		const sent: CapturedSendCall[] = [];
+		const live = { idle: true };
+		const sessionContext = context(cwd, sessionId, "main", live);
+		const handlers = start(sessionContext, undefined, (...args) => {
+			captureInternalSend(sent, args[0], args[1]);
+		});
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
 
-	const prompt = async (requestId: string, input: Record<string, unknown>) => {
+		const control = async (requestId: string, operation: string, input: Record<string, unknown>) => {
+			const frame = JSON.stringify({
+				type: "control_request",
+				id: requestId,
+				operation,
+				input,
+			});
+			expect(Buffer.byteLength(frame)).toBeLessThan(256 * 1024);
+			socket.send(frame);
+			await waitFor(
+				() => frames.some(frame => frame.type === "control_response" && frame.id === requestId),
+				`${requestId} response`,
+			);
+			return frames.find(frame => frame.type === "control_response" && frame.id === requestId)!;
+		};
+
+		const prompt = async (requestId: string, input: Record<string, unknown>) => {
+			socket.send(
+				JSON.stringify({
+					type: "control_command",
+					sessionId,
+					token: endpoint.token,
+					requestId,
+					command: { type: "control_request", id: requestId, operation: "turn.prompt", input },
+				}),
+			);
+			await waitFor(
+				() => frames.some(frame => frame.type === "control_command_result" && frame.requestId === requestId),
+				`${requestId} response`,
+			);
+		};
+
+		await prompt("text-and-images", {
+			text: "Compare these screenshots.",
+			images: [{ data: "cG5nLWJ5dGVz", mimeType: "image/png" }, { data: "ZGVmYXVsdC1taW1l" }],
+		});
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+		await prompt("images-only", {
+			text: "",
+			images: [{ data: "d2VicC1ieXRlcw", mimeType: "image/webp" }],
+		});
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+		const original = Buffer.from(
+			await Bun.file(new URL("./fixtures/sdk-inline-image-large.png", import.meta.url)).arrayBuffer(),
+		);
+		expect(original.length).toBeGreaterThan(256 * 1024);
+		const digest = Buffer.from(await crypto.subtle.digest("SHA-256", original)).toString("hex");
+		const stage = async (name: string): Promise<string> => {
+			const begun = await control(`${name}-begin`, "turn.image.begin", {
+				mimeType: "image/png",
+				byteLength: original.length,
+				sha256: digest,
+			});
+			const uploadId = (begun.result as { id: string }).id;
+			expect(uploadId).toMatch(/^[0-9a-f]{8}-/);
+			expect(begun).toMatchObject({ ok: true, result: { id: uploadId, nextSequence: 0 } });
+			let sequence = 0;
+			for (let offset = 0; offset < original.length; offset += 96 * 1024) {
+				const response = await control(`${name}-chunk-${sequence}`, "turn.image.append", {
+					id: uploadId,
+					sequence,
+					data: original.subarray(offset, offset + 96 * 1024).toString("base64"),
+				});
+				expect(response).toMatchObject({ ok: true, result: { nextSequence: ++sequence } });
+			}
+			expect(await control(`${name}-finish`, "turn.image.finish", { id: uploadId })).toMatchObject({ ok: true });
+			return uploadId;
+		};
+		const uploadId = await stage("stage");
+		expect(
+			await control("staged-image", "turn.prompt", { text: "Read this image", stagedImages: [{ id: uploadId }] }),
+		).toMatchObject({ ok: true, result: { accepted: true } });
+		expect(releases).toEqual([]);
+		expect((sent[2]?.[0] as Array<{ type: string; data?: string }>)[1]?.data).toBe(original.toString("base64"));
+
+		expect(sent).toEqual([
+			[
+				[
+					{ type: "text", text: "Compare these screenshots." },
+					{ type: "image", data: "cG5nLWJ5dGVz", mimeType: "image/png" },
+					{ type: "image", data: "ZGVmYXVsdC1taW1l", mimeType: "image/jpeg" },
+				],
+				{
+					preflightSignal: expect.any(AbortSignal),
+					onQueuedPromoted: expect.any(Function),
+					onDispatchDisposition: expect.any(Function),
+				},
+			],
+			[
+				[{ type: "image", data: "d2VicC1ieXRlcw", mimeType: "image/webp" }],
+				{
+					preflightSignal: expect.any(AbortSignal),
+					onQueuedPromoted: expect.any(Function),
+					onDispatchDisposition: expect.any(Function),
+				},
+			],
+			[
+				[
+					{ type: "text", text: "Read this image" },
+					{ type: "image", data: original.toString("base64"), mimeType: "image/png" },
+				],
+				{
+					preflightSignal: expect.any(AbortSignal),
+					onQueuedPromoted: expect.any(Function),
+					onDispatchDisposition: expect.any(Function),
+				},
+			],
+		]);
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		const rejectedId = await stage("rejected");
+		expect(
+			await control("rejected-image", "turn.prompt", {
+				text: "Reject",
+				stagedImages: [{ id: rejectedId }],
+				clientRef: " ",
+			}),
+		).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+		expect(sent).toHaveLength(3);
+		expect(releases).toHaveLength(1);
+		live.idle = false;
+		const busyId = await stage("busy");
+		expect(
+			await control("busy-image", "turn.prompt", {
+				text: "Busy",
+				stagedImages: [{ id: busyId }],
+			}),
+		).toMatchObject({ ok: false, error: { code: "busy" } });
+		expect(sent).toHaveLength(3);
+		expect(releases).toHaveLength(2);
+		await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+		expect(releases).toHaveLength(3);
+		await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+		expect(releases).toHaveLength(3);
+		live.idle = true;
+		const racedId = await stage("race");
+		expect(
+			await control("raced-image", "turn.prompt", {
+				text: "Diverted after idle snapshot",
+				stagedImages: [{ id: racedId }],
+			}),
+		).toMatchObject({ ok: true, result: { accepted: true } });
+		expect(releases).toHaveLength(3);
+		expect(sent).toHaveLength(4);
+		// The agent queue can remove a prompt diverted after the host's idle snapshot.
+		sent[3]?.[1]?.onQueuedPromoted?.({ startsOwnRun: false, removed: true });
+		expect(releases).toHaveLength(4);
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		expect(releases).toHaveLength(4);
+	} finally {
+		redeemSpy.mockRestore();
+	}
+});
+
+test("fatal prompt claim failure releases accepted image capacity without publishing a terminal", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-fatal-image-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-fatal-image-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
+	const sessionContext = context(cwd, sessionId);
+	const sessionManager = sessionContext.sessionManager as Record<string, unknown>;
+	sessionContext.sessionManager = { ...sessionManager, getSessionFile: () => sessionFile };
+	const failedCommit = failNextReconciliationCommit(sessionFile, sessionId);
+	const warnSpy = spyOn(logger, "warn").mockImplementation(() => {});
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	let reserved = 0;
+	let releases = 0;
+	// Use the real upload/redeem path, with a one-reservation quota so a
+	// retained accepted image deterministically blocks the next connection.
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		if (reserved) throw new TypedControlError("busy", "Accepted image capacity exceeded.");
+		const reservation = originalRedeem.call(this, owner, ids);
+		reserved++;
+		let released = false;
+		return {
+			images: reservation.images,
+			release: () => {
+				if (released) return;
+				released = true;
+				reservation.release();
+				reserved--;
+				releases++;
+			},
+		};
+	});
+	try {
+		const handlers = start(
+			sessionContext,
+			undefined,
+			async (_content, options) => {
+				await firePreflightAccept(options);
+			},
+			true,
+		);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const open = async () => {
+			const frames: Record<string, unknown>[] = [];
+			const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+			sockets.push(socket);
+			socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+			await new Promise<void>((resolve, reject) => {
+				socket.addEventListener("open", () => resolve(), { once: true });
+				socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+			});
+			const control = async (id: string, operation: string, input: Record<string, unknown>) => {
+				const json = JSON.stringify({ type: "control_request", id, operation, input });
+				expect(Buffer.byteLength(json)).toBeLessThan(256 * 1024);
+				socket.send(json);
+				await waitFor(
+					() => frames.some(frame => frame.type === "control_response" && frame.id === id),
+					`${id} response`,
+				);
+				return frames.find(frame => frame.type === "control_response" && frame.id === id)!;
+			};
+			return { frames, control };
+		};
+		const requester = await open();
+		const healthy = await open();
+		const bytes = Buffer.from(
+			await Bun.file(new URL("./fixtures/sdk-inline-image-large.png", import.meta.url)).arrayBuffer(),
+		);
+		const sha256 = Buffer.from(await crypto.subtle.digest("SHA-256", bytes)).toString("hex");
+		const stage = async (client: typeof requester, name: string) => {
+			const begun = await client.control(`${name}-begin`, "turn.image.begin", {
+				mimeType: "image/png",
+				byteLength: bytes.length,
+				sha256,
+			});
+			expect(begun).toMatchObject({ ok: true });
+			const id = (begun.result as { id: string }).id;
+			let sequence = 0;
+			for (let offset = 0; offset < bytes.length; offset += 96 * 1024) {
+				expect(
+					await client.control(`${name}-chunk-${sequence}`, "turn.image.append", {
+						id,
+						sequence: sequence++,
+						data: bytes.subarray(offset, offset + 96 * 1024).toString("base64"),
+					}),
+				).toMatchObject({ ok: true });
+			}
+			expect(await client.control(`${name}-finish`, "turn.image.finish", { id })).toMatchObject({ ok: true });
+			return id;
+		};
+		const firstId = await stage(requester, "fatal");
+		const nextId = await stage(healthy, "healthy");
+		const accepted = await requester.control("fatal-prompt", "turn.prompt", {
+			text: "This terminal claim will fail",
+			stagedImages: [{ id: firstId }],
+		});
+		expect(accepted).toMatchObject({ ok: true, result: { accepted: true } });
+		const correlation = acceptedCorrelation(accepted);
+		expect(reserved).toBe(1);
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		failedCommit.arm();
+		await handlers.get("agent_end")?.(assistantEndEvent("must not publish"), sessionContext);
+		await failedCommit.failed;
+		await waitFor(
+			() =>
+				requester.frames.some(frame => frame.type === "agent_failed" && frame.commandId === correlation.commandId),
+			"fatal prompt closure",
+		);
+		const terminalFrames = () =>
+			requester.frames.filter(
+				frame =>
+					(frame.type === "agent_failed" || frame.type === "agent_end") &&
+					frame.commandId === correlation.commandId &&
+					frame.turnId === correlation.turnId,
+			);
+		expect(terminalFrames()).toEqual([
+			expect.objectContaining({
+				type: "agent_failed",
+				error: { code: "terminal_uncertain", message: "Prompt reconciliation is unavailable." },
+			}),
+		]);
+		expect(reserved).toBe(0);
+		expect(releases).toBe(1);
+		const next = await healthy.control("healthy-prompt", "turn.prompt", {
+			text: "Capacity is available to this live socket",
+			stagedImages: [{ id: nextId }],
+		});
+		expect(next).toMatchObject({ ok: true, result: { accepted: true } });
+		expect(reserved).toBe(1);
+		expect(terminalFrames()).toHaveLength(1);
+		const shutdownFailure = await Promise.resolve(
+			handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext),
+		).then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		expect((shutdownFailure as { code?: string } | undefined)?.code).toBe("sdk_reconciliation_teardown_failed");
+	} finally {
+		redeemSpy.mockRestore();
+		warnSpy.mockRestore();
+		failedCommit.restore();
+	}
+}, 60_000);
+
+test("unsettled fatal abort retains accepted images until session teardown", async () => {
+	for (const settlement of ["throws", "unfenced"] as const) {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-unsettled-image-${settlement}-`));
+		dirs.push(cwd);
+		const sessionId = `sdk-unsettled-image-${settlement}-${Date.now()}`;
+		const live = { idle: true };
+		const base = context(cwd, sessionId, "main", live);
+		const ledger = createRunResourceLedger();
+		const originalDomain = ledger.open("live-image-run");
+		const successorDomain = ledger.open("successor-image-run");
+		if (!originalDomain || !successorDomain) throw new Error("Test run domains could not open.");
+		const trustedOwners = new WeakMap<object, AgentTerminalOwnerContext>();
+		let abortCalls = 0;
+		const sessionContext = {
+			...base,
+			sessionManager: {
+				...(base.sessionManager as Record<string, unknown>),
+				getSessionFile: () => path.join(cwd, "session.jsonl"),
+			},
+			getActivePromptHandle: () => "live-image-run",
+			getRunOwnerDomain: (handle: string) => ledger.lookupDomain(handle),
+			getTerminalRunOwnerForEvent: (event: object) => trustedOwners.get(event),
+			getTerminalTurnEpoch: () => 1,
+			abortPromptAndWait: async (handle: string) => {
+				expect(handle).toBe("live-image-run");
+				abortCalls++;
+				if (settlement === "throws") throw new Error("run is still holding image strings");
+				return { status: "unfenced", reason: "resources_pending", pending: [] };
+			},
+		};
+		const originalRedeem = PromptImageUploadStore.prototype.redeem;
+		let reserved = 0;
+		let releases = 0;
+		const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+			this: PromptImageUploadStore,
+			owner,
+			ids,
+		) {
+			if (reserved) throw new TypedControlError("busy", "Accepted image capacity exceeded.");
+			const reservation = originalRedeem.call(this, owner, ids);
+			reserved++;
+			let released = false;
+			return {
+				images: reservation.images,
+				release: () => {
+					if (released) return;
+					released = true;
+					reservation.release();
+					reserved--;
+					releases++;
+				},
+			};
+		});
+		const warnSpy = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const handlers = start(
+				sessionContext,
+				{ get: () => undefined, getAgentDir: () => cwd } as unknown as Settings,
+				async (_content, options) => {
+					await firePreflightAccept(options);
+				},
+				true,
+			);
+			const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+			await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+			const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+			const open = async () => {
+				const frames: Record<string, unknown>[] = [];
+				const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+				sockets.push(socket);
+				socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+				await new Promise<void>((resolve, reject) => {
+					socket.addEventListener("open", () => resolve(), { once: true });
+					socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+				});
+				const control = async (id: string, operation: string, input: Record<string, unknown>) => {
+					socket.send(JSON.stringify({ type: "control_request", id, operation, input }));
+					await waitFor(
+						() => frames.some(frame => frame.type === "control_response" && frame.id === id),
+						`${id} response`,
+					);
+					return frames.find(frame => frame.type === "control_response" && frame.id === id)!;
+				};
+				return { socket, frames, control };
+			};
+			const requester = await open();
+			const other = await open();
+			const bytes = Buffer.from(
+				await Bun.file(new URL("./fixtures/sdk-inline-image-large.png", import.meta.url)).arrayBuffer(),
+			);
+			const sha256 = Buffer.from(await crypto.subtle.digest("SHA-256", bytes)).toString("hex");
+			const stage = async (client: typeof requester, name: string) => {
+				const begun = await client.control(`${name}-begin`, "turn.image.begin", {
+					mimeType: "image/png",
+					byteLength: bytes.length,
+					sha256,
+				});
+				expect(begun).toMatchObject({ ok: true });
+				const id = (begun.result as { id: string }).id;
+				let sequence = 0;
+				for (let offset = 0; offset < bytes.length; offset += 96 * 1024) {
+					expect(
+						await client.control(`${name}-chunk-${sequence}`, "turn.image.append", {
+							id,
+							sequence: sequence++,
+							data: bytes.subarray(offset, offset + 96 * 1024).toString("base64"),
+						}),
+					).toMatchObject({ ok: true });
+				}
+				expect(await client.control(`${name}-finish`, "turn.image.finish", { id })).toMatchObject({ ok: true });
+				return id;
+			};
+			const firstId = await stage(requester, "first");
+			const secondId = await stage(other, "second");
+			const accepted = await requester.control("live-prompt", "turn.prompt", {
+				text: "Keep the image in the run",
+				stagedImages: [{ id: firstId }],
+			});
+			expect(accepted).toMatchObject({ ok: true, result: { accepted: true } });
+			const correlation = acceptedCorrelation(accepted);
+			await handlers.get("agent_start")?.(
+				{
+					type: "agent_start",
+					runId: "live-image-run",
+					commandId: correlation.commandId,
+					turnId: correlation.turnId,
+				},
+				sessionContext,
+			);
+			live.idle = false;
+			// The abort response may be fenced with the requester; the fatal frame
+			// is the observable result of this deliberately unsettled run.
+			requester.socket.send(
+				JSON.stringify({
+					type: "control_request",
+					id: "fatal-abort",
+					operation: "turn.abort",
+					input: { mode: "terminal" },
+					idempotencyKey: `fatal-abort-${settlement}`,
+				}),
+			);
+			await waitFor(
+				() =>
+					requester.frames.some(
+						frame => frame.type === "agent_failed" && frame.commandId === correlation.commandId,
+					),
+				"fatal abort closure",
+			);
+			expect(abortCalls).toBe(1);
+			expect(
+				requester.frames.filter(
+					frame =>
+						(frame.type === "agent_end" || frame.type === "agent_failed") &&
+						frame.commandId === correlation.commandId,
+				),
+			).toEqual([
+				expect.objectContaining({
+					type: "agent_failed",
+					error: expect.objectContaining({ code: "terminal_uncertain" }),
+				}),
+			]);
+			expect(reserved).toBe(1);
+			expect(releases).toBe(0);
+			expect(
+				await other.control("blocked-prompt", "turn.prompt", {
+					text: "Cannot overbook the still-running image",
+					stagedImages: [{ id: secondId }],
+				}),
+			).toMatchObject({ ok: false, error: { code: "busy" } });
+			expect(reserved).toBe(1);
+			// An unrelated start after the fatal record's TTL invokes delivery
+			// cleanup. Its terminal still has no authority over the original run.
+			const now = Date.now();
+			const clock = spyOn(Date, "now").mockReturnValue(now + 6 * 60_000);
+			try {
+				await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+			} finally {
+				clock.mockRestore();
+			}
+			expect(reserved).toBe(1);
+			const successorEnd = { type: "agent_end" as const, messages: [] };
+			// An earlier extension may replace the public WeakMap context. The
+			// SDK must trust only AgentSession's independent event proof.
+			setAgentTerminalOwnerContext(successorEnd, {
+				resourceRunId: "live-image-run",
+				domain: originalDomain,
+			});
+			trustedOwners.set(successorEnd, { resourceRunId: "successor-image-run", domain: successorDomain });
+			await handlers.get("agent_end")?.(successorEnd, sessionContext);
+			expect(reserved).toBe(1);
+			// Fatal closure cleared the run's correlation; an uncorrelated end
+			// cannot prove that this exact accepted image has been released.
+			await handlers.get("agent_end")?.({ type: "agent_end", messages: [] }, sessionContext);
+			expect(reserved).toBe(1);
+			if (settlement === "throws") {
+				const originalEnd = { type: "agent_end" as const, messages: [] };
+				trustedOwners.set(originalEnd, {
+					resourceRunId: "live-image-run",
+					domain: originalDomain,
+				});
+				await handlers.get("agent_end")?.(originalEnd, sessionContext);
+				expect(reserved).toBe(0);
+				expect(releases).toBe(1);
+				live.idle = true;
+				expect(
+					await other.control("recovered-prompt", "turn.prompt", {
+						text: "Capacity returns after the exact original run ended",
+						stagedImages: [{ id: secondId }],
+					}),
+				).toMatchObject({ ok: true, result: { accepted: true } });
+				expect(reserved).toBe(1);
+			}
+			const shutdownFailure = await Promise.resolve(
+				handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext),
+			).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(shutdownFailure).toBeUndefined();
+			expect(reserved).toBe(0);
+			expect(releases).toBe(settlement === "throws" ? 2 : 1);
+		} finally {
+			redeemSpy.mockRestore();
+			warnSpy.mockRestore();
+		}
+	}
+}, 60_000);
+
+test("a diverted image prompt belongs to its consuming run, not a later pending correlation", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-steered-image-owner-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-steered-image-owner-${Date.now()}`;
+	const live = { idle: true, handle: "original-run" };
+	const base = context(cwd, sessionId, "main", live);
+	const ledger = createRunResourceLedger();
+	const originalDomain = ledger.open("original-run");
+	const successorDomain = ledger.open("successor-run");
+	if (!originalDomain || !successorDomain) throw new Error("Test run domains could not open.");
+	const trustedOwners = new WeakMap<object, AgentTerminalOwnerContext>();
+	const sessionContext = {
+		...base,
+		sessionManager: {
+			...(base.sessionManager as Record<string, unknown>),
+			getSessionFile: () => path.join(cwd, "session.jsonl"),
+		},
+		getActivePromptHandle: () => live.handle,
+		getRunOwnerDomain: (handle: string) => ledger.lookupDomain(handle),
+		getTerminalRunOwnerForEvent: (event: object) => trustedOwners.get(event),
+		getTerminalTurnEpoch: () => 1,
+		abortPromptAndWait: async () => {
+			throw new Error("consuming run still holds image strings");
+		},
+	};
+	const accepted = Promise.withResolvers<void>();
+	const preflight = Promise.withResolvers<void>();
+	const consume = Promise.withResolvers<void>();
+	const consumed = Promise.withResolvers<void>();
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	let reserved = 0;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		reserved++;
+		return {
+			images: reservation.images,
+			release: () => {
+				reserved--;
+				reservation.release();
+			},
+		};
+	});
+	const warnSpy = spyOn(logger, "warn").mockImplementation(() => {});
+	try {
+		const handlers = start(
+			sessionContext,
+			{ get: () => undefined, getAgentDir: () => cwd } as unknown as Settings,
+			async (_content, options) => {
+				accepted.resolve();
+				await preflight.promise;
+				await firePreflightAccept(options);
+				options?.onDispatchDisposition?.({ startsOwnRun: false });
+				await consume.promise;
+				options?.onQueuedPromoted?.({ startsOwnRun: false });
+				consumed.resolve();
+			},
+			true,
+		);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		const control = async (id: string, operation: string, input: Record<string, unknown>) => {
+			socket.send(JSON.stringify({ type: "control_request", id, operation, input }));
+			await waitFor(
+				() => frames.some(frame => frame.type === "control_response" && frame.id === id),
+				`${id} response`,
+			);
+			return frames.find(frame => frame.type === "control_response" && frame.id === id)!;
+		};
+		const bytes = Buffer.from(
+			await Bun.file(new URL("./fixtures/sdk-inline-image-large.png", import.meta.url)).arrayBuffer(),
+		);
+		const sha256 = Buffer.from(await crypto.subtle.digest("SHA-256", bytes)).toString("hex");
+		const begun = await control("steered-begin", "turn.image.begin", {
+			mimeType: "image/png",
+			byteLength: bytes.length,
+			sha256,
+		});
+		expect(begun).toMatchObject({ ok: true });
+		const imageId = (begun.result as { id: string }).id;
+		let sequence = 0;
+		for (let offset = 0; offset < bytes.length; offset += 96 * 1024) {
+			expect(
+				await control(`steered-chunk-${sequence}`, "turn.image.append", {
+					id: imageId,
+					sequence: sequence++,
+					data: bytes.subarray(offset, offset + 96 * 1024).toString("base64"),
+				}),
+			).toMatchObject({ ok: true });
+		}
+		expect(await control("steered-finish", "turn.image.finish", { id: imageId })).toMatchObject({ ok: true });
 		socket.send(
 			JSON.stringify({
-				type: "control_command",
-				sessionId,
-				token: endpoint.token,
-				requestId,
-				command: { type: "control_request", id: requestId, operation: "turn.prompt", input },
+				type: "control_request",
+				id: "steered-prompt",
+				operation: "turn.prompt",
+				input: { text: "Image diverted during preflight", stagedImages: [{ id: imageId }] },
+			}),
+		);
+		await accepted.promise;
+		// A different run starts while preflight is awaiting AgentSession. The
+		// prompt is accepted only after this run has become busy, so it is queued.
+		live.idle = false;
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		preflight.resolve();
+		await waitFor(() => frames.some(frame => frame.id === "steered-prompt"), "steered prompt admission");
+		const ack = frames.find(frame => frame.id === "steered-prompt")!;
+		expect(ack).toMatchObject({ ok: true, result: { accepted: true } });
+		const correlation = acceptedCorrelation(ack);
+		expect(reserved).toBe(1);
+		const originalEnd = { type: "agent_end" as const, messages: [] };
+		trustedOwners.set(originalEnd, { resourceRunId: "original-run", domain: originalDomain });
+		await handlers.get("agent_end")?.(originalEnd, sessionContext);
+		expect(reserved).toBe(1);
+		live.handle = "successor-run";
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		expect(frames.some(frame => frame.type === "agent_start" && frame.commandId === correlation.commandId)).toBe(
+			false,
+		);
+		consume.resolve();
+		await consumed.promise;
+		// The successor is the actual consuming run. A fatal transport response
+		// cannot release its accepted image until that exact run terminates.
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "steered-abort",
+				operation: "turn.abort",
+				input: { mode: "terminal" },
+				idempotencyKey: "steered-abort",
 			}),
 		);
 		await waitFor(
-			() => frames.some(frame => frame.type === "control_command_result" && frame.requestId === requestId),
-			`${requestId} response`,
+			() => frames.some(frame => frame.type === "agent_failed" && frame.commandId === correlation.commandId),
+			"steered fatal closure",
 		);
-	};
+		expect(reserved).toBe(1);
+		const successorEnd = { type: "agent_end" as const, messages: [] };
+		trustedOwners.set(successorEnd, { resourceRunId: "successor-run", domain: successorDomain });
+		await handlers.get("agent_end")?.(successorEnd, sessionContext);
+		expect(reserved).toBe(0);
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	} finally {
+		preflight.resolve();
+		consume.resolve();
+		redeemSpy.mockRestore();
+		warnSpy.mockRestore();
+	}
+}, 60_000);
 
-	await prompt("text-and-images", {
-		text: "Compare these screenshots.",
-		images: [{ data: "cG5nLWJ5dGVz", mimeType: "image/png" }, { data: "ZGVmYXVsdC1taW1l" }],
+test("queued image controls cannot recreate leases after their connection closes", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-disconnect-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-image-disconnect-${Date.now()}`;
+	const sent: CapturedSendCall[] = [];
+	const sessionContext = context(cwd, sessionId);
+	const handlers = start(sessionContext, undefined, (...args) => captureInternalSend(sent, args[0], args[1]));
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const stalled = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const originalDisconnect = PromptImageUploadStore.prototype.disconnect;
+	const originalBegin = PromptImageUploadStore.prototype.begin;
+	const beginOutcomes: Array<{ owner: string | undefined; code: string }> = [];
+	const beginSpy = spyOn(PromptImageUploadStore.prototype, "begin").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		value,
+	) {
+		try {
+			const result = originalBegin.call(this, owner, value);
+			beginOutcomes.push({ owner, code: "ok" });
+			return result;
+		} catch (error) {
+			beginOutcomes.push({ owner, code: (error as { code?: string }).code ?? "internal" });
+			throw error;
+		}
 	});
-	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
-	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
-	await prompt("images-only", {
-		text: "",
-		images: [{ data: "d2VicC1ieXRlcw", mimeType: "image/webp" }],
+	const appendSpy = spyOn(PromptImageUploadStore.prototype, "append");
+	const disconnectSpy = spyOn(PromptImageUploadStore.prototype, "disconnect").mockImplementation(function (
+		this: PromptImageUploadStore,
+		connectionId,
+	) {
+		originalDisconnect.call(this, connectionId);
 	});
-
-	expect(sent).toEqual([
-		[
-			[
-				{ type: "text", text: "Compare these screenshots." },
-				{ type: "image", data: "cG5nLWJ5dGVz", mimeType: "image/png" },
-				{ type: "image", data: "ZGVmYXVsdC1taW1l", mimeType: "image/jpeg" },
-			],
-			{
-				preflightSignal: expect.any(AbortSignal),
-				onQueuedPromoted: expect.any(Function),
-				onDispatchDisposition: expect.any(Function),
-			},
-		],
-		[
-			[{ type: "image", data: "d2VicC1ieXRlcw", mimeType: "image/webp" }],
-			{
-				preflightSignal: expect.any(AbortSignal),
-				onQueuedPromoted: expect.any(Function),
-				onDispatchDisposition: expect.any(Function),
-			},
-		],
-	]);
+	const originalFinish = PromptImageUploadStore.prototype.finish;
+	let firstFinish = true;
+	const finishSpy = spyOn(PromptImageUploadStore.prototype, "finish").mockImplementation(async function (
+		this: PromptImageUploadStore,
+		owner,
+		value,
+	) {
+		if (!firstFinish) return originalFinish.call(this, owner, value);
+		firstFinish = false;
+		stalled.resolve();
+		await release.promise;
+		return { id: (value as { id: string }).id, byteLength: 1, sha256: "0".repeat(64), mimeType: "image/png" };
+	});
+	try {
+		const open = async (): Promise<{ socket: WebSocket; frames: Record<string, unknown>[] }> => {
+			const frames: Record<string, unknown>[] = [];
+			const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+			sockets.push(socket);
+			socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+			await new Promise<void>((resolve, reject) => {
+				socket.addEventListener("open", () => resolve(), { once: true });
+				socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+			});
+			return { socket, frames };
+		};
+		const disconnected = await open();
+		const healthy = await open();
+		await waitFor(() => disconnected.frames.some(frame => frame.type === "hello"), "disconnected connection ID");
+		await waitFor(() => healthy.frames.some(frame => frame.type === "hello"), "healthy connection ID");
+		const disconnectedId = disconnected.frames.find(frame => frame.type === "hello")!.connectionId;
+		const healthyId = healthy.frames.find(frame => frame.type === "hello")!.connectionId;
+		expect(disconnectedId).not.toBe(healthyId);
+		const callsFrom = (spy: { mock: { calls: readonly (readonly unknown[])[] } }, owner: unknown) =>
+			spy.mock.calls.filter(([connectionId]) => connectionId === owner).length;
+		const send = (socket: WebSocket, id: string, operation: string, input: Record<string, unknown>) =>
+			socket.send(JSON.stringify({ type: "control_request", id, operation, input }));
+		const descriptor = { mimeType: "image/png", byteLength: 1, sha256: "0".repeat(64) };
+		send(disconnected.socket, "initial", "turn.image.begin", descriptor);
+		await waitFor(() => disconnected.frames.some(frame => frame.id === "initial"), "initial image lease");
+		const initial = disconnected.frames.find(frame => frame.id === "initial") as { result: { id: string } };
+		send(disconnected.socket, "held-finish", "turn.image.finish", { id: initial.result.id });
+		await stalled.promise;
+		// These frames enter the ordered dispatcher while finish holds its queue.
+		send(disconnected.socket, "queued-append", "turn.image.append", {
+			id: initial.result.id,
+			sequence: 0,
+			data: "AA==",
+		});
+		send(disconnected.socket, "queued-finish", "turn.image.finish", { id: initial.result.id });
+		send(disconnected.socket, "queued-begin", "turn.image.begin", descriptor);
+		disconnected.socket.send(JSON.stringify({ type: "query_request", id: "received", query: "not.real" }));
+		await waitFor(() => disconnected.frames.some(frame => frame.id === "received"), "queued frames received");
+		// The query is a same-socket receipt barrier, not part of the ordered control chain.
+		// The held finish must still keep every later image operation from executing.
+		expect(callsFrom(beginSpy, disconnectedId)).toBe(1);
+		expect(callsFrom(appendSpy, disconnectedId)).toBe(0);
+		expect(callsFrom(finishSpy, disconnectedId)).toBe(1);
+		send(healthy.socket, "live-prompt", "turn.prompt", { text: "Keep this prompt" });
+		const closed = new Promise<void>(resolve =>
+			disconnected.socket.addEventListener("close", () => resolve(), { once: true }),
+		);
+		disconnected.socket.close();
+		await closed;
+		await waitFor(() => callsFrom(disconnectSpy, disconnectedId) === 1, "image lease disconnect sweep");
+		expect(callsFrom(beginSpy, disconnectedId)).toBe(1);
+		expect(callsFrom(appendSpy, disconnectedId)).toBe(0);
+		release.resolve();
+		await waitFor(() => healthy.frames.some(frame => frame.id === "live-prompt"), "queued live prompt");
+		expect(healthy.frames.find(frame => frame.id === "live-prompt")).toMatchObject({ ok: true });
+		expect(sent).toHaveLength(1);
+		const disconnectedBegins = beginOutcomes.filter(outcome => outcome.owner === disconnectedId);
+		expect(disconnectedBegins.map(outcome => outcome.code)).toEqual(["ok", "resource_gone"]);
+		send(healthy.socket, "live-begin", "turn.image.begin", descriptor);
+		await waitFor(() => healthy.frames.some(frame => frame.id === "live-begin"), "live image control");
+		expect(healthy.frames.find(frame => frame.id === "live-begin")).toMatchObject({ ok: true });
+		expect(callsFrom(beginSpy, healthyId)).toBe(1);
+		expect(beginOutcomes.filter(outcome => outcome.owner === healthyId).map(outcome => outcome.code)).toEqual(["ok"]);
+		// All 16 upload slots remain available: the queued begin cannot leave a
+		// lease behind after the disconnect sweep, even without a response socket.
+		for (let index = 1; index < 16; index++) {
+			const id = `live-begin-${index}`;
+			send(healthy.socket, id, "turn.image.begin", descriptor);
+			await waitFor(() => healthy.frames.some(frame => frame.id === id), `${id} image control`);
+			expect(healthy.frames.find(frame => frame.id === id)).toMatchObject({ ok: true });
+		}
+		expect(callsFrom(beginSpy, healthyId)).toBe(16);
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	} finally {
+		release.resolve();
+		finishSpy.mockRestore();
+		disconnectSpy.mockRestore();
+		appendSpy.mockRestore();
+		beginSpy.mockRestore();
+	}
 });
 
 test("SDK host correlates follow-up acknowledgements with the later agent start", async () => {

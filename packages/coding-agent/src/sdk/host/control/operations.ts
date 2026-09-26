@@ -21,7 +21,16 @@ export type ControlInput = Record<string, unknown>;
  * AgentSession and its controllers without exposing those concrete types here.
  */
 export interface ControlSurface {
-	prompt(text: string, images?: ControlValue, clientRef?: string): Promise<ControlValue> | ControlValue;
+	prompt(
+		text: string,
+		images?: ControlValue,
+		clientRef?: string,
+		stagedImages?: ControlValue,
+	): Promise<ControlValue> | ControlValue;
+	imageBegin?(input: ControlValue): Promise<ControlValue> | ControlValue;
+	imageAppend?(input: ControlValue): Promise<ControlValue> | ControlValue;
+	imageFinish?(input: ControlValue): Promise<ControlValue> | ControlValue;
+	imageDiscard?(input: ControlValue): Promise<ControlValue> | ControlValue;
 	steer(text: string, clientRef?: string): Promise<ControlValue> | ControlValue;
 	followUp(text: string): Promise<ControlValue> | ControlValue;
 	abort(): Promise<ControlValue> | ControlValue;
