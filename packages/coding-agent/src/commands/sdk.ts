@@ -791,7 +791,6 @@ export async function runSessionHost(
 	};
 
 	let opened: { parsed: ParsedArgs; sessionManager: SessionManager | undefined } | undefined;
-	let openedSessionManager: SessionManager | undefined;
 	let sessionManagerTransferred = false;
 	let created: CreateLifecycleAgentSessionResult | undefined;
 	let mcpConfigDirectory: OwnedMcpConfigDirectory | undefined;
@@ -1000,7 +999,6 @@ export async function runSessionHost(
 			},
 		);
 		if (!opened) throw new Error("Lifecycle session manager was not opened.");
-		openedSessionManager = opened.sessionManager;
 		throwIfStartupInterrupted();
 		if (request.mcpServers && request.mcpServers.length > 0) {
 			const temporaryRoot = await beforeCutoff(() => fs.realpath(os.tmpdir()));
