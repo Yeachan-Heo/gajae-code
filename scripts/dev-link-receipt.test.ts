@@ -114,9 +114,10 @@ describe.skipIf(process.platform === "win32")("dev:link ownership receipts (#599
 		const fixture = await fixtureCheckout();
 		expect(runLink(fixture).exitCode).toBe(0);
 		const alias = path.join(fixture.targetDir, "가재씨");
-		await fs.rm(alias);
-		await fs.symlink(path.join(fixture.root, "packages", "coding-agent", "src", "cli.ts"), `${alias}.tmp`);
-		await fs.rename(`${alias}.tmp`, alias);
+		// Move the original aside instead of deleting it: while it stays allocated, the filesystem
+		// cannot hand its inode to the replacement, so the replacement is guaranteed a new identity.
+		await fs.rename(alias, `${alias}.original`);
+		await fs.symlink(path.join(fixture.root, "packages", "coding-agent", "src", "cli.ts"), alias);
 		const receipt = JSON.parse(await fs.readFile(`${alias}.gjc-managed.json`, "utf8"));
 		expect(receipt.identity.ino).not.toBe(String((await fs.lstat(alias)).ino));
 
