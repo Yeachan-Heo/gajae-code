@@ -1514,7 +1514,18 @@ export function createInvocationReconciliation(
 						recordErrorOutcome?.kind === "failed" &&
 						recordErrorOutcome.providerCode !== undefined &&
 						incomingOutcome.providerCode === undefined;
-					next.outcome = preferRecordError ? recordErrorOutcome : incomingOutcome;
+					// The frame outcome now carries the provider code on its own (the
+					// post-start failure evidence supplies it), so preferRecordError no
+					// longer fires for a provider refusal and the frame outcome wins. It
+					// is built from evidence and never carries the diagnostic, so fill the
+					// hole additively from the classification already recorded by
+					// agent_failed: the primary classifier, phase, category, providerCode
+					// and evidence of the chosen outcome stay exactly as upstream built
+					// them, and an outcome that already carries a diagnostic is untouched.
+					next.outcome = enrichOutcomeDiagnostic(
+						preferRecordError ? recordErrorOutcome : incomingOutcome,
+						next.providerDiagnostic,
+					) as InvocationOutcome;
 					if (next.error === undefined)
 						next.error = { code: incomingOutcome.code, message: incomingOutcome.message };
 					else next.error = { code: next.error.code, message: incomingOutcome.message };
