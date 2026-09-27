@@ -10,9 +10,22 @@ export const AB_SCHEMA = "gjc.native-bench-ab/1";
 
 export interface AbCase {
 	id: string;
+	/**
+	 * One sample of work. Wall time around the awaited call is the sample,
+	 * unless the call resolves to `{ measuredMs }`: then that value is the
+	 * sample. Use it when the awaited call includes fixed waits (for example a
+	 * test terminal's settle delay) that would otherwise dominate the timing.
+	 */
 	run: () => unknown;
 	/** Warmup calls before sampling; defaults to 25. */
 	warmup?: number;
+}
+
+function measuredMs(value: unknown): number | undefined {
+	if (typeof value !== "object" || value === null || !("measuredMs" in value)) return undefined;
+	const ms = (value as { measuredMs: unknown }).measuredMs;
+	if (typeof ms !== "number" || !Number.isFinite(ms) || ms < 0) throw new Error(`invalid measuredMs ${String(ms)}`);
+	return ms;
 }
 
 interface CliOptions {
@@ -60,8 +73,8 @@ export async function runAbSuite(suite: string, cases: readonly AbCase[], defaul
 			const samples: number[] = [];
 			for (let i = 0; i < cli.iterations; i++) {
 				const start = Bun.nanoseconds();
-				await item.run();
-				samples.push((Bun.nanoseconds() - start) / 1e6);
+				const value = await item.run();
+				samples.push(measuredMs(value) ?? (Bun.nanoseconds() - start) / 1e6);
 			}
 			results.push({ id: item.id, status: "measured", samples });
 		} catch (error) {

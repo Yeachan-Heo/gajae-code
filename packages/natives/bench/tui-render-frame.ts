@@ -3,6 +3,7 @@
 // E-TUI-MARKDOWN, E-TUI-RENDER-FRAME).
 import { clearRenderCache, Markdown } from "../../tui/src/components/markdown";
 import { Text } from "../../tui/src/components/text";
+import { renderMetrics } from "../../tui/src/metrics";
 import { TUI } from "../../tui/src/tui";
 import { makeRecordedSession } from "../../tui/test/replay-harness";
 import { defaultMarkdownTheme } from "../../tui/test/test-themes";
@@ -51,11 +52,21 @@ const tui = new TUI(term);
 tui.start();
 tui.addChild(new Text(transcriptLines().join("\n"), 1, 0));
 
-async function renderFrame(): Promise<void> {
+renderMetrics.enable();
+
+// Times the frame work the TUI records itself (#doRender + commit), not the
+// test terminal's fixed settle delay inside waitForRender(). The terminal is a
+// VirtualTerminal, so this gates frame construction and diffing; the native
+// TtyWriter output path is not exercised here (see tui-input-write/keystroke).
+async function renderFrame(): Promise<{ measuredMs: number }> {
 	const before = term.getWriteLog().length;
+	renderMetrics.reset();
 	tui.requestRender(false, "ab.tui-render-frame");
 	await term.waitForRender();
 	if (term.getWriteLog().length === before) throw new Error("render did not flush");
+	const frames = renderMetrics.snapshot().renderDurations;
+	if (frames.count === 0) throw new Error("requestRender did not record a frame");
+	return { measuredMs: frames.meanMs * frames.count };
 }
 
 const markdownMessages = Array.from({ length: 20 }, (_, index) => markdownChunk(index));
