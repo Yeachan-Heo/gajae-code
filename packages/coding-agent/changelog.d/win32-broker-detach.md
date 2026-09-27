@@ -1,3 +1,3 @@
 ### Fixed
 
-- Windows SDK broker now spawns directly with `detached:true` using Bun's UV_PROCESS_DETACHED flag, preventing it from being part of the parent's job. This ensures the broker and other clients' sessions survive when one client is force-terminated, without the complexity of cmd.exe wrapping that caused quoting, variable expansion, and discovery matching issues (issue #6007).
+- Windows SDK broker now uses an intermediate 'hop' process to spawn with `detached:true`, allowing the broker to survive parent tree termination (taskkill /T /F). The hop exits immediately after spawning the real broker with detached mode and windowsHide, breaking the process tree chain. This avoids cmd.exe wrapping complexity (quoting, variable expansion, discovery matching) while ensuring broker survival across force-termination scenarios (issue #6007).
