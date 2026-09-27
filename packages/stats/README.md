@@ -88,3 +88,57 @@ The web dashboard provides:
 ## License
 
 MIT
+
+## Tips & Common Patterns
+
+### Quick Sync and Summary
+```bash
+# Sync latest sessions and print summary
+gjc stats --sync
+```
+
+### JSON Output for Scripting
+```bash
+# Export stats as JSON for external processing
+gjc stats --json | jq '.overall.totalCost'
+```
+
+### Custom Port with Summary
+```bash
+# Start dashboard on custom port and show summary
+gjc stats --port 3000 --summary
+```
+
+### Programmatic: Per-Folder Breakdown
+```typescript
+import { syncAllSessions, getDashboardStats } from "@gajae-code/stats";
+
+// Sync and get folder stats
+const { processed, files } = await syncAllSessions();
+const stats = await getDashboardStats();
+
+// Find the folder with highest total cost
+const topFolder = stats.byFolder.reduce(
+  (a, b) => (a.totalCost > b.totalCost ? a : b),
+  stats.byFolder[0]
+);
+console.log(`Highest cost folder: ${topFolder.folder} (${formatCost(topFolder.totalCost)})`);
+```
+
+### Programmatic: Per-Model Analysis
+```typescript
+import { syncAllSessions, getDashboardStats } from "@gajae-code/stats";
+
+const { processed, files } = await syncAllSessions();
+const stats = await getDashboardStats();
+
+// Model with highest average tokens per second
+const topModel = stats.byModel[0]; // already sorted by requests
+console.log(`Most active model: ${topModel.model} with ${topModel.totalRequests} requests`);
+```
+
+### Troubleshooting
+
+- **No data shown?** Ensure session logs exist at `~/.gjc/agent/sessions/`
+- **Dashboard not starting?** Check that port 3847 (or your custom port) is available
+- **Empty results?** Run `gjc stats --sync` to force sync of new session files
