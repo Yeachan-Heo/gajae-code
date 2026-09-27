@@ -1,8 +1,59 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { type BrokerDiscovery, readBrokerDiscovery, readBrokerRestartIntent } from "./discovery";
-import { resolveBrokerSpawnOptionsForProduction, withBrokerStartupLock } from "./ensure";
+import { type BrokerSpawnResult, resolveBrokerSpawnOptionsForProduction, withBrokerStartupLock } from "./ensure";
 import { observeProcessIncarnation } from "./process-incarnation";
 import { resolveSdkInternalSpawnCommand } from "./runtime";
+
+/**
+ * Spawn the broker using a hop on Windows or direct spawn on POSIX.
+ * Shared logic between ensure.ts and daemon-entry.ts.
+ */
+function spawnBrokerWithHopForDaemonEntry(
+	brokerFile: string,
+	brokerArgs: readonly string[],
+	options: {
+		env: NodeJS.ProcessEnv;
+		cwd?: string;
+	},
+): BrokerSpawnResult {
+	if (process.platform === "win32") {
+		// On Windows, spawn the hop process which will spawn the real broker.
+		const hopMessage = {
+			command: {
+				file: brokerFile,
+				args: Array.from(brokerArgs),
+			},
+			env: options.env,
+			stdio: "ignore",
+		};
+
+		const gjcPath = process.execPath;
+		const child = spawn(gjcPath, ["internal", "broker-hop", JSON.stringify(hopMessage)], {
+			detached: false,
+			windowsHide: true,
+			stdio: ["ignore", "pipe", "ignore"],
+			env: process.env,
+		});
+
+		return {
+			process: child,
+			realBrokerPid: undefined, // Will be read from hop stdout
+		};
+	} else {
+		// On POSIX, spawn the broker directly with detached:true.
+		const child = spawn(brokerFile, Array.from(brokerArgs), {
+			detached: true,
+			stdio: "ignore",
+			env: options.env,
+			...(options.cwd ? { cwd: options.cwd } : {}),
+		});
+
+		return {
+			process: child,
+			realBrokerPid: child.pid,
+		};
+	}
+}
 
 export interface AuthorizedBrokerSuccessorOptions {
 	agentDir: string;
@@ -69,15 +120,62 @@ export async function launchAuthorizedBrokerSuccessor(
 				"--agent-dir",
 				options.agentDir,
 			]);
-			// On all platforms, spawn with detached:true to allow the broker to survive
-			// parent termination. Bun.spawn uses libuv's UV_PROCESS_DETACHED on Windows,
-			// which creates a process outside the parent's job.
-			child = spawn(brokerSpawnOpts.file, brokerSpawnOpts.args, {
-				detached: true,
-				stdio: "ignore",
-				env: { ...command.env, GJC_BROKER_RESTART_REQUEST: options.requestId },
-				...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
-			});
+			const env = { ...command.env, GJC_BROKER_RESTART_REQUEST: options.requestId };
+
+			let spawnResult: BrokerSpawnResult;
+			let spawnError: Error | undefined;
+
+			if (process.platform === "win32") {
+				// On Windows, spawn the hop which will spawn the real broker.
+				spawnResult = spawnBrokerWithHopForDaemonEntry(brokerSpawnOpts.file, brokerSpawnOpts.args, { env });
+
+				const hopProcess = spawnResult.process;
+				hopProcess.once("error", error => {
+					spawnError ??= error;
+				});
+
+				// Read the real broker pid from the hop's stdout.
+				if (hopProcess.stdout) {
+					let hopStdout = "";
+					hopProcess.stdout.on("data", chunk => {
+						hopStdout += chunk.toString();
+					});
+
+					// Wait for the hop process to exit and parse the response.
+					await new Promise<void>((resolve, reject) => {
+						hopProcess.on("exit", code => {
+							if (code !== 0) {
+								spawnError ??= new Error(`broker hop exited with code ${code}`);
+							} else if (hopStdout.trim()) {
+								try {
+									const hopResponse = JSON.parse(hopStdout.trim());
+									spawnResult.realBrokerPid = hopResponse.pid;
+								} catch (error) {
+									spawnError ??= new Error(
+										`Failed to parse broker hop response: ${error instanceof Error ? error.message : String(error)}`,
+									);
+								}
+							}
+							resolve();
+						});
+						hopProcess.on("error", reject);
+					});
+				}
+			} else {
+				// On POSIX, spawn the broker directly.
+				spawnResult = spawnBrokerWithHopForDaemonEntry(brokerSpawnOpts.file, brokerSpawnOpts.args, {
+					env,
+					cwd: command.kind === "bun-source" ? command.cwd : undefined,
+				});
+
+				spawnResult.process.once("error", error => {
+					spawnError = error;
+				});
+			}
+
+			child = spawnResult.process;
+			child.unref();
+			return { kind: "spawned" as const, child, spawnError: () => spawnError };
 		} catch (spawnError) {
 			return {
 				kind: "refused" as const,
@@ -85,12 +183,6 @@ export async function launchAuthorizedBrokerSuccessor(
 				detail: spawnError instanceof Error ? spawnError.message : String(spawnError),
 			};
 		}
-		let spawnError: Error | undefined;
-		child.once("error", childError => {
-			spawnError = childError;
-		});
-		child.unref();
-		return { kind: "spawned" as const, child, spawnError: () => spawnError };
 	});
 	if (spawnOutcome.kind !== "spawned") return spawnOutcome;
 	const { child } = spawnOutcome;

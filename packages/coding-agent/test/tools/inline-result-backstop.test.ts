@@ -238,7 +238,7 @@ describe("inline-result backstop (Finding 12)", () => {
 		// Simulate spillLargeResultToArtifact followed by backstop:
 		// A 100KB non-read tool result spills at 50KB threshold, then backstop applies 12KB cap.
 		const full = bigText(100);
-		const spilled40KBHeadTail = `${bigText(20)}\n...(elided)...\n${bigText(20)}`;
+		const spilled40KBHeadTail = bigText(20) + "\n...(elided)...\n" + bigText(20);
 		const saved: Array<{ content: string; toolType: string }> = [];
 
 		const tool = wrapToolWithMetaNotice(
