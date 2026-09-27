@@ -113,6 +113,21 @@ export declare class MacAppearanceObserver {
   stop(): void
 }
 
+/**
+ * Exclusive read-only lease over one already published broker document.
+ *
+ * The lease exposes no descriptor, no path, no write method and no publication
+ * authority: it can only copy bounded bytes, re-prove the retained descriptor
+ * and name edges, and close. `close` is idempotent and never throws; every use
+ * after close reports `unsafe_discovery`.
+ */
+export declare class NativeDiagnosticSnapshot {
+  get ok(): boolean
+  get reason(): string | null
+  read(): NativeDiagnosticSnapshotRead
+  revalidate(): NativeDiagnosticSnapshotStatus
+  close(): void
+}
 /** Retained no-follow authority for the SDK publication namespace. */
 export declare class NativeRetainedBrokerPublication {
   /**
@@ -1010,6 +1025,19 @@ export interface DiffChange {
  * ancestor policy and the read budget are fixed by this adapter.
  */
 export declare function diagnosticSnapshotOpen(agentDir: string, budgetMs: number): NativeDiagnosticSnapshot
+
+/** One jsdiff change object: a run of added, removed, or common tokens. */
+export interface DiffChange {
+  /** Joined token text for this run (lines keep their `
+  ` terminators). */
+  value: string
+  /** Number of tokens in this run. */
+  count: number
+  /** True when this run exists only in the new text. */
+  added: boolean
+  /** True when this run exists only in the old text. */
+  removed: boolean
+}
 
 /**
  * Diff `oldText.split("
