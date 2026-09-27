@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { type BrokerDiscovery, readBrokerDiscovery, readBrokerRestartIntent } from "./discovery";
-import { withBrokerStartupLock } from "./ensure";
+import { resolveBrokerSpawnOptionsForProduction, withBrokerStartupLock } from "./ensure";
 import { observeProcessIncarnation } from "./process-incarnation";
 import { resolveSdkInternalSpawnCommand } from "./runtime";
 
@@ -64,8 +64,13 @@ export async function launchAuthorizedBrokerSuccessor(
 		const command = resolveSdkInternalSpawnCommand("broker-internal");
 		let child: ChildProcess;
 		try {
-			child = spawn(command.file, [...command.args, "--agent-dir", options.agentDir], {
-				detached: true,
+			const brokerSpawnOpts = resolveBrokerSpawnOptionsForProduction(command.file, [
+				...command.args,
+				"--agent-dir",
+				options.agentDir,
+			]);
+			child = spawn(brokerSpawnOpts.file, brokerSpawnOpts.args, {
+				detached: process.platform !== "win32",
 				stdio: "ignore",
 				env: { ...command.env, GJC_BROKER_RESTART_REQUEST: options.requestId },
 				...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
