@@ -29,6 +29,7 @@ type Fixture = {
 	promptClientRef(): string;
 	newSessionAgain(): Promise<void>;
 	sendStopped(reason: StoppedReason): void;
+	sendStarted(): void;
 	sendFailed(code: string): void;
 	sendToolStart(toolCallId: string): void;
 	sendToolEnd(toolCallId: string): void;
@@ -147,6 +148,10 @@ export function createFixture(
 				...correlation,
 				outcome: { kind: "stopped", reason, provenance: reason === "cancelled" ? "client_cancel" : "agent" },
 			});
+		};
+		const sendStarted = (): void => {
+			const correlation = activeCorrelation();
+			send({ type: "agent_start", sessionId, ...correlation });
 		};
 		const sendFailed = (code: string): void => {
 			const correlation = activeCorrelation();
@@ -395,6 +400,7 @@ export function createFixture(
 				await bounded(agent.newSession({ cwd, mcpServers: [] }), "new session after retirement");
 			},
 			sendStopped,
+			sendStarted,
 			sendFailed,
 			sendToolStart,
 			sendToolEnd,
@@ -687,7 +693,7 @@ test("a reconnect before a failed abort does not leave the prompt cancelled", as
 	}
 });
 
-test("a failed abort during provider preflight leaves the prompt recoverable", async () => {
+test("a no_active_turn abort during provider preflight durably cancels without dispatching", async () => {
 	const fixture = await createFixture({
 		abortAcknowledgement: { turn: "no_active_turn", terminal: "terminal_no_effect" },
 	});
@@ -698,20 +704,104 @@ test("a failed abort during provider preflight leaves the prompt recoverable", a
 		await releaseProviderPreflight.promise;
 	});
 	try {
-		const pending = prompt(fixture, "abort during provider preflight");
+		const pending = prompt(fixture, "cancel during provider preflight");
 		await bounded(providerPreflight.promise, "provider preflight");
 		await expect(fixture.agent.cancel({ sessionId: fixture.sessionId })).rejects.toMatchObject({
 			code: "abort_unacknowledged",
 		});
 		releaseProviderPreflight.resolve();
-		await bounded(fixture.promptDelivered, "prompt delivery after failed preflight abort");
-		fixture.sendStopped("end_turn");
-		expect(await bounded(pending, "prompt recovery after failed preflight abort")).toEqual({
-			stopReason: "end_turn",
-		});
+		expect(await bounded(pending, "pre-admission cancellation")).toEqual({ stopReason: "cancelled" });
+		expect(fixture.promptDeliveryCount()).toBe(0);
 	} finally {
 		releaseProviderPreflight.resolve();
 		ensureProviders.mockRestore();
+		fixture.dispose();
+	}
+});
+
+test("a pre-admission no_active_turn abort is retried after prompt acknowledgement", async () => {
+	let abortCalls = 0;
+	const admittedAbortIssued = Promise.withResolvers<void>();
+	const fixture = await createFixture({
+		cancelSettlementGraceMs: 0,
+		deferPromptAcknowledgement: true,
+		abortAcknowledgement: () => {
+			abortCalls++;
+			if (abortCalls === 1) return { turn: "no_active_turn", terminal: "terminal_no_effect" };
+			admittedAbortIssued.resolve();
+			return { ok: true, selection: "turn", turn: "stopped", terminal: "terminal_no_effect" };
+		},
+	});
+	try {
+		const pending = prompt(fixture, "cancel before prompt acknowledgement");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		expect(fixture.hasPendingPromptAcknowledgement()).toBe(true);
+		await expect(fixture.agent.cancel({ sessionId: fixture.sessionId })).rejects.toMatchObject({
+			code: "abort_unacknowledged",
+		});
+		expect(abortCalls).toBe(1);
+
+		fixture.acknowledgePendingPrompt();
+		await bounded(admittedAbortIssued.promise, "terminal abort after prompt acknowledgement");
+		expect(abortCalls).toBe(2);
+		expect(await bounded(pending, "acknowledged cancellation settlement")).toEqual({ stopReason: "cancelled" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("a no_active_turn retry is repeated after the correlated turn starts", async () => {
+	let abortCalls = 0;
+	const preStartRetryFailed = Promise.withResolvers<void>();
+	const startedAbortIssued = Promise.withResolvers<void>();
+	const warning = vi.spyOn(logger, "warn").mockImplementation((event, ..._details) => {
+		if (event === "ACP could not retry a cancel after prompt admission") preStartRetryFailed.resolve();
+	});
+	const fixture = await createFixture({
+		cancelSettlementGraceMs: 0,
+		deferPromptAcknowledgement: true,
+		abortAcknowledgement: () => {
+			abortCalls++;
+			if (abortCalls <= 3) return { turn: "no_active_turn", terminal: "terminal_no_effect" };
+			startedAbortIssued.resolve();
+			return { ok: true, selection: "turn", turn: "stopped", terminal: "terminal_no_effect" };
+		},
+	});
+	try {
+		const pending = prompt(fixture, "cancel before correlated run starts");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		await expect(fixture.agent.cancel({ sessionId: fixture.sessionId })).rejects.toMatchObject({
+			code: "abort_unacknowledged",
+		});
+		expect(abortCalls).toBe(1);
+
+		fixture.acknowledgePendingPrompt();
+		await bounded(preStartRetryFailed.promise, "pre-start abort no-effect response");
+		expect(abortCalls).toBe(3);
+		fixture.sendStarted();
+		await bounded(startedAbortIssued.promise, "terminal abort after correlated start");
+		expect(abortCalls).toBe(4);
+		expect(await bounded(pending, "cancelled settlement after correlated start")).toEqual({ stopReason: "cancelled" });
+	} finally {
+		warning.mockRestore();
+		fixture.dispose();
+	}
+});
+
+test("a no_active_turn cancel without a pending prompt leaves the next prompt uncancelled", async () => {
+	const fixture = await createFixture({
+		abortAcknowledgement: { turn: "no_active_turn", terminal: "terminal_no_effect" },
+	});
+	try {
+		await expect(bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel without waiter")).rejects.toMatchObject({
+			code: "abort_unacknowledged",
+		});
+		const pending = prompt(fixture, "prompt after cancel without waiter");
+		await bounded(fixture.promptDelivered, "later prompt delivery");
+		expect(fixture.promptDeliveryCount()).toBe(1);
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "later prompt completion")).toEqual({ stopReason: "end_turn" });
+	} finally {
 		fixture.dispose();
 	}
 });

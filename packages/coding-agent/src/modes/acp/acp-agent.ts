@@ -214,6 +214,12 @@ interface PromptWaiter {
 	/** Whether ANY overlapping cancel attempt for this prompt was acknowledged:
 	 *  a later failed attempt must not erase an earlier success (review thread P2). */
 	cancelAcknowledged?: boolean;
+	/** Durable cancel intent after a no-effect abort before this waiter starts work; retained until settlement. */
+	cancelBeforeAdmission?: boolean;
+	/** Abort scope replayed after admission and again at correlated start if no turn was active yet. */
+	cancelBeforeAdmissionScope?: AbortScope;
+	/** A correlated start may need one final abort after an admitted-but-not-running no-effect response. */
+	cancelAfterStartAbortIssued?: boolean;
 	/** In-flight cancel attempts for this prompt: cancellation intent must stay
 	 *  set while any attempt can still acknowledge, so a failure only clears
 	 *  the shared flag when no attempt remains pending (review thread P2). */
@@ -591,6 +597,12 @@ function isAbortAcknowledged(value: unknown, scope: AbortScope): boolean {
 	if (result.aborted === true) return true;
 	return result.ok === true && result.turn === "stopped" && result.selection === scope;
 }
+function isAbortNoEffect(value: unknown): boolean {
+	const candidate = object(value);
+	const result = object(candidate?.result) ?? candidate;
+	return result?.turn === "no_active_turn" || result?.turn === "no_effect" || result?.turn === "no_store";
+}
+
 function strictCorrelationFrom(...values: unknown[]): PromptCorrelation | undefined {
 	const correlation: PromptCorrelation = {};
 	let malformed = false;
@@ -2362,7 +2374,7 @@ export class AcpAgent implements Agent {
 				this.#releaseRetiredPromptAcknowledgement(params.sessionId, waiter);
 				return await response;
 			}
-			if (record.cancelRequested && waiter.cancelAcknowledged) {
+			if (record.cancelRequested && (waiter.cancelAcknowledged || waiter.cancelBeforeAdmission)) {
 				this.#releaseRetiredPromptAcknowledgement(params.sessionId, waiter);
 				await this.#settleCancelledPrompt(params.sessionId, record, waiter);
 				return await response;
@@ -2385,7 +2397,7 @@ export class AcpAgent implements Agent {
 			this.#releaseRetiredPromptAcknowledgement(params.sessionId, waiter);
 			return await response;
 		}
-		if (record.cancelRequested && waiter.cancelAcknowledged) {
+		if (record.cancelRequested && (waiter.cancelAcknowledged || waiter.cancelBeforeAdmission)) {
 			this.#releaseRetiredPromptAcknowledgement(params.sessionId, waiter);
 			await this.#settleCancelledPrompt(params.sessionId, record, waiter);
 			return await response;
@@ -2415,18 +2427,18 @@ export class AcpAgent implements Agent {
 					record.adapter,
 				);
 			}
+		if (waiter.settled || record.activePrompt !== waiter) {
+			return await response;
+		}
+		if (record.cancelRequested && (waiter.cancelAcknowledged || waiter.cancelBeforeAdmission)) {
+			await this.#settleCancelledPrompt(params.sessionId, record, waiter);
+			return await response;
+		}
 		waiter.dispatched = true;
 		// The turn is now dispatched to the host: this prompt owned the session's first turn,
 		// so it — not a preflight rejection that threw before this point — is what settles
 		// `firstPromptDone` in `prompt()` (review P2).
 		if (retryReservation) retryReservation.admitted = true;
-		if (waiter.settled || record.activePrompt !== waiter) {
-			return await response;
-		}
-		if (record.cancelRequested && waiter.cancelAcknowledged) {
-			await this.#settleCancelledPrompt(params.sessionId, record, waiter);
-			return await response;
-		}
 
 		waiter.acknowledgementPending = true;
 		const promptAdapter = record.adapter;
@@ -2545,6 +2557,19 @@ export class AcpAgent implements Agent {
 			if (promptWaiterRetired(record, waiter)) {
 				this.#rememberSettledPromptCorrelation(params.sessionId, record, acknowledgementCorrelation);
 				return await response;
+			}
+			if (waiter.cancelBeforeAdmission && record.cancelRequested) {
+				const scope = waiter.cancelBeforeAdmissionScope ?? "turn";
+				// Keep the intent until an acknowledged abort or the prompt terminal settles it.
+				void this.cancel({
+					sessionId: params.sessionId,
+					_meta: { gjc: { abortScope: scope } },
+				} as CancelNotification).catch(error =>
+					logger.warn("ACP could not retry a cancel after prompt admission", {
+						sessionId: params.sessionId,
+						error: error instanceof Error ? error.message : String(error),
+					}),
+				);
 			}
 			// Frames held while ownership was unknown belong to this prompt only when the
 			// acknowledgement proves their complete correlation matches exactly.
@@ -2691,7 +2716,11 @@ export class AcpAgent implements Agent {
 			// return the semantically meaningful `cancelled` stop reason, so that Clients
 			// can reliably confirm the cancellation." Surfacing the transport's `busy`
 			// rejection instead would show the user a spurious error for their own cancel.
-			if (record.cancelRequested && waiter.cancelAcknowledged) {
+			if (
+				record.cancelRequested &&
+				(waiter.cancelAcknowledged ||
+					(waiter.cancelBeforeAdmission && !waiter.acknowledged && !waiter.dispatched))
+			) {
 				record.cancelRequested = false;
 				// The client's turn is settled by the return; the advisory idle publication
 				// must not gate it and must still be attempted so the running phase is
@@ -2715,6 +2744,8 @@ export class AcpAgent implements Agent {
 		// `_meta.gjc.abortScope: "owned"` (or `GJC_ACP_ABORT_SCOPE=owned`).
 		const scope = resolveAcpAbortScope(params._meta, process.env);
 		const waiter = record.activePrompt;
+		const waiterWasUnacknowledged = waiter !== undefined && !waiter.acknowledged;
+		const waiterWasBeforeActivity = waiter !== undefined && !waiter.observedTurnActivity;
 		if (waiter) {
 			// Overlapping cancels must not lose an earlier successful
 			// acknowledgement: ANY successful attempt resolves the shared
@@ -2733,9 +2764,27 @@ export class AcpAgent implements Agent {
 			}
 		}
 		try {
-			const acknowledgement = await record.adapter.cancel(scope);
+			let acknowledgement = await record.adapter.cancel(scope);
+			let acknowledgementScope = scope;
+			if (
+				!isAbortAcknowledged(acknowledgement, scope) &&
+				isAbortNoEffect(acknowledgement) &&
+				(waiterWasUnacknowledged || waiterWasBeforeActivity) &&
+				waiter &&
+				record.activePrompt === waiter &&
+				!waiter.settled
+			) {
+				waiter.cancelBeforeAdmission = true;
+				waiter.cancelBeforeAdmissionScope =
+					waiter.cancelBeforeAdmissionScope === "owned" || scope === "owned" ? "owned" : "turn";
+				if (waiter.acknowledged) {
+					// The first abort raced prompt admission. Retry now that the turn is admitted.
+					acknowledgementScope = waiter.cancelBeforeAdmissionScope;
+					acknowledgement = await record.adapter.cancel(acknowledgementScope);
+				}
+			}
 			const result = object(object(acknowledgement)?.result) ?? object(acknowledgement);
-			if (!isAbortAcknowledged(acknowledgement, scope))
+			if (!isAbortAcknowledged(acknowledgement, acknowledgementScope))
 				throw new AcpSdkAdapterError(
 					"abort_unacknowledged",
 					"SDK did not acknowledge cancellation of the active prompt.",
@@ -2846,7 +2895,12 @@ export class AcpAgent implements Agent {
 		} finally {
 			if (waiter) {
 				waiter.pendingCancelAttempts = Math.max(0, (waiter.pendingCancelAttempts ?? 1) - 1);
-				if (waiter.pendingCancelAttempts === 0 && !waiter.cancelAcknowledged && record.activePrompt === waiter) {
+				if (
+					waiter.pendingCancelAttempts === 0 &&
+					!waiter.cancelAcknowledged &&
+					!waiter.cancelBeforeAdmission &&
+					record.activePrompt === waiter
+				) {
 					record.cancelRequested = false;
 				}
 			}
@@ -2869,8 +2923,9 @@ export class AcpAgent implements Agent {
 
 	async #settleCancelledPrompt(id: string, record: SessionRecord, waiter: PromptWaiter): Promise<void> {
 		// The authoritative terminal wins whenever it arrives in time; this only runs
-		// when nothing settled the prompt after the SDK acknowledged the cancellation.
-		if (!waiter.cancelAcknowledged) return;
+		// after an acknowledged abort or before turn dispatch for this waiter.
+		const preAdmissionCancellation = waiter.cancelBeforeAdmission && !waiter.acknowledged && !waiter.dispatched;
+		if (!waiter.cancelAcknowledged && !preAdmissionCancellation) return;
 		if (this.#sessions.get(id) !== record || record.activePrompt !== waiter || waiter.settled) return;
 		if (waiter.terminalReserved) return;
 		// An overlapping acknowledged cancel does not supersede the earlier
@@ -2893,6 +2948,8 @@ export class AcpAgent implements Agent {
 		if (!record.backgroundBusy) record.busy = false;
 		clearPromptWatchdog(waiter);
 		record.cancelRequested = false;
+		waiter.cancelBeforeAdmission = false;
+		waiter.cancelBeforeAdmissionScope = undefined;
 		waiter.settled = true;
 		this.#fenceRetiredPromptAcknowledgement(id, waiter);
 		waiter.deferredFrames.length = 0;
@@ -4605,6 +4662,24 @@ export class AcpAgent implements Agent {
 		}
 		if (toolCallId && event.type === "tool_execution_end") record.toolArgs.delete(toolCallId);
 		if (event.type === "agent_start") {
+			if (
+				promptOwner?.cancelBeforeAdmission &&
+				record.cancelRequested &&
+				!promptOwner.cancelAcknowledged &&
+				!promptOwner.cancelAfterStartAbortIssued
+			) {
+				promptOwner.cancelAfterStartAbortIssued = true;
+				const scope = promptOwner.cancelBeforeAdmissionScope ?? "turn";
+				void this.cancel({
+					sessionId: id,
+					_meta: { gjc: { abortScope: scope } },
+				} as CancelNotification).catch(error =>
+					logger.warn("ACP could not retry a cancel after prompt start", {
+						sessionId: id,
+						error: error instanceof Error ? error.message : String(error),
+					}),
+				);
+			}
 			await this.#publishSessionUpdate(
 				id,
 				{
@@ -4874,6 +4949,8 @@ export class AcpAgent implements Agent {
 		record.activePrompt = undefined;
 		clearPromptWatchdog(waiter);
 		waiter.settled = true;
+		waiter.cancelBeforeAdmission = false;
+		waiter.cancelBeforeAdmissionScope = undefined;
 		const { outcome } = waiter.terminal;
 		this.#rememberSettledPromptCorrelation(id, record, waiter.correlation);
 		if (outcome.kind === "stopped") {
