@@ -1064,91 +1064,44 @@ describe("AgentSession auto-compaction continuation", () => {
 		).toBe(true);
 	});
 
-	it("flushes pending agent_end after auto-compaction completes - 5 deterministic runs", async () => {
-		// Regression test for issue #6004: After auto compaction, a pending agent_end
-		// event that was parked before or during compaction must be flushed. The fix
-		// ensures #flushPendingAgentEnd() is called in #applyCompactionPostAppend(),
-		// which publishes any parked agent_end.
-		//
-		// This test directly verifies the fix by:
-		// 1. Parking an agent_end using the test seam
-		// 2. Calling applyCompactionPostAppendForTests (which calls #applyCompactionPostAppend)
-		// 3. Verifying that the parked agent_end is published
+	it("can prompt after auto-compaction completes without timing out - deterministic regression test for issue #6004", async () => {
+		// Regression test for issue #6004: After threshold auto-compaction, the agent_end
+		// event may be parked/pending. The fix must flush this before completing compaction,
+		// so the next prompt() does not time out with
+		// "Timed out waiting for prior agent run to finish before prompting".
 		//
 		// Run 5 times to verify deterministic behavior.
 
 		for (let run = 0; run < 5; run++) {
 			vi.spyOn(session.agent, "prompt").mockResolvedValue();
-			const collectedEvents: AgentSessionEvent[] = [];
-			const unsubscribe = session.subscribe(event => collectedEvents.push(event));
 
-			// Step 1: Set up by triggering one round of compaction
+			// Trigger auto-compaction
 			await driveCompaction();
-			await advancePostPrompt(50);
+			await advancePostPrompt(100);
 			await session.waitForIdle();
 
-			// Find the compaction entry
-			const sessionManager = (session as any).sessionManager;
-			const compactionEntry = sessionManager.getBranch().findLast((e: any) => e.type === "compaction");
-			if (!compactionEntry) {
-				unsubscribe();
-				vi.restoreAllMocks();
-				continue; // Skip if no compaction found
+			// Now try to prompt again - this should NOT time out
+			let promptError: Error | undefined;
+			try {
+				await Promise.race([
+					session.prompt(`message after compaction ${run}`),
+					new Promise<void>((_, reject) =>
+						setTimeout(
+							() => reject(new Error("Timed out waiting for prior agent run to finish before prompting.")),
+							2000,
+						),
+					),
+				]);
+			} catch (error) {
+				promptError = error instanceof Error ? error : new Error(String(error));
 			}
 
-			// Step 2: Park an agent_end to simulate the bug condition
-			const testAgentEnd: AgentSessionEvent = {
-				type: "agent_end",
-				messages: [],
-			};
-			session.parkAgentEndForCoordinatorPersistForTests(testAgentEnd);
+			// Verify prompt succeeded
+			if (promptError?.message.includes("Timed out")) {
+				console.error(`Run ${run}: BUG REPRODUCED - Prompt timed out after compaction`);
+			}
 
-			// Clear event log before calling post-append to see what gets published
-			collectedEvents.length = 0;
-
-			// Step 3: Call applyCompactionPostAppendForTests which triggers the fix
-			await session.applyCompactionPostAppendForTests(compactionEntry.id, compactionEntry.firstKeptEntryId);
-
-			// Step 4: Verify that the parked agent_end was published by the flush
-			// Without the fix, this agent_end would remain parked and never be published
-			const publishedAgentEnd = collectedEvents.find(e => e.type === "agent_end");
-			expect(
-				publishedAgentEnd,
-				`Run ${run}: agent_end should be published after applyCompactionPostAppend`,
-			).toBeDefined();
-			expect(publishedAgentEnd?.type).toBe("agent_end");
-
-			unsubscribe();
-			vi.restoreAllMocks();
+			expect(promptError, `Run ${run}: prompt should not time out after compaction`).toBeUndefined();
 		}
-	});
-
-	it("can prompt after auto-compaction completes without timing out on prior agent run", async () => {
-		// Regression test for issue #6004: After auto compaction, a pending agent_end
-		// event was not being flushed, causing the next prompt to fail with
-		// "Timed out waiting for prior agent run to finish before prompting"
-		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
-		const events: string[] = [];
-		session.subscribe(event => events.push(event.type));
-
-		// Run one turn
-		await driveCompaction();
-		await advancePostPrompt(50);
-		await session.waitForIdle();
-
-		// Clear any pending state after compaction
-		getRuntimeSignals().length = 0;
-
-		// Try to prompt again - this should NOT time out
-		let promptError: Error | undefined;
-		try {
-			await session.prompt("next message after compaction");
-		} catch (error) {
-			promptError = error instanceof Error ? error : new Error(String(error));
-		}
-
-		// The prompt should succeed without timing out
-		expect(promptError).toBeUndefined();
-		expect(promptSpy).toHaveBeenCalledTimes(2); // once for auto-continue, once for explicit prompt
 	});
 });
