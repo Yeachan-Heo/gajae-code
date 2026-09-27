@@ -101,6 +101,8 @@ describe("InteractiveMode.setEditorComponent", () => {
 		const reset = vi.spyOn(mode.ui, "resetViewportAnchorIntent");
 		const reconcile = vi.spyOn(mode.ui, "prepareViewportAnchorForTranscriptRebuild");
 		vi.spyOn(mode, "renderSessionContext").mockImplementation(() => undefined);
+		// Startup's first paint precedes every transcript rebuild.
+		mode.renderInitialMessages();
 
 		mode.rebuildChatFromMessages("replace-identity");
 		expect(reset).toHaveBeenCalledTimes(1);
@@ -293,7 +295,7 @@ describe("InteractiveMode.setEditorComponent", () => {
 		expect(report).not.toHaveBeenCalled();
 	});
 
-	it("renders an idle extension custom message through the real rebuild boundary", async () => {
+	function initializeExtensionActions(): ExtensionActions {
 		let actions: ExtensionActions | undefined;
 		const extensionRunner = {
 			initialize(
@@ -310,15 +312,35 @@ describe("InteractiveMode.setEditorComponent", () => {
 			configurable: true,
 			value: extensionRunner as unknown as AgentSession["extensionRunner"],
 		});
-		const reconcile = vi.spyOn(mode.ui, "prepareViewportAnchorForTranscriptRebuild");
 		new ExtensionUiController(mode).initializeHookRunner({} as ExtensionUIContext, false);
 		if (!actions) throw new Error("Extension actions were not initialized");
+		return actions;
+	}
+
+	it("renders an idle extension custom message through the real rebuild boundary", async () => {
+		mode.renderInitialMessages();
+		const actions = initializeExtensionActions();
+		const reconcile = vi.spyOn(mode.ui, "prepareViewportAnchorForTranscriptRebuild");
 
 		actions.sendMessage({ customType: "test", content: "visible extension message", display: true });
 		await Bun.sleep(0);
 
 		expect(reconcile).toHaveBeenCalledTimes(1);
 		expect(mode.chatContainer.render(80).join("\n")).toContain("visible extension message");
+	});
+
+	it("renders a pre-paint extension message once and keeps pre-paint notices", async () => {
+		const actions = initializeExtensionActions();
+		mode.showWarning("pre-paint notice");
+
+		// session_start extensions send display messages before startup's first paint.
+		actions.sendMessage({ customType: "test", content: "pre-paint extension message", display: true });
+		await Bun.sleep(0);
+		mode.renderInitialMessages(undefined, { preserveExistingChat: true });
+
+		const rendered = mode.chatContainer.render(80).join("\n");
+		expect(rendered.split("pre-paint extension message")).toHaveLength(2);
+		expect(rendered).toContain("pre-paint notice");
 	});
 
 	it("renders the default composer as a closed rounded input box", () => {

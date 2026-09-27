@@ -565,6 +565,13 @@ export class InteractiveMode implements InteractiveModeContext {
 	#suspendedActivityIndicator?: Loader;
 	#stopped = false;
 	#initPromise?: Promise<void>;
+	// Until startup's first paint renders the session transcript, chatContainer holds
+	// only pre-paint notices. A transcript rebuild before then (e.g. an extension
+	// session_start message with display:true) would wipe those notices and leave
+	// session components that the first paint preserves and renders again, so every
+	// session-derived block would show twice. Rebuilds are no-ops until the first
+	// paint, which renders the full session anyway.
+	#initialTranscriptPainted = false;
 	#stopListeners = new Set<() => void>();
 	#eventBus?: EventBus;
 	#eventBusUnsubscribers: Array<() => void> = [];
@@ -1561,6 +1568,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	rebuildChatFromMessages(policy: TranscriptRebuildPolicy): void {
+		if (!this.#initialTranscriptPainted) return;
 		prepareTranscriptRebuild(this.ui, policy);
 		this.resetAssistantTextPresentation();
 		this.chatContainer.clear();
@@ -2184,11 +2192,13 @@ export class InteractiveMode implements InteractiveModeContext {
 		prebuiltContext?: SessionContext,
 		options?: { preserveExistingChat?: boolean },
 	): void {
+		if (!this.#initialTranscriptPainted) return;
 		prepareTranscriptRebuild(this.ui, policy);
 		this.#uiHelpers.renderInitialMessages(prebuiltContext, options);
 	}
 	renderInitialMessages(prebuiltContext?: SessionContext, options?: { preserveExistingChat?: boolean }): void {
 		this.#uiHelpers.renderInitialMessages(prebuiltContext, options);
+		this.#initialTranscriptPainted = true;
 	}
 
 	getUserMessageText(message: Message): string {
