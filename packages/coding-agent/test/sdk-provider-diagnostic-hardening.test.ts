@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { createKindAwareReconciliation } from "../src/sdk/bus/kind-aware-reconciliation";
+import { createKindAwareReconciliation, type KindAwareReconciliation } from "../src/sdk/bus/kind-aware-reconciliation";
 import { createReconciliationStore } from "../src/sdk/bus/reconciliation-store";
-import { createInvocationReconciliation } from "../src/sdk/host/session-runtime";
+import { createInvocationReconciliation, type InvocationReconciliation } from "../src/sdk/host/session-runtime";
 import { failedPromptOutcome, publicTerminalOutcome, rephaseFailedOutcome } from "../src/sdk/prompt-failure";
 
 /**
@@ -635,5 +635,90 @@ describe("F1 both reconcilers deliver the same diagnostic on an agent_end that c
 			expect(settled.status).toBe("failed");
 			expect(settled.outcome?.providerDiagnostic).toBeUndefined();
 		});
+	}
+});
+
+describe("F1 conflicting primary: a diagnostic is inherited only by its own failure", () => {
+	const ids = { commandId: "cp-c", turnId: "cp-t" };
+	const outcomeWithPrimary = (providerCode: string, diagnostic?: Record<string, unknown>) =>
+		failedPromptOutcome({
+			code: "prompt_failed",
+			provenance: "agent_failed",
+			providerCode,
+			evidence: { startedAt: 1 },
+			...(diagnostic === undefined ? {} : { providerDiagnostic: diagnostic as never }),
+		});
+
+	async function settle(
+		engine: "bus" | "host",
+		frameOutcome: ReturnType<typeof outcomeWithPrimary>,
+		claimPendingFirst: boolean,
+	): Promise<TerminalRow> {
+		const reconciliation: KindAwareReconciliation | InvocationReconciliation =
+			engine === "bus" ? createKindAwareReconciliation() : createInvocationReconciliation();
+		reconciliation.admit("prompt", "ref");
+		await reconciliation.noteAccepted("prompt", ids, "ref");
+		await reconciliation.noteTransition("prompt", ids, { type: "agent_start" });
+		await reconciliation.noteTransition("prompt", ids, {
+			type: "agent_failed",
+			error: { code: "provider_rejected", message: "Agent run failed.", providerDiagnostic: AUTH_DIAGNOSTIC },
+		} as never);
+		if (claimPendingFirst) {
+			// Each engine exposes the pending claim under its own name; both stage the
+			// same durable pendingOutcome the terminal branch then selects.
+			if (engine === "bus")
+				await (reconciliation as KindAwareReconciliation).claimPendingOutcome("prompt", ids, frameOutcome);
+			else
+				await (reconciliation as InvocationReconciliation).stagePendingTerminalOutcome(
+					"prompt",
+					ids,
+					frameOutcome,
+					true,
+					undefined,
+				);
+		}
+		await reconciliation.noteTransition("prompt", ids, { type: "agent_end", outcome: frameOutcome } as never);
+		return reconciliation.lookup("prompt", { clientRef: "ref" }) as TerminalRow;
+	}
+
+	for (const engine of ["bus", "host"] as const) {
+		for (const claimPendingFirst of [false, true]) {
+			const branch = claimPendingFirst ? "pending" : "ordinary";
+
+			test(`${engine}/${branch} keeps the diagnostic when the selected outcome has the same primary`, async () => {
+				const settled = await settle(engine, outcomeWithPrimary("provider_rejected"), claimPendingFirst);
+				expect(settled.status).toBe("failed");
+				expect(settled.outcome?.providerCode).toBe("provider_rejected");
+				expect(settled.outcome?.providerDiagnostic).toEqual(AUTH_DIAGNOSTIC);
+			});
+
+			test(`${engine}/${branch} does not inherit the diagnostic of a different failure`, async () => {
+				const settled = await settle(engine, outcomeWithPrimary("provider_down"), claimPendingFirst);
+				// Selection, legacy classification and receipt are untouched.
+				expect(settled.status).toBe("failed");
+				expect(settled.receiptState).toBe("missing");
+				expect(settled.error?.code).toBe("provider_rejected");
+				expect(settled.outcome?.code).toBe("prompt_failed");
+				expect(settled.outcome?.providerCode).toBe("provider_down");
+				// An auth/401 classification must never describe a provider_down terminal.
+				expect(settled.outcome?.providerDiagnostic).toBeUndefined();
+			});
+
+			test(`${engine}/${branch} keeps an explicit carrier that the selected outcome brought itself`, async () => {
+				const ownDiagnostic = {
+					category: "provider_unavailable",
+					httpStatus: 503,
+					code: "overloaded_error",
+					evidence: "structured_code",
+				} as const;
+				const settled = await settle(
+					engine,
+					outcomeWithPrimary("provider_down", { ...ownDiagnostic }),
+					claimPendingFirst,
+				);
+				expect(settled.outcome?.providerCode).toBe("provider_down");
+				expect(settled.outcome?.providerDiagnostic).toEqual(ownDiagnostic);
+			});
+		}
 	}
 });

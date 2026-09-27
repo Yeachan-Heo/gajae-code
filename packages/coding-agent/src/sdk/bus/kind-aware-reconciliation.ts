@@ -137,6 +137,23 @@ const enrichOutcomeDiagnostic = (
 const diagnosticForSamePrimaryCode = (record: { error?: { code: string } }, failure: { code: string }): boolean =>
 	record.error === undefined || record.error.code === failure.code;
 
+/**
+ * A collected diagnostic belongs to ONE failure. It may fill a hole in the
+ * selected terminal only when that terminal describes the same failure: the
+ * primary the record classified must equal the primary the outcome reports.
+ * Inheriting across primaries put an auth/401 classification on a provider_down
+ * terminal, which is a false statement about the failure.
+ */
+const diagnosticBelongsToOutcome = (
+	record: { error?: { code: string } },
+	outcome: SdkPromptTerminalOutcome | undefined,
+): boolean => {
+	if (outcome?.kind !== "failed") return false;
+	const recordPrimary = record.error?.code;
+	if (recordPrimary === undefined) return true;
+	return recordPrimary === (outcome.providerCode ?? outcome.code);
+};
+
 const isDeadlineOutcome = (outcome: SdkPromptTerminalOutcome | undefined): boolean =>
 	outcome?.kind === "failed" && outcome.provenance === "deadline";
 
@@ -671,7 +688,10 @@ export function createKindAwareReconciliation(
 				// from evidence and carries no diagnostic, so fill that hole additively
 				// from the same-failure classification agent_failed already recorded --
 				// the host reconciler delivers the same field for the same input.
-				record.outcome = enrichOutcomeDiagnostic(terminalOutcome, record.providerDiagnostic) ?? terminalOutcome;
+				record.outcome =
+					(diagnosticBelongsToOutcome(record, terminalOutcome)
+						? enrichOutcomeDiagnostic(terminalOutcome, record.providerDiagnostic)
+						: terminalOutcome) ?? terminalOutcome;
 				delete record.pendingOutcome;
 				if (terminalOutcome.kind === "failed") {
 					record.status = "failed";
@@ -702,7 +722,10 @@ export function createKindAwareReconciliation(
 							)
 						: frameOutcome;
 				if (terminalOutcome !== undefined) {
-					record.outcome = enrichOutcomeDiagnostic(terminalOutcome, record.providerDiagnostic) ?? terminalOutcome;
+					record.outcome =
+						(diagnosticBelongsToOutcome(record, terminalOutcome)
+							? enrichOutcomeDiagnostic(terminalOutcome, record.providerDiagnostic)
+							: terminalOutcome) ?? terminalOutcome;
 					if (terminalOutcome.kind === "failed") {
 						record.status = "failed";
 						if (!providerError) record.error = { code: terminalOutcome.code, message: terminalOutcome.message };

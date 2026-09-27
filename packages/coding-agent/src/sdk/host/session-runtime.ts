@@ -913,6 +913,20 @@ function diagnosticForSamePrimaryCode(record: { error?: { code: string } }, fail
 }
 
 /**
+ * A collected diagnostic belongs to ONE failure: it may only fill a hole in a
+ * terminal whose primary matches the primary the record classified.
+ */
+function diagnosticBelongsToOutcome(record: { error?: { code: string } }, outcome: unknown): boolean {
+	if (!outcome || typeof outcome !== "object") return false;
+	const failed = outcome as { kind?: unknown; code?: unknown; providerCode?: unknown };
+	if (failed.kind !== "failed") return false;
+	const recordPrimary = record.error?.code;
+	if (recordPrimary === undefined) return true;
+	const outcomePrimary = typeof failed.providerCode === "string" ? failed.providerCode : failed.code;
+	return recordPrimary === outcomePrimary;
+}
+
+/**
  * Additive late enrichment: fill a MISSING diagnostic on an already settled
  * failed outcome. An existing diagnostic is never replaced, and no other field
  * of the terminal is touched.
@@ -1522,9 +1536,14 @@ export function createInvocationReconciliation(
 					// agent_failed: the primary classifier, phase, category, providerCode
 					// and evidence of the chosen outcome stay exactly as upstream built
 					// them, and an outcome that already carries a diagnostic is untouched.
-					next.outcome = enrichOutcomeDiagnostic(
-						preferRecordError ? recordErrorOutcome : incomingOutcome,
-						next.providerDiagnostic,
+					const selectedOutcome = preferRecordError ? recordErrorOutcome : incomingOutcome;
+					// Same-primary only: a collected diagnostic describes the failure the
+					// record classified, so it must not travel onto a terminal that reports a
+					// different provider primary.
+					next.outcome = (
+						diagnosticBelongsToOutcome(next, selectedOutcome)
+							? enrichOutcomeDiagnostic(selectedOutcome, next.providerDiagnostic)
+							: selectedOutcome
 					) as InvocationOutcome;
 					if (next.error === undefined)
 						next.error = { code: incomingOutcome.code, message: incomingOutcome.message };
