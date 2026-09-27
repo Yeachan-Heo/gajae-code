@@ -978,9 +978,15 @@ export async function runInteractiveMode(
 
 	// Startup input bypasses the editor submit path, so seed the automatic title
 	// here. Skill invocations are skipped exactly as they are on the editor path.
+	// It must run before the prompt (the title gate skips sessions that already
+	// hold a user message), and a title failure must never drop the prompt.
 	const maybeGenerateStartupTitle = (text: string): void => {
 		if (text.startsWith("/") && isNamespacedSkillSlashCommandName(text.slice(1))) return;
-		mode.maybeGenerateSessionTitle(text);
+		try {
+			mode.maybeGenerateSessionTitle(text);
+		} catch (error: unknown) {
+			logger.warn("Startup session title generation failed", { error: String(error) });
+		}
 	};
 
 	const runStartupInputAndPromptLoop = async (): Promise<never> => {
