@@ -8,7 +8,7 @@ on:
         required: true
         type: choice
         default: rss
-        options: [rss, edit-hotspots, grep]
+        options: [rss, edit-hotspots, grep, profile-stability]
       base:
         description: Git ref to use as the baseline
         required: true
@@ -38,13 +38,38 @@ jobs:
         run: echo "$(dirname "$(rustup which cargo)")" >> "$GITHUB_PATH"
       - name: Install workspace dependencies
         run: bun install --frozen-lockfile
+      - name: Build native addon
+        if: ${{ inputs.suite == 'profile-stability' }}
+        run: bun run build:native
+      - name: Profile twice and compare top self-time functions (AC1a.3)
+        if: ${{ inputs.suite == 'profile-stability' }}
+        run: |
+          set -euo pipefail
+          mkdir -p profile-stability
+          uptime | tee profile-stability/load-before.txt
+          bun run bench:profile -- --scenario all --out profile-stability/run1 | tee profile-stability/run1.log
+          bun run bench:profile -- --scenario all --out profile-stability/run2 --compare profile-stability/run1/report.json | tee profile-stability/run2.log
+          uptime | tee profile-stability/load-after.txt
+      - name: Upload profile stability evidence
+        if: ${{ always() && inputs.suite == 'profile-stability' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: profile-stability-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            profile-stability/*.log
+            profile-stability/*.txt
+            profile-stability/*/report.json
+            profile-stability/*/report.md
+          if-no-files-found: error
+          retention-days: 30
       - name: Run native benchmark A/B
+        if: ${{ inputs.suite != 'profile-stability' }}
         env:
           SUITE: ${{ inputs.suite }}
           BASE: ${{ inputs.base }}
         run: bun scripts/native-bench-ab.ts --suite "$SUITE" --base "$BASE" --allow-baseline-drift --json > native-bench-ab.json
       - name: Upload benchmark JSON
-        if: always()
+        if: ${{ always() && inputs.suite != 'profile-stability' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: native-bench-ab-${{ github.run_id }}-${{ github.run_attempt }}
