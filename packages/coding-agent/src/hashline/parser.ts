@@ -21,6 +21,7 @@ const LID_CAPTURE_RE = new RegExp(`^\\s*[>+\\-*]*\\s*${HL_HASH_CAPTURE_RE_RAW}(?
 const regexEscape = (str: string): string => str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 const BARE_LINE_REF_RE = /^\s*[>+\-*]*\s*([1-9]\d*)(?:\s*(?:-|\.\.)\s*([1-9]\d*))?\s*$/;
+const HASH_ONLY_REF_RE = /^\s*[>+\-*]*\s*([a-z]{2})\s*$/i;
 
 /**
  * An op referenced lines by number alone, without the content hash. The edit
@@ -49,6 +50,13 @@ function parseLid(raw: string, lineNum: number): Anchor {
 				`line ${lineNum}: anchor ${JSON.stringify(raw.trim())} is missing its hash; ` +
 					`use the full anchor such as ${describeAnchorExamples(String(start))}.`,
 				{ start: Math.min(start, end), end: Math.max(start, end) },
+			);
+		}
+		const hashOnly = HASH_ONLY_REF_RE.exec(raw);
+		if (hashOnly) {
+			throw new Error(
+				`line ${lineNum}: anchor ${JSON.stringify(raw.trim())} is missing the line number. ` +
+					`The anchor must include both line number and hash, such as ${describeAnchorExamples()}.`,
 			);
 		}
 		throw new Error(

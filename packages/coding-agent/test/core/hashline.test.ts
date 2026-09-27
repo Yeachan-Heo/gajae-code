@@ -450,7 +450,7 @@ describe("hashline — hash-less line references", () => {
 	});
 
 	it("still reports other malformed anchors as plain parse errors", () => {
-		expect(() => parseHashline(`≔sr\n${pl("x")}`)).toThrow(/expected a full anchor/);
+		expect(() => parseHashline(`≔sr\n${pl("x")}`)).toThrow(/missing the line number/);
 		expect(() => parseHashline(`≔sr\n${pl("x")}`)).not.toThrow(HashlineMissingHashError);
 	});
 
@@ -498,6 +498,66 @@ describe("hashline — hash-less line references", () => {
 			await Bun.write(path.join(tempDir, "a.ts"), "one\ntwo\n");
 			const run = executeHashlineSingle(hashlineExecuteOptions(tempDir, `§a.ts\n≔40\n${pl("X")}\n`));
 			await expect(run).rejects.toThrow("The edit was NOT applied. Line 40 does not exist (a.ts has 3 lines).");
+		});
+	});
+
+	describe("diagnostic messages for malformed anchors", () => {
+		it("provides actionable diagnostic for bare single line number anchor", () => {
+			expect(() => parseHashline(`≔47\n${pl("x")}`)).toThrow(/anchor "47" is missing its hash/);
+			expect(() => parseHashline(`≔47\n${pl("x")}`)).toThrow(HashlineMissingHashError);
+		});
+
+		it("provides actionable diagnostic for bare range with .. separator", () => {
+			expect(() => parseHashline(`≔22..23\n${pl("x")}`)).toThrow(/anchor "22\.\.23" is missing its hash/);
+			expect(() => parseHashline(`≔22..23\n${pl("x")}`)).toThrow(HashlineMissingHashError);
+		});
+
+		it("provides actionable diagnostic for bare range with - separator", () => {
+			expect(() => parseHashline(`≔24-27\n${pl("x")}`)).toThrow(/anchor "24-27" is missing its hash/);
+			expect(() => parseHashline(`≔24-27\n${pl("x")}`)).toThrow(HashlineMissingHashError);
+		});
+
+		it("provides actionable diagnostic for hash-only anchor", () => {
+			expect(() => parseHashline(`≔sr\n${pl("x")}`)).toThrow(/anchor "sr" is missing the line number/);
+			expect(() => parseHashline(`≔sr\n${pl("x")}`)).not.toThrow(HashlineMissingHashError);
+		});
+
+		it("provides actionable diagnostic for hash-only anchor with lowercase", () => {
+			expect(() => parseHashline(`«ab\n${pl("x")}`)).toThrow(/anchor "ab" is missing the line number/);
+		});
+
+		it("provides actionable diagnostic for hash-only anchor with uppercase", () => {
+			expect(() => parseHashline(`»YY\n${pl("x")}`)).toThrow(/anchor "YY" is missing the line number/);
+		});
+
+		it("file is NOT modified when bare line anchor error is thrown", async () => {
+			await withTempDir(async tempDir => {
+				const filePath = path.join(tempDir, "test.ts");
+				const original = "line 1\nline 2\nline 3\n";
+				await Bun.write(filePath, original);
+
+				const input = `§test.ts\n≔2\n${pl("MODIFIED")}\n`;
+				const run = executeHashlineSingle(hashlineExecuteOptions(tempDir, input));
+				await expect(run).rejects.toThrow(/missing its hash/);
+
+				const contents = await Bun.file(filePath).text();
+				expect(contents).toBe(original);
+			});
+		});
+
+		it("file is NOT modified when hash-only anchor error is thrown", async () => {
+			await withTempDir(async tempDir => {
+				const filePath = path.join(tempDir, "test.ts");
+				const original = "line 1\nline 2\nline 3\n";
+				await Bun.write(filePath, original);
+
+				const input = `§test.ts\n≔sr\n${pl("MODIFIED")}\n`;
+				const run = executeHashlineSingle(hashlineExecuteOptions(tempDir, input));
+				await expect(run).rejects.toThrow(/missing the line number/);
+
+				const contents = await Bun.file(filePath).text();
+				expect(contents).toBe(original);
+			});
 		});
 	});
 });
