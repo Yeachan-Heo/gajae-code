@@ -24,6 +24,7 @@ interface HopMessage {
 	};
 	env: Record<string, string>;
 	stdio: "ignore" | number;
+	cwd?: string;
 }
 
 export async function runBrokerHopFromArgv(argv: string[]): Promise<void> {
@@ -42,7 +43,7 @@ export async function runBrokerHopFromArgv(argv: string[]): Promise<void> {
 		process.exit(1);
 	}
 
-	if (!message.command || !message.command.file || !Array.isArray(message.command.args)) {
+	if (!message.command?.file || !Array.isArray(message.command.args)) {
 		process.stderr.write("gjc: broker hop message missing command\n");
 		process.exit(1);
 	}
@@ -60,7 +61,9 @@ export async function runBrokerHopFromArgv(argv: string[]): Promise<void> {
 			windowsHide: true,
 			stdio: ["ignore", "ignore", stdioArg],
 			env: message.env,
+			...(message.cwd ? { cwd: message.cwd } : {}),
 		});
+		child.unref();
 
 		if (child.pid === undefined) {
 			process.stderr.write("gjc: broker hop spawn succeeded but child pid unavailable\n");
@@ -69,7 +72,7 @@ export async function runBrokerHopFromArgv(argv: string[]): Promise<void> {
 
 		// Write the real broker pid to stdout as JSON and exit immediately.
 		// The parent process reads this line to learn the real broker's pid.
-		process.stdout.write(JSON.stringify({ pid: child.pid }) + "\n");
+		process.stdout.write(`${JSON.stringify({ pid: child.pid })}\n`);
 		process.exit(0);
 	} catch (error) {
 		process.stderr.write(`gjc: broker hop spawn failed: ${error instanceof Error ? error.message : String(error)}\n`);
