@@ -4,11 +4,19 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { type BrokerDiscovery, isPidAlive } from "../src/sdk/broker/discovery";
-import { brokerOwnerIdentityMatchesForTest, reapSpawnedBrokerForTest } from "../src/sdk/broker/ensure";
+import {
+	BrokerHopError,
+	brokerOwnerIdentityMatchesForTest,
+	parseBrokerHopReply,
+	reapSpawnedBrokerForTest,
+} from "../src/sdk/broker/ensure";
 
 const HOP_ENTRY = path.join(import.meta.dir, "..", "src", "sdk", "broker", "hop.ts");
 
-async function runHop(message: unknown): Promise<{ hop: ChildProcess; stdout: string; code: number | null }> {
+async function runHop(
+	message: unknown,
+	env: NodeJS.ProcessEnv = process.env,
+): Promise<{ hop: ChildProcess; stdout: string; code: number | null }> {
 	const hop = spawn(
 		process.execPath,
 		[
@@ -16,7 +24,7 @@ async function runHop(message: unknown): Promise<{ hop: ChildProcess; stdout: st
 			`import(${JSON.stringify(HOP_ENTRY)}).then(m => m.runBrokerHopFromArgv(process.argv.slice(1)))`,
 			JSON.stringify(message),
 		],
-		{ stdio: ["ignore", "pipe", "pipe"] },
+		{ stdio: ["ignore", "pipe", "pipe"], env },
 	);
 	let stdout = "";
 	hop.stdout?.on("data", chunk => {
@@ -68,12 +76,7 @@ describe("SDK broker hop protocol", () => {
 	});
 
 	test("hop reports a live detached broker pid that outlives the hop, and reap targets that pid", async () => {
-		const { hop, stdout, code } = await runHop({
-			command: { file: "sleep", args: ["30"] },
-			env: { PATH: process.env.PATH ?? "" },
-			stdio: "ignore",
-			cwd: tempDir,
-		});
+		const { hop, stdout, code } = await runHop({ command: { file: "sleep", args: ["30"] }, cwd: tempDir });
 		expect(code).toBe(0);
 		const reported = JSON.parse(stdout.trim()) as { pid: number };
 		expect(Number.isInteger(reported.pid)).toBe(true);
@@ -88,13 +91,41 @@ describe("SDK broker hop protocol", () => {
 	});
 
 	test("hop exits non-zero without a pid when the broker command cannot be spawned", async () => {
-		const { stdout, code } = await runHop({
-			command: { file: path.join(tempDir, "missing-broker"), args: [] },
-			env: {},
-			stdio: "ignore",
-		});
+		const { stdout, code } = await runHop({ command: { file: path.join(tempDir, "missing-broker"), args: [] } });
 		expect(stdout.trim()).toBe("");
 		expect(code).not.toBe(0);
+	});
+
+	test("broker inherits the hop environment and writes stderr to the log path (no fd numbers, no env on argv)", async () => {
+		const logPath = path.join(tempDir, "broker-spawn.log");
+		const marker = `SECRET_${randomUUID()}`;
+		const message = {
+			command: { file: "sh", args: ["-c", 'echo "$GJC_HOP_TEST_VALUE" >&2'] },
+			stderrLogPath: logPath,
+		};
+		expect(JSON.stringify(message)).not.toContain(marker);
+		const { stdout, code } = await runHop(message, { ...process.env, GJC_HOP_TEST_VALUE: marker });
+		expect(code).toBe(0);
+		const { pid } = JSON.parse(stdout.trim()) as { pid: number };
+		const deadline = Date.now() + 5_000;
+		while (isPidAlive(pid) && Date.now() < deadline) await Bun.sleep(20);
+		expect((await fs.readFile(logPath, "utf8")).trim()).toBe(marker);
+	});
+
+	test("parseBrokerHopReply accepts only a positive integer pid from a clean exit", () => {
+		expect(parseBrokerHopReply(0, '{"pid":4321}\n')).toEqual({ realBrokerPid: 4321, error: undefined });
+		for (const [code, stdout] of [
+			[1, '{"pid":4321}'],
+			[0, ""],
+			[0, "not json"],
+			[0, '{"pid":"4321"}'],
+			[0, '{"pid":0}'],
+			[0, '{"pid":1.5}'],
+		] as const) {
+			const parsed = parseBrokerHopReply(code, stdout);
+			expect(parsed.realBrokerPid).toBeUndefined();
+			expect(parsed.error).toBeInstanceOf(BrokerHopError);
+		}
 	});
 
 	test("hop failure produces typed BrokerHopError", async () => {
@@ -113,16 +144,6 @@ describe("SDK broker hop protocol", () => {
 		expect(error.hopExitCode).toBe(1);
 		expect(error.hopStdout).toBe("invalid json");
 		expect(error.reason).toBe("test hop failure");
-	});
-
-	test("hop protocol validates pid response is numeric", () => {
-		// Test that hop response validation requires numeric pid
-		// Invalid response without pid should produce error
-		const invalidResponses = [{}, { pid: "not-a-number" }, { pid: NaN }, { pid: Infinity }, { pid: {} }];
-
-		for (const response of invalidResponses) {
-			expect(typeof response.pid === "number" && Number.isFinite(response.pid)).toBe(false);
-		}
 	});
 
 	test("broker owner identity matching requires exact pid and incarnation", () => {
