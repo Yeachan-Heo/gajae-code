@@ -1997,6 +1997,11 @@ function manualLockCleanupCommand(lockPath: string): string {
  * Remove an empty lock directory (no info file) after its identity is verified.
  * Empty directories can result from a release/removal that deleted the info file
  * but left the directory. If the root identity matches, the directory is safe to remove.
+ *
+ * To avoid TOCTOU races where a concurrent reclaimer creates a successor lock
+ * after we verify the directory is empty but before we delete it, we atomically
+ * rename the directory to a unique tombstone name first, then re-verify its identity,
+ * then remove only the tombstone. If the rename fails or identity changes, we fail closed.
  */
 async function removeEmptyFileLockDir(
 	lockDir: string,
@@ -2028,16 +2033,66 @@ async function removeEmptyFileLockDir(
 	}
 	if (infoExists) return "owner_changed";
 
-	// For empty directories without an owner token, always use standard removal (fs.rm)
-	// to avoid leaving behind detached paths that cannot be cleaned up without an owner token.
-	// Standard removal is safe for empty directories and doesn't create removal transitions.
+	// Atomically rename to a unique tombstone name to bind removal to this exact directory.
+	// If a concurrent process creates a successor at the original path, the rename fails and
+	// we fail closed. If the rename succeeds, the original path is no longer occupied,
+	// so we can safely re-verify and remove only the tombstone.
+	const tombstonePath = `${lockDir}.removing-${crypto.randomUUID()}`;
 	try {
-		await fs.rm(lockDir, { recursive: true, force: true });
-		return "removed";
+		await fs.rename(lockDir, tombstonePath);
+	} catch (error) {
+		// Rename failed; this could mean:
+		// - The directory was already removed by another process
+		// - A new directory was created at the same path by a concurrent reclaimer
+		// - Some other filesystem error occurred
+		// In all cases, fail closed: we cannot safely assume the removal succeeded.
+		if (isEnoent(error)) return "removed";
+		if (isTransientReleaseError(error)) throw error;
+		return "owner_changed";
+	}
+
+	// Re-verify the tombstone still has the expected identity and is still empty.
+	// If identity changed, a successor was created; fail closed.
+	let tombstoneRoot: BigIntStats;
+	try {
+		tombstoneRoot = await fs.lstat(tombstonePath, { bigint: true });
 	} catch (error) {
 		if (isEnoent(error)) return "removed";
 		if (isTransientReleaseError(error)) throw error;
 		return "cleanup_failed";
+	}
+
+	// Verify identity still matches
+	if (
+		!tombstoneRoot.isDirectory() ||
+		tombstoneRoot.isSymbolicLink() ||
+		String(tombstoneRoot.dev) !== expected.rootDev ||
+		String(tombstoneRoot.ino) !== expected.rootIno
+	) {
+		// Identity mismatch; fail closed and leave the tombstone for manual cleanup
+		return "owner_changed";
+	}
+
+	// Verify the tombstone is still empty (no info file)
+	try {
+		await fs.lstat(path.join(tombstonePath, "info"), { bigint: true });
+		// Info file exists; another process created it after we renamed
+		return "owner_changed";
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+	}
+
+	// Safe to remove the verified tombstone. Use non-recursive removal so that if
+	// the directory is no longer empty (e.g., due to a race), removal fails.
+	try {
+		await fs.rmdir(tombstonePath);
+		return "removed";
+	} catch (error) {
+		if (isEnoent(error)) return "removed";
+		// ENOTEMPTY or EACCES: directory is no longer empty or we lack permission
+		// Fail closed by returning owner_changed
+		if (isTransientReleaseError(error)) throw error;
+		return "owner_changed";
 	}
 }
 
