@@ -1,362 +1,205 @@
 # @gajae-code/utils
 
-Shared utilities for Gajae-Code packages. Provides logging, path management, crash reporting, formatting, and other common utilities used across the monorepo.
+Shared utilities for the gajae-code packages: logging, config and data paths, environment access, formatting, streams, process management, file helpers, and crash reporting.
 
-## Installation
+Everything below is exported from the package root (`@gajae-code/utils`). A few modules are exported as namespaces; see [Namespaces](#namespaces).
 
-```bash
-bun add @gajae-code/utils
-```
+## Logger
 
-## Quick Start
-
-```typescript
-import { logger, getProjectDir, formatDuration, formatNumber } from "@gajae-code/utils";
-
-// Configure logger (e.g., for headless services)
-logger.setTransports({ console: true });
-
-logger.info("Application started", { version: "1.0.0" });
-logger.debug("Debug info", { context: "auth" });
-
-// Path utilities
-const projectDir = getProjectDir();
-console.log("Project directory:", projectDir);
-
-// Formatting helpers
-console.log(formatDuration(1500));      // "1.5s"
-console.log(formatNumber(1234567));     // "1,234,567"
-```
-
-## Modules
-
-### Logger (`logger`)
-
-Centralized logging with file rotation. **No console output by default** — writing to stdout/stderr would corrupt the TUI rendering. Exported as a namespace.
+The logger is exported as the `logger` namespace. By default it writes JSON lines to a rotating file, `gjc.<YYYY-MM-DD>.log` in the logs directory (`~/.gjc/logs`, or `GJC_LOG_DIR`). It writes nothing to stdout or stderr, because console output would corrupt the TUI.
 
 ```typescript
 import { logger } from "@gajae-code/utils";
 
-// Default: rotating file at ~/.gjc/logs/gjc.<DATE>.log
 logger.info("Server started", { port: 3847 });
-
-// For headless services (auth broker, etc.) that need console output
-logger.setTransports({ console: true });
-
-// Log levels: "error" | "warn" | "info" | "debug"
-logger.error("Connection failed", { error: err.message });
 logger.warn("Retrying", { attempt: 3 });
-logger.debug("Request details", { url, headers });
+logger.error("Connection failed", { error: "ECONNRESET" });
+logger.debug("Request details", { url: "https://example.com" });
+
+// Long-running headless services can log to the console instead of the file.
+logger.setTransports({ console: true, file: false });
 ```
 
-**Key features:**
-- Automatic log rotation (daily, max 30 files)
-- JSON structured logging with `pid`, `timestamp`, `level`
-- Buffered logs before initialization (capped at 10,000 entries)
-- AsyncLocalStorage context for correlation IDs
+- Levels: `error`, `warn`, `info`, `debug`. Each record includes `timestamp`, `level`, `pid`, `message`, and the context fields.
+- Rotation: daily files, rotated again at 10 MB, gzipped, and at most 5 kept.
+- Records written before the logger finishes loading are buffered, up to 10,000.
+- `logger.time(op, fn)`, `logger.startTiming()`, `logger.endTiming()`, and `logger.printTimings()` record nested timing spans.
 
-### Paths & Directories (`dirs`)
-
-Centralized path helpers for config directories with XDG compliance.
+## Paths (`dirs`)
 
 ```typescript
 import {
-  getConfigDir,
+  APP_NAME,
+  CONFIG_DIR_NAME,
+  getAgentDir,
+  getConfigRootDir,
+  getEffectiveLogsDir,
   getLogsDir,
   getProjectDir,
-  getSessionDir,
-  getTmpDir,
-  CONFIG_DIR_NAME,
-  APP_NAME,
-  getEffectiveLogsDir,
+  getSessionsDir,
 } from "@gajae-code/utils";
 
-// ~/.gjc (or XDG-compliant location)
-const configDir = getConfigDir();
+APP_NAME; // "gjc"
+CONFIG_DIR_NAME; // ".gjc"
 
-// ~/.gjc/logs
-const logsDir = getLogsDir();
-
-// Project-specific directory
-const projectDir = getProjectDir(); // e.g., /home/user/project/.gjc
-
-// Temporary directory
-const tmpDir = getTmpDir();
+getConfigRootDir(); // config root, ~/.gjc by default
+getAgentDir(); // agent directory under the config root
+getSessionsDir(); // session logs in the agent directory
+getLogsDir(); // ~/.gjc/logs
+getEffectiveLogsDir(); // where the logger actually writes (honors a trusted GJC_LOG_DIR)
+getProjectDir(); // the current project directory (process.cwd() unless setProjectDir() changed it)
 ```
 
-**Environment variables:**
+The module has more path getters for agent state (`getPluginsDir`, `getMemoriesDir`, `getCrashLogPath`, `getMCPConfigPath`, and others). They are all in `src/dirs.ts`.
+
+Environment variables read by `dirs`:
+
 | Variable | Purpose |
 |----------|---------|
-| `GJC_CONFIG_DIR` | Override config root (legacy: `PI_CONFIG_DIR`) |
-| `GJC_CODING_AGENT_DIR` | Override agent directory |
-| `XDG_DATA_HOME` | XDG data directory (Linux) |
-| `XDG_STATE_HOME` | XDG state directory (Linux) |
-| `XDG_CACHE_HOME` | XDG cache directory (Linux) |
+| `GJC_CONFIG_DIR` | Config directory name (legacy `PI_CONFIG_DIR`) |
+| `GJC_CODING_AGENT_DIR` | Agent directory override (legacy `PI_CODING_AGENT_DIR`) |
+| `GJC_LOG_DIR` | Log directory override |
+| `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME` | XDG base directories |
 
-### Async Utilities (`async`)
+## Environment (`env`)
 
 ```typescript
-import { withTimeout } from "@gajae-code/utils";
+import { $env, $flag, $pickenv, parseEnvFile } from "@gajae-code/utils";
 
-// Wrap a promise with timeout
-const result = await withTimeout(fetchData(), 5000, "Operation timed out");
-
-// With abort signal
-const result = await withTimeout(promise, 3000, "Timeout", signal);
+const home = $env.HOME;
+const apiKey = $pickenv("ANTHROPIC_API_KEY", "OPENAI_API_KEY"); // first non-empty value
+const verbose = $flag("GJC_VERBOSE"); // boolean flag, false when unset
+const fromFile = parseEnvFile(".env"); // reads and parses the file at this path
 ```
 
-### Crash Reporting (`crash-fingerprint`, `crash-journal`, `crash-redaction`)
-
-Structured crash reporting with fingerprinting and PII redaction.
+## Formatting (`format`)
 
 ```typescript
 import {
-  computeCrashFingerprint,
-  appendCrashEvent,
-  redactCrashSecrets,
-} from "@gajae-code/utils";
-
-try {
-  await riskyOperation();
-} catch (error) {
-  // Generate stable fingerprint for deduplication
-  const fingerprint = computeCrashFingerprint(error);
-  console.log("Crash fingerprint:", fingerprint); // e.g., "a1b2c3d4"
-
-  // Record to crash journal
-  await appendCrashEvent({
-    fingerprint,
-    message: error.message,
-    stack: error.stack,
-    provenance: "product",
-    timestamp: Date.now(),
-  });
-
-  // Redact sensitive data before sending
-  const safeReport = redactCrashSecrets(error.stack);
-}
-```
-
-### Environment (`env`, `env-file`)
-
-Environment variable parsing with validation and `.env` file support.
-
-```typescript
-import {
-  parseEnvFile,
-  parseShellEnvFile,
-  isValidEnvName,
-  $pickenv,
-  $pickflag,
-} from "@gajae-code/utils";
-
-// Parse .env file
-const env = parseEnvFile(await fs.readFile(".env", "utf-8"));
-
-// Parse shell-style .env
-const shellEnv = parseShellEnvFile(".env");
-
-// Validate env name
-if (isValidEnvName("MY_VAR")) { /* ... */ }
-
-// Pick from Bun.env with fallback
-const apiKey = $pickenv("ANTHROPIC_API_KEY", "OPENAI_API_KEY");
-```
-
-### Formatting (`format`)
-
-```typescript
-import {
+  formatAge,
+  formatBytes,
+  formatCount,
   formatDuration,
   formatNumber,
-  formatBytes,
   formatPercent,
-  truncate,
-  formatCount,
-  formatAge,
   pluralize,
+  truncate,
 } from "@gajae-code/utils";
 
-formatDuration(1500);           // "1.5s"
-formatDuration(123456789);      // "1d 10h"
-formatNumber(1234567);          // "1,234,567"
-formatBytes(1024 * 1024);       // "1.00 MB"
-formatPercent(0.1234);          // "12.34%"
-truncate("Hello World", 8);     // "Hello…"
-formatCount("request", 42);     // "42 requests"
-formatAge(3661);                // "1h 1m"
-pluralize("item", 5);           // "items"
+formatDuration(1500); // "1.5s"
+formatDuration(123456789); // "1d10h"
+formatNumber(12345); // "12K"
+formatNumber(1234567); // "1.2M"
+formatBytes(1024 * 1024); // "1.0MB"
+formatPercent(0.1234); // "12.3%"
+truncate("Hello World", 8); // "Hello W…"
+formatCount("request", 42); // "42 requests"
+formatAge(3661); // "1h ago" (argument in seconds)
+pluralize("item", 5); // "items"
 ```
 
-### Stream Utilities (`stream`, `abortable`)
+## Async and streams
 
 ```typescript
-import {
-  readLines,
-  readJsonl,
-  parseJsonlLenient,
-  createAbortableStream,
-  once,
-  untilAborted,
-} from "@gajae-code/utils";
+import { createAbortableStream, readJsonl, readLines, withTimeout } from "@gajae-code/utils";
 
-// Read lines from stream
-for await (const line of readLines(stream)) {
-  console.log(line);
-}
+// Rejects with the message if the promise does not settle within 5 s.
+const response = await withTimeout(fetch("https://example.com"), 5000, "request timed out");
 
-// Read JSONL
-for await (const obj of readJsonl(stream)) {
-  process(obj);
-}
-
-// Abortable stream
-const { stream: abortable, abort } = createAbortableStream(sourceStream);
-abort(); // triggers abort signal
-
-// Wait for single event
-const event = await once(emitter, "data");
-
-// Stream until aborted
-for await (const chunk of untilAborted(stream, signal)) {
-  process(chunk);
+// readLines yields each line as bytes; readJsonl yields parsed values.
+const body = createAbortableStream(response.body!, AbortSignal.timeout(10_000));
+for await (const line of readLines(body)) {
+  console.log(new TextDecoder().decode(line));
 }
 ```
 
-### Process Management (`ptree`, `procmgr`)
+`readJsonl`, `readSseJson`, `readSseEvents`, and `parseJsonlLenient` cover JSONL and server-sent event streams.
+
+## Processes
+
+Process helpers are exported through the `ptree` and `procmgr` namespaces. The error classes `AbortError`, `ChildProcess`, `Exception`, and `NonZeroExitError` are also exported at the root.
 
 ```typescript
-import { spawn, exec, ChildProcess, AbortError } from "@gajae-code/utils";
-import { isPidRunning, onProcessExit } from "@gajae-code/utils";
+import { procmgr, ptree } from "@gajae-code/utils";
 
-// Spawn with proper signal handling
-const child = spawn("bun", ["run", "script.ts"], {
-  stdio: "inherit",
-  signal: AbortSignal.timeout(30000),
-});
+const result = await ptree.exec(["git", "status", "--short"]);
+if (result.ok) console.log(result.stdout);
 
-// Execute and get result
-const result = await exec(["bun", "run", "build"]);
+const child = ptree.spawn(["bun", "--version"]);
+procmgr.isPidRunning(child.pid);
+```
 
-// Process utilities
-if (await isPidRunning(pid)) {
-  await onProcessExit(pid);
+## Files
+
+```typescript
+import { globPaths, peekFile, TempDir, tryParseJson } from "@gajae-code/utils";
+
+// Glob relative to cwd (defaults to getProjectDir()), with exclusions.
+const sources = await globPaths("src/**/*.ts", { cwd: process.cwd(), exclude: ["**/*.test.ts"] });
+
+// Read only the first bytes of a file.
+const header = await peekFile("package.json", 64, bytes => new TextDecoder().decode(bytes));
+
+// A temporary directory that is removed when the scope exits.
+await using tmp = await TempDir.create("my-tool-");
+console.log(tmp.path());
+
+const parsed = tryParseJson<{ name: string }>("{\"name\":\"gjc\"}"); // null on invalid JSON
+```
+
+## Errors
+
+```typescript
+import { isDesignedError, isEnoent, markDesignedError, safeErrorDescription, toError } from "@gajae-code/utils";
+
+try {
+  await Bun.file("missing.txt").text();
+} catch (error) {
+  if (isEnoent(error)) console.log("not found");
+  console.log(safeErrorDescription(error)); // a string for any thrown value
 }
+
+const expected = markDesignedError(new Error("user cancelled"));
+isDesignedError(expected); // true
+toError("plain string"); // wraps non-Error values in an Error
 ```
 
-### Glob & File Utilities (`glob`, `peek-file`, `temp`)
+`isEacces`, `isEisdir`, `isEnotdir`, `isEexist`, `isEnotempty`, and `hasFsCode` classify other filesystem errors.
 
-```typescript
-import { globPaths, loadGitignorePatterns } from "@gajae-code/utils";
-import { peekFile, peekFileSync } from "@gajae-code/utils";
-import { TempDir } from "@gajae-code/utils";
+## Other modules
 
-// Fast glob matching with gitignore support
-const files = await globPaths("src/**/*.ts", { cwd: projectDir });
-
-// Peek at file without reading entirely
-const firstBytes = await peekFile("large.log", 1024, header => header);
-
-// Temporary directory (auto-cleanup on scope exit)
-using tempDir = new TempDir("my-app-");
-console.log(tempDir.path);
-```
-
-### Text & Sanitization (`sanitize-text`, `frontmatter`, `tab-spacing`)
-
-```typescript
-import { sanitizeText, sanitizeDisplayLine } from "@gajae-code/utils";
-import { parseFrontmatter, FrontmatterError } from "@gajae-code/utils";
-import { getDefaultTabWidth, setDefaultTabWidth } from "@gajae-code/utils";
-
-// Sanitize for display (no tabs, safe for TUI)
-const safe = sanitizeText(userInput);
-
-// Sanitize single display line
-const line = sanitizeDisplayLine(userInput);
-
-// Parse YAML frontmatter
-const { data, content } = parseFrontmatter("---\ntitle: Test\n---\nBody");
-
-// Tab width configuration
-console.log(getDefaultTabWidth()); // 3
-setDefaultTabWidth(4);
-```
-
-### Error Handling (`safe-error`, `error-classification`, `fs-error`)
-
-```typescript
-import { safeErrorDescription } from "@gajae-code/utils";
-import { isDesignedError, markDesignedError } from "@gajae-code/utils";
-import { isFsError, isEnoent, isEacces } from "@gajae-code/utils";
-
-// Safe error description for unknown values
-const desc = safeErrorDescription(unknownError);
-
-// Mark/identify designed errors
-const error = markDesignedError(new Error("expected"));
-if (isDesignedError(error)) { /* ... */ }
-
-// File system error classification
-if (isEnoent(err)) { /* file not found */ }
-if (isEacces(err)) { /* permission denied */ }
-```
-
-### Miscellaneous Utilities
-
-| Module | Key Exports |
-|--------|-------------|
+| Module | Main exports |
+|--------|--------------|
 | `color` | `hexToRgb`, `rgbToHex`, `hsvToRgb`, `adjustHsv` |
-| `fetch-retry` | `fetchWithRetry`, `isRetryableError`, `extractRetryHint` |
-| `fs-error` | `isFsError`, `isEnoent`, `isEacces`, `isEisdir` |
-| `header-value` | `sanitizeHeaderComponent` |
-| `hook-fetch` | `hookFetch`, `FetchHandler` |
-| `json` | `tryParseJson` |
-| `mermaid-ascii` | `renderMermaidAscii`, `extractMermaidBlocks` |
-| `mime` | `parseImageMetadata`, `readImageMetadata` |
-| `peek-file` | `peekFile`, `peekFileSync` |
-| `safe-stderr` | `safeStderrWrite` |
-| `snowflake` | `Snowflake` (unique ID generator) |
+| `crash-fingerprint`, `crash-journal`, `crash-redaction` | `computeCrashFingerprint`, `appendCrashEvent`, `redactCrashSecrets` |
+| `fetch-retry` | `fetchWithRetry` |
+| `frontmatter` | `parseFrontmatter` (returns `{ frontmatter, body }`), `FrontmatterError` |
+| `mermaid-ascii` | `renderMermaidAscii` |
+| `sanitize-text` | `sanitizeText`, `sanitizeDisplayLine` |
+| `snowflake` | `Snowflake` (sortable ID helpers) |
+| `tab-spacing` | `getDefaultTabWidth` (3 by default), `setDefaultTabWidth` |
 | `type-guards` | `isRecord`, `asRecord`, `toError` |
-| `which` | `$which` (find executable) |
-| `broken-pipe` | `isBrokenPipeError`, `createProcessStdoutEpipeClassifier` |
+| `which` | `$which` |
 
-### Namespace Exports
+## Namespaces
 
-These modules are exported as namespaces — access their members via dot notation:
+These modules are exported as namespaces rather than as flat names:
 
-```typescript
-import { logger, postmortem, procmgr, prompt, ptree } from "@gajae-code/utils";
+| Namespace | Contents |
+|-----------|----------|
+| `logger` | Logging and timing spans |
+| `postmortem` | Crash recording |
+| `procmgr` | Process liveness and exit helpers |
+| `prompt` | Prompt helpers |
+| `ptree` | `spawn`, `exec`, and the child-process classes |
 
-// logger: logger.info(), logger.setTransports(), logger.error(), ...
-// postmortem: postmortem.record(), postmortem.CrashJournal, ...
-// procmgr: procmgr.isPidRunning(), procmgr.onProcessExit()
-// prompt: prompt.*, ...
-// ptree: ptree.spawn(), ptree.exec(), ptree.ChildProcess, ...
-```
-
-### Additional Exports
-
-- `structuredCloneJSON` — Deep clone with fallback to JSON
-- `postmortem` namespace — Crash reporting internals
-- `prompt` namespace — Prompt utilities
-
-## Testing
+## Development
 
 ```bash
-# Run all tests
+cd packages/utils
+bun run check   # Biome + tsc
 bun test
-
-# Run specific test
-bun test test/logger.test.ts
 ```
-
-## Contributing
-
-This package follows the monorepo conventions:
-- Run `bun run check` before committing
-- Add tests for new utilities
-- Update this README when adding new exports
 
 ## License
 
