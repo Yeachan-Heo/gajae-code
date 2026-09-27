@@ -74,11 +74,13 @@ test("Phase 3 highlight output matches the synced multi-language golden and expl
 	for (const divergence of acceptedDivergences.divergences) {
 		expect(divergence.reason.length).toBeGreaterThan(0);
 		expect(divergence.upstreamRationale.length).toBeGreaterThan(0);
-		expect(divergence.changelog).toBe("packages/natives/changelog.d/rust-porting-phase3-highlight.md");
+		expect(divergence.changelog).toBe("packages/natives/CHANGELOG.md");
 		expect(divergence.testsUpdated).toBe("packages/natives/test/phase3-highlight-golden.test.ts");
 	}
-	const changelog = await readFile(`${import.meta.dir}/../changelog.d/rust-porting-phase3-highlight.md`, "utf8");
-	expect(changelog.trim().length).toBeGreaterThan(0);
+	const changelog = await readFile(`${import.meta.dir}/../CHANGELOG.md`, "utf8");
+	expect(changelog).toContain(
+		"Add the pinned upstream Julia, Nix, Mermaid, TypeScript, TSX, and Astro syntax grammars.",
+	);
 }, 20_000);
 
 test("Phase 3 bundled syntaxes expose their language aliases", () => {

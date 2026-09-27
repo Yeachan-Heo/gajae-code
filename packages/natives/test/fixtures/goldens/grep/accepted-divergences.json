@@ -6,7 +6,7 @@
       "caseId": "pcre2-lookahead",
       "reason": "Pinned upstream PCRE2 fallback accepts positive lookahead, so this pattern now returns fixture matches instead of the pre-sync regex parse error.",
       "upstreamRationale": "grep.rs compiles with grep-regex first and falls back to grep-pcre2 for lookaround and backreference syntax that Rust regex does not support.",
-      "changelog": "packages/natives/changelog.d/rust-porting-phase-2-5-grep.md",
+      "changelog": "packages/natives/CHANGELOG.md",
       "testsUpdated": true,
       "expected": {
         "totalMatches": 217,

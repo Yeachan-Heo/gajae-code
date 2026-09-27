@@ -48,11 +48,9 @@ describe("pdf native differential", () => {
 				const divergence = acceptedById.get(fixture.id);
 				if (!divergence) throw new Error(`Unaccepted PDF Markdown divergence: ${fixture.id}`);
 				expect(divergence.reason.trim().length).toBeGreaterThan(0);
-				expect(
-					await Bun.file(
-						path.resolve(import.meta.dir, "../../coding-agent/changelog.d/pdf-inspector.md"),
-					).exists(),
-				).toBe(true);
+				expect(await Bun.file(path.resolve(import.meta.dir, "../../coding-agent/CHANGELOG.md")).text()).toContain(
+					"PDF Markdown now preserves explicit page markers and groups adjacent text runs.",
+				);
 			}
 			expect(actual.markdown).toContain("<!-- Page 1 -->");
 			if (fixture.id === "pdf-two-pages") expect(actual.markdown).toContain("<!-- Page 2 -->");

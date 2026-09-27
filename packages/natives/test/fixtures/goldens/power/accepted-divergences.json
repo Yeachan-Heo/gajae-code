@@ -6,8 +6,8 @@
 			"postSync": "The class is exported as PowerAssertion and its existing GJC caller uses the new native name.",
 			"reason": "Adopted the pinned upstream cross-platform API; no compatibility alias is retained.",
 			"changelog": [
-				"packages/natives/changelog.d/rust-porting-phase-3-power.md",
-				"packages/coding-agent/changelog.d/cross-platform-power-assertions.md"
+				"packages/natives/CHANGELOG.md",
+				"packages/coding-agent/CHANGELOG.md"
 			]
 		},
 		{
@@ -16,8 +16,8 @@
 			"postSync": "Pinned upstream supports login1/ScreenSaver inhibition on Linux and thread-affine execution state on Windows; the existing lazy coding-agent consumer now uses those supported platforms.",
 			"reason": "Adopted as an upstream improvement that makes existing prevent-sleep settings effective on supported non-macOS platforms.",
 			"changelog": [
-				"packages/natives/changelog.d/rust-porting-phase-3-power.md",
-				"packages/coding-agent/changelog.d/cross-platform-power-assertions.md"
+				"packages/natives/CHANGELOG.md",
+				"packages/coding-agent/CHANGELOG.md"
 			]
 		}
 	]
