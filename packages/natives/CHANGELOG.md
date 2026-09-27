@@ -2,6 +2,69 @@
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-09-27
+
+### Added
+
+- Added the native Mermaid-to-ASCII renderer for flowcharts, sequence, class, ER, state, and XY chart diagrams.
+
+- Add the asynchronous `pdfToMarkdown` native binding backed by the MIT `pdf-inspector` dependency's default features, returning Markdown, document metadata, and pages needing OCR without bundling OCR engines.
+
+- The native power assertion is now exported as `PowerAssertion` and prevents sleep through macOS IOKit, Linux login1/desktop ScreenSaver, and Windows execution-state APIs, using a GJC identity and `power.start`/`power.stop` profile regions.
+
+- Full-language native AST support now includes Emacs Lisp and Fortran; default-language builds keep their existing language set and Perl remains gated by `full-langs`.
+- AST search/edit now accepts multi-node JSON pair patterns and collapses byte-identical rewrite edits, avoiding false overlap errors when patterns produce the same replacement.
+
+- Added lazy native diff exports for line runs, line changes, word changes, structured-patch hunks, and streaming diffs, backed by the pinned MIT-licensed `pi-diff` crate.
+
+- Add native SVG/SVGZ-to-PNG rasterization for bounded image previews.
+
+- Added the Unix-only `TtyWriter` N-API class, which queues UTF-8 output to a dedicated thread, tracks pending bytes, detects dead terminal fds, and supports bounded exit flushing.
+
+### Changed
+
+- Re-synced pi-shell output decoding with the pinned upstream implementation. UTF-8 remains preferred; Windows output switches to the system ANSI code page after invalid UTF-8. Local output budgets, truncation reporting, process cancellation, minimizer captures, and shell callbacks remain in place. Recorded shell-output goldens are checked in `phase3-shell-golden.test.ts`; shell builtin divergences are explicitly listed in `fixtures/goldens/accepted-divergences.json`.
+- Reconciled brush base builtins change-by-change while keeping `brush-builtins-vendored` as the shell's provider: `cd -P -e`, non-terminal `read -e`/`read -i`, symbolic umasks, `unset -n`, local `declare -I`, `jobs`, `enable`, multi-operand `command -v`/`-V`, completion diagnostics, and `mapfile -C`/`-c`. `true`, `false`, and `:` now have manual pages.
+- Deliberately not adopted: `history`, `pwd`, `hash`, `type`, `pushd`, `popd`, and `test` changes require a pi-vfs-backed async filesystem API that the local brush-core fork does not expose; pi-vfs remains internal to pi-shell. `fc` editor mode remains unavailable because the local pi-shell does not materialize brush history. The `exec` subshell-spawn change and upstream `kill`/`wait` expansions are not adopted because their newer process/job APIs do not preserve GJC's process-observation and cancellation contracts. Utility builtins remain excluded under the accepted D3 dependency decision.
+
+- Build the native addon with Rust `nightly-2026-08-12` and align shared Cargo dependencies with the pinned upstream tracked in `docs/rust-porting-inventory.md` (html-to-markdown-rs 3.x, icy_sixel 0.7, brush-parser 0.4, phf 0.14, similar 3.2, smallvec 1.16, dashmap 6.2, tree-sitter-cmake 0.7.5, tree-sitter-r 1.3, syntect with bundled themes and YAML syntax loading).
+- `htmlToMarkdown` now uses html-to-markdown-rs 3.x and fails with `Conversion error` when the document exceeds the converter's nesting depth, instead of returning truncated markdown.
+- `encodeSixel` output now starts with a SIXEL raster-attributes header (`"1;1;<width>;<height>`), so terminals size the image before drawing it.
+
+- Native isolation now exposes selective copy-on-write tree cloning for APFS, Linux FICLONE, and Windows block-clone backends. Unsupported backends report an explicit unavailable error; local Windows dependency features and secure plain-tree diff traversal remain intact.
+
+- `glob` now uses the shared native filesystem walker and its bounded scan/cache policy, preserving stable sorted results across ignore rules, symlinks, and large directories.
+- Walker Rayon pool initialization now fails closed to serial work; `walkerPoolStatus()` exposes a non-forcing diagnostic, and native load failures during discovery no longer become empty results.
+
+- `fuzzyFind` and `listWorkspace` now use the shared filesystem walker while retaining their existing result shapes and pinned pre-sync behavior for hidden, ignored, symlinked, and large directory trees.
+
+- Re-synced native `grep`, `search`, and `hasMatch` with the pinned walker-based implementation. Regex lookarounds and backreferences use a statically bundled PCRE2 build (`PCRE2_SYS_STATIC=1`), so the addon has no dynamic PCRE2 runtime dependency. The existing grep result shape and cached serial fallback are retained; the upstream-only injectable shell filesystem option is omitted because GJC has no caller for it.
+
+- Appearance detection, observer start, and observer stop now publish stable work-profile region tags; the existing dark/light/undefined native result and lazy theme consumer are unchanged.
+
+- Re-synced the HTML-to-Markdown N-API boundary to consume JavaScript strings directly. Recorded native goldens cover headings, links, clean-content preprocessing, skipped images, and the depth-limit error; conversion behavior and exported TypeScript shape remain unchanged.
+
+- Work-profile folded stacks retain the upstream region format, and the `profile_region` helper now has a nested-stack regression guard for module instrumentation.
+
+- Re-synced the existing SIXEL encoder and added its `sixel.encode` profile region. The upstream bounded SIXEL decoder was not adopted because GJC has no consumer for it.
+
+- Add the pinned upstream Julia, Nix, Mermaid, TypeScript, TSX, and Astro syntax grammars. Existing semantic theme colors and GJC highlight caches remain unchanged; accepted output differences for newly covered languages are recorded with the differential goldens.
+
+- Re-synced the process binding to the pinned upstream baseline while preserving identity-aware observations and pinned-root signaling through the local pi-shell process implementation.
+
+- Re-synced the PTY binding to the pinned upstream baseline while retaining GJC's bounded loss-reporting queue, ConPTY single-flight guard, and post-spawn child cleanup.
+
+### Fixed
+
+- Prevent the synthetic N-API UTF-16 terminator from leaking into padded truncation output for non-ASCII text. Preserve the GJC two-cell width contract for Hangul compatibility jamo and U+3164.
+- Re-sync key handling with pinned upstream: keep Alt+B/F navigation aliases in legacy mode while treating them as literal Alt keys in Kitty mixed mode, recognize keypad digits when NumLock metadata is omitted, avoid mapping unmodified non-Latin text to its physical base-layout shortcut, and accept the legacy Ctrl+- encoding.
+
+- Windows native loading now installs a bounded Tokio runtime and probed Rayon pool before async or parallel work starts. If no safe Rayon workers can be created, cached grep uses its serial path rather than initializing Rayon’s default global pool.
+
+- Native clipboard reads now decode Windows CF_DIB/CF_DIBV5 images that arboard rejects, and Linux retains its X11 clipboard owner so copied text remains available after the call returns.
+
+- Native panic diagnostics remain opt-in through `GJC_NATIVE_CRASH_DIAGNOSTICS`. When enabled, allocation failures also write a structured report under `~/.gjc/logs`; no panic or allocation hook is installed when the setting is absent.
+
 ## [0.17.7] - 2026-09-25
 
 ### Changed

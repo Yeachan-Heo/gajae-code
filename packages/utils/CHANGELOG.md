@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-09-27
+
+### Changed
+
+- Mermaid ASCII helpers now call the lazily loaded native renderer instead of a TypeScript rendering dependency.
+
 ## [0.17.7] - 2026-09-25
 
 ## [0.17.6] - 2026-09-24

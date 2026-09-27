@@ -34,7 +34,7 @@ export const TtyWriter = nativeBindings.TtyWriter;
 // functions
 export const __gjcInstallTokioRuntime = nativeBindings.__gjcInstallTokioRuntime;
 export const __piNativesPublishOutcomeV1 = nativeBindings.__piNativesPublishOutcomeV1;
-export const __piNativesV0_17_7 = nativeBindings.__piNativesV0_17_7;
+export const __piNativesV0_18_0 = nativeBindings.__piNativesV0_18_0;
 export const applyBashFixups = nativeBindings.applyBashFixups;
 export const applyOwnerOnlyFdSecurity = nativeBindings.applyOwnerOnlyFdSecurity;
 export const applyOwnerOnlyPathSecurity = nativeBindings.applyOwnerOnlyPathSecurity;

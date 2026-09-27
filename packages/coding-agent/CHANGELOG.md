@@ -2,6 +2,111 @@
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-09-27
+
+### Added
+
+- Record an RSS checkpoint for every stable and nightly release. The release workflow measures the released linux-x64 binary and the previous stable release on the same runner, then runs an advisory compare that reports regressions without failing the release. `scripts/verify-rss-checkpoints.ts` gains `--binary`, `--commit`, `--output-dir`, and `--advisory` for this. The time report now goes to a file, fixing an intermittent EAGAIN failure when `/usr/bin/time` wrote to the harness's non-blocking stderr pipe.
+
+- Added `bench/agent-session-profile.ts`. It records a `.cpuprofile`, early and late V8 heap snapshots, and post-GC memory samples for the `memory-agent-session-lifecycle` perf fixture. The tool:
+  - separates reachable retention from allocator high-water
+  - reclassifies the agent-session hotspots from captured profiler symbols
+  - confirms CPU self-time only from the hotspot's own frames; cost that sits only in callees is reported as inclusive path cost
+
+  Recorded evidence shows the fixture's soak RSS growth is bounded allocator high-water: reachable heap moved by less than 0.6 MiB and the live object count fell. No agent-session hotspot is self-time confirmed. `getEntries` and `#appendEntry` carry about 47% and 30% of profiled time inclusively but under 3% self (#5942).
+
+- `bun run bench:tool-results:live`: a manual live A/B harness that runs a deterministic corpus of read/search tasks against a real model under baseline and candidate settings overrides. It reports tool-result characters per task (per tool), task success, and a verdict. It rejects arms that resolve to identical settings, and provider-errored runs make the verdict inconclusive instead of counting as savings (#5945).
+
+- Every assistant turn now records a prompt-prefix fingerprint (`promptPrefix`) that compares its request with the agent's previous one: a stable xxHash64 of the provider-visible prefix, how many already-sent messages were reused, and the first layer the client changed (`append`, `model`, `tools`, `system`, `messages` plus the role of the rewritten message, or `options` when only serialization-affecting request options such as tool choice changed). `gjc stats --summary` and `gjc stats --json` (`cacheMissAttribution`) use it to split prompt-cache prefix misses into client-caused, provider-side (prefix intact), and model-switch misses (ignoring provider/model pairs that never report cache reads), and to break the client-caused misses down by cause (#5946).
+
+- Managed model fallback chains now circuit-break failing entries. When an entry fails out of a chain, its circuit opens in the shared model registry, so later turns, chain restarts, profile activation, and sibling sessions such as subagents skip that entry instead of spending its whole `fallback.maxAttempts` budget again. The cooldown starts at `fallback.circuitCooldownMs` (default 60s) and doubles on each consecutive failure, up to `fallback.circuitMaxCooldownMs` (default 30m). A typed Retry-After replaces the cooldown, so sibling sessions also wait for the provider-specified time. Once the cooldown ends, exactly one session claims the probe; an accepted response closes the circuit. With `retry.fallbackRevertPolicy: cooldown-expiry`, the next turn returns to the head. The final chain entry is never skipped, and a chain whose entries are all open still probes. Set `fallback.circuitCooldownMs: 0` to disable the breaker (#5948).
+
+- The session power-prevention caller now uses the native `PowerAssertion` API on supported Linux and Windows sessions as well as macOS; unsupported platforms remain no-op.
+
+- Failed prompt outcomes now carry an optional bounded `providerDiagnostic` (`category`, `httpStatus`, `code`, `evidence`) when the provider adapter classified the failure from its own structured metadata. It survives the prompt sanitizer, both reconciliation implementations, durable persistence and reload, pending-outcome restart settlement, and the public status projection, and a late `agent_failed` may fill a missing diagnostic on an already settled failure without touching its status, terminal time, receipt or classifier. Primary failure code, category, phase, message, retry behaviour and CLI exit codes are unchanged, and a malformed or forged diagnostic is stripped instead of invalidating the record.
+
+- Read local SVG files and fetch `image/svg+xml` resources as rasterized PNG images.
+
+### Changed
+
+- Compiled `gjc` binaries now use code splitting, so lazily imported modules load only when needed. Measured on a linux-x64 build (15 interleaved samples), `gjc --version` drops from 700 ms and 162 MB max RSS to 200 ms and 81 MB, and `gjc --help` drops from 700 ms and 162 MB to 190 ms and 81 MB. Internal bash helper processes use about half as much RSS.
+
+- Tool results now have a 12 KB inline cap by default (`tools.maxInlineResultBytes`, previously 0 = off). Larger results keep their head and tail inline, and the full text is saved behind an `artifact://` reference. A live A/B on claude-haiku-4-5, gpt-5.5, and gpt-5.6-luna cut tool-result characters per task by 34–57% with task success unchanged (45/45). Set the value to `0` to restore uncapped inline results (#5945).
+
+- The bundled `ultragoal` skill prompt now inlines only the sections every run needs. The boundary completion cohort gate, terminal critic gate, and cross-repository succession contracts moved verbatim into on-demand skill fragments (`embedded:gjc/skill-fragments/ultragoal/<name>.md`), and short summaries in the prompt point to them. Each ultragoal `skill-prompt` injection drops from about 57k to about 33k characters (-41%) ([#5949](https://github.com/Yeachan-Heo/gajae-code/issues/5949)).
+
+- Updated built-in Codex presets and autorouting to use verified GPT-6 Sol/Luna models while retaining GPT-5.6 Terra and provider-safe GPT-5.6 Luna aliases where required.
+- Migrated built-in Opus presets to first-party Claude Opus 5.5 with medium default/planner effort and high critic/architect effort, retaining the Claude Opus 4.6 fallback and Sonnet executor.
+
+- Edit previews, unified diffs, word highlighting, vim previews, eval-helper diffs, and hashline recovery now obtain diff hunks from the native addon on first use, with no JavaScript diff-generation fallback. Hashline patch application remains on `diff` until the patch/apply-port item.
+
+- Mermaid diagrams in the render tool and terminal theme now use the native Rust renderer. Layout, glyph, spacing, and invalid-input behavior can differ from the previous TypeScript renderer; every corpus difference is recorded with a case-specific reason in the native Mermaid golden divergence ledger.
+
+- PDF Markdown now preserves explicit page markers and groups adjacent text runs. This accepted D6/D7 output-shape divergence is backed by the `pdf-native` golden corpus and differential tests; pages with no extracted text report the page numbers requiring OCR.
+
+- Replace-mode and patch sequence fuzzy matching now use the native pi-edit matchers on first use. UTF-16 scoring preserves the TypeScript decisions and confidences, so user-visible matching behavior does not change.
+
+### Removed
+
+- Remove MuPDF.js and its AGPL-3.0-or-later runtime and release-material build from PDF extraction in favor of the native MIT `pdf-inspector` implementation. Markit remains for DOCX, PPTX, XLSX, EPUB, and RTF conversion.
+
+### Fixed
+
+- SDK broker exits now log and persist a bounded structured reason for startup deadlines and pre-readiness signals as well as publication fences, committed restarts, and shutdown requests. Signal-path records use bounded asynchronous writes so slow filesystems cannot block postmortem cleanup. Broker RPCs stay unavailable until retained discovery ownership is proven, so supervisors can diagnose restarts without exposing an unready broker. Windows broker startup also reads managed enrollment state without invoking the Linux-only private publication path (#5851).
+- Broker exit persistence does not recreate a removed `sdk/` root while a broker self-reaps.
+
+- SDK prompt deadline expiry fences the exact accepted run and dispatched tools before publishing `prompt_deadline_exceeded`; when settlement is unproven, the prompt remains recoverable in flight with its pending outcome hidden (#5869).
+
+- Managed fallback now rotates content-free quota and rate-limit failures through available same-provider, same-kind credentials before advancing to the next model.
+
+- SDK lifecycle startup now safely reconciles promotion fences left by a process crash after fencing but before fence removal, preventing failure receipts from becoming permanently unreadable. Restart readers validate the fence's recorded artifact digest against the staged and final receipts; if the final receipt matches, the fence is removed and the receipt becomes readable; if only a staged receipt exists or digests mismatch, the fence remains (fail-closed) to preserve recovery safety.
+
+- The handled-error crash journal (`gjc-error.log`, `gjc-error-events.jsonl`) no longer records designed tool outcomes as crashes (#5938): `tool_call` blocks from extensions and hooks (now reported as `blocked` on the `execute_tool` span), edit refusals (`EditMatchError`, `ApplyPatchError`, malformed `apply_patch` envelopes and diff hunks, ambiguous `old_text` occurrences, empty `old_text`, no-op edits), extension `tool_result` verdicts that mark a result as an error or reword a designed failure, unknown or malformed `embedded:` resources, tool-argument validation failures, and calls to unknown tools. Genuine tool faults, extension `tool_call` rewrites that turn valid input into invalid arguments, `tool_result` mediation failures the runner synthesizes from a failing or malformed hook, exceptions thrown by legacy hook `tool_call` handlers, and bash shell-runtime exits (`Shell runtime exited with code 70.`, the native shell's ownership-ledger fail-closed exit) are still recorded. Extension `tool_call` handler failures stay reported through the extension error listeners.
+
+- Non-interactive runs (`gjc -p`, `--mode text|json`, auto-print) no longer fetch provider usage they never display: credential selection ranks from reports that long-lived hosts already cached in `agent.db` and makes no usage-endpoint requests of its own ([#5939](https://github.com/Yeachan-Heo/gajae-code/issues/5939)).
+
+- Fixed `scripts/verify-rss-checkpoints.ts` rejecting successful samples on Linux. The measured Bun child left the shared stderr pipe non-blocking, so GNU `time` failed to write its report (EAGAIN) and exited 1. The report now goes to a file.
+
+- Cut memory at every `gjc` startup: CLI flag parsing no longer loads the whole provider barrel, which pulled in about 550 modules (OpenAI and Anthropic SDKs, zod locales, mermaid) before argv was parsed. `--help` and `--version` now load 43 modules instead of 588 when run from source, and the compiled binary's `--help` peak RSS drops from about 162 MiB to 152 MiB.
+- Stop keeping every `node` interpreter found on PATH in memory for the life of the session. The plugin MCP launcher now hashes those binaries in fixed 1 MiB chunks instead of reading each one whole. In the S5 bash scenario this lowers the main process's peak RSS from about 757 MiB to 581 MiB.
+
+- The inline-result cap never truncates output it cannot store as an artifact. Standalone `gjc read` has no session artifact store, so it prints the full output, and it now honors the configured `tools.*` output settings (#5945).
+
+- Land a hashline edit whose anchors come from the original read after this session's own earlier edit shifted the file. The read cache now keeps up to 4 snapshot generations per path, and stale-anchor recovery replays against each one, newest first. Replays stay refused unless every anchor matches that snapshot, every hunk's context was actually observed, and each hunk lands at exactly one place in the live file ([#5947](https://github.com/Yeachan-Heo/gajae-code/issues/5947)).
+- Keep anchor-mismatch rejections compact and actionable. When a stale anchor's content uniquely moved within 20 lines, the rejection names the new anchor (`Likely moved ...: 6vp -> 9vp`) and shows that line marked `>`, without applying the edit ([#5947](https://github.com/Yeachan-Heo/gajae-code/issues/5947)).
+- Answer a hashline op that names lines by number only (`≔16`, `≔23-25`) with the current full anchors for those lines instead of a generic parse error, so the model can retry without another read. The edit is never applied on a line number alone ([#5947](https://github.com/Yeachan-Heo/gajae-code/issues/5947)).
+
+- Goal sessions no longer write a `mode_change` session entry after every tool call. Usage counters now update in memory at tool boundaries and are saved once at agent end or when the goal's status changes, so session files grow much less ([#5949](https://github.com/Yeachan-Heo/gajae-code/issues/5949)).
+- bash now uses a leading `cd <dir> &&` as the tool cwd only when `<dir>` is a single shell word. Commands like `cd /repo 2>/dev/null && …` no longer fail with "Working directory does not exist"; the shell runs them unchanged. The missing-cwd error and the restricted-bash control-operator rejection now say how to fix the command ([#5949](https://github.com/Yeachan-Heo/gajae-code/issues/5949)).
+- The system prompt preparation deadline now counts only time when the event loop is responsive. Concurrent in-process sessions (for example `bench:edit`) no longer report `loadSystemPromptFiles` as timed out and fall back to the minimal prompt ([#5949](https://github.com/Yeachan-Heo/gajae-code/issues/5949)).
+
+- Managed fallback no longer fails the run when the credential row it preselected for the next request is removed or becomes unavailable before the API-key lookup; it re-resolves another untried same-kind credential or falls back to normal resolution, and never dispatches the vanished row (#5956).
+
+- `monitor` now rejects an explicit `timeout` above 3600 seconds before starting a job, instead of accepting it and silently stopping the monitor after 3600 seconds (#5970).
+
+- Python `output()` helper in eval now works correctly by using the tool bridge instead of filesystem access. This fixes issue #5936 where the helper was always raising `RuntimeError: No session - output artifacts unavailable` because environment variables used to resolve artifacts were intentionally removed for security in #2724. The fix maintains the security boundary while enabling the helper to function properly in Python eval cells.
+
+- Pressing Enter while a turn is streaming no longer kills the interactive session with an unhandled `managed_append_identity_mismatch` rejection. When another process resumed the same session (for example a second `gjc -c`), the managed append fence correctly refused the stale writer, but the editor submit handler dropped the promise returned by `submitText`, so the rethrown fence error escaped as a process-fatal unhandled rejection. Rejected editor submissions are now reported through the normal error line and the input loop stays usable; the append fence itself is unchanged.
+
+- OpenAI-compatible model discovery now respects endpoint-advertised reasoning effort levels when `compat.supportsReasoningEffort` is enabled, instead of using only bundled reference models.
+
+- SDK lifecycle cleanup now requires literal `.` separators when recognising canonical failure-receipt and promotion-fence file names, instead of treating them as regex wildcards.
+
+- Windows clipboard image reads now decode Qt `CF_DIB` and `CF_DIBV5` `BI_BITFIELDS` payloads that arboard rejects, returning the image as PNG through the existing lazy native clipboard path. On Linux, retaining arboard's X11 selection owner for the process lifetime keeps copied clipboard text available after the copy call returns.
+
+- Reading a PDF that mixes text and scanned pages now prefixes the extracted Markdown with a warning listing pages that need OCR and any font-encoding issues, instead of presenting partial output as complete.
+- Fetching a URL labeled `image/svg+xml` whose bytes cannot be rasterized now returns the invalid-image metadata result instead of failing the whole fetch.
+
+- SDK Q27 model-profile availability queries no longer fail closed when a registry adapter omits the fallback-circuit query; full registries still enforce open circuits during chain resolution.
+
+- Resuming a session with a removed or unavailable durable credential pin no longer crashes during saved-model resolution or silently uses another account through the settings default. Re-pin the credential or select AUTO explicitly to restore that provider.
+
+- Discovery now propagates native-addon load failures instead of masking them as an empty file-match result; glob operation errors still return no matches.
+
+- The exported `TOOL_CATALOG` entry for `read` no longer describes the receipt budget as "about undefined lines or undefined KiB"; the catalog generator now renders the settings defaults (50 lines / 10 KiB).
+
+- Windows binary updates now keep the `.exe` extension on the staged download so the candidate can be executed and verified before installation.
+
 ## [0.17.7] - 2026-09-25
 
 ### Added

@@ -1,3 +1,0 @@
-### Added
-
-- Anthropic failures now carry an optional bounded `providerDiagnostic` (`category`, `httpStatus`, `code`, `evidence`) on the terminal assistant message, minted only from structured SDK error metadata or an explicit SSE `event: error` envelope. It distinguishes auth rejections, rate limits and upstream outages without exposing provider text, and contradictory or unreadable metadata produces no diagnostic; unsupported codes are discarded, while an independently valid status may still classify. The legacy `errorStatus`, error messages, retry admission and fallback behaviour are unchanged.

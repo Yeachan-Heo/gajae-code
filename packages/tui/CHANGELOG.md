@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-09-27
+
+### Added
+
+- Unix TTY writes and out-of-band terminal capability sequences now share a lazily loaded native FIFO writer on Unix. Terminal teardown and process exit perform a bounded flush; Windows remains on Bun's stdout path.
+
 ## [0.17.7] - 2026-09-25
 
 ## [0.17.6] - 2026-09-24

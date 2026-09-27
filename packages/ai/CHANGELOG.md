@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-09-27
+
+### Added
+
+- `AuthStorage.setUsageProbeMode("cache-only")` limits credential ranking and quota checks to usage reports already cached in the shared store, so callers that never display usage can select credentials without calling provider usage endpoints.
+
+- `AssistantMessage.promptPrefix` (`PromptPrefixTelemetry`) carries the prompt-prefix fingerprint of the request that produced the message, so prompt-cache misses can be attributed to client prefix mutation or provider eviction (#5946).
+
+- Added bundled GPT-6 Sol and GPT-6 Luna model metadata and pricing for the OpenAI Codex transport.
+
+- Anthropic failures now carry an optional bounded `providerDiagnostic` (`category`, `httpStatus`, `code`, `evidence`) on the terminal assistant message, minted only from structured SDK error metadata or an explicit SSE `event: error` envelope. It distinguishes auth rejections, rate limits and upstream outages without exposing provider text, and contradictory or unreadable metadata produces no diagnostic; unsupported codes are discarded, while an independently valid status may still classify. The legacy `errorStatus`, error messages, retry admission and fallback behaviour are unchanged.
+
+### Changed
+
+- `AuthStorage.markUsageLimitReached` now reports the marked row identity and remaining unblocked same-kind credential IDs, distinguishing a vanished row from an exhausted pool.
+
+### Fixed
+
+- Share per-credential provider usage probes across processes through `agent.db`: a cross-process lease single-flights each credential's `/usage` request, a failed probe with no last-good report is now cooled down for about a minute instead of being retried on every credential selection, and loading credentials into a new process no longer purges the reports its peers already cached. Concurrent and back-to-back `gjc` processes no longer each hit the provider's usage endpoint and trip its 429 rate limit ([#5939](https://github.com/Yeachan-Heo/gajae-code/issues/5939)).
+
+- Kiro CodeWhisperer OAuth endpoint now correctly resolves to `codewhisperer.${region}.amazonaws.com` instead of the non-existent `amazoncodewhispererstreamingservice.${region}.amazonaws.com`. OAuth bearer token authentication requests targeting `AmazonCodeWhispererService.GenerateAssistantResponse` now route to a resolvable endpoint that matches the working endpoint used by API-key authentication. (#6002)
+
+- Direct `xai/grok-4.7` now advertises `reasoning_effort=xhigh`. xAI documents `xhigh` for grok-4.6 and later, but the thinking policy treated only grok-4.6 as xhigh-capable and clamped grok-4.7 to high, so the model picker could not select it.
+
 ## [0.17.7] - 2026-09-25
 
 ### Changed
