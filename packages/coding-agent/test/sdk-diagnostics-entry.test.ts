@@ -566,6 +566,13 @@ const CHAIN_OPEN_FLAGS = String(fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY 
  * artifact once, plus every ancestor directory of that artifact once, all read-only. Any
  * other path, any write flag and any extra open fail this pin.
  */
+/**
+ * The runtime tuple the observation contract admits. The approved loader chain only
+ * exists here; every other tuple refuses before any open, so its ledger must be
+ * strictly empty with zero native activation rather than a relaxed subset of this pin.
+ */
+const SUPPORTED_RUNTIME = process.platform === "darwin" && process.arch === "arm64" && Bun.version === "1.4.0";
+
 function approvedLoaderReads(): string[] {
 	// The artifact is opened exactly twice: once to verify the trusted digest and once for
 	// the descriptor-pinned activation. A third open, another path or a write flag fails.
@@ -590,10 +597,11 @@ function expectInert(run: EntryRun, options: { approvedLoaderChain?: boolean } =
 	expect(run.trap.fsMutations).toEqual([]);
 	// Reads are pinned by exact identity, exact read-only flags and exact multiset. The
 	// ledger is never reset, so this covers the whole entry: import and invocation alike.
-	expect([...run.trap.reads].sort()).toEqual(options.approvedLoaderChain ? approvedLoaderReads() : []);
+	const approvedChain = options.approvedLoaderChain === true && SUPPORTED_RUNTIME;
+	expect([...run.trap.reads].sort()).toEqual(approvedChain ? approvedLoaderReads() : []);
 	// Native activation: zero before any approved artifact access, and positive exactly on
 	// the route that legitimately activates the addon.
-	if (options.approvedLoaderChain) expect(run.trap.nativeActivations).toBeGreaterThan(0);
+	if (approvedChain) expect(run.trap.nativeActivations).toBeGreaterThan(0);
 	else expect(run.trap.nativeActivations).toBe(0);
 	// One un-reset ledger for the whole entry; no fabricated stage split is claimed.
 	expect(run.trap.stage).toBe("whole-entry");
@@ -930,7 +938,7 @@ describe("sdk diagnostics public entry (B1)", () => {
 				});
 
 				// Every other gate is independently satisfied.
-				const approved = approvedLoaderReads().sort();
+				const approved = SUPPORTED_RUNTIME ? approvedLoaderReads().sort() : [];
 				const observed = [...run.trap.reads].sort();
 				const artifactBytes = fsStatSync(RESOLVED_ARTIFACT_PATH).size;
 				const chunkBound = Math.ceil(artifactBytes / (1024 * 1024)) + 2;
@@ -1065,7 +1073,7 @@ describe("sdk diagnostics public entry (B1)", () => {
 					failures.push({ inject: row.inject, reason: "pinned assertion accepted the injected ledger" });
 					continue;
 				}
-				const approved = approvedLoaderReads();
+				const approved = SUPPORTED_RUNTIME ? approvedLoaderReads() : [];
 				const observed = [...run.trap.reads].sort();
 				const extraOpens = observed.filter(entry => !approved.includes(entry));
 				const artifactOpenCount = observed.filter(entry => entry.includes(RESOLVED_ARTIFACT_PATH)).length;

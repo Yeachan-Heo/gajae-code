@@ -2864,6 +2864,9 @@ pub(crate) mod platform {
 		/// leaving owner writes available, and those callers exist to fix it.
 		RepairableWrite,
 		/// Read-only observation: never acquire or even attempt write authority.
+		/// The read-denial retry this refuses exists only on macOS, so the variant is
+		/// available exactly where an acquisition can select it.
+		#[cfg(target_os = "macos")]
 		ReadOnly,
 	}
 
@@ -2883,7 +2886,8 @@ pub(crate) mod platform {
 	fn checked_file_with_policy(
 		path: &Path,
 		kind: &str,
-		policy: AcquisitionPolicy,
+		// Consulted only by the macOS read-denial retry below.
+		_policy: AcquisitionPolicy,
 	) -> Result<CheckedPathAuthority, NativeOwnerOnlySecurityResult> {
 		if !matches!(kind, "directory" | "file") {
 			return Err(NativeOwnerOnlySecurityResult::failure("io_error"));
@@ -2979,7 +2983,7 @@ pub(crate) mod platform {
 		let target_fd = if target_fd < 0 && !is_directory {
 			let read_error = std::io::Error::last_os_error();
 			if read_error.raw_os_error() == Some(libc::EACCES)
-				&& policy == AcquisitionPolicy::RepairableWrite
+				&& _policy == AcquisitionPolicy::RepairableWrite
 			{
 				// A hostile macOS ACL may deny reads while leaving owner writes
 				// available. Retry only that denial with write authority so ACLs can
@@ -7621,14 +7625,20 @@ pub(crate) mod platform {
 
 	/// Copy budget for one publication read, plus a sentinel byte used to detect
 	/// an oversized or growing file without reading to EOF.
+	#[cfg(target_os = "macos")]
 	pub(super) const DIAGNOSTIC_SNAPSHOT_MAX_BYTES: usize = 65536;
 	#[cfg(target_os = "macos")]
 	const DIAGNOSTIC_SNAPSHOT_ACL_TEXT_MAX: usize = 4096;
+	#[cfg(target_os = "macos")]
 	const DIAGNOSTIC_SNAPSHOT_MAX_PATH_BYTES: usize = 4096;
+	#[cfg(target_os = "macos")]
 	const DIAGNOSTIC_SNAPSHOT_MAX_COMPONENTS: usize = 128;
 	#[cfg(target_os = "macos")]
 	const DIAGNOSTIC_SNAPSHOT_MAX_BUDGET_MS: u32 = 10_000;
 
+	// Every producer and consumer of this classification is the Darwin diagnostic
+	// path; other targets answer with the fixed unsupported string instead.
+	#[cfg(target_os = "macos")]
 	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 	pub(super) enum DiagnosticFailure {
 		Absent,
@@ -7637,6 +7647,7 @@ pub(crate) mod platform {
 		Timeout,
 	}
 
+	#[cfg(target_os = "macos")]
 	impl DiagnosticFailure {
 		pub(super) const fn reason(self) -> &'static str {
 			match self {
@@ -7650,6 +7661,7 @@ pub(crate) mod platform {
 
 	/// The one publication this adapter may resolve. The peer never supplies a
 	/// leaf name, operation or path segment.
+	#[cfg(target_os = "macos")]
 	fn diagnostic_publication_path(
 		agent_dir: &str,
 	) -> Result<std::path::PathBuf, DiagnosticFailure> {
@@ -8470,6 +8482,7 @@ pub(crate) mod platform {
 	/// Whether this build admits the diagnostic snapshot capability at all. The
 	/// observation contract was established for Darwin on arm64 only; a Darwin
 	/// x64 build reports unsupported before any path is opened.
+	#[cfg(target_os = "macos")]
 	pub(super) const fn diagnostic_runtime_supported() -> bool {
 		cfg!(all(target_os = "macos", target_arch = "aarch64"))
 	}
