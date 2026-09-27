@@ -2,7 +2,6 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 import type { ImageContent } from "@gajae-code/ai/core";
 import type { Component } from "@gajae-code/tui";
 import { Markdown, Text } from "@gajae-code/tui";
-import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { jsBackend, pythonBackend } from "../eval";
 import type { ExecutorBackend } from "../eval/backend";
@@ -10,7 +9,6 @@ import type { EvalCellResult, EvalDisplayOutput, EvalLanguage, EvalStatusEvent, 
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { truncateToVisualLines } from "../modes/components/visual-truncate";
 import { getMarkdownTheme, type Theme } from "../modes/theme/theme";
-import evalDescription from "../prompts/tools/eval.md" with { type: "text" };
 import { DEFAULT_MAX_BYTES, OutputSink, type OutputSummary, TailBuffer } from "../session/streaming-output";
 import { getTreeBranch, getTreeContinuePrefix, renderCodeCell } from "../tui";
 import { resolveEvalBackends, type ToolSession } from ".";
@@ -21,6 +19,7 @@ import {
 	stripOutputNotice,
 } from "./output-meta";
 import { formatTitle, replaceTabs, shortenPath, truncateToWidth, wrapBrackets } from "./render-utils";
+import { evalToolDescriptionForSession } from "./session-descriptions";
 import { ToolAbortError, ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
@@ -134,16 +133,7 @@ function renderJsonTree(value: unknown, theme: Theme, expanded: boolean, maxDept
 	return renderNode(value, "", 0, true);
 }
 
-export interface EvalToolDescriptionOptions {
-	py?: boolean;
-	js?: boolean;
-}
-
-export function getEvalToolDescription(options: EvalToolDescriptionOptions = {}): string {
-	const py = options.py ?? true;
-	const js = options.js ?? true;
-	return prompt.render(evalDescription, { py, js });
-}
+export { type EvalToolDescriptionOptions, getEvalToolDescription } from "./session-descriptions";
 
 export interface EvalToolOptions {
 	proxyExecutor?: EvalProxyExecutor;
@@ -204,9 +194,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 	readonly loadMode = "discoverable";
 	readonly label = "Eval";
 	get description(): string {
-		if (!this.session) return getEvalToolDescription();
-		const backends = resolveEvalBackends(this.session);
-		return getEvalToolDescription({ py: backends.python, js: backends.js });
+		return evalToolDescriptionForSession(this.session);
 	}
 	readonly parameters = evalSchema;
 	readonly concurrency = "exclusive";
