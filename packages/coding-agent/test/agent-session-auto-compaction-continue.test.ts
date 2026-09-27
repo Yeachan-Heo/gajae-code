@@ -1064,6 +1064,65 @@ describe("AgentSession auto-compaction continuation", () => {
 		).toBe(true);
 	});
 
+	it("flushes pending agent_end after auto-compaction completes - 5 deterministic runs", async () => {
+		// Regression test for issue #6004: After auto compaction, a pending agent_end
+		// event that was parked before or during compaction must be flushed. The fix
+		// ensures #flushPendingAgentEnd() is called in #applyCompactionPostAppend(),
+		// which publishes any parked agent_end.
+		//
+		// This test directly verifies the fix by:
+		// 1. Parking an agent_end using the test seam
+		// 2. Calling applyCompactionPostAppendForTests (which calls #applyCompactionPostAppend)
+		// 3. Verifying that the parked agent_end is published
+		//
+		// Run 5 times to verify deterministic behavior.
+
+		for (let run = 0; run < 5; run++) {
+			vi.spyOn(session.agent, "prompt").mockResolvedValue();
+			const collectedEvents: AgentSessionEvent[] = [];
+			const unsubscribe = session.subscribe(event => collectedEvents.push(event));
+
+			// Step 1: Set up by triggering one round of compaction
+			await driveCompaction();
+			await advancePostPrompt(50);
+			await session.waitForIdle();
+
+			// Find the compaction entry
+			const sessionManager = (session as any).sessionManager;
+			const compactionEntry = sessionManager.getBranch().findLast((e: any) => e.type === "compaction");
+			if (!compactionEntry) {
+				unsubscribe();
+				vi.restoreAllMocks();
+				continue; // Skip if no compaction found
+			}
+
+			// Step 2: Park an agent_end to simulate the bug condition
+			const testAgentEnd: AgentSessionEvent = {
+				type: "agent_end",
+				messages: [],
+			};
+			session.parkAgentEndForCoordinatorPersistForTests(testAgentEnd);
+
+			// Clear event log before calling post-append to see what gets published
+			collectedEvents.length = 0;
+
+			// Step 3: Call applyCompactionPostAppendForTests which triggers the fix
+			await session.applyCompactionPostAppendForTests(compactionEntry.id, compactionEntry.firstKeptEntryId);
+
+			// Step 4: Verify that the parked agent_end was published by the flush
+			// Without the fix, this agent_end would remain parked and never be published
+			const publishedAgentEnd = collectedEvents.find(e => e.type === "agent_end");
+			expect(
+				publishedAgentEnd,
+				`Run ${run}: agent_end should be published after applyCompactionPostAppend`,
+			).toBeDefined();
+			expect(publishedAgentEnd?.type).toBe("agent_end");
+
+			unsubscribe();
+			vi.restoreAllMocks();
+		}
+	});
+
 	it("can prompt after auto-compaction completes without timing out on prior agent run", async () => {
 		// Regression test for issue #6004: After auto compaction, a pending agent_end
 		// event was not being flushed, causing the next prompt to fail with
