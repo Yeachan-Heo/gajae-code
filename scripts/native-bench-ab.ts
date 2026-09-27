@@ -47,7 +47,7 @@ export interface ParsedOptions {
 	rss: string[];
 }
 
-const SUITES: Record<string, { adapter: string; actualSuite: string; cases: string[] }> = {
+const SUITES: Record<string, { adapter: string; actualSuite: string; cases: string[]; support?: string[] }> = {
 	"edit-hotspots": { adapter: "packages/natives/bench/edit-hotspots.ts", actualSuite: "edit-hotspots", cases: ["H01", "H02", "H03", "H06"] },
 	grep: { adapter: "packages/natives/bench/grep.ts", actualSuite: "grep", cases: ["G01", "G02", "G03", "G04", "G05", "G06", "G07", "G08"] },
 	"natives-grep": { adapter: "packages/natives/bench/grep.ts", actualSuite: "grep", cases: ["G01", "G02", "G03", "G04", "G05", "G06", "G07", "G08"] },
@@ -65,6 +65,7 @@ const SUITES: Record<string, { adapter: string; actualSuite: string; cases: stri
 	"tools:bash": { adapter: "packages/natives/bench/tools-bash.ts", actualSuite: "tools:bash", cases: ["B01"] },
 	"tools:glob": { adapter: "packages/natives/bench/tools-glob.ts", actualSuite: "tools:glob", cases: ["G01"] },
 	"tui-input-write": { adapter: "packages/natives/bench/tui-input-write.ts", actualSuite: "tui-input-write", cases: ["I01"] },
+	"tty-write": { adapter: "packages/natives/bench/tty-write.ts", actualSuite: "tty-write", cases: ["W01", "W02"], support: ["packages/natives/bench/tty-write-child.ts"] },
 	rss: { adapter: "", actualSuite: "rss", cases: [] },
 };
 
@@ -652,7 +653,7 @@ export async function runNativeBenchAb(repoRoot: string, options: ParsedOptions)
 		};
 	}
 	return withDetachedWorktree(repoRoot, baseSha, async baseRoot => {
-		const adapterDigest = await installHeadAdapter(repoRoot, baseRoot, config.adapter);
+		const adapterDigest = await installHeadAdapter(repoRoot, baseRoot, config.adapter, config.support);
 		return {
 			schema: BENCH_SCHEMA,
 			mode: "A/B",
@@ -675,10 +676,16 @@ export const AB_ADAPTER_SUPPORT = "packages/natives/bench/ab-adapter.ts";
  * implementation behind those entrypoints differs between sides. Returns the
  * digest of the installed bytes, adapter first.
  */
-export async function installHeadAdapter(headRoot: string, baseRoot: string, adapter: string): Promise<string> {
+export async function installHeadAdapter(
+	headRoot: string,
+	baseRoot: string,
+	adapter: string,
+	extraSupport: readonly string[] = [],
+): Promise<string> {
 	const hasher = new Bun.CryptoHasher("sha256");
 	const support = Bun.file(path.join(headRoot, AB_ADAPTER_SUPPORT));
-	const files = (await support.exists()) && adapter !== AB_ADAPTER_SUPPORT ? [adapter, AB_ADAPTER_SUPPORT] : [adapter];
+	const shared = (await support.exists()) && adapter !== AB_ADAPTER_SUPPORT ? [AB_ADAPTER_SUPPORT] : [];
+	const files = [adapter, ...shared, ...extraSupport];
 	for (const file of files) {
 		const bytes = await Bun.file(path.join(headRoot, file)).bytes();
 		await Bun.write(path.join(baseRoot, file), bytes);
