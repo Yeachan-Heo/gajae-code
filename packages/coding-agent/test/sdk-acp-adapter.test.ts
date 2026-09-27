@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
 import packageJson from "../package.json" with { type: "json" };
-import { AcpAgent } from "../src/modes/acp/acp-agent";
+import { AcpAgent, acpRequestFailure } from "../src/modes/acp/acp-agent";
 import { AcpSdkAdapter, type AcpSdkAdapterError, acpMcpLaunchFailure } from "../src/sdk/acp";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { SdkClientError } from "../src/sdk/client";
@@ -855,6 +855,26 @@ test("the ACP MCP launch wrapper reports broker refusal and re-attributes spawn 
 	);
 	expect(acpMcpLaunchFailure(readyThenExited, mcpServers)).toBe(readyThenExited);
 	expect(acpMcpLaunchFailure(readyThenExited, [])).toBe(readyThenExited);
+
+	const lifecycleFailure = new SdkClientError(
+		"broker_lifecycle_failed",
+		"broker lifecycle failed token=secret-token endpoint=https://example.test/mcp?token=secret-token url=https://example.test",
+	);
+	const attributed = acpMcpLaunchFailure(lifecycleFailure, mcpServers) as AcpSdkAdapterError;
+	expect(attributed.code).toBe("unavailable");
+	expect(attributed.message).toContain("broker_lifecycle_failed");
+	expect(attributed.message).not.toContain("secret-token");
+	expect(attributed.message).not.toContain("https://example.test");
+	expect(attributed.message).not.toMatch(/\b(?:token|url|endpoint)\b/i);
+	expect(attributed.cause).toBe(lifecycleFailure);
+
+	const transportFailure = new SdkClientError("connection_closed", "SDK request failed");
+	expect(acpMcpLaunchFailure(transportFailure, mcpServers)).toBe(transportFailure);
+
+	const requestFailure = acpRequestFailure(attributed) as Error;
+	expect(requestFailure.message).toBe(`Internal error: ${attributed.message}`);
+	expect(requestFailure.message.match(/MCP server request failed to start/g)).toHaveLength(1);
+	expect((requestFailure as { data?: { details?: unknown } }).data?.details).toBeUndefined();
 });
 test("the production ACP MCP launch path preserves broker admission timeout failures", async () => {
 	const root = await fs.mkdtemp(path.join(tmpdir(), "gjc-acp-mcp-admission-timeout-"));

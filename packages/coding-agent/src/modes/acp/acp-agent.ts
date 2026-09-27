@@ -1507,6 +1507,11 @@ export function acpRequestFailure(error: unknown): unknown {
 	const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
 	if (typeof code !== "string") return error;
 	const message = error instanceof Error ? error.message : code;
+	// ACP clients render `data.details` after the JSON-RPC message. The MCP launch
+	// diagnostic is already the complete additional message, so repeating it in
+	// `details` produces `Internal error: X.: X.` on the wire.
+	const duplicateMcpLaunchDetails =
+		code === "unavailable" && message.startsWith("MCP server request failed to start (");
 	// A prompt terminal additionally publishes its classification (issue #5615). The
 	// spread is empty for every other error, so their payloads are byte-identical to
 	// before. `code`/`details` and the JSON-RPC code itself are untouched either way:
@@ -1514,8 +1519,8 @@ export function acpRequestFailure(error: unknown): unknown {
 	const promptFailure = promptFailureFromDirectError(error);
 	const data =
 		promptFailure !== undefined
-			? { code, details: message, ...promptFailureWireData(promptFailure) }
-			: { code, details: message };
+			? { code, ...(duplicateMcpLaunchDetails ? {} : { details: message }), ...promptFailureWireData(promptFailure) }
+			: { code, ...(duplicateMcpLaunchDetails ? {} : { details: message }) };
 	// An abandoned prompt additionally publishes the plan it never finished (issue #5669).
 	// Same rule as above: `code`/`details` and the JSON-RPC code are untouched, and an abandon
 	// that observed no plan adds no keys, so its payload stays byte-identical to before.
