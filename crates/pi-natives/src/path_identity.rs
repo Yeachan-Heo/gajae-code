@@ -8460,8 +8460,12 @@ pub(crate) mod platform {
 		deadline:  std::time::Instant,
 	}
 
+	/// The unsupported counterpart. It is inhabited so `&self` methods are sound
+	/// and lint-clean, and its private field keeps every caller outside this module
+	/// from constructing one: the only way to obtain a lease stays
+	/// `open_diagnostic_snapshot`, which refuses without touching the filesystem.
 	#[cfg(not(target_os = "macos"))]
-	pub(super) enum DiagnosticSnapshotLease {}
+	pub(super) struct DiagnosticSnapshotLease(());
 
 	/// Whether this build admits the diagnostic snapshot capability at all. The
 	/// observation contract was established for Darwin on arm64 only; a Darwin
@@ -8768,12 +8772,12 @@ pub(crate) mod platform {
 
 	#[cfg(not(target_os = "macos"))]
 	impl DiagnosticSnapshotLease {
-		pub(super) fn read_bytes(&self) -> Result<Vec<u8>, &'static str> {
-			match *self {}
+		pub(super) const fn read_bytes(&self) -> Result<Vec<u8>, &'static str> {
+			Err("unsupported")
 		}
 
-		pub(super) fn revalidate_edges(&self) -> Result<(), &'static str> {
-			match *self {}
+		pub(super) const fn revalidate_edges(&self) -> Result<(), &'static str> {
+			Err("unsupported")
 		}
 	}
 
@@ -8812,11 +8816,12 @@ pub(crate) mod platform {
 	}
 
 	#[cfg(not(target_os = "macos"))]
-	pub(super) fn open_diagnostic_snapshot(
+	// The fixed unsupported answer: no selector is parsed and no path is opened.
+	pub(super) const fn open_diagnostic_snapshot(
 		_agent_dir: &str,
 		_budget_ms: u32,
 	) -> Result<DiagnosticSnapshotLease, &'static str> {
-		Err(DiagnosticFailure::Unsupported.reason())
+		Err("unsupported")
 	}
 
 	#[cfg(all(test, target_os = "macos"))]
@@ -13457,19 +13462,21 @@ mod platform {
 
 	// Read-only broker diagnostic snapshot is a Darwin-first capability; every
 	// other platform reports the fixed unsupported outcome without opening a path.
-	pub(super) enum DiagnosticSnapshotLease {}
+	// Inhabited but not constructible from outside this module: no caller can mint a
+	// lease, and the fixed unsupported answers need no filesystem access.
+	pub(super) struct DiagnosticSnapshotLease(());
 
 	impl DiagnosticSnapshotLease {
-		pub(super) fn read_bytes(&self) -> Result<Vec<u8>, &'static str> {
-			match *self {}
+		pub(super) const fn read_bytes(&self) -> Result<Vec<u8>, &'static str> {
+			Err("unsupported")
 		}
 
-		pub(super) fn revalidate_edges(&self) -> Result<(), &'static str> {
-			match *self {}
+		pub(super) const fn revalidate_edges(&self) -> Result<(), &'static str> {
+			Err("unsupported")
 		}
 	}
 
-	pub(super) fn open_diagnostic_snapshot(
+	pub(super) const fn open_diagnostic_snapshot(
 		_agent_dir: &str,
 		_budget_ms: u32,
 	) -> Result<DiagnosticSnapshotLease, &'static str> {
@@ -13579,19 +13586,21 @@ mod platform {
 
 	// Read-only broker diagnostic snapshot is a Darwin-first capability; every
 	// other platform reports the fixed unsupported outcome without opening a path.
-	pub(super) enum DiagnosticSnapshotLease {}
+	// Inhabited but not constructible from outside this module: no caller can mint a
+	// lease, and the fixed unsupported answers need no filesystem access.
+	pub(super) struct DiagnosticSnapshotLease(());
 
 	impl DiagnosticSnapshotLease {
-		pub(super) fn read_bytes(&self) -> Result<Vec<u8>, &'static str> {
-			match *self {}
+		pub(super) const fn read_bytes(&self) -> Result<Vec<u8>, &'static str> {
+			Err("unsupported")
 		}
 
-		pub(super) fn revalidate_edges(&self) -> Result<(), &'static str> {
-			match *self {}
+		pub(super) const fn revalidate_edges(&self) -> Result<(), &'static str> {
+			Err("unsupported")
 		}
 	}
 
-	pub(super) fn open_diagnostic_snapshot(
+	pub(super) const fn open_diagnostic_snapshot(
 		_agent_dir: &str,
 		_budget_ms: u32,
 	) -> Result<DiagnosticSnapshotLease, &'static str> {
@@ -15969,7 +15978,10 @@ impl NativeDiagnosticSnapshot {
 
 	#[napi]
 	pub fn close(&self) {
-		drop(self.lease.lock().take());
+		// Taking the lease releases the retained descriptors; a second close observes
+		// `None`, so close stays idempotent without an explicit drop of a non-Drop
+		// value.
+		let _released = self.lease.lock().take();
 	}
 }
 

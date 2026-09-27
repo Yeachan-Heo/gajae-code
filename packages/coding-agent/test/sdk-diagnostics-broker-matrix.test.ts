@@ -226,8 +226,10 @@ describe("observation negative matrix — facade (F5)", () => {
 		const observation = await observeExistingBroker({ agentDir });
 		expect({ ok: observation.ok, reason: observation.ok ? null : observation.unavailable.reason }).toEqual({
 			ok: false,
-			reason: "absent",
+			reason: SUPPORTED_RUNTIME ? "absent" : "unsupported",
 		});
+		// Neither route may publish or leave anything behind in the authority directory.
+		expect(await fs.readdir(path.join(agentDir, "sdk"))).toEqual([]);
 	});
 
 	it.skipIf(!SUPPORTED_RUNTIME)(

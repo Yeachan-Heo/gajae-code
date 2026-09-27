@@ -576,6 +576,12 @@ jobs:
         run: |
           test -f packages/natives/native/pi_natives.linux-x64-baseline.node
           test -f packages/natives/native/pi_natives.linux-x64-modern.node
+      # `if-no-files-found: error` only proves the glob matched something, so assert every
+      # named producer sidecar exists before the upload claims to transport trust.
+      - name: Verify producer provenance sidecars
+        run: |
+          test -f packages/natives/native/pi_natives.linux-x64-baseline.node.provenance.json
+          test -f packages/natives/native/pi_natives.linux-x64-modern.node.provenance.json
       - name: Upload native addon(s)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
@@ -583,6 +589,8 @@ jobs:
           path: |
             packages/natives/native/pi_natives.linux-x64-baseline.node
             packages/natives/native/pi_natives.linux-x64-modern.node
+            packages/natives/native/pi_natives.linux-x64-baseline.node.provenance.json
+            packages/natives/native/pi_natives.linux-x64-modern.node.provenance.json
           if-no-files-found: error
           retention-days: 1
           overwrite: true
@@ -741,6 +749,16 @@ jobs:
         with:
           name: dev-affected-native-${{ github.run_id }}
           path: packages/natives/native
+      # The transferred addons are only trusted through their producer sidecars: rebuild
+      # the record from them and verify every addon in the directory before anything in
+      # the shard can load one. Version/digest mismatches stay fail-closed.
+      - name: Rebuild and verify transferred native provenance
+        if: ${{ matrix.native }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun scripts/verify-diagnostic-artifact-provenance.ts --rebuild-from-sidecars packages/natives/native
+          bun scripts/verify-diagnostic-artifact-provenance.ts --verify packages/natives/native
       - name: Run affected task shard
         env:
           AFFECTED_TASK_KEY: ${{ matrix.key }}

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 
 /**
@@ -67,7 +68,7 @@ async function fixturePackage(
 
 describe("diagnostic artifact provenance transfer (C2)", () => {
 	it("rebuilds the trusted record from the transferred sidecars", async () => {
-		const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-prov-rebuild-"));
+		const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-prov-rebuild-"));
 		try {
 			const fixture = await fixturePackage(workspace, {
 				addons: {
@@ -99,7 +100,7 @@ describe("diagnostic artifact provenance transfer (C2)", () => {
 	});
 
 	it("refuses an addon that arrived without its provenance sidecar", async () => {
-		const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-prov-missing-"));
+		const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-prov-missing-"));
 		try {
 			const fixture = await fixturePackage(workspace, { sidecars: "none" });
 			const result = await run(["--rebuild-from-sidecars", fixture.native], workspace);
@@ -112,7 +113,7 @@ describe("diagnostic artifact provenance transfer (C2)", () => {
 	});
 
 	it("refuses a sidecar whose digest does not match the transferred bytes", async () => {
-		const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-prov-mismatch-"));
+		const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-prov-mismatch-"));
 		try {
 			const fixture = await fixturePackage(workspace, { sidecars: "mismatched" });
 			const result = await run(["--rebuild-from-sidecars", fixture.native], workspace);
@@ -124,7 +125,7 @@ describe("diagnostic artifact provenance transfer (C2)", () => {
 	});
 
 	it("fails the verify gate on a stale version or stale digest", async () => {
-		const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-prov-stale-"));
+		const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-prov-stale-"));
 		try {
 			const fixture = await fixturePackage(workspace);
 			const manifestPath = path.join(fixture.native, "diagnostic-artifact.json");
@@ -157,7 +158,7 @@ describe("diagnostic artifact provenance transfer (C2)", () => {
 	});
 
 	it("gates platform-package staging on byte equality with the trusted record", async () => {
-		const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-prov-stage-"));
+		const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-prov-stage-"));
 		try {
 			const fixture = await fixturePackage(workspace);
 			expect((await run(["--rebuild-from-sidecars", fixture.native], workspace)).exitCode).toBe(0);
@@ -181,7 +182,7 @@ describe("diagnostic artifact provenance transfer (C2)", () => {
 	});
 
 	it("never hides a build-version drift behind the re-stamped record", async () => {
-		const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-prov-drift-"));
+		const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-prov-drift-"));
 		try {
 			// The sidecar was produced by a build at 9.9.9-fixture; the package now ships
 			// 9.9.10-nightly. Re-stamping the record must not paper over that: the drift is
@@ -217,7 +218,7 @@ describe("diagnostic artifact provenance transfer (C2)", () => {
 	});
 
 	it("packs the trusted record into the real natives tarball", async () => {
-		const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-prov-pack-"));
+		const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-prov-pack-"));
 		try {
 			const packed = Bun.spawnSync({
 				cmd: [process.execPath, "pm", "pack", "--destination", workspace],
@@ -246,7 +247,7 @@ describe("diagnostic artifact provenance transfer (C2)", () => {
 	it("keeps the shipped record in step with the built addon in this checkout", async () => {
 		// The runner gets a task-owned HOME/TMPDIR even though it inspects the real
 		// package directory, so nothing is written inside the checkout.
-		const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-prov-checkout-"));
+		const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-prov-checkout-"));
 		try {
 			const result = await run(["--verify", path.join(NATIVES_PACKAGE, "native")], workspace);
 			expect(result.exitCode).toBe(0);

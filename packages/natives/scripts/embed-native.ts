@@ -129,11 +129,14 @@ async function assertTrustedArtifactRecord(): Promise<void> {
 }
 
 async function embedNative(): Promise<void> {
-	await assertTrustedArtifactRecord();
+	// Restoring the constant null stub neither selects nor reads an addon, so it stays
+	// available even when a present artifact has no trusted record. Every real embedding
+	// below still passes the provenance gate before any require or output mutation.
 	if (process.argv.includes("--reset")) {
 		await Bun.write(outputPath, stubContent);
 		return;
 	}
+	await assertTrustedArtifactRecord();
 
 	const targetPlatform = Bun.env.TARGET_PLATFORM || process.platform;
 	const targetArch = Bun.env.TARGET_ARCH || process.arch;

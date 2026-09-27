@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { parse } from "yaml";
 
@@ -83,7 +84,7 @@ describe("cross-platform run steps declare their shell", () => {
 		// Exactly one of them is the cross-platform binaries step.
 		expect(provenanceSteps.filter(step => step.windowsCapable).length).toBe(1);
 		expect(provenanceSteps.length).toBeGreaterThanOrEqual(2);
-		const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-ci-shell-"));
+		const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-ci-shell-"));
 		const bash = Bun.which("bash") ?? "/bin/bash";
 		try {
 			for (const [index, step] of provenanceSteps.entries()) {

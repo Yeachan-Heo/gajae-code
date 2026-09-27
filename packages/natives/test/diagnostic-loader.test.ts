@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 
 /**
@@ -135,7 +136,7 @@ const result = loaded.ok
 	: { ok: false, reason: loaded.reason };
 console.log(JSON.stringify({ result, mutations }));
 `;
-	const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-diag-loader-"));
+	const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-diag-loader-"));
 	try {
 		const harnessPath = path.join(workspace, "harness.ts");
 		await Bun.write(harnessPath, harness);
@@ -230,7 +231,7 @@ describe("read-only diagnostic native loader (B3)", () => {
 	});
 
 	it.skipIf(!SUPPORTED_RUNTIME)("reports unsupported for a corrupt artifact without repairing it", async () => {
-		const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-diag-corrupt-"));
+		const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-diag-corrupt-"));
 		try {
 			const corruptNative = await fixturePackage(workspace);
 			await Bun.write(path.join(corruptNative, "pi_natives.darwin-arm64.node"), "not a mach-o addon");
@@ -271,7 +272,7 @@ console.log(JSON.stringify(loaded.ok ? { ok: true } : { ok: false, reason: loade
 	});
 
 	it.skipIf(!SUPPORTED_RUNTIME)("reports unsupported for a missing artifact", async () => {
-		const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-diag-missing-"));
+		const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-diag-missing-"));
 		try {
 			const emptyNative = await fixturePackage(workspace);
 			const harness = path.join(workspace, "missing.ts");
@@ -385,7 +386,7 @@ console.log(JSON.stringify(loaded.ok ? { ok: true } : { ok: false, reason: loade
 	it.skipIf(!SUPPORTED_RUNTIME)(
 		"refuses an artifact whose bytes are not the trusted ones, even when it self-reports the right version",
 		async () => {
-			const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-diag-digest-"));
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-diag-digest-"));
 			try {
 				const fixture = await fixtureNatives(workspace, { digest: "0".repeat(64) });
 				await fs.copyFile(ARTIFACT, path.join(fixture.native, ADDON_BASENAME));
@@ -403,7 +404,7 @@ console.log(JSON.stringify(loaded.ok ? { ok: true } : { ok: false, reason: loade
 		"refuses a symlinked artifact and a symlinked ancestor",
 		async () => {
 			for (const shape of ["artifact", "ancestor"] as const) {
-				const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", `gjc-diag-link-${shape}-`));
+				const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), `gjc-diag-link-${shape}-`));
 				try {
 					const fixture = await fixtureNatives(workspace);
 					const real = path.join(workspace, "real-addon.node");
@@ -439,7 +440,7 @@ console.log(JSON.stringify(loaded.ok ? { ok: true } : { ok: false, reason: loade
 	it.skipIf(!SUPPORTED_RUNTIME)(
 		"refuses a group-writable artifact",
 		async () => {
-			const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-diag-mode-"));
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-diag-mode-"));
 			try {
 				const fixture = await fixtureNatives(workspace);
 				const artifact = path.join(fixture.native, ADDON_BASENAME);
@@ -456,7 +457,7 @@ console.log(JSON.stringify(loaded.ok ? { ok: true } : { ok: false, reason: loade
 	it.skipIf(!SUPPORTED_RUNTIME)(
 		"refuses to load without a package-owned trusted digest entry",
 		async () => {
-			const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-diag-nomanifest-"));
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-diag-nomanifest-"));
 			try {
 				const fixture = await fixtureNatives(workspace, { omitManifest: true });
 				await fs.copyFile(ARTIFACT, path.join(fixture.native, ADDON_BASENAME));
@@ -476,7 +477,7 @@ console.log(JSON.stringify(loaded.ok ? { ok: true } : { ok: false, reason: loade
 	it.skipIf(!SUPPORTED_RUNTIME)(
 		"loads the real published layout: the optional platform package supplies the artifact (R5)",
 		async () => {
-			const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-diag-pack-"));
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-diag-pack-"));
 			try {
 				const fixture = await fixtureNatives(workspace);
 				// No addon beside the loader: exactly the `npm pack` layout of
@@ -558,7 +559,7 @@ describe("artifact activation is pinned to the verified bytes (R1 reopened)", ()
 	it.skipIf(!SUPPORTED_RUNTIME)(
 		"activates the exact verified bytes even after the pathname is replaced",
 		async () => {
-			const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-diag-swap-"));
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-diag-swap-"));
 			try {
 				const { loader, artifact } = await fixture(workspace);
 				// Two-phase boundary: verification hands back a pinned handle, activation
@@ -602,7 +603,7 @@ console.log(JSON.stringify({
 	it.skipIf(!SUPPORTED_RUNTIME)(
 		"pins activation to the descriptor's vnode, not to the pathname",
 		async () => {
-			const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-diag-vnode-"));
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-diag-vnode-"));
 			try {
 				const original = path.join(workspace, "original.bin");
 				await Bun.write(original, "original-bytes");
@@ -639,7 +640,7 @@ console.log(JSON.stringify({
 		"refuses an artifact whose ancestor is writable by group or other, before any activation",
 		async () => {
 			for (const mode of [0o777, 0o757, 0o775] as const) {
-				const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-diag-ambient-"));
+				const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-diag-ambient-"));
 				try {
 					const { loader, native } = await fixture(workspace);
 					await fs.chmod(native, mode);
@@ -671,7 +672,7 @@ console.log(JSON.stringify({
 	it.skipIf(!SUPPORTED_RUNTIME)(
 		"never activates bytes that failed verification",
 		async () => {
-			const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-diag-noactivate-"));
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-diag-noactivate-"));
 			try {
 				const { loader, artifact } = await fixture(workspace);
 				// Genuine addon bytes, but the trusted record is replaced with another digest:
@@ -779,7 +780,7 @@ describe("pre-activation namespace authority (C1)", () => {
 	it.skipIf(!SUPPORTED_RUNTIME)(
 		"refuses to activate bytes that were modified in place after verification",
 		async () => {
-			const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-diag-inplace-"));
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-diag-inplace-"));
 			try {
 				const { loader, artifact } = await fixture(workspace);
 				// The same inode is written again between verification and activation with
@@ -823,7 +824,7 @@ console.log(JSON.stringify({
 	it.skipIf(!SUPPORTED_RUNTIME)(
 		"still activates an untouched verified artifact (C1 control)",
 		async () => {
-			const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-diag-untouched-"));
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-diag-untouched-"));
 			try {
 				const { loader, artifact } = await fixture(workspace);
 				const script = `const { verifyDiagnosticArtifact, activateVerifiedArtifact } = await import(${JSON.stringify(
@@ -897,7 +898,7 @@ describe("verified handle lifetime (C3)", () => {
 	it.skipIf(!SUPPORTED_RUNTIME)(
 		"exposes no raw descriptor and consumes the handle exactly once",
 		async () => {
-			const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-diag-handle-"));
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-diag-handle-"));
 			try {
 				const { loader, artifact, other } = await fixture(workspace);
 				const script = `const fs = require("node:fs");
@@ -1048,7 +1049,7 @@ console.log(JSON.stringify(loaded.ok ? { ok: true } : { ok: false, reason: loade
 			const { inspectAclOnDescriptor } = (await import(LOADER)) as {
 				inspectAclOnDescriptor: (fd: number) => "absent" | "present" | "unproven";
 			};
-			const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-acl-api-"));
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-acl-api-"));
 			try {
 				const clean = path.join(workspace, "clean.bin");
 				const guarded = path.join(workspace, "guarded.bin");
@@ -1089,7 +1090,7 @@ console.log(JSON.stringify(loaded.ok ? { ok: true } : { ok: false, reason: loade
 				inspectAclOnDescriptor: (descriptor: number) => "absent" | "present" | "unproven";
 			};
 			const nodeFs = await import("node:fs");
-			const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-acl-nondarwin-"));
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-acl-nondarwin-"));
 			try {
 				const file = path.join(workspace, "plain.bin");
 				await Bun.write(file, "plain");
@@ -1117,7 +1118,7 @@ console.log(JSON.stringify(loaded.ok ? { ok: true } : { ok: false, reason: loade
 				inspectAclOnDescriptor: (descriptor: number) => "absent" | "present" | "unproven";
 			};
 			const nodeFs = await import("node:fs");
-			const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-acl-errno-"));
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-acl-errno-"));
 			try {
 				const clean = path.join(workspace, "clean.bin");
 				await Bun.write(clean, "clean");
@@ -1173,7 +1174,7 @@ console.log(JSON.stringify(loaded.ok ? { ok: true } : { ok: false, reason: loade
 	it.skipIf(!SUPPORTED_RUNTIME)(
 		"refuses an artifact whose ACL grants write to another account",
 		async () => {
-			const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-acl-grant-"));
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-acl-grant-"));
 			try {
 				const { loader, artifact } = await fixture(workspace);
 				// Contract-aware baseline: a trusted ancestor above the anchor may carry the
@@ -1203,7 +1204,7 @@ console.log(JSON.stringify(loaded.ok ? { ok: true } : { ok: false, reason: loade
 	it.skipIf(!SUPPORTED_RUNTIME)(
 		"refuses an artifact whose directory ACL grants write",
 		async () => {
-			const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-acl-dir-"));
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-acl-dir-"));
 			try {
 				const { loader, artifact, native } = await fixture(workspace);
 				// Contract-aware baseline: a trusted ancestor above the anchor may carry the
@@ -1248,7 +1249,7 @@ int *__error(void) { static int e = 0; return &e; }
 	it.skipIf(process.platform !== "darwin")(
 		"keeps the same bootstrap guarantees inside an actual compiled binary",
 		async () => {
-			const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-shadow-compiled-"));
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-shadow-compiled-"));
 			try {
 				await Bun.write(path.join(workspace, "shadow.c"), SHADOW_SOURCE);
 				const built = Bun.spawnSync({
@@ -1344,7 +1345,7 @@ console.log(JSON.stringify({
 	it.skipIf(process.platform !== "darwin")(
 		"never initializes a task-owned shadow library and refuses a dyld-override environment before dlopen",
 		async () => {
-			const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-shadow-"));
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-shadow-"));
 			try {
 				await Bun.write(path.join(workspace, "shadow.c"), SHADOW_SOURCE);
 				const built = Bun.spawnSync({
@@ -1422,7 +1423,7 @@ console.log(JSON.stringify({
 				expect(inserted.markerRan).toBe(true);
 
 				// Trusted positive: no shadow in the working directory, no override.
-				const clean = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-shadow-clean-"));
+				const clean = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-shadow-clean-"));
 				try {
 					expect(run(clean, {})).toEqual({ classification: "absent", markerRan: false });
 				} finally {
@@ -1522,7 +1523,7 @@ describe("artifact namespace anchor policy and real activation (ACL contract)", 
 	it.skipIf(!SUPPORTED_RUNTIME)(
 		"activates the real addon with the approved ancestor exception above the anchor",
 		async () => {
-			const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-acl-activate-"));
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-acl-activate-"));
 			try {
 				const { above, loader, artifact } = await fixture(workspace);
 				installAcl(above, "everyone deny delete");
@@ -1547,7 +1548,7 @@ console.log(JSON.stringify({
 	it.skipIf(!SUPPORTED_RUNTIME)(
 		"drives a real lease through the loader API and refuses after a fixture mutation",
 		async () => {
-			const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-acl-lease-"));
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-acl-lease-"));
 			try {
 				const { above, loader } = await fixture(workspace);
 				installAcl(above, "everyone deny delete");
@@ -1605,7 +1606,7 @@ console.log(JSON.stringify({
 		"keeps the artifact namespace anchor and leaf strict",
 		async () => {
 			for (const target of ["anchor", "artifact"] as const) {
-				const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", `gjc-acl-anchor-${target}-`));
+				const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), `gjc-acl-anchor-${target}-`));
 				try {
 					const fixtures = await fixture(workspace);
 					installAcl(fixtures.above, "everyone deny delete");
@@ -1644,7 +1645,7 @@ console.log(JSON.stringify(loaded.ok ? { ok: true } : { ok: false, reason: loade
 				["multiple-deny", ["everyone deny delete", "staff deny delete"]],
 			];
 			for (const [label, specs] of cases) {
-				const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-acl-neg-"));
+				const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-acl-neg-"));
 				try {
 					const fixtures = await fixture(workspace);
 					for (const spec of specs) installAcl(fixtures.above, spec);
@@ -1774,7 +1775,7 @@ try {
 	it.skipIf(process.platform !== "darwin")(
 		"refuses an ACL whose completeness is outside the exact approved mask",
 		async () => {
-			const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-acl-mask-"));
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-acl-mask-"));
 			const targets: string[] = [];
 			try {
 				const tool = await craftTool(workspace);
@@ -1806,7 +1807,7 @@ try {
 	it.skipIf(process.platform !== "darwin")(
 		"never treats an iteration failure as proof of a single entry",
 		async () => {
-			const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-acl-count-"));
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-acl-count-"));
 			const targets: string[] = [];
 			try {
 				// The patched copy lives in a fixture package so its sibling imports resolve.
@@ -2199,7 +2200,7 @@ console.log(JSON.stringify({
 	it.skipIf(process.platform !== "darwin")(
 		"closes every COUNT call-boundary failure on the real source",
 		async () => {
-			const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-acl-matrix-count-"));
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-acl-matrix-count-"));
 			const targets: string[] = [];
 			try {
 				const native = await fixturePackage(workspace);
@@ -2468,7 +2469,7 @@ console.log(JSON.stringify({
 	it.skipIf(process.platform !== "darwin")(
 		"closes every FFI failure on the real source and frees the handle exactly once",
 		async () => {
-			const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-acl-matrix-ffi-"));
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-acl-matrix-ffi-"));
 			const targets: string[] = [];
 			try {
 				const native = await fixturePackage(workspace);
@@ -2585,7 +2586,7 @@ console.log(JSON.stringify({
 	it.skipIf(process.platform !== "darwin")(
 		"traces reset -> call -> capture -> free at the iterator boundaries",
 		async () => {
-			const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-acl-matrix-trace-"));
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-acl-matrix-trace-"));
 			const targets: string[] = [];
 			try {
 				const native = await fixturePackage(workspace);
@@ -2951,7 +2952,7 @@ if (!loaded.ok) {
 	it.skipIf(!SUPPORTED_RUNTIME)(
 		"uses the already verified cached artifact, exercises the lease and extracts nothing",
 		async () => {
-			const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-diag-compiled-"));
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-diag-compiled-"));
 			try {
 				const version = await packageVersion();
 				const dir = await cacheDir(workspace, version);
@@ -3002,7 +3003,7 @@ if (!loaded.ok) {
 	it.skipIf(!SUPPORTED_RUNTIME)(
 		"reports unsupported when the cache is absent",
 		async () => {
-			const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-diag-compiled-absent-"));
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-diag-compiled-absent-"));
 			try {
 				const binary = await buildCompiledProbe(workspace);
 				const { parsed } = await runCompiled(binary, workspace);
@@ -3019,7 +3020,7 @@ if (!loaded.ok) {
 	it.skipIf(!SUPPORTED_RUNTIME)(
 		"reports unsupported for a corrupt cached artifact",
 		async () => {
-			const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-diag-compiled-corrupt-"));
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-diag-compiled-corrupt-"));
 			try {
 				const version = await packageVersion();
 				const dir = await cacheDir(workspace, version);
@@ -3066,7 +3067,7 @@ if (!loaded.ok) {
 		async () => {
 			const realVersion = await packageVersion();
 			for (const expectedVersion of [realVersion, "0.0.0-fixture"]) {
-				const workspace = await fs.mkdtemp(path.join(process.env.TMPDIR ?? ".", "gjc-diag-version-"));
+				const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-diag-version-"));
 				try {
 					const root = await fixturePackageRoot(workspace, expectedVersion);
 					// The cache slot the loader will consult for this expected version.
