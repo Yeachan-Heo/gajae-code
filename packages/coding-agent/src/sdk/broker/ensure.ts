@@ -28,16 +28,26 @@ import {
 } from "./startup-failure";
 
 /**
- * On Windows, spawning a detached process requires an intermediate launcher.
- * This is because `detached: true` on Windows keeps the child in the parent's
-/**
- * descendant of cmd rather than the parent, allowing it to survive parent termination.
- *
- * Returns the file and arguments to spawn. On Windows, wraps the real command
- * in `cmd /c start`. On other platforms, returns the original command and arguments.
+ * Escape arguments for cmd.exe parsing. Wraps each argument in quotes and
+ * escapes internal quotes. This prevents cmd.exe from interpreting special
+ * characters like %, &, ^, <, >, and | as command operators.
  */
-function resolveBrokerSpawnOptions(file: string, args: readonly string[]): { file: string; args: string[] } {
-	if (process.platform !== "win32") {
+function escapeCmdArgument(arg: string): string {
+	// Wrap in quotes and escape any internal quotes by doubling them
+	return `"${arg.replace(/"/g, '""')}"`;
+}
+
+/**
+ * Resolve broker spawn options based on the platform.
+ * On Windows, wraps the command in cmd /c start. On other platforms, returns unchanged.
+ * Exposed for testing with platform injection.
+ */
+function resolveBrokerSpawnOptionsWithPlatform(
+	file: string,
+	args: readonly string[],
+	platform: NodeJS.Platform,
+): { file: string; args: string[] } {
+	if (platform !== "win32") {
 		return { file, args: Array.from(args) };
 	}
 	// On Windows, use cmd /c start /b to spawn without a new console window
@@ -46,11 +56,26 @@ function resolveBrokerSpawnOptions(file: string, args: readonly string[]): { fil
 	// The empty title "" is required: start treats its first quoted argument as
 	// the window title, so paths containing spaces would be consumed as the title
 	// rather than executed. Provide an explicit empty title to avoid this.
-	// Format: cmd /c start "" /b <file> <args...>
+	// The file path and arguments are wrapped in quotes to prevent cmd.exe from
+	// interpreting special characters like %, &, ^, <, >, and | as command operators.
+	// Format: cmd /c start "" /b "<file>" "<arg1>" "<arg2>" ...
 	return {
 		file: "cmd",
-		args: ["/c", "start", "", "/b", file, ...args],
+		args: ["/c", "start", "", "/b", escapeCmdArgument(file), ...args.map(escapeCmdArgument)],
 	};
+}
+
+/**
+ * On Windows, spawning a detached process requires an intermediate launcher.
+ * This is because `detached: true` on Windows keeps the child in the parent's
+ * process tree as a descendant of cmd rather than the parent, allowing it to
+ * survive parent termination.
+ *
+ * Returns the file and arguments to spawn. On Windows, wraps the real command
+ * in `cmd /c start`. On other platforms, returns the original command and arguments.
+ */
+function resolveBrokerSpawnOptions(file: string, args: readonly string[]): { file: string; args: string[] } {
+	return resolveBrokerSpawnOptionsWithPlatform(file, args, process.platform);
 }
 
 function resolveExpectedBrokerGeneration(): string {
@@ -484,16 +509,31 @@ function registerBrokerOwner(
 	child: ChildProcess,
 	timing: ReapTiming = DEFAULT_REAP_TIMING,
 ): BrokerOwner {
-	const incarnation = child.pid === undefined ? undefined : brokerProcessIncarnation(child.pid);
+	const isWindows = process.platform === "win32";
+	// On Windows, child is cmd.exe (launcher), not the real broker. The real broker
+	// publishes its own pid in the discovery, so we can't match child.pid.
+	// On other platforms, child is the actual broker.
+	const launcherIncarnation = isWindows
+		? undefined
+		: child.pid === undefined
+			? undefined
+			: brokerProcessIncarnation(child.pid);
 	let state: "starting" | "ready" | "cleanup-unverified" = "starting";
-	const matches = (discovery: BrokerDiscovery | null): boolean =>
-		Boolean(
-			discovery &&
-				child.pid !== undefined &&
-				incarnation &&
+	const matches = (discovery: BrokerDiscovery | null): boolean => {
+		if (!discovery) return false;
+		if (isWindows) {
+			// On Windows, just verify we got a valid discovery. The spawned broker
+			// publishes its own pid, which we can't predict before spawn.
+			return true;
+		}
+		// On other platforms, verify the discovery comes from the child we spawned
+		return Boolean(
+			child.pid !== undefined &&
+				launcherIncarnation &&
 				discovery.pid === child.pid &&
-				discovery.incarnation === incarnation,
+				discovery.incarnation === launcherIncarnation,
 		);
+	};
 	const owner: BrokerOwner = {
 		async stop(): Promise<void> {
 			try {
@@ -778,12 +818,16 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		const exitedBeforeDiscovery = child.exitCode !== null || child.signalCode !== null;
 		const marker = await readBrokerStartupFailureMarker(settings.agentDir);
 		const startupExitRecord = await readBrokerStartupExitRecord(settings.agentDir);
+		const isWindows = process.platform === "win32";
+		// On Windows, child is cmd.exe (launcher), not the real broker.
+		// The real broker writes the marker with its own pid.
+		// We can't verify the pid match, but we can verify the timestamp.
 		const trustedMarker =
 			marker &&
-			child.pid !== undefined &&
 			childIncarnation !== undefined &&
-			marker.pid === child.pid &&
-			marker.incarnation === childIncarnation
+			(isWindows
+				? marker.writtenAt >= childSpawnedAt
+				: child.pid !== undefined && marker.pid === child.pid && marker.incarnation === childIncarnation)
 				? marker
 				: undefined;
 		const trustedStartupExitRecord =
@@ -1006,4 +1050,13 @@ export function resolveBrokerSpawnOptionsForTest(
 	args: readonly string[],
 ): { file: string; args: string[] } {
 	return resolveBrokerSpawnOptions(file, args);
+}
+
+/** Test hook: allows testing platform-specific behavior by injecting the platform parameter. */
+export function resolveBrokerSpawnOptionsWithPlatformForTest(
+	file: string,
+	args: readonly string[],
+	platform: NodeJS.Platform,
+): { file: string; args: string[] } {
+	return resolveBrokerSpawnOptionsWithPlatform(file, args, platform);
 }
