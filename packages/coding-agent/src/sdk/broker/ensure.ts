@@ -104,45 +104,88 @@ function spawnBrokerWithHop(
 		cwd?: string;
 	},
 ): BrokerSpawnResult {
-	if (process.platform === "win32") {
-		// On Windows, spawn the hop process which will spawn the real broker.
-		const hopMessage = {
-			command: {
-				file: brokerFile,
-				args: Array.from(brokerArgs),
-			},
-			env: options.env,
-			stdio: options.stdioFd ?? "ignore",
-			...(options.cwd ? { cwd: options.cwd } : {}),
-		};
+	// POSIX: spawn the broker directly with detached:true.
+	const child = spawn(brokerFile, Array.from(brokerArgs), {
+		detached: true,
+		stdio: ["ignore", "ignore", options.stdioFd ?? "ignore"],
+		env: options.env,
+		...(options.cwd ? { cwd: options.cwd } : {}),
+	});
+	return { process: child, realBrokerPid: child.pid };
+}
 
-		const hopCmd = resolveHopInvocation(JSON.stringify(hopMessage));
-		const child = spawn(hopCmd.file, hopCmd.args, {
-			detached: false,
-			...(options.cwd ? { cwd: options.cwd } : {}),
-			windowsHide: true,
-			stdio: ["ignore", "pipe", "pipe"],
-			env: process.env,
-		});
+/** What the parent sends the Windows hop. The broker environment is never serialized here. */
+export interface BrokerHopMessage {
+	command: { file: string; args: string[] };
+	cwd?: string;
+	/** Path (never an inherited fd number) the hop opens for the broker's stderr. */
+	stderrLogPath?: string;
+}
 
-		return {
-			process: child,
-			realBrokerPid: undefined, // Will be read from hop stdout
-		};
-	} else {
-		// On POSIX, spawn the broker directly with detached:true.
-		const child = spawn(brokerFile, Array.from(brokerArgs), {
-			detached: true,
-			stdio: ["ignore", "ignore", options.stdioFd ?? "ignore"],
-			env: options.env,
-			...(options.cwd ? { cwd: options.cwd } : {}),
-		});
+export interface BrokerHopLaunch {
+	process: ChildProcess;
+	realBrokerPid: number | undefined;
+	error: Error | undefined;
+}
 
-		return {
-			process: child,
-			realBrokerPid: child.pid,
-		};
+/**
+ * Windows only: launch the broker through the internal hop and await its reply.
+ *
+ * `taskkill /T /F` walks ParentProcessId, so a broker spawned directly by the client
+ * dies with it even when detached. The hop spawns the broker and exits at once,
+ * leaving the broker without a live parent in the client's tree. The broker
+ * environment reaches the hop as its own process environment (the broker inherits
+ * it), never on the command line, and stderr is passed as a path because a parent
+ * fd number does not exist inside the hop.
+ */
+export async function launchBrokerViaHop(
+	message: BrokerHopMessage,
+	options: { env: NodeJS.ProcessEnv; cwd?: string },
+): Promise<BrokerHopLaunch> {
+	const hopCmd = resolveHopInvocation(JSON.stringify(message));
+	const hop = spawn(hopCmd.file, hopCmd.args, {
+		detached: false,
+		windowsHide: true,
+		stdio: ["ignore", "pipe", "pipe"],
+		env: options.env,
+		...(options.cwd ? { cwd: options.cwd } : {}),
+	});
+	let stdout = "";
+	hop.stdout?.on("data", chunk => {
+		stdout += chunk.toString();
+	});
+	hop.stderr?.resume();
+	const outcome = await new Promise<{ code: number | null; spawnError?: Error }>(resolve => {
+		hop.once("error", spawnError => resolve({ code: null, spawnError }));
+		hop.once("close", code => resolve({ code }));
+	});
+	return { process: hop, ...parseBrokerHopReply(outcome.code, stdout, outcome.spawnError) };
+}
+
+/** Parses the hop's single-line `{"pid":N}` reply into a broker pid or a typed error. */
+export function parseBrokerHopReply(
+	code: number | null,
+	stdout: string,
+	spawnError?: Error,
+): { realBrokerPid: number | undefined; error: Error | undefined } {
+	const fail = (reason: string) => ({
+		realBrokerPid: undefined,
+		error: new BrokerHopError({ exitCode: code, stdout, reason }),
+	});
+	if (spawnError) return fail(`hop could not be spawned: ${spawnError.message}`);
+	if (code !== 0) return fail(`hop process exited with non-zero code ${code}`);
+	const line = stdout.trim();
+	if (!line) return fail("hop exited with code 0 but no response on stdout");
+	let reply: unknown;
+	try {
+		reply = JSON.parse(line);
+	} catch (error) {
+		return fail(`failed to parse hop JSON response: ${error instanceof Error ? error.message : String(error)}`);
 	}
+	const pid = (reply as { pid?: unknown } | null)?.pid;
+	if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0)
+		return fail(`hop response missing or invalid pid: ${String(pid)}`);
+	return { realBrokerPid: pid, error: undefined };
 }
 
 function resolveExpectedBrokerGeneration(): string {
@@ -871,73 +914,22 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		let spawnError: Error | undefined;
 
 		if (process.platform === "win32") {
-			// On Windows, spawn the hop which will spawn the real broker.
-			spawnResult = spawnBrokerWithHop(brokerSpawnOpts.file, brokerSpawnOpts.args, {
-				stdioFd: spawnLog?.handle.fd,
-				env,
-				cwd: command.kind === "bun-source" ? command.cwd : undefined,
-			});
-
-			const hopProcess = spawnResult.process;
-			hopProcess.once("error", error => {
-				spawnError = error;
-			});
-
-			// Read the real broker pid from the hop's stdout.
-			if (hopProcess.stdout) {
-				let hopStdout = "";
-				hopProcess.stdout.on("data", chunk => {
-					hopStdout += chunk.toString();
-				});
-
-				// Wait for the hop process to exit and parse the response.
-				await new Promise<void>((resolve, reject) => {
-					hopProcess.on("close", code => {
-						if (code !== 0) {
-							spawnError ??= new BrokerHopError({
-								exitCode: code,
-								stdout: hopStdout,
-								reason: `hop process exited with non-zero code ${code}`,
-							});
-						} else if (hopStdout.trim()) {
-							try {
-								const hopResponse = JSON.parse(hopStdout.trim());
-								if (typeof hopResponse.pid !== "number") {
-									spawnError ??= new BrokerHopError({
-										exitCode: code,
-										stdout: hopStdout,
-										reason: `hop response missing or invalid pid: ${String(hopResponse.pid)}`,
-									});
-								} else {
-									spawnResult.realBrokerPid = hopResponse.pid;
-								}
-							} catch (error) {
-								spawnError ??= new BrokerHopError({
-									exitCode: code,
-									stdout: hopStdout,
-									reason: `failed to parse hop JSON response: ${error instanceof Error ? error.message : String(error)}`,
-								});
-							}
-						} else {
-							spawnError ??= new BrokerHopError({
-								exitCode: code,
-								stdout: hopStdout,
-								reason: "hop exited with code 0 but no response on stdout",
-							});
-						}
-						resolve();
-					});
-					hopProcess.on("error", reject);
-				});
-			}
+			const launched = await launchBrokerViaHop(
+				{
+					command: { file: brokerSpawnOpts.file, args: brokerSpawnOpts.args },
+					...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
+					...(spawnLog ? { stderrLogPath: spawnLog.path } : {}),
+				},
+				{ env, cwd: command.kind === "bun-source" ? command.cwd : undefined },
+			);
+			spawnResult = { process: launched.process, realBrokerPid: launched.realBrokerPid };
+			spawnError = launched.error;
 		} else {
-			// On POSIX, spawn the broker directly.
 			spawnResult = spawnBrokerWithHop(brokerSpawnOpts.file, brokerSpawnOpts.args, {
 				stdioFd: spawnLog?.handle.fd,
 				env,
 				cwd: command.kind === "bun-source" ? command.cwd : undefined,
 			});
-
 			spawnResult.process.once("error", error => {
 				spawnError = error;
 			});

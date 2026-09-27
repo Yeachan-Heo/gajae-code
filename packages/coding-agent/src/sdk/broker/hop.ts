@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
+import * as fs from "node:fs";
 import process from "node:process";
+import type { BrokerHopMessage } from "./ensure";
 
 /**
  * Windows broker hop: spawns the real broker with detached:true and reports its pid.
@@ -17,65 +19,37 @@ import process from "node:process";
  * Exits with code 1 on spawn failure (error logged to stderr).
  */
 
-interface HopMessage {
-	command: {
-		file: string;
-		args: string[];
-	};
-	env: Record<string, string>;
-	stdio: "ignore" | number;
-	cwd?: string;
-}
-
 export async function runBrokerHopFromArgv(argv: string[]): Promise<void> {
-	if (argv.length !== 1) {
-		process.stderr.write("gjc: broker hop requires exactly one argument\n");
-		process.exit(1);
-	}
-
-	let message: HopMessage;
+	if (argv.length !== 1) fail("broker hop requires exactly one argument");
+	let message: BrokerHopMessage;
 	try {
-		message = JSON.parse(argv[0]);
+		message = JSON.parse(argv[0]) as BrokerHopMessage;
 	} catch (error) {
-		process.stderr.write(
-			`gjc: broker hop JSON parse error: ${error instanceof Error ? error.message : String(error)}\n`,
-		);
-		process.exit(1);
+		fail(`broker hop JSON parse error: ${error instanceof Error ? error.message : String(error)}`);
 	}
-
-	if (!message.command?.file || !Array.isArray(message.command.args)) {
-		process.stderr.write("gjc: broker hop message missing command\n");
-		process.exit(1);
-	}
-
-	if (!message.env || typeof message.env !== "object") {
-		process.stderr.write("gjc: broker hop message missing env\n");
-		process.exit(1);
-	}
-
-	const stdioArg = message.stdio === "ignore" ? "ignore" : (message.stdio as any);
-
+	if (!message.command?.file || !Array.isArray(message.command.args)) fail("broker hop message missing command");
 	try {
+		// stderr is opened here by path: a parent fd number is meaningless in this process.
+		const stderr = message.stderrLogPath ? fs.openSync(message.stderrLogPath, "a") : "ignore";
+		// The broker inherits this process's environment, which the parent set to the
+		// broker environment; it is never carried on the command line.
 		const child = spawn(message.command.file, message.command.args, {
 			detached: true,
 			windowsHide: true,
-			stdio: ["ignore", "ignore", stdioArg],
-			env: message.env,
+			stdio: ["ignore", "ignore", stderr],
+			env: process.env,
 			...(message.cwd ? { cwd: message.cwd } : {}),
 		});
+		if (typeof stderr === "number") fs.closeSync(stderr);
+		if (child.pid === undefined) fail("broker hop spawn succeeded but child pid unavailable");
 		child.unref();
-
-		if (child.pid === undefined) {
-			process.stderr.write("gjc: broker hop spawn succeeded but child pid unavailable\n");
-			process.exit(1);
-		}
-
-		// Write the real broker pid to stdout as JSON and exit immediately.
-		// The parent process reads this line to learn the real broker's pid.
-		process.stdout.write(`${JSON.stringify({ pid: child.pid })}\n`);
-		process.exit(0);
+		process.stdout.write(`${JSON.stringify({ pid: child.pid })}\n`, () => process.exit(0));
 	} catch (error) {
-		process.stderr.write(`gjc: broker hop spawn failed: ${error instanceof Error ? error.message : String(error)}\n`);
-		process.exit(1);
+		fail(`broker hop spawn failed: ${error instanceof Error ? error.message : String(error)}`);
 	}
+}
+
+function fail(message: string): never {
+	process.stderr.write(`gjc: ${message}\n`);
+	process.exit(1);
 }
