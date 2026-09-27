@@ -127,8 +127,7 @@ type LockInfo = FileLockOwnerToken;
 
 export const FileLockTestHooks: {
 	afterParentMkdir?: (lockPath: string) => void | Promise<void>;
-	beforeEmptyLockDirRename?: (lockDir: string) => void | Promise<void>;
-	afterEmptyLockDirRename?: (tombstonePath: string) => void | Promise<void>;
+	beforeEmptyLockDirRmdir?: (lockDir: string) => void | Promise<void>;
 	nativePublicationBindings?: () => {
 		renameNoReplacePathAsync: typeof renameNoReplacePathAsync;
 		renameDirectoryNoReplacePathAsync: typeof renameDirectoryNoReplacePathAsync;
@@ -1774,62 +1773,13 @@ function manualLockCleanupCommand(lockPath: string): string {
 }
 
 /**
- * Restore a moved directory from tombstone back to original location if needed.
- * Called when identity mismatch or info file is detected after rename, meaning
- * a successor was created at the original lockDir after we moved the original to tombstone.
- * Restoring ensures the successor's lock is not left orphaned.
- *
- * Only restores if lockDir does not exist; if restore fails, fails loudly with
- * a manual cleanup hint to prevent silent mutual-exclusion breakage.
- */
-async function restoreMovedLockDir(lockDir: string, tombstonePath: string): Promise<void> {
-	let lockDirExists = false;
-	try {
-		await fs.lstat(lockDir, { bigint: true });
-		lockDirExists = true;
-	} catch (error) {
-		if (!isEnoent(error)) throw error;
-	}
-
-	// lockDir exists already (e.g., successor was created), so don't restore
-	// The tombstone will be left for manual cleanup
-	if (lockDirExists) return;
-
-	// lockDir doesn't exist; restore the tombstone
-	try {
-		await fs.rename(tombstonePath, lockDir);
-	} catch (error) {
-		// Restoration failed; this could mean:
-		// - The tombstone was already removed by another process
-		// - lockDir was created by another process between our check and rename
-		// - Some other filesystem error occurred
-		// Fail loudly with a manual cleanup hint to prevent silent breakage
-		if (isEnoent(error)) {
-			// Tombstone gone; that's acceptable, just return
-			return;
-		}
-		if (isTransientReleaseError(error)) throw error;
-		// Non-transient error during restore; fail loudly
-		const cleanup = manualLockCleanupCommand(tombstonePath);
-		throw Object.assign(
-			new Error(
-				`Failed to restore lock directory from ${tombstonePath} to ${lockDir}. ` +
-					`This may break mutual exclusion. Manual cleanup required: ${cleanup}`,
-			),
-			{ code: "lock_restore_failed", lockDir, tombstonePath },
-		);
-	}
-}
-
-/**
  * Remove an empty lock directory (no info file) after its identity is verified.
  * Empty directories can result from a release/removal that deleted the info file
  * but left the directory. If the root identity matches, the directory is safe to remove.
  *
- * To avoid TOCTOU races where a concurrent reclaimer creates a successor lock
- * after we verify the directory is empty but before we delete it, we atomically
- * rename the directory to a unique tombstone name first, then re-verify its identity,
- * then remove only the tombstone. If the rename fails or identity changes, we fail closed.
+ * Uses non-recursive rmdir() to ensure atomicity and prevent TOCTOU races.
+ * If rmdir succeeds, the directory is gone. If it fails with ENOTEMPTY,
+ * a concurrent reclaimer has created a successor, and we fail closed.
  */
 async function removeEmptyFileLockDir(
 	lockDir: string,
@@ -1861,80 +1811,25 @@ async function removeEmptyFileLockDir(
 	}
 	if (infoExists) return "owner_changed";
 
-	// Atomically rename to a unique tombstone name to bind removal to this exact directory.
-	// If a concurrent process creates a successor at the original path, the rename fails and
-	// we fail closed. If the rename succeeds, the original path is no longer occupied,
-	// so we can safely re-verify and remove only the tombstone.
-	const tombstonePath = `${lockDir}.removing-${crypto.randomUUID()}`;
+	// Non-recursive rmdir is atomic and safe: it succeeds only if the directory
+	// exists and is empty. If a concurrent reclaimer creates a successor between
+	// our identity check and this rmdir, the rmdir will fail with ENOTEMPTY.
+	// If the directory is gone, rmdir fails with ENOENT. Either way, we return
+	// a safe result without ever moving or deleting a successor's lock.
 
-	// Test hook: allow injection of a successor before the rename
-	// This simulates the race where the original dir is deleted and a new one is created
-	if (FileLockTestHooks.beforeEmptyLockDirRename) {
-		await FileLockTestHooks.beforeEmptyLockDirRename(lockDir);
+	// Test hook: allow injection of a successor before rmdir
+	if (FileLockTestHooks.beforeEmptyLockDirRmdir) {
+		await FileLockTestHooks.beforeEmptyLockDirRmdir(lockDir);
 	}
 
 	try {
-		await fs.rename(lockDir, tombstonePath);
-	} catch (error) {
-		// Rename failed; this could mean:
-		// - The directory was already removed by another process
-		// - A new directory was created at the same path by a concurrent reclaimer
-		// - Some other filesystem error occurred
-		// In all cases, fail closed: we cannot safely assume the removal succeeded.
-		if (isEnoent(error)) return "removed";
-		if (isTransientReleaseError(error)) throw error;
-		return "owner_changed";
-	}
-
-	// Test hook: allow injection of a successor lock at lockDir after the rename
-	if (FileLockTestHooks.afterEmptyLockDirRename) {
-		await FileLockTestHooks.afterEmptyLockDirRename(tombstonePath);
-	}
-
-	// Re-verify the tombstone still has the expected identity and is still empty.
-	// If identity changed, a successor was created; fail closed.
-	let tombstoneRoot: BigIntStats;
-	try {
-		tombstoneRoot = await fs.lstat(tombstonePath, { bigint: true });
-	} catch (error) {
-		if (isEnoent(error)) return "removed";
-		if (isTransientReleaseError(error)) throw error;
-		return "cleanup_failed";
-	}
-
-	// Verify identity still matches
-	if (
-		!tombstoneRoot.isDirectory() ||
-		tombstoneRoot.isSymbolicLink() ||
-		String(tombstoneRoot.dev) !== expected.rootDev ||
-		String(tombstoneRoot.ino) !== expected.rootIno
-	) {
-		// Identity mismatch; a successor was created after we renamed.
-		// Restore the tombstone back to lockDir to avoid breaking mutual exclusion.
-		await restoreMovedLockDir(lockDir, tombstonePath);
-		return "owner_changed";
-	}
-
-	// Verify the tombstone is still empty (no info file)
-	try {
-		await fs.lstat(path.join(tombstonePath, "info"), { bigint: true });
-		// Info file exists; another process created it after we renamed.
-		// Restore the tombstone back to lockDir to avoid breaking mutual exclusion.
-		await restoreMovedLockDir(lockDir, tombstonePath);
-		return "owner_changed";
-	} catch (error) {
-		if (!isEnoent(error)) throw error;
-	}
-
-	// Safe to remove the verified tombstone. Use non-recursive removal so that if
-	// the directory is no longer empty (e.g., due to a race), removal fails.
-	try {
-		await fs.rmdir(tombstonePath);
+		await fs.rmdir(lockDir);
 		return "removed";
 	} catch (error) {
 		if (isEnoent(error)) return "removed";
-		// ENOTEMPTY or EACCES: directory is no longer empty or we lack permission
-		// Fail closed by returning owner_changed
+		// ENOTEMPTY: a successor was created after our identity check
+		// EACCES: permission denied
+		// Other transient errors should be retried by the caller
 		if (isTransientReleaseError(error)) throw error;
 		return "owner_changed";
 	}
