@@ -69,8 +69,11 @@ export async function launchAuthorizedBrokerSuccessor(
 				"--agent-dir",
 				options.agentDir,
 			]);
+			// On all platforms, spawn with detached:true to allow the broker to survive
+			// parent termination. Bun.spawn uses libuv's UV_PROCESS_DETACHED on Windows,
+			// which creates a process outside the parent's job.
 			child = spawn(brokerSpawnOpts.file, brokerSpawnOpts.args, {
-				detached: process.platform !== "win32",
+				detached: true,
 				stdio: "ignore",
 				env: { ...command.env, GJC_BROKER_RESTART_REQUEST: options.requestId },
 				...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
@@ -99,11 +102,8 @@ export async function launchAuthorizedBrokerSuccessor(
 				reason: "spawn_failed",
 				detail: spawnOutcome.spawnError()?.message,
 			};
-		// On Windows, child is cmd.exe which exits immediately with code 0 after
-		// spawning the real broker via `start`. Do not break the poll loop on a
-		// clean exit (code 0); break only on spawn error or actual failure (signal
-		// or non-zero exit). This allows discovery polling to continue through the
-		// normal deadline while the real broker starts and publishes.
+		// Break the poll loop only on spawn error or actual failure (signal or non-zero exit).
+		// The detached broker runs independently after spawn.
 		const failedSpawn =
 			spawnOutcome.spawnError() || child.signalCode !== null || (child.exitCode !== null && child.exitCode !== 0);
 		if (failedSpawn) return { kind: "refused", reason: "spawn_exited_before_publication" };
