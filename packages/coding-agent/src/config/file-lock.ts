@@ -18,7 +18,7 @@ import {
 	snapshotDirectoryTree,
 } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
-import { isEnoent } from "@gajae-code/utils/fs-error";
+import { isEexist, isEnoent } from "@gajae-code/utils/fs-error";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 
 export interface FileLockOptions {
@@ -127,7 +127,8 @@ type LockInfo = FileLockOwnerToken;
 
 export const FileLockTestHooks: {
 	afterParentMkdir?: (lockPath: string) => void | Promise<void>;
-	beforeEmptyLockDirRmdir?: (lockDir: string) => void | Promise<void>;
+	beforeEmptyLockDirClaim?: (lockDir: string) => void | Promise<void>;
+	forceEnableEmptyLockDirRemoval?: boolean;
 	nativePublicationBindings?: () => {
 		renameNoReplacePathAsync: typeof renameNoReplacePathAsync;
 		renameDirectoryNoReplacePathAsync: typeof renameDirectoryNoReplacePathAsync;
@@ -1654,8 +1655,9 @@ async function staleLockSnapshot(
 		// On POSIX: There is a concept of legacy directory-lock holders that are real
 		// holders. An empty directory must not be removed automatically.
 		//
-		// For all cases: Fail closed and retry (return stale: false) on POSIX.
-		if (process.platform === "win32") {
+		// For all cases: Fail closed and retry (return stale: false) on POSIX,
+		// unless the test hook forceEnableEmptyLockDirRemoval is set.
+		if (process.platform === "win32" || FileLockTestHooks.forceEnableEmptyLockDirRemoval) {
 			let emptyDirIdentity: GenericFileLockDirIdentity | null = null;
 			try {
 				emptyDirIdentity = await captureEmptyFileLockDirIdentity(lockPath, _staleMs);
@@ -1773,13 +1775,16 @@ function manualLockCleanupCommand(lockPath: string): string {
 }
 
 /**
- * Remove an empty lock directory (no info file) after its identity is verified.
+ * Claim an empty lock directory (no info file) after its identity is verified.
  * Empty directories can result from a release/removal that deleted the info file
- * but left the directory. If the root identity matches, the directory is safe to remove.
+ * but left the directory. If the root identity matches, the directory is safe to claim
+ * by creating an info file with exclusive-create (O_EXCL).
  *
- * Uses non-recursive rmdir() to ensure atomicity and prevent TOCTOU races.
- * If rmdir succeeds, the directory is gone. If it fails with ENOTEMPTY,
- * a concurrent reclaimer has created a successor, and we fail closed.
+ * Uses exclusive-create (open 'wx' / O_EXCL) for atomicity and TOCTOU race prevention.
+ * If exclusive-create succeeds, this process now owns the lock. If it fails with EEXIST,
+ * a concurrent reclaimer has already claimed it, and we back off safely.
+ * After successful creation, re-verify that the directory identity still matches
+ * to ensure no replacement occurred.
  */
 async function removeEmptyFileLockDir(
 	lockDir: string,
@@ -1811,28 +1816,67 @@ async function removeEmptyFileLockDir(
 	}
 	if (infoExists) return "owner_changed";
 
-	// Non-recursive rmdir is atomic and safe: it succeeds only if the directory
-	// exists and is empty. If a concurrent reclaimer creates a successor between
-	// our identity check and this rmdir, the rmdir will fail with ENOTEMPTY.
-	// If the directory is gone, rmdir fails with ENOENT. Either way, we return
-	// a safe result without ever moving or deleting a successor's lock.
-
-	// Test hook: allow injection of a successor before rmdir
-	if (FileLockTestHooks.beforeEmptyLockDirRmdir) {
-		await FileLockTestHooks.beforeEmptyLockDirRmdir(lockDir);
+	// Test hook: allow injection of a concurrent claim before our attempt
+	if (FileLockTestHooks.beforeEmptyLockDirClaim) {
+		await FileLockTestHooks.beforeEmptyLockDirClaim(lockDir);
 	}
+
+	// Claim ownership by exclusive-creating the info file.
+	// This is atomic: either we create it first (and own the lock), or EEXIST
+	// means another process created it concurrently.
+	const infoPath = path.join(lockDir, "info");
+	const claimedOwner = lockInfo(undefined, crypto.randomUUID());
+	const claimedInfoBytes = JSON.stringify(claimedOwner);
 
 	try {
-		await fs.rmdir(lockDir);
-		return "removed";
+		// Use exclusive create: open(infoPath, O_WRONLY | O_CREAT | O_EXCL)
+		const fd = await fs.open(infoPath, "wx", 0o600);
+		try {
+			await fd.write(claimedInfoBytes);
+		} finally {
+			await fd.close();
+		}
 	} catch (error) {
-		if (isEnoent(error)) return "removed";
-		// ENOTEMPTY: a successor was created after our identity check
-		// EACCES: permission denied
-		// Other transient errors should be retried by the caller
+		if (isEexist(error)) {
+			// Another process claimed it first, back off safely
+			return "owner_changed";
+		}
 		if (isTransientReleaseError(error)) throw error;
+		return "cleanup_failed";
+	}
+
+	// After successful exclusive-create, re-verify the directory identity
+	// to ensure it hasn't been replaced between our check and claim.
+	let verifyRoot: BigIntStats;
+	try {
+		verifyRoot = await fs.lstat(lockDir, { bigint: true });
+	} catch (error) {
+		if (isEnoent(error)) {
+			// The directory was removed after we claimed it. Clean up our info file.
+			try {
+				await fs.unlink(infoPath);
+			} catch {
+				// Best effort; ignore failure
+			}
+			return "owner_changed";
+		}
+		if (isTransientReleaseError(error)) throw error;
+		return "cleanup_failed";
+	}
+
+	if (String(verifyRoot.dev) !== expected.rootDev || String(verifyRoot.ino) !== expected.rootIno) {
+		// The directory was replaced (mounted or link changed). Clean up our info file.
+		try {
+			await fs.unlink(infoPath);
+		} catch {
+			// Best effort; ignore failure
+		}
 		return "owner_changed";
 	}
+
+	// Successfully claimed the empty lock directory by creating the info file.
+	// This process now owns the lock through the normal owned path.
+	return "removed";
 }
 
 // Set the default removeEmptyFileLockDir implementation in test hooks for test access
@@ -2069,7 +2113,21 @@ async function tryAcquireLock(
 			}
 		}
 		if (!publishedSuccessfully) {
-			if (published.reason === "destination_exists") return null;
+			if (published.reason === "destination_exists") {
+				// Check if destination is owned by the current process. This can happen
+				// when we successfully claimed a stale empty lock by creating an info file.
+				// We should recognize this and reuse the claimed lock instead of failing.
+				const claimedInfo = await readLockInfo(destinationPath);
+				if (claimedInfo && claimedInfo.pid === process.pid && !ownerIncarnationChanged(claimedInfo)) {
+					// Destination is owned by us (same PID, same incarnation).
+					// This is our claimed lock. Clean up the staged lock and return
+					// the claimed lock owner token.
+					removePending = true;
+					onAcquired?.();
+					return claimedInfo;
+				}
+				return null;
+			}
 			const failure = new Error(
 				`Failed to publish file lock: ${published.code ?? published.reason ?? "unknown"}.`,
 			) as NodeJS.ErrnoException;
