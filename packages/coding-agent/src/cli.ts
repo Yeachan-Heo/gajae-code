@@ -133,6 +133,11 @@ export async function runCli(argv: string[]): Promise<void> {
 			return;
 		}
 	}
+	if (argv.length >= 2 && argv[0] === "internal" && argv[1] === "broker-hop") {
+		const { runBrokerHopFromArgv } = await import("./sdk/broker/hop");
+		await runBrokerHopFromArgv(argv.slice(2));
+		return;
+	}
 	if (argv[0] === "sdk" && argv[1] === "stderr-drain-internal") {
 		// Private lifecycle stderr drainer: must stay ahead of the public sdk family
 		// dispatcher, which would otherwise reject the private argv as a usage error.
