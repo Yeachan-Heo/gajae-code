@@ -1938,8 +1938,6 @@ async function staleLockSnapshot(
 	return { stale: false };
 }
 
-type StaleLockRemovalAttempt = { removed: true } | { removed: false; failure?: FileLockStaleRemovalFailure };
-
 type RecordedStaleRemovalFailure = {
 	owner: FileLockOwnerToken | undefined;
 	identity: GenericFileLockDirIdentity;
@@ -2109,18 +2107,27 @@ async function removeEmptyFileLockDir(
 // Set the default removeEmptyFileLockDir implementation in test hooks for test access
 FileLockTestHooks.removeEmptyFileLockDir = removeEmptyFileLockDir;
 
+type FileLockRemovalAttempt =
+	| { removed: true; claimedOwner?: FileLockOwnerToken }
+	| { removed: false; failure?: FileLockStaleRemovalFailure };
+
 async function removeStaleLockForAcquire(
 	lockPath: string,
 	snapshot: LockStaleSnapshot,
-): Promise<StaleLockRemovalAttempt> {
+): Promise<FileLockRemovalAttempt> {
 	if (!snapshot.stale) return { removed: false };
 	try {
-		// Empty lock directories (marker identity with infoDev="-1") are removed directly
-		// without an owner token, since they have no info file to validate against.
+		// Empty lock directories (marker identity with infoDev="-1") are claimed directly
+		// by creating an owner info file. Track the claimed owner token so we can
+		// verify it later when trying to reuse the lock.
 		if (snapshot.owner === undefined && snapshot.identity.infoDev === "-1") {
 			const removalFn = FileLockTestHooks.removeEmptyFileLockDir || removeEmptyFileLockDir;
 			const outcome = await removalFn(lockPath, snapshot.identity);
-			if (outcome === "removed") return { removed: true };
+			if (outcome === "removed") {
+				// Read the claimed owner token so we can verify it later
+				const claimedOwner = await readLockInfo(lockPath);
+				return { removed: true, claimedOwner: claimedOwner ?? undefined };
+			}
 			return { removed: false, failure: { outcome, message: "empty lock directory removal failed" } };
 		}
 		const outcome = await removeFileLockDirForGc(lockPath, snapshot.owner!, snapshot.identity);
@@ -2218,6 +2225,7 @@ async function tryAcquireLock(
 	previousOwnerHostIds: readonly string[],
 	ownerToken = crypto.randomUUID(),
 	onAcquired?: () => void,
+	recentlyClaimedOwner?: FileLockOwnerToken,
 ): Promise<FileLockAcquisitionResult> {
 	await ensureLockParent(path.dirname(lockPath));
 	const afterParentMkdir = FileLockTestHooks.afterParentMkdir;
@@ -2348,14 +2356,21 @@ async function tryAcquireLock(
 		}
 		if (!publishedSuccessfully) {
 			if (published.reason === "destination_exists") {
-				// Check if destination is owned by the current process. This can happen
-				// when we successfully claimed a stale empty lock by creating an info file.
-				// We should recognize this and reuse the claimed lock instead of failing.
+				// Check if destination is owned by the current process via a recent empty-dir claim.
+				// This can happen when we successfully claimed a stale empty lock by creating an info file
+				// in a previous iteration. We should recognize this and reuse the claimed lock.
+				// IMPORTANT: Only reuse if the owner token matches what we claimed (recently ClaimedOwner),
+				// to avoid reusing locks held by other acquisitions in the same process.
 				const claimedInfo = await readLockInfo(destinationPath);
-				if (claimedInfo && claimedInfo.pid === process.pid && !ownerIncarnationChanged(claimedInfo)) {
-					// Destination is owned by us (same PID, same incarnation).
-					// This is our claimed lock. Clean up the staged lock and return
-					// the claimed lock owner token.
+				if (
+					claimedInfo &&
+					recentlyClaimedOwner &&
+					claimedInfo.owner_token === recentlyClaimedOwner.owner_token &&
+					claimedInfo.pid === process.pid &&
+					!ownerIncarnationChanged(claimedInfo)
+				) {
+					// Destination is our recently-claimed empty lock.
+					// Clean up the staged lock and return the claimed lock owner token.
 					removePending = true;
 					onAcquired?.();
 					return claimedInfo;
@@ -2742,6 +2757,7 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 	const contentionStartTimes = new Map<string, string | null>();
 	let contentionObserved = false;
 	let staleRemovalFailure: RecordedStaleRemovalFailure | undefined;
+	let recentlyClaimedOwner: FileLockOwnerToken | undefined; // Track owner tokens created by empty-dir claim
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
 		if (opts.signal?.aborted) throw opts.signal.reason ?? new Error("File lock acquisition aborted");
 		const localKey = await localLockKey(lockPath);
@@ -2757,6 +2773,7 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			opts.previousOwnerHostIds ?? [],
 			ownerToken,
 			opts.onAcquired,
+			recentlyClaimedOwner,
 		);
 		if (isFileLockOrphanTransition(result))
 			throw new FileLockAcquireError(
@@ -2796,6 +2813,10 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 		const staleRemoval = await removeStaleLockForAcquire(lockPath, stale);
 		if (staleRemoval.removed) {
 			staleRemovalFailure = undefined;
+			// Track the claimed owner token so we can verify it when retrying
+			if (staleRemoval.claimedOwner) {
+				recentlyClaimedOwner = staleRemoval.claimedOwner;
+			}
 			continue;
 		}
 		staleRemovalFailure =
