@@ -32,6 +32,7 @@ type FailedOutcome = {
 	kind: string;
 	code: string;
 	message: string;
+	provenance?: string;
 	phase?: string;
 	category?: string;
 	providerCode?: string;
@@ -575,4 +576,64 @@ describe("R7 same-primary-code attribution", () => {
 			expect(after.outcome?.providerDiagnostic).toBeUndefined();
 		});
 	});
+});
+
+describe("F1 both reconcilers deliver the same diagnostic on an agent_end that carries an outcome", () => {
+	const ids = { commandId: "f1-c", turnId: "f1-t" };
+	const sameFrameOutcome = () =>
+		failedPromptOutcome({
+			code: "prompt_failed",
+			provenance: "agent_failed",
+			providerCode: "provider_rejected",
+			evidence: { startedAt: 1 },
+		});
+
+	for (const engine of ["bus", "host"] as const) {
+		test(`${engine} reconciler keeps the earlier diagnostic when the terminal frame supplies the same primary outcome`, async () => {
+			const reconciliation = engine === "bus" ? createKindAwareReconciliation() : createInvocationReconciliation();
+			reconciliation.admit("prompt", "ref");
+			await reconciliation.noteAccepted("prompt", ids, "ref");
+			await reconciliation.noteTransition("prompt", ids, { type: "agent_start" });
+			await reconciliation.noteTransition("prompt", ids, {
+				type: "agent_failed",
+				error: { code: "provider_rejected", message: "Agent run failed.", providerDiagnostic: AUTH_DIAGNOSTIC },
+			} as never);
+			await reconciliation.noteTransition("prompt", ids, {
+				type: "agent_end",
+				outcome: sameFrameOutcome(),
+			} as never);
+
+			const settled = reconciliation.lookup("prompt", { clientRef: "ref" }) as TerminalRow;
+			// The chosen outcome and every legacy field stay exactly as the engine built them.
+			expect(settled.status).toBe("failed");
+			expect(settled.receiptState).toBe("missing");
+			expect(settled.error?.code).toBe("provider_rejected");
+			expect(settled.outcome?.code).toBe("prompt_failed");
+			expect(settled.outcome?.provenance).toBe("agent_failed");
+			expect(settled.outcome?.phase).toBe("post_start");
+			expect(settled.outcome?.category).toBe("provider_rejected");
+			expect(settled.outcome?.providerCode).toBe("provider_rejected");
+			// Only the missing canonical field is filled.
+			expect(settled.outcome?.providerDiagnostic).toEqual(AUTH_DIAGNOSTIC);
+		});
+
+		test(`${engine} reconciler leaves a terminal frame outcome undiagnosed when no diagnostic was recorded`, async () => {
+			const reconciliation = engine === "bus" ? createKindAwareReconciliation() : createInvocationReconciliation();
+			reconciliation.admit("prompt", "ref");
+			await reconciliation.noteAccepted("prompt", ids, "ref");
+			await reconciliation.noteTransition("prompt", ids, { type: "agent_start" });
+			await reconciliation.noteTransition("prompt", ids, {
+				type: "agent_failed",
+				error: { code: "provider_rejected", message: "Agent run failed." },
+			} as never);
+			await reconciliation.noteTransition("prompt", ids, {
+				type: "agent_end",
+				outcome: sameFrameOutcome(),
+			} as never);
+
+			const settled = reconciliation.lookup("prompt", { clientRef: "ref" }) as TerminalRow;
+			expect(settled.status).toBe("failed");
+			expect(settled.outcome?.providerDiagnostic).toBeUndefined();
+		});
+	}
 });

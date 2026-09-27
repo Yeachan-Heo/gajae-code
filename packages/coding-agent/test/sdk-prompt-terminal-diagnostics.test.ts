@@ -421,3 +421,72 @@ isolatedSdkHostTest(
 	},
 	75_000,
 );
+
+const F2_DIAGNOSTIC = {
+	category: "auth",
+	httpStatus: 401,
+	code: "authentication_error",
+	evidence: "structured_code",
+} as const;
+
+isolatedSdkHostTest(
+	"F2 the native agent_failed producer publishes the adapter diagnostic on the real wire frame",
+	async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-f2-thrown-"));
+		dirs.push(cwd);
+		const sessionId = `sdk-f2-thrown-${Date.now()}`;
+		const sessionContext = context(cwd, sessionId);
+		const handlers = await start(sessionContext, () => undefined);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "f2-thrown",
+				operation: "turn.prompt",
+				input: { text: "provider refuses this turn", clientRef: "f2-thrown-ref" },
+			}),
+		);
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === "f2-thrown"),
+			"prompt acknowledgement",
+		);
+
+		// The real native handlers, with the payload the Agent emits: a thrown
+		// provider failure whose validated diagnostic travels on the error.
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		await handlers.get("agent_failed")?.(
+			{
+				type: "agent_failed",
+				error: Object.assign(new Error("provider rejected sk-ant-secret-F2 https://api.example/v1"), {
+					code: "provider_rejected",
+					providerDiagnostic: { ...F2_DIAGNOSTIC },
+				}),
+			},
+			sessionContext,
+		);
+		await waitFor(() => frames.some(frame => frame.type === "agent_failed"), "native agent_failed frame");
+
+		const failure = frames.find(frame => frame.type === "agent_failed") as Record<string, unknown>;
+		expect(failure).toMatchObject({
+			error: { code: "provider_rejected", message: "Prompt submission failed.", providerDiagnostic: F2_DIAGNOSTIC },
+		});
+		// The published frame stays bounded: no raw body, key or URL rides along.
+		expect(JSON.stringify(failure)).not.toContain("sk-ant-secret-F2");
+		expect(JSON.stringify(failure)).not.toContain("api.example");
+
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	},
+	75_000,
+);

@@ -5259,7 +5259,15 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					if (unrecorded !== undefined) {
 						await current.reconciliation.noteTransition("skill", invocation.correlation, {
 							type: "agent_failed",
-							error: Object.assign(new Error(unrecorded.message), { code: unrecorded.code }),
+							// The cached reason is the only surviving copy of this failure after
+							// both earlier writes failed, so replay it whole: dropping the carrier
+							// here loses the classification exactly when durability was in doubt.
+							error: Object.assign(new Error(unrecorded.message), {
+								code: unrecorded.code,
+								...(unrecorded.providerDiagnostic === undefined
+									? {}
+									: { providerDiagnostic: unrecorded.providerDiagnostic }),
+							}),
 						} as never);
 						current.unrecordedFailureReasons?.delete(recoveryKey);
 					}

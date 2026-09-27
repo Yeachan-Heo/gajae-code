@@ -667,7 +667,11 @@ export function createKindAwareReconciliation(
 					);
 				else if (isDeadlineOutcome(pendingOutcome) && frameOutcome?.kind === "stopped")
 					terminalOutcome = frameOutcome;
-				record.outcome = terminalOutcome;
+				// The selection above is untouched. A frame or pending outcome is built
+				// from evidence and carries no diagnostic, so fill that hole additively
+				// from the same-failure classification agent_failed already recorded --
+				// the host reconciler delivers the same field for the same input.
+				record.outcome = enrichOutcomeDiagnostic(terminalOutcome, record.providerDiagnostic) ?? terminalOutcome;
 				delete record.pendingOutcome;
 				if (terminalOutcome.kind === "failed") {
 					record.status = "failed";
@@ -698,7 +702,7 @@ export function createKindAwareReconciliation(
 							)
 						: frameOutcome;
 				if (terminalOutcome !== undefined) {
-					record.outcome = terminalOutcome;
+					record.outcome = enrichOutcomeDiagnostic(terminalOutcome, record.providerDiagnostic) ?? terminalOutcome;
 					if (terminalOutcome.kind === "failed") {
 						record.status = "failed";
 						if (!providerError) record.error = { code: terminalOutcome.code, message: terminalOutcome.message };

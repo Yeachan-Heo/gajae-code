@@ -138,6 +138,8 @@ import {
 	failedPromptOutcome,
 	formatPromptFailureForLocalLog,
 	PROMPT_FAILURE_MESSAGE_DEADLINE,
+	providerDiagnosticField,
+	publishedPromptFailure,
 	sanitizePromptFailure,
 } from "../prompt-failure";
 import { PROMPT_CLIENT_REF_MAX_LENGTH, type SdkPromptTerminalOutcome } from "../prompt-status";
@@ -9588,7 +9590,10 @@ export function createNotificationsExtension(
 		if (!rt) return;
 		const correlation = rt.activePromptCorrelation;
 		if (!correlation) return;
-		const error = sanitizePromptFailure(event.error);
+		// The publication projection: the same bounded code/message plus the
+		// validated optional diagnostic the adapter attached. The frame is what a
+		// client observes, so a diagnostic dropped here is a diagnostic nobody sees.
+		const error = publishedPromptFailure(event.error);
 		rt.emitPromptLifecycle(correlation, {
 			type: "agent_failed",
 			sessionId: id,
@@ -9649,6 +9654,13 @@ export function createNotificationsExtension(
 					provenance: "agent_failed",
 					...(providerCode !== undefined ? { providerCode } : {}),
 					evidence: {},
+					// The terminal assistant carries the adapter's already validated DTO
+					// alongside its bounded classifier; revalidation in failedPromptOutcome
+					// drops anything that is absent, malformed or forged. Message text is
+					// still never parsed.
+					...providerDiagnosticField(
+						(terminalAssistant as { providerDiagnostic?: unknown } | undefined)?.providerDiagnostic,
+					),
 				});
 			}
 			const successAssistant = assistants.find(

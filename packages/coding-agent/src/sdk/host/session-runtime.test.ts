@@ -7964,6 +7964,82 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		}
 	});
 
+	test("F3 skill terminal recovery preserves the provider diagnostic after a failed durable failure write", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-skill-diagnostic-recovery-"));
+		let failedFailureWrites = 0;
+		try {
+			const harness = await invocationHarness("skill-diagnostic-recovery", cwd, {
+				invokeSkill: async (_name, _args, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+				persistInterceptor: transition => {
+					// The first durable agent_failed write fails, so the reason survives only
+					// in the in-memory cache and must be replayed with its carrier intact.
+					// This guards the recovery replay reachable from this route; the
+					// double-failure scheduled-recovery branch is not reached by this input
+					// and is reported as unverified rather than claimed.
+					if (transition.type === "agent_failed" && failedFailureWrites < 2) {
+						failedFailureWrites += 1;
+						throw Object.assign(new Error("injected diagnostic persistence failure"), { code: "io_error" });
+					}
+				},
+			});
+			const submitted = await harness.control("skill.invoke", {
+				name: "diagnostic-hang",
+				args: "",
+				clientRef: "skill-diagnostic-recovery-ref",
+			});
+			expect(submitted.ok).toBe(true);
+			await harness.emit("agent_start");
+			await harness.emit("agent_failed", {
+				error: Object.assign(new Error("provider rejected sk-ant-secret-SKILL"), {
+					code: "provider_rejected",
+					providerDiagnostic: {
+						category: "auth",
+						httpStatus: 401,
+						code: "authentication_error",
+						evidence: "structured_code",
+					},
+				}),
+			});
+			await harness.emit("agent_end");
+			let settled:
+				| { status?: string; receiptState?: string; error?: { code?: string }; outcome?: Record<string, unknown> }
+				| undefined;
+			for (let attempt = 0; attempt < 600 && settled === undefined; attempt += 1) {
+				const frame = await harness.query("skill.invoke_status", { clientRef: "skill-diagnostic-recovery-ref" });
+				const result = frame.result as
+					| {
+							status?: string;
+							receiptState?: string;
+							error?: { code?: string };
+							outcome?: Record<string, unknown>;
+					  }
+					| undefined;
+				if (result?.status === "failed" || result?.status === "terminal_ok") settled = result;
+				else await Bun.sleep(10);
+			}
+			if (settled === undefined) throw new Error("skill diagnostic recovery never converged on a terminal status");
+			expect(failedFailureWrites).toBeGreaterThan(0);
+			// Legacy skill terminal semantics are untouched by the replay.
+			expect(settled.status).toBe("failed");
+			expect(settled.error?.code).toBe("provider_rejected");
+			expect(settled.receiptState).toBe("missing");
+			expect((settled.outcome as { providerDiagnostic?: unknown } | undefined)?.providerDiagnostic).toEqual({
+				category: "auth",
+				httpStatus: 401,
+				code: "authentication_error",
+				evidence: "structured_code",
+			});
+			expect(JSON.stringify(settled)).not.toContain("sk-ant-secret-SKILL");
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("retains skill terminal recovery across session replacement", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-skill-terminal-replacement-"));
 		let failFirstTerminalWrite = true;

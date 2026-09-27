@@ -1,3 +1,4 @@
+import type { ProviderDiagnostic } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
 import type { KindAwareReconciliation } from "./bus/kind-aware-reconciliation";
 import type { InvocationCorrelation, InvocationReconciliation } from "./host/session-runtime";
@@ -107,7 +108,10 @@ export class PromptDeadlineManager {
 	readonly #deadlineTerminalizationConfirmed = new Set<string>();
 	readonly #terminalPublicationPending = new Map<string, SdkPromptTerminalOutcome>();
 	readonly #deadlineStartCleanup = new Map<string, () => void>();
-	readonly #pendingTerminalFailureReasons = new Map<string, { code: string; message: string }>();
+	readonly #pendingTerminalFailureReasons = new Map<
+		string,
+		{ code: string; message: string; providerDiagnostic?: ProviderDiagnostic }
+	>();
 	readonly #pendingTerminalEvidence = new Map<string, PromptTerminalTransitionEvidence>();
 	readonly #getLeaseMs: () => number;
 	readonly #getMaxMs: () => number;
@@ -274,7 +278,12 @@ export class PromptDeadlineManager {
 					// boundary below classifies the abandoned prompt as terminal_ok.
 					await this.#reconciliation.noteTransition("prompt", correlation, {
 						type: "agent_failed",
-						error: Object.assign(new Error(failureReason.message), { code: failureReason.code }),
+						error: Object.assign(new Error(failureReason.message), {
+							code: failureReason.code,
+							...(failureReason.providerDiagnostic === undefined
+								? {}
+								: { providerDiagnostic: failureReason.providerDiagnostic }),
+						}),
 					} as never);
 				}
 				await this.#reconciliation.noteTransition("prompt", correlation, {
@@ -396,7 +405,12 @@ export class PromptDeadlineManager {
 				try {
 					await this.#reconciliation.noteTransition("prompt", correlation, {
 						type: "agent_failed",
-						error: Object.assign(new Error(failureReason.message), { code: failureReason.code }),
+						error: Object.assign(new Error(failureReason.message), {
+							code: failureReason.code,
+							...(failureReason.providerDiagnostic === undefined
+								? {}
+								: { providerDiagnostic: failureReason.providerDiagnostic }),
+						}),
 					} as never);
 					this.#pendingTerminalFailureReasons.delete(key);
 				} catch {
@@ -743,7 +757,7 @@ export class PromptDeadlineManager {
 	 * synthetic prompt_deadline_exceeded outcome. */
 	noteTerminalTransition(
 		correlation: InvocationCorrelation,
-		pendingFailure?: { code: string; message: string },
+		pendingFailure?: { code: string; message: string; providerDiagnostic?: ProviderDiagnostic },
 		evidence?: PromptTerminalTransitionEvidence,
 		deferUntilDeadlineSettlement = false,
 	): void {
