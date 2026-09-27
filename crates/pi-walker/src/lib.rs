@@ -4101,19 +4101,7 @@ mod platform {
 		F: FnMut(RawDirEntry<'_>) -> std::result::Result<ReadDirControl, WalkError<E>>,
 	{
 		let fd = open_dir(path)?;
-		let mut attrs = libc::attrlist {
-			bitmapcount: libc::ATTR_BIT_MAP_COUNT,
-			reserved:    0,
-			commonattr:  libc::ATTR_CMN_NAME | libc::ATTR_CMN_OBJTYPE,
-			volattr:     0,
-			dirattr:     0,
-			fileattr:    0,
-			forkattr:    0,
-		};
-		if detail == WalkDetail::Full {
-			attrs.commonattr |= libc::ATTR_CMN_MODTIME;
-			attrs.fileattr |= libc::ATTR_FILE_DATALENGTH;
-		}
+		let mut attrs = bulk_attrlist(detail);
 
 		if buffer.len() != BUFFER_SIZE {
 			buffer.resize(BUFFER_SIZE, 0);
@@ -4168,6 +4156,26 @@ mod platform {
 			}
 		}
 		Ok(ReadDirControl::Continue)
+	}
+
+	/// Attribute request for `getattrlistbulk(2)`. The call rejects requests
+	/// without `ATTR_CMN_RETURNED_ATTRS` (EINVAL), which would silently route
+	/// every directory through the slower `std::fs::read_dir` fallback.
+	fn bulk_attrlist(detail: WalkDetail) -> libc::attrlist {
+		let mut attrs = libc::attrlist {
+			bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+			reserved:    0,
+			commonattr:  libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | libc::ATTR_CMN_OBJTYPE,
+			volattr:     0,
+			dirattr:     0,
+			fileattr:    0,
+			forkattr:    0,
+		};
+		if detail == WalkDetail::Full {
+			attrs.commonattr |= libc::ATTR_CMN_MODTIME;
+			attrs.fileattr |= libc::ATTR_FILE_DATALENGTH;
+		}
+		attrs
 	}
 
 	fn read_dir_entries_std<F, E>(
@@ -4245,13 +4253,26 @@ mod platform {
 
 	fn parse_record(record: &[u8], detail: WalkDetail) -> io::Result<Option<RawDirEntry<'_>>> {
 		let mut cursor = size_of::<u32>();
+		// ATTR_CMN_RETURNED_ATTRS is packed first and says which requested
+		// attributes follow; the kernel omits ones it does not return (for
+		// example file data length on a directory).
+		let returned = read_value::<libc::attribute_set_t>(record, &mut cursor)?;
 		let name_ref_start = cursor;
 		let name_ref = read_value::<libc::attrreference_t>(record, &mut cursor)?;
 		let obj_type = read_value::<u32>(record, &mut cursor)?;
 		let (mtime, data_length) = if detail == WalkDetail::Full {
-			let modified = read_value::<libc::timespec>(record, &mut cursor)?;
-			let data_length = read_value::<u64>(record, &mut cursor)?;
-			(mtime_millis(modified.tv_sec as i64, modified.tv_nsec as i64), Some(data_length))
+			let modified = if returned.commonattr & libc::ATTR_CMN_MODTIME != 0 {
+				let modified = read_value::<libc::timespec>(record, &mut cursor)?;
+				mtime_millis(modified.tv_sec as i64, modified.tv_nsec as i64)
+			} else {
+				None
+			};
+			let data_length = if returned.fileattr & libc::ATTR_FILE_DATALENGTH != 0 {
+				Some(read_value::<u64>(record, &mut cursor)?)
+			} else {
+				None
+			};
+			(modified, data_length)
 		} else {
 			(None, None)
 		};
@@ -4322,6 +4343,75 @@ mod platform {
 
 	fn invalid_data(message: &'static str) -> io::Error {
 		io::Error::new(io::ErrorKind::InvalidData, message)
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use std::{collections::BTreeMap, fs};
+
+		use super::*;
+
+		fn temp_dir(tag: &str) -> std::path::PathBuf {
+			let dir = std::env::temp_dir().join(format!(
+				"pi-walker-bulk-{tag}-{}-{}",
+				std::process::id(),
+				std::time::SystemTime::now()
+					.duration_since(std::time::UNIX_EPOCH)
+					.expect("clock after epoch")
+					.as_nanos()
+			));
+			fs::create_dir_all(dir.join("sub")).expect("create fixture dirs");
+			fs::write(dir.join("a.txt"), b"hello").expect("write file");
+			fs::write(dir.join("b.rs"), b"fn main() {}").expect("write file");
+			dir
+		}
+
+		#[test]
+		fn getattrlistbulk_request_is_accepted_without_std_fallback() {
+			let dir = temp_dir("accepted");
+			for detail in [WalkDetail::Minimal, WalkDetail::Full] {
+				let fd = open_dir(&dir).expect("open fixture dir");
+				let mut attrs = bulk_attrlist(detail);
+				let mut buffer = vec![0u8; BUFFER_SIZE];
+				// SAFETY: valid fd, attrlist and writable buffer for the call.
+				let count = unsafe {
+					libc::getattrlistbulk(
+						fd.0,
+						std::ptr::addr_of_mut!(attrs).cast(),
+						buffer.as_mut_ptr().cast(),
+						buffer.len(),
+						libc::FSOPT_NOFOLLOW as u64,
+					)
+				};
+				assert!(
+					count > 0,
+					"getattrlistbulk rejected the request: {}",
+					io::Error::last_os_error()
+				);
+			}
+			fs::remove_dir_all(&dir).expect("cleanup");
+		}
+
+		#[test]
+		fn bulk_listing_matches_std_names_types_and_sizes() {
+			let dir = temp_dir("matches");
+			let mut buffer = Vec::new();
+			let mut bulk = BTreeMap::new();
+			read_dir_entries::<_, ()>(&dir, WalkDetail::Full, &mut buffer, |entry| {
+				bulk.insert(entry.name.to_string_lossy().into_owned(), (entry.file_type, entry.size));
+				Ok(ReadDirControl::Continue)
+			})
+			.unwrap_or_else(|_| panic!("bulk listing failed"));
+			let expected: BTreeMap<_, _> = [
+				("a.txt".to_string(), (FileType::File, Some(5.0))),
+				("b.rs".to_string(), (FileType::File, Some(12.0))),
+				("sub".to_string(), (FileType::Dir, None)),
+			]
+			.into_iter()
+			.collect();
+			assert_eq!(bulk, expected);
+			fs::remove_dir_all(&dir).expect("cleanup");
+		}
 	}
 }
 
