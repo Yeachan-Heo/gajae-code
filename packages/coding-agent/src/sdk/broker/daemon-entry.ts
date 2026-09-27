@@ -1,8 +1,30 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { type BrokerDiscovery, readBrokerDiscovery, readBrokerRestartIntent } from "./discovery";
-import { type BrokerSpawnResult, resolveBrokerSpawnOptionsForProduction, withBrokerStartupLock } from "./ensure";
+import {
+	BrokerHopError,
+	type BrokerSpawnResult,
+	resolveBrokerSpawnOptionsForProduction,
+	withBrokerStartupLock,
+} from "./ensure";
 import { observeProcessIncarnation } from "./process-incarnation";
 import { resolveSdkInternalSpawnCommand } from "./runtime";
+
+/**
+ * Resolve the hop invocation command for the current runtime (source or compiled).
+ * Returns the executable path and arguments to spawn the hop process.
+ */
+function resolveHopInvocationForDaemonEntry(hopMessage: string): { file: string; args: string[] } {
+	const brokerCmd = resolveSdkInternalSpawnCommand("broker-internal");
+	if (brokerCmd.kind === "bun-source") {
+		// Source mode: args are ["--no-env-file", "--config=...", cli.ts, "sdk", "broker-internal"]
+		// Replace the last two with ["internal", "broker-hop", hopMessage]
+		const args = [...brokerCmd.args.slice(0, -2), "internal", "broker-hop", hopMessage];
+		return { file: brokerCmd.file, args };
+	} else {
+		// Compiled mode: file is gjc executable
+		return { file: brokerCmd.file, args: ["internal", "broker-hop", hopMessage] };
+	}
+}
 
 /**
  * Spawn the broker using a hop on Windows or direct spawn on POSIX.
@@ -27,8 +49,8 @@ function spawnBrokerWithHopForDaemonEntry(
 			stdio: "ignore",
 		};
 
-		const gjcPath = process.execPath;
-		const child = spawn(gjcPath, ["internal", "broker-hop", JSON.stringify(hopMessage)], {
+		const hopCmd = resolveHopInvocationForDaemonEntry(JSON.stringify(hopMessage));
+		const child = spawn(hopCmd.file, hopCmd.args, {
 			detached: false,
 			windowsHide: true,
 			stdio: ["ignore", "pipe", "ignore"],
@@ -145,16 +167,36 @@ export async function launchAuthorizedBrokerSuccessor(
 					await new Promise<void>((resolve, reject) => {
 						hopProcess.on("exit", code => {
 							if (code !== 0) {
-								spawnError ??= new Error(`broker hop exited with code ${code}`);
+								spawnError ??= new BrokerHopError({
+									exitCode: code,
+									stdout: hopStdout,
+									reason: `hop process exited with non-zero code ${code}`,
+								});
 							} else if (hopStdout.trim()) {
 								try {
 									const hopResponse = JSON.parse(hopStdout.trim());
-									spawnResult.realBrokerPid = hopResponse.pid;
+									if (typeof hopResponse.pid !== "number") {
+										spawnError ??= new BrokerHopError({
+											exitCode: code,
+											stdout: hopStdout,
+											reason: `hop response missing or invalid pid: ${String(hopResponse.pid)}`,
+										});
+									} else {
+										spawnResult.realBrokerPid = hopResponse.pid;
+									}
 								} catch (error) {
-									spawnError ??= new Error(
-										`Failed to parse broker hop response: ${error instanceof Error ? error.message : String(error)}`,
-									);
+									spawnError ??= new BrokerHopError({
+										exitCode: code,
+										stdout: hopStdout,
+										reason: `failed to parse hop JSON response: ${error instanceof Error ? error.message : String(error)}`,
+									});
 								}
+							} else {
+								spawnError ??= new BrokerHopError({
+									exitCode: code,
+									stdout: hopStdout,
+									reason: "hop exited with code 0 but no response on stdout",
+								});
 							}
 							resolve();
 						});
