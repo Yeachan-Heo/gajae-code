@@ -2000,6 +2000,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const key = await modelRegistry
 				.getApiKey(candidate, credentialSessionId, { credentialSelector })
 				.catch(error => {
+					if (authStorage.hasSessionCredentialUnavailable(candidate.provider, credentialSessionId))
+						return undefined;
 					if (credentialSelector) {
 						logger.debug("Credential selector did not match model availability candidate", {
 							provider: candidate.provider,

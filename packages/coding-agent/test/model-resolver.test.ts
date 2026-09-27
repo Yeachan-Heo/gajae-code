@@ -95,6 +95,51 @@ test("skips an unavailable credential without probing another account, but accep
 	expect(calls).toEqual(["openai", "anthropic"]);
 });
 
+test("continues an explicit chain when an OAuth lookup invalidates its pin", async () => {
+	let unavailable = false;
+	const calls: string[] = [];
+	const registry = {
+		getAvailable: () => [mockModels[0], mockModels[1]],
+		getApiKey: async (candidate: Model) => {
+			calls.push(candidate.provider);
+			if (candidate.provider === "anthropic") {
+				unavailable = true;
+				throw new Error("Selected credential for anthropic (id:13) is unavailable");
+			}
+			return "key";
+		},
+		isSelectorCircuitOpen: () => false,
+	} as never;
+	const resolution = await resolveModelChainWithAuth(
+		["anthropic/claude-sonnet-4-5", "openai/gpt-4o"],
+		registry,
+		undefined,
+		"resumed-session",
+		{ isCredentialUnavailable: provider => provider === "anthropic" && unavailable },
+	);
+	expect(resolution.model).toBe(mockModels[1]);
+	expect(resolution.skips).toEqual([{ selector: "anthropic/claude-sonnet-4-5", reason: "credential_unavailable" }]);
+	expect(calls).toEqual(["anthropic", "openai"]);
+});
+
+test("propagates lookup failures that did not invalidate a pin", async () => {
+	const failure = new Error("OAuth broker failed");
+	await expect(
+		resolveModelChainWithAuth(
+			["anthropic/claude-sonnet-4-5"],
+			{
+				getAvailable: () => [mockModels[0]],
+				getApiKey: async () => {
+					throw failure;
+				},
+			} as never,
+			undefined,
+			"resumed-session",
+			{ isCredentialUnavailable: () => false },
+		),
+	).rejects.toBe(failure);
+});
+
 test("uses provider credential session separately from canonical stickiness", async () => {
 	const alpha = { ...mockModels[1], provider: "alpha", id: "org/shared-model" } as Model;
 	const beta = { ...mockModels[1], provider: "beta", id: "org/shared-model" } as Model;

@@ -1189,7 +1189,15 @@ async function resolveModelChainEntries(
 				skips.push({ selector, reason: "credential_unavailable" });
 				break;
 			}
-			const key = await modelRegistry.getApiKey(candidate.model, credentialSessionId, { signal: options?.signal });
+			let key: string | undefined;
+			try {
+				key = await modelRegistry.getApiKey(candidate.model, credentialSessionId, { signal: options?.signal });
+			} catch (error) {
+				// OAuth selection can invalidate a pin after the preflight check.
+				if (!options?.isCredentialUnavailable?.(candidate.model.provider)) throw error;
+				skips.push({ selector, reason: "credential_unavailable" });
+				break;
+			}
 			if (isAuthenticatedOrKeyless(key)) {
 				return { ...candidate, activeIndex, skips };
 			}

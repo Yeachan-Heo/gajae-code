@@ -815,6 +815,42 @@ describe("startup model-profile credential recovery eligibility", () => {
 	});
 });
 
+test("interactive resume keeps a session open when its default profile requires an unavailable pin", async () => {
+	const profile: ModelProfileDefinition = {
+		name: "pinned-default",
+		requiredProviders: ["profile-provider"],
+		modelMapping: { default: "profile-provider/default" },
+		source: "user",
+	};
+	const session = fakeSession(null);
+	const settings = Settings.isolated({ "modelProfile.default": profile.name });
+	const getApiKeyForProvider = vi.fn(async () => "another-account-key");
+	const registry = {
+		...fakeRegistry([profile]),
+		getApiKeyForProvider,
+		authStorage: {
+			hasSessionCredentialUnavailable: (provider: string, scope: string) =>
+				provider === "profile-provider" && scope === session.credentialSessionId,
+		},
+	};
+	const result = await applyStartupModelProfilesForRoot({
+		session,
+		settings,
+		modelRegistry: registry as never,
+		parsedArgs: { resume: "saved-session" },
+		isInteractive: true,
+		hasInteractiveTerminal: true,
+		initialMessage: undefined,
+		initialMessages: [],
+		resumeAction: undefined,
+	});
+	expect(result.recoverableErrors).toHaveLength(1);
+	expect(result.recoverableErrors[0]).toContain("profile-provider");
+	expect(getApiKeyForProvider).not.toHaveBeenCalled();
+	expect(session.model).toBeUndefined();
+	expect(settings.get("modelProfile.default")).toBe(profile.name);
+});
+
 test("input-free interactive startup reports a stale persisted default without changing it", async () => {
 	const session = fakeSession(null);
 	const settings = Settings.isolated({ "modelProfile.default": "deleted-profile" });

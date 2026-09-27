@@ -114,6 +114,7 @@ export interface PrepareModelProfileActivationOptions {
 			>
 		> & {
 			getError?: ModelRegistry["getError"];
+			authStorage?: ModelRegistry["authStorage"];
 		};
 	settings: Pick<Settings, "get" | "getGlobal" | "getOverride">;
 	profileName: string;
@@ -474,6 +475,23 @@ export class ModelProfileCredentialError extends Error {
 	}
 }
 
+async function getProfileProviderApiKey(
+	registry: PrepareModelProfileActivationOptions["modelRegistry"],
+	provider: string,
+	sessionId: string,
+	profileLabel: string,
+): Promise<string | undefined> {
+	const pinUnavailable = () => registry.authStorage?.hasSessionCredentialUnavailable(provider, sessionId) === true;
+	if (pinUnavailable()) throw new ModelProfileCredentialError(profileLabel, [provider]);
+	try {
+		return await registry.getApiKeyForProvider(provider, sessionId);
+	} catch (error) {
+		// OAuth selection can invalidate a pin while the credential probe is running.
+		if (pinUnavailable()) throw new ModelProfileCredentialError(profileLabel, [provider]);
+		throw error;
+	}
+}
+
 export function formatModelProfileCredentialError(profileLabel: string, providers: readonly string[]): string {
 	return `Model profile "${profileLabel}" requires credentials for: ${providers.join(", ")}. Run /login and configure the missing provider(s), then retry.`;
 }
@@ -760,7 +778,12 @@ export async function resolveModelProfileDefaultChain(options: {
 	])) {
 		let apiKey: string | undefined;
 		try {
-			apiKey = await options.modelRegistry.getApiKeyForProvider(provider, options.credentialSessionId);
+			apiKey = await getProfileProviderApiKey(
+				options.modelRegistry,
+				provider,
+				options.credentialSessionId,
+				profileLabel,
+			);
 		} catch (error) {
 			if (requiredProviderSet.has(provider) && !alternativeSet.has(provider)) throw error;
 			continue;
@@ -785,7 +808,12 @@ export async function resolveModelProfileDefaultChain(options: {
 	const proxyApiKey =
 		proxyProvider === undefined
 			? undefined
-			: await options.modelRegistry.getApiKeyForProvider(proxyProvider, options.credentialSessionId);
+			: await getProfileProviderApiKey(
+					options.modelRegistry,
+					proxyProvider,
+					options.credentialSessionId,
+					profileLabel,
+				);
 	if (
 		proxyProvider !== undefined &&
 		!isModelProfileProxyConfigured(proxyProvider, configuredProviderIds, proxyApiKey === kNoAuth)
@@ -884,6 +912,11 @@ export async function resolveModelProfileDefaultChain(options: {
 			aliasIntent: "preset-equivalent",
 			canonicalSessionId: null,
 			credentialSessionId: options.credentialSessionId,
+			isCredentialUnavailable: provider =>
+				options.modelRegistry.authStorage?.hasSessionCredentialUnavailable(
+					provider,
+					options.credentialSessionId,
+				) === true,
 		},
 	);
 	return { profileName, entries: defaultChain, ...resolution };
@@ -1081,6 +1114,11 @@ async function resolveAndClampSelectorValue(
 					aliasIntent: options.aliasIntent,
 					canonicalSessionId: options.sessionId,
 					credentialSessionId: options.credentialSessionId,
+					isCredentialUnavailable: provider =>
+						options.modelRegistry.authStorage?.hasSessionCredentialUnavailable(
+							provider,
+							options.credentialSessionId,
+						) === true,
 				},
 			);
 			resolved = {
@@ -1211,6 +1249,11 @@ async function concretizeProfileSelectorValue(
 							aliasIntent: "preset-equivalent",
 							canonicalSessionId: prepared.session.sessionId,
 							credentialSessionId,
+							isCredentialUnavailable: provider =>
+								prepared.modelRegistry.authStorage?.hasSessionCredentialUnavailable(
+									provider,
+									credentialSessionId,
+								) === true,
 						},
 					)
 				: resolveModelRoleValue(selector, candidates, {
@@ -1320,7 +1363,7 @@ export async function prepareModelProfileActivation(
 		for (const provider of authenticationProbeProviders) {
 			let apiKey: string | undefined;
 			try {
-				apiKey = await options.modelRegistry.getApiKeyForProvider(provider, credentialSessionId);
+				apiKey = await getProfileProviderApiKey(options.modelRegistry, provider, credentialSessionId, profileLabel);
 			} catch (error) {
 				if (requiredProviderSet.has(provider) && !alternativeSet.has(provider)) throw error;
 				continue;
@@ -1355,7 +1398,7 @@ export async function prepareModelProfileActivation(
 		const proxyApiKey =
 			proxyProvider === undefined
 				? undefined
-				: await options.modelRegistry.getApiKeyForProvider(proxyProvider, credentialSessionId);
+				: await getProfileProviderApiKey(options.modelRegistry, proxyProvider, credentialSessionId, profileLabel);
 		if (proxyProvider !== undefined) {
 			const configuredProxyProviders = options.modelRegistry.getConfiguredProviderIds?.();
 			if (!isModelProfileProxyConfigured(proxyProvider, configuredProxyProviders, proxyApiKey === kNoAuth)) {
@@ -1460,6 +1503,9 @@ export async function prepareModelProfileActivation(
 				aliasIntent: "preset-equivalent",
 				canonicalSessionId: options.session.sessionId,
 				credentialSessionId,
+				isCredentialUnavailable: provider =>
+					options.modelRegistry.authStorage?.hasSessionCredentialUnavailable(provider, credentialSessionId) ===
+					true,
 			},
 		);
 		const defaultModel = defaultResolution.model;
