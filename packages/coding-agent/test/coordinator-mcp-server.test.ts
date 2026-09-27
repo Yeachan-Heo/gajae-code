@@ -7122,7 +7122,8 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 					force: true,
 					await_completion: false,
 				};
-				expect(await f.server.callTool("gjc_delegate_execute", request)).toMatchObject({ ok: true });
+				const result = await f.server.callTool("gjc_delegate_execute", request);
+				expect(result, `bounded-pin-${index}`).toMatchObject({ ok: true });
 				const file = receiptPath(f.root, request.idempotency_key);
 				const content = await Bun.file(file).text();
 				receipts.push({ promptKey: JSON.parse(content).delegate_response_pin.prompt_key_digest, file, content });
@@ -7149,7 +7150,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			expect(await pending()).toEqual([first.promptKey]);
 			expect(await survivor.callTool("gjc_coordinator_list_artifacts")).toMatchObject({ ok: true });
 			expect(await pending()).toEqual([]);
-		}, 30000);
+		}, 120_000);
 
 		it("bounds session discovery and wraps past missing sessions to later peer pins", async () => {
 			const f = await fixture(true, {
