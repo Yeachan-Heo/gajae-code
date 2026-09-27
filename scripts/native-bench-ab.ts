@@ -48,7 +48,7 @@ export interface ParsedOptions {
 }
 
 const SUITES: Record<string, { adapter: string; actualSuite: string; cases: string[] }> = {
-	"edit-hotspots": { adapter: "packages/natives/bench/edit-hotspots.ts", actualSuite: "edit-hotspots", cases: ["H01", "H02", "H06"] },
+	"edit-hotspots": { adapter: "packages/natives/bench/edit-hotspots.ts", actualSuite: "edit-hotspots", cases: ["H01", "H02", "H03", "H06"] },
 	grep: { adapter: "packages/natives/bench/grep.ts", actualSuite: "grep", cases: ["G01", "G02", "G03", "G04", "G05", "G06", "G07", "G08"] },
 	"natives-grep": { adapter: "packages/natives/bench/grep.ts", actualSuite: "grep", cases: ["G01", "G02", "G03", "G04", "G05", "G06", "G07", "G08"] },
 	rss: { adapter: "", actualSuite: "rss", cases: [] },
@@ -637,15 +637,30 @@ export async function runNativeBenchAb(repoRoot: string, options: ParsedOptions)
 			...result,
 		};
 	}
-	return withDetachedWorktree(repoRoot, baseSha, async baseRoot => ({
-		schema: BENCH_SCHEMA,
-		mode: "A/B",
-		suite: options.suite,
-		baseSha,
-		headSha,
-		host,
-		...(await run(baseRoot)),
-	}));
+	return withDetachedWorktree(repoRoot, baseSha, async baseRoot => {
+		const adapterDigest = await installHeadAdapter(repoRoot, baseRoot, config.adapter);
+		return {
+			schema: BENCH_SCHEMA,
+			mode: "A/B",
+			suite: options.suite,
+			baseSha,
+			headSha,
+			host,
+			adapter: { path: config.adapter, sha256: adapterDigest },
+			...(await run(baseRoot)),
+		};
+	});
+}
+
+/**
+ * Copy the head adapter into the base worktree so both sides time identical
+ * fixtures through the same public entrypoints. Only the implementation behind
+ * those entrypoints differs between sides.
+ */
+export async function installHeadAdapter(headRoot: string, baseRoot: string, adapter: string): Promise<string> {
+	const bytes = await Bun.file(path.join(headRoot, adapter)).bytes();
+	await Bun.write(path.join(baseRoot, adapter), bytes);
+	return new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
 }
 
 export function formatBenchError(error: unknown): { schema: string; verdict: "FAIL" | "ERROR" | "HostTooNoisy"; error: string; message: string } {

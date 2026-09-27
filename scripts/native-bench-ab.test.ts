@@ -14,6 +14,7 @@ import {
 	requireRssBuildArtifact,
 	retryRssSampler,
 	validateBenchAdapter,
+	installHeadAdapter,
 	withDetachedWorktree,
 	BenchError,
 	formatBenchError,
@@ -41,7 +42,7 @@ async function gitFixture(): Promise<string> {
 	return root;
 }
 
-const declaredEditCases = ["H01", "H02", "H06"];
+const declaredEditCases = ["H01", "H02", "H03", "H06"];
 const report = (cases: unknown[]) => ({ schema: BENCH_SCHEMA, suite: "edit-hotspots", cases });
 
 describe("native bench A/B contract", () => {
@@ -112,7 +113,7 @@ describe("native bench A/B contract", () => {
 
 	test("validates adapter schema and requires every declared measured case", () => {
 		const valid = report(declaredEditCases.map(id => ({ id, status: "measured", samples: [0.5, 0.6] })));
-		expect(validateBenchAdapter(valid, "edit-hotspots", declaredEditCases).cases).toHaveLength(3);
+		expect(validateBenchAdapter(valid, "edit-hotspots", declaredEditCases).cases).toHaveLength(declaredEditCases.length);
 		expect(() => validateBenchAdapter(report(declaredEditCases.slice(0, 2).map(id => ({ id, status: "measured", samples: [1] }))), "edit-hotspots", declaredEditCases)).toThrow("omitted declared case");
 		expect(() => validateBenchAdapter(report(declaredEditCases.map((id, index) => ({ id, status: index === 2 ? "skipped" : "measured", samples: index === 2 ? [] : [1] }))), "edit-hotspots", declaredEditCases)).toThrow("status=skipped");
 		expect(() => validateBenchAdapter(report(declaredEditCases.map(id => ({ id, status: "measured", samples: [] }))), "edit-hotspots", declaredEditCases)).toThrow("zero samples");
@@ -149,5 +150,24 @@ describe("native bench A/B contract", () => {
 		const worktrees = Bun.spawnSync(["git", "worktree", "list", "--porcelain"], { cwd: root, stdout: "pipe" }).stdout.toString();
 		expect(worktrees).toContain(root);
 		expect(worktrees).not.toContain(`${path.sep}base\n`);
+	});
+
+	test("installs the head adapter bytes into the base worktree before timing", async () => {
+		const root = await gitFixture();
+		const adapter = "bench/adapter.ts";
+		await fs.mkdir(path.join(root, "bench"));
+		await fs.writeFile(path.join(root, adapter), "export const side = 'base';\n");
+		for (const args of [["add", adapter], ["commit", "-qm", "base adapter"]]) {
+			Bun.spawnSync(["git", ...args], { cwd: root, stdout: "pipe", stderr: "pipe" });
+		}
+		const baseSha = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: root, stdout: "pipe" }).stdout.toString().trim();
+		const headBytes = "export const side = 'head';\n";
+		await fs.writeFile(path.join(root, adapter), headBytes);
+		const installed = await withDetachedWorktree(root, baseSha, async baseRoot => {
+			const digest = await installHeadAdapter(root, baseRoot, adapter);
+			return { digest, text: await Bun.file(path.join(baseRoot, adapter)).text() };
+		}, { prepare: false });
+		expect(installed.text).toBe(headBytes);
+		expect(installed.digest).toBe(new Bun.CryptoHasher("sha256").update(headBytes).digest("hex"));
 	});
 });
