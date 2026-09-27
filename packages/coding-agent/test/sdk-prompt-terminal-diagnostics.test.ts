@@ -490,3 +490,107 @@ isolatedSdkHostTest(
 	},
 	75_000,
 );
+
+isolatedSdkHostTest(
+	"F2 the native terminal stream-error producer carries the diagnostic to the supported turn.result query",
+	async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-f2-stream-"));
+		dirs.push(cwd);
+		const sessionId = `sdk-f2-stream-${Date.now()}`;
+		const sessionContext = context(cwd, sessionId);
+		const handlers = await start(sessionContext, () => undefined);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "f2-stream",
+				operation: "turn.prompt",
+				input: { text: "provider fails inside the stream", clientRef: "f2-stream-ref" },
+			}),
+		);
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === "f2-stream"),
+			"prompt acknowledgement",
+		);
+
+		// No agent_failed frame: the failure exists only as a terminal error assistant,
+		// so the diagnostic can come from nowhere but the stream-error producer itself.
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		await handlers.get("agent_end")?.(
+			{
+				type: "agent_end",
+				stopReason: "completed",
+				messages: [
+					{
+						role: "assistant",
+						stopReason: "error",
+						errorKind: "provider_error",
+						errorCode: "provider_unavailable",
+						errorMessage: "overloaded sk-ant-secret-F2-STREAM https://api.example/v1",
+						providerDiagnostic: {
+							category: "provider_unavailable",
+							httpStatus: 503,
+							code: "overloaded_error",
+							evidence: "structured_code",
+						},
+					},
+				],
+			},
+			sessionContext,
+		);
+
+		// Q26 `turn.result` is a QUERY, not a control operation: it is read through
+		// `query_request`, which is the supported public readback for a durable turn.
+		let settled: { status?: string; error?: { code?: string }; outcome?: Record<string, unknown> } | undefined;
+		let lastResponse = "none";
+		for (let attempt = 0; attempt < 120 && settled === undefined; attempt += 1) {
+			socket.send(
+				JSON.stringify({
+					type: "query_request",
+					id: `f2-stream-result-${attempt}`,
+					query: "turn.result",
+					input: { kind: "prompt", clientRef: "f2-stream-ref" },
+				}),
+			);
+			await Bun.sleep(25);
+			const response = frames.find(frame => frame.id === `f2-stream-result-${attempt}`) as
+				| { result?: { status?: string; error?: { code?: string }; outcome?: Record<string, unknown> } }
+				| undefined;
+			if (response !== undefined) lastResponse = JSON.stringify(response);
+			if (response?.result?.status === "failed" || response?.result?.status === "terminal_ok")
+				settled = response.result;
+		}
+		if (settled === undefined) throw new Error(`turn.result never reported a terminal status; last=${lastResponse}`);
+
+		expect(settled.status).toBe("failed");
+		expect(settled.outcome).toMatchObject({
+			kind: "failed",
+			code: "prompt_failed",
+			provenance: "agent_failed",
+			providerCode: "provider_unavailable",
+			providerDiagnostic: {
+				category: "provider_unavailable",
+				httpStatus: 503,
+				code: "overloaded_error",
+				evidence: "structured_code",
+			},
+		});
+		expect(JSON.stringify(settled)).not.toContain("sk-ant-secret-F2-STREAM");
+		expect(JSON.stringify(settled)).not.toContain("api.example");
+
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	},
+	75_000,
+);
