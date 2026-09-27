@@ -93,20 +93,27 @@ MIT
 
 ### Quick Sync and Summary
 ```bash
-# Sync latest sessions and print summary
-gjc stats --sync
+# Sync latest sessions and print summary (syncs first, then prints)
+gjc stats --summary
 ```
 
 ### JSON Output for Scripting
 ```bash
 # Export stats as JSON for external processing
-gjc stats --json | jq '.overall.totalCost'
+# Note: Use --json alone; the initial sync message goes to stderr
+gjc stats --json 2>/dev/null | jq '.overall.totalCost'
 ```
 
-### Custom Port with Summary
+### Custom Port (Dashboard)
 ```bash
-# Start dashboard on custom port and show summary
-gjc stats --port 3000 --summary
+# Start dashboard on custom port
+gjc stats --port 3000
+```
+
+### Summary Only (No Dashboard)
+```bash
+# Print summary to console (syncs first, then prints, no server)
+gjc stats --summary
 ```
 
 ### Programmatic: Per-Folder Breakdown
@@ -118,11 +125,15 @@ const { processed, files } = await syncAllSessions();
 const stats = await getDashboardStats();
 
 // Find the folder with highest total cost
-const topFolder = stats.byFolder.reduce(
-  (a, b) => (a.totalCost > b.totalCost ? a : b),
-  stats.byFolder[0]
-);
-console.log(`Highest cost folder: ${topFolder.folder} (${formatCost(topFolder.totalCost)})`);
+if (stats.byFolder.length > 0) {
+  const topFolder = stats.byFolder.reduce(
+    (a, b) => (a.totalCost > b.totalCost ? a : b),
+    stats.byFolder[0]
+  );
+  console.log(`Highest cost folder: ${topFolder.folder} ($${topFolder.totalCost.toFixed(2)})`);
+} else {
+  console.log("No folder data available");
+}
 ```
 
 ### Programmatic: Per-Model Analysis
@@ -132,13 +143,13 @@ import { syncAllSessions, getDashboardStats } from "@gajae-code/stats";
 const { processed, files } = await syncAllSessions();
 const stats = await getDashboardStats();
 
-// Model with highest average tokens per second
-const topModel = stats.byModel[0]; // already sorted by requests
-console.log(`Most active model: ${topModel.model} with ${topModel.totalRequests} requests`);
+// Model with most requests (byModel is sorted by totalRequests DESC)
+const topModel = stats.byModel[0];
+console.log(`Most requested model: ${topModel.model} with ${topModel.totalRequests} requests`);
 ```
 
 ### Troubleshooting
 
 - **No data shown?** Ensure session logs exist at `~/.gjc/agent/sessions/`
 - **Dashboard not starting?** Check that port 3847 (or your custom port) is available
-- **Empty results?** Run `gjc stats --sync` to force sync of new session files
+- **Empty results?** Run `gjc stats --summary` to force sync and show summary
