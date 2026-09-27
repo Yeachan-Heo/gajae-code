@@ -28,54 +28,14 @@ import {
 } from "./startup-failure";
 
 /**
- * Escape arguments for cmd.exe parsing. Wraps each argument in quotes and
- * escapes internal quotes. This prevents cmd.exe from interpreting special
- * characters like %, &, ^, <, >, and | as command operators.
- */
-function escapeCmdArgument(arg: string): string {
-	// Wrap in quotes and escape any internal quotes by doubling them
-	return `"${arg.replace(/"/g, '""')}"`;
-}
-
-/**
- * Resolve broker spawn options based on the platform.
- * On Windows, wraps the command in cmd /c start. On other platforms, returns unchanged.
- * Exposed for testing with platform injection.
- */
-function resolveBrokerSpawnOptionsWithPlatform(
-	file: string,
-	args: readonly string[],
-	platform: NodeJS.Platform,
-): { file: string; args: string[] } {
-	if (platform !== "win32") {
-		return { file, args: Array.from(args) };
-	}
-	// On Windows, use cmd /c start /b to spawn without a new console window
-	// and detached from the parent process. This prevents taskkill /T on the
-	// parent from killing the broker and all its children.
-	// The empty title "" is required: start treats its first quoted argument as
-	// the window title, so paths containing spaces would be consumed as the title
-	// rather than executed. Provide an explicit empty title to avoid this.
-	// The file path and arguments are wrapped in quotes to prevent cmd.exe from
-	// interpreting special characters like %, &, ^, <, >, and | as command operators.
-	// Format: cmd /c start "" /b "<file>" "<arg1>" "<arg2>" ...
-	return {
-		file: "cmd",
-		args: ["/c", "start", "", "/b", escapeCmdArgument(file), ...args.map(escapeCmdArgument)],
-	};
-}
-
-/**
- * On Windows, spawning a detached process requires an intermediate launcher.
- * This is because `detached: true` on Windows keeps the child in the parent's
- * process tree as a descendant of cmd rather than the parent, allowing it to
- * survive parent termination.
+ * Broker spawn always uses direct spawning. On all platforms, including Windows,
+ * Bun.spawn with detached:true creates a process that survives parent termination.
+ * This avoids the complexity and fragility of cmd.exe wrapping on Windows.
  *
- * Returns the file and arguments to spawn. On Windows, wraps the real command
- * in `cmd /c start`. On other platforms, returns the original command and arguments.
+ * Returns the file and arguments to spawn unchanged.
  */
 function resolveBrokerSpawnOptions(file: string, args: readonly string[]): { file: string; args: string[] } {
-	return resolveBrokerSpawnOptionsWithPlatform(file, args, process.platform);
+	return { file, args: Array.from(args) };
 }
 
 function resolveExpectedBrokerGeneration(): string {
@@ -1031,32 +991,12 @@ export function brokerStartupFailureReasonForTest(marker: BrokerStartupFailureMa
 	return brokerStartupFailureReason(marker);
 }
 /**
- * Resolves broker spawn options based on the current platform.
- * On Windows, wraps the command in cmd /c start to handle process detachment.
- * On other platforms, returns the command and arguments unchanged.
- *
- * This is used by both production code (authorized broker restarts) and tests.
+ * Resolves broker spawn options. Always returns the command unchanged,
+ * using direct spawning on all platforms.
  */
 export function resolveBrokerSpawnOptionsForProduction(
 	file: string,
 	args: readonly string[],
 ): { file: string; args: string[] } {
 	return resolveBrokerSpawnOptions(file, args);
-}
-
-/** Test hook: verifies the broker spawn-option selection for Windows vs non-Windows platforms. */
-export function resolveBrokerSpawnOptionsForTest(
-	file: string,
-	args: readonly string[],
-): { file: string; args: string[] } {
-	return resolveBrokerSpawnOptions(file, args);
-}
-
-/** Test hook: allows testing platform-specific behavior by injecting the platform parameter. */
-export function resolveBrokerSpawnOptionsWithPlatformForTest(
-	file: string,
-	args: readonly string[],
-	platform: NodeJS.Platform,
-): { file: string; args: string[] } {
-	return resolveBrokerSpawnOptionsWithPlatform(file, args, platform);
 }
