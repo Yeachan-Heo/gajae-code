@@ -127,12 +127,16 @@ type LockInfo = FileLockOwnerToken;
 
 export const FileLockTestHooks: {
 	afterParentMkdir?: (lockPath: string) => void | Promise<void>;
+	beforeEmptyLockDirRename?: (lockDir: string) => void | Promise<void>;
+	afterEmptyLockDirRename?: (tombstonePath: string) => void | Promise<void>;
 	nativePublicationBindings?: () => {
 		renameNoReplacePathAsync: typeof renameNoReplacePathAsync;
 		renameDirectoryNoReplacePathAsync: typeof renameDirectoryNoReplacePathAsync;
 	};
 	nativeQuarantineBindings?: () => NativeFileLockBindings;
 	nativeExactRemovalProbe?: () => boolean | Promise<boolean>;
+	/** @internal For testing only: direct access to removeEmptyFileLockDir */
+	removeEmptyFileLockDir?: (lockDir: string, expected: GenericFileLockDirIdentity) => Promise<FileLockGcRemoval>;
 } = {};
 
 /**
@@ -1776,6 +1780,54 @@ function manualLockCleanupCommand(lockPath: string): string {
 }
 
 /**
+ * Restore a moved directory from tombstone back to original location if needed.
+ * Called when identity mismatch or info file is detected after rename, meaning
+ * a successor was created at the original lockDir after we moved the original to tombstone.
+ * Restoring ensures the successor's lock is not left orphaned.
+ *
+ * Only restores if lockDir does not exist; if restore fails, fails loudly with
+ * a manual cleanup hint to prevent silent mutual-exclusion breakage.
+ */
+async function restoreMovedLockDir(lockDir: string, tombstonePath: string): Promise<void> {
+	let lockDirExists = false;
+	try {
+		await fs.lstat(lockDir, { bigint: true });
+		lockDirExists = true;
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+	}
+
+	// lockDir exists already (e.g., successor was created), so don't restore
+	// The tombstone will be left for manual cleanup
+	if (lockDirExists) return;
+
+	// lockDir doesn't exist; restore the tombstone
+	try {
+		await fs.rename(tombstonePath, lockDir);
+	} catch (error) {
+		// Restoration failed; this could mean:
+		// - The tombstone was already removed by another process
+		// - lockDir was created by another process between our check and rename
+		// - Some other filesystem error occurred
+		// Fail loudly with a manual cleanup hint to prevent silent breakage
+		if (isEnoent(error)) {
+			// Tombstone gone; that's acceptable, just return
+			return;
+		}
+		if (isTransientReleaseError(error)) throw error;
+		// Non-transient error during restore; fail loudly
+		const cleanup = manualLockCleanupCommand(tombstonePath);
+		throw Object.assign(
+			new Error(
+				`Failed to restore lock directory from ${tombstonePath} to ${lockDir}. ` +
+					`This may break mutual exclusion. Manual cleanup required: ${cleanup}`,
+			),
+			{ code: "lock_restore_failed", lockDir, tombstonePath },
+		);
+	}
+}
+
+/**
  * Remove an empty lock directory (no info file) after its identity is verified.
  * Empty directories can result from a release/removal that deleted the info file
  * but left the directory. If the root identity matches, the directory is safe to remove.
@@ -1820,6 +1872,13 @@ async function removeEmptyFileLockDir(
 	// we fail closed. If the rename succeeds, the original path is no longer occupied,
 	// so we can safely re-verify and remove only the tombstone.
 	const tombstonePath = `${lockDir}.removing-${crypto.randomUUID()}`;
+
+	// Test hook: allow injection of a successor before the rename
+	// This simulates the race where the original dir is deleted and a new one is created
+	if (FileLockTestHooks.beforeEmptyLockDirRename) {
+		await FileLockTestHooks.beforeEmptyLockDirRename(lockDir);
+	}
+
 	try {
 		await fs.rename(lockDir, tombstonePath);
 	} catch (error) {
@@ -1831,6 +1890,11 @@ async function removeEmptyFileLockDir(
 		if (isEnoent(error)) return "removed";
 		if (isTransientReleaseError(error)) throw error;
 		return "owner_changed";
+	}
+
+	// Test hook: allow injection of a successor lock at lockDir after the rename
+	if (FileLockTestHooks.afterEmptyLockDirRename) {
+		await FileLockTestHooks.afterEmptyLockDirRename(tombstonePath);
 	}
 
 	// Re-verify the tombstone still has the expected identity and is still empty.
@@ -1851,14 +1915,18 @@ async function removeEmptyFileLockDir(
 		String(tombstoneRoot.dev) !== expected.rootDev ||
 		String(tombstoneRoot.ino) !== expected.rootIno
 	) {
-		// Identity mismatch; fail closed and leave the tombstone for manual cleanup
+		// Identity mismatch; a successor was created after we renamed.
+		// Restore the tombstone back to lockDir to avoid breaking mutual exclusion.
+		await restoreMovedLockDir(lockDir, tombstonePath);
 		return "owner_changed";
 	}
 
 	// Verify the tombstone is still empty (no info file)
 	try {
 		await fs.lstat(path.join(tombstonePath, "info"), { bigint: true });
-		// Info file exists; another process created it after we renamed
+		// Info file exists; another process created it after we renamed.
+		// Restore the tombstone back to lockDir to avoid breaking mutual exclusion.
+		await restoreMovedLockDir(lockDir, tombstonePath);
 		return "owner_changed";
 	} catch (error) {
 		if (!isEnoent(error)) throw error;
@@ -1878,6 +1946,9 @@ async function removeEmptyFileLockDir(
 	}
 }
 
+// Set the default removeEmptyFileLockDir implementation in test hooks for test access
+FileLockTestHooks.removeEmptyFileLockDir = removeEmptyFileLockDir;
+
 async function removeStaleLockForAcquire(
 	lockPath: string,
 	snapshot: LockStaleSnapshot,
@@ -1887,7 +1958,8 @@ async function removeStaleLockForAcquire(
 		// Empty lock directories (marker identity with infoDev="-1") are removed directly
 		// without an owner token, since they have no info file to validate against.
 		if (snapshot.owner === undefined && snapshot.identity.infoDev === "-1") {
-			const outcome = await removeEmptyFileLockDir(lockPath, snapshot.identity);
+			const removalFn = FileLockTestHooks.removeEmptyFileLockDir || removeEmptyFileLockDir;
+			const outcome = await removalFn(lockPath, snapshot.identity);
 			if (outcome === "removed") return { removed: true };
 			return { removed: false, failure: { outcome, message: "empty lock directory removal failed" } };
 		}
