@@ -85,71 +85,69 @@ The web dashboard provides:
 - Per-folder breakdown table
 - Auto-refresh every 30 seconds
 
-## License
-
-MIT
-
 ## Tips & Common Patterns
 
-### Quick Sync and Summary
+### Sync and print a summary
+
+Every `gjc stats` invocation syncs session files before it does anything else, so there is no separate sync flag.
+
 ```bash
-# Sync latest sessions and print summary (syncs first, then prints)
 gjc stats --summary
 ```
 
-### JSON Output for Scripting
+### JSON output for scripting
+
+`gjc stats --json` prints a `Synced N new entries ...` status line and a blank line on stdout before the JSON object (sync progress goes to stderr). Skip to the first line that opens the object before piping into `jq`:
+
 ```bash
-# Export stats as JSON for external processing
-# Note: Use --json alone; the initial sync message goes to stderr
-gjc stats --json 2>/dev/null | jq '.overall.totalCost'
+gjc stats --json | sed -n '/^{/,$p' | jq '.overall.totalCost'
 ```
 
-### Custom Port (Dashboard)
+### Dashboard on a custom port
+
 ```bash
-# Start dashboard on custom port
 gjc stats --port 3000
 ```
 
-### Summary Only (No Dashboard)
-```bash
-# Print summary to console (syncs first, then prints, no server)
-gjc stats --summary
-```
+`--summary` and `--json` print and exit without starting the server, so `--port` has no effect when combined with them.
 
-### Programmatic: Per-Folder Breakdown
+### Programmatic: highest-cost folder
+
 ```typescript
-import { syncAllSessions, getDashboardStats } from "@gajae-code/stats";
+import { getDashboardStats, syncAllSessions } from "@gajae-code/stats";
 
-// Sync and get folder stats
-const { processed, files } = await syncAllSessions();
+await syncAllSessions();
 const stats = await getDashboardStats();
 
-// Find the folder with highest total cost
-if (stats.byFolder.length > 0) {
-  const topFolder = stats.byFolder.reduce(
-    (a, b) => (a.totalCost > b.totalCost ? a : b),
-    stats.byFolder[0]
-  );
+const [first, ...rest] = stats.byFolder;
+if (first) {
+  const topFolder = rest.reduce((a, b) => (b.totalCost > a.totalCost ? b : a), first);
   console.log(`Highest cost folder: ${topFolder.folder} ($${topFolder.totalCost.toFixed(2)})`);
 } else {
   console.log("No folder data available");
 }
 ```
 
-### Programmatic: Per-Model Analysis
-```typescript
-import { syncAllSessions, getDashboardStats } from "@gajae-code/stats";
+### Programmatic: most-requested model
 
-const { processed, files } = await syncAllSessions();
+```typescript
+import { getDashboardStats, syncAllSessions } from "@gajae-code/stats";
+
+await syncAllSessions();
 const stats = await getDashboardStats();
 
-// Model with most requests (byModel is sorted by totalRequests DESC)
+// byModel is ordered by request count, highest first.
 const topModel = stats.byModel[0];
-console.log(`Most requested model: ${topModel.model} with ${topModel.totalRequests} requests`);
+if (topModel) {
+  console.log(`Most requested model: ${topModel.model} (${topModel.totalRequests} requests)`);
+}
 ```
 
 ### Troubleshooting
 
-- **No data shown?** Ensure session logs exist at `~/.gjc/agent/sessions/`
-- **Dashboard not starting?** Check that port 3847 (or your custom port) is available
-- **Empty results?** Run `gjc stats --summary` to force sync and show summary
+- **No data shown?** Check that session logs exist under `~/.gjc/agent/sessions/`.
+- **Dashboard not starting?** Check that port 3847 (or the port passed to `--port`) is free.
+
+## License
+
+MIT
