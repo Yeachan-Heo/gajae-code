@@ -2326,15 +2326,15 @@ export class Agent {
 			// Store the sanitized message only: the raw provider error may carry request
 			// bodies, credentials, or tokens (exact-head review P1).
 			this.#state.error = sanitizeAgentFailure(err).message;
-			this.#emit({
-				type: "agent_failed",
-				// Runtime-authenticated classifiers only: abort comes from the
-				// signal, and a local staging failure comes from the identity-
-				// checked managedLocalErrorDiagnostic — a foreign error that
-				// self-declares a local kind still maps to agent_failed.
-				error: sanitizeAgentFailure(err, runtimeFailureCode),
-				scope: handle.scope,
-			});
+			if (!abortController.signal.aborted) {
+				this.#emit({
+					type: "agent_failed",
+					// Only the identity-checked local staging diagnostic may assert a
+					// local failure kind; a foreign self-declaration stays agent_failed.
+					error: sanitizeAgentFailure(err, runtimeFailureCode),
+					scope: handle.scope,
+				});
+			}
 			this.requestRunTerminal(managedLogicalRunOwner ?? runId, {
 				stopReason: abortController.signal.aborted ? "cancelled" : "error",
 				messages: [errorMsg],
