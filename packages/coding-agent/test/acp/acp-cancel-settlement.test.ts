@@ -781,7 +781,9 @@ test("a no_active_turn retry is repeated after the correlated turn starts", asyn
 		fixture.sendStarted();
 		await bounded(startedAbortIssued.promise, "terminal abort after correlated start");
 		expect(abortCalls).toBe(4);
-		expect(await bounded(pending, "cancelled settlement after correlated start")).toEqual({ stopReason: "cancelled" });
+		expect(await bounded(pending, "cancelled settlement after correlated start")).toEqual({
+			stopReason: "cancelled",
+		});
 	} finally {
 		warning.mockRestore();
 		fixture.dispose();
@@ -793,7 +795,9 @@ test("a no_active_turn cancel without a pending prompt leaves the next prompt un
 		abortAcknowledgement: { turn: "no_active_turn", terminal: "terminal_no_effect" },
 	});
 	try {
-		await expect(bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel without waiter")).rejects.toMatchObject({
+		await expect(
+			bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel without waiter"),
+		).rejects.toMatchObject({
 			code: "abort_unacknowledged",
 		});
 		const pending = prompt(fixture, "prompt after cancel without waiter");

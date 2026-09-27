@@ -2718,8 +2718,7 @@ export class AcpAgent implements Agent {
 			// rejection instead would show the user a spurious error for their own cancel.
 			if (
 				record.cancelRequested &&
-				(waiter.cancelAcknowledged ||
-					(waiter.cancelBeforeAdmission && !waiter.acknowledged && !waiter.dispatched))
+				(waiter.cancelAcknowledged || (waiter.cancelBeforeAdmission && !waiter.acknowledged && !waiter.dispatched))
 			) {
 				record.cancelRequested = false;
 				// The client's turn is settled by the return; the advisory idle publication
