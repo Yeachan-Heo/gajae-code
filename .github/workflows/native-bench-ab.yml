@@ -45,21 +45,22 @@ jobs:
         if: ${{ inputs.suite == 'profile-stability' }}
         run: |
           set -euo pipefail
-          mkdir -p profile-stability
-          uptime | tee profile-stability/load-before.txt
-          bun run bench:profile -- --scenario all --out profile-stability/run1 | tee profile-stability/run1.log
-          bun run bench:profile -- --scenario all --out profile-stability/run2 --compare profile-stability/run1/report.json | tee profile-stability/run2.log
-          uptime | tee profile-stability/load-after.txt
+          mkdir -p .gjc/profiles/profile-stability
+          uptime | tee .gjc/profiles/profile-stability/load-before.txt
+          bun run bench:profile -- --scenario all --out .gjc/profiles/profile-stability/run1 | tee .gjc/profiles/profile-stability/run1.log
+          bun run bench:profile -- --scenario all --out .gjc/profiles/profile-stability/run2 --compare .gjc/profiles/profile-stability/run1/report.json | tee .gjc/profiles/profile-stability/run2.log
+          uptime | tee .gjc/profiles/profile-stability/load-after.txt
       - name: Upload profile stability evidence
         if: ${{ always() && inputs.suite == 'profile-stability' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: profile-stability-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            profile-stability/*.log
-            profile-stability/*.txt
-            profile-stability/*/report.json
-            profile-stability/*/report.md
+            .gjc/profiles/profile-stability/*.log
+            .gjc/profiles/profile-stability/*.txt
+            .gjc/profiles/profile-stability/*/report.json
+            .gjc/profiles/profile-stability/*/report.md
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 30
       - name: Run native benchmark A/B
