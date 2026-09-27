@@ -50,6 +50,8 @@ import { parseThinkingLevel } from "../../thinking";
 import { readEndpointFile } from "../broker/endpoint-authority";
 import { ensureBroker } from "../broker/ensure";
 import { processIncarnation } from "../broker/process-incarnation";
+import { RecoveryBackoffTracker } from "../broker/recovery-backoff";
+import { isSdkInternalRuntimeImagePresent, sdkInternalRuntimeImage } from "../broker/runtime";
 import {
 	type MasterRoleAttestationV2,
 	resolveSessionLocator,
@@ -716,6 +718,8 @@ export interface CreateSdkSessionRuntimeOptions {
 	onFailureDiagnosticKeyCountForTests?: (count: number) => void;
 	/** Test-only observation after a resolved invocation completion is reconciled. */
 	onInvocationCompletionReconciledForTests?: (kind: InvocationKind, correlation: InvocationCorrelation) => void;
+	/** Test hook: provides a function to inject a controlled clock for broker recovery backoff assertions. */
+	setRecoveryBackoffClockForTest?: (inject: (clock: { now(): number }) => void) => void;
 }
 
 function unavailable(operation: string): () => never {
@@ -7013,6 +7017,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		let brokerRegistered = false;
 		let brokerRegistrationInFlight: Promise<void> | undefined;
 		let brokerRecoveryStopped = false;
+		let brokerRecoveryRestartRequired = false;
+		const brokerRecoveryBackoff = new RecoveryBackoffTracker();
+		if (options.setRecoveryBackoffClockForTest) {
+			options.setRecoveryBackoffClockForTest((clock: { now(): number }) =>
+				brokerRecoveryBackoff.setClockForTest(clock),
+			);
+		}
 		const registerBroker = async (): Promise<void> => {
 			if (brokerRegistered) return;
 			if (brokerRegistrationInFlight !== undefined) {
@@ -7143,7 +7154,30 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		let brokerRecoveryTimer: NodeJS.Timeout | undefined;
 		let brokerRecoveryInFlight: Promise<void> | undefined;
 		const runBrokerRecovery = async (): Promise<void> => {
-			if (brokerRecoveryStopped || brokerRecoveryInFlight !== undefined) return;
+			if (brokerRecoveryStopped || brokerRecoveryInFlight !== undefined || brokerRecoveryRestartRequired) return;
+
+			// Check if this process's own runtime image is gone or replaced.
+			// If so, we cannot spawn a broker and must surface a restart condition.
+			const runtimeImage = sdkInternalRuntimeImage();
+			if (runtimeImage) {
+				const imagePresent = await isSdkInternalRuntimeImagePresent(runtimeImage).catch(
+					() => true, // Assume present on any error to be conservative
+				);
+				if (!imagePresent) {
+					// Runtime image is gone or replaced; cannot spawn broker.
+					// Mark that a restart is required and stop recovery attempts.
+					brokerRecoveryRestartRequired = true;
+					stopBrokerRecovery();
+					logger.warn("sdk broker recovery requires session restart", {
+						reason: "runtime_image_replaced",
+					});
+					return;
+				}
+			}
+
+			// Check if we should proceed with recovery based on backoff schedule.
+			if (!brokerRecoveryBackoff.canAttemptRecovery(options.agentDir)) return;
+
 			const recovery = (async (): Promise<void> => {
 				if (brokerRecoveryStopped) return;
 				if (brokerRegistered) await (options.ensureBrokerImpl ?? ensureBroker)({ agentDir: options.agentDir });
@@ -7152,8 +7186,23 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			brokerRecoveryInFlight = recovery;
 			try {
 				await recovery;
+				// Recovery succeeded; reset backoff state.
+				brokerRecoveryBackoff.recordSuccess(options.agentDir);
 			} catch (error) {
-				logger.warn("sdk broker recovery unavailable", { code: brokerDiagnosticCode(error) });
+				const shouldContinue = brokerRecoveryBackoff.recordFailure(options.agentDir);
+				if (!shouldContinue) {
+					// Max recovery attempts reached; mark that restart is required.
+					brokerRecoveryRestartRequired = true;
+					stopBrokerRecovery();
+					logger.warn("sdk broker recovery max attempts exceeded", {
+						code: brokerDiagnosticCode(error),
+					});
+				} else {
+					logger.warn("sdk broker recovery unavailable", {
+						code: brokerDiagnosticCode(error),
+						backoffWaitMs: brokerRecoveryBackoff.getBackoffWaitMs(options.agentDir),
+					});
+				}
 			} finally {
 				if (brokerRecoveryInFlight === recovery) brokerRecoveryInFlight = undefined;
 			}
