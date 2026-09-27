@@ -30,7 +30,7 @@ import {
 /**
  * On Windows, spawning a detached process requires an intermediate launcher.
  * This is because `detached: true` on Windows keeps the child in the parent's
- * process tree (issue #6007). Using `cmd /c start` creates the broker as a
+/**
  * descendant of cmd rather than the parent, allowing it to survive parent termination.
  *
  * Returns the file and arguments to spawn. On Windows, wraps the real command
@@ -43,11 +43,13 @@ function resolveBrokerSpawnOptions(file: string, args: readonly string[]): { fil
 	// On Windows, use cmd /c start /b to spawn without a new console window
 	// and detached from the parent process. This prevents taskkill /T on the
 	// parent from killing the broker and all its children.
-	// Format: cmd /c start /b <file> <args...>
-	const cmdArgs = [file, ...args];
+	// The empty title "" is required: start treats its first quoted argument as
+	// the window title, so paths containing spaces would be consumed as the title
+	// rather than executed. Provide an explicit empty title to avoid this.
+	// Format: cmd /c start "" /b <file> <args...>
 	return {
 		file: "cmd",
-		args: ["/c", "start", "/b", ...cmdArgs],
+		args: ["/c", "start", "", "/b", file, ...args],
 	};
 }
 
@@ -741,7 +743,14 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		await spawnLog?.handle.close().catch(() => undefined);
 		let discoveryError: unknown;
 		while (ensureBrokerTiming.now() < deadline) {
-			if (spawnError || child.exitCode !== null || child.signalCode !== null) break;
+			// On Windows, child is cmd.exe which exits immediately with code 0 after
+			// spawning the real broker via `start`. Do not break the poll loop on a
+			// clean exit (code 0); break only on spawn error or actual failure (signal
+			// or non-zero exit). This allows discovery polling to continue through the
+			// normal deadline while the real broker starts and publishes.
+			const failedSpawn =
+				spawnError || child.signalCode !== null || (child.exitCode !== null && child.exitCode !== 0);
+			if (failedSpawn) break;
 			try {
 				const discovered = await readBrokerDiscoveryBeforeDeadline(
 					settings.agentDir,
@@ -767,29 +776,6 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 			await ensureBrokerTiming.sleep(50);
 		}
 		const exitedBeforeDiscovery = child.exitCode !== null || child.signalCode !== null;
-		if (exitedBeforeDiscovery && child.exitCode === 0) {
-			// A clean exit means another broker won the ownership lock (two ACP
-			// processes racing a cold broker state, e.g. a provider probe and an
-			// agent launch). The winner may publish its discovery right after our
-			// last poll; reuse it instead of failing the caller. Transient discovery
-			// read failures fall through to the common cleanup + failure path below.
-			try {
-				for (let retry = 0; retry < 20; retry++) {
-					const winner = await readBrokerDiscoveryBeforeDeadline(
-						settings.agentDir,
-						settings.heartbeatTtlMs,
-						deadline,
-					);
-					if (winner && (await isBrokerReusable(winner))) {
-						await owner.stop();
-						return { kind: "external-discovery", discovery: winner };
-					}
-					await ensureBrokerTiming.sleep(50);
-				}
-			} catch {
-				// fall through to cleanup + failure
-			}
-		}
 		const marker = await readBrokerStartupFailureMarker(settings.agentDir);
 		const startupExitRecord = await readBrokerStartupExitRecord(settings.agentDir);
 		const trustedMarker =
@@ -916,11 +902,16 @@ export function startFixtureBrokerWithLeaseForTest(settings: EnsureBrokerSetting
  * Test-only launch surface for topology fixtures. It accepts an already-resolved
  * command and retains the exact spawned child; no production selection path
  * reaches this function.
+ *
+ * Note: This function does NOT use the Windows cmd.exe wrapper from
+ * resolveBrokerSpawnOptions. Fixtures are test-only and do not require Windows
+ * process-tree detachment; the fixture needs to retain exact ownership of the
+ * actual broker process to control its stdio[3] control pipe. Production code
+ * uses resolveBrokerSpawnOptions to handle Windows detachment properly.
  */
 export function startFixtureBrokerCommandWithLeaseForTest(command: FixtureBrokerCommand): StartedFixtureBrokerCommand {
 	if (!command.file || !Array.isArray(command.args)) throw new Error("Invalid fixture broker command.");
-	const brokerSpawnOpts = resolveBrokerSpawnOptions(command.file, command.args);
-	const child = spawn(brokerSpawnOpts.file, brokerSpawnOpts.args, {
+	const child = spawn(command.file, command.args, {
 		cwd: command.cwd,
 		detached: process.platform !== "win32",
 		stdio: ["ignore", "ignore", "ignore", "pipe"],
@@ -995,6 +986,20 @@ export function registerBrokerOwnerForTest(
 export function brokerStartupFailureReasonForTest(marker: BrokerStartupFailureMarker | undefined): string {
 	return brokerStartupFailureReason(marker);
 }
+/**
+ * Resolves broker spawn options based on the current platform.
+ * On Windows, wraps the command in cmd /c start to handle process detachment.
+ * On other platforms, returns the command and arguments unchanged.
+ *
+ * This is used by both production code (authorized broker restarts) and tests.
+ */
+export function resolveBrokerSpawnOptionsForProduction(
+	file: string,
+	args: readonly string[],
+): { file: string; args: string[] } {
+	return resolveBrokerSpawnOptions(file, args);
+}
+
 /** Test hook: verifies the broker spawn-option selection for Windows vs non-Windows platforms. */
 export function resolveBrokerSpawnOptionsForTest(
 	file: string,
