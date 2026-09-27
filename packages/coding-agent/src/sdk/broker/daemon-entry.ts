@@ -99,8 +99,14 @@ export async function launchAuthorizedBrokerSuccessor(
 				reason: "spawn_failed",
 				detail: spawnOutcome.spawnError()?.message,
 			};
-		if (child.exitCode !== null || child.signalCode !== null)
-			return { kind: "refused", reason: "spawn_exited_before_publication" };
+		// On Windows, child is cmd.exe which exits immediately with code 0 after
+		// spawning the real broker via `start`. Do not break the poll loop on a
+		// clean exit (code 0); break only on spawn error or actual failure (signal
+		// or non-zero exit). This allows discovery polling to continue through the
+		// normal deadline while the real broker starts and publishes.
+		const failedSpawn =
+			spawnOutcome.spawnError() || child.signalCode !== null || (child.exitCode !== null && child.exitCode !== 0);
+		if (failedSpawn) return { kind: "refused", reason: "spawn_exited_before_publication" };
 		const discovered = await readBrokerDiscovery(options.agentDir);
 		if (
 			discovered &&
