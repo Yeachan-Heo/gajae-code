@@ -2264,11 +2264,15 @@ where
 }
 
 struct CollectVisitor<'a, E> {
-	root:    &'a Path,
-	policy:  cache::ScanPolicy,
-	entries: Vec<CollectedEntry>,
-	failure: Option<String>,
-	_error:  std::marker::PhantomData<fn() -> E>,
+	root:       &'a Path,
+	policy:     cache::ScanPolicy,
+	entries:    Vec<CollectedEntry>,
+	/// Sum of `entry.path.capacity()` over `entries`, maintained by `push` so
+	/// the byte budget is checked in O(1) per entry instead of re-summing every
+	/// path.
+	path_bytes: usize,
+	failure:    Option<String>,
+	_error:     std::marker::PhantomData<fn() -> E>,
 }
 
 fn bounded_root(root: &Path) -> String {
@@ -2291,18 +2295,22 @@ fn scan_limit_error(
 
 impl<'a, E> CollectVisitor<'a, E> {
 	fn new(root: &'a Path, policy: cache::ScanPolicy) -> Self {
-		Self { root, policy, entries: Vec::new(), failure: None, _error: std::marker::PhantomData }
+		Self {
+			root,
+			policy,
+			entries: Vec::new(),
+			path_bytes: 0,
+			failure: None,
+			_error: std::marker::PhantomData,
+		}
 	}
 
 	fn retained_bytes(&self, extra_path_capacity: usize) -> Option<usize> {
-		let entries_bytes = self
-			.entries
-			.capacity()
-			.checked_mul(std::mem::size_of::<CollectedEntry>())?;
 		self
 			.entries
-			.iter()
-			.try_fold(entries_bytes, |bytes, entry| bytes.checked_add(entry.path.capacity()))?
+			.capacity()
+			.checked_mul(std::mem::size_of::<CollectedEntry>())?
+			.checked_add(self.path_bytes)?
 			.checked_add(extra_path_capacity)
 	}
 
@@ -2413,6 +2421,9 @@ impl<'a, E> CollectVisitor<'a, E> {
 			return Err(());
 		}
 
+		// `actual_bytes` already proved this sum fits the budget, so it cannot
+		// overflow.
+		self.path_bytes += path.capacity();
 		self.entries.push(CollectedEntry {
 			path,
 			file_type: entry.file_type,
@@ -4908,6 +4919,46 @@ mod tests {
 		fn path(&self) -> &Path {
 			&self.root
 		}
+	}
+
+	fn push_named(collector: &mut CollectVisitor<'_, ()>, relative: &str) -> bool {
+		collector
+			.push(Entry {
+				path: Path::new(relative),
+				relative,
+				name: OsStr::new(relative),
+				file_type: FileType::File,
+				mtime: None,
+				size: None,
+				depth: 2,
+			})
+			.is_ok()
+	}
+
+	#[test]
+	fn collect_visitor_tracks_path_bytes_and_enforces_the_byte_budget() {
+		let policy = cache::ScanPolicy {
+			max_entries:   10_000,
+			max_bytes:     64 * 1024,
+			cache_entries: 1,
+			cache_bytes:   64 * 1024,
+		};
+		let mut collector = CollectVisitor::<()>::new(Path::new("/"), policy);
+		let mut pushed = 0;
+		while push_named(&mut collector, &format!("dir/entry-{pushed:05}.rs")) {
+			pushed += 1;
+			let recomputed: usize = collector
+				.entries
+				.iter()
+				.map(|entry| entry.path.capacity())
+				.sum();
+			assert_eq!(collector.path_bytes, recomputed);
+		}
+		assert!(pushed > 0, "the budget admits at least one entry");
+		let retained = collector.retained_bytes(0).expect("no overflow");
+		assert!(retained <= policy.max_bytes, "retained {retained} exceeds budget");
+		let failure = collector.failure.expect("the byte budget eventually trips");
+		assert!(failure.contains("dimension=bytes"), "{failure}");
 	}
 
 	impl Drop for TempTree {
