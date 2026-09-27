@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	AB_ADAPTER_SUPPORT,
 	assessLatencyCase,
 	assessLatencyRound,
 	finalVerdictAfterReruns,
@@ -169,5 +170,22 @@ describe("native bench A/B contract", () => {
 		}, { prepare: false });
 		expect(installed.text).toBe(headBytes);
 		expect(installed.digest).toBe(new Bun.CryptoHasher("sha256").update(headBytes).digest("hex"));
+	});
+
+	test("installs the shared adapter driver next to the adapter when the head has one", async () => {
+		const root = await gitFixture();
+		const adapter = "packages/natives/bench/suite.ts";
+		await fs.mkdir(path.join(root, "packages/natives/bench"), { recursive: true });
+		const baseSha = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: root, stdout: "pipe" }).stdout.toString().trim();
+		const adapterBytes = "import { runAbSuite } from './ab-adapter';\n";
+		const supportBytes = "export function runAbSuite() {}\n";
+		await fs.writeFile(path.join(root, adapter), adapterBytes);
+		await fs.writeFile(path.join(root, AB_ADAPTER_SUPPORT), supportBytes);
+		const installed = await withDetachedWorktree(root, baseSha, async baseRoot => ({
+			digest: await installHeadAdapter(root, baseRoot, adapter),
+			support: await Bun.file(path.join(baseRoot, AB_ADAPTER_SUPPORT)).text(),
+		}), { prepare: false });
+		expect(installed.support).toBe(supportBytes);
+		expect(installed.digest).toBe(new Bun.CryptoHasher("sha256").update(adapterBytes).update(supportBytes).digest("hex"));
 	});
 });

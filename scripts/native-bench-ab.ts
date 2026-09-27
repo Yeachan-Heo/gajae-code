@@ -51,6 +51,8 @@ const SUITES: Record<string, { adapter: string; actualSuite: string; cases: stri
 	"edit-hotspots": { adapter: "packages/natives/bench/edit-hotspots.ts", actualSuite: "edit-hotspots", cases: ["H01", "H02", "H03", "H06"] },
 	grep: { adapter: "packages/natives/bench/grep.ts", actualSuite: "grep", cases: ["G01", "G02", "G03", "G04", "G05", "G06", "G07", "G08"] },
 	"natives-grep": { adapter: "packages/natives/bench/grep.ts", actualSuite: "grep", cases: ["G01", "G02", "G03", "G04", "G05", "G06", "G07", "G08"] },
+	"render-transcript": { adapter: "packages/natives/bench/render-transcript.ts", actualSuite: "render-transcript", cases: ["R01", "R02", "R03"] },
+	"tui-render-frame": { adapter: "packages/natives/bench/tui-render-frame.ts", actualSuite: "tui-render-frame", cases: ["F01", "F02"] },
 	rss: { adapter: "", actualSuite: "rss", cases: [] },
 };
 
@@ -652,15 +654,25 @@ export async function runNativeBenchAb(repoRoot: string, options: ParsedOptions)
 	});
 }
 
+/** Shared adapter driver installed next to every adapter on the base side. */
+export const AB_ADAPTER_SUPPORT = "packages/natives/bench/ab-adapter.ts";
+
 /**
- * Copy the head adapter into the base worktree so both sides time identical
- * fixtures through the same public entrypoints. Only the implementation behind
- * those entrypoints differs between sides.
+ * Copy the head adapter (and its shared driver) into the base worktree so both
+ * sides time identical fixtures through the same public entrypoints. Only the
+ * implementation behind those entrypoints differs between sides. Returns the
+ * digest of the installed bytes, adapter first.
  */
 export async function installHeadAdapter(headRoot: string, baseRoot: string, adapter: string): Promise<string> {
-	const bytes = await Bun.file(path.join(headRoot, adapter)).bytes();
-	await Bun.write(path.join(baseRoot, adapter), bytes);
-	return new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+	const hasher = new Bun.CryptoHasher("sha256");
+	const support = Bun.file(path.join(headRoot, AB_ADAPTER_SUPPORT));
+	const files = (await support.exists()) && adapter !== AB_ADAPTER_SUPPORT ? [adapter, AB_ADAPTER_SUPPORT] : [adapter];
+	for (const file of files) {
+		const bytes = await Bun.file(path.join(headRoot, file)).bytes();
+		await Bun.write(path.join(baseRoot, file), bytes);
+		hasher.update(bytes);
+	}
+	return hasher.digest("hex");
 }
 
 export function formatBenchError(error: unknown): { schema: string; verdict: "FAIL" | "ERROR" | "HostTooNoisy"; error: string; message: string } {
