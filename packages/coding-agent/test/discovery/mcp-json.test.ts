@@ -117,12 +117,19 @@ interface BigIntPathStatReader {
  * through untouched: an unrelated descriptor opened first would otherwise consume the one-shot hook,
  * run the swap before the loader starts, and let the loader legitimately read the replacement.
  */
+/**
+ * Intercepts armed by the current test. A hook that never fires would let a fail-closed test pass
+ * without its swap ever running, so `afterEach` requires every armed hook to have fired.
+ */
+const armedOpenIntercepts: Array<{ configPath: string; fired: () => boolean }> = [];
+
 function interceptNextOpenOf(
 	configPath: string,
 	intercept: (open: () => Promise<fs.FileHandle>) => Promise<fs.FileHandle>,
 ): void {
 	const openFile = fs.open;
 	let armed = true;
+	armedOpenIntercepts.push({ configPath, fired: () => !armed });
 	vi.spyOn(fs, "open").mockImplementation(async (file, flags, mode) => {
 		if (!armed || file !== configPath) return openFile(file, flags, mode);
 		armed = false;
@@ -294,8 +301,13 @@ describe("explicit MCP JSON exact-file trust", () => {
 	});
 
 	afterEach(async () => {
+		const unfiredIntercepts = armedOpenIntercepts
+			.splice(0)
+			.filter(intercept => !intercept.fired())
+			.map(intercept => intercept.configPath);
 		await fs.rm(tempDir, { recursive: true, force: true });
 		vi.restoreAllMocks();
+		expect(unfiredIntercepts).toEqual([]);
 	});
 
 	test("loads a regular exact config through the descriptor-bound reader", async () => {
