@@ -1058,14 +1058,17 @@ describe("sdk diagnostics public entry (B1)", () => {
 		const strayPath = path.join(os.tmpdir(), `gjc-entry-stray-${Math.random().toString(36).slice(2)}`);
 		await Bun.write(strayPath, "stray");
 		try {
-			const rows: { inject: string; expect: "reads" | "fsMutations"; requiresArtifact?: boolean }[] = [
+			// Annotated before the filter so each `expect` keeps its literal type instead of
+			// widening to `string` through the chained call.
+			const injections: { inject: string; expect: "reads" | "fsMutations"; requiresArtifact?: boolean }[] = [
 				// Another path opened read-only: the exact multiset no longer matches.
 				{ inject: "other-path", expect: "reads" },
 				// One extra open of the approved artifact: the pinned count no longer matches.
 				{ inject: "extra-open", expect: "reads", requiresArtifact: true },
 				// A write-flag open: the trap classifies it as a mutation, which must stay empty.
 				{ inject: "write-flags", expect: "fsMutations" },
-			].filter(row => SUPPORTED_RUNTIME || row.requiresArtifact !== true);
+			];
+			const rows = injections.filter(row => SUPPORTED_RUNTIME || row.requiresArtifact !== true);
 			// The path and write-flag negatives are platform independent and always run.
 			expect(rows.map(row => row.inject).sort()).toEqual(
 				SUPPORTED_RUNTIME ? ["extra-open", "other-path", "write-flags"] : ["other-path", "write-flags"],

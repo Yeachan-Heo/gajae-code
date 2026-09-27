@@ -2864,8 +2864,8 @@ pub(crate) mod platform {
 		/// leaving owner writes available, and those callers exist to fix it.
 		RepairableWrite,
 		/// Read-only observation: never acquire or even attempt write authority.
-		/// The read-denial retry this refuses exists only on macOS, so the variant is
-		/// available exactly where an acquisition can select it.
+		/// The read-denial retry this refuses exists only on macOS, so the
+		/// variant is available exactly where an acquisition can select it.
 		#[cfg(target_os = "macos")]
 		ReadOnly,
 	}
@@ -8473,9 +8473,10 @@ pub(crate) mod platform {
 	}
 
 	/// The unsupported counterpart. It is inhabited so `&self` methods are sound
-	/// and lint-clean, and its private field keeps every caller outside this module
-	/// from constructing one: the only way to obtain a lease stays
-	/// `open_diagnostic_snapshot`, which refuses without touching the filesystem.
+	/// and lint-clean, and its private field keeps every caller outside this
+	/// module from constructing one: the only way to obtain a lease stays
+	/// `open_diagnostic_snapshot`, which refuses without touching the
+	/// filesystem.
 	#[cfg(not(target_os = "macos"))]
 	pub(super) struct DiagnosticSnapshotLease(());
 
@@ -13475,8 +13476,8 @@ mod platform {
 
 	// Read-only broker diagnostic snapshot is a Darwin-first capability; every
 	// other platform reports the fixed unsupported outcome without opening a path.
-	// Inhabited but not constructible from outside this module: no caller can mint a
-	// lease, and the fixed unsupported answers need no filesystem access.
+	// Inhabited but not constructible from outside this module: no caller can mint
+	// a lease, and the fixed unsupported answers need no filesystem access.
 	pub(super) struct DiagnosticSnapshotLease(());
 
 	impl DiagnosticSnapshotLease {
@@ -13599,8 +13600,8 @@ mod platform {
 
 	// Read-only broker diagnostic snapshot is a Darwin-first capability; every
 	// other platform reports the fixed unsupported outcome without opening a path.
-	// Inhabited but not constructible from outside this module: no caller can mint a
-	// lease, and the fixed unsupported answers need no filesystem access.
+	// Inhabited but not constructible from outside this module: no caller can mint
+	// a lease, and the fixed unsupported answers need no filesystem access.
 	pub(super) struct DiagnosticSnapshotLease(());
 
 	impl DiagnosticSnapshotLease {
