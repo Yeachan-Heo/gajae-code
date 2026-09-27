@@ -8786,10 +8786,16 @@ pub(crate) mod platform {
 
 	#[cfg(not(target_os = "macos"))]
 	impl DiagnosticSnapshotLease {
+		// The receiver is the contract, not an unused parameter: callers hold a
+		// retained lease and invoke `lease.read_bytes()`, which the macOS
+		// implementation answers from that lease's own descriptors. An associated
+		// function would change the API of a type whose whole purpose is to be held.
+		#[allow(clippy::unused_self, reason = "keeps the lease method API identical on every target")]
 		pub(super) const fn read_bytes(&self) -> Result<Vec<u8>, &'static str> {
 			Err("unsupported")
 		}
 
+		#[allow(clippy::unused_self, reason = "keeps the lease method API identical on every target")]
 		pub(super) const fn revalidate_edges(&self) -> Result<(), &'static str> {
 			Err("unsupported")
 		}
