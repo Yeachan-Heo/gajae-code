@@ -19,6 +19,7 @@ const originalWebSocket = global.WebSocket;
 const originalCodexWebSocketRetryBudget = Bun.env.PI_CODEX_WEBSOCKET_RETRY_BUDGET;
 const originalCodexWebSocketRetryDelayMs = Bun.env.PI_CODEX_WEBSOCKET_RETRY_DELAY_MS;
 const originalCodexWebSocketIdleTimeoutMs = Bun.env.PI_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS;
+const originalStreamIdleTimeoutMs = Bun.env.GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS;
 
 function restoreEnv(name: string, value: string | undefined): void {
 	if (value === undefined) {
@@ -35,6 +36,7 @@ afterEach(() => {
 	restoreEnv("PI_CODEX_WEBSOCKET_RETRY_BUDGET", originalCodexWebSocketRetryBudget);
 	restoreEnv("PI_CODEX_WEBSOCKET_RETRY_DELAY_MS", originalCodexWebSocketRetryDelayMs);
 	restoreEnv("PI_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS", originalCodexWebSocketIdleTimeoutMs);
+	restoreEnv("GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS", originalStreamIdleTimeoutMs);
 	vi.restoreAllMocks();
 });
 
@@ -422,6 +424,49 @@ describe("openai-codex streaming", () => {
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toBe("OpenAI Codex SSE stream stalled while waiting for the next event");
 		expect(result.content as unknown[]).toEqual([{ type: "text", text: "", textSignature: undefined }]);
+	});
+
+	it("ends an SSE stream that hangs after a text delta", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const encoder = new TextEncoder();
+		global.fetch = (async () =>
+			new Response(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						for (const event of [
+							{
+								type: "response.output_item.added",
+								item: {
+									type: "message",
+									id: "msg_stalled",
+									role: "assistant",
+									status: "in_progress",
+									content: [],
+								},
+							},
+							{ type: "response.content_part.added", part: { type: "output_text", text: "" } },
+							{ type: "response.output_text.delta", delta: "partial" },
+						]) {
+							controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+						}
+					},
+				}),
+				{ status: 200, headers: { "content-type": "text/event-stream" } },
+			)) as unknown as typeof fetch;
+		const controller = new AbortController();
+		const deadline = setTimeout(() => controller.abort(), 150);
+		try {
+			const result = await streamOpenAICodexResponses(
+				{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+				createCodexTestContext(),
+				{ apiKey: createCodexTestToken(), signal: controller.signal, streamIdleTimeoutMs: 20 },
+			).result();
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toBe("OpenAI Codex SSE stream stalled while waiting for the next event");
+		} finally {
+			clearTimeout(deadline);
+		}
 	});
 
 	it("parses websocket JSON from non-string payloads", async () => {
@@ -4041,6 +4086,47 @@ describe("openai-codex streaming", () => {
 		expect(stalled.errorMessage).toContain("idle timeout waiting for websocket");
 		expect(sendCount).toBe(2);
 		expect(fetchSpy).not.toHaveBeenCalled();
+	});
+
+	it("ends a preferred websocket stream at the shared idle bound after output progress", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		Bun.env.GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS = "20";
+		class StalledWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+			send(): void {
+				this.sendJson({
+					type: "response.output_item.added",
+					item: { type: "message", id: "msg_stalled", role: "assistant", status: "in_progress", content: [] },
+				});
+				this.sendJson({ type: "response.content_part.added", part: { type: "output_text", text: "" } });
+				this.sendJson({ type: "response.output_text.delta", delta: "partial" });
+			}
+		}
+		global.WebSocket = StalledWebSocket as unknown as typeof WebSocket;
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Unexpected SSE replay"));
+		const controller = new AbortController();
+		const deadline = setTimeout(() => controller.abort(), 150);
+		try {
+			const result = await streamOpenAICodexResponses(
+				createCodexTestModel("https://chatgpt.com/backend-api"),
+				createCodexTestContext(),
+				{
+					apiKey: createCodexTestToken(),
+					sessionId: "stalled-websocket-output",
+					providerSessionState: new Map<string, ProviderSessionState>(),
+					signal: controller.signal,
+				},
+			).result();
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain("idle timeout waiting for websocket");
+			expect(fetchSpy).not.toHaveBeenCalled();
+		} finally {
+			clearTimeout(deadline);
+		}
 	});
 
 	it("replays x-codex-turn-state on subsequent SSE requests", async () => {
