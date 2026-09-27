@@ -16413,6 +16413,12 @@ export class AgentSession {
 			);
 		}
 
+		// After compaction resets the message history, flush any pending agent_end event
+		// that may have been parked before or during compaction. This ensures that a
+		// pending terminal event doesn't cause the next prompt to fail with
+		// "Timed out waiting for prior agent run to finish" (#6004).
+		this.#flushPendingAgentEnd();
+
 		return savedCompactionEntry;
 	}
 
