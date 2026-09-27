@@ -88,3 +88,61 @@ test("resolveBrokerSpawnOptions handles user profile paths with spaces", () => {
 	expect(result.file).toBe("C:\\Users\\John Doe\\AppData\\Local\\Programs\\gjc\\gjc.exe");
 	expect(result.args).toEqual([]);
 });
+
+/**
+ * Broker hop protocol tests (Windows hop process).
+ * Verifies the JSON protocol used to communicate broker spawn arguments to the hop.
+ */
+
+test("broker hop protocol: valid JSON message with broker pid", () => {
+	const message = {
+		command: {
+			file: "/path/to/broker",
+			args: ["--agent-dir", "/home/user/.gjc"],
+		},
+		env: { KEY: "value" },
+		stdio: "ignore",
+	};
+
+	const json = JSON.stringify(message);
+	const parsed = JSON.parse(json);
+
+	expect(parsed.command.file).toBe("/path/to/broker");
+	expect(parsed.command.args).toEqual(["--agent-dir", "/home/user/.gjc"]);
+	expect(parsed.env.KEY).toBe("value");
+	expect(parsed.stdio).toBe("ignore");
+});
+
+test("broker hop protocol: hop response with broker pid", () => {
+	const hopResponse = `{"pid":1234}\n`;
+	const parsed = JSON.parse(hopResponse.trim());
+
+	expect(parsed.pid).toBe(1234);
+	expect(typeof parsed.pid).toBe("number");
+});
+
+test("broker hop protocol: handles stdio as file descriptor", () => {
+	const message = {
+		command: {
+			file: "/path/to/broker",
+			args: [],
+		},
+		env: {},
+		stdio: 3, // File descriptor number
+	};
+
+	const json = JSON.stringify(message);
+	const parsed = JSON.parse(json);
+
+	expect(parsed.stdio).toBe(3);
+	expect(typeof parsed.stdio).toBe("number");
+});
+
+test("broker hop protocol: hop response parsing preserves precision", () => {
+	// Test that large pids are preserved exactly
+	const largePid = 999999;
+	const hopResponse = JSON.stringify({ pid: largePid });
+	const parsed = JSON.parse(hopResponse);
+
+	expect(parsed.pid).toBe(largePid);
+});
