@@ -7964,6 +7964,81 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		}
 	});
 
+	test("F3 the scheduled skill terminal recovery replays the diagnostic after the initial and inline writes both fail", async () => {
+		// The entry fault is the real one: an accepted skill.invoke rejects, so the
+		// route produces its own agent_failed. `agentFailedWriteFailures: 2` makes the
+		// initial durable failure write AND the inline agent_end re-record fail, which
+		// is the only state in which the scheduled recovery owns the reason. Observability
+		// is fixture-only: the interceptor counts, it does not change production flow.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-skill-scheduled-diagnostic-"));
+		let agentFailedWriteAttempts = 0;
+		try {
+			const harness = await invocationHarness("skill-scheduled-diagnostic", cwd, {
+				invokeSkill: async (_name, _args, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					throw Object.assign(new Error("provider rejected sk-ant-secret-SCHEDULED"), {
+						code: "provider_rejected",
+						providerDiagnostic: {
+							category: "auth",
+							httpStatus: 401,
+							code: "authentication_error",
+							evidence: "structured_code",
+						},
+					});
+				},
+				persistInterceptor: transition => {
+					if (transition.type === "agent_failed") agentFailedWriteAttempts += 1;
+				},
+				agentFailedWriteFailures: 2,
+			});
+			const submitted = await harness.control("skill.invoke", {
+				name: "explode-with-diagnostic",
+				args: "",
+				clientRef: "skill-scheduled-diagnostic-ref",
+			});
+			expect(submitted.ok).toBe(true);
+			let settled:
+				| { status?: string; receiptState?: string; error?: { code?: string }; outcome?: Record<string, unknown> }
+				| undefined;
+			for (let attempt = 0; attempt < 600 && settled === undefined; attempt += 1) {
+				const frame = await harness.query("skill.invoke_status", {
+					clientRef: "skill-scheduled-diagnostic-ref",
+				});
+				const result = frame.result as
+					| {
+							status?: string;
+							receiptState?: string;
+							error?: { code?: string };
+							outcome?: Record<string, unknown>;
+					  }
+					| undefined;
+				if (result?.status === "failed" || result?.status === "terminal_ok") settled = result;
+				else await Bun.sleep(10);
+			}
+			if (settled === undefined) throw new Error("scheduled skill recovery never converged on a terminal status");
+			// Branch reachability: the fixture store counts only REJECTED agent_failed
+			// writes, so exactly two means the initial durable write and the inline
+			// agent_end re-record both failed. The terminal below therefore came from the
+			// later recovery attempt, not from either of those two writes.
+			expect(agentFailedWriteAttempts).toBe(2);
+			// Legacy skill terminal semantics are unchanged by the replay.
+			expect(settled.status).toBe("failed");
+			expect(settled.error?.code).toBe("provider_rejected");
+			expect((settled.outcome as { providerCode?: string } | undefined)?.providerCode).toBe("provider_rejected");
+			expect((settled.outcome as { providerDiagnostic?: unknown } | undefined)?.providerDiagnostic).toEqual({
+				category: "auth",
+				httpStatus: 401,
+				code: "authentication_error",
+				evidence: "structured_code",
+			});
+			expect(JSON.stringify(settled)).not.toContain("sk-ant-secret-SCHEDULED");
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("F3 skill terminal recovery preserves the provider diagnostic after a failed durable failure write", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-skill-diagnostic-recovery-"));
 		let failedFailureWrites = 0;

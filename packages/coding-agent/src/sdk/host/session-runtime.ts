@@ -2624,11 +2624,18 @@ async function resolveSdkWorkflowGate(
 /** Compound failure-plus-terminal recovery intent for a rejected submission:
  * the deadline manager's replay re-records this cause before agent_end so the
  * abandoned prompt terminalizes failed, never terminal_ok (exact-head review). */
-function rejectionRecoveryIntent(error: unknown): { code: string; message: string } {
+function rejectionRecoveryIntent(error: unknown): {
+	code: string;
+	message: string;
+	providerDiagnostic?: ProviderDiagnostic;
+} {
 	// The recovery intent is persisted and surfaced through prompt status, so it
 	// carries the sanitized classifier only — never a raw provider message
-	// (exact-head review P1).
-	return sanitizePromptFailure(error);
+	// (exact-head review P1). The optional revalidated diagnostic travels with it
+	// because this intent is the only surviving copy of the failure once the
+	// initial durable write and the inline re-record have both failed; dropping it
+	// here silently downgrades the recovered terminal.
+	return publishedPromptFailure(error);
 }
 
 /**
@@ -2867,7 +2874,7 @@ function createControlSurface(
 		kind: InvocationKind,
 		correlation: InvocationCorrelation,
 		leaseRelease?: "always" | "recover-failure" | "recover-terminal",
-		failureIntent?: { code: string; message: string },
+		failureIntent?: { code: string; message: string; providerDiagnostic?: ProviderDiagnostic },
 	) => void,
 	canResolveGate: () => boolean = () => true,
 	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T> = async resolution => await resolution,
@@ -6426,7 +6433,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const skillRecoveryTasks = new Map<string, Promise<void>>();
 		const scheduleSkillRecovery = (
 			correlation: InvocationCorrelation,
-			failureIntent?: { code: string; message: string },
+			failureIntent?: { code: string; message: string; providerDiagnostic?: ProviderDiagnostic },
 		): void => {
 			const key = lifecycleCorrelationKey(correlation);
 			if (skillRecoveryTasks.has(key)) return;
@@ -6441,8 +6448,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						if (!failureRecorded) {
 							await reconciliation.noteTransition("skill", correlation, {
 								type: "agent_failed",
+								// The intent is the only surviving copy of this failure at this
+								// point, so replay it whole; the consumer revalidates the carrier.
 								error: Object.assign(new Error(intent?.message ?? "skill invocation failed"), {
 									code: intent?.code ?? "skill_failed",
+									...(intent?.providerDiagnostic === undefined
+										? {}
+										: { providerDiagnostic: intent.providerDiagnostic }),
 								}),
 							} as never);
 							failureRecorded = true;
@@ -6724,7 +6736,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				kind: InvocationKind,
 				correlation: InvocationCorrelation,
 				leaseRelease?: "always" | "recover-failure" | "recover-terminal",
-				failureIntent?: { code: string; message: string },
+				failureIntent?: { code: string; message: string; providerDiagnostic?: ProviderDiagnostic },
 			) => {
 				// An accepted submission that settles WITHOUT starting (a rejection
 				// after acceptance) must not leave its pending entry behind: remove
