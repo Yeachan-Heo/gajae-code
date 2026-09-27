@@ -2064,7 +2064,7 @@ describe("SDK broker identity and discovery", () => {
 			},
 		});
 
-		await reapSpawnedBrokerForTest(child as unknown as ChildProcess, { gracefulMs: 1, killVerifyMs: 1 });
+		await reapSpawnedBrokerForTest(child as unknown as ChildProcess, undefined, { gracefulMs: 1, killVerifyMs: 1 });
 
 		expect(signals).toEqual([]);
 	});
@@ -2094,7 +2094,7 @@ describe("SDK broker identity and discovery", () => {
 				return true;
 			},
 		});
-		const owner = registerBrokerOwnerForTest(dir, child as unknown as ChildProcess, {
+		const owner = registerBrokerOwnerForTest(dir, child as unknown as ChildProcess, undefined, undefined, {
 			gracefulMs: 1,
 			killVerifyMs: 1,
 		});
