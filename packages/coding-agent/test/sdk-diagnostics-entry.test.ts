@@ -633,7 +633,7 @@ function expectInert(run: EntryRun, options: { approvedLoaderChain?: boolean } =
 		const target = entry.split('"')[1] ?? "";
 		return !artifactChain.has(target);
 	});
-	if (options.approvedLoaderChain) {
+	if (approvedChain) {
 		expect(strayStatReads).toEqual([]);
 		expect(strayAsyncReads).toEqual([]);
 		// Descriptor reads are bounded by the artifact itself, not left unlimited: the
@@ -913,14 +913,22 @@ describe("sdk diagnostics public entry (B1)", () => {
 		const strayPath = path.join(os.tmpdir(), `gjc-entry-live-${Math.random().toString(36).slice(2)}`);
 		await Bun.write(strayPath, "live-descriptor-bytes");
 		try {
-			const rows = [
+			const rows: { inject: string; label: string; evidence: string; requiresArtifact?: boolean }[] = [
 				// A live descriptor this route holds, opened through the raw syscall so the open
 				// ledger never sees it.
 				{ inject: "live-foreign-fd-read", label: "live foreign descriptor", evidence: "live-foreign-fd" },
 				// The artifact's own descriptor number, closed and then reused by a different
 				// file: the number is back, the permission is not.
-				{ inject: "reused-fd-number-read", label: "reused descriptor number", evidence: "reused-fd" },
-			];
+				{
+					inject: "reused-fd-number-read",
+					label: "reused descriptor number",
+					evidence: "reused-fd",
+					// Only meaningful where an artifact descriptor exists to be closed and reused.
+					requiresArtifact: true,
+				},
+			].filter(row => SUPPORTED_RUNTIME || row.requiresArtifact !== true);
+			// The foreign-descriptor negative is platform independent and always runs.
+			expect(rows.map(row => row.inject)).toContain("live-foreign-fd-read");
 			for (const row of rows) {
 				const run = await runEntry(["sdk", "diagnostics", "broker", "--agent-dir", absentAgentDir, "--json"], {
 					env: { GJC_ENTRY_TRAP_INJECT: row.inject, GJC_ENTRY_TRAP_STRAY: strayPath },
@@ -940,10 +948,16 @@ describe("sdk diagnostics public entry (B1)", () => {
 				// Every other gate is independently satisfied.
 				const approved = SUPPORTED_RUNTIME ? approvedLoaderReads().sort() : [];
 				const observed = [...run.trap.reads].sort();
-				const artifactBytes = fsStatSync(RESOLVED_ARTIFACT_PATH).size;
-				const chunkBound = Math.ceil(artifactBytes / (1024 * 1024)) + 2;
 				const descriptorReads = run.trap.statReads.filter(entry => entry.startsWith("fs.readSync "));
 				const unattributed = descriptorReads.filter(entry => entry.includes("unattributed-fd"));
+				// Supported tuple: the digest pass reads the real artifact in 1 MiB chunks, so the
+				// budget comes from its real size. Unsupported tuple: no artifact is ever opened,
+				// so the only admissible descriptor reads are the ones this row really injected on
+				// its own task-owned sentinel -- asserted exactly, and never by stat'ing an addon
+				// that does not exist on this platform.
+				const descriptorReadsAccounted = SUPPORTED_RUNTIME
+					? descriptorReads.length <= Math.ceil(fsStatSync(RESOLVED_ARTIFACT_PATH).size / (1024 * 1024)) + 2
+					: descriptorReads.length === unattributed.length;
 				const openGatePasses =
 					row.inject === "live-foreign-fd-read"
 						? JSON.stringify(observed) === JSON.stringify(approved)
@@ -954,7 +968,7 @@ describe("sdk diagnostics public entry (B1)", () => {
 					label: row.label,
 					openGatePasses,
 					pathGatePasses: observed.every(entry => approved.includes(entry)),
-					countGatePasses: descriptorReads.length <= chunkBound,
+					countGatePasses: descriptorReadsAccounted,
 					mutations: run.trap.fsMutations,
 					instrumentationComplete: run.trap.uncoveredBoundaries,
 				}).toEqual({
@@ -1044,20 +1058,26 @@ describe("sdk diagnostics public entry (B1)", () => {
 		const strayPath = path.join(os.tmpdir(), `gjc-entry-stray-${Math.random().toString(36).slice(2)}`);
 		await Bun.write(strayPath, "stray");
 		try {
-			const rows: { inject: string; expect: "reads" | "fsMutations" }[] = [
+			const rows: { inject: string; expect: "reads" | "fsMutations"; requiresArtifact?: boolean }[] = [
 				// Another path opened read-only: the exact multiset no longer matches.
 				{ inject: "other-path", expect: "reads" },
 				// One extra open of the approved artifact: the pinned count no longer matches.
-				{ inject: "extra-open", expect: "reads" },
+				{ inject: "extra-open", expect: "reads", requiresArtifact: true },
 				// A write-flag open: the trap classifies it as a mutation, which must stay empty.
 				{ inject: "write-flags", expect: "fsMutations" },
-			];
+			].filter(row => SUPPORTED_RUNTIME || row.requiresArtifact !== true);
+			// The path and write-flag negatives are platform independent and always run.
+			expect(rows.map(row => row.inject).sort()).toEqual(
+				SUPPORTED_RUNTIME ? ["extra-open", "other-path", "write-flags"] : ["other-path", "write-flags"],
+			);
 			const failures: { inject: string; reason: string }[] = [];
 			for (const row of rows) {
 				const run = await runEntry(["sdk", "diagnostics", "broker", "--agent-dir", absentAgentDir, "--json"], {
 					env: {
 						GJC_ENTRY_TRAP_INJECT: row.inject,
-						GJC_ENTRY_TRAP_ARTIFACT: RESOLVED_ARTIFACT_PATH,
+						// Unsupported tuples have no addon to name, so the injector targets this
+						// row's real task-owned sentinel instead of a path that does not exist.
+						GJC_ENTRY_TRAP_ARTIFACT: SUPPORTED_RUNTIME ? RESOLVED_ARTIFACT_PATH : strayPath,
 						GJC_ENTRY_TRAP_STRAY: strayPath,
 					},
 				});
