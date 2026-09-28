@@ -4129,6 +4129,55 @@ describe("openai-codex streaming", () => {
 		}
 	});
 
+	it("ends a stalled empty reasoning tool-call start at the shared idle bound", async () => {
+		const originalIdle = Bun.env.PI_STREAM_IDLE_TIMEOUT_MS;
+		Bun.env.PI_STREAM_IDLE_TIMEOUT_MS = "25";
+		const sockets: MockWebSocket[] = [];
+		class StalledToolCallWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				sockets.push(this);
+				this.scheduleOpen();
+			}
+
+			send(): void {
+				this.sendJson({ type: "response.output_item.added", item: { type: "reasoning", id: "r1", summary: [] } });
+				this.sendJson({
+					type: "response.output_item.added",
+					item: { type: "function_call", id: "fc1", call_id: "call1", name: "todo_write", arguments: "" },
+				});
+			}
+		}
+		global.WebSocket = StalledToolCallWebSocket as unknown as typeof WebSocket;
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response(new ReadableStream({ start() {} }), {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+		);
+		try {
+			const result = await streamOpenAICodexResponses(
+				createCodexTestModel("https://chatgpt.com/backend-api"),
+				createCodexTestContext(),
+				{
+					apiKey: createCodexTestToken(),
+					sessionId: "stalled-empty-tool-call",
+					preferWebsockets: true,
+					streamIdleTimeoutMs: 25,
+					providerSessionState: new Map<string, ProviderSessionState>(),
+				},
+			).result();
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain("idle timeout");
+			expect(sockets).toHaveLength(1);
+			expect(fetchSpy).not.toHaveBeenCalled();
+		} finally {
+			if (originalIdle === undefined) delete Bun.env.PI_STREAM_IDLE_TIMEOUT_MS;
+			else Bun.env.PI_STREAM_IDLE_TIMEOUT_MS = originalIdle;
+			fetchSpy.mockRestore();
+		}
+	});
+
 	it("replays x-codex-turn-state on subsequent SSE requests", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
