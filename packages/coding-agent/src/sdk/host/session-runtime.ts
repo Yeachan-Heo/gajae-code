@@ -6237,7 +6237,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	api.on("turn_start", async (_event, ctx) => {
 		const current = lifecycleStateForContext(ctx, "agent_start");
 		if (!current) return;
-		await current.registerBroker();
+		// Optional broker discovery must not hold an interactive extension event open.
+		// registerBroker owns single-flight recovery and optional-failure diagnostics.
+		const registration = current.registerBroker();
+		if (options.brokerRegistrationRequired) await registration;
 		current.runtime.emitEvent({ type: "turn_start", sessionId: ctx.sessionManager.getSessionId() });
 	});
 	const consumedMasterNonces = new Map<string, number>();
@@ -7332,7 +7335,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		const startupImageCapture = captureStartupRuntimeImage();
 		const registerBroker = async (): Promise<void> => {
-			if (brokerRegistered) return;
+			if (brokerRecoveryStopped || brokerRegistered) return;
 			if (brokerRegistrationInFlight !== undefined) {
 				await brokerRegistrationInFlight;
 				return;
@@ -7365,6 +7368,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 								throw new Error("SDK transport endpoint was not published before broker registration.");
 							const endpointPath = path.join(input.stateRoot, "sdk", `${input.sessionId}.json`);
 							const file = await readEndpointFile(endpointPath);
+							if (brokerRecoveryStopped) return;
 							if (!file) throw new Error("SDK endpoint could not be read as a stable regular file.");
 							const endpoint = JSON.parse(file.source) as Record<string, unknown>;
 							if (
@@ -7568,7 +7572,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		active = runtimeOwner;
 		try {
 			publishedEndpointUrl = (await runtime.start()).url;
-			await registerBroker();
+			// Required lifecycle hosts remain fail-closed; optional hosts publish locally
+			// and recover broker availability outside the extension watchdog.
+			const registration = registerBroker();
+			if (options.brokerRegistrationRequired) await registration;
 			// Await the startup runtime image capture before arming recovery.
 			// This ensures replacement detection works correctly on the first recovery check.
 			await startupImageCapture;
