@@ -869,7 +869,30 @@ test("the ACP MCP launch wrapper reports broker refusal and re-attributes spawn 
 	expect(attributed.cause).toBe(lifecycleFailure);
 
 	const transportFailure = new SdkClientError("connection_closed", "SDK request failed");
-	expect(acpMcpLaunchFailure(transportFailure, mcpServers)).toBe(transportFailure);
+	const markedTransportFailures = [
+		new SdkClientError("connection_closed", "SDK request failed", undefined, undefined, { transport: true }),
+		new SdkClientError("unavailable", "SDK request failed", undefined, undefined, { transport: true }),
+		new SdkClientError("timeout", "SDK request failed", undefined, undefined, { transport: true }),
+	];
+	for (const marked of markedTransportFailures) expect(acpMcpLaunchFailure(marked, mcpServers)).toBe(marked);
+	expect(acpMcpLaunchFailure(transportFailure, mcpServers)).not.toBe(transportFailure);
+
+	const frameUnavailable = new SdkClientError("unavailable", "mcp spawn failed", {
+		code: "unavailable",
+		message: "mcp spawn failed",
+	});
+	const attributedFrameUnavailable = acpMcpLaunchFailure(frameUnavailable, mcpServers) as AcpSdkAdapterError;
+	expect(attributedFrameUnavailable.code).toBe("unavailable");
+	expect(attributedFrameUnavailable.message).toContain("MCP server request failed to start (docs, search)");
+	expect(attributedFrameUnavailable.message).toContain("[unavailable: mcp spawn failed]");
+
+	const frameWithoutCode = new SdkClientError("unavailable", "mcp spawn failed", {
+		message: "mcp spawn failed",
+	});
+	const attributedFrameWithoutCode = acpMcpLaunchFailure(frameWithoutCode, mcpServers) as AcpSdkAdapterError;
+	expect(attributedFrameWithoutCode.code).toBe("unavailable");
+	expect(attributedFrameWithoutCode.message).toContain("MCP server request failed to start (docs, search)");
+	expect(attributedFrameWithoutCode.message).toContain("[unavailable: mcp spawn failed]");
 
 	const requestFailure = acpRequestFailure(attributed) as Error;
 	expect(requestFailure.message).toBe(`Internal error: ${attributed.message}`);

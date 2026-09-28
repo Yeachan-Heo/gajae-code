@@ -146,9 +146,9 @@ const ACP_MCP_PRESERVED_LAUNCH_CODES = new Set([
 ]);
 
 /**
- * SDK transport failures happen before the lifecycle request reaches any MCP server and must
- * retain their original retry semantics. `unavailable` is preserved here only for the SDK
- * client transport error, while lifecycle `unavailable` failures are still attributed below.
+ * SDK client transport failures happen before the lifecycle request reaches any MCP server and
+ * must retain their original retry semantics. The `transport` origin marker is required because
+ * broker ERROR frames are also represented as SdkClientError instances with these same codes.
  */
 const ACP_MCP_PRESERVED_TRANSPORT_CODES = new Set(["connection_closed", "unavailable", "timeout"]);
 
@@ -166,7 +166,10 @@ export function acpMcpLaunchFailure(error: unknown, mcpServers: SessionLifecycle
 	if (
 		mcpServers.length === 0 ||
 		(code !== undefined && ACP_MCP_PRESERVED_LAUNCH_CODES.has(code)) ||
-		(error instanceof SdkClientError && code !== undefined && ACP_MCP_PRESERVED_TRANSPORT_CODES.has(code))
+		(error instanceof SdkClientError &&
+			error.transport === true &&
+			code !== undefined &&
+			ACP_MCP_PRESERVED_TRANSPORT_CODES.has(code))
 	)
 		return error;
 	const names = mcpServers
