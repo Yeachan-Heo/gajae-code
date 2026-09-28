@@ -106,7 +106,9 @@ async function waitFor(predicate: () => boolean, label: string): Promise<void> {
 	const deadline = Date.now() + 45_000;
 	while (Date.now() < deadline) {
 		if (predicate()) return;
-		await Bun.sleep(5);
+		// Use minimal sleep to avoid flakiness on loaded CI runners.
+		// Tests should prefer VirtualClock advances over real-time polling when possible.
+		await Bun.sleep(1);
 	}
 	throw new Error(`Timed out waiting for ${label}`);
 }
