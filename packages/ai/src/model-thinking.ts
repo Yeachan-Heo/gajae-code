@@ -604,6 +604,9 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 	} else {
 		delete model.applyPatchToolType;
 	}
+	const toolMode = inferGeneratedToolMode(parsedModel);
+	if (toolMode) model.toolMode = toolMode;
+	else delete model.toolMode;
 	if (
 		(model.api === "anthropic-messages" || model.api === "bedrock-converse-stream") &&
 		isClaudeForcedToolChoiceIncapableModelId(model.id)
@@ -772,6 +775,10 @@ function inferGeneratedApplyPatchToolType(
 		return "freeform";
 	}
 	return undefined;
+}
+
+function inferGeneratedToolMode(parsedModel: ParsedModel): ApiModel<Api>["toolMode"] {
+	return parsedModel.family === "openai" && semverGte(parsedModel.version, "5.6") ? "code_mode_only" : undefined;
 }
 
 function applyGpt55ContextWindow(model: ApiModel<Api>, parsedModel: OpenAIModel): boolean {

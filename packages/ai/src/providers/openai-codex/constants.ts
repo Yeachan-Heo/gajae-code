@@ -10,6 +10,7 @@ export const OPENAI_HEADERS = {
 	ORIGINATOR: "originator",
 	SESSION_ID: "session_id",
 	CONVERSATION_ID: "conversation_id",
+	TURN_METADATA: "x-codex-turn-metadata",
 } as const;
 
 export const OPENAI_HEADER_VALUES = {

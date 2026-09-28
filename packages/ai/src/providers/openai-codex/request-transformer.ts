@@ -48,6 +48,7 @@ export interface RequestBody {
 	include?: string[];
 	prompt_cache_key?: string;
 	prompt_cache_retention?: "in_memory" | "24h";
+	client_metadata?: Record<string, string>;
 	max_output_tokens?: number;
 	max_completion_tokens?: number;
 	[key: string]: unknown;

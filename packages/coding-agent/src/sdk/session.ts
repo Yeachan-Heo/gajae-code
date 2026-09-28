@@ -3201,6 +3201,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			discoverableToolAllowedNames: options.discoverableToolAllowedNames,
 			getToolByName: name => session?.getToolByName(name),
 			getToolForExecution: name => session?.getToolForExecution(name),
+			getToolForEvalBridge: name => session?.getToolForEvalBridge(name),
+			getCodeModeBridgeTools: () => session?.getCodeModeBridgeTools() ?? [],
 			agentRegistry,
 			getSessionSpawns: () => options.spawns ?? "*",
 			getMasterBashCapability: () => masterModeContext?.getCapability(),
@@ -4692,6 +4694,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			toolNames: string[],
 			tools: Map<string, AgentTool>,
 			candidateModel?: Model,
+			promptOptions?: { directToolNames?: readonly string[] },
 		): Promise<BuildSystemPromptResult> => {
 			// This callback is reused for later prompt/tool/model rebuilds. Retire
 			// the previous generation's evidence up front: from here until a
@@ -4761,6 +4764,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				contextFiles,
 				tools: promptTools,
 				toolNames,
+				directToolNames: promptOptions?.directToolNames,
 				rules: rulebookRules,
 				alwaysApplyRules,
 				skillsSettings: settings.getGroup("skills"),
@@ -5177,10 +5181,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getAuthCredentialType: resolvedCredentialType,
 			streamFn: async (streamModel, context, streamOptions) => {
 				const requestStartedAt = performance.now();
+				const toolNamespacesInfo = session?.codeModeNamespacesInfo;
 				let stream: Awaited<ReturnType<typeof streamSimple>>;
 				try {
 					stream = await streamSimple(streamModel, context, {
 						...streamOptions,
+						...(toolNamespacesInfo === undefined ? {} : { toolNamespacesInfo }),
 						onAuthError: async (provider, oldKey, error) => {
 							const resolvedScope = resolvedCredentialScopes.has(provider)
 								? resolvedCredentialScopes.get(provider)
@@ -5424,6 +5430,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// carried by the host replay ring through the internal runtime seam above.
 		if (autoroutingInactive) session.configWarnings.push(AUTOROUTING_INACTIVE_WARNING);
 		hasSession = true;
+		await session.initializeCodeMode();
 		const cleanupOwnedManager = cleanupOwnedMcpManager;
 		const sessionOwnedMcpManager = ownsMcpManager ? mcpManager : undefined;
 		if (cleanupOwnedManager && cleanupOwnedMcpManagerOwner !== sessionOwnedMcpManager) {

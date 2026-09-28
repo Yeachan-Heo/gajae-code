@@ -972,6 +972,7 @@ function mapOptionsForApi<TApi extends Api>(
 		sessionId: options?.sessionId,
 		providerSessionId: options?.providerSessionId,
 		providerSessionState: options?.providerSessionState,
+		toolNamespacesInfo: options?.toolNamespacesInfo,
 		devinAcp: options?.devinAcp,
 		onPayload: options?.onPayload,
 		onResponse: options?.onResponse,

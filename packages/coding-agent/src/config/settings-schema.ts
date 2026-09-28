@@ -3466,6 +3466,28 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"tools.codeMode": {
+		type: "enum",
+		values: ["off", "auto", "on"] as const,
+		default: "off",
+		ui: {
+			tab: "tools",
+			label: "Code Mode",
+			description:
+				"Collapse the direct tool surface behind JavaScript eval. Auto enables catalog-approved models (GPT-5.6+); On forces any compatible model; Off keeps direct tools.",
+		},
+	},
+
+	"tools.codeModeDirectTools": {
+		type: "array",
+		default: [] as string[],
+		ui: {
+			tab: "tools",
+			label: "Code Mode Direct Tools",
+			description: "Extra enabled tools that remain directly visible while Code Mode is active.",
+		},
+	},
+
 	// Async jobs
 	"async.enabled": {
 		type: "boolean",

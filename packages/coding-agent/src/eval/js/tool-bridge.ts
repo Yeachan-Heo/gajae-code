@@ -30,7 +30,11 @@ function toolResultHasError(result: AgentToolResult): boolean {
 }
 
 function getTool(session: ToolSession, name: string): AgentTool {
-	const tool = session.getToolForExecution ? session.getToolForExecution(name) : session.getToolByName?.(name);
+	const tool = session.getToolForEvalBridge
+		? session.getToolForEvalBridge(name)
+		: session.getToolForExecution
+			? session.getToolForExecution(name)
+			: session.getToolByName?.(name);
 	if (!tool) {
 		throw new ToolError(`Unknown tool from js runtime: ${name}`);
 	}

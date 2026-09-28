@@ -611,6 +611,85 @@ describe("createAgentSession defaultInactive tool activation", () => {
 	});
 });
 
+describe("Code Mode tool activation", () => {
+	const tempDirs: string[] = [];
+
+	afterEach(() => {
+		for (const authStorage of authStorages.splice(0)) {
+			authStorage.close();
+		}
+		for (const tempDir of tempDirs.splice(0)) {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+		vi.restoreAllMocks();
+	});
+
+	it("forces enabled tools behind eval while keeping them callable through the bridge", async () => {
+		const settings = Settings.isolated({ "tools.codeMode": "on", "eval.js": true });
+		const { session } = await createMinimalSession(tempDirs, settings, ["eval", "read", "bash"]);
+
+		try {
+			expect(session.getEnabledToolNames()).toEqual(expect.arrayContaining(["eval", "read", "bash"]));
+			expect(session.getActiveToolNames()).toContain("eval");
+			expect(session.getActiveToolNames()).not.toContain("read");
+			expect(session.getActiveToolNames()).not.toContain("bash");
+			expect(session.getCodeModeBridgeTools().map(tool => tool.name)).toEqual(
+				expect.arrayContaining(["read", "bash"]),
+			);
+			expect(session.getToolForEvalBridge("read")?.name).toBe("read");
+			expect(session.getToolForEvalBridge("write")).toBeUndefined();
+			const evalDescription = session.getToolByName("eval")?.description ?? "";
+			expect(evalDescription).toContain("Code Mode is active");
+			expect(evalDescription).toContain("read(args:");
+			const systemPrompt = session.agent.state.systemPrompt.join("\n");
+			const inventory = /<inventory>([\s\S]*?)<\/inventory>/.exec(systemPrompt)?.[1] ?? "";
+			expect(inventory).toContain("eval");
+			expect(inventory).not.toContain("read");
+			expect(systemPrompt).toContain("File/dir reads");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("reconciles runtime off changes back to the full direct surface", async () => {
+		const settings = Settings.isolated({ "tools.codeMode": "on", "eval.js": true });
+		const { session } = await createMinimalSession(tempDirs, settings, ["eval", "read"]);
+
+		try {
+			expect(session.getActiveToolNames()).not.toContain("read");
+			settings.set("tools.codeMode", "off");
+			for (let attempt = 0; attempt < 50 && !session.getActiveToolNames().includes("read"); attempt++) {
+				await Bun.sleep(1);
+			}
+			expect(session.getActiveToolNames()).toContain("read");
+			expect(session.getCodeModeBridgeTools()).toEqual([]);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("auto follows model toolMode across model changes", async () => {
+		const settings = Settings.isolated({ "tools.codeMode": "auto", "eval.js": true });
+		const { session } = await createMinimalSession(tempDirs, settings, ["eval", "read"]);
+
+		try {
+			expect(session.getActiveToolNames()).toContain("read");
+			const current = session.model;
+			if (!current) throw new Error("Expected a model");
+			current.toolMode = "code_mode_only";
+			await session.reconcileCodeMode();
+			expect(session.getEnabledToolNames()).toContain("read");
+			expect(session.getActiveToolNames()).not.toContain("read");
+
+			delete current.toolMode;
+			await session.reconcileCodeMode();
+			expect(session.getActiveToolNames()).toContain("read");
+		} finally {
+			await session.dispose();
+		}
+	});
+});
+
 describe("Cursor edit grant capture", () => {
 	it("captures replace mode before the model-facing edit entry is removed", () => {
 		const toolRegistry = new Map<string, unknown>([["edit", { name: "edit" }]]);

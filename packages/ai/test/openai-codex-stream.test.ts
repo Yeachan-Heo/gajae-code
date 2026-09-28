@@ -279,6 +279,44 @@ describe("openai-codex streaming", () => {
 		]);
 	});
 
+	it("emits Code Mode tool namespaces in Codex turn metadata", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const sse = createCompletedCodexSse("Hello");
+		let capturedBody: Record<string, unknown> | undefined;
+		global.fetch = vi.fn(async (_input: string | URL, init?: RequestInit) => {
+			capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+		}) as unknown as typeof fetch;
+		const namespaces = {
+			functions: {
+				name: "functions",
+				functions: {
+					read: {
+						name: "read",
+						direct: false,
+						code_mode_name: "read",
+						deferred: false,
+						source: { kind: "harness" },
+					},
+				},
+			},
+		};
+
+		const model = { ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false };
+		await streamOpenAICodexResponses(model, createCodexTestContext(), {
+			apiKey: token,
+			toolNamespacesInfo: namespaces,
+		}).result();
+
+		const clientMetadata = capturedBody?.client_metadata as Record<string, string> | undefined;
+		expect(clientMetadata).toBeDefined();
+		expect(JSON.parse(clientMetadata?.["x-codex-turn-metadata"] ?? "{}")).toEqual({
+			tool_namespaces_info: namespaces,
+		});
+	});
+
 	it("maps reserved tool wire names back to canonical tool names", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());

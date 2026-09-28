@@ -460,6 +460,8 @@ export interface StreamOptions {
 	 * Providers can use this to persist transport/session state between turns.
 	 */
 	providerSessionState?: Map<string, ProviderSessionState>;
+	/** Codex Code Mode tool exposure snapshot emitted as turn metadata; ignored by other providers. */
+	toolNamespacesInfo?: unknown;
 	/**
 	 * Set by GJC for internal maintenance/one-shot work (context compaction,
 	 * handoff and branch summaries, utility generations) rather than an
@@ -1421,6 +1423,8 @@ export interface Model<TApi extends Api = any> {
 	 * - `"function"` or undefined: JSON function-tool with `{input: string}` (spec §1.2).
 	 */
 	applyPatchToolType?: "freeform" | "function";
+	/** Prefer the eval-based Code Mode tool surface when the user selects automatic mode. */
+	toolMode?: "code_mode_only";
 	/**
 	 * Force OAuth-style request shaping for providers whose API key prefix doesn't
 	 * match an OAuth token (e.g. routing Anthropic traffic through a proxy that

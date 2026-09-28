@@ -65,6 +65,26 @@ describe("callSessionTool", () => {
 		expect(rawExecute).not.toHaveBeenCalled();
 	});
 
+	it("does not fall back when the Code Mode bridge rejects a disabled tool", async () => {
+		const rawExecute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "raw" }] });
+		const rawTool = createTool("bash", rawExecute);
+		const rawLookup = vi.fn(() => rawTool);
+		const preparedLookup = vi.fn(() => rawTool);
+		const session = {
+			...createSession([]),
+			getToolByName: rawLookup,
+			getToolForExecution: preparedLookup,
+			getToolForEvalBridge: () => undefined,
+		};
+
+		await expect(callSessionTool("bash", { command: "echo disabled" }, { session })).rejects.toThrow(
+			"Unknown tool from js runtime: bash",
+		);
+		expect(rawLookup).not.toHaveBeenCalled();
+		expect(preparedLookup).not.toHaveBeenCalled();
+		expect(rawExecute).not.toHaveBeenCalled();
+	});
+
 	it("injects js intent and summarizes text results", async () => {
 		const execute = vi.fn().mockResolvedValue({
 			content: [{ type: "text", text: "hello" }],

@@ -274,6 +274,10 @@ export interface ToolSession {
 	getToolByName?: (name: string) => AgentTool | undefined;
 	/** Look up a registered tool with the session's execution guards applied. */
 	getToolForExecution?: (name: string) => AgentTool | undefined;
+	/** Look up an enabled tool for JavaScript Code Mode; disabled tools must stay unreachable. */
+	getToolForEvalBridge?: (name: string) => AgentTool | undefined;
+	/** Tools currently demoted from the provider wire and advertised through eval's `tool.*` bridge. */
+	getCodeModeBridgeTools?: () => readonly AgentTool[];
 	/** Purge undelivered queued custom messages matching the predicate. Returns counts. */
 	purgeQueuedCustomMessages?: (predicate: (message: CustomMessage) => boolean) => PurgeQueuedCustomMessagesResult;
 	/** Agent registry for IRC routing across live sessions. */

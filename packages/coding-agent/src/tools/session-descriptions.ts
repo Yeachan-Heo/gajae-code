@@ -6,6 +6,7 @@
  * loaded tool reports afterwards, and the provider-visible `tools` block (and with it the
  * prompt-cache prefix) does not change when the implementation loads (#5992).
  */
+import type { AgentTool } from "@gajae-code/agent-core";
 import { parseFrontmatter, prompt } from "@gajae-code/utils";
 import architectAgent from "../prompts/agents/architect.md" with { type: "text" };
 import criticAgent from "../prompts/agents/critic.md" with { type: "text" };
@@ -17,6 +18,7 @@ import taskDescription from "../prompts/tools/task.md" with { type: "text" };
 import { getTaskSimpleModeCapabilities, type TaskSimpleMode } from "../task/simple-mode";
 import { getTaskSchema, type TaskToolSchemaInstance } from "../task/types";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
+import { generateCodeModeDeclarations } from "./code-mode-declarations";
 import { resolveEvalBackends } from "./eval-backends";
 
 interface DescriptionSettings {
@@ -39,6 +41,7 @@ interface DescriptionSession {
 	settings: DescriptionSettings;
 	getSessionSpawns?: () => string | null;
 	hasEditTool?: boolean;
+	getCodeModeBridgeTools?: () => readonly AgentTool[];
 }
 
 interface BundledAgentName {
@@ -66,18 +69,24 @@ const BUNDLED_AGENT_NAMES = [
 export interface EvalToolDescriptionOptions {
 	py?: boolean;
 	js?: boolean;
+	codeModeDeclarations?: string;
 }
 
 export function getEvalToolDescription(options: EvalToolDescriptionOptions = {}): string {
 	const py = options.py ?? true;
 	const js = options.js ?? true;
-	return prompt.render(evalDescription, { py, js });
+	return prompt.render(evalDescription, { py, js, codeModeDeclarations: options.codeModeDeclarations });
 }
 
 export function evalToolDescriptionForSession(session: DescriptionSession | null | undefined): string {
 	if (!session) return getEvalToolDescription();
 	const backends = resolveEvalBackends({ settings: session.settings } as Parameters<typeof resolveEvalBackends>[0]);
-	return getEvalToolDescription({ py: backends.python, js: backends.js });
+	const bridgeTools = session.getCodeModeBridgeTools?.() ?? [];
+	return getEvalToolDescription({
+		py: backends.python,
+		js: backends.js,
+		codeModeDeclarations: bridgeTools.length > 0 ? generateCodeModeDeclarations(bridgeTools) : undefined,
+	});
 }
 
 export function searchToolDescriptionForSession(session: DescriptionSession): string {

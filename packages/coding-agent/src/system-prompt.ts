@@ -406,6 +406,12 @@ export interface BuildSystemPromptOptions {
 	tools?: Map<string, SystemPromptToolMetadata>;
 	/** Tool names to include in prompt. */
 	toolNames?: string[];
+	/**
+	 * Names actually exposed as provider-callable tools. Defaults to `toolNames`.
+	 * Code Mode passes its direct keep-set so the rendered inventory matches the
+	 * wire surface while capability gates still see every eval-bridge tool.
+	 */
+	directToolNames?: readonly string[];
 	/** Text to append to system prompt. */
 	appendSystemPrompt?: string;
 	/** Rendered GJC plugin system-appendix blocks (lower-authority, appended last). */
@@ -600,6 +606,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		repeatToolDescriptions = false,
 		reasoningLanguage = "off",
 		toolNames: providedToolNames,
+		directToolNames,
 		cwd,
 		contextFiles: providedContextFiles,
 		rules,
@@ -745,7 +752,9 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	const toolPromptNames = new Map<string, string>(toolNames.map(name => [name, tools?.get(name)?.wireName ?? name]));
 	const toolRefs = Object.fromEntries(toolPromptNames.entries());
 	const hasHiddenToolDiscoveryTool = Object.hasOwn(toolRefs, "search_tool_bm25");
-	const toolInfo = toolNames.map(name => ({
+	const directSet = directToolNames === undefined ? undefined : new Set(directToolNames);
+	const inventoryToolNames = directSet === undefined ? toolNames : toolNames.filter(name => directSet.has(name));
+	const toolInfo = inventoryToolNames.map(name => ({
 		name: toolPromptNames.get(name) ?? name,
 		internalName: name,
 		label: tools?.get(name)?.label ?? "",

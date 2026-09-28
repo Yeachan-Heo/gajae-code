@@ -158,6 +158,16 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal ACP lifecycle quiescence plumbing, not a user-facing control seam",
 	"agent_session:getToolByName": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getToolForExecution": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:getEnabledToolNames":
+		"internal Code Mode roster accessor; public tool controls remain on the reviewed tools.list/tools.active.set seams",
+	"agent_session:getToolForEvalBridge":
+		"internal guarded Code Mode eval-dispatch accessor, not an independent user-facing SDK control seam",
+	"agent_session:getCodeModeBridgeTools":
+		"internal Code Mode prompt/description inventory accessor, not a user-facing SDK control seam",
+	"agent_session:initializeCodeMode":
+		"internal session-start lifecycle synchronization for Code Mode, not a user-facing SDK control seam",
+	"agent_session:reconcileCodeMode":
+		"internal settings/model-change synchronization for Code Mode, not a user-facing SDK control seam",
 	"agent_session:registerForegroundFoldParticipant": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:hasForegroundBashBackgroundRequestHandler":
 		"internal accessor/plumbing, not a user-facing control seam",

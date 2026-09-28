@@ -45,6 +45,17 @@ output(*ids, format?="raw", query?=None, offset?=None, limit?=None) → str | di
 tool.<name>(args) → unknown
     Invoke any session tool by name. `args` is the tool's parameter object.
 ```
+{{#if codeModeDeclarations}}
+
+**Code Mode is active.** Tools omitted from the direct model tool list remain callable from JavaScript through `tool.*` using these signatures:
+
+```ts
+declare const tool: {
+{{codeModeDeclarations}}
+};
+```
+Prefer one `eval` cell that composes related tool calls when it avoids extra model round trips. Only the declarations above are available through the Code Mode bridge.
+{{/if}}
 </prelude>
 
 <output>

@@ -768,6 +768,13 @@ async function buildTransformedCodexRequestBody(
 		stream: true,
 		prompt_cache_key: normalizeOpenAIResponsesPromptCacheKey(options?.sessionId),
 	};
+	if (options?.toolNamespacesInfo !== undefined) {
+		params.client_metadata = {
+			[OPENAI_HEADERS.TURN_METADATA]: JSON.stringify({
+				tool_namespaces_info: options.toolNamespacesInfo,
+			}),
+		};
+	}
 
 	if (options?.maxTokens) {
 		params.max_output_tokens = options.maxTokens;

@@ -831,6 +831,22 @@
 					"description": "Maximum timeout in seconds the agent can set for any tool (0 = no limit)",
 					"default": 0
 				},
+				"codeMode": {
+					"type": "string",
+					"enum": [
+						"off",
+						"auto",
+						"on"
+					],
+					"description": "Collapse the direct tool surface behind JavaScript eval. Auto enables catalog-approved models (GPT-5.6+); On forces any compatible model; Off keeps direct tools.",
+					"default": "off"
+				},
+				"codeModeDirectTools": {
+					"type": "array",
+					"items": true,
+					"description": "Extra enabled tools that remain directly visible while Code Mode is active.",
+					"default": []
+				},
 				"discoveryMode": {
 					"type": "string",
 					"enum": [

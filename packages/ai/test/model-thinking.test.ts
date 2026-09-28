@@ -957,6 +957,27 @@ describe("generated model policies", () => {
 			expect(model.contextWindow).toBe(372_000);
 		}
 	});
+
+	it("marks GPT-5.6 and newer OpenAI-family models for automatic Code Mode", () => {
+		const models: Model<Api>[] = [
+			createModel({ id: "gpt-5.5", api: "openai-responses", provider: "openai" }),
+			createModel({ id: "gpt-5.6-sol", api: "openai-codex-responses", provider: "openai-codex" }),
+			createModel({ id: "gpt-5.6-codex", api: "openai-codex-responses", provider: "openai-codex" }),
+			createModel({ id: "gpt-6", api: "openai-responses", provider: "openai" }),
+			createModel({ id: "claude-opus-5.5", api: "anthropic-messages", provider: "anthropic" }),
+		];
+		models[0]!.toolMode = "code_mode_only";
+
+		applyGeneratedModelPolicies(models);
+
+		expect(models.map(model => model.toolMode)).toEqual([
+			undefined,
+			"code_mode_only",
+			"code_mode_only",
+			"code_mode_only",
+			undefined,
+		]);
+	});
 });
 
 describe("model thinking runtime helpers", () => {

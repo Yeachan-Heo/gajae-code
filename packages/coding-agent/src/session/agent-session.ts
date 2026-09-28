@@ -443,6 +443,7 @@ import { assertEditableFile } from "../tools/auto-generated-guard";
 import { releaseTabsForOwner } from "../tools/browser/tab-supervisor";
 import type { CheckpointState } from "../tools/checkpoint";
 import { outputMeta, wrapToolWithMetaNotice } from "../tools/output-meta";
+import { buildToolNamespacesInfo, resolveCodeMode, type ToolNamespacesInfo } from "./code-mode";
 import { normalizeLocalScheme, resolveReadPath, resolveToCwd } from "../tools/path-utils";
 import { registerResourceGcSession } from "../tools/resource-gc";
 import { getLatestTodoPhasesFromEntries, type TodoItem, type TodoPhase } from "../tools/todo-write";
@@ -1008,6 +1009,7 @@ export interface AgentSessionConfig {
 		toolNames: string[],
 		tools: Map<string, AgentTool>,
 		candidateModel?: Model,
+		options?: { directToolNames?: readonly string[] },
 	) => Promise<{ systemPrompt: string[] }>;
 	/** Initial workspace tree snapshot used for the first volatile per-turn context message. */
 	workspaceTree?: WorkspaceTree;
@@ -3697,6 +3699,7 @@ export class AgentSession {
 	}
 	#unregisterSessionMemorySettings?: () => void;
 	#unregisterDelegationHintSettings?: () => void;
+	#unregisterCodeModeSettings?: () => void;
 	/**
 	 * AsyncJobManager owned by this session (top-level only). Subagents leave
 	 * this undefined and **MUST NOT** dispose the global instance on teardown.
@@ -3794,6 +3797,10 @@ export class AgentSession {
 
 	// Tool registry and prompt builder for extensions
 	#toolRegistry: Map<string, AgentTool>;
+	/** Full user/session-selected tool roster. Code Mode may expose only a subset directly. */
+	#enabledToolNames: string[] = [];
+	/** Direct model-visible names while Code Mode is active; undefined otherwise. */
+	#codeModeDirectToolNames: Set<string> | undefined;
 	/**
 	 * Session-owned provenance for tool OBJECTS built from a built-in descriptor.
 	 *
@@ -3820,7 +3827,8 @@ export class AgentSession {
 				toolNames: string[],
 				tools: Map<string, AgentTool>,
 				candidateModel?: Model,
-		  ) => Promise<{ systemPrompt: string[] }>)
+				options?: { directToolNames?: readonly string[] },
+			  ) => Promise<{ systemPrompt: string[] }>)
 		| undefined;
 	#getMcpServerInstructions: (() => Map<string, string> | undefined) | undefined;
 	#reloadSshTool: (() => Promise<AgentTool | null>) | undefined;
@@ -5490,6 +5498,7 @@ export class AgentSession {
 			this.#providerSessionState = config.providerSessionState;
 		}
 		this.#toolRegistry = config.toolRegistry ?? new Map();
+		this.#enabledToolNames = this.agent.state.tools.map(tool => tool.name);
 		this.#builtinToolIdentities = new WeakSet(config.builtinToolIdentities ?? []);
 		this.#workflowGateToolSession = config.workflowGateToolSession;
 		this.#requestedToolNames = config.requestedToolNames;
@@ -5757,6 +5766,20 @@ export class AgentSession {
 			if (settingPath === "task.delegationHint.mode") {
 				this.#delegationHint.setEnabled(this.settings.get("task.delegationHint.mode") === "hint");
 			}
+		});
+		this.#unregisterCodeModeSettings = this.settings.onChanged(settingPath => {
+			if (
+				settingPath !== "tools.codeMode" &&
+				settingPath !== "tools.codeModeDirectTools" &&
+				settingPath !== "eval.js"
+			) {
+				return;
+			}
+			void this.reconcileCodeMode().catch(error => {
+				logger.warn("Failed to reconcile Code Mode after settings change", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
 		});
 		// Per-tool TTSR reminders are folded into the matched tool's result via this hook.
 		this.agent.afterToolCall = (ctx, signal) => {
@@ -6098,7 +6121,7 @@ export class AgentSession {
 	): Promise<void> {
 		const previousSelectedMCPToolNames = this.getSelectedMCPToolNames();
 		const previous = new Set(previousNames);
-		const previousActive = this.getActiveToolNames();
+		const previousActive = this.getEnabledToolNames();
 		for (const name of previous) this.#toolRegistry.delete(name);
 		const getCustomToolContext = () => this.#getCustomToolContext();
 		const added: string[] = [];
@@ -10513,6 +10536,8 @@ export class AgentSession {
 		this.#unregisterSessionMemorySettings = undefined;
 		this.#unregisterDelegationHintSettings?.();
 		this.#unregisterDelegationHintSettings = undefined;
+		this.#unregisterCodeModeSettings?.();
+		this.#unregisterCodeModeSettings = undefined;
 		if (ownerTerminalContextFromEnvironment() === null) this.#unregisterRuntimeStateFinalizer?.();
 		this.#unregisterRuntimeStateFinalizer = undefined;
 		this.#unregisterBeforeMoveListener?.();
@@ -10626,6 +10651,8 @@ export class AgentSession {
 		this.#unregisterSessionMemorySettings = undefined;
 		this.#unregisterDelegationHintSettings?.();
 		this.#unregisterDelegationHintSettings = undefined;
+		this.#unregisterCodeModeSettings?.();
+		this.#unregisterCodeModeSettings = undefined;
 		const work = Promise.allSettled([
 			// kill:true so a forced exit also reaps spawned-app Chrome we own (headless
 			// always closes; connected/attached browsers only disconnect — never killed).
@@ -10954,7 +10981,7 @@ export class AgentSession {
 
 	#getSelectedDiscoveredBuiltinToolNames(): string[] {
 		return this.#selectRestorableDiscoveredBuiltinToolNames(this.#selectedDiscoveredToolNames).filter(name =>
-			this.getActiveToolNames().includes(name),
+			this.getEnabledToolNames().includes(name),
 		);
 	}
 
@@ -10989,9 +11016,14 @@ export class AgentSession {
 	}
 
 	#getActiveNonMCPToolNames(): string[] {
-		return this.getActiveToolNames().filter(
+		return this.getEnabledToolNames().filter(
 			name => !this.#discoverableMCPTools.has(name) && this.#toolRegistry.has(name),
 		);
+	}
+
+	/** Full selected roster, including tools demoted behind eval by Code Mode. */
+	getEnabledToolNames(): string[] {
+		return [...this.#enabledToolNames];
 	}
 
 	/**
@@ -11032,6 +11064,63 @@ export class AgentSession {
 	getToolForExecution(name: string): AgentTool | undefined {
 		const tool = this.getToolByName(name);
 		return tool ? this.#prepareToolForExecution(tool) : undefined;
+	}
+
+	/** Resolve an eval-bridge call only when the underlying tool is enabled for this session. */
+	getToolForEvalBridge(name: string): AgentTool | undefined {
+		const tool = this.getToolByName(name);
+		if (!tool || !this.#enabledToolNames.includes(tool.name)) return undefined;
+		return this.#prepareToolForExecution(tool);
+	}
+
+	/** Tools hidden from the provider wire and advertised through eval while Code Mode is active. */
+	getCodeModeBridgeTools(): readonly AgentTool[] {
+		const direct = this.#codeModeDirectToolNames;
+		if (!direct) return [];
+		return this.#enabledToolNames.flatMap(name => {
+			if (direct.has(name)) return [];
+			const tool = this.#toolRegistry.get(name);
+			return tool ? [tool] : [];
+		});
+	}
+
+	/** Current Code Mode tool namespace snapshot for Codex turn metadata. */
+	get codeModeNamespacesInfo(): ToolNamespacesInfo | undefined {
+		const direct = this.#codeModeDirectToolNames;
+		if (!direct) return undefined;
+		const tools = this.#enabledToolNames.flatMap(name => {
+			const tool = this.#toolRegistry.get(name);
+			if (!tool) return [];
+			const metadata = tool as AgentTool & { loadMode?: string; mcpServerName?: string };
+			return [
+				{
+					name: tool.name,
+					customWireName: tool.customWireName,
+					loadMode: metadata.loadMode,
+					mcpServerName: metadata.mcpServerName,
+				},
+			];
+		});
+		return buildToolNamespacesInfo({ tools, directToolNames: direct });
+	}
+
+	#hasCodeModeEvalTransport(enabledToolNames: readonly string[] = this.#enabledToolNames): boolean {
+		const evalTool = this.#toolRegistry.get("eval");
+		return (
+			evalTool !== undefined &&
+			this.#builtinToolIdentities.has(evalTool) &&
+			enabledToolNames.includes("eval") &&
+			this.settings.get("eval.js") === true
+		);
+	}
+
+	async initializeCodeMode(): Promise<void> {
+		await this.#applyActiveToolsByName(this.#enabledToolNames, { persistMCPSelection: false });
+	}
+
+	async reconcileCodeMode(): Promise<void> {
+		if (this.#isDisposed) return;
+		await this.#applyActiveToolsByName(this.#enabledToolNames, { persistMCPSelection: false });
 	}
 
 	/**
@@ -11283,7 +11372,7 @@ export class AgentSession {
 			if (!manager) return { action, name, status: "unavailable", toolCount: 0 };
 
 			const selected = this.getSelectedMCPToolNames();
-			const active = this.getActiveToolNames().filter(toolName => isMCPToolName(toolName));
+			const active = this.getEnabledToolNames().filter(toolName => isMCPToolName(toolName));
 			const serverToolNames = new Set(
 				Array.from(this.#toolRegistry.values())
 					.filter(
@@ -11442,8 +11531,12 @@ export class AgentSession {
 
 	async #prepareDefaultModelSelectionPrompt(model: Model): Promise<string[] | undefined> {
 		if (!this.#rebuildSystemPrompt) return undefined;
-		if (!this.getActiveToolNames().includes("edit")) return undefined;
-		const built = await this.#rebuildSystemPrompt(this.getActiveToolNames(), this.#toolRegistry, model);
+		if (!this.getEnabledToolNames().includes("edit")) return undefined;
+		const activeToolNames = this.getActiveToolNames();
+		const promptToolNames = this.#codeModeDirectToolNames ? this.getEnabledToolNames() : activeToolNames;
+		const built = await this.#rebuildSystemPrompt(promptToolNames, this.#toolRegistry, model, {
+			directToolNames: this.#codeModeDirectToolNames ? activeToolNames : undefined,
+		});
 		return built.systemPrompt;
 	}
 
@@ -11482,12 +11575,12 @@ export class AgentSession {
 	}
 
 	async #syncEditToolModeAfterModelChange(_previousEditMode: EditMode): Promise<void> {
-		if (this.getActiveToolNames().includes("edit")) await this.refreshBaseSystemPrompt();
+		if (this.getEnabledToolNames().includes("edit")) await this.refreshBaseSystemPrompt();
 	}
 
 	getSelectedMCPToolNames(): string[] {
 		if (!this.#mcpDiscoveryEnabled) {
-			return this.getActiveToolNames().filter(
+			return this.getEnabledToolNames().filter(
 				name => isMCPToolName(name) && this.#toolRegistry.has(name) && !this.#mandatoryMCPToolNames.has(name),
 			);
 		}
@@ -11510,7 +11603,7 @@ export class AgentSession {
 		// For "all" mode we combine built-in registry entries + MCP tools.
 		// For "mcp-only" mode we only return MCP tools.
 		const mode = this.#resolveEffectiveDiscoveryMode();
-		const activeNames = new Set(this.getActiveToolNames());
+		const activeNames = new Set(this.getEnabledToolNames());
 		const mcpTools = Array.from(this.#discoverableMCPTools.values()).filter(t => !activeNames.has(t.name));
 		const builtinTools: DiscoverableTool[] = mode === "all" ? this.#collectDiscoverableBuiltinTools() : [];
 		const allTools = [...builtinTools, ...mcpTools];
@@ -11522,7 +11615,7 @@ export class AgentSession {
 	 *  (resolve, yield, report_finding) out of the index and avoids mislabeling
 	 *  extension/custom default-inactive tools as built-ins. */
 	#collectDiscoverableBuiltinTools(): DiscoverableTool[] {
-		const activeNames = new Set(this.getActiveToolNames());
+		const activeNames = new Set(this.getEnabledToolNames());
 		const result: DiscoverableTool[] = [];
 		for (const tool of this.#toolRegistry.values()) {
 			if (tool.loadMode !== "discoverable") continue;
@@ -11549,7 +11642,7 @@ export class AgentSession {
 	async activateDiscoveredTools(toolNames: string[]): Promise<string[]> {
 		const previousSelectedMCPToolNames = this.getSelectedMCPToolNames();
 		const previousSelectedDiscoveredBuiltinToolNames = this.#getSelectedDiscoveredBuiltinToolNames();
-		const nextActiveToolNames = this.getActiveToolNames();
+		const nextActiveToolNames = this.getEnabledToolNames();
 		const nextActiveNameSet = new Set(nextActiveToolNames);
 		const nextSelectedDiscoveredBuiltinToolNames = new Set(this.#selectedDiscoveredToolNames);
 		const activated: string[] = [];
@@ -11818,15 +11911,27 @@ export class AgentSession {
 		const previousSelectedMCPToolNames = options?.previousSelectedMCPToolNames ?? this.getSelectedMCPToolNames();
 		const previousSelectedDiscoveredBuiltinToolNames =
 			options?.previousSelectedDiscoveredBuiltinToolNames ?? this.#getSelectedDiscoveredBuiltinToolNames();
-		const tools: AgentTool[] = [];
 		const validToolNames: string[] = [];
 		for (const name of toolNames) {
 			const tool = this.#toolRegistry.get(name);
-			if (tool) {
-				tools.push(tool);
-				validToolNames.push(name);
-			}
+			if (tool) validToolNames.push(name);
 		}
+		const codeMode = resolveCodeMode({
+			toolMode: this.model?.toolMode,
+			setting: this.settings.get("tools.codeMode"),
+			extraDirectTools: this.settings.get("tools.codeModeDirectTools"),
+			enabledToolNames: validToolNames,
+			evalTransportAvailable: this.#hasCodeModeEvalTransport(validToolNames),
+		});
+		const directToolNames = validToolNames.filter(name => codeMode.directToolNames.has(name));
+		const tools = directToolNames.flatMap(name => {
+			const tool = this.#toolRegistry.get(name);
+			return tool ? [tool] : [];
+		});
+		const previousEnabledToolNames = this.#enabledToolNames;
+		const previousCodeModeDirectToolNames = this.#codeModeDirectToolNames;
+		this.#enabledToolNames = [...validToolNames];
+		this.#codeModeDirectToolNames = codeMode.active ? new Set(codeMode.directToolNames) : undefined;
 		const nextSelectedMCPToolNames = this.#mcpDiscoveryEnabled
 			? new Set(
 					validToolNames.filter(
@@ -11847,14 +11952,16 @@ export class AgentSession {
 				nextSelectedDiscoveredBuiltinToolNames.delete(name);
 			}
 		}
-		const signature = this.#computeAppliedToolSignature(validToolNames, tools);
+		const signature = this.#computeAppliedToolSignature(directToolNames, tools);
 		const promptRelevantToolsChanged =
 			signature !== (this.#pendingAppliedToolSignature ?? this.#lastAppliedToolSignature);
 		if (promptRelevantToolsChanged && this.#rebuildSystemPrompt) {
 			const generation = this.#reserveBaseSystemPromptGeneration();
 			try {
 				const built = await this.#runAdmittedBaseSystemPromptRebuild(() =>
-					this.#rebuildSystemPrompt!(validToolNames, this.#toolRegistry),
+					this.#rebuildSystemPrompt!(validToolNames, this.#toolRegistry, undefined, {
+						directToolNames: codeMode.active ? directToolNames : undefined,
+					}),
 				);
 				if (this.#isDisposed) {
 					if (generation === this.#baseSystemPromptGeneration) {
@@ -11869,6 +11976,8 @@ export class AgentSession {
 					this.#pendingAppliedToolSignature = undefined;
 				}
 			} catch (error) {
+				this.#enabledToolNames = previousEnabledToolNames;
+				this.#codeModeDirectToolNames = previousCodeModeDirectToolNames;
 				if (generation === this.#baseSystemPromptGeneration) {
 					this.#pendingAppliedToolSignature = undefined;
 				}
@@ -11899,7 +12008,7 @@ export class AgentSession {
 		resetCapabilities();
 		if (!this.#reloadSshTool) return;
 		const previousSshTool = this.#toolRegistry.get("ssh");
-		const previousActiveToolNames = this.getActiveToolNames();
+		const previousActiveToolNames = this.getEnabledToolNames();
 		const hadSshTool = previousSshTool !== undefined;
 		const wasActive = previousActiveToolNames.includes("ssh");
 		const previousHostNames =
@@ -11980,12 +12089,15 @@ export class AgentSession {
 	async refreshBaseSystemPrompt(): Promise<void> {
 		if (!this.#rebuildSystemPrompt) return;
 		const activeToolNames = this.getActiveToolNames();
+		const promptToolNames = this.#codeModeDirectToolNames ? this.getEnabledToolNames() : activeToolNames;
 		const generation = this.#reserveBaseSystemPromptGeneration();
 		this.#defaultModelSelectionMutationRevision++;
 		let built: { systemPrompt: string[] };
 		try {
 			built = await this.#runAdmittedBaseSystemPromptRebuild(() =>
-				this.#rebuildSystemPrompt!(activeToolNames, this.#toolRegistry),
+				this.#rebuildSystemPrompt!(promptToolNames, this.#toolRegistry, undefined, {
+					directToolNames: this.#codeModeDirectToolNames ? activeToolNames : undefined,
+				}),
 			);
 		} catch (error) {
 			if (generation === this.#baseSystemPromptGeneration) {
@@ -12080,7 +12192,8 @@ export class AgentSession {
 			entries.sort();
 			registrySegment = entries.join("\u0004");
 		}
-		return `${nameSegment}\u0003${descriptionSegment}\u0005${registrySegment}`;
+		const codeModeSegment = this.#codeModeDirectToolNames ? this.#enabledToolNames.join("\u0006") : "";
+		return `${nameSegment}\u0003${descriptionSegment}\u0005${registrySegment}\u0007${codeModeSegment}`;
 	}
 
 	/**
@@ -12197,7 +12310,7 @@ export class AgentSession {
 		if (!parent) {
 			if (this.#gjcSubskillToolNames.size === 0) return;
 			const previousGjcSubskillToolNames = new Set(this.#gjcSubskillToolNames);
-			const previousActiveToolNames = this.getActiveToolNames();
+			const previousActiveToolNames = this.getEnabledToolNames();
 			for (const name of previousGjcSubskillToolNames) {
 				this.#toolRegistry.delete(name);
 			}
@@ -12231,7 +12344,7 @@ export class AgentSession {
 			return;
 		}
 
-		const previousActiveToolNames = this.getActiveToolNames();
+		const previousActiveToolNames = this.getEnabledToolNames();
 		for (const name of previousGjcSubskillToolNames) {
 			this.#toolRegistry.delete(name);
 		}
@@ -12996,7 +13109,9 @@ export class AgentSession {
 	#attachAskTool(): void {
 		if (this.#explicitEmptyToolSelection) return;
 		const askTool = this.#toolRegistry.get("ask");
-		if (!askTool || this.getActiveToolNames().includes(askTool.name)) return;
+		if (!askTool || this.#enabledToolNames.includes(askTool.name)) return;
+		this.#enabledToolNames = [...this.#enabledToolNames, askTool.name];
+		if (this.#codeModeDirectToolNames) this.#codeModeDirectToolNames.add(askTool.name);
 		this.#setGuardedAgentTools([...this.agent.state.tools, askTool]);
 		this.#invalidateDiscoveryCaches();
 		void this.refreshBaseSystemPrompt().catch(error => {
@@ -13089,7 +13204,7 @@ export class AgentSession {
 			return false;
 		}
 
-		const previousTools = this.getActiveToolNames();
+		const previousTools = this.getEnabledToolNames();
 		const goalTools = [...new Set([...previousTools, "goal"])];
 		await this.#goalRuntime.createGoal({ objective: pendingGoal.objective, provenance: pendingGoal.provenance });
 		await this.setActiveToolsByName(goalTools);
@@ -17646,7 +17761,7 @@ export class AgentSession {
 		if (nextDiscoverySessionToolNames) {
 			// Avoid a full system-prompt rebuild when the active set is unchanged; rebuild
 			// can block on shared workspace-tree work across repeated /new transitions.
-			const current = this.getActiveToolNames().slice().sort().join("\0");
+			const current = this.getEnabledToolNames().slice().sort().join("\0");
 			const next = [...new Set(nextDiscoverySessionToolNames.map(n => n.toLowerCase()))].sort().join("\0");
 			if (current !== next) {
 				await this.#applyActiveToolsByName(nextDiscoverySessionToolNames, {
@@ -17954,6 +18069,7 @@ export class AgentSession {
 		// otherwise prefer the model's configured defaultLevel, then preserve the current level.
 		this.setThinkingLevel(options?.thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel);
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
+		await this.reconcileCodeMode();
 	}
 
 	setActiveModelProfile(name: string | undefined): void {
