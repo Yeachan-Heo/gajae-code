@@ -140,131 +140,57 @@ describe("empty lock directory (issue #6008, claim-based ownership)", () => {
 		}
 	});
 
-	test("claimed owner is immediately registered and released on abort (issue #6008)", async () => {
-		// This test verifies the fix for: "Claimed-lock leak: removeEmptyFileLockDir 
-		// writes info with pid=process.pid, but the caller only learns the owner via 
-		// a fallible re-read in removeStaleLockForAcquire. Return the owner record 
-		// written by the claim directly from removeEmptyFileLockDir and adopt it 
-		// immediately in acquireFileLock so abort/last-attempt/transient re-read paths 
-		// can't leave a live-pid lock behind."
-		//
-		// The bug: without the fix, if a claimed lock owner is re-read but that re-read
-		// fails transiently (or is otherwise not properly registered), the next attempt
-		// might fail to recognize the lock as being held by this process.
-		//
-		// The fix: removeEmptyFileLockDir now returns the owner token directly, and
-		// acquireFileLock immediately registers it in localLockStates.
-
+	test("a claim on the final attempt is adopted, not leaked as a live-pid lock", async () => {
 		const filePath = path.join(await makeTemp(), "index.jsonl");
 		const lockDir = `${filePath}.lock`;
 		await fs.mkdir(lockDir);
-
-		// Set directory as stale to trigger claim
 		const pastTime = new Date(Date.now() - 15_000);
 		await fs.utimes(lockDir, pastTime, pastTime);
 
-		// First acquisition: claim the empty lock and then abort mid-operation
-		const controller = new AbortController();
-		let firstStarted = false;
-
-		try {
-			await withFileLock(
-				filePath,
-				async () => {
-					firstStarted = true;
-					// Trigger abort immediately after acquiring the lock
-					controller.abort();
-				},
-				{
-					retries: 3,
-					retryDelayMs: 10,
-					staleMs: 10_000,
-					signal: controller.signal,
-				},
-			);
-		} catch (error) {
-			// Expected: abort throws
-			if (!(error instanceof Error && error.message.includes("aborted"))) {
-				throw error;
-			}
-		}
-
-		expect(firstStarted).toBe(true);
-
-		// Second acquisition: the claimed lock should be releasable and re-acquirable
-		// even though the first acquisition was aborted. This tests that the claimed
-		// owner was properly registered in localLockStates and not left as a leaked
-		// live-pid lock.
-		let secondStarted = false;
+		// With a single attempt the claim is the last thing the acquisition does. It must
+		// return the claimed lock instead of exiting with acquire_timeout while `info`
+		// still names this process.
+		let ran = false;
 		await withFileLock(
 			filePath,
 			async () => {
-				secondStarted = true;
+				ran = true;
+				const info = JSON.parse(await fs.readFile(path.join(lockDir, "info"), "utf8"));
+				expect(info.pid).toBe(process.pid);
 			},
-			{
-				retries: 5,
-				retryDelayMs: 10,
-				staleMs: 10_000,
-			},
+			{ retries: 1, retryDelayMs: 1, staleMs: 10_000 },
 		);
-
-		expect(secondStarted).toBe(true);
+		expect(ran).toBe(true);
+		await expect(fs.stat(lockDir)).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
-	test("transient error on claimed-owner read is retried, not aborted (issue #6008)", async () => {
-		// This test verifies the fix for: "readLockInfo(destinationPath) now runs on 
-		// every destination_exists even when recentlyClaimedOwner is undefined; a transient 
-		// Windows EPERM/EACCES/sharing violation rethrows and aborts acquireFileLock. 
-		// Only read when recentlyClaimedOwner is set, and treat transient read errors 
-		// (reuse the module's existing isTransientReleaseError-style handling) as 'retry' 
-		// (return null), never throw."
-		//
-		// The bug: without the fix, readLockInfo is called unconditionally, and if it
-		// throws a transient error (like sharing_violation on Windows), the entire
-		// acquisition fails. This is especially problematic when recentlyClaimedOwner
-		// is undefined because we don't need the read at all.
-		//
-		// The fix: only call readLockInfo when recentlyClaimedOwner is set, and catch
-		// transient errors to treat them as retryable conditions.
-
+	test("an abort after the claim still returns the claimed lock to the caller", async () => {
 		const filePath = path.join(await makeTemp(), "index.jsonl");
 		const lockDir = `${filePath}.lock`;
 		await fs.mkdir(lockDir);
-
-		// Set directory as stale to trigger claim
 		const pastTime = new Date(Date.now() - 15_000);
 		await fs.utimes(lockDir, pastTime, pastTime);
 
-		let readAttempts = 0;
-		const mockRemoveEmptyDir = FileLockTestHooks.removeEmptyFileLockDir;
-
-		// Track how many times the removeEmptyFileLockDir is called
-		FileLockTestHooks.removeEmptyFileLockDir = async (lockDir, expected, ownerHostId) => {
-			readAttempts++;
-			if (mockRemoveEmptyDir) {
-				return mockRemoveEmptyDir(lockDir, expected, ownerHostId);
-			}
-			return "cleanup_failed";
+		const controller = new AbortController();
+		const original = FileLockTestHooks.removeEmptyFileLockDir!;
+		FileLockTestHooks.removeEmptyFileLockDir = async (dir, expected, ownerHostId) => {
+			const outcome = await original(dir, expected, ownerHostId);
+			controller.abort();
+			return outcome;
 		};
-
 		try {
-			let acquired = false;
+			let ran = false;
 			await withFileLock(
 				filePath,
 				async () => {
-					acquired = true;
+					ran = true;
 				},
-				{
-					retries: 5,
-					retryDelayMs: 10,
-					staleMs: 10_000,
-				},
+				{ retries: 5, retryDelayMs: 1, staleMs: 10_000, signal: controller.signal },
 			);
-
-			// The acquisition should succeed despite any transient conditions
-			expect(acquired).toBe(true);
+			expect(ran).toBe(true);
 		} finally {
-			FileLockTestHooks.removeEmptyFileLockDir = mockRemoveEmptyDir;
+			FileLockTestHooks.removeEmptyFileLockDir = original;
 		}
+		await expect(fs.stat(lockDir)).rejects.toMatchObject({ code: "ENOENT" });
 	});
 });

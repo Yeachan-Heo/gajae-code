@@ -145,7 +145,11 @@ export const FileLockTestHooks: {
 	nativeQuarantineBindings?: () => NativeFileLockBindings;
 	nativeExactRemovalProbe?: () => boolean | Promise<boolean>;
 	/** @internal For testing only: direct access to removeEmptyFileLockDir */
-	removeEmptyFileLockDir?: (lockDir: string, expected: GenericFileLockDirIdentity) => Promise<FileLockGcRemoval>;
+	removeEmptyFileLockDir?: (
+		lockDir: string,
+		expected: GenericFileLockDirIdentity,
+		ownerHostId?: string,
+	) => Promise<EmptyLockDirClaim>;
 } = {};
 
 /**
@@ -1428,6 +1432,8 @@ function ownerGenerationIsDead(owner: FileLockOwnerToken): boolean {
 
 /** Outcome of a guarded lock-dir removal attempt (`removeFileLockDirForGc`). */
 export type FileLockGcRemoval = "removed" | "owner_changed" | "missing" | "cleanup_failed";
+/** Outcome of claiming an empty lock directory: the owner record written by the claim, or why it failed. */
+export type EmptyLockDirClaim = FileLockOwnerToken | Exclude<FileLockGcRemoval, "removed">;
 
 type LockStaleSnapshot =
 	| { stale: false }
@@ -2015,12 +2021,12 @@ async function removeEmptyFileLockDir(
 	lockDir: string,
 	expected: GenericFileLockDirIdentity,
 	ownerHostId?: string,
-): Promise<FileLockGcRemoval | FileLockOwnerToken> {
+): Promise<EmptyLockDirClaim> {
 	let root: BigIntStats;
 	try {
 		root = await fs.lstat(lockDir, { bigint: true });
 	} catch (error) {
-		if (isEnoent(error)) return "removed";
+		if (isEnoent(error)) return "missing";
 		if (isTransientReleaseError(error)) throw error;
 		return "cleanup_failed";
 	}
@@ -2121,21 +2127,14 @@ async function removeStaleLockForAcquire(
 	if (!snapshot.stale) return { removed: false };
 	try {
 		// Empty lock directories (marker identity with infoDev="-1") are claimed directly
-		// by creating an owner info file. Track the claimed owner token so we can
-		// verify it later when trying to reuse the lock.
+		// by exclusively creating an owner info file; the claim returns that owner record.
 		if (snapshot.owner === undefined && snapshot.identity.infoDev === "-1") {
 			const removalFn = FileLockTestHooks.removeEmptyFileLockDir || removeEmptyFileLockDir;
 			const outcome = await removalFn(lockPath, snapshot.identity, ownerHostId);
-			// The outcome can be either a FileLockGcRemoval string or a FileLockOwnerToken object
-			if (typeof outcome === "object" && outcome !== null && "owner_token" in outcome) {
-				// Successfully claimed and got the owner record directly
-				return { removed: true, claimedOwner: outcome };
-			}
-			if (outcome === "removed") {
-				// This shouldn't happen with the new implementation, but handle it for safety
-				return { removed: true };
-			}
-			return { removed: false, failure: { outcome: outcome as FileLockGcRemoval, message: "empty lock directory removal failed" } };
+			if (typeof outcome === "object") return { removed: true, claimedOwner: outcome };
+			// The directory vanished between the snapshot and the claim: retry immediately.
+			if (outcome === "missing") return { removed: true };
+			return { removed: false, failure: { outcome, message: "empty lock directory claim failed" } };
 		}
 		const outcome = await removeFileLockDirForGc(lockPath, snapshot.owner!, snapshot.identity);
 		if (outcome === "removed") return { removed: true };
@@ -2232,7 +2231,6 @@ async function tryAcquireLock(
 	previousOwnerHostIds: readonly string[],
 	ownerToken = crypto.randomUUID(),
 	onAcquired?: () => void,
-	recentlyClaimedOwner?: FileLockOwnerToken,
 ): Promise<FileLockAcquisitionResult> {
 	await ensureLockParent(path.dirname(lockPath));
 	const afterParentMkdir = FileLockTestHooks.afterParentMkdir;
@@ -2363,35 +2361,6 @@ async function tryAcquireLock(
 		}
 		if (!publishedSuccessfully) {
 			if (published.reason === "destination_exists") {
-				// Check if destination is owned by the current process via a recent empty-dir claim.
-				// This can happen when we successfully claimed a stale empty lock by creating an info file
-				// in a previous iteration. We should recognize this and reuse the claimed lock.
-				// IMPORTANT: Only reuse if the owner token matches what we claimed (recently ClaimedOwner),
-				// to avoid reusing locks held by other acquisitions in the same process.
-				if (recentlyClaimedOwner) {
-					try {
-						const claimedInfo = await readLockInfo(destinationPath);
-						if (
-							claimedInfo &&
-							claimedInfo.owner_token === recentlyClaimedOwner.owner_token &&
-							claimedInfo.pid === process.pid &&
-							!ownerIncarnationChanged(claimedInfo)
-						) {
-							// Destination is our recently-claimed empty lock.
-							// Clean up the staged lock and return the claimed lock owner token.
-							removePending = true;
-							onAcquired?.();
-							return claimedInfo;
-						}
-					} catch (error) {
-						// Treat transient read errors (EPERM, EACCES, sharing_violation on Windows) as retry
-						// instead of failing the acquisition. Return null to trigger another attempt.
-						if (isTransientReleaseError(error)) {
-							return null;
-						}
-						throw error;
-					}
-				}
 				return null;
 			}
 			const failure = new Error(
@@ -2774,7 +2743,6 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 	const contentionStartTimes = new Map<string, string | null>();
 	let contentionObserved = false;
 	let staleRemovalFailure: RecordedStaleRemovalFailure | undefined;
-	let recentlyClaimedOwner: FileLockOwnerToken | undefined; // Track owner tokens created by empty-dir claim
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
 		if (opts.signal?.aborted) throw opts.signal.reason ?? new Error("File lock acquisition aborted");
 		const localKey = await localLockKey(lockPath);
@@ -2790,7 +2758,6 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			opts.previousOwnerHostIds ?? [],
 			ownerToken,
 			opts.onAcquired,
-			recentlyClaimedOwner,
 		);
 		if (isFileLockOrphanTransition(result))
 			throw new FileLockAcquireError(
@@ -2830,13 +2797,14 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 		const staleRemoval = await removeStaleLockForAcquire(lockPath, stale, opts.ownerHostId);
 		if (staleRemoval.removed) {
 			staleRemovalFailure = undefined;
-			// Track the claimed owner token so we can verify it when retrying
 			if (staleRemoval.claimedOwner) {
-				recentlyClaimedOwner = staleRemoval.claimedOwner;
-				// Immediately register this claimed owner in local lock states
-				// so abort/transient-error paths don't leave a live-pid lock behind
-				const localKey = await localLockKey(lockPath);
+				// The exclusive-create claim already made this process the owner of the
+				// directory. Adopt it now: continuing the loop would let an abort or the
+				// final attempt exit while the claimed record still names this live PID.
 				localLockStates.set(localKey, { owner: staleRemoval.claimedOwner, status: "held" });
+				opts.onAcquired?.();
+				const claimedOwner = staleRemoval.claimedOwner;
+				return () => releaseLock(lockPath, claimedOwner, localKey);
 			}
 			continue;
 		}
