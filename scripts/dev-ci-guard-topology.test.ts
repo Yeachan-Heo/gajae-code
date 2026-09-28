@@ -119,15 +119,18 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 				scenario: scenario.name,
 				cancel: scenario.event === "pull_request" && !scenario.skip,
 			});
-			// GitHub publishes contexts even for skipped jobs: evaluate their names
-			// independently of scheduling so metadata cannot forge code evidence.
-			for (const [id, canonical, nonCode] of [
-				["affected", "Affected path validation", "Not code evidence - affected validation skipped"],
-				["gjc-state-gates", "gjc-state-gates", "Not code evidence - state gates skipped"],
-				["virtual-integration", "Virtual integration validation", "Not code evidence - virtual integration skipped"],
+			// Static names for real validation jobs; separate skipped-context jobs publish
+			// non-code names independently so metadata cannot forge code evidence.
+			for (const [id, canonical, skippedId, skippedName] of [
+				["affected", "Affected path validation", "affected-not-code-skipped", "Not code evidence - affected validation skipped"],
+				["gjc-state-gates", "gjc-state-gates", "gjc-state-gates-not-code-skipped", "Not code evidence - state gates skipped"],
+				["virtual-integration", "Virtual integration validation", "virtual-integration-not-code-skipped", "Not code evidence - virtual integration skipped"],
 			]) {
-				const expected = scenario.skip || (headOnlyDispatch && id !== "virtual-integration") ? nonCode : canonical;
-				expect({ scenario: scenario.name, id, context: evaluate(requiredJob(document, id!).name) }).toEqual({ scenario: scenario.name, id, context: expected });
+				// Real validation jobs always have static canonical names
+				expect({ scenario: scenario.name, id, context: requiredJob(document, id!).name }).toEqual({ scenario: scenario.name, id, context: canonical });
+				// Skipped-context jobs have their own static names and are scheduled only when appropriate
+				const skippedJob = requiredJob(document, skippedId!);
+				expect({ scenario: scenario.name, id: skippedId, context: skippedJob.name }).toEqual({ scenario: scenario.name, id: skippedId, context: skippedName });
 			}
 			const scheduled: string[] = [];
 			for (const [name, job] of Object.entries(document.jobs)) {
@@ -139,9 +142,14 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 			}
 			// The contract lane is both bootstrap jobs: the verdict line lives in the body,
 			// so a metadata edit must re-evaluate the contract AND the merge approval it
-			// reports. Neither is code evidence.
-			if (scenario.skip) expect({ scenario: scenario.name, scheduled }).toEqual({ scenario: scenario.name, scheduled: ["pr-contract-bootstrap", "merge-approval-bootstrap"] });
-			else if (headOnlyDispatch) expect(scheduled).toEqual(["virtual-integration"]);
+			// reports. Neither is code evidence. Metadata-only skips also schedule the
+			// "not-code-skipped" placeholder jobs to publish distinct check contexts.
+			if (scenario.skip) {
+				const expectedSkipped = ["pr-contract-bootstrap", "merge-approval-bootstrap", "affected-not-code-skipped", "gjc-state-gates-not-code-skipped"];
+				// virtual-integration-not-code-skipped only runs in pull_request metadata edits, not in dispatch head-only cases
+				if (scenario.event === "pull_request") expectedSkipped.push("virtual-integration-not-code-skipped");
+				expect({ scenario: scenario.name, scheduled }).toEqual({ scenario: scenario.name, scheduled: expectedSkipped });
+			} else if (headOnlyDispatch) expect(scheduled).toEqual(["affected-not-code-skipped", "gjc-state-gates-not-code-skipped", "virtual-integration"]);
 			else {
 				expect(scheduled).toContain("affected-plan");
 				expect(scheduled).toContain("affected-shards");
@@ -302,7 +310,7 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		const d = await workflow();
 		const virtual = requiredJob(d, "virtual-integration");
 		expect(virtual.needs).toEqual(["affected-plan", "affected"]);
-		expect(virtual.if).toBe("${{ always() && ((github.event_name == 'pull_request' && needs.affected.result == 'success') || (github.event_name == 'workflow_dispatch' && inputs.head_sha != '')) }}");
+		expect(virtual.if).toBe("${{ always() && ((github.event_name == 'pull_request' && needs.affected.result == 'success') || (github.event_name == 'workflow_dispatch' && inputs.head_sha != '')) && !(github.event_name == 'pull_request' && github.event.action == 'edited' && (github.event.changes.body != null || github.event.changes.title != null) && github.event.changes.base == null) }}");
 		expect(requiredEnvValue(virtual, "CI_VI_HEAD_SHA")).toBe("${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.head_sha }}");
 		expect(requiredEnvValue(virtual, "CI_VI_REQUIRED")).toBe("${{ github.event_name == 'workflow_dispatch' && 'true' || needs.affected-plan.outputs.has_risk_canaries }}");
 		// The base is no longer pinned to the stale event base at the job level;
