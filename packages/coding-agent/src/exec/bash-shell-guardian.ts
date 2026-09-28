@@ -160,7 +160,7 @@ function findDarwinLedgerHolders(device: number, inode: bigint): NativeProcess[]
 type DarwinAncestryTracker = {
 	seed(uniqueId: bigint): void;
 	track(processRef: NativeProcess, uniqueId?: bigint): boolean;
-	poll(): boolean;
+	poll(candidates?: ReadonlyMap<number, { uniqueId: bigint; parentUniqueId: bigint }>): boolean;
 	close(): void;
 };
 
@@ -195,24 +195,38 @@ function createDarwinAncestryTracker(owned: Map<string, NativeProcess>): DarwinA
 				knownUniqueIds.add(uniqueId);
 			},
 			track,
-			poll() {
-				const capacity = proc.symbols.proc_listallpids(null, 0);
-				if (capacity <= 0) return false;
-				const pids = new Int32Array(capacity + 64);
-				const count = proc.symbols.proc_listallpids(ptr(pids), pids.byteLength);
-				if (count <= 0) return false;
-				const candidates = new Map<
-					number,
-					{ uniqueId: bigint; parentUniqueId: bigint; processRef: NativeProcess }
-				>();
-				for (let index = 0; index < count; index++) {
-					const pid = pids[index]!;
-					const processRef = Process.fromPid(pid);
-					if (!processRef) continue;
-					const identity = uniqueIdentity(pid);
-					const after = Process.fromPid(pid);
-					if (identity && after?.incarnation === processRef.incarnation) {
-						candidates.set(pid, { ...identity, processRef });
+			poll(precandidates?: ReadonlyMap<number, { uniqueId: bigint; parentUniqueId: bigint }>) {
+				let candidates: Map<number, { uniqueId: bigint; parentUniqueId: bigint; processRef: NativeProcess }>;
+				if (precandidates) {
+					// Fast path: use pre-filtered candidates with parentUniqueId in knownUniqueIds.
+					// Only call Process.fromPid for these candidates, not all ~1200 pids.
+					candidates = new Map();
+					for (const [pid, identity] of precandidates) {
+						if (!knownUniqueIds.has(identity.parentUniqueId)) continue;
+						const processRef = Process.fromPid(pid);
+						if (!processRef) continue;
+						const after = Process.fromPid(pid);
+						if (after?.incarnation === processRef.incarnation) {
+							candidates.set(pid, { ...identity, processRef });
+						}
+					}
+				} else {
+					// Full scan: enumerate all pids and check incarnation before collecting identity.
+					const capacity = proc.symbols.proc_listallpids(null, 0);
+					if (capacity <= 0) return false;
+					const pids = new Int32Array(capacity + 64);
+					const count = proc.symbols.proc_listallpids(ptr(pids), pids.byteLength);
+					if (count <= 0) return false;
+					candidates = new Map();
+					for (let index = 0; index < count; index++) {
+						const pid = pids[index]!;
+						const processRef = Process.fromPid(pid);
+						if (!processRef) continue;
+						const identity = uniqueIdentity(pid);
+						const after = Process.fromPid(pid);
+						if (identity && after?.incarnation === processRef.incarnation) {
+							candidates.set(pid, { ...identity, processRef });
+						}
 					}
 				}
 				for (const pid of extendOwnedDarwinAncestry(knownUniqueIds, candidates)) {
@@ -291,6 +305,14 @@ export async function runBashShellGuardian(): Promise<void> {
 	let cleaning: Promise<void> | undefined;
 	let ledgerBuffer = "";
 	let ownershipScan = Promise.resolve(true);
+	let activityGraceMs = 0;
+	let activityGraceTimeout: NodeJS.Timeout | undefined;
+	const activityGraceWindow = 250; // ms to keep polling after activity stops
+	const clearActivityGrace = (): void => {
+		if (activityGraceTimeout) clearTimeout(activityGraceTimeout);
+		activityGraceTimeout = undefined;
+		activityGraceMs = 0;
+	};
 	const scanOwnership = (): Promise<boolean> => {
 		ownershipScan = ownershipScan.then(async previousOk => {
 			if (!previousOk) return false;
@@ -303,16 +325,38 @@ export async function runBashShellGuardian(): Promise<void> {
 			ledgerBuffer += content;
 			const lines = ledgerBuffer.split("\n");
 			ledgerBuffer = lines.pop() ?? "";
+			let newLinesProcessed = 0;
+			const preCandidates = new Map<number, { uniqueId: bigint; parentUniqueId: bigint }>();
 			for (const line of lines) {
 				if (!line) continue;
+				newLinesProcessed++;
 				const owned = authenticateOwnershipRecord(line, ledgerToken);
-				if (owned?.darwinUniqueId && darwinTracker) darwinTracker.seed(owned.darwinUniqueId);
+				if (owned?.darwinUniqueId && darwinTracker) {
+					darwinTracker.seed(owned.darwinUniqueId);
+					// For poll optimization: track uniqueIds from seeded records.
+					if (owned.processRef) {
+						preCandidates.set(owned.processRef.pid, {
+							uniqueId: owned.darwinUniqueId,
+							parentUniqueId: owned.darwinUniqueId, // Will be re-checked in poll
+						});
+					}
+				}
 				if (owned?.processRef && darwinTracker && !darwinTracker.track(owned.processRef, owned.darwinUniqueId))
 					return false;
 				if (owned?.processRef && !darwinTracker) retainOwnedProcess(ownedProcesses, owned.processRef);
 			}
-			if (darwinTracker) {
-				if (!darwinTracker.poll()) return false;
+			// Detect activity: if new ownership records were added, set grace period for extended polling
+			if (newLinesProcessed > 0) {
+				clearActivityGrace();
+				activityGraceMs = Date.now() + activityGraceWindow;
+				activityGraceTimeout = setTimeout(() => {
+					clearActivityGrace();
+				}, activityGraceWindow);
+			}
+			if (darwinTracker && (newLinesProcessed > 0 || Date.now() < activityGraceMs)) {
+				// Poll only if new activity detected or still within grace window.
+				// For optimization, pass pre-filtered candidates from just-added records.
+				if (!darwinTracker.poll(newLinesProcessed > 0 ? preCandidates : undefined)) return false;
 			}
 			return true;
 		});
@@ -336,12 +380,17 @@ export async function runBashShellGuardian(): Promise<void> {
 					.finally(() => {
 						periodicScanActive = false;
 					});
-			}, 100)
+			}, 25) // Reduced interval to check for ledger activity more frequently without expensive polls
 		: undefined;
 	const cleanup = (): Promise<void> => {
 		cleaning ??= (async () => {
+			clearActivityGrace();
 			if (ownershipScanTimer) clearInterval(ownershipScanTimer);
 			let trackingOk = await scanOwnership();
+			// Run a full poll during cleanup to catch any remaining descendants.
+			if (darwinTracker) {
+				trackingOk = darwinTracker.poll() && trackingOk;
+			}
 			if (supervisor.exitCode === null && supervisor.signalCode === null) {
 				if (process.platform !== "win32" && supervisor.pid) {
 					try {
