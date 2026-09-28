@@ -716,7 +716,7 @@ describe("ACP builtin slash commands", () => {
 	});
 
 	it("model: applies explicit thinking level to the live default session", async () => {
-		const { runtime, session } = createRuntime();
+		const { runtime, session, output } = createRuntime();
 		const available = [{ provider: "anthropic", id: "claude-3-5-sonnet", contextWindow: 200_000 }];
 		session.getAvailableModels = () => available;
 		const setModelSpy = spyOn(session, "setModel").mockResolvedValue(undefined);
@@ -731,6 +731,9 @@ describe("ACP builtin slash commands", () => {
 			thinkingLevel: "low",
 		});
 		expect(setThinkingLevelSpy).toHaveBeenCalledWith("low");
+		// Verify real user-facing behavior: command output confirms the action
+		expect(output[0]).toContain("Default model set to anthropic/claude-3-5-sonnet");
+		expect(output[0]).toContain("low");
 	});
 
 	it("model: applies explicit thinking level from a bare model id", async () => {
