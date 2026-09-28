@@ -250,3 +250,18 @@ describe("preset catalog model entries", () => {
 		expect(model.thinking).toEqual({ mode: "effort", minLevel: Effort.High, maxLevel: Effort.High });
 	});
 });
+
+	test("bundles claude-sonnet-5-5 across all major providers", () => {
+		const providers = ["anthropic", "github-copilot", "jetbrains-junie", "kiro", "opencode-zen", "venice"];
+
+		for (const provider of providers) {
+			const model = getBundledModel(provider as GeneratedProvider, "claude-sonnet-5-5");
+			expect(model, `${provider}/claude-sonnet-5-5`).toBeDefined();
+			expect(model?.id).toBe("claude-sonnet-5-5");
+			expect(model?.name).toMatch(/Sonnet 5\.5/);
+			expect(model?.input).toContain("text");
+			expect(model?.input).toContain("image");
+			expect(model?.reasoning).toBe(true);
+			expect(model?.contextWindow).toBe(1_000_000);
+		}
+	});
