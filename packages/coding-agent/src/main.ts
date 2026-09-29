@@ -52,7 +52,6 @@ import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } 
 import { initializeWithSettings } from "./discovery";
 import { exportFromFile } from "./export/html";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
-import { isNamespacedSkillSlashCommandName } from "./extensibility/skills";
 import { releaseLaunchWorktreeReservationAfterRegistration } from "./gjc-runtime/launch-worktree-reservation";
 import { persistCoordinatorRuntimeInputReady } from "./gjc-runtime/session-state-sidecar";
 import { assertMasterLaunchArgs, assertMasterLaunchDisposition, createMasterModeContext } from "./master-mode/context";
@@ -990,12 +989,14 @@ export async function runInteractiveMode(
 	}
 
 	// Startup input bypasses the editor submit path, so seed the automatic title
-	// here. Skill invocations are skipped exactly as they are on the editor path.
-	// It must run before the prompt (the title gate skips sessions that already
-	// hold a user message), and a title failure must never drop the prompt.
-	const maybeGenerateStartupTitle = (text: string): void => {
-		if (text.startsWith("/") && isNamespacedSkillSlashCommandName(text.slice(1))) return;
+	// here. Only text that `prompt` actually dispatches to a loaded skill is
+	// skipped; unknown `/skill:` text is submitted as an ordinary prompt and is
+	// titled like one. It must run before the prompt (the title gate skips
+	// sessions that already hold a user message), and a title failure must never
+	// drop the prompt.
+	const maybeGenerateStartupTitle = (text: string, images?: readonly unknown[]): void => {
 		try {
+			if (session.resolvePromptSkillInvocation(text, images)) return;
 			mode.maybeGenerateSessionTitle(text);
 		} catch (error: unknown) {
 			logger.warn("Startup session title generation failed", { error: String(error) });
@@ -1015,7 +1016,7 @@ export async function runInteractiveMode(
 
 		if (initialMessage !== undefined) {
 			try {
-				maybeGenerateStartupTitle(initialMessage);
+				maybeGenerateStartupTitle(initialMessage, initialImages);
 				await session.prompt(initialMessage, { images: initialImages });
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";

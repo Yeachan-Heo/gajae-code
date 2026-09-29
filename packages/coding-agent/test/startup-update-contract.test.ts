@@ -831,7 +831,7 @@ describe("startup update contract", () => {
 			}
 		}
 	}, 15_000);
-	it("seeds the automatic title from startup messages but not from skill invocations", async () => {
+	it("seeds the automatic title from startup messages but not from dispatched skill invocations", async () => {
 		using tempDir = TempDir.createSync("@gjc-startup-title-");
 		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
 		const stop = new Error("stop startup title harness");
@@ -843,10 +843,13 @@ describe("startup update contract", () => {
 				events.push(`prompt:${text}`);
 				prompted.push(text);
 			},
+			// Only `demo` is a loaded skill; `/skill:missing` is submitted as ordinary text.
+			resolvePromptSkillInvocation: (text: string) =>
+				text.startsWith("/skill:demo") ? { skill: { name: "demo" }, args: "go" } : undefined,
 		});
 		try {
 			await expect(
-				runRootCommand(rootArgs({ messages: ["/skill:demo go", "Explain hash maps"] }), [], {
+				runRootCommand(rootArgs({ messages: ["/skill:demo go", "/skill:missing go"] }), [], {
 					createAgentSession: async () => result,
 					discoverAuthStorage: async () => authStorage,
 					settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": false }),
@@ -872,8 +875,8 @@ describe("startup update contract", () => {
 						}) as unknown as InteractiveMode,
 				}),
 			).rejects.toBe(stop);
-			expect(prompted).toEqual(["/skill:demo go", "Explain hash maps"]);
-			expect(events).toEqual(["prompt:/skill:demo go", "title:Explain hash maps", "prompt:Explain hash maps"]);
+			expect(prompted).toEqual(["/skill:demo go", "/skill:missing go"]);
+			expect(events).toEqual(["prompt:/skill:demo go", "title:/skill:missing go", "prompt:/skill:missing go"]);
 		} finally {
 			authStorage.close();
 		}
