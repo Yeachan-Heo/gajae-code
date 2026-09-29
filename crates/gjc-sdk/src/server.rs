@@ -5156,6 +5156,41 @@ mod tests {
 		assert!(matches!(delivered, Message::Text(text) if text.contains("tool_activity")));
 		handle.stop();
 	}
+	/// Whether a client send failed because the server already closed the
+	/// socket.
+	fn is_peer_closed_send_error(error: &tokio_tungstenite::tungstenite::Error) -> bool {
+		use tokio_tungstenite::tungstenite::Error;
+		match error {
+			Error::ConnectionClosed | Error::AlreadyClosed => true,
+			Error::Io(io) => matches!(
+				io.kind(),
+				std::io::ErrorKind::ConnectionReset
+					| std::io::ErrorKind::ConnectionAborted
+					| std::io::ErrorKind::BrokenPipe
+			),
+			_ => false,
+		}
+	}
+
+	#[test]
+	fn peer_closed_send_errors_are_only_close_and_reset() {
+		use std::io::{Error as IoError, ErrorKind};
+
+		use tokio_tungstenite::tungstenite::Error;
+		for closed in [
+			Error::ConnectionClosed,
+			Error::AlreadyClosed,
+			Error::Io(IoError::from(ErrorKind::ConnectionReset)),
+			Error::Io(IoError::from(ErrorKind::ConnectionAborted)),
+			Error::Io(IoError::from(ErrorKind::BrokenPipe)),
+		] {
+			assert!(is_peer_closed_send_error(&closed), "{closed:?}");
+		}
+		for other in [Error::Io(IoError::from(ErrorKind::PermissionDenied)), Error::Utf8] {
+			assert!(!is_peer_closed_send_error(&other), "{other:?}");
+		}
+	}
+
 	#[tokio::test]
 	async fn oversized_text_frame_closes_only_the_offending_client() {
 		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
@@ -5165,10 +5200,16 @@ mod tests {
 		next_server_hello(&mut healthy).await;
 		wait_for_clients(&handle, 2).await;
 
-		oversized
+		// The server may reject the frame after reading its header and close the
+		// socket before the client finishes flushing the payload; that surfaces as
+		// a reset/closed error on the write and is the same "offender closed"
+		// outcome the read side below already accepts.
+		if let Err(error) = oversized
 			.send(Message::Text("x".repeat(REQUEST_FRAME_BYTES + 1)))
 			.await
-			.expect("send oversized text frame");
+		{
+			assert!(is_peer_closed_send_error(&error), "send oversized text frame: {error:?}");
+		}
 		match tokio::time::timeout(std::time::Duration::from_secs(2), oversized.next())
 			.await
 			.expect("oversized client was not closed")
