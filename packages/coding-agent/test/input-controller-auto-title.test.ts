@@ -40,6 +40,7 @@ type StubEditor = {
 function createContext(opts: { isStreaming: boolean; messages: AgentMessage[] }) {
 	let editorText = "";
 	let sessionName: string | undefined;
+	let sessionId = "session-1";
 	const editor: StubEditor = {
 		setText(text) {
 			editorText = text;
@@ -81,6 +82,7 @@ function createContext(opts: { isStreaming: boolean; messages: AgentMessage[] })
 		sessionManager: {
 			getCwd: () => process.cwd(),
 			getSessionName: () => sessionName,
+			getSessionId: () => sessionId,
 			setSessionName,
 		},
 		showError: vi.fn(),
@@ -109,7 +111,12 @@ function createContext(opts: { isStreaming: boolean; messages: AgentMessage[] })
 		editor.setText(text);
 		await controller.handleQueueSubmit();
 	};
-	return { submit, queueSubmit, setSessionName, prompt, onInputCallback };
+	// New Session / switch / resume commits a successor into the same manager.
+	const replaceSession = (nextId: string) => {
+		sessionId = nextId;
+		sessionName = undefined;
+	};
+	return { submit, queueSubmit, setSessionName, prompt, onInputCallback, replaceSession };
 }
 
 describe("InputController automatic session title", () => {
@@ -192,6 +199,46 @@ describe("InputController automatic session title", () => {
 		expect(prompt).toHaveBeenCalledTimes(1);
 		expect(completeSimple).not.toHaveBeenCalled();
 		expect(setSessionName).not.toHaveBeenCalled();
+	});
+
+	it("discards a pending title when the session is replaced before it lands", async () => {
+		const release = Promise.withResolvers<void>();
+		const completeSimple = vi.spyOn(ai, "completeSimple").mockImplementation(async () => {
+			await release.promise;
+			return titleResponse("Predecessor Title");
+		});
+		const { submit, setSessionName, replaceSession } = createContext({ isStreaming: true, messages: [] });
+
+		await submit("predecessor question");
+		replaceSession("session-2");
+		release.resolve();
+		await Bun.sleep(0);
+
+		expect(completeSimple).toHaveBeenCalledTimes(1);
+		expect(setSessionName).not.toHaveBeenCalled();
+	});
+
+	it("titles a replacement session while the predecessor's title is still pending", async () => {
+		const releaseFirst = Promise.withResolvers<void>();
+		const completeSimple = vi
+			.spyOn(ai, "completeSimple")
+			.mockImplementationOnce(async () => {
+				await releaseFirst.promise;
+				return titleResponse("Predecessor Title");
+			})
+			.mockResolvedValueOnce(titleResponse("Successor Title"));
+		const { submit, setSessionName, replaceSession } = createContext({ isStreaming: true, messages: [] });
+
+		await submit("predecessor question");
+		replaceSession("session-2");
+		await submit("successor question");
+		await Bun.sleep(0);
+		releaseFirst.resolve();
+		await Bun.sleep(0);
+
+		expect(completeSimple).toHaveBeenCalledTimes(2);
+		expect(setSessionName).toHaveBeenCalledTimes(1);
+		expect(setSessionName).toHaveBeenCalledWith("Successor Title", "auto");
 	});
 
 	it("still titles the first idle message", async () => {

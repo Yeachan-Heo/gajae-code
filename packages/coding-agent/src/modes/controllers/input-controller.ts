@@ -95,7 +95,8 @@ function isExpandable(obj: unknown): obj is Expandable {
 export class InputController {
 	readonly actionRegistry: ActionRegistry<void>;
 	readonly #loadPastedImageBatch: typeof loadPastedImageBatch;
-	#autoTitleInFlight = false;
+	/** Session id with an automatic-title request pending, if any. */
+	#autoTitleInFlightSessionId: string | undefined;
 	#deferredSubmission?: {
 		text: string;
 		images?: InteractiveModeContext["pendingImages"];
@@ -1611,13 +1612,16 @@ export class InputController {
 	 * Generate the automatic session title from the first user message. Called
 	 * from the editor submit and queue-shortcut paths (idle and streaming) and
 	 * from interactive startup messages; it is a no-op once the session has a
-	 * user message, a name, or a title request already in flight.
+	 * user message, a name, or a title request already in flight. The result is
+	 * bound to the session that requested it: a completion that lands after the
+	 * session was replaced (New Session, switch, resume) is discarded.
 	 */
 	maybeGenerateSessionTitle(text: string): void {
-		if (this.#autoTitleInFlight || this.ctx.sessionManager.getSessionName()) return;
+		const sessionId = this.ctx.sessionManager.getSessionId();
+		if (this.#autoTitleInFlightSessionId === sessionId || this.ctx.sessionManager.getSessionName()) return;
 		if ($pickenv("GJC_NO_TITLE", "PI_NO_TITLE")) return;
 		if (this.ctx.session.messages.some((m: AgentMessage) => m.role === "user")) return;
-		this.#autoTitleInFlight = true;
+		this.#autoTitleInFlightSessionId = sessionId;
 		generateSessionTitle(
 			text,
 			this.ctx.session.modelRegistry,
@@ -1627,7 +1631,7 @@ export class InputController {
 			provider => this.ctx.session.agent.metadataForProvider(provider),
 		)
 			.then(async title => {
-				if (!title) return;
+				if (!title || this.ctx.sessionManager.getSessionId() !== sessionId) return;
 				const applied = await this.ctx.sessionManager.setSessionName(title, "auto");
 				if (applied) {
 					setSessionTerminalTitle(this.ctx.sessionManager.getSessionName()!, this.ctx.sessionManager.getCwd());
@@ -1636,7 +1640,7 @@ export class InputController {
 			})
 			.catch(() => {})
 			.finally(() => {
-				this.#autoTitleInFlight = false;
+				if (this.#autoTitleInFlightSessionId === sessionId) this.#autoTitleInFlightSessionId = undefined;
 			});
 	}
 
