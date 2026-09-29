@@ -7,7 +7,7 @@ import { Broker } from "../src/sdk/broker/broker";
 import { type BrokerDiscovery, readBrokerDiscovery } from "../src/sdk/broker/discovery";
 import type { EnsureBrokerSettings } from "../src/sdk/broker/ensure";
 import { SessionIndex, type SessionIndexEvent } from "../src/sdk/broker/session-index";
-import { createSdkSessionRuntimeExtension, SessionSdkSessionRuntime } from "../src/sdk/host/session-runtime";
+import { createSdkSessionRuntimeExtension } from "../src/sdk/host/session-runtime";
 import {
 	deriveSessionLifecycleIdempotencyKey,
 	type SessionLifecycleClient,
@@ -133,15 +133,7 @@ test("four live SDK hosts recover broker index heartbeats without recreating ses
 	let ensureInFlight = 0;
 	let failEnsures = false;
 	let releaseFailure: PromiseWithResolvers<void> | undefined;
-	const registrationsReady = Promise.withResolvers<void>();
-	let registrations = 0;
-	const register = SessionSdkSessionRuntime.prototype.registerWithBroker;
-	const registerSpy = spyOn(SessionSdkSessionRuntime.prototype, "registerWithBroker").mockImplementation(
-		async function (this: SessionSdkSessionRuntime, ...args) {
-			await register.apply(this, args);
-			if (++registrations === 4) registrationsReady.resolve();
-		},
-	);
+	const timersArmed = Promise.withResolvers<void>();
 	const ensureForTest = async (input: EnsureBrokerSettings): Promise<BrokerDiscovery> => {
 		ensureCalls++;
 		ensureInFlight++;
@@ -188,6 +180,7 @@ test("four live SDK hosts recover broker index heartbeats without recreating ses
 						},
 					};
 					timerRecords.push(timer);
+					if (timerRecords.length === 4) timersArmed.resolve();
 					return timer as unknown as NodeJS.Timeout;
 				}) as typeof setInterval,
 				clearIntervalImpl: ((timer: NodeJS.Timeout) => {
@@ -224,7 +217,8 @@ test("four live SDK hosts recover broker index heartbeats without recreating ses
 			hosts.push({ handlers, context, stats });
 			await hosts[index]!.handlers.get("session_start")?.({}, context);
 		}
-		await registrationsReady.promise;
+		// Optional hosts arm recovery once their startup registration settles.
+		await timersArmed.promise;
 		expect(transportStats.map(stats => stats.starts)).toEqual([1, 1, 1, 1]);
 		expect(timerRecords).toHaveLength(4);
 		expect(timerRecords.every(timer => timer.unrefCalls === 1)).toBe(true);
@@ -275,7 +269,6 @@ test("four live SDK hosts recover broker index heartbeats without recreating ses
 			}
 		}
 		await broker?.stop();
-		registerSpy.mockRestore();
 		await fs.rm(root, { recursive: true, force: true });
 	}
 });
@@ -418,7 +411,6 @@ test("stopping a host while broker ensure is pending cannot register it after di
 	const ensureRelease = Promise.withResolvers<void>();
 	const ensureCompleted = Promise.withResolvers<void>();
 	let timerCount = 0;
-	let clearedTimers = 0;
 	let transportStops = 0;
 	let broker: Broker | undefined;
 	try {
@@ -437,9 +429,7 @@ test("stopping a host while broker ensure is pending cannot register it after di
 				timerCount++;
 				return { callback } as unknown as NodeJS.Timeout;
 			}) as typeof setInterval,
-			clearIntervalImpl: (() => {
-				clearedTimers++;
-			}) as typeof clearInterval,
+			clearIntervalImpl: (() => {}) as typeof clearInterval,
 			createTransport: async ({ sessionId: transportSessionId, stateRoot, token }) => ({
 				sessionId: transportSessionId,
 				stateRoot,
@@ -478,8 +468,7 @@ test("stopping a host while broker ensure is pending cannot register it after di
 		await Bun.sleep(0);
 		await broker.index.refresh();
 		expect(broker.index.listSessions().sessions.some(session => session.sessionId === sessionId)).toBe(false);
-		expect(timerCount).toBe(1);
-		expect(clearedTimers).toBe(1);
+		expect(timerCount).toBe(0);
 		expect(transportStops).toBe(1);
 	} finally {
 		await broker?.stop();

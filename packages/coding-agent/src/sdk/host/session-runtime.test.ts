@@ -4131,20 +4131,19 @@ describe("SessionSdkSessionRuntime", () => {
 		try {
 			await harness.emit("session_start");
 			await Promise.all([harness.emit("turn_start"), harness.emit("turn_start")]);
-			harness.recover();
-			harness.recover();
 			expect(attempts).toBe(1);
 			expect(harness.turnStarts()).toBe(2);
-			expect(harness.recoveryActive()).toBe(true);
+			// Recovery arms only once the startup attempt settles.
+			expect(harness.recoveryActive()).toBe(false);
 			await harness.emit("session_shutdown");
 			expect(harness.stops()).toBe(1);
-			expect(harness.recoveryActive()).toBe(false);
 			gate.resolve(testBrokerDiscovery);
 			await Bun.sleep(0);
-			harness.recover();
 			await harness.emit("turn_start");
 			expect(attempts).toBe(1);
 			expect(publication).not.toHaveBeenCalled();
+			// An attempt that settles after shutdown must not arm recovery either.
+			expect(harness.recoveryActive()).toBe(false);
 		} finally {
 			gate.resolve(testBrokerDiscovery);
 			await harness.dispose();
@@ -4165,6 +4164,8 @@ describe("SessionSdkSessionRuntime", () => {
 			first.reject(Object.assign(new Error("injected broker contention"), { code: "acquire_timeout" }));
 			await Bun.sleep(0);
 			expect(warning).toHaveBeenCalledWith("sdk broker registration unavailable", { code: "acquire_timeout" });
+			// The settled startup attempt armed recovery, and its failure holds the next tick.
+			expect(harness.recoveryActive()).toBe(true);
 			harness.recover();
 			await harness.emit("turn_start");
 			harness.recover();

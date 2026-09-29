@@ -7313,7 +7313,15 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			// Await the startup runtime image capture before arming recovery.
 			// This ensures replacement detection works correctly on the first recovery check.
 			await startupImageCapture;
-			if (!brokerRecoveryStopped) startBrokerRecovery();
+			// Recovery arms only after the startup attempt settles, so no tick overlaps it, and
+			// a failed startup attempt holds the backoff like a failed recovery registration.
+			const armBrokerRecovery = (): void => {
+				if (brokerRecoveryStopped) return;
+				if (!brokerRegistered) brokerRecoveryBackoff.recordFailure(options.agentDir);
+				startBrokerRecovery();
+			};
+			if (options.brokerRegistrationRequired) armBrokerRecovery();
+			else void registration.then(armBrokerRecovery);
 		} catch (error) {
 			active = undefined;
 			stopBrokerRecovery();
