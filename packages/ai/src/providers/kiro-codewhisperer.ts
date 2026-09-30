@@ -251,7 +251,8 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 
 			// Verify content-type is eventstream; if not, read and report the actual error
 			const contentType = response.headers.get("content-type") ?? "";
-			if (!contentType.includes("application/vnd.amazon.eventstream")) {
+			const mediaType = contentType.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+			if (mediaType !== "application/vnd.amazon.eventstream") {
 				const errBody = await response.text().catch(() => "");
 				const err = new Error(
 					`Kiro CodeWhisperer returned non-eventstream response (${contentType}): ${errBody.slice(0, 1000)}`,

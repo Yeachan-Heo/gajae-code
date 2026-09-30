@@ -159,17 +159,8 @@ describe("Kiro CodeWhisperer OAuth endpoint #6002", () => {
 		expect(capturedUrl).toBe("https://codewhisperer.ap-southeast-1.amazonaws.com/");
 	});
 
-	test("surfaces non-eventstream 200 response with proper error message", async () => {
-		globalThis.fetch = (async (_input: string | URL | Request, _init?: RequestInit) => {
-			// Simulate a JSON error response (e.g., from CodeWhisperer when credentials are bad)
-			return new Response(JSON.stringify({ message: "Invalid API key" }), {
-				status: 200,
-				headers: { "content-type": "application/json" },
-			});
-		}) as unknown as typeof fetch;
-
-		let caughtError: Error | undefined;
-
+	async function streamErrorMessage(response: Response): Promise<string | undefined> {
+		globalThis.fetch = (async () => response) as unknown as typeof fetch;
 		try {
 			const model = {
 				id: "test-model",
@@ -184,31 +175,40 @@ describe("Kiro CodeWhisperer OAuth endpoint #6002", () => {
 				contextWindow: 200_000,
 				maxTokens: 8_192,
 			} satisfies Model<"kiro-codewhisperer-stream">;
-
-			const context: Context = {
-				messages: [{ role: "user", content: "say ok", timestamp: 1 }],
-			};
-
-			const stream = streamKiroCodeWhisperer(model, context, {
-				apiKey: "bad-key",
-				region: "us-east-1",
-			});
-
-			for await (const _event of stream) {
-				// Consume the stream
+			const context: Context = { messages: [{ role: "user", content: "say ok", timestamp: 1 }] };
+			const stream = streamKiroCodeWhisperer(model, context, { apiKey: "secret-bearer", region: "us-east-1" });
+			let errorMessage: string | undefined;
+			for await (const event of stream) {
+				if (event.type === "error") errorMessage = event.error.errorMessage;
 			}
-		} catch (error) {
-			caughtError = error as Error;
+			return errorMessage;
+		} finally {
+			globalThis.fetch = originalFetch;
 		}
+	}
 
-		globalThis.fetch = originalFetch;
+	test("surfaces a non-eventstream 200 body instead of an eventstream truncation error (#6158)", async () => {
+		const errorMessage = await streamErrorMessage(
+			new Response(JSON.stringify({ message: "Invalid API key" }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			}),
+		);
 
-		// Before the fix, this will fail with 'eventstream: truncated message at end of stream'
-		// After the fix, it should show the actual error message
-		expect(caughtError).toBeDefined();
-		const errorMessage = caughtError?.message ?? "";
 		expect(errorMessage).toContain("Invalid API key");
 		expect(errorMessage).toContain("application/json");
 		expect(errorMessage).not.toContain("eventstream: truncated message");
+		expect(errorMessage).not.toContain("secret-bearer");
+	});
+
+	test("accepts the eventstream media type case-insensitively with parameters", async () => {
+		const errorMessage = await streamErrorMessage(
+			new Response(new Uint8Array(0), {
+				status: 200,
+				headers: { "content-type": "Application/Vnd.Amazon.Eventstream; charset=binary" },
+			}),
+		);
+
+		expect(errorMessage ?? "").not.toContain("non-eventstream");
 	});
 });
