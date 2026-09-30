@@ -8,6 +8,7 @@ import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
+import * as contributionPrepModule from "@gajae-code/coding-agent/session/contribution-prep";
 import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
@@ -258,5 +259,33 @@ describe("AgentSession volatile context cache prefix extension", () => {
 			),
 		).toBe(false);
 		expect(session.agent.state.messages.some(msg => msg.role === "user")).toBe(true);
+	});
+	it("excludes retained volatile context from fork seeds, contribution prep, and session export", async () => {
+		scriptedResponses = [createTextAssistantMessage("first response"), createTextAssistantMessage("second response")];
+		await session.prompt("first question?");
+		await session.prompt("second question?");
+		const marker = "current working directory is";
+		expect(JSON.stringify(session.agent.state.messages)).toContain(marker);
+
+		const seed = await session.buildForkContextSeed({ maxMessages: 100, maxTokens: 1_000_000 });
+		expect(seed.messages.length).toBeGreaterThan(0);
+		expect(JSON.stringify(seed.messages)).not.toContain(marker);
+		expect(JSON.stringify(seed.agentMessages)).not.toContain(marker);
+
+		expect(session.formatSessionAsText()).toContain("second question?");
+		expect(session.formatSessionAsText()).not.toContain(marker);
+
+		const prepSpy = spyOn(contributionPrepModule, "prepareContributionPrep").mockResolvedValue(
+			{} as Awaited<ReturnType<typeof contributionPrepModule.prepareContributionPrep>>,
+		);
+		try {
+			await session.prepareContributionPrep();
+			const prepMessages = prepSpy.mock.calls[0]?.[0]?.messages;
+			if (!prepMessages) throw new Error("Expected prepareContributionPrep call");
+			expect(prepMessages.some(msg => msg.role === "user")).toBe(true);
+			expect(JSON.stringify(prepMessages)).not.toContain(marker);
+		} finally {
+			prepSpy.mockRestore();
+		}
 	});
 });

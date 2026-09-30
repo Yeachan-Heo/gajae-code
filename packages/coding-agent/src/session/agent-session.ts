@@ -6318,7 +6318,10 @@ export class AgentSession {
 				},
 			};
 		}
-		const transformedMessages = await this.#transformContext([...this.messages], options.signal);
+		const transformedMessages = await this.#transformContext(
+			this.#withoutEphemeralCustomMessages(this.messages),
+			options.signal,
+		);
 		const convertedMessages = await this.#convertToLlm(transformedMessages);
 		const providerMessages = this.model
 			? normalizeMessagesForProvider(convertedMessages, this.model)
@@ -20515,7 +20518,7 @@ export class AgentSession {
 				sessionId: this.sessionId,
 				cwd: this.sessionManager.getCwd(),
 				sessionFile: this.sessionFile,
-				messages: this.agent.state.messages,
+				messages: this.#withoutEphemeralCustomMessages(this.agent.state.messages),
 				customInstructions: options.customInstructions,
 			},
 			options,
@@ -27665,7 +27668,7 @@ export class AgentSession {
 	 */
 	formatSessionAsText(): string {
 		return formatSessionDumpText({
-			messages: this.messages,
+			messages: this.#withoutEphemeralCustomMessages(this.messages),
 			systemPrompt: this.agent.state.systemPrompt,
 			model: this.agent.state.model,
 			thinkingLevel: this.#thinkingLevel,
