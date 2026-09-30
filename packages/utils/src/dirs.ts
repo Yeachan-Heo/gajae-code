@@ -924,6 +924,63 @@ export function getSessionsDir(agentDir?: string): string {
 	return dirs.agentSubdir(agentDir, "sessions", "data");
 }
 
+const projectStateSegmentCache = new Map<string, string>();
+
+/**
+ * Single fs-safe segment naming a project's runtime state directory:
+ * `<basename>-<sha256(canonical path)[0..16]>`. The canonical path resolves
+ * symlinks (and macOS `/private` aliases) so every alias of a checkout shares
+ * one state root; Windows paths are case-folded.
+ */
+export function projectStateSegment(projectDir: string): string {
+	const resolved = path.resolve(projectDir);
+	const cached = projectStateSegmentCache.get(resolved);
+	if (cached) return cached;
+	let canonical = resolved;
+	let canonicalized = false;
+	// Canonicalize the nearest existing ancestor so a not-yet-created project under
+	// a symlinked parent (macOS /var -> /private/var) keeps the same root once created.
+	const missing: string[] = [];
+	for (let probe = resolved; ; ) {
+		try {
+			canonical = path.join(fs.realpathSync(probe), ...missing);
+			canonicalized = missing.length === 0;
+			break;
+		} catch {
+			const parent = path.dirname(probe);
+			if (parent === probe) break;
+			missing.unshift(path.basename(probe));
+			probe = parent;
+		}
+	}
+	const key = process.platform === "win32" ? canonical.toLowerCase() : canonical;
+	const digest = new Bun.CryptoHasher("sha256").update(key).digest("hex").slice(0, 16);
+	const name =
+		path
+			.basename(canonical)
+			.replace(/[^A-Za-z0-9._-]/g, "_")
+			.replace(/^\.+/, "_")
+			.slice(0, 40) || "root";
+	const segment = `${name}-${digest}`;
+	// Cache only canonicalized results: a directory created later must not stay
+	// pinned to its pre-creation lexical identity.
+	if (canonicalized) projectStateSegmentCache.set(resolved, segment);
+	return segment;
+}
+
+/**
+ * Get the per-project runtime state root (~/.gjc/agent/projects/<segment>).
+ *
+ * Generated runtime state (session directories, locks, sidecars, SDK endpoints)
+ * lives here instead of `<project>/.gjc`, so a workspace on a synced or
+ * network mount never hosts GJC lock directories. User-authored project config
+ * (`<project>/.gjc/config.yml`, skills, agents, mcp.json, secrets) stays in the
+ * project.
+ */
+export function getProjectStateRoot(projectDir: string, agentDir?: string): string {
+	return path.join(dirs.agentSubdir(agentDir, "projects", "state"), projectStateSegment(projectDir));
+}
+
 /** Get the content-addressed blob store directory (~/.gjc/agent/blobs). */
 export function getBlobsDir(agentDir?: string): string {
 	return dirs.agentSubdir(agentDir, "blobs", "data");
