@@ -289,6 +289,7 @@ Cancellation discards provisional output and emits exactly one cancelled `agent_
 Built-in profiles are grouped by provider mix and tier:
 
 - `codex-{eco,medium,pro}` — GPT-6 Sol/Luna and GPT-5.6 Terra role mixes tuned by tier and reasoning effort; `lunamaxxing` — OpenAI Codex GPT-6 Luna-only profile with maximum reasoning on delegated roles
+- `codex-sol61` — GPT-6.1 Sol profile using `low`, `medium`, `high`, `xhigh`, and `max` effort levels (no `none` or `minimal`)
 - `astra-{lite,default,heavy}` — additive OpenAI Codex profiles led by `openai-codex/gpt-6-astra`, displayed as `ASTRA-Lite`, `ASTRA-Default`, and `ASTRA-Heavy` in the CODEX group
 - `opencodego` — single OpenCode Go preset (Kimi K3 default and planner, DeepSeek executor/architect, MiMo critic)
 - `commandcode-goat` — Command Code GOAT preset (GLM-5.3 default, DeepSeek V4 Flash executor, Kimi K3 planner, GLM-5.2 critic, and DeepSeek V4 Pro architect)

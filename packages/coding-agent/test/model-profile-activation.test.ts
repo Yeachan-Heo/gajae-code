@@ -1754,6 +1754,16 @@ describe("model profile activation", () => {
 			},
 		],
 		[
+			"codex-sol61",
+			{
+				default: "openai-codex/gpt-6.1-sol:medium",
+				executor: "openai-codex/gpt-6.1-sol:medium",
+				planner: "openai-codex/gpt-6.1-sol:high",
+				critic: "openai-codex/gpt-6.1-sol:xhigh",
+				architect: "openai-codex/gpt-6-astra:xhigh",
+			},
+		],
+		[
 			"opus-codex",
 			{
 				default: "anthropic/claude-opus-5-5:medium",

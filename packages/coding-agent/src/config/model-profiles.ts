@@ -93,6 +93,13 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		critic: "openai-codex/gpt-6-sol:max",
 		architect: "openai-codex/gpt-6-sol:xhigh",
 	}),
+	profile("codex-sol61", ["openai-codex"], {
+		default: "openai-codex/gpt-6.1-sol:medium",
+		executor: "openai-codex/gpt-6.1-sol:medium",
+		planner: "openai-codex/gpt-6.1-sol:high",
+		critic: "openai-codex/gpt-6.1-sol:xhigh",
+		architect: "openai-codex/gpt-6-astra:xhigh",
+	}),
 	profile("lunamaxxing", ["openai-codex"], {
 		default: "openai-codex/gpt-6-luna:medium",
 		executor: "openai-codex/gpt-6-luna:xhigh",
@@ -555,6 +562,7 @@ const PROFILE_PRESENTATION: Record<string, ModelProfilePresentation> = {
 	"codex-eco": { displayName: "Codex Eco", providerGroup: "CODEX" },
 	"codex-medium": { displayName: "Codex Medium", providerGroup: "CODEX" },
 	"codex-pro": { displayName: "Codex Pro", providerGroup: "CODEX" },
+	"codex-sol61": { displayName: "Codex Sol 6.1", providerGroup: "CODEX" },
 	lunamaxxing: { displayName: "LunaMaxxing", providerGroup: "CODEX" },
 	"astra-lite": { displayName: "ASTRA-Lite", providerGroup: "CODEX" },
 	"astra-default": { displayName: "ASTRA-Default", providerGroup: "CODEX" },
