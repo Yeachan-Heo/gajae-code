@@ -10,20 +10,50 @@ function createSettings(initial: {
 		modelRoles: { ...initial.modelRoles },
 		"task.agentModelOverrides": { ...initial.agentModelOverrides },
 	};
+	const globalValues = {
+		modelRoles: { ...initial.modelRoles },
+		"task.agentModelOverrides": { ...initial.agentModelOverrides },
+	};
+	const overrides: Partial<typeof values> = {};
 	return {
 		values,
 		settings: {
 			get(key: keyof typeof values) {
 				return values[key];
 			},
+			getGlobal(key: keyof typeof values) {
+				return globalValues[key];
+			},
+			getOverride(key: keyof typeof values) {
+				return overrides[key];
+			},
 			override(key: keyof typeof values, value: (typeof values)[typeof key]) {
-				values[key] = value;
+				values[key] = { ...globalValues[key], ...value };
+				overrides[key] = value;
+			},
+			clearOverride(key: keyof typeof values) {
+				delete overrides[key];
+				values[key] = globalValues[key];
 			},
 		} as unknown as Settings,
 	};
 }
 
 describe("ModelBindingsApplier", () => {
+	test("forced configured bindings do not resurrect previously observed profile values", () => {
+		const { settings, values } = createSettings({ modelRoles: {}, agentModelOverrides: {} });
+		const applier = new ModelBindingsApplier();
+		applier.setBindings({ modelRoles: { smol: "config/smol" } });
+		applier.applyTo(settings);
+		values.modelRoles.smol = "profile/smol";
+		applier.apply();
+		expect(values.modelRoles.smol).toBe("profile/smol");
+		applier.forceApplyTo(settings);
+		expect(values.modelRoles.smol).toBe("config/smol");
+		applier.apply();
+		expect(values.modelRoles.smol).toBe("config/smol");
+	});
+
 	test("restores untouched bindings while preserving user edits", () => {
 		const { settings, values } = createSettings({
 			modelRoles: { default: "openai/gpt-4.1" },

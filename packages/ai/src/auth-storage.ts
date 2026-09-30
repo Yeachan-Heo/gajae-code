@@ -6161,7 +6161,7 @@ export class AuthStorage {
 	 */
 	async peekApiKey(
 		provider: string,
-		options?: Pick<AuthApiKeyOptions, "owner"> & { sessionId?: string },
+		options?: AuthApiKeyOptions & { sessionId?: string },
 	): Promise<string | undefined> {
 		provider = resolveOAuthStorageProvider(provider);
 		const runtimeKey = this.#runtimeOverrides.get(provider);
@@ -6172,11 +6172,7 @@ export class AuthStorage {
 		if (configKey && !configOverride?.envSourced) return configKey;
 		if (options?.sessionId && this.hasSessionCredentialUnavailable(provider, options.sessionId)) return undefined;
 
-		const selectedCredential = this.#resolveSelectedStoredCredential(
-			provider,
-			options?.owner ? { owner: options.owner } : undefined,
-			options?.sessionId,
-		);
+		const selectedCredential = this.#resolveSelectedStoredCredential(provider, options, options?.sessionId);
 		if (configKey) {
 			// Env-sourced (`apiKeyEnv`) override: same precedence as getApiKey —
 			// a stored api_key credential from `auth login` wins, stored OAuth
@@ -6205,7 +6201,7 @@ export class AuthStorage {
 		// A hard selector is an identity boundary. If its selected row cannot
 		// provide a current token, discovery must not continue into the shared
 		// credential pool and silently query another account's catalog.
-		if (this.#getCredentialSelector(provider, undefined, options?.sessionId)) return undefined;
+		if (this.#getCredentialSelector(provider, options, options?.sessionId)) return undefined;
 
 		const attemptedApiKeyIndices = new Set<number>();
 		for (;;) {

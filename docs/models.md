@@ -6,6 +6,7 @@ This document describes how the coding-agent currently loads models, applies ove
 
 Primary implementation files:
 
+- `src/config/config-hot-reload.ts`: interactive configuration watching, snapshot validation, and lifecycle cleanup
 - `src/config/model-registry.ts` — loads embedded + signed-registry + custom models, provider overrides, runtime discovery, auth integration
 - `src/config/model-resolver.ts` — parses model patterns and selects models for the default and agent roles
 - `src/config/settings-schema.ts` — model-related settings (`modelRoles`, provider transport preferences)
@@ -22,6 +23,32 @@ Legacy behavior still present:
 
 - If `models.yml` is missing and `models.json` exists at the same location, it is migrated to `models.yml`.
 - Explicit `.json` / `.jsonc` config paths are still supported when passed programmatically to `ModelRegistry`.
+
+## Editing configuration in an open session
+
+Foreground interactive sessions watch the resolved user `config.yml` and
+`models.yml` paths. Saving either file schedules a validated reload; no restart,
+provider discovery request, or explicit preset reselection is required. Atomic
+editor saves are supported.
+
+Changes apply between requests, not during a streamed response. The active
+preset's new mappings apply to subsequent requests and delegated work; explicit
+session model or role overrides remain authoritative. Editing `modelProfile.default`
+affects the next startup, not the current active preset. The status line and open model selector
+refresh after the runtime accepts the change.
+
+Invalid YAML, invalid settings, or removal of an active preset or required model
+rejects the change with a visible diagnostic. The accepted runtime configuration
+remains in use until the file is repaired. Deleting an already accepted config
+file is also rejected rather than silently resetting the running session.
+Reloading does not rewrite configuration files or persist session overrides.
+
+This is configuration reload, not process or extension reload. Startup-only
+services such as MCP processes, extension code, and notification daemons still
+require a restart. Project configuration precedence is preserved, but project
+file watching and automatic reload in ACP, SDK, print, and background hosts are
+not enabled by this feature. A session without an active preset does not acquire
+one merely because a custom preset exists on disk.
 
 ## `models.yml` shape
 
