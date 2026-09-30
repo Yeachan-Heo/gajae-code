@@ -3,9 +3,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { AcpSdkAdapter, acpMcpLaunchFailure } from "../src/sdk/acp";
-import { lifecycleRequestTimeoutMs } from "../src/sdk/broker/startup-budget";
 import { Broker } from "../src/sdk/broker/broker";
 import { setLifecycleCommandResolverForTest } from "../src/sdk/broker/lifecycle";
+import { lifecycleRequestTimeoutMs } from "../src/sdk/broker/startup-budget";
 import { SdkClientError } from "../src/sdk/client";
 
 test("replays an uncertain ACP lifecycle launch with the same idempotency key", async () => {
