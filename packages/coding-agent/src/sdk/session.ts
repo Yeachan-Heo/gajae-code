@@ -59,7 +59,11 @@ import { loadCapability, reset as resetCapabilities } from "../capability";
 import { type Rule, ruleCapability, setActiveRules } from "../capability/rule";
 import type { SourceMeta } from "../capability/types";
 import { AUTOROUTING_INACTIVE_WARNING } from "../config/autorouting-contract";
-import { ModelProfileCredentialError, resolveMissingSessionModelRecovery } from "../config/model-profile-activation";
+import {
+	isSessionCredentialPinBlocking,
+	ModelProfileCredentialError,
+	resolveMissingSessionModelRecovery,
+} from "../config/model-profile-activation";
 import { resolveModelProfileName } from "../config/model-profile-contract";
 import { resolveProfileBindings } from "../config/model-profiles";
 import { kNoAuth, ModelRegistry } from "../config/model-registry";
@@ -1974,7 +1978,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const getModelAvailabilityKey = (candidate: Model): string =>
 			`${candidate.provider}\u0000${candidate.baseUrl ?? ""}`;
 		const hasModelApiKey = async (candidate: Model): Promise<boolean> => {
-			if (authStorage.hasSessionCredentialUnavailable(candidate.provider, credentialSessionId)) return false;
+			if (isSessionCredentialPinBlocking(modelRegistry, candidate.provider, credentialSessionId)) return false;
 			const availabilityKey = getModelAvailabilityKey(candidate);
 			const cached = modelApiKeyAvailability.get(availabilityKey);
 			if (cached !== undefined) {
@@ -2000,7 +2004,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const key = await modelRegistry
 				.getApiKey(candidate, credentialSessionId, { credentialSelector })
 				.catch(error => {
-					if (authStorage.hasSessionCredentialUnavailable(candidate.provider, credentialSessionId))
+					if (isSessionCredentialPinBlocking(modelRegistry, candidate.provider, credentialSessionId))
 						return undefined;
 					if (credentialSelector) {
 						logger.debug("Credential selector did not match model availability candidate", {

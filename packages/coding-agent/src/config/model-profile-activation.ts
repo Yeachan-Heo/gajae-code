@@ -476,19 +476,47 @@ export class ModelProfileCredentialError extends Error {
 	}
 }
 
+interface SessionPinRegistry {
+	authStorage?: {
+		hasRuntimeApiKey(provider: string): boolean;
+		hasConfigApiKey(provider: string, owner?: object): boolean;
+		hasSessionCredentialUnavailable(provider: string, scopeId?: string): boolean;
+	};
+	getAuthStorageOwner?(): object;
+}
+
+/**
+ * Whether an unavailable session credential pin blocks `provider`.
+ *
+ * Mirrors `AuthStorage.getApiKey` precedence: a runtime `--api-key` override or a
+ * `models.yml` provider key registered for this registry's owner is resolved before the
+ * unavailable-pin marker, so either one keeps the provider usable.
+ */
+export function isSessionCredentialPinBlocking(
+	registry: SessionPinRegistry,
+	provider: string,
+	sessionId: string | undefined,
+): boolean {
+	const authStorage = registry.authStorage;
+	if (!authStorage) return false;
+	if (authStorage.hasRuntimeApiKey(provider)) return false;
+	if (authStorage.hasConfigApiKey(provider, registry.getAuthStorageOwner?.())) return false;
+	return authStorage.hasSessionCredentialUnavailable(provider, sessionId);
+}
+
 async function getProfileProviderApiKey(
 	registry: PrepareModelProfileActivationOptions["modelRegistry"],
 	provider: string,
 	sessionId: string,
 	profileLabel: string,
 ): Promise<string | undefined> {
-	const pinUnavailable = () => registry.authStorage?.hasSessionCredentialUnavailable(provider, sessionId) === true;
-	if (pinUnavailable()) throw new ModelProfileCredentialError(profileLabel, [provider]);
+	const pinBlocking = () => isSessionCredentialPinBlocking(registry, provider, sessionId);
+	if (pinBlocking()) throw new ModelProfileCredentialError(profileLabel, [provider]);
 	try {
 		return await registry.getApiKeyForProvider(provider, sessionId);
 	} catch (error) {
 		// OAuth selection can invalidate a pin while the credential probe is running.
-		if (pinUnavailable()) throw new ModelProfileCredentialError(profileLabel, [provider]);
+		if (pinBlocking()) throw new ModelProfileCredentialError(profileLabel, [provider]);
 		throw error;
 	}
 }
@@ -915,10 +943,7 @@ export async function resolveModelProfileDefaultChain(options: {
 			canonicalSessionId: null,
 			credentialSessionId: options.credentialSessionId,
 			isCredentialUnavailable: provider =>
-				options.modelRegistry.authStorage?.hasSessionCredentialUnavailable(
-					provider,
-					options.credentialSessionId,
-				) === true,
+				isSessionCredentialPinBlocking(options.modelRegistry, provider, options.credentialSessionId),
 		},
 	);
 	return { profileName, entries: defaultChain, ...resolution };
@@ -1117,10 +1142,7 @@ async function resolveAndClampSelectorValue(
 					canonicalSessionId: options.sessionId,
 					credentialSessionId: options.credentialSessionId,
 					isCredentialUnavailable: provider =>
-						options.modelRegistry.authStorage?.hasSessionCredentialUnavailable(
-							provider,
-							options.credentialSessionId,
-						) === true,
+						isSessionCredentialPinBlocking(options.modelRegistry, provider, options.credentialSessionId),
 				},
 			);
 			resolved = {
@@ -1252,10 +1274,7 @@ async function concretizeProfileSelectorValue(
 							canonicalSessionId: prepared.session.sessionId,
 							credentialSessionId,
 							isCredentialUnavailable: provider =>
-								prepared.modelRegistry.authStorage?.hasSessionCredentialUnavailable(
-									provider,
-									credentialSessionId,
-								) === true,
+								isSessionCredentialPinBlocking(prepared.modelRegistry, provider, credentialSessionId),
 						},
 					)
 				: resolveModelRoleValue(selector, candidates, {
@@ -1506,8 +1525,7 @@ export async function prepareModelProfileActivation(
 				canonicalSessionId: options.session.sessionId,
 				credentialSessionId,
 				isCredentialUnavailable: provider =>
-					options.modelRegistry.authStorage?.hasSessionCredentialUnavailable(provider, credentialSessionId) ===
-					true,
+					isSessionCredentialPinBlocking(options.modelRegistry, provider, credentialSessionId),
 			},
 		);
 		const defaultModel = defaultResolution.model;

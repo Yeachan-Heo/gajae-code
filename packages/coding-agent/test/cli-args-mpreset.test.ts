@@ -829,6 +829,8 @@ test("interactive resume keeps a session open when its default profile requires 
 		...fakeRegistry([profile]),
 		getApiKeyForProvider,
 		authStorage: {
+			hasRuntimeApiKey: () => false,
+			hasConfigApiKey: () => false,
 			hasSessionCredentialUnavailable: (provider: string, scope: string) =>
 				provider === "profile-provider" && scope === session.credentialSessionId,
 		},
@@ -849,6 +851,42 @@ test("interactive resume keeps a session open when its default profile requires 
 	expect(getApiKeyForProvider).not.toHaveBeenCalled();
 	expect(session.model).toBeUndefined();
 	expect(settings.get("modelProfile.default")).toBe(profile.name);
+});
+
+test("interactive resume honors a runtime API key over an unavailable pin for the default profile", async () => {
+	const profile: ModelProfileDefinition = {
+		name: "pinned-default-runtime-key",
+		requiredProviders: ["profile-provider"],
+		modelMapping: { default: "profile-provider/default" },
+		source: "user",
+	};
+	const session = fakeSession(null);
+	const settings = Settings.isolated({ "modelProfile.default": profile.name });
+	const getApiKeyForProvider = vi.fn(async () => "runtime-key");
+	const registry = {
+		...fakeRegistry([profile]),
+		getApiKeyForProvider,
+		authStorage: {
+			hasRuntimeApiKey: (provider: string) => provider === "profile-provider",
+			hasConfigApiKey: () => false,
+			hasSessionCredentialUnavailable: (provider: string, scope: string) =>
+				provider === "profile-provider" && scope === session.credentialSessionId,
+		},
+	};
+	const result = await applyStartupModelProfilesForRoot({
+		session,
+		settings,
+		modelRegistry: registry as never,
+		parsedArgs: { resume: "saved-session" },
+		isInteractive: true,
+		hasInteractiveTerminal: true,
+		initialMessage: undefined,
+		initialMessages: [],
+		resumeAction: undefined,
+	});
+	expect(result.recoverableErrors).toEqual([]);
+	expect(getApiKeyForProvider).toHaveBeenCalled();
+	expect(session.model?.provider).toBe("profile-provider");
 });
 
 test("input-free interactive startup reports a stale persisted default without changing it", async () => {
