@@ -32,7 +32,6 @@ import { getShellConfig as resolveShellConfig } from "@gajae-code/utils/shell-co
 import { YAML } from "bun";
 import { type Settings as SettingsCapabilityItem, settingsCapability } from "../capability/settings";
 import type { ModelRole } from "../config/model-registry";
-import type { ConfigHotReloadFileSnapshot } from "./config-hot-reload";
 import { loadCapability } from "../discovery";
 import { extractWorkflowSetting, type WorkflowSettingKey } from "../gjc-runtime/workflow-settings";
 import { isLightTheme, setAutoThemeMapping, setColorBlindMode, setSymbolPreset } from "../modes/theme/theme";
@@ -63,6 +62,7 @@ import {
 	validateAutoroutingEffective,
 	validateAutoroutingLocal,
 } from "./autorouting-contract";
+import type { ConfigHotReloadFileSnapshot } from "./config-hot-reload";
 import { isModelSelectorValue, type ModelSelectorValue, normalizeModelSelectorValue } from "./model-selector-value";
 
 import {
@@ -807,7 +807,10 @@ export class Settings implements NotificationSettingsReader {
 	async stageGlobalConfigReload(snapshot: ConfigHotReloadFileSnapshot): Promise<SettingsGlobalConfigCandidate> {
 		const configPath = this.#configPath;
 		if (!configPath) {
-			throw new SettingsGlobalConfigReloadError("Global config reload requires a disk-backed Settings instance.", null);
+			throw new SettingsGlobalConfigReloadError(
+				"Global config reload requires a disk-backed Settings instance.",
+				null,
+			);
 		}
 
 		if (path.resolve(snapshot.path) !== path.resolve(configPath)) {
@@ -956,15 +959,15 @@ export class Settings implements NotificationSettingsReader {
 					})),
 				);
 			}
-		const effectiveAutorouting = validateAutoroutingEffective(getByPath(effective, ["task", "autorouting"]));
-		if (!effectiveAutorouting.active && effectiveAutorouting.issue) {
-			diagnostics.issues.push({
-				path: "task.autorouting",
-				kind: "invalid",
-				detail: effectiveAutorouting.issue.detail,
-			});
-		}
-		diagnostics.valid = !diagnostics.issues.some(issue => issue.kind === "invalid");
+			const effectiveAutorouting = validateAutoroutingEffective(getByPath(effective, ["task", "autorouting"]));
+			if (!effectiveAutorouting.active && effectiveAutorouting.issue) {
+				diagnostics.issues.push({
+					path: "task.autorouting",
+					kind: "invalid",
+					detail: effectiveAutorouting.issue.detail,
+				});
+			}
+			diagnostics.valid = !diagnostics.issues.some(issue => issue.kind === "invalid");
 			if (!diagnostics.valid) {
 				throw new SettingsGlobalConfigReloadError(
 					"Cannot stage global config reload because settings validation failed.",
@@ -1023,7 +1026,10 @@ export class Settings implements NotificationSettingsReader {
 			);
 		}
 		if (state.published) {
-			throw new SettingsGlobalConfigReloadError("The global config candidate has already been published.", state.configPath);
+			throw new SettingsGlobalConfigReloadError(
+				"The global config candidate has already been published.",
+				state.configPath,
+			);
 		}
 		if (
 			this.#configPath !== state.configPath ||

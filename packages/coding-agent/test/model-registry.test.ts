@@ -9691,6 +9691,268 @@ describe("ModelRegistry", () => {
 	});
 });
 
+describe("ModelRegistry config reload", () => {
+	let tempDir: string;
+	let modelsPath: string;
+	let authStorage: AuthStorage;
+	let registry: ModelRegistry;
+	let previousPresetRegistryDisabled: string | undefined;
+
+	beforeEach(async () => {
+		resetSettingsForTest();
+		previousPresetRegistryDisabled = Bun.env.GJC_MODEL_PRESET_REGISTRY_DISABLED;
+		Bun.env.GJC_MODEL_PRESET_REGISTRY_DISABLED = "true";
+		tempDir = path.resolve(
+			import.meta.dir,
+			"../../../.gjc/evidence/config-hot-reload",
+			`registry-${Snowflake.next()}`,
+		);
+		fs.mkdirSync(tempDir, { recursive: true });
+		modelsPath = path.join(tempDir, "models.json");
+		await Bun.write(
+			modelsPath,
+			JSON.stringify({
+				providers: {
+					"reload-proxy": {
+						baseUrl: "https://old.example.com/v1",
+						apiKey: "old-models-key",
+						api: "openai-responses",
+						models: [{ id: "old-model" }],
+					},
+				},
+			}),
+		);
+		authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+		registry = new ModelRegistry(authStorage, modelsPath, undefined, { automaticRefresh: false });
+	});
+
+	afterEach(async () => {
+		await registry.dispose();
+		authStorage.close();
+		resetSettingsForTest();
+		if (previousPresetRegistryDisabled === undefined) delete Bun.env.GJC_MODEL_PRESET_REGISTRY_DISABLED;
+		else Bun.env.GJC_MODEL_PRESET_REGISTRY_DISABLED = previousPresetRegistryDisabled;
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	test("stages the supplied snapshot without mutating live models or auth until commit", async () => {
+		const snapshotText = JSON.stringify({
+			providers: {
+				"reload-proxy": {
+					baseUrl: "https://new.example.com/v1",
+					apiKey: "new-models-key",
+					api: "openai-responses",
+					models: [{ id: "new-model" }],
+				},
+			},
+		});
+		const candidate = await registry.stageModelsConfigReload({
+			path: modelsPath,
+			text: snapshotText,
+			identity: "snapshot-revision-2",
+		});
+
+		expect(registry.getModelsConfigPath()).toBe(modelsPath);
+		expect(candidate.valid).toBe(true);
+		expect(candidate.diagnostics.valid).toBe(true);
+		expect(candidate.registry.find("reload-proxy", "new-model")).toBeDefined();
+		expect(candidate.registry.getModelProfiles()).toBeInstanceOf(Map);
+		expect(registry.find("reload-proxy", "old-model")).toBeDefined();
+		expect(registry.find("reload-proxy", "new-model")).toBeUndefined();
+		expect(await authStorage.peekApiKey("reload-proxy")).toBe("old-models-key");
+
+		candidate.commit();
+		expect(registry.find("reload-proxy", "old-model")).toBeUndefined();
+		expect(registry.find("reload-proxy", "new-model")).toBeDefined();
+		expect(await authStorage.peekApiKey("reload-proxy")).toBe("new-models-key");
+
+		candidate.rollback();
+		expect(registry.find("reload-proxy", "old-model")).toBeDefined();
+		expect(registry.find("reload-proxy", "new-model")).toBeUndefined();
+		expect(await authStorage.peekApiKey("reload-proxy")).toBe("old-models-key");
+		candidate.rollback();
+	});
+
+	test("rejects malformed snapshots and deletion of an accepted file without changing auth", async () => {
+		const malformed = await registry.stageModelsConfigReload({ path: modelsPath, text: "{", identity: "invalid" });
+		expect(malformed.valid).toBe(false);
+		expect(malformed.diagnostics.valid).toBe(false);
+		malformed.rollback();
+		expect(await authStorage.peekApiKey("reload-proxy")).toBe("old-models-key");
+
+		const deletion = await registry.stageModelsConfigReload({ path: modelsPath, text: null, identity: "deleted" });
+		expect(deletion.valid).toBe(false);
+		deletion.rollback();
+		expect(registry.find("reload-proxy", "old-model")).toBeDefined();
+		expect(await authStorage.peekApiKey("reload-proxy")).toBe("old-models-key");
+	});
+
+	test("publication fences drain consumers, are writer-fair, and release idempotently", async () => {
+		const firstConsumerRelease = await holdConsumer();
+		const order: string[] = [];
+		const publicationFence = registry.acquirePublicationFence().then(release => {
+			order.push("writer");
+			return release;
+		});
+		const waitingConsumer = holdConsumer().then(release => {
+			order.push("consumer");
+			return release;
+		});
+		firstConsumerRelease();
+		firstConsumerRelease();
+
+		const releaseFence = await publicationFence;
+		expect(order).toEqual(["writer"]);
+		releaseFence();
+		releaseFence();
+		const releaseConsumer = await waitingConsumer;
+		expect(order).toEqual(["writer", "consumer"]);
+		releaseConsumer();
+	});
+
+	test("aborted queued publication fences are removed without blocking later consumers", async () => {
+		const releaseConsumer = await holdConsumer();
+		const controller = new AbortController();
+		const waitingFence = registry.acquirePublicationFence(controller.signal);
+		controller.abort(new Error("cancel fence"));
+		await expect(waitingFence).rejects.toThrow("cancel fence");
+		releaseConsumer();
+		const releaseNextConsumer = await holdConsumer();
+		releaseNextConsumer();
+	});
+
+	async function holdConsumer(): Promise<() => void> {
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		const completion = registry.withConsumerLease(async () => {
+			entered.resolve();
+			await gate.promise;
+		});
+		await Promise.race([entered.promise, completion]);
+		return () => gate.resolve();
+	}
+
+	test("rejects a stale candidate after a direct provider registration", async () => {
+		const candidate = await registry.stageModelsConfigReload({
+			path: modelsPath,
+			text: await Bun.file(modelsPath).text(),
+			identity: "before-registration",
+		});
+		registry.registerProvider("runtime-provider", {
+			baseUrl: "https://runtime.example/v1",
+			api: "openai-responses",
+			apiKey: "runtime-key",
+			models: [
+				{
+					id: "runtime",
+					name: "Runtime",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 8192,
+					maxTokens: 1024,
+				},
+			],
+		});
+		expect(() => candidate.commit()).toThrow("changed during configuration preflight");
+		candidate.rollback();
+		expect(registry.find("runtime-provider", "runtime")).toBeDefined();
+		expect(await registry.getApiKeyForProvider("runtime-provider")).toBe("runtime-key");
+	});
+
+	test("rejects publication from a consumer callback instead of deadlocking", async () => {
+		await registry.withConsumerLease(async () => {
+			await expect(registry.acquirePublicationFence()).rejects.toThrow("holding a model consumer lease");
+		});
+	});
+
+	test("staged credential resolution preserves explicit account selectors", async () => {
+		const config = JSON.parse(await Bun.file(modelsPath).text());
+		delete config.providers["reload-proxy"].apiKey;
+		config.providers["reload-proxy"].auth = "apiKey";
+		await authStorage.set("reload-proxy", [{ type: "api_key", key: "stored-key" }]);
+		const candidate = await registry.stageModelsConfigReload({
+			path: modelsPath,
+			text: JSON.stringify(config),
+			identity: "scoped-auth",
+		});
+		await expect(
+			candidate.registry.getApiKeyForProvider("reload-proxy", undefined, "https://old.example.com/v1", {
+				credentialSelector: { kind: "email", value: "missing@example.com" },
+			}),
+		).rejects.toThrow("No credential found");
+		expect(await candidate.registry.getApiKeyForProvider("reload-proxy")).toBe("stored-key");
+		candidate.rollback();
+	});
+
+	test("causal child consumers finish before a queued writer without deadlocking their parent", async () => {
+		const parentEntered = Promise.withResolvers<void>();
+		const childMayStart = Promise.withResolvers<void>();
+		const events: string[] = [];
+		const parent = registry.withConsumerLease(async () => {
+			parentEntered.resolve();
+			await childMayStart.promise;
+			await registry.withConsumerLease(() => events.push("child"));
+			events.push("parent");
+		});
+		await parentEntered.promise;
+		const writer = registry.acquirePublicationFence().then(release => {
+			events.push("writer");
+			release();
+		});
+		childMayStart.resolve();
+		await Promise.all([parent, writer]);
+		expect(events).toEqual(["child", "parent", "writer"]);
+	});
+
+	test("catalog refresh waits for publication and notifications wait for finalization", async () => {
+		const release = await registry.acquirePublicationFence();
+		let refreshed = false;
+		const refresh = registry.refreshStatic().then(() => {
+			refreshed = true;
+		});
+		await Bun.sleep(5);
+		expect(refreshed).toBe(false);
+		const text = await Bun.file(modelsPath).text();
+		const next = JSON.parse(text);
+		next.providers["reload-proxy"].apiKey = "rotated-key";
+		const candidate = await registry.stageModelsConfigReload({
+			path: modelsPath,
+			text: JSON.stringify(next),
+			identity: "auth-change",
+		});
+		let notifications = 0;
+		const stop = registry.onCatalogChanged(() => {
+			notifications++;
+		});
+		expect(candidate.changed).toBe(true);
+		candidate.commit();
+		expect(notifications).toBe(0);
+		expect(await registry.getApiKeyForProvider("reload-proxy")).toBe("rotated-key");
+		candidate.finalize();
+		expect(notifications).toBe(1);
+		stop();
+		release();
+		await refresh;
+		expect(refreshed).toBe(true);
+	});
+
+	test("removing the only configured key does not reuse accepted credentials during preflight", async () => {
+		const config = JSON.parse(await Bun.file(modelsPath).text());
+		delete config.providers["reload-proxy"].apiKey;
+		config.providers["reload-proxy"].auth = "apiKey";
+		const candidate = await registry.stageModelsConfigReload({
+			path: modelsPath,
+			text: JSON.stringify(config),
+			identity: "removed-key",
+		});
+		expect(await candidate.registry.getApiKeyForProvider("reload-proxy")).toBeUndefined();
+		expect(await registry.getApiKeyForProvider("reload-proxy")).toBe("old-models-key");
+		candidate.rollback();
+		expect(await registry.getApiKeyForProvider("reload-proxy")).toBe("old-models-key");
+	});
+});
+
 describe("isQuietLocalDiscoveryFailure", () => {
 	const refused = Object.assign(new Error("unable to connect"), { code: "ECONNREFUSED" });
 
