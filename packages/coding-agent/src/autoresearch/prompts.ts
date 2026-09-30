@@ -9,7 +9,7 @@
  * `run_experiment` / `log_experiment` / `update_notes` tool names, and the old
  * `~/.gjc/autoresearch` state locations has been scrubbed — the prompts speak
  * to the native command, the session-owned mission-free `python` tool, and the session-scoped
- * state under `.gjc/_session-{id}/autoresearch/`.
+ * state under `$GJC_STATE_DIR/_session-{id}/autoresearch/`.
  */
 import { prompt } from "@gajae-code/utils";
 import iteratePromptTemplate from "./prompts/prompt.md" with { type: "text" };

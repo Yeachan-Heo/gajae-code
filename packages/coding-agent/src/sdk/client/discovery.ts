@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import path from "node:path";
+import { projectSharedStateRoot } from "../../gjc-runtime/session-layout";
 import { type BrokerDiscovery, readBrokerDiscovery as readBrokerFile } from "../broker/discovery";
 
 export interface SdkSessionEndpoint {
@@ -35,8 +36,10 @@ export class SdkDiscoveryError extends Error {
 
 export type SdkSessionEndpointScope = "default" | "chat";
 
-export function endpointDirectory(repo: string, scope: SdkSessionEndpointScope = "default"): string {
-	return scope === "chat" ? path.join(repo, ".gjc", "state", "chat", "sdk") : path.join(repo, ".gjc", "state", "sdk");
+/** `agentDir` selects the profile whose project state root holds the endpoints (process default when omitted). */
+export function endpointDirectory(repo: string, scope: SdkSessionEndpointScope = "default", agentDir?: string): string {
+	const stateRoot = projectSharedStateRoot(repo, agentDir);
+	return scope === "chat" ? path.join(stateRoot, "chat", "sdk") : path.join(stateRoot, "sdk");
 }
 function isUsableSessionId(sessionId: string): boolean {
 	return (
@@ -91,8 +94,8 @@ function discoveryError(file: string, error: unknown): SdkDiscoveryError {
 }
 
 /** Lists endpoint files and returns individual malformed or unreadable records as warnings. */
-export async function listSdkSessionEndpoints(repo: string): Promise<SdkSessionEndpointList> {
-	const directory = endpointDirectory(repo);
+export async function listSdkSessionEndpoints(repo: string, agentDir?: string): Promise<SdkSessionEndpointList> {
+	const directory = endpointDirectory(repo, "default", agentDir);
 	let entries: Array<{ name: string; isFile(): boolean }>;
 	try {
 		entries = (await fs.readdir(directory, { withFileTypes: true })) as Array<{ name: string; isFile(): boolean }>;
@@ -128,9 +131,10 @@ export async function readSdkSessionEndpoint(
 	repo: string,
 	sessionId: string,
 	scope: SdkSessionEndpointScope = "default",
+	agentDir?: string,
 ): Promise<SdkSessionEndpoint | null> {
 	if (!isUsableSessionId(sessionId)) return null;
-	const file = path.join(endpointDirectory(repo, scope), `${sessionId}.json`);
+	const file = path.join(endpointDirectory(repo, scope, agentDir), `${sessionId}.json`);
 	try {
 		const stat = await fs.lstat(file);
 		if (!stat.isFile()) return null;

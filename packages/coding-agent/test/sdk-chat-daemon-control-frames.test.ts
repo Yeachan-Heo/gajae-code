@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { ChatDaemonRuntime } from "../src/sdk/bus/chat-daemon-runtime";
 import { ConversationStore } from "../src/sdk/bus/conversation-store";
@@ -88,7 +89,7 @@ async function withRuntime(
 	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-chat-control-frames-"));
 	let runtime: ChatDaemonRuntime | undefined;
 	try {
-		const stateRoot = path.join(agentDir, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(agentDir, agentDir);
 		const endpointFile = path.join(stateRoot, "sdk", `${SESSION_ID}.json`);
 		await fs.mkdir(path.dirname(endpointFile), { recursive: true });
 		await fs.writeFile(

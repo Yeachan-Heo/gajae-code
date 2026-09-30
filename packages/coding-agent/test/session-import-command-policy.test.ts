@@ -6,6 +6,7 @@ import * as path from "node:path";
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
 import { TempDir } from "@gajae-code/utils";
 import packageJson from "../package.json" with { type: "json" };
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { processIncarnation } from "../src/sdk/broker/process-incarnation";
@@ -36,7 +37,7 @@ async function publishBrokerSession(
 	endpointGeneration: number,
 	endpointMtimeMs: number,
 ): Promise<void> {
-	const stateRoot = path.join(cwd, ".gjc", "state");
+	const stateRoot = projectSharedStateRoot(cwd);
 	const sessionsDir = path.join(agentDir, "sdk", "sessions");
 	await fs.mkdir(sessionsDir, { recursive: true });
 	const indexFile = path.join(sessionsDir, "index.jsonl");
@@ -110,7 +111,7 @@ async function createAcpPromptFixture(): Promise<AcpPromptFixture> {
 				if (frame.type === "broker_request") {
 					if (frame.operation === "session.create") {
 						const url = `ws://127.0.0.1:${server.port}`;
-						const sdkDir = path.join(cwd, ".gjc", "state", "sdk");
+						const sdkDir = path.join(projectSharedStateRoot(cwd), "sdk");
 						nodeFs.mkdirSync(sdkDir, { recursive: true });
 						const endpointFile = path.join(sdkDir, `${sessionId}.json`);
 						nodeFs.writeFileSync(

@@ -15,7 +15,7 @@ import {
 	MANAGED_OWNER_SUPERVISOR_ARG,
 } from "./managed-owner-supervisor";
 import { resolveGjcTmuxBinary } from "./psmux-detect";
-import { GJC_DIR, GJC_SESSION_PREFIX, tmuxRuntimeSessionPath } from "./session-layout";
+import { GJC_SESSION_PREFIX, projectStateRoot, tmuxRuntimeSessionPath } from "./session-layout";
 import {
 	GJC_COORDINATOR_SESSION_ID_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
@@ -493,7 +493,7 @@ function assertMutationAuthority(session: GjcTmuxSessionStatus): void {
 }
 
 function canonicalProviderStateDirs(cwd: string): string[] {
-	const gjcDir = path.join(cwd, GJC_DIR);
+	const gjcDir = projectStateRoot(cwd);
 	let entries: fsSync.Dirent[];
 	try {
 		entries = fsSync.readdirSync(gjcDir, { withFileTypes: true });

@@ -2,6 +2,7 @@ import { expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { Broker, type SpawnPromptLayer } from "../src/sdk/broker/broker";
 import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
 import { setLifecycleCommandResolverForTest, writeSessionLifecycleFailure } from "../src/sdk/broker/lifecycle";
@@ -20,7 +21,7 @@ async function attest(broker: Broker, cwd: string): Promise<void> {
 		await broker.index.append({
 			type: "host_registered",
 			sessionId: ownerId,
-			locator: { cwd, worktreeRoot: null, stateRoot: path.join(cwd, ".gjc", "state") },
+			locator: { cwd, worktreeRoot: null, stateRoot: projectSharedStateRoot(cwd, broker.settings.agentDir) },
 			endpointGeneration,
 			pid: process.pid,
 			hostIncarnation: incarnation,
@@ -73,7 +74,7 @@ for (const scenario of [
 		let effectMarker = "";
 		let closes = 0;
 		let registrations = 0;
-		const stateRoot = path.join(root, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(root, path.join(root, "agent"));
 		const markerPath = () => path.join(stateRoot, "sdk", `${childId}.lifecycle.json`);
 		const launchedProof = { ...proof };
 		if (scenario === "missing_pid") delete launchedProof.pid;
@@ -238,7 +239,9 @@ test("real session.spawn publishes lifecycle authority and registers a live chil
 		expect(
 			(rows.result as { sessions: Array<{ endpointGeneration: number }> }).sessions[0]!.endpointGeneration,
 		).toBeGreaterThan(0);
-		const marker = await Bun.file(path.join(root, ".gjc", "state", "sdk", `${childId}.lifecycle.json`)).json();
+		const marker = await Bun.file(
+			path.join(projectSharedStateRoot(root, broker.settings.agentDir), "sdk", `${childId}.lifecycle.json`),
+		).json();
 		expect(marker).toMatchObject({ pid: launchedProof?.pid, incarnation: launchedProof?.processIncarnation });
 		const ledger = await Bun.file(path.join(broker.settings.agentDir, "sdk", "spawn-authority.jsonl")).text();
 		expect(ledger).toContain('"authority_active"');

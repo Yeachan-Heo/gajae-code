@@ -3,6 +3,7 @@
 import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { projectSharedStateRoot } from "../../src/gjc-runtime/session-layout";
 import { SessionIndex } from "../../src/sdk/broker/session-index";
 
 // fixtures/ -> test/ -> package root (packages/coding-agent)
@@ -79,17 +80,17 @@ try {
 			},
 		},
 	});
-	await mkdir(path.join(repo, ".gjc", "state", "sdk"), { recursive: true });
+	await mkdir(path.join(projectSharedStateRoot(repo, agentDir), "sdk"), { recursive: true });
 	await writeFile(
-		path.join(repo, ".gjc", "state", "sdk", "s1.json"),
+		path.join(projectSharedStateRoot(repo, agentDir), "sdk", "s1.json"),
 		JSON.stringify({ sessionId: "s1", pid: process.pid, url: `ws://127.0.0.1:${server.port}`, token: "tok" }),
 	);
-	const endpointMtimeMs = (await stat(path.join(repo, ".gjc", "state", "sdk", "s1.json"))).mtimeMs;
+	const endpointMtimeMs = (await stat(path.join(projectSharedStateRoot(repo, agentDir), "sdk", "s1.json"))).mtimeMs;
 	const index = await new SessionIndex(agentDir).open();
 	await index.append({
 		type: "host_registered",
 		sessionId: "s1",
-		locator: { cwd: repo, worktreeRoot: null, stateRoot: path.join(repo, ".gjc", "state") },
+		locator: { cwd: repo, worktreeRoot: null, stateRoot: projectSharedStateRoot(repo, agentDir) },
 		endpointGeneration: 1,
 		pid: process.pid,
 		endpointMtimeMs,

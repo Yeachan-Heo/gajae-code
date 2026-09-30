@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
+import { projectSharedStateRoot } from "../gjc-runtime/session-layout";
 import { ensureCoordinatorDirectory, syncCoordinatorDirectory, writeCoordinatorAtomic } from "./durability";
 import type { PrivateAskGateCodecV1, PublicReason } from "./question-gate-codec";
 
@@ -2659,7 +2660,7 @@ function assertCreationRetirementProofMatches(
 		if (
 			session.session_id !== proof.session_id ||
 			path.resolve(session.cwd) !== path.resolve(proof.cwd) ||
-			path.resolve(session.cwd, ".gjc", "state") !== path.resolve(proof.state_root) ||
+			projectSharedStateRoot(path.resolve(session.cwd)) !== path.resolve(proof.state_root) ||
 			session.broker.endpoint_generation !== proof.endpoint_generation ||
 			intent.kind === "register" ||
 			intent.remote_create_key !== proof.remote_create_key

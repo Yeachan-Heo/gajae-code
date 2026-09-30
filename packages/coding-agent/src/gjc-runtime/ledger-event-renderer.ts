@@ -5,7 +5,7 @@
  * events (those skills persist through `bash`-backed `gjc` CLI calls whose tool
  * `details` carry no structured payload). The durable source of truth is the
  * append-only ledgers:
- *   - ultragoal: `.gjc/ultragoal/ledger.jsonl`
+ *   - ultragoal: `$GJC_STATE_DIR/_session-{sessionid}/ultragoal/ledger.jsonl`
  *   - ralplan:   `.gjc/plans/ralplan/<run-id>/index.jsonl`
  *
  * This module is I/O-free: callers read the files and pass lines or already-parsed

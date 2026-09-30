@@ -277,7 +277,7 @@ providers:
 | --- | --- |
 | `gjc ralplan` | Runs the native RALPLAN consensus planning workflow |
 | `gjc deep-interview` | Runs the native deep-interview workflow |
-| `gjc state` | Reads or updates current-session workflow state receipts under `.gjc/_session-{sessionid}/state` |
+| `gjc state` | Reads or updates current-session workflow state receipts under `$GJC_STATE_DIR/_session-{sessionid}/state` |
 
 ### Interactive `--tmux` startup and scroll/mouse profile
 

@@ -6,6 +6,7 @@ import { Agent } from "@gajae-code/agent-core";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { Settings } from "../src/config/settings";
 import type { ExtensionAPI, ExtensionContext } from "../src/extensibility/extensions";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { createSdkSessionRuntimeExtension } from "../src/sdk/host/session-runtime";
 import type { SdkFrame } from "../src/sdk/host/types";
 import { AgentSession } from "../src/session/agent-session";
@@ -126,7 +127,7 @@ async function startRuntimeHarness(): Promise<RuntimeHarness> {
 		onSessionEvent: () => () => {},
 		sessionManager: {
 			getSessionId: () => sessionId,
-			getSessionFile: () => path.join(cwd, ".gjc", "state", `${sessionId}.jsonl`),
+			getSessionFile: () => path.join(projectSharedStateRoot(cwd), `${sessionId}.jsonl`),
 			getSessionName: () => undefined,
 			getBranch: () => [],
 		},

@@ -9,13 +9,15 @@ import {
 	type ModeChangeEntry,
 	type SessionEntry,
 } from "../session/session-manager";
-import { sessionStateDir, sessionUltragoalDir } from "./session-layout";
+import { projectStateRoot, sessionStateDir, sessionUltragoalDir } from "./session-layout";
 import { resolveGjcSessionForRead, resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
 import { removeFileAudited, writeJsonAtomic } from "./state-writer";
 
 export const GJC_SESSION_FILE_ENV = "GJC_SESSION_FILE";
 export const GJC_SESSION_ID_ENV = "GJC_SESSION_ID";
 export const GJC_SESSION_CWD_ENV = "GJC_SESSION_CWD";
+/** Absolute per-project runtime state root; session state lives at `$GJC_STATE_DIR/_session-<id>`. */
+export const GJC_STATE_DIR_ENV = "GJC_STATE_DIR";
 
 const REQUEST_VERSION = 1;
 export const DEFAULT_ULTRAGOAL_OBJECTIVE =
@@ -280,6 +282,9 @@ export function buildGjcRuntimeSessionEnv(input: {
 	const env: Record<string, string> = {};
 	if (input.sessionFile) env[GJC_SESSION_FILE_ENV] = input.sessionFile;
 	if (input.sessionId) env[GJC_SESSION_ID_ENV] = input.sessionId;
-	if (input.cwd) env[GJC_SESSION_CWD_ENV] = input.cwd;
+	if (input.cwd) {
+		env[GJC_SESSION_CWD_ENV] = input.cwd;
+		env[GJC_STATE_DIR_ENV] = projectStateRoot(input.cwd);
+	}
 	return env;
 }

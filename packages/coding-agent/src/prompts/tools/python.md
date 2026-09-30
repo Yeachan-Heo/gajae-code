@@ -1,6 +1,6 @@
 Execute Python in a persistent per-session REPL kernel.
 
-Variables, imports, and loaded data persist across calls in the current GJC session. The kernel runs in the session working directory. Each `execute` call is appended to a JSONL transcript under `.gjc/_session-{sessionid}/ipykernels/`; display artifacts are stored under `.gjc/_session-{sessionid}/ipykernels/artifacts/`.
+Variables, imports, and loaded data persist across calls in the current GJC session. The kernel runs in the session working directory. Each `execute` call is appended to a JSONL transcript under `$GJC_STATE_DIR/_session-{sessionid}/ipykernels/`; display artifacts are stored under `$GJC_STATE_DIR/_session-{sessionid}/ipykernels/artifacts/`.
 
 ## Actions
 

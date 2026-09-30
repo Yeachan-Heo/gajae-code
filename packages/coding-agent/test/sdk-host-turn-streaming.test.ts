@@ -14,6 +14,7 @@ import {
 	ExtensionRunner,
 	testSetExtensionHandlerTimeoutMs,
 } from "../src/extensibility/extensions/runner";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { mapAgentWireEventPayloadToAcpSessionUpdates } from "../src/modes/acp/acp-event-mapper";
 import { toAgentWireEventPayload } from "../src/modes/shared/agent-wire/event-envelope";
 import { createReconciliationStore, type ReconciliationStore } from "../src/sdk/bus/reconciliation-store";
@@ -224,7 +225,7 @@ async function createHostHarness(
 			}),
 		sessionManager: {
 			getSessionId: () => sessionId,
-			getSessionFile: () => path.join(cwd, ".gjc", "state", `${sessionId}.jsonl`),
+			getSessionFile: () => path.join(projectSharedStateRoot(cwd), `${sessionId}.jsonl`),
 			getSessionName: () => undefined,
 			getBranch: () => [],
 		},

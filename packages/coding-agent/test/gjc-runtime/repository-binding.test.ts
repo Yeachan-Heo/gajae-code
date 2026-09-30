@@ -15,6 +15,7 @@ import {
 	repositoryBindingsMatch,
 	resolveTaskRepositoryBinding,
 } from "../../src/gjc-runtime/repository-binding";
+import { projectStateRoot } from "../../src/gjc-runtime/session-layout";
 import { buildTaskReceipt } from "../../src/task/receipt";
 import type { SingleResult } from "../../src/task/types";
 
@@ -285,8 +286,8 @@ describe("repository binding (#2901)", () => {
 			// instead re-seed is not needed: enforce uses LEFT seed when cwd is RIGHT only if
 			// state lives under RIGHT. Product path: seed on LEFT, then invoke write with cwd=RIGHT
 			// cannot see LEFT state — so test sibling by reusing LEFT binding via explicit fail path:
-			const leftState = path.join(left, ".gjc", `_session-${sessionId}`, "state", "ralplan-state.json");
-			const rightStateDir = path.join(right, ".gjc", `_session-${sessionId}`, "state");
+			const leftState = path.join(projectStateRoot(left), `_session-${sessionId}`, "state", "ralplan-state.json");
+			const rightStateDir = path.join(projectStateRoot(right), `_session-${sessionId}`, "state");
 			await fsp.mkdir(rightStateDir, { recursive: true });
 			await fsp.copyFile(leftState, path.join(rightStateDir, "ralplan-state.json"));
 

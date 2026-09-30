@@ -6,6 +6,7 @@ import {
 	planLaunchWorktree,
 	WorktreePreparationTimeoutError,
 } from "../src/gjc-runtime/launch-worktree";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { Broker } from "../src/sdk/broker/broker";
 import {
 	deriveLifecycleDeadlines,
@@ -74,7 +75,7 @@ test("RED A: slow worktree prep no longer spends the child semantic readiness cl
 			"session.create",
 			{
 				cwd: repo,
-				stateRoot: path.join(repo, ".gjc", "state"),
+				stateRoot: projectSharedStateRoot(repo, agentDir),
 				target: { worktree: { enabled: true, name: "feat" } },
 				readinessTimeoutMs: 10_000,
 			},

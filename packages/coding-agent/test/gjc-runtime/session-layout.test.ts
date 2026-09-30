@@ -8,6 +8,9 @@ import {
 	encodeSessionSegment,
 	GJC_SESSION_PREFIX,
 	modeStatePath,
+	projectConfigRoot,
+	projectSharedStateRoot,
+	projectStateRoot,
 	sessionActivityPath,
 	sessionIdFromDirName,
 	sessionRoot,
@@ -23,6 +26,7 @@ import {
 	SessionResolutionError,
 	writeSessionActivityMarker,
 } from "@gajae-code/coding-agent/gjc-runtime/session-resolution";
+import { getAgentDir } from "@gajae-code/utils";
 
 const tempRoots: string[] = [];
 
@@ -42,9 +46,9 @@ describe("session-layout (pure)", () => {
 		expect(decodeSessionSegment(encodeSessionSegment("a.b/c"))).toBe("a.b/c");
 	});
 
-	it("builds session root and category dirs under .gjc/_session-<id>", () => {
+	it("builds session root and category dirs under the external project state root", () => {
 		const root = sessionRoot("/proj", "abc");
-		expect(root).toBe(path.join("/proj", ".gjc", "_session-abc"));
+		expect(root).toBe(path.join(projectStateRoot("/proj"), "_session-abc"));
 		expect(sessionStateDir("/proj", "abc")).toBe(path.join(root, "state"));
 		expect(modeStatePath("/proj", "abc", "ralplan")).toBe(path.join(root, "state", "ralplan-state.json"));
 		expect(activeEntryPath("/proj", "abc", "ultragoal")).toBe(path.join(root, "state", "active", "ultragoal.json"));
@@ -64,8 +68,31 @@ describe("session-layout (pure)", () => {
 		expect(() => tmuxRuntimeSessionPath("/proj", "abc", "../../escape")).toThrow();
 		expect(() => tmuxRuntimeSessionPath("/proj", "abc", "a\\b")).toThrow();
 		expect(modeStatePath("/proj", "abc", "deep-interview")).toBe(
-			path.join("/proj", ".gjc", "_session-abc", "state", "deep-interview-state.json"),
+			path.join(projectStateRoot("/proj"), "_session-abc", "state", "deep-interview-state.json"),
 		);
+	});
+
+	it("keeps runtime state out of the project while user config stays in <cwd>/.gjc", () => {
+		const stateRoot = projectStateRoot("/proj");
+		expect(path.dirname(stateRoot)).toBe(path.join(getAgentDir(), "projects"));
+		expect(path.basename(stateRoot)).toMatch(/^proj-[0-9a-f]{16}$/);
+		expect(projectSharedStateRoot("/proj")).toBe(path.join(stateRoot, "state"));
+		expect(projectConfigRoot("/proj")).toBe(path.join("/proj", ".gjc"));
+		expect(path.relative("/proj", sessionRoot("/proj", "abc")).startsWith("..")).toBe(true);
+	});
+
+	it("distinguishes projects that share a basename", () => {
+		expect(projectStateRoot("/a/app")).not.toBe(projectStateRoot("/b/app"));
+	});
+
+	it("resolves every symlink alias of a checkout to one state root", async () => {
+		const base = await tempDir();
+		const real = path.join(base, "real-project");
+		const alias = path.join(base, "alias-project");
+		await fs.mkdir(real);
+		await fs.symlink(real, alias, "dir");
+		expect(projectStateRoot(alias)).toBe(projectStateRoot(real));
+		expect(path.basename(projectStateRoot(alias))).toMatch(/^real-project-[0-9a-f]{16}$/);
 	});
 
 	it("recovers session id from a _session-* dir name and rejects invalid names", () => {

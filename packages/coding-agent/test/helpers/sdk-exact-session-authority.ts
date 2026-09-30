@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { projectSharedStateRoot } from "../../src/gjc-runtime/session-layout";
 import { processIncarnation } from "../../src/sdk/broker/process-incarnation";
 import { type SessionIndexEvent, sessionIndexChecksum } from "../../src/sdk/broker/session-index";
 import { SESSION_INDEX_EVENT_VERSION } from "../../src/sdk/broker/state-version";
@@ -32,7 +33,11 @@ export async function prepareExactSessionAuthority(
 	options: ExactSessionAuthorityOptions,
 ): Promise<ExactSessionAuthorityFixture> {
 	const endpointGeneration = options.endpointGeneration ?? 1;
-	const endpointFile = path.join(options.cwd, ".gjc", "state", "sdk", `${options.sessionId}.json`);
+	const endpointFile = path.join(
+		projectSharedStateRoot(options.cwd, options.agentDir),
+		"sdk",
+		`${options.sessionId}.json`,
+	);
 	await fs.mkdir(path.dirname(endpointFile), { recursive: true });
 	const endpoint = {
 		sessionId: options.sessionId,
@@ -56,7 +61,7 @@ export async function publishExactSessionAuthority(
 	options: ExactSessionAuthorityOptions,
 	authority: ExactSessionAuthorityFixture,
 ): Promise<void> {
-	const stateRoot = path.join(options.cwd, ".gjc", "state");
+	const stateRoot = projectSharedStateRoot(options.cwd, options.agentDir);
 	const indexDirectory = path.join(options.agentDir, "sdk", "sessions");
 	await fs.mkdir(indexDirectory, { recursive: true });
 	// SessionIndex.append() stamps the OS incarnation on every host registration it

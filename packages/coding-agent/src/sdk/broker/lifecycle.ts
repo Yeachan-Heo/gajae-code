@@ -35,6 +35,7 @@ import {
 	WorktreePreparationTimeoutError,
 } from "../../gjc-runtime/launch-worktree";
 import { probeLinuxProcPidSync } from "../../gjc-runtime/linux-proc";
+import { projectSharedStateRoot } from "../../gjc-runtime/session-layout";
 import {
 	GJC_COORDINATOR_SESSION_BRANCH_ENV,
 	GJC_COORDINATOR_SESSION_ID_ENV,
@@ -631,8 +632,9 @@ type Input = Record<string, unknown>;
 // receives the caller's original input after startup admission has expanded it.
 type LifecycleEffectIntentWithDeadline = LifecycleEffectIntent & { lifecycleCleanupDeadlineAt?: number };
 export const isCanonicalSessionId = (value: string): boolean => /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value);
-const defaultStateRoot = (cwd: string) => path.join(path.resolve(cwd), ".gjc", "state");
-const hasDefaultStateRoot = (cwd: string, root: string) => path.resolve(root) === defaultStateRoot(cwd);
+const defaultStateRoot = (cwd: string, agentDir?: string) => projectSharedStateRoot(path.resolve(cwd), agentDir);
+const hasDefaultStateRoot = (cwd: string, root: string, agentDir?: string) =>
+	path.resolve(root) === defaultStateRoot(cwd, agentDir);
 
 export interface SessionLifecycleWorktreeTarget {
 	enabled: true;
@@ -841,6 +843,7 @@ function isSessionLifecycleMcpServers(value: unknown): value is SessionLifecycle
 export function readSessionLifecycleLaunchRequest(
 	value: string | undefined,
 	now = Date.now(),
+	agentDir?: string,
 ): SessionLifecycleLaunchRequest {
 	if (!value) throw new Error("GJC_SDK_LIFECYCLE_REQUEST is required.");
 	const request = JSON.parse(value) as Partial<SessionLifecycleLaunchRequest>;
@@ -854,7 +857,7 @@ export function readSessionLifecycleLaunchRequest(
 		!request.cwd ||
 		typeof request.stateRoot !== "string" ||
 		!request.stateRoot ||
-		!hasDefaultStateRoot(request.cwd, request.stateRoot) ||
+		!hasDefaultStateRoot(request.cwd, request.stateRoot, agentDir) ||
 		(request.sourceSessionId !== undefined &&
 			(typeof request.sourceSessionId !== "string" || !isCanonicalSessionId(request.sourceSessionId))) ||
 		(request.sourceSessionPath !== undefined &&
@@ -1088,11 +1091,11 @@ function lifecycleCwd(input: Input): string | undefined {
 	const cwd = text(input.cwd) ?? text(input.path) ?? text(target?.path);
 	return cwd ? path.resolve(cwd) : undefined;
 }
-function stateRoot(input: Input, cwd: string | undefined): string | undefined {
+function stateRoot(input: Input, cwd: string | undefined, agentDir: string): string | undefined {
 	const target = input.target as Record<string, unknown> | undefined;
 	const root = text(input.stateRoot) ?? text(target?.stateRoot);
 	if (root) return path.resolve(root);
-	return cwd ? path.join(cwd, ".gjc", "state") : undefined;
+	return cwd ? projectSharedStateRoot(cwd, agentDir) : undefined;
 }
 
 function isLifecycleWorktreeTarget(value: unknown): value is SessionLifecycleWorktreeTarget {
@@ -1275,9 +1278,9 @@ async function validateLiveResumeScope(
 ): Promise<ResumeScope | BrokerResponse> {
 	const requestedCwd = lifecycleCwd(input);
 	if (!requestedCwd) return fail("invalid_input", "A target path is required.");
-	const suppliedRoot = stateRoot(input, requestedCwd);
-	if (!suppliedRoot || !hasDefaultStateRoot(requestedCwd, suppliedRoot))
-		return fail("invalid_input", "stateRoot must be the default .gjc/state for cwd.");
+	const suppliedRoot = stateRoot(input, requestedCwd, broker.settings.agentDir);
+	if (!suppliedRoot || !hasDefaultStateRoot(requestedCwd, suppliedRoot, broker.settings.agentDir))
+		return fail("invalid_input", "stateRoot must be the default project state root for cwd.");
 	try {
 		if (!(await fs.stat(requestedCwd)).isDirectory())
 			return fail("invalid_input", "Lifecycle worktree must be a directory.");
@@ -1304,7 +1307,7 @@ async function validateLiveResumeScope(
 			);
 		}
 	}
-	const root = defaultStateRoot(cwd);
+	const root = defaultStateRoot(cwd, broker.settings.agentDir);
 	if (!sameResumeLocator(record, cwd, root))
 		return fail("endpoint_stale", "Live session does not match the requested resume scope.");
 	const sessionPath = text(input.sessionPath);
@@ -1424,7 +1427,7 @@ export function prepareSpawnChildHostLaunch(
 ): SpawnChildHostLaunch {
 	const cwd = path.resolve(input.cwd);
 	const childId = input.childId ?? randomUUID();
-	const stateRoot = defaultStateRoot(cwd);
+	const stateRoot = defaultStateRoot(cwd, broker.settings.agentDir);
 	const effectMarker = randomUUID();
 	const deadlines = deriveLifecycleDeadlines(input.receivedAt ?? Date.now(), DEFAULT_READINESS_TIMEOUT_MS);
 	const request: SessionLifecycleLaunchRequest = {
@@ -5773,9 +5776,9 @@ async function launchInput(
 	const requestedCwd = lifecycleCwd(input);
 	if (!requestedCwd) return fail("invalid_input", "A target path is required.");
 	const sourceCwd = requestedCwd;
-	const suppliedRoot = stateRoot(input, requestedCwd);
-	if (!suppliedRoot || !hasDefaultStateRoot(requestedCwd, suppliedRoot))
-		return fail("invalid_input", "stateRoot must be the default .gjc/state for cwd.");
+	const suppliedRoot = stateRoot(input, requestedCwd, broker.settings.agentDir);
+	if (!suppliedRoot || !hasDefaultStateRoot(requestedCwd, suppliedRoot, broker.settings.agentDir))
+		return fail("invalid_input", "stateRoot must be the default project state root for cwd.");
 
 	try {
 		if (!(await fs.stat(sourceCwd)).isDirectory())
@@ -5822,7 +5825,7 @@ async function launchInput(
 			);
 		}
 	}
-	const resolvedRoot = defaultStateRoot(cwd);
+	const resolvedRoot = defaultStateRoot(cwd, broker.settings.agentDir);
 
 	const requested = sessionId(input);
 	if (requested !== undefined && !isCanonicalSessionId(requested))
@@ -6198,9 +6201,9 @@ async function validateDeletePath(
 	const lexicalCwd = lifecycleCwd(input);
 	if (!sessionPath || !lexicalCwd)
 		return fail("invalid_input", "session.delete requires sessionPath and its configured cwd.");
-	const requestedRoot = stateRoot(input, lexicalCwd);
-	if (!requestedRoot || !hasDefaultStateRoot(lexicalCwd, requestedRoot))
-		return fail("invalid_input", "stateRoot must be the default .gjc/state for cwd.");
+	const requestedRoot = stateRoot(input, lexicalCwd, broker.settings.agentDir);
+	if (!requestedRoot || !hasDefaultStateRoot(lexicalCwd, requestedRoot, broker.settings.agentDir))
+		return fail("invalid_input", "stateRoot must be the default project state root for cwd.");
 	const cwd = canonicalExistingPath(lexicalCwd);
 	const canonicalRequestedRoot = canonicalExistingPath(requestedRoot);
 	if (
@@ -8105,14 +8108,14 @@ function validateLifecycleDeleteMetadataBinding(
 		return fail("terminal_uncertain", "Lifecycle delete metadata cleanup is not authorized for this operation.");
 	const requestedId = sessionId(input);
 	const cwd = lifecycleCwd(input);
-	const requestedRoot = stateRoot(input, cwd);
+	const requestedRoot = stateRoot(input, cwd, broker.settings.agentDir);
 	const canonicalRequestedRoot = requestedRoot ? canonicalExistingPath(requestedRoot) : undefined;
 	if (
 		!requestedId ||
 		!isCanonicalSessionId(requestedId) ||
 		!cwd ||
 		!requestedRoot ||
-		!hasDefaultStateRoot(cwd, requestedRoot) ||
+		!hasDefaultStateRoot(cwd, requestedRoot, broker.settings.agentDir) ||
 		!canonicalRequestedRoot ||
 		cleanup.sessionId !== requestedId ||
 		!cleanup.metadataRoot ||
@@ -8210,7 +8213,7 @@ export async function executeLifecycle(
 	if (!proofBudget) proofBudget = lifecycleProofBudgetFromEffectIntent(broker, entry?.effectIntent);
 	const priorDurableEffects = entry?.durableEffects;
 	const evidenceCwd = entry?.effectIntent?.worktree?.worktreePath ?? lifecycleCwd(input);
-	const root = entry?.effectIntent?.stateRoot ?? stateRoot(input, evidenceCwd);
+	const root = entry?.effectIntent?.stateRoot ?? stateRoot(input, evidenceCwd, broker.settings.agentDir);
 	const marker =
 		entry?.effectMarker && entry.intendedSessionId && root
 			? await readEffectMarker(lifecycleMarkerPath(root, entry.intendedSessionId))

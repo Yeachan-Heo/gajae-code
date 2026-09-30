@@ -2,6 +2,7 @@ import { expect } from "bun:test";
 import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { projectSharedStateRoot } from "../../src/gjc-runtime/session-layout";
 import { startFixtureBrokerWithLeaseForTest } from "../../src/sdk/broker/ensure";
 import { SdkClient } from "../../src/sdk/client";
 import {
@@ -83,7 +84,7 @@ async function managedWorkspace(
 		expect(candidates).toHaveLength(1);
 		return {
 			cwd,
-			stateRoot: path.join(cwd, ".gjc", "state"),
+			stateRoot: projectSharedStateRoot(cwd, agentDir),
 			scope: resolved.scope,
 			source: { id: sessionId, path: sourcePath, bytes: await fs.readFile(sourcePath) },
 		};
@@ -236,7 +237,7 @@ function success(result: BrokerResult): Record<string, unknown> {
 export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 	const repo = await fs.mkdtemp(path.join(tmpdir(), "gjc-sdk-machine-lifecycle-"));
 	const agentDir = path.join(repo, ".gjc", "agent");
-	const stateRoot = path.join(repo, ".gjc", "state");
+	const stateRoot = projectSharedStateRoot(repo, agentDir);
 	const environment = createFixtureBrokerEnvironment(repo, agentDir);
 	const fixtureSessionDir = SessionManager.getDefaultSessionDir(repo, agentDir);
 	const started = await startFixtureBrokerWithLeaseForTest({ agentDir, env: environment });

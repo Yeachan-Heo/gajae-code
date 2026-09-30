@@ -3,7 +3,7 @@
  * runtime for the autoresearch workflow skill.
  *
  * Everything the runtime persists lives under
- * `<cwd>/.gjc/_session-{gjcSessionId}/autoresearch/` (`sessionAutoresearchDir`):
+ * `$GJC_STATE_DIR/_session-{gjcSessionId}/autoresearch/` (`sessionAutoresearchDir`):
  * the mission artifact (`mission.json`) and the append-only ledger
  * (`ledger.jsonl`). The legacy global autoresearch store is intentionally
  * dead: no code path in this module writes there, and every mutation routes
@@ -933,11 +933,11 @@ function renderAutoresearchHelp(): string {
 		"      --json       Output a machine-readable receipt.",
 		"",
 		"STATE",
-		"  Mission/ledger/verdict state persists under .gjc/_session-{sessionid}/autoresearch/.",
+		"  Mission/ledger/verdict state persists under $GJC_STATE_DIR/_session-{sessionid}/autoresearch/.",
 		"  The global autoresearch store is not written.",
 		"",
 		"EXAMPLES",
-		"  $ gjc autoresearch --spec .gjc/_session-abc/specs/deep-interview-my-mission.md --json",
+		"  $ gjc autoresearch --spec $GJC_STATE_DIR/_session-abc/specs/deep-interview-my-mission.md --json",
 		'  $ gjc autoresearch "Optimize the tokenizer throughput"',
 		"  $ gjc autoresearch",
 		"",

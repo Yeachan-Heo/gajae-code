@@ -7,6 +7,7 @@ import { closeModelCache, getBundledModel } from "@gajae-code/ai";
 import { ModelRegistry } from "../src/config/model-registry";
 import type { ExtensionRunner } from "../src/extensibility/extensions/runner";
 import { INTERACTIVE_SELECTOR_RESUME_ORIGIN } from "../src/extensibility/shared-events";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import { createNotificationsExtension, shouldAwaitNotificationStartup } from "../src/sdk/bus/index";
 import { SessionSdkHost } from "../src/sdk/host";
@@ -122,7 +123,7 @@ function createHarness(
 		},
 	} as never;
 
-	const notifDir = path.join(cwd, ".gjc", "state", "sdk");
+	const notifDir = path.join(projectSharedStateRoot(cwd), "sdk");
 	return {
 		handlers,
 		commands,
@@ -199,8 +200,8 @@ test("session_switch publishes successor SDK authority only after AgentSession r
 	createNotificationsExtension(api);
 	const ctx = { cwd, sessionManager: currentSessionManager } as never;
 	const predecessorSessionId = currentSessionManager.getSessionId();
-	const predecessorEndpoint = path.join(cwd, ".gjc", "state", "sdk", `${predecessorSessionId}.json`);
-	const successorEndpoint = path.join(cwd, ".gjc", "state", "sdk", `${targetSessionId}.json`);
+	const predecessorEndpoint = path.join(projectSharedStateRoot(cwd), "sdk", `${predecessorSessionId}.json`);
+	const successorEndpoint = path.join(projectSharedStateRoot(cwd), "sdk", `${targetSessionId}.json`);
 	let session: AgentSession | undefined;
 	let postCommitObserved = false;
 	const extensionRunner = {
@@ -280,7 +281,7 @@ test("turn.prompt preflight rejection returns a correlated failure without an ac
 		},
 	} as never;
 	await handlers.get("session_start")!({ type: "session_start" }, ctx);
-	const endpointPath = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	const endpointPath = path.join(projectSharedStateRoot(cwd), "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointPath), 4000, "preflight endpoint");
 	const { url, token } = readTestSdkEndpoint(endpointPath);
 	const frames: Array<Record<string, unknown>> = [];
@@ -349,7 +350,7 @@ test("accepted turn.prompt submission failures emit a correlated terminal event"
 		},
 	} as never;
 	await handlers.get("session_start")!({ type: "session_start" }, ctx);
-	const endpointPath = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	const endpointPath = path.join(projectSharedStateRoot(cwd), "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointPath), 4000, "terminal failure endpoint");
 	const { url, token } = readTestSdkEndpoint(endpointPath);
 	const frames: Array<Record<string, unknown>> = [];
@@ -565,7 +566,7 @@ test("session_switch rotates SDK authority while preserving topic identity", asy
 
 		await handlers.get("session_start")!({ type: "session_start" }, ctx);
 
-		const notifDir = path.join(cwd, ".gjc", "state", "sdk");
+		const notifDir = path.join(projectSharedStateRoot(cwd), "sdk");
 		const originalEndpoint = path.join(notifDir, `${sid}.json`);
 		await waitFor(() => fs.existsSync(originalEndpoint), 4000, "original endpoint file");
 

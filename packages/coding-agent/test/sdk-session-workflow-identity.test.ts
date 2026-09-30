@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { AsyncJobManager, asyncJobEndpointId } from "@gajae-code/coding-agent/async";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { deepInterviewStatePath } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
-import { sessionUltragoalDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { projectStateRoot, sessionUltragoalDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
@@ -69,9 +69,13 @@ test("SDK tool session separates workflow identity from async endpoint identity"
 		);
 
 		const statePath = deepInterviewStatePath(cwd, sessionId);
-		expect(statePath).toBe(path.join(cwd, ".gjc", `_session-${sessionId}`, "state", "deep-interview-state.json"));
+		expect(statePath).toBe(
+			path.join(projectStateRoot(cwd), `_session-${sessionId}`, "state", "deep-interview-state.json"),
+		);
 		expect(statePath).not.toContain("%5B");
-		expect(sessionUltragoalDir(cwd, sessionId)).toBe(path.join(cwd, ".gjc", `_session-${sessionId}`, "ultragoal"));
+		expect(sessionUltragoalDir(cwd, sessionId)).toBe(
+			path.join(projectStateRoot(cwd), `_session-${sessionId}`, "ultragoal"),
+		);
 	} finally {
 		await session.dispose();
 	}

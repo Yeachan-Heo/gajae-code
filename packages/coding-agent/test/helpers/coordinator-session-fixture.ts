@@ -15,6 +15,7 @@ import {
 	initializeCoordinatorNamespace,
 	withSessionTransaction,
 } from "../../src/coordinator-mcp/question-state";
+import { projectSharedStateRoot } from "../../src/gjc-runtime/session-layout";
 
 /**
  * Coordinator-mcp lifecycle fixtures for the post-#4731 durability layout.
@@ -212,7 +213,7 @@ export function fixtureBrokerRows(
 } {
 	const base = {
 		sessionId,
-		locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+		locator: { cwd: root, worktreeRoot: null, stateRoot: projectSharedStateRoot(root) },
 		endpointGeneration: FIXTURE_ENDPOINT_GENERATION,
 		pid: process.pid,
 		endpointMtimeMs: FIXTURE_ENDPOINT_MTIME_MS,

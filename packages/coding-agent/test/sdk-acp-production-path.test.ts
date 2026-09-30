@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
 import packageJson from "../package.json" with { type: "json" };
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { AcpAgent, acpSkillInvocation } from "../src/modes/acp/acp-agent";
 import { brokerProcessIncarnation, writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { SessionIndex } from "../src/sdk/broker/session-index";
@@ -269,7 +270,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	const brokerSessions: Record<string, unknown>[] = [
 		{
 			sessionId: "owned-session",
-			locator: { cwd, worktreeRoot: null, stateRoot: path.join(cwd, ".gjc", "state") },
+			locator: { cwd, worktreeRoot: null, stateRoot: projectSharedStateRoot(cwd, agentDir) },
 			live: true,
 			endpointGeneration: 1,
 		},
@@ -664,7 +665,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	});
 	servers.push(server);
 	await mkdir(cwd, { recursive: true });
-	const endpointPath = path.join(cwd, ".gjc", "state", "sdk", "owned-session.json");
+	const endpointPath = path.join(projectSharedStateRoot(cwd, agentDir), "sdk", "owned-session.json");
 	await mkdir(path.dirname(endpointPath), { recursive: true });
 	await Bun.write(
 		endpointPath,
@@ -689,7 +690,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	await index.append({
 		type: "host_registered",
 		sessionId: "owned-session",
-		locator: { cwd: cwd, worktreeRoot: null, stateRoot: path.join(cwd, ".gjc", "state") },
+		locator: { cwd: cwd, worktreeRoot: null, stateRoot: projectSharedStateRoot(cwd, agentDir) },
 		endpointGeneration: 1,
 		pid: process.pid,
 		processIncarnation,

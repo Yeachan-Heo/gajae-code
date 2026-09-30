@@ -31,7 +31,7 @@ import {
 	RepositoryBindingError,
 } from "./repository-binding";
 import { GJC_RALPLAN_ARTIFACT_ENV, isRestrictedRoleAgentBash } from "./restricted-role-agent-bash";
-import { gjcRoot, modeStatePath, sessionIdFromDirName, sessionPlansDir } from "./session-layout";
+import { modeStatePath, projectStateRoot, sessionIdFromDirName, sessionPlansDir } from "./session-layout";
 import { resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
 import { migrateWorkflowState } from "./state-migrations";
 import { runNativeStateCommand } from "./state-runtime";
@@ -57,7 +57,7 @@ import {
  *
  * 1. **Consensus handoff**: `gjc ralplan [--interactive] [--deliberate] [--architect <kind>]
  *    [--critic <kind>] [--session-id <id>] "<task>"` validates the documented flag surface,
- *    seeds `.gjc/state/ralplan-state.json`, and updates the shared HUD rail via
+ *    seeds `$GJC_STATE_DIR/state/ralplan-state.json`, and updates the shared HUD rail via
  *    `syncSkillActiveState`. The CLI never *runs* the Planner / Architect / Critic loop itself —
  *    that lives in the bundled `/skill:ralplan` skill — but it accepts every documented flag so
  *    scripted users see a useful response and the active run is visible to the TUI.
@@ -1470,7 +1470,7 @@ async function persistRalplanFinalAdmission(
 async function findExistingRalplanRunOwners(cwd: string, runId: string): Promise<string[]> {
 	let entries: Dirent<string>[];
 	try {
-		entries = await fs.readdir(gjcRoot(cwd), { withFileTypes: true });
+		entries = await fs.readdir(projectStateRoot(cwd), { withFileTypes: true });
 	} catch (error) {
 		const err = error as NodeJS.ErrnoException;
 		if (err.code === "ENOENT" || err.code === "ENOTDIR") return [];

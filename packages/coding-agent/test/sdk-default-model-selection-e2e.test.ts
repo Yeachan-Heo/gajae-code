@@ -6,6 +6,7 @@ import { closeModelCache, Effort } from "@gajae-code/ai";
 import { YAML } from "bun";
 import { ModelRegistry } from "../src/config/model-registry";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { initializeExtensions } from "../src/modes/runtime-init";
 import { createAgentSession, type Q10Model, type Q10SettableThinkingLevel } from "../src/sdk";
 import { startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
@@ -164,7 +165,7 @@ test("model.set executes every Q10-advertised selection and persists the public 
 	});
 	await initializeExtensions(session, { reportSendError: () => {}, reportRuntimeError: () => {} });
 
-	const endpointFile = path.join(tempDir, ".gjc", "state", "sdk", `${session.sessionId}.json`);
+	const endpointFile = path.join(projectSharedStateRoot(tempDir, agentDir), "sdk", `${session.sessionId}.json`);
 	const deadline = Date.now() + 4_000;
 	while (!(await Bun.file(endpointFile).exists())) {
 		if (Date.now() > deadline) throw new Error("Timed out starting SDK host");
@@ -531,7 +532,7 @@ test("selecting a synthetic gajae-code profile remains session-scoped across con
 	});
 	await initializeExtensions(session, { reportSendError: () => {}, reportRuntimeError: () => {} });
 
-	const endpointFile = path.join(tempDir, ".gjc", "state", "sdk", `${session.sessionId}.json`);
+	const endpointFile = path.join(projectSharedStateRoot(tempDir, agentDir), "sdk", `${session.sessionId}.json`);
 	const deadline = Date.now() + 4_000;
 	while (!(await Bun.file(endpointFile).exists())) {
 		if (Date.now() > deadline) throw new Error("Timed out starting SDK host");

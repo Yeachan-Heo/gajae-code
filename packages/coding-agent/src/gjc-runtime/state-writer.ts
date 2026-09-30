@@ -18,6 +18,8 @@ import {
 	activeStateDir as layoutActiveStateDir,
 	auditPath as layoutAuditPath,
 	transactionJournalPath as layoutTransactionJournalPath,
+	projectConfigRoot,
+	projectStateRoot,
 } from "./session-layout";
 import { RequiredOnWriteEnvelopeSchema } from "./state-schema";
 
@@ -241,16 +243,23 @@ function cwdForOptions(options?: StateWriterOptions): string {
 	return path.resolve(options?.cwd ?? process.cwd());
 }
 
+function isStrictlyWithin(root: string, candidate: string): boolean {
+	const relative = path.relative(root, candidate);
+	return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
+/**
+ * Resolve a writer target. Session/runtime state lives under the project's
+ * external state root; legacy-shaped relative `.gjc/...` targets resolve under
+ * the project config root. Anything else is refused.
+ */
 function resolveGjcTarget(targetPath: string, cwd = process.cwd()): string {
 	if (!targetPath.trim()) throw new Error("targetPath is required");
 	const projectRoot = path.resolve(cwd);
-	const gjcRoot = path.join(projectRoot, ".gjc");
 	const resolved = path.resolve(projectRoot, targetPath);
-	const relative = path.relative(gjcRoot, resolved);
-	if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) {
-		throw new Error(`target path must be within project .gjc/**: ${targetPath}`);
-	}
-	return resolved;
+	if (isStrictlyWithin(projectStateRoot(projectRoot), resolved)) return resolved;
+	if (isStrictlyWithin(projectConfigRoot(projectRoot), resolved)) return resolved;
+	throw new Error(`target path must be within the project GJC state root or .gjc/**: ${targetPath}`);
 }
 
 function tempPathFor(filePath: string): string {
@@ -1314,7 +1323,7 @@ export async function removeFileAudited(targetPath: string, options?: StateWrite
 }
 
 /**
- * Active entry files under `.gjc/_session-{id}/state/active/<skill>.json` are authoritative. The
+ * Active entry files under `$GJC_STATE_DIR/_session-{id}/state/active/<skill>.json` are authoritative. The
  * adjacent `skill-active-state.json` file is only a derived cache rebuilt from
  * those entries, so concurrent snapshot rebuilds can race without losing any
  * writer's per-skill state.

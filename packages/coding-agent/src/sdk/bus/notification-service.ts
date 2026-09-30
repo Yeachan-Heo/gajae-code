@@ -30,6 +30,7 @@ function nativeNotification(): NativeNotificationBindings {
 }
 
 import type { Settings } from "../../config/settings";
+import { projectSharedStateRoot } from "../../gjc-runtime/session-layout";
 import { isProcessIncarnation, processIncarnation } from "../broker/process-incarnation";
 import {
 	getNotificationConfig,
@@ -313,7 +314,7 @@ function defaultPidAlive(pid: number): boolean {
 }
 
 function defaultStateRoot(): string {
-	return path.join(process.cwd(), ".gjc", "state");
+	return projectSharedStateRoot(process.cwd());
 }
 
 function endpointDir(stateRoot: string): string {

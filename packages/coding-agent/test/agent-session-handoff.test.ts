@@ -18,6 +18,7 @@ import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import * as activeStateModule from "@gajae-code/coding-agent/skill-state/active-state";
 import { TempDir } from "@gajae-code/utils";
+import { projectStateRoot } from "../src/gjc-runtime/session-layout";
 
 describe("AgentSession handoff", () => {
 	let tempDir: TempDir;
@@ -436,7 +437,7 @@ describe("AgentSession handoff", () => {
 				],
 			}),
 		);
-		const workflowDir = path.join(tempDir.path(), ".gjc", `_session-${session.sessionId}`, "ultragoal");
+		const workflowDir = path.join(projectStateRoot(tempDir.path()), `_session-${session.sessionId}`, "ultragoal");
 		await fs.mkdir(workflowDir, { recursive: true });
 		await Bun.write(
 			path.join(workflowDir, "goals.json"),

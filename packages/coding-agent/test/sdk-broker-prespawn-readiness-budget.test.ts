@@ -1,6 +1,7 @@
 import { expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { ACP_EXTERNAL_CONNECT_TIMEOUT_MS, ACP_SESSION_READINESS_TIMEOUT_MS } from "../src/modes/acp/acp-agent";
 import { Broker, sdkHostStartupConcurrency } from "../src/sdk/broker/broker";
 import {
@@ -60,7 +61,7 @@ test("broker pre-spawn bookkeeping does not spend child semantic readiness", asy
 				"session.create",
 				{
 					cwd: root,
-					stateRoot: path.join(root, ".gjc", "state"),
+					stateRoot: projectSharedStateRoot(root, agentDir),
 					readinessTimeoutMs: 10_000,
 				},
 				"prespawn-budget",

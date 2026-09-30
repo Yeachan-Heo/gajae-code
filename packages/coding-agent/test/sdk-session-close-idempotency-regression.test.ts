@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { Broker } from "../src/sdk/broker/broker";
 import { endpointIncarnation } from "../src/sdk/broker/endpoint-authority";
 import { deriveIdempotencyIdentity } from "../src/sdk/broker/identity";
@@ -86,7 +87,7 @@ test("close does not replay a terminal result across a same-id resumed host gene
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-close-generation-"));
 	roots.push(root);
 	const agentDir = path.join(root, "agent");
-	const stateRoot = path.join(root, ".gjc", "state");
+	const stateRoot = projectSharedStateRoot(root);
 	const sessionId = "resumed-close-generation";
 	const broker = new Broker({ agentDir });
 	brokers.push(broker);
@@ -128,7 +129,7 @@ test("a terminal close error can be retried for the current authority without re
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-close-terminal-error-"));
 	roots.push(root);
 	const agentDir = path.join(root, "agent");
-	const stateRoot = path.join(root, ".gjc", "state");
+	const stateRoot = projectSharedStateRoot(root);
 	const sessionId = "terminal-error-close";
 	const broker = new Broker({ agentDir });
 	brokers.push(broker);
@@ -155,7 +156,7 @@ test("a repeated close for one host generation remains idempotent", async () => 
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-close-duplicate-"));
 	roots.push(root);
 	const agentDir = path.join(root, "agent");
-	const stateRoot = path.join(root, ".gjc", "state");
+	const stateRoot = projectSharedStateRoot(root);
 	const sessionId = "duplicate-close-generation";
 	const broker = new Broker({ agentDir });
 	brokers.push(broker);
@@ -174,7 +175,7 @@ test("an explicit close key cannot be reused for a different target authority", 
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-close-cross-target-"));
 	roots.push(root);
 	const agentDir = path.join(root, "agent");
-	const stateRoot = path.join(root, ".gjc", "state");
+	const stateRoot = projectSharedStateRoot(root);
 	const broker = new Broker({ agentDir });
 	brokers.push(broker);
 	await broker.start();

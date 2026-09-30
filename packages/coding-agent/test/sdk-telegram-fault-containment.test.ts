@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { parseTopicRegistryState, TopicRegistry } from "../src/sdk/bus/topic-registry";
 import { type NotificationSubscription, SessionRouter, type SessionRouterClient } from "../src/sdk/router";
@@ -23,7 +24,7 @@ async function routerHarness(
 ): Promise<RouterHarness> {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-telegram-fault-"));
 	const agentDir = path.join(root, ".gjc", "agent");
-	const stateRoot = path.join(root, ".gjc", "state");
+	const stateRoot = projectSharedStateRoot(root, agentDir);
 	const sessionId = "telegram-fault-session";
 	const endpointFile = path.join(stateRoot, "sdk", `${sessionId}.json`);
 	fs.mkdirSync(path.dirname(endpointFile), { recursive: true });

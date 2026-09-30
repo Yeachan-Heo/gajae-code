@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
+import { projectSharedStateRoot } from "../../gjc-runtime/session-layout";
 import {
 	resolvedScopeV1,
 	resolveScopeRequest,
@@ -490,7 +491,10 @@ function validSessionCloseTarget(target: Readonly<Record<string, unknown>>): boo
 	);
 }
 
-export function validateSessionReconcileUncertainTarget(value: unknown): value is SessionReconcileUncertainTarget {
+export function validateSessionReconcileUncertainTarget(
+	value: unknown,
+	agentDir?: string,
+): value is SessionReconcileUncertainTarget {
 	if (!isRecord(value)) return false;
 	const target = value;
 	const bounded = (value: unknown, max: number): value is string =>
@@ -502,7 +506,7 @@ export function validateSessionReconcileUncertainTarget(value: unknown): value i
 		path.isAbsolute(target.cwd) &&
 		bounded(target.stateRoot, 4096) &&
 		path.isAbsolute(target.stateRoot) &&
-		path.resolve(target.stateRoot) === path.join(path.resolve(target.cwd), ".gjc", "state") &&
+		path.resolve(target.stateRoot) === projectSharedStateRoot(path.resolve(target.cwd), agentDir) &&
 		typeof target.endpointGeneration === "number" &&
 		Number.isSafeInteger(target.endpointGeneration) &&
 		target.endpointGeneration > 0 &&
@@ -518,7 +522,10 @@ export function validateSessionReconcileUncertainTarget(value: unknown): value i
 }
 
 /** Validates lifecycle authority and shape without contacting the Broker. */
-export function validateSessionLifecycleMutationRequest(request: unknown): SessionLifecycleMutationValidation {
+export function validateSessionLifecycleMutationRequest(
+	request: unknown,
+	agentDir?: string,
+): SessionLifecycleMutationValidation {
 	const record = isRecord(request) ? request : {};
 	const operation = operationOf(record.operation);
 	if (operation === "session.list")
@@ -533,7 +540,7 @@ export function validateSessionLifecycleMutationRequest(request: unknown): Sessi
 		return failure(operation, "terminal", "invalid_request", "target must be an object");
 	if (operation === "session.close" && !validSessionCloseTarget(record.target))
 		return failure(operation, "terminal", "invalid_input", "session.close endpoint authority is invalid");
-	if (operation === "session.reconcile_uncertain" && !validateSessionReconcileUncertainTarget(record.target))
+	if (operation === "session.reconcile_uncertain" && !validateSessionReconcileUncertainTarget(record.target, agentDir))
 		return failure(
 			operation,
 			"terminal",
@@ -970,9 +977,12 @@ function brokerSuccess(value: unknown): unknown | undefined {
 
 export class SessionLifecycleService {
 	readonly #client: SessionLifecycleClient;
+	/** Agent dir whose project state roots this service addresses; undefined means the process default. */
+	readonly #stateAgentDir: string | undefined;
 
-	constructor(client: SessionLifecycleClient) {
+	constructor(client: SessionLifecycleClient, stateAgentDir?: string) {
 		this.#client = client;
+		this.#stateAgentDir = stateAgentDir;
 	}
 
 	async lookup(request: SessionLifecycleLookupRequest): Promise<SessionLifecycleLookupOutcome> {
@@ -1180,7 +1190,7 @@ export class SessionLifecycleService {
 		| SessionDeleteOutcome
 		| SessionReconcileUncertainOutcome
 	> {
-		const validation = validateSessionLifecycleMutationRequest(request);
+		const validation = validateSessionLifecycleMutationRequest(request, this.#stateAgentDir);
 		if (!validation.ok) return validation;
 		const { operation, actor, requestKey, target } = validation;
 		const normalizedTarget =
@@ -1188,10 +1198,9 @@ export class SessionLifecycleService {
 				? {
 						...target,
 						cwd: path.resolve((target as unknown as SessionReconcileUncertainTarget).cwd),
-						stateRoot: path.join(
+						stateRoot: projectSharedStateRoot(
 							path.resolve((target as unknown as SessionReconcileUncertainTarget).cwd),
-							".gjc",
-							"state",
+							this.#stateAgentDir,
 						),
 					}
 				: target;

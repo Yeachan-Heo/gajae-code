@@ -9,6 +9,7 @@ import * as native from "@gajae-code/natives";
 import { getSessionsDir } from "@gajae-code/utils";
 
 import { lifecycleArgs } from "../src/commands/sdk";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import {
 	Broker,
 	type BrokerResponse,
@@ -497,11 +498,13 @@ it("SDK lifecycle model presets reach the session host parser", async () => {
 		JSON.stringify({
 			operation: "session.create",
 			sessionId: "session-1",
-			stateRoot: path.join(cwd, ".gjc", "state"),
+			stateRoot: projectSharedStateRoot(cwd, agentDir),
 			cwd,
 			modelPreset: "codex-eco",
 			...deriveLifecycleDeadlines(Date.now(), 10_000),
 		}),
+		undefined,
+		agentDir,
 	);
 	try {
 		expect((await lifecycleArgs(request, cwd, agentDir)).mpreset).toBe("codex-eco");
@@ -518,11 +521,13 @@ it("SDK lifecycle explicit model pins reach the session host parser and validate
 		JSON.stringify({
 			operation: "session.create",
 			sessionId: "session-1",
-			stateRoot: path.join(cwd, ".gjc", "state"),
+			stateRoot: projectSharedStateRoot(cwd, agentDir),
 			cwd,
 			modelId: "cursor/claude-fable-5-xhigh",
 			...deriveLifecycleDeadlines(Date.now(), 10_000),
 		}),
+		undefined,
+		agentDir,
 	);
 	try {
 		expect(request.modelId).toBe("cursor/claude-fable-5-xhigh");
@@ -533,6 +538,8 @@ it("SDK lifecycle explicit model pins reach the session host parser and validate
 					...request,
 					modelId: "   ",
 				}),
+				undefined,
+				agentDir,
 			),
 		).toThrow("GJC_SDK_LIFECYCLE_REQUEST is invalid.");
 	} finally {
@@ -594,7 +601,7 @@ it("SDK lifecycle launch requests preserve validated ACP MCP transports", async 
 	const request: SessionLifecycleLaunchRequest = {
 		operation: "session.create",
 		sessionId: "session-1",
-		stateRoot: path.join(cwd, ".gjc", "state"),
+		stateRoot: projectSharedStateRoot(cwd, agentDir),
 		cwd,
 		mcpServers: [
 			{
@@ -614,13 +621,17 @@ it("SDK lifecycle launch requests preserve validated ACP MCP transports", async 
 		...deriveLifecycleDeadlines(Date.now(), 10_000),
 	};
 	try {
-		expect(readSessionLifecycleLaunchRequest(JSON.stringify(request)).mcpServers).toEqual(request.mcpServers);
+		expect(readSessionLifecycleLaunchRequest(JSON.stringify(request), undefined, agentDir).mcpServers).toEqual(
+			request.mcpServers,
+		);
 		expect(() =>
 			readSessionLifecycleLaunchRequest(
 				JSON.stringify({
 					...request,
 					mcpServers: [{ name: "Air", command: "relative-command", args: [] }],
 				}),
+				undefined,
+				agentDir,
 			),
 		).toThrow("GJC_SDK_LIFECYCLE_REQUEST is invalid.");
 	} finally {
@@ -636,7 +647,7 @@ it("initializes the managed target scope before lifecycle fork arguments expose 
 		operation: "session.fork",
 		sessionId: "fork-destination",
 		cwd,
-		stateRoot: path.join(cwd, ".gjc", "state"),
+		stateRoot: projectSharedStateRoot(cwd, agentDir),
 		...deriveLifecycleDeadlines(Date.now(), 10_000),
 		sourceCwd: cwd,
 		sourceSessionId: "source-session",
@@ -660,7 +671,7 @@ it("exposes the same prepared managed fork scope on repeated lifecycle argument 
 		operation: "session.fork",
 		sessionId: "fork-destination",
 		cwd,
-		stateRoot: path.join(cwd, ".gjc", "state"),
+		stateRoot: projectSharedStateRoot(cwd, agentDir),
 		...deriveLifecycleDeadlines(Date.now(), 10_000),
 		sourceCwd: cwd,
 		sourceSessionId: "source-session",
@@ -691,7 +702,7 @@ it("SDK lifecycle launch requests retain Coordinator verifier metadata but rejec
 	const request = {
 		operation: "session.create",
 		sessionId: "session-1",
-		stateRoot: path.join(cwd, ".gjc", "state"),
+		stateRoot: projectSharedStateRoot(cwd),
 		cwd,
 		...deriveLifecycleDeadlines(Date.now(), 10_000),
 	};
@@ -715,7 +726,7 @@ it("SDK lifecycle transcript authority requires and preserves a full sha256 iden
 	const request = {
 		operation: "session.resume",
 		sessionId: "session-1",
-		stateRoot: path.join(cwd, ".gjc", "state"),
+		stateRoot: projectSharedStateRoot(cwd),
 		cwd,
 		sessionPath: "/agent/sessions/session-1.jsonl",
 		sessionIdentity: {
@@ -2317,7 +2328,7 @@ describe("SDK broker identity and discovery", () => {
 		const requestedCwd = path.join(dir, "requested-workspace");
 		await fs.mkdir(liveCwd, { recursive: true });
 		await fs.mkdir(requestedCwd, { recursive: true });
-		const stateRoot = path.join(liveCwd, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(liveCwd, dir);
 		const sessionId = "shared-live-session";
 		const sessionDir = SessionManager.getDefaultSessionDir(liveCwd, dir);
 		const sessionPath = path.join(sessionDir, `${sessionId}.jsonl`);
@@ -2376,7 +2387,7 @@ describe("SDK broker identity and discovery", () => {
 	it("enforces a supplied saved-session identity before live resume", async () => {
 		const dir = await temp();
 		const cwd = path.join(dir, "repo");
-		const stateRoot = path.join(cwd, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(cwd, dir);
 		const broker = new Broker({ agentDir: dir });
 		let saved: SessionManager | undefined;
 		try {
@@ -2446,7 +2457,7 @@ describe("SDK broker identity and discovery", () => {
 	it("does not replay a lifecycle success onto a replacement endpoint incarnation", async () => {
 		const dir = await temp();
 		const cwd = path.join(dir, "repo");
-		const stateRoot = path.join(cwd, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(cwd, dir);
 		const broker = new Broker({ agentDir: dir });
 		let saved: SessionManager | undefined;
 		try {
@@ -2553,7 +2564,7 @@ describe("SDK broker identity and discovery", () => {
 	it("replays a lifecycle success when the indexed mtime matches the live file (#5376)", async () => {
 		const dir = await temp();
 		const cwd = path.join(dir, "repo");
-		const stateRoot = path.join(cwd, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(cwd, dir);
 		const broker = new Broker({ agentDir: dir });
 		let saved: SessionManager | undefined;
 		try {
@@ -2710,12 +2721,15 @@ describe("SDK broker identity and discovery", () => {
 			expect(
 				await broker.handleRequest(
 					"session.lookup",
-					{ operation: "session.create", target: { ...target, stateRoot: path.join(otherCwd, ".gjc", "state") } },
+					{
+						operation: "session.create",
+						target: { ...target, stateRoot: projectSharedStateRoot(otherCwd, agentDir) },
+					},
 					key,
 				),
 			).toEqual({
 				ok: false,
-				error: { code: "invalid_input", message: "stateRoot must be the default .gjc/state for cwd." },
+				error: { code: "invalid_input", message: "stateRoot must be the default project state root for cwd." },
 			});
 			expect(launchAttempts).toBe(1);
 		} finally {
@@ -2883,8 +2897,8 @@ describe("SDK broker identity and discovery", () => {
 		}
 	});
 	it("replays exact-target terminal legacy creates and expires opaque cross-target key history", async () => {
-		const normalizedCreateInput = (input: Record<string, unknown>): Record<string, unknown> => {
-			const normalized = normalizeBrokerInput("session.create", input);
+		const normalizedCreateInput = (input: Record<string, unknown>, agentDir: string): Record<string, unknown> => {
+			const normalized = normalizeBrokerInput("session.create", input, agentDir);
 			if (!("input" in normalized)) throw new Error("Expected valid legacy create fixture input");
 			return normalized.input;
 		};
@@ -2895,11 +2909,11 @@ describe("SDK broker identity and discovery", () => {
 		const exactRoot = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-legacy-create-exact-"));
 		const exactAgentDir = path.join(exactRoot, "agent");
 		const exactInput = { cwd: path.join(exactRoot, "workspace") };
-		const exactNormalizedInput = normalizedCreateInput(exactInput);
+		const exactNormalizedInput = normalizedCreateInput(exactInput, exactAgentDir);
 		await fs.mkdir(exactInput.cwd, { recursive: true });
 		const exactKey = "legacy-target-create-key";
 		const exactTargetHash = createHash("sha256")
-			.update(JSON.stringify(lifecycleTargetForTest("session.create", exactNormalizedInput)))
+			.update(JSON.stringify(lifecycleTargetForTest("session.create", exactNormalizedInput, exactAgentDir)))
 			.digest("hex");
 		const exactRequestHash = requestHashFor(exactNormalizedInput);
 		const exactIdentity = await deriveLegacyTargetIdentity(
@@ -2933,12 +2947,12 @@ describe("SDK broker identity and discovery", () => {
 		const changedAgentDir = path.join(changedRoot, "agent");
 		const priorInput = { cwd: path.join(changedRoot, "prior-workspace") };
 		const changedInput = { cwd: path.join(changedRoot, "new-workspace") };
-		const normalizedPriorInput = normalizedCreateInput(priorInput);
+		const normalizedPriorInput = normalizedCreateInput(priorInput, changedAgentDir);
 		await fs.mkdir(priorInput.cwd, { recursive: true });
 		await fs.mkdir(changedInput.cwd, { recursive: true });
 		const changedKey = "legacy-target-create-key";
 		const priorTargetHash = createHash("sha256")
-			.update(JSON.stringify(lifecycleTargetForTest("session.create", normalizedPriorInput)))
+			.update(JSON.stringify(lifecycleTargetForTest("session.create", normalizedPriorInput, changedAgentDir)))
 			.digest("hex");
 		const priorRequestHash = requestHashFor(normalizedPriorInput);
 		const priorIdentity = await deriveLegacyTargetIdentity(
@@ -3161,7 +3175,7 @@ describe("SDK broker identity and discovery", () => {
 				),
 			).toEqual({
 				ok: false,
-				error: { code: "invalid_input", message: "stateRoot must be the default .gjc/state for cwd." },
+				error: { code: "invalid_input", message: "stateRoot must be the default project state root for cwd." },
 			});
 		} finally {
 			await fs.rm(dir, { recursive: true, force: true });
@@ -3171,7 +3185,7 @@ describe("SDK broker identity and discovery", () => {
 	it("fails closed on retained artifacts across retry without deleting transcript authority", async () => {
 		const dir = await temp();
 		const cwd = path.join(dir, "workspace");
-		const stateRoot = path.join(cwd, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(cwd, dir);
 		const sessionId = "verified-delete";
 		const sessionPath = await managedSessionPath(dir, cwd, sessionId);
 		const artifactsDir = sessionPath.slice(0, -6);
@@ -3230,7 +3244,7 @@ describe("SDK broker identity and discovery", () => {
 	it("removes an authorized root-only artifact quarantine before transcript cleanup", async () => {
 		const dir = await temp();
 		const cwd = path.join(dir, "workspace");
-		const stateRoot = path.join(cwd, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(cwd, dir);
 		const sessionId = "root-only-retained-artifacts";
 		const sessionPath = await managedSessionPath(dir, cwd, sessionId);
 		const artifactsDir = sessionPath.slice(0, -6);
@@ -3364,7 +3378,7 @@ describe("SDK broker identity and discovery", () => {
 	it("keeps transcript completion pending through canonical artifact reappearance", async () => {
 		const dir = await temp();
 		const cwd = path.join(dir, "workspace");
-		const stateRoot = path.join(cwd, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(cwd, dir);
 		const sessionId = "canonical-after-artifacts-removed";
 		const sessionPath = await managedSessionPath(dir, cwd, sessionId);
 		const artifactsDir = sessionPath.slice(0, -6);
@@ -3499,7 +3513,7 @@ describe("SDK broker identity and discovery", () => {
 		const dir = await temp();
 		const cwd = path.join(dir, "workspace");
 		const cwdAlias = path.join(dir, "workspace-alias");
-		const stateRoot = path.join(cwd, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(cwd, dir);
 		const sessionId = "retained-artifact-side-path";
 		const sessionPath = await managedSessionPath(dir, cwd, sessionId);
 		const artifactsDir = sessionPath.slice(0, -6);
@@ -3649,7 +3663,7 @@ describe("SDK broker identity and discovery", () => {
 	it("refuses an out-of-plan root-only artifact quarantine across replay", async () => {
 		const dir = await temp();
 		const cwd = path.join(dir, "workspace");
-		const stateRoot = path.join(cwd, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(cwd, dir);
 		const sessionId = "foreign-root-only-artifacts";
 		const sessionPath = await managedSessionPath(dir, cwd, sessionId);
 		const artifactsDir = sessionPath.slice(0, -6);
@@ -3773,7 +3787,7 @@ describe("SDK broker identity and discovery", () => {
 						cwd,
 						sessionsRoot: path.join(dir, "sessions"),
 						transcriptPath: sessionPath,
-						metadataRoot: path.join(cwd, ".gjc", "state"),
+						metadataRoot: projectSharedStateRoot(cwd, dir),
 						artifactsIdentity: { dev: "7", ino: "8", nlink: "1", size: 9, mtimeNs: "10", sha256: "a".repeat(64) },
 						transcriptIdentity: { dev: "5", ino: "6", nlink: "1", size: 7, mtimeNs: "8", sha256: "b".repeat(64) },
 						detachedArtifactsPath,
@@ -3805,7 +3819,7 @@ describe("SDK broker identity and discovery", () => {
 	it("replays transcript cleanup after artifact completion without reattaching completed artifact authority", async () => {
 		const dir = await temp();
 		const cwd = path.join(dir, "workspace");
-		const stateRoot = path.join(cwd, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(cwd, dir);
 		const sessionId = "artifacts-removed-replay";
 		const sessionPath = await managedSessionPath(dir, cwd, sessionId);
 		const artifactsDir = sessionPath.slice(0, -6);
@@ -4031,7 +4045,7 @@ describe("SDK broker identity and discovery", () => {
 	it("retries cleanup pending after restart, then reopens and exactly replays successful metadata cleanup", async () => {
 		const dir = await temp();
 		const cwd = path.join(dir, "workspace");
-		const stateRoot = path.join(cwd, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(cwd, dir);
 		const sessionId = "metadata-cleanup-pending";
 		const sessionPath = await managedSessionPath(dir, cwd, sessionId);
 		const markerPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`);
@@ -4086,7 +4100,7 @@ describe("SDK broker identity and discovery", () => {
 	it("advances typed retained cleanup authority to completion and exactly replays it", async () => {
 		const dir = await temp();
 		const cwd = path.join(dir, "workspace");
-		const stateRoot = path.join(cwd, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(cwd, dir);
 		const sessionId = "retained-authority";
 		const sessionPath = await managedSessionPath(dir, cwd, sessionId);
 		const markerPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`);
@@ -4188,7 +4202,7 @@ describe("SDK broker identity and discovery", () => {
 
 	it("routes confirmed operator terminal aborts with the indexed private capability", async () => {
 		const dir = await temp();
-		const stateRoot = path.join(dir, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(dir, dir);
 		const sessionId = "operator-abort";
 		const lifecycleRequestId = "operator-abort-capability";
 		const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
@@ -4347,7 +4361,7 @@ describe("SDK broker identity and discovery", () => {
 
 	it("returns endpoint_stale without dispatching close after endpoint generation rotation", async () => {
 		const dir = await temp();
-		const stateRoot = path.join(dir, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(dir, dir);
 		const sessionId = "rotating";
 		const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
 		const broker = new Broker({ agentDir: dir });
@@ -4430,7 +4444,7 @@ describe("SDK broker identity and discovery", () => {
 
 	it("preserves a typed session-host close failure without signal fallback", async () => {
 		const dir = await temp();
-		const stateRoot = path.join(dir, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(dir, dir);
 		const sessionId = "flush-failure";
 		const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
 		const broker = new Broker({ agentDir: dir });

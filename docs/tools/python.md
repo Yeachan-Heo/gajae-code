@@ -50,9 +50,9 @@ The session's kernel is disposed on:
 
 ## Transcript recording
 
-The runtime records one JSONL entry per `execute` at `.gjc/_session-{sessionid}/ipykernels/{datetime}-{kernelid}/transcript.jsonl`, containing `timestamp`, `code`, `output`, `exitCode`, `cancelled`, and `truncated`. `{kernelid}` is the executor identity captured when the kernel is acquired, so a real kernel replacement uses a new transcript directory. `clear` records no entry.
+The runtime records one JSONL entry per `execute` at `$GJC_STATE_DIR/_session-{sessionid}/ipykernels/{datetime}-{kernelid}/transcript.jsonl`, containing `timestamp`, `code`, `output`, `exitCode`, `cancelled`, and `truncated`. `{kernelid}` is the executor identity captured when the kernel is acquired, so a real kernel replacement uses a new transcript directory. `clear` records no entry.
 
-Display artifacts use the stable session-rooted directory `.gjc/_session-{sessionid}/ipykernels/artifacts`, rather than a per-kernel transcript directory.
+Display artifacts use the stable session-rooted directory `$GJC_STATE_DIR/_session-{sessionid}/ipykernels/artifacts`, rather than a per-kernel transcript directory.
 
 ## Related
 

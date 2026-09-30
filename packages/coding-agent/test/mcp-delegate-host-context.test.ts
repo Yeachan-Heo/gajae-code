@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { activeSnapshotPath } from "../src/gjc-runtime/session-layout";
+import { activeSnapshotPath, projectStateRoot } from "../src/gjc-runtime/session-layout";
 import {
 	detectMcpDelegateFlowActivation,
 	listMcpDelegateHostContexts,
@@ -190,7 +190,7 @@ describe("MCP delegate-flow host context", () => {
 			await fs.utimes(contextPath, new Date(oldRecordedAt), new Date(oldRecordedAt));
 		}
 		for (let index = 65; index < 69; index++) {
-			await fs.mkdir(path.join(root, ".gjc", `_session-session-${String(index).padStart(3, "0")}`), {
+			await fs.mkdir(path.join(projectStateRoot(root), `_session-session-${String(index).padStart(3, "0")}`), {
 				recursive: true,
 			});
 		}
@@ -238,7 +238,7 @@ describe("MCP delegate-flow host context", () => {
 				},
 			],
 		] as const) {
-			const contextPath = path.join(root, ".gjc", directory, "state", "mcp-delegate-host-context.json");
+			const contextPath = path.join(projectStateRoot(root), directory, "state", "mcp-delegate-host-context.json");
 			await fs.mkdir(path.dirname(contextPath), { recursive: true });
 			await fs.writeFile(contextPath, JSON.stringify(context), "utf8");
 		}

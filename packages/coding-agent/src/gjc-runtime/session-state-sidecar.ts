@@ -20,7 +20,7 @@ import {
 } from "../coordinator-mcp/durability";
 import { reduceTerminalReceiptState } from "../sdk/receipt-state";
 import { TOOL_CATALOG } from "../tools/tool-catalog.generated";
-import { sessionRoot, sessionRuntimeDir, sessionRuntimeStatePath } from "./session-layout";
+import { projectStateRoot, sessionRoot, sessionRuntimeDir, sessionRuntimeStatePath } from "./session-layout";
 import { SessionStateLockUnavailableError, withSessionStateFileLock } from "./session-state-lock";
 import {
 	isValidOwnerIntent,
@@ -1109,9 +1109,9 @@ class ForeignRuntimeStateError extends Error {
  * - it already reached a terminal state and is explicitly not live, so no owner can still
  *   be writing to it (`live` must be `false` rather than merely absent: an older or
  *   truncated marker that omits the field says nothing about whether its owner runs);
- * - the marker file itself lives inside the current workspace, which is what distinguishes
- *   a session directory that travelled here with its repository from one that still
- *   belongs to a different workspace on this machine.
+ * - the marker file itself lives under the current workspace's project state root
+ *   ({@link projectStateRoot}), which is what distinguishes a session directory keyed to
+ *   this workspace from one that belongs to a different workspace on this machine.
  *
  * The second condition is the load-bearing one. Terminal-and-not-live alone would let a
  * finished `C:\...` session be adopted by a `D:\...` workspace, and those are unrelated
@@ -1125,7 +1125,7 @@ function isAdoptableForeignRuntimeState(
 	if (previous.live !== false) return false;
 	if (previous.state !== "completed" && previous.state !== "errored") return false;
 	if (!stateFile) return false;
-	return pathIsInside(stateFile, input.cwd, input.platform);
+	return pathIsInside(stateFile, projectStateRoot(input.cwd), input.platform);
 }
 
 /** True when `candidate` resolves to `root` itself or something beneath it. */
@@ -1948,9 +1948,13 @@ function assertNoSymlinkDirectoryComponents(root: string, directory: string): vo
 }
 
 function confinedJournalPath(cwd: string, sessionId: string, platform: NodeJS.Platform): string {
-	const canonicalRoot = fsSync.realpathSync(cwd);
-	const rawJournalFile = runtimeStateRescopeJournalPath(canonicalRoot, sessionId);
-	assertNoSymlinkDirectoryComponents(canonicalRoot, path.dirname(rawJournalFile));
+	const canonicalCwd = fsSync.realpathSync(cwd);
+	// The journal lives under the project's runtime state root (outside the
+	// workspace); confinement is checked against that root, not the cwd.
+	const stateRoot = projectStateRoot(canonicalCwd);
+	const canonicalRoot = canonicalStateFilePath(stateRoot);
+	const rawJournalFile = runtimeStateRescopeJournalPath(canonicalCwd, sessionId);
+	assertNoSymlinkDirectoryComponents(stateRoot, path.dirname(rawJournalFile));
 	const journalFile = canonicalStateFilePath(rawJournalFile);
 	const pathImpl = platform === "win32" ? path.win32 : path;
 	const relative = pathImpl.relative(canonicalRoot, journalFile);

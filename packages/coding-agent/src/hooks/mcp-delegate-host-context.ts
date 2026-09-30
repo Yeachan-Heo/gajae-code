@@ -1,7 +1,7 @@
 import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { sessionStateDir } from "../gjc-runtime/session-layout";
+import { GJC_SESSION_PREFIX, projectStateRoot, sessionStateDir } from "../gjc-runtime/session-layout";
 
 export const GJC_MCP_DELEGATE_FLOW_ACTIVATION = "$gjc-mcp-delegate-flow";
 
@@ -110,7 +110,7 @@ export async function listMcpDelegateHostContexts(
 ): Promise<{ contexts: McpDelegateHostContextV1[]; failures: number }> {
 	let entries: Dirent[];
 	try {
-		entries = await fs.readdir(path.join(cwd, ".gjc"), { withFileTypes: true });
+		entries = await fs.readdir(projectStateRoot(cwd), { withFileTypes: true });
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { contexts: [], failures: 0 };
 		return { contexts: [], failures: 1 };
@@ -118,8 +118,8 @@ export async function listMcpDelegateHostContexts(
 	let failures = 0;
 	const candidates: Array<{ path: string; mtimeMs: number }> = [];
 	for (const entry of entries) {
-		if (!entry.isDirectory() || !entry.name.startsWith("_session-")) continue;
-		const contextPath = path.join(cwd, ".gjc", entry.name, "state", "mcp-delegate-host-context.json");
+		if (!entry.isDirectory() || !entry.name.startsWith(GJC_SESSION_PREFIX)) continue;
+		const contextPath = path.join(projectStateRoot(cwd), entry.name, "state", "mcp-delegate-host-context.json");
 		try {
 			const stat = await fs.stat(contextPath);
 			if (stat.isFile() && stat.size <= MAX_HOST_CONTEXT_BYTES)

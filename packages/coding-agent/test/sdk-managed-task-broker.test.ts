@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { Broker, setManagedCloseWaitForTest } from "../src/sdk/broker/broker";
 import { readBrokerDiscovery } from "../src/sdk/broker/discovery";
 import {
@@ -162,7 +163,7 @@ async function attest(broker: Broker, cwd: string): Promise<void> {
 		await broker.index.append({
 			type: "host_registered",
 			sessionId: ownerId,
-			locator: { cwd, worktreeRoot: null, stateRoot: path.join(cwd, ".gjc", "state") },
+			locator: { cwd, worktreeRoot: null, stateRoot: projectSharedStateRoot(cwd) },
 			endpointGeneration,
 			pid: process.pid,
 			hostIncarnation: incarnation,

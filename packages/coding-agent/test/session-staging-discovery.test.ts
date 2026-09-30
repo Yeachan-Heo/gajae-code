@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { projectStateRoot } from "../src/gjc-runtime/session-layout";
 import {
 	listProjectSessionTranscriptFiles,
 	resolveResumableSession,
@@ -21,7 +22,7 @@ describe("staged session discovery exclusion", () => {
 	it("hides staged project transcripts while retaining a sibling transcript", async () => {
 		const cwd = await mkdtemp(path.join(tmpdir(), "gjc-discovery-cwd-"));
 		const agentDir = await mkdtemp(path.join(tmpdir(), "gjc-discovery-agent-"));
-		const scope = path.join(cwd, ".gjc", "sessions", "scope");
+		const scope = path.join(projectStateRoot(cwd), "sessions", "scope");
 		const staged = path.join(scope, SESSION_STAGING_DIRNAME, "attempt.jsonl");
 		const sibling = path.join(scope, "sibling.jsonl");
 		await makeTranscript(staged, cwd, "staged-id");
@@ -50,8 +51,8 @@ describe("staged session discovery exclusion", () => {
 
 	it("excludes sessions/<cwd>/.staging and agent-session/.staging from all four readers individually", async () => {
 		const cwd = await mkdtemp(path.join(tmpdir(), "gjc-four-reader-cwd-"));
-		const projectScope = path.join(cwd, ".gjc", "sessions", "cwd-scope");
-		const agentSessionScope = path.join(cwd, ".gjc", "agent-session");
+		const projectScope = path.join(projectStateRoot(cwd), "sessions", "cwd-scope");
+		const agentSessionScope = path.join(projectStateRoot(cwd), "agent-session");
 		const projectStaged = path.join(projectScope, SESSION_STAGING_DIRNAME, "project-staged.jsonl");
 		const agentSessionStaged = path.join(agentSessionScope, SESSION_STAGING_DIRNAME, "agent-staged.jsonl");
 		const projectSibling = path.join(projectScope, "project-sibling.jsonl");

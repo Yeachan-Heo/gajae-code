@@ -7,6 +7,7 @@ import * as autoresearchGit from "@gajae-code/coding-agent/autoresearch/git";
 import {
 	activeSnapshotPath,
 	modeStatePath,
+	projectSharedStateRoot,
 	sessionStateDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
@@ -1062,6 +1063,29 @@ describe("workflow mutation guard", () => {
 			assertWorkflowMutationRawPathsAllowed({
 				cwd,
 				rawPaths: [".gjc/state/ralplan-state.json"],
+				forceOverride: true,
+			}),
+		).rejects.toBeInstanceOf(ToolError);
+	});
+
+	it("guards the external project state root like in-project .gjc/**", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveDeepInterview(cwd);
+		const modePath = modeStatePath(cwd, "session-a", "deep-interview");
+		expect(path.relative(cwd, modePath).startsWith("..")).toBe(true);
+
+		const direct = await getWorkflowMutationDecision({
+			cwd,
+			sessionId: "session-a",
+			tool: tool("write"),
+			args: { path: modePath, content: "{}" },
+		});
+		expect(direct.blocked).toBe(true);
+
+		await expect(
+			assertWorkflowMutationRawPathsAllowed({
+				cwd,
+				rawPaths: [path.join(projectSharedStateRoot(cwd), "sdk", "endpoint.json")],
 				forceOverride: true,
 			}),
 		).rejects.toBeInstanceOf(ToolError);

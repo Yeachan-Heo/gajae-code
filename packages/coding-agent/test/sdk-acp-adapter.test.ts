@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
 import packageJson from "../package.json" with { type: "json" };
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { AcpAgent, acpRequestFailure } from "../src/modes/acp/acp-agent";
 import { AcpSdkAdapter, type AcpSdkAdapterError, acpMcpLaunchFailure } from "../src/sdk/acp";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
@@ -514,7 +515,7 @@ test("ACP reconcile_uncertain validates proof and projects an opaque result", as
 			retired: true,
 			ledgerState: "terminal_error",
 			indexType: "session_closed",
-			stateRoot: "/workspace/.gjc/state",
+			stateRoot: projectSharedStateRoot("/workspace"),
 			endpointGeneration: 2,
 			endpointMtimeMs: 1,
 			processIncarnation: "linux:123",
@@ -530,7 +531,7 @@ test("ACP reconcile_uncertain validates proof and projects an opaque result", as
 		{
 			sessionId: "retired-session",
 			cwd: "/workspace",
-			stateRoot: "/workspace/.gjc/state",
+			stateRoot: projectSharedStateRoot("/workspace"),
 			endpointGeneration: 2,
 			endpointMtimeMs: 1,
 			processIncarnation: "linux:123",

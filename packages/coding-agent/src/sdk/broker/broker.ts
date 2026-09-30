@@ -8,6 +8,7 @@ import { logger, resolveEquivalentPath } from "@gajae-code/utils";
 import packageJson from "../../../package.json" with { type: "json" };
 import type { ModelProfileErrorDetails } from "../../config/model-profile-contract";
 import { planLaunchWorktree } from "../../gjc-runtime/launch-worktree";
+import { projectSharedStateRoot } from "../../gjc-runtime/session-layout";
 import { readExistingStateForMutation, withWorkflowStateLock } from "../../gjc-runtime/state-writer";
 import { SdkClient, SdkClientError } from "../client";
 import {
@@ -756,7 +757,11 @@ function normalizeAliasedString(
 	return { value: values[0] };
 }
 
-export function normalizeBrokerInput(operation: string, input: Record<string, unknown>): InputNormalization {
+export function normalizeBrokerInput(
+	operation: string,
+	input: Record<string, unknown>,
+	agentDir?: string,
+): InputNormalization {
 	const normalized: Record<string, unknown> = { ...input };
 	const session = normalizeAliasedString(input, "sessionId", ["id"]);
 	if (session.error) return error("invalid_input", session.error);
@@ -829,9 +834,9 @@ export function normalizeBrokerInput(operation: string, input: Record<string, un
 		normalizeLifecycleDirectory,
 	);
 	if (stateRoot.error) return error("invalid_input", stateRoot.error);
-	if (stateRoot.value !== undefined && (!cwd.value || stateRoot.value !== path.join(cwd.value, ".gjc", "state")))
-		return error("invalid_input", "stateRoot must be the default .gjc/state for cwd.");
-	if (cwd.value !== undefined) normalized.stateRoot = path.join(cwd.value, ".gjc", "state");
+	if (stateRoot.value !== undefined && (!cwd.value || stateRoot.value !== projectSharedStateRoot(cwd.value, agentDir)))
+		return error("invalid_input", "stateRoot must be the default project state root for cwd.");
+	if (cwd.value !== undefined) normalized.stateRoot = projectSharedStateRoot(cwd.value, agentDir);
 	else if (stateRoot.value !== undefined) return error("invalid_input", "stateRoot requires cwd.");
 
 	if (target) {
@@ -1044,7 +1049,7 @@ function sameSessionControlAuthority(
 	);
 }
 
-function lifecycleTarget(operation: string, input: Record<string, unknown>): unknown {
+function lifecycleTarget(operation: string, input: Record<string, unknown>, agentDir?: string): unknown {
 	const target = input.target as Record<string, unknown> | undefined;
 	const string = (...values: unknown[]): string | undefined =>
 		values.find((value): value is string => typeof value === "string" && value.length > 0);
@@ -1053,7 +1058,7 @@ function lifecycleTarget(operation: string, input: Record<string, unknown>): unk
 		explicitRoot ??
 		(() => {
 			const cwd = string(input.cwd, input.path, target?.path);
-			return cwd ? path.join(cwd, ".gjc", "state") : undefined;
+			return cwd ? projectSharedStateRoot(cwd, agentDir) : undefined;
 		})();
 	const id = string(input.sessionId, input.id);
 	switch (operation) {
@@ -1108,8 +1113,8 @@ function lifecycleWorktreeTarget(input: Record<string, unknown>): { name: string
 }
 
 /** Test seam for lifecycle serialization identity. */
-export function lifecycleTargetForTest(operation: string, input: Record<string, unknown>): unknown {
-	return lifecycleTarget(operation, input);
+export function lifecycleTargetForTest(operation: string, input: Record<string, unknown>, agentDir?: string): unknown {
+	return lifecycleTarget(operation, input, agentDir);
 }
 
 const BROKER_LOCK_RECORD = "owner.json";
@@ -4774,7 +4779,7 @@ export class Broker {
 			if (isBrokerResponse(lookup)) return lookup;
 			// The ledger fingerprint covers the normalized mutation input, so the
 			// lookup target must pass through the same normalization to match it.
-			const lookupTarget = normalizeBrokerInput(lookup.operation, lookup.target);
+			const lookupTarget = normalizeBrokerInput(lookup.operation, lookup.target, this.settings.agentDir);
 			if (isBrokerResponse(lookupTarget)) return lookupTarget;
 			return await this.#lookupLifecycle(
 				lookup.operation,
@@ -4783,7 +4788,7 @@ export class Broker {
 				lifecycleFingerprint(lookup.operation, lookup.target),
 			);
 		}
-		const normalization = normalizeBrokerInput(operation, input);
+		const normalization = normalizeBrokerInput(operation, input, this.settings.agentDir);
 		if (isBrokerResponse(normalization)) return normalization;
 		input = normalization.input;
 		const fingerprint = lifecycleFingerprint(operation, input);
@@ -4912,7 +4917,7 @@ export class Broker {
 		if (idempotencyKey.length > 256 || /[\u0000-\u001f\u007f]/u.test(idempotencyKey))
 			return error("invalid_input", "idempotencyKey must be a bounded non-empty string");
 		const target = createHash("sha256")
-			.update(canonicalJson(lifecycleTarget(operation, input)))
+			.update(canonicalJson(lifecycleTarget(operation, input, this.settings.agentDir)))
 			.digest("hex");
 		const identity = await deriveIdempotencyIdentity(
 			this.settings.agentDir,
@@ -5022,7 +5027,7 @@ export class Broker {
 				input = {
 					sessionId: cleanup.sessionId,
 					cwd: cleanup.cwd,
-					stateRoot: path.join(cleanup.cwd, ".gjc", "state"),
+					stateRoot: projectSharedStateRoot(cleanup.cwd, this.settings.agentDir),
 					sessionPath: cleanup.transcriptPath,
 				};
 		}

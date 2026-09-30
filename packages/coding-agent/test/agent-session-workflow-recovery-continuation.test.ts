@@ -14,6 +14,7 @@ import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import * as activeStateModule from "@gajae-code/coding-agent/skill-state/active-state";
 import { getProjectAgentDir, TempDir } from "@gajae-code/utils";
+import { projectStateRoot } from "../src/gjc-runtime/session-layout";
 
 function assistantMessage(stopReason: "stop" | "length" = "stop"): AssistantMessage {
 	return {
@@ -118,7 +119,7 @@ describe("AgentSession workflow recovery continuation (#4560)", () => {
 	}
 
 	async function seedUltragoalPlan(): Promise<void> {
-		const dir = path.join(tempDir.path(), ".gjc", `_session-${session.sessionId}`, "ultragoal");
+		const dir = path.join(projectStateRoot(tempDir.path()), `_session-${session.sessionId}`, "ultragoal");
 		const now = new Date().toISOString();
 		await Bun.write(
 			path.join(dir, "goals.json"),
@@ -154,7 +155,13 @@ describe("AgentSession workflow recovery continuation (#4560)", () => {
 
 	async function seedRalplanReview(): Promise<void> {
 		const runId = "review-run";
-		const runDir = path.join(tempDir.path(), ".gjc", `_session-${session.sessionId}`, "plans", "ralplan", runId);
+		const runDir = path.join(
+			projectStateRoot(tempDir.path()),
+			`_session-${session.sessionId}`,
+			"plans",
+			"ralplan",
+			runId,
+		);
 		const plan = `Plan the durable recovery contract.\n\n## Accepted Scope\n- recovery projection\n\n## Non-Goals\n- unrelated UI changes\n\n## Acceptance Criteria\n- forced compaction resumes plan review\n`;
 		const artifactPath = path.join(runDir, "stage-01-planner.md");
 		await Bun.write(artifactPath, plan);
@@ -168,13 +175,13 @@ describe("AgentSession workflow recovery continuation (#4560)", () => {
 			})}\n`,
 		);
 		await Bun.write(
-			path.join(tempDir.path(), ".gjc", `_session-${session.sessionId}`, "state", "ralplan-state.json"),
+			path.join(projectStateRoot(tempDir.path()), `_session-${session.sessionId}`, "state", "ralplan-state.json"),
 			JSON.stringify({ run_id: runId, current_phase: "planner", active: true }),
 		);
 	}
 
 	async function seedJoinedCohort(sourceHash: string): Promise<void> {
-		const dir = path.join(tempDir.path(), ".gjc", `_session-${session.sessionId}`, "ultragoal");
+		const dir = path.join(projectStateRoot(tempDir.path()), `_session-${session.sessionId}`, "ultragoal");
 		await Bun.write(
 			path.join(dir, "ledger.jsonl"),
 			`${JSON.stringify({
@@ -188,7 +195,7 @@ describe("AgentSession workflow recovery continuation (#4560)", () => {
 	}
 
 	async function seedUltragoalPlanWithBlockedGoal(): Promise<void> {
-		const dir = path.join(tempDir.path(), ".gjc", `_session-${session.sessionId}`, "ultragoal");
+		const dir = path.join(projectStateRoot(tempDir.path()), `_session-${session.sessionId}`, "ultragoal");
 		const now = new Date().toISOString();
 		await Bun.write(
 			path.join(dir, "goals.json"),

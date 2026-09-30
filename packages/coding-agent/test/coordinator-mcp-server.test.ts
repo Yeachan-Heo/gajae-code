@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, setSystemTime, vi } from "bun:test";
 import { createHash } from "node:crypto";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -43,6 +44,7 @@ import {
 	readCoordinatorArtifact,
 } from "../src/coordinator-mcp/server";
 import { MAX_REAP_FAILURES } from "../src/coordinator-mcp/session-reaper";
+import { projectSharedStateRoot, projectStateRoot } from "../src/gjc-runtime/session-layout";
 import { withSessionStateFileLock } from "../src/gjc-runtime/session-state-lock";
 import { persistMcpDelegateHostContext } from "../src/hooks/mcp-delegate-host-context";
 import {
@@ -82,6 +84,25 @@ import {
 	createFixtureRootCleanup,
 } from "./helpers/fixture-broker-cleanup";
 import { prepareExactSessionAuthority } from "./helpers/sdk-exact-session-authority";
+
+/**
+ * The broker-profile project state root for a fixture workspace. Every coordinator
+ * server in this file runs its broker/router under `<fixtureRoot>/agent-global`, and
+ * every fixture workspace is `<fixtureRoot>` or a directory beneath it.
+ */
+function brokerStateRoot(workspace: string): string {
+	const fixtureRoot = fixtureRootOf(workspace);
+	return projectSharedStateRoot(workspace, path.join(fixtureRoot, "agent-global"));
+}
+function fixtureRootOf(workspace: string): string {
+	const resolved = path.resolve(workspace);
+	for (const tmp of new Set([path.resolve(os.tmpdir()), fsSync.realpathSync(os.tmpdir())])) {
+		const relative = path.relative(tmp, resolved);
+		if (relative && !relative.startsWith("..") && !path.isAbsolute(relative))
+			return path.join(tmp, relative.split(path.sep)[0]!);
+	}
+	throw new Error(`fixture workspace outside tmpdir: ${workspace}`);
+}
 
 // Coordinator state writes serialize on a lock whose removals go through identity-bound
 // native primitives; point them at a working implementation.
@@ -362,7 +383,7 @@ async function createSdkControlServer(
 	brokerSessions: Array<Record<string, unknown>> = [
 		{
 			sessionId: "visible-session",
-			locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+			locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 			live: true,
 			endpointGeneration: 1,
 			pid: 101,
@@ -449,7 +470,7 @@ async function createSdkControlServer(
 					locator: {
 						cwd: routerWorkspace,
 						worktreeRoot: declaredLocator.worktreeRoot ?? null,
-						stateRoot: declaredLocator.stateRoot ?? path.join(routerWorkspace, ".gjc", "state"),
+						stateRoot: declaredLocator.stateRoot ?? projectSharedStateRoot(routerWorkspace, agentDir),
 					},
 					live: session.live === true,
 					terminalUncertain: session.terminalUncertain === true,
@@ -530,7 +551,13 @@ async function createSdkControlServer(
 							const lifecycleCwd = worktree?.enabled === true ? path.join(root, "hermes-worktree") : undefined;
 							const sessionId = `created-session-${++createdSessions}`;
 							const sessionCwd = lifecycleCwd ?? root;
-							const endpointPath = path.join(sessionCwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+							// The broker materializes the managed worktree before its host publishes.
+							await fs.mkdir(sessionCwd, { recursive: true });
+							const endpointPath = path.join(
+								projectSharedStateRoot(sessionCwd, agentDir),
+								"sdk",
+								`${sessionId}.json`,
+							);
 							await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 							await Bun.write(
 								endpointPath,
@@ -547,7 +574,7 @@ async function createSdkControlServer(
 								locator: {
 									cwd: sessionCwd,
 									worktreeRoot: null,
-									stateRoot: path.join(sessionCwd, ".gjc", "state"),
+									stateRoot: projectSharedStateRoot(sessionCwd, agentDir),
 								},
 								live: true,
 								endpointGeneration: 1,
@@ -635,7 +662,7 @@ async function createSdkControlServer(
 			},
 		},
 	});
-	await fs.mkdir(path.join(root, ".gjc", "state", "sdk"), { recursive: true });
+	await fs.mkdir(path.join(projectSharedStateRoot(root, agentDir), "sdk"), { recursive: true });
 	await writeBrokerDiscovery(agentDir, {
 		version: 1,
 		protocolVersion: 3,
@@ -1450,7 +1477,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 						retired: true,
 						ledgerState: "terminal_error",
 						indexType: "session_closed",
-						stateRoot: path.join(root, ".gjc", "state"),
+						stateRoot: brokerStateRoot(root),
 						endpointGeneration: 2,
 						endpointMtimeMs: 1,
 						processIncarnation: "linux:123",
@@ -1474,7 +1501,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const retirementArgs = {
 			cwd: root,
 			session_id: "retired-session",
-			state_root: path.join(root, ".gjc", "state"),
+			state_root: brokerStateRoot(root),
 			endpoint_generation: 2,
 			endpoint_mtime_ms: 1,
 			process_incarnation: "linux:123",
@@ -1510,7 +1537,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		});
 		expect(JSON.stringify(retired)).not.toContain("processIncarnation");
 		expect(JSON.stringify(retired)).not.toContain("hostIncarnation");
-		expect(JSON.stringify(retired)).not.toContain(path.join(root, ".gjc", "state"));
+		expect(JSON.stringify(retired)).not.toContain(brokerStateRoot(root));
 		expect(JSON.parse(await fs.readFile(originalPath, "utf8"))).toMatchObject({
 			state: "completed",
 			response: { ok: false, error: { code: "retired" } },
@@ -1584,7 +1611,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const retirementArgs = {
 			cwd: root,
 			session_id: "retired-session",
-			state_root: path.join(root, ".gjc", "state"),
+			state_root: brokerStateRoot(root),
 			endpoint_generation: 2,
 			endpoint_mtime_ms: 1,
 			process_incarnation: "linux:123",
@@ -1614,7 +1641,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			input: {
 				sessionId: "retired-session",
 				cwd: root,
-				stateRoot: path.join(root, ".gjc", "state"),
+				stateRoot: brokerStateRoot(root),
 				endpointGeneration: 2,
 				endpointMtimeMs: 1,
 				processIncarnation: "linux:123",
@@ -1655,7 +1682,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const base = {
 			cwd: root,
 			session_id: "retired-session",
-			state_root: path.join(root, ".gjc", "state"),
+			state_root: brokerStateRoot(root),
 			endpoint_generation: 2,
 			endpoint_mtime_ms: 1,
 			process_incarnation: "linux:123",
@@ -1742,7 +1769,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const base = {
 			cwd: root,
 			session_id: "retired-session",
-			state_root: path.join(root, ".gjc", "state"),
+			state_root: brokerStateRoot(root),
 			endpoint_generation: 2,
 			endpoint_mtime_ms: 1,
 			process_incarnation: "linux:123",
@@ -1815,7 +1842,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const retirementArgs = {
 			cwd: root,
 			session_id: "retired-session",
-			state_root: path.join(root, ".gjc", "state"),
+			state_root: brokerStateRoot(root),
 			endpoint_generation: 2,
 			endpoint_mtime_ms: 1,
 			process_incarnation: "linux:123",
@@ -2337,12 +2364,12 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const server = await createSdkControlServer(root, controls, [], undefined, [
 			{
 				sessionId: "live-session",
-				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 				live: true,
 			},
 			{
 				sessionId: "stale-session",
-				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 				live: false,
 				endpoint: { url: "ws://broker.example.test/endpoint?token=stale-secret", token: "Bearer stale-secret" },
 			},
@@ -2351,7 +2378,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 				locator: {
 					cwd: path.join(root, "other"),
 					worktreeRoot: null,
-					stateRoot: path.join(root, "other", ".gjc", "state"),
+					stateRoot: brokerStateRoot(path.join(root, "other")),
 				},
 				live: true,
 			},
@@ -2382,12 +2409,12 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const controls: SdkControl[] = [];
 		const pageOne = {
 			sessionId: "page-one",
-			locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+			locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 			live: true,
 		};
 		const pageTwo = {
 			sessionId: "page-two",
-			locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+			locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 			live: false,
 		};
 		const server = await createSdkControlServer(root, controls, [], undefined, [pageOne], undefined, undefined, {
@@ -2418,7 +2445,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const controls: SdkControl[] = [];
 		const pageOne = {
 			sessionId: "page-one",
-			locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+			locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 			live: true,
 		};
 		const server = await createSdkControlServer(root, controls, [], undefined, [pageOne], undefined, undefined, {
@@ -2444,7 +2471,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const controls: SdkControl[] = [];
 		const page = {
 			sessionId: "page",
-			locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+			locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 			live: true,
 		};
 		const server = await createSdkControlServer(root, controls, [], undefined, [page], undefined, undefined, {
@@ -2471,7 +2498,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const controls: SdkControl[] = [];
 		const page = {
 			sessionId: "page",
-			locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+			locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 			live: true,
 		};
 		const server = await createSdkControlServer(root, controls, [], undefined, [page], undefined, undefined, {
@@ -2630,7 +2657,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			idempotency_key: "prompt-1",
 			allow_mutation: true,
 		});
-		await fs.rm(path.join(root, ".gjc", "state", "sdk", "visible-session.json"));
+		await fs.rm(path.join(brokerStateRoot(root), "sdk", "visible-session.json"));
 
 		await expect(server.callTool("gjc_coordinator_read_turn", { turn_id: sent.turn_id })).resolves.toMatchObject({
 			ok: true,
@@ -2840,7 +2867,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 				if (operation !== "session.create") return undefined;
 				lifecycleInput = input;
 				return deferred.promise.then(async result => {
-					const endpointPath = path.join(root, ".gjc", "state", "sdk", "created-session-1.json");
+					const endpointPath = path.join(brokerStateRoot(root), "sdk", "created-session-1.json");
 					await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 					await Bun.write(
 						endpointPath,
@@ -2853,7 +2880,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 					);
 					brokerSessions.push({
 						sessionId: "created-session-1",
-						locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+						locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 						live: true,
 						endpointGeneration: 1,
 						pid: process.pid,
@@ -3631,7 +3658,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const sessions = [
 			{
 				sessionId: "visible-session",
-				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 				live: true,
 				endpointGeneration: 1,
 				pid: 101,
@@ -3654,7 +3681,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			token: "successor-token",
 			endpointGeneration: 1,
 		});
-		const endpointPath = path.join(root, ".gjc", "state", "sdk", "visible-session.json");
+		const endpointPath = path.join(brokerStateRoot(root), "sdk", "visible-session.json");
 		await fs.utimes(endpointPath, 0.002, 0.002);
 		sessions[0] = {
 			...sessions[0]!,
@@ -3688,7 +3715,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const sessions = [
 			{
 				sessionId: "visible-session",
-				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 				live: true,
 				endpointGeneration: 1,
 				pid: 101,
@@ -3705,11 +3732,11 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			token: "successor-token",
 			endpointGeneration: 1,
 		});
-		const endpointPath = path.join(otherWorkspace, ".gjc", "state", "sdk", "visible-session.json");
+		const endpointPath = path.join(brokerStateRoot(otherWorkspace), "sdk", "visible-session.json");
 		await fs.utimes(endpointPath, 0.003, 0.003);
 		sessions[0] = {
 			...sessions[0]!,
-			locator: { cwd: otherWorkspace, worktreeRoot: null, stateRoot: path.join(otherWorkspace, ".gjc", "state") },
+			locator: { cwd: otherWorkspace, worktreeRoot: null, stateRoot: brokerStateRoot(otherWorkspace) },
 			pid: successor.pid,
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
 		};
@@ -3729,7 +3756,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const sessions = [
 			{
 				sessionId: "visible-session",
-				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 				live: true,
 				endpointGeneration: 1,
 				pid: 101,
@@ -3741,7 +3768,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		await server.router.start();
 		const staleAttachment = server.router.attachment("visible-session", 1);
 		if (!staleAttachment) throw new Error("missing initial session attachment");
-		const endpointPath = path.join(root, ".gjc", "state", "sdk", "visible-session.json");
+		const endpointPath = path.join(brokerStateRoot(root), "sdk", "visible-session.json");
 		await Bun.write(endpointPath, JSON.stringify({ url: "ws://successor.test", token: "successor-endpoint-secret" }));
 		await fs.utimes(endpointPath, 0.002, 0.002);
 		sessions[0]!.endpointMtimeMs = 2;
@@ -3796,7 +3823,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const sessions = [
 			{
 				sessionId: "visible-session",
-				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 				live: true,
 				endpointGeneration: 1,
 				pid: 101,
@@ -3807,7 +3834,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		await registerSdkSession(server, root);
 		sessions.push({
 			sessionId: "foreign-session",
-			locator: { cwd: otherWorkspace, worktreeRoot: null, stateRoot: path.join(otherWorkspace, ".gjc", "state") },
+			locator: { cwd: otherWorkspace, worktreeRoot: null, stateRoot: brokerStateRoot(otherWorkspace) },
 			live: true,
 			endpointGeneration: 1,
 			pid: 102,
@@ -3847,7 +3874,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const sessions = [
 			{
 				sessionId: "visible-session",
-				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 				live: true,
 				endpointGeneration: 1,
 				pid: 101,
@@ -3863,7 +3890,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			if (sessions.length === 0)
 				sessions.push({
 					sessionId: "visible-session",
-					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+					locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 					live: true,
 					endpointGeneration: 1,
 					pid: 101,
@@ -4283,7 +4310,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 					locator: {
 						cwd: sessionCwd,
 						worktreeRoot: sessionCwd,
-						stateRoot: path.join(sessionCwd, ".gjc", "state"),
+						stateRoot: brokerStateRoot(sessionCwd),
 					},
 					live: true,
 					endpointGeneration: 1,
@@ -4294,7 +4321,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		];
 		for (const session of brokerSessions) {
 			const sessionCwd = (session.locator as Record<string, unknown>).cwd as string;
-			const endpointPath = path.join(sessionCwd, ".gjc", "state", "sdk", `${session.sessionId}.json`);
+			const endpointPath = path.join(brokerStateRoot(sessionCwd), "sdk", `${session.sessionId}.json`);
 			await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 			await Bun.write(
 				endpointPath,
@@ -4734,7 +4761,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const root = await tempRoot();
 		const emitter = new BrokerWorkflowGateEmitter(
 			"visible-session",
-			new FileGateStore(path.join(root, ".gjc", "state", "workflow-gates.json")),
+			new FileGateStore(path.join(brokerStateRoot(root), "workflow-gates.json")),
 		);
 		const acceptedGateIds: string[] = [];
 		for (let index = 0; index < MAX_ACCEPTED_WORKFLOW_GATE_QUERY_RECORDS + 1; index++) {
@@ -5709,7 +5736,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			["_session-traversal", "../evil", "resume"],
 			["_session-oversized", "oversized", "x".repeat(1024 * 1024)],
 		] as const) {
-			const contextPath = path.join(root, ".gjc", directory, "state", "mcp-delegate-host-context.json");
+			const contextPath = path.join(projectStateRoot(root), directory, "state", "mcp-delegate-host-context.json");
 			await fs.mkdir(path.dirname(contextPath), { recursive: true });
 			await fs.writeFile(
 				contextPath,
@@ -6033,9 +6060,9 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			sessionId: "valid-host",
 			prompt: "$gjc-mcp-delegate-flow",
 		});
-		await fs.mkdir(path.join(root, ".gjc", "_session-corrupt-host", "state"), { recursive: true });
+		await fs.mkdir(path.join(projectStateRoot(root), "_session-corrupt-host", "state"), { recursive: true });
 		await fs.writeFile(
-			path.join(root, ".gjc", "_session-corrupt-host", "state", "mcp-delegate-host-context.json"),
+			path.join(projectStateRoot(root), "_session-corrupt-host", "state", "mcp-delegate-host-context.json"),
 			"{",
 			"utf8",
 		);
@@ -6062,7 +6089,12 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls);
 		const namespace = coordinatorNamespace(root);
-		const contextPath = path.join(root, ".gjc", "_session-corrupt-host", "state", "mcp-delegate-host-context.json");
+		const contextPath = path.join(
+			projectStateRoot(root),
+			"_session-corrupt-host",
+			"state",
+			"mcp-delegate-host-context.json",
+		);
 		await fs.mkdir(path.dirname(contextPath), { recursive: true });
 		await fs.writeFile(contextPath, "{", "utf8");
 
@@ -6132,7 +6164,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 				? [
 						{
 							sessionId: "visible-session",
-							locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+							locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 							live: true,
 							endpointGeneration: 1,
 							pid: 101,
@@ -7944,7 +7976,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			[
 				{
 					sessionId: "visible-session",
-					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+					locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 					live: true,
 					endpointGeneration: 1,
 					pid: 101,
@@ -8102,7 +8134,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const controls: SdkControl[] = [];
 		const brokerSessions = sessionIds.map((sessionId, index) => ({
 			sessionId,
-			locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+			locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 			live: true,
 			endpointGeneration: 1,
 			pid: 300 + index,
@@ -8193,7 +8225,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const brokerSessions = [
 			{
 				sessionId: "idle-session",
-				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 				live: true,
 				endpointGeneration: 1,
 				pid: 202,
@@ -8266,7 +8298,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const brokerSessions: Array<Record<string, unknown>> = [
 			{
 				sessionId,
-				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 				live: true,
 				lastHeartbeatAt: Date.now(),
 				endpointGeneration: 1,
@@ -8499,7 +8531,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const brokerSessions = [
 			{
 				sessionId: "orphan-session",
-				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 				live: true,
 				endpointGeneration: 1,
 				pid: 202,
@@ -8611,7 +8643,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const brokerSessions = [
 			{
 				sessionId: "live-orphan",
-				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 				live: true,
 				endpointGeneration: 1,
 				pid: 303,
@@ -9040,7 +9072,7 @@ it("repairs one terminal session without deleting another session's projections"
 	const sessions = [
 		{
 			sessionId: "visible-session",
-			locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+			locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 			live: true,
 			endpointGeneration: 1,
 			pid: 101,
@@ -9048,7 +9080,7 @@ it("repairs one terminal session without deleting another session's projections"
 		},
 		{
 			sessionId: "other-session",
-			locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+			locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 			live: true,
 			endpointGeneration: 1,
 			pid: 102,
@@ -9124,7 +9156,7 @@ async function createActivationHarness(sessionFrameResult?: (frame: Record<strin
 	const brokerSessions: Array<Record<string, unknown>> = [
 		{
 			sessionId: "visible-session",
-			locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+			locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 			live: true,
 			endpointGeneration: 1,
 			pid: 101,
@@ -9517,19 +9549,19 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 		const server = await createSdkControlServer(root, controls, [], undefined, [
 			{
 				sessionId: "alpha-session",
-				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 				live: true,
 				endpointGeneration: 1,
 			},
 			{
 				sessionId: "beta-session",
-				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 				live: true,
 				endpointGeneration: 1,
 			},
 			{
 				sessionId: "gamma-session",
-				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 				live: true,
 				endpointGeneration: 1,
 			},
@@ -9570,13 +9602,13 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 		const server = await createSdkControlServer(root, controls, [], undefined, [
 			{
 				sessionId: "alpha-session",
-				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 				live: true,
 				endpointGeneration: 1,
 			},
 			{
 				sessionId: "zeta-session",
-				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 				live: true,
 				endpointGeneration: 1,
 			},
@@ -9638,13 +9670,13 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 		const server = await createSdkControlServer(root, controls, [], undefined, [
 			{
 				sessionId: "alpha-session",
-				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 				live: true,
 				endpointGeneration: 1,
 			},
 			{
 				sessionId: "beta-session",
-				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 				live: true,
 				endpointGeneration: 1,
 			},
@@ -10763,19 +10795,19 @@ describe("Coordinator MCP deep-audit regressions", () => {
 			[
 				{
 					sessionId: "alpha-session",
-					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+					locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 					live: true,
 					endpointGeneration: 1,
 				},
 				{
 					sessionId: "beta-session",
-					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+					locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 					live: true,
 					endpointGeneration: 1,
 				},
 				{
 					sessionId: "gamma-session",
-					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+					locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 					live: true,
 					endpointGeneration: 1,
 				},
@@ -11140,13 +11172,13 @@ describe("Coordinator MCP deep-audit regressions", () => {
 		const server = await createSdkControlServer(root, controls, [], undefined, [
 			{
 				sessionId: "visible-session",
-				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 				live: true,
 				endpointGeneration: 1,
 			},
 			{
 				sessionId: "other-session",
-				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 				live: true,
 				endpointGeneration: 1,
 			},
@@ -11325,7 +11357,7 @@ describe("Coordinator MCP deep-audit regressions", () => {
 		const brokerSessions = [
 			{
 				sessionId: "visible-session",
-				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				locator: { cwd: root, worktreeRoot: null, stateRoot: brokerStateRoot(root) },
 				live: true,
 				endpointGeneration: 1,
 				pid: 101,

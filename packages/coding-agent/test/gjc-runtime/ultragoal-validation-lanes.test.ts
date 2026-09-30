@@ -11,6 +11,7 @@ import {
 	validateUltragoalQualityGateReadOnly,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
 import { isHighRiskChangePath } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-validation-policy";
+import { projectStateRoot } from "../../src/gjc-runtime/session-layout";
 
 const TEST_SESSION_ID = "test-session-4560";
 
@@ -222,7 +223,7 @@ describe("ultragoal validation lane selection gate (#4560)", () => {
 
 	/** Append a prior verified complete-checkpoint cohort with `sourceHash`. */
 	async function seedPriorCohort(sourceHash: string): Promise<void> {
-		const ledgerPath = path.join(root, ".gjc", `_session-${TEST_SESSION_ID}`, "ultragoal", "ledger.jsonl");
+		const ledgerPath = path.join(projectStateRoot(root), `_session-${TEST_SESSION_ID}`, "ultragoal", "ledger.jsonl");
 		const existing = await Bun.file(ledgerPath).text();
 		const event = {
 			eventId: "prior-1",

@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { projectSharedStateRoot } from "../../gjc-runtime/session-layout";
 import {
 	isValidReadinessTimeoutMs,
 	lifecycleRequestTimeoutMs,
@@ -92,7 +93,7 @@ export class AgentDirSessionLifecycleService extends SessionLifecycleService {
 	readonly #agentDir: string;
 
 	constructor(agentDir: string) {
-		super(new AgentDirSessionLifecycleClient(agentDir));
+		super(new AgentDirSessionLifecycleClient(agentDir), agentDir);
 		this.#agentDir = agentDir;
 	}
 
@@ -119,7 +120,7 @@ export class AgentDirSessionLifecycleService extends SessionLifecycleService {
 		const cwd = path.resolve(requestedCwd);
 		const target = {
 			cwd,
-			stateRoot: path.join(cwd, ".gjc", "state"),
+			stateRoot: projectSharedStateRoot(cwd, this.#agentDir),
 			...(targetInput.kind === "worktree" ? { worktree: { enabled: true as const, name: targetInput.branch } } : {}),
 			...(modelPreset === undefined ? {} : { modelPreset }),
 			...(readinessTimeoutMs === undefined ? {} : { readinessTimeoutMs }),
@@ -213,7 +214,7 @@ export class AgentDirSessionLifecycleService extends SessionLifecycleService {
 		const target = {
 			sessionId: selected.sessionId,
 			cwd: selectedCwd,
-			stateRoot: path.join(selectedCwd, ".gjc", "state"),
+			stateRoot: projectSharedStateRoot(selectedCwd, this.#agentDir),
 			sessionPath: selected.sessionStateFile,
 			...(request.modelPreset === undefined ? {} : { modelPreset: request.modelPreset }),
 			...(readinessTimeoutMs === undefined ? {} : { readinessTimeoutMs }),

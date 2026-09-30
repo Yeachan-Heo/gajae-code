@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { YAML } from "bun";
+import { projectSharedStateRoot } from "../../src/gjc-runtime/session-layout";
 import {
 	extractWorkflowSetting,
 	resolveWorkflowSetting,
@@ -114,9 +115,9 @@ describe("workflow-settings resolver", () => {
 		// later `gjc config unset` must stick even while the target stays present.
 		await writeProjectConfig(cwd, { theme: { dark: "red" } });
 		await writeProjectSettings(cwd, { "gjc.ralplan.maxIterations": 7 });
-		await fs.mkdir(path.join(cwd, ".gjc", "state"), { recursive: true });
+		await fs.mkdir(projectSharedStateRoot(cwd, agentDir), { recursive: true });
 		await fs.writeFile(
-			path.join(cwd, ".gjc", "state", "settings.json.migrated-keys"),
+			path.join(projectSharedStateRoot(cwd, agentDir), "settings.json.migrated-keys"),
 			JSON.stringify(["gjc.ralplan.maxIterations"]),
 		);
 		await fs.writeFile(path.join(agentDir, "config.yml"), YAML.stringify({ theme: { dark: "red" } }, null, 2));
@@ -137,9 +138,9 @@ describe("workflow-settings resolver", () => {
 		// pre-ownership JSON parse of the legacy source.
 		await writeProjectConfig(cwd, { theme: { dark: "red" } });
 		await fs.writeFile(path.join(cwd, ".gjc", "settings.json"), "{ corrupted");
-		await fs.mkdir(path.join(cwd, ".gjc", "state"), { recursive: true });
+		await fs.mkdir(projectSharedStateRoot(cwd, agentDir), { recursive: true });
 		await fs.writeFile(
-			path.join(cwd, ".gjc", "state", "settings.json.migrated-keys"),
+			path.join(projectSharedStateRoot(cwd, agentDir), "settings.json.migrated-keys"),
 			JSON.stringify(["gjc.ralplan.maxIterations", "gjc.ralplan.autoHandoff", "gjc.ralplan.maxReviewPassesPerLane"]),
 		);
 		await fs.writeFile(path.join(agentDir, "config.yml"), YAML.stringify({ theme: { dark: "red" } }, null, 2));
@@ -292,13 +293,13 @@ describe("workflow-settings resolver", () => {
 		// (which would make ralplan exit 2 again).
 		await writeProjectConfig(cwd, { theme: { dark: "red" } });
 		await writeProjectSettings(cwd, { "gjc.ralplan.maxIterations": "invalid" });
-		await fs.mkdir(path.join(cwd, ".gjc", "state"), { recursive: true });
+		await fs.mkdir(projectSharedStateRoot(cwd, agentDir), { recursive: true });
 		await fs.writeFile(
-			path.join(cwd, ".gjc", "state", "settings.json.migrated-keys"),
+			path.join(projectSharedStateRoot(cwd, agentDir), "settings.json.migrated-keys"),
 			JSON.stringify(["gjc.ralplan.maxIterations"]),
 		);
 		await fs.mkdir(agentDir, { recursive: true });
-		await fs.chmod(path.join(cwd, ".gjc", "state"), 0o000);
+		await fs.chmod(projectSharedStateRoot(cwd, agentDir), 0o000);
 		try {
 			const result = await resolveIn(
 				cwd,
@@ -309,7 +310,7 @@ describe("workflow-settings resolver", () => {
 			expect(result.threw).toBe(true);
 			expect(result.message ?? "").toContain("EACCES");
 		} finally {
-			await fs.chmod(path.join(cwd, ".gjc", "state"), 0o700);
+			await fs.chmod(projectSharedStateRoot(cwd, agentDir), 0o700);
 		}
 	});
 
@@ -368,9 +369,9 @@ describe("workflow-settings resolver", () => {
 		// was then deleted: the removal must stick, not resurrect the retained
 		// legacy value. The agent target exists so the config-root legacy is off.
 		await writeProjectSettings(cwd, { "gjc.ralplan.maxIterations": 7 });
-		await fs.mkdir(path.join(cwd, ".gjc", "state"), { recursive: true });
+		await fs.mkdir(projectSharedStateRoot(cwd, agentDir), { recursive: true });
 		await fs.writeFile(
-			path.join(cwd, ".gjc", "state", "settings.json.migrated-keys"),
+			path.join(projectSharedStateRoot(cwd, agentDir), "settings.json.migrated-keys"),
 			JSON.stringify(["gjc.ralplan.maxIterations"]),
 		);
 		await fs.writeFile(path.join(agentDir, "config.yml"), YAML.stringify({ theme: { dark: "red" } }, null, 2));
@@ -389,9 +390,9 @@ describe("workflow-settings resolver", () => {
 		// The key was project-migrated and unset; the agent config.yml is absent,
 		// so the aliasing config-root legacy candidate would otherwise resurrect
 		// the stale value at agent precedence.
-		await fs.mkdir(path.join(home, ".gjc", "state"), { recursive: true });
+		await fs.mkdir(projectSharedStateRoot(home, path.join(home, ".gjc", "agent")), { recursive: true });
 		await fs.writeFile(
-			path.join(home, ".gjc", "state", "settings.json.migrated-keys"),
+			path.join(projectSharedStateRoot(home, path.join(home, ".gjc", "agent")), "settings.json.migrated-keys"),
 			JSON.stringify(["gjc.ralplan.maxIterations"]),
 		);
 
@@ -414,9 +415,9 @@ describe("workflow-settings resolver", () => {
 		await fs.mkdir(path.join(cwd, ".gjc"), { recursive: true });
 		await fs.symlink(path.join(home, ".myconfig", "settings.json"), path.join(cwd, ".gjc", "settings.json"));
 		// The key was project-migrated and unset.
-		await fs.mkdir(path.join(cwd, ".gjc", "state"), { recursive: true });
+		await fs.mkdir(projectSharedStateRoot(cwd, path.join(home, ".myconfig", "agent")), { recursive: true });
 		await fs.writeFile(
-			path.join(cwd, ".gjc", "state", "settings.json.migrated-keys"),
+			path.join(projectSharedStateRoot(cwd, path.join(home, ".myconfig", "agent")), "settings.json.migrated-keys"),
 			JSON.stringify(["gjc.ralplan.maxIterations"]),
 		);
 
@@ -556,11 +557,11 @@ describe("workflow-settings resolver", () => {
 		const cwd = await tempDir();
 		await fs.mkdir(path.join(home, ".myconfig"), { recursive: true });
 		await fs.mkdir(path.join(cwd, ".gjc"), { recursive: true });
-		await fs.mkdir(path.join(cwd, ".gjc", "state"), { recursive: true });
+		await fs.mkdir(projectSharedStateRoot(cwd, path.join(home, ".myconfig", "agent")), { recursive: true });
 		// Project-layer retention evidence (from the project migration retaining
 		// an invalid strict ralplan legacy value).
 		await fs.writeFile(
-			path.join(cwd, ".gjc", "state", "settings.json.strict-invalid"),
+			path.join(projectSharedStateRoot(cwd, path.join(home, ".myconfig", "agent")), "settings.json.strict-invalid"),
 			JSON.stringify({
 				version: 1,
 				key: "gjc.ralplan.maxIterations",
@@ -586,11 +587,11 @@ describe("workflow-settings resolver", () => {
 		const cwd = await tempDir();
 		await fs.mkdir(path.join(home, ".myconfig"), { recursive: true });
 		await fs.mkdir(path.join(cwd, ".gjc"), { recursive: true });
-		await fs.mkdir(path.join(cwd, ".gjc", "state"), { recursive: true });
+		await fs.mkdir(projectSharedStateRoot(cwd, path.join(home, ".myconfig", "agent")), { recursive: true });
 		// Malformed-source evidence (the project migration could not parse
 		// settings.json): no key can be trusted, so every strict resolve throws.
 		await fs.writeFile(
-			path.join(cwd, ".gjc", "state", "settings.json.strict-invalid"),
+			path.join(projectSharedStateRoot(cwd, path.join(home, ".myconfig", "agent")), "settings.json.strict-invalid"),
 			JSON.stringify({ version: 2, malformed: true, source: path.join(cwd, ".gjc", "settings.json") }),
 		);
 

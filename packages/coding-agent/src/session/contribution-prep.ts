@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentMessage } from "@gajae-code/agent-core";
 import type { AssistantMessage, ToolResultMessage, UserMessage } from "@gajae-code/ai/core";
+import { projectStateRoot } from "../gjc-runtime/session-layout";
 import { resolveGjcCommand } from "../task/gjc-command";
 import { shortenPath } from "../tools/render-utils";
 
@@ -386,7 +387,7 @@ export async function prepareContributionPrep(
 	const createdAt = (options.now ?? context.now ?? new Date()).toISOString();
 	const safeTimestamp = createdAt.replace(/[:.]/g, "-");
 	const artifactDir = path.join(
-		options.artifactRoot ?? path.join(context.cwd, ".gjc", "contribution-prep"),
+		options.artifactRoot ?? path.join(projectStateRoot(context.cwd), "contribution-prep"),
 		safeTimestamp,
 	);
 	assertSafeArtifactPath(artifactDir);

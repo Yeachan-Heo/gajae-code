@@ -4,7 +4,7 @@
  * `storage.ts` + `state.ts` without SQLite.
  *
  * Everything lives under the session autoresearch root
- * (`<cwd>/.gjc/_session-{id}/autoresearch/`): `runs.jsonl` holds one JSON
+ * (`$GJC_STATE_DIR/_session-{id}/autoresearch/`): `runs.jsonl` holds one JSON
  * object per run and `experiment.json` holds the metric/session configuration.
  * The legacy global store (a per-project SQLite DB keyed outside the session)
  * is intentionally dead — no code path here resolves or writes it.

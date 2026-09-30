@@ -643,14 +643,16 @@ Project executor override body.
 		expect(deepInterview).toBeDefined();
 		const content = deepInterview?.content ?? "";
 
-		for (const required of ["ask", ".gjc/_session-{sessionid}/state", "pending approval"]) {
+		for (const required of ["ask", "$GJC_STATE_DIR/_session-{sessionid}/state", "pending approval"]) {
 			expect(content).toContain(required);
 		}
 		expect(content).toContain("/skill:ralplan");
 		expect(content).toContain("/skill:autoresearch");
 		expect(content).toContain("`gjc ralplan` is a native CLI");
 		expect(content).toContain("Direct `.gjc/` file edits are forbidden unless an explicit force override is active");
-		expect(content).toContain("do not edit `.gjc/_session-{sessionid}/state` directly without force override");
+		expect(content).toContain(
+			"do not edit `$GJC_STATE_DIR/_session-{sessionid}/state` directly without force override",
+		);
 		expect(content).toContain("gjc deep-interview clear --force");
 		expect(content).toContain("gjc deep-interview read --json");
 		expect(content).toContain("gjc deep-interview write --input");
@@ -730,13 +732,13 @@ Project executor override body.
 		expect(content).toContain("--stage planner");
 		expect(content).toContain("--stage architect");
 		expect(content).toContain("--stage critic");
-		expect(content).toContain("do not directly edit `.gjc/_session-{sessionid}/plans`");
+		expect(content).toContain("do not directly edit `$GJC_STATE_DIR/_session-{sessionid}/plans`");
 		expect(content).toContain("gjc state clear --force --mode ralplan");
 		expect(content).toContain('workflowGate: { stage: "ralplan", kind: "approval" }');
 		expect(content).toContain("A role subagent's own session id is transcript/resume identity only");
 		expect(content).toContain("RPC/headless clients receive a `ralplan`/`approval` workflow gate");
 		expect(content).toContain(
-			"Direct `write`, `edit`, or `ast_edit` calls against `.gjc/_session-{sessionid}/specs`, `.gjc/_session-{sessionid}/plans`, `.gjc/_session-{sessionid}/state`, or any other `.gjc/` path are forbidden",
+			"Direct `write`, `edit`, or `ast_edit` calls against `$GJC_STATE_DIR/_session-{sessionid}/specs`, `$GJC_STATE_DIR/_session-{sessionid}/plans`, `$GJC_STATE_DIR/_session-{sessionid}/state`, or any other `.gjc/` path are forbidden",
 		);
 	});
 

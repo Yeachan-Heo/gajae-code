@@ -15,6 +15,7 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { getNotificationConfig } from "../src/sdk/bus/config";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
 import { NotificationSessionController } from "../src/sdk/bus/session-control";
@@ -103,7 +104,7 @@ async function createIsolationHarness(input: {
 		ctx,
 		settings,
 		controller,
-		endpoint: path.join(cwd, ".gjc", "state", "sdk", `${sid}.json`),
+		endpoint: path.join(projectSharedStateRoot(cwd, agentDir), "sdk", `${sid}.json`),
 	};
 }
 

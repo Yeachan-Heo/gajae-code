@@ -1,4 +1,3 @@
-import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import {
 	type Api,
@@ -134,6 +133,7 @@ function credentialStoreOperationError(action: "Login" | "Logout", error: unknow
 	return `${action} failed: credential store operation failed${typeof code === "string" ? ` (${code})` : ""}.`;
 }
 
+import { projectSharedStateRoot } from "../../gjc-runtime/session-layout";
 import {
 	filterAutoImportOAuthCredentials,
 	formatDiscoverySummary,
@@ -456,7 +456,7 @@ export function createNotificationsEditorOperations(
 			try {
 				const input: Parameters<typeof checkNotificationHealth>[0] & { signal?: AbortSignal } = {
 					settings: ctx.settings,
-					stateRoot: path.join(ctx.sessionManager.getCwd(), ".gjc", "state"),
+					stateRoot: projectSharedStateRoot(ctx.sessionManager.getCwd()),
 					probe,
 					provider,
 					signal,
@@ -511,7 +511,7 @@ export function createNotificationsEditorOperations(
 			try {
 				const result = await services.recoverNotifications({
 					settings: ctx.settings,
-					stateRoot: path.join(ctx.sessionManager.getCwd(), ".gjc", "state"),
+					stateRoot: projectSharedStateRoot(ctx.sessionManager.getCwd()),
 				});
 				return {
 					...result,

@@ -3,6 +3,7 @@ import { createHash, createHmac } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { Broker, spawnRegistrationMatches } from "../src/sdk/broker/broker";
 import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
 import { setLifecycleCommandResolverForTest } from "../src/sdk/broker/lifecycle";
@@ -375,7 +376,8 @@ describe("Broker spawn flow driver", () => {
 		const agentDir = await temp();
 		const physical = path.join(agentDir, "private", "var", "folders", "workspace");
 		const lexical = path.join(agentDir, "var", "folders", "workspace");
-		await fs.mkdir(path.join(physical, ".gjc", "state"), { recursive: true });
+		await fs.mkdir(physical, { recursive: true });
+		await fs.mkdir(projectSharedStateRoot(physical, agentDir), { recursive: true });
 		await fs.symlink(path.join(agentDir, "private", "var"), path.join(agentDir, "var"), "dir");
 		const candidate = {
 			sessionId: "child-macos",
@@ -387,7 +389,7 @@ describe("Broker spawn flow driver", () => {
 			locator: {
 				cwd: physical,
 				worktreeRoot: physical,
-				stateRoot: path.join(physical, ".gjc", "state"),
+				stateRoot: projectSharedStateRoot(physical, agentDir),
 			},
 		} as IndexedSession;
 		try {
@@ -395,14 +397,14 @@ describe("Broker spawn flow driver", () => {
 				spawnRegistrationMatches(candidate, {
 					childId: "child-macos",
 					cwd: lexical,
-					stateRoot: path.join(lexical, ".gjc", "state"),
+					stateRoot: projectSharedStateRoot(lexical, agentDir),
 				}),
 			).toBe(true);
 			expect(
 				spawnRegistrationMatches(candidate, {
 					childId: "child-macos",
 					cwd: lexical,
-					stateRoot: path.join(agentDir, "other", ".gjc", "state"),
+					stateRoot: projectSharedStateRoot(path.join(agentDir, "other"), agentDir),
 				}),
 			).toBe(false);
 		} finally {

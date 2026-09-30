@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { Broker, type SpawnPromptLayer } from "../src/sdk/broker/broker";
 import { managedIdentity, managedTaskDomainPath } from "../src/sdk/broker/managed-task-dag";
 import { processIncarnation } from "../src/sdk/broker/process-incarnation";
@@ -100,7 +101,7 @@ async function attest(broker: Broker, cwd: string): Promise<void> {
 		await broker.index.append({
 			type: "host_registered",
 			sessionId: ownerId,
-			locator: { cwd, worktreeRoot: null, stateRoot: path.join(cwd, ".gjc", "state") },
+			locator: { cwd, worktreeRoot: null, stateRoot: projectSharedStateRoot(cwd) },
 			endpointGeneration,
 			pid: process.pid,
 			hostIncarnation: incarnation,
@@ -909,7 +910,7 @@ for (const endpointGeneration of [0, 1]) {
 	await broker.index.append({
 		type: "host_registered",
 		sessionId: ownerId,
-		locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+		locator: { cwd: root, worktreeRoot: null, stateRoot: projectSharedStateRoot(root) },
 		endpointGeneration,
 		pid: process.pid,
 		hostIncarnation: incarnation,

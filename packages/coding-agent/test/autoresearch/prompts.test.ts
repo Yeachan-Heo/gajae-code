@@ -170,7 +170,7 @@ describe("autoresearch two-phase prompts", () => {
 			}
 		}
 		// Session-scoped state is the sanctioned location.
-		expect(iteratePromptTemplate).toContain(".gjc/_session-{id}/autoresearch/");
+		expect(iteratePromptTemplate).toContain("$GJC_STATE_DIR/_session-{id}/autoresearch/");
 		expect(iteratePromptTemplate).toContain("bash autoresearch.sh");
 		expect(iteratePromptTemplate).toContain("METRIC name=value");
 		expect(iteratePromptTemplate).toContain("ASI key=value");

@@ -6,6 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { YAML } from "bun";
 import { safeRm } from "../../../../scripts/safe-cleanup";
+import { projectSharedStateRoot } from "../../src/gjc-runtime/session-layout";
 
 const PROBE = path.join(import.meta.dir, "../fixtures/settings-workflow-migration-probe.ts");
 
@@ -457,7 +458,7 @@ describe("config-root workflow settings migration", () => {
 		// a later `gjc config unset` of the target value would resurrect the
 		// invalid legacy value and exit 2 instead of falling through to
 		// defaults (mirroring the config-root path, where the source is retired).
-		await fs.mkdir(path.join(cwd, ".gjc", "state"), { recursive: true });
+		await fs.mkdir(path.join(cwd, ".gjc"), { recursive: true });
 		await fs.writeFile(
 			path.join(cwd, ".gjc", "config.yml"),
 			YAML.stringify({ gjc: { ralplan: { maxIterations: 7 } } }, null, 2),
@@ -473,7 +474,7 @@ describe("config-root workflow settings migration", () => {
 
 		// The migrated-keys ownership marker records the shadowed key.
 		const marker = JSON.parse(
-			await fs.readFile(path.join(cwd, ".gjc", "state", "settings.json.migrated-keys"), "utf8"),
+			await fs.readFile(path.join(projectSharedStateRoot(cwd, agentDir), "settings.json.migrated-keys"), "utf8"),
 		) as string[];
 		expect(marker).toContain("gjc.ralplan.maxIterations");
 		// Simulate `gjc config unset`: remove the key from the project config.
@@ -643,7 +644,10 @@ describe("config-root workflow settings migration", () => {
 		const source = path.join(home, ".gjc", "settings.json");
 		// The project evidence path is occupied -> the PROJECT migration falls
 		// back into the project config.yml with the project marker name.
-		await fs.mkdir(path.join(home, ".gjc", "state", "settings.json.strict-invalid"), { recursive: true });
+		await fs.mkdir(
+			path.join(projectSharedStateRoot(home, path.join(home, ".gjc", "agent")), "settings.json.strict-invalid"),
+			{ recursive: true },
+		);
 		await fs.writeFile(source, JSON.stringify({ "gjc.ralplan.maxIterations": "bad" }));
 
 		// Run from HOME (collision): only the project migration writes a fallback.
@@ -2146,6 +2150,20 @@ type ProjectProbeResult = {
 	settingsGetMaxIterations?: unknown;
 };
 
+/**
+ * Agent dir the project probe runs with: the isolated temp home's default
+ * profile when a home is given, otherwise a sibling of the workspace, so project
+ * runtime state never lands in the runner's real profile.
+ */
+function projectProbeAgentDir(cwd: string, home?: string): string {
+	return home ? path.join(home, ".gjc", "agent") : `${cwd}.agent`;
+}
+
+/** Project runtime state root the project probe resolves for `cwd`. */
+function probeStateRoot(cwd: string, home?: string): string {
+	return projectSharedStateRoot(cwd, projectProbeAgentDir(cwd, home));
+}
+
 async function runProjectProbe(
 	cwd: string,
 	options: { viaTrigger?: boolean; home?: string; expectLoadFailure?: boolean; env?: Record<string, string> } = {},
@@ -2161,7 +2179,7 @@ async function runProjectProbe(
 		env: {
 			...process.env,
 			// A runner's real agent config must never leak into these probes.
-			GJC_CODING_AGENT_DIR: undefined,
+			GJC_CODING_AGENT_DIR: options.home ? undefined : projectProbeAgentDir(cwd),
 			PI_CODING_AGENT_DIR: undefined,
 			GJC_CONFIG_DIR: undefined,
 			PI_CONFIG_DIR: undefined,
@@ -2360,9 +2378,9 @@ describe("project workflow settings migration", () => {
 		// corrupted. A stale global malformed marker must NOT be published: a
 		// deliberate `gjc config unset` of an owned key must keep falling through
 		// to the lower layer/default instead of exiting 2.
-		await fs.mkdir(path.join(cwd, ".gjc", "state"), { recursive: true });
+		await fs.mkdir(probeStateRoot(cwd), { recursive: true });
 		await fs.writeFile(
-			path.join(cwd, ".gjc", "state", "settings.json.migrated-keys"),
+			path.join(probeStateRoot(cwd), "settings.json.migrated-keys"),
 			JSON.stringify(["gjc.ralplan.maxIterations", "gjc.ralplan.autoHandoff", "gjc.ralplan.maxReviewPassesPerLane"]),
 		);
 		await fs.writeFile(path.join(cwd, ".gjc", "settings.json"), "{ corrupted");
@@ -2448,7 +2466,7 @@ describe("project workflow settings migration", () => {
 		await fs.mkdir(path.join(cwd, ".gjc"), { recursive: true });
 		// The migrated-key marker path is occupied by a directory, so only the
 		// marker write fails (the evidence file is unaffected).
-		await fs.mkdir(path.join(cwd, ".gjc", "state", "settings.json.migrated-keys"), { recursive: true });
+		await fs.mkdir(path.join(probeStateRoot(cwd), "settings.json.migrated-keys"), { recursive: true });
 		// An invalid strict key (evidence) plus a valid key (would be copied).
 		await fs.writeFile(
 			path.join(cwd, ".gjc", "settings.json"),
@@ -2465,19 +2483,20 @@ describe("project workflow settings migration", () => {
 
 	test("an unreadable ownership marker leaves an absent config.yml absent so the fallback stays active", async () => {
 		const cwd = await tempDir();
+		const home = await tempDir();
 		await fs.mkdir(path.join(cwd, ".gjc"), { recursive: true });
 		// The migrated-key marker path is occupied by a directory, so only the
 		// marker write fails. config.yml does NOT exist yet: the rollback would
 		// otherwise leave an empty authoritative config.yml behind and silently
 		// disable the retained settings.json fallback while the marker stays
 		// unwritable.
-		await fs.mkdir(path.join(cwd, ".gjc", "state", "settings.json.migrated-keys"), { recursive: true });
+		await fs.mkdir(path.join(probeStateRoot(cwd, home), "settings.json.migrated-keys"), { recursive: true });
 		await fs.writeFile(
 			path.join(cwd, ".gjc", "settings.json"),
 			JSON.stringify({ "gjc.ralplan.maxIterations": 7, "gjc.ralplan.maxReviewPassesPerLane": 2 }),
 		);
 
-		const result = await runProjectProbe(cwd, { home: await tempDir(), expectLoadFailure: true });
+		const result = await runProjectProbe(cwd, { home, expectLoadFailure: true });
 		// The unreadable marker ABORTS the migration before any publication:
 		// the retained source stays active and no config.yml is created, so the
 		// fallback resolution keeps working on every retry.
@@ -2492,7 +2511,7 @@ describe("project workflow settings migration", () => {
 		await fs.mkdir(path.join(cwd, ".gjc"), { recursive: true });
 		// The strict-evidence path is occupied by a directory, so the evidence
 		// write fails and the invalid value falls back into config.yml.
-		await fs.mkdir(path.join(cwd, ".gjc", "state", "settings.json.strict-invalid"), { recursive: true });
+		await fs.mkdir(path.join(probeStateRoot(cwd), "settings.json.strict-invalid"), { recursive: true });
 		await fs.writeFile(
 			path.join(cwd, ".gjc", "settings.json"),
 			JSON.stringify({ "gjc.ralplan.maxIterations": "bad" }),
@@ -2515,7 +2534,7 @@ describe("project workflow settings migration", () => {
 	test("fallback cleanup preserves a user's newer config.yml override", async () => {
 		const cwd = await tempDir();
 		await fs.mkdir(path.join(cwd, ".gjc"), { recursive: true });
-		await fs.mkdir(path.join(cwd, ".gjc", "state", "settings.json.strict-invalid"), { recursive: true });
+		await fs.mkdir(path.join(probeStateRoot(cwd), "settings.json.strict-invalid"), { recursive: true });
 		await fs.writeFile(
 			path.join(cwd, ".gjc", "settings.json"),
 			JSON.stringify({ "gjc.ralplan.maxIterations": "bad" }),
@@ -2544,7 +2563,7 @@ describe("project workflow settings migration", () => {
 		// write fails; the malformed source must still keep the ralplan exit-2
 		// error observable through guaranteed-invalid placeholder values in
 		// config.yml (the only surface the strict resolver reads).
-		await fs.mkdir(path.join(cwd, ".gjc", "state", "settings.json.strict-invalid"), { recursive: true });
+		await fs.mkdir(path.join(probeStateRoot(cwd), "settings.json.strict-invalid"), { recursive: true });
 		await fs.writeFile(path.join(cwd, ".gjc", "settings.json"), "{ not json");
 
 		const first = await runProjectProbe(cwd);
@@ -2563,7 +2582,7 @@ describe("project workflow settings migration", () => {
 	test("a malformed-source fallback skips keys with a valid config.yml override", async () => {
 		const cwd = await tempDir();
 		await fs.mkdir(path.join(cwd, ".gjc"), { recursive: true });
-		await fs.mkdir(path.join(cwd, ".gjc", "state", "settings.json.strict-invalid"), { recursive: true });
+		await fs.mkdir(path.join(probeStateRoot(cwd), "settings.json.strict-invalid"), { recursive: true });
 		// A valid explicit config.yml value must win over the malformed source:
 		// no placeholder overwrites it, and the unresolved strict keys still get
 		// their invalid placeholders so exit 2 stays observable for them.
@@ -2581,7 +2600,7 @@ describe("project workflow settings migration", () => {
 	test("a malformed-source fallback never overwrites a user's present invalid config.yml value", async () => {
 		const cwd = await tempDir();
 		await fs.mkdir(path.join(cwd, ".gjc"), { recursive: true });
-		await fs.mkdir(path.join(cwd, ".gjc", "state", "settings.json.strict-invalid"), { recursive: true });
+		await fs.mkdir(path.join(probeStateRoot(cwd), "settings.json.strict-invalid"), { recursive: true });
 		// The user's pre-existing INVALID value already keeps the exit-2 error
 		// observable on its own, so the fallback must not replace it with a
 		// placeholder (a later unset/cleanup would then delete user data).
@@ -2604,18 +2623,19 @@ describe("project workflow settings migration", () => {
 
 	test("an all-present migration surfaces a migrated-keys marker failure instead of silent completion", async () => {
 		const cwd = await tempDir();
+		const home = await tempDir();
 		await fs.mkdir(path.join(cwd, ".gjc"), { recursive: true });
 		// config.yml already holds every valid source key (all-present); the
 		// migrated-keys marker path is occupied by a directory so ownership
 		// cannot be durably recorded.
-		await fs.mkdir(path.join(cwd, ".gjc", "state", "settings.json.migrated-keys"), { recursive: true });
+		await fs.mkdir(path.join(probeStateRoot(cwd, home), "settings.json.migrated-keys"), { recursive: true });
 		await fs.writeFile(
 			path.join(cwd, ".gjc", "config.yml"),
 			YAML.stringify({ gjc: { ralplan: { maxIterations: 9 } } }, null, 2),
 		);
 		await fs.writeFile(path.join(cwd, ".gjc", "settings.json"), JSON.stringify({ "gjc.ralplan.maxIterations": 7 }));
 
-		const result = await runProjectProbe(cwd, { home: await tempDir(), expectLoadFailure: true });
+		const result = await runProjectProbe(cwd, { home, expectLoadFailure: true });
 		// The unreadable marker (EISDIR on the occupied path) ABORTS the
 		// migration: the user's pre-existing valid value stays untouched instead
 		// of being re-imported over by a markerless publication.
@@ -2625,11 +2645,12 @@ describe("project workflow settings migration", () => {
 
 	test("a marker re-read failure after publication rolls the committed values back", async () => {
 		const cwd = await tempDir();
+		await fs.mkdir(path.join(cwd, ".gjc"), { recursive: true });
 		const home = await tempDir();
-		await fs.mkdir(path.join(cwd, ".gjc", "state"), { recursive: true });
+		await fs.mkdir(probeStateRoot(cwd, home), { recursive: true });
 		// The marker is readable for the initial read; the seam replaces it
 		// with a DIRECTORY before the post-publication re-read.
-		await fs.writeFile(path.join(cwd, ".gjc", "state", "settings.json.migrated-keys"), JSON.stringify([]));
+		await fs.writeFile(path.join(probeStateRoot(cwd, home), "settings.json.migrated-keys"), JSON.stringify([]));
 		// A VALID key that is actually published (so the post-publication marker
 		// re-read hook is reached) plus an INVALID strict key, whose evidence is
 		// current and must survive the rollback.
@@ -2638,7 +2659,7 @@ describe("project workflow settings migration", () => {
 			JSON.stringify({ "gjc.ralplan.maxIterations": 7, "gjc.ralplan.autoHandoff": "bad" }),
 		);
 		await fs.writeFile(
-			path.join(cwd, ".gjc", "state", "settings.json.strict-invalid"),
+			path.join(probeStateRoot(cwd, home), "settings.json.strict-invalid"),
 			JSON.stringify({ version: 2, keys: [{ key: "gjc.ralplan.autoHandoff", value: "bad" }] }),
 		);
 
@@ -2926,7 +2947,7 @@ describe("project workflow settings migration", () => {
 		await fs.mkdir(path.join(cwd, ".gjc"), { recursive: true });
 		// The strict-evidence path is occupied by a directory, so the evidence
 		// write fails and the invalid value would fall back into config.yml.
-		await fs.mkdir(path.join(cwd, ".gjc", "state", "settings.json.strict-invalid"), { recursive: true });
+		await fs.mkdir(path.join(probeStateRoot(cwd), "settings.json.strict-invalid"), { recursive: true });
 		await fs.writeFile(
 			path.join(cwd, ".gjc", "config.yml"),
 			YAML.stringify({ gjc: { ralplan: { maxIterations: "user-mistake" } } }, null, 2),
@@ -2948,7 +2969,7 @@ describe("project workflow settings migration", () => {
 		await fs.mkdir(path.join(cwd, ".gjc"), { recursive: true });
 		// The strict-evidence path is occupied by a directory, so the fallback
 		// path stays active across every load.
-		await fs.mkdir(path.join(cwd, ".gjc", "state", "settings.json.strict-invalid"), { recursive: true });
+		await fs.mkdir(path.join(probeStateRoot(cwd), "settings.json.strict-invalid"), { recursive: true });
 		await fs.writeFile(
 			path.join(cwd, ".gjc", "settings.json"),
 			JSON.stringify({ "gjc.ralplan.maxIterations": "badA" }),
@@ -3029,7 +3050,7 @@ describe("project workflow settings migration", () => {
 	test("fallback cleanup leaves future-schema targets and markers untouched", async () => {
 		const cwd = await tempDir();
 		await fs.mkdir(path.join(cwd, ".gjc"), { recursive: true });
-		await fs.mkdir(path.join(cwd, ".gjc", "state", "settings.json.strict-invalid"), { recursive: true });
+		await fs.mkdir(path.join(probeStateRoot(cwd), "settings.json.strict-invalid"), { recursive: true });
 		// Fallback path: source invalid -> config.yml fallback value + marker.
 		await fs.writeFile(
 			path.join(cwd, ".gjc", "settings.json"),
@@ -3058,9 +3079,10 @@ describe("project workflow settings migration", () => {
 		const cwd = await tempDir();
 		const home = await tempDir();
 		await fs.mkdir(path.join(cwd, ".gjc"), { recursive: true });
-		// .gjc/state is a FILE, so the project evidence cannot be written; the
-		// read-only future-schema target cannot carry fallback placeholders.
-		await fs.writeFile(path.join(cwd, ".gjc", "state"), "occupied");
+		// The project state root is a FILE, so the project evidence cannot be
+		// written; the read-only future-schema target cannot carry fallback placeholders.
+		await fs.mkdir(path.dirname(probeStateRoot(cwd, home)), { recursive: true });
+		await fs.writeFile(probeStateRoot(cwd, home), "occupied");
 		await fs.writeFile(path.join(cwd, ".gjc", "config.yml"), YAML.stringify({ configSchemaVersion: 9999 }, null, 2));
 		await fs.writeFile(
 			path.join(cwd, ".gjc", "settings.json"),
@@ -3068,7 +3090,7 @@ describe("project workflow settings migration", () => {
 		);
 
 		const result = await runProjectProbe(cwd, { home, expectLoadFailure: true });
-		// The unreadable marker (ENOTDIR: .gjc/state is a FILE) ABORTS the
+		// The unreadable marker (ENOTDIR: the project state root is a FILE) ABORTS the
 		// migration instead of reimporting the stale value with an empty
 		// ownership set; the read-only future-schema target is left untouched.
 		expect(result.loadFailed).toBe(true);
@@ -3080,7 +3102,7 @@ describe("project workflow settings migration", () => {
 		await fs.mkdir(path.join(cwd, ".gjc"), { recursive: true });
 		// The migrated-key marker path is occupied by a directory, so the marker
 		// read fails (EISDIR) and the migration aborts.
-		await fs.mkdir(path.join(cwd, ".gjc", "state", "settings.json.migrated-keys"), { recursive: true });
+		await fs.mkdir(path.join(probeStateRoot(cwd, home), "settings.json.migrated-keys"), { recursive: true });
 		// config.yml already contains a PRESENT-but-invalid maxIterations value
 		// (user data) and the source holds the valid legacy value that repairs it.
 		await fs.writeFile(

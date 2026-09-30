@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { postmortem } from "@gajae-code/utils";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
 import {
 	cleanupFixtureRoots,
@@ -72,7 +73,7 @@ async function createHarness(prefix: string) {
 		},
 	} as never;
 
-	const endpoint = path.join(cwd, ".gjc", "state", "sdk", `${sid}.json`);
+	const endpoint = path.join(projectSharedStateRoot(cwd, agentDir), "sdk", `${sid}.json`);
 	return { handlers, ctx, sid, endpoint, cleanup };
 }
 

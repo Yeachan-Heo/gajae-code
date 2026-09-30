@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { acpMcpLaunchFailure } from "../src/sdk/acp";
 import { Broker } from "../src/sdk/broker/broker";
 import {
@@ -251,7 +252,7 @@ test("win32 ready-then-exit is typed ready_then_exited with exit evidence and sa
 		expect(response.error.message).toMatch(/exit=9/);
 		expect(response.error.message).not.toContain("ready-then-exit-secret");
 		expect(await broker.handleRequest("session.create", input, "win32-rte")).toEqual(response);
-		const sdkDir = path.join(cwd, ".gjc", "state", "sdk");
+		const sdkDir = path.join(projectSharedStateRoot(cwd), "sdk");
 		const entries = await fs.readdir(sdkDir).catch(() => [] as string[]);
 		const canonical = entries.filter(entry => !entry.startsWith(".gjc-delete-"));
 		expect(canonical.some(entry => entry.endsWith(".lifecycle.json"))).toBe(false);

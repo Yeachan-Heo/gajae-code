@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import * as native from "@gajae-code/natives";
 import { FileLockTestHooks } from "../src/config/file-lock";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { endpointIncarnation } from "../src/sdk/broker/endpoint-authority";
 import {
 	canonicalSessionCwd,
@@ -1080,7 +1081,7 @@ describe("SDK session index", () => {
 			indexSeq: 1,
 			type: "host_registered" as const,
 			sessionId: "legacy-prefix",
-			locator: { repo: dir, stateRoot: path.join(dir, ".gjc", "state") },
+			locator: { repo: dir, stateRoot: projectSharedStateRoot(dir) },
 			endpointGeneration: 1,
 			pid: process.pid,
 			ts: 1,
@@ -2278,7 +2279,7 @@ describe("SDK session index", () => {
 			indexSeq: 1,
 			type: "host_registered" as const,
 			sessionId: "legacy-session",
-			locator: { repo: dir, stateRoot: path.join(dir, ".gjc", "state") },
+			locator: { repo: dir, stateRoot: projectSharedStateRoot(dir) },
 			endpointGeneration: 1,
 			pid: process.pid,
 			ts: Date.now(),
@@ -2306,7 +2307,7 @@ describe("SDK session index", () => {
 			indexSeq: 1,
 			type: "host_registered" as const,
 			sessionId: "mixed-session",
-			locator: { cwd: dir, worktreeRoot: null, stateRoot: path.join(dir, ".gjc", "state"), repo: dir },
+			locator: { cwd: dir, worktreeRoot: null, stateRoot: projectSharedStateRoot(dir), repo: dir },
 			endpointGeneration: 1,
 			pid: process.pid,
 			ts: Date.now(),

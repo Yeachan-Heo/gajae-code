@@ -13,6 +13,7 @@ import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { SkillTool } from "@gajae-code/coding-agent/tools/skill";
 import { ToolError } from "@gajae-code/coding-agent/tools/tool-errors";
 import { safeRm } from "../../../../scripts/safe-cleanup";
+import { projectStateRoot } from "../../src/gjc-runtime/session-layout";
 
 async function makeSkill(name: string, content: string): Promise<Skill> {
 	const dir = await mkdtemp(path.join(os.tmpdir(), `skill-tool-${name}-`));
@@ -69,8 +70,8 @@ function encodeSessionSegment(value: string): string {
 }
 
 function stateBaseDir(cwd: string, sessionId?: string): string {
-	if (!sessionId) return path.join(cwd, ".gjc", "_session-test", "state");
-	return path.join(cwd, ".gjc", `_session-${encodeSessionSegment(sessionId)}`, "state");
+	if (!sessionId) return path.join(projectStateRoot(cwd), "_session-test", "state");
+	return path.join(projectStateRoot(cwd), `_session-${encodeSessionSegment(sessionId)}`, "state");
 }
 
 async function writeCallerModeState(

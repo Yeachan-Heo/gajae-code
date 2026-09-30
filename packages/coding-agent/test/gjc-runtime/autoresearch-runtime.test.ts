@@ -20,6 +20,7 @@ import {
 import {
 	activeSnapshotPath,
 	autoresearchRlmArtifactRoot,
+	projectStateRoot,
 	sessionAutoresearchDir,
 	sessionAutoresearchRunsDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
@@ -95,13 +96,13 @@ describe("autoresearch session layout", () => {
 	it("resolves every autoresearch path under .gjc/_session-{id}/", () => {
 		const root = "/repo";
 		const sessionDir = sessionAutoresearchDir(root, TEST_SESSION_ID);
-		expect(sessionDir).toBe(path.join(root, ".gjc", `_session-${TEST_SESSION_ID}`, "autoresearch"));
+		expect(sessionDir).toBe(path.join(projectStateRoot(root), `_session-${TEST_SESSION_ID}`, "autoresearch"));
 		expect(sessionAutoresearchRunsDir(root, TEST_SESSION_ID)).toBe(path.join(sessionDir, "runs"));
 		expect(autoresearchRlmArtifactRoot(root, TEST_SESSION_ID, "run-1")).toBe(path.join(sessionDir, "runs", "run-1"));
 
 		const paths = getAutoresearchPaths(root, TEST_SESSION_ID);
 		for (const candidate of [paths.dir, paths.missionPath, paths.ledgerPath]) {
-			const relative = path.relative(path.join(root, ".gjc", `_session-${TEST_SESSION_ID}`), candidate);
+			const relative = path.relative(path.join(projectStateRoot(root), `_session-${TEST_SESSION_ID}`), candidate);
 			expect(relative.startsWith("..")).toBe(false);
 			expect(path.isAbsolute(relative)).toBe(false);
 		}
@@ -149,11 +150,11 @@ describe("autoresearch mission write boundary (AC-16)", () => {
 		const root = await tempDir();
 		// A data file at the exact session root a mode would have been inferred
 		// from, if the runtime inferred modes — it must not.
-		await fs.mkdir(path.join(root, ".gjc", `_session-${TEST_SESSION_ID}`, "autoresearch"), {
+		await fs.mkdir(path.join(projectStateRoot(root), `_session-${TEST_SESSION_ID}`, "autoresearch"), {
 			recursive: true,
 		});
 		await fs.writeFile(
-			path.join(root, ".gjc", `_session-${TEST_SESSION_ID}`, "autoresearch", "DATA.md"),
+			path.join(projectStateRoot(root), `_session-${TEST_SESSION_ID}`, "autoresearch", "DATA.md"),
 			"# dataset\n",
 			"utf-8",
 		);

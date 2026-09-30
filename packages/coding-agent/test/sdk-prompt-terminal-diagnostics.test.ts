@@ -6,6 +6,7 @@ import { Agent, type AgentEvent } from "@gajae-code/agent-core";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { logger } from "@gajae-code/utils";
 import type { ExtensionActions, ExtensionAPI } from "../src/extensibility/extensions/types";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { createNotificationsExtension } from "../src/sdk/bus";
 
@@ -120,7 +121,7 @@ isolatedSdkHostTest(
 		const unsubscribe = agent.subscribe(event => {
 			void handlers.get(event.type)?.(event, sessionContext);
 		});
-		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		const endpointFile = path.join(projectSharedStateRoot(cwd), "sdk", `${sessionId}.json`);
 		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
 		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
 
@@ -230,7 +231,7 @@ isolatedSdkHostTest(
 		const unsubscribe = agent.subscribe(event => {
 			void handlers.get(event.type)?.(event, sessionContext);
 		});
-		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		const endpointFile = path.join(projectSharedStateRoot(cwd), "sdk", `${sessionId}.json`);
 		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
 		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
 
@@ -289,7 +290,7 @@ isolatedSdkHostTest(
 		const handlers = await start(sessionContext, async () => {
 			throw new Error(reason);
 		});
-		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		const endpointFile = path.join(projectSharedStateRoot(cwd), "sdk", `${sessionId}.json`);
 		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
 		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
 
@@ -367,7 +368,7 @@ isolatedSdkHostTest(
 		const sessionId = `sdk-prompt-terminal-cancel-${Date.now()}`;
 		const sessionContext = context(cwd, sessionId);
 		const handlers = await start(sessionContext);
-		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		const endpointFile = path.join(projectSharedStateRoot(cwd), "sdk", `${sessionId}.json`);
 		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
 		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
 
@@ -430,7 +431,7 @@ isolatedSdkHostTest(
 		const sessionId = `sdk-prompt-terminal-paused-${Date.now()}`;
 		const sessionContext = context(cwd, sessionId);
 		const handlers = await start(sessionContext);
-		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		const endpointFile = path.join(projectSharedStateRoot(cwd), "sdk", `${sessionId}.json`);
 		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
 		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
 		const frames: Record<string, unknown>[] = [];
@@ -565,7 +566,7 @@ isolatedSdkHostTest(
 		const sessionId = `sdk-f2-thrown-${Date.now()}`;
 		const sessionContext = context(cwd, sessionId);
 		const handlers = await start(sessionContext, () => undefined);
-		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		const endpointFile = path.join(projectSharedStateRoot(cwd), "sdk", `${sessionId}.json`);
 		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
 		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
 
@@ -627,7 +628,7 @@ isolatedSdkHostTest(
 		const sessionId = `sdk-f2-stream-${Date.now()}`;
 		const sessionContext = context(cwd, sessionId);
 		const handlers = await start(sessionContext, () => undefined);
-		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		const endpointFile = path.join(projectSharedStateRoot(cwd), "sdk", `${sessionId}.json`);
 		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
 		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
 

@@ -132,7 +132,7 @@ export function migrateWorkflowState(raw: Record<string, unknown>, skill: string
  * Readers that need compatibility with old on-disk workflow state shapes must call
  * this in-memory helper and must never call `migrateAndPersistLegacyState`. The
  * persist variant is reserved for explicit state migration commands because it is
- * the only path allowed to write normalized upgrades back to `.gjc/state/**`.
+ * the only path allowed to write normalized upgrades back to `$GJC_STATE_DIR/state/**`.
  */
 export function normalizeLegacyState(raw: Record<string, unknown>, skill: string): NormalizeLegacyStateResult {
 	const canonicalSkill = canonicalSkillOrThrow(skill);

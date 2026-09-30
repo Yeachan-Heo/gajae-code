@@ -22,7 +22,11 @@ const uncertain = () => "uncertain" as const;
 // `setProcessIncarnationForTest` therefore exercises the real code path without
 // standing up a full broker.
 function fakeBroker(index: SessionIndex, incarnationReader: (pid: number) => string | undefined): Broker {
-	const broker = { index, ledger: { get: () => undefined } } as unknown as Broker;
+	const broker = {
+		index,
+		ledger: { get: () => undefined },
+		settings: { agentDir: indexAgentDirs.get(index) },
+	} as unknown as Broker;
 	setProcessIncarnationForTest(broker, incarnationReader);
 	return broker;
 }
@@ -49,10 +53,15 @@ const registration = (
 const brokers: Broker[] = [];
 const dirs: string[] = [];
 
+/** Agent dir each scenario's index (and its stand-in broker) is bound to. */
+const indexAgentDirs = new WeakMap<SessionIndex, string>();
+
 async function scenario(): Promise<{ index: SessionIndex; stateRoot: string }> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-forced-stale-release-"));
 	dirs.push(dir);
-	return { index: new SessionIndex(dir), stateRoot: path.join(dir, "state") };
+	const index = new SessionIndex(dir);
+	indexAgentDirs.set(index, dir);
+	return { index, stateRoot: path.join(dir, "state") };
 }
 
 afterEach(async () => {

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { projectSharedStateRoot } from "../../src/gjc-runtime/session-layout";
 import { type PlanRequest, planTmuxOwnerIsolationSync } from "../../src/gjc-runtime/tmux-owner-isolation";
 import { resolveOwner } from "../../src/harness-control-plane/owner";
 import { createHarnessCliEnvWithFixtureBroker, type HarnessCliBrokerFixture } from "./cli-workspace-env";
@@ -82,9 +83,11 @@ async function startSdkFixture(): Promise<void> {
 			},
 		},
 	});
-	await mkdir(path.join(workspace, ".gjc", "state", "sdk"), { recursive: true });
+	await mkdir(path.join(projectSharedStateRoot(workspace, cliEnv.env.GJC_CODING_AGENT_DIR), "sdk"), {
+		recursive: true,
+	});
 	await writeFile(
-		path.join(workspace, ".gjc", "state", "sdk", `${SID}.json`),
+		path.join(projectSharedStateRoot(workspace, cliEnv.env.GJC_CODING_AGENT_DIR), "sdk", `${SID}.json`),
 		JSON.stringify({ url: `ws://127.0.0.1:${sdkServer.port}`, token: "test-token" }),
 	);
 }
@@ -340,7 +343,9 @@ describe("gjc harness start --detach (detached owner lifecycle, B1)", () => {
 	it("reports blocked only after detached owner endpoint remains unavailable", async () => {
 		tmuxCommand = path.join(root, "missing-tmux");
 		disableSdkHost = true;
-		await rm(path.join(workspace, ".gjc", "state", "sdk", `${SID}.json`), { force: true });
+		await rm(path.join(projectSharedStateRoot(workspace, cliEnv.env.GJC_CODING_AGENT_DIR), "sdk", `${SID}.json`), {
+			force: true,
+		});
 		const started = await runHarness([
 			"start",
 			"--input",

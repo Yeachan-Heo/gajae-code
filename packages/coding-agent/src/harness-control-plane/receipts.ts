@@ -1,7 +1,7 @@
 /**
  * Harness receipt schemas + validators (M7).
  *
- * Receipts are NEW schemas that FOLLOW the .gjc/state + ultragoal-ledger patterns
+ * Receipts are NEW schemas that FOLLOW the project state-root + ultragoal-ledger patterns
  * (atomic, append-indexed, immutable) — not drop-in reuse. Every receipt carries a
  * canonical-JSON sha256 over its content (excluding the hash field) plus referenced
  * artifact hashes; validators recompute and FAIL CLOSED on tamper/mismatch.

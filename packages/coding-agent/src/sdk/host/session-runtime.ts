@@ -35,6 +35,7 @@ import {
 } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import type { AgentEndEvent } from "../../extensibility/shared-events";
+import { projectSharedStateRoot } from "../../gjc-runtime/session-layout";
 import { normalizeGoal } from "../../goals/state";
 import { toAgentWireEventPayload } from "../../modes/shared/agent-wire/event-envelope";
 import type { AgentSessionEvent } from "../../session/agent-session";
@@ -131,7 +132,6 @@ import {
 	type SdkCapabilities,
 	type SdkSurfacePolicy,
 } from "./surface-policy";
-
 import type { BrokerIndexWriter, SdkFrame } from "./types";
 
 const execFileAsync = promisify(execFile);
@@ -4711,7 +4711,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const sessionId = ctx.sessionManager.getSessionId();
 		const sessionFile = ctx.sessionManager.getSessionFile?.();
 		if (sessionFile) return `${sessionId}\u0000${sessionFile}`;
-		const stateRoot = path.join(ctx.cwd, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(ctx.cwd, options.agentDir);
 		return `${sessionId}\u0000${resolveReconciliationSessionFile(undefined, stateRoot, sessionId)}`;
 	};
 	const lifecycleStateForContext = (
@@ -6118,7 +6118,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	const startRuntime = async (ctx: ExtensionContext): Promise<void> => {
 		if (active) return;
 		const sessionId = ctx.sessionManager.getSessionId();
-		const stateRoot = path.join(ctx.cwd, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(ctx.cwd, options.agentDir);
 		const token = crypto.randomBytes(24).toString("base64url");
 		const transport = await options.createTransport({ sessionId, stateRoot, token });
 		const revisions = new RevisionStore(sessionId, Date.now, { storageDir: stateRoot });

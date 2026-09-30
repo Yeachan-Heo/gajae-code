@@ -13,7 +13,7 @@ Use when the user asks for `autoresearch`, or gives a bounded research goal whos
 
 ```
 /skill:autoresearch "<research goal>"
-/skill:autoresearch --spec .gjc/_session-{sessionid}/specs/deep-interview-<slug>.md
+/skill:autoresearch --spec $GJC_STATE_DIR/_session-{sessionid}/specs/deep-interview-<slug>.md
 ```
 
 Invoke this workflow as `/skill:autoresearch`; the durable state behind it is driven by the `gjc autoresearch` runtime command.
@@ -22,7 +22,7 @@ Invoke this workflow as `/skill:autoresearch`; the durable state behind it is dr
 
 `autoresearch` runs one goal-directed research mission: it interleaves web research with data/environment experimentation and ends on a single structured, best-effort verdict. The verdict receipt carries a structured `status`, `evidence[]`, `caveats[]`, and the `evaluator` identity that issued it. The mission is research, NOT implementation: its durable outputs are findings, evidence, run records, and a verdict — never product code.
 
-All mission state persists per session under `.gjc/_session-{sessionid}/autoresearch/` and survives across `gjc autoresearch` invocations. The global `~/.gjc/autoresearch` store is never written.
+All mission state persists per session under `$GJC_STATE_DIR/_session-{sessionid}/autoresearch/` and survives across `gjc autoresearch` invocations. The global `~/.gjc/autoresearch` store is never written.
 
 ## Always-used command examples
 
@@ -76,7 +76,7 @@ Lifecycle:
 - **Create** — right after the mission artifact is written (both spec and cold intake), call `goal({"op":"get"})`; create only when it returns no goal or a terminal `complete`/`dropped` goal. Use `goal({"op":"create","objective":"Drive the autoresearch mission '<mission objective>' to a persisted structured verdict receipt"})`. No goal exists during intake questioning, so `ask`-driven cold-intake clarification is unaffected.
 - **Collision rule** — an `active` **or `paused`** goal is a collision, not an invitation to call `create`: never replace, resume, complete, or drop a different goal. If the existing goal has this mission's exact objective, continue its lifecycle; otherwise run the mission without goal mode and leave the other goal untouched. This matters because the goal runtime rejects `create` over any nonterminal goal, including a paused one.
 - **Resume rule** — when re-entering a mission (`gjc autoresearch read --json`), inspect both the latest persisted verdict and `goal({"op":"get"})`. With no verdict or an explicit `status.disposition: "inconclusive"`, create a goal only when no goal or a terminal goal exists; resume a matching paused goal with `goal({"op":"resume"})`, continue a matching active goal, and honor any different active/paused goal as a collision. With `status.disposition: "conclusive"`, never create or resume a new goal: complete the matching nonterminal goal if one exists, otherwise retry only the pending mission clear. A missing or different disposition is treated as open rather than auto-cleared.
-- **Complete** — after a structured verdict receipt is persisted under `.gjc/_session-{sessionid}/autoresearch/`, call `goal({"op":"complete"})` exactly once for the matching nonterminal mission goal. Any verdict completes the goal-tracking pass, including best-effort and inconclusive verdicts; an inconclusive mission stays open for follow-up, but its current goal pass is complete. Verdict writes themselves are append-only and not idempotent: after an uncertain verdict command, read the latest ledger/receipt before retrying and do not issue a duplicate verdict merely because the first response was lost. If goal completion or the following clear fails, retain the durable state and retry on re-entry rather than issuing a second completion or dropping a completed goal.
+- **Complete** — after a structured verdict receipt is persisted under `$GJC_STATE_DIR/_session-{sessionid}/autoresearch/`, call `goal({"op":"complete"})` exactly once for the matching nonterminal mission goal. Any verdict completes the goal-tracking pass, including best-effort and inconclusive verdicts; an inconclusive mission stays open for follow-up, but its current goal pass is complete. Verdict writes themselves are append-only and not idempotent: after an uncertain verdict command, read the latest ledger/receipt before retrying and do not issue a duplicate verdict merely because the first response was lost. If goal completion or the following clear fails, retain the durable state and retry on re-entry rather than issuing a second completion or dropping a completed goal.
 - **Auto-clear** — only `status.disposition: "conclusive"` is terminal for mission cleanup; best-effort evidence and confidence do not by themselves determine terminality. Immediately after completing the matching goal, run `gjc autoresearch clear` so no stale conclusive mission artifact lingers. This automatic clear follows a completed goal and never calls `goal({"op":"drop"})`; if the clear fails, retry it on re-entry without creating a new goal. Inconclusive, missing, or other dispositions skip the clear — the mission stays open for follow-up under the existing non-terminal contract.
 - **Drop** — call `goal({"op":"drop"})` only for this mission's matching nonterminal goal, whether `active` or `paused`: on a manual `gjc autoresearch clear` (pre-verdict or open-inconclusive mission), on handoff to `/skill:ralplan`, `/skill:deep-interview`, or `/skill:ultragoal`, and on user cancel. Never drop a different goal. The post-verdict auto-clear is exempt — its goal is already complete, and a completed goal is never dropped.
 
@@ -116,10 +116,10 @@ The mission ends on one mission-level structured verdict: `status` (structured d
 
 ## Artifacts
 
-- `.gjc/_session-{sessionid}/autoresearch/` — mission artifact, append-only JSONL ledger, session-scoped run records (plus the TUI run-table dashboard).
+- `$GJC_STATE_DIR/_session-{sessionid}/autoresearch/` — mission artifact, append-only JSONL ledger, session-scoped run records (plus the TUI run-table dashboard).
 - The ledger appends `mission_created`, `mode_set`, `run_logged`, `verdict_issued`, `critic_recorded`, and `mission_cleared` events; verdict and critic receipts ride on their events as structured data.
 - Persist everything through `gjc autoresearch`; never hand-edit `.gjc/` (no direct `write`/`edit`/`ast_edit` against `.gjc/` paths without an explicit force override).
-- On interruption, resume via `gjc autoresearch read --json`; do not read or edit `.gjc/_session-{sessionid}/autoresearch/` files directly.
+- On interruption, resume via `gjc autoresearch read --json`; do not read or edit `$GJC_STATE_DIR/_session-{sessionid}/autoresearch/` files directly.
 
 ## Boundary
 
