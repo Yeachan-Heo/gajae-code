@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { AcpSdkAdapter, acpMcpLaunchFailure } from "../src/sdk/acp";
+import { lifecycleRequestTimeoutMs } from "../src/sdk/broker/startup-budget";
 import { SdkClientError } from "../src/sdk/client";
 
 test("replays an uncertain ACP lifecycle launch with the same idempotency key", async () => {
@@ -24,8 +25,12 @@ test("replays an uncertain ACP lifecycle launch with the same idempotency key", 
 			),
 		).resolves.toEqual({ sessionId: "session-reconciled" });
 		expect(calls).toHaveLength(2);
-		expect(calls[0]?.options).toEqual({ idempotencyKey: "acp-request-1" });
-		expect(calls[1]?.options).toEqual({ idempotencyKey: "acp-request-1" });
+		// session.create is a startup lifecycle operation, so the adapter attaches the
+		// computed broker deadline. The replay must reuse the exact same key AND deadline.
+		const expectedTimeoutMs = lifecycleRequestTimeoutMs("session.create", calls[0]!.input);
+		expect(expectedTimeoutMs).toBeGreaterThan(0);
+		expect(calls[0]?.options).toEqual({ idempotencyKey: "acp-request-1", timeoutMs: expectedTimeoutMs });
+		expect(calls[1]?.options).toEqual(calls[0]!.options);
 		expect(calls[1]?.input).toEqual(calls[0]?.input);
 	} finally {
 		await adapter.close();
