@@ -635,6 +635,7 @@ export class AcpSdkAdapter {
 					}));
 		const options = {
 			idempotencyKey,
+			deadline,
 			// SdkClient reads this after connecting, so reconnect and replay spend the same allowance.
 			get timeoutMs() {
 				return timeoutMs === undefined ? undefined : Math.max(0, deadline - Date.now());
