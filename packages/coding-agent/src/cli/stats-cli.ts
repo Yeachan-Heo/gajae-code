@@ -70,41 +70,6 @@ export interface StatsCommandArgs {
 	summary: boolean;
 }
 
-// =============================================================================
-// Argument Parser
-// =============================================================================
-
-/**
- * Parse stats subcommand arguments.
- * Returns undefined if not a stats command.
- */
-export function parseStatsArgs(args: string[]): StatsCommandArgs | undefined {
-	if (args.length === 0 || args[0] !== "stats") {
-		return undefined;
-	}
-
-	const result: StatsCommandArgs = {
-		port: 3847,
-		json: false,
-		summary: false,
-	};
-
-	for (let i = 1; i < args.length; i++) {
-		const arg = args[i];
-		if (arg === "--json" || arg === "-j") {
-			result.json = true;
-		} else if (arg === "--summary" || arg === "-s") {
-			result.summary = true;
-		} else if ((arg === "--port" || arg === "-p") && i + 1 < args.length) {
-			result.port = parseInt(args[++i], 10);
-		} else if (arg.startsWith("--port=")) {
-			result.port = parseInt(arg.split("=")[1], 10);
-		}
-	}
-
-	return result;
-}
-
 function formatCost(n: number): string {
 	if (n < 0.01) return `$${n.toFixed(4)}`;
 	if (n < 1) return `$${n.toFixed(3)}`;
