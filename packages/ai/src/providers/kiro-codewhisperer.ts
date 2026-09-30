@@ -78,7 +78,7 @@ interface WireUserMessage {
 			toolResults?: WireToolResult[];
 			editorStateContext?: Record<string, unknown>;
 		};
-		origin?: string;
+		origin: typeof KIRO_ORIGIN;
 	};
 }
 
@@ -141,6 +141,12 @@ interface ErrorPayload {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const DEFAULT_REGION = "us-east-1";
+
+/**
+ * Without `origin` the service ignores `modelId` and routes every request to
+ * `auto`; with it, response frames report the requested model.
+ */
+const KIRO_ORIGIN = "AI_EDITOR";
 
 type Block = (TextContent | ToolCall) & { index?: number; partialJson?: string };
 
@@ -386,7 +392,20 @@ function buildConversationState(
 	const history: WireHistoryMessage[] = [];
 	const systemPrompt = context.systemPrompt?.join("\n") ?? "";
 
-	for (let i = 0; i < messages.length - 1; i++) {
+	// Parallel tool calls end the conversation with several consecutive toolResult
+	// messages. They all answer the last assistant turn, so they must travel
+	// together in currentMessage; leaving the earlier ones as a separate history
+	// entry is rejected upstream with TOOL_USE_RESULT_MISMATCH.
+	let currentStart = messages.length - 1;
+	while (
+		currentStart > 0 &&
+		messages[currentStart].role === "toolResult" &&
+		messages[currentStart - 1].role === "toolResult"
+	) {
+		currentStart--;
+	}
+
+	for (let i = 0; i < currentStart; i++) {
 		const msg = messages[i];
 		const previous = history[history.length - 1];
 		// Parallel tool calls produce consecutive toolResult messages; they answer one
@@ -406,9 +425,14 @@ function buildConversationState(
 		history.push(convertToWireMessage(msg, modelId, i === 0 ? systemPrompt : undefined));
 	}
 
-	// Convert the last message as currentMessage
+	// Convert the last message as currentMessage, carrying every trailing parallel result.
 	const lastMsg = messages[messages.length - 1];
 	const currentMessage = convertToWireUserMessage(lastMsg, modelId, systemPrompt);
+	if (currentStart < messages.length - 1) {
+		currentMessage.userInputMessage.userInputMessageContext = {
+			toolResults: messages.slice(currentStart).map(msg => convertToolResult(msg as ToolResultMessage)),
+		};
+	}
 
 	// Add tools to the current message context
 	if (context.tools && context.tools.length > 0) {
@@ -480,6 +504,7 @@ function convertToWireUserMessage(
 		userInputMessage: {
 			content,
 			modelId,
+			origin: KIRO_ORIGIN,
 		},
 	};
 
