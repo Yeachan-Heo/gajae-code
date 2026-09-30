@@ -177,6 +177,19 @@ describe("AuthStorage config-override apiKey", () => {
 		});
 	});
 
+	test("hasLiteralConfigApiKey distinguishes a literal key from an env-sourced one per owner", () => {
+		if (!authStorage) throw new Error("test setup failed");
+		const owner = {};
+		const otherOwner = {};
+		authStorage.setConfigApiKey("anthropic", "env-key", { envSourced: true, owner });
+		expect(authStorage.hasConfigApiKey("anthropic", owner)).toBe(true);
+		expect(authStorage.hasLiteralConfigApiKey("anthropic", owner)).toBe(false);
+
+		authStorage.setConfigApiKey("anthropic", "literal-key", { owner });
+		expect(authStorage.hasLiteralConfigApiKey("anthropic", owner)).toBe(true);
+		expect(authStorage.hasLiteralConfigApiKey("anthropic", otherOwner)).toBe(false);
+	});
+
 	test("describeCredentialSource reports the stored credential that shadows an env-sourced override", async () => {
 		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
 			if (!authStorage) throw new Error("test setup failed");
