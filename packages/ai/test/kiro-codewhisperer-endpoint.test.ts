@@ -201,6 +201,40 @@ describe("Kiro CodeWhisperer OAuth endpoint #6002", () => {
 		expect(errorMessage).not.toContain("secret-bearer");
 	});
 
+	test("redacts an echoed bearer credential from a non-eventstream 200 body", async () => {
+		const errorMessage = await streamErrorMessage(
+			new Response("echo: Authorization: Bearer secret-bearer; raw=secret-bearer", {
+				status: 200,
+				headers: { "content-type": "text/plain" },
+			}),
+		);
+
+		expect(errorMessage).toContain("non-eventstream");
+		expect(errorMessage).not.toContain("secret-bearer");
+	});
+
+	test("reads only a bounded prefix of a non-terminating non-eventstream body", async () => {
+		let pulls = 0;
+		let cancelled = false;
+		const chunk = new TextEncoder().encode("x".repeat(1024));
+		const body = new ReadableStream<Uint8Array>({
+			pull(controller) {
+				pulls++;
+				controller.enqueue(chunk);
+			},
+			cancel() {
+				cancelled = true;
+			},
+		});
+		const errorMessage = await streamErrorMessage(
+			new Response(body, { status: 200, headers: { "content-type": "text/html" } }),
+		);
+
+		expect(errorMessage).toContain("non-eventstream");
+		expect(cancelled).toBe(true);
+		expect(pulls).toBeLessThan(16);
+	});
+
 	test("accepts the eventstream media type case-insensitively with parameters", async () => {
 		const errorMessage = await streamErrorMessage(
 			new Response(new Uint8Array(0), {

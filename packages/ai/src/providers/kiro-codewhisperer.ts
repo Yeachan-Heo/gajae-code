@@ -30,7 +30,7 @@ import { transportFailureFacts } from "../utils/fallback-transport";
 import { withHttpStatus } from "../utils/http-inspector";
 import { captureUnicodeEscapeEvidence } from "../utils/json-parse";
 import { decodeEventStream } from "./aws-eventstream";
-import { isKiroApiKey, streamKiroApiKey, toKiroModelId } from "./kiro-api-key";
+import { isKiroApiKey, sanitizeKiroError, streamKiroApiKey, toKiroModelId } from "./kiro-api-key";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Provider options
@@ -240,9 +240,9 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 			});
 
 			if (!response.ok) {
-				const errBody = await response.text().catch(() => "");
+				const errBody = await readBodyPrefix(response);
 				throw withHttpStatus(
-					new Error(`Kiro CodeWhisperer HTTP ${response.status}: ${errBody.slice(0, 1000)}`),
+					new Error(sanitizeKiroError(`Kiro CodeWhisperer HTTP ${response.status}: ${errBody}`, bearerToken)),
 					response.status,
 				);
 			}
@@ -253,9 +253,12 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 			const contentType = response.headers.get("content-type") ?? "";
 			const mediaType = contentType.split(";", 1)[0]?.trim().toLowerCase() ?? "";
 			if (mediaType !== "application/vnd.amazon.eventstream") {
-				const errBody = await response.text().catch(() => "");
+				const errBody = await readBodyPrefix(response);
 				const err = new Error(
-					`Kiro CodeWhisperer returned non-eventstream response (${contentType}): ${errBody.slice(0, 1000)}`,
+					sanitizeKiroError(
+						`Kiro CodeWhisperer returned non-eventstream response (${contentType}): ${errBody}`,
+						bearerToken,
+					),
 				);
 				throw withHttpStatus(err, response.status);
 			}
@@ -613,6 +616,37 @@ function handleToolUseEvent(
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/** Byte cap for diagnostic error bodies; the rest of the stream is cancelled unread. */
+const ERROR_BODY_PREFIX_BYTES = 4096;
+
+/** Read at most {@link ERROR_BODY_PREFIX_BYTES} of a response body for diagnostics, then cancel the remainder. */
+async function readBodyPrefix(response: Response): Promise<string> {
+	if (!response.body) return "";
+	const reader = response.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	try {
+		while (total < ERROR_BODY_PREFIX_BYTES) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			const take = value.subarray(0, ERROR_BODY_PREFIX_BYTES - total);
+			chunks.push(take);
+			total += take.length;
+		}
+	} catch {
+		// Diagnostic read only; report whatever prefix arrived.
+	} finally {
+		reader.cancel().catch(() => {});
+	}
+	const bytes = new Uint8Array(total);
+	let offset = 0;
+	for (const chunk of chunks) {
+		bytes.set(chunk, offset);
+		offset += chunk.length;
+	}
+	return new TextDecoder().decode(bytes);
+}
 
 function resolveBearerToken(apiKey: string | undefined): string | undefined {
 	if (!apiKey) {

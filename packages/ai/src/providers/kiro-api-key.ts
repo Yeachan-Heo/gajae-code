@@ -118,7 +118,7 @@ function kiroApiHeaders(apiKey: string, target: string): Record<string, string> 
 	};
 }
 
-function sanitizeKiroError(value: unknown, secret?: string): string {
+export function sanitizeKiroError(value: unknown, secret?: string): string {
 	let message = value instanceof Error ? value.message : String(value);
 	if (secret) message = message.split(secret).join("[redacted]");
 	message = message.replace(/bearer\s+[^\s,;]+/gi, "Bearer [redacted]");
