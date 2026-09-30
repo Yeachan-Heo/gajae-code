@@ -254,11 +254,13 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 			const mediaType = contentType.split(";", 1)[0]?.trim().toLowerCase() ?? "";
 			if (mediaType !== "application/vnd.amazon.eventstream") {
 				const errBody = await readBodyPrefix(response);
-				// Deliberately no HTTP status: a 2xx protocol mismatch is deterministic, and a
-				// status would materialize transport-failure facts that session fallback retries.
+				// Deliberately no HTTP status metadata, and no "HTTP <code>" wording that the
+				// message-based status parser would pick up: a 2xx protocol mismatch is
+				// deterministic, and a status would materialize transport-failure facts that
+				// session fallback retries.
 				throw new Error(
 					sanitizeKiroError(
-						`Kiro CodeWhisperer returned non-eventstream response (${contentType}): ${errBody}`,
+						`Kiro CodeWhisperer returned a non-eventstream ${response.status} response (${contentType}): ${errBody}`,
 						bearerToken,
 					),
 				);

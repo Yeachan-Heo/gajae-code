@@ -214,6 +214,7 @@ describe("Kiro CodeWhisperer OAuth endpoint #6002", () => {
 
 		expect(errorMessage).toContain("Invalid API key");
 		expect(errorMessage).toContain("application/json");
+		expect(errorMessage).toContain("non-eventstream 200 response");
 		expect(errorMessage).not.toContain("eventstream: truncated message");
 		expect(errorMessage).not.toContain("secret-bearer");
 	});
