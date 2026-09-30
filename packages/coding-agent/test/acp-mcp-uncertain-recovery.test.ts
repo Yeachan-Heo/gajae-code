@@ -105,7 +105,9 @@ test("uses the SDK default timeout when lifecycle sizing is unavailable", async 
 	};
 	const adapter = new AcpSdkAdapter({ client: client as never });
 	try {
-		await expect(adapter.lifecycle("session.close", { readinessTimeoutMs: 1 }, "default-budget")).resolves.toEqual({ ok: true });
+		await expect(adapter.lifecycle("session.close", { readinessTimeoutMs: 1 }, "default-budget")).resolves.toEqual({
+			ok: true,
+		});
 		expect(optionsSeen[0]!.timeoutMs).toBe(DEFAULT_SDK_REQUEST_TIMEOUT_MS);
 	} finally {
 		await adapter.close();
@@ -216,9 +218,11 @@ test("keeps the sent uncertainty when replay times out before dispatch", async (
 	};
 	const adapter = new AcpSdkAdapter({ client: client as never });
 	try {
-		const error = (await adapter.lifecycle("session.close", {}, "acp-request-4").catch(value => value)) as SdkClientError & {
+		const error = (await adapter
+			.lifecycle("session.close", {}, "acp-request-4")
+			.catch(value => value)) as SdkClientError & {
 			recovery?: SdkClientError;
-	};
+		};
 		expect(error).toBe(original);
 		expect(error.details).toEqual(original.details);
 		expect(error.recovery).toBe(replayFailure);

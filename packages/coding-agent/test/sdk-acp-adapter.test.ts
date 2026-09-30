@@ -507,6 +507,7 @@ test("ACP SDK adapter exposes SDK event frames while rejecting raw lifecycle glo
 			input: { cwd: "/workspace" },
 			idempotencyKey: "lifecycle-key",
 			timeoutMs: 21_000,
+			deadline: expect.any(Number),
 		});
 		expect(received).toContainEqual({ type: "event", payload: { type: "turn_end" } });
 	} finally {
@@ -902,7 +903,8 @@ test("ACP lifecycle aliases forward caller idempotency keys outside operation in
 			operation: alias.operation,
 			input: alias.input,
 			idempotencyKey: `alias-${index}`,
-			...(alias.operation === "session.close" ? {} : { timeoutMs: 21_000 }),
+			...(alias.operation === "session.close" ? { timeoutMs: 10_000 } : { timeoutMs: 21_000 }),
+			deadline: expect.any(Number),
 		})),
 	);
 	await adapter.close();
