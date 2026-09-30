@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { logger } from "@gajae-code/utils";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
-import { DEFAULT_SDK_REQUEST_TIMEOUT_MS, SdkClientError, SdkPreparedDispatchError, type SdkClient } from "../client";
+import { DEFAULT_SDK_REQUEST_TIMEOUT_MS, type SdkClient, SdkClientError, SdkPreparedDispatchError } from "../client";
 import type { AbortScope } from "../host/control/operations";
 import { assertReverseResponseFrame, ReverseLeaseError } from "../host/reverse-leases";
 import {
