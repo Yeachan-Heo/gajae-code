@@ -977,7 +977,7 @@ The built-in model generator also assigns this automatically for `*-spark` model
 
 ## Compatibility and routing fields
 
-The `compat` block on a provider or model overrides the URL-based auto-detection in `packages/ai/src/providers/openai-completions-compat.ts`. It is validated by `OpenAICompatSchema` in `packages/coding-agent/src/config/model-registry.ts` and consumed by every `openai-completions` transport (`packages/ai/src/providers/openai-completions.ts`). The canonical type is `OpenAICompat` in `packages/ai/src/types.ts`.
+The `compat` block on a provider or model overrides the URL-based auto-detection in `packages/ai/src/providers/openai-completions-compat.ts`. It is validated by `ModelCompatSchema` (exported as `OpenAICompatSchema`) in `packages/coding-agent/src/config/models-config-schema.ts` and consumed by every `openai-completions` transport (`packages/ai/src/providers/openai-completions.ts`). The canonical type is `OpenAICompat` in `packages/ai/src/types.ts`.
 
 `models.yml` accepts the following keys (all optional; unset falls back to URL detection):
 
@@ -985,11 +985,15 @@ Request shaping:
 
 - `supportsStore` — emit `store: false` on requests. Default: auto (off for non-standard endpoints).
 - `supportsDeveloperRole` — use the `developer` system role for reasoning models instead of `system`. Default: auto.
+- `supportsMultipleSystemMessages` — send system-prompt content as multiple separate blocks instead of merging it into one. Default: `true` for canonical Anthropic endpoints and `false` for unknown or strict-template hosts. Setting it to `true` preserves separate blocks, which is preferred for KV-cache reuse when the trailing prompt changes between calls.
 - `sendSessionHeaders` — forward the agent session id as `session_id` and `x-session-id` request headers so OpenAI-compatible relays/proxies can do session-affinity routing and reuse a server-side prompt cache. Default: `false`. Caller-set `headers`/`requestTransform` values are never overwritten.
 - `supportsResponsesSessionAffinity` — for `openai-responses`, opt in to forwarding `session_id` and `x-client-request-id` affinity headers to a custom OpenAI-compatible relay. Canonical OpenAI routing remains automatic; known non-OpenAI provider IDs are rejected. Default: `false`.
 - `supportsUsageInStreaming` — send `stream_options: { include_usage: true }` to receive token usage on streaming responses. Default: `true`.
 - `maxTokensField` — `"max_completion_tokens"` or `"max_tokens"`. Default: auto.
 - `supportsToolChoice` — emit the `tool_choice` parameter when the caller forces a specific tool. Default: `true`. Set `false` for endpoints that 400 on `tool_choice` (e.g. DeepSeek when reasoning is on).
+- `toolChoiceSupport` — the highest `tool_choice` level the endpoint accepts: `"none"` (no `tool_choice` parameter), `"auto"`, `"required"` (any tool), or `"named"` (a specific function). Default: auto-detected. This is the modern enum form of `supportsToolChoice` / `supportsForcedToolChoice`; a model with no explicit value is normalized to `"auto"`.
+- `supportsForcedToolChoice` — legacy flag for whether `tool_choice` may force a call (`any` / a named tool). Default: `true`, except known incompatible Anthropic models. Prefer `toolChoiceSupport` on new entries.
+- `disableReasoningOnToolChoice` — disable reasoning whenever the request carries `tool_choice` at all (not only a forced call). Default: auto-detected (DeepSeek reasoning models), which covers endpoints that accept `tools` and `tool_choice` but reject `tool_choice` while thinking is enabled.
 - `disableReasoningOnForcedToolChoice` — drop `reasoning_effort` / OpenRouter `reasoning` whenever `tool_choice` forces a call. Default: auto (Kimi/Anthropic-fronted endpoints).
 - `extraBody` — extra top-level fields merged into every request body (gateway hints, controller selectors, etc.). A `tool_choice` here acts as an endpoint default rather than an override: it applies only on a turn that offers tools and resolved no directive of its own, so forced-tool directives are preserved and deliberate no-tools turns are left untouched.
 
@@ -1001,6 +1005,7 @@ Reasoning / thinking:
 - `reasoningContentField` — assistant field carrying chain-of-thought: `"reasoning_content"`, `"reasoning"`, or `"reasoning_text"`. Default: auto.
 - `requiresReasoningContentForToolCalls` — assistant tool-call turns must round-trip the reasoning field (DeepSeek-R1, Kimi, OpenRouter when reasoning is on). Default: `false`.
 - `requiresAssistantContentForToolCalls` — assistant tool-call turns must include non-empty text content (Kimi). Default: `false`.
+- `allowsSyntheticReasoningContentForToolCalls` — accept a synthetic placeholder (e.g. `"."`) when an assistant tool-call turn is missing `reasoning_content`. Default: `true`. Set `false` for providers that validate the exact reasoning value (DeepSeek).
 
 Tool / message normalization:
 
@@ -1017,6 +1022,12 @@ Gateway routing (only applied when `baseUrl` matches the gateway):
 - `vercelGatewayRouting.only` / `vercelGatewayRouting.order` — provider routing on `ai-gateway.vercel.sh` (see <https://vercel.com/docs/ai-gateway/models-and-providers/provider-options>).
 
 Provider-level `compat` is the baseline; per-model `compat` is deep-merged on top, with `openRouterRouting`, `vercelGatewayRouting`, and `extraBody` merged as nested objects.
+Provider-level keys outside `compat` (all optional):
+
+- `authHeader` — treat the resolved `apiKey` as a raw `Authorization` header value instead of a bearer token. Default: `false`.
+- `webSearch` — provider-level web-search routing for the provider's models: `"on"`, `"off"`, or `"auto"` (let the `web_search` tool decide per request).
+- `transport` — streaming transport override. The only accepted value is `"pi-native"`, which dispatches every model under the provider through the auth-gateway's `POST /v1/pi/stream` endpoint instead of the per-provider SDK. The provider's `baseUrl` must point at a compatible `gjc auth-gateway`, and `apiKey` must carry the gateway bearer.
+- `openaiCompat` — local OpenAI-compatible endpoint descriptor (`baseUrl` required, plus optional `apiKey` / `apiKeyEnv`) used by the local-provider smoke check.
 
 ### Anthropic compatibility (`anthropic-messages`)
 
