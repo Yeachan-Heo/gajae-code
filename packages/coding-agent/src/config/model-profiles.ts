@@ -256,14 +256,14 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 	}),
 	profile("claude-opus", ["anthropic"], {
 		default: ["anthropic/claude-opus-5-5:medium", "anthropic/claude-opus-4-6:xhigh"],
-		executor: "anthropic/claude-sonnet-5",
+		executor: "anthropic/claude-sonnet-5-5",
 		planner: ["anthropic/claude-opus-5-5:medium", "anthropic/claude-opus-4-6:low"],
 		critic: ["anthropic/claude-opus-5-5:high", "anthropic/claude-opus-4-6:high"],
 		architect: ["anthropic/claude-opus-5-5:high", "anthropic/claude-opus-4-6:xhigh"],
 	}),
 	profile("claude-fable", ["anthropic"], {
 		default: "anthropic/claude-fable-5-1:xhigh",
-		executor: "anthropic/claude-sonnet-5",
+		executor: "anthropic/claude-sonnet-5-5",
 		planner: "anthropic/claude-fable-5-1:low",
 		critic: "anthropic/claude-fable-5-1:high",
 		architect: "anthropic/claude-fable-5-1:xhigh",
@@ -491,7 +491,7 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 	profile("opus-codex", ["anthropic", "openai-codex"], {
 		default: "anthropic/claude-opus-5-5:medium",
 		executor: "openai-codex/gpt-5.6-terra:low",
-		planner: "anthropic/claude-sonnet-5",
+		planner: "anthropic/claude-sonnet-5-5",
 		critic: "openai-codex/gpt-6-sol:xhigh",
 		architect: "openai-codex/gpt-6-sol:high",
 	}),

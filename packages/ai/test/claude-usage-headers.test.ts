@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { claudeCodeVersion } from "../src/providers/anthropic";
+import { CLAUDE_CODE_BASELINE_VERSION, getClaudeCodeVersion } from "../src/providers/claude-code-version";
 import type { UsageFetchContext } from "../src/usage";
 import { claudeUsageProvider } from "../src/usage/claude";
 
@@ -76,8 +76,10 @@ describe("claude usage request headers", () => {
 
 		const headers = calls[0]?.init?.headers;
 		expect(getHeaderCaseInsensitive(headers, "authorization")).toBe(`Bearer ${token}`);
-		expect(claudeCodeVersion).toBe("2.1.281");
-		expect(getHeaderCaseInsensitive(headers, "user-agent")).toBe("claude-cli/2.1.281 (external, cli)");
+		expect(getClaudeCodeVersion()).toBe(CLAUDE_CODE_BASELINE_VERSION);
+		expect(getHeaderCaseInsensitive(headers, "user-agent")).toBe(
+			`claude-cli/${CLAUDE_CODE_BASELINE_VERSION} (external, cli)`,
+		);
 
 		const beta = getHeaderCaseInsensitive(headers, "anthropic-beta");
 		expect(beta).toBeDefined();

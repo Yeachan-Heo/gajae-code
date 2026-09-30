@@ -112,6 +112,16 @@ function credentialFreeLifecycleResult(value: unknown): unknown {
 	return output;
 }
 
+const ACP_MCP_FAILURE_MESSAGE_MAX_LENGTH = 240;
+
+function credentialFreeLifecycleMessage(error: unknown): string {
+	const message = error instanceof Error ? error.message : String(error);
+	return message
+		.replace(/\b(?:endpoint|token|url)\s*[:=]\s*(?:"[^"]*"|'[^']*'|\S+)/gi, "[redacted]")
+		.replace(/https?:\/\/[^\s)]+/gi, "[redacted-url]")
+		.slice(0, ACP_MCP_FAILURE_MESSAGE_MAX_LENGTH);
+}
+
 /**
  * Lifecycle failures the ACP MCP launch wrapper must report verbatim. Everything else
  * is re-attributed to the configured MCP servers, which is the useful answer for a
@@ -136,21 +146,46 @@ const ACP_MCP_PRESERVED_LAUNCH_CODES = new Set([
 ]);
 
 /**
+ * SDK client transport failures happen before the lifecycle request reaches any MCP server and
+ * must retain their original retry semantics. The `transport` origin marker is required because
+ * broker ERROR frames are also represented as SdkClientError instances with these same codes.
+ */
+const ACP_MCP_PRESERVED_TRANSPORT_CODES = new Set(["connection_closed", "unavailable", "timeout"]);
+
+/**
  * The error an ACP session launch must throw once a lifecycle request that carried MCP
- * servers has failed.
+ * servers has failed. Broker transport failures from the SDK client are preserved verbatim;
+ * other failures keep the adapter's `unavailable` code while carrying a bounded, credential-free
+ * copy of the original code and message as their cause diagnostic.
  */
 export function acpMcpLaunchFailure(error: unknown, mcpServers: SessionLifecycleMcpServer[]): unknown {
 	const code =
 		typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
 			? error.code
 			: undefined;
-	if (mcpServers.length === 0 || (code !== undefined && ACP_MCP_PRESERVED_LAUNCH_CODES.has(code))) return error;
+	if (
+		mcpServers.length === 0 ||
+		(code !== undefined && ACP_MCP_PRESERVED_LAUNCH_CODES.has(code)) ||
+		(error instanceof SdkClientError &&
+			error.transport === true &&
+			code !== undefined &&
+			ACP_MCP_PRESERVED_TRANSPORT_CODES.has(code))
+	)
+		return error;
 	const names = mcpServers
 		.slice(0, 8)
 		.map(server => server.name)
 		.join(", ");
 	const suffix = mcpServers.length > 8 ? `, and ${mcpServers.length - 8} more` : "";
-	return new AcpSdkAdapterError("unavailable", `MCP server request failed to start (${names}${suffix}).`);
+	const originalCode = code ?? "unknown";
+	const originalMessage = credentialFreeLifecycleMessage(error);
+	const diagnostic = originalMessage ? ` [${originalCode}: ${originalMessage}]` : ` [${originalCode}]`;
+	const wrapped = new AcpSdkAdapterError(
+		"unavailable",
+		`MCP server request failed to start (${names}${suffix}): broker lifecycle failed${diagnostic}`,
+	);
+	Object.assign(wrapped, { cause: error });
+	return wrapped;
 }
 
 export type AcpReconnectFailedHandler = (error: SdkClientError) => void;

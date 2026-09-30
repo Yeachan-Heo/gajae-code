@@ -2,20 +2,6 @@
   "schemaVersion": 1,
   "divergences": [
     {
-      "caseId": "typescript",
-      "reason": "The pinned TypeScript grammar now colors TypeScript-specific declarations and annotations instead of using the JavaScript grammar.",
-      "upstreamRationale": "The pinned upstream syntax set adds TypeScript.sublime-syntax and maps ts/mts/cts/typescript to it.",
-      "changelog": "packages/natives/CHANGELOG.md",
-      "testsUpdated": "packages/natives/test/phase3-highlight-golden.test.ts"
-    },
-    {
-      "caseId": "tsx",
-      "reason": "The pinned TypeScriptReact grammar distinguishes TS annotations, JSX tags, and JSX attributes from the old JavaScript fallback.",
-      "upstreamRationale": "The pinned upstream syntax set adds TypeScriptReact.sublime-syntax and maps tsx to it.",
-      "changelog": "packages/natives/CHANGELOG.md",
-      "testsUpdated": "packages/natives/test/phase3-highlight-golden.test.ts"
-    },
-    {
       "caseId": "nix",
       "reason": "Nix snippets are now syntax colored instead of being returned unchanged.",
       "upstreamRationale": "The pinned upstream syntax set adds Nix.sublime-syntax and maps nix to Nix.",

@@ -652,6 +652,9 @@ function assertRegistryIdentityPolicy(value: unknown): void {
 }
 
 function assertCanonicalUnicode(value: string): void {
+	// Native well-formedness check first; the scan below only runs to name the
+	// offending surrogate when the string is malformed.
+	if (value.isWellFormed()) return;
 	for (let index = 0; index < value.length; index++) {
 		const code = value.charCodeAt(index);
 		if (code >= 0xd800 && code <= 0xdbff) {
@@ -665,6 +668,18 @@ function assertCanonicalUnicode(value: string): void {
 	}
 }
 
+/** Characters JSON.stringify escapes in strings (lone surrogates are rejected earlier). */
+const JSON_STRING_ESCAPES = /["\\\u0000-\u001f]/;
+
+/**
+ * Quote a string exactly as JSON.stringify does. Registry documents are almost
+ * entirely plain ASCII identifiers, so skipping the per-call JSON.stringify for
+ * strings with nothing to escape removes most of the serializer's cost.
+ */
+function quoteCanonicalString(value: string): string {
+	return JSON_STRING_ESCAPES.test(value) ? JSON.stringify(value) : `"${value}"`;
+}
+
 function serializeCanonicalJson(value: unknown, stack: Set<object>): string {
 	if (value === null) return "null";
 	if (typeof value === "boolean") return value ? "true" : "false";
@@ -674,7 +689,7 @@ function serializeCanonicalJson(value: unknown, stack: Set<object>): string {
 	}
 	if (typeof value === "string") {
 		assertCanonicalUnicode(value);
-		return JSON.stringify(value);
+		return quoteCanonicalString(value);
 	}
 	if (typeof value !== "object") throw new TypeError(`Canonical JSON rejects ${typeof value}.`);
 	if (stack.has(value)) throw new TypeError("Canonical JSON rejects cycles.");
@@ -694,7 +709,7 @@ function serializeCanonicalJson(value: unknown, stack: Set<object>): string {
 		const entries: string[] = [];
 		for (const key of Object.keys(record).sort()) {
 			assertCanonicalUnicode(key);
-			entries.push(`${JSON.stringify(key)}:${serializeCanonicalJson(record[key], stack)}`);
+			entries.push(`${quoteCanonicalString(key)}:${serializeCanonicalJson(record[key], stack)}`);
 		}
 		return `{${entries.join(",")}}`;
 	} finally {

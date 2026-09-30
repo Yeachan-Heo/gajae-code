@@ -176,12 +176,19 @@ describe("calculateCost", () => {
 		});
 	});
 
-	it("bundles GPT-6 Sol and Luna standard and long-context pricing", () => {
+	it("bundles GPT-6 Sol family standard and long-context pricing", () => {
 		const sol = getBundledModel("openai-codex", "gpt-6-sol");
 		expect(sol.cost).toEqual({ input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 });
 		expect(sol.longContextPricing).toEqual({
 			threshold: 272_000,
 			cost: { input: 4, output: 15, cacheRead: 0.4, cacheWrite: 5 },
+		});
+
+		const sol61 = getBundledModel("openai-codex", "gpt-6.1-sol");
+		expect(sol61.cost).toEqual({ input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 });
+		expect(sol61.longContextPricing).toEqual({
+			threshold: 272_000,
+			cost: { input: 4, output: 15, cacheRead: 0.2, cacheWrite: 5 },
 		});
 
 		const luna = getBundledModel("openai-codex", "gpt-6-luna");

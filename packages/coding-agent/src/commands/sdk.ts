@@ -642,8 +642,7 @@ export async function runSessionHost(
 			},
 			absent.result,
 		);
-
-		throw new Error("SDK startup did not complete before readiness cutoff.");
+		return;
 	}
 
 	const rollback = new SdkStartupRollbackTracker();

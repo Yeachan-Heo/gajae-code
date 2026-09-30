@@ -138,6 +138,16 @@ describe("adaptive compaction threshold", () => {
 		).toBe(72_000);
 	});
 
+	it("does not cap the enabled adaptive sentinel on a 1M window", () => {
+		const threshold = resolveThresholdTokens(1_000_000, {
+			...adaptiveSettings,
+			thresholdPercent: -1,
+			adaptiveState: { turnsSinceCompact: 20, callsInWindow: 60, lastContextTokens: 800_000 },
+		});
+
+		expect(threshold).toBe(680_000);
+	});
+
 	it("fails safe for malformed decision state and window settings", () => {
 		expect(
 			computeAdaptiveThresholdPercent(

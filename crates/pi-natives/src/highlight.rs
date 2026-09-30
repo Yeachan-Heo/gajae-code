@@ -59,13 +59,15 @@ thread_local! {
 	static HIGHLIGHT_CHECKPOINT: RefCell<Vec<HighlightCheckpoint>> = const { RefCell::new(Vec::new()) };
 }
 
+// The pinned upstream TypeScript/TypeScriptReact grammars are deliberately not
+// bundled (keep-local D-HIGHLIGHT-TS-JS-GRAMMAR): they grow first-use
+// syntax-set construction from ~10ms to ~600ms and make every TS/TSX highlight
+// ~3x slower, so ts/tsx keep syntect's JavaScript grammar.
 const EXTRA_SYNTAXES: &[&str] = &[
 	include_str!("syntaxes/Astro.sublime-syntax"),
 	include_str!("syntaxes/Julia.sublime-syntax"),
 	include_str!("syntaxes/Mermaid.sublime-syntax"),
 	include_str!("syntaxes/Nix.sublime-syntax"),
-	include_str!("syntaxes/TypeScript.sublime-syntax"),
-	include_str!("syntaxes/TypeScriptReact.sublime-syntax"),
 ];
 
 fn get_syntax_set() -> &'static SyntaxSet {
@@ -212,9 +214,10 @@ pub struct HighlightColors {
 /// Language alias mappings: (aliases, target syntax name).
 /// Used for languages not in syntect's default set or with non-standard names.
 const LANG_ALIASES: &[(&[&str], &str)] = &[
-	(&["ts", "mts", "cts", "typescript"], "TypeScript"),
-	(&["tsx"], "TypeScriptReact"),
-	(&["js", "jsx", "javascript", "mjs", "cjs"], "JavaScript"),
+	(
+		&["ts", "mts", "cts", "typescript", "tsx", "js", "jsx", "javascript", "mjs", "cjs"],
+		"JavaScript",
+	),
 	(&["py", "python"], "Python"),
 	(&["rb", "ruby"], "Ruby"),
 	(&["jl", "julia"], "Julia"),
@@ -778,7 +781,7 @@ mod bundled_syntax_tests {
 	#[test]
 	fn pinned_upstream_syntaxes_are_loaded() {
 		let languages = get_supported_languages();
-		for language in ["Astro", "Julia", "Mermaid", "Nix", "TypeScript", "TypeScriptReact"] {
+		for language in ["Astro", "Julia", "Mermaid", "Nix"] {
 			assert!(
 				languages.iter().any(|candidate| candidate == language),
 				"missing syntax {language}"
@@ -795,8 +798,8 @@ mod bundled_syntax_tests {
 			("mermaid", "Mermaid"),
 			("mmd", "Mermaid"),
 			("nix", "Nix"),
-			("ts", "TypeScript"),
-			("tsx", "TypeScriptReact"),
+			("ts", "JavaScript"),
+			("tsx", "JavaScript"),
 		] {
 			assert!(supports_language(alias.to_string()), "alias {alias} was not recognized");
 			assert_eq!(

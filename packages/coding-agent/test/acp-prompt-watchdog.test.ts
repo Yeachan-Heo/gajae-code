@@ -86,6 +86,7 @@ type Fixture = {
 	/** Sends one raw frame down the session socket, correlation included or omitted verbatim. */
 	send(frame: Record<string, unknown>): void;
 	sendAssistantText(text: string): void;
+	sendAssistantToolCall(): void;
 	sendStopped(reason: StoppedReason): void;
 	sendToolStart(toolCallId: string): void;
 	sendToolEnd(toolCallId: string): void;
@@ -193,6 +194,25 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 			payload: {
 				event_type: "message_end",
 				event: { type: "message_end", message: { role: "assistant", content: [{ type: "text", text }] } },
+			},
+		});
+	};
+	const sendAssistantToolCall = (): void => {
+		send({
+			type: "event",
+			kind: "message_end",
+			sessionId,
+			commandId,
+			turnId,
+			payload: {
+				event_type: "message_end",
+				event: {
+					type: "message_end",
+					message: {
+						role: "assistant",
+						content: [{ type: "toolCall", id: "todo-1", name: "todo_write", arguments: {} }],
+					},
+				},
 			},
 		});
 	};
@@ -393,6 +413,7 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 		promptDeliveryCount: () => turnCount,
 		send,
 		sendAssistantText,
+		sendAssistantToolCall,
 		sendStopped,
 		sendToolStart,
 		sendToolEnd,
@@ -489,6 +510,29 @@ test("a prompt awaiting the model past the inference bound is rejected instead o
 		// remains observably busy until it publishes a real terminal/activity boundary.
 		expect(idleUpdates(fixture.updates)).toBe(idleBefore);
 		expect(workingUpdates(fixture.updates)).toBeGreaterThan(0);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("a streamed tool-call start stays on the awaiting-model bound until execution starts", async () => {
+	const fixture = await createFixture();
+	try {
+		const { pending } = await startTurn(fixture);
+		fixture.sendAssistantToolCall();
+		await Bun.sleep(10);
+		const armed = fixture.clock.armed;
+		expect(armed?.at).toBe(ACP_PROMPT_INFERENCE_TIMEOUT_MS);
+		fixture.clock.advance(ACP_PROMPT_INFERENCE_TIMEOUT_MS + 1);
+		await expect(
+			bounded(
+				pending.then(
+					() => undefined,
+					reason => reason,
+				),
+				"tool-call watchdog rejection",
+			),
+		).resolves.toBeInstanceOf(Error);
 	} finally {
 		fixture.dispose();
 	}

@@ -69,7 +69,22 @@ function textOf(result: unknown): string {
 	return content.find(block => block.type === "text")?.text ?? "";
 }
 
-const coordinatorOnlyEnvNames = [
+import {
+	MANAGED_OWNER_PREDECESSOR_GENERATION_ENV,
+	MANAGED_OWNER_PREDECESSOR_INCARNATION_ENV,
+	MANAGED_OWNER_PREDECESSOR_RUN_ID_ENV,
+	MANAGED_OWNER_PREDECESSOR_TOKEN_ENV,
+	MANAGED_OWNER_TRANSCRIPT_PATH_ENV,
+} from "../../src/gjc-runtime/managed-owner-admission";
+import {
+	MANAGED_OWNER_CHILD_TOKEN_ENV,
+	MANAGED_OWNER_GENERATION_ENV,
+	MANAGED_OWNER_INCARNATION_ENV,
+	MANAGED_OWNER_RUN_ID_ENV,
+	MANAGED_OWNER_STATE_DIR_ENV,
+} from "../../src/gjc-runtime/managed-owner-supervisor";
+
+const baseCoordinatorOnlyEnvNames = [
 	"GJC_COORDINATOR_SESSION_STATE_FILE",
 	"GJC_COORDINATOR_SESSION_ID",
 	"GJC_COORDINATOR_SESSION_BRANCH",
@@ -77,6 +92,24 @@ const coordinatorOnlyEnvNames = [
 	"GJC_COORDINATOR_SESSION_READINESS_FILE",
 	"GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED",
 	"GJC_COORDINATOR_SIDECAR_KEY_ID",
+];
+
+const coordinatorOnlyEnvNames = [
+	...baseCoordinatorOnlyEnvNames,
+	// Managed-owner env family from managed-owner-supervisor.ts
+	MANAGED_OWNER_STATE_DIR_ENV,
+	MANAGED_OWNER_GENERATION_ENV,
+	MANAGED_OWNER_RUN_ID_ENV,
+	MANAGED_OWNER_INCARNATION_ENV,
+	MANAGED_OWNER_CHILD_TOKEN_ENV,
+	// Managed-owner env family from managed-owner-admission.ts
+	MANAGED_OWNER_PREDECESSOR_TOKEN_ENV,
+	MANAGED_OWNER_PREDECESSOR_GENERATION_ENV,
+	MANAGED_OWNER_PREDECESSOR_RUN_ID_ENV,
+	MANAGED_OWNER_PREDECESSOR_INCARNATION_ENV,
+	MANAGED_OWNER_TRANSCRIPT_PATH_ENV,
+	"GJC_TMUX_OWNER_SERVER_KEY",
+	"GJC_TMUX_LAUNCHED",
 ];
 
 describe("issue #5374: session identity on the bash tool-env path", () => {
@@ -111,7 +144,18 @@ describe("issue #5802: coordinator env isolation at the bash boundary", () => {
 
 		try {
 			const command = [
-				`for name in ${coordinatorOnlyEnvNames.join(" ")}; do`,
+				`for name in ${baseCoordinatorOnlyEnvNames.join(" ")} ${[
+					MANAGED_OWNER_STATE_DIR_ENV,
+					MANAGED_OWNER_GENERATION_ENV,
+					MANAGED_OWNER_RUN_ID_ENV,
+					MANAGED_OWNER_INCARNATION_ENV,
+					MANAGED_OWNER_CHILD_TOKEN_ENV,
+					MANAGED_OWNER_PREDECESSOR_TOKEN_ENV,
+					MANAGED_OWNER_PREDECESSOR_GENERATION_ENV,
+					MANAGED_OWNER_PREDECESSOR_RUN_ID_ENV,
+					MANAGED_OWNER_PREDECESSOR_INCARNATION_ENV,
+					MANAGED_OWNER_TRANSCRIPT_PATH_ENV,
+				].join(" ")}; do`,
 				`  value=$(printenv "$name" 2>/dev/null || printf '<unset>')`,
 				`  printf '%s=%s\\n' "$name" "$value"`,
 				"done",
@@ -126,10 +170,24 @@ describe("issue #5802: coordinator env isolation at the bash boundary", () => {
 				},
 			});
 			const output = textOf(result);
-			for (const name of coordinatorOnlyEnvNames) {
+			for (const name of baseCoordinatorOnlyEnvNames) {
 				expect(output).toContain(
 					`${name}=${name === "GJC_COORDINATOR_SESSION_ID" ? "explicit-coordinator-id" : "<unset>"}`,
 				);
+			}
+			for (const name of [
+				MANAGED_OWNER_STATE_DIR_ENV,
+				MANAGED_OWNER_GENERATION_ENV,
+				MANAGED_OWNER_RUN_ID_ENV,
+				MANAGED_OWNER_INCARNATION_ENV,
+				MANAGED_OWNER_CHILD_TOKEN_ENV,
+				MANAGED_OWNER_PREDECESSOR_TOKEN_ENV,
+				MANAGED_OWNER_PREDECESSOR_GENERATION_ENV,
+				MANAGED_OWNER_PREDECESSOR_RUN_ID_ENV,
+				MANAGED_OWNER_PREDECESSOR_INCARNATION_ENV,
+				MANAGED_OWNER_TRANSCRIPT_PATH_ENV,
+			]) {
+				expect(output).toContain(`${name}=<unset>`);
 			}
 			expect(output).toContain("GJC_SESSION_ID=child-session");
 			expect(output).toContain("BASH_TOOL_EXPLICIT=explicit-tool-value");

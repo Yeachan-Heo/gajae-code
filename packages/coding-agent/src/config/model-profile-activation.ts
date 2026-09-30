@@ -17,6 +17,7 @@ import {
 export { resolveModelProfileName } from "./model-profile-contract";
 
 import {
+	createRegistrySelectorIndex,
 	GJC_MODEL_ASSIGNMENT_TARGETS,
 	type GjcModelAssignmentTargetId,
 	isAuthenticated,
@@ -693,6 +694,7 @@ export async function resolveMissingSessionModelRecovery(options: {
 		options.skips.every(skip => skip.reason === "unknown_model");
 	if (!allSelectorsUnknown) return undefined;
 	const fullCatalog = options.modelRegistry.getAll();
+	const catalogIndex = createRegistrySelectorIndex(fullCatalog);
 	const savedSelectorsMissingFromCatalog = resolveConfiguredModelPatterns(
 		options.defaultEntries,
 		options.settings,
@@ -706,7 +708,7 @@ export async function resolveMissingSessionModelRecovery(options: {
 			}).model
 		)
 			return false;
-		return !registrySelectorResolvesToModel(selector, fullCatalog);
+		return !registrySelectorResolvesToModel(selector, catalogIndex);
 	});
 	const savedConcreteDefault = options.savedDefault ? parseModelString(options.savedDefault) : undefined;
 	const savedConcreteDefaultMissingFromCatalog =

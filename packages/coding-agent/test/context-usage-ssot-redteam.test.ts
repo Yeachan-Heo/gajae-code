@@ -1,6 +1,11 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import { Agent, type AgentMessage } from "@gajae-code/agent-core";
-import { calculateContextTokens, estimateMessageTokensHeuristic } from "@gajae-code/agent-core/compaction";
+import {
+	type CompactionSettings,
+	calculateContextTokens,
+	estimateMessageTokensHeuristic,
+	resolveThresholdTokens,
+} from "@gajae-code/agent-core/compaction";
 import { type AssistantMessage, getBundledModel, type Model, type Usage } from "@gajae-code/ai";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -65,6 +70,7 @@ function estimateDisplayMessages(messages: readonly AgentMessage[]): number {
 async function createSession(
 	messages: AgentMessage[] = [],
 	extensionRunner?: ExtensionRunner,
+	options: { model?: Model; settings?: Record<string, unknown> } = {},
 ): Promise<{
 	session: AgentSession;
 	sessionManager: SessionManager;
@@ -77,9 +83,10 @@ async function createSession(
 	authStorages.push(authStorage);
 
 	const sessionManager = SessionManager.inMemory();
+	const model = options.model ?? { ...bundledModel, contextWindow };
 	const agent = new Agent({
 		initialState: {
-			model: { ...bundledModel, contextWindow },
+			model,
 			systemPrompt: ["Test system prompt"],
 			tools: [],
 			messages,
@@ -88,7 +95,11 @@ async function createSession(
 	const session = new AgentSession({
 		agent,
 		sessionManager,
-		settings: Settings.isolated({ "compaction.enabled": false, "todo.reminders": false }),
+		settings: Settings.isolated({
+			"compaction.enabled": false,
+			"todo.reminders": false,
+			...options.settings,
+		}),
 		extensionRunner,
 		modelRegistry: new ModelRegistry(authStorage),
 	});
@@ -133,6 +144,11 @@ function createDisplaySession(
 		getAsyncJobSnapshot: () => ({ running: [] }),
 		getGoalModeState: () => undefined,
 		getContextUsage: () => contextUsage,
+		getAutoCompactionThresholdTokens: () =>
+			resolveThresholdTokens(
+				resolvedModel?.contextWindow ?? 0,
+				Settings.instance.getGroup("compaction") as CompactionSettings,
+			),
 	} as unknown as AgentSession;
 }
 
@@ -239,6 +255,63 @@ describe("context usage SSOT red-team probes", () => {
 		expect(rendered).toContain("150.0%");
 		expect(() => renderContextUsage(breakdown, theme)).not.toThrow();
 		component.dispose();
+	});
+
+	it("uses the real default threshold for a 700K 1M-model auto-compaction buffer", async () => {
+		const bundledModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!bundledModel) throw new Error("Expected bundled Anthropic model");
+		const model: Model = { ...bundledModel, contextWindow: 1_000_000 };
+		const { session } = await createSession([], undefined, {
+			model,
+			settings: { "compaction.enabled": true },
+		});
+
+		const breakdown = computeContextBreakdown(session);
+		expect(session.getAutoCompactionThresholdTokens()).toBe(300_000);
+		expect(breakdown.autoCompactBufferTokens).toBe(700_000);
+		expect(breakdown.freeTokens).toBeGreaterThanOrEqual(0);
+	});
+
+	it("uses the real adaptive threshold in the context-usage buffer", async () => {
+		const bundledModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!bundledModel) throw new Error("Expected bundled Anthropic model");
+		const model: Model = { ...bundledModel, contextWindow: 1_000_000 };
+		const { session } = await createSession([], undefined, {
+			model,
+			settings: {
+				"compaction.enabled": true,
+				"compaction.adaptive.enabled": true,
+				"compaction.adaptive.baseThresholdPercent": 85,
+			},
+		});
+
+		const breakdown = computeContextBreakdown(session);
+		expect(session.getAutoCompactionThresholdTokens()).toBe(850_000);
+		expect(breakdown.autoCompactBufferTokens).toBe(150_000);
+	});
+
+	it("uses the promoted model threshold in the context-usage buffer", async () => {
+		const bundledModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!bundledModel) throw new Error("Expected bundled Anthropic model");
+		const sourceModel: Model = { ...bundledModel, contextWindow: 1_000_000 };
+		const promotedModel: Model = {
+			...sourceModel,
+			id: "context-usage-promoted-model",
+			name: "Context Usage Promoted Model",
+			contextWindow: 1_050_000,
+		};
+		const { session } = await createSession([], undefined, {
+			model: sourceModel,
+			settings: { "compaction.enabled": true, "contextPromotion.enabled": true },
+		});
+		await session.setModelTemporary(promotedModel, undefined, {
+			cause: "temporary-operation",
+			reason: "context-promotion",
+		});
+
+		const breakdown = computeContextBreakdown(session);
+		expect(session.getAutoCompactionThresholdTokens()).toBe(892_500);
+		expect(breakdown.autoCompactBufferTokens).toBe(157_500);
 	});
 
 	it("renders unknown context usage without a model", () => {

@@ -9,6 +9,7 @@ import {
 	canonicalExistingDirectoryIdentity,
 	exactRemoveDirectoryTree,
 	exactReplacePath,
+	exactReplaceRetained,
 	exactRestore,
 	exactUnlink,
 	exactUnlinkDirect,
@@ -153,6 +154,46 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		expect(exactReplacePath(source, destination, sourceIdentity, destinationIdentity)).toEqual({ ok: true });
 		expect(await fs.readFile(destination, "utf8")).toBe("new-state");
 		await expect(fs.access(source)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("publishes a retained self-replacement for owner-only executables (#6096)", async () => {
+		// exactReplaceRetained reads each retained handle's owner and DACL to enforce
+		// the no-shared-write invariant. Without READ_CONTROL on those handles,
+		// GetSecurityInfo fails and every real Windows `gjc update` stopped at
+		// acl_unavailable before promotion.
+		const root = await temporaryDirectory();
+		const source = path.join(root, "staged.exe");
+		const destination = path.join(root, "gjc.exe");
+		await fs.writeFile(source, "new-binary");
+		await fs.writeFile(destination, "old-binary");
+		expect(applyOwnerOnlyPathSecurity(source, "file")).toEqual({ ok: true });
+		expect(applyOwnerOnlyPathSecurity(destination, "file")).toEqual({ ok: true });
+		const parent = await parentIdentity(source);
+		const identity = async (pathname: string, contents: string) => {
+			const stat = await fs.stat(pathname, { bigint: true });
+			return {
+				...parent,
+				dev: stat.dev,
+				ino: stat.ino,
+				nlink: stat.nlink,
+				size: stat.size,
+				mtimeNs: stat.mtimeNs,
+				sha256: sha256(contents),
+			};
+		};
+
+		const result = exactReplaceRetained(
+			source,
+			destination,
+			"gjc.exe.backup",
+			await identity(source, "new-binary"),
+			await identity(destination, "old-binary"),
+		);
+
+		expect(result.code).toBeUndefined();
+		expect(result.ok).toBe(true);
+		expect(await fs.readFile(destination, "utf8")).toBe("new-binary");
+		expect(await fs.readFile(path.join(root, "gjc.exe.backup"), "utf8")).toBe("old-binary");
 	});
 
 	it("retries a transient destination sharing violation and succeeds after the holder releases", async () => {

@@ -271,6 +271,15 @@ export function sdkInternalRuntimeImage(): string | undefined {
 	return publishedRuntimeImage({});
 }
 
+/** Identity of a runtime image: enough to detect replacement at the same path. */
+export interface SdkInternalRuntimeImageIdentity {
+	path: string;
+	dev: number;
+	ino: number;
+	mtimeMs: number;
+	size: number;
+}
+
 /** A stat that has not answered by here is inconclusive, never proof of absence. */
 const RUNTIME_IMAGE_PROBE_TIMEOUT_MS = 1_000;
 
@@ -305,6 +314,80 @@ export async function isSdkInternalRuntimeImagePresent(file: string): Promise<bo
 		return await Promise.race([probe, inconclusive.promise]);
 	} finally {
 		clearTimeout(timer);
+	}
+}
+
+const RUNTIME_IMAGE_PROBE_TIMED_OUT = Symbol("runtime-image-probe-timed-out");
+
+/**
+ * `fsp.stat` bounded by the runtime-image probe timeout. A metadata request on a
+ * stalled mount can never settle; the timeout sentinel lets callers treat that as
+ * inconclusive instead of pending forever.
+ */
+async function statRuntimeImageBounded(file: string): Promise<fs.Stats | typeof RUNTIME_IMAGE_PROBE_TIMED_OUT> {
+	const timedOut = Promise.withResolvers<typeof RUNTIME_IMAGE_PROBE_TIMED_OUT>();
+	const timer: NodeJS.Timeout = setTimeout(
+		() => timedOut.resolve(RUNTIME_IMAGE_PROBE_TIMED_OUT),
+		RUNTIME_IMAGE_PROBE_TIMEOUT_MS,
+	);
+	try {
+		return await Promise.race([fsp.stat(file), timedOut.promise]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+/**
+ * Capture the runtime image identity (dev, ino, mtimeMs, size) at startup.
+ * Used to detect if the binary at the same path has been replaced.
+ */
+export async function captureRuntimeImageIdentity(file: string): Promise<SdkInternalRuntimeImageIdentity | undefined> {
+	try {
+		const resolved = path.resolve(file);
+		const stats = await statRuntimeImageBounded(resolved);
+		// A timed-out probe leaves the identity unknown, like any other failure.
+		if (stats === RUNTIME_IMAGE_PROBE_TIMED_OUT || !stats.isFile()) return undefined;
+		return {
+			path: resolved,
+			dev: stats.dev,
+			ino: stats.ino,
+			mtimeMs: stats.mtimeMs,
+			size: stats.size,
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Check if the runtime image has been replaced since startup.
+ * Returns `true` if the path is gone, its dev/ino differ from the startup identity,
+ * or its size or modification time changed (an in-place rewrite keeps the inode).
+ * Returns `false` (inconclusive) if the file exists and matches, or on any error.
+ */
+export async function isSdkInternalRuntimeImageReplaced(
+	startupIdentity: SdkInternalRuntimeImageIdentity | undefined,
+): Promise<boolean> {
+	if (startupIdentity === undefined) return false;
+
+	try {
+		const stats = await statRuntimeImageBounded(startupIdentity.path);
+		// A timed-out probe is inconclusive, not proof of replacement.
+		if (stats === RUNTIME_IMAGE_PROBE_TIMED_OUT) return false;
+		if (!stats.isFile()) return false; // Not a file, but not proven gone
+		// dev/ino catch a replacement at the same path; size and mtime catch an
+		// in-place rewrite that keeps the inode (mtime also covers same-size bytes).
+		return (
+			stats.dev !== startupIdentity.dev ||
+			stats.ino !== startupIdentity.ino ||
+			stats.size !== startupIdentity.size ||
+			stats.mtimeMs !== startupIdentity.mtimeMs
+		);
+	} catch (error) {
+		// Only ENOENT/ENOTDIR prove absence
+		if (isProvenRuntimeImageAbsence(error)) return true;
+		// Inconclusive on other errors
+		return false;
 	}
 }
 

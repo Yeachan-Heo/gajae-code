@@ -121,7 +121,6 @@ const warmup = await glob({
 if (warmup.totalMatches !== 1) throw new Error(`warmup glob returned ${warmup.totalMatches} entries`);
 // The phase-0 addon can start Tokio workers on import and Rust caches RUST_MIN_STACK on the first spawn. Keep the deterministic test hook scoped to WALK_POOL; the 2.1 runtime-install order removes this interaction at integration.
 const statusAfterWarmup = walkerPoolStatus();
-const before = await threadSnapshot();
 await fs.writeFile(readyFile, JSON.stringify({ rss: process.memoryUsage().rss }));
 while (
 	!(await fs.stat(startFile).then(
@@ -131,6 +130,10 @@ while (
 )
 	await Bun.sleep(5);
 
+// Measure thread count immediately before the glob operation to minimize the time
+// window for unrelated background threads (e.g., Bun/Tokio workers) to spawn,
+// ensuring the measurement reflects only changes caused by the glob itself.
+const before = await threadSnapshot();
 const result = await glob({
 	path: root,
 	pattern: "**/*.txt",

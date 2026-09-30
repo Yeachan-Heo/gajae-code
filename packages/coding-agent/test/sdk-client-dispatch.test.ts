@@ -594,6 +594,31 @@ test("synchronous send failure rejects as unavailable without onDispatch firing"
 	});
 });
 
+test("transport-origin markers distinguish closed-client failures from server error frames", async () => {
+	await withFakeTransport(async () => {
+		const closedClient = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		await closedClient.close();
+		await expect(closedClient.request({ type: "control_request", operation: "session.list" })).rejects.toMatchObject({
+			code: "connection_closed",
+			transport: true,
+		});
+
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		const socket = await connect(client);
+		const request = client.request({ type: "control_request", operation: "session.create" });
+		await flush();
+		const frame = sentFrame(socket);
+		socket.message({
+			type: "control_response",
+			id: frame.id,
+			ok: false,
+			error: { code: "unavailable", message: "server lifecycle failed" },
+		});
+		await expect(request).rejects.toMatchObject({ code: "unavailable", transport: false });
+		await client.close();
+	});
+});
+
 test("a throwing onDispatch observer cannot displace transport settlement", async () => {
 	await withFakeTransport(async () => {
 		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0, timeoutMs: 10_000 });

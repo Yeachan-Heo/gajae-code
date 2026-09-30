@@ -36,7 +36,8 @@ test("the production SDK host suites run sequentially and stop after a failure",
 		active -= 1;
 		return suite.file === sdkProductionHostIsolatedSuites[0].file ? 0 : 17;
 	});
-	expect(started).toEqual(sdkProductionHostIsolatedSuites.map(suite => suite.file));
+	expect(sdkProductionHostIsolatedSuites.length).toBeGreaterThan(2);
+	expect(started).toEqual(sdkProductionHostIsolatedSuites.slice(0, 2).map(suite => suite.file));
 	expect(maxActive).toBe(1);
 	expect(exitCode).toBe(17);
 });
@@ -144,12 +145,12 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		}
 	});
 
-	test("skips code-validation roots for metadata edits while retaining the contract", async () => {
+	test("skips code-validation roots for metadata-only edits", async () => {
 		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
-		// `edited` must stay in the trigger list: the verdict line lives in the PR
-		// body, so `pr-contract-bootstrap` has to re-check it on every body change.
+		// `edited` stays in the trigger list because retargeting a PR to another base
+		// is an `edited` event that must re-validate; body/title-only edits are skipped below.
 		expect(workflow).toContain("types: [opened, edited, synchronize, reopened, ready_for_review]");
-		expect(workflow).toContain("  pr-contract-bootstrap:\n    name: PR contract bootstrap\n    if: ${{ github.event_name == 'pull_request' }}");
+		expect(workflow).not.toContain("pr-contract-bootstrap:");
 
 		// Every job that validates code must opt out of a metadata-only edit.
 		// Metadata changes no tree, so running them re-queues an identical matrix and
@@ -1565,6 +1566,10 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 	test("prompt-deadline-lease changes select the production deadline manager suite", () => {
 		const tasks = targeted(["packages/coding-agent/src/sdk/prompt-deadline-lease.ts"]);
 		expect(tasks.map(task => task.key)).toContain("test:packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts");
+	});
+	test("broker lifecycle changes select the lifecycle e2e suite", () => {
+		const tasks = targeted(["packages/coding-agent/src/sdk/broker/lifecycle.ts"]);
+		expect(tasks.map(task => task.key)).toContain("test:packages/coding-agent/test/sdk-broker-lifecycle-e2e.test.ts");
 	});
 	test("agent-session source changes select the promotion and concurrency suites", () => {
 		const tasks = targeted(["packages/coding-agent/src/session/agent-session.ts"]);

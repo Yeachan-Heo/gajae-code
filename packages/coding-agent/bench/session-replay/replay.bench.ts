@@ -19,6 +19,7 @@ import { ModelRegistry } from "../../src/config/model-registry";
 import type { PerfCorpusReport } from "../perf-corpus-schema";
 
 import { startCpuProfile } from "../../src/debug/profiler";
+import { disposeAllShellSessions } from "../../src/exec/bash-executor";
 const compactionSummaryText = "Compacted summary of the recorded sanitized session.";
 
 const streamCompactionSummary: CustomStreamSimpleFn = model => {
@@ -115,12 +116,13 @@ const MIN_SCENARIO_WALL_MS: Partial<Record<ScenarioName, number>> = {
 	"session-load": 5_000,
 	"session-save": 5_000,
 	replay: 10_000,
-	tools: 15_000,
+	// I/O-bound: ~2% of wall time is on-CPU, so it needs a longer window for a stable top-10.
+	tools: 45_000,
 	keystroke: 8_000,
 	compaction: 5_000,
 };
 const MAX_SCENARIO_REPEATS = 200;
-const STARTUP_REPEATS = 5;
+const STARTUP_REPEATS = 60;
 type SessionJsonlEntry = Parameters<typeof toolCallSequence>[0][number];
 
 type SessionMessage = Message;
@@ -337,7 +339,7 @@ async function runStartupScenario(outputDirectory: string): Promise<{ profile: F
 			} else {
 				// Each run writes its own .cpuprofile into profileDirectory; they are merged below.
 				for (let repeat = 0; repeat < STARTUP_REPEATS; repeat += 1) {
-					const child = Bun.spawn([process.execPath, "--cpu-prof", "--cpu-prof-dir", profileDirectory, "--no-env-file", "--preload", traceLoader, cliEntry, ...argv], {
+					const child = Bun.spawn([process.execPath, "--cpu-prof", `--cpu-prof-interval=${intervalMicros}`, "--cpu-prof-dir", profileDirectory, "--no-env-file", "--preload", traceLoader, cliEntry, ...argv], {
 						cwd: repositoryRoot,
 						env,
 						stdout: "pipe",
@@ -768,6 +770,9 @@ async function runToolScenario(originMs: number): Promise<HarnessMark[]> {
 		}
 		return marks;
 	} finally {
+		// BashTool keeps a persistent shell worker/supervisor alive; without this
+		// its sockets hold the event loop open and the process never exits.
+		await disposeAllShellSessions();
 		await fs.rm(tempRoot, { recursive: true, force: true });
 	}
 }

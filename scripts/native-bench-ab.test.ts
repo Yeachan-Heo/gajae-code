@@ -59,6 +59,14 @@ describe("native bench A/B contract", () => {
 		expect(parseNativeBenchOptions(["--suite", "rss", "--base", "HEAD", "--calibrate"]).suite).toBe("rss");
 		expect(() => parseNativeBenchOptions(["--suite", "edit-hotspots"])).toThrow("--base");
 	});
+	test("uses a suite's default iterations unless --iterations is explicit", () => {
+		expect(parseNativeBenchOptions(["--suite", "builtins", "--base", "HEAD"]).iterations).toBe(20);
+		expect(parseNativeBenchOptions(["--suite", "builtins", "--base", "HEAD", "--iterations", "50"]).iterations).toBe(50);
+		expect(parseNativeBenchOptions(["--suite", "grep", "--base", "HEAD"]).iterations).toBe(200);
+		expect(() => parseNativeBenchOptions(["--suite", "builtins", "--base", "HEAD", "--iterations", "0"])).toThrow(
+			"--iterations",
+		);
+	});
 	test("surfaces BaselineIdentityMismatch unless baseline drift is explicit", () => {
 		expect(() => assertBaselineIdentity("base-sha", "head-sha", false, false)).toThrow();
 		expect(() => assertBaselineIdentity("base-sha", "head-sha", true, false)).not.toThrow();

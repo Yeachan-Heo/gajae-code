@@ -45,8 +45,9 @@ export const TIER_MAP_VERSION = 1;
 
 export const CURATED_TIER_LABELS = {
 	"anthropic/claude-haiku-4-5": [{ tier: "fast", rank: 1 }],
-	"anthropic/claude-sonnet-5": [{ tier: "balanced", rank: 1 }],
-	"anthropic/claude-sonnet-4-6": [{ tier: "balanced", rank: 2 }],
+	"anthropic/claude-sonnet-5-5": [{ tier: "balanced", rank: 1 }],
+	"anthropic/claude-sonnet-5": [{ tier: "balanced", rank: 2 }],
+	"anthropic/claude-sonnet-4-6": [{ tier: "balanced", rank: 3 }],
 	"anthropic/claude-opus-5-5": [{ tier: "strong", effort: "high", rank: 1 }],
 	"anthropic/claude-opus-5": [{ tier: "strong", effort: "high", rank: 2 }],
 	"anthropic/claude-opus-4-8": [{ tier: "strong", effort: "high", rank: 3 }],
@@ -55,6 +56,7 @@ export const CURATED_TIER_LABELS = {
 		{ tier: "balanced", effort: "medium", rank: 1 },
 	],
 	"openai-codex/gpt-6-sol": [{ tier: "strong", effort: "high", rank: 1 }],
+	"openai-codex/gpt-6.1-sol": [{ tier: "strong", effort: "high", rank: 2 }],
 	"google/gemini-3.5-flash-lite": [{ tier: "fast", rank: 1 }],
 	"google/gemini-2.5-flash-lite": [{ tier: "fast", rank: 2 }],
 	"google/gemini-3.5-flash": [{ tier: "balanced", rank: 1 }],
@@ -75,6 +77,22 @@ export const CURATED_TIER_LABELS = {
 
 /** Generated from packages/ai/src/models.json at feature land: 3936 in-scope baseline skips. */
 export const TIER_MAP_SKIP_LIST = {
+	"amazon-bedrock/anthropic.claude-sonnet-5-5": { rationale: "Sonnet 5.5 catalog addition (#6111); not yet curated" },
+	"amazon-bedrock/au.anthropic.claude-sonnet-5-5": {
+		rationale: "Sonnet 5.5 catalog addition (#6111); not yet curated",
+	},
+	"amazon-bedrock/eu.anthropic.claude-sonnet-5-5": {
+		rationale: "Sonnet 5.5 catalog addition (#6111); not yet curated",
+	},
+	"amazon-bedrock/global.anthropic.claude-sonnet-5-5": {
+		rationale: "Sonnet 5.5 catalog addition (#6111); not yet curated",
+	},
+	"amazon-bedrock/jp.anthropic.claude-sonnet-5-5": {
+		rationale: "Sonnet 5.5 catalog addition (#6111); not yet curated",
+	},
+	"amazon-bedrock/us.anthropic.claude-sonnet-5-5": {
+		rationale: "Sonnet 5.5 catalog addition (#6111); not yet curated",
+	},
 	"kiro/claude-opus-5-5": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"kiro/claude-opus-5.5": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"alibaba-token-plan/qwen3.8-flash": { rationale: "post-rebase catalog addition from dev; not yet curated" },

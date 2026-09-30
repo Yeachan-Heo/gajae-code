@@ -47,7 +47,16 @@ export interface ParsedOptions {
 	rss: string[];
 }
 
-const SUITES: Record<string, { adapter: string; actualSuite: string; cases: string[]; support?: string[] }> = {
+/**
+ * `defaultIterations` overrides DEFAULT_ITERATIONS for suites whose samples are
+ * expensive; an explicit `--iterations` still wins. Keep it at 20 or more:
+ * each block's p95 is `quantile(samples, 0.95)`, which degenerates to the
+ * block maximum below 20 samples and would weaken the p95 gate.
+ */
+const SUITES: Record<
+	string,
+	{ adapter: string; actualSuite: string; cases: string[]; support?: string[]; defaultIterations?: number }
+> = {
 	"edit-hotspots": { adapter: "packages/natives/bench/edit-hotspots.ts", actualSuite: "edit-hotspots", cases: ["H01", "H02", "H03", "H06"] },
 	grep: { adapter: "packages/natives/bench/grep.ts", actualSuite: "grep", cases: ["G01", "G02", "G03", "G04", "G05", "G06", "G07", "G08"] },
 	"natives-grep": { adapter: "packages/natives/bench/grep.ts", actualSuite: "grep", cases: ["G01", "G02", "G03", "G04", "G05", "G06", "G07", "G08"] },
@@ -66,6 +75,16 @@ const SUITES: Record<string, { adapter: string; actualSuite: string; cases: stri
 	"tools:glob": { adapter: "packages/natives/bench/tools-glob.ts", actualSuite: "tools:glob", cases: ["G01"] },
 	"tui-input-write": { adapter: "packages/natives/bench/tui-input-write.ts", actualSuite: "tui-input-write", cases: ["I01"] },
 	"tty-write": { adapter: "packages/natives/bench/tty-write.ts", actualSuite: "tty-write", cases: ["W01", "W02"], support: ["packages/natives/bench/tty-write-child.ts"] },
+	pty: { adapter: "packages/natives/bench/pty.ts", actualSuite: "pty", cases: ["P01", "P02"] },
+	power: { adapter: "packages/natives/bench/power.ts", actualSuite: "power", cases: ["W01"] },
+	appearance: { adapter: "packages/natives/bench/appearance.ts", actualSuite: "appearance", cases: ["A01"] },
+	prof: { adapter: "packages/natives/bench/prof.ts", actualSuite: "prof", cases: ["R01", "R02"] },
+	iso: { adapter: "packages/natives/bench/iso.ts", actualSuite: "iso", cases: ["I01", "I02", "I03"] },
+	crash: { adapter: "packages/natives/bench/crash.ts", actualSuite: "crash", cases: ["C01", "C02"] },
+	// Each builtins sample loops the builtin 10,000 times (~0.3-0.55 s), so 200
+	// samples per case would blow the 10-minute adapter timeout and the job budget.
+	builtins: { adapter: "packages/natives/bench/builtins.ts", actualSuite: "builtins", cases: ["B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08"], defaultIterations: 20 },
+	clipboard: { adapter: "packages/natives/bench/clipboard.ts", actualSuite: "clipboard", cases: ["C01"] },
 	rss: { adapter: "", actualSuite: "rss", cases: [] },
 };
 
@@ -82,7 +101,7 @@ export function parseNativeBenchOptions(args: readonly string[]): ParsedOptions 
 	let calibrate = false;
 	let allowBaselineDrift = false;
 	let blocks = DEFAULT_BLOCKS;
-	let iterations = DEFAULT_ITERATIONS;
+	let iterations: number | undefined;
 	let rss: string[] = [];
 	for (let index = 0; index < args.length; index += 1) {
 		const arg = args[index];
@@ -110,6 +129,7 @@ export function parseNativeBenchOptions(args: readonly string[]): ParsedOptions 
 	if (!suite || !SUITES[suite]) throw new BenchError("InvalidSuite", `--suite must be one of: ${Object.keys(SUITES).join(", ")}`);
 	if (!base) throw new BenchError("MissingBase", "--base <git-ref> is required");
 	if (!Number.isInteger(blocks) || blocks < 1) throw new BenchError("InvalidBlocks", "--blocks must be a positive integer");
+	iterations ??= SUITES[suite].defaultIterations ?? DEFAULT_ITERATIONS;
 	if (!Number.isInteger(iterations) || iterations < 1) throw new BenchError("InvalidIterations", "--iterations must be a positive integer");
 	const invalidRss = rss.filter(id => !(RSS_SCENARIOS as readonly string[]).includes(id));
 	if (invalidRss.length) throw new BenchError("InvalidRssScenario", `unsupported RSS scenarios: ${invalidRss.join(", ")}`);

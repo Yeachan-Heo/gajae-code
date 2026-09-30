@@ -1,0 +1,338 @@
+{
+  "upstreamSha": "a85bd5228d9f0f619deade1db78fa49420a721e1",
+  "devSha": "d73818b6ac3ca39ffeab133f4df99b35509490ae",
+  "repositories": {
+    "largeWorktree": {
+      "path": "/Users/bellman/Documents/Workspace/gajae-code",
+      "headSha": "804436c4b821e754f1548c88e4ab0d04d683a937",
+      "readOnly": true
+    },
+    "smallFixture": {
+      "pathInScratch": "/Users/bellman/tmp/w-vcs/.bench-small",
+      "headSha": "18f4e1c4923d5b16e7c85483339c2de80992ecab",
+      "recipe": "24 tracked files file-00.txt..file-23.txt, each with 60 lines formatted file=<index> line=<line> seed=baseline; baseline commit plus 5 commits appending commit <n> to file-00.txt; then stage an append to file-01.txt, append an unstaged line to file-02.txt, and add new-untracked.txt."
+    }
+  },
+  "host": {
+    "os": "darwin",
+    "arch": "arm64",
+    "cpuModel": "Apple M5 Max",
+    "cores": 18,
+    "loadBefore": {
+      "oneMinute": 3.02,
+      "fiveMinute": 6.18,
+      "fifteenMinute": 8.57,
+      "raw": "{ 3.02 6.18 8.57 }"
+    },
+    "loadAfter": {
+      "oneMinute": 3.92,
+      "fiveMinute": 5.83,
+      "fifteenMinute": 8.25,
+      "raw": "{ 3.92 5.83 8.25 }"
+    },
+    "loadAtLaunch": {
+      "oneMinute": 3.02,
+      "fiveMinute": 6.18,
+      "fifteenMinute": 8.57,
+      "raw": "{ 3.02 6.18 8.57 }"
+    }
+  },
+  "addonGzipBytes": {
+    "before": 16367446,
+    "after": 22153466,
+    "delta": 5786020,
+    "limit": 8000000
+  },
+  "methodology": {
+    "startedAt": "2026-09-29T01:59:07.216Z",
+    "finishedAt": "2026-09-29T02:00:19.170Z",
+    "elapsedSeconds": 71.954,
+    "timedSamples": "Every sample waited until sysctl vm.loadavg 1-minute value was below 9, then timed only the API call with performance.now().",
+    "interleaving": "ABAB per iteration: TypeScript CLI base then native head; each case has 15 blocks x 20 paired iterations.",
+    "timerScope": "Native VcsGitRepo handles were discovered once before timing; each sampled operation call and its JS wrapper cost were included. Native show Buffer-to-UTF-8 decoding is included in its timed call.",
+    "blocksPerCase": 15,
+    "iterationsPerBlock": 20,
+    "bootstrap": {
+      "resamples": 10000,
+      "seed": 561038805,
+      "ci": "Percentile 95% CI from paired-block bootstrap; each resample draws 15 block indices with replacement and pools each selected block's 20 base/head samples.",
+      "aggregate": "For each paired resample, compute each of the eight head/base p50 ratios and their geometric mean using shared sampled block indices."
+    }
+  },
+  "correctnessChecks": [
+    {
+      "name": "large-worktree.status",
+      "cliSha256": "4b9819da34be2cf39da12c2fa31fc4feff5f1467cb53e8905e59f1f74dc08f28",
+      "nativeSha256": "4b9819da34be2cf39da12c2fa31fc4feff5f1467cb53e8905e59f1f74dc08f28",
+      "cliUtf8Bytes": 76,
+      "nativeUtf8Bytes": 76,
+      "equivalent": true
+    },
+    {
+      "name": "large-worktree.diff",
+      "cliSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "nativeSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "cliUtf8Bytes": 0,
+      "nativeUtf8Bytes": 0,
+      "equivalent": true
+    },
+    {
+      "name": "large-worktree.log",
+      "cliSha256": "e77a11998f44aa9e8e890ff796d38b79bf3a34cd38e0f18330bd455ae65f9bbe",
+      "nativeSha256": "e77a11998f44aa9e8e890ff796d38b79bf3a34cd38e0f18330bd455ae65f9bbe",
+      "cliUtf8Bytes": 14344,
+      "nativeUtf8Bytes": 14344,
+      "equivalent": true
+    },
+    {
+      "name": "large-worktree.show",
+      "cliSha256": "95395bfdb9827983e542709d8a3a592eb6af48725aa34bd98262a52b54bdffd1",
+      "nativeSha256": "236ecdd33e5ab35d963506f4c6b863148ba6156feddeb2d3adfe14fc74248c74",
+      "cliUtf8Bytes": 26603,
+      "nativeUtf8Bytes": 28211,
+      "equivalent": false,
+      "mediumFormatEquivalent": false,
+      "note": "The measured base is the exact TS default `git.show(cwd, 'HEAD')` command (`git show --format= HEAD`); native `showCommit('HEAD')` output differs, including under CLI `--format=medium` on this large worktree. Timing comparison is reported transparently, not presented as byte-equivalent output."
+    },
+    {
+      "name": "small-fixture.status",
+      "cliSha256": "5b152b1de2efb1e8db02578bbb445df54ffdbad2341bbe50fc4eb1887fd8fdc3",
+      "nativeSha256": "5b152b1de2efb1e8db02578bbb445df54ffdbad2341bbe50fc4eb1887fd8fdc3",
+      "cliUtf8Bytes": 51,
+      "nativeUtf8Bytes": 51,
+      "equivalent": true
+    },
+    {
+      "name": "small-fixture.diff",
+      "cliSha256": "3cc1e58d700b16ec84a8fb1f3dd15a1488aa924f1c6ac1f3cf78bc4e0d26c64a",
+      "nativeSha256": "3cc1e58d700b16ec84a8fb1f3dd15a1488aa924f1c6ac1f3cf78bc4e0d26c64a",
+      "cliUtf8Bytes": 528,
+      "nativeUtf8Bytes": 528,
+      "equivalent": true
+    },
+    {
+      "name": "small-fixture.log",
+      "cliSha256": "c2dd764eb5905568bdeb05b14947eca64520195f8745c31cbc0d6400c6948b56",
+      "nativeSha256": "c2dd764eb5905568bdeb05b14947eca64520195f8745c31cbc0d6400c6948b56",
+      "cliUtf8Bytes": 120,
+      "nativeUtf8Bytes": 120,
+      "equivalent": true
+    },
+    {
+      "name": "small-fixture.show",
+      "cliSha256": "308fb0576ba4b6c2d4c67b27792259775597e3dabee2e5967e431f2208b78cbb",
+      "nativeSha256": "537c749257af128b6c0ae1b8f347b29d9878492096f6bef1155a08a7ccd1c7af",
+      "cliUtf8Bytes": 172,
+      "nativeUtf8Bytes": 335,
+      "equivalent": false,
+      "mediumFormatEquivalent": true,
+      "note": "The measured base is the exact TS default `git.show(cwd, 'HEAD')` command (`git show --format= HEAD`); native `showCommit('HEAD')` differs in output, while CLI `--format=medium` matches this fixture byte-for-byte."
+    }
+  ],
+  "aggregate": {
+    "definition": "Geometric mean of the eight per-case head/base p50 ratios.",
+    "headOverBaseP50": 0.2398066567056362,
+    "ci95": {
+      "lower": 0.23818294572206145,
+      "upper": 0.24135047151053757
+    },
+    "resamples": 10000
+  },
+  "schema": "gjc.rust-porting.d5-evidence/1",
+  "cases": [
+    {
+      "name": "large-worktree.status",
+      "repository": "large-worktree",
+      "operation": "status",
+      "cliCommand": "git status --porcelain",
+      "nativeExport": "VcsGitRepo.statusPorcelain({})",
+      "p50Ms": {
+        "base": 36.37875,
+        "head": 41.5084
+      },
+      "headOverBaseP50": 1.141006769061609,
+      "ci95": {
+        "lower": 1.121067759329044,
+        "upper": 1.1617557374247607
+      },
+      "output": {
+        "cliSha256": "4b9819da34be2cf39da12c2fa31fc4feff5f1467cb53e8905e59f1f74dc08f28",
+        "nativeSha256": "4b9819da34be2cf39da12c2fa31fc4feff5f1467cb53e8905e59f1f74dc08f28",
+        "cliUtf8Bytes": 76,
+        "nativeUtf8Bytes": 76,
+        "equivalent": true
+      }
+    },
+    {
+      "name": "large-worktree.diff",
+      "repository": "large-worktree",
+      "operation": "diff",
+      "cliCommand": "git diff HEAD",
+      "nativeExport": "VcsGitRepo.diffText({ base: 'HEAD' })",
+      "p50Ms": {
+        "base": 17.25995,
+        "head": 12.905650000000001
+      },
+      "headOverBaseP50": 0.7477223282802095,
+      "ci95": {
+        "lower": 0.7290515296228197,
+        "upper": 0.760691235257664
+      },
+      "output": {
+        "cliSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "nativeSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "cliUtf8Bytes": 0,
+        "nativeUtf8Bytes": 0,
+        "equivalent": true
+      }
+    },
+    {
+      "name": "large-worktree.log",
+      "repository": "large-worktree",
+      "operation": "log",
+      "cliCommand": "git log -n200 --pretty=format:%s",
+      "nativeExport": "VcsGitRepo.logSubjects(200)",
+      "p50Ms": {
+        "base": 16.500999999999998,
+        "head": 9.0451
+      },
+      "headOverBaseP50": 0.5481546572934974,
+      "ci95": {
+        "lower": 0.5372084049930751,
+        "upper": 0.5539174928646305
+      },
+      "output": {
+        "cliSha256": "e77a11998f44aa9e8e890ff796d38b79bf3a34cd38e0f18330bd455ae65f9bbe",
+        "nativeSha256": "e77a11998f44aa9e8e890ff796d38b79bf3a34cd38e0f18330bd455ae65f9bbe",
+        "cliUtf8Bytes": 14344,
+        "nativeUtf8Bytes": 14344,
+        "equivalent": true
+      }
+    },
+    {
+      "name": "large-worktree.show",
+      "repository": "large-worktree",
+      "operation": "show",
+      "cliCommand": "git show --format= HEAD",
+      "nativeExport": "VcsGitRepo.showCommit('HEAD')",
+      "p50Ms": {
+        "base": 15.6329,
+        "head": 2.5221999999999998
+      },
+      "headOverBaseP50": 0.16133922688688598,
+      "ci95": {
+        "lower": 0.1586320584152222,
+        "upper": 0.16343427233324342
+      },
+      "output": {
+        "cliSha256": "95395bfdb9827983e542709d8a3a592eb6af48725aa34bd98262a52b54bdffd1",
+        "nativeSha256": "236ecdd33e5ab35d963506f4c6b863148ba6156feddeb2d3adfe14fc74248c74",
+        "cliUtf8Bytes": 26603,
+        "nativeUtf8Bytes": 28211,
+        "equivalent": false,
+        "mediumFormatEquivalent": false
+      }
+    },
+    {
+      "name": "small-fixture.status",
+      "repository": "small-fixture",
+      "operation": "status",
+      "cliCommand": "git status --porcelain",
+      "nativeExport": "VcsGitRepo.statusPorcelain({})",
+      "p50Ms": {
+        "base": 10.72345,
+        "head": 14.272400000000001
+      },
+      "headOverBaseP50": 1.3309522588346103,
+      "ci95": {
+        "lower": 1.28811362410555,
+        "upper": 1.3750492402126795
+      },
+      "output": {
+        "cliSha256": "5b152b1de2efb1e8db02578bbb445df54ffdbad2341bbe50fc4eb1887fd8fdc3",
+        "nativeSha256": "5b152b1de2efb1e8db02578bbb445df54ffdbad2341bbe50fc4eb1887fd8fdc3",
+        "cliUtf8Bytes": 51,
+        "nativeUtf8Bytes": 51,
+        "equivalent": true
+      }
+    },
+    {
+      "name": "small-fixture.diff",
+      "repository": "small-fixture",
+      "operation": "diff",
+      "cliCommand": "git diff HEAD",
+      "nativeExport": "VcsGitRepo.diffText({ base: 'HEAD' })",
+      "p50Ms": {
+        "base": 10.677,
+        "head": 1.00105
+      },
+      "headOverBaseP50": 0.09375760981549125,
+      "ci95": {
+        "lower": 0.09205670082028343,
+        "upper": 0.09510478999727574
+      },
+      "output": {
+        "cliSha256": "3cc1e58d700b16ec84a8fb1f3dd15a1488aa924f1c6ac1f3cf78bc4e0d26c64a",
+        "nativeSha256": "3cc1e58d700b16ec84a8fb1f3dd15a1488aa924f1c6ac1f3cf78bc4e0d26c64a",
+        "cliUtf8Bytes": 528,
+        "nativeUtf8Bytes": 528,
+        "equivalent": true
+      }
+    },
+    {
+      "name": "small-fixture.log",
+      "repository": "small-fixture",
+      "operation": "log",
+      "cliCommand": "git log -n200 --pretty=format:%s",
+      "nativeExport": "VcsGitRepo.logSubjects(200)",
+      "p50Ms": {
+        "base": 10.2721,
+        "head": 0.40149999999999997
+      },
+      "headOverBaseP50": 0.03908645749165214,
+      "ci95": {
+        "lower": 0.038664700276005166,
+        "upper": 0.03980045816183511
+      },
+      "output": {
+        "cliSha256": "c2dd764eb5905568bdeb05b14947eca64520195f8745c31cbc0d6400c6948b56",
+        "nativeSha256": "c2dd764eb5905568bdeb05b14947eca64520195f8745c31cbc0d6400c6948b56",
+        "cliUtf8Bytes": 120,
+        "nativeUtf8Bytes": 120,
+        "equivalent": true
+      }
+    },
+    {
+      "name": "small-fixture.show",
+      "repository": "small-fixture",
+      "operation": "show",
+      "cliCommand": "git show --format= HEAD",
+      "nativeExport": "VcsGitRepo.showCommit('HEAD')",
+      "p50Ms": {
+        "base": 10.4801,
+        "head": 0.31145
+      },
+      "headOverBaseP50": 0.029718227879504965,
+      "ci95": {
+        "lower": 0.02919034136742833,
+        "upper": 0.030238898739728112
+      },
+      "output": {
+        "cliSha256": "308fb0576ba4b6c2d4c67b27792259775597e3dabee2e5967e431f2208b78cbb",
+        "nativeSha256": "537c749257af128b6c0ae1b8f347b29d9878492096f6bef1155a08a7ccd1c7af",
+        "cliUtf8Bytes": 172,
+        "nativeUtf8Bytes": 335,
+        "equivalent": false,
+        "mediumFormatEquivalent": true
+      }
+    }
+  ],
+  "d5Verdict": {
+    "sizeGate": "pass",
+    "aggregateReadWin": "pass",
+    "statusNonInferiority": "fail",
+    "showOutputEquivalence": "fail"
+  },
+  "inventoryDecision": "rejected",
+  "decisionReason": "Aggregate read-suite ratio 0.240 (CI upper 0.241) and addon +5.79 MB pass D5, but adopting the row would regress status (large worktree 1.141x, CI [1.121, 1.162]; small fixture 1.331x, CI [1.288, 1.375]) and native show output is not byte-identical to the git CLI output the TS consumers parse. Partial adoption (diff/log native, status/show on CLI) needs an owner D5 decision."
+}

@@ -102,6 +102,7 @@ export function injectCodexGpt6Models(models: Model[]): void {
 	const bundled: Model<"openai-codex-responses">[] = [
 		gpt6("gpt-6-astra", "GPT-6-Astra", 1),
 		gpt6("gpt-6-sol", "GPT-6-Sol"),
+		gpt6("gpt-6.1-sol", "GPT-6.1-Sol"),
 		gpt6("gpt-6-luna", "GPT-6-Luna"),
 	];
 	for (const model of bundled) {

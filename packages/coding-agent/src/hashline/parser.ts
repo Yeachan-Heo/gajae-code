@@ -20,35 +20,59 @@ import type { Anchor, HashlineCursor, HashlineEdit } from "./types";
 const LID_CAPTURE_RE = new RegExp(`^\\s*[>+\\-*]*\\s*${HL_HASH_CAPTURE_RE_RAW}(?:\\|.*)?\\s*$`);
 const regexEscape = (str: string): string => str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-const BARE_LINE_REF_RE = /^\s*[>+\-*]*\s*([1-9]\d*)(?:\s*(?:-|\.\.)\s*([1-9]\d*))?\s*$/;
+// Dots in copied text are literal unless followed by a possible range endpoint.
+// Ambiguous copied ranges still require a re-read instead of a one-line retry.
+const BARE_LINE_REF_RE =
+	/^\s*[>+\-*]*\s*([1-9]\d*)(?:\s*(?:-|\.\.)\s*([1-9]\d*))?(?:\|(?:(?!\.\.\s*[>+\-*]*\s*(?:[1-9]\d*|[a-z]{2}(?:\||\s*$))).)*)?\s*$/;
+const HASH_ONLY_REF_RE = /^\s*[>+\-*]*\s*([a-z]{2})(?:\|.*)?\s*$/;
+type HashlineOpSigil = typeof HL_OP_INSERT_BEFORE | typeof HL_OP_INSERT_AFTER | typeof HL_OP_REPLACE;
 
 /**
- * An op referenced lines by number alone, without the content hash. The edit
- * is never applied on a line number alone; the executor answers with the
- * current full anchors for {@link lines} so the model can retry without an
- * extra read.
+ * An op referenced lines by number alone. The edit is never applied on a line
+ * number alone; the executor answers with the current full anchors so the model
+ * can retry without another read.
  */
 export class HashlineMissingHashError extends Error {
 	constructor(
 		message: string,
 		readonly lines: { start: number; end: number },
+		readonly opSigil: HashlineOpSigil,
+		readonly rangeRaw?: { start: string; end: string },
 	) {
 		super(message);
 		this.name = "HashlineMissingHashError";
 	}
 }
 
-function parseLid(raw: string, lineNum: number): Anchor {
+export class HashlineMissingLineError extends Error {
+	constructor(
+		readonly hash: string,
+		readonly lineNum: number | undefined,
+		readonly opSigil: HashlineOpSigil,
+		readonly rangeRaw?: { start: string; end: string },
+	) {
+		super(
+			lineNum === undefined
+				? `Anchor "${hash}" lacks its line number.`
+				: `Anchor "${hash}" lacks its line number. Did you mean ${opSigil}${lineNum}${hash}?`,
+		);
+		this.name = "HashlineMissingLineError";
+	}
+}
+
+function parseLid(raw: string, lineNum: number, opSigil: HashlineOpSigil): Anchor {
 	const match = LID_CAPTURE_RE.exec(raw);
 	if (!match) {
+		const hashOnly = HASH_ONLY_REF_RE.exec(raw);
+		if (hashOnly) throw new HashlineMissingLineError(hashOnly[1], undefined, opSigil);
 		const bare = BARE_LINE_REF_RE.exec(raw);
 		if (bare) {
 			const start = Number.parseInt(bare[1], 10);
 			const end = bare[2] === undefined ? start : Number.parseInt(bare[2], 10);
 			throw new HashlineMissingHashError(
-				`line ${lineNum}: anchor ${JSON.stringify(raw.trim())} is missing its hash; ` +
-					`use the full anchor such as ${describeAnchorExamples(String(start))}.`,
+				`line ${lineNum}: anchor ${JSON.stringify(raw.trim())} is missing its hash.`,
 				{ start: Math.min(start, end), end: Math.max(start, end) },
+				opSigil,
 			);
 		}
 		throw new Error(
@@ -64,12 +88,12 @@ interface ParsedRange {
 	end: Anchor;
 }
 
-function parseRange(raw: string, lineNum: number): ParsedRange {
+function parseRange(raw: string, lineNum: number, opSigil: HashlineOpSigil): ParsedRange {
 	// Reject an all-numeric range (`16..18`, `16-18`) as a whole so the error
 	// carries the full span rather than just its first endpoint.
-	if (BARE_LINE_REF_RE.test(raw)) parseLid(raw, lineNum);
+	if (BARE_LINE_REF_RE.test(raw)) parseLid(raw, lineNum, opSigil);
 	if (!raw.includes("..")) {
-		const start = parseLid(raw, lineNum);
+		const start = parseLid(raw, lineNum, opSigil);
 		return { start, end: { ...start } };
 	}
 	const [startRaw, endRaw, extra] = raw.split("..");
@@ -79,8 +103,30 @@ function parseRange(raw: string, lineNum: number): ParsedRange {
 				`For a one-line edit, repeat the same anchor on both sides.`,
 		);
 	}
-	const start = parseLid(startRaw, lineNum);
-	const end = parseLid(endRaw, lineNum);
+	let start: Anchor;
+	try {
+		start = parseLid(startRaw, lineNum, opSigil);
+	} catch (err) {
+		if (err instanceof HashlineMissingHashError) {
+			throw new HashlineMissingHashError(err.message, err.lines, err.opSigil, { start: startRaw, end: endRaw });
+		}
+		if (err instanceof HashlineMissingLineError) {
+			throw new HashlineMissingLineError(err.hash, err.lineNum, err.opSigil, { start: startRaw, end: endRaw });
+		}
+		throw err;
+	}
+	let end: Anchor;
+	try {
+		end = parseLid(endRaw, lineNum, opSigil);
+	} catch (err) {
+		if (err instanceof HashlineMissingHashError) {
+			throw new HashlineMissingHashError(err.message, err.lines, err.opSigil, { start: startRaw, end: endRaw });
+		}
+		if (err instanceof HashlineMissingLineError) {
+			throw new HashlineMissingLineError(err.hash, err.lineNum, err.opSigil, { start: startRaw, end: endRaw });
+		}
+		throw err;
+	}
 	if (end.line < start.line) {
 		throw new Error(`line ${lineNum}: range ${startRaw}..${endRaw} ends before it starts.`);
 	}
@@ -104,7 +150,8 @@ function parseInsertTarget(raw: string, lineNum: number, kind: "before" | "after
 	if (raw === "BOF") return { kind: "bof" };
 	if (raw === "EOF") return { kind: "eof" };
 	const cursorKind = kind === "before" ? "before_anchor" : "after_anchor";
-	return { kind: cursorKind, anchor: parseLid(raw, lineNum) };
+	const opSigil = kind === "before" ? HL_OP_INSERT_BEFORE : HL_OP_INSERT_AFTER;
+	return { kind: cursorKind, anchor: parseLid(raw, lineNum, opSigil) };
 }
 
 /**
@@ -137,7 +184,7 @@ const INSERT_BEFORE_OP_RE = new RegExp(
 const INSERT_AFTER_OP_RE = new RegExp(
 	`^${regexEscape(HL_OP_INSERT_AFTER)}\\s*([^|\\s]+)(?:${HL_BODY_SEP_RE_RAW}(.*))?\\s*$`,
 );
-const REPLACE_OP_RE = new RegExp(`^${regexEscape(HL_OP_REPLACE)}\\s*([^\\s+<\\-=]\\S*)\\s*$`);
+const REPLACE_OP_RE = new RegExp(`^${regexEscape(HL_OP_REPLACE)}\\s*([^\\s+<\\-=]\\S*(?:\\|.*)?)\\s*$`);
 
 function isEnvelopeOrAbortMarkerLine(line: string): boolean {
 	const trimmed = line.trimEnd();
@@ -240,7 +287,7 @@ export function parseHashlineWithWarnings(diff: string): { edits: HashlineEdit[]
 
 		const replaceMatch = REPLACE_OP_RE.exec(line);
 		if (replaceMatch) {
-			const range = parseRange(replaceMatch[1], lineNum);
+			const range = parseRange(replaceMatch[1], lineNum, HL_OP_REPLACE);
 			const { payload, nextIndex } = collectPayload(lines, i + 1, lineNum, false);
 			if (payload.length > 0) {
 				for (const text of payload) {

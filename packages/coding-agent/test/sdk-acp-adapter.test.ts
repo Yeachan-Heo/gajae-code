@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
 import packageJson from "../package.json" with { type: "json" };
-import { AcpAgent } from "../src/modes/acp/acp-agent";
+import { AcpAgent, acpRequestFailure } from "../src/modes/acp/acp-agent";
 import { AcpSdkAdapter, type AcpSdkAdapterError, acpMcpLaunchFailure } from "../src/sdk/acp";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { SdkClientError } from "../src/sdk/client";
@@ -855,6 +855,49 @@ test("the ACP MCP launch wrapper reports broker refusal and re-attributes spawn 
 	);
 	expect(acpMcpLaunchFailure(readyThenExited, mcpServers)).toBe(readyThenExited);
 	expect(acpMcpLaunchFailure(readyThenExited, [])).toBe(readyThenExited);
+
+	const lifecycleFailure = new SdkClientError(
+		"broker_lifecycle_failed",
+		"broker lifecycle failed token=secret-token endpoint=https://example.test/mcp?token=secret-token url=https://example.test",
+	);
+	const attributed = acpMcpLaunchFailure(lifecycleFailure, mcpServers) as AcpSdkAdapterError;
+	expect(attributed.code).toBe("unavailable");
+	expect(attributed.message).toContain("broker_lifecycle_failed");
+	expect(attributed.message).not.toContain("secret-token");
+	expect(attributed.message).not.toContain("https://example.test");
+	expect(attributed.message).not.toMatch(/\b(?:token|url|endpoint)\b/i);
+	expect(attributed.cause).toBe(lifecycleFailure);
+
+	const transportFailure = new SdkClientError("connection_closed", "SDK request failed");
+	const markedTransportFailures = [
+		new SdkClientError("connection_closed", "SDK request failed", undefined, undefined, { transport: true }),
+		new SdkClientError("unavailable", "SDK request failed", undefined, undefined, { transport: true }),
+		new SdkClientError("timeout", "SDK request failed", undefined, undefined, { transport: true }),
+	];
+	for (const marked of markedTransportFailures) expect(acpMcpLaunchFailure(marked, mcpServers)).toBe(marked);
+	expect(acpMcpLaunchFailure(transportFailure, mcpServers)).not.toBe(transportFailure);
+
+	const frameUnavailable = new SdkClientError("unavailable", "mcp spawn failed", {
+		code: "unavailable",
+		message: "mcp spawn failed",
+	});
+	const attributedFrameUnavailable = acpMcpLaunchFailure(frameUnavailable, mcpServers) as AcpSdkAdapterError;
+	expect(attributedFrameUnavailable.code).toBe("unavailable");
+	expect(attributedFrameUnavailable.message).toContain("MCP server request failed to start (docs, search)");
+	expect(attributedFrameUnavailable.message).toContain("[unavailable: mcp spawn failed]");
+
+	const frameWithoutCode = new SdkClientError("unavailable", "mcp spawn failed", {
+		message: "mcp spawn failed",
+	});
+	const attributedFrameWithoutCode = acpMcpLaunchFailure(frameWithoutCode, mcpServers) as AcpSdkAdapterError;
+	expect(attributedFrameWithoutCode.code).toBe("unavailable");
+	expect(attributedFrameWithoutCode.message).toContain("MCP server request failed to start (docs, search)");
+	expect(attributedFrameWithoutCode.message).toContain("[unavailable: mcp spawn failed]");
+
+	const requestFailure = acpRequestFailure(attributed) as Error;
+	expect(requestFailure.message).toBe(`Internal error: ${attributed.message}`);
+	expect(requestFailure.message.match(/MCP server request failed to start/g)).toHaveLength(1);
+	expect((requestFailure as { data?: { details?: unknown } }).data?.details).toBeUndefined();
 });
 test("the production ACP MCP launch path preserves broker admission timeout failures", async () => {
 	const root = await fs.mkdtemp(path.join(tmpdir(), "gjc-acp-mcp-admission-timeout-"));

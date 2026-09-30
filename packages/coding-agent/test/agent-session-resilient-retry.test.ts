@@ -1286,6 +1286,96 @@ describe.serial("AgentSession resilient retry", () => {
 		expect(retryEndEvents[0]).toMatchObject({ success: true });
 		expect(lastAssistant(session).stopReason).toBe("stop");
 	});
+	it("retries a content-free unexpected socket close under bare defaults", async () => {
+		const requestedModels: string[] = [];
+		const errorMessage =
+			"The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch() (transport=ECONNRESET url=<redacted>)";
+		session = buildStatusErrorSession({
+			errorMessage,
+			bareDefault: true,
+			recoveredContent: "recovered",
+			requestedModels,
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents, retryEndEvents } = track(session);
+
+		await session.prompt("bare-config socket close");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryStartEvents[0]?.unbounded).toBe(false);
+		expect(requestedModels).toHaveLength(2);
+		expect(retryEndEvents).toEqual([expect.objectContaining({ success: true })]);
+		expect(lastAssistant(session)).toMatchObject({
+			stopReason: "stop",
+			content: [{ type: "text", text: "recovered" }],
+		});
+	});
+	it("bounds bare-default unexpected socket close retries by retry.maxRetries", async () => {
+		const requestedModels: string[] = [];
+		const errorMessage =
+			"The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch() (transport=ECONNRESET url=<redacted>)";
+		session = buildStatusErrorSession({
+			errorMessage,
+			bareDefault: true,
+			requestedModels,
+			failureByCall: () => ({ errorMessage }),
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents, retryEndEvents } = track(session);
+
+		await session.prompt("bare-config socket close exhaustion");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(3);
+		expect(retryStartEvents.every(event => event.unbounded === false)).toBe(true);
+		expect(requestedModels).toHaveLength(4);
+		expect(retryEndEvents).toEqual([expect.objectContaining({ success: false })]);
+		expect(lastAssistant(session)).toMatchObject({ stopReason: "error", errorMessage });
+	});
+	it("does not retry an unexpected socket close after visible assistant content", async () => {
+		const requestedModels: string[] = [];
+		const errorMessage = "The socket connection was closed unexpectedly. (transport=ECONNRESET)";
+		session = buildStatusErrorSession({
+			errorMessage,
+			bareDefault: true,
+			partialContent: "already visible",
+			recoveredContent: "should-not-reach",
+			requestedModels,
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("bare-config visible socket close");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(0);
+		expect(requestedModels).toHaveLength(1);
+		expect(lastAssistant(session)).toMatchObject({
+			stopReason: "error",
+			content: [{ type: "text", text: "already visible" }],
+		});
+	});
+	it("does not retry an unexpected socket close when retry is disabled", async () => {
+		const requestedModels: string[] = [];
+		const errorMessage = "The socket connection was closed unexpectedly. (transport=ECONNRESET)";
+		session = buildStatusErrorSession({
+			errorMessage,
+			bareDefault: true,
+			settingsOverrides: { "retry.enabled": false },
+			recoveredContent: "should-not-reach",
+			requestedModels,
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("bare-config disabled socket close");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(0);
+		expect(requestedModels).toHaveLength(1);
+		expect(lastAssistant(session)).toMatchObject({ stopReason: "error", errorMessage });
+	});
 	it("retries the reported Codex capacity overload under bare defaults", async () => {
 		const model = getBundledModel("openai-codex", "gpt-5.4-mini");
 		if (!model) throw new Error("Expected bundled Codex test model to exist");

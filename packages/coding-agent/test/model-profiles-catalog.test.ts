@@ -320,7 +320,7 @@ const expectedProfiles: Array<{
 		requiredProviders: ["anthropic"],
 		mapping: {
 			default: ["anthropic/claude-opus-5-5:medium", "anthropic/claude-opus-4-6:xhigh"],
-			executor: "anthropic/claude-sonnet-5",
+			executor: "anthropic/claude-sonnet-5-5",
 			planner: ["anthropic/claude-opus-5-5:medium", "anthropic/claude-opus-4-6:low"],
 			critic: ["anthropic/claude-opus-5-5:high", "anthropic/claude-opus-4-6:high"],
 			architect: ["anthropic/claude-opus-5-5:high", "anthropic/claude-opus-4-6:xhigh"],
@@ -331,7 +331,7 @@ const expectedProfiles: Array<{
 		requiredProviders: ["anthropic"],
 		mapping: {
 			default: "anthropic/claude-fable-5-1:xhigh",
-			executor: "anthropic/claude-sonnet-5",
+			executor: "anthropic/claude-sonnet-5-5",
 			planner: "anthropic/claude-fable-5-1:low",
 			critic: "anthropic/claude-fable-5-1:high",
 			architect: "anthropic/claude-fable-5-1:xhigh",
@@ -673,7 +673,7 @@ const expectedProfiles: Array<{
 		mapping: {
 			default: "anthropic/claude-opus-5-5:medium",
 			executor: "openai-codex/gpt-5.6-terra:low",
-			planner: "anthropic/claude-sonnet-5",
+			planner: "anthropic/claude-sonnet-5-5",
 			critic: "openai-codex/gpt-6-sol:xhigh",
 			architect: "openai-codex/gpt-6-sol:high",
 		},
@@ -792,7 +792,7 @@ function substituteCodexFamily(selector: string, source: "sol" | "terra", target
 const fixedNonCodexComboMappings: Record<string, Partial<Record<Role, string>>> = {
 	"opus-codex": {
 		default: "anthropic/claude-opus-5-5:medium",
-		planner: "anthropic/claude-sonnet-5",
+		planner: "anthropic/claude-sonnet-5-5",
 	},
 	"codex-opencodego": {
 		executor: "opencode-go/deepseek-v4-pro",

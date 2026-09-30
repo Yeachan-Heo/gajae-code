@@ -63,6 +63,41 @@ function typedResult(response: unknown): BrokerRestartResult {
 	return { ok: false, error: { code: "protocol_error", message: "broker returned a malformed restart response" } };
 }
 
+/**
+ * Sends one restart verb. SdkClient rejects an `{ok:false}` response as an
+ * SdkClientError, but that refusal is the broker's own typed decision, so it is
+ * returned as the result. Only a request that got no response for its id (its
+ * outcome is unknown) propagates as an error.
+ */
+async function restartRequest(
+	client: SdkClient,
+	operation: string,
+	input: Record<string, unknown>,
+): Promise<BrokerRestartResult> {
+	let requestFrameId: unknown;
+	let refused = false;
+	const unsubscribe = client.onFrame(frame => {
+		const id = typeof frame.id === "string" ? frame.id : frame.requestId;
+		if (requestFrameId !== undefined && id === requestFrameId && (frame.ok === false || frame.status === "error"))
+			refused = true;
+	});
+	try {
+		return typedResult(
+			await client.global(operation, input, {
+				onDispatch: ({ frame }) => {
+					requestFrameId = frame.id;
+				},
+			}),
+		);
+	} catch (error) {
+		if (refused && error instanceof SdkClientError)
+			return { ok: false, error: { code: error.code, message: error.message } };
+		throw error;
+	} finally {
+		unsubscribe();
+	}
+}
+
 export async function prepareDoctorBrokerRestart(
 	client: SdkClient,
 	discovery: BrokerDiscovery,
@@ -74,7 +109,7 @@ export async function prepareDoctorBrokerRestart(
 		deadlineAt: Date.now() + (options.deadlineMs ?? 30_000),
 		drain: options.drain,
 	};
-	return typedResult(await client.global("broker.prepare_restart", { ...input }));
+	return await restartRequest(client, "broker.prepare_restart", { ...input });
 }
 
 export async function commitDoctorBrokerRestart(
@@ -90,11 +125,11 @@ export async function commitDoctorBrokerRestart(
 		lease: prepared.lease,
 		occupancyEpoch: prepared.occupancyEpoch,
 	};
-	return typedResult(await client.global("broker.commit_restart", { ...input }));
+	return await restartRequest(client, "broker.commit_restart", { ...input });
 }
 
 export async function cancelDoctorBrokerRestart(client: SdkClient, requestId: string): Promise<BrokerRestartResult> {
-	return typedResult(await client.global("broker.cancel_restart", { requestId }));
+	return await restartRequest(client, "broker.cancel_restart", { requestId });
 }
 
 const OLD_OWNER_EXIT_POLL_MS = 50;

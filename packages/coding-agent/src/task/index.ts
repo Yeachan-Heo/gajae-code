@@ -32,11 +32,11 @@ import { resolveProfileBindings } from "../config/model-profiles";
 import { resolveAgentModelPatterns } from "../config/model-resolver";
 import type { Theme } from "../modes/theme/theme";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
-import taskDescriptionTemplate from "../prompts/tools/task.md" with { type: "text" };
 import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: "text" };
 import type { ForkContextSeed } from "../session/agent-session";
 import { splitSelectorThinkingSuffix } from "../thinking";
 import { formatBytes, formatDuration } from "../tools/render-utils";
+import { renderTaskDescription } from "../tools/session-descriptions";
 import { escapeXmlAttribute } from "../utils/xml-escape";
 import {
 	type AgentDefinition,
@@ -317,57 +317,26 @@ export {
 	taskSchema,
 } from "./types";
 
-/**
- * Render the tool description from a cached agent list and current settings.
- */
 function hasAvailableIrcTool(session: ToolSession): boolean {
 	return session.settings.get("irc.enabled") === true && session.getToolByName?.("irc") !== undefined;
 }
 
-function renderDescription(
-	agents: AgentDefinition[],
-	maxConcurrency: number,
-	isolationEnabled: boolean,
-	asyncEnabled: boolean,
-	disabledAgents: string[],
-	simpleMode: TaskSimpleMode,
-	ircEnabled: boolean,
-	parentSpawns: string,
-	autoroutingActive: boolean,
-): string {
-	const spawningDisabled = parentSpawns === "";
-	let filteredAgents = filterVisibleAgents(agents);
-	filteredAgents =
-		disabledAgents.length > 0 ? filteredAgents.filter(a => !disabledAgents.includes(a.name)) : filteredAgents;
-	if (spawningDisabled) {
-		filteredAgents = [];
-	} else if (parentSpawns !== "*") {
-		const allowed = new Set(
-			parentSpawns
-				.split(",")
-				.map(s => s.trim())
-				.filter(Boolean),
-		);
-		filteredAgents = filteredAgents.filter(a => allowed.has(a.name));
-	}
-	const { contextEnabled, customSchemaEnabled } = getTaskSimpleModeCapabilities(simpleMode);
-	const description = prompt.render(taskDescriptionTemplate, {
-		agents: filteredAgents,
-		spawningDisabled,
-		MAX_CONCURRENCY: maxConcurrency,
-		isolationEnabled,
-		asyncEnabled,
-		contextEnabled,
-		customSchemaEnabled,
-		ircEnabled,
-		defaultMode: simpleMode === "default",
-		schemaFreeMode: simpleMode === "schema-free",
-		independentMode: simpleMode === "independent",
-		autoroutingActive,
-	});
-	return description;
+function callableAgents(agents: readonly AgentDefinition[], session: ToolSession): AgentDefinition[] {
+	const disabledAgents = new Set(session.settings.get("task.disabledAgents"));
+	const parentSpawns = session.getSessionSpawns() ?? "*";
+	const allowedSpawns =
+		parentSpawns === "*"
+			? undefined
+			: new Set(
+					parentSpawns
+						.split(",")
+						.map(agent => agent.trim())
+						.filter(Boolean),
+				);
+	return filterVisibleAgents(agents).filter(
+		agent => !disabledAgents.has(agent.name) && (allowedSpawns === undefined || allowedSpawns.has(agent.name)),
+	);
 }
-
 function createTaskModeError(text: string): AgentToolResult<TaskToolDetails> {
 	return {
 		content: [{ type: "text", text }],
@@ -614,22 +583,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		return renderTaskCall(args as TaskParams, options, theme);
 	}
 
-	/** Dynamic description that reflects current disabled-agent settings */
 	get description(): string {
-		const disabledAgents = this.session.settings.get("task.disabledAgents") as string[];
-		const maxConcurrency = this.session.settings.get("task.maxConcurrency");
-		const isolationMode = this.session.settings.get("task.isolation.mode");
-		return renderDescription(
-			this.#discoveredAgents,
-			maxConcurrency,
-			isolationMode !== "none",
-			true,
-			disabledAgents,
-			this.#getTaskSimpleMode(),
-			hasAvailableIrcTool(this.session),
-			this.session.getSessionSpawns() ?? "*",
-			this.session.settings.getEffectiveAutorouting().active,
-		);
+		return renderTaskDescription(this.session);
 	}
 	readonly #sessionRepositoryBinding: RepositoryBinding;
 	#testRunSubprocess: typeof runSubprocess | undefined;
@@ -945,8 +900,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const agent = getAgent(this.#discoveredAgents, params.agent);
 		if (!agent) {
 			const available =
-				filterVisibleAgents(this.#discoveredAgents)
-					.map(a => a.name)
+				callableAgents(this.#discoveredAgents, this.session)
+					.map(agent => agent.name)
 					.join(", ") || "none";
 			return {
 				content: [{ type: "text", text: `Unknown agent "${params.agent}". Available: ${available}` }],
@@ -1714,8 +1669,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const agent = getAgent(agents, agentName);
 		if (!agent) {
 			const available =
-				filterVisibleAgents(agents)
-					.map(a => a.name)
+				callableAgents(agents, this.session)
+					.map(agent => agent.name)
 					.join(", ") || "none";
 			return {
 				content: [

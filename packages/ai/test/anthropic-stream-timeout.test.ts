@@ -994,6 +994,67 @@ describe("anthropic first-event timeouts", () => {
 		});
 	});
 
+	it("retries a ceiling-bound request whose connection reset before any response (#6072)", async () => {
+		let attempts = 0;
+		const fetchMock = (async () => {
+			attempts += 1;
+			if (attempts === 1) {
+				throw Object.assign(new Error("The socket connection was closed unexpectedly"), { code: "ECONNRESET" });
+			}
+			return new Response(
+				JSON.stringify({
+					type: "error",
+					error: { type: "overloaded_error", message: "Overloaded" },
+				}),
+				{ status: 529, headers: { "content-type": "application/json" } },
+			);
+		}) as FetchImpl;
+		const providerRetryWait = vi.fn(async () => {});
+
+		const result = await streamAnthropic(customModel("https://proxy.example"), contextWithBytes(1_670_000), {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			streamFirstEventTimeoutMs: 1,
+			providerRetryWait,
+		}).result();
+
+		// The reset is retried; the 529 that answers the retry is a real server
+		// response, so the one-attempt upload ceiling applies from there.
+		expect(attempts).toBe(2);
+		expect(providerRetryWait).toHaveBeenCalledTimes(1);
+		expect(result.errorStatus).toBe(529);
+		expect(result.transportFailure).toMatchObject({ endpointClass: "custom", retryMaxAttempts: 1 });
+	});
+
+	it("recovers a ceiling-bound request after an injected client's connection error (#6072)", async () => {
+		let attempts = 0;
+		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
+			attempts += 1;
+			if (attempts === 1) {
+				return {
+					async withResponse(): Promise<never> {
+						throw new Error("Connection error.");
+					},
+				} as never;
+			}
+			return createAnthropicMockStream({
+				signal: requestOptions?.signal,
+				events: createSuccessfulAnthropicEvents("after reset"),
+			}) as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const injectedClient = { baseURL: "https://proxy.example", messages: { create } } as unknown as Anthropic;
+
+		const result = await streamAnthropic(customModel("https://proxy.example"), contextWithBytes(1_670_000), {
+			client: injectedClient,
+			streamFirstEventTimeoutMs: 100,
+			providerRetryWait: async () => {},
+		}).result();
+
+		expect(attempts).toBe(2);
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toEqual([expect.objectContaining({ type: "text", text: "after reset" })]);
+	});
+
 	it("does not arm the Anthropic first-event watchdog before the stream connects", async () => {
 		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
 			return createAnthropicMockStream({

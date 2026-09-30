@@ -4,16 +4,20 @@ on:
   workflow_dispatch:
     inputs:
       suite:
-        description: Benchmark suite to compare
+        description: "Benchmark suite to compare (any SUITES key in scripts/native-bench-ab.ts, or profile-stability)"
         required: true
-        type: choice
+        type: string
         default: rss
-        options: [rss, edit-hotspots, grep, profile-stability]
       base:
         description: Git ref to use as the baseline
         required: true
         type: string
         default: origin/main
+      iterations:
+        description: Optional per-block iteration count passed to the adapter (empty keeps its default)
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -46,7 +50,23 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p .gjc/profiles/profile-stability
+          # The native build leaves the runner saturated; profile only once the
+          # 1-minute load settles below half the cores (AC1a.3 needs a quiet host).
+          cores=$(sysctl -n hw.ncpu)
+          quiet=0
+          for _ in $(seq 1 90); do
+            load=$(sysctl -n vm.loadavg | awk '{print $2}')
+            if awk -v l="$load" -v c="$cores" 'BEGIN { exit !(l < c / 2) }'; then quiet=1; break; fi
+            sleep 10
+          done
+          if [ "$quiet" -ne 1 ]; then
+            echo "::error::runner never became quiet (1-minute load $load, need < $cores/2); stability comparison not run"
+            uptime | tee .gjc/profiles/profile-stability/load-never-quiet.txt
+            exit 1
+          fi
           uptime | tee .gjc/profiles/profile-stability/load-before.txt
+          # Warm module, transpiler and fixture caches so both measured runs start alike.
+          bun run bench:profile -- --scenario all --out .gjc/profiles/profile-stability/warmup > /dev/null
           bun run bench:profile -- --scenario all --out .gjc/profiles/profile-stability/run1 | tee .gjc/profiles/profile-stability/run1.log
           bun run bench:profile -- --scenario all --out .gjc/profiles/profile-stability/run2 --compare .gjc/profiles/profile-stability/run1/report.json | tee .gjc/profiles/profile-stability/run2.log
           uptime | tee .gjc/profiles/profile-stability/load-after.txt
@@ -68,7 +88,29 @@ jobs:
         env:
           SUITE: ${{ inputs.suite }}
           BASE: ${{ inputs.base }}
-        run: bun scripts/native-bench-ab.ts --suite "$SUITE" --base "$BASE" --allow-baseline-drift --json > native-bench-ab.json
+          ITERATIONS: ${{ inputs.iterations }}
+        run: |
+          set -euo pipefail
+          # native-bench-ab.ts rejects a 1-minute load above half the physical
+          # cores; wait for dependency install/toolchain setup to drain first.
+          cores=$(sysctl -n hw.physicalcpu)
+          quiet=0
+          for _ in $(seq 1 90); do
+            load=$(sysctl -n vm.loadavg | awk '{print $2}')
+            if awk -v l="$load" -v c="$cores" 'BEGIN { exit !(l <= c / 2) }'; then quiet=1; break; fi
+            sleep 10
+          done
+          if [ "$quiet" -ne 1 ]; then
+            echo "::error::runner never became quiet (1-minute load $load, need <= $cores/2); A/B not run"
+            exit 1
+          fi
+          # macOS ships Bash 3.2, where expanding an empty array under `set -u`
+          # is an unbound-variable error, so branch instead of splicing args.
+          if [ -n "$ITERATIONS" ]; then
+            bun scripts/native-bench-ab.ts --suite "$SUITE" --base "$BASE" --allow-baseline-drift --json --iterations "$ITERATIONS" > native-bench-ab.json
+          else
+            bun scripts/native-bench-ab.ts --suite "$SUITE" --base "$BASE" --allow-baseline-drift --json > native-bench-ab.json
+          fi
       - name: Upload benchmark JSON
         if: ${{ always() && inputs.suite != 'profile-stability' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4

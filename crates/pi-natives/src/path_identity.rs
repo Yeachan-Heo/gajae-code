@@ -8804,7 +8804,7 @@ mod platform {
 		let source = match open_exact_with_share(
 			&source_path,
 			"file",
-			FILE_READ_ATTRIBUTES | FILE_READ_DATA | 0x0001_0000,
+			FILE_READ_ATTRIBUTES | FILE_READ_DATA | READ_CONTROL | 0x0001_0000,
 			FILE_SHARE_READ,
 		) {
 			Ok(handle) => handle,
@@ -8861,7 +8861,11 @@ mod platform {
 			open_relative_with_share_status(
 				parent_handle,
 				destination_name,
-				FILE_READ_ATTRIBUTES | 0x0001_0000 | FILE_WRITE_ATTRIBUTES | FILE_READ_DATA,
+				FILE_READ_ATTRIBUTES
+					| 0x0001_0000
+					| FILE_WRITE_ATTRIBUTES
+					| FILE_READ_DATA
+					| READ_CONTROL,
 				false,
 				FILE_SHARE_READ | FILE_SHARE_DELETE,
 			)

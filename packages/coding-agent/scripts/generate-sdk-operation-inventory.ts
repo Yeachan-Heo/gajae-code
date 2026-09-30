@@ -203,6 +203,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:queueDeferredMessage": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:queueDeferredMessageForTests": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getContextUsageObservabilityForTests": "test-only observability, not a user-facing control seam",
+	"agent_session:getAutoCompactionThresholdTokens":
+		"internal compaction-threshold accessor feeding the /context breakdown; exposed through context.get, not an independent SDK operation",
 	"agent_session:purgeQueuedCustomMessages": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:clearQueue": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:popLastQueuedMessage": "internal accessor/plumbing, not a user-facing control seam",

@@ -1,7 +1,7 @@
 // Vendored from oh-my-pi (MIT) crates/pi-natives/src/appearance.rs @
 // a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: retain
-// std::sync::mpsc instead of adding flume and profile the public appearance
-// operations.
+// std::sync::mpsc instead of adding flume and profile the appearance observer
+// operations (not the sub-microsecond detect query).
 
 //! macOS appearance detection via CoreFoundation.
 //!
@@ -40,7 +40,11 @@ mod platform {
 	use std::{
 		ffi::{CStr, CString, c_char, c_void},
 		ptr,
-		sync::{Arc, mpsc},
+		sync::{
+			Arc,
+			atomic::{AtomicBool, Ordering},
+			mpsc,
+		},
 		thread::{self, JoinHandle},
 	};
 
@@ -114,7 +118,11 @@ mod platform {
 		);
 
 		fn CFRunLoopGetCurrent() -> CFRunLoopRef;
-		fn CFRunLoopRun();
+		fn CFRunLoopRunInMode(
+			mode: CFStringRef,
+			seconds: f64,
+			return_after_source_handled: bool,
+		) -> i32;
 		fn CFRunLoopStop(rl: CFRunLoopRef);
 
 		fn CFAbsoluteTimeGetCurrent() -> f64;
@@ -279,8 +287,13 @@ mod platform {
 	const POLL_INTERVAL_SECS: f64 = 2.0;
 
 	/// Internal state for a running observer.
+	/// Longest time a stop request waits for the observer thread to notice it
+	/// when `CFRunLoopStop` lands before the run loop is running.
+	const STOP_POLL_SECS: f64 = 0.25;
+
 	pub struct ObserverInner {
 		run_loop: Arc<Mutex<Option<SendableRunLoop>>>,
+		stopping: Arc<AtomicBool>,
 		thread:   Option<JoinHandle<()>>,
 	}
 
@@ -288,6 +301,8 @@ mod platform {
 		pub fn start(tsfn: ThreadsafeFunction<MacOSAppearance>) -> Self {
 			let run_loop: Arc<Mutex<Option<SendableRunLoop>>> = Arc::new(Mutex::new(None));
 			let rl_clone = run_loop.clone();
+			let stopping = Arc::new(AtomicBool::new(false));
+			let stopping_thread = stopping.clone();
 
 			// Signal that the background thread has stored its `CFRunLoopRef`.
 			let (tx, rx) = mpsc::sync_channel::<()>(1);
@@ -350,8 +365,13 @@ mod platform {
 					// Report initial appearance immediately.
 					(*ctx_ptr).report_if_changed();
 
-					// Block until `CFRunLoopStop()` is called from `stop()`.
-					CFRunLoopRun();
+					// Run until `stop()` sets the flag. `CFRunLoopStop` only interrupts
+					// a loop that is already running, so a stop issued before this
+					// point would be lost with a plain `CFRunLoopRun()` and `stop()`
+					// would join forever. Bounded slices re-check the flag.
+					while !stopping_thread.load(Ordering::Acquire) {
+						CFRunLoopRunInMode(kCFRunLoopDefaultMode, STOP_POLL_SECS, false);
+					}
 
 					// -- Cleanup ---------------------------------------------
 					CFRunLoopTimerInvalidate(timer);
@@ -367,10 +387,11 @@ mod platform {
 			rx.recv()
 				.expect("observer startup channel stays alive until run loop is stored");
 
-			Self { run_loop, thread: Some(handle) }
+			Self { run_loop, stopping, thread: Some(handle) }
 		}
 
 		pub fn stop(&mut self) {
+			self.stopping.store(true, Ordering::Release);
 			let rl = self.run_loop.lock().take();
 			if let Some(rl) = rl {
 				// SAFETY: `rl.0` came from `CFRunLoopGetCurrent` on the observer thread and is
@@ -401,7 +422,8 @@ mod platform {
 #[napi(js_name = "detectMacOSAppearance")]
 #[allow(clippy::missing_const_for_fn, reason = "napi macro is incompatible with const fn")]
 pub fn detect_macos_appearance() -> Option<MacOSAppearance> {
-	let _profile = crate::prof::profile_region("appearance.detect");
+	// Not wrapped in profile_region: the guard (two clock reads, a mutex and a
+	// sample push) costs ~7% of this sub-microsecond query.
 	#[cfg(target_os = "macos")]
 	{
 		Some(platform::detect_appearance())

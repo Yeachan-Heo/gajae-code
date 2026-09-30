@@ -131,7 +131,10 @@ export async function runStatsCommand(cmd: StatsCommandArgs): Promise<void> {
 	const { processed, files } = await syncAllSessions({ onProgress: progress.onProgress });
 	progress.finish();
 	const total = await getTotalMessageCount();
-	console.log(`Synced ${processed} new entries from ${files} files (${total} total)\n`);
+	const synced = `Synced ${processed} new entries from ${files} files (${total} total)\n`;
+	// `--json` stdout must be exactly the JSON document so it can be piped into a parser.
+	if (cmd.json) process.stderr.write(`${synced}\n`);
+	else console.log(synced);
 
 	if (cmd.json) {
 		const stats = await getDashboardStats();

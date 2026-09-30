@@ -1,5 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import type { AgentMessage } from "@gajae-code/agent-core";
+import { type CompactionSettings, resolveThresholdTokens } from "@gajae-code/agent-core/compaction";
+
 import { resetSettingsForTest, Settings } from "../src/config/settings";
 import type { ContextUsage } from "../src/extensibility/extensions/types";
 import { StatusLineComponent } from "../src/modes/components/tool-status-header";
@@ -69,6 +71,8 @@ function makeSession(contextUsage: ContextUsage): AgentSession {
 		getGoalModeState: () => undefined,
 		// This lightweight session stubs the pinned ContextUsage snapshot contract.
 		getContextUsage: () => contextUsage,
+		getAutoCompactionThresholdTokens: () =>
+			resolveThresholdTokens(contextWindow, Settings.instance.getGroup("compaction") as CompactionSettings),
 	} as unknown as AgentSession;
 }
 

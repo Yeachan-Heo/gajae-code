@@ -31,4 +31,19 @@ Confirmed by this baseline: `streaming-output.ts` `push` (tools), `serializeCano
 
 ## Stability
 
-Two consecutive runs on the same host (AC1a.3) matched ≥8/10 top functions for startup, session-load and compaction. tools, keystroke, replay and session-save fell below 8/10, and were dominated by I/O and runtime frames (`spawnSync`, stream reads) whose rank order moves with host load. These runs overlapped with a load average of 10–36 from concurrent builds. The harness now repeats each scenario inside one profiler window up to a minimum wall time. The stability gate must be re-run on a quiet host before the Phase 4 hand-port list is final.
+AC1a.3 passes on the dedicated `macos-14` runner (`native-bench-ab.yml`, suite `profile-stability`, run https://github.com/Yeachan-Heo/gajae-code/actions/runs/36502046414 on dev `1011a4aede`). The job waits for the post-build load to settle below half the cores (1-minute load 1.36 before, 1.45 after), runs one warm-up profile, then two measured `--scenario all` runs compared with `--compare`:
+
+| Scenario | Top-10 overlap |
+|---|---:|
+| compaction | 8/10 |
+| keystroke | 9/10 |
+| replay | 9/10 |
+| session-load | 10/10 |
+| session-save | 9/10 |
+| startup | 10/10 |
+| tools | 8/10 |
+
+Earlier local runs fell short because of host load and three harness defects, fixed before this run:
+- `bench:profile` never exited after the tools scenario: a leaked shell session held the event loop open (#6073).
+- Self time credited each sample with the whole gap since the previous one, so idle waits (child processes, I/O) made the last sampled frame look hot. Credit is now capped at ten sampling intervals. On-CPU work, including long synchronous native calls, keeps being sampled at the configured interval (#6092).
+- Startup children were sampled at 1 ms with 5 repeats. They now use the harness interval with 60 repeats, and the I/O-bound tools scenario runs for 45 s (#6092, #6103).

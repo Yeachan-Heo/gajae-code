@@ -283,6 +283,23 @@ describe("doctor broker restart protocol", () => {
 		if (outcome.kind === "owner_unavailable") expect(outcome.reason).toBe("no_discovery");
 	});
 
+	it("restartBrokerForDoctor returns a busy owner's refusal as prepare_refused through the SDK client", async () => {
+		const { dir, broker } = await fixture();
+		await broker.index.append({
+			type: "host_registered",
+			sessionId: "attached-live",
+			locator: { cwd: dir, worktreeRoot: null, stateRoot: path.join(dir, "state") },
+			endpointGeneration: 1,
+			pid: process.pid,
+		});
+		const outcome = await restartBrokerForDoctor({ agentDir: dir, deadlineMs: 1_000 });
+		expect(outcome).toMatchObject({ kind: "prepare_refused", code: "restart_busy" });
+		// Nothing was prepared: no durable intent, and new work is admitted again.
+		expect(await readBrokerRestartIntent(dir)).toBeNull();
+		expect((await broker.handleRequest("session.list", {})).ok).toBe(true);
+		await broker.stop();
+	});
+
 	it("launchAuthorizedBrokerSuccessor refuses to spawn when no intent was ever committed for the request", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-doctor-no-intent-"));
 		const result = await launchAuthorizedBrokerSuccessor({

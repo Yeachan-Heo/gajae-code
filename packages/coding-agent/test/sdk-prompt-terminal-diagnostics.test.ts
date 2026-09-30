@@ -422,6 +422,134 @@ isolatedSdkHostTest(
 	75_000,
 );
 
+isolatedSdkHostTest(
+	"SDK host treats a cooperative pause as a normal prompt terminal",
+	async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-terminal-paused-"));
+		dirs.push(cwd);
+		const sessionId = `sdk-prompt-terminal-paused-${Date.now()}`;
+		const sessionContext = context(cwd, sessionId);
+		const handlers = await start(sessionContext);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		const diagnostics: unknown[] = [];
+		const errorSpy = spyOn(logger, "error").mockImplementation((...args: unknown[]) => {
+			if (args[0] === "sdk_prompt_terminal_failed") diagnostics.push(args[1]);
+		});
+
+		const submit = async (requestId: string): Promise<void> => {
+			socket.send(
+				JSON.stringify({
+					type: "control_request",
+					id: requestId,
+					operation: "turn.prompt",
+					input: { text: "pause this turn", clientRef: requestId },
+				}),
+			);
+			await waitFor(
+				() => frames.some(frame => frame.type === "control_response" && frame.id === requestId),
+				`prompt acknowledgement ${requestId}`,
+			);
+		};
+		const waitForActive = async (clientRef: string): Promise<void> => {
+			let lastResponse = "none";
+			for (let attempt = 0; attempt < 120; attempt += 1) {
+				const id = `${clientRef}-active-${attempt}`;
+				socket.send(
+					JSON.stringify({
+						type: "query_request",
+						id,
+						query: "turn.result",
+						input: { kind: "prompt", clientRef },
+					}),
+				);
+				await waitFor(() => frames.some(frame => frame.id === id), `active prompt query ${clientRef}`);
+				const response = frames.find(frame => frame.id === id) as
+					| { result?: { status?: string; [key: string]: unknown } }
+					| undefined;
+				if (response !== undefined) lastResponse = JSON.stringify(response);
+				if (response?.result?.status === "accepted" || response?.result?.status === "in_flight") return;
+			}
+			throw new Error(`prompt ${clientRef} never became in_flight; lastResponse=${lastResponse}`);
+		};
+		const result = async (clientRef: string): Promise<Record<string, unknown>> => {
+			let lastResponse = "none";
+			let responseSeen = false;
+			for (let attempt = 0; attempt < 120; attempt += 1) {
+				const id = `${clientRef}-result-${attempt}`;
+				socket.send(
+					JSON.stringify({
+						type: "query_request",
+						id,
+						query: "turn.result",
+						input: { kind: "prompt", clientRef },
+					}),
+				);
+				await waitFor(() => frames.some(frame => frame.id === id), `terminal prompt query ${clientRef}`);
+				const response = frames.find(frame => frame.id === id) as
+					| { result?: { status?: string; [key: string]: unknown } }
+					| undefined;
+				if (response !== undefined) {
+					responseSeen = true;
+					lastResponse = JSON.stringify(response);
+				}
+				if (response?.result?.status === "failed" || response?.result?.status === "terminal_ok")
+					return response.result;
+				await Bun.sleep(25);
+			}
+			throw new Error(
+				`turn.result never reported a terminal status for ${clientRef}; responseSeen=${responseSeen}; lastResponse=${lastResponse}`,
+			);
+		};
+
+		try {
+			await submit("paused-prompt");
+			await waitForActive("paused-prompt");
+			await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+			await handlers.get("agent_end")?.({ type: "agent_end", stopReason: "paused", messages: [] }, sessionContext);
+			const paused = await result("paused-prompt");
+			expect(paused.status).toBe("terminal_ok");
+			expect(paused.outcome).toEqual({ kind: "stopped", reason: "end_turn", provenance: "agent" });
+			expect(diagnostics).toHaveLength(0);
+
+			await submit("paused-error-prompt");
+			await waitForActive("paused-error-prompt");
+			await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+			await handlers.get("agent_end")?.(
+				{
+					type: "agent_end",
+					stopReason: "paused",
+					messages: [{ role: "assistant", stopReason: "error", errorMessage: "provider failed" }],
+				},
+				sessionContext,
+			);
+			const failed = await result("paused-error-prompt");
+			expect(failed.status).toBe("failed");
+			expect(failed.outcome).toMatchObject({ kind: "failed", code: "prompt_failed", provenance: "agent_failed" });
+			expect(diagnostics).toHaveLength(1);
+			expect(diagnostics[0]).toMatchObject({
+				loopStopReason: "paused",
+				assistantStopReason: "error",
+				reason: "provider failed",
+			});
+		} finally {
+			errorSpy.mockRestore();
+		}
+
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	},
+	75_000,
+);
+
 const F2_DIAGNOSTIC = {
 	category: "auth",
 	httpStatus: 401,

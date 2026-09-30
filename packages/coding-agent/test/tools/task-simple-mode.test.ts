@@ -181,35 +181,39 @@ describe("task.simple", () => {
 			'REQUIRED when the user explicitly requests a worktree (for example, "use worktree")',
 		);
 	});
-	it("hides IRC guidance when the IRC tool is not available", async () => {
-		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
-			agents: TEST_AGENTS,
-			projectAgentsDir: null,
-		});
-
-		const tool = await TaskTool.create(createSession({ "irc.enabled": true }, { getToolByName: () => undefined }));
-
-		expect(tool.description).not.toContain("Coordinate with running tasks via `irc`");
-		expect(tool.description).not.toContain("via the `irc` tool");
-		expect(tool.description).toContain("Use `subagent` action `inspect` or `list`");
-	});
-
-	it("shows IRC guidance when the IRC tool is available", async () => {
+	it("filters the bundled task roster by disabled agents and spawn permissions", async () => {
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
 			agents: TEST_AGENTS,
 			projectAgentsDir: null,
 		});
 
 		const tool = await TaskTool.create(
+			createSession({ "task.disabledAgents": ["critic"] }, { getSessionSpawns: () => "executor,planner" }),
+		);
+		const description = tool.description;
+
+		expect(description.match(/Bundled role names: ([^.]+)\./)?.[1].split(", ")).toEqual(["executor", "planner"]);
+	});
+	it("keeps IRC guidance stable when the IRC tool becomes available", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: TEST_AGENTS,
+			projectAgentsDir: null,
+		});
+		let ircAvailable = false;
+		const tool = await TaskTool.create(
 			createSession(
 				{ "irc.enabled": true },
-				{ getToolByName: name => (name === "irc" ? ({ name: "irc" } as never) : undefined) },
+				{ getToolByName: name => (name === "irc" && ircAvailable ? ({ name: "irc" } as never) : undefined) },
 			),
 		);
 
-		expect(tool.description).toContain("Coordinate with running tasks via `irc`");
-		expect(tool.description).toContain("via the `irc` tool");
-		expect(tool.description).not.toContain("Use `subagent` action `inspect` or `list`");
+		const unavailableDescription = tool.description;
+		ircAvailable = true;
+		const availableDescription = tool.description;
+
+		expect(availableDescription).toBe(unavailableDescription);
+		expect(availableDescription).toContain("Use `irc` for live coordination when it is available.");
+		expect(availableDescription).toContain("Use `subagent` action `inspect` or `list`");
 	});
 
 	it("omits IRC launch hints when tool lookup metadata is missing", async () => {

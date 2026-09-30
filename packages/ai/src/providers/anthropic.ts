@@ -113,6 +113,7 @@ import {
 	type ResolveToolChoiceResult,
 	resolveToolChoice,
 } from "../utils/tool-choice-capability";
+import { getClaudeCodeVersion } from "./claude-code-version";
 import {
 	buildCopilotDynamicHeaders,
 	hasCopilotVisionInput,
@@ -294,7 +295,7 @@ export function buildAnthropicHeaders(options: AnthropicHeaderOptions): Record<s
 		const incomingUserAgent = getHeaderCaseInsensitive(options.modelHeaders, "User-Agent");
 		const userAgent = isClaudeCodeClientUserAgent(incomingUserAgent)
 			? incomingUserAgent
-			: `claude-cli/${claudeCodeVersion} (external, cli)`;
+			: `claude-cli/${getClaudeCodeVersion()} (external, cli)`;
 		return {
 			...modelHeaders,
 			...claudeCodeHeaders,
@@ -851,7 +852,6 @@ function getCacheControl(
 }
 
 // Stealth mode: Mimic Anthropic Code headers and tool prefixing.
-export const claudeCodeVersion = "2.1.281";
 export const claudeCodeEntrypoint = "sdk-cli";
 export const claudeToolPrefix: string = "proxy_";
 export const claudeCodeSystemInstruction = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
@@ -928,7 +928,7 @@ function createClaudeBillingHeader(payload: unknown): string {
 	const buildHash = Array.from(randomBytes, byte => byte.toString(16).padStart(2, "0"))
 		.join("")
 		.slice(0, 3);
-	return `${CLAUDE_BILLING_HEADER_PREFIX} cc_version=${claudeCodeVersion}.${buildHash}; cc_entrypoint=${claudeCodeEntrypoint}; cch=${cch};`;
+	return `${CLAUDE_BILLING_HEADER_PREFIX} cc_version=${getClaudeCodeVersion()}.${buildHash}; cc_entrypoint=${claudeCodeEntrypoint}; cch=${cch};`;
 }
 
 const CLAUDE_CLOAKING_USER_ID_REGEX =
@@ -1761,6 +1761,23 @@ function isTransientStreamEnvelopeError(error: unknown): boolean {
 	return (
 		error.message.includes(ANTHROPIC_STREAM_ENVELOPE_ERROR_PREFIX) ||
 		/stream event order|before message_start|before terminal stop signal/i.test(error.message)
+	);
+}
+
+/**
+ * A request whose connection failed before the server returned any response:
+ * the SDK's connection error, or a reset/closed/refused socket with no HTTP status.
+ */
+function isPreResponseConnectionFailure(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	if (extractHttpStatusFromError(error) !== undefined) return false;
+	if (error instanceof Anthropic.APIConnectionTimeoutError) return false;
+	if (error instanceof Anthropic.APIConnectionError) return true;
+	const code = (error as { code?: unknown }).code;
+	if (typeof code === "string" && /^(?:ECONNRESET|ECONNREFUSED|EPIPE|ENOTFOUND|EAI_AGAIN)$/.test(code)) return true;
+	return (
+		isUnexpectedSocketCloseMessage(error.message) ||
+		/\b(?:ECONNRESET|ECONNREFUSED|EPIPE)\b|^connection error\.?$|other side closed/i.test(error.message)
 	);
 }
 
@@ -2672,7 +2689,14 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					// Otherwise the multi-megabyte body is re-uploaded up to the default
 					// streamMaxRetries budget despite the ceiling. Once iteration has
 					// begun, only the grace-clock path above decides.
-					if (requestUploadCeilingBound && firstEventWaitStartedAt === undefined) {
+					// A connection that dropped before any response (reset, socket closed,
+					// connect failure) is exempt: the server never answered, so a retry is
+					// not a re-upload after a stall, and a network blip must not end the turn.
+					if (
+						requestUploadCeilingBound &&
+						firstEventWaitStartedAt === undefined &&
+						!isPreResponseConnectionFailure(streamFailure)
+					) {
 						Object.assign(streamFailure as Error, {
 							requestBytes,
 							endpointClass,

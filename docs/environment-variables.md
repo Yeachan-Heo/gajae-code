@@ -172,6 +172,14 @@ When `CLAUDE_CODE_USE_FOUNDRY` is enabled, Anthropic requests switch to Foundry 
 | `CLAUDE_CODE_CLIENT_CERT`   | PEM path or inline PEM                         | mTLS client certificate                                                       |
 | `CLAUDE_CODE_CLIENT_KEY`    | PEM path or inline PEM                         | mTLS client private key (must be paired with cert)                            |
 
+### Claude Code client version
+
+Anthropic OAuth requests sign `claude-cli/<version>` and the billing header's `cc_version` with the latest published Claude Code release: the higher of Anthropic's `latest` native-installer channel and the `@anthropic-ai/claude-code` npm dist-tag. The lookup runs in the background at most every 6 hours, is cached at `~/.gjc/cache/claude-code-version.json`, and never blocks a request; until it succeeds (or when offline) the bundled floor in `packages/ai/src/providers/claude-code-version.ts` is used, and the signed version never drops below that floor.
+
+| Variable | Default / behavior |
+| --- | --- |
+| `GJC_CLAUDE_CODE_VERSION` | Unset: auto-resolve as above. Exact `X.Y.Z`: sign with that version and skip the network lookup. Other values are ignored. |
+
 ### Amazon Bedrock
 
 | Variable | Default / behavior |

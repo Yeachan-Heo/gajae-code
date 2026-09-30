@@ -121,6 +121,14 @@ describe("session replay profile report", () => {
 		expect(result[0]?.symbol).toBe("otherFunction@file:///workspace/packages/tui/src/other.ts:9");
 	});
 
+	it("credits at most ten sampling intervals to a sample that follows an idle gap", () => {
+		const idle = { ...profile(), timeDeltas: [100, 300, 1_000_000] };
+		expect(aggregateSelfTime(idle).map(item => [item.functionName, item.selfTimeMs])).toEqual([
+			["otherFunction", 1],
+			["hotFunction", 0.4],
+		]);
+	});
+
 	it("slices sample durations by marked window boundaries", () => {
 		const mark: HarnessMark = {
 			scenario: "replay",

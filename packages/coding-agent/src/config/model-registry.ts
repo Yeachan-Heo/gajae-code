@@ -782,26 +782,53 @@ function registryModelMetadataWithoutApiSpecificFields(model: Model<Api>): Parti
 	return metadata;
 }
 
-export function registrySelectorResolvesToModel(selector: string, models: readonly Model<Api>[]): boolean {
+/**
+ * Lowercased lookup keys for a model catalog, so selector resolution is a set
+ * lookup instead of a scan that re-lowercases every model id per selector.
+ */
+export interface RegistrySelectorIndex {
+	/** `id` and `provider/id`. */
+	exact: ReadonlySet<string>;
+	/** `id` alone. */
+	ids: ReadonlySet<string>;
+	/** Model ids per provider, for parsed `provider/id` selectors (nested, so no delimiter can collide). */
+	providerIds: ReadonlyMap<string, ReadonlySet<string>>;
+	/** Every `/`-delimited suffix of each id (`a/b/c` → `b/c`, `c`). */
+	idSuffixes: ReadonlySet<string>;
+}
+
+export function createRegistrySelectorIndex(models: readonly Model<Api>[]): RegistrySelectorIndex {
+	const exact = new Set<string>();
+	const ids = new Set<string>();
+	const providerIds = new Map<string, Set<string>>();
+	const idSuffixes = new Set<string>();
+	for (const model of models) {
+		const id = model.id.toLowerCase();
+		const provider = model.provider.toLowerCase();
+		ids.add(id);
+		exact.add(id);
+		exact.add(`${provider}/${id}`);
+		let providerModelIds = providerIds.get(provider);
+		if (!providerModelIds) {
+			providerModelIds = new Set<string>();
+			providerIds.set(provider, providerModelIds);
+		}
+		providerModelIds.add(id);
+		for (let slash = id.indexOf("/"); slash !== -1; slash = id.indexOf("/", slash + 1)) {
+			idSuffixes.add(id.slice(slash + 1));
+		}
+	}
+	return { exact, ids, providerIds, idSuffixes };
+}
+
+export function registrySelectorResolvesToModel(selector: string, index: RegistrySelectorIndex): boolean {
 	const normalizedSelector = selector.trim().toLowerCase();
-	if (
-		models.some(
-			model =>
-				model.id.toLowerCase() === normalizedSelector ||
-				`${model.provider}/${model.id}`.toLowerCase() === normalizedSelector,
-		)
-	)
-		return true;
+	if (index.exact.has(normalizedSelector)) return true;
 	const suffix = splitSelectorThinkingSuffix(normalizedSelector);
 	const baseSelector = suffix.thinkingLevel === undefined ? normalizedSelector : suffix.selector;
 	const parsed = parseModelString(baseSelector);
-	if (parsed)
-		return models.some(
-			model => model.provider.toLowerCase() === parsed.provider && model.id.toLowerCase() === parsed.id,
-		);
-	return models.some(
-		model => model.id.toLowerCase() === baseSelector || model.id.toLowerCase().endsWith(`/${baseSelector}`),
-	);
+	if (parsed) return index.providerIds.get(parsed.provider)?.has(parsed.id) ?? false;
+	return index.ids.has(baseSelector) || index.idSuffixes.has(baseSelector);
 }
 
 function filterMaterializedRegistryProfiles(
@@ -810,6 +837,7 @@ function filterMaterializedRegistryProfiles(
 	dynamicProviders: ReadonlySet<string>,
 ): Map<string, ModelProfileDefinition> {
 	const filtered = new Map<string, ModelProfileDefinition>();
+	const index = createRegistrySelectorIndex(models);
 	for (const [name, profile] of profiles) {
 		if (
 			profile.source === "registry" &&
@@ -818,7 +846,7 @@ function filterMaterializedRegistryProfiles(
 				return (
 					selectors.length > 0 &&
 					!selectors.some(selector => {
-						if (registrySelectorResolvesToModel(selector, models)) return true;
+						if (registrySelectorResolvesToModel(selector, index)) return true;
 						const suffix = splitSelectorThinkingSuffix(selector);
 						const parsed = parseModelString(suffix.thinkingLevel ? suffix.selector : selector);
 						return parsed !== undefined && dynamicProviders.has(parsed.provider);

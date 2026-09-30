@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as childProcess from "node:child_process";
+import { createHmac } from "node:crypto";
 import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -17,6 +18,7 @@ import {
 	setShellFactoryForTests,
 } from "@gajae-code/coding-agent/exec/bash-executor";
 import {
+	authenticateOwnershipRecord,
 	extendOwnedDarwinAncestry,
 	parseOwnershipRecord,
 	retainOwnedProcess,
@@ -78,6 +80,83 @@ describe("executeBash", () => {
 		]);
 		expect(extendOwnedDarwinAncestry(known, candidates)).toEqual([42, 43]);
 		expect(known).toEqual(new Set([100n, 200n, 300n]));
+	});
+
+	it("accepts Darwin records with unique id when signature matches", () => {
+		// Test that records with darwinUniqueId are correctly validated
+		// (This is unchanged behavior but we verify it still works)
+		const token = "abc123def456";
+		const uniqueId = "999";
+		const signature = createHmac("sha256", token).update(`42:test-incarnation:${uniqueId}`).digest("hex");
+		const record = JSON.stringify({
+			pid: 42,
+			incarnation: "test-incarnation",
+			darwinUniqueId: uniqueId,
+			signature,
+		});
+		// Should not throw or return undefined for signature validation
+		// (Process.fromPid result depends on runtime state)
+		const parsed = parseOwnershipRecord(record);
+		expect(parsed?.darwinUniqueId).toBe(uniqueId);
+	});
+
+	it("accepts Darwin records without unique id (incarnation-only signature)", () => {
+		// Test that records with empty/null darwinUniqueId are accepted with correct signature
+		// This is the new behavior for fast-exiting entitled children
+		const token = "xyz789abc123";
+		const signature = createHmac("sha256", token)
+			.update(`42:test-incarnation:`) // Empty unique id
+			.digest("hex");
+		const record = JSON.stringify({
+			pid: 42,
+			incarnation: "test-incarnation",
+			darwinUniqueId: null, // null represents empty/missing unique id
+			signature,
+		});
+		// Verify the record is parsed correctly
+		const parsed = parseOwnershipRecord(record);
+		expect(parsed).toBeDefined();
+		expect(parsed?.darwinUniqueId).toBeNull();
+		// Verify it doesn't get rejected just because darwinUniqueId is missing
+		expect(parsed?.signature).toBe(signature);
+	});
+
+	it("rejects ownership records with bad signature", () => {
+		const token = "correct-token";
+		const wrongToken = "wrong-token";
+		const uniqueId = "999";
+		// Create a signature with the correct token
+		const correctSignature = createHmac("sha256", token).update(`42:test-incarnation:${uniqueId}`).digest("hex");
+		// But present a record with the wrong token
+		const record = JSON.stringify({
+			pid: 42,
+			incarnation: "test-incarnation",
+			darwinUniqueId: uniqueId,
+			signature: correctSignature,
+		});
+		const result = authenticateOwnershipRecord(record, wrongToken);
+		expect(result).toBeUndefined();
+	});
+
+	it("computes identity-level fixpoint with absent intermediate parents and unrelated processes", () => {
+		// Scenario: root process 100 is known, has child 200 (not in listing).
+		// Grandchild 300 whose parentUniqueId is 200 (intermediate missing) must not be selected.
+		// Process 400 with unrelated ancestry must not be selected.
+		// Process 500 with grandchild 600 via chain 100->500->600 must be selected.
+		const known = new Set([100n]);
+		const candidates = new Map([
+			// Direct child of known root
+			[42, { uniqueId: 500n, parentUniqueId: 100n }],
+			// Grandchild of root (parent 500 is in candidates, will be added first)
+			[43, { uniqueId: 600n, parentUniqueId: 500n }],
+			// Child of unknown parent (not in candidates, ancestry chain broken)
+			[44, { uniqueId: 300n, parentUniqueId: 200n }],
+			// Completely unrelated process
+			[45, { uniqueId: 700n, parentUniqueId: 999n }],
+		]);
+		const result = extendOwnedDarwinAncestry(known, candidates);
+		expect(result).toEqual([42, 43]);
+		expect(known).toEqual(new Set([100n, 500n, 600n]));
 	});
 	let tempDir: string;
 

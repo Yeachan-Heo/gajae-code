@@ -68,6 +68,30 @@ struct OwnershipLedger {
 	token: String,
 }
 
+/// Optional Darwin evidence may be unavailable, but an incarnation must never
+/// be invented. A changed incarnation means the original child has exited.
+/// A later `Present` is only accepted when it matches the incarnation pinned at
+/// spawn: without a pin, the PID may already belong to an unrelated process
+/// that reused it, and signing or targeting that occupant is unsafe.
+#[cfg(any(target_os = "macos", test))]
+fn observed_spawn_incarnation(
+	incarnation: Option<String>,
+	observation: process::ProcessObservation,
+) -> Result<Option<String>, ()> {
+	match (incarnation, observation) {
+		(_, process::ProcessObservation::Absent) => Ok(None),
+		(Some(pinned), process::ProcessObservation::Present { incarnation: observed }) => {
+			if pinned == observed {
+				Ok(Some(pinned))
+			} else {
+				Ok(None)
+			}
+		},
+		(None, process::ProcessObservation::Present { .. }) => Err(()),
+		(pinned, process::ProcessObservation::Unknown { .. }) => pinned.map(Some).ok_or(()),
+	}
+}
+
 impl ExternalProcessObserver for CommandProcessObserver {
 	fn spawned(&self, pid: i32, process_group_id: Option<i32>) {
 		if let Some(upstream) = &self.upstream {
@@ -75,18 +99,41 @@ impl ExternalProcessObserver for CommandProcessObserver {
 		}
 		if let Some(ledger) = &self.ownership_ledger {
 			let process = process::Process::from_pid(pid);
+			let incarnation = process.as_ref().map(process::Process::incarnation);
+			let darwin_unique_id = process
+				.as_ref()
+				.and_then(process::Process::darwin_unique_id)
+				.map(|value| value.to_string());
+			// `pid_released` means the observation proved the spawned child is gone
+			// (absent, or the pid now holds a different incarnation). Re-resolving
+			// the numeric pid would then target an unrelated occupant, so only the
+			// process group is recorded.
 			#[cfg(target_os = "macos")]
-			let Some(process) = process else {
-				std::process::exit(70);
+			let (incarnation, pid_released) = if darwin_unique_id.is_none() {
+				match observed_spawn_incarnation(incarnation, process::Process::observe(pid)) {
+					Ok(Some(incarnation)) => (Some(incarnation), false),
+					Ok(None) => (None, true),
+					Err(()) => std::process::exit(70),
+				}
+			} else {
+				(incarnation, false)
 			};
 			#[cfg(not(target_os = "macos"))]
-			let Some(process) = process else {
-				self
-					.targets
-					.lock()
-					.expect("process target lock poisoned")
-					.add_pid(pid);
-				if let Some(pgid) = process_group_id {
+			let pid_released = false;
+			let Some(incarnation) = incarnation else {
+				let mut targets = self.targets.lock().expect("process target lock poisoned");
+				if !pid_released {
+					targets.add_pid(pid);
+				}
+				drop(targets);
+				// A released leader (Absent or reused) leaves only a numeric PGID. Any
+				// later lookup by that number can race a reuse (the group may empty
+				// and be reassigned between observation and lookup), so the group is
+				// neither rescanned nor published as signal authority: adopting a
+				// stranger's group is worse than missing an escaped member. Members
+				// still reachable from owned processes are covered by the guardian's
+				// ancestry tracking and the session/descendant scans at cleanup.
+				if !pid_released && let Some(pgid) = process_group_id {
 					self
 						.process_group_id
 						.compare_exchange(0, pgid, Ordering::SeqCst, Ordering::SeqCst)
@@ -94,16 +141,11 @@ impl ExternalProcessObserver for CommandProcessObserver {
 				}
 				return;
 			};
-			let incarnation = process.incarnation();
-			let darwin_unique_id = process.darwin_unique_id().map(|value| value.to_string());
-			#[cfg(target_os = "macos")]
-			if darwin_unique_id.is_none() {
-				process.kill_tree(Some(process::KILL_SIGNAL));
-				std::process::exit(70);
-			}
 			let payload = format!("{pid}:{incarnation}:{}", darwin_unique_id.as_deref().unwrap_or(""));
 			let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(ledger.token.as_bytes()) else {
-				process.kill_tree(Some(process::KILL_SIGNAL));
+				if let Some(process) = &process {
+					process.kill_tree(Some(process::KILL_SIGNAL));
+				}
 				std::process::exit(70);
 			};
 			mac.update(payload.as_bytes());
@@ -127,14 +169,17 @@ impl ExternalProcessObserver for CommandProcessObserver {
 					.is_ok()
 			});
 			if !published {
-				process.kill_tree(Some(process::KILL_SIGNAL));
+				if let Some(process) = &process {
+					process.kill_tree(Some(process::KILL_SIGNAL));
+				}
 				std::process::exit(70);
 			}
-			self
-				.targets
-				.lock()
-				.expect("process target lock poisoned")
-				.add_process(process);
+			let mut targets = self.targets.lock().expect("process target lock poisoned");
+			if let Some(process) = process {
+				targets.add_process(process);
+			} else {
+				targets.add_pid(pid);
+			}
 		} else {
 			self
 				.targets
@@ -2248,6 +2293,88 @@ fn quote_arg(arg: &str) -> String {
 mod tests {
 	use super::*;
 
+	#[test]
+	fn spawn_identity_decisions() {
+		use process::ProcessObservation::{Absent, Present, Unknown};
+		let pinned = || Some("darwin:123:456".to_owned());
+		let present = || Present { incarnation: "darwin:123:456".to_owned() };
+		let unknown = || Unknown { reason_code: "identity_unavailable".to_owned() };
+		assert_eq!(observed_spawn_incarnation(None, Absent), Ok(None));
+		assert_eq!(observed_spawn_incarnation(pinned(), Absent), Ok(None));
+		// No incarnation pinned at spawn: a later occupant of the PID must not be
+		// adopted as the spawned child.
+		assert_eq!(observed_spawn_incarnation(None, present()), Err(()));
+		assert_eq!(observed_spawn_incarnation(pinned(), present()), Ok(pinned()));
+		assert_eq!(observed_spawn_incarnation(pinned(), unknown()), Ok(pinned()));
+		assert_eq!(observed_spawn_incarnation(None, unknown()), Err(()));
+		assert_eq!(
+			observed_spawn_incarnation(pinned(), Present { incarnation: "darwin:789:0".to_owned() }),
+			Ok(None),
+		);
+	}
+
+	#[cfg(target_os = "macos")]
+	#[test]
+	fn spawned_reaped_child_does_not_require_ledger_identity() {
+		let path = std::env::temp_dir().join(format!("pi-shell-reaped-{}.jsonl", std::process::id()));
+		let file = fs::File::create(&path).expect("create ledger");
+		let observer = CommandProcessObserver {
+			process_group_id: Arc::new(AtomicI32::new(0)),
+			targets:          Arc::new(StdMutex::new(process::TerminationTargets::new())),
+			ownership_ledger: Some(OwnershipLedger {
+				file:  Arc::new(StdMutex::new(file)),
+				token: "test-token".to_owned(),
+			}),
+			upstream:         None,
+		};
+		let mut child = std::process::Command::new("/usr/bin/true")
+			.spawn()
+			.expect("spawn child");
+		let pid = i32::try_from(child.id()).expect("pid fits");
+		child.wait().expect("reap child");
+		observer.spawned(pid, Some(pid));
+		// On macOS the reaped child is confirmed Absent, so its numeric pgid is not
+		// published as signal authority. Elsewhere the pid path still records it.
+		let expected_pgid = if cfg!(target_os = "macos") { 0 } else { pid };
+		assert_eq!(observer.process_group_id.load(Ordering::SeqCst), expected_pgid);
+		assert_eq!(fs::read_to_string(&path).expect("read ledger"), "");
+		fs::remove_file(path).expect("remove ledger");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn spawn_ledger_write_failure_exits_70() {
+		const CHILD_FLAG: &str = "PI_SHELL_TEST_LEDGER_FAILURE";
+		if std::env::var_os(CHILD_FLAG).is_some() {
+			// A read-only descriptor deterministically rejects publication on
+			// every Unix platform, without depending on /dev/full availability.
+			let file = fs::File::open("/dev/null").expect("open read-only ledger");
+			let observer = CommandProcessObserver {
+				process_group_id: Arc::new(AtomicI32::new(0)),
+				targets:          Arc::new(StdMutex::new(process::TerminationTargets::new())),
+				ownership_ledger: Some(OwnershipLedger {
+					file:  Arc::new(StdMutex::new(file)),
+					token: "test-token".to_owned(),
+				}),
+				upstream:         None,
+			};
+			let mut child = std::process::Command::new("/bin/sleep")
+				.arg("30")
+				.spawn()
+				.expect("spawn identifiable child");
+			observer.spawned(i32::try_from(child.id()).expect("pid fits"), None);
+			child.kill().expect("clean up unexpected survivor");
+			child.wait().expect("reap unexpected survivor");
+			panic!("ledger failure must exit before returning");
+		}
+		let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+			.args(["--exact", "shell::tests::spawn_ledger_write_failure_exits_70", "--nocapture"])
+			.env(CHILD_FLAG, "1")
+			.status()
+			.expect("run isolated observer");
+		assert_eq!(status.code(), Some(70));
+	}
+
 	#[cfg(unix)]
 	static PROCESS_TEST_LOCK: TokioMutex<()> = TokioMutex::const_new(());
 	#[cfg(unix)]
@@ -3580,8 +3707,18 @@ mod tests {
 	async fn jobs_list_changed_reports_completed_jobs() {
 		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
 		let shell = Shell::new(None);
+		// Poll `jobs -n` until the background job's completion is reported rather
+		// than betting a fixed sleep on python3 startup (flaky on loaded macOS,
+		// #6098). The redirect keeps `jobs` in the current shell, so the first
+		// non-empty report is the one notification for this job; the loop is
+		// bounded at ~10s.
+		let report = std::env::temp_dir().join(format!("pi-shell-jobs-n-{}.txt", std::process::id()));
+		let report = report.display();
 		let (result, output) = run_and_capture(&shell, ShellRunOptions {
-			command: "python3 -c 'import time; time.sleep(0.1)' & sleep 0.3; jobs -n".to_string(),
+			command: format!(
+				"python3 -c 'pass' & for _ in $(seq 1 200); do jobs -n > '{report}'; [ -s '{report}' \
+				 ] && break; sleep 0.05; done; cat '{report}'; rm -f '{report}'"
+			),
 			..Default::default()
 		})
 		.await;

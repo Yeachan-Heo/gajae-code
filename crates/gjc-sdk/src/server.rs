@@ -5165,10 +5165,22 @@ mod tests {
 		next_server_hello(&mut healthy).await;
 		wait_for_clients(&handle, 2).await;
 
-		oversized
+		// The server rejects the frame from its length header and closes while
+		// the client may still be writing the payload, so the send itself can
+		// observe the close as a reset or broken pipe. Either way the offending
+		// client is disconnected, which is what this test asserts.
+		match oversized
 			.send(Message::Text("x".repeat(REQUEST_FRAME_BYTES + 1)))
 			.await
-			.expect("send oversized text frame");
+		{
+			Ok(()) => {},
+			Err(tokio_tungstenite::tungstenite::Error::Io(error))
+				if matches!(
+					error.kind(),
+					std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+				) => {},
+			Err(error) => panic!("send oversized text frame: {error:?}"),
+		}
 		match tokio::time::timeout(std::time::Duration::from_secs(2), oversized.next())
 			.await
 			.expect("oversized client was not closed")

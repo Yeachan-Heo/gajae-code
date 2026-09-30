@@ -1,5 +1,5 @@
 import { scheduler } from "node:timers/promises";
-import { claudeCodeVersion } from "../providers/anthropic";
+import { getClaudeCodeVersion } from "../providers/claude-code-version";
 import type {
 	CredentialRankingStrategy,
 	UsageAmount,
@@ -32,7 +32,6 @@ const CLAUDE_HEADERS = {
 	"anthropic-beta":
 		"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05",
 	"content-type": "application/json",
-	"user-agent": `claude-cli/${claudeCodeVersion} (external, cli)`,
 	connection: "keep-alive",
 } as const;
 
@@ -352,6 +351,7 @@ async function fetchClaudeUsage(params: UsageFetchParams, ctx: UsageFetchContext
 	const url = `${baseUrl}/usage`;
 	const headers: Record<string, string> = {
 		...CLAUDE_HEADERS,
+		"user-agent": `claude-cli/${getClaudeCodeVersion()} (external, cli)`,
 		authorization: `Bearer ${credential.accessToken}`,
 	};
 

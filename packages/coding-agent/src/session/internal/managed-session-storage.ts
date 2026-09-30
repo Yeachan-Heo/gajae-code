@@ -165,6 +165,27 @@ function isRetryableReplacementReceiptCleanupError(error: unknown): boolean {
 	return error instanceof Error && error.message === "managed_replace_receipt_cleanup_pending:io_error";
 }
 
+/**
+ * A receipt retirement slot is named only from the receipt and predecessor
+ * identities, so every process sharing a managed scope — the publisher retiring
+ * its own receipt and each peer reconciler that listed it — claims the same
+ * slot. Native exact-unlink reports `quarantine_collision` from its no-replace
+ * claim before any rename, so a collision that carries no detached or retained
+ * path proves only that a peer owns the retirement right now: this process
+ * changed nothing, the receipt stays where a later reconciliation finds it, and
+ * the unrelated mutation that triggered the scan must not fail.
+ */
+function isPeerOwnedReceiptRetirement(result: NativeExactUnlinkResult): boolean {
+	return (
+		!result.ok &&
+		result.code === "quarantine_collision" &&
+		result.detachedPath === undefined &&
+		result.retainedSuccessorPath === undefined &&
+		result.retainedPlaceholderPath === undefined &&
+		result.retainedUnknownPath === undefined
+	);
+}
+
 /** A same-filesystem rename updates the moved root's ctime but no other tree identity. */
 function sameDirectoryTreeSnapshotAfterRename(
 	left: NativeDirectoryTreeSnapshot,
@@ -1622,6 +1643,7 @@ export class ManagedSessionDescendantStore {
 			sha256: placeholder.identity.sha256,
 			quarantineName,
 		});
+		if (isPeerOwnedReceiptRetirement(removed)) return true;
 		if (
 			(!exactUnlinkCompleted(removed) && removed.code !== "not_found") ||
 			removed.retainedSuccessorPath !== undefined ||
@@ -1660,6 +1682,7 @@ export class ManagedSessionDescendantStore {
 			detachOnly: true,
 			quarantineName,
 		});
+		if (isPeerOwnedReceiptRetirement(detached)) return;
 		if (
 			!detached.ok &&
 			detached.code === "not_found" &&

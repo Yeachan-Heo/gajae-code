@@ -1692,7 +1692,7 @@
 				},
 				"thresholdPercent": {
 					"type": "number",
-					"description": "Percent threshold for context maintenance; set to Default to use legacy reserve-based behavior",
+					"description": "Percent threshold for context maintenance; the 300,000-token default cap applies only with adaptive mode disabled (except during context promotion)",
 					"default": -1
 				},
 				"thresholdTokens": {

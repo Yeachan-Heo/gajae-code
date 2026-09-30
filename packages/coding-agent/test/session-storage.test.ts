@@ -1763,6 +1763,92 @@ describe("replacement cleanup receipt reconcile TOCTOU resilience", () => {
 		expect(fs.existsSync(path.join(root, "cleanup-identity-mismatch"))).toBe(false);
 	});
 
+	it("defers a canonical receipt whose retirement slot a peer has already claimed", () => {
+		const predecessorPath = path.join(root, "predecessor");
+		fs.writeFileSync(predecessorPath, "predecessor\n");
+		const predecessor = snapshot(predecessorPath);
+		const contents = JSON.stringify({ arbitrary: "receipt contents are advisory" });
+		const { receipt, receiptIdentity } = publishCanonicalReceipt(predecessor, contents);
+		// A peer's native exact-unlink claims the slot with an empty exchange
+		// placeholder before it swaps the receipt out of its canonical name.
+		const slot = receiptQuarantine(receiptIdentity, predecessor);
+		fs.writeFileSync(slot, "");
+		const peerClaim = snapshot(slot);
+		const retainedReceipt = snapshot(receipt);
+		const exactUnlink = vi.spyOn(native, "exactUnlink");
+
+		replay("peer-claimed-slot");
+
+		expect(exactUnlink.mock.results.find(result => result.type === "return")?.value).toMatchObject({
+			ok: false,
+			code: "quarantine_collision",
+		});
+		expect(snapshot(receipt)).toEqual(retainedReceipt);
+		expect(snapshot(slot)).toEqual(peerClaim);
+		expect(fs.existsSync(path.join(root, "peer-claimed-slot"))).toBe(true);
+
+		// Once the claim is released without retiring the receipt, the retained
+		// receipt is reconciled by the next mutation.
+		fs.unlinkSync(slot);
+		replay("peer-released-slot");
+
+		expect(fs.existsSync(receipt)).toBe(false);
+		expect(fs.readFileSync(slot, "utf8")).toBe(contents);
+		expect(fs.existsSync(path.join(root, "peer-released-slot"))).toBe(true);
+	});
+
+	it("defers a detached receipt placeholder whose retirement slot a peer has already claimed", () => {
+		const predecessorPath = path.join(root, "predecessor");
+		fs.writeFileSync(predecessorPath, "predecessor\n");
+		const predecessor = snapshot(predecessorPath);
+		const { receipt, receiptIdentity } = publishCanonicalReceipt(
+			predecessor,
+			JSON.stringify({ arbitrary: "receipt contents are advisory" }),
+		);
+		// A peer detached the receipt and left its empty exchange placeholder at the
+		// canonical name; a second peer already claimed the placeholder's slot.
+		const detachedReceipt = receiptQuarantine(receiptIdentity, predecessor);
+		fs.renameSync(receipt, detachedReceipt);
+		fs.writeFileSync(receipt, "");
+		const placeholder = snapshot(receipt);
+		const hex = (value: string) => BigInt(value).toString(16);
+		const placeholderSlot = path.join(
+			root,
+			`.gjc-receipt-placeholder-remove-${hex(placeholder.dev)}-${hex(placeholder.ino)}-${hex(predecessor.dev)}-${hex(predecessor.ino)}-${hex(receiptIdentity.dev)}-${hex(receiptIdentity.ino)}`,
+		);
+		fs.writeFileSync(placeholderSlot, "");
+		const peerClaim = snapshot(placeholderSlot);
+
+		replay("peer-claimed-placeholder-slot");
+
+		expect(snapshot(receipt)).toEqual(placeholder);
+		expect(snapshot(placeholderSlot)).toEqual(peerClaim);
+		expect(snapshot(detachedReceipt)).toMatchObject({ ino: receiptIdentity.ino, sha256: receiptIdentity.sha256 });
+		expect(fs.existsSync(path.join(root, "peer-claimed-placeholder-slot"))).toBe(true);
+	});
+
+	it("keeps a receipt slot collision that retained receipt state fail-closed", () => {
+		const predecessorPath = path.join(root, "predecessor");
+		fs.writeFileSync(predecessorPath, "predecessor\n");
+		const predecessor = snapshot(predecessorPath);
+		const { receipt } = publishCanonicalReceipt(
+			predecessor,
+			JSON.stringify({ arbitrary: "receipt contents are advisory" }),
+		);
+
+		vi.spyOn(native, "exactUnlink").mockImplementation(pathname => {
+			if (pathname === receipt)
+				return { ok: false, code: "quarantine_collision", retainedUnknownPath: path.join(root, ".unknown") };
+			throw new Error(`Unexpected exact unlink: ${pathname}`);
+		});
+
+		expect(() => replay("collision-retained-state")).toThrow(
+			"managed_replace_receipt_cleanup_pending:quarantine_collision",
+		);
+		expect(fs.existsSync(receipt)).toBe(true);
+		expect(fs.existsSync(path.join(root, "collision-retained-state"))).toBe(false);
+	});
+
 	it.skipIf(process.platform !== "darwin")(
 		"keeps an exact replacement I/O failure fail-closed because replacement state is unknown",
 		() => {

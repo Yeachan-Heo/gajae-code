@@ -58,11 +58,15 @@ interface WireToolSpec {
 }
 
 interface WireToolResult {
-	toolResultMessage: {
-		content: string;
-		toolUseId: string;
-		status?: "success" | "error";
-	};
+	toolUseId: string;
+	status: "success" | "error";
+	content: Array<{ text: string }>;
+}
+
+interface WireToolUse {
+	toolUseId: string;
+	name: string;
+	input: Record<string, unknown>;
 }
 
 interface WireUserMessage {
@@ -71,7 +75,7 @@ interface WireUserMessage {
 		modelId?: string;
 		userInputMessageContext?: {
 			tools?: { tools: WireToolSpec[] };
-			toolResults?: { toolResults: WireToolResult[][] };
+			toolResults?: WireToolResult[];
 			editorStateContext?: Record<string, unknown>;
 		};
 		origin?: string;
@@ -81,6 +85,7 @@ interface WireUserMessage {
 interface WireAssistantMessage {
 	assistantResponseMessage: {
 		content: string;
+		toolUses?: WireToolUse[];
 	};
 }
 
@@ -383,6 +388,21 @@ function buildConversationState(
 
 	for (let i = 0; i < messages.length - 1; i++) {
 		const msg = messages[i];
+		const previous = history[history.length - 1];
+		// Parallel tool calls produce consecutive toolResult messages; they answer one
+		// assistant turn, so their results share a single user entry.
+		if (
+			msg.role === "toolResult" &&
+			messages[i - 1]?.role === "toolResult" &&
+			previous &&
+			"userInputMessage" in previous
+		) {
+			previous.userInputMessage.userInputMessageContext ??= {};
+			const context = previous.userInputMessage.userInputMessageContext;
+			context.toolResults ??= [];
+			context.toolResults.push(convertToolResult(msg as ToolResultMessage));
+			continue;
+		}
 		history.push(convertToWireMessage(msg, modelId, i === 0 ? systemPrompt : undefined));
 	}
 
@@ -419,20 +439,27 @@ function convertToWireMessage(
 	if (msg.role === "toolResult") {
 		return convertToWireUserMessage(msg, modelId, systemPrompt);
 	}
-	// assistant → assistant response
+	// assistant → assistant response; tool calls stay structured so later tool
+	// results can reference the toolUseId they answer.
 	const textParts: string[] = [];
+	const toolUses: WireToolUse[] = [];
 	for (const block of msg.content) {
 		if (typeof block === "string") {
 			textParts.push(block);
 		} else if (block.type === "text") {
 			textParts.push(block.text);
 		} else if (block.type === "toolCall") {
-			textParts.push(JSON.stringify({ toolUseId: block.id, name: block.name, input: block.arguments }));
+			toolUses.push({
+				toolUseId: block.id,
+				name: block.name,
+				input: (block.arguments ?? {}) as Record<string, unknown>,
+			});
 		}
 	}
 	return {
 		assistantResponseMessage: {
-			content: textParts.join("\n") || "",
+			content: textParts.join("\n"),
+			...(toolUses.length > 0 ? { toolUses } : {}),
 		},
 	};
 }
@@ -442,7 +469,9 @@ function convertToWireUserMessage(
 	modelId: string,
 	systemPrompt?: string,
 ): WireUserMessage {
-	let content = extractTextContent(msg);
+	// A tool result travels in userInputMessageContext.toolResults; repeating it as
+	// message text would show the model each result twice.
+	let content = msg.role === "toolResult" ? "Tool results provided." : extractTextContent(msg);
 	if (systemPrompt) {
 		content = `${systemPrompt}\n\n${content}`;
 	}
@@ -454,25 +483,26 @@ function convertToWireUserMessage(
 		},
 	};
 
-	// Handle tool results
 	if (msg.role === "toolResult") {
-		const toolResultMsg = msg as ToolResultMessage;
-		const toolResults = (toolResultMsg.content ?? []).map(detail => ({
-			toolResultMessage: {
-				content: detail.type === "text" ? detail.text : "",
-				toolUseId: toolResultMsg.toolCallId,
-				status: toolResultMsg.isError ? ("error" as const) : ("success" as const),
-			},
-		}));
-		if (toolResults.length > 0) {
-			if (!userMsg.userInputMessage.userInputMessageContext) {
-				userMsg.userInputMessage.userInputMessageContext = {};
-			}
-			userMsg.userInputMessage.userInputMessageContext.toolResults = { toolResults: [toolResults] };
-		}
+		userMsg.userInputMessage.userInputMessageContext = {
+			toolResults: [convertToolResult(msg as ToolResultMessage)],
+		};
 	}
 
 	return userMsg;
+}
+
+/** One CodeWhisperer tool result per tool call, keyed by the toolUseId it answers. */
+function convertToolResult(msg: ToolResultMessage): WireToolResult {
+	const text = (msg.content ?? [])
+		.map(block => (block.type === "text" ? block.text : block.type === "image" ? "[image omitted]" : ""))
+		.filter(part => part.length > 0)
+		.join("\n");
+	return {
+		toolUseId: msg.toolCallId,
+		status: msg.isError ? "error" : "success",
+		content: [{ text }],
+	};
 }
 
 function extractTextContent(msg: Context["messages"][number]): string {

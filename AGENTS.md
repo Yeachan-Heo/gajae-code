@@ -54,10 +54,12 @@ A second checkout created with `git worktree add` starts with no `node_modules/`
 built native addon, so every `bun test` fails with a bare module-resolution error until
 dependencies are installed. Run `bun run setup:worktree` there (equivalent to
 `bun install && bun run build:native`). Do **not** run `bun run install:dev` in a
-worktree: it repoints the global `gjc` on `PATH`, rewrites `core.hooksPath`, and
-overwrites user-level defaults for your primary checkout. `bun run dev:doctor -- --worktree`
-reports whether the current checkout can resolve workspace packages and load the native
-addon, and names the fix when it cannot.
+worktree: it repoints the global `gjc` on `PATH` and overwrites user-level defaults
+for your primary checkout. `bun run dev:doctor -- --worktree` reports whether the
+current checkout can resolve workspace packages and load the native addon, and names
+the fix when it cannot. If an older `install:dev` set `core.hooksPath` to the now-removed
+`.githooks` directory, run `git config --local --unset core.hooksPath` in the primary
+checkout to restore Git's default hook lookup; do not unset a custom hooks path.
 
 Removing build output (never touches sources, `node_modules/`, `.gjc/` state, or `artifacts/` test working space):
 
@@ -174,8 +176,7 @@ Avoid placeholder tests, tautologies, broad `not.toThrow()` assertions, duplicat
 
 - Always commit incrementally; atomic commits are preferred. One logical change per commit — never batch unrelated work.
 - For targeted branch / PR-like work, always open a PR targeting `dev`.
-- Agent reviews (`architect`/`critic`) and owner self-approval (`merge-self-approved`) require exactly one `gajae.pr-review-verdict.v1` body line. Human reviewers need only an authenticated GitHub `APPROVED` review on the exact current head from an eligible reviewer other than the PR author; no body verdict is required. For human-only review, leave the template's verdict section empty. Risk classification and reviewer eligibility still apply, and human approval does not override malformed or explicit blocking body verdicts.
-- Enable the local exact-head PR preflight with `bun run dev:hooks` (also included in `install:dev`). The Git hook passes the destination branch, pushed object SHA, and actual push URL to `scripts/verify-pr-verdict.ts --push-preflight <branch> <pushed-sha> --push-url <destination-url>`. It rejects stale digests, unrebased bases, malformed verdicts, missing risk classifications, unresolved repository/fork authority, and a `merge-self-approved` verdict that its own signed risk-record comment does not back at the exact head. Valid blocking verdicts (`needs-human`, `merge-blocked`) are allowed locally; only the server merge gate authorizes merge. Bypass with `GJC_SKIP_PR_PREFLIGHT=1` or `--no-verify`. The opt-in `gh pr create` preflight (`--preflight-command`) is evaluated before the PR exists, so it can never see a self-review record and rejects a `merge-self-approved` body; create the PR, post the record, then validate at push time.
+- Agent reviews (`architect`/`critic`) are advisory comments on the PR. Merges to `dev` require one approving GitHub review from a write-access maintainer on the exact current head (enforced by native ruleset).
 - Commit messages use the lore format: conventional-commit subject, a short why-focused body, then structured trailers. Include only the trailers that apply.
 
   ```

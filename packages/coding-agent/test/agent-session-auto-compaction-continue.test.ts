@@ -155,6 +155,30 @@ describe("AgentSession auto-compaction continuation", () => {
 		expect(promptSpy.mock.invocationCallOrder[0]).toBeGreaterThan(0);
 	});
 
+	it("uses the 300K default threshold for a 1M model", async () => {
+		const model = session.model;
+		if (!model) throw new Error("Expected an active model");
+		session.agent.setModel({ ...model, contextWindow: 1_000_000 });
+		session.settings.set("compaction.autoContinue", false);
+		const events: AgentSessionEvent[] = [];
+		session.subscribe(event => events.push(event));
+		const usageAt = (tokens: number) => ({
+			input: tokens,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: tokens,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
+
+		await driveCompaction(assistantMessage({ usage: usageAt(299_000) }));
+		expect(events.some(event => event.type === "auto_compaction_start")).toBe(false);
+
+		await driveCompaction(assistantMessage({ usage: usageAt(300_001) }));
+		expect(events.some(event => event.type === "auto_compaction_start" && event.reason === "threshold")).toBe(true);
+		expect(getRuntimeSignals().filter(signal => signal === "compaction:start:threshold")).toHaveLength(1);
+	});
+
 	it("appends canonical work state to hook-provided compaction summaries", async () => {
 		session.setGoalModeState({
 			enabled: true,

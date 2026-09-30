@@ -211,6 +211,9 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 		"packages/coding-agent/test/workspace-tree.test.ts",
 	],
 	"packages/coding-agent/src/main.ts": ["packages/coding-agent/test/startup-update-contract.test.ts"],
+	// The broker lifecycle e2e suite is not named after lifecycle.ts, so basename
+	// mapping misses its Linux-only regressions on lifecycle changes (#6145 review).
+	"packages/coding-agent/src/sdk/broker/lifecycle.ts": ["packages/coding-agent/test/sdk-broker-lifecycle-e2e.test.ts"],
 	"packages/coding-agent/src/sdk/prompt-deadline-lease.ts": ["packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts"],
 	"packages/coding-agent/src/sdk/prompt-deadline-manager.ts": ["packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts"],
 	// The prompt-deadline docs guard derives its expected figure from this schema's

@@ -160,6 +160,20 @@ function profileFunctionSymbol(node: CpuProfileNode): { symbol: string; function
 	return { symbol: `${functionName}@${url}:${line}`, functionName, url, line };
 }
 
+/**
+ * A sample gap longer than this many sampling intervals means the thread was
+ * idle (awaiting I/O, a child process, a timer) rather than executing the
+ * sampled frame. Crediting the whole gap to that frame turns one-second waits
+ * into "hot" functions and makes top-self-time lists unstable across runs.
+ *
+ * On-CPU work keeps being sampled at the configured interval, including long
+ * synchronous native calls: a 124ms `Bun.hash` and 200ms of JS spinning
+ * produced no gap over 2ms, while a 250ms `await Bun.sleep` produced one
+ * 250ms gap. In the replay corpus the long gaps land on `kill`, `rm`,
+ * `spawn`, `close` and stream callbacks.
+ */
+const MAX_SAMPLE_INTERVALS = 10;
+
 function indexedSelfTime(
 	profile: CpuProfile,
 	startMs: number,
@@ -175,8 +189,11 @@ function indexedSelfTime(
 		const durationMicros = Number.isFinite(timeDeltas[index]) && (timeDeltas[index] ?? 0) > 0
 			? (timeDeltas[index] ?? intervalMicros)
 			: intervalMicros;
-		const sampleStart = elapsedMs;
-		const sampleEnd = sampleStart + durationMicros / 1_000;
+		// The timeline advances by the real gap so mark windows stay aligned; only
+		// the time credited to the sampled frame is capped.
+		const creditedMicros = Math.min(durationMicros, intervalMicros * MAX_SAMPLE_INTERVALS);
+		const sampleEnd = elapsedMs + durationMicros / 1_000;
+		const sampleStart = sampleEnd - creditedMicros / 1_000;
 		elapsedMs = sampleEnd;
 		const overlapMs = Math.max(0, Math.min(endMs, sampleEnd) - Math.max(startMs, sampleStart));
 		if (overlapMs <= 0) continue;

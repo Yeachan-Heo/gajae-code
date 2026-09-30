@@ -116,6 +116,7 @@ import { type AbortScope, type ControlSurface, dispatchControl, TypedControlErro
 import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
 import { isAutoroutingInactive, markAutoroutingInactive } from "../host/internal-autorouting-state";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
+import { RESPONSE_CEILING_BYTES } from "../host/query/handlers";
 import type { SdkFrame } from "../host/types";
 import {
 	parseSyntheticModelId,
@@ -137,6 +138,7 @@ import {
 	assistantFailureCode,
 	failedPromptOutcome,
 	formatPromptFailureForLocalLog,
+	isSafePromptFailureCode,
 	PROMPT_FAILURE_MESSAGE_DEADLINE,
 	providerDiagnosticField,
 	publishedPromptFailure,
@@ -4246,6 +4248,16 @@ export function shouldAwaitNotificationStartup(event: {
 	return event.type !== "session_switch" || event.transition?.origin !== INTERACTIVE_SELECTOR_RESUME_ORIGIN;
 }
 
+export function boundedCorrelatedAgentEndFrame(frame: Record<string, unknown>): Record<string, unknown> {
+	const finalText = typeof frame.finalText === "string" ? frame.finalText : "";
+	if (finalText.length <= RESPONSE_CEILING_BYTES / 8) return frame;
+	return {
+		...frame,
+		finalText: `${finalText.slice(0, RESPONSE_CEILING_BYTES / 8)}[truncated]`,
+		finalTextTruncated: true,
+	};
+}
+
 export function createNotificationsExtension(
 	api: ExtensionAPI,
 	options: {
@@ -5080,6 +5092,8 @@ export function createNotificationsExtension(
 			acknowledged: boolean;
 			connectionId: string;
 			abandoned: boolean;
+			terminalRetry?: Promise<void>;
+			backlogDropLogged?: boolean;
 			failed: boolean;
 			terminal: boolean;
 			retainCorrelation: boolean;
@@ -5331,6 +5345,289 @@ export function createNotificationsExtension(
 			submission.abandoned = true;
 			submission.bufferedFrames.length = 0;
 		};
+		const isCorrelatedDeltaFrame = (frame: Record<string, unknown>): boolean => {
+			if (frame.type !== "event" || frame.kind !== "message_update") return false;
+			const payload = frame.payload as {
+				event?: { assistantMessageEvent?: { type?: string } };
+			};
+			const type = payload.event?.assistantMessageEvent?.type;
+			return type === "text_delta" || type === "thinking_delta";
+		};
+		const boundedCorrelatedFrames = (frame: Record<string, unknown>): Record<string, unknown>[] | undefined => {
+			if (frame.type === "event" && frame.kind === "message_update") {
+				const payload = frame.payload as {
+					event?: {
+						message?: { role?: string };
+						assistantMessageEvent?: { type?: string; delta?: string };
+					};
+				};
+				const update = payload.event?.assistantMessageEvent;
+				if (update?.type !== "text_delta" && update?.type !== "thinking_delta") return undefined;
+				// ACP consumes deltas, so retain the delta while discarding the replaceable
+				// accumulated message snapshot. Split giant deltas without changing content.
+				const delta = update.delta ?? "";
+				const makeFrame = (chunk: string): Record<string, unknown> => ({
+					...frame,
+					payload: {
+						event_type: "message_update",
+						event: {
+							type: "message_update",
+							message: { role: payload.event?.message?.role ?? "assistant", content: [] },
+							assistantMessageEvent: { type: update.type, delta: chunk },
+						},
+					},
+				});
+				const frames: Record<string, unknown>[] = [];
+				let offset = 0;
+				while (offset < delta.length || (offset === 0 && delta.length === 0)) {
+					let low = 1;
+					let high = delta.length - offset + 1;
+					let bestEnd = 0;
+					while (low < high) {
+						const candidateLength = Math.floor((low + high) / 2);
+						let candidateEnd = offset + candidateLength;
+						if (
+							candidateEnd < delta.length &&
+							delta.charCodeAt(candidateEnd) >= 0xdc00 &&
+							delta.charCodeAt(candidateEnd) <= 0xdfff
+						)
+							candidateEnd += 1;
+						const candidate = JSON.stringify(makeFrame(delta.slice(offset, candidateEnd)));
+						if (Buffer.byteLength(candidate) <= RESPONSE_CEILING_BYTES) {
+							bestEnd = candidateEnd;
+							low = candidateLength + 1;
+						} else {
+							high = candidateLength;
+						}
+					}
+					if (bestEnd === 0) return undefined;
+					frames.push(makeFrame(delta.slice(offset, bestEnd)));
+					offset = bestEnd;
+					if (delta.length === 0) break;
+				}
+				return frames;
+			}
+			if (frame.type === "event" && frame.kind === "message_end") {
+				const payload = frame.payload as {
+					event?: { message?: { role?: string; content?: Array<{ type?: string; text?: string }> } };
+				};
+				const message = payload.event?.message;
+				const textBlocks =
+					message?.content
+						?.filter(
+							(block): block is { type: "text"; text: string } =>
+								block.type === "text" && typeof block.text === "string",
+						)
+						.map(block => block.text) ?? [];
+				const makeMessageEndFrame = (
+					content: Array<{ type: "text"; text: string }>,
+					textTruncated?: true,
+					omittedTextBlocks?: number,
+				): Record<string, unknown> => ({
+					...frame,
+					payload: {
+						event_type: "message_end",
+						event: {
+							type: "message_end",
+							message: {
+								role: message?.role ?? "assistant",
+								content,
+								...(textTruncated ? { textTruncated } : {}),
+								...(omittedTextBlocks ? { omittedTextBlocks } : {}),
+							},
+						},
+					},
+				});
+				const fits = (candidate: Record<string, unknown>): boolean =>
+					Buffer.byteLength(JSON.stringify(candidate)) <= RESPONSE_CEILING_BYTES;
+				const content: Array<{ type: "text"; text: string }> = [];
+				let textTruncated = false;
+				let omittedTextBlocks = 0;
+				for (const [index, textBlock] of textBlocks.entries()) {
+					const wholeBlock = [...content, { type: "text" as const, text: textBlock }];
+					if (fits(makeMessageEndFrame(wholeBlock))) {
+						content.push({ type: "text", text: textBlock });
+						continue;
+					}
+					textTruncated = true;
+					const remainingTextBlocks = textBlocks.length - index;
+					let low = 1;
+					let high = textBlock.length + 1;
+					let bestEnd = 0;
+					while (low < high) {
+						const candidateLength = Math.floor((low + high) / 2);
+						let candidateEnd = candidateLength;
+						if (
+							candidateEnd < textBlock.length &&
+							textBlock.charCodeAt(candidateEnd) >= 0xdc00 &&
+							textBlock.charCodeAt(candidateEnd) <= 0xdfff
+						)
+							candidateEnd += 1;
+						const candidateContent = [
+							...content,
+							...(candidateEnd > 0 ? [{ type: "text" as const, text: textBlock.slice(0, candidateEnd) }] : []),
+						];
+						const candidateOmittedTextBlocks = remainingTextBlocks - (candidateEnd > 0 ? 1 : 0);
+						if (
+							fits(
+								makeMessageEndFrame(
+									candidateContent,
+									true,
+									candidateOmittedTextBlocks > 0 ? candidateOmittedTextBlocks : undefined,
+								),
+							)
+						) {
+							bestEnd = candidateEnd;
+							low = candidateLength + 1;
+						} else high = candidateLength;
+					}
+					if (bestEnd > 0) content.push({ type: "text", text: textBlock.slice(0, bestEnd) });
+					omittedTextBlocks = remainingTextBlocks - (bestEnd > 0 ? 1 : 0);
+					break;
+				}
+				return [
+					makeMessageEndFrame(
+						content,
+						textTruncated ? true : undefined,
+						omittedTextBlocks > 0 ? omittedTextBlocks : undefined,
+					),
+				];
+			}
+			if (frame.type === "agent_end") {
+				return [boundedCorrelatedAgentEndFrame(frame)];
+			}
+			if (frame.type === "agent_failed") {
+				const outcome = frame.outcome as Extract<SdkPromptTerminalOutcome, { kind: "failed" }> | undefined;
+				return [
+					{
+						...frame,
+						error: { code: outcome?.code ?? "prompt_failed", message: "Prompt failure details were truncated." },
+						...(outcome ? { outcome: { ...outcome, message: "Prompt failure details were truncated." } } : {}),
+					},
+				];
+			}
+			return undefined;
+		};
+		const deliverCorrelatedFrame = (submission: PromptSubmission, frame: Record<string, unknown>) => {
+			if (submission.abandoned) return;
+			const activeRuntime = runtime;
+			if (!activeRuntime) return;
+			const fail = (cause: string, frameBytes: number, failedJson = JSON.stringify(frame)) => {
+				// A non-terminal frame only reports progress from a still-running
+				// prompt. Abandon its delivery on failure instead of publishing a
+				// synthetic terminal that could race the real run and make ACP
+				// settle the prompt while provider/tool execution continues.
+				if (frame.type !== "agent_end" && frame.type !== "agent_failed") {
+					if (cause === "writer_backlog_full") {
+						if (!submission.backlogDropLogged) {
+							submission.backlogDropLogged = true;
+							logger.warn(
+								`sdk: correlated non-terminal delivery dropped: cause=${cause} frameBytes=${frameBytes}`,
+							);
+						}
+						return;
+					}
+					logger.warn(`sdk: correlated non-terminal delivery abandoned: cause=${cause} frameBytes=${frameBytes}`);
+					abandonPrompt(submission);
+					return;
+				}
+				if (cause === "writer_backlog_full") {
+					const correlation = { commandId: String(frame.commandId), turnId: String(frame.turnId) };
+					const key = promptSubmissionKey(correlation);
+					submission.terminalRetry = (async () => {
+						const deadline = Date.now() + 3_000;
+						while (Date.now() < deadline) {
+							await Bun.sleep(50);
+							try {
+								activeRuntime.server.sendTo(submission.connectionId, failedJson);
+								return;
+							} catch (retryError) {
+								if (!String(retryError).includes("cause=writer_backlog_full")) break;
+							}
+						}
+						terminalDeliveryFailure(cause, frameBytes);
+					})().finally(() => {
+						submission.terminalRetry = undefined;
+						if (submission.terminal && promptSubmissions.get(key) === submission) {
+							if (!submission.abandoned) submission.phase = "delivered";
+							finalizePrompt(key, correlation);
+						}
+					});
+					return;
+				}
+				terminalDeliveryFailure(cause, frameBytes);
+			};
+			const terminalDeliveryFailure = (cause: string, frameBytes: number) => {
+				const safeCause = isSafePromptFailureCode(cause) ? cause : "unknown";
+				const correlation = { commandId: String(frame.commandId), turnId: String(frame.turnId) };
+				const outcome = failedPromptOutcome({
+					code: "prompt_failed",
+					provenance: "agent_failed",
+					providerCode: safeCause,
+					evidence: {},
+				});
+				try {
+					activeRuntime.server.sendTo(
+						submission.connectionId,
+						JSON.stringify({
+							type: "agent_failed",
+							sessionId: activeRuntime.id,
+							...correlation,
+							error: {
+								code: "delivery_failed",
+								message: "Prompt frame delivery failed.",
+								cause: safeCause,
+								frameBytes,
+							},
+							outcome,
+						}),
+					);
+				} catch (error) {
+					logger.warn(`sdk: correlated delivery failure terminal failed: ${String(error)}`);
+				}
+				abandonPrompt(submission);
+			};
+			const original = JSON.stringify(frame);
+			const originalBytes = Buffer.byteLength(original);
+			let framesToSend = [frame];
+			if (originalBytes > RESPONSE_CEILING_BYTES) {
+				const bounded = boundedCorrelatedFrames(frame);
+				if (!bounded) {
+					if (frame.type === "event" && frame.kind === "message_update" && !isCorrelatedDeltaFrame(frame)) return;
+					fail("oversized_frame", originalBytes);
+					return;
+				}
+				framesToSend = bounded;
+			}
+			for (const frameToSend of framesToSend) {
+				const json = JSON.stringify(frameToSend);
+				if (Buffer.byteLength(json) > RESPONSE_CEILING_BYTES) {
+					fail("oversized_frame", originalBytes);
+					return;
+				}
+				try {
+					activeRuntime.server.sendTo(submission.connectionId, json);
+				} catch (error) {
+					const detail = String(error);
+					if (detail.includes("cause=oversized_frame") && json === original) {
+						const bounded = boundedCorrelatedFrames(frame);
+						if (bounded) {
+							try {
+								for (const retryFrame of bounded)
+									activeRuntime.server.sendTo(submission.connectionId, JSON.stringify(retryFrame));
+								return;
+							} catch (retryError) {
+								logger.warn(`sdk: bounded correlated delivery failed: ${String(retryError)}`);
+							}
+						}
+					}
+					logger.warn(`sdk: correlated delivery failed: ${detail}`);
+					const cause = /cause=([a-z_]+)/.exec(detail)?.[1] ?? "unknown";
+					fail(cause, originalBytes, json);
+					return;
+				}
+			}
+		};
 		const emitPromptLifecycle = (
 			correlation: { commandId: string; turnId: string } | undefined,
 			frame: PromptLifecycleFrame,
@@ -5353,13 +5650,9 @@ export function createNotificationsExtension(
 				submission.bufferedFrames.push(frame);
 				return;
 			}
-			try {
-				runtime.server.sendTo(submission.connectionId, JSON.stringify(frame));
-			} catch (error) {
-				logger.warn(`sdk: correlated lifecycle delivery failed: ${String(error)}`);
-				abandonPrompt(submission);
-			}
+			deliverCorrelatedFrame(submission, frame);
 			if (submission.terminal) {
+				if (submission.terminalRetry) return;
 				submission.phase = "delivered";
 				finalizePrompt(key, correlation);
 			}
@@ -5497,12 +5790,7 @@ export function createNotificationsExtension(
 				submission.bufferedFrames.push(frame);
 				return;
 			}
-			try {
-				runtime.server.sendTo(submission.connectionId, JSON.stringify(frame));
-			} catch (error) {
-				logger.warn(`sdk: correlated agent event delivery failed: ${String(error)}`);
-				abandonPrompt(submission);
-			}
+			deliverCorrelatedFrame(submission, frame);
 		};
 		/**
 		 * Status of a registered deadline expiry attempt after an awaited
@@ -5666,15 +5954,13 @@ export function createNotificationsExtension(
 		};
 		const flushPromptLifecycle = (key: string, submission: PromptSubmission) => {
 			for (const frame of submission.bufferedFrames.splice(0)) {
-				try {
-					server.sendTo(submission.connectionId, JSON.stringify(frame));
-				} catch (error) {
-					logger.warn(`sdk: buffered correlated lifecycle delivery failed: ${String(error)}`);
-					abandonPrompt(submission);
-					break;
-				}
+				deliverCorrelatedFrame(submission, frame);
+				if (submission.abandoned) break;
 			}
 			if (submission.terminal) {
+				if (submission.terminalRetry) {
+					return;
+				}
 				submission.phase = "delivered";
 				const [commandId, turnId] = key.split(":", 2);
 				if (commandId && turnId) finalizePrompt(key, { commandId, turnId });
@@ -9636,10 +9922,10 @@ export function createNotificationsExtension(
 			else if (finalAssistant?.errorKind === "provider_safety_stop")
 				outcome = { kind: "stopped", reason: "refusal", provenance: "agent" };
 			// A missing/normal final assistant with a non-failing loop stop reason is a
-			// normal turn end; only explicit error/aborted assistants or non-completed
-			// loop stop reasons are failures. Text is never parsed.
+			// normal turn end; only explicit error/aborted assistants or other
+			// non-completed loop stop reasons are failures. Text is never parsed.
 			else if (
-				(event.stopReason === undefined || event.stopReason === "completed") &&
+				(event.stopReason === undefined || event.stopReason === "completed" || event.stopReason === "paused") &&
 				finalAssistant?.stopReason !== "error" &&
 				finalAssistant?.stopReason !== "aborted"
 			)

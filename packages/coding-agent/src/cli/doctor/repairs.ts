@@ -892,7 +892,15 @@ export async function executeSelectedDoctorRepair(
 				outcome =
 					result.kind === "restarted"
 						? { kind: result.kind, successorIncarnation: result.successor.incarnation }
-						: { kind: result.kind, ...("reason" in result ? { reason: result.reason } : {}) };
+						: {
+								kind: result.kind,
+								// A broker refusal carries the broker's own code (e.g. restart_busy).
+								...("reason" in result
+									? { reason: result.reason }
+									: "code" in result
+										? { reason: result.code }
+										: {}),
+							};
 			} else {
 				settings = await Settings.loadForScope({ cwd: context.cwd, agentDir: context.agentRoot.locator });
 				const result = await restartDaemonForDoctor({

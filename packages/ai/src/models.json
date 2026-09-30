@@ -964,6 +964,31 @@
 				"maxLevel": "high"
 			}
 		},
+		"anthropic.claude-sonnet-5-5": {
+			"id": "anthropic.claude-sonnet-5-5",
+			"name": "Anthropic Sonnet 5.5",
+			"api": "bedrock-converse-stream",
+			"provider": "amazon-bedrock",
+			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2,
+				"output": 10,
+				"cacheRead": 0.2,
+				"cacheWrite": 2.5
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "anthropic-budget-effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
 		"apac.amazon.nova-lite-v1:0": {
 			"id": "apac.amazon.nova-lite-v1:0",
 			"name": "Nova Lite (APAC)",
@@ -1286,6 +1311,31 @@
 		"au.anthropic.claude-sonnet-5": {
 			"id": "au.anthropic.claude-sonnet-5",
 			"name": "Anthropic Sonnet 5 (AU)",
+			"api": "bedrock-converse-stream",
+			"provider": "amazon-bedrock",
+			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2.2,
+				"output": 11,
+				"cacheRead": 0.22,
+				"cacheWrite": 2.75
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "anthropic-budget-effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"au.anthropic.claude-sonnet-5-5": {
+			"id": "au.anthropic.claude-sonnet-5-5",
+			"name": "Anthropic Sonnet 5.5 (AU)",
 			"api": "bedrock-converse-stream",
 			"provider": "amazon-bedrock",
 			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
@@ -2072,6 +2122,31 @@
 				"maxLevel": "high"
 			}
 		},
+		"eu.anthropic.claude-sonnet-5-5": {
+			"id": "eu.anthropic.claude-sonnet-5-5",
+			"name": "Anthropic Sonnet 5.5 (EU)",
+			"api": "bedrock-converse-stream",
+			"provider": "amazon-bedrock",
+			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2.2,
+				"output": 11,
+				"cacheRead": 0.22,
+				"cacheWrite": 2.75
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "anthropic-budget-effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
 		"eu.mistral.pixtral-large-2502-v1:0": {
 			"id": "eu.mistral.pixtral-large-2502-v1:0",
 			"name": "Pixtral Large (25.02) (EU)",
@@ -2455,6 +2530,31 @@
 		"global.anthropic.claude-sonnet-5": {
 			"id": "global.anthropic.claude-sonnet-5",
 			"name": "Anthropic Sonnet 5 (Global)",
+			"api": "bedrock-converse-stream",
+			"provider": "amazon-bedrock",
+			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2,
+				"output": 10,
+				"cacheRead": 0.2,
+				"cacheWrite": 2.5
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "anthropic-budget-effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"global.anthropic.claude-sonnet-5-5": {
+			"id": "global.anthropic.claude-sonnet-5-5",
+			"name": "Anthropic Sonnet 5.5 (Global)",
 			"api": "bedrock-converse-stream",
 			"provider": "amazon-bedrock",
 			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
@@ -2998,6 +3098,31 @@
 		"jp.anthropic.claude-sonnet-5": {
 			"id": "jp.anthropic.claude-sonnet-5",
 			"name": "Anthropic Sonnet 5 (JP)",
+			"api": "bedrock-converse-stream",
+			"provider": "amazon-bedrock",
+			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2.2,
+				"output": 11,
+				"cacheRead": 0.22,
+				"cacheWrite": 2.75
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "anthropic-budget-effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"jp.anthropic.claude-sonnet-5-5": {
+			"id": "jp.anthropic.claude-sonnet-5-5",
+			"name": "Anthropic Sonnet 5.5 (JP)",
 			"api": "bedrock-converse-stream",
 			"provider": "amazon-bedrock",
 			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
@@ -4501,6 +4626,31 @@
 				"maxLevel": "high"
 			}
 		},
+		"us.anthropic.claude-sonnet-5-5": {
+			"id": "us.anthropic.claude-sonnet-5-5",
+			"name": "Anthropic Sonnet 5.5 (US)",
+			"api": "bedrock-converse-stream",
+			"provider": "amazon-bedrock",
+			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2.2,
+				"output": 11,
+				"cacheRead": 0.22,
+				"cacheWrite": 2.75
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "anthropic-budget-effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
 		"us.deepseek.r1-v1:0": {
 			"id": "us.deepseek.r1-v1:0",
 			"name": "DeepSeek-R1 (US)",
@@ -5635,6 +5785,31 @@
 		"claude-sonnet-5": {
 			"id": "claude-sonnet-5",
 			"name": "Anthropic Sonnet 5",
+			"api": "anthropic-messages",
+			"provider": "anthropic",
+			"baseUrl": "https://api.anthropic.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2,
+				"output": 10,
+				"cacheRead": 0.2,
+				"cacheWrite": 2.5
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "max"
+			}
+		},
+		"claude-sonnet-5-5": {
+			"id": "claude-sonnet-5-5",
+			"name": "Anthropic Sonnet 5.5",
 			"api": "anthropic-messages",
 			"provider": "anthropic",
 			"baseUrl": "https://api.anthropic.com",
@@ -68022,6 +68197,41 @@
 					"input": 4,
 					"output": 15,
 					"cacheRead": 0.4,
+					"cacheWrite": 5
+				}
+			}
+		},
+		"gpt-6.1-sol": {
+			"id": "gpt-6.1-sol",
+			"name": "GPT-6.1-Sol",
+			"api": "openai-codex-responses",
+			"provider": "openai-codex",
+			"baseUrl": "https://chatgpt.com/backend-api",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2,
+				"output": 10,
+				"cacheRead": 0.1,
+				"cacheWrite": 2.5
+			},
+			"contextWindow": 272000,
+			"maxTokens": 128000,
+			"preferWebsockets": true,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max"
+			},
+			"longContextPricing": {
+				"threshold": 272000,
+				"cost": {
+					"input": 4,
+					"output": 15,
+					"cacheRead": 0.2,
 					"cacheWrite": 5
 				}
 			}

@@ -5507,6 +5507,17 @@
 		]
 	},
 	{
+		"sourceId": "agent_session:getAutoCompactionThresholdTokens",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal compaction-threshold accessor feeding the /context breakdown; exposed through context.get, not an independent SDK operation",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "agent_session:getContextUsage",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",

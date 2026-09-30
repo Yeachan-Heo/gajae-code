@@ -2050,9 +2050,15 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "context",
 			label: "Compaction Threshold",
-			description: "Percent threshold for context maintenance; set to Default to use legacy reserve-based behavior",
+			description:
+				"Percent threshold for context maintenance; the 300,000-token default cap applies only with adaptive mode disabled (except during context promotion)",
 			options: [
-				{ value: "default", label: "Default", description: "Legacy reserve-based threshold" },
+				{
+					value: "default",
+					label: "Default",
+					description:
+						"300,000-token default cap applies only with adaptive mode disabled (except during context promotion)",
+				},
 				{ value: "10", label: "10%", description: "Extremely early maintenance" },
 				{ value: "20", label: "20%", description: "Very early maintenance" },
 				{ value: "30", label: "30%", description: "Early maintenance" },

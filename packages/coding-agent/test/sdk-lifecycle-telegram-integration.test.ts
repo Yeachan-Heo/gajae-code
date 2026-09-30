@@ -218,7 +218,12 @@ test("four live SDK hosts recover broker index heartbeats without recreating ses
 		const firstTimer = timerRecords[0]!;
 		firstTimer.callback();
 		firstTimer.callback();
-		await Bun.sleep(0);
+		// Recovery awaits the (bounded) runtime-image replacement probe, a real
+		// fs.stat, before ensuring the broker, so the first ensure can land after
+		// more than one tick under load. Wait for it, then give a duplicate the
+		// same window to show up before asserting the single-flight guard held.
+		for (let attempt = 0; attempt < 200 && failingEnsureCalls === 0; attempt++) await Bun.sleep(5);
+		for (let attempt = 0; attempt < 10; attempt++) await Bun.sleep(5);
 		expect(failingEnsureCalls).toBe(1);
 		releaseFailure?.resolve();
 		for (let attempt = 0; attempt < 100 && ensureInFlight > 0; attempt++) await Bun.sleep(1);

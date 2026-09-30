@@ -41,7 +41,12 @@ type Fixture = {
 	fireRetryBackoff(): void;
 	promptDeliveryCount(): number;
 	sendStopped(reason: StoppedReason): void;
-	sendFailed(code: FailedCode, finalText?: string, providerCode?: string): void;
+	sendFailed(
+		code: FailedCode,
+		finalText?: string,
+		providerCode?: string,
+		deliveryFailure?: { cause: string; frameBytes: number },
+	): void;
 	/**
 	 * A `prompt_failed` terminal in the startup-readiness class (issue #5574): a provider/transport
 	 * classifier, which the agent pairs with the observed `agent_start` to classify the failure as
@@ -190,7 +195,12 @@ async function createFixture(
 			error: { code: "provider_unavailable", message: "diagnostic from fixture" },
 		});
 	};
-	const sendFailed = (code: FailedCode, finalText?: string, providerCode?: string): void => {
+	const sendFailed = (
+		code: FailedCode,
+		finalText?: string,
+		providerCode?: string,
+		deliveryFailure?: { cause: string; frameBytes: number },
+	): void => {
 		const correlation = activeCorrelation();
 		const outcome = {
 			kind: "failed" as const,
@@ -203,6 +213,9 @@ async function createFixture(
 			type: "agent_failed",
 			sessionId,
 			...correlation,
+			...(deliveryFailure
+				? { error: { code: "delivery_failed", message: "Prompt frame delivery failed.", ...deliveryFailure } }
+				: {}),
 			outcome,
 			...(finalText === undefined ? {} : { finalText }),
 		});
@@ -720,6 +733,35 @@ test("ACP prompt rejects prompt_failed terminal outcomes with their code", async
 		await expect(bounded(pending, "prompt failure")).rejects.toMatchObject({
 			code: "prompt_failed",
 			message: "Prompt submission failed.",
+		});
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP surfaces a correlated delivery failure without waiting for the watchdog", async () => {
+	const fixture = await createFixture();
+	try {
+		const pending = prompt(fixture, "delivery failure");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		fixture.sendFailed("prompt_failed", undefined, "writer_backlog_full", {
+			cause: "writer_backlog_full",
+			frameBytes: 200,
+		});
+		const rejection = await bounded(
+			pending.then(
+				() => undefined,
+				(error: unknown) => error,
+			),
+			"delivery failure rejection",
+		);
+		const failure = acpRequestFailure(rejection) as RequestError;
+		expect(failure.code).toBe(-32603);
+		expect(failure.data).toMatchObject({
+			code: "prompt_failed",
+			reason: "delivery_failed",
+			cause: "writer_backlog_full",
+			frameBytes: "200",
 		});
 	} finally {
 		fixture.dispose();

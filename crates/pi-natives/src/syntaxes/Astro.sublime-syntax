@@ -1,13 +1,14 @@
 # Vendored from oh-my-pi (MIT) crates/pi-natives/src/syntaxes/Astro.sublime-syntax @ a85bd5228d9f0f619deade1db78fa49420a721e1
-# Local modifications: attribution header only.
+# Local modifications: frontmatter and `{…}` holes embed syntect's JavaScript
+# (`source.js`) instead of the unbundled TypeScript grammar (D-HIGHLIGHT-TS-JS-GRAMMAR).
 %YAML 1.2
 ---
 # Astro component syntax for syntect.
 #
 # An Astro file is an optional `---` fenced TypeScript frontmatter followed by
 # an HTML-like template whose `{…}` holes are TypeScript expressions. Sublime
-# ships no Astro grammar, so this one composes the vendored TypeScript syntax
-# (`source.ts`) with syntect's bundled HTML (`text.html.basic`).
+# ships no Astro grammar, so this one composes syntect's JavaScript syntax
+# (`source.js`) with syntect's bundled HTML (`text.html.basic`).
 name: Astro
 file_extensions:
   - astro
@@ -23,12 +24,12 @@ contexts:
       set: template
 
   frontmatter:
-    - meta_content_scope: source.ts.embedded.astro
+    - meta_content_scope: source.js.embedded.astro
     - match: '^(---)[ \t]*$'
       captures:
         1: punctuation.section.frontmatter.end.astro
       set: template
-    - include: scope:source.ts
+    - include: scope:source.js
 
   template:
     - include: expression
@@ -41,8 +42,8 @@ contexts:
     - match: '\{'
       scope: punctuation.section.embedded.begin.astro
       push:
-        - meta_content_scope: source.ts.embedded.astro
+        - meta_content_scope: source.js.embedded.astro
         - match: '\}'
           scope: punctuation.section.embedded.end.astro
           pop: true
-        - include: scope:source.ts
+        - include: scope:source.js

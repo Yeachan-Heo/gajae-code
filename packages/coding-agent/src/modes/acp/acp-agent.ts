@@ -667,7 +667,9 @@ function logDroppedPromptTerminal(
 	});
 }
 
-type SdkPromptFailedOutcome = Extract<SdkPromptTerminalOutcome, { kind: "failed" }>;
+type SdkPromptFailedOutcome = Extract<SdkPromptTerminalOutcome, { kind: "failed" }> & {
+	deliveryFailure?: { cause: string; frameBytes: number };
+};
 
 /**
  * A prompt rejection that still carries the terminal's structured failure classification.
@@ -803,6 +805,13 @@ function promptFailureWireData(failure: SdkPromptFailedOutcome): Record<string, 
 		category: failure.category,
 		retryability: promptFailureRetryability(failure.category),
 		...(isSafePromptFailureCode(failure.providerCode) ? { providerCode: failure.providerCode } : {}),
+		...(failure.deliveryFailure
+			? {
+					reason: "delivery_failed",
+					cause: failure.deliveryFailure.cause,
+					frameBytes: String(failure.deliveryFailure.frameBytes),
+				}
+			: {}),
 		...(operatorMessage === undefined ? {} : { operatorMessage }),
 	};
 }
@@ -921,13 +930,28 @@ function terminalOutcome(event: JsonObject): SdkPromptTerminalOutcome | undefine
 		typeof outcome.message === "string" &&
 		(outcome.provenance === "agent_failed" || outcome.provenance === "deadline")
 	) {
-		return failedPromptOutcome({
+		const failure = failedPromptOutcome({
 			code: outcome.code,
 			provenance: outcome.provenance,
 			...(typeof outcome.providerCode === "string" ? { providerCode: outcome.providerCode } : {}),
 			...(isSdkPromptFailurePhase(outcome.phase) ? { phase: outcome.phase } : {}),
 			evidence: {},
 		});
+		const delivery = object(event.error);
+		if (
+			delivery?.code === "delivery_failed" &&
+			isSafePromptFailureCode(delivery.cause) &&
+			typeof delivery.frameBytes === "number" &&
+			Number.isSafeInteger(delivery.frameBytes) &&
+			delivery.frameBytes >= 0
+		) {
+			const classified: SdkPromptFailedOutcome = {
+				...failure,
+				deliveryFailure: { cause: delivery.cause, frameBytes: delivery.frameBytes },
+			};
+			return classified;
+		}
+		return failure;
 	}
 	return undefined;
 }
@@ -1113,6 +1137,15 @@ function acpFrameFromRouted(frame: SessionRouterFrame, attachmentSessionId: stri
 function frameMessageRole(event: JsonObject | undefined): string | undefined {
 	const role = object(event?.message)?.role;
 	return typeof role === "string" ? role : undefined;
+}
+
+function frameMessageHasToolCall(event: JsonObject | undefined): boolean {
+	const content = object(event?.message)?.content;
+	if (!Array.isArray(content)) return false;
+	return content.some(block => {
+		const value = object(block);
+		return value?.type === "toolCall" || value?.type === "tool_use";
+	});
 }
 
 const ACP_CONFIG_OPTIONS = [
@@ -1507,6 +1540,11 @@ export function acpRequestFailure(error: unknown): unknown {
 	const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
 	if (typeof code !== "string") return error;
 	const message = error instanceof Error ? error.message : code;
+	// ACP clients render `data.details` after the JSON-RPC message. The MCP launch
+	// diagnostic is already the complete additional message, so repeating it in
+	// `details` produces `Internal error: X.: X.` on the wire.
+	const duplicateMcpLaunchDetails =
+		code === "unavailable" && message.startsWith("MCP server request failed to start (");
 	// A prompt terminal additionally publishes its classification (issue #5615). The
 	// spread is empty for every other error, so their payloads are byte-identical to
 	// before. `code`/`details` and the JSON-RPC code itself are untouched either way:
@@ -1514,8 +1552,8 @@ export function acpRequestFailure(error: unknown): unknown {
 	const promptFailure = promptFailureFromDirectError(error);
 	const data =
 		promptFailure !== undefined
-			? { code, details: message, ...promptFailureWireData(promptFailure) }
-			: { code, details: message };
+			? { code, ...(duplicateMcpLaunchDetails ? {} : { details: message }), ...promptFailureWireData(promptFailure) }
+			: { code, ...(duplicateMcpLaunchDetails ? {} : { details: message }) };
 	// An abandoned prompt additionally publishes the plan it never finished (issue #5669).
 	// Same rule as above: `code`/`details` and the JSON-RPC code are untouched, and an abandon
 	// that observed no plan adds no keys, so its payload stays byte-identical to before.
@@ -4200,6 +4238,7 @@ export class AcpAgent implements Agent {
 			typeof event?.type === "string" ? event.type : undefined,
 			typeof event?.toolCallId === "string" ? event.toolCallId : undefined,
 			frameMessageRole(event),
+			frameMessageHasToolCall(event),
 		);
 	}
 
@@ -4961,10 +5000,11 @@ export class AcpAgent implements Agent {
 		// connection watched start. Upgrade it from the frames this prompt actually owned, never
 		// downgrade a terminal that already reported `post_start`, and carry the whole
 		// classification on the rejection so the first-turn retry gate can read it (review P1).
-		const failure =
+		const failure = (
 			outcome.phase === "post_start"
 				? outcome
-				: (rephaseFailedOutcome(outcome, { hasActivity: waiter.observedTurnActivity }) as SdkPromptFailedOutcome);
+				: rephaseFailedOutcome(outcome, { hasActivity: waiter.observedTurnActivity })
+		) as SdkPromptFailedOutcome;
 		waiter.reject(new AcpPromptFailureError(failure));
 	}
 
