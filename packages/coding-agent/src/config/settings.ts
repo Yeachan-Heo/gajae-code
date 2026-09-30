@@ -32,6 +32,7 @@ import { getShellConfig as resolveShellConfig } from "@gajae-code/utils/shell-co
 import { YAML } from "bun";
 import { type Settings as SettingsCapabilityItem, settingsCapability } from "../capability/settings";
 import type { ModelRole } from "../config/model-registry";
+import type { ConfigHotReloadFileSnapshot } from "./config-hot-reload";
 import { loadCapability } from "../discovery";
 import { extractWorkflowSetting, type WorkflowSettingKey } from "../gjc-runtime/workflow-settings";
 import { isLightTheme, setAutoThemeMapping, setColorBlindMode, setSymbolPreset } from "../modes/theme/theme";
@@ -91,6 +92,53 @@ export * from "./settings-schema";
 export interface RawSettings {
 	[key: string]: unknown;
 }
+
+/** Validated candidate view. `get` includes local patches and effective overlays. */
+export interface SettingsGlobalConfigCandidate {
+	readonly configPath: string;
+	readonly diagnostics: SettingsSchemaReport;
+	get<P extends SettingPath>(settingPath: P): SettingValue<P>;
+	/** Candidate global values include pending local patches, but exclude other layers. */
+	getGlobal<P extends SettingPath>(settingPath: P): SettingValue<P> | undefined;
+}
+
+export interface SettingsConfigReloadPublication {
+	finalize(): void;
+	rollback(): void;
+}
+
+export class SettingsGlobalConfigReloadError extends Error {
+	constructor(
+		message: string,
+		readonly configPath: string | null,
+		readonly diagnostics?: SettingsSchemaReport,
+	) {
+		super(message);
+		this.name = "SettingsGlobalConfigReloadError";
+	}
+}
+
+interface SettingsGlobalConfigCandidateState {
+	owner: Settings;
+	configPath: string;
+	globalWithPendingPatches: RawSettings;
+	effective: RawSettings;
+	diagnostics: SettingsSchemaReport;
+	rawConfig: RawSettings;
+	currentGlobal: RawSettings;
+	currentProject: RawSettings;
+	currentOverrides: RawSettings;
+	currentMerged: RawSettings;
+	cwd: string;
+	sourcePresent: boolean;
+	futureSchemaVersion: boolean;
+	published: boolean;
+}
+
+const settingsGlobalConfigCandidateStates = new WeakMap<
+	SettingsGlobalConfigCandidate,
+	SettingsGlobalConfigCandidateState
+>();
 
 const UNSAFE_EDIT_VARIANT_PATTERNS = new Set(["__proto__", "constructor", "prototype"]);
 
@@ -544,6 +592,8 @@ export class Settings implements NotificationSettingsReader {
 	#schemaMigrationPending = false;
 	/** A newer config schema must never be rewritten by legacy migrations. */
 	#futureSchemaVersion = false;
+	/** Set only after a valid disk-backed global config has been loaded or published. */
+	#hasAcceptedGlobalConfigFile = false;
 	#hasMalformedConfigRoot = false;
 	/** YAML syntax was unrecoverable, so the loaded defaults are read-only until config.yml is repaired. */
 	#hasRecoveredConfigSyntax = false;
@@ -743,6 +793,350 @@ export class Settings implements NotificationSettingsReader {
 	onChanged(listener: (path: SettingPath) => void): () => void {
 		this.#changeListeners.add(listener);
 		return () => this.#changeListeners.delete(listener);
+	}
+
+	/** The resolved global config.yml path, or null for in-memory settings. */
+	getGlobalConfigPath(): string | null {
+		return this.#configPath;
+	}
+
+	/**
+	 * Validate the watcher's exact snapshot without writing or rereading it.
+	 * Rebase pending local patches after prior durable operations settle.
+	 */
+	async stageGlobalConfigReload(snapshot: ConfigHotReloadFileSnapshot): Promise<SettingsGlobalConfigCandidate> {
+		const configPath = this.#configPath;
+		if (!configPath) {
+			throw new SettingsGlobalConfigReloadError("Global config reload requires a disk-backed Settings instance.", null);
+		}
+
+		if (path.resolve(snapshot.path) !== path.resolve(configPath)) {
+			throw new SettingsGlobalConfigReloadError("Global config snapshot path does not match Settings.", configPath);
+		}
+		const pendingAtStage = structuredClone(this.#pendingPatchesInGenerationOrder());
+		return enqueueAtomicYamlOperation(configPath, async () => {
+			const sourcePresent = snapshot.text !== null;
+			const content = snapshot.text ?? "";
+			if (!sourcePresent) {
+				if (this.#hasAcceptedGlobalConfigFile) {
+					const diagnostics: SettingsSchemaReport = {
+						valid: false,
+						issues: [
+							{
+								path: "config.yml",
+								kind: "invalid",
+								detail: "The previously accepted global config.yml is missing.",
+							},
+						],
+					};
+					throw new SettingsGlobalConfigReloadError(
+						"Cannot stage global config reload because the previously accepted config.yml is missing.",
+						configPath,
+						diagnostics,
+					);
+				}
+			}
+
+			let rawConfig: RawSettings = {};
+			if (content.trim() !== "") {
+				let parsed: unknown;
+				try {
+					parsed = YAML.parse(content);
+				} catch {
+					const diagnostics: SettingsSchemaReport = {
+						valid: false,
+						issues: [
+							{
+								path: "config.yml",
+								kind: "invalid",
+								detail: "Configuration YAML syntax is invalid; repair config.yml before reloading.",
+							},
+						],
+					};
+					throw new SettingsGlobalConfigReloadError(
+						"Cannot stage global config reload because config.yml has invalid YAML syntax.",
+						configPath,
+						diagnostics,
+					);
+				}
+				if (parsed !== undefined) {
+					if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+						const diagnostics: SettingsSchemaReport = {
+							valid: false,
+							issues: [
+								{
+									path: "config.yml",
+									kind: "invalid",
+									detail: "Configuration root must be a YAML mapping.",
+								},
+							],
+						};
+						throw new SettingsGlobalConfigReloadError(
+							"Cannot stage global config reload because the config.yml root is not a mapping.",
+							configPath,
+							diagnostics,
+						);
+					}
+					rawConfig = parsed as RawSettings;
+				}
+			}
+
+			const reconciled = reconcileSettingsSchema(rawConfig);
+			const diagnostics = reconciled.report;
+			for (const [settingPath, pathSegments] of [
+				["modelRoles", ["modelRoles"]],
+				["task.agentModelOverrides", ["task", "agentModelOverrides"]],
+			] as const) {
+				const value = getByPath(reconciled.settings, [...pathSegments]);
+				if (value === undefined) continue;
+				const record = rawSettingsRecord(value);
+				if (!record || Object.keys(shallowModelSelectorRecord(record)).length !== Object.keys(record).length) {
+					diagnostics.issues.push({
+						path: settingPath,
+						kind: "invalid",
+						detail: "Model selector records contain invalid values.",
+					});
+					diagnostics.valid = false;
+				}
+			}
+			const configSchemaVersion = normalizeConfigSchemaVersion(rawConfig.configSchemaVersion);
+			const futureSchemaVersion =
+				typeof configSchemaVersion === "number" && configSchemaVersion > CONFIG_SCHEMA_VERSION;
+			if (futureSchemaVersion) {
+				diagnostics.issues.push({
+					path: "configSchemaVersion",
+					kind: "pending-migration",
+					detail: `Configuration requires schema version ${configSchemaVersion}.`,
+				});
+			}
+			if (sourcePresent && hasLegacyCustomImageProvider(rawConfig)) {
+				diagnostics.issues.push({
+					path: "providers.image",
+					kind: "invalid",
+					detail: LEGACY_CUSTOM_IMAGE_PROVIDER_DIAGNOSTIC,
+				});
+				diagnostics.valid = false;
+			}
+			try {
+				parseNotificationSettingsSnapshot(rawConfig);
+			} catch (error) {
+				if (!(error instanceof Error) || error.message !== "gjc_notify_daemon_invalid_configuration") throw error;
+				diagnostics.issues.push({
+					path: "notifications",
+					kind: "invalid",
+					detail: "Global notification settings are invalid.",
+				});
+				diagnostics.valid = false;
+			}
+			const currentGlobal = structuredClone(this.#global);
+			const currentProject = structuredClone(this.#project);
+			const currentOverrides = structuredClone(this.#overrides);
+			const currentMerged = structuredClone(this.#merged);
+			const globalWithPendingPatches = structuredClone(reconciled.settings) as RawSettings;
+			const rawWithPendingPatches = structuredClone(rawConfig);
+			for (const patch of [...pendingAtStage, ...this.#pendingPatchesInGenerationOrder()]) {
+				applySettingsPatch(globalWithPendingPatches, { ...patch, value: structuredClone(patch.value) });
+				applySettingsPatch(rawWithPendingPatches, { ...patch, value: structuredClone(patch.value) });
+			}
+			const effective = this.#mergeSettingsLayers(globalWithPendingPatches, currentProject, currentOverrides);
+			diagnostics.issues = diagnostics.issues.filter(
+				issue =>
+					!(
+						(issue.kind === "invalid" || issue.kind === "unknown") &&
+						(issue.path === "task.autorouting" || issue.path.startsWith("task.autorouting."))
+					),
+			);
+			for (const source of [globalWithPendingPatches, currentProject, currentOverrides]) {
+				const fragment = getByPath(source, ["task", "autorouting"]);
+				diagnostics.issues.push(
+					...validateAutoroutingLocal(fragment).map(localIssue => ({
+						path: localIssue.path ? `task.autorouting.${localIssue.path}` : "task.autorouting",
+						kind: "invalid" as const,
+						detail: localIssue.detail,
+					})),
+				);
+			}
+		const effectiveAutorouting = validateAutoroutingEffective(getByPath(effective, ["task", "autorouting"]));
+		if (!effectiveAutorouting.active && effectiveAutorouting.issue) {
+			diagnostics.issues.push({
+				path: "task.autorouting",
+				kind: "invalid",
+				detail: effectiveAutorouting.issue.detail,
+			});
+		}
+		diagnostics.valid = !diagnostics.issues.some(issue => issue.kind === "invalid");
+			if (!diagnostics.valid) {
+				throw new SettingsGlobalConfigReloadError(
+					"Cannot stage global config reload because settings validation failed.",
+					configPath,
+					structuredClone(diagnostics),
+				);
+			}
+			const state: SettingsGlobalConfigCandidateState = {
+				owner: this,
+				configPath,
+				globalWithPendingPatches,
+				effective,
+				diagnostics: structuredClone(diagnostics),
+				rawConfig: rawWithPendingPatches,
+				currentGlobal,
+				currentProject,
+				currentOverrides,
+				currentMerged,
+				cwd: this.#cwd,
+				sourcePresent,
+				futureSchemaVersion,
+				published: false,
+			};
+			const candidate: SettingsGlobalConfigCandidate = {
+				configPath,
+				diagnostics: structuredClone(diagnostics),
+				get<P extends SettingPath>(settingPath: P): SettingValue<P> {
+					const value = getByPath(state.effective, settingPath.split("."));
+					if (value === undefined) return structuredClone(getDefault(settingPath));
+					const pathScopedValue = resolvePathScopedStringArray(settingPath, value, state.cwd);
+					return structuredClone((pathScopedValue ?? value) as SettingValue<P>);
+				},
+				getGlobal<P extends SettingPath>(settingPath: P): SettingValue<P> | undefined {
+					const value = getByPath(state.globalWithPendingPatches, settingPath.split("."));
+					return value === undefined ? undefined : structuredClone(value as SettingValue<P>);
+				},
+			};
+			settingsGlobalConfigCandidateStates.set(candidate, state);
+			return Object.freeze(candidate);
+		});
+	}
+
+	/**
+	 * Publish a staged global config and its dependent synchronous model commit as
+	 * one in-memory transaction. A thrown commit restores settings without hooks.
+	 */
+	publishGlobalConfigReload(
+		candidate: SettingsGlobalConfigCandidate,
+		commitSync: () => void = () => {},
+	): SettingsConfigReloadPublication {
+		const state = settingsGlobalConfigCandidateStates.get(candidate);
+		if (!state || state.owner !== this) {
+			throw new SettingsGlobalConfigReloadError(
+				"The global config candidate does not belong to this Settings instance.",
+				this.#configPath,
+			);
+		}
+		if (state.published) {
+			throw new SettingsGlobalConfigReloadError("The global config candidate has already been published.", state.configPath);
+		}
+		if (
+			this.#configPath !== state.configPath ||
+			!util.isDeepStrictEqual(this.#global, state.currentGlobal) ||
+			!util.isDeepStrictEqual(this.#project, state.currentProject) ||
+			!util.isDeepStrictEqual(this.#overrides, state.currentOverrides) ||
+			!util.isDeepStrictEqual(this.#merged, state.currentMerged)
+		) {
+			throw new SettingsGlobalConfigReloadError(
+				"Settings changed while the global config candidate was being prepared; stage it again.",
+				state.configPath,
+				structuredClone(state.diagnostics),
+			);
+		}
+
+		const previousValues = new Map<SettingPath, unknown>();
+		for (const settingPath of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
+			previousValues.set(settingPath, structuredClone(this.get(settingPath)));
+		}
+		const previous = {
+			global: this.#global,
+			overrides: structuredClone(this.#overrides),
+			rawNotificationConfig: this.#rawNotificationConfig,
+			durableRawNotificationConfig: this.#durableRawNotificationConfig,
+			durableNotificationFingerprint: this.#durableNotificationFingerprint,
+			merged: this.#merged,
+			schemaReport: this.#schemaReport,
+			autoroutingEffective: this.#autoroutingEffective,
+			autoroutingLocalIssues: this.#autoroutingLocalIssues,
+			futureSchemaVersion: this.#futureSchemaVersion,
+			hasAcceptedGlobalConfigFile: this.#hasAcceptedGlobalConfigFile,
+			hasMalformedConfigRoot: this.#hasMalformedConfigRoot,
+			hasRecoveredConfigSyntax: this.#hasRecoveredConfigSyntax,
+			hasInvalidNotificationGlobal: this.#hasInvalidNotificationGlobal,
+			notificationValidationGeneration: this.#notificationValidationGeneration,
+		};
+		let publicationState: "pending" | "finalized" | "rolled-back" = "pending";
+		const rollback = () => {
+			if (publicationState === "rolled-back") return;
+			if (publicationState === "finalized") throw new Error("Cannot roll back finalized configuration.");
+			this.#global = previous.global;
+			this.#overrides = previous.overrides;
+			this.#rawNotificationConfig = previous.rawNotificationConfig;
+			this.#durableRawNotificationConfig = previous.durableRawNotificationConfig;
+			this.#durableNotificationFingerprint = previous.durableNotificationFingerprint;
+			this.#merged = previous.merged;
+			this.#schemaReport = previous.schemaReport;
+			this.#autoroutingEffective = previous.autoroutingEffective;
+			this.#autoroutingLocalIssues = previous.autoroutingLocalIssues;
+			this.#futureSchemaVersion = previous.futureSchemaVersion;
+			this.#hasAcceptedGlobalConfigFile = previous.hasAcceptedGlobalConfigFile;
+			this.#hasMalformedConfigRoot = previous.hasMalformedConfigRoot;
+			this.#hasRecoveredConfigSyntax = previous.hasRecoveredConfigSyntax;
+			this.#hasInvalidNotificationGlobal = previous.hasInvalidNotificationGlobal;
+			this.#notificationValidationGeneration = previous.notificationValidationGeneration;
+			publicationState = "rolled-back";
+		};
+		this.#global = structuredClone(state.globalWithPendingPatches);
+		const previousNotificationFingerprint = this.#durableNotificationFingerprint;
+		this.#captureRawNotificationConfig(state.rawConfig);
+		for (const patch of this.#pendingPatchesInGenerationOrder()) {
+			this.#applyNotificationMutationToRaw(patch.path, patch.value);
+		}
+		if (previousNotificationFingerprint !== this.#durableNotificationFingerprint) {
+			this.#notificationValidationGeneration++;
+		}
+		this.#schemaReport = structuredClone(state.diagnostics);
+		this.#futureSchemaVersion = state.futureSchemaVersion;
+		this.#hasMalformedConfigRoot = false;
+		this.#hasRecoveredConfigSyntax = false;
+		this.#hasInvalidNotificationGlobal = false;
+		this.#rebuildMerged();
+		this.#recomputeNotificationValidationFromRaw();
+
+		try {
+			const result: unknown = commitSync();
+			if (result && typeof result === "object" && "then" in result) {
+				throw new TypeError("Global config reload commit callback must be synchronous.");
+			}
+		} catch (error) {
+			rollback();
+			throw error;
+		}
+
+		this.#hasAcceptedGlobalConfigFile ||= state.sourcePresent;
+		state.published = true;
+		return {
+			rollback,
+			finalize: () => {
+				if (publicationState !== "pending") return;
+				publicationState = "finalized";
+				for (const settingPath of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
+					const previousValue = previousValues.get(settingPath);
+					const nextValue = this.get(settingPath);
+					if (util.isDeepStrictEqual(previousValue, nextValue)) continue;
+					const hook = SETTING_HOOKS[settingPath];
+					if (hook) {
+						try {
+							hook(nextValue, previousValue);
+						} catch {
+							logger.warn("Configuration reload setting hook failed", { settingPath });
+						}
+					}
+					for (const listener of this.#changeListeners) {
+						try {
+							listener(settingPath);
+						} catch {
+							logger.warn("Configuration reload listener failed", { settingPath });
+						}
+					}
+				}
+			},
+		};
 	}
 
 	/** Whether durable settings mutations are permitted for the loaded configuration. */
@@ -1156,6 +1550,7 @@ export class Settings implements NotificationSettingsReader {
 		cloned.#autoroutingLocalIssues = structuredClone(this.#autoroutingLocalIssues);
 		cloned.#schemaMigrationPending = this.#schemaMigrationPending;
 		cloned.#futureSchemaVersion = this.#futureSchemaVersion;
+		cloned.#hasAcceptedGlobalConfigFile = this.#hasAcceptedGlobalConfigFile;
 		cloned.#hasMalformedConfigRoot = this.#hasMalformedConfigRoot;
 		cloned.#hasRecoveredConfigSyntax = this.#hasRecoveredConfigSyntax;
 		cloned.#hasInvalidNotificationGlobal = this.#hasInvalidNotificationGlobal;
@@ -1516,7 +1911,10 @@ export class Settings implements NotificationSettingsReader {
 			throw error;
 		}
 		this.#resetYamlLoadState();
-		if (content.trim() === "") return {};
+		if (content.trim() === "") {
+			if (filePath === this.#configPath) this.#hasAcceptedGlobalConfigFile = true;
+			return {};
+		}
 		let parsed: unknown;
 		try {
 			parsed = YAML.parse(content);
@@ -1536,7 +1934,10 @@ export class Settings implements NotificationSettingsReader {
 			this.#captureRawNotificationConfig(undefined);
 			return {};
 		}
-		if (parsed === undefined) return {};
+		if (parsed === undefined) {
+			if (filePath === this.#configPath) this.#hasAcceptedGlobalConfigFile = true;
+			return {};
+		}
 		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
 			this.#hasMalformedConfigRoot = true;
 			this.#schemaReport = {
@@ -1604,6 +2005,14 @@ export class Settings implements NotificationSettingsReader {
 			});
 		}
 		this.#schemaReport = reconciled.report;
+		if (
+			filePath === this.#configPath &&
+			reconciled.report.valid &&
+			!this.#hasInvalidNotificationGlobal &&
+			!hasLegacyCustomImageProvider(parsedRaw)
+		) {
+			this.#hasAcceptedGlobalConfigFile = true;
+		}
 		return reconciled.settings;
 	}
 
@@ -6022,16 +6431,20 @@ export class Settings implements NotificationSettingsReader {
 	}
 
 	#rebuildMerged(): void {
-		const project = structuredClone(this.#project);
-		const overrides = structuredClone(this.#overrides);
+		this.#merged = this.#mergeSettingsLayers(this.#global, this.#project, this.#overrides);
+		this.#recomputeAutoroutingDiagnostic();
+	}
+
+	#mergeSettingsLayers(global: RawSettings, projectLayer: RawSettings, overrideLayer: RawSettings): RawSettings {
+		const project = structuredClone(projectLayer);
+		const overrides = structuredClone(overrideLayer);
 		for (const settingPath of GLOBAL_ONLY_SETTINGS) {
 			const segments = settingPath.split(".");
 			deleteByPath(project, segments);
 			deleteByPath(overrides, segments);
 		}
-		this.#merged = this.#deepMerge(this.#deepMerge({}, this.#global), project);
-		this.#merged = this.#deepMerge(this.#merged, overrides);
-		this.#recomputeAutoroutingDiagnostic();
+		const merged = this.#deepMerge(this.#deepMerge({}, global), project);
+		return this.#deepMerge(merged, overrides);
 	}
 
 	#fireAllHooks(): void {
