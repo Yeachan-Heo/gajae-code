@@ -1,8 +1,9 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { Agent, type AgentTool, ThinkingLevel } from "@gajae-code/agent-core";
 import type { ImageContent, SimpleStreamOptions } from "@gajae-code/ai";
 import { z } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { logger } from "@gajae-code/utils";
 import { createAssistantMessage } from "./helpers";
 
 describe("Agent", () => {
@@ -97,6 +98,31 @@ describe("Agent", () => {
 		// The run still terminalized on error despite the throwing subscriber.
 		const last = agent.state.messages.at(-1) as { stopReason?: string } | undefined;
 		expect(last?.stopReason).toBe("error");
+	});
+
+	it("logs the redacted underlying cause of a generic run failure", async () => {
+		const warnSpy = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const agent = new Agent({
+				streamFn: () => {
+					throw new Error("OAuth token refresh ownership remained ambiguous", {
+						cause: new Error("refresh_token=rt-live-secret-value-123 rejected"),
+					});
+				},
+			});
+			await agent.prompt("trigger logged failure", { fallbackManaged: true });
+			const call = warnSpy.mock.calls.find(([message]) => message === "Agent run failed");
+			expect(call).toBeDefined();
+			const context = call?.[1] as { cause?: string; code?: string };
+			expect(context.code).toBe("agent_failed");
+			expect(context.cause).toContain("OAuth token refresh ownership remained ambiguous");
+			expect(context.cause).toContain("caused by Error: refresh_token=");
+			expect(JSON.stringify(call)).not.toContain("rt-live-secret-value-123");
+			// The transcript still carries only the generic message.
+			expect(JSON.stringify(agent.state.messages)).not.toContain("ambiguous");
+		} finally {
+			warnSpy.mockRestore();
+		}
 	});
 
 	it("terminal state and history never contain raw provider error text", async () => {

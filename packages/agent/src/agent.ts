@@ -27,7 +27,7 @@ import {
 	CURSOR_COMPOSER_BASH_POLICY_RECOVERY_PROMPT,
 	isCurrentComposerBashPolicyBlockedError,
 } from "@gajae-code/ai/providers/composer-discipline";
-import { extractHttpStatusFromError } from "@gajae-code/utils";
+import { extractHttpStatusFromError, logger, redactCrashSecrets } from "@gajae-code/utils";
 import { agentLoop, agentLoopContinue, managedLocalErrorDiagnostic } from "./agent-loop";
 import type { AppendOnlyContextManager } from "./append-only-context";
 import type { AttemptRunHandle, AttemptScope } from "./attempt-scope";
@@ -163,6 +163,30 @@ function safeErrorStatus(error: unknown): number | undefined {
 		);
 	} catch {
 		return undefined;
+	}
+}
+
+/**
+ * The user-facing failure is deliberately generic, so the underlying cause is
+ * otherwise lost. Record it in the local debug log with credentials redacted
+ * and the text bounded; this never reaches the transcript or SDK clients.
+ */
+function describeRunFailureForLog(error: unknown): { cause: string; stack?: string } {
+	try {
+		const raw = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+		const chain: string[] = [raw];
+		let cause = error instanceof Error ? error.cause : undefined;
+		for (let depth = 0; cause !== undefined && depth < 3; depth++) {
+			chain.push(`caused by ${cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause)}`);
+			cause = cause instanceof Error ? cause.cause : undefined;
+		}
+		const stack = error instanceof Error ? error.stack?.split("\n").slice(1, 9).join("\n") : undefined;
+		return {
+			cause: redactCrashSecrets(chain.join(" | ")).slice(0, 2000),
+			...(stack ? { stack: redactCrashSecrets(stack) } : {}),
+		};
+	} catch {
+		return { cause: "<unreadable error>" };
 	}
 }
 
@@ -2293,6 +2317,15 @@ export class Agent {
 				: (managedLocalErrorDiagnostic(err)?.errorKind ?? providerCode);
 			const sanitized = sanitizeAgentFailure(err, runtimeFailureCode);
 			const errorName = safeErrorName(err);
+			if (!abortController.signal.aborted) {
+				logger.warn("Agent run failed", {
+					provider: model.provider,
+					model: model.id,
+					code: sanitized.code,
+					status: safeErrorStatus(err),
+					...describeRunFailureForLog(err),
+				});
+			}
 
 			const errorMsg: AgentMessage = {
 				role: "assistant",
