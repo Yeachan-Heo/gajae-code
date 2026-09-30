@@ -209,26 +209,36 @@ describe("configuration hot reload watcher", () => {
 		expect(errors).toHaveLength(1);
 	});
 
-	test("coalesces burst changes to the newest revision and aborts older application", async () => {
+	test("coalesces pending changes to the newest revision and aborts older application", async () => {
 		const directory = await temporaryDirectory();
 		const paths = await configPaths(path.join(directory, "config"));
 		const calls: { candidate: ConfigHotReloadCandidate; signal: AbortSignal }[] = [];
-		const watcher = createWatcher(async (candidate, signal) => {
-			calls.push({ candidate, signal });
-			if (candidate.config.text === "config: first\n") {
-				const aborted = Promise.withResolvers<void>();
-				signal.addEventListener("abort", () => aborted.resolve(), { once: true });
-				await aborted.promise;
-			}
-		});
+		const releaseFirst = Promise.withResolvers<void>();
+		const validated: ConfigHotReloadCandidate[] = [];
+		const watcher = createWatcher(
+			async (candidate, signal) => {
+				calls.push({ candidate, signal });
+				if (candidate.config.text === "config: first\n") {
+					await releaseFirst.promise;
+				}
+			},
+			() => {},
+			candidate => {
+				validated.push(candidate);
+			},
+		);
 		await watcher.start(paths);
 
-		await atomicReplace(paths.configPath, "config: first\n");
-		await waitFor(() => calls[0]);
-		await atomicReplace(paths.configPath, "config: second\n");
-		await Bun.sleep(15);
-		await atomicReplace(paths.configPath, "config: newest\n");
-
+		try {
+			await atomicReplace(paths.configPath, "config: first\n");
+			await waitFor(() => calls[0]);
+			await atomicReplace(paths.configPath, "config: second\n");
+			await waitFor(() => (calls[0]?.signal.aborted ? true : undefined));
+			await atomicReplace(paths.configPath, "config: newest\n");
+			await waitFor(() => validated.find(candidate => candidate.config.text === "config: newest\n"));
+		} finally {
+			releaseFirst.resolve();
+		}
 		const latestCall = await waitFor(() => calls[1]);
 		expect(calls[0]?.signal.aborted).toBe(true);
 		expect(latestCall.candidate.config.text).toBe("config: newest\n");
