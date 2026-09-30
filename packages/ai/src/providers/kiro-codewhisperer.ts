@@ -255,11 +255,12 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 				// Deliberately no HTTP status metadata and no "HTTP <code>" wording: a 2xx
 				// protocol mismatch is deterministic, and a status would materialize
 				// transport-failure facts that session fallback retries.
+				// Sanitize each untrusted part on its own so the fixed prefix does not eat
+				// into the body's 1000-character diagnostic budget.
+				const safeContentType = contentType ? sanitizeKiroError(contentType, bearerToken) : "";
+				const safeBody = errBody ? sanitizeKiroError(errBody, bearerToken) : "";
 				throw new KiroNonEventStreamError(
-					sanitizeKiroError(
-						`Kiro CodeWhisperer returned a non-eventstream ${response.status} response (${contentType}): ${errBody}`,
-						bearerToken,
-					),
+					`Kiro CodeWhisperer returned a non-eventstream ${response.status} response (${safeContentType}): ${safeBody}`,
 				);
 			}
 

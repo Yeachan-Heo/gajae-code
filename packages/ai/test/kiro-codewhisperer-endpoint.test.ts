@@ -265,6 +265,16 @@ describe("Kiro CodeWhisperer OAuth endpoint #6002", () => {
 		expect(errorMessage).not.toContain("secret-bearer");
 	});
 
+	test("keeps the full body diagnostic budget after the status/content-type prefix", async () => {
+		const body = `${"a".repeat(990)}TAIL`;
+		const errorMessage = await streamErrorMessage(
+			new Response(body, { status: 200, headers: { "content-type": "application/json" } }),
+		);
+
+		expect(errorMessage).toContain("non-eventstream 200 response (application/json)");
+		expect(errorMessage).toContain("TAIL");
+	});
+
 	test("reads only a bounded prefix of a non-terminating non-eventstream body", async () => {
 		let pulls = 0;
 		let cancelled = false;
