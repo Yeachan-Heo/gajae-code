@@ -16141,6 +16141,9 @@ export class AgentSession {
 		this.#cachedWorkspaceTree = undefined;
 		this.#cachedWorkspaceTreeAt = 0;
 		this.#pendingWorkspaceTreeRescope = true;
+		// Sent copies name the abandoned root; the rescope already rebuilds the stable
+		// prompt, so there is no cache prefix left to preserve by keeping them.
+		this.#removeEphemeralCustomMessages();
 	}
 
 	/** Skill loading warnings captured by SDK */
@@ -20278,7 +20281,7 @@ export class AgentSession {
 			}
 
 			const handoffText = await generateHandoff(
-				this.agent.state.messages,
+				this.#withoutEphemeralCustomMessages(this.agent.state.messages),
 				model,
 				apiKey,
 				{

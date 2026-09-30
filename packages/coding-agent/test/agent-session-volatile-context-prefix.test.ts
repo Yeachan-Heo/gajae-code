@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
 import { Agent, type AgentMessage, type AgentTool } from "@gajae-code/agent-core";
-import { type AssistantMessage, getBundledModel, type TextContent, type ToolCall } from "@gajae-code/ai";
+import * as compactionModule from "@gajae-code/agent-core/compaction";
+import { type AssistantMessage, getBundledModel, type ToolCall } from "@gajae-code/ai";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -56,22 +57,6 @@ function createTextAssistantMessage(text: string): AssistantMessage {
 		stopReason: "stop",
 		timestamp: Date.now(),
 	};
-}
-
-function getMessageText(message: AgentMessage): string {
-	if (!("content" in message)) {
-		return "";
-	}
-	if (typeof message.content === "string") {
-		return message.content;
-	}
-	if (!Array.isArray(message.content)) {
-		return "";
-	}
-	return message.content
-		.filter((block): block is TextContent => block.type === "text")
-		.map(content => content.text)
-		.join("\n");
 }
 
 describe("AgentSession volatile context cache prefix extension", () => {
@@ -226,5 +211,52 @@ describe("AgentSession volatile context cache prefix extension", () => {
 			msg => msg.role === "custom" && msg.customType === "volatile-project-context",
 		);
 		expect(hasVolatileInAgent).toBe(true);
+	});
+	it("excludes retained volatile context from handoff generation input", async () => {
+		scriptedResponses = [createTextAssistantMessage("first response"), createTextAssistantMessage("second response")];
+		await session.prompt("first question?");
+		await session.prompt("second question?");
+		expect(
+			session.agent.state.messages.some(
+				msg => msg.role === "custom" && msg.customType === "volatile-project-context",
+			),
+		).toBe(true);
+
+		const generateHandoffSpy = spyOn(compactionModule, "generateHandoff").mockResolvedValue("## Goal\nContinue");
+		try {
+			await session.handoff();
+			const handoffMessages = generateHandoffSpy.mock.calls[0]?.[0];
+			if (!handoffMessages) throw new Error("Expected generateHandoff call");
+			expect(handoffMessages.some(msg => msg.role === "user")).toBe(true);
+			expect(
+				handoffMessages.some(
+					msg =>
+						msg.role === "custom" &&
+						(msg.customType === "volatile-project-context" ||
+							msg.customType === "untrusted-mcp-server-instructions"),
+				),
+			).toBe(false);
+		} finally {
+			generateHandoffSpy.mockRestore();
+		}
+	});
+
+	it("drops retained volatile context naming the old root when the session is rescoped", async () => {
+		scriptedResponses = [createTextAssistantMessage("first response")];
+		await session.prompt("first question?");
+		expect(
+			session.agent.state.messages.some(
+				msg => msg.role === "custom" && msg.customType === "volatile-project-context",
+			),
+		).toBe(true);
+
+		session.retireWorkspaceTreeForRescope();
+
+		expect(
+			session.agent.state.messages.some(
+				msg => msg.role === "custom" && msg.customType === "volatile-project-context",
+			),
+		).toBe(false);
+		expect(session.agent.state.messages.some(msg => msg.role === "user")).toBe(true);
 	});
 });
