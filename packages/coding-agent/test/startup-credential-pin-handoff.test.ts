@@ -566,7 +566,9 @@ describe("startup credential pin handoff", () => {
 					});
 					session = result.session;
 					expect(`${session.model?.provider}/${session.model?.id}`).toBe(`${fixture.provider}/entitled-model`);
-					// Only the deliberately unresolvable settings default may be reported.
+					// Only the unresolvable settings default may be reported. This proves the
+					// pre-extension restore selected the model: the post-extension retry would
+					// also restore it but clears this message, so keep the exact match.
 					expect(result.modelFallbackMessage).toBe(`Model ${fixture.provider}/missing-model not found`);
 					expect(
 						fixture.authStorage.hasSessionCredentialUnavailable(fixture.provider, resumed.credentialScope),
@@ -621,63 +623,76 @@ describe("startup credential pin handoff", () => {
 			}
 		});
 
-		test("restores an extension-registered saved model after extensions load when a runtime key exists", async () => {
-			using tempDir = TempDir.createSync("@gjc-startup-pin-explicit-late-");
-			const fixture = await createCredentialFixture(tempDir.path());
-			const lateProvider = "late-pin-provider";
-			await fixture.authStorage.set(lateProvider, [
-				{ type: "oauth", access: "late-wrong", refresh: "late-wrong-r", expires: Date.now() + 3_600_000 },
-				{ type: "oauth", access: "late-paid", refresh: "late-paid-r", expires: Date.now() + 3_600_000 },
-			]);
-			const latePaidRow = fixture.authStorage.listCredentialInventory(lateProvider)[1];
-			if (!latePaidRow) throw new Error("Expected late provider credential rows");
-			const resumed = await persistStalePinnedSession(
-				fixture,
-				`${lateProvider}/late-model`,
-				lateProvider,
-				latePaidRow.id,
-			);
-			fixture.authStorage.setRuntimeApiKey(lateProvider, runtimeKey);
-			let session: AgentSession | undefined;
-			try {
-				// The unresolvable default leaves the post-extension retry as the only restore path.
-				const result = await resumeStalePinnedSession(fixture, resumed, {
-					settings: settingsWithDefault(`${fixture.provider}/missing-model`),
-					extensions: [
-						pi => {
-							pi.registerProvider(lateProvider, {
-								baseUrl: "https://late-pin.example.test/v1",
-								api: "openai-completions",
-								oauth: {
-									name: "Late Pin Fixture",
-									login: async () => ({
-										access: "late-login",
-										refresh: "late-login-r",
-										expires: Date.now() + 3_600_000,
-									}),
-									getApiKey: credentials => credentials.access,
-								},
-								models: [
-									{
-										id: "late-model",
-										name: "Late Model",
-										reasoning: false,
-										input: ["text"],
-										cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-										contextWindow: 128_000,
-										maxTokens: 8_192,
+		for (const withRuntimeKey of [true, false]) {
+			test(`post-extension retry ${withRuntimeKey ? "restores" : "keeps blocked"} an extension-registered saved model ${withRuntimeKey ? "with" : "without"} a runtime key`, async () => {
+				using tempDir = TempDir.createSync("@gjc-startup-pin-explicit-late-");
+				const fixture = await createCredentialFixture(tempDir.path());
+				const lateProvider = "late-pin-provider";
+				await fixture.authStorage.set(lateProvider, [
+					{ type: "oauth", access: "late-wrong", refresh: "late-wrong-r", expires: Date.now() + 3_600_000 },
+					{ type: "oauth", access: "late-paid", refresh: "late-paid-r", expires: Date.now() + 3_600_000 },
+				]);
+				const latePaidRow = fixture.authStorage.listCredentialInventory(lateProvider)[1];
+				if (!latePaidRow) throw new Error("Expected late provider credential rows");
+				const resumed = await persistStalePinnedSession(
+					fixture,
+					`${lateProvider}/late-model`,
+					lateProvider,
+					latePaidRow.id,
+				);
+				if (withRuntimeKey) fixture.authStorage.setRuntimeApiKey(lateProvider, runtimeKey);
+				let session: AgentSession | undefined;
+				try {
+					// The unresolvable default leaves the post-extension retry as the only restore path.
+					const result = await resumeStalePinnedSession(fixture, resumed, {
+						settings: settingsWithDefault(`${fixture.provider}/missing-model`),
+						extensions: [
+							pi => {
+								pi.registerProvider(lateProvider, {
+									baseUrl: "https://late-pin.example.test/v1",
+									api: "openai-completions",
+									oauth: {
+										name: "Late Pin Fixture",
+										login: async () => ({
+											access: "late-login",
+											refresh: "late-login-r",
+											expires: Date.now() + 3_600_000,
+										}),
+										getApiKey: credentials => credentials.access,
 									},
-								],
-							});
-						},
-					],
-				});
-				session = result.session;
-				expect(`${session.model?.provider}/${session.model?.id}`).toBe(`${lateProvider}/late-model`);
-				expect(result.modelFallbackMessage).toBeUndefined();
-			} finally {
-				await disposeFixture(fixture, session);
-			}
-		});
+									models: [
+										{
+											id: "late-model",
+											name: "Late Model",
+											reasoning: false,
+											input: ["text"],
+											cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+											contextWindow: 128_000,
+											maxTokens: 8_192,
+										},
+									],
+								});
+							},
+						],
+					});
+					session = result.session;
+					if (withRuntimeKey) {
+						expect(`${session.model?.provider}/${session.model?.id}`).toBe(`${lateProvider}/late-model`);
+						expect(result.modelFallbackMessage).toBeUndefined();
+					} else {
+						expect(session.model).toBeUndefined();
+						expect(result.modelFallbackMessage).toContain(`Could not restore model ${lateProvider}/late-model`);
+						expect(
+							await fixture.authStorage.peekApiKey(lateProvider, {
+								sessionId: resumed.credentialScope,
+								owner: fixture.modelRegistry.getAuthStorageOwner(),
+							}),
+						).toBeUndefined();
+					}
+				} finally {
+					await disposeFixture(fixture, session);
+				}
+			});
+		}
 	});
 });
