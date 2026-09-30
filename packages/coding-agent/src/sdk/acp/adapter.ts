@@ -159,6 +159,10 @@ const ACP_MCP_PRESERVED_LAUNCH_CODES = new Set([
  */
 const ACP_MCP_PRESERVED_TRANSPORT_CODES = new Set(["connection_closed", "unavailable", "timeout"]);
 
+function attachReplayRecovery(error: SdkClientError, recovery: unknown): void {
+	Object.assign(error, { recovery });
+}
+
 /**
  * The error an ACP session launch must throw once a lifecycle request that carried MCP
  * servers has failed. Broker transport failures from the SDK client are preserved verbatim;
@@ -665,7 +669,8 @@ export class AcpSdkAdapter {
 					const result = await client.global(operation, input, options);
 					if (Date.now() >= deadline) throw firstError;
 					return result;
-				} catch {
+				} catch (replayError) {
+					attachReplayRecovery(firstError, replayError);
 					throw firstError;
 				}
 			}

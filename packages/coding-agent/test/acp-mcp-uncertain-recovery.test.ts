@@ -156,3 +156,73 @@ test("keeps uncertainty typed when the idempotent replay also loses its response
 		await adapter.close();
 	}
 });
+
+test("keeps the sent uncertainty when replay reconnects before dispatch", async () => {
+	const sentDetails = { id: "sent-request", operation: "session.create", idempotencyKey: "acp-request-3" };
+	const original = new SdkClientError("uncertain_after_send", "response lost after dispatch", sentDetails);
+	const replayFailure = new SdkClientError(
+		"reconnect_exhausted",
+		"SDK WebSocket reconnect attempts exhausted",
+		new Error("connection refused"),
+		{ attemptsConsumed: 2, attemptBudget: 2, elapsedMs: 25, reason: "attempts_exhausted" },
+		{ transport: true },
+	);
+	let attempts = 0;
+	const client = {
+		async global() {
+			attempts += 1;
+			throw attempts === 1 ? original : replayFailure;
+		},
+		async close() {},
+	};
+	const adapter = new AcpSdkAdapter({ client: client as never });
+	try {
+		const error = (await adapter
+			.lifecycle("session.create", { cwd: "/tmp/workspace", target: { path: "/tmp/workspace" } }, "acp-request-3")
+			.catch(value => value)) as SdkClientError & { recovery?: unknown };
+		expect(error).toBe(original);
+		expect(error.code).toBe("uncertain_after_send");
+		expect(error.details).toBe(sentDetails);
+		expect(error.recovery).toBe(replayFailure);
+		const attributed = acpMcpLaunchFailure(error, [{ name: "paseo", command: "/bin/true", args: [] }]) as {
+			code: string;
+		};
+		expect(attributed.code).toBe("uncertain_after_send");
+	} finally {
+		await adapter.close();
+	}
+});
+
+test("keeps the sent uncertainty when replay times out before dispatch", async () => {
+	const original = new SdkClientError("uncertain_after_send", "response lost after dispatch", {
+		id: "sent-request",
+		operation: "session.close",
+		idempotencyKey: "acp-request-4",
+	});
+	const replayFailure = new SdkClientError(
+		"timeout",
+		"SDK request timed out before dispatch",
+		{ requestId: "replay-request", requestSent: false },
+		undefined,
+		{ transport: true },
+	);
+	let attempts = 0;
+	const client = {
+		async global() {
+			attempts += 1;
+			throw attempts === 1 ? original : replayFailure;
+		},
+		async close() {},
+	};
+	const adapter = new AcpSdkAdapter({ client: client as never });
+	try {
+		const error = (await adapter.lifecycle("session.close", {}, "acp-request-4").catch(value => value)) as SdkClientError & {
+			recovery?: SdkClientError;
+	};
+		expect(error).toBe(original);
+		expect(error.details).toEqual(original.details);
+		expect(error.recovery).toBe(replayFailure);
+	} finally {
+		await adapter.close();
+	}
+});
