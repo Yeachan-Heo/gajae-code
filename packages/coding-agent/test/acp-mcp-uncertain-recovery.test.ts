@@ -1,6 +1,11 @@
 import { expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { AcpSdkAdapter, acpMcpLaunchFailure } from "../src/sdk/acp";
 import { lifecycleRequestTimeoutMs } from "../src/sdk/broker/startup-budget";
+import { Broker } from "../src/sdk/broker/broker";
+import { setLifecycleCommandResolverForTest } from "../src/sdk/broker/lifecycle";
 import { SdkClientError } from "../src/sdk/client";
 
 test("replays an uncertain ACP lifecycle launch with the same idempotency key", async () => {
@@ -34,6 +39,30 @@ test("replays an uncertain ACP lifecycle launch with the same idempotency key", 
 		expect(calls[1]?.input).toEqual(calls[0]?.input);
 	} finally {
 		await adapter.close();
+	}
+});
+
+test("the broker replays a committed create failure without attempting a second spawn", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-acp-lifecycle-replay-"));
+	const broker = new Broker({ agentDir: path.join(root, "agent") });
+	let spawnAttempts = 0;
+	try {
+		setLifecycleCommandResolverForTest(broker, () => {
+			spawnAttempts += 1;
+			throw new Error("fixture spawn failure");
+		});
+		await broker.start();
+		const input = { cwd: root };
+		const first = await broker.handleRequest("session.create", input, "acp-lost-response");
+		// The caller loses this response after dispatch and repeats the identical request.
+		const replay = await broker.handleRequest("session.create", input, "acp-lost-response");
+		expect(first).toMatchObject({ ok: false, error: { code: "spawn_failed" } });
+		expect(replay).toEqual(first);
+		expect(spawnAttempts).toBe(1);
+	} finally {
+		setLifecycleCommandResolverForTest(broker, undefined);
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
 	}
 });
 
