@@ -8,6 +8,7 @@ import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
+import type { ContributionPrepResult } from "@gajae-code/coding-agent/session/contribution-prep";
 import * as contributionPrepModule from "@gajae-code/coding-agent/session/contribution-prep";
 import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
@@ -276,7 +277,7 @@ describe("AgentSession volatile context cache prefix extension", () => {
 		expect(session.formatSessionAsText()).not.toContain(marker);
 
 		const prepSpy = spyOn(contributionPrepModule, "prepareContributionPrep").mockResolvedValue(
-			{} as Awaited<ReturnType<typeof contributionPrepModule.prepareContributionPrep>>,
+			{} as ContributionPrepResult,
 		);
 		try {
 			await session.prepareContributionPrep();
