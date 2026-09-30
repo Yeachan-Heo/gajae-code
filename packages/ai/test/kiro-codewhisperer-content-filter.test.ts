@@ -117,12 +117,15 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 				body: streamFrom([initialResponse, metadataWithRefusal]),
 				status: 200,
 			} as unknown as Response);
-		}) as typeof fetch;
+		}) as unknown as typeof fetch;
 
 		try {
 			const stream = streamKiroCodeWhisperer(model, context, { apiKey: "token", region: "us-east-1" });
 			for await (const event of stream) {
-				events.push({ type: event.type, message: event.error ?? event.partial });
+				events.push({
+					type: event.type,
+					message: "error" in event ? event.error : "partial" in event ? event.partial : undefined,
+				});
 			}
 		} catch {
 			// Stream may throw; errors are captured in events
@@ -182,12 +185,15 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 				ok: true,
 				status: 200,
 			} as unknown as Response);
-		}) as typeof fetch;
+		}) as unknown as typeof fetch;
 
 		try {
 			const stream = streamKiroCodeWhisperer(model, context, { apiKey: "token", region: "us-east-1" });
 			for await (const event of stream) {
-				events.push({ type: event.type, message: event.error ?? event.partial });
+				events.push({
+					type: event.type,
+					message: "error" in event ? event.error : "partial" in event ? event.partial : undefined,
+				});
 			}
 		} catch {
 			// Stream may throw; errors are captured in events
@@ -221,12 +227,15 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 				ok: true,
 				status: 200,
 			} as unknown as Response);
-		}) as typeof fetch;
+		}) as unknown as typeof fetch;
 
 		try {
 			const stream = streamKiroCodeWhisperer(model, context, { apiKey: "token", region: "us-east-1" });
 			for await (const event of stream) {
-				events.push({ type: event.type, message: event.error ?? event.partial });
+				events.push({
+					type: event.type,
+					message: "error" in event ? event.error : "partial" in event ? event.partial : undefined,
+				});
 			}
 		} catch {
 			// Stream may throw; errors are captured in events
@@ -264,12 +273,15 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 				ok: true,
 				status: 200,
 			} as unknown as Response);
-		}) as typeof fetch;
+		}) as unknown as typeof fetch;
 
 		try {
 			const stream = streamKiroCodeWhisperer(model, context, { apiKey: "token", region: "us-east-1" });
 			for await (const event of stream) {
-				events.push({ type: event.type, message: event.error ?? event.partial });
+				events.push({
+					type: event.type,
+					message: "error" in event ? event.error : "partial" in event ? event.partial : undefined,
+				});
 			}
 		} catch {
 			// Stream may throw; errors are captured in events
@@ -307,12 +319,15 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 				ok: true,
 				status: 200,
 			} as unknown as Response);
-		}) as typeof fetch;
+		}) as unknown as typeof fetch;
 
 		try {
 			const stream = streamKiroCodeWhisperer(model, context, { apiKey: "token", region: "us-east-1" });
 			for await (const event of stream) {
-				events.push({ type: event.type, message: event.error ?? event.partial });
+				events.push({
+					type: event.type,
+					message: "error" in event ? event.error : "partial" in event ? event.partial : undefined,
+				});
 			}
 		} catch {
 			// Stream may throw; errors are captured in events
