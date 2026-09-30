@@ -254,13 +254,14 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 			const mediaType = contentType.split(";", 1)[0]?.trim().toLowerCase() ?? "";
 			if (mediaType !== "application/vnd.amazon.eventstream") {
 				const errBody = await readBodyPrefix(response);
-				const err = new Error(
+				// Deliberately no HTTP status: a 2xx protocol mismatch is deterministic, and a
+				// status would materialize transport-failure facts that session fallback retries.
+				throw new Error(
 					sanitizeKiroError(
 						`Kiro CodeWhisperer returned non-eventstream response (${contentType}): ${errBody}`,
 						bearerToken,
 					),
 				);
-				throw withHttpStatus(err, response.status);
 			}
 
 			// Decode eventstream

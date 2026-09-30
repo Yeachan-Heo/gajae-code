@@ -5,7 +5,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import { streamKiroCodeWhisperer } from "../src/providers/kiro-codewhisperer";
-import type { Context, Model } from "../src/types";
+import type { AssistantMessage, Context, Model } from "../src/types";
 
 const originalFetch = globalThis.fetch;
 
@@ -159,7 +159,7 @@ describe("Kiro CodeWhisperer OAuth endpoint #6002", () => {
 		expect(capturedUrl).toBe("https://codewhisperer.ap-southeast-1.amazonaws.com/");
 	});
 
-	async function streamErrorMessage(response: Response): Promise<string | undefined> {
+	async function streamError(response: Response): Promise<AssistantMessage | undefined> {
 		globalThis.fetch = (async () => response) as unknown as typeof fetch;
 		try {
 			const model = {
@@ -177,15 +177,32 @@ describe("Kiro CodeWhisperer OAuth endpoint #6002", () => {
 			} satisfies Model<"kiro-codewhisperer-stream">;
 			const context: Context = { messages: [{ role: "user", content: "say ok", timestamp: 1 }] };
 			const stream = streamKiroCodeWhisperer(model, context, { apiKey: "secret-bearer", region: "us-east-1" });
-			let errorMessage: string | undefined;
+			let error: AssistantMessage | undefined;
 			for await (const event of stream) {
-				if (event.type === "error") errorMessage = event.error.errorMessage;
+				if (event.type === "error") error = event.error;
 			}
-			return errorMessage;
+			return error;
 		} finally {
 			globalThis.fetch = originalFetch;
 		}
 	}
+
+	async function streamErrorMessage(response: Response): Promise<string | undefined> {
+		return (await streamError(response))?.errorMessage;
+	}
+
+	test("does not classify a non-eventstream 200 as a retryable transport failure", async () => {
+		const error = await streamError(
+			new Response(JSON.stringify({ message: "Invalid API key" }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+
+		expect(error?.errorMessage).toContain("Invalid API key");
+		expect(error?.transportFailure).toBeUndefined();
+		expect(error?.errorStatus).toBeUndefined();
+	});
 
 	test("surfaces a non-eventstream 200 body instead of an eventstream truncation error (#6158)", async () => {
 		const errorMessage = await streamErrorMessage(
