@@ -27,6 +27,12 @@ export const STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE = "stream_first_event_time
 /** Stable code for a nominally successful response with no content or token usage. */
 export const EMPTY_RESPONSE_PROVIDER_CODE = "empty_response";
 /**
+ * Terminal error code for a successful HTTP response whose body is not the protocol the
+ * provider speaks (for example a JSON or HTML error returned with 200). Deterministic for
+ * the request, so session retry and managed fallback must surface it instead of replaying.
+ */
+export const PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE = "provider_protocol_mismatch";
+/**
  * OpenAI's typed capacity-overload code. It arrives without an HTTP status —
  * inside an HTTP 200 terminal Responses envelope or a Codex error event — so the
  * code itself is the only structured evidence of the failure and must survive

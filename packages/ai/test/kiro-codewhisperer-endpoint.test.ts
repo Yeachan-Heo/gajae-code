@@ -6,6 +6,7 @@
 import { describe, expect, test } from "bun:test";
 import { streamKiroCodeWhisperer } from "../src/providers/kiro-codewhisperer";
 import type { AssistantMessage, Context, Model } from "../src/types";
+import { PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE } from "../src/utils/fallback-transport";
 
 const originalFetch = globalThis.fetch;
 
@@ -230,6 +231,7 @@ describe("Kiro CodeWhisperer OAuth endpoint #6002", () => {
 		expect(error?.errorMessage).toContain("401 Invalid API key");
 		expect(error?.errorStatus).toBeUndefined();
 		expect(error?.transportFailure).toBeUndefined();
+		expect(error?.errorCode).toBe(PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE);
 	});
 
 	test("redacts an echoed bearer credential from a non-eventstream 200 body", async () => {

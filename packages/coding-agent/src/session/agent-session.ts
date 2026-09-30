@@ -133,6 +133,7 @@ import {
 	classifyFallbackTrigger,
 	EMPTY_RESPONSE_PROVIDER_CODE,
 	type FallbackAttemptToken,
+	PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE,
 	type FallbackTriggerClass,
 	SERVER_OVERLOADED_PROVIDER_CODE,
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
@@ -23082,6 +23083,9 @@ export class AgentSession {
 		// Without this the message carries no transport facts and would fall
 		// through to "unknown", which is admitted for bounded retry (#5627).
 		if (message.errorCode === REPETITION_GUARD_ERROR_CODE) return "terminal";
+		// A 2xx body in the wrong protocol replays identically; its embedded body text
+		// (e.g. "HTTP 503") must not be reparsed as a transient failure.
+		if (message.errorCode === PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE) return "terminal";
 		if (message.errorKind === "local_snapshot_failure") return "local_snapshot";
 		if (message.errorKind === "local_buffer_overflow") return "local_buffer_overflow";
 		if (this.#isTypedFirstEventTimeout(message)) return "first_event_timeout";

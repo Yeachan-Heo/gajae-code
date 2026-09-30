@@ -26,7 +26,7 @@ import type {
 	ToolResultMessage,
 } from "../types";
 import { AssistantMessageEventStream } from "../utils/event-stream";
-import { transportFailureFacts } from "../utils/fallback-transport";
+import { PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE, transportFailureFacts } from "../utils/fallback-transport";
 import { withHttpStatus } from "../utils/http-inspector";
 import { captureUnicodeEscapeEvidence } from "../utils/json-parse";
 import { decodeEventStream } from "./aws-eventstream";
@@ -367,6 +367,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 			// The non-eventstream diagnostic embeds untrusted body text; never parse a status out of it.
 			output.errorStatus = error instanceof KiroNonEventStreamError ? undefined : extractHttpStatusFromError(error);
 			output.transportFailure = transportFailureFacts(error);
+			if (error instanceof KiroNonEventStreamError) output.errorCode = PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE;
 			const baseMessage = error instanceof Error ? error.message : JSON.stringify(error);
 			output.errorMessage = baseMessage;
 			output.duration = Date.now() - startTime;
