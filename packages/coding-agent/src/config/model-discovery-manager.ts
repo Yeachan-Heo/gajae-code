@@ -100,6 +100,16 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 		const state = this.#states.get(provider);
 		return state === undefined ? undefined : this.#snapshot(state);
 	}
+
+	/** Retain accepted discovery evidence for unchanged providers during a local reload. */
+	retainStatesFrom(source: ModelDiscoveryManager<TProvider>, providers: ReadonlySet<string>): void {
+		for (const provider of this.#providers) {
+			if (!providers.has(provider.provider)) continue;
+			const state = source.#states.get(provider.provider);
+			if (state) this.#states.set(provider.provider, this.#snapshot(state));
+		}
+	}
+
 	invalidate(provider: string): void {
 		this.#invalidate(provider);
 		this.#states.delete(provider);

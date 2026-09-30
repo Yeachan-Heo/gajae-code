@@ -224,11 +224,17 @@ import {
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
 import type { CasReceipt } from "../config/atomic-yaml-patch";
+import type { ConfigHotReloadCandidate, ConfigHotReloadPaths } from "../config/config-hot-reload";
 import {
 	activateModelProfile,
 	applyModelProfileRuntimeBindings,
+	finishPreparedModelProfileActivation,
 	materializeActiveModelProfileAssignment,
+	type PreparedModelProfileActivation,
+	prepareModelProfileActivation,
+	publishPreparedModelProfileActivation,
 	resolveMissingSessionModelRecovery,
+	rollbackPreparedModelProfileActivation,
 } from "../config/model-profile-activation";
 import {
 	ModelProfileRegistryError,
@@ -252,6 +258,7 @@ import {
 	kNoAuth,
 	MODEL_ROLE_IDS,
 	type ModelRegistry,
+	type ModelsConfigReloadCandidate,
 } from "../config/model-registry";
 import {
 	extractExplicitThinkingSelector,
@@ -267,10 +274,14 @@ import {
 } from "../config/model-resolver";
 import { type ModelSelectorValue, normalizeModelSelectorValue } from "../config/model-selector-value";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
-import type { Settings, SkillsSettings } from "../config/settings";
+import type {
+	Settings,
+	SettingsConfigReloadPublication,
+	SettingsGlobalConfigCandidate,
+	SkillsSettings,
+} from "../config/settings";
 import { onAppendOnlyModeChanged } from "../config/settings";
-import type { SettingPath } from "../config/settings-schema";
-import { getDefault } from "../config/settings-schema";
+import { getDefault, SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
 import { resolveEagerTaskDelegation } from "../config/task-delegation";
 import { RawSseDebugBuffer } from "../debug/raw-sse-buffer";
 import { loadCapability } from "../discovery";
@@ -2682,6 +2693,54 @@ export interface DefaultFallbackRuntimeState {
 	exhaustedLastTurn: boolean;
 }
 
+export interface PreparedProfileModelSelection {
+	readonly sessionId: string;
+	readonly model: Model;
+	readonly thinkingLevel: ThinkingLevel | undefined;
+	readonly previousModel: Model | undefined;
+	readonly previousThinkingLevel: ThinkingLevel | undefined;
+	readonly previousEditMode: EditMode;
+	readonly signal: AbortSignal | undefined;
+}
+
+export interface ConfigurationReloadResult {
+	readonly applied: boolean;
+	readonly settingsChanged: boolean;
+	readonly modelsChanged: boolean;
+	readonly changedSettings: readonly SettingPath[];
+}
+
+export type ConfigurationReloadErrorCode =
+	| "SESSION_UNAVAILABLE"
+	| "PATH_CHANGED"
+	| "SETTINGS_INVALID"
+	| "MODELS_INVALID"
+	| "MODEL_UNAVAILABLE"
+	| "ACTIVE_PROFILE_INVALID"
+	| "PUBLICATION_FAILED"
+	| "VALIDATION_CLEANUP_FAILED";
+
+const CONFIGURATION_RELOAD_ERROR_MESSAGES: Record<ConfigurationReloadErrorCode, string> = {
+	SESSION_UNAVAILABLE: "Configuration reload is unavailable for this session.",
+	PATH_CHANGED: "Configuration files changed while reload was pending.",
+	SETTINGS_INVALID: "The updated settings configuration is invalid.",
+	MODELS_INVALID: "The updated model catalog is invalid.",
+	MODEL_UNAVAILABLE: "The selected model is unavailable in the updated configuration.",
+	ACTIVE_PROFILE_INVALID: "The active model preset is invalid for the updated configuration.",
+	PUBLICATION_FAILED: "Configuration reload could not be applied.",
+	VALIDATION_CLEANUP_FAILED: "Configuration validation could not release its staged catalog.",
+};
+
+export class ConfigurationReloadError extends Error {
+	readonly code: ConfigurationReloadErrorCode;
+
+	constructor(code: ConfigurationReloadErrorCode, cause?: unknown) {
+		super(CONFIGURATION_RELOAD_ERROR_MESSAGES[code], cause === undefined ? undefined : { cause });
+		this.name = "ConfigurationReloadError";
+		this.code = code;
+	}
+}
+
 /**
  * Fire-and-forget continuations (auto-compaction retries, queued follow-ups) race a
  * still-busy agent whose current turn can legitimately hold the run for minutes.
@@ -2788,6 +2847,8 @@ export class AgentSession {
 	#unavailableModelProfile: string | undefined;
 	#activeProfileInstalledRoles = new Map<string, ModelSelectorValue | undefined>();
 	#activeProfileInstalledAgentOverrides = new Map<string, ModelSelectorValue | undefined>();
+	#activeProfileInstalledRoleValues = new Map<string, ModelSelectorValue>();
+	#activeProfileInstalledAgentOverrideValues = new Map<string, ModelSelectorValue>();
 	#preProfileModel: Model | undefined;
 	#sessionAdmissionQueue: SessionAdmissionEntry[] = [];
 	#activeSessionAdmission: SessionAdmissionEntry | undefined;
@@ -2798,6 +2859,7 @@ export class AgentSession {
 	#successorSessionAdmissionContext = new AsyncLocalStorage<SuccessorSessionAdmission>();
 	#selectionFenceGenerationContext = new AsyncLocalStorage<number>();
 	#selectionFenceTail: Promise<void> = Promise.resolve();
+	#configurationReloadControllers = new Set<AbortController>();
 	#pendingSelectionFences = 0;
 	#selectionAwaitingMutationTransaction: symbol | undefined;
 	#authorizedClosedSelectionTransaction: symbol | undefined;
@@ -4313,6 +4375,9 @@ export class AgentSession {
 				{ code: "busy" },
 			);
 		}
+		if (["new-session", "switch-session", "clear-context", "fork", "branch", "navigate-tree"].includes(kind)) {
+			for (const controller of this.#configurationReloadControllers) controller.abort();
+		}
 		this.#sessionTransitionKind = kind;
 		this.#coordinatorPersistGeneration += 1;
 		this.#wakeFollowUpReservationTransitionWaiters();
@@ -4477,6 +4542,7 @@ export class AgentSession {
 			allowPromptContinuationReentry?: boolean;
 			idleDelivery?: boolean;
 			startupPromptWaiterRelease?: () => void;
+			skipModelRegistryLease?: boolean;
 		},
 	): Promise<T> {
 		const owner = this.#sessionAdmissionContext.getStore();
@@ -4590,11 +4656,13 @@ export class AgentSession {
 					{ code: "busy" },
 				);
 			}
-
 			const release = () => {
 				releaseEntry();
 			};
-			return await this.#sessionAdmissionContext.run(entry, () => body({ release }));
+			const admittedBody = () => this.#sessionAdmissionContext.run(entry, () => body({ release }));
+			return await (options?.skipModelRegistryLease
+				? admittedBody()
+				: this.#modelRegistry.withConsumerLease(admittedBody, signal));
 		} finally {
 			releaseEntry();
 		}
@@ -18318,6 +18386,375 @@ export class AgentSession {
 		this.#userModelSelectionRevision++;
 	}
 
+	getConfigurationPaths(): ConfigHotReloadPaths | undefined {
+		const configPath = this.settings.getGlobalConfigPath();
+		const modelsPath = this.#modelRegistry.getModelsConfigPath();
+		if (!configPath || !modelsPath) return undefined;
+		return {
+			configPath: path.resolve(configPath),
+			modelsPath: path.resolve(modelsPath),
+		};
+	}
+
+	#assertConfigurationReloadAvailable(candidate: ConfigHotReloadCandidate): void {
+		if (this.#sessionAdmissionClosing || this.#sessionAdmissionClosed || this.#isDisposed) {
+			throw new ConfigurationReloadError("SESSION_UNAVAILABLE");
+		}
+		const paths = this.getConfigurationPaths();
+		if (
+			!paths ||
+			path.resolve(candidate.config.path) !== paths.configPath ||
+			path.resolve(candidate.models.path) !== paths.modelsPath
+		) {
+			throw new ConfigurationReloadError(paths ? "PATH_CHANGED" : "SESSION_UNAVAILABLE");
+		}
+	}
+
+	#readOnlyModelsCandidate(candidate: ModelsConfigReloadCandidate): ModelRegistry {
+		const liveRegistry = this.#modelRegistry;
+		return new Proxy(candidate.registry, {
+			get(target, property) {
+				if (property === "getSessionCanonicalVariant") {
+					return liveRegistry.getSessionCanonicalVariant.bind(liveRegistry);
+				}
+				if (
+					property === "clearCanonicalVariant" ||
+					property === "restoreSessionCanonicalVariant" ||
+					property === "seedCanonicalVariant"
+				) {
+					return () => undefined;
+				}
+				const value = Reflect.get(target, property, target);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		}) as ModelRegistry;
+	}
+
+	#settingsCandidateView(candidate: SettingsGlobalConfigCandidate) {
+		return {
+			get: <P extends SettingPath>(settingPath: P) => candidate.get(settingPath),
+			getGlobal: <P extends SettingPath>(settingPath: P) => candidate.getGlobal(settingPath),
+			getOverride: <P extends SettingPath>(settingPath: P) => this.settings.getOverride(settingPath),
+			getStorage: () => this.settings.getStorage(),
+		};
+	}
+
+	async #preflightActiveProfile(
+		settingsCandidate: SettingsGlobalConfigCandidate,
+		modelsCandidate: ModelsConfigReloadCandidate,
+		options?: {
+			prepareSessionModelSelection?: boolean;
+			settingsForApply?: Settings;
+			signal?: AbortSignal;
+		},
+	): Promise<PreparedModelProfileActivation | undefined> {
+		const activeProfile = this.getActiveModelProfile();
+		if (!activeProfile) return undefined;
+		try {
+			return await prepareModelProfileActivation({
+				session: this,
+				modelRegistry: this.#readOnlyModelsCandidate(modelsCandidate),
+				settings: this.#settingsCandidateView(settingsCandidate),
+				...(options?.settingsForApply ? { settingsForApply: options.settingsForApply } : {}),
+				...(options?.prepareSessionModelSelection ? { prepareSessionModelSelection: true } : {}),
+				preserveManualOverrides: true,
+				preserveCanonicalVariant: true,
+				...(options?.signal ? { signal: options.signal } : {}),
+				profileName: activeProfile,
+			});
+		} catch (error) {
+			throw new ConfigurationReloadError("ACTIVE_PROFILE_INVALID", error);
+		}
+	}
+
+	async validateConfiguration(candidate: ConfigHotReloadCandidate): Promise<void> {
+		this.#assertConfigurationReloadAvailable(candidate);
+		let modelsCandidate: ModelsConfigReloadCandidate | undefined;
+		let validationError: ConfigurationReloadError | undefined;
+		try {
+			let settingsCandidate: SettingsGlobalConfigCandidate;
+			try {
+				settingsCandidate = await this.settings.stageGlobalConfigReload(candidate.config);
+			} catch (error) {
+				throw new ConfigurationReloadError("SETTINGS_INVALID", error);
+			}
+			if (!settingsCandidate.diagnostics.valid) throw new ConfigurationReloadError("SETTINGS_INVALID");
+			try {
+				modelsCandidate = await this.#modelRegistry.stageModelsConfigReload(candidate.models, settingsCandidate);
+			} catch (error) {
+				throw new ConfigurationReloadError("MODELS_INVALID", error);
+			}
+			if (!modelsCandidate.valid || !modelsCandidate.diagnostics.valid) {
+				throw new ConfigurationReloadError("MODELS_INVALID");
+			}
+			const prepared = await this.#preflightActiveProfile(settingsCandidate, modelsCandidate);
+			const chain = this.getConfiguredModelChainState("default");
+			if (!prepared || chain?.origin !== "profile-activation" || chain.identity !== this.getActiveModelProfile()) {
+				this.#updatedCurrentModel(modelsCandidate.registry);
+			}
+		} catch (error) {
+			validationError =
+				error instanceof ConfigurationReloadError
+					? error
+					: new ConfigurationReloadError("ACTIVE_PROFILE_INVALID", error);
+		} finally {
+			if (modelsCandidate) {
+				try {
+					modelsCandidate.rollback();
+				} catch (error) {
+					validationError ??= new ConfigurationReloadError("VALIDATION_CLEANUP_FAILED", error);
+				}
+			}
+		}
+		if (validationError) throw validationError;
+	}
+
+	async reloadConfiguration(
+		candidate: ConfigHotReloadCandidate,
+		signal: AbortSignal,
+	): Promise<ConfigurationReloadResult> {
+		const owner = this.#sessionAdmissionContext.getStore();
+		if (owner && !owner.released) throw new ConfigurationReloadError("SESSION_UNAVAILABLE");
+		this.#assertConfigurationReloadAvailable(candidate);
+
+		const transitionAbortController = new AbortController();
+		this.#configurationReloadControllers.add(transitionAbortController);
+		const reloadSignal = AbortSignal.any([
+			signal,
+			this.#disposeAbortController.signal,
+			transitionAbortController.signal,
+		]);
+		const expectedSessionId = this.sessionId;
+		const selectionTransaction = Symbol("configuration-reload");
+		const priorSelectionFence = this.#selectionFenceTail;
+		const selectionFence = Promise.withResolvers<void>();
+		this.#selectionFenceGeneration += 1;
+		this.#pendingSelectionFences += 1;
+		const selectionFenceGeneration = this.#selectionFenceGeneration;
+		if (this.#oldestPendingSelectionFenceGeneration === 0) {
+			this.#oldestPendingSelectionFenceGeneration = selectionFenceGeneration;
+		}
+		this.#selectionFenceTail = priorSelectionFence.then(() => selectionFence.promise);
+		void this.#selectionFenceTail.catch(() => {});
+		let publicationFenceRelease: (() => void) | undefined;
+		let stagedModels: ModelsConfigReloadCandidate | undefined;
+		let modelRollbackAttempted = false;
+		let modelCommitSucceeded = false;
+		try {
+			reloadSignal.throwIfAborted();
+			await awaitPromptInvocationPreflight(priorSelectionFence, reloadSignal);
+			await this.#withSessionAdmission("selection", async () => {}, reloadSignal, undefined, {
+				selectionTransaction,
+				skipModelRegistryLease: true,
+			});
+			if (this.sessionId !== expectedSessionId) throw new Error("Session changed during configuration reload");
+			this.#selectionAwaitingMutationTransaction = selectionTransaction;
+			await awaitPromptInvocationPreflight(this.waitForIdle(selectionFenceGeneration), reloadSignal);
+
+			return await this.#withSessionAdmission(
+				"selection",
+				async () => {
+					reloadSignal.throwIfAborted();
+					if (this.sessionId !== expectedSessionId) {
+						throw new ConfigurationReloadError("SESSION_UNAVAILABLE");
+					}
+					this.#assertConfigurationReloadAvailable(candidate);
+					let stagedSettings: SettingsGlobalConfigCandidate;
+					try {
+						// Stage after admission and idle drain so settings written by the prior turn are rebased.
+						stagedSettings = await this.settings.stageGlobalConfigReload(candidate.config);
+					} catch (error) {
+						throw new ConfigurationReloadError("SETTINGS_INVALID", error);
+					}
+					if (!stagedSettings.diagnostics.valid) throw new ConfigurationReloadError("SETTINGS_INVALID");
+					try {
+						stagedModels = await this.#modelRegistry.stageModelsConfigReload(candidate.models, stagedSettings);
+					} catch (error) {
+						throw new ConfigurationReloadError("MODELS_INVALID", error);
+					}
+					if (!stagedModels.valid || !stagedModels.diagnostics.valid) {
+						throw new ConfigurationReloadError("MODELS_INVALID");
+					}
+					reloadSignal.throwIfAborted();
+
+					const changedSettings = (Object.keys(SETTINGS_SCHEMA) as SettingPath[]).filter(
+						settingPath =>
+							!util.isDeepStrictEqual(this.settings.get(settingPath), stagedSettings.get(settingPath)) ||
+							!util.isDeepStrictEqual(
+								this.settings.getGlobal(settingPath),
+								stagedSettings.getGlobal(settingPath),
+							),
+					);
+					let prepared: PreparedModelProfileActivation | undefined;
+					let preparedLiveModelSelection: PreparedProfileModelSelection | undefined;
+					let preserveDefaultModelSelection = true;
+					const activeProfile = this.getActiveModelProfile();
+					if (activeProfile) {
+						prepared = await this.#preflightActiveProfile(stagedSettings, stagedModels, {
+							prepareSessionModelSelection: true,
+							signal: reloadSignal,
+							settingsForApply: this.settings,
+						});
+						const previousChain = prepared!.previousDefaultChainState;
+						const profileOwnsDefaultChain =
+							previousChain?.origin === "profile-activation" && previousChain.identity === activeProfile;
+						const chainIsUnchanged =
+							prepared!.defaultChain.length === (previousChain?.entries.length ?? 0) &&
+							prepared!.defaultChain.every((selector, index) => selector === previousChain?.entries[index]);
+						preserveDefaultModelSelection =
+							prepared!.defaultChain.length === 0 || !profileOwnsDefaultChain || chainIsUnchanged;
+					}
+					if (preserveDefaultModelSelection && this.#currentModelConfigurationChanged(stagedModels.registry)) {
+						const updatedModel = this.#updatedCurrentModel(stagedModels.registry);
+						if (updatedModel) {
+							preparedLiveModelSelection = await this.prepareModelSelectionForProfileActivation(
+								updatedModel,
+								this.thinkingLevel,
+								reloadSignal,
+							);
+						}
+					}
+					reloadSignal.throwIfAborted();
+					publicationFenceRelease = await this.#modelRegistry.acquirePublicationFence(reloadSignal);
+					reloadSignal.throwIfAborted();
+					const modelsChanged = stagedModels.changed;
+					const settingsChanged = changedSettings.length > 0;
+					if (!settingsChanged && !modelsChanged) {
+						stagedModels!.rollback();
+						modelRollbackAttempted = true;
+						return { applied: false, settingsChanged: false, modelsChanged: false, changedSettings: [] };
+					}
+
+					let publication: SettingsConfigReloadPublication | undefined;
+					let modelCommitStarted = false;
+					let activationPublicationStarted = false;
+					let liveModelSelectionCommitted = false;
+					try {
+						publication = this.settings.publishGlobalConfigReload(stagedSettings, () => {
+							modelCommitStarted = true;
+							stagedModels!.commit();
+							if (prepared) {
+								activationPublicationStarted = true;
+								publishPreparedModelProfileActivation(prepared, { preserveDefaultModelSelection });
+							}
+							if (preparedLiveModelSelection) {
+								liveModelSelectionCommitted = true;
+								this.commitPreparedProfileModelSelection(preparedLiveModelSelection);
+							}
+						});
+						stagedModels.finalize();
+						publication.finalize();
+						modelCommitSucceeded = true;
+					} catch (error) {
+						const rollbackErrors: unknown[] = [];
+						try {
+							publication?.rollback();
+						} catch (rollbackError) {
+							rollbackErrors.push(rollbackError);
+						}
+						if (prepared && activationPublicationStarted) {
+							try {
+								await rollbackPreparedModelProfileActivation(prepared, { preserveDefaultModelSelection });
+							} catch (rollbackError) {
+								rollbackErrors.push(rollbackError);
+							}
+						}
+						if (liveModelSelectionCommitted && preparedLiveModelSelection) {
+							try {
+								await this.restoreModelSelectionForRollback(
+									preparedLiveModelSelection.previousModel,
+									preparedLiveModelSelection.previousThinkingLevel,
+								);
+							} catch (rollbackError) {
+								rollbackErrors.push(rollbackError);
+							}
+						}
+						if (modelCommitStarted) {
+							try {
+								stagedModels!.rollback();
+							} catch (rollbackError) {
+								rollbackErrors.push(rollbackError);
+							} finally {
+								modelRollbackAttempted = true;
+							}
+						}
+						if (rollbackErrors.length > 0) {
+							throw new ConfigurationReloadError(
+								"PUBLICATION_FAILED",
+								new AggregateError([error, ...rollbackErrors]),
+							);
+						}
+						throw new ConfigurationReloadError("PUBLICATION_FAILED", error);
+					} finally {
+						publicationFenceRelease?.();
+						publicationFenceRelease = undefined;
+					}
+					if (prepared) {
+						await this.#modelRegistry.withConsumerLease(async () => {
+							await finishPreparedModelProfileActivation(prepared);
+						});
+					}
+					if (preparedLiveModelSelection) {
+						try {
+							await this.finishPreparedProfileModelSelection(preparedLiveModelSelection);
+						} catch (error) {
+							logger.warn("Failed to refresh session tools after model catalog reload", {
+								error: error instanceof Error ? error.message : String(error),
+							});
+						}
+					}
+					return {
+						applied: true,
+						settingsChanged,
+						modelsChanged,
+						changedSettings,
+					};
+				},
+				reloadSignal,
+				undefined,
+				{ selectionTransaction, skipModelRegistryLease: true },
+			);
+		} catch (error) {
+			if (stagedModels && !modelRollbackAttempted && !modelCommitSucceeded) {
+				try {
+					stagedModels.rollback();
+				} catch (rollbackError) {
+					throw new ConfigurationReloadError("PUBLICATION_FAILED", new AggregateError([error, rollbackError]));
+				}
+			}
+			if (error instanceof ConfigurationReloadError) throw error;
+			throw new ConfigurationReloadError("PUBLICATION_FAILED", error);
+		} finally {
+			publicationFenceRelease?.();
+			if (this.#selectionAwaitingMutationTransaction === selectionTransaction) {
+				this.#selectionAwaitingMutationTransaction = undefined;
+			}
+			selectionFence.resolve();
+			this.#pendingSelectionFences -= 1;
+			if (this.#oldestPendingSelectionFenceGeneration === selectionFenceGeneration) {
+				this.#oldestPendingSelectionFenceGeneration = 0;
+			}
+			this.#configurationReloadControllers.delete(transitionAbortController);
+			this.#resolveSessionSettlement();
+		}
+	}
+
+	#updatedCurrentModel(registry: ModelRegistry): Model | undefined {
+		const current = this.model;
+		if (!current) return undefined;
+		const updated = registry
+			.getAvailable()
+			.find(model => model.provider === current.provider && model.id === current.id);
+		if (!updated) throw new ConfigurationReloadError("MODEL_UNAVAILABLE");
+		return updated;
+	}
+
+	#currentModelConfigurationChanged(registry: ModelRegistry): boolean {
+		const current = this.model;
+		const updated = this.#updatedCurrentModel(registry);
+		return current !== undefined && updated !== undefined && !util.isDeepStrictEqual(current, updated);
+	}
+
 	/**
 	 * Re-apply vendor-separated delegation after a profile activation changed the
 	 * role layer. `eagerTasks` is resolved at prompt build time, but under
@@ -18411,10 +18848,28 @@ export class AgentSession {
 			const modelRoles = { ...this.settings.get("modelRoles") };
 			const agentOverrides = { ...this.settings.get("task.agentModelOverrides") };
 			for (const [role, baseline] of this.#activeProfileInstalledRoles) {
+				const installed = this.#activeProfileInstalledRoleValues.get(role);
+				if (
+					installed !== undefined &&
+					!util.isDeepStrictEqual(
+						normalizeModelSelectorValue(modelRoles[role]),
+						normalizeModelSelectorValue(installed),
+					)
+				)
+					continue;
 				if (role === "default" || baseline === undefined) delete modelRoles[role];
 				else modelRoles[role] = baseline;
 			}
 			for (const [role, baseline] of this.#activeProfileInstalledAgentOverrides) {
+				const installed = this.#activeProfileInstalledAgentOverrideValues.get(role);
+				if (
+					installed !== undefined &&
+					!util.isDeepStrictEqual(
+						normalizeModelSelectorValue(agentOverrides[role]),
+						normalizeModelSelectorValue(installed),
+					)
+				)
+					continue;
 				if (baseline === undefined) delete agentOverrides[role];
 				else agentOverrides[role] = baseline;
 			}
@@ -18422,6 +18877,8 @@ export class AgentSession {
 			this.settings.override("task.agentModelOverrides", agentOverrides);
 			this.#activeProfileInstalledRoles.clear();
 			this.#activeProfileInstalledAgentOverrides.clear();
+			this.#activeProfileInstalledRoleValues.clear();
+			this.#activeProfileInstalledAgentOverrideValues.clear();
 		}
 		if (hadInstalledKeys || this.getActiveModelProfile() !== undefined) {
 			this.#modelRegistry.reapplyConfiguredModelBindings(this.settings);
@@ -18439,31 +18896,100 @@ export class AgentSession {
 		modelRoles: readonly string[],
 		agentModelOverrides: readonly string[],
 		preProfileModel: Model | undefined,
+		baseline?: {
+			modelRoles: Readonly<Record<string, ModelSelectorValue>>;
+			agentModelOverrides: Readonly<Record<string, ModelSelectorValue>>;
+		},
+		installed?: {
+			modelRoles: Readonly<Record<string, ModelSelectorValue>>;
+			agentModelOverrides: Readonly<Record<string, ModelSelectorValue>>;
+		},
 	): void {
 		const bindings = this.#modelRegistry.getConfiguredModelBindings?.();
 		if (this.#preProfileModel === undefined) this.#preProfileModel = preProfileModel;
+		const modelRoleSet = new Set(modelRoles);
+		const agentOverrideSet = new Set(agentModelOverrides);
+		for (const role of this.#activeProfileInstalledRoles.keys()) {
+			if (!modelRoleSet.has(role)) {
+				this.#activeProfileInstalledRoles.delete(role);
+				this.#activeProfileInstalledRoleValues.delete(role);
+			}
+		}
+		for (const role of this.#activeProfileInstalledAgentOverrides.keys()) {
+			if (!agentOverrideSet.has(role)) {
+				this.#activeProfileInstalledAgentOverrides.delete(role);
+				this.#activeProfileInstalledAgentOverrideValues.delete(role);
+			}
+		}
 		for (const role of modelRoles) {
-			if (this.#activeProfileInstalledRoles.has(role)) continue;
-			const bindingValue = bindings?.modelRoles?.[role];
-			this.#activeProfileInstalledRoles.set(
-				role,
-				bindingValue ?? this.settings.getGlobal("modelRoles")?.[role as never],
-			);
+			if (!this.#activeProfileInstalledRoles.has(role)) {
+				const bindingValue = bindings?.modelRoles?.[role];
+				this.#activeProfileInstalledRoles.set(
+					role,
+					baseline
+						? Object.hasOwn(baseline.modelRoles, role)
+							? baseline.modelRoles[role]
+							: undefined
+						: (bindingValue ?? this.settings.getGlobal("modelRoles")?.[role as never]),
+				);
+			}
+			const installedValue = installed?.modelRoles[role] ?? this.settings.get("modelRoles")[role];
+			if (installedValue !== undefined) this.#activeProfileInstalledRoleValues.set(role, installedValue);
 		}
 		for (const role of agentModelOverrides) {
-			if (this.#activeProfileInstalledAgentOverrides.has(role)) continue;
-			const bindingValue = bindings?.agentModelOverrides?.[role];
-			this.#activeProfileInstalledAgentOverrides.set(
-				role,
-				bindingValue ?? this.settings.getGlobal("task.agentModelOverrides")?.[role as never],
-			);
+			if (!this.#activeProfileInstalledAgentOverrides.has(role)) {
+				const bindingValue = bindings?.agentModelOverrides?.[role];
+				this.#activeProfileInstalledAgentOverrides.set(
+					role,
+					baseline
+						? Object.hasOwn(baseline.agentModelOverrides, role)
+							? baseline.agentModelOverrides[role]
+							: undefined
+						: (bindingValue ?? this.settings.getGlobal("task.agentModelOverrides")?.[role as never]),
+				);
+			}
+			const installedValue =
+				installed?.agentModelOverrides[role] ?? this.settings.get("task.agentModelOverrides")[role];
+			if (installedValue !== undefined) this.#activeProfileInstalledAgentOverrideValues.set(role, installedValue);
 		}
+	}
+
+	getProfileInstalledOverrideState(): {
+		modelRoles: ReadonlyMap<string, ModelSelectorValue | undefined>;
+		agentModelOverrides: ReadonlyMap<string, ModelSelectorValue | undefined>;
+		installedModelRoles: ReadonlyMap<string, ModelSelectorValue>;
+		installedAgentModelOverrides: ReadonlyMap<string, ModelSelectorValue>;
+		preProfileModel: Model | undefined;
+	} {
+		return {
+			modelRoles: new Map(this.#activeProfileInstalledRoles),
+			agentModelOverrides: new Map(this.#activeProfileInstalledAgentOverrides),
+			installedModelRoles: new Map(this.#activeProfileInstalledRoleValues),
+			installedAgentModelOverrides: new Map(this.#activeProfileInstalledAgentOverrideValues),
+			preProfileModel: this.#preProfileModel,
+		};
+	}
+
+	restoreProfileInstalledOverrideState(state: {
+		modelRoles: ReadonlyMap<string, ModelSelectorValue | undefined>;
+		agentModelOverrides: ReadonlyMap<string, ModelSelectorValue | undefined>;
+		installedModelRoles: ReadonlyMap<string, ModelSelectorValue>;
+		installedAgentModelOverrides: ReadonlyMap<string, ModelSelectorValue>;
+		preProfileModel: Model | undefined;
+	}): void {
+		this.#activeProfileInstalledRoles = new Map(state.modelRoles);
+		this.#activeProfileInstalledAgentOverrides = new Map(state.agentModelOverrides);
+		this.#activeProfileInstalledRoleValues = new Map(state.installedModelRoles);
+		this.#activeProfileInstalledAgentOverrideValues = new Map(state.installedAgentModelOverrides);
+		this.#preProfileModel = state.preProfileModel;
 	}
 
 	/** Drop the recorded profile-installed override keys after materialization. */
 	clearProfileInstalledOverrides(): void {
 		this.#activeProfileInstalledRoles.clear();
 		this.#activeProfileInstalledAgentOverrides.clear();
+		this.#activeProfileInstalledRoleValues.clear();
+		this.#activeProfileInstalledAgentOverrideValues.clear();
 	}
 
 	/** Current profile-installed override keys, for deriving the activation base. */
@@ -18894,6 +19420,48 @@ export class AgentSession {
 			throw error;
 		}
 		return scope;
+	}
+
+	async prepareModelSelectionForProfileActivation(
+		model: Model,
+		thinkingLevel: ThinkingLevel | undefined,
+		signal?: AbortSignal,
+	): Promise<PreparedProfileModelSelection> {
+		signal?.throwIfAborted();
+		const sessionId = this.sessionId;
+		const previousModel = this.model;
+		const previousThinkingLevel = this.thinkingLevel;
+		const previousEditMode = this.#resolveActiveEditMode();
+		if (this.sessionId !== sessionId) throw new Error("Session changed while preparing profile model selection");
+		return {
+			sessionId,
+			model,
+			thinkingLevel,
+			previousModel,
+			previousThinkingLevel,
+			previousEditMode,
+			signal,
+		};
+	}
+
+	commitPreparedProfileModelSelection(prepared: PreparedProfileModelSelection): void {
+		prepared.signal?.throwIfAborted();
+		if (
+			this.sessionId !== prepared.sessionId ||
+			this.model !== prepared.previousModel ||
+			this.thinkingLevel !== prepared.previousThinkingLevel
+		) {
+			throw new Error("Session model changed while preparing profile activation");
+		}
+		this.#setModelAuthoritatively(prepared.model, "profile-activation");
+		this.#syncAppendOnlyContext(prepared.model);
+		this.sessionManager.appendModelChange(`${prepared.model.provider}/${prepared.model.id}`, "temporary");
+		this.settings.getStorage()?.recordModelUsage(`${prepared.model.provider}/${prepared.model.id}`);
+		this.setThinkingLevel(prepared.thinkingLevel ?? prepared.model.thinking?.defaultLevel ?? this.thinkingLevel);
+	}
+
+	finishPreparedProfileModelSelection(prepared: PreparedProfileModelSelection): Promise<void> {
+		return this.#syncEditToolModeAfterModelChange(prepared.previousEditMode);
 	}
 
 	/** Restore the exact live-model state captured before a failed selector transaction. */
@@ -26763,6 +27331,10 @@ export class AgentSession {
 			);
 			const previousActiveProfileInstalledRoles = new Map(this.#activeProfileInstalledRoles);
 			const previousActiveProfileInstalledAgentOverrides = new Map(this.#activeProfileInstalledAgentOverrides);
+			const previousActiveProfileInstalledRoleValues = new Map(this.#activeProfileInstalledRoleValues);
+			const previousActiveProfileInstalledAgentOverrideValues = new Map(
+				this.#activeProfileInstalledAgentOverrideValues,
+			);
 			const previousPreProfileModel = this.#preProfileModel;
 			const previousServiceTier = this.agent.serviceTier;
 			const previousSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
@@ -27193,6 +27765,10 @@ export class AgentSession {
 				else this.settings.override("task.agentModelOverrides", previousAgentModelOverridesOverride);
 				this.#activeProfileInstalledRoles = new Map(previousActiveProfileInstalledRoles);
 				this.#activeProfileInstalledAgentOverrides = new Map(previousActiveProfileInstalledAgentOverrides);
+				this.#activeProfileInstalledRoleValues = new Map(previousActiveProfileInstalledRoleValues);
+				this.#activeProfileInstalledAgentOverrideValues = new Map(
+					previousActiveProfileInstalledAgentOverrideValues,
+				);
 				this.#preProfileModel = previousPreProfileModel;
 				this.#activeModelProfile = previousActiveModelProfile;
 				this.#restoreWorkflowGateEmitter(suspendedWorkflowGateEmitter);

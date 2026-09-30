@@ -1116,7 +1116,10 @@ describe("Settings", () => {
 
 			await Bun.write(getConfigPath(), "configSchemaVersion: 2\ndisplay:\n  tabWidth: not-a-number\n");
 			await expect(stageConfigReload(settings)).rejects.toMatchObject({
-				diagnostics: { valid: false, issues: [expect.objectContaining({ path: "display.tabWidth", kind: "invalid" })] },
+				diagnostics: {
+					valid: false,
+					issues: [expect.objectContaining({ path: "display.tabWidth", kind: "invalid" })],
+				},
 			});
 			expect(settings.get("display.tabWidth")).toBe(3);
 
@@ -1266,7 +1269,10 @@ describe("Settings", () => {
 		await writeSettings({ configSchemaVersion: 2, display: { tabWidth: 3 }, theme: { dark: "red-claw" } });
 		const settings = await Settings.loadReadonly({ cwd: projectDir, agentDir });
 		try {
-			await Bun.write(getConfigPath(), "configSchemaVersion: 2\ndisplay:\n  tabWidth: 7\ntheme:\n  dark: red-claw\n");
+			await Bun.write(
+				getConfigPath(),
+				"configSchemaVersion: 2\ndisplay:\n  tabWidth: 7\ntheme:\n  dark: red-claw\n",
+			);
 			const candidate = await stageConfigReload(settings);
 			settings.override("theme.dark", "blue-crab");
 
