@@ -254,11 +254,10 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 			const mediaType = contentType.split(";", 1)[0]?.trim().toLowerCase() ?? "";
 			if (mediaType !== "application/vnd.amazon.eventstream") {
 				const errBody = await readBodyPrefix(response);
-				// Deliberately no HTTP status metadata, and no "HTTP <code>" wording that the
-				// message-based status parser would pick up: a 2xx protocol mismatch is
-				// deterministic, and a status would materialize transport-failure facts that
-				// session fallback retries.
-				throw new Error(
+				// Deliberately no HTTP status metadata and no "HTTP <code>" wording: a 2xx
+				// protocol mismatch is deterministic, and a status would materialize
+				// transport-failure facts that session fallback retries.
+				throw new KiroNonEventStreamError(
 					sanitizeKiroError(
 						`Kiro CodeWhisperer returned a non-eventstream ${response.status} response (${contentType}): ${errBody}`,
 						bearerToken,
@@ -365,7 +364,8 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 				delete (block as Block).partialJson;
 			}
 			output.stopReason = options.signal?.aborted ? "aborted" : "error";
-			output.errorStatus = extractHttpStatusFromError(error);
+			// The non-eventstream diagnostic embeds untrusted body text; never parse a status out of it.
+			output.errorStatus = error instanceof KiroNonEventStreamError ? undefined : extractHttpStatusFromError(error);
 			output.transportFailure = transportFailureFacts(error);
 			const baseMessage = error instanceof Error ? error.message : JSON.stringify(error);
 			output.errorMessage = baseMessage;
@@ -619,6 +619,11 @@ function handleToolUseEvent(
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/** A 2xx response that is not an AWS event stream: a deterministic protocol error, never a transport failure. */
+class KiroNonEventStreamError extends Error {
+	override name = "KiroNonEventStreamError";
+}
 
 /** Byte cap for diagnostic error bodies; the rest of the stream is cancelled unread. */
 const ERROR_BODY_PREFIX_BYTES = 4096;

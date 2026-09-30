@@ -219,6 +219,19 @@ describe("Kiro CodeWhisperer OAuth endpoint #6002", () => {
 		expect(errorMessage).not.toContain("secret-bearer");
 	});
 
+	test("does not parse a status out of status-like body text in a non-eventstream 200", async () => {
+		const error = await streamError(
+			new Response("Error: 401 Invalid API key (HTTP 503)", {
+				status: 200,
+				headers: { "content-type": "text/plain" },
+			}),
+		);
+
+		expect(error?.errorMessage).toContain("401 Invalid API key");
+		expect(error?.errorStatus).toBeUndefined();
+		expect(error?.transportFailure).toBeUndefined();
+	});
+
 	test("redacts an echoed bearer credential from a non-eventstream 200 body", async () => {
 		const errorMessage = await streamErrorMessage(
 			new Response("echo: Authorization: Bearer secret-bearer; raw=secret-bearer", {
