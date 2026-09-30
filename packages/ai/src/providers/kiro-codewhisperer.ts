@@ -250,7 +250,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 			// Verify content-type is eventstream; if not, read and report the actual error
 			const contentType = response.headers.get("content-type") ?? "";
 			const mediaType = contentType.split(";", 1)[0]?.trim().toLowerCase() ?? "";
-			if (mediaType !== "application/vnd.amazon.eventstream") {
+			if (!response.body || mediaType !== "application/vnd.amazon.eventstream") {
 				const errBody = await readBodyPrefix(response);
 				// Deliberately no HTTP status metadata and no "HTTP <code>" wording: a 2xx
 				// protocol mismatch is deterministic, and a status would materialize
@@ -262,8 +262,6 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 					),
 				);
 			}
-
-			if (!response.body) throw new Error("Kiro CodeWhisperer response has no body");
 
 			// Decode eventstream
 			for await (const message of decodeEventStream(response.body)) {

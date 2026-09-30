@@ -243,6 +243,16 @@ describe("Kiro CodeWhisperer OAuth endpoint #6002", () => {
 		expect(error?.transportFailure).toBeUndefined();
 	});
 
+	test("classifies a bodyless 2xx labeled as eventstream as a terminal protocol mismatch", async () => {
+		const error = await streamError(
+			new Response(null, { status: 204, headers: { "content-type": "application/vnd.amazon.eventstream" } }),
+		);
+
+		expect(error?.errorMessage).toContain("non-eventstream 204 response");
+		expect(error?.errorCode).toBe(PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE);
+		expect(error?.errorStatus).toBeUndefined();
+	});
+
 	test("redacts an echoed bearer credential from a non-eventstream 200 body", async () => {
 		const errorMessage = await streamErrorMessage(
 			new Response("echo: Authorization: Bearer secret-bearer; raw=secret-bearer", {
