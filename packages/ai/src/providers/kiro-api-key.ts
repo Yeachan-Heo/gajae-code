@@ -7,6 +7,11 @@
  */
 import { $env } from "@gajae-code/utils";
 import { assertAwsRegionLabel } from "../adapter-internals/aws-region";
+import {
+	isProviderSafetyStopAdapterInvocation,
+	mintProviderSafetyStop,
+	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+} from "../adapter-internals/provider-safety-stop";
 import { Effort } from "../model-thinking";
 import type {
 	Api,
@@ -345,6 +350,10 @@ type KiroStreamEvent =
 	| { type: "toolUseInput"; data: { input: string } }
 	| { type: "toolUseStop"; data: { stop: boolean } }
 	| { type: "usage"; data: { inputTokens?: number; outputTokens?: number } }
+	| {
+			type: "refusal";
+			data: { stopReason?: string; stopDetails?: { refusal?: { category?: string; explanation?: string } } };
+	  }
 	| { type: "error"; data: { error: string; message?: string } };
 
 const EVENT_PATTERNS = [
@@ -355,6 +364,8 @@ const EVENT_PATTERNS = [
 	'{"contextUsagePercentage":',
 	'{"usage":',
 	'{"toolUseId":',
+	'{"stopReason":',
+	'{"stopDetails":',
 	'{"error":',
 	'{"Error":',
 ];
@@ -425,6 +436,17 @@ export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[];
 			} else if (parsed.usage && typeof parsed.usage === "object") {
 				const u = parsed.usage as { inputTokens?: number; outputTokens?: number };
 				events.push({ type: "usage", data: u });
+			} else if (parsed.stopReason || parsed.stopDetails) {
+				// Refusal or terminal metadata event
+				events.push({
+					type: "refusal",
+					data: {
+						stopReason: parsed.stopReason as string | undefined,
+						stopDetails: parsed.stopDetails as
+							| { refusal?: { category?: string; explanation?: string } }
+							| undefined,
+					},
+				});
 			} else if (parsed.error || parsed.Error) {
 				events.push({
 					type: "error",
@@ -666,43 +688,50 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				};
 				const index = blocks.length;
 				blocks.push({ ...toolCall, index });
-				stream.push({ type: "toolcall_start", contentIndex: index, partial: output });
-				stream.push({ type: "toolcall_delta", contentIndex: index, delta: args, partial: output });
-				stream.push({ type: "toolcall_end", contentIndex: index, toolCall, partial: output });
 				currentTool = undefined;
 			};
 
-			const emitText = (delta: string) => {
+			const appendText = (delta: string) => {
 				if (thinkingIndex !== undefined) {
-					stream.push({
-						type: "thinking_end",
-						contentIndex: thinkingIndex,
-						content: "",
-						partial: output,
-					});
 					thinkingIndex = undefined;
 				}
 				if (textIndex === undefined) {
 					textIndex = blocks.length;
 					blocks.push({ type: "text", text: "", index: textIndex });
-					stream.push({ type: "text_start", contentIndex: textIndex, partial: output });
 				}
 				const block = blocks[textIndex] as TextContent;
 				block.text += delta;
-				stream.push({ type: "text_delta", contentIndex: textIndex, delta, partial: output });
 			};
 
-			const emitThinking = (delta: string) => {
+			const appendThinking = (delta: string) => {
 				if (thinkingIndex === undefined) {
 					thinkingIndex = blocks.length;
 					blocks.push({ type: "thinking", thinking: "", index: thinkingIndex } as ThinkingContent & {
 						index: number;
 					});
-					stream.push({ type: "thinking_start", contentIndex: thinkingIndex, partial: output });
 				}
 				const block = blocks[thinkingIndex] as ThinkingContent;
 				block.thinking += delta;
-				stream.push({ type: "thinking_delta", contentIndex: thinkingIndex, delta, partial: output });
+			};
+
+			const emitBlocksToStream = () => {
+				for (let i = 0; i < blocks.length; i++) {
+					const block = blocks[i];
+					if (block.type === "thinking") {
+						stream.push({ type: "thinking_start", contentIndex: i, partial: output });
+						stream.push({ type: "thinking_delta", contentIndex: i, delta: block.thinking, partial: output });
+						stream.push({ type: "thinking_end", contentIndex: i, content: block.thinking, partial: output });
+					} else if (block.type === "text") {
+						stream.push({ type: "text_start", contentIndex: i, partial: output });
+						stream.push({ type: "text_delta", contentIndex: i, delta: block.text, partial: output });
+						stream.push({ type: "text_end", contentIndex: i, content: block.text, partial: output });
+					} else if (block.type === "toolCall") {
+						stream.push({ type: "toolcall_start", contentIndex: i, partial: output });
+						const args = JSON.stringify(block.arguments ?? {});
+						stream.push({ type: "toolcall_delta", contentIndex: i, delta: args, partial: output });
+						stream.push({ type: "toolcall_end", contentIndex: i, toolCall: block, partial: output });
+					}
+				}
 			};
 
 			let inThink = false;
@@ -714,76 +743,117 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						const start = thinkBuf.indexOf("<thinking>");
 						if (start < 0) {
 							if (thinkBuf) {
-								emitText(thinkBuf);
+								appendText(thinkBuf);
 								thinkBuf = "";
 							}
 							return;
 						}
-						if (start > 0) emitText(thinkBuf.slice(0, start));
+						if (start > 0) appendText(thinkBuf.slice(0, start));
 						thinkBuf = thinkBuf.slice(start + "<thinking>".length);
 						inThink = true;
 					} else {
 						const end = thinkBuf.indexOf("</thinking>");
 						if (end < 0) {
 							if (thinkBuf) {
-								emitThinking(thinkBuf);
+								appendThinking(thinkBuf);
 								thinkBuf = "";
 							}
 							return;
 						}
-						if (end > 0) emitThinking(thinkBuf.slice(0, end));
+						if (end > 0) appendThinking(thinkBuf.slice(0, end));
 						thinkBuf = thinkBuf.slice(end + "</thinking>".length);
 						inThink = false;
-						if (thinkingIndex !== undefined) {
-							stream.push({
-								type: "thinking_end",
-								contentIndex: thinkingIndex,
-								content: "",
-								partial: output,
-							});
-							thinkingIndex = undefined;
-						}
 					}
 				}
 			};
 
+			// Collect all events from the stream
+			const allEvents: KiroStreamEvent[] = [];
 			while (true) {
 				const { done, value } = await reader.read();
 				if (done) break;
 				buffer += decoder.decode(value, { stream: true });
 				const { events, remaining } = parseKiroApiEvents(buffer);
 				buffer = remaining;
-				for (const event of events) {
-					if (event.type === "content") {
-						if (event.data === lastContent) continue;
-						lastContent = event.data;
-						consumeContent(event.data);
-					} else if (event.type === "toolUse") {
-						if (currentTool && currentTool.id !== event.data.toolUseId) flushTool();
-						if (!currentTool) {
-							currentTool = { id: event.data.toolUseId, name: event.data.name, input: event.data.input };
-						} else {
-							currentTool.input += event.data.input;
-						}
-						if (event.data.stop) flushTool();
-					} else if (event.type === "toolUseInput" && currentTool) {
+				allEvents.push(...events);
+			}
+
+			// Check for refusal event
+			const refusalEventIndex = allEvents.findIndex(e => e.type === "refusal" && e.data.stopDetails?.refusal);
+
+			// Process events and build blocks (without streaming yet)
+			const eventsToProcess = refusalEventIndex >= 0 ? allEvents.slice(0, refusalEventIndex + 1) : allEvents;
+
+			for (const event of eventsToProcess) {
+				if (event.type === "content") {
+					if (event.data === lastContent) continue;
+					lastContent = event.data;
+					consumeContent(event.data);
+				} else if (event.type === "toolUse") {
+					if (currentTool && currentTool.id !== event.data.toolUseId) flushTool();
+					if (!currentTool) {
+						currentTool = { id: event.data.toolUseId, name: event.data.name, input: event.data.input };
+					} else {
 						currentTool.input += event.data.input;
-					} else if (event.type === "toolUseStop" && event.data.stop) {
-						flushTool();
-					} else if (event.type === "usage") {
-						if (event.data.inputTokens !== undefined) output.usage.input = event.data.inputTokens;
-						if (event.data.outputTokens !== undefined) output.usage.output = event.data.outputTokens;
-						output.usage.totalTokens = output.usage.input + output.usage.output;
-					} else if (event.type === "error") {
-						throw new Error(sanitizeKiroError(`${event.data.error}: ${event.data.message ?? ""}`, apiKey));
 					}
+					if (event.data.stop) flushTool();
+				} else if (event.type === "toolUseInput" && currentTool) {
+					currentTool.input += event.data.input;
+				} else if (event.type === "toolUseStop" && event.data.stop) {
+					flushTool();
+				} else if (event.type === "usage") {
+					if (event.data.inputTokens !== undefined) output.usage.input = event.data.inputTokens;
+					if (event.data.outputTokens !== undefined) output.usage.output = event.data.outputTokens;
+					output.usage.totalTokens = output.usage.input + output.usage.output;
+				} else if (event.type === "refusal") {
+					const refusalData = event.data as {
+						stopReason?: string;
+						stopDetails?: { refusal?: { category?: string; explanation?: string } };
+					};
+					if (refusalData.stopDetails?.refusal) {
+						// Handle refusal - clear accumulated blocks and emit error
+						consumeContent(""); // Flush any pending thinking
+						flushTool();
+
+						const refusal = refusalData.stopDetails.refusal;
+						const category = refusal.category;
+						const explanation = refusal.explanation?.trim();
+						const label = category ? `Kiro refused the request (${category})` : "Kiro refused the request";
+
+						output.stopReason = "error";
+						output.errorMessage = explanation ? `${label}: ${explanation}` : label;
+						output.content = [];
+
+						// Mint provider safety stop
+						const adapterInvocation = isProviderSafetyStopAdapterInvocation(options);
+						const useRefusalSignal = category || "refusal";
+						const authenticated = mintProviderSafetyStop(
+							output,
+							useRefusalSignal,
+							PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+							options?.fetch,
+							adapterInvocation,
+						);
+
+						if (!authenticated) {
+							output.transportFailure = {
+								kind: "transport",
+								status: 500,
+								providerCode: "untrusted_safety_stop",
+							};
+						}
+
+						stream.push({ type: "error", reason: "error", error: output });
+						stream.end();
+						return;
+					}
+				} else if (event.type === "error") {
+					throw new Error(sanitizeKiroError(`${event.data.error}: ${event.data.message ?? ""}`, apiKey));
 				}
 			}
-			flushTool();
-			if (textIndex !== undefined) {
-				const block = blocks[textIndex] as TextContent;
-				stream.push({ type: "text_end", contentIndex: textIndex, content: block.text, partial: output });
-			}
+
+			// If we reach here without a refusal, emit all blocks to stream
+			emitBlocksToStream();
 			const hasText = blocks.some(b => b.type === "text" && b.text.length > 0);
 			const hasTools = blocks.some(b => b.type === "toolCall");
 			if (!hasText && !hasTools) {

@@ -12,6 +12,11 @@
  */
 import { $credentialEnv, $env, extractHttpStatusFromError } from "@gajae-code/utils";
 import { assertAwsRegionLabel } from "../adapter-internals/aws-region";
+import {
+	isProviderSafetyStopAdapterInvocation,
+	mintProviderSafetyStop,
+	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+} from "../adapter-internals/provider-safety-stop";
 import type { Effort } from "../model-thinking";
 import type {
 	Api,
@@ -122,6 +127,16 @@ interface ToolUseEventPayload {
 	};
 }
 
+interface MetadataEvent {
+	stopReason?: string;
+	stopDetails?: {
+		refusal?: {
+			category?: string;
+			explanation?: string;
+		};
+	};
+}
+
 interface MessageMetadataEvent {
 	messageMetadataEvent?: {
 		conversationId?: string;
@@ -156,6 +171,49 @@ const DEFAULT_REGION = "us-east-1";
 const KIRO_ORIGIN = "AI_EDITOR";
 
 type Block = (TextContent | ToolCall) & { index?: number; partialJson?: string };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Refusal handling (shared between bearer token and API-key paths)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function handleKiroRefusal(
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+	_model: Model<Api>,
+	refusal: { category?: string; explanation?: string } | undefined,
+	options?: KiroCodeWhispererOptions,
+): boolean {
+	const category = refusal?.category;
+	const explanation = refusal?.explanation?.trim();
+	const label = category ? `Kiro refused the request (${category})` : "Kiro refused the request";
+
+	output.stopReason = "error";
+	output.errorMessage = explanation ? `${label}: ${explanation}` : label;
+	output.content = [];
+
+	// Attempt to mint provider safety stop for structured refusal
+	const adapterInvocation = isProviderSafetyStopAdapterInvocation(options);
+	const useRefusalSignal = category || "refusal";
+	const authenticated = mintProviderSafetyStop(
+		output,
+		useRefusalSignal,
+		PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+		options?.fetch,
+		adapterInvocation,
+	);
+
+	if (!authenticated) {
+		// If the refusal signal is not recognized, fall back to error transport failure
+		output.transportFailure = {
+			kind: "transport",
+			status: 500,
+			providerCode: "untrusted_safety_stop",
+		};
+	}
+
+	stream.push({ type: "error", reason: "error", error: output });
+	return true;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Stream function
@@ -326,24 +384,26 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 						handleToolUseEvent(ev, blocks, output, stream);
 						break;
 					}
+					case "metadataEvent": {
+						const ev = payload as MetadataEvent;
+						if (ev.stopDetails?.refusal) {
+							output.duration = Date.now() - startTime;
+							if (firstTokenTime) output.ttft = firstTokenTime - startTime;
+							handleKiroRefusal(output, stream, model, ev.stopDetails.refusal, options);
+							stream.end();
+							return;
+						}
+						break;
+					}
 					case "messageMetadataEvent": {
 						const ev = payload as MessageMetadataEvent;
 						if (ev.messageMetadataEvent?.conversationId) {
 							output.responseId = ev.messageMetadataEvent.conversationId;
 						}
-						// Check for content filter refusal before continuing
-						const stopDetails = ev.messageMetadataEvent?.stopDetails;
-						if (stopDetails?.refusal) {
-							const category = stopDetails.refusal.category;
-							const explanation = stopDetails.refusal.explanation?.trim();
-							const label = category ? `Kiro refused the request (${category})` : "Kiro refused the request";
-							output.stopReason = "error";
-							output.errorMessage = explanation ? `${label}: ${explanation}` : label;
-							// Clear any partial content (text or tool calls) that was generated before the refusal
-							output.content = [];
+						if (ev.messageMetadataEvent?.stopDetails?.refusal) {
 							output.duration = Date.now() - startTime;
 							if (firstTokenTime) output.ttft = firstTokenTime - startTime;
-							stream.push({ type: "error", reason: "error", error: output });
+							handleKiroRefusal(output, stream, model, ev.messageMetadataEvent.stopDetails.refusal, options);
 							stream.end();
 							return;
 						}

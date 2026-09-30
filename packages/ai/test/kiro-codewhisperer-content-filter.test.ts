@@ -85,7 +85,7 @@ const context: Context = {
 };
 
 describe("Kiro CodeWhisperer content filter #6150", () => {
-	test("surfaces refusal from messageMetadataEvent with category and explanation", async () => {
+	test("surfaces refusal from metadataEvent with category and explanation", async () => {
 		const events: Array<{ type: string; message?: { errorMessage?: string; content?: unknown[] } }> = [];
 
 		// Create an event stream with a text response followed by a refusal metadata event
@@ -95,16 +95,14 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 		);
 
 		const metadataWithRefusal = encodeFrame(
-			{ ":message-type": "event", ":event-type": "messageMetadataEvent" },
+			{ ":message-type": "event", ":event-type": "metadataEvent" },
 			new TextEncoder().encode(
 				JSON.stringify({
-					messageMetadataEvent: {
-						conversationId: "conv-123",
-						stopDetails: {
-							refusal: {
-								category: "CYBER",
-								explanation: "Request violates malicious code policy",
-							},
+					stopReason: "CONTENT_FILTERED",
+					stopDetails: {
+						refusal: {
+							category: "CYBER",
+							explanation: "Request violates malicious code policy",
 						},
 					},
 				}),
@@ -155,16 +153,14 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 		);
 
 		const metadataWithRefusal = encodeFrame(
-			{ ":message-type": "event", ":event-type": "messageMetadataEvent" },
+			{ ":message-type": "event", ":event-type": "metadataEvent" },
 			new TextEncoder().encode(
 				JSON.stringify({
-					messageMetadataEvent: {
-						conversationId: "conv-456",
-						stopDetails: {
-							refusal: {
-								category: "VIOLENCE",
-								explanation: "Cannot assist with that request",
-							},
+					stopReason: "CONTENT_FILTERED",
+					stopDetails: {
+						refusal: {
+							category: "VIOLENCE",
+							explanation: "Cannot assist with that request",
 						},
 					},
 				}),
@@ -212,12 +208,10 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 
 		// Create an event stream with only metadata, no response content, no refusal
 		const emptyMetadata = encodeFrame(
-			{ ":message-type": "event", ":event-type": "messageMetadataEvent" },
+			{ ":message-type": "event", ":event-type": "metadataEvent" },
 			new TextEncoder().encode(
 				JSON.stringify({
-					messageMetadataEvent: {
-						conversationId: "conv-789",
-					},
+					stopReason: "COMPLETED",
 				}),
 			),
 		);
@@ -252,16 +246,14 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 		const events: Array<{ type: string; message?: { errorMessage?: string } }> = [];
 
 		const metadataWithRefusalNoExplanation = encodeFrame(
-			{ ":message-type": "event", ":event-type": "messageMetadataEvent" },
+			{ ":message-type": "event", ":event-type": "metadataEvent" },
 			new TextEncoder().encode(
 				JSON.stringify({
-					messageMetadataEvent: {
-						conversationId: "conv-999",
-						stopDetails: {
-							refusal: {
-								category: "ILLEGAL",
-								// No explanation
-							},
+					stopReason: "CONTENT_FILTERED",
+					stopDetails: {
+						refusal: {
+							category: "ILLEGAL",
+							// No explanation
 						},
 					},
 				}),
@@ -298,16 +290,14 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 		const events: Array<{ type: string; message?: { errorMessage?: string } }> = [];
 
 		const metadataWithRefusalNoCategory = encodeFrame(
-			{ ":message-type": "event", ":event-type": "messageMetadataEvent" },
+			{ ":message-type": "event", ":event-type": "metadataEvent" },
 			new TextEncoder().encode(
 				JSON.stringify({
-					messageMetadataEvent: {
-						conversationId: "conv-888",
-						stopDetails: {
-							refusal: {
-								// No category
-								explanation: "Your request cannot be processed",
-							},
+					stopReason: "CONTENT_FILTERED",
+					stopDetails: {
+						refusal: {
+							// No category
+							explanation: "Your request cannot be processed",
 						},
 					},
 				}),

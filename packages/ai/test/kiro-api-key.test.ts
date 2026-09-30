@@ -86,4 +86,30 @@ describe("parseKiroApiEvents", () => {
 			data: { name: "read", toolUseId: "t1", input: "{}", stop: true },
 		});
 	});
+	test("parses refusal events with category and explanation", () => {
+		const { events } = parseKiroApiEvents(
+			'{"stopReason":"CONTENT_FILTERED","stopDetails":{"refusal":{"category":"CYBER","explanation":"Violates policy"}}}',
+		);
+		expect(events).toHaveLength(1);
+		const event = events[0];
+		expect(event?.type).toBe("refusal");
+		if (event?.type === "refusal") {
+			expect(event.data.stopReason).toBe("CONTENT_FILTERED");
+			expect(event.data.stopDetails?.refusal?.category).toBe("CYBER");
+			expect(event.data.stopDetails?.refusal?.explanation).toBe("Violates policy");
+		}
+	});
+	test("parses refusal events split across chunks", () => {
+		const part1 = '{"stopReason":"CONTENT_FILTERED","stopDetails":{"refusal":{"category"';
+		const part2 = ':"VIOLENCE","explanation":"Cannot assist"}}}';
+		const { events: events1, remaining: remaining1 } = parseKiroApiEvents(part1);
+		expect(events1).toHaveLength(0);
+		const { events: events2 } = parseKiroApiEvents(remaining1 + part2);
+		expect(events2).toHaveLength(1);
+		const event = events2[0];
+		expect(event?.type).toBe("refusal");
+		if (event?.type === "refusal") {
+			expect(event.data.stopDetails?.refusal?.category).toBe("VIOLENCE");
+		}
+	});
 });
