@@ -126,6 +126,13 @@ interface MessageMetadataEvent {
 	messageMetadataEvent?: {
 		conversationId?: string;
 		utteranceId?: string;
+		stopReason?: string;
+		stopDetails?: {
+			refusal?: {
+				category?: string;
+				explanation?: string;
+			};
+		};
 	};
 }
 
@@ -324,6 +331,22 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 						if (ev.messageMetadataEvent?.conversationId) {
 							output.responseId = ev.messageMetadataEvent.conversationId;
 						}
+						// Check for content filter refusal before continuing
+						const stopDetails = ev.messageMetadataEvent?.stopDetails;
+						if (stopDetails?.refusal) {
+							const category = stopDetails.refusal.category;
+							const explanation = stopDetails.refusal.explanation?.trim();
+							const label = category ? `Kiro refused the request (${category})` : "Kiro refused the request";
+							output.stopReason = "error";
+							output.errorMessage = explanation ? `${label}: ${explanation}` : label;
+							// Clear any partial content (text or tool calls) that was generated before the refusal
+							output.content = [];
+							output.duration = Date.now() - startTime;
+							if (firstTokenTime) output.ttft = firstTokenTime - startTime;
+							stream.push({ type: "error", reason: "error", error: output });
+							stream.end();
+							return;
+						}
 						break;
 					}
 					case "codeReferenceEvent":
@@ -349,6 +372,17 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 
 			if (options.signal?.aborted) throw new Error("Request was aborted");
 
+			// Check for truly empty output (no text, no tool calls)
+			const hasText = blocks.some(b => b.type === "text" && (b.text?.length ?? 0) > 0);
+			const hasToolCall = blocks.some(b => b.type === "toolCall");
+			if (!hasText && !hasToolCall) {
+				output.stopReason = "error";
+				output.errorMessage = "Kiro API key stream returned no tokens";
+				stream.push({ type: "error", reason: "error", error: output });
+				stream.end();
+				return;
+			}
+
 			// Finalize blocks
 			for (const block of blocks) {
 				delete block.index;
@@ -356,7 +390,6 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 			}
 
 			// Determine stop reason
-			const hasToolCall = blocks.some(b => b.type === "toolCall");
 			output.stopReason = hasToolCall ? "toolUse" : "stop";
 
 			output.duration = Date.now() - startTime;
