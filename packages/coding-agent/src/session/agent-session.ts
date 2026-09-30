@@ -26038,7 +26038,8 @@ export class AgentSession {
 
 	/** Build a background snapshot with in-flight assistant and optional context. */
 	#buildEphemeralSnapshot(promptText: string, prependMessages?: AgentMessage[]): AgentMessage[] {
-		const messages = [...this.messages];
+		// Side requests run in a fresh provider session with no prefix to preserve.
+		const messages = this.#withoutEphemeralCustomMessages(this.messages);
 		const streaming = this.agent.state.streamMessage;
 		if (streaming && streaming.role === "assistant") {
 			const preservedBlocks: AssistantMessage["content"] = [];

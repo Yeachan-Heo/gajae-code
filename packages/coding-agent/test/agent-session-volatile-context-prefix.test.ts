@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
 import { Agent, type AgentMessage, type AgentTool } from "@gajae-code/agent-core";
 import * as compactionModule from "@gajae-code/agent-core/compaction";
+import * as aiModule from "@gajae-code/ai";
 import { type AssistantMessage, getBundledModel, type ToolCall } from "@gajae-code/ai";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -288,5 +289,36 @@ describe("AgentSession volatile context cache prefix extension", () => {
 		} finally {
 			prepSpy.mockRestore();
 		}
+	});
+	it("excludes retained volatile context from side-channel ephemeral turns", async () => {
+		scriptedResponses = [createTextAssistantMessage("first response"), createTextAssistantMessage("second response")];
+		await session.prompt("first question?");
+		await session.prompt("second question?");
+		const marker = "current working directory is";
+		const before = requestContexts.length;
+
+		const sideContexts: unknown[] = [];
+		const sideStream = spyOn(aiModule, "streamSimple").mockImplementation((_model, context) => {
+			sideContexts.push(structuredClone(context.messages));
+			const response = createTextAssistantMessage("side answer");
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				stream.push({ type: "start", partial: response });
+				stream.push({ type: "done", reason: "stop", message: response });
+			});
+			return stream;
+		});
+		try {
+			await session.runEphemeralTurn({ promptText: "side question" });
+		} finally {
+			sideStream.mockRestore();
+		}
+
+		expect(requestContexts.length).toBe(before);
+		const sideRequest = sideContexts[0];
+		if (!sideRequest) throw new Error("Expected a side-channel request");
+		expect(JSON.stringify(sideRequest)).toContain("side question");
+		expect(JSON.stringify(sideRequest)).toContain("second question?");
+		expect(JSON.stringify(sideRequest)).not.toContain(marker);
 	});
 });
