@@ -247,8 +247,6 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 				);
 			}
 
-			if (!response.body) throw new Error("Kiro CodeWhisperer response has no body");
-
 			// Verify content-type is eventstream; if not, read and report the actual error
 			const contentType = response.headers.get("content-type") ?? "";
 			const mediaType = contentType.split(";", 1)[0]?.trim().toLowerCase() ?? "";
@@ -264,6 +262,8 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 					),
 				);
 			}
+
+			if (!response.body) throw new Error("Kiro CodeWhisperer response has no body");
 
 			// Decode eventstream
 			for await (const message of decodeEventStream(response.body)) {
