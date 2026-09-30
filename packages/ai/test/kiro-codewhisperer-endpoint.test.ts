@@ -158,4 +158,57 @@ describe("Kiro CodeWhisperer OAuth endpoint #6002", () => {
 
 		expect(capturedUrl).toBe("https://codewhisperer.ap-southeast-1.amazonaws.com/");
 	});
+
+	test("surfaces non-eventstream 200 response with proper error message", async () => {
+		globalThis.fetch = (async (_input: string | URL | Request, _init?: RequestInit) => {
+			// Simulate a JSON error response (e.g., from CodeWhisperer when credentials are bad)
+			return new Response(JSON.stringify({ message: "Invalid API key" }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		}) as unknown as typeof fetch;
+
+		let caughtError: Error | undefined;
+
+		try {
+			const model = {
+				id: "test-model",
+				name: "Test",
+				api: "kiro-codewhisperer-stream" as const,
+				provider: "kiro" as const,
+				baseUrl: "",
+				reasoning: false,
+				input: ["text"],
+				output: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 200_000,
+				maxTokens: 8_192,
+			} satisfies Model<"kiro-codewhisperer-stream">;
+
+			const context: Context = {
+				messages: [{ role: "user", content: "say ok", timestamp: 1 }],
+			};
+
+			const stream = streamKiroCodeWhisperer(model, context, {
+				apiKey: "bad-key",
+				region: "us-east-1",
+			});
+
+			for await (const _event of stream) {
+				// Consume the stream
+			}
+		} catch (error) {
+			caughtError = error as Error;
+		}
+
+		globalThis.fetch = originalFetch;
+
+		// Before the fix, this will fail with 'eventstream: truncated message at end of stream'
+		// After the fix, it should show the actual error message
+		expect(caughtError).toBeDefined();
+		const errorMessage = caughtError?.message ?? "";
+		expect(errorMessage).toContain("Invalid API key");
+		expect(errorMessage).toContain("application/json");
+		expect(errorMessage).not.toContain("eventstream: truncated message");
+	});
 });

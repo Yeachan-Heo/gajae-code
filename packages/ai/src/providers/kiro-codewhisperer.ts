@@ -249,6 +249,16 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 
 			if (!response.body) throw new Error("Kiro CodeWhisperer response has no body");
 
+			// Verify content-type is eventstream; if not, read and report the actual error
+			const contentType = response.headers.get("content-type") ?? "";
+			if (!contentType.includes("application/vnd.amazon.eventstream")) {
+				const errBody = await response.text().catch(() => "");
+				const err = new Error(
+					`Kiro CodeWhisperer returned non-eventstream response (${contentType}): ${errBody.slice(0, 1000)}`,
+				);
+				throw withHttpStatus(err, response.status);
+			}
+
 			// Decode eventstream
 			for await (const message of decodeEventStream(response.body)) {
 				if (options.signal?.aborted) break;
