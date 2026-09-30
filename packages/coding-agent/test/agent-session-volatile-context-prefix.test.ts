@@ -1,0 +1,230 @@
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import * as path from "node:path";
+import { Agent, type AgentMessage, type AgentTool } from "@gajae-code/agent-core";
+import { type AssistantMessage, getBundledModel, type TextContent, type ToolCall } from "@gajae-code/ai";
+import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
+import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
+import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
+import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { TempDir } from "@gajae-code/utils";
+import * as z from "zod/v4";
+
+function createToolCallAssistantMessage(name: string, args: Record<string, unknown>): AssistantMessage {
+	const toolCall: ToolCall = {
+		type: "toolCall",
+		id: `call_${name}`,
+		name,
+		arguments: args,
+	};
+	return {
+		role: "assistant",
+		content: [toolCall],
+		api: "anthropic-messages",
+		provider: "anthropic",
+		model: "mock",
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "toolUse",
+		timestamp: Date.now(),
+	};
+}
+
+function createTextAssistantMessage(text: string): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text }],
+		api: "anthropic-messages",
+		provider: "anthropic",
+		model: "mock",
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: Date.now(),
+	};
+}
+
+function getMessageText(message: AgentMessage): string {
+	if (!("content" in message)) {
+		return "";
+	}
+	if (typeof message.content === "string") {
+		return message.content;
+	}
+	if (!Array.isArray(message.content)) {
+		return "";
+	}
+	return message.content
+		.filter((block): block is TextContent => block.type === "text")
+		.map(content => content.text)
+		.join("\n");
+}
+
+describe("AgentSession volatile context cache prefix extension", () => {
+	let tempDir: TempDir;
+	let session: AgentSession;
+	let sessionManager: SessionManager;
+	let modelRegistry: ModelRegistry;
+	let settings: Settings;
+	let authStorage: AuthStorage | undefined;
+
+	const requestContexts: AgentMessage[][] = [];
+	let streamCallCount = 0;
+	let scriptedResponses: AssistantMessage[] = [];
+
+	beforeEach(async () => {
+		tempDir = TempDir.createSync("@pi-volatile-context-prefix-");
+		requestContexts.length = 0;
+		streamCallCount = 0;
+		scriptedResponses = [];
+
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
+
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
+		settings = Settings.isolated({
+			"compaction.enabled": false,
+		});
+		sessionManager = SessionManager.inMemory(tempDir.path());
+
+		const mockBashTool: AgentTool = {
+			name: "bash",
+			label: "Bash",
+			description: "Mock bash tool",
+			parameters: z.object({ command: z.string() }),
+			execute: async () => ({ content: [{ type: "text" as const, text: "command output" }] }),
+		};
+
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: {
+				model,
+				systemPrompt: ["Test system prompt"],
+				tools: [mockBashTool],
+				messages: [],
+			},
+			convertToLlm,
+			streamFn: (_model, context) => {
+				streamCallCount++;
+				// Capture the context (messages) sent to the LLM for each request
+				requestContexts.push(structuredClone(context.messages));
+
+				const response = scriptedResponses.shift() ?? createTextAssistantMessage("done");
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: response });
+					const reason = response.stopReason === "toolUse" ? "toolUse" : "stop";
+					stream.push({ type: "done", reason, message: response });
+				});
+				return stream;
+			},
+		});
+
+		const toolRegistry = new Map<string, AgentTool>([[mockBashTool.name, mockBashTool]]);
+
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			toolRegistry,
+		});
+	});
+
+	afterEach(async () => {
+		if (session) {
+			await session.dispose();
+		}
+		authStorage?.close();
+		authStorage = undefined;
+		tempDir.removeSync();
+	});
+
+	it("maintains volatile context as a prefix extension across multiple turns with tool calls", async () => {
+		// Turn 1: Plain text request
+		scriptedResponses = [createTextAssistantMessage("first response")];
+		await session.prompt("first question?");
+		expect(streamCallCount).toBe(1);
+		expect(requestContexts).toHaveLength(1);
+		const firstRequest = requestContexts[0];
+		if (!firstRequest) throw new Error("Expected first request context");
+
+		// Turn 2: Tool call request (causes multiple LLM calls for tool results)
+		scriptedResponses = [
+			createToolCallAssistantMessage("bash", { command: "echo hello" }),
+			createTextAssistantMessage("tool result processed"),
+		];
+		await session.prompt("please run a command?");
+		expect(streamCallCount).toBe(3); // turn1 + turn2_toolcall + turn2_result
+		const secondRequest = requestContexts[1];
+		if (!secondRequest) throw new Error("Expected second request context");
+
+		// Turn 3: Another plain request
+		scriptedResponses = [createTextAssistantMessage("third response")];
+		await session.prompt("final question?");
+		expect(streamCallCount).toBe(4);
+		const thirdRequest = requestContexts[3];
+		if (!thirdRequest) throw new Error("Expected third request context");
+
+		// Verify that each request is a prefix-extension of the previous:
+		// - Every message in request 1 should be at the same index in request 2 and 3
+		// - Request 2 should have request 1 as a prefix, plus new messages appended
+		// - Request 3 should have request 2 as a prefix, plus new messages appended
+
+		// Check first->second prefix relationship
+		expect(secondRequest.length).toBeGreaterThanOrEqual(firstRequest.length);
+		for (let i = 0; i < firstRequest.length; i++) {
+			const firstMsg = firstRequest[i];
+			const secondMsg = secondRequest[i];
+			if (!firstMsg || !secondMsg) throw new Error(`Message missing at index ${i}`);
+
+			// Messages at the same index should be identical (byte-equivalent)
+			expect(JSON.stringify(secondMsg)).toBe(JSON.stringify(firstMsg));
+		}
+
+		// Check second->third prefix relationship
+		expect(thirdRequest.length).toBeGreaterThanOrEqual(secondRequest.length);
+		for (let i = 0; i < secondRequest.length; i++) {
+			const secondMsg = secondRequest[i];
+			const thirdMsg = thirdRequest[i];
+			if (!secondMsg || !thirdMsg) throw new Error(`Message missing at index ${i}`);
+
+			// Messages at the same index should be identical (byte-equivalent)
+			expect(JSON.stringify(thirdMsg)).toBe(JSON.stringify(secondMsg));
+		}
+	});
+
+	it("removes volatile context from durable storage but keeps it in agent.state after sending", async () => {
+		scriptedResponses = [createTextAssistantMessage("first response")];
+		await session.prompt("first question?");
+
+		// Volatile messages should NOT be in durable storage (session manager branch)
+		const branchEntries = sessionManager.getBranch();
+		const hasVolatileInBranch = branchEntries.some(
+			entry => entry.type === "custom_message" && entry.customType === "volatile-project-context",
+		);
+		expect(hasVolatileInBranch).toBe(false);
+
+		// But they SHOULD be in agent.state (in-memory) after the turn
+		const hasVolatileInAgent = session.agent.state.messages.some(
+			msg => msg.role === "custom" && msg.customType === "volatile-project-context",
+		);
+		expect(hasVolatileInAgent).toBe(true);
+	});
+});

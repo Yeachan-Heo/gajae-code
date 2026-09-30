@@ -12429,7 +12429,6 @@ export class AgentSession {
 			});
 			if (continuationSdkRunToken === undefined) await this.#waitForPostPromptRecovery();
 		} finally {
-			this.#removeEphemeralCustomMessages();
 			await this.#settleEndedInFlight(
 				inFlightPrompt,
 				continuationSdkRunToken === undefined ? "full" : "publication",
@@ -13988,8 +13987,6 @@ export class AgentSession {
 				throw new Error(formatNoCredentialOnboardingError(this.model.provider));
 			}
 
-			this.#removeEphemeralCustomMessages();
-
 			// Check if we need to compact before sending (catches aborted responses)
 			const lastAssistant = this.#findLastAssistantMessage();
 			if (lastAssistant && !options?.skipCompactionCheck) {
@@ -14328,7 +14325,6 @@ export class AgentSession {
 				return;
 			throw error;
 		} finally {
-			this.#removeEphemeralCustomMessages();
 			if (rosterClaim) {
 				this.agent.replaceMessages(
 					this.agent.state.messages.filter(
