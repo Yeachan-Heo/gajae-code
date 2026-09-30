@@ -12392,9 +12392,16 @@ export class AgentSession {
 		let continuationSdkRunToken: string | undefined;
 		try {
 			const volatileProjectContextMessage = await this.#buildVolatileProjectContextMessage();
-			this.agent.appendMessage(volatileProjectContextMessage);
+			if (!this.#isLatestRetainedEphemeralCopy(volatileProjectContextMessage)) {
+				this.agent.appendMessage(volatileProjectContextMessage);
+			}
 			const untrustedMcpServerInstructionsMessage = this.#buildUntrustedMcpServerInstructionsMessage();
-			if (untrustedMcpServerInstructionsMessage) this.agent.appendMessage(untrustedMcpServerInstructionsMessage);
+			if (
+				untrustedMcpServerInstructionsMessage &&
+				!this.#isLatestRetainedEphemeralCopy(untrustedMcpServerInstructionsMessage)
+			) {
+				this.agent.appendMessage(untrustedMcpServerInstructionsMessage);
+			}
 			const hindsightState = this.getHindsightSessionState();
 			await hindsightState?.maybeRecallOnAgentStart();
 			hindsightRecall = hindsightState?.getRecallSnippetForInjection();
@@ -13295,6 +13302,21 @@ export class AgentSession {
 		);
 	}
 
+	/**
+	 * Sent ephemeral copies stay in live state so the provider prefix is stable. A new
+	 * copy is only worth appending when its provider-visible content changed; an
+	 * identical one would just repeat tokens that still count against the window.
+	 */
+	#isLatestRetainedEphemeralCopy(message: CustomMessage): boolean {
+		const messages = this.agent.state.messages;
+		for (let index = messages.length - 1; index >= 0; index--) {
+			const candidate = messages[index];
+			if (candidate?.role !== "custom" || candidate.customType !== message.customType) continue;
+			return JSON.stringify(candidate.content) === JSON.stringify(message.content);
+		}
+		return false;
+	}
+
 	#removeEphemeralCustomMessages(): void {
 		const messages = this.agent.state.messages;
 		const withoutEphemeralMessages = this.#withoutEphemeralCustomMessages(messages);
@@ -14164,9 +14186,16 @@ export class AgentSession {
 					messages.push(goalModeMessage);
 				}
 				const volatileProjectContextMessage = await this.#buildVolatileProjectContextMessage();
-				messages.push(volatileProjectContextMessage);
+				if (!this.#isLatestRetainedEphemeralCopy(volatileProjectContextMessage)) {
+					messages.push(volatileProjectContextMessage);
+				}
 				const untrustedMcpServerInstructionsMessage = this.#buildUntrustedMcpServerInstructionsMessage();
-				if (untrustedMcpServerInstructionsMessage) messages.push(untrustedMcpServerInstructionsMessage);
+				if (
+					untrustedMcpServerInstructionsMessage &&
+					!this.#isLatestRetainedEphemeralCopy(untrustedMcpServerInstructionsMessage)
+				) {
+					messages.push(untrustedMcpServerInstructionsMessage);
+				}
 
 				// Roster: one Phase A claim, revalidated and reused on every attempt;
 				// a superseded claim releases and the prompt proceeds without it.
