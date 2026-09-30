@@ -2182,6 +2182,16 @@ export class AuthStorage {
 	}
 
 	/**
+	 * Whether a provider's config override is a literal `apiKey`, not an `apiKeyEnv`
+	 * indirection. Only a literal key outranks an unavailable session pin: an
+	 * env-sourced override yields to the stored api_key pool (see {@link getApiKey}).
+	 */
+	hasLiteralConfigApiKey(provider: string, owner?: object): boolean {
+		const registration = this.#configOverrideRegistration(provider, owner);
+		return Boolean(registration?.apiKey) && !registration?.envSourced;
+	}
+
+	/**
 	 * Whether credential selection for a provider is pinned to one stored row by
 	 * a runtime selector (`--credential`).
 	 *

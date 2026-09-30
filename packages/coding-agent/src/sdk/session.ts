@@ -1974,8 +1974,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				options.preferredCredentialSelector.selector,
 			);
 		}
-		// Mirrors AuthStorage.getApiKey precedence: a runtime key or this registry's
-		// models.yml key outranks an unavailable pin; without one the provider stays blocked.
+		// A runtime key or this registry's literal models.yml apiKey outranks an
+		// unavailable pin; without one the provider stays blocked (never retargeted).
 		const isCredentialPinBlocking = (provider: string): boolean =>
 			isSessionCredentialPinBlocking(modelRegistry, provider, credentialSessionId);
 		const modelApiKeyAvailability = new Map<string, boolean>();

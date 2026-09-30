@@ -830,7 +830,7 @@ test("interactive resume keeps a session open when its default profile requires 
 		getApiKeyForProvider,
 		authStorage: {
 			hasRuntimeApiKey: () => false,
-			hasConfigApiKey: () => false,
+			hasLiteralConfigApiKey: () => false,
 			hasSessionCredentialUnavailable: (provider: string, scope: string) =>
 				provider === "profile-provider" && scope === session.credentialSessionId,
 		},
@@ -868,7 +868,7 @@ test("interactive resume honors a runtime API key over an unavailable pin for th
 		getApiKeyForProvider,
 		authStorage: {
 			hasRuntimeApiKey: (provider: string) => provider === "profile-provider",
-			hasConfigApiKey: () => false,
+			hasLiteralConfigApiKey: () => false,
 			hasSessionCredentialUnavailable: (provider: string, scope: string) =>
 				provider === "profile-provider" && scope === session.credentialSessionId,
 		},

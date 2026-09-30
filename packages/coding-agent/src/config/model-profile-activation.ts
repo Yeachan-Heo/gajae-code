@@ -479,7 +479,7 @@ export class ModelProfileCredentialError extends Error {
 interface SessionPinRegistry {
 	authStorage?: {
 		hasRuntimeApiKey(provider: string): boolean;
-		hasConfigApiKey(provider: string, owner?: object): boolean;
+		hasLiteralConfigApiKey(provider: string, owner?: object): boolean;
 		hasSessionCredentialUnavailable(provider: string, scopeId?: string): boolean;
 	};
 	getAuthStorageOwner?(): object;
@@ -488,9 +488,11 @@ interface SessionPinRegistry {
 /**
  * Whether an unavailable session credential pin blocks `provider`.
  *
- * Mirrors `AuthStorage.getApiKey` precedence: a runtime `--api-key` override or a
- * `models.yml` provider key registered for this registry's owner is resolved before the
- * unavailable-pin marker, so either one keeps the provider usable.
+ * Mirrors `AuthStorage.getApiKey` precedence: a runtime `--api-key` override or a literal
+ * `models.yml` `apiKey` registered for this registry's owner is resolved before the
+ * unavailable-pin marker, so either one keeps the provider usable. An `apiKeyEnv` key does
+ * not: `getApiKey` prefers another stored api_key account over it, which would silently
+ * retarget the unavailable pin.
  */
 export function isSessionCredentialPinBlocking(
 	registry: SessionPinRegistry,
@@ -500,7 +502,7 @@ export function isSessionCredentialPinBlocking(
 	const authStorage = registry.authStorage;
 	if (!authStorage) return false;
 	if (authStorage.hasRuntimeApiKey(provider)) return false;
-	if (authStorage.hasConfigApiKey(provider, registry.getAuthStorageOwner?.())) return false;
+	if (authStorage.hasLiteralConfigApiKey(provider, registry.getAuthStorageOwner?.())) return false;
 	return authStorage.hasSessionCredentialUnavailable(provider, sessionId);
 }
 

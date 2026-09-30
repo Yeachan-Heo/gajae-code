@@ -606,6 +606,34 @@ describe("startup credential pin handoff", () => {
 			}
 		});
 
+		test("an apiKeyEnv config key does not unblock the pin onto another stored api_key account", async () => {
+			using tempDir = TempDir.createSync("@gjc-startup-pin-env-config-");
+			const fixture = await createCredentialFixture(tempDir.path());
+			const alternateKey = "fixture-alternate-api-key";
+			fixture.authStorage.upsertCredential(fixture.provider, { type: "api_key", key: alternateKey });
+			const resumed = await persistStalePinnedSession(fixture, `${fixture.provider}/entitled-model`);
+			fixture.authStorage.setConfigApiKey(fixture.provider, "fixture-env-config-key", {
+				envSourced: true,
+				owner: fixture.modelRegistry.getAuthStorageOwner(),
+			});
+			// getApiKey prefers the stored api_key account over an apiKeyEnv override,
+			// so treating this override as explicit would retarget the unavailable pin.
+			expect(await fixture.modelRegistry.getApiKeyForProvider(fixture.provider, resumed.credentialScope)).toBe(
+				alternateKey,
+			);
+			let session: AgentSession | undefined;
+			try {
+				const result = await resumeStalePinnedSession(fixture, resumed, {
+					settings: settingsWithDefault(`${fixture.provider}/entitled-model`),
+				});
+				session = result.session;
+				expect(session.model).toBeUndefined();
+				expect(result.modelFallbackMessage).toContain("Re-pin a credential or select AUTO explicitly");
+			} finally {
+				await disposeFixture(fixture, session);
+			}
+		});
+
 		test("falls back to the settings default on the pinned provider when a runtime key exists", async () => {
 			using tempDir = TempDir.createSync("@gjc-startup-pin-explicit-settings-");
 			const fixture = await createCredentialFixture(tempDir.path());

@@ -487,7 +487,7 @@ describe("model profile activation", () => {
 			getApiKeyForProvider,
 			authStorage: {
 				hasRuntimeApiKey: () => false,
-				hasConfigApiKey: () => false,
+				hasLiteralConfigApiKey: () => false,
 				hasSessionCredentialUnavailable: (provider: string, scope: string) =>
 					provider === "provider-a" && scope === "resume-session",
 			},
@@ -516,7 +516,7 @@ describe("model profile activation", () => {
 			getApiKeyForProvider,
 			authStorage: {
 				hasRuntimeApiKey: () => true,
-				hasConfigApiKey: () => false,
+				hasLiteralConfigApiKey: () => false,
 				hasSessionCredentialUnavailable: (provider: string, scope: string) =>
 					provider === "provider-a" && scope === "resume-session",
 			},
@@ -548,7 +548,7 @@ describe("model profile activation", () => {
 			},
 			authStorage: {
 				hasRuntimeApiKey: () => false,
-				hasConfigApiKey: () => false,
+				hasLiteralConfigApiKey: () => false,
 				hasSessionCredentialUnavailable: (provider: string, scope: string) =>
 					provider === "provider-a" && scope === "session-1" && unavailable,
 			},
@@ -578,7 +578,7 @@ describe("model profile activation", () => {
 			},
 			authStorage: {
 				hasRuntimeApiKey: () => false,
-				hasConfigApiKey: () => false,
+				hasLiteralConfigApiKey: () => false,
 				hasSessionCredentialUnavailable: () => false,
 			},
 		} as unknown as ModelRegistry;
@@ -604,7 +604,7 @@ describe("model profile activation", () => {
 			getApiKeyForProvider: async () => "runtime-key-value",
 			authStorage: {
 				hasRuntimeApiKey: (provider: string) => provider === "provider-a",
-				hasConfigApiKey: () => false,
+				hasLiteralConfigApiKey: () => false,
 				hasSessionCredentialUnavailable: (provider: string, scope: string) =>
 					provider === "provider-a" && scope === "session-1",
 			},
@@ -633,7 +633,8 @@ describe("model profile activation", () => {
 			authStorage: {
 				hasRuntimeApiKey: () => false,
 				// The models.yml key is registered for this registry's owner only.
-				hasConfigApiKey: (provider: string, keyOwner?: object) => provider === "provider-a" && keyOwner === owner,
+				hasLiteralConfigApiKey: (provider: string, keyOwner?: object) =>
+					provider === "provider-a" && keyOwner === owner,
 				hasSessionCredentialUnavailable: (provider: string, scope: string) =>
 					provider === "provider-a" && scope === "session-1",
 			},
@@ -664,7 +665,7 @@ describe("model profile activation", () => {
 			},
 			authStorage: {
 				hasRuntimeApiKey: () => false,
-				hasConfigApiKey: () => false,
+				hasLiteralConfigApiKey: () => false,
 				hasSessionCredentialUnavailable: (provider: string, scope: string) =>
 					provider === "provider-a" && scope === "session-1" && unavailable,
 			},
