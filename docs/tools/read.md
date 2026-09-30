@@ -15,7 +15,7 @@
   - `packages/coding-agent/src/utils/file-display-mode.ts` — decide hashline vs line-number vs raw display.
   - `packages/coding-agent/src/workspace-tree.ts` — render directory trees.
   - `packages/coding-agent/src/edit/file-read-cache.ts` — cache read lines for later hashline edit recovery.
-  - `packages/coding-agent/src/tools/index.ts` — registers `read: s => new ReadTool(s)`.
+  - `packages/coding-agent/src/tools/descriptors.ts` — registers `read: s => new ReadTool(s)`.
 
 ## Inputs
 

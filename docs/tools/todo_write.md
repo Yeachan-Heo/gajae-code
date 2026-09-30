@@ -6,7 +6,7 @@
 - Entry: `packages/coding-agent/src/tools/todo-write.ts`
 - Model-facing prompt: `packages/coding-agent/src/prompts/tools/todo-write.md`
 - Key collaborators:
-  - `packages/coding-agent/src/tools/index.ts` — registers tool, exposes session hooks, gates availability.
+  - `packages/coding-agent/src/tools/descriptors.ts` — registers the tool and gates availability on `todo.enabled`.
   - `packages/coding-agent/src/modes/controllers/event-controller.ts` — updates the visible todo UI on tool completion.
   - `packages/coding-agent/src/session/agent-session.ts` — stores cached phases, auto-clears done/dropped tasks, emits failure reminders.
   - `packages/coding-agent/src/modes/controllers/todo-command-controller.ts` — `/todo` command path, custom-entry persistence, transcript reminder injection.
@@ -160,5 +160,5 @@ The same file also exposes non-tool helpers used by `/todo`:
   - plain `todo_write` calls survive in transcript tool-result details;
   - `/todo` command edits additionally append `customType: "user_todo_edit"` entries and inject a visible-to-model `<system-reminder>` developer message describing the manual edit.
 - On session resume, `AgentSession.#syncTodoPhasesFromBranch()` strips `completed` and `abandoned` tasks before restoring the cached list. The `/todo` command works around that by reading the latest transcript/custom-entry state so historical done/dropped tasks still appear to the user.
-- Tool availability is gated by `todo.enabled`, and the registry excludes it when `includeYield` is enabled (`packages/coding-agent/src/tools/index.ts`).
+- Tool availability is gated by `todo.enabled`, and the registry excludes it when `includeYield` is enabled (`packages/coding-agent/src/tools/descriptors.ts`).
 - Subagents do not inherit `todo_write`; `packages/coding-agent/src/task/executor.ts` filters it out as a parent-owned tool.

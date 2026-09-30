@@ -7,7 +7,7 @@
 - Model-facing prompt: `packages/coding-agent/src/prompts/tools/render-mermaid.md`
 - Key collaborators:
   - `packages/utils/src/mermaid-ascii.ts` — lazy wrapper around the native render binding.
-  - `packages/coding-agent/src/tools/index.ts` — tool registration and enablement gate.
+  - `packages/coding-agent/src/tools/descriptors.ts` — tool registration and enablement gate.
   - `packages/coding-agent/src/sdk/session.ts` — session-facing artifact allocation hook.
   - `packages/coding-agent/src/session/session-manager.ts` — persistent-session artifact path allocation.
   - `packages/coding-agent/src/session/artifacts.ts` — artifact filename generation and writes.
@@ -68,7 +68,7 @@ No image path, SVG, PNG, or binary payload is returned. Stored artifacts are pla
 - No tool-local timeout, retry, truncation, or streaming path.
 - Numeric config fields are quantized to integers with `Math.floor()` and clamped to `0` minimum in `sanitizeRenderConfig()`.
 - Renderer implementation is vendored under `crates/pi-natives/src/mermaid/` from the pinned upstream source revision; accepted output differences are recorded in the native golden ledger.
-- The tool is registered as discoverable and gated by `renderMermaid.enabled` in `packages/coding-agent/src/tools/index.ts`.
+- The tool is registered as discoverable and gated by `renderMermaid.enabled` in `packages/coding-agent/src/tools/descriptors.ts`.
 
 ## Errors
 - `renderMermaidAscii()` is not wrapped in a local `try/catch`; renderer exceptions propagate out of `execute()`.

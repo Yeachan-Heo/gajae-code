@@ -12,7 +12,7 @@
   - `packages/coding-agent/src/tools/tool-result.ts` — build `content` and `details.meta`.
   - `packages/coding-agent/src/tools/output-meta.ts` — encode limit / truncation metadata.
   - `packages/coding-agent/src/tools/tool-errors.ts` — map user-facing tool errors.
-  - `packages/coding-agent/src/tools/index.ts` — register the built-in local implementation.
+  - `packages/coding-agent/src/tools/descriptors.ts` — registers the built-in local implementation.
 
 ## Inputs
 

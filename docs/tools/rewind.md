@@ -9,7 +9,7 @@
   - `packages/coding-agent/src/session/agent-session.ts` — validates pending rewind state, applies the actual rewind, and injects the retained report.
   - `packages/coding-agent/src/session/session-manager.ts` — branches the persisted session tree and appends persisted summary/report entries.
   - `packages/coding-agent/src/session/messages.ts` — converts persisted `branch_summary` entries into LLM-visible branch-summary messages on rebuilt context.
-  - `packages/coding-agent/src/tools/index.ts` — registers the tool and shares the `checkpoint.enabled` gate.
+  - `packages/coding-agent/src/tools/descriptors.ts` — defines the discoverable descriptor and shares the `checkpoint.enabled` gate.
 
 ## Inputs
 
@@ -77,7 +77,7 @@ The returned tool result is not the final rewind. `AgentSession` waits until `tu
 - `ToolError("No active checkpoint.")` — thrown when no checkpoint state is present.
 - `ToolError("Report cannot be empty.")` — thrown when the trimmed report is empty.
 - Missing checkpoint entry IDs during apply do not fail the tool call; `#applyRewind()` catches the error, logs `Rewind branch checkpoint missing, falling back to root`, and branches from root.
-- If the agent turn is aborted while a checkpoint is active, `AgentSession` clears checkpoint state rather than applying a delayed rewind.
+- An aborted turn does not clear checkpoint state: `#checkpointState` is cleared only at the end of `#applyRewind()`. A checkpoint whose rewind never ran stays active, and the `#enforceRewindBeforeYield()` guard keeps requiring a report before the agent can yield.
 
 ## Notes
 - Checkpoint selection is implicit. `rewind` always targets the single `#checkpointState` captured by the last successful `checkpoint`; there is no checkpoint list, label, or ID parameter.
