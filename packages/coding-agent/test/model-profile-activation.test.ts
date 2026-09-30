@@ -82,6 +82,11 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 				minLevel: ThinkingLevel.Low,
 				maxLevel: ThinkingLevel.Max,
 			}),
+			model("openai-codex", "gpt-6.1-sol", {
+				mode: "effort",
+				minLevel: ThinkingLevel.Low,
+				maxLevel: ThinkingLevel.Max,
+			}),
 			model("openai-codex", "gpt-5.6-terra", {
 				mode: "effort",
 				minLevel: ThinkingLevel.Low,
