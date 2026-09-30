@@ -33,6 +33,7 @@ test("replays an uncertain ACP lifecycle launch with the same idempotency key", 
 		// session.create is a startup lifecycle operation, so the adapter attaches the
 		// computed broker deadline. The replay must reuse the exact same key AND deadline.
 		const expectedTimeoutMs = lifecycleRequestTimeoutMs("session.create", calls[0]!.input);
+		if (expectedTimeoutMs === undefined) throw new Error("session.create timeout was not computed");
 		expect(expectedTimeoutMs).toBeGreaterThan(0);
 		expect(calls[0]?.options).toMatchObject({ idempotencyKey: "acp-request-1", timeoutMs: expectedTimeoutMs });
 		expect(calls[0]?.options.deadline).toBeTypeOf("number");
