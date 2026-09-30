@@ -342,31 +342,35 @@ describe("configuration hot reload watcher", () => {
 		const directory = await temporaryDirectory();
 		const paths = await configPaths(path.join(directory, "config"));
 		const applied: ConfigHotReloadCandidate[] = [];
-		const oldValidationStarted = Promise.withResolvers<void>();
+		const errors: ConfigHotReloadError[] = [];
+		let oldValidationStarted = false;
 		const releaseOldValidation = Promise.withResolvers<void>();
-		const newestApplied = Promise.withResolvers<void>();
 		const watcher = createWatcher(
 			candidate => {
 				applied.push(candidate);
-				if (candidate.config.text === "config: newest\n") newestApplied.resolve();
 			},
-			() => {},
+			error => {
+				errors.push(error);
+			},
 			candidate => {
 				if (candidate.config.text !== "config: old\n") return;
-				oldValidationStarted.resolve();
+				oldValidationStarted = true;
 				return releaseOldValidation.promise;
 			},
 		);
 		await watcher.start(paths);
 
-		await fs.writeFile(paths.configPath, "config: old\n");
-		await oldValidationStarted.promise;
-		await fs.writeFile(paths.configPath, "config: newest\n");
-		await newestApplied.promise;
-
-		releaseOldValidation.resolve();
+		try {
+			await atomicReplace(paths.configPath, "config: old\n");
+			await waitFor(() => (oldValidationStarted ? true : undefined));
+			await atomicReplace(paths.configPath, "config: newest\n");
+			await waitFor(() => applied.find(candidate => candidate.config.text === "config: newest\n"));
+		} finally {
+			releaseOldValidation.resolve();
+		}
 		await Bun.sleep(120);
 		expect(applied.map(candidate => candidate.config.text)).toEqual(["config: newest\n"]);
+		expect(errors).toEqual([]);
 	});
 
 	test("deduplicates read errors until a successful read recovers", async () => {
@@ -385,22 +389,25 @@ describe("configuration hot reload watcher", () => {
 		await watcher.start(paths);
 		await fs.rm(paths.configPath);
 		await fs.mkdir(paths.configPath);
+		await atomicReplace(paths.modelsPath, "models: initial\n");
 		await waitFor(() => errors[0]);
 		expect(errors[0]?.operation).toBe("read");
 		expect(errors[0]?.message).not.toContain(paths.configPath);
 
-		await fs.rm(paths.configPath, { recursive: true });
-		await fs.mkdir(paths.configPath);
+		await atomicReplace(paths.modelsPath, "models: repeated-read\n");
 		await Bun.sleep(160);
 		expect(errors).toHaveLength(1);
 
 		await fs.rm(paths.configPath, { recursive: true });
-		await fs.writeFile(paths.configPath, "config: read-recovered\n");
-		const recovered = await waitFor(() => candidates[0]);
+		await atomicReplace(paths.configPath, "config: read-recovered\n");
+		const recovered = await waitFor(() =>
+			candidates.find(candidate => candidate.config.text === "config: read-recovered\n"),
+		);
 		expect(recovered.config.text).toBe("config: read-recovered\n");
 
 		await fs.rm(paths.configPath);
 		await fs.mkdir(paths.configPath);
+		await atomicReplace(paths.modelsPath, "models: read-failed-again\n");
 		await waitFor(() => errors[1]);
 		expect(errors).toHaveLength(2);
 	});
