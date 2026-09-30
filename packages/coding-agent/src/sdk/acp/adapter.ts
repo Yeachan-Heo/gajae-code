@@ -143,6 +143,7 @@ const ACP_MCP_PRESERVED_LAUNCH_CODES = new Set([
 	"readiness_timeout",
 	"spawn_failed",
 	"worktree_in_use",
+	"uncertain_after_send",
 ]);
 
 /**
@@ -603,11 +604,19 @@ export class AcpSdkAdapter {
 		// request that named no readiness budget is queued for the default one, so it
 		// needs the same extension rather than the client's generic request deadline.
 		const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
-		const response = await this.#client.global(operation, input, {
+		const options = {
 			idempotencyKey,
 			...(timeoutMs === undefined ? {} : { timeoutMs }),
-		});
-		return response;
+		};
+		try {
+			return await this.#client.global(operation, input, options);
+		} catch (error) {
+			if (!(error instanceof SdkClientError) || error.code !== "uncertain_after_send") throw error;
+			// The broker records lifecycle effects by idempotency key. Replaying the exact
+			// request lets it return the committed result after a transport loss without
+			// creating a second session.
+			return await this.#client.global(operation, input, options);
+		}
 	}
 
 	async sdkControl(params: { operation: string; input?: JsonObject }): Promise<unknown> {
