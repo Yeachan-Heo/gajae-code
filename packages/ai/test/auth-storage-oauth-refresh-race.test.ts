@@ -1649,6 +1649,56 @@ describe("AuthStorage OAuth refresh race", () => {
 		expect(events).toHaveLength(1);
 		expect(events[0]?.disabledCause).toContain("Unknown OAuth provider: jetbrains-junie");
 		expect(store.listAuthCredentials(provider)).toHaveLength(0);
+		const readonlyDb = new Database(path.join(tempDir, "agent.db"), { readonly: true });
+		try {
+			const row = readonlyDb.prepare("SELECT COUNT(*) AS count FROM oauth_refresh_leases").get() as
+				| { count?: number }
+				| undefined;
+			expect(row?.count).toBe(0);
+		} finally {
+			readonlyDb.close();
+		}
+	});
+
+	test("releases a lease when the replay guard rethrows a memoized refresh failure", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+		const provider = "unit-oauth-replay-guard-lease-release";
+		let refreshCalls = 0;
+		oauthUtils.registerOAuthProvider({
+			id: provider,
+			name: "Unit OAuth Replay Guard Lease Release",
+			sourceId: "auth-storage-oauth-refresh-race-test",
+			async login() {
+				return { access: "unused", refresh: "unused", expires: Date.now() + 60 * 60_000 };
+			},
+			async refreshToken() {
+				refreshCalls += 1;
+				throw new Error("temporary refresh failure");
+			},
+			getApiKey(credentials) {
+				return credentials.access;
+			},
+		});
+
+		await authStorage.set(provider, {
+			type: "oauth",
+			access: "expired-access",
+			refresh: "replay-guard-refresh",
+			expires: Date.now() - 60_000,
+		});
+		await expect(authStorage.getApiKey(provider, "replay-first")).resolves.toBeUndefined();
+		await expect(authStorage.getApiKey(provider, "replay-second")).resolves.toBeUndefined();
+		expect(refreshCalls).toBe(1);
+
+		const readonlyDb = new Database(path.join(tempDir, "agent.db"), { readonly: true });
+		try {
+			const row = readonlyDb.prepare("SELECT COUNT(*) AS count FROM oauth_refresh_leases").get() as
+				| { count?: number }
+				| undefined;
+			expect(row?.count).toBe(0);
+		} finally {
+			readonlyDb.close();
+		}
 	});
 
 	test("expires abandoned leases, isolates credentials, and never lets force steal an active lease", async () => {
