@@ -1653,6 +1653,82 @@ describe("AuthStorage OAuth refresh race", () => {
 		}
 	});
 
+	test("releases the lease when the refresh times out", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+		const peerStore = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
+		const refreshStarted = Promise.withResolvers<void>();
+		const leaseReleased = Promise.withResolvers<void>();
+		const allowRefresh = Promise.withResolvers<void>();
+		try {
+			const releaseOAuthRefreshLease = store.releaseOAuthRefreshLease;
+			if (!releaseOAuthRefreshLease) throw new Error("test store cannot release OAuth leases");
+			const releaseLease = releaseOAuthRefreshLease.bind(store);
+			vi.spyOn(store, "releaseOAuthRefreshLease").mockImplementation(lease => {
+				releaseLease(lease);
+				leaseReleased.resolve();
+			});
+			// DEFAULT_OAUTH_REFRESH_TIMEOUT_MS is not exported; fire that specific
+			// delay immediately so the test doesn't wait 10s, while leaving every
+			// other setTimeout call (e.g. internal retry/backoff timers) unaffected.
+			const originalSetTimeout = globalThis.setTimeout;
+			vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+				handler: () => void,
+				delay?: number,
+				...args: unknown[]
+			) => {
+				if (delay === 10_000) return originalSetTimeout(handler, 0);
+				return originalSetTimeout(handler, delay, ...args);
+			}) as typeof setTimeout);
+
+			const provider = "unit-oauth-lease-timeout";
+			oauthUtils.registerOAuthProvider({
+				id: provider,
+				name: "Unit OAuth Lease Timeout",
+				sourceId: "auth-storage-oauth-refresh-race-test",
+				async login() {
+					throw new Error("Unexpected login");
+				},
+				async refreshToken() {
+					refreshStarted.resolve();
+					await allowRefresh.promise;
+					throw new Error("refresh failed after timeout");
+				},
+				getApiKey(credentials) {
+					return credentials.access;
+				},
+			});
+			await authStorage.set(provider, {
+				type: "oauth",
+				access: "access-before",
+				refresh: "refresh-before",
+				expires: Date.now() - 60_000,
+			});
+			const row = store.listAuthCredentials(provider)[0];
+			if (!row) throw new Error("expected OAuth credential");
+
+			const refresh = authStorage.refreshCredentialById(row.id);
+			await refreshStarted.promise;
+			await expect(refresh).rejects.toThrow(/timed out/);
+			allowRefresh.resolve();
+			await leaseReleased.promise;
+
+			const peerClaim = peerStore.claimOAuthRefreshLease(
+				row.id,
+				"refresh-before",
+				false,
+				"timeout-peer",
+				Date.now(),
+				15_000,
+			);
+			expect(peerClaim.kind).toBe("claimed");
+			if (peerClaim.kind === "claimed") peerStore.releaseOAuthRefreshLease(peerClaim.lease);
+		} finally {
+			allowRefresh.resolve();
+			vi.restoreAllMocks();
+			peerStore.close();
+		}
+	});
+
 	test("releases the lease when atomic refresh persistence loses ownership", async () => {
 		if (!authStorage || !store) throw new Error("test setup failed");
 		const peerStore = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
