@@ -5,6 +5,7 @@ import {
 	injectImageGenerationModels,
 	injectMuseSparkModels,
 } from "../scripts/generate-models";
+import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "../src/provider-models/openai-compat";
 import type { Model } from "../src/types";
 
 describe("injectCodexGpt6Models", () => {
@@ -17,47 +18,47 @@ describe("injectCodexGpt6Models", () => {
 		expect(models).toEqual([
 			expect.objectContaining({
 				id: "gpt-6-astra",
-				name: "GPT-6-Astra",
+				name: "GPT-6 Astra",
 				api: "openai-codex-responses",
 				provider: "openai-codex",
 				reasoning: true,
 				input: ["text", "image"],
-				contextWindow: 272_000,
-				maxTokens: 128_000,
+				contextWindow: UNK_CONTEXT_WINDOW,
+				maxTokens: UNK_MAX_TOKENS,
 				preferWebsockets: true,
 				priority: 1,
 			}),
 			expect.objectContaining({
 				id: "gpt-6-sol",
-				name: "GPT-6-Sol",
+				name: "GPT-6 Sol",
 				api: "openai-codex-responses",
 				provider: "openai-codex",
 				reasoning: true,
 				input: ["text", "image"],
-				contextWindow: 272_000,
-				maxTokens: 128_000,
+				contextWindow: UNK_CONTEXT_WINDOW,
+				maxTokens: UNK_MAX_TOKENS,
 				preferWebsockets: true,
 			}),
 			expect.objectContaining({
 				id: "gpt-6.1-sol",
-				name: "GPT-6.1-Sol",
+				name: "GPT-6.1 Sol",
 				api: "openai-codex-responses",
 				provider: "openai-codex",
 				reasoning: true,
 				input: ["text", "image"],
-				contextWindow: 272_000,
-				maxTokens: 128_000,
+				contextWindow: UNK_CONTEXT_WINDOW,
+				maxTokens: UNK_MAX_TOKENS,
 				preferWebsockets: true,
 			}),
 			expect.objectContaining({
 				id: "gpt-6-luna",
-				name: "GPT-6-Luna",
+				name: "GPT-6 Luna",
 				api: "openai-codex-responses",
 				provider: "openai-codex",
 				reasoning: true,
 				input: ["text", "image"],
-				contextWindow: 272_000,
-				maxTokens: 128_000,
+				contextWindow: UNK_CONTEXT_WINDOW,
+				maxTokens: UNK_MAX_TOKENS,
 				preferWebsockets: true,
 			}),
 		]);
@@ -78,7 +79,7 @@ describe("injectCodexGpt6Models", () => {
 			input: ["text", "image"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 			contextWindow: 300_000,
-			maxTokens: 128_000,
+			maxTokens: UNK_MAX_TOKENS,
 		};
 		const models: Model[] = [discovered];
 

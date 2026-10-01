@@ -94,16 +94,16 @@ export function injectCodexGpt6Models(models: Model[]): void {
 		reasoning: true,
 		input: ["text", "image"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 272_000,
-		maxTokens: 128_000,
+		contextWindow: UNK_CONTEXT_WINDOW,
+		maxTokens: UNK_MAX_TOKENS,
 		preferWebsockets: true,
 		...(priority === undefined ? {} : { priority }),
 	});
 	const bundled: Model<"openai-codex-responses">[] = [
-		gpt6("gpt-6-astra", "GPT-6-Astra", 1),
-		gpt6("gpt-6-sol", "GPT-6-Sol"),
-		gpt6("gpt-6.1-sol", "GPT-6.1-Sol"),
-		gpt6("gpt-6-luna", "GPT-6-Luna"),
+		gpt6("gpt-6-astra", "GPT-6 Astra", 1),
+		gpt6("gpt-6-sol", "GPT-6 Sol"),
+		gpt6("gpt-6.1-sol", "GPT-6.1 Sol"),
+		gpt6("gpt-6-luna", "GPT-6 Luna"),
 	];
 	for (const model of bundled) {
 		const exists = models.some(existing => existing.provider === model.provider && existing.id === model.id);

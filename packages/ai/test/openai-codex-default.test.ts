@@ -31,7 +31,7 @@ describe("OpenAI Codex defaults", () => {
 		}
 	});
 
-	it("bundles GPT-6 Astra with reviewed Codex and pricing metadata", () => {
+	it("bundles GPT-6 Astra with reviewed Codex and UNK limits to inherit from models.dev", () => {
 		const model = getBundledModel("openai-codex", "gpt-6-astra");
 
 		expect(model).toMatchObject({
@@ -39,17 +39,11 @@ describe("OpenAI Codex defaults", () => {
 			api: "openai-codex-responses",
 			reasoning: true,
 			input: ["text", "image"],
-			contextWindow: 272_000,
-			maxTokens: 128_000,
+			contextWindow: 222_222,
+			maxTokens: 8_888,
 			preferWebsockets: true,
 			priority: 1,
 			applyPatchToolType: "freeform",
-			thinking: { mode: "effort", minLevel: Effort.Low, maxLevel: Effort.Max },
-			cost: { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 },
-			longContextPricing: {
-				threshold: 272_000,
-				cost: { input: 20, output: 75, cacheRead: 2, cacheWrite: 25 },
-			},
 		});
 	});
 });

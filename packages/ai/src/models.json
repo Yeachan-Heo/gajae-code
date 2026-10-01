@@ -69284,7 +69284,7 @@
 		},
 		"gpt-6-astra": {
 			"id": "gpt-6-astra",
-			"name": "GPT-6-Astra",
+			"name": "GPT-6 Astra",
 			"api": "openai-codex-responses",
 			"provider": "openai-codex",
 			"baseUrl": "https://chatgpt.com/backend-api",
@@ -69299,8 +69299,8 @@
 				"cacheRead": 1,
 				"cacheWrite": 12.5
 			},
-			"contextWindow": 272000,
-			"maxTokens": 128000,
+			"contextWindow": 222222,
+			"maxTokens": 8888,
 			"preferWebsockets": true,
 			"priority": 1,
 			"thinking": {
@@ -69321,7 +69321,7 @@
 		},
 		"gpt-6-luna": {
 			"id": "gpt-6-luna",
-			"name": "GPT-6-Luna",
+			"name": "GPT-6 Luna",
 			"api": "openai-codex-responses",
 			"provider": "openai-codex",
 			"baseUrl": "https://chatgpt.com/backend-api",
@@ -69336,8 +69336,8 @@
 				"cacheRead": 0.01,
 				"cacheWrite": 0.125
 			},
-			"contextWindow": 272000,
-			"maxTokens": 128000,
+			"contextWindow": 222222,
+			"maxTokens": 8888,
 			"preferWebsockets": true,
 			"thinking": {
 				"mode": "effort",
@@ -69356,7 +69356,7 @@
 		},
 		"gpt-6-sol": {
 			"id": "gpt-6-sol",
-			"name": "GPT-6-Sol",
+			"name": "GPT-6 Sol",
 			"api": "openai-codex-responses",
 			"provider": "openai-codex",
 			"baseUrl": "https://chatgpt.com/backend-api",
@@ -69371,8 +69371,8 @@
 				"cacheRead": 0.2,
 				"cacheWrite": 2.5
 			},
-			"contextWindow": 272000,
-			"maxTokens": 128000,
+			"contextWindow": 222222,
+			"maxTokens": 8888,
 			"preferWebsockets": true,
 			"thinking": {
 				"mode": "effort",
@@ -73471,7 +73471,7 @@
 			"cost": {
 				"input": 0.015543,
 				"output": 0.396,
-				"cacheRead": 0.0029100000000000003,
+				"cacheRead": 0.0028510000000000002,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
@@ -73493,13 +73493,13 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.16,
-				"output": 1.7964799999999999,
-				"cacheRead": 0.08832,
+				"input": 0.2859,
+				"output": 3.5,
+				"cacheRead": 0.2859,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
-			"maxTokens": 943718,
+			"maxTokens": 393216,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -73517,7 +73517,7 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.006534,
+				"input": 0.004455,
 				"output": 0.13068,
 				"cacheRead": 0.0013859999999999999,
 				"cacheWrite": 0
@@ -73592,9 +73592,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.28,
+				"input": 0.38,
 				"output": 10,
-				"cacheRead": 0.28,
+				"cacheRead": 0.38,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
@@ -73816,13 +73816,13 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.19,
-				"output": 4,
-				"cacheRead": 0.19,
+				"input": 0.1428,
+				"output": 2.694296,
+				"cacheRead": 0.185725,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
-			"maxTokens": 131072,
+			"maxTokens": 943718,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -75828,9 +75828,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.0066,
+				"input": 0.0045,
 				"output": 1.28,
-				"cacheRead": 0.0066,
+				"cacheRead": 0.0045,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
@@ -75952,7 +75952,7 @@
 			"cost": {
 				"input": 0.015543,
 				"output": 0.396,
-				"cacheRead": 0.0029100000000000003,
+				"cacheRead": 0.0028510000000000002,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
@@ -78981,9 +78981,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.28,
+				"input": 0.38,
 				"output": 10,
-				"cacheRead": 0.28,
+				"cacheRead": 0.38,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
