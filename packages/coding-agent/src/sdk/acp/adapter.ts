@@ -165,6 +165,13 @@ function replayFailedBeforeDispatch(error: unknown): boolean {
 	return details?.requestSent !== true;
 }
 
+function replayRefusedBeforeLedger(error: unknown): boolean {
+	if (!(error instanceof SdkClientError) || error.transport) return false;
+	// broker_restarting also covers an in-progress ledger row, where the original
+	// request remains unresolved; both responses must preserve sent uncertainty.
+	return error.code === "broker_restarting" || error.code === "unavailable";
+}
+
 function attachReplayRecovery(error: SdkClientError, recovery: unknown): void {
 	Object.assign(error, { recovery });
 }
@@ -641,11 +648,12 @@ export class AcpSdkAdapter {
 					timeoutMs: replayTimeoutMs,
 				});
 			} catch (replayError) {
-				if (!replayFailedBeforeDispatch(replayError)) throw replayError;
+				if (!replayFailedBeforeDispatch(replayError) && !replayRefusedBeforeLedger(replayError)) throw replayError;
 				// The original request was handed to the broker, so its outcome remains
-				// authoritative even when reconnecting for the idempotent replay fails
-				// before a second frame can be sent. Keep its sent identity and details
-				// intact; recovery diagnostics live alongside, not inside, that contract.
+				// authoritative when reconnecting for the idempotent replay fails before
+				// dispatch or the broker refuses it before lifecycle ledger reconciliation.
+				// Keep its sent identity and details intact; recovery diagnostics live
+				// alongside, not inside, that contract.
 				attachReplayRecovery(error, replayError);
 				throw error;
 			}
