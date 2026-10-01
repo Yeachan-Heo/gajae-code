@@ -1,4 +1,4 @@
 ### Fixed
 
-- **Grok CLI version management**: Fixed version resolution to properly fetch and cache the latest Grok CLI version from GitHub releases instead of always using the fallback version. Removed dead code in the 426 error handler that was unreachable due to type mismatch in the response callback. Made `streamGrokCli` async to allow proper awaiting of version fetching, ensuring clients always send the latest version header.
-- **Grok CLI tests**: Fixed tests to mock network calls to GitHub instead of making real HTTP requests. All async operations are now properly awaited, and test assertions correctly validate the fetched version behavior.
+- **Grok CLI version management**: Bumped Grok CLI client version from hardcoded 0.2.33 to 1.0.13. Added background version fetching from GitHub releases with caching (24-hour TTL) and failure caching to prevent retry storms when the GitHub API is unavailable. The version header is always available synchronously (fallback on first call), with best-effort background updates for subsequent requests.
+- **Grok CLI tests**: Fixed tests to mock network calls to GitHub instead of making real HTTP requests. Tests now properly validate cached version behavior and failure handling.
