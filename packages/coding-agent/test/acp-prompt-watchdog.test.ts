@@ -538,6 +538,69 @@ test("a streamed tool-call start stays on the awaiting-model bound until executi
 	}
 });
 
+test("a silent completed todo_write argument stream rejects the ACP client within the documented bound", async () => {
+	const fixture = await createFixture();
+	const diagnostic = vi.spyOn(logger, "error");
+	try {
+		const { pending } = await startTurn(fixture);
+		const outcome = pending.catch((reason: unknown) => reason);
+		const { commandId, turnId } = fixture.correlation();
+		const message = {
+			role: "assistant",
+			content: [
+				{
+					type: "toolCall",
+					id: "todo-complete-args",
+					name: "todo_write",
+					arguments: { ops: [{ op: "init", phases: [] }] },
+				},
+			],
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
+		};
+		// Real provider streams first publish an empty assistant shell, then tool chunks.
+		// Neither complete JSON arguments nor a toolcall_start means tool execution began.
+		for (const type of ["message_start", "message_update"]) {
+			const previousTimer = fixture.clock.armed?.id;
+			fixture.send({
+				type: "event",
+				kind: type,
+				sessionId: fixture.sessionId,
+				commandId,
+				turnId,
+				payload: {
+					event_type: type,
+					event: {
+						type,
+						message: type === "message_start" ? { ...message, content: [] } : message,
+						...(type === "message_update"
+							? { assistantMessageEvent: { type: "toolcall_start", contentIndex: 0, partial: message } }
+							: {}),
+					},
+				},
+			});
+			await waitFor(() => fixture.clock.armed?.id !== previousTimer, `${type} watchdog ingress`);
+		}
+		const deadline = fixture.clock.armed?.at;
+		expect(deadline).toBeDefined();
+		expect(deadline).toBeLessThanOrEqual(fixture.clock.now() + ACP_PROMPT_INFERENCE_TIMEOUT_MS);
+		fixture.clock.advance(ACP_PROMPT_INFERENCE_TIMEOUT_MS);
+		const error = await bounded(outcome, "silent todo ACP rejection");
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("ACP prompt was abandoned");
+		expect((error as Error).message).toContain('"message_update"');
+		expect(
+			diagnostic.mock.calls.some(
+				call =>
+					call[0] === "acp_prompt_watchdog_expired" &&
+					(call[1] as { toolRunning?: boolean })?.toolRunning === false,
+			),
+		).toBe(true);
+	} finally {
+		diagnostic.mockRestore();
+		fixture.dispose();
+	}
+});
+
 test("a foreign failed terminal cannot clear host busy before watchdog rejection", async () => {
 	const fixture = await createFixture();
 	try {

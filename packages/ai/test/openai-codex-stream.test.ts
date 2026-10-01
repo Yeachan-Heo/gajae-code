@@ -3952,6 +3952,77 @@ describe("openai-codex streaming", () => {
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
 
+	it.each([
+		"null",
+		"42",
+		'["task"]',
+		'"task"',
+	])("preserves recovery and diagnostics for non-record provisional arguments: %s", async argumentsJson => {
+		for (const mode of ["replay", "close", "idle"] as const) {
+			class ProvisionalArgumentsWebSocket extends MockWebSocket {
+				constructor(url: string, options?: { headers?: WsHeaders }) {
+					super(url, options);
+					this.scheduleOpen();
+				}
+				send(): void {
+					this.sendJson({
+						type: "response.output_item.added",
+						item: {
+							type: "function_call",
+							id: "fc_provisional",
+							call_id: "call_provisional",
+							name: "todo_write",
+							arguments: "",
+						},
+					});
+					this.sendJson({ type: "response.function_call_arguments.done", arguments: argumentsJson });
+					// No output_item.done: successful JSON parsing does not validate the terminal object.
+					if (mode !== "idle") {
+						this.readyState = MockWebSocket.CLOSED;
+						this.emit("close", { code: 1006 } as unknown as Event);
+					}
+				}
+			}
+			global.WebSocket = ProvisionalArgumentsWebSocket as unknown as typeof WebSocket;
+			const fetchSpy = vi
+				.spyOn(globalThis, "fetch")
+				.mockResolvedValue(
+					new Response(
+						`data: ${JSON.stringify({ type: "response.output_item.added", item: { type: "message", id: "msg_1", role: "assistant", status: "in_progress", content: [] } })}\n\n` +
+							createCompletedCodexSse("Recovered from SSE"),
+						{ headers: { "content-type": "text/event-stream" } },
+					),
+				);
+			try {
+				const result = await streamOpenAICodexResponses(
+					createCodexTestModel("https://chatgpt.com/backend-api"),
+					createCodexTestContext(),
+					{
+						apiKey: createCodexTestToken(),
+						sessionId: `provisional-${argumentsJson}-${mode}`,
+						providerSessionState: new Map<string, ProviderSessionState>(),
+						streamIdleTimeoutMs: 25,
+						disableProviderRetries: mode !== "replay",
+					},
+				).result();
+				if (mode === "replay") {
+					expect(result.stopReason).toBe("stop");
+					expect(result.errorMessage).toBeUndefined();
+					expect(result.content.find(block => block.type === "text")?.text).toBe("Recovered from SSE");
+					expect(fetchSpy).toHaveBeenCalledTimes(1);
+				} else {
+					expect(result.stopReason).toBe("error");
+					expect(result.errorMessage).toContain(
+						mode === "idle" ? "idle timeout waiting for websocket" : "websocket closed (1006)",
+					);
+					expect(fetchSpy).not.toHaveBeenCalled();
+				}
+			} finally {
+				fetchSpy.mockRestore();
+			}
+		}
+	});
+
 	it("replays over SSE when websocket closes after buffered output without a terminal event", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
@@ -4355,6 +4426,65 @@ describe("openai-codex streaming", () => {
 		} finally {
 			if (originalIdle === undefined) delete Bun.env.PI_STREAM_IDLE_TIMEOUT_MS;
 			else Bun.env.PI_STREAM_IDLE_TIMEOUT_MS = originalIdle;
+			fetchSpy.mockRestore();
+		}
+	});
+
+	it.each([
+		false,
+		true,
+	])("ends a silent todo_write start with complete arguments and zero usage (item finalized: %s)", async finalized => {
+		const args = {
+			ops: [{ op: "init", phases: [{ name: "Investigate", tasks: [{ content: "Inspect the stall" }] }] }],
+		};
+		class SilentTodoWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+			send(): void {
+				const item = {
+					type: "function_call",
+					id: "fc_todo",
+					call_id: "call_todo",
+					name: "todo_write",
+					arguments: JSON.stringify(args),
+				};
+				this.sendJson({ type: "response.output_item.added", item });
+				this.sendJson({ type: "response.function_call_arguments.delta", delta: item.arguments });
+				this.sendJson({ type: "response.function_call_arguments.done", arguments: item.arguments });
+				if (finalized) this.sendJson({ type: "response.output_item.done", item });
+				// No response.completed, usage, or subsequent transport activity.
+			}
+		}
+		global.WebSocket = SilentTodoWebSocket as unknown as typeof WebSocket;
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response(new ReadableStream({ start() {} }), {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+		);
+		try {
+			const result = await streamOpenAICodexResponses(
+				createCodexTestModel("https://chatgpt.com/backend-api"),
+				createCodexTestContext(),
+				{
+					apiKey: createCodexTestToken(),
+					sessionId: `silent-complete-todo-${finalized}`,
+					preferWebsockets: true,
+					streamIdleTimeoutMs: 25,
+					streamFirstEventTimeoutMs: 50,
+					providerSessionState: new Map<string, ProviderSessionState>(),
+				},
+			).result();
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain("idle timeout waiting for websocket");
+			expect(result.usage.totalTokens).toBe(0);
+			expect(result.content).toContainEqual(
+				expect.objectContaining({ type: "toolCall", name: "todo_write", arguments: args }),
+			);
+			expect(fetchSpy).not.toHaveBeenCalled();
+		} finally {
 			fetchSpy.mockRestore();
 		}
 	});

@@ -12301,9 +12301,16 @@ export class AgentSession {
 		return this.agent.activeResourceRunId;
 	}
 
-	/** All messages including custom types like BashExecutionMessage */
+	/**
+	 * All messages including custom types like BashExecutionMessage. Request-scoped
+	 * ephemeral copies are retained only in `agent.state.messages` to keep the provider
+	 * cache prefix stable; they are never part of this public view.
+	 */
 	get messages(): AgentMessage[] {
-		return this.agent.state.messages;
+		const messages = this.agent.state.messages;
+		return messages.some(message => message.role === "custom" && this.#isEphemeralCustomMessageType(message.customType))
+			? this.#withoutEphemeralCustomMessages(messages)
+			: messages;
 	}
 	get transcriptPromptGeneration(): number {
 		return this.#promptGeneration;
