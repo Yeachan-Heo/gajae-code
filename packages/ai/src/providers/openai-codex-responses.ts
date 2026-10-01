@@ -1942,7 +1942,6 @@ async function tryRecoverCodexPreviousResponseNotFound(
 		!runtime.sentPreviousResponseId ||
 		runtime.previousResponseRecoveryAttempted ||
 		!websocketState ||
-		context.options?.fallbackManaged ||
 		context.options?.disableProviderRetries ||
 		runtime.transport !== "websocket" ||
 		context.output.content.length > 0 ||
