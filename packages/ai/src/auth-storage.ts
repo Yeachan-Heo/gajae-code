@@ -5775,8 +5775,7 @@ export class AuthStorage {
 			// caller-owned abort, never for an internal timeout.
 			const callerAbort = signal?.aborted && !isTimeoutAbort(signal);
 			const unknownProvider = error instanceof UnknownOAuthProviderError;
-			const taggedError =
-				callerAbort || unknownProvider ? error : tagRefreshAttempt(error, credential.refresh);
+			const taggedError = callerAbort || unknownProvider ? error : tagRefreshAttempt(error, credential.refresh);
 			if (!callerAbort && !unknownProvider && localDial && credentialId !== undefined) {
 				for (const [key, entry] of this.#recentOAuthRefreshFailures) {
 					if (entry.expiresAt <= Date.now()) this.#recentOAuthRefreshFailures.delete(key);
