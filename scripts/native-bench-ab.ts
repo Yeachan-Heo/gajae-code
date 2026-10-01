@@ -58,6 +58,7 @@ const SUITES: Record<
 	{ adapter: string; actualSuite: string; cases: string[]; support?: string[]; defaultIterations?: number }
 > = {
 	"edit-hotspots": { adapter: "packages/natives/bench/edit-hotspots.ts", actualSuite: "edit-hotspots", cases: ["H01", "H02", "H03", "H06"] },
+	"word-diff": { adapter: "packages/natives/bench/word-diff.ts", actualSuite: "word-diff", cases: ["D01", "D02", "D03"], defaultIterations: 20 },
 	grep: { adapter: "packages/natives/bench/grep.ts", actualSuite: "grep", cases: ["G01", "G02", "G03", "G04", "G05", "G06", "G07", "G08"] },
 	"natives-grep": { adapter: "packages/natives/bench/grep.ts", actualSuite: "grep", cases: ["G01", "G02", "G03", "G04", "G05", "G06", "G07", "G08"] },
 	"render-transcript": { adapter: "packages/natives/bench/render-transcript.ts", actualSuite: "render-transcript", cases: ["R01", "R02", "R03"] },
