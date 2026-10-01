@@ -1282,7 +1282,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	 */
 	async #waitForManagedBashJob(
 		job: ManagedBashJobHandle,
-		thresholdMs: number | undefined,
+		thresholdMs: number,
 		signal?: AbortSignal,
 		backgroundRequest?: Promise<FoldReason>,
 		foldAdapter?: FoldAdapter,
@@ -1292,36 +1292,31 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		}
 
 		const startedAt = Date.now();
-		const threshold =
-			thresholdMs === undefined ? undefined : Promise.withResolvers<{ kind: "running"; reason: FoldReason }>();
-		const thresholdTimer =
-			threshold === undefined
-				? undefined
-				: setTimeout(
-						() => {
-							const requestFold = this.session.requestForegroundBashBackground;
-							if (!foldAdapter || !requestFold) {
-								threshold.resolve({ kind: "running", reason: "timer" });
-								return;
-							}
-							void requestFold("timer", foldAdapter)
-								.then(folded => {
-									if (!folded) threshold.resolve({ kind: "running", reason: "timer" });
-								})
-								.catch(error => {
-									logger.warn("Timer-triggered fold failed", {
-										jobId: foldAdapter.jobId,
-										error: error instanceof Error ? error.message : String(error),
-									});
-									threshold.resolve({ kind: "running", reason: "timer" });
-								});
-						},
-						Math.max(0, thresholdMs ?? 0),
-					);
+		const threshold = Promise.withResolvers<{ kind: "running"; reason: FoldReason }>();
+		const thresholdTimer = setTimeout(
+			() => {
+				const requestFold = this.session.requestForegroundBashBackground;
+				if (!foldAdapter || !requestFold) {
+					threshold.resolve({ kind: "running", reason: "timer" });
+					return;
+				}
+				void requestFold("timer", foldAdapter)
+					.then(folded => {
+						if (!folded) threshold.resolve({ kind: "running", reason: "timer" });
+					})
+					.catch(error => {
+						logger.warn("Timer-triggered fold failed", {
+							jobId: foldAdapter.jobId,
+							error: error instanceof Error ? error.message : String(error),
+						});
+						threshold.resolve({ kind: "running", reason: "timer" });
+					});
+			},
+			Math.max(0, thresholdMs),
+		);
 		const waiters: Array<
 			Promise<ManagedBashJobCompletion | { kind: "running"; reason: FoldReason } | { kind: "aborted" }>
-		> = [job.completion];
-		if (threshold) waiters.push(threshold.promise);
+		> = [job.completion, threshold.promise];
 		if (backgroundRequest) {
 			waiters.push(backgroundRequest.then(reason => ({ kind: "running" as const, reason })));
 		}
@@ -1342,7 +1337,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			return await Promise.race(waiters);
 		} finally {
 			stopSteerWatch();
-			if (thresholdTimer !== undefined) clearTimeout(thresholdTimer);
+			clearTimeout(thresholdTimer);
 			if (signal && onAbort) signal.removeEventListener("abort", onAbort);
 		}
 	}
@@ -1903,11 +1898,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// longer has to be bypassed to make folding work. A capable ACP session keeps
 		// its terminal contract and still folds.
 		if (!pty && ownedManager && !clientTerminalActive) {
-			// With auto-background off, the foreground wait has no timer threshold, so the job
-			// only leaves the foreground on an explicit Ctrl+B or steer fold.
+			// With auto-background off, wait past the command's own timeout so the job only
+			// leaves the foreground on an explicit Ctrl+B fold, never on an auto-background timer.
 			const autoBackgroundWaitMs = this.#autoBackgroundEnabled
 				? this.#resolveAutoBackgroundWaitMs(timeoutMs)
-				: undefined;
+				: timeoutMs + 1_000;
 			const startBackgrounded = autoBackgroundWaitMs === 0;
 			let managedForegroundSettled = false;
 			const job = this.#startManagedBashJob({
@@ -2609,7 +2604,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			try {
 				bridgeWait = await this.#waitForManagedBashJob(
 					bridgeHandle,
-					this.#autoBackgroundEnabled ? this.#resolveAutoBackgroundWaitMs(timeoutMs) : undefined,
+					this.#autoBackgroundEnabled ? this.#resolveAutoBackgroundWaitMs(timeoutMs) : timeoutMs + 1_000,
 					signal,
 					bridgeFoldRequest.promise,
 					bridgeFoldAdapter,
