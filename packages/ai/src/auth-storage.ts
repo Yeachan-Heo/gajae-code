@@ -531,7 +531,8 @@ export interface AuthCredentialStore {
 	 * Atomically adopts a fresh row or claims the current refresh token for one
 	 * local provider dial. SQLite-backed stores use this to prevent another
 	 * process from replaying a rotating refresh token between a pre-read and
-	 * the provider request.
+	 * the provider request. The supplied clock is advanced by any time spent
+	 * waiting for the immediate write reservation.
 	 */
 	claimOAuthRefreshLease?(
 		credentialId: number,
@@ -7217,7 +7218,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			`);
 			this.#db.run("DROP TABLE auth_credentials_v0");
 		});
-		migrate();
+		migrate.immediate();
 	}
 
 	#migrateAuthSchemaV1OrV2ToV3(): void {
@@ -7239,7 +7240,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			`);
 			this.#db.run("DROP TABLE auth_credentials_legacy");
 		});
-		migrate();
+		migrate.immediate();
 	}
 
 	#migrateAuthSchemaV3ToV4(): void {
@@ -7261,7 +7262,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			`);
 			this.#db.run("DROP TABLE auth_credentials_v3");
 		});
-		migrate();
+		migrate.immediate();
 	}
 	#migrateAuthSchemaV4ToV5(): void {
 		const columns = this.#db.prepare("PRAGMA table_info(auth_credentials)").all() as Array<{ name?: string }>;
@@ -7364,7 +7365,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				.run(`usage_cache:report:${provider}:`.length, `usage_cache:report:${provider}:`);
 			return { kind: "removed", ids: unique.map(target => target.id) };
 		});
-		return remove();
+		return remove.immediate();
 	}
 	claimOAuthRefreshLease(
 		credentialId: number,
@@ -7374,7 +7375,9 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		nowMs: number,
 		leaseMs: number,
 	): OAuthRefreshLeaseClaim {
+		const enteredAtMs = Date.now();
 		const claim = this.#db.transaction((): OAuthRefreshLeaseClaim => {
+			const effectiveNowMs = nowMs + Math.max(0, Date.now() - enteredAtMs);
 			const row = this.#db
 				.prepare(
 					"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials WHERE id = ? AND disabled_cause IS NULL",
@@ -7382,17 +7385,21 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				.get(credentialId) as AuthRow | undefined;
 			const credential = row ? deserializeCredential(row) : null;
 			if (credential?.type !== "oauth") return { kind: "missing" };
-			if (!force && credential.refresh !== expectedRefresh && nowMs + OAUTH_REFRESH_SKEW_MS < credential.expires) {
+			if (
+				!force &&
+				credential.refresh !== expectedRefresh &&
+				effectiveNowMs + OAUTH_REFRESH_SKEW_MS < credential.expires
+			) {
 				return { kind: "adopted", credential };
 			}
 			const active = this.#db
 				.prepare("SELECT owner, expires_at FROM oauth_refresh_leases WHERE credential_id = ?")
 				.get(credentialId) as { owner?: string; expires_at?: number } | undefined;
-			if (typeof active?.expires_at === "number" && active.expires_at > nowMs) {
+			if (typeof active?.expires_at === "number" && active.expires_at > effectiveNowMs) {
 				if (active.owner === owner) {
 					this.#db
 						.prepare("UPDATE oauth_refresh_leases SET expires_at = ? WHERE credential_id = ? AND owner = ?")
-						.run(nowMs + leaseMs, credentialId, owner);
+						.run(effectiveNowMs + leaseMs, credentialId, owner);
 					return {
 						kind: "claimed",
 						credential,
@@ -7412,10 +7419,10 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				.prepare(
 					"INSERT INTO oauth_refresh_leases (credential_id, owner, token_fingerprint, expires_at) VALUES (?, ?, ?, ?)",
 				)
-				.run(credentialId, owner, tokenFingerprint, nowMs + leaseMs);
+				.run(credentialId, owner, tokenFingerprint, effectiveNowMs + leaseMs);
 			return { kind: "claimed", credential, lease: { credentialId, owner, tokenFingerprint } };
 		});
-		return claim();
+		return claim.immediate();
 	}
 
 	completeOAuthRefreshLease(lease: OAuthRefreshLease, credential: OAuthCredential): boolean {
@@ -7450,7 +7457,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				.run(lease.credentialId, lease.owner);
 			return true;
 		});
-		return complete();
+		return complete.immediate();
 	}
 
 	releaseOAuthRefreshLease(lease: OAuthRefreshLease): void {
@@ -7512,7 +7519,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			return result;
 		});
 
-		const result = replace(provider, credentials);
+		const result = replace.immediate(provider, credentials);
 		this.#purgeSupersededDisabledRows(provider, result);
 		return result;
 	}
@@ -7559,7 +7566,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			return result;
 		});
 
-		const result = upsert(provider, credential);
+		const result = upsert.immediate(provider, credential);
 		this.#purgeSupersededDisabledRows(provider, result);
 		return result;
 	}
@@ -7756,12 +7763,22 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 
 	tryAcquireUsageFetchLease(key: string, owner: string, nowMs: number, leaseMs: number): boolean | undefined {
 		try {
-			const nowSec = Math.floor(nowMs / 1000);
-			const expiresAtSec = Math.ceil((nowMs + leaseMs) / 1000);
-			const result = this.#claimUsageFetchLeaseStmt.run(`usage_fetch_lease:${key}`, owner, expiresAtSec, nowSec) as {
-				changes: number;
-			};
-			return result.changes === 1;
+			const enteredAtMs = Date.now();
+			const claim = this.#db.transaction(() => {
+				const effectiveNowMs = nowMs + Math.max(0, Date.now() - enteredAtMs);
+				const nowSec = Math.floor(effectiveNowMs / 1000);
+				const expiresAtSec = Math.ceil((effectiveNowMs + leaseMs) / 1000);
+				const result = this.#claimUsageFetchLeaseStmt.run(
+					`usage_fetch_lease:${key}`,
+					owner,
+					expiresAtSec,
+					nowSec,
+				) as {
+					changes: number;
+				};
+				return result.changes === 1;
+			});
+			return claim.immediate();
 		} catch {
 			return undefined;
 		}
@@ -7783,7 +7800,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			this.#upsertCacheStmt.run(key, String(next), expiresAtSec);
 			return next;
 		});
-		return allocate();
+		return allocate.immediate();
 	}
 
 	deleteCachePrefix(prefix: string): void {

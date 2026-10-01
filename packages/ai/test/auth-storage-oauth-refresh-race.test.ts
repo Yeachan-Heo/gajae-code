@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -1873,6 +1874,113 @@ describe("AuthStorage OAuth refresh race", () => {
 			peerStore.close();
 		}
 	});
+
+	test("waits for another process write before claiming and completing a lease", async () => {
+		if (!authStorage || !(store instanceof SqliteAuthCredentialStore)) throw new Error("test setup failed");
+		const sqliteStore = store;
+		await authStorage.set("anthropic", [
+			{ type: "oauth", access: "expired-access", refresh: "shared-refresh", expires: Date.now() - 60_000 },
+		]);
+		const [stored] = sqliteStore.listAuthCredentials("anthropic");
+		if (!stored) throw new Error("credential missing");
+
+		const holdWriteLock = async (holdMs = 50): Promise<Bun.Subprocess> => {
+			const lockProcess = Bun.spawn(
+				[
+					process.execPath,
+					path.join(import.meta.dir, "fixtures/hold-sqlite-write-lock.ts"),
+					path.join(tempDir, "agent.db"),
+					String(holdMs),
+				],
+				{
+					stdout: "pipe",
+					stderr: "pipe",
+				},
+			);
+			const reader = lockProcess.stdout.getReader();
+			const { value, done } = await reader.read();
+			reader.releaseLock();
+			if (done || !value || !new TextDecoder().decode(value).includes("LOCKED")) {
+				throw new Error("SQLite lock helper did not acquire the write lock");
+			}
+			return lockProcess;
+		};
+
+		const claimLock = await holdWriteLock();
+		const claim = sqliteStore.claimOAuthRefreshLease(
+			stored.id,
+			"shared-refresh",
+			false,
+			"owner-a",
+			Date.now(),
+			60_000,
+		);
+		await claimLock.exited;
+		expect(claim.kind).toBe("claimed");
+		if (claim.kind !== "claimed") return;
+
+		const completeLock = await holdWriteLock();
+		expect(() =>
+			sqliteStore.completeOAuthRefreshLease(claim.lease, {
+				type: "oauth",
+				access: "fresh-access",
+				refresh: "fresh-refresh",
+				expires: Date.now() + 60 * 60_000,
+			}),
+		).not.toThrow();
+		await completeLock.exited;
+	});
+
+	test("starts a refresh lease after waiting for the immediate reservation", async () => {
+		if (!authStorage || !(store instanceof SqliteAuthCredentialStore)) throw new Error("test setup failed");
+		const sqliteStore = store;
+		await authStorage.set("anthropic", [
+			{ type: "oauth", access: "expired-access", refresh: "shared-refresh", expires: Date.now() - 60_000 },
+		]);
+		const [stored] = sqliteStore.listAuthCredentials("anthropic");
+		if (!stored) throw new Error("credential missing");
+
+		const lockProcess = Bun.spawn(
+			[
+				process.execPath,
+				path.join(import.meta.dir, "fixtures/hold-sqlite-write-lock.ts"),
+				path.join(tempDir, "agent.db"),
+				"1500",
+			],
+			{ stdout: "pipe", stderr: "pipe" },
+		);
+		const reader = lockProcess.stdout.getReader();
+		const { value, done } = await reader.read();
+		reader.releaseLock();
+		if (done || !value || !new TextDecoder().decode(value).includes("LOCKED")) {
+			throw new Error("SQLite lock helper did not acquire the write lock");
+		}
+
+		const leaseMs = 1_000;
+		const sampledNowMs = Date.now();
+		const claim = sqliteStore.claimOAuthRefreshLease(
+			stored.id,
+			"shared-refresh",
+			false,
+			"owner-a",
+			sampledNowMs,
+			leaseMs,
+		);
+		const returnedAtMs = Date.now();
+		await lockProcess.exited;
+		expect(claim.kind).toBe("claimed");
+
+		const db = new Database(path.join(tempDir, "agent.db"), { readonly: true });
+		try {
+			const row = db.prepare("SELECT expires_at FROM oauth_refresh_leases WHERE credential_id = ?").get(stored.id) as
+				| { expires_at?: number }
+				| undefined;
+			expect(row?.expires_at).toBeGreaterThanOrEqual(returnedAtMs + leaseMs - 150);
+		} finally {
+			db.close();
+		}
+	});
+
 	test("expires abandoned leases, isolates credentials, and never lets force steal an active lease", async () => {
 		if (!authStorage || !(store instanceof SqliteAuthCredentialStore)) throw new Error("test setup failed");
 		await authStorage.set("anthropic", [
