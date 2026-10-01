@@ -4143,6 +4143,7 @@ interface PreflightHooks {
 	onPreflightAccepted?: () => void;
 	onPreflightAcceptCommit?: () => void | Promise<void>;
 	expectedSdkRunToken?: string;
+	onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 }
 
 interface ResponseFrame {
@@ -5233,6 +5234,129 @@ describe("post-acceptance invocation terminalization", () => {
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
+	test("unowned predecessor end cannot publish a queued successor receipt", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "sdk-unowned-predecessor-"));
+		const promotions: Array<(promotion: { startsOwnRun: boolean }) => void> = [];
+		const harness = await invocationHarness("unowned-predecessor", cwd, {
+			sendUserMessage: async (_content, options) => {
+				await options?.onPreflightAcceptCommit?.();
+				if (options?.onQueuedPromoted) promotions.push(options.onQueuedPromoted);
+				options?.onPreflightAccepted?.();
+			},
+		});
+		try {
+			await harness.emit("agent_start");
+			const accepted = await harness.control("turn.follow_up", { text: "queued verification" });
+			expect(accepted.ok).toBe(true);
+			expect(promotions).toHaveLength(1);
+			promotions[0]!({ startsOwnRun: true });
+			await harness.emit("agent_start");
+			const selector = {
+				kind: "prompt",
+				commandId: accepted.result?.commandId,
+				turnId: accepted.result?.turnId,
+			};
+			await harness.emit("agent_end", { messages: [{ role: "assistant", content: "predecessor final" }] });
+			expect(await harness.query("turn.result", selector)).toMatchObject({
+				result: { status: "in_flight", receiptState: "absent" },
+			});
+			await harness.emit("agent_end", { messages: [{ role: "assistant", content: "verification final" }] });
+			expect(await harness.query("turn.result", selector)).toMatchObject({
+				result: {
+					status: "terminal_ok",
+					turnId: accepted.result?.turnId,
+					receiptState: "present",
+					content: { text: "verification final" },
+				},
+			});
+		} finally {
+			await harness.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("unowned run stays paired after predecessor SDK references retire", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "sdk-unowned-retirement-"));
+		const promotions: Array<(promotion: { startsOwnRun: boolean }) => void> = [];
+		const harness = await invocationHarness("unowned-retirement", cwd, {
+			sendUserMessage: async (_content, options) => {
+				await options?.onPreflightAcceptCommit?.();
+				if (options?.onQueuedPromoted) promotions.push(options.onQueuedPromoted);
+				options?.onPreflightAccepted?.();
+			},
+		});
+		try {
+			const first = await harness.control("turn.follow_up", { text: "first" });
+			expect(promotions).toHaveLength(1);
+			promotions[0]!({ startsOwnRun: true });
+			await harness.emit("agent_start");
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", { messages: [{ role: "assistant", content: "first final" }] });
+			expect(
+				await harness.query("turn.result", {
+					kind: "prompt",
+					commandId: first.result?.commandId,
+					turnId: first.result?.turnId,
+				}),
+			).toMatchObject({ result: { status: "terminal_ok", content: { text: "first final" } } });
+			const next = await harness.control("turn.follow_up", { text: "next" });
+			expect(promotions).toHaveLength(2);
+			promotions[1]!({ startsOwnRun: true });
+			await harness.emit("agent_start");
+			const selector = { kind: "prompt", commandId: next.result?.commandId, turnId: next.result?.turnId };
+			await harness.emit("agent_end", { messages: [{ role: "assistant", content: "unowned final" }] });
+			expect(await harness.query("turn.result", selector)).toMatchObject({
+				result: { status: "in_flight", receiptState: "absent" },
+			});
+			await harness.emit("agent_end", { messages: [{ role: "assistant", content: "next final" }] });
+			expect(await harness.query("turn.result", selector)).toMatchObject({
+				result: { status: "terminal_ok", content: { text: "next final" } },
+			});
+		} finally {
+			await harness.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("unowned run retains attached invocation across predecessor completion", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "sdk-unowned-attached-"));
+		const promotions: Array<(promotion: { startsOwnRun: boolean }) => void> = [];
+		const harness = await invocationHarness("unowned-attached", cwd, {
+			sendUserMessage: async (_content, options) => {
+				await options?.onPreflightAcceptCommit?.();
+				if (options?.onQueuedPromoted) promotions.push(options.onQueuedPromoted);
+				options?.onPreflightAccepted?.();
+			},
+		});
+		try {
+			await harness.control("turn.follow_up", { text: "predecessor" });
+			expect(promotions).toHaveLength(1);
+			promotions[0]!({ startsOwnRun: true });
+			await harness.emit("agent_start");
+			await harness.emit("agent_start");
+			const attached = await harness.control("turn.follow_up", { text: "attach to current unowned run" });
+			expect(attached.ok).toBe(true);
+			expect(promotions).toHaveLength(2);
+			promotions[1]!({ startsOwnRun: false });
+			const selector = {
+				kind: "prompt",
+				commandId: attached.result?.commandId,
+				turnId: attached.result?.turnId,
+			};
+			await harness.emit("agent_end", { messages: [{ role: "assistant", content: "predecessor final" }] });
+			expect(await harness.query("turn.result", selector)).toMatchObject({
+				result: { status: expect.stringMatching(/accepted|in_flight/), receiptState: "absent" },
+			});
+			await harness.emit("agent_end", { messages: [{ role: "assistant", content: "attached final" }] });
+			expect(await harness.query("turn.result", selector)).toMatchObject({
+				result: { status: "terminal_ok", content: { text: "attached final" } },
+			});
+		} finally {
+			await harness.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("immediate prompt after abort ack is not terminalized by the aborted turn's delayed agent_end", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-abort-immediate-prompt-"));
 		try {
