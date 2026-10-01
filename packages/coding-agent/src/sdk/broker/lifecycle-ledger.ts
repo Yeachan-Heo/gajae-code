@@ -33,8 +33,8 @@ export interface LifecycleCleanupProof {
 	processExited: true;
 	endpointRemoved: true;
 	hostUnregistered:
-	| { state: "unregistered"; indexSeq: number; lifecycleRequestId?: string }
-	| { state: "not_registered" };
+		| { state: "unregistered"; indexSeq: number; lifecycleRequestId?: string }
+		| { state: "not_registered" };
 	rollback: {
 		endpointGeneration: number | null;
 		fenced: true;
@@ -246,14 +246,14 @@ function hasValidTerminalDigests(entry: LifecycleLedgerEntry): boolean {
 		entry.response === undefined
 			? undefined
 			: createHash("sha256")
-				.update(
-					canonicalJson(
-						cleanupPendingResponse
-							? { intendedSessionId: entry.intendedSessionId, response: entry.response }
-							: entry.response,
-					),
-				)
-				.digest("hex");
+					.update(
+						canonicalJson(
+							cleanupPendingResponse
+								? { intendedSessionId: entry.intendedSessionId, response: entry.response }
+								: entry.response,
+						),
+					)
+					.digest("hex");
 	if (entry.responseDigest !== undefined) {
 		if (entry.response === undefined || entry.responseDigest !== expectedResponseDigest) return false;
 	} else if (responseDigestRequired) return false;
@@ -266,14 +266,14 @@ function hasValidTerminalDigests(entry: LifecycleLedgerEntry): boolean {
 			typeof entry.unresolvedCleanupResponseDigest !== "string" ||
 			unresolvedResponse.error?.cleanup?.sessionId !== entry.intendedSessionId ||
 			entry.unresolvedCleanupResponseDigest !==
-			createHash("sha256")
-				.update(
-					canonicalJson({
-						intendedSessionId: entry.intendedSessionId,
-						response: entry.unresolvedCleanupResponse,
-					}),
-				)
-				.digest("hex")
+				createHash("sha256")
+					.update(
+						canonicalJson({
+							intendedSessionId: entry.intendedSessionId,
+							response: entry.unresolvedCleanupResponse,
+						}),
+					)
+					.digest("hex")
 		)
 			return false;
 	}
@@ -699,10 +699,7 @@ export class LifecycleLedger {
 					latest =>
 						latest.identity !== replacement?.identity &&
 						terminal(latest.state) &&
-						!(
-							latest.operationKey?.startsWith("session.close\u0000") &&
-							latest.closeAuthorityBound !== true
-						) &&
+						!(latest.operationKey?.startsWith("session.close\u0000") && latest.closeAuthorityBound !== true) &&
 						!protectedCreateIdentities.has(latest.identity) &&
 						pendingCleanupSessionId(latest.response) === undefined &&
 						pendingCleanupSessionId(latest.unresolvedCleanupResponse) === undefined,
@@ -746,9 +743,9 @@ export class LifecycleLedger {
 			const h = await fs.open(
 				temporary,
 				fsSync.constants.O_WRONLY |
-				fsSync.constants.O_CREAT |
-				fsSync.constants.O_EXCL |
-				fsSync.constants.O_NOFOLLOW,
+					fsSync.constants.O_CREAT |
+					fsSync.constants.O_EXCL |
+					fsSync.constants.O_NOFOLLOW,
 				0o600,
 			);
 			try {
@@ -765,7 +762,7 @@ export class LifecycleLedger {
 			this.#rowCount = snapshot.length;
 			this.#byteCount = contents.length;
 		} finally {
-			if (!renamed) await fs.unlink(temporary).catch(() => { });
+			if (!renamed) await fs.unlink(temporary).catch(() => {});
 		}
 		return replacement !== undefined;
 	}
