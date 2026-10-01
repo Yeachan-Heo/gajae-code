@@ -7,9 +7,9 @@
 import { describe, expect, test } from "bun:test";
 import { withProviderSafetyStopAdapterInvocation } from "../src/adapter-internals/provider-safety-stop";
 import { crc32 } from "../src/providers/aws-eventstream";
+import type { KiroCodeWhispererOptions } from "../src/providers/kiro-codewhisperer";
 import { streamKiroCodeWhisperer } from "../src/providers/kiro-codewhisperer";
 import type { Context, Model } from "../src/types";
-import type { KiroCodeWhispererOptions } from "../src/providers/kiro-codewhisperer";
 
 // ---- Frame builder (mirrors aws-eventstream.ts for test isolation) ----
 
@@ -68,7 +68,11 @@ function streamFrom(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
 
 const originalFetch = globalThis.fetch;
 
-function trustedStreamKiroCodeWhisperer(model: Model<"kiro-codewhisperer-stream">, context: Context, options: KiroCodeWhispererOptions) {
+function trustedStreamKiroCodeWhisperer(
+	model: Model<"kiro-codewhisperer-stream">,
+	context: Context,
+	options: KiroCodeWhispererOptions,
+) {
 	return streamKiroCodeWhisperer(model, context, withProviderSafetyStopAdapterInvocation(options));
 }
 
