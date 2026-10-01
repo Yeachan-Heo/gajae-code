@@ -15,6 +15,7 @@ import {
 	readBrokerDiscovery,
 	readBrokerRestartIntent,
 } from "./discovery";
+import { observeProcessIncarnation } from "./process-incarnation";
 import {
 	isSdkInternalRuntimeImagePresent,
 	resolveSdkInternalSpawnCommand,
@@ -580,7 +581,7 @@ async function reapSpawnedBroker(
 	// run out the TERM/KILL windows or report a stuck child that never existed.
 	if (pidToReap === undefined) return;
 	if (pidToReap !== child.pid) {
-		await reapDetachedBrokerPid(pidToReap, timing);
+		await reapDetachedBrokerPid(pidToReap, brokerIncarnation, timing);
 		return;
 	}
 	// Reaping owns repeated teardown diagnostics too. Keep exactly one error
@@ -630,8 +631,14 @@ async function reapSpawnedBroker(
  * Reap a broker this process launched through the Windows hop. The hop has already
  * exited, so its ChildProcess carries no signal to await: the real broker is targeted
  * by the pid the hop reported, and exit is proven by the pid no longer existing.
+ * On Windows, verify the pid still names the original broker (not a recycled pid)
+ * by checking its incarnation before signaling.
  */
-async function reapDetachedBrokerPid(pid: number, timing: ReapTiming): Promise<void> {
+async function reapDetachedBrokerPid(
+	pid: number,
+	brokerIncarnation?: string,
+	timing: ReapTiming = DEFAULT_REAP_TIMING,
+): Promise<void> {
 	const awaitGone = async (windowMs: number): Promise<boolean> => {
 		const deadline = Date.now() + windowMs;
 		while (isPidAlive(pid)) {
@@ -648,6 +655,14 @@ async function reapDetachedBrokerPid(pid: number, timing: ReapTiming): Promise<v
 		}
 	};
 	if (!isPidAlive(pid)) return;
+	// On Windows, verify incarnation before signaling to avoid killing a recycled pid.
+	// If incarnation doesn't match or is unknown, treat it as already exited.
+	if (brokerIncarnation) {
+		const observation = observeProcessIncarnation(pid);
+		if (observation.status !== "present" || observation.incarnation !== brokerIncarnation) {
+			return; // Process is gone, unknown, or pid was recycled
+		}
+	}
 	signal("SIGTERM");
 	if (await awaitGone(timing.gracefulMs)) return;
 	signal("SIGKILL");
