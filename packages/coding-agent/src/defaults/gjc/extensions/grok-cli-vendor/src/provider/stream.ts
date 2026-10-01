@@ -6,8 +6,9 @@ import type {
   SimpleStreamOptions,
 } from '@gajae-code/ai/core';
 import { streamOpenAIResponses } from '@gajae-code/ai/providers/openai-responses';
+import { getGrokCliVersion, updateVersionFromError } from './version-manager';
 
-const GROK_CLI_VERSION = '0.2.33';
+let cachedVersion: string | null = null;
 
 /**
  * Stream function that adds Grok CLI-specific headers to requests.
@@ -16,6 +17,7 @@ const GROK_CLI_VERSION = '0.2.33';
  *   - x-grok-conv-id: <session/conversation ID>
  *   - x-grok-model-override: <model ID>
  *   - x-xai-token-auth: xai-grok-cli
+ *   - x-grok-client-version: resolved dynamically with 426 error handling
  */
 export function streamGrokCli(
   model: Model<Api>,
@@ -23,10 +25,22 @@ export function streamGrokCli(
   options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
   const sessionId = options?.sessionId;
+
+  // Ensure we have a version available synchronously
+  // The async getGrokCliVersion will prime the cache for next request
+  if (cachedVersion === null) {
+    // Initialize with async fetch for background updates
+    getGrokCliVersion().then((version) => {
+      cachedVersion = version;
+    });
+    // Use fallback immediately
+    cachedVersion = '1.0.13';
+  }
+
   const headers: Record<string, string> = {
     ...options?.headers,
     'x-grok-client-identifier': 'gjc-grok-cli',
-    'x-grok-client-version': GROK_CLI_VERSION,
+    'x-grok-client-version': cachedVersion,
     'x-xai-token-auth': 'xai-grok-cli',
     'x-grok-model-override': model.id,
   };
@@ -43,7 +57,17 @@ export function streamGrokCli(
   return streamOpenAIResponses(responsesModel, context, {
     ...options,
     headers,
-    onResponse(response) {
+    async onResponse(response) {
+      // Handle HTTP 426 "version outdated" errors
+      if (response.status === 426) {
+        try {
+          const errorText = await response.text();
+          const updatedVersion = updateVersionFromError(errorText);
+          cachedVersion = updatedVersion;
+        } catch (err) {
+          // Silently ignore parse errors
+        }
+      }
       options?.onResponse?.(response, model);
     },
   });
