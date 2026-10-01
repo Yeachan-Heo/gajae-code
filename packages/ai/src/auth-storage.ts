@@ -1677,10 +1677,19 @@ export class AuthStorage {
 	#hasConfigOverride(provider: string, owner?: object): boolean {
 		return this.#configOverrideRegistration(provider, owner) !== undefined;
 	}
-	getProviderEvidenceGeneration(provider: string, resolvedApiKey?: string, owner?: object): string {
+	/**
+	 * Return provider-specific discovery evidence. `stagedConfigApiKey` lets a read-only
+	 * config candidate derive the same fingerprint before its owner-scoped override is published.
+	 */
+	getProviderEvidenceGeneration(
+		provider: string,
+		resolvedApiKey?: string,
+		owner?: object,
+		stagedConfigApiKey?: { apiKey: string },
+	): string {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		provider = storageProvider;
-		const configOverride = this.#configOverrideRegistration(storageProvider, owner);
+		const configOverride = stagedConfigApiKey ?? this.#configOverrideRegistration(storageProvider, owner);
 		const ownerGeneration = owner ? this.#getOwnerProviderGeneration(owner, storageProvider) : 0;
 		const ownerFallbackGeneration = owner ? this.#getOwnerFallbackGeneration(owner) : this.#fallbackGeneration;
 		const generation = owner
@@ -3488,16 +3497,12 @@ export class AuthStorage {
 	getEffectiveCredentialType(
 		provider: string,
 		sessionId?: string,
-		options?: Pick<AuthApiKeyOptions, "owner">,
+		options?: Pick<AuthApiKeyOptions, "owner" | "credentialSelector">,
 	): AuthCredential["type"] | undefined {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		let selected: ({ index: number } & StoredCredential) | undefined;
 		try {
-			selected = this.#resolveSelectedStoredCredential(
-				storageProvider,
-				options?.owner ? { owner: options.owner } : undefined,
-				sessionId,
-			);
+			selected = this.#resolveSelectedStoredCredential(storageProvider, options, sessionId);
 		} catch {
 			return undefined;
 		}
@@ -3519,17 +3524,14 @@ export class AuthStorage {
 		return undefined;
 	}
 
-	/**
-	 * Check whether configured auth is currently usable without resolving credentials.
-	 */
-	hasUsableAuth(provider: string, options?: Pick<AuthApiKeyOptions, "owner">): boolean {
+	/** Check whether configured auth is usable without resolving credentials or refreshing OAuth. */
+	hasUsableAuth(
+		provider: string,
+		options?: Pick<AuthApiKeyOptions, "owner" | "credentialSelector"> & { sessionId?: string },
+	): boolean {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		try {
-			const selectedCredential = this.#resolveSelectedStoredCredential(
-				storageProvider,
-				options?.owner ? { owner: options.owner } : undefined,
-				undefined,
-			);
+			const selectedCredential = this.#resolveSelectedStoredCredential(storageProvider, options, options?.sessionId);
 			if (this.hasRuntimeApiKey(storageProvider)) return true;
 			if (this.#hasConfigOverride(storageProvider, options?.owner)) return true;
 			if (selectedCredential) {

@@ -1812,9 +1812,20 @@ function createStagedAuthStorage(base: AuthStorage): StagedAuthStorageState {
 	): Promise<string | undefined> => {
 		if (base.hasRuntimeApiKey(provider)) return base.peekApiKey(provider, options);
 		const configured = getConfigApiKey(provider, options?.owner);
+		if (
+			configured &&
+			base.resolveEffectiveCredentialSelector(provider, options?.sessionId, options?.credentialSelector)
+		) {
+			throw new Error(
+				`Credential selector cannot be used for ${provider} while a config API key override is active`,
+			);
+		}
 		if (configured && !configured.envSourced) return configured.apiKey;
 		if (configured?.envSourced) {
-			const credentialType = base.getEffectiveCredentialType(provider, options?.sessionId, { owner: lookupOwner });
+			const credentialType = base.getEffectiveCredentialType(provider, options?.sessionId, {
+				owner: lookupOwner,
+				credentialSelector: options?.credentialSelector,
+			});
 			if (credentialType !== "api_key") return configured.apiKey;
 		}
 		const storedKey = await base.peekApiKey(provider, { ...options, owner: lookupOwner });
@@ -1857,45 +1868,83 @@ function createStagedAuthStorage(base: AuthStorage): StagedAuthStorageState {
 			}
 			if (property === "onGenerationChanged") return () => () => {};
 			if (property === "peekApiKey") return peekApiKey;
-			if (property === "getApiKey") {
+			if (property === "getApiKey")
 				return (provider: string, sessionId?: string, options?: AuthApiKeyOptions) =>
 					peekApiKey(provider, { ...options, sessionId });
-			}
 			if (property === "hasConfigApiKey") {
 				return (provider: string, owner?: object) =>
 					getConfigApiKey(provider, owner) !== undefined || base.hasConfigApiKey(provider, lookupOwner);
 			}
 			if (property === "hasAuth") {
-				return (provider: string, sessionId?: string, options?: { owner?: object }) =>
-					getConfigApiKey(provider, options?.owner) !== undefined ||
-					base.hasAuth(provider, sessionId, { owner: lookupOwner });
+				return (provider: string, sessionId?: string, options?: { owner?: object }) => {
+					const configured = getConfigApiKey(provider, options?.owner);
+					if (configured && base.resolveEffectiveCredentialSelector(provider, sessionId)) return false;
+					return configured !== undefined || base.hasAuth(provider, sessionId, { owner: lookupOwner });
+				};
 			}
 			if (property === "hasUsableAuth") {
-				return (provider: string, options?: { owner?: object }) =>
-					getConfigApiKey(provider, options?.owner) !== undefined ||
-					base.hasUsableAuth(provider, { owner: lookupOwner });
+				return (
+					provider: string,
+					options?: { owner?: object; sessionId?: string; credentialSelector?: AuthCredentialSelector },
+				) => {
+					const configured = getConfigApiKey(provider, options?.owner);
+					if (
+						configured &&
+						base.resolveEffectiveCredentialSelector(provider, options?.sessionId, options?.credentialSelector)
+					) {
+						return false;
+					}
+					return (
+						configured !== undefined ||
+						base.hasUsableAuth(provider, {
+							owner: lookupOwner,
+							sessionId: options?.sessionId,
+							credentialSelector: options?.credentialSelector,
+						})
+					);
+				};
 			}
 			if (property === "getEffectiveCredentialType") {
-				return (provider: string, sessionId?: string, options?: { owner?: object }) => {
+				return (
+					provider: string,
+					sessionId?: string,
+					options?: { owner?: object; credentialSelector?: AuthCredentialSelector },
+				) => {
 					if (base.hasRuntimeApiKey(provider))
 						return base.getEffectiveCredentialType(provider, sessionId, options);
 					const configured = getConfigApiKey(provider, options?.owner);
+					if (
+						configured &&
+						base.resolveEffectiveCredentialSelector(provider, sessionId, options?.credentialSelector)
+					) {
+						return undefined;
+					}
 					if (
 						configured &&
 						!(configured.envSourced && base.getSessionCredentialType(provider, sessionId) === "api_key")
 					) {
 						return "api_key";
 					}
-					return base.getEffectiveCredentialType(provider, sessionId, { owner: lookupOwner });
+					return base.getEffectiveCredentialType(provider, sessionId, {
+						owner: lookupOwner,
+						credentialSelector: options?.credentialSelector,
+					});
 				};
 			}
 			if (property === "getProviderEvidenceGeneration") {
 				return (provider: string, resolvedApiKey?: string, owner?: object) => {
-					const generation = base.getProviderEvidenceGeneration(provider, resolvedApiKey, lookupOwner);
 					const configured = getConfigApiKey(provider, owner);
-					return configured
-						? crypto.createHash("sha256").update(`${generation}\0${configured.apiKey}`).digest("hex")
-						: generation;
+					const effectiveApiKey = base.hasRuntimeApiKey(provider)
+						? resolvedApiKey
+						: configured && !configured.envSourced
+							? configured.apiKey
+							: (resolvedApiKey ?? configured?.apiKey);
+					return base.getProviderEvidenceGeneration(
+						provider,
+						effectiveApiKey,
+						lookupOwner,
+						configured ? { apiKey: configured.apiKey } : undefined,
+					);
 				};
 			}
 			const value = Reflect.get(target, property, target);
@@ -2127,6 +2176,9 @@ export class ModelRegistry {
 		this.#descriptorDiscoveryGenerations = new Map(source.#descriptorDiscoveryGenerations);
 		this.#configuredDiscoveryEvidence = new Map(source.#configuredDiscoveryEvidence);
 		this.#providerEvidenceApiKeys = new Map(source.#providerEvidenceApiKeys);
+		this.#credentiallessAuthFallbackProviders = new Map(source.#credentiallessAuthFallbackProviders);
+		this.#optionalAuthPreflightGenerations = new Map(source.#optionalAuthPreflightGenerations);
+		this.#optionalAuthPreflightEpoch = source.#optionalAuthPreflightEpoch;
 		this.#ownedConfigApiKeys = new Map(source.#ownedConfigApiKeys);
 		this.#acceptedPresets = source.#acceptedPresets;
 		this.#loadedModelPresetRegistryManifestSha256 = source.#loadedModelPresetRegistryManifestSha256;
@@ -2328,9 +2380,18 @@ export class ModelRegistry {
 		this.#availableModelsCache = undefined;
 	}
 
-	#applyOwnedConfigApiKeys(configs: ReadonlyMap<string, StagedConfigApiKey>): void {
-		this.authStorage.clearConfigApiKeys(this.#authStorageConfigOwner);
+	#reconcileOwnedConfigApiKeys(
+		configs: ReadonlyMap<string, StagedConfigApiKey>,
+		previousConfigs: ReadonlyMap<string, StagedConfigApiKey>,
+	): void {
+		for (const [provider, previous] of previousConfigs) {
+			const next = configs.get(provider);
+			if (next?.apiKey === previous.apiKey && next.envSourced === previous.envSourced) continue;
+			this.authStorage.removeConfigApiKey(provider, this.#authStorageConfigOwner);
+		}
 		for (const [provider, config] of configs) {
+			const previous = previousConfigs.get(provider);
+			if (previous?.apiKey === config.apiKey && previous.envSourced === config.envSourced) continue;
 			this.authStorage.setConfigApiKey(provider, config.apiKey, {
 				envSourced: config.envSourced,
 				owner: this.#authStorageConfigOwner,
@@ -2349,6 +2410,7 @@ export class ModelRegistry {
 			identity: string;
 		},
 		registrySettings: Pick<Settings, "get" | "getGlobal"> = this.#settings,
+		credentialSessionId?: string,
 	): Promise<ModelsConfigReloadCandidate> {
 		if (this.#disposed) throw new Error("Model registry is disposed");
 		const pathMatches = path.resolve(snapshot.path) === path.resolve(this.#modelsConfigFile.path());
@@ -2389,6 +2451,13 @@ export class ModelRegistry {
 			diagnostics.valid = false;
 			diagnostics.errors.push(registry.getError()!);
 		}
+		for (const provider of registry.#ownedConfigApiKeys.keys()) {
+			if (!this.authStorage.hasEffectiveCredentialSelector(provider, credentialSessionId)) continue;
+			diagnostics.valid = false;
+			diagnostics.errors.push(
+				new Error(`Cannot configure an API key override for ${provider} while a credential selector is active`),
+			);
+		}
 		let committed = false;
 		let finished = false;
 		const previousConfigPresent = this.#acceptedModelsConfigPresent;
@@ -2400,20 +2469,95 @@ export class ModelRegistry {
 				provider =>
 					isDeepStrictEqual(previousConfigValue?.providers?.[provider], nextConfigValue?.providers?.[provider]) &&
 					isDeepStrictEqual(this.#providerOverrides.get(provider), registry.#providerOverrides.get(provider)) &&
-					this.#customProviderApiKeys.get(provider) === registry.#customProviderApiKeys.get(provider),
+					isDeepStrictEqual(this.#modelOverrides.get(provider), registry.#modelOverrides.get(provider)) &&
+					this.#customProviderApiKeys.get(provider) === registry.#customProviderApiKeys.get(provider) &&
+					isDeepStrictEqual(this.#ownedConfigApiKeys.get(provider), registry.#ownedConfigApiKeys.get(provider)),
 			),
 		);
+		const unchangedProviderSnapshots = new Map(
+			[...unchangedProviders].map(provider => [
+				provider,
+				{
+					models: this.#models.filter(model => model.provider === provider),
+					discoveryState: this.#discoveryManager.getState(provider),
+					configuredEvidence: this.#configuredDiscoveryEvidence.get(provider),
+					descriptorEvidence: this.#descriptorDiscoveryEvidence.get(provider),
+					descriptorGeneration: this.#descriptorDiscoveryGenerations.get(provider),
+					providerEvidenceApiKey: this.#providerEvidenceApiKeys.get(provider),
+					credentiallessFallback: this.#credentiallessAuthFallbackProviders.get(provider),
+					optionalAuthPreflightGeneration: this.#optionalAuthPreflightGenerations.get(provider),
+					activity: this.#providerActivity.get(provider),
+				},
+			]),
+		);
+		const copyProviderEntry = <T>(target: Map<string, T>, source: ReadonlyMap<string, T>, provider: string) => {
+			const value = source.get(provider);
+			if (value === undefined) target.delete(provider);
+			else target.set(provider, value);
+		};
 		const stagedModelKeys = new Set(registry.#models.map(model => `${model.provider}/${model.id}`));
 		for (const model of this.#models) {
 			if (!unchangedProviders.has(model.provider) || stagedModelKeys.has(`${model.provider}/${model.id}`)) continue;
 			registry.#models.push(model);
 		}
 		registry.#discoveryManager.retainStatesFrom(this.#discoveryManager, unchangedProviders);
+		const retainedActivity = new Map(registry.#providerActivity);
 		for (const provider of unchangedProviders) {
-			const activity = this.#providerActivity.get(provider);
-			if (activity) registry.#providerActivity = new Map([...registry.#providerActivity, [provider, activity]]);
+			copyProviderEntry(registry.#configuredDiscoveryEvidence, this.#configuredDiscoveryEvidence, provider);
+			copyProviderEntry(registry.#descriptorDiscoveryEvidence, this.#descriptorDiscoveryEvidence, provider);
+			copyProviderEntry(registry.#descriptorDiscoveryGenerations, this.#descriptorDiscoveryGenerations, provider);
+			copyProviderEntry(registry.#providerEvidenceApiKeys, this.#providerEvidenceApiKeys, provider);
+			copyProviderEntry(retainedActivity, this.#providerActivity, provider);
 		}
+		registry.#providerActivity = retainedActivity;
 		registry.#rebuildCanonicalIndex();
+		const rebaseProviderDiscoveryAfterQueuedRefresh = () => {
+			const changedProviders = new Set(
+				[...unchangedProviders].filter(provider => {
+					const snapshot = unchangedProviderSnapshots.get(provider)!;
+					return (
+						!isDeepStrictEqual(
+							snapshot.models,
+							this.#models.filter(model => model.provider === provider),
+						) ||
+						!isDeepStrictEqual(snapshot.discoveryState, this.#discoveryManager.getState(provider)) ||
+						!isDeepStrictEqual(snapshot.configuredEvidence, this.#configuredDiscoveryEvidence.get(provider)) ||
+						!isDeepStrictEqual(snapshot.descriptorEvidence, this.#descriptorDiscoveryEvidence.get(provider)) ||
+						snapshot.descriptorGeneration !== this.#descriptorDiscoveryGenerations.get(provider) ||
+						snapshot.providerEvidenceApiKey !== this.#providerEvidenceApiKeys.get(provider) ||
+						snapshot.credentiallessFallback !== this.#credentiallessAuthFallbackProviders.get(provider) ||
+						snapshot.optionalAuthPreflightGeneration !== this.#optionalAuthPreflightGenerations.get(provider) ||
+						!isDeepStrictEqual(snapshot.activity, this.#providerActivity.get(provider))
+					);
+				}),
+			);
+			if (changedProviders.size === 0) return;
+
+			registry.#models = registry.#models.filter(model => !changedProviders.has(model.provider));
+			registry.#models.push(...this.#models.filter(model => changedProviders.has(model.provider)));
+			for (const provider of changedProviders) registry.#discoveryManager.invalidate(provider);
+			registry.#discoveryManager.retainStatesFrom(this.#discoveryManager, changedProviders);
+			const providerActivity = new Map(registry.#providerActivity);
+			for (const provider of changedProviders) {
+				copyProviderEntry(registry.#configuredDiscoveryEvidence, this.#configuredDiscoveryEvidence, provider);
+				copyProviderEntry(registry.#descriptorDiscoveryEvidence, this.#descriptorDiscoveryEvidence, provider);
+				copyProviderEntry(registry.#descriptorDiscoveryGenerations, this.#descriptorDiscoveryGenerations, provider);
+				copyProviderEntry(registry.#providerEvidenceApiKeys, this.#providerEvidenceApiKeys, provider);
+				copyProviderEntry(
+					registry.#credentiallessAuthFallbackProviders,
+					this.#credentiallessAuthFallbackProviders,
+					provider,
+				);
+				copyProviderEntry(
+					registry.#optionalAuthPreflightGenerations,
+					this.#optionalAuthPreflightGenerations,
+					provider,
+				);
+				copyProviderEntry(providerActivity, this.#providerActivity, provider);
+			}
+			registry.#providerActivity = providerActivity;
+			registry.#rebuildCanonicalIndex();
+		};
 		const expectedGeneration = this.#catalogRefreshGeneration;
 		const commit = () => {
 			if (finished) throw new Error("Models config reload candidate is no longer active");
@@ -2422,9 +2566,17 @@ export class ModelRegistry {
 			if (this.#disposed || this.#catalogRefreshGeneration !== expectedGeneration) {
 				throw new Error("Model catalog changed during configuration preflight");
 			}
+			for (const provider of registry.#ownedConfigApiKeys.keys()) {
+				if (this.authStorage.hasEffectiveCredentialSelector(provider, credentialSessionId)) {
+					throw new Error(
+						`Cannot configure an API key override for ${provider} while a credential selector is active`,
+					);
+				}
+			}
+			rebaseProviderDiscoveryAfterQueuedRefresh();
 			this.#swapReloadableState(registry);
 			try {
-				this.#applyOwnedConfigApiKeys(this.#ownedConfigApiKeys);
+				this.#reconcileOwnedConfigApiKeys(this.#ownedConfigApiKeys, registry.#ownedConfigApiKeys);
 				this.#acceptedModelsConfigPresent = source.status === "ok";
 				this.#acceptedConfigValue = nextConfigValue;
 				// The captured source may precede the current disk revision.
@@ -2432,7 +2584,7 @@ export class ModelRegistry {
 				committed = true;
 			} catch (error) {
 				this.#swapReloadableState(registry);
-				this.#applyOwnedConfigApiKeys(this.#ownedConfigApiKeys);
+				this.#reconcileOwnedConfigApiKeys(this.#ownedConfigApiKeys, registry.#ownedConfigApiKeys);
 				throw error;
 			}
 		};
@@ -2440,7 +2592,7 @@ export class ModelRegistry {
 			if (finished) return;
 			if (committed) {
 				this.#swapReloadableState(registry);
-				this.#applyOwnedConfigApiKeys(this.#ownedConfigApiKeys);
+				this.#reconcileOwnedConfigApiKeys(this.#ownedConfigApiKeys, registry.#ownedConfigApiKeys);
 				this.#acceptedModelsConfigPresent = previousConfigPresent;
 				this.#acceptedConfigValue = previousConfigValue;
 				committed = false;
@@ -6788,6 +6940,19 @@ export class ModelRegistry {
 			}
 		}
 		return apiKey;
+	}
+
+	/** Check credential availability without resolving keys or refreshing OAuth tokens. */
+	hasUsableAuthForProvider(provider: string, sessionId?: string): boolean {
+		return this.authStorage.hasUsableAuth(provider, {
+			owner: this.#authStorageConfigOwner,
+			sessionId,
+		});
+	}
+
+	/** @internal Whether this registry is an unpublished staged reload candidate. */
+	isStagedReloadCandidate(): boolean {
+		return this.#stagedReloadCandidate;
 	}
 
 	#refreshRotatingConfigApiKey(provider: string, forceStatic = false): void {

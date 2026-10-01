@@ -1081,6 +1081,8 @@ export interface ModelChainResolutionOptions {
 	canonicalSessionId?: string | null;
 	credentialSessionId?: string;
 	isCredentialUnavailable?: (provider: string) => boolean;
+	/** Read-only auth eligibility for staged profile preflight when no access token can be exposed. */
+	isProviderAuthAvailable?: (provider: string) => boolean;
 	signal?: AbortSignal;
 }
 
@@ -1198,7 +1200,7 @@ async function resolveModelChainEntries(
 				skips.push({ selector, reason: "credential_unavailable" });
 				break;
 			}
-			if (isAuthenticatedOrKeyless(key)) {
+			if (isAuthenticatedOrKeyless(key) || options?.isProviderAuthAvailable?.(candidate.model.provider)) {
 				return { ...candidate, activeIndex, skips };
 			}
 			skips.push({ selector, reason: "unauthenticated" });

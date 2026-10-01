@@ -22,6 +22,7 @@ const fallbackRuntimeState = {
 
 function fakeRegistry(options?: {
 	missingProviders?: string[];
+	usableAuthProviders?: string[];
 	profiles?: ModelProfileDefinition[];
 	models?: Model[];
 }) {
@@ -30,6 +31,7 @@ function fakeRegistry(options?: {
 		profiles.set(profile.name, profile);
 	}
 	const missing = new Set(options?.missingProviders ?? []);
+	const usableAuth = new Set(options?.usableAuthProviders ?? []);
 	const models = options?.models ?? [
 		model("provider-a", "default"),
 		model("provider-a", "alternate"),
@@ -41,6 +43,7 @@ function fakeRegistry(options?: {
 		getModelProfiles: () => new Map(profiles),
 		getAvailableModelProfileNames: () => [...profiles.keys()].sort(),
 		getApiKeyForProvider: async (provider: string) => (missing.has(provider) ? undefined : `key-${provider}`),
+		hasUsableAuthForProvider: (provider: string) => usableAuth.has(provider),
 		getAll: () => models,
 		resolveCanonicalModel: () => undefined,
 		getCanonicalVariants: () => [],
@@ -221,6 +224,40 @@ describe("model profile activation red-team", () => {
 		).rejects.toThrow(/executor selectors do not match any catalog model/);
 		expect(session.model?.id).toBe("initial");
 		expect(settings.get("task.agentModelOverrides")).toEqual({ executor: "provider-a/original" });
+		expect(settings.get("modelProfile.default")).toBe("old-profile");
+		expect(calls.setCalls).toEqual([]);
+		expect(calls.overrideCalls).toEqual([]);
+		expect(calls.flushCount).toBe(0);
+	});
+
+	test("live activation does not admit a model from an OAuth row when token resolution fails", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated({ "modelProfile.default": "old-profile" });
+		const calls = instrumentSettings(settings);
+		const registry = fakeRegistry({
+			missingProviders: ["provider-a"],
+			usableAuthProviders: ["provider-a"],
+			profiles: [
+				{
+					name: "live-oauth",
+					requiredProviders: [],
+					modelMapping: { default: "provider-a/default" },
+					source: "user",
+				},
+			],
+		});
+		const attemptedProviders: string[] = [];
+		const getApiKeyForProvider = registry.getApiKeyForProvider;
+		registry.getApiKeyForProvider = async provider => {
+			attemptedProviders.push(provider);
+			return getApiKeyForProvider(provider);
+		};
+
+		await expect(
+			activateModelProfile({ session, modelRegistry: registry, settings, profileName: "live-oauth" }),
+		).rejects.toThrow('Model profile "live-oauth" default selector did not resolve: provider-a/default');
+		expect(attemptedProviders).toContain("provider-a");
+		expect(session.model?.id).toBe("initial");
 		expect(settings.get("modelProfile.default")).toBe("old-profile");
 		expect(calls.setCalls).toEqual([]);
 		expect(calls.overrideCalls).toEqual([]);
