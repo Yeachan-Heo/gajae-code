@@ -65,7 +65,7 @@ function wrapFetchForVersionHandling(baseFetch: FetchImpl): FetchImpl {
   return Object.assign(
     async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
       const response = await baseFetch(input, init);
-      
+
       // Handle HTTP 426 "version outdated" errors by reading the body and updating the cache
       if (response.status === 426) {
         try {
@@ -82,7 +82,7 @@ function wrapFetchForVersionHandling(baseFetch: FetchImpl): FetchImpl {
           return response;
         }
       }
-      
+
       return response;
     },
     { preconnect: baseFetch.preconnect },
