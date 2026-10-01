@@ -1555,9 +1555,9 @@ function isStatuslessTypedOverloadFacts(facts: TransportFailureFacts | undefined
 function isBareDefaultCodexOverload(message: AssistantMessage): boolean {
 	return (
 		message.api === "openai-codex-responses" &&
-		BARE_DEFAULT_CODEX_RETRYABLE_ERROR.test(message.errorMessage ?? "") &&
 		(isExactTypedOverloadFacts(message, BARE_DEFAULT_CODEX_RETRYABLE_CODES) ||
-			!hasBareDefaultRetryDisqualifyingFacts(message)) &&
+			(BARE_DEFAULT_CODEX_RETRYABLE_ERROR.test(message.errorMessage ?? "") &&
+				!hasBareDefaultRetryDisqualifyingFacts(message))) &&
 		!assistantMessageHasVisibleOrToolContent(message)
 	);
 }
@@ -22989,6 +22989,7 @@ export class AgentSession {
 			return false;
 		const contextWindow = this.model?.contextWindow ?? 0;
 		if (classifyContextOverflow(message, transportFailure, contextWindow)) return false;
+		if (isBareDefaultCodexOverload(message)) return true;
 		const managedFallback = this.#defaultFallbackChain().chain.entries.length > 1;
 		// An account-specific model rejection that cannot rotate to another
 		// credential stays terminal only on the session's own retry path; managed
@@ -24353,6 +24354,7 @@ export class AgentSession {
 			isBareDefaultCodexOverload(message) ||
 			isBareDefaultAnthropicOverload(message) ||
 			isBareDefaultOpenAIResponsesOverload(message);
+		const canReplayCodexProviderOverload = isBareDefaultCodexOverload(message);
 		const reportedRetryMaxAttempts = transportFailure?.retryMaxAttempts;
 		if (reportedRetryMaxAttempts !== undefined) {
 			this.#providerRetryMaxAttempts = Math.min(
@@ -24392,9 +24394,10 @@ export class AgentSession {
 					}
 				: false;
 		}
+		const fallbackTrigger = this.#fallbackTriggerFor(message, !managedFallback, transportFailure);
 		const trigger:
 			| { class: FallbackTriggerClass; retryAfterMs?: number; authDisposition?: AuthDisposition }
-			| undefined = this.#fallbackTriggerFor(message, !managedFallback, transportFailure);
+			| undefined = canReplayCodexProviderOverload ? { class: "server" } : fallbackTrigger;
 		// OpenAI's typed statusless capacity-overload code (issue #5018) must not
 		// gain managed-chain retry/advance authority from its new facts. Before
 		// the code survived transport, this failure reached the session as an
@@ -24497,7 +24500,7 @@ export class AgentSession {
 		const canReplayEmptyResponse = emptyResponse && (this.#retryAttempt === 0 || this.#hasCleanRetryReplaySafety);
 		if (!managedFallback && !legacyRetryConfigured && !canReplayRotatedCredential && !canReplayEmptyResponse) {
 			if (
-				(!canReplayProviderOverload &&
+				(!canReplayCodexProviderOverload &&
 					!canReplayUnexpectedSocketClose &&
 					!this.#isTypedFirstEventTimeout(message) &&
 					!messageOnlyWatchdogTimeout &&
@@ -24506,6 +24509,7 @@ export class AgentSession {
 						!BARE_DEFAULT_WATCHDOG_ERROR.test(message.errorMessage ?? ""))) ||
 				(!firstEventTimeout &&
 					!messageOnlyWatchdogTimeout &&
+					!canReplayCodexProviderOverload &&
 					!canReplayUnexpectedSocketClose &&
 					!this.#hasCleanRetryReplaySafety)
 			) {
