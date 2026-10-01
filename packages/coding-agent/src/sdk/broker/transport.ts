@@ -1,5 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { ServerWebSocket } from "bun";
+import { logger } from "@gajae-code/utils";
 import type { Broker } from "./broker";
 
 const PROTOCOL_VERSION = 3;
@@ -160,7 +161,8 @@ export class BrokerTransport {
 		try {
 			const result = await this.#broker.handleRequest(frame.operation, frame.input, frame.idempotencyKey);
 			send(socket, { type: "broker_response", id: frame.id, ...result });
-		} catch {
+		} catch (error) {
+			logger.warn(`sdk broker request failed: ${error instanceof Error ? error.message : String(error)}`);
 			sendError(socket, frame.id, "unavailable", "broker request failed");
 		}
 	}
