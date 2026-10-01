@@ -135,6 +135,9 @@ export interface PrepareModelProfileActivationOptions {
 			Pick<
 				ModelRegistry,
 				| "getAvailable"
+				| "getAvailableForProfileActivation"
+				| "hasUsableAuthForProvider"
+				| "isStagedReloadCandidate"
 				| "resolveModelByLookupAlias"
 				| "lookupAliasExists"
 				| "clearCanonicalVariant"
@@ -570,6 +573,17 @@ async function getProfileProviderApiKey(
 	}
 }
 
+function isStagedProviderAuthAvailable(
+	registry: PrepareModelProfileActivationOptions["modelRegistry"],
+	provider: string,
+	sessionId: string,
+): boolean {
+	return (
+		registry.isStagedReloadCandidate?.() === true &&
+		(registry.hasUsableAuthForProvider?.(provider, sessionId) ?? false)
+	);
+}
+
 export function formatModelProfileCredentialError(profileLabel: string, providers: readonly string[]): string {
 	return `Model profile "${profileLabel}" requires credentials for: ${providers.join(", ")}. Run /login and configure the missing provider(s), then retry.`;
 }
@@ -867,7 +881,8 @@ export async function resolveModelProfileDefaultChain(options: {
 			if (requiredProviderSet.has(provider) && !alternativeSet.has(provider)) throw error;
 			continue;
 		}
-		if (apiKey === kNoAuth || isAuthenticated(apiKey)) authenticatedProviders.add(provider);
+		const hasUsableAuth = isStagedProviderAuthAvailable(options.modelRegistry, provider, options.credentialSessionId);
+		if (apiKey === kNoAuth || isAuthenticated(apiKey) || hasUsableAuth) authenticatedProviders.add(provider);
 		else if (requiredProviderSet.has(provider)) missingProviders.push(provider);
 	}
 	const proxyProvider = profile.source !== "user" ? resolveProxyProviderId(options.settings) : undefined;
@@ -893,6 +908,9 @@ export async function resolveModelProfileDefaultChain(options: {
 					options.credentialSessionId,
 					profileLabel,
 				);
+	const proxyHasUsableAuth =
+		proxyProvider !== undefined &&
+		isStagedProviderAuthAvailable(options.modelRegistry, proxyProvider, options.credentialSessionId);
 	if (
 		proxyProvider !== undefined &&
 		!isModelProfileProxyConfigured(proxyProvider, configuredProviderIds, proxyApiKey === kNoAuth)
@@ -901,7 +919,8 @@ export async function resolveModelProfileDefaultChain(options: {
 			`modelProfile.proxyProvider "${proxyProvider}" is not configured. Configure it with \`gjc setup provider\` before activating a preset.`,
 		);
 	}
-	const proxyAuthenticated = proxyApiKey !== undefined && (proxyApiKey === kNoAuth || isAuthenticated(proxyApiKey));
+	const proxyAuthenticated =
+		(proxyApiKey !== undefined && (proxyApiKey === kNoAuth || isAuthenticated(proxyApiKey))) || proxyHasUsableAuth;
 	if (proxyMode === "always" && !proxyAuthenticated)
 		throw new ModelProfileCredentialError(profileLabel, [proxyProvider!]);
 	const strictMissing = missingProviders.filter(
@@ -990,6 +1009,8 @@ export async function resolveModelProfileDefaultChain(options: {
 			credentialSessionId: options.credentialSessionId,
 			isCredentialUnavailable: provider =>
 				isSessionCredentialPinBlocking(options.modelRegistry, provider, options.credentialSessionId),
+			isProviderAuthAvailable: provider =>
+				isStagedProviderAuthAvailable(options.modelRegistry, provider, options.credentialSessionId),
 		},
 	);
 	return { profileName, entries: defaultChain, ...resolution };
@@ -1189,6 +1210,8 @@ async function resolveAndClampSelectorValue(
 					credentialSessionId: options.credentialSessionId,
 					isCredentialUnavailable: provider =>
 						isSessionCredentialPinBlocking(options.modelRegistry, provider, options.credentialSessionId),
+					isProviderAuthAvailable: provider =>
+						isStagedProviderAuthAvailable(options.modelRegistry, provider, options.credentialSessionId),
 				},
 			);
 			resolved = {
@@ -1321,6 +1344,8 @@ async function concretizeProfileSelectorValue(
 							credentialSessionId,
 							isCredentialUnavailable: provider =>
 								isSessionCredentialPinBlocking(prepared.modelRegistry, provider, credentialSessionId),
+							isProviderAuthAvailable: provider =>
+								isStagedProviderAuthAvailable(prepared.modelRegistry, provider, credentialSessionId),
 						},
 					)
 				: resolveModelRoleValue(selector, candidates, {
@@ -1448,7 +1473,8 @@ export async function prepareModelProfileActivation(
 				if (requiredProviderSet.has(provider) && !alternativeSet.has(provider)) throw error;
 				continue;
 			}
-			if (apiKey !== kNoAuth && !isAuthenticated(apiKey)) {
+			const hasUsableAuth = isStagedProviderAuthAvailable(options.modelRegistry, provider, credentialSessionId);
+			if (apiKey !== kNoAuth && !isAuthenticated(apiKey) && !hasUsableAuth) {
 				if (requiredProviderSet.has(provider)) missingProviders.push(provider);
 			} else {
 				authenticatedProviders.push(provider);
@@ -1479,6 +1505,9 @@ export async function prepareModelProfileActivation(
 			proxyProvider === undefined
 				? undefined
 				: await getProfileProviderApiKey(options.modelRegistry, proxyProvider, credentialSessionId, profileLabel);
+		const proxyHasUsableAuth =
+			proxyProvider !== undefined &&
+			isStagedProviderAuthAvailable(options.modelRegistry, proxyProvider, credentialSessionId);
 		if (proxyProvider !== undefined) {
 			const configuredProxyProviders = options.modelRegistry.getConfiguredProviderIds?.();
 			if (!isModelProfileProxyConfigured(proxyProvider, configuredProxyProviders, proxyApiKey === kNoAuth)) {
@@ -1489,8 +1518,8 @@ export async function prepareModelProfileActivation(
 		}
 		const proxyAuthenticated =
 			proxyProvider !== undefined &&
-			proxyApiKey !== undefined &&
-			(proxyApiKey === kNoAuth || isAuthenticated(proxyApiKey));
+			((proxyApiKey !== undefined && (proxyApiKey === kNoAuth || isAuthenticated(proxyApiKey))) ||
+				proxyHasUsableAuth);
 		if (proxyMode === "always" && !proxyAuthenticated) {
 			throw new ModelProfileCredentialError(profileLabel, [proxyProvider!]);
 		}
@@ -1582,6 +1611,8 @@ export async function prepareModelProfileActivation(
 				credentialSessionId,
 				isCredentialUnavailable: provider =>
 					isSessionCredentialPinBlocking(options.modelRegistry, provider, credentialSessionId),
+				isProviderAuthAvailable: provider =>
+					isStagedProviderAuthAvailable(options.modelRegistry, provider, credentialSessionId),
 			},
 		);
 		const defaultModel = defaultResolution.model;
