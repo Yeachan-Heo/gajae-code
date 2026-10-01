@@ -156,7 +156,7 @@ describe.serial("AgentSession resilient retry", () => {
 		if (currentSession) {
 			// Keep teardown failures from masking the case result. The explicit loop
 			// disposals below propagate persistence failures after their assertions.
-			await currentSession.awaitCoordinatorRuntimeStatePersistenceForTests().catch(() => {});
+			await currentSession.awaitCoordinatorRuntimeStatePersistenceForTests().catch(() => { });
 			await currentSession.dispose();
 		}
 		currentAuthStorage.close();
@@ -292,10 +292,10 @@ describe.serial("AgentSession resilient retry", () => {
 			...(options.bareDefault
 				? {}
 				: {
-						"retry.baseDelayMs": 1,
-						"retry.maxDelayMs": 10,
-						"retry.maxRetries": 1,
-					}),
+					"retry.baseDelayMs": 1,
+					"retry.maxDelayMs": 10,
+					"retry.maxRetries": 1,
+				}),
 			...options.settingsOverrides,
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
@@ -332,10 +332,10 @@ describe.serial("AgentSession resilient retry", () => {
 			...(options.bareDefault
 				? {}
 				: {
-						"retry.baseDelayMs": 1,
-						"retry.maxDelayMs": 10,
-						"retry.maxRetries": 1,
-					}),
+					"retry.baseDelayMs": 1,
+					"retry.maxDelayMs": 10,
+					"retry.maxRetries": 1,
+				}),
 			...options.settingsOverrides,
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
@@ -388,8 +388,8 @@ describe.serial("AgentSession resilient retry", () => {
 				extensionRunner,
 				onResponse: extensionRunner
 					? async (response, model, scope) => {
-							await extensionRunner.emitAfterProviderResponse(response, model, scope);
-						}
+						await extensionRunner.emitAfterProviderResponse(response, model, scope);
+					}
 					: undefined,
 			}),
 		);
@@ -506,16 +506,16 @@ describe.serial("AgentSession resilient retry", () => {
 			errorMessage: string;
 			transportFailure?: AssistantMessage["transportFailure"];
 		}> = [
-			{
-				partialContent: "already streamed",
-				errorMessage: "upstream request failed: stream interrupted before terminal response event",
-				transportFailure: { kind: "transport", providerCode: "upstream_stream_error" },
-			},
-			{
-				partialContent: "partial thinking leaked as text",
-				errorMessage: "weird unclassified glitch after progress",
-			},
-		];
+				{
+					partialContent: "already streamed",
+					errorMessage: "upstream request failed: stream interrupted before terminal response event",
+					transportFailure: { kind: "transport", providerCode: "upstream_stream_error" },
+				},
+				{
+					partialContent: "partial thinking leaked as text",
+					errorMessage: "weird unclassified glitch after progress",
+				},
+			];
 		for (const testCase of cases) {
 			const requestedModels: string[] = [];
 			session = buildStatusErrorSession({
@@ -778,7 +778,7 @@ describe.serial("AgentSession resilient retry", () => {
 			if (event.type === "auto_retry_end") resolveEnded();
 		});
 
-		const prompt = session.prompt("trigger retry then retry-now").catch(() => {});
+		const prompt = session.prompt("trigger retry then retry-now").catch(() => { });
 		await started;
 		await ended;
 		await prompt;
@@ -813,7 +813,7 @@ describe.serial("AgentSession resilient retry", () => {
 			if (event.type === "auto_retry_end") resolveEnded();
 		});
 
-		const prompt = session.prompt("trigger retry then cancel").catch(() => {});
+		const prompt = session.prompt("trigger retry then cancel").catch(() => { });
 		await started;
 		await ended;
 		await prompt;
@@ -1457,37 +1457,37 @@ describe.serial("AgentSession resilient retry", () => {
 			const events =
 				requests <= providerFailures
 					? [
-							{ type: "response.created", response: { id: "r1", status: "in_progress", output: [] } },
-							{ type: "error", code, message: "fake upstream failure" },
-						]
+						{ type: "response.created", response: { id: "r1", status: "in_progress", output: [] } },
+						{ type: "error", code, message: "fake upstream failure" },
+					]
 					: [
-							{
-								type: "response.output_item.added",
-								output_index: 0,
-								item: { id: "msg_1", type: "message", role: "assistant", status: "in_progress", content: [] },
+						{
+							type: "response.output_item.added",
+							output_index: 0,
+							item: { id: "msg_1", type: "message", role: "assistant", status: "in_progress", content: [] },
+						},
+						{ type: "response.content_part.added", part: { type: "output_text", text: "" } },
+						{ type: "response.output_text.delta", delta: "recovered" },
+						{
+							type: "response.output_item.done",
+							item: {
+								id: "msg_1",
+								type: "message",
+								role: "assistant",
+								status: "completed",
+								content: [{ type: "output_text", text: "recovered", annotations: [] }],
 							},
-							{ type: "response.content_part.added", part: { type: "output_text", text: "" } },
-							{ type: "response.output_text.delta", delta: "recovered" },
-							{
-								type: "response.output_item.done",
-								item: {
-									id: "msg_1",
-									type: "message",
-									role: "assistant",
-									status: "completed",
-									content: [{ type: "output_text", text: "recovered", annotations: [] }],
-								},
+						},
+						{
+							type: "response.completed",
+							response: {
+								id: "r2",
+								status: "completed",
+								output: [],
+								usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
 							},
-							{
-								type: "response.completed",
-								response: {
-									id: "r2",
-									status: "completed",
-									output: [],
-									usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
-								},
-							},
-						];
+						},
+					];
 			return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(""), {
 				headers: { "content-type": "text/event-stream" },
 			});
@@ -2226,22 +2226,22 @@ describe.serial("AgentSession resilient retry", () => {
 			failureByCall: call =>
 				call === 1
 					? {
-							errorMessage: "Anthropic stream timed out while waiting for the first event",
-							transportFailure: {
-								kind: "transport",
-								providerCode: "stream_first_event_timeout",
-								requestBytes: 4096,
-								firstEventElapsedMs: 100_000,
-								firstEventTimeoutMs: 100_000,
-								endpointClass: "canonical",
-								retryMaxAttempts: 2,
-							},
+						errorMessage: "Anthropic stream timed out while waiting for the first event",
+						transportFailure: {
+							kind: "transport",
+							providerCode: "stream_first_event_timeout",
+							requestBytes: 4096,
+							firstEventElapsedMs: 100_000,
+							firstEventTimeoutMs: 100_000,
+							endpointClass: "canonical",
+							retryMaxAttempts: 2,
 						}
+					}
 					: {
-							errorMessage: "529 Overloaded",
-							errorStatus: 529,
-							transportFailure: { kind: "transport", status: 529, anthropicErrorType: "overloaded_error" },
-						},
+						errorMessage: "529 Overloaded",
+						errorStatus: 529,
+						transportFailure: { kind: "transport", status: 529, anthropicErrorType: "overloaded_error" },
+					},
 		});
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 		const { retryStartEvents } = track(session);
@@ -2978,6 +2978,197 @@ describe.serial("AgentSession resilient retry", () => {
 		expect(retryStartEvents).toHaveLength(1);
 		expect(streamCalls).toBe(2);
 		expect(lastAssistant(session).stopReason).toBe("error");
+	});
+	it.each([
+		"server_is_overloaded",
+		"server_error",
+		"internal_error",
+	])("surfaces Codex %s when auto_retry_start throws", async code => {
+		const model = getBundledModel("openai-codex", "gpt-5.4-mini");
+		if (!model) throw new Error("Expected bundled Codex test model to exist");
+		let streamCalls = 0;
+		const handlerError = `retry hook rejected Codex ${code}`;
+		session = buildBareStreamingSession({
+			model,
+			streamFn: () => {
+				streamCalls++;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const failure = assistantMessage(
+						model,
+						[],
+						"error",
+						`Codex error event: fake upstream failure (code=${code})`,
+					);
+					failure.transportFailure = { kind: "transport", providerCode: code };
+					stream.push({ type: "start", partial: failure });
+					stream.push({ type: "error", reason: "error", error: failure });
+				});
+				return stream;
+			},
+			extensionRunner: createExtensionRunner(
+				new Map([
+					[
+						"auto_retry_start",
+						[
+							async () => {
+								throw new Error(handlerError);
+							},
+						],
+					],
+				]),
+			),
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt(`throwing retry hook for Codex ${code}`);
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(1);
+		expect(streamCalls).toBe(2);
+		expect(lastAssistant(session)).toMatchObject({ stopReason: "error" });
+	});
+	it.each([
+		"server_is_overloaded",
+		"server_error",
+		"internal_error",
+	])("abortRetry cancels a pending Codex %s retry", async code => {
+		const model = getBundledModel("openai-codex", "gpt-5.4-mini");
+		if (!model) throw new Error("Expected bundled Codex test model to exist");
+		let streamCalls = 0;
+		const retryStarted = Promise.withResolvers<void>();
+		const retryEnded = Promise.withResolvers<void>();
+		session = buildBareStreamingSession({
+			model,
+			streamFn: () => {
+				streamCalls++;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const failure = assistantMessage(
+						model,
+						[],
+						"error",
+						`Codex error event: fake upstream failure (code=${code})`,
+					);
+					failure.transportFailure = { kind: "transport", providerCode: code };
+					stream.push({ type: "start", partial: failure });
+					stream.push({ type: "error", reason: "error", error: failure });
+				});
+				return stream;
+			},
+		});
+		vi.spyOn(scheduler, "wait").mockImplementation(async (_delayMs, options) => {
+			const signal = options?.signal;
+			await new Promise<void>(resolve => {
+				if (signal?.aborted) resolve();
+				else signal?.addEventListener("abort", () => resolve(), { once: true });
+			});
+		});
+		const { retryStartEvents, retryEndEvents } = track(session);
+		session.subscribe(event => {
+			if (event.type === "auto_retry_start") {
+				retryStarted.resolve();
+				session?.abortRetry();
+			}
+			if (event.type === "auto_retry_end") retryEnded.resolve();
+		});
+
+		const prompt = session.prompt(`cancel Codex ${code} retry`).catch(() => { });
+		await retryStarted.promise;
+		await retryEnded.promise;
+		await prompt;
+		await session.waitForIdle();
+
+		expect(streamCalls).toBe(1);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryEndEvents).toEqual([
+			expect.objectContaining({ success: false, finalError: expect.stringContaining("cancelled") }),
+		]);
+	});
+	it.each([
+		"server_is_overloaded",
+		"server_error",
+		"internal_error",
+	])("disposal cancels a pending Codex %s retry", async code => {
+		const model = getBundledModel("openai-codex", "gpt-5.4-mini");
+		if (!model) throw new Error("Expected bundled Codex test model to exist");
+		let streamCalls = 0;
+		const retryStarted = Promise.withResolvers<void>();
+		session = buildBareStreamingSession({
+			model,
+			streamFn: () => {
+				streamCalls++;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const failure = assistantMessage(
+						model,
+						[],
+						"error",
+						`Codex error event: fake upstream failure (code=${code})`,
+					);
+					failure.transportFailure = { kind: "transport", providerCode: code };
+					stream.push({ type: "start", partial: failure });
+					stream.push({ type: "error", reason: "error", error: failure });
+				});
+				return stream;
+			},
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents, retryEndEvents } = track(session);
+		session.subscribe(event => {
+			if (event.type === "auto_retry_start") retryStarted.resolve();
+		});
+
+		const prompt = session.prompt(`dispose during Codex ${code} retry`);
+		await retryStarted.promise;
+		await expect(session.dispose()).resolves.toBeUndefined();
+		await prompt;
+
+		expect(streamCalls).toBe(1);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryEndEvents).toEqual([expect.objectContaining({ success: false, attempt: 1 })]);
+		expect(session.isRetrying).toBe(false);
+		expect(session.isStreaming).toBe(false);
+		session = undefined;
+	});
+	it.each([
+		"server_is_overloaded",
+		"server_error",
+		"internal_error",
+	])("bounds repeated content-free Codex %s failures", async code => {
+		const model = getBundledModel("openai-codex", "gpt-5.4-mini");
+		if (!model) throw new Error("Expected bundled Codex test model to exist");
+		let streamCalls = 0;
+		const errorMessage = `Codex error event: fake upstream failure (code=${code})`;
+		session = buildBareStreamingSession({
+			model,
+			streamFn: () => {
+				streamCalls++;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const failure = assistantMessage(model, [], "error", errorMessage);
+					failure.transportFailure = { kind: "transport", providerCode: code };
+					stream.push({ type: "start", partial: failure });
+					stream.push({ type: "error", reason: "error", error: failure });
+				});
+				return stream;
+			},
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents, retryEndEvents } = track(session);
+
+		await session.prompt(`exhaust Codex ${code} retry budget`);
+		await session.waitForIdle();
+
+		expect(streamCalls).toBe(4);
+		expect(retryStartEvents).toHaveLength(3);
+		expect(retryStartEvents.every(event => event.unbounded === false)).toBe(true);
+		expect(retryEndEvents).toEqual([expect.objectContaining({ success: false, attempt: 3 })]);
+		expect(lastAssistant(session)).toMatchObject({
+			stopReason: "error",
+			errorMessage: expect.stringContaining(errorMessage),
+		});
 	});
 
 	it("retries provider stream idle stalls under a bare default config (single model)", async () => {
