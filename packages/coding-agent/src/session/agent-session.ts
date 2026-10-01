@@ -14358,6 +14358,10 @@ export class AgentSession {
 				return;
 			throw error;
 		} finally {
+			// Remove ephemeral custom messages after prompt completion. These are kept internally
+			// during prompt execution for cache preservation but shouldn't persist in the visible
+			// message history after the prompt attempt ends.
+			this.#removeEphemeralCustomMessages();
 			if (rosterClaim) {
 				this.agent.replaceMessages(
 					this.agent.state.messages.filter(
