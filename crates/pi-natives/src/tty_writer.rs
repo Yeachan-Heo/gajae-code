@@ -40,32 +40,27 @@ fn append_js_utf8(data: JsString<'_>, len: usize, output: &mut Vec<u8>) -> Resul
 	let capacity = len
 		.checked_add(1)
 		.ok_or_else(|| Error::from_reason("terminal string is too large"))?;
-	let start = output.len();
-	let end = start
-		.checked_add(capacity)
-		.ok_or_else(|| Error::from_reason("terminal output buffer is too large"))?;
 	output.reserve(capacity);
-	// SAFETY: the reserve above guarantees writable space through `end`; the
-	// N-API call below initializes the reported UTF-8 bytes and trailing NUL.
-	unsafe { output.set_len(end) };
+	let start = output.len();
 	let mut written = 0;
-	// SAFETY: `data` is a live JS string in this callback, and `output[start..end]`
-	// has the exact UTF-8 byte length plus the required NUL slot.
+	// SAFETY: `reserve` guarantees `capacity` writable bytes of spare capacity
+	// past `start`; `data` is a live JS string in this callback and `capacity`
+	// is its exact UTF-8 length plus the required NUL slot.
 	let status = unsafe {
 		napi::sys::napi_get_value_string_utf8(
 			raw.env,
 			raw.value,
-			output.as_mut_ptr().add(start).cast(),
+			output.spare_capacity_mut().as_mut_ptr().cast(),
 			capacity,
 			&mut written,
 		)
 	};
-	if let Err(error) = napi::check_status!(status, "Failed to read JavaScript string") {
-		output.truncate(start);
-		return Err(error);
-	}
-	output.truncate(start + written);
-	Ok(written)
+	napi::check_status!(status, "Failed to read JavaScript string")?;
+	// SAFETY: N-API initialized `written` bytes (`<= capacity - 1`) of the spare
+	// capacity starting at `start`, so extending the length covers only
+	// initialized bytes.
+	unsafe { output.set_len(start + written.min(len)) };
+	Ok(written.min(len))
 }
 
 #[cfg(test)]
