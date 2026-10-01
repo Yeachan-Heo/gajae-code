@@ -2660,7 +2660,8 @@ export const TOOL_CATALOG: Readonly<Record<string, ToolCatalogEntry>> = {
 					"description": "recency filter"
 				},
 				"limit": {
-					"type": "number",
+					"type": "integer",
+					"minimum": 1,
 					"description": "max results"
 				},
 				"max_tokens": {
@@ -2672,7 +2673,8 @@ export const TOOL_CATALOG: Readonly<Record<string, ToolCatalogEntry>> = {
 					"description": "sampling temperature"
 				},
 				"num_search_results": {
-					"type": "number",
+					"type": "integer",
+					"minimum": 1,
 					"description": "number of search results"
 				},
 				"xai_search_mode": {
