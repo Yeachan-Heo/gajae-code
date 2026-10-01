@@ -1,6 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
-import type { ServerWebSocket } from "bun";
 import { logger } from "@gajae-code/utils";
+import type { ServerWebSocket } from "bun";
 import type { Broker } from "./broker";
 
 const PROTOCOL_VERSION = 3;
