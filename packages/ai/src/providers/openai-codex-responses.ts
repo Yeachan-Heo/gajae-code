@@ -762,11 +762,13 @@ async function buildCodexRequestContext(
 	const providerSessionState = getCodexProviderSessionState(options?.providerSessionState);
 	const sessionKey = getCodexWebSocketSessionKey(promptCacheKey, model, accountId, baseUrl);
 	const publicSessionKey = getCodexPublicSessionKey(promptCacheKey, model, baseUrl);
-	if (sessionKey && publicSessionKey) {
-		providerSessionState?.webSocketPublicToPrivate.set(publicSessionKey, sessionKey);
-	}
 	const websocketState =
-		sessionKey && providerSessionState ? getCodexWebSocketSessionState(sessionKey, providerSessionState) : undefined;
+		providerSessionState && sessionKey
+			? getCodexWebSocketSessionState(
+					resolveCodexWebSocketSessionKey(sessionKey, publicSessionKey, providerSessionState),
+					providerSessionState,
+				)
+			: undefined;
 
 	return {
 		apiKey,
@@ -2320,11 +2322,9 @@ export async function prewarmOpenAICodexResponses(
 	const providerSessionState = getCodexProviderSessionState(options?.providerSessionState);
 	const sessionKey = getCodexWebSocketSessionKey(promptCacheKey, model, accountId, baseUrl);
 	const publicSessionKey = getCodexPublicSessionKey(promptCacheKey, model, baseUrl);
-	if (publicSessionKey && sessionKey) {
-		providerSessionState?.webSocketPublicToPrivate.set(publicSessionKey, sessionKey);
-	}
 	if (!sessionKey || !providerSessionState) return;
-	const state = getCodexWebSocketSessionState(sessionKey, providerSessionState);
+	const effectiveSessionKey = resolveCodexWebSocketSessionKey(sessionKey, publicSessionKey, providerSessionState);
+	const state = getCodexWebSocketSessionState(effectiveSessionKey, providerSessionState);
 	if (!shouldUseCodexWebSocket(model, state, options?.preferWebsockets)) return;
 	const headers = logger.time(
 		"prewarmCodex:createHeaders",
@@ -2364,6 +2364,18 @@ function getCodexWebSocketSessionKey(
 	const promptCacheKey = normalizeOpenAIResponsesPromptCacheKey(sessionId);
 	if (!promptCacheKey) return undefined;
 	return `${accountId ?? "opaque"}:${baseUrl}:${model.id}:${promptCacheKey}`;
+}
+
+function resolveCodexWebSocketSessionKey(
+	sessionKey: string,
+	publicSessionKey: string | undefined,
+	providerSessionState: CodexProviderSessionState,
+): string {
+	if (!publicSessionKey) return sessionKey;
+	const existingSessionKey = providerSessionState.webSocketPublicToPrivate.get(publicSessionKey);
+	if (existingSessionKey) return existingSessionKey;
+	providerSessionState.webSocketPublicToPrivate.set(publicSessionKey, sessionKey);
+	return sessionKey;
 }
 
 function getCodexPublicSessionKey(

@@ -4612,6 +4612,49 @@ describe("openai-codex streaming", () => {
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
 
+	it("reuses the fatal prewarm verdict when the account-scoped key changes", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const sse = createCompletedCodexSse("Hello SSE");
+		const fetchMock = vi.fn(
+			async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		);
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		let constructorCount = 0;
+		class RejectingWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				constructorCount += 1;
+				queueMicrotask(() => {
+					this.readyState = MockWebSocket.CLOSED;
+					this.emit("close", { code: 1008 } as unknown as Event);
+				});
+			}
+		}
+		global.WebSocket = RejectingWebSocket as unknown as typeof WebSocket;
+
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		await expect(
+			prewarmOpenAICodexResponses(model, {
+				apiKey: createCodexTestToken("acc_prewarm"),
+				sessionId: "ws-account-key-change",
+				providerSessionState,
+			}),
+		).rejects.toThrow("Codex websocket transport error: websocket closed before open (1008)");
+
+		const result = await streamOpenAICodexResponses(model, createCodexTestContext(), {
+			apiKey: createCodexTestToken("acc_request"),
+			sessionId: "ws-account-key-change",
+			providerSessionState,
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(constructorCount).toBe(1);
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+	});
+
 	it("keeps websocket enabled after a non-fatal prewarm failure", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
