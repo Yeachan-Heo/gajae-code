@@ -311,28 +311,28 @@ export type BrokerCleanupEvidence = {
 export type BrokerResponse =
 	| { ok: true; result?: unknown; indexSeq?: number }
 	| {
-			ok: false;
-			error: {
-				code: BrokerErrorCode;
-				message: string;
-				details?: ModelProfileErrorDetails | SpawnSubstrateFailure;
-				endpoint?: "unavailable";
-				cleanup?: BrokerCleanupEvidence;
-			};
-			indexSeq?: number;
-			durableEffects?: LifecycleDurableEffectsReceipt;
-			startupFailure?: LifecycleStartupFailureReceipt;
-	  };
+		ok: false;
+		error: {
+			code: BrokerErrorCode;
+			message: string;
+			details?: ModelProfileErrorDetails | SpawnSubstrateFailure;
+			endpoint?: "unavailable";
+			cleanup?: BrokerCleanupEvidence;
+		};
+		indexSeq?: number;
+		durableEffects?: LifecycleDurableEffectsReceipt;
+		startupFailure?: LifecycleStartupFailureReceipt;
+	};
 type VerifiedManagedOwner =
 	| {
-			kind: "verified";
-			ownerSessionId: string;
-			attestationEpoch: string;
-			controlRoot: string;
-			enrollmentId: string;
-			worktrees: string[];
-			aliases?: string[];
-	  }
+		kind: "verified";
+		ownerSessionId: string;
+		attestationEpoch: string;
+		controlRoot: string;
+		enrollmentId: string;
+		worktrees: string[];
+		aliases?: string[];
+	}
 	| { kind: "denied"; response: BrokerResponse };
 const error = (code: BrokerErrorCode, message: string): BrokerResponse => ({ ok: false, error: { code, message } });
 const spawnFailureError = (failure: SpawnSubstrateFailure): BrokerResponse => ({
@@ -1031,7 +1031,7 @@ function sameSessionControlAuthority(
 		left.record.hostIncarnation === right.record.hostIncarnation &&
 		left.record.lifecycleRequestId === right.record.lifecycleRequestId &&
 		endpointIncarnation(left.record, left.record.sessionId) ===
-			endpointIncarnation(right.record, right.record.sessionId) &&
+		endpointIncarnation(right.record, right.record.sessionId) &&
 		left.endpoint.sessionId === right.endpoint.sessionId &&
 		left.endpoint.pid === right.endpoint.pid &&
 		left.endpoint.url === right.endpoint.url &&
@@ -1532,12 +1532,12 @@ export class Broker {
 	#ownsResolveModelPin: boolean;
 	#restart:
 		| {
-				options: BrokerRestartPrepareOptions;
-				lease: string;
-				occupancyEpoch: number;
-				expiresAt: number;
-				timer: NodeJS.Timeout;
-		  }
+			options: BrokerRestartPrepareOptions;
+			lease: string;
+			occupancyEpoch: number;
+			expiresAt: number;
+			timer: NodeJS.Timeout;
+		}
 		| undefined;
 	constructor(settings: BrokerSettings) {
 		this.settings = {
@@ -1561,16 +1561,16 @@ export class Broker {
 		this.#onStartupReady = settings.onStartupReady;
 		this.#startupPrePublicationDelayMs =
 			Number.isSafeInteger(settings.startupPrePublicationDelayMs) &&
-			(settings.startupPrePublicationDelayMs ?? 0) > 0 &&
-			(settings.startupPrePublicationDelayMs ?? 0) <= 10_000
+				(settings.startupPrePublicationDelayMs ?? 0) > 0 &&
+				(settings.startupPrePublicationDelayMs ?? 0) <= 10_000
 				? (settings.startupPrePublicationDelayMs as number)
 				: 0;
 		this.#startupPrePublicationTestHook = settings.startupPrePublicationTestHook;
 		this.#startupAfterDiscoveryWriteTestHook = settings.startupAfterDiscoveryWriteTestHook;
 		this.#startupPostPublicationDelayMs =
 			Number.isSafeInteger(settings.startupPostPublicationDelayMs) &&
-			(settings.startupPostPublicationDelayMs ?? 0) > 0 &&
-			(settings.startupPostPublicationDelayMs ?? 0) <= 10_000
+				(settings.startupPostPublicationDelayMs ?? 0) > 0 &&
+				(settings.startupPostPublicationDelayMs ?? 0) <= 10_000
 				? (settings.startupPostPublicationDelayMs as number)
 				: 0;
 		if (!this.settings.masterCapabilityVerifier)
@@ -1688,7 +1688,7 @@ export class Broker {
 					lookupManagedAttemptByNativeIdentity(state, scopedIdentity) ??
 					state.graphs.flatMap(graph => graph.attempts).find(item => item.native.key === callerKey);
 				if (attempt) return error("spawn_failed", "managed native identity cannot re-enter ordinary session.spawn");
-			} catch {}
+			} catch { }
 		}
 		return undefined;
 	}
@@ -1934,32 +1934,32 @@ export class Broker {
 					expectedRevision: input.expectedRevision,
 					...(input.expectedRevision === 0
 						? {
-								assertNoManagedEvidence: async () => {
-									let enrolled: ManagedEnrollmentRecord;
-									try {
-										enrolled = await loadManagedEnrollmentRecord(this.settings.agentDir);
-									} catch {
-										throw new Error("native managed evidence exists");
-									}
-									if (
-										rootWasEstablished ||
-										enrolled.establishedRoots.includes(binding.controlRoot) ||
-										enrolled.publishingRoots.includes(binding.controlRoot) ||
-										(enrolled.byRoot[binding.controlRoot] ?? []).length > 0
-									)
-										throw new Error("native managed evidence exists");
-									await recordManagedEnrollment(this.settings.agentDir, binding.controlRoot);
-								},
-								beforeFirstPublication: async () => {
-									await markManagedEnrollmentPublishing(this.settings.agentDir, binding.controlRoot);
-								},
-								onFirstPublication: async () => {
-									await markManagedEnrollmentEstablished(this.settings.agentDir, binding.controlRoot);
-								},
-								onFirstPublicationAborted: async () => {
-									await markManagedEnrollmentPending(this.settings.agentDir, binding.controlRoot);
-								},
-							}
+							assertNoManagedEvidence: async () => {
+								let enrolled: ManagedEnrollmentRecord;
+								try {
+									enrolled = await loadManagedEnrollmentRecord(this.settings.agentDir);
+								} catch {
+									throw new Error("native managed evidence exists");
+								}
+								if (
+									rootWasEstablished ||
+									enrolled.establishedRoots.includes(binding.controlRoot) ||
+									enrolled.publishingRoots.includes(binding.controlRoot) ||
+									(enrolled.byRoot[binding.controlRoot] ?? []).length > 0
+								)
+									throw new Error("native managed evidence exists");
+								await recordManagedEnrollment(this.settings.agentDir, binding.controlRoot);
+							},
+							beforeFirstPublication: async () => {
+								await markManagedEnrollmentPublishing(this.settings.agentDir, binding.controlRoot);
+							},
+							onFirstPublication: async () => {
+								await markManagedEnrollmentEstablished(this.settings.agentDir, binding.controlRoot);
+							},
+							onFirstPublicationAborted: async () => {
+								await markManagedEnrollmentPending(this.settings.agentDir, binding.controlRoot);
+							},
+						}
 						: {}),
 				},
 				async state =>
@@ -2305,14 +2305,14 @@ export class Broker {
 			...(seed === undefined
 				? {}
 				: {
-						seed: {
-							phase: seed.phase,
-							clientRef: seed.clientRef,
-							...(seed.commandId === undefined ? {} : { commandId: seed.commandId }),
-							...(seed.turnId === undefined ? {} : { turnId: seed.turnId }),
-							...(seed.lastQ26Status === undefined ? {} : { status: seed.lastQ26Status }),
-						},
-					}),
+					seed: {
+						phase: seed.phase,
+						clientRef: seed.clientRef,
+						...(seed.commandId === undefined ? {} : { commandId: seed.commandId }),
+						...(seed.turnId === undefined ? {} : { turnId: seed.turnId }),
+						...(seed.lastQ26Status === undefined ? {} : { status: seed.lastQ26Status }),
+					},
+				}),
 		};
 	}
 
@@ -2609,7 +2609,7 @@ export class Broker {
 					return error(
 						"terminal_uncertain",
 						"session.spawn child registration is uncertain (substrate release could not be proven)" +
-							(startupFailure ? ` (${startupFailure.phase}/${startupFailure.reason})` : ""),
+						(startupFailure ? ` (${startupFailure.phase}/${startupFailure.reason})` : ""),
 					);
 				}
 				pinnedRegistration = registration.registration;
@@ -2874,9 +2874,9 @@ export class Broker {
 				);
 			return ambiguous
 				? error(
-						"terminal_uncertain",
-						current.failure?.message ?? "session.spawn state could not be advanced durably",
-					)
+					"terminal_uncertain",
+					current.failure?.message ?? "session.spawn state could not be advanced durably",
+				)
 				: error("spawn_failed", "session.spawn could not be advanced durably");
 		}
 	}
@@ -3219,7 +3219,7 @@ export class Broker {
 		stateRoot: string;
 	}): Promise<{ ok: true; registration: SpawnHostRegistration } | { ok: false }> {
 		const deadline = Date.now() + SPAWN_HOST_REGISTRATION_TIMEOUT_MS;
-		for (;;) {
+		for (; ;) {
 			try {
 				await this.index.refresh();
 				// The launch locator is authority: a same-id row registered by an
@@ -3614,7 +3614,7 @@ export class Broker {
 				lock.pid > 0
 			)
 				return { ownerId: lock.ownerId, pid: lock.pid, identity: `owner:${lock.ownerId}`, lockIdentity };
-		} catch {}
+		} catch { }
 		return { pid: 0, identity: `contents:${createHash("sha256").update(raw).digest("hex")}`, lockIdentity };
 	}
 	async #readLock(): Promise<BrokerLockSnapshot | null> {
@@ -3670,7 +3670,7 @@ export class Broker {
 		} catch (e) {
 			try {
 				await fs.rmdir(this.#lock);
-			} catch {}
+			} catch { }
 			throw e;
 		}
 	}
@@ -3781,7 +3781,7 @@ export class Broker {
 		this.#throwIfStartupAborted();
 		await fs.mkdir(path.dirname(this.#lock), { recursive: true, mode: 0o700 });
 		this.#throwIfStartupAborted();
-		for (;;) {
+		for (; ;) {
 			try {
 				await this.#createLock();
 				break;
@@ -3851,7 +3851,7 @@ export class Broker {
 				try {
 					const binding = await loadManagedDomainBinding(ref.controlRoot);
 					if (binding) await reconcileRunningManagedVerification(binding);
-				} catch {}
+				} catch { }
 			}
 			const now = Date.now();
 			const incarnation = brokerProcessIncarnation(process.pid);
@@ -4675,9 +4675,9 @@ export class Broker {
 			offset >= snapshot.sessions.length
 				? undefined
 				: this.#storeSessionListCursor(
-						{ ...snapshot, offset, expiresAt: Date.now() + SESSION_LIST_CURSOR_TTL_MS },
-						typeof cursor === "string" ? cursor : undefined,
-					);
+					{ ...snapshot, offset, expiresAt: Date.now() + SESSION_LIST_CURSOR_TTL_MS },
+					typeof cursor === "string" ? cursor : undefined,
+				);
 		return {
 			ok: true,
 			result: {
@@ -4937,6 +4937,11 @@ export class Broker {
 			...(operation === "session.close" && typeof input.sessionId === "string"
 				? { intendedSessionId: input.sessionId }
 				: {}),
+			...(operation === "session.close" &&
+				typeof input.endpointGeneration === "number" &&
+				typeof input.endpointIncarnation === "string"
+				? { closeAuthorityBound: true }
+				: {}),
 		};
 		if (!this.ledger.get(identity)) {
 			const matchingOperation = this.ledger.findAnyByOperationKey(operationKey);
@@ -5056,16 +5061,16 @@ export class Broker {
 						const replaySessionId = (replay.result as { sessionId: string }).sessionId;
 						const replayIncarnation =
 							typeof replayResult?.endpointIncarnation === "string" &&
-							/^[a-f0-9]{64}$/.test(replayResult.endpointIncarnation)
+								/^[a-f0-9]{64}$/.test(replayResult.endpointIncarnation)
 								? replayResult.endpointIncarnation
 								: endpointIncarnation(
-										{
-											endpointGeneration: replayResult?.endpointGeneration as number,
-											endpointMtimeMs: replayResult?.endpointMtimeMs as number,
-											pid: replayResult?.pid as number,
-										},
-										replaySessionId,
-									);
+									{
+										endpointGeneration: replayResult?.endpointGeneration as number,
+										endpointMtimeMs: replayResult?.endpointMtimeMs as number,
+										pid: replayResult?.pid as number,
+									},
+									replaySessionId,
+								);
 						if (!replayIncarnation)
 							return error("endpoint_stale", "lifecycle replay lacks original endpoint authority");
 						const refreshed = await this.#readLifecycleReplayEndpoint(replaySessionId);
@@ -5091,9 +5096,9 @@ export class Broker {
 				const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
 				await this.ledger.transition(identity, lifecycleResponseState(response), {
 					...(operation === "session.delete" &&
-					typeof input.sessionId === "string" &&
-					lifecycleResponseState(response) === "terminal_uncertain" &&
-					!pendingCleanupSessionId(response)
+						typeof input.sessionId === "string" &&
+						lifecycleResponseState(response) === "terminal_uncertain" &&
+						!pendingCleanupSessionId(response)
 						? { intendedSessionId: input.sessionId }
 						: {}),
 					response: storedResponse,
@@ -5116,9 +5121,9 @@ export class Broker {
 				await this.ledger.transition(identity, lifecycleResponseState(response), {
 					...(pendingCleanupSessionId(response) ? { intendedSessionId: pendingCleanupSessionId(response) } : {}),
 					...(operation === "session.delete" &&
-					typeof input.sessionId === "string" &&
-					lifecycleResponseState(response) === "terminal_uncertain" &&
-					!pendingCleanupSessionId(response)
+						typeof input.sessionId === "string" &&
+						lifecycleResponseState(response) === "terminal_uncertain" &&
+						!pendingCleanupSessionId(response)
 						? { intendedSessionId: input.sessionId }
 						: {}),
 					response: storedResponse,
@@ -5143,8 +5148,8 @@ export class Broker {
 			await this.ledger.transition(identity, lifecycleResponseState(response), {
 				...(pendingCleanupSessionId(response) ? { intendedSessionId: pendingCleanupSessionId(response) } : {}),
 				...(refusalSessionId !== undefined &&
-				lifecycleResponseState(response) === "terminal_uncertain" &&
-				!pendingCleanupSessionId(response)
+					lifecycleResponseState(response) === "terminal_uncertain" &&
+					!pendingCleanupSessionId(response)
 					? { intendedSessionId: refusalSessionId }
 					: {}),
 				resultSessionId:
