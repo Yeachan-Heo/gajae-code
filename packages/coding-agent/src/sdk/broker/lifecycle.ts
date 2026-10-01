@@ -8160,32 +8160,28 @@ export async function executeLifecycle(
 		expected,
 		evidence,
 		proofBudget,
-		!response.ok && response.error.code === "ready_then_exited",
+		!response.ok ? response.error.code === "ready_then_exited" : false,
 	);
-	const startupFailure: LifecycleStartupFailureReceipt | undefined = evidence
-		? {
-				// Include message and artifactDigest only for recovery-stamped conflicts
-				...(response.error.code === "terminal_uncertain"
-					? {
-							artifactDigest: evidence.digest,
-							message: evidence.artifact.message,
-						}
-					: {}),
-				phase: evidence.artifact.phase,
-				reason: evidence.artifact.reason,
-				...(evidence.artifact.code === undefined
-					? {}
-					: { code: evidence.artifact.code, details: evidence.artifact.details }),
-				rollback: {
-					endpointGeneration: evidence.artifact.rollback.endpointGeneration,
-					fenced: evidence.artifact.rollback.fenced,
-					runtimeRemoved: evidence.artifact.rollback.runtimeRemoved,
-					hostStopped: evidence.artifact.rollback.hostStopped,
-					brokerRegistrationReleased: evidence.artifact.rollback.brokerRegistrationReleased,
-				},
-				...(cleanupProof ? { cleanupProof } : {}),
-			}
-		: undefined;
+	const startupFailure: LifecycleStartupFailureReceipt | undefined =
+		evidence && !response.ok
+			? {
+					artifactDigest: evidence.digest,
+					message: evidence.artifact.message,
+					phase: evidence.artifact.phase,
+					reason: evidence.artifact.reason,
+					...(evidence.artifact.code === undefined
+						? {}
+						: { code: evidence.artifact.code, details: evidence.artifact.details }),
+					rollback: {
+						endpointGeneration: evidence.artifact.rollback.endpointGeneration,
+						fenced: evidence.artifact.rollback.fenced,
+						runtimeRemoved: evidence.artifact.rollback.runtimeRemoved,
+						hostStopped: evidence.artifact.rollback.hostStopped,
+						brokerRegistrationReleased: evidence.artifact.rollback.brokerRegistrationReleased,
+					},
+					...(cleanupProof ? { cleanupProof } : {}),
+				}
+			: undefined;
 	const durableEffectsBody: Omit<LifecycleDurableEffectsReceipt, "digest"> = {
 		...(priorDurableEffects?.worktree ? { worktree: priorDurableEffects.worktree } : {}),
 		...(evidence?.artifact.transcript
