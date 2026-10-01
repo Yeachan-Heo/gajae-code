@@ -15,6 +15,7 @@ interface CacheEntry {
 }
 
 let versionCache: CacheEntry | null = null;
+let failureCacheExpiry: number | null = null; // Timestamp when we can retry a failed fetch; prevents 404 storms
 
 /**
  * Fetch the latest Grok CLI version from GitHub releases API.
@@ -52,8 +53,13 @@ async function fetchLatestVersionFromGitHub(): Promise<string | null> {
  *
  * Strategy:
  * 1. Return cached version if not expired
- * 2. Try to fetch latest from GitHub (non-blocking; fires in background)
+ * 2. If not cached or expired, try to fetch latest from GitHub (non-blocking; fires in background)
  * 3. Fall back to hardcoded version
+ *
+ * Note: This function is intentionally synchronous/fire-and-forget. The GitHub fetch
+ * happens in the background and updates the cache for future requests. On first call
+ * or cache miss, the fallback is returned immediately. Failed fetches (404, network errors)
+ * are cached with a TTL to prevent retry storms.
  */
 export function getGrokCliVersion(): string {
   const now = Date.now();
@@ -63,16 +69,33 @@ export function getGrokCliVersion(): string {
     return versionCache.version;
   }
 
+  // If a fetch failed recently, don't retry immediately; use failure cache TTL
+  // This prevents hitting GitHub 404 or rate limits repeatedly
+  if (failureCacheExpiry && now < failureCacheExpiry) {
+    return FALLBACK_VERSION;
+  }
+
   // Attempt to fetch latest version asynchronously (non-blocking)
   // This updates the cache in the background for future requests
   fetchLatestVersionFromGitHub()
     .then((latestVersion) => {
+      // Use 'Date.now()' again to get current timestamp, not the outer 'now' from function start
+      const updateTime = Date.now();
       if (latestVersion) {
-        versionCache = { version: latestVersion, timestamp: now };
+        versionCache = { version: latestVersion, timestamp: updateTime };
+        // Clear failure cache on success
+        failureCacheExpiry = null;
+      } else {
+        // Fetch returned null (GitHub error, network error, etc.)
+        // Set failure cache to prevent retrying immediately
+        // Use shorter TTL than success cache (1 hour) to eventually recover if endpoint comes back
+        failureCacheExpiry = updateTime + 60 * 60 * 1000;
       }
     })
     .catch(() => {
-      // Silently ignore fetch errors; we'll use fallback
+      // Network or parsing error
+      const updateTime = Date.now();
+      failureCacheExpiry = updateTime + 60 * 60 * 1000;
     });
 
   // Return cached or fallback version immediately (non-blocking)
@@ -110,6 +133,7 @@ export function updateVersionFromError(errorBody: string): string {
  */
 export function resetVersionCache(): void {
   versionCache = null;
+  failureCacheExpiry = null;
 }
 
 /**
