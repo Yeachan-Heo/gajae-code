@@ -86,7 +86,7 @@ describe("SDK broker hop protocol", () => {
 		expect(isPidAlive(reported.pid)).toBe(true);
 
 		// Reaping through the exited hop's ChildProcess must signal the reported broker pid.
-		await reapSpawnedBrokerForTest(hop, reported.pid, { gracefulMs: 2_000, killVerifyMs: 2_000 });
+		await reapSpawnedBrokerForTest(hop, reported.pid, undefined, { gracefulMs: 2_000, killVerifyMs: 2_000 });
 		expect(isPidAlive(reported.pid)).toBe(false);
 	});
 

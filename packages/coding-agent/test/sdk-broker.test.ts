@@ -2069,7 +2069,7 @@ describe("SDK broker identity and discovery", () => {
 			},
 		});
 
-		await reapSpawnedBrokerForTest(child as unknown as ChildProcess, undefined, { gracefulMs: 1, killVerifyMs: 1 });
+		await reapSpawnedBrokerForTest(child as unknown as ChildProcess, undefined, undefined, { gracefulMs: 1, killVerifyMs: 1 });
 
 		expect(signals).toEqual([]);
 	});
