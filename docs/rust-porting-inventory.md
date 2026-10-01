@@ -26,8 +26,8 @@ Upstream pin: `can1357/oh-my-pi@a85bd5228d9f0f619deade1db78fa49420a721e1`
 |---|---|---|---|---|
 | 0 — toolchain and shared deps at pin | in-progress | | | `nightly-2026-08-12`; shared workspace deps aligned to the pin. |
 | 1b — inventory and shared gates | in-progress | | | Schema and gate tooling are being established. |
-| 2.7 — pi-edit matcher foundation | blocked | | | The surrogate custom-threshold matcher uses Unicode scalar values; `replace.ts` remains TypeScript until UTF-16 threshold semantics are resolved. |
-| 2.8–2.10 — remaining pi-edit consumers | candidate | | | Consumer integration remains scoped by the 2.7 custom-threshold decision. |
+| 2.7 — pi-edit matcher foundation | adopted | https://github.com/Yeachan-Heo/gajae-code/pull/6016 | | Matcher and fuzzy scoring landed via #5980/#6016; UTF-16 threshold semantics kept under keep-local D-PI-EDIT-UTF16-SCORING. |
+| 2.8–2.10 — remaining pi-edit consumers | rejected | | | Upstream pi-edit hashline/patch/streaming modes implement a different edit protocol (PUT / unified-hunk rejection) than the gjc grammar in `hashline/grammar.lark`; D9 makes gjc prompts and grammars authoritative, so adopting them would change model-visible bytes. `Diff.applyPatch` and the hashline/apply_patch/streaming TS paths stay local, guarded by D-TRANSITIONAL-TS. |
 
 ## Inventory tables
 
