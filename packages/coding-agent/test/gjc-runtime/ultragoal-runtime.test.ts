@@ -6,6 +6,7 @@ import { deflateSync } from "node:zlib";
 import {
 	activeEntryPath,
 	activeSnapshotPath,
+	projectStateRoot,
 	modeStatePath as sessionModeStatePath,
 	sessionStateDir,
 	sessionUltragoalDir,
@@ -2242,8 +2243,18 @@ describe("native GJC ultragoal runtime", () => {
 		const gatePath = path.join(root, "valid-gate.json");
 		await fs.writeFile(gatePath, validGate);
 
-		const goalsPath = path.join(root, ".gjc", `_session-${process.env.GJC_SESSION_ID}`, "ultragoal", "goals.json");
-		const ledgerPath = path.join(root, ".gjc", `_session-${process.env.GJC_SESSION_ID}`, "ultragoal", "ledger.jsonl");
+		const goalsPath = path.join(
+			projectStateRoot(root),
+			`_session-${process.env.GJC_SESSION_ID}`,
+			"ultragoal",
+			"goals.json",
+		);
+		const ledgerPath = path.join(
+			projectStateRoot(root),
+			`_session-${process.env.GJC_SESSION_ID}`,
+			"ultragoal",
+			"ledger.jsonl",
+		);
 		const [goalsBefore, ledgerBefore] = await Promise.all([
 			fs.readFile(goalsPath, "utf8"),
 			fs.readFile(ledgerPath, "utf8"),
@@ -2304,7 +2315,12 @@ describe("native GJC ultragoal runtime", () => {
 	it("quality-gate init: writes a multi-surface template without mutating goals", async () => {
 		const root = await batchTempDir();
 		await createUltragoalPlan({ cwd: root, brief: "Ship one boundary" });
-		const goalsPath = path.join(root, ".gjc", `_session-${process.env.GJC_SESSION_ID}`, "ultragoal", "goals.json");
+		const goalsPath = path.join(
+			projectStateRoot(root),
+			`_session-${process.env.GJC_SESSION_ID}`,
+			"ultragoal",
+			"goals.json",
+		);
 		const goalsBefore = await fs.readFile(goalsPath, "utf8");
 		const out = path.join(root, "quality-gate.json");
 

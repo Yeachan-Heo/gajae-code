@@ -17,11 +17,12 @@ import {
 	ZERO_PROGRESS_STALL_THRESHOLD,
 } from "@gajae-code/coding-agent/gjc-runtime/workflow-recovery-projection";
 import { TempDir } from "@gajae-code/utils";
+import { projectStateRoot } from "../src/gjc-runtime/session-layout";
 
 const SESSION_ID = "sess-4560";
 
 function ralplanRunDir(cwd: string, runId: string): string {
-	return path.join(cwd, ".gjc", `_session-${SESSION_ID}`, "plans", "ralplan", runId);
+	return path.join(projectStateRoot(cwd), `_session-${SESSION_ID}`, "plans", "ralplan", runId);
 }
 
 const FINAL_PLAN = `Fix widget parser performance regression.
@@ -43,7 +44,7 @@ Use bounded lookahead instead of full-buffer regex.
 `;
 
 function ultragoalDir(cwd: string): string {
-	return path.join(cwd, ".gjc", `_session-${SESSION_ID}`, "ultragoal");
+	return path.join(projectStateRoot(cwd), `_session-${SESSION_ID}`, "ultragoal");
 }
 
 describe("workflow recovery projection (#4560)", () => {
@@ -132,7 +133,7 @@ describe("workflow recovery projection (#4560)", () => {
 		expect(discovered?.provenance.runId).toBe("valid-run");
 
 		await Bun.write(
-			path.join(tempDir.path(), ".gjc", `_session-${SESSION_ID}`, "state", "ralplan-state.json"),
+			path.join(projectStateRoot(tempDir.path()), `_session-${SESSION_ID}`, "state", "ralplan-state.json"),
 			JSON.stringify({ run_id: "unfinished-run" }),
 		);
 		const activeUnfinished = await projectLatestRalplanRun({ cwd: tempDir.path(), sessionId: SESSION_ID });
@@ -152,7 +153,7 @@ describe("workflow recovery projection (#4560)", () => {
 			})}\n${JSON.stringify({ event: "planning_stuck", planning_stuck: true })}\n`,
 		);
 		await Bun.write(
-			path.join(tempDir.path(), ".gjc", `_session-${SESSION_ID}`, "state", "ralplan-state.json"),
+			path.join(projectStateRoot(tempDir.path()), `_session-${SESSION_ID}`, "state", "ralplan-state.json"),
 			JSON.stringify({ run_id: "stuck-run" }),
 		);
 		const projection = await projectLatestRalplanRun({ cwd: tempDir.path(), sessionId: SESSION_ID });
@@ -176,7 +177,7 @@ describe("workflow recovery projection (#4560)", () => {
 			})}\n`,
 		);
 		await Bun.write(
-			path.join(tempDir.path(), ".gjc", `_session-${SESSION_ID}`, "state", "ralplan-state.json"),
+			path.join(projectStateRoot(tempDir.path()), `_session-${SESSION_ID}`, "state", "ralplan-state.json"),
 			JSON.stringify({ run_id: "planner-only-run" }),
 		);
 		const projection = await projectLatestRalplanRun({ cwd: tempDir.path(), sessionId: SESSION_ID });
@@ -199,12 +200,12 @@ describe("workflow recovery projection (#4560)", () => {
 				sha256: crypto.createHash("sha256").update(FINAL_PLAN).digest("hex"),
 			})}\n`,
 		);
-		const plansRoot = path.join(tempDir.path(), ".gjc", `_session-${SESSION_ID}`, "plans");
+		const plansRoot = path.join(projectStateRoot(tempDir.path()), `_session-${SESSION_ID}`, "plans");
 		await fs.mkdir(plansRoot, { recursive: true });
 		// The `ralplan` ancestor component itself is a symlink out of the tree.
 		await fs.symlink(path.join(tempDir.path(), "outside"), path.join(plansRoot, "ralplan"));
 		await Bun.write(
-			path.join(tempDir.path(), ".gjc", `_session-${SESSION_ID}`, "state", "ralplan-state.json"),
+			path.join(projectStateRoot(tempDir.path()), `_session-${SESSION_ID}`, "state", "ralplan-state.json"),
 			JSON.stringify({ run_id: "evil-run" }),
 		);
 		await expect(projectLatestRalplanRun({ cwd: tempDir.path(), sessionId: SESSION_ID })).resolves.toBeUndefined();
@@ -223,7 +224,7 @@ describe("workflow recovery projection (#4560)", () => {
 			})}\n`,
 		);
 		await Bun.write(
-			path.join(tempDir.path(), ".gjc", `_session-${SESSION_ID}`, "state", "ralplan-state.json"),
+			path.join(projectStateRoot(tempDir.path()), `_session-${SESSION_ID}`, "state", "ralplan-state.json"),
 			"{not-json",
 		);
 		await expect(projectLatestRalplanRun({ cwd: tempDir.path(), sessionId: SESSION_ID })).resolves.toBeUndefined();

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { z } from "zod";
+import { projectStateRoot } from "../../gjc-runtime/session-layout";
 import {
 	type GuardedWriteResult,
 	readExistingStateForMutation,
@@ -828,7 +829,7 @@ export async function assertManagedManifestCurrent(
 	);
 }
 export function managedTaskDomainPath(controlRoot: string): string {
-	return path.join(controlRoot, ".gjc", "managed-task-domain", "state.json");
+	return path.join(projectStateRoot(controlRoot), "managed-task-domain", "state.json");
 }
 export function managedEnrollmentIndexPath(agentDir: string): string {
 	return path.join(agentDir, ".gjc", "managed-task-enrollments", "index.json");

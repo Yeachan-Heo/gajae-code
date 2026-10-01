@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import type { SessionIndex } from "../src/sdk/broker/session-index";
 import { SessionRouter, type SessionRouterClient } from "../src/sdk/router";
 
@@ -26,7 +27,7 @@ async function scopedRouterFixture(sessionIds?: readonly string[]): Promise<{
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-router-attach-scope-"));
 	tempDirs.push(repo);
 	const agentDir = path.join(repo, ".gjc", "agent");
-	const stateRoot = path.join(repo, ".gjc", "state");
+	const stateRoot = projectSharedStateRoot(repo, agentDir);
 	const endpointDir = path.join(stateRoot, "sdk");
 	fs.mkdirSync(endpointDir, { recursive: true });
 

@@ -87,7 +87,7 @@ import { getSkillManifest, isKnownWorkflowState, isValidTransition } from "./wor
  * Native implementation of the `gjc state read|write|clear` command surface.
  *
  * Simple file-receipt operations against session-scoped state under
- * `.gjc/_session-{id}/state/`. This is the sanctioned CLI mediator for
+ * `$GJC_STATE_DIR/_session-{id}/state/`. This is the sanctioned CLI mediator for
  * mutation-guarded GJC state — agents call it instead of editing those files directly.
  */
 
@@ -1028,8 +1028,9 @@ export async function reconcileWorkflowSkillState(options: {
 		envSessionId: process.env.GJC_SESSION_ID,
 	});
 	return withWorkflowStateLock(
-		path.relative(options.cwd, modeStateFile(options.cwd, options.mode, sessionId)),
+		modeStateFile(options.cwd, options.mode, sessionId),
 		async () => reconcileWorkflowSkillStateUnlocked(options, sessionId),
+		{ cwd: options.cwd },
 	);
 }
 

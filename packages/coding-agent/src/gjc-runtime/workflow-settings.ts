@@ -26,7 +26,7 @@
  * during migration (see Settings) or the retained-legacy fallback layer.
  *
  * This module must stay pure and acyclic: it imports only path helpers and the
- * pure `gjcRoot`/`dirs` utilities, never `Settings`, discovery/capability
+ * pure `session-layout`/`dirs` utilities, never `Settings`, discovery/capability
  * loaders, or workflow runtimes. All config/agent paths are constructed inside
  * each resolver call (never at module scope) because `dirs.ts` caches directory
  * resolution at module load.
@@ -42,7 +42,7 @@ import {
 	standardizeMacOSPath,
 } from "@gajae-code/utils";
 import { YAML } from "bun";
-import { gjcRoot } from "./session-layout";
+import { projectConfigRoot, projectSharedStateRoot } from "./session-layout";
 
 export type WorkflowSettingKey =
 	| "gjc.deepInterview.ambiguityThreshold"
@@ -124,21 +124,21 @@ type ResolverCandidate = {
 };
 
 const LAYER_CANDIDATES: ReadonlyArray<ResolverCandidate> = [
-	{ layer: "project-config", format: "yaml", buildPath: cwd => path.resolve(gjcRoot(cwd), "config.yml") },
+	{ layer: "project-config", format: "yaml", buildPath: cwd => path.resolve(projectConfigRoot(cwd), "config.yml") },
 ];
 
 /**
- * The project migration's per-key ownership marker (`.gjc/state/
+ * The project migration's per-key ownership marker (`$GJC_STATE_DIR/state/
  * settings.json.migrated-keys`): a key recorded there was migrated into project
  * config.yml and is owned by that surface. Deleting config.yml afterwards must
  * NOT resurrect the retained legacy value (the removal sticks), so the legacy
  * fallback layer is suppressed for marked keys. A missing or malformed marker
  * reads as no ownership.
  */
-async function projectKeyMigrated(cwd: string, key: WorkflowSettingKey): Promise<boolean> {
+async function projectKeyMigrated(cwd: string, key: WorkflowSettingKey, agentDir?: string): Promise<boolean> {
 	let raw: string;
 	try {
-		raw = await Bun.file(path.join(gjcRoot(cwd), "state", "settings.json.migrated-keys")).text();
+		raw = await Bun.file(path.join(projectSharedStateRoot(cwd, agentDir), "settings.json.migrated-keys")).text();
 	} catch (error) {
 		// Only a MISSING marker reads as no ownership. A non-ENOENT read
 		// failure (EACCES, transient I/O) must fail closed: reporting unowned
@@ -328,7 +328,7 @@ export async function resolveWorkflowSetting<T>(
 	// legacy sits above the agent config.yml (it was the previously effective
 	// project override); the config-root legacy sits below it (the agent
 	// config.yml is the current machine-global surface).
-	const projectSettingsJson = path.resolve(gjcRoot(cwd), "settings.json");
+	const projectSettingsJson = path.resolve(projectConfigRoot(cwd), "settings.json");
 	const agentSettingsJson = path.resolve(getConfigRootDir(), "settings.json");
 	const legacyCandidates: ResolverCandidate[] = [];
 	if (await legacySourceExists(projectSettingsJson)) {
@@ -338,7 +338,7 @@ export async function resolveWorkflowSetting<T>(
 			buildPath: () => projectSettingsJson,
 			// A key already migrated into config.yml is owned by that surface:
 			// deleting the file afterwards must not resurrect the retained value.
-			migrationOwned: key => projectKeyMigrated(cwd, key),
+			migrationOwned: key => projectKeyMigrated(cwd, key, options.agentDir),
 		});
 	}
 	// When the config-root source ALIASES the project source (GJC run from the
@@ -360,7 +360,7 @@ export async function resolveWorkflowSetting<T>(
 			format: "json",
 			buildPath: () => agentSettingsJson,
 			...(configRootAliasesProject
-				? { migrationOwned: (key: WorkflowSettingKey) => projectKeyMigrated(cwd, key) }
+				? { migrationOwned: (key: WorkflowSettingKey) => projectKeyMigrated(cwd, key, options.agentDir) }
 				: {}),
 		});
 	}
@@ -386,9 +386,13 @@ export async function resolveWorkflowSetting<T>(
 		// config.yml value already returned above, so it still wins. An OWNED
 		// project key (deliberately unset) is exempt: its strict error is
 		// irrelevant and must not exit 2.
-		if (candidate.layer === "agent-config" && invalidPolicy === "throw" && !(await projectKeyMigrated(cwd, key))) {
+		if (
+			candidate.layer === "agent-config" &&
+			invalidPolicy === "throw" &&
+			!(await projectKeyMigrated(cwd, key, options.agentDir))
+		) {
 			const retained = await readRetainedStrictEvidence(
-				path.join(gjcRoot(cwd), "state", STRICT_INVALID_EVIDENCE_FILENAME),
+				path.join(projectSharedStateRoot(cwd, options.agentDir), STRICT_INVALID_EVIDENCE_FILENAME),
 				key,
 			);
 			if (retained) {

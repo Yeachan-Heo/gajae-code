@@ -1,6 +1,7 @@
 import { afterEach, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { Broker } from "../src/sdk/broker/broker";
 import { readBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { type FixtureBrokerLease, startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
@@ -116,7 +117,7 @@ it("starts the default source session host with isolated bootstrap policy and wo
 	const root = await tempRoot();
 	const workspace = path.join(root, "workspace ü");
 	const agentDir = path.join(root, "agent");
-	const stateRoot = path.join(workspace, ".gjc", "state");
+	const stateRoot = projectSharedStateRoot(workspace, agentDir);
 	const sentinel = path.join(root, "host-preload-sentinel");
 	const preload = path.join(root, "host-preload.ts");
 	await fs.mkdir(workspace, { recursive: true });

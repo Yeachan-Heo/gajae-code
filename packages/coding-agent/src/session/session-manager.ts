@@ -69,7 +69,7 @@ import {
 } from "../config/model-profile-ownership";
 import { EDIT_SNAPSHOT_EXTERNALIZED_NOTICE, editSnapshotReceipt } from "../edit/renderer";
 import type { TtsrInjectionRecord } from "../export/ttsr";
-import { assertSafePathComponent } from "../gjc-runtime/session-layout";
+import { assertSafePathComponent, projectStateRoot } from "../gjc-runtime/session-layout";
 import { writeTextAtomic } from "../gjc-runtime/state-writer";
 import type { ManagedLegacyLocalMigrationSource } from "../internal-urls/local-protocol";
 import * as git from "../utils/git";
@@ -6510,9 +6510,9 @@ class NdjsonFileWriter {
 const PROJECT_SESSION_SCAN_MAX_DIRECTORIES = 4096;
 const PROJECT_SESSION_SCAN_MAX_FILES = 1000;
 
-function isProjectSessionTranscriptPath(projectGjcDir: string, filePath: string): boolean {
+function isProjectSessionTranscriptPath(projectStateDir: string, filePath: string): boolean {
 	if (isStagedSessionPath(filePath)) return false;
-	const relative = path.relative(projectGjcDir, filePath);
+	const relative = path.relative(projectStateDir, filePath);
 	if (relative.startsWith("..") || path.isAbsolute(relative)) return false;
 	const segments = relative.split(path.sep);
 	if (segments.includes(SESSION_STAGING_DIRNAME)) return false;
@@ -6522,21 +6522,22 @@ function isProjectSessionTranscriptPath(projectGjcDir: string, filePath: string)
 }
 
 /**
- * Discover resumable transcripts intentionally stored inside a project's `.gjc`.
+ * Discover resumable transcripts intentionally stored under a project's runtime
+ * state root (`~/.gjc/agent/projects/<name>-<hash>`).
  * Runtime token/audit JSONL files are excluded by requiring a known transcript
  * container (`agent-session` or `sessions`).
  */
 export function listProjectSessionTranscriptFiles(cwd: string): string[] {
-	const projectGjcDir = path.join(path.resolve(cwd), ".gjc");
+	const projectStateDir = projectStateRoot(path.resolve(cwd));
 	let rootStat: fs.Stats;
 	try {
-		rootStat = fs.lstatSync(projectGjcDir);
+		rootStat = fs.lstatSync(projectStateDir);
 	} catch {
 		return [];
 	}
 	if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return [];
 
-	const directories = [projectGjcDir];
+	const directories = [projectStateDir];
 	const files: string[] = [];
 	let scannedDirectories = 0;
 	while (directories.length > 0 && scannedDirectories < PROJECT_SESSION_SCAN_MAX_DIRECTORIES) {
@@ -6560,7 +6561,7 @@ export function listProjectSessionTranscriptFiles(cwd: string): string[] {
 				entry.isFile() &&
 				!entry.name.startsWith(".") &&
 				entry.name.endsWith(".jsonl") &&
-				isProjectSessionTranscriptPath(projectGjcDir, entryPath)
+				isProjectSessionTranscriptPath(projectStateDir, entryPath)
 			) {
 				files.push(entryPath);
 				if (files.length >= PROJECT_SESSION_SCAN_MAX_FILES) return files;
@@ -17606,9 +17607,7 @@ export class SessionManager {
 		if (explicitSessionDir) {
 			const root = await fs.promises.realpath(explicitSessionDir);
 			if (!pathIsWithin(root, sessionPath)) throw new Error("Session is outside the configured session directory.");
-		} else if (
-			!isProjectSessionTranscriptPath(path.join(canonicalizeTrustedPath(session.cwd), ".gjc"), sessionPath)
-		) {
+		} else if (!isProjectSessionTranscriptPath(projectStateRoot(canonicalizeTrustedPath(session.cwd)), sessionPath)) {
 			const sessionsRoot = path.dirname(directory);
 			const resolved = resolveManagedScope({ cwd: session.cwd, agentDir: path.dirname(sessionsRoot), sessionsRoot });
 			if (resolved.kind === "error") throw new Error(`Could not resolve managed session scope: ${resolved.message}`);
@@ -21420,10 +21419,10 @@ export class SessionManager {
 		const inspected = inspectTranscriptHeaderBounded(sessionPath, storage, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES);
 		if (!inspected.ok || !inspected.inspection.cwd) throw new Error("Session has no valid workspace header.");
 		const headerCwd = inspected.inspection.cwd;
-		const projectGjcDir = path.join(path.resolve(headerCwd), ".gjc");
-		if (isProjectSessionTranscriptPath(projectGjcDir, sessionPath)) {
-			const relativePath = path.relative(projectGjcDir, path.resolve(sessionPath)).split(path.sep).join("/");
-			const authority = nativeSessionManager().openRecoveryFsRoot(projectGjcDir);
+		const projectStateDir = projectStateRoot(path.resolve(headerCwd));
+		if (isProjectSessionTranscriptPath(projectStateDir, sessionPath)) {
+			const relativePath = path.relative(projectStateDir, path.resolve(sessionPath)).split(path.sep).join("/");
+			const authority = nativeSessionManager().openRecoveryFsRoot(projectStateDir);
 			try {
 				const observed = authority.stat(relativePath);
 				if (!observed.ok || !observed.identity?.sha256)

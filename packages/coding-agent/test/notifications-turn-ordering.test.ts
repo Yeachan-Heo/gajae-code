@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
 import { POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY, TOOL_ACTIVITY_CAPABILITY } from "../src/sdk/bus/telegram-daemon";
 import {
@@ -119,7 +120,7 @@ async function setup(
 
 	await handlers.get("session_start")!({ type: "session_start" }, ctx);
 
-	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sid}.json`);
+	const endpointFile = path.join(projectSharedStateRoot(cwd, agentDir), "sdk", `${sid}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), 4000, "endpoint file");
 	const { url, token } = readTestSdkEndpoint(endpointFile);
 

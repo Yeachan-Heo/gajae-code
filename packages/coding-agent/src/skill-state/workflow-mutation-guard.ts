@@ -5,7 +5,12 @@ import type { AgentTool } from "@gajae-code/agent-core";
 import { logger } from "@gajae-code/utils";
 import { isAutoresearchAuthorizedResearchPath } from "../autoresearch/git";
 import { expandApplyPatchToEntries } from "../edit/modes/apply-patch";
-import { GJC_SESSION_PREFIX, modeStatePath as sessionModeStatePath } from "../gjc-runtime/session-layout";
+import {
+	GJC_DIR,
+	GJC_SESSION_PREFIX,
+	projectStateRoot,
+	modeStatePath as sessionModeStatePath,
+} from "../gjc-runtime/session-layout";
 import { resolveGjcSessionForRead } from "../gjc-runtime/session-resolution";
 import { ModeStateSchema } from "../gjc-runtime/state-schema";
 import { getSkillManifest } from "../gjc-runtime/workflow-manifest";
@@ -1644,9 +1649,18 @@ function resolveRawPath(cwd: string, rawPath: string): { absolutePath?: string; 
 	}
 }
 
+/**
+ * Project-relative segments for a mutation target. A target under the project's
+ * external runtime state root is reported as `.gjc/<rest>` so session and shared
+ * runtime state stay guarded exactly like the in-project `.gjc/**` config tree.
+ */
 function relativeGjcSegments(cwd: string, rawPath: string): string[] | null {
 	const { absolutePath, unknown } = resolveRawPath(cwd, rawPath);
 	if (unknown || !absolutePath) return null;
+	const stateRelative = path.relative(projectStateRoot(path.resolve(cwd)), path.resolve(absolutePath));
+	if (stateRelative !== "" && !stateRelative.startsWith("..") && !path.isAbsolute(stateRelative)) {
+		return [GJC_DIR, ...normalizePosix(stateRelative).split("/").filter(Boolean)];
+	}
 	const relative = path.relative(path.resolve(cwd), path.resolve(absolutePath));
 	if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) return null;
 	return normalizePosix(relative).split("/").filter(Boolean);

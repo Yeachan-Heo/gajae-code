@@ -63,7 +63,7 @@ describe("correlated steer production dispatch", () => {
 			expect(byCanonical).toMatchObject({ ok: true, result: durableStatus });
 			expect((byRef as { result: Record<string, unknown> }).result).not.toHaveProperty("sessionId");
 			expect((byCanonical as { result: Record<string, unknown> }).result).not.toHaveProperty("sessionId");
-			const reconciliationPath = path.join(root, ".gjc", "state", ".sdk-reconciliation", `${host.sessionId}.json`);
+			const reconciliationPath = path.join(host.stateRoot, ".sdk-reconciliation", `${host.sessionId}.json`);
 			const exists = await fs
 				.stat(reconciliationPath)
 				.then(() => true)

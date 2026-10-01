@@ -16,6 +16,7 @@ import { mergeModelProfiles } from "../src/config/model-profiles";
 import { kNoAuth, type ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import type { ExtensionAPI, ExtensionContext } from "../src/extensibility/extensions";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { Broker } from "../src/sdk/broker/broker";
 import {
 	readSessionLifecycleFailureForTest,
@@ -533,7 +534,7 @@ describe("broker model-profile validation", () => {
 		expect(validateBrokerModelPresetForTest(agentDir, "custom/profile !")).toBe("custom/profile !");
 		expect(validateBrokerModelPresetForTest(agentDir, "codex-standard")).toBe("codex-medium");
 		const cwd = await temp();
-		const stateRoot = path.join(cwd, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(cwd);
 		await fs.mkdir(stateRoot, { recursive: true });
 		await Bun.write(
 			path.join(cwd, "models.yml"),

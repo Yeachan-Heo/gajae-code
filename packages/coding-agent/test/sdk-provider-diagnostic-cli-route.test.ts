@@ -8,6 +8,7 @@ import { Messages } from "@anthropic-ai/sdk/resources/messages/messages";
 import type { AssistantMessage, Context, Model } from "@gajae-code/ai";
 import { streamAnthropic } from "@gajae-code/ai";
 import type { Server } from "bun";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { Broker } from "../src/sdk/broker/broker";
 import type { KindAwareReconciliation } from "../src/sdk/bus/kind-aware-reconciliation";
 import { createKindAwareReconciliation } from "../src/sdk/bus/kind-aware-reconciliation";
@@ -238,8 +239,8 @@ describe("provider diagnostic through the real SDK session CLI route", () => {
 	beforeEach(async () => {
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-diagnostic-route-"));
 		await initializeTestRepository(root);
-		stateRoot = path.join(root, ".gjc", "state");
 		agentDir = path.join(root, "agent");
+		stateRoot = projectSharedStateRoot(root, agentDir);
 		await fs.mkdir(agentDir, { recursive: true });
 		token = "route-token";
 		served = undefined;

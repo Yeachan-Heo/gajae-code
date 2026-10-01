@@ -1,7 +1,7 @@
 /**
  * Session-scoped storage for the harness control plane.
  *
- * Layout (under the harness state root, default `<cwd>/.gjc/_session-{sessionid}/state/harness`):
+ * Layout (under the harness state root, default `$GJC_STATE_DIR/_session-{sessionid}/state/harness`):
  *   sessions/<encoded-id>/state.json        lifecycle + handle (atomic)
  *   sessions/<encoded-id>/lease.json         owner lease (M3)
  *   sessions/<encoded-id>/events.jsonl       owner-only severity envelopes

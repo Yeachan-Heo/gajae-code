@@ -14,6 +14,7 @@ import type { SessionListOutcome } from "@gajae-code/coding-agent/sdk/lifecycle/
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Snowflake } from "@gajae-code/utils";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { createMasterCapabilityVerifier, readEndpoint } from "../src/sdk/broker/master-capability";
 import { type IndexedSession, SessionIndex } from "../src/sdk/broker/session-index";
 import { createNotificationsExtension } from "../src/sdk/bus";
@@ -341,7 +342,7 @@ describe("master SDK host composition", () => {
 			dispose = async () => await created.session.dispose();
 			const sessionId = sessionManager.getSessionId();
 			await created.session.extensionRunner?.emit({ type: "session_start" });
-			const endpointDir = path.join(cwd, ".gjc", "state", "sdk");
+			const endpointDir = path.join(projectSharedStateRoot(cwd, agentDir), "sdk");
 			const endpoint = path.join(endpointDir, `${sessionId}.json`);
 			await waitFor(async () => await Bun.file(endpoint).exists(), "master SDK endpoint");
 			await waitFor(() => providerDaemonEnsures > 0, "configured notification provider startup");

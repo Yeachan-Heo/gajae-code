@@ -18,6 +18,7 @@ import {
 } from "@agentclientprotocol/sdk";
 import { TempDir } from "@gajae-code/utils";
 import packageJson from "../../package.json" with { type: "json" };
+import { projectSharedStateRoot } from "../../src/gjc-runtime/session-layout";
 import { AcpAgent, acpRequestFailure } from "../../src/modes/acp/acp-agent";
 import { writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
 import { SessionIndex } from "../../src/sdk/broker/session-index";
@@ -167,7 +168,7 @@ async function createFixture(): Promise<Fixture> {
 				if (frame.type === "broker_request") {
 					const endpointMtimeMs = 1;
 					if (frame.operation === "session.create") {
-						const endpointPath = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+						const endpointPath = path.join(projectSharedStateRoot(cwd, agentDir), "sdk", `${sessionId}.json`);
 						await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 						await Bun.write(
 							endpointPath,
@@ -178,7 +179,7 @@ async function createFixture(): Promise<Fixture> {
 						await index.append({
 							type: "host_registered",
 							sessionId,
-							locator: { cwd, worktreeRoot: null, stateRoot: path.join(cwd, ".gjc", "state") },
+							locator: { cwd, worktreeRoot: null, stateRoot: projectSharedStateRoot(cwd, agentDir) },
 							endpointGeneration: 1,
 							pid: process.pid,
 							endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,

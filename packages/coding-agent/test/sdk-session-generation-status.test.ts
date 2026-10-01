@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { SessionIndex, type SessionLocatorV2 } from "../src/sdk/broker/session-index";
 import { SessionRouter } from "../src/sdk/router";
@@ -23,7 +24,7 @@ async function fixture(policy: ConstructorParameters<typeof SessionIndex>[1] = {
 	const locator: SessionLocatorV2 = {
 		cwd: agentDir,
 		worktreeRoot: null,
-		stateRoot: path.join(agentDir, ".gjc", "state"),
+		stateRoot: projectSharedStateRoot(agentDir),
 	};
 	return { agentDir, index, locator, router };
 }
@@ -228,7 +229,7 @@ describe("SessionRouter exact generation status", () => {
 		const locator: SessionLocatorV2 = {
 			cwd: agentDir,
 			worktreeRoot: null,
-			stateRoot: path.join(agentDir, ".gjc", "state"),
+			stateRoot: projectSharedStateRoot(agentDir),
 		};
 		let running = true;
 		let observedIncarnation = "linux:100";
@@ -258,7 +259,7 @@ describe("SessionRouter exact generation status", () => {
 		const locator: SessionLocatorV2 = {
 			cwd: agentDir,
 			worktreeRoot: null,
-			stateRoot: path.join(agentDir, ".gjc", "state"),
+			stateRoot: projectSharedStateRoot(agentDir),
 		};
 		let index: SessionIndex;
 		let raced = false;

@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import path from "node:path";
 import { getBundledModel } from "@gajae-code/ai";
+import { projectSharedStateRoot } from "../../src/gjc-runtime/session-layout";
 import { initializeExtensions } from "../../src/modes/runtime-init";
 import { createAgentSession } from "../../src/sdk";
 import { startFixtureBrokerWithLeaseForTest } from "../../src/sdk/broker/ensure";
@@ -20,6 +21,8 @@ export interface ProductionSdkHost {
 	sessionId: string;
 	session: Awaited<ReturnType<typeof createAgentSession>>["session"];
 	endpointMtimeMs: number;
+	/** Shared project state root holding this host's endpoint (`<stateRoot>/sdk/<sessionId>.json`). */
+	stateRoot: string;
 	observed: Array<{ kind: "control" | "query"; operation: string }>;
 	dispatches: Array<{ deliverAs?: string }>;
 	triggerAsk: (
@@ -117,7 +120,8 @@ export async function startProductionSdkHost(
 				if (priorNotifications === undefined) delete process.env.GJC_NOTIFICATIONS;
 				else process.env.GJC_NOTIFICATIONS = priorNotifications;
 			}
-			const file = path.join(cwd, ".gjc", "state", "sdk", `${session.sessionId}.json`);
+			const stateRoot = projectSharedStateRoot(cwd, agentDir);
+			const file = path.join(stateRoot, "sdk", `${session.sessionId}.json`);
 			const deadline = Date.now() + 4_000;
 			while (!fs.existsSync(file)) {
 				if (Date.now() > deadline) throw new Error("Timed out starting production SDK host");
@@ -142,6 +146,7 @@ export async function startProductionSdkHost(
 			return {
 				endpoint,
 				endpointMtimeMs,
+				stateRoot,
 				sessionId: session.sessionId,
 				session,
 				observed,

@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createCoordinatorMcpServer } from "../../src/coordinator-mcp/server";
+import { projectSharedStateRoot } from "../../src/gjc-runtime/session-layout";
 import { type BrokerDiscovery, brokerProcessIncarnation, writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
 import { SessionIndex } from "../../src/sdk/broker/session-index";
 import type { SessionRouterClient } from "../../src/sdk/router";
@@ -78,7 +79,11 @@ describe("send_prompt same-session concurrency", () => {
 								if (operation === "session.create") {
 									brokerSessions.push({
 										sessionId,
-										locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+										locator: {
+											cwd: root,
+											worktreeRoot: null,
+											stateRoot: projectSharedStateRoot(root, agentDir),
+										},
 										live: true,
 										endpointGeneration: 1,
 										pid: authority.pid,

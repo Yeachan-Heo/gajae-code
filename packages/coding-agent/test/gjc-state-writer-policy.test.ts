@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { activeEntryPath } from "../src/gjc-runtime/session-layout";
 import {
 	detectWorkflowEnvelopeIntegrityMismatch,
 	removeActiveEntry,
@@ -46,7 +47,7 @@ describe("GJC state writer revision policy", () => {
 	}
 
 	async function readJson(root: string, targetPath: string): Promise<Record<string, unknown>> {
-		return JSON.parse(await fs.readFile(path.join(root, targetPath), "utf-8"));
+		return JSON.parse(await fs.readFile(path.resolve(root, targetPath), "utf-8"));
 	}
 
 	it("source write with stale expectedRevision throws and preserves the newer record", async () => {
@@ -238,7 +239,7 @@ describe("GJC state writer revision policy", () => {
 			});
 
 			expect(result.deleted).toBe(false);
-			await expect(readJson(root, ".gjc/_session-sess/state/active/deep-interview.json")).resolves.toMatchObject({
+			await expect(readJson(root, activeEntryPath(root, "sess", "deep-interview"))).resolves.toMatchObject({
 				skill: "deep-interview",
 				source_state_revision: 5,
 			});
@@ -260,9 +261,7 @@ describe("GJC state writer revision policy", () => {
 			});
 
 			expect(result.deleted).toBe(true);
-			await expect(
-				fs.stat(path.join(root, ".gjc/_session-sess/state/active/deep-interview.json")),
-			).rejects.toThrow();
+			await expect(fs.stat(activeEntryPath(root, "sess", "deep-interview"))).rejects.toThrow();
 		});
 	});
 });

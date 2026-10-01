@@ -1,6 +1,6 @@
 /**
  * RLM session artifact layout under
- * <cwd>/.gjc/_session-{gjcSessionId}/autoresearch/runs/<rlmSessionId>/.
+ * $GJC_STATE_DIR/_session-{gjcSessionId}/autoresearch/runs/<rlmSessionId>/.
  *
  * The GJC session id (process boundary) scopes the directory; the RLM session id
  * names the individual research run within it. The two ids are kept distinct.

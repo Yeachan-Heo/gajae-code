@@ -3,6 +3,7 @@ import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "../src/extensibility/extensions";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { Broker } from "../src/sdk/broker/broker";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { createSdkSessionRuntimeExtension } from "../src/sdk/host/session-runtime";
@@ -170,7 +171,7 @@ test("broker session.list retries one changed snapshot and diagnoses persistent 
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-saved-session-race-"));
 	const cwd = path.join(root, "workspace");
 	const agentDir = path.join(root, "agent");
-	const stateRoot = path.join(cwd, ".gjc", "state");
+	const stateRoot = projectSharedStateRoot(cwd);
 	await fs.mkdir(cwd, { recursive: true });
 	const savedSession = SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
 	await savedSession.ensureOnDisk();

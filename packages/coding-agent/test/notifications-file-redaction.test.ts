@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
 import {
@@ -74,7 +75,7 @@ async function createHarness(
 			getCwd: () => cwd,
 		},
 	} as never;
-	const endpoint = () => path.join(cwd, ".gjc", "state", "sdk", `${sid}.json`);
+	const endpoint = () => path.join(projectSharedStateRoot(cwd, agentDir), "sdk", `${sid}.json`);
 
 	return {
 		handlers,

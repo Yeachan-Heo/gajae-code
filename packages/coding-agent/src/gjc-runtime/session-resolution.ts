@@ -1,7 +1,7 @@
 /**
  * Boundary session resolution for GJC workflow state.
  *
- * This is the impure companion to the pure `session-layout.ts`. Only CLI /
+ * This is the filesystem-scanning companion to `session-layout.ts`. Only CLI /
  * runtime entrypoints call these resolvers; low-level readers and writers
  * receive an explicit `gjcSessionId` (or a path produced by the pure helper) so
  * no module silently picks a session.
@@ -21,7 +21,7 @@ import {
 	GJC_SESSION_ACTIVITY_FILE,
 	type GjcSessionContext,
 	type GjcSessionSource,
-	gjcRoot,
+	projectStateRoot,
 	sessionIdFromDirName,
 	sessionRoot,
 } from "./session-layout";
@@ -130,7 +130,7 @@ interface SessionCandidate {
 }
 
 /**
- * Scan `.gjc/_session-*` directories and select the most-recently-active one by
+ * Scan `$GJC_STATE_DIR/_session-*` directories and select the most-recently-active one by
  * its activity marker. Never uses raw directory mtime. Throws on zero candidates
  * or an ambiguous tie.
  */
@@ -157,7 +157,7 @@ export async function detectLatestSession(cwd: string): Promise<GjcSessionContex
 }
 
 async function collectActiveSessionCandidates(cwd: string): Promise<SessionCandidate[]> {
-	const root = gjcRoot(cwd);
+	const root = projectStateRoot(cwd);
 	let entries: import("node:fs").Dirent[];
 	try {
 		entries = await fs.readdir(root, { withFileTypes: true });

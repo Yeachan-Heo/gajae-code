@@ -11,6 +11,7 @@ import {
 	COORDINATOR_MCP_TOOL_NAMES,
 	type CoordinatorToolName,
 } from "../coordinator/contract";
+import { projectSharedStateRoot } from "../gjc-runtime/session-layout";
 import {
 	SessionStateLockUnavailableError,
 	tryWithSessionStateFileLock,
@@ -10005,7 +10006,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					typeof endpointMtimeMs !== "number" ||
 					!Number.isFinite(endpointMtimeMs) ||
 					endpointMtimeMs <= 0 ||
-					path.resolve(stateRoot) !== path.join(cwd, ".gjc", "state")
+					path.resolve(stateRoot) !== projectSharedStateRoot(cwd, routerAgentDir)
 				)
 					return {
 						ok: false,

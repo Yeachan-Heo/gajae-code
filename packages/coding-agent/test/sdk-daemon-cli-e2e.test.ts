@@ -5,6 +5,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
 import { PUBLIC_COMMAND_DIAGNOSTICS } from "../src/cli/public-command-errors";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { Broker, normalizeBrokerInput } from "../src/sdk/broker/broker";
 import { deriveIdempotencyIdentity } from "../src/sdk/broker/identity";
 import { resolveScopeRequest, scopeRequestV1 } from "../src/sdk/broker/session-scope";
@@ -210,7 +211,7 @@ describe("SDK session CLI", () => {
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-cli-"));
 		await initializeTestRepository(root);
 		agentDir = path.join(root, "agent");
-		stateRoot = path.join(root, ".gjc", "state");
+		stateRoot = projectSharedStateRoot(root, agentDir);
 		const token = "session-token";
 		endpointServer = Bun.serve({
 			hostname: "127.0.0.1",
@@ -2192,7 +2193,7 @@ describe("SDK session CLI", () => {
 		const idempotencyKey = deriveSessionLifecycleIdempotencyKey(actor, requestKey, "session.create");
 		const identity = await deriveIdempotencyIdentity(agentDir, "session.create", idempotencyKey);
 		// A real session.create persists the fingerprint of its normalized input.
-		const normalized = normalizeBrokerInput("session.create", target);
+		const normalized = normalizeBrokerInput("session.create", target, agentDir);
 		if (!("input" in normalized)) throw new Error("Expected a valid create target fixture");
 		const fingerprint = createHash("sha256")
 			.update(JSON.stringify({ operation: "session.create", input: normalized.input }))

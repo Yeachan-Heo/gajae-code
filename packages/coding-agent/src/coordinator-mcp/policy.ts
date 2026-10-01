@@ -3,7 +3,7 @@ import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { coordinatorMcpStateRoot, gjcRoot } from "../gjc-runtime/session-layout";
+import { coordinatorMcpStateRoot, projectSharedStateRoot } from "../gjc-runtime/session-layout";
 import {
 	DEFAULT_SESSION_IDLE_TTL_MS,
 	DEFAULT_SESSION_SWEEP_INTERVAL_MS,
@@ -147,7 +147,7 @@ function cleanScope(value: string | undefined): string | null {
 function defaultCoordinatorMcpStateRoot(cwd: string, gjcSessionId?: string): string {
 	return gjcSessionId
 		? coordinatorMcpStateRoot(cwd, gjcSessionId)
-		: path.join(gjcRoot(cwd), "state", "coordinator-mcp");
+		: path.join(projectSharedStateRoot(cwd), "coordinator-mcp");
 }
 
 export function buildCoordinatorMcpConfig(env: NodeJS.ProcessEnv = process.env): CoordinatorMcpConfig {

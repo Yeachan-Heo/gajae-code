@@ -4,7 +4,7 @@ import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
-
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { brokerProcessIncarnation, writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { SDK_STATE_VERSION } from "../src/sdk/broker/state-version";
@@ -95,7 +95,7 @@ async function routerFixture(
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-router-authority-"));
 	tempDirs.push(repo);
 	const agentDir = path.join(repo, ".gjc", "agent");
-	const stateRoot = path.join(repo, ".gjc", "state");
+	const stateRoot = projectSharedStateRoot(repo, agentDir);
 	const sessionId = "router-session";
 	const endpointDir = path.join(stateRoot, "sdk");
 	const endpointFile = path.join(endpointDir, `${sessionId}.json`);
@@ -277,7 +277,7 @@ function hungRouterFixture(): HungRouterFixture {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-router-hung-"));
 	tempDirs.push(repo);
 	const agentDir = path.join(repo, ".gjc", "agent");
-	const stateRoot = path.join(repo, ".gjc", "state");
+	const stateRoot = projectSharedStateRoot(repo, agentDir);
 	const endpointDir = path.join(stateRoot, "sdk");
 	fs.mkdirSync(endpointDir, { recursive: true });
 	const indexed = [
@@ -368,7 +368,7 @@ describe("SessionRouter dispatch authority", () => {
 		const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-router-ambiguous-"));
 		tempDirs.push(repo);
 		const agentDir = path.join(repo, ".gjc", "agent");
-		const stateRoot = path.join(repo, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(repo, agentDir);
 		const alternateStateRoot = path.join(repo, ".gjc", "alternate-state");
 		const sessionId = "router-ambiguous";
 		const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
@@ -456,8 +456,8 @@ describe("SessionRouter dispatch authority", () => {
 		tempDirs.push(repo);
 		const agentDir = path.join(repo, ".gjc", "agent");
 		const alternateRepo = path.join(repo, "alternate-worktree");
-		const alternateStateRoot = path.join(alternateRepo, ".gjc", "state");
-		const currentStateRoot = path.join(repo, ".gjc", "state");
+		const alternateStateRoot = projectSharedStateRoot(alternateRepo, agentDir);
+		const currentStateRoot = projectSharedStateRoot(repo, agentDir);
 		const sessionId = "router-ambiguous-reverse";
 		const endpointPath = path.join(alternateStateRoot, "sdk", `${sessionId}.json`);
 		fs.mkdirSync(path.dirname(endpointPath), { recursive: true });
@@ -540,7 +540,7 @@ describe("SessionRouter dispatch authority", () => {
 		const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-router-reconcile-"));
 		tempDirs.push(repo);
 		const agentDir = path.join(repo, ".gjc", "agent");
-		const stateRoot = path.join(repo, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(repo, agentDir);
 		const endpointDir = path.join(stateRoot, "sdk");
 		fs.mkdirSync(endpointDir, { recursive: true });
 		const indexed = [
@@ -2048,7 +2048,7 @@ describe("SessionRouter dispatch authority", () => {
 		const repo = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-router-4527-"));
 		tempDirs.push(repo);
 		const agentDir = path.join(repo, ".gjc", "agent");
-		const stateRoot = path.join(repo, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(repo, agentDir);
 		const endpointDir = path.join(stateRoot, "sdk");
 		await fsPromises.mkdir(endpointDir, { recursive: true });
 		const sessionId = "wedge";
@@ -2171,7 +2171,7 @@ describe("SessionRouter dispatch authority", () => {
 		const repo = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-router-start-wedge-"));
 		tempDirs.push(repo);
 		const agentDir = path.join(repo, ".gjc", "agent");
-		const stateRoot = path.join(repo, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(repo, agentDir);
 		const endpointDir = path.join(stateRoot, "sdk");
 		await fsPromises.mkdir(endpointDir, { recursive: true });
 		const wedged = "start-wedged";
@@ -2267,7 +2267,7 @@ describe("SessionRouter dispatch authority", () => {
 		const repo = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-router-replay-nodup-"));
 		tempDirs.push(repo);
 		const agentDir = path.join(repo, ".gjc", "agent");
-		const stateRoot = path.join(repo, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(repo, agentDir);
 		const endpointDir = path.join(stateRoot, "sdk");
 		await fsPromises.mkdir(endpointDir, { recursive: true });
 		const sessionId = "replay-unanswered";
@@ -2372,7 +2372,7 @@ describe("SessionRouter dispatch authority", () => {
 		const repo = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-router-4689-"));
 		tempDirs.push(repo);
 		const agentDir = path.join(repo, ".gjc", "agent");
-		const stateRoot = path.join(repo, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(repo, agentDir);
 		const endpointDir = path.join(stateRoot, "sdk");
 		await fsPromises.mkdir(endpointDir, { recursive: true });
 		const sessionId = "idle-poll";
@@ -2512,7 +2512,7 @@ describe("SessionRouter dispatch authority", () => {
 		const repo = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-router-4689-sweep-"));
 		tempDirs.push(repo);
 		const agentDir = path.join(repo, ".gjc", "agent");
-		const stateRoot = path.join(repo, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(repo, agentDir);
 		const endpointDir = path.join(stateRoot, "sdk");
 		await fsPromises.mkdir(endpointDir, { recursive: true });
 		const sessionId = "sweep";
@@ -2595,7 +2595,7 @@ describe("SessionRouter dispatch authority", () => {
 		const repo = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-router-4730-publishwin-"));
 		tempDirs.push(repo);
 		const agentDir = path.join(repo, ".gjc", "agent");
-		const stateRoot = path.join(repo, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(repo, agentDir);
 		const endpointDir = path.join(stateRoot, "sdk");
 		await fsPromises.mkdir(endpointDir, { recursive: true });
 		const sessionId = "publish-window";
@@ -2746,7 +2746,7 @@ describe("SessionRouter dispatch authority", () => {
 		const repo = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-router-4730-hbrepl-"));
 		tempDirs.push(repo);
 		const agentDir = path.join(repo, ".gjc", "agent");
-		const stateRoot = path.join(repo, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(repo, agentDir);
 		const endpointDir = path.join(stateRoot, "sdk");
 		await fsPromises.mkdir(endpointDir, { recursive: true });
 		const sessionId = "hb-replaced";
@@ -2893,7 +2893,7 @@ describe("SessionRouter dispatch authority", () => {
 			const repo = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-router-4689-retire-"));
 			tempDirs.push(repo);
 			const agentDir = path.join(repo, ".gjc", "agent");
-			const stateRoot = path.join(repo, ".gjc", "state");
+			const stateRoot = projectSharedStateRoot(repo, agentDir);
 			const endpointDir = path.join(stateRoot, "sdk");
 			await fsPromises.mkdir(endpointDir, { recursive: true });
 			const sessionId = "retire";
@@ -2977,7 +2977,7 @@ describe("SessionRouter dispatch authority", () => {
 		const repo = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-router-4689-force-"));
 		tempDirs.push(repo);
 		const agentDir = path.join(repo, ".gjc", "agent");
-		const stateRoot = path.join(repo, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(repo, agentDir);
 		const endpointDir = path.join(stateRoot, "sdk");
 		await fsPromises.mkdir(endpointDir, { recursive: true });
 		const sessionId = "force-escalation";
@@ -3052,7 +3052,7 @@ describe("SessionRouter dispatch authority", () => {
 		const repo = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-router-4689-retry-"));
 		tempDirs.push(repo);
 		const agentDir = path.join(repo, ".gjc", "agent");
-		const stateRoot = path.join(repo, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(repo, agentDir);
 		const endpointDir = path.join(stateRoot, "sdk");
 		await fsPromises.mkdir(endpointDir, { recursive: true });
 		const sessionId = "retry-latch";
@@ -3136,7 +3136,7 @@ describe("SessionRouter dispatch authority", () => {
 		const repo = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-router-4689-hb-"));
 		tempDirs.push(repo);
 		const agentDir = path.join(repo, ".gjc", "agent");
-		const stateRoot = path.join(repo, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(repo, agentDir);
 		const endpointDir = path.join(stateRoot, "sdk");
 		await fsPromises.mkdir(endpointDir, { recursive: true });
 		const sessionId = "heartbeat-shape";

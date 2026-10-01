@@ -3,6 +3,7 @@ import * as path from "node:path";
 import type { AgentSideConnection, PromptRequest, SessionNotification } from "@agentclientprotocol/sdk";
 import { logger, TempDir } from "@gajae-code/utils";
 import packageJson from "../../package.json" with { type: "json" };
+import { projectSharedStateRoot } from "../../src/gjc-runtime/session-layout";
 import { AcpAgent } from "../../src/modes/acp/acp-agent";
 import { AcpSdkAdapter } from "../../src/sdk/acp/adapter";
 import { writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
@@ -244,7 +245,7 @@ export function createFixture(
 												locator: {
 													cwd,
 													worktreeRoot: null,
-													stateRoot: path.join(cwd, ".gjc", "state"),
+													stateRoot: projectSharedStateRoot(cwd, agentDir),
 												},
 												live: options.liveSessionIndex === true,
 											},

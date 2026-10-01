@@ -11,6 +11,7 @@ import {
 	type Settings,
 } from "../src/config/settings";
 import type { ExtensionActions, ExtensionAPI } from "../src/extensibility/extensions/types";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { createNotificationsExtension } from "../src/sdk/bus";
 import { TOOL_CALL_BOUNDARY_GRACE_MS } from "../src/sdk/prompt-tool-boundary";
 
@@ -263,16 +264,12 @@ async function acceptPrompt(
 	const sessionId = `sdk-bus-deadline-${label}-${Date.now()}`;
 	const sessionContext = context(cwd, sessionId, options.abortPromptAndWait);
 	const acceptFailure: AcceptFailure = { armed: false };
-	const handlers = start(
-		sessionContext,
-		options.settings?.(cwd) ?? deadlineSettings(cwd, leaseMs, maxRuntimeMs),
-		acceptFailure,
-		options.ledgerTools,
-	);
+	const settings = options.settings?.(cwd) ?? deadlineSettings(cwd, leaseMs, maxRuntimeMs);
+	const handlers = start(sessionContext, settings, acceptFailure, options.ledgerTools);
 	const scheduled: (() => void)[] = [];
 	const scheduledDelays: number[] = [];
 
-	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	const endpointFile = path.join(projectSharedStateRoot(cwd, settings.getAgentDir()), "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
 	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
 	const frames: Record<string, unknown>[] = [];

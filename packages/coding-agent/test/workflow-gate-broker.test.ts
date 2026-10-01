@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { projectStateRoot } from "../src/gjc-runtime/session-layout";
 import { questionToGate } from "../src/modes/shared/agent-wire/deep-interview-gate";
 import type { GateContinuation } from "../src/modes/shared/agent-wire/workflow-gate-broker";
 import {
@@ -548,7 +549,12 @@ describe("WorkflowGateBroker", () => {
 	});
 	it("does not mkdir at construction on a fresh empty store under a non-writable cwd (#4568)", () => {
 		const dir = mkdtempSync(path.join(tmpdir(), "gate-unwritable-fresh-"));
-		const storePath = path.join(dir, "workspace", ".gjc", "_session-s1", "state", "workflow-gates.json");
+		const storePath = path.join(
+			projectStateRoot(path.join(dir, "workspace")),
+			"_session-s1",
+			"state",
+			"workflow-gates.json",
+		);
 		const broker = new WorkflowGateBroker(
 			"run-4568-fresh",
 			new FileGateStore(storePath),
@@ -570,7 +576,12 @@ describe("WorkflowGateBroker", () => {
 	});
 	it("surfaces an unwritable directory as a typed GateStoreWriteError instead of a raw errno (#4568)", () => {
 		const dir = mkdtempSync(path.join(tmpdir(), "gate-unwritable-write-"));
-		const storePath = path.join(dir, "workspace", ".gjc", "_session-s2", "state", "workflow-gates.json");
+		const storePath = path.join(
+			projectStateRoot(path.join(dir, "workspace")),
+			"_session-s2",
+			"state",
+			"workflow-gates.json",
+		);
 		const broker = new WorkflowGateBroker(
 			"run-4568-write",
 			new FileGateStore(storePath),

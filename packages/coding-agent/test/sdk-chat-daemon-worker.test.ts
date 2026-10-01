@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import path from "node:path";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import {
@@ -304,7 +305,7 @@ describe("chat daemon worker", () => {
 	it("creates a real configured runtime, maps event threads, routes safe replies, handles lifecycle transitions, and cleans up", async () => {
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-chat-worker-"));
 		const agentDir = path.join(root, "agent");
-		const stateRoot = path.join(root, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(root, agentDir);
 		const endpointPath = path.join(stateRoot, "sdk", "session.json");
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fs.writeFile(
@@ -563,7 +564,7 @@ describe("chat daemon worker", () => {
 	it("uses the broker-authorized isolated chat endpoint", async () => {
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-chat-isolated-endpoint-"));
 		const agentDir = path.join(root, "agent");
-		const stateRoot = path.join(root, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(root, agentDir);
 		const endpointPath = path.join(stateRoot, "chat", "sdk", "session.json");
 		const defaultEndpointPath = path.join(stateRoot, "sdk", "session.json");
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
@@ -621,7 +622,7 @@ describe("chat daemon worker", () => {
 	it("rejects a discovery record replaced after broker registration", async () => {
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-chat-endpoint-mtime-"));
 		const agentDir = path.join(root, "agent");
-		const stateRoot = path.join(root, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(root, agentDir);
 		const endpointPath = path.join(stateRoot, "sdk", "session.json");
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fs.writeFile(
@@ -687,7 +688,7 @@ describe("chat daemon worker", () => {
 	it("fails closed when a replacement client cannot connect", async () => {
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-chat-replace-"));
 		const agentDir = path.join(root, "agent");
-		const stateRoot = path.join(root, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(root, agentDir);
 		const endpointPath = path.join(stateRoot, "sdk", "session.json");
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fs.writeFile(
@@ -773,7 +774,7 @@ describe("chat daemon worker", () => {
 		for (const scenario of scenarios) {
 			root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-chat-frame-"));
 			const agentDir = path.join(root, "agent");
-			const stateRoot = path.join(root, ".gjc", "state");
+			const stateRoot = projectSharedStateRoot(root, agentDir);
 			const endpointPath = path.join(stateRoot, "sdk", "session.json");
 			await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 			await fs.writeFile(
@@ -904,7 +905,7 @@ describe("chat daemon worker", () => {
 	it("persists Slack action authority across restart, restores it for inbound replies, and clears resolved actions", async () => {
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-slack-worker-"));
 		const agentDir = path.join(root, "agent");
-		const stateRoot = path.join(root, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(root, agentDir);
 		const endpointPath = path.join(stateRoot, "sdk", "session.json");
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fs.writeFile(
@@ -1063,7 +1064,7 @@ describe("chat daemon worker", () => {
 	it("replays Slack control, query, and global commands with their durable receipt keys", async () => {
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-slack-command-keys-"));
 		const agentDir = path.join(root, "agent");
-		const stateRoot = path.join(root, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(root, agentDir);
 		const endpointPath = path.join(stateRoot, "sdk", "session.json");
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fs.writeFile(
@@ -1242,7 +1243,7 @@ describe("chat daemon worker", () => {
 	it("retains a sent control prompt as ambiguous when its SDK response is lost", async () => {
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-chat-command-response-loss-"));
 		const agentDir = path.join(root, "agent");
-		const stateRoot = path.join(root, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(root, agentDir);
 		const endpointPath = path.join(stateRoot, "sdk", "session.json");
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fs.writeFile(
@@ -1422,7 +1423,7 @@ describe("chat daemon worker", () => {
 	it("uses the production SdkClient loopback boundary while Discord remains fake", async () => {
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-chat-worker-wire-"));
 		const agentDir = path.join(root, "agent");
-		const stateRoot = path.join(root, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(root, agentDir);
 		const endpointPath = path.join(stateRoot, "sdk", "session.json");
 		const token = "loopback-sdk-token";
 		const frames: Record<string, unknown>[] = [];
@@ -1584,9 +1585,12 @@ describe("chat daemon worker", () => {
 			root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-slack-production-host-"));
 			const agentDir = path.join(root, ".gjc", "agent");
 			const host = await startProductionSdkHost(root);
-			const endpointIdentity = await fs.stat(path.join(root, ".gjc", "state", "sdk", `${host.sessionId}.json`), {
-				bigint: true,
-			});
+			const endpointIdentity = await fs.stat(
+				path.join(projectSharedStateRoot(root, agentDir), "sdk", `${host.sessionId}.json`),
+				{
+					bigint: true,
+				},
+			);
 			const index = await new SessionIndex(agentDir).open();
 			const config = {
 				identity: "fingerprint-only",
@@ -1634,7 +1638,7 @@ describe("chat daemon worker", () => {
 				await index.append({
 					type: "host_registered",
 					sessionId: host.sessionId,
-					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+					locator: { cwd: root, worktreeRoot: null, stateRoot: projectSharedStateRoot(root, agentDir) },
 					endpointGeneration: 1,
 					pid: host.endpoint.pid,
 					endpointMtimeMs: host.endpointMtimeMs,

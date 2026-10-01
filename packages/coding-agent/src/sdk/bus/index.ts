@@ -58,6 +58,7 @@ import {
 } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { INTERACTIVE_SELECTOR_RESUME_ORIGIN } from "../../extensibility/shared-events";
+import { projectSharedStateRoot } from "../../gjc-runtime/session-layout";
 import { toAgentWireEventPayload } from "../../modes/shared/agent-wire/event-envelope";
 import {
 	NotificationGatePolicyChangedError,
@@ -4820,7 +4821,7 @@ export function createNotificationsExtension(
 			return { status: "already", runtime: existingRuntime };
 		}
 
-		const stateRoot = path.join(ctx.cwd, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(ctx.cwd, settings?.getAgentDir?.());
 		let isolateChatEndpoint = forceIsolatedChatSessions.delete(id);
 		if (
 			!isolateChatEndpoint &&

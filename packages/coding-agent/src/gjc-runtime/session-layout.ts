@@ -1,18 +1,23 @@
 /**
- * Pure path layout for session-scoped GJC workflow state.
+ * Path layout for session-scoped GJC workflow state.
  *
- * Every generated/runtime artifact for a GJC session lives under
- * `<cwd>/.gjc/_session-{encodedSessionId}/...`. The `_session-` prefix is what
- * discriminates a session directory from shared, user-authored/installed config
- * (settings.json, secrets.yml, agents/, gjc-plugins/, agent/, python-env/, user
- * skills/commands), which always stays at the `.gjc/` root.
+ * Generated runtime state lives OUTSIDE the project, under the per-project
+ * state root `~/.gjc/agent/projects/<name>-<hash>/` ({@link projectStateRoot}):
+ * session directories `_session-{encodedSessionId}/...` and the shared `state/`
+ * tree (SDK endpoints, coordinator/notification state, locks). Keeping lock
+ * directories off the workspace means a checkout on a synced or network mount
+ * (Synology/Dropbox/OneDrive, SMB) never hosts GJC lock publication.
  *
- * This module is PURE and acyclic: every export is a deterministic function of
- * its arguments. It never reads `process.env` and never touches the filesystem.
- * Session resolution (flag/payload/env/latest-activity-marker) and any
- * filesystem scanning live in `session-resolution.ts`, the boundary module.
+ * User-authored project config (config.yml, settings.json, secrets.yml, agents/,
+ * skills/, gjc-plugins/, mcp.json, python-env/) stays in `<cwd>/.gjc`
+ * ({@link projectConfigRoot}).
+ *
+ * Resolvers never read `process.env`. Session resolution
+ * (flag/payload/env/latest-activity-marker) and filesystem scanning live in
+ * `session-resolution.ts`, the boundary module.
  */
 import * as path from "node:path";
+import { getProjectStateRoot } from "@gajae-code/utils";
 
 export const GJC_DIR = ".gjc";
 export const GJC_SESSION_PREFIX = "_session-";
@@ -63,15 +68,33 @@ export function assertSafePathComponent(value: string, label: string): void {
 	}
 }
 
-/** The shared `.gjc/` root (holds shared config; never session-scoped). */
-export function gjcRoot(cwd: string): string {
+/** The project's user-authored config root: `<cwd>/.gjc` (never holds runtime state). */
+export function projectConfigRoot(cwd: string): string {
 	return path.join(cwd, GJC_DIR);
 }
 
-/** The per-session root directory: `<cwd>/.gjc/_session-{encodedId}`. */
+/**
+ * The project's runtime state root: `<agentDir>/projects/<name>-<hash>`.
+ * Holds every `_session-*` directory and the shared {@link projectSharedStateRoot}.
+ * `agentDir` defaults to the process agent dir; pass it when acting for a
+ * different profile (e.g. an SDK broker bound to an explicit agent dir).
+ */
+export function projectStateRoot(cwd: string, agentDir?: string): string {
+	return getProjectStateRoot(cwd, agentDir);
+}
+
+/**
+ * The project's shared (non-session) runtime state directory:
+ * `<projectStateRoot>/state` (SDK endpoints, coordinator, notifications, locks).
+ */
+export function projectSharedStateRoot(cwd: string, agentDir?: string): string {
+	return path.join(projectStateRoot(cwd, agentDir), "state");
+}
+
+/** The per-session root directory: `<projectStateRoot>/_session-{encodedId}`. */
 export function sessionRoot(cwd: string, gjcSessionId: string): string {
 	assertNonEmptyGjcSessionId(gjcSessionId, "sessionRoot");
-	return path.join(gjcRoot(cwd), `${GJC_SESSION_PREFIX}${encodeSessionSegment(gjcSessionId)}`);
+	return path.join(projectStateRoot(cwd), `${GJC_SESSION_PREFIX}${encodeSessionSegment(gjcSessionId)}`);
 }
 
 /** Directory name (no path) for a session id, e.g. `_session-abc`. */

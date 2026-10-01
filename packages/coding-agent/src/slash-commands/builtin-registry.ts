@@ -23,6 +23,7 @@ import {
 	splitSelectorThinkingSuffix,
 } from "../config/model-resolver";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../discovery/helpers.js";
+import { projectSharedStateRoot } from "../gjc-runtime/session-layout";
 import { DynamicBorder } from "../modes/components/dynamic-border";
 import { getAvailableThemes, getDetectedThemeSettingsPath, setTheme, theme } from "../modes/theme/theme";
 import {
@@ -788,7 +789,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			// Session-local notification controls are extension-owned. Always pass them
 			// through so this builtin cannot shadow the live per-session command.
 			if (action === "on" || action === "off") return { prompt: command.text };
-			const stateRoot = path.join(runtime.cwd, ".gjc", "state");
+			const stateRoot = projectSharedStateRoot(runtime.cwd);
 			switch (action) {
 				case "status": {
 					const { buildNotificationStatusReport, formatNotificationStatusReport } = await import(

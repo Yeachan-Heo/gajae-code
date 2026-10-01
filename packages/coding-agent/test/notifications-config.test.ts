@@ -14,6 +14,7 @@ import {
 	Settings,
 } from "../src/config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../src/extensibility/extensions";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { createAgentSession } from "../src/sdk";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { processIncarnation } from "../src/sdk/broker/process-incarnation";
@@ -1722,26 +1723,28 @@ describe("notifications config", () => {
 			await parentPrefixSubagent.session.extensionRunner?.emit({ type: "session_start" });
 			await agentTypeOnlySubagent.session.extensionRunner?.emit({ type: "session_start" });
 			await explicitExtensionSubagent.session.extensionRunner?.emit({ type: "session_start" });
-			const topLevelEndpoint = path.join(cwd, ".gjc", "state", "sdk", `${topLevel.session.sessionId}.json`);
-			const subagentEndpoint = path.join(cwd, ".gjc", "state", "sdk", `${subagent.session.sessionId}.json`);
+			const topLevelEndpoint = path.join(
+				projectSharedStateRoot(cwd, agentDir),
+				"sdk",
+				`${topLevel.session.sessionId}.json`,
+			);
+			const subagentEndpoint = path.join(
+				projectSharedStateRoot(cwd, agentDir),
+				"sdk",
+				`${subagent.session.sessionId}.json`,
+			);
 			const parentPrefixSubagentEndpoint = path.join(
-				cwd,
-				".gjc",
-				"state",
+				projectSharedStateRoot(cwd, agentDir),
 				"sdk",
 				`${parentPrefixSubagent.session.sessionId}.json`,
 			);
 			const agentTypeOnlySubagentEndpoint = path.join(
-				cwd,
-				".gjc",
-				"state",
+				projectSharedStateRoot(cwd, agentDir),
 				"sdk",
 				`${agentTypeOnlySubagent.session.sessionId}.json`,
 			);
 			const explicitExtensionSubagentEndpoint = path.join(
-				cwd,
-				".gjc",
-				"state",
+				projectSharedStateRoot(cwd, agentDir),
 				"sdk",
 				`${explicitExtensionSubagent.session.sessionId}.json`,
 			);
@@ -1876,7 +1879,7 @@ describe("notifications config", () => {
 					chatId: "foreign-chat",
 					startedAt: Date.now(),
 					heartbeatAt: Date.now(),
-					roots: [path.join(cwd, ".gjc", "state")],
+					roots: [projectSharedStateRoot(cwd, agentDir)],
 					version: DAEMON_VERSION,
 					generation: DAEMON_GENERATION,
 				}),
@@ -1910,8 +1913,8 @@ describe("notifications config", () => {
 			const sessionStart = handlers.get("session_start");
 			const sessionShutdown = handlers.get("session_shutdown");
 			if (!sessionStart || !sessionShutdown) throw new Error("notifications extension handlers were not registered");
-			const standardEndpoint = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
-			const chatEndpoint = path.join(cwd, ".gjc", "state", "chat", "sdk", `${sessionId}.json`);
+			const standardEndpoint = path.join(projectSharedStateRoot(cwd, agentDir), "sdk", `${sessionId}.json`);
+			const chatEndpoint = path.join(projectSharedStateRoot(cwd, agentDir), "chat", "sdk", `${sessionId}.json`);
 			try {
 				await sessionStart({}, context);
 				// Isolation is decided up front from the durable foreign owner state
@@ -1960,7 +1963,7 @@ describe("notifications config", () => {
 				).session;
 				const runner = session.extensionRunner;
 				if (!runner) throw new Error("notifications extension runner was not registered");
-				const endpoint = path.join(cwd, ".gjc", "state", "sdk", `${session.sessionId}.json`);
+				const endpoint = path.join(projectSharedStateRoot(cwd, agentDir), "sdk", `${session.sessionId}.json`);
 
 				const errors: string[] = [];
 				const unsubscribe = runner.onError(error => errors.push(error.error));
@@ -2008,7 +2011,7 @@ describe("notifications config", () => {
 				},
 				ui: { notify: () => {} },
 			} as unknown as ExtensionCommandContext;
-			const endpoint = path.join(cwd, ".gjc", "state", "sdk", "provider-readiness-retry.json");
+			const endpoint = path.join(projectSharedStateRoot(cwd, agentDir), "sdk", "provider-readiness-retry.json");
 			createNotificationsExtension(api, {
 				settings,
 				ensureProviderDaemon: async () => {
@@ -2074,7 +2077,7 @@ describe("notifications config", () => {
 				).session;
 				const runner = session.extensionRunner;
 				if (!runner) throw new Error("notifications extension runner was not registered");
-				endpoint = path.join(cwd, ".gjc", "state", "sdk", `${session.sessionId}.json`);
+				endpoint = path.join(projectSharedStateRoot(cwd, agentDir), "sdk", `${session.sessionId}.json`);
 
 				await runner.emit({ type: "session_start" });
 				expect(fs.existsSync(endpoint)).toBe(true);
@@ -2131,7 +2134,8 @@ describe("notifications config", () => {
 				enableMCP: false,
 				enableLsp: false,
 			});
-		const endpointFor = (sessionId: string): string => path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		const endpointFor = (sessionId: string): string =>
+			path.join(projectSharedStateRoot(cwd, agentDir), "sdk", `${sessionId}.json`);
 		try {
 			resetSettingsForTest();
 			await Settings.init({ inMemory: true, cwd, agentDir });
@@ -2253,7 +2257,7 @@ describe("notifications config", () => {
 		expect(extensionShouldRegister).toBe(false);
 		if (extensionShouldRegister) createNotificationsExtension(api);
 		expect(notify).toBeUndefined();
-		expect(fs.existsSync(path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`))).toBe(false);
+		expect(fs.existsSync(path.join(projectSharedStateRoot(cwd), "sdk", `${sessionId}.json`))).toBe(false);
 		expect(fs.existsSync(daemonPaths(agentDir).roots)).toBe(false);
 	});
 	test("captured /notify on ensures provider transport once without registering a session root", async () => {
@@ -2329,7 +2333,7 @@ describe("notifications config", () => {
 			}),
 		);
 
-		const endpoint = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		const endpoint = path.join(projectSharedStateRoot(cwd, agentDir), "sdk", `${sessionId}.json`);
 		const roots = daemonPaths(agentDir).roots;
 		const sessionStart = handlers.get("session_start");
 		const sessionShutdown = handlers.get("session_shutdown");

@@ -10,6 +10,7 @@ import {
 	recordUltragoalBlockerClassification,
 	recordUltragoalCriticVerdict,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
+import { projectStateRoot } from "../../src/gjc-runtime/session-layout";
 
 const TEST_SESSION_ID = "ultragoal-pause-guard-redteam-session";
 const ORIGINAL_GJC_SESSION_ID = process.env.GJC_SESSION_ID;
@@ -34,7 +35,7 @@ async function createActiveRun(): Promise<string> {
 }
 
 function ultragoalPath(cwd: string, file: "goals.json" | "ledger.jsonl"): string {
-	return path.join(cwd, ".gjc", `_session-${TEST_SESSION_ID}`, "ultragoal", file);
+	return path.join(projectStateRoot(cwd), `_session-${TEST_SESSION_ID}`, "ultragoal", file);
 }
 
 afterEach(async () => {

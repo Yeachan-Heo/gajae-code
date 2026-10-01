@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 
 const packageRoot = path.resolve(import.meta.dir, "..");
@@ -52,7 +53,7 @@ test("shipped MCP stdio advertises confirm and forwards confirmed destructive co
 
 	try {
 		const sessionId = "confirmed-control-session";
-		const stateRoot = path.join(repo, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(repo, agentDir);
 		const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
 		await mkdir(path.dirname(endpointPath), { recursive: true });
 		await writeFile(

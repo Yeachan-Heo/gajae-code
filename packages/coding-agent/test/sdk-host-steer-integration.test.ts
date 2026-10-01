@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "../src/extensibility/extensions";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { createSdkSessionRuntimeExtension, type SessionSdkTransport } from "../src/sdk/host/session-runtime";
 
 interface Harness {
@@ -53,7 +54,7 @@ function createHarness(cwd: string, sessionId: string, sessionFile: string | und
 	};
 	const transport: SessionSdkTransport = {
 		sessionId,
-		stateRoot: path.join(cwd, ".gjc", "state"),
+		stateRoot: projectSharedStateRoot(cwd, cwd),
 		token: "test-token",
 		sendFrame: (_connectionId, frame) => {
 			const response = frame as Record<string, unknown>;
@@ -82,7 +83,7 @@ function createHarness(cwd: string, sessionId: string, sessionFile: string | und
 			dispatches++;
 			persistedAtDispatch = await fs.readFile(
 				path.join(
-					path.dirname(sessionFile ?? path.join(cwd, ".gjc", "state", `${sessionId}.jsonl`)),
+					path.dirname(sessionFile ?? path.join(projectSharedStateRoot(cwd, cwd), `${sessionId}.jsonl`)),
 					".sdk-reconciliation",
 					`${sessionId}.json`,
 				),
@@ -332,7 +333,7 @@ test("production SDK host persists steer reconciliation under state root when se
 		const accepted = await control(harness, "accept", "private steer text", "state-root-ref");
 		expect(accepted).toMatchObject({ ok: true, result: { accepted: true, clientRef: "state-root-ref" } });
 		const persisted = await fs.readFile(
-			path.join(cwd, ".gjc", "state", ".sdk-reconciliation", `${sessionId}.json`),
+			path.join(projectSharedStateRoot(cwd, cwd), ".sdk-reconciliation", `${sessionId}.json`),
 			"utf8",
 		);
 		expect(persisted).toContain('"status":"accepted"');

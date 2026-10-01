@@ -17,6 +17,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { TempDir } from "@gajae-code/utils";
+import { projectStateRoot } from "../../src/gjc-runtime/session-layout";
 import { resolveUltragoalValidationApplicability } from "../../src/gjc-runtime/ultragoal-validation-policy";
 import {
 	hashWorkflowRecoveryProjection,
@@ -29,11 +30,11 @@ import {
 const SESSION_ID = "compaction-matrix";
 
 function ralplanRunDir(cwd: string, runId: string): string {
-	return path.join(cwd, ".gjc", `_session-${SESSION_ID}`, "plans", "ralplan", runId);
+	return path.join(projectStateRoot(cwd), `_session-${SESSION_ID}`, "plans", "ralplan", runId);
 }
 
 function ultragoalDir(cwd: string): string {
-	return path.join(cwd, ".gjc", `_session-${SESSION_ID}`, "ultragoal");
+	return path.join(projectStateRoot(cwd), `_session-${SESSION_ID}`, "ultragoal");
 }
 
 const FINAL_PLAN = `Fix widget parser performance regression.
@@ -64,7 +65,7 @@ interface GoalSeed {
 }
 
 async function seedPlan(root: string, goals: GoalSeed[], objective: string): Promise<void> {
-	const dir = path.join(root, ".gjc", `_session-${SESSION_ID}`, "ultragoal");
+	const dir = path.join(projectStateRoot(root), `_session-${SESSION_ID}`, "ultragoal");
 	await fs.mkdir(dir, { recursive: true });
 	const now = new Date().toISOString();
 	await Bun.write(

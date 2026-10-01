@@ -40,4 +40,4 @@ Do not edit product source, manifests, or dependencies. The harness must use exi
 
 - Do **not** start the iteration loop yet. The experiment machinery is unavailable until a mission exists.
 - Do **not** treat a compile-only check as a benchmark. The harness must actually execute the workload and emit `METRIC`.
-- Do **not** create `autoresearch.md`, `autoresearch.checks.sh`, `autoresearch.program.md`, `autoresearch.ideas.md`, `autoresearch.jsonl`, `.autoresearch/`, or `autoresearch.config.json`. Mission and run state is tracked for you under `.gjc/_session-{id}/autoresearch/`.
+- Do **not** create `autoresearch.md`, `autoresearch.checks.sh`, `autoresearch.program.md`, `autoresearch.ideas.md`, `autoresearch.jsonl`, `.autoresearch/`, or `autoresearch.config.json`. Mission and run state is tracked for you under `$GJC_STATE_DIR/_session-{id}/autoresearch/`.

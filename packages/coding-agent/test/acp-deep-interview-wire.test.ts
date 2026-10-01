@@ -12,6 +12,7 @@ import {
 	type RequestPermissionResponse,
 	type SessionNotification,
 } from "@agentclientprotocol/sdk";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
 import { resolveSessionLocator, type SessionLocatorV2 } from "../src/sdk/broker/session-index";
 import { lifecycleRequestTimeoutMs } from "../src/sdk/broker/startup-budget";
@@ -217,7 +218,7 @@ interface FixtureBrokerListClient {
 }
 
 function fixtureSessionOwner(cwd = "/fixture/workspace"): SessionLocatorV2 {
-	return { cwd, worktreeRoot: null, stateRoot: path.join(cwd, ".gjc", "state") };
+	return { cwd, worktreeRoot: null, stateRoot: projectSharedStateRoot(cwd) };
 }
 
 async function listedFixtureSessionIds(
@@ -1160,7 +1161,7 @@ describe("ACP deep-interview wire path", () => {
 			await fs.promises.mkdir(dir, { recursive: true });
 		const workspace = path.join(root, "workspace");
 		await fs.promises.mkdir(path.join(workspace, ".gjc", "skills", "wire-skill"), { recursive: true });
-		const sessionOwner = await resolveSessionLocator(workspace, path.join(workspace, ".gjc", "state"));
+		const sessionOwner = await resolveSessionLocator(workspace, projectSharedStateRoot(workspace));
 		await fs.promises.writeFile(
 			path.join(workspace, ".gjc", "skills", "wire-skill", "SKILL.md"),
 			"---\nname: wire-skill\ndescription: Complete one deterministic ACP turn.\n---\n\nReturn one short completion message.\n",

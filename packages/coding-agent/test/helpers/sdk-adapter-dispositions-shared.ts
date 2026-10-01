@@ -13,6 +13,7 @@ import * as os from "node:os";
 import path from "node:path";
 import packageJson from "../../package.json" with { type: "json" };
 import { PublicCommandFailure, renderPublicCommandFailure } from "../../src/cli/public-command-errors";
+import { projectSharedStateRoot } from "../../src/gjc-runtime/session-layout";
 import { AcpSdkAdapter } from "../../src/sdk/acp";
 import { Broker } from "../../src/sdk/broker";
 import { brokerOwnerForTest } from "../../src/sdk/broker/ensure";
@@ -323,9 +324,12 @@ export function daemonCliLifecycleInput(host: AdapterFixture, operation: string)
 export async function fixture(): Promise<AdapterFixture> {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-adapter-dispositions-"));
 	const agentDir = path.join(repo, ".gjc", "adapter-agent");
-	const stateRoot = path.join(repo, ".gjc", "state");
 	Bun.spawnSync(["git", "init", "-q"], { cwd: repo });
 	const productionHost = await startProductionSdkHost(repo, { acceptPromptPreflightWithoutExecution: true });
+	// The host publishes under its own profile's project state root; this fixture's
+	// broker runs under a separate profile, so mirror the endpoint into the broker
+	// profile's state root exactly as a host registered with that broker would.
+	const stateRoot = projectSharedStateRoot(repo, agentDir);
 	const sessionId = productionHost.sessionId;
 	const observed: ObservedRequest[] = productionHost.observed;
 	const broker = new Broker({ agentDir, packageGeneration: packageJson.version });
@@ -335,7 +339,10 @@ export async function fixture(): Promise<AdapterFixture> {
 		observed.push({ kind: "global", operation });
 		return await handleRequest(operation, input, idempotencyKey);
 	};
-	const endpointMtimeMs = fs.statSync(path.join(stateRoot, "sdk", `${sessionId}.json`)).mtimeMs;
+	const endpointFile = path.join(stateRoot, "sdk", `${sessionId}.json`);
+	fs.mkdirSync(path.dirname(endpointFile), { recursive: true, mode: 0o700 });
+	fs.copyFileSync(path.join(productionHost.stateRoot, "sdk", `${sessionId}.json`), endpointFile);
+	const endpointMtimeMs = fs.statSync(endpointFile).mtimeMs;
 	const hostIncarnation = currentHostIncarnation();
 	await broker.index.append({
 		type: "host_registered",

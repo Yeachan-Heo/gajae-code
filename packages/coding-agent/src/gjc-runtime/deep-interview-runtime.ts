@@ -33,7 +33,7 @@ export * from "./deep-interview-recorder";
  *
  * The CLI itself does not run the Socratic interview; that lives inside the `/skill:deep-interview`
  * skill executed by the agent. This handler validates the documented argument-hint surface
- * (`[--trace] [--quick|--standard|--deep] <idea>`), seeds `.gjc/state/deep-interview-state.json`, and
+ * (`[--trace] [--quick|--standard|--deep] <idea>`), seeds `$GJC_STATE_DIR/state/deep-interview-state.json`, and
  * updates the shared HUD rail via `syncSkillActiveState` so the active interview is visible to
  * the TUI.
  */

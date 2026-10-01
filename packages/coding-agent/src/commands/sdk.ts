@@ -562,10 +562,10 @@ export async function runSessionHost(
 	const createLifecycleSession = timing.createLifecycleAgentSession ?? createLifecycleAgentSession;
 	const writeLifecycleReady = timing.writeSessionLifecycleReady ?? writeSessionLifecycleReady;
 	const writeMcpConfig = timing.writeMcpConfig ?? ((filePath, contents) => Bun.write(filePath, contents));
-	const request = readSessionLifecycleLaunchRequest(process.env.GJC_SDK_LIFECYCLE_REQUEST, now());
-	let constructionCleanupComplete = true;
 	const agentDir = process.env.GJC_AGENT_DIR;
 	if (!agentDir) throw new Error("GJC_AGENT_DIR is required for sdk session-host-internal.");
+	const request = readSessionLifecycleLaunchRequest(process.env.GJC_SDK_LIFECYCLE_REQUEST, now(), agentDir);
+	let constructionCleanupComplete = true;
 	const cwd = timing.cwd ?? process.cwd();
 	if ((await fs.realpath(request.cwd)) !== (await fs.realpath(cwd)))
 		throw new Error(`Lifecycle worktree mismatch: expected ${request.cwd}, got ${cwd}.`);

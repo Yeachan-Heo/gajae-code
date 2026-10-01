@@ -15,6 +15,7 @@ import {
 } from "../src/cli/public-command-errors";
 import { renderPublicCommandHelp } from "../src/cli/public-command-help";
 import Sdk, { parseSdkInternalArgv, watchSessionHostClientAttachment } from "../src/commands/sdk.js";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { brokerProcessIncarnation, writeBrokerDiscovery } from "../src/sdk/broker/discovery.js";
 import { reapDeadSessionRegistrations } from "../src/sdk/broker/lifecycle.js";
 import { SessionIndex } from "../src/sdk/broker/session-index.js";
@@ -1296,7 +1297,7 @@ describe("SDK serve CLI and discovery", () => {
 
 	test("parses stale tombstones and fails endpoint selection closed", async () => {
 		const repo = await tempDir();
-		const state = path.join(repo, ".gjc", "state", "sdk");
+		const state = path.join(projectSharedStateRoot(repo), "sdk");
 		await fs.mkdir(state, { recursive: true });
 		await fs.writeFile(
 			path.join(state, "stale.json"),
@@ -1392,7 +1393,7 @@ describe("SDK serve CLI and discovery", () => {
 	test("reattaches one indexed-but-dead explicit session before serving", async () => {
 		const sessionId = "dead-session";
 		const cwd = "/workspace";
-		const stateRoot = `${cwd}/.gjc/state`;
+		const stateRoot = projectSharedStateRoot(cwd);
 		const identity = {
 			dev: "1",
 			ino: "2",
@@ -1479,7 +1480,7 @@ describe("SDK serve CLI and discovery", () => {
 		const index = await new SessionIndex(agentDir).open();
 		const sessionId = "reaped-session";
 		const deadPid = 4_194_304;
-		const locator = { cwd: agentDir, worktreeRoot: null, stateRoot: path.join(agentDir, ".gjc", "state") };
+		const locator = { cwd: agentDir, worktreeRoot: null, stateRoot: projectSharedStateRoot(agentDir, agentDir) };
 		const identity = {
 			dev: "1",
 			ino: "2",
@@ -1524,7 +1525,7 @@ describe("SDK serve CLI and discovery", () => {
 		const agentDir = await tempDir();
 		const index = await new SessionIndex(agentDir).open();
 		const sessionId = "detached-idle-session";
-		const locator = { cwd: agentDir, worktreeRoot: null, stateRoot: path.join(agentDir, ".gjc", "state") };
+		const locator = { cwd: agentDir, worktreeRoot: null, stateRoot: projectSharedStateRoot(agentDir, agentDir) };
 		const identity = {
 			dev: "1",
 			ino: "2",
@@ -1591,13 +1592,13 @@ describe("SDK serve CLI and discovery", () => {
 		const agentDir = await tempDir();
 		const cwd = path.join(agentDir, "workspace");
 		const symlinkedCwd = path.join(agentDir, "workspace-link");
-		await fs.mkdir(path.join(cwd, ".gjc", "state"), { recursive: true });
+		await fs.mkdir(projectSharedStateRoot(cwd, agentDir), { recursive: true });
 		await fs.symlink(cwd, symlinkedCwd, "dir");
 		const sessionId = "symlinked-state-root";
 		const locator = {
 			cwd,
 			worktreeRoot: null,
-			stateRoot: path.join(symlinkedCwd, ".gjc", "state"),
+			stateRoot: projectSharedStateRoot(symlinkedCwd, agentDir),
 		};
 		const identity = {
 			dev: "1",
@@ -1640,7 +1641,7 @@ describe("SDK serve CLI and discovery", () => {
 		expect(resumeInput).toMatchObject({
 			sessionId,
 			cwd,
-			stateRoot: path.join(cwd, ".gjc", "state"),
+			stateRoot: projectSharedStateRoot(cwd),
 		});
 	});
 
@@ -1649,7 +1650,7 @@ describe("SDK serve CLI and discovery", () => {
 		const socketPath = path.join(agentDir, "serve.sock");
 		const sessionId = "dead-session";
 		const cwd = "/workspace";
-		const stateRoot = `${cwd}/.gjc/state`;
+		const stateRoot = projectSharedStateRoot(cwd);
 		const identity = {
 			dev: "1",
 			ino: "2",
@@ -1812,7 +1813,7 @@ describe("SDK serve CLI and discovery", () => {
 
 	test("does not retry a recovery when the resumed session remains dead", async () => {
 		const sessionId = "still-dead";
-		const locator = { cwd: "/workspace", worktreeRoot: null, stateRoot: "/workspace/.gjc/state" };
+		const locator = { cwd: "/workspace", worktreeRoot: null, stateRoot: projectSharedStateRoot("/workspace") };
 		const calls: string[] = [];
 		const broker = {
 			global: async (operation: string, input: Record<string, unknown>) => {
@@ -1877,7 +1878,7 @@ describe("SDK serve CLI and discovery", () => {
 
 	test("does not recover an indexed terminal-uncertain explicit session", async () => {
 		const sessionId = "uncertain-session";
-		const locator = { cwd: "/workspace", worktreeRoot: null, stateRoot: "/workspace/.gjc/state" };
+		const locator = { cwd: "/workspace", worktreeRoot: null, stateRoot: projectSharedStateRoot("/workspace") };
 		const identity = {
 			dev: "1",
 			ino: "2",
@@ -1912,7 +1913,7 @@ describe("SDK serve CLI and discovery", () => {
 
 	test("does not recover a nonterminal stale row without retirement proof", async () => {
 		const sessionId = "heartbeat-stale-session";
-		const locator = { cwd: "/workspace", worktreeRoot: null, stateRoot: "/workspace/.gjc/state" };
+		const locator = { cwd: "/workspace", worktreeRoot: null, stateRoot: projectSharedStateRoot("/workspace") };
 		const calls: string[] = [];
 		const broker = {
 			global: async (operation: string) => {
@@ -1943,7 +1944,7 @@ describe("SDK serve CLI and discovery", () => {
 
 	test("does not resume an indexed terminal session", async () => {
 		const sessionId = "terminal-session";
-		const locator = { cwd: "/workspace", worktreeRoot: null, stateRoot: "/workspace/.gjc/state" };
+		const locator = { cwd: "/workspace", worktreeRoot: null, stateRoot: projectSharedStateRoot("/workspace") };
 		const calls: string[] = [];
 		const broker = {
 			global: async (operation: string) => {
@@ -2001,7 +2002,7 @@ describe("SDK serve CLI and discovery", () => {
 
 	test("surfaces a recovery failure without retrying or selecting an endpoint", async () => {
 		const sessionId = "resume-fails";
-		const locator = { cwd: "/workspace", worktreeRoot: null, stateRoot: "/workspace/.gjc/state" };
+		const locator = { cwd: "/workspace", worktreeRoot: null, stateRoot: projectSharedStateRoot("/workspace") };
 		const calls: string[] = [];
 		const broker = {
 			global: async (operation: string, input: Record<string, unknown>) => {

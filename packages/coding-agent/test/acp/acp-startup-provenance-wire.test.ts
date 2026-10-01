@@ -20,6 +20,7 @@ import {
 	type RequestPermissionResponse,
 } from "@agentclientprotocol/sdk";
 import packageJson from "../../package.json" with { type: "json" };
+import { projectSharedStateRoot } from "../../src/gjc-runtime/session-layout";
 import { AcpAgent } from "../../src/modes/acp/acp-agent";
 import { brokerProcessIncarnation, writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
 import { startFixtureBrokerWithLeaseForTest } from "../../src/sdk/broker/ensure";
@@ -291,7 +292,7 @@ describe("ACP startup-control provenance wire oracle", () => {
 				},
 			},
 		});
-		const endpointPath = path.join(workspace, ".gjc", "state", "sdk", "missing-provenance.json");
+		const endpointPath = path.join(projectSharedStateRoot(workspace, agentDir), "sdk", "missing-provenance.json");
 		await fsp.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fsp.writeFile(
 			endpointPath,
@@ -307,7 +308,7 @@ describe("ACP startup-control provenance wire oracle", () => {
 		await index.append({
 			type: "host_registered",
 			sessionId: "missing-provenance",
-			locator: { cwd: workspace, worktreeRoot: null, stateRoot: path.join(workspace, ".gjc", "state") },
+			locator: { cwd: workspace, worktreeRoot: null, stateRoot: projectSharedStateRoot(workspace, agentDir) },
 			endpointGeneration: 1,
 			pid: process.pid,
 			processIncarnation: incarnation,

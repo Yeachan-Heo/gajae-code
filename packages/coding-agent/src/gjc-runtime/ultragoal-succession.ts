@@ -59,15 +59,13 @@ import * as path from "node:path";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
 import { DEFAULT_ULTRAGOAL_OBJECTIVE } from "./goal-mode-request";
 import {
-	assertPathUnderRepositoryBinding,
 	captureRepositoryBinding,
 	parseRepositoryBinding,
 	publicRepositoryBinding,
 	type RepositoryBinding,
-	RepositoryBindingError,
 	repositoryBindingsMatch,
 } from "./repository-binding";
-import { gjcRoot, sessionUltragoalDir } from "./session-layout";
+import { projectStateRoot, sessionUltragoalDir } from "./session-layout";
 import {
 	resolveGjcSessionForRead,
 	resolveGjcSessionForWrite,
@@ -320,7 +318,7 @@ export function ultragoalSuccessionOfferPath(cwd: string, sessionId: string, ope
  * ultragoal root that `getUltragoalPaths` already uses for session-less state.
  */
 export function ultragoalSuccessionClaimPath(cwd: string, operationId: string): string {
-	return path.join(gjcRoot(cwd), "ultragoal", SUCCESSION_DIR_NAME, "claims", `${operationId}.json`);
+	return path.join(projectStateRoot(cwd), "ultragoal", SUCCESSION_DIR_NAME, "claims", `${operationId}.json`);
 }
 
 // ---- small helpers -----------------------------------------------------
@@ -1179,20 +1177,18 @@ export async function adoptUltragoalSuccession(
 	const declaredOffer = parseOfferDocument(initialBytes, declaredPath);
 	const sourceRepository = parseRepositoryBinding(declaredOffer.source.repository);
 
-	// The offer must physically live inside the source worktree it claims. This
-	// rejects a relocated copy and a symlink that escapes the bound root.
-	let resolvedOfferPath: string;
-	try {
-		resolvedOfferPath = assertPathUnderRepositoryBinding(sourceRepository, declaredPath);
-	} catch (error) {
-		if (error instanceof RepositoryBindingError) {
-			throw new UltragoalSuccessionError(
-				"offer_path_escape",
-				`The succession offer at ${declaredPath} resolves outside the source repository it names ` +
-					`(${sourceRepository.worktreeRoot}): ${error.message}`,
-			);
-		}
-		throw error;
+	// The offer must physically live inside the source worktree's project state
+	// root (where the source session wrote it). This rejects a relocated copy and
+	// a symlink that escapes that root.
+	const sourceStateRoot = await realpathOrResolve(projectStateRoot(sourceRepository.worktreeRoot));
+	const resolvedOfferPath = await realpathOrResolve(declaredPath);
+	const offerRelative = path.relative(sourceStateRoot, resolvedOfferPath);
+	if (!offerRelative || offerRelative.startsWith("..") || path.isAbsolute(offerRelative)) {
+		throw new UltragoalSuccessionError(
+			"offer_path_escape",
+			`The succession offer at ${declaredPath} resolves outside the source repository state root it names ` +
+				`(${sourceStateRoot}, for ${sourceRepository.worktreeRoot}).`,
+		);
 	}
 	const offerBytes = await readBytesOrNull(resolvedOfferPath);
 	if (!offerBytes) {
@@ -1691,5 +1687,14 @@ export async function runUltragoalSuccessionCommand(
 			return { status: 1, stderr: `[${error.code}] ${error.message}\n` };
 		}
 		throw error;
+	}
+}
+
+/** Realpath when the target exists (collapses macOS `/var` ↔ `/private/var`); lexical resolve otherwise. */
+async function realpathOrResolve(target: string): Promise<string> {
+	try {
+		return await fs.realpath(target);
+	} catch {
+		return path.resolve(target);
 	}
 }

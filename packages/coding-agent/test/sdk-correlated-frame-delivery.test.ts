@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { NotificationServer } from "@gajae-code/natives";
 import type { ExtensionActions, ExtensionAPI } from "../src/extensibility/extensions/types";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { boundedCorrelatedAgentEndFrame, createNotificationsExtension } from "../src/sdk/bus";
 import { RESPONSE_CEILING_BYTES } from "../src/sdk/host/query/handlers";
@@ -103,7 +104,7 @@ async function connect(
 	cwd: string,
 	sessionId: string,
 ): Promise<{ socket: WebSocket; frames: Record<string, unknown>[] }> {
-	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	const endpointFile = path.join(projectSharedStateRoot(cwd), "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
 	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
 	const frames: Record<string, unknown>[] = [];

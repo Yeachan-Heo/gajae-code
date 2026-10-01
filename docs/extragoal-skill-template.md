@@ -185,10 +185,10 @@ The Extragoal leader is an LLM interpreting this checklist as prompt policy; the
 
 Persist each round under the session state dir:
 
-- `.gjc/_session-{sessionid}/extragoal/gate-<round>.md` — bundle receipt (diff stat + head SHA), raw reviewer output, findings, triage table.
+- `$GJC_STATE_DIR/_session-{sessionid}/extragoal/gate-<round>.md` — bundle receipt (diff stat + head SHA), raw reviewer output, findings, triage table.
 - Final report — findings, triage dispositions, fix commit SHAs, and re-sign receipts, appended to the normal ultragoal completion evidence.
 
-Extragoal is a local skill, so it writes this one non-contract subtree directly; the bundled-skill `.gjc` write discipline (sanctioned CLI writers only) continues to cover the contract surfaces (`state/`, `specs/`, `plans/`, `ultragoal/`). Gate artifacts inherit whatever the bundle contained — treat them as sensitive, and never commit `.gjc/_session-*` gate artifacts.
+Extragoal is a local skill, so it writes this one non-contract subtree directly; the bundled-skill `.gjc` write discipline (sanctioned CLI writers only) continues to cover the contract surfaces (`state/`, `specs/`, `plans/`, `ultragoal/`). Gate artifacts inherit whatever the bundle contained — treat them as sensitive, and never commit `$GJC_STATE_DIR/_session-*` gate artifacts.
 
 ## Guards
 

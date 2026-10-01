@@ -38,6 +38,7 @@ import type {
 	NotificationSessionReconcileResult,
 	NotificationSessionStatus,
 } from "@gajae-code/coding-agent/sdk/bus/session-control";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 
 const TOKEN = "1234567890:ABCDEFghijkLmnOpQrsTuvWxYz012345678";
 
@@ -368,7 +369,7 @@ describe("notification settings controller adapter", () => {
 			},
 			recoverNotifications: async input => {
 				serviceCalls.push("recover");
-				expect(input).toMatchObject({ settings, stateRoot: path.join("/workspace/current", ".gjc", "state") });
+				expect(input).toMatchObject({ settings, stateRoot: projectSharedStateRoot("/workspace/current") });
 				return recovery();
 			},
 			stopTelegramDaemon: async input => {
@@ -442,7 +443,7 @@ describe("notification settings controller adapter", () => {
 			expect.objectContaining({ sessionManager: ctx.sessionManager }),
 		);
 		expect(healthCalls).toContainEqual(
-			expect.objectContaining({ stateRoot: path.join("/workspace/current", ".gjc", "state"), probe: true, signal }),
+			expect.objectContaining({ stateRoot: projectSharedStateRoot("/workspace/current"), probe: true, signal }),
 		);
 		expect(serviceCalls).toEqual(["status", "test", "recover"]);
 

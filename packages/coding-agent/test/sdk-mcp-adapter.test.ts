@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import path from "node:path";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { Broker } from "../src/sdk/broker/broker";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { SessionLifecycleService } from "../src/sdk/lifecycle";
@@ -66,7 +67,7 @@ async function fixture() {
 	});
 	servers.push(server);
 	const sessionId = "live-session";
-	const stateRoot = path.join(repo, ".gjc", "state");
+	const stateRoot = projectSharedStateRoot(repo, agentDir);
 	const sdkDir = path.join(stateRoot, "sdk");
 	fs.mkdirSync(sdkDir, { recursive: true });
 	const endpointPath = path.join(sdkDir, `${sessionId}.json`);

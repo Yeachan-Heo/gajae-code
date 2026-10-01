@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
 import { runRalplanCliCommand } from "../../src/commands/ralplan";
+import { projectStateRoot } from "../../src/gjc-runtime/session-layout";
 import ralplanPersistenceTemplate from "../../src/prompts/agent-fragments/ralplan-persistence.md" with { type: "text" };
 
 const tempRoots: string[] = [];
@@ -74,19 +75,19 @@ async function pathExists(target: string): Promise<boolean> {
 }
 
 function statePath(root: string, sessionId: string): string {
-	return path.join(root, ".gjc", `_session-${sessionId}`, "state", "ralplan-state.json");
+	return path.join(projectStateRoot(root), `_session-${sessionId}`, "state", "ralplan-state.json");
 }
 
 function runDir(root: string, sessionId: string, runId: string): string {
-	return path.join(root, ".gjc", `_session-${sessionId}`, "plans", "ralplan", runId);
+	return path.join(projectStateRoot(root), `_session-${sessionId}`, "plans", "ralplan", runId);
 }
 
 function hudPath(root: string, sessionId: string): string {
-	return path.join(root, ".gjc", `_session-${sessionId}`, "state", "skill-active-state.json");
+	return path.join(projectStateRoot(root), `_session-${sessionId}`, "state", "skill-active-state.json");
 }
 
 function activeEntryPath(root: string, sessionId: string): string {
-	return path.join(root, ".gjc", `_session-${sessionId}`, "state", "active", "ralplan.json");
+	return path.join(projectStateRoot(root), `_session-${sessionId}`, "state", "active", "ralplan.json");
 }
 
 async function symlinkDir(target: string, prefix: string): Promise<string> {
@@ -222,7 +223,7 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		expect(indexRows.length).toBe(2);
 
 		// The dispatcher cwd receives no ralplan state, artifact, ledger, or HUD writes.
-		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
+		expect(await pathExists(projectStateRoot(dispatcher))).toBe(false);
 	});
 
 	it("resolves a relative --worktree-root and a relative --artifact from the invoking cwd", async () => {
@@ -261,7 +262,7 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		expect(write.status).toBe(0);
 		const persisted = await fs.readFile(path.join(runDir(target, session, session), "stage-01-planner.md"), "utf-8");
 		expect(persisted).toBe("plan from dispatcher file\n");
-		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
+		expect(await pathExists(projectStateRoot(dispatcher))).toBe(false);
 	});
 
 	it("validates a committed target with Windows-safe git argv", async () => {
@@ -279,8 +280,8 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 			ok: true,
 			repository_binding: { worktreeRoot: await realpath(target) },
 		});
-		expect(await pathExists(path.join(target, ".gjc"))).toBe(true);
-		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
+		expect(await pathExists(projectStateRoot(target))).toBe(true);
+		expect(await pathExists(projectStateRoot(dispatcher))).toBe(false);
 	});
 
 	it("supports resume/restart: re-seed and later writes keep the same bound target run", async () => {
@@ -345,7 +346,7 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		const dir = runDir(target, session, session);
 		expect(await pathExists(path.join(dir, "stage-01-planner.md"))).toBe(true);
 		expect(await pathExists(path.join(dir, "stage-01-critic.md"))).toBe(true);
-		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
+		expect(await pathExists(projectStateRoot(dispatcher))).toBe(false);
 	});
 
 	it("rejects missing, non-directory, non-git, and subdirectory targets before any mutation", async () => {
@@ -392,10 +393,10 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 			expect(write.status, `${label} write`).toBe(2);
 			expect(write.stderr ?? "", `${label} write`).toMatch(match);
 			// No filesystem mutation anywhere.
-			expect(await pathExists(path.join(root, ".gjc")), label).toBe(false);
+			expect(await pathExists(projectStateRoot(root)), label).toBe(false);
 		}
-		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
-		expect(await pathExists(path.join(target, ".gjc"))).toBe(false);
+		expect(await pathExists(projectStateRoot(dispatcher))).toBe(false);
+		expect(await pathExists(projectStateRoot(target))).toBe(false);
 	});
 
 	it("rejects a linked worktree sharing commonDir when the run is bound to a different worktreeRoot", async () => {
@@ -431,7 +432,7 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		expect(write.status).toBe(2);
 		expect(write.stderr ?? "").toMatch(/holds no seeded ralplan run state|must exactly equal/);
 		// The linked worktree must not receive a fragmented ralplan tree.
-		expect(await pathExists(path.join(linked, ".gjc"))).toBe(false);
+		expect(await pathExists(projectStateRoot(linked))).toBe(false);
 	});
 
 	it("resets the per-iteration lane budget from the target ledger after a revision", async () => {
@@ -484,7 +485,7 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		const dir = runDir(target, session, session);
 		expect(await pathExists(path.join(dir, "stage-02-architect.md"))).toBe(true);
 		expect(await pathExists(path.join(dir, "stage-02-critic.md"))).toBe(true);
-		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
+		expect(await pathExists(projectStateRoot(dispatcher))).toBe(false);
 	});
 
 	it("keeps duplicate-write and owner-session conflict behavior in explicit-target mode", async () => {
@@ -600,7 +601,7 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		);
 		expect(writeViaSymlink.status).toBe(0);
 		expect(await pathExists(path.join(runDir(target, session, session), "stage-01-planner.md"))).toBe(true);
-		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
+		expect(await pathExists(projectStateRoot(dispatcher))).toBe(false);
 		expect(await pathExists(path.join(path.dirname(targetLink), ".gjc"))).toBe(false);
 	});
 
@@ -666,8 +667,8 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		expect(await pathExists(path.join(dir, "stage-01-architect.md"))).toBe(true);
 		expect(await pathExists(hudPath(target, session))).toBe(true);
 		expect(await pathExists(activeEntryPath(target, session))).toBe(true);
-		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
-		expect(await pathExists(path.join(laterDispatcher, ".gjc"))).toBe(false);
+		expect(await pathExists(projectStateRoot(dispatcher))).toBe(false);
+		expect(await pathExists(projectStateRoot(laterDispatcher))).toBe(false);
 		expect(await pathExists(path.join(path.dirname(dispatcherLink), ".gjc"))).toBe(false);
 	});
 
@@ -709,8 +710,8 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		);
 		expect(trailingWrite.status).toBe(2);
 		expect(trailingWrite.stderr ?? "").toMatch(/requires a non-empty path/);
-		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
-		expect(await pathExists(path.join(target, ".gjc", `_session-${session}`))).toBe(false);
+		expect(await pathExists(projectStateRoot(dispatcher))).toBe(false);
+		expect(await pathExists(path.join(projectStateRoot(target), `_session-${session}`))).toBe(false);
 
 		expect(
 			(await runNativeRalplanCommand(["--worktree-root", target, "--session-id", session, "stuck task"], dispatcher))
@@ -762,7 +763,7 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		expect(index).toMatch(/planning_stuck/);
 		const state = await readState(target, session);
 		expect(state.planning_stuck).toEqual(expect.objectContaining({ marker: "PLANNING-STUCK" }));
-		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
+		expect(await pathExists(projectStateRoot(dispatcher))).toBe(false);
 	});
 	it("rejects a fake .git directory that is not a valid worktree before mutation", async () => {
 		const session = "wt-fake-git";
@@ -775,8 +776,8 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		);
 		expect(seed.status).toBe(2);
 		expect(seed.stderr ?? "").toMatch(/not a valid git worktree|not inside a git repository/);
-		expect(await pathExists(path.join(fake, ".gjc"))).toBe(false);
-		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
+		expect(await pathExists(projectStateRoot(fake))).toBe(false);
+		expect(await pathExists(projectStateRoot(dispatcher))).toBe(false);
 	});
 
 	it("rejects duplicate --worktree-root flags before mutation", async () => {
@@ -810,8 +811,8 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		);
 		expect(write.status).toBe(2);
 		expect(write.stderr ?? "").toMatch(/at most once|requires a non-empty path/);
-		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
-		expect(await pathExists(path.join(target, ".gjc"))).toBe(false);
+		expect(await pathExists(projectStateRoot(dispatcher))).toBe(false);
+		expect(await pathExists(projectStateRoot(target))).toBe(false);
 	});
 
 	it("rejects an explicit-target --artifact file that escapes the invoking cwd", async () => {
@@ -892,8 +893,8 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		);
 		expect(seed.status).toBe(2);
 		expect(seed.stderr ?? "").toMatch(/not a valid git worktree|not inside a git repository/);
-		expect(await pathExists(path.join(fake, ".gjc"))).toBe(false);
-		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
+		expect(await pathExists(projectStateRoot(fake))).toBe(false);
+		expect(await pathExists(projectStateRoot(dispatcher))).toBe(false);
 	});
 
 	it.each(["blob", "tree"] as const)("rejects a %s object in HEAD before seed or write mutation", async kind => {
@@ -912,7 +913,7 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		);
 		expect(seed.status).toBe(2);
 		expect(seed.stderr ?? "").toMatch(/not a commit worktree/);
-		expect(await pathExists(path.join(target, ".gjc"))).toBe(false);
+		expect(await pathExists(projectStateRoot(target))).toBe(false);
 
 		const write = await runNativeRalplanCommand(
 			explicitWriteArgs({
@@ -926,8 +927,8 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		);
 		expect(write.status).toBe(2);
 		expect(write.stderr ?? "").toMatch(/not a commit worktree/);
-		expect(await pathExists(path.join(target, ".gjc"))).toBe(false);
-		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
+		expect(await pathExists(projectStateRoot(target))).toBe(false);
+		expect(await pathExists(projectStateRoot(dispatcher))).toBe(false);
 	});
 
 	it("accepts a valid SHA-256 commit worktree", async () => {
@@ -945,8 +946,8 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 			dispatcher,
 		);
 		expect(seed.status).toBe(0);
-		expect(await pathExists(path.join(target, ".gjc"))).toBe(true);
-		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
+		expect(await pathExists(projectStateRoot(target))).toBe(true);
+		expect(await pathExists(projectStateRoot(dispatcher))).toBe(false);
 	});
 
 	it("rejects a forged ref HEAD that does not resolve in the object database", async () => {
@@ -965,8 +966,8 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		);
 		expect(seed.status).toBe(2);
 		expect(seed.stderr ?? "").toMatch(/not a valid git worktree|not inside a git repository/);
-		expect(await pathExists(path.join(fake, ".gjc"))).toBe(false);
-		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
+		expect(await pathExists(projectStateRoot(fake))).toBe(false);
+		expect(await pathExists(projectStateRoot(dispatcher))).toBe(false);
 	});
 
 	it("rejects a target whose .gjc is a symlink outside the worktree", async () => {
@@ -982,7 +983,7 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		expect(seed.status).toBe(2);
 		expect(seed.stderr ?? "").toMatch(/symlinked \.gjc|escapes the target worktree/);
 		expect(await pathExists(path.join(outside, `_session-${session}`))).toBe(false);
-		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
+		expect(await pathExists(projectStateRoot(dispatcher))).toBe(false);
 	});
 
 	it("rejects an in-cwd artifact symlink so a swapped path cannot be followed", async () => {
@@ -1035,6 +1036,6 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		expect(status).toBe(2);
 		expect(stderr).toMatch(/symlinked \.gjc|escapes the target worktree/);
 		expect(await pathExists(path.join(outside, "config.yml"))).toBe(false);
-		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
+		expect(await pathExists(projectStateRoot(dispatcher))).toBe(false);
 	});
 });

@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getConfigRootDir, setAgentDir } from "@gajae-code/utils";
+import { projectStateRoot } from "../../src/gjc-runtime/session-layout";
 import { ManagedSessionDescendantStore } from "../../src/session/internal/managed-session-storage";
 import {
 	CURRENT_SESSION_VERSION,
@@ -378,7 +379,7 @@ describe("picker star persistence", () => {
 	});
 
 	it("supports project-local candidates without managed-directory migration", async () => {
-		const projectDir = path.join(cwd, ".gjc", "sessions");
+		const projectDir = path.join(projectStateRoot(cwd), "sessions");
 		await fs.mkdir(projectDir, { recursive: true });
 		const { candidate, file } = await fixture({ dir: projectDir, capable: false });
 		await SessionManager.setSessionStarredForPicker(candidate, true);

@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { ChatDaemonRuntime } from "../src/sdk/bus/chat-daemon-runtime";
@@ -414,7 +415,7 @@ async function withAttachedSessionRuntime(run: (harness: AttachedRuntimeHarness)
 		warnings.push(message);
 	});
 	try {
-		const stateRoot = path.join(agentDir, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(agentDir, agentDir);
 		const endpointFile = path.join(stateRoot, "sdk", `${SESSION_ID}.json`);
 		await fs.mkdir(path.dirname(endpointFile), { recursive: true });
 		await fs.writeFile(
@@ -538,7 +539,7 @@ async function withAttachedDiscordRuntime(
 	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-chat-reconnect-discord-"));
 	let runtime: ChatDaemonRuntime | undefined;
 	try {
-		const stateRoot = path.join(agentDir, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(agentDir, agentDir);
 		const endpointFile = path.join(stateRoot, "sdk", `${SESSION_ID}.json`);
 		await fs.mkdir(path.dirname(endpointFile), { recursive: true });
 		await fs.writeFile(
@@ -731,7 +732,7 @@ test("chat daemon startup isolates an unreachable indexed endpoint from a health
 		warnings.push(message);
 	});
 	try {
-		const stateRoot = path.join(agentDir, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(agentDir, agentDir);
 		const endpointDir = path.join(stateRoot, "sdk");
 		await fs.mkdir(endpointDir, { recursive: true });
 		const sessions = [

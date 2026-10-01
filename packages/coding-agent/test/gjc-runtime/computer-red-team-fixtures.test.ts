@@ -3,7 +3,6 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { deflateSync } from "node:zlib";
-import { sessionUltragoalDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import {
 	createUltragoalPlan,
 	runNativeUltragoalCommand,
@@ -111,12 +110,6 @@ async function seedPlan(root: string): Promise<void> {
 		cwd: root,
 		brief: "@goal computer gate fixture",
 	});
-	await runGit(root, [
-		"add",
-		path.relative(root, path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json")),
-		path.relative(root, path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "ledger.jsonl")),
-	]);
-	await runGit(root, ["commit", "-m", "plan"]);
 	await startNextUltragoalGoal({ cwd: root });
 }
 

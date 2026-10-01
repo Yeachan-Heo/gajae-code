@@ -1,0 +1,4 @@
+### Changed
+
+- Per-project runtime state no longer lives in the working folder. Session state (`_session-*`) and shared project state (`state/`) now go to `<agentDir>/projects/<folder-name>-<sha256(realpath)[:16]>/` (by default `~/.gjc/agent/projects/...`). `<cwd>/.gjc` holds only user-authored project config. GJC therefore no longer writes into the working folder, so a folder synced by Synology Drive, OneDrive, or Dropbox cannot rewrite lock files underneath GJC and cause `Failed to publish file lock: owner_mismatch` errors. Workflow prompts and skills name the state dir through the new `GJC_STATE_DIR` environment variable. Existing `.gjc/_session-*` and `.gjc/state` directories are neither read nor migrated.
+- A broker, router, lifecycle service, or SDK host bound to an explicit agent dir now resolves project state roots under that agent dir, not under the process-default agent dir.

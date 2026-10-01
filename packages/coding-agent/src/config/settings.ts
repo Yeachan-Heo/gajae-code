@@ -33,6 +33,7 @@ import { YAML } from "bun";
 import { type Settings as SettingsCapabilityItem, settingsCapability } from "../capability/settings";
 import type { ModelRole } from "../config/model-registry";
 import { loadCapability } from "../discovery";
+import { projectSharedStateRoot } from "../gjc-runtime/session-layout";
 import { extractWorkflowSetting, type WorkflowSettingKey } from "../gjc-runtime/workflow-settings";
 import { isLightTheme, setAutoThemeMapping, setColorBlindMode, setSymbolPreset } from "../modes/theme/theme";
 import {
@@ -110,7 +111,7 @@ type ProjectTargetBeforeState = { present: boolean; value: unknown };
 /**
  * Guaranteed-invalid placeholder values persisted into project `config.yml` as
  * fallback strict evidence when the retained `.gjc/settings.json` is malformed
- * or unreadable AND the strict-invalid evidence sidecar (`.gjc/state/`) cannot
+ * or unreadable AND the strict-invalid evidence sidecar (the shared project state dir (`$GJC_STATE_DIR/state/`)) cannot
  * be written. The strict resolver reads config.yml only, so each value keeps
  * the ralplan exit-2 error observable until the user repairs the source.
  */
@@ -3959,18 +3960,23 @@ export class Settings implements NotificationSettingsReader {
 	}
 
 	/**
-	 * Project strict-invalid evidence lives under the ignored runtime dir
-	 * `.gjc/state/` so running GJC never dirties the user's git worktree; the
-	 * config-root evidence stays next to its machine-global source (outside any
-	 * repository).
+	 * Project strict-invalid evidence lives under the project's runtime state
+	 * root (outside the workspace) so running GJC never dirties the user's
+	 * worktree; the config-root evidence stays next to its machine-global source
+	 * (outside any repository).
 	 */
 	#projectStrictInvalidEvidencePath(source: string): string {
-		return path.join(path.dirname(source), "state", "settings.json.strict-invalid");
+		return path.join(this.#projectRuntimeStateDir(source), "settings.json.strict-invalid");
+	}
+
+	/** Shared runtime state dir for the project owning `<project>/.gjc/settings.json` (`source`). */
+	#projectRuntimeStateDir(source: string): string {
+		return projectSharedStateRoot(path.dirname(path.dirname(source)), this.#agentDir);
 	}
 
 	/**
 	 * Record malformed-source strict evidence for the project migration; when the
-	 * evidence sidecar (`.gjc/state/`) cannot be written, fall back to persisting
+	 * evidence sidecar (the shared project state dir (`$GJC_STATE_DIR/state/`)) cannot be written, fall back to persisting
 	 * invalid placeholder values into the project config.yml so the ralplan exit-2
 	 * error stays observable either way.
 	 */
@@ -4054,7 +4060,7 @@ export class Settings implements NotificationSettingsReader {
 	 * values for the strict ralplan keys into the project config.yml (the only
 	 * surface the strict resolver reads) so `gjc ralplan` keeps exiting 2 while
 	 * the source is malformed. The fallback is tracked by the fallback-invalid
-	 * marker (writable next to the source even when `.gjc/state/` is not) and is
+	 * marker (writable next to the source even when the shared project state dir (`$GJC_STATE_DIR/state/`) is not) and is
 	 * removed once the source is repaired.
 	 */
 	async #persistProjectMalformedStrictFallback(source: string, target: string): Promise<void> {
@@ -4472,13 +4478,13 @@ export class Settings implements NotificationSettingsReader {
 	 * Read the project workflow migration's per-key completion marker. A key in
 	 * this set is owned by config.yml and is never re-imported from the retained
 	 * `.gjc/settings.json`, so removing a migrated override from config.yml
-	 * sticks. The marker lives under the ignored runtime dir `.gjc/state/` so a
+	 * sticks. The marker lives under the ignored runtime dir the shared project state dir (`$GJC_STATE_DIR/state/`) so a
 	 * successful migration never dirties the user's git worktree. A missing or
 	 * malformed marker reads as empty (the migration simply re-copies absent-only
 	 * values and rewrites the marker).
 	 */
 	async #readProjectMigratedKeys(source: string): Promise<Set<WorkflowSettingKey>> {
-		const markerPath = path.join(path.dirname(source), "state", "settings.json.migrated-keys");
+		const markerPath = path.join(this.#projectRuntimeStateDir(source), "settings.json.migrated-keys");
 		let raw: string;
 		try {
 			raw = await Bun.file(markerPath).text();
@@ -4510,11 +4516,11 @@ export class Settings implements NotificationSettingsReader {
 
 	/**
 	 * Atomically persist the project workflow migration's per-key completion
-	 * marker under `.gjc/state/` (temp file + rename; the directory is created on
+	 * marker under the shared project state dir (`$GJC_STATE_DIR/state/`) (temp file + rename; the directory is created on
 	 * demand).
 	 */
 	async #writeProjectMigratedKeys(source: string, keys: readonly WorkflowSettingKey[]): Promise<boolean> {
-		const markerPath = path.join(path.dirname(source), "state", "settings.json.migrated-keys");
+		const markerPath = path.join(this.#projectRuntimeStateDir(source), "settings.json.migrated-keys");
 		// A UNIQUE staging path: two GJC processes may migrate the same project
 		// concurrently, and a fixed .tmp name could be consumed by one writer's
 		// rename, making the other fail its marker write and roll back a copy
@@ -4656,7 +4662,7 @@ export class Settings implements NotificationSettingsReader {
 	 * Read the fallback-invalid marker (keys persisted into config.yml as
 	 * fallback evidence when the strict-evidence sidecar could not be written).
 	 * The marker lives next to the legacy source so it stays writable in the
-	 * exact scenario that produced it (.gjc/state/ is read-only or occupied).
+	 * exact scenario that produced it (the project state root is read-only or occupied).
 	 */
 	async #readFallbackInvalidKeys(
 		source: string,

@@ -11,7 +11,7 @@ Primary goal:
 There is no goal recorded for this mission yet. Infer what to optimize from the latest user message and the conversation; capture the goal in your notes once it is clear.
 {{/if}}
 
-Mission state and run artifacts are managed for you under `.gjc/_session-{id}/autoresearch/`. The benchmark entrypoint is `bash autoresearch.sh` (committed during Phase 1). Do not edit `autoresearch.sh` mid-segment unless you intentionally start a fresh baseline. Do not create `autoresearch.md` or `.autoresearch/` in this repo.
+Mission state and run artifacts are managed for you under `$GJC_STATE_DIR/_session-{id}/autoresearch/`. The benchmark entrypoint is `bash autoresearch.sh` (committed during Phase 1). Do not edit `autoresearch.sh` mid-segment unless you intentionally start a fresh baseline. Do not create `autoresearch.md` or `.autoresearch/` in this repo.
 
 Working directory: `{{working_dir}}`
 {{#if has_branch}}Active branch: `{{branch}}`{{/if}}

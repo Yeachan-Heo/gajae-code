@@ -13,9 +13,9 @@ Use when the user asks for `ultragoal`, `create-goals`, `complete-goals`, durabl
 
 `ultragoal` turns a brief into repo-native durable artifacts and then drives execution through the unified `goal` tool as a UX bridge only. `goals.json` is the canonical source of goal identity and state; `ledger.jsonl` is the canonical proof stream for checkpoints, receipts, blockers, steering, and reviews. The inline `goal` tool and goal-mode-request create-bridge exist only to keep the agent's interactive loop focused on the current aggregate or story objective. Completion is verified purely from durable `goals.json` plus fresh `ledger.jsonl` receipts, never from inline goal state. The agent, not the CLI or hooks, calls `goal({"op":"complete"})` or `goal({"op":"drop"})` after durable run completion or cleanup; CLI commands and hooks never mutate goal state.
 
-- `.gjc/_session-{sessionid}/ultragoal/brief.md`
-- `.gjc/_session-{sessionid}/ultragoal/goals.json`
-- `.gjc/_session-{sessionid}/ultragoal/ledger.jsonl` (checkpoint and structured steering audit events)
+- `$GJC_STATE_DIR/_session-{sessionid}/ultragoal/brief.md`
+- `$GJC_STATE_DIR/_session-{sessionid}/ultragoal/goals.json`
+- `$GJC_STATE_DIR/_session-{sessionid}/ultragoal/ledger.jsonl` (checkpoint and structured steering audit events)
 
 Existing aggregate plans with the legacy enumerated objective are migrated to the stable pointer objective on read, persisted to `goals.json`, retained in `gjcObjectiveAliases` for already-active hidden goal reconciliation, and audited with an `aggregate_objective_migrated` ledger entry.
 - **Nudge budget setting** — the per-story give-up budget
@@ -101,7 +101,7 @@ goal({"op":"resume"})
    - `gjc ultragoal create-goals --brief-file <path>`
    - `cat <brief> | gjc ultragoal create-goals --from-stdin`
    - `gjc ultragoal create-goals --gjc-goal-mode per-story --brief "<brief>"` only when one GJC goal context per story is explicitly preferred
-3. Inspect `.gjc/_session-{sessionid}/ultragoal/goals.json` and refine if needed.
+3. Inspect `$GJC_STATE_DIR/_session-{sessionid}/ultragoal/goals.json` and refine if needed.
 
 ### Create-goals granularity: merge validation-coupled stories
 
@@ -179,9 +179,9 @@ gjc ultragoal steer --kind mark_blocked_superseded --goal-id G004 --evidence "Th
 
 Steering invariants:
 
-- Do not edit the aggregate goal objective, original brief constraints, quality gates, or completion status. The aggregate objective is a stable pointer to `.gjc/_session-{sessionid}/ultragoal/goals.json` and `.gjc/_session-{sessionid}/ultragoal/ledger.jsonl`, not an enumeration of initial goal ids.
-- Do not hard-delete goals, auto-complete work, weaken verification, or silently mutate `.gjc/_session-{sessionid}/ultragoal`.
-- Accepted and rejected attempts append structured audit entries to `.gjc/_session-{sessionid}/ultragoal/ledger.jsonl`.
+- Do not edit the aggregate goal objective, original brief constraints, quality gates, or completion status. The aggregate objective is a stable pointer to `$GJC_STATE_DIR/_session-{sessionid}/ultragoal/goals.json` and `$GJC_STATE_DIR/_session-{sessionid}/ultragoal/ledger.jsonl`, not an enumeration of initial goal ids.
+- Do not hard-delete goals, auto-complete work, weaken verification, or silently mutate `$GJC_STATE_DIR/_session-{sessionid}/ultragoal`.
+- Accepted and rejected attempts append structured audit entries to `$GJC_STATE_DIR/_session-{sessionid}/ultragoal/ledger.jsonl`.
 - Superseded goals remain in `goals.json` with steering metadata and are skipped for scheduling.
 - Blocked goals without replacements are skipped for scheduling but still block final completion until later explicit steering replaces or supersedes them.
 
@@ -211,7 +211,7 @@ When delegating:
 - Give each `executor` bounded targets and explicit acceptance criteria, and keep checkpoint/goal-state ownership in the leader.
 - Parallelize only across genuinely different sub-domains/modules/systems; sequence anything with a real dependency or shared-surface overlap.
 - Work within a single domain/subsystem stays with the leader as direct edits — do not split one cohesive change across subagents, and do not over-delegate trivial work.
-- After integrating delegated slices, you MAY run `architect` / `critic` review lanes for early signal, but treat them as **advisory**: the canonical review is the boundary cohort gate below, and a slice-level lane never substitutes for it or its verdict. Skip slice review entirely when the boundary cohort will cover the same change set shortly. Worker agents never mutate `.gjc/_session-{sessionid}/ultragoal` or call goal tools.
+- After integrating delegated slices, you MAY run `architect` / `critic` review lanes for early signal, but treat them as **advisory**: the canonical review is the boundary cohort gate below, and a slice-level lane never substitutes for it or its verdict. Skip slice review entirely when the boundary cohort will cover the same change set shortly. Worker agents never mutate `$GJC_STATE_DIR/_session-{sessionid}/ultragoal` or call goal tools.
 
 When delegating with native subagents, an await timeout only limits the leader's wait. It is not subagent failure evidence and must not be used as a cancellation reason; inspect or continue independent work, and cancel only when the subagent has actually failed, gone off-track, or become unrecoverably wrong.
 
@@ -222,12 +222,12 @@ Fresh spawns re-pay the full context ramp-up (file reads, domain orientation, co
 - Track the subagent id per role + domain as it is created; on the next same-domain `executor` slice or same-scope `architect` review lane, resume that id and inject only the delta (new targets, new acceptance criteria, the updated frozen change set) rather than re-briefing from scratch.
 - Reuse is domain-scoped: resume only when the prior context is an asset. A slice in a genuinely different sub-domain/module/system gets a fresh spawn — stale cross-domain context is a liability, not a saving.
 - Resumability requires retained subagent resume metadata and a persistent parent session; use existing `subagent` resume/steer controls only. Route per attempt: `running` → steer/inject to the same id and await; `queued` → retain or await the same id; terminal (`completed`/`failed`/`cancelled`) with context available → resume the same id; `context_unavailable`, `not_found`, `no_runner`, or `resume_failed` → fresh spawn fallback for that slice.
-- A resumed subagent is still the same worker under the same contract: it must not mutate `.gjc/_session-{sessionid}/ultragoal`, call goal tools, or absorb checkpoint/goal-state ownership, and review lanes (`architect`, `critic`) stay read-only when resumed.
+- A resumed subagent is still the same worker under the same contract: it must not mutate `$GJC_STATE_DIR/_session-{sessionid}/ultragoal`, call goal tools, or absorb checkpoint/goal-state ownership, and review lanes (`architect`, `critic`) stay read-only when resumed.
 - Resumption never weakens gates: a resumed `architect` review or `executor` QA lane must still evaluate the current frozen change set on its own evidence, not rubber-stamp its earlier verdict.
 
 If an Ultragoal request has no approved plan or consensus artifact **and** the scope genuinely needs one, run `ralplan` first and preserve its PRD, test spec, role roster, and verification guidance in the Ultragoal ledger. Skip `ralplan` for small scope: work that fits a single reviewable PR and is tied to a single domain/subsystem can proceed directly from the brief — record that judgment in the ledger instead of running a planning round. Reach for `ralplan` when the scope spans multiple domains/subsystems, needs cross-cutting sequencing, or would not fit a single PR.
 
-The Ultragoal leader owns `.gjc/_session-{sessionid}/ultragoal/goals.json` and `.gjc/_session-{sessionid}/ultragoal/ledger.jsonl`. Role agents return implementation/review evidence; they do not checkpoint Ultragoal or mutate goal state.
+The Ultragoal leader owns `$GJC_STATE_DIR/_session-{sessionid}/ultragoal/goals.json` and `$GJC_STATE_DIR/_session-{sessionid}/ultragoal/ledger.jsonl`. Role agents return implementation/review evidence; they do not checkpoint Ultragoal or mutate goal state.
 
 ### Native executor parallelism contract
 
@@ -235,7 +235,7 @@ Native subagent parallelism is a contract for bounded `executor` delegation, not
 
 - **Use native `executor` parallelism only** when a story's expected diffs fall in genuinely different sub-domains/modules/systems, each boundable by a per-slice coordination contract.
 - **Default to direct leader edits** otherwise; sequence any work with real dependencies, shared-file overlap, or a single-domain footprint, and never parallelize work that lacks a safe contract.
-- Worker agents **MUST NOT mutate `.gjc/_session-{sessionid}/ultragoal`**, call goal tools, make checkpoint decisions, own integration, or own final verification. The Ultragoal leader keeps those responsibilities.
+- Worker agents **MUST NOT mutate `$GJC_STATE_DIR/_session-{sessionid}/ultragoal`**, call goal tools, make checkpoint decisions, own integration, or own final verification. The Ultragoal leader keeps those responsibilities.
 - Workers must not run `gjc ultragoal checkpoint`: checkpoint authority stays with the leader after worker tasks are terminal. The leader checkpoints from worker evidence plus the current-session GJC goal snapshot, and performs no hidden goal mutation.
 
 Before workers start, each per-slice coordination contract MUST name the target files/surfaces, independence assumptions, allowed coordination channel, conflict-escalation rule, expected evidence, and terminal status. Conflict or assignment changes remain leader-owned and must be auditable through durable ledger evidence.
@@ -329,7 +329,7 @@ When the aggregate ultragoal is complete OR the user requests return to planning
 gjc state ultragoal write --input '{"current_phase":"handoff"}' --json
 ```
 
-The skill tool then dispatches `/skill:ralplan` or `/skill:deep-interview` same-turn and runs `gjc state ultragoal handoff --to <ralplan|deep-interview> --json` in-process to atomically demote ultragoal, promote the callee, and sync both `.gjc/_session-{sessionid}/state/skill-active-state.json` files. You do not need to run the handoff verb yourself.
+The skill tool then dispatches `/skill:ralplan` or `/skill:deep-interview` same-turn and runs `gjc state ultragoal handoff --to <ralplan|deep-interview> --json` in-process to atomically demote ultragoal, promote the callee, and sync both `$GJC_STATE_DIR/_session-{sessionid}/state/skill-active-state.json` files. You do not need to run the handoff verb yourself.
 
 ## Constraints
 

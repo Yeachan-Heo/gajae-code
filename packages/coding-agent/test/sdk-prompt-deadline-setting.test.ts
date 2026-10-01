@@ -18,6 +18,7 @@ import {
 } from "@gajae-code/coding-agent/config/settings-schema";
 import type { ExtensionAPI, ExtensionContext, ExtensionEvent } from "../src/extensibility/extensions";
 import type { ExtensionActions } from "../src/extensibility/extensions/types";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { createNotificationsExtension } from "../src/sdk/bus";
 import { createSdkSessionRuntimeExtension } from "../src/sdk/host/session-runtime";
 import type { SdkFrame } from "../src/sdk/host/types";
@@ -325,7 +326,11 @@ describe("sdk prompt deadline arming — bus route (#5583)", () => {
 			const ctx = context(cwd, sessionId);
 			const handlers = start(ctx, shape.omitSettings ? undefined : missingDeadlineSettings(cwd, shape.stored));
 
-			const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+			const endpointFile = path.join(
+				projectSharedStateRoot(cwd, shape.omitSettings ? undefined : cwd),
+				"sdk",
+				`${sessionId}.json`,
+			);
 			await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
 			const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
 			const frames: Record<string, unknown>[] = [];

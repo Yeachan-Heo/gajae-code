@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import { deepInterviewDraftPath } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-stage";
 import { ENVELOPE_RESERVED_STATE_KEYS } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
-import { modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { modeStatePath, projectStateRoot } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 
 const TEST_SESSION_ID = "stage-test-session";
 const tempRoots: string[] = [];
@@ -904,7 +904,12 @@ describe("deep-interview staged transitions", () => {
 	it("refreshes the active-state/HUD projection after write and apply", async () => {
 		const root = await tempDir();
 		await seed(root);
-		const snapshotPath = path.join(root, ".gjc", `_session-${TEST_SESSION_ID}`, "state", "skill-active-state.json");
+		const snapshotPath = path.join(
+			projectStateRoot(root),
+			`_session-${TEST_SESSION_ID}`,
+			"state",
+			"skill-active-state.json",
+		);
 		const readHudAmbiguity = async (): Promise<string | undefined> => {
 			const snapshot = JSON.parse(await fs.readFile(snapshotPath, "utf-8")) as Record<string, unknown>;
 			const skills = snapshot.active_skills as Record<string, unknown>[];

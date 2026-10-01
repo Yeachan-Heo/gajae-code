@@ -12,6 +12,7 @@ import * as path from "node:path";
 import { getEffectiveLogPath } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { ensureWorkflowSettingsMigrated, Settings, SettingsMigrationTestHooks } from "../../src/config/settings";
+import { projectSharedStateRoot } from "../../src/gjc-runtime/session-layout";
 
 const cwd = process.cwd();
 // Test seam: when enabled, the post-publication marker RE-READ is made to
@@ -19,7 +20,7 @@ const cwd = process.cwd();
 // migrated values already committed, so the rollback path is exercised.
 if (process.env.SETTINGS_MIGRATION_TEST_MARKER_MERGE_DIR === "1") {
 	SettingsMigrationTestHooks.beforeProjectMarkerMerge = async () => {
-		const marker = path.join(cwd, ".gjc", "state", "settings.json.migrated-keys");
+		const marker = path.join(projectSharedStateRoot(cwd), "settings.json.migrated-keys");
 		await fs.rm(marker, { force: true });
 		await fs.mkdir(marker, { recursive: true });
 	};
@@ -63,7 +64,7 @@ let maxIterations: unknown = null;
 let maxReviewPassesPerLane: unknown = null;
 let gjcValueType: string | null = null;
 let configYmlRootType: string | null = null;
-const strictInvalidEvidencePath = path.resolve(projectDir, "state", "settings.json.strict-invalid");
+const strictInvalidEvidencePath = path.join(projectSharedStateRoot(cwd), "settings.json.strict-invalid");
 let strictInvalidEvidenceKeys: string[] = [];
 let strictInvalidEvidenceMalformed = false;
 if (await exists(strictInvalidEvidencePath)) {

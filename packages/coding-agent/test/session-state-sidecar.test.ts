@@ -8,7 +8,7 @@ import * as path from "node:path";
 import { postmortem } from "@gajae-code/utils";
 import { FileLockTestHooks, processStartTime } from "../src/config/file-lock";
 import { loadInstallationHostId } from "../src/config/machine-identity";
-import { sessionRuntimeDir } from "../src/gjc-runtime/session-layout";
+import { projectStateRoot, sessionRoot, sessionRuntimeDir } from "../src/gjc-runtime/session-layout";
 import { SessionStateLockUnavailableError, withSessionStateFileLock } from "../src/gjc-runtime/session-state-lock";
 import {
 	__sessionStateSidecarTestHooks,
@@ -348,7 +348,7 @@ describe("coordinator runtime state sidecar", () => {
 
 	it("ignores a session root removed between postmortem lock parent creation and acquisition", async () => {
 		const root = await tempRoot();
-		const stateFile = path.join(root, ".gjc", "_session-removed", "state", "runtime-state.json");
+		const stateFile = path.join(projectStateRoot(root), "_session-removed", "state", "runtime-state.json");
 		const sessionRoot = path.resolve(path.dirname(stateFile), "..");
 		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
 		let removed = false;
@@ -370,7 +370,7 @@ describe("coordinator runtime state sidecar", () => {
 	});
 	it("does not suppress a nested state lock failure while the owning session root remains", async () => {
 		const root = await tempRoot();
-		const sessionRoot = path.join(root, ".gjc", "_session-present");
+		const sessionRoot = path.join(projectStateRoot(root), "_session-present");
 		const stateFile = path.join(sessionRoot, "runtime", "nested", "runtime-state.json");
 		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
 		await fs.mkdir(sessionRoot, { recursive: true });
@@ -1596,14 +1596,13 @@ describe("coordinator runtime state sidecar", () => {
 		expect(await Bun.file(stateFile).text()).toBe(beforeRejectedWrite);
 	});
 
-	it("adopts a terminal foreign-workspace marker that travelled inside the current workspace", async () => {
-		// A session directory committed to version control reaches a second machine with a
-		// marker whose recorded cwd is the other platform's path. The marker is readable and
-		// terminal, and it now lives inside this workspace, so resuming here must not be
-		// refused as if the file were corrupt.
+	it("adopts a terminal foreign-workspace marker stored under the current workspace's state root", async () => {
+		// A marker whose recorded cwd is another platform's path, but which lives under this
+		// workspace's project state root, is readable and terminal, so resuming here must not
+		// be refused as if the file were corrupt.
 		const root = await tempRoot();
 		const sessionId = "travelled-session";
-		const runtimeDir = path.join(root, ".gjc", `_session-${sessionId}`, "runtime");
+		const runtimeDir = path.join(projectStateRoot(root), `_session-${sessionId}`, "runtime");
 		await fs.mkdir(runtimeDir, { recursive: true });
 		const stateFile = path.join(runtimeDir, "runtime-state.json");
 		await Bun.write(
@@ -1644,7 +1643,7 @@ describe("coordinator runtime state sidecar", () => {
 			{ state: "running", live: false },
 		]) {
 			const root = await tempRoot();
-			const runtimeDir = path.join(root, ".gjc", `_session-${sessionId}`, "runtime");
+			const runtimeDir = path.join(projectStateRoot(root), `_session-${sessionId}`, "runtime");
 			await fs.mkdir(runtimeDir, { recursive: true });
 			const stateFile = path.join(runtimeDir, "runtime-state.json");
 			await Bun.write(
@@ -3191,7 +3190,9 @@ describe("coordinator runtime state sidecar", () => {
 		await fs.mkdir(launcher);
 		await fs.mkdir(target);
 		await fs.mkdir(outside);
-		await fs.symlink(outside, path.join(target, ".gjc"));
+		const targetSessionRoot = sessionRoot(target, sessionId);
+		await fs.mkdir(path.dirname(targetSessionRoot), { recursive: true });
+		await fs.symlink(outside, targetSessionRoot);
 
 		await expect(
 			prepareCoordinatorRuntimeStateRescope({
@@ -3203,7 +3204,7 @@ describe("coordinator runtime state sidecar", () => {
 			}),
 		).rejects.toThrow();
 
-		expect(fsSync.existsSync(path.join(outside, `_session-${sessionId}`, "runtime-state-rescope.json"))).toBe(false);
+		expect(fsSync.existsSync(path.join(outside, "runtime", "runtime-state-rescope.json"))).toBe(false);
 	});
 	it("issue-4629: preparing a new move never replaces an existing recovery journal", async () => {
 		delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];

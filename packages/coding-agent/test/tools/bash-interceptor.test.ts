@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentToolContext } from "@gajae-code/agent-core";
 import { validateToolArguments } from "@gajae-code/ai/utils/validation";
-import { sessionDirName } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { projectStateRoot, sessionDirName } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { Settings } from "../../src/config/settings";
 import { type BashInterceptorRule, DEFAULT_BASH_INTERCEPTOR_RULES } from "../../src/config/settings-schema";
 import { disposeAllShellSessions, getShellSessionCount } from "../../src/exec/bash-executor";
@@ -371,8 +371,7 @@ describe("BashTool restricted role-agent allowlist", () => {
 			expect(result.content.find(part => part.type === "text")?.text).toContain("stage-01-critic.md");
 			const persisted = await fs.readFile(
 				path.join(
-					root,
-					".gjc",
+					projectStateRoot(root),
 					sessionDirName("restricted-bash-test"),
 					"plans",
 					"ralplan",
@@ -404,8 +403,7 @@ describe("BashTool restricted role-agent allowlist", () => {
 			expect(result.content.find(part => part.type === "text")?.text).toContain("stage-01-architect.md");
 			const persisted = await fs.readFile(
 				path.join(
-					root,
-					".gjc",
+					projectStateRoot(root),
 					sessionDirName("restricted-bash-test"),
 					"plans",
 					"ralplan",

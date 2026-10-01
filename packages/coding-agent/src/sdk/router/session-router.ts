@@ -2,6 +2,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
+import { projectSharedStateRoot } from "../../gjc-runtime/session-layout";
 import { endpointIncarnation, matchesIndexedEndpointFile } from "../broker/endpoint-authority";
 import {
 	canonicalSessionCwd,
@@ -810,7 +811,7 @@ export class SessionRouter {
 				"Broker lifecycle result omitted an exact session endpoint authority.",
 			);
 		const cwd = await canonicalSessionCwd(fallback.cwd);
-		const stateRoot = path.join(cwd, ".gjc", "state");
+		const stateRoot = projectSharedStateRoot(cwd, this.#agentDir);
 		const indexed: IndexedSession = {
 			sessionId,
 			locator: await resolveSessionLocator(cwd, stateRoot),
@@ -1448,7 +1449,7 @@ export class SessionRouter {
 	): Promise<{ endpoint: SdkSessionEndpoint; identity: SessionEndpointIdentity } | null> {
 		if (!isSessionAuthorityEligible(indexed)) return null;
 		const cwd = indexed.locator.cwd;
-		const defaultStateRoot = path.join(cwd, ".gjc", "state");
+		const defaultStateRoot = projectSharedStateRoot(cwd, this.#agentDir);
 		// Locator cwd is already canonical. `stateRoot` remains the host-provided
 		// authority path, so this comparison resolves equivalent paths only for the
 		// state-root identity boundary; cwd never retains lexical symlink spellings.
@@ -1460,9 +1461,9 @@ export class SessionRouter {
 					? "chat"
 					: undefined;
 		if (!scope || indexed.endpointMtimeMs === undefined || !Number.isFinite(indexed.endpointMtimeMs)) return null;
-		const endpointPath = path.join(endpointDirectory(cwd, scope), `${indexed.sessionId}.json`);
+		const endpointPath = path.join(endpointDirectory(cwd, scope, this.#agentDir), `${indexed.sessionId}.json`);
 		const endpointIdentity = await lstatEndpoint(endpointPath);
-		const endpoint = await readSdkSessionEndpoint(cwd, indexed.sessionId, scope);
+		const endpoint = await readSdkSessionEndpoint(cwd, indexed.sessionId, scope, this.#agentDir);
 		if (!endpoint || endpoint.stale || endpoint.pid !== indexed.pid) return null;
 		if (!endpointIdentity || !matchesIndexedEndpointFile(endpointIdentity, indexed)) return null;
 		// Identity is proven INSIDE this authority read (#4730 review): sampling it

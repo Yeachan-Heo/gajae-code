@@ -2,6 +2,7 @@ import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import * as brokerEnsure from "../src/sdk/broker/ensure";
 import { resolveSessionLocator } from "../src/sdk/broker/session-index";
 import { resolveScopeRequest } from "../src/sdk/broker/session-scope";
@@ -313,7 +314,11 @@ describe("SessionLifecycleService", () => {
 					sessions: [
 						{
 							sessionId: "second",
-							locator: { cwd: "/workspace", worktreeRoot: null, stateRoot: "/workspace/.gjc/state" },
+							locator: {
+								cwd: "/workspace",
+								worktreeRoot: null,
+								stateRoot: projectSharedStateRoot("/workspace"),
+							},
 						},
 					],
 					warnings: ["second-page-warning"],
@@ -333,7 +338,7 @@ describe("SessionLifecycleService", () => {
 					{
 						sessionId: "second",
 						cwd: "/workspace",
-						locator: { cwd: "/workspace", worktreeRoot: null, stateRoot: "/workspace/.gjc/state" },
+						locator: { cwd: "/workspace", worktreeRoot: null, stateRoot: projectSharedStateRoot("/workspace") },
 					},
 				],
 				warnings: ["first-page-warning"],
@@ -407,7 +412,7 @@ describe("SessionLifecycleService", () => {
 		});
 	});
 	it("rejects mixed scope, exact path, and cursor list targets", async () => {
-		const anchor = await resolveSessionLocator(process.cwd(), path.join(process.cwd(), ".gjc", "state"));
+		const anchor = await resolveSessionLocator(process.cwd(), projectSharedStateRoot(process.cwd()));
 		const scope = {
 			version: 1 as const,
 			requested: "global" as const,
@@ -498,7 +503,7 @@ describe("SessionLifecycleService", () => {
 	});
 	it("rejects scoped pagination when a later page drifts from the frozen observation", async () => {
 		const { service, client } = serviceWith();
-		const anchor = await resolveSessionLocator(process.cwd(), path.join(process.cwd(), ".gjc", "state"));
+		const anchor = await resolveSessionLocator(process.cwd(), projectSharedStateRoot(process.cwd()));
 		const scopeRequest = {
 			version: 1 as const,
 			requested: "global" as const,
@@ -526,7 +531,7 @@ describe("SessionLifecycleService", () => {
 		expect(result).toMatchObject({ ok: false, certainty: "uncertain", error: { code: "scope_observation_drift" } });
 	});
 	it("maps malformed scoped locator rows to a malformed_response failure", async () => {
-		const anchor = await resolveSessionLocator(process.cwd(), path.join(process.cwd(), ".gjc", "state"));
+		const anchor = await resolveSessionLocator(process.cwd(), projectSharedStateRoot(process.cwd()));
 		const scopeRequest = {
 			version: 1 as const,
 			requested: "global" as const,
@@ -1081,7 +1086,7 @@ describe("SessionLifecycleService", () => {
 					target: {
 						sessionId: olderExact.sessionId,
 						cwd: "/workspace",
-						stateRoot: "/workspace/.gjc/state",
+						stateRoot: projectSharedStateRoot("/workspace", "/agent"),
 						sessionPath: olderExact.sessionStateFile,
 					},
 				}),
@@ -1174,7 +1179,7 @@ describe("SessionLifecycleService", () => {
 				}),
 			).resolves.toMatchObject({ ok: true });
 			expect(createSpy.mock.calls[0]?.[0]).toMatchObject({
-				target: { cwd: requested, stateRoot: path.join(requested, ".gjc", "state") },
+				target: { cwd: requested, stateRoot: projectSharedStateRoot(requested, root) },
 			});
 			const createRequest = createSpy.mock.calls[0]?.[0];
 			expect(createRequest?.timeoutMs).toBe(
@@ -1213,7 +1218,7 @@ describe("SessionLifecycleService", () => {
 		const target: SessionReconcileUncertainTarget = {
 			sessionId: "retired-session",
 			cwd: "/tmp/workspace",
-			stateRoot: "/tmp/workspace/.gjc/state",
+			stateRoot: projectSharedStateRoot("/tmp/workspace"),
 			endpointGeneration: 2,
 			endpointMtimeMs: 1,
 			processIncarnation: "linux:123",
@@ -1264,7 +1269,7 @@ describe("SessionLifecycleService", () => {
 			target: {
 				sessionId: "retired-session",
 				cwd: "/tmp/workspace",
-				stateRoot: "/tmp/workspace/.gjc/state",
+				stateRoot: projectSharedStateRoot("/tmp/workspace"),
 				endpointGeneration: 2,
 				endpointMtimeMs: 1,
 				processIncarnation: "linux:123",
@@ -1285,7 +1290,7 @@ describe("SessionLifecycleService", () => {
 				retired: true,
 				ledgerState: "terminal_error",
 				indexType: "session_closed",
-				stateRoot: "/tmp/workspace/.gjc/state",
+				stateRoot: projectSharedStateRoot("/tmp/workspace"),
 				endpointGeneration: 2,
 				endpointMtimeMs: 1,
 				processIncarnation: "linux:123",
@@ -1301,7 +1306,7 @@ describe("SessionLifecycleService", () => {
 			target: {
 				sessionId: "retired.session",
 				cwd: "/tmp/workspace/../workspace",
-				stateRoot: "/tmp/workspace/../workspace/.gjc/state",
+				stateRoot: `${projectSharedStateRoot("/tmp/workspace")}/../state`,
 				endpointGeneration: 2,
 				endpointMtimeMs: 1,
 				processIncarnation: "linux:123",
@@ -1313,7 +1318,7 @@ describe("SessionLifecycleService", () => {
 		expect(result).toMatchObject({ ok: true, result: { sessionId: "retired.session" } });
 		expect(client.calls[0]?.input).toMatchObject({
 			cwd: "/tmp/workspace",
-			stateRoot: "/tmp/workspace/.gjc/state",
+			stateRoot: projectSharedStateRoot("/tmp/workspace"),
 		});
 	});
 });

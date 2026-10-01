@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Settings } from "../src/config/settings";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { getNotificationConfig } from "../src/sdk/bus/config";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
 import type { NotificationSessionContext } from "../src/sdk/bus/session-control";
@@ -219,7 +220,7 @@ async function bootSession(
 	});
 	await handlers.get("session_start")!({ type: "session_start" }, ctx);
 	await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
-	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sid}.json`);
+	const endpointFile = path.join(projectSharedStateRoot(cwd, agentDir), "sdk", `${sid}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), 4000, "endpoint file");
 	const { url, token } = readTestSdkEndpoint(endpointFile);
 

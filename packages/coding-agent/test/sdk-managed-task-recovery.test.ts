@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { projectSharedStateRoot } from "../src/gjc-runtime/session-layout";
 import { Broker } from "../src/sdk/broker/broker";
 import { readBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
@@ -92,7 +93,7 @@ async function attest(broker: Broker, cwd: string): Promise<void> {
 		await broker.index.append({
 			type: "host_registered",
 			sessionId: ownerId,
-			locator: { cwd, worktreeRoot: null, stateRoot: path.join(cwd, ".gjc", "state") },
+			locator: { cwd, worktreeRoot: null, stateRoot: projectSharedStateRoot(cwd) },
 			endpointGeneration,
 			pid: process.pid,
 			hostIncarnation: incarnation,
@@ -501,7 +502,7 @@ describe("managed native recovery (M3)", () => {
 				endpointPid: 8989,
 				endpointIncarnation: "inc-8989",
 				endpointCwd: root,
-				endpointStateRoot: path.join(root, ".gjc", "state"),
+				endpointStateRoot: projectSharedStateRoot(root),
 				closeState: "active",
 				createdAt: probeAt,
 				updatedAt: probeAt,
@@ -686,7 +687,7 @@ describe("managed native recovery (M3)", () => {
 				endpointPid: 9898,
 				endpointIncarnation: "inc-9898",
 				endpointCwd: root,
-				endpointStateRoot: path.join(root, ".gjc", "state"),
+				endpointStateRoot: projectSharedStateRoot(root),
 				closeState: "active",
 				createdAt: authorityNow,
 				updatedAt: authorityNow,
