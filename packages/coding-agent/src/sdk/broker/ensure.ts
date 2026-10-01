@@ -19,6 +19,7 @@ import {
 	resolveSdkInternalSpawnCommand,
 	type SdkInternalSpawnCommand,
 } from "./runtime";
+import { observeProcessIncarnation } from "./process-incarnation";
 import {
 	BrokerStartupError,
 	type BrokerStartupFailureMarker,
@@ -369,6 +370,7 @@ interface BrokerOwner {
 	stop(): Promise<void>;
 	canReuse(discovery: BrokerDiscovery | null): boolean;
 	markReady(discovery: BrokerDiscovery): boolean;
+	setTarget(pid: number, incarnation: string): void;
 }
 type EnsureInitiator = "discovery" | "fixture-lease";
 type EnsureOutcome =
@@ -453,25 +455,59 @@ async function reapSpawnedBroker(child: ChildProcess, timing: ReapTiming = DEFAU
 	throw new Error(`Detached SDK broker (pid ${child.pid}) did not exit after SIGKILL during reap.`);
 }
 
+async function reapSpawnedBrokerIdentity(
+	pid: number,
+	incarnation: string,
+	timing: ReapTiming = DEFAULT_REAP_TIMING,
+): Promise<void> {
+	const matches = (): boolean => {
+		const observed = observeProcessIncarnation(pid);
+		return observed.status === "present" && observed.incarnation === incarnation;
+	};
+	const gone = (): boolean => observeProcessIncarnation(pid).status === "absent";
+	const signal = (sig: NodeJS.Signals): void => {
+		if (!matches()) return;
+		try {
+			process.kill(pid, sig);
+		} catch {
+			// already exited between identity check and signal delivery
+		}
+	};
+	if (gone() || !matches()) return;
+	signal("SIGTERM");
+	await Promise.race([waitForProcessAbsence(pid), sleep(timing.gracefulMs)]);
+	if (gone()) return;
+	signal("SIGKILL");
+	await Promise.race([waitForProcessAbsence(pid), sleep(timing.killVerifyMs)]);
+	if (!gone()) throw new Error(`Detached SDK broker (pid ${pid}) did not exit after SIGKILL during reap.`);
+}
+
+async function waitForProcessAbsence(pid: number): Promise<void> {
+	while (observeProcessIncarnation(pid).status !== "absent") await Bun.sleep(10);
+}
+
 function registerBrokerOwner(
 	agentDir: string,
 	child: ChildProcess,
 	timing: ReapTiming = DEFAULT_REAP_TIMING,
 ): BrokerOwner {
-	const incarnation = child.pid === undefined ? undefined : brokerProcessIncarnation(child.pid);
+	let targetPid = child.pid;
+	let targetIncarnation = child.pid === undefined ? undefined : brokerProcessIncarnation(child.pid);
 	let state: "starting" | "ready" | "cleanup-unverified" = "starting";
 	const matches = (discovery: BrokerDiscovery | null): boolean =>
 		Boolean(
 			discovery &&
-				child.pid !== undefined &&
-				incarnation &&
-				discovery.pid === child.pid &&
-				discovery.incarnation === incarnation,
+				targetPid !== undefined &&
+				targetIncarnation !== undefined &&
+				discovery.pid === targetPid &&
+				discovery.incarnation === targetIncarnation,
 		);
 	const owner: BrokerOwner = {
 		async stop(): Promise<void> {
 			try {
-				await reapSpawnedBroker(child, timing);
+				if (targetPid !== undefined && targetIncarnation !== undefined && targetPid !== child.pid)
+					await reapSpawnedBrokerIdentity(targetPid, targetIncarnation, timing);
+				else await reapSpawnedBroker(child, timing);
 			} catch (error) {
 				state = "cleanup-unverified";
 				throw error;
@@ -485,6 +521,10 @@ function registerBrokerOwner(
 			if (!matches(discovery)) return false;
 			state = "ready";
 			return true;
+		},
+		setTarget(pid, incarnation): void {
+			targetPid = pid;
+			targetIncarnation = incarnation;
 		},
 	};
 	owners.set(agentDir, owner);
@@ -688,7 +728,11 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		// that finished between our first read and the lock acquisition.
 		const discoveredUnderLock = await reconcileBrokerGenerationForStartup(settings, deadline);
 		if (discoveredUnderLock) return { kind: "external-discovery", discovery: discoveredUnderLock };
-		const command = resolveSdkInternalSpawnCommand("broker-internal");
+		const command = resolveSdkInternalSpawnCommand(
+			process.platform === "win32" || initiator === "fixture-lease"
+				? "broker-internal"
+				: "broker-trampoline-internal",
+		);
 		spawnLog = await openBrokerSpawnLog(settings.agentDir);
 		// A stale marker must never be misattributed to this spawn; clear it first.
 		await clearBrokerStartupExitRecord(settings.agentDir);
@@ -696,7 +740,7 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		const childSpawnedAt = Date.now();
 		const child = spawn(command.file, [...command.args, "--agent-dir", settings.agentDir], {
 			detached: true,
-			stdio: ["ignore", "ignore", spawnLog ? spawnLog.handle.fd : "ignore"],
+			stdio: ["ignore", process.platform === "win32" ? "ignore" : "pipe", spawnLog ? spawnLog.handle.fd : "ignore"],
 			env: brokerSpawnEnvironment(command, settings.env),
 			...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
 		});
@@ -704,15 +748,33 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		child.once("error", error => {
 			spawnError = error;
 		});
-		const childIncarnation = child.pid === undefined ? undefined : brokerProcessIncarnation(child.pid);
+		let spawnedBrokerPid = child.pid;
+		let spawnedBrokerIncarnation = child.pid === undefined ? undefined : brokerProcessIncarnation(child.pid);
 		const owner = registerBrokerOwner(settings.agentDir, child);
+		if (process.platform !== "win32" && child.stdout) {
+			let output = "";
+			child.stdout.on("data", chunk => {
+				output += Buffer.from(chunk).toString("utf8");
+				const line = output.split("\n", 1)[0]?.trim();
+				const [rawPid, rawIncarnation] = line?.split("\t") ?? [];
+				const pid = rawPid ? Number(rawPid) : NaN;
+				if (!Number.isSafeInteger(pid) || pid <= 0) return;
+				const incarnation = rawIncarnation || brokerProcessIncarnation(pid);
+				if (incarnation) {
+					spawnedBrokerPid = pid;
+					spawnedBrokerIncarnation = incarnation;
+					owner.setTarget(pid, incarnation);
+				}
+			});
+		}
 		child.unref();
 		// The child holds its own duplicate of the descriptor. Failure to close the
 		// parent's diagnostic handle must not discard exact ownership of a live child.
 		await spawnLog?.handle.close().catch(() => undefined);
 		let discoveryError: unknown;
 		while (ensureBrokerTiming.now() < deadline) {
-			if (spawnError || child.exitCode !== null || child.signalCode !== null) break;
+			if (spawnError || (process.platform === "win32" && (child.exitCode !== null || child.signalCode !== null)))
+				break;
 			try {
 				const discovered = await readBrokerDiscoveryBeforeDeadline(
 					settings.agentDir,
@@ -737,7 +799,8 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 			}
 			await ensureBrokerTiming.sleep(50);
 		}
-		const exitedBeforeDiscovery = child.exitCode !== null || child.signalCode !== null;
+		const exitedBeforeDiscovery =
+			process.platform === "win32" && (child.exitCode !== null || child.signalCode !== null);
 		if (exitedBeforeDiscovery && child.exitCode === 0) {
 			// A clean exit means another broker won the ownership lock (two ACP
 			// processes racing a cold broker state, e.g. a provider probe and an
@@ -765,16 +828,16 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		const startupExitRecord = await readBrokerStartupExitRecord(settings.agentDir);
 		const trustedMarker =
 			marker &&
-			child.pid !== undefined &&
-			childIncarnation !== undefined &&
-			marker.pid === child.pid &&
-			marker.incarnation === childIncarnation
+			spawnedBrokerPid !== undefined &&
+			spawnedBrokerIncarnation !== undefined &&
+			marker.pid === spawnedBrokerPid &&
+			marker.incarnation === spawnedBrokerIncarnation
 				? marker
 				: undefined;
 		const trustedStartupExitRecord =
 			startupExitRecord &&
-			child.pid !== undefined &&
-			startupExitRecord.pid === child.pid &&
+			spawnedBrokerPid !== undefined &&
+			startupExitRecord.pid === spawnedBrokerPid &&
 			startupExitRecord.writtenAt >= childSpawnedAt
 				? startupExitRecord
 				: undefined;

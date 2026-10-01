@@ -61,7 +61,9 @@ export async function launchAuthorizedBrokerSuccessor(
 			existing.restartRequestId === options.requestId
 		)
 			return { kind: "adopted" as const, discovery: existing };
-		const command = resolveSdkInternalSpawnCommand("broker-internal");
+		const command = resolveSdkInternalSpawnCommand(
+			process.platform === "win32" ? "broker-internal" : "broker-trampoline-internal",
+		);
 		let child: ChildProcess;
 		try {
 			child = spawn(command.file, [...command.args, "--agent-dir", options.agentDir], {
@@ -94,7 +96,7 @@ export async function launchAuthorizedBrokerSuccessor(
 				reason: "spawn_failed",
 				detail: spawnOutcome.spawnError()?.message,
 			};
-		if (child.exitCode !== null || child.signalCode !== null)
+		if (process.platform === "win32" && (child.exitCode !== null || child.signalCode !== null))
 			return { kind: "refused", reason: "spawn_exited_before_publication" };
 		const discovered = await readBrokerDiscovery(options.agentDir);
 		if (
