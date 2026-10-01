@@ -236,6 +236,8 @@ import {
 import {
 	commitDurableModelProfileOwnership,
 	type DurableModelProfileOwnership,
+	InvalidModelProfileOwnershipError,
+	ModelProfileOwnershipConflictError,
 	type ModelProfileOwnershipMarker,
 	modelProfileOwnershipMarkersEqual,
 	readDurableModelProfileOwnership,
@@ -18547,7 +18549,12 @@ export class AgentSession {
 			this.setThinkingLevel(thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel);
 			if (options?.persistAsSessionDefault === true && options.cause !== "profile-activation") {
 				// Concrete model selection clears session-scoped profile state (#5919).
-				this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: true, force: true });
+				// Materialize durable profiles first (if persisted and active), then reset
+				// without force to preserve durable semantics.
+				if (this.model && this.settings.get("modelProfile.default") !== undefined) {
+					this.materializeActiveDefaultModelProfileAssignment(this.model);
+				}
+				this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: true });
 				const origin = options.cause === "startup-override" ? "startup-override" : "model_selection";
 				const effectiveLevel = thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel;
 				this.setConfiguredModelChain(
@@ -18650,7 +18657,12 @@ export class AgentSession {
 		// IMPORTANT: This is called AFTER durable persistence completes, so the
 		// session-scoped updates occur during the promotion phase after ownership
 		// is committed. Session ownership is captured in the promotion logic above.
-		this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: true, force: true });
+		// Materialize durable profiles first (if persisted and active), then reset
+		// without force to preserve durable semantics.
+		if (this.model && this.settings.get("modelProfile.default") !== undefined) {
+			this.materializeActiveDefaultModelProfileAssignment(this.model);
+		}
+		this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: true });
 		this.#setModelWithProviderSessionReset(model);
 		this.#seedSessionCanonicalVariant(model);
 		const thinkingLevelChanged = this.#thinkingLevel !== thinkingLevel;
@@ -18848,13 +18860,28 @@ export class AgentSession {
 						}
 					}
 					// Concrete model selection clears durable profile ownership (#5919).
+					// The ownership clear is attempted atomically with other model role updates.
+					// If it fails due to concurrent access, we log and continue: the model
+					// selection has been promoted and committed, so the concrete pick is durable.
+					// A stale profile ownership marker will be resolved on the next session startup.
 					try {
 						await commitDurableModelProfileOwnership(this.settings, { kind: "cleared" });
 					} catch (error) {
-						logger.warn("Failed to commit cleared durable profile ownership after model selection", {
-							code: "default_model_selection_ownership_commit_failed",
-							disposition: "continue",
-						});
+						if (error instanceof ModelProfileOwnershipConflictError) {
+							logger.info("Model selection ownership clear deferred due to concurrent access", {
+								code: "default_model_selection_ownership_conflict",
+								disposition: "continue",
+								expectedVersion: error.expectedVersion,
+								actualVersion: error.actualVersion,
+							});
+						} else if (error instanceof InvalidModelProfileOwnershipError) {
+							logger.warn("Invalid model profile ownership marker during selection", {
+								code: "default_model_selection_ownership_invalid",
+								disposition: "continue",
+							});
+						} else {
+							throw error;
+						}
 					}
 					options?.onAfterMutation?.();
 					return { provider: model.provider, modelId: model.id, thinkingLevel: effectiveLevel };
