@@ -8,18 +8,21 @@ import { runSSHCommand } from "../../src/cli/ssh-cli";
 const originalProjectDir = getProjectDir();
 let tempDir: TempDir | null = null;
 let stdout: string[] = [];
+let writeSpy: ReturnType<typeof spyOn<typeof process.stdout, "write">> | undefined;
 
 beforeEach(() => {
 	tempDir = TempDir.createSync(path.join(os.tmpdir(), "gjc-ssh-cli-port-"));
 	setProjectDir(tempDir.path());
 	stdout = [];
-	spyOn(process.stdout, "write").mockImplementation(chunk => {
+	writeSpy = spyOn(process.stdout, "write").mockImplementation(chunk => {
 		stdout.push(String(chunk));
 		return true;
 	});
 });
 
 afterEach(() => {
+	writeSpy?.mockRestore();
+	writeSpy = undefined;
 	process.exitCode = 0;
 	setProjectDir(originalProjectDir);
 	tempDir?.removeSync();
