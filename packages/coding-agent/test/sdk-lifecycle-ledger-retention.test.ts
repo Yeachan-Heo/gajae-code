@@ -8,13 +8,24 @@ async function temporaryAgentDir(prefix: string): Promise<string> {
 }
 
 async function recordTerminalOk(ledger: LifecycleLedger, identity: string): Promise<void> {
-	await ledger.begin(identity, `${identity}-request`);
+	await ledger.begin(identity, `${identity}-request`, {
+		operationKey: `test.operation\u0000${identity}`,
+		fingerprint: `${identity}-fingerprint`,
+	});
 	await ledger.transition(identity, "terminal_ok", { response: { ok: true, identity } });
 }
 
 async function recordTerminalError(ledger: LifecycleLedger, identity: string): Promise<void> {
-	await ledger.begin(identity, `${identity}-request`);
+	await ledger.begin(identity, `${identity}-request`, {
+		operationKey: `test.operation\u0000${identity}`,
+		fingerprint: `${identity}-fingerprint`,
+	});
 	await ledger.transition(identity, "terminal_error", { response: { ok: false, identity } });
+}
+
+async function recordLegacyTerminalOk(ledger: LifecycleLedger, identity: string): Promise<void> {
+	await ledger.begin(identity, `${identity}-request`);
+	await ledger.transition(identity, "terminal_ok", { response: { ok: true, identity } });
 }
 
 function retirementResponse(createIdentity: string): {
@@ -91,12 +102,63 @@ describe("LifecycleLedger retention", () => {
 		}
 	});
 
+	it("retains metadata-free terminal legacy identities under pressure", async () => {
+		const agentDir = await temporaryAgentDir("gjc-ledger-retention-legacy-terminal-");
+		try {
+			const ledger = await new LifecycleLedger(agentDir, { maxRows: 4 }).open();
+			await recordLegacyTerminalOk(ledger, "legacy-terminal");
+			for (let index = 1; index <= 8; index += 1) await recordTerminalOk(ledger, `traffic-${index}`);
+
+			const reopened = await new LifecycleLedger(agentDir, { maxRows: 4 }).open();
+			expect(reopened.get("legacy-terminal")?.state).toBe("terminal_ok");
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("retains partial metadata terminal identities under pressure", async () => {
+		const agentDir = await temporaryAgentDir("gjc-ledger-retention-partial-metadata-");
+		try {
+			const ledger = await new LifecycleLedger(agentDir, { maxRows: 4 }).open();
+			await ledger.begin("partial-metadata", "partial-request", { operationKey: "test.operation\u0000partial" });
+			await ledger.transition("partial-metadata", "terminal_ok", { response: { ok: true } });
+			for (let index = 1; index <= 8; index += 1) await recordTerminalOk(ledger, `traffic-${index}`);
+
+			const reopened = await new LifecycleLedger(agentDir, { maxRows: 4 }).open();
+			expect(reopened.get("partial-metadata")?.state).toBe("terminal_ok");
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps a legacy close fence through successor admission and delayed retry", async () => {
+		const agentDir = await temporaryAgentDir("gjc-ledger-retention-legacy-close-retry-");
+		try {
+			const ledger = await new LifecycleLedger(agentDir, { maxRows: 4 }).open();
+			const closeResponse = { ok: true, result: { sessionId: "S" } };
+			await ledger.begin("legacy-close-S", "legacy-close-S-request");
+			await ledger.transition("legacy-close-S", "terminal_ok", { response: closeResponse });
+			for (let index = 1; index <= 8; index += 1) await recordTerminalOk(ledger, `traffic-${index}`);
+
+			expect(ledger.hasLegacyIdentity()).toBe(true);
+			await ledger.begin("successor-create-S", "successor-create-request", {
+				operationKey: "session.create\u0000successor",
+				fingerprint: "successor-fingerprint",
+			});
+			expect(await ledger.begin("legacy-close-S", "legacy-close-S-request")).toMatchObject({ kind: "replay" });
+			expect(ledger.get("legacy-close-S")?.response).toEqual(closeResponse);
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
 	it("evicts settled generation-bound closes under capacity pressure", async () => {
 		const agentDir = await temporaryAgentDir("gjc-ledger-retention-bound-close-");
 		try {
 			const ledger = await new LifecycleLedger(agentDir, { maxRows: 4 }).open();
 			await ledger.begin("bound-close", "close-request", {
 				operationKey: "session.close\u0000close-key",
+				fingerprint: "close-fingerprint",
 				closeAuthorityBound: true,
 			});
 			await ledger.transition("bound-close", "terminal_ok", { response: { ok: true } });
@@ -204,13 +266,44 @@ describe("LifecycleLedger retention", () => {
 			const renameSpy = vi
 				.spyOn(fs, "rename")
 				.mockRejectedValueOnce(new Error("simulated compaction write failure"));
-			expect(recordTerminalOk(ledger, "failing-3")).rejects.toThrow("simulated compaction write failure");
+			await expect(recordTerminalOk(ledger, "failing-3")).rejects.toThrow("simulated compaction write failure");
 			renameSpy.mockRestore();
 
 			const reopened = await new LifecycleLedger(agentDir, { maxRows: 4 }).open();
 			expect(reopened.get("original-1")?.state).toBe("terminal_ok");
 			expect(reopened.get("original-2")?.state).toBe("terminal_ok");
 			expect(reopened.get("failing-3")).toBeUndefined();
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("retains legacy fences when capacity has no evictable rows", async () => {
+		const agentDir = await temporaryAgentDir("gjc-ledger-retention-capacity-fail-closed-");
+		try {
+			const ledger = await new LifecycleLedger(agentDir, { maxRows: 4 }).open();
+			await recordLegacyTerminalOk(ledger, "legacy-1");
+			await recordLegacyTerminalOk(ledger, "legacy-2");
+			await expect(recordLegacyTerminalOk(ledger, "legacy-3")).rejects.toThrow(
+				"Lifecycle ledger append exceeds configured bounds.",
+			);
+			expect(ledger.get("legacy-1")?.state).toBe("terminal_ok");
+			expect(ledger.get("legacy-2")?.state).toBe("terminal_ok");
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("replays a retained legacy fence instead of duplicating a late terminal result", async () => {
+		const agentDir = await temporaryAgentDir("gjc-ledger-retention-late-legacy-result-");
+		try {
+			const ledger = await new LifecycleLedger(agentDir, { maxRows: 4 }).open();
+			await recordLegacyTerminalOk(ledger, "late-legacy");
+			for (let index = 1; index <= 8; index += 1) await recordTerminalOk(ledger, `traffic-${index}`);
+			expect(await ledger.begin("late-legacy", "late-legacy-request")).toMatchObject({ kind: "replay" });
+
+			const reopened = await new LifecycleLedger(agentDir, { maxRows: 4 }).open();
+			expect(reopened.get("late-legacy")?.state).toBe("terminal_ok");
 		} finally {
 			await fs.rm(agentDir, { recursive: true, force: true });
 		}

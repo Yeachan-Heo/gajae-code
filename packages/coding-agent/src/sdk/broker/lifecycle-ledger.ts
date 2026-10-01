@@ -699,7 +699,9 @@ export class LifecycleLedger {
 					latest =>
 						latest.identity !== replacement?.identity &&
 						terminal(latest.state) &&
-						!(latest.operationKey?.startsWith("session.close\u0000") && latest.closeAuthorityBound !== true) &&
+						latest.operationKey !== undefined &&
+						latest.fingerprint !== undefined &&
+						(!latest.operationKey.startsWith("session.close\u0000") || latest.closeAuthorityBound === true) &&
 						!protectedCreateIdentities.has(latest.identity) &&
 						pendingCleanupSessionId(latest.response) === undefined &&
 						pendingCleanupSessionId(latest.unresolvedCleanupResponse) === undefined,
