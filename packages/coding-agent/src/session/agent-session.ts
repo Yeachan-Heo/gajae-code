@@ -5079,26 +5079,6 @@ export class AgentSession {
 		this.#startAgentEndPublication(pending, lease);
 	}
 
-	#flushPendingAgentEndAfterCompaction(): void {
-		// Do not publish if the agent_end is being held for a continuation (this should have been checked before calling this).
-		if (this.#pendingAgentEndContinuationHolds.size > 0) {
-			return;
-		}
-		// Do not publish if there are live prompts in flight.
-		if (this.#livePromptsInFlight() > 0) {
-			return;
-		}
-		const pending = this.#pendingAgentEndEmit;
-		if (!pending) {
-			return;
-		}
-		// Publish the pending agent_end even though handlers are still in flight, because we're inside
-		// the compaction flow and need to ensure the run settles for the next prompt (#6004).
-		this.#pendingAgentEndEmit = undefined;
-		const lease = this.#deferredAgentEndLeases.get(pending);
-		if (lease) this.#deferredAgentEndLeases.delete(pending);
-		this.#startAgentEndPublication(pending, lease);
-	}
 	#startAgentEndPublication(pending: AgentSessionEvent, lease?: RunResourceProducerLease): void {
 		this.#agentEndPublicationInFlight++;
 		const pendingScope = (pending as AgentSessionEvent & { scope?: AttemptScopeRef }).scope as
@@ -16434,12 +16414,6 @@ export class AgentSession {
 			);
 		}
 
-		// After compaction resets the message history, flush any pending agent_end event
-		// that may have been parked before or during compaction. This ensures that a
-		// pending terminal event doesn't cause the next prompt to fail with
-		// "Timed out waiting for prior agent run to finish" (#6004).
-		this.#flushPendingAgentEnd();
-
 		return savedCompactionEntry;
 	}
 
@@ -22766,15 +22740,6 @@ export class AgentSession {
 					? await this.#scheduleOverflowRetryContinuation(generation, options?.resourceRunId)
 					: false;
 
-			// If no continuation is scheduled, publish any pending agent_end that was parked during compaction.
-			// This ensures the run settles properly for the next prompt (#6004).
-			// Note: The threshold path and other non-overflow paths will publish the pending agent_end
-			// through the normal handler unwinding at line 7038, but for overflow recovery with continuation,
-			// we must NOT publish here because the agent_end is reserved for the continuation.
-			if (!overflowContinuationScheduled && willRetry) {
-				this.#flushPendingAgentEndAfterCompaction();
-			}
-
 			await this.#emitSessionEvent({
 				type: "auto_compaction_end",
 				action,
@@ -22783,6 +22748,15 @@ export class AgentSession {
 				willRetry: overflowContinuationScheduled,
 				continuationSkipReason,
 			});
+
+			// After auto_compaction_end has been emitted and handlers have run, publish any pending agent_end
+			// that was parked during overflow compaction. This ensures the run settles properly for the next
+			// prompt (#6004), now that the handler barrier is properly in place and the transition has unwound.
+			// Only do this for overflow cases without continuation scheduled.
+			if (!overflowContinuationScheduled && willRetry) {
+				this.#flushPendingAgentEnd();
+			}
+
 			if (autoCompactionSignal.aborted) return { kind: "aborted", source: "signal" };
 
 			if (willRetry) {
