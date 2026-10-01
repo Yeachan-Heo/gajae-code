@@ -123,6 +123,7 @@ export async function createLifecycleAgentSession(
 			// inside the broker's readiness window is what kills the child at the
 			// cutoff; the host resumes it once readiness is published.
 			deferMemoryBackendStartup: true,
+			deferOptionalModelRefresh: true,
 			[lifecycleStartupCapabilityOption]: capability,
 			...(mcpStartupTimeoutMs !== undefined ? { [lifecycleMcpStartupTimeoutOption]: mcpStartupTimeoutMs } : {}),
 		} as CreateAgentSessionOptions & {
