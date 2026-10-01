@@ -416,7 +416,7 @@ async function reapSpawnedBroker(child: ChildProcess, timing: ReapTiming = DEFAU
 	// listener for the retained child so a later signal-delivery error cannot
 	// become an unhandled EventEmitter error after the spawn listener is consumed.
 	if (!reapErrorGuards.has(child)) {
-		child.on("error", () => {});
+		child.on("error", () => { });
 		reapErrorGuards.add(child);
 	}
 
@@ -474,9 +474,10 @@ async function reapSpawnedBrokerIdentity(
 		}
 	};
 	if (gone() || !matches()) return;
-	signal("SIGTERM");
-	await Promise.race([waitForProcessAbsence(pid), sleep(timing.gracefulMs)]);
-	if (gone()) return;
+	// A reported trampoline has already detached this broker from the retained
+	// child handle, so graceful shutdown cannot be observed or reaped reliably.
+	// Force termination keeps discovery-timeout cleanup within its caller's
+	// bounded deadline while the identity check still prevents PID reuse.
 	signal("SIGKILL");
 	await Promise.race([waitForProcessAbsence(pid), sleep(timing.killVerifyMs)]);
 	if (!gone()) throw new Error(`Detached SDK broker (pid ${pid}) did not exit after SIGKILL during reap.`);
@@ -497,10 +498,10 @@ function registerBrokerOwner(
 	const matches = (discovery: BrokerDiscovery | null): boolean =>
 		Boolean(
 			discovery &&
-				targetPid !== undefined &&
-				targetIncarnation !== undefined &&
-				discovery.pid === targetPid &&
-				discovery.incarnation === targetIncarnation,
+			targetPid !== undefined &&
+			targetIncarnation !== undefined &&
+			discovery.pid === targetPid &&
+			discovery.incarnation === targetIncarnation,
 		);
 	const owner: BrokerOwner = {
 		async stop(): Promise<void> {
@@ -599,15 +600,15 @@ async function retireUnusableBroker(
 		} finally {
 			await closeBrokerClientBeforeDeadline(client, deadline).catch(() => undefined);
 		}
-	} catch {}
+	} catch { }
 	if (!shutdownSucceeded) {
 		try {
 			if (brokerProcessIncarnation(stale.pid) === stale.incarnation) {
 				try {
 					process.kill(stale.pid, "SIGTERM");
-				} catch {}
+				} catch { }
 			}
-		} catch {}
+		} catch { }
 	}
 	// Wait for the stale identity to disappear (owner-fenced: pid+incarnation).
 	while (ensureBrokerTiming.now() < deadline) {
@@ -712,7 +713,7 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 	// waits for the exact lock generation to release, then rechecks discovery.
 	// Fixture leases always spawn their own.
 	let spawnLog: BrokerSpawnLog | undefined;
-	const releaseSpawnLock = initiator === "fixture-lease" ? async () => {} : await acquireSpawnLock(settings.agentDir);
+	const releaseSpawnLock = initiator === "fixture-lease" ? async () => { } : await acquireSpawnLock(settings.agentDir);
 	try {
 		const deadline =
 			ensureBrokerTiming.now() +
@@ -856,7 +857,10 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 			await ensureBrokerTiming.sleep(50);
 		}
 		const exitedBeforeDiscovery =
-			(isTrampoline && (childExited || brokerDeathObserved)) ||
+			(isTrampoline &&
+				(!trampolineReported ||
+					(childExited && (childExitCode !== 0 || childSignalCode !== null)) ||
+					brokerDeathObserved)) ||
 			(!isTrampoline && process.platform === "win32" && (child.exitCode !== null || child.signalCode !== null));
 		if (!isTrampoline && exitedBeforeDiscovery && childExitCode === 0) {
 			// A clean exit means another broker won the ownership lock (two ACP
@@ -885,17 +889,17 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		const startupExitRecord = await readBrokerStartupExitRecord(settings.agentDir);
 		const trustedMarker =
 			marker &&
-			spawnedBrokerPid !== undefined &&
-			spawnedBrokerIncarnation !== undefined &&
-			marker.pid === spawnedBrokerPid &&
-			marker.incarnation === spawnedBrokerIncarnation
+				spawnedBrokerPid !== undefined &&
+				spawnedBrokerIncarnation !== undefined &&
+				marker.pid === spawnedBrokerPid &&
+				marker.incarnation === spawnedBrokerIncarnation
 				? marker
 				: undefined;
 		const trustedStartupExitRecord =
 			startupExitRecord &&
-			spawnedBrokerPid !== undefined &&
-			startupExitRecord.pid === spawnedBrokerPid &&
-			startupExitRecord.writtenAt >= childSpawnedAt
+				spawnedBrokerPid !== undefined &&
+				startupExitRecord.pid === spawnedBrokerPid &&
+				startupExitRecord.writtenAt >= childSpawnedAt
 				? startupExitRecord
 				: undefined;
 		const startupLockPath = path.join(settings.agentDir, "sdk", STARTUP_LOCK_TARGET_NAME);
@@ -948,24 +952,24 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 			? new Error(`Failed to spawn detached SDK broker: ${spawnError.message}`)
 			: exitedBeforeDiscovery
 				? new BrokerStartupError({
-						exitCode: isTrampoline
-							? (trustedStartupExitRecord?.exitCode ??
-								trustedMarker?.exitCode ??
-								childExitCode ??
-								child.exitCode ??
-								null)
-							: (childExitCode ?? child.exitCode ?? trustedStartupExitRecord?.exitCode ?? null),
-						signal: isTrampoline
-							? (trustedStartupExitRecord?.signal ??
-								trustedMarker?.signal ??
-								childSignalCode ??
-								child.signalCode ??
-								null)
-							: (childSignalCode ?? child.signalCode ?? trustedStartupExitRecord?.signal ?? null),
-						reason:
-							brokerStartupExitReason(trustedStartupExitRecord) ?? brokerStartupFailureReason(trustedMarker),
-						stderrExcerpt: spawnLogTail.length > 0 ? spawnLogTail : undefined,
-					})
+					exitCode: isTrampoline
+						? (trustedStartupExitRecord?.exitCode ??
+							trustedMarker?.exitCode ??
+							childExitCode ??
+							child.exitCode ??
+							null)
+						: (childExitCode ?? child.exitCode ?? trustedStartupExitRecord?.exitCode ?? null),
+					signal: isTrampoline
+						? (trustedStartupExitRecord?.signal ??
+							trustedMarker?.signal ??
+							childSignalCode ??
+							child.signalCode ??
+							null)
+						: (childSignalCode ?? child.signalCode ?? trustedStartupExitRecord?.signal ?? null),
+					reason:
+						brokerStartupExitReason(trustedStartupExitRecord) ?? brokerStartupFailureReason(trustedMarker),
+					stderrExcerpt: spawnLogTail.length > 0 ? spawnLogTail : undefined,
+				})
 				: discoveryError
 					? discoveryError
 					: new Error("Timed out waiting for detached SDK broker discovery.");
@@ -987,7 +991,7 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 function startEnsure(settings: EnsureBrokerSettings, initiator: EnsureInitiator): EnsureInFlight {
 	const promise = ensureBrokerOnce(settings, initiator);
 	const discovery = promise.then(outcome => outcome.discovery);
-	void discovery.catch(() => {});
+	void discovery.catch(() => { });
 	const entry = { initiator, promise, discovery };
 	ensureInFlight.set(settings.agentDir, entry);
 	const clear = (): void => {
