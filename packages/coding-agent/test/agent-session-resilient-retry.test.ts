@@ -1508,6 +1508,55 @@ describe.serial("AgentSession resilient retry", () => {
 		await disposeAfterCoordinatorPersistence(session);
 		session = undefined;
 	});
+	it("surfaces Codex schema validation veto without a session replay", async () => {
+		const bundled = getBundledModel("openai-codex", "gpt-5.5");
+		if (!bundled) throw new Error("Expected bundled Codex test model to exist");
+		const model: Model<"openai-codex-responses"> = {
+			...bundled,
+			api: "openai-codex-responses",
+			baseUrl: "http://127.0.0.1:20339/backend-api",
+			preferWebsockets: false,
+		};
+		authStorage.setRuntimeApiKey(model.provider, "fake-key");
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (requestedModel, context, options) =>
+				streamOpenAICodexResponses({ ...model, id: requestedModel.id }, context, options ?? {}),
+		});
+		session = configureRetryTestSession(
+			new AgentSession({ agent, sessionManager: createRetryTestSessionManager(), settings, modelRegistry }),
+		);
+		let requests = 0;
+		const events = [
+			{ type: "response.created", response: { id: "r1", status: "in_progress", output: [] } },
+			{
+				type: "error",
+				code: "server_error",
+				message:
+					"Invalid schema for function 'computer': schema must have type 'object' and not have 'oneOf' at the top level. (code=invalid_function_parameters)",
+			},
+		];
+		vi.spyOn(globalThis, "fetch").mockImplementation((async () => {
+			requests++;
+			return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+				headers: { "content-type": "text/event-stream" },
+			});
+		}) as unknown as typeof fetch);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("surface Codex schema validation");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(0);
+		expect(requests).toBe(1);
+		expect(lastAssistant(session)).toMatchObject({ stopReason: "error" });
+		expect(lastAssistant(session).errorMessage).toContain("invalid_function_parameters");
+		await disposeAfterCoordinatorPersistence(session);
+		session = undefined;
+	});
 	it.each(["server_error", "internal_error"])("does not retry Codex %s after visible content", async code => {
 		const model = getBundledModel("openai-codex", "gpt-5.4-mini");
 		if (!model) throw new Error("Expected bundled Codex test model to exist");

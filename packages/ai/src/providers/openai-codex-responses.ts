@@ -2197,7 +2197,11 @@ async function handleCodexStreamFailure(
 			? error.code
 			: undefined;
 	output.transportFailure = typedProviderCode
-		? { ...(transportFailure ?? { kind: "transport" as const }), providerCode: typedProviderCode }
+		? {
+				...(transportFailure ?? { kind: "transport" as const }),
+				providerCode: typedProviderCode,
+				...(error instanceof CodexProviderStreamError && !error.retryable ? { retryMaxAttempts: 1 } : {}),
+			}
 		: transportFailure;
 	output.errorMessage = await finalizeErrorMessage(error, context.requestContext.rawRequestDump);
 	output.duration = Date.now() - context.startTime;
