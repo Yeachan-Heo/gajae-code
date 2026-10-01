@@ -1864,33 +1864,59 @@ export class AcpAgent implements Agent {
 		const mcpServers = this.#mcpServers(params);
 		this.#assertAbsoluteCwd(params.cwd);
 		this.#assertNoAdditionalDirectories(params.additionalDirectories);
-		const result = await this.#launchSessionWithMcp(
-			"session.create",
-			{
-				cwd: params.cwd,
-				target: { path: params.cwd },
-				...(this.#startupOptions?.modelPreset ? { modelPreset: this.#startupOptions.modelPreset } : {}),
-				readinessTimeoutMs: ACP_SESSION_READINESS_TIMEOUT_MS,
-				...(mcpServers.length > 0 ? { mcpServers } : {}),
-			},
-			randomUUID(),
-			mcpServers,
-		);
-		const id = sessionId(result);
-		this.#knownSessionCwds.set(id, params.cwd);
-		this.#knownSessionMcpServers.set(id, mcpServers);
-		// This connection launched the host, so it owns the broker lifecycle before the
-		// attachment reports a control surface. Without it a failed attach discards the
-		// session as unowned and masks the real error with cleanup uncertainty.
-		this.#ownedSessionIds.add(id);
+		const startedAt = performance.now();
+		const phases: Record<string, number> = {};
+		let id: string | undefined;
 		try {
+			let phaseStartedAt = performance.now();
+			const result = await this.#launchSessionWithMcp(
+				"session.create",
+				{
+					cwd: params.cwd,
+					target: { path: params.cwd },
+					...(this.#startupOptions?.modelPreset ? { modelPreset: this.#startupOptions.modelPreset } : {}),
+					readinessTimeoutMs: ACP_SESSION_READINESS_TIMEOUT_MS,
+					...(mcpServers.length > 0 ? { mcpServers } : {}),
+				},
+				randomUUID(),
+				mcpServers,
+			);
+			phases.launchMs = performance.now() - phaseStartedAt;
+			id = sessionId(result);
+			this.#knownSessionCwds.set(id, params.cwd);
+			this.#knownSessionMcpServers.set(id, mcpServers);
+			// This connection launched the host, so it owns the broker lifecycle before the
+			// attachment reports a control surface. Without it a failed attach discards the
+			// session as unowned and masks the real error with cleanup uncertainty.
+			this.#ownedSessionIds.add(id);
+			phaseStartedAt = performance.now();
 			await this.#attach(id, params.cwd, undefined, result);
+			phases.attachMs = performance.now() - phaseStartedAt;
+			phaseStartedAt = performance.now();
 			await applyAcpStartupOptions(this.#adapter(id), this.#startupOptions);
+			phases.startupOptionsMs = performance.now() - phaseStartedAt;
+			phaseStartedAt = performance.now();
 			const response = { sessionId: id, ...(await this.#sessionState(id, true)) };
+			phases.sessionStateMs = performance.now() - phaseStartedAt;
 			this.#scheduleBootstrap(id);
+			logger.debug("acp_session_new_phases", {
+				sessionId: id,
+				...phases,
+				outcome: "ok",
+				totalMs: performance.now() - startedAt,
+			});
 			return response;
 		} catch (error) {
-			await this.#discardNewSession(id);
+			try {
+				if (id !== undefined) await this.#discardNewSession(id);
+			} finally {
+				logger.debug("acp_session_new_phases", {
+					...(id !== undefined ? { sessionId: id } : {}),
+					...phases,
+					outcome: "error",
+					totalMs: performance.now() - startedAt,
+				});
+			}
 			throw error;
 		}
 	}
