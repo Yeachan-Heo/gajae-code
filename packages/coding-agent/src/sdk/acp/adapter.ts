@@ -5,6 +5,7 @@ import {
 	DEFAULT_SDK_REQUEST_TIMEOUT_MS,
 	type SdkClient,
 	SdkClientError,
+	SdkPreparedDispatchError,
 	type SdkDispatchContext,
 	type SdkSentRecord,
 } from "../client";
@@ -158,6 +159,24 @@ const ACP_MCP_PRESERVED_LAUNCH_CODES = new Set([
  * broker ERROR frames are also represented as SdkClientError instances with these same codes.
  */
 const ACP_MCP_PRESERVED_TRANSPORT_CODES = new Set(["connection_closed", "unavailable", "timeout"]);
+
+function replayFailedBeforeDispatch(error: unknown): boolean {
+	if (error instanceof SdkPreparedDispatchError) return true;
+	if (!(error instanceof SdkClientError)) return true;
+	if (!error.transport) return false;
+	if (error.code === "reconnect_exhausted" || error.code === "connection_closed" || error.code === "unavailable")
+		return true;
+	if (error.code !== "timeout") return false;
+	const details = object(error.details);
+	return details?.requestSent !== true;
+}
+
+function replayRefusedBeforeLedger(error: unknown): boolean {
+	if (!(error instanceof SdkClientError) || error.transport) return false;
+	// broker_restarting also covers an in-progress ledger row, where the original
+	// request remains unresolved; both responses must preserve sent uncertainty.
+	return error.code === "broker_restarting" || error.code === "unavailable";
+}
 
 function attachReplayRecovery(error: SdkClientError, recovery: unknown): void {
 	Object.assign(error, { recovery });
@@ -670,6 +689,7 @@ export class AcpSdkAdapter {
 					if (Date.now() >= deadline) throw firstError;
 					return result;
 				} catch (replayError) {
+					if (!replayFailedBeforeDispatch(replayError) && !replayRefusedBeforeLedger(replayError)) throw replayError;
 					attachReplayRecovery(firstError, replayError);
 					throw firstError;
 				}
