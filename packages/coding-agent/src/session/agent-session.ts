@@ -22749,14 +22749,6 @@ export class AgentSession {
 				continuationSkipReason,
 			});
 
-			// After auto_compaction_end has been emitted and handlers have run, publish any pending agent_end
-			// that was parked during overflow compaction. This ensures the run settles properly for the next
-			// prompt (#6004), now that the handler barrier is properly in place and the transition has unwound.
-			// Only do this for overflow cases without continuation scheduled.
-			if (!overflowContinuationScheduled && willRetry) {
-				this.#flushPendingAgentEnd();
-			}
-
 			if (autoCompactionSignal.aborted) return { kind: "aborted", source: "signal" };
 
 			if (willRetry) {
