@@ -395,10 +395,14 @@ export function stream<TApi extends Api>(
 			onStreamCreated,
 		);
 	} else if (model.api === "kiro-codewhisperer-stream") {
+		const kiroOptions = (options || {}) as KiroCodeWhispererOptions;
+		const adapterKiroOptions = isProviderSafetyStopModelTrusted(model)
+			? withProviderSafetyStopAdapterInvocation(kiroOptions)
+			: kiroOptions;
 		return streamKiroCodeWhisperer(
 			model as Model<"kiro-codewhisperer-stream">,
 			context,
-			(options || {}) as KiroCodeWhispererOptions,
+			adapterKiroOptions,
 			onStreamCreated,
 		);
 	} else if (model.api === "devin-acp") {

@@ -5,9 +5,11 @@
  * instead of the generic "Kiro API key stream returned no tokens".
  */
 import { describe, expect, test } from "bun:test";
+import { withProviderSafetyStopAdapterInvocation } from "../src/adapter-internals/provider-safety-stop";
 import { crc32 } from "../src/providers/aws-eventstream";
 import { streamKiroCodeWhisperer } from "../src/providers/kiro-codewhisperer";
 import type { Context, Model } from "../src/types";
+import type { KiroCodeWhispererOptions } from "../src/providers/kiro-codewhisperer";
 
 // ---- Frame builder (mirrors aws-eventstream.ts for test isolation) ----
 
@@ -66,6 +68,10 @@ function streamFrom(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
 
 const originalFetch = globalThis.fetch;
 
+function trustedStreamKiroCodeWhisperer(model: Model<"kiro-codewhisperer-stream">, context: Context, options: KiroCodeWhispererOptions) {
+	return streamKiroCodeWhisperer(model, context, withProviderSafetyStopAdapterInvocation(options));
+}
+
 const model = {
 	id: "test-model",
 	name: "Test",
@@ -117,7 +123,7 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 		}) as unknown as typeof fetch;
 
 		try {
-			const stream = streamKiroCodeWhisperer(model, context, { apiKey: "token", region: "us-east-1" });
+			const stream = trustedStreamKiroCodeWhisperer(model, context, { apiKey: "token", region: "us-east-1" });
 			for await (const event of stream) {
 				events.push({
 					type: event.type,
@@ -197,7 +203,7 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 		}) as unknown as typeof fetch;
 
 		try {
-			const stream = streamKiroCodeWhisperer(model, context, { apiKey: "token", region: "us-east-1" });
+			const stream = trustedStreamKiroCodeWhisperer(model, context, { apiKey: "token", region: "us-east-1" });
 			for await (const event of stream) {
 				events.push({
 					type: event.type,
@@ -240,7 +246,7 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 		}) as unknown as typeof fetch;
 
 		try {
-			const stream = streamKiroCodeWhisperer(model, context, { apiKey: "token", region: "us-east-1" });
+			const stream = trustedStreamKiroCodeWhisperer(model, context, { apiKey: "token", region: "us-east-1" });
 			for await (const event of stream) {
 				events.push({
 					type: event.type,
@@ -283,7 +289,7 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 		}) as unknown as typeof fetch;
 
 		try {
-			const stream = streamKiroCodeWhisperer(model, context, { apiKey: "token", region: "us-east-1" });
+			const stream = trustedStreamKiroCodeWhisperer(model, context, { apiKey: "token", region: "us-east-1" });
 			for await (const event of stream) {
 				events.push({
 					type: event.type,
@@ -328,7 +334,7 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 		}) as unknown as typeof fetch;
 
 		try {
-			const stream = streamKiroCodeWhisperer(model, context, { apiKey: "token", region: "us-east-1" });
+			const stream = trustedStreamKiroCodeWhisperer(model, context, { apiKey: "token", region: "us-east-1" });
 			for await (const event of stream) {
 				events.push({
 					type: event.type,
