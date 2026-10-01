@@ -1,4 +1,4 @@
 ### Fixed
 
-- **Grok CLI version management**: Bumped Grok CLI client version from hardcoded 0.2.33 to 1.0.13. Added background version fetching from GitHub releases with caching (24-hour TTL) and failure caching to prevent retry storms when the GitHub API is unavailable. The version header is always available synchronously (fallback on first call), with best-effort background updates for subsequent requests.
-- **Grok CLI tests**: Fixed tests to mock network calls to GitHub instead of making real HTTP requests. Tests now properly validate cached version behavior and failure handling.
+- **Grok CLI version management**: Bumped Grok CLI client version from hardcoded 0.2.33 to 1.0.13. Added automatic version learning from HTTP 426 "version outdated" errors returned by xAI. When xAI returns a 426 response with a minimum version requirement, the version cache is automatically updated for subsequent requests. Added failure backoff protection that preserves known working versions during transient errors instead of downgrading to fallback.
+- **Grok CLI tests**: Fixed tests to mock network calls properly and validate cached version behavior, error handling, and version preservation during failure backoff.
