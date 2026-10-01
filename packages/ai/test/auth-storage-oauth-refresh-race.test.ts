@@ -1729,9 +1729,9 @@ describe("AuthStorage OAuth refresh race", () => {
 		const refresh = authStorage.refreshCredentialById(credentialId, timeoutSignal);
 		await refreshStarted.promise;
 		await expect(refresh).rejects.toThrow();
+		releaseRefresh.reject(new Error("release refresh cancelled"));
 		await expect(authStorage.getApiKey(provider, "release-timeout")).resolves.toBeUndefined();
 		expect(refreshCalls).toBe(1);
-		releaseRefresh.resolve();
 	});
 
 	test("preserves a caller abort and allows the next refresh when release fails", async () => {
