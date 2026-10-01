@@ -1485,6 +1485,62 @@ describe("AuthStorage OAuth refresh race", () => {
 			peerStore.close();
 		}
 	});
+
+	test("waits for another process write before claiming and completing a lease", async () => {
+		if (!authStorage || !(store instanceof SqliteAuthCredentialStore)) throw new Error("test setup failed");
+		const sqliteStore = store;
+		await authStorage.set("anthropic", [
+			{ type: "oauth", access: "expired-access", refresh: "shared-refresh", expires: Date.now() - 60_000 },
+		]);
+		const [stored] = sqliteStore.listAuthCredentials("anthropic");
+		if (!stored) throw new Error("credential missing");
+
+		const holdWriteLock = async (): Promise<Bun.Subprocess> => {
+			const lockProcess = Bun.spawn(
+				[
+					process.execPath,
+					path.join(import.meta.dir, "fixtures/hold-sqlite-write-lock.ts"),
+					path.join(tempDir, "agent.db"),
+				],
+				{
+					stdout: "pipe",
+					stderr: "pipe",
+				},
+			);
+			const reader = lockProcess.stdout.getReader();
+			const { value, done } = await reader.read();
+			reader.releaseLock();
+			if (done || !value || !new TextDecoder().decode(value).includes("LOCKED")) {
+				throw new Error("SQLite lock helper did not acquire the write lock");
+			}
+			return lockProcess;
+		};
+
+		const claimLock = await holdWriteLock();
+		const claim = sqliteStore.claimOAuthRefreshLease(
+			stored.id,
+			"shared-refresh",
+			false,
+			"owner-a",
+			Date.now(),
+			60_000,
+		);
+		await claimLock.exited;
+		expect(claim.kind).toBe("claimed");
+		if (claim.kind !== "claimed") return;
+
+		const completeLock = await holdWriteLock();
+		expect(() =>
+			sqliteStore.completeOAuthRefreshLease(claim.lease, {
+				type: "oauth",
+				access: "fresh-access",
+				refresh: "fresh-refresh",
+				expires: Date.now() + 60 * 60_000,
+			}),
+		).not.toThrow();
+		await completeLock.exited;
+	});
+
 	test("expires abandoned leases, isolates credentials, and never lets force steal an active lease", async () => {
 		if (!authStorage || !(store instanceof SqliteAuthCredentialStore)) throw new Error("test setup failed");
 		await authStorage.set("anthropic", [
