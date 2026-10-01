@@ -324,13 +324,13 @@ describe("configuration hot reload watcher", () => {
 		);
 		await watcher.start(paths);
 
-		await fs.writeFile(paths.configPath, "config: first\n");
+		await atomicReplace(paths.configPath, "config: first\n");
 		await firstStarted.promise;
-		await fs.writeFile(paths.configPath, "config: pending\n");
+		await atomicReplace(paths.configPath, "config: pending\n");
 		await pendingValidated.promise;
 		await Bun.sleep(15);
 		const abortedBeforeInvalid = calls[0]?.signal.aborted;
-		await fs.writeFile(paths.configPath, "config: invalid secret\n");
+		await atomicReplace(paths.configPath, "config: invalid secret\n");
 		const validationError = await waitFor(() => errors[0]);
 		expect(validationError.operation).toBe("validate");
 		expect(validationError.message).not.toContain("secret");
@@ -341,9 +341,9 @@ describe("configuration hot reload watcher", () => {
 		expect(pendingCall.signal.aborted).toBe(false);
 		expect(calls.some(call => call.candidate.config.text === "config: invalid secret\n")).toBe(false);
 
-		await fs.writeFile(paths.configPath, "config: repaired\n");
+		await atomicReplace(paths.configPath, "config: repaired\n");
 		await waitFor(() => calls.find(call => call.candidate.config.text === "config: repaired\n"));
-		await fs.writeFile(paths.configPath, "config: invalid secret\n");
+		await atomicReplace(paths.configPath, "config: invalid secret\n");
 		await waitFor(() => errors[1]);
 		expect(errors).toHaveLength(2);
 	});

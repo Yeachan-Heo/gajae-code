@@ -12,8 +12,8 @@ export class ModelBindingsApplier {
 	#bindings: ConfiguredModelBindings | undefined;
 	#lastAppliedRoles = new Map<string, ModelSelectorValue>();
 	#lastAppliedAgentOverrides = new Map<string, ModelSelectorValue>();
-	#manualRoles = new Map<string, ModelSelectorValue>();
-	#manualAgentOverrides = new Map<string, ModelSelectorValue>();
+	#manualRoles = new Map<string, ModelSelectorValue | undefined>();
+	#manualAgentOverrides = new Map<string, ModelSelectorValue | undefined>();
 	#appliedRoles = new Set<string>();
 	#appliedAgentOverrides = new Set<string>();
 	#roleBaselines = new Map<string, ModelSelectorValue | undefined>();
@@ -152,7 +152,7 @@ export class ModelBindingsApplier {
 		settingPath: "modelRoles" | "task.agentModelOverrides",
 		configured: Record<string, ModelSelectorValue>,
 		lastApplied: Map<string, ModelSelectorValue>,
-		manualOverrides: Map<string, ModelSelectorValue>,
+		manualOverrides: Map<string, ModelSelectorValue | undefined>,
 		baselines: Map<string, ModelSelectorValue | undefined>,
 	): void {
 		const configuredKeys = new Set(Object.keys(configured));
@@ -161,6 +161,12 @@ export class ModelBindingsApplier {
 		const runtime = targetSettings.getOverride(settingPath) ?? {};
 		for (const key of configuredKeys) {
 			if (!lastApplied.has(key) && !baselines.has(key)) baselines.set(key, this.#clone(runtime[key]));
+		}
+
+		// Manual bindings remain authoritative, but their cached values must follow
+		// later edits and removals from the runtime override slots.
+		for (const key of manualOverrides.keys()) {
+			manualOverrides.set(key, this.#clone(runtime[key]));
 		}
 
 		// Keep existing non-global values that belong to another runtime layer.
@@ -172,7 +178,11 @@ export class ModelBindingsApplier {
 		// A value changed while our previous overlay was active is a manual edit.
 		for (const [key, previous] of lastApplied) {
 			const currentValue = current[key];
-			if (currentValue !== undefined && !this.#equal(currentValue, previous)) {
+			if (!Object.hasOwn(runtime, key) || !Object.hasOwn(current, key)) {
+				manualOverrides.set(key, undefined);
+			} else if (!this.#equal(runtime[key], previous)) {
+				manualOverrides.set(key, this.#clone(runtime[key])!);
+			} else if (!this.#equal(currentValue, previous)) {
 				manualOverrides.set(key, this.#clone(currentValue)!);
 			}
 		}
@@ -187,7 +197,10 @@ export class ModelBindingsApplier {
 				baselines.delete(key);
 			}
 		}
-		for (const [key, value] of manualOverrides) nextOverrides[key] = this.#clone(value)!;
+		for (const [key, value] of manualOverrides) {
+			if (value === undefined) delete nextOverrides[key];
+			else nextOverrides[key] = this.#clone(value)!;
+		}
 		lastApplied.clear();
 		for (const [key, value] of Object.entries(configured)) {
 			if (manualOverrides.has(key)) continue;

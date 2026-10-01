@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
@@ -42,15 +42,44 @@ describe("AgentSession configuration reload", () => {
 		].join("\n");
 	}
 
-	function modelsText(options: { name: string; baseUrl: string; withProfile?: boolean }): string {
+	function unsetEnvironmentVariables(...names: string[]): () => void {
+		const previous = new Map(names.map(name => [name, Bun.env[name]] as const));
+		for (const name of names) delete Bun.env[name];
+		return () => {
+			for (const [name, value] of previous) {
+				if (value === undefined) delete Bun.env[name];
+				else Bun.env[name] = value;
+			}
+		};
+	}
+
+	function modelsText(options: {
+		providerId?: string;
+		modelId?: string;
+		api?: string;
+		name: string;
+		baseUrl: string;
+		apiKey?: string;
+		withProfile?: boolean;
+		requiresProvider?: boolean;
+		apiKeyEnv?: string;
+	}): string {
+		const providerId = options.providerId ?? provider;
+		const modelIdValue = options.modelId ?? modelId;
 		return [
 			"providers:",
-			`  ${provider}:`,
+			`  ${providerId}:`,
 			`    baseUrl: ${options.baseUrl}`,
-			"    api: openai-completions",
-			"    auth: none",
+			`    api: ${options.api ?? "openai-completions"}`,
+			...(options.apiKeyEnv || options.apiKey
+				? [
+						"    auth: apiKey",
+						...(options.apiKeyEnv ? [`    apiKeyEnv: ${options.apiKeyEnv}`] : []),
+						...(options.apiKey ? [`    apiKey: ${options.apiKey}`] : []),
+					]
+				: ["    auth: none"]),
 			"    models:",
-			`      - id: ${modelId}`,
+			`      - id: ${modelIdValue}`,
 			`        name: ${options.name}`,
 			"        contextWindow: 32768",
 			"        maxTokens: 4096",
@@ -58,16 +87,24 @@ describe("AgentSession configuration reload", () => {
 				? [
 						"profiles:",
 						"  active-profile:",
-						"    required_providers: []",
+						`    required_providers: ${options.requiresProvider ? `[${providerId}]` : "[]"}`,
 						"    model_mapping:",
-						`      default: ${provider}/${modelId}`,
+						`      default: ${providerId}/${modelIdValue}`,
 					]
 				: []),
 			"",
 		].join("\n");
 	}
 
-	async function createSession(options?: { withProfile?: boolean }) {
+	async function createSession(options?: {
+		providerId?: string;
+		modelId?: string;
+		api?: string;
+		withProfile?: boolean;
+		requiresProvider?: boolean;
+		apiKeyEnv?: string;
+		credentialSessionId?: string;
+	}) {
 		const evidenceRoot = path.resolve(import.meta.dir, "../../../.gjc/evidence/config-hot-reload");
 		await fs.mkdir(evidenceRoot, { recursive: true });
 		tempDir = await fs.mkdtemp(path.join(evidenceRoot, "session-"));
@@ -76,7 +113,16 @@ describe("AgentSession configuration reload", () => {
 		await Bun.write(configPath, settingsText({ todoEnabled: false, compactionEnabled: false }));
 		await Bun.write(
 			modelsPath,
-			modelsText({ name: "Before", baseUrl: "https://before.example/v1", withProfile: options?.withProfile }),
+			modelsText({
+				providerId: options?.providerId,
+				modelId: options?.modelId,
+				api: options?.api,
+				name: "Before",
+				baseUrl: "https://before.example/v1",
+				withProfile: options?.withProfile,
+				requiresProvider: options?.requiresProvider,
+				apiKeyEnv: options?.apiKeyEnv,
+			}),
 		);
 		const settings = await Settings.loadForScope({ cwd: tempDir, agentDir: tempDir });
 		authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
@@ -84,7 +130,11 @@ describe("AgentSession configuration reload", () => {
 			agentDir: tempDir,
 			automaticRefresh: false,
 		});
-		const initialModel = modelRegistry.getAll().find(model => model.provider === provider && model.id === modelId);
+		const initialModel = modelRegistry
+			.getAll()
+			.find(
+				model => model.provider === (options?.providerId ?? provider) && model.id === (options?.modelId ?? modelId),
+			);
 		if (!initialModel) throw new Error("Expected configured test model in the real model registry");
 		const agent = new Agent({ initialState: { model: initialModel, systemPrompt: ["Test"], tools: [] } });
 		session = new AgentSession({
@@ -92,6 +142,7 @@ describe("AgentSession configuration reload", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
+			credentialSessionId: options?.credentialSessionId,
 		});
 		return { configPath, modelsPath, initialModel };
 	}
@@ -278,5 +329,129 @@ describe("AgentSession configuration reload", () => {
 		});
 		expect(session!.getActiveModelProfile()).toBe("active-profile");
 		expect(modelRegistry!.getModelProfile("active-profile")?.name).toBe("active-profile");
+	});
+
+	it("keeps an expired refreshable OAuth provider eligible during a read-only reload preflight", async () => {
+		const oauthProvider = "anthropic";
+		const oauthModelId = "claude-sonnet-4-5";
+		const apiKeyEnv = "GJC_TEST_RELOAD_EXPIRED_OAUTH_KEY";
+		const restoreEnvironment = unsetEnvironmentVariables(
+			apiKeyEnv,
+			"ANTHROPIC_API_KEY",
+			"ANTHROPIC_OAUTH_TOKEN",
+			"ANTHROPIC_FOUNDRY_API_KEY",
+		);
+		try {
+			const { configPath, modelsPath } = await createSession({
+				providerId: oauthProvider,
+				modelId: oauthModelId,
+				api: "anthropic-messages",
+				withProfile: true,
+				requiresProvider: true,
+				apiKeyEnv,
+			});
+			await authStorage!.set(oauthProvider, [
+				{
+					type: "oauth",
+					access: "expired-profile-access",
+					refresh: "refresh-profile-token",
+					expires: Date.now() - 60_000,
+					email: "profile@example.com",
+				},
+			]);
+			authStorage!.setRuntimeCredentialSelector(oauthProvider, { kind: "email", value: "profile@example.com" });
+			session!.setActiveModelProfile("active-profile");
+			expect(await authStorage!.peekApiKey(oauthProvider, { sessionId: session!.sessionId })).toBeUndefined();
+			expect(authStorage!.hasUsableAuth(oauthProvider, { sessionId: session!.sessionId })).toBe(true);
+			const getApiKey = vi.spyOn(authStorage!, "getApiKey");
+			const nextConfig = settingsText({ todoEnabled: true, compactionEnabled: false });
+			const models = await Bun.file(modelsPath).text();
+			const staged = candidate(11, configPath, modelsPath, nextConfig, models);
+
+			try {
+				await expect(session!.reloadConfiguration(staged, new AbortController().signal)).resolves.toMatchObject({
+					applied: true,
+					settingsChanged: true,
+					modelsChanged: false,
+				});
+				expect(getApiKey).not.toHaveBeenCalled();
+				expect(authStorage!.hasRuntimeCredentialSelector(oauthProvider)).toBe(true);
+				expect(authStorage!.getEffectiveCredentialType(oauthProvider, session!.sessionId)).toBe("oauth");
+			} finally {
+				getApiKey.mockRestore();
+			}
+		} finally {
+			restoreEnvironment();
+		}
+	});
+
+	it("rejects a literal key that conflicts with the credential scope without an active profile", async () => {
+		const oauthProvider = "anthropic";
+		const oauthModelId = "claude-sonnet-4-5";
+		const credentialSessionId = "reload-credential-scope";
+		const apiKeyEnv = "GJC_TEST_RELOAD_PINNED_OAUTH_KEY";
+		const restoreEnvironment = unsetEnvironmentVariables(
+			apiKeyEnv,
+			"ANTHROPIC_API_KEY",
+			"ANTHROPIC_OAUTH_TOKEN",
+			"ANTHROPIC_FOUNDRY_API_KEY",
+		);
+		try {
+			const { configPath, modelsPath, initialModel } = await createSession({
+				providerId: oauthProvider,
+				modelId: oauthModelId,
+				api: "anthropic-messages",
+				apiKeyEnv,
+				credentialSessionId,
+			});
+			await authStorage!.set(oauthProvider, [
+				{
+					type: "oauth",
+					access: "pinned-profile-access",
+					refresh: "pinned-profile-refresh",
+					expires: Date.now() + 60_000,
+					email: "pinned-profile@example.com",
+				},
+			]);
+			await session!.setCredentialPin(oauthProvider, {
+				kind: "email",
+				value: "pinned-profile@example.com",
+			});
+			expect(session!.credentialSessionId).toBe(credentialSessionId);
+			expect(session!.credentialSessionId).not.toBe(session!.sessionId);
+			expect(session!.getActiveModelProfile()).toBeUndefined();
+
+			const nextModels = modelsText({
+				providerId: oauthProvider,
+				modelId: oauthModelId,
+				api: "anthropic-messages",
+				name: "After",
+				baseUrl: "https://before.example/v1",
+				apiKey: "candidate-literal-key",
+			});
+			await Bun.write(modelsPath, nextModels);
+			const nextConfig = settingsText({ todoEnabled: false, compactionEnabled: false });
+			const stagedForValidation = candidate(12, configPath, modelsPath, nextConfig, nextModels);
+			await expect(session!.validateConfiguration(stagedForValidation)).rejects.toMatchObject({
+				name: "ConfigurationReloadError",
+				code: "MODELS_INVALID",
+			});
+			const stagedForReload = candidate(13, configPath, modelsPath, nextConfig, nextModels);
+			await expect(
+				session!.reloadConfiguration(stagedForReload, new AbortController().signal),
+			).rejects.toMatchObject({
+				name: "ConfigurationReloadError",
+				code: "MODELS_INVALID",
+			});
+			expect(modelRegistry!.find(oauthProvider, oauthModelId)).toBe(initialModel);
+			expect(session!.model).toBe(initialModel);
+			expect(authStorage!.hasConfigApiKey(oauthProvider, modelRegistry!.getAuthStorageOwner())).toBe(false);
+			expect(await authStorage!.peekApiKey(oauthProvider, { sessionId: credentialSessionId })).toBe(
+				"pinned-profile-access",
+			);
+			expect(authStorage!.hasEffectiveCredentialSelector(oauthProvider, credentialSessionId)).toBe(true);
+		} finally {
+			restoreEnvironment();
+		}
 	});
 });

@@ -21,6 +21,7 @@ import {
 	kNoAuth,
 	MODEL_ROLE_IDS,
 	ModelRegistry,
+	type ModelsConfigReloadCandidate,
 	requiresExplicitThinkingChoice,
 } from "@gajae-code/coding-agent/config/model-registry";
 import {
@@ -9608,6 +9609,187 @@ describe("ModelRegistry config reload", () => {
 		expect(registry.find("reload-proxy", "new-model")).toBeUndefined();
 		expect(await authStorage.peekApiKey("reload-proxy")).toBe("old-models-key");
 		candidate.rollback();
+	});
+
+	test("rebases provider discovery that drains ahead of a staged reload publication", async () => {
+		const initialConfig = {
+			providers: {
+				"reload-proxy": {
+					baseUrl: "https://old.example.com/v1",
+					apiKey: "old-models-key",
+					api: "openai-responses",
+					models: [{ id: "old-model", name: "Before" }],
+				},
+				"reload-race": {
+					baseUrl: "https://race.example.com/v1",
+					api: "openai-completions",
+					discovery: { type: "openai-models-list" },
+				},
+			},
+		};
+		await Bun.write(modelsPath, JSON.stringify(initialConfig));
+		await registry.refreshStatic();
+		authStorage.setRuntimeApiKey("reload-race", "race-key");
+
+		const nextConfig = structuredClone(initialConfig);
+		nextConfig.providers["reload-proxy"].models[0]!.name = "After";
+		const candidate = await registry.stageModelsConfigReload({
+			path: modelsPath,
+			text: JSON.stringify(nextConfig),
+			identity: "unrelated-provider-edit",
+		});
+		const response = Promise.withResolvers<Response>();
+		const requestStarted = Promise.withResolvers<void>();
+		using _hook = hookFetch(input => {
+			requestStarted.resolve();
+			expect(String(input)).toBe("https://race.example.com/v1/models");
+			return response.promise;
+		});
+		const refresh = registry.refreshProvider("reload-race", "online");
+		await requestStarted.promise;
+		const publicationFence = registry.acquirePublicationFence();
+		let releaseFence: (() => void) | undefined;
+		try {
+			await Bun.sleep(0);
+			response.resolve(
+				new Response(JSON.stringify({ data: [{ id: "refreshed-model" }] }), {
+					headers: { "Content-Type": "application/json" },
+				}),
+			);
+			releaseFence = await publicationFence;
+			await refresh;
+			candidate.commit();
+			candidate.finalize();
+			expect(registry.find("reload-race", "refreshed-model")).toBeDefined();
+			expect(registry.find("reload-race", "old-model")).toBeUndefined();
+			expect(registry.find("reload-proxy", "old-model")?.name).toBe("After");
+		} finally {
+			response.resolve(new Response(JSON.stringify({ data: [] }), { status: 200 }));
+			releaseFence?.();
+			candidate.rollback();
+		}
+	});
+
+	test("preserves authoritative discovery for an unchanged literal-key provider across reload", async () => {
+		const previousOpenAiKey = Bun.env.OPENAI_API_KEY;
+		Bun.env.OPENAI_API_KEY = "ambient-openai-key";
+		let candidate: ModelsConfigReloadCandidate | undefined;
+		try {
+			const bundledIds = (getBundledModels("openai") as Model<Api>[]).map(model => model.id);
+			const discoveredId = bundledIds[0]!;
+			const unsupportedId = bundledIds.find(id => id !== discoveredId)!;
+			const initialConfig = JSON.parse(await Bun.file(modelsPath).text()) as {
+				providers: Record<string, unknown>;
+			};
+			initialConfig.providers.openai = {
+				baseUrl: "https://openai-config.example/v1",
+				api: "openai-responses",
+				apiKey: "literal-openai-key",
+				discovery: { type: "openai-models-list" },
+				models: [{ id: "openai-local-model" }],
+			};
+			await Bun.write(modelsPath, JSON.stringify(initialConfig));
+			await registry.refreshStatic();
+			using _hook = hookFetch(input => {
+				expect(String(input)).toBe("https://openai-config.example/v1/models");
+				return new Response(JSON.stringify({ data: [{ id: discoveredId }] }), {
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+			await registry.refreshProvider("openai", "online");
+			expect(registry.getAvailable().some(model => model.provider === "openai" && model.id === unsupportedId)).toBe(
+				false,
+			);
+
+			const nextConfig = structuredClone(initialConfig);
+			const reloadProxy = nextConfig.providers["reload-proxy"] as {
+				models: Array<{ id: string; name?: string }>;
+			};
+			reloadProxy.models[0]!.name = "Unrelated edit";
+			candidate = await registry.stageModelsConfigReload({
+				path: modelsPath,
+				text: JSON.stringify(nextConfig),
+				identity: "literal-key-unrelated-edit",
+			});
+			expect(candidate.valid).toBe(true);
+			candidate.commit();
+			candidate.finalize();
+			expect(registry.getAvailable().some(model => model.provider === "openai" && model.id === unsupportedId)).toBe(
+				false,
+			);
+		} finally {
+			candidate?.rollback();
+			if (previousOpenAiKey === undefined) delete Bun.env.OPENAI_API_KEY;
+			else Bun.env.OPENAI_API_KEY = previousOpenAiKey;
+		}
+	});
+
+	test("rejects a candidate literal key while a stored OAuth credential is pinned", async () => {
+		const pinnedModelsPath = path.join(tempDir, "pinned-models.json");
+		const apiKeyEnv = "GJC_TEST_PINNED_RELOAD_API_KEY";
+		const previousApiKey = Bun.env[apiKeyEnv];
+		delete Bun.env[apiKeyEnv];
+		const pinnedSessionId = "pinned-reload-session";
+		const initialConfig = {
+			providers: {
+				"pinned-provider": {
+					baseUrl: "https://pinned.example/v1",
+					api: "openai-responses",
+					apiKeyEnv,
+					models: [{ id: "pinned-model" }],
+				},
+			},
+		};
+		let pinnedRegistry: ModelRegistry | undefined;
+		let candidate: ModelsConfigReloadCandidate | undefined;
+		try {
+			await Bun.write(pinnedModelsPath, JSON.stringify(initialConfig));
+			pinnedRegistry = new ModelRegistry(authStorage, pinnedModelsPath, undefined, { automaticRefresh: false });
+			await authStorage.set("pinned-provider", [
+				{
+					type: "oauth",
+					access: "pinned-oauth-access",
+					refresh: "pinned-oauth-refresh",
+					expires: Date.now() + 60_000,
+					email: "pinned@example.com",
+				},
+			]);
+			authStorage.setSessionCredentialSelector(pinnedSessionId, "pinned-provider", {
+				kind: "email",
+				value: "pinned@example.com",
+			});
+			const nextConfig = {
+				providers: {
+					"pinned-provider": {
+						...initialConfig.providers["pinned-provider"],
+						apiKey: "candidate-literal-key",
+					},
+				},
+			};
+			candidate = await pinnedRegistry.stageModelsConfigReload(
+				{
+					path: pinnedModelsPath,
+					text: JSON.stringify(nextConfig),
+					identity: "pinned-literal-key",
+				},
+				undefined,
+				pinnedSessionId,
+			);
+			expect(candidate.valid).toBe(false);
+			expect(candidate.diagnostics.errors.join(" ")).toContain("credential selector is active");
+			candidate.rollback();
+			expect(pinnedRegistry.find("pinned-provider", "pinned-model")).toBeDefined();
+			expect(await authStorage.peekApiKey("pinned-provider", { sessionId: pinnedSessionId })).toBe(
+				"pinned-oauth-access",
+			);
+			expect(authStorage.hasEffectiveCredentialSelector("pinned-provider", pinnedSessionId)).toBe(true);
+		} finally {
+			candidate?.rollback();
+			authStorage.clearSessionCredentialSelector("pinned-provider", pinnedSessionId);
+			await pinnedRegistry?.dispose();
+			if (previousApiKey === undefined) delete Bun.env[apiKeyEnv];
+			else Bun.env[apiKeyEnv] = previousApiKey;
+		}
 	});
 
 	test("rejects malformed snapshots and deletion of an accepted file without changing auth", async () => {

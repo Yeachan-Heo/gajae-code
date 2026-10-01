@@ -18140,7 +18140,11 @@ export class AgentSession {
 			}
 			if (!settingsCandidate.diagnostics.valid) throw new ConfigurationReloadError("SETTINGS_INVALID");
 			try {
-				modelsCandidate = await this.#modelRegistry.stageModelsConfigReload(candidate.models, settingsCandidate);
+				modelsCandidate = await this.#modelRegistry.stageModelsConfigReload(
+					candidate.models,
+					settingsCandidate,
+					this.credentialSessionId,
+				);
 			} catch (error) {
 				throw new ConfigurationReloadError("MODELS_INVALID", error);
 			}
@@ -18228,7 +18232,11 @@ export class AgentSession {
 					}
 					if (!stagedSettings.diagnostics.valid) throw new ConfigurationReloadError("SETTINGS_INVALID");
 					try {
-						stagedModels = await this.#modelRegistry.stageModelsConfigReload(candidate.models, stagedSettings);
+						stagedModels = await this.#modelRegistry.stageModelsConfigReload(
+							candidate.models,
+							stagedSettings,
+							this.credentialSessionId,
+						);
 					} catch (error) {
 						throw new ConfigurationReloadError("MODELS_INVALID", error);
 					}
