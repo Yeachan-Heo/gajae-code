@@ -187,6 +187,7 @@ const CODEX_RETRYABLE_EVENT_MESSAGE =
 const CODEX_ACCOUNT_MODEL_UNAVAILABLE_MESSAGE = /\bnot supported when using codex with a chatgpt account\b/i;
 const CODEX_PROVIDER_SESSION_STATE_KEY = "openai-codex-responses";
 const providerSessionStateIdentities = new WeakMap<Map<string, ProviderSessionState>, number>();
+const disabledCodexPublicSessionKeys = new Set<string>();
 let nextProviderSessionStateIdentity = 1;
 
 function getProviderSessionStateIdentity(
@@ -204,7 +205,12 @@ const X_CODEX_TURN_STATE_HEADER = "x-codex-turn-state";
 const X_MODELS_ETAG_HEADER = "x-models-etag";
 const X_REASONING_INCLUDED_HEADER = "x-reasoning-included";
 /** Connection-level websocket failures that should immediately fall back to SSE without retrying. */
-const CODEX_WEBSOCKET_FATAL_PATTERNS = ["websocket error:", "websocket closed before open", "connection timeout"];
+const CODEX_WEBSOCKET_FATAL_PATTERNS = [
+	"websocket error:",
+	"websocket closed before open",
+	"websocket is closed before the connection is established",
+	"connection timeout",
+];
 /** Max total time to spend retrying 429s with server-provided delays (5 minutes). */
 const CODEX_RATE_LIMIT_BUDGET_MS = 5 * 60 * 1000;
 
@@ -300,6 +306,7 @@ type CodexWebSocketSessionState = {
 interface CodexProviderSessionState extends ProviderSessionState {
 	webSocketSessions: Map<string, CodexWebSocketSessionState>;
 	webSocketPublicToPrivate: Map<string, string>;
+	disabledWebSocketPublicSessions: Set<string>;
 }
 
 interface CodexRequestContext {
@@ -459,12 +466,14 @@ function createCodexProviderSessionState(): CodexProviderSessionState {
 	const state: CodexProviderSessionState = {
 		webSocketSessions: new Map(),
 		webSocketPublicToPrivate: new Map(),
+		disabledWebSocketPublicSessions: new Set(),
 		close: () => {
 			for (const session of state.webSocketSessions.values()) {
 				session.connection?.close("session_disposed");
 			}
 			state.webSocketSessions.clear();
 			state.webSocketPublicToPrivate.clear();
+			state.disabledWebSocketPublicSessions.clear();
 		},
 	};
 	return state;
@@ -789,6 +798,14 @@ async function buildCodexRequestContext(
 		providerSessionState && effectiveSessionKey
 			? getCodexWebSocketSessionState(effectiveSessionKey, providerSessionState)
 			: undefined;
+	if (
+		websocketState &&
+		publicSessionKey &&
+		(disabledCodexPublicSessionKeys.has(publicSessionKey) ||
+			providerSessionState?.disabledWebSocketPublicSessions.has(publicSessionKey))
+	) {
+		websocketState.disableWebsocket = true;
+	}
 
 	return {
 		apiKey,
@@ -2374,6 +2391,8 @@ export async function prewarmOpenAICodexResponses(
 		const websocketError = error instanceof Error ? error : new Error(String(error));
 		if (isCodexWebSocketFatalError(websocketError)) {
 			recordCodexWebSocketFailure(state, true);
+			if (publicSessionKey) providerSessionState.disabledWebSocketPublicSessions.add(publicSessionKey);
+			if (publicSessionKey) disabledCodexPublicSessionKeys.add(publicSessionKey);
 		}
 		throw error;
 	}
