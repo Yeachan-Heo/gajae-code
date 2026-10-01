@@ -5,6 +5,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import { isContinuingMidRunMaintenanceOutcome, isNonDispatchedToolEvent, ThinkingLevel } from "@gajae-code/agent-core";
+import type { AttemptScope } from "@gajae-code/agent-core/attempt-scope";
 import type { Api, ImageContent, Model, ProviderDiagnostic } from "@gajae-code/ai/core";
 
 import { logger } from "@gajae-code/utils";
@@ -4715,6 +4716,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		string,
 		{ state: RuntimeState; batch?: LifecycleBatch; correlationKey?: string }
 	>();
+	const lifecycleScopeOwners = new WeakMap<AttemptScope, { state: RuntimeState; batch: LifecycleBatch }>();
 	const lifecycleCorrelationKey = (correlation: InvocationCorrelation): string =>
 		`${correlation.commandId}:${correlation.turnId}`;
 	const sessionIdentityForContext = (ctx: ExtensionContext): string | undefined => {
@@ -5093,6 +5095,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		stopReason?: AgentEndEvent["stopReason"],
 		startToken?: string,
 		startTokens?: string[],
+		startLifecycleScope?: AttemptScope,
 	): Promise<void> => {
 		const current = lifecycleOwner?.state ?? active;
 		if (!current) return;
@@ -5143,13 +5146,18 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			);
 			transitions = [...fallback, ...attached].map(({ kind, correlation }) => ({ kind, correlation }));
 		} else if (type === "agent_start") {
-			current.lifecycleEpoch = ++nextLifecycleEpoch;
+			const scopeOwner = startLifecycleScope ? lifecycleScopeOwners.get(startLifecycleScope) : undefined;
+			const scopeBatch =
+				scopeOwner?.state === current && current.openLifecycleBatches.includes(scopeOwner.batch)
+					? scopeOwner.batch
+					: undefined;
+			current.lifecycleEpoch = scopeBatch?.epoch ?? ++nextLifecycleEpoch;
 			if (current === active) activePromptOwnerHolder.lifecycleEpoch = current.lifecycleEpoch;
 			// Mark lifecycle active even when the drain is empty: a monitor/cron
 			// run started by the session has no SDK pending entry but is still a
 			// real active run that later in-run promotions must attach to instead
-			// of falling back to pending (review P1). Only a token-bound
-			// continuation retains the previous SDK owner.
+			// of falling back to pending (review P1). Only an explicitly bound
+			// continuation retains a previous public lifecycle boundary.
 			current.lifecycleActive = true;
 			// Drain EVERY entry admitted for this run: a continuation may promote
 			// several follow-ups (each with its own requester correlation) into one
@@ -5170,11 +5178,17 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				typeof startToken === "string" && startToken.length > 0
 					? lifecycleRunOwners.get(startToken)?.batch
 					: undefined;
-			if (drained.length > 0 || !existingTokenBatch || !current.openLifecycleBatches.includes(existingTokenBatch)) {
+			const continuationBatch =
+				scopeBatch ??
+				(drained.length === 0 && existingTokenBatch && current.openLifecycleBatches.includes(existingTokenBatch)
+					? existingTokenBatch
+					: undefined);
+			let batch: LifecycleBatch;
+			if (!continuationBatch) {
 				// Every new run owns an end, including interactive/monitor runs
 				// without SDK invocations. Their delayed ends must never consume
 				// the next SDK run's terminal receipt.
-				const batch: LifecycleBatch = {
+				batch = {
 					epoch: current.lifecycleEpoch,
 					unownedStart: drained.length === 0,
 					invocations: drained,
@@ -5184,25 +5198,27 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					heldContent: [],
 				};
 				current.openLifecycleBatches.push(batch);
-				for (const entry of drained) {
-					lifecycleRunOwners.set(entry.sdkRunToken, {
-						state: current,
-						batch,
-						correlationKey: lifecycleCorrelationKey(entry.correlation),
-					});
-				}
-				adoptLifecycleBatch(batch);
-				for (const entry of drained) {
-					if (entry.kind !== "prompt") continue;
-					if (current.deadlineManager.isExpiring(entry.correlation))
-						current.deadlineManager.captureExpiringRun(entry.correlation);
-					else current.deadlineManager.onRunStarted(entry.correlation);
-				}
 			} else {
-				// A continuation within the same SDK-owned run carries the same token
-				// but has no newly pending invocation. Preserve the established owner so
-				// later chunks and the final terminal remain directed to its submitters.
-				adoptLifecycleBatch(existingTokenBatch);
+				// The producer consumed the predecessor end, or this is the same
+				// token-owned run. Preserve its attached owners and single final end.
+				batch = continuationBatch;
+				batch.invocations.push(...drained);
+				if (drained.length > 0) batch.startPublished = false;
+			}
+			if (startLifecycleScope) lifecycleScopeOwners.set(startLifecycleScope, { state: current, batch });
+			for (const entry of drained) {
+				lifecycleRunOwners.set(entry.sdkRunToken, {
+					state: current,
+					batch,
+					correlationKey: lifecycleCorrelationKey(entry.correlation),
+				});
+			}
+			adoptLifecycleBatch(batch);
+			for (const entry of drained) {
+				if (entry.kind !== "prompt") continue;
+				if (current.deadlineManager.isExpiring(entry.correlation))
+					current.deadlineManager.captureExpiringRun(entry.correlation);
+				else current.deadlineManager.onRunStarted(entry.correlation);
 			}
 			transitions = drained.map(({ kind, correlation }) => ({ kind, correlation }));
 		} else {
@@ -5792,6 +5808,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					undefined,
 					typeof event.sdkRunToken === "string" ? event.sdkRunToken : undefined,
 					event.sdkRunTokens,
+					event.lifecycleScope,
 				),
 			owner,
 		).catch(error => {

@@ -5,6 +5,7 @@ import { type AssistantMessage, getBundledModel, type ToolCall } from "@gajae-co
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import type { AgentStartEvent, ExtensionEvent } from "@gajae-code/coding-agent/extensibility/extensions/types";
 import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
@@ -379,7 +380,9 @@ describe("AgentSession auto-retry busy recovery", () => {
 		const mock = createMockModel({
 			responses: [
 				{ throw: "503 service unavailable: overloaded_error retry-after-ms=5" },
+				{ throw: "503 service unavailable: overloaded_error retry-after-ms=5" },
 				{ content: ["retry successor succeeded"] },
+				{ content: ["independent prompt succeeded"] },
 			],
 		});
 		const agent = new Agent({
@@ -393,7 +396,21 @@ describe("AgentSession auto-retry busy recovery", () => {
 			"retry.maxDelayMs": 5_000,
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
-		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		const lifecycleStarts: AgentStartEvent[] = [];
+		const extensionRunner = {
+			emitBeforeAgentStart: async () => undefined,
+			hasHandlers: () => false,
+			emit: async (event: ExtensionEvent) => {
+				if (event.type === "agent_start") lifecycleStarts.push(event);
+			},
+		} as never;
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			extensionRunner,
+		});
 
 		const handles: string[] = [];
 		const terminalEvents: AgentSessionEvent[] = [];
@@ -405,15 +422,31 @@ describe("AgentSession auto-retry busy recovery", () => {
 		await session.prompt("retry with an owned successor");
 		await session.waitForIdle();
 
-		expect(handles).toHaveLength(2);
+		expect(handles).toHaveLength(3);
 		expect(handles[0]).not.toBe(handles[1]);
+		expect(handles[1]).not.toBe(handles[2]);
 		expect(await agent.resourceLedger.waitForSettlement(handles[0]!, { graceMs: 100 })).toEqual({
 			status: "settled",
 		});
 		expect(await agent.resourceLedger.waitForSettlement(handles[1]!, { graceMs: 100 })).toEqual({
 			status: "settled",
 		});
+		expect(await agent.resourceLedger.waitForSettlement(handles[2]!, { graceMs: 100 })).toEqual({
+			status: "settled",
+		});
 		expect(terminalEvents).toHaveLength(1);
+		expect(lifecycleStarts).toHaveLength(3);
+		expect(lifecycleStarts[0]?.sdkRunToken).toBeUndefined();
+		expect(lifecycleStarts[0]?.lifecycleScope).toBeDefined();
+		expect(lifecycleStarts[1]?.lifecycleScope).toBe(lifecycleStarts[0]?.lifecycleScope);
+		expect(lifecycleStarts[2]?.lifecycleScope).toBe(lifecycleStarts[0]?.lifecycleScope);
+
+		await session.prompt("independent prompt after retry");
+		await session.waitForIdle();
+		expect(lifecycleStarts).toHaveLength(4);
+		expect(lifecycleStarts[3]?.lifecycleScope).toBeDefined();
+		expect(lifecycleStarts[3]?.lifecycleScope).not.toBe(lifecycleStarts[0]?.lifecycleScope);
+		expect(terminalEvents).toHaveLength(2);
 	});
 	it("does not wedge when an auto-retry recovers on a turn ending with a successful yield", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
