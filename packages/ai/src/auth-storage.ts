@@ -26,7 +26,13 @@ import type {
 	UsageReport,
 } from "./usage";
 
-import { getOAuthApiKey, getOAuthProvider, refreshOAuthToken, resolveOAuthStorageProvider } from "./utils/oauth";
+import {
+	getOAuthApiKey,
+	getOAuthProvider,
+	refreshOAuthToken,
+	resolveOAuthStorageProvider,
+	UnknownOAuthProviderError,
+} from "./utils/oauth";
 import { loginDeepInfra } from "./utils/oauth/deepinfra";
 import { loginDeepSeek } from "./utils/oauth/deepseek";
 import { loginOpenAICodexDevice } from "./utils/oauth/openai-codex";
@@ -3884,7 +3890,7 @@ export class AuthStorage {
 			default: {
 				const customProvider = getOAuthProvider(provider);
 				if (!customProvider) {
-					throw new Error(`Unknown OAuth provider: ${provider}`);
+					throw new UnknownOAuthProviderError(provider);
 				}
 				const customLoginResult = await customProvider.login({
 					onAuth: info => ctrl.onAuth(info),
@@ -5550,6 +5556,7 @@ export class AuthStorage {
 		let refreshPromise: Promise<OAuthCredentials>;
 		let localDial = false;
 		let refreshLease: OAuthRefreshLease | undefined;
+		let refreshLeaseCompleted = false;
 
 		// Caller override > store-level hook > local per-provider refresh.
 		// `RemoteAuthCredentialStore` exposes the hook so a broker-backed gateway
@@ -5713,10 +5720,15 @@ export class AuthStorage {
 				if (!completeLease?.(refreshLease, persisted)) {
 					throw new Error("OAuth token refresh ownership was lost before persistence");
 				}
+				refreshLeaseCompleted = true;
 				authority.persistedByLease = true;
 			}
 			return authority;
 		} catch (error) {
+			if (refreshLease && !refreshLeaseCompleted) {
+				const releaseLease = this.#store.releaseOAuthRefreshLease?.bind(this.#store);
+				releaseLease?.(refreshLease);
+			}
 			// A genuine caller cancellation (e.g. the agent's ESC) is not a refresh
 			// failure. Rethrow before any failure classification so it never poisons
 			// the replay guard (which would temp-block the credential on the next
@@ -5980,6 +5992,7 @@ export class AuthStorage {
 			// Only remove credentials for definitive auth failures
 			// Keep credentials for transient errors (network, 5xx) and block temporarily
 			const isDefinitiveFailure =
+				error instanceof UnknownOAuthProviderError ||
 				/invalid_grant|grant is invalid|invalid_token|revoked|unauthorized|expired.*refresh|refresh.*expired/i.test(
 					errorMsg,
 				) ||
