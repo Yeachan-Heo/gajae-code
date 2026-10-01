@@ -5774,8 +5774,10 @@ export class AuthStorage {
 			// and tripping provider reuse detection. Skip the guard update only for a
 			// caller-owned abort, never for an internal timeout.
 			const callerAbort = signal?.aborted && !isTimeoutAbort(signal);
-			const taggedError = callerAbort ? error : tagRefreshAttempt(error, credential.refresh);
-			if (!callerAbort && localDial && credentialId !== undefined) {
+			const unknownProvider = error instanceof UnknownOAuthProviderError;
+			const taggedError =
+				callerAbort || unknownProvider ? error : tagRefreshAttempt(error, credential.refresh);
+			if (!callerAbort && !unknownProvider && localDial && credentialId !== undefined) {
 				for (const [key, entry] of this.#recentOAuthRefreshFailures) {
 					if (entry.expiresAt <= Date.now()) this.#recentOAuthRefreshFailures.delete(key);
 				}
@@ -6027,7 +6029,6 @@ export class AuthStorage {
 			// Only remove credentials for definitive auth failures
 			// Keep credentials for transient errors (network, 5xx) and block temporarily
 			const isDefinitiveFailure =
-				error instanceof UnknownOAuthProviderError ||
 				/invalid_grant|grant is invalid|invalid_token|revoked|unauthorized|expired.*refresh|refresh.*expired/i.test(
 					errorMsg,
 				) ||
