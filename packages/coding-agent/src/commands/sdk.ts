@@ -1,3 +1,4 @@
+import { type ChildProcess, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
@@ -42,6 +43,7 @@ import {
 	writeSessionLifecycleReady,
 } from "../sdk/broker/lifecycle";
 import { processIncarnation } from "../sdk/broker/process-incarnation";
+import { resolveSdkInternalSpawnCommand } from "../sdk/broker/runtime";
 import { writeBrokerStartupFailureMarker } from "../sdk/broker/startup-failure";
 import { runSdkStderrDrainer } from "../sdk/broker/stderr-drainer";
 import { renderSdkSearchTable, runSdkSearch, runSdkSessionCli } from "../sdk/cli";
@@ -1441,6 +1443,7 @@ export async function runSessionHost(
 
 export type SdkInternalArgv =
 	| { action: "broker-internal"; agentDir: string }
+	| { action: "broker-trampoline-internal"; agentDir: string }
 	| { action: "session-host-internal" }
 	| { action: "stderr-drain-internal"; logPath: string; maxBytes: number };
 
@@ -1455,6 +1458,14 @@ export function parseSdkInternalArgv(argv: readonly string[]): SdkInternalArgv {
 		isSafeSdkInternalAgentDir(argv[2])
 	)
 		return { action: "broker-internal", agentDir: argv[2] };
+	if (
+		argv[0] === "broker-trampoline-internal" &&
+		argv.length === 3 &&
+		argv[1] === "--agent-dir" &&
+		typeof argv[2] === "string" &&
+		isSafeSdkInternalAgentDir(argv[2])
+	)
+		return { action: "broker-trampoline-internal", agentDir: argv[2] };
 	if (
 		argv[0] === "stderr-drain-internal" &&
 		argv.length === 5 &&
@@ -1494,6 +1505,7 @@ export default class Sdk extends Command {
 	async run(): Promise<void> {
 		if (
 			this.argv[0] !== "broker-internal" &&
+			this.argv[0] !== "broker-trampoline-internal" &&
 			this.argv[0] !== "session-host-internal" &&
 			this.argv[0] !== "stderr-drain-internal"
 		) {
@@ -1596,6 +1608,53 @@ export default class Sdk extends Command {
 		}
 
 		const internal = parseSdkInternalArgv(this.argv);
+		if (internal.action === "broker-trampoline-internal") {
+			if (process.platform === "win32") throw new CliParseError("Broker trampoline is unavailable on Windows.");
+			const command = resolveSdkInternalSpawnCommand("broker-internal");
+			let child: ChildProcess;
+			try {
+				child = spawn(command.file, [...command.args, "--agent-dir", internal.agentDir], {
+					detached: true,
+					stdio: ["ignore", "ignore", "inherit"],
+					env: command.env,
+					...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
+				});
+			} catch (error) {
+				throw new Error("Broker trampoline could not start broker.", { cause: error });
+			}
+			let spawnError: Error | undefined;
+			child.once("error", error => {
+				spawnError = error;
+			});
+			if (child.pid === undefined) throw new Error("Broker trampoline could not start broker.");
+			const incarnation = processIncarnation(child.pid);
+			if (!incarnation) {
+				try {
+					child.kill("SIGKILL");
+				} catch {
+					// The child may already have exited; either way identity was not established.
+				}
+				throw new Error("Broker trampoline could not observe broker identity.");
+			}
+			if (spawnError) throw new Error("Broker trampoline could not start broker.", { cause: spawnError });
+			const stdoutWrite = Promise.withResolvers<void>();
+			process.stdout.write(`${child.pid}\t${incarnation}\n`, error => {
+				if (error) stdoutWrite.reject(error);
+				else stdoutWrite.resolve();
+			});
+			try {
+				await stdoutWrite.promise;
+			} catch (error) {
+				try {
+					child.kill("SIGKILL");
+				} catch {
+					// The child may already have exited; reporting failure remains authoritative.
+				}
+				throw error;
+			}
+			child.unref();
+			return;
+		}
 		if (internal.action === "broker-internal") usePostmortemSignalExitAuthority();
 		if (internal.action === "session-host-internal") {
 			await runSessionHost();

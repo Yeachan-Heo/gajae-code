@@ -291,6 +291,11 @@ export function isSdkInternalArgv(argv: readonly string[]): boolean {
 			argv.length === 3 &&
 			argv[1] === "--agent-dir" &&
 			typeof argv[2] === "string" &&
+			isSafeSdkInternalAgentDir(argv[2])) ||
+		(argv[0] === "broker-trampoline-internal" &&
+			argv.length === 3 &&
+			argv[1] === "--agent-dir" &&
+			typeof argv[2] === "string" &&
 			isSafeSdkInternalAgentDir(argv[2]))
 	);
 }
