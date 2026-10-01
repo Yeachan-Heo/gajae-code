@@ -18555,12 +18555,20 @@ export class AgentSession {
 					this.materializeActiveDefaultModelProfileAssignment(this.model);
 				}
 				this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: true });
+				// For user-selection and startup-override causes, also clear stale persisted
+				// defaults via the legacy path when there is no ownership record.
+				if (options.cause === "user-selection" || options.cause === "startup-override") {
+					const ownership = readDurableModelProfileOwnership(this.settings);
+					if (ownership.version === 0) {
+						this.#clearActiveModelProfileForConcreteDefault(options.cause);
+					}
+				}
 				const origin = options.cause === "startup-override" ? "startup-override" : "model_selection";
 				const effectiveLevel = thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel;
 				this.setConfiguredModelChain(
 					"default",
 					[formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel)],
-					origin,
+				origin,
 				);
 			}
 			await this.#syncEditToolModeAfterModelChange(previousEditMode);
@@ -18861,7 +18869,9 @@ export class AgentSession {
 						}
 					}
 					// Concrete model selection clears durable profile ownership (#5919).
-					// Only clear if there is an existing ownership record (version > 0).
+					// If there is an existing ownership record (version > 0), clear it.
+					// If there is no ownership record (version === 0), call the legacy path to
+					// clear stale persisted profiles that no longer match the selection.
 					// The ownership clear is attempted atomically with other model role updates.
 					// If it fails due to concurrent access, we log and continue: the model
 					// selection has been promoted and committed, so the concrete pick is durable.
@@ -18887,6 +18897,10 @@ export class AgentSession {
 								throw error;
 							}
 						}
+					} else {
+						// Legacy path: no ownership record exists. Clear stale persisted defaults
+						// that no longer match the concrete selection.
+						this.#clearActiveModelProfileForConcreteDefault("user-selection");
 					}
 					options?.onAfterMutation?.();
 					return { provider: model.provider, modelId: model.id, thinkingLevel: effectiveLevel };
