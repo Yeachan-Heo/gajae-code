@@ -568,6 +568,7 @@ const DEFAULT_REAP_TIMING: ReapTiming = {
 async function reapSpawnedBroker(
 	child: ChildProcess,
 	realBrokerPid?: number,
+	brokerIncarnation?: string,
 	timing: ReapTiming = DEFAULT_REAP_TIMING,
 ): Promise<void> {
 	// On Windows with hop, realBrokerPid is the actual broker process to reap.
@@ -681,7 +682,7 @@ function registerBrokerOwner(
 	const owner: BrokerOwner = {
 		async stop(): Promise<void> {
 			try {
-				await reapSpawnedBroker(child, expectedBrokerPid, timing);
+				await reapSpawnedBroker(child, expectedBrokerPid, expectedBrokerIncarnation, timing);
 			} catch (error) {
 				state = "cleanup-unverified";
 				throw error;
@@ -1171,9 +1172,10 @@ export function brokerOwnerIdentityMatchesForTest(
 export function reapSpawnedBrokerForTest(
 	child: ChildProcess,
 	realBrokerPid?: number,
+	brokerIncarnation?: string,
 	timing: ReapTiming = DEFAULT_REAP_TIMING,
 ): Promise<void> {
-	return reapSpawnedBroker(child, realBrokerPid, timing);
+	return reapSpawnedBroker(child, realBrokerPid, brokerIncarnation, timing);
 }
 /** Test hook: resolves the complete broker environment without spawning. */
 export function brokerSpawnEnvironmentForTest(
