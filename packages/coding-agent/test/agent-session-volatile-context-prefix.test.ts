@@ -215,6 +215,30 @@ describe("AgentSession volatile context cache prefix extension", () => {
 		);
 		expect(hasVolatileInAgent).toBe(true);
 	});
+	it("hides retained ephemerals from session.messages but still counts them in context usage", async () => {
+		scriptedResponses = [createTextAssistantMessage("first response")];
+		await session.prompt("first question?");
+
+		const isEphemeral = (msg: AgentMessage): boolean =>
+			msg.role === "custom" &&
+			(msg.customType === "volatile-project-context" || msg.customType === "untrusted-mcp-server-instructions");
+		expect(session.agent.state.messages.some(isEphemeral)).toBe(true);
+		expect(session.messages.some(isEphemeral)).toBe(false);
+		expect(session.messages.filter(msg => !isEphemeral(msg))).toEqual(
+			session.agent.state.messages.filter(msg => !isEphemeral(msg)),
+		);
+
+		// Context accounting must follow what the provider actually receives, so a
+		// large retained ephemeral has to raise the estimate even though it is hidden.
+		const before = session.getContextUsage();
+		const retained = session.agent.state.messages.findIndex(isEphemeral);
+		const original = session.agent.state.messages[retained];
+		if (original?.role !== "custom") throw new Error("Expected retained ephemeral message");
+		session.agent.appendMessage({ ...original, content: "x".repeat(15_000) });
+		const after = session.getContextUsage();
+		expect(before?.tokens).not.toBeNull();
+		expect(after?.tokens ?? 0).toBeGreaterThan((before?.tokens ?? 0) + 1_000);
+	});
 	it("excludes retained volatile context from handoff generation input", async () => {
 		scriptedResponses = [createTextAssistantMessage("first response"), createTextAssistantMessage("second response")];
 		await session.prompt("first question?");
