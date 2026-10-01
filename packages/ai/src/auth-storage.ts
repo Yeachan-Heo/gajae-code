@@ -5667,11 +5667,10 @@ export class AuthStorage {
 			} else {
 				const customProvider = getOAuthProvider(provider);
 				if (customProvider) {
-					const refreshToken = customProvider.refreshToken;
-					if (!refreshToken) {
+					if (!customProvider.refreshToken) {
 						failBeforeRefresh(new Error(`OAuth provider "${provider}" does not support token refresh`));
 					} else {
-						refreshPromise = refreshToken(credential);
+						refreshPromise = customProvider.refreshToken(credential);
 					}
 				} else {
 					refreshPromise = refreshOAuthToken(provider as OAuthProvider, credential);
