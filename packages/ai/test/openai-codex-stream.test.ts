@@ -80,6 +80,10 @@ function createCompletedCodexSse(text: string): string {
 	].join("\n\n")}\n\n`;
 }
 
+function createCodexErrorSse(events: Record<string, unknown>[]): string {
+	return `${events.map(event => `data: ${JSON.stringify(event)}`).join("\n\n")}\n\n`;
+}
+
 function getRequestSignal(input: string | URL | Request, init: RequestInit | undefined): AbortSignal | undefined {
 	if (init?.signal) return init.signal;
 	if (input instanceof Request) return input.signal;
@@ -321,6 +325,111 @@ describe("openai-codex streaming", () => {
 		const toolCalls = result.content.filter(block => block.type === "toolCall");
 		expect(toolCalls).toHaveLength(1);
 		expect(toolCalls[0]).toMatchObject({ name: "computer", arguments: { action: "screenshot" } });
+	});
+
+	it("salvages finalized function calls after a transient stream close", async () => {
+		const sse = createCodexErrorSse([
+			{
+				type: "response.output_item.added",
+				item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "todo_write", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_1", delta: '{"ops":[]}' },
+			{
+				type: "response.output_item.done",
+				item: {
+					type: "function_call",
+					id: "fc_1",
+					call_id: "call_1",
+					name: "todo_write",
+					arguments: '{"ops":[]}',
+				},
+			},
+			{
+				type: "error",
+				code: "request_timeout",
+				message:
+					"stream disconnected before completion: stream closed before response.completed (code=request_timeout)",
+			},
+		]);
+		global.fetch = vi.fn(
+			async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		) as unknown as typeof fetch;
+
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken() },
+		).result();
+
+		expect(result.stopReason).toBe("toolUse");
+		expect(result.errorCode).toBe("codex_stream_closed_after_finalized_tool_calls");
+		expect(result.content).toEqual([
+			{ type: "toolCall", id: "call_1|fc_1", name: "todo_write", arguments: { ops: [] } },
+		]);
+	});
+
+	it.each([
+		[
+			"unfinalized function call",
+			[
+				{
+					type: "response.output_item.added",
+					item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "todo_write", arguments: "" },
+				},
+				{ type: "response.function_call_arguments.delta", item_id: "fc_1", delta: '{"ops":' },
+			],
+		],
+		[
+			"non-transient failure",
+			[
+				{
+					type: "response.output_item.added",
+					item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "todo_write", arguments: "" },
+				},
+				{
+					type: "response.output_item.done",
+					item: {
+						type: "function_call",
+						id: "fc_1",
+						call_id: "call_1",
+						name: "todo_write",
+						arguments: '{"ops":[]}',
+					},
+				},
+			],
+		],
+		[
+			"text-only partial",
+			[
+				{
+					type: "response.output_item.added",
+					item: { type: "message", id: "msg_1", role: "assistant", status: "in_progress", content: [] },
+				},
+				{ type: "response.output_text.delta", delta: "partial" },
+			],
+		],
+	] as const)("keeps %s stream failures terminal", async (label, prefix) => {
+		const error =
+			label === "non-transient failure"
+				? { type: "error", code: "invalid_request_error", message: "invalid request" }
+				: {
+						type: "error",
+						code: "request_timeout",
+						message:
+							"stream disconnected before completion: stream closed before response.completed (code=request_timeout)",
+					};
+		const sse = createCodexErrorSse([...prefix, error]);
+		global.fetch = vi.fn(
+			async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		) as unknown as typeof fetch;
+
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken() },
+		).result();
+
+		expect(result.stopReason).toBe("error");
 	});
 
 	it.each([

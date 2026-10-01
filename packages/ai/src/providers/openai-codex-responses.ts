@@ -116,6 +116,7 @@ const CODEX_WEBSOCKET_CONNECT_TIMEOUT_MS = 10000;
 const CODEX_WEBSOCKET_IDLE_TIMEOUT_MS = 300000;
 const CODEX_WEBSOCKET_RETRY_BUDGET = CODEX_MAX_RETRIES;
 const CODEX_WEBSOCKET_TRANSPORT_ERROR_PREFIX = "Codex websocket transport error";
+const CODEX_SALVAGED_STREAM_CLOSE_ERROR_CODE = "codex_stream_closed_after_finalized_tool_calls";
 const CODEX_PREVIOUS_RESPONSE_STALE_CODES = new Set(["previous_response_not_found", "codex_previous_response_stale"]);
 // Some Codex deployments reject a stale continuation anchor with a generic
 // `invalid_request_error` code and name the anchor only in the message
@@ -1092,10 +1093,10 @@ async function processCodexResponseStream(
 ): Promise<CodexStreamCompletion> {
 	const { output, stream } = context;
 	stream.push({ type: "start", partial: output });
+	let firstTokenTime = context.firstTokenTime;
 
 	while (true) {
 		try {
-			let firstTokenTime = context.firstTokenTime;
 			for await (const rawEvent of runtime.eventStream) {
 				firstTokenTime = handleCodexStreamEvent({
 					...context,
@@ -1107,12 +1108,56 @@ async function processCodexResponseStream(
 			}
 			return { firstTokenTime };
 		} catch (error) {
+			if (trySalvageCodexFinalizedToolCalls(context, runtime, error)) {
+				return { firstTokenTime };
+			}
 			const recovered = await recoverCodexStreamError(context, runtime, error);
 			if (!recovered) {
 				throw error;
 			}
 		}
 	}
+}
+
+function trySalvageCodexFinalizedToolCalls(
+	context: CodexStreamProcessingContext,
+	runtime: CodexStreamRuntime,
+	error: unknown,
+): boolean {
+	const toolCalls = context.output.content.filter((block): block is ToolCall => block.type === "toolCall");
+	if (
+		!isCodexTransientStreamClose(error) ||
+		toolCalls.length === 0 ||
+		runtime.currentBlock !== null ||
+		context.output.content.some(block => block.type !== "thinking" && block.type !== "toolCall") ||
+		toolCalls.some(toolCall => !runtime.finalizedToolCallIds.has(toolCall.id))
+	) {
+		return false;
+	}
+
+	context.output.stopReason = "toolUse";
+	context.output.errorCode = CODEX_SALVAGED_STREAM_CLOSE_ERROR_CODE;
+	runtime.sawTerminalEvent = true;
+	logCodexDebug("codex stream closed after finalized tool calls; salvaging tool-use response", {
+		error: error instanceof Error ? error.message : String(error),
+		toolCallCount: toolCalls.length,
+		transport: runtime.transport,
+	});
+	return true;
+}
+
+function isCodexTransientStreamClose(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	const message = error.message.toLowerCase();
+	const providerCode =
+		(error as CodexProviderStreamError & { providerCode?: string }).code?.toLowerCase() ??
+		(error as { providerCode?: string }).providerCode?.toLowerCase();
+	const hasRequestTimeout = providerCode === "request_timeout" || message.includes("request_timeout");
+	const hasClosedStreamMessage =
+		message.includes("stream disconnected before completion") ||
+		message.includes("stream closed before response.completed") ||
+		message.includes("websocket closed before response completion");
+	return hasRequestTimeout && hasClosedStreamMessage;
 }
 
 function handleCodexStreamEvent(args: {
