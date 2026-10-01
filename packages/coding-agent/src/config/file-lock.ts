@@ -385,7 +385,7 @@ async function captureEmptyFileLockDirIdentity(
 	if (root.isSymbolicLink() || !root.isDirectory()) return null;
 
 	// Enumerate the directory to ensure it only contains the info file (or nothing)
-	let entries: Awaited<ReturnType<typeof fs.readdir>>;
+	let entries: string[];
 	try {
 		entries = await fs.readdir(lockDir, { withFileTypes: false });
 	} catch (error) {
