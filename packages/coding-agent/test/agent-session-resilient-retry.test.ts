@@ -1402,6 +1402,50 @@ describe.serial("AgentSession resilient retry", () => {
 		expect(retryEndEvents).toEqual([expect.objectContaining({ success: true })]);
 		expect(lastAssistant(session).content).toEqual([{ type: "text", text: "recovered after provider retries" }]);
 	});
+	it.each(["server_error", "internal_error"])("retries content-free Codex %s under bare defaults", async code => {
+		const model = getBundledModel("openai-codex", "gpt-5.4-mini");
+		if (!model) throw new Error("Expected bundled Codex test model to exist");
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			model,
+			bareDefault: true,
+			errorMessage: `Codex error event (code=${code}, status=500)`,
+			recoveredContent: "recovered after provider retries",
+			requestedModels,
+		});
+		const { retryStartEvents } = track(session);
+
+		await session.prompt(`recover Codex ${code}`);
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(1);
+		expect(requestedModels).toHaveLength(2);
+		expect(lastAssistant(session).content).toEqual([{ type: "text", text: "recovered after provider retries" }]);
+	});
+	it.each(["server_error", "internal_error"])("does not retry Codex %s after visible content", async code => {
+		const model = getBundledModel("openai-codex", "gpt-5.4-mini");
+		if (!model) throw new Error("Expected bundled Codex test model to exist");
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			model,
+			bareDefault: true,
+			errorMessage: `Codex error event (code=${code}, status=500)`,
+			partialContent: "already visible",
+			recoveredContent: "should not reach",
+			requestedModels,
+		});
+		const { retryStartEvents } = track(session);
+
+		await session.prompt(`surface visible Codex ${code}`);
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(0);
+		expect(requestedModels).toHaveLength(1);
+		expect(lastAssistant(session)).toMatchObject({
+			stopReason: "error",
+			content: [{ type: "text", text: "already visible" }],
+		});
+	});
 	it("does not retry near-miss or non-Codex overload errors under bare defaults", async () => {
 		const codexModel = getBundledModel("openai-codex", "gpt-5.4-mini");
 		const anthropicModel = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -1410,7 +1454,7 @@ describe.serial("AgentSession resilient retry", () => {
 			{
 				model: codexModel,
 				errorMessage:
-					"Codex error event: Our servers are currently overloaded. Please try again later. (code=server_error)",
+					"Codex error event: Our servers are currently overloaded. Please try again later. (code=server_error_now)",
 			},
 			{
 				model: anthropicModel,
