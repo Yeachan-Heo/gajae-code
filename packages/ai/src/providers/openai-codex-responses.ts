@@ -2336,14 +2336,22 @@ export async function prewarmOpenAICodexResponses(
 		"websocket",
 		state,
 	);
-	await logger.time(
-		"prewarmCodex:establishWs",
-		getOrCreateCodexWebSocketConnection,
-		state,
-		toWebSocketUrl(url),
-		headers,
-		options?.signal,
-	);
+	try {
+		await logger.time(
+			"prewarmCodex:establishWs",
+			getOrCreateCodexWebSocketConnection,
+			state,
+			toWebSocketUrl(url),
+			headers,
+			options?.signal,
+		);
+	} catch (error) {
+		const websocketError = error instanceof Error ? error : new Error(String(error));
+		if (isCodexWebSocketFatalError(websocketError)) {
+			recordCodexWebSocketFailure(state, true);
+		}
+		throw error;
+	}
 	state.prewarmed = true;
 }
 

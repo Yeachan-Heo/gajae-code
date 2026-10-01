@@ -4568,6 +4568,89 @@ describe("openai-codex streaming", () => {
 		expect(transportDetails.canAppend).toBe(true);
 	});
 
+	it("disables websocket after a fatal prewarm handshake failure", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const sse = createCompletedCodexSse("Hello SSE");
+		const fetchMock = vi.fn(
+			async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		);
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		let constructorCount = 0;
+		class RejectingWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				constructorCount += 1;
+				queueMicrotask(() => {
+					this.readyState = MockWebSocket.CLOSED;
+					this.emit("close", { code: 1008 } as unknown as Event);
+				});
+			}
+		}
+		global.WebSocket = RejectingWebSocket as unknown as typeof WebSocket;
+
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const options = {
+			apiKey: token,
+			sessionId: "ws-fatal-prewarm",
+			providerSessionState,
+		};
+
+		await expect(prewarmOpenAICodexResponses(model, options)).rejects.toThrow(
+			"Codex websocket transport error: websocket closed before open (1008)",
+		);
+		const afterPrewarm = getOpenAICodexTransportDetails(model, options);
+		expect(afterPrewarm.websocketDisabled).toBe(true);
+		expect(afterPrewarm.fallbackCount).toBe(1);
+
+		const result = await streamOpenAICodexResponses(model, createCodexTestContext(), options).result();
+		expect(result.stopReason).toBe("stop");
+		expect(constructorCount).toBe(1);
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("keeps websocket enabled after a non-fatal prewarm failure", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const sse = createCompletedCodexSse("Hello SSE");
+		const fetchMock = vi.fn(
+			async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		);
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		const abortController = new AbortController();
+		let constructorCount = 0;
+		class TransientFailureWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				constructorCount += 1;
+			}
+		}
+		global.WebSocket = TransientFailureWebSocket as unknown as typeof WebSocket;
+		queueMicrotask(() => abortController.abort());
+
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const options = {
+			apiKey: token,
+			sessionId: "ws-transient-prewarm",
+			signal: abortController.signal,
+			providerSessionState,
+		};
+
+		await expect(prewarmOpenAICodexResponses(model, options)).rejects.toThrow(
+			"Codex websocket transport error: request was aborted",
+		);
+		const afterPrewarm = getOpenAICodexTransportDetails(model, options);
+		expect(afterPrewarm.websocketDisabled).toBe(false);
+		expect(afterPrewarm.fallbackCount).toBe(0);
+		expect(constructorCount).toBe(1);
+	});
+
 	it("applies each reused websocket request's idle timeout", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
