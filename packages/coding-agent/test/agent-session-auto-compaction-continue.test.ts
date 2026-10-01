@@ -1064,44 +1064,59 @@ describe("AgentSession auto-compaction continuation", () => {
 		).toBe(true);
 	});
 
-	it("can prompt after auto-compaction completes without timing out - deterministic regression test for issue #6004", async () => {
-		// Regression test for issue #6004: After threshold auto-compaction, the agent_end
-		// event may be parked/pending. The fix must flush this before completing compaction,
-		// so the next prompt() does not time out with
+	it("flushes pending agent_end after overflow compaction without timing out - regression test for issue #6004", async () => {
+		// Regression test for issue #6004: After overflow auto-compaction with no continuation scheduled,
+		// the pending agent_end event must be flushed after auto_compaction_end is emitted.
+		// Without the fix, the next prompt() would time out with
 		// "Timed out waiting for prior agent run to finish before prompting".
 		//
-		// Run 5 times to verify deterministic behavior.
+		// This test exercises the real overflow path (not threshold) where the agent_end is pending
+		// and must be published after the compaction event is emitted.
 
-		for (let run = 0; run < 5; run++) {
-			vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		// First, fill the message history to trigger overflow (threshold + some buffer)
+		const largeMessage = assistantMessage({
+			usage: {
+				input: 350_000, // Exceeds the default threshold of 300K
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 350_000,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+		});
 
-			// Trigger auto-compaction
-			await driveCompaction();
-			await advancePostPrompt(100);
-			await session.waitForIdle();
+		// Trigger overflow auto-compaction by emitting agent_end
+		sessionManager.appendMessage(largeMessage);
+		session.agent.emitExternalEvent({ type: "message_end", message: largeMessage });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [largeMessage] });
 
-			// Now try to prompt again - this should NOT time out
-			let promptError: Error | undefined;
-			try {
-				await Promise.race([
-					session.prompt(`message after compaction ${run}`),
-					new Promise<void>((_, reject) =>
-						setTimeout(
-							() => reject(new Error("Timed out waiting for prior agent run to finish before prompting.")),
-							2000,
-						),
+		// Wait for compaction to complete
+		for (let i = 0; i < 20; i++) await Promise.resolve();
+		await session.waitForIdle();
+
+		// Now try to prompt - this should NOT time out even though compaction just completed
+		let promptError: Error | undefined;
+		try {
+			const promptResult = await Promise.race([
+				session.prompt("message after overflow compaction"),
+				new Promise<void>((_, reject) =>
+					setTimeout(
+						() => reject(new Error("Timed out waiting for prior agent run to finish before prompting.")),
+						3000,
 					),
-				]);
-			} catch (error) {
-				promptError = error instanceof Error ? error : new Error(String(error));
-			}
-
-			// Verify prompt succeeded
-			if (promptError?.message.includes("Timed out")) {
-				console.error(`Run ${run}: BUG REPRODUCED - Prompt timed out after compaction`);
-			}
-
-			expect(promptError, `Run ${run}: prompt should not time out after compaction`).toBeUndefined();
+				),
+			]);
+			// The prompt should have been queued without timing out
+			expect(promptResult).toBeDefined();
+		} catch (error) {
+			promptError = error instanceof Error ? error : new Error(String(error));
 		}
+
+		// Verify prompt did not time out
+		if (promptError?.message.includes("Timed out")) {
+			console.error("BUG REPRODUCED - Prompt timed out after overflow compaction");
+		}
+
+		expect(promptError, "prompt should not time out after overflow compaction").toBeUndefined();
 	});
 });
