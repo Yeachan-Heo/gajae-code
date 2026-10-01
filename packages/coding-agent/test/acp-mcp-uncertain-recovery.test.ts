@@ -196,6 +196,89 @@ test("keeps the sent uncertainty when replay reconnects before dispatch", async 
 	}
 });
 
+test("keeps sent uncertainty when replay is refused during broker restart", async () => {
+	const sentDetails = { id: "sent-request", operation: "session.create", idempotencyKey: "acp-request-5" };
+	const original = new SdkClientError("uncertain_after_send", "response lost after dispatch", sentDetails);
+	const refusal = new SdkClientError("broker_restarting", "broker restart is prepared");
+	let calls = 0;
+	const client = {
+		async global() {
+			calls += 1;
+			throw calls === 1 ? original : refusal;
+		},
+		async close() {},
+	};
+	const adapter = new AcpSdkAdapter({ client: client as never });
+	try {
+		const error = (await adapter
+			.lifecycle("session.create", { cwd: "/tmp/workspace", target: { path: "/tmp/workspace" } }, "acp-request-5")
+			.catch(value => value)) as SdkClientError & { recovery?: unknown };
+		expect(error).toBe(original);
+		expect(error.code).toBe("uncertain_after_send");
+		expect(error.details).toBe(sentDetails);
+		expect(error.recovery).toBe(refusal);
+		expect(calls).toBe(2);
+		expect(
+			(acpMcpLaunchFailure(error, [{ name: "paseo", command: "/bin/true", args: [] }]) as SdkClientError).code,
+		).toBe("uncertain_after_send");
+	} finally {
+		await adapter.close();
+	}
+});
+
+test("keeps sent uncertainty when replay is refused while broker publication is unavailable", async () => {
+	const sentDetails = { id: "sent-request", operation: "session.create", idempotencyKey: "acp-request-6" };
+	const original = new SdkClientError("uncertain_after_send", "response lost after dispatch", sentDetails);
+	const refusal = new SdkClientError("unavailable", "broker publication is unavailable");
+	let calls = 0;
+	const client = {
+		async global() {
+			calls += 1;
+			throw calls === 1 ? original : refusal;
+		},
+		async close() {},
+	};
+	const adapter = new AcpSdkAdapter({ client: client as never });
+	try {
+		const error = (await adapter
+			.lifecycle("session.create", { cwd: "/tmp/workspace", target: { path: "/tmp/workspace" } }, "acp-request-6")
+			.catch(value => value)) as SdkClientError & { recovery?: unknown };
+		expect(error).toBe(original);
+		expect(error.code).toBe("uncertain_after_send");
+		expect(error.details).toBe(sentDetails);
+		expect(error.recovery).toBe(refusal);
+		expect(calls).toBe(2);
+		expect(
+			(acpMcpLaunchFailure(error, [{ name: "paseo", command: "/bin/true", args: [] }]) as SdkClientError).code,
+		).toBe("uncertain_after_send");
+	} finally {
+		await adapter.close();
+	}
+});
+
+test("throws a reconciled terminal replay error instead of original uncertainty", async () => {
+	const original = new SdkClientError("uncertain_after_send", "response lost after dispatch");
+	const replayFailure = new SdkClientError("spawn_failed", "spawn failed during reconciliation");
+	let calls = 0;
+	const client = {
+		async global() {
+			calls += 1;
+			throw calls === 1 ? original : replayFailure;
+		},
+		async close() {},
+	};
+	const adapter = new AcpSdkAdapter({ client: client as never });
+	try {
+		const error = await adapter
+			.lifecycle("session.create", { cwd: "/tmp/workspace", target: { path: "/tmp/workspace" } }, "acp-request-7")
+			.catch(value => value);
+		expect(error).toBe(replayFailure);
+		expect(calls).toBe(2);
+	} finally {
+		await adapter.close();
+	}
+});
+
 test("keeps the sent uncertainty when replay times out before dispatch", async () => {
 	const original = new SdkClientError("uncertain_after_send", "response lost after dispatch", {
 		id: "sent-request",
