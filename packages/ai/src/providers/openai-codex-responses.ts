@@ -1143,6 +1143,9 @@ function trySalvageCodexFinalizedToolCalls(
 		toolCallCount: toolCalls.length,
 		transport: runtime.transport,
 	});
+	if (context.requestContext.websocketState) {
+		resetCodexWebSocketAppendState(context.requestContext.websocketState);
+	}
 	return true;
 }
 

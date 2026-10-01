@@ -2201,6 +2201,147 @@ describe("openai-codex streaming", () => {
 		});
 	});
 
+	it("resets websocket append state after salvaging a finalized tool call", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-salvage-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const sentRequests: Array<Record<string, unknown>> = [];
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		});
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		class SalvageWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+
+			send(data: string): void {
+				const request = JSON.parse(data) as Record<string, unknown>;
+				sentRequests.push(request);
+				const requestIndex = sentRequests.length;
+
+				if (requestIndex === 1) {
+					this.emitCodexResponse({
+						messageId: "msg_a",
+						responseId: "resp_a",
+						text: "Answer A",
+						terminalType: "response.completed",
+						includeCreated: true,
+					});
+					return;
+				}
+
+				if (requestIndex === 2) {
+					this.sendJson({ type: "response.created", response: { id: "resp_b" } });
+					this.sendJson({
+						type: "response.output_item.added",
+						item: { type: "function_call", id: "fc_b", call_id: "call_b", name: "todo_write", arguments: "" },
+					});
+					this.sendJson({
+						type: "response.function_call_arguments.delta",
+						item_id: "fc_b",
+						delta: '{"ops":[]}',
+					});
+					this.sendJson({
+						type: "response.output_item.done",
+						item: {
+							type: "function_call",
+							id: "fc_b",
+							call_id: "call_b",
+							name: "todo_write",
+							arguments: '{"ops":[]}',
+						},
+					});
+					this.sendJson({
+						type: "error",
+						code: "request_timeout",
+						message:
+							"stream disconnected before completion: stream closed before response.completed (code=request_timeout)",
+					});
+					return;
+				}
+
+				if (requestIndex === 3) {
+					expect(request.previous_response_id).toBeUndefined();
+					this.emitCodexResponse({
+						messageId: "msg_c",
+						responseId: "resp_c",
+						text: "Answer C",
+						terminalType: "response.completed",
+						includeCreated: true,
+					});
+					return;
+				}
+
+				throw new Error(`Unexpected websocket request index: ${requestIndex}`);
+			}
+		}
+
+		global.WebSocket = SalvageWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const sessionId = "ws-salvage-session";
+		const firstContext: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [{ role: "user", content: "Question A", timestamp: Date.now() }],
+		};
+		const firstResponse = await streamOpenAICodexResponses(model, firstContext, {
+			apiKey: token,
+			sessionId,
+			providerSessionState,
+		}).result();
+		const secondContext: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [
+				...firstContext.messages,
+				firstResponse,
+				{ role: "user", content: "Question B", timestamp: Date.now() + 1 },
+			],
+		};
+		const secondResponse = await streamOpenAICodexResponses(model, secondContext, {
+			apiKey: token,
+			sessionId,
+			providerSessionState,
+		}).result();
+
+		expect(secondResponse.stopReason).toBe("toolUse");
+		expect(secondResponse.errorCode).toBe("codex_stream_closed_after_finalized_tool_calls");
+		const thirdContext: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [
+				...secondContext.messages,
+				secondResponse,
+				{
+					role: "toolResult",
+					toolCallId: "call_b|fc_b",
+					toolName: "todo_write",
+					content: [{ type: "text", text: "Tool completed" }],
+					isError: false,
+					timestamp: Date.now() + 2,
+				},
+			],
+		};
+		await streamOpenAICodexResponses(model, thirdContext, {
+			apiKey: token,
+			sessionId,
+			providerSessionState,
+		}).result();
+
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(sentRequests).toHaveLength(3);
+		expect(sentRequests[2]?.previous_response_id).toBeUndefined();
+		const fullInput = sentRequests[2]?.input;
+		expect(Array.isArray(fullInput)).toBe(true);
+		const serializedInput = JSON.stringify(fullInput);
+		expect(serializedInput).toContain("Question A");
+		expect(serializedInput).toContain("Question B");
+		expect(serializedInput).toContain("function_call");
+		expect(serializedInput).toContain("function_call_output");
+		expect(serializedInput).toContain("Tool completed");
+	});
+
 	it("retries websocket continuations with full context when previous_response_id expires", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
