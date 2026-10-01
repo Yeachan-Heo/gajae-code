@@ -1442,6 +1442,64 @@ describe("AuthStorage OAuth refresh race", () => {
 		});
 	});
 
+	test("releases a failed refresh lease for peer processes", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+		const peerStore = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
+		const peer = new AuthStorage(peerStore);
+		try {
+			const provider = "unit-oauth-lease-release";
+			let refreshCalls = 0;
+			oauthUtils.registerOAuthProvider({
+				id: provider,
+				name: "Unit OAuth Lease Release",
+				sourceId: "auth-storage-oauth-refresh-race-test",
+				async login() {
+					throw new Error("Unexpected login");
+				},
+				async refreshToken() {
+					refreshCalls += 1;
+					throw new Error("refresh failed");
+				},
+				getApiKey(credentials) {
+					return credentials.access;
+				},
+			});
+
+			await authStorage.set(provider, {
+				type: "oauth",
+				access: "access-before",
+				refresh: "refresh-before",
+				expires: Date.now() - 60_000,
+			});
+			await peer.reload();
+			const row = store.listAuthCredentials(provider)[0];
+			if (!row) throw new Error("expected OAuth credential");
+
+			await expect(authStorage.refreshCredentialById(row.id)).rejects.toThrow("refresh failed");
+			expect(refreshCalls).toBe(1);
+
+			const peerClaim = peerStore.claimOAuthRefreshLease(
+				row.id,
+				"refresh-before",
+				false,
+				"lease-release-test-peer",
+				Date.now(),
+				15_000,
+			);
+			expect(peerClaim.kind).toBe("claimed");
+			if (peerClaim.kind === "claimed") {
+				peerStore.releaseOAuthRefreshLease(peerClaim.lease);
+			}
+
+			const peerRefreshStarted = performance.now();
+			await expect(peer.refreshCredentialById(row.id)).rejects.toThrow("refresh failed");
+			expect(performance.now() - peerRefreshStarted).toBeLessThan(1_000);
+			expect(refreshCalls).toBe(2);
+		} finally {
+			peerStore.close();
+		}
+	});
+
 	test("leases one rotating token across SQLite connections and adopts the winner", async () => {
 		if (!authStorage || !store) throw new Error("test setup failed");
 		const peerStore = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
