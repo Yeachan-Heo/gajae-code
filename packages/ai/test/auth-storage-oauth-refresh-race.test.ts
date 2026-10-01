@@ -1593,6 +1593,64 @@ describe("AuthStorage OAuth refresh race", () => {
 		}
 	});
 
+	test("releases a failed refresh lease so another process can claim immediately", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+		const peerStore = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
+		const peer = new AuthStorage(peerStore);
+		try {
+			const provider = "unit-oauth-lease-release";
+			let refreshCalls = 0;
+			oauthUtils.registerOAuthProvider({
+				id: provider,
+				name: "Unit OAuth Lease Release",
+				sourceId: "auth-storage-oauth-refresh-race-test",
+				async login() {
+					return { access: "unused", refresh: "unused", expires: Date.now() + 60 * 60_000 };
+				},
+				async refreshToken() {
+					refreshCalls += 1;
+					throw new Error("temporary refresh failure");
+				},
+				getApiKey(credentials) {
+					return credentials.access;
+				},
+			});
+
+			await authStorage.set(provider, {
+				type: "oauth",
+				access: "expired-access",
+				refresh: "shared-refresh",
+				expires: Date.now() - 60_000,
+			});
+			await peer.reload();
+			const credentialId = store.listAuthCredentials(provider)[0]?.id;
+			if (credentialId === undefined) throw new Error("credential missing");
+			await expect(authStorage.refreshCredentialById(credentialId)).rejects.toThrow("temporary refresh failure");
+			const startedAt = Date.now();
+			await expect(peer.refreshCredentialById(credentialId)).rejects.toThrow("temporary refresh failure");
+			expect(Date.now() - startedAt).toBeLessThan(1_000);
+			expect(refreshCalls).toBe(2);
+		} finally {
+			peerStore.close();
+		}
+	});
+
+	test("disables a credential after an unknown OAuth provider refresh failure", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+		const provider = "jetbrains-junie";
+		await authStorage.set(provider, {
+			type: "oauth",
+			access: "expired-access",
+			refresh: "unknown-provider-refresh",
+			expires: Date.now() - 60_000,
+		});
+
+		expect(await authStorage.getApiKey(provider, "unknown-provider")).toBeUndefined();
+		expect(events).toHaveLength(1);
+		expect(events[0]?.disabledCause).toContain("Unknown OAuth provider: jetbrains-junie");
+		expect(store.listAuthCredentials(provider)).toHaveLength(0);
+	});
+
 	test("expires abandoned leases, isolates credentials, and never lets force steal an active lease", async () => {
 		if (!authStorage || !(store instanceof SqliteAuthCredentialStore)) throw new Error("test setup failed");
 		await authStorage.set("anthropic", [
