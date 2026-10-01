@@ -8164,10 +8164,8 @@ export async function executeLifecycle(
 	);
 	const startupFailure: LifecycleStartupFailureReceipt | undefined = evidence
 		? {
-				artifactDigest: evidence.digest,
 				phase: evidence.artifact.phase,
 				reason: evidence.artifact.reason,
-				message: evidence.artifact.message,
 				...(evidence.artifact.code === undefined
 					? {}
 					: { code: evidence.artifact.code, details: evidence.artifact.details }),
