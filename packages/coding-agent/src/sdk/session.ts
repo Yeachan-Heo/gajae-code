@@ -582,6 +582,12 @@ export interface CreateAgentSessionOptions {
 	 */
 	deferMemoryBackendStartup?: boolean;
 
+	/**
+	 * Defer model profile activation until explicit model pin validation occurs.
+	 * @internal Lifecycle-only: prevents default profile activation before pin resolution.
+	 */
+	deferModelProfileActivation?: boolean;
+
 	/** Enable LSP integration (tool, formatting, diagnostics, warmup). Default: true */
 	enableLsp?: boolean;
 	/** Skip Python kernel availability check and prelude warmup */
@@ -5416,7 +5422,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			forkContextSeed: options.forkContextSeed,
 			providerSessionState: options.providerSessionState,
 		});
-		session.setActiveModelProfile(startupActiveModelProfile);
+		// Defer profile activation until explicit model pin validation occurs (#5919).
+		if (!options.deferModelProfileActivation) {
+			session.setActiveModelProfile(startupActiveModelProfile);
+		}
 		if (retainedRecoveryBindingsAfterLateRestore) session.markStartupRecoveryBindingsRequired();
 		if (recoveredSessionDefault)
 			session.installRecoveredDefaultFallbackChain(
