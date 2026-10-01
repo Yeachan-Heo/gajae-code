@@ -65,6 +65,7 @@ import {
 	resolveMissingSessionModelRecovery,
 } from "../config/model-profile-activation";
 import { resolveModelProfileName } from "../config/model-profile-contract";
+import type { ModelProfileOwnershipMarker } from "../config/model-profile-ownership";
 import { resolveProfileBindings } from "../config/model-profiles";
 import { kNoAuth, ModelRegistry } from "../config/model-registry";
 import {
@@ -489,6 +490,8 @@ export interface CreateAgentSessionOptions {
 	modelPattern?: string;
 	/** Active profile inherited by a nested SDK/subagent session. */
 	activeModelProfile?: string;
+	/** Model profile ownership marker for propagating parent profile ownership to subagent sessions. */
+	modelProfileOwnershipMarker?: ModelProfileOwnershipMarker;
 	/** Thinking selector. Default: from settings, else unset */
 	thinkingLevel?: ThinkingLevel;
 	/** Runtime substitution metadata for the initial model_change session event. */
@@ -1934,6 +1937,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
 			}));
 		liveSessionManager = sessionManager;
+		// Apply inherited model profile ownership marker to subagent sessions when a parent provides one.
+		if (options.modelProfileOwnershipMarker !== undefined) {
+			sessionManager.appendModelProfileOwnershipMarker(options.modelProfileOwnershipMarker);
+		}
 		const logicalSessionId = sessionManager.getSessionId();
 		// Fork-context seeds carry conversation content only, never provider identity:
 		// a shared continuity id would make concurrent subagents present the same
