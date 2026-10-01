@@ -2378,25 +2378,43 @@ export async function prewarmOpenAICodexResponses(
 		"websocket",
 		state,
 	);
+	const connectionPromise = logger.time(
+		"prewarmCodex:establishWs",
+		getOrCreateCodexWebSocketConnection,
+		state,
+		toWebSocketUrl(url),
+		headers,
+		options?.signal,
+	);
+	const attemptedConnection = state.connection;
 	try {
-		await logger.time(
-			"prewarmCodex:establishWs",
-			getOrCreateCodexWebSocketConnection,
-			state,
-			toWebSocketUrl(url),
-			headers,
-			options?.signal,
-		);
+		await connectionPromise;
 	} catch (error) {
 		const websocketError = error instanceof Error ? error : new Error(String(error));
-		if (isCodexWebSocketFatalError(websocketError)) {
+		const superseded =
+			attemptedConnection?.wasClosedLocally() === true ||
+			(attemptedConnection !== undefined && state.connection !== attemptedConnection);
+		const fatalPrewarmFailure =
+			isCodexWebSocketFatalError(websocketError) &&
+			!websocketError.message.toLowerCase().includes("connection timeout") &&
+			!/^.*websocket closed before open \((?:1000|1001|1005)\)$/i.test(websocketError.message) &&
+			!superseded &&
+			state.connection === attemptedConnection;
+		if (fatalPrewarmFailure) {
 			recordCodexWebSocketFailure(state, true);
 			if (publicSessionKey) providerSessionState.disabledWebSocketPublicSessions.add(publicSessionKey);
 			if (publicSessionKey) disabledCodexPublicSessionKeys.add(publicSessionKey);
+		} else if (superseded) {
+			logCodexDebug("ignoring superseded Codex websocket prewarm failure", {
+				error: websocketError.message,
+				publicSessionKey,
+			});
 		}
 		throw error;
 	}
-	state.prewarmed = true;
+	if (state.connection === attemptedConnection) {
+		state.prewarmed = true;
+	}
 }
 
 function getCodexWebSocketSessionKey(
@@ -2415,10 +2433,9 @@ function resolveCodexWebSocketSessionKey(
 	publicSessionKey: string | undefined,
 	providerSessionState: CodexProviderSessionState,
 ): string {
-	if (!publicSessionKey) return sessionKey;
-	const existingSessionKey = providerSessionState.webSocketPublicToPrivate.get(publicSessionKey);
-	if (existingSessionKey) return existingSessionKey;
-	providerSessionState.webSocketPublicToPrivate.set(publicSessionKey, sessionKey);
+	if (publicSessionKey) {
+		providerSessionState.webSocketPublicToPrivate.set(publicSessionKey, sessionKey);
+	}
 	return sessionKey;
 }
 
@@ -2687,6 +2704,7 @@ class CodexWebSocketConnection {
 	#waiters: Array<() => void> = [];
 	#connectPromise?: Promise<void>;
 	#activeRequest = false;
+	#localCloseReason?: string;
 
 	constructor(url: string, headers: Record<string, string>, options: CodexWebSocketConnectionOptions) {
 		this.#url = url;
@@ -2699,11 +2717,16 @@ class CodexWebSocketConnection {
 		return this.#socket?.readyState === WebSocket.OPEN;
 	}
 
+	wasClosedLocally(): boolean {
+		return this.#localCloseReason !== undefined;
+	}
+
 	matchesAuth(headers: Record<string, string>): boolean {
 		return this.#headers.authorization === headers.authorization;
 	}
 
 	close(reason = "done"): void {
+		this.#localCloseReason = reason;
 		if (
 			this.#socket &&
 			(this.#socket.readyState === WebSocket.OPEN || this.#socket.readyState === WebSocket.CONNECTING)

@@ -4694,6 +4694,224 @@ describe("openai-codex streaming", () => {
 		expect(constructorCount).toBe(1);
 	});
 
+	it("ignores a fatal failure from a superseded prewarm connection", async () => {
+		const firstSocketCreated = Promise.withResolvers<void>();
+		const sockets: MockWebSocket[] = [];
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		});
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		class SupersededPrewarmWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				sockets.push(this);
+				if (sockets.length === 1) {
+					firstSocketCreated.resolve();
+				} else {
+					this.scheduleOpen();
+				}
+			}
+
+			close(): void {
+				this.readyState = MockWebSocket.CLOSED;
+				this.emit("close", { code: 1008 } as unknown as Event);
+			}
+
+			send(): void {
+				this.emitCodexResponse({ messageId: "msg_successor", responseId: "resp_successor", text: "successor" });
+			}
+		}
+
+		global.WebSocket = SupersededPrewarmWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const options = {
+			apiKey: createCodexTestToken(),
+			sessionId: "ws-superseded-prewarm",
+			providerSessionState,
+		};
+		const prewarmPromise = prewarmOpenAICodexResponses(model, options);
+		const prewarmFailure = prewarmPromise.catch(error => error);
+		await firstSocketCreated.promise;
+
+		const result = await streamOpenAICodexResponses(model, createCodexTestContext(), options).result();
+		const prewarmError = await prewarmFailure;
+		expect(prewarmError instanceof Error ? prewarmError.message : String(prewarmError)).toContain(
+			"websocket closed before open (1008)",
+		);
+
+		expect(result.stopReason).toBe("stop");
+		expect(sockets).toHaveLength(2);
+		expect(sockets[1]?.readyState).toBe(MockWebSocket.OPEN);
+		expect(getOpenAICodexTransportDetails(model, options).websocketDisabled).toBe(false);
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it("keeps continuation state isolated across account switches", async () => {
+		const requests: Array<Record<string, unknown>> = [];
+		class AccountScopedWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+
+			send(data: string): void {
+				requests.push(JSON.parse(data) as Record<string, unknown>);
+				const index = requests.length;
+				this.emitCodexResponse({
+					messageId: `msg_account_${index}`,
+					responseId: `resp_account_${index}`,
+					text: `Account ${index}`,
+				});
+			}
+		}
+
+		global.WebSocket = AccountScopedWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const sessionId = "ws-account-switch-healthy";
+		const firstContext: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [{ role: "user", content: "First question", timestamp: Date.now() }],
+		};
+		const first = await streamOpenAICodexResponses(model, firstContext, {
+			apiKey: createCodexTestToken("acc_a"),
+			sessionId,
+			providerSessionState,
+		}).result();
+		const secondContext: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [
+				...firstContext.messages,
+				first,
+				{ role: "user", content: "Second question", timestamp: Date.now() + 1 },
+			],
+		};
+
+		const second = await streamOpenAICodexResponses(model, secondContext, {
+			apiKey: createCodexTestToken("acc_b"),
+			sessionId,
+			providerSessionState,
+		}).result();
+
+		expect(first.stopReason).toBe("stop");
+		expect(second.stopReason).toBe("stop");
+		expect(requests).toHaveLength(2);
+		expect(requests[1]?.previous_response_id).toBeUndefined();
+		expect(JSON.stringify(requests[1]?.input)).toContain("First question");
+		expect(JSON.stringify(requests[1]?.input)).toContain("Second question");
+	});
+
+	it("does not disable websocket after a non-fatal prewarm close", async () => {
+		class GracefulPrewarmCloseWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				queueMicrotask(() => {
+					this.readyState = MockWebSocket.CLOSED;
+					this.emit("close", { code: 1000 } as unknown as Event);
+				});
+			}
+		}
+
+		global.WebSocket = GracefulPrewarmCloseWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const options = {
+			apiKey: createCodexTestToken(),
+			sessionId: "ws-graceful-prewarm-close",
+			providerSessionState: new Map<string, ProviderSessionState>(),
+		};
+
+		await expect(prewarmOpenAICodexResponses(model, options)).rejects.toThrow(
+			"Codex websocket transport error: websocket closed before open (1000)",
+		);
+		expect(getOpenAICodexTransportDetails(model, options)).toMatchObject({
+			websocketDisabled: false,
+			fallbackCount: 0,
+		});
+	});
+
+	it("ignores a late prewarm failure after successor response completion", async () => {
+		const sockets: MockWebSocket[] = [];
+		const firstSocketCreated = Promise.withResolvers<void>();
+		class LatePrewarmFailureWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				sockets.push(this);
+				if (sockets.length === 1) firstSocketCreated.resolve();
+				else this.scheduleOpen();
+			}
+
+			close(): void {
+				this.readyState = MockWebSocket.CLOSED;
+			}
+
+			send(): void {
+				this.emitCodexResponse({ messageId: "msg_late", responseId: "resp_late", text: "successor" });
+			}
+		}
+
+		global.WebSocket = LatePrewarmFailureWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const options = {
+			apiKey: createCodexTestToken(),
+			sessionId: "ws-late-prewarm",
+			providerSessionState,
+		};
+		const prewarmPromise = prewarmOpenAICodexResponses(model, options);
+		await firstSocketCreated.promise;
+		const result = await streamOpenAICodexResponses(model, createCodexTestContext(), options).result();
+		sockets[0]?.emit("close", { code: 1008 } as unknown as Event);
+		await expect(prewarmPromise).rejects.toThrow("websocket closed before open (1008)");
+
+		expect(result.stopReason).toBe("stop");
+		expect(getOpenAICodexTransportDetails(model, options)).toMatchObject({
+			websocketDisabled: false,
+			websocketConnected: true,
+		});
+	});
+
+	it("does not record a prewarm failure after provider session teardown", async () => {
+		let firstSocket: MockWebSocket | undefined;
+		let socketCount = 0;
+		const firstSocketCreated = Promise.withResolvers<void>();
+		class TeardownPrewarmWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				socketCount += 1;
+				if (socketCount === 1) {
+					firstSocket = this;
+					firstSocketCreated.resolve();
+				} else this.scheduleOpen();
+			}
+
+			send(): void {
+				this.emitCodexResponse({ messageId: "msg_fresh", responseId: "resp_fresh", text: "fresh" });
+			}
+		}
+
+		global.WebSocket = TeardownPrewarmWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const options = {
+			apiKey: createCodexTestToken(),
+			sessionId: "ws-teardown-prewarm",
+			providerSessionState,
+		};
+		const prewarmPromise = prewarmOpenAICodexResponses(model, options);
+		await firstSocketCreated.promise;
+		const codexState = providerSessionState.get("openai-codex-responses");
+		codexState?.close();
+		firstSocket?.emit("close", { code: 1008 } as unknown as Event);
+		await expect(prewarmPromise).rejects.toThrow("websocket closed before open (1008)");
+
+		const result = await streamOpenAICodexResponses(model, createCodexTestContext(), options).result();
+		expect(result.stopReason).toBe("stop");
+		expect(socketCount).toBe(2);
+		expect(getOpenAICodexTransportDetails(model, options).websocketDisabled).toBe(false);
+	});
+
 	it("applies each reused websocket request's idle timeout", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
