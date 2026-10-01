@@ -986,8 +986,9 @@ mapping.
 
 - paired provider identity and operation capability are checked before the
   Broker call;
-- retries reuse the same provider request key, so one request produces one
-  Broker ledger identity and at most one lifecycle effect;
+- retries reuse the same provider request key; replay and at-most-once lifecycle
+  effects apply while the Broker ledger retains that identity. Eligible settled
+  identities may be evicted oldest-first under capacity pressure;
 - `terminal_uncertain` remains uncertain and is reconciled from Broker ledger,
   effect marker, process incarnation, endpoint/index, readiness, and exact
   cleanup evidence only;
