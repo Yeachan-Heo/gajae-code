@@ -2,18 +2,23 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { FileLockAcquireError, FileLockTestHooks, withFileLock } from "@gajae-code/coding-agent/config/file-lock";
+import {
+	__testSeam_setForceEnableEmptyLockDirRemoval,
+	FileLockAcquireError,
+	FileLockTestHooks,
+	withFileLock,
+} from "@gajae-code/coding-agent/config/file-lock";
 
 const tempDirs: string[] = [];
 
 beforeEach(() => {
 	// Enable empty lock directory removal on all platforms for testing
-	FileLockTestHooks.forceEnableEmptyLockDirRemoval = true;
+	__testSeam_setForceEnableEmptyLockDirRemoval(true);
 });
 
 afterEach(async () => {
 	// Disable the test hook
-	FileLockTestHooks.forceEnableEmptyLockDirRemoval = false;
+	__testSeam_setForceEnableEmptyLockDirRemoval(false);
 	FileLockTestHooks.beforeEmptyLockDirClaim = undefined;
 
 	for (const dir of tempDirs.splice(0)) {
