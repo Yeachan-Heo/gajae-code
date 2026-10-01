@@ -111,7 +111,6 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 
 		globalThis.fetch = (async () => {
 			return new Response(streamFrom([initialResponse, metadataWithRefusal]), {
-				ok: true,
 				status: 200,
 				headers: { "content-type": "application/vnd.amazon.eventstream" },
 			});
@@ -178,7 +177,6 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 
 		globalThis.fetch = (async () => {
 			return new Response(streamFrom([chunk1, chunk2]), {
-				ok: true,
 				status: 200,
 				headers: { "content-type": "application/vnd.amazon.eventstream" },
 			});
@@ -204,7 +202,7 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 		expect(errorEvent?.message?.errorMessage).toContain("Cannot assist with that request");
 	});
 
-	test("preserves generic empty-body error when no refusal is present", async () => {
+	test("does not report a refusal when the metadata carries none", async () => {
 		const events: Array<{ type: string; message?: { errorMessage?: string } }> = [];
 
 		// Create an event stream with only metadata, no response content, no refusal
@@ -219,7 +217,6 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 
 		globalThis.fetch = (async () => {
 			return new Response(streamFrom([emptyMetadata]), {
-				ok: true,
 				status: 200,
 				headers: { "content-type": "application/vnd.amazon.eventstream" },
 			});
@@ -239,9 +236,8 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 
 		globalThis.fetch = originalFetch;
 
-		const errorEvent = events.find(e => e.type === "error");
-		expect(errorEvent).toBeDefined();
-		expect(errorEvent?.message?.errorMessage).toBe("Kiro API key stream returned no tokens");
+		expect(events.find(e => e.type === "error")).toBeUndefined();
+		expect(events.at(-1)?.type).toBe("done");
 	});
 
 	test("refusal without explanation is still reported with category", async () => {
@@ -264,7 +260,6 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 
 		globalThis.fetch = (async () => {
 			return new Response(streamFrom([metadataWithRefusalNoExplanation]), {
-				ok: true,
 				status: 200,
 				headers: { "content-type": "application/vnd.amazon.eventstream" },
 			});
@@ -309,7 +304,6 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 
 		globalThis.fetch = (async () => {
 			return new Response(streamFrom([metadataWithRefusalNoCategory]), {
-				ok: true,
 				status: 200,
 				headers: { "content-type": "application/vnd.amazon.eventstream" },
 			});

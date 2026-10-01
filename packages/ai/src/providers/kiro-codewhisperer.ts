@@ -432,17 +432,6 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 
 			if (options.signal?.aborted) throw new Error("Request was aborted");
 
-			// Check for truly empty output (no text, no tool calls)
-			const hasText = blocks.some(b => b.type === "text" && (b.text?.length ?? 0) > 0);
-			const hasToolCall = blocks.some(b => b.type === "toolCall");
-			if (!hasText && !hasToolCall) {
-				output.stopReason = "error";
-				output.errorMessage = "Kiro API key stream returned no tokens";
-				stream.push({ type: "error", reason: "error", error: output });
-				stream.end();
-				return;
-			}
-
 			// Finalize blocks
 			for (const block of blocks) {
 				delete block.index;
@@ -450,6 +439,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 			}
 
 			// Determine stop reason
+			const hasToolCall = blocks.some(b => b.type === "toolCall");
 			output.stopReason = hasToolCall ? "toolUse" : "stop";
 
 			output.duration = Date.now() - startTime;
