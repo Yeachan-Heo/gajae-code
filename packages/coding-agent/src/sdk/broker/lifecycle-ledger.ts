@@ -653,16 +653,42 @@ export class LifecycleLedger {
 			if (entry.state === "accepted" && !anchors.has(entry.identity) && entry.requestHash === latest?.requestHash)
 				anchors.set(entry.identity, entry);
 		}
-		const snapshot: LifecycleLedgerEntry[] = [];
 		const compacted = new Map(this.#byIdentity);
 		if (replacement) compacted.set(replacement.identity, replacement);
-		for (const [identity, latest] of compacted) {
-			const anchor = anchors.get(identity);
-			if (!anchor) throw new Error("Lifecycle ledger compaction requires an accepted identity anchor.");
-			snapshot.push(replacement?.identity === identity && latest.state === "accepted" ? latest : anchor);
-			if (latest.state !== "accepted") snapshot.push(latest);
+		const buildSnapshot = (): LifecycleLedgerEntry[] => {
+			const next: LifecycleLedgerEntry[] = [];
+			for (const [identity, latest] of compacted) {
+				const anchor = anchors.get(identity);
+				if (!anchor) throw new Error("Lifecycle ledger compaction requires an accepted identity anchor.");
+				next.push(replacement?.identity === identity && latest.state === "accepted" ? latest : anchor);
+				if (latest.state !== "accepted") next.push(latest);
+			}
+			return next;
+		};
+		let snapshot = buildSnapshot();
+		let contents = Buffer.from(snapshot.map(entry => `${JSON.stringify(entry)}\n`).join(""));
+		const needsEviction =
+			replacement === undefined
+				? snapshot.length >= this.#limits.maxRows || contents.length >= this.#limits.maxBytes
+				: snapshot.length > this.#limits.maxRows || contents.length > this.#limits.maxBytes;
+		if (needsEviction) {
+			const evictable = [...compacted.values()]
+				.filter(
+					latest =>
+						latest.identity !== replacement?.identity &&
+						terminal(latest.state) &&
+						pendingCleanupSessionId(latest.response) === undefined &&
+						pendingCleanupSessionId(latest.unresolvedCleanupResponse) === undefined,
+				)
+				.sort((left, right) => left.ts - right.ts);
+			for (const latest of evictable) {
+				if (snapshot.length <= this.#limits.maxRows / 2 && contents.length <= this.#limits.maxBytes / 2) break;
+				compacted.delete(latest.identity);
+				snapshot = buildSnapshot();
+				contents = Buffer.from(snapshot.map(entry => `${JSON.stringify(entry)}\n`).join(""));
+			}
+			// Replay is guaranteed only for identities retained in the compacted ledger.
 		}
-		const contents = Buffer.from(snapshot.map(entry => `${JSON.stringify(entry)}\n`).join(""));
 		if (
 			snapshot.length > this.#limits.maxRows ||
 			contents.length > this.#limits.maxBytes ||
