@@ -4,8 +4,13 @@
 // time the same fixtures through the same public entrypoint (`renderDiff`),
 // which computes a word diff for every adjacent removed/added line pair. Only
 // the implementation behind it differs (jsdiff on base, native on head).
+import { Settings } from "../../coding-agent/src/config/settings";
 import { renderDiff } from "../../coding-agent/src/modes/components/diff";
+import { initTheme } from "../../coding-agent/src/modes/theme/theme";
 import { runAbSuite } from "./ab-adapter";
+
+await initTheme("dark");
+await Settings.init({ inMemory: true, cwd: process.cwd() });
 
 interface Fixture {
 	id: string;
