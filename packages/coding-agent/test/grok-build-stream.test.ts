@@ -1,4 +1,4 @@
-import { describe, expect, it, spyOn, beforeEach } from "bun:test";
+import { beforeEach, describe, expect, it, spyOn } from "bun:test";
 import type { Api, Context, Model, SimpleStreamOptions } from "@gajae-code/ai";
 import * as openaiResponses from "@gajae-code/ai/providers/openai-responses";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
@@ -12,6 +12,14 @@ describe("Grok Build stream wrapper", () => {
 
 	it("forwards requests through OpenAI responses with Grok Build headers", () => {
 		const captured: { model?: Model<Api>; options?: unknown } = {};
+		const fetchSpy = spyOn(globalThis, "fetch").mockResolvedValueOnce(
+			new Response(
+				JSON.stringify({
+					tag_name: "v1.0.13",
+				}),
+				{ status: 200 },
+			),
+		);
 		const spy = spyOn(openaiResponses, "streamOpenAIResponses").mockImplementation((model, _context, options) => {
 			captured.model = model as Model<Api>;
 			captured.options = options as unknown;
@@ -43,12 +51,21 @@ describe("Grok Build stream wrapper", () => {
 				"x-xai-token-auth": "xai-grok-cli",
 			});
 		} finally {
+			fetchSpy.mockRestore();
 			spy.mockRestore();
 		}
 	});
 
 	it("uses version manager for x-grok-client-version header instead of hardcoded 0.2.33", () => {
 		const captured: { model?: Model<Api>; options?: unknown } = {};
+		const fetchSpy = spyOn(globalThis, "fetch").mockResolvedValueOnce(
+			new Response(
+				JSON.stringify({
+					tag_name: "v1.0.13",
+				}),
+				{ status: 200 },
+			),
+		);
 		const spy = spyOn(openaiResponses, "streamOpenAIResponses").mockImplementation((model, _context, options) => {
 			captured.model = model as Model<Api>;
 			captured.options = options as unknown;
@@ -74,15 +91,24 @@ describe("Grok Build stream wrapper", () => {
 			expect(version).toBeDefined();
 			expect(version).not.toBe("0.2.33");
 
-			// Should be at least 1.0.13 (the fallback)
+			// Should be at least 1.0.13 (fallback or fetched)
 			expect(version).toBe("1.0.13");
 		} finally {
+			fetchSpy.mockRestore();
 			spy.mockRestore();
 		}
 	});
 
 	it("includes sessionId in x-grok-conv-id header when provided", () => {
 		const captured: { options?: unknown } = {};
+		const fetchSpy = spyOn(globalThis, "fetch").mockResolvedValueOnce(
+			new Response(
+				JSON.stringify({
+					tag_name: "v1.0.13",
+				}),
+				{ status: 200 },
+			),
+		);
 		const spy = spyOn(openaiResponses, "streamOpenAIResponses").mockImplementation((_model, _context, options) => {
 			captured.options = options as unknown;
 			return new AssistantMessageEventStream();
@@ -102,12 +128,21 @@ describe("Grok Build stream wrapper", () => {
 			const headers = (captured.options as { headers?: Record<string, string> } | undefined)?.headers;
 			expect(headers?.["x-grok-conv-id"]).toBe("custom-session-id");
 		} finally {
+			fetchSpy.mockRestore();
 			spy.mockRestore();
 		}
 	});
 
 	it("omits x-grok-conv-id header when sessionId is not provided", () => {
 		const captured: { options?: unknown } = {};
+		const fetchSpy = spyOn(globalThis, "fetch").mockResolvedValueOnce(
+			new Response(
+				JSON.stringify({
+					tag_name: "v1.0.13",
+				}),
+				{ status: 200 },
+			),
+		);
 		const spy = spyOn(openaiResponses, "streamOpenAIResponses").mockImplementation((_model, _context, options) => {
 			captured.options = options as unknown;
 			return new AssistantMessageEventStream();
@@ -125,6 +160,7 @@ describe("Grok Build stream wrapper", () => {
 			const headers = (captured.options as { headers?: Record<string, string> } | undefined)?.headers;
 			expect(headers?.["x-grok-conv-id"]).toBeUndefined();
 		} finally {
+			fetchSpy.mockRestore();
 			spy.mockRestore();
 		}
 	});
