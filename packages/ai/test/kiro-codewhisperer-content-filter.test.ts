@@ -112,9 +112,9 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 		globalThis.fetch = (async () => {
 			return new Response(streamFrom([initialResponse, metadataWithRefusal]), {
 				ok: true,
-				body: streamFrom([initialResponse, metadataWithRefusal]),
 				status: 200,
-			} as unknown as Response);
+				headers: { "content-type": "application/vnd.amazon.eventstream" },
+			});
 		}) as unknown as typeof fetch;
 
 		try {
@@ -180,7 +180,8 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 			return new Response(streamFrom([chunk1, chunk2]), {
 				ok: true,
 				status: 200,
-			} as unknown as Response);
+				headers: { "content-type": "application/vnd.amazon.eventstream" },
+			});
 		}) as unknown as typeof fetch;
 
 		try {
@@ -220,7 +221,8 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 			return new Response(streamFrom([emptyMetadata]), {
 				ok: true,
 				status: 200,
-			} as unknown as Response);
+				headers: { "content-type": "application/vnd.amazon.eventstream" },
+			});
 		}) as unknown as typeof fetch;
 
 		try {
@@ -264,7 +266,8 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 			return new Response(streamFrom([metadataWithRefusalNoExplanation]), {
 				ok: true,
 				status: 200,
-			} as unknown as Response);
+				headers: { "content-type": "application/vnd.amazon.eventstream" },
+			});
 		}) as unknown as typeof fetch;
 
 		try {
@@ -308,7 +311,8 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 			return new Response(streamFrom([metadataWithRefusalNoCategory]), {
 				ok: true,
 				status: 200,
-			} as unknown as Response);
+				headers: { "content-type": "application/vnd.amazon.eventstream" },
+			});
 		}) as unknown as typeof fetch;
 
 		try {
