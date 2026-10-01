@@ -1064,14 +1064,10 @@ describe("AgentSession auto-compaction continuation", () => {
 		).toBe(true);
 	});
 
-	it("flushes pending agent_end after overflow compaction without timing out - regression test for issue #6004", async () => {
-		// Regression test for issue #6004: After overflow auto-compaction with no continuation scheduled,
-		// the pending agent_end event must be flushed after auto_compaction_end is emitted.
-		// Without the fix, the next prompt() would time out with
-		// "Timed out waiting for prior agent run to finish before prompting".
-		//
-		// This test exercises the real overflow path (not threshold) where the agent_end is pending
-		// and must be published after the compaction event is emitted.
+	it("allows prompting after overflow compaction completes", async () => {
+		// Verify that prompts can be submitted after overflow auto-compaction completes.
+		// This test exercises the overflow path to ensure that compaction transitions
+		// are handled correctly and don't block subsequent prompt admission.
 
 		// First, fill the message history to trigger overflow (threshold + some buffer)
 		const largeMessage = assistantMessage({
@@ -1094,16 +1090,13 @@ describe("AgentSession auto-compaction continuation", () => {
 		for (let i = 0; i < 20; i++) await Promise.resolve();
 		await session.waitForIdle();
 
-		// Now try to prompt - this should NOT time out even though compaction just completed
+		// Now try to prompt - this should succeed without timing out
 		let promptError: Error | undefined;
 		try {
 			await Promise.race([
 				session.prompt("message after overflow compaction"),
 				new Promise<void>((_, reject) =>
-					setTimeout(
-						() => reject(new Error("Timed out waiting for prior agent run to finish before prompting.")),
-						3000,
-					),
+					setTimeout(() => reject(new Error("Timed out waiting for prompt after compaction")), 3000),
 				),
 			]);
 			// The prompt should have been queued without timing out
@@ -1111,11 +1104,6 @@ describe("AgentSession auto-compaction continuation", () => {
 			promptError = error instanceof Error ? error : new Error(String(error));
 		}
 
-		// Verify prompt did not time out
-		if (promptError?.message.includes("Timed out")) {
-			console.error("BUG REPRODUCED - Prompt timed out after overflow compaction");
-		}
-
-		expect(promptError, "prompt should not time out after overflow compaction").toBeUndefined();
+		expect(promptError, "prompt should succeed after overflow compaction").toBeUndefined();
 	});
 });

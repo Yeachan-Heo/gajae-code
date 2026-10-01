@@ -1,3 +1,3 @@
-### Fixes
+### Tests
 
-- Flush pending agent_end event after auto-compaction completes to prevent "Timed out waiting for prior agent run to finish" error on the next prompt. When the session is loaded in a new process after compaction, the in-memory agent_end event is lost, causing the next prompt() call to timeout. Fixes #6004.
+- Add regression test for issue #6004: Verify that after overflow auto-compaction without a continuation scheduled, the session remains usable for subsequent prompts. The test exercises the overflow path to ensure pending agent_end events do not block future prompt submissions (related to #6004).
