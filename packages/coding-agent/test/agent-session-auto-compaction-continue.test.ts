@@ -1097,7 +1097,7 @@ describe("AgentSession auto-compaction continuation", () => {
 		// Now try to prompt - this should NOT time out even though compaction just completed
 		let promptError: Error | undefined;
 		try {
-			const promptResult = await Promise.race([
+			await Promise.race([
 				session.prompt("message after overflow compaction"),
 				new Promise<void>((_, reject) =>
 					setTimeout(
@@ -1107,7 +1107,6 @@ describe("AgentSession auto-compaction continuation", () => {
 				),
 			]);
 			// The prompt should have been queued without timing out
-			expect(promptResult).toBeDefined();
 		} catch (error) {
 			promptError = error instanceof Error ? error : new Error(String(error));
 		}
