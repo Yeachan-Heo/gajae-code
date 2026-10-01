@@ -1937,10 +1937,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
 			}));
 		liveSessionManager = sessionManager;
-		// Apply inherited model profile ownership marker to subagent sessions when a parent provides one.
-		if (options.modelProfileOwnershipMarker !== undefined) {
-			sessionManager.appendModelProfileOwnershipMarker(options.modelProfileOwnershipMarker);
-		}
 		const logicalSessionId = sessionManager.getSessionId();
 		// Fork-context seeds carry conversation content only, never provider identity:
 		// a shared continuity id would make concurrent subagents present the same
@@ -2065,6 +2061,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const hasExistingSession = existingBranch.length > 0;
 		const hasThinkingEntry = existingBranch.some(entry => entry.type === "thinking_level_change");
 		const hasServiceTierEntry = existingBranch.some(entry => entry.type === "service_tier_change");
+
+		// Apply inherited model profile ownership marker to subagent sessions when a parent provides one.
+		// This must occur after computing hasExistingSession to avoid marking a fresh session as resumed.
+		if (options.modelProfileOwnershipMarker !== undefined) {
+			sessionManager.appendModelProfileOwnershipMarker(options.modelProfileOwnershipMarker);
+		}
 
 		for (const entry of existingBranch) {
 			if (entry.type !== "custom" || entry.customType !== "auth-credential-pin") continue;
