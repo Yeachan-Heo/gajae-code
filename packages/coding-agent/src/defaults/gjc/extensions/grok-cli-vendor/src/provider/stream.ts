@@ -2,6 +2,7 @@ import type {
   Api,
   AssistantMessageEventStream,
   Context,
+  FetchImpl,
   Model,
   SimpleStreamOptions,
 } from '@gajae-code/ai/core';
@@ -45,23 +46,45 @@ export function streamGrokCli(
     api: 'openai-responses',
   } as Model<'openai-responses'>;
 
+  // Wrap fetch to intercept 426 errors and extract version info
+  const baseFetch = options?.fetch ?? (globalThis.fetch.bind(globalThis) as FetchImpl);
+  const wrappedFetch = wrapFetchForVersionHandling(baseFetch);
+
   return streamOpenAIResponses(responsesModel, context, {
     ...options,
     headers,
-    onResponse(response) {
-      // Handle HTTP 426 "version outdated" errors by updating the cache
-      if (response.status === 426) {
-        response
-          .text()
-          .then((errorText) => {
-            updateVersionFromError(errorText);
-          })
-          .catch(() => {
-            // Silently ignore errors reading response text
-          });
-      }
-      // Forward to any existing onResponse handler
-      options?.onResponse?.(response, model);
-    },
+    fetch: wrappedFetch,
   });
+}
+
+/**
+ * Wraps a fetch function to intercept HTTP 426 responses and extract version info.
+ * When a 426 error is received, reads the response body and updates the version cache.
+ */
+function wrapFetchForVersionHandling(baseFetch: FetchImpl): FetchImpl {
+  return Object.assign(
+    async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const response = await baseFetch(input, init);
+      
+      // Handle HTTP 426 "version outdated" errors by reading the body and updating the cache
+      if (response.status === 426) {
+        try {
+          const errorText = await response.text();
+          updateVersionFromError(errorText);
+          // Return a new response since we consumed the body
+          return new Response(errorText, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: response.headers,
+          });
+        } catch {
+          // If body reading fails, return the original response
+          return response;
+        }
+      }
+      
+      return response;
+    },
+    { preconnect: baseFetch.preconnect },
+  ) as FetchImpl;
 }
