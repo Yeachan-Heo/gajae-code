@@ -825,13 +825,15 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						output.content = [];
 
 						// Mint provider safety stop
+						// Do not pass options.fetch as callerTransport: the refusal came from the
+						// provider's response, not from a caller-controlled fabrication.
 						const adapterInvocation = isProviderSafetyStopAdapterInvocation(options);
 						const useRefusalSignal = category || "refusal";
 						const authenticated = mintProviderSafetyStop(
 							output,
 							useRefusalSignal,
 							PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
-							options?.fetch,
+							undefined,
 							adapterInvocation,
 						);
 

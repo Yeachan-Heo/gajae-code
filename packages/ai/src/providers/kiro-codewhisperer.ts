@@ -192,13 +192,15 @@ function handleKiroRefusal(
 	output.content = [];
 
 	// Attempt to mint provider safety stop for structured refusal
+	// Do not pass options.fetch as callerTransport: the refusal came from the
+	// provider's response, not from a caller-controlled fabrication.
 	const adapterInvocation = isProviderSafetyStopAdapterInvocation(options);
 	const useRefusalSignal = category || "refusal";
 	const authenticated = mintProviderSafetyStop(
 		output,
 		useRefusalSignal,
 		PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
-		options?.fetch,
+		undefined,
 		adapterInvocation,
 	);
 
@@ -335,7 +337,16 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 				);
 			}
 
-			// Decode eventstream
+			// Stage event payloads to buffer content until we confirm no refusal is present.
+			// This prevents partial text/tool-call events from being emitted if the stream
+			// ends with a refusal metadata event.
+			interface StagedEvent {
+				eventType: string;
+				payload: unknown;
+			}
+			const stagedEvents: StagedEvent[] = [];
+
+			// Collect all event frames from the eventstream
 			for await (const message of decodeEventStream(response.body)) {
 				if (options.signal?.aborted) break;
 
@@ -362,6 +373,45 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 				const payload = safeParsePayload(message.payload);
 				if (!payload) continue;
 
+				// Stage the event for processing after we scan for refusals
+				stagedEvents.push({ eventType, payload });
+
+				const errorPayload = payload as ErrorPayload;
+				if (errorPayload.error?.message) {
+					throw new Error(`Kiro CodeWhisperer stream error: ${errorPayload.error.message}`);
+				}
+			}
+
+			// Scan for refusal in staged events before emitting any content
+			let refusalEvent: { eventType: string; refusal: { category?: string; explanation?: string } } | undefined;
+			for (const { eventType, payload } of stagedEvents) {
+				if (eventType === "metadataEvent") {
+					const ev = payload as MetadataEvent;
+					if (ev.stopDetails?.refusal) {
+						refusalEvent = { eventType, refusal: ev.stopDetails.refusal };
+						break;
+					}
+				}
+				if (eventType === "messageMetadataEvent") {
+					const ev = payload as MessageMetadataEvent;
+					if (ev.messageMetadataEvent?.stopDetails?.refusal) {
+						refusalEvent = { eventType, refusal: ev.messageMetadataEvent.stopDetails.refusal };
+						break;
+					}
+				}
+			}
+
+			// If refusal found, emit error and return without emitting content events
+			if (refusalEvent) {
+				output.duration = Date.now() - startTime;
+				if (firstTokenTime) output.ttft = firstTokenTime - startTime;
+				handleKiroRefusal(output, stream, model, refusalEvent.refusal, options);
+				stream.end();
+				return;
+			}
+
+			// No refusal found, process all staged events
+			for (const { eventType, payload } of stagedEvents) {
 				switch (eventType) {
 					case "assistantResponseEvent": {
 						const ev = payload as AssistantResponseEvent;
@@ -384,31 +434,16 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 						handleToolUseEvent(ev, blocks, output, stream);
 						break;
 					}
-					case "metadataEvent": {
-						const ev = payload as MetadataEvent;
-						if (ev.stopDetails?.refusal) {
-							output.duration = Date.now() - startTime;
-							if (firstTokenTime) output.ttft = firstTokenTime - startTime;
-							handleKiroRefusal(output, stream, model, ev.stopDetails.refusal, options);
-							stream.end();
-							return;
-						}
-						break;
-					}
 					case "messageMetadataEvent": {
 						const ev = payload as MessageMetadataEvent;
 						if (ev.messageMetadataEvent?.conversationId) {
 							output.responseId = ev.messageMetadataEvent.conversationId;
 						}
-						if (ev.messageMetadataEvent?.stopDetails?.refusal) {
-							output.duration = Date.now() - startTime;
-							if (firstTokenTime) output.ttft = firstTokenTime - startTime;
-							handleKiroRefusal(output, stream, model, ev.messageMetadataEvent.stopDetails.refusal, options);
-							stream.end();
-							return;
-						}
 						break;
 					}
+					case "metadataEvent":
+						// Already handled above for refusals; skip
+						break;
 					case "codeReferenceEvent":
 					case "supplementaryWebLinksEvent":
 					case "followupPromptEvent":
@@ -422,11 +457,6 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 					default:
 						// Unknown event types — ignore (forward compatibility)
 						break;
-				}
-
-				const errorPayload = payload as ErrorPayload;
-				if (errorPayload.error?.message) {
-					throw new Error(`Kiro CodeWhisperer stream error: ${errorPayload.error.message}`);
 				}
 			}
 
