@@ -78,7 +78,7 @@ export async function launchAuthorizedBrokerSuccessor(
 						command: { file: brokerSpawnOpts.file, args: brokerSpawnOpts.args },
 						...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
 					},
-					{ env, cwd: command.kind === "bun-source" ? command.cwd : undefined },
+					{ env, cwd: command.kind === "bun-source" ? command.cwd : undefined, deadlineMs: deadline },
 				);
 				child = launched.process;
 				spawnError = launched.error;

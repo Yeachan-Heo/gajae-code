@@ -231,8 +231,7 @@ function codexOutputHasMeaningfulProgress(output: AssistantMessage): boolean {
 			(block.type === "toolCall" &&
 				typeof block.arguments === "object" &&
 				block.arguments !== null &&
-				!Array.isArray(block.arguments) &&
-				Object.keys(block.arguments).length > 0),
+				!Array.isArray(block.arguments)),
 	);
 }
 
@@ -1950,6 +1949,8 @@ async function tryRecoverCodexPreviousResponseNotFound(
 		// Managed fallback forces streamMaxRetries to 0; this replay is exempt
 		// from that budget and bounded by previousResponseRecoveryAttempted.
 		runtime.previousResponseRecoveryAttempted ||
+		(!context.options?.fallbackManaged &&
+			resolveRetryBudget(context.options?.streamMaxRetries, CODEX_MAX_RETRIES) <= 0) ||
 		!websocketState ||
 		context.options?.disableProviderRetries ||
 		runtime.transport !== "websocket" ||
