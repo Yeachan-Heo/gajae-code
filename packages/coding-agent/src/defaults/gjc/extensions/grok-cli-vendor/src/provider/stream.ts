@@ -6,7 +6,7 @@ import type {
   SimpleStreamOptions,
 } from '@gajae-code/ai/core';
 import { streamOpenAIResponses } from '@gajae-code/ai/providers/openai-responses';
-import { getGrokCliVersion } from './version-manager';
+import { getGrokCliVersion, updateVersionFromError } from './version-manager';
 
 /**
  * Stream function that adds Grok CLI-specific headers to requests.
@@ -48,5 +48,20 @@ export function streamGrokCli(
   return streamOpenAIResponses(responsesModel, context, {
     ...options,
     headers,
+    onResponse(response) {
+      // Handle HTTP 426 "version outdated" errors by updating the cache
+      if (response.status === 426) {
+        response
+          .text()
+          .then((errorText) => {
+            updateVersionFromError(errorText);
+          })
+          .catch(() => {
+            // Silently ignore errors reading response text
+          });
+      }
+      // Forward to any existing onResponse handler
+      options?.onResponse?.(response, model);
+    },
   });
 }
