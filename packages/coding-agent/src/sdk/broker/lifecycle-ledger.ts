@@ -33,8 +33,8 @@ export interface LifecycleCleanupProof {
 	processExited: true;
 	endpointRemoved: true;
 	hostUnregistered:
-		| { state: "unregistered"; indexSeq: number; lifecycleRequestId?: string }
-		| { state: "not_registered" };
+	| { state: "unregistered"; indexSeq: number; lifecycleRequestId?: string }
+	| { state: "not_registered" };
 	rollback: {
 		endpointGeneration: number | null;
 		fenced: true;
@@ -74,6 +74,8 @@ export interface LifecycleDurableEffectsReceipt {
 export interface LifecycleLedgerEntry {
 	operationKey?: string;
 	fingerprint?: string;
+	/** True only when a session.close request supplied immutable generation authority. */
+	closeAuthorityBound?: boolean;
 	version: typeof SDK_STATE_VERSION;
 	identity: string;
 	requestHash: string;
@@ -213,6 +215,20 @@ function pendingCleanupSessionId(response: unknown): string | undefined {
 	return canonicalCleanupSessionId(cleanup?.sessionId) ? cleanup.sessionId : undefined;
 }
 
+function retirementCreateIdentity(response: unknown): string | undefined {
+	if (!response || typeof response !== "object") return undefined;
+	const error = (response as { error?: unknown }).error;
+	if (!error || typeof error !== "object") return undefined;
+	const cleanup = (error as { cleanup?: unknown }).cleanup;
+	if (!cleanup || typeof cleanup !== "object") return undefined;
+	const receipt = (cleanup as { uncertainRetirement?: unknown }).uncertainRetirement;
+	if (!receipt || typeof receipt !== "object") return undefined;
+	const identity = (receipt as { identity?: unknown }).identity;
+	if (!identity || typeof identity !== "object") return undefined;
+	const createIdentity = (identity as { createIdentity?: unknown }).createIdentity;
+	return typeof createIdentity === "string" && createIdentity.length > 0 ? createIdentity : undefined;
+}
+
 function hasValidTerminalDigests(entry: LifecycleLedgerEntry): boolean {
 	const response = entry.response as { ok?: unknown; error?: { code?: unknown; cleanup?: unknown } } | undefined;
 	const cleanupPendingResponse =
@@ -230,14 +246,14 @@ function hasValidTerminalDigests(entry: LifecycleLedgerEntry): boolean {
 		entry.response === undefined
 			? undefined
 			: createHash("sha256")
-					.update(
-						canonicalJson(
-							cleanupPendingResponse
-								? { intendedSessionId: entry.intendedSessionId, response: entry.response }
-								: entry.response,
-						),
-					)
-					.digest("hex");
+				.update(
+					canonicalJson(
+						cleanupPendingResponse
+							? { intendedSessionId: entry.intendedSessionId, response: entry.response }
+							: entry.response,
+					),
+				)
+				.digest("hex");
 	if (entry.responseDigest !== undefined) {
 		if (entry.response === undefined || entry.responseDigest !== expectedResponseDigest) return false;
 	} else if (responseDigestRequired) return false;
@@ -250,14 +266,14 @@ function hasValidTerminalDigests(entry: LifecycleLedgerEntry): boolean {
 			typeof entry.unresolvedCleanupResponseDigest !== "string" ||
 			unresolvedResponse.error?.cleanup?.sessionId !== entry.intendedSessionId ||
 			entry.unresolvedCleanupResponseDigest !==
-				createHash("sha256")
-					.update(
-						canonicalJson({
-							intendedSessionId: entry.intendedSessionId,
-							response: entry.unresolvedCleanupResponse,
-						}),
-					)
-					.digest("hex")
+			createHash("sha256")
+				.update(
+					canonicalJson({
+						intendedSessionId: entry.intendedSessionId,
+						response: entry.unresolvedCleanupResponse,
+					}),
+				)
+				.digest("hex")
 		)
 			return false;
 	}
@@ -672,21 +688,47 @@ export class LifecycleLedger {
 				? snapshot.length >= this.#limits.maxRows || contents.length >= this.#limits.maxBytes
 				: snapshot.length > this.#limits.maxRows || contents.length > this.#limits.maxBytes;
 		if (needsEviction) {
+			const protectedCreateIdentities = new Set<string>();
+			for (const entry of compacted.values()) {
+				const createIdentity =
+					retirementCreateIdentity(entry.response) ?? retirementCreateIdentity(entry.unresolvedCleanupResponse);
+				if (createIdentity !== undefined) protectedCreateIdentities.add(createIdentity);
+			}
 			const evictable = [...compacted.values()]
 				.filter(
 					latest =>
 						latest.identity !== replacement?.identity &&
 						terminal(latest.state) &&
+						!(
+							latest.operationKey?.startsWith("session.close\u0000") &&
+							latest.closeAuthorityBound !== true
+						) &&
+						!protectedCreateIdentities.has(latest.identity) &&
 						pendingCleanupSessionId(latest.response) === undefined &&
 						pendingCleanupSessionId(latest.unresolvedCleanupResponse) === undefined,
 				)
 				.sort((left, right) => left.ts - right.ts);
-			for (const latest of evictable) {
-				if (snapshot.length <= this.#limits.maxRows / 2 && contents.length <= this.#limits.maxBytes / 2) break;
-				compacted.delete(latest.identity);
-				snapshot = buildSnapshot();
-				contents = Buffer.from(snapshot.map(entry => `${JSON.stringify(entry)}\n`).join(""));
+			const rowsByIdentity = new Map<string, number>();
+			const bytesByIdentity = new Map<string, number>();
+			for (const entry of snapshot) {
+				rowsByIdentity.set(entry.identity, (rowsByIdentity.get(entry.identity) ?? 0) + 1);
+				bytesByIdentity.set(
+					entry.identity,
+					(bytesByIdentity.get(entry.identity) ?? 0) + Buffer.byteLength(`${JSON.stringify(entry)}\n`),
+				);
 			}
+			let remainingRows = snapshot.length;
+			let remainingBytes = contents.length;
+			const evicted = new Set<string>();
+			for (const latest of evictable) {
+				if (remainingRows <= this.#limits.maxRows / 2 && remainingBytes <= this.#limits.maxBytes / 2) break;
+				evicted.add(latest.identity);
+				remainingRows -= rowsByIdentity.get(latest.identity) ?? 0;
+				remainingBytes -= bytesByIdentity.get(latest.identity) ?? 0;
+			}
+			for (const identity of evicted) compacted.delete(identity);
+			snapshot = buildSnapshot();
+			contents = Buffer.from(snapshot.map(entry => `${JSON.stringify(entry)}\n`).join(""));
 			// Replay is guaranteed only for identities retained in the compacted ledger.
 		}
 		if (
@@ -704,9 +746,9 @@ export class LifecycleLedger {
 			const h = await fs.open(
 				temporary,
 				fsSync.constants.O_WRONLY |
-					fsSync.constants.O_CREAT |
-					fsSync.constants.O_EXCL |
-					fsSync.constants.O_NOFOLLOW,
+				fsSync.constants.O_CREAT |
+				fsSync.constants.O_EXCL |
+				fsSync.constants.O_NOFOLLOW,
 				0o600,
 			);
 			try {
@@ -723,7 +765,7 @@ export class LifecycleLedger {
 			this.#rowCount = snapshot.length;
 			this.#byteCount = contents.length;
 		} finally {
-			if (!renamed) await fs.unlink(temporary).catch(() => {});
+			if (!renamed) await fs.unlink(temporary).catch(() => { });
 		}
 		return replacement !== undefined;
 	}
@@ -761,7 +803,7 @@ export class LifecycleLedger {
 	async migrateIdentity(
 		from: string,
 		to: string,
-		metadata: { operationKey: string; fingerprint: string },
+		metadata: { operationKey: string; fingerprint: string; closeAuthorityBound?: boolean },
 	): Promise<LifecycleLedgerEntry | undefined> {
 		return this.#mutate(async () => {
 			const existing = this.#byIdentity.get(to);
@@ -824,7 +866,12 @@ export class LifecycleLedger {
 	async begin(
 		identity: string,
 		requestHash: string,
-		metadata: { operationKey?: string; fingerprint?: string; intendedSessionId?: string } = {},
+		metadata: {
+			operationKey?: string;
+			fingerprint?: string;
+			intendedSessionId?: string;
+			closeAuthorityBound?: boolean;
+		} = {},
 	): Promise<BeginResult> {
 		return this.#mutate(async () => this.#begin(identity, requestHash, metadata));
 	}
@@ -832,7 +879,12 @@ export class LifecycleLedger {
 	async #begin(
 		identity: string,
 		requestHash: string,
-		metadata: { operationKey?: string; fingerprint?: string; intendedSessionId?: string },
+		metadata: {
+			operationKey?: string;
+			fingerprint?: string;
+			intendedSessionId?: string;
+			closeAuthorityBound?: boolean;
+		},
 	): Promise<BeginResult> {
 		const prior = this.#byIdentity.get(identity);
 		if (!prior)
@@ -845,6 +897,7 @@ export class LifecycleLedger {
 					operationKey: metadata.operationKey,
 					fingerprint: metadata.fingerprint,
 					intendedSessionId: metadata.intendedSessionId,
+					closeAuthorityBound: metadata.closeAuthorityBound,
 					state: "accepted",
 					ts: Date.now(),
 				}),
