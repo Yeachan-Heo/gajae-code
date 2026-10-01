@@ -235,10 +235,14 @@ describe("memories runtime", () => {
 		const completeSpy = vi
 			.spyOn(ai, "completeSimple")
 			.mockResolvedValueOnce(
-				createAssistantMessage(JSON.stringify({ rollout_summary: "Summary", rollout_slug: "reasoning", raw_memory: "Raw" })),
+				createAssistantMessage(
+					JSON.stringify({ rollout_summary: "Summary", rollout_slug: "reasoning", raw_memory: "Raw" }),
+				),
 			)
 			.mockResolvedValueOnce(
-				createAssistantMessage(JSON.stringify({ memory_md: "# Memory\n\nMerged", memory_summary: "Summary", skills: [] })),
+				createAssistantMessage(
+					JSON.stringify({ memory_md: "# Memory\n\nMerged", memory_summary: "Summary", skills: [] }),
+				),
 			);
 
 		startMemoryStartupTask({
