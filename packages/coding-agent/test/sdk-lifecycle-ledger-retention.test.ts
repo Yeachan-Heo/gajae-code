@@ -28,6 +28,31 @@ async function recordLegacyTerminalOk(ledger: LifecycleLedger, identity: string)
 	await ledger.transition(identity, "terminal_ok", { response: { ok: true, identity } });
 }
 
+async function ledgerBytes(agentDir: string): Promise<number> {
+	try {
+		return (await fs.readFile(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl"))).byteLength;
+	} catch (error) {
+		if (error instanceof Error && "code" in error && error.code === "ENOENT") return 0;
+		throw error;
+	}
+}
+
+async function recordShortTerminal(ledger: LifecycleLedger, identity: string): Promise<void> {
+	await ledger.begin(identity, "r", { operationKey: "o", fingerprint: "f" });
+	await ledger.transition(identity, "terminal_ok", { response: { ok: true } });
+}
+
+function useExplicitClock(): { advance: () => void; restore: () => void } {
+	let timestamp = 1_000;
+	const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => timestamp);
+	return {
+		advance: () => {
+			timestamp += 1;
+		},
+		restore: () => nowSpy.mockRestore(),
+	};
+}
+
 function retirementResponse(createIdentity: string): {
 	ok: false;
 	error: {
@@ -45,6 +70,79 @@ function retirementResponse(createIdentity: string): {
 }
 
 describe("LifecycleLedger retention", () => {
+	it.each([
+		{
+			name: "cleanup",
+			protectedIdentity: "cleanup",
+			maxBytes: 750,
+			incomingSize: 350,
+			seed: async (ledger: LifecycleLedger) => {
+				await ledger.begin("cleanup", "r", { operationKey: "o", fingerprint: "f" });
+				await ledger.transition("cleanup", "terminal_error", {
+					response: { ok: false, error: { code: "cleanup_pending", cleanup: { sessionId: "s" } } },
+				});
+			},
+		},
+		{
+			name: "legacy",
+			protectedIdentity: "legacy",
+			maxBytes: 750,
+			incomingSize: 350,
+			seed: async (ledger: LifecycleLedger) => {
+				await recordLegacyTerminalOk(ledger, "legacy");
+			},
+		},
+		{
+			name: "close authority",
+			protectedIdentity: "close",
+			maxBytes: 750,
+			incomingSize: 350,
+			seed: async (ledger: LifecycleLedger) => {
+				await ledger.begin("close", "r", { operationKey: "session.close\u0000k", fingerprint: "f" });
+				await ledger.transition("close", "terminal_ok", { response: { ok: true } });
+			},
+		},
+		{
+			name: "retirement",
+			protectedIdentity: "create",
+			maxBytes: 2_000,
+			incomingSize: 1_500,
+			seed: async (ledger: LifecycleLedger) => {
+				await recordTerminalError(ledger, "create");
+				await ledger.begin("retirement", "r", { operationKey: "o", fingerprint: "f" });
+				await ledger.transition("retirement", "effect_started", {
+					response: retirementResponse("create"),
+				});
+			},
+		},
+	] as const)("rejects byte-pressure admission when only $name entries remain", async ({
+		seed,
+		protectedIdentity,
+		maxBytes,
+		incomingSize,
+	}) => {
+		const agentDir = await temporaryAgentDir("gjc-ledger-retention-byte-protected-");
+		try {
+			const ledger = await new LifecycleLedger(agentDir, {
+				maxBytes,
+				maxRows: 100,
+				maxLineBytes: 2_000,
+			}).open();
+			await seed(ledger);
+			const beforeBytes = await ledgerBytes(agentDir);
+			const beforeEntry = ledger.get(protectedIdentity);
+
+			await expect(
+				ledger.begin("incoming", "r", { operationKey: "o", fingerprint: "x".repeat(incomingSize) }),
+			).rejects.toThrow("Lifecycle ledger append exceeds configured bounds.");
+			expect(await ledgerBytes(agentDir)).toBe(beforeBytes);
+			expect(ledger.get(protectedIdentity)).toEqual(beforeEntry);
+			expect(ledger.get("incoming")).toBeUndefined();
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
 	it("evicts old final identities so bounded appends continue succeeding", async () => {
 		const agentDir = await temporaryAgentDir("gjc-ledger-retention-");
 		try {
@@ -57,6 +155,86 @@ describe("LifecycleLedger retention", () => {
 			const reopened = await new LifecycleLedger(agentDir, { maxRows: 4 }).open();
 			expect(reopened.get("identity-10")?.state).toBe("terminal_ok");
 			expect(reopened.get("identity-1")).toBeUndefined();
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("admits a new identity by evicting the oldest settled row under byte pressure", async () => {
+		const agentDir = await temporaryAgentDir("gjc-ledger-retention-byte-admission-");
+		const clock = useExplicitClock();
+		try {
+			const ledger = await new LifecycleLedger(agentDir, { maxBytes: 750, maxRows: 100 }).open();
+			await recordShortTerminal(ledger, "a");
+			clock.advance();
+			await recordShortTerminal(ledger, "b");
+			clock.advance();
+
+			await expect(ledger.begin("c", "r", { operationKey: "o", fingerprint: "f" })).resolves.toMatchObject({
+				kind: "new",
+				entry: { identity: "c", state: "accepted" },
+			});
+			expect(ledger.get("a")).toBeUndefined();
+			expect(ledger.get("b")?.state).toBe("terminal_ok");
+			expect(ledger.get("c")?.state).toBe("accepted");
+		} finally {
+			clock.restore();
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("continues admitting settled identities under a fixed byte cap", async () => {
+		const agentDir = await temporaryAgentDir("gjc-ledger-retention-byte-repeat-");
+		const clock = useExplicitClock();
+		try {
+			const ledger = await new LifecycleLedger(agentDir, { maxBytes: 750, maxRows: 100 }).open();
+			await recordShortTerminal(ledger, "a");
+			clock.advance();
+			await recordShortTerminal(ledger, "b");
+			for (const identity of ["c", "d", "e", "f", "g"]) {
+				clock.advance();
+				await recordShortTerminal(ledger, identity);
+				expect(ledger.get(identity)?.state).toBe("terminal_ok");
+			}
+		} finally {
+			clock.restore();
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("reopens consistently after byte-pressure eviction and admits again", async () => {
+		const agentDir = await temporaryAgentDir("gjc-ledger-retention-byte-reopen-");
+		const clock = useExplicitClock();
+		try {
+			const ledger = await new LifecycleLedger(agentDir, { maxBytes: 750, maxRows: 100 }).open();
+			await recordShortTerminal(ledger, "a");
+			clock.advance();
+			await recordShortTerminal(ledger, "b");
+			clock.advance();
+			await ledger.begin("c", "r", { operationKey: "o", fingerprint: "f" });
+			expect(ledger.get("a")).toBeUndefined();
+
+			const reopened = await new LifecycleLedger(agentDir, { maxBytes: 750, maxRows: 100 }).open();
+			expect(reopened.get("a")).toBeUndefined();
+			expect(reopened.get("b")?.state).toBe("terminal_ok");
+			expect(reopened.get("c")?.state).toBe("accepted");
+			await recordShortTerminal(reopened, "d");
+			expect(reopened.get("d")?.state).toBe("terminal_ok");
+		} finally {
+			clock.restore();
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects an oversized incoming row without writing it", async () => {
+		const agentDir = await temporaryAgentDir("gjc-ledger-retention-byte-oversized-");
+		try {
+			const ledger = await new LifecycleLedger(agentDir, { maxBytes: 100, maxRows: 100 }).open();
+			await expect(ledger.begin("oversized", "request", { operationKey: "o", fingerprint: "f" })).rejects.toThrow(
+				"Lifecycle ledger append exceeds configured bounds.",
+			);
+			expect(await ledgerBytes(agentDir)).toBe(0);
+			expect(ledger.get("oversized")).toBeUndefined();
 		} finally {
 			await fs.rm(agentDir, { recursive: true, force: true });
 		}
