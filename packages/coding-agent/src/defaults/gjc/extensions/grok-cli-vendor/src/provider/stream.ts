@@ -6,9 +6,7 @@ import type {
   SimpleStreamOptions,
 } from '@gajae-code/ai/core';
 import { streamOpenAIResponses } from '@gajae-code/ai/providers/openai-responses';
-import { getGrokCliVersion, updateVersionFromError } from './version-manager';
-
-let cachedVersion: string | null = null;
+import { getGrokCliVersion } from './version-manager';
 
 /**
  * Stream function that adds Grok CLI-specific headers to requests.
@@ -17,7 +15,7 @@ let cachedVersion: string | null = null;
  *   - x-grok-conv-id: <session/conversation ID>
  *   - x-grok-model-override: <model ID>
  *   - x-xai-token-auth: xai-grok-cli
- *   - x-grok-client-version: resolved dynamically with 426 error handling
+ *   - x-grok-client-version: resolved dynamically from GitHub releases (cached)
  */
 export function streamGrokCli(
   model: Model<Api>,
@@ -26,21 +24,14 @@ export function streamGrokCli(
 ): AssistantMessageEventStream {
   const sessionId = options?.sessionId;
 
-  // Ensure we have a version available synchronously
-  // The async getGrokCliVersion will prime the cache for next request
-  if (cachedVersion === null) {
-    // Initialize with async fetch for background updates
-    getGrokCliVersion().then((version) => {
-      cachedVersion = version;
-    });
-    // Use fallback immediately
-    cachedVersion = '1.0.13';
-  }
+  // Get the cached Grok CLI version (or fallback if not yet fetched)
+  // The version manager fetches from GitHub in the background on first call
+  const grokCliVersion = getGrokCliVersion();
 
   const headers: Record<string, string> = {
     ...options?.headers,
     'x-grok-client-identifier': 'gjc-grok-cli',
-    'x-grok-client-version': cachedVersion,
+    'x-grok-client-version': grokCliVersion,
     'x-xai-token-auth': 'xai-grok-cli',
     'x-grok-model-override': model.id,
   };
@@ -57,18 +48,5 @@ export function streamGrokCli(
   return streamOpenAIResponses(responsesModel, context, {
     ...options,
     headers,
-    async onResponse(response) {
-      // Handle HTTP 426 "version outdated" errors
-      if (response.status === 426) {
-        try {
-          const errorText = await response.text();
-          const updatedVersion = updateVersionFromError(errorText);
-          cachedVersion = updatedVersion;
-        } catch (err) {
-          // Silently ignore parse errors
-        }
-      }
-      options?.onResponse?.(response, model);
-    },
   });
 }

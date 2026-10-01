@@ -1,10 +1,10 @@
-import { describe, expect, it, beforeEach, afterEach, spyOn } from "bun:test";
+import { beforeEach, describe, expect, it, spyOn } from "bun:test";
 import {
+	getFallbackVersion,
 	getGrokCliVersion,
 	parseMinimumVersionFrom426,
-	updateVersionFromError,
 	resetVersionCache,
-	getFallbackVersion,
+	updateVersionFromError,
 } from "../src/defaults/gjc/extensions/grok-cli-vendor/src/provider/version-manager";
 
 describe("Grok CLI version manager", () => {
@@ -12,30 +12,32 @@ describe("Grok CLI version manager", () => {
 		resetVersionCache();
 	});
 
-	it("returns fallback version when GitHub API is unavailable", async () => {
-		const version = await getGrokCliVersion();
-		expect(version).toBe(getFallbackVersion());
-		expect(version).toBe("1.0.13");
+	it("returns fallback version when GitHub API is unavailable", () => {
+		const fetchSpy = spyOn(globalThis, "fetch").mockRejectedValueOnce(new Error("Network error"));
+		try {
+			const version = getGrokCliVersion();
+			expect(version).toBe(getFallbackVersion());
+			expect(version).toBe("1.0.13");
+		} finally {
+			fetchSpy.mockRestore();
+		}
 	});
 
 	describe("parseMinimumVersionFrom426", () => {
 		it("extracts version from standard 426 error message", () => {
-			const errorBody =
-				"Your Grok CLI version (0.2.33) is outdated. Please update to version 1.0.13 or later";
+			const errorBody = "Your Grok CLI version (0.2.33) is outdated. Please update to version 1.0.13 or later";
 			const version = parseMinimumVersionFrom426(errorBody);
 			expect(version).toBe("1.0.13");
 		});
 
 		it("extracts version with different formatting", () => {
-			const errorBody =
-				"Your Grok CLI version (0.2.30) is outdated. Please update to version 2.1.5 or later.";
+			const errorBody = "Your Grok CLI version (0.2.30) is outdated. Please update to version 2.1.5 or later.";
 			const version = parseMinimumVersionFrom426(errorBody);
 			expect(version).toBe("2.1.5");
 		});
 
 		it("handles case-insensitive error messages", () => {
-			const errorBody =
-				"Your Grok CLI version (0.2.33) is outdated. PLEASE UPDATE TO VERSION 1.5.0 OR LATER";
+			const errorBody = "Your Grok CLI version (0.2.33) is outdated. PLEASE UPDATE TO VERSION 1.5.0 OR LATER";
 			const version = parseMinimumVersionFrom426(errorBody);
 			expect(version).toBe("1.5.0");
 		});
@@ -47,8 +49,7 @@ describe("Grok CLI version manager", () => {
 		});
 
 		it("handles malformed version numbers gracefully", () => {
-			const errorBody =
-				"Your Grok CLI version (0.2.33) is outdated. Please update to version x.y.z or later";
+			const errorBody = "Your Grok CLI version (0.2.33) is outdated. Please update to version x.y.z or later";
 			const version = parseMinimumVersionFrom426(errorBody);
 			// Should still extract even if format is unusual
 			expect(version).toBe("x.y.z");
@@ -57,8 +58,7 @@ describe("Grok CLI version manager", () => {
 
 	describe("updateVersionFromError", () => {
 		it("updates cache and returns version from error message", () => {
-			const errorBody =
-				"Your Grok CLI version (0.2.33) is outdated. Please update to version 1.0.20 or later";
+			const errorBody = "Your Grok CLI version (0.2.33) is outdated. Please update to version 1.0.20 or later";
 			const version = updateVersionFromError(errorBody);
 			expect(version).toBe("1.0.20");
 		});
@@ -69,29 +69,26 @@ describe("Grok CLI version manager", () => {
 			expect(version).toBe(getFallbackVersion());
 		});
 
-		it("subsequent calls use the updated version", async () => {
-			const errorBody =
-				"Your Grok CLI version (0.2.33) is outdated. Please update to version 1.2.3 or later";
+		it("subsequent calls use the updated version", () => {
+			const errorBody = "Your Grok CLI version (0.2.33) is outdated. Please update to version 1.2.3 or later";
 			updateVersionFromError(errorBody);
 
 			// Next call should use the cached version
-			const cachedVersion = await getGrokCliVersion();
+			const cachedVersion = getGrokCliVersion();
 			expect(cachedVersion).toBe("1.2.3");
 		});
 	});
 
 	describe("version caching", () => {
-		it("uses cached version on subsequent calls", async () => {
-			const version1 = await getGrokCliVersion();
-			const version2 = await getGrokCliVersion();
+		it("uses cached version on subsequent calls", () => {
+			const version1 = getGrokCliVersion();
+			const version2 = getGrokCliVersion();
 			expect(version1).toBe(version2);
 		});
 	});
 
 	describe("GitHub fetch behavior (when mocked)", () => {
-		it("would use fetched version if GitHub API succeeds", async () => {
-			// This is a placeholder test showing the expected behavior
-			// In production, real network calls would use the fetched version
+		it("uses fetched version if GitHub API succeeds", async () => {
 			const fetchSpy = spyOn(globalThis, "fetch").mockResolvedValueOnce(
 				new Response(
 					JSON.stringify({
@@ -101,22 +98,31 @@ describe("Grok CLI version manager", () => {
 				),
 			);
 
-			const version = await getGrokCliVersion();
-			// Should use fallback initially, but next await would get the real version
-			expect(version).toBeDefined();
+			try {
+				const version = getGrokCliVersion();
+				// Initial call returns fallback while fetch is in flight
+				expect(version).toBe(getFallbackVersion());
 
-			fetchSpy.mockRestore();
+				// Wait for the background fetch to complete
+				await new Promise(resolve => setTimeout(resolve, 50));
+
+				// Next call should return the fetched version
+				const cachedVersion = getGrokCliVersion();
+				expect(cachedVersion).toBe("1.2.3");
+			} finally {
+				fetchSpy.mockRestore();
+			}
 		});
 
-		it("handles GitHub API network errors gracefully", async () => {
-			const fetchSpy = spyOn(globalThis, "fetch").mockRejectedValueOnce(
-				new Error("Network error"),
-			);
+		it("handles GitHub API network errors gracefully", () => {
+			const fetchSpy = spyOn(globalThis, "fetch").mockRejectedValueOnce(new Error("Network error"));
 
-			const version = await getGrokCliVersion();
-			expect(version).toBe(getFallbackVersion());
-
-			fetchSpy.mockRestore();
+			try {
+				const version = getGrokCliVersion();
+				expect(version).toBe(getFallbackVersion());
+			} finally {
+				fetchSpy.mockRestore();
+			}
 		});
 
 		it("strips 'v' prefix from GitHub tag names", async () => {
@@ -129,10 +135,20 @@ describe("Grok CLI version manager", () => {
 				),
 			);
 
-			// Wait a bit for the background fetch to complete
-			await new Promise((resolve) => setTimeout(resolve, 50));
+			try {
+				const version = getGrokCliVersion();
+				// Initial call returns fallback while fetch is in flight
+				expect(version).toBe(getFallbackVersion());
 
-			fetchSpy.mockRestore();
+				// Wait for the background fetch to complete
+				await new Promise(resolve => setTimeout(resolve, 50));
+
+				// Next call should return the fetched version with 'v' prefix stripped
+				const cachedVersion = getGrokCliVersion();
+				expect(cachedVersion).toBe("1.0.13");
+			} finally {
+				fetchSpy.mockRestore();
+			}
 		});
 	});
 });
