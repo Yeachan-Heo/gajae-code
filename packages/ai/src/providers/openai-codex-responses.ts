@@ -186,6 +186,20 @@ const CODEX_RETRYABLE_EVENT_MESSAGE =
 	/processing your request|retry your request|temporar(?:y|ily)|overloaded|service.?unavailable|internal error|server error/i;
 const CODEX_ACCOUNT_MODEL_UNAVAILABLE_MESSAGE = /\bnot supported when using codex with a chatgpt account\b/i;
 const CODEX_PROVIDER_SESSION_STATE_KEY = "openai-codex-responses";
+const providerSessionStateIdentities = new WeakMap<Map<string, ProviderSessionState>, number>();
+let nextProviderSessionStateIdentity = 1;
+
+function getProviderSessionStateIdentity(
+	providerSessionState: Map<string, ProviderSessionState> | undefined,
+): number | undefined {
+	if (!providerSessionState) return undefined;
+	let identity = providerSessionStateIdentities.get(providerSessionState);
+	if (identity === undefined) {
+		identity = nextProviderSessionStateIdentity++;
+		providerSessionStateIdentities.set(providerSessionState, identity);
+	}
+	return identity;
+}
 const X_CODEX_TURN_STATE_HEADER = "x-codex-turn-state";
 const X_MODELS_ETAG_HEADER = "x-models-etag";
 const X_REASONING_INCLUDED_HEADER = "x-reasoning-included";
@@ -762,12 +776,18 @@ async function buildCodexRequestContext(
 	const providerSessionState = getCodexProviderSessionState(options?.providerSessionState);
 	const sessionKey = getCodexWebSocketSessionKey(promptCacheKey, model, accountId, baseUrl);
 	const publicSessionKey = getCodexPublicSessionKey(promptCacheKey, model, baseUrl);
-	const websocketState =
+	const effectiveSessionKey =
 		providerSessionState && sessionKey
-			? getCodexWebSocketSessionState(
-					resolveCodexWebSocketSessionKey(sessionKey, publicSessionKey, providerSessionState),
-					providerSessionState,
-				)
+			? resolveCodexWebSocketSessionKey(sessionKey, publicSessionKey, providerSessionState)
+			: undefined;
+	logCodexDebug("build request context session keys", {
+		publicSessionKey,
+		effectiveSessionKey,
+		providerSessionStateMapIdentity: getProviderSessionStateIdentity(options?.providerSessionState),
+	});
+	const websocketState =
+		providerSessionState && effectiveSessionKey
+			? getCodexWebSocketSessionState(effectiveSessionKey, providerSessionState)
 			: undefined;
 
 	return {
@@ -2324,6 +2344,11 @@ export async function prewarmOpenAICodexResponses(
 	const publicSessionKey = getCodexPublicSessionKey(promptCacheKey, model, baseUrl);
 	if (!sessionKey || !providerSessionState) return;
 	const effectiveSessionKey = resolveCodexWebSocketSessionKey(sessionKey, publicSessionKey, providerSessionState);
+	logCodexDebug("prewarm session keys", {
+		publicSessionKey,
+		effectiveSessionKey,
+		providerSessionStateMapIdentity: getProviderSessionStateIdentity(options?.providerSessionState),
+	});
 	const state = getCodexWebSocketSessionState(effectiveSessionKey, providerSessionState);
 	if (!shouldUseCodexWebSocket(model, state, options?.preferWebsockets)) return;
 	const headers = logger.time(
