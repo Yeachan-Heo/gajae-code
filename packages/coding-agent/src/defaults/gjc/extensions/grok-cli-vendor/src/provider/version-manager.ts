@@ -72,31 +72,16 @@ export function getGrokCliVersion(): string {
   // If a fetch failed recently, don't retry immediately; use failure cache TTL
   // This prevents hitting GitHub 404 or rate limits repeatedly
   if (failureCacheExpiry && now < failureCacheExpiry) {
-    return FALLBACK_VERSION;
+    // Return cached version if available during backoff, otherwise fallback
+    return versionCache?.version ?? FALLBACK_VERSION;
   }
 
-  // Attempt to fetch latest version asynchronously (non-blocking)
-  // This updates the cache in the background for future requests
-  fetchLatestVersionFromGitHub()
-    .then((latestVersion) => {
-      // Use 'Date.now()' again to get current timestamp, not the outer 'now' from function start
-      const updateTime = Date.now();
-      if (latestVersion) {
-        versionCache = { version: latestVersion, timestamp: updateTime };
-        // Clear failure cache on success
-        failureCacheExpiry = null;
-      } else {
-        // Fetch returned null (GitHub error, network error, etc.)
-        // Set failure cache to prevent retrying immediately
-        // Use shorter TTL than success cache (1 hour) to eventually recover if endpoint comes back
-        failureCacheExpiry = updateTime + 60 * 60 * 1000;
-      }
-    })
-    .catch(() => {
-      // Network or parsing error
-      const updateTime = Date.now();
-      failureCacheExpiry = updateTime + 60 * 60 * 1000;
-    });
+  // Note: Background fetch from GitHub is not attempted since the grok-cli releases
+  // endpoint does not exist. Version learning is available through 426 error handling
+  // in the production error path (stream.ts onResponse handler), which updates the cache
+  // when xAI returns HTTP 426 with a minimum version requirement.
+  // TODO: When a reliable version source becomes available (e.g., xai-org releases a
+  // public CLI with GitHub releases), uncomment the background fetch below.
 
   // Return cached or fallback version immediately (non-blocking)
   return versionCache?.version ?? FALLBACK_VERSION;
