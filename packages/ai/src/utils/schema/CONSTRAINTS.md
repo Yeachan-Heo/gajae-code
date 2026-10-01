@@ -51,6 +51,7 @@ When strict mode is requested (`strict=true` at call site), the schema MUST sati
 
 6. **Provider payload strict flag must match effective strictness**
    - Callers MUST send `strict: true` only if enforcement succeeded (`effectiveStrict === true`).
+   - OpenAI Responses and Codex Responses MUST send `strict: false` when enforcement is disabled or fails. Omitting the flag lets Responses implicitly strictify the schema, making optional fields required without the adapter's nullable unions.
 
 ---
 

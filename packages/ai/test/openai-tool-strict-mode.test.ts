@@ -418,7 +418,7 @@ describe("OpenAI tool strict mode", () => {
 		};
 		const tool = payload.tools?.[0];
 
-		expect(tool?.strict).toBeUndefined();
+		expect(tool?.strict).toBe(false);
 		expect(getYieldDataSchema(tool?.parameters).additionalProperties).toBe(true);
 	});
 

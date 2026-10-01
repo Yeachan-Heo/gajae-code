@@ -3169,7 +3169,7 @@ type CodexToolPayload =
 			name: string;
 			description: string;
 			parameters: Record<string, unknown>;
-			strict?: boolean;
+			strict: boolean;
 	  }
 	| {
 			type: "custom";
@@ -3205,7 +3205,8 @@ export function convertOpenAICodexResponsesTools(
 			name: codexToolWireName(tool.name),
 			description: tool.description || "",
 			parameters,
-			...(effectiveStrict && { strict: true }),
+			// Responses may strictify omitted flags, making optional MCP fields required.
+			strict: effectiveStrict,
 		};
 	});
 	// Tool definitions bypass the `input`/`instructions` sanitizers, so a

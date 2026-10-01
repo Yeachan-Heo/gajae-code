@@ -58,6 +58,7 @@ describe("openai-codex tool schemas", () => {
 			name: "list_outgoing_messages",
 			description: "List outgoing messages",
 			parameters: { type: "object", properties: {} },
+			strict: false,
 		});
 	});
 });
