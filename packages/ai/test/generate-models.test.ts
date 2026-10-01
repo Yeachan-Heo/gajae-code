@@ -358,3 +358,31 @@ describe("injectMuseSparkModels", () => {
 		]);
 	});
 });
+
+describe("pricing normalization", () => {
+	it("validates that negative pricing is not used in bundled models", async () => {
+		const modelsJson = await import("../src/models.json");
+		const allModels: Model[] = [];
+
+		for (const providerModels of Object.values(modelsJson.default as Record<string, Record<string, Model>>)) {
+			for (const model of Object.values(providerModels)) {
+				allModels.push(model);
+			}
+		}
+
+		// Verify that no model has negative pricing
+		for (const model of allModels) {
+			expect(model.cost.input).toBeGreaterThanOrEqual(0);
+			expect(model.cost.output).toBeGreaterThanOrEqual(0);
+			expect(model.cost.cacheRead).toBeGreaterThanOrEqual(0);
+			expect(model.cost.cacheWrite).toBeGreaterThanOrEqual(0);
+		}
+
+		// Specifically verify the jev-router has been fixed
+		const jevRouter = allModels.find(m => m.provider === "openrouter" && m.id === "typesafe/jev-router");
+		if (jevRouter) {
+			expect(jevRouter.cost.input).toBe(0);
+			expect(jevRouter.cost.output).toBe(0);
+		}
+	});
+});
