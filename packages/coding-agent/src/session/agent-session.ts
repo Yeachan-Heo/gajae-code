@@ -27315,7 +27315,7 @@ export class AgentSession {
 		const branchEntries = this.sessionManager.getBranch();
 		const latestCompaction = getLatestCompactionEntry(branchEntries);
 		const boundaryTs = latestCompaction ? new Date(latestCompaction.timestamp).getTime() : 0;
-		const anchor = this.#findAnchorableUsageIndex(this.messages, boundaryTs);
+		const anchor = this.#findAnchorableUsageIndex(this.agent.state.messages, boundaryTs);
 		let value: ContextUsage;
 		if (latestCompaction && !anchor) {
 			value = { tokens: null, contextWindow, percent: null, source: "unknown" };
@@ -27338,7 +27338,7 @@ export class AgentSession {
 	}
 
 	#contextUsageCacheKey(model: Model, contextWindow: number): string {
-		const messages = this.messages;
+		const messages = this.agent.state.messages;
 		const lastMessage = messages[messages.length - 1];
 		// Entry and leaf revisions change whenever the active branch changes, avoiding getBranch() on warm reads.
 		const revision = this.sessionManager.revisionSnapshot();
@@ -27487,7 +27487,7 @@ export class AgentSession {
 	 * raw promptTokens/estimatedTokens quotient). Clamped to [0.5, 2] downstream.
 	 */
 	#computeCompactionTokenCorrectionRatio(): number | undefined {
-		const messages = this.messages;
+		const messages = this.agent.state.messages;
 		let lastUsageIndex = -1;
 		let lastUsage: Usage | undefined;
 		for (let i = messages.length - 1; i >= 0; i--) {
@@ -27537,7 +27537,7 @@ export class AgentSession {
 		tokens: number;
 		anchored: boolean;
 	} {
-		const messages = this.messages;
+		const messages = this.agent.state.messages;
 		let anchor = knownAnchor;
 		if (boundaryTs === undefined) {
 			const latestCompaction = getLatestCompactionEntry(this.sessionManager.getBranch());
