@@ -31,13 +31,10 @@ if (process.env.GJC_TIMING || process.env.PI_TIMING) {
 }
 
 async function installRuntimeGlobals(writeNoFileWarning?: (text: string) => void): Promise<void> {
-	const { installH2Fetch } = await import("@gajae-code/ai/utils/h2-fetch");
-	// Activate HTTP/2 for all `fetch()` calls (provider streams, OAuth, model
-	// discovery, web tools). Bun's HTTP/2 client is gated on a startup flag we
-	// can't toggle from JS, so we patch globalThis.fetch to pass
-	// `protocol: "http2"` per request, with transparent HTTP/1.1 fallback on
-	// `HTTP2Unsupported`. See @gajae-code/ai/utils/h2-fetch for details.
-	installH2Fetch();
+	// fetch() deliberately stays on HTTP/1.1. Bun's HTTP/2 client (per-request
+	// `protocol: "http2"`) wedges a pooled connection while uploading large
+	// request bodies (~300KB): every later request on it waits forever for
+	// response headers. Do not re-enable HTTP/2 without re-running that probe.
 
 	const { warnIfMacOSNoFileLimitTooLow } = await import("./cli/nofile-limit");
 	warnIfMacOSNoFileLimitTooLow({ writeStderr: writeNoFileWarning });

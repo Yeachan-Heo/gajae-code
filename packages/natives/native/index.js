@@ -21,7 +21,6 @@ export const ComputerController = nativeBindings.ComputerController;
 export const DiffStream = nativeBindings.DiffStream;
 export const DoctorJournalAuthority = nativeBindings.DoctorJournalAuthority;
 export const MacAppearanceObserver = nativeBindings.MacAppearanceObserver;
-export const MacOSPowerAssertion = nativeBindings.MacOSPowerAssertion;
 export const NativeDiagnosticSnapshot = nativeBindings.NativeDiagnosticSnapshot;
 export const NativeRetainedBrokerPublication = nativeBindings.NativeRetainedBrokerPublication;
 export const NotificationServer = nativeBindings.NotificationServer;

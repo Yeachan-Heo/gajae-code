@@ -24,7 +24,6 @@ if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 }
 process.title = APP_NAME;
 
-
 /** Run the CLI with argv excluding process.argv prefix. */
 export async function runCli(argv: string[]): Promise<void> {
 	// Exact-token diagnostics selector, ahead of every effectful branch. A private
