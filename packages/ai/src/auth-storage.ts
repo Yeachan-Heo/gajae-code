@@ -5559,9 +5559,17 @@ export class AuthStorage {
 		let refreshLeaseCompleted = false;
 		const releaseRefreshLease = (): void => {
 			if (!refreshLease || refreshLeaseCompleted) return;
-			const releaseLease = this.#store.releaseOAuthRefreshLease?.bind(this.#store);
-			releaseLease?.(refreshLease);
 			refreshLeaseCompleted = true;
+			try {
+				const releaseLease = this.#store.releaseOAuthRefreshLease?.bind(this.#store);
+				releaseLease?.(refreshLease);
+			} catch (error) {
+				logger.warn("OAuth refresh lease release failed", {
+					provider,
+					credentialId: refreshLease.credentialId,
+					error: scrubHealthReason(error, [credential.access, credential.refresh]),
+				});
+			}
 		};
 
 		// Caller override > store-level hook > local per-provider refresh.
@@ -5754,7 +5762,6 @@ export class AuthStorage {
 			}
 			return authority;
 		} catch (error) {
-			releaseRefreshLease();
 			// A genuine caller cancellation (e.g. the agent's ESC) is not a refresh
 			// failure. Rethrow before any failure classification so it never poisons
 			// the replay guard (which would temp-block the credential on the next
@@ -5766,17 +5773,19 @@ export class AuthStorage {
 			// pair is immediately eligible for a second refresh, replaying the token
 			// and tripping provider reuse detection. Skip the guard update only for a
 			// caller-owned abort, never for an internal timeout.
-			if (signal?.aborted && !isTimeoutAbort(signal)) throw error;
-			if (localDial && credentialId !== undefined) {
+			const callerAbort = signal?.aborted && !isTimeoutAbort(signal);
+			const taggedError = callerAbort ? error : tagRefreshAttempt(error, credential.refresh);
+			if (!callerAbort && localDial && credentialId !== undefined) {
 				for (const [key, entry] of this.#recentOAuthRefreshFailures) {
 					if (entry.expiresAt <= Date.now()) this.#recentOAuthRefreshFailures.delete(key);
 				}
 				this.#recentOAuthRefreshFailures.set(`${credentialId}:${credential.refresh}`, {
 					expiresAt: Date.now() + OAUTH_REFRESH_FAILURE_REPLAY_GUARD_MS,
-					error,
+					error: taggedError,
 				});
 			}
-			throw tagRefreshAttempt(error, credential.refresh);
+			releaseRefreshLease();
+			throw taggedError;
 		} finally {
 			if (timeout) clearTimeout(timeout);
 			if (signal && onAbort) signal.removeEventListener("abort", onAbort);
