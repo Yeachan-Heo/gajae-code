@@ -1814,6 +1814,12 @@ export class AcpAgent implements Agent {
 
 	async initialize(params: InitializeRequest): Promise<InitializeResponse> {
 		this.#clientCapabilities = params.clientCapabilities;
+		// ACP clients issue `session/new` immediately after `initialize`. Start the
+		// broker handshake while the protocol response is in flight so cold broker
+		// discovery and SDK WebSocket setup do not sit on the critical spawn path.
+		void this.#brokerConnection().catch(error => {
+			logger.debug("ACP broker prewarm failed", { error: String(error) });
+		});
 		const authMethods: AuthMethod[] = [
 			{
 				id: "agent",
