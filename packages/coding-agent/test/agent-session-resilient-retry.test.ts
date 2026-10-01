@@ -585,9 +585,9 @@ describe.serial("AgentSession resilient retry", () => {
 			stopReason: "stop",
 			content: [{ type: "text", text: "recovered" }],
 		});
-			await disposeAfterCoordinatorPersistence(session);
-			session = undefined;
-		});
+		await disposeAfterCoordinatorPersistence(session);
+		session = undefined;
+	});
 
 	it("surfaces terminal coded errors without retrying", async () => {
 		session = buildSession({
@@ -1505,9 +1505,9 @@ describe.serial("AgentSession resilient retry", () => {
 			stopReason: "stop",
 			content: [{ type: "text", text: "recovered" }],
 		});
-			await disposeAfterCoordinatorPersistence(session);
-			session = undefined;
-		});
+		await disposeAfterCoordinatorPersistence(session);
+		session = undefined;
+	});
 	it.each(["server_error", "internal_error"])("does not retry Codex %s after visible content", async code => {
 		const model = getBundledModel("openai-codex", "gpt-5.4-mini");
 		if (!model) throw new Error("Expected bundled Codex test model to exist");

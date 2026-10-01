@@ -22989,7 +22989,7 @@ export class AgentSession {
 			return false;
 		const contextWindow = this.model?.contextWindow ?? 0;
 		if (classifyContextOverflow(message, transportFailure, contextWindow)) return false;
-		if (isBareDefaultCodexOverload(message)) return true;
+		if (isBareDefaultCodexOverload(message) && this.settings.get("retry.enabled") !== false) return true;
 		const managedFallback = this.#defaultFallbackChain().chain.entries.length > 1;
 		// An account-specific model rejection that cannot rotate to another
 		// credential stays terminal only on the session's own retry path; managed
