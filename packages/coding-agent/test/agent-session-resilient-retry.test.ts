@@ -1409,7 +1409,8 @@ describe.serial("AgentSession resilient retry", () => {
 		session = buildStatusErrorSession({
 			model,
 			bareDefault: true,
-			errorMessage: `Codex error event (code=${code}, status=500)`,
+			errorMessage: `Codex error event: fake upstream failure (code=${code})`,
+			transportFailure: { kind: "transport", providerCode: code },
 			recoveredContent: "recovered after provider retries",
 			requestedModels,
 		});
@@ -1429,7 +1430,8 @@ describe.serial("AgentSession resilient retry", () => {
 		session = buildStatusErrorSession({
 			model,
 			bareDefault: true,
-			errorMessage: `Codex error event (code=${code}, status=500)`,
+			errorMessage: `Codex error event: fake upstream failure (code=${code})`,
+			transportFailure: { kind: "transport", providerCode: code },
 			partialContent: "already visible",
 			recoveredContent: "should not reach",
 			requestedModels,

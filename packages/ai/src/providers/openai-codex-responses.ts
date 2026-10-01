@@ -52,7 +52,11 @@ import {
 	sanitizeOpenAIResponsesHistoryItemsForReplay,
 } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
-import { STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE, transportFailureFacts } from "../utils/fallback-transport";
+import {
+	SERVER_OVERLOADED_PROVIDER_CODE,
+	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
+	transportFailureFacts,
+} from "../utils/fallback-transport";
 import { finalizeErrorMessage, type RawHttpRequestDump } from "../utils/http-inspector";
 import {
 	getOpenAIStreamIdleTimeoutMs,
@@ -159,6 +163,11 @@ const CODEX_PREVIOUS_RESPONSE_STALE_PROSE_MESSAGE = new RegExp(
 	"i",
 );
 const CODEX_RETRYABLE_EVENT_CODES = new Set(["model_error", "server_error", "internal_error"]);
+const CODEX_TYPED_TRANSPORT_PROVIDER_CODES = new Set([
+	SERVER_OVERLOADED_PROVIDER_CODE,
+	"server_error",
+	"internal_error",
+]);
 const CODEX_NON_RETRYABLE_EVENT_CODES = new Set([
 	"invalid_function_parameters",
 	"invalid_request_error",
@@ -2182,7 +2191,14 @@ async function handleCodexStreamFailure(
 	}
 	output.stopReason = context.options?.signal?.aborted ? "aborted" : "error";
 	output.errorStatus = extractHttpStatusFromError(error);
-	output.transportFailure = transportFailureFacts(error);
+	const transportFailure = transportFailureFacts(error);
+	const typedProviderCode =
+		error instanceof CodexProviderStreamError && CODEX_TYPED_TRANSPORT_PROVIDER_CODES.has(error.code ?? "")
+			? error.code
+			: undefined;
+	output.transportFailure = typedProviderCode
+		? { ...(transportFailure ?? { kind: "transport" as const }), providerCode: typedProviderCode }
+		: transportFailure;
 	output.errorMessage = await finalizeErrorMessage(error, context.requestContext.rawRequestDump);
 	output.duration = Date.now() - context.startTime;
 	if (context.firstTokenTime) {

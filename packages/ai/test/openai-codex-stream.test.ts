@@ -1221,6 +1221,26 @@ describe("openai-codex streaming", () => {
 		expect(streamResult.errorMessage).not.toContain("API-key credential");
 	});
 
+	it.each(["server_error", "internal_error"])("preserves bare Codex %s error codes as transport facts", async code => {
+		const tempDir = TempDir.createSync("@pi-codex-provider-error-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const model = { ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false };
+		const sse = `data: ${JSON.stringify({ type: "error", error: { code, message: "fake upstream failure" } })}\n\n`;
+		global.fetch = vi.fn(
+			async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		) as unknown as typeof fetch;
+
+		const result = await streamOpenAICodexResponses(model, createCodexTestContext(), {
+			apiKey: token,
+			streamMaxRetries: 0,
+		}).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain(`code=${code}`);
+		expect(result.transportFailure).toMatchObject({ kind: "transport", providerCode: code });
+	});
+
 	it("stops reading SSE responses after a terminal response event", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
