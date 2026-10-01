@@ -2331,9 +2331,8 @@ export class AcpAgent implements Agent {
 		admissionReservation: PromptAdmissionReservation,
 	): Promise<boolean> {
 		let cancelTimer: (() => void) | undefined;
-		const timeout = new Promise<boolean>(resolve => {
-			cancelTimer = this.#promptWatchdogClock.schedule(() => resolve(false), ACP_BUSY_SETTLE_WAIT_MS);
-		});
+		const { promise: timeout, resolve: resolveTimeout } = Promise.withResolvers<boolean>();
+		cancelTimer = this.#promptWatchdogClock.schedule(() => resolveTimeout(false), ACP_BUSY_SETTLE_WAIT_MS);
 		try {
 			return await Promise.race([
 				waiter.settlement.then(() => true),
@@ -4673,8 +4672,13 @@ export class AcpAgent implements Agent {
 					correlationsExactlyMatch(uncertainAbortOwner.correlation, ownedBackgroundCorrelation)
 				)
 					this.#clearUncertainAbortOwner(id, record, uncertainAbortOwner.kind, ownedBackgroundCorrelation);
+				const wasBusy = record.backgroundBusy;
 				record.backgroundBusy = record.backgroundAnonymousCount > 0 || record.backgroundCorrelations.length > 0;
 				record.busy = record.backgroundBusy;
+				if (wasBusy && !record.backgroundBusy) {
+					for (const resolve of record.idleWaiters) resolve();
+					record.idleWaiters.clear();
+				}
 				await this.#publishPromptPhase(id, record.adapter, undefined);
 				return;
 			}
@@ -4692,8 +4696,13 @@ export class AcpAgent implements Agent {
 						owner => !correlationsExactlyMatch(owner, ownedBackgroundCorrelation),
 					);
 				else record.backgroundAnonymousCount--;
+				const wasBusy = record.backgroundBusy;
 				record.backgroundBusy = record.backgroundAnonymousCount > 0 || record.backgroundCorrelations.length > 0;
 				record.busy = true;
+				if (wasBusy && !record.backgroundBusy) {
+					for (const resolve of record.idleWaiters) resolve();
+					record.idleWaiters.clear();
+				}
 				await this.#publishPromptPhase(id, record.adapter, activePrompt);
 				return;
 			}

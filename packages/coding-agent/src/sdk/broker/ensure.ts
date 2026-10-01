@@ -141,7 +141,7 @@ export interface BrokerHopLaunch {
  */
 export async function launchBrokerViaHop(
 	message: BrokerHopMessage,
-	options: { env: NodeJS.ProcessEnv; cwd?: string },
+	options: { env: NodeJS.ProcessEnv; cwd?: string; deadlineMs?: number },
 ): Promise<BrokerHopLaunch> {
 	const hopCmd = resolveHopInvocation(JSON.stringify(message));
 	const hop = spawn(hopCmd.file, hopCmd.args, {
@@ -156,10 +156,24 @@ export async function launchBrokerViaHop(
 		stdout += chunk.toString();
 	});
 	hop.stderr?.resume();
-	const outcome = await new Promise<{ code: number | null; spawnError?: Error }>(resolve => {
-		hop.once("error", spawnError => resolve({ code: null, spawnError }));
-		hop.once("close", code => resolve({ code }));
-	});
+	const { promise: hopCompletion, resolve } = Promise.withResolvers<{ code: number | null; spawnError?: Error }>();
+	hop.once("error", spawnError => resolve({ code: null, spawnError }));
+	hop.once("close", code => resolve({ code }));
+
+	let outcome: { code: number | null; spawnError?: Error };
+	if (options.deadlineMs !== undefined && options.deadlineMs > 0) {
+		const remainingMs = Math.max(0, options.deadlineMs - Date.now());
+		const timeoutPromise = new Promise<{ code: number | null; spawnError?: Error }>(timeoutResolve => {
+			const timer = setTimeout(() => {
+				hop.kill();
+				timeoutResolve({ code: null, spawnError: new Error("broker hop timeout") });
+			}, remainingMs);
+			hopCompletion.finally(() => clearTimeout(timer));
+		});
+		outcome = await Promise.race([hopCompletion, timeoutPromise]);
+	} else {
+		outcome = await hopCompletion;
+	}
 	return { process: hop, ...parseBrokerHopReply(outcome.code, stdout, outcome.spawnError) };
 }
 
@@ -936,7 +950,7 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 					...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
 					...(spawnLog ? { stderrLogPath: spawnLog.path } : {}),
 				},
-				{ env, cwd: command.kind === "bun-source" ? command.cwd : undefined },
+				{ env, cwd: command.kind === "bun-source" ? command.cwd : undefined, deadlineMs: deadline },
 			);
 			spawnResult = { process: launched.process, realBrokerPid: launched.realBrokerPid };
 			spawnError = launched.error;
