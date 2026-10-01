@@ -142,7 +142,9 @@ describe("LifecycleLedger retention", () => {
 			await ledger.transition("restart-retirement", "effect_started", {
 				response: retirementResponse("restart-create"),
 			});
-			await ledger.transition("restart-retirement", "terminal_error", { response: { ok: false, error: { code: "terminal_uncertain" } } });
+			await ledger.transition("restart-retirement", "terminal_error", {
+				response: { ok: false, error: { code: "terminal_uncertain" } },
+			});
 			for (let index = 1; index <= 8; index += 1) await recordTerminalOk(ledger, `traffic-${index}`);
 
 			const reopened = await new LifecycleLedger(agentDir, { maxRows: 6 }).open();
@@ -199,7 +201,9 @@ describe("LifecycleLedger retention", () => {
 			const ledger = await new LifecycleLedger(agentDir, { maxRows: 4 }).open();
 			await recordTerminalOk(ledger, "original-1");
 			await recordTerminalOk(ledger, "original-2");
-			const renameSpy = vi.spyOn(fs, "rename").mockRejectedValueOnce(new Error("simulated compaction write failure"));
+			const renameSpy = vi
+				.spyOn(fs, "rename")
+				.mockRejectedValueOnce(new Error("simulated compaction write failure"));
 			expect(recordTerminalOk(ledger, "failing-3")).rejects.toThrow("simulated compaction write failure");
 			renameSpy.mockRestore();
 
