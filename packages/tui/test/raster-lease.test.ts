@@ -67,7 +67,7 @@ describe("TUI raster lease public boundary", () => {
 			operation: { type: "raster-erase", bytes: bytes("X") },
 			token: stale,
 		});
-		expect(ack.status).toBe("stale-token");
+		expect(ack.status).toBe("failed");
 		expect(terminal.getWriteLog()).toEqual([]);
 	});
 
@@ -111,7 +111,7 @@ describe("TUI raster lease public boundary", () => {
 		expect(terminal.getWriteLog()).toEqual([]);
 
 		const stale = await tui.queueTerminalOutput("NOPE", { shouldWrite: () => false });
-		expect(stale.status).toBe("stale-token");
+		expect(stale.status).toBe("failed");
 		terminal.clearWriteLog();
 		const written = await tui.queueTerminalOutput("OK", { shouldWrite: () => true });
 		expect(written.status).toBe("written");
@@ -135,7 +135,7 @@ describe("TUI raster lease public boundary", () => {
 				shouldWrite: () => false,
 			},
 		});
-		expect(ack.status).toBe("stale-token");
+		expect(ack.status).toBe("failed");
 		expect(terminal.getWriteLog()).toEqual([]);
 	});
 	it("drops queued output whose owner becomes stale before terminal write", async () => {
@@ -144,7 +144,7 @@ describe("TUI raster lease public boundary", () => {
 
 		const ack = await tui.queueTerminalOutput("STALE_FRAME", { shouldWrite: () => false });
 
-		expect(ack.status).toBe("stale-token");
+		expect(ack.status).toBe("failed");
 		expect(terminal.getWriteLog()).toEqual([]);
 	});
 	it("serializes retained cleanup behind prior output and before successor output", async () => {
@@ -209,7 +209,7 @@ describe("TUI raster lease public boundary", () => {
 				shouldWrite: () => current,
 			},
 		});
-		expect(ack.status).toBe("stale-token");
+		expect(ack.status).toBe("failed");
 		expect(terminal.getWriteLog()).toEqual(["SAVE", "RESTORE"]);
 	});
 	it("writes multipart cursor guards atomically when no barrier is required", async () => {
@@ -742,7 +742,7 @@ describe("TUI raster lease public boundary", () => {
 					operation: { type: "raster-erase", bytes: bytes("STALE_PET") },
 				})
 			).status,
-		).toBe("stale-token");
+		).toBe("failed");
 
 		expect(tui.followLiveViewport()).toBe(true);
 		await terminal.waitForRender();
