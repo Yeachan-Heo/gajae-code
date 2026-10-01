@@ -8164,6 +8164,13 @@ export async function executeLifecycle(
 	);
 	const startupFailure: LifecycleStartupFailureReceipt | undefined = evidence
 		? {
+				// Include message and artifactDigest only for recovery-stamped conflicts
+				...(response.error.code === "terminal_uncertain"
+					? {
+							artifactDigest: evidence.digest,
+							message: evidence.artifact.message,
+						}
+					: {}),
 				phase: evidence.artifact.phase,
 				reason: evidence.artifact.reason,
 				...(evidence.artifact.code === undefined
