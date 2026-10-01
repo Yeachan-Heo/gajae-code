@@ -18657,13 +18657,13 @@ export class AgentSession {
 		// IMPORTANT: This is called AFTER durable persistence completes, so the
 		// session-scoped updates occur during the promotion phase after ownership
 		// is committed. Session ownership is captured in the promotion logic above.
-		// Materialize durable profiles first (if persisted and active), then reset
-		// without force to preserve durable semantics.
+		this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: true });
+		this.#setModelWithProviderSessionReset(model);
+		// Materialize durable profiles after model installation so the persisted
+		// default selector matches the newly installed model.
 		if (this.model && this.settings.get("modelProfile.default") !== undefined) {
 			this.materializeActiveDefaultModelProfileAssignment(this.model);
 		}
-		this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: true });
-		this.#setModelWithProviderSessionReset(model);
 		this.#seedSessionCanonicalVariant(model);
 		const thinkingLevelChanged = this.#thinkingLevel !== thinkingLevel;
 		this.#thinkingLevelMutationRevision++;
