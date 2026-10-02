@@ -446,6 +446,51 @@ describe("openai-codex streaming", () => {
 		]);
 	});
 
+	it("refuses to salvage when another returned tool call is unfinished", async () => {
+		const sse = createCodexErrorSse([
+			{
+				type: "response.output_item.added",
+				item: {
+					type: "function_call",
+					id: "fc_incomplete",
+					call_id: "call_incomplete",
+					name: "todo_write",
+					arguments: "",
+				},
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_incomplete", delta: '{"ops":[]' },
+			{
+				type: "response.output_item.added",
+				item: {
+					type: "function_call",
+					id: "fc_complete",
+					call_id: "call_complete",
+					name: "todo_write",
+					arguments: "",
+				},
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_complete", delta: '{"ops":[]}' },
+			{
+				type: "error",
+				code: "request_timeout",
+				message:
+					"stream disconnected before completion: stream closed before response.completed (code=request_timeout)",
+			},
+		]);
+		global.fetch = vi.fn(
+			async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		) as unknown as typeof fetch;
+
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken() },
+		).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.content.filter(block => block.type === "toolCall")).toHaveLength(2);
+	});
+
 	it("salvages a complete tool call after an idle stall", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
@@ -483,6 +528,51 @@ describe("openai-codex streaming", () => {
 
 		expect(result.stopReason).toBe("toolUse");
 		expect(result.errorCode).toBe("codex_stream_closed_after_complete_tool_arguments");
+		expect(result.content).toEqual([
+			{ type: "toolCall", id: "call_idle_complete|fc_idle_complete", name: "todo_write", arguments: { ops: [] } },
+		]);
+	});
+
+	it("preserves malformed Unicode evidence when salvaging after a transient close", async () => {
+		const sse = createCodexErrorSse([
+			{
+				type: "response.output_item.added",
+				item: {
+					type: "function_call",
+					id: "fc_unicode",
+					call_id: "call_unicode",
+					name: "todo_write",
+					arguments: "",
+				},
+			},
+			{
+				type: "response.function_call_arguments.delta",
+				item_id: "fc_unicode",
+				delta: String.raw`{"value":"\uD800"}`,
+			},
+			{
+				type: "error",
+				code: "request_timeout",
+				message:
+					"stream disconnected before completion: stream closed before response.completed (code=request_timeout)",
+			},
+		]);
+		global.fetch = vi.fn(
+			async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		) as unknown as typeof fetch;
+
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken() },
+		).result();
+		const [toolCall] = result.content.filter(block => block.type === "toolCall");
+
+		expect(result.stopReason).toBe("toolUse");
+		expect(toolCall?.arguments).toEqual({ value: String.fromCharCode(0xd800) });
+		expect(toolCall?.escapedNonAsciiArguments).toBe(true);
+		expect(toolCall?.escapedUnicodeArgumentEvidence).toMatchObject({ malformed: true });
+		expect(JSON.stringify(toolCall)).not.toContain("escapedUnicodeArgumentEvidence");
 	});
 
 	it.each([
