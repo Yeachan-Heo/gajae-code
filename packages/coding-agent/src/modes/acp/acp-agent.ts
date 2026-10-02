@@ -6161,6 +6161,16 @@ export class AcpAgent implements Agent {
 		if (this.#disposed) return;
 		this.#disposed = true;
 		const failures: unknown[] = [];
+		const broker = this.#broker;
+		this.#broker = undefined;
+		// Start closing a pending broker before session teardown can block on a live
+		// adapter; otherwise a replacement connection may remain open until teardown
+		// finishes, while callers waiting on that connection cannot observe closure.
+		const brokerClose = broker
+			?.then(connection => this.#closeBrokerAdapter(connection.adapter))
+			.catch(error => {
+				failures.push(error);
+			});
 		for (const id of [...this.#sessions.keys()]) {
 			try {
 				await this.#teardownSession(id, "connection closed", false);
@@ -6184,15 +6194,7 @@ export class AcpAgent implements Agent {
 		this.#pendingCloseIdempotencyKeys.clear();
 		if (this.#lifecycleOperations.size === 0) this.#lifecycleOperations.clear();
 		this.#tearingDown.clear();
-		if (this.#broker) {
-			const broker = this.#broker;
-			this.#broker = undefined;
-			try {
-				await this.#closeBrokerAdapter((await broker).adapter);
-			} catch (error) {
-				failures.push(error);
-			}
-		}
+		if (brokerClose) await brokerClose;
 		this.#pendingRouterAdapters.clear();
 		this.#pendingRouterFrames.clear();
 		try {
