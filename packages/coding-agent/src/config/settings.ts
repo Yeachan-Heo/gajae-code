@@ -1135,7 +1135,7 @@ export class Settings implements NotificationSettingsReader {
 		cloned.#project = {};
 		cloned.#rebuildMerged();
 		cloned.#project = await cloned.#loadProjectSettings(true);
-		await cloned.#normalizeAfterLoad();
+		await cloned.#normalizeAfterLoad(false);
 		return cloned;
 	}
 
@@ -1677,7 +1677,7 @@ export class Settings implements NotificationSettingsReader {
 		return settings;
 	}
 
-	async #normalizeAfterLoad(): Promise<void> {
+	async #normalizeAfterLoad(publishHooks = true): Promise<void> {
 		this.#sanitizeModelSelectorRecords();
 		this.#rebuildMerged();
 		if (!this.#futureSchemaVersion) {
@@ -1693,7 +1693,7 @@ export class Settings implements NotificationSettingsReader {
 		await this.flush();
 		this.#sanitizeModelSelectorRecords();
 		this.#rebuildMerged();
-		this.#fireAllHooks();
+		if (publishHooks) this.#fireAllHooks();
 	}
 
 	#sanitizeModelSelectorRecords(): void {

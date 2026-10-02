@@ -595,7 +595,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		return renderTaskDescription(this.session);
 	}
 	#sessionRepositoryBinding: RepositoryBinding;
-	#scopeIdentity: TaskScopeIdentity | undefined;
+	#scopeIdentity: TaskScopeIdentity;
 	#artifactOwner: TaskTool | undefined;
 	#executionArtifacts: TaskArtifacts | undefined;
 	#testRunSubprocess: typeof runSubprocess | undefined;
@@ -616,6 +616,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			bashAllowedPrefixes: agent.bashAllowedPrefixes ? [...agent.bashAllowedPrefixes] : undefined,
 		}));
 		this.#sessionRepositoryBinding = sessionRepositoryBinding;
+		this.#scopeIdentity = { cwd: session.cwd, generation: 0 };
 	}
 
 	#runSubprocess(options: Parameters<typeof runSubprocess>[0]): Promise<SingleResult> {
@@ -814,6 +815,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			this.#executionArtifacts = await this.#artifactOwner.#resolveEffectiveArtifactsDir();
 			return this.#executionArtifacts;
 		}
+		// Persistent parents establish their canonical owner before synchronous
+		// lookup. Non-persistent trees must first honour an already-adopted store;
+		// allocation and cleanup registration below remain one attempt per batch.
+		if (this.session.getSessionFile()) await this.session.ensureArtifactManager?.();
 		const shared = this.#sharedArtifactStore();
 		if (shared) {
 			return {
@@ -862,7 +867,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				session.getTaskScopeSettings?.() ?? session.settings,
 			);
 			const tool = new TaskTool(session, agents, publicRepositoryBinding(binding), projectAgentsDir);
-			tool.#scopeIdentity = identity ? { ...identity } : undefined;
+			tool.#scopeIdentity = identity ? { ...identity } : { cwd, generation: 0 };
 			tool.#testRunSubprocess = options?.runSubprocess;
 			return tool;
 		};
@@ -877,7 +882,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			const binding = await captureRepositoryBinding(cwd, { displayPath: cwd });
 			await assertExecutionRootMatchesRepositoryBinding(session.cwd, binding);
 			const tool = new TaskTool(session, loadBundledAgents(), publicRepositoryBinding(binding));
-			tool.#scopeIdentity = identity ? { ...identity } : undefined;
+			tool.#scopeIdentity = identity ? { ...identity } : { cwd, generation: 0 };
 			return tool;
 		};
 		return session.runWithTaskAdmission ? session.runWithTaskAdmission(create) : create();
@@ -911,7 +916,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			signal?.throwIfAborted();
 			try {
 				const identity = this.session.getTaskScopeIdentity?.();
-				if (identity && this.#scopeIdentity) {
+				if (identity) {
 					if (identity.generation < this.#scopeIdentity.generation) {
 						throw new Error("Task admission generation moved backwards.");
 					}
@@ -925,6 +930,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						this.#sessionRepositoryBinding = publicRepositoryBinding(binding);
 						this.#scopeIdentity = { ...identity };
 					}
+				}
+				if (path.resolve(this.session.cwd) !== path.resolve(this.#scopeIdentity.cwd)) {
+					throw new Error("Task admission cwd changed without a committed move.");
 				}
 				await assertExecutionRootMatchesRepositoryBinding(this.session.cwd, this.#sessionRepositoryBinding);
 			} catch (error) {

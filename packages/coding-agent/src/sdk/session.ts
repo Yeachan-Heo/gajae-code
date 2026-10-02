@@ -3388,10 +3388,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const manager = sessionManager.getArtifactManager();
 			return manager ? [manager.dir] : [];
 		};
-		toolSession.agentOutputManager = new AgentOutputManager(
-			getArtifactsDir,
-			options.parentTaskPrefix ? { parentPrefix: options.parentTaskPrefix } : undefined,
-		);
+		toolSession.agentOutputManager = new AgentOutputManager(getArtifactsDir, {
+			...(options.parentTaskPrefix ? { parentPrefix: options.parentTaskPrefix } : {}),
+			getAuthorizedArtifactsDirs: () => {
+				const manager = sessionManager.getArtifactManager();
+				return manager ? [manager.dir] : [];
+			},
+		});
 
 		// Create built-in tools (already wrapped with meta notice formatting)
 		const builtinTools = await logger.time(

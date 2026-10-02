@@ -62,8 +62,11 @@ User-driven `/move` and SDK cwd relocation are separate authorized surfaces. Aft
 committed move, new task admissions use the target repository authority and refreshed
 agent resources, even when the task tool was materialized before the move. Already
 admitted tasks (including queued and resumed work) retain their original execution
-scope. A failed move or arbitrary cwd mutation does not grant target authority;
-caller-provided `repositoryBinding` still cannot relocate the session.
+scope. Cancellation or failure before publication commits preserves the source scope;
+an error while finalizing an already-published move retains the committed target
+scope. The runtime's committed cwd/generation, not the mere presence of an error,
+determines task admission authority. Arbitrary cwd mutation never grants target
+authority; caller-provided `repositoryBinding` still cannot relocate the session.
 
 `tasks[].tier` is inert while `task.autorouting.enabled` is `false`. When autorouting is active it selects the model chain for that item, an omitted `tier` routes as `balanced`, and the routed pin overrides the manual model chain. See [Autorouting](#autorouting).
 
@@ -105,6 +108,7 @@ Artifacts and side channels:
 - Every subagent with an artifacts dir writes `<id>.md`; `agent://<id>` resolves to that file.
 - If the output file is JSON, `agent://<id>/<path>` and `agent://<id>?q=<query>` perform JSON extraction in `packages/coding-agent/src/internal-urls/agent-protocol.ts`.
 - When the parent session persists artifacts, each subagent also gets `<id>.jsonl` session history.
+- Managed persistent parents use one stable logical-session/tree artifact owner outside the transcript's movable basename tree. Running child writers, prior outputs and numeric artifact allocation survive a parent cwd move and reopening the parent. Its persisted locator is identity data, not permission to open an arbitrary path: the verified managed storage root, directory identity and session-owned manifest must all match. Missing or replaced owners are diagnosed rather than replaced with an empty store; session deletion and disk GC retire only the captured exact owner tree.
 - Isolated execution writes a unique recovery artifact before cleanup whenever root changes, nested changes, or incomplete-capture evidence exists, including failed/paused/aborted tasks.
 - Async mode returns immediately after job registration, then emits `onUpdate(...)` progress snapshots and later hands completion to the session async-job pipeline.
 

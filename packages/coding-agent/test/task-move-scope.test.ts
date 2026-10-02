@@ -7,12 +7,15 @@ import { getBundledModel } from "@gajae-code/ai";
 import * as utils from "@gajae-code/utils";
 import { safeRm } from "../../../scripts/safe-cleanup";
 import { AsyncJobManager } from "../src/async";
-import { Settings } from "../src/config/settings";
+import * as templateDiscovery from "../src/config/prompt-templates";
+import { onAppendOnlyModeChanged, Settings } from "../src/config/settings";
 import { captureRepositoryBinding } from "../src/gjc-runtime/repository-binding";
 import { InternalUrlRouter } from "../src/internal-urls/router";
 import { createAgentSession } from "../src/sdk";
 import { ArtifactManager } from "../src/session/artifacts";
 import { SessionManager } from "../src/session/session-manager";
+import { MemorySessionStorage } from "../src/session/session-storage";
+import * as contextDiscovery from "../src/system-prompt";
 import { AgentOutputManager, TaskTool } from "../src/task";
 import type { ExecutorOptions } from "../src/task/executor";
 import type { TaskScopeAuthority } from "../src/task/scope";
@@ -37,7 +40,7 @@ async function git(cwd: string, args: string[]): Promise<void> {
 	if (code !== 0) throw new Error(`git ${args.join(" ")}: ${stdout}${stderr}`);
 }
 
-async function harness(isolated = false) {
+async function harness(isolated = false, persisted = false, storage?: MemorySessionStorage) {
 	const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-scope-")));
 	roots.push(root);
 	const a = path.join(root, "workspace");
@@ -83,7 +86,11 @@ async function harness(isolated = false) {
 		settings.override("task.enableLsp", false);
 		settings.override("irc.enabled", false);
 	}
-	const sessionManager = SessionManager.inMemory(a);
+	const sessionManager = storage
+		? SessionManager.create(a, SessionManager.explicitDestination(path.join(root, "sessions")), storage)
+		: persisted
+			? SessionManager.create(a, SessionManager.managedDestination(a, home))
+			: SessionManager.inMemory(a);
 	const jobs = new AsyncJobManager({ onJobComplete: async () => {} });
 	managers.push(jobs);
 	const artifacts = new ArtifactManager(path.join(root, "outputs"));
@@ -141,18 +148,20 @@ async function complete(options: ExecutorOptions, extra: Partial<SingleResult> =
 	const output = await Bun.file(path.join(options.cwd, "marker.txt")).text();
 	if (options.artifactsDir) {
 		const outputPath = path.join(options.artifactsDir, `${options.id}.md`);
-		await Bun.write(outputPath, output);
-		await Bun.write(
-			`${outputPath}.meta.json`,
-			JSON.stringify({
-				id: options.id,
-				kind: "agent-output",
-				createdAt: new Date().toISOString(),
-				sizeBytes: Buffer.byteLength(output),
-				lineCount: 1,
-				sha256: createHash("sha256").update(output).digest("hex"),
-			}),
-		);
+		const metadata = JSON.stringify({
+			id: options.id,
+			kind: "agent-output",
+			createdAt: new Date().toISOString(),
+			sizeBytes: Buffer.byteLength(output),
+			lineCount: 1,
+			sha256: createHash("sha256").update(output).digest("hex"),
+		});
+		if (options.managedPersistence) {
+			await options.managedPersistence.publishOutput(output, Buffer.from(metadata));
+		} else {
+			await Bun.write(outputPath, output);
+			await Bun.write(`${outputPath}.meta.json`, metadata);
+		}
 	}
 	return {
 		index: options.index,
@@ -310,6 +319,69 @@ describe("task admission after trusted committed moves", () => {
 		});
 	}
 
+	it("uses published B authority after a late move finalization error", async () => {
+		const storage = new MemorySessionStorage();
+		const h = await harness(false, false, storage);
+		await h.sessionManager.ensureOnDisk();
+		const seen: ExecutorOptions[] = [];
+		const tool = await TaskTool.create(h.session, {
+			runSubprocess: async worker => {
+				seen.push(worker);
+				return complete(worker);
+			},
+		});
+		const writeText = storage.writeTextSync.bind(storage);
+		const writeBytes = storage.writeBytesOwnedSync.bind(storage);
+		vi.spyOn(storage, "writeTextSync").mockImplementation((file, content) => {
+			if (h.sessionManager.getCwd() === h.b) throw new Error("injected post-publication finalization failure");
+			writeText(file, content);
+		});
+		vi.spyOn(storage, "writeBytesOwnedSync").mockImplementation((file, content) => {
+			if (h.sessionManager.getCwd() === h.b) throw new Error("injected post-publication finalization failure");
+			writeBytes(file, content);
+		});
+		await expect(h.sessionManager.moveTo(h.b)).rejects.toThrow("injected post-publication finalization failure");
+		expect(h.sessionManager.getCwd()).toBe(h.b);
+		expect(h.sessionManager.getCwdGeneration()).toBe(1);
+		await start(tool, [task("AfterPublishedMove")]);
+		await h.jobs.waitForAll();
+		expect(seen[0]?.cwd).toBe(h.b);
+		expect(seen[0]?.agent.systemPrompt).toContain("Use B scope only");
+		expect(h.jobs.getJob("0-AfterPublishedMove")?.status).toBe("completed");
+	});
+
+	it("keeps A task authority after a queued cwd move is actually cancelled", async () => {
+		const h = await harness();
+		const seen: ExecutorOptions[] = [];
+		const tool = await TaskTool.create(h.session, {
+			runSubprocess: async worker => {
+				seen.push(worker);
+				return complete(worker);
+			},
+		});
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const holder = h.sessionManager.runExclusiveCwdTransition(async () => {
+			entered.resolve();
+			await release.promise;
+		});
+		await entered.promise;
+		const controller = new AbortController();
+		const move = vi.fn(() => h.sessionManager.moveTo(h.b));
+		const cancelled = h.sessionManager.runExclusiveCwdTransition(move, { signal: controller.signal });
+		controller.abort(new Error("cancelled pending cwd move"));
+		await expect(cancelled).rejects.toThrow("cancelled pending cwd move");
+		expect(move).not.toHaveBeenCalled();
+		expect(h.sessionManager.getCwdGeneration()).toBe(0);
+		expect(h.sessionManager.getCwd()).toBe(h.a);
+		release.resolve();
+		await holder;
+		await start(tool, [task("AfterCancelledMove")]);
+		await h.jobs.waitForAll();
+		expect(seen[0]?.cwd).toBe(h.a);
+		expect(seen[0]?.id).toBe("0-AfterCancelledMove");
+	});
+
 	it("rejects cancelled admission before allocation after the move writer drains", async () => {
 		const h = await harness();
 		const tool = await TaskTool.create(h.session, { runSubprocess: complete });
@@ -405,6 +477,36 @@ describe("task admission after trusted committed moves", () => {
 		await h.jobs.waitForAll();
 		expect(allocate.mock.calls[0]?.[0]).toEqual(["Valid"]);
 	});
+
+	for (const trusted of [true, false]) {
+		it(`rejects same-repository cwd drift ${trusted ? "with" : "without"} scope hooks before discovery`, async () => {
+			const h = await harness(true);
+			if (!trusted) {
+				delete h.session.getTaskScopeIdentity;
+				delete h.session.runWithTaskAdmission;
+			}
+			const tool = await TaskTool.create(h.session, { runSubprocess: complete });
+			const sibling = path.join(h.a, "same-repository-directory");
+			await fs.mkdir(sibling);
+			const sourceBinding = await captureRepositoryBinding(h.a);
+			const driftBinding = await captureRepositoryBinding(sibling);
+			expect(driftBinding.worktreeRoot).toBe(sourceBinding.worktreeRoot);
+			expect(driftBinding.commonDir).toBe(sourceBinding.commonDir);
+			const discovery = vi.fn(h.session.getTaskScopeSettings ?? (() => h.sourceSettings));
+			h.session.getTaskScopeSettings = discovery;
+			const allocate = vi.spyOn(h.allocator, "allocateBatch");
+			const register = vi.spyOn(h.jobs, "register");
+			h.setDrift(sibling);
+			expect(text(await start(tool, [task("SameRepoDrift")]))).toContain("cwd changed without a committed move");
+			expect(discovery).not.toHaveBeenCalled();
+			expect(allocate).not.toHaveBeenCalled();
+			expect(register).not.toHaveBeenCalled();
+			h.setDrift();
+			await start(tool, [task("ValidAfterDrift")]);
+			await h.jobs.waitForAll();
+			expect(h.jobs.getJob("0-ValidAfterDrift")?.status).toBe("completed");
+		});
+	}
 
 	it("does not recapture authority for callers without trusted scope hooks", async () => {
 		const h = await harness();
@@ -502,6 +604,314 @@ describe("task admission after trusted committed moves", () => {
 		expect(await Bun.file(config).text()).toBe(before);
 	});
 
+	for (const resource of ["context", "skills", "templates"] as const) {
+		it(`retires stale A ${resource} after target discovery fails without losing B authority`, async () => {
+			const h = await harness();
+			const seen: ExecutorOptions[] = [];
+			const create = TaskTool.create;
+			vi.spyOn(TaskTool, "create").mockImplementation((toolSession, options) =>
+				create(toolSession, {
+					...options,
+					runSubprocess: async worker => {
+						seen.push(worker);
+						return complete(worker);
+					},
+				}),
+			);
+			const { session } = await createAgentSession({
+				cwd: h.a,
+				agentDir: h.home,
+				sessionManager: h.sessionManager,
+				settings: h.sourceSettings,
+				model: getBundledModel("openai", "gpt-4o-mini"),
+				disableExtensionDiscovery: true,
+				slashCommands: [],
+				enableMCP: false,
+				enableMcpAutoload: false,
+				enableLsp: false,
+				toolNames: ["task"],
+			});
+			try {
+				const tool = session.getToolByName("task")!;
+				const jobs = AsyncJobManager.instance();
+				if (!jobs) throw new Error("Expected SDK-owned jobs");
+				await start(tool, [task("BeforeFailure")]);
+				await jobs.waitForAll();
+				expect(seen[0]?.contextFiles?.some(file => file.path.startsWith(h.a))).toBe(true);
+				expect(seen[0]?.skills?.some(skill => skill.filePath.startsWith(h.a))).toBe(true);
+				expect(seen[0]?.promptTemplates?.some(template => template.content.includes("Template A"))).toBe(true);
+				const failure = new Error(`injected target ${resource} discovery failure`);
+				const warnings = vi.spyOn(utils.logger, "warn");
+				if (resource === "context") {
+					vi.spyOn(contextDiscovery, "loadProjectContextFilesResult").mockRejectedValue(failure);
+				} else if (resource === "skills") {
+					vi.spyOn(session, "reloadSkills").mockRejectedValue(failure);
+				} else {
+					vi.spyOn(templateDiscovery, "loadPromptTemplates").mockRejectedValue(failure);
+				}
+				await h.sessionManager.moveTo(h.b);
+				await start(tool, [task("AfterFailure")]);
+				await jobs.waitForAll();
+				const retained = seen.at(-1)!;
+				expect(retained.cwd).toBe(h.b);
+				expect(retained.agent.systemPrompt).toContain("Use B scope only");
+				expect(retained.settings?.getCwd()).toBe(h.b);
+				if (resource === "context") expect(retained.contextFiles).toEqual([]);
+				if (resource === "skills") {
+					expect(retained.skills?.some(skill => skill.filePath.startsWith(h.a))).toBe(false);
+					expect(retained.skills?.map(skill => skill.name).sort()).toEqual([
+						"autoresearch",
+						"deep-interview",
+						"ralplan",
+						"ultragoal",
+					]);
+				}
+				if (resource === "templates") expect(retained.promptTemplates).toEqual([]);
+				expect(JSON.stringify(warnings.mock.calls)).toContain(failure.message);
+				expect(jobs.getJob("1-AfterFailure")?.status).toBe("completed");
+			} finally {
+				await session.dispose();
+			}
+		});
+	}
+
+	it("retains managed persistent running queued and resumed A work across physical publication", async () => {
+		const h = await harness(false, true);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const seen: ExecutorOptions[] = [];
+		const create = TaskTool.create;
+		vi.spyOn(TaskTool, "create").mockImplementation((toolSession, options) =>
+			create(toolSession, {
+				...options,
+				runSubprocess: async worker => {
+					seen.push(worker);
+					if (!worker.managedPersistence) throw new Error("Expected managed task persistence");
+					const child = await worker.managedPersistence.openSession(worker.cwd);
+					try {
+						if (worker.id === "0-PersistedRunning" && worker.runMode !== "message") {
+							child.appendCustomEntry("before-parent-move", { cwd: worker.cwd });
+							await child.ensureOnDisk();
+							await child.flush();
+							entered.resolve();
+							await release.promise;
+						}
+						child.appendCustomEntry("scope-probe", { cwd: worker.cwd, runMode: worker.runMode });
+						await child.ensureOnDisk();
+						await child.flush();
+						return await complete(worker);
+					} finally {
+						await child.close();
+					}
+				},
+			}),
+		);
+		const { session } = await createAgentSession({
+			cwd: h.a,
+			agentDir: h.home,
+			sessionManager: h.sessionManager,
+			settings: h.sourceSettings,
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			slashCommands: [],
+			enableMCP: false,
+			enableMcpAutoload: false,
+			enableLsp: false,
+			toolNames: ["task", "read"],
+		});
+		try {
+			const tool = session.getToolByName("task")!;
+			const jobs = AsyncJobManager.instance();
+			if (!jobs) throw new Error("Expected SDK-owned jobs");
+			await start(tool, [task("PersistedRunning"), task("PersistedQueued")]);
+			await entered.promise;
+			const sourceDir = h.sessionManager.getArtifactsDir();
+			expect(sourceDir).not.toBeNull();
+			await h.sessionManager.moveTo(h.b);
+			expect(h.sessionManager.getArtifactsDir()).not.toBe(sourceDir);
+			release.resolve();
+			await jobs.waitForAll();
+			for (const id of ["0-PersistedRunning", "1-PersistedQueued"]) {
+				const job = jobs.getJob(id);
+				expect({ status: job?.status, error: job?.errorText }).toEqual(
+					expect.objectContaining({ status: "completed" }),
+				);
+				expect(
+					text(await session.getToolByName("read")!.execute("retained-output", { path: `agent://${id}` })),
+				).toContain("A");
+			}
+			expect(jobs.resumeSubagent("0-PersistedRunning", { ownerId: "0-Main" }, "resume A").ok).toBe(true);
+			await jobs.waitForAll();
+			expect(jobs.getSubagentRecords().find(record => record.subagentId === "0-PersistedRunning")?.status).toBe(
+				"completed",
+			);
+			expect(seen.filter(worker => worker.id === "0-PersistedRunning")).toHaveLength(2);
+			expect(seen.every(worker => worker.cwd === h.a)).toBe(true);
+			const owner = h.sessionManager.getArtifactManager()!;
+			const transcript = h.sessionManager.getSessionFile()!;
+			const childTranscript = path.join(owner.dir, "0-PersistedRunning.jsonl");
+			const records = await Bun.file(childTranscript).text();
+			expect(records).toContain("before-parent-move");
+			expect(records.match(/scope-probe/g)).toHaveLength(2);
+			await session.dispose();
+			const reopened = await SessionManager.open(transcript, SessionManager.managedDestination(h.b, h.home));
+			try {
+				const restored = reopened.getArtifactManager()!;
+				expect(restored).not.toBe(owner);
+				expect(restored.dir).toBe(owner.dir);
+				expect(reopened.isArtifactManagerAuthorized(restored)).toBe(true);
+				const output = await InternalUrlRouter.instance().resolve("agent://0-PersistedRunning", {
+					cwd: h.b,
+					getArtifactsDir: () => restored.dir,
+					getAuthorizedArtifactsDirs: () => [restored.dir],
+				});
+				expect(output.content).toBe("A");
+			} finally {
+				await reopened.close();
+			}
+		} finally {
+			release.resolve();
+			await session.dispose();
+		}
+	}, 30_000);
+
+	it("keeps shared numeric allocation across owner reopen and rejects a replaced manifest", async () => {
+		const h = await harness(false, true);
+		const manager = h.sessionManager;
+		const owner = await manager.ensureArtifactManager();
+		if (!owner) throw new Error("Expected persistent owner");
+		const first = await manager.allocateArtifactPath("probe");
+		await manager.moveTo(h.b);
+		expect(manager.getArtifactManager()).toBe(owner);
+		const second = await manager.allocateArtifactPath("probe");
+		expect(second.id).not.toBe(first.id);
+		expect(first.id).toBeDefined();
+		expect(second.id).toBeDefined();
+		expect(first.path).toBeUndefined();
+		expect(second.path).toBeUndefined();
+		const transcript = manager.getSessionFile()!;
+		await manager.close();
+		const reopened = await SessionManager.open(transcript, SessionManager.managedDestination(h.b, h.home));
+		const restored = reopened.getArtifactManager()!;
+		try {
+			expect(restored.dir).toBe(owner.dir);
+			const third = await reopened.allocateArtifactPath("probe");
+			expect([first.id, second.id]).not.toContain(third.id);
+			await reopened.newSession();
+			const successor = await reopened.ensureArtifactManager();
+			expect(successor?.dir).not.toBe(restored.dir);
+			expect(reopened.isArtifactManagerAuthorized(restored)).toBe(false);
+		} finally {
+			await reopened.close();
+		}
+		const manifest = path.join(owner.dir, ".gjc-task-artifact-owner-v1.json");
+		const original = await Bun.file(manifest).text();
+		await Bun.write(manifest, "{}");
+		const damaged = await SessionManager.open(transcript, SessionManager.managedDestination(h.b, h.home));
+		try {
+			expect(() => damaged.getArtifactManager()).toThrow("task_artifact_owner_manifest_invalid");
+			expect(await Bun.file(manifest).text()).toBe("{}");
+		} finally {
+			await damaged.close();
+			await Bun.write(manifest, original);
+		}
+	});
+
+	it("normalizes target settings without publishing process-global hooks", async () => {
+		const h = await harness();
+		const config = path.join(h.b, ".gjc", "config.yml");
+		const before = "provider:\n  appendOnlyContext: on\nask:\n  timeout: 60000\n";
+		await Bun.write(config, before);
+		const changes: string[] = [];
+		const unsubscribe = onAppendOnlyModeChanged(value => changes.push(value));
+		try {
+			const preview = await h.sourceSettings.snapshotForCwd(h.b);
+			expect(preview.get("provider.appendOnlyContext")).toBe("on");
+			expect(preview.get("ask.timeout")).toBe(60);
+			expect(changes).toEqual([]);
+			expect(h.sourceSettings.getCwd()).toBe(h.a);
+			expect(await Bun.file(config).text()).toBe(before);
+		} finally {
+			unsubscribe();
+		}
+	});
+
+	it("preserves enabled exact MCP and LSP tools across an authorized SDK move", async () => {
+		const h = await harness();
+		const config = path.join(h.root, "mcp.json");
+		const fixture = `
+const readline = require('node:readline');
+readline.createInterface({ input: process.stdin }).on('line', line => {
+  const request = JSON.parse(line);
+  if (request.id === undefined) return;
+  let result = {};
+  if (request.method === 'initialize') result = { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'scope-fixture', version: '1' } };
+  if (request.method === 'tools/list') result = { tools: [{ name: 'marker', description: 'Local scope marker', inputSchema: { type: 'object', properties: {} } }] };
+  if (request.method === 'tools/call') result = { content: [{ type: 'text', text: 'scope-service-live' }] };
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }) + '\\n');
+});
+`;
+		await Bun.write(
+			config,
+			JSON.stringify({ mcpServers: { scopefixture: { command: process.execPath, args: ["-e", fixture] } } }),
+		);
+		const seen: ExecutorOptions[] = [];
+		const create = TaskTool.create;
+		vi.spyOn(TaskTool, "create").mockImplementation((session, options) =>
+			create(session, {
+				...options,
+				runSubprocess: async worker => {
+					seen.push(worker);
+					return complete(worker);
+				},
+			}),
+		);
+		const { session } = await createAgentSession({
+			cwd: h.a,
+			agentDir: h.home,
+			sessionManager: h.sessionManager,
+			settings: h.sourceSettings,
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			slashCommands: [],
+			enableMCP: true,
+			enableMcpAutoload: false,
+			mcpConfigPath: config,
+			enableLsp: true,
+			toolNames: ["task", "move_session", "read", "lsp"],
+		});
+		try {
+			const taskTool = session.getToolByName("task")!;
+			expect(session.getToolByName("move_session")).toBeUndefined();
+			const service = session.getToolByName("mcp__scopefixture_marker")!;
+			const lsp = session.getToolByName("lsp")!;
+			expect(service).toBeDefined();
+			expect(lsp).toBeDefined();
+			expect(session.getActiveToolNames()).toContain(service.name);
+			expect(session.getActiveToolNames()).toContain(lsp.name);
+			expect(text(await service.execute("before-move", {}))).toContain("scope-service-live");
+			const jobs = AsyncJobManager.instance()!;
+			await start(taskTool, [task("AuthorizedSource")]);
+			await jobs.waitForAll();
+			expect(seen[0]?.id).toBe("0-AuthorizedSource");
+			expect(seen[0]?.cwd).toBe(h.a);
+			await h.sessionManager.moveTo(h.b);
+			expect(session.getToolByName("move_session")).toBeUndefined();
+			expect(session.getToolByName(service.name)).toBe(service);
+			expect(session.getToolByName(lsp.name)).toBe(lsp);
+			expect(session.getActiveToolNames()).toContain(service.name);
+			expect(session.getActiveToolNames()).toContain(lsp.name);
+			expect(text(await service.execute("after-move", {}))).toContain("scope-service-live");
+			await start(taskTool, [task("AuthorizedTarget")]);
+			await jobs.waitForAll();
+			expect(seen[1]?.id).toBe("1-AuthorizedTarget");
+			expect(seen[1]?.cwd).toBe(h.b);
+			expect(seen[1]?.parentMcpManager).toBeUndefined();
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
+
 	for (const surface of ["agent", "SDK"] as const) {
 		it(`wires eager task settings and resources through a real ${surface} move`, async () => {
 			const h = await harness();
@@ -548,6 +958,15 @@ describe("task admission after trusted committed moves", () => {
 				await jobs.waitForAll();
 				expect(seen[0]?.cwd).toBe(h.a);
 				if (surface === "agent") {
+					const sibling = path.join(h.root, "sibling");
+					await fs.mkdir(sibling);
+					for (const denied of [sibling, h.root]) {
+						await expect(
+							session.getToolByName("move_session")!.execute("denied", { path: denied }),
+						).rejects.toThrow("only narrows the session scope");
+						expect(h.sessionManager.getCwd()).toBe(h.a);
+						expect(h.sessionManager.getCwdGeneration()).toBe(0);
+					}
 					expect(text(await session.getToolByName("move_session")!.execute("move", { path: "repo" }))).toContain(
 						h.b,
 					);
