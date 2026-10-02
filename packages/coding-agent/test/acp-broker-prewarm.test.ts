@@ -1,8 +1,25 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
+import { mkdir, mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
-import type { AcpSdkAdapter } from "../src/sdk/acp";
-import type { SdkClient } from "../src/sdk/client";
+import { AcpSdkAdapter } from "../src/sdk/acp/adapter";
+import { startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
+import { SdkClient } from "../src/sdk/client";
+import {
+	cleanupFixtureRoots,
+	createFixtureBrokerEnvironment,
+	createFixtureRootCleanup,
+	type FixtureRootCleanup,
+	withFixtureBrokerEnvironment,
+} from "./helpers/fixture-broker-cleanup";
+
+const cleanupRoots: FixtureRootCleanup[] = [];
+
+afterEach(async () => {
+	await cleanupFixtureRoots(cleanupRoots);
+});
 
 type Deferred<T> = {
 	promise: Promise<T>;
@@ -20,6 +37,15 @@ function adapter(label: string): AcpSdkAdapter {
 		global: async () => ({ sessions: [{ sessionId: label, locator: { cwd: process.cwd() } }] }),
 		close: async () => {},
 	} as unknown as AcpSdkAdapter;
+}
+
+async function waitFor(predicate: () => boolean, label: string): Promise<void> {
+	const deadline = Date.now() + 10_000;
+	while (Date.now() < deadline) {
+		if (predicate()) return;
+		await Bun.sleep(10);
+	}
+	throw new Error(`Timed out waiting for ${label}`);
 }
 
 describe("ACP broker prewarm", () => {
@@ -254,5 +280,114 @@ describe("ACP broker prewarm", () => {
 		await Bun.sleep(10);
 
 		expect(closeCalls).toBe(1);
+	});
+
+	it("closes a replacement adapter resolved while live session teardown is pending", async () => {
+		const root = await mkdtemp(path.join(tmpdir(), "gjc-acp-broker-dispose-race-"));
+		const cwd = path.join(root, "workspace");
+		const agentDir = path.join(root, "agent");
+		await mkdir(cwd, { recursive: true });
+		const environment = createFixtureBrokerEnvironment(root, agentDir);
+		const started = await withFixtureBrokerEnvironment(() =>
+			startFixtureBrokerWithLeaseForTest({ agentDir, env: environment }),
+		);
+		cleanupRoots.push(createFixtureRootCleanup(root, agentDir, started.lease));
+
+		const replacementClient = deferred<SdkClient>();
+		let connectCalls = 0;
+		let reconnectFailureHandler: ((error: unknown) => void) | undefined;
+		const realConnect = SdkClient.connect.bind(SdkClient);
+		const reconnectSpy = vi.spyOn(SdkClient.prototype, "onReconnectFailed").mockImplementation(handler => {
+			reconnectFailureHandler ??= handler as unknown as (error: unknown) => void;
+			return () => {};
+		});
+		const connectSpy = vi.spyOn(SdkClient, "connect").mockImplementation(async (url, token, options) => {
+			connectCalls += 1;
+			if (connectCalls === 2) return replacementClient.promise;
+			return await realConnect(url, token, options);
+		});
+		const abort = new AbortController();
+		const unhandled: unknown[] = [];
+		const onUnhandled = (error: unknown): void => {
+			unhandled.push(error);
+		};
+		process.on("unhandledRejection", onUnhandled);
+		const agent = new AcpAgent(
+			{ signal: abort.signal, closed: Promise.resolve() } as unknown as AgentSideConnection,
+			{ agentDir },
+		);
+
+		const teardown = Promise.withResolvers<void>();
+		let sessionCloseStarted = false;
+		let replacementWindow = true;
+		let sessionAdapter: AcpSdkAdapter | undefined;
+		let firstBrokerAdapter: AcpSdkAdapter | undefined;
+		const originalStart = AcpSdkAdapter.prototype.start;
+		const startSpy = vi.spyOn(AcpSdkAdapter.prototype, "start").mockImplementation(async function (
+			this: AcpSdkAdapter,
+			...args
+		) {
+			firstBrokerAdapter ??= this;
+			return await originalStart.apply(this, args);
+		});
+		const originalOnFrame = AcpSdkAdapter.prototype.onFrame;
+		const frameSpy = vi.spyOn(AcpSdkAdapter.prototype, "onFrame").mockImplementation(function (
+			this: AcpSdkAdapter,
+			handler,
+		) {
+			sessionAdapter = this;
+			return originalOnFrame.call(this, handler);
+		});
+		let replacementCloseCalls = 0;
+		const originalClose = AcpSdkAdapter.prototype.close;
+		const closeSpy = vi.spyOn(AcpSdkAdapter.prototype, "close").mockImplementation(async function (
+			this: AcpSdkAdapter,
+		) {
+			if (this === sessionAdapter && !sessionCloseStarted) {
+				sessionCloseStarted = true;
+				await teardown.promise;
+			} else if (
+				this !== sessionAdapter &&
+				this !== firstBrokerAdapter &&
+				sessionCloseStarted &&
+				replacementWindow
+			) {
+				replacementCloseCalls += 1;
+			}
+			await originalClose.call(this);
+		});
+
+		try {
+			await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+			const created = await agent.newSession({ cwd, mcpServers: [] });
+			reconnectFailureHandler?.(new Error("reconnect failed"));
+
+			const listing = agent.listSessions({});
+			await waitFor(() => connectCalls === 2, "replacement broker connection");
+			abort.abort();
+			await waitFor(() => sessionCloseStarted, "live session teardown");
+
+			const replacementConnection = await realConnect(started.discovery.url, started.discovery.token, {
+				reconnectAttempts: 0,
+			});
+			replacementClient.resolve(replacementConnection);
+			await expect(listing).rejects.toMatchObject({ code: "connection_closed" });
+			replacementWindow = false;
+			teardown.resolve();
+			await Bun.sleep(20);
+
+			expect(created.sessionId).toEqual(expect.any(String));
+			expect(replacementCloseCalls).toBe(1);
+			expect(unhandled).toEqual([]);
+		} finally {
+			startSpy.mockRestore();
+			reconnectSpy.mockRestore();
+			connectSpy.mockRestore();
+			frameSpy.mockRestore();
+			teardown.resolve();
+			abort.abort();
+			closeSpy.mockRestore();
+			process.off("unhandledRejection", onUnhandled);
+		}
 	});
 });
