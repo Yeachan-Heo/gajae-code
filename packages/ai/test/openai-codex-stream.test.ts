@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { enrichModelThinking } from "@gajae-code/ai/model-thinking";
 import {
+	createCodexStreamProgressClassifier,
 	getOpenAICodexTransportDetails,
 	getOpenAICodexWebSocketDebugStats,
 	prewarmOpenAICodexResponses,
@@ -136,6 +137,46 @@ function createMalformedDeltaCodexSse(signal: AbortSignal | undefined): Response
 		},
 		cancel() {
 			if (interval) clearInterval(interval);
+			if (abortListener) signal?.removeEventListener("abort", abortListener);
+		},
+	});
+	return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+}
+
+function createTimedCodexSse(
+	signal: AbortSignal | undefined,
+	events: Record<string, unknown>[],
+	intervalMs = 10,
+	closeAfterEvents = true,
+): Response {
+	const encoder = new TextEncoder();
+	let stopped = false;
+	let abortListener: (() => void) | undefined;
+	const encode = (event: Record<string, unknown>): Uint8Array => encoder.encode(`data: ${JSON.stringify(event)}\n\n`);
+	const stream = new ReadableStream<Uint8Array>({
+		start(controller) {
+			abortListener = () => {
+				stopped = true;
+				controller.error(signal?.reason ?? new DOMException("request aborted", "AbortError"));
+			};
+			if (signal?.aborted) {
+				abortListener();
+				return;
+			}
+			signal?.addEventListener("abort", abortListener, { once: true });
+			void (async () => {
+				for (const event of events) {
+					await Bun.sleep(intervalMs);
+					if (stopped) return;
+					controller.enqueue(encode(event));
+				}
+				if (closeAfterEvents && !stopped) controller.close();
+			})().catch(error => {
+				if (!stopped) controller.error(error);
+			});
+		},
+		cancel() {
+			stopped = true;
 			if (abortListener) signal?.removeEventListener("abort", abortListener);
 		},
 	});
@@ -535,39 +576,97 @@ describe("openai-codex streaming", () => {
 		expect(result.content as unknown[]).toEqual([{ type: "text", text: "", textSignature: undefined }]);
 	});
 
-	it("does not treat whitespace-only tool argument deltas as stream progress", async () => {
+	it("treats trailing whitespace after complete tool arguments as non-progress", () => {
+		const isProgress = createCodexStreamProgressClassifier();
+		expect(
+			isProgress({
+				type: "response.output_item.added",
+				output_index: 3,
+				item: { type: "function_call", id: "fc_complete", arguments: "" },
+			}),
+		).toBe(true);
+		expect(
+			isProgress({ type: "response.function_call_arguments.delta", item_id: "fc_complete", delta: '{"ops":[]}' }),
+		).toBe(true);
+		expect(isProgress({ type: "response.function_call_arguments.delta", item_id: "fc_complete", delta: " \t" })).toBe(
+			false,
+		);
+	});
+
+	it("treats whitespace inside incomplete tool arguments as progress", () => {
+		const isProgress = createCodexStreamProgressClassifier();
+		expect(
+			isProgress({
+				type: "response.output_item.added",
+				output_index: 4,
+				item: { type: "function_call", id: "fc_incomplete", arguments: "" },
+			}),
+		).toBe(true);
+		expect(
+			isProgress({
+				type: "response.function_call_arguments.delta",
+				item_id: "fc_incomplete",
+				delta: '{"ops":',
+			}),
+		).toBe(true);
+		expect(
+			isProgress({ type: "response.function_call_arguments.delta", item_id: "fc_incomplete", delta: " \t" }),
+		).toBe(true);
+	});
+
+	it("treats whitespace after a malformed tool argument prefix as progress", () => {
+		const isProgress = createCodexStreamProgressClassifier();
+		expect(
+			isProgress({
+				type: "response.output_item.added",
+				output_index: 5,
+				item: { type: "function_call", id: "fc_malformed", arguments: "" },
+			}),
+		).toBe(true);
+		expect(
+			isProgress({
+				type: "response.function_call_arguments.delta",
+				item_id: "fc_malformed",
+				delta: '{"ops":]',
+			}),
+		).toBe(true);
+		expect(
+			isProgress({ type: "response.function_call_arguments.delta", item_id: "fc_malformed", delta: " \t" }),
+		).toBe(true);
+	});
+
+	it("times out SSE after trailing whitespace follows complete tool arguments", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
-		const encoder = new TextEncoder();
-		global.fetch = (async () =>
-			new Response(
-				new ReadableStream<Uint8Array>({
-					start(controller) {
-						for (const event of [
-							{ type: "response.created", response: { id: "resp_whitespace", status: "in_progress" } },
-							{
-								type: "response.output_item.added",
-								item: {
-									type: "function_call",
-									id: "fc_whitespace",
-									call_id: "call_whitespace",
-									name: "todo_write",
-									status: "in_progress",
-									arguments: "",
-								},
+		global.fetch = ((input: string | URL | Request, init?: RequestInit) =>
+			Promise.resolve(
+				createTimedCodexSse(
+					getRequestSignal(input, init),
+					[
+						{ type: "response.created", response: { id: "resp_whitespace", status: "in_progress" } },
+						{
+							type: "response.output_item.added",
+							output_index: 0,
+							item: {
+								type: "function_call",
+								id: "fc_whitespace",
+								call_id: "call_whitespace",
+								name: "todo_write",
+								status: "in_progress",
+								arguments: "",
 							},
-							{ type: "response.function_call_arguments.delta", item_id: "fc_whitespace", delta: '{"ops":[]}' },
-						])
-							controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
-						controller.enqueue(
-							encoder.encode(
-								`data: ${JSON.stringify({ type: "response.function_call_arguments.delta", item_id: "fc_whitespace", delta: " \t" })}\n\n`,
-							),
-						);
-					},
-				}),
-				{ status: 200, headers: { "content-type": "text/event-stream" } },
-			)) as unknown as typeof fetch;
+						},
+						{ type: "response.function_call_arguments.delta", item_id: "fc_whitespace", delta: '{"ops":[]}' },
+						...Array.from({ length: 1000 }, () => ({
+							type: "response.function_call_arguments.delta",
+							item_id: "fc_whitespace",
+							delta: " \t",
+						})),
+					],
+					10,
+					false,
+				),
+			)) as typeof fetch;
 		const result = await streamOpenAICodexResponses(
 			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
 			createCodexTestContext(),
@@ -575,6 +674,167 @@ describe("openai-codex streaming", () => {
 		).result();
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toBe("OpenAI Codex SSE stream stalled while waiting for the next event");
+	});
+
+	it("does not time out SSE while whitespace arrives inside incomplete tool arguments", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		global.fetch = ((input: string | URL | Request, init?: RequestInit) =>
+			Promise.resolve(
+				createTimedCodexSse(
+					getRequestSignal(input, init),
+					[
+						{
+							type: "response.output_item.added",
+							output_index: 0,
+							item: {
+								type: "function_call",
+								id: "fc_open",
+								call_id: "call_open",
+								name: "todo_write",
+								arguments: "",
+							},
+						},
+						{ type: "response.function_call_arguments.delta", item_id: "fc_open", delta: '{"ops":' },
+						...Array.from({ length: 3 }, () => ({
+							type: "response.function_call_arguments.delta",
+							item_id: "fc_open",
+							delta: " \t",
+						})),
+						{ type: "response.function_call_arguments.delta", item_id: "fc_open", delta: "[]}" },
+						{
+							type: "response.function_call_arguments.done",
+							item_id: "fc_open",
+							arguments: '{"ops": \t[]}',
+						},
+						{
+							type: "response.output_item.done",
+							item: {
+								type: "function_call",
+								id: "fc_open",
+								call_id: "call_open",
+								name: "todo_write",
+								arguments: '{"ops": \t[]}',
+							},
+						},
+						{ type: "response.completed", response: { status: "completed", usage: DEFAULT_USAGE } },
+					],
+					10,
+				),
+			)) as typeof fetch;
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken(), streamIdleTimeoutMs: 20 },
+		).result();
+		expect(result.stopReason).toBe("toolUse");
+		expect(result.content).toEqual([
+			expect.objectContaining({ type: "toolCall", name: "todo_write", arguments: { ops: [] } }),
+		]);
+	});
+
+	it("keeps SSE progress for whitespace in reasoning and custom tool deltas", () => {
+		const isProgress = createCodexStreamProgressClassifier();
+		expect(isProgress({ type: "response.reasoning_summary_text.delta", delta: " \t" })).toBe(true);
+		expect(isProgress({ type: "response.custom_tool_call_input.delta", delta: " \t" })).toBe(true);
+	});
+
+	it("honors caller cancellation during trailing whitespace after complete arguments", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const controller = new AbortController();
+		global.fetch = ((input: string | URL | Request, init?: RequestInit) =>
+			Promise.resolve(
+				createTimedCodexSse(
+					getRequestSignal(input, init),
+					[
+						{
+							type: "response.output_item.added",
+							output_index: 0,
+							item: { type: "function_call", id: "fc_abort", name: "todo_write", arguments: "" },
+						},
+						{ type: "response.function_call_arguments.delta", item_id: "fc_abort", delta: "{}" },
+						...Array.from({ length: 10 }, () => ({
+							type: "response.function_call_arguments.delta",
+							item_id: "fc_abort",
+							delta: " ",
+						})),
+					],
+					10,
+					false,
+				),
+			)) as typeof fetch;
+		setTimeout(() => controller.abort(), 45);
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{
+				apiKey: createCodexTestToken(),
+				signal: controller.signal,
+				streamIdleTimeoutMs: 100,
+			},
+		).result();
+		expect(result.stopReason).toBe("aborted");
+	});
+
+	it("allows websocket whitespace argument deltas to make progress without SSE replay", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Unexpected SSE replay"));
+		class WhitespaceToolCallWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+
+			send(): void {
+				this.sendJson({ type: "response.created", response: { id: "resp_ws", status: "in_progress" } });
+				this.sendJson({
+					type: "response.output_item.added",
+					output_index: 0,
+					item: { type: "function_call", id: "fc_ws", call_id: "call_ws", name: "todo_write", arguments: "" },
+				});
+				this.sendJson({ type: "response.function_call_arguments.delta", item_id: "fc_ws", delta: "{}" });
+				for (let index = 0; index < 4; index++) {
+					setTimeout(
+						() => {
+							this.sendJson({ type: "response.function_call_arguments.delta", item_id: "fc_ws", delta: " " });
+						},
+						(index + 1) * 10,
+					);
+				}
+				setTimeout(() => {
+					this.sendJson({
+						type: "response.output_item.done",
+						item: {
+							type: "function_call",
+							id: "fc_ws",
+							call_id: "call_ws",
+							name: "todo_write",
+							arguments: "{}    ",
+						},
+					});
+					this.sendJson({ type: "response.completed", response: { status: "completed", usage: DEFAULT_USAGE } });
+				}, 55);
+			}
+		}
+		global.WebSocket = WhitespaceToolCallWebSocket as unknown as typeof WebSocket;
+		const result = await streamOpenAICodexResponses(
+			createCodexTestModel("https://chatgpt.com/backend-api"),
+			createCodexTestContext(),
+			{
+				apiKey: createCodexTestToken(),
+				sessionId: "ws-whitespace-progress",
+				preferWebsockets: true,
+				streamIdleTimeoutMs: 20,
+				providerSessionState: new Map<string, ProviderSessionState>(),
+			},
+		).result();
+		expect(result.stopReason).toBe("toolUse");
+		expect(result.content).toEqual([
+			expect.objectContaining({ type: "toolCall", name: "todo_write", arguments: {} }),
+		]);
+		expect(fetchSpy).not.toHaveBeenCalled();
 	});
 
 	it("ends an SSE stream that hangs after a text delta", async () => {

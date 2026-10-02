@@ -208,10 +208,7 @@ const CODEX_PROGRESS_EVENT_TYPES = new Set([
 ]);
 
 /**
- * A progress event must carry real semantic payload, matching the Anthropic
- * predicate: a recognized envelope whose `delta` is absent or not a non-empty
- * string is NOT progress — otherwise repeated malformed/no-op deltas reset the
- * idle watchdog indefinitely and a managed attempt need never terminate.
+ * A progress event must carry a non-empty delta for delta events.
  * Non-delta envelope types (lifecycle, item boundaries, terminal events) count
  * as progress by type alone, as before.
  */
@@ -221,7 +218,65 @@ function isCodexStreamProgressEvent(event: unknown): boolean {
 	if (typeof type !== "string" || !CODEX_PROGRESS_EVENT_TYPES.has(type)) return false;
 	if (!type.endsWith(".delta")) return true;
 	const delta = (event as { delta?: unknown }).delta;
-	return typeof delta === "string" && delta.trim().length > 0;
+	return typeof delta === "string" && delta.length > 0;
+}
+
+type CodexArgumentBuffer = { value: string };
+
+/** @internal Exported for tests. */
+export function createCodexStreamProgressClassifier(): (event: unknown) => boolean {
+	const argumentBuffers = new Map<string, CodexArgumentBuffer>();
+
+	const getArgumentKey = (event: Record<string, unknown>): string | undefined => {
+		if (typeof event.item_id === "string") return `item:${event.item_id}`;
+		if (typeof event.output_index === "number") return `output:${event.output_index}`;
+		return undefined;
+	};
+
+	const rememberFunctionCallItem = (event: Record<string, unknown>): void => {
+		if (event.type !== "response.output_item.added" || !event.item || typeof event.item !== "object") return;
+		const item = event.item as Record<string, unknown>;
+		if (item.type !== "function_call" || typeof item.arguments !== "string") return;
+		const buffer = { value: item.arguments };
+		if (typeof item.id === "string") argumentBuffers.set(`item:${item.id}`, buffer);
+		if (typeof event.output_index === "number") argumentBuffers.set(`output:${event.output_index}`, buffer);
+	};
+
+	return event => {
+		if (!isCodexStreamProgressEvent(event)) return false;
+		if (!event || typeof event !== "object") return false;
+		const record = event as Record<string, unknown>;
+		rememberFunctionCallItem(record);
+		if (record.type === "response.function_call_arguments.done") {
+			const key = getArgumentKey(record);
+			const buffer = key ? argumentBuffers.get(key) : undefined;
+			const argumentsValue = record.arguments;
+			if (buffer && typeof argumentsValue === "string") buffer.value = argumentsValue;
+			return true;
+		}
+		if (record.type !== "response.function_call_arguments.delta" || typeof record.delta !== "string") return true;
+
+		const key = getArgumentKey(record);
+		if (!key) return true;
+		let buffer = argumentBuffers.get(key);
+		if (!buffer) {
+			buffer = { value: "" };
+			argumentBuffers.set(key, buffer);
+		}
+		const isWhitespaceOnly = record.delta.trim().length === 0;
+		const wasComplete =
+			isWhitespaceOnly &&
+			(() => {
+				try {
+					JSON.parse(buffer.value);
+					return true;
+				} catch {
+					return false;
+				}
+			})();
+		buffer.value += record.delta;
+		return !wasComplete;
+	};
 }
 
 function codexOutputHasMeaningfulProgress(output: AssistantMessage): boolean {
@@ -709,7 +764,7 @@ function createRequestSetup(options: OpenAICodexResponsesOptions | undefined): C
 			onIdle: () => requestAbortController.abort(),
 			onFirstItemTimeout: () => requestAbortController.abort(),
 			abortSignal: options?.signal,
-			isProgressItem: isCodexStreamProgressEvent,
+			isProgressItem: createCodexStreamProgressClassifier(),
 		});
 	return { requestAbortController, requestSignal, firstEventTimeoutMs, wrapCodexSseStream };
 }

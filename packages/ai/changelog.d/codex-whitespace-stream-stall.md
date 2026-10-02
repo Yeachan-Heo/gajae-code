@@ -1,3 +1,3 @@
 ### Fixed
 
-- Treat whitespace-only Codex function-call argument deltas as idle stream events so completed tool arguments cannot hold a turn open indefinitely.
+- Treat trailing whitespace after complete Codex function-call arguments as idle SSE events without changing WebSocket progress or replay semantics.
