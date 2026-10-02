@@ -3698,7 +3698,13 @@ test("unsettled fatal abort retains accepted images until session teardown", asy
 	}
 }, 60_000);
 
-test("a diverted image prompt belongs to its consuming run, not a later pending correlation", async () => {
+test.each([
+	"fatal",
+	"natural",
+	"removed",
+	"ordinary-abort",
+	"terminal-abort",
+] as const)("a diverted image prompt keeps exact lifecycle ownership (%s)", async mode => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-steered-image-owner-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-steered-image-owner-${Date.now()}`;
@@ -3725,8 +3731,9 @@ test("a diverted image prompt belongs to its consuming run, not a later pending 
 	};
 	const accepted = Promise.withResolvers<void>();
 	const preflight = Promise.withResolvers<void>();
-	const consume = Promise.withResolvers<void>();
-	const consumed = Promise.withResolvers<void>();
+	let queued = false;
+	let promote: ((promotion: { startsOwnRun?: boolean; removed?: boolean }) => void) | undefined;
+	let releaseQueueAbort: (() => void) | undefined;
 	const originalRedeem = PromptImageUploadStore.prototype.redeem;
 	let reserved = 0;
 	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
@@ -3753,10 +3760,16 @@ test("a diverted image prompt belongs to its consuming run, not a later pending 
 				accepted.resolve();
 				await preflight.promise;
 				await firePreflightAccept(options);
+				queued = true;
+				promote = options?.onQueuedPromoted;
+				const remove = () => {
+					if (!queued) return;
+					queued = false;
+					promote?.({ startsOwnRun: false, removed: true });
+				};
+				options?.preflightSignal?.addEventListener("abort", remove, { once: true });
+				releaseQueueAbort = () => options?.preflightSignal?.removeEventListener("abort", remove);
 				options?.onDispatchDisposition?.({ startsOwnRun: false });
-				await consume.promise;
-				options?.onQueuedPromoted?.({ startsOwnRun: false });
-				consumed.resolve();
 			},
 			true,
 		);
@@ -3819,7 +3832,55 @@ test("a diverted image prompt belongs to its consuming run, not a later pending 
 		const ack = frames.find(frame => frame.id === "steered-prompt")!;
 		expect(ack).toMatchObject({ ok: true, result: { accepted: true } });
 		const correlation = acceptedCorrelation(ack);
+		await waitFor(() => promote !== undefined, "exact queued owner");
 		expect(reserved).toBe(1);
+		const queryResult = async () => {
+			const id = `result-${frames.length}`;
+			socket.send(
+				JSON.stringify({
+					type: "query_request",
+					id,
+					query: "turn.result",
+					input: { kind: "prompt", ...correlation },
+				}),
+			);
+			await waitFor(() => frames.some(frame => frame.id === id), "durable diverted result");
+			return frames.find(frame => frame.id === id)!;
+		};
+		if (mode === "removed" || mode === "ordinary-abort" || mode === "terminal-abort") {
+			if (mode === "removed") {
+				queued = false;
+				promote?.({ startsOwnRun: false, removed: true });
+			} else if (mode === "terminal-abort") {
+				socket.send(
+					JSON.stringify({
+						type: "control_request",
+						id: "cancel-before-consumption",
+						operation: "turn.abort",
+						input: { mode: "terminal" },
+						idempotencyKey: "cancel-before-consumption",
+					}),
+				);
+				await waitFor(
+					() => frames.some(frame => frame.id === "cancel-before-consumption"),
+					"terminal cancel response",
+				);
+				expect(frames.find(frame => frame.id === "cancel-before-consumption")).toMatchObject({ ok: true });
+			} else expect(await control("cancel-before-consumption", "turn.abort", {})).toMatchObject({ ok: true });
+			await waitFor(
+				() => frames.some(frame => frame.type === "agent_end" && frame.commandId === correlation.commandId),
+				"removed image terminal",
+			);
+			expect(queued).toBe(false);
+			expect(reserved).toBe(0);
+			expect(await queryResult()).toMatchObject({
+				ok: true,
+				result: { status: "terminal_ok", outcome: { kind: "stopped", reason: "cancelled" } },
+			});
+			expect(live.handle).toBe("original-run");
+			await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+			return;
+		}
 		const originalEnd = { type: "agent_end" as const, messages: [] };
 		trustedOwners.set(originalEnd, { resourceRunId: "original-run", domain: originalDomain });
 		await handlers.get("agent_end")?.(originalEnd, sessionContext);
@@ -3829,32 +3890,48 @@ test("a diverted image prompt belongs to its consuming run, not a later pending 
 		expect(frames.some(frame => frame.type === "agent_start" && frame.commandId === correlation.commandId)).toBe(
 			false,
 		);
-		consume.resolve();
-		await consumed.promise;
-		// The successor is the actual consuming run. A fatal transport response
-		// cannot release its accepted image until that exact run terminates.
-		socket.send(
-			JSON.stringify({
-				type: "control_request",
-				id: "steered-abort",
-				operation: "turn.abort",
-				input: { mode: "terminal" },
-				idempotencyKey: "steered-abort",
-			}),
-		);
-		await waitFor(
-			() => frames.some(frame => frame.type === "agent_failed" && frame.commandId === correlation.commandId),
-			"steered fatal closure",
-		);
-		expect(reserved).toBe(1);
-		const successorEnd = { type: "agent_end" as const, messages: [] };
+		queued = false;
+		releaseQueueAbort?.();
+		promote?.({ startsOwnRun: false });
+		if (mode === "fatal") {
+			// The successor is the actual consuming run. A fatal transport response
+			// cannot release its accepted image until that exact run terminates.
+			socket.send(
+				JSON.stringify({
+					type: "control_request",
+					id: "steered-abort",
+					operation: "turn.abort",
+					input: { mode: "terminal" },
+					idempotencyKey: "steered-abort",
+				}),
+			);
+			await waitFor(
+				() => frames.some(frame => frame.type === "agent_failed" && frame.commandId === correlation.commandId),
+				"steered fatal closure",
+			);
+			expect(reserved).toBe(1);
+		}
+		const successorEnd = {
+			type: "agent_end" as const,
+			messages: [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Image completed" }] }],
+		};
 		trustedOwners.set(successorEnd, { resourceRunId: "successor-run", domain: successorDomain });
 		await handlers.get("agent_end")?.(successorEnd, sessionContext);
 		expect(reserved).toBe(0);
+		if (mode === "natural") {
+			expect(await queryResult()).toMatchObject({
+				ok: true,
+				result: { status: "terminal_ok", outcome: { kind: "stopped", reason: "end_turn" } },
+			});
+			await handlers.get("agent_end")?.(successorEnd, sessionContext);
+			expect(
+				frames.filter(frame => frame.type === "agent_end" && frame.commandId === correlation.commandId),
+			).toHaveLength(1);
+		}
 		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 	} finally {
 		preflight.resolve();
-		consume.resolve();
+		releaseQueueAbort?.();
 		redeemSpy.mockRestore();
 		warnSpy.mockRestore();
 	}

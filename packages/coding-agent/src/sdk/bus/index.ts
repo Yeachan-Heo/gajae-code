@@ -1242,6 +1242,8 @@ interface SessionRuntime {
 	imageUploads: PromptImageUploadStore;
 	releaseAcceptedImage: (correlation: { commandId: string; turnId: string }) => void;
 	releaseAcceptedImagesForRun: (owner: AgentTerminalOwnerContext) => void;
+	getJoinedPromptCorrelations: (owner: AgentTerminalOwnerContext) => Array<{ commandId: string; turnId: string }>;
+	isPromptRunOwner: (correlation: { commandId: string; turnId: string }, owner: AgentTerminalOwnerContext) => boolean;
 	releaseAcceptedImages: () => void;
 	/** Delivers one ring-positioned event envelope to every attached subscriber
 	 *  connection, applying the same capability gate as event replay. */
@@ -4937,6 +4939,17 @@ export function createNotificationsExtension(
 		});
 		const acceptedImages = new Map<string, () => void>();
 		const acceptedImageRunOwners = new Map<string, AgentTerminalOwnerContext>();
+		const joinedPromptOwners = new Map<
+			string,
+			{ correlation: { commandId: string; turnId: string }; owner: AgentTerminalOwnerContext }
+		>();
+		const getJoinedPromptCorrelations = (terminalOwner: AgentTerminalOwnerContext) =>
+			[...joinedPromptOwners.values()]
+				.filter(
+					({ owner }) =>
+						owner.resourceRunId === terminalOwner.resourceRunId && owner.domain === terminalOwner.domain,
+				)
+				.map(({ correlation }) => correlation);
 		const releaseAcceptedImage = (correlation: { commandId: string; turnId: string }) => {
 			const key = `${correlation.commandId}:${correlation.turnId}`;
 			acceptedImages.get(key)?.();
@@ -8241,10 +8254,16 @@ export function createNotificationsExtension(
 			imageUploads,
 			releaseAcceptedImage,
 			releaseAcceptedImagesForRun,
+			getJoinedPromptCorrelations,
+			isPromptRunOwner: (correlation, owner) => {
+				const handle = promptSubmissions.get(promptSubmissionKey(correlation))?.executionHandle;
+				return handle === owner.resourceRunId && terminalAbortSeams?.getRunOwnerDomain?.(handle) === owner.domain;
+			},
 			releaseAcceptedImages: () => {
 				for (const release of acceptedImages.values()) release();
 				acceptedImages.clear();
 				acceptedImageRunOwners.clear();
+				joinedPromptOwners.clear();
 			},
 			broadcastEventFrame,
 			broadcastEventFrameWithReceipts,

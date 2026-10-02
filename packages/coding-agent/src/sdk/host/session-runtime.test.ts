@@ -5374,6 +5374,77 @@ test("SDK-only host retains accepted staged bytes until terminal and releases re
 	}
 });
 
+test.each(["natural", "removed"] as const)("SDK-only staged diversion has a durable terminal (%s)", async mode => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-only-diverted-image-"));
+	let harness: InvocationHarness | undefined;
+	let promotion: PreflightHooks["onQueuedPromoted"];
+	try {
+		harness = await invocationHarness(`sdk-only-diverted-${mode}`, cwd, {
+			sendUserMessage: async (content, options) => {
+				await options?.onPreflightAcceptCommit?.();
+				if (Array.isArray(content)) {
+					options?.onDispatchDisposition?.({ startsOwnRun: false });
+					promotion = options?.onQueuedPromoted;
+					return;
+				}
+				await neverSettlingPromise();
+			},
+		});
+		const original = await harness.control("turn.prompt", { text: "original" });
+		expect(original.ok).toBe(true);
+		await harness.emit("agent_start");
+		const bytes = Buffer.from(
+			await Bun.file(new URL("../../../test/fixtures/sdk-inline-image-large.png", import.meta.url)).arrayBuffer(),
+		);
+		const begun = await harness.control("turn.image.begin", {
+			mimeType: "image/png",
+			byteLength: bytes.length,
+			sha256: createHash("sha256").update(bytes).digest("hex"),
+		});
+		expect(begun.ok).toBe(true);
+		const id = begun.result?.id;
+		let sequence = 0;
+		for (let offset = 0; offset < bytes.length; offset += 96 * 1024) {
+			expect(
+				await harness.control("turn.image.append", {
+					id,
+					sequence: sequence++,
+					data: bytes.subarray(offset, offset + 96 * 1024).toString("base64"),
+				}),
+			).toMatchObject({ ok: true });
+		}
+		expect(await harness.control("turn.image.finish", { id })).toMatchObject({ ok: true });
+		const admitted = await harness.control("turn.prompt", { text: "joined image", stagedImages: [{ id }] });
+		expect(admitted).toMatchObject({ ok: true, result: { accepted: true } });
+		const correlation = { commandId: admitted.result?.commandId, turnId: admitted.result?.turnId };
+		expect((await harness.query("turn.result", { kind: "prompt", ...correlation })).result?.status).toBe("accepted");
+		expect(promotion).toBeDefined();
+		promotion?.({ startsOwnRun: false, ...(mode === "removed" ? { removed: true } : {}) });
+		if (mode === "natural")
+			await harness.emit("agent_end", {
+				messages: [{ role: "assistant", stopReason: "stop", content: "image done" }],
+			});
+		expect(await settledStatus(harness, "turn.result", { kind: "prompt", ...correlation })).toMatchObject(
+			mode === "natural" ? { status: "terminal_ok" } : { status: "failed", error: { code: "cancelled" } },
+		);
+		await harness.emit("agent_start");
+		await harness.emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop", content: "unrelated" }] });
+		expect(
+			harness.broadcasts.filter(
+				frame =>
+					frame.type === "event" &&
+					frame.kind === "agent_end" &&
+					(frame.payload as { commandId?: string; turnId?: string } | undefined)?.commandId ===
+						correlation.commandId &&
+					(frame.payload as { commandId?: string; turnId?: string } | undefined)?.turnId === correlation.turnId,
+			),
+		).toHaveLength(1);
+	} finally {
+		await harness?.stop();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
 /** Reconciliation store used to inject durable-write failures from tests: wraps a
  * session-file-backed store and fails the write whenever the staged records contain
  * the intermediate failed-without-terminal state an agent_failed transition persists. */
