@@ -754,10 +754,18 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		child.once("error", error => {
 			spawnError = error;
 		});
-		child.once("close", (code, signal) => {
+		// The trampoline must be gone before we accept the broker discovery. Until
+		// then the broker can still be a descendant of the caller's process tree,
+		// and a tree teardown can signal both processes before init reparents it.
+		child.once("exit", (code, signal) => {
 			childExited = true;
 			childExitCode = code;
 			childSignalCode = signal;
+		});
+		child.once("close", (code, signal) => {
+			childExited = true;
+			childExitCode ??= code;
+			childSignalCode ??= signal;
 		});
 		let trampolineReported = !isTrampoline;
 		let spawnedBrokerPid = isTrampoline ? undefined : child.pid;
@@ -826,6 +834,10 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 				);
 				if (discovered) {
 					if (!(await isBrokerReusable(discovered))) {
+						await ensureBrokerTiming.sleep(50);
+						continue;
+					}
+					if (isTrampoline && !childExited) {
 						await ensureBrokerTiming.sleep(50);
 						continue;
 					}
