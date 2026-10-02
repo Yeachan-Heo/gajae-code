@@ -222,7 +222,8 @@ describe("CLI help load order", () => {
 			expect(exitCode, combined).toBe(0);
 			expect(stdout).toContain("USAGE");
 			expect(stdout).toContain("$ gjc contribute-pr");
-			expect(stdout).toContain("--no-spawn");
+			expect(stdout).not.toContain("--no-spawn");
+			expect(stdout).not.toContain("--spawn-worker");
 			expect(combined).not.toContain("Failed to load pi_natives native addon");
 		},
 		15_000,

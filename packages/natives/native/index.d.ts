@@ -615,8 +615,7 @@ export declare class TtyWriter {
    * Enqueue terminal output; never blocks. Returns the total bytes now
    * pending (including this chunk).
    *
-   * Reads the JS string as UTF-16 and transcodes it with `xutf` straight into
-   * the shared back buffer.
+   * Reads the JS string as UTF-8 directly into the shared back buffer.
    */
   write(data: string): number
   /** Bytes accepted but not yet written to the terminal. */
@@ -672,7 +671,7 @@ export declare function __piNativesPublishOutcomeV1(): void
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV0_18_4(): void
+export declare function __piNativesV0_18_5(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.

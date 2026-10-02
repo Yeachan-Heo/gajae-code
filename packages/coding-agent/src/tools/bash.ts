@@ -19,8 +19,10 @@ import {
 } from "../gjc-runtime/managed-owner-admission";
 import {
 	MANAGED_OWNER_CHILD_TOKEN_ENV,
+	MANAGED_OWNER_COMMAND_ENV,
 	MANAGED_OWNER_GENERATION_ENV,
 	MANAGED_OWNER_INCARNATION_ENV,
+	MANAGED_OWNER_REDACT_COMMAND_ENV,
 	MANAGED_OWNER_RUN_ID_ENV,
 	MANAGED_OWNER_STATE_DIR_ENV,
 } from "../gjc-runtime/managed-owner-supervisor";
@@ -118,6 +120,8 @@ export const MANAGED_OWNER_BASH_ENV = [
 	MANAGED_OWNER_RUN_ID_ENV,
 	MANAGED_OWNER_INCARNATION_ENV,
 	MANAGED_OWNER_CHILD_TOKEN_ENV,
+	MANAGED_OWNER_COMMAND_ENV,
+	MANAGED_OWNER_REDACT_COMMAND_ENV,
 	MANAGED_OWNER_PREDECESSOR_TOKEN_ENV,
 	MANAGED_OWNER_PREDECESSOR_GENERATION_ENV,
 	MANAGED_OWNER_PREDECESSOR_RUN_ID_ENV,
@@ -1278,7 +1282,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	 */
 	async #waitForManagedBashJob(
 		job: ManagedBashJobHandle,
-		thresholdMs: number,
+		thresholdMs: number | undefined,
 		signal?: AbortSignal,
 		backgroundRequest?: Promise<FoldReason>,
 		foldAdapter?: FoldAdapter,
@@ -1288,31 +1292,36 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		}
 
 		const startedAt = Date.now();
-		const threshold = Promise.withResolvers<{ kind: "running"; reason: FoldReason }>();
-		const thresholdTimer = setTimeout(
-			() => {
-				const requestFold = this.session.requestForegroundBashBackground;
-				if (!foldAdapter || !requestFold) {
-					threshold.resolve({ kind: "running", reason: "timer" });
-					return;
-				}
-				void requestFold("timer", foldAdapter)
-					.then(folded => {
-						if (!folded) threshold.resolve({ kind: "running", reason: "timer" });
-					})
-					.catch(error => {
-						logger.warn("Timer-triggered fold failed", {
-							jobId: foldAdapter.jobId,
-							error: error instanceof Error ? error.message : String(error),
-						});
-						threshold.resolve({ kind: "running", reason: "timer" });
-					});
-			},
-			Math.max(0, thresholdMs),
-		);
+		const threshold =
+			thresholdMs === undefined ? undefined : Promise.withResolvers<{ kind: "running"; reason: FoldReason }>();
+		const thresholdTimer =
+			threshold === undefined
+				? undefined
+				: setTimeout(
+						() => {
+							const requestFold = this.session.requestForegroundBashBackground;
+							if (!foldAdapter || !requestFold) {
+								threshold.resolve({ kind: "running", reason: "timer" });
+								return;
+							}
+							void requestFold("timer", foldAdapter)
+								.then(folded => {
+									if (!folded) threshold.resolve({ kind: "running", reason: "timer" });
+								})
+								.catch(error => {
+									logger.warn("Timer-triggered fold failed", {
+										jobId: foldAdapter.jobId,
+										error: error instanceof Error ? error.message : String(error),
+									});
+									threshold.resolve({ kind: "running", reason: "timer" });
+								});
+						},
+						Math.max(0, thresholdMs ?? 0),
+					);
 		const waiters: Array<
 			Promise<ManagedBashJobCompletion | { kind: "running"; reason: FoldReason } | { kind: "aborted" }>
-		> = [job.completion, threshold.promise];
+		> = [job.completion];
+		if (threshold) waiters.push(threshold.promise);
 		if (backgroundRequest) {
 			waiters.push(backgroundRequest.then(reason => ({ kind: "running" as const, reason })));
 		}
@@ -1333,7 +1342,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			return await Promise.race(waiters);
 		} finally {
 			stopSteerWatch();
-			clearTimeout(thresholdTimer);
+			if (thresholdTimer !== undefined) clearTimeout(thresholdTimer);
 			if (signal && onAbort) signal.removeEventListener("abort", onAbort);
 		}
 	}
@@ -1894,11 +1903,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// longer has to be bypassed to make folding work. A capable ACP session keeps
 		// its terminal contract and still folds.
 		if (!pty && ownedManager && !clientTerminalActive) {
-			// With auto-background off, wait past the command's own timeout so the job only
-			// leaves the foreground on an explicit Ctrl+B fold, never on an auto-background timer.
+			// With auto-background off, the foreground wait has no timer threshold, so the job
+			// only leaves the foreground on an explicit Ctrl+B or steer fold.
 			const autoBackgroundWaitMs = this.#autoBackgroundEnabled
 				? this.#resolveAutoBackgroundWaitMs(timeoutMs)
-				: timeoutMs + 1_000;
+				: undefined;
 			const startBackgrounded = autoBackgroundWaitMs === 0;
 			let managedForegroundSettled = false;
 			const job = this.#startManagedBashJob({
@@ -2600,7 +2609,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			try {
 				bridgeWait = await this.#waitForManagedBashJob(
 					bridgeHandle,
-					this.#autoBackgroundEnabled ? this.#resolveAutoBackgroundWaitMs(timeoutMs) : timeoutMs + 1_000,
+					this.#autoBackgroundEnabled ? this.#resolveAutoBackgroundWaitMs(timeoutMs) : undefined,
 					signal,
 					bridgeFoldRequest.promise,
 					bridgeFoldAdapter,

@@ -44,10 +44,10 @@ import {
 export const webSearchSchema = z.object({
 	query: z.string().describe("search query"),
 	recency: z.enum(["day", "week", "month", "year"]).describe("recency filter").optional(),
-	limit: z.number().describe("max results").optional(),
+	limit: z.number().int().min(1).describe("max results").optional(),
 	max_tokens: z.number().describe("max output tokens").optional(),
 	temperature: z.number().describe("sampling temperature").optional(),
-	num_search_results: z.number().describe("number of search results").optional(),
+	num_search_results: z.number().int().min(1).describe("number of search results").optional(),
 	xai_search_mode: z
 		.enum(["web", "x", "web_and_x"])
 		.describe("xAI only: use web_search, x_search, or both")

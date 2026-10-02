@@ -22,7 +22,7 @@ export type ControlInput = Record<string, unknown>;
  */
 export interface ControlSurface {
 	prompt(text: string, images?: ControlValue, clientRef?: string): Promise<ControlValue> | ControlValue;
-	steer(text: string, clientRef?: string): Promise<ControlValue> | ControlValue;
+	steer(text: string, clientRef?: string, expectedSdkRunToken?: string): Promise<ControlValue> | ControlValue;
 	followUp(text: string): Promise<ControlValue> | ControlValue;
 	abort(): Promise<ControlValue> | ControlValue;
 	/** Terminal abort: stop the current root turn (and optionally exact owned work). */

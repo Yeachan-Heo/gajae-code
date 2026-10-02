@@ -1239,6 +1239,7 @@ test("standalone Telegram command polling survives a zero-session idle window un
 	const secondPollEntered = Promise.withResolvers<void>();
 	const releaseFirstPoll = Promise.withResolvers<void>();
 	let pollCount = 0;
+	let controlWatchTimers = 0;
 	const pid = process.pid;
 	const incarnation = "linux:4241";
 	await writeDaemonOwner(agentDir, {
@@ -1265,6 +1266,10 @@ test("standalone Telegram command polling survives a zero-session idle window un
 		now: () => nowState.value,
 		pid,
 		pidIncarnation: () => incarnation,
+		setTimeoutImpl: ((callback: () => void, ms = 0) => {
+			if (ms === 750) controlWatchTimers++;
+			return setTimeout(callback, ms);
+		}) as typeof setTimeout,
 		setIntervalImpl: ((callback: () => void, ms: number) => {
 			const timer = nextTimerId++;
 			timers.set(timer, { callback, ms });
@@ -1296,9 +1301,99 @@ test("standalone Telegram command polling survives a zero-session idle window un
 		releaseFirstPoll.resolve();
 		await secondPollEntered.promise;
 		expect(pollCount).toBeGreaterThan(1);
+		expect(controlWatchTimers).toBe(0);
 
 		daemon.requestStop();
 		await runPromise;
+		expect(timers.size).toBe(0);
+	} finally {
+		daemon.requestStop();
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("Telegram control watcher aborts a blocked poll independently of the run loop", async () => {
+	const agentDir = tempAgentDir();
+	const timers = new Map<number, { callback: () => void; ms: number }>();
+	let nextTimerId = 1;
+	const pollEntered = Promise.withResolvers<void>();
+	let shouldStop = false;
+	let aborted = false;
+	const pid = process.pid;
+	const incarnation = "linux:4241";
+	await writeDaemonOwner(agentDir, {
+		pid,
+		incarnation,
+		ownerId: "watch-owner",
+		acquisitionId: "watch-owner",
+		ownershipPhase: "ready",
+		tokenFingerprint: tokenFingerprint(BOT_TOKEN),
+		chatId: "42",
+		startedAt: 0,
+		heartbeatAt: 0,
+		version: DAEMON_VERSION,
+		generation: DAEMON_GENERATION,
+		servingEpoch: SERVING_EPOCH,
+	});
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "watch-owner",
+		botToken: BOT_TOKEN,
+		chatId: "42",
+		pid,
+		pidIncarnation: () => incarnation,
+		keepAliveWithoutAttachments: true,
+		setTimeoutImpl: ((callback: () => void, ms = 0) => {
+			if (ms !== 750) return setTimeout(callback, ms);
+			const timer = nextTimerId++;
+			timers.set(timer, { callback, ms });
+			return timer as unknown as NodeJS.Timeout;
+		}) as typeof setTimeout,
+		clearTimeoutImpl: ((timer: NodeJS.Timeout) => {
+			if (!timers.delete(timer as unknown as number)) clearTimeout(timer);
+		}) as typeof clearTimeout,
+		control: {
+			shouldStop: async () => shouldStop,
+			requestedAction: () => Promise.withResolvers<"reload" | "stop" | undefined>().promise,
+		},
+		botApi: {
+			async call(method, _body, options) {
+				if (method === "getUpdates") {
+					pollEntered.resolve();
+					await new Promise<void>(resolve => {
+						if (options?.signal?.aborted) {
+							aborted = true;
+							resolve();
+							return;
+						}
+						options?.signal?.addEventListener(
+							"abort",
+							() => {
+								aborted = true;
+								resolve();
+							},
+							{ once: true },
+						);
+					});
+					return { ok: true, result: [] };
+				}
+				if (method === "getChat") return { ok: true, result: { id: 42, type: "private" } };
+				return { ok: true, result: true };
+			},
+		},
+	});
+	try {
+		const runPromise = daemon.run();
+		await pollEntered.promise;
+		shouldStop = true;
+		const watcher = [...timers.entries()].find(([, timer]) => timer.ms === 750);
+		expect(watcher).toBeDefined();
+		if (watcher) {
+			timers.delete(watcher[0]);
+			watcher[1].callback();
+		}
+		await runPromise;
+		expect(aborted).toBe(true);
 		expect(timers.size).toBe(0);
 	} finally {
 		daemon.requestStop();

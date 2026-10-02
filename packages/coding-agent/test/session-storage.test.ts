@@ -1402,6 +1402,42 @@ describe("replacement cleanup receipt reconcile TOCTOU resilience", () => {
 		expect(fs.existsSync(path.join(root, "concurrent-reconcile"))).toBe(true);
 	});
 
+	it("accepts a real native lost-source result only for the exact peer-promoted orphan receipt", () => {
+		const { pending, receipt } = pendingReceipt();
+		const originalBytes = fs.readFileSync(pending);
+		const originalInode = fs.statSync(pending).ino;
+		const realRename = native.renameNoReplacePath;
+		vi.spyOn(native, "renameNoReplacePath").mockImplementation((source, destination) => {
+			if (source !== pending) return realRename(source, destination);
+			expect(realRename(source, destination).ok).toBe(true);
+			return realRename(source, destination);
+		});
+
+		replay("native-concurrent-reconcile");
+
+		expect(fs.existsSync(pending)).toBe(false);
+		expect(fs.statSync(receipt).ino).toBe(originalInode);
+		expect(fs.readFileSync(receipt).equals(originalBytes)).toBe(true);
+		expect(fs.existsSync(path.join(root, "native-concurrent-reconcile"))).toBe(true);
+	});
+
+	it("refuses a real native lost-source result when the promoted receipt was replaced", () => {
+		const { pending, receipt } = pendingReceipt();
+		const realRename = native.renameNoReplacePath;
+		vi.spyOn(native, "renameNoReplacePath").mockImplementation((source, destination) => {
+			if (source !== pending) return realRename(source, destination);
+			expect(realRename(source, destination).ok).toBe(true);
+			const replacement = `${destination}.replacement`;
+			fs.copyFileSync(destination, replacement);
+			fs.renameSync(replacement, destination);
+			return realRename(source, destination);
+		});
+
+		expect(() => replay("unproven-native-reconcile")).toThrow("managed_replace_cleanup_receipt_invalid");
+		expect(fs.existsSync(receipt)).toBe(true);
+		expect(fs.existsSync(path.join(root, "unproven-native-reconcile"))).toBe(false);
+	});
+
 	it("canonicalizes signed file ids from an interrupted pending Windows receipt", () => {
 		const destination = path.join(root, "session.jsonl");
 		const staging = path.join(root, ".session.replacement");

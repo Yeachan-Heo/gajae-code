@@ -2211,19 +2211,22 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	{
 		name: "contribute-pr",
 		aliases: ["contribution-prep"],
-		description: "Dump redacted session context and spawn a fresh contribute-pr worker",
+		description: "Dump redacted session context and write a worker prompt for a separate terminal",
 		inlineHint: "[focus instructions]",
 		allowArgs: true,
 		handle: async (command, runtime) => {
-			const result = await runtime.session.prepareContributionPrep({
+			const prepared = await runtime.session.prepareContributionPrep({
 				customInstructions: command.args || undefined,
-				spawnWorker: true,
+				// The interactive session owns the terminal; don't detach a second GJC
+				// process that can later be adopted by zsh when this session exits.
+				spawnWorker: false,
 			});
 			await runtime.output(
 				[
 					"Contribution prep artifacts written.",
-					`Manifest: ${result.manifestPath}`,
-					`Worker prompt: ${result.workerPromptPath}`,
+					`Manifest: ${prepared.manifestPath}`,
+					`Worker prompt: ${prepared.workerPromptPath}`,
+					"Run the worker prompt from a separate terminal when ready.",
 				].join("\n"),
 			);
 			return commandConsumed();

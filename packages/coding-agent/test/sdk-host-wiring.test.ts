@@ -6166,7 +6166,7 @@ test("SDK host replay gaps are generation-scoped and sequence gaps remain cohere
 	await host.stop();
 });
 
-test("Q17 returns resource_gone without readable assistant text and reads a completed persisted turn after reopen", async () => {
+test("Q17 returns empty observation without readable assistant text and reads a completed persisted turn after reopen", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-last-assistant-"));
 	dirs.push(cwd);
 	const original = SessionManager.create(cwd, cwd);
@@ -6229,13 +6229,13 @@ test("Q17 returns resource_gone without readable assistant text and reads a comp
 			frames.some(
 				frame => frame.type === "control_command_result" && frame.requestId === "before" && frame.status === "ok",
 			),
-		"empty Q17 resource_gone response",
+		"empty Q17 empty observation response",
 	);
 	expect(
 		JSON.parse(
 			String(frames.find(frame => frame.type === "control_command_result" && frame.requestId === "before")?.message),
 		),
-	).toMatchObject({ ok: false, error: { code: "resource_gone" } });
+	).toMatchObject({ ok: true, page: { items: [null] } });
 	socket.send(
 		JSON.stringify({
 			type: "control_request",

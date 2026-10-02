@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import type {
 	NativeDirectoryTreeSnapshot,
@@ -11,6 +12,7 @@ import type {
 	RecoveryFsRoot,
 } from "@gajae-code/natives";
 import { isEnoent, logger } from "@gajae-code/utils";
+import { isProcessIncarnation, observeProcessIncarnation } from "../../sdk/broker/process-incarnation";
 import type { SessionStorageRangeSnapshot, SessionStorageStat } from "../session-storage";
 import {
 	classifyNativePublishOutcome,
@@ -370,7 +372,68 @@ type ReplacementCleanupReceipt = {
 	destination: string;
 	successor: SerializedReplacementIdentity;
 	predecessor: SerializedReplacementIdentity;
+	publisher?: ReplacementReceiptPublisher;
 };
+
+type ReplacementReceiptPublisher = {
+	attemptId: string;
+	ownerId: string;
+	pid: number;
+	incarnation: string;
+	host: string;
+};
+
+// A process can contain multiple JS isolates. Only this exact owner may infer
+// that an absent local attempt has settled; another isolate's empty set is not
+// evidence that its sibling has finished publishing.
+const replacementPublisherOwnerId = randomUUID();
+const activeReplacementAttempts = new Set<string>();
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+function replacementReceiptPublisher(bytes: Uint8Array): ReplacementReceiptPublisher | undefined {
+	let record: Record<string, unknown> | undefined;
+	try {
+		record = asRecord(JSON.parse(Buffer.from(bytes).toString("utf8")));
+	} catch {
+		return undefined;
+	}
+	if (!record || !Object.hasOwn(record, "publisher")) return undefined;
+	const publisher = asRecord(record.publisher);
+	if (
+		!publisher ||
+		typeof publisher.attemptId !== "string" ||
+		!UUID_PATTERN.test(publisher.attemptId) ||
+		typeof publisher.ownerId !== "string" ||
+		!UUID_PATTERN.test(publisher.ownerId) ||
+		!Number.isSafeInteger(publisher.pid) ||
+		Number(publisher.pid) <= 0 ||
+		Number(publisher.pid) > 0x7fff_ffff ||
+		!isProcessIncarnation(publisher.incarnation) ||
+		typeof publisher.host !== "string" ||
+		!publisher.host ||
+		typeof record.destination !== "string" ||
+		typeof record.staging !== "string" ||
+		path.resolve(record.staging) !==
+			path.join(
+				path.dirname(path.resolve(record.destination)),
+				`.${path.basename(record.destination)}.${publisher.attemptId}.replacement`,
+			)
+	)
+		throw new Error("managed_replace_cleanup_receipt_invalid");
+	return publisher as ReplacementReceiptPublisher;
+}
+
+/** Unknown/remote/stopped owners retain their receipt; elapsed time is not death proof. */
+function replacementReceiptIsOwned(bytes: Uint8Array): boolean {
+	const publisher = replacementReceiptPublisher(bytes);
+	if (!publisher) return false;
+	if (publisher.host !== os.hostname()) return true;
+	if (publisher.pid === process.pid && publisher.ownerId === replacementPublisherOwnerId)
+		return activeReplacementAttempts.has(publisher.attemptId);
+	const observed = observeProcessIncarnation(publisher.pid);
+	if (observed.status === "absent") return false;
+	return observed.status !== "present" || observed.incarnation === publisher.incarnation;
+}
 
 type LegacyReplacementCleanupIdentity = {
 	dev: bigint;
@@ -1668,6 +1731,7 @@ export class ManagedSessionDescendantStore {
 			if (this.#recoverReplacementCleanupPlaceholder(receiptPath, binding, receipt)) return;
 			throw new Error("managed_replace_cleanup_receipt_invalid");
 		}
+		if (replacementReceiptIsOwned(receipt.bytes)) return;
 		const predecessor = binding.predecessor;
 		const quarantineName = replacementReceiptRetirementName(receipt.identity, predecessor);
 		const detached = nativeSessionStorage().exactUnlink(receiptPath, {
@@ -1770,7 +1834,14 @@ export class ManagedSessionDescendantStore {
 	}
 
 	#reconcilePendingReplacementReceipt(receiptPath: string): void {
-		const pending = captureManagedFilePrefixNoFollow(receiptPath, REPLACEMENT_CLEANUP_RECEIPT_MAX_BYTES);
+		let pending: ManagedFileSnapshot;
+		try {
+			pending = captureManagedFilePrefixNoFollow(receiptPath, REPLACEMENT_CLEANUP_RECEIPT_MAX_BYTES);
+		} catch (error) {
+			// Directory enumeration is not a claim on a peer's receipt name.
+			if (isEnoent(error)) return;
+			throw error;
+		}
 		const parsed = parseReplacementCleanupReceipt(pending.bytes);
 		const predecessor = parsed ? parseReplacementIdentity(parsed.predecessor) : undefined;
 		if (
@@ -1780,6 +1851,7 @@ export class ManagedSessionDescendantStore {
 			path.dirname(path.resolve(parsed.destination)) !== this.#baseDir
 		)
 			throw new Error("managed_replace_cleanup_receipt_invalid");
+		if (replacementReceiptIsOwned(pending.bytes)) return;
 		const destination = replacementReceiptPath(this.#baseDir, predecessor, pending.identity);
 		const outcome = classifyNativePublishOutcome(
 			nativeSessionStorage().renameNoReplacePath(receiptPath, destination),
@@ -1788,7 +1860,11 @@ export class ManagedSessionDescendantStore {
 			fsyncDirectory(this.#baseDir);
 			return;
 		}
-		if (outcome.reason === "destination_exists" || outcome.reason === "invalid_request") {
+		if (
+			outcome.reason === "destination_exists" ||
+			outcome.reason === "invalid_request" ||
+			(outcome.reason === "identity_violation" && outcome.mutationState === "not_committed")
+		) {
 			const captureIfPresent = (pathname: string): ManagedFileSnapshot | undefined => {
 				try {
 					return captureManagedFilePrefixNoFollow(pathname, REPLACEMENT_CLEANUP_RECEIPT_MAX_BYTES);
@@ -3524,7 +3600,21 @@ function replaceManagedFileGeneratedSync(
 ): ManagedFileSnapshot["identity"] {
 	const parent = path.dirname(destination);
 	ensureManagedDirectory(parent, root, policy);
-	const staging = path.join(parent, `.${path.basename(destination)}.${randomUUID()}.replacement`);
+	const attemptId = randomUUID();
+	const staging = path.join(parent, `.${path.basename(destination)}.${attemptId}.replacement`);
+	const publisherObservation = expectedDestination ? observeProcessIncarnation(process.pid) : undefined;
+	if (expectedDestination && publisherObservation?.status !== "present")
+		throw new Error("managed_replace_publisher_identity_unavailable");
+	const publisher: ReplacementReceiptPublisher | undefined =
+		publisherObservation?.status === "present"
+			? {
+					attemptId,
+					ownerId: replacementPublisherOwnerId,
+					pid: process.pid,
+					incarnation: publisherObservation.incarnation,
+					host: os.hostname(),
+				}
+			: undefined;
 	let fd: number | undefined;
 	let stagedIdentity: { dev: bigint; ino: bigint } | undefined;
 	let preserveStaging = false;
@@ -3542,6 +3632,7 @@ function replaceManagedFileGeneratedSync(
 	let publicationDurable = false;
 	let publicationCommitted = false;
 	let expectedSuccessor: ManagedFileSnapshot["identity"] | undefined;
+	activeReplacementAttempts.add(attemptId);
 	try {
 		fd = fs.openSync(
 			staging,
@@ -3578,6 +3669,7 @@ function replaceManagedFileGeneratedSync(
 						destination,
 						successor: serializeReplacementIdentity(successor),
 						predecessor: serializeReplacementIdentity(expectedDestination),
+						publisher,
 					} satisfies ReplacementCleanupReceipt),
 				),
 				root,
@@ -3733,6 +3825,7 @@ function replaceManagedFileGeneratedSync(
 				}
 			}
 		}
+		activeReplacementAttempts.delete(attemptId);
 	}
 	if (failure !== undefined && !(acceptCommittedCleanupFailure && publicationDurable && publishedIdentity))
 		throw failure;

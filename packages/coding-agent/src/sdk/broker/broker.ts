@@ -4937,6 +4937,11 @@ export class Broker {
 			...(operation === "session.close" && typeof input.sessionId === "string"
 				? { intendedSessionId: input.sessionId }
 				: {}),
+			...(operation === "session.close" &&
+			typeof input.endpointGeneration === "number" &&
+			typeof input.endpointIncarnation === "string"
+				? { closeAuthorityBound: true }
+				: {}),
 		};
 		if (!this.ledger.get(identity)) {
 			const matchingOperation = this.ledger.findAnyByOperationKey(operationKey);

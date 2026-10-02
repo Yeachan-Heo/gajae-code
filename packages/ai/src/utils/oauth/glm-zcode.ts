@@ -387,7 +387,7 @@ export class GlmZcodeOAuthFlow extends OAuthCallbackFlow {
 		return {
 			url: `${authorizeUrl}?${params.toString()}`,
 			instructions:
-				"Complete Z.AI login in your browser. This is an UNOFFICIAL ZCode-based login — use at your own risk; it may stop working or violate ZCode/Z.AI Terms of Service. Because this CLI cannot receive the zcode:// redirect, paste the final redirect URL or authorization code when prompted. If the ZCode desktop app is installed, cancel the browser's prompt to open it: the app exchanges the single-use code itself and the pasted code is then rejected (broker error 2007).",
+				"Complete Z.AI login in your browser. This is an UNOFFICIAL ZCode-based login — use at your own risk; it may stop working or violate ZCode/Z.AI Terms of Service. If the ZCode desktop app is installed, cancel the browser's prompt to open it: the app exchanges the single-use code itself and the pasted code is then rejected (broker error 2007). After login the browser redirects to a zcode:// address, which never appears in the address bar — copy it from DevTools instead: open the browser DevTools Network tab (filter: zcode), select the zcode://oauth/callback?code=…&state=… request, and paste that full URL (or just the code) at the prompt.",
 		};
 	}
 
@@ -395,6 +395,13 @@ export class GlmZcodeOAuthFlow extends OAuthCallbackFlow {
 		return exchangeGlmZcodeCode(this.#fetch, { code, state, redirectUri }, this.ctrl.signal);
 	}
 }
+
+/**
+ * Manual-input prompt for the paste fallback. Repeats the redirect-URL shape and
+ * the DevTools pointer so a re-prompt after a rejected paste stays self-contained.
+ */
+export const GLM_ZCODE_MANUAL_INPUT_PROMPT =
+	"Paste the full zcode://oauth/callback?code=…&state=… URL (copy it from browser DevTools → Network tab; the address bar never shows it) or the authorization code:";
 
 export async function loginGlmZcode(
 	ctrl: OAuthController,

@@ -74,9 +74,12 @@ async function handleAdd(cmd: SSHCommandArgs): Promise<void> {
 		return;
 	}
 
-	// Validate port if provided
+	// Validate port if provided. `Number.parseInt` accepts trailing garbage
+	// (parseInt("22oops") === 22, parseInt("2222.5") === 2222), so require
+	// the whole token to be digits before parsing.
+	let port: number | undefined;
 	if (cmd.flags.port !== undefined) {
-		const port = Number.parseInt(cmd.flags.port, 10);
+		port = /^\d+$/.test(cmd.flags.port) ? Number.parseInt(cmd.flags.port, 10) : Number.NaN;
 		if (Number.isNaN(port) || port < 1 || port > 65535) {
 			process.stdout.write(chalk.red("Error: Port must be an integer between 1 and 65535\n"));
 			process.exitCode = 1;
@@ -86,7 +89,7 @@ async function handleAdd(cmd: SSHCommandArgs): Promise<void> {
 
 	const hostConfig: SSHHostConfig = { host };
 	if (cmd.flags.user) hostConfig.username = cmd.flags.user;
-	if (cmd.flags.port) hostConfig.port = Number.parseInt(cmd.flags.port, 10);
+	if (port !== undefined) hostConfig.port = port;
 	if (cmd.flags.key) hostConfig.keyPath = cmd.flags.key;
 	if (cmd.flags.desc) hostConfig.description = cmd.flags.desc;
 	if (cmd.flags.compat) hostConfig.compat = true;

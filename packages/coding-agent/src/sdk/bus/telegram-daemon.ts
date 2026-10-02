@@ -362,6 +362,7 @@ const BOT_API_RETRY_ATTEMPTS = 3;
 // Backoff after a failed getUpdates long-poll so a persistent outage does not
 // busy-loop the daemon.
 const POLL_BACKOFF_MS = 1_000;
+const CONTROL_STOP_WATCH_INTERVAL_MS = 750;
 const AUTOMATIC_RELOAD_COOLDOWN_MS = 10 * 60 * 1_000;
 // Default freshness-poll window a cooldown contender waits for a sibling's
 // replacement daemon to publish a fresh ready owner before reloading itself.
@@ -4567,6 +4568,7 @@ export class TelegramNotificationDaemon {
 	private stopRequested = false;
 	/** First observed stop cause wins, including an explicit stop. */
 	#stopCause: TelegramDaemonStopCause | undefined;
+	#controlStopCheck: Promise<boolean> | undefined;
 	/** Signal cause resolution is asynchronous because control requests are file-backed. */
 	#stopCauseResolution: Promise<void> | undefined;
 
@@ -12875,6 +12877,9 @@ export class TelegramNotificationDaemon {
 				throw new Error("validation forum destination must be the exact supergroup forum returned by getChat");
 		}
 		let ownershipProved = false;
+		let controlWatchTimer: Timer | NodeJS.Timeout | undefined;
+		let controlWatchActive = true;
+		const clearTimeoutImpl = this.opts.clearTimeoutImpl ?? clearTimeout;
 		try {
 			const renewed = await renewDaemonHeartbeat({
 				settings: this.opts.settings,
@@ -12935,6 +12940,19 @@ export class TelegramNotificationDaemon {
 			}
 			await this.#attachmentRouter.start();
 			let idleSince = this.runtime.now();
+			const setTimeoutImpl = this.opts.setTimeoutImpl ?? setTimeout;
+			const watchControl = () => {
+				if (!controlWatchActive || !this.running || !this.opts.control) return;
+				controlWatchTimer = setTimeoutImpl(() => {
+					controlWatchTimer = undefined;
+					void this.controlStopRequested()
+						.catch(() => false)
+						.finally(() => {
+							if (controlWatchActive && this.running) watchControl();
+						});
+				}, CONTROL_STOP_WATCH_INTERVAL_MS);
+			};
+			if (this.opts.control) watchControl();
 			while (this.running) {
 				if (await this.controlStopRequested()) break;
 				// A thrown renewal (e.g. a transient Windows EPERM/EACCES/EBUSY while
@@ -13003,6 +13021,8 @@ export class TelegramNotificationDaemon {
 			this.requestStop("unexpected_exception");
 			throw error;
 		} finally {
+			controlWatchActive = false;
+			if (controlWatchTimer !== undefined) clearTimeoutImpl(controlWatchTimer);
 			this.requestStop();
 			await this.#stopCauseResolution;
 			this.running = false;
@@ -13089,8 +13109,21 @@ export class TelegramNotificationDaemon {
 	private async controlStopRequested(): Promise<boolean> {
 		if (this.runtime.stopRequested) return true;
 		if (!this.opts.control) return false;
+		if (this.#controlStopCheck) return this.#controlStopCheck;
+		const check = this.checkControlStopRequested();
+		this.#controlStopCheck = check;
 		try {
-			const requested = await this.opts.control.shouldStop(this.opts.ownerId);
+			return await check;
+		} finally {
+			if (this.#controlStopCheck === check) this.#controlStopCheck = undefined;
+		}
+	}
+
+	private async checkControlStopRequested(): Promise<boolean> {
+		try {
+			const control = this.opts.control;
+			if (!control) return false;
+			const requested = await control.shouldStop(this.opts.ownerId);
 			if (!requested) return false;
 			this.#resolveControlStopCause("stop");
 			this.requestStop();

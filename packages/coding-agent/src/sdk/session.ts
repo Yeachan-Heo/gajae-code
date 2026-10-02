@@ -581,6 +581,12 @@ export interface CreateAgentSessionOptions {
 	 * @internal CLI-only ordering guard; SDK callers retain immediate startup by default.
 	 */
 	deferMemoryBackendStartup?: boolean;
+	/**
+	 * Skip optional model-catalog discovery during lifecycle startup. ACP hosts must
+	 * publish their endpoint before unrelated provider credential refreshes begin.
+	 * @internal lifecycle-only startup guard.
+	 */
+	deferOptionalModelRefresh?: boolean;
 
 	/** Enable LSP integration (tool, formatting, diagnostics, warmup). Default: true */
 	enableLsp?: boolean;
@@ -697,6 +703,22 @@ export interface CreateAgentSessionResult {
 	 * this session published. Undefined when no GJC bundles participated.
 	 */
 	gjcRuntimeSnapshot?: GjcRuntimeSnapshotProvider;
+}
+
+/**
+ * Start optional provider/model discovery only when it is safe to add work to
+ * the caller's startup graph. Lifecycle hosts deliberately skip this during
+ * construction: discovery preflights every configured provider and may refresh
+ * an unrelated OAuth credential while several hosts are opening the same DB.
+ */
+export function startOptionalModelRefresh(
+	modelRegistry: Pick<ModelRegistry, "refreshInBackground">,
+	credentialSessionId: string | undefined,
+	deferred: boolean,
+): boolean {
+	if (deferred) return false;
+	modelRegistry.refreshInBackground("online-if-uncached", credentialSessionId);
+	return true;
 }
 
 export interface DeferredMcpConfigStartupResult {
@@ -2157,7 +2179,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				settings,
 			);
 			await refreshMissingQualifiedModelProviders(startupModelSelectors, modelRegistry, credentialSessionId);
-			modelRegistry.refreshInBackground("online-if-uncached", credentialSessionId);
+			startOptionalModelRefresh(modelRegistry, credentialSessionId, options.deferOptionalModelRefresh === true);
 		}
 
 		const hasExplicitModel = options.model !== undefined || options.modelPattern !== undefined;

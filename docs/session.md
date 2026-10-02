@@ -55,6 +55,25 @@ On Linux filesystems where the exact POSIX ACL xattr operation returns `ENOTSUP`
 
 Managed migration-lock release checks its retained descriptor before native security verification. On Linux, a closed or reused descriptor can be replaced only by reopening the same lock file with no-follow, owner-only security and original file identity checks; the original attempt id must still own the lock before its released record is written. A successor or an insecure replacement is never release authority. Repeated release is inert and cannot retire a successor.
 
+Managed replacement receipts bind the exact staging attempt to a publisher (PID,
+kernel process incarnation, host, and JS-isolate owner). Both pending-receipt
+promotion and canonical-receipt retirement defer to a live or unobservable
+publisher. A stopped process is still an owner; age alone is never permission
+to reconcile. The publishing isolate releases its local attempt only after the
+transaction exits. A different process or isolate requires positive owner-exit
+or PID-reuse evidence before recovering its receipt. A foreign host remains
+unresolved. Existing orphan receipts still follow the exact receipt-identity
+recovery protocol; a missing pending name is accepted only when the canonical
+receipt proves the same file object and bytes.
+
+Deploy this protocol at an owner-coordinated checkpoint for every writer and
+reconciler sharing a managed scope: older writers do not honor the publisher
+field. Updating one binary does not update already-running processes or clear
+their latched persistence errors. Preserve live owners, descendants, locks,
+transcripts, and ambiguous commit evidence; do not delete guards, refresh an
+expected inode blindly, or retry an uncertain write. A successful SDK query is
+not a durable-append or recovery verdict.
+
 Blob store location:
 
 ```text

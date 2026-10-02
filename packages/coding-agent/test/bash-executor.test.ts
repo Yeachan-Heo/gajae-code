@@ -195,6 +195,151 @@ describe("executeBash", () => {
 		expect(result.cancelled).toBe(false);
 	});
 
+	it("does not deadlock when a compound pipeline stage writes over a pipe buffer", async () => {
+		if (process.platform === "win32") return;
+
+		const result = await executeBash("{ head -c 70000 /dev/zero | tr '\\0' A; echo; } | grep ZZZ || true", {
+			cwd: tempDir,
+			timeout: 4000,
+		});
+		expect(result.cancelled).toBe(false);
+		expect(result.exitCode).toBe(0);
+	}, 10_000);
+
+	it("does not deadlock when a for-loop pipeline stage writes over a pipe buffer", async () => {
+		if (process.platform === "win32") return;
+
+		const result = await executeBash("for i in $(seq 1 20000); do echo line$i; done | grep ZZZ || true", {
+			cwd: tempDir,
+			timeout: 4000,
+		});
+		expect(result.cancelled).toBe(false);
+		expect(result.exitCode).toBe(0);
+	}, 10_000);
+
+	it("does not deadlock when a compound pipeline stage writes over 64 KiB", async () => {
+		if (process.platform === "win32") return;
+
+		const result = await executeBash(
+			"i=0; while [ $i -lt 20000 ]; do echo line$i; i=$((i + 1)); done | grep ZZZ || true",
+			{ cwd: tempDir, timeout: 4000 },
+		);
+		expect(result.cancelled).toBe(false);
+		expect(result.exitCode).toBe(0);
+	}, 10_000);
+
+	it("preserves byte counts through a compound pipeline stage", async () => {
+		if (process.platform === "win32") return;
+
+		const result = await executeBash("{ head -c 200000 /dev/zero | tr '\\0' A; echo; } | wc -c", {
+			cwd: tempDir,
+			timeout: 4000,
+		});
+		expect(result.cancelled).toBe(false);
+		expect(result.exitCode).toBe(0);
+		expect(result.output.trim()).toBe("200001");
+	}, 10_000);
+
+	it("preserves PIPESTATUS and pipefail across a compound pipeline", async () => {
+		if (process.platform === "win32") return;
+
+		const result = await executeBash(
+			`set -o pipefail; { false; } | true; status=$? statuses=("\${PIPESTATUS[@]}"); printf '%s %s %s\\n' "$status" "\${statuses[0]}" "\${statuses[1]}"`,
+			{ cwd: tempDir, timeout: 4000 },
+		);
+		expect(result.cancelled).toBe(false);
+		expect(result.exitCode).toBe(0);
+		expect(result.output.trim()).toBe("1 1 0");
+	}, 10_000);
+
+	it("does not deadlock with multiple blocking compound readers", async () => {
+		if (process.platform === "win32") return;
+
+		const trigger = path.join(tempDir, "trigger");
+		childProcess.execFileSync("mkfifo", [trigger]);
+		const stages = Array.from({ length: 32 }, (_, i) => `{ : > stage-${i}; read v; printf '%s\\n' "$v"; }`);
+		const started = new Set<string>();
+		let released = false;
+		const watcher = fs.watch(tempDir, (_event, filename) => {
+			if (filename?.startsWith("stage-")) {
+				started.add(filename);
+				if (!released && started.size === stages.length) {
+					released = true;
+					fs.writeFileSync(trigger, "x\n");
+				}
+			}
+		});
+		let result: BashResult;
+		try {
+			result = await executeBash(
+				`shopt -u lastpipe; { read v < trigger; printf '%s\\n' "$v"; } | ${stages.join(" | ")}`,
+				{ cwd: tempDir, timeout: 5000 },
+			);
+		} finally {
+			watcher.close();
+		}
+		expect(result.cancelled).toBe(false);
+		expect(result.exitCode).toBe(0);
+		expect(result.output.trim()).toBe("x");
+	}, 10_000);
+
+	it("joins started compound stages after a later launch error", async () => {
+		if (process.platform === "win32") return;
+
+		const marker = path.join(tempDir, "marker");
+		const result = await executeBash("{ sleep 1; printf late > marker; } | { :; } <&99", {
+			cwd: tempDir,
+			timeout: 5000,
+		});
+		expect(result.cancelled).toBe(false);
+		expect(result.exitCode).toBeDefined();
+		expect(result.exitCode).not.toBe(0);
+		expect(fs.readFileSync(marker, "utf8")).toBe("late");
+	}, 10_000);
+
+	it("joins remaining compound stages after a stage wait error", async () => {
+		if (process.platform === "win32") return;
+
+		const marker = path.join(tempDir, "marker");
+		const sessionKey = "pipeline-wait-error";
+		const result = await executeBash("{ { :; } <&99; } | { sleep 1; printf late > marker; }", {
+			cwd: tempDir,
+			timeout: 5000,
+			sessionKey,
+		});
+		expect(result.cancelled).toBe(false);
+		expect(result.exitCode).toBeDefined();
+		expect(result.exitCode).not.toBe(0);
+		expect(fs.readFileSync(marker, "utf8")).toBe("late");
+
+		const reused = await executeBash("printf reuse-ok", {
+			cwd: tempDir,
+			timeout: 5000,
+			sessionKey,
+		});
+		expect(reused).toMatchObject({ exitCode: 0, cancelled: false });
+		expect(reused.output).toBe("reuse-ok");
+	}, 10_000);
+
+	it("preserves parent compound and lastpipe mutations across a compound pipeline", async () => {
+		if (process.platform === "win32") return;
+
+		const result = await executeBash(
+			"{ value=before; }; { value=changed; printf payload; } | cat >/dev/null; printf 'parent:%s\\n' \"$value\"; shopt -s lastpipe; printf 'line\\n' | { read value; }; printf 'lastpipe:%s\\n' \"$value\"",
+			{ cwd: tempDir, timeout: 4000 },
+		);
+		expect(result.cancelled).toBe(false);
+		expect(result.exitCode).toBe(0);
+		expect(result.output.trim()).toBe("parent:before\nlastpipe:line");
+	}, 10_000);
+
+	it("preserves simple pipeline behavior alongside compound pipelines", async () => {
+		const result = await executeBash("printf 'simple pipeline\\n' | cat", { cwd: tempDir, timeout: 4000 });
+		expect(result.cancelled).toBe(false);
+		expect(result.exitCode).toBe(0);
+		expect(result.output.trim()).toBe("simple pipeline");
+	}, 10_000);
+
 	it("starts the command timeout after isolated shell readiness", async () => {
 		if (process.platform === "win32") return;
 		setShellFactoryForTests(() => ({
@@ -1080,6 +1225,71 @@ describe("executeBash", () => {
 			else process.env.GJC_SESSION_FILE = previousSessionFile;
 			if (previousOwnerPath === undefined) delete process.env.GJC_MANAGED_OWNER_TRANSCRIPT_PATH;
 			else process.env.GJC_MANAGED_OWNER_TRANSCRIPT_PATH = previousOwnerPath;
+			await disposeAllShellSessions();
+		}
+	});
+
+	it("unsets all managed-owner env vars to allow nested admission to return fresh (issue #6139)", async () => {
+		const previousRun = process.env.GJC_MANAGED_OWNER_RUN_ID;
+		const previousIncarnation = process.env.GJC_MANAGED_OWNER_INCARNATION;
+		const previousToken = process.env.GJC_MANAGED_OWNER_CHILD_TOKEN;
+		const previousStateDir = process.env.GJC_TMUX_OWNER_STATE_DIR;
+		const previousGeneration = process.env.GJC_TMUX_OWNER_GENERATION;
+		const previousPredecessorToken = process.env.GJC_MANAGED_OWNER_PREDECESSOR_TOKEN;
+		const previousRedactCmd = process.env.GJC_MANAGED_OWNER_REDACT_COMMAND;
+
+		// Set managed-owner env vars to simulate nested environment
+		process.env.GJC_MANAGED_OWNER_RUN_ID = "test-run-id";
+		process.env.GJC_MANAGED_OWNER_INCARNATION = "test-incarnation";
+		process.env.GJC_MANAGED_OWNER_CHILD_TOKEN = "test-token";
+		process.env.GJC_TMUX_OWNER_STATE_DIR = "/test/state";
+		process.env.GJC_TMUX_OWNER_GENERATION = "test-gen";
+		process.env.GJC_MANAGED_OWNER_PREDECESSOR_TOKEN = "test-pred-token";
+		process.env.GJC_MANAGED_OWNER_REDACT_COMMAND = "1";
+
+		try {
+			await disposeAllShellSessions();
+			// Explicitly unset managed-owner vars like the bash tool does
+			const unsetEnv = [
+				"GJC_MANAGED_OWNER_CHILD_TOKEN",
+				"GJC_MANAGED_OWNER_COMMAND_JSON",
+				"GJC_COORDINATOR_SESSION_ID",
+				"GJC_TMUX_OWNER_GENERATION",
+				"GJC_TMUX_OWNER_STATE_DIR",
+				"GJC_MANAGED_OWNER_RUN_ID",
+				"GJC_MANAGED_OWNER_INCARNATION",
+				"GJC_MANAGED_OWNER_REDACT_COMMAND",
+				"GJC_MANAGED_OWNER_PREDECESSOR_TOKEN",
+				"GJC_MANAGED_OWNER_PREDECESSOR_GENERATION",
+				"GJC_MANAGED_OWNER_PREDECESSOR_RUN_ID",
+				"GJC_MANAGED_OWNER_PREDECESSOR_INCARNATION",
+			];
+			const result = await executeBash(
+				'printf "%s|%s|%s|%s|%s|%s|%s" "$(printenv GJC_MANAGED_OWNER_RUN_ID || printf unset)" "$(printenv GJC_MANAGED_OWNER_INCARNATION || printf unset)" "$(printenv GJC_MANAGED_OWNER_CHILD_TOKEN || printf unset)" "$(printenv GJC_TMUX_OWNER_STATE_DIR || printf unset)" "$(printenv GJC_TMUX_OWNER_GENERATION || printf unset)" "$(printenv GJC_MANAGED_OWNER_PREDECESSOR_TOKEN || printf unset)" "$(printenv GJC_MANAGED_OWNER_REDACT_COMMAND || printf unset)"',
+				{
+					cwd: tempDir,
+					timeout: 5000,
+					sessionKey: "managed-owner-unset-test",
+					unsetEnv,
+				},
+			);
+			expect(result.output).toBe("unset|unset|unset|unset|unset|unset|unset");
+		} finally {
+			// Restore previous env
+			if (previousRun === undefined) delete process.env.GJC_MANAGED_OWNER_RUN_ID;
+			else process.env.GJC_MANAGED_OWNER_RUN_ID = previousRun;
+			if (previousIncarnation === undefined) delete process.env.GJC_MANAGED_OWNER_INCARNATION;
+			else process.env.GJC_MANAGED_OWNER_INCARNATION = previousIncarnation;
+			if (previousToken === undefined) delete process.env.GJC_MANAGED_OWNER_CHILD_TOKEN;
+			else process.env.GJC_MANAGED_OWNER_CHILD_TOKEN = previousToken;
+			if (previousStateDir === undefined) delete process.env.GJC_TMUX_OWNER_STATE_DIR;
+			else process.env.GJC_TMUX_OWNER_STATE_DIR = previousStateDir;
+			if (previousGeneration === undefined) delete process.env.GJC_TMUX_OWNER_GENERATION;
+			else process.env.GJC_TMUX_OWNER_GENERATION = previousGeneration;
+			if (previousPredecessorToken === undefined) delete process.env.GJC_MANAGED_OWNER_PREDECESSOR_TOKEN;
+			else process.env.GJC_MANAGED_OWNER_PREDECESSOR_TOKEN = previousPredecessorToken;
+			if (previousRedactCmd === undefined) delete process.env.GJC_MANAGED_OWNER_REDACT_COMMAND;
+			else process.env.GJC_MANAGED_OWNER_REDACT_COMMAND = previousRedactCmd;
 			await disposeAllShellSessions();
 		}
 	});

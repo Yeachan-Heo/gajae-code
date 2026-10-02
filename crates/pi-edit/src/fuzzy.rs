@@ -8,8 +8,8 @@
 use crate::{
 	error::EditError,
 	text::{
-		adjust_indentation, count_leading_whitespace, is_non_empty_line, js_trim, js_trim_end,
-		js_trim_start, normalize_for_fuzzy, normalize_to_lf, normalize_unicode, utf16_len,
+		adjust_indentation, count_leading_whitespace, js_trim, js_trim_end, js_trim_start,
+		normalize_for_fuzzy, normalize_to_lf, normalize_unicode, utf16_len,
 	},
 };
 
@@ -363,53 +363,165 @@ fn find_exact_match_outcome(
 	})
 }
 
-fn relative_indent_depths(lines: &[&str]) -> Vec<usize> {
-	let indents: Vec<usize> = lines
-		.iter()
-		.map(|line| count_leading_whitespace(line))
-		.collect();
-	let non_empty_indents: Vec<usize> = lines
-		.iter()
-		.zip(&indents)
-		.filter_map(|(line, indent)| is_non_empty_line(line).then_some(*indent))
-		.collect();
-	let min_indent = non_empty_indents.iter().copied().min().unwrap_or(0);
-	let indent_unit = non_empty_indents
-		.iter()
-		.filter_map(|indent| indent.checked_sub(min_indent))
-		.filter(|step| *step > 0)
-		.min()
-		.unwrap_or(1);
+/// A line prepared once per whole-block search: its indent, whether it is
+/// blank, and the UTF-16 units of its fuzzy-normalized body.
+struct PreparedLine {
+	indent:    usize,
+	non_empty: bool,
+	body:      Vec<u16>,
+}
+
+fn prepare_lines(lines: &[&str]) -> Vec<PreparedLine> {
 	lines
 		.iter()
-		.zip(indents)
-		.map(|(line, indent)| {
-			if !is_non_empty_line(line) || indent_unit == 0 {
-				0
-			} else {
-				((indent - min_indent) as f64 / indent_unit as f64).round() as usize
+		.map(|line| {
+			let trimmed = js_trim(line);
+			PreparedLine {
+				indent:    count_leading_whitespace(line),
+				non_empty: !trimmed.is_empty(),
+				body:      if trimmed.is_empty() {
+					Vec::new()
+				} else {
+					normalize_for_fuzzy(trimmed).encode_utf16().collect()
+				},
 			}
 		})
 		.collect()
 }
 
-fn normalize_lines(lines: &[&str], include_depth: bool) -> Vec<String> {
-	let depths = include_depth.then(|| relative_indent_depths(lines));
-	lines
+/// Indent depth of each line relative to the smallest non-blank indent,
+/// measured in the smallest positive indent step of the block.
+fn relative_indent_depths(lines: &[PreparedLine], depths: &mut Vec<usize>) {
+	depths.clear();
+	let min_indent = lines
 		.iter()
-		.enumerate()
-		.map(|(index, line)| {
-			let trimmed = js_trim(line);
-			let prefix = depths
-				.as_ref()
-				.map_or_else(|| "|".to_owned(), |values| format!("{}|", values[index]));
-			if trimmed.is_empty() {
-				prefix
-			} else {
-				prefix + &normalize_for_fuzzy(trimmed)
+		.filter(|line| line.non_empty)
+		.map(|line| line.indent)
+		.min()
+		.unwrap_or(0);
+	let indent_unit = lines
+		.iter()
+		.filter(|line| line.non_empty && line.indent > min_indent)
+		.map(|line| line.indent - min_indent)
+		.min()
+		.unwrap_or(1);
+	depths.extend(lines.iter().map(|line| {
+		if line.non_empty {
+			((line.indent - min_indent) as f64 / indent_unit as f64).round() as usize
+		} else {
+			0
+		}
+	}));
+}
+
+/// Write the normalized comparison form of `line` (`"<depth>|body"`, or
+/// `"|body"` without depth) into `out` as UTF-16 units.
+fn write_normalized_line(out: &mut Vec<u16>, line: &PreparedLine, depth: Option<usize>) {
+	out.clear();
+	if let Some(depth) = depth {
+		out.extend(depth.to_string().bytes().map(u16::from));
+	}
+	out.push(u16::from(b'|'));
+	out.extend_from_slice(&line.body);
+}
+
+/// Bit-parallel (Myers/Hyyrö) Levenshtein distance against a fixed pattern of
+/// at most 128 UTF-16 units; longer patterns use the row DP.
+///
+/// Masks are stored only for units that occur (sorted, so non-ASCII lookups
+/// binary-search). ASCII lookups, the hot case for source text, go through a
+/// 128-byte slot index into `masks` so the inner loop stays branch-light while
+/// per-pattern memory stays proportional to the pattern.
+struct UnitPattern {
+	units:       Vec<u16>,
+	masks:       Vec<(u16, u128)>,
+	/// `ascii_slot[unit]` is `index + 1` into `masks`, or 0 when absent.
+	ascii_slot:  [u8; 128],
+	high_bit:    u128,
+	active_bits: u128,
+}
+
+impl UnitPattern {
+	fn new(units: Vec<u16>) -> Self {
+		let mut masks: Vec<(u16, u128)> = Vec::new();
+		let len = units.len();
+		if len <= 128 {
+			for (index, &unit) in units.iter().enumerate() {
+				let bit = 1u128 << index;
+				if let Some(entry) = masks.iter_mut().find(|entry| entry.0 == unit) {
+					entry.1 |= bit;
+				} else {
+					masks.push((unit, bit));
+				}
 			}
-		})
-		.collect()
+			masks.sort_unstable_by_key(|entry| entry.0);
+		}
+		// At most 128 distinct units fit a <=128-unit pattern, so `index + 1`
+		// always fits in a u8.
+		let mut ascii_slot = [0u8; 128];
+		for (index, &(unit, _)) in masks.iter().enumerate() {
+			if unit < 128 {
+				ascii_slot[unit as usize] = (index + 1) as u8;
+			}
+		}
+		// Patterns longer than 128 units never use the bit vectors (row DP).
+		let (high_bit, active_bits) = match len {
+			1..=127 => (1u128 << (len - 1), (1u128 << len) - 1),
+			128 => (1u128 << 127, u128::MAX),
+			_ => (0, 0),
+		};
+		Self { units, masks, ascii_slot, high_bit, active_bits }
+	}
+
+	fn mask(&self, unit: u16) -> u128 {
+		if unit < 128 {
+			match self.ascii_slot[unit as usize] {
+				0 => 0,
+				slot => self.masks[usize::from(slot) - 1].1,
+			}
+		} else {
+			self
+				.masks
+				.binary_search_by_key(&unit, |entry| entry.0)
+				.map_or(0, |index| self.masks[index].1)
+		}
+	}
+
+	fn distance(&self, text: &[u16]) -> usize {
+		let pattern_len = self.units.len();
+		if pattern_len == 0 || text.is_empty() || pattern_len > 128 {
+			return levenshtein_units(&self.units, text);
+		}
+		let mut score = pattern_len;
+		let mut pv = self.active_bits;
+		let mut mv = 0u128;
+		for &unit in text {
+			let eq = self.mask(unit);
+			let xv = eq | mv;
+			let xh = (((eq & pv).wrapping_add(pv)) ^ pv) | eq;
+			let ph = mv | !(xh | pv);
+			let mh = pv & xh;
+			if ph & self.high_bit != 0 {
+				score += 1;
+			} else if mh & self.high_bit != 0 {
+				score -= 1;
+			}
+			let ph = ((ph << 1) | 1) & self.active_bits;
+			let mh = (mh << 1) & self.active_bits;
+			pv = (mh | !(xv | ph)) & self.active_bits;
+			mv = ph & xv & self.active_bits;
+		}
+		score
+	}
+
+	/// Same value as [`similarity`] over the UTF-16 forms of both strings.
+	fn similarity(&self, text: &[u16]) -> f64 {
+		let max_len = self.units.len().max(text.len());
+		if max_len == 0 {
+			return 1.0;
+		}
+		1.0 - self.distance(text) as f64 / max_len as f64
+	}
 }
 
 fn line_offsets(lines: &[&str]) -> Vec<usize> {
@@ -431,32 +543,52 @@ struct BestFuzzyMatch {
 
 fn best_fuzzy_match_core(
 	content_lines: &[&str],
-	target_lines: &[&str],
+	content_prepared: &[PreparedLine],
+	target_prepared: &[PreparedLine],
 	offsets: &[usize],
 	threshold: f64,
 	include_depth: bool,
 	excluded_ranges: &[ExcludedRange],
 ) -> BestFuzzyMatch {
-	let target_normalized = normalize_lines(target_lines, include_depth);
+	let target_len = target_prepared.len();
+	let mut depths = Vec::with_capacity(target_len);
+	if include_depth {
+		relative_indent_depths(target_prepared, &mut depths);
+	}
+	let mut normalized = Vec::new();
+	let target_patterns: Vec<UnitPattern> = target_prepared
+		.iter()
+		.enumerate()
+		.map(|(index, line)| {
+			write_normalized_line(&mut normalized, line, include_depth.then(|| depths[index]));
+			UnitPattern::new(normalized.clone())
+		})
+		.collect();
 	let mut best = None;
 	let mut best_score = -1.0;
 	let mut second_best_score = -1.0;
 	let mut above_threshold_count = 0;
-	for start in 0..=content_lines.len() - target_lines.len() {
+	for start in 0..=content_lines.len() - target_len {
 		let start_index = offsets[start];
-		let end_line = start + target_lines.len() - 1;
+		let end_line = start + target_len - 1;
 		let end_index = (offsets[end_line] + content_lines[end_line].len()).max(start_index + 1);
 		if overlaps_excluded(start_index, end_index, excluded_ranges) {
 			continue;
 		}
-		let window = &content_lines[start..start + target_lines.len()];
-		let window_normalized = normalize_lines(window, include_depth);
-		let score = target_normalized
+		let window = &content_prepared[start..start + target_len];
+		if include_depth {
+			relative_indent_depths(window, &mut depths);
+		}
+		let score = target_patterns
 			.iter()
-			.zip(&window_normalized)
-			.map(|(target, actual)| similarity(target, actual))
+			.zip(window)
+			.enumerate()
+			.map(|(index, (pattern, line))| {
+				write_normalized_line(&mut normalized, line, include_depth.then(|| depths[index]));
+				pattern.similarity(&normalized)
+			})
 			.sum::<f64>()
-			/ target_lines.len() as f64;
+			/ target_len as f64;
 		if score >= threshold {
 			above_threshold_count += 1;
 		}
@@ -464,7 +596,7 @@ fn best_fuzzy_match_core(
 			second_best_score = best_score;
 			best_score = score;
 			best = Some(FuzzyMatch {
-				actual_text: window.join("\n"),
+				actual_text: content_lines[start..start + target_len].join("\n"),
 				start_index,
 				start_line: start as u32 + 1,
 				confidence: score,
@@ -492,9 +624,12 @@ fn best_fuzzy_match(
 		};
 	}
 	let offsets = line_offsets(&content_lines);
+	let content_prepared = prepare_lines(&content_lines);
+	let target_prepared = prepare_lines(&target_lines);
 	let mut result = best_fuzzy_match_core(
 		&content_lines,
-		&target_lines,
+		&content_prepared,
+		&target_prepared,
 		&offsets,
 		threshold,
 		true,
@@ -507,7 +642,8 @@ fn best_fuzzy_match(
 	{
 		let without_depth = best_fuzzy_match_core(
 			&content_lines,
-			&target_lines,
+			&content_prepared,
+			&target_prepared,
 			&offsets,
 			threshold,
 			false,
@@ -1332,6 +1468,36 @@ mod tests {
 	}
 
 	#[test]
+	fn unit_pattern_distance_matches_row_dp() {
+		let long = "x".repeat(130);
+		let samples = [
+			"",
+			"a",
+			"|return alphaBetaGamma(value, options);",
+			"0|return alphaBetaGamme(value, options);",
+			"beta 😀",
+			"beta 😃",
+			"unicode – café 👩‍💻",
+			"tabs and unicode “quotes”",
+			"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+			long.as_str(),
+		];
+		for pattern in samples {
+			let pattern_units: Vec<u16> = pattern.encode_utf16().collect();
+			let compiled = UnitPattern::new(pattern_units.clone());
+			for text in samples {
+				let text_units: Vec<u16> = text.encode_utf16().collect();
+				assert_eq!(
+					compiled.distance(&text_units),
+					levenshtein_units(&pattern_units, &text_units),
+					"distance({pattern:?}, {text:?})"
+				);
+				assert_eq!(compiled.similarity(&text_units), similarity(pattern, text));
+			}
+		}
+	}
+
+	#[test]
 	fn fuzzy_scoring_matches_javascript_utf16_code_units() {
 		assert_eq!(levenshtein_distance("😀", "😃"), 1);
 		assert_eq!(similarity("😀", "😃"), 0.5);
@@ -1589,5 +1755,70 @@ mod tests {
 				.to_string(),
 			"oldText must not be empty."
 		);
+	}
+
+	#[test]
+	fn unit_pattern_score_parity_mixed_ascii_non_ascii() {
+		// Test that UTF-16 scoring is identical for mixed ASCII and non-ASCII patterns.
+		let pattern_ascii = "hello world";
+		let text_ascii = "hello warld"; // One character different
+		let pattern_utf16: Vec<u16> = pattern_ascii.encode_utf16().collect();
+		let text_utf16: Vec<u16> = text_ascii.encode_utf16().collect();
+
+		let pattern = UnitPattern::new(pattern_utf16);
+		let similarity = pattern.similarity(&text_utf16);
+
+		// Both strings are 11 UTF-16 units long, 1 difference = 10/11 similarity
+		let expected = 10.0 / 11.0;
+		assert!((similarity - expected).abs() < 0.001);
+
+		// Test with non-ASCII characters: emoji and accented characters
+		let pattern_non_ascii = "cafe ☺";
+		let text_non_ascii = "cafe ☻";
+		let pattern_non_ascii_utf16: Vec<u16> = pattern_non_ascii.encode_utf16().collect();
+		let text_non_ascii_utf16: Vec<u16> = text_non_ascii.encode_utf16().collect();
+
+		let pattern_non_ascii_obj = UnitPattern::new(pattern_non_ascii_utf16.clone());
+		let similarity_non_ascii = pattern_non_ascii_obj.similarity(&text_non_ascii_utf16);
+
+		// Both are 6 UTF-16 units (cafe = 5, emoji = 1 each), 1 different emoji
+		let expected_non_ascii = 5.0 / 6.0;
+		assert!((similarity_non_ascii - expected_non_ascii).abs() < 0.001);
+	}
+
+	/// Complete retained bytes of one pattern: the struct itself plus the heap
+	/// capacity of both owned vectors.
+	fn unit_pattern_retained_bytes(pattern: &UnitPattern) -> usize {
+		std::mem::size_of::<UnitPattern>()
+			+ pattern.units.capacity() * std::mem::size_of::<u16>()
+			+ pattern.masks.capacity() * std::mem::size_of::<(u16, u128)>()
+	}
+
+	#[test]
+	fn unit_pattern_footprint_scales_with_distinct_units() {
+		// A short line must stay well below the 2 KiB-per-pattern dense table the
+		// sparse representation replaced, and cost must track distinct units.
+		let short: Vec<u16> = "|line".encode_utf16().collect();
+		let short_pattern = UnitPattern::new(short.clone());
+		assert_eq!(short_pattern.masks.len(), 5);
+		let short_bytes = unit_pattern_retained_bytes(&short_pattern);
+		assert!(short_bytes < 1024, "short pattern retains {short_bytes} bytes");
+
+		// A 128-unit pattern with every unit distinct is the worst case the
+		// bit-vector path admits; it must still be bounded by its unit count.
+		let wide: Vec<u16> = (0..128u16).map(|unit| 0x100 + unit).collect();
+		let wide_pattern = UnitPattern::new(wide);
+		assert_eq!(wide_pattern.masks.len(), 128);
+		let wide_bytes = unit_pattern_retained_bytes(&wide_pattern);
+		let per_unit = std::mem::size_of::<(u16, u128)>() + std::mem::size_of::<u16>();
+		assert!(
+			wide_bytes <= std::mem::size_of::<UnitPattern>() + 128 * per_unit + 64,
+			"wide pattern retains {wide_bytes} bytes"
+		);
+		assert!(short_bytes < wide_bytes, "footprint must grow with distinct units");
+
+		// Patterns longer than 128 units use the row DP and keep no masks.
+		let long: Vec<u16> = vec![u16::from(b'x'); 200];
+		assert!(UnitPattern::new(long).masks.is_empty());
 	}
 }

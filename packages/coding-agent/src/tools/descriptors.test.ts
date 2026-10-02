@@ -736,6 +736,35 @@ describe("tool descriptor compatibility gate", () => {
 			}),
 		).toThrow('Validation failed for tool "ask"');
 	});
+	test("loaded and deferred asks reject missing interview metadata and empty siblings with actionable corrections", async () => {
+		for (const stage of ["topology", "post-topology"] as const) {
+			const session = makeSession({ "tools.discoveryMode": "all" });
+			session.hasUI = true;
+			session.getDeepInterviewAskStage = () => stage;
+			const eager = await BUILTIN_TOOL_DESCRIPTORS.ask.load(session);
+			const lazy = (await createTools(session)).find(tool => tool.name === "ask");
+			if (!eager || !lazy) throw new Error("expected eager and deferred asks");
+			const ordinary = {
+				id: "dot-gjc-topology",
+				question: "Round 0 | Topology confirmation\n\nDoes this scope match?",
+				options: [{ label: "Looks right" }],
+				workflowGate: { stage: "deep-interview", kind: "question" },
+			};
+			for (const [arguments_, correction] of [
+				[{ questions: [ordinary] }, "require structured deepInterview metadata"],
+				[{ questions: [{ ...ordinary, deepInterview: null }] }, "require structured deepInterview metadata"],
+				[{ questions: [ordinary, { id: "metadata", question: "", options: [] }] }, "remove empty extra questions"],
+				[{ questions: [ordinary, ordinary] }, "require exactly one question"],
+			] as const) {
+				for (const tool of [eager, lazy]) {
+					expect(() =>
+						validateToolArguments(tool, { type: "toolCall", id: "incident", name: "ask", arguments: arguments_ }),
+					).toThrow(correction);
+				}
+			}
+		}
+	});
+
 	test("deferred ask validation matches eager AskTool on adversarial contracts", async () => {
 		const session = makeSession({ "tools.discoveryMode": "all" });
 		session.hasUI = true;

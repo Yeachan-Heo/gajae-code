@@ -10,6 +10,10 @@ import { interactiveBootstrapText, routeModelsAlias, routeRootArgv } from "../sr
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
 const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
 
+async function readStream(stream: ReadableStream<Uint8Array>): Promise<string> {
+	return new Response(stream).text();
+}
+
 function extractRegisteredCommands(source: string): string[] {
 	const commandsBlock = source.match(/const commands: CommandEntry\[\] = \[([\s\S]*?)\];/);
 	if (!commandsBlock) return [];
@@ -182,6 +186,30 @@ process.exitCode = await child.exited;`;
 			"launch",
 			"quick-lane",
 		]);
+	});
+
+	it("does not spawn a contribution worker from the standalone CLI", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-contribute-pr-cli-"));
+		try {
+			const artifactRoot = path.join(root, "artifacts");
+			const proc = Bun.spawn([process.execPath, cliEntry, "contribute-pr", "--artifact-root", artifactRoot], {
+				cwd: repoRoot,
+				stdout: "pipe",
+				stderr: "pipe",
+				env: { ...process.env, NO_COLOR: "1" },
+			});
+			const [stdout, stderr, exitCode] = await Promise.all([
+				readStream(proc.stdout as ReadableStream<Uint8Array>),
+				readStream(proc.stderr as ReadableStream<Uint8Array>),
+				proc.exited,
+			]);
+
+			expect(exitCode, `${stdout}\\n${stderr}`).toBe(0);
+			expect(stdout).toContain("Spawned worker: no");
+			expect(stdout).not.toContain("Spawned worker: yes");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 
 	it("maps the removed worktree package subpaths to throwing tombstone modules", () => {

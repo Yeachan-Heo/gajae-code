@@ -1279,22 +1279,16 @@ describe("file lock cleanup failure handling (#2478)", () => {
 	});
 
 	test.skipIf(process.platform === "win32")(
-		"classifies a dead removal transition owner as abandoned without deleting it",
+		"recovers a dead removal transition owner and acquires (#6101)",
 		async () => {
 			const lockedFile = path.join(await makeTemp(), "dead-transition.json");
 			const detachedPath = `${lockedFile}.lock.removing`;
 			await writeInfo(detachedPath, { pid: DEAD_PID, timestamp: Date.now(), owner_token: "dead-transition" });
 
-			const failure = await withFileLock(lockedFile, async () => undefined, { retries: 2, retryDelayMs: 1 }).catch(
-				error => error,
-			);
-			expect(failure).toMatchObject({
-				code: "acquire_timeout",
-				reason: "acquire_timeout",
-				attempts: 2,
-				holder: expect.stringContaining("blocked by abandoned removal transition"),
-			});
-			expect(await fs.exists(detachedPath)).toBe(true);
+			await expect(
+				withFileLock(lockedFile, async () => undefined, { retries: 2, retryDelayMs: 1 }),
+			).resolves.toBeUndefined();
+			expect(await fs.exists(detachedPath)).toBe(false);
 		},
 	);
 
