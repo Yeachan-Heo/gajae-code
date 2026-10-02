@@ -5605,6 +5605,16 @@ test.each([
 			status: "failed",
 			error: { code: "cancelled" },
 		});
+		if (mode === "ordinary") {
+			const repeatedAbort = await harness.controlAs("A", "turn.abort", { mode: "turn" });
+			expect(repeatedAbort).toMatchObject({
+				ok: true,
+				result: { aborted: false, turn: "no_active_turn" },
+			});
+			expect(rootAbortCalls).toBe(0);
+			expect(session.isStreaming).toBe(true);
+			expect(session.getQueuedMessages().steering).toEqual(["keep unrelated queue item"]);
+		}
 
 		rootGate.resolve();
 		await session.waitForIdle();
