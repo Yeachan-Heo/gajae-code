@@ -11,13 +11,8 @@ type Deferred<T> = {
 };
 
 function deferred<T>(): Deferred<T> {
-	let resolve!: (value: T) => void;
-	let reject!: (error: unknown) => void;
-	const promise = new Promise<T>((promiseResolve, promiseReject) => {
-		resolve = promiseResolve;
-		reject = promiseReject;
-	});
-	return { promise, resolve, reject };
+	const result = Promise.withResolvers<T>();
+	return result;
 }
 
 function adapter(label: string): AcpSdkAdapter {
@@ -138,6 +133,28 @@ describe("ACP broker prewarm", () => {
 		expect(closeCalls).toBe(1);
 	});
 
+	it("does not clobber the broker slot when a disposed connection rejects", async () => {
+		const first = deferred<{ adapter: AcpSdkAdapter; client: SdkClient }>();
+		let calls = 0;
+		const abort = new AbortController();
+		const agent = new AcpAgent(
+			{ signal: abort.signal, closed: Promise.resolve() } as unknown as AgentSideConnection,
+			{
+				brokerConnector: () => {
+					calls += 1;
+					return first.promise;
+				},
+			},
+		);
+
+		await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+		abort.abort();
+		first.reject(new Error("broker timeout"));
+		await Promise.allSettled([first.promise]);
+		await expect(agent.listSessions({})).rejects.toThrow("broker timeout");
+		expect(calls).toBe(2);
+	});
+
 	it("reuses a successful prewarm for the foreground caller", async () => {
 		let calls = 0;
 		const abort = new AbortController();
@@ -211,5 +228,31 @@ describe("ACP broker prewarm", () => {
 			expect.objectContaining({ sessions: [expect.objectContaining({ sessionId: "endpoint B" })] }),
 		]);
 		expect(calls).toBe(2);
+	});
+
+	it("closes a resolved prewarm adapter exactly once across repeated disposal", async () => {
+		let closeCalls = 0;
+		const abort = new AbortController();
+		const agent = new AcpAgent(
+			{ signal: abort.signal, closed: Promise.resolve() } as unknown as AgentSideConnection,
+			{
+				brokerConnector: async () => ({
+					adapter: {
+						close: async () => {
+							closeCalls += 1;
+						},
+					} as unknown as AcpSdkAdapter,
+					client: {} as SdkClient,
+				}),
+			},
+		);
+
+		await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+		await Bun.sleep(1);
+		abort.abort();
+		abort.abort();
+		await Bun.sleep(10);
+
+		expect(closeCalls).toBe(1);
 	});
 });
