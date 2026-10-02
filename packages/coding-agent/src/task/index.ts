@@ -77,7 +77,6 @@ import {
 	renderSubagentUserPrompt,
 	runSubprocess,
 } from "./executor";
-
 import { adviseForkContextMode } from "./fork-context-advisory";
 import { FORK_CONTEXT_TOKEN_BUDGET_BY_MODE } from "./fork-context-budget";
 import { getTaskIdValidationError, validateAllocatedTaskId } from "./id";
@@ -86,6 +85,7 @@ import { mapWithConcurrencyLimit, Semaphore } from "./parallel";
 import { assertNoRawTaskFields, buildTaskReceipt, buildTaskRoiSummary, type TaskResultReceipt } from "./receipt";
 import { renderResult, renderCall as renderTaskCall } from "./render";
 import { reconcileSpawnRoi } from "./roi-reconciliation";
+import { snapshotTaskSession, type TaskScopeAuthority, type TaskScopeIdentity } from "./scope";
 import { getTaskSimpleModeCapabilities, type TaskSimpleMode } from "./simple-mode";
 import { DEFAULT_SPAWN_THRESHOLD, evaluateSpawnGate } from "./spawn-gate";
 import {
@@ -118,7 +118,15 @@ interface DuplicateDisposition {
 	predecessorIds: string[];
 }
 
+interface TaskArtifacts {
+	sessionArtifactsDir: string | null;
+	durableArtifactsDir: string | null;
+	effectiveArtifactsDir: string | undefined;
+	parentArtifactManager: ArtifactManager | undefined;
+}
+
 interface TaskResumeDescriptor {
+	executionTool: TaskTool;
 	toolCallId: string;
 	params: TaskParams;
 	task: TaskItem & { id: string };
@@ -586,16 +594,27 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	get description(): string {
 		return renderTaskDescription(this.session);
 	}
-	readonly #sessionRepositoryBinding: RepositoryBinding;
+	#sessionRepositoryBinding: RepositoryBinding;
+	#scopeIdentity: TaskScopeIdentity | undefined;
+	#artifactOwner: TaskTool | undefined;
+	#executionArtifacts: TaskArtifacts | undefined;
 	#testRunSubprocess: typeof runSubprocess | undefined;
 
 	private constructor(
-		private readonly session: ToolSession,
+		private readonly session: ToolSession & TaskScopeAuthority,
 		discoveredAgents: AgentDefinition[],
 		sessionRepositoryBinding: RepositoryBinding,
+		private readonly projectAgentsDir: string | null = null,
 	) {
 		this.#blockedAgent = $pickenv("GJC_BLOCKED_AGENT", "PI_BLOCKED_AGENT");
-		this.#discoveredAgents = discoveredAgents;
+		this.#discoveredAgents = discoveredAgents.map(agent => ({
+			...agent,
+			tools: agent.tools ? [...agent.tools] : undefined,
+			spawns: Array.isArray(agent.spawns) ? [...agent.spawns] : agent.spawns,
+			model: agent.model ? [...agent.model] : undefined,
+			autoloadSkills: agent.autoloadSkills ? [...agent.autoloadSkills] : undefined,
+			bashAllowedPrefixes: agent.bashAllowedPrefixes ? [...agent.bashAllowedPrefixes] : undefined,
+		}));
 		this.#sessionRepositoryBinding = sessionRepositoryBinding;
 	}
 
@@ -785,12 +804,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	 * level a private store. Sessions without a manager fall back to the session
 	 * artifacts path, then to the session-lifetime durable temp root.
 	 */
-	async #resolveEffectiveArtifactsDir(): Promise<{
-		sessionArtifactsDir: string | null;
-		durableArtifactsDir: string | null;
-		effectiveArtifactsDir: string | undefined;
-		parentArtifactManager: ArtifactManager | undefined;
-	}> {
+	async #resolveEffectiveArtifactsDir(): Promise<TaskArtifacts> {
+		if (this.#executionArtifacts) return this.#executionArtifacts;
+		if (this.#artifactOwner) {
+			this.#executionArtifacts = await this.#artifactOwner.#resolveEffectiveArtifactsDir();
+			return this.#executionArtifacts;
+		}
 		const shared = this.#sharedArtifactStore();
 		if (shared) {
 			return {
@@ -824,20 +843,36 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	 * Repository authority is captured from session cwd *before* agent discovery so
 	 * multi-repo workspaces fail closed prior to context/discovery (#2901).
 	 */
-	static async create(session: ToolSession, options?: { runSubprocess?: typeof runSubprocess }): Promise<TaskTool> {
-		const sessionRepositoryBinding = await captureRepositoryBinding(session.cwd, { displayPath: session.cwd });
-		await assertExecutionRootMatchesRepositoryBinding(session.cwd, sessionRepositoryBinding);
-		const { agents } = await discoverAgents(session.cwd);
-		const tool = new TaskTool(session, agents, publicRepositoryBinding(sessionRepositoryBinding));
-		tool.#testRunSubprocess = options?.runSubprocess;
-		return tool;
+	static async create(
+		session: ToolSession & TaskScopeAuthority,
+		options?: { runSubprocess?: typeof runSubprocess },
+	): Promise<TaskTool> {
+		const create = async () => {
+			const identity = session.getTaskScopeIdentity?.();
+			const cwd = identity?.cwd ?? session.cwd;
+			const binding = await captureRepositoryBinding(cwd, { displayPath: cwd });
+			await assertExecutionRootMatchesRepositoryBinding(session.cwd, binding);
+			const { agents, projectAgentsDir } = await discoverAgents(cwd, session.home, session.settings);
+			const tool = new TaskTool(session, agents, publicRepositoryBinding(binding), projectAgentsDir);
+			tool.#scopeIdentity = identity ? { ...identity } : undefined;
+			tool.#testRunSubprocess = options?.runSubprocess;
+			return tool;
+		};
+		return session.runWithTaskAdmission ? session.runWithTaskAdmission(create) : create();
 	}
 
 	/** Create catalog metadata from bundled agents only, without ambient filesystem discovery. */
-	static async createForToolCatalog(session: ToolSession): Promise<TaskTool> {
-		const sessionRepositoryBinding = await captureRepositoryBinding(session.cwd, { displayPath: session.cwd });
-		await assertExecutionRootMatchesRepositoryBinding(session.cwd, sessionRepositoryBinding);
-		return new TaskTool(session, loadBundledAgents(), publicRepositoryBinding(sessionRepositoryBinding));
+	static async createForToolCatalog(session: ToolSession & TaskScopeAuthority): Promise<TaskTool> {
+		const create = async () => {
+			const identity = session.getTaskScopeIdentity?.();
+			const cwd = identity?.cwd ?? session.cwd;
+			const binding = await captureRepositoryBinding(cwd, { displayPath: cwd });
+			await assertExecutionRootMatchesRepositoryBinding(session.cwd, binding);
+			const tool = new TaskTool(session, loadBundledAgents(), publicRepositoryBinding(binding));
+			tool.#scopeIdentity = identity ? { ...identity } : undefined;
+			return tool;
+		};
+		return session.runWithTaskAdmission ? session.runWithTaskAdmission(create) : create();
 	}
 
 	/**
@@ -858,6 +893,49 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	}
 
 	async execute(
+		toolCallId: string,
+		rawParams: unknown,
+		signal?: AbortSignal,
+		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
+	): Promise<AgentToolResult<TaskToolDetails>> {
+		const params = structuredClone(rawParams);
+		const admit = async () => {
+			signal?.throwIfAborted();
+			try {
+				const identity = this.session.getTaskScopeIdentity?.();
+				if (identity && this.#scopeIdentity) {
+					if (identity.generation < this.#scopeIdentity.generation) {
+						throw new Error("Task admission generation moved backwards.");
+					}
+					if (identity.generation === this.#scopeIdentity.generation) {
+						if (identity.cwd !== this.#scopeIdentity.cwd) {
+							throw new Error("Task admission cwd changed without a committed move.");
+						}
+					} else {
+						const binding = await captureRepositoryBinding(identity.cwd, { displayPath: identity.cwd });
+						await assertExecutionRootMatchesRepositoryBinding(this.session.cwd, binding);
+						this.#sessionRepositoryBinding = publicRepositoryBinding(binding);
+						this.#scopeIdentity = { ...identity };
+					}
+				}
+				await assertExecutionRootMatchesRepositoryBinding(this.session.cwd, this.#sessionRepositoryBinding);
+			} catch (error) {
+				return createTaskModeError(
+					`Session repository binding rejected before task discovery: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+			const snapshot = snapshotTaskSession(this.session, this.#resolveOwnedJobManager());
+			const { agents, projectAgentsDir } = await discoverAgents(snapshot.cwd, snapshot.home, snapshot.settings);
+			signal?.throwIfAborted();
+			const execution = new TaskTool(snapshot, agents, this.#sessionRepositoryBinding, projectAgentsDir);
+			execution.#artifactOwner = this;
+			execution.#testRunSubprocess = this.#testRunSubprocess;
+			return execution.#executeAdmitted(toolCallId, params, signal, onUpdate);
+		};
+		return this.session.runWithTaskAdmission ? this.session.runWithTaskAdmission(admit) : admit();
+	}
+
+	async #executeAdmitted(
 		_toolCallId: string,
 		rawParams: unknown,
 		signal?: AbortSignal,
@@ -965,8 +1043,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		// Prefer file-backed session artifacts; otherwise allocate a session-lifetime
 		// durable root so detached outputs remain readable for the parent session.
 		// Resolve before ID allocation so agentOutputManager can scan the durable root.
+		signal?.throwIfAborted();
 		const { effectiveArtifactsDir: batchArtifactsDir, parentArtifactManager: asyncParentArtifactManager } =
 			await this.#resolveEffectiveArtifactsDir();
+		signal?.throwIfAborted();
 		let externalTaskSessionsDir: string | undefined;
 		if (!batchArtifactsDir) {
 			// Durable allocation failed: keep child session jsonl under local:// only.
@@ -981,8 +1061,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			await fs.mkdir(externalTaskSessionsDir, { recursive: true, mode: 0o700 });
 		}
 
-		const outputManager =
-			this.session.agentOutputManager ?? new AgentOutputManager(this.session.getArtifactsDir ?? (() => null));
+		const artifactOwner = this.#artifactOwner?.session ?? this.session;
+		const authorizedArtifactsDirs = [...(artifactOwner.getAuthorizedArtifactsDirs?.() ?? [])];
+		this.session.getArtifactsDir = () => batchArtifactsDir ?? null;
+		this.session.getAuthorizedArtifactsDirs = () => authorizedArtifactsDirs;
+		this.session.getArtifactManager = () => asyncParentArtifactManager ?? null;
+		this.session.isArtifactManagerAuthorized = candidate => candidate === asyncParentArtifactManager;
+		artifactOwner.agentOutputManager ??= new AgentOutputManager(artifactOwner.getArtifactsDir ?? (() => null));
+		const outputManager = artifactOwner.agentOutputManager;
+		this.session.agentOutputManager = outputManager;
+		signal?.throwIfAborted();
 		const uniqueIds = await outputManager.allocateBatch(taskItems.map(t => t.id));
 		const fallbackAgentSource =
 			this.#discoveredAgents.find(agent => agent.name === params.agent)?.source ?? "bundled";
@@ -1138,7 +1226,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					"task",
 					descriptor.task.id,
 					async ({ signal: runSignal }) => {
-						const result = await this.#executeSync(
+						const result = await descriptor.executionTool.#executeSync(
 							descriptor.toolCallId,
 							{ ...descriptor.params, tasks: [resumedTask] },
 							runSignal,
@@ -1453,6 +1541,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							subagentId: uniqueId,
 							ownerId: this.session.getAgentId?.() ?? undefined,
 							data: {
+								executionTool: this,
 								toolCallId: _toolCallId,
 								params,
 								task: { ...taskItem, id: uniqueId },
@@ -1617,7 +1706,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		},
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const startTime = Date.now();
-		// Pre-discovery authority: session cwd must still match the capture from create().
+		if (
+			this.#artifactOwner &&
+			(this.#artifactOwner.session.getSessionId?.() ?? null) !== (this.session.getSessionId?.() ?? null)
+		) {
+			throw new Error("Task execution belongs to a retired logical session.");
+		}
+		// Revalidate the immutable admission binding, not the parent's later cwd.
 		try {
 			await assertExecutionRootMatchesRepositoryBinding(this.session.cwd, this.#sessionRepositoryBinding);
 		} catch (error) {
@@ -1635,7 +1730,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 		const boundParams: TaskParams = { ...params, tasks: bindingResolution.tasks };
 
-		const { agents, projectAgentsDir } = await discoverAgents(this.session.cwd);
+		const agents = this.#discoveredAgents;
+		const projectAgentsDir = this.projectAgentsDir;
 		const { agent: agentName, context, schema: outputSchema } = boundParams;
 		const simpleMode = this.#getTaskSimpleMode();
 		const { contextEnabled, customSchemaEnabled } = getTaskSimpleModeCapabilities(simpleMode);
@@ -2118,9 +2214,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							.map(name => availableSkills.find(s => s.name === name))
 							.filter((s): s is NonNullable<typeof s> => s !== undefined)
 					: [];
-			const contextFiles = this.session.contextFiles?.filter(
-				file => path.basename(file.path).toLowerCase() !== "agents.md",
-			);
+			const contextFiles = this.session.contextFiles;
 			const promptTemplates = this.session.promptTemplates;
 			const parentMcpManager = this.session.getMcpManager?.();
 			// Exact-config tools-only managers belong to the top-level ACP session and cannot be reused by sub-sessions.
