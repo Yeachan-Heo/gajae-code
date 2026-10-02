@@ -1749,6 +1749,7 @@ export class AcpAgent implements Agent {
 	#clientCapabilities: ClientCapabilities | undefined;
 	#broker: Promise<BrokerConnection> | undefined;
 	#speculativeBroker: Promise<BrokerConnection> | undefined;
+	readonly #brokerClosures = new WeakMap<AcpSdkAdapter, Promise<void>>();
 	readonly #brokerConnector: BrokerConnector | undefined;
 	readonly #startupOptions: AcpStartupOptions | undefined;
 	readonly #cancelSettlementGraceMs: number;
@@ -4265,6 +4266,14 @@ export class AcpAgent implements Agent {
 		return (await this.#brokerConnection()).adapter;
 	}
 
+	#closeBrokerAdapter(adapter: AcpSdkAdapter): Promise<void> {
+		const existing = this.#brokerClosures.get(adapter);
+		if (existing) return existing;
+		const closing = Promise.resolve().then(() => adapter.close());
+		this.#brokerClosures.set(adapter, closing);
+		return closing;
+	}
+
 	async #brokerConnection(options: { speculative?: boolean } = {}): Promise<BrokerConnection> {
 		if (!this.#broker) {
 			let pending!: Promise<BrokerConnection>;
@@ -4277,12 +4286,15 @@ export class AcpAgent implements Agent {
 		try {
 			const connection = await pending;
 			if (this.#disposed) {
+				try {
+					await this.#closeBrokerAdapter(connection.adapter);
+				} catch {}
 				throw new AcpSdkAdapterError("connection_closed", "ACP connection is closed.");
 			}
 			if (this.#speculativeBroker === pending) this.#speculativeBroker = undefined;
 			return connection;
 		} catch (error) {
-			if (this.#broker === pending) this.#broker = undefined;
+			if (this.#broker === pending && !this.#disposed) this.#broker = undefined;
 			if (this.#speculativeBroker === pending) this.#speculativeBroker = undefined;
 			if (joinedSpeculative && !options.speculative && !this.#disposed) return await this.#brokerConnection();
 			throw error;
@@ -6052,7 +6064,7 @@ export class AcpAgent implements Agent {
 			const broker = this.#broker;
 			this.#broker = undefined;
 			try {
-				await (await broker).adapter.close();
+				await this.#closeBrokerAdapter((await broker).adapter);
 			} catch (error) {
 				failures.push(error);
 			}
