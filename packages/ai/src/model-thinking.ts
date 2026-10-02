@@ -939,6 +939,14 @@ function inferSupportedEfforts<TApi extends Api>(parsedModel: ParsedModel, model
 	if (model.provider === "alibaba-token-plan" && model.id === "glm-5.3") {
 		return ALIBABA_GLM_53_EFFORTS;
 	}
+	if (model.provider === "glm-zcode" && (model.id === "glm-5.3" || model.id === "glm-5.3-flash")) {
+		// The GLM Coding Plan serves these over the Anthropic Messages-compatible
+		// endpoint, where thinking rides the budget ladder. The generic
+		// anthropic-messages fallback stops at xhigh (32768 tokens), but the
+		// endpoint accepts budgets up to 65536 and reasoning volume scales with
+		// the budget (verified 2026-10-02), so expose the full ladder including max.
+		return DEFAULT_REASONING_EFFORTS_WITH_XHIGH_AND_MAX;
+	}
 	switch (parsedModel.family) {
 		case "openai":
 			return inferOpenAISupportedEfforts(parsedModel);

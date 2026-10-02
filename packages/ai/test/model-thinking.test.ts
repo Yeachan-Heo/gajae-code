@@ -184,6 +184,23 @@ describe("model thinking metadata", () => {
 		expect(requireSupportedEffort(glm, Effort.Max)).toBe(Effort.Max);
 	});
 
+	it("exposes the full budget ladder including max for GLM Coding Plan GLM-5.3 models", () => {
+		for (const id of ["glm-5.3", "glm-5.3-flash"] as const) {
+			const model = createModel({
+				id,
+				api: "anthropic-messages",
+				provider: "glm-zcode",
+			});
+			expect(model.thinking).toEqual({
+				mode: "budget",
+				minLevel: Effort.Minimal,
+				maxLevel: Effort.Max,
+			});
+			expect(requireSupportedEffort(model, Effort.Max)).toBe(Effort.Max);
+			expect(clampThinkingLevelForModel(model, Effort.Max)).toBe(Effort.Max);
+		}
+	});
+
 	it("stores supported efforts for Codex mini in model metadata", () => {
 		const model = createModel({
 			id: "gpt-5.1-codex-mini",
