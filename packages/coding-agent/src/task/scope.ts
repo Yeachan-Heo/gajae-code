@@ -1,4 +1,5 @@
 import { AsyncJobManager } from "../async";
+import type { Settings } from "../config/settings";
 import type { ToolSession } from "../tools";
 
 /** SDK-owned identity: generations advance only when a session move commits. */
@@ -10,11 +11,15 @@ export interface TaskScopeIdentity {
 /** A short admission lease, not a lease held by detached task execution. */
 export interface TaskScopeAuthority {
 	getTaskScopeIdentity?: () => TaskScopeIdentity;
+	getTaskScopeSettings?: () => Settings;
 	runWithTaskAdmission?<T>(admit: () => Promise<T>): Promise<T>;
 }
 
 /** Retain execution inputs while leaving shared services and output allocation owned by the parent. */
-export function snapshotTaskSession(session: ToolSession, jobManager: AsyncJobManager | undefined): ToolSession {
+export function snapshotTaskSession(
+	session: ToolSession & TaskScopeAuthority,
+	jobManager: AsyncJobManager | undefined,
+): ToolSession {
 	const sessionFile = session.getSessionFile();
 	const sessionId = session.getSessionId?.() ?? null;
 	const endpointId = session.getAsyncEndpointId?.() ?? sessionId;
@@ -36,7 +41,7 @@ export function snapshotTaskSession(session: ToolSession, jobManager: AsyncJobMa
 	const snapshot: ToolSession & TaskScopeAuthority & { getActiveModelProfile: () => string | undefined } = {
 		...session,
 		cwd: session.cwd,
-		settings: session.settings.snapshot(),
+		settings: (session.getTaskScopeSettings?.() ?? session.settings).snapshot(),
 		contextFiles: session.contextFiles ? structuredClone(session.contextFiles) : undefined,
 		workspaceTree: session.workspaceTree ? structuredClone(session.workspaceTree) : undefined,
 		skills: session.skills?.map(skill => ({ ...skill, _source: skill._source ? { ...skill._source } : undefined })),
@@ -60,6 +65,7 @@ export function snapshotTaskSession(session: ToolSession, jobManager: AsyncJobMa
 		getAsyncJobManager: () => jobManager,
 		getToolByName: name => (name === "irc" ? ircTool : undefined),
 		getTaskScopeIdentity: undefined,
+		getTaskScopeSettings: undefined,
 		runWithTaskAdmission: undefined,
 	};
 	return snapshot;

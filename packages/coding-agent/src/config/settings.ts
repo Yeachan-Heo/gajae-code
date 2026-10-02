@@ -1127,6 +1127,20 @@ export class Settings implements NotificationSettingsReader {
 	}
 
 
+
+	/** Resolve a retained execution's project layer without persistence or global hooks. */
+	async snapshotForCwd(cwd: string): Promise<Settings> {
+		const cloned = this.snapshot();
+		if (path.resolve(cwd) === path.resolve(this.#cwd)) return cloned;
+		cloned.#cwd = path.resolve(cwd);
+		cloned.#readonly = true;
+		cloned.#project = {};
+		cloned.#rebuildMerged();
+		cloned.#project = await cloned.#loadProjectSettings(true);
+		await cloned.#normalizeAfterLoad(false);
+		return cloned;
+	}
+
 	async cloneForCwd(cwd: string): Promise<Settings> {
 		// A clone shares the same config queue. Settle an already-reserved local
 		// debounce before the clone can enqueue a durable selector, preventing it

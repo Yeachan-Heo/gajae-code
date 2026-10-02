@@ -583,7 +583,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	 */
 
 	get parameters(): TaskToolSchemaInstance {
-		const isolationEnabled = this.session.settings.get("task.isolation.mode") !== "none";
+		const isolationEnabled = this.#settings().get("task.isolation.mode") !== "none";
 		return getTaskSchema({ isolationEnabled, simpleMode: this.#getTaskSimpleMode() });
 	}
 
@@ -622,8 +622,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		return (this.#testRunSubprocess ?? runSubprocess)(options);
 	}
 
+	#settings() {
+		return this.session.getTaskScopeSettings?.() ?? this.session.settings;
+	}
+
 	#getTaskSimpleMode(): TaskSimpleMode {
-		return this.session.settings.get("task.simple");
+		return this.#settings().get("task.simple");
 	}
 
 	/**
@@ -852,7 +856,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			const cwd = identity?.cwd ?? session.cwd;
 			const binding = await captureRepositoryBinding(cwd, { displayPath: cwd });
 			await assertExecutionRootMatchesRepositoryBinding(session.cwd, binding);
-			const { agents, projectAgentsDir } = await discoverAgents(cwd, session.home, session.settings);
+			const { agents, projectAgentsDir } = await discoverAgents(
+				cwd,
+				session.home,
+				session.getTaskScopeSettings?.() ?? session.settings,
+			);
 			const tool = new TaskTool(session, agents, publicRepositoryBinding(binding), projectAgentsDir);
 			tool.#scopeIdentity = identity ? { ...identity } : undefined;
 			tool.#testRunSubprocess = options?.runSubprocess;
