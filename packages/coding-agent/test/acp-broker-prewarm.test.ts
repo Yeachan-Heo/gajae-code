@@ -435,10 +435,14 @@ describe("ACP broker prewarm", () => {
 			abort.abort();
 			await waitFor(() => sessionCloseStarted, "live session teardown");
 
-			const replacementConnection = await realConnect(started.discovery.url, started.discovery.token, {
-				reconnectAttempts: 0,
-			});
-			replacementClient.resolve(replacementConnection);
+			replacementClient.resolve({
+				connectionId: "replacement",
+				connect: async () => {},
+				close: async () => {},
+				onFrame: () => () => {},
+				onReconnect: () => () => {},
+				onReconnectFailed: () => () => {},
+			} as unknown as SdkClient);
 			await expect(listing).rejects.toMatchObject({ code: "connection_closed" });
 			replacementWindow = false;
 			teardown.resolve();

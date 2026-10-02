@@ -4333,7 +4333,8 @@ export class AcpAgent implements Agent {
 	async #awaitBrokerDeadline(pending: Promise<BrokerConnection>, deadlineAt?: number): Promise<BrokerConnection> {
 		if (deadlineAt === undefined) return await pending;
 		const remainingMs = deadlineAt - this.#promptWatchdogClock.now();
-		if (remainingMs <= 0) throw new AcpSdkAdapterError("timeout", "ACP broker connection exceeded its request budget.");
+		if (remainingMs <= 0)
+			throw new AcpSdkAdapterError("timeout", "ACP broker connection exceeded its request budget.");
 		let timedOut = false;
 		const timeout = Promise.withResolvers<BrokerConnection>();
 		const cancel = this.#promptWatchdogClock.schedule(() => {
