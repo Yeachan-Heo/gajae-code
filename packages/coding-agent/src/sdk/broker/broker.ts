@@ -9,6 +9,11 @@ import packageJson from "../../../package.json" with { type: "json" };
 import type { ModelProfileErrorDetails } from "../../config/model-profile-contract";
 import { planLaunchWorktree } from "../../gjc-runtime/launch-worktree";
 import { readExistingStateForMutation, withWorkflowStateLock } from "../../gjc-runtime/state-writer";
+import type {
+	TaskArtifactOwnerDeletionEvidence,
+	TaskArtifactOwnerRetirementContinuation,
+	TaskArtifactOwnerRetirementOutcome,
+} from "../../session/task-artifact-owner";
 import { SdkClient, SdkClientError } from "../client";
 import {
 	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
@@ -261,6 +266,18 @@ export type BrokerArtifactTree = {
 	completed?: true;
 };
 
+type TaskArtifactOwnerNativeOutcome = NonNullable<TaskArtifactOwnerRetirementOutcome["nativeOutcome"]>;
+
+export type BrokerTaskArtifactOwnerRetirementDisposition =
+	| { kind: "completed"; nativeOutcome?: TaskArtifactOwnerNativeOutcome }
+	| {
+			kind: "payload_retired";
+			namespace: "retained";
+			nativeOutcome: TaskArtifactOwnerNativeOutcome;
+	  }
+	| { kind: "cleanup_pending"; nativeOutcome?: TaskArtifactOwnerNativeOutcome }
+	| { kind: "uncertain"; reason: string; nativeOutcome?: TaskArtifactOwnerNativeOutcome };
+
 export type BrokerCleanupEvidence = {
 	phase: "artifacts" | "transcript" | "metadata" | "lifecycle";
 	cleanupReceiptVersion?: 1;
@@ -293,6 +310,16 @@ export type BrokerCleanupEvidence = {
 	retainedTranscriptSuccessorPath?: string;
 	retainedTranscriptPlaceholderPath?: string;
 	retainedTranscriptUnknownPath?: string;
+	/** Immutable task-artifact owner capture and the latest strictly parsed native continuation. */
+	taskArtifactOwnerDeletionEvidence?: TaskArtifactOwnerDeletionEvidence;
+	taskArtifactOwnerRetirementContinuation?: TaskArtifactOwnerRetirementContinuation;
+	/** Exact native retirement disposition; replay never treats this historical result as fresh proof. */
+	taskArtifactOwnerRetirementOutcome?: BrokerTaskArtifactOwnerRetirementDisposition;
+	taskArtifactOwnerPayloadRetired?: true;
+	taskArtifactOwnerNamespaceRetained?: true;
+	taskArtifactOwnerRetired?: true;
+	/** Durable marker that the transcript effect completed while a payload-retired namespace remains. */
+	taskArtifactOwnerTranscriptDeleted?: true;
 	/** Durable proof that artifact cleanup completed before transcript mutation. */
 	artifactsRemoved?: boolean;
 	artifactsAbsentAtAuthorization?: true;

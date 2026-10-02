@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as util from "node:util";
 
 import type * as native from "@gajae-code/natives";
 
@@ -39,10 +40,15 @@ import {
 	captureTaskArtifactOwnerDeletionEvidence,
 	parseTaskArtifactOwnerDeletionEvidence,
 	parseTaskArtifactOwnerLocator,
+	parseTaskArtifactOwnerRetirementOutcome,
 	retireTaskArtifactOwner,
 	type TaskArtifactOwnerDeletionEvidence,
 	type TaskArtifactOwnerLocator,
+	type TaskArtifactOwnerRetirementContinuation,
+	type TaskArtifactOwnerRetirementOutcome,
 	type TaskArtifactOwnerStorageContext,
+	verifyTaskArtifactOwnerPhysicalRetirement,
+	verifyTaskArtifactOwnerRetirementContinuation,
 } from "./task-artifact-owner";
 
 const utf8Decoder = new TextDecoder("utf-8");
@@ -464,10 +470,17 @@ export interface VerifiedSessionDeleteTarget {
 	taskArtifactOwnerStorageContext?: TaskArtifactOwnerStorageContext;
 	/** Exact owner-tree evidence captured before deletion and retained across retries. */
 	taskArtifactOwnerDeletionEvidence?: TaskArtifactOwnerDeletionEvidence;
+	/** Owning SDK journal retains the full native disposition before transcript effects. */
+	taskArtifactOwnerRetirementOutcome?: TaskArtifactOwnerRetirementOutcome;
+	taskArtifactOwnerTranscriptDeleted?: true;
 	/** Explicitly leave owner retirement to the managed tombstone coordinator. */
 	deferTaskArtifactOwnerRetirement?: true;
 	/** Durable receipt proves exact owner retirement already completed. */
 	taskArtifactOwnerRetired?: true;
+	/** Exact native remnant, separate from immutable original authority. */
+	taskArtifactOwnerRetirementContinuation?: TaskArtifactOwnerRetirementContinuation;
+	taskArtifactOwnerPayloadRetired?: true;
+	taskArtifactOwnerNamespaceRetained?: true;
 	/** Native-retained publisher successor observed during cleanup. */
 	retainedArtifactsSuccessorPath?: string;
 	/** Native-retained exchange placeholder observed during cleanup. */
@@ -495,9 +508,22 @@ export type VerifiedSessionDeleteResult =
 			phase: "artifacts";
 			transcriptIdentity: SessionStorageFileIdentity;
 			taskArtifactOwnerDeletionEvidence?: TaskArtifactOwnerDeletionEvidence;
+			taskArtifactOwnerRetirementOutcome?: TaskArtifactOwnerRetirementOutcome;
 			taskArtifactOwnerRetired?: true;
+			/** Exact native remnant, separate from immutable original authority. */
+			taskArtifactOwnerRetirementContinuation?: TaskArtifactOwnerRetirementContinuation;
+			taskArtifactOwnerPayloadRetired?: true;
+			taskArtifactOwnerNamespaceRetained?: true;
 	  }
-	| { kind: "deleted" }
+	| {
+			kind: "deleted";
+			taskArtifactOwnerDeletionEvidence?: TaskArtifactOwnerDeletionEvidence;
+			taskArtifactOwnerRetirementOutcome?: TaskArtifactOwnerRetirementOutcome;
+			taskArtifactOwnerRetired?: true;
+			taskArtifactOwnerRetirementContinuation?: TaskArtifactOwnerRetirementContinuation;
+			taskArtifactOwnerPayloadRetired?: true;
+			taskArtifactOwnerNamespaceRetained?: true;
+	  }
 	| {
 			kind: "cleanup_pending";
 			phase: "artifacts";
@@ -515,7 +541,12 @@ export type VerifiedSessionDeleteResult =
 			retainedPlaceholderPath?: string;
 			retainedUnknownPath?: string;
 			taskArtifactOwnerDeletionEvidence?: TaskArtifactOwnerDeletionEvidence;
+			taskArtifactOwnerRetirementOutcome?: TaskArtifactOwnerRetirementOutcome;
 			taskArtifactOwnerRetired?: true;
+			/** Exact native remnant, separate from immutable original authority. */
+			taskArtifactOwnerRetirementContinuation?: TaskArtifactOwnerRetirementContinuation;
+			taskArtifactOwnerPayloadRetired?: true;
+			taskArtifactOwnerNamespaceRetained?: true;
 	  }
 	| {
 			kind: "cleanup_pending";
@@ -523,7 +554,12 @@ export type VerifiedSessionDeleteResult =
 			error: Error;
 			transcriptIdentity: SessionStorageFileIdentity;
 			taskArtifactOwnerDeletionEvidence: TaskArtifactOwnerDeletionEvidence;
+			taskArtifactOwnerRetirementOutcome?: TaskArtifactOwnerRetirementOutcome;
 			taskArtifactOwnerRetired?: true;
+			/** Exact native remnant, separate from immutable original authority. */
+			taskArtifactOwnerRetirementContinuation?: TaskArtifactOwnerRetirementContinuation;
+			taskArtifactOwnerPayloadRetired?: true;
+			taskArtifactOwnerNamespaceRetained?: true;
 			retainedSuccessorPath?: string;
 			retainedPlaceholderPath?: string;
 			retainedUnknownPath?: string;
@@ -541,7 +577,12 @@ export type VerifiedSessionDeleteResult =
 			retainedPlaceholderPath?: string;
 			retainedUnknownPath?: string;
 			taskArtifactOwnerDeletionEvidence?: TaskArtifactOwnerDeletionEvidence;
+			taskArtifactOwnerRetirementOutcome?: TaskArtifactOwnerRetirementOutcome;
 			taskArtifactOwnerRetired?: true;
+			/** Exact native remnant, separate from immutable original authority. */
+			taskArtifactOwnerRetirementContinuation?: TaskArtifactOwnerRetirementContinuation;
+			taskArtifactOwnerPayloadRetired?: true;
+			taskArtifactOwnerNamespaceRetained?: true;
 	  };
 
 /** Default OS-close dispatcher: a direct `fs.closeSync`. */
@@ -2335,6 +2376,10 @@ export class FileSessionStorage implements SessionStorage {
 			taskArtifactOwnerDeletionEvidence: taskArtifactOwnerEvidenceValue,
 			deferTaskArtifactOwnerRetirement,
 			taskArtifactOwnerRetired,
+			taskArtifactOwnerRetirementOutcome: ownerRetirementOutcomeValue,
+			taskArtifactOwnerRetirementContinuation: ownerContinuationValue,
+			taskArtifactOwnerPayloadRetired,
+			taskArtifactOwnerNamespaceRetained,
 		} = target;
 		try {
 			assertNoReparsePath(sessionsRoot);
@@ -2460,7 +2505,56 @@ export class FileSessionStorage implements SessionStorage {
 			throw new SessionDeleteVerificationError("artifacts", "task_artifact_owner_evidence_not_in_transcript");
 		if (ownerEvidence && !taskArtifactOwnerStorageContext)
 			throw new SessionDeleteVerificationError("artifacts", "task_artifact_owner_context_missing");
-		if (ownerLocator && ownerEvidence && taskArtifactOwnerStorageContext && !taskArtifactOwnerRetired) {
+		let ownerRetirementOutcome =
+			ownerRetirementOutcomeValue !== undefined && ownerEvidence && taskArtifactOwnerStorageContext
+				? withTaskArtifactOwnerFailure(() =>
+						parseTaskArtifactOwnerRetirementOutcome(
+							taskArtifactOwnerStorageContext,
+							ownerEvidence,
+							ownerRetirementOutcomeValue,
+						),
+					)
+				: undefined;
+		if (ownerRetirementOutcomeValue !== undefined && !ownerRetirementOutcome)
+			throw new SessionDeleteVerificationError("artifacts", "task_artifact_owner_retirement_outcome_missing");
+		if (
+			(ownerContinuationValue !== undefined) !==
+			(ownerRetirementOutcome !== undefined && ownerRetirementOutcome.kind !== "completed")
+		)
+			throw new SessionDeleteVerificationError("artifacts", "task_artifact_owner_retirement_continuation_mismatch");
+		if (
+			ownerRetirementOutcome &&
+			ownerRetirementOutcome.kind !== "completed" &&
+			!util.isDeepStrictEqual(ownerContinuationValue, ownerRetirementOutcome.continuation)
+		)
+			throw new SessionDeleteVerificationError("artifacts", "task_artifact_owner_retirement_continuation_mismatch");
+		const suppliedContinuation =
+			ownerRetirementOutcome && ownerRetirementOutcome.kind !== "completed"
+				? ownerRetirementOutcome.continuation
+				: undefined;
+		let ownerContinuation = suppliedContinuation
+			? withTaskArtifactOwnerFailure(() =>
+					verifyTaskArtifactOwnerRetirementContinuation(
+						taskArtifactOwnerStorageContext!,
+						ownerEvidence!,
+						suppliedContinuation,
+					),
+				)
+			: undefined;
+		const payloadRetired = ownerRetirementOutcome?.kind === "payload_retired";
+		if (
+			(taskArtifactOwnerPayloadRetired === true) !== payloadRetired ||
+			(taskArtifactOwnerNamespaceRetained === true) !== payloadRetired ||
+			(taskArtifactOwnerRetired === true) !== (ownerRetirementOutcome?.kind === "completed")
+		)
+			throw new SessionDeleteVerificationError("artifacts", "task_artifact_owner_retirement_outcome_mismatch");
+		if (
+			ownerLocator &&
+			ownerEvidence &&
+			taskArtifactOwnerStorageContext &&
+			!taskArtifactOwnerRetired &&
+			!ownerContinuation
+		) {
 			const currentOwnerEvidence = withTaskArtifactOwnerFailure(() =>
 				captureTaskArtifactOwnerDeletionEvidence(taskArtifactOwnerStorageContext, sessionId, ownerLocator),
 			);
@@ -2468,31 +2562,42 @@ export class FileSessionStorage implements SessionStorage {
 				throw new SessionDeleteVerificationError("artifacts", "task_artifact_owner_changed_since_capture");
 		}
 		let ownerRetired = taskArtifactOwnerRetired === true;
+		let ownerPayloadRetired = taskArtifactOwnerPayloadRetired === true;
+		let ownerNamespaceRetained = taskArtifactOwnerNamespaceRetained === true;
 		if (ownerRetired) {
-			if (!ownerEvidence || !taskArtifactOwnerStorageContext)
+			if (!ownerEvidence || !taskArtifactOwnerStorageContext || !ownerRetirementOutcome)
 				throw new SessionDeleteVerificationError("artifacts", "task_artifact_owner_retired_evidence_missing");
-			try {
-				const stillPresent = withTaskArtifactOwnerFailure(() =>
-					captureTaskArtifactOwnerDeletionEvidence(
-						taskArtifactOwnerStorageContext,
-						sessionId,
-						ownerEvidence.locator,
-					),
-				);
-				if (stillPresent)
-					throw new SessionDeleteVerificationError("artifacts", "task_artifact_owner_retirement_unverified");
-			} catch (error) {
-				if (!(error instanceof Error) || error.message !== "task_artifact_owner_missing") throw error;
-			}
+			withTaskArtifactOwnerFailure(() =>
+				verifyTaskArtifactOwnerPhysicalRetirement(
+					taskArtifactOwnerStorageContext,
+					ownerEvidence,
+					ownerRetirementOutcome,
+				),
+			);
 		}
 		const retireOwnerIfRequired = (): Error | undefined => {
 			if (deferTaskArtifactOwnerRetirement || ownerRetired || !ownerEvidence) return undefined;
 			if (!taskArtifactOwnerStorageContext)
 				return new SessionDeleteVerificationError("artifacts", "task_artifact_owner_context_missing");
 			try {
-				withTaskArtifactOwnerFailure(() => retireTaskArtifactOwner(taskArtifactOwnerStorageContext, ownerEvidence));
-				ownerRetired = true;
-				return undefined;
+				const outcome = withTaskArtifactOwnerFailure(() =>
+					retireTaskArtifactOwner(taskArtifactOwnerStorageContext, ownerEvidence, ownerContinuation),
+				);
+				ownerRetirementOutcome = outcome;
+				if (outcome.kind === "completed") {
+					ownerRetired = true;
+					ownerContinuation = undefined;
+					ownerPayloadRetired = false;
+					ownerNamespaceRetained = false;
+					return undefined;
+				}
+				ownerContinuation = outcome.continuation;
+				ownerPayloadRetired = outcome.kind === "payload_retired";
+				ownerNamespaceRetained = outcome.kind === "payload_retired";
+				return new SessionDeleteVerificationError(
+					"artifacts",
+					outcome.kind === "uncertain" ? outcome.reason : "task_artifact_owner_namespace_cleanup_pending",
+				);
 			} catch (error) {
 				return new SessionDeleteVerificationError(
 					"artifacts",
@@ -2505,10 +2610,19 @@ export class FileSessionStorage implements SessionStorage {
 		};
 		const ownerResultFields = (): Pick<
 			Extract<VerifiedSessionDeleteResult, { kind: "artifacts_removed" }>,
-			"taskArtifactOwnerDeletionEvidence" | "taskArtifactOwnerRetired"
+			| "taskArtifactOwnerDeletionEvidence"
+			| "taskArtifactOwnerRetirementOutcome"
+			| "taskArtifactOwnerRetired"
+			| "taskArtifactOwnerRetirementContinuation"
+			| "taskArtifactOwnerPayloadRetired"
+			| "taskArtifactOwnerNamespaceRetained"
 		> => ({
 			...(ownerEvidence ? { taskArtifactOwnerDeletionEvidence: ownerEvidence } : {}),
+			...(ownerRetirementOutcome ? { taskArtifactOwnerRetirementOutcome: ownerRetirementOutcome } : {}),
 			...(ownerRetired ? { taskArtifactOwnerRetired: true as const } : {}),
+			...(ownerContinuation ? { taskArtifactOwnerRetirementContinuation: ownerContinuation } : {}),
+			...(ownerPayloadRetired ? { taskArtifactOwnerPayloadRetired: true as const } : {}),
+			...(ownerNamespaceRetained ? { taskArtifactOwnerNamespaceRetained: true as const } : {}),
 		});
 		const ownerCleanupPending = (error: Error): VerifiedSessionDeleteResult => ({
 			kind: "cleanup_pending",
@@ -2516,6 +2630,7 @@ export class FileSessionStorage implements SessionStorage {
 			error,
 			transcriptIdentity,
 			taskArtifactOwnerDeletionEvidence: ownerEvidence!,
+			...ownerResultFields(),
 		});
 		const finishArtifactPhase = (): VerifiedSessionDeleteResult => {
 			const ownerError = retireOwnerIfRequired();
@@ -2835,7 +2950,7 @@ export class FileSessionStorage implements SessionStorage {
 			}
 			return finishArtifactPhase();
 		}
-		if (deferTaskArtifactOwnerRetirement && ownerEvidence && !ownerRetired)
+		if (deferTaskArtifactOwnerRetirement && ownerEvidence && !ownerRetired && !ownerPayloadRetired)
 			return {
 				kind: "artifacts_removed",
 				phase: "artifacts",
@@ -2857,7 +2972,7 @@ export class FileSessionStorage implements SessionStorage {
 				quarantineName: path.basename(plannedTranscriptPath),
 			});
 			if (!deletion.ok) {
-				if (transcriptDeletionTerminal(deletion)) return { kind: "deleted" };
+				if (transcriptDeletionTerminal(deletion)) return { kind: "deleted", ...ownerResultFields() };
 				const error = exactUnlinkFailure(deletion);
 				const retainedAuthority =
 					deletion.detachedPath ||
@@ -2886,7 +3001,7 @@ export class FileSessionStorage implements SessionStorage {
 						: {}),
 				};
 			}
-			return { kind: "deleted" };
+			return { kind: "deleted", ...ownerResultFields() };
 		}
 		if (!initialStat || !initialDigest)
 			throw new SessionDeleteVerificationError("stat", "Transcript cleanup state is invalid");
@@ -2927,7 +3042,7 @@ export class FileSessionStorage implements SessionStorage {
 			quarantineName: path.basename(plannedTranscriptPath),
 		});
 		if (!deletion.ok) {
-			if (transcriptDeletionTerminal(deletion)) return { kind: "deleted" };
+			if (transcriptDeletionTerminal(deletion)) return { kind: "deleted", ...ownerResultFields() };
 			const error = exactUnlinkFailure(deletion);
 			const retainedAuthority =
 				deletion.detachedPath ||
@@ -2956,7 +3071,7 @@ export class FileSessionStorage implements SessionStorage {
 					: {}),
 			};
 		}
-		return { kind: "deleted" };
+		return { kind: "deleted", ...ownerResultFields() };
 	}
 
 	#verifiedReadAndHeader(
@@ -3793,19 +3908,32 @@ export class MemorySessionStorage implements SessionStorage {
  *
  * `kept` means the transcript survived and nothing of the session was
  * destroyed, with the exact reason so `gjc gc --disk` can report it.
- * `cleanup_pending` means the delete authority already detached or removed the
- * session's artifact tree (or quarantined the transcript) before it stopped:
- * the record survives, the session does not, and a caller must NOT report that
- * as an ordinary keep.
+ * `cleanup_pending` means artifact removal or exact task-owner retirement has
+ * partially committed while the transcript survives. The retained receipt
+ * carries the native disposition so a caller must NOT report it as an ordinary
+ * keep or infer physical owner retirement from payload destruction alone.
  */
 export type SessionRetirementOutcome =
-	| { kind: "retired" }
+	| {
+			kind: "retired";
+			taskArtifactOwnerDeletionEvidence?: TaskArtifactOwnerDeletionEvidence;
+			taskArtifactOwnerRetirementOutcome?: TaskArtifactOwnerRetirementOutcome;
+			taskArtifactOwnerRetired?: true;
+			taskArtifactOwnerRetirementContinuation?: TaskArtifactOwnerRetirementContinuation;
+			taskArtifactOwnerPayloadRetired?: true;
+			taskArtifactOwnerNamespaceRetained?: true;
+	  }
 	| { kind: "kept"; reason: string }
 	| {
 			kind: "cleanup_pending";
 			reason: string;
 			taskArtifactOwnerDeletionEvidence?: TaskArtifactOwnerDeletionEvidence;
+			taskArtifactOwnerRetirementOutcome?: TaskArtifactOwnerRetirementOutcome;
 			taskArtifactOwnerRetired?: true;
+			/** Exact native remnant, separate from immutable original authority. */
+			taskArtifactOwnerRetirementContinuation?: TaskArtifactOwnerRetirementContinuation;
+			taskArtifactOwnerPayloadRetired?: true;
+			taskArtifactOwnerNamespaceRetained?: true;
 	  };
 
 /** A retirement that cleared every precondition the retention pass itself owns. */
@@ -3817,6 +3945,7 @@ type SessionRetirementPlan =
 			taskArtifactOwnerLocator?: TaskArtifactOwnerLocator;
 			gcContinuationReceipt?: ManagedGcSessionRetirementReceipt;
 	  }
+	| { kind: "owner_shared"; reason: string; gcContinuationReceipt?: ManagedGcSessionRetirementReceipt }
 	| { kind: "kept"; reason: string };
 
 /** Verified managed-scope capability used to persist per-transcript GC continuation receipts. */
@@ -3828,7 +3957,12 @@ export type SessionRetirementProbeOutcome =
 	| {
 			kind: "retirable";
 			taskArtifactOwnerDeletionEvidence?: TaskArtifactOwnerDeletionEvidence;
+			taskArtifactOwnerRetirementOutcome?: TaskArtifactOwnerRetirementOutcome;
 			taskArtifactOwnerRetired?: true;
+			/** Exact native remnant, separate from immutable original authority. */
+			taskArtifactOwnerRetirementContinuation?: TaskArtifactOwnerRetirementContinuation;
+			taskArtifactOwnerPayloadRetired?: true;
+			taskArtifactOwnerNamespaceRetained?: true;
 	  }
 	| { kind: "kept"; reason: string };
 
@@ -3837,6 +3971,59 @@ export type SessionRetirementProbeOutcome =
  * and carry a usable session header — and bind the delete target to the exact
  * bytes just read. Nothing here mutates the store.
  */
+function hasSiblingTaskArtifactOwnerTranscript(
+	storage: FileSessionStorage,
+	transcriptPath: string,
+	locator: TaskArtifactOwnerLocator,
+): boolean {
+	const directory = path.dirname(transcriptPath);
+	let names: string[];
+	try {
+		names = fs.readdirSync(directory);
+	} catch {
+		return true;
+	}
+	for (const name of names) {
+		if (!name.endsWith(".jsonl") || path.join(directory, name) === transcriptPath) continue;
+		const siblingPath = path.join(directory, name);
+		let before: fs.BigIntStats;
+		try {
+			before = fs.lstatSync(siblingPath, { bigint: true });
+		} catch {
+			return true;
+		}
+		if (before.isSymbolicLink() || !before.isFile()) continue;
+		try {
+			const sibling = storage.readSnapshotSync(siblingPath);
+			const after = fs.lstatSync(siblingPath, { bigint: true });
+			if (
+				after.isSymbolicLink() ||
+				!after.isFile() ||
+				after.dev !== before.dev ||
+				after.ino !== before.ino ||
+				after.nlink !== before.nlink ||
+				after.size !== before.size ||
+				after.mtimeNs !== before.mtimeNs ||
+				after.ctimeNs !== before.ctimeNs ||
+				sibling.stat.dev !== before.dev ||
+				sibling.stat.ino !== before.ino ||
+				sibling.stat.size !== Number(before.size) ||
+				sibling.stat.nlink !== before.nlink ||
+				sibling.stat.mtimeNs !== before.mtimeNs ||
+				sibling.stat.ctimeNs !== before.ctimeNs
+			)
+				return true;
+			const header = parseFirstJsonlLine(sibling.bytes);
+			if (header?.type !== "session" || typeof header.id !== "string") return true;
+			const siblingLocator = taskArtifactOwnerLocatorFromTranscriptBytes(sibling.bytes, header.id);
+			if (siblingLocator && JSON.stringify(siblingLocator) === JSON.stringify(locator)) return true;
+		} catch {
+			return true;
+		}
+	}
+	return false;
+}
+
 function planSessionRetirement(
 	storage: FileSessionStorage,
 	sessionsRoot: string,
@@ -3899,26 +4086,45 @@ function planSessionRetirement(
 				taskArtifactOwnerStorageContext,
 				continuationTarget,
 			);
+			if (hasSiblingTaskArtifactOwnerTranscript(storage, transcriptPath, taskArtifactOwnerLocator))
+				return {
+					kind: "owner_shared",
+					reason: "task_artifact_owner_shared_with_sibling_transcript",
+					...(gcContinuationReceipt ? { gcContinuationReceipt } : {}),
+				};
 			if (gcContinuationReceipt) {
 				taskArtifactOwnerDeletionEvidence = gcContinuationReceipt.taskArtifactOwnerDeletionEvidence;
-				try {
-					const currentEvidence = captureTaskArtifactOwnerDeletionEvidence(
+				const outcome = gcContinuationReceipt.taskArtifactOwnerRetirementOutcome;
+				if (gcContinuationReceipt.taskArtifactOwnerRetired) {
+					if (outcome?.kind !== "completed") throw new Error("task_artifact_owner_continuation_outcome_mismatch");
+					verifyTaskArtifactOwnerPhysicalRetirement(
 						taskArtifactOwnerStorageContext,
-						header.id,
-						taskArtifactOwnerLocator,
+						taskArtifactOwnerDeletionEvidence,
+						outcome,
 					);
-					if (
-						gcContinuationReceipt.taskArtifactOwnerRetired ||
-						JSON.stringify(currentEvidence) !== JSON.stringify(taskArtifactOwnerDeletionEvidence)
-					)
-						throw new Error("task_artifact_owner_continuation_owner_mismatch");
-				} catch (error) {
-					if (
-						!(error instanceof Error) ||
-						error.message !== "task_artifact_owner_missing" ||
-						!gcContinuationReceipt.artifactsRemoved
-					)
-						throw error;
+				} else if (outcome && outcome.kind !== "completed") {
+					verifyTaskArtifactOwnerRetirementContinuation(
+						taskArtifactOwnerStorageContext,
+						taskArtifactOwnerDeletionEvidence,
+						outcome.continuation,
+					);
+				} else {
+					try {
+						const currentEvidence = captureTaskArtifactOwnerDeletionEvidence(
+							taskArtifactOwnerStorageContext,
+							header.id,
+							taskArtifactOwnerLocator,
+						);
+						if (JSON.stringify(currentEvidence) !== JSON.stringify(taskArtifactOwnerDeletionEvidence))
+							throw new Error("task_artifact_owner_continuation_owner_mismatch");
+					} catch (error) {
+						if (
+							!(error instanceof Error) ||
+							error.message !== "task_artifact_owner_missing" ||
+							!gcContinuationReceipt.artifactsRemoved
+						)
+							throw error;
+					}
 				}
 			} else {
 				taskArtifactOwnerDeletionEvidence = captureTaskArtifactOwnerDeletionEvidence(
@@ -3984,12 +4190,20 @@ export function probeSessionRetirement(
 		continuation,
 	);
 	if (plan.kind === "kept") return plan;
+	if (plan.kind === "owner_shared") return { kind: "kept", reason: plan.reason };
+	const receipt = plan.gcContinuationReceipt;
+	const outcome = receipt?.taskArtifactOwnerRetirementOutcome;
 	return {
 		kind: "retirable",
-		...(plan.gcContinuationReceipt
-			? { taskArtifactOwnerDeletionEvidence: plan.gcContinuationReceipt.taskArtifactOwnerDeletionEvidence }
+		...(receipt ? { taskArtifactOwnerDeletionEvidence: receipt.taskArtifactOwnerDeletionEvidence } : {}),
+		...(outcome ? { taskArtifactOwnerRetirementOutcome: outcome } : {}),
+		...(receipt?.taskArtifactOwnerRetired ? { taskArtifactOwnerRetired: true as const } : {}),
+		...(outcome && outcome.kind !== "completed"
+			? { taskArtifactOwnerRetirementContinuation: outcome.continuation }
 			: {}),
-		...(plan.gcContinuationReceipt?.taskArtifactOwnerRetired ? { taskArtifactOwnerRetired: true as const } : {}),
+		...(outcome?.kind === "payload_retired"
+			? { taskArtifactOwnerPayloadRetired: true as const, taskArtifactOwnerNamespaceRetained: true as const }
+			: {}),
 	};
 }
 
@@ -4036,12 +4250,23 @@ async function retireGcOwnerTranscript(
 		taskArtifactOwnerDeletionEvidence: evidence,
 	};
 	let artifactsRemoved = receipt.artifactsRemoved === true;
+	let ownerRetirementOutcome = receipt.taskArtifactOwnerRetirementOutcome;
 	let taskArtifactOwnerRetired = receipt.taskArtifactOwnerRetired === true;
+	const outcomeFields = () => ({
+		taskArtifactOwnerDeletionEvidence: evidence,
+		...(ownerRetirementOutcome ? { taskArtifactOwnerRetirementOutcome: ownerRetirementOutcome } : {}),
+		...(ownerRetirementOutcome && ownerRetirementOutcome.kind !== "completed"
+			? { taskArtifactOwnerRetirementContinuation: ownerRetirementOutcome.continuation }
+			: {}),
+		...(ownerRetirementOutcome?.kind === "payload_retired"
+			? { taskArtifactOwnerPayloadRetired: true as const, taskArtifactOwnerNamespaceRetained: true as const }
+			: {}),
+		...(taskArtifactOwnerRetired ? { taskArtifactOwnerRetired: true as const } : {}),
+	});
 	const pending = (reason: string): SessionRetirementOutcome => ({
 		kind: "cleanup_pending",
 		reason,
-		taskArtifactOwnerDeletionEvidence: evidence,
-		...(taskArtifactOwnerRetired ? { taskArtifactOwnerRetired: true as const } : {}),
+		...outcomeFields(),
 	});
 	try {
 		if (!plan.gcContinuationReceipt) {
@@ -4062,10 +4287,7 @@ async function retireGcOwnerTranscript(
 				return {
 					kind: "cleanup_pending",
 					reason: `cleanup_pending_${artifactPhase.phase}: ${artifactPhase.error.message}`,
-					taskArtifactOwnerDeletionEvidence: artifactPhase.taskArtifactOwnerDeletionEvidence ?? evidence,
-					...(artifactPhase.taskArtifactOwnerRetired || taskArtifactOwnerRetired
-						? { taskArtifactOwnerRetired: true as const }
-						: {}),
+					...outcomeFields(),
 				};
 			if (artifactPhase.kind !== "artifacts_removed")
 				return { kind: "kept", reason: "task_artifact_owner_continuation_artifact_phase_incomplete" };
@@ -4078,41 +4300,60 @@ async function retireGcOwnerTranscript(
 			);
 		}
 		if (!taskArtifactOwnerRetired) {
-			try {
-				retireTaskArtifactOwner(ownerContext, evidence);
-			} catch (error) {
-				if (!(error instanceof Error) || error.message !== "task_artifact_owner_missing") throw error;
+			const previousContinuation =
+				ownerRetirementOutcome && ownerRetirementOutcome.kind !== "completed"
+					? ownerRetirementOutcome.continuation
+					: undefined;
+			ownerRetirementOutcome = retireTaskArtifactOwner(ownerContext, evidence, previousContinuation);
+			if (ownerRetirementOutcome.kind === "completed") {
+				receipt = await publishManagedGcSessionRetirementReceipt(
+					continuation.managedScope,
+					ownerContext,
+					{
+						...receipt,
+						taskArtifactOwnerRetirementOutcome: ownerRetirementOutcome,
+					},
+					"owner_retired",
+				);
+				taskArtifactOwnerRetired = receipt.taskArtifactOwnerRetired === true;
+			} else {
+				receipt = await publishManagedGcSessionRetirementReceipt(
+					continuation.managedScope,
+					ownerContext,
+					{
+						...receipt,
+						taskArtifactOwnerRetirementOutcome: ownerRetirementOutcome,
+						taskArtifactOwnerRetirementContinuation: ownerRetirementOutcome.continuation,
+						...(ownerRetirementOutcome.kind === "payload_retired"
+							? {
+									taskArtifactOwnerPayloadRetired: true as const,
+									taskArtifactOwnerNamespaceRetained: true as const,
+								}
+							: {}),
+					},
+					"owner_pending",
+				);
+				return pending(
+					ownerRetirementOutcome.kind === "uncertain"
+						? ownerRetirementOutcome.reason
+						: "task_artifact_owner_namespace_cleanup_pending",
+				);
 			}
-			try {
-				const currentEvidence = captureTaskArtifactOwnerDeletionEvidence(ownerContext, evidence.sessionId, locator);
-				if (currentEvidence) throw new Error("task_artifact_owner_retirement_unverified");
-			} catch (error) {
-				if (!(error instanceof Error) || error.message !== "task_artifact_owner_missing") throw error;
-			}
-			receipt = await publishManagedGcSessionRetirementReceipt(
-				continuation.managedScope,
-				ownerContext,
-				receipt,
-				"owner_retired",
-			);
-			taskArtifactOwnerRetired = receipt.taskArtifactOwnerRetired === true;
 		}
 		const deletion = await storage.deleteSessionVerified({
 			...target,
 			taskArtifactOwnerDeletionEvidence: evidence,
+			taskArtifactOwnerRetirementOutcome: ownerRetirementOutcome,
 			taskArtifactOwnerRetired: true,
 			deferTaskArtifactOwnerRetirement: true,
 			artifactsRemoved: true,
 		});
-		if (deletion.kind === "deleted") return { kind: "retired" };
+		if (deletion.kind === "deleted") return { kind: "retired", ...outcomeFields() };
 		if (deletion.kind === "cleanup_pending")
 			return {
 				kind: "cleanup_pending",
 				reason: `cleanup_pending_${deletion.phase}: ${deletion.error.message}`,
-				taskArtifactOwnerDeletionEvidence: deletion.taskArtifactOwnerDeletionEvidence ?? evidence,
-				...(deletion.taskArtifactOwnerRetired || taskArtifactOwnerRetired
-					? { taskArtifactOwnerRetired: true as const }
-					: {}),
+				...outcomeFields(),
 			};
 		return pending("transcript_not_deleted");
 	} catch (error) {
@@ -4138,6 +4379,24 @@ export async function retireSessionTranscript(
 		continuation,
 	);
 	if (plan.kind === "kept") return plan;
+	if (plan.kind === "owner_shared") {
+		const receipt = plan.gcContinuationReceipt;
+		if (!receipt?.artifactsRemoved) return { kind: "kept", reason: plan.reason };
+		const outcome = receipt.taskArtifactOwnerRetirementOutcome;
+		return {
+			kind: "cleanup_pending",
+			reason: plan.reason,
+			taskArtifactOwnerDeletionEvidence: receipt.taskArtifactOwnerDeletionEvidence,
+			...(outcome ? { taskArtifactOwnerRetirementOutcome: outcome } : {}),
+			...(outcome && outcome.kind !== "completed"
+				? { taskArtifactOwnerRetirementContinuation: outcome.continuation }
+				: {}),
+			...(outcome?.kind === "payload_retired"
+				? { taskArtifactOwnerPayloadRetired: true as const, taskArtifactOwnerNamespaceRetained: true as const }
+				: {}),
+			...(receipt.taskArtifactOwnerRetired ? { taskArtifactOwnerRetired: true as const } : {}),
+		};
+	}
 	if (plan.taskArtifactOwnerLocator && plan.target.taskArtifactOwnerDeletionEvidence && continuation)
 		return retireGcOwnerTranscript(storage, plan, continuation);
 
