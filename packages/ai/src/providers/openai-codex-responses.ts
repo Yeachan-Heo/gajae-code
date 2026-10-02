@@ -1259,12 +1259,10 @@ function trySalvageCodexFinalizedToolCalls(
 			? runtime.currentBlock
 			: undefined;
 	const completeActiveToolCall = activeToolCall?.argumentsComplete === true;
-	const hasCompleteArguments = toolCalls.some(toolCall => runtime.finalizedToolCallIds.has(toolCall.id))
-		? toolCalls.every(
-				toolCall =>
-					runtime.finalizedToolCallIds.has(toolCall.id) || (toolCall === activeToolCall && completeActiveToolCall),
-			)
-		: completeActiveToolCall;
+	const hasCompleteArguments = toolCalls.every(
+		toolCall =>
+			runtime.finalizedToolCallIds.has(toolCall.id) || (toolCall === activeToolCall && completeActiveToolCall),
+	);
 	const isIdleStall =
 		error instanceof Error && error.message === "OpenAI Codex SSE stream stalled while waiting for the next event";
 	const canSalvageFinalizedCall =
