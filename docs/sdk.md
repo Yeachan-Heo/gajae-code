@@ -476,7 +476,10 @@ Finished references are connection-owned and one-shot. `turn.prompt` consumes
 `stagedImages: [{ id }]`; callers cannot mix them with direct `images` or reuse
 references after redemption, including a subsequent admission rejection. ACP's
 bounded retry after a **confirmed** `busy` response restages the original bytes
-with fresh references. A lost or uncertain acknowledgement is reconciled through
+with fresh references. Capacity rejection may precede redemption, so old IDs
+must be discarded or confirmed already gone before fresh staging. Unconfirmed
+cleanup emits a bounded diagnostic and refuses the retry; it does not invent
+capacity release or replay an uncertain mutation. A lost or uncertain acknowledgement is reconciled through
 `turn.result`, never treated as permission to upload and execute the prompt again.
 The user's message is echoed once across a confirmed retry.
 
@@ -487,7 +490,12 @@ capability; cancelling it must not abort unrelated active work. After consumptio
 its image quota and durable completion belong to the exact consuming run and
 cancellation domain. A trusted natural terminal settles each joined accepted
 prompt with its own correlation; confirmed queue removal settles that submission
-without waiting for an unrelated run. A transport diagnostic or delivery-record
+without waiting for an unrelated run. A deterministic cancellation receipt waits
+for that submission's durable terminal; persistence uncertainty remains uncertain
+on same-key replay. Confirmed queue residence suspends the terminal lease. Actual
+consumption or own-run promotion starts a fresh bounded lease, renewed only by
+attributable progress in the same consuming run and cancellation domain.
+A transport diagnostic or delivery-record
 expiry does not prove execution ended and cannot release accepted-image quota.
 Exact run terminal or session teardown releases retained image quota.
 
@@ -512,8 +520,11 @@ accepted turn count — including a running tool's partial-result `tool_executio
 long-running tool that streams output (e.g. a multi-minute compile) keeps renewing the lease mid-run;
 heartbeats, streaming text/thinking deltas, retries, other turns/sessions, and
 unrelated session noise do not renew the lease, and out-of-order delivery never shortens it. The
-hard maximum is never unbounded: every renewal is capped at `acceptedAt + sdk.promptMaxRuntimeMs` so a
-wedged or continuously noisy prompt still reaches a deterministic terminal outcome. Terminalization then has a fixed `10_000` ms
+hard maximum is never unbounded: every renewal is capped at the lease's start time plus
+`sdk.promptMaxRuntimeMs`. The lease begins at acceptance for a directly executing prompt;
+for confirmed queued input it is suspended during queue residence and begins again at
+actual consumption or own-run promotion, without changing the durable `acceptedAt`.
+A wedged or continuously noisy executing prompt still reaches a deterministic terminal outcome. Terminalization then has a fixed `10_000` ms
 grace period, which is not configurable. A controlled terminal failure reaches ACP
 as JSON-RPC `-32603` with `data.code` of `prompt_failed` or
 `prompt_deadline_exceeded`.
