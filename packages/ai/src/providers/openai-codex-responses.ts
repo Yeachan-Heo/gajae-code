@@ -1288,7 +1288,10 @@ function trySalvageCodexFinalizedToolCalls(
 			name: activeToolCall.name,
 			arguments: activeToolCall.arguments,
 		};
+		const rawPartialJson = activeToolCall.partialJson;
+		captureUnicodeEscapeEvidence(toolCall, rawPartialJson);
 		Object.assign(activeToolCall, toolCall);
+		captureUnicodeEscapeEvidence(activeToolCall, rawPartialJson);
 		delete (activeToolCall as { partialJson?: string }).partialJson;
 		delete (activeToolCall as { argumentsComplete?: boolean }).argumentsComplete;
 		runtime.finalizedToolCallIds.add(toolCall.id);
