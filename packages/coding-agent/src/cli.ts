@@ -10,6 +10,7 @@ import {
 	BASH_SHELL_SUPERVISOR_ARG,
 	BASH_SHELL_WORKER_ARG,
 } from "./exec/bash-shell-worker-protocol";
+import { runBrokerHopFromArgv } from "./sdk/broker/hop";
 import { runSdkStderrDrainerFromArgv } from "./sdk/broker/stderr-drainer";
 
 const MANAGED_OWNER_SUPERVISOR_ARG = "--internal-managed-owner-supervisor";
@@ -132,6 +133,10 @@ export async function runCli(argv: string[]): Promise<void> {
 			await completeManagedOwnerRecovery(admission.context);
 			return;
 		}
+	}
+	if (argv.length >= 2 && argv[0] === "internal" && argv[1] === "broker-hop") {
+		await runBrokerHopFromArgv(argv.slice(2));
+		return;
 	}
 	if (argv[0] === "sdk" && argv[1] === "stderr-drain-internal") {
 		// Private lifecycle stderr drainer: must stay ahead of the public sdk family

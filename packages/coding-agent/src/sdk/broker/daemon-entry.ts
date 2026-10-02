@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { type BrokerDiscovery, readBrokerDiscovery, readBrokerRestartIntent } from "./discovery";
-import { withBrokerStartupLock } from "./ensure";
+import { launchBrokerViaHop, resolveBrokerSpawnOptionsForProduction, withBrokerStartupLock } from "./ensure";
 import { observeProcessIncarnation } from "./process-incarnation";
 import { resolveSdkInternalSpawnCommand } from "./runtime";
 
@@ -64,12 +64,37 @@ export async function launchAuthorizedBrokerSuccessor(
 		const command = resolveSdkInternalSpawnCommand("broker-internal");
 		let child: ChildProcess;
 		try {
-			child = spawn(command.file, [...command.args, "--agent-dir", options.agentDir], {
-				detached: true,
-				stdio: "ignore",
-				env: { ...command.env, GJC_BROKER_RESTART_REQUEST: options.requestId },
-				...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
-			});
+			const brokerSpawnOpts = resolveBrokerSpawnOptionsForProduction(command.file, [
+				...command.args,
+				"--agent-dir",
+				options.agentDir,
+			]);
+			const env = { ...command.env, GJC_BROKER_RESTART_REQUEST: options.requestId };
+
+			let spawnError: Error | undefined;
+			if (process.platform === "win32") {
+				const launched = await launchBrokerViaHop(
+					{
+						command: { file: brokerSpawnOpts.file, args: brokerSpawnOpts.args },
+						...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
+					},
+					{ env, cwd: command.kind === "bun-source" ? command.cwd : undefined, deadlineMs: deadline },
+				);
+				child = launched.process;
+				spawnError = launched.error;
+			} else {
+				child = spawn(brokerSpawnOpts.file, brokerSpawnOpts.args, {
+					detached: true,
+					stdio: "ignore",
+					env,
+					...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
+				});
+				child.once("error", error => {
+					spawnError = error;
+				});
+			}
+			child.unref();
+			return { kind: "spawned" as const, child, spawnError: () => spawnError };
 		} catch (spawnError) {
 			return {
 				kind: "refused" as const,
@@ -77,12 +102,6 @@ export async function launchAuthorizedBrokerSuccessor(
 				detail: spawnError instanceof Error ? spawnError.message : String(spawnError),
 			};
 		}
-		let spawnError: Error | undefined;
-		child.once("error", childError => {
-			spawnError = childError;
-		});
-		child.unref();
-		return { kind: "spawned" as const, child, spawnError: () => spawnError };
 	});
 	if (spawnOutcome.kind !== "spawned") return spawnOutcome;
 	const { child } = spawnOutcome;
@@ -94,8 +113,11 @@ export async function launchAuthorizedBrokerSuccessor(
 				reason: "spawn_failed",
 				detail: spawnOutcome.spawnError()?.message,
 			};
-		if (child.exitCode !== null || child.signalCode !== null)
-			return { kind: "refused", reason: "spawn_exited_before_publication" };
+		// Break the poll loop only on spawn error or actual failure (signal or non-zero exit).
+		// The detached broker runs independently after spawn.
+		const failedSpawn =
+			spawnOutcome.spawnError() || child.signalCode !== null || (child.exitCode !== null && child.exitCode !== 0);
+		if (failedSpawn) return { kind: "refused", reason: "spawn_exited_before_publication" };
 		const discovered = await readBrokerDiscovery(options.agentDir);
 		if (
 			discovered &&

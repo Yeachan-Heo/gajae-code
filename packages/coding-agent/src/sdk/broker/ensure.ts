@@ -11,9 +11,11 @@ import { type BrokerStartupExitRecord, clearBrokerStartupExitRecord, readBrokerS
 import {
 	type BrokerDiscovery,
 	brokerProcessIncarnation,
+	isPidAlive,
 	readBrokerDiscovery,
 	readBrokerRestartIntent,
 } from "./discovery";
+import { observeProcessIncarnation } from "./process-incarnation";
 import {
 	isSdkInternalRuntimeImagePresent,
 	resolveSdkInternalSpawnCommand,
@@ -26,6 +28,180 @@ import {
 	clearBrokerStartupFailureMarker,
 	readBrokerStartupFailureMarker,
 } from "./startup-failure";
+
+/**
+ * Result of spawning a broker via hop (Windows) or direct (POSIX).
+ * On Windows, the hop writes the real broker's pid to stdout as JSON.
+ * On POSIX, the child process is the real broker.
+ */
+export interface BrokerSpawnResult {
+	/** The hop or broker process. On Windows, this exits immediately; on POSIX, this is the broker. */
+	process: ChildProcess;
+	/** The real broker's pid (from hop stdout on Windows, or child.pid on POSIX). */
+	realBrokerPid: number | undefined;
+	/** On Windows only: the parsed hop response if available. */
+	hopResponse?: { pid: number };
+}
+
+/**
+ * Typed error returned when a Windows broker hop fails.
+ * The hop is mandatory on Windows for broker detachment; failure is unrecoverable.
+ */
+export class BrokerHopError extends Error {
+	readonly code = "broker_hop_failed";
+	readonly hopExitCode: number | null;
+	readonly hopStdout: string;
+	readonly reason: string;
+
+	constructor(fields: { exitCode: number | null; stdout: string; reason: string }) {
+		super(`Windows broker hop failed: ${fields.reason}`);
+		this.name = "BrokerHopError";
+		this.hopExitCode = fields.exitCode;
+		this.hopStdout = fields.stdout;
+		this.reason = fields.reason;
+	}
+}
+
+/**
+ * On Windows, spawn a hop process that will spawn the real broker with detached:true.
+ * On POSIX, spawn the broker directly with detached:true.
+ *
+ * The hop design allows the Windows broker to survive parent termination because the
+ * hop exits immediately after spawning the broker, breaking the process tree chain.
+ * Without the hop, a broker spawned with detached:true is still killed by taskkill /T /F
+ * because it walks ParentProcessId even for detached processes.
+ */
+function resolveBrokerSpawnOptions(file: string, args: readonly string[]): { file: string; args: string[] } {
+	return { file, args: Array.from(args) };
+}
+
+/**
+ * Resolve the hop invocation command for the current runtime (source or compiled).
+ * Returns the executable path and arguments to spawn the hop process.
+ */
+function resolveHopInvocation(hopMessage: string): { file: string; args: string[] } {
+	const brokerCmd = resolveSdkInternalSpawnCommand("broker-internal");
+	if (brokerCmd.kind === "bun-source") {
+		// Source mode: args are ["--no-env-file", "--config=...", cli.ts, "sdk", "broker-internal"]
+		// Replace the last two with ["internal", "broker-hop", hopMessage]
+		const args = [...brokerCmd.args.slice(0, -2), "internal", "broker-hop", hopMessage];
+		return { file: brokerCmd.file, args };
+	} else {
+		// Compiled mode: file is gjc executable
+		return { file: brokerCmd.file, args: ["internal", "broker-hop", hopMessage] };
+	}
+}
+
+/**
+ * Spawn the broker, using a hop on Windows or direct spawn on POSIX.
+ * Returns the spawned process and the real broker's pid.
+ */
+function spawnBrokerWithHop(
+	brokerFile: string,
+	brokerArgs: readonly string[],
+	options: {
+		stdioFd?: number;
+		env: NodeJS.ProcessEnv;
+		cwd?: string;
+	},
+): BrokerSpawnResult {
+	// POSIX: spawn the broker directly with detached:true.
+	const child = spawn(brokerFile, Array.from(brokerArgs), {
+		detached: true,
+		stdio: ["ignore", "ignore", options.stdioFd ?? "ignore"],
+		env: options.env,
+		...(options.cwd ? { cwd: options.cwd } : {}),
+	});
+	return { process: child, realBrokerPid: child.pid };
+}
+
+/** What the parent sends the Windows hop. The broker environment is never serialized here. */
+export interface BrokerHopMessage {
+	command: { file: string; args: string[] };
+	cwd?: string;
+	/** Path (never an inherited fd number) the hop opens for the broker's stderr. */
+	stderrLogPath?: string;
+}
+
+export interface BrokerHopLaunch {
+	process: ChildProcess;
+	realBrokerPid: number | undefined;
+	error: Error | undefined;
+}
+
+/**
+ * Windows only: launch the broker through the internal hop and await its reply.
+ *
+ * `taskkill /T /F` walks ParentProcessId, so a broker spawned directly by the client
+ * dies with it even when detached. The hop spawns the broker and exits at once,
+ * leaving the broker without a live parent in the client's tree. The broker
+ * environment reaches the hop as its own process environment (the broker inherits
+ * it), never on the command line, and stderr is passed as a path because a parent
+ * fd number does not exist inside the hop.
+ */
+export async function launchBrokerViaHop(
+	message: BrokerHopMessage,
+	options: { env: NodeJS.ProcessEnv; cwd?: string; deadlineMs?: number },
+): Promise<BrokerHopLaunch> {
+	const hopCmd = resolveHopInvocation(JSON.stringify(message));
+	const hop = spawn(hopCmd.file, hopCmd.args, {
+		detached: false,
+		windowsHide: true,
+		stdio: ["ignore", "pipe", "pipe"],
+		env: options.env,
+		...(options.cwd ? { cwd: options.cwd } : {}),
+	});
+	let stdout = "";
+	hop.stdout?.on("data", chunk => {
+		stdout += chunk.toString();
+	});
+	hop.stderr?.resume();
+	const { promise: hopCompletion, resolve } = Promise.withResolvers<{ code: number | null; spawnError?: Error }>();
+	hop.once("error", spawnError => resolve({ code: null, spawnError }));
+	hop.once("close", code => resolve({ code }));
+
+	let outcome: { code: number | null; spawnError?: Error };
+	if (options.deadlineMs !== undefined && options.deadlineMs > 0) {
+		const remainingMs = Math.max(0, options.deadlineMs - Date.now());
+		const timeoutPromise = new Promise<{ code: number | null; spawnError?: Error }>(timeoutResolve => {
+			const timer = setTimeout(() => {
+				hop.kill();
+				timeoutResolve({ code: null, spawnError: new Error("broker hop timeout") });
+			}, remainingMs);
+			hopCompletion.finally(() => clearTimeout(timer));
+		});
+		outcome = await Promise.race([hopCompletion, timeoutPromise]);
+	} else {
+		outcome = await hopCompletion;
+	}
+	return { process: hop, ...parseBrokerHopReply(outcome.code, stdout, outcome.spawnError) };
+}
+
+/** Parses the hop's single-line `{"pid":N}` reply into a broker pid or a typed error. */
+export function parseBrokerHopReply(
+	code: number | null,
+	stdout: string,
+	spawnError?: Error,
+): { realBrokerPid: number | undefined; error: Error | undefined } {
+	const fail = (reason: string) => ({
+		realBrokerPid: undefined,
+		error: new BrokerHopError({ exitCode: code, stdout, reason }),
+	});
+	if (spawnError) return fail(`hop could not be spawned: ${spawnError.message}`);
+	if (code !== 0) return fail(`hop process exited with non-zero code ${code}`);
+	const line = stdout.trim();
+	if (!line) return fail("hop exited with code 0 but no response on stdout");
+	let reply: unknown;
+	try {
+		reply = JSON.parse(line);
+	} catch (error) {
+		return fail(`failed to parse hop JSON response: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	const pid = (reply as { pid?: unknown } | null)?.pid;
+	if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0)
+		return fail(`hop response missing or invalid pid: ${String(pid)}`);
+	return { realBrokerPid: pid, error: undefined };
+}
 
 function resolveExpectedBrokerGeneration(): string {
 	const v = (packageJson as { version?: unknown }).version;
@@ -404,12 +580,24 @@ const DEFAULT_REAP_TIMING: ReapTiming = {
  * teardown (e.g. a transient signal-delivery failure); that is diagnostic only
  * and never counts as exit, so the escalation cannot be skipped mid-shutdown.
  */
-async function reapSpawnedBroker(child: ChildProcess, timing: ReapTiming = DEFAULT_REAP_TIMING): Promise<void> {
+async function reapSpawnedBroker(
+	child: ChildProcess,
+	realBrokerPid?: number,
+	brokerIncarnation?: string,
+	timing: ReapTiming = DEFAULT_REAP_TIMING,
+): Promise<void> {
+	// On Windows with hop, realBrokerPid is the actual broker process to reap.
+	// On POSIX or when realBrokerPid is undefined, child is the actual broker to reap.
+	const pidToReap = realBrokerPid ?? child.pid;
 	// A spawn failure (e.g. ENOENT) never created a kernel process: pid is
 	// undefined and there is nothing to signal or await. The `error` event is the
 	// only signal and is diagnostic here — termination trivially holds, so do not
 	// run out the TERM/KILL windows or report a stuck child that never existed.
-	if (child.pid === undefined) return;
+	if (pidToReap === undefined) return;
+	if (pidToReap !== child.pid) {
+		await reapDetachedBrokerPid(pidToReap, brokerIncarnation, timing);
+		return;
+	}
 	// Reaping owns repeated teardown diagnostics too. Keep exactly one error
 	// listener for the retained child so a later signal-delivery error cannot
 	// become an unhandled EventEmitter error after the spawn listener is consumed.
@@ -450,28 +638,80 @@ async function reapSpawnedBroker(child: ChildProcess, timing: ReapTiming = DEFAU
 	if (hasExited()) return;
 	// SIGKILL is uninterruptible; a child still alive past this bounded wait is a
 	// kernel-level stuck state. Surface it rather than silently orphaning the spawn.
-	throw new Error(`Detached SDK broker (pid ${child.pid}) did not exit after SIGKILL during reap.`);
+	throw new Error(`Detached SDK broker (pid ${pidToReap}) did not exit after SIGKILL during reap.`);
+}
+
+/**
+ * Reap a broker this process launched through the Windows hop. The hop has already
+ * exited, so its ChildProcess carries no signal to await: the real broker is targeted
+ * by the pid the hop reported, and exit is proven by the pid no longer existing.
+ * On Windows, verify the pid still names the original broker (not a recycled pid)
+ * by checking its incarnation before signaling.
+ */
+async function reapDetachedBrokerPid(
+	pid: number,
+	brokerIncarnation?: string,
+	timing: ReapTiming = DEFAULT_REAP_TIMING,
+): Promise<void> {
+	const awaitGone = async (windowMs: number): Promise<boolean> => {
+		const deadline = Date.now() + windowMs;
+		while (isPidAlive(pid)) {
+			if (Date.now() >= deadline) return false;
+			await sleep(Math.min(20, Math.max(1, deadline - Date.now())));
+		}
+		return true;
+	};
+	const signal = (sig: NodeJS.Signals): void => {
+		try {
+			process.kill(pid, sig);
+		} catch {
+			// already exited between the liveness check and the kill
+		}
+	};
+	if (!isPidAlive(pid)) return;
+	// On Windows, verify incarnation before signaling to avoid killing a recycled pid.
+	// If incarnation doesn't match or is unknown, treat it as already exited.
+	if (brokerIncarnation) {
+		const observation = observeProcessIncarnation(pid);
+		if (observation.status !== "present" || observation.incarnation !== brokerIncarnation) {
+			return; // Process is gone, unknown, or pid was recycled
+		}
+	}
+	signal("SIGTERM");
+	if (await awaitGone(timing.gracefulMs)) return;
+	signal("SIGKILL");
+	if (await awaitGone(timing.killVerifyMs)) return;
+	throw new Error(`Detached SDK broker (pid ${pid}) did not exit after SIGKILL during reap.`);
 }
 
 function registerBrokerOwner(
 	agentDir: string,
 	child: ChildProcess,
+	realBrokerPid: number | undefined,
+	brokerIncarnation: string | undefined,
 	timing: ReapTiming = DEFAULT_REAP_TIMING,
 ): BrokerOwner {
-	const incarnation = child.pid === undefined ? undefined : brokerProcessIncarnation(child.pid);
+	// On Windows, child is the hop process which exits immediately after spawning the real broker.
+	// The real broker publishes its own pid in the discovery (realBrokerPid from hop stdout).
+	// On other platforms, child is the actual broker, and its pid is the real broker pid.
+	const expectedBrokerPid = realBrokerPid ?? child.pid;
+	const expectedBrokerIncarnation = brokerIncarnation;
 	let state: "starting" | "ready" | "cleanup-unverified" = "starting";
-	const matches = (discovery: BrokerDiscovery | null): boolean =>
-		Boolean(
-			discovery &&
-				child.pid !== undefined &&
-				incarnation &&
-				discovery.pid === child.pid &&
-				discovery.incarnation === incarnation,
+	const matches = (discovery: BrokerDiscovery | null): boolean => {
+		if (!discovery) return false;
+		// On Windows, verify the discovery matches the real broker pid from the hop.
+		// On other platforms, verify the discovery comes from the child we spawned.
+		return Boolean(
+			expectedBrokerPid !== undefined &&
+				expectedBrokerIncarnation &&
+				discovery.pid === expectedBrokerPid &&
+				discovery.incarnation === expectedBrokerIncarnation,
 		);
+	};
 	const owner: BrokerOwner = {
 		async stop(): Promise<void> {
 			try {
-				await reapSpawnedBroker(child, timing);
+				await reapSpawnedBroker(child, expectedBrokerPid, expectedBrokerIncarnation, timing);
 			} catch (error) {
 				state = "cleanup-unverified";
 				throw error;
@@ -694,25 +934,55 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		await clearBrokerStartupExitRecord(settings.agentDir);
 		await clearBrokerStartupFailureMarker(settings.agentDir);
 		const childSpawnedAt = Date.now();
-		const child = spawn(command.file, [...command.args, "--agent-dir", settings.agentDir], {
-			detached: true,
-			stdio: ["ignore", "ignore", spawnLog ? spawnLog.handle.fd : "ignore"],
-			env: brokerSpawnEnvironment(command, settings.env),
-			...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
-		});
+		const brokerSpawnOpts = resolveBrokerSpawnOptions(command.file, [
+			...command.args,
+			"--agent-dir",
+			settings.agentDir,
+		]);
+		const env = brokerSpawnEnvironment(command, settings.env);
+		let spawnResult: BrokerSpawnResult;
 		let spawnError: Error | undefined;
-		child.once("error", error => {
-			spawnError = error;
-		});
-		const childIncarnation = child.pid === undefined ? undefined : brokerProcessIncarnation(child.pid);
-		const owner = registerBrokerOwner(settings.agentDir, child);
+
+		if (process.platform === "win32") {
+			const launched = await launchBrokerViaHop(
+				{
+					command: { file: brokerSpawnOpts.file, args: brokerSpawnOpts.args },
+					...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
+					...(spawnLog ? { stderrLogPath: spawnLog.path } : {}),
+				},
+				{ env, cwd: command.kind === "bun-source" ? command.cwd : undefined, deadlineMs: deadline },
+			);
+			spawnResult = { process: launched.process, realBrokerPid: launched.realBrokerPid };
+			spawnError = launched.error;
+		} else {
+			spawnResult = spawnBrokerWithHop(brokerSpawnOpts.file, brokerSpawnOpts.args, {
+				stdioFd: spawnLog?.handle.fd,
+				env,
+				cwd: command.kind === "bun-source" ? command.cwd : undefined,
+			});
+			spawnResult.process.once("error", error => {
+				spawnError = error;
+			});
+		}
+
+		const child = spawnResult.process;
+		const realBrokerPid = spawnResult.realBrokerPid;
+		const childIncarnation = realBrokerPid === undefined ? undefined : brokerProcessIncarnation(realBrokerPid);
+		const owner = registerBrokerOwner(settings.agentDir, child, realBrokerPid, childIncarnation);
 		child.unref();
 		// The child holds its own duplicate of the descriptor. Failure to close the
 		// parent's diagnostic handle must not discard exact ownership of a live child.
 		await spawnLog?.handle.close().catch(() => undefined);
 		let discoveryError: unknown;
 		while (ensureBrokerTiming.now() < deadline) {
-			if (spawnError || child.exitCode !== null || child.signalCode !== null) break;
+			// On Windows, child is the hop process which exits immediately with code 0 after
+			// spawning the real broker with detached:true. Do not break the poll loop on a
+			// clean exit (code 0); break only on spawn error or actual failure (signal
+			// or non-zero exit). This allows discovery polling to continue through the
+			// normal deadline while the real broker starts and publishes.
+			const failedSpawn =
+				spawnError || child.signalCode !== null || (child.exitCode !== null && child.exitCode !== 0);
+			if (failedSpawn) break;
 			try {
 				const discovered = await readBrokerDiscoveryBeforeDeadline(
 					settings.agentDir,
@@ -738,43 +1008,25 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 			await ensureBrokerTiming.sleep(50);
 		}
 		const exitedBeforeDiscovery = child.exitCode !== null || child.signalCode !== null;
-		if (exitedBeforeDiscovery && child.exitCode === 0) {
-			// A clean exit means another broker won the ownership lock (two ACP
-			// processes racing a cold broker state, e.g. a provider probe and an
-			// agent launch). The winner may publish its discovery right after our
-			// last poll; reuse it instead of failing the caller. Transient discovery
-			// read failures fall through to the common cleanup + failure path below.
-			try {
-				for (let retry = 0; retry < 20; retry++) {
-					const winner = await readBrokerDiscoveryBeforeDeadline(
-						settings.agentDir,
-						settings.heartbeatTtlMs,
-						deadline,
-					);
-					if (winner && (await isBrokerReusable(winner))) {
-						await owner.stop();
-						return { kind: "external-discovery", discovery: winner };
-					}
-					await ensureBrokerTiming.sleep(50);
-				}
-			} catch {
-				// fall through to cleanup + failure
-			}
-		}
 		const marker = await readBrokerStartupFailureMarker(settings.agentDir);
 		const startupExitRecord = await readBrokerStartupExitRecord(settings.agentDir);
+		// On Windows with hop: child is the hop process which exits immediately,
+		// and realBrokerPid is read from hop stdout. The real broker writes the marker/exit
+		// record with its own pid.
+		// On POSIX: child is the real broker, and child.pid is used for validation.
 		const trustedMarker =
 			marker &&
-			child.pid !== undefined &&
 			childIncarnation !== undefined &&
-			marker.pid === child.pid &&
-			marker.incarnation === childIncarnation
+			realBrokerPid !== undefined &&
+			marker.pid === realBrokerPid &&
+			marker.incarnation === childIncarnation &&
+			marker.writtenAt >= childSpawnedAt
 				? marker
 				: undefined;
 		const trustedStartupExitRecord =
 			startupExitRecord &&
-			child.pid !== undefined &&
-			startupExitRecord.pid === child.pid &&
+			realBrokerPid !== undefined &&
+			startupExitRecord.pid === realBrokerPid &&
 			startupExitRecord.writtenAt >= childSpawnedAt
 				? startupExitRecord
 				: undefined;
@@ -887,12 +1139,16 @@ export function startFixtureBrokerWithLeaseForTest(settings: EnsureBrokerSetting
  * Test-only launch surface for topology fixtures. It accepts an already-resolved
  * command and retains the exact spawned child; no production selection path
  * reaches this function.
+ *
+ * Note: This function does NOT use the Windows broker hop. Fixtures are test-only
+ * and do not require Windows process-tree detachment; the fixture needs to retain
+ * exact ownership of the actual broker process to control its stdio[3] control pipe.
  */
 export function startFixtureBrokerCommandWithLeaseForTest(command: FixtureBrokerCommand): StartedFixtureBrokerCommand {
 	if (!command.file || !Array.isArray(command.args)) throw new Error("Invalid fixture broker command.");
-	const child = spawn(command.file, [...command.args], {
+	const child = spawn(command.file, command.args, {
 		cwd: command.cwd,
-		detached: true,
+		detached: process.platform !== "win32",
 		stdio: ["ignore", "ignore", "ignore", "pipe"],
 		env: command.env,
 	});
@@ -942,8 +1198,13 @@ export function brokerOwnerIdentityMatchesForTest(
 	return sameBrokerOwner(left, right);
 }
 /** Test hook: drives the detached-broker reap on a controllable child surface. */
-export function reapSpawnedBrokerForTest(child: ChildProcess, timing: ReapTiming = DEFAULT_REAP_TIMING): Promise<void> {
-	return reapSpawnedBroker(child, timing);
+export function reapSpawnedBrokerForTest(
+	child: ChildProcess,
+	realBrokerPid?: number,
+	brokerIncarnation?: string,
+	timing: ReapTiming = DEFAULT_REAP_TIMING,
+): Promise<void> {
+	return reapSpawnedBroker(child, realBrokerPid, brokerIncarnation, timing);
 }
 /** Test hook: resolves the complete broker environment without spawning. */
 export function brokerSpawnEnvironmentForTest(
@@ -956,12 +1217,24 @@ export function brokerSpawnEnvironmentForTest(
 export function registerBrokerOwnerForTest(
 	agentDir: string,
 	child: ChildProcess,
+	realBrokerPid?: number,
+	brokerIncarnation?: string,
 	timing: ReapTiming = DEFAULT_REAP_TIMING,
 ): BrokerOwner {
-	return registerBrokerOwner(agentDir, child, timing);
+	return registerBrokerOwner(agentDir, child, realBrokerPid, brokerIncarnation, timing);
 }
 
 /** Test hook: exercises the same trusted-marker reason reconstruction used by ensureBroker. */
 export function brokerStartupFailureReasonForTest(marker: BrokerStartupFailureMarker | undefined): string {
 	return brokerStartupFailureReason(marker);
+}
+/**
+ * Resolves broker spawn options. Always returns the command unchanged,
+ * using direct spawning on all platforms.
+ */
+export function resolveBrokerSpawnOptionsForProduction(
+	file: string,
+	args: readonly string[],
+): { file: string; args: string[] } {
+	return resolveBrokerSpawnOptions(file, args);
 }
