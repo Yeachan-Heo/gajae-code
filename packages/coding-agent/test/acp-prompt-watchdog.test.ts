@@ -163,6 +163,7 @@ type FixtureOptions = {
 	cancelSettlementGraceMs?: number;
 	preflightCancelAcknowledgement?: boolean;
 	deferCancelAcknowledgement?: boolean;
+	noActiveTurnAbort?: boolean;
 	imageEchoGate?: { started: () => void; release: Promise<void> };
 };
 
@@ -375,6 +376,13 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 						: frame.operation === "turn.abort"
 							? (() => {
 									const scope = (frame.input as { scope?: string })?.scope === "owned" ? "owned" : "turn";
+									if (options.noActiveTurnAbort)
+										return {
+											ok: true,
+											selection: scope,
+											turn: "no_active_turn",
+											terminal: "terminal_no_effect",
+										};
 									return {
 										ok: true,
 										selection: scope,
@@ -754,7 +762,10 @@ test("cancelling before image echo completes settles locally without aborting a 
 test("a successor behind an already-settled cancelled image echo is cancellable before the echo clears", async () => {
 	const echoStarted = Promise.withResolvers<void>();
 	const echoGate = Promise.withResolvers<void>();
-	const fixture = await createFixture({ imageEchoGate: { started: echoStarted.resolve, release: echoGate.promise } });
+	const fixture = await createFixture({
+		noActiveTurnAbort: true,
+		imageEchoGate: { started: echoStarted.resolve, release: echoGate.promise },
+	});
 	try {
 		const image = Buffer.from(
 			await Bun.file(path.join(import.meta.dir, "fixtures/sdk-inline-image-large.png")).arrayBuffer(),
@@ -771,6 +782,7 @@ test("a successor behind an already-settled cancelled image echo is cancellable 
 		const cancellation = fixture.agent.cancel({ sessionId: fixture.sessionId });
 		await bounded(cancellation, "cancel pending successor admission");
 		expect(await bounded(successor, "cancelled pending successor")).toEqual({ stopReason: "cancelled" });
+		expect(fixture.abortCount()).toBe(0);
 		expect(fixture.promptDeliveryCount()).toBe(0);
 		expect(fixture.imageUploadCount()).toBe(0);
 

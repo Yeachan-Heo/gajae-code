@@ -2658,13 +2658,37 @@ export class AcpAgent implements Agent {
 		const { promise: uploadStopped, resolve: stopUpload } = Promise.withResolvers<void>();
 		waiter.uploadAbort.signal.addEventListener("abort", () => stopUpload(undefined), { once: true });
 		const stagedIds = new Set<string>();
-		const discardStaged = () => {
-			for (const id of stagedIds) {
-				stagedIds.delete(id);
-				void record.adapter.uploadImageDiscard(id).catch(() => undefined);
+		const discardImage = async (id: string): Promise<boolean> => {
+			try {
+				await record.adapter.uploadImageDiscard(id);
+				return true;
+			} catch (error) {
+				const code =
+					error instanceof SdkClientError || error instanceof AcpSdkAdapterError ? error.code : "unknown";
+				if (code === "resource_gone") return true;
+				// A failed or uncertain cleanup stays host-owned until its fixed lease expires
+				// or the connection closes. Preserve evidence without exposing image payloads.
+				logger.warn("acp_image_discard_failed", {
+					sessionId: params.sessionId,
+					code: /^[a-z][a-z0-9_]{0,63}$/.test(code) ? code : "unknown",
+				});
+				return false;
 			}
 		};
-		waiter.uploadAbort.signal.addEventListener("abort", discardStaged, { once: true });
+		const discardStaged = async (): Promise<boolean> => {
+			const pending = [...stagedIds].map(id => {
+				stagedIds.delete(id);
+				return discardImage(id);
+			});
+			return (await Promise.all(pending)).every(confirmed => confirmed);
+		};
+		waiter.uploadAbort.signal.addEventListener(
+			"abort",
+			() => {
+				void discardStaged();
+			},
+			{ once: true },
+		);
 		// A request already on the wire cannot be cancelled. Fence each subsequent step
 		// and discard a late begin response instead of leaking its host lease.
 		const whileActive = async <T>(task: Promise<T>): Promise<T> => {
@@ -2692,7 +2716,7 @@ export class AcpAgent implements Agent {
 							id &&
 							(promptWaiterRetired(record, waiter) || waiter.uploadAbort.signal.aborted)
 						)
-							void record.adapter.uploadImageDiscard(id).catch(() => undefined);
+							void discardImage(id);
 					},
 					() => undefined,
 				);
@@ -2937,9 +2961,10 @@ export class AcpAgent implements Agent {
 					// The rejected attempt owns no host execution. Cancellation while waiting or
 					// restaging must stay local rather than abort an unrelated active run.
 					waiter.dispatched = false;
-					// Busy is a confirmed response after one-shot host redemption. Retire those ids
-					// immediately so cancellation during the idle wait never discards consumed refs.
-					if (stageImages) stagedIds.clear();
+					// Capacity rejection can precede one-shot redemption. Retire old references
+					// before restaging; only acknowledged discard/already-gone proves cleanup.
+					if (stageImages && !(await whileActive(discardStaged())))
+						throw new AcpSdkAdapterError("image_cleanup_failed", "Image staging cleanup was not confirmed.");
 					if (
 						record.activePrompt !== waiter ||
 						waiter.settled ||
@@ -3264,10 +3289,15 @@ export class AcpAgent implements Agent {
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
 		// Record the client's intent before awaiting the SDK so a prompt that rejects
 		// mid-cancel (e.g. preflight `busy`) can still settle as `cancelled`.
+		const pendingAdmission = record.pendingPromptAdmission;
 		record.cancelRequested = true;
 		const localCommand = !record.activePrompt && record.pendingPromptAdmission?.localCommand === true;
 		this.#settlePendingPromptAdmission(record, { kind: "cancelled" });
 		const waiter = record.activePrompt;
+		if (pendingAdmission && !waiter) {
+			record.cancelRequested = false;
+			return;
+		}
 		waiter?.uploadAbort.abort();
 		// A reentrant cancel inside socket.send cannot decide whether the frame was
 		// accepted until onDispatch or the synchronous send failure is observed.
