@@ -205,6 +205,7 @@ import {
 	loadProjectContextFilesResult as loadContextFilesResultInternal,
 } from "../system-prompt";
 import { AgentOutputManager } from "../task/output-manager";
+import type { TaskScopeAuthority } from "../task/scope";
 import { parseThinkingLevel, resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
 import { isMCPBridgeTool, selectRestorableDiscoveredBuiltinToolNames } from "../tool-discovery/tool-index";
 import {
@@ -2854,10 +2855,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 		};
 
-		const toolSession: ToolSession = {
+		const toolSession: ToolSession & TaskScopeAuthority = {
 			get cwd() {
 				return sessionManager.getCwd();
 			},
+			getTaskScopeIdentity: () => ({
+				cwd: sessionManager.getCwd(),
+				generation: sessionManager.getCwdGeneration(),
+			}),
+			runWithTaskAdmission: admit => sessionManager.runWithCwdReadLease(admit),
 			hasUI: options.hasUI ?? false,
 			profileAuthority,
 			workflowGateEligible: true,

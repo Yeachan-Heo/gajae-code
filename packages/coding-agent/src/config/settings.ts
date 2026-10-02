@@ -1104,6 +1104,28 @@ export class Settings implements NotificationSettingsReader {
 		if (saveError !== undefined) throw saveError;
 	}
 
+	/** Copy execution settings without reloading, persisting, or sharing mutable layers. */
+	snapshot(): Settings {
+		const cloned = new Settings({ cwd: this.#cwd, agentDir: this.#agentDir, inMemory: true });
+		cloned.#global = structuredClone(this.#global);
+		cloned.#project = structuredClone(this.#project);
+		cloned.#overrides = structuredClone(this.#overrides);
+		cloned.#merged = structuredClone(this.#merged);
+		cloned.#schemaReport = structuredClone(this.#schemaReport);
+		cloned.#autoroutingEffective = structuredClone(this.#autoroutingEffective);
+		cloned.#autoroutingLocalIssues = structuredClone(this.#autoroutingLocalIssues);
+		cloned.#schemaMigrationPending = this.#schemaMigrationPending;
+		cloned.#futureSchemaVersion = this.#futureSchemaVersion;
+		cloned.#hasMalformedConfigRoot = this.#hasMalformedConfigRoot;
+		cloned.#hasRecoveredConfigSyntax = this.#hasRecoveredConfigSyntax;
+		cloned.#hasInvalidNotificationGlobal = this.#hasInvalidNotificationGlobal;
+		cloned.#notificationValidationGeneration = this.#notificationValidationGeneration;
+		cloned.#rawNotificationConfig = structuredClone(this.#rawNotificationConfig);
+		cloned.#durableRawNotificationConfig = structuredClone(this.#durableRawNotificationConfig);
+		cloned.#durableNotificationFingerprint = this.#durableNotificationFingerprint;
+		return cloned;
+	}
+
 	async cloneForCwd(cwd: string): Promise<Settings> {
 		// A clone shares the same config queue. Settle an already-reserved local
 		// debounce before the clone can enqueue a durable selector, preventing it

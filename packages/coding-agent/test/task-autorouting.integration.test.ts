@@ -356,7 +356,7 @@ describe("TaskTool autorouting integration surfaces", () => {
 		expect(result.content[0]?.type).toBe("text");
 		expect(JSON.stringify(result)).not.toContain('"routing"');
 	});
-	it("registered resume runner recomputes a fresh route and marks freshOnResume", async () => {
+	it("registered resume runner keeps admitted settings while new admissions refresh routing", async () => {
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents, projectAgentsDir: null });
 		const settings = Settings.isolated({
 			"task.autorouting.enabled": true,
@@ -400,8 +400,14 @@ describe("TaskTool autorouting integration surfaces", () => {
 		expect(captured.at(-1)?.runMode).toBe("resume");
 		expect(captured.at(-1)?.routing).toMatchObject({
 			freshOnResume: true,
-			effectiveModel: "anthropic/claude-opus-5",
+			effectiveModel: "anthropic/claude-haiku-4-5",
 		});
+		await tool.execute("new-settings", {
+			agent: "task",
+			tasks: [{ id: "Fresh", description: "fresh", assignment: "run", tier: "fast" }],
+		} as never);
+		await AsyncJobManager.instance()!.waitForAll();
+		expect(captured.at(-1)?.routing).toMatchObject({ effectiveModel: "anthropic/claude-opus-5" });
 	});
 
 	it("cancelled placeholders preserve routed synthetic evidence", () => {
