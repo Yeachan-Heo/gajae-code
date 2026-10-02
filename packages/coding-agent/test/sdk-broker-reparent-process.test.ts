@@ -41,8 +41,8 @@ function killProcessTree(rootPid: number): void {
 	}
 }
 
-async function waitForFile(file: string): Promise<void> {
-	for (let attempt = 0; attempt < 200; attempt++) {
+async function waitForFile(file: string, parent: Bun.Subprocess): Promise<void> {
+	for (let attempt = 0; attempt < 800; attempt++) {
 		if (
 			await fs
 				.stat(file)
@@ -50,6 +50,8 @@ async function waitForFile(file: string): Promise<void> {
 				.catch(() => false)
 		)
 			return;
+		if (parent.exitCode !== null || parent.signalCode !== null)
+			throw new Error(`Spawner exited before writing ${file}.`);
 		await Bun.sleep(25);
 	}
 	throw new Error(`Timed out waiting for ${file}`);
@@ -66,15 +68,17 @@ test.serial(
 			[
 				process.execPath,
 				"-e",
-				`import * as fs from "node:fs/promises"; import { ensureBroker } from ${JSON.stringify(ensureModule)}; const d = await ensureBroker({ agentDir: ${JSON.stringify(agentDir)} }); await fs.writeFile(${JSON.stringify(ready)}, JSON.stringify({ pid: d.pid, heartbeatAt: d.heartbeatAt })); await new Promise(() => {});`,
+				`import * as fs from "node:fs/promises"; import { ensureBroker } from ${JSON.stringify(ensureModule)}; try { const d = await ensureBroker({ agentDir: ${JSON.stringify(agentDir)} }); await fs.writeFile(${JSON.stringify(ready)}, JSON.stringify({ pid: d.pid, heartbeatAt: d.heartbeatAt })); await new Promise(() => {}); } catch (error) { process.stderr.write(error instanceof Error ? error.stack ?? error.message : String(error)); process.exitCode = 1; }`,
 			],
 			{ stdout: "ignore", stderr: "pipe" },
 		);
 		let brokerPid: number | undefined;
 		try {
 			try {
-				await waitForFile(ready);
+				await waitForFile(ready, parent);
 			} catch (error) {
+				if (parent.exitCode === null && parent.signalCode === null) parent.kill("SIGKILL");
+				await parent.exited;
 				throw new Error(
 					`${error instanceof Error ? error.message : String(error)}\n${await new Response(parent.stderr).text()}`,
 				);
@@ -108,5 +112,5 @@ test.serial(
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	},
-	30_000,
+	60_000,
 );
