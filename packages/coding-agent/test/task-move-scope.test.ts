@@ -16,7 +16,7 @@ import { SessionManager } from "../src/session/session-manager";
 import { AgentOutputManager, TaskTool } from "../src/task";
 import type { ExecutorOptions } from "../src/task/executor";
 import type { TaskScopeAuthority } from "../src/task/scope";
-import type { SingleResult, TaskItem } from "../src/task/types";
+import type { SingleResult, TaskItem, TaskToolSchemaInstance } from "../src/task/types";
 import type { Tool, ToolSession } from "../src/tools";
 import { BUILTIN_TOOL_DESCRIPTORS, LazyAgentTool } from "../src/tools/descriptors";
 
@@ -51,6 +51,14 @@ async function harness(isolated = false) {
 		await fs.mkdir(path.join(cwd!, ".gjc", "agents"), { recursive: true });
 		await Bun.write(path.join(cwd!, "marker.txt"), marker!);
 		await Bun.write(path.join(cwd!, "AGENTS.md"), `Original ${marker} instructions`);
+		await Bun.write(
+			path.join(cwd!, ".gjc", "prompts", "scope-template.md"),
+			`---\ndescription: ${marker} template\n---\nTemplate ${marker} instructions.`,
+		);
+		await Bun.write(
+			path.join(cwd!, ".gjc", "skills", "scope-skill", "SKILL.md"),
+			`---\nname: scope-skill\ndescription: ${marker} skill\n---\nSkill ${marker} instructions.`,
+		);
 		await Bun.write(path.join(cwd!, ".gjc", "config.yml"), "task:\n  maxConcurrency: 1\n");
 		await Bun.write(
 			path.join(cwd!, ".gjc", "agents", "scope-probe.md"),
@@ -222,6 +230,29 @@ describe("task admission after trusted committed moves", () => {
 			expect(await Bun.file(path.join(h.artifacts.dir, `${last.id}.md`)).text()).toBe("B");
 		});
 	}
+
+	it("updates an unused discovery facade without materializing it or changing parent settings", async () => {
+		const h = await harness();
+		h.targetSettings.override("task.simple", "independent");
+		h.session.getTaskScopeSettings = () =>
+			h.sessionManager.getCwdGeneration() === 0 ? h.sourceSettings : h.targetSettings;
+		const load = vi.fn(() => TaskTool.create(h.session, { runSubprocess: complete }));
+		const tool = new LazyAgentTool(BUILTIN_TOOL_DESCRIPTORS.task, undefined, load, h.session);
+		await h.sessionManager.moveTo(h.b);
+		h.session.settings = h.sourceSettings;
+		expect(
+			(tool.parameters as TaskToolSchemaInstance).safeParse({
+				agent: "scope-probe",
+				tasks: [task("Metadata", { inheritContext: "receipt" })],
+			}).success,
+		).toBe(false);
+		expect(tool.description).toContain("independent mode cannot inherit");
+		expect(load).not.toHaveBeenCalled();
+		await start(tool, [task("LazyTarget")]);
+		await h.jobs.waitForAll();
+		expect(load).toHaveBeenCalledTimes(1);
+		expect(h.jobs.getJob("0-LazyTarget")?.status).toBe("completed");
+	});
 
 	it("recovers target admission after a cached first worker fails", async () => {
 		const h = await harness();
@@ -471,66 +502,96 @@ describe("task admission after trusted committed moves", () => {
 		expect(await Bun.file(config).text()).toBe(before);
 	});
 
-	it("wires authority through the real SDK eager task and move_session tools", async () => {
-		const h = await harness();
-		const seen: ExecutorOptions[] = [];
-		const create = TaskTool.create;
-		vi.spyOn(TaskTool, "create").mockImplementation((session, options) =>
-			create(session, {
-				...options,
-				runSubprocess: async worker => {
-					seen.push(worker);
-					return complete(worker);
-				},
-			}),
-		);
-		const { session } = await createAgentSession({
-			cwd: h.a,
-			agentDir: h.home,
-			sessionManager: h.sessionManager,
-			settings: h.sourceSettings,
-			model: getBundledModel("openai", "gpt-4o-mini"),
-			disableExtensionDiscovery: true,
-			skills: [],
-			promptTemplates: [],
-			slashCommands: [],
-			enableMCP: false,
-			enableMcpAutoload: false,
-			enableLsp: false,
-			toolNames: ["task", "move_session", "read"],
-		});
-		try {
-			const taskTool = session.getToolByName("task")!;
-			expect(
-				text(await taskTool.execute("warm-failure", { agent: "missing-scope-agent", tasks: [task("Warm")] })),
-			).toContain("Unknown agent");
-			const jobs = AsyncJobManager.instance();
-			if (!jobs) throw new Error("Expected the SDK-owned async manager");
-			await start(taskTool, [task("SDKSource")]);
-			await jobs.waitForAll();
-			expect(seen[0]?.cwd).toBe(h.a);
-			expect(text(await session.getToolByName("move_session")!.execute("move", { path: "repo" }))).toContain(h.b);
-			const started = await start(taskTool, [task("SDKTarget")]);
-			expect(text(started)).toContain("background task");
-			await jobs.waitForAll();
-			expect(seen[1]?.cwd).toBe(h.b);
-			expect(seen[1]?.agent.systemPrompt).toContain("Use B scope only");
-			expect(seen.map(options => options.id)).toEqual(["0-SDKSource", "1-SDKTarget"]);
-			const priorOutput = await session
-				.getToolByName("read")!
-				.execute("prior-output", { path: "agent://0-SDKSource" });
-			expect(text(priorOutput)).toContain("A");
-			const previousId = h.sessionManager.getSessionId();
-			expect(await session.newSession()).toBe(true);
-			expect(h.sessionManager.getSessionId()).not.toBe(previousId);
-			await start(taskTool, [task("FreshLogicalSession")]);
-			await jobs.waitForAll();
-			expect(seen.at(-1)?.cwd).toBe(h.b);
-			expect(seen.at(-1)?.id).toBe("2-FreshLogicalSession");
-			expect(seen.at(-1)?.parentSessionId).toBe(h.sessionManager.getSessionId());
-			expect(seen.at(-1)?.artifactsDir).not.toBe(seen[1]?.artifactsDir);
-		} finally {
-			await session.dispose();
-		}
-	}, 30_000);
+	for (const surface of ["agent", "SDK"] as const) {
+		it(`wires eager task settings and resources through a real ${surface} move`, async () => {
+			const h = await harness();
+			const targetConfig = "task:\n  maxConcurrency: 2\n  simple: independent\nask:\n  timeout: 60000\n";
+			await Bun.write(path.join(h.b, ".gjc", "config.yml"), targetConfig);
+			const preview = await h.sourceSettings.snapshotForCwd(h.b);
+			expect({
+				mode: preview.get("task.simple"),
+				concurrency: preview.get("task.maxConcurrency"),
+				timeout: preview.get("ask.timeout"),
+			}).toEqual({ mode: "independent", concurrency: 2, timeout: 60 });
+			const seen: ExecutorOptions[] = [];
+			const create = TaskTool.create;
+			vi.spyOn(TaskTool, "create").mockImplementation((session, options) =>
+				create(session, {
+					...options,
+					runSubprocess: async worker => {
+						seen.push(worker);
+						return complete(worker);
+					},
+				}),
+			);
+			const { session } = await createAgentSession({
+				cwd: h.a,
+				agentDir: h.home,
+				sessionManager: h.sessionManager,
+				settings: h.sourceSettings,
+				model: getBundledModel("openai", "gpt-4o-mini"),
+				disableExtensionDiscovery: true,
+				slashCommands: [],
+				enableMCP: false,
+				enableMcpAutoload: false,
+				enableLsp: false,
+				toolNames: ["task", "move_session", "read"],
+			});
+			try {
+				const taskTool = session.getToolByName("task")!;
+				expect(
+					text(await taskTool.execute("warm-failure", { agent: "missing-scope-agent", tasks: [task("Warm")] })),
+				).toContain("Unknown agent");
+				const jobs = AsyncJobManager.instance();
+				if (!jobs) throw new Error("Expected the SDK-owned async manager");
+				await start(taskTool, [task("SDKSource")]);
+				await jobs.waitForAll();
+				expect(seen[0]?.cwd).toBe(h.a);
+				if (surface === "agent") {
+					expect(text(await session.getToolByName("move_session")!.execute("move", { path: "repo" }))).toContain(
+						h.b,
+					);
+				} else {
+					await h.sessionManager.moveTo(h.b);
+				}
+				expect(
+					(taskTool.parameters as TaskToolSchemaInstance).safeParse({
+						agent: "scope-probe",
+						tasks: [task("Metadata", { inheritContext: "receipt" })],
+					}).success,
+				).toBe(false);
+				const started = await start(taskTool, [task("SDKTarget")]);
+				expect(text(started)).toContain("background task");
+				await jobs.waitForAll();
+				expect(seen[1]?.cwd).toBe(h.b);
+				expect(seen[1]?.agent.systemPrompt).toContain("Use B scope only");
+				expect(seen[1]?.contextFiles?.some(file => file.content.includes("Original B instructions"))).toBe(true);
+				expect(seen[1]?.settings?.getCwd()).toBe(h.b);
+				expect(seen[1]?.settings?.get("task.maxConcurrency")).toBe(2);
+				expect(seen[1]?.settings?.get("ask.timeout")).toBe(60);
+				expect(seen[1]?.promptTemplates?.find(template => template.name === "scope-template")?.content).toContain(
+					"Template B",
+				);
+				expect(seen[1]?.skills?.find(skill => skill.name === "scope-skill")?.filePath).toContain(h.b);
+				expect(h.sourceSettings.getCwd()).toBe(h.a);
+				expect(await Bun.file(path.join(h.b, ".gjc", "config.yml")).text()).toBe(targetConfig);
+				expect(seen.map(options => options.id)).toEqual(["0-SDKSource", "1-SDKTarget"]);
+				const priorOutput = await session
+					.getToolByName("read")!
+					.execute("prior-output", { path: "agent://0-SDKSource" });
+				expect(text(priorOutput)).toContain("A");
+				const previousId = h.sessionManager.getSessionId();
+				expect(await session.newSession()).toBe(true);
+				expect(h.sessionManager.getSessionId()).not.toBe(previousId);
+				await start(taskTool, [task("FreshLogicalSession")]);
+				await jobs.waitForAll();
+				expect(seen.at(-1)?.cwd).toBe(h.b);
+				expect(seen.at(-1)?.id).toBe("2-FreshLogicalSession");
+				expect(seen.at(-1)?.parentSessionId).toBe(h.sessionManager.getSessionId());
+				expect(seen.at(-1)?.artifactsDir).not.toBe(seen[1]?.artifactsDir);
+			} finally {
+				await session.dispose();
+			}
+		}, 30_000);
+	}
 });

@@ -1126,6 +1126,19 @@ export class Settings implements NotificationSettingsReader {
 		return cloned;
 	}
 
+	/** Resolve a retained execution's project layer without persistence or global hooks. */
+	async snapshotForCwd(cwd: string): Promise<Settings> {
+		const cloned = this.snapshot();
+		if (path.resolve(cwd) === path.resolve(this.#cwd)) return cloned;
+		cloned.#cwd = path.resolve(cwd);
+		cloned.#readonly = true;
+		cloned.#project = {};
+		cloned.#rebuildMerged();
+		cloned.#project = await cloned.#loadProjectSettings(true);
+		await cloned.#normalizeAfterLoad();
+		return cloned;
+	}
+
 	async cloneForCwd(cwd: string): Promise<Settings> {
 		// A clone shares the same config queue. Settle an already-reserved local
 		// debounce before the clone can enqueue a durable selector, preventing it
@@ -1594,9 +1607,14 @@ export class Settings implements NotificationSettingsReader {
 		return reconciled.settings;
 	}
 
-	async #loadProjectSettings(): Promise<RawSettings> {
+	async #loadProjectSettings(bypassCache = false): Promise<RawSettings> {
 		try {
-			const result = await loadCapability(settingsCapability.id, { cwd: this.#cwd, settings: this });
+			const result = await loadCapability(settingsCapability.id, {
+				cwd: this.#cwd,
+				agentDir: this.#agentDir,
+				settings: this,
+				bypassCache,
+			});
 			let merged: RawSettings = {};
 			for (const item of result.items as SettingsCapabilityItem[]) {
 				if (item.level !== "project") continue;
