@@ -409,6 +409,82 @@ describe("openai-codex streaming", () => {
 		]);
 	});
 
+	it("keeps a complete tool call when transient close omits output_item.done", async () => {
+		const sse = createCodexErrorSse([
+			{
+				type: "response.output_item.added",
+				item: {
+					type: "function_call",
+					id: "fc_unfinalized",
+					call_id: "call_unfinalized",
+					name: "todo_write",
+					arguments: "",
+				},
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_unfinalized", delta: '{"ops":[]}' },
+			{
+				type: "error",
+				code: "request_timeout",
+				message:
+					"stream disconnected before completion: stream closed before response.completed (code=request_timeout)",
+			},
+		]);
+		global.fetch = vi.fn(
+			async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		) as unknown as typeof fetch;
+
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken() },
+		).result();
+
+		expect(result.stopReason).toBe("toolUse");
+		expect(result.errorCode).toBe("codex_stream_closed_after_complete_tool_arguments");
+		expect(result.content).toEqual([
+			{ type: "toolCall", id: "call_unfinalized|fc_unfinalized", name: "todo_write", arguments: { ops: [] } },
+		]);
+	});
+
+	it("salvages a complete tool call after an idle stall", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		global.fetch = ((input: string | URL | Request, init?: RequestInit) =>
+			Promise.resolve(
+				createTimedCodexSse(
+					getRequestSignal(input, init),
+					[
+						{
+							type: "response.output_item.added",
+							item: {
+								type: "function_call",
+								id: "fc_idle_complete",
+								call_id: "call_idle_complete",
+								name: "todo_write",
+								arguments: "",
+							},
+						},
+						{
+							type: "response.function_call_arguments.delta",
+							item_id: "fc_idle_complete",
+							delta: '{"ops":[]}',
+						},
+					],
+					10,
+					false,
+				),
+			)) as typeof fetch;
+
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken(), streamIdleTimeoutMs: 20 },
+		).result();
+
+		expect(result.stopReason).toBe("toolUse");
+		expect(result.errorCode).toBe("codex_stream_closed_after_complete_tool_arguments");
+	});
+
 	it.each([
 		[
 			"unfinalized function call",
@@ -672,8 +748,8 @@ describe("openai-codex streaming", () => {
 			createCodexTestContext(),
 			{ apiKey: createCodexTestToken(), streamIdleTimeoutMs: 20 },
 		).result();
-		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toBe("OpenAI Codex SSE stream stalled while waiting for the next event");
+		expect(result.stopReason).toBe("toolUse");
+		expect(result.errorCode).toBe("codex_stream_closed_after_complete_tool_arguments");
 	});
 
 	it("does not time out SSE while whitespace arrives inside incomplete tool arguments", async () => {

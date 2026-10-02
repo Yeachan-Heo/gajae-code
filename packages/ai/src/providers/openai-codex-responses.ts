@@ -121,6 +121,7 @@ const CODEX_WEBSOCKET_IDLE_TIMEOUT_MS = 300000;
 const CODEX_WEBSOCKET_RETRY_BUDGET = CODEX_MAX_RETRIES;
 const CODEX_WEBSOCKET_TRANSPORT_ERROR_PREFIX = "Codex websocket transport error";
 const CODEX_SALVAGED_STREAM_CLOSE_ERROR_CODE = "codex_stream_closed_after_finalized_tool_calls";
+const CODEX_SALVAGED_COMPLETE_TOOL_ARGUMENTS_ERROR_CODE = "codex_stream_closed_after_complete_tool_arguments";
 const CODEX_PREVIOUS_RESPONSE_STALE_CODES = new Set(["previous_response_not_found", "codex_previous_response_stale"]);
 // Some Codex deployments reject a stale continuation anchor with a generic
 // `invalid_request_error` code and name the anchor only in the message
@@ -326,6 +327,18 @@ function codexOutputHasMeaningfulProgress(output: AssistantMessage): boolean {
 	);
 }
 
+function isPlainJsonObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isCompleteJsonObject(value: string): boolean {
+	try {
+		return isPlainJsonObject(JSON.parse(value));
+	} catch {
+		return false;
+	}
+}
+
 type CodexTransport = "sse" | "websocket";
 interface CodexInitialTransport {
 	eventStream: AsyncGenerator<Record<string, unknown>>;
@@ -337,7 +350,14 @@ interface CodexInitialTransport {
 }
 type CodexEventItem = ResponseReasoningItem | ResponseOutputMessage | ResponseFunctionToolCall | ResponseCustomToolCall;
 type CodexThinkingBlock = ThinkingContent & { summaryBuffer: string; rawBuffer: string; summaryStarted: boolean };
-type CodexOutputBlock = CodexThinkingBlock | TextContent | (ToolCall & { partialJson: string; doneInput?: string });
+type CodexOutputBlock =
+	| CodexThinkingBlock
+	| TextContent
+	| (ToolCall & {
+			partialJson: string;
+			doneInput?: string;
+			argumentsComplete?: boolean;
+	  });
 export interface OpenAICodexWebSocketDebugStats {
 	fullContextRequests: number;
 	deltaRequests: number;
@@ -779,6 +799,7 @@ function removeTransientBlockIndices(output: AssistantMessage): void {
 		if (block.type === "toolCall") {
 			delete (block as { partialJson?: string }).partialJson;
 			delete (block as { doneInput?: string }).doneInput;
+			delete (block as { argumentsComplete?: boolean }).argumentsComplete;
 		}
 	}
 }
@@ -1233,20 +1254,67 @@ function trySalvageCodexFinalizedToolCalls(
 	error: unknown,
 ): boolean {
 	const toolCalls = context.output.content.filter((block): block is ToolCall => block.type === "toolCall");
-	if (
-		!isCodexTransientStreamClose(error) ||
-		toolCalls.length === 0 ||
-		runtime.currentBlock !== null ||
-		context.output.content.some(block => block.type !== "thinking" && block.type !== "toolCall") ||
-		toolCalls.some(toolCall => !runtime.finalizedToolCallIds.has(toolCall.id))
-	) {
+	const activeToolCall =
+		runtime.currentItem?.type === "function_call" && runtime.currentBlock?.type === "toolCall"
+			? runtime.currentBlock
+			: undefined;
+	const completeActiveToolCall = activeToolCall?.argumentsComplete === true;
+	const hasCompleteArguments = toolCalls.some(toolCall => runtime.finalizedToolCallIds.has(toolCall.id))
+		? toolCalls.every(
+				toolCall =>
+					runtime.finalizedToolCallIds.has(toolCall.id) || (toolCall === activeToolCall && completeActiveToolCall),
+			)
+		: completeActiveToolCall;
+	const isIdleStall =
+		error instanceof Error && error.message === "OpenAI Codex SSE stream stalled while waiting for the next event";
+	const canSalvageFinalizedCall =
+		isCodexTransientStreamClose(error) &&
+		toolCalls.length > 0 &&
+		runtime.currentBlock === null &&
+		context.output.content.every(block => block.type === "thinking" || block.type === "toolCall") &&
+		toolCalls.every(toolCall => runtime.finalizedToolCallIds.has(toolCall.id));
+	const canSalvageCompleteArguments =
+		(isCodexTransientStreamClose(error) || isIdleStall) &&
+		toolCalls.length > 0 &&
+		context.output.content.every(block => block.type === "thinking" || block.type === "toolCall") &&
+		hasCompleteArguments;
+	if (!canSalvageFinalizedCall && !canSalvageCompleteArguments) {
 		return false;
 	}
 
+	if (canSalvageCompleteArguments && activeToolCall && !runtime.finalizedToolCallIds.has(activeToolCall.id)) {
+		const item = runtime.currentItem;
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: activeToolCall.id,
+			name: activeToolCall.name,
+			arguments: activeToolCall.arguments,
+		};
+		Object.assign(activeToolCall, toolCall);
+		delete (activeToolCall as { partialJson?: string }).partialJson;
+		delete (activeToolCall as { argumentsComplete?: boolean }).argumentsComplete;
+		runtime.finalizedToolCallIds.add(toolCall.id);
+		runtime.nativeOutputItems.push({
+			...item,
+			arguments: JSON.stringify(toolCall.arguments),
+			status: "completed",
+		} as Record<string, unknown>);
+		context.stream.push({
+			type: "toolcall_end",
+			contentIndex: context.output.content.length - 1,
+			toolCall,
+			partial: context.output,
+		});
+		runtime.currentItem = null;
+		runtime.currentBlock = null;
+	}
+
 	context.output.stopReason = "toolUse";
-	context.output.errorCode = CODEX_SALVAGED_STREAM_CLOSE_ERROR_CODE;
+	context.output.errorCode = canSalvageFinalizedCall
+		? CODEX_SALVAGED_STREAM_CLOSE_ERROR_CODE
+		: CODEX_SALVAGED_COMPLETE_TOOL_ARGUMENTS_ERROR_CODE;
 	runtime.sawTerminalEvent = true;
-	logCodexDebug("codex stream closed after finalized tool calls; salvaging tool-use response", {
+	logCodexDebug("codex stream closed after complete tool arguments; salvaging tool-use response", {
 		error: error instanceof Error ? error.message : String(error),
 		toolCallCount: toolCalls.length,
 		transport: runtime.transport,
@@ -1433,6 +1501,7 @@ function createOutputBlockForItem(item: CodexEventItem): CodexOutputBlock | null
 			name: codexToolCanonicalName(item.name),
 			arguments: {},
 			partialJson: item.arguments || "",
+			argumentsComplete: isCompleteJsonObject(item.arguments || ""),
 		};
 	}
 	if (item.type === "custom_tool_call") {
@@ -1602,8 +1671,12 @@ function handleToolCallArgumentsDelta(
 	blockIndex: () => number,
 ): void {
 	if (currentItem?.type !== "function_call" || currentBlock?.type !== "toolCall") return;
+	if (currentBlock.argumentsComplete === true && delta.trim().length > 0) {
+		currentBlock.argumentsComplete = false;
+	}
 	currentBlock.partialJson += delta;
 	currentBlock.arguments = parseStreamingJson(currentBlock.partialJson);
+	currentBlock.argumentsComplete = isCompleteJsonObject(currentBlock.partialJson);
 	stream.push({ type: "toolcall_delta", contentIndex: blockIndex(), delta, partial: output });
 }
 
@@ -1617,6 +1690,7 @@ function handleToolCallArgumentsDone(
 	if (typeof args === "string") {
 		currentBlock.partialJson = args;
 		currentBlock.arguments = parseStreamingJson(currentBlock.partialJson);
+		currentBlock.argumentsComplete = isCompleteJsonObject(currentBlock.partialJson);
 		captureUnicodeEscapeEvidence(currentBlock, args);
 	}
 }
@@ -1760,6 +1834,7 @@ function handleOutputItemDone(
 		Object.assign(runtime.currentBlock, toolCall);
 		captureUnicodeEscapeEvidence(runtime.currentBlock, item.arguments);
 		delete (runtime.currentBlock as { partialJson?: string }).partialJson;
+		delete (runtime.currentBlock as { argumentsComplete?: boolean }).argumentsComplete;
 		delete (runtime.currentBlock as { doneInput?: string }).doneInput;
 		runtime.canSafelyReplayWebsocketOverSse = false;
 		stream.push({ type: "toolcall_end", contentIndex: blockIndex(), toolCall, partial: output });
