@@ -2411,28 +2411,42 @@ export class AcpAgent implements Agent {
 		if (record.pendingPromptAdmission)
 			throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
 		const activePrompt = record.activePrompt;
-		if (activePrompt) {
-			const cancellationPending =
-				record.cancelRequested ||
+		const cancellationPending =
+			activePrompt !== undefined &&
+			(record.cancelRequested ||
 				activePrompt.cancelAttempt !== undefined ||
-				activePrompt.cancelAcknowledged === true;
-			if (!cancellationPending || record.pendingPromptAdmission)
-				throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
+				activePrompt.cancelAcknowledged === true);
+		if (activePrompt && !cancellationPending)
+			throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
+		if (cancellationPending || record.cancelledEchoTail) {
 			const { promise: woken, resolve: wake } = Promise.withResolvers<void>();
 			admissionReservation = { wake, woken };
 			record.pendingPromptAdmission = admissionReservation;
 		}
+		const admissionCancelled = (): boolean => {
+			const settlement = admissionReservation?.settlement;
+			if (settlement?.kind === "rejected") throw settlement.error;
+			return settlement?.kind === "cancelled" || admissionReservation?.cancelled === true;
+		};
 		try {
 			if (admissionReservation) {
-				const settled = await this.#waitForPromptSettlement(activePrompt as PromptWaiter, admissionReservation);
-				const settlement = admissionReservation.settlement;
-				if (settlement?.kind === "rejected") throw settlement.error;
-				if (settlement?.kind === "cancelled" || admissionReservation.cancelled) return { stopReason: "cancelled" };
-				if (!settled) throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
-				await this.#drainPromptPublicationTails(params.sessionId);
-				if (admissionReservation.settlement?.kind === "rejected") throw admissionReservation.settlement.error;
-				if (admissionReservation.settlement?.kind === "cancelled" || admissionReservation.cancelled)
-					return { stopReason: "cancelled" };
+				if (activePrompt) {
+					const settled = await this.#waitForPromptSettlement(activePrompt, admissionReservation);
+					if (admissionCancelled()) return { stopReason: "cancelled" };
+					if (!settled) throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
+				}
+				const publicationDrained = await Promise.race([
+					this.#drainPromptPublicationTails(params.sessionId).then(() => true),
+					admissionReservation.woken.then(() => false),
+				]);
+				if (admissionCancelled()) return { stopReason: "cancelled" };
+				if (!publicationDrained)
+					throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
+				const echoTail = record.cancelledEchoTail;
+				if (echoTail) {
+					await Promise.race([echoTail, admissionReservation.woken]);
+					if (admissionCancelled()) return { stopReason: "cancelled" };
+				}
 			}
 			return await this.#submitPromptCore(params, echoUserMessage, retryReservation, admissionReservation);
 		} finally {
@@ -2503,9 +2517,6 @@ export class AcpAgent implements Agent {
 			return { stopReason: "cancelled" };
 		const record = this.#sessions.get(params.sessionId);
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
-		if (record.cancelledEchoTail) await record.cancelledEchoTail;
-		if (this.#sessions.get(params.sessionId) !== record)
-			throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
 		// A first-turn retry holds the session across its backoff gap. Any prompt that is not the
 		// retry owner is rejected here, before any state mutation or dispatch, so it cannot steal
 		// the first turn while the authorized retry is still pending (review P1, issue #5574).
@@ -2662,6 +2673,80 @@ export class AcpAgent implements Agent {
 				throw new AcpSdkAdapterError("prompt_cancelled", "ACP prompt stopped before image dispatch.");
 			return value as T;
 		};
+		const stagePromptImages = async (): Promise<void> => {
+			for (const image of payload.images) {
+				const bytes = Buffer.from(image.data, "base64");
+				if (bytes.toString("base64") !== image.data)
+					throw new AcpSdkAdapterError("invalid_input", "ACP image data must be canonical base64.");
+				const sha256 = createHash("sha256").update(bytes).digest("hex");
+				const begin = record.adapter.uploadImageBegin({
+					mimeType: image.mimeType,
+					byteLength: bytes.length,
+					sha256,
+				});
+				void begin.then(
+					result => {
+						const id = result?.id;
+						if (
+							typeof id === "string" &&
+							id &&
+							(promptWaiterRetired(record, waiter) || waiter.uploadAbort.signal.aborted)
+						)
+							void record.adapter.uploadImageDiscard(id).catch(() => undefined);
+					},
+					() => undefined,
+				);
+				const { id, nextSequence } = await whileActive(begin);
+				if (typeof id === "string" && id) stagedIds.add(id);
+				if (typeof id !== "string" || !id || nextSequence !== 0)
+					throw new AcpSdkAdapterError(
+						"invalid_prompt_acknowledgement",
+						"SDK image begin acknowledgement is invalid.",
+					);
+				let sequence = 0;
+				for (let offset = 0; offset < bytes.length; offset += IMAGE_UPLOAD_CHUNK_BYTES) {
+					const chunk = bytes.subarray(offset, offset + IMAGE_UPLOAD_CHUNK_BYTES);
+					const appended = await whileActive(
+						record.adapter.uploadImageAppend({ id, sequence, data: chunk.toString("base64") }),
+					);
+					if (
+						appended?.id !== id ||
+						appended.nextSequence !== ++sequence ||
+						appended.receivedBytes !== offset + chunk.length
+					)
+						throw new AcpSdkAdapterError(
+							"invalid_prompt_acknowledgement",
+							"SDK image append acknowledgement is invalid.",
+						);
+				}
+				const finished = await whileActive(record.adapter.uploadImageFinish(id));
+				if (
+					finished?.id !== id ||
+					finished.byteLength !== bytes.length ||
+					finished.sha256 !== sha256 ||
+					finished.mimeType !== image.mimeType
+				)
+					throw new AcpSdkAdapterError(
+						"invalid_prompt_acknowledgement",
+						"SDK image finish acknowledgement is invalid.",
+					);
+			}
+			const stagedFrameBytes = Buffer.byteLength(
+				JSON.stringify({
+					type: "control_request",
+					operation: "turn.prompt",
+					id: PROMPT_FRAME_ID_PLACEHOLDER,
+					input: {
+						text: payload.text,
+						stagedImages: [...stagedIds].map(id => ({ id })),
+						clientRef,
+					},
+					...(record.adapter.connectionId === undefined ? {} : { connectionId: record.adapter.connectionId }),
+				}),
+			);
+			if (stagedFrameBytes > MAX_PROMPT_FRAME_BYTES)
+				throw new AcpSdkAdapterError("invalid_input", "ACP prompt text exceeds the SDK transport limit.");
+		};
 		try {
 			record.activePrompt = waiter;
 			if (record.pendingPromptAdmission === admissionReservation) record.pendingPromptAdmission = undefined;
@@ -2749,82 +2834,7 @@ export class AcpAgent implements Agent {
 						echoTask = undefined;
 						waiter.echoPublication = undefined;
 					}
-				if (stageImages) {
-					for (const image of payload.images) {
-						const bytes = Buffer.from(image.data, "base64");
-						if (bytes.toString("base64") !== image.data)
-							throw new AcpSdkAdapterError("invalid_input", "ACP image data must be canonical base64.");
-						const sha256 = createHash("sha256").update(bytes).digest("hex");
-						const begin = record.adapter.uploadImageBegin({
-							mimeType: image.mimeType,
-							byteLength: bytes.length,
-							sha256,
-						});
-						void begin.then(
-							result => {
-								const id = result?.id;
-								if (
-									typeof id === "string" &&
-									id &&
-									(promptWaiterRetired(record, waiter) || waiter.uploadAbort.signal.aborted)
-								)
-									void record.adapter.uploadImageDiscard(id).catch(() => undefined);
-							},
-							() => undefined,
-						);
-						const { id, nextSequence } = await whileActive(begin);
-						if (typeof id === "string" && id) stagedIds.add(id);
-						if (typeof id !== "string" || !id || nextSequence !== 0)
-							throw new AcpSdkAdapterError(
-								"invalid_prompt_acknowledgement",
-								"SDK image begin acknowledgement is invalid.",
-							);
-						let sequence = 0;
-						for (let offset = 0; offset < bytes.length; offset += IMAGE_UPLOAD_CHUNK_BYTES) {
-							const chunk = bytes.subarray(offset, offset + IMAGE_UPLOAD_CHUNK_BYTES);
-							const appended = await whileActive(
-								record.adapter.uploadImageAppend({ id, sequence, data: chunk.toString("base64") }),
-							);
-							if (
-								appended?.id !== id ||
-								appended.nextSequence !== ++sequence ||
-								appended.receivedBytes !== offset + chunk.length
-							)
-								throw new AcpSdkAdapterError(
-									"invalid_prompt_acknowledgement",
-									"SDK image append acknowledgement is invalid.",
-								);
-						}
-						const finished = await whileActive(record.adapter.uploadImageFinish(id));
-						if (
-							finished?.id !== id ||
-							finished.byteLength !== bytes.length ||
-							finished.sha256 !== sha256 ||
-							finished.mimeType !== image.mimeType
-						)
-							throw new AcpSdkAdapterError(
-								"invalid_prompt_acknowledgement",
-								"SDK image finish acknowledgement is invalid.",
-							);
-					}
-					const stagedFrameBytes = Buffer.byteLength(
-						JSON.stringify({
-							type: "control_request",
-							operation: "turn.prompt",
-							id: PROMPT_FRAME_ID_PLACEHOLDER,
-							input: {
-								text: payload.text,
-								stagedImages: [...stagedIds].map(id => ({ id })),
-								clientRef,
-							},
-							...(record.adapter.connectionId === undefined
-								? {}
-								: { connectionId: record.adapter.connectionId }),
-						}),
-					);
-					if (stagedFrameBytes > MAX_PROMPT_FRAME_BYTES)
-						throw new AcpSdkAdapterError("invalid_input", "ACP prompt text exceeds the SDK transport limit.");
-				}
+				if (stageImages) await stagePromptImages();
 			} catch (error) {
 				waiter.uploadAbort.abort();
 				discardStaged();
@@ -2924,6 +2934,12 @@ export class AcpAgent implements Agent {
 				} catch (error) {
 					if (!(error instanceof SdkClientError || error instanceof AcpSdkAdapterError) || error.code !== "busy")
 						throw error;
+					// The rejected attempt owns no host execution. Cancellation while waiting or
+					// restaging must stay local rather than abort an unrelated active run.
+					waiter.dispatched = false;
+					// Busy is a confirmed response after one-shot host redemption. Retire those ids
+					// immediately so cancellation during the idle wait never discards consumed refs.
+					if (stageImages) stagedIds.clear();
 					if (
 						record.activePrompt !== waiter ||
 						waiter.settled ||
@@ -2942,6 +2958,7 @@ export class AcpAgent implements Agent {
 						waiter.cancelBeforeAdmission
 					)
 						throw error;
+					if (stageImages) await stagePromptImages();
 					acknowledgement = await submit();
 				}
 				// A recovered waiter already owns its exact identity; a late ack cannot rebind it.

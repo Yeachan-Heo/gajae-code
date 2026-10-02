@@ -751,6 +751,68 @@ test("cancelling before image echo completes settles locally without aborting a 
 	}
 });
 
+test("a successor behind an already-settled cancelled image echo is cancellable before the echo clears", async () => {
+	const echoStarted = Promise.withResolvers<void>();
+	const echoGate = Promise.withResolvers<void>();
+	const fixture = await createFixture({ imageEchoGate: { started: echoStarted.resolve, release: echoGate.promise } });
+	try {
+		const image = Buffer.from(
+			await Bun.file(path.join(import.meta.dir, "fixtures/sdk-inline-image-large.png")).arrayBuffer(),
+		);
+		const predecessor = fixture.agent.prompt({
+			sessionId: fixture.sessionId,
+			prompt: [{ type: "image", mimeType: "image/png", data: image.toString("base64") }],
+		} as PromptRequest);
+		await bounded(echoStarted.promise, "cancelled predecessor image echo");
+		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel predecessor before dispatch");
+		expect(await bounded(predecessor, "settled predecessor cancellation")).toEqual({ stopReason: "cancelled" });
+
+		const successor = prompt(fixture, "successor cancelled while predecessor echo is stuck");
+		const cancellation = fixture.agent.cancel({ sessionId: fixture.sessionId });
+		await bounded(cancellation, "cancel pending successor admission");
+		expect(await bounded(successor, "cancelled pending successor")).toEqual({ stopReason: "cancelled" });
+		expect(fixture.promptDeliveryCount()).toBe(0);
+		expect(fixture.imageUploadCount()).toBe(0);
+
+		echoGate.resolve();
+		await Bun.sleep(20);
+		expect(fixture.promptDeliveryCount()).toBe(0);
+		expect(fixture.imageUploadCount()).toBe(0);
+	} finally {
+		echoGate.resolve();
+		fixture.dispose();
+	}
+});
+
+test("a successor cancellation is independent while its echoed-image predecessor remains active", async () => {
+	const fixture = await createFixture();
+	try {
+		const predecessor = fixture.agent.prompt({
+			sessionId: fixture.sessionId,
+			prompt: [{ type: "image", mimeType: "image/png", data: Buffer.from([1, 2, 3]).toString("base64") }],
+		} as PromptRequest);
+		await waitFor(() => fixture.promptDeliveryCount() === 1, "echoed image predecessor delivery");
+		await waitFor(() => workingUpdates(fixture.updates) > 0, "echoed image predecessor start");
+		expect(
+			fixture.updates.filter(
+				update =>
+					update.update.sessionUpdate === "user_message_chunk" &&
+					(update.update as { content: { type: string } }).content.type === "image",
+			),
+		).toHaveLength(1);
+
+		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "active image predecessor cancellation");
+		const successor = prompt(fixture, "successor cancelled during predecessor shutdown");
+		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel active predecessor successor");
+		expect(await bounded(successor, "cancelled active-predecessor successor")).toEqual({ stopReason: "cancelled" });
+		expect(fixture.promptDeliveryCount()).toBe(1);
+		fixture.sendStopped("cancelled");
+		expect(await bounded(predecessor, "cancelled echoed-image predecessor")).toEqual({ stopReason: "cancelled" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
 test("a reentrant cancel during a throwing prompt socket send never aborts unrelated host work", async () => {
 	const fixture = await createFixture();
 	const send = WebSocket.prototype.send;
@@ -878,9 +940,11 @@ test("a rejected cancelled image echo tears down the session and does not strand
 		expect(await bounded(cancelled, "cancelled rejected echo")).toEqual({ stopReason: "cancelled" });
 		const successor = prompt(fixture, "after rejected echo");
 		echoGate.reject(new Error("client publication rejected"));
+		// Publication rejects through the existing session frame-processing failure path.
 		await expect(bounded(successor, "successor after echo rejection")).rejects.toMatchObject({
-			code: "connection_closed",
+			code: "frame_processing_failed",
 		});
+		await waitFor(() => fixture.clock.pending === 0, "rejected cancelled echo timer cleanup");
 		expect(fixture.clock.pending).toBe(0);
 		expect(fixture.promptDeliveryCount()).toBe(0);
 		await expect(prompt(fixture, "after rejected echo teardown")).rejects.toMatchObject({ code: "not_found" });
