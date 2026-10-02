@@ -460,7 +460,14 @@ SDK frame cap remains 256 KiB. Large inline images cross it through SDK-core-own
 credentials to the ACP client.
 
 Staging is scoped to the authenticated live connection and session. Each upload
-has a fixed two-minute lease, a declared byte length, MIME type, and SHA-256 digest.
+has a two-minute inactivity lease, a declared byte length, MIME type, and SHA-256 digest.
+`turn.image.begin` optionally accepts a nonempty `batchId` of at most 128 characters.
+Successful begin, append, and finish operations renew live uploads only for the same
+authenticated connection and explicit batch; omitted batch IDs renew that upload alone.
+ACP uses its request `clientRef` as the batch label so an early completed image stays
+available while later images are still transferring. Invalid or rejected operations,
+unrelated batches/connections, and cleanup do not renew these leases. Two minutes
+without successful staging progress still retires the batch, without changing quotas.
 Chunks are canonical base64 in sequence, with at most 96 KiB decoded per chunk.
 The host verifies exact length, digest, MIME/header agreement, dimensions, and
 image decoding before a reference is usable. A prompt accepts at most 16 images,
@@ -481,7 +488,12 @@ must be discarded or confirmed already gone before fresh staging. Unconfirmed
 cleanup emits a bounded diagnostic and refuses the retry; it does not invent
 capacity release or replay an uncertain mutation. A lost or uncertain acknowledgement is reconciled through
 `turn.result`, never treated as permission to upload and execute the prompt again.
-The user's message is echoed once across a confirmed retry.
+The user's message is echoed once across a confirmed retry. Upload validation and
+final staged-envelope bounds pass before any text/image echo is published, so an
+upload rejection cannot leave an accepted-looking transcript entry. Validated replies
+for this request's active staging renew only its local ACP inactivity watchdog; they
+are not model/tool activity or execution authority. This pre-dispatch boundary does
+not suppress the user message for later prompt-admission or admitted model failures.
 
 Cancellation applies to the exact outstanding prompt, including successor
 admission while a cancelled image's user-message echo is still being published.

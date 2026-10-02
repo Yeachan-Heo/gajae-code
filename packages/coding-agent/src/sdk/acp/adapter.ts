@@ -480,6 +480,7 @@ export class AcpSdkAdapter {
 		mimeType: string;
 		byteLength: number;
 		sha256: string;
+		batchId?: string;
 	}): Promise<{ id: string; nextSequence: number }> {
 		return (await this.#requestImageUpload("turn.image.begin", input)) as {
 			id: string;

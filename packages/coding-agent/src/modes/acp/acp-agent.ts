@@ -2666,7 +2666,7 @@ export class AcpAgent implements Agent {
 				const code =
 					error instanceof SdkClientError || error instanceof AcpSdkAdapterError ? error.code : "unknown";
 				if (code === "resource_gone") return true;
-				// A failed or uncertain cleanup stays host-owned until its fixed lease expires
+				// A failed or uncertain cleanup stays host-owned until its inactivity lease expires
 				// or the connection closes. Preserve evidence without exposing image payloads.
 				logger.warn("acp_image_discard_failed", {
 					sessionId: params.sessionId,
@@ -2697,6 +2697,11 @@ export class AcpAgent implements Agent {
 				throw new AcpSdkAdapterError("prompt_cancelled", "ACP prompt stopped before image dispatch.");
 			return value as T;
 		};
+		const observeUploadProgress = (): void => {
+			waiter.lastFrameAt = this.#promptWatchdogClock.now();
+			waiter.lastFrameType = "image_upload_progress";
+			this.#armPromptWatchdog(params.sessionId, record, waiter);
+		};
 		const stagePromptImages = async (): Promise<void> => {
 			for (const image of payload.images) {
 				const bytes = Buffer.from(image.data, "base64");
@@ -2707,6 +2712,7 @@ export class AcpAgent implements Agent {
 					mimeType: image.mimeType,
 					byteLength: bytes.length,
 					sha256,
+					batchId: clientRef,
 				});
 				void begin.then(
 					result => {
@@ -2727,6 +2733,7 @@ export class AcpAgent implements Agent {
 						"invalid_prompt_acknowledgement",
 						"SDK image begin acknowledgement is invalid.",
 					);
+				observeUploadProgress();
 				let sequence = 0;
 				for (let offset = 0; offset < bytes.length; offset += IMAGE_UPLOAD_CHUNK_BYTES) {
 					const chunk = bytes.subarray(offset, offset + IMAGE_UPLOAD_CHUNK_BYTES);
@@ -2742,6 +2749,7 @@ export class AcpAgent implements Agent {
 							"invalid_prompt_acknowledgement",
 							"SDK image append acknowledgement is invalid.",
 						);
+					observeUploadProgress();
 				}
 				const finished = await whileActive(record.adapter.uploadImageFinish(id));
 				if (
@@ -2754,6 +2762,7 @@ export class AcpAgent implements Agent {
 						"invalid_prompt_acknowledgement",
 						"SDK image finish acknowledgement is invalid.",
 					);
+				observeUploadProgress();
 			}
 			const stagedFrameBytes = Buffer.byteLength(
 				JSON.stringify({
@@ -2839,6 +2848,8 @@ export class AcpAgent implements Agent {
 			let echoPending = false;
 			let echoTask: Promise<void> | undefined;
 			try {
+				// Upload validation and final envelope bounds must pass before any transcript echo.
+				if (stageImages) await stagePromptImages();
 				if (echoUserMessage)
 					for (const block of params.prompt) {
 						if (block.type !== "text" && block.type !== "image") continue;
@@ -2858,7 +2869,6 @@ export class AcpAgent implements Agent {
 						echoTask = undefined;
 						waiter.echoPublication = undefined;
 					}
-				if (stageImages) await stagePromptImages();
 			} catch (error) {
 				waiter.uploadAbort.abort();
 				discardStaged();

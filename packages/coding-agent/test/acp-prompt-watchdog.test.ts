@@ -7,6 +7,7 @@ import packageJson from "../package.json" with { type: "json" };
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { AcpSdkAdapter } from "../src/sdk/acp/adapter";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
+import { PromptImageUploadStore } from "../src/sdk/host/prompt-image-upload";
 import {
 	ACP_PROMPT_INACTIVITY_TIMEOUT_MS,
 	ACP_PROMPT_INFERENCE_TIMEOUT_MS,
@@ -84,6 +85,7 @@ type Fixture = {
 	correlation(): { commandId: string; turnId: string };
 	promptDeliveryCount(): number;
 	imageUploadCount(): number;
+	liveImageUploadCount(): number;
 	abortCount(): number;
 	/** Sends one raw frame down the session socket, correlation included or omitted verbatim. */
 	send(frame: Record<string, unknown>): void;
@@ -165,6 +167,8 @@ type FixtureOptions = {
 	deferCancelAcknowledgement?: boolean;
 	noActiveTurnAbort?: boolean;
 	imageEchoGate?: { started: () => void; release: Promise<void> };
+	imageProgressMs?: number;
+	imageControlGate?: { operation: string; started: () => void; release: Promise<void> };
 };
 
 async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
@@ -176,6 +180,9 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 	const updates: SessionNotification[] = [];
 	const clock = new VirtualClock();
 	const abort = new AbortController();
+	const imageUploads = new PromptImageUploadStore(() => !abort.signal.aborted);
+	const liveImageIds = new Set<string>();
+	let imageSocket: TestSocket | undefined;
 	let turnCount = 0;
 	let imageUploadCount = 0;
 	let abortCount = 0;
@@ -324,6 +331,12 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 			open(socket) {
 				socket.send(JSON.stringify({ type: "hello", connectionId: "acp-prompt-watchdog" }));
 			},
+			close(socket) {
+				if (socket === imageSocket) {
+					imageUploads.disconnect("acp-prompt-watchdog");
+					liveImageIds.clear();
+				}
+			},
 			message(socket, raw) {
 				const frame = JSON.parse(String(raw)) as Record<string, unknown>;
 				if (frame.type === "register_provider") {
@@ -360,9 +373,65 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 					return;
 				}
 				if (frame.type !== "control_request") return;
-				if (typeof frame.operation === "string" && frame.operation.startsWith("turn.image.")) imageUploadCount++;
+				if (typeof frame.operation === "string" && frame.operation.startsWith("turn.image.")) {
+					imageUploadCount++;
+					imageSocket = socket;
+					void (async () => {
+						try {
+							const gate = options.imageControlGate;
+							if (gate && frame.operation === gate.operation) {
+								gate.started();
+								await gate.release;
+							}
+							if (frame.operation !== "turn.image.discard") clock.advance(options.imageProgressMs ?? 0);
+							const owner = "acp-prompt-watchdog";
+							const result =
+								frame.operation === "turn.image.begin"
+									? imageUploads.begin(owner, frame.input)
+									: frame.operation === "turn.image.append"
+										? imageUploads.append(owner, frame.input)
+										: frame.operation === "turn.image.finish"
+											? await imageUploads.finish(owner, frame.input)
+											: imageUploads.discard(owner, frame.input);
+							if (frame.operation === "turn.image.begin") liveImageIds.add((result as { id: string }).id);
+							if (frame.operation === "turn.image.discard")
+								liveImageIds.delete((frame.input as { id: string }).id);
+							socket.send(JSON.stringify({ type: "control_response", id: frame.id, ok: true, result }));
+						} catch (error) {
+							const failure = error as Error & { code?: string };
+							socket.send(
+								JSON.stringify({
+									type: "control_response",
+									id: frame.id,
+									ok: false,
+									error: { code: failure.code ?? "internal", message: failure.message },
+								}),
+							);
+						}
+					})();
+					return;
+				}
 				if (frame.operation === "turn.abort") abortCount++;
 				if (frame.operation === "turn.prompt") {
+					const stagedImages = (frame.input as { stagedImages?: Array<{ id: string }> })?.stagedImages;
+					if (stagedImages) {
+						try {
+							const reservation = imageUploads.redeem("acp-prompt-watchdog", stagedImages);
+							for (const { id } of stagedImages) liveImageIds.delete(id);
+							reservation.release();
+						} catch (error) {
+							const failure = error as Error & { code?: string };
+							socket.send(
+								JSON.stringify({
+									type: "control_response",
+									id: frame.id,
+									ok: false,
+									error: { code: failure.code ?? "internal", message: failure.message },
+								}),
+							);
+							return;
+						}
+					}
 					promptSocket = socket;
 					turnCount += 1;
 					commandId = `watchdog-command-${turnCount}`;
@@ -483,6 +552,7 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 		correlation: () => ({ commandId, turnId }),
 		promptDeliveryCount: () => turnCount,
 		imageUploadCount: () => imageUploadCount,
+		liveImageUploadCount: () => liveImageIds.size,
 		abortCount: () => abortCount,
 		send,
 		sendAssistantText,
@@ -496,6 +566,7 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 		acknowledgePrompt,
 		dispose: () => {
 			abort.abort();
+			imageUploads.close();
 			server.stop(true);
 			tempDir.removeSync();
 		},
@@ -678,6 +749,64 @@ test("a silent completed todo_write argument stream rejects the ACP client withi
 	}
 });
 
+test("validated image staging progress renews only the current undispatched watchdog", async () => {
+	const fixture = await createFixture({ imageProgressMs: ACP_PROMPT_INACTIVITY_TIMEOUT_MS - 1 });
+	try {
+		const image = Buffer.from(
+			await Bun.file(path.join(import.meta.dir, "fixtures/sdk-inline-image-large.png")).arrayBuffer(),
+		);
+		const pending = fixture.agent.prompt({
+			sessionId: fixture.sessionId,
+			prompt: [{ type: "image", mimeType: "image/png", data: image.toString("base64") }],
+		} as PromptRequest);
+		await waitFor(() => fixture.promptDeliveryCount() === 1, "slow but progressing image dispatch");
+		expect(fixture.clock.now()).toBeGreaterThan(2 * ACP_PROMPT_INACTIVITY_TIMEOUT_MS);
+		expect(fixture.liveImageUploadCount()).toBe(0);
+		expect(fixture.updates.filter(update => update.update.sessionUpdate === "user_message_chunk")).toHaveLength(1);
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "slow staged completion")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+for (const operation of ["turn.image.begin", "turn.image.append", "turn.image.finish"]) {
+	test(`cancelling held ${operation} is local and cannot publish a late image echo`, async () => {
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		const fixture = await createFixture({
+			imageControlGate: { operation, started: entered.resolve, release: gate.promise },
+		});
+		try {
+			const image = Buffer.from(
+				await Bun.file(path.join(import.meta.dir, "fixtures/sdk-inline-image-large.png")).arrayBuffer(),
+			);
+			const pending = fixture.agent.prompt({
+				sessionId: fixture.sessionId,
+				prompt: [
+					{ type: "text", text: "image attempt" },
+					{ type: "image", mimeType: "image/png", data: image.toString("base64") },
+				],
+			} as PromptRequest);
+			await bounded(entered.promise, "held image operation");
+			await fixture.agent.cancel({ sessionId: fixture.sessionId });
+			expect(await bounded(pending, "cancelled staging")).toEqual({ stopReason: "cancelled" });
+			expect(fixture.abortCount()).toBe(0);
+			expect(fixture.promptDeliveryCount()).toBe(0);
+			expect(fixture.updates.filter(update => update.update.sessionUpdate === "user_message_chunk")).toHaveLength(0);
+			gate.resolve();
+			await waitFor(() => fixture.liveImageUploadCount() === 0, "cancelled upload cleanup");
+			await Bun.sleep(20);
+			expect(fixture.promptDeliveryCount()).toBe(0);
+			expect(fixture.liveImageUploadCount()).toBe(0);
+			expect(fixture.updates.filter(update => update.update.sessionUpdate === "user_message_chunk")).toHaveLength(0);
+		} finally {
+			gate.resolve();
+			fixture.dispose();
+		}
+	});
+}
+
 test("a stalled image echo cannot hold a settled prompt or dispatch after late publication", async () => {
 	const echoStarted = Promise.withResolvers<void>();
 	const echoGate = Promise.withResolvers<void>();
@@ -698,7 +827,8 @@ test("a stalled image echo cannot hold a settled prompt or dispatch after late p
 		);
 		await bounded(echoStarted.promise, "image echo publication");
 		expect(fixture.promptDeliveryCount()).toBe(0);
-		expect(fixture.imageUploadCount()).toBe(0);
+		expect(fixture.imageUploadCount()).toBeGreaterThan(0);
+		expect(fixture.liveImageUploadCount()).toBe(1);
 		expect(fixture.clock.pending).toBe(1);
 
 		fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS + 1);
@@ -707,14 +837,14 @@ test("a stalled image echo cannot hold a settled prompt or dispatch after late p
 		});
 		expect(settlements).toBe(1);
 		expect(fixture.promptDeliveryCount()).toBe(0);
-		expect(fixture.imageUploadCount()).toBe(0);
+		await waitFor(() => fixture.liveImageUploadCount() === 0, "abandoned echo upload retirement");
 		await expect(prompt(fixture, "after abandoned echo")).rejects.toMatchObject({ code: "not_found" });
 
 		echoGate.resolve();
 		await Bun.sleep(20);
 		expect(settlements).toBe(1);
 		expect(fixture.promptDeliveryCount()).toBe(0);
-		expect(fixture.imageUploadCount()).toBe(0);
+		expect(fixture.liveImageUploadCount()).toBe(0);
 	} finally {
 		echoGate.resolve();
 		fixture.dispose();
@@ -738,14 +868,15 @@ test("cancelling before image echo completes settles locally without aborting a 
 		expect(await bounded(pending, "cancelled image echo")).toEqual({ stopReason: "cancelled" });
 		expect(fixture.abortCount()).toBe(0);
 		expect(fixture.promptDeliveryCount()).toBe(0);
-		expect(fixture.imageUploadCount()).toBe(0);
+		await waitFor(() => fixture.liveImageUploadCount() === 0, "cancelled echo upload retirement");
+		expect(fixture.imageUploadCount()).toBeGreaterThan(0);
 		expect(fixture.clock.pending).toBe(1);
 		const followUp = prompt(fixture, "after cancelled image echo");
 		await Bun.sleep(20);
 		expect(fixture.promptDeliveryCount()).toBe(0);
 		echoGate.resolve();
 		await waitFor(() => fixture.promptDeliveryCount() === 1, "follow-up after delayed image echo");
-		expect(fixture.imageUploadCount()).toBe(0);
+		expect(fixture.liveImageUploadCount()).toBe(0);
 		const userEchoes = fixture.updates.filter(update => update.update.sessionUpdate === "user_message_chunk");
 		expect(userEchoes.map(update => (update.update as { content: { type: string } }).content.type)).toEqual([
 			"image",
@@ -777,6 +908,8 @@ test("a successor behind an already-settled cancelled image echo is cancellable 
 		await bounded(echoStarted.promise, "cancelled predecessor image echo");
 		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel predecessor before dispatch");
 		expect(await bounded(predecessor, "settled predecessor cancellation")).toEqual({ stopReason: "cancelled" });
+		await waitFor(() => fixture.liveImageUploadCount() === 0, "predecessor staged upload retirement");
+		const uploadRequests = fixture.imageUploadCount();
 
 		const successor = prompt(fixture, "successor cancelled while predecessor echo is stuck");
 		const cancellation = fixture.agent.cancel({ sessionId: fixture.sessionId });
@@ -784,12 +917,14 @@ test("a successor behind an already-settled cancelled image echo is cancellable 
 		expect(await bounded(successor, "cancelled pending successor")).toEqual({ stopReason: "cancelled" });
 		expect(fixture.abortCount()).toBe(0);
 		expect(fixture.promptDeliveryCount()).toBe(0);
-		expect(fixture.imageUploadCount()).toBe(0);
+		expect(fixture.imageUploadCount()).toBe(uploadRequests);
+		expect(fixture.liveImageUploadCount()).toBe(0);
 
 		echoGate.resolve();
 		await Bun.sleep(20);
 		expect(fixture.promptDeliveryCount()).toBe(0);
-		expect(fixture.imageUploadCount()).toBe(0);
+		expect(fixture.imageUploadCount()).toBe(uploadRequests);
+		expect(fixture.liveImageUploadCount()).toBe(0);
 	} finally {
 		echoGate.resolve();
 		fixture.dispose();

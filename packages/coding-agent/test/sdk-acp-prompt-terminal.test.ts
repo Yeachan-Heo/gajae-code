@@ -962,6 +962,69 @@ test("ACP waits for SDK idle before retrying a busy successor", async () => {
 	}
 });
 
+for (const method of ["uploadImageBegin", "uploadImageAppend", "uploadImageFinish"] as const) {
+	test(`ACP ${method} rejection emits no user echo or turn dispatch`, async () => {
+		const fixture = await createFixture({ acceptStagedImages: true });
+		const rejection = vi
+			.spyOn(AcpSdkAdapter.prototype, method)
+			.mockRejectedValue(new SdkClientError("invalid_input", "Image staging rejected."));
+		const cancel = vi.spyOn(AcpSdkAdapter.prototype, "cancel");
+		try {
+			const bytes = Buffer.from(
+				await Bun.file(path.join(import.meta.dir, "fixtures/sdk-inline-image-large.png")).arrayBuffer(),
+			);
+			await expect(
+				bounded(
+					fixture.agent.prompt({
+						sessionId: fixture.sessionId,
+						prompt: [
+							{ type: "text", text: "must not appear" },
+							{ type: "image", mimeType: "image/png", data: bytes.toString("base64") },
+						],
+					} as PromptRequest),
+					"rejected image staging",
+				),
+			).rejects.toMatchObject({ code: "invalid_input" });
+			expect(rejection).toHaveBeenCalledTimes(1);
+			expect(fixture.updates.filter(update => update.update.sessionUpdate === "user_message_chunk")).toHaveLength(0);
+			expect(fixture.promptDeliveryCount()).toBe(0);
+			expect(cancel).not.toHaveBeenCalled();
+		} finally {
+			rejection.mockRestore();
+			cancel.mockRestore();
+			fixture.dispose();
+		}
+	});
+}
+
+test("ACP staged envelope overflow cannot leave a user echo", async () => {
+	const fixture = await createFixture({ acceptStagedImages: true });
+	const cancel = vi.spyOn(AcpSdkAdapter.prototype, "cancel");
+	try {
+		const bytes = Buffer.from(
+			await Bun.file(path.join(import.meta.dir, "fixtures/sdk-inline-image-large.png")).arrayBuffer(),
+		);
+		await expect(
+			bounded(
+				fixture.agent.prompt({
+					sessionId: fixture.sessionId,
+					prompt: [
+						{ type: "text", text: "x".repeat(256 * 1024) },
+						{ type: "image", mimeType: "image/png", data: bytes.toString("base64") },
+					],
+				} as PromptRequest),
+				"oversize staged envelope",
+			),
+		).rejects.toMatchObject({ code: "invalid_input" });
+		expect(fixture.updates.filter(update => update.update.sessionUpdate === "user_message_chunk")).toHaveLength(0);
+		expect(fixture.promptDeliveryCount()).toBe(0);
+		expect(cancel).not.toHaveBeenCalled();
+	} finally {
+		cancel.mockRestore();
+		fixture.dispose();
+	}
+});
+
 test.each([
 	"post-redemption",
 	"pre-redemption",
