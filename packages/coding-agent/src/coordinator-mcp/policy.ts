@@ -86,9 +86,19 @@ const LEGACY_MUTATION_CLASS_ALIASES = new Map<string, CoordinatorMutationClass>(
 	["report", "reports"],
 ]);
 
+// Number.parseInt reads a leading digit prefix ("64KB" -> 64, "1e6" -> 1,
+// "1.5" -> 1), which would silently shrink a cap or TTL to a tiny value. Only
+// plain decimal digits count; anything else falls back to the default.
+function parsePositiveInt(value: string | undefined): number | undefined {
+	const trimmed = (value ?? "").trim();
+	if (!/^\d+$/.test(trimmed)) return undefined;
+	const parsed = Number.parseInt(trimmed, 10);
+	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
 function parsePositiveIntMs(value: string | undefined, fallback: number, floor: number): number {
-	const parsed = Number.parseInt((value ?? "").trim(), 10);
-	if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+	const parsed = parsePositiveInt(value);
+	if (parsed === undefined) return fallback;
 	return Math.max(floor, parsed);
 }
 
@@ -133,8 +143,8 @@ function parseMutationClasses(value: string | undefined): Set<CoordinatorMutatio
 }
 
 function parseByteCap(value: string | undefined): number {
-	const parsed = Number.parseInt(value ?? "", 10);
-	if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_ARTIFACT_BYTE_CAP;
+	const parsed = parsePositiveInt(value);
+	if (parsed === undefined) return DEFAULT_ARTIFACT_BYTE_CAP;
 	return Math.min(parsed, MAX_ARTIFACT_BYTE_CAP);
 }
 

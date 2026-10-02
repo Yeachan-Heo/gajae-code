@@ -33,6 +33,32 @@ describe("Hermes MCP safety policy", () => {
 		expect(config.artifactByteCap).toBe(65536);
 	});
 
+	it("falls back to defaults for malformed numeric env values instead of reading a digit prefix", () => {
+		const defaults = buildCoordinatorMcpConfig({});
+		for (const value of ["64KB", "1e6", "1.5", "0x10", "-5", "0", " ", "abc"]) {
+			const config = buildCoordinatorMcpConfig({
+				GJC_COORDINATOR_MCP_ARTIFACT_BYTE_CAP: value,
+				GJC_COORDINATOR_MCP_SESSION_IDLE_TTL_MS: value,
+				GJC_COORDINATOR_MCP_SESSION_SWEEP_INTERVAL_MS: value,
+			});
+			expect(config.artifactByteCap, value).toBe(defaults.artifactByteCap);
+			expect(config.sessionIdleTtlMs, value).toBe(defaults.sessionIdleTtlMs);
+			expect(config.sessionSweepIntervalMs, value).toBe(defaults.sessionSweepIntervalMs);
+		}
+	});
+
+	it("accepts plain digit env values with surrounding whitespace and keeps the byte cap ceiling", () => {
+		const config = buildCoordinatorMcpConfig({
+			GJC_COORDINATOR_MCP_ARTIFACT_BYTE_CAP: " 4096 ",
+			GJC_COORDINATOR_MCP_SESSION_IDLE_TTL_MS: "99999999999",
+		});
+		expect(config.artifactByteCap).toBe(4096);
+		expect(config.sessionIdleTtlMs).toBe(99999999999);
+		expect(buildCoordinatorMcpConfig({ GJC_COORDINATOR_MCP_ARTIFACT_BYTE_CAP: "99999999" }).artifactByteCap).toBe(
+			1024 * 1024,
+		);
+	});
+
 	it("scopes the default state root to GJC_SESSION_ID when present", () => {
 		const config = buildCoordinatorMcpConfig({ GJC_SESSION_ID: "coordinator-policy-test-session" });
 
