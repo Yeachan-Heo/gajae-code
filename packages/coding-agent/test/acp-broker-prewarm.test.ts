@@ -78,6 +78,74 @@ describe("ACP broker prewarm", () => {
 		expect(calls).toBe(2);
 	});
 
+	it("declines a joined prewarm retry when session/new cannot reserve lifecycle time", async () => {
+		const first = deferred<{ adapter: AcpSdkAdapter; client: SdkClient }>();
+		const second = deferred<{ adapter: AcpSdkAdapter; client: SdkClient }>();
+		let calls = 0;
+		let now = 0;
+		const abort = new AbortController();
+		const agent = new AcpAgent(
+			{ signal: abort.signal, closed: Promise.resolve() } as unknown as AgentSideConnection,
+			{
+				promptWatchdogClock: {
+					now: () => now,
+					schedule: () => () => {},
+				},
+				brokerConnector: () => {
+					calls += 1;
+					return calls === 1 ? first.promise : second.promise;
+				},
+			},
+		);
+
+		await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+		const originalError = new Error("prewarm failed too late");
+		const session = agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+		now = 17_000;
+		first.reject(originalError);
+
+		await expect(session).rejects.toBe(originalError);
+		expect(calls).toBe(1);
+	});
+
+	it("bounds a joined prewarm retry by the remaining session/new budget", async () => {
+		const first = deferred<{ adapter: AcpSdkAdapter; client: SdkClient }>();
+		const second = deferred<{ adapter: AcpSdkAdapter; client: SdkClient }>();
+		const retryStarted = deferred<void>();
+		let calls = 0;
+		let now = 0;
+		let deadlineHandler: (() => void) | undefined;
+		const abort = new AbortController();
+		const agent = new AcpAgent(
+			{ signal: abort.signal, closed: Promise.resolve() } as unknown as AgentSideConnection,
+			{
+				promptWatchdogClock: {
+					now: () => now,
+					schedule: (handler: () => void) => {
+						deadlineHandler = handler;
+						return () => {};
+					},
+				},
+				brokerConnector: () => {
+					calls += 1;
+					if (calls === 2) retryStarted.resolve();
+					return calls === 1 ? first.promise : second.promise;
+				},
+			},
+		);
+
+		await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+		const session = agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+		first.reject(new Error("prewarm failed"));
+		await retryStarted.promise;
+		expect(calls).toBe(2);
+		now = 60_000;
+		deadlineHandler?.();
+
+		await expect(session).rejects.toThrow("ACP broker connection exceeded its request budget.");
+		expect(calls).toBe(2);
+	});
+
 	it("does not retry a foreground attempt that starts after prewarm failure", async () => {
 		const first = deferred<{ adapter: AcpSdkAdapter; client: SdkClient }>();
 		const foreground = deferred<{ adapter: AcpSdkAdapter; client: SdkClient }>();

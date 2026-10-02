@@ -50,6 +50,7 @@ import { hasAcpFinalTextContent, resolveAcpFinalText } from "../../sdk/acp/final
 import type { SessionLifecycleMcpServer } from "../../sdk/acp/mcp";
 import { ensureBroker } from "../../sdk/broker/ensure";
 import { canonicalSessionCwd } from "../../sdk/broker/session-index";
+import { lifecycleStartupBudgetMs } from "../../sdk/broker/startup-budget";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/client";
 import type { AbortScope } from "../../sdk/host/control/operations";
 import { SYNTHETIC_PROVIDER_ID } from "../../sdk/model-profile-namespace";
@@ -148,6 +149,7 @@ export const ACP_EXTERNAL_CONNECT_TIMEOUT_MS = 60_000;
  * budget near 45s — a ~15s margin under the 60s ceiling.
  */
 export const ACP_SESSION_READINESS_TIMEOUT_MS = 22_000;
+const ACP_SESSION_CREATE_LIFECYCLE_ALLOWANCE_MS = lifecycleStartupBudgetMs(ACP_SESSION_READINESS_TIMEOUT_MS);
 
 /**
  * A freshly created session host can accept the first turn before it has finished
@@ -249,6 +251,11 @@ type PromptPhaseOwner = PromptWaiter | "background" | undefined;
 
 type BrokerConnection = { adapter: AcpSdkAdapter; client: SdkClient };
 type BrokerConnector = () => Promise<BrokerConnection>;
+type BrokerConnectionOptions = {
+	speculative?: boolean;
+	deadlineAt?: number;
+	retryReserveMs?: number;
+};
 type PendingAttachment = { epoch: number; task: Promise<void> };
 
 type PromptAdmissionSettlement = { kind: "cancelled" } | { kind: "rejected"; error: AcpSdkAdapterError };
@@ -1877,6 +1884,7 @@ export class AcpAgent implements Agent {
 	}
 
 	async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
+		const deadlineAt = this.#promptWatchdogClock.now() + ACP_EXTERNAL_CONNECT_TIMEOUT_MS;
 		const mcpServers = this.#mcpServers(params);
 		this.#assertAbsoluteCwd(params.cwd);
 		this.#assertNoAdditionalDirectories(params.additionalDirectories);
@@ -1896,6 +1904,7 @@ export class AcpAgent implements Agent {
 				},
 				randomUUID(),
 				mcpServers,
+				{ deadlineAt, retryReserveMs: ACP_SESSION_CREATE_LIFECYCLE_ALLOWANCE_MS },
 			);
 			phases.launchMs = performance.now() - phaseStartedAt;
 			id = sessionId(result);
@@ -4262,8 +4271,8 @@ export class AcpAgent implements Agent {
 		} catch {}
 	}
 
-	async #brokerAdapter(): Promise<AcpSdkAdapter> {
-		return (await this.#brokerConnection()).adapter;
+	async #brokerAdapter(options: BrokerConnectionOptions = {}): Promise<AcpSdkAdapter> {
+		return (await this.#brokerConnection(options)).adapter;
 	}
 
 	#closeBrokerAdapter(adapter: AcpSdkAdapter): Promise<void> {
@@ -4274,7 +4283,7 @@ export class AcpAgent implements Agent {
 		return closing;
 	}
 
-	async #brokerConnection(options: { speculative?: boolean } = {}): Promise<BrokerConnection> {
+	async #brokerConnection(options: BrokerConnectionOptions = {}): Promise<BrokerConnection> {
 		if (!this.#broker) {
 			let pending!: Promise<BrokerConnection>;
 			pending = this.#brokerConnector?.() ?? this.#connectBroker(() => pending);
@@ -4284,7 +4293,7 @@ export class AcpAgent implements Agent {
 		const pending = this.#broker;
 		const joinedSpeculative = this.#speculativeBroker === pending;
 		try {
-			const connection = await pending;
+			const connection = await this.#awaitBrokerDeadline(pending, options.deadlineAt);
 			if (this.#disposed) {
 				try {
 					await this.#closeBrokerAdapter(connection.adapter);
@@ -4296,8 +4305,40 @@ export class AcpAgent implements Agent {
 		} catch (error) {
 			if (this.#broker === pending && !this.#disposed) this.#broker = undefined;
 			if (this.#speculativeBroker === pending) this.#speculativeBroker = undefined;
-			if (joinedSpeculative && !options.speculative && !this.#disposed) return await this.#brokerConnection();
+			if (joinedSpeculative && !options.speculative && !this.#disposed) {
+				if (
+					options.deadlineAt !== undefined &&
+					options.retryReserveMs !== undefined &&
+					options.deadlineAt - this.#promptWatchdogClock.now() < options.retryReserveMs
+				)
+					throw error;
+				return await this.#brokerConnection({
+					deadlineAt: options.deadlineAt,
+					retryReserveMs: options.retryReserveMs,
+				});
+			}
 			throw error;
+		}
+	}
+
+	async #awaitBrokerDeadline(pending: Promise<BrokerConnection>, deadlineAt?: number): Promise<BrokerConnection> {
+		if (deadlineAt === undefined) return await pending;
+		const remainingMs = deadlineAt - this.#promptWatchdogClock.now();
+		if (remainingMs <= 0) throw new AcpSdkAdapterError("timeout", "ACP broker connection exceeded its request budget.");
+		let timedOut = false;
+		const timeout = Promise.withResolvers<BrokerConnection>();
+		const cancel = this.#promptWatchdogClock.schedule(() => {
+			timedOut = true;
+			timeout.reject(new AcpSdkAdapterError("timeout", "ACP broker connection exceeded its request budget."));
+		}, remainingMs);
+		const guarded = pending.then(connection => {
+			if (timedOut) void this.#closeBrokerAdapter(connection.adapter).catch(() => undefined);
+			return connection;
+		});
+		try {
+			return await Promise.race([guarded, timeout.promise]);
+		} finally {
+			cancel();
 		}
 	}
 
@@ -6016,9 +6057,10 @@ export class AcpAgent implements Agent {
 		input: JsonObject,
 		idempotencyKey: string,
 		mcpServers: SessionLifecycleMcpServer[],
+		brokerOptions?: BrokerConnectionOptions,
 	): Promise<unknown> {
 		try {
-			return await (await this.#brokerAdapter()).lifecycle(operation, input, idempotencyKey);
+			return await (await this.#brokerAdapter(brokerOptions)).lifecycle(operation, input, idempotencyKey);
 		} catch (error) {
 			throw acpMcpLaunchFailure(error, mcpServers);
 		}
