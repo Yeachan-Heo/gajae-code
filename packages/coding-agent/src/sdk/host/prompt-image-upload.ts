@@ -16,7 +16,8 @@ const MAX_UPLOADS = 16;
 const MAX_ACCEPTED_BYTES = 64 * 1024 * 1024;
 const MAX_PROCESS_BYTES = 256 * 1024 * 1024;
 const MAX_CONCURRENT_FINISHES = 1;
-const LEASE_MS = 2 * 60_000;
+const LEASE_MS = 120_000;
+const MAX_BATCH_ID_LENGTH = 128;
 const CANONICAL_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 let processBytes = 0;
 let transientBytes = 0;
@@ -24,6 +25,7 @@ let concurrentFinishes = 0;
 
 type Upload = {
 	owner: string;
+	batchId?: string;
 	mimeType: string;
 	byteLength: number;
 	sha256: string;
@@ -71,7 +73,7 @@ export class PromptImageUploadStore {
 		this.#assertOpen();
 		const owner = ownerId(connectionId);
 		this.#assertConnected(owner);
-		const input = object(value, ["mimeType", "byteLength", "sha256"]);
+		const input = object(value, ["mimeType", "byteLength", "sha256", "batchId"]);
 		if (
 			typeof input.mimeType !== "string" ||
 			!["image/png", "image/jpeg", "image/webp", "image/gif"].includes(input.mimeType)
@@ -85,12 +87,18 @@ export class PromptImageUploadStore {
 			invalid("Image byteLength exceeds the 20 MiB limit.");
 		if (typeof input.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(input.sha256))
 			invalid("Invalid image SHA-256 digest.");
+		if (
+			Object.hasOwn(input, "batchId") &&
+			(typeof input.batchId !== "string" || input.batchId.length === 0 || input.batchId.length > MAX_BATCH_ID_LENGTH)
+		)
+			invalid("Image batchId must be a nonempty string of at most 128 characters.");
 		if (this.#uploads.size >= MAX_UPLOADS) busy("Too many concurrent image uploads.");
 		const id = crypto.randomUUID();
 		const timer = setTimeout(() => this.#remove(id), LEASE_MS);
 		timer.unref?.();
-		this.#uploads.set(id, {
+		const upload: Upload = {
 			owner,
+			...(typeof input.batchId === "string" ? { batchId: input.batchId } : {}),
 			mimeType: input.mimeType,
 			byteLength: input.byteLength as number,
 			sha256: input.sha256,
@@ -101,7 +109,9 @@ export class PromptImageUploadStore {
 			finishing: false,
 			finished: false,
 			timer,
-		});
+		};
+		this.#uploads.set(id, upload);
+		this.#renewBatch(owner, id, upload);
 		return { id, nextSequence: 0 };
 	}
 
@@ -173,6 +183,7 @@ export class PromptImageUploadStore {
 			processBytes -= addedBytes;
 			throw error;
 		}
+		this.#renewBatch(upload.owner, input.id as string, upload);
 		return { id: input.id as string, nextSequence: upload.sequence, receivedBytes: upload.length };
 	}
 
@@ -231,6 +242,7 @@ export class PromptImageUploadStore {
 			upload.chunks = [bytes];
 			upload.reservedBytes = upload.length;
 			upload.finished = true;
+			this.#renewBatch(upload.owner, input.id as string, upload);
 			return { id: input.id as string, byteLength: upload.length, sha256: upload.sha256, mimeType: upload.mimeType };
 		} finally {
 			// A discarded lease still owns its source chunks until this async decode settles.
@@ -327,6 +339,20 @@ export class PromptImageUploadStore {
 	#assertConnected(owner: string): void {
 		if (!this.#isConnectionOpen(owner))
 			throw new TypedControlError("resource_gone", "Image upload connection is closed.");
+	}
+	#renewBatch(owner: string, id: string, current: Upload): void {
+		if (this.#uploads.get(id) !== current) return;
+		if (current.batchId === undefined) {
+			this.#resetLease(id, current);
+			return;
+		}
+		for (const [uploadId, upload] of this.#uploads)
+			if (upload.owner === owner && upload.batchId === current.batchId) this.#resetLease(uploadId, upload);
+	}
+	#resetLease(id: string, upload: Upload): void {
+		clearTimeout(upload.timer);
+		upload.timer = setTimeout(() => this.#remove(id), LEASE_MS);
+		upload.timer.unref?.();
 	}
 	#remove(id: string): void {
 		const upload = this.#uploads.get(id);

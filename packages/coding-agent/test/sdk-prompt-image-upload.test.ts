@@ -23,6 +23,20 @@ function pngChunk(type: string, data = Buffer.alloc(0)): Buffer {
 	return Buffer.concat([length, name, data, checksum]);
 }
 
+function tinyPng(seed = 17): Buffer {
+	const header = Buffer.alloc(13);
+	header.writeUInt32BE(1, 0);
+	header.writeUInt32BE(1, 4);
+	header[8] = 8;
+	header[9] = 2;
+	return Buffer.concat([
+		PNG_SIGNATURE,
+		pngChunk("IHDR", header),
+		pngChunk("IDAT", deflateSync(Buffer.from([0, seed & 255, (seed + 1) & 255, (seed + 2) & 255]))),
+		pngChunk("IEND"),
+	]);
+}
+
 /** Uncompressed scanlines with varied RGB pixels: the encoded image itself exceeds one SDK frame. */
 function originalLargePng(seed = 0x12345678): Buffer {
 	const width = 400;
@@ -55,8 +69,9 @@ function originalLargePng(seed = 0x12345678): Buffer {
 const digest = (bytes: Buffer): string => createHash("sha256").update(bytes).digest("hex");
 const descriptor = (bytes: Buffer) => ({ mimeType: "image/png", byteLength: bytes.length, sha256: digest(bytes) });
 
-function upload(store: PromptImageUploadStore, owner: string, bytes: Buffer): string {
-	const { id } = store.begin(owner, descriptor(bytes));
+function upload(store: PromptImageUploadStore, owner: string, bytes: Buffer, batchId?: string): string {
+	const input = descriptor(bytes);
+	const { id } = store.begin(owner, batchId === undefined ? input : { ...input, batchId });
 	let sequence = 0;
 	for (let offset = 0; offset < bytes.length; offset += 96 * 1024) {
 		const chunk = bytes.subarray(offset, offset + 96 * 1024);
@@ -69,8 +84,8 @@ function upload(store: PromptImageUploadStore, owner: string, bytes: Buffer): st
 	return id;
 }
 
-async function stage(store: PromptImageUploadStore, owner: string, bytes: Buffer): Promise<string> {
-	const id = upload(store, owner, bytes);
+async function stage(store: PromptImageUploadStore, owner: string, bytes: Buffer, batchId?: string): Promise<string> {
+	const id = upload(store, owner, bytes, batchId);
 	await store.finish(owner, { id });
 	return id;
 }
@@ -216,7 +231,7 @@ test("coalesced allocation quotas recover on discard, disconnect and expiry", ()
 		expect(() => expiredStore.append("sender", { id: ids[3]!, sequence: 170, data: crossingChunk })).toThrow(
 			expect.objectContaining({ code: "busy" }),
 		);
-		vi.advanceTimersByTime(2 * 60_000);
+		vi.advanceTimersByTime(120_000);
 		const replacement = expiredStore.begin("sender", {
 			mimeType: "image/png",
 			byteLength: 20 * 1024 * 1024,
@@ -447,7 +462,7 @@ test("expired leases free capacity and a discard during decoding cannot resurrec
 		vi.useFakeTimers();
 		const expired = store.begin("sender", descriptor(bytes));
 		store.append("sender", { id: expired.id, sequence: 0, data: bytes.subarray(0, 96 * 1024).toString("base64") });
-		vi.advanceTimersByTime(2 * 60_000);
+		vi.advanceTimersByTime(120_000);
 		expect(() => store.append("sender", { id: expired.id, sequence: 1, data: "AA==" })).toThrow(
 			expect.objectContaining({ code: "resource_gone" }),
 		);
@@ -473,6 +488,180 @@ test("expired leases free capacity and a discard during decoding cannot resurrec
 		} finally {
 			accepted.release();
 		}
+	} finally {
+		vi.useRealTimers();
+		store.close();
+	}
+});
+
+test("batch IDs are nonempty strings bounded to 128 characters", () => {
+	const store = new PromptImageUploadStore(alwaysConnected);
+	const input = descriptor(tinyPng());
+	try {
+		for (const batchId of ["", "x".repeat(129), 17, null, undefined])
+			expect(() => store.begin("sender", { ...input, batchId })).toThrow(
+				expect.objectContaining({ code: "invalid_input" }),
+			);
+		expect(store.begin("sender", { ...input, batchId: "x".repeat(128) })).toMatchObject({ nextSequence: 0 });
+		expect(store.begin("sender", input)).toMatchObject({ nextSequence: 0 });
+	} finally {
+		store.close();
+	}
+});
+
+test("slow same-batch progress renews early-finished uploads for the full transfer", async () => {
+	const earlyBytes = tinyPng(11);
+	const slowBytes = originalLargePng();
+	const store = new PromptImageUploadStore(alwaysConnected);
+	try {
+		vi.useFakeTimers();
+		const early = await stage(store, "sender", earlyBytes, "request-ref");
+		const slow = store.begin("sender", { ...descriptor(slowBytes), batchId: "request-ref" });
+		const startedAt = Date.now();
+		for (let offset = 0, sequence = 0; offset < slowBytes.length; offset += MAX_CHUNK_BYTES, sequence++) {
+			vi.advanceTimersByTime(60_000);
+			store.append("sender", {
+				id: slow.id,
+				sequence,
+				data: slowBytes.subarray(offset, offset + MAX_CHUNK_BYTES).toString("base64"),
+			});
+		}
+		expect(Date.now() - startedAt).toBeGreaterThan(120_000);
+		await store.finish("sender", { id: slow.id });
+		const accepted = store.redeem("sender", [{ id: early }, { id: slow.id }]);
+		try {
+			expect(accepted.images.map(image => Buffer.from(image.data, "base64").toString("hex"))).toEqual([
+				earlyBytes.toString("hex"),
+				slowBytes.toString("hex"),
+			]);
+		} finally {
+			accepted.release();
+		}
+	} finally {
+		vi.useRealTimers();
+		store.close();
+	}
+});
+
+test("successful finish renews finished peers in the same batch", async () => {
+	const peerBytes = tinyPng(31);
+	const finishingBytes = tinyPng(73);
+	const store = new PromptImageUploadStore(alwaysConnected);
+	try {
+		vi.useFakeTimers();
+		const peer = await stage(store, "sender", peerBytes, "finish-ref");
+		const finishing = upload(store, "sender", finishingBytes, "finish-ref");
+		vi.advanceTimersByTime(119_000);
+		await store.finish("sender", { id: finishing });
+		vi.advanceTimersByTime(2_000);
+		const accepted = store.redeem("sender", [{ id: peer }]);
+		try {
+			expect(Buffer.from(accepted.images[0]!.data, "base64").equals(peerBytes)).toBe(true);
+		} finally {
+			accepted.release();
+		}
+	} finally {
+		vi.useRealTimers();
+		store.close();
+	}
+});
+
+test("batch lease renewals are owner-scoped and unbatched progress renews only its entry", async () => {
+	const bytes = tinyPng();
+	const store = new PromptImageUploadStore(alwaysConnected);
+	try {
+		vi.useFakeTimers();
+		const sameBatch = await stage(store, "owner", bytes, "shared");
+		const otherBatch = await stage(store, "owner", bytes, "different");
+		const otherOwner = await stage(store, "other-owner", bytes, "shared");
+		const unbatched = await stage(store, "owner", bytes);
+		const partial = { mimeType: "image/png", byteLength: 2, sha256: "0".repeat(64) };
+		const unbatchedProgress = store.begin("owner", partial);
+		const unbatchedSibling = store.begin("owner", partial);
+
+		vi.advanceTimersByTime(119_000);
+		const newBatchEntry = store.begin("owner", { ...partial, batchId: "shared" });
+		store.append("owner", { id: unbatchedProgress.id, sequence: 0, data: "AQ==" });
+		vi.advanceTimersByTime(2_000);
+
+		const accepted = store.redeem("owner", [{ id: sameBatch }]);
+		accepted.release();
+		for (const [owner, id] of [
+			["owner", otherBatch],
+			["other-owner", otherOwner],
+			["owner", unbatched],
+		] as const)
+			expect(() => store.redeem(owner, [{ id }])).toThrow(expect.objectContaining({ code: "resource_gone" }));
+		expect(() => store.append("owner", { id: unbatchedSibling.id, sequence: 0, data: "AQ==" })).toThrow(
+			expect.objectContaining({ code: "resource_gone" }),
+		);
+		expect(store.append("owner", { id: unbatchedProgress.id, sequence: 1, data: "Ag==" })).toMatchObject({
+			receivedBytes: 2,
+		});
+		expect(store.append("owner", { id: newBatchEntry.id, sequence: 0, data: "AQ==" })).toMatchObject({
+			receivedBytes: 1,
+		});
+	} finally {
+		vi.useRealTimers();
+		store.close();
+	}
+});
+
+test("invalid, incomplete, repeated and busy traffic cannot extend upload leases", async () => {
+	const bytes = tinyPng();
+	const store = new PromptImageUploadStore(alwaysConnected);
+	const partial = { mimeType: "image/png", byteLength: 2, sha256: "0".repeat(64) };
+	try {
+		vi.useFakeTimers();
+		const incomplete = store.begin("incomplete-owner", partial);
+		const invalidBatch = await stage(store, "invalid-owner", bytes, "shared");
+		const finished = await stage(store, "finished-owner", bytes, "repeat");
+		const wrongDigest = store.begin("digest-owner", {
+			...descriptor(bytes),
+			sha256: "0".repeat(64),
+			batchId: "failed-finish",
+		});
+		store.append("digest-owner", { id: wrongDigest.id, sequence: 0, data: bytes.toString("base64") });
+		const failedFinishPeer = await stage(store, "digest-owner", bytes, "failed-finish");
+		const busyTarget = store.begin("busy-owner", { ...descriptor(bytes), batchId: "busy" });
+		for (let index = 0; index < 10; index++) store.begin("busy-owner", descriptor(bytes));
+
+		vi.advanceTimersByTime(119_000);
+		expect(() => store.append("incomplete-owner", { id: incomplete.id, sequence: 1, data: "AQ==" })).toThrow(
+			expect.objectContaining({ code: "invalid_input" }),
+		);
+		await expect(store.finish("incomplete-owner", { id: incomplete.id })).rejects.toMatchObject({
+			code: "invalid_input",
+		});
+		expect(() => store.begin("invalid-owner", { ...descriptor(bytes), batchId: "x".repeat(129) })).toThrow(
+			expect.objectContaining({ code: "invalid_input" }),
+		);
+		await expect(store.finish("finished-owner", { id: finished })).rejects.toMatchObject({
+			code: "invalid_input",
+		});
+		await expect(store.finish("digest-owner", { id: wrongDigest.id })).rejects.toMatchObject({
+			code: "invalid_input",
+		});
+		expect(() => store.begin("busy-owner", { ...descriptor(bytes), batchId: "busy" })).toThrow(
+			expect.objectContaining({ code: "busy" }),
+		);
+		vi.advanceTimersByTime(2_000);
+
+		expect(() => store.append("incomplete-owner", { id: incomplete.id, sequence: 0, data: "AQ==" })).toThrow(
+			expect.objectContaining({ code: "resource_gone" }),
+		);
+		for (const [owner, id] of [
+			["invalid-owner", invalidBatch],
+			["finished-owner", finished],
+			["digest-owner", failedFinishPeer],
+		] as const)
+			expect(() => store.redeem(owner, [{ id }])).toThrow(expect.objectContaining({ code: "resource_gone" }));
+		expect(() => store.append("digest-owner", { id: wrongDigest.id, sequence: 1, data: "AQ==" })).toThrow(
+			expect.objectContaining({ code: "resource_gone" }),
+		);
+		expect(() => store.append("busy-owner", { id: busyTarget.id, sequence: 0, data: "AQ==" })).toThrow(
+			expect.objectContaining({ code: "resource_gone" }),
+		);
 	} finally {
 		vi.useRealTimers();
 		store.close();
