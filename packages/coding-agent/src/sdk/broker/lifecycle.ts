@@ -1870,12 +1870,21 @@ export async function writeSessionLifecycleReady(
 	let publicationAttempted = false;
 	let publicationIdentity: (NativeExactFileIdentity & LifecyclePublicationIdentity) | undefined;
 	let placeholderIdentity: (LifecyclePublicationIdentity & { nlink: bigint }) | undefined;
+	let deadPredecessorIdentity: (LifecyclePublicationIdentity & { nlink: bigint }) | undefined;
 	let directoryChanged = false;
 	let retainedPublicationPath: string | undefined;
 	let revocation: Promise<boolean> | undefined;
 	const parentStillOwned = (): boolean => {
 		const current = lifecycleParentIdentity(directory);
 		return current !== undefined && current.dev === parent.dev && current.ino === parent.ino;
+	};
+	const readyPathHoldsAnotherInode = (identity: { dev: bigint; ino: bigint }): boolean => {
+		try {
+			const current = fsSync.lstatSync(readyPath, { bigint: true });
+			return current.dev !== identity.dev || current.ino !== identity.ino;
+		} catch (error) {
+			return (error as NodeJS.ErrnoException).code === "ENOENT";
+		}
 	};
 	const capturePublicationIdentity = async (
 		fileHandle: fs.FileHandle,
@@ -1918,19 +1927,42 @@ export async function writeSessionLifecycleReady(
 		handle = undefined;
 		if (!canPublish()) throw new Error("Lifecycle readiness cutoff passed before publication.");
 		if (!parentStillOwned()) throw new Error("Lifecycle readiness directory identity changed before publication.");
-		placeholderHandle = await fs.open(
-			readyPath,
-			fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_RDWR,
-			0o600,
-		);
-		placeholderCreatedByUs = true;
-		directoryChanged = true;
-		await placeholderHandle.sync();
-		placeholderIdentity = await captureOpenedLifecycleFileIdentity(placeholderHandle);
-		if (placeholderIdentity.size !== 0n || placeholderIdentity.nlink !== 1n)
-			throw new Error("Lifecycle readiness placeholder identity is invalid.");
-		await placeholderHandle.close();
-		placeholderHandle = undefined;
+		const predecessor = captureLifecycleFile(readyPath, false, true);
+		if (predecessor) {
+			let predecessorMarker: unknown;
+			try {
+				predecessorMarker = parseLifecycleJson(predecessor.bytes);
+			} catch {
+				predecessorMarker = undefined;
+			}
+			// Only a predecessor whose exact owner is proven exited may be exchanged away. A live,
+			// uncertain, or unrecognised holder keeps the O_EXCL placeholder path and its EEXIST
+			// failure, so owner-bound publication (#5893) never displaces another process's authority.
+			if (
+				isExactEffectMarker(predecessorMarker) &&
+				observeProcess(predecessorMarker.pid, predecessorMarker.incarnation) === "exited"
+			)
+				deadPredecessorIdentity = predecessor.identity;
+		}
+		let destinationIdentity: LifecyclePublicationIdentity & { nlink: bigint };
+		if (deadPredecessorIdentity) {
+			destinationIdentity = deadPredecessorIdentity;
+		} else {
+			placeholderHandle = await fs.open(
+				readyPath,
+				fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_RDWR,
+				0o600,
+			);
+			placeholderCreatedByUs = true;
+			directoryChanged = true;
+			await placeholderHandle.sync();
+			placeholderIdentity = await captureOpenedLifecycleFileIdentity(placeholderHandle);
+			if (placeholderIdentity.size !== 0n || placeholderIdentity.nlink !== 1n)
+				throw new Error("Lifecycle readiness placeholder identity is invalid.");
+			await placeholderHandle.close();
+			placeholderHandle = undefined;
+			destinationIdentity = placeholderIdentity;
+		}
 		if (!parentStillOwned()) throw new Error("Lifecycle readiness directory identity changed before commit.");
 		if (!canPublish()) throw new Error("Lifecycle readiness cutoff passed before publication commit.");
 		publicationAttempted = true;
@@ -1943,7 +1975,7 @@ export async function writeSessionLifecycleReady(
 				parentIno: parentIdentity.ino,
 			},
 			{
-				...placeholderIdentity,
+				...destinationIdentity,
 				parentDev: parentIdentity.dev,
 				parentIno: parentIdentity.ino,
 			},
@@ -2001,6 +2033,12 @@ export async function writeSessionLifecycleReady(
 				readyPathRemoved = removeOwnedLifecycleReadyMarker(root, id, publicationIdentity, parentIdentity);
 			if (!readyPathRemoved && placeholderCreatedByUs && placeholderIdentity)
 				readyPathRemoved = removeLifecyclePublicationFile(readyPath, placeholderIdentity, parentIdentity);
+			// An exchange over a dead predecessor that failed before committing leaves that predecessor
+			// or a racing successor at readyPath, which this writer must not revoke. Our inode can only
+			// reach readyPath through the exchange, so an inode that is not ours proves nothing of ours
+			// remains there; any other outcome keeps the fail-closed cleanup escalation.
+			if (!readyPathRemoved && deadPredecessorIdentity && !published && publicationIdentity)
+				readyPathRemoved = readyPathHoldsAnotherInode(publicationIdentity);
 			if ((published || publicationAttempted || placeholderCreatedByUs) && !readyPathRemoved)
 				cleanupErrors.push(new Error("Lifecycle readiness authority could not be exactly revoked."));
 			if (temporaryCreatedByUs) {

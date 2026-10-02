@@ -2771,6 +2771,187 @@ test("failed atomic readiness replacement removes only its empty placeholder", a
 	}
 });
 
+async function writeDeadOwnerReadyMarker(readyPath: string, effectMarker: string) {
+	const dead = spawnDisposableHost();
+	const deadIncarnation = await incarnation(dead.pid);
+	dead.kill("SIGTERM");
+	await dead.exited;
+	await fs.mkdir(path.dirname(readyPath), { recursive: true, mode: 0o700 });
+	const bytes = Buffer.from(JSON.stringify({ pid: dead.pid, effectMarker, incarnation: deadIncarnation }), "utf8");
+	await fs.writeFile(readyPath, bytes, { mode: 0o600 });
+	return { bytes, ino: (await fs.stat(readyPath, { bigint: true })).ino };
+}
+
+async function readyDirectoryResidue(readyPath: string): Promise<string[]> {
+	return (await fs.readdir(path.dirname(readyPath))).filter(
+		name => name.endsWith(".tmp") || name.startsWith(".gjc-reap-"),
+	);
+}
+
+test("ready publication replaces a dead owner's stale ready marker for the same session", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ready-stale-dead-owner-"));
+	const sessionId = "ready-stale-dead-owner";
+	const readyPath = path.join(root, "sdk", `${sessionId}.lifecycle.ready.json`);
+	try {
+		const stale = await writeDeadOwnerReadyMarker(readyPath, "stale-owner-marker");
+		await expect(writeSessionLifecycleReady(root, sessionId, "successor-marker")).resolves.toBeUndefined();
+		expect(JSON.parse(await fs.readFile(readyPath, "utf8"))).toEqual({
+			pid: process.pid,
+			effectMarker: "successor-marker",
+			incarnation: await incarnation(process.pid),
+		});
+		expect((await fs.stat(readyPath, { bigint: true })).ino).not.toBe(stale.ino);
+		expect(await readyDirectoryResidue(readyPath)).toEqual([]);
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+for (const holder of ["live owner", "uncertain owner", "unrecognised content", "empty placeholder"] as const) {
+	test.skipIf(holder === "uncertain owner" && process.getuid?.() === 0)(
+		`ready publication retains a stale ready marker held by a ${holder}`,
+		async () => {
+			const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ready-stale-retained-"));
+			const sessionId = "ready-stale-retained";
+			const readyPath = path.join(root, "sdk", `${sessionId}.lifecycle.ready.json`);
+			try {
+				await fs.mkdir(path.dirname(readyPath), { recursive: true, mode: 0o700 });
+				const bytes =
+					holder === "live owner"
+						? JSON.stringify({
+								pid: process.pid,
+								effectMarker: "live-owner-marker",
+								incarnation: await incarnation(process.pid),
+							})
+						: holder === "uncertain owner"
+							? JSON.stringify({ pid: 1, effectMarker: "foreign", incarnation: "foreign:1" })
+							: holder === "unrecognised content"
+								? "not json"
+								: "";
+				await fs.writeFile(readyPath, bytes, { mode: 0o600 });
+				const before = await fs.stat(readyPath, { bigint: true });
+				await expect(writeSessionLifecycleReady(root, sessionId, "successor-marker")).rejects.toMatchObject({
+					code: "EEXIST",
+				});
+				expect(await fs.readFile(readyPath, "utf8")).toBe(bytes);
+				expect((await fs.stat(readyPath, { bigint: true })).ino).toBe(before.ino);
+				expect(await readyDirectoryResidue(readyPath)).toEqual([]);
+			} finally {
+				await fs.rm(root, { recursive: true, force: true });
+			}
+		},
+	);
+}
+
+test("ready publication over a dead owner loses the exchange to a concurrent successor", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ready-stale-race-"));
+	const sessionId = "ready-stale-race";
+	const readyPath = path.join(root, "sdk", `${sessionId}.lifecycle.ready.json`);
+	const originalExactReplace = native.exactReplacePath.bind(native);
+	const successorBytes = JSON.stringify({ pid: process.pid, effectMarker: "racing-successor", incarnation: "race" });
+	let restoreReplaceSpy: (() => void) | undefined;
+	try {
+		await writeDeadOwnerReadyMarker(readyPath, "stale-owner-marker");
+		const replaceSpy = vi.spyOn(native, "exactReplacePath").mockImplementation((source, destination, from, to) => {
+			if (path.resolve(destination) === path.resolve(readyPath)) {
+				const replacement = path.join(path.dirname(readyPath), ".replacement-ready-marker.tmp");
+				writeFileSync(replacement, successorBytes);
+				syncFs.unlinkSync(readyPath);
+				syncFs.renameSync(replacement, readyPath);
+			}
+			return originalExactReplace(source, destination, from, to);
+		});
+		restoreReplaceSpy = () => replaceSpy.mockRestore();
+		const writing = writeSessionLifecycleReady(root, sessionId, "successor-marker");
+		await expect(writing).rejects.toThrow("Lifecycle readiness atomic publication failed: identity_mismatch.");
+		await expect(writing).rejects.not.toBeInstanceOf(LifecycleReadinessCleanupError);
+		expect(await fs.readFile(readyPath, "utf8")).toBe(successorBytes);
+		expect(await readyDirectoryResidue(readyPath)).toEqual([]);
+	} finally {
+		restoreReplaceSpy?.();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("failed readiness replacement over a dead owner leaves the dead owner's marker intact", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ready-stale-replace-failure-"));
+	const sessionId = "ready-stale-replace-failure";
+	const readyPath = path.join(root, "sdk", `${sessionId}.lifecycle.ready.json`);
+	const originalExactReplace = native.exactReplacePath.bind(native);
+	let restoreReplaceSpy: (() => void) | undefined;
+	try {
+		const stale = await writeDeadOwnerReadyMarker(readyPath, "stale-owner-marker");
+		const replaceSpy = vi.spyOn(native, "exactReplacePath").mockImplementation((source, destination, from, to) => {
+			if (path.resolve(destination) === path.resolve(readyPath))
+				return { ok: false, code: "controlled readiness replacement failure" };
+			return originalExactReplace(source, destination, from, to);
+		});
+		restoreReplaceSpy = () => replaceSpy.mockRestore();
+		const writing = writeSessionLifecycleReady(root, sessionId, "successor-marker");
+		await expect(writing).rejects.toThrow("controlled readiness replacement failure");
+		await expect(writing).rejects.not.toBeInstanceOf(LifecycleReadinessCleanupError);
+		expect(await fs.readFile(readyPath)).toEqual(stale.bytes);
+		expect((await fs.stat(readyPath, { bigint: true })).ino).toBe(stale.ino);
+		expect(await readyDirectoryResidue(readyPath)).toEqual([]);
+	} finally {
+		restoreReplaceSpy?.();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("partial readiness exchange over a dead owner escalates when its own marker cannot be revoked", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ready-stale-partial-exchange-"));
+	const sessionId = "ready-stale-partial-exchange";
+	const readyPath = path.join(root, "sdk", `${sessionId}.lifecycle.ready.json`);
+	const originalExactReplace = native.exactReplacePath.bind(native);
+	const originalExactUnlink = native.exactUnlinkDirect.bind(native);
+	let restoreReplaceSpy: (() => void) | undefined;
+	let restoreUnlinkSpy: (() => void) | undefined;
+	let exchangeCommitted: boolean | undefined;
+	try {
+		await writeDeadOwnerReadyMarker(readyPath, "stale-owner-marker");
+		const replaceSpy = vi.spyOn(native, "exactReplacePath").mockImplementation((source, destination, from, to) => {
+			const result = originalExactReplace(source, destination, from, to);
+			if (path.resolve(destination) !== path.resolve(readyPath)) return result;
+			exchangeCommitted = result.ok;
+			return { ok: false, code: "controlled partial exchange" };
+		});
+		restoreReplaceSpy = () => replaceSpy.mockRestore();
+		const unlinkSpy = vi.spyOn(native, "exactUnlinkDirect").mockImplementation((target, identity) => {
+			if (path.resolve(target) === path.resolve(readyPath))
+				return { ok: false, code: "controlled ready unlink failure" };
+			return originalExactUnlink(target, identity);
+		});
+		restoreUnlinkSpy = () => unlinkSpy.mockRestore();
+		const writing = writeSessionLifecycleReady(root, sessionId, "successor-marker");
+		await expect(writing).rejects.toBeInstanceOf(LifecycleReadinessCleanupError);
+		expect(exchangeCommitted).toBe(true);
+		expect(JSON.parse(await fs.readFile(readyPath, "utf8")).effectMarker).toBe("successor-marker");
+	} finally {
+		restoreUnlinkSpy?.();
+		restoreReplaceSpy?.();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("cutoff after replacing a dead owner's ready marker revokes only the successor's publication", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ready-stale-cutoff-"));
+	const sessionId = "ready-stale-cutoff";
+	const readyPath = path.join(root, "sdk", `${sessionId}.lifecycle.ready.json`);
+	let checks = 0;
+	try {
+		await writeDeadOwnerReadyMarker(readyPath, "stale-owner-marker");
+		await expect(writeSessionLifecycleReady(root, sessionId, "successor-marker", () => ++checks < 3)).rejects.toThrow(
+			"Lifecycle readiness cutoff passed during publication.",
+		);
+		expect(checks).toBe(3);
+		await expect(fs.stat(readyPath)).rejects.toMatchObject({ code: "ENOENT" });
+		expect(await readyDirectoryResidue(readyPath)).toEqual([]);
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
 test.skipIf(process.platform === "win32")(
 	"failure receipt is revoked when its directory durability barrier fails",
 	async () => {
@@ -4545,6 +4726,68 @@ test("broker directly resumes and forks a canonical cold saved session with scop
 		await fs.rm(root, { recursive: true, force: true });
 	}
 }, 50_000);
+
+test.skipIf(process.platform === "win32")(
+	"broker resumes a session whose host was terminated by signal and left its ready marker",
+	async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-stale-ready-resume-"));
+		const agentDir = path.join(root, "agent");
+		const stateRoot = path.join(root, ".gjc", "state");
+		const broker = new Broker({ agentDir });
+		const readMarkerPid = async (readyPath: string): Promise<number> => {
+			const marker = JSON.parse(await fs.readFile(readyPath, "utf8")) as { pid?: unknown };
+			if (typeof marker.pid !== "number") throw new Error("Ready marker names no pid.");
+			return marker.pid;
+		};
+		try {
+			await broker.start();
+			const created = await broker.handleRequest(
+				"session.create",
+				{ cwd: root, stateRoot, readinessTimeoutMs: 20_000 },
+				"stale-ready-create",
+			);
+			expect(created).toMatchObject({ ok: true });
+			if (!created.ok) throw new Error(created.error.message);
+			const sessionId = String((created.result as { sessionId: unknown }).sessionId);
+			const readyPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.ready.json`);
+			const hostPid = broker.index.listSessions().sessions.find(session => session.sessionId === sessionId)?.pid;
+			if (hostPid === undefined) throw new Error("Expected the created host to be indexed.");
+			expect(await readMarkerPid(readyPath)).toBe(hostPid);
+			const hostIncarnation = await incarnation(hostPid);
+			process.kill(hostPid, "SIGTERM");
+			await waitFor(
+				async () => (observeProcessForTest(hostPid, hostIncarnation) === "exited" ? true : undefined),
+				"signalled host exit",
+			);
+			expect(await readMarkerPid(readyPath)).toBe(hostPid);
+			const scopeResult = await resolveManagedSessionScope({ cwd: root, agentDir });
+			if (scopeResult.kind !== "resolved") throw new Error(scopeResult.message);
+			const inventory = await listManagedSessionCandidates({ scope: scopeResult.scope });
+			if (inventory.kind !== "complete") throw new Error(inventory.message);
+			const candidate = inventory.owned.find(item => item.sessionId === sessionId);
+			if (!candidate) throw new Error("Expected the signalled session to remain a managed candidate.");
+			const resumed = await broker.handleRequest(
+				"session.resume",
+				{ cwd: root, stateRoot, sessionId, sessionPath: candidate.path, readinessTimeoutMs: 20_000 },
+				"stale-ready-resume",
+			);
+			expect(resumed).toMatchObject({ ok: true, result: { sessionId } });
+			const resumedPid = await readMarkerPid(readyPath);
+			expect(resumedPid).not.toBe(hostPid);
+			expect(broker.index.listSessions().sessions.find(session => session.sessionId === sessionId)?.pid).toBe(
+				resumedPid,
+			);
+			expect(await broker.handleRequest("session.close", { sessionId }, "stale-ready-close")).toMatchObject({
+				ok: true,
+				result: { sessionId },
+			});
+		} finally {
+			await broker.stop();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	},
+	60_000,
+);
 
 test("broker replays one identity-bound lifecycle metadata cleanup plan after the first delete detach", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-delete-metadata-crash-"));
