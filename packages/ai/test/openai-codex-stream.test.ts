@@ -535,6 +535,48 @@ describe("openai-codex streaming", () => {
 		expect(result.content as unknown[]).toEqual([{ type: "text", text: "", textSignature: undefined }]);
 	});
 
+	it("does not treat whitespace-only tool argument deltas as stream progress", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const encoder = new TextEncoder();
+		global.fetch = (async () =>
+			new Response(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						for (const event of [
+							{ type: "response.created", response: { id: "resp_whitespace", status: "in_progress" } },
+							{
+								type: "response.output_item.added",
+								item: {
+									type: "function_call",
+									id: "fc_whitespace",
+									call_id: "call_whitespace",
+									name: "todo_write",
+									status: "in_progress",
+									arguments: "",
+								},
+							},
+							{ type: "response.function_call_arguments.delta", item_id: "fc_whitespace", delta: '{"ops":[]}' },
+						])
+							controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+						controller.enqueue(
+							encoder.encode(
+								`data: ${JSON.stringify({ type: "response.function_call_arguments.delta", item_id: "fc_whitespace", delta: " \t" })}\n\n`,
+							),
+						);
+					},
+				}),
+				{ status: 200, headers: { "content-type": "text/event-stream" } },
+			)) as unknown as typeof fetch;
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken(), streamIdleTimeoutMs: 20 },
+		).result();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("OpenAI Codex SSE stream stalled while waiting for the next event");
+	});
+
 	it("ends an SSE stream that hangs after a text delta", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());

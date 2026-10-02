@@ -221,7 +221,7 @@ function isCodexStreamProgressEvent(event: unknown): boolean {
 	if (typeof type !== "string" || !CODEX_PROGRESS_EVENT_TYPES.has(type)) return false;
 	if (!type.endsWith(".delta")) return true;
 	const delta = (event as { delta?: unknown }).delta;
-	return typeof delta === "string" && delta.length > 0;
+	return typeof delta === "string" && delta.trim().length > 0;
 }
 
 function codexOutputHasMeaningfulProgress(output: AssistantMessage): boolean {
