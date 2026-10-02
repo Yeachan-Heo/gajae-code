@@ -248,6 +248,7 @@ type UncertainPromptRecoveryResult =
 type PromptPhaseOwner = PromptWaiter | "background" | undefined;
 
 type BrokerConnection = { adapter: AcpSdkAdapter; client: SdkClient };
+type BrokerConnector = () => Promise<BrokerConnection>;
 type PendingAttachment = { epoch: number; task: Promise<void> };
 
 type PromptAdmissionSettlement = { kind: "cancelled" } | { kind: "rejected"; error: AcpSdkAdapterError };
@@ -408,6 +409,10 @@ function parsePromptWatchdogClock(value: unknown): PromptWatchdogClock | undefin
 	return typeof candidate?.now === "function" && typeof candidate.schedule === "function"
 		? (candidate as unknown as PromptWatchdogClock)
 		: undefined;
+}
+
+function parseBrokerConnector(value: unknown): BrokerConnector | undefined {
+	return typeof value === "function" ? (value as BrokerConnector) : undefined;
 }
 
 function object(value: unknown): JsonObject | undefined {
@@ -1743,6 +1748,8 @@ export class AcpAgent implements Agent {
 	readonly #lifecycleOperations = new Map<string, Promise<void>>();
 	#clientCapabilities: ClientCapabilities | undefined;
 	#broker: Promise<BrokerConnection> | undefined;
+	#speculativeBroker: Promise<BrokerConnection> | undefined;
+	readonly #brokerConnector: BrokerConnector | undefined;
 	readonly #startupOptions: AcpStartupOptions | undefined;
 	readonly #cancelSettlementGraceMs: number;
 	readonly #promptWatchdogClock: PromptWatchdogClock;
@@ -1757,6 +1764,7 @@ export class AcpAgent implements Agent {
 					startupOptions?: AcpStartupOptions;
 					cancelSettlementGraceMs?: number;
 					promptWatchdogClock?: PromptWatchdogClock;
+					brokerConnector?: BrokerConnector;
 			  }
 			| unknown,
 	) {
@@ -1803,6 +1811,7 @@ export class AcpAgent implements Agent {
 				? candidate.cancelSettlementGraceMs
 				: CANCEL_SETTLEMENT_GRACE_MS;
 		this.#promptWatchdogClock = parsePromptWatchdogClock(candidate?.promptWatchdogClock) ?? systemPromptWatchdogClock;
+		this.#brokerConnector = parseBrokerConnector(candidate?.brokerConnector);
 		queueMicrotask(() => {
 			if (connection.signal.aborted) {
 				this.#beginDispose();
@@ -1817,7 +1826,7 @@ export class AcpAgent implements Agent {
 		// ACP clients issue `session/new` immediately after `initialize`. Start the
 		// broker handshake while the protocol response is in flight so cold broker
 		// discovery and SDK WebSocket setup do not sit on the critical spawn path.
-		void this.#brokerConnection().catch(error => {
+		void this.#brokerConnection({ speculative: true }).catch(error => {
 			logger.debug("ACP broker prewarm failed", { error: String(error) });
 		});
 		const authMethods: AuthMethod[] = [
@@ -4256,31 +4265,42 @@ export class AcpAgent implements Agent {
 		return (await this.#brokerConnection()).adapter;
 	}
 
-	async #brokerConnection(): Promise<BrokerConnection> {
+	async #brokerConnection(options: { speculative?: boolean } = {}): Promise<BrokerConnection> {
 		if (!this.#broker) {
 			let pending!: Promise<BrokerConnection>;
-			pending = (async () => {
-				await ensureBroker({ agentDir: this.#agentDir });
-				const discovery = await readSdkBrokerDiscovery(this.#agentDir);
-				if (!discovery) throw new AcpSdkAdapterError("unavailable", "SDK broker discovery is unavailable.");
-				const client = await SdkClient.connect(discovery.url, discovery.token, { ...ACP_SESSION_RECONNECT });
-				const adapter = new AcpSdkAdapter({ client });
-				adapter.onReconnectFailed(() => {
-					if (this.#broker === pending) this.#broker = undefined;
-					void adapter.close().catch(() => undefined);
-				});
-				await adapter.start();
-				return { adapter, client };
-			})();
+			pending = this.#brokerConnector?.() ?? this.#connectBroker(() => pending);
 			this.#broker = pending;
+			if (options.speculative) this.#speculativeBroker = pending;
 		}
 		const pending = this.#broker;
+		const joinedSpeculative = this.#speculativeBroker === pending;
 		try {
-			return await pending;
+			const connection = await pending;
+			if (this.#disposed) {
+				throw new AcpSdkAdapterError("connection_closed", "ACP connection is closed.");
+			}
+			if (this.#speculativeBroker === pending) this.#speculativeBroker = undefined;
+			return connection;
 		} catch (error) {
 			if (this.#broker === pending) this.#broker = undefined;
+			if (this.#speculativeBroker === pending) this.#speculativeBroker = undefined;
+			if (joinedSpeculative && !options.speculative && !this.#disposed) return await this.#brokerConnection();
 			throw error;
 		}
+	}
+
+	async #connectBroker(getPending: () => Promise<BrokerConnection>): Promise<BrokerConnection> {
+		await ensureBroker({ agentDir: this.#agentDir });
+		const discovery = await readSdkBrokerDiscovery(this.#agentDir);
+		if (!discovery) throw new AcpSdkAdapterError("unavailable", "SDK broker discovery is unavailable.");
+		const client = await SdkClient.connect(discovery.url, discovery.token, { ...ACP_SESSION_RECONNECT });
+		const adapter = new AcpSdkAdapter({ client });
+		adapter.onReconnectFailed(() => {
+			if (this.#broker === getPending()) this.#broker = undefined;
+			void adapter.close().catch(() => undefined);
+		});
+		await adapter.start();
+		return { adapter, client };
 	}
 
 	#adapter(id: string): AcpSdkAdapter {
