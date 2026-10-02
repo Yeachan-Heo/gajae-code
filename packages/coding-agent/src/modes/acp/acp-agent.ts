@@ -4228,7 +4228,7 @@ export class AcpAgent implements Agent {
 				}
 			}
 			try {
-				await record?.adapter.close();
+				if (record) await this.#closeBrokerAdapter(record.adapter);
 			} catch (error) {
 				failures.push(error);
 			}
@@ -4273,7 +4273,7 @@ export class AcpAgent implements Agent {
 		}
 		waiter?.reject(error);
 		try {
-			await adapter.close();
+			await this.#closeBrokerAdapter(adapter);
 		} catch {}
 		try {
 			await record.attachment.retire?.();
@@ -4360,7 +4360,7 @@ export class AcpAgent implements Agent {
 		const adapter = new AcpSdkAdapter({ client });
 		adapter.onReconnectFailed(() => {
 			if (this.#broker === getPending()) this.#broker = undefined;
-			void adapter.close().catch(() => undefined);
+			void this.#closeBrokerAdapter(adapter).catch(() => undefined);
 		});
 		await adapter.start();
 		return { adapter, client };
