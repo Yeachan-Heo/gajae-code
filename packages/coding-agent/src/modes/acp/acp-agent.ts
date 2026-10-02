@@ -165,6 +165,12 @@ const ACP_FIRST_PROMPT_MAX_RETRIES = 2;
 /** Backoff before each first-prompt retry, scaled by attempt (250ms, then 500ms). */
 const ACP_FIRST_PROMPT_RETRY_BASE_DELAY_MS = 250;
 const ACP_BUSY_SETTLE_WAIT_MS = 5_000;
+/**
+ * Default model settlement timeout: when no --model is passed but modelRoles.default is configured,
+ * we wait for the SDK to apply the default before answering session/new, so the model option is present.
+ * The SDK applies defaults synchronously for known models, so this is a bounded safety timeout.
+ */
+const ACP_MODEL_SETTLEMENT_TIMEOUT_MS = 500;
 
 type JsonObject = Record<string, unknown>;
 interface PromptWaiter {
@@ -1920,6 +1926,9 @@ export class AcpAgent implements Agent {
 			phaseStartedAt = performance.now();
 			await applyAcpStartupOptions(this.#adapter(id), this.#startupOptions);
 			phases.startupOptionsMs = performance.now() - phaseStartedAt;
+			phaseStartedAt = performance.now();
+			await this.#waitForModelSettle(id);
+			phases.modelSettleMs = performance.now() - phaseStartedAt;
 			phaseStartedAt = performance.now();
 			const response = { sessionId: id, ...(await this.#sessionState(id, true)) };
 			phases.sessionStateMs = performance.now() - phaseStartedAt;
@@ -5401,6 +5410,78 @@ export class AcpAgent implements Agent {
 			await this.#failSession(id, record.adapter, failure);
 			throw failure;
 		}
+	}
+
+	/**
+	 * Wait for the model to settle when no explicit --model was passed but a default might be configured.
+	 * Give each probe its own timeout clamped to the remaining budget so wedged probes cannot exceed 500ms total.
+	 * Catch probe errors as advisory so a rejected probe does not discard the session (issue #6009).
+	 */
+	async #waitForModelSettle(id: string): Promise<void> {
+		const record = this.#sessions.get(id);
+		if (!record) return; // Session was closed; skip settlement wait.
+
+		// If an explicit --model was passed, it's already settled by applyAcpStartupOptions.
+		if (this.#startupOptions?.modelId) return;
+
+		// Set the deadline once for all probes (including the first).
+		const deadline = Date.now() + ACP_MODEL_SETTLEMENT_TIMEOUT_MS;
+
+		// Query the config once to check if the model is already settled.
+		// Even the first probe gets its own timeout clamped to the remaining budget.
+		let config: unknown;
+		const remaining = deadline - Date.now();
+		if (remaining > 0) {
+			try {
+				const controller = new AbortController();
+				const timeoutHandle = setTimeout(() => controller.abort(), remaining);
+				try {
+					const { promise: timeoutPromise, reject: rejectTimeout } = Promise.withResolvers<never>();
+					const listener = () => rejectTimeout(new Error("probe_timeout"));
+					controller.signal.addEventListener("abort", listener);
+					config = await Promise.race([record.adapter.query("config.list/get"), timeoutPromise]);
+				} finally {
+					clearTimeout(timeoutHandle);
+				}
+			} catch {
+				// Advisory: ignore first probe error and proceed to retry loop.
+				// The first probe's failure doesn't mean the model won't settle later.
+				config = undefined;
+			}
+		}
+		const currentModel = config !== undefined ? configValues(config).get(MODEL_CONFIG_ID) : undefined;
+		if (currentModel !== undefined) return; // Model is settled.
+		if (remaining <= 0) return; // Budget exhausted before entering retry loop.
+
+		// No explicit model and no settled value: the SDK may be applying a default.
+		// Retry with a bounded timeout, where each probe gets its own timeout clamped to the remaining budget.
+		// Only wait if there's a reasonable chance a default is configured (no model after first probe).
+		while (Date.now() < deadline) {
+			await Bun.sleep(50); // Small delay before retry.
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) break; // Budget exhausted.
+
+			let nextConfig: unknown;
+			try {
+				// Give this probe its own timeout clamped to the remaining budget.
+				// A wedged probe will timeout after `remaining` ms, not the full SDK timeout.
+				const controller = new AbortController();
+				const timeoutHandle = setTimeout(() => controller.abort(), remaining);
+				try {
+					const { promise: timeoutPromise, reject: rejectTimeout } = Promise.withResolvers<never>();
+					const listener = () => rejectTimeout(new Error("probe_timeout"));
+					controller.signal.addEventListener("abort", listener);
+					nextConfig = await Promise.race([record.adapter.query("config.list/get"), timeoutPromise]);
+				} finally {
+					clearTimeout(timeoutHandle);
+				}
+			} catch {
+				// Advisory: probe failed or timed out; continue retrying while budget remains.
+				continue;
+			}
+			if (configValues(nextConfig).get(MODEL_CONFIG_ID) !== undefined) return; // Settled.
+		}
+		// Budget exhausted: proceed without model. The model option may be missing from the response.
 	}
 
 	async #sessionState(

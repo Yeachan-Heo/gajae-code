@@ -276,20 +276,31 @@ export function createCodexStreamProgressClassifier(): (event: unknown) => boole
 		if (typeof event.output_index === "number") argumentBuffers.set(`output:${event.output_index}`, buffer);
 	};
 
+	// Reads `type` and `delta` exactly once per event: the stream handler reads the
+	// same parsed event afterwards, and a second read here could observe a
+	// different value than the one that is classified and assembled.
 	return event => {
-		if (!isCodexStreamProgressEvent(event)) return false;
 		if (!event || typeof event !== "object") return false;
 		const record = event as Record<string, unknown>;
+		const type = record.type;
+		if (typeof type !== "string" || !CODEX_PROGRESS_EVENT_TYPES.has(type)) return false;
+		if (type.endsWith(".delta")) {
+			const delta = record.delta;
+			if (typeof delta !== "string" || delta.length === 0) return false;
+			if (type !== "response.function_call_arguments.delta") return true;
+			return classifyArgumentDelta(record, delta);
+		}
 		rememberFunctionCallItem(record);
-		if (record.type === "response.function_call_arguments.done") {
+		if (type === "response.function_call_arguments.done") {
 			const key = getArgumentKey(record);
 			const buffer = key ? argumentBuffers.get(key) : undefined;
 			const argumentsValue = record.arguments;
 			if (buffer && typeof argumentsValue === "string") buffer.value = argumentsValue;
-			return true;
 		}
-		if (record.type !== "response.function_call_arguments.delta" || typeof record.delta !== "string") return true;
+		return true;
+	};
 
+	function classifyArgumentDelta(record: Record<string, unknown>, delta: string): boolean {
 		const key = getArgumentKey(record);
 		if (!key) return true;
 		let buffer = argumentBuffers.get(key);
@@ -297,7 +308,7 @@ export function createCodexStreamProgressClassifier(): (event: unknown) => boole
 			buffer = { value: "" };
 			argumentBuffers.set(key, buffer);
 		}
-		const isWhitespaceOnly = record.delta.trim().length === 0;
+		const isWhitespaceOnly = delta.trim().length === 0;
 		const wasComplete =
 			isWhitespaceOnly &&
 			(() => {
@@ -308,9 +319,9 @@ export function createCodexStreamProgressClassifier(): (event: unknown) => boole
 					return false;
 				}
 			})();
-		buffer.value += record.delta;
+		buffer.value += delta;
 		return !wasComplete;
-	};
+	}
 }
 
 function codexOutputHasMeaningfulProgress(output: AssistantMessage): boolean {
