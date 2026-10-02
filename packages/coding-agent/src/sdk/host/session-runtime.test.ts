@@ -3,11 +3,16 @@ import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { markNonDispatchedToolEvent } from "@gajae-code/agent-core";
+import { Agent, markNonDispatchedToolEvent } from "@gajae-code/agent-core";
+import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { logger } from "@gajae-code/utils";
 import { AsyncJobManager } from "../../async";
-import type { Settings } from "../../config/settings";
+import { ModelRegistry } from "../../config/model-registry";
+import { Settings } from "../../config/settings";
 import type { ExtensionAPI, ExtensionContext, ExtensionTranscriptEntry } from "../../extensibility/extensions";
+import { AgentSession } from "../../session/agent-session";
+import { AuthStorage } from "../../session/auth-storage";
+import { SessionManager } from "../../session/session-manager";
 import {
 	registerOwnedRegistration,
 	resetTerminalAbortRegistriesForTests,
@@ -3027,11 +3032,18 @@ describe("SessionSdkSessionRuntime", () => {
 				handlers.set(event, handler);
 			},
 			sendUserMessage: (
-				_content: string,
-				options: { onPreflightAccepted?: () => void; onPreflightAcceptCommit?: () => void } | undefined,
+				content: string,
+				options:
+					| {
+							onPreflightAccepted?: () => void;
+							onPreflightAcceptCommit?: () => void;
+							onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+					  }
+					| undefined,
 			) =>
 				Promise.resolve(options?.onPreflightAcceptCommit?.()).then(() => {
 					options?.onPreflightAccepted?.();
+					if (content === "follow up b") options?.onQueuedPromoted?.({ startsOwnRun: false });
 					return {};
 				}),
 		} as unknown as ExtensionAPI;
@@ -4145,6 +4157,8 @@ interface PreflightHooks {
 	onPreflightAccepted?: () => void;
 	onPreflightAcceptCommit?: () => void | Promise<void>;
 	expectedSdkRunToken?: string;
+	preflightSignal?: AbortSignal;
+	queuedAtDispatch?: boolean;
 	onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 }
 
@@ -4165,6 +4179,12 @@ interface ResponseFrame {
 
 interface InvocationHarness {
 	control(operation: string, input: Record<string, unknown>): Promise<ResponseFrame>;
+	controlAs(
+		connectionId: string,
+		operation: string,
+		input: Record<string, unknown>,
+		idempotencyKey?: string,
+	): Promise<ResponseFrame>;
 	query(name: string, input: Record<string, unknown>): Promise<ResponseFrame>;
 	emit(event: string, payload?: unknown): Promise<void>;
 	switchSession(sessionId: string): Promise<void>;
@@ -4264,7 +4284,7 @@ async function invocationHarness(
 				sessionId: id,
 				stateRoot,
 				token,
-				isConnectionOpen: connectionId => open && connectionId === "client",
+				isConnectionOpen: () => open,
 				onFrame(handler) {
 					deliver = handler;
 					deliveries.set(id, handler);
@@ -4311,16 +4331,26 @@ async function invocationHarness(
 		},
 	};
 	await handlers.get("session_start")?.({}, ctx);
-	const request = (frame: Record<string, unknown>): Promise<ResponseFrame> => {
+	const request = (frame: Record<string, unknown>, connectionId = "client"): Promise<ResponseFrame> => {
 		const id = `frame-${nextId}`;
 		nextId += 1;
 		const { promise, resolve } = Promise.withResolvers<ResponseFrame>();
 		waiters.set(id, resolve);
-		deliver?.("client", { ...frame, id } as SdkFrame);
+		deliver?.(connectionId, { ...frame, id } as SdkFrame);
 		return promise;
 	};
 	return {
 		control: (operation, input) => request({ type: "control_request", operation, input }),
+		controlAs: (connectionId, operation, input, idempotencyKey) =>
+			request(
+				{
+					type: "control_request",
+					operation,
+					input,
+					...(idempotencyKey === undefined ? {} : { idempotencyKey }),
+				},
+				connectionId,
+			),
 		query: (name, input) => request({ type: "query_request", query: name, input }),
 		broadcasts,
 		emit: async (event, payload) => {
@@ -4451,14 +4481,20 @@ test("SDK-only host retains accepted staged bytes until terminal and releases re
 		});
 		expect(releases).toHaveLength(2);
 		const racedId = await stage();
-		expect(
-			await harness.control("turn.prompt", {
-				text: "Diverted after idle snapshot",
-				stagedImages: [{ id: racedId }],
-			}),
-		).toMatchObject({ ok: true, result: { accepted: true } });
+		const removed = await harness.control("turn.prompt", {
+			text: "Diverted after idle snapshot",
+			stagedImages: [{ id: racedId }],
+		});
+		expect(removed).toMatchObject({ ok: true, result: { accepted: true } });
 		expect(releases).toHaveLength(2);
 		queuedPromotions[1]?.({ startsOwnRun: false, removed: true });
+		expect(
+			await settledStatus(harness, "turn.result", {
+				kind: "prompt",
+				commandId: removed.result?.commandId,
+				turnId: removed.result?.turnId,
+			}),
+		).toMatchObject({ status: "failed", error: { code: "cancelled" } });
 		expect(releases).toHaveLength(3);
 		await harness.stop();
 		harness = undefined;
@@ -4535,6 +4571,232 @@ test.each(["natural", "removed"] as const)("SDK-only staged diversion has a dura
 					(frame.payload as { commandId?: string; turnId?: string } | undefined)?.turnId === correlation.turnId,
 			),
 		).toHaveLength(1);
+	} finally {
+		await harness?.stop();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test.each([
+	"ordinary",
+	"terminal",
+] as const)("SDK-only %s abort cancels only its accepted image queue owner behind a real active AgentSession run", async mode => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), `gjc-sdk-queued-image-${mode}-`));
+	const rootGate = Promise.withResolvers<void>();
+	const rootStarted = Promise.withResolvers<void>();
+	const failedRemovalWrite = Promise.withResolvers<void>();
+	const modelCalls: number[] = [];
+	let rootAbortCalls = 0;
+	let imagePreflightSignal: AbortSignal | undefined;
+	let harness: InvocationHarness | undefined;
+	let session: AgentSession | undefined;
+	let authStorage: AuthStorage | undefined;
+	try {
+		authStorage = await AuthStorage.create(path.join(cwd, "testauth.db"));
+		const mock = createMockModel({
+			responses: [
+				async () => {
+					modelCalls.push(Date.now());
+					rootStarted.resolve();
+					await rootGate.promise;
+					return { content: ["B root completed"] };
+				},
+				() => {
+					modelCalls.push(Date.now());
+					return { content: ["unrelated queued steer completed"] };
+				},
+			],
+		});
+		authStorage.setRuntimeApiKey(mock.model.provider, "test-key");
+		const modelRegistry = new ModelRegistry(authStorage);
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(cwd),
+			settings,
+			modelRegistry,
+		});
+		const hooks: Parameters<typeof invocationHarness>[2] = {
+			isIdle: () => !session!.isStreaming,
+			abort: () => {
+				rootAbortCalls += 1;
+			},
+			sendUserMessage: (content, sendOptions) => {
+				if (
+					Array.isArray(content) &&
+					content.some(block => typeof block === "object" && block !== null && block.type === "image")
+				)
+					imagePreflightSignal = sendOptions?.preflightSignal;
+				return session!.sendUserMessage(content as never, sendOptions as never);
+			},
+			...(mode === "ordinary"
+				? {
+						persistInterceptor: transition => {
+							if (transition.type === "agent_failed") failedRemovalWrite.resolve();
+						},
+						agentFailedWriteFailures: 1,
+						onDurableAttempt: attempt => {
+							if (attempt.type === "agent_failed" && attempt.outcome === "rejected")
+								failedRemovalWrite.resolve();
+						},
+					}
+				: {
+						terminalAbortSeams: {
+							getTerminalTurnEpoch: () => (session?.isStreaming ? 17 : undefined),
+							getActivePromptHandle: () => (session?.isStreaming ? "B-root-handle" : undefined),
+							getActivePromptOwnerConnectionId: () => (session?.isStreaming ? "B" : undefined),
+							cancelPendingPreflightForTerminalAbort: () => {},
+							abortPromptAndWaitWithTerminal: async () => {
+								rootAbortCalls += 1;
+								return { status: "settled", terminalScope: {} };
+							},
+						},
+					}),
+		};
+		harness = await invocationHarness(`queued-image-${mode}`, cwd, hooks);
+		session.subscribe(async event => {
+			await harness?.emit(event.type, event);
+		});
+
+		const rootAccepted = await harness.controlAs("B", "turn.prompt", { text: "B owns the active root" });
+		expect(rootAccepted).toMatchObject({ ok: true, result: { accepted: true } });
+		await rootStarted.promise;
+		const keepQueued = await harness.controlAs("C", "turn.prompt", { text: "keep unrelated queue item" });
+		expect(keepQueued).toMatchObject({ ok: true, result: { accepted: true } });
+
+		const imageBytes = Buffer.from(
+			await Bun.file(new URL("../../../test/fixtures/sdk-inline-image-large.png", import.meta.url)).arrayBuffer(),
+		);
+		const begun = await harness.controlAs("A", "turn.image.begin", {
+			mimeType: "image/png",
+			byteLength: imageBytes.length,
+			sha256: createHash("sha256").update(imageBytes).digest("hex"),
+		});
+		const imageId = begun.result?.id;
+		expect(begun.ok).toBe(true);
+		if (typeof imageId !== "string") throw new Error("SDK host did not return a staged image ID.");
+		let sequence = 0;
+		for (let offset = 0; offset < imageBytes.length; offset += 96 * 1024) {
+			const data = imageBytes.subarray(offset, offset + 96 * 1024).toString("base64");
+			expect(
+				await harness.controlAs("A", "turn.image.append", { id: imageId, sequence: sequence++, data }),
+			).toMatchObject({ ok: true });
+		}
+		expect(await harness.controlAs("A", "turn.image.finish", { id: imageId })).toMatchObject({ ok: true });
+		const acceptedImage = await harness.controlAs("A", "turn.prompt", {
+			text: "cancel exact queued image",
+			stagedImages: [{ id: imageId }],
+		});
+		expect(acceptedImage).toMatchObject({ ok: true, result: { accepted: true } });
+		const imageCorrelation = {
+			commandId: acceptedImage.result?.commandId,
+			turnId: acceptedImage.result?.turnId,
+		};
+		expect(imagePreflightSignal).toBeInstanceOf(AbortSignal);
+		expect(imagePreflightSignal?.aborted).toBe(false);
+		expect(session.getQueuedMessages().steering).toEqual(["keep unrelated queue item", "cancel exact queued image"]);
+
+		let abortCompleted = false;
+		const abortRequest =
+			mode === "ordinary"
+				? harness.controlAs("A", "turn.abort", { mode: "turn" })
+				: harness.controlAs("A", "turn.abort", { mode: "terminal" }, `queued-image-${mode}-key`);
+		const observedAbort = abortRequest.then(response => {
+			abortCompleted = true;
+			return response;
+		});
+		if (mode === "ordinary") {
+			await failedRemovalWrite.promise;
+			await Bun.sleep(0);
+			expect(abortCompleted).toBe(false);
+		}
+		const abortResponse = await observedAbort;
+		if (mode === "ordinary") expect(abortResponse).toMatchObject({ ok: true, result: { aborted: true } });
+		else
+			expect(abortResponse).toMatchObject({
+				ok: true,
+				result: { turn: "no_active_turn", terminal: "terminal_no_effect" },
+			});
+		expect(imagePreflightSignal?.aborted).toBe(true);
+		expect(rootAbortCalls).toBe(0);
+		expect(session.isStreaming).toBe(true);
+		expect(session.getQueuedMessages().steering).toEqual(["keep unrelated queue item"]);
+		expect(await settledStatus(harness, "turn.result", { kind: "prompt", ...imageCorrelation })).toMatchObject({
+			status: "failed",
+			error: { code: "cancelled" },
+		});
+
+		rootGate.resolve();
+		await session.waitForIdle();
+		const userMessages = session.agent.state.messages;
+		const hasUserText = (text: string): boolean =>
+			userMessages.some(message => {
+				if (message.role !== "user") return false;
+				return typeof message.content === "string"
+					? message.content === text
+					: message.content.some(block => block.type === "text" && block.text === text);
+			});
+		expect(hasUserText("keep unrelated queue item")).toBe(true);
+		expect(hasUserText("cancel exact queued image")).toBe(false);
+		expect(
+			userMessages.some(
+				message =>
+					message.role === "user" &&
+					Array.isArray(message.content) &&
+					message.content.some(block => block.type === "image" && block.data === imageBytes.toString("base64")),
+			),
+		).toBe(false);
+		expect(modelCalls).toHaveLength(2);
+		const correlatedTerminals = harness.broadcasts.filter(
+			frame =>
+				frame.type === "event" &&
+				frame.kind === "agent_end" &&
+				(frame.payload as { commandId?: string; turnId?: string } | undefined)?.commandId ===
+					imageCorrelation.commandId &&
+				(frame.payload as { commandId?: string; turnId?: string } | undefined)?.turnId === imageCorrelation.turnId,
+		);
+		expect(correlatedTerminals).toHaveLength(1);
+	} finally {
+		rootGate.resolve();
+		await session?.waitForIdle().catch(() => undefined);
+		await harness?.stop();
+		await session?.dispose();
+		authStorage?.close();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test("SDK-only ordinary abort selects its owned root ahead of same-connection queued input", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-only-owned-root-selection-"));
+	let harness: InvocationHarness | undefined;
+	let idle = true;
+	let rootAborts = 0;
+	let queuedSignal: AbortSignal | undefined;
+	try {
+		harness = await invocationHarness("sdk-only-owned-root-selection", cwd, {
+			isIdle: () => idle,
+			abort: () => {
+				rootAborts++;
+			},
+			sendUserMessage: async (content, options) => {
+				await options?.onPreflightAcceptCommit?.();
+				if (content === "root") await neverSettlingPromise();
+				else queuedSignal = options?.preflightSignal;
+			},
+		});
+		expect(await harness.control("turn.prompt", { text: "root" })).toMatchObject({ ok: true });
+		idle = false;
+		await harness.emit("agent_start");
+		expect(await harness.control("turn.prompt", { text: "queued for later" })).toMatchObject({ ok: true });
+		expect(queuedSignal?.aborted).toBe(false);
+		expect(await harness.control("turn.abort", {})).toMatchObject({ ok: true, result: { aborted: true } });
+		expect(rootAborts).toBe(1);
+		expect(queuedSignal?.aborted).toBe(false);
 	} finally {
 		await harness?.stop();
 		await rm(cwd, { recursive: true, force: true });
@@ -9531,23 +9793,30 @@ test("SDK-only host does not assign a follow-up requester ownership until the fo
 	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-followup-stale-"));
 	const idle = true;
 	let promoted: ((promotion: { startsOwnRun: boolean }) => void) | undefined;
+	let queueSignal: AbortSignal | undefined;
 	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
 	const api = {
 		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
 			handlers.set(event, handler);
 		},
-		sendUserMessage: (
-			_content: string,
-			options:
-				| {
-						onPreflightAccepted?: () => void;
-						onPreflightAcceptCommit?: () => void;
-						onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
-				  }
-				| undefined,
-		) =>
+		sendUserMessage: (_content: string, options: PreflightHooks | undefined) =>
 			Promise.resolve(options?.onPreflightAcceptCommit?.()).then(() => {
-				promoted = options?.onQueuedPromoted;
+				let queued = true;
+				queueSignal = options?.preflightSignal;
+				promoted = promotion => {
+					if (!queued) return;
+					queued = false;
+					options?.onQueuedPromoted?.(promotion);
+				};
+				queueSignal?.addEventListener(
+					"abort",
+					() => {
+						if (!queued) return;
+						queued = false;
+						options?.onQueuedPromoted?.({ startsOwnRun: false, removed: true });
+					},
+					{ once: true },
+				);
 				options?.onPreflightAccepted?.();
 				return {};
 			}),
@@ -9614,7 +9883,16 @@ test("SDK-only host does not assign a follow-up requester ownership until the fo
 			result: expect.objectContaining({ turn: "no_active_turn" }),
 		});
 		expect(seamCalls).toHaveLength(0);
-		// When the follow-up IS promoted, B owns its run and can abort it.
+		expect(queueSignal?.aborted).toBe(true);
+		// The cancelled input cannot be promoted. A fresh follow-up receives fresh authority.
+		transport.feed("conn-b", {
+			type: "control_request",
+			id: "followup-b-next",
+			operation: "turn.follow_up",
+			input: { text: "fresh followup" },
+		} as SdkFrame);
+		await waitResponse("followup-b-next");
+		expect(queueSignal?.aborted).toBe(false);
 		promoted!({ startsOwnRun: true });
 		await handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
 		transport.feed("conn-b", {

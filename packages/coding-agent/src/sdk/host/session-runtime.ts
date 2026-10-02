@@ -230,6 +230,8 @@ class SdkOnlyIdempotencyConflictError extends Error {
  *  the outcome synchronously on its capture slot, while this runtime observes
  *  the publication from the separate `agent_end` handler. */
 const SDK_ONLY_TERMINAL_PUBLICATION_WAIT_MS = 1_000;
+/** Queue-owner cancellation is synchronous in AgentSession; this bound fails closed if its disposition is lost. */
+const SDK_ONLY_QUEUE_CANCELLATION_WAIT_MS = 1_000;
 /** Bounded wait for in-flight workflow gate resolutions to settle during SDK
  *  runtime shutdown before proceeding with cleanup. Unresolved resolutions
  *  after this bound are abandoned — their durable broker state is the recovery
@@ -751,6 +753,26 @@ function unavailable(operation: string): () => never {
 export interface InvocationCorrelation {
 	commandId: string;
 	turnId: string;
+}
+
+type AcceptedQueueDisposition = "preflight" | "queued" | "consumed" | "promoted" | "removed" | "teardown";
+
+interface AcceptedQueueCancellationResult {
+	removed: boolean;
+	consumed: boolean;
+	unconfirmed: boolean;
+}
+
+interface AcceptedQueueCancellation {
+	correlation: InvocationCorrelation;
+	connectionId: string | undefined;
+	controller: AbortController;
+	accepted: boolean;
+	queueCandidate: boolean;
+	disposition: AcceptedQueueDisposition;
+	dispositionPromise: Promise<AcceptedQueueDisposition>;
+	resolveDisposition: (disposition: AcceptedQueueDisposition) => void;
+	removalTerminalization?: Promise<boolean>;
 }
 
 export type InvocationKind = "prompt" | "skill" | "steer";
@@ -2882,7 +2904,7 @@ function createControlSurface(
 		connectionId: string | undefined,
 		sdkRunToken: string,
 		promotion?: { startsOwnRun?: boolean; removed?: boolean },
-	) => void,
+	) => undefined | Promise<boolean>,
 	policy?: SdkSurfacePolicy,
 	settings?: Settings,
 	configOverrides?: Map<string, unknown>,
@@ -2905,6 +2927,7 @@ function createControlSurface(
 	publishLifecycleFrame?: (frame: SdkFrame) => void,
 	retainAcceptedImage?: (correlation: InvocationCorrelation, release: () => void) => void,
 	releaseAcceptedImage?: (correlation: InvocationCorrelation) => void,
+	acceptedQueueCancellations: Map<string, AcceptedQueueCancellation> = new Map(),
 ): ControlSurface {
 	const normalizePromptImages = (value: unknown): ImageContent[] => {
 		if (!Array.isArray(value)) return [];
@@ -3008,6 +3031,48 @@ function createControlSurface(
 		}
 		return pending;
 	};
+	const cancelAcceptedQueueSubmissions = async (
+		connectionId: string | undefined,
+	): Promise<AcceptedQueueCancellationResult> => {
+		const result: AcceptedQueueCancellationResult = { removed: false, consumed: false, unconfirmed: false };
+		if (connectionId === undefined) return result;
+		const owned = [...acceptedQueueCancellations.values()].filter(
+			request => request.connectionId === connectionId && request.accepted && request.queueCandidate,
+		);
+		for (const request of owned) {
+			let disposition = request.disposition;
+			if (disposition === "queued") {
+				request.controller.abort();
+				disposition = request.disposition;
+				if (disposition === "queued") {
+					const timedOut = Promise.withResolvers<AcceptedQueueDisposition>();
+					const timer = setTimeout(() => timedOut.resolve("teardown"), SDK_ONLY_QUEUE_CANCELLATION_WAIT_MS);
+					timer.unref();
+					try {
+						disposition = await Promise.race([request.dispositionPromise, timedOut.promise]);
+					} finally {
+						clearTimeout(timer);
+					}
+				}
+			}
+			if (disposition === "removed") {
+				if (await request.removalTerminalization) result.removed = true;
+				else result.unconfirmed = true;
+			} else if (disposition === "consumed" || disposition === "promoted") {
+				result.consumed = true;
+			} else if (disposition === "teardown") {
+				result.unconfirmed = true;
+			}
+		}
+		return result;
+	};
+	const requesterOwnsActiveRun = (connectionId: string | undefined): boolean => {
+		if (connectionId === undefined) return false;
+		const seamOwner = terminalAbortSeams?.getActivePromptOwnerConnectionId?.();
+		return seamOwner === undefined
+			? (activePromptOwner.connectionIds?.has(connectionId) ?? false)
+			: seamOwner === connectionId;
+	};
 	const normalizeClientRef = (clientRef: string | undefined): string | undefined => {
 		if (clientRef === undefined) return undefined;
 		const trimmed = clientRef.trim();
@@ -3022,6 +3087,7 @@ function createControlSurface(
 		clientRef: string | undefined,
 		run: (options: {
 			sdkRunCapability: SdkRunCapability;
+			preflightSignal: AbortSignal;
 			onPreflightAccepted: () => void;
 			onPreflightAcceptCommit: () => Promise<void>;
 			/** Internal disposition before a queued submission is actually consumed. */
@@ -3065,10 +3131,23 @@ function createControlSurface(
 			publishTerminal(canonicalFailedOutcome(failure));
 		};
 		const preflight = Promise.withResolvers<void>();
+		const preflightController = new AbortController();
+		const queueDisposition = Promise.withResolvers<AcceptedQueueDisposition>();
+		const queueCancellation: AcceptedQueueCancellation = {
+			correlation,
+			connectionId: requesterConnectionId,
+			controller: preflightController,
+			accepted: false,
+			queueCandidate: false,
+			disposition: "preflight",
+			dispositionPromise: queueDisposition.promise,
+			resolveDisposition: queueDisposition.resolve,
+		};
 		let accepted = false;
 		let settled = false;
 		const cancelPreflight = () => {
 			if (settled) return;
+			preflightController.abort();
 			settled = true;
 			preflight.reject(
 				Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" }),
@@ -3086,6 +3165,8 @@ function createControlSurface(
 			try {
 				await reconciliation.noteAccepted(kind, correlation, retainedClientRef);
 				accepted = true;
+				queueCancellation.accepted = true;
+				if (queueCancellation.queueCandidate) queueCancellation.disposition = "queued";
 				settled = true;
 				if (kind === "prompt" && startsOwnTurn) armPromptDeadline(correlation);
 				// The accepted submission does NOT own the active turn until its run
@@ -3118,16 +3199,23 @@ function createControlSurface(
 		// Skills always start their own invocation; a plain prompt starts one
 		// only when idle at dispatch time.
 		const startsOwnTurn = kind === "skill" || (kind === "prompt" && !alwaysQueued && !queuedAtDispatch);
+		queueCancellation.queueCandidate = queuedAtDispatch;
+		if (queuedAtDispatch && queueCancellation.accepted) queueCancellation.disposition = "queued";
+		if (kind === "prompt")
+			acceptedQueueCancellations.set(`${correlation.commandId}:${correlation.turnId}`, queueCancellation);
 		let promotionStartsOwnRun: boolean | undefined;
 		try {
 			const submission = Promise.resolve(
 				run({
 					onPreflightAccepted: () => void accept().catch(() => undefined),
+					preflightSignal: preflightController.signal,
 					sdkRunCapability,
 					onPreflightAcceptCommit: accept,
 					onDispatchDisposition: promotion => {
 						promotionStartsOwnRun = promotion.startsOwnRun;
 						if (promotion.startsOwnRun === false) {
+							queueCancellation.queueCandidate = true;
+							if (queueCancellation.accepted) queueCancellation.disposition = "queued";
 							// Dispatch-race diversion (#4668 review P1): the idle snapshot leased
 							// this prompt at acceptance, but it was actually diverted into the
 							// in-flight run's steering queue. While it sits queued — legitimately
@@ -3144,8 +3232,19 @@ function createControlSurface(
 					// terminal-abort that turn (review threads P1/P2).
 					onQueuedPromoted: (promotion?: { startsOwnRun?: boolean; removed?: boolean }) => {
 						promotionStartsOwnRun = promotion?.startsOwnRun;
-						if (promotion?.removed) releaseAcceptedImage?.(correlation);
-						onPromotedTurn?.(kind, correlation, requesterConnectionId, sdkRunToken, promotion);
+						if (promotion?.removed) {
+							queueCancellation.disposition = "removed";
+							queueCancellation.removalTerminalization = Promise.resolve(
+								onPromotedTurn?.(kind, correlation, requesterConnectionId, sdkRunToken, promotion),
+							).then(result => result === true);
+							queueCancellation.resolveDisposition("removed");
+							return;
+						}
+						if (queueCancellation.queueCandidate) {
+							queueCancellation.disposition = promotion?.startsOwnRun === false ? "consumed" : "promoted";
+							queueCancellation.resolveDisposition(queueCancellation.disposition);
+						}
+						void onPromotedTurn?.(kind, correlation, requesterConnectionId, sdkRunToken, promotion);
 					},
 					queuedAtDispatch,
 				}),
@@ -3353,6 +3452,10 @@ function createControlSurface(
 				...(acceptedFields?.() ?? {}),
 			};
 		} catch (error) {
+			if (!accepted) {
+				preflightController.abort();
+				acceptedQueueCancellations.delete(`${correlation.commandId}:${correlation.turnId}`);
+			}
 			releaseAcceptedImage?.(correlation);
 			if (!accepted) reconciliation.release(kind, retainedClientRef);
 			throw error;
@@ -3721,6 +3824,36 @@ function createControlSurface(
 					return boundTerminalRetentionState(state.keys, mutate(state.scopes), terminalReservationLimit);
 				});
 			};
+			const unconfirmedQueueTerminal = async (): Promise<unknown> => {
+				const result = {
+					ok: true,
+					selection: scope,
+					turn: "uncertain",
+					ownedWork: scope === "turn" ? "left_running" : "uncertain",
+					automaticDelivery: scope === "turn" ? "enabled" : "none",
+					resumeOnOwnedCompletion: scope === "turn",
+					reason: "queue_terminal_unconfirmed",
+				};
+				const payloadHash = hashResult(result);
+				await transactBoundedTerminalScopes(scopes =>
+					scopes.map(record =>
+						(keyHash
+							? record.idempotencyKeyHash === keyHash
+							: record.turnContinuationFence.abortedAttemptEpoch === epoch) &&
+						record.turnDisposition === "no_effect_reserved"
+							? {
+									...record,
+									turnDisposition: "uncertain",
+									responsePayloadHash: payloadHash,
+									replayPayloadHash: replayShapedHash(record, result, payloadHash),
+									terminalAt: Date.now(),
+								}
+							: record,
+					),
+				);
+				return result;
+			};
+			const abortingConnectionId = sdkControlRequesterContext.getStore();
 			let handle = terminalAbortSeams.getActivePromptHandle();
 			let epoch = terminalAbortSeams.getTerminalTurnEpoch();
 			// Set when the no-effect reservation found an existing SAME-input row or
@@ -3812,9 +3945,12 @@ function createControlSurface(
 				const recheckedHandle = terminalAbortSeams.getActivePromptHandle();
 				const recheckedEpoch = terminalAbortSeams.getTerminalTurnEpoch();
 				if (!recheckedHandle || recheckedEpoch === undefined) {
-					// No prompt won the race: finalize the reserved row so a later
-					// same-key retry replays this deterministic no_active_turn result
-					// (review thread P2).
+					// An accepted SDK queue owner is independent of the root prompt. Remove
+					// only this requester's exact queued submissions, and do not claim the
+					// root stopped; terminal success waits for each correlated removal
+					// failure+terminal transaction to become durable.
+					const queueCancellation = await cancelAcceptedQueueSubmissions(abortingConnectionId);
+					if (queueCancellation.unconfirmed) return await unconfirmedQueueTerminal();
 					return await returnNoActiveTurn();
 				}
 				handle = recheckedHandle;
@@ -3832,7 +3968,6 @@ function createControlSurface(
 			// per-connection selection of the full bus path. The owner is re-read
 			// through the seam when provided (deterministic tests) and otherwise
 			// from the runtime-tracked accepting connection.
-			const abortingConnectionId = sdkControlRequesterContext.getStore();
 			const currentOwnerConnectionIds = (): ReadonlySet<string> => {
 				const seam = terminalAbortSeams.getActivePromptOwnerConnectionId?.();
 				// The seam reports a single deterministic owner (test harnesses); the
@@ -3880,9 +4015,10 @@ function createControlSurface(
 					abortingConnectionId === undefined ||
 					!recheckedOwners.has(abortingConnectionId)
 				) {
-					// The turn is still not the aborting connection's: finalize the
-					// reserved row so a later same-key retry replays no_active_turn
-					// deterministically (review thread P2).
+					// Request-owned steering cannot borrow the unrelated root's abort
+					// authority. It may still be removed by its exact queue capability.
+					const queueCancellation = await cancelAcceptedQueueSubmissions(abortingConnectionId);
+					if (queueCancellation.unconfirmed) return await unconfirmedQueueTerminal();
 					const noActiveTurnResult = {
 						ok: true,
 						selection: scope,
@@ -4335,6 +4471,13 @@ function createControlSurface(
 			);
 		},
 		abort: async () => {
+			const connectionId = sdkControlRequesterContext.getStore();
+			if (!requesterOwnsActiveRun(connectionId)) {
+				const queueCancellation = await cancelAcceptedQueueSubmissions(connectionId);
+				if (queueCancellation.unconfirmed) return { aborted: false, reason: "queue_terminal_unconfirmed" };
+				if (queueCancellation.removed) return { aborted: true };
+				if (queueCancellation.consumed) return { aborted: false, turn: "no_active_turn" };
+			}
 			await Promise.resolve(ctx.abort()).catch(() => undefined);
 			return { aborted: true };
 		},
@@ -4677,11 +4820,31 @@ function quiescingFrame(frame: Record<string, unknown>): Record<string, unknown>
 /** Install a complete SDK host for a session when notifications are inactive. */
 export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: CreateSdkSessionRuntimeOptions): void {
 	const acceptedImages = new Map<string, () => void>();
+	const acceptedQueueCancellations = new Map<string, AcceptedQueueCancellation>();
 	const imageKey = (correlation: InvocationCorrelation): string => `${correlation.commandId}:${correlation.turnId}`;
 	const releaseAcceptedImage = (correlation: InvocationCorrelation): void => {
 		const key = imageKey(correlation);
 		acceptedImages.get(key)?.();
 		acceptedImages.delete(key);
+		const cancellation = acceptedQueueCancellations.get(key);
+		if (cancellation) {
+			cancellation.controller.abort();
+			acceptedQueueCancellations.delete(key);
+			if (cancellation.disposition === "queued") {
+				cancellation.disposition = "teardown";
+				cancellation.resolveDisposition("teardown");
+			}
+		}
+	};
+	const disposeAcceptedQueueCancellations = (): void => {
+		for (const cancellation of acceptedQueueCancellations.values()) {
+			cancellation.controller.abort();
+			if (cancellation.disposition === "queued") {
+				cancellation.disposition = "teardown";
+				cancellation.resolveDisposition("teardown");
+			}
+		}
+		acceptedQueueCancellations.clear();
 	};
 	let currentImageUploads: PromptImageUploadStore | undefined;
 	let active:
@@ -6578,9 +6741,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			kind: InvocationKind,
 			correlation: InvocationCorrelation,
 			error: { code: string; message: string },
-		): void => {
+		): Promise<boolean> => {
 			if (lifecycleOwnerHolder.state) removeLifecycleTokenAliases(lifecycleOwnerHolder.state, correlation);
-			const attempt = async (remaining: number): Promise<void> => {
+			const attempt = async (remaining: number): Promise<boolean> => {
 				try {
 					// 1. Record the failure reason durably FIRST. If this write fails,
 					// never fall through to agent_end: the record still has no error,
@@ -6603,7 +6766,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 							turnId: correlation.turnId,
 							error: sanitizePromptFailure(reasonError),
 						});
-						return;
+						return false;
 					}
 					await Bun.sleep(1_000);
 					return attempt(remaining - 1);
@@ -6628,6 +6791,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					// 3. Release recovery ownership ONLY after durable terminalization.
 					deadlineManager.clear(correlation);
 					if (kind === "prompt") releaseAcceptedImage(correlation);
+					return true;
 				} catch (transitionError) {
 					// Keep prompt recovery leased; skill recovery has no prompt lease.
 					if (kind === "skill") scheduleSkillRecovery(correlation);
@@ -6638,9 +6802,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						turnId: correlation.turnId,
 						error: sanitizePromptFailure(transitionError),
 					});
+					return false;
 				}
 			};
-			void attempt(3);
+			return attempt(3);
 		};
 
 		// Never fall back to the runtime's frame-observer set: it is not the
@@ -6697,11 +6862,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						});
 				};
 				if (lifecycleOwnerHolder.quiescing) {
-					terminalizeAbandonedSubmission(kind, correlation, {
+					return terminalizeAbandonedSubmission(kind, correlation, {
 						code: "session_quiescing",
 						message: "Session endpoint was replaced before the invocation started.",
 					});
-					return;
 				}
 				// Lease at the ACTUAL promotion boundary (#4668 review): a promoted
 				// submission that wedges before its run's agent_start must still
@@ -6721,11 +6885,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 							entry.correlation.turnId === correlation.turnId,
 					);
 					if (pendingIdx >= 0) pending.splice(pendingIdx, 1);
-					terminalizeAbandonedSubmission(kind, correlation, {
+					return terminalizeAbandonedSubmission(kind, correlation, {
 						code: "cancelled",
 						message: "Queued prompt was removed before consumption.",
 					});
-					return;
 				}
 				if (promotion?.startsOwnRun !== false) {
 					// A submission PROMOTED to its own run (finished prompt unwinding)
@@ -6880,6 +7043,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			frame => runtime.emitEvent(frame),
 			(correlation, release) => acceptedImages.set(imageKey(correlation), release),
 			releaseAcceptedImage,
+			acceptedQueueCancellations,
 		);
 		const installProviderDefinitions = (capability: string, definitions: unknown): void => {
 			if (capability === "permission") {
@@ -7385,6 +7549,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			if (!brokerRecoveryStopped) startBrokerRecovery();
 		} catch (error) {
 			active = undefined;
+			disposeAcceptedQueueCancellations();
 			imageUploads.close();
 			if (currentImageUploads === imageUploads) currentImageUploads = undefined;
 			for (const release of acceptedImages.values()) release();
@@ -7440,6 +7605,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		if (!current) return;
 		currentImageUploads?.close();
 		currentImageUploads = undefined;
+		disposeAcceptedQueueCancellations();
 		for (const release of acceptedImages.values()) release();
 		acceptedImages.clear();
 		if (cancelSkillRecovery) {
