@@ -3704,6 +3704,12 @@ test.each([
 	"removed",
 	"ordinary-abort",
 	"terminal-abort",
+	"queued-deadline",
+	"busy-at-dispatch",
+	"joined-progress",
+	"held-terminal",
+	"claim-failure",
+	"finalize-failure",
 ] as const)("a diverted image prompt keeps exact lifecycle ownership (%s)", async mode => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-steered-image-owner-"));
 	dirs.push(cwd);
@@ -3752,10 +3758,28 @@ test.each([
 		};
 	});
 	const warnSpy = spyOn(logger, "warn").mockImplementation(() => {});
+	const heldCommit =
+		mode === "held-terminal"
+			? pauseNextReconciliationCommit(path.join(cwd, "session.jsonl"), sessionId, true)
+			: undefined;
+	const failedCommit =
+		mode === "claim-failure" || mode === "finalize-failure"
+			? failNextReconciliationCommit(path.join(cwd, "session.jsonl"), sessionId, mode === "finalize-failure")
+			: undefined;
 	try {
 		const handlers = start(
 			sessionContext,
-			{ get: () => undefined, getAgentDir: () => cwd } as unknown as Settings,
+			{
+				get: (key: string) =>
+					mode === "queued-deadline" || mode === "joined-progress"
+						? key === "sdk.promptDeadlineMs"
+							? 100
+							: key === "sdk.promptMaxRuntimeMs"
+								? 1_000
+								: undefined
+						: undefined,
+				getAgentDir: () => cwd,
+			} as unknown as Settings,
 			async (_content, options) => {
 				accepted.resolve();
 				await preflight.promise;
@@ -3765,6 +3789,8 @@ test.each([
 				const remove = () => {
 					if (!queued) return;
 					queued = false;
+					heldCommit?.arm();
+					failedCommit?.arm();
 					promote?.({ startsOwnRun: false, removed: true });
 				};
 				options?.preflightSignal?.addEventListener("abort", remove, { once: true });
@@ -3814,6 +3840,10 @@ test.each([
 			).toMatchObject({ ok: true });
 		}
 		expect(await control("steered-finish", "turn.image.finish", { id: imageId })).toMatchObject({ ok: true });
+		if (mode === "busy-at-dispatch") {
+			live.idle = false;
+			await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		}
 		socket.send(
 			JSON.stringify({
 				type: "control_request",
@@ -3822,6 +3852,19 @@ test.each([
 				input: { text: "Image diverted during preflight", stagedImages: [{ id: imageId }] },
 			}),
 		);
+		if (mode === "busy-at-dispatch") {
+			await waitFor(
+				() => frames.some(frame => frame.id === "steered-prompt" && frame.type === "control_response"),
+				"staged busy rejection",
+			);
+			expect(frames.find(frame => frame.id === "steered-prompt" && frame.type === "control_response")).toMatchObject(
+				{ ok: false, error: { code: "busy" } },
+			);
+			expect(queued).toBe(false);
+			expect(reserved).toBe(0);
+			await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+			return;
+		}
 		await accepted.promise;
 		// A different run starts while preflight is awaiting AgentSession. The
 		// prompt is accepted only after this run has become busy, so it is queued.
@@ -3847,6 +3890,99 @@ test.each([
 			await waitFor(() => frames.some(frame => frame.id === id), "durable diverted result");
 			return frames.find(frame => frame.id === id)!;
 		};
+		if (heldCommit || failedCommit) {
+			socket.send(
+				JSON.stringify({
+					type: "control_request",
+					id: "persist-cancel",
+					operation: "turn.abort",
+					input: { mode: "terminal" },
+					idempotencyKey: "persist-cancel",
+				}),
+			);
+			if (heldCommit) {
+				await heldCommit.started;
+				expect(frames.some(frame => frame.id === "persist-cancel" && frame.type === "control_response")).toBe(
+					false,
+				);
+				const before = (await Bun.file(
+					reconciliationStorePath(path.join(cwd, "session.jsonl"), sessionId),
+				).json()) as ReconciliationStoreDocument;
+				expect(
+					before.records.find(record => record.commandId === correlation.commandId)?.terminalAt,
+				).toBeUndefined();
+				heldCommit.release();
+				await waitFor(
+					() => frames.some(frame => frame.id === "persist-cancel" && frame.type === "control_response"),
+					"joined durable cancellation reply",
+				);
+				expect(
+					frames.find(frame => frame.id === "persist-cancel" && frame.type === "control_response"),
+				).toMatchObject({ ok: true });
+				expect(await queryResult()).toMatchObject({
+					ok: true,
+					result: { status: "terminal_ok", outcome: { reason: "cancelled" } },
+				});
+				await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+			} else if (failedCommit) {
+				await failedCommit.failed;
+				await waitFor(
+					() => warnSpy.mock.calls.some(args => String(args[0]).includes("persistence failed")),
+					"failed durable removal",
+				);
+				const durable = (await Bun.file(
+					reconciliationStorePath(path.join(cwd, "session.jsonl"), sessionId),
+				).json()) as ReconciliationStoreDocument;
+				expect(
+					durable.records.find(record => record.commandId === correlation.commandId)?.terminalAt,
+				).toBeUndefined();
+				expect(durable.terminalScopes?.at(-1)?.turnDisposition).toBe("no_effect_reserved");
+				expect(
+					frames.find(frame => frame.id === "persist-cancel" && frame.type === "control_response"),
+				).toMatchObject({ ok: true, result: { turn: "uncertain", reason: "worker_unsettled" } });
+				expect(frames.some(frame => frame.type === "agent_end" && frame.commandId === correlation.commandId)).toBe(
+					false,
+				);
+				const replayFrames: Record<string, unknown>[] = [];
+				const replaySocket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+				sockets.push(replaySocket);
+				replaySocket.addEventListener("message", event => replayFrames.push(JSON.parse(String(event.data))));
+				await waitFor(() => replaySocket.readyState === WebSocket.OPEN, "fresh cancellation replay client");
+				replaySocket.send(
+					JSON.stringify({
+						type: "control_request",
+						id: "persist-cancel-replay",
+						operation: "turn.abort",
+						input: { mode: "terminal" },
+						idempotencyKey: "persist-cancel",
+					}),
+				);
+				await waitFor(
+					() => replayFrames.some(frame => frame.id === "persist-cancel-replay"),
+					"uncertain cancellation replay",
+				);
+				expect(replayFrames.find(frame => frame.id === "persist-cancel-replay")).toMatchObject({
+					ok: true,
+					result: { turn: "uncertain" },
+				});
+				const shutdownFailure = await Promise.resolve(
+					handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext),
+				).then(
+					() => undefined,
+					(error: unknown) => error,
+				);
+				expect((shutdownFailure as { code?: string } | undefined)?.code).toBe("sdk_reconciliation_teardown_failed");
+			}
+			expect(queued).toBe(false);
+			expect(live.handle).toBe("original-run");
+			return;
+		}
+		if (mode === "queued-deadline") {
+			await Bun.sleep(350);
+			expect(await queryResult()).toMatchObject({ ok: true, result: { status: "accepted" } });
+			expect(queued).toBe(true);
+			expect(reserved).toBe(1);
+		}
 		if (mode === "removed" || mode === "ordinary-abort" || mode === "terminal-abort") {
 			if (mode === "removed") {
 				queued = false;
@@ -3893,6 +4029,36 @@ test.each([
 		queued = false;
 		releaseQueueAbort?.();
 		promote?.({ startsOwnRun: false });
+		if (mode === "joined-progress") {
+			await handlers.get("tool_execution_start")?.(
+				{ type: "tool_execution_start", toolCallId: "joined-tool", toolName: "read", args: {} },
+				sessionContext,
+			);
+			for (let tick = 0; tick < 5; tick++) {
+				await Bun.sleep(60);
+				await handlers.get("tool_execution_update")?.(
+					{
+						type: "tool_execution_update",
+						toolCallId: "joined-tool",
+						toolName: "read",
+						args: {},
+						partialResult: { content: [{ type: "text", text: "progress" }] },
+					},
+					sessionContext,
+				);
+				expect(await queryResult()).toMatchObject({ ok: true, result: { status: "accepted" } });
+			}
+			await handlers.get("tool_execution_end")?.(
+				{
+					type: "tool_execution_end",
+					toolCallId: "joined-tool",
+					toolName: "read",
+					result: { content: [{ type: "text", text: "done" }] },
+					isError: false,
+				},
+				sessionContext,
+			);
+		}
 		if (mode === "fatal") {
 			// The successor is the actual consuming run. A fatal transport response
 			// cannot release its accepted image until that exact run terminates.
@@ -3918,7 +4084,7 @@ test.each([
 		trustedOwners.set(successorEnd, { resourceRunId: "successor-run", domain: successorDomain });
 		await handlers.get("agent_end")?.(successorEnd, sessionContext);
 		expect(reserved).toBe(0);
-		if (mode === "natural") {
+		if (mode === "natural" || mode === "queued-deadline" || mode === "joined-progress") {
 			expect(await queryResult()).toMatchObject({
 				ok: true,
 				result: { status: "terminal_ok", outcome: { kind: "stopped", reason: "end_turn" } },
@@ -3932,6 +4098,9 @@ test.each([
 	} finally {
 		preflight.resolve();
 		releaseQueueAbort?.();
+		heldCommit?.release();
+		heldCommit?.restore();
+		failedCommit?.restore();
 		redeemSpy.mockRestore();
 		warnSpy.mockRestore();
 	}

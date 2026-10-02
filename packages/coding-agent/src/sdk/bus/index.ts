@@ -4939,6 +4939,7 @@ export function createNotificationsExtension(
 		});
 		const acceptedImages = new Map<string, () => void>();
 		const acceptedImageRunOwners = new Map<string, AgentTerminalOwnerContext>();
+		const queuedRemovalTerminals = new Map<string, Promise<boolean>>();
 		const joinedPromptOwners = new Map<
 			string,
 			{ correlation: { commandId: string; turnId: string }; owner: AgentTerminalOwnerContext }
