@@ -7,6 +7,7 @@ import packageJson from "../package.json" with { type: "json" };
 import { AcpAgent, acpRequestFailure } from "../src/modes/acp/acp-agent";
 import { AcpSdkAdapter, type AcpSdkAdapterError, acpMcpLaunchFailure } from "../src/sdk/acp";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
+import { lifecycleRequestTimeoutMs } from "../src/sdk/broker/startup-budget";
 import { SdkClientError, type SdkRequestOptions } from "../src/sdk/client";
 import { MAX_REVERSE_PAYLOAD_BYTES } from "../src/sdk/host";
 import type { SessionAttachment } from "../src/sdk/router";
@@ -382,6 +383,24 @@ test("ACP SDK adapter maps native and extension methods and keeps endpoint crede
 	} satisfies Partial<AcpSdkAdapterError>);
 	await adapter.close();
 	await broker.close();
+});
+
+test("ACP lifecycle startup deadline is bounded by the broker startup budget", async () => {
+	const sdk = new FakeSdkClient();
+	const adapter = new AcpSdkAdapter({ client: sdk as never });
+	const startedAt = Date.now();
+	try {
+		const input = { cwd: "/workspace", target: { path: "/workspace" } };
+		await adapter.global("session.create", input, "bounded-startup-key");
+		const frame = sdk.frames.at(-1);
+		const deadline = frame?.deadline;
+		const expected = lifecycleRequestTimeoutMs("session.create", input);
+		if (typeof deadline !== "number" || expected === undefined) throw new Error("startup deadline was not recorded");
+		expect(deadline - startedAt).toBeLessThanOrEqual(expected + 5);
+		expect(frame?.timeoutMs).toBe(expected);
+	} finally {
+		await adapter.close();
+	}
 });
 
 test("Broker client injection cannot service live session controls or queries", async () => {
