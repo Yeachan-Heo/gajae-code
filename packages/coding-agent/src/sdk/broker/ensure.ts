@@ -829,6 +829,10 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 						await ensureBrokerTiming.sleep(50);
 						continue;
 					}
+					if (isTrampoline && !childExited) {
+						await ensureBrokerTiming.sleep(50);
+						continue;
+					}
 					if (isTrampoline && spawnedBrokerPid !== undefined && spawnedBrokerIncarnation !== undefined) {
 						const observed = observeProcessIncarnation(spawnedBrokerPid);
 						if (
