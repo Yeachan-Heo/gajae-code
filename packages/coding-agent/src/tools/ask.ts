@@ -17,6 +17,7 @@
 
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import type { RawArgumentValidationResult } from "@gajae-code/ai/types";
+import { validateToolArguments } from "@gajae-code/ai/utils/validation";
 import {
 	type Component,
 	Container,
@@ -64,6 +65,7 @@ import { GJC_ASK_TIMEOUT_CODE } from "./ask-answer-registry";
 import {
 	type AskParametersSchema,
 	type AskToolInput,
+	askSchema,
 	intentContract,
 	intentReview,
 	recoverRoundZeroIntentContract,
@@ -860,6 +862,20 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			this.session.getSessionAgentDir?.() ?? this.session.settings.getAgentDir(),
 		);
 		assertDeepInterviewStructuredResponseWithinLimit(params);
+		// Recheck at execution time as well: direct SDK callers and a phase change
+		// after tool-call validation must not open an unrecordable interview ask.
+		const stage = this.session.getDeepInterviewAskStage?.();
+		params = askSchema.parse(
+			validateToolArguments(
+				{
+					name: this.name,
+					description: this.description,
+					parameters: stage === undefined ? askSchema : selectAskParameters(stage),
+					rawArgumentValidation: arguments_ => recoverRoundZeroIntentContract(arguments_, stage),
+				},
+				{ type: "toolCall", id: _toolCallId, name: this.name, arguments: params },
+			),
+		);
 		let activeRemoteReceipt: AskRemoteReceipt | undefined;
 		let activeRemoteRequest: AskAnswerRequest | undefined;
 		let remoteGeneration = 0;
@@ -1183,13 +1199,6 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 
 		// Send notification if waiting and not suppressed
 		this.#sendAskNotification();
-
-		if (params.questions.length === 0) {
-			return {
-				content: [{ type: "text" as const, text: "Error: questions must not be empty" }],
-				details: {},
-			};
-		}
 
 		const askQuestion = async (
 			q: AskParams["questions"][number],

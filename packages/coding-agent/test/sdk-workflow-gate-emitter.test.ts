@@ -7,8 +7,14 @@ import { getBundledModel } from "@gajae-code/ai";
 import { validateToolArguments } from "@gajae-code/ai/utils/validation";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { Settings } from "../src/config/settings";
+import {
+	enrichDeepInterviewRoundScoring,
+	readDeepInterviewStateCompact,
+} from "../src/gjc-runtime/deep-interview-recorder";
+import type { DeepInterviewStateEnvelope } from "../src/gjc-runtime/deep-interview-state";
 import { createDeepInterviewIntentManifest } from "../src/gjc-runtime/deep-interview-state";
 import { activeEntryPath, modeStatePath, sessionStateDir } from "../src/gjc-runtime/session-layout";
+import { ensureWorkflowSkillActivationState } from "../src/hooks/skill-state";
 import {
 	BrokerWorkflowGateEmitter,
 	FileGateStore,
@@ -50,6 +56,128 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 	afterEach(() => {
 		for (const d of tempDirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
 	});
+
+	it("rejects the incident before emission and persists Round 0 through Round 1 scoring", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-ask-integrity-"));
+		tempDirs.push(tempDir);
+		const sessionManager = SessionManager.create(tempDir, tempDir);
+		await sessionManager.ensureOnDisk();
+		const sessionId = sessionManager.getSessionId();
+		await ensureWorkflowSkillActivationState({ cwd: tempDir, skill: "deep-interview", sessionId });
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager,
+			settings: Settings.isolated(),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			hasUI: false,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+		});
+		try {
+			const emitGate = vi.fn(async (input: OpenGateInput) => ({ selected: [input.options?.[0]?.label ?? ""] }));
+			session.setWorkflowGateEmitter({ supportsRemoteGateAnswers: () => true, emitGate });
+			const ask = session.getToolByName("ask");
+			if (!ask) throw new Error("Expected real SDK ask tool");
+			expect(session.getDeepInterviewAskStage()).toBe("topology");
+			const statePath = modeStatePath(tempDir, sessionId, "deep-interview");
+			const initialState = await Bun.file(statePath).text();
+			const missing = {
+				id: "dot-gjc-topology",
+				question: "Round 0 | Topology confirmation\n\n범위와 의도가 맞습니까?",
+				options: [{ label: "이 범위와 의도가 맞음" }],
+				workflowGate: { stage: "deep-interview", kind: "question" },
+			};
+			for (const questions of [[missing], [missing, { id: "metadata", question: "", options: [] }]]) {
+				const call = { type: "toolCall" as const, id: "incident", name: "ask", arguments: { questions } };
+				expect(() => validateToolArguments(ask, call)).toThrow("raw arguments rejected before coercion");
+				await expect(ask.execute("incident", { questions })).rejects.toThrow(
+					"raw arguments rejected before coercion",
+				);
+			}
+			expect(emitGate).not.toHaveBeenCalled();
+			expect(await Bun.file(statePath).text()).toBe(initialState);
+
+			const topologyQuestion = {
+				...missing,
+				deepInterview: {
+					round: 0,
+					component: "review-topology",
+					dimension: "topology",
+					ambiguity: 1,
+					intent_contract: {
+						items: [
+							{ id: "artifact:dot-skill", category: "artifact", statement: "Dot에서 사용하는 세션 관리 스킬" },
+						],
+						confirmation_options: ["이 범위와 의도가 맞음"],
+					},
+				},
+			};
+			const validated = validateToolArguments(ask, {
+				type: "toolCall",
+				id: "round-zero",
+				name: "ask",
+				arguments: { questions: [topologyQuestion] },
+			});
+			const zeroResult = await ask.execute("round-zero", validated);
+			expect(zeroResult.content[0]).toMatchObject({ type: "text", text: "User selected: 이 범위와 의도가 맞음" });
+			const locked = (await Bun.file(statePath).json()) as DeepInterviewStateEnvelope;
+			expect(locked.state?.intent_contract).toMatchObject({ version: 1, confirmation_round: 0 });
+			expect(session.getDeepInterviewAskStage()).toBe("post-topology");
+			expect(() =>
+				validateToolArguments(ask, {
+					type: "toolCall",
+					id: "stale-round-zero",
+					name: "ask",
+					arguments: { questions: [topologyQuestion] },
+				}),
+			).toThrow('Validation failed for tool "ask"');
+			const roundOne = {
+				id: "constraints",
+				question: "Which execution boundary matters most?",
+				options: [{ label: "SDK only" }, { label: "Shell commands" }],
+				deepInterview: { round: 1, component: "session-orchestration", dimension: "constraints", ambiguity: 0.7 },
+			};
+			await ask.execute(
+				"round-one",
+				validateToolArguments(ask, {
+					type: "toolCall",
+					id: "round-one",
+					name: "ask",
+					arguments: { questions: [roundOne] },
+				}),
+			);
+			expect(emitGate).toHaveBeenCalledTimes(2);
+			expect((await readDeepInterviewStateCompact(statePath)).pending_shells).toEqual([
+				expect.objectContaining({ round: 0, selected_options: ["이 범위와 의도가 맞음"], lifecycle: "answered" }),
+				expect.objectContaining({ round: 1, selected_options: ["SDK only"], lifecycle: "answered" }),
+			]);
+			await enrichDeepInterviewRoundScoring(
+				tempDir,
+				statePath,
+				{
+					round: 1,
+					questionId: "constraints",
+					scores: { goal: 0.8, constraints: 0.8, criteria: 0.8 },
+					ambiguity: 0.2,
+				},
+				{ sessionId },
+			);
+			const scored = await readDeepInterviewStateCompact(statePath);
+			expect(scored.recent_scored_rounds).toEqual([
+				expect.objectContaining({ round: 1, lifecycle: "scored", selected_options: ["SDK only"] }),
+			]);
+			expect(scored.pending_shells).toHaveLength(1);
+			expect(((await Bun.file(statePath).json()) as DeepInterviewStateEnvelope).state?.intent_contract).toEqual(
+				locked.state?.intent_contract,
+			);
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
 
 	it("makes the real ask tool emit a workflow_gate when an emitter is attached to the session", async () => {
 		await initTheme(false);
