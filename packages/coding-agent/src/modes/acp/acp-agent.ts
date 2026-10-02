@@ -2751,8 +2751,6 @@ export class AcpAgent implements Agent {
 					}
 				if (stageImages) {
 					for (const image of payload.images) {
-						if (!CANONICAL_IMAGE_BASE64.test(image.data) || !image.data)
-							throw new AcpSdkAdapterError("invalid_input", "ACP image data must be canonical base64.");
 						const bytes = Buffer.from(image.data, "base64");
 						if (bytes.toString("base64") !== image.data)
 							throw new AcpSdkAdapterError("invalid_input", "ACP image data must be canonical base64.");
@@ -2817,8 +2815,11 @@ export class AcpAgent implements Agent {
 							input: {
 								text: payload.text,
 								stagedImages: [...stagedIds].map(id => ({ id })),
-								clientRef: PROMPT_FRAME_ID_PLACEHOLDER,
+								clientRef,
 							},
+							...(record.adapter.connectionId === undefined
+								? {}
+								: { connectionId: record.adapter.connectionId }),
 						}),
 					);
 					if (stagedFrameBytes > MAX_PROMPT_FRAME_BYTES)
