@@ -14741,8 +14741,8 @@ export class AgentSession {
 	/**
 	 * One-shot preflight-abort binding: an invocation cancelled after its queue
 	 * admission must cancel the submission it admitted, so an aborted dispatch
-	 * can never execute later. Both explicit delivery paths (follow-up and
-	 * steer) share this helper so their cancellation semantics cannot diverge
+	 * can never execute later. Explicit and implicitly diverted queue admissions
+	 * share this helper so their cancellation semantics cannot diverge
 	 * (exact-head review P1).
 	 */
 	#bindPreflightAbortCancellation(
@@ -15874,12 +15874,13 @@ export class AgentSession {
 			if (this.#isLiveTurnBusy() && !waitedForAbortUnwind) {
 				if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 				assertPreflightStillOpen();
-				await this.#queueSteer(text, images, {
+				const queuedSteer = await this.#queueSteer(text, images, {
 					claimsGenuineUserIntent: true,
-					onPromoted: options?.onQueuedPromoted,
+					onPromoted: onQueuedPromoted,
 					external: true,
 					sdkRunToken: internalOptions?.sdkRunToken,
 				});
+				this.#bindPreflightAbortCancellation(options?.preflightSignal, queuedSteer);
 				// Dispatch-race disposition (#4668 review P1): the SDK snapshot-decided
 				// this submission starts its own turn (idle at dispatch), but the
 				// session began streaming before sendUserMessage ran, so the message
@@ -15889,8 +15890,15 @@ export class AgentSession {
 				// would terminalize the accepted request as an own-run completion
 				// before it is consumed. Report the internal in-run disposition so the
 				// runtime attaches the correlation to the in-flight run instead.
-				options?.onDispatchDisposition?.({ startsOwnRun: false });
-				options?.onPreflightAccepted?.();
+				try {
+					assertPreflightStillOpen();
+					options?.onDispatchDisposition?.({ startsOwnRun: false });
+					options?.onPreflightAccepted?.();
+					assertPreflightStillOpen();
+				} catch (error) {
+					queuedSteer.cancel();
+					throw error;
+				}
 				return;
 			}
 
