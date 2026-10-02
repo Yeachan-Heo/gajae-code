@@ -6823,7 +6823,6 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 							terminalScope: { abortedAttemptEpoch: epoch, lineageIdHash: "deadline-flush-lineage" },
 						};
 					},
-
 				},
 				persistInterceptor: () => {},
 				agentFailedWriteFailures: 0,
