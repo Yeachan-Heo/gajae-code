@@ -4,6 +4,7 @@ import { deflateSync } from "node:zlib";
 import { PromptImageUploadStore } from "../src/sdk/host/prompt-image-upload";
 
 const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+const MAX_CHUNK_BYTES = 96 * 1024;
 // Standalone tests deliberately allow synthetic owners; hosts bind this to live sockets.
 const alwaysConnected = (_owner: string): boolean => true;
 
@@ -74,6 +75,25 @@ async function stage(store: PromptImageUploadStore, owner: string, bytes: Buffer
 	return id;
 }
 
+function fillNearLimit(store: PromptImageUploadStore): string[] {
+	const fullChunk = Buffer.alloc(MAX_CHUNK_BYTES).toString("base64");
+	const finalChunk = Buffer.alloc(MAX_CHUNK_BYTES - 1).toString("base64");
+	const chunkCounts = [171, 171, 170, 170];
+	const ids: string[] = [];
+	for (const chunkCount of chunkCounts) {
+		const { id } = store.begin("sender", {
+			mimeType: "image/png",
+			byteLength: 20 * 1024 * 1024,
+			sha256: "0".repeat(64),
+		});
+		ids.push(id);
+		for (let sequence = 0; sequence < chunkCount - 1; sequence++)
+			store.append("sender", { id, sequence, data: fullChunk });
+		store.append("sender", { id, sequence: chunkCount - 1, data: finalChunk });
+	}
+	return ids;
+}
+
 test("a valid original image larger than 256 KiB survives chunk upload and host redemption byte for byte", async () => {
 	const bytes = originalLargePng();
 	expect(bytes.length).toBeGreaterThan(256 * 1024);
@@ -91,6 +111,124 @@ test("a valid original image larger than 256 KiB survives chunk upload and host 
 		}
 	} finally {
 		store.close();
+	}
+});
+
+test("100000 one-byte fragments coalesce into bounded allocations and preserve exact bytes and final boundaries", async () => {
+	const header = Buffer.alloc(13);
+	header.writeUInt32BE(1, 0);
+	header.writeUInt32BE(1, 4);
+	header[8] = 8;
+	header[9] = 2;
+	const core = Buffer.concat([
+		PNG_SIGNATURE,
+		pngChunk("IHDR", header),
+		pngChunk("IDAT", deflateSync(Buffer.from([0, 17, 34, 51]))),
+		pngChunk("IEND"),
+	]);
+	const byteLength = 100_000;
+	const bytes = Buffer.concat([
+		core.subarray(0, -12),
+		pngChunk("ruSt", Buffer.alloc(byteLength - core.length - 12)),
+		core.subarray(-12),
+	]);
+	expect(bytes).toHaveLength(byteLength);
+	const encodedByte = Array.from({ length: 256 }, (_, value) => Buffer.from([value]).toString("base64"));
+	const store = new PromptImageUploadStore(alwaysConnected);
+	const allocatedSizes: number[] = [];
+	const allocate = Buffer.allocUnsafeSlow;
+	const allocations = vi.spyOn(Buffer, "allocUnsafeSlow").mockImplementation(size => {
+		allocatedSizes.push(size);
+		return allocate(size);
+	});
+	try {
+		const { id } = store.begin("sender", descriptor(bytes));
+		let result = { id, nextSequence: 0, receivedBytes: 0 };
+		for (let offset = 0; offset < bytes.length; offset++)
+			result = store.append("sender", {
+				id,
+				sequence: offset,
+				data: encodedByte[bytes[offset]!]!,
+			});
+		expect(allocatedSizes).toEqual([MAX_CHUNK_BYTES, byteLength - MAX_CHUNK_BYTES]);
+		allocations.mockRestore();
+		expect(result).toEqual({ id, nextSequence: bytes.length, receivedBytes: bytes.length });
+		expect(() => store.append("sender", { id, sequence: bytes.length, data: "AQ==" })).toThrow(
+			expect.objectContaining({ code: "invalid_input" }),
+		);
+		await store.finish("sender", { id });
+		const accepted = store.redeem("sender", [{ id }]);
+		try {
+			expect(accepted.images[0]?.mimeType).toBe("image/png");
+			expect(Buffer.from(accepted.images[0]!.data, "base64").equals(bytes)).toBe(true);
+		} finally {
+			accepted.release();
+		}
+	} finally {
+		allocations.mockRestore();
+		store.close();
+	}
+});
+
+test("coalesced allocation quotas recover on discard, disconnect and expiry", () => {
+	const crossingChunk = Buffer.from([1, 2]).toString("base64");
+
+	const discardedStore = new PromptImageUploadStore(alwaysConnected);
+	try {
+		const ids = fillNearLimit(discardedStore);
+		expect(() => discardedStore.append("sender", { id: ids[3]!, sequence: 170, data: crossingChunk })).toThrow(
+			expect.objectContaining({ code: "busy" }),
+		);
+		discardedStore.discard("sender", { id: ids[0] });
+		expect(discardedStore.append("sender", { id: ids[3]!, sequence: 170, data: crossingChunk })).toMatchObject({
+			nextSequence: 171,
+		});
+	} finally {
+		discardedStore.close();
+	}
+	Bun.gc(true);
+
+	const disconnectedStore = new PromptImageUploadStore(alwaysConnected);
+	try {
+		const ids = fillNearLimit(disconnectedStore);
+		expect(() => disconnectedStore.append("sender", { id: ids[3]!, sequence: 170, data: crossingChunk })).toThrow(
+			expect.objectContaining({ code: "busy" }),
+		);
+		disconnectedStore.disconnect("sender");
+		const replacement = disconnectedStore.begin("sender", {
+			mimeType: "image/png",
+			byteLength: 20 * 1024 * 1024,
+			sha256: "0".repeat(64),
+		});
+		const fullChunk = Buffer.alloc(MAX_CHUNK_BYTES).toString("base64");
+		expect(disconnectedStore.append("sender", { id: replacement.id, sequence: 0, data: fullChunk })).toMatchObject({
+			receivedBytes: MAX_CHUNK_BYTES,
+		});
+	} finally {
+		disconnectedStore.close();
+	}
+	Bun.gc(true);
+
+	const expiredStore = new PromptImageUploadStore(alwaysConnected);
+	try {
+		vi.useFakeTimers();
+		const ids = fillNearLimit(expiredStore);
+		expect(() => expiredStore.append("sender", { id: ids[3]!, sequence: 170, data: crossingChunk })).toThrow(
+			expect.objectContaining({ code: "busy" }),
+		);
+		vi.advanceTimersByTime(2 * 60_000);
+		const replacement = expiredStore.begin("sender", {
+			mimeType: "image/png",
+			byteLength: 20 * 1024 * 1024,
+			sha256: "0".repeat(64),
+		});
+		const fullChunk = Buffer.alloc(MAX_CHUNK_BYTES).toString("base64");
+		expect(expiredStore.append("sender", { id: replacement.id, sequence: 0, data: fullChunk })).toMatchObject({
+			receivedBytes: MAX_CHUNK_BYTES,
+		});
+	} finally {
+		vi.useRealTimers();
+		expiredStore.close();
 	}
 });
 

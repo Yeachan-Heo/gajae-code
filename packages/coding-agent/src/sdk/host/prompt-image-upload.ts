@@ -10,6 +10,7 @@ import {
 import { TypedControlError } from "./control/dispatch";
 
 const MAX_CHUNK_BYTES = 96 * 1024;
+const MIN_RETAINED_BUFFER_BYTES = 4 * 1024;
 const MAX_IMAGES = 16;
 const MAX_UPLOADS = 16;
 const MAX_ACCEPTED_BYTES = 64 * 1024 * 1024;
@@ -27,6 +28,7 @@ type Upload = {
 	byteLength: number;
 	sha256: string;
 	chunks: Buffer[];
+	reservedBytes: number;
 	length: number;
 	sequence: number;
 	finishing: boolean;
@@ -93,6 +95,7 @@ export class PromptImageUploadStore {
 			byteLength: input.byteLength as number,
 			sha256: input.sha256,
 			chunks: [],
+			reservedBytes: 0,
 			length: 0,
 			sequence: 0,
 			finishing: false,
@@ -122,16 +125,54 @@ export class PromptImageUploadStore {
 		if (bytes.length === 0 || bytes.length > MAX_CHUNK_BYTES || bytes.toString("base64") !== input.data)
 			invalid("Image chunk must be canonical base64 within the frame limit.");
 		if (upload.length + bytes.length > upload.byteLength) invalid("Image upload exceeds its declared size.");
+		const nextLength = upload.length + bytes.length;
+		const allocationLimit = Math.max(upload.byteLength, MIN_RETAINED_BUFFER_BYTES);
+		const requiredBytes = Math.min(Math.ceil(nextLength / MAX_CHUNK_BYTES) * MAX_CHUNK_BYTES, allocationLimit);
+		const addedBytes = requiredBytes - upload.reservedBytes;
 		if (
-			this.#uploadBytes + bytes.length > MAX_PASTED_IMAGE_SOURCE_BYTES ||
-			processBytes + transientBytes + bytes.length > MAX_PROCESS_BYTES
+			this.#uploadBytes + addedBytes > MAX_PASTED_IMAGE_SOURCE_BYTES ||
+			processBytes + transientBytes + addedBytes > MAX_PROCESS_BYTES
 		)
 			busy("Image staging capacity exceeded.");
-		upload.chunks.push(bytes);
-		upload.length += bytes.length;
-		upload.sequence++;
-		this.#uploadBytes += bytes.length;
-		processBytes += bytes.length;
+
+		// Reserve coalesced fixed-size slabs before allocating or retaining them. Tiny declared
+		// uploads reserve at least 4 KiB, avoiding one retained Buffer per admitted byte.
+		this.#uploadBytes += addedBytes;
+		processBytes += addedBytes;
+		const originalChunkCount = upload.chunks.length;
+		try {
+			const newChunks: Buffer[] = [];
+			for (let allocated = upload.reservedBytes; allocated < requiredBytes; ) {
+				const chunkBytes = Math.min(MAX_CHUNK_BYTES, requiredBytes - allocated);
+				newChunks.push(Buffer.allocUnsafeSlow(chunkBytes));
+				allocated += chunkBytes;
+			}
+
+			let sourceOffset = 0;
+			let targetOffset = upload.length;
+			while (sourceOffset < bytes.length) {
+				const chunkIndex = Math.floor(targetOffset / MAX_CHUNK_BYTES);
+				const chunk =
+					chunkIndex < upload.chunks.length
+						? upload.chunks[chunkIndex]!
+						: newChunks[chunkIndex - upload.chunks.length]!;
+				const chunkOffset = targetOffset % MAX_CHUNK_BYTES;
+				const copied = Math.min(bytes.length - sourceOffset, chunk.length - chunkOffset);
+				bytes.copy(chunk, chunkOffset, sourceOffset, sourceOffset + copied);
+				sourceOffset += copied;
+				targetOffset += copied;
+			}
+
+			if (newChunks.length > 0) upload.chunks.push(...newChunks);
+			upload.reservedBytes = requiredBytes;
+			upload.length = nextLength;
+			upload.sequence++;
+		} catch (error) {
+			upload.chunks.length = originalChunkCount;
+			this.#uploadBytes -= addedBytes;
+			processBytes -= addedBytes;
+			throw error;
+		}
 		return { id: input.id as string, nextSequence: upload.sequence, receivedBytes: upload.length };
 	}
 
@@ -152,7 +193,7 @@ export class PromptImageUploadStore {
 		upload.finishing = true;
 		concurrentFinishes++;
 		transientBytes += upload.length;
-		let reservedBytes = upload.length;
+		let transientReservation = upload.length;
 		try {
 			const bytes = Buffer.concat(upload.chunks, upload.length);
 			if (crypto.createHash("sha256").update(bytes).digest("hex") !== upload.sha256)
@@ -172,7 +213,7 @@ export class PromptImageUploadStore {
 			if (processBytes + transientBytes + decodedBytes > MAX_PROCESS_BYTES)
 				busy("Image decoding capacity exceeded.");
 			transientBytes += decodedBytes;
-			reservedBytes += decodedBytes;
+			transientReservation += decodedBytes;
 			try {
 				const decoded = await new Bun.Image(bytes).metadata();
 				if (decoded.width !== metadata.width || decoded.height !== metadata.height)
@@ -184,16 +225,20 @@ export class PromptImageUploadStore {
 			// The transport can disconnect while decoding. A removed lease cannot be resurrected.
 			if (this.#uploads.get(input.id as string) !== upload)
 				throw new TypedControlError("resource_gone", "Image upload expired.");
+			const releasedBytes = upload.reservedBytes - upload.length;
+			this.#uploadBytes -= releasedBytes;
+			processBytes -= releasedBytes;
 			upload.chunks = [bytes];
+			upload.reservedBytes = upload.length;
 			upload.finished = true;
 			return { id: input.id as string, byteLength: upload.length, sha256: upload.sha256, mimeType: upload.mimeType };
 		} finally {
 			// A discarded lease still owns its source chunks until this async decode settles.
 			if (this.#uploads.get(input.id as string) !== upload) {
-				this.#uploadBytes -= upload.length;
-				processBytes -= upload.length;
+				this.#uploadBytes -= upload.reservedBytes;
+				processBytes -= upload.reservedBytes;
 			}
-			transientBytes -= reservedBytes;
+			transientBytes -= transientReservation;
 			concurrentFinishes--;
 			upload.finishing = false;
 		}
@@ -289,8 +334,8 @@ export class PromptImageUploadStore {
 		this.#uploads.delete(id);
 		clearTimeout(upload.timer);
 		if (!upload.finishing) {
-			this.#uploadBytes -= upload.length;
-			processBytes -= upload.length;
+			this.#uploadBytes -= upload.reservedBytes;
+			processBytes -= upload.reservedBytes;
 		}
 	}
 }
