@@ -2961,6 +2961,7 @@ function createControlSurface(
 	imageUploads?: PromptImageUploadStore,
 	retainAcceptedImage?: (correlation: InvocationCorrelation, release: () => void) => void,
 	releaseAcceptedImage?: (correlation: InvocationCorrelation) => void,
+	acceptedQueueCancellations: Map<string, AcceptedQueueCancellation> = new Map(),
 ): ControlSurface {
 	const normalizePromptImages = (value: unknown): ImageContent[] => {
 		if (!Array.isArray(value)) return [];
@@ -3183,6 +3184,7 @@ function createControlSurface(
 		const cancelPreflight = () => {
 			preflightController.abort();
 			if (settled) return;
+			preflightController.abort();
 			settled = true;
 			preflight.reject(
 				Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" }),
@@ -4940,11 +4942,31 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			);
 	};
 	const acceptedImages = new Map<string, () => void>();
+	const acceptedQueueCancellations = new Map<string, AcceptedQueueCancellation>();
 	const imageKey = (correlation: InvocationCorrelation): string => `${correlation.commandId}:${correlation.turnId}`;
 	const releaseAcceptedImage = (correlation: InvocationCorrelation): void => {
 		const key = imageKey(correlation);
 		acceptedImages.get(key)?.();
 		acceptedImages.delete(key);
+		const cancellation = acceptedQueueCancellations.get(key);
+		if (cancellation) {
+			cancellation.controller.abort();
+			acceptedQueueCancellations.delete(key);
+			if (cancellation.disposition === "queued") {
+				cancellation.disposition = "teardown";
+				cancellation.resolveDisposition("teardown");
+			}
+		}
+	};
+	const disposeAcceptedQueueCancellations = (): void => {
+		for (const cancellation of acceptedQueueCancellations.values()) {
+			cancellation.controller.abort();
+			if (cancellation.disposition === "queued") {
+				cancellation.disposition = "teardown";
+				cancellation.resolveDisposition("teardown");
+			}
+		}
+		acceptedQueueCancellations.clear();
 	};
 	let currentImageUploads: PromptImageUploadStore | undefined;
 	let active:
@@ -7151,6 +7173,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			imageUploads,
 			(correlation, release) => acceptedImages.set(imageKey(correlation), release),
 			releaseAcceptedImage,
+			acceptedQueueCancellations,
 		);
 		const installProviderDefinitions = (capability: string, definitions: unknown): void => {
 			if (capability === "permission") {
@@ -7749,6 +7772,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		current.fenceGateResolutions();
 		currentImageUploads?.close();
 		currentImageUploads = undefined;
+		disposeAcceptedQueueCancellations();
 		for (const release of acceptedImages.values()) release();
 		acceptedImages.clear();
 		let queueCancellationFailure: unknown;
