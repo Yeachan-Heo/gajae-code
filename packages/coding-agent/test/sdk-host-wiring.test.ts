@@ -3930,6 +3930,10 @@ test.each([
 					() => warnSpy.mock.calls.some(args => String(args[0]).includes("persistence failed")),
 					"failed durable removal",
 				);
+				await waitFor(
+					() => frames.some(frame => frame.id === "persist-cancel" && frame.type === "control_response"),
+					"uncertain cancellation reply",
+				);
 				const durable = (await Bun.file(
 					reconciliationStorePath(path.join(cwd, "session.jsonl"), sessionId),
 				).json()) as ReconciliationStoreDocument;
