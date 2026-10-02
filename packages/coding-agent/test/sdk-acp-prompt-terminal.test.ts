@@ -138,6 +138,7 @@ async function createFixture(
 		virtualPromptWatchdog?: boolean;
 		busyOnSecondPrompt?: boolean;
 		busyBeforeSecondImageRedemption?: boolean;
+		discardResourceGone?: boolean;
 		busyUntilIdle?: boolean;
 		busyAfterCancel?: boolean;
 		blockSecondImageBegin?: boolean;
@@ -415,6 +416,8 @@ async function createFixture(
 										: frame.operation === "turn.image.finish"
 											? await imageUploads.finish(owner, frame.input)
 											: imageUploads.discard(owner, frame.input);
+							if (frame.operation === "turn.image.discard" && options.discardResourceGone)
+								throw new SdkClientError("resource_gone", "Image upload is unavailable.");
 							if (frame.operation === "turn.image.begin") {
 								imageUploadIds.push((result as { id: string }).id);
 								if (options.blockSecondImageBegin && imageUploadIds.length === 2) {
@@ -962,12 +965,14 @@ test("ACP waits for SDK idle before retrying a busy successor", async () => {
 test.each([
 	"post-redemption",
 	"pre-redemption",
+	"already-gone",
 	"cancel-before-idle",
 	"discard-failure",
 ] as const)("ACP retires one-shot refs before confirmed busy retry (%s)", async mode => {
 	const imageCount = mode === "post-redemption" ? 1 : 16;
 	const fixture = await createFixture({
 		busyBeforeSecondImageRedemption: mode !== "post-redemption",
+		discardResourceGone: mode === "already-gone",
 		busyOnSecondPrompt: true,
 		busyUntilIdle: true,
 		priorTranscriptUserTurn: true,
@@ -976,12 +981,8 @@ test.each([
 	});
 	const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 	const adapterCancel = vi.spyOn(AcpSdkAdapter.prototype, "cancel");
-	const discard =
-		mode === "discard-failure"
-			? vi
-					.spyOn(AcpSdkAdapter.prototype, "uploadImageDiscard")
-					.mockRejectedValue(new Error("sensitive image contents"))
-			: undefined;
+	const discard = vi.spyOn(AcpSdkAdapter.prototype, "uploadImageDiscard");
+	if (mode === "discard-failure") discard.mockRejectedValue(new Error("sensitive image contents"));
 	try {
 		const first = prompt(fixture, "provider failure");
 		await bounded(fixture.promptDelivered, "failed prompt delivery");
@@ -1006,6 +1007,13 @@ test.each([
 			return;
 		}
 		await bounded(fixture.idleWaitScheduled, "busy image idle wait");
+		if (mode === "already-gone") {
+			expect(discard).toHaveBeenCalledTimes(imageCount);
+			await Promise.all(
+				discard.mock.results.map(result => expect(result.value).rejects.toMatchObject({ code: "resource_gone" })),
+			);
+			expect(warn.mock.calls.filter(args => args[0] === "acp_image_discard_failed")).toHaveLength(0);
+		}
 		expect(fixture.redeemedImages).toEqual(mode === "post-redemption" ? [bytes] : []);
 		if (mode === "cancel-before-idle") {
 			await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel after pre-redemption busy");
@@ -1036,7 +1044,7 @@ test.each([
 		fixture.sendStopped("end_turn");
 		expect(await bounded(completed, "busy image successor settlement")).toEqual({ stopReason: "end_turn" });
 	} finally {
-		discard?.mockRestore();
+		discard.mockRestore();
 		adapterCancel.mockRestore();
 		warn.mockRestore();
 		fixture.dispose();
