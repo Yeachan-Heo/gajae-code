@@ -350,6 +350,7 @@ describe("ACP broker prewarm", () => {
 		expect(closeCalls).toBe(1);
 	});
 
+	// Real fixture broker spawn + real newSession takes 4-6.5s on 1-2 vCPU CI runners, so it must not inherit Bun's 5s default (same budget as other fixture-broker tests).
 	it("closes a replacement adapter resolved while live session teardown is pending", async () => {
 		const root = await mkdtemp(path.join(tmpdir(), "gjc-acp-broker-dispose-race-"));
 		const cwd = path.join(root, "workspace");
@@ -461,5 +462,5 @@ describe("ACP broker prewarm", () => {
 			closeSpy.mockRestore();
 			process.off("unhandledRejection", onUnhandled);
 		}
-	});
+	}, 30_000);
 });
