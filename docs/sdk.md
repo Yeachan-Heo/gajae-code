@@ -449,6 +449,47 @@ progress in the same consuming run and cancellation domain. Session teardown
 retires joined attribution; late predecessor progress or terminal events cannot
 adopt or settle a successor. Transport or delivery failure alone does not prove
 execution settled and does not retire a live unsettled execution owner.
+### ACP inline images and internal staging
+
+ACP clients can submit standard inline `ContentBlock.image` data on both initial
+and follow-up prompts. GJC preserves the encoded image's original bytes and MIME
+type; clients do not need a custom upload API or a `resource_link`. The internal
+SDK frame cap remains 256 KiB. Large inline images cross it through SDK-core-owned
+`turn.image.begin`, `turn.image.append`, `turn.image.finish`, and
+`turn.image.discard` controls, not by increasing the cap or exposing endpoint
+credentials to the ACP client.
+
+Staging is scoped to the authenticated live connection and session. Each upload
+has a fixed two-minute lease, a declared byte length, MIME type, and SHA-256 digest.
+Chunks are canonical base64 in sequence, with at most 96 KiB decoded per chunk.
+The host verifies exact length, digest, MIME/header agreement, dimensions, and
+image decoding before a reference is usable. A prompt accepts at most 16 images,
+each at most 20 MiB, with 64 MiB source limits for pending and accepted images and
+a shared 256 MiB process payload/copy budget. Appends coalesce into retained
+96 KiB slabs instead of retaining one Buffer per fragment; tiny uploads reserve
+at least 4 KiB. Session and process staging budgets charge the actual retained
+allocation before it is created, and successful finalization releases slab
+padding. Flexible fragment sizes remain supported without a chunk-count limit.
+Expiry, discard, and connection loss retire unconsumed upload capacity.
+
+Finished references are connection-owned and one-shot. `turn.prompt` consumes
+`stagedImages: [{ id }]`; callers cannot mix them with direct `images` or reuse
+references after redemption, including a subsequent admission rejection. ACP's
+bounded retry after a **confirmed** `busy` response restages the original bytes
+with fresh references. A lost or uncertain acknowledgement is reconciled through
+`turn.result`, never treated as permission to upload and execute the prompt again.
+The user's message is echoed once across a confirmed retry.
+
+Cancellation applies to the exact outstanding prompt, including successor
+admission while a cancelled image's user-message echo is still being published.
+Before consumption, a prompt diverted into steering retains its own queue-removal
+capability; cancelling it must not abort unrelated active work. After consumption,
+its image quota and durable completion belong to the exact consuming run and
+cancellation domain. A trusted natural terminal settles each joined accepted
+prompt with its own correlation; confirmed queue removal settles that submission
+without waiting for an unrelated run. A transport diagnostic or delivery-record
+expiry does not prove execution ended and cannot release accepted-image quota.
+Exact run terminal or session teardown releases retained image quota.
 
 `turn.prompt` remains ordered and non-idempotent. Its envelope `idempotencyKey`
 does not replay a response or produce `idempotency_conflict`. A retained duplicate
