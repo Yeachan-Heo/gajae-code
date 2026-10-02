@@ -137,6 +137,7 @@ async function createFixture(
 		controlledRetryBackoff?: boolean;
 		virtualPromptWatchdog?: boolean;
 		busyOnSecondPrompt?: boolean;
+		busyBeforeSecondImageRedemption?: boolean;
 		busyUntilIdle?: boolean;
 		busyAfterCancel?: boolean;
 		blockSecondImageBegin?: boolean;
@@ -438,7 +439,11 @@ async function createFixture(
 				}
 				if (frame.operation === "turn.prompt" || frame.operation === "skill.invoke") {
 					const stagedImages = (frame.input as { stagedImages?: Array<{ id: string }> }).stagedImages;
-					if (stagedImages && imageUploads) {
+					if (
+						stagedImages &&
+						imageUploads &&
+						!(options.busyBeforeSecondImageRedemption && promptDeliveries === 1)
+					) {
 						try {
 							const reservation = imageUploads.redeem("sdk-acp-prompt-terminal", stagedImages);
 							for (const image of reservation.images) redeemedImages.push(Buffer.from(image.data, "base64"));
@@ -830,11 +835,12 @@ function prompt(fixture: Fixture, text: string): Promise<{ stopReason: StoppedRe
 	} as PromptRequest) as Promise<{ stopReason: StoppedReason }>;
 }
 
-function imagePrompt(fixture: Fixture, bytes: Buffer): Promise<{ stopReason: StoppedReason }> {
+function imagePrompt(fixture: Fixture, bytes: Buffer, imageCount = 1): Promise<{ stopReason: StoppedReason }> {
+	const data = bytes.toString("base64");
 	return fixture.agent.prompt({
 		sessionId: fixture.sessionId,
 		messageId: "00000000-0000-4000-8000-000000000001",
-		prompt: [{ type: "image", mimeType: "image/png", data: bytes.toString("base64") }],
+		prompt: Array.from({ length: imageCount }, () => ({ type: "image", mimeType: "image/png", data })),
 	} as PromptRequest) as Promise<{ stopReason: StoppedReason }>;
 }
 
@@ -953,14 +959,29 @@ test("ACP waits for SDK idle before retrying a busy successor", async () => {
 	}
 });
 
-test("ACP restages one-shot image refs with fresh ids after a confirmed busy-until-idle response", async () => {
+test.each([
+	"post-redemption",
+	"pre-redemption",
+	"cancel-before-idle",
+	"discard-failure",
+] as const)("ACP retires one-shot refs before confirmed busy retry (%s)", async mode => {
+	const imageCount = mode === "post-redemption" ? 1 : 16;
 	const fixture = await createFixture({
+		busyBeforeSecondImageRedemption: mode !== "post-redemption",
 		busyOnSecondPrompt: true,
 		busyUntilIdle: true,
 		priorTranscriptUserTurn: true,
 		virtualPromptWatchdog: true,
 		acceptStagedImages: true,
 	});
+	const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+	const adapterCancel = vi.spyOn(AcpSdkAdapter.prototype, "cancel");
+	const discard =
+		mode === "discard-failure"
+			? vi
+					.spyOn(AcpSdkAdapter.prototype, "uploadImageDiscard")
+					.mockRejectedValue(new Error("sensitive image contents"))
+			: undefined;
 	try {
 		const first = prompt(fixture, "provider failure");
 		await bounded(fixture.promptDelivered, "failed prompt delivery");
@@ -970,30 +991,54 @@ test("ACP restages one-shot image refs with fresh ids after a confirmed busy-unt
 		const bytes = Buffer.from(
 			await Bun.file(path.join(import.meta.dir, "fixtures/sdk-inline-image-large.png")).arrayBuffer(),
 		);
-		const successor = imagePrompt(fixture, bytes);
+		const successor = imagePrompt(fixture, bytes, imageCount);
 		await waitFor(() => fixture.promptDeliveryCount() === 2, "busy image prompt delivery");
 		await bounded(fixture.busyResponseEntered, "confirmed busy image response");
+		if (mode === "discard-failure") {
+			await expect(bounded(successor, "unconfirmed cleanup rejects retry")).rejects.toMatchObject({
+				code: "image_cleanup_failed",
+			});
+			expect(fixture.promptDeliveryCount()).toBe(2);
+			expect(fixture.imageUploadIds).toHaveLength(imageCount);
+			expect(discard).toHaveBeenCalledTimes(imageCount);
+			expect(warn.mock.calls.filter(args => args[0] === "acp_image_discard_failed")).toHaveLength(imageCount);
+			expect(JSON.stringify(warn.mock.calls)).not.toContain("sensitive image contents");
+			return;
+		}
 		await bounded(fixture.idleWaitScheduled, "busy image idle wait");
-		expect(fixture.redeemedImages).toEqual([bytes]);
+		expect(fixture.redeemedImages).toEqual(mode === "post-redemption" ? [bytes] : []);
+		if (mode === "cancel-before-idle") {
+			await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel after pre-redemption busy");
+			expect(await bounded(successor, "cancelled busy image")).toEqual({ stopReason: "cancelled" });
+			expect(adapterCancel).not.toHaveBeenCalled();
+			expect(fixture.imageUploadIds).toHaveLength(imageCount);
+		}
 		fixture.sendIdle();
+		const completed = mode === "cancel-before-idle" ? imagePrompt(fixture, bytes, imageCount) : successor;
 		await waitFor(() => fixture.promptDeliveryCount() === 3, "restaged image prompt delivery");
 
-		expect(fixture.imageUploadIds).toHaveLength(2);
-		expect(new Set(fixture.imageUploadIds).size).toBe(2);
-		expect(fixture.redeemedImages).toEqual([bytes, bytes]);
-		expect(fixture.mutationInputs.slice(1).map(input => input.stagedImages)).toEqual(
-			fixture.imageUploadIds.map(id => [{ id }]),
+		expect(fixture.imageUploadIds).toHaveLength(imageCount * 2);
+		expect(new Set(fixture.imageUploadIds).size).toBe(imageCount * 2);
+		expect(fixture.redeemedImages).toEqual(
+			mode === "post-redemption" ? [bytes, bytes] : Array.from({ length: imageCount }, () => bytes),
 		);
+		expect(fixture.mutationInputs.slice(1).map(input => input.stagedImages)).toEqual([
+			fixture.imageUploadIds.slice(0, imageCount).map(id => ({ id })),
+			fixture.imageUploadIds.slice(imageCount).map(id => ({ id })),
+		]);
 		expect(
 			fixture.updates.filter(
 				update =>
 					update.update.sessionUpdate === "user_message_chunk" &&
 					(update.update as { content: { type: string } }).content.type === "image",
 			),
-		).toHaveLength(1);
+		).toHaveLength(imageCount * (mode === "cancel-before-idle" ? 2 : 1));
 		fixture.sendStopped("end_turn");
-		expect(await bounded(successor, "busy image successor settlement")).toEqual({ stopReason: "end_turn" });
+		expect(await bounded(completed, "busy image successor settlement")).toEqual({ stopReason: "end_turn" });
 	} finally {
+		discard?.mockRestore();
+		adapterCancel.mockRestore();
+		warn.mockRestore();
 		fixture.dispose();
 	}
 });
