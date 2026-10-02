@@ -120,7 +120,9 @@ export const expectedDomainErrors: Readonly<Record<string, string>> = {
 	// goal.list/get is intentionally absent: on a goal-less session it now
 	// succeeds with an explicit no_active_goal diagnostic payload instead of
 	// resource_gone (#4668), so adapters must observe ok: true.
-	"session.last_assistant": "resource_gone",
+	// session.last_assistant is intentionally absent: when there is no readable
+	// assistant text, it now returns an empty observation (ok: true with page.items: [null])
+	// instead of resource_gone (#5821), so adapters must observe ok: true.
 	"resource.body": "resource_gone",
 	"artifact.read": "resource_gone",
 	"retry.last": "nothing_to_retry",
