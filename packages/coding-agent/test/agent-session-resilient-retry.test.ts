@@ -1427,9 +1427,11 @@ describe.serial("AgentSession resilient retry", () => {
 		expect(lastAssistant(session).content).toEqual([{ type: "text", text: "recovered after provider retries" }]);
 	});
 	it.each([
-		"server_error",
-		"internal_error",
-	])("retries real Codex SSE %s through the SDK session after provider exhaustion", async code => {
+		{ code: "server_error", message: "fake upstream failure" },
+		{ code: "internal_error", message: "fake upstream failure" },
+		{ code: "server_is_overloaded", message: "Please try again later." },
+		{ code: "server_is_overloaded", message: undefined },
+	])("retries real Codex SSE $code through the SDK session after provider exhaustion", async ({ code, message }) => {
 		const bundled = getBundledModel("openai-codex", "gpt-5.5");
 		if (!bundled) throw new Error("Expected bundled Codex test model to exist");
 		const model: Model<"openai-codex-responses"> = {
@@ -1458,7 +1460,7 @@ describe.serial("AgentSession resilient retry", () => {
 				requests <= providerFailures
 					? [
 							{ type: "response.created", response: { id: "r1", status: "in_progress", output: [] } },
-							{ type: "error", code, message: "fake upstream failure" },
+							{ type: "error", code, ...(message === undefined ? {} : { message }) },
 						]
 					: [
 							{

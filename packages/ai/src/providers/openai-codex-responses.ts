@@ -162,7 +162,12 @@ const CODEX_PREVIOUS_RESPONSE_STALE_PROSE_MESSAGE = new RegExp(
 		`|${CODEX_PREVIOUS_RESPONSE_PROSE_TOKEN}(?:(?!${CODEX_PREVIOUS_RESPONSE_STALE_SUBFIELD_GUARD})[^\\n]){0,48}?(?:${CODEX_ANCHOR_STALE_QUALIFIER})(?![^\\n]{0,48}(?:${CODEX_PREVIOUS_RESPONSE_STALE_SUBFIELD_GUARD}))`,
 	"i",
 );
-const CODEX_RETRYABLE_EVENT_CODES = new Set(["model_error", "server_error", "internal_error"]);
+const CODEX_RETRYABLE_EVENT_CODES = new Set([
+	"model_error",
+	"server_error",
+	"internal_error",
+	SERVER_OVERLOADED_PROVIDER_CODE,
+]);
 const CODEX_TYPED_TRANSPORT_PROVIDER_CODES = new Set([
 	SERVER_OVERLOADED_PROVIDER_CODE,
 	"server_error",
@@ -2239,7 +2244,7 @@ async function handleCodexStreamFailure(
 		? {
 				...(transportFailure ?? { kind: "transport" as const }),
 				providerCode: typedProviderCode,
-				...(error instanceof CodexProviderStreamError && !error.retryable ? { retryMaxAttempts: 1 } : {}),
+				...(error instanceof CodexProviderStreamError && error.deterministicVeto ? { retryMaxAttempts: 1 } : {}),
 			}
 		: transportFailure;
 	output.errorMessage = await finalizeErrorMessage(error, context.requestContext.rawRequestDump);
@@ -3398,6 +3403,7 @@ function getCodexEventErrorMessage(rawEvent: Record<string, unknown>): string {
 
 class CodexProviderStreamError extends Error {
 	readonly retryable: boolean;
+	readonly deterministicVeto: boolean;
 	readonly code?: string;
 	readonly credentialModelUnavailable: boolean;
 	/**
@@ -3411,6 +3417,7 @@ class CodexProviderStreamError extends Error {
 	constructor(
 		message: string,
 		retryable: boolean,
+		deterministicVeto: boolean,
 		code: string | undefined,
 		providerMessage: string,
 		credentialModelUnavailable: boolean,
@@ -3418,6 +3425,7 @@ class CodexProviderStreamError extends Error {
 		super(message);
 		this.name = "CodexProviderStreamError";
 		this.retryable = retryable;
+		this.deterministicVeto = deterministicVeto;
 		this.code = code;
 		this.providerMessage = providerMessage;
 		this.credentialModelUnavailable = credentialModelUnavailable;
@@ -3427,10 +3435,7 @@ class CodexProviderStreamError extends Error {
 function isRetryableCodexFailureEvent(rawEvent: Record<string, unknown>): boolean {
 	const code = getCodexEventErrorCode(rawEvent).toLowerCase();
 	const message = getCodexEventErrorMessage(rawEvent);
-	if (
-		(code && CODEX_NON_RETRYABLE_EVENT_CODES.has(code)) ||
-		(!!message && CODEX_NON_RETRYABLE_EVENT_MESSAGE.test(message))
-	) {
+	if (isCodexDeterministicVeto(code, message)) {
 		return false;
 	}
 	if (code && CODEX_RETRYABLE_EVENT_CODES.has(code)) {
@@ -3439,9 +3444,17 @@ function isRetryableCodexFailureEvent(rawEvent: Record<string, unknown>): boolea
 	return !!message && CODEX_RETRYABLE_EVENT_MESSAGE.test(message);
 }
 
+function isCodexDeterministicVeto(code: string, message: string): boolean {
+	return (
+		(code && CODEX_NON_RETRYABLE_EVENT_CODES.has(code)) ||
+		(!!message && CODEX_NON_RETRYABLE_EVENT_MESSAGE.test(message))
+	);
+}
+
 function createCodexProviderStreamError(rawEvent: Record<string, unknown>): CodexProviderStreamError {
 	const code = getCodexEventErrorCode(rawEvent);
 	const message = getCodexEventErrorMessage(rawEvent);
+	const deterministicVeto = isCodexDeterministicVeto(code.toLowerCase(), message);
 	const formattedMessage =
 		typeof rawEvent.type === "string" && rawEvent.type === "error"
 			? formatCodexErrorEvent(rawEvent, code, message)
@@ -3449,6 +3462,7 @@ function createCodexProviderStreamError(rawEvent: Record<string, unknown>): Code
 	return new CodexProviderStreamError(
 		formattedMessage,
 		isRetryableCodexFailureEvent(rawEvent),
+		deterministicVeto,
 		code || undefined,
 		message,
 		isCodexAccountModelUnavailable(message, code),
