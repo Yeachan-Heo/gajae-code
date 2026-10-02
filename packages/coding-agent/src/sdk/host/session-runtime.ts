@@ -4472,11 +4472,11 @@ function createControlSurface(
 		},
 		abort: async () => {
 			const connectionId = sdkControlRequesterContext.getStore();
-			if (!requesterOwnsActiveRun(connectionId)) {
+			if (connectionId !== undefined && !requesterOwnsActiveRun(connectionId)) {
 				const queueCancellation = await cancelAcceptedQueueSubmissions(connectionId);
 				if (queueCancellation.unconfirmed) return { aborted: false, reason: "queue_terminal_unconfirmed" };
 				if (queueCancellation.removed) return { aborted: true };
-				if (queueCancellation.consumed) return { aborted: false, turn: "no_active_turn" };
+				return { aborted: false, turn: "no_active_turn" };
 			}
 			await Promise.resolve(ctx.abort()).catch(() => undefined);
 			return { aborted: true };
