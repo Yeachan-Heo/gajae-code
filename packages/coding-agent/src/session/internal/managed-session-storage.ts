@@ -1474,6 +1474,7 @@ export class ManagedSessionDescendantStore {
 		retained?: { authority: RecoveryFsRoot; authorityBaseDir: string },
 		policy?: ManagedSessionSecurityPolicy,
 		profileAgentDir?: string,
+		expectedSubtreeRoot?: ManagedDirectoryRoot,
 	) {
 		managedRelativePath(root, baseDir);
 
@@ -1512,13 +1513,46 @@ export class ManagedSessionDescendantStore {
 				});
 			}
 			this.#authority = retained.authority;
+			if (
+				expectedSubtreeRoot &&
+				(expectedSubtreeRoot.canonicalPath !== this.#baseDir ||
+					expectedSubtreeRoot.dev !== this.#subtreeRoot.dev ||
+					expectedSubtreeRoot.ino !== this.#subtreeRoot.ino)
+			)
+				throw new Error("Managed subtree authority changed during establishment");
 			this.#assertBound();
 
 			return;
 		}
 		assertManagedDirectoryRoot(root);
-		ensureManagedDirectory(this.#baseDir, root, this.#policy);
+		if (expectedSubtreeRoot) {
+			if (expectedSubtreeRoot.canonicalPath !== this.#baseDir)
+				throw new Error("Managed subtree authority path mismatch");
+			assertManagedDirectoryRoot(expectedSubtreeRoot);
+			const verified = validateNativeSecurityResult(
+				process.platform === "win32"
+					? nativeSessionStorage().verifyOwnerOnlyPathSecurityExpected(
+							this.#baseDir,
+							"directory",
+							expectedSubtreeRoot.dev,
+							expectedSubtreeRoot.ino,
+						)
+					: nativeSessionStorage().verifyOwnerOnlyPathSecurity(this.#baseDir, "directory"),
+				"verify",
+				"directory",
+			);
+			if (!verified.ok) throw securityError(this.#baseDir, verified);
+			assertManagedDirectoryRoot(expectedSubtreeRoot);
+		} else {
+			ensureManagedDirectory(this.#baseDir, root, this.#policy);
+		}
 		const subtreeStat = fs.lstatSync(this.#baseDir, { bigint: true });
+		if (
+			expectedSubtreeRoot &&
+			(canonicalFileId(subtreeStat.dev) !== expectedSubtreeRoot.dev ||
+				canonicalFileId(subtreeStat.ino) !== expectedSubtreeRoot.ino)
+		)
+			throw new Error("Managed subtree authority changed during establishment");
 		this.#subtreeRoot = Object.freeze({
 			canonicalPath: this.#baseDir,
 			dev: canonicalFileId(subtreeStat.dev),

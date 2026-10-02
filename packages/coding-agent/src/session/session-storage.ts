@@ -2580,6 +2580,18 @@ export class FileSessionStorage implements SessionStorage {
 			if (!taskArtifactOwnerStorageContext)
 				return new SessionDeleteVerificationError("artifacts", "task_artifact_owner_context_missing");
 			try {
+				if (
+					hasSiblingTaskArtifactOwnerTranscript(
+						this,
+						transcriptPath,
+						ownerEvidence.locator,
+						taskArtifactOwnerStorageContext,
+					)
+				)
+					return new SessionDeleteVerificationError(
+						"artifacts",
+						"task_artifact_owner_shared_with_sibling_transcript",
+					);
 				const outcome = withTaskArtifactOwnerFailure(() =>
 					retireTaskArtifactOwner(taskArtifactOwnerStorageContext, ownerEvidence, ownerContinuation),
 				);
@@ -3971,55 +3983,102 @@ export type SessionRetirementProbeOutcome =
  * and carry a usable session header — and bind the delete target to the exact
  * bytes just read. Nothing here mutates the store.
  */
-function hasSiblingTaskArtifactOwnerTranscript(
+export function hasSiblingTaskArtifactOwnerTranscript(
 	storage: FileSessionStorage,
 	transcriptPath: string,
 	locator: TaskArtifactOwnerLocator,
+	context: TaskArtifactOwnerStorageContext,
 ): boolean {
-	const directory = path.dirname(transcriptPath);
-	let names: string[];
+	const root = path.resolve(context.sessionsRoot);
+	const directories: Array<{ path: string; stat: fs.BigIntStats }> = [];
+	let rootBefore: fs.BigIntStats;
 	try {
-		names = fs.readdirSync(directory);
+		assertManagedDirectoryRoot(context.rootAuthority);
+		if (!pathIsWithin(context.rootAuthority.canonicalPath, root)) return true;
+		for (
+			let directory = root;
+			directory !== context.rootAuthority.canonicalPath;
+			directory = path.dirname(directory)
+		) {
+			const stat = fs.lstatSync(directory, { bigint: true });
+			if (!stat.isDirectory() || stat.isSymbolicLink()) return true;
+		}
+		rootBefore = fs.lstatSync(root, { bigint: true });
+		for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+			if (entry.name.startsWith(".")) continue;
+			const directory = path.join(root, entry.name);
+			const stat = fs.lstatSync(directory, { bigint: true });
+			if (stat.isSymbolicLink()) return true;
+			if (!stat.isDirectory()) continue;
+			if (!entry.name.startsWith("v2-") && !entry.name.startsWith("-")) return true;
+			directories.push({ path: directory, stat });
+		}
 	} catch {
 		return true;
 	}
-	for (const name of names) {
-		if (!name.endsWith(".jsonl") || path.join(directory, name) === transcriptPath) continue;
-		const siblingPath = path.join(directory, name);
-		let before: fs.BigIntStats;
+	for (const candidate of directories) {
+		const directory = candidate.path;
+		let names: string[];
 		try {
-			before = fs.lstatSync(siblingPath, { bigint: true });
+			names = fs.readdirSync(directory);
 		} catch {
 			return true;
 		}
-		if (before.isSymbolicLink() || !before.isFile()) continue;
-		try {
-			const sibling = storage.readSnapshotSync(siblingPath);
-			const after = fs.lstatSync(siblingPath, { bigint: true });
+		for (const name of names) {
+			if (!name.endsWith(".jsonl") || path.join(directory, name) === transcriptPath) continue;
+			const siblingPath = path.join(directory, name);
+			let before: fs.BigIntStats;
+			try {
+				before = fs.lstatSync(siblingPath, { bigint: true });
+			} catch {
+				return true;
+			}
+			if (before.isSymbolicLink() || !before.isFile()) continue;
+			try {
+				const sibling = storage.readSnapshotSync(siblingPath);
+				const after = fs.lstatSync(siblingPath, { bigint: true });
+				if (
+					after.isSymbolicLink() ||
+					!after.isFile() ||
+					after.dev !== before.dev ||
+					after.ino !== before.ino ||
+					after.nlink !== before.nlink ||
+					after.size !== before.size ||
+					after.mtimeNs !== before.mtimeNs ||
+					after.ctimeNs !== before.ctimeNs ||
+					sibling.stat.dev !== before.dev ||
+					sibling.stat.ino !== before.ino ||
+					sibling.stat.size !== Number(before.size) ||
+					sibling.stat.nlink !== before.nlink ||
+					sibling.stat.mtimeNs !== before.mtimeNs ||
+					sibling.stat.ctimeNs !== before.ctimeNs
+				)
+					return true;
+				const header = parseFirstJsonlLine(sibling.bytes);
+				if (header?.type !== "session" || typeof header.id !== "string") return true;
+				const siblingLocator = taskArtifactOwnerLocatorFromTranscriptBytes(sibling.bytes, header.id);
+				if (siblingLocator && JSON.stringify(siblingLocator) === JSON.stringify(locator)) return true;
+			} catch {
+				return true;
+			}
+		}
+	}
+	try {
+		assertManagedDirectoryRoot(context.rootAuthority);
+		for (const candidate of [{ path: root, stat: rootBefore }, ...directories]) {
+			const current = fs.lstatSync(candidate.path, { bigint: true });
 			if (
-				after.isSymbolicLink() ||
-				!after.isFile() ||
-				after.dev !== before.dev ||
-				after.ino !== before.ino ||
-				after.nlink !== before.nlink ||
-				after.size !== before.size ||
-				after.mtimeNs !== before.mtimeNs ||
-				after.ctimeNs !== before.ctimeNs ||
-				sibling.stat.dev !== before.dev ||
-				sibling.stat.ino !== before.ino ||
-				sibling.stat.size !== Number(before.size) ||
-				sibling.stat.nlink !== before.nlink ||
-				sibling.stat.mtimeNs !== before.mtimeNs ||
-				sibling.stat.ctimeNs !== before.ctimeNs
+				current.isSymbolicLink() ||
+				!current.isDirectory() ||
+				current.dev !== candidate.stat.dev ||
+				current.ino !== candidate.stat.ino ||
+				current.mtimeNs !== candidate.stat.mtimeNs ||
+				current.ctimeNs !== candidate.stat.ctimeNs
 			)
 				return true;
-			const header = parseFirstJsonlLine(sibling.bytes);
-			if (header?.type !== "session" || typeof header.id !== "string") return true;
-			const siblingLocator = taskArtifactOwnerLocatorFromTranscriptBytes(sibling.bytes, header.id);
-			if (siblingLocator && JSON.stringify(siblingLocator) === JSON.stringify(locator)) return true;
-		} catch {
-			return true;
 		}
+	} catch {
+		return true;
 	}
 	return false;
 }
@@ -4086,7 +4145,14 @@ function planSessionRetirement(
 				taskArtifactOwnerStorageContext,
 				continuationTarget,
 			);
-			if (hasSiblingTaskArtifactOwnerTranscript(storage, transcriptPath, taskArtifactOwnerLocator))
+			if (
+				hasSiblingTaskArtifactOwnerTranscript(
+					storage,
+					transcriptPath,
+					taskArtifactOwnerLocator,
+					taskArtifactOwnerStorageContext,
+				)
+			)
 				return {
 					kind: "owner_shared",
 					reason: "task_artifact_owner_shared_with_sibling_transcript",
@@ -4304,6 +4370,8 @@ async function retireGcOwnerTranscript(
 				ownerRetirementOutcome && ownerRetirementOutcome.kind !== "completed"
 					? ownerRetirementOutcome.continuation
 					: undefined;
+			if (hasSiblingTaskArtifactOwnerTranscript(storage, target.transcriptPath, locator, ownerContext))
+				return { kind: "kept", reason: "task_artifact_owner_shared_with_sibling_transcript" };
 			ownerRetirementOutcome = retireTaskArtifactOwner(ownerContext, evidence, previousContinuation);
 			if (ownerRetirementOutcome.kind === "completed") {
 				receipt = await publishManagedGcSessionRetirementReceipt(

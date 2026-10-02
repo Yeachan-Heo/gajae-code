@@ -54,6 +54,7 @@ import {
 } from "../../session/internal/managed-session-storage";
 import {
 	FileSessionStorage,
+	hasSiblingTaskArtifactOwnerTranscript,
 	SessionDeleteVerificationError,
 	type SessionStorageFileIdentity,
 	type SessionStorageSnapshot,
@@ -7815,6 +7816,18 @@ async function executeLifecycleResponse(
 				return await publishTaskArtifactOwnerPending("task_artifact_owner_context_missing", receipt);
 			let outcome: TaskArtifactOwnerRetirementOutcome;
 			try {
+				if (
+					hasSiblingTaskArtifactOwnerTranscript(
+						validated.storage,
+						cleanupTarget.transcriptPath,
+						evidence.locator,
+						ownerContext,
+					)
+				)
+					return await publishTaskArtifactOwnerPending(
+						"task_artifact_owner_shared_with_sibling_transcript",
+						receipt,
+					);
 				outcome = retireTaskArtifactOwner(
 					ownerContext,
 					evidence,

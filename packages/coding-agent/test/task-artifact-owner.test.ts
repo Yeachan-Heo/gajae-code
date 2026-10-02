@@ -1,9 +1,11 @@
 import { afterEach, expect, it, vi } from "bun:test";
 import * as crypto from "node:crypto";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
+import { $ } from "bun";
 import { safeRm } from "../../../scripts/safe-cleanup";
 import { collectGcDiskReport, resolveGcDiskPolicy } from "../src/gjc-runtime/gc-runtime";
 import {
@@ -15,6 +17,7 @@ import {
 	readManagedGcSessionRetirementReceipt,
 	resolveManagedScope,
 } from "../src/session/internal/managed-session-scope";
+import * as managedStorage from "../src/session/internal/managed-session-storage";
 import { SessionManager } from "../src/session/session-manager";
 import {
 	FileSessionStorage,
@@ -23,8 +26,10 @@ import {
 } from "../src/session/session-storage";
 import {
 	captureTaskArtifactOwnerDeletionEvidence,
+	restoreManagedTaskArtifactOwner,
 	retireTaskArtifactOwner,
 	type TaskArtifactOwnerDeletionEvidence,
+	type TaskArtifactOwnerRetirementContinuation,
 	type TaskArtifactOwnerStorageContext,
 } from "../src/session/task-artifact-owner";
 
@@ -120,7 +125,7 @@ async function fixture() {
 	return { root, cwd, agentDir, transcript, ownerDir, context: gcContext, scope, target, evidence };
 }
 
-async function retireThroughGcToOwnerPending(h: OwnerGcFixture) {
+async function publishGcThroughArtifacts(h: OwnerGcFixture) {
 	const prepared: ManagedGcSessionRetirementReceipt = {
 		...h.target,
 		state: "prepared",
@@ -157,6 +162,11 @@ async function retireThroughGcToOwnerPending(h: OwnerGcFixture) {
 		prepared,
 		"artifacts_removed",
 	);
+	return { prepared, artifactsRemoved };
+}
+
+async function retireThroughGcToOwnerPending(h: OwnerGcFixture) {
+	const { artifactsRemoved } = await publishGcThroughArtifacts(h);
 	const outcome = await retireSessionTranscript(
 		new FileSessionStorage(),
 		h.context.sessionsRoot,
@@ -240,6 +250,274 @@ it("direct owner retirement proves durable empty payload while honestly retainin
 	);
 	expect(await Bun.file(h.transcript).exists()).toBe(true);
 });
+
+it.skipIf(process.platform !== "darwin")(
+	"managed GC rejects in-flight owner publication and preserves proof on process restart",
+	async () => {
+		const h = await fixture();
+		const manager = await SessionManager.open(h.transcript, SessionManager.managedDestination(h.cwd, h.agentDir));
+		const owner = manager.getArtifactManager();
+		if (!owner) throw new Error("Expected admitted GC writer");
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const publish = managedStorage.ManagedSessionDescendantStore.prototype.publishNoReplace;
+		const writerSpy = vi
+			.spyOn(managedStorage.ManagedSessionDescendantStore.prototype, "publishNoReplace")
+			.mockImplementation(async function (this: managedStorage.ManagedSessionDescendantStore, relative, bytes) {
+				if (this.dir === owner.dir && bytes.byteLength > 0) {
+					entered.resolve();
+					await release.promise;
+				}
+				return publish.call(this, relative, bytes);
+			});
+		const pendingWrite = owner.save("in-flight GC writer payload", "probe").then(
+			value => ({ status: "saved" as const, value }),
+			error => ({ status: "rejected" as const, error: String(error) }),
+		);
+		const remove = native.exactRemoveDirectoryTree;
+		let nativeCalled = false;
+		const removeSpy = vi.spyOn(native, "exactRemoveDirectoryTree").mockImplementation((...args) => {
+			const outcome = remove(...args);
+			if (args[0] === owner.dir) {
+				nativeCalled = true;
+				release.resolve();
+			}
+			return outcome;
+		});
+		try {
+			await entered.promise;
+			const evidence = captureTaskArtifactOwnerDeletionEvidence(h.context, h.target.sessionId, h.evidence.locator);
+			if (!evidence) throw new Error("Expected pre-retirement writer snapshot");
+			h.evidence = evidence;
+			const outcome = await retireSessionTranscript(
+				new FileSessionStorage(),
+				h.context.sessionsRoot,
+				h.transcript,
+				h.context,
+				{ managedScope: h.scope },
+			);
+			expect(nativeCalled).toBe(true);
+			expect(await pendingWrite).toMatchObject({
+				status: "rejected",
+				error: expect.stringMatching(/Managed root authority changed|ENOENT/),
+			});
+			expect(outcome).toMatchObject({
+				kind: "cleanup_pending",
+				taskArtifactOwnerPayloadRetired: true,
+				taskArtifactOwnerDeletionEvidence: evidence,
+			});
+			const recorded = readManagedGcSessionRetirementReceipt(h.scope, h.context, h.target);
+			expect(recorded?.taskArtifactOwnerDeletionEvidence).toEqual(evidence);
+			expect(await replayInFreshProcess(h)).toMatchObject({
+				kind: "cleanup_pending",
+				taskArtifactOwnerPayloadRetired: true,
+			});
+			expect(
+				readManagedGcSessionRetirementReceipt(h.scope, h.context, h.target)?.taskArtifactOwnerDeletionEvidence,
+			).toEqual(evidence);
+			expect(await Bun.file(h.transcript).exists()).toBe(true);
+		} finally {
+			release.resolve();
+			await pendingWrite;
+			writerSpy.mockRestore();
+			removeSpy.mockRestore();
+			await manager.close();
+		}
+	},
+);
+
+async function replayInFreshProcess(h: OwnerGcFixture) {
+	const helper = path.join(import.meta.dir, "fixtures/task-owner-gc-replay.ts");
+	const child = await $`${process.execPath} ${helper}`
+		.env({
+			...process.env,
+			GJC_OWNER_REPLAY_INPUT: JSON.stringify({
+				cwd: h.cwd,
+				agentDir: h.agentDir,
+				sessionsRoot: h.context.sessionsRoot,
+				transcriptPath: h.transcript,
+			}),
+		})
+		.quiet()
+		.nothrow();
+	expect(child.exitCode, child.stderr.toString()).toBe(0);
+	const report = JSON.parse(child.stdout.toString()) as {
+		pid: number;
+		outcome: { kind: string; taskArtifactOwnerPayloadRetired?: boolean; taskArtifactOwnerRetired?: boolean };
+	};
+	expect(report.pid).not.toBe(process.pid);
+	return report.outcome;
+}
+
+for (const phase of ["prepared", "artifacts_removed", "owner_pending"] as const) {
+	it.skipIf(process.platform !== "darwin")(`replays durable GC ${phase} in a fresh process`, async () => {
+		const h = await fixture();
+		if (phase === "prepared")
+			await publishManagedGcSessionRetirementReceipt(
+				h.scope,
+				h.context,
+				{
+					...h.target,
+					state: "prepared",
+					taskArtifactOwnerDeletionEvidence: h.evidence,
+				},
+				"prepared",
+			);
+		else if (phase === "artifacts_removed") await publishGcThroughArtifacts(h);
+		else await retireThroughGcToOwnerPending(h);
+		const before = readManagedGcSessionRetirementReceipt(h.scope, h.context, h.target);
+		expect(before?.state).toBe(phase);
+		const transcriptBefore = await Bun.file(h.transcript).bytes();
+		expect(await replayInFreshProcess(h)).toMatchObject({
+			kind: "cleanup_pending",
+			taskArtifactOwnerPayloadRetired: true,
+		});
+		const after = readManagedGcSessionRetirementReceipt(h.scope, h.context, h.target);
+		expect(after).toMatchObject({
+			state: "owner_pending",
+			ownerRetirementAttempt: phase === "owner_pending" ? 2 : 1,
+		});
+		expect(after?.taskArtifactOwnerDeletionEvidence).toEqual(h.evidence);
+		expect(after?.taskArtifactOwnerRetirementOutcome?.evidence).toEqual(h.evidence);
+		expect(await Bun.file(h.transcript).bytes()).toEqual(transcriptBefore);
+	});
+}
+
+for (const corruption of ["prepared", "missing-attempt", "expanded-next-attempt"] as const) {
+	it.skipIf(process.platform !== "darwin")(
+		`refuses ${corruption} GC receipt corruption in a fresh process`,
+		async () => {
+			const h = await fixture();
+			await retireThroughGcToOwnerPending(h);
+			await retireSessionTranscript(new FileSessionStorage(), h.context.sessionsRoot, h.transcript, h.context, {
+				managedScope: h.scope,
+			});
+			const prepared = (
+				await Array.fromAsync(
+					new Bun.Glob("**/gc-retirement-*-prepared.json").scan({
+						cwd: h.context.sessionsRoot,
+						absolute: true,
+						dot: true,
+					}),
+				)
+			)[0];
+			const attempts = (
+				await Array.fromAsync(
+					new Bun.Glob("**/gc-retirement-*-owner_pending-*.json").scan({
+						cwd: h.context.sessionsRoot,
+						absolute: true,
+						dot: true,
+					}),
+				)
+			).sort();
+			if (!prepared || attempts.length !== 2) throw new Error("Expected prepared and two contiguous attempts");
+			if (corruption === "prepared") {
+				const record = JSON.parse(await Bun.file(prepared).text()) as Record<string, unknown>;
+				record.schemaVersion = 99;
+				await Bun.write(prepared, JSON.stringify(record));
+			} else if (corruption === "missing-attempt") {
+				await fs.rename(attempts[0]!, path.join(h.root, "retained-original-attempt.json"));
+			} else {
+				const record = JSON.parse(await Bun.file(attempts[1]!).text()) as {
+					taskArtifactOwnerRetirementContinuation: TaskArtifactOwnerRetirementContinuation;
+					taskArtifactOwnerRetirementOutcome: { continuation: TaskArtifactOwnerRetirementContinuation };
+				};
+				const original = record.taskArtifactOwnerRetirementContinuation;
+				const entry = original.retainedTreeSnapshot.entries.find(item => item.kind === "file");
+				if (!entry) throw new Error("Expected actual native empty-file evidence");
+				const expanded = {
+					...original,
+					retainedTreeSnapshot: {
+						...original.retainedTreeSnapshot,
+						entries: [...original.retainedTreeSnapshot.entries, { ...entry, relativePath: "expanded-authority" }],
+					},
+				};
+				record.taskArtifactOwnerRetirementContinuation = expanded;
+				record.taskArtifactOwnerRetirementOutcome.continuation = expanded;
+				await Bun.write(attempts[1]!, JSON.stringify(record));
+			}
+			const remnant = `${h.ownerDir}.removing`;
+			const before = await snapshotPath(remnant);
+			const transcriptBefore = await Bun.file(h.transcript).bytes();
+			expect(await replayInFreshProcess(h)).toMatchObject({ kind: "kept" });
+			expect(await snapshotPath(remnant)).toEqual(before);
+			expect(await Bun.file(h.transcript).bytes()).toEqual(transcriptBefore);
+		},
+	);
+}
+
+for (const replacement of ["unchanged", "foreign-remnant"] as const) {
+	it.skipIf(process.platform !== "darwin")(
+		`replays original authority after failed GC disposition publication with ${replacement}`,
+		async () => {
+			const h = await fixture();
+			await publishGcThroughArtifacts(h);
+			const transcriptBefore = await Bun.file(h.transcript).bytes();
+			const publish = managedStorage.publishManagedTombstone;
+			let interrupted = false;
+			const spy = vi
+				.spyOn(managedStorage, "publishManagedTombstone")
+				.mockImplementation(async (destination, record, assertOwned) => {
+					if (record.state === "owner_pending") {
+						interrupted = true;
+						throw new Error("injected GC disposition publication failure");
+					}
+					return publish(destination, record, assertOwned);
+				});
+			try {
+				const outcome = await retireSessionTranscript(
+					new FileSessionStorage(),
+					h.context.sessionsRoot,
+					h.transcript,
+					h.context,
+					{ managedScope: h.scope },
+				);
+				expect(interrupted).toBe(true);
+				expect(outcome).toMatchObject({
+					kind: "cleanup_pending",
+					reason: expect.stringContaining("injected GC disposition publication failure"),
+				});
+			} finally {
+				spy.mockRestore();
+			}
+			await expect(fs.lstat(h.ownerDir)).rejects.toMatchObject({ code: "ENOENT" });
+			expect((await fs.stat(`${h.ownerDir}.removing`, { bigint: true })).ino.toString()).toBe(
+				h.evidence.locator.directoryIno,
+			);
+			const predecessor = readManagedGcSessionRetirementReceipt(h.scope, h.context, h.target);
+			expect(predecessor?.state).toBe("artifacts_removed");
+			expect(predecessor?.taskArtifactOwnerDeletionEvidence).toEqual(h.evidence);
+			if (replacement === "foreign-remnant") {
+				const remnant = `${h.ownerDir}.removing`;
+				const original = `${remnant}.original`;
+				await fs.rename(remnant, original);
+				await fs.mkdir(remnant, { mode: 0o755 });
+				await Bun.write(path.join(remnant, "foreign"), "foreign replacement bytes");
+				const originalBefore = await snapshotPath(original);
+				const foreignBefore = await snapshotPath(remnant);
+				const outcome = await replayInFreshProcess(h);
+				expect(outcome.kind).toBe("cleanup_pending");
+				expect(outcome.taskArtifactOwnerPayloadRetired).toBeUndefined();
+				expect(outcome.taskArtifactOwnerRetired).toBeUndefined();
+				expect(await snapshotPath(original)).toEqual(originalBefore);
+				expect(await snapshotPath(remnant)).toEqual(foreignBefore);
+				expect(await Bun.file(h.transcript).bytes()).toEqual(transcriptBefore);
+				expect(
+					readManagedGcSessionRetirementReceipt(h.scope, h.context, h.target)?.taskArtifactOwnerDeletionEvidence,
+				).toEqual(h.evidence);
+				return;
+			}
+			expect(await replayInFreshProcess(h)).toMatchObject({
+				kind: "cleanup_pending",
+				taskArtifactOwnerPayloadRetired: true,
+			});
+			const replayed = readManagedGcSessionRetirementReceipt(h.scope, h.context, h.target);
+			expect(replayed).toMatchObject({ state: "owner_pending", ownerRetirementAttempt: 1 });
+			expect(replayed?.taskArtifactOwnerDeletionEvidence).toEqual(h.evidence);
+			expect(await Bun.file(h.transcript).bytes()).toEqual(transcriptBefore);
+		},
+	);
+}
 
 it("persists immutable managed GC phases and replays the full native owner disposition", async () => {
 	const h = await fixture();
@@ -427,6 +705,195 @@ it("refuses a repopulated native remnant before GC replay mutates it", async () 
 	expect(await snapshotPath(outcome.continuation.retainedRootPath)).toEqual(remnantBefore);
 	expect(await Bun.file(repopulated).text()).toBe("untrusted remnant content");
 });
+
+it("refuses locator authority supplied under a foreign managed profile", async () => {
+	const h = await fixture();
+	const foreign = await fixture();
+	const copied = path.join(foreign.context.sessionsRoot, ".task-artifact-owners", h.evidence.locator.ownerId);
+	await fs.mkdir(copied, { mode: 0o755 });
+	await Bun.write(
+		path.join(copied, ".gjc-task-artifact-owner-v1.json"),
+		await Bun.file(path.join(h.ownerDir, ".gjc-task-artifact-owner-v1.json")).bytes(),
+	);
+	await Bun.write(path.join(copied, "foreign-payload"), "foreign profile bytes");
+	const sourceBefore = await snapshotPath(h.ownerDir);
+	const foreignBefore = await snapshotPath(copied);
+	const nativeSpy = vi.spyOn(native, "exactRemoveDirectoryTree");
+	try {
+		expect(() => restoreManagedTaskArtifactOwner(foreign.context, h.target.sessionId, h.evidence.locator)).toThrow(
+			"task_artifact_owner_identity_mismatch",
+		);
+		expect(retireTaskArtifactOwner(foreign.context, h.evidence)).toMatchObject({
+			kind: "uncertain",
+			reason: "task_artifact_owner_parent_identity_changed",
+		});
+		await expect(
+			retireSessionTranscript(
+				new FileSessionStorage(),
+				foreign.context.sessionsRoot,
+				h.transcript,
+				foreign.context,
+				{ managedScope: foreign.scope },
+			),
+		).resolves.toMatchObject({ kind: "kept" });
+		expect(nativeSpy.mock.calls).toHaveLength(0);
+		expect(await snapshotPath(h.ownerDir)).toEqual(sourceBefore);
+		expect(await snapshotPath(copied)).toEqual(foreignBefore);
+	} finally {
+		nativeSpy.mockRestore();
+	}
+});
+
+for (const substitution of ["directory", "symlink"] as const) {
+	it(`refuses captured owner parent ${substitution} substitution before retirement or replay`, async () => {
+		const h = await fixture();
+		const parent = path.dirname(h.ownerDir);
+		const retained = `${parent}.original`;
+		await fs.rename(parent, retained);
+		const foreign = path.join(h.root, "foreign-parent");
+		await fs.mkdir(foreign, { mode: 0o755 });
+		await Bun.write(path.join(foreign, "payload"), "foreign parent bytes");
+		if (substitution === "symlink") await fs.symlink(foreign, parent, "dir");
+		else await fs.mkdir(parent, { mode: 0o755 });
+		const originalBefore = await snapshotPath(retained);
+		const namedBefore = await snapshotPath(parent);
+		const foreignBefore = await snapshotPath(foreign);
+		const transcriptBefore = await Bun.file(h.transcript).bytes();
+		const nativeSpy = vi.spyOn(native, "exactRemoveDirectoryTree");
+		try {
+			expect(retireTaskArtifactOwner(h.context, h.evidence).kind).toBe("uncertain");
+			await expect(
+				retireSessionTranscript(new FileSessionStorage(), h.context.sessionsRoot, h.transcript, h.context, {
+					managedScope: h.scope,
+				}),
+			).resolves.toMatchObject({ kind: "kept" });
+			expect(nativeSpy.mock.calls).toHaveLength(0);
+			expect(await snapshotPath(retained)).toEqual(originalBefore);
+			expect(await snapshotPath(parent)).toEqual(namedBefore);
+			expect(await snapshotPath(foreign)).toEqual(foreignBefore);
+			expect(await Bun.file(h.transcript).bytes()).toEqual(transcriptBefore);
+		} finally {
+			nativeSpy.mockRestore();
+		}
+	});
+}
+
+it("preserves cross-scope owner references retained after managed move metadata rollback", async () => {
+	const h = await fixture();
+	const targetCwd = path.join(h.root, "target-workspace");
+	await fs.mkdir(targetCwd);
+	const destination = SessionManager.managedDestination(targetCwd, h.agentDir);
+	if (destination.kind !== "managed") throw new Error("Expected managed target");
+	const targetTranscript = path.join(destination.directory, path.basename(h.transcript));
+	const manager = await SessionManager.open(h.transcript, SessionManager.managedDestination(h.cwd, h.agentDir));
+	const append = managedStorage.ManagedSessionDescendantStore.prototype.appendExpectedIdentitySync;
+	let injected = false;
+	const spy = vi
+		.spyOn(managedStorage.ManagedSessionDescendantStore.prototype, "appendExpectedIdentitySync")
+		.mockImplementation(function (this: managedStorage.ManagedSessionDescendantStore, relative, bytes, expected) {
+			if (!injected && this.dir === destination.directory && relative === path.basename(h.transcript)) {
+				injected = true;
+				throw new Error("injected managed target metadata failure");
+			}
+			return append.call(this, relative, bytes, expected);
+		});
+	try {
+		await expect(manager.moveTo(targetCwd)).rejects.toThrow("injected managed target metadata failure");
+		expect(injected).toBe(true);
+		expect(manager.getCwd()).toBe(h.cwd);
+	} finally {
+		spy.mockRestore();
+		await manager.close();
+	}
+	const beforeSource = await Bun.file(h.transcript).bytes();
+	const beforeTarget = await Bun.file(targetTranscript).bytes();
+	expect(taskArtifactOwnerLocatorFromTranscriptBytes(beforeSource, h.target.sessionId)).toEqual(h.evidence.locator);
+	expect(taskArtifactOwnerLocatorFromTranscriptBytes(beforeTarget, h.target.sessionId)).toEqual(h.evidence.locator);
+	const ownerBefore = await snapshotPath(h.ownerDir);
+	const storage = new FileSessionStorage();
+	await expect(
+		retireSessionTranscript(storage, h.context.sessionsRoot, h.transcript, h.context, { managedScope: h.scope }),
+	).resolves.toMatchObject({
+		kind: "kept",
+		reason: "task_artifact_owner_shared_with_sibling_transcript",
+	});
+	const targetScope = resolveManagedScope({
+		cwd: targetCwd,
+		agentDir: h.agentDir,
+		sessionsRoot: h.context.sessionsRoot,
+	});
+	if (targetScope.kind !== "resolved") throw new Error("Expected verified target scope");
+	await expect(
+		retireSessionTranscript(storage, h.context.sessionsRoot, targetTranscript, h.context, {
+			managedScope: targetScope.scope,
+		}),
+	).resolves.toMatchObject({ kind: "kept" });
+	expect(await Bun.file(h.transcript).bytes()).toEqual(beforeSource);
+	expect(await Bun.file(targetTranscript).bytes()).toEqual(beforeTarget);
+	expect(await snapshotPath(h.ownerDir)).toEqual(ownerBefore);
+});
+
+for (const boundary of ["capture", "native-security"] as const) {
+	it(`refuses owner replacement at ${boundary} without security repair`, async () => {
+		const h = await fixture();
+		const retained = `${h.ownerDir}.original`;
+		const replacement = path.join(h.root, "replacement");
+		await fs.mkdir(replacement, { mode: 0o755 });
+		await Bun.write(
+			path.join(replacement, ".gjc-task-artifact-owner-v1.json"),
+			await Bun.file(path.join(h.ownerDir, ".gjc-task-artifact-owner-v1.json")).bytes(),
+		);
+		await Bun.write(path.join(replacement, "payload"), "replacement bytes");
+		const replacementChildren = await snapshotPath(replacement);
+		const transcriptBefore = await Bun.file(h.transcript).bytes();
+		let replacementStat: fsSync.BigIntStats | undefined;
+		let swapped = false;
+		const swap = () => {
+			if (swapped) return;
+			swapped = true;
+			fsSync.renameSync(h.ownerDir, retained);
+			fsSync.renameSync(replacement, h.ownerDir);
+			replacementStat = fsSync.lstatSync(h.ownerDir, { bigint: true });
+		};
+		const capture = managedStorage.ManagedSessionDescendantStore.prototype.captureDirectoryIdentity;
+		const verify = native.verifyOwnerOnlyPathSecurityExpected;
+		const verifyPosix = native.verifyOwnerOnlyPathSecurity;
+		const spy =
+			boundary === "capture"
+				? vi
+						.spyOn(managedStorage.ManagedSessionDescendantStore.prototype, "captureDirectoryIdentity")
+						.mockImplementation(function (this: managedStorage.ManagedSessionDescendantStore, relative) {
+							const result = capture.call(this, relative);
+							if (relative === `.task-artifact-owners/${h.evidence.locator.ownerId}`) swap();
+							return result;
+						})
+				: process.platform === "win32"
+					? vi
+							.spyOn(native, "verifyOwnerOnlyPathSecurityExpected")
+							.mockImplementation((pathname, kind, dev, ino) => {
+								if (pathname === h.ownerDir) swap();
+								return verify(pathname, kind, dev, ino);
+							})
+					: vi.spyOn(native, "verifyOwnerOnlyPathSecurity").mockImplementation((pathname, kind) => {
+							if (pathname === h.ownerDir) swap();
+							return verifyPosix(pathname, kind);
+						});
+		try {
+			expect(() => restoreManagedTaskArtifactOwner(h.context, h.target.sessionId, h.evidence.locator)).toThrow(
+				/Managed root authority changed|Owner-only security rejected/,
+			);
+			expect(swapped).toBe(true);
+			if (!replacementStat) throw new Error("Expected the replacement boundary to execute");
+			expect(fsSync.lstatSync(h.ownerDir, { bigint: true })).toEqual(replacementStat);
+			expect(await Bun.file(path.join(h.ownerDir, "payload")).text()).toBe("replacement bytes");
+			expect(await Bun.file(h.transcript).bytes()).toEqual(transcriptBefore);
+			const after = await snapshotPath(h.ownerDir);
+			expect(after).toMatchObject({ entries: (replacementChildren as { entries: unknown[] }).entries });
+		} finally {
+			spy.mockRestore();
+		}
+	});
+}
 
 for (const replacement of ["missing", "symlink", "different-inode", "foreign-manifest"] as const) {
 	it(`refuses ${replacement} owner authority without replacement or foreign mutation`, async () => {

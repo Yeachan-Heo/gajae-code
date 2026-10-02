@@ -3,9 +3,11 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as native from "@gajae-code/natives";
 import { safeRm } from "../../../scripts/safe-cleanup";
 import { Broker, type BrokerCleanupEvidence, type BrokerResponse } from "../src/sdk/broker/broker";
 import { managedRootForScope, resolveManagedScope } from "../src/session/internal/managed-session-scope";
+import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
 import { SessionManager } from "../src/session/session-manager";
 import { FileSessionStorage } from "../src/session/session-storage";
 import * as taskArtifactOwner from "../src/session/task-artifact-owner";
@@ -215,6 +217,83 @@ function record(value: unknown): Record<string, unknown> | undefined {
 		? (value as Record<string, unknown>)
 		: undefined;
 }
+
+it.skipIf(process.platform !== "darwin")(
+	"public saved-session delete rejects an in-flight admitted owner publication",
+	async () => {
+		const fixture = await createFixture();
+		let broker = new Broker({ agentDir: fixture.agentDir });
+		const manager = await SessionManager.open(
+			fixture.transcript,
+			SessionManager.managedDestination(fixture.cwd, fixture.agentDir),
+		);
+		const owner = manager.getArtifactManager();
+		if (!owner) throw new Error("Expected admitted owner writer");
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const publish = ManagedSessionDescendantStore.prototype.publishNoReplace;
+		const writerSpy = vi
+			.spyOn(ManagedSessionDescendantStore.prototype, "publishNoReplace")
+			.mockImplementation(async function (this: ManagedSessionDescendantStore, relative, bytes) {
+				if (this.dir === owner.dir && bytes.byteLength > 0) {
+					entered.resolve();
+					await release.promise;
+				}
+				return publish.call(this, relative, bytes);
+			});
+		const pendingWrite = owner.save("in-flight public-delete writer", "probe").then(
+			value => ({ status: "saved" as const, value }),
+			error => ({ status: "rejected" as const, error: String(error) }),
+		);
+		const remove = native.exactRemoveDirectoryTree;
+		let nativeCalled = false;
+		const removeSpy = vi.spyOn(native, "exactRemoveDirectoryTree").mockImplementation((...args) => {
+			const result = remove(...args);
+			if (args[0] === owner.dir) {
+				nativeCalled = true;
+				release.resolve();
+			}
+			return result;
+		});
+		try {
+			await entered.promise;
+			fixture.ownerFiles = await regularFiles(owner.dir);
+			await broker.start();
+			const request = {
+				cwd: fixture.cwd,
+				stateRoot: path.join(fixture.cwd, ".gjc", "state"),
+				sessionId: fixture.sessionId,
+				sessionPath: fixture.transcript,
+			};
+			const response = await broker.handleRequest("session.delete", request, "writer-race-delete");
+			expect(nativeCalled).toBe(true);
+			expect(await pendingWrite).toMatchObject({
+				status: "rejected",
+				error: expect.stringMatching(/Managed root authority changed|ENOENT/),
+			});
+			const cleanup = expectPayloadRetired(response, fixture.sessionId);
+			await verifyRetainedOwner(fixture, cleanup);
+			await preserveNewerSession(fixture);
+			await broker.stop();
+			broker = new Broker({ agentDir: fixture.agentDir });
+			await broker.start();
+			const replay = expectPayloadRetired(
+				await broker.handleRequest("session.delete", request, "writer-race-delete"),
+				fixture.sessionId,
+			);
+			expect(replay.taskArtifactOwnerDeletionEvidence).toEqual(cleanup.taskArtifactOwnerDeletionEvidence);
+			await verifyRetainedOwner(fixture, replay);
+		} finally {
+			release.resolve();
+			await pendingWrite;
+			writerSpy.mockRestore();
+			removeSpy.mockRestore();
+			await manager.close();
+			await broker.stop();
+			await safeRm(fixture.root, { recursive: true, force: true });
+		}
+	},
+);
 
 it("saved-session deletion retains the exact payload-retired owner journal across broker restart", async () => {
 	const fixture = await createFixture();

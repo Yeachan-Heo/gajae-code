@@ -175,12 +175,19 @@ function assertSessionRoot(context: TaskArtifactOwnerStorageContext): void {
 
 function newSessionRootStore(context: TaskArtifactOwnerStorageContext): ManagedSessionDescendantStore {
 	assertSessionRoot(context);
+	const stat = fs.lstatSync(context.sessionsRoot, { bigint: true });
+	if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("task_artifact_owner_root_invalid");
 	return new ManagedSessionDescendantStore(
 		context.rootAuthority,
 		context.sessionsRoot,
 		undefined,
 		context.securityPolicy,
 		context.profileAgentDir,
+		{
+			canonicalPath: context.sessionsRoot,
+			dev: BigInt.asUintN(64, stat.dev),
+			ino: BigInt.asUintN(64, stat.ino),
+		},
 	);
 }
 
@@ -263,12 +270,18 @@ function openOwnerStore(
 	const identity = rootStore.captureDirectoryIdentity(ownerRelativePath(locator.ownerId));
 	if (identity.dev !== locator.directoryDev || identity.ino !== locator.directoryIno)
 		throw new Error("task_artifact_owner_identity_mismatch");
+	const ownerPath = path.join(context.sessionsRoot, ownerRelativePath(locator.ownerId));
 	const ownerStore = new ManagedSessionDescendantStore(
 		context.rootAuthority,
-		path.join(context.sessionsRoot, ownerRelativePath(locator.ownerId)),
+		ownerPath,
 		undefined,
 		context.securityPolicy,
 		context.profileAgentDir,
+		{
+			canonicalPath: ownerPath,
+			dev: BigInt(locator.directoryDev),
+			ino: BigInt(locator.directoryIno),
+		},
 	);
 	assertOwnerIdentity(ownerStore, locator);
 	readOwnerManifest(ownerStore, locator, OWNER_MANIFEST);

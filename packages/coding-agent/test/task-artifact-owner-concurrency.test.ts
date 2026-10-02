@@ -3,12 +3,14 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as native from "@gajae-code/natives";
 import { safeRm } from "../../../scripts/safe-cleanup";
 import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
 import { SessionManager } from "../src/session/session-manager";
 import { taskArtifactOwnerLocatorFromTranscriptBytes } from "../src/session/session-storage";
 import {
 	captureTaskArtifactOwnerDeletionEvidence,
+	ensureManagedTaskArtifactOwner,
 	parseTaskArtifactOwnerRetirementOutcome,
 	retireTaskArtifactOwner,
 	type TaskArtifactOwnerStorageContext,
@@ -57,6 +59,59 @@ it("serializes concurrent owner establishment and preserves one numeric claim sp
 		};
 		expect(manifest.sessionId).toBe(h.manager.getSessionId());
 	} finally {
+		await h.manager.close();
+	}
+});
+
+it("serializes independent owner establishment contexts at the managed lock", async () => {
+	const h = await fixture();
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const publish = ManagedSessionDescendantStore.prototype.publishNoReplace;
+	let manifests = 0;
+	let secondSettled = false;
+	const spy = vi.spyOn(ManagedSessionDescendantStore.prototype, "publishNoReplace").mockImplementation(async function (
+		this: ManagedSessionDescendantStore,
+		relative,
+		bytes,
+	) {
+		if (relative.endsWith(".gjc-task-artifact-owner-v1.json")) {
+			manifests++;
+			entered.resolve();
+			await release.promise;
+		}
+		return publish.call(this, relative, bytes);
+	});
+	try {
+		const first = ensureManagedTaskArtifactOwner(h.context, h.manager.getSessionId(), undefined);
+		await entered.promise;
+		const second = ensureManagedTaskArtifactOwner({ ...h.context }, h.manager.getSessionId(), undefined).finally(
+			() => {
+				secondSettled = true;
+			},
+		);
+		await Bun.sleep(20);
+		expect(secondSettled).toBe(false);
+		release.resolve();
+		const [a, b] = await Promise.all([first, second]);
+		expect(manifests).toBe(1);
+		expect(a.manager).not.toBe(b.manager);
+		expect(a.locator).toEqual(b.locator);
+		const claims = await Promise.all([a.manager.allocatePath("probe"), b.manager.allocatePath("probe")]);
+		expect(new Set(claims.map(claim => claim.id)).size).toBe(2);
+		const owner = await h.manager.ensureArtifactManager();
+		expect(owner?.dir).toBe(a.manager.dir);
+		const transcript = h.manager.getSessionFile()!;
+		await h.manager.close();
+		const reopened = await SessionManager.open(transcript, SessionManager.managedDestination(h.cwd, h.home));
+		try {
+			expect(reopened.getArtifactManager()?.dir).toBe(a.manager.dir);
+		} finally {
+			await reopened.close();
+		}
+	} finally {
+		release.resolve();
+		spy.mockRestore();
 		await h.manager.close();
 	}
 });
@@ -207,6 +262,72 @@ it.skipIf(process.platform !== "darwin")(
 			);
 			await expect(fs.lstat(owner.dir)).rejects.toMatchObject({ code: "ENOENT" });
 		} finally {
+			await h.manager.close();
+		}
+	},
+);
+
+it.skipIf(process.platform !== "darwin")(
+	"rejects an in-flight admitted publication after actual native owner retirement",
+	async () => {
+		const h = await fixture();
+		const owner = await h.manager.ensureArtifactManager();
+		if (!owner) throw new Error("Expected managed owner");
+		await owner.save("acknowledged original payload", "probe");
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const publish = ManagedSessionDescendantStore.prototype.publishNoReplace;
+		const writeSpy = vi
+			.spyOn(ManagedSessionDescendantStore.prototype, "publishNoReplace")
+			.mockImplementation(async function (this: ManagedSessionDescendantStore, relative, bytes) {
+				if (this.dir === owner.dir && bytes.byteLength > 0) {
+					entered.resolve();
+					await release.promise;
+				}
+				return publish.call(this, relative, bytes);
+			});
+		const pendingWrite = owner.save("in-flight writer payload", "probe").then(
+			value => ({ status: "saved" as const, value }),
+			error => ({ status: "rejected" as const, error: String(error) }),
+		);
+		let nativeCalled = false;
+		const remove = native.exactRemoveDirectoryTree;
+		const removeSpy = vi.spyOn(native, "exactRemoveDirectoryTree").mockImplementation((...args) => {
+			const outcome = remove(...args);
+			if (args[0] === owner.dir) {
+				nativeCalled = true;
+				release.resolve();
+			}
+			return outcome;
+		});
+		try {
+			await entered.promise;
+			const locator = taskArtifactOwnerLocatorFromTranscriptBytes(
+				await Bun.file(h.manager.getSessionFile()!).bytes(),
+				h.manager.getSessionId(),
+			);
+			const evidence = captureTaskArtifactOwnerDeletionEvidence(h.context, h.manager.getSessionId(), locator);
+			if (!evidence) throw new Error("Expected captured in-flight owner authority");
+			const outcome = retireTaskArtifactOwner(h.context, evidence);
+			expect(nativeCalled).toBe(true);
+			expect(outcome.kind).toBe("payload_retired");
+			expect(await pendingWrite).toMatchObject({
+				status: "rejected",
+				error: expect.stringMatching(/Managed root authority changed|ENOENT/),
+			});
+			if (outcome.kind !== "payload_retired") throw new Error("Expected actual native payload proof");
+			const verified = verifyTaskArtifactOwnerRetirementContinuation(h.context, evidence, outcome.continuation);
+			expect(verified.retainedTreeSnapshot).toEqual(outcome.continuation.retainedTreeSnapshot);
+			for (const entry of verified.retainedTreeSnapshot.entries) {
+				if (entry.kind === "file")
+					expect(await Bun.file(path.join(verified.retainedRootPath, entry.relativePath)).text()).toBe("");
+			}
+			await expect(fs.lstat(owner.dir)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			release.resolve();
+			await pendingWrite;
+			writeSpy.mockRestore();
+			removeSpy.mockRestore();
 			await h.manager.close();
 		}
 	},
