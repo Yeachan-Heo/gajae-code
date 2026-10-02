@@ -6171,7 +6171,10 @@ export class AgentSession {
 				path.basename(sessionModeStatePath(this.sessionManager.getCwd(), currentSessionId, active.skill)),
 			);
 			const raw = fs.readFileSync(filePath, "utf-8");
-			const parsed = JSON.parse(raw) as { state?: { intent_contract?: unknown } };
+			const parsed = JSON.parse(raw) as { current_phase?: unknown; state?: { intent_contract?: unknown } };
+			// A persisted final spec moves to handoff. Its next-workflow/approval
+			// asks are not interview rounds and must not require recorder metadata.
+			if (parsed.current_phase !== "interviewing") return undefined;
 			const intentContract = parsed.state?.intent_contract;
 			if (intentContract === undefined) return "topology";
 			assertDeepInterviewIntentManifest(intentContract);

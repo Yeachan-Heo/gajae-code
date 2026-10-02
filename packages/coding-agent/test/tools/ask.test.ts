@@ -21,6 +21,7 @@ import {
 	MAX_ASK_ANSWER_DEADLINE_MS,
 	resolveAskAnswerDeadlineMs,
 } from "@gajae-code/coding-agent/tools/ask";
+import type { AskToolInput } from "@gajae-code/coding-agent/tools/ask-contract";
 import { ToolAbortError } from "@gajae-code/coding-agent/tools/tool-errors";
 import { logger } from "@gajae-code/utils";
 
@@ -121,6 +122,37 @@ describe("AskTool execution integrity", () => {
 		}
 		expect(select).not.toHaveBeenCalled();
 		expect(awaitAnswer).not.toHaveBeenCalled();
+	});
+
+	it("rejects encoded interview defects before selector, answer registration, gate or recorder", async () => {
+		const select = vi.fn(async () => "Yes");
+		const awaitAnswer = vi.fn(async () => "Yes");
+		const getAskAnswerSource = vi.fn(() => ({ awaitAnswer }));
+		const emitGate = vi.fn(async () => ({ selected: ["Yes"] }));
+		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound");
+		const tool = new AskTool(
+			createSession({
+				getDeepInterviewAskStage: () => "topology",
+				getAskAnswerSource,
+				getWorkflowGateEmitter: () => ({ supportsRemoteGateAnswers: () => true, emitGate }),
+			}),
+		);
+		const question = { id: "q", question: "Continue?", options: [{ label: "Yes" }] };
+		for (const questions of [
+			[question],
+			[{ ...question, deepInterview: null }],
+			[question, { id: "metadata", question: " \t\n", options: [] }],
+		]) {
+			const malformed = { questions: JSON.stringify(questions) } as unknown as AskToolInput;
+			await expect(
+				tool.execute("encoded-defect", malformed, undefined, undefined, createContext({ select })),
+			).rejects.toThrow("raw arguments rejected before coercion");
+		}
+		expect(select).not.toHaveBeenCalled();
+		expect(getAskAnswerSource).not.toHaveBeenCalled();
+		expect(awaitAnswer).not.toHaveBeenCalled();
+		expect(emitGate).not.toHaveBeenCalled();
+		expect(recorder).not.toHaveBeenCalled();
 	});
 
 	it("preserves ordinary multi-question free-text answers", async () => {

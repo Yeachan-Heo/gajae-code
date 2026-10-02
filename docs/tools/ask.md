@@ -27,7 +27,7 @@
 | `recommended` | `number` | No | Zero-based recommended option index. In single-select mode the label gets ` (Recommended)` appended in the UI. |
 | `deepInterview` | `object` | In an active interview | Structured round metadata. Round 0 requires `round: 0`, `component: "review-topology"`, `dimension: "topology"`, `ambiguity`, and `intent_contract` containing the displayed intent items and affirmative labels. Subsequent rounds require a positive round, component, dimension, and ambiguity. |
 
-Active deep-interview calls contain exactly one question. Metadata belongs on that question, not in an additional `metadata` or `ignore` question. Question prose and `workflowGate` do not substitute for `deepInterview`: only the structured metadata lets the recorder persist the answer and lock confirmed intent. Ordinary asks still support multiple questions and free-text-only questions with `options: []`.
+While deep-interview state is in `current_phase: "interviewing"`, calls contain exactly one question. After native final-spec persistence moves the workflow to `handoff`, next-workflow and approval choices use ordinary asks without round metadata. Metadata belongs on that question, not in an additional `metadata` or `ignore` question. Question prose and `workflowGate` do not substitute for `deepInterview`: only the structured metadata lets the recorder persist the answer and lock confirmed intent. Ordinary asks still support multiple questions and free-text-only questions with `options: []`.
 
 ## Outputs
 - Single-shot result.

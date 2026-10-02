@@ -11,6 +11,7 @@ import {
 	enrichDeepInterviewRoundScoring,
 	readDeepInterviewStateCompact,
 } from "../src/gjc-runtime/deep-interview-recorder";
+import { runNativeDeepInterviewCommand } from "../src/gjc-runtime/deep-interview-runtime";
 import type { DeepInterviewStateEnvelope } from "../src/gjc-runtime/deep-interview-state";
 import { createDeepInterviewIntentManifest } from "../src/gjc-runtime/deep-interview-state";
 import { activeEntryPath, modeStatePath, sessionStateDir } from "../src/gjc-runtime/session-layout";
@@ -91,7 +92,13 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 				options: [{ label: "이 범위와 의도가 맞음" }],
 				workflowGate: { stage: "deep-interview", kind: "question" },
 			};
-			for (const questions of [[missing], [missing, { id: "metadata", question: "", options: [] }]]) {
+			for (const questions of [
+				[missing],
+				[missing, { id: "metadata", question: "", options: [] }],
+				JSON.stringify([missing]),
+				JSON.stringify([{ ...missing, deepInterview: null }]),
+				JSON.stringify([missing, { id: "metadata", question: " \t\n", options: [] }]),
+			]) {
 				const call = { type: "toolCall" as const, id: "incident", name: "ask", arguments: { questions } };
 				expect(() => validateToolArguments(ask, call)).toThrow("raw arguments rejected before coercion");
 				await expect(ask.execute("incident", { questions })).rejects.toThrow(
@@ -122,10 +129,26 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 				name: "ask",
 				arguments: { questions: [topologyQuestion] },
 			});
+			await initTheme(false);
+			const abort = vi.fn();
+			await expect(
+				ask.execute("cancel-round-zero", validated, undefined, undefined, {
+					hasUI: true,
+					ui: { select: async () => undefined },
+					abort,
+				} as unknown as AgentToolContext),
+			).rejects.toThrow("cancelled");
+			expect(abort).toHaveBeenCalledTimes(1);
+			expect(emitGate).not.toHaveBeenCalled();
+			expect(await Bun.file(statePath).text()).toBe(initialState);
 			const zeroResult = await ask.execute("round-zero", validated);
 			expect(zeroResult.content[0]).toMatchObject({ type: "text", text: "User selected: 이 범위와 의도가 맞음" });
 			const locked = (await Bun.file(statePath).json()) as DeepInterviewStateEnvelope;
-			expect(locked.state?.intent_contract).toMatchObject({ version: 1, confirmation_round: 0 });
+			expect(locked.state?.intent_contract).toMatchObject({
+				version: 1,
+				confirmation_round: 0,
+				items: topologyQuestion.deepInterview.intent_contract.items,
+			});
 			expect(session.getDeepInterviewAskStage()).toBe("post-topology");
 			expect(() =>
 				validateToolArguments(ask, {
@@ -174,6 +197,44 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			expect(((await Bun.file(statePath).json()) as DeepInterviewStateEnvelope).state?.intent_contract).toEqual(
 				locked.state?.intent_contract,
 			);
+			const finalSpec = await runNativeDeepInterviewCommand(
+				[
+					"--write",
+					"--stage",
+					"final",
+					"--slug",
+					"ask-integrity",
+					"--spec",
+					"# Dot session skill\n\nPreserve artifact:dot-skill with SDK-only execution.\n",
+					"--session-id",
+					sessionId,
+					"--json",
+				],
+				tempDir,
+				{ agentDir: tempDir },
+			);
+			expect(finalSpec.status).toBe(0);
+			expect(session.getDeepInterviewAskStage()).toBeUndefined();
+			const handoffCall = {
+				type: "toolCall" as const,
+				id: "handoff-choice",
+				name: "ask",
+				arguments: {
+					questions: [
+						{
+							id: "next-workflow",
+							question: "Which refinement path should follow this spec?",
+							options: [{ label: "Refine with ralplan" }, { label: "Keep spec only" }],
+						},
+					],
+				},
+			};
+			await ask.execute("handoff-choice", validateToolArguments(ask, handoffCall));
+			expect(emitGate).toHaveBeenCalledTimes(3);
+			expect(await readDeepInterviewStateCompact(statePath)).toMatchObject({
+				recent_scored_rounds: scored.recent_scored_rounds,
+				pending_shells: scored.pending_shells,
+			});
 		} finally {
 			await session.dispose();
 		}
