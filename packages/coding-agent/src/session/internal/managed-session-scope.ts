@@ -34,6 +34,8 @@ import {
 import { parseFirstJsonlLine } from "../session-transcript-header";
 import {
 	parseTaskArtifactOwnerDeletionEvidence,
+	parseTaskArtifactOwnerRetirementOutcome,
+	type TaskArtifactOwnerDeletionEvidence,
 	type TaskArtifactOwnerStorageContext,
 } from "../task-artifact-owner-codec";
 import { verifyTaskArtifactOwnerPhysicalRetirement } from "../task-artifact-owner-retirement";
@@ -75,6 +77,20 @@ import {
 	validateManagedArtifactTree,
 	validateNativeSecurityResult,
 } from "./managed-session-storage";
+import {
+	hasUnsupportedLegacyOwnerTarget as hasUnsupportedLegacyOwnerTargetInternal,
+	type ManagedGcOwnerCleanupAuthority,
+	type ManagedGcOwnerDeleteFields,
+	type ManagedGcOwnerProgress,
+	managedGcOwnerDeleteFields as managedGcOwnerDeleteFieldsInternal,
+	managedGcOwnerProgressBeforeDelete as managedGcOwnerProgressBeforeDeleteInternal,
+	persistManagedGcOwnerTranscriptDeletion,
+	persistManagedGcStorageOwnerDisposition as persistManagedGcStorageOwnerDispositionInternal,
+	prepareManagedGcOwnerTargets as prepareManagedGcOwnerTargetsInternal,
+	publishManagedGcArtifactsRemoved as publishManagedGcArtifactsRemovedInternal,
+	retireManagedGcOwnerAfterArtifacts as retireManagedGcOwnerAfterArtifactsInternal,
+	taskArtifactOwnerTranscriptResult as taskArtifactOwnerTranscriptResultInternal,
+} from "./managed-task-owner-cleanup";
 import { captureTaskArtifactOwnerDeletionEvidence } from "./task-artifact-owner-access";
 import { taskArtifactOwnerLocatorFromTranscriptBytes } from "./task-artifact-owner-transcript";
 
@@ -390,6 +406,8 @@ async function deleteSessionVerifiedWithFence(
 	stage: ManagedVerifiedDeleteTestEvent["stage"],
 	lock: ManagedStorageLock,
 	target: VerifiedSessionDeleteTarget,
+	scope: ManagedScope,
+	retiredTarget: RetiredTarget,
 	verifyAuthority?: () => void,
 ): Promise<VerifiedSessionDeleteResult> {
 	lock.assertOwned();
@@ -398,7 +416,10 @@ async function deleteSessionVerifiedWithFence(
 	if (hook) await hook({ flow, stage });
 	lock.assertOwned();
 	verifyAuthority?.();
-	return new FileSessionStorage().deleteSessionVerified(target);
+	const ownerFields = await managedGcOwnerDeleteFields(scope, retiredTarget, lock);
+	lock.assertOwned();
+	verifyAuthority?.();
+	return new FileSessionStorage().deleteSessionVerified({ ...target, ...ownerFields });
 }
 
 type NativeIdentity =
@@ -2187,7 +2208,9 @@ function preparedReceiptMatches(
 	}
 }
 
-type RetiredTarget = ManagedCandidate;
+type RetiredTarget = ManagedCandidate & {
+	taskArtifactOwnerDeletionEvidence?: TaskArtifactOwnerDeletionEvidence;
+};
 
 const MANAGED_GC_RETIREMENT_PREFIX = "gc-retirement-";
 const MANAGED_GC_RETIREMENT_RECEIPTS = `${MANAGED_INTERNAL_DIRECTORY}/${MANAGED_RECEIPTS_DIRECTORY}`;
@@ -2263,6 +2286,134 @@ function managedGcTrustedScope(scope: ManagedScope): ManagedGcTrustedScope {
 /** Build owner-storage authority only from a previously prepared trusted managed scope. */
 export function taskArtifactOwnerStorageContextForScope(scope: ManagedScope): TaskArtifactOwnerStorageContext {
 	return managedGcTrustedScope(scope).ownerContext;
+}
+
+function managedGcOwnerCleanupAuthority(scope: ManagedScope, lock: ManagedStorageLock): ManagedGcOwnerCleanupAuthority {
+	return {
+		agentDir: scope.agentDir,
+		sessionsRoot: scope.sessionsRoot,
+		directoryPath: scope.directoryPath,
+		storageContext: taskArtifactOwnerStorageContextForScope(scope),
+		assertOwned: () => lock.assertOwned(),
+		bindTarget: transcriptPath => bindManagedGcSessionRetirementTarget(scope, transcriptPath),
+		readReceipt: async transcriptPath => {
+			lock.assertOwned();
+			const receipt = await readManagedGcSessionRetirementReceipt(scope, transcriptPath);
+			lock.assertOwned();
+			return receipt;
+		},
+		publishReceipt: async receipt => {
+			lock.assertOwned();
+			const published = await publishManagedGcSessionRetirementReceipt(scope, receipt);
+			lock.assertOwned();
+			return published;
+		},
+		findCompletedRetirement: async (evidence, exceptTranscriptPath) => {
+			lock.assertOwned();
+			const receipts = await discoverManagedGcSessionRetirementReceipts({
+				agentDir: scope.agentDir,
+				sessionsRoot: scope.sessionsRoot,
+			});
+			lock.assertOwned();
+			const match = receipts.find(
+				({ scope: source, receipt }) =>
+					source.agentDir === scope.agentDir &&
+					source.sessionsRoot === scope.sessionsRoot &&
+					source.directoryPath !== scope.directoryPath &&
+					receipt.transcriptPath !== exceptTranscriptPath &&
+					receipt.state === "owner_retired" &&
+					receipt.taskArtifactOwnerRetirementOutcome?.kind === "completed" &&
+					deepSame(receipt.taskArtifactOwnerDeletionEvidence, evidence),
+			);
+			return match
+				? {
+						scope: {
+							agentDir: match.scope.agentDir,
+							sessionsRoot: match.scope.sessionsRoot,
+							directoryPath: match.scope.directoryPath,
+						},
+						receipt: match.receipt,
+					}
+				: undefined;
+		},
+	};
+}
+
+function hasUnsupportedLegacyOwnerTarget(scope: ManagedScope, target: RetiredTarget): boolean {
+	return hasUnsupportedLegacyOwnerTargetInternal(scope.directoryPath, target);
+}
+
+async function prepareManagedGcOwnerTargets(
+	scope: ManagedScope,
+	targets: readonly RetiredTarget[],
+	lock: ManagedStorageLock,
+): Promise<RetiredTarget[]> {
+	return prepareManagedGcOwnerTargetsInternal(managedGcOwnerCleanupAuthority(scope, lock), targets);
+}
+
+async function managedGcOwnerDeleteFields(
+	scope: ManagedScope,
+	target: RetiredTarget,
+	lock: ManagedStorageLock,
+): Promise<ManagedGcOwnerDeleteFields> {
+	return managedGcOwnerDeleteFieldsInternal(managedGcOwnerCleanupAuthority(scope, lock), target);
+}
+
+async function publishManagedGcArtifactsRemoved(
+	scope: ManagedScope,
+	target: RetiredTarget,
+	lock: ManagedStorageLock,
+): Promise<ManagedGcSessionRetirementReceipt | undefined> {
+	return publishManagedGcArtifactsRemovedInternal(managedGcOwnerCleanupAuthority(scope, lock), target);
+}
+
+async function retireManagedGcOwnerAfterArtifacts(
+	scope: ManagedScope,
+	target: RetiredTarget,
+	tombstoneTargets: readonly RetiredTarget[],
+	lock: ManagedStorageLock,
+): Promise<ManagedGcOwnerProgress> {
+	return retireManagedGcOwnerAfterArtifactsInternal(
+		managedGcOwnerCleanupAuthority(scope, lock),
+		target,
+		tombstoneTargets,
+	);
+}
+
+async function persistManagedGcStorageOwnerDisposition(
+	scope: ManagedScope,
+	target: RetiredTarget,
+	deletion: Extract<VerifiedSessionDeleteResult, { kind: "cleanup_pending"; phase: "task_artifact_owner" }>,
+	lock: ManagedStorageLock,
+): Promise<ManagedGcOwnerProgress> {
+	return persistManagedGcStorageOwnerDispositionInternal(
+		managedGcOwnerCleanupAuthority(scope, lock),
+		target,
+		deletion,
+	);
+}
+
+async function managedGcOwnerProgressBeforeDelete(
+	scope: ManagedScope,
+	target: RetiredTarget,
+	tombstoneTargets: readonly RetiredTarget[],
+	artifactsRemoved: boolean,
+	lock: ManagedStorageLock,
+): Promise<ManagedGcOwnerProgress> {
+	return managedGcOwnerProgressBeforeDeleteInternal(
+		managedGcOwnerCleanupAuthority(scope, lock),
+		target,
+		tombstoneTargets,
+		artifactsRemoved,
+	);
+}
+
+async function taskArtifactOwnerTranscriptResult(
+	scope: ManagedScope,
+	target: RetiredTarget,
+	lock: ManagedStorageLock,
+): Promise<"none" | "retired" | "payload_retired"> {
+	return taskArtifactOwnerTranscriptResultInternal(managedGcOwnerCleanupAuthority(scope, lock), target);
 }
 function managedGcScopeStore(scope: ManagedScope, trusted: ManagedGcTrustedScope): ManagedSessionDescendantStore {
 	return new ManagedSessionDescendantStore(
@@ -3064,12 +3215,19 @@ function retiredTargets(scope: ManagedScope, pathname: string): readonly Retired
 					: path.dirname(item.path) === scope.directoryPath
 						? "v2"
 						: "legacy";
+			const taskArtifactOwnerDeletionEvidence =
+				item.taskArtifactOwnerDeletionEvidence === undefined
+					? undefined
+					: parseTaskArtifactOwnerDeletionEvidence(item.taskArtifactOwnerDeletionEvidence);
+			if (taskArtifactOwnerDeletionEvidence && taskArtifactOwnerDeletionEvidence.sessionId !== item.sessionId)
+				return undefined;
 			targets.push({
 				path: item.path,
 				sessionId: item.sessionId,
 				cwd: item.cwd,
 				provenance,
 				migrationState: provenance === "v2" ? "native_v2" : "legacy_unmigrated",
+				...(taskArtifactOwnerDeletionEvidence ? { taskArtifactOwnerDeletionEvidence } : {}),
 				identity: {
 					canonicalPath: fields.canonicalPath,
 					dev: BigInt(fields.dev),
@@ -3165,6 +3323,7 @@ function retainedArtifactsRootMatches(record: Record<string, unknown>): boolean 
 type CleanupReceipt = {
 	attempt: number;
 	target: RetiredTarget;
+	taskArtifactOwnerTranscriptDeleted?: true;
 	expectedArtifactsIdentity?: SessionStorageFileIdentity;
 	expectedArtifactsTree?: NativeDirectoryTreeSnapshot;
 	artifactsPayloadDurable?: true;
@@ -3208,6 +3367,7 @@ function cleanupReceipt(scope: ManagedScope, tombstone: string, receipt: Cleanup
 			cwd: receipt.target.cwd,
 			identity: receipt.target.identity,
 		},
+		...(receipt.taskArtifactOwnerTranscriptDeleted ? { taskArtifactOwnerTranscriptDeleted: true } : {}),
 		...(receipt.expectedArtifactsIdentity ? { expectedArtifactsIdentity: receipt.expectedArtifactsIdentity } : {}),
 		...(receipt.expectedArtifactsTree ? { expectedArtifactsTree: receipt.expectedArtifactsTree } : {}),
 		...(receipt.artifactsPayloadDurable === true ? { artifactsPayloadDurable: true } : {}),
@@ -3385,18 +3545,11 @@ function isAuthorizedArtifactRoot(target: RetiredTarget, plannedRoot: string, pa
 	);
 }
 
-function rejectTaskArtifactOwnerCleanupPending(
-	deletion: Extract<VerifiedSessionDeleteResult, { kind: "cleanup_pending"; phase: "task_artifact_owner" }>,
-): never {
-	throw new Error("task_artifact_owner_retirement_pending", { cause: deletion });
-}
-
 function assertAuthorizedCleanupPending(
 	target: RetiredTarget,
 	active: CleanupReceipt,
 	deletion: Extract<VerifiedSessionDeleteResult, { kind: "cleanup_pending" }>,
 ): void {
-	if (deletion.phase === "task_artifact_owner") rejectTaskArtifactOwnerCleanupPending(deletion);
 	if (
 		(deletion.phase === "artifacts" &&
 			!isAuthorizedArtifactRoot(
@@ -3895,7 +4048,9 @@ function pendingCleanupReceipt(
 						!Number.isSafeInteger(record.artifactsRemovedAttempt) ||
 						record.artifactsRemovedAttempt < 1 ||
 						record.artifactsRemovedAttempt > (attempt as number))) ||
-				(record.transcriptPayloadDurable !== undefined && record.transcriptPayloadDurable !== true)
+				(record.transcriptPayloadDurable !== undefined && record.transcriptPayloadDurable !== true) ||
+				(record.taskArtifactOwnerTranscriptDeleted !== undefined &&
+					(record.taskArtifactOwnerTranscriptDeleted !== true || !target.taskArtifactOwnerDeletionEvidence))
 			)
 				throw new Error("durability_failed");
 			const artifact = record.expectedArtifactsIdentity as Record<string, unknown> | undefined;
@@ -3940,6 +4095,7 @@ function pendingCleanupReceipt(
 				detachedArtifactsPath: record.detachedArtifactsPath as string | undefined,
 				detachedTranscriptPath: record.detachedTranscriptPath as string | undefined,
 				transcriptPayloadDurable: record.transcriptPayloadDurable === true ? true : undefined,
+				taskArtifactOwnerTranscriptDeleted: record.taskArtifactOwnerTranscriptDeleted === true ? true : undefined,
 				retainedArtifactsSuccessorPath: record.retainedArtifactsSuccessorPath as string | undefined,
 				retainedArtifactsPlaceholderPath: record.retainedArtifactsPlaceholderPath as string | undefined,
 				retainedArtifactsUnknownPath: record.retainedArtifactsUnknownPath as string | undefined,
@@ -3996,6 +4152,7 @@ function nextCleanupReceipt(target: RetiredTarget, pending: CleanupReceipt | und
 	return {
 		attempt,
 		target,
+		taskArtifactOwnerTranscriptDeleted: pending?.taskArtifactOwnerTranscriptDeleted,
 		expectedArtifactsIdentity,
 		expectedArtifactsTree,
 		artifactsPayloadDurable: pending?.artifactsPayloadDurable,
@@ -4027,9 +4184,10 @@ function cleanupPendingEvidence(
 	active: CleanupReceipt,
 	deletion: Extract<VerifiedSessionDeleteResult, { kind: "cleanup_pending" }>,
 ): CleanupReceipt {
-	if (deletion.phase === "task_artifact_owner") rejectTaskArtifactOwnerCleanupPending(deletion);
 	return {
 		...retry,
+		taskArtifactOwnerTranscriptDeleted:
+			deletion.taskArtifactOwnerTranscriptDeleted ?? active.taskArtifactOwnerTranscriptDeleted,
 		expectedArtifactsIdentity:
 			deletion.phase === "artifacts" ? deletion.artifactsIdentity : active.expectedArtifactsIdentity,
 		expectedArtifactsTree: deletion.phase === "artifacts" ? deletion.artifactsTree : active.expectedArtifactsTree,
@@ -4073,29 +4231,43 @@ async function continueDetachedArtifactCleanup(
 	lock: ManagedStorageLock,
 	flow: ManagedVerifiedDeleteTestEvent["flow"],
 ): Promise<{ deletion: VerifiedSessionDeleteResult; pendingEvidence: CleanupReceipt }> {
-	const deletion = await deleteSessionVerifiedWithFence(flow, "artifact-finalization", lock, {
-		sessionsRoot: scope.sessionsRoot,
-		transcriptPath: target.path,
-		sessionId: target.sessionId,
-		cwd: target.cwd,
-		transcriptIdentity: target.identity,
-		transcriptParentIdentity: (() => {
-			const parent = fs.lstatSync(path.dirname(target.path), { bigint: true });
-			return { dev: parent.dev, ino: parent.ino };
-		})(),
-		expectedArtifactsIdentity: pendingEvidence.expectedArtifactsIdentity,
-		expectedArtifactsTree: pendingEvidence.expectedArtifactsTree,
-		detachedArtifactsPath: pendingEvidence.detachedArtifactsPath,
-		retainedArtifactsSuccessorPath: pendingEvidence.retainedArtifactsSuccessorPath,
-		retainedArtifactsPlaceholderPath: pendingEvidence.retainedArtifactsPlaceholderPath,
-		retainedArtifactsUnknownPath: pendingEvidence.retainedArtifactsUnknownPath,
-		detachedTranscriptPath: pendingEvidence.detachedTranscriptPath ?? fallbackDetachedTranscriptPath,
-		retainedTranscriptSuccessorPath: pendingEvidence.retainedTranscriptSuccessorPath,
-		retainedTranscriptPlaceholderPath: pendingEvidence.retainedTranscriptPlaceholderPath,
-		retainedTranscriptUnknownPath: pendingEvidence.retainedTranscriptUnknownPath,
-		plannedArtifactsPath: pendingEvidence.plannedArtifactsPath,
-		plannedTranscriptPath: pendingEvidence.plannedTranscriptPath,
-	});
+	const deletion = await deleteSessionVerifiedWithFence(
+		flow,
+		"artifact-finalization",
+		lock,
+		{
+			sessionsRoot: scope.sessionsRoot,
+			transcriptPath: target.path,
+			sessionId: target.sessionId,
+			cwd: target.cwd,
+			transcriptIdentity: target.identity,
+			transcriptParentIdentity: (() => {
+				const parent = fs.lstatSync(path.dirname(target.path), { bigint: true });
+				return { dev: parent.dev, ino: parent.ino };
+			})(),
+			expectedArtifactsIdentity: pendingEvidence.expectedArtifactsIdentity,
+			expectedArtifactsTree: pendingEvidence.expectedArtifactsTree,
+			detachedArtifactsPath: pendingEvidence.detachedArtifactsPath,
+			retainedArtifactsSuccessorPath: pendingEvidence.retainedArtifactsSuccessorPath,
+			retainedArtifactsPlaceholderPath: pendingEvidence.retainedArtifactsPlaceholderPath,
+			retainedArtifactsUnknownPath: pendingEvidence.retainedArtifactsUnknownPath,
+			detachedTranscriptPath: pendingEvidence.detachedTranscriptPath ?? fallbackDetachedTranscriptPath,
+			retainedTranscriptSuccessorPath: pendingEvidence.retainedTranscriptSuccessorPath,
+			retainedTranscriptPlaceholderPath: pendingEvidence.retainedTranscriptPlaceholderPath,
+			retainedTranscriptUnknownPath: pendingEvidence.retainedTranscriptUnknownPath,
+			plannedArtifactsPath: pendingEvidence.plannedArtifactsPath,
+			plannedTranscriptPath: pendingEvidence.plannedTranscriptPath,
+		},
+		scope,
+		target,
+	);
+	if (deletion.kind === "cleanup_pending" && deletion.phase === "task_artifact_owner") {
+		await persistManagedGcStorageOwnerDisposition(scope, target, deletion, lock);
+		const retry = nextCleanupReceipt(target, pendingEvidence);
+		const pending = cleanupPendingEvidence(retry, pendingEvidence, deletion);
+		await publishCleanupPending(scope, tombstone, pending, lock);
+		return { deletion, pendingEvidence: pending };
+	}
 	if (deletion.kind === "cleanup_pending") {
 		if (
 			deletion.phase !== "artifacts" ||
@@ -4134,8 +4306,36 @@ async function publishCleanupPending(
 	if (!persisted || persisted.attempt !== receipt.attempt) throw new Error("durability_failed");
 }
 
-function cleanupCompleted(scope: ManagedScope, tombstone: string, target: RetiredTarget): boolean {
+async function persistManagedOwnerTranscriptDeletion(
+	scope: ManagedScope,
+	tombstone: string,
+	target: RetiredTarget,
+	fallback: CleanupReceipt,
+	lock: ManagedStorageLock,
+	deletion: Extract<VerifiedSessionDeleteResult, { kind: "deleted" }>,
+): Promise<void> {
+	return persistManagedGcOwnerTranscriptDeletion({
+		target,
+		fallback,
+		deletion,
+		readLatest: () => pendingCleanupReceipt(scope, tombstone, target),
+		nextReceipt: latest => nextCleanupReceipt(target, latest),
+		publishPending: receipt => publishCleanupPending(scope, tombstone, receipt, lock),
+	});
+}
+
+async function cleanupCompleted(scope: ManagedScope, tombstone: string, target: RetiredTarget): Promise<boolean> {
 	try {
+		const ownerReceipt = target.taskArtifactOwnerDeletionEvidence
+			? await readManagedGcSessionRetirementReceipt(scope, target.path)
+			: undefined;
+		if (
+			target.taskArtifactOwnerDeletionEvidence &&
+			(!ownerReceipt ||
+				ownerReceipt.state !== "owner_retired" ||
+				!deepSame(ownerReceipt.taskArtifactOwnerDeletionEvidence, target.taskArtifactOwnerDeletionEvidence))
+		)
+			return false;
 		const value: unknown = JSON.parse(
 			captureManagedFileNoFollow(cleanupReceiptPath(tombstone, target, "completed", 1)).bytes.toString("utf8"),
 		);
@@ -4143,6 +4343,39 @@ function cleanupCompleted(scope: ManagedScope, tombstone: string, target: Retire
 		const record = value as Record<string, unknown>;
 		const recorded = record.target as Record<string, unknown> | undefined;
 		const identity = recorded?.identity as Record<string, unknown> | undefined;
+		const expectedKeys = ownerReceipt
+			? [
+					"schemaVersion",
+					"state",
+					"scope",
+					"tombstone",
+					"attempt",
+					"target",
+					"taskArtifactOwnerDeletionEvidence",
+					"taskArtifactOwnerRetirementOutcome",
+					"taskArtifactOwnerRetired",
+					"taskArtifactOwnerTranscriptDeleted",
+				]
+			: ["schemaVersion", "state", "scope", "tombstone", "attempt", "target"];
+		if (Object.keys(record).length !== expectedKeys.length || !expectedKeys.every(key => key in record)) return false;
+		if (ownerReceipt) {
+			const pending = pendingCleanupReceipt(scope, tombstone, target);
+			if (record.taskArtifactOwnerTranscriptDeleted !== true || !pending?.taskArtifactOwnerTranscriptDeleted)
+				return false;
+			const evidence = parseTaskArtifactOwnerDeletionEvidence(record.taskArtifactOwnerDeletionEvidence);
+			const outcome = parseTaskArtifactOwnerRetirementOutcome(
+				taskArtifactOwnerStorageContextForScope(scope),
+				evidence,
+				record.taskArtifactOwnerRetirementOutcome,
+			);
+			if (
+				record.taskArtifactOwnerRetired !== true ||
+				outcome.kind !== "completed" ||
+				!deepSame(evidence, ownerReceipt.taskArtifactOwnerDeletionEvidence) ||
+				!deepSame(outcome, ownerReceipt.taskArtifactOwnerRetirementOutcome)
+			)
+				return false;
+		}
 		return (
 			record.schemaVersion === 1 &&
 			record.state === "cleanup_completed" &&
@@ -4169,6 +4402,24 @@ async function publishCleanupCompleted(
 	target: RetiredTarget,
 	lock: ManagedStorageLock,
 ): Promise<void> {
+	const ownerReceipt = target.taskArtifactOwnerDeletionEvidence
+		? await readManagedGcSessionRetirementReceipt(scope, target.path)
+		: undefined;
+	if (
+		target.taskArtifactOwnerDeletionEvidence &&
+		(!ownerReceipt ||
+			ownerReceipt.state !== "owner_retired" ||
+			!deepSame(ownerReceipt.taskArtifactOwnerDeletionEvidence, target.taskArtifactOwnerDeletionEvidence))
+	)
+		throw new Error("durability_failed");
+	const ownerOutcome = ownerReceipt?.taskArtifactOwnerRetirementOutcome;
+	if (
+		ownerReceipt &&
+		(!ownerOutcome ||
+			ownerOutcome.kind !== "completed" ||
+			!pendingCleanupReceipt(scope, tombstone, target)?.taskArtifactOwnerTranscriptDeleted)
+	)
+		throw new Error("durability_failed");
 	try {
 		await publishManagedTombstone(
 			cleanupReceiptPath(tombstone, target, "completed", 1),
@@ -4179,12 +4430,21 @@ async function publishCleanupCompleted(
 				tombstone,
 				attempt: 1,
 				target: { path: target.path, sessionId: target.sessionId, cwd: target.cwd, identity: target.identity },
+				...(ownerReceipt && ownerOutcome
+					? {
+							taskArtifactOwnerDeletionEvidence: ownerReceipt.taskArtifactOwnerDeletionEvidence,
+							taskArtifactOwnerRetirementOutcome: ownerOutcome,
+							taskArtifactOwnerRetired: true,
+							taskArtifactOwnerTranscriptDeleted: true,
+						}
+					: {}),
 			},
 			lock.assertOwned,
 		);
 	} catch (error) {
 		if ((error as Error).message !== "destination_conflict") throw error;
 	}
+	if (!(await cleanupCompleted(scope, tombstone, target))) throw new Error("durability_failed");
 }
 
 function tombstonePathContaining(scope: ManagedScope, candidate: ManagedCandidate): string | undefined {
@@ -4939,9 +5199,15 @@ export async function reconcileManagedTombstones(
 	const directory = path.join(managedInternalDirectory(scope), MANAGED_TOMBSTONES_DIRECTORY);
 	for (const name of fs.readdirSync(directory)) {
 		const tombstone = path.join(directory, name);
-		const targets = retiredTargets(scope, tombstone);
-		if (!targets) continue;
-		if (targets.every(target => cleanupCompleted(scope, tombstone, target))) continue;
+		const discoveredTargets = retiredTargets(scope, tombstone);
+		if (!discoveredTargets || discoveredTargets.some(target => hasUnsupportedLegacyOwnerTarget(scope, target)))
+			continue;
+		if (
+			await Promise.all(discoveredTargets.map(target => cleanupCompleted(scope, tombstone, target))).then(values =>
+				values.every(Boolean),
+			)
+		)
+			continue;
 		let lock: ManagedStorageLock | undefined;
 		try {
 			lock = await acquireManagedLock(
@@ -4949,11 +5215,22 @@ export async function reconcileManagedTombstones(
 				path.basename(tombstone, ".json"),
 				scopeRoot(scope),
 			);
-			const lockedTargets = retiredTargets(scope, tombstone);
-			if (!lockedTargets) continue;
+			const discoveredLockedTargets = retiredTargets(scope, tombstone);
+			if (
+				!discoveredLockedTargets ||
+				discoveredLockedTargets.some(target => hasUnsupportedLegacyOwnerTarget(scope, target))
+			)
+				continue;
+			const lockedTargets = await prepareManagedGcOwnerTargets(scope, discoveredLockedTargets, lock);
+			if (
+				await Promise.all(lockedTargets.map(target => cleanupCompleted(scope, tombstone, target))).then(values =>
+					values.every(Boolean),
+				)
+			)
+				continue;
 			for (const target of lockedTargets) {
 				lock.assertOwned();
-				if (cleanupCompleted(scope, tombstone, target)) continue;
+				if (await cleanupCompleted(scope, tombstone, target)) continue;
 				try {
 					const pending = pendingCleanupReceipt(scope, tombstone, target);
 					const observedPending = pending ? probePlannedCleanupDetach(target, pending) : undefined;
@@ -4978,8 +5255,17 @@ export async function reconcileManagedTombstones(
 									target,
 									replayReceipt,
 									artifactsEvidence.retainedArtifactsRootPath,
-								)
+								) &&
+								(!target.taskArtifactOwnerDeletionEvidence ||
+									pending?.taskArtifactOwnerTranscriptDeleted === true)
 							) {
+								const ownerProgress = await retireManagedGcOwnerAfterArtifacts(
+									scope,
+									target,
+									lockedTargets,
+									lock,
+								);
+								if (ownerProgress.state === "pending" || ownerProgress.state === "payload_retired") continue;
 								fsyncManagedParent(target.path);
 								await publishCleanupCompleted(scope, tombstone, target, lock);
 								continue;
@@ -5004,38 +5290,11 @@ export async function reconcileManagedTombstones(
 						? target
 						: validateCandidateForScope(scope, target);
 					if (!initialTarget) throw new Error("source_changed");
-					let deletion = await deleteSessionVerifiedWithFence("reconcile", "initial", lock, {
-						sessionsRoot: scope.sessionsRoot,
-						transcriptPath: target.path,
-						sessionId: target.sessionId,
-						cwd: target.cwd,
-						transcriptIdentity: {
-							...initialTarget.identity,
-							nlink: fs.lstatSync(observedPending?.detachedTranscriptPath ?? target.path, { bigint: true })
-								.nlink,
-						},
-						expectedArtifactsIdentity: active.expectedArtifactsIdentity,
-						expectedArtifactsTree: active.expectedArtifactsTree,
-						detachedArtifactsPath:
-							active.detachedArtifactsPath ??
-							observedPending?.detachedArtifactsPath ??
-							(fs.existsSync(active.plannedArtifactsPath) ? active.plannedArtifactsPath : undefined),
-						detachedTranscriptPath:
-							active.detachedTranscriptPath ??
-							observedPending?.detachedTranscriptPath ??
-							(pending && fs.existsSync(pending.plannedTranscriptPath)
-								? pending.plannedTranscriptPath
-								: undefined) ??
-							(fs.existsSync(active.plannedTranscriptPath) ? active.plannedTranscriptPath : undefined),
-						retainedArtifactsSuccessorPath: active.retainedArtifactsSuccessorPath,
-						retainedArtifactsPlaceholderPath: active.retainedArtifactsPlaceholderPath,
-						retainedArtifactsUnknownPath: active.retainedArtifactsUnknownPath,
-						retainedTranscriptSuccessorPath: active.retainedTranscriptSuccessorPath,
-						retainedTranscriptPlaceholderPath: active.retainedTranscriptPlaceholderPath,
-						retainedTranscriptUnknownPath: active.retainedTranscriptUnknownPath,
-						plannedArtifactsPath: active.plannedArtifactsPath,
-						plannedTranscriptPath: active.plannedTranscriptPath,
-						...(cleanupArtifactsRemoved(
+					let ownerProgress = await managedGcOwnerProgressBeforeDelete(
+						scope,
+						target,
+						lockedTargets,
+						cleanupArtifactsRemoved(
 							scope,
 							tombstone,
 							target,
@@ -5043,12 +5302,65 @@ export async function reconcileManagedTombstones(
 								active.artifactsRemovedAttempt ??
 								pending?.attempt ??
 								active.attempt,
-						)
-							? { artifactsRemoved: true as const }
-							: {}),
-					});
+						),
+						lock,
+					);
+					if (ownerProgress.state === "pending") continue;
+					let deletion = await deleteSessionVerifiedWithFence(
+						"reconcile",
+						"initial",
+						lock,
+						{
+							sessionsRoot: scope.sessionsRoot,
+							transcriptPath: target.path,
+							sessionId: target.sessionId,
+							cwd: target.cwd,
+							transcriptIdentity: {
+								...initialTarget.identity,
+								nlink: fs.lstatSync(observedPending?.detachedTranscriptPath ?? target.path, { bigint: true })
+									.nlink,
+							},
+							expectedArtifactsIdentity: active.expectedArtifactsIdentity,
+							expectedArtifactsTree: active.expectedArtifactsTree,
+							detachedArtifactsPath:
+								active.detachedArtifactsPath ??
+								observedPending?.detachedArtifactsPath ??
+								(fs.existsSync(active.plannedArtifactsPath) ? active.plannedArtifactsPath : undefined),
+							detachedTranscriptPath:
+								active.detachedTranscriptPath ??
+								observedPending?.detachedTranscriptPath ??
+								(pending && fs.existsSync(pending.plannedTranscriptPath)
+									? pending.plannedTranscriptPath
+									: undefined) ??
+								(fs.existsSync(active.plannedTranscriptPath) ? active.plannedTranscriptPath : undefined),
+							retainedArtifactsSuccessorPath: active.retainedArtifactsSuccessorPath,
+							retainedArtifactsPlaceholderPath: active.retainedArtifactsPlaceholderPath,
+							retainedArtifactsUnknownPath: active.retainedArtifactsUnknownPath,
+							retainedTranscriptSuccessorPath: active.retainedTranscriptSuccessorPath,
+							retainedTranscriptPlaceholderPath: active.retainedTranscriptPlaceholderPath,
+							retainedTranscriptUnknownPath: active.retainedTranscriptUnknownPath,
+							plannedArtifactsPath: active.plannedArtifactsPath,
+							plannedTranscriptPath: active.plannedTranscriptPath,
+							...(cleanupArtifactsRemoved(
+								scope,
+								tombstone,
+								target,
+								pending?.artifactsRemovedAttempt ??
+									active.artifactsRemovedAttempt ??
+									pending?.attempt ??
+									active.attempt,
+							)
+								? { artifactsRemoved: true as const }
+								: {}),
+						},
+						scope,
+						target,
+					);
 					if (deletion.kind === "artifacts_removed") {
+						await publishManagedGcArtifactsRemoved(scope, target, lock);
 						await publishCleanupArtifactsRemoved(scope, tombstone, active, lock);
+						ownerProgress = await retireManagedGcOwnerAfterArtifacts(scope, target, lockedTargets, lock);
+						if (ownerProgress.state === "pending") continue;
 						active = { ...active, artifactsRemovedAttempt: active.attempt };
 						const refreshedTarget = validateCandidateForScope(scope, target);
 						if (!refreshedTarget) throw new Error("source_changed");
@@ -5075,9 +5387,15 @@ export async function reconcileManagedTombstones(
 								retainedTranscriptUnknownPath: active.retainedTranscriptUnknownPath,
 								artifactsRemoved: true,
 							},
+							scope,
+							target,
 						);
 					}
 					if (deletion.kind === "cleanup_pending") {
+						if (deletion.phase === "task_artifact_owner") {
+							ownerProgress = await persistManagedGcStorageOwnerDisposition(scope, target, deletion, lock);
+							continue;
+						}
 						assertAuthorizedCleanupPending(target, active, deletion);
 						const retry = nextCleanupReceipt(target, active);
 						let pendingEvidence = cleanupPendingEvidence(retry, active, deletion);
@@ -5104,7 +5422,10 @@ export async function reconcileManagedTombstones(
 									!retainedArtifactPayloadAbsent(deletion.detachedArtifactsPath))
 							)
 								continue;
+							await publishManagedGcArtifactsRemoved(scope, target, lock);
 							await publishCleanupArtifactsRemoved(scope, tombstone, pendingEvidence, lock);
+							ownerProgress = await retireManagedGcOwnerAfterArtifacts(scope, target, lockedTargets, lock);
+							if (ownerProgress.state === "pending") continue;
 							pendingEvidence = { ...pendingEvidence, artifactsRemovedAttempt: pendingEvidence.attempt };
 							const retainedProof = cleanupArtifactsRemovedReceipt(
 								tombstone,
@@ -5140,6 +5461,8 @@ export async function reconcileManagedTombstones(
 									retainedTranscriptUnknownPath: pendingEvidence.retainedTranscriptUnknownPath,
 									artifactsRemoved: true,
 								},
+								scope,
+								target,
 								() => {
 									if (
 										!cleanupArtifactsRemoved(
@@ -5152,8 +5475,10 @@ export async function reconcileManagedTombstones(
 										throw new Error("durability_failed");
 								},
 							);
-							if (deletion.kind === "cleanup_pending" && deletion.phase === "task_artifact_owner")
-								rejectTaskArtifactOwnerCleanupPending(deletion);
+							if (deletion.kind === "cleanup_pending" && deletion.phase === "task_artifact_owner") {
+								ownerProgress = await persistManagedGcStorageOwnerDisposition(scope, target, deletion, lock);
+								continue;
+							}
 							if (deletion.kind === "cleanup_pending") {
 								if (
 									deletion.phase !== "transcript" ||
@@ -5170,8 +5495,6 @@ export async function reconcileManagedTombstones(
 									throw new Error("durability_failed");
 							}
 						}
-						if (deletion.kind === "cleanup_pending" && deletion.phase === "task_artifact_owner")
-							rejectTaskArtifactOwnerCleanupPending(deletion);
 						if (
 							deletion.kind === "cleanup_pending" &&
 							(deletion.phase !== "transcript" ||
@@ -5189,6 +5512,15 @@ export async function reconcileManagedTombstones(
 						)
 							continue;
 					}
+					if (deletion.kind === "deleted")
+						await persistManagedOwnerTranscriptDeletion(scope, tombstone, target, active, lock, deletion);
+					const ownerDisposition = await taskArtifactOwnerTranscriptResult(scope, target, lock);
+					if (
+						(ownerDisposition !== "none" && ownerDisposition !== "retired") ||
+						(target.taskArtifactOwnerDeletionEvidence &&
+							!pendingCleanupReceipt(scope, tombstone, target)?.taskArtifactOwnerTranscriptDeleted)
+					)
+						continue;
 					fsyncManagedParent(target.path);
 					await publishCleanupCompleted(scope, tombstone, target, lock);
 				} catch (error) {
@@ -5609,6 +5941,24 @@ async function deleteManagedSessionCandidateInternal(
 	scope: ManagedScope,
 	candidate: ManagedCandidate,
 ): Promise<ManagedDeleteCandidateResult> {
+	try {
+		if (hasUnsupportedLegacyOwnerTargetInternal(scope.directoryPath, candidate)) {
+			const tombstonePath = path.join(
+				managedInternalDirectory(scope),
+				MANAGED_TOMBSTONES_DIRECTORY,
+				`${stableOperationName(candidate)}.json`,
+			);
+			return {
+				kind: "cleanup_pending",
+				tombstonePath,
+				phase: "artifacts",
+				message: "task_artifact_owner_legacy_scope_unsupported",
+			};
+		}
+	} catch (error) {
+		const code = expectedFailure(error);
+		return { kind: "error", code, message: error instanceof Error ? error.message : "Managed deletion failed." };
+	}
 	const prepared = await prepareManagedSessionScopeForWrite(scope);
 	if (prepared.kind === "error")
 		return {
@@ -5634,9 +5984,17 @@ async function deleteManagedSessionCandidateInternal(
 			scopeRoot(scope),
 		);
 		let targets = retiredTargets(scope, tombstone);
+		const initialTargets = targets ?? (current ? [current, ...(paired ? [paired] : [])] : []);
+		if (initialTargets.some(target => hasUnsupportedLegacyOwnerTarget(scope, target)))
+			return {
+				kind: "cleanup_pending",
+				tombstonePath: tombstone,
+				phase: "artifacts",
+				message: "task_artifact_owner_legacy_scope_unsupported",
+			};
 		if (!targets) {
 			if (!current) throw new Error("source_changed");
-			targets = [current, ...(paired ? [paired] : [])];
+			targets = await prepareManagedGcOwnerTargets(scope, [current, ...(paired ? [paired] : [])], lock);
 			lock.assertOwned();
 			try {
 				await publishManagedTombstone(
@@ -5651,6 +6009,9 @@ async function deleteManagedSessionCandidateInternal(
 							cwd: target.cwd,
 							provenance: target.provenance,
 							identity: target.identity,
+							...(target.taskArtifactOwnerDeletionEvidence
+								? { taskArtifactOwnerDeletionEvidence: target.taskArtifactOwnerDeletionEvidence }
+								: {}),
 						})),
 					},
 					lock.assertOwned,
@@ -5661,6 +6022,7 @@ async function deleteManagedSessionCandidateInternal(
 			targets = retiredTargets(scope, tombstone);
 			if (!targets) throw new Error("durability_failed");
 		}
+		targets = await prepareManagedGcOwnerTargets(scope, targets, lock);
 		let deletedAny = false;
 		for (const target of targets) {
 			lock.assertOwned();
@@ -5670,6 +6032,42 @@ async function deleteManagedSessionCandidateInternal(
 				fs.lstatSync(target.path);
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+					if (!observedPending && target.taskArtifactOwnerDeletionEvidence) {
+						if (!pending?.taskArtifactOwnerTranscriptDeleted)
+							return {
+								kind: "cleanup_pending",
+								tombstonePath: tombstone,
+								phase: "artifacts",
+								message: "task_artifact_owner_transcript_deletion_unverified",
+							};
+						const artifactsEvidence = cleanupArtifactsRemovedEvidence(
+							scope,
+							tombstone,
+							target,
+							pending.artifactsRemovedAttempt ?? pending.attempt,
+						);
+						if (
+							!artifactsEvidence ||
+							!cleanupRootsAbsent(tombstone, target, pending, artifactsEvidence.retainedArtifactsRootPath)
+						)
+							return {
+								kind: "cleanup_pending",
+								tombstonePath: tombstone,
+								phase: "artifacts",
+								message: "task_artifact_owner_retirement_pending",
+							};
+						const ownerProgress = await retireManagedGcOwnerAfterArtifacts(scope, target, targets, lock);
+						if (ownerProgress.state === "pending" || ownerProgress.state === "payload_retired")
+							return {
+								kind: "cleanup_pending",
+								tombstonePath: tombstone,
+								phase: "artifacts",
+								message: ownerProgress.message ?? "task_artifact_owner_retirement_pending",
+							};
+						fsyncManagedParent(target.path);
+						await publishCleanupCompleted(scope, tombstone, target, lock);
+						continue;
+					}
 					if (!observedPending) continue;
 					const artifactsEvidence = cleanupArtifactsRemovedEvidence(
 						scope,
@@ -5679,15 +6077,31 @@ async function deleteManagedSessionCandidateInternal(
 					);
 					if (
 						artifactsEvidence &&
-						cleanupRootsAbsent(tombstone, target, observedPending, artifactsEvidence.retainedArtifactsRootPath)
+						cleanupRootsAbsent(tombstone, target, observedPending, artifactsEvidence.retainedArtifactsRootPath) &&
+						(!target.taskArtifactOwnerDeletionEvidence || pending?.taskArtifactOwnerTranscriptDeleted === true)
 					) {
+						const ownerProgress = await retireManagedGcOwnerAfterArtifacts(scope, target, targets, lock);
+						if (ownerProgress.state === "pending" || ownerProgress.state === "payload_retired")
+							return {
+								kind: "cleanup_pending",
+								tombstonePath: tombstone,
+								phase: "artifacts",
+								message: ownerProgress.message ?? "task_artifact_owner_retirement_pending",
+							};
 						fsyncManagedParent(target.path);
 						await publishCleanupCompleted(scope, tombstone, target, lock);
 						continue;
 					}
+					if (target.taskArtifactOwnerDeletionEvidence && !observedPending.detachedTranscriptPath)
+						return {
+							kind: "cleanup_pending",
+							tombstonePath: tombstone,
+							phase: "artifacts",
+							message: "task_artifact_owner_transcript_deletion_unverified",
+						};
 				} else throw error;
 			}
-			if (cleanupCompleted(scope, tombstone, target)) continue;
+			if (await cleanupCompleted(scope, tombstone, target)) continue;
 			deletedAny = true;
 			const verified = observedPending ? target : validateCandidateForScope(scope, target);
 			if (!verified || !sameCandidate(verified, target)) throw new Error("source_changed");
@@ -5703,64 +6117,118 @@ async function deleteManagedSessionCandidateInternal(
 				await publishCleanupPending(scope, tombstone, active, lock);
 			const initialTarget = validateCandidateForScope(scope, target);
 			if (!initialTarget) throw new Error("source_changed");
-			let deletion = await deleteSessionVerifiedWithFence("direct", "initial", lock, {
-				sessionsRoot: scope.sessionsRoot,
-				transcriptPath: target.path,
-				sessionId: target.sessionId,
-				cwd: target.cwd,
-				transcriptIdentity: initialTarget.identity,
-				transcriptParentIdentity: (() => {
-					const parent = fs.lstatSync(path.dirname(target.path), { bigint: true });
-					return { dev: parent.dev, ino: parent.ino };
-				})(),
-				expectedArtifactsIdentity: active.expectedArtifactsIdentity,
-				expectedArtifactsTree: active.expectedArtifactsTree,
-				detachedArtifactsPath: active.detachedArtifactsPath ?? observedPending?.detachedArtifactsPath,
-				detachedTranscriptPath:
-					active.detachedTranscriptPath ??
-					observedPending?.detachedTranscriptPath ??
-					(pending && fs.existsSync(pending.plannedTranscriptPath) ? pending.plannedTranscriptPath : undefined),
-				retainedArtifactsSuccessorPath: active.retainedArtifactsSuccessorPath,
-				retainedArtifactsPlaceholderPath: active.retainedArtifactsPlaceholderPath,
-				retainedArtifactsUnknownPath: active.retainedArtifactsUnknownPath,
-				retainedTranscriptSuccessorPath: active.retainedTranscriptSuccessorPath,
-				retainedTranscriptPlaceholderPath: active.retainedTranscriptPlaceholderPath,
-				retainedTranscriptUnknownPath: active.retainedTranscriptUnknownPath,
-				plannedArtifactsPath: active.plannedArtifactsPath,
-				plannedTranscriptPath: active.plannedTranscriptPath,
-				...(cleanupArtifactsRemoved(
+			let ownerProgress = await managedGcOwnerProgressBeforeDelete(
+				scope,
+				target,
+				targets,
+				cleanupArtifactsRemoved(
 					scope,
 					tombstone,
 					target,
 					pending?.artifactsRemovedAttempt ?? active.artifactsRemovedAttempt ?? pending?.attempt ?? active.attempt,
-				)
-					? { artifactsRemoved: true as const }
-					: {}),
-			});
-			if (deletion.kind === "artifacts_removed") {
-				await publishCleanupArtifactsRemoved(scope, tombstone, active, lock);
-				active = { ...active, artifactsRemovedAttempt: active.attempt };
-				const refreshedTarget = validateCandidateForScope(scope, target);
-				if (!refreshedTarget) throw new Error("source_changed");
-				deletion = await deleteSessionVerifiedWithFence("direct", "transcript-after-artifacts-removed", lock, {
+				),
+				lock,
+			);
+			if (ownerProgress.state === "pending")
+				return {
+					kind: "cleanup_pending",
+					tombstonePath: tombstone,
+					phase: "artifacts",
+					message: ownerProgress.message ?? "task_artifact_owner_retirement_pending",
+				};
+			let deletion = await deleteSessionVerifiedWithFence(
+				"direct",
+				"initial",
+				lock,
+				{
 					sessionsRoot: scope.sessionsRoot,
 					transcriptPath: target.path,
 					sessionId: target.sessionId,
 					cwd: target.cwd,
-					transcriptIdentity: refreshedTarget.identity,
-					plannedArtifactsPath: active.plannedArtifactsPath,
-					plannedTranscriptPath: active.plannedTranscriptPath,
-					detachedTranscriptPath: active.detachedTranscriptPath ?? observedPending?.detachedTranscriptPath,
+					transcriptIdentity: initialTarget.identity,
+					transcriptParentIdentity: (() => {
+						const parent = fs.lstatSync(path.dirname(target.path), { bigint: true });
+						return { dev: parent.dev, ino: parent.ino };
+					})(),
+					expectedArtifactsIdentity: active.expectedArtifactsIdentity,
+					expectedArtifactsTree: active.expectedArtifactsTree,
+					detachedArtifactsPath: active.detachedArtifactsPath ?? observedPending?.detachedArtifactsPath,
+					detachedTranscriptPath:
+						active.detachedTranscriptPath ??
+						observedPending?.detachedTranscriptPath ??
+						(pending && fs.existsSync(pending.plannedTranscriptPath) ? pending.plannedTranscriptPath : undefined),
 					retainedArtifactsSuccessorPath: active.retainedArtifactsSuccessorPath,
 					retainedArtifactsPlaceholderPath: active.retainedArtifactsPlaceholderPath,
 					retainedArtifactsUnknownPath: active.retainedArtifactsUnknownPath,
 					retainedTranscriptSuccessorPath: active.retainedTranscriptSuccessorPath,
 					retainedTranscriptPlaceholderPath: active.retainedTranscriptPlaceholderPath,
 					retainedTranscriptUnknownPath: active.retainedTranscriptUnknownPath,
-					artifactsRemoved: true,
-				});
+					plannedArtifactsPath: active.plannedArtifactsPath,
+					plannedTranscriptPath: active.plannedTranscriptPath,
+					...(cleanupArtifactsRemoved(
+						scope,
+						tombstone,
+						target,
+						pending?.artifactsRemovedAttempt ??
+							active.artifactsRemovedAttempt ??
+							pending?.attempt ??
+							active.attempt,
+					)
+						? { artifactsRemoved: true as const }
+						: {}),
+				},
+				scope,
+				target,
+			);
+			if (deletion.kind === "artifacts_removed") {
+				await publishManagedGcArtifactsRemoved(scope, target, lock);
+				await publishCleanupArtifactsRemoved(scope, tombstone, active, lock);
+				ownerProgress = await retireManagedGcOwnerAfterArtifacts(scope, target, targets, lock);
+				if (ownerProgress.state === "pending")
+					return {
+						kind: "cleanup_pending",
+						tombstonePath: tombstone,
+						phase: "artifacts",
+						message: ownerProgress.message ?? "task_artifact_owner_retirement_pending",
+					};
+				active = { ...active, artifactsRemovedAttempt: active.attempt };
+				const refreshedTarget = validateCandidateForScope(scope, target);
+				if (!refreshedTarget) throw new Error("source_changed");
+				deletion = await deleteSessionVerifiedWithFence(
+					"direct",
+					"transcript-after-artifacts-removed",
+					lock,
+					{
+						sessionsRoot: scope.sessionsRoot,
+						transcriptPath: target.path,
+						sessionId: target.sessionId,
+						cwd: target.cwd,
+						transcriptIdentity: refreshedTarget.identity,
+						plannedArtifactsPath: active.plannedArtifactsPath,
+						plannedTranscriptPath: active.plannedTranscriptPath,
+						detachedTranscriptPath: active.detachedTranscriptPath ?? observedPending?.detachedTranscriptPath,
+						retainedArtifactsSuccessorPath: active.retainedArtifactsSuccessorPath,
+						retainedArtifactsPlaceholderPath: active.retainedArtifactsPlaceholderPath,
+						retainedArtifactsUnknownPath: active.retainedArtifactsUnknownPath,
+						retainedTranscriptSuccessorPath: active.retainedTranscriptSuccessorPath,
+						retainedTranscriptPlaceholderPath: active.retainedTranscriptPlaceholderPath,
+						retainedTranscriptUnknownPath: active.retainedTranscriptUnknownPath,
+						artifactsRemoved: true,
+					},
+					scope,
+					target,
+				);
 			}
 			if (deletion.kind === "cleanup_pending") {
+				if (deletion.phase === "task_artifact_owner") {
+					ownerProgress = await persistManagedGcStorageOwnerDisposition(scope, target, deletion, lock);
+					return {
+						kind: "cleanup_pending",
+						tombstonePath: tombstone,
+						phase: "artifacts",
+						message: ownerProgress.message ?? deletion.error.message,
+					};
+				}
 				assertAuthorizedCleanupPending(target, active, deletion);
 				const retry = nextCleanupReceipt(target, active);
 				let pendingEvidence = cleanupPendingEvidence(retry, active, deletion);
@@ -5794,7 +6262,16 @@ async function deleteManagedSessionCandidateInternal(
 							phase: deletion.phase,
 							message: "Exact cleanup remains pending because descriptor-bound final deletion is unavailable.",
 						};
+					await publishManagedGcArtifactsRemoved(scope, target, lock);
 					await publishCleanupArtifactsRemoved(scope, tombstone, pendingEvidence, lock);
+					ownerProgress = await retireManagedGcOwnerAfterArtifacts(scope, target, targets, lock);
+					if (ownerProgress.state === "pending")
+						return {
+							kind: "cleanup_pending",
+							tombstonePath: tombstone,
+							phase: "artifacts",
+							message: ownerProgress.message ?? "task_artifact_owner_retirement_pending",
+						};
 					pendingEvidence = { ...pendingEvidence, artifactsRemovedAttempt: pendingEvidence.attempt };
 					const retainedProof = cleanupArtifactsRemovedReceipt(
 						tombstone,
@@ -5830,6 +6307,8 @@ async function deleteManagedSessionCandidateInternal(
 							retainedTranscriptUnknownPath: pendingEvidence.retainedTranscriptUnknownPath,
 							artifactsRemoved: true,
 						},
+						scope,
+						target,
 						() => {
 							if (
 								!cleanupArtifactsRemoved(
@@ -5842,8 +6321,15 @@ async function deleteManagedSessionCandidateInternal(
 								throw new Error("durability_failed");
 						},
 					);
-					if (deletion.kind === "cleanup_pending" && deletion.phase === "task_artifact_owner")
-						rejectTaskArtifactOwnerCleanupPending(deletion);
+					if (deletion.kind === "cleanup_pending" && deletion.phase === "task_artifact_owner") {
+						ownerProgress = await persistManagedGcStorageOwnerDisposition(scope, target, deletion, lock);
+						return {
+							kind: "cleanup_pending",
+							tombstonePath: tombstone,
+							phase: "artifacts",
+							message: ownerProgress.message ?? deletion.error.message,
+						};
+					}
 					if (deletion.kind === "cleanup_pending") {
 						if (
 							deletion.phase !== "transcript" ||
@@ -5856,8 +6342,6 @@ async function deleteManagedSessionCandidateInternal(
 						await publishCleanupPending(scope, tombstone, pendingEvidence, lock);
 					}
 				}
-				if (deletion.kind === "cleanup_pending" && deletion.phase === "task_artifact_owner")
-					rejectTaskArtifactOwnerCleanupPending(deletion);
 				if (
 					deletion.kind === "cleanup_pending" &&
 					(deletion.phase !== "transcript" ||
@@ -5876,12 +6360,42 @@ async function deleteManagedSessionCandidateInternal(
 					return {
 						kind: "cleanup_pending",
 						tombstonePath: tombstone,
-						phase: deletion.phase,
-						message: deletion.error.message,
+						phase: ownerProgress.state === "payload_retired" ? "artifacts" : deletion.phase,
+						message:
+							ownerProgress.state === "payload_retired"
+								? "task_artifact_owner_namespace_cleanup_pending"
+								: deletion.error.message,
 					};
 				// A retained transcript quarantine proves canonical absence and remains
 				// identity-bound in the durable pending receipt.
 			}
+			if (deletion.kind === "deleted")
+				await persistManagedOwnerTranscriptDeletion(scope, tombstone, target, active, lock, deletion);
+			const ownerDisposition = await taskArtifactOwnerTranscriptResult(scope, target, lock);
+			if (ownerDisposition === "payload_retired")
+				return {
+					kind: "cleanup_pending",
+					tombstonePath: tombstone,
+					phase: "artifacts",
+					message: "task_artifact_owner_namespace_cleanup_pending",
+				};
+			if (target.taskArtifactOwnerDeletionEvidence && ownerDisposition !== "retired")
+				return {
+					kind: "cleanup_pending",
+					tombstonePath: tombstone,
+					phase: "artifacts",
+					message: "task_artifact_owner_retirement_pending",
+				};
+			if (
+				target.taskArtifactOwnerDeletionEvidence &&
+				!pendingCleanupReceipt(scope, tombstone, target)?.taskArtifactOwnerTranscriptDeleted
+			)
+				return {
+					kind: "cleanup_pending",
+					tombstonePath: tombstone,
+					phase: "transcript",
+					message: "task_artifact_owner_transcript_deletion_unverified",
+				};
 			fsyncManagedParent(target.path);
 			await publishCleanupCompleted(scope, tombstone, target, lock);
 		}
