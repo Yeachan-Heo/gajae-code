@@ -30,7 +30,8 @@ import {
 	listCanonicalBlobs,
 	removeCanonicalBlob,
 } from "../session/blob-store";
-import { FileSessionStorage, probeSessionRetirement, retireSessionTranscript } from "../session/session-storage";
+import { probeSessionRetirement, retireSessionTranscript } from "../session/session-retirement";
+import { FileSessionStorage } from "../session/session-storage";
 import {
 	collectEmptyDeleteReceipts,
 	type EmptyDeleteGcRecord,
