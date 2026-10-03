@@ -35,6 +35,7 @@ type Upload = {
 	sequence: number;
 	finishing: boolean;
 	finished: boolean;
+	expiresAt: number;
 	timer: NodeJS.Timeout;
 };
 
@@ -92,6 +93,8 @@ export class PromptImageUploadStore {
 			(typeof input.batchId !== "string" || input.batchId.length === 0 || input.batchId.length > MAX_BATCH_ID_LENGTH)
 		)
 			invalid("Image batchId must be a nonempty string of at most 128 characters.");
+		const now = Date.now();
+		for (const [uploadId, upload] of this.#uploads) this.#expire(uploadId, upload, now);
 		if (this.#uploads.size >= MAX_UPLOADS) busy("Too many concurrent image uploads.");
 		const id = crypto.randomUUID();
 		const timer = setTimeout(() => this.#remove(id), LEASE_MS);
@@ -108,6 +111,7 @@ export class PromptImageUploadStore {
 			sequence: 0,
 			finishing: false,
 			finished: false,
+			expiresAt: now + LEASE_MS,
 			timer,
 		};
 		this.#uploads.set(id, upload);
@@ -234,7 +238,7 @@ export class PromptImageUploadStore {
 				invalid("Image cannot be decoded.");
 			}
 			// The transport can disconnect while decoding. A removed lease cannot be resurrected.
-			if (this.#uploads.get(input.id as string) !== upload)
+			if (this.#uploads.get(input.id as string) !== upload || this.#expire(input.id as string, upload))
 				throw new TypedControlError("resource_gone", "Image upload expired.");
 			const releasedBytes = upload.reservedBytes - upload.length;
 			this.#uploadBytes -= releasedBytes;
@@ -280,7 +284,7 @@ export class PromptImageUploadStore {
 				invalid("stagedImages contains an invalid or duplicate ID.");
 			seen.add(id);
 			const entry = this.#uploads.get(id);
-			if (!entry || entry.owner !== owner)
+			if (!entry || entry.owner !== owner || this.#expire(id, entry))
 				throw new TypedControlError("resource_gone", "Image upload is unavailable.");
 			if (!entry.finished) invalid("Image upload is not finished.");
 			bytes += entry.length;
@@ -329,7 +333,7 @@ export class PromptImageUploadStore {
 		this.#assertConnected(owner);
 		if (typeof value !== "string" || !value) invalid("Image upload ID is required.");
 		const upload = this.#uploads.get(value);
-		if (!upload || upload.owner !== owner)
+		if (!upload || upload.owner !== owner || this.#expire(value, upload))
 			throw new TypedControlError("resource_gone", "Image upload is unavailable.");
 		return upload;
 	}
@@ -340,17 +344,26 @@ export class PromptImageUploadStore {
 		if (!this.#isConnectionOpen(owner))
 			throw new TypedControlError("resource_gone", "Image upload connection is closed.");
 	}
+	#expire(id: string, upload: Upload, now = Date.now()): boolean {
+		if (now < upload.expiresAt) return false;
+		this.#remove(id);
+		return true;
+	}
 	#renewBatch(owner: string, id: string, current: Upload): void {
-		if (this.#uploads.get(id) !== current) return;
+		const now = Date.now();
+		if (this.#uploads.get(id) !== current || this.#expire(id, current, now))
+			throw new TypedControlError("resource_gone", "Image upload expired.");
 		if (current.batchId === undefined) {
-			this.#resetLease(id, current);
+			this.#resetLease(id, current, now);
 			return;
 		}
 		for (const [uploadId, upload] of this.#uploads)
-			if (upload.owner === owner && upload.batchId === current.batchId) this.#resetLease(uploadId, upload);
+			if (upload.owner === owner && upload.batchId === current.batchId && !this.#expire(uploadId, upload, now))
+				this.#resetLease(uploadId, upload, now);
 	}
-	#resetLease(id: string, upload: Upload): void {
+	#resetLease(id: string, upload: Upload, now: number): void {
 		clearTimeout(upload.timer);
+		upload.expiresAt = now + LEASE_MS;
 		upload.timer = setTimeout(() => this.#remove(id), LEASE_MS);
 		upload.timer.unref?.();
 	}
