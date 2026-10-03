@@ -65,6 +65,7 @@ import {
 	ManagedSessionDescendantStore,
 	type ManagedSessionSecurityPolicy,
 	type ManagedStorageLock,
+	managedDirectoryRoot,
 	managedSecurityFailureClassification,
 	prepareManagedDirectoryRoot,
 	publishManagedFileNoReplace,
@@ -115,6 +116,14 @@ const managedScopeConfigurations = new WeakMap<
 const managedDirectoryIdentities = new WeakMap<ManagedScope, { dev: bigint; ino: bigint }>();
 const managedDirectoryAuthorities = new WeakMap<ManagedScope, RecoveryFsRoot | undefined>();
 const boundManagedWriteAuthorities = new WeakMap<ManagedScope, ManagedCandidateWriteAuthority>();
+const readManagedGcScopeIdentities = new WeakMap<
+	ManagedScope,
+	{
+		readonly configuredRoot: { readonly path: string; readonly dev: bigint; readonly ino: bigint };
+		readonly profile: { readonly path: string; readonly dev: bigint; readonly ino: bigint };
+		readonly sessions: { readonly path: string; readonly dev: bigint; readonly ino: bigint };
+	}
+>();
 
 function bindManagedWriteAuthority(scope: ManagedScope, authority: ManagedCandidateWriteAuthority): void {
 	if (
@@ -712,6 +721,71 @@ export function resolveManagedScope(input: ManagedScopeInput): ManagedScopeResol
 /** Resolve a scope for a synchronous write without mutating an existing ACL mismatch. */
 export function resolveManagedScopeForWrite(input: ManagedScopeInput): ManagedScopeResolution {
 	return resolveManagedScopeInternal(input, true);
+}
+
+/** Resolve only an existing, authenticated v2 scope; this path never initializes or repairs storage. */
+export function resolveManagedGcScopeForRead(input: ManagedScopeInput): ManagedScopeResolution {
+	const resolved = resolveManagedScope(input);
+	if (resolved.kind === "error") return resolved;
+	const scope = resolved.scope;
+	try {
+		const rootPath = configuredRootPath(scope);
+		if (
+			path.resolve(scope.agentDir) !== scope.agentDir ||
+			path.resolve(scope.sessionsRoot) !== scope.sessionsRoot ||
+			path.dirname(scope.directoryPath) !== scope.sessionsRoot ||
+			scope.directoryName !== `v2-${scopeDigest(scope.platform, scope.canonicalCwd)}`
+		)
+			throw new Error("managed_gc_scope_authority_mismatch");
+		const captureDirectory = (pathname: string) => {
+			const stat = fs.lstatSync(pathname, { bigint: true });
+			if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("managed_gc_scope_authority_mismatch");
+			const security = validateNativeSecurityResult(
+				verifyExistingManagedScopeDirectory(pathname),
+				"verify",
+				"directory",
+			);
+			if (!security.ok) throw new Error("managed_gc_scope_authority_mismatch");
+			return { path: pathname, dev: stat.dev, ino: stat.ino };
+		};
+		const configuredRoot = captureDirectory(rootPath);
+		const profile = captureDirectory(scope.agentDir);
+		const sessions = captureDirectory(scope.sessionsRoot);
+		const scopeDirectory = captureDirectory(scope.directoryPath);
+		const rootAuthority = managedDirectoryRoot(rootPath);
+		if (
+			rootAuthority.canonicalPath !== rootPath ||
+			rootAuthority.dev !== BigInt.asUintN(64, configuredRoot.dev) ||
+			rootAuthority.ino !== BigInt.asUintN(64, configuredRoot.ino)
+		)
+			throw new Error("managed_gc_scope_authority_mismatch");
+		const bindingPath = path.join(scope.directoryPath, MANAGED_SESSION_BINDING_FILE);
+		const binding = captureManagedFileNoFollow(bindingPath);
+		if (validateBindingRaw(scope, binding.bytes.toString("utf8")))
+			throw new Error("managed_gc_scope_authority_mismatch");
+		for (const expected of [configuredRoot, profile, sessions, scopeDirectory]) {
+			const current = fs.lstatSync(expected.path, { bigint: true });
+			if (
+				!current.isDirectory() ||
+				current.isSymbolicLink() ||
+				current.dev !== expected.dev ||
+				current.ino !== expected.ino
+			)
+				throw new Error("managed_gc_scope_authority_mismatch");
+		}
+		managedRoots.set(scope, rootAuthority);
+		managedDirectoryIdentities.set(scope, { dev: scopeDirectory.dev, ino: scopeDirectory.ino });
+		managedDirectoryAuthorities.set(scope, undefined);
+		readManagedGcScopeIdentities.set(scope, { configuredRoot, profile, sessions });
+		return resolved;
+	} catch (error) {
+		return {
+			kind: "error",
+			code: "binding_invalid",
+			message: "The existing managed GC read authority could not be verified.",
+			cause: { classification: managedScopeResidualClassification(error) ?? "managed_gc_scope_authority_mismatch" },
+		};
+	}
 }
 
 function legacyDirectoryNames(
@@ -2148,6 +2222,31 @@ function managedGcTrustedScope(scope: ManagedScope): ManagedGcTrustedScope {
 	assertManagedDirectoryRoot(root);
 	managedDirectoryIdentityForScope(scope);
 	assertRetainedManagedDirectoryIdentity(scope);
+	const readIdentities = readManagedGcScopeIdentities.get(scope);
+	if (readIdentities) {
+		for (const expected of [readIdentities.configuredRoot, readIdentities.profile, readIdentities.sessions]) {
+			const current = fs.lstatSync(expected.path, { bigint: true });
+			if (
+				!current.isDirectory() ||
+				current.isSymbolicLink() ||
+				current.dev !== expected.dev ||
+				current.ino !== expected.ino
+			)
+				throw new Error("managed_gc_scope_authority_mismatch");
+		}
+		for (const pathname of [
+			readIdentities.configuredRoot.path,
+			readIdentities.profile.path,
+			readIdentities.sessions.path,
+		]) {
+			const verified = validateNativeSecurityResult(
+				verifyExistingManagedScopeDirectory(pathname),
+				"verify",
+				"directory",
+			);
+			if (!verified.ok) throw new Error("managed_gc_scope_authority_mismatch");
+		}
+	}
 	return {
 		root,
 		retainedAuthority: managedDirectoryAuthorities.get(scope),
@@ -2454,10 +2553,10 @@ function readManagedGcSessionRetirementReceiptUnlocked(
 	transcriptPathValue: string,
 	trusted: ManagedGcTrustedScope,
 	store: ManagedSessionDescendantStore,
-	lock: ManagedStorageLock,
+	lock?: ManagedStorageLock,
 ): ManagedGcSessionRetirementReceipt | undefined {
 	const transcriptPath = validateManagedGcTranscriptPath(scope, transcriptPathValue);
-	lock.assertOwned();
+	lock?.assertOwned();
 	store.assertBound();
 	const prepared = readManagedGcPreparedAuthority(scope, transcriptPath, trusted.ownerContext, store);
 	if (!prepared) {
@@ -2632,6 +2731,146 @@ export async function readManagedGcSessionRetirementReceipt(
 	return withManagedGcRetirementJournal(scope, transcriptPath, (trusted, store, lock) =>
 		readManagedGcSessionRetirementReceiptUnlocked(scope, transcriptPath, trusted, store, lock),
 	);
+}
+
+/** Read an authenticated journal without creating lock/receipt directories or repairing security state. */
+export async function readManagedGcSessionRetirementReceiptReadOnly(
+	scope: ManagedScope,
+	transcriptPath: string,
+): Promise<ManagedGcSessionRetirementReceipt | undefined> {
+	const trusted = managedGcTrustedScope(scope);
+	validateManagedGcTranscriptPath(scope, transcriptPath);
+	const store = managedGcScopeStore(scope, trusted);
+	try {
+		store.verifyRootSecurity();
+		store.assertBound();
+		try {
+			store.captureDirectoryIdentity(MANAGED_GC_RETIREMENT_RECEIPTS);
+		} catch (error) {
+			if (hasFsCode(error, "ENOENT")) return undefined;
+			throw error;
+		}
+		return readManagedGcSessionRetirementReceiptUnlocked(scope, transcriptPath, trusted, store);
+	} finally {
+		store.close();
+	}
+}
+
+/** Discover complete owner journals under authenticated existing v2 scopes without initializing storage. */
+export async function discoverManagedGcSessionRetirementReceipts(input: {
+	agentDir: string;
+	sessionsRoot: string;
+}): Promise<readonly { readonly scope: ManagedScope; readonly receipt: ManagedGcSessionRetirementReceipt }[]> {
+	const agentDir = canonicalizeTrustedPath(input.agentDir);
+	const sessionsRoot = canonicalizeTrustedPath(input.sessionsRoot);
+	const profileStat = fs.lstatSync(agentDir, { bigint: true });
+	const rootStat = fs.lstatSync(sessionsRoot, { bigint: true });
+	for (const [pathname, stat] of [
+		[agentDir, profileStat],
+		[sessionsRoot, rootStat],
+	] as const) {
+		if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("managed_gc_scope_authority_mismatch");
+		const verified = validateNativeSecurityResult(
+			verifyExistingManagedScopeDirectory(pathname),
+			"verify",
+			"directory",
+		);
+		if (!verified.ok) throw new Error("managed_gc_scope_authority_mismatch");
+	}
+	const inventoryBefore = {
+		dev: rootStat.dev,
+		ino: rootStat.ino,
+		profileDev: profileStat.dev,
+		profileIno: profileStat.ino,
+	};
+	const entries = fs.readdirSync(sessionsRoot, { withFileTypes: true });
+	const result: Array<{ readonly scope: ManagedScope; readonly receipt: ManagedGcSessionRetirementReceipt }> = [];
+	for (const entry of entries) {
+		if (!/^v2-[a-z2-7]{52}$/u.test(entry.name)) continue;
+		if (!entry.isDirectory() || entry.isSymbolicLink()) throw new Error("managed_gc_scope_authority_mismatch");
+		const scopePath = path.join(sessionsRoot, entry.name);
+		const bindingPath = path.join(scopePath, MANAGED_SESSION_BINDING_FILE);
+		const bindingBytes = captureManagedFileNoFollow(bindingPath).bytes;
+		let bindingValue: unknown;
+		try {
+			bindingValue = JSON.parse(bindingBytes.toString("utf8"));
+		} catch {
+			throw new Error("managed_gc_scope_authority_mismatch");
+		}
+		if (!isBinding(bindingValue) || bindingValue.identityDigest !== entry.name.slice(3))
+			throw new Error("managed_gc_scope_authority_mismatch");
+		const resolved = resolveManagedGcScopeForRead({ cwd: bindingValue.canonicalPath, agentDir, sessionsRoot });
+		if (resolved.kind !== "resolved" || resolved.scope.directoryPath !== scopePath)
+			throw new Error("managed_gc_scope_authority_mismatch");
+		const scope = resolved.scope;
+		const trusted = managedGcTrustedScope(scope);
+		const store = managedGcScopeStore(scope, trusted);
+		try {
+			let directoryIdentity: { dev: string; ino: string };
+			try {
+				directoryIdentity = store.captureDirectoryIdentity(MANAGED_GC_RETIREMENT_RECEIPTS);
+			} catch (error) {
+				if (hasFsCode(error, "ENOENT")) continue;
+				throw error;
+			}
+			const receiptDir = path.join(scopePath, MANAGED_GC_RETIREMENT_RECEIPTS);
+			const receiptEntries = fs.readdirSync(receiptDir, { withFileTypes: true });
+			const after = store.captureDirectoryIdentity(MANAGED_GC_RETIREMENT_RECEIPTS);
+			if (after.dev !== directoryIdentity.dev || after.ino !== directoryIdentity.ino)
+				throw new Error("task_artifact_owner_continuation_authority_mismatch");
+			const names = receiptEntries.filter(item => item.name.startsWith(MANAGED_GC_RETIREMENT_PREFIX));
+			const groups = new Map<string, string[]>();
+			for (const item of names) {
+				if (
+					!item.isFile() ||
+					item.isSymbolicLink() ||
+					!/^gc-retirement-[a-f0-9]{64}-(?:prepared|artifacts_removed|owner_retired|owner_pending-[0-9]{8,})\.json$/u.test(
+						item.name,
+					)
+				)
+					throw new Error("task_artifact_owner_continuation_corrupt");
+				const key = item.name.slice(MANAGED_GC_RETIREMENT_PREFIX.length, MANAGED_GC_RETIREMENT_PREFIX.length + 64);
+				groups.set(key, [...(groups.get(key) ?? []), item.name]);
+			}
+			for (const [key, group] of groups) {
+				const preparedName = `${MANAGED_GC_RETIREMENT_PREFIX}${key}-prepared.json`;
+				if (!group.includes(preparedName)) throw new Error("task_artifact_owner_continuation_state_missing");
+				const preparedFile = store.readExpected(`${MANAGED_GC_RETIREMENT_RECEIPTS}/${preparedName}`);
+				if (!preparedFile) throw new Error("task_artifact_owner_continuation_state_missing");
+				let preparedValue: unknown;
+				try {
+					preparedValue = JSON.parse(preparedFile.bytes.toString("utf8"));
+				} catch {
+					throw new Error("task_artifact_owner_continuation_corrupt");
+				}
+				const transcriptPath =
+					preparedValue && typeof preparedValue === "object"
+						? (preparedValue as Record<string, unknown>).transcriptPath
+						: undefined;
+				if (typeof transcriptPath !== "string" || managedGcRetirementTranscriptKey(transcriptPath) !== key)
+					throw new Error("task_artifact_owner_continuation_authority_mismatch");
+				const receipt = await readManagedGcSessionRetirementReceiptReadOnly(scope, transcriptPath);
+				if (!receipt) throw new Error("task_artifact_owner_continuation_state_missing");
+				result.push({ scope, receipt });
+			}
+		} finally {
+			store.close();
+		}
+	}
+	const rootAfter = fs.lstatSync(sessionsRoot, { bigint: true });
+	const profileAfter = fs.lstatSync(agentDir, { bigint: true });
+	if (
+		!rootAfter.isDirectory() ||
+		rootAfter.isSymbolicLink() ||
+		rootAfter.dev !== inventoryBefore.dev ||
+		rootAfter.ino !== inventoryBefore.ino ||
+		!profileAfter.isDirectory() ||
+		profileAfter.isSymbolicLink() ||
+		profileAfter.dev !== inventoryBefore.profileDev ||
+		profileAfter.ino !== inventoryBefore.profileIno
+	)
+		throw new Error("managed_gc_scope_authority_mismatch");
+	return result.sort((left, right) => left.receipt.transcriptPath.localeCompare(right.receipt.transcriptPath));
 }
 
 function managedGcReceiptForPublication(
