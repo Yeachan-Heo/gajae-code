@@ -136,6 +136,15 @@ pub fn endpoint_path(state_root: &Path, session_id: &str) -> PathBuf {
 /// Propagates filesystem errors (permissions, disk, etc.).
 pub fn write_endpoint(state_root: &Path, record: &EndpointRecord) -> std::io::Result<PathBuf> {
 	let dir = endpoint_dir(state_root);
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::DirBuilderExt;
+		fs::DirBuilder::new()
+			.recursive(true)
+			.mode(0o700)
+			.create(&dir)?;
+	}
+	#[cfg(not(unix))]
 	fs::create_dir_all(&dir)?;
 	harden_dir(&dir)?;
 
@@ -369,6 +378,20 @@ mod tests {
 		let raw = fs::read_to_string(&path).unwrap();
 		assert!(raw.contains("secret-token"));
 		fs::remove_dir_all(&root).ok();
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn newly_created_endpoint_parents_are_private() {
+		use std::os::unix::fs::PermissionsExt;
+		let root = temp_root();
+		let state_root = root.join(".gjc").join("state");
+		let rec = EndpointRecord::new("sess-1", "127.0.0.1", 5555, "tok");
+		write_endpoint(&state_root, &rec).unwrap();
+		for dir in [root.join(".gjc"), state_root.clone(), endpoint_dir(&state_root)] {
+			assert_eq!(fs::metadata(dir).unwrap().permissions().mode() & 0o777, 0o700);
+		}
+		fs::remove_dir_all(root).unwrap();
 	}
 
 	#[cfg(unix)]

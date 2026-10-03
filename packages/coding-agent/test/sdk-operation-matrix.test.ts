@@ -166,7 +166,7 @@ describe("SDK operation matrix", () => {
 	});
 
 	it("keeps control errors, query continuity, counts, and the stage-05 adapter partition explicit", () => {
-		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(53);
+		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(57);
 		expect(OPERATIONS.filter(operation => operation.kind === "global")).toHaveLength(10);
 		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(30);
 		expect(OPERATIONS.filter(operation => operation.kind === "reverse")).toHaveLength(6);

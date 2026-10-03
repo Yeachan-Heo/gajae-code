@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as path from "node:path";
 import {
 	type Agent,
@@ -36,7 +36,7 @@ import {
 	type SetSessionModeRequest,
 	type SetSessionModeResponse,
 } from "@agentclientprotocol/sdk";
-import { getAgentDir, logger, resolveEquivalentPath } from "@gajae-code/utils";
+import { getAgentDir, logger, resolveEquivalentPath, SUPPORTED_IMAGE_MIME_TYPES } from "@gajae-code/utils";
 import packageJson from "../../../package.json" with { type: "json" };
 import {
 	ACP_SESSION_RECONNECT,
@@ -65,10 +65,17 @@ import type {
 	SdkPromptFailurePhase,
 	SdkPromptTerminalOutcome,
 } from "../../sdk/prompt-status";
-import { PromptActivity, type PromptWatchdogClock, systemPromptWatchdogClock } from "../../sdk/prompt-watchdog";
+import {
+	ACP_PROMPT_INACTIVITY_TIMEOUT_MS,
+	PromptActivity,
+	type PromptWatchdogClock,
+	systemPromptWatchdogClock,
+} from "../../sdk/prompt-watchdog";
 import { validateRequiredPromptText } from "../../sdk/protocol/adapter-validation";
 import { type SessionAttachment, SessionRouter, type SessionRouterFrame } from "../../sdk/router";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../../sdk/session-list";
+import { MAX_IMAGE_INPUT_BYTES } from "../../utils/image-loading";
+import { MAX_PASTED_IMAGE_SOURCE_BYTES } from "../../utils/pasted-image-loading";
 import { resolveAcpAbortScope } from "./abort-scope";
 import {
 	type AgentSessionEvent,
@@ -109,6 +116,10 @@ const CANCEL_SETTLEMENT_GRACE_MS = 5_000;
  * an oversize frame, so an over-limit prompt must be refused before it is sent.
  */
 const MAX_PROMPT_FRAME_BYTES = 256 * 1024;
+const IMAGE_UPLOAD_CHUNK_BYTES = 96 * 1024;
+const MAX_PROMPT_IMAGES = 16;
+const INVALID_IMAGE_BASE64_CHARACTER = /[^A-Za-z0-9+/]/;
+const CANONICAL_TWO_BYTE_TAIL = "AEIMQUYcgkosw048";
 /**
  * `SdkClient` wraps every control request as `{type,operation,input,id}` with a UUID
  * `id` before it reaches the socket, so the prompt must be measured inside that
@@ -172,12 +183,18 @@ const ACP_MODEL_SETTLEMENT_TIMEOUT_MS = 500;
 
 type JsonObject = Record<string, unknown>;
 interface PromptWaiter {
+	/** Stops pre-dispatch image work on cancellation, settlement, or attachment loss. */
+	uploadAbort: AbortController;
+	/** User echo in flight; cancellation fences successor publication until it completes. */
+	echoPublication?: Promise<void>;
 	acknowledged: boolean;
 	invocationKind: "prompt" | "skill";
 	/** ACP-owned identity, never inherited from caller metadata or reused for replay. */
 	clientRef: string;
-	/** True once turn.prompt / skill.invoke has been sent; cancel must not fake-settle after this. */
+	/** True after turn.prompt's synchronous socket send returns (or skill.invoke dispatch); host abort owns cancellation thereafter. */
 	dispatched: boolean;
+	/** While socket.send is synchronous and unresolved, cancellation must wait for its send/throw disposition. */
+	dispatchPending?: Promise<void>;
 	/** True only while the dispatched control request can still reveal its correlation. */
 	acknowledgementPending: boolean;
 
@@ -305,6 +322,8 @@ type SessionRecord = {
 	uncertainAbortOwner?: UncertainAbortOwner;
 	/** Set by `session/cancel` so an in-flight prompt settles as `cancelled`, never as an error. */
 	cancelRequested?: boolean;
+	/** A cancelled user echo must finish publication before a successor publishes its message. */
+	cancelledEchoTail?: Promise<void>;
 	/** True once the session's first logical prompt has settled; gates first-turn readiness retries. */
 	firstPromptDone?: boolean;
 	/** Whether the current prompt attempt was observed doing work; reset per attempt, read by the first-turn retry gate. */
@@ -2336,28 +2355,42 @@ export class AcpAgent implements Agent {
 		if (record.pendingPromptAdmission)
 			throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
 		const activePrompt = record.activePrompt;
-		if (activePrompt) {
-			const cancellationPending =
-				record.cancelRequested ||
+		const cancellationPending =
+			activePrompt !== undefined &&
+			(record.cancelRequested ||
 				activePrompt.cancelAttempt !== undefined ||
-				activePrompt.cancelAcknowledged === true;
-			if (!cancellationPending || record.pendingPromptAdmission)
-				throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
+				activePrompt.cancelAcknowledged === true);
+		if (activePrompt && !cancellationPending)
+			throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
+		if (cancellationPending || record.cancelledEchoTail) {
 			const { promise: woken, resolve: wake } = Promise.withResolvers<void>();
 			admissionReservation = { wake, woken };
 			record.pendingPromptAdmission = admissionReservation;
 		}
+		const admissionCancelled = (): boolean => {
+			const settlement = admissionReservation?.settlement;
+			if (settlement?.kind === "rejected") throw settlement.error;
+			return settlement?.kind === "cancelled" || admissionReservation?.cancelled === true;
+		};
 		try {
 			if (admissionReservation) {
-				const settled = await this.#waitForPromptSettlement(activePrompt as PromptWaiter, admissionReservation);
-				const settlement = admissionReservation.settlement;
-				if (settlement?.kind === "rejected") throw settlement.error;
-				if (settlement?.kind === "cancelled" || admissionReservation.cancelled) return { stopReason: "cancelled" };
-				if (!settled) throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
-				await this.#drainPromptPublicationTails(params.sessionId);
-				if (admissionReservation.settlement?.kind === "rejected") throw admissionReservation.settlement.error;
-				if (admissionReservation.settlement?.kind === "cancelled" || admissionReservation.cancelled)
-					return { stopReason: "cancelled" };
+				if (activePrompt) {
+					const settled = await this.#waitForPromptSettlement(activePrompt, admissionReservation);
+					if (admissionCancelled()) return { stopReason: "cancelled" };
+					if (!settled) throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
+				}
+				const publicationDrained = await Promise.race([
+					this.#drainPromptPublicationTails(params.sessionId).then(() => true),
+					admissionReservation.woken.then(() => false),
+				]);
+				if (admissionCancelled()) return { stopReason: "cancelled" };
+				if (!publicationDrained)
+					throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
+				const echoTail = record.cancelledEchoTail;
+				if (echoTail) {
+					await Promise.race([echoTail, admissionReservation.woken]);
+					if (admissionCancelled()) return { stopReason: "cancelled" };
+				}
 			}
 			return await this.#submitPromptCore(params, echoUserMessage, retryReservation, admissionReservation);
 		} finally {
@@ -2433,6 +2466,31 @@ export class AcpAgent implements Agent {
 			});
 			if (promptError) throw new AcpSdkAdapterError(promptError.code, promptError.message);
 		}
+		// Check encoded lengths before serializing the complete SDK frame or allocating
+		// decoded buffers. The host applies these same bounds to staged source bytes.
+		if (payload.images.length > MAX_PROMPT_IMAGES)
+			throw new AcpSdkAdapterError("invalid_input", "ACP prompts cannot contain more than 16 images.");
+		let sourceBytes = 0;
+		for (const image of payload.images) {
+			if (!SUPPORTED_IMAGE_MIME_TYPES.has(image.mimeType))
+				throw new AcpSdkAdapterError("invalid_input", "Unsupported ACP image MIME type.");
+			const data = image.data;
+			if (!data || data.length % 4 !== 0)
+				throw new AcpSdkAdapterError("invalid_input", "ACP image data must be canonical base64.");
+			const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+			const byteLength = (data.length / 4) * 3 - padding;
+			if (byteLength <= 0 || byteLength > MAX_IMAGE_INPUT_BYTES)
+				throw new AcpSdkAdapterError("invalid_input", "ACP image exceeds the 20 MiB source limit.");
+			sourceBytes += byteLength;
+			if (sourceBytes > MAX_PASTED_IMAGE_SOURCE_BYTES)
+				throw new AcpSdkAdapterError("invalid_input", "ACP images exceed the 64 MiB source limit.");
+			if (
+				data.search(INVALID_IMAGE_BASE64_CHARACTER) !== (padding ? data.length - padding : -1) ||
+				(padding === 2 && !"AQgw".includes(data.at(-3)!)) ||
+				(padding === 1 && !CANONICAL_TWO_BYTE_TAIL.includes(data.at(-2)!))
+			)
+				throw new AcpSdkAdapterError("invalid_input", "ACP image data must be canonical base64.");
+		}
 		// A new turn starts uncancelled; a stale flag must never settle it as `cancelled`.
 		record.cancelRequested = false;
 		if (isAcpUnavailableSlashCommand(payload.text)) {
@@ -2449,13 +2507,8 @@ export class AcpAgent implements Agent {
 			);
 			return { stopReason: "end_turn" };
 		}
-		// The SDK transport hard-caps a single request frame at 256 KiB and answers an
-		// oversize frame by closing the socket (CloseCode::Size, crates/gjc-sdk/src/server.rs),
-		// which surfaces to the client as an opaque `connection_closed` mid-turn. Reject
-		// the prompt up front with a typed, actionable error instead of losing the session.
-		// Measure the frame the server actually receives, not just the payload: SdkClient
-		// wraps it as {type,operation,input,id} with a UUID id, so a prompt sized just
-		// under the cap would still be killed by CloseCode::Size.
+		// Measure the entire SDK frame, including its UUID envelope. Large image prompts
+		// use host-owned staging; text-only oversize prompts still fail before dispatch.
 		const promptFrameBytes = Buffer.byteLength(
 			JSON.stringify({
 				type: "control_request",
@@ -2465,14 +2518,16 @@ export class AcpAgent implements Agent {
 				// the field even though it is not part of the skill input payload.
 				...(skillInvocation ? { confirm: false } : {}),
 				id: PROMPT_FRAME_ID_PLACEHOLDER,
+				...(record.adapter.connectionId === undefined ? {} : { connectionId: record.adapter.connectionId }),
 			}),
 		);
-		if (promptFrameBytes > MAX_PROMPT_FRAME_BYTES)
+		const stageImages = !skillInvocation && payload.images.length > 0 && promptFrameBytes > MAX_PROMPT_FRAME_BYTES;
+		if (promptFrameBytes > MAX_PROMPT_FRAME_BYTES && !stageImages)
 			throw new AcpSdkAdapterError(
 				"invalid_input",
 				`ACP prompt is ${Math.ceil(promptFrameBytes / 1024)} KiB, over the ${Math.floor(
 					MAX_PROMPT_FRAME_BYTES / 1024,
-				)} KiB transport limit. Attach a smaller or more compressed image.`,
+				)} KiB transport limit.`,
 			);
 		record.publicationGeneration++;
 		// Reset per attempt: a first-turn readiness retry keys on whether THIS attempt was
@@ -2489,6 +2544,7 @@ export class AcpAgent implements Agent {
 		const waiter: PromptWaiter = {
 			invocationKind: skillInvocation ? "skill" : "prompt",
 			clientRef,
+			uploadAbort: new AbortController(),
 			acknowledged: false,
 			dispatched: false,
 			acknowledgementPending: false,
@@ -2509,6 +2565,131 @@ export class AcpAgent implements Agent {
 			settlement,
 			resolve,
 			reject,
+		};
+		const { promise: uploadStopped, resolve: stopUpload } = Promise.withResolvers<void>();
+		waiter.uploadAbort.signal.addEventListener("abort", () => stopUpload(undefined), { once: true });
+		const stagedIds = new Set<string>();
+		const discardImage = async (id: string): Promise<boolean> => {
+			try {
+				await record.adapter.uploadImageDiscard(id);
+				return true;
+			} catch (error) {
+				const code =
+					error instanceof SdkClientError || error instanceof AcpSdkAdapterError ? error.code : "unknown";
+				if (code === "resource_gone") return true;
+				// A failed or uncertain cleanup stays host-owned until its inactivity lease expires
+				// or the connection closes. Preserve evidence without exposing image payloads.
+				logger.warn("acp_image_discard_failed", {
+					sessionId: params.sessionId,
+					code: /^[a-z][a-z0-9_]{0,63}$/.test(code) ? code : "unknown",
+				});
+				return false;
+			}
+		};
+		const discardStaged = async (): Promise<boolean> => {
+			const pending = [...stagedIds].map(id => {
+				stagedIds.delete(id);
+				return discardImage(id);
+			});
+			return (await Promise.all(pending)).every(confirmed => confirmed);
+		};
+		waiter.uploadAbort.signal.addEventListener(
+			"abort",
+			() => {
+				void discardStaged();
+			},
+			{ once: true },
+		);
+		// A request already on the wire cannot be cancelled. Fence each subsequent step
+		// and discard a late begin response instead of leaking its host lease.
+		const whileActive = async <T>(task: Promise<T>): Promise<T> => {
+			const value = await Promise.race([task, settlement, uploadStopped]);
+			if (promptWaiterRetired(record, waiter) || waiter.uploadAbort.signal.aborted)
+				throw new AcpSdkAdapterError("prompt_cancelled", "ACP prompt stopped before image dispatch.");
+			return value as T;
+		};
+		const observeUploadProgress = (): void => {
+			waiter.lastFrameAt = this.#promptWatchdogClock.now();
+			waiter.lastFrameType = "image_upload_progress";
+			this.#armPromptWatchdog(params.sessionId, record, waiter);
+		};
+		const stagePromptImages = async (): Promise<void> => {
+			for (const image of payload.images) {
+				const bytes = Buffer.from(image.data, "base64");
+				if (bytes.toString("base64") !== image.data)
+					throw new AcpSdkAdapterError("invalid_input", "ACP image data must be canonical base64.");
+				const sha256 = createHash("sha256").update(bytes).digest("hex");
+				const begin = record.adapter.uploadImageBegin({
+					mimeType: image.mimeType,
+					byteLength: bytes.length,
+					sha256,
+					batchId: clientRef,
+				});
+				void begin.then(
+					result => {
+						const id = result?.id;
+						if (
+							typeof id === "string" &&
+							id &&
+							(promptWaiterRetired(record, waiter) || waiter.uploadAbort.signal.aborted)
+						)
+							void discardImage(id);
+					},
+					() => undefined,
+				);
+				const { id, nextSequence } = await whileActive(begin);
+				if (typeof id === "string" && id) stagedIds.add(id);
+				if (typeof id !== "string" || !id || nextSequence !== 0)
+					throw new AcpSdkAdapterError(
+						"invalid_prompt_acknowledgement",
+						"SDK image begin acknowledgement is invalid.",
+					);
+				observeUploadProgress();
+				let sequence = 0;
+				for (let offset = 0; offset < bytes.length; offset += IMAGE_UPLOAD_CHUNK_BYTES) {
+					const chunk = bytes.subarray(offset, offset + IMAGE_UPLOAD_CHUNK_BYTES);
+					const appended = await whileActive(
+						record.adapter.uploadImageAppend({ id, sequence, data: chunk.toString("base64") }),
+					);
+					if (
+						appended?.id !== id ||
+						appended.nextSequence !== ++sequence ||
+						appended.receivedBytes !== offset + chunk.length
+					)
+						throw new AcpSdkAdapterError(
+							"invalid_prompt_acknowledgement",
+							"SDK image append acknowledgement is invalid.",
+						);
+					observeUploadProgress();
+				}
+				const finished = await whileActive(record.adapter.uploadImageFinish(id));
+				if (
+					finished?.id !== id ||
+					finished.byteLength !== bytes.length ||
+					finished.sha256 !== sha256 ||
+					finished.mimeType !== image.mimeType
+				)
+					throw new AcpSdkAdapterError(
+						"invalid_prompt_acknowledgement",
+						"SDK image finish acknowledgement is invalid.",
+					);
+				observeUploadProgress();
+			}
+			const stagedFrameBytes = Buffer.byteLength(
+				JSON.stringify({
+					type: "control_request",
+					operation: "turn.prompt",
+					id: PROMPT_FRAME_ID_PLACEHOLDER,
+					input: {
+						text: payload.text,
+						stagedImages: [...stagedIds].map(id => ({ id })),
+						clientRef,
+					},
+					...(record.adapter.connectionId === undefined ? {} : { connectionId: record.adapter.connectionId }),
+				}),
+			);
+			if (stagedFrameBytes > MAX_PROMPT_FRAME_BYTES)
+				throw new AcpSdkAdapterError("invalid_input", "ACP prompt text exceeds the SDK transport limit.");
 		};
 		try {
 			record.activePrompt = waiter;
@@ -2575,51 +2756,136 @@ export class AcpAgent implements Agent {
 			// must be published verbatim so attachments are visible, not just fed to the model.
 			// A first-turn readiness retry (issue #5574) skips the echo: the message was already
 			// published on the first attempt and re-echoing would duplicate it in the transcript.
-			if (echoUserMessage)
-				for (const block of params.prompt) {
-					if (block.type !== "text" && block.type !== "image") continue;
-					if (block.type === "text" && block.text.length === 0) continue;
-					await this.#publishSessionUpdate(
-						params.sessionId,
-						{
-							sessionId: params.sessionId,
-							update: { sessionUpdate: "user_message_chunk", content: block },
-						},
-						record.adapter,
-					);
+			let echoPending = false;
+			let echoTask: Promise<void> | undefined;
+			try {
+				// Upload validation and final envelope bounds must pass before any transcript echo.
+				if (stageImages) await stagePromptImages();
+				if (echoUserMessage)
+					for (const block of params.prompt) {
+						if (block.type !== "text" && block.type !== "image") continue;
+						if (block.type === "text" && block.text.length === 0) continue;
+						echoPending = true;
+						echoTask = this.#publishSessionUpdate(
+							params.sessionId,
+							{
+								sessionId: params.sessionId,
+								update: { sessionUpdate: "user_message_chunk", content: block },
+							},
+							record.adapter,
+						);
+						waiter.echoPublication = echoTask;
+						await whileActive(echoTask);
+						echoPending = false;
+						echoTask = undefined;
+						waiter.echoPublication = undefined;
+					}
+			} catch (error) {
+				waiter.uploadAbort.abort();
+				discardStaged();
+				if (waiter.settled || record.activePrompt !== waiter) {
+					if (echoPending && !waiter.cancelAcknowledged && this.#sessions.get(params.sessionId) === record)
+						void this.#failSession(
+							params.sessionId,
+							record.adapter,
+							new AcpSdkAdapterError(
+								"connection_closed",
+								"ACP user-message publication did not complete before settlement.",
+							),
+						);
+					return await response;
 				}
+				if (waiter.cancelAttempt && (await waiter.cancelAttempt)) {
+					await this.#settleCancelledPrompt(params.sessionId, record, waiter);
+					if (echoPending)
+						void this.#failSession(
+							params.sessionId,
+							record.adapter,
+							new AcpSdkAdapterError(
+								"connection_closed",
+								"ACP user-message publication did not complete before cancellation.",
+							),
+						);
+					return await response;
+				}
+
+				record.activePrompt = undefined;
+				record.busy = record.backgroundBusy;
+				clearPromptWatchdog(waiter);
+				waiter.settled = true;
+				void this.#publishPromptPhaseIdle(params.sessionId, record.adapter);
+				throw error;
+			}
 			if (waiter.settled || record.activePrompt !== waiter) {
+				discardStaged();
 				return await response;
 			}
 			if (record.cancelRequested && (waiter.cancelAcknowledged || waiter.cancelBeforeAdmission)) {
+				discardStaged();
 				await this.#settleCancelledPrompt(params.sessionId, record, waiter);
 				return await response;
 			}
-			waiter.dispatched = true;
+			if (skillInvocation) {
+				waiter.dispatched = true;
+				if (retryReservation) retryReservation.admitted = true;
+			}
 			record.sdkIdle = false;
-			// The turn is now dispatched to the host: this prompt owned the session's first turn,
-			// so it — not a preflight rejection that threw before this point — is what settles
-			// `firstPromptDone` in `prompt()` (review P2).
-			if (retryReservation) retryReservation.admitted = true;
 
 			waiter.acknowledgementPending = true;
 			const promptAdapter = record.adapter;
+			let finishDispatch: (() => void) | undefined;
 			const acknowledgementTask = (async (): Promise<PromptResponse> => {
 				if (waiter.settled || record.activePrompt !== waiter) return await response;
 				const submit = async (): Promise<unknown> =>
 					skillInvocation
 						? await promptAdapter.control("skill.invoke", { ...skillInvocation, clientRef })
-						: await promptAdapter.prompt({
-								text: payload.text,
-								clientRef,
-								...(payload.images.length ? { images: payload.images } : {}),
-							});
+						: await promptAdapter.prompt(
+								{
+									text: payload.text,
+									clientRef,
+									...(stageImages
+										? { stagedImages: [...stagedIds].map(id => ({ id })) }
+										: payload.images.length
+											? { images: payload.images }
+											: {}),
+								},
+								context => {
+									if (promptWaiterRetired(record, waiter) || waiter.uploadAbort.signal.aborted)
+										throw new AcpSdkAdapterError(
+											"prompt_cancelled",
+											"ACP prompt stopped before image dispatch.",
+										);
+									if (Buffer.byteLength(JSON.stringify(context.frame)) > MAX_PROMPT_FRAME_BYTES)
+										throw new AcpSdkAdapterError(
+											"invalid_input",
+											"ACP prompt exceeds the SDK transport limit.",
+										);
+									const pending = Promise.withResolvers<void>();
+									waiter.dispatchPending = pending.promise;
+									finishDispatch = () => {
+										if (waiter.dispatchPending === pending.promise) waiter.dispatchPending = undefined;
+										pending.resolve();
+									};
+								},
+								() => {
+									waiter.dispatched = true;
+									if (retryReservation) retryReservation.admitted = true;
+									finishDispatch?.();
+								},
+							);
 				let acknowledgement: unknown;
 				try {
 					acknowledgement = await submit();
 				} catch (error) {
 					if (!(error instanceof SdkClientError || error instanceof AcpSdkAdapterError) || error.code !== "busy")
 						throw error;
+					// The rejected attempt owns no host execution. Cancellation while waiting or
+					// restaging must stay local rather than abort an unrelated active run.
+					waiter.dispatched = false;
+					// Capacity rejection can precede one-shot redemption. Retire old references
+					// before restaging; only acknowledged discard/already-gone proves cleanup.
+					if (stageImages && !(await whileActive(discardStaged())))
+						throw new AcpSdkAdapterError("image_cleanup_failed", "Image staging cleanup was not confirmed.");
 					if (
 						record.activePrompt !== waiter ||
 						waiter.settled ||
@@ -2638,6 +2904,7 @@ export class AcpAgent implements Agent {
 						waiter.cancelBeforeAdmission
 					)
 						throw error;
+					if (stageImages) await stagePromptImages();
 					acknowledgement = await submit();
 				}
 				// A recovered waiter already owns its exact identity; a late ack cannot rebind it.
@@ -2649,6 +2916,7 @@ export class AcpAgent implements Agent {
 						"invalid_prompt_acknowledgement",
 						"SDK prompt acknowledgement must accept the prompt and include commandId and turnId.",
 					);
+				stagedIds.clear(); // The host copied and consumed the images before acknowledging.
 				if (
 					this.#sessions.get(params.sessionId) !== record ||
 					record.adapter !== promptAdapter ||
@@ -2870,6 +3138,11 @@ export class AcpAgent implements Agent {
 				return await response;
 			})()
 				.catch(async error => {
+					if (error instanceof SdkClientError && error.code === "uncertain_after_send") {
+						waiter.dispatched = true;
+						if (retryReservation) retryReservation.admitted = true;
+					}
+					finishDispatch?.();
 					if (
 						!(error instanceof SdkClientError || error instanceof AcpSdkAdapterError) ||
 						error.code !== "uncertain_after_send"
@@ -2880,6 +3153,8 @@ export class AcpAgent implements Agent {
 					return await response;
 				})
 				.finally(() => {
+					finishDispatch?.();
+					discardStaged();
 					waiter.acknowledgementPending = false;
 					this.#releaseRetiredPromptAcknowledgement(params.sessionId, waiter);
 				});
@@ -2935,15 +3210,63 @@ export class AcpAgent implements Agent {
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
 		// Record the client's intent before awaiting the SDK so a prompt that rejects
 		// mid-cancel (e.g. preflight `busy`) can still settle as `cancelled`.
+		const pendingAdmission = record.pendingPromptAdmission;
 		record.cancelRequested = true;
 		this.#settlePendingPromptAdmission(record, { kind: "cancelled" });
+		const waiter = record.activePrompt;
+		if (pendingAdmission && !waiter) {
+			record.cancelRequested = false;
+			return;
+		}
+		waiter?.uploadAbort.abort();
+		// A reentrant cancel inside socket.send cannot decide whether the frame was
+		// accepted until onDispatch or the synchronous send failure is observed.
+		if (waiter?.dispatchPending) await waiter.dispatchPending;
+		// Nothing has reached turn.prompt yet: the upload belongs entirely to this
+		// ACP request, and a host terminal abort could stop an unrelated turn.
+		if (waiter && !waiter.dispatched) {
+			if (waiter.echoPublication) {
+				const { promise: tail, resolve, reject } = Promise.withResolvers<void>();
+				const failEcho = (message: string) => {
+					const error = new AcpSdkAdapterError("connection_closed", message);
+					void this.#failSession(params.sessionId, record.adapter, error);
+					reject(error);
+				};
+				const cancelDeadline = this.#promptWatchdogClock.schedule(
+					() =>
+						failEcho(
+							"ACP cancelled user-message publication did not complete before the prompt inactivity bound.",
+						),
+					ACP_PROMPT_INACTIVITY_TIMEOUT_MS,
+				);
+				void waiter.echoPublication.then(
+					() => {
+						cancelDeadline();
+						resolve();
+					},
+					() => {
+						cancelDeadline();
+						failEcho("ACP cancelled user-message publication failed.");
+					},
+				);
+				record.cancelledEchoTail = tail;
+				void tail.catch(() => undefined);
+				void tail
+					.finally(() => {
+						if (record.cancelledEchoTail === tail) record.cancelledEchoTail = undefined;
+					})
+					.catch(() => undefined);
+			}
+			waiter.cancelAcknowledged = true;
+			await this.#settleCancelledPrompt(params.sessionId, record, waiter);
+			return;
+		}
 		// C04 terminal abort: an external client cancel stops the current turn
 		// (`scope:"turn"`, the default, matching the SDK `turn.abort` default and
 		// other ACP clients' cancel behavior). A client that also wants exact owned
 		// subagents and background tasks stopped opts in with
 		// `_meta.gjc.abortScope: "owned"` (or `GJC_ACP_ABORT_SCOPE=owned`).
 		const scope = resolveAcpAbortScope(params._meta, process.env);
-		const waiter = record.activePrompt;
 		const waiterWasUnacknowledged = waiter !== undefined && !waiter.acknowledged;
 		const waiterWasBeforeActivity = waiter !== undefined && !waiter.observedTurnActivity;
 		if (waiter) {
