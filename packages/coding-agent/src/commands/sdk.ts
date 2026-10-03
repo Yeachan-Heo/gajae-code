@@ -653,6 +653,7 @@ export async function runSessionHost(
 	let startupComplete = false;
 	let readinessPublicationCleanupComplete = true;
 	let revokePendingReadinessMarker: (() => Promise<boolean>) | undefined;
+	let revokePublishedReadinessMarker: (() => Promise<boolean>) | undefined;
 	let readinessRevocation: Promise<boolean> | undefined;
 	let startupInterruption: SdkStartupFailure | undefined;
 	const interrupted = Promise.withResolvers<SdkStartupFailure>();
@@ -1270,6 +1271,15 @@ export async function runSessionHost(
 	const exitAfterSessionDisposal = async (reason?: "detached_idle"): Promise<void> => {
 		await disposeSession(reason);
 		let failure: SdkStartupFailure | undefined;
+		if (revokePublishedReadinessMarker) {
+			const revoked = await revokePublishedReadinessMarker();
+			if (!revoked)
+				failure = {
+					phase: "startup",
+					reason: "failed",
+					message: `SDK host readiness marker cleanup could not be verified: ${request.sessionId}`,
+				};
+		}
 		try {
 			const endpoint = JSON.parse(await fs.readFile(sessionEndpointPath, "utf8")) as {
 				pid?: unknown;
@@ -1356,6 +1366,7 @@ export async function runSessionHost(
 						effectMarker,
 						() => startupInterruption === undefined && now() < request.semanticReadyDeadlineAt,
 						revoke => {
+							revokePublishedReadinessMarker = revoke;
 							revokePendingReadinessMarker = revoke;
 							if (startupInterruption !== undefined) startReadinessRevocation(revoke);
 							else if (now() >= request.semanticReadyDeadlineAt) {
