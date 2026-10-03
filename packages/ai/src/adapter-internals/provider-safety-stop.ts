@@ -106,6 +106,10 @@ const STRUCTURED_REFUSAL_SIGNALS: ReadonlySet<string> = new Set([
 	"MODEL_ARMOR",
 	// google-generative-ai: promptFeedback.blockReason
 	"JAILBREAK",
+	// kiro-codewhisperer: stop_details.refusal.category
+	"CYBER",
+	"VIOLENCE",
+	"ILLEGAL",
 ]);
 
 /**
