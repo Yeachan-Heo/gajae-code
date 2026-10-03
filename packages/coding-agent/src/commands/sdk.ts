@@ -1287,7 +1287,7 @@ export async function runSessionHost(
 				};
 			}
 		}
-		if (ownsEndpoint && revokePublishedReadinessMarker) {
+		if (!ownsEndpoint && !failure && revokePublishedReadinessMarker) {
 			const revoked = await revokePublishedReadinessMarker();
 			if (!revoked)
 				failure = {
