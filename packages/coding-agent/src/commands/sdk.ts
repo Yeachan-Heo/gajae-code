@@ -4,7 +4,13 @@ import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { exactRemoveDirectoryTree, type NativeDirectoryTreeSnapshot, snapshotDirectoryTree } from "@gajae-code/natives";
+import {
+	exactRemoveDirectoryTree,
+	exactUnlink,
+	exactUnlinkDirect,
+	type NativeDirectoryTreeSnapshot,
+	snapshotDirectoryTree,
+} from "@gajae-code/natives";
 import { logger, postmortem } from "@gajae-code/utils";
 import { CliParseError, Command } from "@gajae-code/utils/cli";
 import type { Args as ParsedArgs } from "../cli/args";
@@ -24,6 +30,7 @@ import {
 	writeBrokerStartupExitRecordBounded,
 } from "../sdk/broker/broker-exit";
 import { readBrokerDiscovery } from "../sdk/broker/discovery";
+import { readEndpointFile, type EndpointFileRead } from "../sdk/broker/endpoint-authority";
 import {
 	emitBrokerStartupTestSignal,
 	reconcileBrokerGenerationForStartup,
@@ -1268,10 +1275,87 @@ export async function runSessionHost(
 		return failureRollback;
 	};
 	const sessionEndpointPath = path.join(request.stateRoot, "sdk", `${request.sessionId}.json`);
-	const exitAfterSessionDisposal = async (reason?: "detached_idle"): Promise<void> => {
+	const removeOwnedSessionEndpoint = async (): Promise<boolean> => {
+		const endpoint: EndpointFileRead | undefined =
+			(await readEndpointFile(sessionEndpointPath)) ??
+			(await (async () => {
+				let handle: fs.FileHandle | undefined;
+				try {
+					handle = await fs.open(sessionEndpointPath, "r");
+					const before = await handle.stat({ bigint: true });
+					const source = await handle.readFile({ encoding: "utf8" });
+					const after = await handle.stat({ bigint: true });
+					if (
+						!before.isFile() ||
+						before.dev !== after.dev ||
+						before.ino !== after.ino ||
+						before.size !== after.size ||
+						before.mtimeNs !== after.mtimeNs
+					)
+						return undefined;
+					return {
+						source,
+						dev: before.dev,
+						ino: before.ino,
+						nlink: before.nlink,
+						size: before.size,
+						mtimeNs: before.mtimeNs,
+						mtimeMs: Number(before.mtimeNs) / 1_000_000,
+					};
+				} catch {
+					return undefined;
+				} finally {
+					await handle?.close().catch(() => undefined);
+				}
+			})());
+		if (!endpoint) return false;
+		let parsed: { pid?: unknown; sessionId?: unknown };
+		try {
+			parsed = JSON.parse(endpoint.source) as { pid?: unknown; sessionId?: unknown };
+		} catch {
+			return false;
+		}
+		if (parsed.pid !== process.pid || parsed.sessionId !== request.sessionId) {
+			return false;
+		}
+		const removal = (() => {
+			try {
+				return exactUnlinkDirect(sessionEndpointPath, {
+					dev: endpoint.dev,
+					ino: endpoint.ino,
+					size: endpoint.size,
+					mtimeNs: endpoint.mtimeNs,
+					allowHardLink: true,
+				});
+			} catch (error) {
+				logger.warn("SDK host endpoint cleanup failed", { error: String(error) });
+				return undefined;
+			}
+		})();
+		if (!removal) return false;
+		return (
+			removal.ok ||
+			removal.code === "not_found" ||
+			(removal.code === "cleanup_pending" &&
+				removal.payloadDurable === true &&
+				!removal.retainedSuccessorPath &&
+				!removal.retainedUnknownPath)
+		);
+	};
+	let unregisterHostPostmortem: (() => void) | undefined;
+	let sessionDisposalExit: Promise<void> | undefined;
+	const exitAfterSessionDisposal = async (reason?: "detached_idle", exitProcess = true): Promise<void> => {
+		unregisterHostPostmortem?.();
+		unregisterHostPostmortem = undefined;
+		const readinessRevoked = await (revokePublishedReadinessMarker?.() ?? Promise.resolve(true));
 		await disposeSession(reason);
 		let failure: SdkStartupFailure | undefined;
 		let ownsEndpoint = false;
+		let endpointCleanupComplete = await removeOwnedSessionEndpoint();
+		for (let attempt = 0; !endpointCleanupComplete && attempt < 20; attempt += 1) {
+			await Bun.sleep(25);
+			endpointCleanupComplete = await removeOwnedSessionEndpoint();
+		}
 		try {
 			const endpoint = JSON.parse(await fs.readFile(sessionEndpointPath, "utf8")) as {
 				pid?: unknown;
@@ -1285,18 +1369,17 @@ export async function runSessionHost(
 					reason: "failed",
 					message: `SDK host endpoint cleanup could not be verified: ${request.sessionId}`,
 				};
-			}
+			} else endpointCleanupComplete = true;
 		}
-		if (!ownsEndpoint && !failure && revokePublishedReadinessMarker) {
-			const revoked = await revokePublishedReadinessMarker();
-			if (!revoked)
+		if (!ownsEndpoint && !failure && !readinessRevoked && revokePublishedReadinessMarker) {
+			if (!readinessRevoked)
 				failure = {
 					phase: "startup",
 					reason: "failed",
 					message: `SDK host readiness marker cleanup could not be verified: ${request.sessionId}`,
 				};
 		}
-		if (ownsEndpoint && !failure)
+		if (ownsEndpoint && !endpointCleanupComplete && !failure)
 			failure = {
 				phase: "startup",
 				reason: "failed",
@@ -1307,20 +1390,31 @@ export async function runSessionHost(
 			process.stderr.write(`${failure.message}\n`);
 			await writeFailure(failure, rollback.result).catch(() => {});
 		}
-		process.exit(process.exitCode ?? 0);
+		if (exitProcess) process.exit(process.exitCode ?? 0);
 	};
 	let stopping = false;
+	const requestSessionStop = (reason?: "detached_idle", exitProcess = true): Promise<void> => {
+		if (stopping) return sessionDisposalExit ?? Promise.resolve();
+		stopping = true;
+		sessionDisposalExit = exitAfterSessionDisposal(reason, exitProcess);
+		return sessionDisposalExit;
+	};
 	const stop = (reason?: "detached_idle") => {
 		if (startupComplete) {
-			if (stopping) return;
-			stopping = true;
-			void exitAfterSessionDisposal(reason);
+			void requestSessionStop(reason);
 			return;
 		}
 		const failure = capability.normalizeFailure("startup", "failed", "SDK lifecycle host terminated.");
 		interruptStartup(failure);
 	};
 	const onReadySignal = (): void => stop();
+	const registerHostPostmortem = (): void => {
+		if (unregisterHostPostmortem) return;
+		unregisterHostPostmortem = postmortem.register("sdk-session-host:exit", async reason => {
+			if (reason !== postmortem.Reason.SIGTERM && reason !== postmortem.Reason.SIGINT) return;
+			await requestSessionStop(undefined, false);
+		});
+	};
 
 	try {
 		const startupThinkingLevel = request.modelId ? parseModelString(request.modelId)?.thinkingLevel : undefined;
@@ -1377,6 +1471,7 @@ export async function runSessionHost(
 						},
 						() => {
 							readinessPublished = true;
+							registerHostPostmortem();
 						},
 					);
 					return { published: true } as const;
