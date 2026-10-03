@@ -1,8 +1,9 @@
 import { expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-
+import { Broker } from "../src/sdk/broker/broker";
 import * as lifecycle from "../src/sdk/broker/lifecycle";
+import { SessionManager } from "../src/session/session-manager";
 
 test("launch cleanup retires an exited id pair regardless of age or ready marker contents", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-stale-ready-launch-"));
@@ -102,3 +103,61 @@ test("published ready marker exposes revocation for detached host shutdown", asy
 		await fs.rm(root, { recursive: true, force: true });
 	}
 });
+
+test("real session host removes ready and endpoint markers after SIGTERM", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-stale-ready-host-exit-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const broker = new Broker({ agentDir });
+	let hostPid: number | undefined;
+	try {
+		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
+		const source = SessionManager.create(root, SessionManager.managedDestination(root, agentDir));
+		await source.ensureOnDisk();
+		const sessionId = source.getSessionId();
+		const sessionPath = source.getSessionFile();
+		await broker.start();
+		const result = await broker.handleRequest(
+			"session.resume",
+			{ cwd: root, stateRoot, sessionId, sessionPath, readinessTimeoutMs: 20_000 },
+			"stale-ready-host-exit",
+		);
+		expect(result.ok).toBe(true);
+		const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
+		const readyPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.ready.json`);
+		const endpoint = JSON.parse(await fs.readFile(endpointPath, "utf8")) as { pid?: unknown };
+		hostPid = typeof endpoint.pid === "number" ? endpoint.pid : undefined;
+		if (!hostPid) throw new Error("Session endpoint did not publish a host pid.");
+		process.kill(hostPid, "SIGTERM");
+		const exitDeadline = Date.now() + 20_000;
+		let exited = false;
+		while (Date.now() < exitDeadline) {
+			try {
+				process.kill(hostPid, 0);
+			} catch {
+				exited = true;
+				break;
+			}
+			await Bun.sleep(25);
+		}
+		expect(exited).toBe(true);
+		const cleanupDeadline = Date.now() + 5_000;
+		while (Date.now() < cleanupDeadline) {
+			if (!(await Bun.file(readyPath).exists()) && !(await Bun.file(endpointPath).exists())) break;
+			await Bun.sleep(25);
+		}
+		expect(await Bun.file(readyPath).exists()).toBe(false);
+		expect(await Bun.file(endpointPath).exists()).toBe(false);
+		await broker.stop();
+
+		expect(await Bun.file(endpointPath).exists()).toBe(false);
+	} finally {
+		if (hostPid) {
+			try {
+				process.kill(hostPid, "SIGTERM");
+			} catch {}
+		}
+		await broker.stop().catch(() => {});
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 35_000);
