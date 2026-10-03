@@ -12,6 +12,7 @@ import {
 	ACP_PROMPT_INFERENCE_TIMEOUT_MS,
 	ACP_PROMPT_TOOL_ACTIVITY_TIMEOUT_MS,
 } from "../src/sdk/prompt-watchdog";
+import type { SessionAttachment, SessionRouterDeps } from "../src/sdk/router";
 import {
 	type ExactSessionAuthorityFixture,
 	type ExactSessionAuthorityOptions,
@@ -23,6 +24,7 @@ setDefaultTimeout(60_000);
 
 type TestSocket = { send(message: string): void };
 type StoppedReason = "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" | "cancelled";
+type SessionRemovedCallback = NonNullable<SessionRouterDeps["onSessionRemoved"]>;
 
 /**
  * Virtual timer source for the prompt watchdog. Every watchdog assertion moves this
@@ -94,6 +96,7 @@ type Fixture = {
 	sendSessionTerminated(): void;
 	acknowledgeCancel(): void;
 	acknowledgePrompt(): void;
+	removeAttachment(reason?: "removed" | "replaced" | "replaced_same_generation"): Promise<void>;
 	dispose(): void;
 };
 
@@ -158,6 +161,7 @@ function toolCallUpdates(updates: SessionNotification[]): number {
 type FixtureOptions = {
 	agentStartBeforeAcknowledgement?: boolean;
 	deferFirstPromptAcknowledgement?: boolean;
+	sendAgentStartAfterDeferredAcknowledgement?: boolean;
 	cancelSettlementGraceMs?: number;
 	preflightCancelAcknowledgement?: boolean;
 	deferCancelAcknowledgement?: boolean;
@@ -177,6 +181,7 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 	let turnId = "";
 	let promptSocket: TestSocket | undefined;
 	let server!: ReturnType<typeof Bun.serve>;
+	let onSessionRemoved: SessionRemovedCallback | undefined;
 	let deferredPromptAcknowledgement:
 		| { socket: TestSocket; id: unknown; result: { commandId: string; turnId: string; accepted: true } }
 		| undefined;
@@ -198,6 +203,15 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 				result: deferred.result,
 			}),
 		);
+		if (options.sendAgentStartAfterDeferredAcknowledgement)
+			deferred.socket.send(
+				JSON.stringify({
+					type: "agent_start",
+					sessionId,
+					commandId,
+					turnId,
+				}),
+			);
 	};
 	const acknowledgeCancel = (): void => {
 		const deferred = deferredCancelAcknowledgement;
@@ -441,6 +455,11 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 		{
 			agentDir,
 			promptWatchdogClock: clock,
+			routerHooks: {
+				onSessionRemoved: callback => {
+					onSessionRemoved = callback;
+				},
+			},
 			...(options.cancelSettlementGraceMs === undefined
 				? {}
 				: { cancelSettlementGraceMs: options.cancelSettlementGraceMs }),
@@ -466,6 +485,10 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 		sendSessionTerminated,
 		acknowledgeCancel,
 		acknowledgePrompt,
+		removeAttachment: async reason => {
+			if (!onSessionRemoved) throw new Error("Expected the live Router callback");
+			await onSessionRemoved({ sessionId } as SessionAttachment, reason);
+		},
 		dispose: () => {
 			abort.abort();
 			server.stop(true);
@@ -934,6 +957,131 @@ test("a dispatched prompt without acknowledgement enters uncertain recovery afte
 			"uncertain host close recovery",
 		);
 		expect(error).toMatchObject({ code: "terminal_uncertain" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("same-generation attachment replacement preserves an acknowledged prompt", async () => {
+	const fixture = await createFixture();
+	try {
+		const { pending } = await startTurn(fixture);
+		await fixture.removeAttachment("replaced_same_generation");
+		await Bun.sleep(0);
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "same-generation replacement completion")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("same-generation attachment replacement preserves a dispatched unacknowledged prompt", async () => {
+	const fixture = await createFixture({
+		deferFirstPromptAcknowledgement: true,
+		cancelSettlementGraceMs: 25,
+	});
+	try {
+		const pending = prompt(fixture, "same-generation replacement before acknowledgement");
+		await waitFor(
+			() =>
+				fixture.promptDeliveryCount() === 1 &&
+				workingUpdates(fixture.updates) > 0 &&
+				fixture.correlation().commandId.length > 0,
+			"unacknowledged prompt dispatch",
+		);
+		let settled = false;
+		void pending.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+		await fixture.removeAttachment("replaced_same_generation");
+		await Promise.resolve();
+		expect(settled).toBe(false);
+		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "same-generation cancel");
+		expect(await bounded(pending, "same-generation unacknowledged cancellation")).toEqual({
+			stopReason: "cancelled",
+		});
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("real removed callback abandons an acknowledged prompt and publishes idle", async () => {
+	const fixture = await createFixture();
+	try {
+		const { pending } = await startTurn(fixture);
+		const idleBefore = idleUpdates(fixture.updates);
+		await fixture.removeAttachment("removed");
+		await expect(bounded(pending, "removed attachment settlement")).rejects.toMatchObject({
+			code: "prompt_abandoned",
+		});
+		await waitFor(() => idleUpdates(fixture.updates) > idleBefore, "removed attachment idle phase");
+		expect(latestPhase(fixture.updates)).toMatchObject({ phase: "idle", running: false });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("real replacement and router-stop callbacks abandon an acknowledged prompt", async () => {
+	for (const reason of ["replaced", undefined] as const) {
+		const fixture = await createFixture();
+		try {
+			const { pending } = await startTurn(fixture);
+			await fixture.removeAttachment(reason);
+			await expect(bounded(pending, `${reason ?? "undefined"} attachment settlement`)).rejects.toMatchObject({
+				code: "prompt_abandoned",
+			});
+		} finally {
+			fixture.dispose();
+		}
+	}
+});
+
+test("same-generation replacement keeps acknowledged cancellation owned by cancel", async () => {
+	const fixture = await createFixture({ cancelSettlementGraceMs: 25 });
+	try {
+		const { pending } = await startTurn(fixture);
+		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel acknowledgement");
+		await fixture.removeAttachment("replaced_same_generation");
+		expect(await bounded(pending, "same-generation cancelled settlement")).toEqual({ stopReason: "cancelled" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("removed callback settles acknowledged cancellation as cancelled", async () => {
+	const fixture = await createFixture({ cancelSettlementGraceMs: 25 });
+	try {
+		const { pending } = await startTurn(fixture);
+		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel acknowledgement");
+		await fixture.removeAttachment("removed");
+		expect(await bounded(pending, "removed cancelled settlement")).toEqual({ stopReason: "cancelled" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("late terminal and watchdog timer after removal settle exactly once", async () => {
+	const fixture = await createFixture();
+	try {
+		const { pending } = await startTurn(fixture);
+		const idleBefore = idleUpdates(fixture.updates);
+		await fixture.removeAttachment("removed");
+		await expect(bounded(pending, "host removal settlement")).rejects.toMatchObject({
+			code: "prompt_abandoned",
+		});
+		await waitFor(() => idleUpdates(fixture.updates) > idleBefore, "host removal idle phase");
+		const updatesAfterSettlement = fixture.updates.length;
+		fixture.sendStopped("end_turn");
+		fixture.clock.advance(ACP_PROMPT_INFERENCE_TIMEOUT_MS * 2);
+		await Bun.sleep(0);
+		expect(fixture.clock.pending).toBe(0);
+		expect(fixture.updates.length).toBe(updatesAfterSettlement);
+		expect(latestPhase(fixture.updates)).toMatchObject({ phase: "idle", running: false });
 	} finally {
 		fixture.dispose();
 	}

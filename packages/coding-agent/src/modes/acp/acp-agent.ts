@@ -67,7 +67,12 @@ import type {
 } from "../../sdk/prompt-status";
 import { PromptActivity, type PromptWatchdogClock, systemPromptWatchdogClock } from "../../sdk/prompt-watchdog";
 import { validateRequiredPromptText } from "../../sdk/protocol/adapter-validation";
-import { type SessionAttachment, SessionRouter, type SessionRouterFrame } from "../../sdk/router";
+import {
+	type SessionAttachment,
+	SessionRouter,
+	type SessionRouterDeps,
+	type SessionRouterFrame,
+} from "../../sdk/router";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../../sdk/session-list";
 import { resolveAcpAbortScope } from "./abort-scope";
 import {
@@ -171,6 +176,16 @@ const ACP_BUSY_SETTLE_WAIT_MS = 5_000;
 const ACP_MODEL_SETTLEMENT_TIMEOUT_MS = 500;
 
 type JsonObject = Record<string, unknown>;
+type AcpAgentRouterHooks = {
+	onSessionRemoved?: (callback: NonNullable<SessionRouterDeps["onSessionRemoved"]>) => void;
+};
+type AcpAgentOptions = {
+	agentDir?: string;
+	startupOptions?: AcpStartupOptions;
+	cancelSettlementGraceMs?: number;
+	promptWatchdogClock?: PromptWatchdogClock;
+	routerHooks?: AcpAgentRouterHooks;
+};
 interface PromptWaiter {
 	acknowledged: boolean;
 	invocationKind: "prompt" | "skill";
@@ -1755,20 +1770,21 @@ export class AcpAgent implements Agent {
 	#disposed = false;
 	#disposePromise: Promise<void> | undefined;
 
-	constructor(
-		connection: AgentSideConnection,
-		options?:
-			| {
-					agentDir?: string;
-					startupOptions?: AcpStartupOptions;
-					cancelSettlementGraceMs?: number;
-					promptWatchdogClock?: PromptWatchdogClock;
-			  }
-			| unknown,
-	) {
+	constructor(connection: AgentSideConnection, options?: AcpAgentOptions) {
 		this.#connection = connection;
-		const candidate = object(options);
+		const candidate = options;
 		this.#agentDir = typeof candidate?.agentDir === "string" ? candidate.agentDir : getAgentDir();
+		const onSessionRemoved = (
+			attachment: SessionAttachment,
+			removalReason?: "removed" | "replaced" | "replaced_same_generation",
+		) => {
+			const adapter =
+				this.#sessions.get(attachment.sessionId)?.adapter ?? this.#pendingRouterAdapters.get(attachment.sessionId);
+			adapter?.revokeAttachment(attachment);
+			if (adapter && removalReason !== "replaced_same_generation")
+				this.#settlePromptAfterHostClose(attachment.sessionId, removalReason ?? "host_exit");
+		};
+		candidate?.routerHooks?.onSessionRemoved?.(onSessionRemoved);
 		this.#router = new SessionRouter({
 			agentDir: this.#agentDir,
 			attachFilter: sessionId =>
@@ -1798,14 +1814,7 @@ export class AcpAgent implements Agent {
 					if (adapter) adapter.acceptFrame(acpFrame);
 					else this.#pendingRouterFrames.get(attachment.sessionId)?.push(acpFrame);
 				},
-				onSessionRemoved: (attachment, removalReason) => {
-					const adapter =
-						this.#sessions.get(attachment.sessionId)?.adapter ??
-						this.#pendingRouterAdapters.get(attachment.sessionId);
-					adapter?.revokeAttachment(attachment);
-					if (adapter && removalReason !== "replaced_same_generation")
-						this.#settlePromptAfterHostClose(attachment.sessionId, removalReason ?? "host_exit");
-				},
+				onSessionRemoved,
 			},
 		});
 		this.#startupOptions = parseAcpStartupOptions(candidate?.startupOptions);
