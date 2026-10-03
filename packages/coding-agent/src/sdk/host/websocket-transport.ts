@@ -167,6 +167,9 @@ export async function createSdkWebSocketTransport(
 			if (!socket) throw new Error("SDK connection is no longer available.");
 			socket.send(JSON.stringify(frame));
 		},
+		isConnectionOpen(connectionId) {
+			return sockets.has(connectionId);
+		},
 		start: async () => {
 			if (stopPromise) await stopPromise;
 			if (startPromise) return await startPromise;
