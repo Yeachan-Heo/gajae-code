@@ -2,15 +2,27 @@ import { describe, expect, test } from "bun:test";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
 import { parseArgs } from "../src/cli/args";
-import { activateModelProfile } from "../src/config/model-profile-activation";
+import {
+	activateModelProfile,
+	applyPreparedModelProfileActivation,
+	prepareModelProfileActivation,
+} from "../src/config/model-profile-activation";
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
+import type { ModelSelectorValue } from "../src/config/model-selector-value";
 import { Settings } from "../src/config/settings";
+import type { DefaultFallbackRuntimeState } from "../src/session/agent-session";
 
 const model = (provider: string, id: string): Model =>
 	({ provider, id, name: id, api: "openai-responses", contextWindow: 1000, maxTokens: 1000 }) as Model;
+const fallbackRuntimeState = {
+	chain: {},
+	controller: {},
+	exhaustedLastTurn: false,
+} as DefaultFallbackRuntimeState;
 
 function fakeRegistry(options?: {
 	missingProviders?: string[];
+	usableAuthProviders?: string[];
 	profiles?: ModelProfileDefinition[];
 	models?: Model[];
 }) {
@@ -19,6 +31,7 @@ function fakeRegistry(options?: {
 		profiles.set(profile.name, profile);
 	}
 	const missing = new Set(options?.missingProviders ?? []);
+	const usableAuth = new Set(options?.usableAuthProviders ?? []);
 	const models = options?.models ?? [
 		model("provider-a", "default"),
 		model("provider-a", "alternate"),
@@ -30,6 +43,7 @@ function fakeRegistry(options?: {
 		getModelProfiles: () => new Map(profiles),
 		getAvailableModelProfileNames: () => [...profiles.keys()].sort(),
 		getApiKeyForProvider: async (provider: string) => (missing.has(provider) ? undefined : `key-${provider}`),
+		hasUsableAuthForProvider: (provider: string) => usableAuth.has(provider),
 		getAll: () => models,
 		resolveCanonicalModel: () => undefined,
 		getCanonicalVariants: () => [],
@@ -39,17 +53,118 @@ function fakeRegistry(options?: {
 }
 
 function fakeSession(initial = model("provider-a", "initial")) {
+	let activeModelProfile: string | undefined;
+	let preProfileModel: Model | undefined;
+	const profileInstalledRoles = new Map<string, ModelSelectorValue | undefined>();
+	const profileInstalledAgentOverrides = new Map<string, ModelSelectorValue | undefined>();
+	const installedModelRoles = new Map<string, ModelSelectorValue>();
+	const installedAgentModelOverrides = new Map<string, ModelSelectorValue>();
 	return {
 		model: initial as Model | undefined,
 		thinkingLevel: ThinkingLevel.Low as ThinkingLevel | undefined,
 		sessionId: "session-1",
 		setModelTemporaryCalls: [] as Array<{ model: Model; thinkingLevel?: ThinkingLevel }>,
 		configuredModelChains: new Map<string, readonly string[]>(),
+		setConfiguredModelChainCalls: [] as Array<{ role: string; entries: readonly string[] }>,
+		profileInstalledRoles,
+		profileInstalledAgentOverrides,
+		installedModelRoles,
+		installedAgentModelOverrides,
+		defaultFallbackRuntimeState: fallbackRuntimeState,
+		defaultFallbackRuntimeRestoreCalls: 0,
 		getConfiguredModelChain(role: string) {
 			return this.configuredModelChains.get(role);
 		},
 		setConfiguredModelChain(role: string, entries: readonly string[]) {
+			this.setConfiguredModelChainCalls.push({ role, entries: [...entries] });
 			this.configuredModelChains.set(role, [...entries]);
+		},
+		setActiveModelProfile(name: string | undefined) {
+			activeModelProfile = name;
+		},
+		getActiveModelProfile() {
+			return activeModelProfile;
+		},
+		getProfileInstalledOverrideKeys() {
+			return {
+				modelRoles: [...profileInstalledRoles.keys()],
+				agentModelOverrides: [...profileInstalledAgentOverrides.keys()],
+			};
+		},
+		getProfileInstalledOverrideState() {
+			return {
+				modelRoles: new Map(profileInstalledRoles),
+				agentModelOverrides: new Map(profileInstalledAgentOverrides),
+				installedModelRoles: new Map(installedModelRoles),
+				installedAgentModelOverrides: new Map(installedAgentModelOverrides),
+				preProfileModel,
+			};
+		},
+		restoreProfileInstalledOverrideState(state: {
+			modelRoles: ReadonlyMap<string, ModelSelectorValue | undefined>;
+			agentModelOverrides: ReadonlyMap<string, ModelSelectorValue | undefined>;
+			installedModelRoles: ReadonlyMap<string, ModelSelectorValue>;
+			installedAgentModelOverrides: ReadonlyMap<string, ModelSelectorValue>;
+			preProfileModel: Model | undefined;
+		}) {
+			profileInstalledRoles.clear();
+			for (const [role, value] of state.modelRoles) profileInstalledRoles.set(role, value);
+			profileInstalledAgentOverrides.clear();
+			for (const [role, value] of state.agentModelOverrides) profileInstalledAgentOverrides.set(role, value);
+			installedModelRoles.clear();
+			for (const [role, value] of state.installedModelRoles) installedModelRoles.set(role, value);
+			installedAgentModelOverrides.clear();
+			for (const [role, value] of state.installedAgentModelOverrides) installedAgentModelOverrides.set(role, value);
+			preProfileModel = state.preProfileModel;
+		},
+		noteProfileInstalledOverrides(
+			modelRoles: readonly string[],
+			agentModelOverrides: readonly string[],
+			previousModel: Model | undefined,
+			baseline?: {
+				modelRoles: Readonly<Record<string, ModelSelectorValue>>;
+				agentModelOverrides: Readonly<Record<string, ModelSelectorValue>>;
+			},
+			installed?: {
+				modelRoles: Readonly<Record<string, ModelSelectorValue>>;
+				agentModelOverrides: Readonly<Record<string, ModelSelectorValue>>;
+			},
+		) {
+			preProfileModel ??= previousModel;
+			for (const role of [...profileInstalledRoles.keys()]) {
+				if (!modelRoles.includes(role)) {
+					profileInstalledRoles.delete(role);
+					installedModelRoles.delete(role);
+				}
+			}
+			for (const role of [...profileInstalledAgentOverrides.keys()]) {
+				if (!agentModelOverrides.includes(role)) {
+					profileInstalledAgentOverrides.delete(role);
+					installedAgentModelOverrides.delete(role);
+				}
+			}
+			for (const role of modelRoles) {
+				if (!profileInstalledRoles.has(role)) profileInstalledRoles.set(role, baseline?.modelRoles[role]);
+			}
+			for (const role of agentModelOverrides) {
+				if (!profileInstalledAgentOverrides.has(role))
+					profileInstalledAgentOverrides.set(role, baseline?.agentModelOverrides[role]);
+			}
+			for (const role of modelRoles) {
+				const value = installed?.modelRoles[role];
+				if (value !== undefined) installedModelRoles.set(role, value);
+			}
+			for (const role of agentModelOverrides) {
+				const value = installed?.agentModelOverrides[role];
+				if (value !== undefined) installedAgentModelOverrides.set(role, value);
+			}
+		},
+		getDefaultFallbackRuntimeState() {
+			return this.defaultFallbackRuntimeState;
+		},
+		restoreDefaultFallbackRuntimeState(state: DefaultFallbackRuntimeState) {
+			this.defaultFallbackRuntimeRestoreCalls += 1;
+			this.defaultFallbackRuntimeState = state;
 		},
 		async setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel) {
 			this.setModelTemporaryCalls.push({ model: next, thinkingLevel });
@@ -109,6 +224,40 @@ describe("model profile activation red-team", () => {
 		).rejects.toThrow(/executor selectors do not match any catalog model/);
 		expect(session.model?.id).toBe("initial");
 		expect(settings.get("task.agentModelOverrides")).toEqual({ executor: "provider-a/original" });
+		expect(settings.get("modelProfile.default")).toBe("old-profile");
+		expect(calls.setCalls).toEqual([]);
+		expect(calls.overrideCalls).toEqual([]);
+		expect(calls.flushCount).toBe(0);
+	});
+
+	test("live activation does not admit a model from an OAuth row when token resolution fails", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated({ "modelProfile.default": "old-profile" });
+		const calls = instrumentSettings(settings);
+		const registry = fakeRegistry({
+			missingProviders: ["provider-a"],
+			usableAuthProviders: ["provider-a"],
+			profiles: [
+				{
+					name: "live-oauth",
+					requiredProviders: [],
+					modelMapping: { default: "provider-a/default" },
+					source: "user",
+				},
+			],
+		});
+		const attemptedProviders: string[] = [];
+		const getApiKeyForProvider = registry.getApiKeyForProvider;
+		registry.getApiKeyForProvider = async provider => {
+			attemptedProviders.push(provider);
+			return getApiKeyForProvider(provider);
+		};
+
+		await expect(
+			activateModelProfile({ session, modelRegistry: registry, settings, profileName: "live-oauth" }),
+		).rejects.toThrow('Model profile "live-oauth" default selector did not resolve: provider-a/default');
+		expect(attemptedProviders).toContain("provider-a");
+		expect(session.model?.id).toBe("initial");
 		expect(settings.get("modelProfile.default")).toBe("old-profile");
 		expect(calls.setCalls).toEqual([]);
 		expect(calls.overrideCalls).toEqual([]);
@@ -321,6 +470,82 @@ describe("model profile activation red-team", () => {
 		expect(calls.setCalls).toEqual([]);
 		expect(calls.overrideCalls).toEqual(["modelRoles", "task.agentModelOverrides"]);
 		expect(calls.flushCount).toBe(0);
+	});
+
+	test("profile refresh restores dropped assignments and preserves unchanged fallback progress", async () => {
+		const session = fakeSession(model("provider-a", "alternate"));
+		const defaultChain = ["provider-a/default", "provider-a/alternate"];
+		session.setConfiguredModelChain("default", defaultChain);
+		session.setActiveModelProfile("editable");
+		session.profileInstalledAgentOverrides.set("executor", "provider-a/original-executor");
+		session.profileInstalledAgentOverrides.set("critic", "provider-a/architect");
+		session.installedAgentModelOverrides.set("executor", "provider-b/executor");
+		session.installedAgentModelOverrides.set("critic", "provider-a/architect");
+		const settings = Settings.isolated({
+			modelRoles: { planner: "provider-a/architect" },
+			"task.agentModelOverrides": {
+				executor: "provider-a/manual-executor",
+				critic: "provider-a/architect",
+			},
+		});
+		settings.override("task.agentModelOverrides", {
+			executor: "provider-a/manual-executor",
+			critic: "provider-a/architect",
+		});
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: fakeRegistry({
+				profiles: [
+					{
+						name: "editable",
+						requiredProviders: [],
+						modelMapping: {
+							default: defaultChain,
+							executor: "provider-b/executor",
+							critic: "provider-b/executor",
+						},
+						source: "user",
+					},
+				],
+			}),
+			settings,
+			profileName: "editable",
+			preserveManualOverrides: true,
+		});
+
+		await applyPreparedModelProfileActivation(prepared, { preserveDefaultModelSelection: true });
+
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: "provider-a/manual-executor",
+			critic: "provider-b/executor",
+		});
+		expect(settings.get("modelRoles")).toEqual({ planner: "provider-a/architect" });
+		expect(session.model?.id).toBe("alternate");
+		expect(session.setModelTemporaryCalls).toEqual([]);
+		expect(session.configuredModelChains.get("default")).toEqual(defaultChain);
+		expect(session.setConfiguredModelChainCalls).toHaveLength(1);
+		expect(session.defaultFallbackRuntimeState).toBe(fallbackRuntimeState);
+		expect(session.defaultFallbackRuntimeRestoreCalls).toBe(0);
+		expect(session.profileInstalledAgentOverrides.has("executor")).toBe(false);
+		expect(session.installedAgentModelOverrides.get("critic")).toBe("provider-b/executor");
+
+		const explicitReselection = await prepareModelProfileActivation({
+			session,
+			modelRegistry: fakeRegistry({
+				profiles: [
+					{
+						name: "editable",
+						requiredProviders: [],
+						modelMapping: { executor: "provider-b/executor" },
+						source: "user",
+					},
+				],
+			}),
+			settings,
+			profileName: "editable",
+		});
+		await applyPreparedModelProfileActivation(explicitReselection, { preserveDefaultModelSelection: true });
+		expect(settings.get("task.agentModelOverrides").executor).toBe("provider-b/executor");
 	});
 
 	test("unknown profile name lists available names", async () => {

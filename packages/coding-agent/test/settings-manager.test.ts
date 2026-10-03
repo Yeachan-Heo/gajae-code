@@ -4,7 +4,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Effort } from "@gajae-code/ai";
 import type { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
-import { onAppendOnlyModeChanged, resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
+import {
+	onAppendOnlyModeChanged,
+	resetSettingsForTest,
+	Settings,
+	SettingsGlobalConfigReloadError,
+} from "@gajae-code/coding-agent/config/settings";
 import { resolveImageRoleModel } from "@gajae-code/coding-agent/tools/image-gen";
 import {
 	getCustomThemesDir,
@@ -15,10 +20,18 @@ import {
 	setDefaultTabWidth,
 } from "@gajae-code/utils";
 import { YAML } from "bun";
+import { enqueueAtomicYamlOperation } from "../src/config/atomic-yaml-patch";
 import { withFileLock } from "../src/config/file-lock";
 import { createLightweightDaemonSettings } from "../src/sdk/bus/telegram-daemon-cli";
 
 const emptyModelRegistry = { getAvailable: () => [] } as unknown as ModelRegistry;
+
+async function stageConfigReload(settings: Settings) {
+	const configPath = settings.getGlobalConfigPath()!;
+	const file = Bun.file(configPath);
+	const text = (await file.exists()) ? await file.text() : null;
+	return settings.stageGlobalConfigReload({ path: configPath, text, identity: text ?? "missing" });
+}
 
 describe("Settings", () => {
 	let testDir: string;
@@ -1086,6 +1099,222 @@ describe("Settings", () => {
 			expect((await readSettings()).theme).toEqual({ dark: "red-claw" });
 		} finally {
 			source.getStorage()?.close();
+		}
+	});
+
+	it("stages schema-validated global candidates and accepts repaired config", async () => {
+		await Bun.write(getConfigPath(), "display: [");
+		const settings = await Settings.loadReadonly({ cwd: projectDir, agentDir });
+		try {
+			const malformed = await Bun.file(getConfigPath()).text();
+			await expect(stageConfigReload(settings)).rejects.toBeInstanceOf(SettingsGlobalConfigReloadError);
+			await expect(stageConfigReload(settings)).rejects.toMatchObject({
+				diagnostics: { valid: false, issues: [{ path: "config.yml", kind: "invalid" }] },
+			});
+			expect(settings.get("display.tabWidth")).toBe(3);
+			expect(await Bun.file(getConfigPath()).text()).toBe(malformed);
+
+			await Bun.write(getConfigPath(), "configSchemaVersion: 2\ndisplay:\n  tabWidth: not-a-number\n");
+			await expect(stageConfigReload(settings)).rejects.toMatchObject({
+				diagnostics: {
+					valid: false,
+					issues: [expect.objectContaining({ path: "display.tabWidth", kind: "invalid" })],
+				},
+			});
+			expect(settings.get("display.tabWidth")).toBe(3);
+
+			const repaired = "configSchemaVersion: 2\ndisplay:\n  tabWidth: 7\n";
+			await Bun.write(getConfigPath(), repaired);
+			const candidate = await stageConfigReload(settings);
+			expect(candidate.diagnostics.valid).toBe(true);
+			expect(candidate.get("display.tabWidth")).toBe(7);
+			settings.publishGlobalConfigReload(candidate).finalize();
+
+			expect(settings.get("display.tabWidth")).toBe(7);
+			expect(settings.canWriteDurableConfig()).toBe(true);
+			expect(await Bun.file(getConfigPath()).text()).toBe(repaired);
+		} finally {
+			await settings.close();
+		}
+	});
+
+	it("preserves pending patches and project/runtime overrides without writing config.yml", async () => {
+		await writeSettings({
+			configSchemaVersion: 2,
+			display: { tabWidth: 3 },
+			theme: { dark: "red-claw", light: "red-claw" },
+			edit: { mode: "patch" },
+		});
+		await Bun.write(
+			path.join(getProjectAgentDir(projectDir), "config.yml"),
+			YAML.stringify({ edit: { mode: "hashline" } }, null, 2),
+		);
+		const settings = await Settings.loadReadonly({ cwd: projectDir, agentDir });
+		const changedPaths: string[] = [];
+		let unsubscribe = () => {};
+		try {
+			expect(settings.getGlobalConfigPath()).toBe(path.resolve(agentDir, "config.yml"));
+			settings.override("theme.dark", "blue-crab");
+			settings.set("theme.light", "blue-crab");
+			unsubscribe = settings.onChanged(settingPath => changedPaths.push(settingPath));
+			const externalConfig =
+				"configSchemaVersion: 2\ndisplay:\n  tabWidth: 7\ntheme:\n  dark: red-claw\n  light: red-claw\nedit:\n  mode: vim\n";
+			await Bun.write(getConfigPath(), externalConfig);
+			setDefaultTabWidth(3);
+
+			const candidate = await stageConfigReload(settings);
+			expect(candidate.getGlobal("display.tabWidth")).toBe(7);
+			expect(candidate.get("display.tabWidth")).toBe(7);
+			expect(candidate.getGlobal("edit.mode")).toBe("vim");
+			expect(candidate.get("edit.mode")).toBe("hashline");
+			expect(candidate.getGlobal("theme.dark")).toBe("red-claw");
+			expect(candidate.get("theme.dark")).toBe("blue-crab");
+			expect(candidate.getGlobal("theme.light")).toBe("blue-crab");
+			const publication = settings.publishGlobalConfigReload(candidate);
+			expect(changedPaths).toEqual([]);
+			publication.finalize();
+			publication.finalize();
+
+			expect(settings.get("display.tabWidth")).toBe(7);
+			expect(settings.getGlobal("edit.mode")).toBe("vim");
+			expect(settings.get("edit.mode")).toBe("hashline");
+			expect(settings.get("theme.dark")).toBe("blue-crab");
+			expect(settings.getGlobal("theme.light")).toBe("blue-crab");
+			expect(getDefaultTabWidth()).toBe(7);
+			expect(changedPaths).toEqual(["display.tabWidth"]);
+			expect(await Bun.file(getConfigPath()).text()).toBe(externalConfig);
+		} finally {
+			unsubscribe();
+			setDefaultTabWidth(4);
+			await settings.close();
+		}
+	});
+
+	it("rolls back a failed synchronous config/model commit without notifying hooks", async () => {
+		await writeSettings({ configSchemaVersion: 2, display: { tabWidth: 3 }, theme: { dark: "red-claw" } });
+		const settings = await Settings.loadReadonly({ cwd: projectDir, agentDir });
+		const changedPaths: string[] = [];
+		const unsubscribe = settings.onChanged(settingPath => changedPaths.push(settingPath));
+		try {
+			setDefaultTabWidth(3);
+			const externalConfig = "configSchemaVersion: 2\ndisplay:\n  tabWidth: 7\n";
+			await Bun.write(getConfigPath(), externalConfig);
+			const candidate = await stageConfigReload(settings);
+
+			expect(() =>
+				settings.publishGlobalConfigReload(candidate, () => {
+					expect(settings.get("display.tabWidth")).toBe(7);
+					settings.override("theme.dark", "blue-crab");
+					throw new Error("model commit rejected");
+				}),
+			).toThrow("model commit rejected");
+
+			expect(settings.get("display.tabWidth")).toBe(3);
+			expect(settings.get("theme.dark")).toBe("red-claw");
+			expect(settings.getOverride("theme.dark")).toBeUndefined();
+			expect(getDefaultTabWidth()).toBe(3);
+			expect(changedPaths).toEqual([]);
+			expect(await Bun.file(getConfigPath()).text()).toBe(externalConfig);
+		} finally {
+			unsubscribe();
+			setDefaultTabWidth(4);
+			await settings.close();
+		}
+	});
+
+	it("rejects deletion of a previously accepted global config", async () => {
+		await writeSettings({ configSchemaVersion: 2, display: { tabWidth: 5 } });
+		const settings = await Settings.loadReadonly({ cwd: projectDir, agentDir });
+		try {
+			fs.rmSync(getConfigPath());
+			await expect(stageConfigReload(settings)).rejects.toMatchObject({
+				name: "SettingsGlobalConfigReloadError",
+				diagnostics: {
+					valid: false,
+					issues: [expect.objectContaining({ path: "config.yml", detail: expect.stringContaining("missing") })],
+				},
+			});
+			expect(settings.get("display.tabWidth")).toBe(5);
+			expect(fs.existsSync(getConfigPath())).toBe(false);
+		} finally {
+			await settings.close();
+		}
+	});
+
+	it("publishes the captured source, rolls back silently, and leaves newer disk content untouched", async () => {
+		await writeSettings({ configSchemaVersion: 2, display: { tabWidth: 3 } });
+		const settings = await Settings.loadReadonly({ cwd: projectDir, agentDir });
+		const changes: string[] = [];
+		const unsubscribe = settings.onChanged(settingPath => changes.push(settingPath));
+		try {
+			const text = "configSchemaVersion: 2\ndisplay:\n  tabWidth: 7\n";
+			const newerText = "configSchemaVersion: 2\ndisplay:\n  tabWidth: 9\n";
+			await Bun.write(getConfigPath(), newerText);
+			const candidate = await settings.stageGlobalConfigReload({ path: getConfigPath(), text, identity: text });
+			expect(candidate.get("display.tabWidth")).toBe(7);
+			const publication = settings.publishGlobalConfigReload(candidate);
+			expect(settings.get("display.tabWidth")).toBe(7);
+			publication.rollback();
+			publication.finalize();
+			expect(settings.get("display.tabWidth")).toBe(3);
+			expect(changes).toEqual([]);
+			expect(await Bun.file(getConfigPath()).text()).toBe(newerText);
+		} finally {
+			unsubscribe();
+			await settings.close();
+		}
+	});
+
+	it("rejects a staged candidate when runtime overrides changed during preflight", async () => {
+		await writeSettings({ configSchemaVersion: 2, display: { tabWidth: 3 }, theme: { dark: "red-claw" } });
+		const settings = await Settings.loadReadonly({ cwd: projectDir, agentDir });
+		try {
+			await Bun.write(
+				getConfigPath(),
+				"configSchemaVersion: 2\ndisplay:\n  tabWidth: 7\ntheme:\n  dark: red-claw\n",
+			);
+			const candidate = await stageConfigReload(settings);
+			settings.override("theme.dark", "blue-crab");
+
+			expect(() => settings.publishGlobalConfigReload(candidate)).toThrow("Settings changed while");
+			expect(settings.get("display.tabWidth")).toBe(3);
+			expect(settings.get("theme.dark")).toBe("blue-crab");
+		} finally {
+			await settings.close();
+		}
+	});
+
+	it("stages after an already-reserved local save and preserves its patch", async () => {
+		await writeSettings({ configSchemaVersion: 2, display: { tabWidth: 3 }, theme: { light: "red-claw" } });
+		const settings = await Settings.loadForScope({ cwd: projectDir, agentDir });
+		try {
+			const blockerStarted = Promise.withResolvers<void>();
+			const unblockQueue = Promise.withResolvers<void>();
+			const blocker = enqueueAtomicYamlOperation(getConfigPath(), async () => {
+				blockerStarted.resolve();
+				await unblockQueue.promise;
+			});
+			await blockerStarted.promise;
+			settings.set("theme.light", "blue-crab");
+			const text = "configSchemaVersion: 2\ndisplay:\n  tabWidth: 7\ntheme:\n  light: red-claw\n";
+			const candidatePromise = settings.stageGlobalConfigReload({ path: getConfigPath(), text, identity: text });
+			await Bun.write(getConfigPath(), text);
+			unblockQueue.resolve();
+			await blocker;
+
+			const candidate = await candidatePromise;
+			expect(candidate.get("display.tabWidth")).toBe(7);
+			expect(candidate.getGlobal("theme.light")).toBe("blue-crab");
+			settings.publishGlobalConfigReload(candidate).finalize();
+
+			expect(settings.get("display.tabWidth")).toBe(7);
+			expect(settings.getGlobal("theme.light")).toBe("blue-crab");
+			expect(await readSettings()).toMatchObject({
+				display: { tabWidth: 7 },
+				theme: { light: "blue-crab" },
+			});
+		} finally {
+			await settings.close();
 		}
 	});
 });
