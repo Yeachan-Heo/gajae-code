@@ -12,6 +12,7 @@ import { AcpAgent, acpRequestFailure } from "../src/modes/acp/acp-agent";
 import { AcpSdkAdapter } from "../src/sdk/acp/adapter";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { SdkClientError } from "../src/sdk/client";
+import { PromptImageUploadStore } from "../src/sdk/host/prompt-image-upload";
 import {
 	type ExactSessionAuthorityFixture,
 	type ExactSessionAuthorityOptions,
@@ -33,6 +34,7 @@ type Fixture = {
 	updates: SessionNotification[];
 	promptDelivered: Promise<void>;
 	busyResponseEntered: Promise<void>;
+	imageBeginEntered: Promise<void>;
 	abortAcknowledgementEntered: Promise<void>;
 	thirdPromptDelivered: Promise<void>;
 	idleWaitScheduled: Promise<void>;
@@ -71,11 +73,14 @@ type Fixture = {
 	releaseFailureDiagnostic(): void;
 	releasePromptAcknowledgement(): void;
 	releaseAbortAcknowledgement(): void;
+	releaseImageBegin(): void;
 	rejectPromptAcknowledgement(): void;
 	sendTerminal(frame: Record<string, unknown>): void;
 	rebindSession(): Promise<void>;
 	mutationInputs: Record<string, unknown>[];
 	recoveryInputs: Record<string, unknown>[];
+	imageUploadIds: string[];
+	redeemedImages: Buffer[];
 	releaseRecoveryResult(result: unknown): void;
 	releaseRecoveryAcknowledgement(result: Record<string, unknown>, index?: number): void;
 };
@@ -132,8 +137,11 @@ async function createFixture(
 		controlledRetryBackoff?: boolean;
 		virtualPromptWatchdog?: boolean;
 		busyOnSecondPrompt?: boolean;
+		busyBeforeSecondImageRedemption?: boolean;
+		discardResourceGone?: boolean;
 		busyUntilIdle?: boolean;
 		busyAfterCancel?: boolean;
+		blockSecondImageBegin?: boolean;
 		priorTranscriptUserTurn?: boolean;
 		promptAcknowledgementError?: {
 			code: string;
@@ -144,6 +152,7 @@ async function createFixture(
 		uncertainPromptAcknowledgement?: boolean;
 		deferRecoveryAcknowledgement?: boolean;
 		retainRecoveryQuery?: boolean;
+		acceptStagedImages?: boolean;
 	} = {},
 ): Promise<Fixture> {
 	const tempDir = TempDir.createSync("@sdk-acp-prompt-terminal-");
@@ -158,6 +167,9 @@ async function createFixture(
 	const blockedAdvisoryQueries: Array<{ socket: TestSocket; id: string; result: unknown }> = [];
 	const mutationInputs: Record<string, unknown>[] = [];
 	const recoveryInputs: Record<string, unknown>[] = [];
+	const imageUploadIds: string[] = [];
+	const redeemedImages: Buffer[] = [];
+	const imageUploads = options.acceptStagedImages ? new PromptImageUploadStore(() => true) : undefined;
 	let recoveryQuery: { socket: TestSocket; id: unknown } | undefined;
 	const recoveryAcknowledgements: Array<{ socket: TestSocket; id: unknown }> = [];
 	const idleUpdateRelease = Promise.withResolvers<void>();
@@ -179,6 +191,8 @@ async function createFixture(
 	let blockNextWorkingUpdate = options.blockInitialWorkingUpdate === true;
 	const delivered = Promise.withResolvers<void>();
 	const busyResponseEntered = Promise.withResolvers<void>();
+	const imageBeginEntered = Promise.withResolvers<void>();
+	const imageBeginRelease = Promise.withResolvers<void>();
 	const thirdPromptDelivered = Promise.withResolvers<void>();
 	const idleWaitScheduled = Promise.withResolvers<void>();
 	const abortAcknowledgementEntered = Promise.withResolvers<void>();
@@ -390,7 +404,66 @@ async function createFixture(
 					return;
 				}
 				if (frame.type !== "control_request") return;
+				if (typeof frame.operation === "string" && frame.operation.startsWith("turn.image.") && imageUploads) {
+					void (async () => {
+						try {
+							const owner = "sdk-acp-prompt-terminal";
+							const result =
+								frame.operation === "turn.image.begin"
+									? imageUploads.begin(owner, frame.input)
+									: frame.operation === "turn.image.append"
+										? imageUploads.append(owner, frame.input)
+										: frame.operation === "turn.image.finish"
+											? await imageUploads.finish(owner, frame.input)
+											: imageUploads.discard(owner, frame.input);
+							if (frame.operation === "turn.image.discard" && options.discardResourceGone)
+								throw new SdkClientError("resource_gone", "Image upload is unavailable.");
+							if (frame.operation === "turn.image.begin") {
+								imageUploadIds.push((result as { id: string }).id);
+								if (options.blockSecondImageBegin && imageUploadIds.length === 2) {
+									imageBeginEntered.resolve();
+									await imageBeginRelease.promise;
+								}
+							}
+							socket.send(JSON.stringify({ type: "control_response", id: frame.id, ok: true, result }));
+						} catch (error) {
+							const failure = error as Error & { code?: string };
+							socket.send(
+								JSON.stringify({
+									type: "control_response",
+									id: frame.id,
+									ok: false,
+									error: { code: failure.code ?? "internal", message: failure.message },
+								}),
+							);
+						}
+					})();
+					return;
+				}
 				if (frame.operation === "turn.prompt" || frame.operation === "skill.invoke") {
+					const stagedImages = (frame.input as { stagedImages?: Array<{ id: string }> }).stagedImages;
+					if (
+						stagedImages &&
+						imageUploads &&
+						!(options.busyBeforeSecondImageRedemption && promptDeliveries === 1)
+					) {
+						try {
+							const reservation = imageUploads.redeem("sdk-acp-prompt-terminal", stagedImages);
+							for (const image of reservation.images) redeemedImages.push(Buffer.from(image.data, "base64"));
+							reservation.release();
+						} catch (error) {
+							const failure = error as Error & { code?: string };
+							socket.send(
+								JSON.stringify({
+									type: "control_response",
+									id: frame.id,
+									ok: false,
+									error: { code: failure.code ?? "internal", message: failure.message },
+								}),
+							);
+							return;
+						}
+					}
 					promptSocket = socket;
 					promptDeliveries++;
 					if (promptDeliveries === 1 || (options.busyUntilIdle && promptDeliveries === 2)) fixtureSdkIdle = false;
@@ -668,6 +741,7 @@ async function createFixture(
 		updates,
 		promptDelivered: delivered.promise,
 		busyResponseEntered: busyResponseEntered.promise,
+		imageBeginEntered: imageBeginEntered.promise,
 		abortAcknowledgementEntered: abortAcknowledgementEntered.promise,
 		thirdPromptDelivered: thirdPromptDelivered.promise,
 		idleWaitScheduled: idleWaitScheduled.promise,
@@ -699,6 +773,8 @@ async function createFixture(
 		queryCalls,
 		mutationInputs,
 		recoveryInputs,
+		imageUploadIds,
+		redeemedImages,
 		releaseRecoveryResult: result => {
 			if (!recoveryQuery) throw new Error("Expected retained recovery query");
 			recoveryQuery.socket.send(JSON.stringify({ type: "query_response", id: recoveryQuery.id, ok: true, result }));
@@ -728,6 +804,7 @@ async function createFixture(
 		releaseAbortAcknowledgement: () => {
 			for (const release of deferredAbortAcknowledgements.splice(0)) release();
 		},
+		releaseImageBegin: () => imageBeginRelease.resolve(),
 		rejectPromptAcknowledgement: () => rejectPromptAcknowledgement?.(),
 		sendTerminal,
 		rebindSession: async () => {
@@ -744,7 +821,9 @@ async function createFixture(
 		dispose: () => {
 			agentMessageUpdateRelease.resolve();
 			failureDiagnosticRelease.resolve();
+			imageBeginRelease.resolve();
 			abort.abort();
+			imageUploads?.close();
 			server.stop(true);
 			tempDir.removeSync();
 		},
@@ -756,6 +835,15 @@ function prompt(fixture: Fixture, text: string): Promise<{ stopReason: StoppedRe
 		sessionId: fixture.sessionId,
 		messageId: "00000000-0000-4000-8000-000000000001",
 		prompt: [{ type: "text", text }],
+	} as PromptRequest) as Promise<{ stopReason: StoppedReason }>;
+}
+
+function imagePrompt(fixture: Fixture, bytes: Buffer, imageCount = 1): Promise<{ stopReason: StoppedReason }> {
+	const data = bytes.toString("base64");
+	return fixture.agent.prompt({
+		sessionId: fixture.sessionId,
+		messageId: "00000000-0000-4000-8000-000000000001",
+		prompt: Array.from({ length: imageCount }, () => ({ type: "image", mimeType: "image/png", data })),
 	} as PromptRequest) as Promise<{ stopReason: StoppedReason }>;
 }
 
@@ -870,6 +958,205 @@ test("ACP waits for SDK idle before retrying a busy successor", async () => {
 		fixture.sendStopped("end_turn");
 		expect(await bounded(successor, "successor settlement")).toEqual({ stopReason: "end_turn" });
 	} finally {
+		fixture.dispose();
+	}
+});
+
+for (const method of ["uploadImageBegin", "uploadImageAppend", "uploadImageFinish"] as const) {
+	test(`ACP ${method} rejection emits no user echo or turn dispatch`, async () => {
+		const fixture = await createFixture({ acceptStagedImages: true });
+		const rejection = vi
+			.spyOn(AcpSdkAdapter.prototype, method)
+			.mockRejectedValue(new SdkClientError("invalid_input", "Image staging rejected."));
+		const cancel = vi.spyOn(AcpSdkAdapter.prototype, "cancel");
+		try {
+			const bytes = Buffer.from(
+				await Bun.file(path.join(import.meta.dir, "fixtures/sdk-inline-image-large.png")).arrayBuffer(),
+			);
+			await expect(
+				bounded(
+					fixture.agent.prompt({
+						sessionId: fixture.sessionId,
+						prompt: [
+							{ type: "text", text: "must not appear" },
+							{ type: "image", mimeType: "image/png", data: bytes.toString("base64") },
+						],
+					} as PromptRequest),
+					"rejected image staging",
+				),
+			).rejects.toMatchObject({ code: "invalid_input" });
+			expect(rejection).toHaveBeenCalledTimes(1);
+			expect(fixture.updates.filter(update => update.update.sessionUpdate === "user_message_chunk")).toHaveLength(0);
+			expect(fixture.promptDeliveryCount()).toBe(0);
+			expect(cancel).not.toHaveBeenCalled();
+		} finally {
+			rejection.mockRestore();
+			cancel.mockRestore();
+			fixture.dispose();
+		}
+	});
+}
+
+test("ACP staged envelope overflow cannot leave a user echo", async () => {
+	const fixture = await createFixture({ acceptStagedImages: true });
+	const cancel = vi.spyOn(AcpSdkAdapter.prototype, "cancel");
+	try {
+		const bytes = Buffer.from(
+			await Bun.file(path.join(import.meta.dir, "fixtures/sdk-inline-image-large.png")).arrayBuffer(),
+		);
+		await expect(
+			bounded(
+				fixture.agent.prompt({
+					sessionId: fixture.sessionId,
+					prompt: [
+						{ type: "text", text: "x".repeat(256 * 1024) },
+						{ type: "image", mimeType: "image/png", data: bytes.toString("base64") },
+					],
+				} as PromptRequest),
+				"oversize staged envelope",
+			),
+		).rejects.toMatchObject({ code: "invalid_input" });
+		expect(fixture.updates.filter(update => update.update.sessionUpdate === "user_message_chunk")).toHaveLength(0);
+		expect(fixture.promptDeliveryCount()).toBe(0);
+		expect(cancel).not.toHaveBeenCalled();
+	} finally {
+		cancel.mockRestore();
+		fixture.dispose();
+	}
+});
+
+test.each([
+	"post-redemption",
+	"pre-redemption",
+	"already-gone",
+	"cancel-before-idle",
+	"discard-failure",
+] as const)("ACP retires one-shot refs before confirmed busy retry (%s)", async mode => {
+	const imageCount = mode === "post-redemption" ? 1 : 16;
+	const fixture = await createFixture({
+		busyBeforeSecondImageRedemption: mode !== "post-redemption",
+		discardResourceGone: mode === "already-gone",
+		busyOnSecondPrompt: true,
+		busyUntilIdle: true,
+		priorTranscriptUserTurn: true,
+		virtualPromptWatchdog: true,
+		acceptStagedImages: true,
+	});
+	const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+	const adapterCancel = vi.spyOn(AcpSdkAdapter.prototype, "cancel");
+	const discard = vi.spyOn(AcpSdkAdapter.prototype, "uploadImageDiscard");
+	if (mode === "discard-failure") discard.mockRejectedValue(new Error("sensitive image contents"));
+	try {
+		const first = prompt(fixture, "provider failure");
+		await bounded(fixture.promptDelivered, "failed prompt delivery");
+		fixture.sendFailed("prompt_failed", undefined, "server_is_overloaded");
+		await expect(bounded(first, "failed prompt settlement")).rejects.toMatchObject({ code: "prompt_failed" });
+
+		const bytes = Buffer.from(
+			await Bun.file(path.join(import.meta.dir, "fixtures/sdk-inline-image-large.png")).arrayBuffer(),
+		);
+		const successor = imagePrompt(fixture, bytes, imageCount);
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "busy image prompt delivery");
+		await bounded(fixture.busyResponseEntered, "confirmed busy image response");
+		if (mode === "discard-failure") {
+			await expect(bounded(successor, "unconfirmed cleanup rejects retry")).rejects.toMatchObject({
+				code: "image_cleanup_failed",
+			});
+			expect(fixture.promptDeliveryCount()).toBe(2);
+			expect(fixture.imageUploadIds).toHaveLength(imageCount);
+			expect(discard).toHaveBeenCalledTimes(imageCount);
+			expect(warn.mock.calls.filter(args => args[0] === "acp_image_discard_failed")).toHaveLength(imageCount);
+			expect(JSON.stringify(warn.mock.calls)).not.toContain("sensitive image contents");
+			return;
+		}
+		await bounded(fixture.idleWaitScheduled, "busy image idle wait");
+		if (mode === "already-gone") {
+			expect(discard).toHaveBeenCalledTimes(imageCount);
+			await Promise.all(
+				discard.mock.results.map(result => expect(result.value).rejects.toMatchObject({ code: "resource_gone" })),
+			);
+			expect(warn.mock.calls.filter(args => args[0] === "acp_image_discard_failed")).toHaveLength(0);
+		}
+		expect(fixture.redeemedImages).toEqual(mode === "post-redemption" ? [bytes] : []);
+		if (mode === "cancel-before-idle") {
+			await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel after pre-redemption busy");
+			expect(await bounded(successor, "cancelled busy image")).toEqual({ stopReason: "cancelled" });
+			expect(adapterCancel).not.toHaveBeenCalled();
+			expect(fixture.imageUploadIds).toHaveLength(imageCount);
+		}
+		fixture.sendIdle();
+		const completed = mode === "cancel-before-idle" ? imagePrompt(fixture, bytes, imageCount) : successor;
+		await waitFor(() => fixture.promptDeliveryCount() === 3, "restaged image prompt delivery");
+
+		expect(fixture.imageUploadIds).toHaveLength(imageCount * 2);
+		expect(new Set(fixture.imageUploadIds).size).toBe(imageCount * 2);
+		expect(fixture.redeemedImages).toEqual(
+			mode === "post-redemption" ? [bytes, bytes] : Array.from({ length: imageCount }, () => bytes),
+		);
+		expect(fixture.mutationInputs.slice(1).map(input => input.stagedImages)).toEqual([
+			fixture.imageUploadIds.slice(0, imageCount).map(id => ({ id })),
+			fixture.imageUploadIds.slice(imageCount).map(id => ({ id })),
+		]);
+		expect(
+			fixture.updates.filter(
+				update =>
+					update.update.sessionUpdate === "user_message_chunk" &&
+					(update.update as { content: { type: string } }).content.type === "image",
+			),
+		).toHaveLength(imageCount * (mode === "cancel-before-idle" ? 2 : 1));
+		fixture.sendStopped("end_turn");
+		expect(await bounded(completed, "busy image successor settlement")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		discard.mockRestore();
+		adapterCancel.mockRestore();
+		warn.mockRestore();
+		fixture.dispose();
+	}
+});
+
+test("ACP cancels during busy image restaging without dispatching after cancellation", async () => {
+	const fixture = await createFixture({
+		busyOnSecondPrompt: true,
+		busyUntilIdle: true,
+		priorTranscriptUserTurn: true,
+		virtualPromptWatchdog: true,
+		acceptStagedImages: true,
+		blockSecondImageBegin: true,
+	});
+	const adapterCancel = vi.spyOn(AcpSdkAdapter.prototype, "cancel");
+	try {
+		const first = prompt(fixture, "provider failure");
+		await bounded(fixture.promptDelivered, "failed prompt delivery");
+		fixture.sendFailed("prompt_failed", undefined, "server_is_overloaded");
+		await expect(bounded(first, "failed prompt settlement")).rejects.toMatchObject({ code: "prompt_failed" });
+
+		const bytes = Buffer.from(
+			await Bun.file(path.join(import.meta.dir, "fixtures/sdk-inline-image-large.png")).arrayBuffer(),
+		);
+		const successor = imagePrompt(fixture, bytes);
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "busy image prompt delivery");
+		await bounded(fixture.busyResponseEntered, "confirmed busy image response");
+		await bounded(fixture.idleWaitScheduled, "busy image idle wait");
+		fixture.sendIdle();
+		await bounded(fixture.imageBeginEntered, "restaging image begin");
+
+		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel while image restaging");
+		expect(adapterCancel).not.toHaveBeenCalled();
+		fixture.releaseImageBegin();
+		expect(await bounded(successor, "cancelled image successor")).toEqual({ stopReason: "cancelled" });
+		expect(fixture.promptDeliveryCount()).toBe(2);
+		expect(fixture.imageUploadIds).toHaveLength(2);
+		expect(fixture.redeemedImages).toEqual([bytes]);
+		expect(
+			fixture.updates.filter(
+				update =>
+					update.update.sessionUpdate === "user_message_chunk" &&
+					(update.update as { content: { type: string } }).content.type === "image",
+			),
+		).toHaveLength(1);
+	} finally {
+		adapterCancel.mockRestore();
+		fixture.releaseImageBegin();
 		fixture.dispose();
 	}
 });
@@ -1362,6 +1649,43 @@ test("ACP retries a first-turn prompt_failed after the turn started, then recove
 		// The retry lands on a host that has finished coming up and completes normally.
 		fixture.sendStopped("end_turn");
 		expect(await bounded(pending, "first-turn retry recovery")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP restages original large image with fresh refs after confirmed first-turn readiness failure", async () => {
+	const fixture = await createFixture({ acceptStagedImages: true, controlledRetryBackoff: true });
+	try {
+		const bytes = Buffer.from(
+			await Bun.file(path.join(import.meta.dir, "fixtures/sdk-inline-image-large.png")).arrayBuffer(),
+		);
+		expect(bytes.length).toBeGreaterThan(256 * 1024);
+		const pending = imagePrompt(fixture, bytes);
+		await bounded(fixture.promptDelivered, "first image prompt delivery");
+		expect(fixture.imageUploadIds).toHaveLength(1);
+		expect(fixture.redeemedImages).toEqual([bytes]);
+		fixture.sendTerminal({
+			type: "agent_start",
+			sessionId: fixture.sessionId,
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+		});
+		fixture.sendReadinessFailure();
+		await bounded(fixture.retryBackoffScheduled, "confirmed image retry backoff");
+		expect(fixture.promptDeliveryCount()).toBe(1);
+		fixture.fireRetryBackoff();
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "restaged image prompt delivery");
+		expect(fixture.imageUploadIds).toHaveLength(2);
+		expect(new Set(fixture.imageUploadIds).size).toBe(2);
+		expect(fixture.redeemedImages).toEqual([bytes, bytes]);
+		expect(fixture.mutationInputs.map(input => input.stagedImages)).toEqual(
+			fixture.imageUploadIds.map(id => [{ id }]),
+		);
+		expect(new Set(fixture.mutationInputs.map(input => input.clientRef)).size).toBe(2);
+		expect(fixture.updates.filter(update => update.update.sessionUpdate === "user_message_chunk")).toHaveLength(1);
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "confirmed large-image retry completion")).toEqual({ stopReason: "end_turn" });
 	} finally {
 		fixture.dispose();
 	}
@@ -3513,7 +3837,7 @@ test("ACP activity idle alone does not settle a prompt", async () => {
 async function createRecoveryFixture(
 	acknowledgement: "held" | "rejected" | "accepted",
 	blockedAgentMessageText?: string,
-	options: { controlledRetryBackoff?: boolean } = {},
+	options: { controlledRetryBackoff?: boolean; acceptStagedImages?: boolean } = {},
 ): Promise<Fixture & { notify(code?: string): void }> {
 	let notify: ((error: SdkClientError) => void) | undefined;
 	const original = AcpSdkAdapter.prototype.onReconnectFailed;
@@ -3532,6 +3856,7 @@ async function createRecoveryFixture(
 			blockedAgentMessageText,
 			cancelSettlementGraceMs: 25,
 			controlledRetryBackoff: options.controlledRetryBackoff,
+			acceptStagedImages: options.acceptStagedImages,
 		});
 		const callback = notify;
 		if (!callback) throw new Error("Expected session reconnect failure subscription");
@@ -3692,6 +4017,42 @@ test("ACP refreshes a stale Router attachment before retained recovery without r
 				update.update.content.text === "retained report",
 		);
 		expect(retainedChunks).toHaveLength(1);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP never replays a large image after uncertain acknowledgement and attachment replacement", async () => {
+	const fixture = await createRecoveryFixture("rejected", undefined, { acceptStagedImages: true });
+	try {
+		const bytes = Buffer.from(
+			await Bun.file(path.join(import.meta.dir, "fixtures/sdk-inline-image-large.png")).arrayBuffer(),
+		);
+		expect(bytes.length).toBeGreaterThan(256 * 1024);
+		const pending = imagePrompt(fixture, bytes);
+		void pending.catch(() => undefined);
+		await bounded(fixture.promptDelivered, "uncertain image delivery");
+		expect(fixture.imageUploadIds).toHaveLength(1);
+		expect(fixture.redeemedImages).toEqual([bytes]);
+		await fixture.rebindSession();
+		fixture.notify("uncertain_after_send");
+		await waitFor(() => fixture.recoveryInputs.length === 1, "uncertain image reconciliation");
+		expect(fixture.recoveryInputs[0]).toEqual({ kind: "prompt", clientRef: fixture.mutationInputs[0]?.clientRef });
+		fixture.releaseRecoveryResult({ ...retainedTerminal(fixture), status: "unknown" });
+		await expect(bounded(pending, "uncertain image refusal")).rejects.toMatchObject({ code: "terminal_uncertain" });
+		expect(fixture.promptDeliveryCount()).toBe(1);
+		expect(fixture.imageUploadIds).toHaveLength(1);
+		expect(fixture.redeemedImages).toEqual([bytes]);
+		expect(
+			fixture.updates.filter(
+				update =>
+					update.update.sessionUpdate === "user_message_chunk" &&
+					(update.update as { content: { type: string } }).content.type === "image",
+			),
+		).toHaveLength(1);
+		await expect(prompt(fixture, "must not replay image after unknown outcome")).rejects.toMatchObject({
+			code: "not_found",
+		});
 	} finally {
 		fixture.dispose();
 	}
@@ -4190,9 +4551,11 @@ for (const lateAck of ["identical", "mismatching"] as const) {
 		const promptSpy = vi.spyOn(AcpSdkAdapter.prototype, "prompt").mockImplementation(async function (
 			this: AcpSdkAdapter,
 			input,
+			beforeDispatch,
+			onDispatch,
 		) {
 			const first = ++calls === 1;
-			const acknowledgement = await originalPrompt.call(this, input);
+			const acknowledgement = await originalPrompt.call(this, input, beforeDispatch, onDispatch);
 			if (first) firstAck.resolve();
 			return acknowledgement;
 		});

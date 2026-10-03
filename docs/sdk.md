@@ -422,6 +422,55 @@ activity, or an earlier pending claim.
 
 Reconciliation state survives client disconnect/reconnect. With the session-private durable store (`.sdk-reconciliation/`), accepted and terminal prompt records also survive **GJC session-process restart** for the same session identity within capacity, subject to crash-consistent fsync. An ordinary non-terminal prompt record at restart finalizes its pending outcome and receipt state. A prompt with the explicit `deadlineRecoveryPending` marker is the exception: it remains `accepted` or `in_flight`, and its staged pending outcome is not exposed by Q26 while the SDK retains a durable recovery owner. A process restart does not recreate a missing exact-run/tool observation, so the pending outcome stays private until a real terminal event or new settlement evidence arrives. If ownership or settlement remains uncertain, the record stays nonterminal and recoverable instead of being converted into a synthetic deadline failure. A stopped prompt without receipt evidence becomes `terminal_ok + missing`; failed prompt or skill settlement without body evidence becomes `unknown`. Eviction or absence still returns honest `unknown`; that means the prior outcome is unknowable, not that execution did not occur. Active records are capped at 128 per kind and are never aged into terminal. Terminal records are capped at 256 per kind and evicted oldest-terminal first, with no age-based eviction. Reconciliation stores no prompt, transcript, credential, or provider-response body.
 
+### ACP inline images and internal staging
+
+ACP clients can submit standard inline `ContentBlock.image` data on both initial
+and follow-up prompts. GJC preserves the encoded image's original bytes and MIME
+type; clients do not need a custom upload API or a `resource_link`. The internal
+SDK frame cap remains 256 KiB. Large inline images cross it through SDK-core-owned
+`turn.image.begin`, `turn.image.append`, `turn.image.finish`, and
+`turn.image.discard` controls, not by increasing the cap or exposing endpoint
+credentials to the ACP client.
+
+Staging is scoped to the authenticated live connection and session. Each upload
+has a two-minute inactivity lease, a declared byte length, MIME type, and SHA-256 digest.
+`turn.image.begin` optionally accepts a nonempty `batchId` of at most 128 characters.
+Successful begin, append, and finish operations renew live uploads only for the same
+authenticated connection and explicit batch; omitted batch IDs renew that upload alone.
+ACP uses its request `clientRef` as the batch label so an early completed image stays
+available while later images are still transferring. Invalid or rejected operations,
+unrelated batches/connections, and cleanup do not renew these leases. Two minutes
+without successful staging progress still retires the batch, without changing quotas.
+Chunks are canonical base64 in sequence, with at most 96 KiB decoded per chunk.
+The host verifies exact length, digest, MIME/header agreement, dimensions, and
+image decoding before a reference is usable. A prompt accepts at most 16 images,
+each at most 20 MiB, with 64 MiB source limits for pending and accepted images and
+a shared 256 MiB process payload/copy budget. Appends coalesce into retained
+96 KiB slabs instead of retaining one Buffer per fragment; tiny uploads reserve
+at least 4 KiB. Session and process staging budgets charge the actual retained
+allocation before it is created, and successful finalization releases slab
+padding. Flexible fragment sizes remain supported without a chunk-count limit.
+Expiry, discard, and connection loss retire unconsumed upload capacity.
+
+Finished references are connection-owned and one-shot. `turn.prompt` consumes
+`stagedImages: [{ id }]`; callers cannot mix them with direct `images` or reuse
+references after redemption, including a subsequent admission rejection. ACP's
+bounded retry after a **confirmed** `busy` response restages the original bytes
+with fresh references. Capacity rejection may precede redemption, so old IDs
+must be discarded or confirmed already gone before fresh staging. Unconfirmed
+cleanup emits a bounded diagnostic and refuses the retry; it does not invent
+capacity release or replay an uncertain mutation. A lost or uncertain acknowledgement is reconciled through
+`turn.result`, never treated as permission to upload and execute the prompt again.
+The user's message is echoed once across a confirmed retry. Upload validation and
+final staged-envelope bounds pass before any text/image echo is published, so an
+upload rejection cannot leave an accepted-looking transcript entry. Validated replies
+for this request's active staging renew only its local ACP inactivity watchdog; they
+are not model/tool activity or execution authority. This pre-dispatch boundary does
+not suppress the user message for later prompt-admission or admitted model failures.
+
+Cancellation applies to the exact outstanding prompt, including successor
+admission while a cancelled image's user-message echo is still being published.
+
 ### Request-owned queue cancellation and execution deadlines
 
 SDK-only ordinary abort cancels a snapshot of its authenticated requester's
@@ -435,48 +484,17 @@ uncertain and never permits mutation replay.
 
 Before consumption, a prompt diverted into steering retains its own queue-removal
 capability; cancelling it must not abort unrelated active work. After consumption,
-its durable completion belongs to the exact consuming run and cancellation domain.
-A trusted natural terminal settles each joined accepted prompt with its own
-correlation. Confirmed queue removal settles only that submission, without waiting
-for an unrelated run. A deterministic cancellation receipt waits for that
-submission's durable terminal; held or failed persistence remains uncertain,
-including same-key replay. Retired queue authority cannot be reused to abort the
-root run.
-
-Confirmed queue residence suspends the terminal lease. Actual consumption or
-own-run promotion starts a fresh bounded lease, renewed only by attributable
-progress in the same consuming run and cancellation domain. Session teardown
-retires joined attribution; late predecessor progress or terminal events cannot
-adopt or settle a successor. Transport or delivery failure alone does not prove
-execution settled and does not retire a live unsettled execution owner.
-
-### SDK image staging
-
-Both standalone and notification SDK hosts expose `turn.image.begin`,
-`turn.image.append`, `turn.image.finish`, and `turn.image.discard`. The full SDK
-frame cap remains 256 KiB. Finished references are scoped to the authenticated
-live connection and session and are one-shot: `turn.prompt` accepts
-`stagedImages: [{ id }]`, never mixed with direct `images`, and preserves original
-source bytes and MIME. Redemption remains consumed after later admission failure.
-
-Each upload has a two-minute inactivity lease, declared byte length, MIME and
-SHA-256 digest. Successful begin, append and finish renew only live entries of
-that authenticated owner's explicit `batchId` (nonempty, at most 128 characters).
-Without an explicit batch, only the upload itself renews. Rejected traffic, other
-owners, other batches and cleanup never renew or resurrect expired entries.
-Chunks are canonical base64 in sequence, at most 96 KiB decoded each. Exact
-length, digest, MIME/header agreement, dimensions and decoding are validated
-before a reference is usable.
-
-A prompt accepts at most 16 images, each at most 20 MiB, with 64 MiB source limits
-for pending and accepted images and a shared 256 MiB process payload/copy budget.
-Appends coalesce into retained 96 KiB slabs; tiny uploads reserve at least 4 KiB.
-Actual retained allocation is charged before creation; finalization releases slab
-padding. Expiry, discard and connection loss retire unconsumed upload capacity.
-Accepted capacity belongs to the exact consuming run and cancellation domain
-until proven settlement or session teardown. A fatal transport diagnostic or
-delivery-record expiry alone never releases bytes still owned by an unsettled run.
-Closed queued controls cannot recreate staging resources.
+its image quota and durable completion belong to the exact consuming run and
+cancellation domain. A trusted natural terminal settles each joined accepted
+prompt with its own correlation; confirmed queue removal settles that submission
+without waiting for an unrelated run. A deterministic cancellation receipt waits
+for that submission's durable terminal; persistence uncertainty remains uncertain
+on same-key replay. Confirmed queue residence suspends the terminal lease. Actual
+consumption or own-run promotion starts a fresh bounded lease, renewed only by
+attributable progress in the same consuming run and cancellation domain.
+A transport diagnostic or delivery-record
+expiry does not prove execution ended and cannot release accepted-image quota.
+Exact run terminal or session teardown releases retained image quota.
 
 `turn.prompt` remains ordered and non-idempotent. Its envelope `idempotencyKey`
 does not replay a response or produce `idempotency_conflict`. A retained duplicate
