@@ -15,15 +15,16 @@ import { getAgentDbPath, logger } from "@gajae-code/utils";
 import { checkOpenCodexStatus } from "./providers/openai-opencodex-responses";
 import { getEnvApiKey } from "./stream";
 import type { Provider } from "./types";
-import type {
-	CredentialRankingStrategy,
-	UsageCredential,
-	UsageFetchContext,
-	UsageFetchParams,
-	UsageLimit,
-	UsageLogger,
-	UsageProvider,
-	UsageReport,
+import {
+	type CredentialRankingStrategy,
+	UsageAuthenticationError,
+	type UsageCredential,
+	type UsageFetchContext,
+	type UsageFetchParams,
+	type UsageLimit,
+	type UsageLogger,
+	type UsageProvider,
+	type UsageReport,
 } from "./usage";
 
 import {
@@ -4223,7 +4224,12 @@ export class AuthStorage {
 		return match?.id;
 	}
 
-	#persistRefreshedUsageCredential(provider: Provider, previous: UsageCredential, next: UsageCredential): void {
+	#persistRefreshedUsageCredential(
+		provider: Provider,
+		previous: UsageCredential,
+		next: UsageCredential,
+		persist = true,
+	): void {
 		const entries = this.#getStoredCredentials(provider);
 		const index = entries.findIndex(entry => {
 			if (entry.credential.type !== "oauth") return false;
@@ -4238,17 +4244,69 @@ export class AuthStorage {
 		if (index === -1) return;
 		const existing = entries[index]!.credential;
 		if (existing.type !== "oauth") return;
-		this.#replaceCredentialAt(provider, index, {
-			type: "oauth",
-			access: next.accessToken ?? existing.access,
-			refresh: next.refreshToken ?? existing.refresh,
-			expires: next.expiresAt ?? existing.expires,
-			accountId: next.accountId,
-			projectId: next.projectId,
-			email: next.email,
-			enterpriseUrl: next.enterpriseUrl,
-			mcpBinding: next.mcpBinding ?? existing.mcpBinding,
-		});
+		this.#replaceCredentialAt(
+			provider,
+			index,
+			{
+				type: "oauth",
+				access: next.accessToken ?? existing.access,
+				refresh: next.refreshToken ?? existing.refresh,
+				expires: next.expiresAt ?? existing.expires,
+				accountId: next.accountId,
+				projectId: next.projectId,
+				email: next.email,
+				enterpriseUrl: next.enterpriseUrl,
+				mcpBinding: next.mcpBinding ?? existing.mcpBinding,
+			},
+			persist,
+		);
+	}
+
+	async #fetchUsageWithAuthRecovery(
+		provider: UsageProvider,
+		params: UsageFetchParams,
+		ctx: UsageFetchContext,
+		credentialId?: number,
+	): Promise<{ report: UsageReport | null; credential: UsageCredential }> {
+		try {
+			return { report: await provider.fetchUsage(params, ctx), credential: params.credential };
+		} catch (error) {
+			if (!(error instanceof UsageAuthenticationError) || params.credential.type !== "oauth") throw error;
+			params.signal?.throwIfAborted();
+			const refreshable = this.#buildRefreshableOauthCredential(params.credential);
+			if (!refreshable) throw error;
+
+			const id = credentialId ?? this.#findStoredCredentialIdForUsageCredential(params.provider, params.credential);
+			let refreshed: RefreshedOAuthCredentials;
+			try {
+				// Invalidate only this request's snapshot. Keep normal lease adoption
+				// and the replay guard: a peer may already have rotated the token.
+				refreshed = await this.#refreshOAuthCredential(
+					params.provider,
+					{ ...refreshable, expires: 0 },
+					id,
+					params.signal,
+				);
+			} catch (refreshError) {
+				throw new Error(
+					`OAuth refresh after usage HTTP 401 failed: ${scrubHealthReason(refreshError, [
+						refreshable.access,
+						refreshable.refresh,
+					])}`,
+				);
+			}
+			const credential = this.#mergeRefreshedUsageCredential(params.credential, refreshed);
+			this.#persistRefreshedUsageCredential(
+				params.provider,
+				params.credential,
+				credential,
+				!refreshed.persistedByLease,
+			);
+			params.signal?.throwIfAborted();
+			// One retry only. A second rejection is an authentication failure,
+			// not "no usage data", and must not rotate the token again.
+			return { report: await provider.fetchUsage({ ...params, credential }, ctx), credential };
+		}
 	}
 
 	async #fetchUsageUncached(
@@ -4287,7 +4345,12 @@ export class AuthStorage {
 						timeoutSignal,
 					);
 					const refreshedCredential = this.#mergeRefreshedUsageCredential(request.credential, refreshed);
-					this.#persistRefreshedUsageCredential(request.provider, request.credential, refreshedCredential);
+					this.#persistRefreshedUsageCredential(
+						request.provider,
+						request.credential,
+						refreshedCredential,
+						!refreshed.persistedByLease,
+					);
 					params = {
 						...params,
 						credential: refreshedCredential,
@@ -4306,10 +4369,11 @@ export class AuthStorage {
 		if (providerImpl.supports && !providerImpl.supports(params)) return null;
 
 		try {
-			return await providerImpl.fetchUsage(params, {
+			const { report } = await this.#fetchUsageWithAuthRecovery(providerImpl, params, {
 				fetch: this.#usageFetch,
 				logger: logDetails ? this.#usageLogger : undefined,
 			});
+			return report;
 		} catch (error) {
 			if (logDetails) {
 				logger.debug("AuthStorage usage fetch failed", {
@@ -5121,11 +5185,12 @@ export class AuthStorage {
 							row.provider as Provider,
 							initialRequest.credential,
 							refreshedCredential,
+							!refreshed.persistedByLease,
 						);
 						params = { ...params, credential: refreshedCredential };
 					} catch (error) {
 						base.ok = false;
-						base.reason = `oauth refresh failed: ${scrubHealthReason(error)}`;
+						base.reason = `oauth refresh failed: ${scrubHealthReason(error, [cred.access, cred.refresh])}`;
 					}
 				}
 			}
@@ -5142,7 +5207,8 @@ export class AuthStorage {
 			}
 
 			try {
-				const report = await providerImpl.fetchUsage(params, ctx);
+				const { report, credential } = await this.#fetchUsageWithAuthRecovery(providerImpl, params, ctx, row.id);
+				params = { ...params, credential };
 				if (report === null) {
 					base.reason = "usage probe returned no data for this credential";
 				} else {
@@ -5161,7 +5227,17 @@ export class AuthStorage {
 				}
 			} catch (error) {
 				base.ok = false;
-				base.reason = scrubHealthReason(error, cred.type === "api_key" ? [cred.key] : []);
+				base.reason = scrubHealthReason(
+					error,
+					cred.type === "api_key"
+						? [cred.key]
+						: [
+								cred.access,
+								cred.refresh,
+								params.credential.accessToken ?? "",
+								params.credential.refreshToken ?? "",
+							],
+				);
 			}
 
 			results.push(base);
