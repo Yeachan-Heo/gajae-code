@@ -429,6 +429,7 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 		repoRoot,
 		isolatedHome: false,
 		settings: ordinaryOptions.settings,
+		bypassCache: ordinaryOptions.bypassCache,
 	};
 	const providers = filterProviders(capability, ordinaryOptions);
 

@@ -1474,6 +1474,7 @@ export class ManagedSessionDescendantStore {
 		retained?: { authority: RecoveryFsRoot; authorityBaseDir: string },
 		policy?: ManagedSessionSecurityPolicy,
 		profileAgentDir?: string,
+		expectedSubtreeRoot?: ManagedDirectoryRoot,
 	) {
 		managedRelativePath(root, baseDir);
 
@@ -1512,13 +1513,46 @@ export class ManagedSessionDescendantStore {
 				});
 			}
 			this.#authority = retained.authority;
+			if (
+				expectedSubtreeRoot &&
+				(expectedSubtreeRoot.canonicalPath !== this.#baseDir ||
+					expectedSubtreeRoot.dev !== this.#subtreeRoot.dev ||
+					expectedSubtreeRoot.ino !== this.#subtreeRoot.ino)
+			)
+				throw new Error("Managed subtree authority changed during establishment");
 			this.#assertBound();
 
 			return;
 		}
 		assertManagedDirectoryRoot(root);
-		ensureManagedDirectory(this.#baseDir, root, this.#policy);
+		if (expectedSubtreeRoot) {
+			if (expectedSubtreeRoot.canonicalPath !== this.#baseDir)
+				throw new Error("Managed subtree authority path mismatch");
+			assertManagedDirectoryRoot(expectedSubtreeRoot);
+			const verified = validateNativeSecurityResult(
+				process.platform === "win32"
+					? nativeSessionStorage().verifyOwnerOnlyPathSecurityExpected(
+							this.#baseDir,
+							"directory",
+							expectedSubtreeRoot.dev,
+							expectedSubtreeRoot.ino,
+						)
+					: nativeSessionStorage().verifyOwnerOnlyPathSecurity(this.#baseDir, "directory"),
+				"verify",
+				"directory",
+			);
+			if (!verified.ok) throw securityError(this.#baseDir, verified);
+			assertManagedDirectoryRoot(expectedSubtreeRoot);
+		} else {
+			ensureManagedDirectory(this.#baseDir, root, this.#policy);
+		}
 		const subtreeStat = fs.lstatSync(this.#baseDir, { bigint: true });
+		if (
+			expectedSubtreeRoot &&
+			(canonicalFileId(subtreeStat.dev) !== expectedSubtreeRoot.dev ||
+				canonicalFileId(subtreeStat.ino) !== expectedSubtreeRoot.ino)
+		)
+			throw new Error("Managed subtree authority changed during establishment");
 		this.#subtreeRoot = Object.freeze({
 			canonicalPath: this.#baseDir,
 			dev: canonicalFileId(subtreeStat.dev),
@@ -1634,6 +1668,50 @@ export class ManagedSessionDescendantStore {
 		}
 		this.#assertBound();
 	}
+
+	/** Capture a directory identity through this store's retained managed root without repairing it. */
+	captureDirectoryIdentity(relativePath: string): { dev: string; ino: string } {
+		this.#assertBound();
+		const resolved = this.#resolve(relativePath);
+		if (!this.#authority) this.#assertPathBackedDirectoryChain(resolved);
+		const named = fs.lstatSync(resolved, { bigint: true });
+		if (!named.isDirectory() || named.isSymbolicLink()) throw new Error("managed_directory_identity_unavailable");
+		const dev = canonicalFileId(named.dev);
+		const ino = canonicalFileId(named.ino);
+		if (dev !== this.#subtreeRoot.dev) throw new Error("managed_directory_identity_unavailable");
+		if (this.#authority) {
+			const retainedRelative = this.#relative(resolved);
+			if (retainedRelative === "") {
+				if (dev !== this.#subtreeRoot.dev || ino !== this.#subtreeRoot.ino)
+					throw new Error("Managed descendant root binding changed");
+			} else {
+				const retained = this.#authority.retainManagedDirectory(retainedRelative, dev.toString(), ino.toString());
+				try {
+					const identity = retained.identity();
+					if (
+						!identity.ok ||
+						!identity.identity ||
+						identity.identity.dev !== dev.toString() ||
+						identity.identity.ino !== ino.toString()
+					)
+						throw new Error(identity.code ?? "managed_directory_identity_unavailable");
+				} finally {
+					retained.close();
+				}
+			}
+		}
+		const after = fs.lstatSync(resolved, { bigint: true });
+		if (
+			!after.isDirectory() ||
+			after.isSymbolicLink() ||
+			canonicalFileId(after.dev) !== dev ||
+			canonicalFileId(after.ino) !== ino
+		)
+			throw new Error("managed_directory_identity_changed");
+		this.#assertBound();
+		return { dev: dev.toString(), ino: ino.toString() };
+	}
+
 	#assertBound(): void {
 		if (!this.#authority) {
 			const named = fs.statSync(this.#baseDir, { bigint: true });
@@ -3019,6 +3097,34 @@ export class ManagedSessionDescendantStore {
 		if (!removed.ok) throw new Error(removed.code ?? "managed_remove_failed");
 		this.#assertBound();
 	}
+
+	/** Remove one exact managed tree through the parent-identity-bound native protocol. */
+	removeTreeExpectedWithParentIdentity(
+		relativePath: string,
+		expected: NativeDirectoryTreeSnapshot,
+		parentIdentity: { dev: bigint; ino: bigint },
+	): NativeExactUnlinkResult {
+		this.#beforeMutation();
+		this.#assertBound();
+		const resolved = this.#resolve(relativePath);
+		const parentPath = path.dirname(resolved);
+		const parentRelative = path.relative(this.#baseDir, parentPath);
+		if (path.isAbsolute(parentRelative) || parentRelative === ".." || parentRelative.startsWith(`..${path.sep}`))
+			throw new Error("managed_remove_parent_outside_store");
+		const currentParent = this.captureDirectoryIdentity(parentRelative);
+		if (
+			currentParent.dev !== canonicalFileId(parentIdentity.dev).toString() ||
+			currentParent.ino !== canonicalFileId(parentIdentity.ino).toString()
+		)
+			throw new Error("managed_remove_parent_identity_mismatch");
+		const removed = nativeSessionStorage().exactRemoveDirectoryTree(resolved, expected, {
+			dev: BigInt(currentParent.dev),
+			ino: BigInt(currentParent.ino),
+		});
+		this.#assertBound();
+		return removed;
+	}
+
 	fsyncTree(): NativeDirectoryTreeSnapshot {
 		this.#beforeMutation();
 		this.#assertBound();

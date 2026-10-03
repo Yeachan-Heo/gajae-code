@@ -30,7 +30,20 @@ import {
 	listCanonicalBlobs,
 	removeCanonicalBlob,
 } from "../session/blob-store";
-import { FileSessionStorage, probeSessionRetirement, retireSessionTranscript } from "../session/session-storage";
+import { managedRootForScope, resolveManagedScope } from "../session/internal/managed-session-scope";
+import {
+	FileSessionStorage,
+	probeSessionRetirement,
+	retireSessionTranscript,
+	type SessionRetirementContinuation,
+	type SessionRetirementOutcome,
+	type SessionStorageSnapshot,
+	taskArtifactOwnerLocatorFromTranscriptBytes,
+} from "../session/session-storage";
+import type {
+	TaskArtifactOwnerDeletionEvidence,
+	TaskArtifactOwnerStorageContext,
+} from "../session/task-artifact-owner";
 import {
 	collectEmptyDeleteReceipts,
 	type EmptyDeleteGcRecord,
@@ -756,6 +769,10 @@ export interface GcDiskRecord {
 	action: GcDiskAction;
 	reason: string;
 	error?: string;
+	/** Exact task-artifact owner cleanup evidence returned by a partial retirement. */
+	task_artifact_owner_deletion_evidence?: TaskArtifactOwnerDeletionEvidence;
+	/** True when that exact owner evidence has already been retired. */
+	task_artifact_owner_retired?: true;
 	/** Set when `bytes` is a floor because a walk was capped or partially unreadable. */
 	partial?: true;
 	/** Set when this entry was a reclaim candidate that its surface withheld on incomplete evidence. */
@@ -1198,6 +1215,63 @@ async function discoverGcDiskTranscripts(sessionsRoot: string, errors: GcDiskErr
 }
 
 /**
+ * Resolve owner-cleanup authority only from a managed scope independently
+ * verified against the transcript header and its containing managed directory.
+ * Header path values select a scope candidate; they never create authority.
+ */
+async function gcTaskArtifactOwnerStorageContext(
+	storage: FileSessionStorage,
+	sessionsRoot: string,
+	transcriptPath: string,
+	agentDir: string,
+): Promise<{ ownerContext: TaskArtifactOwnerStorageContext; continuation: SessionRetirementContinuation } | undefined> {
+	let snapshot: SessionStorageSnapshot;
+	try {
+		snapshot = storage.readSnapshotSync(transcriptPath);
+	} catch {
+		return undefined;
+	}
+	const firstEnd = snapshot.bytes.indexOf(0x0a);
+	let header: unknown;
+	try {
+		header = JSON.parse(
+			Buffer.from(firstEnd < 0 ? snapshot.bytes : snapshot.bytes.subarray(0, firstEnd)).toString("utf8"),
+		);
+	} catch {
+		return undefined;
+	}
+	if (typeof header !== "object" || header === null || Array.isArray(header)) return undefined;
+	const sessionHeader = header as Record<string, unknown>;
+	const sessionId = sessionHeader.id;
+	const cwd = sessionHeader.cwd;
+	if (sessionHeader.type !== "session" || typeof sessionId !== "string" || typeof cwd !== "string") return undefined;
+	if (!taskArtifactOwnerLocatorFromTranscriptBytes(snapshot.bytes, sessionId)) return undefined;
+
+	const resolved = resolveManagedScope({
+		cwd,
+		agentDir,
+		sessionsRoot,
+	});
+	if (resolved.kind !== "resolved") return undefined;
+	const { scope } = resolved;
+	if (
+		path.resolve(scope.sessionsRoot) !== path.resolve(sessionsRoot) ||
+		path.resolve(scope.directoryPath) !== path.resolve(path.dirname(transcriptPath))
+	)
+		return undefined;
+	const securityPolicy = scope.platform === "win32" ? "windows-existing-verify-first" : "default";
+	return {
+		ownerContext: {
+			rootAuthority: managedRootForScope(scope),
+			sessionsRoot: scope.sessionsRoot,
+			securityPolicy,
+			profileAgentDir: scope.agentDir,
+		},
+		continuation: { managedScope: scope },
+	};
+}
+
+/**
  * Classify (and optionally retire) session transcripts. Returns the transcripts
  * that survived, which is exactly the mark set for the blob sweep.
  */
@@ -1208,8 +1282,9 @@ async function runGcDiskSessions(input: {
 	policy: GcDiskPolicy;
 	now: number;
 	prune: boolean;
+	agentDir: string;
 }): Promise<GcDiskTranscript[]> {
-	const { surface, transcripts, references, policy, now, prune } = input;
+	const { surface, transcripts, references, policy, now, prune, agentDir } = input;
 	const maxAgeMs = policy.sessions_max_age_days * GC_DISK_DAY_MS;
 
 	// The newest transcript in each project directory is the `--continue` resume
@@ -1285,10 +1360,36 @@ async function runGcDiskSessions(input: {
 		// delete authority, and a candidate that fails them is never removable.
 		for (const item of classified) {
 			if (item.record.action !== "would_reclaim") continue;
-			const probe = probeSessionRetirement(storage, surface.root, item.transcript.path);
-			if (probe.kind === "retirable") continue;
-			item.record.action = "keep";
-			item.record.reason = `retention_declined: ${probe.reason}`;
+			try {
+				const ownerAuthority = await gcTaskArtifactOwnerStorageContext(
+					storage,
+					surface.root,
+					item.transcript.path,
+					agentDir,
+				);
+				const probe = probeSessionRetirement(
+					storage,
+					surface.root,
+					item.transcript.path,
+					ownerAuthority?.ownerContext,
+					ownerAuthority?.continuation,
+				);
+				if (probe.kind === "retirable") {
+					if (probe.taskArtifactOwnerDeletionEvidence)
+						item.record.task_artifact_owner_deletion_evidence = probe.taskArtifactOwnerDeletionEvidence;
+					if (probe.taskArtifactOwnerRetired) item.record.task_artifact_owner_retired = true;
+					continue;
+				}
+				item.record.action = "keep";
+				item.record.reason = `retention_declined: ${probe.reason}`;
+				if (probe.reason.includes("task_artifact_owner_")) item.record.error = probe.reason;
+			} catch (error) {
+				const message = gcDiskErrorText(error);
+				item.record.action = "keep";
+				item.record.reason = `retention_declined: ${message}`;
+				item.record.error = message;
+				item.record.withheld = true;
+			}
 		}
 		return classified.filter(item => item.record.action !== "would_reclaim").map(item => item.transcript);
 	}
@@ -1303,7 +1404,29 @@ async function runGcDiskSessions(input: {
 			survivors.push(item.transcript);
 			continue;
 		}
-		const outcome = await retireSessionTranscript(storage, surface.root, item.transcript.path);
+		let outcome: SessionRetirementOutcome;
+		try {
+			const ownerAuthority = await gcTaskArtifactOwnerStorageContext(
+				storage,
+				surface.root,
+				item.transcript.path,
+				agentDir,
+			);
+			outcome = await retireSessionTranscript(
+				storage,
+				surface.root,
+				item.transcript.path,
+				ownerAuthority?.ownerContext,
+				ownerAuthority?.continuation,
+			);
+		} catch (error) {
+			const message = gcDiskErrorText(error);
+			item.record.action = "reclaim_failed";
+			item.record.reason = `retention_failed: ${message}`;
+			item.record.error = message;
+			survivors.push(item.transcript);
+			continue;
+		}
 		if (outcome.kind === "retired") {
 			item.record.action = "reclaimed";
 			continue;
@@ -1315,11 +1438,15 @@ async function runGcDiskSessions(input: {
 			item.record.action = "reclaim_failed";
 			item.record.reason = `retention_incomplete: ${outcome.reason}`;
 			item.record.error = outcome.reason;
+			if (outcome.taskArtifactOwnerDeletionEvidence)
+				item.record.task_artifact_owner_deletion_evidence = outcome.taskArtifactOwnerDeletionEvidence;
+			if (outcome.taskArtifactOwnerRetired) item.record.task_artifact_owner_retired = true;
 			survivors.push(item.transcript);
 			continue;
 		}
 		item.record.action = "keep";
 		item.record.reason = `retention_declined: ${outcome.reason}`;
+		if (outcome.reason.includes("task_artifact_owner_")) item.record.error = outcome.reason;
 		survivors.push(item.transcript);
 	}
 	return survivors;
@@ -2203,6 +2330,7 @@ export async function collectGcDiskReport(input: {
 		policy,
 		now,
 		prune,
+		agentDir,
 	});
 	await runGcDiskBlobs({
 		surface: surfaces.blobs,

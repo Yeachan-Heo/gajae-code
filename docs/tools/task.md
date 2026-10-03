@@ -58,9 +58,15 @@ requests additional per-task isolation in the session's own repository; it is ex
 only when `task.isolation.mode` enables an isolation backend.
 
 `move_session` only narrows to a descendant directory, not a sibling repository.
-User-driven `/move` and SDK cwd relocation are separate surfaces; an already-created
-task tool retains its original repository binding. A fresh target-rooted session avoids
-carrying that old delegation authority across a repository move.
+User-driven `/move` and SDK cwd relocation are separate authorized surfaces. After a
+committed move, new task admissions use the target repository authority and refreshed
+agent resources, even when the task tool was materialized before the move. Already
+admitted tasks (including queued and resumed work) retain their original execution
+scope. Cancellation or failure before publication commits preserves the source scope;
+an error while finalizing an already-published move retains the committed target
+scope. The runtime's committed cwd/generation, not the mere presence of an error,
+determines task admission authority. Arbitrary cwd mutation never grants target
+authority; caller-provided `repositoryBinding` still cannot relocate the session.
 
 `tasks[].tier` is inert while `task.autorouting.enabled` is `false`. When autorouting is active it selects the model chain for that item, an omitted `tier` routes as `balanced`, and the routed pin overrides the manual model chain. See [Autorouting](#autorouting).
 
@@ -102,6 +108,7 @@ Artifacts and side channels:
 - Every subagent with an artifacts dir writes `<id>.md`; `agent://<id>` resolves to that file.
 - If the output file is JSON, `agent://<id>/<path>` and `agent://<id>?q=<query>` perform JSON extraction in `packages/coding-agent/src/internal-urls/agent-protocol.ts`.
 - When the parent session persists artifacts, each subagent also gets `<id>.jsonl` session history.
+- Managed persistent parents use one stable logical-session/tree artifact owner outside the transcript's movable basename tree. Running child writers, prior outputs and numeric artifact allocation survive a parent cwd move and reopening the parent. Its persisted locator is identity data, not permission to open an arbitrary path: the verified managed storage root, directory identity and session-owned manifest must all match. Missing or replaced owners are diagnosed rather than replaced with an empty store; session deletion and disk GC retire only the captured exact owner tree. Known owners are reopened through readonly identity-bound security checks, so a replacement cannot be chmodded or ACL-repaired before refusal. Retirement also checks references across the verified profile's managed cwd scopes, preserving owner payloads still referenced by retained move publications. Managed UUID `.staging` and replacement/append `.replacement` markers prevent retirement-evidence admission while an opened writer descriptor can still change payloads; native scrub alone does not revoke that writer. Retirement evidence binds the original tree and managed parent identity; retries retain a separate, non-expanding native continuation rather than recapturing a larger tree. Durable native payload destruction is distinct from physical namespace cleanup: the POSIX native protocol can scrub authorized files while retaining the exact `.removing` directory. That residual namespace remains journaled and reports `cleanup_pending` in the public `artifacts` phase, not undifferentiated deletion success. Canonical-path absence, empty files or a stale durability flag alone never prove retirement; retained payload and namespace identities are revalidated on replay.
 - Isolated execution writes a unique recovery artifact before cleanup whenever root changes, nested changes, or incomplete-capture evidence exists, including failed/paused/aborted tasks.
 - Async mode returns immediately after job registration, then emits `onUpdate(...)` progress snapshots and later hands completion to the session async-job pipeline.
 
