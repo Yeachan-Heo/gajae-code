@@ -1426,6 +1426,21 @@ const THINKING_CONFIG_OPTIONS = ["off", "minimal", "low", "medium", "high", "xhi
 	name: value,
 }));
 
+function thinkingConfigOptions(query: unknown, currentModel: string | undefined): { value: string; name: string }[] {
+	if (!currentModel) return THINKING_CONFIG_OPTIONS;
+	const separator = currentModel.indexOf("/");
+	if (separator <= 0 || separator === currentModel.length - 1) return THINKING_CONFIG_OPTIONS;
+	const provider = currentModel.slice(0, separator);
+	const id = currentModel.slice(separator + 1);
+	const model = pageItems(query)
+		.map(item => object(item))
+		.find(item => item?.provider === provider && item.id === id);
+	const validLevels = object(model?.thinking)?.validLevels;
+	if (!Array.isArray(validLevels) || validLevels.length === 0) return THINKING_CONFIG_OPTIONS;
+	const levels = validLevels.filter((value): value is string => typeof value === "string");
+	return levels.length === 0 ? THINKING_CONFIG_OPTIONS : levels.map(value => ({ value, name: value }));
+}
+
 /** Maps live canonical SDK config and the selected model catalog into the ACP 1.2.1 session state surface. */
 export function acpSessionStateFromConfig(
 	query: unknown,
@@ -1436,6 +1451,7 @@ export function acpSessionStateFromConfig(
 	const values = configValues(query);
 	const useModelPresets = modelPreset !== undefined;
 	const currentModeId = values.get(MODE_CONFIG_ID) === ACP_PLAN_MODE_ID ? ACP_PLAN_MODE_ID : ACP_DEFAULT_MODE_ID;
+	const thinkingOptions = thinkingConfigOptions(modelCatalogQuery, values.get(MODEL_CONFIG_ID));
 	return {
 		configOptions: [
 			{
@@ -1461,7 +1477,7 @@ export function acpSessionStateFromConfig(
 							? modelPresetConfigOptions(modelCatalogQuery, value)
 							: modelConfigOptions(modelCatalogQuery, value, activeProviders)
 						: option.id === THINKING_CONFIG_ID
-							? THINKING_CONFIG_OPTIONS
+							? thinkingOptions
 							: [...option.options];
 				return [
 					{
@@ -2160,7 +2176,22 @@ export class AcpAgent implements Agent {
 				}
 				break;
 			case THINKING_CONFIG_ID:
-				await this.#adapter(params.sessionId).control("thinking.set", { level: params.value });
+				{
+					const before = await this.#sessionState(params.sessionId);
+					const thinkingOption = before.configOptions?.find(option => option.id === THINKING_CONFIG_ID);
+					if (
+						thinkingOption?.type !== "select" ||
+						!thinkingOption.options.some(option => "value" in option && option.value === params.value)
+					)
+						throw new Error(`Unsupported thinking level: ${params.value}`);
+					await this.#adapter(params.sessionId).control("thinking.set", { level: params.value });
+					const after = await this.#sessionState(params.sessionId);
+					const currentValue = after.configOptions?.find(option => option.id === THINKING_CONFIG_ID)?.currentValue;
+					if (currentValue !== params.value)
+						throw new Error(
+							`Thinking level was not applied: requested ${params.value}, current ${currentValue ?? "unknown"}`,
+						);
+				}
 				break;
 			default: {
 				const operation = ACP_CONFIG_CONTROL_OPERATIONS[params.configId];
