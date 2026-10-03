@@ -1,3 +1,0 @@
-### Fixed
-
-- Anthropic-adaptive models with high/xhigh/max reasoning now receive sufficient `max_tokens` to accommodate both thinking output and message completion. Previously, adaptive requests used the default 32,000-token budget, consuming all tokens for thinking and leaving no output. When reasoning is enabled with adaptive thinking, the budget is now raised to `model.maxTokens` to allow room for both thinking and output. Explicit or configured `maxTokens` values remain authoritative and are not overridden. The fix also treats `maxTokens: 0` (documented as unspecified) the same as `undefined`, matching the behavior of `resolveDefaultRequestMaxTokens` (#6156).

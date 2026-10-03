@@ -128,6 +128,7 @@ export declare class NativeDiagnosticSnapshot {
   revalidate(): NativeDiagnosticSnapshotStatus
   close(): void
 }
+
 /** Retained no-follow authority for the SDK publication namespace. */
 export declare class NativeRetainedBrokerPublication {
   /**
@@ -686,7 +687,7 @@ export declare function __piNativesPublishOutcomeV1(): void
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV0_18_5(): void
+export declare function __piNativesV0_18_6(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.
@@ -1003,19 +1004,6 @@ export interface DependentIdleDeliveryResult {
  * Returns `"dark"` or `"light"` on macOS, `null` on other platforms.
  */
 export declare function detectMacOSAppearance(): MacOSAppearance | null
-
-/** One jsdiff change object: a run of added, removed, or common tokens. */
-export interface DiffChange {
-  /** Joined token text for this run (lines keep their `
-` terminators). */
-  value: string
-  /** Number of tokens in this run. */
-  count: number
-  /** True when this run exists only in the new text. */
-  added: boolean
-  /** True when this run exists only in the old text. */
-  removed: boolean
-}
 
 /**
  * Open a read-only lease over the fixed broker publication under `agentDir`.
@@ -2113,6 +2101,19 @@ export type NativeCanonicalDirectoryIdentity =
 			canonicalPath?: never;
 			code: "not_found" | "not_directory" | "not_utf8" | "network_unsupported" | "identity_unavailable" | "io_error";
 	  }
+
+/** Bytes copied out of one read-only broker publication observation. */
+export interface NativeDiagnosticSnapshotRead {
+  ok: boolean
+  reason?: string
+  bytes?: Uint8Array
+}
+
+/** Outcome of a read-only publication revalidation. */
+export interface NativeDiagnosticSnapshotStatus {
+  ok: boolean
+  reason?: string
+}
 
 export interface NativeDirectoryParentIdentity {
   dev: bigint
