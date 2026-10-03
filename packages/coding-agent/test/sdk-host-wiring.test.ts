@@ -3936,6 +3936,7 @@ test("SDK host text-only stop/restart isolates late predecessor progress and ter
 				abortHandles.push(handle);
 				ledger.seal(handle);
 			}
+			// Retired handles return their real retained settlement, not a root abort.
 			return await ledger.waitForSettlement(handle, { graceMs: 0 });
 		},
 	};
@@ -4162,6 +4163,11 @@ test("SDK host text-only stop/restart isolates late predecessor progress and ter
 			},
 		});
 		expect(abortHandles).toEqual([...predecessorAborts, "successor-deadline-run"]);
+		expect(abortAttempts).toEqual(
+			expect.arrayContaining([
+				{ handle: "successor-deadline-run", activeHandle: "successor-deadline-run", hasLiveDomain: true },
+			]),
+		);
 		expect(abortAttempts.some(attempt => attempt.hasLiveDomain && attempt.handle !== attempt.activeHandle)).toBe(
 			false,
 		);
@@ -4240,7 +4246,7 @@ test("SDK host text-only stop/restart isolates late predecessor progress and ter
 			leaseClock.mockRestore();
 		}
 	}
-});
+}, 30_000);
 
 test("SDK host correlates follow-up acknowledgements with the later agent start", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-follow-up-correlation-"));

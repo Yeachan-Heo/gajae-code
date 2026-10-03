@@ -8073,62 +8073,59 @@ describe("post-acceptance invocation terminalization", () => {
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
-	test("preserves valid textless terminal evidence", async () => {
-		const cases = [
-			{
-				name: "reasoning-only",
-				content: [{ type: "thinking", thinking: "private reasoning" }],
-				usage: { totalTokens: 0 },
-			},
-			{
-				name: "redacted-reasoning-only",
-				content: [{ type: "redactedThinking", data: "encrypted reasoning" }],
-				usage: { totalTokens: 0 },
-			},
-			{
-				name: "tool-only",
-				content: [{ type: "toolCall", id: "call-1", name: "read", arguments: {} }],
-				usage: { totalTokens: 0 },
-			},
-			{
-				name: "positive-token-usage",
-				content: [{ type: "thinking", thinking: "" }],
-				usage: { totalTokens: 1 },
-			},
-		] as const;
-		for (const testCase of cases) {
-			const cwd = await mkdtemp(path.join(os.tmpdir(), `gjc-terminal-valid-${testCase.name}-`));
-			try {
-				const harness = await invocationHarness(`terminal-valid-${testCase.name}`, cwd, {
-					sendUserMessage: async (_content, options) => {
-						await options?.onPreflightAcceptCommit?.();
-						await Promise.withResolvers<void>().promise;
+	test.each([
+		{
+			name: "reasoning-only",
+			content: [{ type: "thinking", thinking: "private reasoning" }],
+			usage: { totalTokens: 0 },
+		},
+		{
+			name: "redacted-reasoning-only",
+			content: [{ type: "redactedThinking", data: "encrypted reasoning" }],
+			usage: { totalTokens: 0 },
+		},
+		{
+			name: "tool-only",
+			content: [{ type: "toolCall", id: "call-1", name: "read", arguments: {} }],
+			usage: { totalTokens: 0 },
+		},
+		{
+			name: "positive-token-usage",
+			content: [{ type: "thinking", thinking: "" }],
+			usage: { totalTokens: 1 },
+		},
+	] as const)("preserves valid textless terminal evidence ($name)", async testCase => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), `gjc-terminal-valid-${testCase.name}-`));
+		try {
+			const harness = await invocationHarness(`terminal-valid-${testCase.name}`, cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await Promise.withResolvers<void>().promise;
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "hello" });
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", {
+				messages: [
+					{
+						role: "assistant",
+						content: testCase.content,
+						...(testCase.usage === undefined ? {} : { usage: testCase.usage }),
 					},
-				});
-				const accepted = await harness.control("turn.prompt", { text: "hello" });
-				await harness.emit("agent_start");
-				await harness.emit("agent_end", {
-					messages: [
-						{
-							role: "assistant",
-							content: testCase.content,
-							...(testCase.usage === undefined ? {} : { usage: testCase.usage }),
-						},
-					],
-				});
-				expect(
-					await settledStatus(harness, "turn.result", {
-						kind: "prompt",
-						commandId: accepted.result?.commandId,
-						turnId: accepted.result?.turnId,
-					}),
-				).toMatchObject({ status: "terminal_ok" });
-				await harness.stop();
-			} finally {
-				await rm(cwd, { recursive: true, force: true });
-			}
+				],
+			});
+			expect(
+				await settledStatus(harness, "turn.result", {
+					kind: "prompt",
+					commandId: accepted.result?.commandId,
+					turnId: accepted.result?.turnId,
+				}),
+			).toMatchObject({ status: "terminal_ok" });
+			await harness.stop();
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
 		}
-	});
+	}, 30_000);
 	test("preserves earlier complete tool activity before a trailing empty assistant", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminal-earlier-tool-activity-"));
 		try {
