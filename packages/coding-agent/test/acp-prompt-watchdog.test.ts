@@ -5,8 +5,9 @@ import { getProviderFirstEventTimeoutFallbackMs } from "@gajae-code/ai/utils/idl
 import { logger, TempDir } from "@gajae-code/utils";
 import packageJson from "../package.json" with { type: "json" };
 import { AcpAgent } from "../src/modes/acp/acp-agent";
-import { AcpSdkAdapter } from "../src/sdk/acp/adapter";
+import { type AcpReconnectFailedHandler, AcpSdkAdapter } from "../src/sdk/acp/adapter";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
+import { SdkClientError } from "../src/sdk/client";
 import { PromptImageUploadStore } from "../src/sdk/host/prompt-image-upload";
 import {
 	ACP_PROMPT_INACTIVITY_TIMEOUT_MS,
@@ -168,6 +169,8 @@ type FixtureOptions = {
 	noActiveTurnAbort?: boolean;
 	imageEchoGate?: { started: () => void; release: Promise<void> };
 	imageProgressMs?: number;
+	allowLiveSessionRecovery?: boolean;
+	recoveryListGate?: { started: () => void; release: Promise<void> };
 	imageControlGate?: { operation: string; started: () => void; release: Promise<void> };
 };
 
@@ -345,7 +348,52 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 					);
 					return;
 				}
+				if (options.allowLiveSessionRecovery && frame.type === "event_replay") {
+					// The held echo is pre-dispatch; this fixture has no sequenced journal events.
+					socket.send(
+						JSON.stringify({
+							type: "event_replay_result",
+							id: frame.id,
+							ok: true,
+							generation: authority.endpointGeneration,
+							lastSeq: 0,
+							events: [],
+						}),
+					);
+					return;
+				}
 				if (frame.type === "broker_request") {
+					if (options.allowLiveSessionRecovery && frame.operation === "session.list") {
+						void (async () => {
+							if (options.recoveryListGate) {
+								options.recoveryListGate.started();
+								await options.recoveryListGate.release;
+							}
+							// Attachment retirement does not stop this still-live published fixture host.
+							socket.send(
+								JSON.stringify({
+									type: "broker_response",
+									id: frame.id,
+									ok: true,
+									result: {
+										sessions: [
+											{
+												...authority,
+												sessionId,
+												locator: { cwd, worktreeRoot: null, stateRoot: path.join(cwd, ".gjc", "state") },
+												live: true,
+											},
+										],
+									},
+								}),
+							);
+						})();
+						return;
+					}
+					if (options.allowLiveSessionRecovery && frame.operation === "session.get_endpoint") {
+						socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: authority }));
+						return;
+					}
 					if (frame.operation !== "session.create") {
 						socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: {} }));
 						return;
@@ -887,6 +935,103 @@ test("cancelling before image echo completes settles locally without aborting a 
 	} finally {
 		echoGate.resolve();
 		fixture.dispose();
+	}
+});
+
+test.each([
+	"drain",
+	"cancel",
+	"deadline",
+	"reject",
+	"gap-deadline",
+] as const)("cancelled image echo retains its %s disposition across same-ID replacement", async mode => {
+	const handlers: AcpReconnectFailedHandler[] = [];
+	const originalSubscribe = AcpSdkAdapter.prototype.onReconnectFailed;
+	const subscription = vi.spyOn(AcpSdkAdapter.prototype, "onReconnectFailed").mockImplementation(function (
+		this: AcpSdkAdapter,
+		handler: AcpReconnectFailedHandler,
+	): () => void {
+		handlers.push(handler);
+		return originalSubscribe.call(this, handler);
+	});
+	const echoStarted = Promise.withResolvers<void>();
+	const echoGate = Promise.withResolvers<void>();
+	const recoveryStarted = Promise.withResolvers<void>();
+	const recoveryGate = Promise.withResolvers<void>();
+	let fixture: Fixture | undefined;
+	try {
+		fixture = await createFixture({
+			allowLiveSessionRecovery: true,
+			imageEchoGate: { started: echoStarted.resolve, release: echoGate.promise },
+			...(mode === "gap-deadline"
+				? { recoveryListGate: { started: recoveryStarted.resolve, release: recoveryGate.promise } }
+				: {}),
+		});
+		const image = Buffer.from(
+			await Bun.file(path.join(import.meta.dir, "fixtures/sdk-inline-image-large.png")).arrayBuffer(),
+		);
+		const predecessor = fixture.agent.prompt({
+			sessionId: fixture.sessionId,
+			prompt: [{ type: "image", mimeType: "image/png", data: image.toString("base64") }],
+		} as PromptRequest);
+		await bounded(echoStarted.promise, "predecessor image publication");
+		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "pre-dispatch cancellation");
+		expect(await bounded(predecessor, "predecessor cancellation")).toEqual({ stopReason: "cancelled" });
+		const installed = handlers.length;
+		const failure = handlers.at(-1);
+		if (!failure) throw new Error("Expected actual reconnect failure subscription");
+		failure(new SdkClientError("reconnect_exhausted", "fixture transport recovery"));
+		if (mode === "gap-deadline") {
+			await bounded(recoveryStarted.promise, "recordless recovery gap");
+			fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS);
+			recoveryGate.resolve();
+		}
+		await waitFor(() => handlers.length > installed, "same-ID replacement subscription");
+		const successor = prompt(fixture, "after replacement");
+		void successor.catch(() => undefined);
+		await Bun.sleep(20);
+		expect(fixture.abortCount()).toBe(0);
+		expect(fixture.promptDeliveryCount()).toBe(0);
+		expect(fixture.updates.filter(update => update.update.sessionUpdate === "user_message_chunk")).toHaveLength(0);
+		if (mode === "drain") {
+			echoGate.resolve();
+			await waitFor(() => fixture?.promptDeliveryCount() === 1, "ordered successor dispatch");
+			expect(
+				fixture.updates
+					.filter(update => update.update.sessionUpdate === "user_message_chunk")
+					.map(update => (update.update as { content: { type: string } }).content.type),
+			).toEqual(["image", "text"]);
+			fixture.sendStopped("end_turn");
+			expect(await bounded(successor, "successor terminal")).toEqual({ stopReason: "end_turn" });
+		} else if (mode === "cancel") {
+			await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel pending successor");
+			expect(await bounded(successor, "pending successor cancellation")).toEqual({ stopReason: "cancelled" });
+			echoGate.resolve();
+			await Bun.sleep(20);
+			expect(fixture.promptDeliveryCount()).toBe(0);
+		} else {
+			if (mode === "deadline") fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS);
+			if (mode === "reject") echoGate.reject(new Error("fixture image publication rejected"));
+			await expect(bounded(successor, "failed replacement publication")).rejects.toMatchObject({
+				code: "connection_closed",
+			});
+			if (mode === "gap-deadline") {
+				echoGate.resolve();
+				await Bun.sleep(20);
+				await expect(prompt(fixture, "after late failed echo completion")).rejects.toMatchObject({
+					code: "connection_closed",
+				});
+			} else {
+				await expect(prompt(fixture, "after publication failure")).rejects.toMatchObject({ code: "not_found" });
+			}
+			expect(fixture.promptDeliveryCount()).toBe(0);
+		}
+		expect(fixture.abortCount()).toBe(0);
+	} finally {
+		echoGate.resolve();
+		recoveryGate.resolve();
+		fixture?.dispose();
+		subscription.mockRestore();
 	}
 });
 

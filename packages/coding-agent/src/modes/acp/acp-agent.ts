@@ -322,8 +322,6 @@ type SessionRecord = {
 	uncertainAbortOwner?: UncertainAbortOwner;
 	/** Set by `session/cancel` so an in-flight prompt settles as `cancelled`, never as an error. */
 	cancelRequested?: boolean;
-	/** A cancelled user echo must finish publication before a successor publishes its message. */
-	cancelledEchoTail?: Promise<void>;
 	/** True once the session's first logical prompt has settled; gates first-turn readiness retries. */
 	firstPromptDone?: boolean;
 	/** Whether the current prompt attempt was observed doing work; reset per attempt, read by the first-turn retry gate. */
@@ -1756,6 +1754,8 @@ export class AcpAgent implements Agent {
 	readonly #retiredPromptAcknowledgements = new Map<string, PromptWaiter>();
 	/** Ready terminal metadata writes retain ownership across same-id record replacement. */
 	readonly #terminalMetadataTails = new Map<string, Promise<void>>();
+	/** Cancelled user publication and its failure survive same-id record replacement. */
+	readonly #cancelledEchoTails = new Map<string, Promise<void>>();
 	/** Unstreamed terminal text retains transcript ownership across same-id replacement. */
 	readonly #finalTextTails = new Map<string, Promise<void>>();
 	/** Generic failure diagnostics publish independently from authoritative terminal ingress. */
@@ -2395,7 +2395,7 @@ export class AcpAgent implements Agent {
 				activePrompt.cancelAcknowledged === true);
 		if (activePrompt && !cancellationPending)
 			throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
-		if (cancellationPending || record.cancelledEchoTail) {
+		if (cancellationPending || this.#cancelledEchoTails.has(params.sessionId)) {
 			const { promise: woken, resolve: wake } = Promise.withResolvers<void>();
 			admissionReservation = { wake, woken };
 			record.pendingPromptAdmission = admissionReservation;
@@ -2419,7 +2419,7 @@ export class AcpAgent implements Agent {
 				if (admissionCancelled()) return { stopReason: "cancelled" };
 				if (!publicationDrained)
 					throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
-				const echoTail = record.cancelledEchoTail;
+				const echoTail = this.#cancelledEchoTails.get(params.sessionId);
 				if (echoTail) {
 					await Promise.race([echoTail, admissionReservation.woken]);
 					if (admissionCancelled()) return { stopReason: "cancelled" };
@@ -3260,9 +3260,13 @@ export class AcpAgent implements Agent {
 		if (waiter && !waiter.dispatched) {
 			if (waiter.echoPublication) {
 				const { promise: tail, resolve, reject } = Promise.withResolvers<void>();
+				let failed = false;
 				const failEcho = (message: string) => {
+					if (this.#cancelledEchoTails.get(params.sessionId) !== tail) return;
+					failed = true;
 					const error = new AcpSdkAdapterError("connection_closed", message);
-					void this.#failSession(params.sessionId, record.adapter, error);
+					const current = this.#sessions.get(params.sessionId);
+					if (current) void this.#failSession(params.sessionId, current.adapter, error);
 					reject(error);
 				};
 				const cancelDeadline = this.#promptWatchdogClock.schedule(
@@ -3275,6 +3279,9 @@ export class AcpAgent implements Agent {
 				void waiter.echoPublication.then(
 					() => {
 						cancelDeadline();
+						if (failed) return;
+						if (this.#cancelledEchoTails.get(params.sessionId) === tail)
+							this.#cancelledEchoTails.delete(params.sessionId);
 						resolve();
 					},
 					() => {
@@ -3282,13 +3289,8 @@ export class AcpAgent implements Agent {
 						failEcho("ACP cancelled user-message publication failed.");
 					},
 				);
-				record.cancelledEchoTail = tail;
+				this.#cancelledEchoTails.set(params.sessionId, tail);
 				void tail.catch(() => undefined);
-				void tail
-					.finally(() => {
-						if (record.cancelledEchoTail === tail) record.cancelledEchoTail = undefined;
-					})
-					.catch(() => undefined);
 			}
 			waiter.cancelAcknowledged = true;
 			await this.#settleCancelledPrompt(params.sessionId, record, waiter);
@@ -4495,6 +4497,7 @@ export class AcpAgent implements Agent {
 	async #teardownSession(id: string, reason: string, closeRemote: boolean): Promise<void> {
 		const record = this.#sessions.get(id);
 		const ownershipBound = record !== undefined || this.#ownedSessionIds.has(id);
+		const cancelledEchoTail = this.#cancelledEchoTails.get(id);
 		this.#beginTeardown(id);
 		try {
 			this.#advanceSessionEpoch(id);
@@ -4583,6 +4586,11 @@ export class AcpAgent implements Agent {
 				this.#pendingCloseIdempotencyKeys.delete(id);
 				this.#uncertainAbortOwners.delete(id);
 			}
+			if (
+				(reason === "closed" || reason === "discarded" || reason === "deleted") &&
+				this.#cancelledEchoTails.get(id) === cancelledEchoTail
+			)
+				this.#cancelledEchoTails.delete(id);
 		} finally {
 			this.#finishTeardown(id);
 		}
@@ -6496,6 +6504,7 @@ export class AcpAgent implements Agent {
 		this.#retiredPromptCorrelations.clear();
 		this.#retiredPromptAcknowledgements.clear();
 		this.#terminalMetadataTails.clear();
+		this.#cancelledEchoTails.clear();
 		this.#finalTextTails.clear();
 		this.#failureDiagnosticTails.clear();
 		this.#promptPhaseTails.clear();

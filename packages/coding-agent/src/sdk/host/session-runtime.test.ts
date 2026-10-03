@@ -6100,62 +6100,59 @@ describe("post-acceptance invocation terminalization", () => {
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
-	test("preserves valid textless terminal evidence", async () => {
-		const cases = [
-			{
-				name: "reasoning-only",
-				content: [{ type: "thinking", thinking: "private reasoning" }],
-				usage: { totalTokens: 0 },
-			},
-			{
-				name: "redacted-reasoning-only",
-				content: [{ type: "redactedThinking", data: "encrypted reasoning" }],
-				usage: { totalTokens: 0 },
-			},
-			{
-				name: "tool-only",
-				content: [{ type: "toolCall", id: "call-1", name: "read", arguments: {} }],
-				usage: { totalTokens: 0 },
-			},
-			{
-				name: "positive-token-usage",
-				content: [{ type: "thinking", thinking: "" }],
-				usage: { totalTokens: 1 },
-			},
-		] as const;
-		for (const testCase of cases) {
-			const cwd = await mkdtemp(path.join(os.tmpdir(), `gjc-terminal-valid-${testCase.name}-`));
-			try {
-				const harness = await invocationHarness(`terminal-valid-${testCase.name}`, cwd, {
-					sendUserMessage: async (_content, options) => {
-						await options?.onPreflightAcceptCommit?.();
-						await Promise.withResolvers<void>().promise;
+	test.each([
+		{
+			name: "reasoning-only",
+			content: [{ type: "thinking", thinking: "private reasoning" }],
+			usage: { totalTokens: 0 },
+		},
+		{
+			name: "redacted-reasoning-only",
+			content: [{ type: "redactedThinking", data: "encrypted reasoning" }],
+			usage: { totalTokens: 0 },
+		},
+		{
+			name: "tool-only",
+			content: [{ type: "toolCall", id: "call-1", name: "read", arguments: {} }],
+			usage: { totalTokens: 0 },
+		},
+		{
+			name: "positive-token-usage",
+			content: [{ type: "thinking", thinking: "" }],
+			usage: { totalTokens: 1 },
+		},
+	] as const)("preserves valid textless terminal evidence ($name)", async testCase => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), `gjc-terminal-valid-${testCase.name}-`));
+		try {
+			const harness = await invocationHarness(`terminal-valid-${testCase.name}`, cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await Promise.withResolvers<void>().promise;
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "hello" });
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", {
+				messages: [
+					{
+						role: "assistant",
+						content: testCase.content,
+						...(testCase.usage === undefined ? {} : { usage: testCase.usage }),
 					},
-				});
-				const accepted = await harness.control("turn.prompt", { text: "hello" });
-				await harness.emit("agent_start");
-				await harness.emit("agent_end", {
-					messages: [
-						{
-							role: "assistant",
-							content: testCase.content,
-							...(testCase.usage === undefined ? {} : { usage: testCase.usage }),
-						},
-					],
-				});
-				expect(
-					await settledStatus(harness, "turn.result", {
-						kind: "prompt",
-						commandId: accepted.result?.commandId,
-						turnId: accepted.result?.turnId,
-					}),
-				).toMatchObject({ status: "terminal_ok" });
-				await harness.stop();
-			} finally {
-				await rm(cwd, { recursive: true, force: true });
-			}
+				],
+			});
+			expect(
+				await settledStatus(harness, "turn.result", {
+					kind: "prompt",
+					commandId: accepted.result?.commandId,
+					turnId: accepted.result?.turnId,
+				}),
+			).toMatchObject({ status: "terminal_ok" });
+			await harness.stop();
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
 		}
-	});
+	}, 30_000);
 	test("preserves earlier complete tool activity before a trailing empty assistant", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminal-earlier-tool-activity-"));
 		try {
@@ -6199,104 +6196,101 @@ describe("post-acceptance invocation terminalization", () => {
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
-	test("fails closed without independent terminal evidence", async () => {
-		const cases = [
-			{ name: "usage-omitted", content: [{ type: "thinking", thinking: "" }], omitUsage: true },
-			{ name: "usage-null", content: [{ type: "thinking", thinking: "" }], usage: null },
-			{ name: "primitive-usage", content: [{ type: "thinking", thinking: "" }], usage: "bad" },
-			{ name: "array-usage", content: [{ type: "thinking", thinking: "" }], usage: [] },
-			{ name: "missing-total-tokens", content: [{ type: "thinking", thinking: "" }], usage: { input: 0 } },
-			{
-				name: "undefined-total-tokens",
-				content: [{ type: "thinking", thinking: "" }],
-				usage: { totalTokens: undefined },
-			},
-			{ name: "negative-total-tokens", content: [{ type: "thinking", thinking: "" }], usage: { totalTokens: -1 } },
-			{
-				name: "nan-total-tokens",
-				content: [{ type: "thinking", thinking: "" }],
-				usage: { totalTokens: Number.NaN },
-			},
-			{
-				name: "infinite-total-tokens",
-				content: [{ type: "thinking", thinking: "" }],
-				usage: { totalTokens: Number.POSITIVE_INFINITY },
-			},
-			{
-				name: "incomplete-tool-call",
-				content: [
+	test.each([
+		{ name: "usage-omitted", content: [{ type: "thinking", thinking: "" }], omitUsage: true },
+		{ name: "usage-null", content: [{ type: "thinking", thinking: "" }], usage: null },
+		{ name: "primitive-usage", content: [{ type: "thinking", thinking: "" }], usage: "bad" },
+		{ name: "array-usage", content: [{ type: "thinking", thinking: "" }], usage: [] },
+		{ name: "missing-total-tokens", content: [{ type: "thinking", thinking: "" }], usage: { input: 0 } },
+		{
+			name: "undefined-total-tokens",
+			content: [{ type: "thinking", thinking: "" }],
+			usage: { totalTokens: undefined },
+		},
+		{ name: "negative-total-tokens", content: [{ type: "thinking", thinking: "" }], usage: { totalTokens: -1 } },
+		{
+			name: "nan-total-tokens",
+			content: [{ type: "thinking", thinking: "" }],
+			usage: { totalTokens: Number.NaN },
+		},
+		{
+			name: "infinite-total-tokens",
+			content: [{ type: "thinking", thinking: "" }],
+			usage: { totalTokens: Number.POSITIVE_INFINITY },
+		},
+		{
+			name: "incomplete-tool-call",
+			content: [
+				{
+					type: "toolCall",
+					id: "call-1",
+					name: "read",
+					arguments: {},
+					incompleteArguments: true,
+					incompleteArgumentsReason: "truncated",
+				},
+			],
+			usage: { totalTokens: 0 },
+		},
+		{
+			name: "malformed-tool-arguments",
+			content: [{ type: "toolCall", id: "call-1", name: "read", arguments: null }],
+			usage: { totalTokens: 0 },
+		},
+		{
+			name: "orphaned-incomplete-reason",
+			content: [
+				{
+					type: "toolCall",
+					id: "call-1",
+					name: "read",
+					arguments: {},
+					incompleteArgumentsReason: "malformed",
+				},
+			],
+			usage: { totalTokens: 0 },
+		},
+	] as const)("fails closed without independent terminal evidence ($name)", async testCase => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), `gjc-terminal-malformed-${testCase.name}-`));
+		try {
+			const harness = await invocationHarness(`terminal-malformed-${testCase.name}`, cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await Promise.withResolvers<void>().promise;
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "hello" });
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", {
+				messages: [
 					{
-						type: "toolCall",
-						id: "call-1",
-						name: "read",
-						arguments: {},
-						incompleteArguments: true,
-						incompleteArgumentsReason: "truncated",
+						role: "assistant",
+						content: testCase.content,
+						...("omitUsage" in testCase ? {} : { usage: testCase.usage }),
 					},
 				],
-				usage: { totalTokens: 0 },
-			},
-			{
-				name: "malformed-tool-arguments",
-				content: [{ type: "toolCall", id: "call-1", name: "read", arguments: null }],
-				usage: { totalTokens: 0 },
-			},
-			{
-				name: "orphaned-incomplete-reason",
-				content: [
-					{
-						type: "toolCall",
-						id: "call-1",
-						name: "read",
-						arguments: {},
-						incompleteArgumentsReason: "malformed",
-					},
-				],
-				usage: { totalTokens: 0 },
-			},
-		] as const;
-		for (const testCase of cases) {
-			const cwd = await mkdtemp(path.join(os.tmpdir(), `gjc-terminal-malformed-${testCase.name}-`));
-			try {
-				const harness = await invocationHarness(`terminal-malformed-${testCase.name}`, cwd, {
-					sendUserMessage: async (_content, options) => {
-						await options?.onPreflightAcceptCommit?.();
-						await Promise.withResolvers<void>().promise;
-					},
-				});
-				const accepted = await harness.control("turn.prompt", { text: "hello" });
-				await harness.emit("agent_start");
-				await harness.emit("agent_end", {
-					messages: [
-						{
-							role: "assistant",
-							content: testCase.content,
-							...("omitUsage" in testCase ? {} : { usage: testCase.usage }),
-						},
-					],
-				});
-				expect(
-					await settledStatus(harness, "turn.result", {
-						kind: "prompt",
-						commandId: accepted.result?.commandId,
-						turnId: accepted.result?.turnId,
-					}),
-				).toMatchObject({
-					status: "failed",
-					error: { code: "prompt_failed", message: "Agent run failed after execution started." },
-					outcome: {
-						kind: "failed",
-						code: "prompt_failed",
-						message: "Agent run failed after execution started.",
-						provenance: "agent_failed",
-						phase: "post_start",
-						category: "agent_runtime",
-					},
-				});
-				await harness.stop();
-			} finally {
-				await rm(cwd, { recursive: true, force: true });
-			}
+			});
+			expect(
+				await settledStatus(harness, "turn.result", {
+					kind: "prompt",
+					commandId: accepted.result?.commandId,
+					turnId: accepted.result?.turnId,
+				}),
+			).toMatchObject({
+				status: "failed",
+				error: { code: "prompt_failed", message: "Agent run failed after execution started." },
+				outcome: {
+					kind: "failed",
+					code: "prompt_failed",
+					message: "Agent run failed after execution started.",
+					provenance: "agent_failed",
+					phase: "post_start",
+					category: "agent_runtime",
+				},
+			});
+			await harness.stop();
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
 		}
 	}, 60_000);
 	test("preserves explicit cancellation for an empty zero-token turn", async () => {
@@ -6360,114 +6354,111 @@ describe("post-acceptance invocation terminalization", () => {
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
-	test("reconciles contract-valid skill completion and agent_end ordering", async () => {
-		const cases = [
-			{
-				name: "completion-real-agent-real",
-				order: "completion-first",
-				completion: "completion",
-				agent: "agent",
-				expected: "completion",
-			},
-			{
-				name: "completion-blank-agent-real",
-				order: "completion-first",
-				completion: " ",
-				agent: "agent",
-				expected: "agent",
-			},
-			{
-				name: "completion-none-agent-real",
-				order: "completion-first",
-				completion: null,
-				agent: "agent",
-				expected: "agent",
-			},
-			{
-				name: "agent-real-completion-real",
-				order: "agent-first",
-				completion: "completion",
-				agent: "agent",
-				expected: "agent",
-			},
-			{
-				name: "agent-real-completion-blank",
-				order: "agent-first",
-				completion: " ",
-				agent: "agent",
-				expected: "agent",
-			},
-			{
-				name: "agent-blank-completion-real",
-				order: "agent-first",
-				completion: "completion",
-				agent: " ",
-				expected: "completion",
-			},
-			{
-				name: "agent-blank-completion-none",
-				order: "agent-first",
-				completion: null,
-				agent: " ",
-				expected: undefined,
-			},
-			{
-				name: "agent-none-completion-real",
-				order: "agent-first",
-				completion: "completion",
-				agent: null,
-				expected: "completion",
-			},
-			{
-				name: "agent-none-completion-blank",
-				order: "agent-first",
-				completion: " ",
-				agent: null,
-				expected: undefined,
-			},
-		] as const;
-		for (const testCase of cases) {
-			const cwd = await mkdtemp(path.join(os.tmpdir(), `gjc-skill-terminal-order-${testCase.name}-`));
-			const completion = Promise.withResolvers<unknown>();
-			const completionReconciled = Promise.withResolvers<void>();
-			try {
-				const harness = await invocationHarness(`skill-terminal-order-${testCase.name}`, cwd, {
-					onInvocationCompletionReconciled: kind => {
-						if (kind === "skill") completionReconciled.resolve();
-					},
-					invokeSkill: async (_name, _args, options) => {
-						await options?.onPreflightAcceptCommit?.();
-						return await completion.promise;
-					},
+	test.each([
+		{
+			name: "completion-real-agent-real",
+			order: "completion-first",
+			completion: "completion",
+			agent: "agent",
+			expected: "completion",
+		},
+		{
+			name: "completion-blank-agent-real",
+			order: "completion-first",
+			completion: " ",
+			agent: "agent",
+			expected: "agent",
+		},
+		{
+			name: "completion-none-agent-real",
+			order: "completion-first",
+			completion: null,
+			agent: "agent",
+			expected: "agent",
+		},
+		{
+			name: "agent-real-completion-real",
+			order: "agent-first",
+			completion: "completion",
+			agent: "agent",
+			expected: "agent",
+		},
+		{
+			name: "agent-real-completion-blank",
+			order: "agent-first",
+			completion: " ",
+			agent: "agent",
+			expected: "agent",
+		},
+		{
+			name: "agent-blank-completion-real",
+			order: "agent-first",
+			completion: "completion",
+			agent: " ",
+			expected: "completion",
+		},
+		{
+			name: "agent-blank-completion-none",
+			order: "agent-first",
+			completion: null,
+			agent: " ",
+			expected: undefined,
+		},
+		{
+			name: "agent-none-completion-real",
+			order: "agent-first",
+			completion: "completion",
+			agent: null,
+			expected: "completion",
+		},
+		{
+			name: "agent-none-completion-blank",
+			order: "agent-first",
+			completion: " ",
+			agent: null,
+			expected: undefined,
+		},
+	] as const)("reconciles contract-valid skill completion and agent_end ordering ($name)", async testCase => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), `gjc-skill-terminal-order-${testCase.name}-`));
+		const completion = Promise.withResolvers<unknown>();
+		const completionReconciled = Promise.withResolvers<void>();
+		try {
+			const harness = await invocationHarness(`skill-terminal-order-${testCase.name}`, cwd, {
+				onInvocationCompletionReconciled: kind => {
+					if (kind === "skill") completionReconciled.resolve();
+				},
+				invokeSkill: async (_name, _args, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					return await completion.promise;
+				},
+			});
+			const accepted = await harness.control("skill.invoke", { name: "ralplan" });
+			const selector = {
+				kind: "skill" as const,
+				commandId: accepted.result?.commandId,
+				turnId: accepted.result?.turnId,
+			};
+			await harness.emit("agent_start");
+			const emitAgentEnd = () =>
+				harness.emit("agent_end", {
+					messages: testCase.agent === null ? [] : [{ role: "assistant", content: testCase.agent }],
 				});
-				const accepted = await harness.control("skill.invoke", { name: "ralplan" });
-				const selector = {
-					kind: "skill" as const,
-					commandId: accepted.result?.commandId,
-					turnId: accepted.result?.turnId,
-				};
-				await harness.emit("agent_start");
-				const emitAgentEnd = () =>
-					harness.emit("agent_end", {
-						messages: testCase.agent === null ? [] : [{ role: "assistant", content: testCase.agent }],
-					});
-				if (testCase.order === "completion-first") {
-					completion.resolve(testCase.completion);
-					await completionReconciled.promise;
-					await emitAgentEnd();
-				} else {
-					await emitAgentEnd();
-					completion.resolve(testCase.completion);
-					await completionReconciled.promise;
-				}
-				const result = await harness.query("turn.result", selector);
-				const content = (result.result as { content?: { text?: string } } | undefined)?.content;
-				expect(content?.text).toBe(testCase.expected);
-				await harness.stop();
-			} finally {
-				completion.resolve(undefined);
-				await rm(cwd, { recursive: true, force: true });
+			if (testCase.order === "completion-first") {
+				completion.resolve(testCase.completion);
+				await completionReconciled.promise;
+				await emitAgentEnd();
+			} else {
+				await emitAgentEnd();
+				completion.resolve(testCase.completion);
+				await completionReconciled.promise;
 			}
+			const result = await harness.query("turn.result", selector);
+			const content = (result.result as { content?: { text?: string } } | undefined)?.content;
+			expect(content?.text).toBe(testCase.expected);
+			await harness.stop();
+		} finally {
+			completion.resolve(undefined);
+			await rm(cwd, { recursive: true, force: true });
 		}
 	}, 30_000);
 	test("a queued follow-up prompt is not terminalized before the turn runs", async () => {
