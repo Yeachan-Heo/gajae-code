@@ -1502,6 +1502,7 @@ export class AuthStorage {
 	#generationListeners: Set<(generation: number) => void> = new Set();
 	#oauthRefreshInFlight: Map<number, Promise<AuthCredentialSnapshotEntry>> = new Map();
 	#oauthCredentialRefreshInFlight: Map<number, Promise<RefreshedOAuthCredentials>> = new Map();
+	#oauthRefreshLeaseHolders = new Map<string, number>();
 	/**
 	 * Locally failed refresh attempts keyed by `${credentialId}:${refreshToken}`.
 	 * See {@link OAUTH_REFRESH_FAILURE_REPLAY_GUARD_MS}.
@@ -5557,9 +5558,22 @@ export class AuthStorage {
 		let localDial = false;
 		let refreshLease: OAuthRefreshLease | undefined;
 		let refreshLeaseCompleted = false;
+		const decrementRefreshLeaseHolder = (): void => {
+			if (!refreshLease) return;
+			const key = String(refreshLease.credentialId);
+			const holders = this.#oauthRefreshLeaseHolders.get(key);
+			if (holders === undefined || holders <= 1) {
+				this.#oauthRefreshLeaseHolders.delete(key);
+			} else {
+				this.#oauthRefreshLeaseHolders.set(key, holders - 1);
+			}
+		};
 		const releaseRefreshLease = (): void => {
 			if (!refreshLease || refreshLeaseCompleted) return;
 			refreshLeaseCompleted = true;
+			const holders = this.#oauthRefreshLeaseHolders.get(String(refreshLease.credentialId)) ?? 1;
+			decrementRefreshLeaseHolder();
+			if (holders > 1) return;
 			try {
 				const releaseLease = this.#store.releaseOAuthRefreshLease?.bind(this.#store);
 				releaseLease?.(refreshLease);
@@ -5623,6 +5637,8 @@ export class AuthStorage {
 						if (claim.kind === "claimed") {
 							credential = claim.credential;
 							refreshLease = claim.lease;
+							const key = String(claim.lease.credentialId);
+							this.#oauthRefreshLeaseHolders.set(key, (this.#oauthRefreshLeaseHolders.get(key) ?? 0) + 1);
 							break;
 						}
 						if (claim.kind === "adopted") {
@@ -5758,6 +5774,7 @@ export class AuthStorage {
 					throw new Error("OAuth token refresh ownership was lost before persistence");
 				}
 				refreshLeaseCompleted = true;
+				decrementRefreshLeaseHolder();
 				authority.persistedByLease = true;
 			}
 			return authority;
