@@ -2887,8 +2887,10 @@ pub(crate) mod platform {
 		path: &Path,
 		kind: &str,
 		// Consulted only by the macOS read-denial retry below.
-		_policy: AcquisitionPolicy,
+		policy: AcquisitionPolicy,
 	) -> Result<CheckedPathAuthority, NativeOwnerOnlySecurityResult> {
+		#[cfg(not(target_os = "macos"))]
+		let _ = policy;
 		if !matches!(kind, "directory" | "file") {
 			return Err(NativeOwnerOnlySecurityResult::failure("io_error"));
 		}
@@ -2983,7 +2985,7 @@ pub(crate) mod platform {
 		let target_fd = if target_fd < 0 && !is_directory {
 			let read_error = std::io::Error::last_os_error();
 			if read_error.raw_os_error() == Some(libc::EACCES)
-				&& _policy == AcquisitionPolicy::RepairableWrite
+				&& policy == AcquisitionPolicy::RepairableWrite
 			{
 				// A hostile macOS ACL may deny reads while leaving owner writes
 				// available. Retry only that denial with write authority so ACLs can
