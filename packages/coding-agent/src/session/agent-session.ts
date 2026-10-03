@@ -1652,7 +1652,10 @@ function isBareDefaultAnthropicOverload(message: AssistantMessage): boolean {
 function assistantMessageHasVisibleOrToolContent(message: AssistantMessage): boolean {
 	return message.content.some(content => {
 		if (content.type === "text") return content.text.length > 0;
-		return content.type === "thinking" || content.type === "redactedThinking" || content.type === "toolCall";
+		if (content.type === "thinking") {
+			return content.thinking.length > 0 || (content.thinkingSignature?.length ?? 0) > 0;
+		}
+		return content.type === "redactedThinking" || content.type === "toolCall";
 	});
 }
 

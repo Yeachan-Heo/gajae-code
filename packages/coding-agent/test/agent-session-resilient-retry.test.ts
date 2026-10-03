@@ -2547,6 +2547,55 @@ describe.serial("AgentSession resilient retry", () => {
 		expect(retryEndEvents).toEqual([expect.objectContaining({ success: true })]);
 		expect(lastAssistant(session).content).toEqual([{ type: "text", text: "recovered after provider retries" }]);
 	});
+	it("retries a Codex overload when the failed attempt only has empty unsigned thinking", async () => {
+		const model = getBundledModel("openai-codex", "gpt-5.4-mini");
+		if (!model) throw new Error("Expected bundled Codex test model to exist");
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			model,
+			bareDefault: true,
+			errorMessage:
+				"Codex error event: Our servers are currently overloaded. Please try again later. (code=server_is_overloaded)",
+			transportFailure: { kind: "transport", providerCode: "server_is_overloaded" },
+			partialBlocks: [{ type: "thinking", thinking: "" }],
+			recoveredContent: "recovered after empty thinking",
+			requestedModels,
+		});
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("recover Codex overload after empty thinking");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(1);
+		expect(requestedModels).toHaveLength(2);
+		expect(lastAssistant(session).content).toEqual([{ type: "text", text: "recovered after empty thinking" }]);
+	});
+	it.each([
+		{ name: "thinking text", content: [{ type: "thinking", thinking: "already reasoned" }] },
+		{ name: "thinking signature", content: [{ type: "thinking", thinking: "", thinkingSignature: "signed" }] },
+		{ name: "tool call", content: [{ type: "toolCall", id: "tool-1", name: "counted", arguments: {} }] },
+	])("does not retry a Codex overload after $name", async ({ name, content }) => {
+		const model = getBundledModel("openai-codex", "gpt-5.4-mini");
+		if (!model) throw new Error("Expected bundled Codex test model to exist");
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			model,
+			bareDefault: true,
+			errorMessage:
+				"Codex error event: Our servers are currently overloaded. Please try again later. (code=server_is_overloaded)",
+			transportFailure: { kind: "transport", providerCode: "server_is_overloaded" },
+			partialBlocks: [...content],
+			recoveredContent: "should not retry",
+			requestedModels,
+		});
+		const { retryStartEvents } = track(session);
+
+		await session.prompt(`surface Codex overload after ${name}`);
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(0);
+		expect(requestedModels).toHaveLength(1);
+	});
 	it("forwards only explicit first-event timeout settings to provider stream options", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
