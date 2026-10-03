@@ -659,6 +659,7 @@ for (const divergent of ["artifacts_removed"] as const) {
 		expect(readManagedGcSessionRetirementReceipt(h.scope, h.context, h.target)?.state).toBe(divergent);
 		const foreign = path.join(h.ownerDir, "foreign.txt");
 		await Bun.write(foreign, "foreign data must survive");
+		await fs.chmod(foreign, 0o600);
 		const changed = captureTaskArtifactOwnerDeletionEvidence(h.context, h.target.sessionId, h.evidence.locator)!;
 		const files = await Array.fromAsync(
 			new Bun.Glob(`**/gc-retirement-*-${divergent}.json`).scan({
@@ -763,12 +764,14 @@ it("refuses locator authority supplied under a foreign managed profile", async (
 	const h = await fixture();
 	const foreign = await fixture();
 	const copied = path.join(foreign.context.sessionsRoot, ".task-artifact-owners", h.evidence.locator.ownerId);
-	await fs.mkdir(copied, { mode: 0o755 });
+	await fs.mkdir(copied, { mode: 0o700 });
 	await Bun.write(
 		path.join(copied, ".gjc-task-artifact-owner-v1.json"),
 		await Bun.file(path.join(h.ownerDir, ".gjc-task-artifact-owner-v1.json")).bytes(),
 	);
+	await fs.chmod(path.join(copied, ".gjc-task-artifact-owner-v1.json"), 0o600);
 	await Bun.write(path.join(copied, "foreign-payload"), "foreign profile bytes");
+	await fs.chmod(path.join(copied, "foreign-payload"), 0o600);
 	const sourceBefore = await snapshotPath(h.ownerDir);
 	const foreignBefore = await snapshotPath(copied);
 	const nativeSpy = vi.spyOn(native, "exactRemoveDirectoryTree");
@@ -979,8 +982,10 @@ for (const replacement of ["missing", "symlink", "different-inode", "foreign-man
 		expect(await snapshotPath(foreign)).toEqual(foreignState);
 		const reopened = await SessionManager.open(h.transcript, SessionManager.managedDestination(h.cwd, h.agentDir));
 		try {
-			expect(() => reopened.getArtifactManager()).toThrow("task_artifact_owner_");
-			await expect(reopened.ensureArtifactManager()).rejects.toThrow("task_artifact_owner_");
+			// Linux can refuse the deliberately unsafe 0755 replacement at its read-only
+			// native security boundary before the owner-domain identity diagnostic.
+			expect(() => reopened.getArtifactManager()).toThrow(/task_artifact_owner_|mode_mismatch/);
+			await expect(reopened.ensureArtifactManager()).rejects.toThrow(/task_artifact_owner_|mode_mismatch/);
 			expect(await Bun.file(h.transcript).text()).toBe(before);
 			expect(await Bun.file(path.join(foreign, "payload")).text()).toBe("foreign bytes");
 			expect(await snapshotPath(retained)).toEqual(originalState);
