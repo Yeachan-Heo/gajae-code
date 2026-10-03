@@ -1390,11 +1390,11 @@ export async function runSessionHost(
 		const failure = capability.normalizeFailure("startup", "failed", "SDK lifecycle host terminated.");
 		interruptStartup(failure);
 	};
-	const onReadySignal = (): void => stop();
 	const registerHostPostmortem = (): void => {
 		if (unregisterHostPostmortem) return;
 		unregisterHostPostmortem = postmortem.register("sdk-session-host:exit", async reason => {
 			if (reason !== postmortem.Reason.SIGTERM && reason !== postmortem.Reason.SIGINT) return;
+			await fs.appendFile("/tmp/gjc-host-trace", `callback ${reason} ${Date.now()}\n`).catch(() => {});
 			// The postmortem signal authority defaults to 143/130; a session host
 			// signal is graceful and must preserve its cleanup result instead.
 			await requestSessionStop(undefined, false);
@@ -1485,8 +1485,6 @@ export async function runSessionHost(
 		revokePendingReadinessMarker = undefined;
 		readinessRevocation = undefined;
 		removeStartupSignalHandlers();
-		process.once("SIGTERM", onReadySignal);
-		process.once("SIGINT", onReadySignal);
 	} catch (error) {
 		if (error instanceof LifecycleReadinessCleanupError) constructionCleanupComplete = false;
 		const failure =
@@ -1499,8 +1497,6 @@ export async function runSessionHost(
 			await failAfterRollback(durableFailure);
 		} finally {
 			removeStartupSignalHandlers();
-			process.removeListener("SIGTERM", onReadySignal);
-			process.removeListener("SIGINT", onReadySignal);
 		}
 		throw error;
 	}
