@@ -7788,7 +7788,7 @@ async function executeLifecycleResponse(
 				`Saved session cleanup is pending in ${deleted.phase}: ${deleted.error.message}`,
 				{
 					cleanupReceiptVersion: 1,
-					phase: deleted.phase,
+					phase: deleted.phase === "task_artifact_owner" ? "artifacts" : deleted.phase,
 					sessionId: validated.target.sessionId,
 					sessionsRoot: validated.target.sessionsRoot,
 					transcriptPath: validated.target.transcriptPath,

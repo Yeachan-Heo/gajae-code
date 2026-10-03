@@ -2439,11 +2439,18 @@ function isAuthorizedArtifactRoot(target: RetiredTarget, plannedRoot: string, pa
 	);
 }
 
+function rejectTaskArtifactOwnerCleanupPending(
+	deletion: Extract<VerifiedSessionDeleteResult, { kind: "cleanup_pending"; phase: "task_artifact_owner" }>,
+): never {
+	throw new Error("task_artifact_owner_retirement_pending", { cause: deletion });
+}
+
 function assertAuthorizedCleanupPending(
 	target: RetiredTarget,
 	active: CleanupReceipt,
 	deletion: Extract<VerifiedSessionDeleteResult, { kind: "cleanup_pending" }>,
 ): void {
+	if (deletion.phase === "task_artifact_owner") rejectTaskArtifactOwnerCleanupPending(deletion);
 	if (
 		(deletion.phase === "artifacts" &&
 			!isAuthorizedArtifactRoot(
@@ -3074,6 +3081,7 @@ function cleanupPendingEvidence(
 	active: CleanupReceipt,
 	deletion: Extract<VerifiedSessionDeleteResult, { kind: "cleanup_pending" }>,
 ): CleanupReceipt {
+	if (deletion.phase === "task_artifact_owner") rejectTaskArtifactOwnerCleanupPending(deletion);
 	return {
 		...retry,
 		expectedArtifactsIdentity:
@@ -4198,6 +4206,8 @@ export async function reconcileManagedTombstones(
 										throw new Error("durability_failed");
 								},
 							);
+							if (deletion.kind === "cleanup_pending" && deletion.phase === "task_artifact_owner")
+								rejectTaskArtifactOwnerCleanupPending(deletion);
 							if (deletion.kind === "cleanup_pending") {
 								if (
 									deletion.phase !== "transcript" ||
@@ -4214,6 +4224,8 @@ export async function reconcileManagedTombstones(
 									throw new Error("durability_failed");
 							}
 						}
+						if (deletion.kind === "cleanup_pending" && deletion.phase === "task_artifact_owner")
+							rejectTaskArtifactOwnerCleanupPending(deletion);
 						if (
 							deletion.kind === "cleanup_pending" &&
 							(deletion.phase !== "transcript" ||
@@ -4884,6 +4896,8 @@ async function deleteManagedSessionCandidateInternal(
 								throw new Error("durability_failed");
 						},
 					);
+					if (deletion.kind === "cleanup_pending" && deletion.phase === "task_artifact_owner")
+						rejectTaskArtifactOwnerCleanupPending(deletion);
 					if (deletion.kind === "cleanup_pending") {
 						if (
 							deletion.phase !== "transcript" ||
@@ -4896,6 +4910,8 @@ async function deleteManagedSessionCandidateInternal(
 						await publishCleanupPending(scope, tombstone, pendingEvidence, lock);
 					}
 				}
+				if (deletion.kind === "cleanup_pending" && deletion.phase === "task_artifact_owner")
+					rejectTaskArtifactOwnerCleanupPending(deletion);
 				if (
 					deletion.kind === "cleanup_pending" &&
 					(deletion.phase !== "transcript" ||
