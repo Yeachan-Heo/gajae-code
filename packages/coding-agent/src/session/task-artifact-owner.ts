@@ -761,7 +761,7 @@ function captureOwnerTreeIfPresent(
 
 function ownerTreeHasPendingManagedPublication(snapshot: NativeDirectoryTreeSnapshot): boolean {
 	return snapshot.entries.some(entry =>
-		/^\..+\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.staging$/.test(
+		/^\..+\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(?:staging|replacement)$/.test(
 			path.posix.basename(entry.relativePath),
 		),
 	);
@@ -1139,7 +1139,7 @@ export function retireTaskArtifactOwner(
 				reason: "task_artifact_owner_parent_identity_changed",
 			};
 
-		// Managed staging may still hold a writable descriptor; scrub cannot revoke it.
+		// Managed publication staging may still hold a writable descriptor; scrub cannot revoke it.
 		if (ownerTreeHasPendingManagedPublication(evidence.treeSnapshot))
 			return {
 				kind: "uncertain",

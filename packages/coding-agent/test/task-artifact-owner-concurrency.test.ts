@@ -5,14 +5,20 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import { safeRm } from "../../../scripts/safe-cleanup";
+import { managedRootForScope, resolveManagedScope } from "../src/session/internal/managed-session-scope";
 import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
 import { SessionManager } from "../src/session/session-manager";
-import { taskArtifactOwnerLocatorFromTranscriptBytes } from "../src/session/session-storage";
+import {
+	FileSessionStorage,
+	retireSessionTranscript,
+	taskArtifactOwnerLocatorFromTranscriptBytes,
+} from "../src/session/session-storage";
 import {
 	captureTaskArtifactOwnerDeletionEvidence,
 	ensureManagedTaskArtifactOwner,
 	parseTaskArtifactOwnerRetirementOutcome,
 	retireTaskArtifactOwner,
+	type TaskArtifactOwnerDeletionEvidence,
 	type TaskArtifactOwnerStorageContext,
 	verifyTaskArtifactOwnerRetirementContinuation,
 } from "../src/session/task-artifact-owner";
@@ -264,6 +270,131 @@ it.skipIf(process.platform !== "darwin")(
 			);
 			await expect(fs.lstat(owner.dir)).rejects.toMatchObject({ code: "ENOENT" });
 		} finally {
+			await h.manager.close();
+		}
+	},
+);
+
+it.skipIf(process.platform !== "darwin")(
+	"refuses an independent managed replacement descriptor before capture or retirement",
+	async () => {
+		const h = await fixture();
+		const owner = await h.manager.ensureArtifactManager();
+		if (!owner) throw new Error("Expected managed owner");
+		const id = await owner.save("original replacement payload", "probe");
+		const payload = await owner.getPath(id);
+		if (!payload) throw new Error("Expected original managed payload");
+		const ready = path.join(h.root, "replacement-ready.json");
+		const release = path.join(h.root, "replacement-release");
+		const child = Bun.spawn(
+			[process.execPath, path.join(import.meta.dir, "fixtures/task-owner-replacement-writer.ts")],
+			{
+				env: {
+					...process.env,
+					GJC_REPLACEMENT_WRITER_INPUT: JSON.stringify({
+						cwd: h.cwd,
+						agentDir: h.home,
+						transcript: h.manager.getSessionFile(),
+						filename: path.basename(payload),
+						ready,
+						release,
+					}),
+				},
+				stdout: "pipe",
+				stderr: "pipe",
+			},
+		);
+		const stdout = new Response(child.stdout).text();
+		const stderr = new Response(child.stderr).text();
+		const nativeSpy = vi.spyOn(native, "exactRemoveDirectoryTree");
+		try {
+			const deadline = Date.now() + 5000;
+			while (!(await Bun.file(ready).exists())) {
+				if (child.exitCode !== null || Date.now() > deadline)
+					throw new Error(`Replacement descriptor fixture failed: ${await stderr}`);
+				await Bun.sleep(10);
+			}
+			const observation = (await Bun.file(ready).json()) as {
+				pid: number;
+				replacement: string;
+				dev: string;
+				ino: string;
+			};
+			expect(observation.pid).not.toBe(process.pid);
+			expect(observation.replacement).toMatch(/\.replacement$/);
+			const locator = taskArtifactOwnerLocatorFromTranscriptBytes(
+				await Bun.file(h.manager.getSessionFile()!).bytes(),
+				h.manager.getSessionId(),
+			);
+			if (!locator) throw new Error("Expected persisted owner locator");
+			let captureFailure: string | undefined;
+			let captured: TaskArtifactOwnerDeletionEvidence | undefined;
+			try {
+				captured = captureTaskArtifactOwnerDeletionEvidence(h.context, h.manager.getSessionId(), locator);
+			} catch (error) {
+				captureFailure = String(error);
+			}
+			if (captured) {
+				const retired = retireTaskArtifactOwner(h.context, captured);
+				await Bun.write(release, "release");
+				await child.exited;
+				if (retired.kind === "payload_retired")
+					expect(
+						await Bun.file(path.join(retired.continuation.retainedRootPath, observation.replacement)).text(),
+					).toBe("");
+				throw new Error("Retirement capture admitted the active replacement descriptor");
+			}
+			expect(captureFailure).toContain("task_artifact_owner_writer_not_quiescent");
+			const stat = await fs.stat(h.context.sessionsRoot, { bigint: true });
+			const store = new ManagedSessionDescendantStore(
+				h.context.rootAuthority,
+				h.context.sessionsRoot,
+				undefined,
+				h.context.securityPolicy,
+				h.context.profileAgentDir,
+				{ canonicalPath: h.context.sessionsRoot, dev: stat.dev, ino: stat.ino },
+			);
+			const raw = {
+				schemaVersion: 2 as const,
+				sessionId: h.manager.getSessionId(),
+				locator,
+				parentIdentity: store.captureDirectoryIdentity(".task-artifact-owners"),
+				treeSnapshot: store.captureTree(`.task-artifact-owners/${locator.ownerId}`),
+			};
+			store.close();
+			expect(retireTaskArtifactOwner(h.context, raw)).toMatchObject({
+				kind: "uncertain",
+				reason: "task_artifact_owner_writer_not_quiescent",
+			});
+			const scope = resolveManagedScope({ cwd: h.cwd, agentDir: h.home, sessionsRoot: h.context.sessionsRoot });
+			if (scope.kind !== "resolved") throw new Error("Expected independent writer GC scope");
+			await expect(
+				retireSessionTranscript(
+					new FileSessionStorage(),
+					h.context.sessionsRoot,
+					h.manager.getSessionFile()!,
+					{ ...h.context, rootAuthority: managedRootForScope(scope.scope) },
+					{ managedScope: scope.scope },
+				),
+			).resolves.toMatchObject({
+				kind: "kept",
+				reason: expect.stringContaining("task_artifact_owner_writer_not_quiescent"),
+			});
+			expect(
+				await Array.fromAsync(
+					new Bun.Glob("**/gc-retirement-*-prepared.json").scan({ cwd: h.context.sessionsRoot, dot: true }),
+				),
+			).toHaveLength(0);
+			expect(nativeSpy.mock.calls).toHaveLength(0);
+			await Bun.write(release, "release");
+			expect(await child.exited, await stderr).toBe(0);
+			expect(JSON.parse(await stdout)).toMatchObject({ status: "acknowledged", pid: observation.pid });
+			expect(await Bun.file(payload).text()).toBe("acknowledged independent replacement payload");
+			expect((await fs.stat(owner.dir, { bigint: true })).ino.toString()).toBe(locator.directoryIno);
+		} finally {
+			await Bun.write(release, "release");
+			await child.exited;
+			nativeSpy.mockRestore();
 			await h.manager.close();
 		}
 	},
