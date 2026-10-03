@@ -1761,10 +1761,17 @@ export async function retireExitedLifecycleMarkerPair(root: string, id: string):
 		return false;
 	}
 	const markerPath = lifecycleMarkerPath(path.dirname(directory), id);
-	const marker = await readEffectMarker(markerPath);
-	if (!marker || observeProcess(marker.pid, marker.incarnation) !== "exited") return false;
 	const primary = captureLifecycleFile(markerPath, true, true);
 	if (!primary) return false;
+	let marker: EffectMarker;
+	try {
+		const parsed = parseLifecycleJson(primary.bytes);
+		if (!isExactEffectMarker(parsed)) return false;
+		marker = parsed;
+	} catch {
+		return false;
+	}
+	if (observeProcess(marker.pid, marker.incarnation) !== "exited") return false;
 	const readyPath = lifecycleReadyPath(path.dirname(directory), id);
 	const ready = captureLifecycleFile(readyPath, true, true);
 	try {
@@ -1784,6 +1791,8 @@ export async function retireExitedLifecycleMarkerPair(root: string, id: string):
 			)
 		)
 			return false;
+		const currentMarker = parseLifecycleJson(currentPrimary.bytes);
+		if (!isExactEffectMarker(currentMarker) || !sameEffectMarker(currentMarker, marker)) return false;
 		if (ready) {
 			const currentReady = captureLifecycleFile(readyPath, true, true);
 			if (
