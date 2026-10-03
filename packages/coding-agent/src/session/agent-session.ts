@@ -234,6 +234,15 @@ import {
 	UnknownModelProfileError,
 	validateModelProfileName,
 } from "../config/model-profile-contract";
+import {
+	commitDurableModelProfileOwnership,
+	type DurableModelProfileOwnership,
+	InvalidModelProfileOwnershipError,
+	ModelProfileOwnershipConflictError,
+	type ModelProfileOwnershipMarker,
+	modelProfileOwnershipMarkersEqual,
+	readDurableModelProfileOwnership,
+} from "../config/model-profile-ownership";
 import { resolveProfileBindings } from "../config/model-profiles";
 import {
 	GJC_MODEL_ASSIGNMENT_TARGETS,
@@ -18593,7 +18602,30 @@ export class AgentSession {
 			// Apply explicit thinking level if given; otherwise prefer the model's
 			// configured defaultLevel; otherwise re-clamp the current level.
 			this.setThinkingLevel(thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel);
-			if (options?.persistAsSessionDefault === true) this.#clearActiveModelProfileForConcreteDefault(options?.cause);
+			if (options?.persistAsSessionDefault === true && options.cause !== "profile-activation") {
+				// Concrete model selection clears session-scoped profile state (#5919).
+				// Materialize durable profiles first (if persisted and active), then reset
+				// without force to preserve durable semantics.
+				if (this.model && this.settings.get("modelProfile.default") !== undefined) {
+					this.materializeActiveDefaultModelProfileAssignment(this.model);
+				}
+				this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: true });
+				// For user-selection and startup-override causes, also clear stale persisted
+				// defaults via the legacy path when there is no ownership record.
+				if (options.cause === "user-selection" || options.cause === "startup-override") {
+					const ownership = readDurableModelProfileOwnership(this.settings);
+					if (ownership.version === 0) {
+						this.#clearActiveModelProfileForConcreteDefault(options.cause);
+					}
+				}
+				const origin = options.cause === "startup-override" ? "startup-override" : "model_selection";
+				const effectiveLevel = thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel;
+				this.setConfiguredModelChain(
+					"default",
+					[formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel)],
+				origin,
+				);
+			}
 			await this.#syncEditToolModeAfterModelChange(previousEditMode);
 		} catch (error) {
 			if (ownsScope) await this.restoreTemporaryProviderSessionScope(scope);
@@ -18684,6 +18716,11 @@ export class AgentSession {
 
 	#publishDefaultModelSelection(model: Model, thinkingLevel: ThinkingLevel, systemPrompt: string[] | undefined): void {
 		this.#clearActiveRetryFallback();
+		// Concrete model selection clears session-scoped profile state (#5919).
+		// IMPORTANT: This is called AFTER durable persistence completes, so the
+		// session-scoped updates occur during the promotion phase after ownership
+		// is committed. Session ownership is captured in the promotion logic above.
+		this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: true });
 		this.#setModelWithProviderSessionReset(model);
 		this.#seedSessionCanonicalVariant(model);
 		const thinkingLevelChanged = this.#thinkingLevel !== thinkingLevel;
@@ -18695,6 +18732,12 @@ export class AgentSession {
 		this.#pendingThinkingVisibilityControlFailure = undefined;
 		this.#thinkingLevel = thinkingLevel;
 		this.agent.setThinkingLevel(toReasoningEffort(thinkingLevel));
+		// Materialize durable profiles after model and thinking level installation
+		// so the persisted default selector matches both the newly installed model
+		// and the selected thinking level.
+		if (this.model && this.settings.get("modelProfile.default") !== undefined) {
+			this.materializeActiveDefaultModelProfileAssignment(this.model);
+		}
 		if (thinkingLevelChanged) {
 			const event: AgentSessionEvent = { type: "thinking_level_changed", thinkingLevel };
 			for (const listener of this.#eventListenerSnapshot) {
@@ -18880,7 +18923,40 @@ export class AgentSession {
 							});
 						}
 					}
-					this.#clearActiveModelProfileForConcreteDefault("user-selection");
+					// Concrete model selection clears durable profile ownership (#5919).
+					// If there is an existing ownership record (version > 0), clear it.
+					// If there is no ownership record (version === 0), call the legacy path to
+					// clear stale persisted profiles that no longer match the selection.
+					// The ownership clear is attempted atomically with other model role updates.
+					// If it fails due to concurrent access, we log and continue: the model
+					// selection has been promoted and committed, so the concrete pick is durable.
+					// A stale profile ownership marker will be resolved on the next session startup.
+					const currentOwnership = readDurableModelProfileOwnership(this.settings);
+					if (currentOwnership.version > 0) {
+						try {
+							await commitDurableModelProfileOwnership(this.settings, { kind: "cleared" });
+						} catch (error) {
+							if (error instanceof ModelProfileOwnershipConflictError) {
+								logger.info("Model selection ownership clear deferred due to concurrent access", {
+									code: "default_model_selection_ownership_conflict",
+									disposition: "continue",
+									expectedVersion: error.expectedVersion,
+									actualVersion: error.actualVersion,
+								});
+							} else if (error instanceof InvalidModelProfileOwnershipError) {
+								logger.warn("Invalid model profile ownership marker during selection", {
+									code: "default_model_selection_ownership_invalid",
+									disposition: "continue",
+								});
+							} else {
+								throw error;
+							}
+						}
+					} else {
+						// Legacy path: no ownership record exists. Clear stale persisted defaults
+						// that no longer match the concrete selection.
+						this.#clearActiveModelProfileForConcreteDefault("user-selection");
+					}
 					options?.onAfterMutation?.();
 					return { provider: model.provider, modelId: model.id, thinkingLevel: effectiveLevel };
 				},
