@@ -13495,6 +13495,22 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * The loaded skill a prompt's text dispatches to, or undefined when `prompt`
+	 * would submit it as ordinary text (unknown or disabled `/skill:` names,
+	 * chains, or attached images). Single source for dispatch and for callers
+	 * that must mirror it, such as startup title seeding.
+	 */
+	resolvePromptSkillInvocation(
+		text: string,
+		images?: readonly unknown[],
+	): ReturnType<typeof parseSkillInvocations>[number] | undefined {
+		if (images?.length || !text.startsWith("/") || !isNamespacedSkillSlashCommandName(text.slice(1))) return;
+		const skillCommands = new Map(this.skills.map(skill => [getSkillSlashCommandName(skill), skill]));
+		const invocations = parseSkillInvocations(text, skillCommands);
+		return invocations.length === 1 ? invocations[0] : undefined;
+	}
+
 	async #promptInternal(
 		text: string,
 		options: PromptOptions | undefined,
@@ -13516,38 +13532,29 @@ export class AgentSession {
 		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 
-		if (
-			expandPromptTemplates &&
-			text.startsWith("/") &&
-			isNamespacedSkillSlashCommandName(text.slice(1)) &&
-			!options?.images?.length
-		) {
-			const skillCommands = new Map(this.skills.map(skill => [getSkillSlashCommandName(skill), skill]));
-			const invocations = parseSkillInvocations(text, skillCommands);
-			if (invocations.length === 1) {
-				const invocation = invocations[0];
-				if (invocation) {
-					await this.invokeSkill(
-						invocation.skill.name,
-						invocation.args,
-						options?.onPreflightAccepted ||
-							options?.onPreflightAcceptCommit ||
-							options?.preflightSignal ||
-							internalOptions?.sdkRunToken
-							? {
-									...(options?.onPreflightAccepted
-										? { onPreflightAccepted: options.onPreflightAccepted }
-										: {}),
-									...(options?.onPreflightAcceptCommit
-										? { onPreflightAcceptCommit: options.onPreflightAcceptCommit }
-										: {}),
-									...(options?.preflightSignal ? { preflightSignal: options.preflightSignal } : {}),
-									...(options?.sdkRunCapability ? { sdkRunCapability: options.sdkRunCapability } : {}),
-								}
-							: undefined,
-					);
-					return;
-				}
+		if (expandPromptTemplates) {
+			const invocation = this.resolvePromptSkillInvocation(text, options?.images);
+			if (invocation) {
+				await this.invokeSkill(
+					invocation.skill.name,
+					invocation.args,
+					options?.onPreflightAccepted ||
+						options?.onPreflightAcceptCommit ||
+						options?.preflightSignal ||
+						internalOptions?.sdkRunToken
+						? {
+								...(options?.onPreflightAccepted
+									? { onPreflightAccepted: options.onPreflightAccepted }
+									: {}),
+								...(options?.onPreflightAcceptCommit
+									? { onPreflightAcceptCommit: options.onPreflightAcceptCommit }
+									: {}),
+								...(options?.preflightSignal ? { preflightSignal: options.preflightSignal } : {}),
+								...(options?.sdkRunCapability ? { sdkRunCapability: options.sdkRunCapability } : {}),
+							}
+						: undefined,
+				);
+				return;
 			}
 		}
 
