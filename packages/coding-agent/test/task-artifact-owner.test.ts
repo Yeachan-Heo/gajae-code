@@ -33,6 +33,8 @@ import {
 	type TaskArtifactOwnerStorageContext,
 } from "../src/session/task-artifact-owner";
 
+import { pauseManagedStagingWriter } from "./fixtures/task-owner-staging";
+
 const roots: string[] = [];
 
 type OwnerGcFixture = {
@@ -250,6 +252,57 @@ it("direct owner retirement proves durable empty payload while honestly retainin
 	);
 	expect(await Bun.file(h.transcript).exists()).toBe(true);
 });
+
+it.skipIf(process.platform !== "darwin")(
+	"GC defers live staging descriptors before publishing original retirement authority",
+	async () => {
+		const h = await fixture();
+		const manager = await SessionManager.open(h.transcript, SessionManager.managedDestination(h.cwd, h.agentDir));
+		const owner = manager.getArtifactManager();
+		if (!owner) throw new Error("Expected admitted GC writer");
+		const writer = pauseManagedStagingWriter(owner.dir);
+		const nativeSpy = vi.spyOn(native, "exactRemoveDirectoryTree");
+		const pending = owner.save("GC live descriptor payload", "probe").then(
+			saved => ({ saved }),
+			error => ({ error: String(error) }),
+		);
+		try {
+			await writer.entered;
+			const before = await Bun.file(h.transcript).bytes();
+			await expect(
+				retireSessionTranscript(new FileSessionStorage(), h.context.sessionsRoot, h.transcript, h.context, {
+					managedScope: h.scope,
+				}),
+			).resolves.toMatchObject({
+				kind: "kept",
+				reason: expect.stringContaining("task_artifact_owner_writer_not_quiescent"),
+			});
+			expect(readManagedGcSessionRetirementReceipt(h.scope, h.context, h.target)).toBeUndefined();
+			expect(
+				nativeSpy.mock.calls.filter(args => args[0] === owner.dir || args[0] === `${owner.dir}.removing`),
+			).toHaveLength(0);
+			expect(await Bun.file(h.transcript).bytes()).toEqual(before);
+			writer.release();
+			const written = await pending;
+			if ("error" in written) throw new Error(written.error);
+			const published = await owner.getPath(written.saved);
+			if (!published) throw new Error("Expected acknowledged GC writer output");
+			expect(await Bun.file(published).text()).toBe("GC live descriptor payload");
+			await expect(
+				retireSessionTranscript(new FileSessionStorage(), h.context.sessionsRoot, h.transcript, h.context, {
+					managedScope: h.scope,
+				}),
+			).resolves.toMatchObject({ kind: "cleanup_pending", taskArtifactOwnerPayloadRetired: true });
+			expect(await Bun.file(h.transcript).bytes()).toEqual(before);
+		} finally {
+			writer.release();
+			await pending;
+			writer.restore();
+			nativeSpy.mockRestore();
+			await manager.close();
+		}
+	},
+);
 
 it.skipIf(process.platform !== "darwin")(
 	"managed GC rejects in-flight owner publication and preserves proof on process restart",

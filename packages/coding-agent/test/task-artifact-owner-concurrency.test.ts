@@ -17,6 +17,8 @@ import {
 	verifyTaskArtifactOwnerRetirementContinuation,
 } from "../src/session/task-artifact-owner";
 
+import { pauseManagedStagingWriter } from "./fixtures/task-owner-staging";
+
 const roots: string[] = [];
 afterEach(async () => {
 	vi.restoreAllMocks();
@@ -262,6 +264,70 @@ it.skipIf(process.platform !== "darwin")(
 			);
 			await expect(fs.lstat(owner.dir)).rejects.toMatchObject({ code: "ENOENT" });
 		} finally {
+			await h.manager.close();
+		}
+	},
+);
+
+it.skipIf(process.platform !== "darwin")(
+	"refuses retirement while an opened managed staging descriptor can still write",
+	async () => {
+		const h = await fixture();
+		const owner = await h.manager.ensureArtifactManager();
+		if (!owner) throw new Error("Expected managed owner");
+		await owner.save("original payload", "probe");
+		const writer = pauseManagedStagingWriter(owner.dir);
+		const removeSpy = vi.spyOn(native, "exactRemoveDirectoryTree");
+		const pending = owner.save("late descriptor payload", "probe").then(
+			value => ({ saved: value }),
+			error => ({ error: String(error) }),
+		);
+		try {
+			await writer.entered;
+			const locator = taskArtifactOwnerLocatorFromTranscriptBytes(
+				await Bun.file(h.manager.getSessionFile()!).bytes(),
+				h.manager.getSessionId(),
+			);
+			if (!locator) throw new Error("Expected persisted owner locator");
+			expect(() => captureTaskArtifactOwnerDeletionEvidence(h.context, h.manager.getSessionId(), locator)).toThrow(
+				"task_artifact_owner_writer_not_quiescent",
+			);
+			const rootStat = await fs.stat(h.context.sessionsRoot, { bigint: true });
+			const store = new ManagedSessionDescendantStore(
+				h.context.rootAuthority,
+				h.context.sessionsRoot,
+				undefined,
+				h.context.securityPolicy,
+				h.context.profileAgentDir,
+				{
+					canonicalPath: h.context.sessionsRoot,
+					dev: rootStat.dev,
+					ino: rootStat.ino,
+				},
+			);
+			const evidence = {
+				schemaVersion: 2 as const,
+				sessionId: h.manager.getSessionId(),
+				locator,
+				parentIdentity: store.captureDirectoryIdentity(".task-artifact-owners"),
+				treeSnapshot: store.captureTree(`.task-artifact-owners/${locator.ownerId}`),
+			};
+			store.close();
+			const result = retireTaskArtifactOwner(h.context, evidence);
+			expect(result).toMatchObject({ kind: "uncertain", reason: "task_artifact_owner_writer_not_quiescent" });
+			expect(removeSpy.mock.calls).toHaveLength(0);
+			writer.release();
+			const written = await pending;
+			if ("error" in written) throw new Error(written.error);
+			const published = await owner.getPath(written.saved);
+			if (!published) throw new Error("Expected acknowledged writer output to survive");
+			expect(await Bun.file(published).text()).toBe("late descriptor payload");
+			expect((await fs.stat(owner.dir, { bigint: true })).ino.toString()).toBe(evidence.locator.directoryIno);
+		} finally {
+			writer.release();
+			await pending;
+			writer.restore();
+			removeSpy.mockRestore();
 			await h.manager.close();
 		}
 	},

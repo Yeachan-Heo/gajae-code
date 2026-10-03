@@ -17,6 +17,8 @@ import {
 	type TaskArtifactOwnerStorageContext,
 } from "../src/session/task-artifact-owner";
 
+import { pauseManagedStagingWriter } from "./fixtures/task-owner-staging";
+
 type FileSnapshot = {
 	relativePath: string;
 	dev: bigint;
@@ -217,6 +219,66 @@ function record(value: unknown): Record<string, unknown> | undefined {
 		? (value as Record<string, unknown>)
 		: undefined;
 }
+
+it.skipIf(process.platform !== "darwin")(
+	"public delete withholds retirement while an opened managed descriptor can still write",
+	async () => {
+		const fixture = await createFixture();
+		const broker = new Broker({ agentDir: fixture.agentDir });
+		const manager = await SessionManager.open(
+			fixture.transcript,
+			SessionManager.managedDestination(fixture.cwd, fixture.agentDir),
+		);
+		const owner = manager.getArtifactManager();
+		if (!owner) throw new Error("Expected live managed owner");
+		const writer = pauseManagedStagingWriter(owner.dir);
+		const nativeSpy = vi.spyOn(native, "exactRemoveDirectoryTree");
+		const pending = owner.save("SDK live descriptor payload", "probe").then(
+			saved => ({ saved }),
+			error => ({ error: String(error) }),
+		);
+		try {
+			await writer.entered;
+			await broker.start();
+			const before = await Bun.file(fixture.transcript).bytes();
+			const response = await broker.handleRequest(
+				"session.delete",
+				{
+					cwd: fixture.cwd,
+					stateRoot: path.join(fixture.cwd, ".gjc", "state"),
+					sessionId: fixture.sessionId,
+					sessionPath: fixture.transcript,
+				},
+				"open-descriptor-delete",
+			);
+			expect(response.ok).toBe(false);
+			const cleanup = cleanupOf(response);
+			expect(cleanup.phase).toBe("artifacts");
+			expect(cleanup.taskArtifactOwnerPayloadRetired).toBeUndefined();
+			expect(cleanup.taskArtifactOwnerTranscriptDeleted).toBeUndefined();
+			expect(cleanup.taskArtifactOwnerCleanupError).toBe("task_artifact_owner_writer_not_quiescent");
+			expect(
+				nativeSpy.mock.calls.filter(args => args[0] === owner.dir || args[0] === `${owner.dir}.removing`),
+			).toHaveLength(0);
+			expect(await Bun.file(fixture.transcript).bytes()).toEqual(before);
+			writer.release();
+			const written = await pending;
+			if ("error" in written) throw new Error(written.error);
+			const published = await owner.getPath(written.saved);
+			if (!published) throw new Error("Expected live writer output");
+			expect(await Bun.file(published).text()).toBe("SDK live descriptor payload");
+			await preserveNewerSession(fixture);
+		} finally {
+			writer.release();
+			await pending;
+			writer.restore();
+			nativeSpy.mockRestore();
+			await manager.close();
+			await broker.stop();
+			await safeRm(fixture.root, { recursive: true, force: true });
+		}
+	},
+);
 
 it.skipIf(process.platform !== "darwin")(
 	"public saved-session delete rejects an in-flight admitted owner publication",

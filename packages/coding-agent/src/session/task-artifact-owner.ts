@@ -759,6 +759,14 @@ function captureOwnerTreeIfPresent(
 	return freezeTreeSnapshot(parseTreeSnapshot(rootStore.captureTree(relative)));
 }
 
+function ownerTreeHasPendingManagedPublication(snapshot: NativeDirectoryTreeSnapshot): boolean {
+	return snapshot.entries.some(entry =>
+		/^\..+\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.staging$/.test(
+			path.posix.basename(entry.relativePath),
+		),
+	);
+}
+
 /** Capture exact, validated owner-tree evidence without repairing its security or timestamps. */
 export function captureTaskArtifactOwnerDeletionEvidence(
 	context: TaskArtifactOwnerStorageContext,
@@ -772,6 +780,8 @@ export function captureTaskArtifactOwnerDeletionEvidence(
 		rootStore.verifyRootSecurity();
 		const parentIdentity = rootStore.captureDirectoryIdentity(OWNER_DIRECTORY);
 		const treeSnapshot = captureValidatedOwnerTree(context, rootStore, sessionId, locator);
+		if (ownerTreeHasPendingManagedPublication(treeSnapshot))
+			throw new Error("task_artifact_owner_writer_not_quiescent");
 		const parentAfter = rootStore.captureDirectoryIdentity(OWNER_DIRECTORY);
 		if (!sameOwnerParentIdentity(parentIdentity, parentAfter))
 			throw new Error("task_artifact_owner_parent_changed_during_capture");
@@ -1127,6 +1137,15 @@ export function retireTaskArtifactOwner(
 				evidence,
 				continuation: fallback,
 				reason: "task_artifact_owner_parent_identity_changed",
+			};
+
+		// Managed staging may still hold a writable descriptor; scrub cannot revoke it.
+		if (ownerTreeHasPendingManagedPublication(evidence.treeSnapshot))
+			return {
+				kind: "uncertain",
+				evidence,
+				continuation: fallback,
+				reason: "task_artifact_owner_writer_not_quiescent",
 			};
 
 		const ownerPath = ownerAbsolutePath(context, evidence.locator.ownerId);

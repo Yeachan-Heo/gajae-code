@@ -320,6 +320,8 @@ export type BrokerCleanupEvidence = {
 	taskArtifactOwnerRetired?: true;
 	/** Durable marker that the transcript effect completed while a payload-retired namespace remains. */
 	taskArtifactOwnerTranscriptDeleted?: true;
+	/** Stable artifacts-phase owner refusal diagnostic retained for retry. */
+	taskArtifactOwnerCleanupError?: string;
 	/** Durable proof that artifact cleanup completed before transcript mutation. */
 	artifactsRemoved?: boolean;
 	artifactsAbsentAtAuthorization?: true;
