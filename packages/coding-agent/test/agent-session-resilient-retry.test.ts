@@ -2048,7 +2048,10 @@ describe.serial("AgentSession resilient retry", () => {
 			getApiKey: provider => `${provider}-test-key`,
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
 			streamFn: (requestedModel, context, options) =>
-				streamOpenAICodexResponses({ ...model, id: requestedModel.id }, context, options ?? {}),
+				streamOpenAICodexResponses({ ...model, id: requestedModel.id }, context, {
+					...(options ?? {}),
+					preferWebsockets: false,
+				}),
 		});
 		const testSession = configureRetryTestSession(
 			new AgentSession({ agent, sessionManager: createRetryTestSessionManager(), settings, modelRegistry }),
@@ -2057,7 +2060,7 @@ describe.serial("AgentSession resilient retry", () => {
 		let requests = 0;
 		const veto = `data: ${JSON.stringify({
 			type: "error",
-			code: "server_error",
+			code: vetoCode,
 			message: `Request blocked (code=${vetoCode})`,
 		})}\n\n`;
 		mockCodexFetch(async () => {
@@ -2065,12 +2068,16 @@ describe.serial("AgentSession resilient retry", () => {
 			return new Response(veto, { headers: { "content-type": "text/event-stream" } });
 		});
 		const { retryStartEvents } = track(testSession);
+		const webSocketSpy = vi.spyOn(globalThis, "WebSocket").mockImplementation((() => {
+			throw new Error("Unexpected Codex WebSocket construction");
+		}) as never);
 
 		await testSession.prompt(`surface configured Codex ${vetoCode} veto`);
 		await testSession.waitForIdle();
 
 		expect(retryStartEvents).toHaveLength(0);
 		expect(requests).toBe(1);
+		expect(webSocketSpy).not.toHaveBeenCalled();
 		await disposeAfterCoordinatorPersistence(testSession);
 		session = undefined;
 	});
@@ -2099,7 +2106,10 @@ describe.serial("AgentSession resilient retry", () => {
 			getApiKey: provider => `${provider}-test-key`,
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
 			streamFn: (requestedModel, context, options) =>
-				streamOpenAICodexResponses({ ...model, id: requestedModel.id }, context, options ?? {}),
+				streamOpenAICodexResponses({ ...model, id: requestedModel.id }, context, {
+					...(options ?? {}),
+					preferWebsockets: false,
+				}),
 		});
 		session = configureRetryTestSession(
 			new AgentSession({ agent, sessionManager: createRetryTestSessionManager(), settings, modelRegistry }),
@@ -2130,12 +2140,16 @@ describe.serial("AgentSession resilient retry", () => {
 		});
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 		const { retryStartEvents } = track(session);
+		const webSocketSpy = vi.spyOn(globalThis, "WebSocket").mockImplementation((() => {
+			throw new Error("Unexpected Codex WebSocket construction");
+		}) as never);
 
 		await session.prompt(`preserve configured Codex ${code} retries`);
 		await session.waitForIdle();
 
 		expect(retryStartEvents.length).toBeGreaterThan(0);
 		expect(requests).toBe(3);
+		expect(webSocketSpy).not.toHaveBeenCalled();
 		expect(lastAssistant(session)).toMatchObject({
 			stopReason: "stop",
 			content: [{ type: "text", text: "recovered" }],
