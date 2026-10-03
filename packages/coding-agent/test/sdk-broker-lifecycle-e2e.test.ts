@@ -813,13 +813,14 @@ test("shipped session host exits promptly after publishing a cutoff receipt", as
 		});
 		if (!child.pid) throw new Error("session host has no pid");
 		const childIncarnation = await incarnation(child.pid);
-		const cutoffStartedAt = performance.now();
 		await fs.writeFile(
 			path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
 			JSON.stringify({ pid: child.pid, effectMarker, incarnation: childIncarnation }),
 		);
+		await waitFor(async () => ((await Bun.file(failurePath).exists()) ? true : undefined), "cutoff receipt");
+		const receiptPublishedAt = performance.now();
 		const outcome = await Promise.race([
-			child.exited.then(code => ({ code, latencyMs: performance.now() - cutoffStartedAt })),
+			child.exited.then(code => ({ code, latencyMs: performance.now() - receiptPublishedAt })),
 			Bun.sleep(1_500).then(() => undefined),
 		]);
 		expect(outcome).toBeDefined();
@@ -4387,7 +4388,7 @@ test("broker directly resumes and forks a canonical cold saved session with scop
 				() => true,
 				() => false,
 			),
-		).toBe(true);
+		).toBe(false);
 		expect(await broker.handleRequest("session.get_endpoint", { sessionId: sourceId })).toMatchObject({
 			ok: false,
 			error: { code: "resource_gone" },
@@ -4455,7 +4456,7 @@ test("broker directly resumes and forks a canonical cold saved session with scop
 				() => true,
 				() => false,
 			),
-		).toBe(true);
+		).toBe(false);
 		expect(await broker.handleRequest("session.get_endpoint", { sessionId: forkId })).toMatchObject({
 			ok: false,
 			error: { code: "resource_gone" },
@@ -4588,7 +4589,7 @@ test("broker replays one identity-bound lifecycle metadata cleanup plan after th
 		const markerPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`);
 		const readyPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.ready.json`);
 		await expect(fs.stat(markerPath)).resolves.toBeDefined();
-		await expect(fs.stat(readyPath)).resolves.toBeDefined();
+		await expect(fs.stat(readyPath)).rejects.toThrow();
 		setLifecycleCleanupHookForTest(crashing, () => {});
 		const deleteInput = { cwd: root, stateRoot, sessionId, sessionPath };
 		await expect(

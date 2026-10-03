@@ -1667,9 +1667,9 @@ export async function reapDeadLifecycleMarkers(
 	let inspected = 0;
 	for await (const entry of directoryHandle) {
 		if (inspected >= inspectionLimit) break;
-		inspected += 1;
 		const name = entry.name;
 		if (!entry.isFile() || !name.endsWith(".lifecycle.json")) continue;
+		inspected += 1;
 		const id = name.slice(0, -".lifecycle.json".length);
 		if (!isCanonicalSessionId(id)) continue;
 		const markerPath = path.join(directory, name);
@@ -1739,6 +1739,108 @@ export async function reapDeadLifecycleMarkers(
 		reaped += 1;
 	}
 	return reaped;
+}
+
+/**
+ * Retires one launch id's lifecycle marker pair after its recorded owner has
+ * exited. Unlike the bounded background sweep, this launch-local repair is
+ * not age-gated and does not require the ready sibling to contain the same
+ * effect marker: the primary marker is the owner authority for this id.
+ */
+type RetireExitedLifecycleMarkerPairHook = () => void | Promise<void>;
+
+async function retireExitedLifecycleMarkerPairImpl(
+	root: string,
+	id: string,
+	afterObservation?: RetireExitedLifecycleMarkerPairHook,
+): Promise<boolean> {
+	if (!isCanonicalSessionId(id)) return false;
+	let directory: string;
+	let directoryIdentity: { dev: bigint; ino: bigint };
+	try {
+		const canonicalRoot = fsSync.realpathSync(root);
+		directory = path.join(canonicalRoot, "sdk");
+		const directoryStat = fsSync.lstatSync(directory, { bigint: true });
+		if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) return false;
+		directoryIdentity = { dev: directoryStat.dev, ino: directoryStat.ino };
+	} catch {
+		return false;
+	}
+	const markerPath = lifecycleMarkerPath(path.dirname(directory), id);
+	const primary = captureLifecycleFile(markerPath, true, true);
+	if (!primary) return false;
+	let marker: EffectMarker;
+	try {
+		const parsed = parseLifecycleJson(primary.bytes);
+		if (!isExactEffectMarker(parsed)) return false;
+		marker = parsed;
+	} catch {
+		return false;
+	}
+	if (observeProcess(marker.pid, marker.incarnation) !== "exited") return false;
+	await afterObservation?.();
+	const readyPath = lifecycleReadyPath(path.dirname(directory), id);
+	const ready = captureLifecycleFile(readyPath, true, true);
+	try {
+		const currentParent = lifecycleParentIdentity(directory);
+		if (
+			!currentParent ||
+			BigInt(currentParent.dev) !== directoryIdentity.dev ||
+			BigInt(currentParent.ino) !== directoryIdentity.ino
+		)
+			return false;
+		const currentPrimary = captureLifecycleFile(markerPath, true, true);
+		await afterObservation?.();
+		if (
+			!currentPrimary ||
+			!sameLifecycleCleanupIdentity(
+				currentPrimary.identity,
+				serializeCleanupIdentity({ ...primary.identity, size: Number(primary.identity.size) }),
+			)
+		)
+			return false;
+		const currentMarker = parseLifecycleJson(currentPrimary.bytes);
+		if (!isExactEffectMarker(currentMarker) || !sameEffectMarker(currentMarker, marker)) return false;
+		if (ready) {
+			const currentReady = captureLifecycleFile(readyPath, true, true);
+			if (
+				!currentReady ||
+				!sameLifecycleCleanupIdentity(
+					currentReady.identity,
+					serializeCleanupIdentity({ ...ready.identity, size: Number(ready.identity.size) }),
+				)
+			)
+				return false;
+			const removedReady = nativeLifecycle().exactUnlinkDirect(readyPath, {
+				...ready.identity,
+				parentDev: directoryIdentity.dev,
+				parentIno: directoryIdentity.ino,
+				quarantineName: `.gjc-reap-${randomUUID()}-${path.basename(readyPath)}`,
+			});
+			if (!removedReady.ok && removedReady.code !== "not_found") return false;
+		}
+		const removedMarker = nativeLifecycle().exactUnlinkDirect(markerPath, {
+			...primary.identity,
+			parentDev: directoryIdentity.dev,
+			parentIno: directoryIdentity.ino,
+			quarantineName: `.gjc-reap-${randomUUID()}-${path.basename(markerPath)}`,
+		});
+		return removedMarker.ok || removedMarker.code === "not_found";
+	} catch {
+		return false;
+	}
+}
+
+export async function retireExitedLifecycleMarkerPair(root: string, id: string): Promise<boolean> {
+	return retireExitedLifecycleMarkerPairImpl(root, id);
+}
+
+export async function retireExitedLifecycleMarkerPairForTest(
+	root: string,
+	id: string,
+	afterObservation: RetireExitedLifecycleMarkerPairHook,
+): Promise<boolean> {
+	return retireExitedLifecycleMarkerPairImpl(root, id, afterObservation);
 }
 
 export async function writeEffectMarker(root: string, id: string, marker: EffectMarker): Promise<void> {
@@ -6650,6 +6752,7 @@ async function executeLifecycleResponse(
 				terminationStartDeadline = childDeadlines.terminationStartDeadlineAt;
 				lifecycleDeadline = childDeadlines.lifecycleCleanupDeadlineAt;
 			}
+			await retireExitedLifecycleMarkerPair(launch.root, launch.id);
 			await reapDeadLifecycleMarkers(launch.root);
 		} catch (error) {
 			if (launch.worktreePlan && worktreeReceipt?.created && !worktreeReceipt.reused) {
