@@ -133,8 +133,8 @@ import {
 	classifyFallbackTrigger,
 	EMPTY_RESPONSE_PROVIDER_CODE,
 	type FallbackAttemptToken,
-	PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE,
 	type FallbackTriggerClass,
+	PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE,
 	SERVER_OVERLOADED_PROVIDER_CODE,
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 } from "@gajae-code/ai/utils/fallback-transport";
@@ -407,11 +407,7 @@ import type { NotificationSessionController } from "../sdk/bus/session-control";
 import { buildSyntheticModelId, syntheticNamespaceCollision } from "../sdk/model-profile-model";
 import { sanitizePromptFailure } from "../sdk/prompt-failure";
 import type { SecretObfuscator } from "../secrets/obfuscator";
-import {
-	formatNoCredentialOnboardingError,
-	formatNoModelOnboardingError,
-	NoModelSelectedError,
-} from "../setup/model-onboarding-guidance";
+import { formatNoCredentialOnboardingError, NoModelSelectedError } from "../setup/model-onboarding-guidance";
 import {
 	isCanonicalGjcWorkflowSkill,
 	isWorkflowContinuationInert,
@@ -12322,7 +12318,9 @@ export class AgentSession {
 	 */
 	get messages(): AgentMessage[] {
 		const messages = this.agent.state.messages;
-		return messages.some(message => message.role === "custom" && this.#isEphemeralCustomMessageType(message.customType))
+		return messages.some(
+			message => message.role === "custom" && this.#isEphemeralCustomMessageType(message.customType),
+		)
 			? this.#withoutEphemeralCustomMessages(messages)
 			: messages;
 	}
@@ -14676,10 +14674,7 @@ export class AgentSession {
 		// prompt still in preflight, aborting) has no run to steer. Ordinary steers
 		// become a sequential follow-up owned by the next turn; SDK turn-bound
 		// steers fail closed rather than being delivered to a successor run.
-		if (
-			options?.expectedSdkRunToken !== undefined &&
-			this.#activeSdkRunToken !== options.expectedSdkRunToken
-		)
+		if (options?.expectedSdkRunToken !== undefined && this.#activeSdkRunToken !== options.expectedSdkRunToken)
 			throw Object.assign(new Error("The expected SDK run is not active."), { code: "turn_not_active" });
 		const admission = this.agent.steer(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
 		if (!admission.admitted) {
