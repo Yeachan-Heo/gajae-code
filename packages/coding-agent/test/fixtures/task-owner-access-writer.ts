@@ -3,9 +3,12 @@ import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import {
+	captureManagedFileNoFollow,
 	type ManagedDirectoryRoot,
 	ManagedSessionDescendantStore,
 	prepareManagedDirectoryRoot,
+	publishManagedFileNoReplace,
+	replaceManagedFileSync,
 } from "../../src/session/internal/managed-session-storage";
 
 interface WriterInput {
@@ -123,7 +126,16 @@ try {
 		});
 		const spy = vi.spyOn(fs, "writeSync").mockImplementation(write);
 		try {
-			store.replaceSync(input.filename, Buffer.from("independent-managed-replacement", "utf8"));
+			const destination = path.join(input.ownerRoot, input.filename);
+			const predecessor = captureManagedFileNoFollow(destination);
+			replaceManagedFileSync(
+				destination,
+				Buffer.from("independent-managed-replacement", "utf8"),
+				expectedOwner,
+				securityPolicy,
+				undefined,
+				predecessor.identity,
+			);
 			if (!held) throw new Error("task_owner_writer_replacement_boundary_missing");
 		} finally {
 			spy.mockRestore();
@@ -152,7 +164,15 @@ try {
 			return handle;
 		});
 		try {
-			await store.publishNoReplace(input.filename, Buffer.from("independent-managed-staging", "utf8"));
+			// Retained Linux stores publish natively without the path API's .staging window.
+			// Exercise the actual managed path publisher on every platform; no native authority is mocked.
+			await publishManagedFileNoReplace(
+				path.join(input.ownerRoot, input.filename),
+				Buffer.from("independent-managed-staging", "utf8"),
+				undefined,
+				expectedOwner,
+				securityPolicy,
+			);
 			if (!held) throw new Error("task_owner_writer_staging_boundary_missing");
 		} finally {
 			open.mockRestore();
