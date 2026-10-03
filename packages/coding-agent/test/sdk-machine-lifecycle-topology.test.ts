@@ -638,7 +638,7 @@ test("shared-agent equal saved IDs select one owner without cross-workspace effe
 		await expect(fs.access(path.join(winner.stateRoot, "sdk", `${A.source.id}.lifecycle.json`))).resolves.toBeNull();
 		await expect(
 			fs.access(path.join(winner.stateRoot, "sdk", `${A.source.id}.lifecycle.ready.json`)),
-		).resolves.toBeNull();
+		).rejects.toThrow();
 		await assertEndpointAndMarkerAbsent(loser, A.source.id);
 		const deleteCall = winner === A ? a : b;
 		const deletion = await (deleteCall === "mcp" ? mcpGlobal : daemonGlobal)(
