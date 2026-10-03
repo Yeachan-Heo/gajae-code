@@ -954,6 +954,78 @@
 		]
 	},
 	{
+		"sourceId": "registry:C54",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "turn.image.begin",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "machine_only",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:C55",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "turn.image.append",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "machine_only",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:C56",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "turn.image.finish",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "machine_only",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:C57",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "turn.image.discard",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "machine_only",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
 		"sourceId": "registry:G01",
 		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
 		"sourceKind": "registry",
@@ -4272,6 +4344,28 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal terminal-abort bus seam (epoch only), threaded via terminalAbortSeams; not a user-facing SDK control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
+		"sourceId": "agent_session:getTerminalRunOwnerForEvent",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal Agent-claimed event ownership proof, read only through the terminalAbortSeams bus capability; not a public SDK operation",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
+		"sourceId": "agent_session:getRunOwnerDomain",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal run-resource ledger domain lookup for accepted-image quota ownership; not a public SDK operation",
 		"exclusionMetadata": {
 			"adapterMappings": "not_applicable",
 			"testIds": "not_applicable"

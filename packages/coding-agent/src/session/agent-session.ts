@@ -31,6 +31,7 @@ import {
 	type AgentMessage,
 	type AgentState,
 	type AgentTool,
+	type AgentTerminalOwnerContext,
 	assertImagePlaceholdersHavePayload,
 	type ContextMaintenanceResult,
 	canContinuePersistedHistory,
@@ -6922,6 +6923,8 @@ export class AgentSession {
 		object,
 		{ scope?: AttemptScope; sdkRunToken?: string; persistGeneration: number; persistBarrier?: Promise<void> }
 	>();
+	/** Extension handlers cannot mutate or replace the Agent-claimed run owner. */
+	#terminalOwnerByExtensionEvent = new WeakMap<object, AgentTerminalOwnerContext>();
 
 	/**
 	 * Capture what is true at the SYNCHRONOUS agent-event boundary, before any async work.
@@ -9928,17 +9931,19 @@ export class AgentSession {
 					deliveryScope,
 				);
 			} else if (event.type === "agent_end") {
-				await this.#extensionRunner.emit(
-					{
-						type: "agent_end",
-						messages: event.messages,
-						stopReason: event.stopReason,
-						maintenanceOutcome: event.maintenanceOutcome,
-						...(sdkRunToken ? { sdkRunToken } : {}),
-					},
-					undefined,
-					deliveryScope,
-				);
+				const extensionEvent = {
+					type: "agent_end" as const,
+					messages: event.messages,
+					stopReason: event.stopReason,
+					maintenanceOutcome: event.maintenanceOutcome,
+					...(sdkRunToken ? { sdkRunToken } : {}),
+				};
+				// Keep the Agent-claimed owner OUTSIDE the public extension event and
+				// its replaceable side channel. Only the owning session may attest
+				// this exact projected event to the SDK bus.
+				const terminalOwner = getAgentTerminalOwnerContext(event);
+				if (terminalOwner) this.#terminalOwnerByExtensionEvent.set(extensionEvent, terminalOwner);
+				await this.#extensionRunner.emit(extensionEvent, undefined, deliveryScope);
 			} else if (event.type === "turn_start") {
 				const hookEvent: TurnStartEvent = {
 					type: "turn_start",
@@ -14771,8 +14776,8 @@ export class AgentSession {
 	/**
 	 * One-shot preflight-abort binding: an invocation cancelled after its queue
 	 * admission must cancel the submission it admitted, so an aborted dispatch
-	 * can never execute later. Both explicit delivery paths (follow-up and
-	 * steer) share this helper so their cancellation semantics cannot diverge
+	 * can never execute later. Explicit and implicitly diverted queue admissions
+	 * share this helper so their cancellation semantics cannot diverge
 	 * (exact-head review P1).
 	 */
 	#bindPreflightAbortCancellation(
@@ -15904,12 +15909,13 @@ export class AgentSession {
 			if (this.#isLiveTurnBusy() && !waitedForAbortUnwind) {
 				if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 				assertPreflightStillOpen();
-				await this.#queueSteer(text, images, {
+				const queuedSteer = await this.#queueSteer(text, images, {
 					claimsGenuineUserIntent: true,
-					onPromoted: options?.onQueuedPromoted,
+					onPromoted: onQueuedPromoted,
 					external: true,
 					sdkRunToken: internalOptions?.sdkRunToken,
 				});
+				this.#bindPreflightAbortCancellation(options?.preflightSignal, queuedSteer);
 				// Dispatch-race disposition (#4668 review P1): the SDK snapshot-decided
 				// this submission starts its own turn (idle at dispatch), but the
 				// session began streaming before sendUserMessage ran, so the message
@@ -15919,8 +15925,15 @@ export class AgentSession {
 				// would terminalize the accepted request as an own-run completion
 				// before it is consumed. Report the internal in-run disposition so the
 				// runtime attaches the correlation to the in-flight run instead.
-				options?.onDispatchDisposition?.({ startsOwnRun: false });
-				options?.onPreflightAccepted?.();
+				try {
+					assertPreflightStillOpen();
+					options?.onDispatchDisposition?.({ startsOwnRun: false });
+					options?.onPreflightAccepted?.();
+					assertPreflightStillOpen();
+				} catch (error) {
+					queuedSteer.cancel();
+					throw error;
+				}
 				return;
 			}
 
@@ -16850,6 +16863,12 @@ export class AgentSession {
 		const lineageIdHash = this.#turnLineageIdHash;
 		if (!lineageIdHash) return undefined;
 		return this.#promptGeneration;
+	}
+	getTerminalRunOwnerForEvent(event: object): AgentTerminalOwnerContext | undefined {
+		return this.#terminalOwnerByExtensionEvent.get(event);
+	}
+	getRunOwnerDomain(handle: string): RunCancellationDomain | undefined {
+		return this.agent.resourceLedger.lookupDomain(handle);
 	}
 	/**
 	 * Logical endpoint used to key owned-registration lineage bindings.
