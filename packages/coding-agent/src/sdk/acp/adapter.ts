@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { logger } from "@gajae-code/utils";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
-import { type SdkClient, SdkClientError } from "../client";
+import { DEFAULT_SDK_REQUEST_TIMEOUT_MS, type SdkClient, SdkClientError, SdkPreparedDispatchError } from "../client";
 import type { AbortScope } from "../host/control/operations";
 import { assertReverseResponseFrame, ReverseLeaseError } from "../host/reverse-leases";
 import {
@@ -143,6 +143,7 @@ const ACP_MCP_PRESERVED_LAUNCH_CODES = new Set([
 	"readiness_timeout",
 	"spawn_failed",
 	"worktree_in_use",
+	"uncertain_after_send",
 ]);
 
 /**
@@ -151,6 +152,29 @@ const ACP_MCP_PRESERVED_LAUNCH_CODES = new Set([
  * broker ERROR frames are also represented as SdkClientError instances with these same codes.
  */
 const ACP_MCP_PRESERVED_TRANSPORT_CODES = new Set(["connection_closed", "unavailable", "timeout"]);
+const ACP_LIFECYCLE_REPLAY_RESPONSE_MARGIN_MS = 2_000;
+
+function replayFailedBeforeDispatch(error: unknown): boolean {
+	if (error instanceof SdkPreparedDispatchError) return true;
+	if (!(error instanceof SdkClientError)) return true;
+	if (!error.transport) return false;
+	if (error.code === "reconnect_exhausted" || error.code === "connection_closed" || error.code === "unavailable")
+		return true;
+	if (error.code !== "timeout") return false;
+	const details = object(error.details);
+	return details?.requestSent !== true;
+}
+
+function replayRefusedBeforeLedger(error: unknown): boolean {
+	if (!(error instanceof SdkClientError) || error.transport) return false;
+	// broker_restarting also covers an in-progress ledger row, where the original
+	// request remains unresolved; both responses must preserve sent uncertainty.
+	return error.code === "broker_restarting" || error.code === "unavailable";
+}
+
+function attachReplayRecovery(error: SdkClientError, recovery: unknown): void {
+	Object.assign(error, { recovery });
+}
 
 /**
  * The error an ACP session launch must throw once a lifecycle request that carried MCP
@@ -602,12 +626,38 @@ export class AcpSdkAdapter {
 		// it on readiness alone times out requests the broker is still running. A
 		// request that named no readiness budget is queued for the default one, so it
 		// needs the same extension rather than the client's generic request deadline.
-		const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
-		const response = await this.#client.global(operation, input, {
+		const timeoutMs = lifecycleRequestTimeoutMs(operation, input) ?? DEFAULT_SDK_REQUEST_TIMEOUT_MS;
+		const deadline = Date.now() + timeoutMs;
+		const options = {
 			idempotencyKey,
-			...(timeoutMs === undefined ? {} : { timeoutMs }),
-		});
-		return response;
+			timeoutMs,
+			deadline,
+		};
+		try {
+			return await this.#client.global(operation, input, options);
+		} catch (error) {
+			if (!(error instanceof SdkClientError) || error.code !== "uncertain_after_send") throw error;
+			const replayTimeoutMs = deadline - Date.now() - ACP_LIFECYCLE_REPLAY_RESPONSE_MARGIN_MS;
+			if (replayTimeoutMs <= 0) throw error;
+			// The broker records lifecycle effects by idempotency key. Replaying the exact
+			// request lets it return the committed result after a transport loss without
+			// creating a second session.
+			try {
+				return await this.#client.global(operation, input, {
+					...options,
+					timeoutMs: replayTimeoutMs,
+				});
+			} catch (replayError) {
+				if (!replayFailedBeforeDispatch(replayError) && !replayRefusedBeforeLedger(replayError)) throw replayError;
+				// The original request was handed to the broker, so its outcome remains
+				// authoritative when reconnecting for the idempotent replay fails before
+				// dispatch or the broker refuses it before lifecycle ledger reconciliation.
+				// Keep its sent identity and details intact; recovery diagnostics live
+				// alongside, not inside, that contract.
+				attachReplayRecovery(error, replayError);
+				throw error;
+			}
+		}
 	}
 
 	async sdkControl(params: { operation: string; input?: JsonObject }): Promise<unknown> {

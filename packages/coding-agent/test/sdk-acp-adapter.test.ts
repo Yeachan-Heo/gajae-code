@@ -7,6 +7,7 @@ import packageJson from "../package.json" with { type: "json" };
 import { AcpAgent, acpRequestFailure } from "../src/modes/acp/acp-agent";
 import { AcpSdkAdapter, type AcpSdkAdapterError, acpMcpLaunchFailure } from "../src/sdk/acp";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
+import { lifecycleRequestTimeoutMs } from "../src/sdk/broker/startup-budget";
 import { SdkClientError } from "../src/sdk/client";
 import { MAX_REVERSE_PAYLOAD_BYTES } from "../src/sdk/host";
 import type { SessionAttachment } from "../src/sdk/router";
@@ -378,6 +379,24 @@ test("ACP SDK adapter maps native and extension methods and keeps endpoint crede
 	await broker.close();
 });
 
+test("ACP lifecycle startup deadline is bounded by the broker startup budget", async () => {
+	const sdk = new FakeSdkClient();
+	const adapter = new AcpSdkAdapter({ client: sdk as never });
+	const startedAt = Date.now();
+	try {
+		const input = { cwd: "/workspace", target: { path: "/workspace" } };
+		await adapter.global("session.create", input, "bounded-startup-key");
+		const frame = sdk.frames.at(-1);
+		const deadline = frame?.deadline;
+		const expected = lifecycleRequestTimeoutMs("session.create", input);
+		if (typeof deadline !== "number" || expected === undefined) throw new Error("startup deadline was not recorded");
+		expect(deadline - startedAt).toBeLessThanOrEqual(expected + 5);
+		expect(frame?.timeoutMs).toBe(expected);
+	} finally {
+		await adapter.close();
+	}
+});
+
 test("Broker client injection cannot service live session controls or queries", async () => {
 	const sdk = new FakeSdkClient();
 	const adapter = new AcpSdkAdapter({ client: sdk as never });
@@ -499,6 +518,7 @@ test("ACP SDK adapter exposes SDK event frames while rejecting raw lifecycle glo
 		input: { cwd: "/workspace" },
 		idempotencyKey: "lifecycle-key",
 		timeoutMs: 21_000,
+		deadline: expect.any(Number),
 	});
 	expect(received).toContainEqual({ type: "event", payload: { type: "turn_end" } });
 	unsubscribe();
@@ -592,7 +612,8 @@ test("ACP lifecycle aliases forward caller idempotency keys outside operation in
 			operation: alias.operation,
 			input: alias.input,
 			idempotencyKey: `alias-${index}`,
-			...(alias.operation === "session.close" ? {} : { timeoutMs: 21_000 }),
+			...(alias.operation === "session.close" ? { timeoutMs: 10_000 } : { timeoutMs: 21_000 }),
+			deadline: expect.any(Number),
 		})),
 	);
 	await adapter.close();
