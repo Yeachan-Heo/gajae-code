@@ -5392,12 +5392,11 @@ async function currentReadyAuthority(
 			token?: unknown;
 			pid?: unknown;
 		};
-		// Native-alive owned readiness is the admission authority. `record.live`
-		// also requires a fresh index heartbeat projection, which can lag a just-
-		// registered detached Windows host. Never admit a terminal/uncertain or
-		// native-dead child; do not refuse a native-alive ready host for a stale live bit.
-		await broker.heartbeatSessions();
-		await broker.index.refresh();
+		// Native-alive owned readiness is the admission authority. The indexed
+		// projection can lag a just-registered detached Windows host, so the
+		// change-stamp refresh is deliberately separate from heartbeat liveness.
+		// Never admit a terminal/uncertain or native-dead child.
+		await broker.index.refreshIfChanged();
 		const record = broker.index
 			.listSessions()
 			.sessions.find(
