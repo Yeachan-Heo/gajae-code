@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import * as nodeFs from "node:fs";
 import { constants as fsConstants, type Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import * as fs from "node:fs/promises";
@@ -89,6 +90,7 @@ export interface WorkflowTransactionJournal {
 	callee?: CanonicalGjcWorkflowSkill;
 	paths: string[];
 	steps: string[];
+	approval_audit_offset?: number;
 }
 
 export type StateWritePolicy = "source" | "cache";
@@ -1559,6 +1561,7 @@ export async function appendAuditEntry(
 	cwd: string,
 	sessionIdOrEntry: string | AuditEntry,
 	maybeEntry?: AuditEntry,
+	options: { lockHeld?: boolean; beforeAppend?: (offset: number) => Promise<unknown> } = {},
 ): Promise<string> {
 	const sessionId =
 		typeof sessionIdOrEntry === "string"
@@ -1568,8 +1571,50 @@ export async function appendAuditEntry(
 	const entry = typeof sessionIdOrEntry === "string" ? maybeEntry : sessionIdOrEntry;
 	if (!entry) throw new Error("audit entry is required");
 	const filePath = resolveGjcTarget(layoutAuditPath(cwd, sessionId), cwd);
-	await fs.mkdir(path.dirname(filePath), { recursive: true });
-	await fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf-8");
+	const append = async () => {
+		await fs.mkdir(path.dirname(filePath), { recursive: true });
+		let initialStat: nodeFs.BigIntStats | undefined;
+		try {
+			initialStat = await fs.lstat(filePath, { bigint: true });
+			if (initialStat.isSymbolicLink() || !initialStat.isFile()) throw new Error("audit path is not a regular file");
+		} catch (error) {
+			if (!isErrno(error, "ENOENT")) throw error;
+		}
+		const flags = initialStat
+			? fsConstants.O_WRONLY |
+				fsConstants.O_APPEND |
+				(process.platform === "win32" ? 0 : (fsConstants.O_NOFOLLOW ?? 0))
+			: fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_EXCL;
+		let handle: fs.FileHandle | undefined;
+		try {
+			handle = await fs.open(filePath, flags, 0o600);
+			const openedStat = await handle.stat({ bigint: true });
+			const pathStat = await fs.lstat(filePath, { bigint: true });
+			const sameObject = (left: nodeFs.BigIntStats, right: nodeFs.BigIntStats) =>
+				left.dev === right.dev && left.ino === right.ino && left.nlink === right.nlink;
+			if (
+				openedStat.isSymbolicLink() ||
+				!openedStat.isFile() ||
+				pathStat.isSymbolicLink() ||
+				!pathStat.isFile() ||
+				(initialStat !== undefined && !sameObject(initialStat, openedStat)) ||
+				!sameObject(openedStat, pathStat)
+			)
+				throw new Error("audit path identity changed before append");
+			if (openedStat.size > BigInt(Number.MAX_SAFE_INTEGER))
+				throw new Error("audit path is too large to append safely");
+			await options.beforeAppend?.(Number(openedStat.size));
+			await handle.writeFile(`${JSON.stringify(entry)}\n`, "utf-8");
+			await handle.sync();
+			const afterPathStat = await fs.lstat(filePath, { bigint: true });
+			if (afterPathStat.isSymbolicLink() || !sameObject(openedStat, afterPathStat))
+				throw new Error("audit path identity changed during append");
+		} finally {
+			await handle?.close();
+		}
+	};
+	if (options.lockHeld) await append();
+	else await withWorkflowStateLock(filePath, append, { cwd });
 	return filePath;
 }
 
