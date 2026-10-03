@@ -448,15 +448,23 @@ describe("broker task artifact owner validation", () => {
 		expect(validPayloadState.payloadRetired).toBe(true);
 		expect(validPayloadState.namespaceRetained).toBe(true);
 		expect(validPayloadState.retirementOutcome?.kind).toBe("payload_retired");
-		expect(() =>
-			decodeBrokerTaskArtifactOwnerCleanupFields(
-				cleanupFields({ ...payloadState, taskArtifactOwnerNamespaceRetained: undefined }),
-				context,
-				sessionId,
-				"artifacts",
-				false,
-			),
-		).toThrow();
+		for (const missing of [
+			"taskArtifactOwnerNamespaceRetained",
+			"taskArtifactOwnerPayloadRetired",
+			"taskArtifactOwnerRetirementOutcome",
+		]) {
+			const incomplete: Record<string, unknown> = { ...payloadState };
+			delete incomplete[missing];
+			expect(() =>
+				decodeBrokerTaskArtifactOwnerCleanupFields(
+					cleanupFields(incomplete),
+					context,
+					sessionId,
+					"artifacts",
+					false,
+				),
+			).toThrow("task_artifact_owner_cleanup_state_invalid");
+		}
 		expect(() =>
 			decodeBrokerTaskArtifactOwnerCleanupFields(
 				{ ...cleanupFields(), unrecognizedOwnerClaim: true },

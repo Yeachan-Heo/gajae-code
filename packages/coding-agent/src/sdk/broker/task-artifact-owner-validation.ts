@@ -229,7 +229,7 @@ export function decodeBrokerTaskArtifactOwnerCleanupFields(
 			payloadRetired !== undefined ||
 			namespaceRetained !== undefined ||
 			transcriptDeleted !== undefined) &&
-			!deletionEvidence) ||
+			(!deletionEvidence || !retirementOutcome)) ||
 		(transcriptDeleted !== undefined &&
 			(phase !== "artifacts" || artifactsRemoved !== true || retirementOutcome === undefined))
 	)
