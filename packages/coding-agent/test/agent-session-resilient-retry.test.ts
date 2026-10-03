@@ -29,6 +29,55 @@ import {
 const REAL_DATE_NOW = Date.now;
 const ORIGINAL_COORDINATOR_STATE_FILE = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
 const ORIGINAL_BEFORE_PERSIST_FROM_EVENT = __sessionStateSidecarTestHooks.beforePersistFromEvent;
+const CODEX_WEBSOCKET_ENV_KEYS = ["GJC_OPENAI_CODE_WEBSOCKET", "PI_CODEX_WEBSOCKET"] as const;
+const ORIGINAL_CODEX_WEBSOCKET_ENV = Object.fromEntries(
+	CODEX_WEBSOCKET_ENV_KEYS.map(key => [key, process.env[key]]),
+) as Record<(typeof CODEX_WEBSOCKET_ENV_KEYS)[number], string | undefined>;
+const ORIGINAL_WEBSOCKET = globalThis.WebSocket;
+
+type CodexFetchInput = Parameters<typeof fetch>[0];
+type CodexFetchInit = Parameters<typeof fetch>[1];
+type CodexFetchHandler = (input: CodexFetchInput, init?: CodexFetchInit) => Response | Promise<Response>;
+
+function isCodexResponsesRequest(input: CodexFetchInput): boolean {
+	const url = input instanceof Request ? input.url : input instanceof URL ? input.href : input;
+	try {
+		return new URL(url).pathname.endsWith("/codex/responses");
+	} catch {
+		return false;
+	}
+}
+
+function mockCodexFetch(handler: CodexFetchHandler) {
+	return vi.spyOn(globalThis, "fetch").mockImplementation((async (input: CodexFetchInput, init: CodexFetchInit) => {
+		if (!isCodexResponsesRequest(input)) return new Response(null, { status: 404 });
+		return handler(input, init);
+	}) as unknown as typeof fetch);
+}
+
+function setCodexWebSocketOptIn(optIn: (typeof CODEX_WEBSOCKET_ENV_KEYS)[number] | undefined): void {
+	for (const key of CODEX_WEBSOCKET_ENV_KEYS) {
+		if (key === optIn) process.env[key] = "1";
+		else delete process.env[key];
+	}
+}
+
+function installCodexWebSocketTripwire(): string[] {
+	const constructions: string[] = [];
+	class UnexpectedCodexWebSocket {
+		static readonly CONNECTING = 0;
+		static readonly OPEN = 1;
+		static readonly CLOSING = 2;
+		static readonly CLOSED = 3;
+
+		constructor(url: string | URL) {
+			constructions.push(String(url));
+			throw new Error("Unexpected Codex WebSocket construction");
+		}
+	}
+	globalThis.WebSocket = UnexpectedCodexWebSocket as unknown as typeof WebSocket;
+	return constructions;
+}
 
 setDefaultTimeout(120_000);
 
@@ -146,18 +195,27 @@ describe.serial("AgentSession resilient retry", () => {
 	afterEach(async () => {
 		// Teardown uses real timer/deadline state. Restore test clocks and scheduler
 		// hooks before disposing so a mocked Date.now cannot wedge cleanup.
-		vi.restoreAllMocks();
 		Date.now = REAL_DATE_NOW;
+		globalThis.WebSocket = ORIGINAL_WEBSOCKET;
+		for (const key of CODEX_WEBSOCKET_ENV_KEYS) {
+			const value = ORIGINAL_CODEX_WEBSOCKET_ENV[key];
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
 		__sessionStateSidecarTestHooks.beforePersistFromEvent = ORIGINAL_BEFORE_PERSIST_FROM_EVENT;
 		const currentSession = session;
 		const currentAuthStorage = authStorage;
 		const currentTempDir = tempDir;
 		session = undefined;
 		if (currentSession) {
+			await currentSession.waitForIdle().catch(() => {});
+			vi.restoreAllMocks();
 			// Keep teardown failures from masking the case result. The explicit loop
 			// disposals below propagate persistence failures after their assertions.
 			await currentSession.awaitCoordinatorRuntimeStatePersistenceForTests().catch(() => {});
 			await currentSession.dispose();
+		} else {
+			vi.restoreAllMocks();
 		}
 		currentAuthStorage.close();
 		currentTempDir.removeSync();
@@ -1454,7 +1512,7 @@ describe.serial("AgentSession resilient retry", () => {
 		);
 		let requests = 0;
 		const providerFailures = 6;
-		vi.spyOn(globalThis, "fetch").mockImplementation((async () => {
+		mockCodexFetch(async () => {
 			requests++;
 			const events =
 				requests <= providerFailures
@@ -1493,7 +1551,7 @@ describe.serial("AgentSession resilient retry", () => {
 			return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(""), {
 				headers: { "content-type": "text/event-stream" },
 			});
-		}) as unknown as typeof fetch);
+		});
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 		const { retryStartEvents, retryEndEvents } = track(session);
 
@@ -1558,10 +1616,10 @@ describe.serial("AgentSession resilient retry", () => {
 		]
 			.map(event => `data: ${JSON.stringify(event)}\n\n`)
 			.join("");
-		vi.spyOn(globalThis, "fetch").mockImplementation((async () => {
+		mockCodexFetch(async () => {
 			requests++;
 			return new Response(requests <= 3 ? failure : success, { headers: { "content-type": "text/event-stream" } });
-		}) as unknown as typeof fetch);
+		});
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 		const { retryStartEvents, retryEndEvents } = track(session);
 
@@ -1606,10 +1664,10 @@ describe.serial("AgentSession resilient retry", () => {
 		);
 		let requests = 0;
 		const failure = `data: ${JSON.stringify({ type: "error", code, message: "persistent upstream failure" })}\n\n`;
-		vi.spyOn(globalThis, "fetch").mockImplementation((async () => {
+		mockCodexFetch(async () => {
 			requests++;
 			return new Response(failure, { headers: { "content-type": "text/event-stream" } });
-		}) as unknown as typeof fetch);
+		});
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 		const { retryStartEvents, retryEndEvents } = track(session);
 
@@ -1671,7 +1729,7 @@ describe.serial("AgentSession resilient retry", () => {
 						preferWebsockets: false,
 					} as Model<"openai-codex-responses">,
 					context,
-					options ?? {},
+					{ ...(options ?? {}), preferWebsockets: false },
 				);
 			},
 		});
@@ -1690,19 +1748,16 @@ describe.serial("AgentSession resilient retry", () => {
 			code,
 			message,
 		})}\n\n`;
-		const fetchSpy = vi
-			.spyOn(globalThis, "fetch")
-			.mockImplementation(
-				(async () =>
-					new Response(errorSse, { headers: { "content-type": "text/event-stream" } })) as unknown as typeof fetch,
-			);
+		const fetchSpy = mockCodexFetch(
+			async () => new Response(errorSse, { headers: { "content-type": "text/event-stream" } }),
+		);
 		const { retryStartEvents } = track(session);
 
 		await session.prompt(`reject unsupported Codex parameter (${mode})`);
 		await session.waitForIdle();
 
 		expect(retryStartEvents).toHaveLength(0);
-		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		expect(fetchSpy.mock.calls.filter(([input]) => isCodexResponsesRequest(input)).length).toBe(1);
 		expect(streamCalls.get(primary.id)).toBe(1);
 		expect(streamCalls.get(fallback.id)).toBeUndefined();
 		expect(lastAssistant(session)).toMatchObject({ stopReason: "error" });
@@ -1833,12 +1888,12 @@ describe.serial("AgentSession resilient retry", () => {
 		]
 			.map(event => `data: ${JSON.stringify(event)}\n\n`)
 			.join("");
-		vi.spyOn(globalThis, "fetch").mockImplementation((async () => {
+		mockCodexFetch(async () => {
 			requests++;
 			return new Response(requests === 1 ? overload : success, {
 				headers: { "content-type": "text/event-stream" },
 			});
-		}) as unknown as typeof fetch);
+		});
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 
 		await session.prompt("recover code-only Codex overload");
@@ -1873,7 +1928,7 @@ describe.serial("AgentSession resilient retry", () => {
 				return streamOpenAICodexResponses(
 					{ ...requestedModel, api: "openai-codex-responses", preferWebsockets: false },
 					context,
-					options ?? {},
+					{ ...(options ?? {}), preferWebsockets: false },
 				);
 			},
 		});
@@ -1891,11 +1946,11 @@ describe.serial("AgentSession resilient retry", () => {
 			message:
 				"Invalid schema for function 'computer': schema must have type 'object' and not have 'oneOf' at the top level. (code=invalid_function_parameters)",
 		})}\n\n`;
-		vi.spyOn(globalThis, "fetch").mockImplementation(
-			(async () =>
+		mockCodexFetch(
+			async () =>
 				new Response(errorSse, {
 					headers: { "content-type": "text/event-stream" },
-				})) as unknown as typeof fetch,
+				}),
 		);
 
 		await session.prompt(`surface managed Codex ${code} schema veto`);
@@ -1942,12 +1997,12 @@ describe.serial("AgentSession resilient retry", () => {
 					"Invalid schema for function 'computer': schema must have type 'object' and not have 'oneOf' at the top level. (code=invalid_function_parameters)",
 			},
 		];
-		vi.spyOn(globalThis, "fetch").mockImplementation((async () => {
+		mockCodexFetch(async () => {
 			requests++;
 			return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(""), {
 				headers: { "content-type": "text/event-stream" },
 			});
-		}) as unknown as typeof fetch);
+		});
 		const { retryStartEvents } = track(session);
 
 		await session.prompt(`surface Codex ${code} schema validation`);
@@ -1990,10 +2045,10 @@ describe.serial("AgentSession resilient retry", () => {
 			message:
 				"Invalid schema for function 'computer': schema must have type 'object'. (code=invalid_function_parameters)",
 		})}\n\n`;
-		vi.spyOn(globalThis, "fetch").mockImplementation((async () => {
+		mockCodexFetch(async () => {
 			requests++;
 			return new Response(veto, { headers: { "content-type": "text/event-stream" } });
-		}) as unknown as typeof fetch);
+		});
 		const { retryStartEvents } = track(session);
 
 		await session.prompt(`surface configured Codex ${code} schema veto`);
@@ -2005,12 +2060,22 @@ describe.serial("AgentSession resilient retry", () => {
 		session = undefined;
 	});
 	it.each([
-		"invalid_prompt",
-		"invalid_function_parameters",
-	])("does not retry configured Codex explicit terminal veto %s", async vetoCode => {
+		[undefined, "invalid_prompt"],
+		[undefined, "invalid_function_parameters"],
+		["GJC_OPENAI_CODE_WEBSOCKET", "invalid_prompt"],
+		["GJC_OPENAI_CODE_WEBSOCKET", "invalid_function_parameters"],
+		["PI_CODEX_WEBSOCKET", "invalid_prompt"],
+		["PI_CODEX_WEBSOCKET", "invalid_function_parameters"],
+	] as const)("does not retry configured Codex explicit terminal veto %s %s", async (optIn, vetoCode) => {
+		setCodexWebSocketOptIn(optIn);
+		const webSocketConstructions = installCodexWebSocketTripwire();
 		const bundled = getBundledModel("openai-codex", "gpt-5.5");
 		if (!bundled) throw new Error("Expected bundled Codex test model to exist");
-		const model: Model<"openai-codex-responses"> = { ...bundled, api: "openai-codex-responses" };
+		const model: Model<"openai-codex-responses"> = {
+			...bundled,
+			api: "openai-codex-responses",
+			preferWebsockets: false,
+		};
 		authStorage.setRuntimeApiKey(model.provider, "fake-key");
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
@@ -2024,7 +2089,10 @@ describe.serial("AgentSession resilient retry", () => {
 			getApiKey: provider => `${provider}-test-key`,
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
 			streamFn: (requestedModel, context, options) =>
-				streamOpenAICodexResponses({ ...model, id: requestedModel.id }, context, options ?? {}),
+				streamOpenAICodexResponses({ ...model, id: requestedModel.id }, context, {
+					...(options ?? {}),
+					preferWebsockets: false,
+				}),
 		});
 		const testSession = configureRetryTestSession(
 			new AgentSession({ agent, sessionManager: createRetryTestSessionManager(), settings, modelRegistry }),
@@ -2036,10 +2104,10 @@ describe.serial("AgentSession resilient retry", () => {
 			code: "server_error",
 			message: `Request blocked (code=${vetoCode})`,
 		})}\n\n`;
-		vi.spyOn(globalThis, "fetch").mockImplementation((async () => {
+		mockCodexFetch(async () => {
 			requests++;
 			return new Response(veto, { headers: { "content-type": "text/event-stream" } });
-		}) as unknown as typeof fetch);
+		});
 		const { retryStartEvents } = track(testSession);
 
 		await testSession.prompt(`surface configured Codex ${vetoCode} veto`);
@@ -2047,16 +2115,27 @@ describe.serial("AgentSession resilient retry", () => {
 
 		expect(retryStartEvents).toHaveLength(0);
 		expect(requests).toBe(1);
+		expect(webSocketConstructions).toEqual([]);
 		await disposeAfterCoordinatorPersistence(testSession);
 		session = undefined;
 	});
 	it.each([
-		"server_error",
-		"internal_error",
-	])("preserves configured legacy retries for content-free Codex %s", async code => {
+		[undefined, "server_error"],
+		[undefined, "internal_error"],
+		["GJC_OPENAI_CODE_WEBSOCKET", "server_error"],
+		["GJC_OPENAI_CODE_WEBSOCKET", "internal_error"],
+		["PI_CODEX_WEBSOCKET", "server_error"],
+		["PI_CODEX_WEBSOCKET", "internal_error"],
+	] as const)("preserves configured legacy retries for content-free Codex %s %s", async (optIn, code) => {
+		setCodexWebSocketOptIn(optIn);
+		const webSocketConstructions = installCodexWebSocketTripwire();
 		const bundled = getBundledModel("openai-codex", "gpt-5.5");
 		if (!bundled) throw new Error("Expected bundled Codex test model to exist");
-		const model: Model<"openai-codex-responses"> = { ...bundled, api: "openai-codex-responses" };
+		const model: Model<"openai-codex-responses"> = {
+			...bundled,
+			api: "openai-codex-responses",
+			preferWebsockets: false,
+		};
 		authStorage.setRuntimeApiKey(model.provider, "fake-key");
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
@@ -2071,7 +2150,10 @@ describe.serial("AgentSession resilient retry", () => {
 			getApiKey: provider => `${provider}-test-key`,
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
 			streamFn: (requestedModel, context, options) =>
-				streamOpenAICodexResponses({ ...model, id: requestedModel.id }, context, options ?? {}),
+				streamOpenAICodexResponses({ ...model, id: requestedModel.id }, context, {
+					...(options ?? {}),
+					preferWebsockets: false,
+				}),
 		});
 		session = configureRetryTestSession(
 			new AgentSession({ agent, sessionManager: createRetryTestSessionManager(), settings, modelRegistry }),
@@ -2094,12 +2176,12 @@ describe.serial("AgentSession resilient retry", () => {
 		]
 			.map(event => `data: ${JSON.stringify(event)}\n\n`)
 			.join("");
-		vi.spyOn(globalThis, "fetch").mockImplementation((async () => {
+		mockCodexFetch(async () => {
 			requests++;
 			return new Response(requests <= 2 ? failure : success, {
 				headers: { "content-type": "text/event-stream" },
 			});
-		}) as unknown as typeof fetch);
+		});
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 		const { retryStartEvents } = track(session);
 
@@ -2108,6 +2190,7 @@ describe.serial("AgentSession resilient retry", () => {
 
 		expect(retryStartEvents.length).toBeGreaterThan(0);
 		expect(requests).toBe(3);
+		expect(webSocketConstructions).toEqual([]);
 		expect(lastAssistant(session)).toMatchObject({
 			stopReason: "stop",
 			content: [{ type: "text", text: "recovered" }],
