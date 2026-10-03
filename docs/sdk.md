@@ -450,6 +450,34 @@ retires joined attribution; late predecessor progress or terminal events cannot
 adopt or settle a successor. Transport or delivery failure alone does not prove
 execution settled and does not retire a live unsettled execution owner.
 
+### SDK image staging
+
+Both standalone and notification SDK hosts expose `turn.image.begin`,
+`turn.image.append`, `turn.image.finish`, and `turn.image.discard`. The full SDK
+frame cap remains 256 KiB. Finished references are scoped to the authenticated
+live connection and session and are one-shot: `turn.prompt` accepts
+`stagedImages: [{ id }]`, never mixed with direct `images`, and preserves original
+source bytes and MIME. Redemption remains consumed after later admission failure.
+
+Each upload has a two-minute inactivity lease, declared byte length, MIME and
+SHA-256 digest. Successful begin, append and finish renew only live entries of
+that authenticated owner's explicit `batchId` (nonempty, at most 128 characters).
+Without an explicit batch, only the upload itself renews. Rejected traffic, other
+owners, other batches and cleanup never renew or resurrect expired entries.
+Chunks are canonical base64 in sequence, at most 96 KiB decoded each. Exact
+length, digest, MIME/header agreement, dimensions and decoding are validated
+before a reference is usable.
+
+A prompt accepts at most 16 images, each at most 20 MiB, with 64 MiB source limits
+for pending and accepted images and a shared 256 MiB process payload/copy budget.
+Appends coalesce into retained 96 KiB slabs; tiny uploads reserve at least 4 KiB.
+Actual retained allocation is charged before creation; finalization releases slab
+padding. Expiry, discard and connection loss retire unconsumed upload capacity.
+Accepted capacity belongs to the exact consuming run and cancellation domain
+until proven settlement or session teardown. A fatal transport diagnostic or
+delivery-record expiry alone never releases bytes still owned by an unsettled run.
+Closed queued controls cannot recreate staging resources.
+
 `turn.prompt` remains ordered and non-idempotent. Its envelope `idempotencyKey`
 does not replay a response or produce `idempotency_conflict`. A retained duplicate
 `clientRef` fails before execution with `client_ref_conflict`, but callers must not
@@ -471,8 +499,11 @@ accepted turn count — including a running tool's partial-result `tool_executio
 long-running tool that streams output (e.g. a multi-minute compile) keeps renewing the lease mid-run;
 heartbeats, streaming text/thinking deltas, retries, other turns/sessions, and
 unrelated session noise do not renew the lease, and out-of-order delivery never shortens it. The
-hard maximum is never unbounded: every renewal is capped at `acceptedAt + sdk.promptMaxRuntimeMs` so a
-wedged or continuously noisy prompt still reaches a deterministic terminal outcome. Terminalization then has a fixed `10_000` ms
+hard maximum is never unbounded: every renewal is capped at the lease's start time plus
+`sdk.promptMaxRuntimeMs`. The lease begins at acceptance for a directly executing prompt;
+for confirmed queued input it is suspended during queue residence and begins again at
+actual consumption or own-run promotion, without changing the durable `acceptedAt`.
+A wedged or continuously noisy executing prompt still reaches a deterministic terminal outcome. Terminalization then has a fixed `10_000` ms
 grace period, which is not configurable. A controlled terminal failure reaches ACP
 as JSON-RPC `-32603` with `data.code` of `prompt_failed` or
 `prompt_deadline_exceeded`.
