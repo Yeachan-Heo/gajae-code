@@ -455,6 +455,164 @@ test("live-connection gate rejects queued image mutations after the disconnect s
 	}
 });
 
+test.each([
+	119_999, 120_000, 120_001,
+])("redemption enforces elapsed inactivity at %d ms without timer delivery", async elapsed => {
+	let now = 1_700_000_000_000;
+	const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+	const store = new PromptImageUploadStore(alwaysConnected);
+	const bytes = tinyPng();
+	try {
+		const id = await stage(store, "sender", bytes);
+		now += elapsed;
+		if (elapsed < 120_000) {
+			const accepted = store.redeem("sender", [{ id }]);
+			try {
+				expect(Buffer.from(accepted.images[0]!.data, "base64").equals(bytes)).toBe(true);
+			} finally {
+				accepted.release();
+			}
+		} else {
+			expect(() => store.redeem("sender", [{ id }])).toThrow(expect.objectContaining({ code: "resource_gone" }));
+		}
+	} finally {
+		store.close();
+		clock.mockRestore();
+	}
+});
+
+test.each([
+	119_999, 120_000, 120_001,
+])("successful batch progress never revives elapsed-expired peers at %d ms", async elapsed => {
+	let now = 1_700_000_000_000;
+	const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+	const store = new PromptImageUploadStore(alwaysConnected);
+	const bytes = tinyPng();
+	try {
+		const peer = await stage(store, "sender", bytes, "same-batch");
+		now += elapsed;
+		const fresh = store.begin("sender", { ...descriptor(bytes), batchId: "same-batch" });
+		now += 1;
+		if (elapsed < 120_000) {
+			const accepted = store.redeem("sender", [{ id: peer }]);
+			accepted.release();
+		} else {
+			expect(() => store.redeem("sender", [{ id: peer }])).toThrow(
+				expect.objectContaining({ code: "resource_gone" }),
+			);
+		}
+		expect(store.append("sender", { id: fresh.id, sequence: 0, data: bytes.toString("base64") })).toMatchObject({
+			receivedBytes: bytes.length,
+		});
+		await store.finish("sender", { id: fresh.id });
+		const accepted = store.redeem("sender", [{ id: fresh.id }]);
+		try {
+			expect(Buffer.from(accepted.images[0]!.data, "base64").equals(bytes)).toBe(true);
+		} finally {
+			accepted.release();
+		}
+	} finally {
+		store.close();
+		clock.mockRestore();
+	}
+});
+
+test.each([
+	"append",
+	"finish",
+	"discard",
+] as const)("%s rejects elapsed expiry without timer delivery or an admission sweep", async operation => {
+	let now = 1_700_000_000_000;
+	const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+	const store = new PromptImageUploadStore(alwaysConnected);
+	const bytes = tinyPng();
+	try {
+		const { id } = store.begin("sender", descriptor(bytes));
+		if (operation !== "append") store.append("sender", { id, sequence: 0, data: bytes.toString("base64") });
+		now += 120_000;
+		if (operation === "append") {
+			expect(() => store.append("sender", { id, sequence: 0, data: bytes.toString("base64") })).toThrow(
+				expect.objectContaining({ code: "resource_gone" }),
+			);
+		} else if (operation === "finish") {
+			await expect(store.finish("sender", { id })).rejects.toMatchObject({ code: "resource_gone" });
+		} else {
+			expect(() => store.discard("sender", { id })).toThrow(expect.objectContaining({ code: "resource_gone" }));
+		}
+	} finally {
+		store.close();
+		clock.mockRestore();
+	}
+});
+
+test("batch renewal cannot revive a peer that expires between admission sweep and renewal", async () => {
+	let now = 1_700_000_000_000;
+	const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+	const store = new PromptImageUploadStore(alwaysConnected);
+	const bytes = tinyPng();
+	try {
+		const peer = await stage(store, "sender", bytes, "same-batch");
+		now += 119_999;
+		clock.mockImplementationOnce(() => now++);
+		const fresh = store.begin("sender", { ...descriptor(bytes), batchId: "same-batch" });
+		expect(() => store.redeem("sender", [{ id: peer }])).toThrow(expect.objectContaining({ code: "resource_gone" }));
+		store.append("sender", { id: fresh.id, sequence: 0, data: bytes.toString("base64") });
+		await store.finish("sender", { id: fresh.id });
+		const accepted = store.redeem("sender", [{ id: fresh.id }]);
+		try {
+			expect(Buffer.from(accepted.images[0]!.data, "base64").equals(bytes)).toBe(true);
+		} finally {
+			accepted.release();
+		}
+	} finally {
+		store.close();
+		clock.mockRestore();
+	}
+});
+
+test("elapsed expiry frees upload slots before timer delivery", async () => {
+	let now = 1_700_000_000_000;
+	const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+	const store = new PromptImageUploadStore(alwaysConnected);
+	const bytes = tinyPng();
+	try {
+		const ids = Array.from({ length: 16 }, () => store.begin("sender", descriptor(bytes)).id);
+		now += 120_000;
+		const fresh = store.begin("sender", descriptor(bytes));
+		expect(() => store.append("sender", { id: ids[0], sequence: 0, data: bytes.toString("base64") })).toThrow(
+			expect.objectContaining({ code: "resource_gone" }),
+		);
+		await expect(store.finish("sender", { id: ids[1] })).rejects.toMatchObject({ code: "resource_gone" });
+		expect(() => store.discard("sender", { id: ids[2] })).toThrow(expect.objectContaining({ code: "resource_gone" }));
+		expect(store.append("sender", { id: fresh.id, sequence: 0, data: bytes.toString("base64") })).toMatchObject({
+			receivedBytes: bytes.length,
+		});
+	} finally {
+		store.close();
+		clock.mockRestore();
+	}
+});
+
+test("finish crossing elapsed expiry fails closed and releases decoder reservations without timer delivery", async () => {
+	let now = 1_700_000_000_000;
+	const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+	const store = new PromptImageUploadStore(alwaysConnected);
+	const bytes = tinyPng();
+	try {
+		const id = upload(store, "sender", bytes);
+		const finishing = store.finish("sender", { id });
+		now += 120_000;
+		await expect(finishing).rejects.toMatchObject({ code: "resource_gone" });
+		expect(() => store.redeem("sender", [{ id }])).toThrow(expect.objectContaining({ code: "resource_gone" }));
+		const next = await stage(store, "sender", bytes);
+		const accepted = store.redeem("sender", [{ id: next }]);
+		accepted.release();
+	} finally {
+		store.close();
+		clock.mockRestore();
+	}
+});
+
 test("expired leases free capacity and a discard during decoding cannot resurrect an upload", async () => {
 	const bytes = originalLargePng();
 	const store = new PromptImageUploadStore(alwaysConnected);
