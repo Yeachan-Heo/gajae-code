@@ -1774,10 +1774,10 @@
 				"image"
 			],
 			"cost": {
-				"input": 1,
-				"output": 5,
-				"cacheRead": 0.1,
-				"cacheWrite": 1.25
+				"input": 1.1,
+				"output": 5.5,
+				"cacheRead": 0.11,
+				"cacheWrite": 1.375
 			},
 			"contextWindow": 200000,
 			"maxTokens": 64000,
@@ -1849,10 +1849,10 @@
 				"image"
 			],
 			"cost": {
-				"input": 5,
-				"output": 25,
-				"cacheRead": 0.5,
-				"cacheWrite": 6.25
+				"input": 5.5,
+				"output": 27.5,
+				"cacheRead": 0.55,
+				"cacheWrite": 6.875
 			},
 			"contextWindow": 200000,
 			"maxTokens": 64000,
@@ -2109,10 +2109,10 @@
 				"image"
 			],
 			"cost": {
-				"input": 2.2,
-				"output": 11,
-				"cacheRead": 0.22,
-				"cacheWrite": 2.75
+				"input": 2,
+				"output": 10,
+				"cacheRead": 0.2,
+				"cacheWrite": 2.5
 			},
 			"contextWindow": 1000000,
 			"maxTokens": 128000,
@@ -2134,10 +2134,10 @@
 				"image"
 			],
 			"cost": {
-				"input": 2.2,
-				"output": 11,
-				"cacheRead": 0.22,
-				"cacheWrite": 2.75
+				"input": 2,
+				"output": 10,
+				"cacheRead": 0.2,
+				"cacheWrite": 2.5
 			},
 			"contextWindow": 1000000,
 			"maxTokens": 128000,
@@ -2479,7 +2479,7 @@
 		},
 		"global.anthropic.claude-sonnet-4-5-20250929-v1:0": {
 			"id": "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
-			"name": "Anthropic Sonnet 4.5 (Global)",
+			"name": "Anthropic Sonnet 4.5",
 			"api": "bedrock-converse-stream",
 			"provider": "amazon-bedrock",
 			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
@@ -2504,7 +2504,7 @@
 		},
 		"global.anthropic.claude-sonnet-4-6": {
 			"id": "global.anthropic.claude-sonnet-4-6",
-			"name": "Anthropic Sonnet 4.6 (Global)",
+			"name": "Anthropic Sonnet 4.6",
 			"api": "bedrock-converse-stream",
 			"provider": "amazon-bedrock",
 			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
@@ -2514,10 +2514,10 @@
 				"image"
 			],
 			"cost": {
-				"input": 3,
-				"output": 15,
-				"cacheRead": 0.3,
-				"cacheWrite": 3.75
+				"input": 3.3,
+				"output": 16.5,
+				"cacheRead": 0.33,
+				"cacheWrite": 4.125
 			},
 			"contextWindow": 1000000,
 			"maxTokens": 128000,
@@ -2573,6 +2573,31 @@
 			"maxTokens": 128000,
 			"thinking": {
 				"mode": "anthropic-budget-effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"global.moonshotai.kimi-k3": {
+			"id": "global.moonshotai.kimi-k3",
+			"name": "Kimi K3 (Global)",
+			"api": "bedrock-converse-stream",
+			"provider": "amazon-bedrock",
+			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 3,
+				"output": 15,
+				"cacheRead": 0.3,
+				"cacheWrite": 3.75
+			},
+			"contextWindow": 1048576,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "budget",
 				"minLevel": "minimal",
 				"maxLevel": "high"
 			}
@@ -2677,9 +2702,109 @@
 				"maxLevel": "max"
 			}
 		},
+		"global.openai.gpt-6-luna": {
+			"id": "global.openai.gpt-6-luna",
+			"name": "GPT-6 Luna (Global)",
+			"api": "bedrock-converse-stream",
+			"provider": "amazon-bedrock",
+			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.1,
+				"output": 0.5,
+				"cacheRead": 0.01,
+				"cacheWrite": 0.125
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		},
+		"global.openai.gpt-6-sol": {
+			"id": "global.openai.gpt-6-sol",
+			"name": "GPT-6 Sol (Global)",
+			"api": "bedrock-converse-stream",
+			"provider": "amazon-bedrock",
+			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2,
+				"output": 10,
+				"cacheRead": 0.2,
+				"cacheWrite": 2.5
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		},
+		"global.openai.gpt-6.1-sol": {
+			"id": "global.openai.gpt-6.1-sol",
+			"name": "GPT-6.1 Sol (Global)",
+			"api": "bedrock-converse-stream",
+			"provider": "amazon-bedrock",
+			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2,
+				"output": 10,
+				"cacheRead": 0.1,
+				"cacheWrite": 2.5
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		},
 		"global.xai.grok-4.6": {
 			"id": "global.xai.grok-4.6",
 			"name": "Grok 4.6 (Global)",
+			"api": "bedrock-converse-stream",
+			"provider": "amazon-bedrock",
+			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2,
+				"output": 6,
+				"cacheRead": 0.5,
+				"cacheWrite": 0
+			},
+			"contextWindow": 500000,
+			"maxTokens": 500000,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"global.xai.grok-4.7": {
+			"id": "global.xai.grok-4.7",
+			"name": "Grok 4.7 (Global)",
 			"api": "bedrock-converse-stream",
 			"provider": "amazon-bedrock",
 			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
@@ -3242,7 +3367,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 204800,
+			"contextWindow": 196608,
 			"maxTokens": 131072,
 			"thinking": {
 				"mode": "budget",
@@ -3290,7 +3415,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 256000,
+			"contextWindow": 262144,
 			"maxTokens": 8192
 		},
 		"mistral.magistral-small-2509": {
@@ -3414,7 +3539,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 256000,
+			"contextWindow": 262144,
 			"maxTokens": 8192
 		},
 		"mistral.pixtral-large-2502-v1:0": {
@@ -3491,7 +3616,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 262143,
+			"contextWindow": 262144,
 			"maxTokens": 16000,
 			"thinking": {
 				"mode": "budget",
@@ -3516,7 +3641,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 262143,
+			"contextWindow": 262144,
 			"maxTokens": 16384,
 			"thinking": {
 				"mode": "budget",
@@ -3541,7 +3666,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 128000,
+			"contextWindow": 131072,
 			"maxTokens": 8192
 		},
 		"nvidia.nemotron-nano-3-30b": {
@@ -3628,7 +3753,7 @@
 				"cacheRead": 0.275,
 				"cacheWrite": 0
 			},
-			"contextWindow": 272000,
+			"contextWindow": 1000000,
 			"maxTokens": 128000,
 			"thinking": {
 				"mode": "budget",
@@ -3761,6 +3886,81 @@
 				"maxLevel": "max"
 			}
 		},
+		"openai.gpt-6-luna": {
+			"id": "openai.gpt-6-luna",
+			"name": "GPT-6 Luna",
+			"api": "bedrock-converse-stream",
+			"provider": "amazon-bedrock",
+			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.11,
+				"output": 0.55,
+				"cacheRead": 0.011,
+				"cacheWrite": 0.1375
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		},
+		"openai.gpt-6-sol": {
+			"id": "openai.gpt-6-sol",
+			"name": "GPT-6 Sol",
+			"api": "bedrock-converse-stream",
+			"provider": "amazon-bedrock",
+			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2.2,
+				"output": 11,
+				"cacheRead": 0.22,
+				"cacheWrite": 2.75
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		},
+		"openai.gpt-6.1-sol": {
+			"id": "openai.gpt-6.1-sol",
+			"name": "GPT-6.1 Sol",
+			"api": "bedrock-converse-stream",
+			"provider": "amazon-bedrock",
+			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2.2,
+				"output": 11,
+				"cacheRead": 0.11,
+				"cacheWrite": 2.75
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		},
 		"openai.gpt-oss-120b": {
 			"id": "openai.gpt-oss-120b",
 			"name": "gpt-oss-120b",
@@ -3777,8 +3977,8 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 128000,
-			"maxTokens": 16384,
+			"contextWindow": 131072,
+			"maxTokens": 131072,
 			"thinking": {
 				"mode": "budget",
 				"minLevel": "minimal",
@@ -3801,8 +4001,8 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 128000,
-			"maxTokens": 16384,
+			"contextWindow": 131072,
+			"maxTokens": 128000,
 			"thinking": {
 				"mode": "budget",
 				"minLevel": "minimal",
@@ -3825,8 +4025,8 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 128000,
-			"maxTokens": 16384,
+			"contextWindow": 131072,
+			"maxTokens": 131072,
 			"thinking": {
 				"mode": "budget",
 				"minLevel": "minimal",
@@ -3849,8 +4049,8 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 128000,
-			"maxTokens": 16384,
+			"contextWindow": 131072,
+			"maxTokens": 128000,
 			"thinking": {
 				"mode": "budget",
 				"minLevel": "minimal",
@@ -4119,7 +4319,7 @@
 		},
 		"us.amazon.nova-lite-v1:0": {
 			"id": "us.amazon.nova-lite-v1:0",
-			"name": "Nova Lite",
+			"name": "Nova Lite (US)",
 			"api": "bedrock-converse-stream",
 			"provider": "amazon-bedrock",
 			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
@@ -4139,7 +4339,7 @@
 		},
 		"us.amazon.nova-micro-v1:0": {
 			"id": "us.amazon.nova-micro-v1:0",
-			"name": "Nova Micro (US)",
+			"name": "Nova Micro",
 			"api": "bedrock-converse-stream",
 			"provider": "amazon-bedrock",
 			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
@@ -4832,7 +5032,7 @@
 		},
 		"us.meta.llama4-scout-17b-instruct-v1:0": {
 			"id": "us.meta.llama4-scout-17b-instruct-v1:0",
-			"name": "Llama 4 Scout 17B Instruct (US)",
+			"name": "Llama 4 Scout 17B Instruct",
 			"api": "bedrock-converse-stream",
 			"provider": "amazon-bedrock",
 			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
@@ -4869,6 +5069,31 @@
 			},
 			"contextWindow": 128000,
 			"maxTokens": 8192
+		},
+		"us.moonshotai.kimi-k3": {
+			"id": "us.moonshotai.kimi-k3",
+			"name": "Kimi K3 (US)",
+			"api": "bedrock-converse-stream",
+			"provider": "amazon-bedrock",
+			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 3.3,
+				"output": 16.5,
+				"cacheRead": 0.33,
+				"cacheWrite": 4.125
+			},
+			"contextWindow": 1048576,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
 		},
 		"us.openai.gpt-5.6-luna": {
 			"id": "us.openai.gpt-5.6-luna",
@@ -4970,6 +5195,81 @@
 				"maxLevel": "max"
 			}
 		},
+		"us.openai.gpt-6-luna": {
+			"id": "us.openai.gpt-6-luna",
+			"name": "GPT-6 Luna (US)",
+			"api": "bedrock-converse-stream",
+			"provider": "amazon-bedrock",
+			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.11,
+				"output": 0.55,
+				"cacheRead": 0.011,
+				"cacheWrite": 0.1375
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		},
+		"us.openai.gpt-6-sol": {
+			"id": "us.openai.gpt-6-sol",
+			"name": "GPT-6 Sol (US)",
+			"api": "bedrock-converse-stream",
+			"provider": "amazon-bedrock",
+			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2.2,
+				"output": 11,
+				"cacheRead": 0.22,
+				"cacheWrite": 2.75
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		},
+		"us.openai.gpt-6.1-sol": {
+			"id": "us.openai.gpt-6.1-sol",
+			"name": "GPT-6.1 Sol (US)",
+			"api": "bedrock-converse-stream",
+			"provider": "amazon-bedrock",
+			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2.2,
+				"output": 11,
+				"cacheRead": 0.11,
+				"cacheWrite": 2.75
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		},
 		"us.writer.palmyra-x4-v1:0": {
 			"id": "us.writer.palmyra-x4-v1:0",
 			"name": "Palmyra X4 (US)",
@@ -5021,6 +5321,31 @@
 		"us.xai.grok-4.6": {
 			"id": "us.xai.grok-4.6",
 			"name": "Grok 4.6 (US)",
+			"api": "bedrock-converse-stream",
+			"provider": "amazon-bedrock",
+			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2.2,
+				"output": 6.6,
+				"cacheRead": 0.55,
+				"cacheWrite": 0
+			},
+			"contextWindow": 500000,
+			"maxTokens": 500000,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"us.xai.grok-4.7": {
+			"id": "us.xai.grok-4.7",
+			"name": "Grok 4.7 (US)",
 			"api": "bedrock-converse-stream",
 			"provider": "amazon-bedrock",
 			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
@@ -5157,7 +5482,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 204800,
+			"contextWindow": 202752,
 			"maxTokens": 131072,
 			"thinking": {
 				"mode": "budget",
@@ -5181,7 +5506,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 200000,
+			"contextWindow": 202752,
 			"maxTokens": 131072,
 			"thinking": {
 				"mode": "budget",
@@ -6137,11 +6462,11 @@
 			"cost": {
 				"input": 0.99,
 				"output": 1.49,
-				"cacheRead": 0,
+				"cacheRead": 0.99,
 				"cacheWrite": 0
 			},
-			"contextWindow": 65536,
-			"maxTokens": 32768,
+			"contextWindow": 131072,
+			"maxTokens": 40960,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -6820,6 +7145,31 @@
 				"maxLevel": "max"
 			}
 		},
+		"anthropic/claude-opus-5.5": {
+			"id": "anthropic/claude-opus-5.5",
+			"name": "Anthropic Opus 5.5",
+			"api": "anthropic-messages",
+			"provider": "cloudflare-ai-gateway",
+			"baseUrl": "https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/anthropic",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 4,
+				"output": 20,
+				"cacheRead": 0.2,
+				"cacheWrite": 5
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "max"
+			}
+		},
 		"anthropic/claude-sonnet-4": {
 			"id": "anthropic/claude-sonnet-4",
 			"name": "Anthropic Sonnet 4",
@@ -6912,7 +7262,7 @@
 				"cacheRead": 0.3,
 				"cacheWrite": 3.75
 			},
-			"contextWindow": 1000000,
+			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"thinking": {
 				"mode": "anthropic-budget-effort",
@@ -7777,6 +8127,56 @@
 				"maxLevel": "max"
 			}
 		},
+		"openai/gpt-6-luna": {
+			"id": "openai/gpt-6-luna",
+			"name": "GPT-6 Luna",
+			"api": "anthropic-messages",
+			"provider": "cloudflare-ai-gateway",
+			"baseUrl": "https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/anthropic",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.1,
+				"output": 0.5,
+				"cacheRead": 0.01,
+				"cacheWrite": 0.125
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		},
+		"openai/gpt-6-sol": {
+			"id": "openai/gpt-6-sol",
+			"name": "GPT-6 Sol",
+			"api": "anthropic-messages",
+			"provider": "cloudflare-ai-gateway",
+			"baseUrl": "https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/anthropic",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2,
+				"output": 10,
+				"cacheRead": 0.2,
+				"cacheWrite": 2.5
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		},
 		"openai/o1": {
 			"id": "openai/o1",
 			"name": "o1",
@@ -8365,6 +8765,31 @@
 		"xai/grok-4.6": {
 			"id": "xai/grok-4.6",
 			"name": "Grok 4.6",
+			"api": "anthropic-messages",
+			"provider": "cloudflare-ai-gateway",
+			"baseUrl": "https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/anthropic",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2,
+				"output": 6,
+				"cacheRead": 0.5,
+				"cacheWrite": 0
+			},
+			"contextWindow": 500000,
+			"maxTokens": 500000,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"xai/grok-4.7": {
+			"id": "xai/grok-4.7",
+			"name": "Grok 4.7",
 			"api": "anthropic-messages",
 			"provider": "cloudflare-ai-gateway",
 			"baseUrl": "https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/anthropic",
@@ -13485,7 +13910,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 131072,
+			"contextWindow": 65536,
 			"maxTokens": 16384
 		},
 		"meta-llama/Llama-4-Scout-17B-16E-Instruct": {
@@ -14278,6 +14703,30 @@
 				"maxLevel": "xhigh"
 			}
 		},
+		"tencent/Hy4-preview": {
+			"id": "tencent/Hy4-preview",
+			"name": "Hy4 preview",
+			"api": "openai-completions",
+			"provider": "deepinfra",
+			"baseUrl": "https://api.deepinfra.com/v1/openai",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0.834,
+				"output": 2.501,
+				"cacheRead": 0.042,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1048576,
+			"maxTokens": 64000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
 		"thinkingmachines/Inkling": {
 			"id": "thinkingmachines/Inkling",
 			"name": "Inkling",
@@ -14371,6 +14820,56 @@
 			},
 			"contextWindow": 1048576,
 			"maxTokens": 16384,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"XiaomiMiMo/MiMo-V2.6-Flash": {
+			"id": "XiaomiMiMo/MiMo-V2.6-Flash",
+			"name": "MiMo-V2.6-Flash",
+			"api": "openai-completions",
+			"provider": "deepinfra",
+			"baseUrl": "https://api.deepinfra.com/v1/openai",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.14,
+				"output": 0.28,
+				"cacheRead": 0.0028,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1048576,
+			"maxTokens": 131072,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"XiaomiMiMo/MiMo-V2.6-Pro": {
+			"id": "XiaomiMiMo/MiMo-V2.6-Pro",
+			"name": "MiMo-V2.6-Pro",
+			"api": "openai-completions",
+			"provider": "deepinfra",
+			"baseUrl": "https://api.deepinfra.com/v1/openai",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.43,
+				"output": 0.87,
+				"cacheRead": 0.0036,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1048576,
+			"maxTokens": 131072,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -14532,7 +15031,7 @@
 				"text"
 			],
 			"cost": {
-				"input": 1.2,
+				"input": 0.9,
 				"output": 4,
 				"cacheRead": 0.2,
 				"cacheWrite": 0
@@ -14590,7 +15089,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 1000000,
-			"maxTokens": 384000,
+			"maxTokens": 393216,
 			"compat": {
 				"supportsDeveloperRole": false,
 				"supportsReasoningEffort": true,
@@ -14637,7 +15136,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 1000000,
-			"maxTokens": 384000,
+			"maxTokens": 393216,
 			"compat": {
 				"supportsDeveloperRole": false,
 				"supportsReasoningEffort": true,
@@ -14683,7 +15182,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 1000000,
-			"maxTokens": 384000,
+			"maxTokens": 393216,
 			"compat": {
 				"supportsDeveloperRole": false,
 				"supportsReasoningEffort": true,
@@ -15223,6 +15722,34 @@
 				"maxLevel": "max"
 			}
 		},
+		"claude-opus-5.5": {
+			"id": "claude-opus-5.5",
+			"name": "Anthropic Opus 5.5",
+			"api": "anthropic-messages",
+			"provider": "github-copilot",
+			"baseUrl": "https://api.githubcopilot.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 4,
+				"output": 20,
+				"cacheRead": 0.2,
+				"cacheWrite": 5
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"headers": {
+				"User-Agent": "opencode/1.3.15"
+			},
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "max"
+			}
+		},
 		"claude-sonnet-4": {
 			"id": "claude-sonnet-4",
 			"name": "Anthropic Sonnet 4",
@@ -15310,6 +15837,34 @@
 		"claude-sonnet-5": {
 			"id": "claude-sonnet-5",
 			"name": "Anthropic Sonnet 5",
+			"api": "anthropic-messages",
+			"provider": "github-copilot",
+			"baseUrl": "https://api.githubcopilot.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2,
+				"output": 10,
+				"cacheRead": 0.2,
+				"cacheWrite": 2.5
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"headers": {
+				"User-Agent": "opencode/1.3.15"
+			},
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "max"
+			}
+		},
+		"claude-sonnet-5.5": {
+			"id": "claude-sonnet-5.5",
+			"name": "Anthropic Sonnet 5.5",
 			"api": "anthropic-messages",
 			"provider": "github-copilot",
 			"baseUrl": "https://api.githubcopilot.com",
@@ -16081,6 +16636,90 @@
 				"output": 50,
 				"cacheRead": 1,
 				"cacheWrite": 12.5
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"headers": {
+				"User-Agent": "opencode/1.3.15"
+			},
+			"compat": {
+				"supportsStore": false,
+				"supportsDeveloperRole": false,
+				"supportsReasoningEffort": false
+			}
+		},
+		"gpt-6-luna": {
+			"id": "gpt-6-luna",
+			"name": "GPT-6 Luna",
+			"api": "openai-completions",
+			"provider": "github-copilot",
+			"baseUrl": "https://api.githubcopilot.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.1,
+				"output": 0.5,
+				"cacheRead": 0.01,
+				"cacheWrite": 0.125
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"headers": {
+				"User-Agent": "opencode/1.3.15"
+			},
+			"compat": {
+				"supportsStore": false,
+				"supportsDeveloperRole": false,
+				"supportsReasoningEffort": false
+			}
+		},
+		"gpt-6-sol": {
+			"id": "gpt-6-sol",
+			"name": "GPT-6 Sol",
+			"api": "openai-completions",
+			"provider": "github-copilot",
+			"baseUrl": "https://api.githubcopilot.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2,
+				"output": 10,
+				"cacheRead": 0.2,
+				"cacheWrite": 2.5
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"headers": {
+				"User-Agent": "opencode/1.3.15"
+			},
+			"compat": {
+				"supportsStore": false,
+				"supportsDeveloperRole": false,
+				"supportsReasoningEffort": false
+			}
+		},
+		"gpt-6.1-sol": {
+			"id": "gpt-6.1-sol",
+			"name": "GPT-6.1 Sol",
+			"api": "openai-completions",
+			"provider": "github-copilot",
+			"baseUrl": "https://api.githubcopilot.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2,
+				"output": 10,
+				"cacheRead": 0.1,
+				"cacheWrite": 2.5
 			},
 			"contextWindow": 1050000,
 			"maxTokens": 128000,
@@ -16920,8 +17559,8 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 131072,
-			"maxTokens": 65536,
+			"contextWindow": 128000,
+			"maxTokens": 64000,
 			"thinking": {
 				"mode": "budget",
 				"minLevel": "minimal",
@@ -17275,7 +17914,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 65536,
-			"maxTokens": 65536,
+			"maxTokens": 4096,
 			"thinking": {
 				"mode": "google-level",
 				"minLevel": "minimal",
@@ -20118,7 +20757,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 1310720,
+			"contextWindow": 1048576,
 			"maxTokens": 8888
 		},
 		"~google/gemini-flash-latest": {
@@ -20327,7 +20966,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 1310720,
+			"contextWindow": 1048576,
 			"maxTokens": 8888
 		},
 		"~z-ai/glm-latest": {
@@ -20346,7 +20985,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 1310720,
+			"contextWindow": 1048576,
 			"maxTokens": 8888
 		},
 		"ai21/jamba-large-1.7": {
@@ -20422,7 +21061,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 1048576,
+			"contextWindow": 131072,
 			"maxTokens": 8888
 		},
 		"aion-labs/aion-3.0": {
@@ -20441,7 +21080,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 1048576,
+			"contextWindow": 131072,
 			"maxTokens": 8888
 		},
 		"aion-labs/aion-3.0-mini": {
@@ -20460,7 +21099,45 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 1048576,
+			"contextWindow": 131072,
+			"maxTokens": 8888
+		},
+		"aion-labs/aion-3.5": {
+			"id": "aion-labs/aion-3.5",
+			"name": "AionLabs: Aion 3.5",
+			"api": "openai-completions",
+			"provider": "kilo",
+			"baseUrl": "https://api.kilo.ai/api/gateway",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 262144,
+			"maxTokens": 8888
+		},
+		"aion-labs/aion-3.5-mini": {
+			"id": "aion-labs/aion-3.5-mini",
+			"name": "AionLabs: Aion 3.5 Mini",
+			"api": "openai-completions",
+			"provider": "kilo",
+			"baseUrl": "https://api.kilo.ai/api/gateway",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 262144,
 			"maxTokens": 8888
 		},
 		"aion-labs/aion-rp-llama-3.1-8b": {
@@ -20892,7 +21569,7 @@
 		},
 		"anthropic/claude-fable-5": {
 			"id": "anthropic/claude-fable-5",
-			"name": "Anthropic Fable 5",
+			"name": "Anthropic: Anthropic Fable 5 ($$$$)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -20917,7 +21594,7 @@
 		},
 		"anthropic/claude-fable-5.1": {
 			"id": "anthropic/claude-fable-5.1",
-			"name": "Anthropic Fable 5.1",
+			"name": "Anthropic: Anthropic Fable 5.1 ($$$$)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -20942,7 +21619,7 @@
 		},
 		"anthropic/claude-haiku-4.5": {
 			"id": "anthropic/claude-haiku-4.5",
-			"name": "Anthropic Haiku 4.5 (latest)",
+			"name": "Anthropic: Anthropic Haiku 4.5",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -20992,7 +21669,7 @@
 		},
 		"anthropic/claude-opus-4.1": {
 			"id": "anthropic/claude-opus-4.1",
-			"name": "Anthropic Opus 4.1",
+			"name": "Anthropic: Anthropic Opus 4.1 ($$$$)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -21017,7 +21694,7 @@
 		},
 		"anthropic/claude-opus-4.5": {
 			"id": "anthropic/claude-opus-4.5",
-			"name": "Anthropic Opus 4.5 (latest)",
+			"name": "Anthropic: Anthropic Opus 4.5",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -21042,7 +21719,7 @@
 		},
 		"anthropic/claude-opus-4.6": {
 			"id": "anthropic/claude-opus-4.6",
-			"name": "Anthropic Opus 4.6",
+			"name": "Anthropic: Anthropic Opus 4.6",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -21086,7 +21763,7 @@
 		},
 		"anthropic/claude-opus-4.7": {
 			"id": "anthropic/claude-opus-4.7",
-			"name": "Anthropic Opus 4.7",
+			"name": "Anthropic: Anthropic Opus 4.7",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -21130,7 +21807,7 @@
 		},
 		"anthropic/claude-opus-4.8": {
 			"id": "anthropic/claude-opus-4.8",
-			"name": "Anthropic Opus 4.8",
+			"name": "Anthropic: Anthropic Opus 4.8",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -21175,7 +21852,7 @@
 		},
 		"anthropic/claude-opus-5": {
 			"id": "anthropic/claude-opus-5",
-			"name": "Anthropic Opus 5",
+			"name": "Anthropic: Anthropic Opus 5",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -21236,11 +21913,11 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 1000000,
-			"maxTokens": 8888
+			"maxTokens": 128000
 		},
 		"anthropic/claude-sonnet-4": {
 			"id": "anthropic/claude-sonnet-4",
-			"name": "Anthropic Sonnet 4",
+			"name": "Anthropic: Anthropic Sonnet 4",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -21265,7 +21942,7 @@
 		},
 		"anthropic/claude-sonnet-4.5": {
 			"id": "anthropic/claude-sonnet-4.5",
-			"name": "Anthropic Sonnet 4.5 (latest)",
+			"name": "Anthropic: Anthropic Sonnet 4.5",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -21290,7 +21967,7 @@
 		},
 		"anthropic/claude-sonnet-4.6": {
 			"id": "anthropic/claude-sonnet-4.6",
-			"name": "Anthropic Sonnet 4.6",
+			"name": "Anthropic: Anthropic Sonnet 4.6",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -21315,7 +21992,7 @@
 		},
 		"anthropic/claude-sonnet-5": {
 			"id": "anthropic/claude-sonnet-5",
-			"name": "Anthropic Sonnet 5",
+			"name": "Anthropic: Anthropic Sonnet 5",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -21337,6 +22014,25 @@
 				"minLevel": "minimal",
 				"maxLevel": "xhigh"
 			}
+		},
+		"anthropic/claude-sonnet-5.5": {
+			"id": "anthropic/claude-sonnet-5.5",
+			"name": "Anthropic: Anthropic Sonnet 5.5",
+			"api": "openai-completions",
+			"provider": "kilo",
+			"baseUrl": "https://api.kilo.ai/api/gateway",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 8888
 		},
 		"arcee-ai/coder-large": {
 			"id": "arcee-ai/coder-large",
@@ -21851,6 +22547,25 @@
 			"contextWindow": 256000,
 			"maxTokens": 8888
 		},
+		"cohere/command-a-plus": {
+			"id": "cohere/command-a-plus",
+			"name": "Cohere: Command A+",
+			"api": "openai-completions",
+			"provider": "kilo",
+			"baseUrl": "https://api.kilo.ai/api/gateway",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 192000,
+			"maxTokens": 8888
+		},
 		"cohere/command-r-08-2024": {
 			"id": "cohere/command-r-08-2024",
 			"name": "Cohere: Command R (08-2024)",
@@ -22100,7 +22815,7 @@
 		},
 		"deepseek/deepseek-v3.1-terminus": {
 			"id": "deepseek/deepseek-v3.1-terminus",
-			"name": "DeepSeek: DeepSeek V3.1 Terminus (retires Sep 28)",
+			"name": "DeepSeek: DeepSeek V3.1 Terminus",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -22138,7 +22853,7 @@
 		},
 		"deepseek/deepseek-v3.2": {
 			"id": "deepseek/deepseek-v3.2",
-			"name": "DeepSeek V3.2",
+			"name": "DeepSeek: DeepSeek V3.2",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -22162,7 +22877,7 @@
 		},
 		"deepseek/deepseek-v3.2-exp": {
 			"id": "deepseek/deepseek-v3.2-exp",
-			"name": "DeepSeek-V3.2-Exp",
+			"name": "DeepSeek: DeepSeek V3.2 Exp",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -22205,7 +22920,7 @@
 		},
 		"deepseek/deepseek-v4-flash": {
 			"id": "deepseek/deepseek-v4-flash",
-			"name": "DeepSeek V4 Flash",
+			"name": "DeepSeek: DeepSeek V4 Flash 0423",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -22243,7 +22958,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 1310720,
+			"contextWindow": 1048576,
 			"maxTokens": 8888
 		},
 		"deepseek/deepseek-v4-flash-vision-exp": {
@@ -22305,7 +23020,7 @@
 		},
 		"deepseek/deepseek-v4-pro": {
 			"id": "deepseek/deepseek-v4-pro",
-			"name": "DeepSeek V4 Pro",
+			"name": "DeepSeek: DeepSeek V4 Pro 0423",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -22382,7 +23097,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
-			"maxTokens": 8888
+			"maxTokens": 384000
 		},
 		"dots-studio/dots-3-note-preview:free": {
 			"id": "dots-studio/dots-3-note-preview:free",
@@ -22439,6 +23154,25 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 222222,
+			"maxTokens": 8888
+		},
+		"fireworks/ember-1": {
+			"id": "fireworks/ember-1",
+			"name": "Fireworks: Ember-1",
+			"api": "openai-completions",
+			"provider": "kilo",
+			"baseUrl": "https://api.kilo.ai/api/gateway",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1048576,
 			"maxTokens": 8888
 		},
 		"giga-potato": {
@@ -22519,7 +23253,7 @@
 		},
 		"google/gemini-2.5-flash": {
 			"id": "google/gemini-2.5-flash",
-			"name": "Gemini 2.5 Flash",
+			"name": "Google: Gemini 2.5 Flash (retires Oct 20)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -22563,7 +23297,7 @@
 		},
 		"google/gemini-2.5-flash-lite": {
 			"id": "google/gemini-2.5-flash-lite",
-			"name": "Gemini 2.5 Flash Lite",
+			"name": "Google: Gemini 2.5 Flash Lite (retires Oct 20)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -22602,7 +23336,7 @@
 		},
 		"google/gemini-2.5-pro": {
 			"id": "google/gemini-2.5-pro",
-			"name": "Gemini 2.5 Pro",
+			"name": "Google: Gemini 2.5 Pro (retires Oct 20)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -22665,7 +23399,7 @@
 		},
 		"google/gemini-3-flash-preview": {
 			"id": "google/gemini-3-flash-preview",
-			"name": "Gemini 3 Flash Preview",
+			"name": "Google: Gemini 3 Flash Preview",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -22805,7 +23539,7 @@
 		},
 		"google/gemini-3.1-flash-lite": {
 			"id": "google/gemini-3.1-flash-lite",
-			"name": "Gemini 3.1 Flash Lite",
+			"name": "Google: Gemini 3.1 Flash Lite",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -22849,7 +23583,7 @@
 		},
 		"google/gemini-3.1-flash-lite-preview": {
 			"id": "google/gemini-3.1-flash-lite-preview",
-			"name": "Gemini 3.1 Flash Lite Preview",
+			"name": "Google: Gemini 3.1 Flash Lite Preview",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -22869,7 +23603,7 @@
 		},
 		"google/gemini-3.1-pro-preview": {
 			"id": "google/gemini-3.1-pro-preview",
-			"name": "Gemini 3.1 Pro Preview",
+			"name": "Google: Gemini 3.1 Pro Preview",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -22917,7 +23651,7 @@
 		},
 		"google/gemini-3.5-flash": {
 			"id": "google/gemini-3.5-flash",
-			"name": "Gemini 3.5 Flash",
+			"name": "Google: Gemini 3.5 Flash",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -23056,7 +23790,7 @@
 		},
 		"google/gemma-3-12b-it": {
 			"id": "google/gemma-3-12b-it",
-			"name": "Gemma 3 12B IT",
+			"name": "Google: Gemma 3 12B",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -23076,7 +23810,7 @@
 		},
 		"google/gemma-3-27b-it": {
 			"id": "google/gemma-3-27b-it",
-			"name": "Gemma 3 27B IT",
+			"name": "Google: Gemma 3 27B",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -23096,7 +23830,7 @@
 		},
 		"google/gemma-3-4b-it": {
 			"id": "google/gemma-3-4b-it",
-			"name": "Gemma 3 4B IT",
+			"name": "Google: Gemma 3 4B",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -23155,7 +23889,7 @@
 		},
 		"google/gemma-4-31b-it": {
 			"id": "google/gemma-4-31b-it",
-			"name": "Gemma-4-31B-IT",
+			"name": "Google: Gemma 4 31B",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -23536,7 +24270,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 131072,
+			"contextWindow": 262144,
 			"maxTokens": 8888
 		},
 		"inclusionai/ling-3.0-flash-vl:free": {
@@ -24382,7 +25116,7 @@
 		},
 		"meta/muse-glimmer-30b": {
 			"id": "meta/muse-glimmer-30b",
-			"name": "Muse Glimmer 30B",
+			"name": "Meta: Muse Glimmer 30B",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -24602,7 +25336,7 @@
 		},
 		"minimax/minimax-m2": {
 			"id": "minimax/minimax-m2",
-			"name": "MiniMax M2",
+			"name": "MiniMax: MiniMax M2",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -24645,7 +25379,7 @@
 		},
 		"minimax/minimax-m2.1": {
 			"id": "minimax/minimax-m2.1",
-			"name": "MiniMax M2.1",
+			"name": "MiniMax: MiniMax M2.1 (retires Oct 8)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -24669,7 +25403,7 @@
 		},
 		"minimax/minimax-m2.5": {
 			"id": "minimax/minimax-m2.5",
-			"name": "MiniMax M2.5",
+			"name": "MiniMax: MiniMax M2.5",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -24712,7 +25446,7 @@
 		},
 		"minimax/minimax-m2.7": {
 			"id": "minimax/minimax-m2.7",
-			"name": "MiniMax M2.7",
+			"name": "MiniMax: MiniMax M2.7",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -24736,7 +25470,7 @@
 		},
 		"minimax/minimax-m3": {
 			"id": "minimax/minimax-m3",
-			"name": "MiniMax-M3",
+			"name": "MiniMax: MiniMax M3",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -25022,7 +25756,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 222222,
+			"contextWindow": 262144,
 			"maxTokens": 8888
 		},
 		"mistralai/mistral-medium-3": {
@@ -25374,7 +26108,7 @@
 		},
 		"moonshotai/kimi-k2.5": {
 			"id": "moonshotai/kimi-k2.5",
-			"name": "Kimi K2.5",
+			"name": "MoonshotAI: Kimi K2.5",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -25418,7 +26152,7 @@
 		},
 		"moonshotai/kimi-k2.6": {
 			"id": "moonshotai/kimi-k2.6",
-			"name": "Kimi K2.6",
+			"name": "MoonshotAI: Kimi K2.6",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -25462,7 +26196,7 @@
 		},
 		"moonshotai/kimi-k2.7-code": {
 			"id": "moonshotai/kimi-k2.7-code",
-			"name": "Kimi K2.7 Code",
+			"name": "MoonshotAI: Kimi K2.7 Code",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -25487,7 +26221,7 @@
 		},
 		"moonshotai/kimi-k3": {
 			"id": "moonshotai/kimi-k3",
-			"name": "Kimi K3",
+			"name": "MoonshotAI: Kimi K3",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -25921,7 +26655,7 @@
 		},
 		"nvidia/nemotron-3-nano-30b-a3b": {
 			"id": "nvidia/nemotron-3-nano-30b-a3b",
-			"name": "nemotron-3-nano-30b-a3b",
+			"name": "NVIDIA: Nemotron 3 Nano 30B A3B",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -25964,7 +26698,7 @@
 		},
 		"nvidia/nemotron-3-super-120b-a12b": {
 			"id": "nvidia/nemotron-3-super-120b-a12b",
-			"name": "Nemotron 3 Super",
+			"name": "NVIDIA: Nemotron 3 Super",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -26007,7 +26741,7 @@
 		},
 		"nvidia/nemotron-3-ultra-550b-a55b": {
 			"id": "nvidia/nemotron-3-ultra-550b-a55b",
-			"name": "Nemotron 3 Ultra 550B A55B",
+			"name": "NVIDIA: Nemotron 3 Ultra",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -26342,7 +27076,7 @@
 		},
 		"openai/gpt-4.1": {
 			"id": "openai/gpt-4.1",
-			"name": "GPT-4.1",
+			"name": "OpenAI: GPT-4.1",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -26362,7 +27096,7 @@
 		},
 		"openai/gpt-4.1-mini": {
 			"id": "openai/gpt-4.1-mini",
-			"name": "GPT-4.1 mini",
+			"name": "OpenAI: GPT-4.1 Mini",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -26382,7 +27116,7 @@
 		},
 		"openai/gpt-4.1-nano": {
 			"id": "openai/gpt-4.1-nano",
-			"name": "GPT-4.1 nano",
+			"name": "OpenAI: GPT-4.1 Nano",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -26402,7 +27136,7 @@
 		},
 		"openai/gpt-4o": {
 			"id": "openai/gpt-4o",
-			"name": "GPT-4o",
+			"name": "OpenAI: GPT-4o",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -26498,7 +27232,7 @@
 		},
 		"openai/gpt-4o-mini": {
 			"id": "openai/gpt-4o-mini",
-			"name": "GPT-4o mini",
+			"name": "OpenAI: GPT-4o-mini",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -26594,7 +27328,7 @@
 		},
 		"openai/gpt-5": {
 			"id": "openai/gpt-5",
-			"name": "GPT-5",
+			"name": "OpenAI: GPT-5",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -26701,7 +27435,7 @@
 		},
 		"openai/gpt-5-mini": {
 			"id": "openai/gpt-5-mini",
-			"name": "GPT-5 Mini",
+			"name": "OpenAI: GPT-5 Mini",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -26726,7 +27460,7 @@
 		},
 		"openai/gpt-5-nano": {
 			"id": "openai/gpt-5-nano",
-			"name": "GPT-5 Nano",
+			"name": "OpenAI: GPT-5 Nano",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -26776,7 +27510,7 @@
 		},
 		"openai/gpt-5.1": {
 			"id": "openai/gpt-5.1",
-			"name": "GPT-5.1",
+			"name": "OpenAI: GPT-5.1",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -26821,7 +27555,7 @@
 		},
 		"openai/gpt-5.1-codex": {
 			"id": "openai/gpt-5.1-codex",
-			"name": "GPT-5.1-OpenAI code",
+			"name": "OpenAI: GPT-5.1-OpenAI code",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -26865,7 +27599,7 @@
 		},
 		"openai/gpt-5.1-codex-mini": {
 			"id": "openai/gpt-5.1-codex-mini",
-			"name": "GPT-5.1-OpenAI code-Mini",
+			"name": "OpenAI: GPT-5.1-OpenAI code-Mini",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -26890,7 +27624,7 @@
 		},
 		"openai/gpt-5.2": {
 			"id": "openai/gpt-5.2",
-			"name": "GPT-5.2",
+			"name": "OpenAI: GPT-5.2",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -26934,7 +27668,7 @@
 		},
 		"openai/gpt-5.2-codex": {
 			"id": "openai/gpt-5.2-codex",
-			"name": "GPT-5.2-OpenAI code",
+			"name": "OpenAI: GPT-5.2-OpenAI code",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -26959,7 +27693,7 @@
 		},
 		"openai/gpt-5.2-pro": {
 			"id": "openai/gpt-5.2-pro",
-			"name": "GPT-5.2-Pro",
+			"name": "OpenAI: GPT-5.2 Pro ($$$$)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -27003,7 +27737,7 @@
 		},
 		"openai/gpt-5.3-codex": {
 			"id": "openai/gpt-5.3-codex",
-			"name": "GPT-5.3 OpenAI code",
+			"name": "OpenAI: GPT-5.3-OpenAI code",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -27027,7 +27761,7 @@
 		},
 		"openai/gpt-5.4": {
 			"id": "openai/gpt-5.4",
-			"name": "GPT-5.4",
+			"name": "OpenAI: GPT-5.4",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -27071,7 +27805,7 @@
 		},
 		"openai/gpt-5.4-mini": {
 			"id": "openai/gpt-5.4-mini",
-			"name": "GPT-5.4 Mini",
+			"name": "OpenAI: GPT-5.4 Mini",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -27090,7 +27824,7 @@
 		},
 		"openai/gpt-5.4-nano": {
 			"id": "openai/gpt-5.4-nano",
-			"name": "GPT-5.4 Nano",
+			"name": "OpenAI: GPT-5.4 Nano",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -27109,7 +27843,7 @@
 		},
 		"openai/gpt-5.4-pro": {
 			"id": "openai/gpt-5.4-pro",
-			"name": "GPT-5.4 Pro",
+			"name": "OpenAI: GPT-5.4 Pro ($$$$)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -27134,7 +27868,7 @@
 		},
 		"openai/gpt-5.5": {
 			"id": "openai/gpt-5.5",
-			"name": "GPT-5.5",
+			"name": "OpenAI: GPT-5.5",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -27159,7 +27893,7 @@
 		},
 		"openai/gpt-5.5-pro": {
 			"id": "openai/gpt-5.5-pro",
-			"name": "GPT-5.5 Pro",
+			"name": "OpenAI: GPT-5.5 Pro ($$$$)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -27184,7 +27918,7 @@
 		},
 		"openai/gpt-5.6-luna": {
 			"id": "openai/gpt-5.6-luna",
-			"name": "GPT-5.6 Luna",
+			"name": "OpenAI: GPT-5.6 Luna",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -27228,7 +27962,7 @@
 		},
 		"openai/gpt-5.6-sol": {
 			"id": "openai/gpt-5.6-sol",
-			"name": "GPT-5.6 Sol",
+			"name": "OpenAI: GPT-5.6 Sol",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -27272,7 +28006,7 @@
 		},
 		"openai/gpt-5.6-terra": {
 			"id": "openai/gpt-5.6-terra",
-			"name": "GPT-5.6 Terra",
+			"name": "OpenAI: GPT-5.6 Terra",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -27316,7 +28050,7 @@
 		},
 		"openai/gpt-6-astra": {
 			"id": "openai/gpt-6-astra",
-			"name": "GPT-6 Astra",
+			"name": "OpenAI: GPT-6 Astra ($$$$)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -27342,6 +28076,120 @@
 		"openai/gpt-6-astra-pro": {
 			"id": "openai/gpt-6-astra-pro",
 			"name": "OpenAI: GPT-6 Astra Pro ($$$$)",
+			"api": "openai-completions",
+			"provider": "kilo",
+			"baseUrl": "https://api.kilo.ai/api/gateway",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 8888
+		},
+		"openai/gpt-6-luna": {
+			"id": "openai/gpt-6-luna",
+			"name": "OpenAI: GPT-6 Luna",
+			"api": "openai-completions",
+			"provider": "kilo",
+			"baseUrl": "https://api.kilo.ai/api/gateway",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000
+		},
+		"openai/gpt-6-luna-pro": {
+			"id": "openai/gpt-6-luna-pro",
+			"name": "OpenAI: GPT-6 Luna Pro",
+			"api": "openai-completions",
+			"provider": "kilo",
+			"baseUrl": "https://api.kilo.ai/api/gateway",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 8888
+		},
+		"openai/gpt-6-sol": {
+			"id": "openai/gpt-6-sol",
+			"name": "OpenAI: GPT-6 Sol",
+			"api": "openai-completions",
+			"provider": "kilo",
+			"baseUrl": "https://api.kilo.ai/api/gateway",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000
+		},
+		"openai/gpt-6-sol-pro": {
+			"id": "openai/gpt-6-sol-pro",
+			"name": "OpenAI: GPT-6 Sol Pro",
+			"api": "openai-completions",
+			"provider": "kilo",
+			"baseUrl": "https://api.kilo.ai/api/gateway",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 8888
+		},
+		"openai/gpt-6.1-sol": {
+			"id": "openai/gpt-6.1-sol",
+			"name": "OpenAI: GPT-6.1 Sol (new)",
+			"api": "openai-completions",
+			"provider": "kilo",
+			"baseUrl": "https://api.kilo.ai/api/gateway",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 8888
+		},
+		"openai/gpt-6.1-sol-pro": {
+			"id": "openai/gpt-6.1-sol-pro",
+			"name": "OpenAI: GPT-6.1 Sol Pro",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -27417,7 +28265,7 @@
 		},
 		"openai/gpt-oss-120b": {
 			"id": "openai/gpt-oss-120b",
-			"name": "GPT OSS 120B",
+			"name": "OpenAI: gpt-oss-120b",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -27460,7 +28308,7 @@
 		},
 		"openai/gpt-oss-20b": {
 			"id": "openai/gpt-oss-20b",
-			"name": "GPT OSS 20B",
+			"name": "OpenAI: gpt-oss-20b",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -27484,7 +28332,7 @@
 		},
 		"openai/gpt-oss-safeguard-20b": {
 			"id": "openai/gpt-oss-safeguard-20b",
-			"name": "Safety GPT OSS 20B",
+			"name": "OpenAI: gpt-oss-safeguard-20b",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -27558,7 +28406,7 @@
 		},
 		"openai/o3": {
 			"id": "openai/o3",
-			"name": "o3",
+			"name": "OpenAI: o3",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -27602,7 +28450,7 @@
 		},
 		"openai/o3-mini": {
 			"id": "openai/o3-mini",
-			"name": "o3-mini",
+			"name": "OpenAI: o3 Mini",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -27670,7 +28518,7 @@
 		},
 		"openai/o4-mini": {
 			"id": "openai/o4-mini",
-			"name": "o4-mini",
+			"name": "OpenAI: o4 Mini",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -27959,6 +28807,25 @@
 			"contextWindow": 32768,
 			"maxTokens": 8888
 		},
+		"perceptron/perceptron-mk1.5": {
+			"id": "perceptron/perceptron-mk1.5",
+			"name": "Perceptron: Perceptron Mk1.5",
+			"api": "openai-completions",
+			"provider": "kilo",
+			"baseUrl": "https://api.kilo.ai/api/gateway",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 36864,
+			"maxTokens": 8888
+		},
 		"perplexity/sonar": {
 			"id": "perplexity/sonar",
 			"name": "Perplexity: Sonar",
@@ -28132,7 +28999,7 @@
 		},
 		"poolside/laguna-xs-2.1": {
 			"id": "poolside/laguna-xs-2.1",
-			"name": "Laguna XS 2.1",
+			"name": "Poolside: Laguna XS 2.1",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -28365,7 +29232,7 @@
 		},
 		"qwen/qwen-plus-2025-07-28": {
 			"id": "qwen/qwen-plus-2025-07-28",
-			"name": "Qwen: Qwen Plus 0728",
+			"name": "Qwen: Qwen Plus 0728 (retires Oct 9)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -28536,7 +29403,7 @@
 		},
 		"qwen/qwen3-235b-a22b": {
 			"id": "qwen/qwen3-235b-a22b",
-			"name": "Qwen: Qwen3 235B A22B",
+			"name": "Qwen: Qwen3 235B A22B (retires Oct 9)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -28579,7 +29446,7 @@
 		},
 		"qwen/qwen3-235b-a22b-thinking-2507": {
 			"id": "qwen/qwen3-235b-a22b-thinking-2507",
-			"name": "Qwen: Qwen3 235B A22B Thinking 2507",
+			"name": "Qwen: Qwen3 235B A22B Thinking 2507 (retires Oct 9)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -28636,7 +29503,7 @@
 		},
 		"qwen/qwen3-30b-a3b-thinking-2507": {
 			"id": "qwen/qwen3-30b-a3b-thinking-2507",
-			"name": "Qwen: Qwen3 30B A3B Thinking 2507",
+			"name": "Qwen: Qwen3 30B A3B Thinking 2507 (retires Oct 9)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -28679,7 +29546,7 @@
 		},
 		"qwen/qwen3-8b": {
 			"id": "qwen/qwen3-8b",
-			"name": "Qwen: Qwen3 8B",
+			"name": "Qwen: Qwen3 8B (retires Oct 9)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -28774,7 +29641,7 @@
 		},
 		"qwen/qwen3-coder-plus": {
 			"id": "qwen/qwen3-coder-plus",
-			"name": "Qwen3-Coder-Plus",
+			"name": "Qwen: Qwen3 Coder Plus (retires Oct 9)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -28812,7 +29679,7 @@
 		},
 		"qwen/qwen3-max": {
 			"id": "qwen/qwen3-max",
-			"name": "Qwen3-Max-Thinking",
+			"name": "Qwen: Qwen3 Max (retires Oct 9)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -28836,7 +29703,7 @@
 		},
 		"qwen/qwen3-max-thinking": {
 			"id": "qwen/qwen3-max-thinking",
-			"name": "Qwen: Qwen3 Max Thinking",
+			"name": "Qwen: Qwen3 Max Thinking (retires Oct 9)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -28855,7 +29722,7 @@
 		},
 		"qwen/qwen3-next-80b-a3b-instruct": {
 			"id": "qwen/qwen3-next-80b-a3b-instruct",
-			"name": "Qwen3-Next-80B-A3B-Instruct",
+			"name": "Qwen: Qwen3 Next 80B A3B Instruct",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -28917,7 +29784,7 @@
 		},
 		"qwen/qwen3-vl-235b-a22b-thinking": {
 			"id": "qwen/qwen3-vl-235b-a22b-thinking",
-			"name": "Qwen: Qwen3 VL 235B A22B Thinking",
+			"name": "Qwen: Qwen3 VL 235B A22B Thinking (retires Oct 9)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -28955,7 +29822,7 @@
 		},
 		"qwen/qwen3-vl-30b-a3b-thinking": {
 			"id": "qwen/qwen3-vl-30b-a3b-thinking",
-			"name": "Qwen: Qwen3 VL 30B A3B Thinking",
+			"name": "Qwen: Qwen3 VL 30B A3B Thinking (retires Oct 9)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -28974,7 +29841,7 @@
 		},
 		"qwen/qwen3-vl-32b-instruct": {
 			"id": "qwen/qwen3-vl-32b-instruct",
-			"name": "Qwen: Qwen3 VL 32B Instruct",
+			"name": "Qwen: Qwen3 VL 32B Instruct (retires Oct 9)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -28993,7 +29860,7 @@
 		},
 		"qwen/qwen3-vl-8b-instruct": {
 			"id": "qwen/qwen3-vl-8b-instruct",
-			"name": "Qwen: Qwen3 VL 8B Instruct",
+			"name": "Qwen: Qwen3 VL 8B Instruct (retires Oct 9)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -29012,7 +29879,7 @@
 		},
 		"qwen/qwen3-vl-8b-thinking": {
 			"id": "qwen/qwen3-vl-8b-thinking",
-			"name": "Qwen: Qwen3 VL 8B Thinking",
+			"name": "Qwen: Qwen3 VL 8B Thinking (retires Oct 9)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -29031,7 +29898,7 @@
 		},
 		"qwen/qwen3.5-122b-a10b": {
 			"id": "qwen/qwen3.5-122b-a10b",
-			"name": "Qwen3.5 122B-A10B",
+			"name": "Qwen: Qwen3.5-122B-A10B",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -29094,7 +29961,7 @@
 		},
 		"qwen/qwen3.5-397b-a17b": {
 			"id": "qwen/qwen3.5-397b-a17b",
-			"name": "Qwen3.5-397B-A17B",
+			"name": "Qwen: Qwen3.5 397B A17B",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -29195,7 +30062,7 @@
 		},
 		"qwen/qwen3.6-27b": {
 			"id": "qwen/qwen3.6-27b",
-			"name": "Qwen3.6 27B",
+			"name": "Qwen: Qwen3.6 27B",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -29258,7 +30125,7 @@
 		},
 		"qwen/qwen3.6-max-preview": {
 			"id": "qwen/qwen3.6-max-preview",
-			"name": "Qwen: Qwen3.6 Max Preview",
+			"name": "Qwen: Qwen3.6 Max Preview (retires Oct 9)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -29277,7 +30144,7 @@
 		},
 		"qwen/qwen3.6-plus": {
 			"id": "qwen/qwen3.6-plus",
-			"name": "Qwen3.6-Plus",
+			"name": "Qwen: Qwen3.6 Plus",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -29358,7 +30225,7 @@
 		},
 		"qwen/qwen3.7-max": {
 			"id": "qwen/qwen3.7-max",
-			"name": "Qwen3.7 Max",
+			"name": "Qwen: Qwen3.7 Max",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -29382,7 +30249,7 @@
 		},
 		"qwen/qwen3.7-plus": {
 			"id": "qwen/qwen3.7-plus",
-			"name": "Qwen3.7 Plus",
+			"name": "Qwen: Qwen3.7 Plus",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -29426,7 +30293,7 @@
 		},
 		"qwen/qwen3.8-27b": {
 			"id": "qwen/qwen3.8-27b",
-			"name": "Qwen3.8 27B",
+			"name": "Qwen: Qwen3.8 27B",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -29509,6 +30376,44 @@
 		"qwen/qwen3.8-max-0902": {
 			"id": "qwen/qwen3.8-max-0902",
 			"name": "Qwen: Qwen3.8 Max (0902)",
+			"api": "openai-completions",
+			"provider": "kilo",
+			"baseUrl": "https://api.kilo.ai/api/gateway",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 8888
+		},
+		"qwen/qwen3.8-max-prime": {
+			"id": "qwen/qwen3.8-max-prime",
+			"name": "Qwen: Qwen3.8 Max Prime",
+			"api": "openai-completions",
+			"provider": "kilo",
+			"baseUrl": "https://api.kilo.ai/api/gateway",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 8888
+		},
+		"qwen/qwen3.8-omni-flash": {
+			"id": "qwen/qwen3.8-omni-flash",
+			"name": "Qwen: Qwen3.8 Omni Flash",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -29975,9 +30880,28 @@
 			"contextWindow": 1000000,
 			"maxTokens": 8888
 		},
+		"stealth/space-bunny-alpha": {
+			"id": "stealth/space-bunny-alpha",
+			"name": "Space Bunny Alpha (retires Oct 5)",
+			"api": "openai-completions",
+			"provider": "kilo",
+			"baseUrl": "https://api.kilo.ai/api/gateway",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 8888
+		},
 		"stepfun/step-3.5-flash": {
 			"id": "stepfun/step-3.5-flash",
-			"name": "Step 3.5 Flash",
+			"name": "StepFun: Step 3.5 Flash",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -30015,7 +30939,7 @@
 		},
 		"stepfun/step-3.7-flash": {
 			"id": "stepfun/step-3.7-flash",
-			"name": "Step 3.7 Flash",
+			"name": "StepFun: Step 3.7 Flash",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -30173,7 +31097,7 @@
 		},
 		"tencent/hy3-preview": {
 			"id": "tencent/hy3-preview",
-			"name": "Hy3 preview",
+			"name": "Tencent: Hy3 preview",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -30330,7 +31254,7 @@
 		},
 		"thinkingmachines/inkling": {
 			"id": "thinkingmachines/inkling",
-			"name": "Inkling",
+			"name": "Thinking Machines: Inkling",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -30345,7 +31269,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 1048576,
+			"contextWindow": 524288,
 			"maxTokens": 16384,
 			"thinking": {
 				"mode": "effort",
@@ -30369,7 +31293,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 1048576,
+			"contextWindow": 524288,
 			"maxTokens": 8888
 		},
 		"thinkingmachines/inkling-small:free": {
@@ -30410,6 +31334,25 @@
 			"contextWindow": 222222,
 			"maxTokens": 8888
 		},
+		"typesafe/jev-router": {
+			"id": "typesafe/jev-router",
+			"name": "TypeSafe: Jev Router",
+			"api": "openai-completions",
+			"provider": "kilo",
+			"baseUrl": "https://api.kilo.ai/api/gateway",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 8888
+		},
 		"unbiased/pareto": {
 			"id": "unbiased/pareto",
 			"name": "Pareto",
@@ -30447,6 +31390,25 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 6144,
+			"maxTokens": 8888
+		},
+		"upstage/solar-mini4": {
+			"id": "upstage/solar-mini4",
+			"name": "Upstage: Solar Mini 4",
+			"api": "openai-completions",
+			"provider": "kilo",
+			"baseUrl": "https://api.kilo.ai/api/gateway",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 524288,
 			"maxTokens": 8888
 		},
 		"upstage/solar-pro-3": {
@@ -30730,7 +31692,7 @@
 		},
 		"x-ai/grok-4.3": {
 			"id": "x-ai/grok-4.3",
-			"name": "Grok 4.3",
+			"name": "SpaceXAI: Grok 4.3",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -30750,7 +31712,7 @@
 		},
 		"x-ai/grok-4.5": {
 			"id": "x-ai/grok-4.5",
-			"name": "Grok 4.5",
+			"name": "SpaceXAI: Grok 4.5",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -30770,7 +31732,7 @@
 		},
 		"x-ai/grok-4.6": {
 			"id": "x-ai/grok-4.6",
-			"name": "Grok 4.6",
+			"name": "SpaceXAI: Grok 4.6",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -30809,7 +31771,7 @@
 		},
 		"x-ai/grok-build-0.1": {
 			"id": "x-ai/grok-build-0.1",
-			"name": "Grok Build 0.1",
+			"name": "SpaceXAI: Grok Build 0.1",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -30983,7 +31945,7 @@
 		},
 		"xiaomi/mimo-v2.5": {
 			"id": "xiaomi/mimo-v2.5",
-			"name": "MiMo-V2.5",
+			"name": "Xiaomi: MiMo-V2.5",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -31008,7 +31970,7 @@
 		},
 		"xiaomi/mimo-v2.5-pro": {
 			"id": "xiaomi/mimo-v2.5-pro",
-			"name": "MiMo-V2.5-Pro",
+			"name": "Xiaomi: MiMo-V2.5-Pro",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -31046,7 +32008,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 1048576,
+			"contextWindow": 1050000,
 			"maxTokens": 8888
 		},
 		"xiaomi/mimo-v2.6-pro": {
@@ -31065,8 +32027,8 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 1048576,
-			"maxTokens": 8888
+			"contextWindow": 1050000,
+			"maxTokens": 131072
 		},
 		"xiaomi/mimo-v2.6-pro-ultraspeed": {
 			"id": "xiaomi/mimo-v2.6-pro-ultraspeed",
@@ -31108,7 +32070,7 @@
 		},
 		"z-ai/glm-4.5": {
 			"id": "z-ai/glm-4.5",
-			"name": "GLM 4.5",
+			"name": "Z.ai: GLM 4.5",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -31132,7 +32094,7 @@
 		},
 		"z-ai/glm-4.5-air": {
 			"id": "z-ai/glm-4.5-air",
-			"name": "GLM 4.5 Air",
+			"name": "Z.ai: GLM 4.5 Air",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -31175,7 +32137,7 @@
 		},
 		"z-ai/glm-4.6": {
 			"id": "z-ai/glm-4.6",
-			"name": "GLM 4.6",
+			"name": "Z.ai: GLM 4.6",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -31218,7 +32180,7 @@
 		},
 		"z-ai/glm-4.6v": {
 			"id": "z-ai/glm-4.6v",
-			"name": "GLM 4.6V",
+			"name": "Z.ai: GLM 4.6V",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -31243,7 +32205,7 @@
 		},
 		"z-ai/glm-4.7": {
 			"id": "z-ai/glm-4.7",
-			"name": "GLM 4.7",
+			"name": "Z.ai: GLM 4.7",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -31286,7 +32248,7 @@
 		},
 		"z-ai/glm-5": {
 			"id": "z-ai/glm-5",
-			"name": "GLM 5",
+			"name": "Z.ai: GLM 5",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -31310,7 +32272,7 @@
 		},
 		"z-ai/glm-5-turbo": {
 			"id": "z-ai/glm-5-turbo",
-			"name": "GLM 5 Turbo",
+			"name": "Z.ai: GLM 5 Turbo",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -31334,7 +32296,7 @@
 		},
 		"z-ai/glm-5.1": {
 			"id": "z-ai/glm-5.1",
-			"name": "GLM 5.1",
+			"name": "Z.ai: GLM 5.1",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -31358,7 +32320,7 @@
 		},
 		"z-ai/glm-5.2": {
 			"id": "z-ai/glm-5.2",
-			"name": "GLM-5.2",
+			"name": "Z.ai: GLM 5.2",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -31401,7 +32363,7 @@
 		},
 		"z-ai/glm-5.3": {
 			"id": "z-ai/glm-5.3",
-			"name": "GLM-5.3",
+			"name": "Z.ai: GLM 5.3",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -31415,7 +32377,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 1310720,
+			"contextWindow": 1048576,
 			"maxTokens": 131072,
 			"thinking": {
 				"mode": "effort",
@@ -31425,7 +32387,7 @@
 		},
 		"z-ai/glm-5.3-flash": {
 			"id": "z-ai/glm-5.3-flash",
-			"name": "GLM-5.3-Flash",
+			"name": "Z.ai: GLM 5.3 Flash",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -31440,7 +32402,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 1310720,
+			"contextWindow": 1048576,
 			"maxTokens": 131072,
 			"thinking": {
 				"mode": "effort",
@@ -31450,7 +32412,7 @@
 		},
 		"z-ai/glm-5.3-flashx": {
 			"id": "z-ai/glm-5.3-flashx",
-			"name": "GLM 5.3 FlashX",
+			"name": "Z.ai: GLM 5.3 FlashX",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -31473,9 +32435,28 @@
 				"maxLevel": "xhigh"
 			}
 		},
+		"z-ai/glm-5.3-prime": {
+			"id": "z-ai/glm-5.3-prime",
+			"name": "Z.ai: GLM 5.3 Prime",
+			"api": "openai-completions",
+			"provider": "kilo",
+			"baseUrl": "https://api.kilo.ai/api/gateway",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 8888
+		},
 		"z-ai/glm-5v-turbo": {
 			"id": "z-ai/glm-5v-turbo",
-			"name": "GLM 5V Turbo",
+			"name": "Z.ai: GLM 5V Turbo",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -32971,7 +33952,7 @@
 		},
 		"anthropic/claude-haiku-4.5": {
 			"id": "anthropic/claude-haiku-4.5",
-			"name": "Anthropic Haiku 4.5 (latest)",
+			"name": "Anthropic Haiku 4.5",
 			"api": "openai-completions",
 			"provider": "litellm",
 			"baseUrl": "http://localhost:4000/v1",
@@ -33050,7 +34031,7 @@
 		},
 		"anthropic/claude-opus-4.5": {
 			"id": "anthropic/claude-opus-4.5",
-			"name": "Anthropic Opus 4.5 (latest)",
+			"name": "Anthropic Opus 4.5",
 			"api": "openai-completions",
 			"provider": "litellm",
 			"baseUrl": "http://localhost:4000/v1",
@@ -33149,7 +34130,7 @@
 		},
 		"anthropic/claude-sonnet-4.5": {
 			"id": "anthropic/claude-sonnet-4.5",
-			"name": "Anthropic Sonnet 4.5 (latest)",
+			"name": "Anthropic Sonnet 4.5",
 			"api": "openai-completions",
 			"provider": "litellm",
 			"baseUrl": "http://localhost:4000/v1",
@@ -42807,7 +43788,7 @@
 		},
 		"openai/gpt-5.2-pro": {
 			"id": "openai/gpt-5.2-pro",
-			"name": "GPT-5.2-Pro",
+			"name": "GPT-5.2 Pro",
 			"api": "openai-completions",
 			"provider": "litellm",
 			"baseUrl": "http://localhost:4000/v1",
@@ -42852,7 +43833,8 @@
 			"baseUrl": "http://localhost:4000/v1",
 			"reasoning": true,
 			"input": [
-				"text"
+				"text",
+				"image"
 			],
 			"cost": {
 				"input": 0,
@@ -42885,13 +43867,14 @@
 		},
 		"openai/gpt-5.4-mini": {
 			"id": "openai/gpt-5.4-mini",
-			"name": "GPT-5.4 Mini",
+			"name": "GPT-5.4 mini",
 			"api": "openai-completions",
 			"provider": "litellm",
 			"baseUrl": "http://localhost:4000/v1",
-			"reasoning": false,
+			"reasoning": true,
 			"input": [
-				"text"
+				"text",
+				"image"
 			],
 			"cost": {
 				"input": 0,
@@ -42904,13 +43887,14 @@
 		},
 		"openai/gpt-5.4-nano": {
 			"id": "openai/gpt-5.4-nano",
-			"name": "GPT-5.4 Nano",
+			"name": "GPT-5.4 nano",
 			"api": "openai-completions",
 			"provider": "litellm",
 			"baseUrl": "http://localhost:4000/v1",
-			"reasoning": false,
+			"reasoning": true,
 			"input": [
-				"text"
+				"text",
+				"image"
 			],
 			"cost": {
 				"input": 0,
@@ -47284,7 +48268,7 @@
 			"api": "openai-completions",
 			"provider": "litellm",
 			"baseUrl": "http://localhost:4000/v1",
-			"reasoning": false,
+			"reasoning": true,
 			"input": [
 				"text",
 				"image"
@@ -47934,7 +48918,7 @@
 		},
 		"z-ai/glm-5.1": {
 			"id": "z-ai/glm-5.1",
-			"name": "GLM 5.1",
+			"name": "GLM-5.1",
 			"api": "openai-completions",
 			"provider": "litellm",
 			"baseUrl": "http://localhost:4000/v1",
@@ -48975,6 +49959,32 @@
 				"minLevel": "high",
 				"maxLevel": "high"
 			}
+		},
+		"MiniMax-M3.1-Flash-Preview": {
+			"id": "MiniMax-M3.1-Flash-Preview",
+			"name": "MiniMax-M3.1-Flash-Preview",
+			"api": "openai-completions",
+			"provider": "minimax-code",
+			"baseUrl": "https://api.minimax.io/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 512000,
+			"compat": {
+				"supportsStore": false,
+				"supportsDeveloperRole": false,
+				"supportsReasoningEffort": false,
+				"reasoningContentField": "reasoning_content"
+			}
 		}
 	},
 	"minimax-code-cn": {
@@ -49208,6 +50218,32 @@
 				"minLevel": "high",
 				"maxLevel": "high"
 			}
+		},
+		"MiniMax-M3.1-Flash-Preview": {
+			"id": "MiniMax-M3.1-Flash-Preview",
+			"name": "MiniMax-M3.1-Flash-Preview",
+			"api": "openai-completions",
+			"provider": "minimax-code-cn",
+			"baseUrl": "https://api.minimaxi.com/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 512000,
+			"compat": {
+				"supportsStore": false,
+				"supportsDeveloperRole": false,
+				"supportsReasoningEffort": false,
+				"reasoningContentField": "reasoning_content"
+			}
 		}
 	},
 	"mistral": {
@@ -49224,7 +50260,7 @@
 			"cost": {
 				"input": 0.3,
 				"output": 0.9,
-				"cacheRead": 0,
+				"cacheRead": 0.03,
 				"cacheWrite": 0
 			},
 			"contextWindow": 256000,
@@ -49483,7 +50519,7 @@
 			"cost": {
 				"input": 0.5,
 				"output": 1.5,
-				"cacheRead": 0,
+				"cacheRead": 0.05,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -49503,7 +50539,7 @@
 			"cost": {
 				"input": 0.5,
 				"output": 1.5,
-				"cacheRead": 0,
+				"cacheRead": 0.05,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -49563,7 +50599,7 @@
 			"cost": {
 				"input": 1.5,
 				"output": 7.5,
-				"cacheRead": 0,
+				"cacheRead": 0.15,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -49588,7 +50624,7 @@
 			"cost": {
 				"input": 1.5,
 				"output": 7.5,
-				"cacheRead": 0,
+				"cacheRead": 0.15,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -49652,7 +50688,7 @@
 			"cost": {
 				"input": 0.15,
 				"output": 0.6,
-				"cacheRead": 0,
+				"cacheRead": 0.015,
 				"cacheWrite": 0
 			},
 			"contextWindow": 256000,
@@ -49677,7 +50713,7 @@
 			"cost": {
 				"input": 0.15,
 				"output": 0.6,
-				"cacheRead": 0,
+				"cacheRead": 0.015,
 				"cacheWrite": 0
 			},
 			"contextWindow": 256000,
@@ -67241,6 +68277,158 @@
 			},
 			"applyPatchToolType": "freeform"
 		},
+		"gpt-6-luna": {
+			"id": "gpt-6-luna",
+			"name": "GPT-6 Luna",
+			"api": "openai-responses",
+			"provider": "openai",
+			"baseUrl": "",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.1,
+				"output": 0.5,
+				"cacheRead": 0.01,
+				"cacheWrite": 0.125
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max"
+			},
+			"longContextPricing": {
+				"threshold": 272000,
+				"cost": {
+					"input": 0.2,
+					"output": 0.75,
+					"cacheRead": 0.02,
+					"cacheWrite": 0.25
+				}
+			}
+		},
+		"gpt-6-sol": {
+			"id": "gpt-6-sol",
+			"name": "GPT-6 Sol",
+			"api": "openai-responses",
+			"provider": "openai",
+			"baseUrl": "",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2,
+				"output": 10,
+				"cacheRead": 0.2,
+				"cacheWrite": 2.5
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max"
+			},
+			"longContextPricing": {
+				"threshold": 272000,
+				"cost": {
+					"input": 4,
+					"output": 15,
+					"cacheRead": 0.4,
+					"cacheWrite": 5
+				}
+			}
+		},
+		"gpt-6.1-sol": {
+			"id": "gpt-6.1-sol",
+			"name": "GPT-6.1 Sol",
+			"api": "openai-responses",
+			"provider": "openai",
+			"baseUrl": "",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2,
+				"output": 10,
+				"cacheRead": 0.1,
+				"cacheWrite": 2.5
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max"
+			},
+			"longContextPricing": {
+				"threshold": 272000,
+				"cost": {
+					"input": 4,
+					"output": 15,
+					"cacheRead": 0.2,
+					"cacheWrite": 5
+				}
+			}
+		},
+		"gpt-daybreak-blue-latest": {
+			"id": "gpt-daybreak-blue-latest",
+			"name": "Daybreak Blue",
+			"api": "openai-responses",
+			"provider": "openai",
+			"baseUrl": "",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 4,
+				"output": 20,
+				"cacheRead": 0.4,
+				"cacheWrite": 5
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"gpt-daybreak-red-latest": {
+			"id": "gpt-daybreak-red-latest",
+			"name": "Daybreak Red",
+			"api": "openai-responses",
+			"provider": "openai",
+			"baseUrl": "",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 12.5,
+				"output": 75,
+				"cacheRead": 1.25,
+				"cacheWrite": 15.625
+			},
+			"contextWindow": 400000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
 		"gpt-image-2": {
 			"id": "gpt-image-2",
 			"name": "GPT Image 2",
@@ -68111,7 +69299,7 @@
 				"cacheRead": 1,
 				"cacheWrite": 12.5
 			},
-			"contextWindow": 272000,
+			"contextWindow": 1050000,
 			"maxTokens": 128000,
 			"preferWebsockets": true,
 			"priority": 1,
@@ -68133,7 +69321,7 @@
 		},
 		"gpt-6-luna": {
 			"id": "gpt-6-luna",
-			"name": "GPT-6-Luna",
+			"name": "GPT-6 Luna",
 			"api": "openai-codex-responses",
 			"provider": "openai-codex",
 			"baseUrl": "https://chatgpt.com/backend-api",
@@ -68148,7 +69336,7 @@
 				"cacheRead": 0.01,
 				"cacheWrite": 0.125
 			},
-			"contextWindow": 272000,
+			"contextWindow": 1050000,
 			"maxTokens": 128000,
 			"preferWebsockets": true,
 			"thinking": {
@@ -68168,7 +69356,7 @@
 		},
 		"gpt-6-sol": {
 			"id": "gpt-6-sol",
-			"name": "GPT-6-Sol",
+			"name": "GPT-6 Sol",
 			"api": "openai-codex-responses",
 			"provider": "openai-codex",
 			"baseUrl": "https://chatgpt.com/backend-api",
@@ -68183,7 +69371,7 @@
 				"cacheRead": 0.2,
 				"cacheWrite": 2.5
 			},
-			"contextWindow": 272000,
+			"contextWindow": 1050000,
 			"maxTokens": 128000,
 			"preferWebsockets": true,
 			"thinking": {
@@ -68203,7 +69391,7 @@
 		},
 		"gpt-6.1-sol": {
 			"id": "gpt-6.1-sol",
-			"name": "GPT-6.1-Sol",
+			"name": "GPT-6.1 Sol",
 			"api": "openai-codex-responses",
 			"provider": "openai-codex",
 			"baseUrl": "https://chatgpt.com/backend-api",
@@ -68248,10 +69436,10 @@
 				"image"
 			],
 			"cost": {
-				"input": 0,
-				"output": 0,
-				"cacheRead": 0,
-				"cacheWrite": 0
+				"input": 4,
+				"output": 20,
+				"cacheRead": 0.4,
+				"cacheWrite": 5
 			},
 			"contextWindow": 272000,
 			"maxTokens": 128000,
@@ -68713,6 +69901,31 @@
 				"maxLevel": "max"
 			}
 		},
+		"gpt-6-luna": {
+			"id": "gpt-6-luna",
+			"name": "GPT-6 Luna",
+			"api": "openai-responses",
+			"provider": "opencode-go",
+			"baseUrl": "https://opencode.ai/zen/go/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.1,
+				"output": 0.5,
+				"cacheRead": 0.01,
+				"cacheWrite": 0.125
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		},
 		"grok-4.5": {
 			"id": "grok-4.5",
 			"name": "Grok 4.5",
@@ -68974,6 +70187,31 @@
 				"input": 0.3,
 				"output": 1.2,
 				"cacheRead": 0.006,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 131072,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"longcat-2.5-preview-free": {
+			"id": "longcat-2.5-preview-free",
+			"name": "LongCat 2.5 Preview Free",
+			"api": "openai-completions",
+			"provider": "opencode-go",
+			"baseUrl": "https://opencode.ai/zen/go/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1000000,
@@ -69404,6 +70642,31 @@
 				"maxLevel": "xhigh"
 			}
 		},
+		"space-bunny-free": {
+			"id": "space-bunny-free",
+			"name": "Space Bunny Free",
+			"api": "openai-completions",
+			"provider": "opencode-go",
+			"baseUrl": "https://opencode.ai/zen/go/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1048576,
+			"maxTokens": 524288,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
 		"union-alpha": {
 			"id": "union-alpha",
 			"name": "Union Alpha Free",
@@ -69707,6 +70970,31 @@
 				"maxLevel": "max"
 			}
 		},
+		"claude-opus-5-5": {
+			"id": "claude-opus-5-5",
+			"name": "Anthropic Opus 5.5",
+			"api": "anthropic-messages",
+			"provider": "opencode-zen",
+			"baseUrl": "https://opencode.ai/zen",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 4,
+				"output": 20,
+				"cacheRead": 0.2,
+				"cacheWrite": 5
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "max"
+			}
+		},
 		"claude-sonnet-4": {
 			"id": "claude-sonnet-4",
 			"name": "Anthropic Sonnet 4",
@@ -69785,6 +71073,31 @@
 		"claude-sonnet-5": {
 			"id": "claude-sonnet-5",
 			"name": "Anthropic Sonnet 5",
+			"api": "anthropic-messages",
+			"provider": "opencode-zen",
+			"baseUrl": "https://opencode.ai/zen",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2,
+				"output": 10,
+				"cacheRead": 0.2,
+				"cacheWrite": 2.5
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "max"
+			}
+		},
+		"claude-sonnet-5-5": {
+			"id": "claude-sonnet-5-5",
+			"name": "Anthropic Sonnet 5.5",
 			"api": "anthropic-messages",
 			"provider": "opencode-zen",
 			"baseUrl": "https://opencode.ai/zen",
@@ -70831,6 +72144,81 @@
 				"maxLevel": "max"
 			}
 		},
+		"gpt-6-luna": {
+			"id": "gpt-6-luna",
+			"name": "GPT-6 Luna",
+			"api": "openai-responses",
+			"provider": "opencode-zen",
+			"baseUrl": "https://opencode.ai/zen/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.1,
+				"output": 0.5,
+				"cacheRead": 0.01,
+				"cacheWrite": 0.125
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		},
+		"gpt-6-sol": {
+			"id": "gpt-6-sol",
+			"name": "GPT-6 Sol",
+			"api": "openai-responses",
+			"provider": "opencode-zen",
+			"baseUrl": "https://opencode.ai/zen/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2,
+				"output": 10,
+				"cacheRead": 0.2,
+				"cacheWrite": 2.5
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		},
+		"gpt-6.1-sol": {
+			"id": "gpt-6.1-sol",
+			"name": "GPT-6.1 Sol",
+			"api": "openai-responses",
+			"provider": "opencode-zen",
+			"baseUrl": "https://opencode.ai/zen/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2,
+				"output": 10,
+				"cacheRead": 0.1,
+				"cacheWrite": 2.5
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		},
 		"grok-4.5": {
 			"id": "grok-4.5",
 			"name": "Grok 4.5",
@@ -70859,6 +72247,31 @@
 		"grok-4.6": {
 			"id": "grok-4.6",
 			"name": "Grok 4.6",
+			"api": "openai-responses",
+			"provider": "opencode-zen",
+			"baseUrl": "https://opencode.ai/zen/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2,
+				"output": 6,
+				"cacheRead": 0.5,
+				"cacheWrite": 0
+			},
+			"contextWindow": 500000,
+			"maxTokens": 500000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"grok-4.7": {
+			"id": "grok-4.7",
+			"name": "Grok 4.7",
 			"api": "openai-responses",
 			"provider": "opencode-zen",
 			"baseUrl": "https://opencode.ai/zen/v1",
@@ -71182,6 +72595,31 @@
 			},
 			"contextWindow": 262144,
 			"maxTokens": 32768,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"longcat-2.5-preview-free": {
+			"id": "longcat-2.5-preview-free",
+			"name": "LongCat 2.5 Preview Free",
+			"api": "openai-completions",
+			"provider": "opencode-zen",
+			"baseUrl": "https://opencode.ai/zen/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 131072,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -71727,6 +73165,31 @@
 				"maxLevel": "xhigh"
 			}
 		},
+		"qwen3.8-max": {
+			"id": "qwen3.8-max",
+			"name": "Qwen3.8 Max",
+			"api": "openai-completions",
+			"provider": "opencode-zen",
+			"baseUrl": "https://opencode.ai/zen/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2,
+				"output": 6,
+				"cacheRead": 0.25,
+				"cacheWrite": 2.5
+			},
+			"contextWindow": 262144,
+			"maxTokens": 131072,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
 		"ring-2.6-1t-free": {
 			"id": "ring-2.6-1t-free",
 			"name": "Ring 2.6 1T Free",
@@ -71745,6 +73208,31 @@
 			},
 			"contextWindow": 262000,
 			"maxTokens": 66000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"space-bunny-free": {
+			"id": "space-bunny-free",
+			"name": "Space Bunny Free",
+			"api": "openai-completions",
+			"provider": "opencode-zen",
+			"baseUrl": "https://opencode.ai/zen/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1048576,
+			"maxTokens": 524288,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -71981,9 +73469,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.12,
-				"output": 0.48,
-				"cacheRead": 0.0036,
+				"input": 0.027,
+				"output": 0.6,
+				"cacheRead": 0.027,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
@@ -72005,13 +73493,13 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.55572,
-				"output": 1.66716,
-				"cacheRead": 0.018524000000000002,
+				"input": 0.2276,
+				"output": 3.5,
+				"cacheRead": 0.2276,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
-			"maxTokens": 384000,
+			"maxTokens": 393216,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -72029,12 +73517,12 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.03,
-				"output": 1,
-				"cacheRead": 0.008,
+				"input": 0.0108,
+				"output": 1.28,
+				"cacheRead": 0.0108,
 				"cacheWrite": 0
 			},
-			"contextWindow": 1310720,
+			"contextWindow": 1048576,
 			"maxTokens": 943718,
 			"thinking": {
 				"mode": "effort",
@@ -72104,9 +73592,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 1.5,
-				"output": 7.5,
-				"cacheRead": 0.15,
+				"input": 0.6912999999999999,
+				"output": 10,
+				"cacheRead": 0.6912999999999999,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
@@ -72179,10 +73667,10 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.19999999999999998,
-				"output": 1.2,
-				"cacheRead": 0.02,
-				"cacheWrite": 0.25
+				"input": 0.09999999999999999,
+				"output": 0.5,
+				"cacheRead": 0.01,
+				"cacheWrite": 0.125
 			},
 			"contextWindow": 1050000,
 			"maxTokens": 128000,
@@ -72231,7 +73719,7 @@
 			"cost": {
 				"input": 2,
 				"output": 10,
-				"cacheRead": 0.19999999999999998,
+				"cacheRead": 0.09999999999999999,
 				"cacheWrite": 2.5
 			},
 			"contextWindow": 1050000,
@@ -72279,9 +73767,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 1.5999999999999999,
-				"output": 4.8,
-				"cacheRead": 0.39999999999999997,
+				"input": 2,
+				"output": 6,
+				"cacheRead": 0.5,
 				"cacheWrite": 0
 			},
 			"contextWindow": 500000,
@@ -72304,12 +73792,12 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.075,
-				"output": 0.25,
-				"cacheRead": 0.015,
+				"input": 0.02,
+				"output": 0.3,
+				"cacheRead": 0.01,
 				"cacheWrite": 0
 			},
-			"contextWindow": 1310720,
+			"contextWindow": 1048576,
 			"maxTokens": 943718,
 			"thinking": {
 				"mode": "effort",
@@ -72328,13 +73816,13 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.6537999999999999,
-				"output": 2.0547999999999997,
-				"cacheRead": 0.12142000000000001,
+				"input": 0.143,
+				"output": 2.694,
+				"cacheRead": 0.176,
 				"cacheWrite": 0
 			},
-			"contextWindow": 1310720,
-			"maxTokens": 131072,
+			"contextWindow": 1048576,
+			"maxTokens": 943718,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -72376,7 +73864,7 @@
 				"cacheRead": 0.19999999999999998,
 				"cacheWrite": 0
 			},
-			"contextWindow": 1048576,
+			"contextWindow": 131072,
 			"maxTokens": 32768,
 			"thinking": {
 				"mode": "effort",
@@ -72400,7 +73888,7 @@
 				"cacheRead": 0.75,
 				"cacheWrite": 0
 			},
-			"contextWindow": 1048576,
+			"contextWindow": 131072,
 			"maxTokens": 32768,
 			"thinking": {
 				"mode": "effort",
@@ -72424,7 +73912,55 @@
 				"cacheRead": 0.18,
 				"cacheWrite": 0
 			},
-			"contextWindow": 1048576,
+			"contextWindow": 131072,
+			"maxTokens": 32768,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"aion-labs/aion-3.5": {
+			"id": "aion-labs/aion-3.5",
+			"name": "AionLabs: Aion 3.5",
+			"api": "openai-completions",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 3,
+				"output": 6,
+				"cacheRead": 0.75,
+				"cacheWrite": 0
+			},
+			"contextWindow": 262144,
+			"maxTokens": 32768,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"aion-labs/aion-3.5-mini": {
+			"id": "aion-labs/aion-3.5-mini",
+			"name": "AionLabs: Aion 3.5 Mini",
+			"api": "openai-completions",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0.7,
+				"output": 1.4,
+				"cacheRead": 0.18,
+				"cacheWrite": 0
+			},
+			"contextWindow": 262144,
 			"maxTokens": 32768,
 			"thinking": {
 				"mode": "effort",
@@ -72703,7 +74239,7 @@
 		},
 		"anthropic/claude-fable-5": {
 			"id": "anthropic/claude-fable-5",
-			"name": "Anthropic Fable 5",
+			"name": "Anthropic: Anthropic Fable 5",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -72753,7 +74289,7 @@
 		},
 		"anthropic/claude-fable-5.1": {
 			"id": "anthropic/claude-fable-5.1",
-			"name": "Anthropic Fable 5.1",
+			"name": "Anthropic: Anthropic Fable 5.1",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -72803,7 +74339,7 @@
 		},
 		"anthropic/claude-haiku-4.5": {
 			"id": "anthropic/claude-haiku-4.5",
-			"name": "Anthropic Haiku 4.5 (latest)",
+			"name": "Anthropic: Anthropic Haiku 4.5",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -72878,7 +74414,7 @@
 		},
 		"anthropic/claude-opus-4.1": {
 			"id": "anthropic/claude-opus-4.1",
-			"name": "Anthropic Opus 4.1",
+			"name": "Anthropic: Anthropic Opus 4.1",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -72928,7 +74464,7 @@
 		},
 		"anthropic/claude-opus-4.5": {
 			"id": "anthropic/claude-opus-4.5",
-			"name": "Anthropic Opus 4.5 (latest)",
+			"name": "Anthropic: Anthropic Opus 4.5",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -72978,7 +74514,7 @@
 		},
 		"anthropic/claude-opus-4.6": {
 			"id": "anthropic/claude-opus-4.6",
-			"name": "Anthropic Opus 4.6",
+			"name": "Anthropic: Anthropic Opus 4.6",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -73053,7 +74589,7 @@
 		},
 		"anthropic/claude-opus-4.7": {
 			"id": "anthropic/claude-opus-4.7",
-			"name": "Anthropic Opus 4.7",
+			"name": "Anthropic: Anthropic Opus 4.7",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -73128,7 +74664,7 @@
 		},
 		"anthropic/claude-opus-4.8": {
 			"id": "anthropic/claude-opus-4.8",
-			"name": "Anthropic Opus 4.8",
+			"name": "Anthropic: Anthropic Opus 4.8",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -73203,7 +74739,7 @@
 		},
 		"anthropic/claude-opus-5": {
 			"id": "anthropic/claude-opus-5",
-			"name": "Anthropic Opus 5",
+			"name": "Anthropic: Anthropic Opus 5",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -73328,7 +74864,7 @@
 		},
 		"anthropic/claude-sonnet-4": {
 			"id": "anthropic/claude-sonnet-4",
-			"name": "Anthropic Sonnet 4",
+			"name": "Anthropic: Anthropic Sonnet 4",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -73353,7 +74889,7 @@
 		},
 		"anthropic/claude-sonnet-4.5": {
 			"id": "anthropic/claude-sonnet-4.5",
-			"name": "Anthropic Sonnet 4.5 (latest)",
+			"name": "Anthropic: Anthropic Sonnet 4.5",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -73403,7 +74939,7 @@
 		},
 		"anthropic/claude-sonnet-4.6": {
 			"id": "anthropic/claude-sonnet-4.6",
-			"name": "Anthropic Sonnet 4.6",
+			"name": "Anthropic: Anthropic Sonnet 4.6",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -73453,7 +74989,7 @@
 		},
 		"anthropic/claude-sonnet-5": {
 			"id": "anthropic/claude-sonnet-5",
-			"name": "Anthropic Sonnet 5",
+			"name": "Anthropic: Anthropic Sonnet 5",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -73479,6 +75015,56 @@
 		"anthropic/claude-sonnet-5:batch": {
 			"id": "anthropic/claude-sonnet-5:batch",
 			"name": "Anthropic: Anthropic Sonnet 5 (batch)",
+			"api": "openai-completions",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 1,
+				"output": 5,
+				"cacheRead": 0.09999999999999999,
+				"cacheWrite": 1.25
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"anthropic/claude-sonnet-5.5": {
+			"id": "anthropic/claude-sonnet-5.5",
+			"name": "Anthropic: Anthropic Sonnet 5.5",
+			"api": "openai-completions",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2,
+				"output": 10,
+				"cacheRead": 0.19999999999999998,
+				"cacheWrite": 2.5
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"anthropic/claude-sonnet-5.5:batch": {
+			"id": "anthropic/claude-sonnet-5.5:batch",
+			"name": "Anthropic: Anthropic Sonnet 5.5 (batch)",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -73906,6 +75492,34 @@
 				"maxLevel": "high"
 			}
 		},
+		"cohere/command-a-plus": {
+			"id": "cohere/command-a-plus",
+			"name": "Cohere: Command A+",
+			"api": "openai-completions",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.3,
+				"output": 1.5,
+				"cacheRead": 0.15,
+				"cacheWrite": 0
+			},
+			"contextWindow": 192000,
+			"maxTokens": 64000,
+			"compat": {
+				"supportsToolChoice": false
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
 		"cohere/command-r-08-2024": {
 			"id": "cohere/command-r-08-2024",
 			"name": "Cohere: Command R (08-2024)",
@@ -73979,13 +75593,13 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.32,
-				"output": 0.8899999999999999,
+				"input": 0.2574,
+				"output": 1.0287,
 				"cacheRead": 0.15,
 				"cacheWrite": 0
 			},
 			"contextWindow": 163840,
-			"maxTokens": 16384
+			"maxTokens": 16000
 		},
 		"deepseek/deepseek-chat-v3-0324": {
 			"id": "deepseek/deepseek-chat-v3-0324",
@@ -73998,9 +75612,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.25,
-				"output": 1,
-				"cacheRead": 0.135,
+				"input": 0.29,
+				"output": 1.1400000000000001,
+				"cacheRead": 0.11,
 				"cacheWrite": 0
 			},
 			"contextWindow": 163840,
@@ -74094,13 +75708,13 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.27,
+				"input": 0.3,
 				"output": 1,
 				"cacheRead": 0.135,
 				"cacheWrite": 0
 			},
 			"contextWindow": 163840,
-			"maxTokens": 32768,
+			"maxTokens": 65536,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -74133,7 +75747,7 @@
 		},
 		"deepseek/deepseek-v3.2": {
 			"id": "deepseek/deepseek-v3.2",
-			"name": "DeepSeek V3.2",
+			"name": "DeepSeek: DeepSeek V3.2",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -74142,9 +75756,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.26899999999999996,
-				"output": 0.39999999999999997,
-				"cacheRead": 0.13449999999999998,
+				"input": 0.28,
+				"output": 0.42,
+				"cacheRead": 0.028,
 				"cacheWrite": 0
 			},
 			"contextWindow": 163840,
@@ -74157,7 +75771,7 @@
 		},
 		"deepseek/deepseek-v3.2-exp": {
 			"id": "deepseek/deepseek-v3.2-exp",
-			"name": "DeepSeek-V3.2-Exp",
+			"name": "DeepSeek: DeepSeek V3.2 Exp",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -74172,7 +75786,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 163840,
-			"maxTokens": 65536,
+			"maxTokens": 147456,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -74181,7 +75795,7 @@
 		},
 		"deepseek/deepseek-v4-flash": {
 			"id": "deepseek/deepseek-v4-flash",
-			"name": "DeepSeek V4 Flash",
+			"name": "DeepSeek: DeepSeek V4 Flash 0423",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -74190,9 +75804,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.049,
-				"output": 0.098,
-				"cacheRead": 0.0098,
+				"input": 0.041999999999999996,
+				"output": 0.08399999999999999,
+				"cacheRead": 0.008400000000000001,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
@@ -74214,12 +75828,12 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.04,
-				"output": 0.64,
-				"cacheRead": 0.016,
+				"input": 0.0108,
+				"output": 1.28,
+				"cacheRead": 0.0108,
 				"cacheWrite": 0
 			},
-			"contextWindow": 1310720,
+			"contextWindow": 1048576,
 			"maxTokens": 943718,
 			"thinking": {
 				"mode": "effort",
@@ -74239,13 +75853,13 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.22,
-				"output": 0.66,
-				"cacheRead": 0.007,
+				"input": 0.21559999999999999,
+				"output": 0.6468,
+				"cacheRead": 0.00686,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
-			"maxTokens": 943718,
+			"maxTokens": 262144,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -74278,7 +75892,7 @@
 		},
 		"deepseek/deepseek-v4-pro": {
 			"id": "deepseek/deepseek-v4-pro",
-			"name": "DeepSeek V4 Pro",
+			"name": "DeepSeek: DeepSeek V4 Pro 0423",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -74287,9 +75901,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.9159360000000001,
-				"output": 1.8318720000000002,
-				"cacheRead": 0.076328,
+				"input": 0.20879999999999999,
+				"output": 0.41759999999999997,
+				"cacheRead": 0.0174,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
@@ -74311,13 +75925,13 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.66,
-				"output": 1.9800000000000002,
-				"cacheRead": 0.022,
+				"input": 1.32,
+				"output": 3.9600000000000004,
+				"cacheRead": 0.044,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
-			"maxTokens": 384000,
+			"maxTokens": 393216,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -74336,13 +75950,13 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.15,
-				"output": 0.6,
-				"cacheRead": 0.003,
+				"input": 0.03,
+				"output": 0.5,
+				"cacheRead": 0.01,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
-			"maxTokens": 384000,
+			"maxTokens": 943718,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -74418,6 +76032,31 @@
 			"contextWindow": 32768,
 			"maxTokens": 8888
 		},
+		"fireworks/ember-1": {
+			"id": "fireworks/ember-1",
+			"name": "Fireworks: Ember-1",
+			"api": "openai-completions",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 3,
+				"output": 15,
+				"cacheRead": 0.3,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1048576,
+			"maxTokens": 943718,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
 		"google/gemini-2.0-flash-001": {
 			"id": "google/gemini-2.0-flash-001",
 			"name": "Google: Gemini 2.0 Flash",
@@ -74460,7 +76099,7 @@
 		},
 		"google/gemini-2.5-flash": {
 			"id": "google/gemini-2.5-flash",
-			"name": "Gemini 2.5 Flash",
+			"name": "Google: Gemini 2.5 Flash",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -74485,11 +76124,11 @@
 		},
 		"google/gemini-2.5-flash-lite": {
 			"id": "google/gemini-2.5-flash-lite",
-			"name": "Gemini 2.5 Flash Lite",
+			"name": "Google: Gemini 2.5 Flash Lite",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
-			"reasoning": false,
+			"reasoning": true,
 			"input": [
 				"text",
 				"image"
@@ -74501,7 +76140,12 @@
 				"cacheWrite": 0.0833333333333333
 			},
 			"contextWindow": 1048576,
-			"maxTokens": 65535
+			"maxTokens": 65535,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
 		},
 		"google/gemini-2.5-flash-lite-preview-09-2025": {
 			"id": "google/gemini-2.5-flash-lite-preview-09-2025",
@@ -74605,7 +76249,7 @@
 		},
 		"google/gemini-2.5-pro": {
 			"id": "google/gemini-2.5-pro",
-			"name": "Gemini 2.5 Pro",
+			"name": "Google: Gemini 2.5 Pro",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -74705,7 +76349,7 @@
 		},
 		"google/gemini-3-flash-preview": {
 			"id": "google/gemini-3-flash-preview",
-			"name": "Gemini 3 Flash Preview",
+			"name": "Google: Gemini 3 Flash Preview",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -74813,7 +76457,7 @@
 		},
 		"google/gemini-3.1-flash-lite": {
 			"id": "google/gemini-3.1-flash-lite",
-			"name": "Gemini 3.1 Flash Lite",
+			"name": "Google: Gemini 3.1 Flash Lite",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -74838,11 +76482,11 @@
 		},
 		"google/gemini-3.1-flash-lite-preview": {
 			"id": "google/gemini-3.1-flash-lite-preview",
-			"name": "Gemini 3.1 Flash Lite Preview",
+			"name": "Google: Gemini 3.1 Flash Lite Preview",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
-			"reasoning": false,
+			"reasoning": true,
 			"input": [
 				"text",
 				"image"
@@ -74854,7 +76498,12 @@
 				"cacheWrite": 0.0833333333333333
 			},
 			"contextWindow": 1048576,
-			"maxTokens": 65536
+			"maxTokens": 65536,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
 		},
 		"google/gemini-3.1-flash-lite:batch": {
 			"id": "google/gemini-3.1-flash-lite:batch",
@@ -74883,7 +76532,7 @@
 		},
 		"google/gemini-3.1-pro-preview": {
 			"id": "google/gemini-3.1-pro-preview",
-			"name": "Gemini 3.1 Pro Preview",
+			"name": "Google: Gemini 3.1 Pro Preview",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -74970,7 +76619,7 @@
 		},
 		"google/gemini-3.5-flash": {
 			"id": "google/gemini-3.5-flash",
-			"name": "Gemini 3.5 Flash",
+			"name": "Google: Gemini 3.5 Flash",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -75220,7 +76869,7 @@
 		},
 		"google/gemma-3-12b-it": {
 			"id": "google/gemma-3-12b-it",
-			"name": "Gemma 3 12B IT",
+			"name": "Google: Gemma 3 12B",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -75240,7 +76889,7 @@
 		},
 		"google/gemma-3-27b-it": {
 			"id": "google/gemma-3-27b-it",
-			"name": "Gemma 3 27B IT",
+			"name": "Google: Gemma 3 27B",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -75330,7 +76979,7 @@
 		},
 		"google/gemma-4-31b-it": {
 			"id": "google/gemma-4-31b-it",
-			"name": "Gemma-4-31B-IT",
+			"name": "Google: Gemma 4 31B",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -75691,12 +77340,12 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.06,
-				"output": 0.18,
-				"cacheRead": 0.012,
+				"input": 0.020999999999999998,
+				"output": 0.061599999999999995,
+				"cacheRead": 0.004200000000000001,
 				"cacheWrite": 0
 			},
-			"contextWindow": 131072,
+			"contextWindow": 262144,
 			"maxTokens": 32768,
 			"thinking": {
 				"mode": "effort",
@@ -76124,7 +77773,7 @@
 		},
 		"meta/muse-glimmer-30b": {
 			"id": "meta/muse-glimmer-30b",
-			"name": "Muse Glimmer 30B",
+			"name": "Meta: Muse Glimmer 30B",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -76134,13 +77783,13 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.3,
-				"output": 1.2,
+				"input": 0.35,
+				"output": 1.5,
 				"cacheRead": 0.04,
 				"cacheWrite": 0
 			},
 			"contextWindow": 131072,
-			"maxTokens": 16384,
+			"maxTokens": 117964,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -76283,7 +77932,7 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.39999999999999997,
+				"input": 0.55,
 				"output": 2.2,
 				"cacheRead": 0,
 				"cacheWrite": 0
@@ -76298,7 +77947,7 @@
 		},
 		"minimax/minimax-m2": {
 			"id": "minimax/minimax-m2",
-			"name": "MiniMax M2",
+			"name": "MiniMax: MiniMax M2",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -76307,13 +77956,13 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.255,
-				"output": 1.02,
+				"input": 0.3,
+				"output": 1.2,
 				"cacheRead": 0.03,
 				"cacheWrite": 0
 			},
 			"contextWindow": 204800,
-			"maxTokens": 131072,
+			"maxTokens": 176947,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -76322,7 +77971,7 @@
 		},
 		"minimax/minimax-m2.1": {
 			"id": "minimax/minimax-m2.1",
-			"name": "MiniMax M2.1",
+			"name": "MiniMax: MiniMax M2.1",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -76346,7 +77995,7 @@
 		},
 		"minimax/minimax-m2.5": {
 			"id": "minimax/minimax-m2.5",
-			"name": "MiniMax M2.5",
+			"name": "MiniMax: MiniMax M2.5",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -76397,7 +78046,7 @@
 		},
 		"minimax/minimax-m2.7": {
 			"id": "minimax/minimax-m2.7",
-			"name": "MiniMax M2.7",
+			"name": "MiniMax: MiniMax M2.7",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -76406,13 +78055,13 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.3,
-				"output": 1.2,
-				"cacheRead": 0.06,
+				"input": 0.21,
+				"output": 0.84,
+				"cacheRead": 0.041999999999999996,
 				"cacheWrite": 0
 			},
 			"contextWindow": 204800,
-			"maxTokens": 131072,
+			"maxTokens": 176947,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -76421,7 +78070,7 @@
 		},
 		"minimax/minimax-m3": {
 			"id": "minimax/minimax-m3",
-			"name": "MiniMax-M3",
+			"name": "MiniMax: MiniMax M3",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -76719,7 +78368,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
-			"maxTokens": 8888
+			"maxTokens": 209715
 		},
 		"mistralai/mistral-large-2512:batch": {
 			"id": "mistralai/mistral-large-2512:batch",
@@ -77188,7 +78837,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
-			"maxTokens": 98304,
+			"maxTokens": 235929,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -77197,7 +78846,7 @@
 		},
 		"moonshotai/kimi-k2.5": {
 			"id": "moonshotai/kimi-k2.5",
-			"name": "Kimi K2.5",
+			"name": "MoonshotAI: Kimi K2.5",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -77222,7 +78871,7 @@
 		},
 		"moonshotai/kimi-k2.6": {
 			"id": "moonshotai/kimi-k2.6",
-			"name": "Kimi K2.6",
+			"name": "MoonshotAI: Kimi K2.6",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -77232,9 +78881,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.95,
-				"output": 4,
-				"cacheRead": 0.16,
+				"input": 0.43415,
+				"output": 1.8279999999999998,
+				"cacheRead": 0.07311999999999999,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -77272,7 +78921,7 @@
 		},
 		"moonshotai/kimi-k2.7-code": {
 			"id": "moonshotai/kimi-k2.7-code",
-			"name": "Kimi K2.7 Code",
+			"name": "MoonshotAI: Kimi K2.7 Code",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -77282,8 +78931,8 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.7062,
-				"output": 3.3000000000000003,
+				"input": 0.6712,
+				"output": 3.35,
 				"cacheRead": 0.18,
 				"cacheWrite": 0
 			},
@@ -77322,7 +78971,7 @@
 		},
 		"moonshotai/kimi-k3": {
 			"id": "moonshotai/kimi-k3",
-			"name": "Kimi K3",
+			"name": "MoonshotAI: Kimi K3",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -77332,9 +78981,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 3,
-				"output": 15,
-				"cacheRead": 0.3,
+				"input": 0.6912999999999999,
+				"output": 10,
+				"cacheRead": 0.6912999999999999,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
@@ -77632,7 +79281,7 @@
 		},
 		"nvidia/nemotron-3-nano-30b-a3b": {
 			"id": "nvidia/nemotron-3-nano-30b-a3b",
-			"name": "nemotron-3-nano-30b-a3b",
+			"name": "NVIDIA: Nemotron 3 Nano 30B A3B",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -77705,7 +79354,7 @@
 		},
 		"nvidia/nemotron-3-super-120b-a12b": {
 			"id": "nvidia/nemotron-3-super-120b-a12b",
-			"name": "Nemotron 3 Super",
+			"name": "NVIDIA: Nemotron 3 Super",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -77753,7 +79402,7 @@
 		},
 		"nvidia/nemotron-3-ultra-550b-a55b": {
 			"id": "nvidia/nemotron-3-ultra-550b-a55b",
-			"name": "Nemotron 3 Ultra 550B A55B",
+			"name": "NVIDIA: Nemotron 3 Ultra",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -77834,13 +79483,13 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.07,
-				"output": 0.19999999999999998,
-				"cacheRead": 0.04,
+				"input": 0.0595,
+				"output": 0.16999999999999998,
+				"cacheRead": 0.02975,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
-			"maxTokens": 235929,
+			"maxTokens": 131072,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -78138,7 +79787,7 @@
 		},
 		"openai/gpt-4.1": {
 			"id": "openai/gpt-4.1",
-			"name": "GPT-4.1",
+			"name": "OpenAI: GPT-4.1",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -78158,7 +79807,7 @@
 		},
 		"openai/gpt-4.1-mini": {
 			"id": "openai/gpt-4.1-mini",
-			"name": "GPT-4.1 mini",
+			"name": "OpenAI: GPT-4.1 Mini",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -78198,7 +79847,7 @@
 		},
 		"openai/gpt-4.1-nano": {
 			"id": "openai/gpt-4.1-nano",
-			"name": "GPT-4.1 nano",
+			"name": "OpenAI: GPT-4.1 Nano",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -78258,7 +79907,7 @@
 		},
 		"openai/gpt-4o": {
 			"id": "openai/gpt-4o",
-			"name": "GPT-4o",
+			"name": "OpenAI: GPT-4o",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -78357,7 +80006,7 @@
 		},
 		"openai/gpt-4o-mini": {
 			"id": "openai/gpt-4o-mini",
-			"name": "GPT-4o mini",
+			"name": "OpenAI: GPT-4o-mini",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -78457,7 +80106,7 @@
 		},
 		"openai/gpt-5": {
 			"id": "openai/gpt-5",
-			"name": "GPT-5",
+			"name": "OpenAI: GPT-5",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -78582,7 +80231,7 @@
 		},
 		"openai/gpt-5-mini": {
 			"id": "openai/gpt-5-mini",
-			"name": "GPT-5 Mini",
+			"name": "OpenAI: GPT-5 Mini",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -78632,7 +80281,7 @@
 		},
 		"openai/gpt-5-nano": {
 			"id": "openai/gpt-5-nano",
-			"name": "GPT-5 Nano",
+			"name": "OpenAI: GPT-5 Nano",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -78757,7 +80406,7 @@
 		},
 		"openai/gpt-5.1": {
 			"id": "openai/gpt-5.1",
-			"name": "GPT-5.1",
+			"name": "OpenAI: GPT-5.1",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -78802,7 +80451,7 @@
 		},
 		"openai/gpt-5.1-codex": {
 			"id": "openai/gpt-5.1-codex",
-			"name": "GPT-5.1-OpenAI code",
+			"name": "OpenAI: GPT-5.1-OpenAI code",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -78852,7 +80501,7 @@
 		},
 		"openai/gpt-5.1-codex-mini": {
 			"id": "openai/gpt-5.1-codex-mini",
-			"name": "GPT-5.1-OpenAI code-Mini",
+			"name": "OpenAI: GPT-5.1-OpenAI code-Mini",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -78902,7 +80551,7 @@
 		},
 		"openai/gpt-5.2": {
 			"id": "openai/gpt-5.2",
-			"name": "GPT-5.2",
+			"name": "OpenAI: GPT-5.2",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -78947,7 +80596,7 @@
 		},
 		"openai/gpt-5.2-codex": {
 			"id": "openai/gpt-5.2-codex",
-			"name": "GPT-5.2-OpenAI code",
+			"name": "OpenAI: GPT-5.2-OpenAI code",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -78972,7 +80621,7 @@
 		},
 		"openai/gpt-5.2-pro": {
 			"id": "openai/gpt-5.2-pro",
-			"name": "GPT-5.2-Pro",
+			"name": "OpenAI: GPT-5.2 Pro",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -79066,13 +80715,14 @@
 		},
 		"openai/gpt-5.3-codex": {
 			"id": "openai/gpt-5.3-codex",
-			"name": "GPT-5.3 OpenAI code",
+			"name": "OpenAI: GPT-5.3-OpenAI code",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"reasoning": true,
 			"input": [
-				"text"
+				"text",
+				"image"
 			],
 			"cost": {
 				"input": 1.75,
@@ -79090,7 +80740,7 @@
 		},
 		"openai/gpt-5.4": {
 			"id": "openai/gpt-5.4",
-			"name": "GPT-5.4",
+			"name": "OpenAI: GPT-5.4",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -79115,13 +80765,14 @@
 		},
 		"openai/gpt-5.4-mini": {
 			"id": "openai/gpt-5.4-mini",
-			"name": "GPT-5.4 Mini",
+			"name": "OpenAI: GPT-5.4 Mini",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
-			"reasoning": false,
+			"reasoning": true,
 			"input": [
-				"text"
+				"text",
+				"image"
 			],
 			"cost": {
 				"input": 0.75,
@@ -79130,7 +80781,12 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 400000,
-			"maxTokens": 128000
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "xhigh"
+			}
 		},
 		"openai/gpt-5.4-mini:batch": {
 			"id": "openai/gpt-5.4-mini:batch",
@@ -79159,13 +80815,14 @@
 		},
 		"openai/gpt-5.4-nano": {
 			"id": "openai/gpt-5.4-nano",
-			"name": "GPT-5.4 Nano",
+			"name": "OpenAI: GPT-5.4 Nano",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
-			"reasoning": false,
+			"reasoning": true,
 			"input": [
-				"text"
+				"text",
+				"image"
 			],
 			"cost": {
 				"input": 0.19999999999999998,
@@ -79174,7 +80831,12 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 400000,
-			"maxTokens": 128000
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "xhigh"
+			}
 		},
 		"openai/gpt-5.4-nano:batch": {
 			"id": "openai/gpt-5.4-nano:batch",
@@ -79203,7 +80865,7 @@
 		},
 		"openai/gpt-5.4-pro": {
 			"id": "openai/gpt-5.4-pro",
-			"name": "GPT-5.4 Pro",
+			"name": "OpenAI: GPT-5.4 Pro",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -79278,7 +80940,7 @@
 		},
 		"openai/gpt-5.5": {
 			"id": "openai/gpt-5.5",
-			"name": "GPT-5.5",
+			"name": "OpenAI: GPT-5.5",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -79303,7 +80965,7 @@
 		},
 		"openai/gpt-5.5-pro": {
 			"id": "openai/gpt-5.5-pro",
-			"name": "GPT-5.5 Pro",
+			"name": "OpenAI: GPT-5.5 Pro",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -79378,7 +81040,7 @@
 		},
 		"openai/gpt-5.6-luna": {
 			"id": "openai/gpt-5.6-luna",
-			"name": "GPT-5.6 Luna",
+			"name": "OpenAI: GPT-5.6 Luna",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -79478,7 +81140,7 @@
 		},
 		"openai/gpt-5.6-sol": {
 			"id": "openai/gpt-5.6-sol",
-			"name": "GPT-5.6 Sol",
+			"name": "OpenAI: GPT-5.6 Sol",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -79513,10 +81175,10 @@
 				"image"
 			],
 			"cost": {
-				"input": 2,
-				"output": 10,
-				"cacheRead": 0.19999999999999998,
-				"cacheWrite": 2.5
+				"input": 4,
+				"output": 20,
+				"cacheRead": 0.39999999999999997,
+				"cacheWrite": 5
 			},
 			"contextWindow": 1050000,
 			"maxTokens": 128000,
@@ -79578,7 +81240,7 @@
 		},
 		"openai/gpt-5.6-terra": {
 			"id": "openai/gpt-5.6-terra",
-			"name": "GPT-5.6 Terra",
+			"name": "OpenAI: GPT-5.6 Terra",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -79678,7 +81340,7 @@
 		},
 		"openai/gpt-6-astra": {
 			"id": "openai/gpt-6-astra",
-			"name": "GPT-6 Astra",
+			"name": "OpenAI: GPT-6 Astra",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -79776,6 +81438,256 @@
 				"maxLevel": "high"
 			}
 		},
+		"openai/gpt-6-luna": {
+			"id": "openai/gpt-6-luna",
+			"name": "OpenAI: GPT-6 Luna",
+			"api": "openai-completions",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.09999999999999999,
+				"output": 0.5,
+				"cacheRead": 0.01,
+				"cacheWrite": 0.125
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		},
+		"openai/gpt-6-luna-pro": {
+			"id": "openai/gpt-6-luna-pro",
+			"name": "OpenAI: GPT-6 Luna Pro",
+			"api": "openai-completions",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.09999999999999999,
+				"output": 0.5,
+				"cacheRead": 0.01,
+				"cacheWrite": 0.125
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"openai/gpt-6-luna-pro:batch": {
+			"id": "openai/gpt-6-luna-pro:batch",
+			"name": "OpenAI: GPT-6 Luna Pro (batch)",
+			"api": "openai-completions",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.049999999999999996,
+				"output": 0.25,
+				"cacheRead": 0.005,
+				"cacheWrite": 0.0625
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"openai/gpt-6-luna:batch": {
+			"id": "openai/gpt-6-luna:batch",
+			"name": "OpenAI: GPT-6 Luna (batch)",
+			"api": "openai-completions",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.049999999999999996,
+				"output": 0.25,
+				"cacheRead": 0.005,
+				"cacheWrite": 0.0625
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"openai/gpt-6-sol": {
+			"id": "openai/gpt-6-sol",
+			"name": "OpenAI: GPT-6 Sol",
+			"api": "openai-completions",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2,
+				"output": 10,
+				"cacheRead": 0.19999999999999998,
+				"cacheWrite": 2.5
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		},
+		"openai/gpt-6-sol-pro": {
+			"id": "openai/gpt-6-sol-pro",
+			"name": "OpenAI: GPT-6 Sol Pro",
+			"api": "openai-completions",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2,
+				"output": 10,
+				"cacheRead": 0.19999999999999998,
+				"cacheWrite": 2.5
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"openai/gpt-6-sol-pro:batch": {
+			"id": "openai/gpt-6-sol-pro:batch",
+			"name": "OpenAI: GPT-6 Sol Pro (batch)",
+			"api": "openai-completions",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 1,
+				"output": 5,
+				"cacheRead": 0.09999999999999999,
+				"cacheWrite": 1.25
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"openai/gpt-6-sol:batch": {
+			"id": "openai/gpt-6-sol:batch",
+			"name": "OpenAI: GPT-6 Sol (batch)",
+			"api": "openai-completions",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 1,
+				"output": 5,
+				"cacheRead": 0.09999999999999999,
+				"cacheWrite": 1.25
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"openai/gpt-6.1-sol": {
+			"id": "openai/gpt-6.1-sol",
+			"name": "OpenAI: GPT-6.1 Sol",
+			"api": "openai-completions",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2,
+				"output": 10,
+				"cacheRead": 0.09999999999999999,
+				"cacheWrite": 2.5
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		},
+		"openai/gpt-6.1-sol-pro": {
+			"id": "openai/gpt-6.1-sol-pro",
+			"name": "OpenAI: GPT-6.1 Sol Pro",
+			"api": "openai-completions",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2,
+				"output": 10,
+				"cacheRead": 0.09999999999999999,
+				"cacheWrite": 2.5
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
 		"openai/gpt-audio": {
 			"id": "openai/gpt-audio",
 			"name": "OpenAI: GPT Audio",
@@ -79836,7 +81748,7 @@
 		},
 		"openai/gpt-oss-120b": {
 			"id": "openai/gpt-oss-120b",
-			"name": "GPT OSS 120B",
+			"name": "OpenAI: gpt-oss-120b",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -79845,13 +81757,37 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.15,
-				"output": 0.6,
+				"input": 0.037,
+				"output": 0.16999999999999998,
 				"cacheRead": 0.075,
 				"cacheWrite": 0
 			},
 			"contextWindow": 131072,
-			"maxTokens": 65536,
+			"maxTokens": 117964,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"openai/gpt-oss-120b:batch": {
+			"id": "openai/gpt-oss-120b:batch",
+			"name": "OpenAI: gpt-oss-120b (batch)",
+			"api": "openai-completions",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0.0296,
+				"output": 0.136,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 131072,
+			"maxTokens": 117964,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -79908,7 +81844,7 @@
 		},
 		"openai/gpt-oss-20b": {
 			"id": "openai/gpt-oss-20b",
-			"name": "GPT OSS 20B",
+			"name": "OpenAI: gpt-oss-20b",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -79919,7 +81855,7 @@
 			"cost": {
 				"input": 0.018,
 				"output": 0.09,
-				"cacheRead": 0.03,
+				"cacheRead": 0.009,
 				"cacheWrite": 0
 			},
 			"contextWindow": 131072,
@@ -79980,7 +81916,7 @@
 		},
 		"openai/gpt-oss-safeguard-20b": {
 			"id": "openai/gpt-oss-safeguard-20b",
-			"name": "Safety GPT OSS 20B",
+			"name": "OpenAI: gpt-oss-safeguard-20b",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -80054,7 +81990,7 @@
 		},
 		"openai/o3": {
 			"id": "openai/o3",
-			"name": "o3",
+			"name": "OpenAI: o3",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -80104,7 +82040,7 @@
 		},
 		"openai/o3-mini": {
 			"id": "openai/o3-mini",
-			"name": "o3-mini",
+			"name": "OpenAI: o3 Mini",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -80275,7 +82211,7 @@
 		},
 		"openai/o4-mini": {
 			"id": "openai/o4-mini",
-			"name": "o4-mini",
+			"name": "OpenAI: o4 Mini",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -80434,8 +82370,8 @@
 				"image"
 			],
 			"cost": {
-				"input": -1000000,
-				"output": -1000000,
+				"input": 0,
+				"output": 0,
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
@@ -80459,8 +82395,8 @@
 				"image"
 			],
 			"cost": {
-				"input": -1000000,
-				"output": -1000000,
+				"input": 0,
+				"output": 0,
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
@@ -80587,6 +82523,31 @@
 				"supportsToolChoice": false
 			}
 		},
+		"perceptron/perceptron-mk1.5": {
+			"id": "perceptron/perceptron-mk1.5",
+			"name": "Perceptron: Perceptron Mk1.5",
+			"api": "openai-completions",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.15,
+				"output": 1.5,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 36864,
+			"maxTokens": 8192,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
 		"poolside/laguna-m.1": {
 			"id": "poolside/laguna-m.1",
 			"name": "Poolside: Laguna M.1",
@@ -80685,7 +82646,7 @@
 		},
 		"poolside/laguna-xs-2.1": {
 			"id": "poolside/laguna-xs-2.1",
-			"name": "Laguna XS 2.1",
+			"name": "Poolside: Laguna XS 2.1",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -80817,7 +82778,7 @@
 			"cost": {
 				"input": 0.075,
 				"output": 0.5,
-				"cacheRead": 0,
+				"cacheRead": 0.0375,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -81323,7 +83284,7 @@
 		},
 		"qwen/qwen3-coder-plus": {
 			"id": "qwen/qwen3-coder-plus",
-			"name": "Qwen3-Coder-Plus",
+			"name": "Qwen: Qwen3 Coder Plus",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -81380,7 +83341,7 @@
 		},
 		"qwen/qwen3-max": {
 			"id": "qwen/qwen3-max",
-			"name": "Qwen3-Max-Thinking",
+			"name": "Qwen: Qwen3 Max",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -81428,7 +83389,7 @@
 		},
 		"qwen/qwen3-next-80b-a3b-instruct": {
 			"id": "qwen/qwen3-next-80b-a3b-instruct",
-			"name": "Qwen3-Next-80B-A3B-Instruct",
+			"name": "Qwen: Qwen3 Next 80B A3B Instruct",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -81437,13 +83398,13 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.09,
+				"input": 0.09999999999999999,
 				"output": 1.1,
 				"cacheRead": 0.07,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
-			"maxTokens": 16384
+			"maxTokens": 235929
 		},
 		"qwen/qwen3-next-80b-a3b-instruct:free": {
 			"id": "qwen/qwen3-next-80b-a3b-instruct:free",
@@ -81545,13 +83506,13 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.13,
-				"output": 0.52,
+				"input": 0.15,
+				"output": 0.6,
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
-			"maxTokens": 32768
+			"maxTokens": 16384
 		},
 		"qwen/qwen3-vl-30b-a3b-thinking": {
 			"id": "qwen/qwen3-vl-30b-a3b-thinking",
@@ -81645,7 +83606,7 @@
 		},
 		"qwen/qwen3.5-122b-a10b": {
 			"id": "qwen/qwen3.5-122b-a10b",
-			"name": "Qwen3.5 122B-A10B",
+			"name": "Qwen: Qwen3.5-122B-A10B",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -81705,13 +83666,13 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.3125,
-				"output": 1.25,
+				"input": 0.1625,
+				"output": 1.3,
 				"cacheRead": 0.15625,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
-			"maxTokens": 16384,
+			"maxTokens": 65536,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -81720,7 +83681,7 @@
 		},
 		"qwen/qwen3.5-397b-a17b": {
 			"id": "qwen/qwen3.5-397b-a17b",
-			"name": "Qwen3.5-397B-A17B",
+			"name": "Qwen: Qwen3.5 397B A17B",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -81845,7 +83806,7 @@
 		},
 		"qwen/qwen3.6-27b": {
 			"id": "qwen/qwen3.6-27b",
-			"name": "Qwen3.6 27B",
+			"name": "Qwen: Qwen3.6 27B",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -81856,12 +83817,12 @@
 			],
 			"cost": {
 				"input": 0.32,
-				"output": 2.7,
+				"output": 3.1999999999999997,
 				"cacheRead": 0.15,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
-			"maxTokens": 262140,
+			"maxTokens": 81920,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -81944,13 +83905,14 @@
 		},
 		"qwen/qwen3.6-plus": {
 			"id": "qwen/qwen3.6-plus",
-			"name": "Qwen3.6-Plus",
+			"name": "Qwen: Qwen3.6 Plus",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"reasoning": true,
 			"input": [
-				"text"
+				"text",
+				"image"
 			],
 			"cost": {
 				"input": 0.325,
@@ -82042,7 +84004,7 @@
 		},
 		"qwen/qwen3.7-max": {
 			"id": "qwen/qwen3.7-max",
-			"name": "Qwen3.7 Max",
+			"name": "Qwen: Qwen3.7 Max",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -82066,7 +84028,7 @@
 		},
 		"qwen/qwen3.7-plus": {
 			"id": "qwen/qwen3.7-plus",
-			"name": "Qwen3.7 Plus",
+			"name": "Qwen: Qwen3.7 Plus",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -82115,7 +84077,7 @@
 		},
 		"qwen/qwen3.8-27b": {
 			"id": "qwen/qwen3.8-27b",
-			"name": "Qwen3.8 27B",
+			"name": "Qwen: Qwen3.8 27B",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -82229,6 +84191,56 @@
 				"output": 6,
 				"cacheRead": 0.25,
 				"cacheWrite": 2.5
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 131072,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"qwen/qwen3.8-max-prime": {
+			"id": "qwen/qwen3.8-max-prime",
+			"name": "Qwen: Qwen3.8 Max Prime",
+			"api": "openai-completions",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 4,
+				"output": 12,
+				"cacheRead": 0.5,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 131072,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"qwen/qwen3.8-omni-flash": {
+			"id": "qwen/qwen3.8-omni-flash",
+			"name": "Qwen: Qwen3.8 Omni Flash",
+			"api": "openai-completions",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.15,
+				"output": 0.47,
+				"cacheRead": 0.016,
+				"cacheWrite": 0
 			},
 			"contextWindow": 1000000,
 			"maxTokens": 131072,
@@ -82459,13 +84471,38 @@
 			"contextWindow": 131072,
 			"maxTokens": 16384
 		},
+		"stealth/space-bunny-alpha": {
+			"id": "stealth/space-bunny-alpha",
+			"name": "Space Bunny Alpha",
+			"api": "openai-completions",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 524288,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
 		"stepfun/step-3.5-flash": {
 			"id": "stepfun/step-3.5-flash",
-			"name": "Step 3.5 Flash",
+			"name": "StepFun: Step 3.5 Flash",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
-			"reasoning": false,
+			"reasoning": true,
 			"input": [
 				"text"
 			],
@@ -82479,6 +84516,11 @@
 			"maxTokens": 65536,
 			"compat": {
 				"supportsToolChoice": false
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
 			}
 		},
 		"stepfun/step-3.5-flash:free": {
@@ -82510,7 +84552,7 @@
 		},
 		"stepfun/step-3.7-flash": {
 			"id": "stepfun/step-3.7-flash",
-			"name": "Step 3.7 Flash",
+			"name": "StepFun: Step 3.7 Flash",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -82547,9 +84589,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.0825,
-				"output": 0.33,
-				"cacheRead": 0.020625,
+				"input": 0.13199999999999998,
+				"output": 0.5279999999999999,
+				"cacheRead": 0.032999999999999995,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -82562,7 +84604,7 @@
 		},
 		"tencent/hy3-preview": {
 			"id": "tencent/hy3-preview",
-			"name": "Hy3 preview",
+			"name": "Tencent: Hy3 preview",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -82672,7 +84714,7 @@
 		},
 		"thinkingmachines/inkling": {
 			"id": "thinkingmachines/inkling",
-			"name": "Inkling",
+			"name": "Thinking Machines: Inkling",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -82687,7 +84729,7 @@
 				"cacheRead": 0.16999999999999998,
 				"cacheWrite": 0
 			},
-			"contextWindow": 1048576,
+			"contextWindow": 524288,
 			"maxTokens": 471859,
 			"thinking": {
 				"mode": "effort",
@@ -82712,7 +84754,7 @@
 				"cacheRead": 0.09999999999999999,
 				"cacheWrite": 0
 			},
-			"contextWindow": 1048576,
+			"contextWindow": 524288,
 			"maxTokens": 262144,
 			"thinking": {
 				"mode": "effort",
@@ -82849,6 +84891,31 @@
 				"maxLevel": "high"
 			}
 		},
+		"typesafe/jev-router": {
+			"id": "typesafe/jev-router",
+			"name": "TypeSafe: Jev Router",
+			"api": "openai-completions",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 8888,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
 		"unbiased/pareto": {
 			"id": "unbiased/pareto",
 			"name": "Pareto",
@@ -82868,6 +84935,30 @@
 			},
 			"contextWindow": 262144,
 			"maxTokens": 131072
+		},
+		"upstage/solar-mini4": {
+			"id": "upstage/solar-mini4",
+			"name": "Upstage: Solar Mini 4",
+			"api": "openai-completions",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0.049999999999999996,
+				"output": 0.19999999999999998,
+				"cacheRead": 0.005,
+				"cacheWrite": 0
+			},
+			"contextWindow": 524288,
+			"maxTokens": 131072,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
 		},
 		"upstage/solar-pro-3": {
 			"id": "upstage/solar-pro-3",
@@ -83154,7 +85245,7 @@
 		},
 		"x-ai/grok-4.3": {
 			"id": "x-ai/grok-4.3",
-			"name": "Grok 4.3",
+			"name": "SpaceXAI: Grok 4.3",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -83204,7 +85295,7 @@
 		},
 		"x-ai/grok-4.5": {
 			"id": "x-ai/grok-4.5",
-			"name": "Grok 4.5",
+			"name": "SpaceXAI: Grok 4.5",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -83229,7 +85320,7 @@
 		},
 		"x-ai/grok-4.6": {
 			"id": "x-ai/grok-4.6",
-			"name": "Grok 4.6",
+			"name": "SpaceXAI: Grok 4.6",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -83264,9 +85355,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 1.5999999999999999,
-				"output": 4.8,
-				"cacheRead": 0.39999999999999997,
+				"input": 2,
+				"output": 6,
+				"cacheRead": 0.5,
 				"cacheWrite": 0
 			},
 			"contextWindow": 500000,
@@ -83279,11 +85370,11 @@
 		},
 		"x-ai/grok-build-0.1": {
 			"id": "x-ai/grok-build-0.1",
-			"name": "Grok Build 0.1",
+			"name": "SpaceXAI: Grok Build 0.1",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
-			"reasoning": false,
+			"reasoning": true,
 			"input": [
 				"text",
 				"image"
@@ -83295,7 +85386,12 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 256000,
-			"maxTokens": 230400
+			"maxTokens": 230400,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
 		},
 		"x-ai/grok-code-fast-1": {
 			"id": "x-ai/grok-code-fast-1",
@@ -83396,7 +85492,7 @@
 		},
 		"xiaomi/mimo-v2.5": {
 			"id": "xiaomi/mimo-v2.5",
-			"name": "MiMo-V2.5",
+			"name": "Xiaomi: MiMo-V2.5",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -83421,7 +85517,7 @@
 		},
 		"xiaomi/mimo-v2.5-pro": {
 			"id": "xiaomi/mimo-v2.5-pro",
-			"name": "MiMo-V2.5-Pro",
+			"name": "Xiaomi: MiMo-V2.5-Pro",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -83460,7 +85556,7 @@
 				"cacheRead": 0.0028,
 				"cacheWrite": 0
 			},
-			"contextWindow": 1048576,
+			"contextWindow": 1050000,
 			"maxTokens": 131072,
 			"thinking": {
 				"mode": "effort",
@@ -83485,7 +85581,7 @@
 				"cacheRead": 0.0036,
 				"cacheWrite": 0
 			},
-			"contextWindow": 1048576,
+			"contextWindow": 1050000,
 			"maxTokens": 131072,
 			"thinking": {
 				"mode": "effort",
@@ -83539,7 +85635,7 @@
 		},
 		"z-ai/glm-4.5": {
 			"id": "z-ai/glm-4.5",
-			"name": "GLM 4.5",
+			"name": "Z.ai: GLM 4.5",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -83563,7 +85659,7 @@
 		},
 		"z-ai/glm-4.5-air": {
 			"id": "z-ai/glm-4.5-air",
-			"name": "GLM 4.5 Air",
+			"name": "Z.ai: GLM 4.5 Air",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -83636,7 +85732,7 @@
 		},
 		"z-ai/glm-4.6": {
 			"id": "z-ai/glm-4.6",
-			"name": "GLM 4.6",
+			"name": "Z.ai: GLM 4.6",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -83684,7 +85780,7 @@
 		},
 		"z-ai/glm-4.6v": {
 			"id": "z-ai/glm-4.6v",
-			"name": "GLM 4.6V",
+			"name": "Z.ai: GLM 4.6V",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -83709,7 +85805,7 @@
 		},
 		"z-ai/glm-4.7": {
 			"id": "z-ai/glm-4.7",
-			"name": "GLM 4.7",
+			"name": "Z.ai: GLM 4.7",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -83718,9 +85814,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.39999999999999997,
-				"output": 1.75,
-				"cacheRead": 0.08,
+				"input": 0.6,
+				"output": 2.2,
+				"cacheRead": 0.11,
 				"cacheWrite": 0
 			},
 			"contextWindow": 204800,
@@ -83757,7 +85853,7 @@
 		},
 		"z-ai/glm-5": {
 			"id": "z-ai/glm-5",
-			"name": "GLM 5",
+			"name": "Z.ai: GLM 5",
 			"api": "openai-completions",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -83781,7 +85877,7 @@
 		},
 		"z-ai/glm-5-turbo": {
 			"id": "z-ai/glm-5-turbo",
-			"name": "GLM 5 Turbo",
+			"name": "Z.ai: GLM 5 Turbo",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -83805,7 +85901,7 @@
 		},
 		"z-ai/glm-5.1": {
 			"id": "z-ai/glm-5.1",
-			"name": "GLM 5.1",
+			"name": "Z.ai: GLM 5.1",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -83814,13 +85910,13 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.966,
-				"output": 3.036,
-				"cacheRead": 0.1794,
+				"input": 0.9646,
+				"output": 3.0316,
+				"cacheRead": 0.17914,
 				"cacheWrite": 0
 			},
 			"contextWindow": 204800,
-			"maxTokens": 128000,
+			"maxTokens": 131072,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -83829,7 +85925,7 @@
 		},
 		"z-ai/glm-5.2": {
 			"id": "z-ai/glm-5.2",
-			"name": "GLM-5.2",
+			"name": "Z.ai: GLM 5.2",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -83838,13 +85934,13 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.6496,
-				"output": 2.0416,
-				"cacheRead": 0.12064,
+				"input": 1.4,
+				"output": 4.4,
+				"cacheRead": 0.26,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
-			"maxTokens": 131072,
+			"maxTokens": 943718,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -83877,7 +85973,7 @@
 		},
 		"z-ai/glm-5.3": {
 			"id": "z-ai/glm-5.3",
-			"name": "GLM-5.3",
+			"name": "Z.ai: GLM 5.3",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -83886,13 +85982,13 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.6537999999999999,
-				"output": 2.0547999999999997,
-				"cacheRead": 0.12142000000000001,
+				"input": 0.2219,
+				"output": 4.4,
+				"cacheRead": 0.1775,
 				"cacheWrite": 0
 			},
-			"contextWindow": 1310720,
-			"maxTokens": 131072,
+			"contextWindow": 1048576,
+			"maxTokens": 943718,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -83901,7 +85997,7 @@
 		},
 		"z-ai/glm-5.3-flash": {
 			"id": "z-ai/glm-5.3-flash",
-			"name": "GLM-5.3-Flash",
+			"name": "Z.ai: GLM 5.3 Flash",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -83913,11 +86009,11 @@
 			"cost": {
 				"input": 0.15,
 				"output": 0.5,
-				"cacheRead": 0.049999999999999996,
+				"cacheRead": 0.03,
 				"cacheWrite": 0
 			},
-			"contextWindow": 1310720,
-			"maxTokens": 943718,
+			"contextWindow": 1048576,
+			"maxTokens": 943717,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -83951,7 +86047,7 @@
 		},
 		"z-ai/glm-5.3-flashx": {
 			"id": "z-ai/glm-5.3-flashx",
-			"name": "GLM 5.3 FlashX",
+			"name": "Z.ai: GLM 5.3 FlashX",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -83963,10 +86059,34 @@
 			"cost": {
 				"input": 0.37,
 				"output": 1.25,
-				"cacheRead": 0.075,
+				"cacheRead": 0.09,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
+			"maxTokens": 131072,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"z-ai/glm-5.3-prime": {
+			"id": "z-ai/glm-5.3-prime",
+			"name": "Z.ai: GLM 5.3 Prime",
+			"api": "openai-completions",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 2.8,
+				"output": 8.8,
+				"cacheRead": 0.56,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
 			"maxTokens": 131072,
 			"thinking": {
 				"mode": "effort",
@@ -83985,9 +86105,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.72,
-				"output": 2.4,
-				"cacheRead": 0.12,
+				"input": 0.44999999999999996,
+				"output": 2,
+				"cacheRead": 0.09999999999999999,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
@@ -84000,7 +86120,7 @@
 		},
 		"z-ai/glm-5v-turbo": {
 			"id": "z-ai/glm-5v-turbo",
-			"name": "GLM 5V Turbo",
+			"name": "Z.ai: GLM 5V Turbo",
 			"api": "openai-completions",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -84736,6 +86856,50 @@
 				"supportsUsageInStreaming": false
 			}
 		},
+		"aion-labs-aion-3-5": {
+			"id": "aion-labs-aion-3-5",
+			"name": "aion-labs-aion-3-5",
+			"api": "openai-completions",
+			"provider": "venice",
+			"baseUrl": "https://api.venice.ai/api/v1",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 262144,
+			"maxTokens": 8888,
+			"compat": {
+				"supportsUsageInStreaming": false
+			}
+		},
+		"aion-labs-aion-3-5-mini": {
+			"id": "aion-labs-aion-3-5-mini",
+			"name": "aion-labs-aion-3-5-mini",
+			"api": "openai-completions",
+			"provider": "venice",
+			"baseUrl": "https://api.venice.ai/api/v1",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 262144,
+			"maxTokens": 8888,
+			"compat": {
+				"supportsUsageInStreaming": false
+			}
+		},
 		"aion-labs.aion-2-0": {
 			"id": "aion-labs.aion-2-0",
 			"name": "aion-labs.aion-2-0",
@@ -85099,6 +87263,29 @@
 				"maxLevel": "xhigh"
 			}
 		},
+		"claude-opus-5-5-fast": {
+			"id": "claude-opus-5-5-fast",
+			"name": "anthropic-opus-5-5-fast",
+			"api": "openai-completions",
+			"provider": "venice",
+			"baseUrl": "https://api.venice.ai/api/v1",
+			"reasoning": false,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 8888,
+			"compat": {
+				"supportsUsageInStreaming": false
+			}
+		},
 		"claude-opus-5-fast": {
 			"id": "claude-opus-5-fast",
 			"name": "anthropic-opus-5-fast",
@@ -85232,6 +87419,28 @@
 				"mode": "effort",
 				"minLevel": "minimal",
 				"maxLevel": "xhigh"
+			}
+		},
+		"claude-sonnet-5-5": {
+			"id": "claude-sonnet-5-5",
+			"name": "anthropic-sonnet-5-5",
+			"api": "openai-completions",
+			"provider": "venice",
+			"baseUrl": "https://api.venice.ai/api/v1",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"compat": {
+				"supportsUsageInStreaming": false
 			}
 		},
 		"deepseek-v3.2": {
@@ -87522,6 +89731,72 @@
 				"supportsUsageInStreaming": false
 			}
 		},
+		"openai-gpt-6-luna": {
+			"id": "openai-gpt-6-luna",
+			"name": "openai-gpt-6-luna",
+			"api": "openai-completions",
+			"provider": "venice",
+			"baseUrl": "https://api.venice.ai/api/v1",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 8888,
+			"compat": {
+				"supportsUsageInStreaming": false
+			}
+		},
+		"openai-gpt-6-sol": {
+			"id": "openai-gpt-6-sol",
+			"name": "openai-gpt-6-sol",
+			"api": "openai-completions",
+			"provider": "venice",
+			"baseUrl": "https://api.venice.ai/api/v1",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 8888,
+			"compat": {
+				"supportsUsageInStreaming": false
+			}
+		},
+		"openai-gpt-61-sol": {
+			"id": "openai-gpt-61-sol",
+			"name": "openai-gpt-61-sol",
+			"api": "openai-completions",
+			"provider": "venice",
+			"baseUrl": "https://api.venice.ai/api/v1",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 8888,
+			"compat": {
+				"supportsUsageInStreaming": false
+			}
+		},
 		"openai-gpt-oss-120b": {
 			"id": "openai-gpt-oss-120b",
 			"name": "OpenAI GPT OSS 120B",
@@ -88064,6 +90339,28 @@
 		"xiaomi-mimo-v2-5": {
 			"id": "xiaomi-mimo-v2-5",
 			"name": "xiaomi-mimo-v2-5",
+			"api": "openai-completions",
+			"provider": "venice",
+			"baseUrl": "https://api.venice.ai/api/v1",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 8888,
+			"compat": {
+				"supportsUsageInStreaming": false
+			}
+		},
+		"xiaomi-mimo-v2-6-flash": {
+			"id": "xiaomi-mimo-v2-6-flash",
+			"name": "xiaomi-mimo-v2-6-flash",
 			"api": "openai-completions",
 			"provider": "venice",
 			"baseUrl": "https://api.venice.ai/api/v1",
@@ -88765,7 +91062,7 @@
 			],
 			"cost": {
 				"input": 0.39999999999999997,
-				"output": 2.5,
+				"output": 2.4,
 				"cacheRead": 0.04,
 				"cacheWrite": 0.5
 			},
@@ -88854,7 +91151,7 @@
 		},
 		"alibaba/qwen3.7-max": {
 			"id": "alibaba/qwen3.7-max",
-			"name": "Qwen3.7 Max",
+			"name": "Qwen 3.7 Max",
 			"api": "anthropic-messages",
 			"provider": "vercel-ai-gateway",
 			"baseUrl": "https://ai-gateway.vercel.sh",
@@ -88878,7 +91175,7 @@
 		},
 		"alibaba/qwen3.7-plus": {
 			"id": "alibaba/qwen3.7-plus",
-			"name": "Qwen3.7 Plus",
+			"name": "Qwen 3.7 Plus",
 			"api": "anthropic-messages",
 			"provider": "vercel-ai-gateway",
 			"baseUrl": "https://ai-gateway.vercel.sh",
@@ -88978,7 +91275,7 @@
 		},
 		"alibaba/qwen3.8-max": {
 			"id": "alibaba/qwen3.8-max",
-			"name": "Qwen3.8 Max",
+			"name": "Qwen 3.8 Max",
 			"api": "anthropic-messages",
 			"provider": "vercel-ai-gateway",
 			"baseUrl": "https://ai-gateway.vercel.sh",
@@ -89020,6 +91317,31 @@
 			},
 			"contextWindow": 991000,
 			"maxTokens": 128000,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"alibaba/qwen3.8-max-prime": {
+			"id": "alibaba/qwen3.8-max-prime",
+			"name": "Qwen 3.8 Max Prime",
+			"api": "anthropic-messages",
+			"provider": "vercel-ai-gateway",
+			"baseUrl": "https://ai-gateway.vercel.sh",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 4,
+				"output": 12,
+				"cacheRead": 0.5,
+				"cacheWrite": 5
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 131072,
 			"thinking": {
 				"mode": "budget",
 				"minLevel": "minimal",
@@ -89292,7 +91614,7 @@
 		},
 		"anthropic/claude-haiku-4.5": {
 			"id": "anthropic/claude-haiku-4.5",
-			"name": "Anthropic Haiku 4.5 (latest)",
+			"name": "Anthropic Haiku 4.5",
 			"api": "anthropic-messages",
 			"baseUrl": "https://ai-gateway.vercel.sh",
 			"provider": "vercel-ai-gateway",
@@ -89333,7 +91655,7 @@
 				"cacheWrite": 18.75
 			},
 			"contextWindow": 200000,
-			"maxTokens": 8192,
+			"maxTokens": 32000,
 			"thinking": {
 				"mode": "budget",
 				"minLevel": "minimal",
@@ -89367,7 +91689,7 @@
 		},
 		"anthropic/claude-opus-4.5": {
 			"id": "anthropic/claude-opus-4.5",
-			"name": "Anthropic Opus 4.5 (latest)",
+			"name": "Anthropic Opus 4.5",
 			"api": "anthropic-messages",
 			"baseUrl": "https://ai-gateway.vercel.sh",
 			"provider": "vercel-ai-gateway",
@@ -89640,7 +91962,7 @@
 				"cacheWrite": 3.75
 			},
 			"contextWindow": 1000000,
-			"maxTokens": 8192,
+			"maxTokens": 64000,
 			"thinking": {
 				"mode": "budget",
 				"minLevel": "minimal",
@@ -89649,7 +91971,7 @@
 		},
 		"anthropic/claude-sonnet-4.5": {
 			"id": "anthropic/claude-sonnet-4.5",
-			"name": "Anthropic Sonnet 4.5 (latest)",
+			"name": "Anthropic Sonnet 4.5",
 			"api": "anthropic-messages",
 			"baseUrl": "https://ai-gateway.vercel.sh",
 			"provider": "vercel-ai-gateway",
@@ -89700,6 +92022,31 @@
 		"anthropic/claude-sonnet-5": {
 			"id": "anthropic/claude-sonnet-5",
 			"name": "Anthropic Sonnet 5",
+			"api": "anthropic-messages",
+			"provider": "vercel-ai-gateway",
+			"baseUrl": "https://ai-gateway.vercel.sh",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2,
+				"output": 10,
+				"cacheRead": 0.19999999999999998,
+				"cacheWrite": 2.5
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "max"
+			}
+		},
+		"anthropic/claude-sonnet-5.5": {
+			"id": "anthropic/claude-sonnet-5.5",
+			"name": "Anthropic Sonnet 5.5",
 			"api": "anthropic-messages",
 			"provider": "vercel-ai-gateway",
 			"baseUrl": "https://ai-gateway.vercel.sh",
@@ -90078,9 +92425,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.22,
-				"output": 0.66,
-				"cacheRead": 0.007,
+				"input": 0.21559999999999999,
+				"output": 0.6468,
+				"cacheRead": 0.0068,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
@@ -90164,6 +92511,31 @@
 				"maxLevel": "xhigh"
 			}
 		},
+		"fireworks/ember-1": {
+			"id": "fireworks/ember-1",
+			"name": "Ember-1",
+			"api": "anthropic-messages",
+			"provider": "vercel-ai-gateway",
+			"baseUrl": "https://ai-gateway.vercel.sh",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 3,
+				"output": 15,
+				"cacheRead": 0.3,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1048576,
+			"maxTokens": 1048576,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
 		"google/gemini-2.0-flash": {
 			"id": "google/gemini-2.0-flash",
 			"name": "Gemini 2.0 Flash",
@@ -90222,7 +92594,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 1000000,
-			"maxTokens": 65536,
+			"maxTokens": 65535,
 			"thinking": {
 				"mode": "budget",
 				"minLevel": "minimal",
@@ -90235,7 +92607,7 @@
 			"api": "anthropic-messages",
 			"baseUrl": "https://ai-gateway.vercel.sh",
 			"provider": "vercel-ai-gateway",
-			"reasoning": false,
+			"reasoning": true,
 			"input": [
 				"text",
 				"image"
@@ -90247,7 +92619,12 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
-			"maxTokens": 65536
+			"maxTokens": 65535,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
 		},
 		"google/gemini-2.5-flash-lite-preview-09-2025": {
 			"id": "google/gemini-2.5-flash-lite-preview-09-2025",
@@ -90317,7 +92694,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
-			"maxTokens": 65536,
+			"maxTokens": 65535,
 			"thinking": {
 				"mode": "budget",
 				"minLevel": "minimal",
@@ -90545,7 +92922,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 1000000,
-			"maxTokens": 65536,
+			"maxTokens": 65535,
 			"thinking": {
 				"mode": "budget",
 				"minLevel": "low",
@@ -90570,7 +92947,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 1000000,
-			"maxTokens": 65536,
+			"maxTokens": 65535,
 			"thinking": {
 				"mode": "budget",
 				"minLevel": "low",
@@ -90604,7 +92981,7 @@
 		},
 		"google/gemma-4-31b-it": {
 			"id": "google/gemma-4-31b-it",
-			"name": "Gemma-4-31B-IT",
+			"name": "Gemma 4 31B IT",
 			"api": "anthropic-messages",
 			"provider": "vercel-ai-gateway",
 			"baseUrl": "https://ai-gateway.vercel.sh",
@@ -90729,9 +93106,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0,
-				"output": 0,
-				"cacheRead": 0,
+				"input": 0.075,
+				"output": 0.22,
+				"cacheRead": 0.015,
 				"cacheWrite": 0
 			},
 			"contextWindow": 256000,
@@ -90826,9 +93203,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0,
-				"output": 0,
-				"cacheRead": 0,
+				"input": 0.075,
+				"output": 0.22,
+				"cacheRead": 0.015,
 				"cacheWrite": 0
 			},
 			"contextWindow": 256000,
@@ -90882,6 +93259,54 @@
 			},
 			"contextWindow": 256000,
 			"maxTokens": 32000,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"inclusionai/ling-3.1-flash": {
+			"id": "inclusionai/ling-3.1-flash",
+			"name": "Ling 3.1 Flash",
+			"api": "anthropic-messages",
+			"provider": "vercel-ai-gateway",
+			"baseUrl": "https://ai-gateway.vercel.sh",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 262144,
+			"maxTokens": 32768,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"inclusionai/ling-3.1-flash-free": {
+			"id": "inclusionai/ling-3.1-flash-free",
+			"name": "Ling 3.1 Flash (Free)",
+			"api": "anthropic-messages",
+			"provider": "vercel-ai-gateway",
+			"baseUrl": "https://ai-gateway.vercel.sh",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 262144,
+			"maxTokens": 32768,
 			"thinking": {
 				"mode": "budget",
 				"minLevel": "minimal",
@@ -91000,6 +93425,31 @@
 			},
 			"contextWindow": 256000,
 			"maxTokens": 80000,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"meituan/longcat-2.5-preview": {
+			"id": "meituan/longcat-2.5-preview",
+			"name": "LongCat 2.5 Preview",
+			"api": "anthropic-messages",
+			"provider": "vercel-ai-gateway",
+			"baseUrl": "https://ai-gateway.vercel.sh",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.3,
+				"output": 1.2,
+				"cacheRead": 0.006,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1048576,
+			"maxTokens": 131072,
 			"thinking": {
 				"mode": "budget",
 				"minLevel": "minimal",
@@ -91482,7 +93932,7 @@
 		},
 		"minimax/minimax-m2.7-highspeed": {
 			"id": "minimax/minimax-m2.7-highspeed",
-			"name": "MiniMax M2.7 highspeed",
+			"name": "MiniMax M2.7 High Speed",
 			"api": "anthropic-messages",
 			"provider": "vercel-ai-gateway",
 			"baseUrl": "https://ai-gateway.vercel.sh",
@@ -91506,7 +93956,7 @@
 		},
 		"minimax/minimax-m3": {
 			"id": "minimax/minimax-m3",
-			"name": "MiniMax-M3",
+			"name": "MiniMax M3",
 			"api": "anthropic-messages",
 			"provider": "vercel-ai-gateway",
 			"baseUrl": "https://ai-gateway.vercel.sh",
@@ -92049,7 +94499,7 @@
 			"cost": {
 				"input": 0.95,
 				"output": 4,
-				"cacheRead": 0.16,
+				"cacheRead": 0.19,
 				"cacheWrite": 0
 			},
 			"contextWindow": 256000,
@@ -92137,7 +94587,7 @@
 		},
 		"nvidia/nemotron-3-nano-30b-a3b": {
 			"id": "nvidia/nemotron-3-nano-30b-a3b",
-			"name": "nemotron-3-nano-30b-a3b",
+			"name": "Nemotron 3 Nano 30B A3B",
 			"api": "anthropic-messages",
 			"provider": "vercel-ai-gateway",
 			"baseUrl": "https://ai-gateway.vercel.sh",
@@ -92161,7 +94611,7 @@
 		},
 		"nvidia/nemotron-3-super-120b-a12b": {
 			"id": "nvidia/nemotron-3-super-120b-a12b",
-			"name": "Nemotron 3 Super",
+			"name": "NVIDIA Nemotron 3 Super 120B A12B",
 			"api": "anthropic-messages",
 			"provider": "vercel-ai-gateway",
 			"baseUrl": "https://ai-gateway.vercel.sh",
@@ -92185,7 +94635,7 @@
 		},
 		"nvidia/nemotron-3-ultra-550b-a55b": {
 			"id": "nvidia/nemotron-3-ultra-550b-a55b",
-			"name": "Nemotron 3 Ultra 550B A55B",
+			"name": "Nemotron 3 Ultra",
 			"api": "anthropic-messages",
 			"provider": "vercel-ai-gateway",
 			"baseUrl": "https://ai-gateway.vercel.sh",
@@ -92233,7 +94683,7 @@
 		},
 		"nvidia/nemotron-nano-12b-v2-vl": {
 			"id": "nvidia/nemotron-nano-12b-v2-vl",
-			"name": "Nemotron Nano 12B v2 VL",
+			"name": "Nvidia Nemotron Nano 12B V2 VL",
 			"api": "anthropic-messages",
 			"baseUrl": "https://ai-gateway.vercel.sh",
 			"provider": "vercel-ai-gateway",
@@ -92596,7 +95046,7 @@
 		},
 		"openai/gpt-5-codex": {
 			"id": "openai/gpt-5-codex",
-			"name": "GPT-5 OpenAI code",
+			"name": "GPT-5-OpenAI code",
 			"api": "anthropic-messages",
 			"baseUrl": "https://ai-gateway.vercel.sh",
 			"provider": "vercel-ai-gateway",
@@ -92646,7 +95096,7 @@
 		},
 		"openai/gpt-5-mini": {
 			"id": "openai/gpt-5-mini",
-			"name": "GPT-5 Mini",
+			"name": "GPT-5 mini",
 			"api": "anthropic-messages",
 			"baseUrl": "https://ai-gateway.vercel.sh",
 			"provider": "vercel-ai-gateway",
@@ -92696,7 +95146,7 @@
 		},
 		"openai/gpt-5-nano": {
 			"id": "openai/gpt-5-nano",
-			"name": "GPT-5 Nano",
+			"name": "GPT-5 nano",
 			"api": "anthropic-messages",
 			"baseUrl": "https://ai-gateway.vercel.sh",
 			"provider": "vercel-ai-gateway",
@@ -92796,7 +95246,7 @@
 		},
 		"openai/gpt-5.1-codex-mini": {
 			"id": "openai/gpt-5.1-codex-mini",
-			"name": "GPT-5.1-OpenAI code-Mini",
+			"name": "GPT 5.1 OpenAI code Mini",
 			"api": "anthropic-messages",
 			"baseUrl": "https://ai-gateway.vercel.sh",
 			"provider": "vercel-ai-gateway",
@@ -92896,7 +95346,7 @@
 		},
 		"openai/gpt-5.2": {
 			"id": "openai/gpt-5.2",
-			"name": "GPT-5.2",
+			"name": "GPT 5.2",
 			"api": "anthropic-messages",
 			"baseUrl": "https://ai-gateway.vercel.sh",
 			"provider": "vercel-ai-gateway",
@@ -92946,7 +95396,7 @@
 		},
 		"openai/gpt-5.2-codex": {
 			"id": "openai/gpt-5.2-codex",
-			"name": "GPT-5.2-OpenAI code",
+			"name": "GPT 5.2 OpenAI code",
 			"api": "anthropic-messages",
 			"baseUrl": "https://ai-gateway.vercel.sh",
 			"provider": "vercel-ai-gateway",
@@ -92996,7 +95446,7 @@
 		},
 		"openai/gpt-5.2-pro": {
 			"id": "openai/gpt-5.2-pro",
-			"name": "GPT-5.2-Pro",
+			"name": "GPT 5.2",
 			"api": "anthropic-messages",
 			"baseUrl": "https://ai-gateway.vercel.sh",
 			"provider": "vercel-ai-gateway",
@@ -93040,13 +95490,14 @@
 		},
 		"openai/gpt-5.3-codex": {
 			"id": "openai/gpt-5.3-codex",
-			"name": "GPT-5.3 OpenAI code",
+			"name": "GPT 5.3 OpenAI code",
 			"api": "anthropic-messages",
 			"provider": "vercel-ai-gateway",
 			"baseUrl": "https://ai-gateway.vercel.sh",
 			"reasoning": true,
 			"input": [
-				"text"
+				"text",
+				"image"
 			],
 			"cost": {
 				"input": 1.75,
@@ -93089,7 +95540,7 @@
 		},
 		"openai/gpt-5.4": {
 			"id": "openai/gpt-5.4",
-			"name": "GPT-5.4",
+			"name": "GPT 5.4",
 			"api": "anthropic-messages",
 			"provider": "vercel-ai-gateway",
 			"baseUrl": "https://ai-gateway.vercel.sh",
@@ -93139,13 +95590,14 @@
 		},
 		"openai/gpt-5.4-mini": {
 			"id": "openai/gpt-5.4-mini",
-			"name": "GPT-5.4 Mini",
+			"name": "GPT 5.4 Mini",
 			"api": "anthropic-messages",
 			"provider": "vercel-ai-gateway",
 			"baseUrl": "https://ai-gateway.vercel.sh",
-			"reasoning": false,
+			"reasoning": true,
 			"input": [
-				"text"
+				"text",
+				"image"
 			],
 			"cost": {
 				"input": 0.75,
@@ -93154,7 +95606,12 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 400000,
-			"maxTokens": 128000
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "low",
+				"maxLevel": "xhigh"
+			}
 		},
 		"openai/gpt-5.4-mini-fast": {
 			"id": "openai/gpt-5.4-mini-fast",
@@ -93183,13 +95640,14 @@
 		},
 		"openai/gpt-5.4-nano": {
 			"id": "openai/gpt-5.4-nano",
-			"name": "GPT-5.4 Nano",
+			"name": "GPT 5.4 Nano",
 			"api": "anthropic-messages",
 			"provider": "vercel-ai-gateway",
 			"baseUrl": "https://ai-gateway.vercel.sh",
-			"reasoning": false,
+			"reasoning": true,
 			"input": [
-				"text"
+				"text",
+				"image"
 			],
 			"cost": {
 				"input": 0.19999999999999998,
@@ -93198,11 +95656,16 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 400000,
-			"maxTokens": 128000
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "low",
+				"maxLevel": "xhigh"
+			}
 		},
 		"openai/gpt-5.4-pro": {
 			"id": "openai/gpt-5.4-pro",
-			"name": "GPT-5.4 Pro",
+			"name": "GPT 5.4 Pro",
 			"api": "anthropic-messages",
 			"provider": "vercel-ai-gateway",
 			"baseUrl": "https://ai-gateway.vercel.sh",
@@ -93227,7 +95690,7 @@
 		},
 		"openai/gpt-5.5": {
 			"id": "openai/gpt-5.5",
-			"name": "GPT-5.5",
+			"name": "GPT 5.5",
 			"api": "anthropic-messages",
 			"provider": "vercel-ai-gateway",
 			"baseUrl": "https://ai-gateway.vercel.sh",
@@ -93277,7 +95740,7 @@
 		},
 		"openai/gpt-5.5-pro": {
 			"id": "openai/gpt-5.5-pro",
-			"name": "GPT-5.5 Pro",
+			"name": "GPT 5.5 Pro",
 			"api": "anthropic-messages",
 			"provider": "vercel-ai-gateway",
 			"baseUrl": "https://ai-gateway.vercel.sh",
@@ -93302,7 +95765,7 @@
 		},
 		"openai/gpt-5.6-luna": {
 			"id": "openai/gpt-5.6-luna",
-			"name": "GPT-5.6 Luna",
+			"name": "GPT 5.6 Luna",
 			"api": "anthropic-messages",
 			"provider": "vercel-ai-gateway",
 			"baseUrl": "https://ai-gateway.vercel.sh",
@@ -93352,7 +95815,7 @@
 		},
 		"openai/gpt-5.6-sol": {
 			"id": "openai/gpt-5.6-sol",
-			"name": "GPT-5.6 Sol",
+			"name": "GPT 5.6 Sol",
 			"api": "anthropic-messages",
 			"provider": "vercel-ai-gateway",
 			"baseUrl": "https://ai-gateway.vercel.sh",
@@ -93402,7 +95865,7 @@
 		},
 		"openai/gpt-5.6-terra": {
 			"id": "openai/gpt-5.6-terra",
-			"name": "GPT-5.6 Terra",
+			"name": "GPT 5.6 Terra",
 			"api": "anthropic-messages",
 			"provider": "vercel-ai-gateway",
 			"baseUrl": "https://ai-gateway.vercel.sh",
@@ -93500,6 +95963,156 @@
 				"maxLevel": "xhigh"
 			}
 		},
+		"openai/gpt-6-luna": {
+			"id": "openai/gpt-6-luna",
+			"name": "GPT-6 Luna",
+			"api": "anthropic-messages",
+			"provider": "vercel-ai-gateway",
+			"baseUrl": "https://ai-gateway.vercel.sh",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.09999999999999999,
+				"output": 0.5,
+				"cacheRead": 0.01,
+				"cacheWrite": 0.125
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		},
+		"openai/gpt-6-luna-fast": {
+			"id": "openai/gpt-6-luna-fast",
+			"name": "GPT-6 Luna (Fast)",
+			"api": "anthropic-messages",
+			"provider": "vercel-ai-gateway",
+			"baseUrl": "https://ai-gateway.vercel.sh",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.19999999999999998,
+				"output": 1,
+				"cacheRead": 0.02,
+				"cacheWrite": 0.25
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"openai/gpt-6-sol": {
+			"id": "openai/gpt-6-sol",
+			"name": "GPT-6 Sol",
+			"api": "anthropic-messages",
+			"provider": "vercel-ai-gateway",
+			"baseUrl": "https://ai-gateway.vercel.sh",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2,
+				"output": 10,
+				"cacheRead": 0.19999999999999998,
+				"cacheWrite": 2.5
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		},
+		"openai/gpt-6-sol-fast": {
+			"id": "openai/gpt-6-sol-fast",
+			"name": "GPT-6 Sol (Fast)",
+			"api": "anthropic-messages",
+			"provider": "vercel-ai-gateway",
+			"baseUrl": "https://ai-gateway.vercel.sh",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 4,
+				"output": 20,
+				"cacheRead": 0.39999999999999997,
+				"cacheWrite": 5
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"openai/gpt-6.1-sol": {
+			"id": "openai/gpt-6.1-sol",
+			"name": "GPT-6.1 Sol",
+			"api": "anthropic-messages",
+			"provider": "vercel-ai-gateway",
+			"baseUrl": "https://ai-gateway.vercel.sh",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2,
+				"output": 10,
+				"cacheRead": 0.09999999999999999,
+				"cacheWrite": 2.5
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		},
+		"openai/gpt-6.1-sol-fast": {
+			"id": "openai/gpt-6.1-sol-fast",
+			"name": "GPT-6.1 Sol (Fast)",
+			"api": "anthropic-messages",
+			"provider": "vercel-ai-gateway",
+			"baseUrl": "https://ai-gateway.vercel.sh",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 4,
+				"output": 20,
+				"cacheRead": 0.19999999999999998,
+				"cacheWrite": 5
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
 		"openai/gpt-oss-120b": {
 			"id": "openai/gpt-oss-120b",
 			"name": "GPT OSS 120B",
@@ -93513,7 +96126,7 @@
 			"cost": {
 				"input": 0.09999999999999999,
 				"output": 0.5,
-				"cacheRead": 0.25,
+				"cacheRead": 0.09999999999999999,
 				"cacheWrite": 0
 			},
 			"contextWindow": 131072,
@@ -93574,7 +96187,7 @@
 		},
 		"openai/gpt-oss-safeguard-20b": {
 			"id": "openai/gpt-oss-safeguard-20b",
-			"name": "Safety GPT OSS 20B",
+			"name": "GPT OSS Safeguard 20B",
 			"api": "anthropic-messages",
 			"baseUrl": "https://ai-gateway.vercel.sh",
 			"provider": "vercel-ai-gateway",
@@ -94329,9 +96942,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 1.2,
-				"output": 3.5999999999999996,
-				"cacheRead": 0.3,
+				"input": 2,
+				"output": 6,
+				"cacheRead": 0.5,
 				"cacheWrite": 0
 			},
 			"contextWindow": 500000,
@@ -94369,13 +96982,14 @@
 		},
 		"stepfun/step-3.5-flash": {
 			"id": "stepfun/step-3.5-flash",
-			"name": "Step 3.5 Flash",
+			"name": "StepFun 3.5 Flash",
 			"api": "anthropic-messages",
 			"provider": "vercel-ai-gateway",
 			"baseUrl": "https://ai-gateway.vercel.sh",
-			"reasoning": false,
+			"reasoning": true,
 			"input": [
-				"text"
+				"text",
+				"image"
 			],
 			"cost": {
 				"input": 0.09,
@@ -94384,7 +96998,12 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 262114,
-			"maxTokens": 262114
+			"maxTokens": 262114,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
 		},
 		"stepfun/step-3.7-flash": {
 			"id": "stepfun/step-3.7-flash",
@@ -94496,7 +97115,7 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.5,
+				"input": 0.44999999999999996,
 				"output": 1.2,
 				"cacheRead": 0.09999999999999999,
 				"cacheWrite": 0
@@ -95074,7 +97693,7 @@
 		},
 		"xiaomi/mimo-v2.5": {
 			"id": "xiaomi/mimo-v2.5",
-			"name": "MiMo-V2.5",
+			"name": "MiMo M2.5",
 			"api": "anthropic-messages",
 			"provider": "vercel-ai-gateway",
 			"baseUrl": "https://ai-gateway.vercel.sh",
@@ -95099,7 +97718,7 @@
 		},
 		"xiaomi/mimo-v2.5-pro": {
 			"id": "xiaomi/mimo-v2.5-pro",
-			"name": "MiMo-V2.5-Pro",
+			"name": "MiMo V2.5 Pro",
 			"api": "anthropic-messages",
 			"provider": "vercel-ai-gateway",
 			"baseUrl": "https://ai-gateway.vercel.sh",
@@ -95523,9 +98142,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 2.0999999999999996,
-				"output": 6.6000000000000005,
-				"cacheRead": 0.21,
+				"input": 2.8,
+				"output": 8.8,
+				"cacheRead": 0.56,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1000000,
@@ -97917,6 +100536,31 @@
 				"maxLevel": "xhigh"
 			}
 		},
+		"anthropic/claude-fable-5.1": {
+			"id": "anthropic/claude-fable-5.1",
+			"name": "Anthropic Fable 5.1",
+			"api": "anthropic-messages",
+			"provider": "zenmux",
+			"baseUrl": "https://zenmux.ai/api/anthropic",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 10,
+				"output": 50,
+				"cacheRead": 0.25,
+				"cacheWrite": 12.5
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
 		"anthropic/claude-haiku-4.5": {
 			"id": "anthropic/claude-haiku-4.5",
 			"name": "Anthropic Haiku 4.5",
@@ -98085,6 +100729,31 @@
 				"output": 25,
 				"cacheRead": 0.5,
 				"cacheWrite": 6.25
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "max"
+			}
+		},
+		"anthropic/claude-opus-5.5": {
+			"id": "anthropic/claude-opus-5.5",
+			"name": "Anthropic Opus 5.5",
+			"api": "anthropic-messages",
+			"provider": "zenmux",
+			"baseUrl": "https://zenmux.ai/api/anthropic",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 4,
+				"output": 20,
+				"cacheRead": 0.2,
+				"cacheWrite": 5
 			},
 			"contextWindow": 1000000,
 			"maxTokens": 128000,
@@ -98666,6 +101335,31 @@
 			},
 			"contextWindow": 1000000,
 			"maxTokens": 8888,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"deepseek/deepseek-v4.1-flash": {
+			"id": "deepseek/deepseek-v4.1-flash",
+			"name": "DeepSeek V4.1 Flash",
+			"api": "openai-completions",
+			"provider": "zenmux",
+			"baseUrl": "https://zenmux.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.15,
+				"output": 0.6,
+				"cacheRead": 0.003,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 384000,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -99748,6 +102442,31 @@
 				"maxLevel": "xhigh"
 			}
 		},
+		"moonshotai/kimi-k2.7-code-highspeed": {
+			"id": "moonshotai/kimi-k2.7-code-highspeed",
+			"name": "Kimi K2.7 Code HighSpeed",
+			"api": "openai-completions",
+			"provider": "zenmux",
+			"baseUrl": "https://zenmux.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 1.9,
+				"output": 8,
+				"cacheRead": 0.38,
+				"cacheWrite": 0
+			},
+			"contextWindow": 262144,
+			"maxTokens": 262144,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
 		"moonshotai/kimi-k3": {
 			"id": "moonshotai/kimi-k3",
 			"name": "Kimi K3",
@@ -100530,6 +103249,56 @@
 				"output": 15,
 				"cacheRead": 0.25,
 				"cacheWrite": 3.125
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		},
+		"openai/gpt-6-astra": {
+			"id": "openai/gpt-6-astra",
+			"name": "GPT-6 Astra",
+			"api": "openai-completions",
+			"provider": "zenmux",
+			"baseUrl": "https://zenmux.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 10,
+				"output": 50,
+				"cacheRead": 1,
+				"cacheWrite": 12.5
+			},
+			"contextWindow": 1050000,
+			"maxTokens": 128000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		},
+		"openai/gpt-6-sol": {
+			"id": "openai/gpt-6-sol",
+			"name": "GPT-6 Sol",
+			"api": "openai-completions",
+			"provider": "zenmux",
+			"baseUrl": "https://zenmux.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2,
+				"output": 10,
+				"cacheRead": 0.2,
+				"cacheWrite": 2.5
 			},
 			"contextWindow": 1050000,
 			"maxTokens": 128000,
@@ -101728,6 +104497,31 @@
 				"input": 1,
 				"output": 3,
 				"cacheRead": 0.2,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1048576,
+			"maxTokens": 131072,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"xiaomi/mimo-v2.6-pro": {
+			"id": "xiaomi/mimo-v2.6-pro",
+			"name": "MiMo-V2.6-Pro",
+			"api": "openai-completions",
+			"provider": "zenmux",
+			"baseUrl": "https://zenmux.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.435,
+				"output": 0.87,
+				"cacheRead": 0.0036,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
