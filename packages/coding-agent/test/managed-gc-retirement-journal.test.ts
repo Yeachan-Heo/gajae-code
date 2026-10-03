@@ -11,11 +11,14 @@ import {
 import {
 	bindManagedGcSessionRetirementTarget,
 	computeManagedScopeDigest,
+	discoverManagedGcSessionRetirementReceipts,
 	type ManagedScope,
 	managedDirectoryIdentityForScope,
 	prepareManagedSessionScopeForWriteSync,
 	publishManagedGcSessionRetirementReceipt,
 	readManagedGcSessionRetirementReceipt,
+	readManagedGcSessionRetirementReceiptReadOnly,
+	resolveManagedGcScopeForRead,
 	resolveManagedScopeForWrite,
 	taskArtifactOwnerStorageContextForScope,
 } from "../src/session/internal/managed-session-scope";
@@ -242,6 +245,30 @@ function readReceiptSuffix(fixture: Fixture, suffix: string): unknown {
 	}
 }
 
+function snapshotTree(root: string): unknown[] {
+	const entries: unknown[] = [];
+	const visit = (pathname: string, relative: string): void => {
+		const stat = fs.lstatSync(pathname, { bigint: true });
+		entries.push({
+			relative,
+			dev: stat.dev.toString(),
+			ino: stat.ino.toString(),
+			mode: stat.mode.toString(),
+			ctimeNs: stat.ctimeNs.toString(),
+			kind: stat.isDirectory() ? "directory" : stat.isFile() ? "file" : "other",
+		});
+		if (stat.isDirectory() && !stat.isSymbolicLink()) {
+			for (const name of fs.readdirSync(pathname).sort()) {
+				visit(path.join(pathname, name), path.join(relative, name));
+			}
+		} else if (stat.isFile()) {
+			entries.push({ relative: `${relative}:bytes`, bytes: fs.readFileSync(pathname).toString("base64") });
+		}
+	};
+	visit(root, ".");
+	return entries;
+}
+
 describe("managed GC retirement journal", () => {
 	it("persists actual native disposition and replays pending namespaces after transcript absence", async () => {
 		const fixture = makeFixture();
@@ -366,6 +393,9 @@ describe("managed GC retirement journal", () => {
 			store.close();
 		}
 		await expect(readManagedGcSessionRetirementReceipt(fixture.scope, fixture.transcriptPath)).rejects.toThrow();
+		await expect(
+			readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath),
+		).rejects.toThrow();
 
 		const replacedTranscript = makeFixture();
 		await publishManagedGcSessionRetirementReceipt(replacedTranscript.scope, preparedReceipt(replacedTranscript));
@@ -384,6 +414,9 @@ describe("managed GC retirement journal", () => {
 		await expect(
 			readManagedGcSessionRetirementReceipt(replacedTranscript.scope, replacedTranscript.transcriptPath),
 		).rejects.toThrow();
+		await expect(
+			readManagedGcSessionRetirementReceiptReadOnly(replacedTranscript.scope, replacedTranscript.transcriptPath),
+		).rejects.toThrow();
 	});
 
 	it("rejects wrong profile/root scope and transcripts outside the trusted scope parent", () => {
@@ -399,6 +432,118 @@ describe("managed GC retirement journal", () => {
 		expect(() =>
 			bindManagedGcSessionRetirementTarget(fixture.scope, path.join(fixture.temporaryRoot, "outside.jsonl")),
 		).toThrow();
+	});
+
+	it("resolves and reads owner journals without changing managed bytes, modes, ctimes, or private directories", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		const before = snapshotTree(fixture.temporaryRoot);
+		const resolved = resolveManagedGcScopeForRead({
+			cwd: fixture.cwd,
+			agentDir: fixture.agentDir,
+			sessionsRoot: fixture.sessionsRoot,
+		});
+		expect(resolved.kind).toBe("resolved");
+		if (resolved.kind !== "resolved") throw new Error(`readonly_scope_resolution_failed:${resolved.code}`);
+		expect((await readManagedGcSessionRetirementReceiptReadOnly(resolved.scope, fixture.transcriptPath))?.state).toBe(
+			"prepared",
+		);
+		const discovered = await discoverManagedGcSessionRetirementReceipts({
+			agentDir: fixture.agentDir,
+			sessionsRoot: fixture.sessionsRoot,
+		});
+		expect(discovered.map(item => item.receipt.transcriptPath)).toContain(fixture.transcriptPath);
+		expect(snapshotTree(fixture.temporaryRoot)).toEqual(before);
+	});
+
+	it("discovers original prepared authority in a fresh process after transcript absence", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		const store = openScopeStore(fixture.scope);
+		try {
+			store.removeIfExistsDescriptor(path.basename(fixture.transcriptPath));
+		} finally {
+			store.close();
+		}
+		const moduleUrl = new URL("../src/session/internal/managed-session-scope.ts", import.meta.url).href;
+		const script =
+			`import { discoverManagedGcSessionRetirementReceipts } from ${JSON.stringify(moduleUrl)};
+` +
+			`  const records = await discoverManagedGcSessionRetirementReceipts({
+` +
+			`    agentDir: ${JSON.stringify(fixture.agentDir)},
+` +
+			`    sessionsRoot: ${JSON.stringify(fixture.sessionsRoot)},
+` +
+			`  });
+` +
+			`  process.stdout.write(JSON.stringify(records.map(({ receipt }) => ({
+` +
+			`    transcriptPath: receipt.transcriptPath, state: receipt.state,
+` +
+			`  }))));
+`;
+		const child = Bun.spawnSync({
+			cmd: [process.execPath, "-e", script],
+			cwd: fixture.temporaryRoot,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(child.exitCode).toBe(0);
+		expect(JSON.parse(Buffer.from(child.stdout).toString("utf8"))).toContainEqual({
+			transcriptPath: fixture.transcriptPath,
+			state: "prepared",
+		});
+		expect(fs.existsSync(fixture.transcriptPath)).toBe(false);
+	});
+
+	it("rejects forged prepared target identity and transcript-key substitution", async () => {
+		const fixture = makeFixture();
+		const key = crypto.createHash("sha256").update(path.resolve(fixture.transcriptPath), "utf8").digest("hex");
+		const forged = {
+			schemaVersion: 1,
+			state: "prepared",
+			scope: computeManagedScopeDigest(fixture.scope.platform, fixture.scope.canonicalCwd),
+			transcriptPath: fixture.transcriptPath,
+			sessionId: fixture.target.sessionId,
+			cwd: fixture.cwd,
+			taskArtifactOwnerLocator: fixture.target.taskArtifactOwnerLocator,
+			transcriptIdentity: {
+				...managedGcRetirementIdentityRecord(fixture.target.transcriptIdentity),
+				ino: (fixture.target.transcriptIdentity.ino + 1n).toString(),
+			},
+			taskArtifactOwnerDeletionEvidence: fixture.evidence,
+		};
+		const substitutedPath = path.join(fixture.scope.directoryPath, "substituted.jsonl");
+		const substitutedKey = crypto.createHash("sha256").update(path.resolve(substitutedPath), "utf8").digest("hex");
+		const store = openScopeStore(fixture.scope);
+		try {
+			for (const receiptKey of [key, substitutedKey]) {
+				store.publishNoReplaceSync(
+					`.gjc-managed-session-internal/receipts/gc-retirement-${receiptKey}-prepared.json`,
+					Buffer.from(`${JSON.stringify(forged)}\n`, "utf8"),
+				);
+			}
+		} finally {
+			store.close();
+		}
+		await expect(
+			readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath),
+		).rejects.toThrow();
+		await expect(readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, substitutedPath)).rejects.toThrow();
+		expect(fs.existsSync(fixture.transcriptPath)).toBe(true);
+		expect(
+			fs.readFileSync(
+				path.join(
+					ownerAbsolutePath(
+						taskArtifactOwnerStorageContextForScope(fixture.scope),
+						fixture.target.taskArtifactOwnerLocator.ownerId,
+					),
+					"payload.json",
+				),
+				"utf8",
+			),
+		).toBe("fixture payload");
 	});
 
 	it("rejects a numbered-attempt gap and later states without prepared authority", async () => {
