@@ -134,8 +134,8 @@ import {
 	classifyFallbackTrigger,
 	EMPTY_RESPONSE_PROVIDER_CODE,
 	type FallbackAttemptToken,
-	PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE,
 	type FallbackTriggerClass,
+	PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE,
 	SERVER_OVERLOADED_PROVIDER_CODE,
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 } from "@gajae-code/ai/utils/fallback-transport";
@@ -408,11 +408,7 @@ import type { NotificationSessionController } from "../sdk/bus/session-control";
 import { buildSyntheticModelId, syntheticNamespaceCollision } from "../sdk/model-profile-model";
 import { sanitizePromptFailure } from "../sdk/prompt-failure";
 import type { SecretObfuscator } from "../secrets/obfuscator";
-import {
-	formatNoCredentialOnboardingError,
-	formatNoModelOnboardingError,
-	NoModelSelectedError,
-} from "../setup/model-onboarding-guidance";
+import { formatNoCredentialOnboardingError, NoModelSelectedError } from "../setup/model-onboarding-guidance";
 import {
 	isCanonicalGjcWorkflowSkill,
 	isWorkflowContinuationInert,
@@ -3797,6 +3793,7 @@ export class AgentSession {
 	#skipPostPromptRecoveryWaitByAttemptScope = new WeakSet<AttemptScope>();
 	#sdkRunTokensByAttemptScope = new WeakMap<AttemptScope, string>();
 	#sdkRunCohortsByAttemptScope = new WeakMap<AttemptScope, string[]>();
+	#lifecycleScopesByAttemptScope = new WeakMap<AttemptScope, AttemptScope>();
 	#activeSdkRunToken: string | undefined;
 	#activeAttemptScope: AttemptScope | undefined;
 	#attemptAuthority!: AttemptScopeAuthority;
@@ -4070,11 +4067,7 @@ export class AgentSession {
 	readonly rawSseDebugBuffer: RawSseDebugBuffer;
 
 	#acquirePowerAssertion(): void {
-		if (
-			process.platform !== "darwin" &&
-			process.platform !== "linux" &&
-			process.platform !== "win32"
-		) {
+		if (process.platform !== "darwin" && process.platform !== "linux" && process.platform !== "win32") {
 			return;
 		}
 		if (this.#powerAssertion || this.#powerAssertionLoad) return;
@@ -5495,12 +5488,7 @@ export class AgentSession {
 					controller !== undefined &&
 					controller.chain.entries.length > 1;
 				if (shouldCapture && modelKey) this.#managedFallbackActiveCredentialRows.delete(modelKey);
-				if (
-					override &&
-					model &&
-					storageProvider === override.storageProvider &&
-					modelKey === override.modelKey
-				) {
+				if (override && model && storageProvider === override.storageProvider && modelKey === override.modelKey) {
 					this.#managedFallbackNextCredentialOverride = undefined;
 					const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId, {
 						credentialSelector: { kind: "id", value: String(override.rowId) },
@@ -5510,10 +5498,7 @@ export class AgentSession {
 						return apiKey;
 					}
 					// The preselected credential is no longer available; try to resolve another one of the same kind.
-					const fallbackApiKey = await this.#resolveManagedFallbackCredentialRow(
-						model,
-						override.credentialKind,
-					);
+					const fallbackApiKey = await this.#resolveManagedFallbackCredentialRow(model, override.credentialKind);
 					if (fallbackApiKey !== undefined) {
 						if (shouldCapture && model) this.#captureManagedFallbackActiveCredential(model);
 						return fallbackApiKey;
@@ -5521,8 +5506,7 @@ export class AgentSession {
 					throw new Error("Selected managed fallback credential is no longer available");
 				}
 				const apiKey = await invokeOriginalGetApiKey(provider);
-				if (shouldCapture && model && isAuthenticated(apiKey))
-					this.#captureManagedFallbackActiveCredential(model);
+				if (shouldCapture && model && isAuthenticated(apiKey)) this.#captureManagedFallbackActiveCredential(model);
 				return apiKey;
 			};
 			this.agent.getApiKey = managedGetApiKey;
@@ -5828,9 +5812,8 @@ export class AgentSession {
 									(largestPhase, phase) =>
 										Math.max(
 											largestPhase,
-											phase.tasks.filter(
-												task => task.status === "pending" || task.status === "in_progress",
-											).length,
+											phase.tasks.filter(task => task.status === "pending" || task.status === "in_progress")
+												.length,
 										),
 									0,
 								);
@@ -8685,6 +8668,14 @@ export class AgentSession {
 													sdkRunToken,
 													consumedSdkRunTokens.length > 0 ? consumedSdkRunTokens : undefined,
 												);
+												const predecessorScope =
+													predecessorAgentEnd && this.#agentEventAdmission.get(predecessorAgentEnd)?.scope;
+												if (predecessorScope) {
+													this.#lifecycleScopesByAttemptScope.set(
+														handle.scope,
+														this.#lifecycleScopesByAttemptScope.get(predecessorScope) ?? predecessorScope,
+													);
+												}
 												options?.onRunAccepted?.(handle);
 												// Keep the queued token available through the acceptance callback;
 												// SDK follow-up owners bind it to the new attempt scope there.
@@ -9907,7 +9898,12 @@ export class AgentSession {
 						type: "agent_start",
 						...(sdkRunToken ? { sdkRunToken } : {}),
 						...(deliveryScope
-							? { sdkRunTokens: this.#sdkRunCohortsByAttemptScope.get(deliveryScope as AttemptScope) }
+							? {
+									sdkRunTokens: this.#sdkRunCohortsByAttemptScope.get(deliveryScope as AttemptScope),
+									lifecycleScope:
+										this.#lifecycleScopesByAttemptScope.get(deliveryScope as AttemptScope) ??
+										(deliveryScope as AttemptScope),
+								}
 							: {}),
 					},
 					undefined,
@@ -12354,7 +12350,9 @@ export class AgentSession {
 	 */
 	get messages(): AgentMessage[] {
 		const messages = this.agent.state.messages;
-		return messages.some(message => message.role === "custom" && this.#isEphemeralCustomMessageType(message.customType))
+		return messages.some(
+			message => message.role === "custom" && this.#isEphemeralCustomMessageType(message.customType),
+		)
 			? this.#withoutEphemeralCustomMessages(messages)
 			: messages;
 	}
@@ -14708,10 +14706,7 @@ export class AgentSession {
 		// prompt still in preflight, aborting) has no run to steer. Ordinary steers
 		// become a sequential follow-up owned by the next turn; SDK turn-bound
 		// steers fail closed rather than being delivered to a successor run.
-		if (
-			options?.expectedSdkRunToken !== undefined &&
-			this.#activeSdkRunToken !== options.expectedSdkRunToken
-		)
+		if (options?.expectedSdkRunToken !== undefined && this.#activeSdkRunToken !== options.expectedSdkRunToken)
 			throw Object.assign(new Error("The expected SDK run is not active."), { code: "turn_not_active" });
 		const admission = this.agent.steer(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
 		if (!admission.admitted) {
@@ -21110,10 +21105,7 @@ export class AgentSession {
 		const isContextPromoted = this.#temporaryProviderSessionScopes.some(
 			scope => scope.token.reason === "context-promotion",
 		);
-		if (
-			!isContextPromoted ||
-			!isDefaultAutoThresholdCeilingApplied(contextWindow, settings)
-		) {
+		if (!isContextPromoted || !isDefaultAutoThresholdCeilingApplied(contextWindow, settings)) {
 			return settings;
 		}
 
@@ -23018,7 +23010,8 @@ export class AgentSession {
 				isAuthenticated(apiKey) &&
 				authStorage.getSessionCredentialRowId(model.provider, this.credentialSessionId) === credential.id &&
 				authStorage.getSessionCredentialType(model.provider, this.credentialSessionId) === credentialKind &&
-				currentCredential && !currentCredential.disabled
+				currentCredential &&
+				!currentCredential.disabled
 			)
 				return apiKey;
 		}
@@ -23935,9 +23928,7 @@ export class AgentSession {
 							!authStorage.isCredentialAvailable(resolvedModel.provider, credential.id)
 						)
 							continue;
-						let credentialKeyResult:
-							| { kind: "resolved"; value: string | undefined }
-							| { kind: "aborted" };
+						let credentialKeyResult: { kind: "resolved"; value: string | undefined } | { kind: "aborted" };
 						try {
 							credentialKeyResult = await awaitWithCancellation(
 								this.#modelRegistry.getApiKey(resolvedModel, this.credentialSessionId, {
@@ -24035,7 +24026,11 @@ export class AgentSession {
 				!transitionStillOwned()
 			)
 				return await rollbackCancelled();
-			if (selectedCredentialRowId !== undefined && selectedCredentialKind !== undefined && this.#restoreManagedFallbackGetApiKey) {
+			if (
+				selectedCredentialRowId !== undefined &&
+				selectedCredentialKind !== undefined &&
+				this.#restoreManagedFallbackGetApiKey
+			) {
 				this.#managedFallbackNextCredentialOverride = {
 					modelKey: canonicalModelKey,
 					storageProvider: resolveOAuthStorageProvider(resolvedModel.provider),
@@ -24468,10 +24463,7 @@ export class AgentSession {
 		// proper session termination handling.
 		if (managedFallback && isStatuslessTypedOverloadFacts(transportFailure)) {
 			return managedOutcome
-				? this.#managedFallbackExhaustionDecision(
-						message,
-						message.errorMessage || "Model fallback attempt failed",
-					)
+				? this.#managedFallbackExhaustionDecision(message, message.errorMessage || "Model fallback attempt failed")
 				: false;
 		}
 		if (!trigger) {
@@ -24686,10 +24678,7 @@ export class AgentSession {
 		if (outcome === "exhausted") {
 			if (managedFallback) {
 				let errorMessage = this.#fallbackExhaustionError(controller);
-				if (
-					!providerRetryCeilingReached &&
-					(trigger.class === "quota" || trigger.class === "rate_limit")
-				) {
+				if (!providerRetryCeilingReached && (trigger.class === "quota" || trigger.class === "rate_limit")) {
 					if (!assistantMessageHasVisibleOrToolContent(message)) {
 						const mark =
 							quotaCredentialMark ??
