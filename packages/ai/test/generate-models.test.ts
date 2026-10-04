@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import {
+	CODEX_GPT6_IDS,
 	injectAlibabaTokenPlanModels,
 	injectCodexGpt6Models,
 	injectImageGenerationModels,
@@ -11,6 +12,15 @@ import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "../src/provider-models/opena
 import type { Model } from "../src/types";
 
 describe("injectCodexGpt6Models", () => {
+	it("resets the seed row of every injected Codex GPT-6 model", () => {
+		const models: Model[] = [];
+		injectCodexGpt6Models(models);
+
+		expect(new Set(models.map(model => model.id))).toEqual(new Set(CODEX_GPT6_IDS));
+		const bundled = modelsJson["openai-codex"] as Record<string, { contextWindow: number }>;
+		for (const id of CODEX_GPT6_IDS) expect(bundled[id]?.contextWindow).not.toBe(272_000);
+	});
+
 	it("adds the reviewed Codex fallbacks exactly once", () => {
 		const models: Model[] = [];
 

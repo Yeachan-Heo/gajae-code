@@ -84,6 +84,16 @@ function isRetiredBundledModel(model: Pick<Model, "provider" | "id">): boolean {
  * Only Astra carries `priority: 1`; Sol and Luna stay in default catalog order
  * so the flagship remains the first Codex suggestion.
  */
+const CODEX_GPT6_MODELS: readonly { id: string; name: string; priority?: number }[] = [
+	{ id: "gpt-6-astra", name: "GPT-6 Astra", priority: 1 },
+	{ id: "gpt-6-sol", name: "GPT-6 Sol" },
+	{ id: "gpt-6.1-sol", name: "GPT-6.1 Sol" },
+	{ id: "gpt-6-luna", name: "GPT-6 Luna" },
+];
+
+/** Codex GPT-6 ids that are re-injected with unknown limits; seed rows for them are reset. */
+export const CODEX_GPT6_IDS: ReadonlySet<string> = new Set(CODEX_GPT6_MODELS.map(model => model.id));
+
 export function injectCodexGpt6Models(models: Model[]): void {
 	const gpt6 = (id: string, name: string, priority?: number): Model<"openai-codex-responses"> => ({
 		id,
@@ -99,13 +109,8 @@ export function injectCodexGpt6Models(models: Model[]): void {
 		preferWebsockets: true,
 		...(priority === undefined ? {} : { priority }),
 	});
-	const bundled: Model<"openai-codex-responses">[] = [
-		gpt6("gpt-6-astra", "GPT-6 Astra", 1),
-		gpt6("gpt-6-sol", "GPT-6 Sol"),
-		gpt6("gpt-6.1-sol", "GPT-6.1 Sol"),
-		gpt6("gpt-6-luna", "GPT-6 Luna"),
-	];
-	for (const model of bundled) {
+	for (const { id, name, priority } of CODEX_GPT6_MODELS) {
+		const model = gpt6(id, name, priority);
 		const exists = models.some(existing => existing.provider === model.provider && existing.id === model.id);
 		if (!exists) models.push(model);
 	}
@@ -536,7 +541,7 @@ export interface SeedLimitPreservation {
  */
 function preserveSeedLimits(
 	prevModelsJson: Record<string, Record<string, Model>>,
-	codexGpt6Ids: Set<string>,
+	codexGpt6Ids: ReadonlySet<string>,
 ): Map<string, SeedLimitPreservation> {
 	const preserved = new Map<string, SeedLimitPreservation>();
 	for (const models of Object.values(prevModelsJson)) {
@@ -855,7 +860,7 @@ async function generateModels() {
 	// Discovery-only providers (local inference servers) — never bundle static models.
 	// Skip Codex gpt-6 models: they will be re-injected with UNK limits to inherit from models.dev.
 	const discoveryOnlyProviders = new Set(["ollama", "sglang", "vllm"]);
-	const codexGpt6Ids = new Set(["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]);
+	const codexGpt6Ids = CODEX_GPT6_IDS;
 	const fetchedKeys = new Set(allModels.map(model => `${model.provider}/${model.id}`));
 
 	// Preserve known limits from seed models that will be excluded, in case discovery fails

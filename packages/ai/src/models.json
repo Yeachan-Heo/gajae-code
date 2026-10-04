@@ -69406,7 +69406,7 @@
 				"cacheRead": 0.1,
 				"cacheWrite": 2.5
 			},
-			"contextWindow": 272000,
+			"contextWindow": 1050000,
 			"maxTokens": 128000,
 			"preferWebsockets": true,
 			"thinking": {
