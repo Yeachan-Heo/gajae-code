@@ -4331,8 +4331,7 @@ async function cleanupCompleted(scope: ManagedScope, tombstone: string, target: 
 			: undefined;
 		if (
 			target.taskArtifactOwnerDeletionEvidence &&
-			(!ownerReceipt ||
-				ownerReceipt.state !== "owner_retired" ||
+			(ownerReceipt?.state !== "owner_retired" ||
 				!deepSame(ownerReceipt.taskArtifactOwnerDeletionEvidence, target.taskArtifactOwnerDeletionEvidence))
 		)
 			return false;
@@ -4407,16 +4406,14 @@ async function publishCleanupCompleted(
 		: undefined;
 	if (
 		target.taskArtifactOwnerDeletionEvidence &&
-		(!ownerReceipt ||
-			ownerReceipt.state !== "owner_retired" ||
+		(ownerReceipt?.state !== "owner_retired" ||
 			!deepSame(ownerReceipt.taskArtifactOwnerDeletionEvidence, target.taskArtifactOwnerDeletionEvidence))
 	)
 		throw new Error("durability_failed");
 	const ownerOutcome = ownerReceipt?.taskArtifactOwnerRetirementOutcome;
 	if (
 		ownerReceipt &&
-		(!ownerOutcome ||
-			ownerOutcome.kind !== "completed" ||
+		(ownerOutcome?.kind !== "completed" ||
 			!pendingCleanupReceipt(scope, tombstone, target)?.taskArtifactOwnerTranscriptDeleted)
 	)
 		throw new Error("durability_failed");
