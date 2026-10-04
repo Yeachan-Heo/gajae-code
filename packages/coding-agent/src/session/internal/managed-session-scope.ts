@@ -6580,7 +6580,7 @@ async function deleteManagedSessionCandidateInternal(
 					return {
 						kind: "cleanup_pending",
 						tombstonePath: tombstone,
-						phase: deletion.phase,
+						phase: deletion.phase === "task_artifact_owner" ? "artifacts" : deletion.phase,
 						message: deletion.error.message,
 					};
 				// A retained transcript quarantine proves canonical absence and remains
