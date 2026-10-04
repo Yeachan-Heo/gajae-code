@@ -39,6 +39,7 @@ import {
 	captureTaskArtifactOwnerDeletionEvidence,
 	newSessionRootStore,
 } from "../src/session/internal/task-artifact-owner-access";
+import { hasSiblingTaskArtifactOwnerTranscript } from "../src/session/internal/task-artifact-owner-transcript";
 import { FileSessionStorage } from "../src/session/session-storage";
 import {
 	immutableDeletionEvidence,
@@ -256,6 +257,73 @@ function protocolFilesystemSnapshot(root: string): unknown[] {
 	visit(root);
 	return entries;
 }
+
+describe("independent async owner sibling inventories", () => {
+	it("requires a trusted inspector when managed protocol roles are present", async () => {
+		const fixture = makeFixture();
+		const context = taskArtifactOwnerStorageContextForScope(fixture.scope);
+		const before = protocolFilesystemSnapshot(fixture.temporaryRoot);
+		expect(
+			await hasSiblingTaskArtifactOwnerTranscript(
+				new FileSessionStorage(),
+				fixture.transcriptPath,
+				fixture.evidence.locator,
+				context,
+			),
+		).toBe(true);
+		expect(
+			await hasSiblingTaskArtifactOwnerTranscript(
+				new FileSessionStorage(),
+				fixture.transcriptPath,
+				fixture.evidence.locator,
+				context,
+				managedGcProtocolScopeInspectorForScope(fixture.scope),
+			),
+		).toBe(false);
+		expect(protocolFilesystemSnapshot(fixture.temporaryRoot)).toEqual(before);
+	});
+
+	it("finds a shared owner in another managed cwd's v4 header patch", async () => {
+		const fixture = makeFixture();
+		const context = taskArtifactOwnerStorageContextForScope(fixture.scope);
+		const otherCwd = path.join(fixture.temporaryRoot, "other-scanner-cwd");
+		fs.mkdirSync(otherCwd, { mode: 0o700 });
+		const other = makeScope(fixture.agentDir, fixture.sessionsRoot, otherCwd);
+		await Bun.write(
+			path.join(other.directoryPath, "shared.jsonl"),
+			`${JSON.stringify({ type: "session", version: 4, id: fixture.target.sessionId, cwd: otherCwd })}\n${JSON.stringify({ type: "header_patch", patch: { taskArtifactOwner: fixture.evidence.locator } })}\n`,
+			{ mode: 0o600 },
+		);
+		const before = protocolFilesystemSnapshot(fixture.temporaryRoot);
+		expect(
+			await hasSiblingTaskArtifactOwnerTranscript(
+				new FileSessionStorage(),
+				fixture.transcriptPath,
+				fixture.evidence.locator,
+				context,
+				managedGcProtocolScopeInspectorForScope(fixture.scope),
+			),
+		).toBe(true);
+		expect(protocolFilesystemSnapshot(fixture.temporaryRoot)).toEqual(before);
+	});
+
+	it("blocks reserved protocol aliases without filesystem effects", async () => {
+		const fixture = makeFixture();
+		const context = taskArtifactOwnerStorageContextForScope(fixture.scope);
+		fs.mkdirSync(path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal.saved"), { mode: 0o700 });
+		const before = protocolFilesystemSnapshot(fixture.temporaryRoot);
+		expect(
+			await hasSiblingTaskArtifactOwnerTranscript(
+				new FileSessionStorage(),
+				fixture.transcriptPath,
+				fixture.evidence.locator,
+				context,
+				managedGcProtocolScopeInspectorForScope(fixture.scope),
+			),
+		).toBe(true);
+		expect(protocolFilesystemSnapshot(fixture.temporaryRoot)).toEqual(before);
+	});
+});
 
 describe("independent authenticated protocol inventories", () => {
 	it("reads a real prepared journal and active lease without filesystem mutation", async () => {
