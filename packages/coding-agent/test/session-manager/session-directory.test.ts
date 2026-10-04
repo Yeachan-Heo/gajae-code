@@ -2194,6 +2194,53 @@ describe("managed session write protocol", () => {
 			lock.mockRestore();
 		}
 	});
+	it.each([
+		"replacement-failure",
+		"destination-swap",
+	] as const)("keeps stale completion evidence when exact recertification encounters %s", async boundary => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const source = path.join(legacyDirectory(sessionsRoot, cwd), "recertification-boundary.jsonl");
+		await fs.mkdir(path.dirname(source), { recursive: true });
+		await fs.writeFile(source, transcript("recertification-boundary", cwd));
+		const listed = listManagedCandidates(scope);
+		if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing candidate");
+		expect(await deleteManagedSessionCandidate(scope, listed.owned[0])).toMatchObject({ kind: "deleted" });
+		const tombstones = path.join(scope.directoryPath, ".gjc-managed-session-internal", "tombstones");
+		const names = (await fs.readdir(tombstones)).filter(name => name.includes(".cleanup-completed-"));
+		expect(names).toHaveLength(1);
+		const receipt = path.join(tombstones, names[0]!);
+		const stale = JSON.parse(await fs.readFile(receipt, "utf8")) as { target: { identity: { sha256: string } } };
+		stale.target.identity.sha256 = "0".repeat(64);
+		const staleBytes = `${JSON.stringify(stale)}\n`;
+		await fs.writeFile(receipt, staleBytes);
+		const original = managedSessionStorage.ManagedSessionDescendantStore.prototype.replaceExpected;
+		let attempts = 0;
+		const replace = vi.spyOn(managedSessionStorage.ManagedSessionDescendantStore.prototype, "replaceExpected");
+		replace.mockImplementation(function (
+			this: managedSessionStorage.ManagedSessionDescendantStore,
+			relative,
+			bytes,
+			expected,
+		) {
+			attempts += 1;
+			if (boundary === "replacement-failure") throw new Error("test_exact_replacement_failed");
+			syncFs.renameSync(receipt, `${receipt}.retained`);
+			syncFs.copyFileSync(`${receipt}.retained`, receipt);
+			return original.call(this, relative, bytes, expected);
+		});
+		try {
+			const cold = resolveManagedScope({ cwd, agentDir: path.dirname(sessionsRoot), sessionsRoot });
+			if (cold.kind !== "resolved") throw new Error(cold.message);
+			expect((await prepareManagedSessionScopeForWrite(cold.scope)).kind).toBe("error");
+			expect(attempts).toBe(1);
+			expect(await fs.readFile(receipt, "utf8")).toBe(staleBytes);
+			await expect(fs.access(source)).rejects.toMatchObject({ code: "ENOENT" });
+			if (boundary === "destination-swap") expect(await fs.readFile(`${receipt}.retained`, "utf8")).toBe(staleBytes);
+		} finally {
+			replace.mockRestore();
+		}
+	});
+
 	it("still acquires the lock when a completed cleanup receipt no longer binds its target identity", async () => {
 		const { cwd, sessionsRoot, scope } = await fixture();
 		const legacy = legacyDirectory(sessionsRoot, cwd);
