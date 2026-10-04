@@ -9,6 +9,7 @@ import { collectGcDiskReport, resolveGcDiskPolicy } from "../src/gjc-runtime/gc-
 import {
 	bindManagedGcSessionRetirementTarget,
 	type ManagedScope,
+	managedGcProtocolScopeInspectorForScope,
 	prepareManagedSessionScopeForWriteSync,
 	publishManagedGcSessionRetirementReceipt,
 	readManagedGcSessionRetirementReceipt,
@@ -205,18 +206,21 @@ async function publishPrepared(fixture: Fixture) {
 async function publishArtifactsRemoved(fixture: Fixture) {
 	const prepared = await publishPrepared(fixture);
 	const directory = path.dirname(fixture.transcriptPath);
-	const artifactPhase = await new FileSessionStorage().deleteSessionVerified({
-		sessionsRoot: fixture.sessionsRoot,
-		transcriptPath: fixture.transcriptPath,
-		sessionId: fixture.sessionId,
-		cwd: fixture.cwd,
-		transcriptIdentity: prepared.target.transcriptIdentity,
-		plannedArtifactsPath: path.join(directory, `.gjc-delete-gc-${crypto.randomUUID()}-artifacts`),
-		plannedTranscriptPath: path.join(directory, `.gjc-delete-gc-${crypto.randomUUID()}-transcript`),
-		taskArtifactOwnerStorageContext: prepared.context,
-		taskArtifactOwnerDeletionEvidence: prepared.evidence,
-		deferTaskArtifactOwnerRetirement: true,
-	});
+	const artifactPhase = await new FileSessionStorage().deleteSessionVerified(
+		{
+			sessionsRoot: fixture.sessionsRoot,
+			transcriptPath: fixture.transcriptPath,
+			sessionId: fixture.sessionId,
+			cwd: fixture.cwd,
+			transcriptIdentity: prepared.target.transcriptIdentity,
+			plannedArtifactsPath: path.join(directory, `.gjc-delete-gc-${crypto.randomUUID()}-artifacts`),
+			plannedTranscriptPath: path.join(directory, `.gjc-delete-gc-${crypto.randomUUID()}-transcript`),
+			taskArtifactOwnerStorageContext: prepared.context,
+			taskArtifactOwnerDeletionEvidence: prepared.evidence,
+			deferTaskArtifactOwnerRetirement: true,
+		},
+		managedGcProtocolScopeInspectorForScope(fixture.scope),
+	);
 	if (artifactPhase.kind !== "artifacts_removed")
 		throw new Error(`fixture_artifact_phase_failed:${artifactPhase.kind}`);
 	const receipt = await publishManagedGcSessionRetirementReceipt(fixture.scope, {
