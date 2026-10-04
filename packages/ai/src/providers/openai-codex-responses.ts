@@ -6,6 +6,7 @@ import {
 	asRecord,
 	extractHttpStatusFromError,
 	fetchWithRetry,
+	isUnexpectedSocketCloseMessage,
 	logger,
 	readSseJson,
 	sanitizeHeaderComponent,
@@ -1507,6 +1508,13 @@ function isCodexTransientStreamClose(error: unknown): boolean {
 	if (!(error instanceof Error)) return false;
 	const providerMessage = (error as CodexProviderStreamError).providerMessage;
 	const message = (providerMessage || error.message).toLowerCase();
+	const transportCode = (error as { code?: unknown }).code;
+	if (
+		isUnexpectedSocketCloseMessage(message) ||
+		(typeof transportCode === "string" && transportCode.toUpperCase() === "ECONNRESET")
+	) {
+		return true;
+	}
 	const providerCode =
 		(error as CodexProviderStreamError & { providerCode?: string }).code?.toLowerCase() ??
 		(error as { providerCode?: string }).providerCode?.toLowerCase();
@@ -2560,7 +2568,7 @@ async function tryRetryCodexProviderError(
 				(block.type === "text" && block.text.length === 0),
 		);
 	if (
-		!isRetryableCodexProviderError(error) ||
+		(!isRetryableCodexProviderError(error) && !canReplayPartialToolCall) ||
 		(context.output.content.length > 0 && !canReplayPartialToolCall) ||
 		runtime.providerRetryAttempt >= resolveRetryBudget(context.options?.streamMaxRetries, CODEX_MAX_RETRIES) ||
 		context.options?.signal?.aborted ||
