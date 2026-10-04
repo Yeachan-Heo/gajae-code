@@ -1242,6 +1242,7 @@ interface SessionRuntime {
 	getJoinedPromptCorrelations: (owner: AgentTerminalOwnerContext) => Array<{ commandId: string; turnId: string }>;
 	isPromptRunOwner: (correlation: { commandId: string; turnId: string }, owner: AgentTerminalOwnerContext) => boolean;
 	releaseAcceptedImages: () => void;
+	retireJoinedPromptOwners: () => void;
 	/** Delivers one ring-positioned event envelope to every attached subscriber
 	 *  connection, applying the same capability gate as event replay. */
 	broadcastEventFrame: (event: SdkFrame) => string[];
@@ -4645,6 +4646,7 @@ export function createNotificationsExtension(
 			requestedRuntime.stopping = true;
 			requestedRuntime.imageUploads.close();
 			requestedRuntime.releaseAcceptedImages();
+			requestedRuntime.retireJoinedPromptOwners();
 			requestedRuntime.abortEphemeralTurns();
 		}
 		if (reason === "session" && requestedRuntime) requestedRuntime.stopSessionNameObserver();
@@ -4948,6 +4950,7 @@ export function createNotificationsExtension(
 				acceptedImageRunOwners.delete(key);
 			}
 		};
+		const retireJoinedPromptOwners = (): void => joinedPromptOwners.clear();
 		const pendingPromptCorrelations: Array<{ commandId: string; turnId: string }> = [];
 		const pendingPromptCorrelationsBySdkRunToken = new Map<string, { commandId: string; turnId: string }>();
 		const workLease = ctx.getSessionWorkLease?.() ?? createSessionWorkLease();
@@ -8240,8 +8243,8 @@ export function createNotificationsExtension(
 				for (const release of acceptedImages.values()) release();
 				acceptedImages.clear();
 				acceptedImageRunOwners.clear();
-				joinedPromptOwners.clear();
 			},
+			retireJoinedPromptOwners,
 			broadcastEventFrame,
 			broadcastEventFrameWithReceipts,
 			revisions,
