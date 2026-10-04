@@ -3,10 +3,13 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	changelogForFragment,
 	compareUnreleasedEdit,
 	consumeFragments,
 	foldFragmentsIntoChangelog,
 	fragmentDirectoryFor,
+	fragmentNoteLines,
+	isConsumedFragmentNote,
 	listFragmentFilesInDirectory,
 	locateUnreleased,
 	parseFragment,
@@ -212,5 +215,59 @@ describe("CLI entrypoints", () => {
 		const guarded = await run(["bun", historyGuardPath, "--base", base], root);
 		expect(guarded.exitCode).toBe(1);
 		expect(guarded.stderr).toContain("edits the shared");
+	});
+});
+describe("release-consumed fragment deletions", () => {
+	const fragment = "### Fixed\n\n- A shipped fix.\n";
+	const unshipped = "### Fixed\n\n- An unshipped fix.\n";
+
+	test("matches a fragment to its package CHANGELOG and extracts only note lines", () => {
+		expect(changelogForFragment("packages/coding-agent/changelog.d/x.md")).toBe("packages/coding-agent/CHANGELOG.md");
+		expect(changelogForFragment("crates/pi-natives/changelog.d/x.md")).toBeUndefined();
+		expect(changelogForFragment("packages/coding-agent/CHANGELOG.md")).toBeUndefined();
+		expect(fragmentNoteLines(fragment)).toEqual(["- A shipped fix."]);
+	});
+
+	test("exempts a note that already landed and fails closed when it did not", () => {
+		const shipped = insert(CHANGELOG, "- A shipped fix.");
+		expect(isConsumedFragmentNote(fragment, shipped)).toBe(true);
+		// The note never landed: deleting the fragment would drop it silently.
+		expect(isConsumedFragmentNote(fragment, CHANGELOG)).toBe(false);
+		expect(isConsumedFragmentNote(undefined, shipped)).toBe(false);
+		expect(isConsumedFragmentNote(fragment, undefined)).toBe(false);
+		expect(isConsumedFragmentNote("### Fixed\n\n", shipped)).toBe(false);
+	});
+
+	test("the guard permits a backmerge that consumes a released fragment and still rejects a dropped note", async () => {
+		// The released CHANGELOG has an empty [Unreleased] body, so folding a note into a
+		// new version section is the only edit and the shared-body guard stays quiet.
+		const released = "# Changelog\n\n## [Unreleased]\n\n## [1.0.0] - 2026-01-01\n\n### Added\n\n- Something shipped.\n";
+		const shipped = released.replace(
+			"## [1.0.0] - 2026-01-01",
+			"## [1.1.0] - 2026-10-04\n\n### Fixed\n\n- A shipped fix.\n\n## [1.0.0] - 2026-01-01",
+		);
+		const root = await tempDir();
+		expect((await git(root, ["init", "-q", "-b", "dev"])).exitCode).toBe(0);
+		await put(root, "packages/coding-agent/CHANGELOG.md", released);
+		// Both fragments exist at the base so each one shows up as a deletion at the head.
+		await put(root, "packages/coding-agent/changelog.d/x.md", fragment);
+		await put(root, "packages/coding-agent/changelog.d/keep.md", unshipped);
+		await commit(root, "base");
+		const base = (await git(root, ["rev-parse", "HEAD"])).stdout.trim();
+
+		// The release flow folds x's note into the CHANGELOG and consumes x.
+		await put(root, "packages/coding-agent/CHANGELOG.md", shipped);
+		await git(root, ["rm", "-q", "packages/coding-agent/changelog.d/x.md"]);
+		await commit(root, "release consumes x");
+		const consumed = await run(["bun", historyGuardPath, "--base", base], root);
+		expect(consumed.stderr).not.toContain("is deleted by this pull request");
+		expect(consumed.exitCode).toBe(0);
+
+		await git(root, ["rm", "-q", "packages/coding-agent/changelog.d/keep.md"]);
+		await commit(root, "drops an unreleased note");
+		const dropped = await run(["bun", historyGuardPath, "--base", base], root);
+		expect(dropped.exitCode).toBe(1);
+		expect(dropped.stderr).toContain("keep.md");
+		expect(dropped.stderr).toContain("is deleted by this pull request");
 	});
 });

@@ -372,6 +372,39 @@ function isGuardedChangelog(file: string): boolean {
 function isFragmentPath(file: string): boolean {
 	return FRAGMENT_PATH.test(file);
 }
+/** The package CHANGELOG a `packages/<pkg>/changelog.d/<slug>.md` fragment folds into. */
+export function changelogForFragment(file: string): string | undefined {
+	const match = /^(packages\/[^/]+)\/changelog\.d\/[^/]+$/.exec(file);
+	return match?.[1] === undefined ? undefined : `${match[1]}/CHANGELOG.md`;
+}
+
+/**
+ * A fragment's note lines: every non-blank line except the `### <Section>` headings,
+ * trimmed. `foldFragmentsIntoChangelog` copies exactly these lines under the matching
+ * section, so finding them in the CHANGELOG proves the note shipped.
+ */
+export function fragmentNoteLines(fragmentText: string): string[] {
+	return fragmentText
+		.split("\n")
+		.map(line => line.trim())
+		.filter(line => line.length > 0 && !ANY_HEADING.test(line));
+}
+
+/**
+ * True when every note line of a deleted fragment already landed in the head CHANGELOG,
+ * i.e. the release flow folded and shipped it. An unreadable fragment or CHANGELOG fails
+ * closed so a genuinely dropped unreleased note is still reported.
+ */
+export function isConsumedFragmentNote(
+	fragmentText: string | undefined,
+	headChangelog: string | undefined,
+): boolean {
+	if (fragmentText === undefined || headChangelog === undefined) return false;
+	const noteLines = fragmentNoteLines(fragmentText);
+	if (noteLines.length === 0) return false;
+	const shipped = new Set(headChangelog.split("\n").map(line => line.trim()));
+	return noteLines.every(line => shipped.has(line));
+}
 
 async function gitShow(revision: string, file: string): Promise<string | undefined> {
 	const result = await $`git show ${`${revision}:${file}`}`.quiet().nothrow();
@@ -439,6 +472,14 @@ export async function collectPullRequestFragmentViolations(
 		if (violation) errors.push(violation);
 	}
 	for (const file of (await gitDiffPaths(base, head, "D")).filter(isFragmentPath)) {
+		const changelog = changelogForFragment(file);
+		const [before, after] = await Promise.all([
+			gitShow(base, file),
+			changelog === undefined ? Promise.resolve(undefined) : gitShow(head, changelog),
+		]);
+		// A backmerge legitimately applies the release flow's own fragment consumption:
+		// the note is already in the head CHANGELOG, so deleting it drops nothing.
+		if (isConsumedFragmentNote(before, after)) continue;
 		errors.push({ file, message: "is deleted by this pull request. Only the release flow folds and consumes fragments (scripts/release.ts); deleting one here drops an unreleased note without shipping it." });
 	}
 	const collected = await collectPackageFragments();
