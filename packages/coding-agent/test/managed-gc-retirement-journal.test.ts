@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -12,14 +12,18 @@ import {
 import {
 	bindManagedGcSessionRetirementTarget,
 	computeManagedScopeDigest,
+	deleteManagedSessionCandidate,
 	discoverManagedGcSessionRetirementReceipts,
+	listManagedCandidates,
 	type ManagedScope,
 	managedDirectoryAuthorityForScope,
+	ManagedSessionScopeTestHooks,
 	managedDirectoryIdentityForScope,
 	prepareManagedSessionScopeForWriteSync,
 	publishManagedGcSessionRetirementReceipt,
 	readManagedGcSessionRetirementReceipt,
 	readManagedGcSessionRetirementReceiptReadOnly,
+	reconcileManagedTombstones,
 	resolveManagedGcScopeForRead,
 	resolveManagedScopeForWrite,
 	taskArtifactOwnerStorageContextForScope,
@@ -29,6 +33,7 @@ import {
 	captureTaskArtifactOwnerDeletionEvidence,
 	newSessionRootStore,
 } from "../src/session/internal/task-artifact-owner-access";
+import { FileSessionStorage } from "../src/session/session-storage";
 import {
 	immutableDeletionEvidence,
 	OWNER_DIRECTORY,
@@ -62,7 +67,139 @@ interface Fixture {
 const temporaryRoots: string[] = [];
 
 afterEach(() => {
+	vi.restoreAllMocks();
+	ManagedSessionScopeTestHooks.beforeVerifiedDelete = undefined;
 	for (const root of temporaryRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+describe("owner-aware readonly data does not authorize legacy effects", () => {
+	it("refuses a live owner locator introduced only by a v4 header patch before deleting artifacts", async () => {
+		const fixture = makeFixture();
+		const locator = fixture.evidence.locator;
+		await Bun.write(
+			fixture.transcriptPath,
+			`${JSON.stringify({ type: "session", version: 4, id: fixture.target.sessionId, cwd: fixture.cwd })}\n${JSON.stringify({ type: "header_patch", patch: { taskArtifactOwner: locator } })}\n`,
+		);
+		const listed = listManagedCandidates(fixture.scope);
+		if (listed.kind !== "complete") throw new Error(listed.message);
+		const candidate = listed.owned.find(value => value.path === fixture.transcriptPath);
+		if (!candidate) throw new Error("owner_candidate_missing");
+		const artifactRoot = fixture.transcriptPath.slice(0, -6);
+		fs.mkdirSync(artifactRoot, { mode: 0o700 });
+		await Bun.write(path.join(artifactRoot, "retained.txt"), "retained artifact");
+		const before = fs.readFileSync(fixture.transcriptPath);
+		const unlink = vi.spyOn(native, "exactUnlink");
+		const removal = vi.spyOn(native, "exactRemoveDirectoryTree");
+		const result = await deleteManagedSessionCandidate(fixture.scope, candidate);
+		expect(result).toMatchObject({ kind: "error", message: "task_artifact_owner_legacy_scope_unsupported" });
+		expect(fs.readFileSync(fixture.transcriptPath)).toEqual(before);
+		expect(fs.readFileSync(path.join(artifactRoot, "retained.txt"), "utf8")).toBe("retained artifact");
+		expect(unlink).toHaveBeenCalledTimes(0);
+		expect(removal).toHaveBeenCalledTimes(0);
+	});
+
+	it("rechecks owner header patches at the immediate deletion fence", async () => {
+		const fixture = makeFixture();
+		const header = `${JSON.stringify({ type: "session", version: 4, id: fixture.target.sessionId, cwd: fixture.cwd })}\n`;
+		await Bun.write(fixture.transcriptPath, header);
+		const listed = listManagedCandidates(fixture.scope);
+		if (listed.kind !== "complete") throw new Error(listed.message);
+		const candidate = listed.owned.find(value => value.path === fixture.transcriptPath);
+		if (!candidate) throw new Error("owner_candidate_missing");
+		const storage = vi.spyOn(FileSessionStorage.prototype, "deleteSessionVerified");
+		ManagedSessionScopeTestHooks.beforeVerifiedDelete = async () => {
+			await Bun.write(
+				fixture.transcriptPath,
+				`${header}${JSON.stringify({ type: "header_patch", patch: { taskArtifactOwner: fixture.evidence.locator } })}\n`,
+			);
+		};
+		const result = await deleteManagedSessionCandidate(fixture.scope, candidate);
+		expect(result).toMatchObject({ kind: "error", message: "task_artifact_owner_legacy_scope_unsupported" });
+		expect(storage).toHaveBeenCalledTimes(0);
+		expect(fs.readFileSync(fixture.transcriptPath, "utf8")).toContain("header_patch");
+	});
+
+	it("refuses malformed owner claims instead of treating the tombstone as absent", async () => {
+		for (const ownerValue of [null, { sessionId: "foreign" }]) {
+			const fixture = makeFixture();
+			const listed = listManagedCandidates(fixture.scope);
+			if (listed.kind !== "complete") throw new Error(listed.message);
+			const candidate = listed.owned.find(value => value.path === fixture.transcriptPath);
+			if (!candidate) throw new Error("owner_candidate_missing");
+			const tombstone = path.join(
+				fixture.scope.directoryPath,
+				".gjc-managed-session-internal/tombstones",
+				`${"b".repeat(64)}.json`,
+			);
+			await Bun.write(
+				tombstone,
+				JSON.stringify(
+					{
+						schemaVersion: 2,
+						state: "retired",
+						scope: computeManagedScopeDigest(fixture.scope.platform, fixture.scope.canonicalCwd),
+						targets: [{ ...candidate, taskArtifactOwnerDeletionEvidence: ownerValue }],
+					},
+					(_key, value: unknown) => (typeof value === "bigint" ? value.toString() : value),
+				),
+			);
+			fs.chmodSync(tombstone, 0o600);
+			const before = fs.readFileSync(fixture.transcriptPath);
+			const storage = vi.spyOn(FileSessionStorage.prototype, "deleteSessionVerified");
+			await expect(reconcileManagedTombstones(fixture.scope)).rejects.toThrow(
+				"task_artifact_owner_legacy_scope_unsupported",
+			);
+			expect(storage).toHaveBeenCalledTimes(0);
+			expect(fs.readFileSync(fixture.transcriptPath)).toEqual(before);
+			storage.mockRestore();
+		}
+	});
+
+	it("refuses owner tombstone retirement even when the canonical transcript is absent", async () => {
+		const fixture = makeFixture();
+		const listed = listManagedCandidates(fixture.scope);
+		if (listed.kind !== "complete") throw new Error(listed.message);
+		const candidate = listed.owned.find(value => value.path === fixture.transcriptPath);
+		if (!candidate) throw new Error("owner_candidate_missing");
+		const store = openScopeStore(fixture.scope);
+		const name = `${"a".repeat(64)}.json`;
+		try {
+			store.publishNoReplaceSync(
+				`.gjc-managed-session-internal/tombstones/${name}`,
+				Buffer.from(
+					JSON.stringify(
+						{
+							schemaVersion: 2,
+							state: "retired",
+							scope: computeManagedScopeDigest(fixture.scope.platform, fixture.scope.canonicalCwd),
+							targets: [{ ...candidate, taskArtifactOwnerDeletionEvidence: fixture.evidence }],
+						},
+						(_key, value: unknown) => (typeof value === "bigint" ? value.toString() : value),
+					),
+				),
+			);
+		} finally {
+			store.close();
+		}
+		fs.unlinkSync(fixture.transcriptPath);
+		const ownerPayload = path.join(
+			fixture.sessionsRoot,
+			ownerRelativePath(fixture.evidence.locator.ownerId),
+			"payload.json",
+		);
+		const before = fs.readFileSync(ownerPayload);
+		const unlink = vi.spyOn(native, "exactUnlink");
+		const removal = vi.spyOn(native, "exactRemoveDirectoryTree");
+		await expect(reconcileManagedTombstones(fixture.scope)).rejects.toThrow(
+			"task_artifact_owner_legacy_scope_unsupported",
+		);
+		expect(fs.readFileSync(ownerPayload)).toEqual(before);
+		expect(
+			fs.readdirSync(path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal/tombstones")),
+		).toEqual([name]);
+		expect(unlink).toHaveBeenCalledTimes(0);
+		expect(removal).toHaveBeenCalledTimes(0);
+	});
 });
 
 function makeScope(agentDir: string, sessionsRoot: string, cwd: string): ManagedScope {
