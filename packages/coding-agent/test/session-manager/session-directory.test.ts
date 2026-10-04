@@ -22,6 +22,7 @@ import {
 } from "../../src/session/internal/managed-session-scope";
 import * as managedSessionStorage from "../../src/session/internal/managed-session-storage";
 import {
+	MANAGED_ARTIFACT_COPY_BATCH_SIZE,
 	MANAGED_ARTIFACT_MAX_FILES,
 	publishManagedFileNoReplace,
 	validateManagedArtifactTree,
@@ -3202,11 +3203,20 @@ describe("scrubbed write-protocol remnant reaping", () => {
 	it("reaps an over-limit poisoned scope before binding publication and preserves protected entries", async () => {
 		const { scope } = await fixture();
 		await fs.mkdir(scope.directoryPath, { recursive: true, mode: 0o700 });
-		for (let index = 0; index <= MANAGED_ARTIFACT_MAX_FILES; index += 1) {
-			const pathname = path.join(scope.directoryPath, `.gjc-receipt-remove-poison-${index}`);
-			await fs.writeFile(pathname, "", { mode: 0o600 });
-			await fs.utimes(pathname, aged, aged);
+		// Keep every over-limit entry real and aged without serializing 100,002 setup operations.
+		for (let start = 0; start <= MANAGED_ARTIFACT_MAX_FILES; start += MANAGED_ARTIFACT_COPY_BATCH_SIZE) {
+			const count = Math.min(MANAGED_ARTIFACT_COPY_BATCH_SIZE, MANAGED_ARTIFACT_MAX_FILES + 1 - start);
+			await Promise.all(
+				Array.from({ length: count }, async (_, offset) => {
+					const pathname = path.join(scope.directoryPath, `.gjc-receipt-remove-poison-${start + offset}`);
+					await Bun.write(pathname, "", { mode: 0o600, createPath: false });
+					await fs.utimes(pathname, aged, aged);
+				}),
+			);
 		}
+		expect(
+			(await fs.readdir(scope.directoryPath)).filter(name => name.startsWith(".gjc-receipt-remove-poison-")),
+		).toHaveLength(MANAGED_ARTIFACT_MAX_FILES + 1);
 		const evidence = path.join(scope.directoryPath, ".gjc-receipt-remove-evidence");
 		await fs.writeFile(evidence, "retained receipt payload", { mode: 0o600 });
 		await fs.utimes(evidence, aged, aged);
@@ -3223,6 +3233,9 @@ describe("scrubbed write-protocol remnant reaping", () => {
 		if (process.platform !== "win32") await fs.symlink(unrelated, symlink);
 
 		expect(prepareManagedSessionScopeForWriteSync(scope)).toMatchObject({ kind: "resolved" });
+		expect(
+			(await fs.readdir(scope.directoryPath)).filter(name => name.startsWith(".gjc-receipt-remove-poison-")),
+		).toHaveLength(0);
 
 		expect(await fs.readFile(evidence, "utf8")).toBe("retained receipt payload");
 		await expect(fs.access(young)).resolves.toBeNull();
