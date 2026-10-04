@@ -5462,29 +5462,59 @@ async function publishCleanupCompleted(
 			!pendingCleanupReceipt(scope, tombstone, target)?.taskArtifactOwnerTranscriptDeleted)
 	)
 		throw new Error("durability_failed");
+	const completedPath = cleanupReceiptPath(tombstone, target, "completed", 1);
+	const record = {
+		schemaVersion: 1,
+		state: "cleanup_completed",
+		scope: scopeDigest(scope.platform, scope.canonicalCwd),
+		tombstone,
+		attempt: 1,
+		target: { path: target.path, sessionId: target.sessionId, cwd: target.cwd, identity: target.identity },
+		...(ownerReceipt && ownerOutcome
+			? {
+					taskArtifactOwnerDeletionEvidence: ownerReceipt.taskArtifactOwnerDeletionEvidence,
+					taskArtifactOwnerRetirementOutcome: ownerOutcome,
+					taskArtifactOwnerRetired: true,
+					taskArtifactOwnerTranscriptDeleted: true,
+				}
+			: {}),
+	};
+	const serialized = `${JSON.stringify(record, (_key, value: unknown) => (typeof value === "bigint" ? value.toString() : value))}\n`;
 	try {
-		await publishManagedTombstone(
-			cleanupReceiptPath(tombstone, target, "completed", 1),
-			{
-				schemaVersion: 1,
-				state: "cleanup_completed",
-				scope: scopeDigest(scope.platform, scope.canonicalCwd),
-				tombstone,
-				attempt: 1,
-				target: { path: target.path, sessionId: target.sessionId, cwd: target.cwd, identity: target.identity },
-				...(ownerReceipt && ownerOutcome
-					? {
-							taskArtifactOwnerDeletionEvidence: ownerReceipt.taskArtifactOwnerDeletionEvidence,
-							taskArtifactOwnerRetirementOutcome: ownerOutcome,
-							taskArtifactOwnerRetired: true,
-							taskArtifactOwnerTranscriptDeleted: true,
-						}
-					: {}),
-			},
-			lock.assertOwned,
-		);
+		await publishManagedTombstone(completedPath, record, lock.assertOwned);
 	} catch (error) {
 		if ((error as Error).message !== "destination_conflict") throw error;
+		lock.assertOwned();
+		if (await cleanupCompleted(scope, tombstone, target)) return;
+		const trusted = managedGcTrustedScope(scope);
+		const store = managedGcScopeStore(scope, trusted);
+		const stale = captureManagedFileNoFollow(completedPath);
+		const value: unknown = JSON.parse(stale.bytes.toString("utf8"));
+		if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("durability_failed");
+		const prior = value as Record<string, unknown>;
+		const priorTarget = prior.target;
+		if (!priorTarget || typeof priorTarget !== "object" || Array.isArray(priorTarget))
+			throw new Error("durability_failed");
+		const targetRecord = priorTarget as Record<string, unknown>;
+		const priorIdentity = targetRecord.identity;
+		if (!priorIdentity || typeof priorIdentity !== "object" || Array.isArray(priorIdentity))
+			throw new Error("durability_failed");
+		const identityRecord = priorIdentity as Record<string, unknown>;
+		if (typeof identityRecord.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(identityRecord.sha256))
+			throw new Error("durability_failed");
+		const recertified = {
+			...prior,
+			target: { ...targetRecord, identity: { ...identityRecord, sha256: target.identity.sha256 } },
+		};
+		if (!deepSame(recertified, JSON.parse(serialized))) throw new Error("durability_failed");
+		lock.assertOwned();
+		store.replaceExpected(
+			path.relative(scope.directoryPath, completedPath),
+			new TextEncoder().encode(serialized),
+			stale,
+		);
+		lock.assertOwned();
+		assertRetainedManagedDirectoryIdentity(scope);
 	}
 	if (!(await cleanupCompleted(scope, tombstone, target))) throw new Error("durability_failed");
 }
