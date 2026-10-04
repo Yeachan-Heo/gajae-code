@@ -883,43 +883,24 @@ async function hashReaperFile(pathname: string, expected: fs.BigIntStats): Promi
 	}
 }
 
+interface ReaperParentIdentity {
+	readonly dev: bigint;
+	readonly ino: bigint;
+}
+
 function exactReaperUnlinkSync(
 	pathname: string,
 	stat: fs.BigIntStats,
 	sha256: string,
 	allowHardLink: boolean,
+	parentIdentity: ReaperParentIdentity,
 ): NativeExactUnlinkResult {
-	const parent = fs.lstatSync(path.dirname(pathname), { bigint: true });
-	if (!parent.isDirectory() || parent.isSymbolicLink()) return { ok: false, code: "parent_mismatch" };
 	const identity: NativeExactFileIdentity = {
 		dev: stat.dev,
 		ino: stat.ino,
 		nlink: stat.nlink,
-		parentDev: parent.dev,
-		parentIno: parent.ino,
-		size: stat.size,
-		mtimeNs: stat.mtimeNs,
-		sha256,
-		quarantineName: remnantReapQuarantineName(pathname),
-		...(allowHardLink ? { allowHardLink: true, requireHardLink: true } : {}),
-	};
-	return nativeSessionStorage().exactUnlinkDirect(pathname, identity);
-}
-
-async function exactReaperUnlink(
-	pathname: string,
-	stat: fs.BigIntStats,
-	sha256: string,
-	allowHardLink: boolean,
-): Promise<NativeExactUnlinkResult> {
-	const parent = await fsp.lstat(path.dirname(pathname), { bigint: true });
-	if (!parent.isDirectory() || parent.isSymbolicLink()) return { ok: false, code: "parent_mismatch" };
-	const identity: NativeExactFileIdentity = {
-		dev: stat.dev,
-		ino: stat.ino,
-		nlink: stat.nlink,
-		parentDev: parent.dev,
-		parentIno: parent.ino,
+		parentDev: parentIdentity.dev,
+		parentIno: parentIdentity.ino,
 		size: stat.size,
 		mtimeNs: stat.mtimeNs,
 		sha256,
@@ -966,6 +947,8 @@ export function reapScrubbedProtocolRemnantsSync(
 	const cutoff = Date.now() - minAgeMs;
 	let reaped = 0;
 	let failures = 0;
+	// Immutable expected identity only; native reopens and revalidates the parent per unlink.
+	let parentIdentity: ReaperParentIdentity | undefined;
 	for (const name of names) {
 		const terminalRemnant = SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix));
 		const replacementCandidate = REPLACEMENT_STAGING_NAME.test(name);
@@ -989,9 +972,29 @@ export function reapScrubbedProtocolRemnantsSync(
 			if (named.mtimeMs > cutoff) continue;
 			const sha256 = terminalRemnant ? EMPTY_FILE_SHA256 : hashReaperFileSync(pathname, named);
 			if (!sha256) continue;
-			const removed = exactReaperUnlinkSync(pathname, named, sha256, !terminalRemnant);
+			if (!parentIdentity) {
+				const parent = fs.lstatSync(path.dirname(pathname), { bigint: true });
+				if (!parent.isDirectory() || parent.isSymbolicLink()) {
+					failures += 1;
+					continue;
+				}
+				parentIdentity = { dev: parent.dev, ino: parent.ino };
+			}
+			const removed = exactReaperUnlinkSync(pathname, named, sha256, !terminalRemnant, parentIdentity);
 			if (removed.ok) reaped += 1;
-			else if (!isBenignReaperRace(removed)) failures += 1;
+			else {
+				let parentKindMismatch = false;
+				if (removed.code === "reparse_point") {
+					try {
+						const parent = fs.lstatSync(path.dirname(pathname), { bigint: true });
+						parentKindMismatch = !parent.isDirectory() || parent.isSymbolicLink();
+					} catch (error) {
+						// Preserve lookup-error accounting without changing or retrying the native result.
+						if (!isEnoent(error)) failures += 1;
+					}
+				}
+				if (parentKindMismatch || !isBenignReaperRace(removed)) failures += 1;
+			}
 		} catch (error) {
 			if (!isEnoent(error)) failures += 1;
 		}
@@ -1025,6 +1028,7 @@ export async function reapScrubbedProtocolRemnants(
 	let reaped = 0;
 	let failures = 0;
 	let scanned = 0;
+	let parentIdentity: ReaperParentIdentity | undefined;
 	for (const name of names) {
 		const terminalRemnant = SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix));
 		const replacementCandidate = REPLACEMENT_STAGING_NAME.test(name);
@@ -1047,9 +1051,29 @@ export async function reapScrubbedProtocolRemnants(
 			if (named.mtimeMs > cutoff) continue;
 			const sha256 = terminalRemnant ? EMPTY_FILE_SHA256 : await hashReaperFile(pathname, named);
 			if (!sha256) continue;
-			const removed = await exactReaperUnlink(pathname, named, sha256, !terminalRemnant);
+			if (!parentIdentity) {
+				const parent = await fsp.lstat(path.dirname(pathname), { bigint: true });
+				if (!parent.isDirectory() || parent.isSymbolicLink()) {
+					failures += 1;
+					continue;
+				}
+				parentIdentity = { dev: parent.dev, ino: parent.ino };
+			}
+			const removed = await exactReaperUnlinkSync(pathname, named, sha256, !terminalRemnant, parentIdentity);
 			if (removed.ok) reaped += 1;
-			else if (!isBenignReaperRace(removed)) failures += 1;
+			else {
+				let parentKindMismatch = false;
+				if (removed.code === "reparse_point") {
+					try {
+						const parent = await fsp.lstat(path.dirname(pathname), { bigint: true });
+						parentKindMismatch = !parent.isDirectory() || parent.isSymbolicLink();
+					} catch (error) {
+						// Preserve lookup-error accounting without changing or retrying the native result.
+						if (!isEnoent(error)) failures += 1;
+					}
+				}
+				if (parentKindMismatch || !isBenignReaperRace(removed)) failures += 1;
+			}
 		} catch (error) {
 			if (!isEnoent(error)) failures += 1;
 		}
