@@ -12,6 +12,7 @@ import {
 	type ManagedCandidate,
 	type ManagedScope,
 	managedDirectoryIdentityForScope,
+	managedGcProtocolScopeInspectorForScope,
 	prepareManagedSessionScopeForWriteSync,
 	publishManagedGcSessionRetirementReceipt,
 	readManagedGcSessionRetirementReceipt,
@@ -227,9 +228,11 @@ async function withAuthority<T>(
 	scope: ManagedScope = fixture.scope,
 ): Promise<T> {
 	const context = taskArtifactOwnerStorageContextForScope(scope);
+	// The outer scope fence must not hold the per-transcript journal publication lease.
+	const lockKey = crypto.createHash("sha256").update(scope.canonicalCwd).digest("hex");
 	const lock = await acquireManagedLock(
 		path.join(scope.directoryPath, ".gjc-managed-session-internal", "locks"),
-		`owner-cleanup-api-${crypto.randomUUID()}`,
+		lockKey,
 		context.rootAuthority,
 		context.securityPolicy,
 	);
@@ -238,6 +241,12 @@ async function withAuthority<T>(
 		sessionsRoot: scope.sessionsRoot,
 		directoryPath: scope.directoryPath,
 		storageContext: context,
+		inspectProtocol: async inputs => {
+			lock.assertOwned();
+			const snapshots = await managedGcProtocolScopeInspectorForScope(scope)(inputs);
+			lock.assertOwned();
+			return snapshots;
+		},
 		assertOwned: () => lock.assertOwned(),
 		bindTarget: transcriptPath => bindManagedGcSessionRetirementTarget(scope, transcriptPath),
 		readReceipt: async transcriptPath => {

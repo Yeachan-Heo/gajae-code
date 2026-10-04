@@ -17,6 +17,7 @@ import type {
 	ManagedGcSessionRetirementReceipt,
 	ManagedGcSessionRetirementTarget,
 } from "./managed-gc-retirement-codec";
+import type { ManagedGcProtocolScopeInspector } from "./managed-session-scope";
 import { captureTaskArtifactOwnerDeletionEvidence } from "./task-artifact-owner-access";
 import {
 	hasSiblingTaskArtifactOwnerTranscript,
@@ -37,6 +38,7 @@ export interface ManagedGcOwnerCleanupAuthority {
 	readonly sessionsRoot: string;
 	readonly directoryPath: string;
 	readonly storageContext: TaskArtifactOwnerStorageContext;
+	readonly inspectProtocol: ManagedGcProtocolScopeInspector;
 	readonly assertOwned: () => void;
 	readonly bindTarget: (transcriptPath: string) => ManagedGcSessionRetirementTarget;
 	readonly readReceipt: (transcriptPath: string) => Promise<ManagedGcSessionRetirementReceipt | undefined>;
@@ -233,15 +235,16 @@ export async function retireManagedGcOwnerAfterArtifacts(
 	if (!receipt) return { state: "none" };
 	const evidence = receipt.taskArtifactOwnerDeletionEvidence;
 	if (!evidence) throw new Error("task_artifact_owner_continuation_evidence_missing");
-	if (
-		hasSiblingTaskArtifactOwnerTranscript(
-			new FileSessionStorage(),
-			target.path,
-			evidence.locator,
-			authority.storageContext,
-		)
-	)
-		return { state: "pending", message: "task_artifact_owner_shared_with_sibling_transcript" };
+	authority.assertOwned();
+	const sharedBefore = await hasSiblingTaskArtifactOwnerTranscript(
+		new FileSessionStorage(),
+		target.path,
+		evidence.locator,
+		authority.storageContext,
+		authority.inspectProtocol,
+	);
+	authority.assertOwned();
+	if (sharedBefore) return { state: "pending", message: "task_artifact_owner_shared_with_sibling_transcript" };
 	if (receipt.state === "owner_retired") return { state: "owner_retired" };
 	for (const sibling of tombstoneTargets) {
 		if (
@@ -291,14 +294,16 @@ export async function retireManagedGcOwnerAfterArtifacts(
 		);
 		if (inheritedOutcome.kind !== "completed") throw new Error("task_artifact_owner_physical_retirement_unverified");
 		verifyTaskArtifactOwnerPhysicalRetirement(authority.storageContext, evidence, inheritedOutcome);
-		if (
-			hasSiblingTaskArtifactOwnerTranscript(
-				new FileSessionStorage(),
-				target.path,
-				evidence.locator,
-				authority.storageContext,
-			)
-		)
+		authority.assertOwned();
+		const sharedAfterInheritance = await hasSiblingTaskArtifactOwnerTranscript(
+			new FileSessionStorage(),
+			target.path,
+			evidence.locator,
+			authority.storageContext,
+			authority.inspectProtocol,
+		);
+		authority.assertOwned();
+		if (sharedAfterInheritance)
 			return { state: "pending", message: "task_artifact_owner_shared_with_sibling_transcript" };
 		const published = await authority.publishReceipt({
 			...managedGcReceiptTarget(receipt),
@@ -403,11 +408,25 @@ export async function managedGcOwnerProgressBeforeDelete(
 	tombstoneTargets: readonly ManagedGcOwnerCleanupTarget[],
 	artifactsRemoved: boolean,
 ): Promise<ManagedGcOwnerProgress> {
-	if (!target.taskArtifactOwnerDeletionEvidence) return { state: "none" };
+	const evidence = target.taskArtifactOwnerDeletionEvidence;
+	if (!evidence) return { state: "none" };
 	const receipt = await authority.readReceipt(target.path);
-	if (!receipt || !deepSame(receipt.taskArtifactOwnerDeletionEvidence, target.taskArtifactOwnerDeletionEvidence))
+	if (!receipt || !deepSame(receipt.taskArtifactOwnerDeletionEvidence, evidence))
 		throw new Error("task_artifact_owner_continuation_state_missing");
-	if (receipt.state === "prepared" && !artifactsRemoved) return { state: "none" };
+	if (receipt.state === "prepared" && !artifactsRemoved) {
+		authority.assertOwned();
+		const shared = await hasSiblingTaskArtifactOwnerTranscript(
+			new FileSessionStorage(),
+			target.path,
+			evidence.locator,
+			authority.storageContext,
+			authority.inspectProtocol,
+		);
+		authority.assertOwned();
+		return shared
+			? { state: "pending", message: "task_artifact_owner_shared_with_sibling_transcript" }
+			: { state: "none" };
+	}
 	return retireManagedGcOwnerAfterArtifacts(authority, target, tombstoneTargets);
 }
 

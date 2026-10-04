@@ -271,6 +271,10 @@ function filesystemSnapshot(root: string): unknown[] {
 	return entries;
 }
 
+function deleteVerified(fixture: Fixture, target: VerifiedSessionDeleteTarget) {
+	return fixture.storage.deleteSessionVerified(target, managedGcProtocolScopeInspectorForScope(fixture.scope));
+}
+
 function fieldsForOutcome(outcome: TaskArtifactOwnerRetirementOutcome) {
 	return {
 		taskArtifactOwnerRetirementOutcome: outcome,
@@ -337,6 +341,10 @@ describe("verified storage consumes task artifact owners", () => {
 			taskArtifactOwnerDeletionEvidence: fixture.evidence,
 		});
 		const inspect = managedGcProtocolScopeInspectorForScope(fixture.scope);
+		const nativeRemoval = recordActualOwnerRemoval();
+		const artifactPath = fixture.transcriptPath.slice(0, -".jsonl".length);
+		fs.mkdirSync(artifactPath, { mode: 0o700 });
+		fs.writeFileSync(path.join(artifactPath, "keep.bin"), "artifact", { mode: 0o600 });
 		const protocolPath = path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal");
 		const locksPath = path.join(protocolPath, "locks");
 		const malformedQuarantinePath = path.join(locksPath, `.gjc-lock-${crypto.randomUUID()}.stale`);
@@ -346,6 +354,10 @@ describe("verified storage consumes task artifact owners", () => {
 			`managed_gc_protocol_lock_quarantine_invalid [locks/${path.basename(malformedQuarantinePath)}]`,
 		);
 		expect(filesystemSnapshot(fixture.root)).toEqual(before);
+		const malformed = await fixture.storage.deleteSessionVerified(targetFor(fixture), inspect);
+		expect(malformed.kind).toBe("cleanup_pending");
+		expect(filesystemSnapshot(fixture.root)).toEqual(before);
+		expect(nativeRemoval.spy).not.toHaveBeenCalled();
 		fs.unlinkSync(malformedQuarantinePath);
 
 		const unknownPath = path.join(protocolPath, "unexpected-role");
@@ -353,6 +365,10 @@ describe("verified storage consumes task artifact owners", () => {
 		before = filesystemSnapshot(fixture.root);
 		await expect(inspect([protocolInputFor(fixture.scope)])).rejects.toThrow("managed_gc_protocol_roles_invalid");
 		expect(filesystemSnapshot(fixture.root)).toEqual(before);
+		const unknown = await fixture.storage.deleteSessionVerified(targetFor(fixture), inspect);
+		expect(unknown.kind).toBe("cleanup_pending");
+		expect(filesystemSnapshot(fixture.root)).toEqual(before);
+		expect(nativeRemoval.spy).not.toHaveBeenCalled();
 		fs.rmdirSync(unknownPath);
 
 		const savedLocksPath = path.join(protocolPath, "locks.saved");
@@ -361,6 +377,10 @@ describe("verified storage consumes task artifact owners", () => {
 		before = filesystemSnapshot(fixture.root);
 		await expect(inspect([protocolInputFor(fixture.scope)])).rejects.toThrow();
 		expect(filesystemSnapshot(fixture.root)).toEqual(before);
+		const symlinked = await fixture.storage.deleteSessionVerified(targetFor(fixture), inspect);
+		expect(symlinked.kind).toBe("cleanup_pending");
+		expect(filesystemSnapshot(fixture.root)).toEqual(before);
+		expect(nativeRemoval.spy).not.toHaveBeenCalled();
 		fs.unlinkSync(locksPath);
 		fs.renameSync(savedLocksPath, locksPath);
 
@@ -373,22 +393,66 @@ describe("verified storage consumes task artifact owners", () => {
 		before = filesystemSnapshot(fixture.root);
 		await expect(inspect([staleInput])).rejects.toThrow("managed_gc_protocol_roles_invalid");
 		expect(filesystemSnapshot(fixture.root)).toEqual(before);
+		const replaced = await fixture.storage.deleteSessionVerified(targetFor(fixture), inspect);
+		expect(replaced.kind).toBe("cleanup_pending");
+		expect(filesystemSnapshot(fixture.root)).toEqual(before);
+		expect(nativeRemoval.spy).not.toHaveBeenCalled();
 
 		const foreign = await makeFixture();
-		const foreignInspect = managedGcProtocolScopeInspectorForScope(fixture.scope);
+		const foreignInspect = managedGcProtocolScopeInspectorForScope(foreign.scope);
 		const sourceBefore = filesystemSnapshot(fixture.root);
 		const foreignBefore = filesystemSnapshot(foreign.root);
-		await expect(foreignInspect([protocolInputFor(foreign.scope)])).rejects.toThrow(
-			"managed_gc_protocol_scope_path_mismatch",
-		);
+		const foreignTarget = await fixture.storage.deleteSessionVerified(targetFor(fixture), foreignInspect);
+		expect(foreignTarget.kind).toBe("cleanup_pending");
 		expect(filesystemSnapshot(fixture.root)).toEqual(sourceBefore);
 		expect(filesystemSnapshot(foreign.root)).toEqual(foreignBefore);
+		expect(nativeRemoval.spy).not.toHaveBeenCalled();
 	});
 
-	it("retires a valid owner with the actual native outcome and returns the full replay evidence", async () => {
+	it("keeps direct owner retirement available without a protocol subtree or inspector", async () => {
 		const fixture = await makeFixture();
+		fs.rmSync(path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal"), {
+			recursive: true,
+			force: false,
+		});
 		const nativeRemoval = recordActualOwnerRemoval();
-		const artifactPhase = await fixture.storage.deleteSessionVerified(targetFor(fixture));
+		const result = await fixture.storage.deleteSessionVerified(targetFor(fixture));
+		expect(["artifacts_removed", "cleanup_pending"]).toContain(result.kind);
+		expect(nativeRemoval.spy).toHaveBeenCalled();
+	});
+
+	it("refuses protocol-bearing direct owner retirement without a Scope inspector before mutation", async () => {
+		const fixture = await makeFixture();
+		const gcTarget = bindManagedGcSessionRetirementTarget(fixture.scope, fixture.transcriptPath);
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, {
+			...gcTarget,
+			state: "prepared",
+			taskArtifactOwnerDeletionEvidence: fixture.evidence,
+		});
+		const artifactPath = fixture.transcriptPath.slice(0, -".jsonl".length);
+		fs.mkdirSync(artifactPath, { mode: 0o700 });
+		fs.writeFileSync(path.join(artifactPath, "keep.bin"), "artifact", { mode: 0o600 });
+		const nativeRemoval = recordActualOwnerRemoval();
+		const before = filesystemSnapshot(fixture.root);
+		const result = await fixture.storage.deleteSessionVerified(targetFor(fixture));
+		expect(result.kind).toBe("cleanup_pending");
+		expect(result.kind === "cleanup_pending" ? result.phase : undefined).toBe("task_artifact_owner");
+		expect(filesystemSnapshot(fixture.root)).toEqual(before);
+		expect(nativeRemoval.spy).not.toHaveBeenCalled();
+		expect(fs.readFileSync(fixture.ownerPayloadPath, "utf8")).toBe("owner-payload");
+		expect(fs.readFileSync(fixture.transcriptPath).byteLength).toBeGreaterThan(0);
+	});
+
+	it("retires a valid prepared-GC owner with the actual native outcome and replay evidence", async () => {
+		const fixture = await makeFixture();
+		const gcTarget = bindManagedGcSessionRetirementTarget(fixture.scope, fixture.transcriptPath);
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, {
+			...gcTarget,
+			state: "prepared",
+			taskArtifactOwnerDeletionEvidence: fixture.evidence,
+		});
+		const nativeRemoval = recordActualOwnerRemoval();
+		const artifactPhase = await deleteVerified(fixture, targetFor(fixture));
 		if (artifactPhase.kind === "cleanup_pending") {
 			expect(artifactPhase.phase).toBe("task_artifact_owner");
 			expect(artifactPhase.taskArtifactOwnerRetired).toBeUndefined();
@@ -417,9 +481,7 @@ describe("verified storage consumes task artifact owners", () => {
 				? { taskArtifactOwnerNamespaceRetained: true as const }
 				: {}),
 		};
-		const deleted = await fixture.storage.deleteSessionVerified(
-			targetFor(fixture, { ...ownerFields, artifactsRemoved: true }),
-		);
+		const deleted = await deleteVerified(fixture, targetFor(fixture, { ...ownerFields, artifactsRemoved: true }));
 		expect(deleted.kind).toBe("deleted");
 		expect(deleted.taskArtifactOwnerDeletionEvidence).toEqual(fixture.evidence);
 		expect(deleted.taskArtifactOwnerRetirementOutcome).toEqual(artifactPhase.taskArtifactOwnerRetirementOutcome);
@@ -436,7 +498,7 @@ describe("verified storage consumes task artifact owners", () => {
 			`${JSON.stringify({ type: "session", id: fixture.sessionId, cwd: fixture.cwd, version: 4 })}\n${patch}`,
 			{ mode: 0o600 },
 		);
-		const result = await fixture.storage.deleteSessionVerified(targetFor(fixture));
+		const result = await deleteVerified(fixture, targetFor(fixture));
 		expect(["artifacts_removed", "cleanup_pending"]).toContain(result.kind);
 		expect(result.taskArtifactOwnerDeletionEvidence).toEqual(fixture.evidence);
 		expect(result.taskArtifactOwnerRetirementOutcome).toBeDefined();
@@ -601,7 +663,7 @@ describe("verified storage consumes task artifact owners", () => {
 		const siblingPath = path.join(siblingScope.directoryPath, `${siblingId}.jsonl`);
 		writeTranscript(siblingPath, siblingId, siblingCwd, fixture.locator);
 
-		const before = await fixture.storage.deleteSessionVerified(targetFor(fixture));
+		const before = await deleteVerified(fixture, targetFor(fixture));
 		expect(before.kind).toBe("cleanup_pending");
 		if (before.kind !== "cleanup_pending") throw new Error("sibling_guard_did_not_block");
 		expect(before.phase).toBe("task_artifact_owner");
@@ -627,7 +689,7 @@ describe("verified storage consumes task artifact owners", () => {
 		}
 		const stagedId = `staged-${crypto.randomUUID()}`;
 		writeTranscript(stagingPath!, stagedId, siblingCwd, fixture.locator);
-		const staged = await fixture.storage.deleteSessionVerified(targetFor(fixture));
+		const staged = await deleteVerified(fixture, targetFor(fixture));
 		expect(staged.kind).toBe("cleanup_pending");
 		expect(fs.readFileSync(stagingPath!).byteLength).toBeGreaterThan(0);
 		expect(fs.readFileSync(fixture.ownerPayloadPath, "utf8")).toBe("owner-payload");
@@ -642,7 +704,7 @@ describe("verified storage consumes task artifact owners", () => {
 		if (process.platform !== "win32") {
 			fs.chmodSync(foreignScope.directoryPath, 0o777);
 			const foreignMode = fs.statSync(foreignScope.directoryPath).mode & 0o777;
-			const result = await fixture.storage.deleteSessionVerified(targetFor(fixture));
+			const result = await deleteVerified(fixture, targetFor(fixture));
 			expect(result.kind).toBe("cleanup_pending");
 			expect(fs.statSync(foreignScope.directoryPath).mode & 0o777).toBe(foreignMode);
 			expect(fs.lstatSync(foreignScope.directoryPath, { bigint: true }).ino).toBe(foreignStat.ino);
@@ -670,7 +732,7 @@ describe("verified storage consumes task artifact owners", () => {
 			}
 			return snapshot;
 		});
-		const result = await fixture.storage.deleteSessionVerified(targetFor(fixture));
+		const result = await deleteVerified(fixture, targetFor(fixture));
 		expect(replaced).toBe(true);
 		expect(result.kind).toBe("cleanup_pending");
 		expect(fs.readFileSync(siblingPath)).toEqual(siblingBytes);

@@ -16,6 +16,7 @@ function nativeSessionStorage(): typeof import("@gajae-code/natives") {
 }
 
 import { isEnoent, pathIsWithin, peekFile, toError } from "@gajae-code/utils";
+import type { ManagedGcProtocolScopeInspector } from "./internal/managed-session-scope";
 import {
 	assertManagedDirectoryRoot,
 	type ManagedDirectoryRoot,
@@ -2348,7 +2349,10 @@ export class FileSessionStorage implements SessionStorage {
 	 * revalidate, transcript last. Partial deletion returns typed cleanup_pending
 	 * evidence; identity/symlink/containment/header/cwd mismatch throws.
 	 */
-	async deleteSessionVerified(target: VerifiedSessionDeleteTarget): Promise<VerifiedSessionDeleteResult> {
+	async deleteSessionVerified(
+		target: VerifiedSessionDeleteTarget,
+		inspectProtocol?: ManagedGcProtocolScopeInspector,
+	): Promise<VerifiedSessionDeleteResult> {
 		const {
 			sessionsRoot,
 			transcriptPath,
@@ -2601,23 +2605,39 @@ export class FileSessionStorage implements SessionStorage {
 		let ownerPayloadRetired = ownerPayloadRetiredValue === true;
 		let ownerNamespaceRetained = ownerNamespaceRetainedValue === true;
 		let ownerTranscriptDeleted = ownerTranscriptDeletedValue === true;
-		const retireOwnerIfRequired = (): Error | undefined => {
+		const ownerSiblingRefusal = async (): Promise<Error | undefined> => {
 			if (deferTaskArtifactOwnerRetirement || ownerRetired || !ownerEvidence) return undefined;
 			if (!taskArtifactOwnerStorageContext)
 				return new SessionDeleteVerificationError("artifacts", "task_artifact_owner_context_missing");
 			try {
 				if (
-					hasSiblingTaskArtifactOwnerTranscript(
+					await hasSiblingTaskArtifactOwnerTranscript(
 						this,
 						transcriptPath,
 						ownerEvidence.locator,
 						taskArtifactOwnerStorageContext,
+						inspectProtocol,
 					)
 				)
 					return new SessionDeleteVerificationError(
 						"artifacts",
 						"task_artifact_owner_shared_with_sibling_transcript",
 					);
+				return undefined;
+			} catch (error) {
+				return new SessionDeleteVerificationError(
+					"artifacts",
+					`task_artifact_owner_cleanup_failed:${toError(error).message}`,
+					{ cause: toError(error) },
+				);
+			}
+		};
+		const retireOwnerIfRequired = async (): Promise<Error | undefined> => {
+			const refusal = await ownerSiblingRefusal();
+			if (refusal) return refusal;
+			if (deferTaskArtifactOwnerRetirement || ownerRetired || !ownerEvidence || !taskArtifactOwnerStorageContext)
+				return undefined;
+			try {
 				ownerOutcome = withTaskArtifactOwnerFailure(() =>
 					retireTaskArtifactOwner(taskArtifactOwnerStorageContext, ownerEvidence!, ownerContinuation),
 				);
@@ -2662,8 +2682,8 @@ export class FileSessionStorage implements SessionStorage {
 			taskArtifactOwnerDeletionEvidence: ownerEvidence!,
 			...ownerResultFields(),
 		});
-		const finishArtifactPhase = (): VerifiedSessionDeleteResult => {
-			const ownerError = retireOwnerIfRequired();
+		const finishArtifactPhase = async (): Promise<VerifiedSessionDeleteResult> => {
+			const ownerError = await retireOwnerIfRequired();
 			if (ownerError && ownerEvidence) return ownerCleanupPending(ownerError);
 			if (ownerTranscriptDeleted) return { kind: "deleted", ...ownerResultFields() };
 			return {
@@ -2673,6 +2693,8 @@ export class FileSessionStorage implements SessionStorage {
 				...ownerResultFields(),
 			};
 		};
+		const ownerPreflightError = await ownerSiblingRefusal();
+		if (ownerPreflightError && ownerEvidence) return ownerCleanupPending(ownerPreflightError);
 		if (detachedArtifactsPath && !artifactsRemoved) {
 			if (
 				!expectedArtifactsIdentity ||
@@ -2748,7 +2770,7 @@ export class FileSessionStorage implements SessionStorage {
 					...ownerResultFields(),
 				};
 			}
-			return finishArtifactPhase();
+			return await finishArtifactPhase();
 		}
 		if (transcriptIdentity.nlink === undefined || transcriptIdentity.nlink !== 1n)
 			throw new SessionDeleteVerificationError(
@@ -2809,7 +2831,7 @@ export class FileSessionStorage implements SessionStorage {
 					"artifacts",
 					"Authorized artifact removal root remains after restart",
 				);
-			return finishArtifactPhase();
+			return await finishArtifactPhase();
 		}
 
 		if (artifactsIdentity && !artifactsRemoved) {
@@ -2979,7 +3001,7 @@ export class FileSessionStorage implements SessionStorage {
 					if (descriptor !== undefined) fs.closeSync(descriptor);
 				}
 			}
-			return finishArtifactPhase();
+			return await finishArtifactPhase();
 		}
 		if (deferTaskArtifactOwnerRetirement && ownerEvidence && !ownerRetired && !ownerPayloadRetired) {
 			return {
@@ -2989,7 +3011,7 @@ export class FileSessionStorage implements SessionStorage {
 				...ownerResultFields(),
 			};
 		}
-		const ownerError = retireOwnerIfRequired();
+		const ownerError = await retireOwnerIfRequired();
 		if (ownerError && ownerEvidence) return ownerCleanupPending(ownerError);
 		if (ownerTranscriptDeleted) return { kind: "deleted", ...ownerResultFields() };
 		if (hasDetachedTranscript) {

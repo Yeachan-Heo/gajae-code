@@ -44,6 +44,9 @@ import {
 	GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV,
 } from "../../gjc-runtime/session-state-sidecar";
 import {
+	type ManagedGcProtocolScopeInspector,
+	type ManagedScope,
+	managedGcProtocolScopeInspectorForScope,
 	resolveManagedGcScopeForRead,
 	taskArtifactOwnerStorageContextForScope,
 } from "../../session/internal/managed-session-scope";
@@ -995,7 +998,7 @@ function brokerTaskArtifactOwnerCleanupFields(cleanup: CleanupEvidence): unknown
 	return fields;
 }
 
-function managedOwnerContextFromInventory(scope: ManagedSessionScope): TaskArtifactOwnerStorageContext {
+function managedOwnerScopeFromInventory(scope: ManagedSessionScope): ManagedScope {
 	const resolved = resolveManagedGcScopeForRead({
 		cwd: scope.legacyLexicalCwd,
 		agentDir: scope.agentDir,
@@ -1014,7 +1017,7 @@ function managedOwnerContextFromInventory(scope: ManagedSessionScope): TaskArtif
 		resolved.scope.directoryPath !== scope.directoryPath
 	)
 		throw new Error("managed_task_artifact_owner_scope_changed");
-	return taskArtifactOwnerStorageContextForScope(resolved.scope);
+	return resolved.scope;
 }
 
 function taskArtifactOwnerTranscriptMatches(
@@ -6013,6 +6016,7 @@ type ValidatedDelete = {
 	metadataRoot: string;
 	transcriptParentIdentity: { dev: string; ino: string };
 	taskArtifactOwnerCaptureError?: string;
+	inspectProtocol?: ManagedGcProtocolScopeInspector;
 };
 function cleanupIdentity(
 	identity: BrokerCleanupEvidence["transcriptIdentity"],
@@ -6307,8 +6311,10 @@ async function validateDeletePath(
 		)
 			return fail("terminal_uncertain", "Cleanup receipt does not match the current managed session authority.");
 		let ownerContext: TaskArtifactOwnerStorageContext;
+		let ownerScope: ManagedScope;
 		try {
-			ownerContext = managedOwnerContextFromInventory(inventory.scope);
+			ownerScope = managedOwnerScopeFromInventory(inventory.scope);
+			ownerContext = taskArtifactOwnerStorageContextForScope(ownerScope);
 		} catch {
 			return fail(
 				"terminal_uncertain",
@@ -6342,6 +6348,7 @@ async function validateDeletePath(
 		}
 		return {
 			...replay,
+			inspectProtocol: managedGcProtocolScopeInspectorForScope(ownerScope),
 			...(owner.cleanupDiagnostic && !owner.deletionEvidence
 				? { taskArtifactOwnerCaptureError: owner.cleanupDiagnostic }
 				: {}),
@@ -6358,8 +6365,10 @@ async function validateDeletePath(
 	if (inventory.migrationPolicy === "disabled" && match.provenance === "legacy")
 		return fail("legacy_migration_disabled", "Saved legacy session migration is disabled for this workspace.");
 	let ownerContext: TaskArtifactOwnerStorageContext;
+	let ownerScope: ManagedScope;
 	try {
-		ownerContext = managedOwnerContextFromInventory(inventory.scope);
+		ownerScope = managedOwnerScopeFromInventory(inventory.scope);
+		ownerContext = taskArtifactOwnerStorageContextForScope(ownerScope);
 	} catch {
 		return fail("invalid_input", "Managed task-artifact-owner authority could not be established for deletion.");
 	}
@@ -6417,6 +6426,7 @@ async function validateDeletePath(
 		storage,
 		target,
 		metadataRoot: canonicalRequestedRoot,
+		inspectProtocol: managedGcProtocolScopeInspectorForScope(ownerScope),
 		transcriptParentIdentity: {
 			dev: transcriptParentStat.dev.toString(),
 			ino: transcriptParentStat.ino.toString(),
@@ -7797,11 +7807,12 @@ async function executeLifecycleResponse(
 			let outcome: TaskArtifactOwnerRetirementOutcome;
 			try {
 				if (
-					hasSiblingTaskArtifactOwnerTranscript(
+					await hasSiblingTaskArtifactOwnerTranscript(
 						validated.storage,
 						cleanupTarget.transcriptPath,
 						evidence.locator,
 						ownerContext,
+						validated.inspectProtocol,
 					)
 				)
 					return await publishTaskArtifactOwnerPending(
@@ -8094,7 +8105,10 @@ async function executeLifecycleResponse(
 						"Saved session cleanup is pending because transcript parent identity changed before exact mutation.",
 						preauthorizedCleanup,
 					);
-				deleted = await validated.storage.deleteSessionVerified({ ...cleanupTarget, ...storageOwnerFields() });
+				deleted = await validated.storage.deleteSessionVerified(
+					{ ...cleanupTarget, ...storageOwnerFields() },
+					validated.inspectProtocol,
+				);
 			}
 		} catch (error) {
 			if (error instanceof Error && error.message.startsWith("task_artifact_owner_"))
@@ -8227,13 +8241,16 @@ async function executeLifecycleResponse(
 					transcriptPhaseCleanup,
 				);
 			try {
-				deleted = await validated.storage.deleteSessionVerified({
-					...cleanupTarget,
-					...storageOwnerFields(),
-					expectedArtifactsIdentity: undefined,
-					detachedArtifactsPath: undefined,
-					artifactsRemoved: true,
-				});
+				deleted = await validated.storage.deleteSessionVerified(
+					{
+						...cleanupTarget,
+						...storageOwnerFields(),
+						expectedArtifactsIdentity: undefined,
+						detachedArtifactsPath: undefined,
+						artifactsRemoved: true,
+					},
+					validated.inspectProtocol,
+				);
 			} catch (error) {
 				if (error instanceof Error && error.message.startsWith("task_artifact_owner_"))
 					return await publishTaskArtifactOwnerPending(error, transcriptPhaseCleanup);

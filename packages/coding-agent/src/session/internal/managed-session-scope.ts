@@ -481,7 +481,10 @@ async function deleteSessionVerifiedWithFence(
 	const ownerFields = await managedGcOwnerDeleteFields(scope, retiredTarget, lock);
 	lock.assertOwned();
 	verifyAuthority?.();
-	return new FileSessionStorage().deleteSessionVerified({ ...target, ...ownerFields });
+	return new FileSessionStorage().deleteSessionVerified(
+		{ ...target, ...ownerFields },
+		managedGcProtocolInspectorForLock(scope, lock),
+	);
 }
 
 type NativeIdentity =
@@ -2350,12 +2353,28 @@ export function taskArtifactOwnerStorageContextForScope(scope: ManagedScope): Ta
 	return managedGcTrustedScope(scope).ownerContext;
 }
 
+function managedGcProtocolInspectorForLock(
+	scope: ManagedScope,
+	lock: ManagedStorageLock,
+): ManagedGcProtocolScopeInspector {
+	const inspect = managedGcProtocolScopeInspectorForScope(scope);
+	return async inputs => {
+		lock.assertOwned();
+		managedGcTrustedScope(scope);
+		const snapshots = await inspect(inputs);
+		lock.assertOwned();
+		managedGcTrustedScope(scope);
+		return snapshots;
+	};
+}
+
 function managedGcOwnerCleanupAuthority(scope: ManagedScope, lock: ManagedStorageLock): ManagedGcOwnerCleanupAuthority {
 	return {
 		agentDir: scope.agentDir,
 		sessionsRoot: scope.sessionsRoot,
 		directoryPath: scope.directoryPath,
 		storageContext: taskArtifactOwnerStorageContextForScope(scope),
+		inspectProtocol: managedGcProtocolInspectorForLock(scope, lock),
 		assertOwned: () => lock.assertOwned(),
 		bindTarget: transcriptPath => bindManagedGcSessionRetirementTarget(scope, transcriptPath),
 		readReceipt: async transcriptPath => {
