@@ -372,80 +372,6 @@ function isGuardedChangelog(file: string): boolean {
 function isFragmentPath(file: string): boolean {
 	return FRAGMENT_PATH.test(file);
 }
-/** The package CHANGELOG a `packages/<pkg>/changelog.d/<slug>.md` fragment folds into. */
-export function changelogForFragment(file: string): string | undefined {
-	const match = /^(packages\/[^/]+)\/changelog\.d\/[^/]+$/.exec(file);
-	return match?.[1] === undefined ? undefined : `${match[1]}/CHANGELOG.md`;
-}
-
-/**
- * A fragment's note lines: every non-blank line except the `### <Section>` headings,
- * trimmed. `foldFragmentsIntoChangelog` copies exactly these lines under the matching
- * section, so finding them in the CHANGELOG proves the note shipped.
- */
-export function fragmentNoteLines(fragmentText: string): string[] {
-	return fragmentText
-		.split("\n")
-		.map(line => line.trim())
-		.filter(line => line.length > 0 && !ANY_HEADING.test(line));
-}
-
-/**
- * A CHANGELOG's version sections keyed by their `[x.y.z]` identifier, each mapped to the
- * body lines beneath it. The identifier — not the heading text — is what a release cut
- * introduces; a date can move without a new release, and the release fold always puts the
- * notes it consumes inside the section it just cut.
- */
-export function versionSections(content: string): Map<string, string[]> {
-	const sections = new Map<string, string[]>();
-	let body: string[] | undefined;
-	for (const raw of content.split("\n")) {
-		const line = raw.trim();
-		// Trim the captured identifier: `## [ 1.0.0 ]` must key as `1.0.0`, or padding a
-		// heading would forge a section the base "did not have" while the history guard —
-		// which trims — still sees the same released version and reports no removal.
-		const identifier = /^## \[([^\]]+)\]/u.exec(line)?.[1]?.trim();
-		if (identifier !== undefined && identifier.length > 0) {
-			body = [];
-			sections.set(identifier, body);
-		} else if (/^## [^#]/u.test(line)) {
-			body = undefined;
-		} else if (body !== undefined) {
-			body.push(line);
-		}
-	}
-	return sections;
-}
-
-/**
- * True when this PR's own change shipped the deleted fragment's note, i.e. when the change
- * looks exactly like the release flow's fold: the note lines are new to the head CHANGELOG
- * and they sit inside a version section the head cut open, which the base did not have.
- *
- * Provenance matters more than content. Content alone would exempt a PR that deletes an
- * unreleased note whose bullet text repeats an older release line; content plus "some new
- * heading appeared" would exempt a PR that only moves a date or adds an empty section while
- * parking the note under an existing heading. Requiring the note to be *inside* a newly cut
- * section rejects both. An unreadable fragment or CHANGELOG fails closed.
- */
-export function isConsumedFragmentNote(
-	fragmentText: string | undefined,
-	baseChangelog: string | undefined,
-	headChangelog: string | undefined,
-): boolean {
-	if (fragmentText === undefined || baseChangelog === undefined || headChangelog === undefined) return false;
-	const noteLines = fragmentNoteLines(fragmentText);
-	if (noteLines.length === 0) return false;
-	const shipped = new Set(headChangelog.split("\n").map(line => line.trim()));
-	if (!noteLines.every(line => shipped.has(line))) return false;
-	const alreadyShipped = new Set(baseChangelog.split("\n").map(line => line.trim()));
-	if (!noteLines.every(line => !alreadyShipped.has(line))) return false;
-	const baseIdentifiers = new Set(versionSections(baseChangelog).keys());
-	const cutBodies = [...versionSections(headChangelog)]
-		.filter(([identifier]) => !baseIdentifiers.has(identifier))
-		.map(([, body]) => body);
-	return noteLines.every(line => cutBodies.some(body => body.includes(line)));
-}
 
 async function gitShow(revision: string, file: string): Promise<string | undefined> {
 	const result = await $`git show ${`${revision}:${file}`}`.quiet().nothrow();
@@ -513,15 +439,6 @@ export async function collectPullRequestFragmentViolations(
 		if (violation) errors.push(violation);
 	}
 	for (const file of (await gitDiffPaths(base, head, "D")).filter(isFragmentPath)) {
-		const changelog = changelogForFragment(file);
-		const [before, baseChangelog, headChangelog] = await Promise.all([
-			gitShow(base, file),
-			changelog === undefined ? Promise.resolve(undefined) : gitShow(base, changelog),
-			changelog === undefined ? Promise.resolve(undefined) : gitShow(head, changelog),
-		]);
-		// A backmerge legitimately applies the release flow's own fragment consumption:
-		// this change folded the note into the head CHANGELOG, so deleting it drops nothing.
-		if (isConsumedFragmentNote(before, baseChangelog, headChangelog)) continue;
 		errors.push({ file, message: "is deleted by this pull request. Only the release flow folds and consumes fragments (scripts/release.ts); deleting one here drops an unreleased note without shipping it." });
 	}
 	const collected = await collectPackageFragments();
