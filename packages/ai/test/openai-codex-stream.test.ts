@@ -332,6 +332,47 @@ function createTimedCodexSse(
 	return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
 }
 
+function createSocketCloseCodexSse(signal: AbortSignal | undefined, events: Record<string, unknown>[]): Response {
+	const encoder = new TextEncoder();
+	let stopped = false;
+	let abortListener: (() => void) | undefined;
+	const stream = new ReadableStream<Uint8Array>({
+		start(controller) {
+			abortListener = () => {
+				stopped = true;
+				controller.error(signal?.reason ?? new DOMException("request aborted", "AbortError"));
+			};
+			if (signal?.aborted) {
+				abortListener();
+				return;
+			}
+			signal?.addEventListener("abort", abortListener, { once: true });
+			void (async () => {
+				for (const event of events) {
+					await Bun.sleep(1);
+					if (stopped) return;
+					controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+				}
+				if (stopped) return;
+				const error = Object.assign(
+					new Error(
+						"The socket connection was closed unexpectedly (transport=ECONNRESET url=https://chatgpt.com/backend-api/codex/responses)",
+					),
+					{ code: "ECONNRESET" },
+				);
+				controller.error(error);
+			})().catch(error => {
+				if (!stopped) controller.error(error);
+			});
+		},
+		cancel() {
+			stopped = true;
+			if (abortListener) signal?.removeEventListener("abort", abortListener);
+		},
+	});
+	return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+}
+
 function encodeWebSocketMessage(value: Record<string, unknown>): Uint8Array {
 	return new TextEncoder().encode(JSON.stringify(value));
 }
@@ -693,6 +734,117 @@ describe("openai-codex streaming", () => {
 		expect(result.content).toEqual([
 			{ type: "toolCall", id: "call_2|fc_2", name: "todo_write", arguments: { ops: [] } },
 		]);
+	});
+
+	it("replays an incomplete tool call after an ECONNRESET socket close", async () => {
+		const partial = [
+			{ type: "response.output_item.added", item: { type: "reasoning", id: "rs_socket", content: [], summary: [] } },
+			{
+				type: "response.output_item.added",
+				item: { type: "function_call", id: "fc_socket", call_id: "call_socket", name: "todo_write", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_socket", delta: '{"ops":' },
+		];
+		const complete = createCodexErrorSse([
+			{
+				type: "response.output_item.added",
+				item: {
+					type: "function_call",
+					id: "fc_socket_2",
+					call_id: "call_socket_2",
+					name: "todo_write",
+					arguments: "",
+				},
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_socket_2", delta: '{"ops":[]}' },
+			{
+				type: "response.output_item.done",
+				item: {
+					type: "function_call",
+					id: "fc_socket_2",
+					call_id: "call_socket_2",
+					name: "todo_write",
+					arguments: '{"ops":[]}',
+				},
+			},
+			{ type: "response.completed", response: { status: "completed", usage: DEFAULT_USAGE } },
+		]);
+		let requestCount = 0;
+		global.fetch = vi.fn(async (_input, init) => {
+			requestCount += 1;
+			if (requestCount === 1) return createSocketCloseCodexSse(getRequestSignal(_input, init), partial);
+			return new Response(complete, { status: 200, headers: { "content-type": "text/event-stream" } });
+		}) as unknown as typeof fetch;
+
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken() },
+		).result();
+
+		expect(requestCount).toBe(2);
+		expect(result.stopReason).toBe("toolUse");
+		expect(result.content).toEqual([
+			{ type: "toolCall", id: "call_socket_2|fc_socket_2", name: "todo_write", arguments: { ops: [] } },
+		]);
+	});
+
+	it("does not replay an ECONNRESET socket close after visible text", async () => {
+		const partial = [
+			{
+				type: "response.output_item.added",
+				item: { type: "message", id: "msg_socket", role: "assistant", content: [] },
+			},
+			{ type: "response.content_part.added", part: { type: "output_text", text: "" } },
+			{ type: "response.output_text.delta", delta: "Already emitted" },
+			{
+				type: "response.output_item.added",
+				item: { type: "function_call", id: "fc_socket", call_id: "call_socket", name: "todo_write", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_socket", delta: '{"ops":' },
+		];
+		const fetchMock = vi.fn(async (_input, init) =>
+			createSocketCloseCodexSse(getRequestSignal(_input, init), partial),
+		);
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken() },
+		).result();
+
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(result.stopReason).toBe("error");
+	});
+
+	it.each([
+		{ label: "provider retries disabled", options: { disableProviderRetries: true } },
+		{ label: "a second socket close", options: {} },
+	])("does not replay an ECONNRESET socket close when $label", async ({ options }) => {
+		const partial = [
+			{ type: "response.output_item.added", item: { type: "reasoning", id: "rs_socket", content: [], summary: [] } },
+			{
+				type: "response.output_item.added",
+				item: { type: "function_call", id: "fc_socket", call_id: "call_socket", name: "todo_write", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_socket", delta: '{"ops":' },
+		];
+		let requestCount = 0;
+		const fetchMock = vi.fn(async (_input, init) => {
+			requestCount += 1;
+			return createSocketCloseCodexSse(getRequestSignal(_input, init), partial);
+		});
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken(), ...options },
+		).result();
+
+		expect(requestCount).toBe(options.disableProviderRetries ? 1 : 2);
+		expect(result.stopReason).toBe("error");
 	});
 
 	it.each([
