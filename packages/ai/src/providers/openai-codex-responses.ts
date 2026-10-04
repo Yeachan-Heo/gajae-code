@@ -484,6 +484,7 @@ interface CodexStreamRuntime {
 	nativeOutputItemOutputIndexes: Array<number | undefined>;
 	websocketStreamRetries: number;
 	providerRetryAttempt: number;
+	partialToolCallReplayAttempted: boolean;
 	toolChoiceFallbackAttempted: boolean;
 	/**
 	 * Stale-anchor recovery is one-shot. Once the anchor is cleared the replay no
@@ -1250,6 +1251,7 @@ function createCodexStreamRuntime(initial: {
 		nativeOutputItemOutputIndexes: [],
 		websocketStreamRetries: 0,
 		providerRetryAttempt: 0,
+		partialToolCallReplayAttempted: false,
 		toolChoiceFallbackAttempted: initial.toolChoiceFallbackApplied === true,
 		previousResponseRecoveryAttempted: false,
 		sentPreviousResponseId: initial.sentPreviousResponseId === true,
@@ -2547,9 +2549,19 @@ async function tryRetryCodexProviderError(
 	runtime: CodexStreamRuntime,
 	error: unknown,
 ): Promise<boolean> {
+	const canReplayPartialToolCall =
+		isCodexTransientStreamClose(error) &&
+		runtime.finalizedToolCallIds.size === 0 &&
+		!runtime.partialToolCallReplayAttempted &&
+		context.output.content.every(
+			block =>
+				block.type === "thinking" ||
+				(block.type === "toolCall" && !runtime.finalizedToolCallIds.has(block.id)) ||
+				(block.type === "text" && block.text.length === 0),
+		);
 	if (
 		!isRetryableCodexProviderError(error) ||
-		context.output.content.length > 0 ||
+		(context.output.content.length > 0 && !canReplayPartialToolCall) ||
 		runtime.providerRetryAttempt >= resolveRetryBudget(context.options?.streamMaxRetries, CODEX_MAX_RETRIES) ||
 		context.options?.signal?.aborted ||
 		context.options?.fallbackManaged ||
@@ -2559,6 +2571,7 @@ async function tryRetryCodexProviderError(
 	}
 
 	runtime.providerRetryAttempt += 1;
+	if (canReplayPartialToolCall) runtime.partialToolCallReplayAttempted = true;
 	const websocketState = context.requestContext.websocketState;
 	if (runtime.transport === "websocket" && websocketState) {
 		resetCodexWebSocketAppendState(websocketState);
@@ -3859,6 +3872,14 @@ function isRetryableCodexFailureEvent(rawEvent: Record<string, unknown>): boolea
 		return false;
 	}
 	if (code && CODEX_RETRYABLE_EVENT_CODES.has(code)) {
+		return true;
+	}
+	if (
+		(code === "request_timeout" || message.toLowerCase().includes("request_timeout")) &&
+		(message.toLowerCase().includes("stream disconnected before completion") ||
+			message.toLowerCase().includes("stream closed before response.completed") ||
+			message.toLowerCase().includes("websocket closed before response completion"))
+	) {
 		return true;
 	}
 	return !!message && CODEX_RETRYABLE_EVENT_MESSAGE.test(message);
