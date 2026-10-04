@@ -3625,10 +3625,22 @@ test("ACP settles an acknowledged cancel as cancelled when a stopped terminal ar
 	const fixture = await createFixture({ cancelSettlementGraceMs: 1_000 });
 	try {
 		const pending = prompt(fixture, "cancel with terminal");
+		let settled = false;
+		void pending.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
 		await bounded(fixture.promptDelivered, "prompt delivery");
 		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel acknowledgement");
+		await Bun.sleep(0);
+		expect(settled).toBe(false);
 		fixture.sendStopped("refusal");
 		expect(await bounded(pending, "terminal settlement")).toEqual({ stopReason: "cancelled" });
+		expect(settled).toBe(true);
 	} finally {
 		fixture.dispose();
 	}
