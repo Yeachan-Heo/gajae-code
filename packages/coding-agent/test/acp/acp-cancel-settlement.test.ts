@@ -3300,3 +3300,20 @@ test("successful remote session retirement releases an unresolved abort owner", 
 		fixture.dispose();
 	}
 });
+
+test("cancel 100ms after background prompt start settles cancelled and follow-up end_turn", async () => {
+	const fixture = await createFixture({ cancelSettlementGraceMs: 25 });
+	try {
+		const background = prompt(fixture, "sleep 5000");
+		await bounded(fixture.promptDelivered, "background prompt delivery");
+		await Bun.sleep(100);
+		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "background cancel acknowledgement");
+		expect(await bounded(background, "background cancelled settlement")).toEqual({ stopReason: "cancelled" });
+		const followUp = prompt(fixture, "follow-up");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "follow-up prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(followUp, "follow-up completion")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.dispose();
+	}
+});
