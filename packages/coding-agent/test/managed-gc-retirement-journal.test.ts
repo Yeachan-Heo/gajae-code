@@ -273,6 +273,8 @@ describe("independent authenticated protocol inventories", () => {
 			context.rootAuthority,
 			context.securityPolicy,
 		);
+		const open = spyOn(native, "openRecoveryFsRoot");
+		const retain = spyOn(native.RecoveryFsRoot.prototype, "retainManagedDirectory");
 		try {
 			const inspect = managedGcProtocolInspectorForLock(fixture.scope, lock);
 			const before = protocolFilesystemSnapshot(fixture.temporaryRoot);
@@ -289,7 +291,11 @@ describe("independent authenticated protocol inventories", () => {
 					?.files.some(value => value.name.endsWith(".lock")),
 			).toBe(true);
 			expect(protocolFilesystemSnapshot(fixture.temporaryRoot)).toEqual(before);
+			expect(open).not.toHaveBeenCalled();
+			expect(retain).not.toHaveBeenCalled();
 		} finally {
+			open.mockRestore();
+			retain.mockRestore();
 			await lock.release();
 		}
 	});
