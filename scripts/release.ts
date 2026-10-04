@@ -980,11 +980,14 @@ export function resolveDiagnosticArtifactBackmerge(ours: string, theirs: string)
 	if (typeof theirsManifest.version !== "string") {
 		throw new Error(`${BACKMERGE_CONFLICT_PATH} has no string version on main`);
 	}
+	if (typeof oursManifest.schema !== "string") {
+		throw new Error(`${BACKMERGE_CONFLICT_PATH} has no string schema on dev`);
+	}
 	if (oursManifest.artifacts === undefined || oursManifest.artifacts === null || typeof oursManifest.artifacts !== "object") {
 		throw new Error(`${BACKMERGE_CONFLICT_PATH} has no artifacts map on dev`);
 	}
 	const resolved = {
-		schema: typeof oursManifest.schema === "string" ? oursManifest.schema : "gjc.diagnostic-artifact",
+		schema: oursManifest.schema,
 		version: theirsManifest.version,
 		artifacts: oursManifest.artifacts,
 	};
@@ -996,6 +999,22 @@ export type BackmergeOutcome =
 	| { action: "merged"; detail: string }
 	| { action: "blocked"; detail: string };
 
+/** First non-empty line of command output, for a bounded user-facing detail. */
+function firstLine(text: string): string {
+	return text
+		.split("\n")
+		.map(line => line.trim())
+		.find(line => line.length > 0) ?? "unknown";
+}
+
+/**
+ * Classify a rejected `git push` of the backmerge commit. Only a `dev` that moved under
+ * the merge is retryable; a permission or branch-protection refusal is terminal, so it is
+ * reported instead of burning the remaining attempts against an unchanged rejection.
+ */
+export function classifyBackmergePushFailure(stderr: string): "retry" | "blocked" {
+	return /non-fast-forward|fetch first/iu.test(stderr) ? "retry" : "blocked";
+}
 function gitAt(dir: string, args: readonly string[]) {
 	return $`git -C ${dir} -c core.fsmonitor=false -c core.untrackedCache=false ${args}`;
 }
@@ -1038,11 +1057,16 @@ export async function backmergeReleaseIntoDev(version: string): Promise<Backmerg
 			if (push.exitCode === 0) {
 				return { action: "merged", detail: `pushed the v${version} release commit into dev` };
 			}
-			// dev moved while this attempt merged; refetch and retry against the new tip.
+			const rejection = push.stderr.toString().trim();
+			if (classifyBackmergePushFailure(rejection) === "blocked") {
+				return { action: "blocked", detail: `push rejected: ${firstLine(rejection)}` };
+			}
+			// Only a dev that moved under the merge is worth retrying against a fresh tip.
 		}
 		return { action: "blocked", detail: `dev kept moving; push rejected ${BACKMERGE_PUSH_ATTEMPTS} times` };
 	} catch (error) {
-		return { action: "blocked", detail: error instanceof Error ? error.message : String(error) };
+		const detail = error instanceof Error ? error.message : String(error);
+		return { action: "blocked", detail: `unexpected error: ${detail}` };
 	} finally {
 		for (const dir of worktrees) {
 			await git(["worktree", "remove", "--force", dir]).quiet().nothrow();
