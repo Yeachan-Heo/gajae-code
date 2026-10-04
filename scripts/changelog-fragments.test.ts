@@ -228,14 +228,27 @@ describe("release-consumed fragment deletions", () => {
 		expect(fragmentNoteLines(fragment)).toEqual(["- A shipped fix."]);
 	});
 
-	test("exempts a note that already landed and fails closed when it did not", () => {
+	test("exempts a note this change shipped and fails closed everywhere else", () => {
 		const shipped = insert(CHANGELOG, "- A shipped fix.");
-		expect(isConsumedFragmentNote(fragment, shipped)).toBe(true);
+		// This change folded the note: absent at base, present at head.
+		expect(isConsumedFragmentNote(fragment, CHANGELOG, shipped)).toBe(true);
 		// The note never landed: deleting the fragment would drop it silently.
-		expect(isConsumedFragmentNote(fragment, CHANGELOG)).toBe(false);
-		expect(isConsumedFragmentNote(undefined, shipped)).toBe(false);
-		expect(isConsumedFragmentNote(fragment, undefined)).toBe(false);
-		expect(isConsumedFragmentNote("### Fixed\n\n", shipped)).toBe(false);
+		expect(isConsumedFragmentNote(fragment, CHANGELOG, CHANGELOG)).toBe(false);
+		// The note was already in an older release, so this change did not ship it. Content
+		// alone must never exempt a deletion — that is the loophole the guard exists for.
+		expect(isConsumedFragmentNote(fragment, shipped, shipped)).toBe(false);
+		expect(isConsumedFragmentNote(undefined, CHANGELOG, shipped)).toBe(false);
+		expect(isConsumedFragmentNote(fragment, undefined, shipped)).toBe(false);
+		expect(isConsumedFragmentNote(fragment, CHANGELOG, undefined)).toBe(false);
+		expect(isConsumedFragmentNote("### Fixed\n\n", CHANGELOG, shipped)).toBe(false);
+	});
+
+	test("documents the exact-line contract: a reformatted note is not treated as shipped", () => {
+		// foldFragmentsIntoChangelog copies fragment lines verbatim, so a wrapped or
+		// re-indented CHANGELOG entry is intentionally not an exemption. This is a
+		// fail-closed false positive (a blocked release PR), never a silent drop.
+		const wrapped = insert(CHANGELOG, "- A shipped\n  fix.");
+		expect(isConsumedFragmentNote(fragment, CHANGELOG, wrapped)).toBe(false);
 	});
 
 	test("the guard permits a backmerge that consumes a released fragment and still rejects a dropped note", async () => {
