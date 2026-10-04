@@ -723,9 +723,13 @@ test("a reconnect before a failed abort does not leave the prompt cancelled", as
 	}
 });
 
-test("a no_active_turn abort during provider preflight durably cancels without dispatching", async () => {
+test("local cancel during provider preflight settles without dispatch or remote abort", async () => {
+	let abortCalls = 0;
 	const fixture = await createFixture({
-		abortAcknowledgement: { turn: "no_active_turn", terminal: "terminal_no_effect" },
+		abortAcknowledgement: () => {
+			abortCalls++;
+			return { turn: "no_active_turn", terminal: "terminal_no_effect" };
+		},
 	});
 	const providerPreflight = Promise.withResolvers<void>();
 	const releaseProviderPreflight = Promise.withResolvers<void>();
@@ -736,12 +740,12 @@ test("a no_active_turn abort during provider preflight durably cancels without d
 	try {
 		const pending = prompt(fixture, "cancel during provider preflight");
 		await bounded(providerPreflight.promise, "provider preflight");
-		await expect(fixture.agent.cancel({ sessionId: fixture.sessionId })).rejects.toMatchObject({
-			code: "abort_unacknowledged",
-		});
+		await fixture.agent.cancel({ sessionId: fixture.sessionId });
+		expect(abortCalls).toBe(0);
 		releaseProviderPreflight.resolve();
 		expect(await bounded(pending, "pre-admission cancellation")).toEqual({ stopReason: "cancelled" });
 		expect(fixture.promptDeliveryCount()).toBe(0);
+		expect(abortCalls).toBe(0);
 	} finally {
 		releaseProviderPreflight.resolve();
 		ensureProviders.mockRestore();
