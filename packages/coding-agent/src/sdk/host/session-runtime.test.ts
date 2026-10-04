@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Agent, markNonDispatchedToolEvent, type ThinkingLevel } from "@gajae-code/agent-core";
+import { Agent, markNonDispatchedToolEvent, ThinkingLevel } from "@gajae-code/agent-core";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { logger } from "@gajae-code/utils";
 import { createTestSession } from "../../../test/utilities";
