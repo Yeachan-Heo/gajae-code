@@ -984,13 +984,14 @@ export function resolveDiagnosticArtifactBackmerge(ours: string, theirs: string)
 	if (typeof oursManifest.schema !== "string") {
 		throw new Error(`${BACKMERGE_CONFLICT_PATH} has no string schema on dev`);
 	}
-	if (oursManifest.artifacts === undefined || oursManifest.artifacts === null || typeof oursManifest.artifacts !== "object") {
+	const artifacts = oursManifest.artifacts;
+	if (artifacts === null || typeof artifacts !== "object" || Array.isArray(artifacts)) {
 		throw new Error(`${BACKMERGE_CONFLICT_PATH} has no artifacts map on dev`);
 	}
 	const resolved = {
 		schema: oursManifest.schema,
 		version: theirsManifest.version,
-		artifacts: oursManifest.artifacts,
+		artifacts,
 	};
 	return `${JSON.stringify(resolved, null, 2)}\n`;
 }
