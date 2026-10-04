@@ -2,12 +2,12 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Effort, enrichModelThinking, getSupportedEfforts } from "@gajae-code/ai/model-thinking";
 import {
 	checkOpenCodexStatus,
 	fetchOpenCodexModels,
 	resolveOpenCodexEndpoint,
 } from "@gajae-code/ai/providers/openai-opencodex-responses";
-import { Effort, enrichModelThinking, getSupportedEfforts } from "@gajae-code/ai/model-thinking";
 
 const originalFetch = globalThis.fetch;
 const originalHome = process.env.OPENCODEX_HOME;
