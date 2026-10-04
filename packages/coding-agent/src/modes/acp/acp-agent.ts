@@ -5274,7 +5274,9 @@ export class AcpAgent implements Agent {
 		const { outcome } = waiter.terminal;
 		this.#rememberSettledPromptCorrelation(id, record, waiter.correlation);
 		if (outcome.kind === "stopped") {
-			waiter.resolve({ stopReason: outcome.reason });
+			// Once the SDK has acknowledged a client cancel, the cancellation owns the
+			// turn even if a stale terminal frame races in with another stopped reason.
+			waiter.resolve({ stopReason: waiter.cancelAcknowledged ? "cancelled" : outcome.reason });
 			return;
 		}
 		// `phase` is the host's own claim, and a host that omits it leaves `terminalOutcome`

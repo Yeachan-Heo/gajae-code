@@ -10,7 +10,7 @@ import { resolveLocalRoot, resolveLocalUrlToPath } from "@gajae-code/coding-agen
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { getAgentDir, postmortem, Snowflake, setAgentDir } from "@gajae-code/utils";
+import { getAgentDir, getProjectDir, postmortem, Snowflake, setAgentDir, setProjectDir } from "@gajae-code/utils";
 import { FileLockTestHooks } from "../src/config/file-lock";
 import { sessionRuntimeDir } from "../src/gjc-runtime/session-layout";
 import {
@@ -45,8 +45,8 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		setAgentDir(agentDirAtStart);
 		FileLockTestHooks.afterParentMkdir = undefined;
 		__sessionStateSidecarTestHooks.beforePersistFromEvent = undefined;
-		if (process.cwd() !== processCwdAtStart) {
-			process.chdir(processCwdAtStart);
+		if (process.cwd() !== processCwdAtStart || getProjectDir() !== processCwdAtStart) {
+			setProjectDir(processCwdAtStart);
 		}
 		for (const tempDir of tempDirs.splice(0)) {
 			fs.rmSync(tempDir, { recursive: true, force: true });
