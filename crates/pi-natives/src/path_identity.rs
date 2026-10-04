@@ -5974,7 +5974,11 @@ pub(crate) mod platform {
 		if fd < 0 {
 			return Err(security_code(&std::io::Error::last_os_error()));
 		}
-		let result = (|| {
+		// SAFETY: this function exclusively owns the freshly opened descriptor.
+		// Hash it directly; duplicating it shares the same file offset and adds no
+		// authority.
+		let mut file = unsafe { File::from_raw_fd(fd) };
+		(|| {
 			// SAFETY: zero is a valid initialized representation for fstat output.
 			let mut opened: libc::stat = unsafe { std::mem::zeroed() };
 			// SAFETY: fd is live and opened is writable.
@@ -5984,7 +5988,7 @@ pub(crate) mod platform {
 			if opened.st_mode & libc::S_IFMT != libc::S_IFREG {
 				return Ok(false);
 			}
-			let digest = digest_fd(fd)?;
+			let digest = digest_reader(&mut file).map_err(|_| "io_error")?;
 			// Linearize the pathname observation after descriptor hashing: the live name
 			// must still resolve no-follow to the descriptor whose metadata and bytes were
 			// checked above.
@@ -6011,10 +6015,7 @@ pub(crate) mod platform {
 				&& named.st_mode & libc::S_IFMT == libc::S_IFREG
 				&& named.st_dev == opened.st_dev
 				&& named.st_ino == opened.st_ino)
-		})();
-		// SAFETY: this function owns fd exactly once.
-		unsafe { libc::close(fd) };
-		result
+		})()
 	}
 
 	#[expect(

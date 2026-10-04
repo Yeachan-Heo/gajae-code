@@ -22,6 +22,7 @@ import {
 } from "../../src/session/internal/managed-session-scope";
 import * as managedSessionStorage from "../../src/session/internal/managed-session-storage";
 import {
+	MANAGED_ARTIFACT_COPY_BATCH_SIZE,
 	MANAGED_ARTIFACT_MAX_FILES,
 	publishManagedFileNoReplace,
 	validateManagedArtifactTree,
@@ -3155,6 +3156,351 @@ describe("scrubbed write-protocol remnant reaping", () => {
 	];
 	const aged = new Date(Date.now() - 60 * 60 * 1000);
 
+	async function seedAgedRemnants(directory: string, names: readonly string[]): Promise<void> {
+		for (const name of names) {
+			const pathname = path.join(directory, name);
+			await Bun.write(pathname, "", { mode: 0o600 });
+			await fs.utimes(pathname, aged, aged);
+		}
+	}
+
+	async function reap(asyncMode: boolean, directory: string) {
+		return asyncMode
+			? managedSessionStorage.reapScrubbedProtocolRemnants(directory)
+			: managedSessionStorage.reapScrubbedProtocolRemnantsSync(directory);
+	}
+
+	for (const asyncMode of [false, true]) {
+		const mode = asyncMode ? "async" : "sync";
+
+		it(`${mode} reaping captures and reuses one fresh stable parent identity per invocation`, async () => {
+			const { scope } = await fixture();
+			await fs.mkdir(scope.directoryPath, { recursive: true, mode: 0o700 });
+			const candidateNames = remnantNames.slice(0, 2);
+			await seedAgedRemnants(scope.directoryPath, candidateNames);
+			const firstParentIdentity = physicalIdentity(scope.directoryPath);
+			let parentCaptures = 0;
+			let restoreParentLstat = () => {};
+			if (asyncMode) {
+				const originalLstat = fs.lstat;
+				const lstat = vi.spyOn(fs, "lstat").mockImplementation((async (file, options) => {
+					if (file === scope.directoryPath) parentCaptures += 1;
+					return originalLstat(file, options as never);
+				}) as typeof fs.lstat);
+				restoreParentLstat = () => lstat.mockRestore();
+			} else {
+				const originalLstat = syncFs.lstatSync;
+				const lstat = vi.spyOn(syncFs, "lstatSync").mockImplementation(((file, options) => {
+					if (file === scope.directoryPath) parentCaptures += 1;
+					return originalLstat(file, options as never);
+				}) as typeof syncFs.lstatSync);
+				restoreParentLstat = () => lstat.mockRestore();
+			}
+			const actualUnlink = native.exactUnlinkDirect;
+			const observedParentIdentities: Array<{ dev: bigint | undefined; ino: bigint | undefined }> = [];
+			const unlink = vi.spyOn(native, "exactUnlinkDirect").mockImplementation((pathname, identity) => {
+				observedParentIdentities.push({ dev: identity.parentDev, ino: identity.parentIno });
+				return actualUnlink(pathname, identity);
+			});
+			try {
+				expect(await reap(asyncMode, scope.directoryPath)).toEqual({ reaped: 2, failures: 0 });
+				expect(parentCaptures).toBe(1);
+				expect(observedParentIdentities).toEqual(
+					candidateNames.map(() => ({ dev: firstParentIdentity.dev, ino: firstParentIdentity.ino })),
+				);
+				const originalDirectory = `${scope.directoryPath}.original`;
+				await fs.rename(scope.directoryPath, originalDirectory);
+				await fs.mkdir(scope.directoryPath, { mode: 0o700 });
+				await seedAgedRemnants(scope.directoryPath, candidateNames);
+				const secondParentStat = syncFs.statSync(scope.directoryPath, { bigint: true });
+				const secondParentIdentity = { dev: secondParentStat.dev, ino: secondParentStat.ino };
+				expect(secondParentIdentity).not.toEqual(firstParentIdentity);
+
+				expect(await reap(asyncMode, scope.directoryPath)).toEqual({ reaped: 2, failures: 0 });
+				expect(parentCaptures).toBe(2);
+				expect(observedParentIdentities).toEqual([
+					...candidateNames.map(() => ({ dev: firstParentIdentity.dev, ino: firstParentIdentity.ino })),
+					...candidateNames.map(() => ({ dev: secondParentIdentity.dev, ino: secondParentIdentity.ino })),
+				]);
+				expect((await fs.readdir(scope.directoryPath)).filter(name => candidateNames.includes(name))).toEqual([]);
+			} finally {
+				restoreParentLstat();
+				unlink.mockRestore();
+			}
+		});
+
+		it(`${mode} reaping does not capture a parent when every candidate is protected`, async () => {
+			const { scope } = await fixture();
+			await fs.mkdir(scope.directoryPath, { recursive: true, mode: 0o700 });
+			const young = path.join(scope.directoryPath, ".gjc-exact-unlink-placeholder-young");
+			const evidence = path.join(scope.directoryPath, ".gjc-exact-unlink-placeholder-evidence");
+			const unrelated = path.join(scope.directoryPath, "unrelated.jsonl");
+			await fs.writeFile(young, "", { mode: 0o600 });
+			await fs.writeFile(evidence, "retained evidence", { mode: 0o600 });
+			await fs.utimes(evidence, aged, aged);
+			await fs.writeFile(unrelated, "", { mode: 0o600 });
+			await fs.utimes(unrelated, aged, aged);
+			let parentCaptures = 0;
+			let restoreParentLstat = () => {};
+			if (asyncMode) {
+				const originalLstat = fs.lstat;
+				const lstat = vi.spyOn(fs, "lstat").mockImplementation((async (file, options) => {
+					if (file === scope.directoryPath) parentCaptures += 1;
+					return originalLstat(file, options as never);
+				}) as typeof fs.lstat);
+				restoreParentLstat = () => lstat.mockRestore();
+			} else {
+				const originalLstat = syncFs.lstatSync;
+				const lstat = vi.spyOn(syncFs, "lstatSync").mockImplementation(((file, options) => {
+					if (file === scope.directoryPath) parentCaptures += 1;
+					return originalLstat(file, options as never);
+				}) as typeof syncFs.lstatSync);
+				restoreParentLstat = () => lstat.mockRestore();
+			}
+			try {
+				expect(await reap(asyncMode, scope.directoryPath)).toEqual({ reaped: 0, failures: 0 });
+				expect(parentCaptures).toBe(0);
+				expect(await fs.readFile(evidence, "utf8")).toBe("retained evidence");
+				await expect(fs.access(young)).resolves.toBeNull();
+				await expect(fs.access(unrelated)).resolves.toBeNull();
+			} finally {
+				restoreParentLstat();
+			}
+		});
+
+		for (const behavior of ["EACCES", "ENOENT", "invalid-type"] as const) {
+			it(`${mode} reaping retries per-file after pre-capture ${behavior}`, async () => {
+				const { scope } = await fixture();
+				await fs.mkdir(scope.directoryPath, { recursive: true, mode: 0o700 });
+				const candidateNames = remnantNames.slice(0, 2);
+				await seedAgedRemnants(scope.directoryPath, candidateNames);
+				const nonDirectory = path.join(scope.directoryPath, "not-a-directory");
+				await fs.writeFile(nonDirectory, "protected", { mode: 0o600 });
+				let parentAttempts = 0;
+				let restoreParentLstat = () => {};
+				if (asyncMode) {
+					const originalLstat = fs.lstat;
+					const lstat = vi.spyOn(fs, "lstat").mockImplementation((async (file, options) => {
+						if (file === scope.directoryPath) {
+							parentAttempts += 1;
+							if (parentAttempts === 1 && behavior === "EACCES")
+								throw Object.assign(new Error("injected EACCES"), { code: "EACCES" });
+							if (parentAttempts === 1 && behavior === "ENOENT")
+								throw Object.assign(new Error("injected ENOENT"), { code: "ENOENT" });
+							if (parentAttempts === 1) return originalLstat(nonDirectory, options as never);
+						}
+						return originalLstat(file, options as never);
+					}) as typeof fs.lstat);
+					restoreParentLstat = () => lstat.mockRestore();
+				} else {
+					const originalLstat = syncFs.lstatSync;
+					const lstat = vi.spyOn(syncFs, "lstatSync").mockImplementation(((file, options) => {
+						if (file === scope.directoryPath) {
+							parentAttempts += 1;
+							if (parentAttempts === 1 && behavior === "EACCES")
+								throw Object.assign(new Error("injected EACCES"), { code: "EACCES" });
+							if (parentAttempts === 1 && behavior === "ENOENT")
+								throw Object.assign(new Error("injected ENOENT"), { code: "ENOENT" });
+							if (parentAttempts === 1) return originalLstat(nonDirectory, options as never);
+						}
+						return originalLstat(file, options as never);
+					}) as typeof syncFs.lstatSync);
+					restoreParentLstat = () => lstat.mockRestore();
+				}
+				const actualUnlink = native.exactUnlinkDirect;
+				const unlink = vi
+					.spyOn(native, "exactUnlinkDirect")
+					.mockImplementation((pathname, identity) => actualUnlink(pathname, identity));
+				const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+				try {
+					const expectedFailures = behavior === "ENOENT" ? 0 : 1;
+					expect(await reap(asyncMode, scope.directoryPath)).toEqual({
+						reaped: 1,
+						failures: expectedFailures,
+					});
+					expect(parentAttempts).toBe(2);
+					expect(unlink).toHaveBeenCalledTimes(1);
+					expect(warning).toHaveBeenCalledTimes(expectedFailures);
+					if (expectedFailures > 0)
+						expect(warning).toHaveBeenCalledWith("Managed session remnant reaping completed with failures", {
+							failureCount: expectedFailures,
+							reapedCount: 1,
+						});
+					expect(
+						(await fs.readdir(scope.directoryPath)).filter(name => candidateNames.includes(name)),
+					).toHaveLength(1);
+					expect(await fs.readFile(nonDirectory, "utf8")).toBe("protected");
+				} finally {
+					restoreParentLstat();
+					unlink.mockRestore();
+					warning.mockRestore();
+				}
+			});
+		}
+
+		it(`${mode} reaping pins the original parent across a real directory replacement`, async () => {
+			const { scope } = await fixture();
+			await fs.mkdir(scope.directoryPath, { recursive: true, mode: 0o700 });
+			const candidateNames = remnantNames.slice(0, 2);
+			await seedAgedRemnants(scope.directoryPath, candidateNames);
+			const originalIdentities = new Map(
+				candidateNames.map(name => [name, physicalIdentity(path.join(scope.directoryPath, name))]),
+			);
+			const movedOriginalDirectory = `${scope.directoryPath}.original`;
+			const replacementDirectory = `${scope.directoryPath}.replacement`;
+			await fs.mkdir(replacementDirectory, { mode: 0o700 });
+			await seedAgedRemnants(replacementDirectory, candidateNames);
+			const replacementIdentities = new Map(
+				candidateNames.map(name => [name, physicalIdentity(path.join(replacementDirectory, name))]),
+			);
+			const nativeResults: native.NativeExactUnlinkResult[] = [];
+			let replaced = false;
+			const actualUnlink = native.exactUnlinkDirect;
+			const unlink = vi.spyOn(native, "exactUnlinkDirect").mockImplementation((pathname, identity) => {
+				const result = actualUnlink(pathname, identity);
+				nativeResults.push(result);
+				if (result.ok && !replaced) {
+					replaced = true;
+					syncFs.renameSync(scope.directoryPath, movedOriginalDirectory);
+					syncFs.renameSync(replacementDirectory, scope.directoryPath);
+				}
+				return result;
+			});
+			const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+			try {
+				expect(await reap(asyncMode, scope.directoryPath)).toEqual({ reaped: 1, failures: 1 });
+				expect(warning).toHaveBeenCalledWith("Managed session remnant reaping completed with failures", {
+					failureCount: 1,
+					reapedCount: 1,
+				});
+				expect(replaced).toBe(true);
+				expect(nativeResults).toHaveLength(2);
+				expect(nativeResults[0]?.ok).toBe(true);
+				expect(nativeResults[1]).toMatchObject({ ok: false, code: "parent_mismatch" });
+				const removedName = candidateNames.find(
+					name => !syncFs.existsSync(path.join(movedOriginalDirectory, name)),
+				);
+				expect(removedName).toBeDefined();
+				const remainingName = candidateNames.find(name => name !== removedName)!;
+				const originalRemainingPath = path.join(movedOriginalDirectory, remainingName);
+				const replacementRemainingPath = path.join(scope.directoryPath, remainingName);
+				const originalExpected = originalIdentities.get(remainingName);
+				const replacementExpected = replacementIdentities.get(remainingName);
+				if (!originalExpected || !replacementExpected) throw new Error("Missing replacement fixture identity");
+				expect(physicalIdentity(originalRemainingPath)).toEqual(originalExpected);
+				expect(physicalIdentity(replacementRemainingPath)).toEqual(replacementExpected);
+				expect(physicalIdentity(replacementRemainingPath)).not.toEqual(physicalIdentity(originalRemainingPath));
+				expect(await fs.readFile(originalRemainingPath)).toEqual(Buffer.alloc(0));
+				expect(await fs.readFile(replacementRemainingPath)).toEqual(Buffer.alloc(0));
+			} finally {
+				unlink.mockRestore();
+				warning.mockRestore();
+			}
+		});
+
+		it(`${mode} reaping counts a real parent symlink substitution without unlinking`, async () => {
+			const { scope } = await fixture();
+			await fs.mkdir(scope.directoryPath, { recursive: true, mode: 0o700 });
+			const name = remnantNames[0]!;
+			const pathname = path.join(scope.directoryPath, name);
+			await seedAgedRemnants(scope.directoryPath, [name]);
+			const originalIdentity = physicalIdentity(pathname);
+			const originalDirectory = `${scope.directoryPath}.original`;
+			const symlinkTarget = path.join(path.dirname(scope.directoryPath), "symlink-target");
+			await fs.mkdir(symlinkTarget, { mode: 0o700 });
+			let moved = false;
+			let nativeFailure: native.NativeExactUnlinkResult | undefined;
+			const actualUnlink = native.exactUnlinkDirect;
+			const unlink = vi.spyOn(native, "exactUnlinkDirect").mockImplementation((file, identity) => {
+				syncFs.renameSync(scope.directoryPath, originalDirectory);
+				moved = true;
+				syncFs.symlinkSync(symlinkTarget, scope.directoryPath, process.platform === "win32" ? "junction" : "dir");
+				const result = actualUnlink(file, identity);
+				nativeFailure = result;
+				return result;
+			});
+			const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+			try {
+				expect(await reap(asyncMode, scope.directoryPath)).toEqual({ reaped: 0, failures: 1 });
+				expect(warning).toHaveBeenCalledWith("Managed session remnant reaping completed with failures", {
+					failureCount: 1,
+					reapedCount: 0,
+				});
+				expect(nativeFailure).toMatchObject({ ok: false, code: "reparse_point" });
+				expect(syncFs.lstatSync(scope.directoryPath).isSymbolicLink()).toBe(true);
+				expect(physicalIdentity(path.join(originalDirectory, name))).toEqual(originalIdentity);
+				expect(await fs.readFile(path.join(originalDirectory, name))).toEqual(Buffer.alloc(0));
+			} finally {
+				unlink.mockRestore();
+				warning.mockRestore();
+				if (moved) {
+					if (
+						syncFs.existsSync(scope.directoryPath) ||
+						syncFs.lstatSync(scope.directoryPath, { throwIfNoEntry: false })
+					)
+						syncFs.unlinkSync(scope.directoryPath);
+					syncFs.renameSync(originalDirectory, scope.directoryPath);
+				}
+			}
+		});
+		for (const code of ["EACCES", "ENOENT"] as const) {
+			it(`${mode} reaping preserves post-failure diagnostic ${code} accounting`, async () => {
+				const { scope } = await fixture();
+				await fs.mkdir(scope.directoryPath, { recursive: true, mode: 0o700 });
+				const name = remnantNames[0]!;
+				await seedAgedRemnants(scope.directoryPath, [name]);
+				const originalIdentity = physicalIdentity(path.join(scope.directoryPath, name));
+				const originalDirectory = `${scope.directoryPath}.original`;
+				const target = path.join(path.dirname(scope.directoryPath), "diagnostic-target");
+				await fs.mkdir(target, { mode: 0o700 });
+				let moved = false;
+				let restoreLstat = () => {};
+				if (asyncMode) {
+					const actualLstat = fs.lstat;
+					const observer = vi.spyOn(fs, "lstat").mockImplementation((async (file, options) => {
+						if (file === scope.directoryPath && moved)
+							throw Object.assign(new Error(`injected diagnostic ${code}`), { code });
+						return actualLstat(file, options as never);
+					}) as typeof fs.lstat);
+					restoreLstat = () => observer.mockRestore();
+				} else {
+					const actualLstat = syncFs.lstatSync;
+					const observer = vi.spyOn(syncFs, "lstatSync").mockImplementation(((file, options) => {
+						if (file === scope.directoryPath && moved)
+							throw Object.assign(new Error(`injected diagnostic ${code}`), { code });
+						return actualLstat(file, options as never);
+					}) as typeof syncFs.lstatSync);
+					restoreLstat = () => observer.mockRestore();
+				}
+				const actualUnlink = native.exactUnlinkDirect;
+				const unlink = vi.spyOn(native, "exactUnlinkDirect").mockImplementation((file, identity) => {
+					syncFs.renameSync(scope.directoryPath, originalDirectory);
+					syncFs.symlinkSync(target, scope.directoryPath, process.platform === "win32" ? "junction" : "dir");
+					moved = true;
+					return actualUnlink(file, identity);
+				});
+				const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+				try {
+					const failures = code === "EACCES" ? 1 : 0;
+					expect(await reap(asyncMode, scope.directoryPath)).toEqual({ reaped: 0, failures });
+					expect(unlink).toHaveBeenCalledTimes(1);
+					expect(warning).toHaveBeenCalledTimes(failures);
+					expect(physicalIdentity(path.join(originalDirectory, name))).toEqual(originalIdentity);
+					expect(await fs.readFile(path.join(originalDirectory, name))).toEqual(Buffer.alloc(0));
+					expect(await fs.readdir(target)).toEqual([]);
+				} finally {
+					unlink.mockRestore();
+					warning.mockRestore();
+					restoreLstat();
+					if (moved) {
+						syncFs.unlinkSync(scope.directoryPath);
+						syncFs.renameSync(originalDirectory, scope.directoryPath);
+					}
+				}
+			});
+		}
+	}
+
 	it("reaps only aged zero-length remnants and preserves evidence", async () => {
 		const { scope } = await fixture();
 		await fs.mkdir(scope.directoryPath, { recursive: true, mode: 0o700 });
@@ -3202,11 +3548,20 @@ describe("scrubbed write-protocol remnant reaping", () => {
 	it("reaps an over-limit poisoned scope before binding publication and preserves protected entries", async () => {
 		const { scope } = await fixture();
 		await fs.mkdir(scope.directoryPath, { recursive: true, mode: 0o700 });
-		for (let index = 0; index <= MANAGED_ARTIFACT_MAX_FILES; index += 1) {
-			const pathname = path.join(scope.directoryPath, `.gjc-receipt-remove-poison-${index}`);
-			await fs.writeFile(pathname, "", { mode: 0o600 });
-			await fs.utimes(pathname, aged, aged);
+		// Keep every over-limit entry real and aged without serializing 100,002 setup operations.
+		for (let start = 0; start <= MANAGED_ARTIFACT_MAX_FILES; start += MANAGED_ARTIFACT_COPY_BATCH_SIZE) {
+			const count = Math.min(MANAGED_ARTIFACT_COPY_BATCH_SIZE, MANAGED_ARTIFACT_MAX_FILES + 1 - start);
+			await Promise.all(
+				Array.from({ length: count }, async (_, offset) => {
+					const pathname = path.join(scope.directoryPath, `.gjc-receipt-remove-poison-${start + offset}`);
+					await Bun.write(pathname, "", { mode: 0o600, createPath: false });
+					await fs.utimes(pathname, aged, aged);
+				}),
+			);
 		}
+		expect(
+			(await fs.readdir(scope.directoryPath)).filter(name => name.startsWith(".gjc-receipt-remove-poison-")),
+		).toHaveLength(MANAGED_ARTIFACT_MAX_FILES + 1);
 		const evidence = path.join(scope.directoryPath, ".gjc-receipt-remove-evidence");
 		await fs.writeFile(evidence, "retained receipt payload", { mode: 0o600 });
 		await fs.utimes(evidence, aged, aged);
@@ -3223,6 +3578,9 @@ describe("scrubbed write-protocol remnant reaping", () => {
 		if (process.platform !== "win32") await fs.symlink(unrelated, symlink);
 
 		expect(prepareManagedSessionScopeForWriteSync(scope)).toMatchObject({ kind: "resolved" });
+		expect(
+			(await fs.readdir(scope.directoryPath)).filter(name => name.startsWith(".gjc-receipt-remove-poison-")),
+		).toHaveLength(0);
 
 		expect(await fs.readFile(evidence, "utf8")).toBe("retained receipt payload");
 		await expect(fs.access(young)).resolves.toBeNull();
