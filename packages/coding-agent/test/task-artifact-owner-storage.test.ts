@@ -555,7 +555,15 @@ describe("verified storage consumes task artifact owners", () => {
 		const fixture = await makeFixture();
 		const nativeRemoval = recordActualOwnerRemoval();
 		const target = targetFor(fixture, { deferTaskArtifactOwnerRetirement: true });
-		const before = await fixture.storage.deleteSessionVerified(target);
+		const transcriptBefore = fs.readFileSync(fixture.transcriptPath);
+		const payloadBefore = fs.readFileSync(fixture.ownerPayloadPath);
+		const untrusted = await fixture.storage.deleteSessionVerified(target);
+		expect(untrusted).toMatchObject({ kind: "cleanup_pending", phase: "task_artifact_owner" });
+		expect(fs.readFileSync(fixture.transcriptPath)).toEqual(transcriptBefore);
+		expect(fs.readFileSync(fixture.ownerPayloadPath)).toEqual(payloadBefore);
+		expect(nativeRemoval.spy).not.toHaveBeenCalled();
+		const inspectProtocol = managedGcProtocolScopeInspectorForScope(fixture.scope);
+		const before = await fixture.storage.deleteSessionVerified(target, inspectProtocol);
 		expect(before.kind).toBe("artifacts_removed");
 		expect(before.taskArtifactOwnerRetirementOutcome).toBeUndefined();
 		expect(nativeRemoval.spy).not.toHaveBeenCalled();
@@ -570,6 +578,7 @@ describe("verified storage consumes task artifact owners", () => {
 				artifactsRemoved: true,
 				deferTaskArtifactOwnerRetirement: true,
 			}),
+			inspectProtocol,
 		);
 		expect(after.taskArtifactOwnerRetirementOutcome).toEqual(outcome);
 		if (outcome.kind === "completed") {
