@@ -777,6 +777,20 @@ interface AcceptedQueueCancellation {
 	removalFailure?: unknown;
 }
 
+function retireAcceptedQueueCancellation(
+	cancellations: Map<string, AcceptedQueueCancellation>,
+	correlation: InvocationCorrelation,
+): void {
+	const key = `${correlation.commandId}:${correlation.turnId}`;
+	const cancellation = cancellations.get(key);
+	if (!cancellation) return;
+	cancellations.delete(key);
+	if (!cancellation.controller.signal.aborted) cancellation.controller.abort();
+	if (cancellation.disposition === "queued") {
+		cancellation.disposition = "teardown";
+		cancellation.resolveDisposition("teardown");
+	}
+}
 export type InvocationKind = "prompt" | "skill" | "steer";
 type InvocationStatus = "accepted" | "in_flight" | "terminal_ok" | "failed" | "uncertain";
 type InvocationOutcome = SdkPromptTerminalOutcome;
@@ -3124,6 +3138,7 @@ function createControlSurface(
 		const sdkRunCapability = createSdkRunCapability(sdkRunToken);
 		const publishTerminal = (outcome: InvocationOutcome): void => {
 			releaseAcceptedImage?.(correlation);
+			retireAcceptedQueueCancellation(acceptedQueueCancellations, correlation);
 			publishLifecycleFrame?.({
 				type: "agent_end",
 				sessionId: ctx.sessionManager.getSessionId(),
@@ -3361,6 +3376,7 @@ function createControlSurface(
 				error => {
 					if (settled) {
 						releaseAcceptedImage?.(correlation);
+						retireAcceptedQueueCancellation(acceptedQueueCancellations, correlation);
 						// The submission promise rejects after preflight acceptance only when the
 						// work itself is over (provider stream interrupt, abort, queue failure).
 						// The accepted run never started (agent_start never fired), so its pending
@@ -3481,11 +3497,9 @@ function createControlSurface(
 				...(acceptedFields?.() ?? {}),
 			};
 		} catch (error) {
-			if (!accepted) {
-				preflightController.abort();
-				acceptedQueueCancellations.delete(`${correlation.commandId}:${correlation.turnId}`);
-			}
+			if (!accepted) preflightController.abort();
 			releaseAcceptedImage?.(correlation);
+			retireAcceptedQueueCancellation(acceptedQueueCancellations, correlation);
 			if (!accepted) reconciliation.release(kind, retainedClientRef);
 			throw error;
 		} finally {
@@ -4868,35 +4882,17 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const key = imageKey(correlation);
 		acceptedImages.get(key)?.();
 		acceptedImages.delete(key);
-		const cancellation = acceptedQueueCancellations.get(key);
-		if (cancellation) {
-			cancellation.controller.abort();
-			acceptedQueueCancellations.delete(key);
-			if (cancellation.disposition === "queued") {
-				cancellation.disposition = "teardown";
-				cancellation.resolveDisposition("teardown");
-			}
-		}
-		for (const cancellation of cancellations) {
-			if (queuedRemovals.includes(cancellation)) continue;
-			const key = `${cancellation.correlation.commandId}:${cancellation.correlation.turnId}`;
-			if (acceptedQueueCancellations.get(key) === cancellation) acceptedQueueCancellations.delete(key);
-		}
-		if (failures.length > 0)
-			throw Object.assign(
-				new AggregateError(failures, "SDK runtime could not durably publish queued prompt cancellations."),
-				{ code: "sdk_reconciliation_teardown_failed" },
-			);
 	};
 	const disposeAcceptedQueueCancellations = (): void => {
-		for (const cancellation of acceptedQueueCancellations.values()) {
-			cancellation.controller.abort();
+		const cancellations = [...acceptedQueueCancellations.values()];
+		acceptedQueueCancellations.clear();
+		for (const cancellation of cancellations) {
+			if (!cancellation.controller.signal.aborted) cancellation.controller.abort();
 			if (cancellation.disposition === "queued") {
 				cancellation.disposition = "teardown";
 				cancellation.resolveDisposition("teardown");
 			}
 		}
-		acceptedQueueCancellations.clear();
 	};
 	let currentImageUploads: PromptImageUploadStore | undefined;
 	let active:
@@ -6000,7 +5996,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		}
 		if (type === "agent_end" && isContinuingMidRunMaintenanceOutcome(maintenanceOutcome)) return;
 		if (type === "agent_end") {
-			for (const invocation of transitions) releaseAcceptedImage(invocation.correlation);
+			for (const invocation of transitions) {
+				releaseAcceptedImage(invocation.correlation);
+				retireAcceptedQueueCancellation(acceptedQueueCancellations, invocation.correlation);
+			}
 			if (current.lifecycleEpoch !== eventLifecycleEpoch) {
 				// A successor agent_start won the lifecycle race while this event's
 				// durable transitions were awaiting persistence. Retire the ended
@@ -6845,7 +6844,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					});
 					// 3. Release recovery ownership ONLY after durable terminalization.
 					deadlineManager.clear(correlation);
-					if (kind === "prompt") releaseAcceptedImage(correlation);
+					if (kind === "prompt") {
+						releaseAcceptedImage(correlation);
+						retireAcceptedQueueCancellation(acceptedQueueCancellations, correlation);
+					}
 					return true;
 				} catch (transitionError) {
 					// Keep prompt recovery leased; skill recovery has no prompt lease.
