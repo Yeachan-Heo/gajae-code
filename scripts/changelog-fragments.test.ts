@@ -249,6 +249,20 @@ describe("release-consumed fragment deletions", () => {
 		expect(isConsumedFragmentNote(fragment, CHANGELOG, insert(CHANGELOG, "- A shipped fix."))).toBe(false);
 		// A new section that does not carry the note ships nothing.
 		expect(isConsumedFragmentNote(fragment, CHANGELOG, cutRelease("- Something else."))).toBe(false);
+		// A date-only move is not a release cut, so a note parked beside it does not ship.
+		const dateTweak = CHANGELOG.replace("2026-01-01", "2026-01-09").replace(
+			"### Fixed\n\n",
+			"### Fixed\n\n- A shipped fix.\n",
+		);
+		expect(isConsumedFragmentNote(fragment, CHANGELOG, dateTweak)).toBe(false);
+		// An empty newly cut section does not host a note parked elsewhere.
+		expect(
+			isConsumedFragmentNote(
+				fragment,
+				CHANGELOG,
+				`${insert(CHANGELOG, "- A shipped fix.")}\n## [9.9.9] - 2026-01-03\n\n### Fixed\n\n- Unrelated.\n`,
+			),
+		).toBe(false);
 		expect(isConsumedFragmentNote(undefined, CHANGELOG, shipped)).toBe(false);
 		expect(isConsumedFragmentNote(fragment, undefined, shipped)).toBe(false);
 		expect(isConsumedFragmentNote(fragment, CHANGELOG, undefined)).toBe(false);

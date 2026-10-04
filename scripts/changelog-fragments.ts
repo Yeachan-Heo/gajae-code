@@ -391,30 +391,39 @@ export function fragmentNoteLines(fragmentText: string): string[] {
 }
 
 /**
- * A CHANGELOG's version-section headings (`## [x.y.z]`), not the `### <Section>` entry
- * headings. A release fold always introduces a new one for the version it cuts.
+ * A CHANGELOG's version sections keyed by their `[x.y.z]` identifier, each mapped to the
+ * body lines beneath it. The identifier — not the heading text — is what a release cut
+ * introduces; a date can move without a new release, and the release fold always puts the
+ * notes it consumes inside the section it just cut.
  */
-export function versionSectionHeadings(content: string): string[] {
-	return content
-		.split("\n")
-		.map(line => line.trim())
-		.filter(line => /^## [^#]/u.test(line));
+export function versionSections(content: string): Map<string, string[]> {
+	const sections = new Map<string, string[]>();
+	let body: string[] | undefined;
+	for (const raw of content.split("\n")) {
+		const line = raw.trim();
+		const identifier = /^## \[([^\]]+)\]/u.exec(line)?.[1];
+		if (identifier !== undefined) {
+			body = [];
+			sections.set(identifier, body);
+		} else if (/^## [^#]/u.test(line)) {
+			body = undefined;
+		} else if (body !== undefined) {
+			body.push(line);
+		}
+	}
+	return sections;
 }
 
 /**
- * True when this PR's own change shipped the deleted fragment's note. Three things must
- * hold, and together they describe exactly what the release flow's
- * `foldFragmentsIntoChangelog` does when it consumes a fragment:
+ * True when this PR's own change shipped the deleted fragment's note, i.e. when the change
+ * looks exactly like the release flow's fold: the note lines are new to the head CHANGELOG
+ * and they sit inside a version section the head cut open, which the base did not have.
  *
- * 1. every note line is present in the head CHANGELOG,
- * 2. every note line is absent from the base CHANGELOG, and
- * 3. the head introduced a version section the base did not have — the section the release
- *    cut open for the notes it folded.
- *
- * Provenance matters more than content here. Content alone would exempt a normal PR that
- * deletes an unreleased note whose bullet text repeats an older release line, and (1)+(2)
- * alone would exempt a PR that parks the note under an already-existing released heading,
- * where no release flow put it. An unreadable fragment or CHANGELOG fails closed.
+ * Provenance matters more than content. Content alone would exempt a PR that deletes an
+ * unreleased note whose bullet text repeats an older release line; content plus "some new
+ * heading appeared" would exempt a PR that only moves a date or adds an empty section while
+ * parking the note under an existing heading. Requiring the note to be *inside* a newly cut
+ * section rejects both. An unreadable fragment or CHANGELOG fails closed.
  */
 export function isConsumedFragmentNote(
 	fragmentText: string | undefined,
@@ -428,8 +437,11 @@ export function isConsumedFragmentNote(
 	if (!noteLines.every(line => shipped.has(line))) return false;
 	const alreadyShipped = new Set(baseChangelog.split("\n").map(line => line.trim()));
 	if (!noteLines.every(line => !alreadyShipped.has(line))) return false;
-	const baseHeadings = new Set(versionSectionHeadings(baseChangelog));
-	return versionSectionHeadings(headChangelog).some(heading => !baseHeadings.has(heading));
+	const baseIdentifiers = new Set(versionSections(baseChangelog).keys());
+	const cutBodies = [...versionSections(headChangelog)]
+		.filter(([identifier]) => !baseIdentifiers.has(identifier))
+		.map(([, body]) => body);
+	return noteLines.every(line => cutBodies.some(body => body.includes(line)));
 }
 
 async function gitShow(revision: string, file: string): Promise<string | undefined> {
