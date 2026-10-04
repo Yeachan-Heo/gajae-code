@@ -263,6 +263,13 @@ describe("release-consumed fragment deletions", () => {
 				`${insert(CHANGELOG, "- A shipped fix.")}\n## [9.9.9] - 2026-01-03\n\n### Fixed\n\n- Unrelated.\n`,
 			),
 		).toBe(false);
+		// Padding a version heading's identifier must not forge a newly cut section: the
+		// history guard trims, so it sees the same released version and no removal.
+		const paddedHeading = CHANGELOG.replace("## [1.0.0]", "## [ 1.0.0 ]").replace(
+			"### Fixed\n\n",
+			"### Fixed\n\n- A shipped fix.\n",
+		);
+		expect(isConsumedFragmentNote(fragment, CHANGELOG, paddedHeading)).toBe(false);
 		expect(isConsumedFragmentNote(undefined, CHANGELOG, shipped)).toBe(false);
 		expect(isConsumedFragmentNote(fragment, undefined, shipped)).toBe(false);
 		expect(isConsumedFragmentNote(fragment, CHANGELOG, undefined)).toBe(false);

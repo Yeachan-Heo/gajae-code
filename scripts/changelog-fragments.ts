@@ -401,8 +401,11 @@ export function versionSections(content: string): Map<string, string[]> {
 	let body: string[] | undefined;
 	for (const raw of content.split("\n")) {
 		const line = raw.trim();
-		const identifier = /^## \[([^\]]+)\]/u.exec(line)?.[1];
-		if (identifier !== undefined) {
+		// Trim the captured identifier: `## [ 1.0.0 ]` must key as `1.0.0`, or padding a
+		// heading would forge a section the base "did not have" while the history guard —
+		// which trims — still sees the same released version and reports no removal.
+		const identifier = /^## \[([^\]]+)\]/u.exec(line)?.[1]?.trim();
+		if (identifier !== undefined && identifier.length > 0) {
 			body = [];
 			sections.set(identifier, body);
 		} else if (/^## [^#]/u.test(line)) {
