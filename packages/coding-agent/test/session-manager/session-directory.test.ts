@@ -1328,6 +1328,35 @@ describe("managed session write protocol", () => {
 		await expect(fs.access(source)).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
+	it.each([
+		"missing-binding",
+		"noncanonical-binding",
+		"unregistered-scope",
+	] as const)("rejects cold reconciliation with %s without repairing storage", async boundary => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		expect((await prepareManagedSessionScopeForWrite(scope)).kind).toBe("resolved");
+		const source = path.join(legacyDirectory(sessionsRoot, cwd), "cold-authority.jsonl");
+		const bytes = transcript("cold-authority", cwd);
+		await fs.mkdir(path.dirname(source), { recursive: true });
+		await fs.writeFile(source, bytes);
+		const cold = resolveManagedScope({ cwd, agentDir: path.dirname(sessionsRoot), sessionsRoot });
+		if (cold.kind !== "resolved") throw new Error(cold.message);
+		const binding = path.join(scope.directoryPath, MANAGED_SESSION_BINDING_FILE);
+		const original = await fs.readFile(binding, "utf8");
+		if (boundary === "missing-binding") await fs.unlink(binding);
+		if (boundary === "noncanonical-binding") await fs.writeFile(binding, `${original}\n`);
+		const input = boundary === "unregistered-scope" ? { ...cold.scope } : cold.scope;
+		await expect(reconcileManagedTombstones(input)).rejects.toThrow(
+			"The existing managed GC read authority could not be verified.",
+		);
+		expect(await fs.readFile(source, "utf8")).toBe(bytes);
+		if (boundary === "missing-binding") await expect(fs.access(binding)).rejects.toMatchObject({ code: "ENOENT" });
+		else
+			expect(await fs.readFile(binding, "utf8")).toBe(
+				boundary === "noncanonical-binding" ? `${original}\n` : original,
+			);
+	});
+
 	it("completes after a crash following transcript unlink with a durable retained artifact root", async () => {
 		const { cwd, sessionsRoot, scope } = await fixture();
 		const source = path.join(legacyDirectory(sessionsRoot, cwd), "post-transcript-crash.jsonl");
