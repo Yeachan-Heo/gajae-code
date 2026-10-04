@@ -288,7 +288,7 @@ function fieldsForOutcome(outcome: TaskArtifactOwnerRetirementOutcome) {
 
 function recordActualOwnerRemoval() {
 	const remove = native.exactRemoveDirectoryTree;
-	const calls: ReturnType<typeof remove>[] = [];
+	const calls: native.NativeExactUnlinkResult[] = [];
 	const spy = vi.spyOn(native, "exactRemoveDirectoryTree").mockImplementation((...args) => {
 		const result = remove(...args);
 		calls.push(result);
@@ -433,8 +433,13 @@ describe("verified storage consumes task artifact owners", () => {
 		fs.mkdirSync(artifactPath, { mode: 0o700 });
 		fs.writeFileSync(path.join(artifactPath, "keep.bin"), "artifact", { mode: 0o600 });
 		const nativeRemoval = recordActualOwnerRemoval();
+		const target = targetFor(fixture);
+		const recoveryOpen = vi.spyOn(native, "openRecoveryFsRoot");
+		const retain = vi.spyOn(native.RecoveryFsRoot.prototype, "retainManagedDirectory");
 		const before = filesystemSnapshot(fixture.root);
-		const result = await fixture.storage.deleteSessionVerified(targetFor(fixture));
+		const result = await fixture.storage.deleteSessionVerified(target);
+		expect(recoveryOpen).not.toHaveBeenCalled();
+		expect(retain).not.toHaveBeenCalled();
 		expect(result.kind).toBe("cleanup_pending");
 		expect(result.kind === "cleanup_pending" ? result.phase : undefined).toBe("task_artifact_owner");
 		expect(filesystemSnapshot(fixture.root)).toEqual(before);

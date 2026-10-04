@@ -224,7 +224,7 @@ export function captureTaskArtifactOwnerDeletionEvidence(
 ): TaskArtifactOwnerDeletionEvidence | undefined {
 	const locator = parseTaskArtifactOwnerLocator(locatorValue);
 	if (!locator) return undefined;
-	const rootStore = newSessionRootStore(context);
+	const rootStore = newSessionRootReaderStore(context);
 	try {
 		rootStore.verifyRootSecurity();
 		const parentIdentity: TaskArtifactOwnerParentIdentity = rootStore.captureDirectoryIdentity(OWNER_DIRECTORY);
