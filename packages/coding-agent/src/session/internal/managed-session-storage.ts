@@ -1457,6 +1457,7 @@ export class ManagedSessionDescendantStore {
 	readonly #root: ManagedDirectoryRoot;
 	readonly #baseDir: string;
 	readonly #policy: ManagedSessionSecurityPolicy;
+	readonly #access: "read-only" | "read-write";
 	readonly #authority: RecoveryFsRoot | undefined;
 	#ownsAuthority = false;
 	#closed = false;
@@ -1475,12 +1476,18 @@ export class ManagedSessionDescendantStore {
 		policy?: ManagedSessionSecurityPolicy,
 		profileAgentDir?: string,
 		expectedSubtreeRoot?: ManagedDirectoryRoot,
+		access: "read-only" | "read-write" = "read-write",
 	) {
+		if (access !== "read-only" && access !== "read-write") throw new Error("managed_store_access_invalid");
+		if (access === "read-only" && retained) throw new Error("managed_read_store_cannot_borrow_authority");
+		if (access === "read-only" && !expectedSubtreeRoot)
+			throw new Error("managed_read_store_requires_existing_identity");
 		managedRelativePath(root, baseDir);
 
 		this.#root = root;
 		this.#baseDir = path.resolve(baseDir);
 		this.#policy = policy ?? "default";
+		this.#access = access;
 		this.#profileAgentDir = profileAgentDir ?? root.canonicalPath;
 		this.#authorityBaseDir = retained?.authorityBaseDir ?? this.#baseDir;
 		if (retained) {
@@ -1558,7 +1565,7 @@ export class ManagedSessionDescendantStore {
 			dev: canonicalFileId(subtreeStat.dev),
 			ino: canonicalFileId(subtreeStat.ino),
 		});
-		if (process.platform === "linux") {
+		if (process.platform === "linux" && access === "read-write") {
 			const before = fs.lstatSync(this.#baseDir, { bigint: true });
 			const authority = nativeSessionStorage().openRecoveryFsRoot(this.#baseDir);
 			const retained = authority.identity();
@@ -1619,6 +1626,7 @@ export class ManagedSessionDescendantStore {
 	}
 
 	retainAuthority(): RecoveryFsRoot | undefined {
+		this.#assertWritable();
 		if (!this.#authority) return undefined;
 		return this.#authority.retainManagedDirectory(
 			"",
@@ -1673,7 +1681,7 @@ export class ManagedSessionDescendantStore {
 	captureDirectoryIdentity(relativePath: string): { dev: string; ino: string } {
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
-		if (!this.#authority) this.#assertPathBackedDirectoryChain(resolved);
+		if (this.#access === "read-only" || !this.#authority) this.#assertPathBackedDirectoryChain(resolved);
 		const named = fs.lstatSync(resolved, { bigint: true });
 		if (!named.isDirectory() || named.isSymbolicLink()) throw new Error("managed_directory_identity_unavailable");
 		const dev = canonicalFileId(named.dev);
@@ -2019,7 +2027,12 @@ export class ManagedSessionDescendantStore {
 		}
 	}
 
+	#assertWritable(): void {
+		if (this.#access === "read-only") throw new Error("managed_store_read_only");
+	}
+
 	#beforeMutation(): void {
+		this.#assertWritable();
 		this.#assertBound();
 		// Reaping is scheduled BEFORE reconciliation, not after. The receipt scan
 		// throws `managed_replace_cleanup_receipt_limit_exceeded` once the bound
@@ -3028,6 +3041,7 @@ export class ManagedSessionDescendantStore {
 			sourceStoreRelativePath: string;
 		},
 	): ManagedFileSnapshot {
+		this.#assertWritable();
 		this.#assertBound();
 		const sourceResolved = this.#resolve(sourceRelativePath);
 		const destinationResolved = this.#resolve(destinationRelativePath);

@@ -2280,6 +2280,21 @@ function managedGcScopeStore(scope: ManagedScope, trusted: ManagedGcTrustedScope
 		},
 	);
 }
+function managedGcScopeReader(scope: ManagedScope, trusted: ManagedGcTrustedScope): ManagedSessionDescendantStore {
+	return new ManagedSessionDescendantStore(
+		trusted.root,
+		scope.directoryPath,
+		undefined,
+		trusted.policy,
+		scope.agentDir,
+		{
+			canonicalPath: scope.directoryPath,
+			dev: BigInt.asUintN(64, trusted.identity.dev),
+			ino: BigInt.asUintN(64, trusted.identity.ino),
+		},
+		"read-only",
+	);
+}
 function managedGcRetirementTranscriptKey(transcriptPath: string): string {
 	return createHash("sha256").update(path.resolve(transcriptPath), "utf8").digest("hex");
 }
@@ -2354,7 +2369,7 @@ export function bindManagedGcSessionRetirementTarget(
 ): ManagedGcSessionRetirementTarget {
 	const trusted = managedGcTrustedScope(scope);
 	const transcriptPath = validateManagedGcTranscriptPath(scope, transcriptPathValue);
-	const store = managedGcScopeStore(scope, trusted);
+	const store = managedGcScopeReader(scope, trusted);
 	try {
 		store.verifyRootSecurity();
 		store.assertBound();
@@ -2740,7 +2755,7 @@ export async function readManagedGcSessionRetirementReceiptReadOnly(
 ): Promise<ManagedGcSessionRetirementReceipt | undefined> {
 	const trusted = managedGcTrustedScope(scope);
 	validateManagedGcTranscriptPath(scope, transcriptPath);
-	const store = managedGcScopeStore(scope, trusted);
+	const store = managedGcScopeReader(scope, trusted);
 	try {
 		store.verifyRootSecurity();
 		store.assertBound();
@@ -2804,7 +2819,7 @@ export async function discoverManagedGcSessionRetirementReceipts(input: {
 			throw new Error("managed_gc_scope_authority_mismatch");
 		const scope = resolved.scope;
 		const trusted = managedGcTrustedScope(scope);
-		const store = managedGcScopeStore(scope, trusted);
+		const store = managedGcScopeReader(scope, trusted);
 		try {
 			let directoryIdentity: { dev: string; ino: string };
 			try {
