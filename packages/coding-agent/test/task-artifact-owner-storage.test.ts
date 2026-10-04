@@ -5,10 +5,18 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import {
+	bindManagedGcSessionRetirementTarget,
+	type ManagedGcProtocolScopeInput,
+	type ManagedScope,
+	managedGcProtocolScopeInspectorForScope,
 	prepareManagedSessionScopeForWriteSync,
+	publishManagedGcSessionRetirementReceipt,
 	resolveManagedScopeForWrite,
 } from "../src/session/internal/managed-session-scope";
 import {
+	acquireManagedLock,
+	captureManagedFileNoFollow,
+	isManagedLockQuarantineName,
 	type ManagedDirectoryRoot,
 	ManagedSessionDescendantStore,
 	prepareManagedDirectoryRoot,
@@ -43,6 +51,7 @@ interface Fixture {
 	readonly ownerPath: string;
 	readonly ownerPayloadPath: string;
 	readonly transcriptPath: string;
+	readonly scope: ManagedScope;
 	readonly evidence: TaskArtifactOwnerDeletionEvidence;
 	readonly storage: FileSessionStorage;
 }
@@ -156,6 +165,7 @@ async function makeFixture(): Promise<Fixture> {
 		ownerPath,
 		ownerPayloadPath: path.join(ownerPath, "payload.bin"),
 		transcriptPath,
+		scope,
 		evidence,
 		storage: new FileSessionStorage(),
 	};
@@ -193,6 +203,74 @@ function targetFor(fixture: Fixture, updates: Partial<VerifiedSessionDeleteTarge
 	};
 }
 
+function protocolInputFor(scope: ManagedScope): ManagedGcProtocolScopeInput {
+	const scopeStat = fs.lstatSync(scope.directoryPath, { bigint: true });
+	const bindingPath = path.join(scope.directoryPath, ".gjc-managed-session-scope.v2.json");
+	const binding = captureManagedFileNoFollow(bindingPath);
+	const bindingStat = fs.lstatSync(bindingPath, { bigint: true });
+	const protocolPath = path.join(scope.directoryPath, ".gjc-managed-session-internal");
+	const protocolStat = fs.lstatSync(protocolPath, { bigint: true });
+	return {
+		scopePath: scope.directoryPath,
+		scopeIdentity: {
+			path: scope.directoryPath,
+			dev: scopeStat.dev.toString(),
+			ino: scopeStat.ino.toString(),
+		},
+		bindingIdentity: {
+			name: path.basename(bindingPath),
+			dev: binding.identity.dev.toString(),
+			ino: binding.identity.ino.toString(),
+			nlink: binding.identity.nlink.toString(),
+			size: binding.identity.size,
+			mtimeNs: binding.identity.mtimeNs.toString(),
+			ctimeNs: binding.identity.ctimeNs.toString(),
+			mode: Number(bindingStat.mode & 0o777n),
+			sha256: binding.identity.sha256,
+		},
+		protocolIdentity: {
+			path: protocolPath,
+			dev: protocolStat.dev.toString(),
+			ino: protocolStat.ino.toString(),
+			mtimeNs: protocolStat.mtimeNs.toString(),
+			ctimeNs: protocolStat.ctimeNs.toString(),
+			mode: Number(protocolStat.mode & 0o777n),
+		},
+	};
+}
+
+function filesystemSnapshot(root: string): unknown[] {
+	const entries: unknown[] = [];
+	const visit = (pathname: string, relative: string): void => {
+		const stat = fs.lstatSync(pathname, { bigint: true });
+		const kind = stat.isSymbolicLink()
+			? "symlink"
+			: stat.isDirectory()
+				? "directory"
+				: stat.isFile()
+					? "file"
+					: "other";
+		entries.push({
+			path: relative,
+			kind,
+			dev: stat.dev.toString(),
+			ino: stat.ino.toString(),
+			nlink: stat.nlink.toString(),
+			size: Number(stat.size),
+			mtimeNs: stat.mtimeNs.toString(),
+			ctimeNs: stat.ctimeNs.toString(),
+			mode: Number(stat.mode & 0o777n),
+			...(kind === "file" ? { bytes: fs.readFileSync(pathname) } : {}),
+			...(kind === "symlink" ? { link: fs.readlinkSync(pathname) } : {}),
+		});
+		if (kind === "directory")
+			for (const name of fs.readdirSync(pathname).sort())
+				visit(path.join(pathname, name), relative ? path.join(relative, name) : name);
+	};
+	visit(root, "");
+	return entries;
+}
+
 function fieldsForOutcome(outcome: TaskArtifactOwnerRetirementOutcome) {
 	return {
 		taskArtifactOwnerRetirementOutcome: outcome,
@@ -216,6 +294,97 @@ function recordActualOwnerRemoval() {
 }
 
 describe("verified storage consumes task artifact owners", () => {
+	it("authenticates a real prepared GC journal and exact protocol roles without mutation", async () => {
+		const fixture = await makeFixture();
+		const target = bindManagedGcSessionRetirementTarget(fixture.scope, fixture.transcriptPath);
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, {
+			...target,
+			state: "prepared",
+			taskArtifactOwnerDeletionEvidence: fixture.evidence,
+		});
+		const inspect = managedGcProtocolScopeInspectorForScope(fixture.scope);
+		const lock = await acquireManagedLock(
+			path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal", "locks"),
+			`gc-retirement-${crypto.createHash("sha256").update(path.resolve(fixture.transcriptPath)).digest("hex")}`,
+			fixture.context.rootAuthority,
+		);
+		try {
+			const before = filesystemSnapshot(fixture.root);
+			const [snapshot] = await inspect([protocolInputFor(fixture.scope)]);
+			expect(snapshot?.scope.path).toBe(fixture.scope.directoryPath);
+			expect(snapshot?.directories.map(directory => directory.role)).toEqual(["locks", "receipts", "tombstones"]);
+			const lockFiles = snapshot?.directories.find(directory => directory.role === "locks")?.files ?? [];
+			const lockQuarantines = lockFiles.filter(file => isManagedLockQuarantineName(file.name));
+			expect(lockFiles.filter(file => !isManagedLockQuarantineName(file.name))).toHaveLength(1);
+			if (process.platform !== "win32") expect(lockQuarantines.length).toBeGreaterThan(0);
+			for (const quarantine of lockQuarantines) {
+				expect(quarantine.size).toBe(0);
+				expect(quarantine.sha256).toBe(crypto.createHash("sha256").digest("hex"));
+			}
+			expect(snapshot?.directories.find(directory => directory.role === "receipts")?.files).toHaveLength(1);
+			expect(filesystemSnapshot(fixture.root)).toEqual(before);
+		} finally {
+			await lock.release();
+		}
+	});
+
+	it("fails closed on unknown, symlinked, replaced, and foreign protocol authority without mutation", async () => {
+		const fixture = await makeFixture();
+		const bound = bindManagedGcSessionRetirementTarget(fixture.scope, fixture.transcriptPath);
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, {
+			...bound,
+			state: "prepared",
+			taskArtifactOwnerDeletionEvidence: fixture.evidence,
+		});
+		const inspect = managedGcProtocolScopeInspectorForScope(fixture.scope);
+		const protocolPath = path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal");
+		const locksPath = path.join(protocolPath, "locks");
+		const malformedQuarantinePath = path.join(locksPath, `.gjc-lock-${crypto.randomUUID()}.stale`);
+		fs.writeFileSync(malformedQuarantinePath, "not-scrubbed", { mode: 0o600 });
+		let before = filesystemSnapshot(fixture.root);
+		await expect(inspect([protocolInputFor(fixture.scope)])).rejects.toThrow(
+			`managed_gc_protocol_lock_quarantine_invalid [locks/${path.basename(malformedQuarantinePath)}]`,
+		);
+		expect(filesystemSnapshot(fixture.root)).toEqual(before);
+		fs.unlinkSync(malformedQuarantinePath);
+
+		const unknownPath = path.join(protocolPath, "unexpected-role");
+		fs.mkdirSync(unknownPath, { mode: 0o700 });
+		before = filesystemSnapshot(fixture.root);
+		await expect(inspect([protocolInputFor(fixture.scope)])).rejects.toThrow("managed_gc_protocol_roles_invalid");
+		expect(filesystemSnapshot(fixture.root)).toEqual(before);
+		fs.rmdirSync(unknownPath);
+
+		const savedLocksPath = path.join(protocolPath, "locks.saved");
+		fs.renameSync(locksPath, savedLocksPath);
+		fs.symlinkSync(savedLocksPath, locksPath);
+		before = filesystemSnapshot(fixture.root);
+		await expect(inspect([protocolInputFor(fixture.scope)])).rejects.toThrow();
+		expect(filesystemSnapshot(fixture.root)).toEqual(before);
+		fs.unlinkSync(locksPath);
+		fs.renameSync(savedLocksPath, locksPath);
+
+		const staleInput = protocolInputFor(fixture.scope);
+		const savedProtocolPath = `${protocolPath}.saved`;
+		fs.renameSync(protocolPath, savedProtocolPath);
+		fs.mkdirSync(protocolPath, { mode: 0o700 });
+		for (const role of ["locks", "receipts", "tombstones"])
+			fs.mkdirSync(path.join(protocolPath, role), { mode: 0o700 });
+		before = filesystemSnapshot(fixture.root);
+		await expect(inspect([staleInput])).rejects.toThrow("managed_gc_protocol_roles_invalid");
+		expect(filesystemSnapshot(fixture.root)).toEqual(before);
+
+		const foreign = await makeFixture();
+		const foreignInspect = managedGcProtocolScopeInspectorForScope(fixture.scope);
+		const sourceBefore = filesystemSnapshot(fixture.root);
+		const foreignBefore = filesystemSnapshot(foreign.root);
+		await expect(foreignInspect([protocolInputFor(foreign.scope)])).rejects.toThrow(
+			"managed_gc_protocol_scope_path_mismatch",
+		);
+		expect(filesystemSnapshot(fixture.root)).toEqual(sourceBefore);
+		expect(filesystemSnapshot(foreign.root)).toEqual(foreignBefore);
+	});
+
 	it("retires a valid owner with the actual native outcome and returns the full replay evidence", async () => {
 		const fixture = await makeFixture();
 		const nativeRemoval = recordActualOwnerRemoval();
