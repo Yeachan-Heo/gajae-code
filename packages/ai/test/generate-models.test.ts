@@ -5,6 +5,7 @@ import {
 	injectImageGenerationModels,
 	injectMuseSparkModels,
 } from "../scripts/generate-models";
+import modelsJson from "../src/models.json" with { type: "json" };
 import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "../src/provider-models/openai-compat";
 import type { Model } from "../src/types";
 
@@ -360,11 +361,10 @@ describe("injectMuseSparkModels", () => {
 });
 
 describe("pricing normalization", () => {
-	it("validates that negative pricing is not used in bundled models", async () => {
-		const modelsJson = await import("../src/models.json");
+	it("validates that negative pricing is not used in bundled models", () => {
 		const allModels: Model[] = [];
 
-		for (const providerModels of Object.values(modelsJson.default as Record<string, Record<string, Model>>)) {
+		for (const providerModels of Object.values(modelsJson as unknown as Record<string, Record<string, Model>>)) {
 			for (const model of Object.values(providerModels)) {
 				allModels.push(model);
 			}
