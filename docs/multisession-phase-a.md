@@ -134,7 +134,7 @@ The Worker arm adds two behaviors that no existing test covered. Phase A adds ch
 
 AGENTS.md normally requires every Worker to use the compile-safe hybrid constructor **and** to be registered as an extra compile entrypoint.
 
-`worker-host.ts` follows the hybrid constructor but is **deliberately not registered** in `scripts/compile-args.ts`. This harness is a source-only experiment, and registering it would ship benchmark code in the `gjc` binary.
+`worker-host.ts` follows the hybrid constructor but is **deliberately not registered** in `packages/coding-agent/scripts/compile-args.ts`. This harness is a source-only experiment, and registering it would ship benchmark code in the `gjc` binary.
 
 Revisit this exception if a bench Worker ever needs to run from a compiled binary.
 
