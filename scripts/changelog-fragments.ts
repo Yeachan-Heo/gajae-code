@@ -391,14 +391,30 @@ export function fragmentNoteLines(fragmentText: string): string[] {
 }
 
 /**
- * True when this PR's own change shipped the deleted fragment's note: every note line
- * is present in the head CHANGELOG and absent from the base CHANGELOG, which is exactly
- * what `foldFragmentsIntoChangelog` does when the release flow consumes a fragment.
+ * A CHANGELOG's version-section headings (`## [x.y.z]`), not the `### <Section>` entry
+ * headings. A release fold always introduces a new one for the version it cuts.
+ */
+export function versionSectionHeadings(content: string): string[] {
+	return content
+		.split("\n")
+		.map(line => line.trim())
+		.filter(line => /^## [^#]/u.test(line));
+}
+
+/**
+ * True when this PR's own change shipped the deleted fragment's note. Three things must
+ * hold, and together they describe exactly what the release flow's
+ * `foldFragmentsIntoChangelog` does when it consumes a fragment:
  *
- * Provenance matters more than content here. Matching head content alone would exempt a
- * normal PR that deletes an unreleased note whose bullet text happens to repeat a line
- * from an older release, so a line already present at base never counts as shipped.
- * An unreadable fragment or CHANGELOG fails closed.
+ * 1. every note line is present in the head CHANGELOG,
+ * 2. every note line is absent from the base CHANGELOG, and
+ * 3. the head introduced a version section the base did not have — the section the release
+ *    cut open for the notes it folded.
+ *
+ * Provenance matters more than content here. Content alone would exempt a normal PR that
+ * deletes an unreleased note whose bullet text repeats an older release line, and (1)+(2)
+ * alone would exempt a PR that parks the note under an already-existing released heading,
+ * where no release flow put it. An unreadable fragment or CHANGELOG fails closed.
  */
 export function isConsumedFragmentNote(
 	fragmentText: string | undefined,
@@ -411,7 +427,9 @@ export function isConsumedFragmentNote(
 	const shipped = new Set(headChangelog.split("\n").map(line => line.trim()));
 	if (!noteLines.every(line => shipped.has(line))) return false;
 	const alreadyShipped = new Set(baseChangelog.split("\n").map(line => line.trim()));
-	return noteLines.every(line => !alreadyShipped.has(line));
+	if (!noteLines.every(line => !alreadyShipped.has(line))) return false;
+	const baseHeadings = new Set(versionSectionHeadings(baseChangelog));
+	return versionSectionHeadings(headChangelog).some(heading => !baseHeadings.has(heading));
 }
 
 async function gitShow(revision: string, file: string): Promise<string | undefined> {

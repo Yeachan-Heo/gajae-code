@@ -83,6 +83,13 @@ function note(text: string, file = "fragment.md") {
 function insert(content: string, entry: string): string {
 	return content.replace("### Fixed\n\n", `### Fixed\n\n${entry}\n`);
 }
+/** What the release fold produces: a newly cut version section carrying the note. */
+function cutRelease(note: string): string {
+	return CHANGELOG.replace(
+		"## [1.0.0] - 2026-01-01",
+		`## [1.0.1] - 2026-01-02\n\n### Fixed\n\n${note}\n\n## [1.0.0] - 2026-01-01`,
+	);
+}
 
 afterEach(async () => {
 	await Promise.all(tempDirs.splice(0).map(root => fs.rm(root, { recursive: true, force: true })));
@@ -229,14 +236,19 @@ describe("release-consumed fragment deletions", () => {
 	});
 
 	test("exempts a note this change shipped and fails closed everywhere else", () => {
-		const shipped = insert(CHANGELOG, "- A shipped fix.");
-		// This change folded the note: absent at base, present at head.
+		// What the release fold produces: a new version section carrying the note.
+		const shipped = cutRelease("- A shipped fix.");
 		expect(isConsumedFragmentNote(fragment, CHANGELOG, shipped)).toBe(true);
 		// The note never landed: deleting the fragment would drop it silently.
 		expect(isConsumedFragmentNote(fragment, CHANGELOG, CHANGELOG)).toBe(false);
 		// The note was already in an older release, so this change did not ship it. Content
 		// alone must never exempt a deletion — that is the loophole the guard exists for.
 		expect(isConsumedFragmentNote(fragment, shipped, shipped)).toBe(false);
+		// The note is parked under a version heading that already existed, so no release cut
+		// a section for it. Nothing put it there but the PR itself.
+		expect(isConsumedFragmentNote(fragment, CHANGELOG, insert(CHANGELOG, "- A shipped fix."))).toBe(false);
+		// A new section that does not carry the note ships nothing.
+		expect(isConsumedFragmentNote(fragment, CHANGELOG, cutRelease("- Something else."))).toBe(false);
 		expect(isConsumedFragmentNote(undefined, CHANGELOG, shipped)).toBe(false);
 		expect(isConsumedFragmentNote(fragment, undefined, shipped)).toBe(false);
 		expect(isConsumedFragmentNote(fragment, CHANGELOG, undefined)).toBe(false);
@@ -247,8 +259,7 @@ describe("release-consumed fragment deletions", () => {
 		// foldFragmentsIntoChangelog copies fragment lines verbatim, so a wrapped or
 		// re-indented CHANGELOG entry is intentionally not an exemption. This is a
 		// fail-closed false positive (a blocked release PR), never a silent drop.
-		const wrapped = insert(CHANGELOG, "- A shipped\n  fix.");
-		expect(isConsumedFragmentNote(fragment, CHANGELOG, wrapped)).toBe(false);
+		expect(isConsumedFragmentNote(fragment, CHANGELOG, cutRelease("- A shipped\n  fix."))).toBe(false);
 	});
 
 	test("the guard permits a backmerge that consumes a released fragment and still rejects a dropped note", async () => {
