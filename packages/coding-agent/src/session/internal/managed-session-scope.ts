@@ -2805,6 +2805,7 @@ export async function discoverManagedGcSessionRetirementReceipts(input: {
 	};
 	const entries = fs.readdirSync(sessionsRoot, { withFileTypes: true });
 	const result: Array<{ readonly scope: ManagedScope; readonly receipt: ManagedGcSessionRetirementReceipt }> = [];
+	// Fail closed for the whole root: a partial inventory cannot prove live sibling absence.
 	for (const entry of entries) {
 		if (!/^v2-[a-z2-7]{52}$/u.test(entry.name)) continue;
 		if (!entry.isDirectory() || entry.isSymbolicLink()) throw new Error("managed_gc_scope_authority_mismatch");
