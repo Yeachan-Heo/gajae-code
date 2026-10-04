@@ -918,8 +918,9 @@ async function cmdRelease(version: string): Promise<void> {
 	if (backmerge.action === "blocked") {
 		console.error(`  Backmerge blocked: ${backmerge.detail}`);
 		console.error(`  v${version} is already published; sync dev by hand:`);
-		console.error("    git fetch origin && git worktree add /tmp/gjc-backmerge origin/dev \\");
-		console.error("      && git -C /tmp/gjc-backmerge merge origin/main && git -C /tmp/gjc-backmerge push origin HEAD:dev");
+		console.error("    git fetch origin && git worktree add /tmp/gjc-backmerge origin/dev");
+		console.error("    git -C /tmp/gjc-backmerge merge origin/main   # keep main's version and dev's artifacts map");
+		console.error("    git -C /tmp/gjc-backmerge push origin HEAD:dev");
 	} else {
 		console.log(`  ${backmerge.action}: ${backmerge.detail}`);
 	}
