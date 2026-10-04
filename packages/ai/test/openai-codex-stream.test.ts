@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { scheduler } from "node:timers/promises";
 import { enrichModelThinking } from "@gajae-code/ai/model-thinking";
 import {
 	createCodexStreamProgressClassifier,
@@ -3349,6 +3350,50 @@ describe("openai-codex streaming", () => {
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toContain("transient failure");
+	});
+
+	it("retries a connection-refused Codex SSE open before completing the turn", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-connect-retry-");
+		setAgentDir(tempDir.path());
+		const sse = createCompletedCodexSse("Recovered");
+		let attempts = 0;
+		const fetchMock = vi.fn(async () => {
+			attempts += 1;
+			if (attempts === 1) {
+				throw Object.assign(new Error("connection refused"), { code: "ConnectionRefused" });
+			}
+			return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+		});
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken() },
+		).result();
+
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+		expect(result.stopReason).not.toBe("error");
+	});
+
+	it("backs off connection-refused SSE opens for at least ten seconds", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-connect-backoff-");
+		setAgentDir(tempDir.path());
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const fetchMock = vi.fn(async () => {
+			throw Object.assign(new Error("connection refused"), { code: "ECONNREFUSED" });
+		});
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken() },
+		).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(fetchMock).toHaveBeenCalledTimes(6);
+		expect(waitSpy.mock.calls.reduce((total, [delay]) => total + Number(delay), 0)).toBeGreaterThanOrEqual(10_000);
 	});
 
 	it("retries transient model_error SSE events before surfacing an error", async () => {

@@ -259,7 +259,7 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		expect(userTexts(session)).toEqual(["p1", "steer me", "queue me"]);
 	});
 
-	it("cancels only the implicit diverted image before queue consumption", async () => {
+	it.each(["text", "image"] as const)("cancels only an implicit diverted %s before queue consumption", async kind => {
 		const gate = Promise.withResolvers<void>();
 		session = buildSession([
 			async () => {
@@ -276,13 +276,16 @@ describe("AgentSession queued prompts (issue #434)", () => {
 			const image = Buffer.from(
 				await Bun.file(path.join(import.meta.dir, "fixtures/sdk-inline-image-large.png")).arrayBuffer(),
 			).toString("base64");
+			const inputText = kind === "image" ? "cancel only this image" : "cancel only this text";
 			const promotions: Array<{ startsOwnRun?: boolean; removed?: boolean }> = [];
 			const dispositions: Array<{ startsOwnRun: boolean }> = [];
 			await session.sendUserMessage(
-				[
-					{ type: "text", text: "cancel only this image" },
-					{ type: "image", mimeType: "image/png", data: image },
-				],
+				kind === "image"
+					? [
+							{ type: "text", text: inputText },
+							{ type: "image", mimeType: "image/png", data: image },
+						]
+					: inputText,
 				{
 					preflightSignal: cancelled.signal,
 					onDispatchDisposition: disposition => dispositions.push(disposition),
@@ -290,7 +293,7 @@ describe("AgentSession queued prompts (issue #434)", () => {
 				},
 			);
 			expect(dispositions).toEqual([{ startsOwnRun: false }]);
-			expect(session.getQueuedMessages().steering).toEqual(["keep steer", "cancel only this image"]);
+			expect(session.getQueuedMessages().steering).toEqual(["keep steer", inputText]);
 			cancelled.abort();
 			expect(session.getQueuedMessages().steering).toEqual(["keep steer"]);
 			expect(promotions).toEqual([{ startsOwnRun: false, removed: true }]);

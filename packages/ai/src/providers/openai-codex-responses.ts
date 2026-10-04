@@ -57,7 +57,7 @@ import {
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 	transportFailureFacts,
 } from "../utils/fallback-transport";
-import { finalizeErrorMessage, type RawHttpRequestDump } from "../utils/http-inspector";
+import { finalizeErrorMessage, isConnectStageTransportFailure, type RawHttpRequestDump } from "../utils/http-inspector";
 import {
 	getOpenAIStreamIdleTimeoutMs,
 	getStreamFirstEventTimeoutMs,
@@ -3454,7 +3454,10 @@ async function openCodexSseEventStream(
 		body: JSON.stringify(body),
 		signal,
 		maxAttempts: resolveRetryBudget(options?.requestMaxRetries, CODEX_MAX_RETRIES) + 1,
-		defaultDelayMs: attempt => CODEX_RETRY_DELAY_MS * (attempt + 1),
+		defaultDelayMs: (attempt, error) =>
+			isConnectStageTransportFailure(error)
+				? Math.min(1000 * 2 ** attempt, 4000)
+				: CODEX_RETRY_DELAY_MS * (attempt + 1),
 		maxDelayMs: CODEX_RATE_LIMIT_BUDGET_MS,
 		fetch: fetchOverride,
 	});

@@ -58,6 +58,12 @@ const TRANSPORT_FAILURE_CODES: ReadonlySet<string> = new Set([
 	"UND_ERR_SOCKET",
 ]);
 
+const CONNECT_STAGE_FAILURE_CODES: ReadonlySet<string> = new Set([
+	"ConnectionRefused",
+	"FailedToOpenSocket",
+	"ECONNREFUSED",
+]);
+
 /**
  * Privacy note appended next to a saved raw HTTP request dump. The dump is
  * sanitized (secrets/thinking redacted) but can still contain prompt content
@@ -185,6 +191,12 @@ function findTransportFailure(error: unknown, depth: number): { code: string; ur
 		return { code: info.code, url: redactRequestUrl(info.path) ?? redactRequestUrl(info.url) };
 	}
 	return findTransportFailure(info.cause, depth + 1);
+}
+
+/** Whether the error indicates that the request failed while opening its connection. */
+export function isConnectStageTransportFailure(error: unknown): boolean {
+	const failure = findTransportFailure(error, 0);
+	return failure !== undefined && CONNECT_STAGE_FAILURE_CODES.has(failure.code);
 }
 
 /**

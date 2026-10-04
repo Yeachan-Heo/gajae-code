@@ -483,17 +483,23 @@ uncertain and never permits mutation replay.
 
 Before consumption, a prompt diverted into steering retains its own queue-removal
 capability; cancelling it must not abort unrelated active work. After consumption,
-its image quota and durable completion belong to the exact consuming run and
-cancellation domain. A trusted natural terminal settles each joined accepted
-prompt with its own correlation; confirmed queue removal settles that submission
-without waiting for an unrelated run. A deterministic cancellation receipt waits
-for that submission's durable terminal; persistence uncertainty remains uncertain
-on same-key replay. Confirmed queue residence suspends the terminal lease. Actual
-consumption or own-run promotion starts a fresh bounded lease, renewed only by
-attributable progress in the same consuming run and cancellation domain.
-A transport diagnostic or delivery-record
-expiry does not prove execution ended and cannot release accepted-image quota.
-Exact run terminal or session teardown releases retained image quota.
+its durable completion belongs to the exact consuming run and cancellation domain.
+A trusted natural terminal settles each joined accepted prompt with its own
+correlation. Confirmed queue removal settles only that submission, without waiting
+for an unrelated run. A deterministic cancellation receipt waits for that
+submission's durable terminal; held or failed persistence remains uncertain,
+including same-key replay. Retired queue authority cannot be reused to abort the
+root run.
+
+Confirmed queue residence suspends the terminal lease. Actual consumption or
+own-run promotion starts a fresh bounded lease, renewed only by attributable
+progress in the same consuming run and cancellation domain. Session teardown
+retires joined attribution; late predecessor progress or terminal events cannot
+adopt or settle a successor. Transport or delivery failure alone does not prove
+execution settled and does not retire a live unsettled execution owner.
+Accepted-image quota shares that exact run/domain ownership: transport diagnostics
+or delivery-record expiry cannot release it. Only exact run terminal or session
+teardown releases retained image capacity.
 
 `turn.prompt` remains ordered and non-idempotent. Its envelope `idempotencyKey`
 does not replay a response or produce `idempotency_conflict`. A retained duplicate
