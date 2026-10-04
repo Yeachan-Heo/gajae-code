@@ -1508,13 +1508,6 @@ function isCodexTransientStreamClose(error: unknown): boolean {
 	if (!(error instanceof Error)) return false;
 	const providerMessage = (error as CodexProviderStreamError).providerMessage;
 	const message = (providerMessage || error.message).toLowerCase();
-	const transportCode = (error as { code?: unknown }).code;
-	if (
-		isUnexpectedSocketCloseMessage(message) ||
-		(typeof transportCode === "string" && transportCode.toUpperCase() === "ECONNRESET")
-	) {
-		return true;
-	}
 	const providerCode =
 		(error as CodexProviderStreamError & { providerCode?: string }).code?.toLowerCase() ??
 		(error as { providerCode?: string }).providerCode?.toLowerCase();
@@ -1525,6 +1518,17 @@ function isCodexTransientStreamClose(error: unknown): boolean {
 		message.includes("stream closed before response.completed") ||
 		message.includes("websocket closed before response completion");
 	return (hasRequestTimeout && hasClosedStreamMessage) || isCodexIdleStall(error);
+}
+
+function isCodexSocketReset(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	const providerMessage = (error as CodexProviderStreamError).providerMessage;
+	const message = (providerMessage || error.message).toLowerCase();
+	const transportCode = (error as { code?: unknown }).code;
+	return (
+		isUnexpectedSocketCloseMessage(message) ||
+		(typeof transportCode === "string" && transportCode.toLowerCase() === "econnreset")
+	);
 }
 
 function isCodexIdleStall(error: unknown): boolean {
@@ -2557,8 +2561,12 @@ async function tryRetryCodexProviderError(
 	runtime: CodexStreamRuntime,
 	error: unknown,
 ): Promise<boolean> {
+	const hasUnfinalizedToolCall = context.output.content.some(
+		block => block.type === "toolCall" && !runtime.finalizedToolCallIds.has(block.id),
+	);
 	const canReplayPartialToolCall =
-		isCodexTransientStreamClose(error) &&
+		((isCodexTransientStreamClose(error) && !isCodexIdleStall(error)) || isCodexSocketReset(error)) &&
+		hasUnfinalizedToolCall &&
 		runtime.finalizedToolCallIds.size === 0 &&
 		!runtime.partialToolCallReplayAttempted &&
 		context.output.content.every(
