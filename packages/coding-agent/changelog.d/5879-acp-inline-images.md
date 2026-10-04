@@ -7,5 +7,6 @@
 - Bound retained upload allocations for tiny image fragments as well as payload bytes.
 - Enforce elapsed upload expiry even when cleanup callbacks are delayed, including redemption, in-flight finalization and live-peer batch renewal.
 - Preserve cancelled user-image publication barriers across same-session-ID replacement and recordless recovery, retaining failed publication until explicit retirement.
+- Cancel the SDK-only ordinary abort requester's admitted preflight snapshot through durable acceptance and before execution starts, without cancelling foreign or later admissions or inventing a durable terminal.
 - Renew upload inactivity leases only within an authenticated request batch, preserving earlier completed images during slow multi-image staging while abandoned uploads still expire.
 - Validate staged images and their SDK envelope before publishing any user echo; renew the local watchdog only for this request's validated staging progress.

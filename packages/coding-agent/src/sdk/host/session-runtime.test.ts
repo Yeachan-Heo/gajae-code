@@ -1,5 +1,6 @@
 import { describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
+import * as fsPromises from "node:fs/promises";
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -23,7 +24,7 @@ import {
 import { Broker } from "../broker/broker";
 import { createKindAwareReconciliation } from "../bus/kind-aware-reconciliation";
 import { createPromptReconciliation } from "../bus/prompt-reconciliation";
-import { createReconciliationStore } from "../bus/reconciliation-store";
+import { createReconciliationStore, type ReconciliationStoreDocument } from "../bus/reconciliation-store";
 import { PromptDeadlineManager } from "../prompt-deadline-manager";
 import { BROKER_RUNTIME_ABORT_CAPABILITY_FIELD, setBrokerRuntimeAbortCapabilityForTest } from "./control/runtime-gate";
 import { SESSION_HOST_OBSERVER_CAPABILITY, TURN_STREAM_CAPABILITY } from "./host";
@@ -2671,17 +2672,31 @@ describe("SessionSdkSessionRuntime", () => {
 		}
 	});
 
-	test("SDK-only host cancels only the preflights admitted at abort time, never a pipelined successor", async () => {
+	test.each([
+		"ordinary",
+		"terminal",
+	] as const)("SDK-only %s abort cancels only its admitted preflight snapshot", async mode => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-preflight-snapshot-"));
+		const signals = new Map<string, AbortSignal>();
+		const acceptCallbacks = new Map<string, () => void | Promise<void>>();
+		let rootAbortCalls = 0;
 		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
 		const api = {
 			on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
 				handlers.set(event, handler);
 			},
-			// Hold every prompt preflight open: acceptance is never signalled, so
-			// each submission stays pending until the abort (or nothing) settles it.
-			// Deferred via Promise.withResolvers per the repository contract.
-			sendUserMessage: () => Promise.withResolvers<void>().promise,
+			// Keep actual admission capabilities pending, rather than inventing
+			// an acceptance or terminal. Record before the runtime can reject.
+			sendUserMessage: (
+				content: Parameters<ExtensionAPI["sendUserMessage"]>[0],
+				options: PreflightHooks | undefined,
+			) => {
+				const text = typeof content === "string" ? content : content.find(block => block.type === "text")?.text;
+				if (text !== undefined && options?.preflightSignal) signals.set(text, options.preflightSignal);
+				if (text !== undefined && options?.onPreflightAcceptCommit)
+					acceptCallbacks.set(text, options.onPreflightAcceptCommit);
+				return Promise.withResolvers<void>().promise;
+			},
 		} as unknown as ExtensionAPI;
 		const transport = memoryTransport();
 		const reconciliationStore = createReconciliationStore({
@@ -2703,7 +2718,12 @@ describe("SessionSdkSessionRuntime", () => {
 				},
 			},
 		});
-		const ctx = extensionContext(transport.sessionId, cwd);
+		const ctx = {
+			...extensionContext(transport.sessionId, cwd),
+			abort: async () => {
+				rootAbortCalls++;
+			},
+		};
 		try {
 			await handlers.get("session_start")?.({}, ctx);
 			const prompt = (id: string) =>
@@ -2714,14 +2734,22 @@ describe("SessionSdkSessionRuntime", () => {
 					input: { text: `hold-${id}`, images: [] },
 				} as SdkFrame);
 			prompt("pre-1");
-			// Let the serialized (ordered) turn.prompt work register its preflight
-			// callback, so the abort's admission snapshot below sees it.
-			await Bun.sleep(0);
+			transport.feed("conn-b", {
+				type: "control_request",
+				id: "foreign-preflight",
+				operation: "turn.prompt",
+				input: { text: "foreign-pending", images: [] },
+			} as SdkFrame);
+			const readyDeadline = Date.now() + 2_000;
+			while (!signals.has("hold-pre-1")) {
+				if (Date.now() >= readyDeadline) throw new Error("Owned preflight was not admitted.");
+				await Bun.sleep(10);
+			}
 			transport.feed("conn-a", {
 				type: "control_request",
 				id: "pre-abort",
 				operation: "turn.abort",
-				input: { mode: "terminal" },
+				input: mode === "terminal" ? { mode: "terminal" } : {},
 				idempotencyKey: "pre-snapshot-key",
 			} as SdkFrame);
 			// A successor prompt pipelined by the SAME connection while the abort
@@ -2731,12 +2759,30 @@ describe("SessionSdkSessionRuntime", () => {
 			const deadline = Date.now() + 15_000;
 			while (
 				!transport.sent.some(frame => frame.id === "pre-abort" && frame.type === "control_response") ||
-				!transport.sent.some(frame => frame.id === "pre-1" && frame.type === "control_response")
+				!transport.sent.some(frame => frame.id === "pre-1" && frame.type === "control_response") ||
+				!signals.has("foreign-pending")
 			) {
 				if (Date.now() > deadline)
 					throw new Error("Timed out waiting for the abort and admitted-preflight responses");
 				await Bun.sleep(20);
 			}
+			expect(rootAbortCalls).toBe(0);
+			expect(signals.get("hold-pre-1")?.aborted).toBe(true);
+			expect(signals.get("foreign-pending")?.aborted).toBe(false);
+			// Prompt controls are serialized. Commit the untouched foreign
+			// admission through its real callback so the later request can enter.
+			const acceptForeign = acceptCallbacks.get("foreign-pending");
+			expect(acceptForeign).toBeDefined();
+			await acceptForeign!();
+			while (!signals.has("hold-pre-2")) {
+				if (Date.now() > deadline) throw new Error("Later admission did not enter after foreign acceptance.");
+				await Bun.sleep(10);
+			}
+			expect(signals.get("hold-pre-2")?.aborted).toBe(false);
+			expect(transport.sent.find(frame => frame.id === "foreign-preflight")).toMatchObject({
+				ok: true,
+				result: { accepted: true },
+			});
 			// The admitted preflight is cancelled by the abort.
 			expect(transport.sent.find(frame => frame.id === "pre-1")).toMatchObject({
 				ok: false,
@@ -2744,7 +2790,7 @@ describe("SessionSdkSessionRuntime", () => {
 			});
 			expect(transport.sent.find(frame => frame.id === "pre-abort")).toMatchObject({
 				ok: true,
-				result: expect.objectContaining({ turn: "no_active_turn" }),
+				result: expect.objectContaining(mode === "terminal" ? { turn: "no_active_turn" } : { aborted: true }),
 			});
 			// The successor preflight was NOT part of the abort's snapshot: it is
 			// neither cancelled nor failed, so no control response is emitted for it.
@@ -4617,6 +4663,114 @@ test.each(["natural", "removed"] as const)("SDK-only staged diversion has a dura
 		await rm(cwd, { recursive: true, force: true });
 	}
 });
+
+test.each([
+	"accepting",
+	"accepted",
+] as const)("SDK-only ordinary abort fences a real %s prompt before agent_start", async phase => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), `gjc-owned-preflight-${phase}-`));
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const clientRef = `owned-before-start-${phase}`;
+	const manager = SessionManager.inMemory(cwd);
+	const sessionId = manager.getSessionId();
+	const store = createReconciliationStore({ sessionFile: path.join(cwd, "session.jsonl"), sessionId });
+	const originalRename = fsPromises.rename;
+	let held = false;
+	let modelCalls = 0;
+	let rootAbortCalls = 0;
+	let ownedSignal: AbortSignal | undefined;
+	let harness: InvocationHarness | undefined;
+	let session: AgentSession | undefined;
+	let authStorage: AuthStorage | undefined;
+	const renameSpy = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
+		if (phase === "accepting" && !held && String(to) === store.path) {
+			const document = (await Bun.file(String(from)).json()) as ReconciliationStoreDocument;
+			if (document.records.some(record => record.clientRef === clientRef && record.status === "accepted")) {
+				held = true;
+				entered.resolve();
+				await release.promise;
+			}
+		}
+		await originalRename(from, to);
+	});
+	try {
+		authStorage = await AuthStorage.create(path.join(cwd, "auth.db"));
+		const mock = createMockModel({
+			responses: [
+				() => {
+					modelCalls++;
+					return { content: ["unexpected model execution"] };
+				},
+			],
+		});
+		authStorage.setRuntimeApiKey(mock.model.provider, "test-key");
+		session = new AgentSession({
+			agent: new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: mock.stream,
+			}),
+			sessionManager: manager,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: new ModelRegistry(authStorage),
+		});
+		harness = await invocationHarness(sessionId, cwd, {
+			isIdle: () => !session!.isStreaming,
+			abort: () => {
+				rootAbortCalls++;
+			},
+			terminalAbortSeams: { getReconciliationStore: () => store },
+			sendUserMessage: (content, options) => {
+				if (typeof content !== "string") throw new Error("Expected a text-only admission.");
+				const { deliverAs, ...admissionOptions } = options ?? {};
+				if (deliverAs !== undefined) throw new Error("Expected an ordinary prompt admission.");
+				ownedSignal = admissionOptions.preflightSignal;
+				return session!.sendUserMessage(content, {
+					...admissionOptions,
+					onPreflightAcceptCommit: async () => {
+						await admissionOptions.onPreflightAcceptCommit?.();
+						if (phase === "accepted") {
+							entered.resolve();
+							await release.promise;
+						}
+					},
+				});
+			},
+		});
+		session.subscribe(async event => {
+			await harness?.emit(event.type, event);
+		});
+		const prompt = harness.controlAs("owner", "turn.prompt", { text: "cancel before execution", clientRef });
+		await entered.promise;
+		if (phase === "accepted") expect(await prompt).toMatchObject({ ok: true, result: { accepted: true } });
+		expect(ownedSignal?.aborted).toBe(false);
+		expect(modelCalls).toBe(0);
+		expect(await harness.controlAs("owner", "turn.abort", {})).toMatchObject({ ok: true, result: { aborted: true } });
+		expect(ownedSignal?.aborted).toBe(true);
+		expect(rootAbortCalls).toBe(0);
+		release.resolve();
+		if (phase === "accepting") expect(await prompt).toMatchObject({ ok: false, error: { code: "busy" } });
+		expect(await settledStatus(harness, "turn.result", { kind: "prompt", clientRef })).toMatchObject({
+			status: "failed",
+		});
+		await session.waitForIdle();
+		expect(modelCalls).toBe(0);
+		expect(rootAbortCalls).toBe(0);
+		const document = (await Bun.file(store.path!).json()) as ReconciliationStoreDocument;
+		const durable = document.records.find(record => record.clientRef === clientRef);
+		expect(durable?.status).toBe("failed");
+		expect(durable?.terminalAt).toBeNumber();
+	} finally {
+		release.resolve();
+		await session?.waitForIdle().catch(() => undefined);
+		await harness?.stop();
+		await session?.dispose();
+		authStorage?.close();
+		renameSpy.mockRestore();
+		await rm(cwd, { recursive: true, force: true });
+	}
+}, 30_000);
 
 test.each([
 	"ordinary",

@@ -3033,10 +3033,11 @@ function createControlSurface(
 	};
 	const cancelAcceptedQueueSubmissions = async (
 		connectionId: string | undefined,
+		admittedRequests: readonly AcceptedQueueCancellation[] = [...acceptedQueueCancellations.values()],
 	): Promise<AcceptedQueueCancellationResult> => {
 		const result: AcceptedQueueCancellationResult = { removed: false, consumed: false, unconfirmed: false };
 		if (connectionId === undefined) return result;
-		const owned = [...acceptedQueueCancellations.values()].filter(
+		const owned = admittedRequests.filter(
 			request => request.connectionId === connectionId && request.accepted && request.queueCandidate,
 		);
 		for (const request of owned) {
@@ -3146,8 +3147,8 @@ function createControlSurface(
 		let accepted = false;
 		let settled = false;
 		const cancelPreflight = () => {
-			if (settled) return;
 			preflightController.abort();
+			if (settled) return;
 			settled = true;
 			preflight.reject(
 				Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" }),
@@ -4472,10 +4473,23 @@ function createControlSurface(
 		},
 		abort: async () => {
 			const connectionId = sdkControlRequesterContext.getStore();
+			const ownedAdmissions = [...acceptedQueueCancellations.values()].filter(
+				request => connectionId !== undefined && request.connectionId === connectionId,
+			);
+			const ownedPreflights = connectionId === undefined ? [] : [...(pendingPreflights.get(connectionId) ?? [])];
+			// Capture both phases before cancellation or any awaited terminal work:
+			// acceptance can settle its callback before agent_start owns the run.
+			for (const cancel of ownedPreflights) cancel();
+			let cancelledAdmission = ownedPreflights.length > 0;
+			for (const request of ownedAdmissions) {
+				if (request.disposition !== "preflight" || request.controller.signal.aborted) continue;
+				request.controller.abort();
+				cancelledAdmission = true;
+			}
 			if (connectionId !== undefined && !requesterOwnsActiveRun(connectionId)) {
-				const queueCancellation = await cancelAcceptedQueueSubmissions(connectionId);
+				const queueCancellation = await cancelAcceptedQueueSubmissions(connectionId, ownedAdmissions);
 				if (queueCancellation.unconfirmed) return { aborted: false, reason: "queue_terminal_unconfirmed" };
-				if (queueCancellation.removed) return { aborted: true };
+				if (queueCancellation.removed || cancelledAdmission) return { aborted: true };
 				return { aborted: false, turn: "no_active_turn" };
 			}
 			await Promise.resolve(ctx.abort()).catch(() => undefined);
