@@ -7537,4 +7537,437 @@ describe("openai-codex streaming", () => {
 		expect(requestTurnStates[0]).toBeNull();
 		expect(requestTurnStates[1]).toBe("turn-state-1");
 	});
+
+	it("discards abandoned tool-call args on timeout partial replay", async () => {
+		const partial = createCodexErrorSse([
+			{
+				type: "response.output_item.added",
+				item: { type: "function_call", id: "fc_abandoned", call_id: "call_abandoned", name: "old_tool", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_abandoned", delta: '{"abandoned":' },
+			{
+				type: "error",
+				code: "request_timeout",
+				message: "stream disconnected before completion: stream closed before response.completed",
+			},
+		]);
+		const accepted = createCodexErrorSse([
+			{
+				type: "response.output_item.added",
+				item: { type: "function_call", id: "fc_accepted", call_id: "call_accepted", name: "new_tool", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_accepted", delta: '{"accepted":true}' },
+			{
+				type: "response.output_item.done",
+				item: {
+					type: "function_call",
+					id: "fc_accepted",
+					call_id: "call_accepted",
+					name: "new_tool",
+					arguments: '{"accepted":true}',
+				},
+			},
+			{ type: "response.completed", response: { status: "completed", usage: DEFAULT_USAGE } },
+		]);
+		let requestCount = 0;
+		global.fetch = vi.fn(async () => {
+			requestCount += 1;
+			return new Response(requestCount === 1 ? partial : accepted, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			});
+		}) as unknown as typeof fetch;
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		const stream = streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken() },
+		);
+		const events = [];
+		for await (const event of stream) events.push(event);
+		const result = await stream.result();
+
+		expect(requestCount).toBe(2);
+		expect(result.content).toEqual([
+			{ type: "toolCall", id: "call_accepted|fc_accepted", name: "new_tool", arguments: { accepted: true } },
+		]);
+		expect(events.filter(event => event.type === "toolcall_start")).toHaveLength(1);
+		expect(events.filter(event => event.type === "toolcall_delta").map(event => event.delta)).toEqual(['{"accepted":true}']);
+		expect(JSON.stringify(events)).not.toContain("abandoned");
+	});
+
+	it("discards abandoned thinking before a replayed tool call", async () => {
+		const partial = createCodexErrorSse([
+			{ type: "response.output_item.added", item: { type: "reasoning", id: "rs_abandoned", summary: [] } },
+			{ type: "response.reasoning_text.delta", item_id: "rs_abandoned", delta: "abandoned thinking" },
+			{
+				type: "response.output_item.added",
+				item: { type: "function_call", id: "fc_abandoned_thinking", call_id: "call_abandoned_thinking", name: "old_tool", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_abandoned_thinking", delta: '{"abandoned":' },
+			{
+				type: "error",
+				code: "request_timeout",
+				message: "stream disconnected before completion: stream closed before response.completed",
+			},
+		]);
+		const accepted = createCodexErrorSse([
+			{ type: "response.output_item.added", item: { type: "reasoning", id: "rs_accepted", summary: [] } },
+			{ type: "response.reasoning_text.delta", item_id: "rs_accepted", delta: "accepted thinking" },
+			{
+				type: "response.output_item.added",
+				item: { type: "function_call", id: "fc_accepted_thinking", call_id: "call_accepted_thinking", name: "new_tool", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_accepted_thinking", delta: '{"accepted":true}' },
+			{
+				type: "response.output_item.done",
+				item: {
+					type: "function_call",
+					id: "fc_accepted_thinking",
+					call_id: "call_accepted_thinking",
+					name: "new_tool",
+					arguments: '{"accepted":true}',
+				},
+			},
+			{ type: "response.completed", response: { status: "completed", usage: DEFAULT_USAGE } },
+		]);
+		let requestCount = 0;
+		global.fetch = vi.fn(async () => {
+			requestCount += 1;
+			return new Response(requestCount === 1 ? partial : accepted, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			});
+		}) as unknown as typeof fetch;
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		const stream = streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken() },
+		);
+		const events = [];
+		for await (const event of stream) events.push(event);
+		await stream.result();
+
+		expect(requestCount).toBe(2);
+		expect(events.filter(event => event.type === "thinking_start")).toHaveLength(1);
+		expect(events.filter(event => event.type === "thinking_delta").map(event => event.delta)).toEqual(["accepted thinking"]);
+		expect(events.filter(event => event.type === "toolcall_start")).toHaveLength(1);
+		expect(JSON.stringify(events)).not.toContain("abandoned");
+	});
+
+	it.each([
+		["exhausted retry budget", { streamMaxRetries: 0 }],
+		["provider retries disabled", { disableProviderRetries: true }],
+		["managed fallback", { fallbackManaged: true }],
+	])("flushes partial events before error with %s", async (_label, options) => {
+		const sse = createCodexErrorSse([
+			{
+				type: "response.output_item.added",
+				item: { type: "function_call", id: "fc_partial_error", call_id: "call_partial_error", name: "partial_tool", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_partial_error", delta: '{"partial":' },
+			{
+				type: "error",
+				code: "request_timeout",
+				message: "stream disconnected before completion: stream closed before response.completed",
+			},
+		]);
+		global.fetch = vi.fn(async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } })) as unknown as typeof fetch;
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		const stream = streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken(), ...options },
+		);
+		const events = [];
+		for await (const event of stream) events.push(event);
+		const result = await stream.result();
+
+		expect(result.stopReason).toBe("error");
+		expect(events.map(event => event.type)).toContain("toolcall_start");
+		expect(events.map(event => event.type)).toContain("toolcall_delta");
+	});
+
+	it("flushes the buffered window on abort and finishes as aborted", async () => {
+		const ready = Promise.withResolvers<ReadableStreamDefaultController<Uint8Array>>();
+		const encoder = new TextEncoder();
+		global.fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+			const body = new ReadableStream<Uint8Array>({
+				start(controller) {
+					ready.resolve(controller);
+					init?.signal?.addEventListener("abort", () => {
+						controller.error(init.signal?.reason ?? new DOMException("aborted", "AbortError"));
+					});
+				},
+			});
+			return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+		}) as unknown as typeof fetch;
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const abort = new AbortController();
+		const stream = streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken(), signal: abort.signal },
+		);
+		const events: Array<{ type: string }> = [];
+		const consuming = (async () => {
+			for await (const event of stream) events.push(event as { type: string });
+		})();
+		const controller = await ready.promise;
+		controller.enqueue(
+			encoder.encode(
+				`data: ${JSON.stringify({ type: "response.output_item.added", item: { type: "function_call", id: "fc_abort", call_id: "call_abort", name: "abort_tool", arguments: "" } })}\n\n`,
+			),
+		);
+		controller.enqueue(
+			encoder.encode(
+				`data: ${JSON.stringify({ type: "response.function_call_arguments.delta", item_id: "fc_abort", delta: '{"partial":' })}\n\n`,
+			),
+		);
+		abort.abort();
+		await consuming;
+		const result = await stream.result();
+
+		expect(result.stopReason).toBe("aborted");
+		expect(events.map(event => event.type)).toContain("toolcall_start");
+		expect(events.map(event => event.type)).toContain("toolcall_delta");
+	});
+
+	it("flushes buffered partial events before a nonretryable error", async () => {
+		const sse = createCodexErrorSse([
+			{
+				type: "response.output_item.added",
+				item: { type: "function_call", id: "fc_nonretryable", call_id: "call_nonretryable", name: "invalid_tool", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_nonretryable", delta: '{"partial":' },
+			{ type: "error", code: "invalid_request_error", message: "invalid request" },
+		]);
+		global.fetch = vi.fn(async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } })) as unknown as typeof fetch;
+
+		const stream = streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken() },
+		);
+		const events = [];
+		for await (const event of stream) events.push(event);
+		const result = await stream.result();
+
+		expect(result.stopReason).toBe("error");
+		expect(events.map(event => event.type)).toContain("toolcall_start");
+		expect(events.map(event => event.type)).toContain("toolcall_delta");
+	});
+
+	it("flushes finalized toolcall_end before close and salvages without duplication", async () => {
+		const sse = createCodexErrorSse([
+			{
+				type: "response.output_item.added",
+				item: { type: "function_call", id: "fc_finalized_flush", call_id: "call_finalized_flush", name: "final_tool", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_finalized_flush", delta: '{"ok":true}' },
+			{
+				type: "response.output_item.done",
+				item: {
+					type: "function_call",
+					id: "fc_finalized_flush",
+					call_id: "call_finalized_flush",
+					name: "final_tool",
+					arguments: '{"ok":true}',
+				},
+			},
+			{
+				type: "error",
+				code: "request_timeout",
+				message: "stream disconnected before completion: stream closed before response.completed",
+			},
+		]);
+		global.fetch = vi.fn(async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } })) as unknown as typeof fetch;
+
+		const stream = streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken() },
+		);
+		const events = [];
+		for await (const event of stream) events.push(event);
+		const result = await stream.result();
+
+		expect(result.stopReason).toBe("toolUse");
+		expect(result.content.filter(block => block.type === "toolCall")).toHaveLength(1);
+		expect(events.filter(event => event.type === "toolcall_end")).toHaveLength(1);
+		expect(events.findIndex(event => event.type === "toolcall_end")).toBeLessThan(
+			events.findIndex(event => event.type === "done"),
+		);
+	});
+
+	it("preserves partial replay allowance across empty transient close, partial timeout, and success", async () => {
+		const emptyTransient = createCodexErrorSse([
+			{ type: "error", code: "model_error", message: "temporarily unavailable; retry your request" },
+		]);
+		const partial = createCodexErrorSse([
+			{
+				type: "response.output_item.added",
+				item: { type: "function_call", id: "fc_partial_allowance", call_id: "call_partial_allowance", name: "old_tool", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_partial_allowance", delta: '{"old":' },
+			{
+				type: "error",
+				code: "request_timeout",
+				message: "stream disconnected before completion: stream closed before response.completed",
+			},
+		]);
+		const success = createCodexErrorSse([
+			{
+				type: "response.output_item.added",
+				item: { type: "function_call", id: "fc_success_allowance", call_id: "call_success_allowance", name: "new_tool", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_success_allowance", delta: '{"new":true}' },
+			{
+				type: "response.output_item.done",
+				item: {
+					type: "function_call",
+					id: "fc_success_allowance",
+					call_id: "call_success_allowance",
+					name: "new_tool",
+					arguments: '{"new":true}',
+				},
+			},
+			{ type: "response.completed", response: { status: "completed", usage: DEFAULT_USAGE } },
+		]);
+		let requestCount = 0;
+		global.fetch = vi.fn(async () => {
+			requestCount += 1;
+			const body = requestCount === 1 ? emptyTransient : requestCount === 2 ? partial : success;
+			return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+		}) as unknown as typeof fetch;
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		const stream = streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken() },
+		);
+		const events = [];
+		for await (const event of stream) events.push(event);
+		const result = await stream.result();
+
+		expect(requestCount).toBe(3);
+		expect(result.content).toEqual([
+			{ type: "toolCall", id: "call_success_allowance|fc_success_allowance", name: "new_tool", arguments: { new: true } },
+		]);
+		expect(events.filter(event => event.type === "toolcall_start")).toHaveLength(1);
+		expect(JSON.stringify(events)).not.toContain("old");
+	});
+
+	it("flushes visible text immediately and vetoes partial replay", async () => {
+		const sse = createCodexErrorSse([
+			{ type: "response.output_item.added", item: { type: "message", id: "msg_veto", role: "assistant", content: [] } },
+			{ type: "response.content_part.added", part: { type: "output_text", text: "" } },
+			{ type: "response.output_text.delta", delta: "visible text" },
+			{
+				type: "response.output_item.added",
+				item: { type: "function_call", id: "fc_veto", call_id: "call_veto", name: "veto_tool", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_veto", delta: '{"partial":' },
+			{ type: "error", code: "request_timeout", message: "stream disconnected before completion" },
+		]);
+		const fetchMock = vi.fn(async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }));
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		const stream = streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken() },
+		);
+		const events = [];
+		for await (const event of stream) events.push(event);
+		const result = await stream.result();
+
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(result.stopReason).toBe("error");
+		expect(events.map(event => event.type)).toContain("text_delta");
+		expect(events.map(event => event.type)).toContain("toolcall_delta");
+	});
+
+	it("replays a socket reset partial call with clean accepted events", async () => {
+		const partial = [
+			{ type: "response.output_item.added", item: { type: "function_call", id: "fc_reset_old", call_id: "call_reset_old", name: "old_tool", arguments: "" } },
+			{ type: "response.function_call_arguments.delta", item_id: "fc_reset_old", delta: '{"old":' },
+		];
+		const accepted = createCodexErrorSse([
+			{
+				type: "response.output_item.added",
+				item: { type: "function_call", id: "fc_reset_new", call_id: "call_reset_new", name: "new_tool", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_reset_new", delta: '{"new":true}' },
+			{
+				type: "response.output_item.done",
+				item: {
+					type: "function_call",
+					id: "fc_reset_new",
+					call_id: "call_reset_new",
+					name: "new_tool",
+					arguments: '{"new":true}',
+				},
+			},
+			{ type: "response.completed", response: { status: "completed", usage: DEFAULT_USAGE } },
+		]);
+		let requestCount = 0;
+		const socketReady = Promise.withResolvers<ReadableStreamDefaultController<Uint8Array>>();
+		global.fetch = vi.fn(async (_input, init) => {
+			requestCount += 1;
+			if (requestCount === 1) {
+				const encoder = new TextEncoder();
+				return new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							socketReady.resolve(controller);
+						},
+						pull(controller) {
+							const event = partial.shift();
+							if (event) {
+								controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
+								return;
+							}
+							controller.error(
+								Object.assign(
+									new Error(
+										"The socket connection was closed unexpectedly (transport=ECONNRESET url=https://chatgpt.com/backend-api/codex/responses)",
+									),
+									{ code: "ECONNRESET" },
+								),
+							);
+						},
+					}),
+					{ status: 200, headers: { "content-type": "text/event-stream" } },
+				);
+			}
+			return new Response(accepted, { status: 200, headers: { "content-type": "text/event-stream" } });
+		}) as unknown as typeof fetch;
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		const stream = streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken() },
+		);
+		const events = [];
+		const consuming = (async () => {
+			for await (const event of stream) events.push(event);
+		})();
+		await socketReady.promise;
+		await consuming;
+		const result = await stream.result();
+
+		expect(requestCount).toBe(2);
+		expect(result.content).toEqual([
+			{ type: "toolCall", id: "call_reset_new|fc_reset_new", name: "new_tool", arguments: { new: true } },
+		]);
+		expect(events.filter(event => event.type === "toolcall_start")).toHaveLength(1);
+		expect(JSON.stringify(events)).not.toContain("old");
+	});
 });
