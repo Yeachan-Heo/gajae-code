@@ -4,6 +4,7 @@ import {
 	injectCodexGpt6Models,
 	injectImageGenerationModels,
 	injectMuseSparkModels,
+	restoreSeedLimits,
 } from "../scripts/generate-models";
 import modelsJson from "../src/models.json" with { type: "json" };
 import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "../src/provider-models/openai-compat";
@@ -87,6 +88,39 @@ describe("injectCodexGpt6Models", () => {
 		injectCodexGpt6Models(models);
 
 		expect(models.find(model => model.id === "gpt-6-astra")).toEqual(discovered);
+	});
+});
+
+describe("restoreSeedLimits", () => {
+	const unknownCodexModel = (overrides: Partial<Model> = {}): Model =>
+		({
+			id: "gpt-6-astra",
+			name: "GPT-6 Astra",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: UNK_CONTEXT_WINDOW,
+			maxTokens: UNK_MAX_TOKENS,
+			...overrides,
+		}) as Model;
+	const seed = new Map([["openai-codex/gpt-6-astra", { contextWindow: 272_000, maxTokens: 128_000 }]]);
+
+	it("restores both limits when discovery leaves both unknown", () => {
+		const [restored] = restoreSeedLimits([unknownCodexModel()], seed);
+		expect(restored.contextWindow).toBe(272_000);
+		expect(restored.maxTokens).toBe(128_000);
+	});
+
+	it("restores only the limit that is still unknown", () => {
+		const [onlyMax] = restoreSeedLimits([unknownCodexModel({ contextWindow: 300_000 })], seed);
+		expect(onlyMax.contextWindow).toBe(300_000);
+		expect(onlyMax.maxTokens).toBe(128_000);
+		const [onlyContext] = restoreSeedLimits([unknownCodexModel({ maxTokens: 64_000 })], seed);
+		expect(onlyContext.contextWindow).toBe(272_000);
+		expect(onlyContext.maxTokens).toBe(64_000);
 	});
 });
 

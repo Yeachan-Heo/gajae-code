@@ -558,41 +558,22 @@ function preserveSeedLimits(
  * This protects against transient external failures (unavailable models.dev, network issues)
  * that would otherwise overwrite resolved limits with unknown markers.
  */
-function restoreSeedLimits(models: Model[], seedLimits: Map<string, SeedLimitPreservation>): Model[] {
+export function restoreSeedLimits(models: Model[], seedLimits: Map<string, SeedLimitPreservation>): Model[] {
 	return models.map(model => {
-		const key = `${model.provider}/${model.id}`;
-		const preserved = seedLimits.get(key);
+		const preserved = seedLimits.get(`${model.provider}/${model.id}`);
 		if (!preserved) {
 			return model;
 		}
-		// Restore context window if still unknown
-		if (model.contextWindow === UNK_CONTEXT_WINDOW && preserved.contextWindow !== undefined) {
-			return {
-				...model,
-				contextWindow: preserved.contextWindow,
-			};
+		// Each limit is restored independently: discovery can leave either or both unknown.
+		const contextWindow =
+			model.contextWindow === UNK_CONTEXT_WINDOW
+				? (preserved.contextWindow ?? model.contextWindow)
+				: model.contextWindow;
+		const maxTokens = model.maxTokens === UNK_MAX_TOKENS ? (preserved.maxTokens ?? model.maxTokens) : model.maxTokens;
+		if (contextWindow === model.contextWindow && maxTokens === model.maxTokens) {
+			return model;
 		}
-		// Restore max tokens if still unknown
-		if (model.maxTokens === UNK_MAX_TOKENS && preserved.maxTokens !== undefined) {
-			return {
-				...model,
-				maxTokens: preserved.maxTokens,
-			};
-		}
-		// If both need restoration
-		if (
-			model.contextWindow === UNK_CONTEXT_WINDOW &&
-			model.maxTokens === UNK_MAX_TOKENS &&
-			preserved.contextWindow !== undefined &&
-			preserved.maxTokens !== undefined
-		) {
-			return {
-				...model,
-				contextWindow: preserved.contextWindow,
-				maxTokens: preserved.maxTokens,
-			};
-		}
-		return model;
+		return { ...model, contextWindow, maxTokens };
 	});
 }
 
