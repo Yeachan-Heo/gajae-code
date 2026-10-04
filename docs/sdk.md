@@ -470,7 +470,6 @@ not suppress the user message for later prompt-admission or admitted model failu
 
 Cancellation applies to the exact outstanding prompt, including successor
 admission while a cancelled image's user-message echo is still being published.
-
 ### Request-owned queue cancellation and execution deadlines
 
 SDK-only ordinary abort cancels a snapshot of its authenticated requester's
