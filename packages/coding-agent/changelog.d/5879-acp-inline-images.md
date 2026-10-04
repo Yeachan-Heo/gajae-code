@@ -10,3 +10,5 @@
 - Cancel the SDK-only ordinary abort requester's admitted preflight snapshot through durable acceptance and before execution starts, without cancelling foreign or later admissions or inventing a durable terminal.
 - Renew upload inactivity leases only within an authenticated request batch, preserving earlier completed images during slow multi-image staging while abandoned uploads still expire.
 - Validate staged images and their SDK envelope before publishing any user echo; renew the local watchdog only for this request's validated staging progress.
+- Authenticate existing managed scope bindings and retained filesystem identities before cold cleanup recovery; never initialize or repair missing storage as a recovery shortcut.
+- Re-certify a stale cleanup-completion digest only after independently verified completion through an exact descriptor-backed replacement; refuse destination swaps and replacement failures without replaying transcript deletion.
