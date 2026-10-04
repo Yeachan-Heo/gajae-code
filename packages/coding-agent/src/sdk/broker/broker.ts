@@ -9,6 +9,10 @@ import packageJson from "../../../package.json" with { type: "json" };
 import type { ModelProfileErrorDetails } from "../../config/model-profile-contract";
 import { planLaunchWorktree } from "../../gjc-runtime/launch-worktree";
 import { readExistingStateForMutation, withWorkflowStateLock } from "../../gjc-runtime/state-writer";
+import type {
+	TaskArtifactOwnerDeletionEvidence,
+	TaskArtifactOwnerRetirementContinuation,
+} from "../../session/task-artifact-owner-codec";
 import { SdkClient, SdkClientError } from "../client";
 import {
 	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
@@ -127,6 +131,7 @@ import {
 	type SpawnSubstrateProvider,
 } from "./spawn-authority";
 import { createSpawnSubstrateProvider } from "./spawn-substrate";
+import type { BrokerTaskArtifactOwnerRetirementDisposition } from "./task-artifact-owner-validation";
 import { BrokerTransport } from "./transport";
 
 export interface BrokerSettings {
@@ -293,6 +298,19 @@ export type BrokerCleanupEvidence = {
 	retainedTranscriptSuccessorPath?: string;
 	retainedTranscriptPlaceholderPath?: string;
 	retainedTranscriptUnknownPath?: string;
+	/** Immutable task-artifact owner authority captured before the first deletion effect. */
+	taskArtifactOwnerDeletionEvidence?: TaskArtifactOwnerDeletionEvidence;
+	/** Latest exact native remnant; it never replaces the original deletion evidence. */
+	taskArtifactOwnerRetirementContinuation?: TaskArtifactOwnerRetirementContinuation;
+	/** Strict owner-only wire disposition, decoded only with its separately stored evidence. */
+	taskArtifactOwnerRetirementOutcome?: BrokerTaskArtifactOwnerRetirementDisposition;
+	taskArtifactOwnerPayloadRetired?: true;
+	taskArtifactOwnerNamespaceRetained?: true;
+	taskArtifactOwnerRetired?: true;
+	/** Durable fact that transcript retirement completed while the owner namespace remains. */
+	taskArtifactOwnerTranscriptDeleted?: true;
+	/** Stable artifacts-phase owner refusal diagnostic. */
+	taskArtifactOwnerCleanupError?: string;
 	/** Durable proof that artifact cleanup completed before transcript mutation. */
 	artifactsRemoved?: boolean;
 	artifactsAbsentAtAuthorization?: true;
@@ -756,6 +774,17 @@ function normalizeAliasedString(
 	return { value: values[0] };
 }
 
+const BROKER_TASK_ARTIFACT_OWNER_CLEANUP_FIELDS = [
+	"taskArtifactOwnerDeletionEvidence",
+	"taskArtifactOwnerRetirementContinuation",
+	"taskArtifactOwnerRetirementOutcome",
+	"taskArtifactOwnerPayloadRetired",
+	"taskArtifactOwnerNamespaceRetained",
+	"taskArtifactOwnerRetired",
+	"taskArtifactOwnerTranscriptDeleted",
+	"taskArtifactOwnerCleanupError",
+] as const;
+
 export function normalizeBrokerInput(operation: string, input: Record<string, unknown>): InputNormalization {
 	const normalized: Record<string, unknown> = { ...input };
 	const session = normalizeAliasedString(input, "sessionId", ["id"]);
@@ -834,6 +863,18 @@ export function normalizeBrokerInput(operation: string, input: Record<string, un
 	if (cwd.value !== undefined) normalized.stateRoot = path.join(cwd.value, ".gjc", "state");
 	else if (stateRoot.value !== undefined) return error("invalid_input", "stateRoot requires cwd.");
 
+	if (operation === "session.delete") {
+		const hasOwnerField = (value: unknown): boolean =>
+			typeof value === "object" &&
+			value !== null &&
+			!Array.isArray(value) &&
+			BROKER_TASK_ARTIFACT_OWNER_CLEANUP_FIELDS.some(key => Object.hasOwn(value, key));
+		if (hasOwnerField(input) || hasOwnerField(target) || hasOwnerField(input.cleanup))
+			return error(
+				"invalid_input",
+				"Task-artifact owner cleanup state is broker-managed and cannot be supplied by clients.",
+			);
+	}
 	if (target) {
 		const normalizedTarget = { ...target };
 		delete normalizedTarget.path;
