@@ -42,6 +42,10 @@ describe("backmerge conflict resolution", () => {
 		expect(() => resolveDiagnosticArtifactBackmerge(`{"schema":"gjc.diagnostic-artifact"}`, MAIN)).toThrow(
 			/no artifacts map on dev/,
 		);
+		// An array is `typeof "object"` too, but it is not the artifacts map.
+		expect(() =>
+			resolveDiagnosticArtifactBackmerge(`{"schema":"gjc.diagnostic-artifact","artifacts":[]}`, MAIN),
+		).toThrow(/no artifacts map on dev/);
 	});
 });
 
