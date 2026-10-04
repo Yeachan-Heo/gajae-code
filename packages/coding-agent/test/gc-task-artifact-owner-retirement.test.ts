@@ -6,6 +6,7 @@ import * as path from "node:path";
 import type { NativeExactUnlinkResult } from "@gajae-code/natives";
 import * as native from "@gajae-code/natives";
 import { collectGcDiskReport, resolveGcDiskPolicy } from "../src/gjc-runtime/gc-runtime";
+import { Broker } from "../src/sdk/broker/broker";
 import {
 	bindManagedGcSessionRetirementTarget,
 	type ManagedScope,
@@ -134,7 +135,10 @@ async function backdate(pathname: string, days: number): Promise<void> {
 }
 
 function snapshotTree(root: string): string[] {
-	const result: string[] = [];
+	const rootStat = fs.lstatSync(root, { bigint: true });
+	const result: string[] = [
+		`.:${rootStat.dev}:${rootStat.ino}:${rootStat.mode}:${rootStat.size}:${rootStat.mtimeNs}:${rootStat.ctimeNs}`,
+	];
 	const walk = (directory: string, relative = "") => {
 		for (const name of fs.readdirSync(directory).sort()) {
 			const pathname = path.join(directory, name);
@@ -233,6 +237,159 @@ async function publishArtifactsRemoved(fixture: Fixture) {
 }
 
 describe("owner-aware disk session retirement", () => {
+	for (const phase of ["prepared", "artifacts_removed"] as const) {
+		for (const transcriptAuthority of ["retained", "absent", "fsync-empty"] as const) {
+			it(`retains a genuine legacy SDK receipt after GC ${phase} with ${transcriptAuthority} authority`, async () => {
+				const fixture = makeFixture();
+				writeSession(fixture.scope, fixture.sessionId, fixture.cwd);
+				const canonicalTranscript = fs.realpathSync(fixture.transcriptPath);
+				const originalUnlink = native.exactUnlink;
+				const failure = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+					if (pathname === fixture.transcriptPath || pathname === canonicalTranscript)
+						return { ok: false, code: "io_error" };
+					return originalUnlink(pathname, identity);
+				});
+				let broker = new Broker({ agentDir: fixture.agentDir });
+				const request = {
+					cwd: fixture.cwd,
+					stateRoot: path.join(fixture.cwd, ".gjc", "state"),
+					sessionId: fixture.sessionId,
+					sessionPath: fixture.transcriptPath,
+				};
+				const requestId = `legacy-sdk-before-gc-${phase}`;
+				try {
+					await broker.start();
+					const initial = await broker.handleRequest("session.delete", request, requestId);
+					if (initial.ok || !initial.error.cleanup)
+						throw new Error(`Expected genuine SDK pending receipt: ${JSON.stringify(initial)}`);
+					expect(initial.error.code).toBe("cleanup_pending");
+					expect(initial.error.cleanup.phase).toBe("transcript");
+					expect(
+						failure.mock.calls.some(
+							([pathname]) => pathname === fixture.transcriptPath || pathname === canonicalTranscript,
+						),
+					).toBe(true);
+					failure.mockRestore();
+					await broker.stop();
+					writeSession(fixture.scope, fixture.sessionId, fixture.cwd, fixture.locator);
+					await backdate(fixture.transcriptPath, 90);
+					writeSession(fixture.scope, "newest-session", fixture.cwd);
+					const { evidence } =
+						phase === "prepared" ? await publishPrepared(fixture) : await publishArtifactsRemoved(fixture);
+					await runGc(fixture, true);
+					const before = await readManagedGcSessionRetirementReceipt(fixture.scope, fixture.transcriptPath);
+					if (!before) throw new Error("Expected original GC native disposition");
+					if (transcriptAuthority === "absent" && fs.existsSync(fixture.transcriptPath))
+						fs.unlinkSync(fixture.transcriptPath);
+					if (transcriptAuthority === "fsync-empty") {
+						const descriptor = fs.openSync(fixture.transcriptPath, "w", 0o600);
+						try {
+							fs.fsyncSync(descriptor);
+						} finally {
+							fs.closeSync(descriptor);
+						}
+					}
+					const journalBefore = journalRecords(fixture.scope.directoryPath);
+					const ownerBefore = fs.existsSync(fixture.ownerPath) ? snapshotTree(fixture.ownerPath) : undefined;
+					const retainedOwner = before.taskArtifactOwnerRetirementContinuation?.retainedRootPath;
+					const retainedBefore =
+						retainedOwner && fs.existsSync(retainedOwner) ? snapshotTree(retainedOwner) : undefined;
+					const transcriptBefore = fs.existsSync(fixture.transcriptPath)
+						? fs.readFileSync(fixture.transcriptPath)
+						: undefined;
+					broker = new Broker({ agentDir: fixture.agentDir });
+					await broker.start();
+					const replay = await broker.handleRequest("session.delete", request, requestId);
+					expect(retainedOwner && fs.existsSync(retainedOwner) ? snapshotTree(retainedOwner) : undefined).toEqual(
+						retainedBefore,
+					);
+					expect(replay.ok).toBe(false);
+					if (replay.ok) throw new Error("Legacy SDK receipt promoted owner/header drift to completion");
+					expect(replay.error.code).toBe(
+						transcriptAuthority === "fsync-empty" ? "invalid_input" : "cleanup_pending",
+					);
+					expect(fs.existsSync(fixture.ownerPath) ? snapshotTree(fixture.ownerPath) : undefined).toEqual(
+						ownerBefore,
+					);
+					expect(
+						fs.existsSync(fixture.transcriptPath) ? fs.readFileSync(fixture.transcriptPath) : undefined,
+					).toEqual(transcriptBefore);
+					expect(journalRecords(fixture.scope.directoryPath)).toEqual(journalBefore);
+					if (transcriptAuthority === "fsync-empty") {
+						await expect(
+							readManagedGcSessionRetirementReceipt(fixture.scope, fixture.transcriptPath),
+						).rejects.toThrow("task_artifact_owner_transcript_header_invalid");
+					} else {
+						const after = await readManagedGcSessionRetirementReceipt(fixture.scope, fixture.transcriptPath);
+						expect(after?.taskArtifactOwnerDeletionEvidence).toEqual(evidence);
+						expect(after?.taskArtifactOwnerRetirementOutcome).toEqual(before.taskArtifactOwnerRetirementOutcome);
+					}
+				} finally {
+					failure.mockRestore();
+					await broker.stop();
+				}
+			});
+		}
+	}
+
+	for (const phase of ["prepared", "artifacts_removed"] as const) {
+		it(`keeps installed SDK owner refusal conservative after GC ${phase} and restart`, async () => {
+			const fixture = makeFixture();
+			await backdate(fixture.transcriptPath, 90);
+			writeSession(fixture.scope, "newest-session", fixture.cwd);
+			let broker = new Broker({ agentDir: fixture.agentDir });
+			const request = {
+				cwd: fixture.cwd,
+				stateRoot: path.join(fixture.cwd, ".gjc", "state"),
+				sessionId: fixture.sessionId,
+				sessionPath: fixture.transcriptPath,
+			};
+			const requestId = `sdk-before-gc-${phase}`;
+			try {
+				await broker.start();
+				const initial = await broker.handleRequest("session.delete", request, requestId);
+				expect(initial.ok).toBe(false);
+				if (initial.ok) throw new Error("Installed SDK accepted an owner without original deletion evidence");
+				expect(initial.error).toMatchObject({
+					code: "invalid_input",
+					message: "Saved session deletion verification failed (artifacts): task_artifact_owner_locator_missing",
+				});
+				await broker.stop();
+				const { evidence } =
+					phase === "prepared" ? await publishPrepared(fixture) : await publishArtifactsRemoved(fixture);
+				await runGc(fixture, true);
+				const before = await readManagedGcSessionRetirementReceipt(fixture.scope, fixture.transcriptPath);
+				if (!before) throw new Error("Expected original GC owner disposition");
+				expect(before.taskArtifactOwnerDeletionEvidence).toEqual(evidence);
+				const ownerBefore = fs.existsSync(fixture.ownerPath) ? snapshotTree(fixture.ownerPath) : undefined;
+				const retainedOwner = before.taskArtifactOwnerRetirementContinuation?.retainedRootPath;
+				const retainedBefore =
+					retainedOwner && fs.existsSync(retainedOwner) ? snapshotTree(retainedOwner) : undefined;
+				const transcriptBefore = fs.existsSync(fixture.transcriptPath)
+					? fs.readFileSync(fixture.transcriptPath)
+					: undefined;
+				broker = new Broker({ agentDir: fixture.agentDir });
+				await broker.start();
+				const replay = await broker.handleRequest("session.delete", request, requestId);
+				expect(retainedOwner && fs.existsSync(retainedOwner) ? snapshotTree(retainedOwner) : undefined).toEqual(
+					retainedBefore,
+				);
+				expect(replay.ok).toBe(false);
+				if (replay.ok) throw new Error("SDK promoted missing owner authority to completion");
+				expect(replay.error.code).toBe(transcriptBefore ? "invalid_input" : "not_found");
+				expect(fs.existsSync(fixture.ownerPath) ? snapshotTree(fixture.ownerPath) : undefined).toEqual(ownerBefore);
+				expect(fs.existsSync(fixture.transcriptPath) ? fs.readFileSync(fixture.transcriptPath) : undefined).toEqual(
+					transcriptBefore,
+				);
+				const after = await readManagedGcSessionRetirementReceipt(fixture.scope, fixture.transcriptPath);
+				expect(after?.taskArtifactOwnerDeletionEvidence).toEqual(evidence);
+				expect(after?.taskArtifactOwnerRetirementOutcome).toEqual(before.taskArtifactOwnerRetirementOutcome);
+			} finally {
+				await broker.stop();
+			}
+		});
+	}
+
 	it("keeps dry-run read-only while projecting the owner-aware retirement decision", async () => {
 		const fixture = makeFixture();
 		await backdate(fixture.transcriptPath, 90);
