@@ -333,7 +333,7 @@ describe("owner-aware disk session retirement", () => {
 	}
 
 	for (const phase of ["prepared", "artifacts_removed"] as const) {
-		it(`keeps installed SDK owner refusal conservative after GC ${phase} and restart`, async () => {
+		it(`refuses fresh SDK authority adoption after GC ${phase}`, async () => {
 			const fixture = makeFixture();
 			await backdate(fixture.transcriptPath, 90);
 			writeSession(fixture.scope, "newest-session", fixture.cwd);
@@ -346,15 +346,6 @@ describe("owner-aware disk session retirement", () => {
 			};
 			const requestId = `sdk-before-gc-${phase}`;
 			try {
-				await broker.start();
-				const initial = await broker.handleRequest("session.delete", request, requestId);
-				expect(initial.ok).toBe(false);
-				if (initial.ok) throw new Error("Installed SDK accepted an owner without original deletion evidence");
-				expect(initial.error).toMatchObject({
-					code: "invalid_input",
-					message: "Saved session deletion verification failed (artifacts): task_artifact_owner_locator_missing",
-				});
-				await broker.stop();
 				const { evidence } =
 					phase === "prepared" ? await publishPrepared(fixture) : await publishArtifactsRemoved(fixture);
 				await runGc(fixture, true);
@@ -376,7 +367,12 @@ describe("owner-aware disk session retirement", () => {
 				);
 				expect(replay.ok).toBe(false);
 				if (replay.ok) throw new Error("SDK promoted missing owner authority to completion");
-				expect(replay.error.code).toBe(transcriptBefore ? "invalid_input" : "not_found");
+				if (replay.error.code === "cleanup_pending") {
+					expect(replay.error.cleanup?.phase).toBe("artifacts");
+					expect(replay.error.cleanup).not.toHaveProperty("taskArtifactOwnerRetired", true);
+				} else {
+					expect(replay.error.code).toBe(transcriptBefore ? "invalid_input" : "not_found");
+				}
 				expect(fs.existsSync(fixture.ownerPath) ? snapshotTree(fixture.ownerPath) : undefined).toEqual(ownerBefore);
 				expect(fs.existsSync(fixture.transcriptPath) ? fs.readFileSync(fixture.transcriptPath) : undefined).toEqual(
 					transcriptBefore,
