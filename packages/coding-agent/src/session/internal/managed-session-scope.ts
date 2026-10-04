@@ -814,8 +814,30 @@ export function resolveManagedScopeForWrite(input: ManagedScopeInput): ManagedSc
 export function resolveManagedGcScopeForRead(input: ManagedScopeInput): ManagedScopeResolution {
 	const resolved = resolveManagedScope(input);
 	if (resolved.kind === "error") return resolved;
-	const scope = resolved.scope;
+	return establishExistingManagedGcScopeAuthority(resolved.scope);
+}
+
+function assertManagedScopeConfiguration(scope: ManagedScope): void {
+	const configuration = managedScopeConfigurations.get(scope);
+	if (
+		!configuration ||
+		scope.agentDir !== configuration.agentDir ||
+		scope.sessionsRoot !== configuration.sessionsRoot ||
+		scope.canonicalCwd !== configuration.canonicalCwd ||
+		scope.directoryName !== configuration.directoryName ||
+		scope.directoryPath !== configuration.directoryPath ||
+		scope.platform !== configuration.platform ||
+		scope.apiVersion !== 1 ||
+		scope.layoutVersion !== MANAGED_SESSION_LAYOUT_VERSION ||
+		scope.identityVersion !== MANAGED_SESSION_IDENTITY_VERSION
+	)
+		throw new Error("managed_gc_scope_authority_mismatch");
+}
+
+function establishExistingManagedGcScopeAuthority(scope: ManagedScope): ManagedScopeResolution {
 	try {
+		assertManagedScopeConfiguration(scope);
+		assertRetainedManagedDirectoryIdentity(scope);
 		const rootPath = configuredRootPath(scope);
 		if (
 			path.resolve(scope.agentDir) !== scope.agentDir ||
@@ -864,7 +886,7 @@ export function resolveManagedGcScopeForRead(input: ManagedScopeInput): ManagedS
 		managedDirectoryIdentities.set(scope, { dev: scopeDirectory.dev, ino: scopeDirectory.ino });
 		managedDirectoryAuthorities.set(scope, undefined);
 		readManagedGcScopeIdentities.set(scope, { configuredRoot, profile, sessions });
-		return resolved;
+		return { kind: "resolved", scope };
 	} catch (error) {
 		return {
 			kind: "error",
@@ -2294,18 +2316,7 @@ function managedGcTrustedScope(scope: ManagedScope): ManagedGcTrustedScope {
 	const configuration = managedScopeConfigurations.get(scope);
 	if (!root || !identity || !configuration || !managedDirectoryAuthorities.has(scope))
 		throw new Error("managed_gc_scope_authority_unavailable");
-	if (
-		scope.agentDir !== configuration.agentDir ||
-		scope.sessionsRoot !== configuration.sessionsRoot ||
-		scope.canonicalCwd !== configuration.canonicalCwd ||
-		scope.directoryName !== configuration.directoryName ||
-		scope.directoryPath !== configuration.directoryPath ||
-		scope.platform !== configuration.platform ||
-		scope.apiVersion !== 1 ||
-		scope.layoutVersion !== MANAGED_SESSION_LAYOUT_VERSION ||
-		scope.identityVersion !== MANAGED_SESSION_IDENTITY_VERSION
-	)
-		throw new Error("managed_gc_scope_authority_mismatch");
+	assertManagedScopeConfiguration(scope);
 	const policy: ManagedSessionSecurityPolicy =
 		scope.platform === "win32" ? "windows-existing-verify-first" : "default";
 	assertManagedDirectoryRoot(root);
@@ -5841,6 +5852,10 @@ export async function reconcileManagedTombstones(
 	scope: ManagedScope,
 	expectedCandidate?: ManagedCandidate,
 ): Promise<void> {
+	if (!managedDirectoryAuthorities.has(scope)) {
+		const established = establishExistingManagedGcScopeAuthority(scope);
+		if (established.kind === "error") throw new Error(established.message);
+	}
 	const directory = path.join(managedInternalDirectory(scope), MANAGED_TOMBSTONES_DIRECTORY);
 	for (const name of fs.readdirSync(directory)) {
 		const tombstone = path.join(directory, name);
