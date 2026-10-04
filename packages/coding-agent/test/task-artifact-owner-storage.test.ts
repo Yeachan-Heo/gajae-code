@@ -555,7 +555,15 @@ describe("verified storage consumes task artifact owners", () => {
 		const fixture = await makeFixture();
 		const nativeRemoval = recordActualOwnerRemoval();
 		const target = targetFor(fixture, { deferTaskArtifactOwnerRetirement: true });
-		const before = await fixture.storage.deleteSessionVerified(target);
+		const unauthenticated = await fixture.storage.deleteSessionVerified(target);
+		expect(unauthenticated).toMatchObject({ kind: "cleanup_pending", phase: "task_artifact_owner" });
+		expect(nativeRemoval.spy).not.toHaveBeenCalled();
+		expect(fs.existsSync(fixture.ownerPayloadPath)).toBe(true);
+		expect(fs.existsSync(fixture.transcriptPath)).toBe(true);
+		const before = await fixture.storage.deleteSessionVerified(
+			target,
+			managedGcProtocolScopeInspectorForScope(fixture.scope),
+		);
 		expect(before.kind).toBe("artifacts_removed");
 		expect(before.taskArtifactOwnerRetirementOutcome).toBeUndefined();
 		expect(nativeRemoval.spy).not.toHaveBeenCalled();
@@ -570,6 +578,7 @@ describe("verified storage consumes task artifact owners", () => {
 				artifactsRemoved: true,
 				deferTaskArtifactOwnerRetirement: true,
 			}),
+			managedGcProtocolScopeInspectorForScope(fixture.scope),
 		);
 		expect(after.taskArtifactOwnerRetirementOutcome).toEqual(outcome);
 		if (outcome.kind === "completed") {
@@ -588,6 +597,23 @@ describe("verified storage consumes task artifact owners", () => {
 			expect(after.taskArtifactOwnerRetired).toBeUndefined();
 			expect(fs.existsSync(fixture.transcriptPath)).toBe(true);
 		}
+	});
+
+	it("refuses deferred retirement with an unauthenticated protocol alias before artifact effects", async () => {
+		const fixture = await makeFixture();
+		const artifacts = fixture.transcriptPath.slice(0, -".jsonl".length);
+		fs.mkdirSync(artifacts, { mode: 0o700 });
+		await Bun.write(path.join(artifacts, "retained-output.txt"), "retained-artifact", { mode: 0o600 });
+		fs.mkdirSync(path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal.saved"), { mode: 0o700 });
+		const before = filesystemSnapshot(fixture.root);
+		const nativeRemoval = recordActualOwnerRemoval();
+		const result = await fixture.storage.deleteSessionVerified(
+			targetFor(fixture, { deferTaskArtifactOwnerRetirement: true }),
+			managedGcProtocolScopeInspectorForScope(fixture.scope),
+		);
+		expect(result).toMatchObject({ kind: "cleanup_pending", phase: "task_artifact_owner" });
+		expect(nativeRemoval.spy).not.toHaveBeenCalled();
+		expect(filesystemSnapshot(fixture.root)).toEqual(before);
 	});
 
 	it("rejects malformed owner patches, foreign locators, forged flags, and expanded evidence before mutation", async () => {

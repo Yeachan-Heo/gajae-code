@@ -2606,7 +2606,8 @@ export class FileSessionStorage implements SessionStorage {
 		let ownerNamespaceRetained = ownerNamespaceRetainedValue === true;
 		let ownerTranscriptDeleted = ownerTranscriptDeletedValue === true;
 		const ownerSiblingRefusal = async (): Promise<Error | undefined> => {
-			if (deferTaskArtifactOwnerRetirement || ownerRetired || !ownerEvidence) return undefined;
+			// Deferral changes who retires the owner, not the pre-artifact sibling authority boundary.
+			if (!ownerEvidence) return undefined;
 			if (!taskArtifactOwnerStorageContext)
 				return new SessionDeleteVerificationError("artifacts", "task_artifact_owner_context_missing");
 			try {
