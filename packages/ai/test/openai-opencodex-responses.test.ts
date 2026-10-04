@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Effort, enrichModelThinking, getSupportedEfforts } from "@gajae-code/ai/model-thinking";
 import {
 	checkOpenCodexStatus,
 	fetchOpenCodexModels,
@@ -134,6 +135,34 @@ describe("OpenCodex discovery", () => {
 			reasoning: true,
 		});
 		expect(models?.[1]).toMatchObject({ wireModelId: "gpt-5.6-terra", reasoning: false });
+	});
+
+	test("exposes thinking efforts only for reasoning models", async () => {
+		spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(
+				async (input: string | Request | URL) => {
+					const url = String(input);
+					if (url.endsWith("/healthz")) return Response.json({ ok: true, version: "opencodex", port: 10100 });
+					return Response.json({
+						data: [
+							{ id: "gpt-6.1-sol@acct-b", reasoning: true },
+							{ id: "gpt-6.1-chat@acct-b", reasoning: false },
+						],
+					});
+				},
+				{ preconnect: originalFetch.preconnect },
+			),
+		);
+
+		const models = await fetchOpenCodexModels();
+		const reasoningModel = models?.find(model => model.wireModelId === "gpt-6.1-sol@acct-b");
+		const nonReasoningModel = models?.find(model => model.wireModelId === "gpt-6.1-chat@acct-b");
+		expect(reasoningModel).toBeDefined();
+		expect(nonReasoningModel).toBeDefined();
+		expect(reasoningModel?.compat).toEqual({ supportsServiceTier: true, supportsReasoningEffort: true });
+		expect(nonReasoningModel?.compat).toEqual({ supportsServiceTier: true });
+		expect(getSupportedEfforts(enrichModelThinking(reasoningModel!))).toContain(Effort.High);
+		expect(getSupportedEfforts(enrichModelThinking(nonReasoningModel!))).toEqual([]);
 	});
 
 	test("prefers runtime metadata before the default port and preserves raw model ids", async () => {

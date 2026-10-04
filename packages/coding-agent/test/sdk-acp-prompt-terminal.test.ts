@@ -3297,14 +3297,14 @@ test("ACP cancel grace preserves background activity that starts after acknowled
 	}
 });
 
-test("ACP keeps the authoritative terminal when it arrives inside the cancel grace", async () => {
+test("ACP settles an acknowledged cancel as cancelled when a stopped terminal arrives inside the cancel grace", async () => {
 	const fixture = await createFixture({ cancelSettlementGraceMs: 1_000 });
 	try {
 		const pending = prompt(fixture, "cancel with terminal");
 		await bounded(fixture.promptDelivered, "prompt delivery");
 		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel acknowledgement");
 		fixture.sendStopped("refusal");
-		expect(await bounded(pending, "terminal settlement")).toEqual({ stopReason: "refusal" });
+		expect(await bounded(pending, "terminal settlement")).toEqual({ stopReason: "cancelled" });
 	} finally {
 		fixture.dispose();
 	}

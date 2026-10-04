@@ -149,6 +149,7 @@ function normalizeModel(row: CatalogRow, endpoint: OpenCodexEndpoint): Model<"op
 		Array.isArray(modalities) && modalities.every(value => value === "text" || value === "image")
 			? modalities
 			: ["text"];
+	const reasoning = (row.reasoning ?? row.capabilities?.supports_reasoning) !== false;
 	return {
 		id: publicId,
 		wireModelId: rawId,
@@ -156,8 +157,8 @@ function normalizeModel(row: CatalogRow, endpoint: OpenCodexEndpoint): Model<"op
 		api: "openai-responses",
 		provider: "opencodex",
 		baseUrl: `${endpoint.baseUrl}/v1`,
-		compat: { supportsServiceTier: true },
-		reasoning: (row.reasoning ?? row.capabilities?.supports_reasoning) !== false,
+		compat: reasoning ? { supportsServiceTier: true, supportsReasoningEffort: true } : { supportsServiceTier: true },
+		reasoning,
 		input,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: asPositiveNumber(row.contextWindow ?? row.capabilities?.context_length, 128_000),
