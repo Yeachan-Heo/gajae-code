@@ -157,9 +157,7 @@ function normalizeModel(row: CatalogRow, endpoint: OpenCodexEndpoint): Model<"op
 		api: "openai-responses",
 		provider: "opencodex",
 		baseUrl: `${endpoint.baseUrl}/v1`,
-		compat: reasoning
-			? { supportsServiceTier: true, supportsReasoningEffort: true }
-			: { supportsServiceTier: true },
+		compat: reasoning ? { supportsServiceTier: true, supportsReasoningEffort: true } : { supportsServiceTier: true },
 		reasoning,
 		input,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
