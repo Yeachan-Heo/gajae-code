@@ -64,24 +64,32 @@ const store = new ManagedSessionDescendantStore(
 );
 
 function publishReady(phase: WriterInput["phase"], markerPath: string, dev: bigint, ino: bigint): void {
-	const fd = fs.openSync(input.ready, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+	const temporary = `${input.ready}.${process.pid}.pending`;
+	const fd = fs.openSync(temporary, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
 	try {
-		fs.writeSync(
-			fd,
-			Buffer.from(
-				JSON.stringify({
-					pid: process.pid,
-					phase,
-					marker: path.basename(markerPath),
-					dev: dev.toString(),
-					ino: ino.toString(),
-				}),
-				"utf8",
-			),
-		);
-		fs.fsyncSync(fd);
+		try {
+			fs.writeSync(
+				fd,
+				Buffer.from(
+					JSON.stringify({
+						pid: process.pid,
+						phase,
+						marker: path.basename(markerPath),
+						dev: dev.toString(),
+						ino: ino.toString(),
+					}),
+					"utf8",
+				),
+			);
+			fs.fsyncSync(fd);
+		} finally {
+			fs.closeSync(fd);
+		}
+		// Existence is the parent's readiness signal: publish only a complete inode.
+		// A hard link retains O_EXCL's refusal to replace an existing ready record.
+		fs.linkSync(temporary, input.ready);
 	} finally {
-		fs.closeSync(fd);
+		fs.unlinkSync(temporary);
 	}
 }
 
