@@ -99,6 +99,7 @@ async function setup(
 	const sid = `order-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	const ctx = {
 		cwd,
+		getActivePromptHandle: () => undefined,
 		sessionManager: {
 			getSessionId: () => sid,
 			getSessionName: () => "Ordering Test",

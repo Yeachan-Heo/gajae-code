@@ -4772,6 +4772,157 @@ test.each([
 	}
 }, 30_000);
 
+test("SDK-only ordinary abort preserves real foreign and later admissions behind a cancelled durable preflight", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-real-admission-snapshot-"));
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const foreignStarted = Promise.withResolvers<void>();
+	const releaseForeign = Promise.withResolvers<void>();
+	const manager = SessionManager.inMemory(cwd);
+	const sessionId = manager.getSessionId();
+	const store = createReconciliationStore({ sessionFile: path.join(cwd, "session.jsonl"), sessionId });
+	const originalRename = fsPromises.rename;
+	const signals = new Map<string, AbortSignal | undefined>();
+	const modelCalls: string[] = [];
+	let held = false;
+	let rootAbortCalls = 0;
+	let harness: InvocationHarness | undefined;
+	let session: AgentSession | undefined;
+	let authStorage: AuthStorage | undefined;
+	const renameSpy = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
+		if (!held && String(to) === store.path) {
+			const document = (await Bun.file(String(from)).json()) as ReconciliationStoreDocument;
+			if (
+				document.records.some(record => record.clientRef === "cancel-owned-real" && record.status === "accepted")
+			) {
+				held = true;
+				entered.resolve();
+				await release.promise;
+			}
+		}
+		await originalRename(from, to);
+	});
+	try {
+		authStorage = await AuthStorage.create(path.join(cwd, "auth.db"));
+		const mock = createMockModel({
+			responses: [
+				() => {
+					modelCalls.push("seed");
+					return { content: ["natural seed completed"] };
+				},
+				async () => {
+					modelCalls.push("foreign");
+					foreignStarted.resolve();
+					await releaseForeign.promise;
+					return { content: ["foreign admission completed"] };
+				},
+				() => {
+					modelCalls.push("later-owner");
+					return { content: ["later owner admission completed"] };
+				},
+			],
+		});
+		authStorage.setRuntimeApiKey(mock.model.provider, "test-key");
+		session = new AgentSession({
+			agent: new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: mock.stream,
+			}),
+			sessionManager: manager,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: new ModelRegistry(authStorage),
+		});
+		harness = await invocationHarness(sessionId, cwd, {
+			isIdle: () => !session!.isStreaming,
+			abort: () => {
+				rootAbortCalls++;
+			},
+			terminalAbortSeams: { getReconciliationStore: () => store },
+			sendUserMessage: (content, options) => {
+				if (typeof content !== "string") throw new Error("Expected text-only real admission.");
+				signals.set(content, options?.preflightSignal);
+				const { deliverAs, ...admissionOptions } = options ?? {};
+				if (deliverAs !== undefined && deliverAs !== "steer" && deliverAs !== "followUp")
+					throw new Error("Unsupported real admission delivery mode.");
+				return session!.sendUserMessage(content, {
+					...admissionOptions,
+					...(deliverAs === undefined ? {} : { deliverAs }),
+				});
+			},
+		});
+		session.subscribe(async event => {
+			await harness?.emit(event.type, event);
+		});
+		expect(
+			await harness.controlAs("seed-owner", "turn.prompt", { text: "seed-real", clientRef: "seed-real" }),
+		).toMatchObject({ ok: true, result: { accepted: true } });
+		expect(await settledStatus(harness, "turn.result", { kind: "prompt", clientRef: "seed-real" })).toMatchObject({
+			status: "terminal_ok",
+		});
+		await session.waitForIdle();
+		const owned = harness.controlAs("owner", "turn.prompt", {
+			text: "cancel-owned-real",
+			clientRef: "cancel-owned-real",
+		});
+		await entered.promise;
+		expect(modelCalls).toEqual(["seed"]);
+		expect(signals.get("cancel-owned-real")?.aborted).toBe(false);
+		const foreign = harness.controlAs("foreign", "turn.prompt", { text: "foreign-real", clientRef: "foreign-real" });
+		expect(await harness.controlAs("owner", "turn.abort", {})).toMatchObject({ ok: true, result: { aborted: true } });
+		expect(signals.get("cancel-owned-real")?.aborted).toBe(true);
+		expect(rootAbortCalls).toBe(0);
+		release.resolve();
+		expect(await owned).toMatchObject({ ok: false, error: { code: "busy" } });
+		expect(
+			await settledStatus(harness, "turn.result", { kind: "prompt", clientRef: "cancel-owned-real" }),
+		).toMatchObject({ status: "failed" });
+		expect(await foreign).toMatchObject({ ok: true, result: { accepted: true } });
+		await foreignStarted.promise;
+		const later = harness.controlAs("owner", "turn.prompt", {
+			text: "later-owner-real",
+			clientRef: "later-owner-real",
+		});
+		expect(await later).toMatchObject({ ok: true, result: { accepted: true } });
+		expect(signals.get("foreign-real")?.aborted).toBe(false);
+		expect(signals.get("later-owner-real")?.aborted).toBe(false);
+		expect(modelCalls).toEqual(["seed", "foreign"]);
+		const pendingDocument = (await Bun.file(store.path!).json()) as ReconciliationStoreDocument;
+		const pendingLater = pendingDocument.records.find(record => record.clientRef === "later-owner-real");
+		expect(pendingLater?.status).toBe("accepted");
+		expect(pendingLater?.startedAt).toBeUndefined();
+		expect(pendingLater?.terminalAt).toBeUndefined();
+		releaseForeign.resolve();
+		await session.waitForIdle();
+		expect(modelCalls).toEqual(["seed", "foreign", "later-owner"]);
+		expect(rootAbortCalls).toBe(0);
+		for (const clientRef of ["foreign-real", "later-owner-real"]) {
+			expect(await settledStatus(harness, "turn.result", { kind: "prompt", clientRef })).toMatchObject({
+				status: "terminal_ok",
+			});
+		}
+		const document = (await Bun.file(store.path!).json()) as ReconciliationStoreDocument;
+		for (const [clientRef, status] of [
+			["cancel-owned-real", "failed"],
+			["foreign-real", "terminal_ok"],
+			["later-owner-real", "terminal_ok"],
+		] as const) {
+			const record = document.records.find(candidate => candidate.clientRef === clientRef);
+			expect(record?.status).toBe(status);
+			expect(record?.terminalAt).toBeNumber();
+		}
+	} finally {
+		release.resolve();
+		releaseForeign.resolve();
+		await session?.waitForIdle().catch(() => undefined);
+		await harness?.stop();
+		await session?.dispose();
+		authStorage?.close();
+		renameSpy.mockRestore();
+		await rm(cwd, { recursive: true, force: true });
+	}
+}, 30_000);
+
 test.each([
 	"ordinary",
 	"terminal",
