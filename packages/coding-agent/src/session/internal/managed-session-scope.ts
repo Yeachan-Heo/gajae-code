@@ -3244,7 +3244,7 @@ export function managedGcProtocolScopeInspectorForScope(scope: ManagedScope): Ma
 			const scopeIdentity = managedGcProtocolPathIdentity(candidateScope.directoryPath);
 			if (scopeIdentity.dev !== input.scopeIdentity.dev || scopeIdentity.ino !== input.scopeIdentity.ino)
 				throw new Error("managed_gc_protocol_scope_identity_mismatch");
-			const store = managedGcScopeStore(candidateScope, candidateTrusted);
+			const store = managedGcScopeReader(candidateScope, candidateTrusted);
 			try {
 				store.verifyRootSecurity();
 				const checkedBinding = managedGcProtocolFileSnapshot(candidateScope, store, MANAGED_SESSION_BINDING_FILE);
