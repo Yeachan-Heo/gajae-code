@@ -2,6 +2,45 @@
 
 ## [Unreleased]
 
+## [0.18.7] - 2026-10-04
+
+### Added
+
+- Resolve readonly target-directory settings snapshots with normalized values and fresh operation-local metadata reads, without changing parent settings or publishing global hooks.
+
+### Changed
+
+- Cut startup memory for the light CLI invocations by deferring the per-path modules out of the eager root command graph: peak RSS dropped from 32.4 MB to 27.7 MB for `--version` and from 32.7 MB to 28.0 MB for `--help`. The quick lane, the bash-shell guardian/supervisor/worker executors, the isolated shell, the tab-worker smoke probe and the fixture report now load only when their own path actually runs, so their behaviour, output and exit codes are unchanged.
+
+### Fixed
+
+- `session.resume` of a session whose detached-idle host already exited no longer fails with `EEXIST` on `<id>.lifecycle.ready.json`: the host revokes its own ready marker on graceful exit, and a launch retires the same id's leftover ready/marker pair when the recorded owner is proven exited (a live or unknown owner still wins) (#6261).
+
+- Settle active ACP prompts immediately when their SDK session host retires, while preserving prompts across same-generation attachment replacement instead of waiting for the inactivity watchdog.
+
+- Apply ACP thinking-level changes through the session control setter so reasoning effort updates the live session state and session config readback reflects the requested level.
+
+- ACP now rejects unsupported or unapplied thinking levels instead of reporting them as successful changes.
+
+- Session heartbeat checkpoints no longer starve the SDK broker discovery heartbeat while waiting on the session-index lock.
+
+- SDK broker readiness polling now uses the session-index change stamp instead of checkpointing live heartbeats and replaying the full index on every poll.
+
+- `gjc config set|get|list` (text and `--json`) no longer print the Slack app-level token `notifications.slack.appToken` verbatim. Secret detection for setting keys now treats any key segment ending in a secret word (`token`, `secret`, `password`, `passwd`, `pwd`, `credential(s)`) as secret instead of relying on a fixed list of camelCase prefixes, so it shows `<redacted>` like every other token setting. Token-budget settings such as `compaction.reserveTokens` stay visible.
+
+- Retry bare-default Codex overloads when the failed attempt contains only an empty unsigned thinking block.
+
+- `HINDSIGHT_RETAIN_EVERY_N_TURNS`, `HINDSIGHT_RECALL_MAX_TOKENS`, `HINDSIGHT_RECALL_CONTEXT_TURNS` and `HINDSIGHT_RECALL_MAX_QUERY_CHARS` now accept only plain non-negative digits. Malformed values such as `5turns`, `1e3`, `1.5` or `-3` fall back to the matching `hindsight.*` setting instead of being read by `parseInt` as 5, 1, 1 or -3. A negative `HINDSIGHT_RETAIN_EVERY_N_TURNS` previously made chunked retention send nothing.
+
+- Slack and Discord chat daemons no longer post every lean final answer twice. The host sends each turn frame on a positioned leg and a raw leg and drops the raw copy only for connections that negotiate `positioned_notification_effects_v1`; the chat daemons' session connections never did, and a lean final carries no `messageRef` to collapse the two copies onto one publication. Chat daemon session connections now negotiate positioned-only notification effects, while plain SDK observers such as `gjc sdk session tail` keep both surfaces.
+
+- Answer modern MCP roots requests without requiring an interactive input handler, while keeping actual elicitation fail-closed when user input is unavailable.
+- Connect supported MCP form requests to the session's user-input surface instead of failing before users can answer.
+
+- SDK MCP initialize now negotiates supported protocol versions and includes the coding-agent package version in `serverInfo`.
+
+- SSH hosts loaded from `ssh.json` no longer accept a malformed `port`. A string port must be plain digits and every port must be an integer from 1 to 65535, so `"22oops"`, `"+22"`, `2222.5`, `0` and `70000` are now dropped with an `Invalid port` warning (the host falls back to the default port) instead of being used as 22, 22, 2222.5, 0 and 70000.
+
 ## [0.18.6] - 2026-10-03
 
 ### Added
