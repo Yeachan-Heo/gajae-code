@@ -7,6 +7,7 @@ interface WorkflowStep {
 	if?: string;
 	uses?: string;
 	run?: string;
+	shell?: string;
 	"continue-on-error"?: boolean;
 	env?: Record<string, string>;
 	with?: Record<string, string | number>;
@@ -54,7 +55,9 @@ describe("main CI native addon recovery", () => {
 		const document = await workflow();
 		const producer = job(document, "main_native");
 		const upload = step(producer, "Upload native addon(s)");
-		const uploaded = (upload.with?.path ?? "").split(/\s+/);
+		const uploadPath = upload.with?.path;
+		if (typeof uploadPath !== "string") throw new Error("Native producer upload paths must be a string");
+		const uploaded = uploadPath.split(/\s+/);
 		for (const variant of ["baseline", "modern"]) {
 			expect(uploaded).toContain(`packages/natives/native/pi_natives.linux-x64-${variant}.node.provenance.json`);
 		}
