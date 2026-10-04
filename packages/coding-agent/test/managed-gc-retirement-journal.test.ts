@@ -80,8 +80,8 @@ afterEach(() => {
 	for (const root of temporaryRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-describe("owner-aware data cannot bypass live consumer authority", () => {
-	it("refuses a v4 owner patch with an unauthenticated reserved protocol alias before deleting artifacts", async () => {
+describe("owner-aware readonly data does not authorize legacy effects", () => {
+	it("refuses a live owner locator introduced only by a v4 header patch before deleting artifacts", async () => {
 		const fixture = makeFixture();
 		const locator = fixture.evidence.locator;
 		await Bun.write(
@@ -95,38 +95,14 @@ describe("owner-aware data cannot bypass live consumer authority", () => {
 		const artifactRoot = fixture.transcriptPath.slice(0, -6);
 		fs.mkdirSync(artifactRoot, { mode: 0o700 });
 		await Bun.write(path.join(artifactRoot, "retained.txt"), "retained artifact");
-		fs.mkdirSync(path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal.saved"), { mode: 0o700 });
 		const before = fs.readFileSync(fixture.transcriptPath);
-		const artifactsBefore = protocolFilesystemSnapshot(artifactRoot);
-		const ownerRoot = path.join(fixture.sessionsRoot, ownerRelativePath(fixture.evidence.locator.ownerId));
-		const ownerBefore = protocolFilesystemSnapshot(ownerRoot);
 		const unlink = vi.spyOn(native, "exactUnlink");
 		const removal = vi.spyOn(native, "exactRemoveDirectoryTree");
 		const result = await deleteManagedSessionCandidate(fixture.scope, candidate);
-		expect(result).toMatchObject({
-			kind: "cleanup_pending",
-			phase: "artifacts",
-			message: "task_artifact_owner_shared_with_sibling_transcript",
-		});
+		expect(result).toMatchObject({ kind: "error", message: "task_artifact_owner_legacy_scope_unsupported" });
 		expect(fs.readFileSync(fixture.transcriptPath)).toEqual(before);
 		expect(fs.readFileSync(path.join(artifactRoot, "retained.txt"), "utf8")).toBe("retained artifact");
-		expect(protocolFilesystemSnapshot(artifactRoot)).toEqual(artifactsBefore);
-		expect(protocolFilesystemSnapshot(ownerRoot)).toEqual(ownerBefore);
-		// Journal reads/preparation may release their own identity-fenced lease, never payloads.
-		const journalLock = path.join(
-			fixture.scope.directoryPath,
-			".gjc-managed-session-internal/locks",
-			`gc-retirement-${crypto.createHash("sha256").update(fixture.transcriptPath).digest("hex")}.lock`,
-		);
-		for (const [pathname, identity] of unlink.mock.calls) {
-			expect(pathname).toBe(journalLock);
-			expect(identity.quarantineName).toMatch(
-				/^\.gjc-lock-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.stale$/u,
-			);
-			expect(identity.sha256).toMatch(/^[0-9a-f]{64}$/u);
-			expect(identity.dev).toBeGreaterThan(0n);
-			expect(identity.ino).toBeGreaterThan(0n);
-		}
+		expect(unlink).toHaveBeenCalledTimes(0);
 		expect(removal).toHaveBeenCalledTimes(0);
 	});
 
@@ -146,7 +122,7 @@ describe("owner-aware data cannot bypass live consumer authority", () => {
 			);
 		};
 		const result = await deleteManagedSessionCandidate(fixture.scope, candidate);
-		expect(result).toMatchObject({ kind: "error", message: "task_artifact_owner_locator_missing" });
+		expect(result).toMatchObject({ kind: "error", message: "task_artifact_owner_legacy_scope_unsupported" });
 		expect(storage).toHaveBeenCalledTimes(0);
 		expect(fs.readFileSync(fixture.transcriptPath, "utf8")).toContain("header_patch");
 	});
@@ -223,27 +199,13 @@ describe("owner-aware data cannot bypass live consumer authority", () => {
 		const unlink = vi.spyOn(native, "exactUnlink");
 		const removal = vi.spyOn(native, "exactRemoveDirectoryTree");
 		await expect(reconcileManagedTombstones(fixture.scope)).rejects.toThrow(
-			"task_artifact_owner_continuation_state_missing",
+			"task_artifact_owner_legacy_scope_unsupported",
 		);
 		expect(fs.readFileSync(ownerPayload)).toEqual(before);
 		expect(
 			fs.readdirSync(path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal/tombstones")),
 		).toEqual([name]);
-		// Journal reads/preparation may release their own identity-fenced lease, never payloads.
-		const journalLock = path.join(
-			fixture.scope.directoryPath,
-			".gjc-managed-session-internal/locks",
-			`gc-retirement-${crypto.createHash("sha256").update(fixture.transcriptPath).digest("hex")}.lock`,
-		);
-		for (const [pathname, identity] of unlink.mock.calls) {
-			expect(pathname).toBe(journalLock);
-			expect(identity.quarantineName).toMatch(
-				/^\.gjc-lock-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.stale$/u,
-			);
-			expect(identity.sha256).toMatch(/^[0-9a-f]{64}$/u);
-			expect(identity.dev).toBeGreaterThan(0n);
-			expect(identity.ino).toBeGreaterThan(0n);
-		}
+		expect(unlink).toHaveBeenCalledTimes(0);
 		expect(removal).toHaveBeenCalledTimes(0);
 	});
 });
