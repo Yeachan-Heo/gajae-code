@@ -390,6 +390,15 @@ const replacementPublisherOwnerId = randomUUID();
 const activeReplacementAttempts = new Set<string>();
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
+/** Exact quarantine names used when native exact-unlink leaves a scrubbed lock inode. */
+export function isManagedLockQuarantineName(name: string): boolean {
+	const prefix = ".gjc-lock-";
+	const suffix = ".stale";
+	return (
+		name.startsWith(prefix) && name.endsWith(suffix) && UUID_PATTERN.test(name.slice(prefix.length, -suffix.length))
+	);
+}
+
 function replacementReceiptPublisher(bytes: Uint8Array): ReplacementReceiptPublisher | undefined {
 	let record: Record<string, unknown> | undefined;
 	try {
@@ -1163,7 +1172,7 @@ type RetainedManagedReplacer = {
 		expectedSha256: string,
 	): { ok: boolean; code?: string };
 };
-type LockRecord = {
+export type LockRecord = {
 	attemptId: string;
 	pid: number;
 	bootId?: string;
@@ -3297,7 +3306,7 @@ function sameReplacementIdentity(
 	);
 }
 
-function parseLockBytes(bytes: Uint8Array): LockRecord | undefined {
+export function parseManagedLockRecord(bytes: Uint8Array): LockRecord | undefined {
 	try {
 		const value: unknown = JSON.parse(Buffer.from(bytes).toString("utf8"));
 		if (!value || typeof value !== "object") return undefined;
@@ -3320,7 +3329,7 @@ function parseLock(pathname: string): LockRecord | undefined {
 	try {
 		const stat = fs.lstatSync(pathname);
 		if (!stat.isFile() || stat.isSymbolicLink()) return undefined;
-		return parseLockBytes(fs.readFileSync(pathname));
+		return parseManagedLockRecord(fs.readFileSync(pathname));
 	} catch {
 		return undefined;
 	}
@@ -3329,7 +3338,7 @@ function parseLock(pathname: string): LockRecord | undefined {
 function captureLock(pathname: string): { record: LockRecord; snapshot: ManagedFileSnapshot } | undefined {
 	try {
 		const snapshot = captureManagedFileNoFollow(pathname);
-		const record = parseLockBytes(snapshot.bytes);
+		const record = parseManagedLockRecord(snapshot.bytes);
 		return record ? { record, snapshot } : undefined;
 	} catch {
 		return undefined;

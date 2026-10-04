@@ -15,9 +15,12 @@ import {
 	deleteManagedSessionCandidate,
 	discoverManagedGcSessionRetirementReceipts,
 	listManagedCandidates,
+	type ManagedGcProtocolScopeInput,
 	type ManagedScope,
 	ManagedSessionScopeTestHooks,
 	managedDirectoryIdentityForScope,
+	managedGcProtocolInspectorForLock,
+	managedGcProtocolScopeInspectorForScope,
 	prepareManagedSessionScopeForWriteSync,
 	publishManagedGcSessionRetirementReceipt,
 	readManagedGcSessionRetirementReceipt,
@@ -27,7 +30,11 @@ import {
 	resolveManagedScopeForWrite,
 	taskArtifactOwnerStorageContextForScope,
 } from "../src/session/internal/managed-session-scope";
-import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
+import {
+	acquireManagedLock,
+	captureManagedFileNoFollow,
+	ManagedSessionDescendantStore,
+} from "../src/session/internal/managed-session-storage";
 import {
 	captureTaskArtifactOwnerDeletionEvidence,
 	newSessionRootStore,
@@ -194,6 +201,120 @@ describe("owner-aware readonly data does not authorize legacy effects", () => {
 		).toEqual([name]);
 		expect(unlink).toHaveBeenCalledTimes(0);
 		expect(removal).toHaveBeenCalledTimes(0);
+	});
+});
+
+function protocolInputFor(scope: ManagedScope): ManagedGcProtocolScopeInput {
+	const scopeStat = fs.lstatSync(scope.directoryPath, { bigint: true });
+	const bindingPath = path.join(scope.directoryPath, ".gjc-managed-session-scope.v2.json");
+	const binding = captureManagedFileNoFollow(bindingPath);
+	const bindingStat = fs.lstatSync(bindingPath, { bigint: true });
+	const protocolPath = path.join(scope.directoryPath, ".gjc-managed-session-internal");
+	const protocolStat = fs.lstatSync(protocolPath, { bigint: true });
+	return {
+		scopePath: scope.directoryPath,
+		scopeIdentity: { path: scope.directoryPath, dev: scopeStat.dev.toString(), ino: scopeStat.ino.toString() },
+		bindingIdentity: {
+			name: path.basename(bindingPath),
+			dev: binding.identity.dev.toString(),
+			ino: binding.identity.ino.toString(),
+			nlink: binding.identity.nlink.toString(),
+			size: binding.identity.size,
+			mtimeNs: binding.identity.mtimeNs.toString(),
+			ctimeNs: binding.identity.ctimeNs.toString(),
+			mode: Number(bindingStat.mode & 0o777n),
+			sha256: binding.identity.sha256,
+		},
+		protocolIdentity: {
+			path: protocolPath,
+			dev: protocolStat.dev.toString(),
+			ino: protocolStat.ino.toString(),
+			mtimeNs: protocolStat.mtimeNs.toString(),
+			ctimeNs: protocolStat.ctimeNs.toString(),
+			mode: Number(protocolStat.mode & 0o777n),
+		},
+	};
+}
+
+function protocolFilesystemSnapshot(root: string): unknown[] {
+	const entries: unknown[] = [];
+	const visit = (pathname: string): void => {
+		const stat = fs.lstatSync(pathname, { bigint: true });
+		entries.push({
+			path: pathname,
+			dev: String(stat.dev),
+			ino: String(stat.ino),
+			mode: String(stat.mode),
+			mtimeNs: String(stat.mtimeNs),
+			ctimeNs: String(stat.ctimeNs),
+			size: String(stat.size),
+			hash: stat.isFile() ? crypto.createHash("sha256").update(fs.readFileSync(pathname)).digest("hex") : undefined,
+		});
+		if (stat.isDirectory() && !stat.isSymbolicLink())
+			for (const name of fs.readdirSync(pathname).sort()) visit(path.join(pathname, name));
+	};
+	visit(root);
+	return entries;
+}
+
+describe("independent authenticated protocol inventories", () => {
+	it("reads a real prepared journal and active lease without filesystem mutation", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		const context = taskArtifactOwnerStorageContextForScope(fixture.scope);
+		const lock = await acquireManagedLock(
+			path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal/locks"),
+			crypto.createHash("sha256").update(fixture.cwd).digest("hex"),
+			context.rootAuthority,
+			context.securityPolicy,
+		);
+		try {
+			const inspect = managedGcProtocolInspectorForLock(fixture.scope, lock);
+			const before = protocolFilesystemSnapshot(fixture.temporaryRoot);
+			const snapshots = await inspect([protocolInputFor(fixture.scope)]);
+			expect(snapshots).toHaveLength(1);
+			expect(
+				snapshots[0]?.directories
+					.find(value => value.role === "receipts")
+					?.files.some(value => value.name.startsWith("gc-retirement-")),
+			).toBe(true);
+			expect(
+				snapshots[0]?.directories
+					.find(value => value.role === "locks")
+					?.files.some(value => value.name.endsWith(".lock")),
+			).toBe(true);
+			expect(protocolFilesystemSnapshot(fixture.temporaryRoot)).toEqual(before);
+		} finally {
+			await lock.release();
+		}
+	});
+
+	it("refuses unknown or symlink protocol entries without repair", async () => {
+		for (const symlink of [false, true]) {
+			const fixture = makeFixture();
+			const inspect = managedGcProtocolScopeInspectorForScope(fixture.scope);
+			const unknown = path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal/receipts/foreign.json");
+			if (symlink) fs.symlinkSync(fixture.transcriptPath, unknown);
+			else {
+				await Bun.write(unknown, "{}");
+				fs.chmodSync(unknown, 0o600);
+			}
+			const before = protocolFilesystemSnapshot(fixture.temporaryRoot);
+			await expect(inspect([protocolInputFor(fixture.scope)])).rejects.toThrow();
+			expect(protocolFilesystemSnapshot(fixture.temporaryRoot)).toEqual(before);
+		}
+	});
+
+	it("rejects a substituted protocol root captured after factory binding", async () => {
+		const fixture = makeFixture();
+		const inspect = managedGcProtocolScopeInspectorForScope(fixture.scope);
+		const protocol = path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal");
+		fs.renameSync(protocol, `${protocol}.saved`);
+		fs.mkdirSync(protocol, { mode: 0o700 });
+		for (const role of ["locks", "receipts", "tombstones"]) fs.mkdirSync(path.join(protocol, role), { mode: 0o700 });
+		const before = protocolFilesystemSnapshot(fixture.temporaryRoot);
+		await expect(inspect([protocolInputFor(fixture.scope)])).rejects.toThrow();
+		expect(protocolFilesystemSnapshot(fixture.temporaryRoot)).toEqual(before);
 	});
 });
 
