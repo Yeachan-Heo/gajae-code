@@ -26,7 +26,10 @@ export interface OwnerManifest extends TaskArtifactOwnerLocator {
 	readonly sessionId: string;
 }
 
-export function newSessionRootStore(context: TaskArtifactOwnerStorageContext): ManagedSessionDescendantStore {
+function sessionRootStore(
+	context: TaskArtifactOwnerStorageContext,
+	access: "read-only" | "read-write",
+): ManagedSessionDescendantStore {
 	assertSessionRoot(context);
 	if (path.resolve(context.profileAgentDir) !== context.profileAgentDir)
 		throw new Error("task_artifact_owner_profile_invalid");
@@ -45,7 +48,17 @@ export function newSessionRootStore(context: TaskArtifactOwnerStorageContext): M
 			dev: BigInt.asUintN(64, stat.dev),
 			ino: BigInt.asUintN(64, stat.ino),
 		},
+		access,
 	);
+}
+
+export function newSessionRootStore(context: TaskArtifactOwnerStorageContext): ManagedSessionDescendantStore {
+	return sessionRootStore(context, "read-write");
+}
+
+/** Path-backed reader with no retained or recovery-mutable native authority. */
+export function newSessionRootReaderStore(context: TaskArtifactOwnerStorageContext): ManagedSessionDescendantStore {
+	return sessionRootStore(context, "read-only");
 }
 
 function parseOwnerManifest(bytes: Uint8Array): OwnerManifest {

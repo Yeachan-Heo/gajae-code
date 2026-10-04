@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as native from "@gajae-code/natives";
 import {
 	type ManagedGcSessionRetirementReceipt,
 	type ManagedGcSessionRetirementTarget,
@@ -13,6 +14,7 @@ import {
 	computeManagedScopeDigest,
 	discoverManagedGcSessionRetirementReceipts,
 	type ManagedScope,
+	managedDirectoryAuthorityForScope,
 	managedDirectoryIdentityForScope,
 	prepareManagedSessionScopeForWriteSync,
 	publishManagedGcSessionRetirementReceipt,
@@ -40,7 +42,11 @@ import {
 	type TaskArtifactOwnerLocator,
 	type TaskArtifactOwnerRetirementContinuation,
 } from "../src/session/task-artifact-owner-codec";
-import { retireTaskArtifactOwner } from "../src/session/task-artifact-owner-retirement";
+import {
+	retireTaskArtifactOwner,
+	verifyTaskArtifactOwnerPhysicalRetirement,
+	verifyTaskArtifactOwnerRetirementContinuation,
+} from "../src/session/task-artifact-owner-retirement";
 
 interface Fixture {
 	readonly temporaryRoot: string;
@@ -327,6 +333,21 @@ describe("managed GC retirement journal", () => {
 					};
 		const published = await publishManagedGcSessionRetirementReceipt(fixture.scope, disposition);
 		expect(published.state).toBe(outcome.kind === "completed" ? "owner_retired" : "owner_pending");
+		if (outcome.kind === "completed") {
+			const openRecoveryFsRoot = spyOn(native, "openRecoveryFsRoot").mockImplementation(() => {
+				throw new Error("readonly_recovery_open_called");
+			});
+			try {
+				verifyTaskArtifactOwnerPhysicalRetirement(
+					taskArtifactOwnerStorageContextForScope(fixture.scope),
+					fixture.evidence,
+					outcome,
+				);
+				expect(openRecoveryFsRoot).not.toHaveBeenCalled();
+			} finally {
+				openRecoveryFsRoot.mockRestore();
+			}
+		}
 		if (outcome.kind === "payload_retired") {
 			expect(outcome.nativeOutcome.payloadDurable).toBe(true);
 			expect(outcome.nativeOutcome.ok).toBe(false);
@@ -434,26 +455,88 @@ describe("managed GC retirement journal", () => {
 		).toThrow();
 	});
 
-	it("resolves and reads owner journals without changing managed bytes, modes, ctimes, or private directories", async () => {
+	it("reads owner journals without recovery effects or changes to managed bytes, modes, ctimes, or private directories", async () => {
 		const fixture = makeFixture();
 		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
 		const before = snapshotTree(fixture.temporaryRoot);
-		const resolved = resolveManagedGcScopeForRead({
-			cwd: fixture.cwd,
-			agentDir: fixture.agentDir,
-			sessionsRoot: fixture.sessionsRoot,
+		const openRecoveryFsRoot = spyOn(native, "openRecoveryFsRoot").mockImplementation(() => {
+			throw new Error("readonly_recovery_open_called");
 		});
-		expect(resolved.kind).toBe("resolved");
-		if (resolved.kind !== "resolved") throw new Error(`readonly_scope_resolution_failed:${resolved.code}`);
-		expect((await readManagedGcSessionRetirementReceiptReadOnly(resolved.scope, fixture.transcriptPath))?.state).toBe(
-			"prepared",
-		);
-		const discovered = await discoverManagedGcSessionRetirementReceipts({
-			agentDir: fixture.agentDir,
-			sessionsRoot: fixture.sessionsRoot,
-		});
-		expect(discovered.map(item => item.receipt.transcriptPath)).toContain(fixture.transcriptPath);
-		expect(snapshotTree(fixture.temporaryRoot)).toEqual(before);
+		const retainedAuthority = managedDirectoryAuthorityForScope(fixture.scope);
+		const retainManagedDirectory = retainedAuthority
+			? spyOn(retainedAuthority, "retainManagedDirectory").mockImplementation(() => {
+					throw new Error("readonly_recovery_retain_called");
+				})
+			: undefined;
+		try {
+			expect(
+				(await readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath))?.state,
+			).toBe("prepared");
+			const resolved = resolveManagedGcScopeForRead({
+				cwd: fixture.cwd,
+				agentDir: fixture.agentDir,
+				sessionsRoot: fixture.sessionsRoot,
+			});
+			expect(resolved.kind).toBe("resolved");
+			if (resolved.kind !== "resolved") throw new Error(`readonly_scope_resolution_failed:${resolved.code}`);
+			expect(
+				(await readManagedGcSessionRetirementReceiptReadOnly(resolved.scope, fixture.transcriptPath))?.state,
+			).toBe("prepared");
+			const discovered = await discoverManagedGcSessionRetirementReceipts({
+				agentDir: fixture.agentDir,
+				sessionsRoot: fixture.sessionsRoot,
+			});
+			expect(discovered.map(item => item.receipt.transcriptPath)).toContain(fixture.transcriptPath);
+
+			const context = taskArtifactOwnerStorageContextForScope(fixture.scope);
+			const continuation = uncertainContinuation(fixture);
+			expect(verifyTaskArtifactOwnerRetirementContinuation(context, fixture.evidence, continuation)).toEqual(
+				continuation,
+			);
+			const identity = managedDirectoryIdentityForScope(fixture.scope);
+			const unboundReaderPath = path.join(fixture.scope.directoryPath, "must-not-be-initialized");
+			expect(
+				() =>
+					new ManagedSessionDescendantStore(
+						context.rootAuthority,
+						unboundReaderPath,
+						undefined,
+						context.securityPolicy,
+						context.profileAgentDir,
+						undefined,
+						"read-only",
+					),
+			).toThrow("managed_read_store_requires_existing_identity");
+			expect(fs.existsSync(unboundReaderPath)).toBe(false);
+			const reader = new ManagedSessionDescendantStore(
+				context.rootAuthority,
+				fixture.scope.directoryPath,
+				undefined,
+				context.securityPolicy,
+				context.profileAgentDir,
+				{
+					canonicalPath: fixture.scope.directoryPath,
+					dev: BigInt.asUintN(64, identity.dev),
+					ino: BigInt.asUintN(64, identity.ino),
+				},
+				"read-only",
+			);
+			try {
+				expect(() => reader.ensureDirectory("must-not-be-created")).toThrow("managed_store_read_only");
+				expect(() => reader.moveFileNoReplace("source", "destination", undefined as never)).toThrow(
+					"managed_store_read_only",
+				);
+				expect(() => reader.retainAuthority()).toThrow("managed_store_read_only");
+			} finally {
+				reader.close();
+			}
+			expect(openRecoveryFsRoot).not.toHaveBeenCalled();
+			if (retainManagedDirectory) expect(retainManagedDirectory).not.toHaveBeenCalled();
+			expect(snapshotTree(fixture.temporaryRoot)).toEqual(before);
+		} finally {
+			retainManagedDirectory?.mockRestore();
+			openRecoveryFsRoot.mockRestore();
+		}
 	});
 
 	it("discovers original prepared authority in a fresh process after transcript absence", async () => {

@@ -5,6 +5,7 @@ import type { ManagedSessionDescendantStore } from "./internal/managed-session-s
 import {
 	captureOwnerTreeIfPresent,
 	captureValidatedOwnerTree,
+	newSessionRootReaderStore,
 	newSessionRootStore,
 	ownerTreeHasPendingManagedPublication,
 } from "./internal/task-artifact-owner-access";
@@ -181,7 +182,7 @@ export function verifyTaskArtifactOwnerPhysicalRetirement(
 ): void {
 	const outcome = parseTaskArtifactOwnerRetirementOutcome(context, evidence, value);
 	if (outcome.kind !== "completed") throw new Error("task_artifact_owner_physical_retirement_unverified");
-	const store = newSessionRootStore(context);
+	const store = newSessionRootReaderStore(context);
 	try {
 		if (!sameOwnerParentIdentity(store.captureDirectoryIdentity(OWNER_DIRECTORY), evidence.parentIdentity))
 			throw new Error("task_artifact_owner_parent_identity_mismatch");
@@ -204,7 +205,7 @@ export function verifyTaskArtifactOwnerRetirementContinuation(
 ): TaskArtifactOwnerRetirementContinuation {
 	const evidence = parseTaskArtifactOwnerDeletionEvidence(evidenceValue);
 	const continuation = parseTaskArtifactOwnerRetirementContinuation(context, evidence, value);
-	const store = newSessionRootStore(context);
+	const store = newSessionRootReaderStore(context);
 	try {
 		if (!sameOwnerParentIdentity(store.captureDirectoryIdentity(OWNER_DIRECTORY), evidence.parentIdentity))
 			throw new Error("task_artifact_owner_parent_identity_mismatch");
