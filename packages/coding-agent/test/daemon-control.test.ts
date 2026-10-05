@@ -36,6 +36,7 @@ import {
 	ensureDiscordDaemon,
 	ensureSlackDaemon,
 	hasSafeChatDaemonStateShape,
+	readChatDaemonState,
 	releaseChatDaemonOwnership,
 } from "../src/sdk/bus/chat-daemon-control";
 import { tokenFingerprint } from "../src/sdk/bus/config";
@@ -3759,5 +3760,188 @@ describe("runChatDaemonInternal heartbeat ownership", () => {
 			"transport stop failed",
 			"transport stop failed",
 		);
+	});
+});
+
+describe("runChatDaemonInternal retires when notifications are disabled", () => {
+	type Kind = "discord" | "slack";
+	type ConfigVariant = "enabled" | "provider-disabled" | "global-disabled";
+
+	function writeConfig(agentDir: string, kind: Kind, variant: ConfigVariant): void {
+		const providerOff = variant === "provider-disabled" ? ["    enabled: false"] : [];
+		const provider =
+			kind === "discord"
+				? [
+						"  discord:",
+						...providerOff,
+						"    botToken: discord-token",
+						"    applicationId: app",
+						"    guildId: guild",
+						"    parentChannelId: parent",
+					]
+				: [
+						"  slack:",
+						...providerOff,
+						"    botToken: xoxb-slack-token",
+						"    appToken: xapp-slack-token",
+						"    workspaceId: T123",
+						"    channelId: C123",
+					];
+		const globalEnabled = variant === "global-disabled" ? "false" : "true";
+		fs.writeFileSync(
+			path.join(agentDir, "config.yml"),
+			["notifications:", `  enabled: ${globalEnabled}`, ...provider, ""].join("\n"),
+		);
+	}
+
+	function writeHalfWrittenConfig(agentDir: string): void {
+		fs.writeFileSync(path.join(agentDir, "config.yml"), "notifications:\n  enabled: [\n");
+	}
+
+	interface Harness {
+		ownerId: string;
+		worker: Promise<void>;
+		tick(): Promise<void>;
+		stops(): number;
+	}
+
+	async function startWorker(
+		agentDir: string,
+		kind: Kind,
+		label: string,
+		pidIncarnation?: (pid: number) => string | undefined,
+	): Promise<Harness> {
+		const ownerId = `${process.pid}-retire-${label}`;
+		let intervalCallback: (() => unknown) | undefined;
+		const started = Promise.withResolvers<void>();
+		const intervalReady = Promise.withResolvers<void>();
+		let stops = 0;
+		const worker = runChatDaemonInternal(kind, ["--agent-dir", agentDir, "--owner-id", ownerId], {
+			pidIncarnation,
+			createRuntime: () => ({
+				start: async () => started.resolve(),
+				stop: async () => {
+					stops++;
+				},
+			}),
+			renewHeartbeat: async () => true,
+			setInterval: ((callback: () => unknown) => {
+				intervalCallback = callback;
+				intervalReady.resolve();
+				return 1 as unknown as ReturnType<typeof setInterval>;
+			}) as unknown as typeof setInterval,
+			clearInterval: () => undefined,
+		});
+		await started.promise;
+		await intervalReady.promise;
+		return {
+			ownerId,
+			worker,
+			tick: async () => {
+				await intervalCallback?.();
+			},
+			stops: () => stops,
+		};
+	}
+
+	async function expectServing(harness: Harness): Promise<void> {
+		const settled = await Promise.race([harness.worker.then(() => "exited"), Bun.sleep(250).then(() => "serving")]);
+		expect(settled).toBe("serving");
+		expect(harness.stops()).toBe(0);
+	}
+
+	async function expectRetired(agentDir: string, kind: Kind, harness: Harness): Promise<void> {
+		await harness.worker;
+		expect(harness.stops()).toBe(1);
+		const state = await readChatDaemonState(agentDir, kind);
+		expect(state?.ownerId).toBe(harness.ownerId);
+		expect(state?.stoppedAt).toBeNumber();
+		// Credentials stay configured while the provider is switched off, as on a real install.
+		const disabled = setPrivateAgentDir(
+			Settings.isolated(
+				kind === "discord"
+					? {
+							"notifications.enabled": false,
+							"notifications.discord.botToken": "discord-token",
+							"notifications.discord.applicationId": "app",
+							"notifications.discord.guildId": "guild",
+							"notifications.discord.parentChannelId": "parent",
+						}
+					: {
+							"notifications.enabled": false,
+							"notifications.slack.botToken": "xoxb-slack-token",
+							"notifications.slack.appToken": "xapp-slack-token",
+							"notifications.slack.workspaceId": "T123",
+							"notifications.slack.channelId": "C123",
+						},
+			),
+			agentDir,
+		);
+		// The worker process exits once runChatDaemonInternal returns; model that exit.
+		const status = await new ChatDaemonController(disabled, kind, { pidAlive: () => false }).status();
+		expect(status.health).toBe("stopped");
+	}
+
+	test.each([
+		["slack", "provider-disabled"],
+		["slack", "global-disabled"],
+		["discord", "provider-disabled"],
+		["discord", "global-disabled"],
+	] as const)("%s owner retires after the config becomes %s", async (kind, variant) => {
+		const agentDir = tempAgentDir();
+		writeConfig(agentDir, kind, "enabled");
+		const harness = await startWorker(agentDir, kind, `${kind}-${variant}`);
+		await harness.tick();
+		await harness.tick();
+		await expectServing(harness);
+
+		writeConfig(agentDir, kind, variant);
+		await harness.tick();
+		await harness.tick();
+		await expectRetired(agentDir, kind, harness);
+
+		// Re-enabling lets a fresh owner acquire the retired slot and serve again.
+		writeConfig(agentDir, kind, "enabled");
+		// This test process stands in for both daemons, so give the successor a distinct
+		// process incarnation, as a freshly spawned worker would have.
+		const successor = await startWorker(agentDir, kind, `${kind}-${variant}-successor`, () => "linux:424242");
+		const successorState = await readChatDaemonState(agentDir, kind);
+		expect(successorState?.ownerId).toBe(successor.ownerId);
+		expect(successorState?.stoppedAt).toBeUndefined();
+		await expectServing(successor);
+		writeConfig(agentDir, kind, variant);
+		await successor.tick();
+		await successor.tick();
+		await expectRetired(agentDir, kind, successor);
+	});
+
+	test("keeps serving through unreadable config and isolated disabled reads", async () => {
+		const agentDir = tempAgentDir();
+		writeConfig(agentDir, "slack", "enabled");
+		const harness = await startWorker(agentDir, "slack", "transient");
+
+		// A half-written / unparsable file is a read error, never a disabled verdict.
+		writeHalfWrittenConfig(agentDir);
+		await harness.tick();
+		await harness.tick();
+		await harness.tick();
+		await expectServing(harness);
+
+		// One disabled read between enabled or unreadable reads is not a settled verdict.
+		writeConfig(agentDir, "slack", "provider-disabled");
+		await harness.tick();
+		writeConfig(agentDir, "slack", "enabled");
+		await harness.tick();
+		writeConfig(agentDir, "slack", "global-disabled");
+		await harness.tick();
+		writeHalfWrittenConfig(agentDir);
+		await harness.tick();
+		await expectServing(harness);
+		expect((await readChatDaemonState(agentDir, "slack"))?.stoppedAt).toBeUndefined();
+
+		writeConfig(agentDir, "slack", "provider-disabled");
+		await harness.tick();
+		await harness.tick();
+		await expectRetired(agentDir, "slack", harness);
 	});
 });

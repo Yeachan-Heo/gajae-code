@@ -2,6 +2,148 @@
 
 ## [Unreleased]
 
+## [0.18.7] - 2026-10-04
+
+### Added
+
+- Resolve readonly target-directory settings snapshots with normalized values and fresh operation-local metadata reads, without changing parent settings or publishing global hooks.
+
+### Changed
+
+- Cut startup memory for the light CLI invocations by deferring the per-path modules out of the eager root command graph: peak RSS dropped from 32.4 MB to 27.7 MB for `--version` and from 32.7 MB to 28.0 MB for `--help`. The quick lane, the bash-shell guardian/supervisor/worker executors, the isolated shell, the tab-worker smoke probe and the fixture report now load only when their own path actually runs, so their behaviour, output and exit codes are unchanged.
+
+### Fixed
+
+- `session.resume` of a session whose detached-idle host already exited no longer fails with `EEXIST` on `<id>.lifecycle.ready.json`: the host revokes its own ready marker on graceful exit, and a launch retires the same id's leftover ready/marker pair when the recorded owner is proven exited (a live or unknown owner still wins) (#6261).
+
+- Settle active ACP prompts immediately when their SDK session host retires, while preserving prompts across same-generation attachment replacement instead of waiting for the inactivity watchdog.
+
+- Apply ACP thinking-level changes through the session control setter so reasoning effort updates the live session state and session config readback reflects the requested level.
+
+- ACP now rejects unsupported or unapplied thinking levels instead of reporting them as successful changes.
+
+- Session heartbeat checkpoints no longer starve the SDK broker discovery heartbeat while waiting on the session-index lock.
+
+- SDK broker readiness polling now uses the session-index change stamp instead of checkpointing live heartbeats and replaying the full index on every poll.
+
+- `gjc config set|get|list` (text and `--json`) no longer print the Slack app-level token `notifications.slack.appToken` verbatim. Secret detection for setting keys now treats any key segment ending in a secret word (`token`, `secret`, `password`, `passwd`, `pwd`, `credential(s)`) as secret instead of relying on a fixed list of camelCase prefixes, so it shows `<redacted>` like every other token setting. Token-budget settings such as `compaction.reserveTokens` stay visible.
+
+- Retry bare-default Codex overloads when the failed attempt contains only an empty unsigned thinking block.
+
+- `HINDSIGHT_RETAIN_EVERY_N_TURNS`, `HINDSIGHT_RECALL_MAX_TOKENS`, `HINDSIGHT_RECALL_CONTEXT_TURNS` and `HINDSIGHT_RECALL_MAX_QUERY_CHARS` now accept only plain non-negative digits. Malformed values such as `5turns`, `1e3`, `1.5` or `-3` fall back to the matching `hindsight.*` setting instead of being read by `parseInt` as 5, 1, 1 or -3. A negative `HINDSIGHT_RETAIN_EVERY_N_TURNS` previously made chunked retention send nothing.
+
+- Slack and Discord chat daemons no longer post every lean final answer twice. The host sends each turn frame on a positioned leg and a raw leg and drops the raw copy only for connections that negotiate `positioned_notification_effects_v1`; the chat daemons' session connections never did, and a lean final carries no `messageRef` to collapse the two copies onto one publication. Chat daemon session connections now negotiate positioned-only notification effects, while plain SDK observers such as `gjc sdk session tail` keep both surfaces.
+
+- Answer modern MCP roots requests without requiring an interactive input handler, while keeping actual elicitation fail-closed when user input is unavailable.
+- Connect supported MCP form requests to the session's user-input surface instead of failing before users can answer.
+
+- SDK MCP initialize now negotiates supported protocol versions and includes the coding-agent package version in `serverInfo`.
+
+- SSH hosts loaded from `ssh.json` no longer accept a malformed `port`. A string port must be plain digits and every port must be an integer from 1 to 65535, so `"22oops"`, `"+22"`, `2222.5`, `0` and `70000` are now dropped with an `Invalid port` warning (the host falls back to the default port) instead of being used as 22, 22, 2222.5, 0 and 70000.
+
+## [0.18.6] - 2026-10-03
+
+### Added
+
+- Explicit correlated active-turn steering through coordinator send_prompt, with operator guidance separating requested evidence, queued tasks, and verified consumption. Retargeting feedback to a new active turn requires a new idempotency key; admission still does not prove consumption.
+
+- `gjc sdk diagnostics broker` and the exported `observeExistingBroker` facade now report a real running broker: the broker publishes a startup-fixed diagnostic generation, build snapshot and protocol, and the observation reads the publication only through the approved read-only native lease, opens exactly one client connection with no reconnect attempts, and returns a frozen snapshot with no token, endpoint, path, pid or environment value. An observed result exits 0 and a typed unavailability exits 1.
+
+- `gjc sdk diagnostics broker`: a read-only broker observation route that can never start, ensure, retire, restart or recover a broker. This entry ships the inert public entry, grammar and bounded observation document; the observation reader is wired in the accompanying fragment.
+
+### Changed
+
+- Built-in Codex profiles no longer use GPT-6 Sol or GPT-5.6 Terra. Every role that used `openai-codex/gpt-6-sol` or `openai-codex/gpt-5.6-terra` now uses `openai-codex/gpt-6.1-sol` at the same reasoning effort, so `codex-medium` and `codex-pro` are GPT-6.1 Sol in every role. Affected profiles: `codex-medium`, `codex-pro`, `astra-lite`, `astra-default`, `astra-heavy`, `opus-codex`, `codex-opencodego`, and `fable-opus-codex`. Moving Terra roles onto Sol is an intentional tier change; the catalog price of GPT-6.1 Sol is equal to or below Terra's. The `gpt-6-sol` and `gpt-5.6-terra` catalog entries are unchanged for explicit selection (#6163).
+- `codex-eco` is now `codex-medium` with Sol lowered to `openai-codex/gpt-6-luna` at the same effort, so it uses GPT-6 Luna in every role. Its default, critic, and architect move from GPT-5.6 Terra to GPT-6 Luna (#6163).
+- Roles that moved off GPT-5.6 Terra now compact earlier. GJC forces the Codex GPT-5.6 family to a 372K context window, while GPT-6.1 Sol and GPT-6 Luna use 272K, the window the Codex backend reports for both families (#6163).
+- Installs that load a signed preset registry revision defining these profiles keep that registry binding (built-in, then registry, then user `models.yml`) until a registry revision carries this change (#6163).
+
+- The `gjc` entry module is now inert on import: entry metadata moved to the pure `@gajae-code/utils/cli-metadata` leaf (re-exported from `dirs`), and the effectful bootstrap (startup timing, stderr drainer, malloc re-exec, managed-owner admission, public dispatch, registry) moved to `cli-ordinary` which loads lazily for every non-diagnostics command with unchanged ordering.
+
+### Removed
+
+- Removed the `codex-sol61` built-in profile added in 0.18.2. A saved or requested `codex-sol61` now resolves to `codex-pro`, which differs in two roles: critic is `openai-codex/gpt-6.1-sol:max` instead of `:xhigh`, and architect is `openai-codex/gpt-6.1-sol:xhigh` instead of `openai-codex/gpt-6-astra:xhigh`. Define a custom `codex-sol61` profile in `models.yml` to keep the previous mapping; a user-defined profile takes precedence over the alias (#6163).
+
+### Fixed
+
+- The isolated bash shell supervisor no longer busy-spins while its shell is idle. It reaped adopted zombies by sweeping all of `/proc` every 25 ms without waiting for the previous sweep to finish, which kept each supervisor at about 160% CPU and tens of thousands of context switches per second even during `sleep`. Sweeps now run only on `SIGCHLD`, one at a time, so an idle supervisor stays near 0% CPU (#5972).
+
+- Run compound pipeline stages concurrently to prevent pipe-buffer deadlocks.
+- Join remaining pipeline stages when a stage wait returns an error.
+
+- ACP `session/new` now waits for the model to settle before building the response when `modelRoles.default` is configured but no `--model` is passed. This ensures the `model` config option is always present in the response, preventing ACP clients (like Paseo) from failing with `model_not_selected` on the first prompt when the session uses a configured default model.
+
+- Resuming a session with an unavailable pinned credential no longer aborts when the startup model profile probes that provider; credential failure is reported so the user can re-pin or select AUTO.
+- Resuming a session with an unavailable pinned credential now honors an explicit `--api-key` or a literal `models.yml` `apiKey` when restoring the saved model, the settings default, and extension-registered models, instead of reporting the pin unavailable. An `apiKeyEnv` key does not unblock the pin, because another stored api_key account could take precedence over it; without an explicit key the provider stays blocked until the user re-pins or selects AUTO.
+
+- Windows Telegram daemon stop and reload now wait for the owner-fenced cooperative control request before force escalation, and post-update recovery failures exit cleanly with actionable guidance instead of an uncaught exception (#6138).
+- Added an owner-fenced control wakeup for blocked Telegram polls and extended hard-termination cooperative grace before escalation (#6138).
+
+- A process dying between the POSIX lock-removal detach and payload scrub no longer wedges every subsequent launch with `FileLockAcquireError` ("blocked by abandoned removal transition"): the dead owner's `.lock.removing` transition is reclaimed through the identity-bound guarded removal, and a refused reclamation keeps contending and still reports the abandoned transition at exhaustion (#6253).
+
+- Allow a fresh ACP prompt to wait for a previously failed or cancelled turn to finish winding down before reporting a busy conflict.
+- Admit the next ACP prompt immediately after cancellation settles instead of requiring a retry.
+
+- Scope ACP SDK session-router attachments to sessions owned or being attached by that ACP connection, preventing foreign session hosts from being kept alive.
+
+- Sessions without explicit `retry.*` settings now auto-retry a content-free OpenAI Codex `server_error` / `internal_error` error event, the same way a content-free `server_is_overloaded` event is already retried. Attempts that produced visible output or tool content are still never retried.
+
+- Coordinator MCP: `GJC_COORDINATOR_MCP_ARTIFACT_BYTE_CAP`, `GJC_COORDINATOR_MCP_SESSION_IDLE_TTL_MS` and `GJC_COORDINATOR_MCP_SESSION_SWEEP_INTERVAL_MS` accept only plain decimal digits; values such as `64KB`, `1e6` or `1.5` now fall back to the default instead of being read as their leading digits (`64KB` used to set a 64-byte artifact cap).
+- `gjc setup hermes --artifact-byte-cap` rejects integers above `Number.MAX_SAFE_INTEGER` (for example `9007199254740992` or `1e21`), which it used to write in a form the coordinator then ignored, silently leaving the 64 KiB default in place.
+
+- Report out-of-scope Coordinator evidence paths as invalid input instead of service unavailability, without exposing denied paths. Clarify evidence-root restrictions in the Hermes operator guide.
+
+- Coordinator MCP tool arguments `timeout_ms`, `poll_interval_ms`, `limit` and `lines`, and the `GJC_COORDINATOR_MCP_PROMPT_ACK_TIMEOUT_MS` env value, no longer read a leading digit prefix. A string such as `1e4` or `5s` became a 1 ms or 5 ms wait, and a one-element array such as `[50]` was accepted as `50`; strings must now be plain decimal digits and non-numeric types fall back to the defaults.
+
+- `GJC_COORDINATOR_MCP_EVENT_WEBHOOK_TIMEOUT_MS` and `GJC_COORDINATOR_MCP_EVENT_WEBHOOK_MAX_ATTEMPTS` now accept only plain decimal digits. Values such as `1.5`, `1e4` or `10s` were read as their leading digits, shrinking the per-attempt timeout to 1 ms or the retry budget to a single attempt; they now fall back to the defaults.
+
+- Reject active deep-interview questions missing structured round metadata instead of accepting answers that cannot be recorded, and reject extra interview questions before prompting.
+- Reject empty and whitespace-only ask question bodies, including metadata-free extra questions, in deferred, loaded, and direct execution paths while preserving ordinary multi-question and free-text asks, including next-workflow choices after final-spec handoff.
+
+- Restore cache prefix extension across LLM requests by keeping volatile project context and untrusted MCP server instructions in `agent.state.messages` after they are sent, rather than removing them after each turn. This allows subsequent requests to properly reuse the cache prefix from previous requests, improving cache hit rates and reducing unnecessary re-computation. Volatile ephemeral messages are still excluded from persistent storage as intended. Fixes #6167.
+
+- Gate the statusless typed overload check on `managedOutcome` in `#handleRetryableError` to prevent hanging when a managed fallback chain encounters a transport 503 error followed by a typed Responses overload error. The fix ensures that on the agent_end path, the statusless overload check returns false to allow proper session termination handling instead of deadlocking. Fixes #6180.
+
+- `AgentSession.messages` no longer exposes request-scoped ephemeral messages (`volatile-project-context`, `untrusted-mcp-server-instructions`) that #6167 retains in `agent.state.messages` for prompt-cache prefix reuse. The cache prefix behavior is unchanged; the public view and everything built on it match the pre-#6167 transcript again, which fixes the red `dev` CI in the managed fallback attempt transaction test (#6191).
+
+- Bash commands with auto-background disabled no longer leave the foreground via the timeout fold timer after timing out.
+
+- Lifecycle ledger compaction now evicts only safe settled identities while retaining unbound close replay fences and retirement-source dependencies.
+
+- Context-usage and compaction token estimates count the request-scoped ephemeral messages (`volatile-project-context`, `untrusted-mcp-server-instructions`) that are retained in `agent.state.messages` for prompt-cache reuse. They are hidden from `AgentSession.messages`, so estimating over that public view undercounted the real provider request and could delay auto-compaction until the context window overflowed.
+
+- Recover abandoned parseable lock removal transitions when their owner is proven dead.
+
+- Let SDK steering reach the active worker despite an earlier ordinary ordered control, while waiting behind abort-and-prompt replacements and fencing to the exact runtime command/turn identity so stale feedback is rejected instead of delivered to a successor.
+
+- Return an empty observation for missing assistant text instead of a resource-loss error, including compatibility with older running SDK hosts.
+
+- Stubbed credential-pin methods in the login preset recommendation test mock (follow-up to #6025).
+
+- Keep managed replacement receipts owned by their exact publishing attempt until it settles, preventing concurrent sessions in one workspace from stealing active receipts and failing transcript persistence with `identity_mismatch`. Peer recovery of publisher-bound receipts requires positive owner-exit or PID-reuse evidence; orphan receipt identity checks and external transcript replacement guards remain intact.
+
+- Fixed the resident-cache GC reaping a *running* session's cache on Linux hosts with a slewed wall clock (WSL2 in particular), which replaced tool results with `[Session resident text blob missing: …]` placeholders and logged `Resident cache trust rejection … blob_create_failed ENOENT`. The owner lease recorded the process start from `ps -o lstart`, which procps renders as `btime + ticks` where `btime` is re-derived from the current wall clock minus uptime, so the same live process reported a start time that drifted (observed: 15 minutes over 11 hours) and the sweep read the drift as PID reuse. On Linux the lease now records the `/proc/<pid>/stat` start tick count scoped by the kernel `boot_id` (basis `linux-proc-ticks:<boot_id>`), which never moves for a live process; reuse is only proven when the basis matches, so leases written by older builds or another boot are never reaped while their PID is alive.
+
+- Broker observation refuses everything it cannot prove: a publication without the diagnostic capability is `unsupported` (never `absent` or malformed), only the canonical loopback endpoint with an in-range port is accepted, the broker answers only from an already-owned healthy publication, one monotonic budget covers the whole observation so an expired budget never opens a socket and a late answer is discarded, and malformed arguments raise a typed argument error instead of a fabricated observation.
+
+- The read-only diagnostic addon's trusted digest now travels with the addon through the release path: each build emits a provenance sidecar, consuming jobs rebuild the record from those sidecars against the version actually being shipped, and embedding plus platform-package staging refuse bytes that do not match it.
+
+- Reverted the 0.18.2 readiness-cutoff reaping (#6126) because it left hosts in `terminal_uncertain` under concurrent recovery (#6143); unregistered hosts terminated by a signal at readiness cutoff again report `terminal_uncertain` until the fix re-lands.
+
+- Coordinator MCP: a `GJC_COORDINATOR_MCP_SESSION_SWEEP_INTERVAL_MS` above `2147483647` (about 24.9 days) no longer makes the idle-session reaper sweep continuously. The interval was passed straight to `setTimeout`, which treats longer delays as 1 ms; it is now capped at the timer maximum.
+
+- `gjc ssh add --port` now rejects ports that are not plain digits (`"22oops"`, `"2222.5"`, `"+22"`, `"1e3"`) instead of silently saving the leading digits to `ssh.json`.
+
+- `gjc web-search --limit` now rejects `0` and negative values with an error instead of passing them to providers, where a negative limit silently dropped results from the end of the source list.
+
+- The `web_search` tool schema now declares `limit` and `num_search_results` as positive integers, so a model-supplied `0`, negative or fractional count is rejected at validation instead of reaching providers, where a negative count silently dropped sources from the end of the list.
+
+### Tests
+
+- Add regression test for issue #6004: Verify that after overflow auto-compaction without a continuation scheduled, the session remains usable for subsequent prompts. The test exercises the overflow path to ensure pending agent_end events do not block future prompt submissions (related to #6004).
+
+## [0.18.5] - 2026-09-30
+
 ## [0.18.4] - 2026-09-30
 
 ## [0.18.3] - 2026-09-30
@@ -606,7 +748,7 @@
 - `gjc doctor --fix --repair service.restart-owned` restarts the SDK broker and Discord, Slack, and Telegram daemons through each owner's prepare/commit protocol. Restart success requires kernel-confirmed predecessor absence and a genuinely different successor process incarnation; matching PIDs are not accepted as proof.
 
 - Successful macOS installs and updates can offer the optional experimental, third-party community Gajae Code App (#5140), defaulting to No. The shared installer requires canonical release checksums and a verified bundle/signature, skips installed apps and automation, and supports `GJC_NO_COMMUNITY_APP=1`; app failures leave GJC installed.
-
+- `deep-interview --crystallize` promotes bounded, revision-bound conversation evidence into versioned specs with verbatim confirmed anchors, distinct inferred/disputed classifications, deterministic deltas, and execution approval closed by default (#5134). Initial snapshots cannot silently discard an older transcript prefix; explicit corrections, permission requirements, mixed-media text anchors, and conflicting obligations retain their evidence semantics. The Phase 5 execution choice carries explicit workflow-gate metadata, and shared project-transcript authentication supports Windows without weakening identity checks.
 ### Fixed
 
 - Coordinator runtime-state updates are no longer dropped when several gjc sessions write the same session-state projection. The state-file acquisition deadline was absolute rather than idle-based, so a contender gave up five seconds after it started waiting even while peers were taking and releasing the lock normally — and each of those writes runs inside the namespace transaction lock whose own budget is sixty seconds, so any critical section outlasting five seconds starved every waiter with `lock_owner_live_or_unverifiable` or `transition_claim_timeout`. A dropped update is permanent: nothing re-derives the snapshot, so the coordinator kept reporting stale lifecycle and tool activity for that session. The deadline now measures waiting without progress, restarting only on proof that the lock changed hands to a peer, and a separate ceiling still bounds total waiting. A change the contender's own stale reclaim caused is not counted as progress, so an endlessly recreated dead claim still fails on its original schedule, and a wedged lock is still refused promptly. Runtime-state persistence additionally retries a pure-contention refusal a bounded number of times; every other refusal is still reported on the first attempt.
@@ -647,6 +789,9 @@
 - Bash cancellation now observes its owned abort acknowledgement immediately and joins it on every execution exit path. A run settling before its abort reply can no longer leave a rejected cleanup promise unobserved when a one-shot worker closes; public operation errors and existing bounded cleanup deadlines are unchanged.
 - A headless `ask` no longer waits forever without a signal. An ask that only a remote answer source or a workflow gate can answer now has a documented answer deadline (`GJC_ASK_ANSWER_DEADLINE_MS`), and its expiry aborts with an origin-labelled error (`no answer was received within Ns of the headless ask answer deadline`) instead of degrading into the empty answer the model reads as "the user declined". The deadline is disabled by default because an attended remote responder may legitimately answer arbitrarily late, and a value beyond the runtime timer's range is treated as disabled rather than silently clamped to a 1 ms delay.
 - Coordinator question reconciliation now reports a published workflow gate that no coordinator turn owns yet as a `pending_registration` diagnostic. Previously the gate was deferred silently, so `gjc_coordinator_list_questions` and `gjc_coordinator_read_coordination_status` answered a healthy empty snapshot for the whole deferral window while the agent was blocked on an ask no operator could see (#5475).
+- Deep Interview and Ralplan execution approval now binds a verified transcript prefix rather than rejecting the workflow's own appended results. Ordinary interview specs and standalone plans retain explicit artifact-bound approval, newly published Crystal versions require fresh consent, historical final retries preserve newer or terminal run state, and ordinary state resets preserve locked user intent while clearing old spec/handoff metadata. Punctuationless questions with arbitrary noun subjects cannot become confirmed Crystal requirements (#5134). Authoritative crystallization transcripts are now restricted to the session manager's managed containers, so a repository-controlled root-level `.gjc/*.jsonl` file cannot be promoted as conversation evidence.
+- Ralplan approval uses the current run's authenticated handoff identity rather than historical session audits. Headless approval records capture durable emitted gate IDs, allowing a repeated question label for a newer publication without accepting replayed consent; off-mode skill guidance consistently requires the structured current-plan approval gate (#5134).
+- Execution approvals now bind the provider Ask invocation ID and require exactly one fresh matching Ask result after the captured transcript prefix; legacy boundaries without that identity, reused provider IDs, empty continuations, and context-free acknowledgements fail closed. Ralplan Ask records remain pending until their durable tool result is written, then the SkillTool consumes them before the Ralplan-to-Ultragoal handoff. Trailing Unicode punctuation runs are stripped conservatively before acknowledgement classification (#5134).
 - Coordinator responses now preserve `error: null` instead of replacing it with an `unavailable` error. Non-null errors still use fixed public messages, and unknown error codes remain mapped to `unavailable`.
 - Session-state locks now recover a settled same-process owner release failure, including an acquisition handoff whose transition cleanup fails, without replaying the callback or touching a successor owner.
 - Session cwd moves now await `local://` initialization when an explicit `--session-dir` destination becomes managed storage, preserving local artifacts and preventing subsequent prompts from failing with `local:// legacy migration must complete before path resolution`; post-commit initialization failures recover coordinator state and settle pending persistence instead of leaving the rescope barrier blocked.

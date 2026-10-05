@@ -31,6 +31,7 @@ import {
 	type AgentMessage,
 	type AgentState,
 	type AgentTool,
+	type AgentTerminalOwnerContext,
 	assertImagePlaceholdersHavePayload,
 	type ContextMaintenanceResult,
 	canContinuePersistedHistory,
@@ -127,14 +128,15 @@ import {
 	streamSimple,
 } from "@gajae-code/ai/core";
 import { normalizeAnthropicBaseUrl } from "@gajae-code/ai/providers/anthropic";
+import { isExplicitCodexTerminalVeto } from "@gajae-code/ai/providers/openai-codex-responses";
 import {
 	type AuthDisposition,
 	beginAttempt,
 	classifyFallbackTrigger,
 	EMPTY_RESPONSE_PROVIDER_CODE,
 	type FallbackAttemptToken,
-	PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE,
 	type FallbackTriggerClass,
+	PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE,
 	SERVER_OVERLOADED_PROVIDER_CODE,
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 } from "@gajae-code/ai/utils/fallback-transport";
@@ -407,11 +409,7 @@ import type { NotificationSessionController } from "../sdk/bus/session-control";
 import { buildSyntheticModelId, syntheticNamespaceCollision } from "../sdk/model-profile-model";
 import { sanitizePromptFailure } from "../sdk/prompt-failure";
 import type { SecretObfuscator } from "../secrets/obfuscator";
-import {
-	formatNoCredentialOnboardingError,
-	formatNoModelOnboardingError,
-	NoModelSelectedError,
-} from "../setup/model-onboarding-guidance";
+import { formatNoCredentialOnboardingError, NoModelSelectedError } from "../setup/model-onboarding-guidance";
 import {
 	isCanonicalGjcWorkflowSkill,
 	isWorkflowContinuationInert,
@@ -1211,7 +1209,10 @@ export interface TrackedSendUserMessageOptions extends SendUserMessageOptions {
 	trackSubmission: true;
 }
 
-type SendUserMessageDispatchOptions = SendUserMessageOptions & { trackSubmission?: boolean };
+type SendUserMessageDispatchOptions = SendUserMessageOptions & {
+	trackSubmission?: boolean;
+	expectedSdkRunToken?: string;
+};
 
 type InternalPromptOptions = PromptOptions & { sdkRunToken?: string };
 type InternalCustomMessageOptions = Pick<
@@ -1420,8 +1421,13 @@ const BARE_DEFAULT_WATCHDOG_ERROR =
 const PROVIDER_FIRST_EVENT_TIMEOUT_ERROR = "Provider stream timed out while waiting for the first event";
 const WRAPPED_PROVIDER_FIRST_EVENT_TIMEOUT_ERROR = `Error: ${PROVIDER_FIRST_EVENT_TIMEOUT_ERROR}`;
 const PROVIDER_FIRST_EVENT_TIMEOUT_WITHOUT_ARTICLE_ERROR = "Provider stream timed out while waiting for first event";
-const BARE_DEFAULT_CODEX_OVERLOAD_ERROR = /^Codex error event(?:: .*)? \(code=server_is_overloaded(?:, [^)]+)*\)$/;
-/** Anthropic's typed capacity-overload `error.type`, the only overload code admitted below. */
+const BARE_DEFAULT_CODEX_RETRYABLE_ERROR =
+	/^Codex error event(?:: .*)? \(code=(?:server_is_overloaded|server_error|internal_error)(?:, [^)]+)*\)$/;
+const BARE_DEFAULT_CODEX_RETRYABLE_CODES = new Set(["server_is_overloaded", "server_error", "internal_error"]);
+const BARE_DEFAULT_CODEX_OVERLOAD_ERROR =
+	/^Codex error event(?:: .*)? \(code=server_is_overloaded(?:, [^)]+)*\)$/;
+const BARE_DEFAULT_OVERLOAD_CODES = new Set([SERVER_OVERLOADED_PROVIDER_CODE]);
+/** Anthropic's typed capacity-overload `error.type`, the only Anthropic overload code admitted below. */
 const ANTHROPIC_OVERLOADED_ERROR_TYPE = "overloaded_error";
 const KIMI_CODE_FIRST_EVENT_TIMEOUT_MESSAGES = {
 	"anthropic-messages": new Set([
@@ -1502,8 +1508,8 @@ function isBareDefaultMessageOnlyFirstEventTimeout(message: AssistantMessage): b
 	);
 }
 /**
- * True when the attempt's structured evidence is exactly the provider's typed
- * capacity-overload code and nothing else: no status, no retained retry header,
+ * True when the attempt's structured evidence is exactly an admitted provider
+ * code and nothing else: no status, no retained retry header,
  * no second typed code, no error kind, and none of the transport's other
  * observations (request size, first-event timing, endpoint class, provider retry
  * ceiling). The code arrives statuslessly (a Codex error event, an HTTP 200
@@ -1512,15 +1518,18 @@ function isBareDefaultMessageOnlyFirstEventTimeout(message: AssistantMessage): b
  * attempt is no longer provably that bare capacity rejection. The code is
  * compared case-sensitively, matching the parser and the transport gate.
  */
-function isExactTypedOverloadFacts(message: AssistantMessage): boolean {
+function isExactTypedOverloadFacts(
+	message: AssistantMessage,
+	acceptedProviderCodes: ReadonlySet<string> = BARE_DEFAULT_OVERLOAD_CODES,
+): boolean {
 	if (message.errorKind !== undefined || message.errorStatus !== undefined) return false;
 	const facts = message.transportFailure;
 	if (!facts) return false;
 	return (
-		facts.providerCode === SERVER_OVERLOADED_PROVIDER_CODE &&
+		acceptedProviderCodes.has(facts.providerCode ?? "") &&
 		facts.status === undefined &&
 		facts.anthropicErrorType === undefined &&
-		(facts.openaiErrorCode === undefined || facts.openaiErrorCode === SERVER_OVERLOADED_PROVIDER_CODE) &&
+		(facts.openaiErrorCode === undefined || facts.openaiErrorCode === facts.providerCode) &&
 		(facts.headers === undefined || Object.keys(facts.headers).length === 0) &&
 		facts.requestBytes === undefined &&
 		facts.firstEventElapsedMs === undefined &&
@@ -1546,11 +1555,41 @@ function isStatuslessTypedOverloadFacts(facts: TransportFailureFacts | undefined
 	);
 }
 
+// Deterministic auth/request/model diagnostics must surface even when a provider
+// labels the failure with a transient code.
+const TERMINAL_ERROR_MESSAGE =
+	/unauthorized|forbidden|authentication_error|permission_error|permission denied|invalid api key|invalid_request_error|invalid request|bad request|bad_request|validation_error|unprocessable|payload too large|payment required|insufficient_quota|insufficient credits|missing required (parameter|field)|invalid schema|invalid tool_choice|unsupported (parameter|value|model)|model_not_found|no such model|unknown model|does not (exist|support)|request was aborted|request aborted|the user aborted/i;
+
+function isTerminalCodexProviderFailure(message: AssistantMessage): boolean {
+	if (message.api !== "openai-codex-responses") return false;
+	if (isExplicitCodexTerminalVeto(message.transportFailure?.providerCode, message.errorMessage)) return true;
+	return (
+		(BARE_DEFAULT_CODEX_RETRYABLE_CODES.has(message.transportFailure?.providerCode ?? "") ||
+			BARE_DEFAULT_CODEX_RETRYABLE_ERROR.test(message.errorMessage ?? "")) &&
+		TERMINAL_ERROR_MESSAGE.test(message.errorMessage ?? "")
+	);
+}
+
 function isBareDefaultCodexOverload(message: AssistantMessage): boolean {
 	return (
 		message.api === "openai-codex-responses" &&
-		BARE_DEFAULT_CODEX_OVERLOAD_ERROR.test(message.errorMessage ?? "") &&
-		(isExactTypedOverloadFacts(message) || !hasBareDefaultRetryDisqualifyingFacts(message)) &&
+		!TERMINAL_ERROR_MESSAGE.test(message.errorMessage ?? "") &&
+		!isExplicitCodexTerminalVeto(undefined, message.errorMessage) &&
+		(isExactTypedOverloadFacts(message, BARE_DEFAULT_OVERLOAD_CODES) ||
+			(BARE_DEFAULT_CODEX_OVERLOAD_ERROR.test(message.errorMessage ?? "") &&
+				!hasBareDefaultRetryDisqualifyingFacts(message))) &&
+		!assistantMessageHasVisibleOrToolContent(message)
+	);
+}
+
+function isBareDefaultCodexProviderFailure(message: AssistantMessage): boolean {
+	return (
+		message.api === "openai-codex-responses" &&
+		!TERMINAL_ERROR_MESSAGE.test(message.errorMessage ?? "") &&
+		!isExplicitCodexTerminalVeto(message.transportFailure?.providerCode, message.errorMessage) &&
+		(isExactTypedOverloadFacts(message, BARE_DEFAULT_CODEX_RETRYABLE_CODES) ||
+			(BARE_DEFAULT_CODEX_RETRYABLE_ERROR.test(message.errorMessage ?? "") &&
+				!hasBareDefaultRetryDisqualifyingFacts(message))) &&
 		!assistantMessageHasVisibleOrToolContent(message)
 	);
 }
@@ -1610,7 +1649,10 @@ function isBareDefaultAnthropicOverload(message: AssistantMessage): boolean {
 function assistantMessageHasVisibleOrToolContent(message: AssistantMessage): boolean {
 	return message.content.some(content => {
 		if (content.type === "text") return content.text.length > 0;
-		return content.type === "thinking" || content.type === "redactedThinking" || content.type === "toolCall";
+		if (content.type === "thinking") {
+			return content.thinking.length > 0 || (content.thinkingSignature?.length ?? 0) > 0;
+		}
+		return content.type === "redactedThinking" || content.type === "toolCall";
 	});
 }
 
@@ -3755,6 +3797,7 @@ export class AgentSession {
 	#skipPostPromptRecoveryWaitByAttemptScope = new WeakSet<AttemptScope>();
 	#sdkRunTokensByAttemptScope = new WeakMap<AttemptScope, string>();
 	#sdkRunCohortsByAttemptScope = new WeakMap<AttemptScope, string[]>();
+	#lifecycleScopesByAttemptScope = new WeakMap<AttemptScope, AttemptScope>();
 	#activeSdkRunToken: string | undefined;
 	#activeAttemptScope: AttemptScope | undefined;
 	#attemptAuthority!: AttemptScopeAuthority;
@@ -4028,11 +4071,7 @@ export class AgentSession {
 	readonly rawSseDebugBuffer: RawSseDebugBuffer;
 
 	#acquirePowerAssertion(): void {
-		if (
-			process.platform !== "darwin" &&
-			process.platform !== "linux" &&
-			process.platform !== "win32"
-		) {
+		if (process.platform !== "darwin" && process.platform !== "linux" && process.platform !== "win32") {
 			return;
 		}
 		if (this.#powerAssertion || this.#powerAssertionLoad) return;
@@ -5078,6 +5117,7 @@ export class AgentSession {
 		if (lease) this.#deferredAgentEndLeases.delete(pending);
 		this.#startAgentEndPublication(pending, lease);
 	}
+
 	#startAgentEndPublication(pending: AgentSessionEvent, lease?: RunResourceProducerLease): void {
 		this.#agentEndPublicationInFlight++;
 		const pendingScope = (pending as AgentSessionEvent & { scope?: AttemptScopeRef }).scope as
@@ -5452,12 +5492,7 @@ export class AgentSession {
 					controller !== undefined &&
 					controller.chain.entries.length > 1;
 				if (shouldCapture && modelKey) this.#managedFallbackActiveCredentialRows.delete(modelKey);
-				if (
-					override &&
-					model &&
-					storageProvider === override.storageProvider &&
-					modelKey === override.modelKey
-				) {
+				if (override && model && storageProvider === override.storageProvider && modelKey === override.modelKey) {
 					this.#managedFallbackNextCredentialOverride = undefined;
 					const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId, {
 						credentialSelector: { kind: "id", value: String(override.rowId) },
@@ -5467,10 +5502,7 @@ export class AgentSession {
 						return apiKey;
 					}
 					// The preselected credential is no longer available; try to resolve another one of the same kind.
-					const fallbackApiKey = await this.#resolveManagedFallbackCredentialRow(
-						model,
-						override.credentialKind,
-					);
+					const fallbackApiKey = await this.#resolveManagedFallbackCredentialRow(model, override.credentialKind);
 					if (fallbackApiKey !== undefined) {
 						if (shouldCapture && model) this.#captureManagedFallbackActiveCredential(model);
 						return fallbackApiKey;
@@ -5478,8 +5510,7 @@ export class AgentSession {
 					throw new Error("Selected managed fallback credential is no longer available");
 				}
 				const apiKey = await invokeOriginalGetApiKey(provider);
-				if (shouldCapture && model && isAuthenticated(apiKey))
-					this.#captureManagedFallbackActiveCredential(model);
+				if (shouldCapture && model && isAuthenticated(apiKey)) this.#captureManagedFallbackActiveCredential(model);
 				return apiKey;
 			};
 			this.agent.getApiKey = managedGetApiKey;
@@ -5566,12 +5597,14 @@ export class AgentSession {
 				void this.#queueFollowUpAfterReservation(message, displayText, {
 					createDisplayEntry: false,
 					trackExternalFollowUp: false,
+					sdkRunToken: this.#activeSdkRunToken,
 				}).catch(error => {
 					this.#settleDeliveredOwnedRegistrations([message]);
 					logger.warn("Owned streaming follow-up was rejected", { error: String(error) });
 				});
 			},
 			injectIdle: async (messages, signal) => {
+				const sdkRunToken = this.#activeSdkRunToken;
 				// Mandated boundary comment (corrected turn semantics): same origin
 				// split as the streaming injector — an allowed owned-completion
 				// delivery starts a fresh turn attempt/lineage and is not a
@@ -5606,14 +5639,14 @@ export class AgentSession {
 								await this.agent.prompt(first, {
 									...this.#managedFallbackPromptOptions(),
 									onRunAccepted: (handle: AttemptRunHandle) => {
-										if (handle) this.#acceptSdkAttemptRun(handle);
+										if (handle) this.#acceptSdkAttemptRun(handle, sdkRunToken);
 									},
 								});
 							} else {
 								await this.agent.prompt(survivors, {
 									...this.#managedFallbackPromptOptions(),
 									onRunAccepted: (handle: AttemptRunHandle) => {
-										if (handle) this.#acceptSdkAttemptRun(handle);
+										if (handle) this.#acceptSdkAttemptRun(handle, sdkRunToken);
 									},
 								});
 							}
@@ -5785,9 +5818,8 @@ export class AgentSession {
 									(largestPhase, phase) =>
 										Math.max(
 											largestPhase,
-											phase.tasks.filter(
-												task => task.status === "pending" || task.status === "in_progress",
-											).length,
+											phase.tasks.filter(task => task.status === "pending" || task.status === "in_progress")
+												.length,
 										),
 									0,
 								);
@@ -6167,7 +6199,10 @@ export class AgentSession {
 				path.basename(sessionModeStatePath(this.sessionManager.getCwd(), currentSessionId, active.skill)),
 			);
 			const raw = fs.readFileSync(filePath, "utf-8");
-			const parsed = JSON.parse(raw) as { state?: { intent_contract?: unknown } };
+			const parsed = JSON.parse(raw) as { current_phase?: unknown; state?: { intent_contract?: unknown } };
+			// A persisted final spec moves to handoff. Its next-workflow/approval
+			// asks are not interview rounds and must not require recorder metadata.
+			if (parsed.current_phase !== "interviewing") return undefined;
 			const intentContract = parsed.state?.intent_contract;
 			if (intentContract === undefined) return "topology";
 			assertDeepInterviewIntentManifest(intentContract);
@@ -6873,6 +6908,8 @@ export class AgentSession {
 		object,
 		{ scope?: AttemptScope; sdkRunToken?: string; persistGeneration: number; persistBarrier?: Promise<void> }
 	>();
+	/** Extension handlers cannot mutate or replace the Agent-claimed run owner. */
+	#terminalOwnerByExtensionEvent = new WeakMap<object, AgentTerminalOwnerContext>();
 
 	/**
 	 * Capture what is true at the SYNCHRONOUS agent-event boundary, before any async work.
@@ -8639,6 +8676,14 @@ export class AgentSession {
 													sdkRunToken,
 													consumedSdkRunTokens.length > 0 ? consumedSdkRunTokens : undefined,
 												);
+												const predecessorScope =
+													predecessorAgentEnd && this.#agentEventAdmission.get(predecessorAgentEnd)?.scope;
+												if (predecessorScope) {
+													this.#lifecycleScopesByAttemptScope.set(
+														handle.scope,
+														this.#lifecycleScopesByAttemptScope.get(predecessorScope) ?? predecessorScope,
+													);
+												}
 												options?.onRunAccepted?.(handle);
 												// Keep the queued token available through the acceptance callback;
 												// SDK follow-up owners bind it to the new attempt scope there.
@@ -9861,7 +9906,12 @@ export class AgentSession {
 						type: "agent_start",
 						...(sdkRunToken ? { sdkRunToken } : {}),
 						...(deliveryScope
-							? { sdkRunTokens: this.#sdkRunCohortsByAttemptScope.get(deliveryScope as AttemptScope) }
+							? {
+									sdkRunTokens: this.#sdkRunCohortsByAttemptScope.get(deliveryScope as AttemptScope),
+									lifecycleScope:
+										this.#lifecycleScopesByAttemptScope.get(deliveryScope as AttemptScope) ??
+										(deliveryScope as AttemptScope),
+								}
 							: {}),
 					},
 					undefined,
@@ -9879,17 +9929,19 @@ export class AgentSession {
 					deliveryScope,
 				);
 			} else if (event.type === "agent_end") {
-				await this.#extensionRunner.emit(
-					{
-						type: "agent_end",
-						messages: event.messages,
-						stopReason: event.stopReason,
-						maintenanceOutcome: event.maintenanceOutcome,
-						...(sdkRunToken ? { sdkRunToken } : {}),
-					},
-					undefined,
-					deliveryScope,
-				);
+				const extensionEvent = {
+					type: "agent_end" as const,
+					messages: event.messages,
+					stopReason: event.stopReason,
+					maintenanceOutcome: event.maintenanceOutcome,
+					...(sdkRunToken ? { sdkRunToken } : {}),
+				};
+				// Keep the Agent-claimed owner OUTSIDE the public extension event and
+				// its replaceable side channel. Only the owning session may attest
+				// this exact projected event to the SDK bus.
+				const terminalOwner = getAgentTerminalOwnerContext(event);
+				if (terminalOwner) this.#terminalOwnerByExtensionEvent.set(extensionEvent, terminalOwner);
+				await this.#extensionRunner.emit(extensionEvent, undefined, deliveryScope);
 			} else if (event.type === "turn_start") {
 				const hookEvent: TurnStartEvent = {
 					type: "turn_start",
@@ -12301,9 +12353,18 @@ export class AgentSession {
 		return this.agent.activeResourceRunId;
 	}
 
-	/** All messages including custom types like BashExecutionMessage */
+	/**
+	 * All messages including custom types like BashExecutionMessage. Request-scoped
+	 * ephemeral copies are retained only in `agent.state.messages` to keep the provider
+	 * cache prefix stable; they are never part of this public view.
+	 */
 	get messages(): AgentMessage[] {
-		return this.agent.state.messages;
+		const messages = this.agent.state.messages;
+		return messages.some(
+			message => message.role === "custom" && this.#isEphemeralCustomMessageType(message.customType),
+		)
+			? this.#withoutEphemeralCustomMessages(messages)
+			: messages;
 	}
 	get transcriptPromptGeneration(): number {
 		return this.#promptGeneration;
@@ -14635,6 +14696,7 @@ export class AgentSession {
 			onQueuedAfterAdmission?: (message: AgentMessage, cancelQueued: () => boolean) => void;
 			external?: boolean;
 			sdkRunToken?: string;
+			expectedSdkRunToken?: string;
 			forceOneAtATime?: boolean;
 			allowDuringSessionTransition?: boolean;
 			allowCancelAndSubmit?: boolean;
@@ -14651,11 +14713,15 @@ export class AgentSession {
 		const message = { role: "user" as const, content, attribution: "user" as const, timestamp: Date.now() };
 		// Enqueue-time admission: the Agent only accepts a steer into a live,
 		// non-aborted run. Anything else (idle, unwinding after agent_end, another
-		// prompt still in preflight, aborting) has no run to steer, so it is routed
-		// as a sequential follow-up owned by the next turn instead of being parked
-		// in a queue nobody owns.
+		// prompt still in preflight, aborting) has no run to steer. Ordinary steers
+		// become a sequential follow-up owned by the next turn; SDK turn-bound
+		// steers fail closed rather than being delivered to a successor run.
+		if (options?.expectedSdkRunToken !== undefined && this.#activeSdkRunToken !== options.expectedSdkRunToken)
+			throw Object.assign(new Error("The expected SDK run is not active."), { code: "turn_not_active" });
 		const admission = this.agent.steer(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
 		if (!admission.admitted) {
+			if (options?.expectedSdkRunToken !== undefined)
+				throw Object.assign(new Error("The expected SDK run is not active."), { code: "turn_not_active" });
 			const queuedFollowUp = await this.#queueFollowUpAfterReservation(message, displayText, {
 				forceOneAtATime: options?.forceOneAtATime,
 				claimsGenuineUserIntent: options?.claimsGenuineUserIntent,
@@ -14707,8 +14773,8 @@ export class AgentSession {
 	/**
 	 * One-shot preflight-abort binding: an invocation cancelled after its queue
 	 * admission must cancel the submission it admitted, so an aborted dispatch
-	 * can never execute later. Both explicit delivery paths (follow-up and
-	 * steer) share this helper so their cancellation semantics cannot diverge
+	 * can never execute later. Explicit and implicitly diverted queue admissions
+	 * share this helper so their cancellation semantics cannot diverge
 	 * (exact-head review P1).
 	 */
 	#bindPreflightAbortCancellation(
@@ -15419,6 +15485,7 @@ export class AgentSession {
 				forceOneAtATime: options?.followUpQueuePolicy === "sequential",
 				createDisplayEntry: false,
 				trackExternalFollowUp: false,
+				sdkRunToken: this.#activeSdkRunToken,
 			});
 			this.#bindCustomDisplayEntry(appMessage, "followUp");
 			// The session can report streaming while no agent loop owns the queue
@@ -15808,6 +15875,7 @@ export class AgentSession {
 					onPromoted: onQueuedPromoted,
 					external: true,
 					sdkRunToken: internalOptions?.sdkRunToken,
+					expectedSdkRunToken: internalOptions?.expectedSdkRunToken,
 					forceOneAtATime: options?.queuePolicy === "sequential",
 					onQueuedAfterAdmission: onTrackedQueued,
 					allowDuringSessionTransition: this.#hasCommittedSuccessorTrackedAdmission(options),
@@ -15839,12 +15907,13 @@ export class AgentSession {
 			if (this.#isLiveTurnBusy() && !waitedForAbortUnwind) {
 				if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 				assertPreflightStillOpen();
-				await this.#queueSteer(text, images, {
+				const queuedSteer = await this.#queueSteer(text, images, {
 					claimsGenuineUserIntent: true,
-					onPromoted: options?.onQueuedPromoted,
+					onPromoted: onQueuedPromoted,
 					external: true,
 					sdkRunToken: internalOptions?.sdkRunToken,
 				});
+				this.#bindPreflightAbortCancellation(options?.preflightSignal, queuedSteer);
 				// Dispatch-race disposition (#4668 review P1): the SDK snapshot-decided
 				// this submission starts its own turn (idle at dispatch), but the
 				// session began streaming before sendUserMessage ran, so the message
@@ -15854,8 +15923,15 @@ export class AgentSession {
 				// would terminalize the accepted request as an own-run completion
 				// before it is consumed. Report the internal in-run disposition so the
 				// runtime attaches the correlation to the in-flight run instead.
-				options?.onDispatchDisposition?.({ startsOwnRun: false });
-				options?.onPreflightAccepted?.();
+				try {
+					assertPreflightStillOpen();
+					options?.onDispatchDisposition?.({ startsOwnRun: false });
+					options?.onPreflightAccepted?.();
+					assertPreflightStillOpen();
+				} catch (error) {
+					queuedSteer.cancel();
+					throw error;
+				}
 				return;
 			}
 
@@ -16785,6 +16861,12 @@ export class AgentSession {
 		const lineageIdHash = this.#turnLineageIdHash;
 		if (!lineageIdHash) return undefined;
 		return this.#promptGeneration;
+	}
+	getTerminalRunOwnerForEvent(event: object): AgentTerminalOwnerContext | undefined {
+		return this.#terminalOwnerByExtensionEvent.get(event);
+	}
+	getRunOwnerDomain(handle: string): RunCancellationDomain | undefined {
+		return this.agent.resourceLedger.lookupDomain(handle);
 	}
 	/**
 	 * Logical endpoint used to key owned-registration lineage bindings.
@@ -21048,10 +21130,7 @@ export class AgentSession {
 		const isContextPromoted = this.#temporaryProviderSessionScopes.some(
 			scope => scope.token.reason === "context-promotion",
 		);
-		if (
-			!isContextPromoted ||
-			!isDefaultAutoThresholdCeilingApplied(contextWindow, settings)
-		) {
+		if (!isContextPromoted || !isDefaultAutoThresholdCeilingApplied(contextWindow, settings)) {
 			return settings;
 		}
 
@@ -22731,6 +22810,7 @@ export class AgentSession {
 				willRetry && !continuationSkipReason
 					? await this.#scheduleOverflowRetryContinuation(generation, options?.resourceRunId)
 					: false;
+
 			await this.#emitSessionEvent({
 				type: "auto_compaction_end",
 				action,
@@ -22739,6 +22819,7 @@ export class AgentSession {
 				willRetry: overflowContinuationScheduled,
 				continuationSkipReason,
 			});
+
 			if (autoCompactionSignal.aborted) return { kind: "aborted", source: "signal" };
 
 			if (willRetry) {
@@ -22954,7 +23035,8 @@ export class AgentSession {
 				isAuthenticated(apiKey) &&
 				authStorage.getSessionCredentialRowId(model.provider, this.credentialSessionId) === credential.id &&
 				authStorage.getSessionCredentialType(model.provider, this.credentialSessionId) === credentialKind &&
-				currentCredential && !currentCredential.disabled
+				currentCredential &&
+				!currentCredential.disabled
 			)
 				return apiKey;
 		}
@@ -22962,6 +23044,7 @@ export class AgentSession {
 	}
 
 	#isRetryableError(message: AssistantMessage): boolean {
+		if (isTerminalCodexProviderFailure(message)) return false;
 		if (this.#isTerminalProviderFirstEventTimeout(message)) return false;
 		if (message.errorMessage?.startsWith("Model fallback chain exhausted;")) return false;
 		if (message.errorMessage?.startsWith("Managed fallback retried the escaped non-ASCII")) return false;
@@ -22972,6 +23055,11 @@ export class AgentSession {
 			return false;
 		const contextWindow = this.model?.contextWindow ?? 0;
 		if (classifyContextOverflow(message, transportFailure, contextWindow)) return false;
+		if (
+			(isBareDefaultCodexOverload(message) || isBareDefaultCodexProviderFailure(message)) &&
+			this.settings.get("retry.enabled") !== false
+		)
+			return true;
 		const managedFallback = this.#defaultFallbackChain().chain.entries.length > 1;
 		// An account-specific model rejection that cannot rotate to another
 		// credential stays terminal only on the session's own retry path; managed
@@ -23084,9 +23172,7 @@ export class AgentSession {
 		// Errors that will never succeed on retry (auth/permission, malformed
 		// request, unknown/unsupported model). These surface immediately rather
 		// than retry forever.
-		return /unauthorized|forbidden|authentication_error|permission_error|permission denied|invalid api key|invalid_request_error|invalid request|bad request|bad_request|validation_error|unprocessable|payload too large|payment required|insufficient_quota|insufficient credits|missing required (parameter|field)|invalid schema|invalid tool_choice|unsupported (parameter|value|model)|model_not_found|no such model|unknown model|does not (exist|support)|request was aborted|request aborted|the user aborted/i.test(
-			errorMessage,
-		);
+		return TERMINAL_ERROR_MESSAGE.test(errorMessage);
 	}
 
 	#extractExplicitHttpStatusFromErrorMessage(errorMessage: string): number | undefined {
@@ -23867,9 +23953,7 @@ export class AgentSession {
 							!authStorage.isCredentialAvailable(resolvedModel.provider, credential.id)
 						)
 							continue;
-						let credentialKeyResult:
-							| { kind: "resolved"; value: string | undefined }
-							| { kind: "aborted" };
+						let credentialKeyResult: { kind: "resolved"; value: string | undefined } | { kind: "aborted" };
 						try {
 							credentialKeyResult = await awaitWithCancellation(
 								this.#modelRegistry.getApiKey(resolvedModel, this.credentialSessionId, {
@@ -23967,7 +24051,11 @@ export class AgentSession {
 				!transitionStillOwned()
 			)
 				return await rollbackCancelled();
-			if (selectedCredentialRowId !== undefined && selectedCredentialKind !== undefined && this.#restoreManagedFallbackGetApiKey) {
+			if (
+				selectedCredentialRowId !== undefined &&
+				selectedCredentialKind !== undefined &&
+				this.#restoreManagedFallbackGetApiKey
+			) {
 				this.#managedFallbackNextCredentialOverride = {
 					modelKey: canonicalModelKey,
 					storageProvider: resolveOAuthStorageProvider(resolvedModel.provider),
@@ -24261,6 +24349,11 @@ export class AgentSession {
 		scope?: AttemptScope,
 		scopeWasClean = this.#isRetryScopeClean(scope),
 	): Promise<boolean | ManagedAttemptDecision> {
+		// Capture the SDK owner before the failed attempt retires its active scope.
+		// Retry/continuation terminals must remain attributed to the prompt that
+		// admitted the provider call, even when the retry starts after agent_end.
+		const retrySdkRunToken =
+			(scope ? this.#sdkRunTokensByAttemptScope.get(scope) : undefined) ?? this.#activeSdkRunToken;
 		const retryAbortEpoch = this.#abortAdmissionEpoch;
 		const retryCancelled = () =>
 			this.#isDisposed || this.#sessionAdmissionClosing || this.#abortAdmissionEpoch !== retryAbortEpoch;
@@ -24275,6 +24368,13 @@ export class AgentSession {
 		const classification = this.#classifyErrorForRetry(message);
 		const localSnapshot = classification === "local_snapshot";
 		const localBufferOverflow = classification === "local_buffer_overflow";
+		// Managed outcomes can reach retry handling without the ordinary admission
+		// check. Do not let retained transport facts bypass the same terminal veto.
+		if (isTerminalCodexProviderFailure(message)) {
+			return managedOutcome
+				? { type: "terminal", terminal: { stopReason: "error", messages: [message] } }
+				: false;
+		}
 		if (retryCancelled()) {
 			return managedOutcome ? { type: "terminal", terminal: { stopReason: "cancelled" } } : false;
 		}
@@ -24336,6 +24436,9 @@ export class AgentSession {
 			isBareDefaultCodexOverload(message) ||
 			isBareDefaultAnthropicOverload(message) ||
 			isBareDefaultOpenAIResponsesOverload(message);
+		const canReplayBareDefaultCodexFailure = isBareDefaultCodexProviderFailure(message);
+		const boundBareDefaultCodexFailure = canReplayBareDefaultCodexFailure && !legacyRetryConfigured;
+		const canReplayCodexProviderOverload = isBareDefaultCodexOverload(message);
 		const reportedRetryMaxAttempts = transportFailure?.retryMaxAttempts;
 		if (reportedRetryMaxAttempts !== undefined) {
 			this.#providerRetryMaxAttempts = Math.min(
@@ -24375,9 +24478,12 @@ export class AgentSession {
 					}
 				: false;
 		}
+		const fallbackTrigger = this.#fallbackTriggerFor(message, !managedFallback, transportFailure);
 		const trigger:
 			| { class: FallbackTriggerClass; retryAfterMs?: number; authDisposition?: AuthDisposition }
-			| undefined = this.#fallbackTriggerFor(message, !managedFallback, transportFailure);
+			| undefined = canReplayCodexProviderOverload || canReplayBareDefaultCodexFailure
+				? { class: "server" }
+				: fallbackTrigger;
 		// OpenAI's typed statusless capacity-overload code (issue #5018) must not
 		// gain managed-chain retry/advance authority from its new facts. Before
 		// the code survived transport, this failure reached the session as an
@@ -24387,10 +24493,7 @@ export class AgentSession {
 		// proper session termination handling.
 		if (managedFallback && isStatuslessTypedOverloadFacts(transportFailure)) {
 			return managedOutcome
-				? this.#managedFallbackExhaustionDecision(
-						message,
-						message.errorMessage || "Model fallback attempt failed",
-					)
+				? this.#managedFallbackExhaustionDecision(message, message.errorMessage || "Model fallback attempt failed")
 				: false;
 		}
 		if (!trigger) {
@@ -24481,6 +24584,7 @@ export class AgentSession {
 		if (!managedFallback && !legacyRetryConfigured && !canReplayRotatedCredential && !canReplayEmptyResponse) {
 			if (
 				(!canReplayProviderOverload &&
+					!canReplayBareDefaultCodexFailure &&
 					!canReplayUnexpectedSocketClose &&
 					!this.#isTypedFirstEventTimeout(message) &&
 					!messageOnlyWatchdogTimeout &&
@@ -24499,6 +24603,7 @@ export class AgentSession {
 			!managedFallback &&
 			classification === "transient" &&
 			!canReplayProviderOverload &&
+			!boundBareDefaultCodexFailure &&
 			!canReplayUnexpectedSocketClose &&
 			!this.#isIdleStreamStallErrorMessage(message.errorMessage ?? "");
 
@@ -24603,10 +24708,7 @@ export class AgentSession {
 		if (outcome === "exhausted") {
 			if (managedFallback) {
 				let errorMessage = this.#fallbackExhaustionError(controller);
-				if (
-					!providerRetryCeilingReached &&
-					(trigger.class === "quota" || trigger.class === "rate_limit")
-				) {
+				if (!providerRetryCeilingReached && (trigger.class === "quota" || trigger.class === "rate_limit")) {
 					if (!assistantMessageHasVisibleOrToolContent(message)) {
 						const mark =
 							quotaCredentialMark ??
@@ -24865,7 +24967,7 @@ export class AgentSession {
 					await this.agent.continue({
 						...this.#managedFallbackPromptOptions(),
 						onRunAccepted: (handle: AttemptRunHandle) => {
-							this.#acceptSdkAttemptRun(handle, this.#activeSdkRunToken);
+							this.#acceptSdkAttemptRun(handle, retrySdkRunToken);
 						},
 					});
 					return;
@@ -24893,6 +24995,7 @@ export class AgentSession {
 				allowDuringCancelAndSubmit: true,
 				suppressPredecessorAgentEnd: resourceRunId !== undefined,
 				resourceRunId,
+				sdkRunToken: retrySdkRunToken,
 				onError: () => this.#failRetryRecovery("Retry continuation failed to start"),
 				onSkip: () => this.#failRetryRecovery("Retry continuation was superseded"),
 			});
@@ -27308,7 +27411,7 @@ export class AgentSession {
 		const branchEntries = this.sessionManager.getBranch();
 		const latestCompaction = getLatestCompactionEntry(branchEntries);
 		const boundaryTs = latestCompaction ? new Date(latestCompaction.timestamp).getTime() : 0;
-		const anchor = this.#findAnchorableUsageIndex(this.messages, boundaryTs);
+		const anchor = this.#findAnchorableUsageIndex(this.agent.state.messages, boundaryTs);
 		let value: ContextUsage;
 		if (latestCompaction && !anchor) {
 			value = { tokens: null, contextWindow, percent: null, source: "unknown" };
@@ -27331,7 +27434,7 @@ export class AgentSession {
 	}
 
 	#contextUsageCacheKey(model: Model, contextWindow: number): string {
-		const messages = this.messages;
+		const messages = this.agent.state.messages;
 		const lastMessage = messages[messages.length - 1];
 		// Entry and leaf revisions change whenever the active branch changes, avoiding getBranch() on warm reads.
 		const revision = this.sessionManager.revisionSnapshot();
@@ -27480,7 +27583,7 @@ export class AgentSession {
 	 * raw promptTokens/estimatedTokens quotient). Clamped to [0.5, 2] downstream.
 	 */
 	#computeCompactionTokenCorrectionRatio(): number | undefined {
-		const messages = this.messages;
+		const messages = this.agent.state.messages;
 		let lastUsageIndex = -1;
 		let lastUsage: Usage | undefined;
 		for (let i = messages.length - 1; i >= 0; i--) {
@@ -27530,7 +27633,7 @@ export class AgentSession {
 		tokens: number;
 		anchored: boolean;
 	} {
-		const messages = this.messages;
+		const messages = this.agent.state.messages;
 		let anchor = knownAnchor;
 		if (boundaryTs === undefined) {
 			const latestCompaction = getLatestCompactionEntry(this.sessionManager.getBranch());

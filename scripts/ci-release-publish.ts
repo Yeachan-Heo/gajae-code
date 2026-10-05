@@ -430,6 +430,24 @@ async function stageNativePlatformArtifacts(pkg: PublishPackage): Promise<void> 
 	for (const entry of matching) {
 		await fs.copyFile(path.join(sourceDir, entry), path.join(targetDir, entry));
 	}
+
+	// The diagnostic loader only activates bytes that match the trusted record shipped
+	// by @gajae-code/natives, so staged platform bytes must be equal to it.
+	const provenanceGate = Bun.spawnSync({
+		cmd: [
+			process.execPath,
+			path.join(repoRoot, "scripts", "verify-diagnostic-artifact-provenance.ts"),
+			"--stage-check",
+			targetDir,
+			"--trusted-native-dir",
+			sourceDir,
+		],
+		stdout: "inherit",
+		stderr: "inherit",
+	});
+	if (provenanceGate.exitCode !== 0) {
+		throw new Error(`Staged native artifacts for ${pkg.dir} do not match the trusted diagnostic record`);
+	}
 }
 
 async function emitTypeDeclarations(pkg: PublishPackage, temporaryRoot?: string): Promise<void> {

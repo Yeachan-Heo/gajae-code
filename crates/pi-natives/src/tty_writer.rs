@@ -31,12 +31,39 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use napi::{Error, JsString, Result};
+use napi::{Error, JsString, JsValue, Result};
 use napi_derive::napi;
 use parking_lot::{Condvar, Mutex};
 
-use crate::js;
+fn append_js_utf8(data: JsString<'_>, len: usize, output: &mut Vec<u8>) -> Result<usize> {
+	let raw = data.value();
+	let capacity = len
+		.checked_add(1)
+		.ok_or_else(|| Error::from_reason("terminal string is too large"))?;
+	output.reserve(capacity);
+	let start = output.len();
+	let mut written = 0;
+	// SAFETY: `reserve` guarantees `capacity` writable bytes of spare capacity
+	// past `start`; `data` is a live JS string in this callback and `capacity`
+	// is its exact UTF-8 length plus the required NUL slot.
+	let status = unsafe {
+		napi::sys::napi_get_value_string_utf8(
+			raw.env,
+			raw.value,
+			output.spare_capacity_mut().as_mut_ptr().cast(),
+			capacity,
+			&mut written,
+		)
+	};
+	napi::check_status!(status, "Failed to read JavaScript string")?;
+	// SAFETY: N-API initialized `written` bytes (`<= capacity - 1`) of the spare
+	// capacity starting at `start`, so extending the length covers only
+	// initialized bytes.
+	unsafe { output.set_len(start + written.min(len)) };
+	Ok(written.min(len))
+}
 
+#[cfg(test)]
 fn append_valid_utf16_segment(units: &[u16], output: &mut Vec<u8>) {
 	if units.is_empty() {
 		return;
@@ -53,6 +80,7 @@ fn append_valid_utf16_segment(units: &[u16], output: &mut Vec<u8>) {
 
 /// Append UTF-16 as JavaScript's UTF-8 encoding does: valid surrogate pairs
 /// become their scalar, while each unpaired surrogate becomes U+FFFD.
+#[cfg(test)]
 fn append_utf16(units: &[u16], output: &mut Vec<u8>) -> usize {
 	let start = output.len();
 	let mut segment_start = 0usize;
@@ -234,34 +262,42 @@ impl TtyWriter {
 	/// Enqueue terminal output; never blocks. Returns the total bytes now
 	/// pending (including this chunk).
 	///
-	/// Reads the JS string as UTF-16 and transcodes it with `xutf` straight into
-	/// the shared back buffer.
+	/// Reads the JS string as UTF-8 directly into the shared back buffer.
 	#[napi]
 	pub fn write(&self, data: JsString) -> Result<u32> {
 		if self.inner.dead.load(Ordering::Acquire) {
 			return Ok(self.pending());
 		}
-		let units = js::utf16(data)?;
-		if units.is_empty() {
+		let len = data.utf8_len()?;
+		if len == 0 {
 			return Ok(self.pending());
 		}
-		Ok(self.append(|back| append_utf16(&units, back)))
+		self.append(|back| append_js_utf8(data, len, back))
 	}
 
 	/// Append into the back buffer under its lock, account the added bytes,
 	/// and wake the pump. `fill` returns the byte count it appended.
-	fn append(&self, fill: impl FnOnce(&mut Vec<u8>) -> usize) -> u32 {
+	fn append(&self, fill: impl FnOnce(&mut Vec<u8>) -> Result<usize>) -> Result<u32> {
 		{
 			let mut back = self.inner.back.lock();
-			let added = fill(&mut back);
+			let start = back.len();
+			let added = match fill(&mut back) {
+				Ok(added) => added,
+				Err(error) => {
+					back.truncate(start);
+					return Err(error);
+				},
+			};
 			// Publish the pending-byte accounting while `back` is still locked.
 			// Once this lock is released, the pump may claim and drain the buffer;
 			// accounting afterward lets its `fetch_sub` win the race and underflow
 			// the counter, permanently pinning JS-side render backpressure on.
 			self.inner.pending.fetch_add(added, Ordering::AcqRel);
 		}
-		self.inner.cv.notify_all();
-		self.pending()
+		// `write` and `flush_sync` run serially on this writer's JS thread, so
+		// the pump is the only possible waiter while a frame is enqueued.
+		self.inner.cv.notify_one();
+		Ok(self.pending())
 	}
 
 	/// Bytes accepted but not yet written to the terminal.
@@ -372,10 +408,12 @@ mod tests {
 	}
 
 	fn push(writer: &TtyWriter, data: &[u8]) {
-		writer.append(|back| {
-			back.extend_from_slice(data);
-			data.len()
-		});
+		writer
+			.append(|back| {
+				back.extend_from_slice(data);
+				Ok(data.len())
+			})
+			.unwrap();
 	}
 
 	fn pipe_pair() -> (i32, i32) {

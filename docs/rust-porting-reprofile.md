@@ -14,7 +14,7 @@ This is the post-vendoring CPU profile that the Rust porting plan's Phase 4 requ
 | compaction | anonymous closure in `registrySelectorResolvesToModel` — `packages/coding-agent/src/config/model-registry.ts:789` | 41.6% | Fixed in TypeScript (#6125); not a port candidate |
 | replay | same closure | 24.4% | same |
 
-After #6125, a CI re-profile of that change (https://github.com/Yeachan-Heo/gajae-code/actions/runs/36548743458) shows 0% in both scenarios. It also shows two remaining compaction functions over the threshold:
+After #6125, the passing profile-stability run (https://github.com/Yeachan-Heo/gajae-code/actions/runs/36697257230, dev `929e0fb367`, all seven scenarios >=8/10 overlap) shows 0% in both scenarios; the earlier run 36548743458 failed its stability comparison and is provisional only. It also shows two remaining compaction functions over the threshold:
 
 | Scenario | Function | Share | Decision |
 |---|---|---:|---|
@@ -28,7 +28,7 @@ startup, session-save, tools and keystroke have no TypeScript function at ≥5%.
 | Window | Top self time |
 |---|---|
 | per keystroke | `match` (regex, runtime) 91–100%, `nativeKeys` 8.6% |
-| per token delta | no attributed samples in the window |
+| per token delta | `structuredClone` 6.5–7.0% (replay scenario self time), `managedChargeStringBytes` 3.1–3.7% (replay scenario self time), `stringify` 5.3–6.1% (replay scenario self time); per-token-window attribution: `structuredClone` 20.0–17.4%, `managedChargeStringBytes` 14.0–15.3% of sampled |
 | session-load | `openSync`, `entries`, `writeFileSync`, `materializeResidentValueSync` 10.8%, `measureJsonLikeBytes` 6.8% |
 
-None of the Phase 1a hand-port candidates (E-H*, E-M*, E-TUI-*) reaches 5% self time in any scenario or leads a critical path (except E-M01, where the per-token-delta window produced no attributed samples; see E-M01 note below). Each is recorded as `rejected` or `unconfirmed` in `docs/rust-porting-inventory.md`. The five functions that crossed 5% or showed significant critical-path presence are the rows E-P4-REGISTRY-SELECTOR, E-P4-CANONICAL-JSON, E-P4-NAMESPACE-SUFFIXES, E-P4-MATERIALIZE-RESIDENT, and E-P4-MEASURE-JSON-LIKE. None was hand-ported: in each case the cost is TypeScript work over JS objects or strings, where a napi boundary adds per-call overhead or the function is a utility that enables higher-level TypeScript optimizations.
+None of the Phase 1a hand-port candidates (E-H*, E-M*, E-TUI-*) reaches 5% self time in any scenario or leads a critical path (except E-M01, where replay scenario self time is measured below the threshold: `managedChargeStringBytes` 3.1–3.7%; the per-token-window attribution is higher at 14.0–15.3%, but does not lead the path; see E-M01 note below). Each is recorded as `rejected` or `unconfirmed` in `docs/rust-porting-inventory.md`. The five functions that crossed 5% or showed significant critical-path presence are the rows E-P4-REGISTRY-SELECTOR, E-P4-CANONICAL-JSON, E-P4-NAMESPACE-SUFFIXES, E-P4-MATERIALIZE-RESIDENT, and E-P4-MEASURE-JSON-LIKE. None was hand-ported: in each case the cost is TypeScript work over JS objects or strings, where a napi boundary adds per-call overhead or the function is a utility that enables higher-level TypeScript optimizations.

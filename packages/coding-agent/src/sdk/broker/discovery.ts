@@ -386,6 +386,14 @@ export interface BrokerDiscovery {
 	ownerId: string;
 	pid: number;
 	incarnation: string;
+	/**
+	 * Public publication-incarnation id for diagnostic observation, fixed at startup.
+	 * Absent on publications written before the capability existed; an observer then
+	 * reports `unsupported` instead of synthesizing compatibility.
+	 */
+	diagnosticGeneration?: string;
+	/** Diagnostic protocol the publisher answers; absent means no capability. */
+	diagnosticProtocol?: number;
 	host: "127.0.0.1";
 	port: number;
 	url: string;

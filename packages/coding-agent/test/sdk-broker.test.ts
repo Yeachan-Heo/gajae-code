@@ -49,6 +49,7 @@ import {
 	waitForChildSpawn,
 } from "../src/sdk/broker/lifecycle";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
+import { observeProcessIncarnation } from "../src/sdk/broker/process-incarnation";
 import { resolveSdkInternalSpawnCommand, resolveSdkInternalSpawnCommandForTest } from "../src/sdk/broker/runtime";
 import { readBrokerStartupFailureMarker, writeBrokerStartupFailureMarker } from "../src/sdk/broker/startup-failure";
 import { BROKER_RUNTIME_ABORT_CAPABILITY_FIELD } from "../src/sdk/host/control/runtime-gate";
@@ -1987,9 +1988,13 @@ describe("SDK broker identity and discovery", () => {
 				"Timed out waiting for detached SDK broker discovery.",
 			);
 			const brokerPid = await gotPid;
-			// The spawned detached broker must have been terminated + reaped, not orphaned.
+			// The spawned detached broker must have been terminated, not orphaned. The
+			// trampoline reparents it away from this process, so once killed it may stay
+			// an unreaped zombie of whichever subreaper adopted it; `kill(pid, 0)` still
+			// reports such a zombie as present. Process-identity observation classifies
+			// it as absent, which is the same authority the production reap path uses.
 			expect(typeof brokerPid).toBe("number");
-			expect(brokerDiscovery.isPidAlive(brokerPid!)).toBe(false);
+			expect(observeProcessIncarnation(brokerPid!).status).toBe("absent");
 			// No owner handle leaked for the failed agent dir.
 			expect(brokerOwnerForTest(dir)).toBeUndefined();
 		} finally {

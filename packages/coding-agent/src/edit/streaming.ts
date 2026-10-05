@@ -7,7 +7,7 @@
  * - compute unified diff previews for the in-flight args
  *   (`computeDiffPreview`), and
  * - render a text placeholder while no diff exists yet
- *   (`renderStreamingFallback`).
+ *   (`renderStreamingPlaceholder`).
  *
  * The shared renderer / `ToolExecutionComponent` consult the strategy via
  * the injected `editMode` rather than probing argument shape.
@@ -72,7 +72,7 @@ export interface EditStreamingStrategy<Args = unknown> {
 	 * Rendered inline while the diff hasn't been computed yet (or when the
 	 * compute returned `null` because args are still too partial).
 	 */
-	renderStreamingFallback(args: Args, uiTheme: Theme): string;
+	renderStreamingPlaceholder(args: Args, uiTheme: Theme): string;
 }
 export interface EditRequestTargetInventory {
 	paths: string[];
@@ -169,7 +169,7 @@ export function getEditRequestTargetInventory(
 	if (editMode === "hashline") {
 		const input = typeof values.input === "string" ? values.input : "";
 		const headerPaths = getHashlineTargetPaths(input);
-		// `path` is only a fallback for headerless input; explicit §PATH headers are the full target set.
+		// `path` is only the target for headerless input; explicit §PATH headers are the full target set.
 		if (headerPaths.length > 0) return { paths: orderedDistinctPaths(headerPaths) };
 		return { paths: orderedDistinctPaths([topLevelPath]) };
 	}
@@ -197,8 +197,8 @@ export function getEditRequestTargetInventory(
 	return { paths: orderedDistinctPaths([topLevelPath, ...editPaths, partialPath]) };
 }
 
-const STREAMING_FALLBACK_LINES = 12;
-const STREAMING_FALLBACK_WIDTH = 80;
+const STREAMING_PLACEHOLDER_LINES = 12;
+const STREAMING_PLACEHOLDER_WIDTH = 80;
 
 function isHashlineHeaderLine(line: string): boolean {
 	return line.trimEnd().startsWith(HL_FILE_PREFIX);
@@ -236,15 +236,15 @@ function trimHashlineStreamingSyntax(lines: string[]): string[] {
 	return lines.slice(index).filter(line => !isHashlineEnvelopeMarkerLine(line));
 }
 
-function renderHashlineInputFallback(input: string, uiTheme: Theme): string {
+function renderHashlineInputPlaceholder(input: string, uiTheme: Theme): string {
 	const lines = trimHashlineStreamingSyntax(sanitizeText(input).split("\n"));
 	if (!lines.some(line => line.trim().length > 0)) return "";
 
-	const displayLines = lines.slice(-STREAMING_FALLBACK_LINES);
+	const displayLines = lines.slice(-STREAMING_PLACEHOLDER_LINES);
 	const hidden = lines.length - displayLines.length;
 	let text = "\n\n";
 	text += displayLines
-		.map(line => uiTheme.fg("toolOutput", truncateToWidth(replaceTabs(line), STREAMING_FALLBACK_WIDTH)))
+		.map(line => uiTheme.fg("toolOutput", truncateToWidth(replaceTabs(line), STREAMING_PLACEHOLDER_WIDTH)))
 		.join("\n");
 	if (hidden > 0) {
 		text += uiTheme.fg("dim", `\n… (streaming +${hidden} lines)`);
@@ -376,7 +376,7 @@ const replaceStrategy: EditStreamingStrategy<ReplaceArgs> = {
 		ctx.signal.throwIfAborted();
 		return [toPerFilePreview(args.path, result)];
 	},
-	renderStreamingFallback() {
+	renderStreamingPlaceholder() {
 		return "";
 	},
 };
@@ -405,7 +405,7 @@ const patchStrategy: EditStreamingStrategy<PatchArgs> = {
 		ctx.signal.throwIfAborted();
 		return [toPerFilePreview(args.path, result)];
 	},
-	renderStreamingFallback() {
+	renderStreamingPlaceholder() {
 		return "";
 	},
 };
@@ -552,7 +552,7 @@ const hashlineStrategy: EditStreamingStrategy<HashlineArgs> = {
 		try {
 			sections = splitHashlineInputs(input, { cwd: ctx.cwd, path: args.path });
 		} catch {
-			// Single-section fallback keeps the original error rendering for the
+			// Single-section handling keeps the original error rendering for the
 			// "haven't typed `§ PATH` yet" case.
 			const result = await computeHashlineDiff({ input, path: args.path }, ctx.cwd, {
 				autoDropPureInsertDuplicates: ctx.hashlineAutoDropPureInsertDuplicates,
@@ -590,8 +590,8 @@ const hashlineStrategy: EditStreamingStrategy<HashlineArgs> = {
 		}
 		return previews.length > 0 ? previews : null;
 	},
-	renderStreamingFallback(args, uiTheme) {
-		return typeof args.input === "string" ? renderHashlineInputFallback(args.input, uiTheme) : "";
+	renderStreamingPlaceholder(args, uiTheme) {
+		return typeof args.input === "string" ? renderHashlineInputPlaceholder(args.input, uiTheme) : "";
 	},
 };
 
@@ -642,7 +642,7 @@ const applyPatchStrategy: EditStreamingStrategy<ApplyPatchArgs> = {
 		}
 		return previews.length > 0 ? previews : null;
 	},
-	renderStreamingFallback() {
+	renderStreamingPlaceholder() {
 		return "";
 	},
 };
@@ -656,7 +656,7 @@ const vimStrategy: EditStreamingStrategy<unknown> = {
 	async computeDiffPreview() {
 		return null;
 	},
-	renderStreamingFallback() {
+	renderStreamingPlaceholder() {
 		return "";
 	},
 };

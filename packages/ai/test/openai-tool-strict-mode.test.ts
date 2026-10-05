@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { getBundledModel } from "@gajae-code/ai/models";
+import { convertOpenAICodexResponsesTools } from "@gajae-code/ai/providers/openai-codex-responses";
 import { streamOpenAICompletions } from "@gajae-code/ai/providers/openai-completions";
-import { streamOpenAIResponses } from "@gajae-code/ai/providers/openai-responses";
+import { convertTools, streamOpenAIResponses } from "@gajae-code/ai/providers/openai-responses";
 import type { Context, Model, OpenAICompat, ProviderSessionState, Tool } from "@gajae-code/ai/types";
 import * as z from "zod/v4";
+import { createCodexModel } from "./helpers";
 
 const originalFetch = global.fetch;
 
@@ -45,6 +47,27 @@ const looseYieldTool: Tool = {
 			},
 		},
 		required: ["result"],
+	},
+};
+
+const linearStyleLooseTool: Tool = {
+	name: "list_comments",
+	description: "List comments for a Linear issue",
+	strict: false,
+	parameters: {
+		type: "object",
+		properties: {
+			issueId: { type: "string" },
+			statusUpdateType: { type: "string", enum: ["project", "initiative"] },
+			first: { type: "integer" },
+			after: { type: "string" },
+			last: { type: "integer" },
+			before: { type: "string" },
+			includeArchived: { type: "boolean" },
+			teamId: { type: "string" },
+			creatorId: { type: "string" },
+			orderBy: { type: "string", enum: ["createdAt", "updatedAt"] },
+		},
 	},
 };
 
@@ -418,8 +441,17 @@ describe("OpenAI tool strict mode", () => {
 		};
 		const tool = payload.tools?.[0];
 
-		expect(tool?.strict).toBeUndefined();
+		expect(tool?.strict).toBe(false);
 		expect(getYieldDataSchema(tool?.parameters).additionalProperties).toBe(true);
+	});
+
+	it("emits strict=false for Linear-style optional schemas on both Responses serializers", () => {
+		const openAIModel = getBundledModel("openai", "gpt-5-mini") as Model<"openai-responses">;
+		const openAITool = convertTools([linearStyleLooseTool], true, openAIModel)[0];
+		const codexTool = convertOpenAICodexResponsesTools([linearStyleLooseTool], createCodexModel("gpt-5.1-codex"))[0];
+
+		expect(toRecord(openAITool).strict).toBe(false);
+		expect(toRecord(codexTool).strict).toBe(false);
 	});
 
 	it("sends strict=true for openai-responses tool schemas on GitHub Copilot", async () => {

@@ -461,6 +461,60 @@ continuation that supplies a different scope or anchor fails with
 Rows are probed only after scope filtering, through broker/router-owned
 credential-free attachments, yielding `reachable`, `unreachable`, or `stale`.
 
+## Read-only broker observation (`gjc sdk diagnostics broker`)
+
+`gjc sdk diagnostics broker [--agent-dir <dir>] [--expected-generation <id>] [--timeout-ms <ms>] [--json]`
+observes an already running broker publication. Unlike every other broker
+command on this page it never calls `ensureBroker`: it cannot start, ensure,
+retire, restart or recover a broker, cannot spawn a host, and writes no error
+evidence — not even for malformed input. It answers only from an already-owned
+healthy retained publication; a broker that owns no publication reports typed
+unavailability instead of acquiring the authority to reply.
+
+Selection is exact. Without `--agent-dir` no alternative root is scanned, and a
+replacement publication observed mid-request fails closed rather than
+reconnecting. A second observation is a new explicit invocation, never an
+automatic retry.
+
+`--timeout-ms` (1..10000, default 2000) is one absolute budget for the whole
+observation — the native lease, connect, authentication and the final identity
+recheck all draw from it, and expiry outranks a later refusal. It is a **work
+budget, not a guaranteed wall-clock return**: the unchanged SDK client close
+grace can extend settlement past the budget, and a synchronous kernel read
+already in flight is not forcibly cancelled. Expect the observation to stop
+doing new work at the deadline, not to return at exactly that instant.
+
+The result is `schema: gjc.broker-observation`, `version: 1`, an `observedAt`
+client timestamp, and exactly one of:
+
+- `broker`: `generation` (the broker's publication-incarnation id, fixed at its
+  startup — not the endpoint generation and not the package version),
+  `build.packageVersion`, `build.buildId` (startup-captured trusted metadata, or
+  `null`), and `diagnosticProtocol: 1`.
+- `unavailable`: `reason` plus a fixed message keyed by that reason. The reasons
+  are exactly `absent`, `stale`, `incompatible`, `authentication_failed`,
+  `unsupported`, `generation_mismatch`, `transport_unavailable`, `timeout`,
+  `invalid_response` and `unsafe_discovery`. Messages are literals, never
+  exception text.
+
+Malformed input is **not** an unavailable reason. Bad argv is a usage error: the
+CLI prints the fixed usage block and exits `2` without observing anything, and
+the SDK facade rejects the same inputs by throwing a typed options error to the
+caller before any observation begins. `invalid_arguments` is that caller-error
+surface, not a value the result DTO can carry.
+
+Exit codes are `0` for an observed broker, `1` for typed unavailability, and `2`
+for malformed argv. All output stays within 8192 UTF-8 bytes and identifying
+fields are never truncated into misleading values. A broker too old to publish a
+generation and diagnostic protocol is `unsupported`; compatibility is never
+synthesized. The document carries no pid, path, URL, port, token, argv or
+environment value.
+
+Observation qualifies on darwin arm64 with Bun 1.4.0 on a local
+ownership-enforcing APFS volume, and activates only the fixed package or cached
+native artifact — a missing or mismatched artifact is `unsupported`, never
+extracted or repaired. It is observation, not signed supply-chain attestation.
+
 ## Local-only spawn (`gjc sdk spawn`)
 
 `gjc sdk spawn --cwd <dir> --prompt <task> [--model <selector>] [--profile <name>] [--json]`

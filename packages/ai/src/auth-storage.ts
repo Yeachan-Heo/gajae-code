@@ -26,7 +26,13 @@ import type {
 	UsageReport,
 } from "./usage";
 
-import { getOAuthApiKey, getOAuthProvider, refreshOAuthToken, resolveOAuthStorageProvider } from "./utils/oauth";
+import {
+	getOAuthApiKey,
+	getOAuthProvider,
+	refreshOAuthToken,
+	resolveOAuthStorageProvider,
+	UnknownOAuthProviderError,
+} from "./utils/oauth";
 import { loginDeepInfra } from "./utils/oauth/deepinfra";
 import { loginDeepSeek } from "./utils/oauth/deepseek";
 import { loginOpenAICodexDevice } from "./utils/oauth/openai-codex";
@@ -531,7 +537,8 @@ export interface AuthCredentialStore {
 	 * Atomically adopts a fresh row or claims the current refresh token for one
 	 * local provider dial. SQLite-backed stores use this to prevent another
 	 * process from replaying a rotating refresh token between a pre-read and
-	 * the provider request.
+	 * the provider request. The supplied clock is advanced by any time spent
+	 * waiting for the immediate write reservation.
 	 */
 	claimOAuthRefreshLease?(
 		credentialId: number,
@@ -3686,10 +3693,11 @@ export class AuthStorage {
 				break;
 			}
 			case "glm-zcode": {
-				const { loginGlmZcode } = await import("./utils/oauth/glm-zcode");
+				const { loginGlmZcode, GLM_ZCODE_MANUAL_INPUT_PROMPT } = await import("./utils/oauth/glm-zcode");
 				credentials = await loginGlmZcode({
 					...ctrl,
-					onManualCodeInput: ctrl.onManualCodeInput ?? manualCodeInput,
+					onManualCodeInput:
+						ctrl.onManualCodeInput ?? (() => ctrl.onPrompt({ message: GLM_ZCODE_MANUAL_INPUT_PROMPT })),
 				});
 				break;
 			}
@@ -3882,7 +3890,7 @@ export class AuthStorage {
 			default: {
 				const customProvider = getOAuthProvider(provider);
 				if (!customProvider) {
-					throw new Error(`Unknown OAuth provider: ${provider}`);
+					throw new UnknownOAuthProviderError(provider);
 				}
 				const customLoginResult = await customProvider.login({
 					onAuth: info => ctrl.onAuth(info),
@@ -5548,6 +5556,21 @@ export class AuthStorage {
 		let refreshPromise: Promise<OAuthCredentials>;
 		let localDial = false;
 		let refreshLease: OAuthRefreshLease | undefined;
+		let refreshLeaseCompleted = false;
+		const releaseRefreshLease = (): void => {
+			if (!refreshLease || refreshLeaseCompleted) return;
+			refreshLeaseCompleted = true;
+			try {
+				const releaseLease = this.#store.releaseOAuthRefreshLease?.bind(this.#store);
+				releaseLease?.(refreshLease);
+			} catch (error) {
+				logger.warn("OAuth refresh lease release failed", {
+					provider,
+					credentialId: refreshLease.credentialId,
+					error: scrubHealthReason(error, [credential.access, credential.refresh]),
+				});
+			}
+		};
 
 		// Caller override > store-level hook > local per-provider refresh.
 		// `RemoteAuthCredentialStore` exposes the hook so a broker-backed gateway
@@ -5581,14 +5604,20 @@ export class AuthStorage {
 					const deadline = Date.now() + OAUTH_REFRESH_LEASE_MS;
 					for (;;) {
 						if (signal?.aborted) throw new Error("OAuth token refresh aborted by caller");
-						const claim = claimLease(
-							credentialId,
-							credential.refresh,
-							force,
-							owner,
-							Date.now(),
-							OAUTH_REFRESH_LEASE_MS,
-						);
+						let claim: OAuthRefreshLeaseClaim;
+						try {
+							claim = claimLease(
+								credentialId,
+								credential.refresh,
+								force,
+								owner,
+								Date.now(),
+								OAUTH_REFRESH_LEASE_MS,
+							);
+						} catch (error) {
+							releaseRefreshLease();
+							throw error;
+						}
 						if (claim.kind === "missing") throw new Error("OAuth refresh credential disappeared");
 
 						if (claim.kind === "claimed") {
@@ -5638,6 +5667,7 @@ export class AuthStorage {
 				const memoKey = `${credentialId}:${credential.refresh}`;
 				const memo = this.#recentOAuthRefreshFailures.get(memoKey);
 				if (memo && memo.expiresAt > Date.now()) {
+					releaseRefreshLease();
 					throw memo.error;
 				}
 			}
@@ -5647,16 +5677,32 @@ export class AuthStorage {
 			// and its refresh token must only ever be sent to the bound token
 			// endpoint.
 			if (credential.mcpBinding) {
-				refreshPromise = refreshBoundMCPOAuthCredential(credential, mcpClient, signal);
+				try {
+					refreshPromise = refreshBoundMCPOAuthCredential(credential, mcpClient, signal);
+				} catch (error) {
+					releaseRefreshLease();
+					throw error;
+				}
 			} else {
 				const customProvider = getOAuthProvider(provider);
 				if (customProvider) {
 					if (!customProvider.refreshToken) {
+						releaseRefreshLease();
 						throw new Error(`OAuth provider "${provider}" does not support token refresh`);
 					}
-					refreshPromise = customProvider.refreshToken(credential);
+					try {
+						refreshPromise = customProvider.refreshToken(credential);
+					} catch (error) {
+						releaseRefreshLease();
+						throw error;
+					}
 				} else {
-					refreshPromise = refreshOAuthToken(provider as OAuthProvider, credential);
+					try {
+						refreshPromise = refreshOAuthToken(provider as OAuthProvider, credential);
+					} catch (error) {
+						releaseRefreshLease();
+						throw error;
+					}
 				}
 			}
 		}
@@ -5711,6 +5757,7 @@ export class AuthStorage {
 				if (!completeLease?.(refreshLease, persisted)) {
 					throw new Error("OAuth token refresh ownership was lost before persistence");
 				}
+				refreshLeaseCompleted = true;
 				authority.persistedByLease = true;
 			}
 			return authority;
@@ -5726,17 +5773,20 @@ export class AuthStorage {
 			// pair is immediately eligible for a second refresh, replaying the token
 			// and tripping provider reuse detection. Skip the guard update only for a
 			// caller-owned abort, never for an internal timeout.
-			if (signal?.aborted && !isTimeoutAbort(signal)) throw error;
-			if (localDial && credentialId !== undefined) {
+			const callerAbort = signal?.aborted && !isTimeoutAbort(signal);
+			const unknownProvider = error instanceof UnknownOAuthProviderError;
+			const taggedError = callerAbort || unknownProvider ? error : tagRefreshAttempt(error, credential.refresh);
+			if (!callerAbort && !unknownProvider && localDial && credentialId !== undefined) {
 				for (const [key, entry] of this.#recentOAuthRefreshFailures) {
 					if (entry.expiresAt <= Date.now()) this.#recentOAuthRefreshFailures.delete(key);
 				}
 				this.#recentOAuthRefreshFailures.set(`${credentialId}:${credential.refresh}`, {
 					expiresAt: Date.now() + OAUTH_REFRESH_FAILURE_REPLAY_GUARD_MS,
-					error,
+					error: taggedError,
 				});
 			}
-			throw tagRefreshAttempt(error, credential.refresh);
+			releaseRefreshLease();
+			throw taggedError;
 		} finally {
 			if (timeout) clearTimeout(timeout);
 			if (signal && onAbort) signal.removeEventListener("abort", onAbort);
@@ -7198,7 +7248,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			`);
 			this.#db.run("DROP TABLE auth_credentials_v0");
 		});
-		migrate();
+		migrate.immediate();
 	}
 
 	#migrateAuthSchemaV1OrV2ToV3(): void {
@@ -7220,7 +7270,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			`);
 			this.#db.run("DROP TABLE auth_credentials_legacy");
 		});
-		migrate();
+		migrate.immediate();
 	}
 
 	#migrateAuthSchemaV3ToV4(): void {
@@ -7242,7 +7292,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			`);
 			this.#db.run("DROP TABLE auth_credentials_v3");
 		});
-		migrate();
+		migrate.immediate();
 	}
 	#migrateAuthSchemaV4ToV5(): void {
 		const columns = this.#db.prepare("PRAGMA table_info(auth_credentials)").all() as Array<{ name?: string }>;
@@ -7345,7 +7395,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				.run(`usage_cache:report:${provider}:`.length, `usage_cache:report:${provider}:`);
 			return { kind: "removed", ids: unique.map(target => target.id) };
 		});
-		return remove();
+		return remove.immediate();
 	}
 	claimOAuthRefreshLease(
 		credentialId: number,
@@ -7355,7 +7405,9 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		nowMs: number,
 		leaseMs: number,
 	): OAuthRefreshLeaseClaim {
+		const enteredAtMs = Date.now();
 		const claim = this.#db.transaction((): OAuthRefreshLeaseClaim => {
+			const effectiveNowMs = nowMs + Math.max(0, Date.now() - enteredAtMs);
 			const row = this.#db
 				.prepare(
 					"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials WHERE id = ? AND disabled_cause IS NULL",
@@ -7363,17 +7415,21 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				.get(credentialId) as AuthRow | undefined;
 			const credential = row ? deserializeCredential(row) : null;
 			if (credential?.type !== "oauth") return { kind: "missing" };
-			if (!force && credential.refresh !== expectedRefresh && nowMs + OAUTH_REFRESH_SKEW_MS < credential.expires) {
+			if (
+				!force &&
+				credential.refresh !== expectedRefresh &&
+				effectiveNowMs + OAUTH_REFRESH_SKEW_MS < credential.expires
+			) {
 				return { kind: "adopted", credential };
 			}
 			const active = this.#db
 				.prepare("SELECT owner, expires_at FROM oauth_refresh_leases WHERE credential_id = ?")
 				.get(credentialId) as { owner?: string; expires_at?: number } | undefined;
-			if (typeof active?.expires_at === "number" && active.expires_at > nowMs) {
+			if (typeof active?.expires_at === "number" && active.expires_at > effectiveNowMs) {
 				if (active.owner === owner) {
 					this.#db
 						.prepare("UPDATE oauth_refresh_leases SET expires_at = ? WHERE credential_id = ? AND owner = ?")
-						.run(nowMs + leaseMs, credentialId, owner);
+						.run(effectiveNowMs + leaseMs, credentialId, owner);
 					return {
 						kind: "claimed",
 						credential,
@@ -7393,10 +7449,10 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				.prepare(
 					"INSERT INTO oauth_refresh_leases (credential_id, owner, token_fingerprint, expires_at) VALUES (?, ?, ?, ?)",
 				)
-				.run(credentialId, owner, tokenFingerprint, nowMs + leaseMs);
+				.run(credentialId, owner, tokenFingerprint, effectiveNowMs + leaseMs);
 			return { kind: "claimed", credential, lease: { credentialId, owner, tokenFingerprint } };
 		});
-		return claim();
+		return claim.immediate();
 	}
 
 	completeOAuthRefreshLease(lease: OAuthRefreshLease, credential: OAuthCredential): boolean {
@@ -7431,7 +7487,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				.run(lease.credentialId, lease.owner);
 			return true;
 		});
-		return complete();
+		return complete.immediate();
 	}
 
 	releaseOAuthRefreshLease(lease: OAuthRefreshLease): void {
@@ -7493,7 +7549,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			return result;
 		});
 
-		const result = replace(provider, credentials);
+		const result = replace.immediate(provider, credentials);
 		this.#purgeSupersededDisabledRows(provider, result);
 		return result;
 	}
@@ -7540,7 +7596,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			return result;
 		});
 
-		const result = upsert(provider, credential);
+		const result = upsert.immediate(provider, credential);
 		this.#purgeSupersededDisabledRows(provider, result);
 		return result;
 	}
@@ -7737,12 +7793,22 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 
 	tryAcquireUsageFetchLease(key: string, owner: string, nowMs: number, leaseMs: number): boolean | undefined {
 		try {
-			const nowSec = Math.floor(nowMs / 1000);
-			const expiresAtSec = Math.ceil((nowMs + leaseMs) / 1000);
-			const result = this.#claimUsageFetchLeaseStmt.run(`usage_fetch_lease:${key}`, owner, expiresAtSec, nowSec) as {
-				changes: number;
-			};
-			return result.changes === 1;
+			const enteredAtMs = Date.now();
+			const claim = this.#db.transaction(() => {
+				const effectiveNowMs = nowMs + Math.max(0, Date.now() - enteredAtMs);
+				const nowSec = Math.floor(effectiveNowMs / 1000);
+				const expiresAtSec = Math.ceil((effectiveNowMs + leaseMs) / 1000);
+				const result = this.#claimUsageFetchLeaseStmt.run(
+					`usage_fetch_lease:${key}`,
+					owner,
+					expiresAtSec,
+					nowSec,
+				) as {
+					changes: number;
+				};
+				return result.changes === 1;
+			});
+			return claim.immediate();
 		} catch {
 			return undefined;
 		}
@@ -7764,7 +7830,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			this.#upsertCacheStmt.run(key, String(next), expiresAtSec);
 			return next;
 		});
-		return allocate();
+		return allocate.immediate();
 	}
 
 	deleteCachePrefix(prefix: string): void {

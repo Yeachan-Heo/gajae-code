@@ -3,8 +3,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
+import { logger } from "@gajae-code/utils";
 import { Broker, setHeartbeatStallForTest, setLivenessGraceForTest } from "../src/sdk/broker/broker";
-import { publishBrokerDiscovery } from "../src/sdk/broker/discovery";
+import { publishBrokerDiscovery, readBrokerDiscovery } from "../src/sdk/broker/discovery";
 
 // A short TTL drives the publication watchdog at `ttl/3`, so a liveness deadline
 // expressed in cadences expires in tens of milliseconds.
@@ -72,6 +73,91 @@ test("a broker that keeps publishing is never terminated by the liveness deadlin
 	setLivenessGraceForTest(broker, WATCHDOG_CADENCE_MS * 8);
 
 	expect(await completedWithin(broker, WATCHDOG_CADENCE_MS * 24)).toBe(false);
+});
+
+test("AC1: a stalled session checkpoint does not starve discovery heartbeats or block stop", async () => {
+	const broker = await startBroker();
+	const checkpointEntered = Promise.withResolvers<void>();
+	const releaseCheckpoint = Promise.withResolvers<void>();
+	// Install after startup so only the periodic checkpoint stalls; retained
+	// publication IO and the broker's watchdog/checkpoint wrapper stay real.
+	const checkpoint = vi.spyOn(broker.index, "checkpointLiveHeartbeats").mockImplementation(async () => {
+		checkpointEntered.resolve();
+		await releaseCheckpoint.promise;
+		return 0;
+	});
+	try {
+		expect(
+			await Promise.race([
+				checkpointEntered.promise.then(() => true),
+				Bun.sleep(WATCHDOG_CADENCE_MS * 20).then(() => false),
+			]),
+		).toBe(true);
+		const before = await readBrokerDiscovery(broker.settings.agentDir, HEARTBEAT_TTL_MS);
+		expect(before).not.toBeNull();
+		let heartbeatAt = before!.heartbeatAt;
+		await Bun.sleep(HEARTBEAT_TTL_MS + WATCHDOG_CADENCE_MS);
+		for (let tick = 0; tick < 3; tick += 1) {
+			expect(checkpoint).toHaveBeenCalledTimes(1);
+			const discovery = await readBrokerDiscovery(broker.settings.agentDir, HEARTBEAT_TTL_MS);
+			expect(discovery).not.toBeNull();
+			expect(discovery!.ownerId).toBe(before!.ownerId);
+			expect(discovery!.heartbeatAt).toBeGreaterThan(heartbeatAt);
+			heartbeatAt = discovery!.heartbeatAt;
+			await Bun.sleep(WATCHDOG_CADENCE_MS * 2);
+		}
+		expect(checkpoint).toHaveBeenCalledTimes(1);
+		// Stop must settle while the checkpoint is still waiting on its release.
+		expect(
+			await Promise.race([broker.stop().then(() => true), Bun.sleep(WATCHDOG_CADENCE_MS * 20).then(() => false)]),
+		).toBe(true);
+	} finally {
+		releaseCheckpoint.resolve();
+		checkpoint.mockRestore();
+		await broker.stop();
+	}
+});
+
+test("AC2: a contender yields to the live owner while its session checkpoint is stalled beyond discovery TTL", async () => {
+	const broker = await startBroker();
+	const checkpointEntered = Promise.withResolvers<void>();
+	const releaseCheckpoint = Promise.withResolvers<void>();
+	const checkpoint = vi.spyOn(broker.index, "checkpointLiveHeartbeats").mockImplementation(async () => {
+		checkpointEntered.resolve();
+		await releaseCheckpoint.promise;
+		return 0;
+	});
+	const info = vi.spyOn(logger, "info");
+	try {
+		expect(
+			await Promise.race([
+				checkpointEntered.promise.then(() => true),
+				Bun.sleep(WATCHDOG_CADENCE_MS * 20).then(() => false),
+			]),
+		).toBe(true);
+		const owner = broker.discovery!;
+		await Bun.sleep(HEARTBEAT_TTL_MS + WATCHDOG_CADENCE_MS);
+		const contender = new Broker({ agentDir: broker.settings.agentDir, heartbeatTtlMs: HEARTBEAT_TTL_MS });
+		brokers.push(contender);
+		const discovered = await contender.start();
+		expect(discovered).toMatchObject({
+			ownerId: owner.ownerId,
+			pid: owner.pid,
+			url: owner.url,
+			token: owner.token,
+			startedAt: owner.startedAt,
+		});
+		expect(info).toHaveBeenCalledWith(
+			expect.any(String),
+			expect.objectContaining({ reason: "startup-race-lost", ownerId: owner.ownerId, pid: owner.pid, exitCode: 0 }),
+		);
+		expect(checkpoint).toHaveBeenCalledTimes(1);
+	} finally {
+		releaseCheckpoint.resolve();
+		checkpoint.mockRestore();
+		info.mockRestore();
+		await broker.stop();
+	}
 });
 
 test("the retained heartbeat never runs its blocking write or fsync on the JS thread", async () => {

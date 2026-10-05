@@ -1,4 +1,4 @@
-import { getAgentDir } from "@gajae-code/utils";
+import { getAgentDir, VERSION } from "@gajae-code/utils";
 import { ensureBroker } from "../broker/ensure";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { SdkClientError } from "../client/client";
@@ -14,6 +14,8 @@ import { type SessionAttachment, SessionRouter, SessionRouterError } from "../ro
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../session-list";
 
 const PROTOCOL_VERSION = "2024-11-05";
+const SUPPORTED_PROTOCOL_VERSIONS = [PROTOCOL_VERSION, "2025-03-26", "2025-06-18"] as const;
+const NEWEST_PROTOCOL_VERSION = SUPPORTED_PROTOCOL_VERSIONS[SUPPORTED_PROTOCOL_VERSIONS.length - 1];
 const SERVER_NAME = "gjc-sdk-mcp";
 const ENDPOINT_CREDENTIAL_OPERATION = "session.get_endpoint";
 
@@ -105,6 +107,16 @@ function schema(name: (typeof SDK_MCP_TOOL_NAMES)[number]): Record<string, unkno
 
 function isObject(value: unknown): value is Arguments {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function negotiatedProtocolVersion(params: unknown): string {
+	const requestedProtocolVersion = isObject(params) ? params.protocolVersion : undefined;
+	if (
+		typeof requestedProtocolVersion === "string" &&
+		(SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(requestedProtocolVersion)
+	)
+		return requestedProtocolVersion;
+	return NEWEST_PROTOCOL_VERSION;
 }
 
 function asString(args: Arguments, name: string): string | null {
@@ -389,9 +401,9 @@ export function createSdkMcpServer(options: SdkMcpServerOptions = {}) {
 				jsonrpc: "2.0",
 				id,
 				result: {
-					protocolVersion: PROTOCOL_VERSION,
+					protocolVersion: negotiatedProtocolVersion(request.params),
 					capabilities: { tools: {} },
-					serverInfo: { name: SERVER_NAME },
+					serverInfo: { name: SERVER_NAME, version: VERSION },
 				},
 			};
 		if (request.method === "tools/list")

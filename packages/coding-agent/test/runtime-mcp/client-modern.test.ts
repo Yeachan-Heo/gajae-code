@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import * as path from "node:path";
+import * as url from "node:url";
+import { getProjectDir } from "@gajae-code/utils";
 import { callTool, connectToServer, disconnectServer, listTools } from "../../src/runtime-mcp/client";
 import type { MCPInputRequestHandler, MCPServerConfig, MCPServerConnection } from "../../src/runtime-mcp/types";
 import { legacyMcpMethodNotFound } from "../mcp-test-utils";
@@ -429,6 +432,110 @@ describe("MRTR input_required", () => {
 		const connection = await connectModern(fixture.url);
 		try {
 			await expect(callTool(connection, "echo", {})).rejects.toThrow(/no interactive input handler/);
+			expect(fixture.requests.filter(request => request.body.method === "tools/call")).toHaveLength(1);
+		} finally {
+			await disconnectServer(connection);
+		}
+	});
+
+	it("fails explicitly without retrying a requestState-only input_required when no interactive input handler is available", async () => {
+		const fixture = startModernFixture({
+			onCall: () => ({ result: { resultType: "input_required", requestState: "state-only-1" } }),
+		});
+		const connection = await connectModern(fixture.url);
+		try {
+			await expect(callTool(connection, "echo", {})).rejects.toThrow(/no interactive input handler/);
+			expect(fixture.requests.filter(request => request.body.method === "tools/call")).toHaveLength(1);
+		} finally {
+			await disconnectServer(connection);
+		}
+	});
+
+	it("answers roots-only input_required locally without an interactive handler and retries once", async () => {
+		const rootsResult = {
+			resultType: "input_required",
+			requestState: "roots-state-1",
+			inputRequests: { roots1: { method: "roots/list" } },
+		};
+		const fixture = startModernFixture({
+			onCall: (_body, index) => {
+				if (index === 1) return { result: rootsResult };
+				return { result: { resultType: "complete", content: [{ type: "text", text: "roots-answered" }] } };
+			},
+		});
+		const connection = await connectModern(fixture.url);
+		try {
+			const result = await callTool(connection, "echo", { text: "hi" });
+			expect(result.content).toEqual([{ type: "text", text: "roots-answered" }]);
+
+			const calls = fixture.requests.filter(request => request.body.method === "tools/call");
+			expect(calls).toHaveLength(2);
+			expect(calls[0]!.body.params?.inputResponses).toBeUndefined();
+			expect(calls[0]!.body.params?.requestState).toBeUndefined();
+			expect(calls[1]!.body.id).not.toBe(calls[0]!.body.id);
+			expect(calls[1]!.body.params?.name).toBe("echo");
+			expect(calls[1]!.body.params?.requestState).toBe("roots-state-1");
+			const cwd = getProjectDir();
+			expect(calls[1]!.body.params?.inputResponses).toEqual({
+				roots1: { roots: [{ uri: url.pathToFileURL(cwd).href, name: path.basename(cwd) }] },
+			});
+		} finally {
+			await disconnectServer(connection);
+		}
+	});
+
+	it("fails explicitly without retrying when roots are mixed with elicitation and no handler is available", async () => {
+		const mixedResult = {
+			resultType: "input_required",
+			requestState: "mixed-state-1",
+			inputRequests: {
+				roots1: { method: "roots/list" },
+				elicit1: {
+					method: "elicitation/create",
+					params: { message: "Pick a value", requestedSchema: { type: "object" } },
+				},
+			},
+		};
+		const fixture = startModernFixture({ onCall: () => ({ result: mixedResult }) });
+		const connection = await connectModern(fixture.url);
+		try {
+			await expect(callTool(connection, "echo", {})).rejects.toThrow(/no interactive input handler/);
+
+			// Exactly the original request: no retry, so the write is never replayed
+			// and the elicitation is never auto-accepted.
+			const calls = fixture.requests.filter(request => request.body.method === "tools/call");
+			expect(calls).toHaveLength(1);
+			expect(calls[0]!.body.params?.inputResponses).toBeUndefined();
+			expect(calls[0]!.body.params?.requestState).toBeUndefined();
+		} finally {
+			await disconnectServer(connection);
+		}
+	});
+
+	it("routes only the non-roots request to the handler and reports its cancellation without retrying", async () => {
+		const mixedResult = {
+			resultType: "input_required",
+			requestState: "mixed-state-2",
+			inputRequests: {
+				roots1: { method: "roots/list" },
+				elicit1: {
+					method: "elicitation/create",
+					params: { message: "Pick a value", requestedSchema: { type: "object" } },
+				},
+			},
+		};
+		const fixture = startModernFixture({ onCall: () => ({ result: mixedResult }) });
+		const connection = await connectModern(fixture.url);
+		const handledKeys: string[] = [];
+		const inputHandler: MCPInputRequestHandler = async key => {
+			handledKeys.push(key);
+			return { kind: "failed", reason: "cancelled" };
+		};
+		try {
+			await expect(callTool(connection, "echo", {}, { inputHandler })).rejects.toThrow(
+				/MCP input request "elicit1" for tools\/call cancelled/,
+			);
+			expect(handledKeys).toEqual(["elicit1"]);
 			expect(fixture.requests.filter(request => request.body.method === "tools/call")).toHaveLength(1);
 		} finally {
 			await disconnectServer(connection);

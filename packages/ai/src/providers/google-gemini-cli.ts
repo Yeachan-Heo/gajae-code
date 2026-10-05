@@ -16,6 +16,7 @@ import type {
 	Api,
 	AssistantMessage,
 	Context,
+	GoogleGeminiCliDiagnostics,
 	Model,
 	StreamFunction,
 	StreamOptions,
@@ -27,6 +28,7 @@ import { normalizeSystemPrompts } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { transportFailureFacts } from "../utils/fallback-transport";
 import { appendRawHttpRequestDumpFor400, type RawHttpRequestDump, withHttpStatus } from "../utils/http-inspector";
+import { FirstEventTimeoutError } from "../utils/idle-iterator";
 import { resolveRetryBudget } from "../utils/retry-budget";
 // Refresh is the sole responsibility of AuthStorage (broker-aware, single-flighted);
 // the stream provider trusts the access token threaded through `options.apiKey`.
@@ -325,6 +327,29 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 			timestamp: Date.now(),
 		};
 		let rawRequestDump: RawHttpRequestDump | undefined;
+		const googleGeminiCliDiagnostics: GoogleGeminiCliDiagnostics = {
+			chunkCounts: { content: 0, thinking: 0, functionCall: 0, usageOnly: 0, other: 0 },
+		};
+		(
+			stream as AssistantMessageEventStream & { googleGeminiCliDiagnostics?: GoogleGeminiCliDiagnostics }
+		).googleGeminiCliDiagnostics = googleGeminiCliDiagnostics;
+		const recordTimeoutDiagnostics = (): void => {
+			const reason = options?.signal?.reason;
+			if (!(reason instanceof FirstEventTimeoutError)) return;
+			googleGeminiCliDiagnostics.firstEventTimeoutMs = reason.firstEventTimeoutMs;
+			googleGeminiCliDiagnostics.firstEventTimeoutSource = reason.firstEventTimeoutSource;
+			(
+				reason as FirstEventTimeoutError & {
+					googleGeminiCliDiagnostics?: GoogleGeminiCliDiagnostics;
+				}
+			).googleGeminiCliDiagnostics = googleGeminiCliDiagnostics;
+		};
+		options?.signal?.addEventListener("abort", recordTimeoutDiagnostics, { once: true });
+		const recordResponse = (): void => {
+			if (googleGeminiCliDiagnostics.responseAtMs === undefined) {
+				googleGeminiCliDiagnostics.responseAtMs = Date.now() - startTime;
+			}
+		};
 
 		try {
 			const apiKeyRaw = options?.apiKey;
@@ -405,6 +430,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 					fetch: options?.fetch,
 				},
 			);
+			recordResponse();
 			if (!response.ok && sentForcedToolChoice) {
 				const errorText = await response.text();
 				const error = createGeminiCliHttpError(response, errorText);
@@ -447,6 +473,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 							fetch: options?.fetch,
 						},
 					);
+					recordResponse();
 				} else {
 					throw error;
 				}
@@ -496,20 +523,29 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 				for await (const chunk of readSseJson<CloudCodeAssistResponseChunk>(
 					activeResponse.body!,
 					options?.signal,
-					event =>
+					event => {
+						if (googleGeminiCliDiagnostics.firstRawSseAtMs === undefined) {
+							googleGeminiCliDiagnostics.firstRawSseAtMs = Date.now() - startTime;
+						}
 						options?.onSseEvent?.(
 							{ event: event.event, data: event.data, raw: [...event.raw] },
 							model,
 							options?.attemptScope,
-						),
+						);
+					},
 				)) {
 					const responseData = chunk.response;
-					if (!responseData) continue;
+					if (!responseData) {
+						googleGeminiCliDiagnostics.chunkCounts.other += 1;
+						continue;
+					}
 
 					const candidate = responseData.candidates?.[0];
+					let chunkKind: keyof GoogleGeminiCliDiagnostics["chunkCounts"] = "other";
 					if (candidate?.content?.parts) {
 						for (const part of candidate.content.parts) {
 							if (part.text !== undefined) {
+								chunkKind = isThinkingPart(part) ? "thinking" : "content";
 								hasContent = true;
 								const isThinking = isThinkingPart(part);
 								if (
@@ -550,6 +586,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 							}
 
 							if (part.functionCall) {
+								chunkKind = "functionCall";
 								hasContent = true;
 								if (currentBlock) {
 									pushBlockEndEvent(currentBlock, blockIndex(), output, stream);
@@ -618,6 +655,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 					}
 
 					if (responseData.usageMetadata) {
+						if (chunkKind === "other") chunkKind = "usageOnly";
 						// promptTokenCount includes cachedContentTokenCount, so subtract to get fresh input
 						const promptTokens = responseData.usageMetadata.promptTokenCount || 0;
 						const cacheReadTokens = responseData.usageMetadata.cachedContentTokenCount || 0;
@@ -639,6 +677,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 						};
 						calculateCost(model, output.usage);
 					}
+					googleGeminiCliDiagnostics.chunkCounts[chunkKind] += 1;
 				}
 
 				if (currentBlock) {
@@ -676,6 +715,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 						body: requestBodyJson,
 						signal: options?.signal,
 					});
+					recordResponse();
 
 					if (!currentResponse.ok) {
 						const retryErrorText = await currentResponse.text();
@@ -711,6 +751,11 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
+			const timeoutError = options?.signal?.reason;
+			if (timeoutError instanceof FirstEventTimeoutError) {
+				googleGeminiCliDiagnostics.firstEventTimeoutMs = timeoutError.firstEventTimeoutMs;
+				googleGeminiCliDiagnostics.firstEventTimeoutSource = timeoutError.firstEventTimeoutSource;
+			}
 			for (const block of output.content) {
 				if ("index" in block) {
 					delete (block as { index?: number }).index;
@@ -719,6 +764,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(error);
 			output.transportFailure = transportFailureFacts(error);
+			output.googleGeminiCliDiagnostics = googleGeminiCliDiagnostics;
 			output.errorMessage = await appendRawHttpRequestDumpFor400(
 				error instanceof Error ? error.message : JSON.stringify(error),
 				error,

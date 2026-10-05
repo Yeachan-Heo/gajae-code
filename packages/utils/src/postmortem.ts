@@ -128,16 +128,22 @@ function runCleanup(reason: Reason, options: CleanupOptions = {}): Promise<void>
  *
  * The deadline defaults to 5000 ms and can be overridden with
  * `GJC_CLEANUP_DEADLINE_MS` (finite values >= 0; anything else falls back to
- * the default).
+ * the default). Values above `MAX_CLEANUP_DEADLINE_MS` are lowered to it.
  */
 const DEFAULT_CLEANUP_DEADLINE_MS = 5_000;
+
+/**
+ * Longest delay setTimeout honors. Bun, like Node, treats any larger delay as 1 ms,
+ * so a very long deadline would otherwise expire before cleanup could run.
+ */
+const MAX_CLEANUP_DEADLINE_MS = 2 ** 31 - 1;
 
 function resolveCleanupDeadlineMs(): number {
 	const raw = process.env.GJC_CLEANUP_DEADLINE_MS;
 	if (raw === undefined || raw.trim() === "") return DEFAULT_CLEANUP_DEADLINE_MS;
 	const parsed = Number(raw);
 	if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_CLEANUP_DEADLINE_MS;
-	return parsed;
+	return Math.min(parsed, MAX_CLEANUP_DEADLINE_MS);
 }
 
 async function awaitCleanupWithDeadline(reason: Reason, options: CleanupOptions = {}): Promise<void> {

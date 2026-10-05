@@ -422,6 +422,34 @@ activity, or an earlier pending claim.
 
 Reconciliation state survives client disconnect/reconnect. With the session-private durable store (`.sdk-reconciliation/`), accepted and terminal prompt records also survive **GJC session-process restart** for the same session identity within capacity, subject to crash-consistent fsync. An ordinary non-terminal prompt record at restart finalizes its pending outcome and receipt state. A prompt with the explicit `deadlineRecoveryPending` marker is the exception: it remains `accepted` or `in_flight`, and its staged pending outcome is not exposed by Q26 while the SDK retains a durable recovery owner. A process restart does not recreate a missing exact-run/tool observation, so the pending outcome stays private until a real terminal event or new settlement evidence arrives. If ownership or settlement remains uncertain, the record stays nonterminal and recoverable instead of being converted into a synthetic deadline failure. A stopped prompt without receipt evidence becomes `terminal_ok + missing`; failed prompt or skill settlement without body evidence becomes `unknown`. Eviction or absence still returns honest `unknown`; that means the prior outcome is unknowable, not that execution did not occur. Active records are capped at 128 per kind and are never aged into terminal. Terminal records are capped at 256 per kind and evicted oldest-terminal first, with no age-based eviction. Reconciliation stores no prompt, transcript, credential, or provider-response body.
 
+### Request-owned queue cancellation and execution deadlines
+
+SDK-only ordinary abort cancels a snapshot of its authenticated requester's
+already-admitted preflights, including a prompt accepted durably but not yet
+started. It cancels those per-request controllers without borrowing another
+run's abort authority; foreign admissions and later pipelined requests are not
+part of the snapshot. A local `aborted: true` acknowledges cancellation, not a
+new durable execution terminal. For already-accepted work, recover its original
+`clientRef` through `turn.result`; unconfirmed terminal persistence remains
+uncertain and never permits mutation replay.
+
+Before consumption, a prompt diverted into steering retains its own queue-removal
+capability; cancelling it must not abort unrelated active work. After consumption,
+its durable completion belongs to the exact consuming run and cancellation domain.
+A trusted natural terminal settles each joined accepted prompt with its own
+correlation. Confirmed queue removal settles only that submission, without waiting
+for an unrelated run. A deterministic cancellation receipt waits for that
+submission's durable terminal; held or failed persistence remains uncertain,
+including same-key replay. Retired queue authority cannot be reused to abort the
+root run.
+
+Confirmed queue residence suspends the terminal lease. Actual consumption or
+own-run promotion starts a fresh bounded lease, renewed only by attributable
+progress in the same consuming run and cancellation domain. Session teardown
+retires joined attribution; late predecessor progress or terminal events cannot
+adopt or settle a successor. Transport or delivery failure alone does not prove
+execution settled and does not retire a live unsettled execution owner.
+
 `turn.prompt` remains ordered and non-idempotent. Its envelope `idempotencyKey`
 does not replay a response or produce `idempotency_conflict`. A retained duplicate
 `clientRef` fails before execution with `client_ref_conflict`, but callers must not
@@ -458,6 +486,37 @@ failure with a successful `cancelled` result. If exact run or tool settlement
 cannot be proven, Q26 remains `accepted` or `in_flight`, the pending outcome
 stays private, and no terminal frame is published until recovery proves
 settlement.
+
+## Read-only broker observation
+
+`observeExistingBroker({ agentDir, expectedGeneration?, timeoutMs? })` reports what an
+already running broker publishes about itself and does nothing else. It owns discovery
+and authentication internally, so callers never receive credentials, socket coordinates
+or private discovery objects, and it is the only broker entry point that cannot start,
+ensure, retire, restart or recover a broker, spawn a host, replay a lifecycle operation
+or write error evidence. It never enters `SessionRouter`, `SessionLifecycleService`,
+`ensureBroker`, `Broker.start`, retirement, recovery, lifecycle lookup, model resolution
+or session enumeration.
+
+The returned value is a detached frozen snapshot, not the broker's mutable discovery
+object: `schema: "gjc.broker-observation"`, `version: 1`, `ok`, `observedAt`, and either
+a `broker` record (`generation`, `build.packageVersion`, `build.buildId | null`,
+`diagnosticProtocol: 1`) or an `unavailable` record whose `message` is a fixed literal
+keyed by `reason`. `generation` is the broker's publication-incarnation id fixed at its
+startup — not `endpointGeneration`, not the package version — and the initial
+publication, the authenticated response and the final publication must all agree on it
+and on the internal owner/process/root identity. An `expectedGeneration` mismatch, or a
+replacement publication observed during the request, fails closed without reconnecting
+or ensuring.
+
+`timeoutMs` (1..10000, default 2000) is a single absolute budget for the whole
+observation; expiry outranks a later refusal. A broker that publishes no generation or
+diagnostic protocol is `unsupported` rather than a synthesized compatibility success.
+The CLI projection of this facade is `gjc sdk diagnostics broker` — see
+[SDK session CLI](sdk-session-cli.md). Observation qualifies on darwin arm64 with Bun
+1.4.0 on a local ownership-enforcing APFS volume and activates only the fixed package or
+cached native artifact; a missing or mismatched artifact is `unsupported`, never
+extracted or repaired. This is observation, not signed supply-chain attestation.
 
 ## Skill invoke reconciliation
 
@@ -986,8 +1045,9 @@ mapping.
 
 - paired provider identity and operation capability are checked before the
   Broker call;
-- retries reuse the same provider request key, so one request produces one
-  Broker ledger identity and at most one lifecycle effect;
+- retries reuse the same provider request key; replay and at-most-once lifecycle
+  effects apply while the Broker ledger retains that identity. Eligible settled
+  identities may be evicted oldest-first under capacity pressure;
 - `terminal_uncertain` remains uncertain and is reconciled from Broker ledger,
   effect marker, process incarnation, endpoint/index, readiness, and exact
   cleanup evidence only;

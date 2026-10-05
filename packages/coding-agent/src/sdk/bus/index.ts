@@ -27,7 +27,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
-import { isNonDispatchedToolEvent, type RunSettlementProof, ThinkingLevel } from "@gajae-code/agent-core";
+import {
+	type AgentTerminalOwnerContext,
+	isNonDispatchedToolEvent,
+	type RunCancellationDomain,
+	type RunSettlementProof,
+	ThinkingLevel,
+} from "@gajae-code/agent-core";
 import type { ImageContent, TextContent, Tool } from "@gajae-code/ai/core";
 import type { NotificationServer as NativeNotificationServer } from "@gajae-code/natives";
 
@@ -105,6 +111,7 @@ import {
 	canDeliverSdkEvent,
 	createSdkSurfaceFactory,
 	masterAttestationForEffectiveHost,
+	POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY,
 	reattestMasterSessionIdentity,
 	SESSION_HOST_OBSERVER_CAPABILITY,
 	type SessionSdkHost,
@@ -204,7 +211,6 @@ import {
 	ASK_SELECTED_ACK_CAPABILITY,
 	type EnsureDaemonResult,
 	ensureTelegramDaemonRunningDetailed,
-	POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY,
 } from "./telegram-daemon";
 
 export type {
@@ -1229,6 +1235,9 @@ export class PresentationArbiter {
 interface SessionRuntime {
 	server: NotificationServer;
 	host: SessionSdkHost;
+	getJoinedPromptCorrelations: (owner: AgentTerminalOwnerContext) => Array<{ commandId: string; turnId: string }>;
+	isPromptRunOwner: (correlation: { commandId: string; turnId: string }, owner: AgentTerminalOwnerContext) => boolean;
+	retireJoinedPromptOwners: () => void;
 	/** Delivers one ring-positioned event envelope to every attached subscriber
 	 *  connection, applying the same capability gate as event replay. */
 	broadcastEventFrame: (event: SdkFrame) => string[];
@@ -2618,6 +2627,12 @@ function sdkControlSurface(
 		error: unknown,
 	) => void | Promise<void> = () => {},
 	onPromptAcceptFailed: (correlation: { commandId: string; turnId: string }) => void = () => {},
+	onPromptDiverted: (correlation: { commandId: string; turnId: string }) => void,
+	onPromptPromoted: (
+		correlation: { commandId: string; turnId: string },
+		promotion: { startsOwnRun?: boolean; removed?: boolean },
+		handle: string | undefined,
+	) => void,
 	acceptGateResolution: () => boolean,
 	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T>,
 	admitPrompt: (clientRef?: string) => void,
@@ -3019,6 +3034,7 @@ function sdkControlSurface(
 			admission.accepted();
 			accepting = false;
 			accepted = true;
+			if (effectiveDeliverAs !== undefined) onPromptDiverted(correlation);
 			// #4743: an accepted run owns a durable terminal publication when it
 			// settles; teardown joins it via this latch (never-accepted preflights
 			// produce no durable write and stay unjoined by design).
@@ -3044,7 +3060,14 @@ function sdkControlSurface(
 					...(effectiveDeliverAs ? { deliverAs: effectiveDeliverAs } : {}),
 					onPreflightAcceptCommit,
 					onPreflightAccepted,
-					...admission.hooks,
+					onQueuedPromoted: promotion => {
+						admission.hooks.onQueuedPromoted(promotion);
+						onPromptPromoted(correlation, promotion, ctx.getActivePromptHandle());
+					},
+					onDispatchDisposition: disposition => {
+						admission.hooks.onDispatchDisposition(disposition);
+						if (!disposition.startsOwnRun) onPromptDiverted(correlation);
+					},
 					preflightSignal: preflightController.signal,
 					...(sdkRunToken ? { sdkRunToken } : {}),
 				}),
@@ -3722,8 +3745,8 @@ function sdkControlSurface(
 				return unavailable("model.cycle", "no session model-cycle seam is installed")();
 			return { changed: (await ctx.cycleModel()) !== undefined };
 		},
-		setThinking: level => {
-			api.setThinkingLevel(level as ThinkingLevel);
+		setThinking: async level => {
+			await api.setThinkingLevelForControl(level as ThinkingLevel, false);
 			return { changed: true };
 		},
 		cycleThinking: () => {
@@ -4290,6 +4313,8 @@ export function createNotificationsExtension(
 		 * preflight outside the durable admission path (review thread P2).
 		 */
 		terminalAbortSeams?: {
+			getTerminalRunOwnerForEvent?: (event: object) => AgentTerminalOwnerContext | undefined;
+			getRunOwnerDomain?: (handle: string) => RunCancellationDomain | undefined;
 			getTerminalTurnEpoch: () => number | undefined;
 			cancelPendingPreflightForTerminalAbort: () => void;
 			captureTerminalAbortSteeringSnapshot?: () => void;
@@ -4577,6 +4602,7 @@ export function createNotificationsExtension(
 		if (reason === "session" && requestedRuntime) {
 			requestedRuntime.inboundFenced = true;
 			requestedRuntime.stopping = true;
+			requestedRuntime.retireJoinedPromptOwners();
 			requestedRuntime.abortEphemeralTurns();
 		}
 		if (reason === "session" && requestedRuntime) requestedRuntime.stopSessionNameObserver();
@@ -4845,6 +4871,19 @@ export function createNotificationsExtension(
 			return failLifecycleStartup("failed", "Lifecycle SDK startup requires an agent directory.");
 
 		const pendingInteractive = new Map<string, PendingInteractiveAsk>();
+		const queuedRemovalTerminals = new Map<string, Promise<boolean>>();
+		const joinedPromptOwners = new Map<
+			string,
+			{ correlation: { commandId: string; turnId: string }; owner: AgentTerminalOwnerContext }
+		>();
+		const getJoinedPromptCorrelations = (terminalOwner: AgentTerminalOwnerContext) =>
+			[...joinedPromptOwners.values()]
+				.filter(
+					({ owner }) =>
+						owner.resourceRunId === terminalOwner.resourceRunId && owner.domain === terminalOwner.domain,
+				)
+				.map(({ correlation }) => correlation);
+		const retireJoinedPromptOwners = (): void => joinedPromptOwners.clear();
 		const pendingPromptCorrelations: Array<{ commandId: string; turnId: string }> = [];
 		const pendingPromptCorrelationsBySdkRunToken = new Map<string, { commandId: string; turnId: string }>();
 		const workLease = ctx.getSessionWorkLease?.() ?? createSessionWorkLease();
@@ -5106,6 +5145,8 @@ export function createNotificationsExtension(
 			 * up to a hard maximum runtime anchored to acceptance.
 			 */
 			deadlineLease: PromptDeadlineLease;
+			deadlineSuspended?: true;
+			sdkRunToken?: string;
 			deadlineTimer?: Parameters<typeof clearTimeout>[0];
 			/**
 			 * Identity of the in-flight deadline expiry attempt (set synchronously
@@ -5314,10 +5355,12 @@ export function createNotificationsExtension(
 				submission.workLease = undefined;
 			}
 			promptSubmissions.delete(key);
-			// A fatal closure is transport-level, not a committed semantic terminal: the
-			// durable record stays authoritative, so it must never leave a tombstone.
-			if (submission.fatal) return;
 			const [commandId, turnId] = key.split(":", 2);
+			// A fatal closure is transport-level, not a committed semantic terminal: the
+			// durable record stays authoritative, so it must never leave a tombstone
+			// or release images still retained by an unsettled run. Runtime teardown
+			// releases those reservations even if this delivery record expires.
+			if (submission.fatal) return;
 			if (!commandId || !turnId) return;
 			removePendingPromptCorrelation({ commandId, turnId });
 			addTerminalTombstone(key, submission.connectionId);
@@ -5664,7 +5707,7 @@ export function createNotificationsExtension(
 		 */
 		const armPromptDeadline = (key: string, correlation: { commandId: string; turnId: string }) => {
 			const submission = promptSubmissions.get(key);
-			if (!submission) return;
+			if (!submission || submission.deadlineSuspended) return;
 			const lease = submission.deadlineLease;
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			submission.deadlineTimer = setTimeout(
@@ -5772,25 +5815,37 @@ export function createNotificationsExtension(
 			);
 		};
 		const emitPromptEvent = (event: AgentSessionEvent) => {
-			if (!runtime?.activePromptCorrelation) return;
+			if (!runtime) return;
 			cleanupPromptRecords();
-			const correlation = runtime.activePromptCorrelation;
-			// Renewal is attributed exactly like the correlated delivery below.
-			renewPromptDeadline(correlation, event);
-			noteToolDispatchBoundary(correlation, event);
-			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
-			if (!submission || submission.abandoned) return;
-			const frame = {
-				type: "event",
-				kind: event.type,
-				payload: toAgentWireEventPayload(event),
-				...correlation,
-			};
-			if (!submission.acknowledged) {
-				submission.bufferedFrames.push(frame);
-				return;
+			const handle = ctx.getActivePromptHandle();
+			const domain = handle ? terminalAbortSeams?.getRunOwnerDomain?.(handle) : undefined;
+			const correlations = handle && domain ? getJoinedPromptCorrelations({ resourceRunId: handle, domain }) : [];
+			const root = runtime.activePromptCorrelation;
+			if (
+				root &&
+				!correlations.some(
+					correlation => correlation.commandId === root.commandId && correlation.turnId === root.turnId,
+				)
+			)
+				correlations.unshift(root);
+			for (const correlation of correlations) {
+				// Renewal is attributed exactly like the correlated delivery below.
+				renewPromptDeadline(correlation, event);
+				noteToolDispatchBoundary(correlation, event);
+				const submission = promptSubmissions.get(promptSubmissionKey(correlation));
+				if (!submission || submission.abandoned) continue;
+				const frame = {
+					type: "event",
+					kind: event.type,
+					payload: toAgentWireEventPayload(event),
+					...correlation,
+				};
+				if (!submission.acknowledged) {
+					submission.bufferedFrames.push(frame);
+					continue;
+				}
+				deliverCorrelatedFrame(submission, frame);
 			}
-			deliverCorrelatedFrame(submission, frame);
 		};
 		/**
 		 * Status of a registered deadline expiry attempt after an awaited
@@ -5809,7 +5864,10 @@ export function createNotificationsExtension(
 			submission: PromptSubmission,
 			attempt: { lease: PromptDeadlineLease; generation: number; selfAbortStarted?: true },
 		): DeadlineAttemptStatus => {
-			if (promptSubmissions.get(key) !== submission || submission.deadlineLease !== attempt.lease) return "stale";
+			if (promptSubmissions.get(key) !== submission) return "stale";
+			if (!attempt.selfAbortStarted && (submission.deadlineSuspended || submission.deadlineLease !== attempt.lease))
+				return "superseded";
+			if (submission.deadlineLease !== attempt.lease) return "stale";
 			const lease = submission.deadlineLease;
 			// A deadline expiry attempt must not be superseded by progress that its
 			// OWN abort caused. Terminal fencing aborts the running tool, and the
@@ -6018,6 +6076,7 @@ export function createNotificationsExtension(
 					maxMs: resolveSdkPromptMaxRuntimeMs(settings?.get("sdk.promptMaxRuntimeMs")),
 				}),
 				phase: "active",
+				...(sdkRunToken ? { sdkRunToken } : {}),
 				...(workLeaseHandle ? { workLease: workLeaseHandle } : {}),
 				// Bound to the Agent run at `agent_start`; acceptance precedes execution.
 				executionHandle: undefined,
@@ -6123,10 +6182,73 @@ export function createNotificationsExtension(
 			correlation: { commandId: string; turnId: string },
 			handle: string | undefined,
 		) => {
-			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
+			const key = promptSubmissionKey(correlation);
+			const submission = promptSubmissions.get(key);
 			if (submission) {
+				if (submission.deadlineSuspended) {
+					submission.deadlineSuspended = undefined;
+					submission.deadlineLease = createPromptDeadlineLease({
+						now: Date.now(),
+						leaseMs: submission.deadlineLease.leaseMs,
+						maxMs: submission.deadlineLease.maxMs,
+					});
+					armPromptDeadline(key, correlation);
+				}
 				submission.executionHandle = handle;
 				submission.preflightAbort = undefined;
+			}
+		};
+		const onPromptDiverted = (correlation: { commandId: string; turnId: string }) => {
+			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
+			// A follow-up's private token can only be adopted by its exact future run.
+			// Implicit steering has no such future-run authority and must leave pending.
+			if (!submission?.sdkRunToken) removePendingPromptCorrelation(correlation);
+			if (!submission || submission.terminal) return;
+			submission.deadlineSuspended = true;
+			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
+			submission.deadlineTimer = undefined;
+		};
+		const onPromptPromoted = (
+			correlation: { commandId: string; turnId: string },
+			promotion: { startsOwnRun?: boolean; removed?: boolean },
+			handle: string | undefined,
+		) => {
+			const key = promptSubmissionKey(correlation);
+			removePendingPromptCorrelation(correlation);
+			if (promotion.removed) {
+				const completion: { terminalized?: boolean } = {};
+				const removal = terminalizePrompt(
+					correlation,
+					{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+					{},
+					undefined,
+					completion,
+				).then(() => completion.terminalized === true);
+				queuedRemovalTerminals.set(key, removal);
+				trackReconciliationProducer(
+					removal.finally(() => {
+						if (queuedRemovalTerminals.get(key) === removal) queuedRemovalTerminals.delete(key);
+					}),
+				);
+				return;
+			}
+			const submission = promptSubmissions.get(key);
+			if (!submission || submission.terminal) return;
+			submission.deadlineSuspended = undefined;
+			submission.deadlineLease = createPromptDeadlineLease({
+				now: Date.now(),
+				leaseMs: submission.deadlineLease.leaseMs,
+				maxMs: submission.deadlineLease.maxMs,
+			});
+			armPromptDeadline(key, correlation);
+			if (promotion.startsOwnRun === true) {
+				if (submission.sdkRunToken) pendingPromptCorrelationsBySdkRunToken.set(submission.sdkRunToken, correlation);
+				else pendingPromptCorrelations.push(correlation);
+			} else {
+				bindPromptExecutionHandle(correlation, handle);
+				const domain = handle ? terminalAbortSeams?.getRunOwnerDomain?.(handle) : undefined;
+				if (handle && domain)
+					joinedPromptOwners.set(key, { correlation, owner: { resourceRunId: handle, domain } });
 			}
 		};
 		const terminalizePrompt = async (
@@ -6156,6 +6278,7 @@ export function createNotificationsExtension(
 			// the seam must refuse to fence the successor's lineage (review
 			// thread P1).
 			const terminalExpectedEpoch = options.terminal ? terminalAbortSeams?.getTerminalTurnEpoch?.() : undefined;
+			const deadlineAttempt = submission.deadlineAttempt;
 			let winner: SdkPromptTerminalOutcome;
 			try {
 				winner = await kindReconciliation.claimPendingOutcome(
@@ -6179,7 +6302,6 @@ export function createNotificationsExtension(
 			// attempt must then back off — reset to active and reschedule —
 			// instead of fencing and publishing a deadline terminal for a live
 			// prompt. A re-accepted or evicted submission is never touched.
-			const deadlineAttempt = submission.deadlineAttempt;
 			if (deadlineAttempt) {
 				const key = promptSubmissionKey(correlation);
 				const status = deadlineAttemptStatus(key, submission, deadlineAttempt);
@@ -6366,6 +6488,7 @@ export function createNotificationsExtension(
 			}
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			if (!recordPromptTerminal(correlation)) return;
+			joinedPromptOwners.delete(promptSubmissionKey(correlation));
 			if (!runtime) {
 				// The runtime (and with it the positioned ring) is gone, so the
 				// terminal can never be published from this process; expire the
@@ -6547,6 +6670,8 @@ export function createNotificationsExtension(
 			recordPromptAccepted,
 			recordPromptFailure,
 			discardPromptAcceptance,
+			onPromptDiverted,
+			onPromptPromoted,
 			() => runtime?.stopping !== true,
 			trackGateResolution,
 			admitPromptSubmission,
@@ -7107,6 +7232,20 @@ export function createNotificationsExtension(
 							);
 							return already_terminalResult;
 						}
+						if (currentSubmission.preflightAbort) {
+							try {
+								await currentSubmission.preflightAbort();
+							} catch (error) {
+								logger.warn(`sdk: accepted queued cancellation failed: ${String(error)}`);
+								failPromptClosed(
+									{ commandId, turnId },
+									currentSubmission,
+									"terminal_uncertain",
+									"Accepted queued prompt could not be settled before cancellation.",
+								);
+								return { ok: false as const, reason: "worker_unsettled" as const };
+							}
+						}
 						if (preflightCancel?.hasPending()) {
 							preflightCancel.cancel();
 							// The seam cancels the SESSION-WIDE preflight controller:
@@ -7115,11 +7254,30 @@ export function createNotificationsExtension(
 							if (noOtherConnectionPreflights?.() !== false)
 								terminalAbortSeams?.cancelPendingPreflightForTerminalAbort?.();
 						}
-						await terminalizePrompt(
-							{ commandId, turnId },
-							{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
-							{},
-						);
+						const removal = queuedRemovalTerminals.get(promptSubmissionKey({ commandId, turnId }));
+						const completion: { terminalized?: boolean } = {};
+						if (removal) completion.terminalized = await removal;
+						else
+							await terminalizePrompt(
+								{ commandId, turnId },
+								{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+								{ fence: Boolean(currentSubmission.executionHandle) },
+								undefined,
+								completion,
+							);
+						const durable = kindReconciliation.lookupResult(currentSubmission.reconciliationKind, {
+							commandId,
+							turnId,
+						});
+						if (
+							completion.terminalized !== true &&
+							(durable.terminalAt === undefined ||
+								(durable.status !== "terminal_ok" && durable.status !== "failed"))
+						) {
+							// The reserved marker remains uncertain; never commit deterministic no-effect
+							// authority while the accepted submission still lacks a durable terminal.
+							return { ok: false as const, reason: "worker_unsettled" as const };
+						}
 						// No prompt won the race: finalize the reserved row so a later
 						// same-key retry replays this deterministic no_active_turn result
 						// instead of reservation uncertainty (review thread P2).
@@ -7993,6 +8151,12 @@ export function createNotificationsExtension(
 		runtime = {
 			server,
 			host,
+			getJoinedPromptCorrelations,
+			isPromptRunOwner: (correlation, owner) => {
+				const handle = promptSubmissions.get(promptSubmissionKey(correlation))?.executionHandle;
+				return handle === owner.resourceRunId && terminalAbortSeams?.getRunOwnerDomain?.(handle) === owner.domain;
+			},
+			retireJoinedPromptOwners,
 			broadcastEventFrame,
 			broadcastEventFrameWithReceipts,
 			revisions,
@@ -9896,13 +10060,25 @@ export function createNotificationsExtension(
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (!rt) return;
-		void rt.host
-			.reportActivity("idle")
-			.catch(error => logger.warn(`notifications: idle activity checkpoint failed: ${String(error)}`));
-		// Clear the streaming flag for SDK consumers even when notifications are off.
-		rt.busy = false;
-		const correlation = rt.activePromptCorrelation;
-		if (correlation) {
+		// The Agent's terminal owner is independent of delivery correlation. Never
+		// borrow a successor's run handle to settle a predecessor's SDK prompts.
+		const terminalOwner = terminalAbortSeams?.getTerminalRunOwnerForEvent?.(event);
+		const rootCorrelation = rt.activePromptCorrelation;
+		const correlations = terminalOwner ? rt.getJoinedPromptCorrelations(terminalOwner) : [];
+		if (
+			rootCorrelation &&
+			(!terminalOwner || rt.isPromptRunOwner(rootCorrelation, terminalOwner)) &&
+			!correlations.some(
+				correlation =>
+					correlation.commandId === rootCorrelation.commandId && correlation.turnId === rootCorrelation.turnId,
+			)
+		)
+			correlations.unshift(rootCorrelation);
+		for (const correlation of correlations) {
+			// This attributed agent_end is an execution boundary even when the
+			// subsequent durable terminal claim fails. A fatal transport closure
+			// clears attribution, so an unrelated later agent_end cannot settle a
+			// predecessor's prompt correlation.
 			const assistants = (Array.isArray(event.messages) ? [...event.messages].reverse() : []).filter(
 				message => message && typeof message === "object" && (message as { role?: unknown }).role === "assistant",
 			) as Array<{ stopReason?: unknown; errorKind?: unknown; errorCode?: unknown }>;
@@ -9990,11 +10166,24 @@ export function createNotificationsExtension(
 						}
 					: {}),
 			});
-		} else {
-			rt.emitPromptLifecycle(undefined, { type: "agent_end", sessionId: id });
 		}
+		if (correlations.length === 0) rt.emitPromptLifecycle(undefined, { type: "agent_end", sessionId: id });
+		if (
+			rootCorrelation &&
+			terminalOwner &&
+			!rt.isPromptRunOwner(rootCorrelation, terminalOwner) &&
+			!correlations.some(
+				correlation =>
+					correlation.commandId === rootCorrelation.commandId && correlation.turnId === rootCorrelation.turnId,
+			)
+		)
+			return;
+		rt.busy = false;
+		void rt.host
+			.reportActivity("idle")
+			.catch(error => logger.warn(`notifications: idle activity checkpoint failed: ${String(error)}`));
 		finishAgentWork(rt, event.stopReason === "paused");
-		rt.activePromptCorrelation = undefined;
+		if (rt.activePromptCorrelation === rootCorrelation) rt.activePromptCorrelation = undefined;
 		terminalizeInFlightTools(rt, id, event.stopReason === "cancelled" ? "cancelled" : "failed");
 		try {
 			pushSessionFrame(rt, { type: "activity", sessionId: id, state: "idle" });

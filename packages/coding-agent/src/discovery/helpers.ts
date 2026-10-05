@@ -203,10 +203,13 @@ export function getProjectPath(ctx: LoadContext, source: SourceId, subpath: stri
 
 /** Build the filesystem authority for a provider read. */
 export function getReadOptions(
-	ctx: Pick<LoadContext, "home" | "isolatedHome" | "userAgentDir" | "homeIdentity" | "userAgentIdentity">,
+	ctx: Pick<
+		LoadContext,
+		"home" | "isolatedHome" | "userAgentDir" | "homeIdentity" | "userAgentIdentity" | "bypassCache"
+	>,
 	scope: ReadScope,
 ): ReadFileOptions | undefined {
-	if (!ctx.isolatedHome) return undefined;
+	if (!ctx.isolatedHome) return ctx.bypassCache ? { bypassCache: true } : undefined;
 	return {
 		isolatedHome: true,
 		home: ctx.home,
@@ -219,7 +222,10 @@ export function getReadOptions(
 }
 
 export async function getReadOptionsForContainment(
-	ctx: Pick<LoadContext, "home" | "isolatedHome" | "userAgentDir" | "homeIdentity" | "userAgentIdentity">,
+	ctx: Pick<
+		LoadContext,
+		"home" | "isolatedHome" | "userAgentDir" | "homeIdentity" | "userAgentIdentity" | "bypassCache"
+	>,
 	scope: ReadScope,
 	containmentRoot?: string,
 ): Promise<ReadFileOptions | undefined> {

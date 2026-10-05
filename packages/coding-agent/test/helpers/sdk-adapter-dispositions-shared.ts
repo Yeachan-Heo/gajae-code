@@ -120,7 +120,9 @@ export const expectedDomainErrors: Readonly<Record<string, string>> = {
 	// goal.list/get is intentionally absent: on a goal-less session it now
 	// succeeds with an explicit no_active_goal diagnostic payload instead of
 	// resource_gone (#4668), so adapters must observe ok: true.
-	"session.last_assistant": "resource_gone",
+	// session.last_assistant is intentionally absent: when there is no readable
+	// assistant text, it now returns an empty observation (ok: true with page.items: [null])
+	// instead of resource_gone (#5821), so adapters must observe ok: true.
 	"resource.body": "resource_gone",
 	"artifact.read": "resource_gone",
 	"retry.last": "nothing_to_retry",
@@ -168,6 +170,22 @@ export function expectSemanticResult(operation: Operation, result: unknown): voi
 		expect(
 			typeof msg === "string" && (msg as string).length > 0,
 			"goal.list/get diagnostic message must be non-empty",
+		).toBe(true);
+	} else if (operation.sdkId === "session.last_assistant") {
+		// Q17 returns an empty observation (ok: true with page.items: [null])
+		// when there is no readable assistant text (#5821).
+		const envelope = result as { ok?: unknown } | null;
+		if (envelope !== null && typeof envelope === "object" && "ok" in envelope)
+			expect(result).toMatchObject({ ok: true });
+		const page =
+			(result as { page?: { items?: unknown[] } } | null)?.page ??
+			(result as { result?: { page?: { items?: unknown[] } } } | null)?.result?.page ??
+			(result as { data?: { page?: { items?: unknown[] } } } | null)?.data?.page;
+		// Empty observation must have page with items:[null]
+		if (page == null) throw new Error("session.last_assistant empty observation page must be present");
+		expect(
+			Array.isArray(page.items) && page.items.length === 1 && page.items[0] === null,
+			"session.last_assistant empty observation must have page.items: [null]",
 		).toBe(true);
 	} else expect(result).toMatchObject({ ok: true });
 }
@@ -395,6 +413,19 @@ export async function fixture(): Promise<AdapterFixture> {
 										"No goal is active in this session: goal mode has not created or resumed a goal, so no goal snapshot exists yet.",
 								},
 							],
+							complete: true,
+						},
+					},
+				};
+			// ACP translated contract for session.last_assistant (#5821): when there is
+			// no readable assistant text, it returns an empty observation with
+			// page.items: [null].
+			if (operation === "session.last_assistant")
+				return {
+					ok: true,
+					result: {
+						page: {
+							items: [null],
 							complete: true,
 						},
 					},

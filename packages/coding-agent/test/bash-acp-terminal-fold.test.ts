@@ -331,7 +331,7 @@ describe("BashTool ACP terminal fold", () => {
 			release: async () => {},
 		};
 		const bridge: ClientBridge = { capabilities: { terminal: true }, createTerminal: async () => handle };
-		const h = makeHarness(bridge);
+		const h = makeHarness(bridge, { autoBackgroundEnabled: true, thresholdMs: 0 });
 		const tool = new BashTool(h.session);
 
 		const result = await tool.execute(
@@ -345,6 +345,32 @@ describe("BashTool ACP terminal fold", () => {
 		const text = h.delivered[0]?.text ?? "";
 		expect(text).toContain("polled diagnostics");
 		expect(text).toContain("Command timed out after 1 seconds");
+	});
+
+	it("returns an ACP timeout instead of timer-folding when auto-background is disabled", async () => {
+		let outputReads = 0;
+		const pendingOutput = Promise.withResolvers<ClientBridgeTerminalOutput>();
+		const pendingExit = Promise.withResolvers<ClientBridgeTerminalExitStatus>();
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-no-timer-fold",
+			waitForExit: () => pendingExit.promise,
+			currentOutput: async () => {
+				outputReads += 1;
+				if (outputReads === 1) return { output: "polled diagnostics\n", truncated: false };
+				return pendingOutput.promise;
+			},
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = { capabilities: { terminal: true }, createTerminal: async () => handle };
+		const h = makeHarness(bridge, { autoBackgroundEnabled: false });
+
+		await expect(
+			new BashTool(h.session).execute("call-no-timer-fold", {
+				command: "trap '' TERM; sleep 4; echo done",
+				timeout: 1,
+			}),
+		).rejects.toThrow("Command timed out after 1 seconds");
 	});
 
 	it("handles NUL-heavy ACP snapshots without quadratic delimiter search", async () => {

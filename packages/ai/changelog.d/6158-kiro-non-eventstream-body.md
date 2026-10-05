@@ -1,3 +1,0 @@
-### Fixed
-
-- A Kiro CodeWhisperer HTTP 200 response whose body is not an AWS event stream (for example a JSON or HTML error) now reports its status, content type, and the first 1000 characters of the body. Previously the body was parsed as event-stream frames and surfaced only as `eventstream: truncated message at end of stream`. The event-stream media type is matched case-insensitively, and the truncation error now reports how many trailing bytes were left (#6158). The error carries the `provider_protocol_mismatch` code, so session retry and managed fallback surface it instead of replaying the request.

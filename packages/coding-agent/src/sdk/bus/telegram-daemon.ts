@@ -71,6 +71,7 @@ export {
 	TELEGRAM_TRANSPORT_GENERATION,
 } from "./telegram-daemon-contract";
 
+import { POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY } from "../host/host";
 import {
 	type AgentDirSessionLifecycleService,
 	createSessionLifecycleService,
@@ -303,8 +304,9 @@ export const ASK_CONTROLS_CAPABILITY = "ask_controls_v1";
 export const TOOL_ACTIVITY_CAPABILITY = "tool_activity_v2";
 /** Receive-only compatibility capability for pre-v2 hosts. */
 export const LEGACY_TOOL_ACTIVITY_CAPABILITY = "tool_activity_v1";
-/** Opts notification adapters into positioned-only delivery for matching live effects. */
-export const POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY = "positioned_notification_effects_v1";
+/** Public `sdk/bus/telegram-daemon` path for the canonical `sdk/host` capability token. */
+export { POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY };
+
 type ToolActivityCapability = "v1" | "v2";
 
 function negotiateToolActivityCapability(

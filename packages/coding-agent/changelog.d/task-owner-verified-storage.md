@@ -1,0 +1,2 @@
+### Fixed
+- Validate logical task-owner deletion with immutable evidence, actual native retirement outcomes and live profile-wide sibling/protocol authentication before artifact effects. Deferred or already-retired owner flags no longer bypass that authority boundary; retained namespaces remain cleanup-pending. Evidence capture uses a path-backed reader without opening native recovery or advancing its reaper cursor on refusal.

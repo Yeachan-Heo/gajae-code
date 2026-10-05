@@ -19,6 +19,8 @@ interface HealthPayload {
 	ok?: unknown;
 	pid?: unknown;
 	port?: unknown;
+	status?: unknown;
+	service?: unknown;
 	version?: unknown;
 }
 
@@ -103,7 +105,10 @@ async function fetchJson(url: string, signal?: AbortSignal): Promise<unknown> {
 function isOpenCodexHealth(payload: unknown, expectedPort: number): boolean {
 	if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
 	const health = payload as HealthPayload;
-	return health.ok === true && health.version === "opencodex" && health.port === expectedPort;
+	const identityOk =
+		(health.ok === true && health.version === "opencodex") ||
+		(health.status === "ok" && health.service === "opencodex");
+	return identityOk && health.port === expectedPort;
 }
 
 export async function resolveOpenCodexEndpoint(signal?: AbortSignal): Promise<OpenCodexEndpoint | undefined> {
@@ -144,6 +149,7 @@ function normalizeModel(row: CatalogRow, endpoint: OpenCodexEndpoint): Model<"op
 		Array.isArray(modalities) && modalities.every(value => value === "text" || value === "image")
 			? modalities
 			: ["text"];
+	const reasoning = (row.reasoning ?? row.capabilities?.supports_reasoning) !== false;
 	return {
 		id: publicId,
 		wireModelId: rawId,
@@ -151,8 +157,8 @@ function normalizeModel(row: CatalogRow, endpoint: OpenCodexEndpoint): Model<"op
 		api: "openai-responses",
 		provider: "opencodex",
 		baseUrl: `${endpoint.baseUrl}/v1`,
-		compat: { supportsServiceTier: true },
-		reasoning: (row.reasoning ?? row.capabilities?.supports_reasoning) !== false,
+		compat: reasoning ? { supportsServiceTier: true, supportsReasoningEffort: true } : { supportsServiceTier: true },
+		reasoning,
 		input,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: asPositiveNumber(row.contextWindow ?? row.capabilities?.context_length, 128_000),

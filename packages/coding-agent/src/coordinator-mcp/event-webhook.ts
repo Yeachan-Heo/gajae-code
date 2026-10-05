@@ -116,6 +116,17 @@ function webhookEnvValue(explicitEnv: NodeJS.ProcessEnv | undefined, name: strin
 	return $credentialEnv(name)?.trim() || undefined;
 }
 
+// Number.parseInt reads a leading digit prefix ("1.5" -> 1, "1e4" -> 1,
+// "10s" -> 10), which would silently turn a timeout into one millisecond or a
+// retry budget into a single attempt. Only plain decimal digits count; anything
+// else falls back to the default, matching the coordinator policy env values.
+function boundedWebhookEnvInt(raw: string | undefined, fallback: number, max: number): number {
+	if (raw === undefined || !/^\d+$/.test(raw)) return fallback;
+	const parsed = Number.parseInt(raw, 10);
+	// An oversized digit string still means "as large as allowed", so it caps.
+	return parsed > 0 ? Math.min(parsed, max) : fallback;
+}
+
 export function parseEventWebhookConfig(explicitEnv?: NodeJS.ProcessEnv): EventWebhookConfig | null {
 	const rawUrl = webhookEnvValue(explicitEnv, "GJC_COORDINATOR_MCP_EVENT_WEBHOOK_URL");
 	if (!rawUrl) return null;
@@ -139,22 +150,16 @@ export function parseEventWebhookConfig(explicitEnv?: NodeJS.ProcessEnv): EventW
 		: null;
 	const tokenFile = webhookEnvValue(explicitEnv, "GJC_COORDINATOR_MCP_EVENT_WEBHOOK_TOKEN_FILE") ?? "";
 	if (tokenFile !== "" && !path.isAbsolute(tokenFile)) throw new Error("coordinator_event_webhook_token_file_invalid");
-	const timeoutRaw = Number.parseInt(
-		webhookEnvValue(explicitEnv, "GJC_COORDINATOR_MCP_EVENT_WEBHOOK_TIMEOUT_MS") ?? "",
-		10,
+	const timeoutMs = boundedWebhookEnvInt(
+		webhookEnvValue(explicitEnv, "GJC_COORDINATOR_MCP_EVENT_WEBHOOK_TIMEOUT_MS"),
+		DEFAULT_EVENT_WEBHOOK_TIMEOUT_MS,
+		MAX_EVENT_WEBHOOK_TIMEOUT_MS,
 	);
-	const timeoutMs =
-		Number.isFinite(timeoutRaw) && timeoutRaw > 0
-			? Math.min(timeoutRaw, MAX_EVENT_WEBHOOK_TIMEOUT_MS)
-			: DEFAULT_EVENT_WEBHOOK_TIMEOUT_MS;
-	const attemptsRaw = Number.parseInt(
-		webhookEnvValue(explicitEnv, "GJC_COORDINATOR_MCP_EVENT_WEBHOOK_MAX_ATTEMPTS") ?? "",
-		10,
+	const maxAttempts = boundedWebhookEnvInt(
+		webhookEnvValue(explicitEnv, "GJC_COORDINATOR_MCP_EVENT_WEBHOOK_MAX_ATTEMPTS"),
+		DEFAULT_EVENT_WEBHOOK_MAX_ATTEMPTS,
+		MAX_EVENT_WEBHOOK_MAX_ATTEMPTS,
 	);
-	const maxAttempts =
-		Number.isFinite(attemptsRaw) && attemptsRaw > 0
-			? Math.min(attemptsRaw, MAX_EVENT_WEBHOOK_MAX_ATTEMPTS)
-			: DEFAULT_EVENT_WEBHOOK_MAX_ATTEMPTS;
 	return { url: rawUrl, tokenFile: tokenFile || null, sessionIds, timeoutMs, maxAttempts };
 }
 

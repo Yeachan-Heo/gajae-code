@@ -764,6 +764,8 @@ export interface AgentStartEvent extends SharedAgentStartEvent {
 	sdkRunToken?: string;
 	/** Complete set of SDK queue owners consumed together by this run. */
 	sdkRunTokens?: string[];
+	/** Internal public lifecycle boundary; accepted retries with a suppressed predecessor end retain it. */
+	lifecycleScope?: AttemptScope;
 }
 
 /** Fired when an agent run fails before emitting agent_end. The error is the

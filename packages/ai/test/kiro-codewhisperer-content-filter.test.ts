@@ -161,8 +161,10 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 		expect(toolEventsBeforeError).toHaveLength(0);
 
 		// Should NOT have text or tool calls in final message
-		const textBlocks = (errorEvent?.message?.content ?? []).filter((b: unknown): boolean => typeof b === "object" && b !== null && "type" in b && (b as any).type === "text");
-		const toolCalls = (errorEvent?.message?.content ?? []).filter((b: unknown): boolean => typeof b === "object" && b !== null && "type" in b && (b as any).type === "toolCall");
+		const blockType = (b: unknown): unknown =>
+			typeof b === "object" && b !== null && "type" in b ? (b as { type: unknown }).type : undefined;
+		const textBlocks = (errorEvent?.message?.content ?? []).filter(b => blockType(b) === "text");
+		const toolCalls = (errorEvent?.message?.content ?? []).filter(b => blockType(b) === "toolCall");
 		expect(textBlocks.length).toBe(0);
 		expect(toolCalls.length).toBe(0);
 	});

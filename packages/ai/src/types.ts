@@ -881,6 +881,8 @@ export interface AssistantMessage {
 	 * supplied no trustworthy structured evidence.
 	 */
 	providerDiagnostic?: ProviderDiagnostic;
+	/** Redacted first-event transport timing and chunk-shape diagnostics for Google Gemini CLI. */
+	googleGeminiCliDiagnostics?: GoogleGeminiCliDiagnostics;
 	/** Typed upstream failure facts retained for retry classification without parsing errorMessage. */
 	transportFailure?: TransportFailureFacts;
 	/**
@@ -898,6 +900,20 @@ export interface AssistantMessage {
 	ttft?: number; // Time to first token in milliseconds
 	/** Prompt-prefix fingerprint of the request that produced this message. */
 	promptPrefix?: PromptPrefixTelemetry;
+}
+
+export interface GoogleGeminiCliDiagnostics {
+	responseAtMs?: number;
+	firstRawSseAtMs?: number;
+	chunkCounts: {
+		content: number;
+		thinking: number;
+		functionCall: number;
+		usageOnly: number;
+		other: number;
+	};
+	firstEventTimeoutMs?: number;
+	firstEventTimeoutSource?: "stream-option" | "env" | "idle-timeout" | "provider-fallback" | "default";
 }
 
 export interface ToolResultMessage<TDetails = any> {
@@ -1019,6 +1035,9 @@ export type TSchema = ZodType | TJsonSchema;
 export type Static<S> = S extends ZodType ? z.infer<S> : S extends { static: infer T } ? T : unknown;
 
 export type RawArgumentRejectionCode =
+	| "ask-question-body-required"
+	| "ask-deep-interview-metadata-required"
+	| "ask-deep-interview-single-question-required"
 	| "ask-deep-interview-question-body-required"
 	| "ask-intent-review-requires-positive-round"
 	| "ask-intent-contract-requires-non-empty-authority"

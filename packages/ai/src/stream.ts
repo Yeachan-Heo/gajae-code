@@ -1026,8 +1026,28 @@ function mapOptionsForApi<TApi extends Api>(
 			// For older models: use budget-based thinking
 			if (model.thinking?.mode === "anthropic-adaptive") {
 				const effort = mapEffortToAnthropicAdaptiveEffort(model, reasoning);
+
+				// Adaptive mode sends effort directly (no explicit budget_tokens).
+				// However, the thinking consumes tokens from the overall max_tokens budget.
+				// If max_tokens is capped at DEFAULT_REQUEST_MAX_TOKENS (32k),
+				// high/xhigh/max reasoning consumes all 32k, leaving no output tokens.
+				// Solution: when caller did not explicitly set maxTokens,
+				// increase the cap to model.maxTokens to allow room for output.
+				let adaptiveMaxTokens = base.maxTokens ?? model.maxTokens;
+				const hasExplicitMaxTokens = Number.isSafeInteger(options?.maxTokens) && (options?.maxTokens as number) > 0;
+				if (
+					!hasExplicitMaxTokens &&
+					adaptiveMaxTokens === DEFAULT_REQUEST_MAX_TOKENS &&
+					Number.isSafeInteger(model.maxTokens) &&
+					model.maxTokens > DEFAULT_REQUEST_MAX_TOKENS
+				) {
+					// Increase to model.maxTokens to leave room for both thinking and output
+					adaptiveMaxTokens = model.maxTokens;
+				}
+
 				return castApi<"anthropic-messages">({
 					...base,
+					maxTokens: adaptiveMaxTokens,
 					thinkingEnabled: true,
 					effort,
 					toolChoice: mapAnthropicToolChoice(options?.toolChoice),

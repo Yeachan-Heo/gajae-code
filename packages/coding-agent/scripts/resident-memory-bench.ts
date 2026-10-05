@@ -2,24 +2,25 @@
  * Pinned, child-isolated resident-cache benchmark.
  *
  * Each `--runs` repetition executes in a fresh Bun child. The default fixture is
- * 5,000 deterministic, unique 48 KiB messages; use the small overrides only for
- * local smoke checks, not performance comparisons.
+ * 500 deterministic, unique 48 KiB messages; it stays inside the product's
+ * eager-resume ceiling so a default run completes, and larger scales are explicit
+ * `--entries`/`--bytes-per-entry` overrides that fail closed above that ceiling.
  *
  * Normal measurements (five child runs per command):
- *   TMPDIR="$HOME/tmp-gjc-tests/" GJC_CODING_AGENT_DIR="$(mktemp -d)" NO_COLOR=1 bun packages/coding-agent/scripts/resident-memory-bench.ts --mode rss --runs 5
- *   TMPDIR="$HOME/tmp-gjc-tests/" GJC_CODING_AGENT_DIR="$(mktemp -d)" NO_COLOR=1 bun packages/coding-agent/scripts/resident-memory-bench.ts --mode put-latency --runs 5
- *   TMPDIR="$HOME/tmp-gjc-tests/" GJC_CODING_AGENT_DIR="$(mktemp -d)" NO_COLOR=1 bun packages/coding-agent/scripts/resident-memory-bench.ts --mode read-churn --runs 5
+ *   TMPDIR="$HOME/tmp-gjc-tests/" NO_COLOR=1 bun packages/coding-agent/scripts/resident-memory-bench.ts --mode rss --runs 5
+ *   TMPDIR="$HOME/tmp-gjc-tests/" NO_COLOR=1 bun packages/coding-agent/scripts/resident-memory-bench.ts --mode put-latency --runs 5
+ *   TMPDIR="$HOME/tmp-gjc-tests/" NO_COLOR=1 bun packages/coding-agent/scripts/resident-memory-bench.ts --mode read-churn --runs 5
  *
  * HEAD forced-rebuild baseline (copy this script to the pinned HEAD worktree):
  *   git worktree add /tmp/gjc-bench-head 3649db42e
- *   TMPDIR="$HOME/tmp-gjc-tests/" GJC_CODING_AGENT_DIR="$(mktemp -d)" NO_COLOR=1 bun packages/coding-agent/scripts/resident-memory-bench.ts --mode read-churn --baseline forced-rebuild --runs 5
+ *   TMPDIR="$HOME/tmp-gjc-tests/" NO_COLOR=1 bun packages/coding-agent/scripts/resident-memory-bench.ts --mode read-churn --baseline forced-rebuild --runs 5
  *
  * Small smoke fixture and deliberate invalid-run demonstration:
- *   TMPDIR="$HOME/tmp-gjc-tests/" GJC_CODING_AGENT_DIR="$(mktemp -d)" NO_COLOR=1 bun packages/coding-agent/scripts/resident-memory-bench.ts --mode rss --entries 8 --bytes-per-entry 4096 --runs 1
- *   TMPDIR="$HOME/tmp-gjc-tests/" GJC_CODING_AGENT_DIR="$(mktemp -d)" NO_COLOR=1 bun packages/coding-agent/scripts/resident-memory-bench.ts --mode put-latency --puts 64 --runs 1
- *   TMPDIR="$HOME/tmp-gjc-tests/" GJC_CODING_AGENT_DIR="$(mktemp -d)" NO_COLOR=1 bun packages/coding-agent/scripts/resident-memory-bench.ts --mode read-churn --entries 8 --bytes-per-entry 4096 --cache-cap-bytes 1024 --runs 1
- *   TMPDIR="$HOME/tmp-gjc-tests/" GJC_CODING_AGENT_DIR="$(mktemp -d)" NO_COLOR=1 bun packages/coding-agent/scripts/resident-memory-bench.ts --mode read-churn --entries 8 --bytes-per-entry 4096 --cache-cap-bytes 1024 --skip-gc --runs 1
- *   TMPDIR="$HOME/tmp-gjc-tests/" GJC_CODING_AGENT_DIR="$(mktemp -d)" NO_COLOR=1 bun packages/coding-agent/scripts/resident-memory-bench.ts --mode rss --force-memory-only --runs 1
+ *   TMPDIR="$HOME/tmp-gjc-tests/" NO_COLOR=1 bun packages/coding-agent/scripts/resident-memory-bench.ts --mode rss --entries 8 --bytes-per-entry 4096 --runs 1
+ *   TMPDIR="$HOME/tmp-gjc-tests/" NO_COLOR=1 bun packages/coding-agent/scripts/resident-memory-bench.ts --mode put-latency --puts 64 --runs 1
+ *   TMPDIR="$HOME/tmp-gjc-tests/" NO_COLOR=1 bun packages/coding-agent/scripts/resident-memory-bench.ts --mode read-churn --entries 8 --bytes-per-entry 4096 --cache-cap-bytes 1024 --runs 1
+ *   TMPDIR="$HOME/tmp-gjc-tests/" NO_COLOR=1 bun packages/coding-agent/scripts/resident-memory-bench.ts --mode read-churn --entries 8 --bytes-per-entry 4096 --cache-cap-bytes 1024 --skip-gc --runs 1
+ *   TMPDIR="$HOME/tmp-gjc-tests/" NO_COLOR=1 bun packages/coding-agent/scripts/resident-memory-bench.ts --mode rss --force-memory-only --runs 1
  *
  * `--skip-gc` deliberately bypasses the required turn boundary and forced GC;
  * the --skip-gc command must exit non-zero with the invalid-run diagnostic. Do not
@@ -28,9 +29,17 @@
  * exercise the existing fallback and is not a supported product configuration.
  * RSS mode reports append-phase and fresh-process reopen measurements with the full
  * `process.memoryUsage()` breakdown, plus repeated forced-GC idle-turn reclaim samples.
- * AC-1 passes only when append steady-state RSS delta stays within 100 MiB; a
- * post-reclaim result within that limit is separately labeled documented evidence. AC-2
- * measures direct `putSync` calls over pre-generated unique Buffers into a
+ * AC-1 passes only when all three ceilings hold: the append steady-state RSS delta stays
+ * within 100 MiB; the read-path residual (post-read forced-GC delta) stays within
+ * max(READ_PATH_RESIDUAL_FLOOR_BYTES, READ_PATH_RESIDUAL_TRANSCRIPT_RATIO_LIMIT x the
+ * fixture's persisted transcript); and the reclaim contract holds
+ * (RECLAIM_ALLOCATOR_FLOOR_BYTES, post-reclaim delta inside the append limit). A reclaim
+ * proof only excuses a steady-state miss: the read-path ceiling and the reclaim contract
+ * are hard gates, so a failed read path exits non-zero instead of being relabeled
+ * documented evidence. The harness always runs against its own throwaway agent dir, so
+ * nothing has to be pre-set, an ambient `GJC_CODING_AGENT_DIR` is ignored, and the
+ * operator's `~/.gjc` is never read; `GJC_RESIDENT_MEMORY_BENCH_AGENT_DIR` pins it.
+ * AC-2 measures direct `putSync` calls over pre-generated unique Buffers into a
  * canonical MemoryBlobStore and an adopted verified EphemeralBlobStore.
  * SessionManager append figures are separate `e2eAppend` diagnostics. A direct
  * store ratio above 1.5x is documented evidence, not a relaxation of the
@@ -43,6 +52,7 @@ import { createRequire, syncBuiltinESMExports } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import { EphemeralBlobStore, MemoryBlobStore, openVerifiedResidentCacheInstanceDir } from "../src/session/blob-store";
+import { MANAGED_ARTIFACT_MAX_FILE_BYTES } from "../src/session/internal/managed-session-storage";
 import type {
 	SessionManagerObservabilityStats,
 	SessionManager as SessionManagerType,
@@ -54,14 +64,50 @@ const { SessionManager } = sessionManagerModule;
 const SCHEMA_VERSION = 4;
 const SYNTHETIC_SEED = 0x5eedc0de;
 const DEFAULT_RUNS = 5;
-const RSS_ENTRY_COUNT = 5_000;
+/**
+ * Default fixture. It has to stay inside the eager-resume ceiling, and at the default
+ * scale the append steady state has to stay inside AC-1: the previous 5_000 x 48 KiB
+ * default persisted about 234 MiB, so every default run died with the product's
+ * oversized-transcript recovery message before it could report anything. Larger scales
+ * are explicit opt-in through `--entries`/`--bytes-per-entry`, bounded by
+ * `assertFixtureWithinEagerResumeCeiling`.
+ */
+const RSS_ENTRY_COUNT = 500;
 const RSS_BYTES_PER_ENTRY = 48 * 1024;
+/**
+ * The eager-resume ceiling the product enforces, imported rather than copied so a
+ * product-side change is reflected here instead of silently invalidating the fixture.
+ */
+const EAGER_RESUME_TRANSCRIPT_CEILING_BYTES = MANAGED_ARTIFACT_MAX_FILE_BYTES;
+/** Measured per-entry framing overhead of the persisted JSONL transcript. */
+const SYNTHETIC_ENTRY_OVERHEAD_BYTES = 160;
 const READ_CHURN_CYCLES = 100;
 const PUT_WARMUP_ITERATIONS = 1_000;
 const PUT_MEASURE_ITERATIONS = 10_000;
 const PUT_BYTES = 4 * 1024;
 const BASELINE_MARKER_BYTES = 128;
 const AC1_APPEND_PHASE_RSS_LIMIT_BYTES = 100 * 1024 * 1024;
+/**
+ * Read-path residual ceiling: after the read plus the forced-GC idle turns the append
+ * phase must not still hold more than `max(READ_PATH_RESIDUAL_FLOOR_BYTES, ratio x the
+ * fixture's persisted transcript)` above the pre-append baseline. Expressing the ceiling
+ * against the fixture keeps an `--entries` override from walking out from under it, and
+ * the absolute floor covers the part of the residual that does not scale with the
+ * fixture: on a tiny smoke fixture the forced-GC delta is a few MiB of ordinary runtime
+ * overhead, which a pure ratio would flag as a failure. AC-1 gates only the append steady
+ * state, so without this second ceiling a retention regression on the read path can keep
+ * a large block of RSS and still report pass. The current tree measures about 5x on the
+ * default fixture (about 121 MiB retained over a 24 MiB transcript).
+ */
+const READ_PATH_RESIDUAL_TRANSCRIPT_RATIO_LIMIT = 8;
+const READ_PATH_RESIDUAL_FLOOR_BYTES = 32 * 1024 * 1024;
+/**
+ * Bun's allocator retains freed pages, so the forced-GC reclaim returns nothing on this
+ * runtime. The floor is an explicit contract instead of an unexplained zero: the reclaim
+ * must never increase RSS, and the post-reclaim delta must stay inside the append limit,
+ * or the run fails closed.
+ */
+const RECLAIM_ALLOCATOR_FLOOR_BYTES = 0;
 const MEMORY_RECLAIM_GC_ROUNDS = 4;
 const SYNTHETIC_TEXT_PATTERN =
 	"gjc-resident-cache-fixture-abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789";
@@ -353,11 +399,34 @@ function parseArgs(argv: string[]): CliArgs {
 }
 
 function fixtureFor(args: CliArgs): FixtureDimensions {
-	return {
+	const fixture: FixtureDimensions = {
 		seed: SYNTHETIC_SEED,
 		entries: args.entries ?? RSS_ENTRY_COUNT,
 		bytesPerEntry: args.bytesPerEntry ?? RSS_BYTES_PER_ENTRY,
 	};
+	assertFixtureWithinEagerResumeCeiling(fixture);
+	return fixture;
+}
+
+/**
+ * Fail closed before the run instead of dying inside the product: a fixture whose
+ * persisted transcript exceeds the eager-resume ceiling cannot be re-opened by the
+ * fresh-open phase, and the failure otherwise surfaces as the product's oversized-
+ * transcript recovery message with no hint that the fixture size is the cause.
+ */
+/** Estimated persisted JSONL size of a fixture; the ceiling and read-path gates share it. */
+function estimatedTranscriptBytes(fixture: FixtureDimensions): number {
+	return fixture.entries * (fixture.bytesPerEntry + SYNTHETIC_ENTRY_OVERHEAD_BYTES);
+}
+
+function assertFixtureWithinEagerResumeCeiling(fixture: FixtureDimensions): void {
+	const estimatedBytes = estimatedTranscriptBytes(fixture);
+	if (estimatedBytes <= EAGER_RESUME_TRANSCRIPT_CEILING_BYTES) return;
+	const estimatedMiB = Math.round(estimatedBytes / (1024 * 1024));
+	const ceilingMiB = Math.round(EAGER_RESUME_TRANSCRIPT_CEILING_BYTES / (1024 * 1024));
+	throw new Error(
+		`--entries/--bytes-per-entry would persist about ${estimatedMiB} MiB of transcript, above the ${ceilingMiB} MiB eager-resume ceiling; lower the fixture so the fresh-open phase can re-open it.`,
+	);
 }
 
 function fixtureForMode(args: CliArgs): FixtureDimensions {
@@ -539,6 +608,34 @@ async function withPersistentFixture<T>(
 	}
 }
 
+/**
+ * The harness runs against its own throwaway agent dir so it never reads or writes the
+ * operator's `~/.gjc` — an ambient `GJC_CODING_AGENT_DIR` (an agent session exports one)
+ * must not redirect a benchmark into live state, and the resident-cache poison that
+ * `--force-memory-only` relies on is only meaningful in a fresh directory anyway.
+ * `GJC_RESIDENT_MEMORY_BENCH_AGENT_DIR` is the explicit opt-in for pinning the directory.
+ */
+let isolatedAgentDir: string | undefined;
+
+async function ensureIsolatedAgentDir(): Promise<void> {
+	const pinned = process.env.GJC_RESIDENT_MEMORY_BENCH_AGENT_DIR;
+	if (pinned) {
+		process.env.GJC_CODING_AGENT_DIR = pinned;
+		process.env.PI_CODING_AGENT_DIR ??= pinned;
+		return;
+	}
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-resident-memory-agent-"));
+	process.env.GJC_CODING_AGENT_DIR = dir;
+	process.env.PI_CODING_AGENT_DIR = dir;
+	isolatedAgentDir = dir;
+}
+
+async function cleanupIsolatedAgentDir(): Promise<void> {
+	const dir = isolatedAgentDir;
+	isolatedAgentDir = undefined;
+	if (dir) await fs.rm(dir, { recursive: true, force: true });
+}
+
 async function forceResidentCacheMemoryFallback(): Promise<void> {
 	const agentDir = process.env.GJC_CODING_AGENT_DIR;
 	if (!agentDir) throw new Error("--force-memory-only requires GJC_CODING_AGENT_DIR to be set.");
@@ -590,7 +687,10 @@ async function settleAndForceGcTwice(): Promise<void> {
 
 /**
  * Let the collector and allocator reclaim after an idle turn without injecting a
- * larger temporary allocation that itself becomes an RSS high-water artifact.
+ * larger temporary allocation that itself becomes an RSS high-water artifact. The
+ * allocator retains the pages it already mapped, so this is expected to release
+ * `RECLAIM_ALLOCATOR_FLOOR_BYTES`; the AC-1 report gates that contract instead of
+ * printing a bare zero.
  */
 async function reclaimAfterMemoryPressure(): Promise<MemoryPressureReclaim> {
 	for (let round = 0; round < MEMORY_RECLAIM_GC_ROUNDS; round++) {
@@ -635,6 +735,9 @@ async function runFreshOpenRss(args: CliArgs): Promise<FreshOpenRssWorkerResult>
 	try {
 		await settleFreshOpenRss();
 		const baseline = memorySample();
+		// `fixtureFor` already proved the persisted transcript stays under the eager-resume
+		// ceiling, so this is the ordinary resume path the product takes for a session a
+		// user would actually reopen.
 		manager = await SessionManager.open(sessionFile);
 		const postOpen = memorySample();
 		const diskBytes = await residentCacheDiskBytes();
@@ -1113,11 +1216,24 @@ function summarizeAc1(runs: readonly RssWorkerResult[]): {
 		postReclaimRssDelta: number;
 		classification: "documented-evidence";
 	};
+	readPathResidual: {
+		postReadGcRssDelta: number;
+		limitBytes: number;
+		floorBytes: number;
+		ratioLimit: number;
+		passes: boolean;
+	};
+	reclaimFloor: {
+		allocatorFloorBytes: number;
+		postReclaimWithinLimit: boolean;
+		passes: boolean;
+	};
 	verdict: "pass" | "documented-evidence-with-reclaim-proof" | "fail";
 } {
 	const appendSteadyDelta = summarize(runs.map(run => run.appendPhase.steadyStateDelta.rssBytes));
 	const postReclaimDelta = summarize(runs.map(run => run.appendPhase.postReclaimDelta.rssBytes));
 	const reclaimedBytes = summarize(runs.map(run => run.appendPhase.reclaimedBytes));
+	const readPathResidualDelta = summarize(runs.map(run => run.appendPhase.postReadGcDelta.rssBytes));
 	const steadyStateExternal = summarize(runs.map(run => run.appendPhase.steadyState.externalBytes));
 	const postReclaimExternal = summarize(runs.map(run => run.appendPhase.postReclaim.externalBytes));
 	const postReclaimExternalDelta = summarize(runs.map(run => run.appendPhase.postReclaimDelta.externalBytes));
@@ -1127,7 +1243,19 @@ function summarizeAc1(runs: readonly RssWorkerResult[]): {
 	const freshOpenRssDelta = summarize(runs.map(run => run.freshOpenPhase.steadyStateDelta.rssBytes));
 	const freshOpenPostReclaimRssDelta = summarize(runs.map(run => run.freshOpenPhase.postReclaimDelta.rssBytes));
 	const passesSteadyStateGate = appendSteadyDelta.median <= AC1_APPEND_PHASE_RSS_LIMIT_BYTES;
-	const hasReclaimProof = postReclaimDelta.median <= AC1_APPEND_PHASE_RSS_LIMIT_BYTES && reclaimedBytes.median > 0;
+	const readPathResidualLimitBytes = Math.max(
+		READ_PATH_RESIDUAL_FLOOR_BYTES,
+		estimatedTranscriptBytes(runs[0]?.fixture ?? { seed: SYNTHETIC_SEED, entries: 0, bytesPerEntry: 0 }) *
+			READ_PATH_RESIDUAL_TRANSCRIPT_RATIO_LIMIT,
+	);
+	const passesReadPathGate = readPathResidualDelta.median <= readPathResidualLimitBytes;
+	const postReclaimWithinLimit = postReclaimDelta.median <= AC1_APPEND_PHASE_RSS_LIMIT_BYTES;
+	const passesReclaimFloorGate = reclaimedBytes.median >= RECLAIM_ALLOCATOR_FLOOR_BYTES && postReclaimWithinLimit;
+	const hasReclaimProof = postReclaimWithinLimit && reclaimedBytes.median > 0;
+	// The reclaim proof excuses the steady-state ceiling only. The read-path ceiling and
+	// the reclaim contract are hard gates, so a proof must not relabel a failed read path
+	// as documented evidence and let the process exit zero.
+	const reclaimProofExcusesOnlySteadyState = hasReclaimProof && passesReadPathGate && passesReclaimFloorGate;
 	return {
 		appendSteadyDelta: appendSteadyDelta.median,
 		postReclaimDelta: postReclaimDelta.median,
@@ -1147,7 +1275,24 @@ function summarizeAc1(runs: readonly RssWorkerResult[]): {
 			postReclaimRssDelta: freshOpenPostReclaimRssDelta.median,
 			classification: "documented-evidence",
 		},
-		verdict: passesSteadyStateGate ? "pass" : hasReclaimProof ? "documented-evidence-with-reclaim-proof" : "fail",
+		readPathResidual: {
+			postReadGcRssDelta: readPathResidualDelta.median,
+			limitBytes: readPathResidualLimitBytes,
+			floorBytes: READ_PATH_RESIDUAL_FLOOR_BYTES,
+			ratioLimit: READ_PATH_RESIDUAL_TRANSCRIPT_RATIO_LIMIT,
+			passes: passesReadPathGate,
+		},
+		reclaimFloor: {
+			allocatorFloorBytes: RECLAIM_ALLOCATOR_FLOOR_BYTES,
+			postReclaimWithinLimit,
+			passes: passesReclaimFloorGate,
+		},
+		verdict:
+			passesSteadyStateGate && passesReadPathGate && passesReclaimFloorGate
+				? "pass"
+				: reclaimProofExcusesOnlySteadyState
+					? "documented-evidence-with-reclaim-proof"
+					: "fail",
 	};
 }
 
@@ -1323,6 +1468,10 @@ async function runParent(args: CliArgs): Promise<void> {
 		runResults: runs,
 	};
 	process.stdout.write(`${JSON.stringify(output)}\n`);
+	// A failed RSS acceptance verdict has to fail the process, otherwise the declared
+	// ceilings are only advisory and nothing downstream can gate on them.
+	if (args.mode === "rss" && (acceptanceReport as { ac1: { verdict: string } }).ac1.verdict === "fail")
+		process.exitCode = 1;
 }
 
 async function main(): Promise<void> {
@@ -1332,7 +1481,12 @@ async function main(): Promise<void> {
 		process.stdout.write(`${JSON.stringify(result)}\n`);
 		return;
 	}
-	await runParent(args);
+	await ensureIsolatedAgentDir();
+	try {
+		await runParent(args);
+	} finally {
+		await cleanupIsolatedAgentDir();
+	}
 }
 
 await main().catch(error => {

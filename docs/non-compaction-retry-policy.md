@@ -51,11 +51,11 @@ Managed fallback uses structured transport facts and typed provider error codes 
 A session with no explicit `retry.*` settings and a single-model default role (no managed fallback) does not use the classification list above on its own. It admits only these content-free failures:
 
 - canonical first-event and idle-stream watchdog aborts, recognized from the typed timeout fact or an exact canonical sentinel message
-- the OpenAI Codex `server_is_overloaded` event, recognized from that provider's typed overload code
+- the OpenAI Codex `server_is_overloaded`, `server_error`, and `internal_error` events, recognized from that provider's typed code or the exact canonical `Codex error event … (code=<code>)` message with no conflicting transport facts. Explicit Codex terminal vetoes (for example `invalid_prompt` or `invalid_function_parameters`, including a `server_error` whose message carries `Request blocked (code=invalid_prompt)`) and terminal-error wording are never admitted, on this path or under configured `retry.*` settings
 - the generic OpenAI Responses `server_is_overloaded` terminal envelope, recognized from the exact statusless `openaiErrorCode` and matching `providerCode`
 - Anthropic's typed `overloaded_error` envelope, recognized by parsing the error envelope and requiring both the outer `type` and the nested `error.type` to match
 
-Overload admissions therefore require a provider-specific typed signature, while watchdog admissions accept only their canonical sentinel messages. Every admission additionally requires that the attempt carry no assistant text, thinking, or tool call and no conflicting transport facts; a status-bearing or otherwise typed failure surfaces instead. Untyped or noncanonical overload and timeout wording never authorizes a replay.
+Overload and Codex server/internal-error admissions therefore require a provider-specific typed signature (or, for Codex, its exact canonical error-event message), while watchdog admissions accept only their canonical sentinel messages. Every admission additionally requires that the attempt carry no assistant text, thinking, or tool call and no conflicting transport facts; a status-bearing or otherwise typed failure surfaces instead. Untyped or noncanonical overload and timeout wording never authorizes a replay.
 
 ### Local snapshot failures (surface immediately, no retry)
 
@@ -169,8 +169,10 @@ If abort hits while sleeping, catch path emits:
 
 On `auto_retry_start`, EventController:
 
-- swaps `Esc` handler to `session.abortRetry()`
-- renders loader text: `Retrying (attempt/maxAttempts) in Ns… (esc to cancel)`
+- installs a backoff interrupt handler: the first `Esc` calls `session.retryNow()`; a second interrupt while backoff remains active calls `session.abortRetry()`
+- renders a countdown with `(esc to retry now)`
+
+A focused ordinary menu receives interrupt/back first: dismissing it neither skips backoff nor primes retry cancellation. Once the menu closes, the next interrupt starts the retry gesture. Ctrl+C remains a global cancellation action. Hook workflow dialogs retain their separate workflow-interrupt policy; inline hook input handles Escape locally.
 
 On `auto_retry_end`, it restores prior `Esc` handler and clears loader state.
 
@@ -242,7 +244,7 @@ Retry stops and will not auto-continue when any of these occur:
 - error is not retry-classified
 - error is context overflow (delegated to compaction path)
 - max retries exceeded
-- user cancels retry through the session/SDK action or `Esc` during retry loader
+- user cancels retry through the session/SDK action, Ctrl+C, or the second interrupt while retry backoff is still active and no ordinary menu owns the key
 - global abort (`abort`) cancels retry first
 
 A new retry chain can still start later on a future retryable error after counters reset.

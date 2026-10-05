@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Effort, enrichModelThinking, getSupportedEfforts } from "@gajae-code/ai/model-thinking";
 import {
 	checkOpenCodexStatus,
 	fetchOpenCodexModels,
@@ -25,6 +26,74 @@ afterEach(async () => {
 });
 
 describe("OpenCodex discovery", () => {
+	test("accepts the ocx 2.75 health contract", async () => {
+		const calls: string[] = [];
+		spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(
+				async (input: string | Request | URL) => {
+					const url = String(input);
+					calls.push(url);
+					if (url.endsWith("/healthz"))
+						return Response.json({ status: "ok", service: "opencodex", version: "2.75.0", port: 10100 });
+					return Response.json([{ id: "provider/model" }]);
+				},
+				{ preconnect: originalFetch.preconnect },
+			),
+		);
+
+		const models = await fetchOpenCodexModels();
+		expect(models).toHaveLength(1);
+		expect(calls).toEqual(["http://127.0.0.1:10100/healthz", "http://127.0.0.1:10100/v1/models"]);
+	});
+
+	test("rejects a health response with a foreign service", async () => {
+		const calls: string[] = [];
+		spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(
+				async (input: string | Request | URL) => {
+					calls.push(String(input));
+					return Response.json({ status: "ok", service: "other", port: 10100 });
+				},
+				{ preconnect: originalFetch.preconnect },
+			),
+		);
+
+		expect(await resolveOpenCodexEndpoint()).toBeUndefined();
+		expect(calls).toEqual(["http://127.0.0.1:10100/healthz"]);
+	});
+
+	test("rejects the ocx 2.75 health contract with a mismatched port", async () => {
+		const calls: string[] = [];
+		spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(
+				async (input: string | Request | URL) => {
+					calls.push(String(input));
+					return Response.json({ status: "ok", service: "opencodex", version: "2.75.0", port: 10201 });
+				},
+				{ preconnect: originalFetch.preconnect },
+			),
+		);
+
+		expect(await resolveOpenCodexEndpoint()).toBeUndefined();
+		expect(calls).toEqual(["http://127.0.0.1:10100/healthz"]);
+	});
+
+	test("rejects the status health contract without a service", async () => {
+		const calls: string[] = [];
+		spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(
+				async (input: string | Request | URL) => {
+					calls.push(String(input));
+					return Response.json({ status: "ok", port: 10100 });
+				},
+				{ preconnect: originalFetch.preconnect },
+			),
+		);
+
+		expect(await resolveOpenCodexEndpoint()).toBeUndefined();
+		expect(calls).toEqual(["http://127.0.0.1:10100/healthz"]);
+	});
+
 	test("uses the public catalog without management credentials and retains capabilities", async () => {
 		const calls: string[] = [];
 		spyOn(globalThis, "fetch").mockImplementation(
@@ -66,6 +135,34 @@ describe("OpenCodex discovery", () => {
 			reasoning: true,
 		});
 		expect(models?.[1]).toMatchObject({ wireModelId: "gpt-5.6-terra", reasoning: false });
+	});
+
+	test("exposes thinking efforts only for reasoning models", async () => {
+		spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(
+				async (input: string | Request | URL) => {
+					const url = String(input);
+					if (url.endsWith("/healthz")) return Response.json({ ok: true, version: "opencodex", port: 10100 });
+					return Response.json({
+						data: [
+							{ id: "gpt-6.1-sol@acct-b", reasoning: true },
+							{ id: "gpt-6.1-chat@acct-b", reasoning: false },
+						],
+					});
+				},
+				{ preconnect: originalFetch.preconnect },
+			),
+		);
+
+		const models = await fetchOpenCodexModels();
+		const reasoningModel = models?.find(model => model.wireModelId === "gpt-6.1-sol@acct-b");
+		const nonReasoningModel = models?.find(model => model.wireModelId === "gpt-6.1-chat@acct-b");
+		expect(reasoningModel).toBeDefined();
+		expect(nonReasoningModel).toBeDefined();
+		expect(reasoningModel?.compat).toEqual({ supportsServiceTier: true, supportsReasoningEffort: true });
+		expect(nonReasoningModel?.compat).toEqual({ supportsServiceTier: true });
+		expect(getSupportedEfforts(enrichModelThinking(reasoningModel!))).toContain(Effort.High);
+		expect(getSupportedEfforts(enrichModelThinking(nonReasoningModel!))).toEqual([]);
 	});
 
 	test("prefers runtime metadata before the default port and preserves raw model ids", async () => {

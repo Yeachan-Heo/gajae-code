@@ -265,6 +265,96 @@ class FakeSdkClient implements SessionRouterClient {
 	}
 }
 
+/**
+ * Drives one lean final answer through the production host into a real chat
+ * runtime and returns how many provider posts carry it. The host emits every
+ * turn_stream on a positioned leg and a raw native leg, excluding from the raw
+ * leg only connections that negotiated positioned-only notification effects. A
+ * lean final carries no messageRef, so a daemon that receives both legs has no
+ * shared identity to collapse them into one post.
+ */
+async function deliverLeanFinalThroughProductionHost(
+	root: string,
+	kind: "slack" | "discord",
+	finalText: string,
+): Promise<number> {
+	const agentDir = path.join(root, ".gjc", "agent");
+	const host = await startProductionSdkHost(root);
+	const index = await new SessionIndex(agentDir).open();
+	const slackProvider = new FakeSlackProvider();
+	const discordProvider = new FakeDiscordProvider();
+	const notifications =
+		kind === "slack"
+			? {
+					slack: {
+						botToken: "bot-token",
+						appToken: "app-token",
+						workspaceId: "team",
+						channelId: "channel",
+						authorizedUserId: "human",
+					},
+				}
+			: {
+					discord: {
+						botToken: "discord-token",
+						applicationId: discordProvider.applicationId,
+						guildId: "guild",
+						parentChannelId: "parent",
+					},
+				};
+	const runtime = new ChatDaemonRuntime(
+		{
+			kind,
+			agentDir,
+			config: { identity: "fingerprint-only", presentation: { redact: false, verbosity: "lean" }, notifications },
+		},
+		{
+			createSlackProvider: () => slackProvider,
+			createDiscordProvider: () => discordProvider,
+			routerDeps: {
+				createIndex: () => index,
+				setInterval: (() => 0) as unknown as typeof setInterval,
+				clearInterval: (() => {}) as typeof clearInterval,
+			},
+		},
+	);
+	const count = (): number =>
+		kind === "slack"
+			? slackProvider.posts.filter(post => post.text.includes(finalText)).length
+			: discordProvider.messages.filter(message => message.content.includes(finalText)).length;
+	try {
+		await index.append({
+			type: "host_registered",
+			sessionId: host.sessionId,
+			locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+			endpointGeneration: 1,
+			pid: host.endpoint.pid,
+			endpointMtimeMs: host.endpointMtimeMs,
+		});
+		await withStageTimeout(`${kind} runtime start`, runtime.start());
+		await withStageTimeout(`${kind} runtime admission`, runtime.reconcile({ waitForReplay: true }));
+		const runner = host.session.extensionRunner;
+		const assistant = { role: "assistant", content: finalText };
+		await runner?.emit({ type: "agent_start" });
+		await runner?.emit({ type: "message_end", message: assistant } as never);
+		await runner?.emit({ type: "turn_end", turnIndex: 0, message: assistant } as never);
+		await runner?.emit({
+			type: "agent_end",
+			stopReason: "completed",
+			messages: [{ role: "assistant", stopReason: "stop" }],
+		} as never);
+		const deadline = Date.now() + 10_000;
+		while (count() < 1 && Date.now() < deadline) await Bun.sleep(10);
+		// Both host legs land within milliseconds; leave room for a second
+		// representation to arrive before asserting that it never does.
+		await Bun.sleep(500);
+		await withStageTimeout(`${kind} runtime stop`, runtime.stop());
+	} finally {
+		await withStageTimeout("production SDK host stop", host.stop());
+	}
+	return count();
+}
+
 describe("chat daemon worker", () => {
 	let root = "";
 	afterEach(async () => {
@@ -1706,6 +1796,26 @@ describe("chat daemon worker", () => {
 			} finally {
 				await withStageTimeout("production SDK host stop", host.stop());
 			}
+		},
+		60_000,
+	);
+
+	it.skipIf(skipProductionSessionHost)(
+		"posts a lean final answer from the production host to Slack exactly once",
+		async () => {
+			root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-slack-lean-final-"));
+			const posts = await deliverLeanFinalThroughProductionHost(root, "slack", "Lean Slack final answer.");
+			expect(posts).toBe(1);
+		},
+		60_000,
+	);
+
+	it.skipIf(skipProductionSessionHost)(
+		"posts a lean final answer from the production host to Discord exactly once",
+		async () => {
+			root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-discord-lean-final-"));
+			const posts = await deliverLeanFinalThroughProductionHost(root, "discord", "Lean Discord final answer.");
+			expect(posts).toBe(1);
 		},
 		60_000,
 	);

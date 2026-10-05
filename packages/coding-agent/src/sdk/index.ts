@@ -21,6 +21,7 @@ export type {
 	TrackedSendUserMessageOptions,
 } from "../session/agent-session";
 export * as bus from "./bus";
+export * from "./diagnostics/observe-broker";
 export * as host from "./host";
 export * as lifecycle from "./lifecycle";
 export * as mcp from "./mcp";

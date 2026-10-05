@@ -4,7 +4,10 @@ import { validateToolArguments } from "@gajae-code/ai/utils/validation";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { AppendOrMergeResult } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
 import * as deepInterviewRecorder from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
+import * as deepInterviewRuntime from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import { deepInterviewCharacterCount } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
+import type { DeepInterviewExecutionApprovalRecord } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
+import * as stateRuntime from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 import { getThemeByName, initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type {
 	AskAnswerRequest,
@@ -21,8 +24,11 @@ import {
 	MAX_ASK_ANSWER_DEADLINE_MS,
 	resolveAskAnswerDeadlineMs,
 } from "@gajae-code/coding-agent/tools/ask";
+import type { AskToolInput } from "@gajae-code/coding-agent/tools/ask-contract";
 import { ToolAbortError } from "@gajae-code/coding-agent/tools/tool-errors";
 import { logger } from "@gajae-code/utils";
+import type { OpenGateInput } from "../../src/modes/shared/agent-wire/workflow-gate-broker";
+import type { WorkflowGate } from "../../src/modes/shared/agent-wire/workflow-gate-types";
 
 function createSession(overrides: Partial<ToolSession> = {}): ToolSession {
 	return {
@@ -102,6 +108,113 @@ function singleDeepInterviewQuestion() {
 		deepInterview: deepInterviewMeta(),
 	};
 }
+
+describe("AskTool execution integrity", () => {
+	it("rejects empty ordinary bodies before local or remote UI side effects", async () => {
+		const select = vi.fn(async () => "yes");
+		const awaitAnswer = vi.fn(async () => "yes");
+		const tool = new AskTool(createSession({ getAskAnswerSource: () => ({ awaitAnswer }) }));
+		for (const question of ["", " \t\n"]) {
+			await expect(
+				tool.execute(
+					"blank",
+					{ questions: [{ id: "metadata", question, options: [] }] },
+					undefined,
+					undefined,
+					createContext({ select }),
+				),
+			).rejects.toThrow("remove empty extra questions");
+		}
+		expect(select).not.toHaveBeenCalled();
+		expect(awaitAnswer).not.toHaveBeenCalled();
+	});
+
+	it("rejects encoded interview defects before selector, answer registration, gate or recorder", async () => {
+		const select = vi.fn(async () => "Yes");
+		const awaitAnswer = vi.fn(async () => "Yes");
+		const getAskAnswerSource = vi.fn(() => ({ awaitAnswer }));
+		const emitGate = vi.fn(async () => ({ selected: ["Yes"] }));
+		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound");
+		const tool = new AskTool(
+			createSession({
+				getDeepInterviewAskStage: () => "topology",
+				getAskAnswerSource,
+				getWorkflowGateEmitter: () => ({ supportsRemoteGateAnswers: () => true, emitGate }),
+			}),
+		);
+		const question = { id: "q", question: "Continue?", options: [{ label: "Yes" }] };
+		for (const questions of [
+			[question],
+			[{ ...question, deepInterview: null }],
+			[question, { id: "metadata", question: " \t\n", options: [] }],
+		]) {
+			const malformed = { questions: JSON.stringify(questions) } as unknown as AskToolInput;
+			await expect(
+				tool.execute("encoded-defect", malformed, undefined, undefined, createContext({ select })),
+			).rejects.toThrow("raw arguments rejected before coercion");
+		}
+		expect(select).not.toHaveBeenCalled();
+		expect(getAskAnswerSource).not.toHaveBeenCalled();
+		expect(awaitAnswer).not.toHaveBeenCalled();
+		expect(emitGate).not.toHaveBeenCalled();
+		expect(recorder).not.toHaveBeenCalled();
+	});
+
+	it("preserves ordinary multi-question free-text answers", async () => {
+		let answerIndex = 0;
+		const answers = ["SDK only", "No shell"];
+		const tool = new AskTool(createSession());
+		const result = await tool.execute(
+			"ordinary-free",
+			{
+				questions: [
+					{ id: "first", question: "Name the first boundary", options: [] },
+					{ id: "second", question: "Name the second boundary", options: [] },
+				],
+			},
+			undefined,
+			undefined,
+			createContext({
+				select: async (_prompt, options) => options.find(option => option.includes("Other")),
+				editor: async () => answers[answerIndex++],
+			}),
+		);
+		expect(result.details?.results?.map(answer => answer.customInput)).toEqual(["SDK only", "No shell"]);
+	});
+
+	it("rechecks the current phase before opening a previously validated ask", async () => {
+		let stage: "topology" | "post-topology" = "topology";
+		const select = vi.fn(async () => "Looks right");
+		const tool = new AskTool(createSession({ getDeepInterviewAskStage: () => stage }));
+		const payload = {
+			questions: [
+				{
+					id: "topology",
+					question: "Confirm scope?",
+					options: [{ label: "Looks right" }],
+					deepInterview: {
+						round: 0,
+						component: "review-topology",
+						dimension: "topology",
+						ambiguity: 1,
+						intent_contract: {
+							items: [{ id: "artifact:report", category: "artifact", statement: "Produce report" }],
+							confirmation_options: ["Looks right"],
+						},
+					},
+				},
+			],
+		};
+		const parsed = askSchema.parse(
+			validateToolArguments(tool, { type: "toolCall", id: "phase-race", name: "ask", arguments: payload }),
+		);
+		stage = "post-topology";
+		await expect(tool.execute("phase-race", parsed, undefined, undefined, createContext({ select }))).rejects.toThrow(
+			'Validation failed for tool "ask"',
+		);
+		expect(select).not.toHaveBeenCalled();
+	});
+});
 
 describe("AskTool cancellation", () => {
 	it("aborts a headless foreground turn when the remote ask is cancelled", async () => {
@@ -1256,7 +1369,10 @@ describe("AskTool remote semantic settlements", () => {
 					questions: [
 						{
 							id: "q",
-							question: mode === "clarification" ? "Round 1 | Scope | Ambiguity: 50%" : "Choose",
+							question:
+								mode === "clarification"
+									? "Round 1 | Scope | Ambiguity: 50%\n\nWhich constraint matters most?"
+									: "Choose",
 							options: [{ label: "alpha" }, { label: "beta" }],
 							recommended: 1,
 							deepInterview: mode === "clarification" ? deepInterviewMeta() : undefined,
@@ -2752,43 +2868,46 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(warn).toHaveBeenCalledWith(expect.stringContaining("deep-interview round recording failed"));
 	});
 
-	it("preserves a foreign workflow answer without writing its deep-interview metadata", async () => {
+	it("rejects foreign workflow metadata before opening a selector or recording consent", async () => {
 		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound");
 		const tool = new AskTool(
 			createSession({ getSessionId: () => "session-ask", getDeepInterviewAskStage: () => "post-topology" }),
 		);
-		const context = createContext({ select: async (_prompt, options) => options[0] });
+		const select = vi.fn(async (_prompt: string, options: string[]) => options[0]);
+		const context = createContext({ select });
 
-		const result = await tool.execute(
-			"call-foreign-workflow-metadata",
-			{
-				questions: [
-					{
-						id: "ralplan-approval",
-						question: "Approve the plan?",
-						options: [{ label: "Approve" }, { label: "Revise" }],
-						workflowGate: { stage: "ralplan", kind: "approval" },
-						deepInterview: {
-							round: 0,
-							component: "review-topology",
-							dimension: "topology",
-							ambiguity: 0,
-							intent_contract: {
-								items: [
-									{ id: "artifact:foreign-plan", category: "artifact", statement: "Execute foreign plan" },
-								],
-								confirmation_options: ["Approve"],
+		await expect(
+			tool.execute(
+				"call-foreign-workflow-metadata",
+				{
+					questions: [
+						{
+							id: "ralplan-approval",
+							question: "Approve the plan?",
+							options: [{ label: "Approve" }, { label: "Revise" }],
+							workflowGate: { stage: "ralplan", kind: "approval" },
+							deepInterview: {
+								round: 0,
+								component: "review-topology",
+								dimension: "topology",
+								ambiguity: 0,
+								intent_contract: {
+									items: [
+										{ id: "artifact:foreign-plan", category: "artifact", statement: "Execute foreign plan" },
+									],
+									confirmation_options: ["Approve"],
+								},
 							},
 						},
-					},
-				],
-			},
-			undefined,
-			undefined,
-			context,
-		);
+					],
+				},
+				undefined,
+				undefined,
+				context,
+			),
+		).rejects.toThrow("deepInterview metadata cannot be combined with a non-deep-interview workflowGate");
 
-		expect(result.content[0]).toMatchObject({ type: "text", text: "User selected: Approve" });
+		expect(select).not.toHaveBeenCalled();
 		expect(recorder).not.toHaveBeenCalled();
 	});
 
@@ -2810,6 +2929,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 	});
 
 	it("does not synthesize or record intent authorization on ask timeout", async () => {
+		let stage: "topology" | "post-topology" = "topology";
 		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
 			action: "created",
 			record: {} as AppendOrMergeResult["record"],
@@ -2818,7 +2938,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 			createSession({
 				settings: Settings.isolated({ "ask.timeout": 0.001 }),
 				getSessionId: () => "session-ask",
-				getDeepInterviewAskStage: () => "post-topology",
+				getDeepInterviewAskStage: () => stage,
 			}),
 		);
 		const context = createContext({
@@ -2852,6 +2972,8 @@ describe("AskTool deep-interview recorder persistence", () => {
 			context,
 		);
 		expect(contractResult.details?.selectedOptions).toEqual([]);
+		// A separate, already-confirmed interview exposes the review phase.
+		stage = "post-topology";
 		const reviewQuestion = {
 			id: "intent-review-timeout",
 			question: "Approve reduction",
@@ -2885,6 +3007,13 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(recorder).not.toHaveBeenCalled();
 	});
 	it("does not auto-select a ralplan approval gate on ask timeout", async () => {
+		spyOn(stateRuntime, "captureExecutionApprovalPresentation").mockResolvedValue({
+			state_path: "/tmp/timeout-state.json",
+			state_revision: 1,
+			artifact_path: "/tmp/timeout-artifact.md",
+			artifact_sha256: "b".repeat(64),
+			run_id: null,
+		});
 		const tool = new AskTool(
 			createSession({
 				settings: Settings.isolated({ "ask.timeout": 0.001 }),
@@ -2947,13 +3076,236 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(result.details?.selectedOptions).toEqual([]);
 	});
 
-	it("discards focused intent choices before multi-question timeout navigation", async () => {
+	it("mints execution approval only from an accepted structured user choice", async () => {
+		spyOn(stateRuntime, "executionApprovalLineage").mockResolvedValue("crystal");
+		spyOn(stateRuntime, "captureExecutionApprovalPresentation").mockResolvedValue({
+			state_path: "/tmp/approval-state.json",
+			state_revision: 1,
+			artifact_path: "/tmp/approval-spec.md",
+			artifact_sha256: "b".repeat(64),
+			run_id: null,
+		});
+		spyOn(stateRuntime, "revokeNonCrystalExecutionApproval").mockResolvedValue();
+		spyOn(deepInterviewRuntime, "assertDeepInterviewCrystalCoversLiveTranscript").mockResolvedValue({
+			transcriptPath: "/tmp/session.jsonl",
+			transcriptSha256: "a".repeat(64),
+		});
+		const record = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
+			path: "/tmp/deep-interview-execution-approval.json",
+			record: {
+				transcript_boundary: { byte_length: 1, device: "1", inode: "1", leaf_id: null },
+			} as DeepInterviewExecutionApprovalRecord,
+		});
+		const revoke = spyOn(stateRuntime, "revokeDeepInterviewExecutionApproval").mockResolvedValue();
+		const question = {
+			id: "deep-interview-execution",
+			question: "Choose the execution path",
+			options: [{ label: "Execute with ultragoal" }, { label: "Stop here" }],
+			workflowGate: { stage: "deep-interview", kind: "execution" } as const,
+		};
+		const local = await new AskTool(
+			createSession({ cwd: "/tmp/approval-local", getSessionId: () => "approval-local" }),
+		).execute(
+			"local-execution-choice",
+			{ questions: [question] },
+			undefined,
+			undefined,
+			createContext({
+				select: async () => "Execute with ultragoal",
+			}),
+		);
+		expect(local.details?.selectedOptions).toEqual(["Execute with ultragoal"]);
+		expect(record).toHaveBeenCalledTimes(1);
+		expect(record.mock.calls[0]?.[0]).toMatchObject({
+			sessionId: "approval-local",
+			questionId: "deep-interview-execution",
+			target: "ultragoal",
+		});
+		const localGateId = record.mock.calls[0]?.[0].gateId;
+		expect(localGateId).not.toBe("deep-interview-execution");
+
+		record.mockClear();
+		const emitter = {
+			supportsRemoteGateAnswers: () => true,
+			emitGate: vi.fn(async () => ({ selected: ["Execute with ultragoal"] })),
+		};
+		const remote = await new AskTool(
+			createSession({
+				cwd: "/tmp/approval-remote",
+				hasUI: false,
+				getSessionId: () => "approval-remote",
+				getWorkflowGateEmitter: () => emitter,
+			} as Partial<ToolSession>),
+		).execute("remote-execution-choice", { questions: [question] }, undefined, undefined, undefined);
+		expect(remote.details?.selectedOptions).toEqual(["Execute with ultragoal"]);
+		expect(emitter.emitGate).toHaveBeenCalledWith(
+			expect.objectContaining({ stage: "deep-interview", kind: "execution" }),
+		);
+		expect(record).toHaveBeenCalledTimes(1);
+		expect(record.mock.calls[0]?.[0]).toMatchObject({
+			sessionId: "approval-remote",
+			questionId: "deep-interview-execution",
+			target: "ultragoal",
+		});
+		expect(record.mock.calls[0]?.[0].gateId).not.toBe("deep-interview-execution");
+		expect(record.mock.calls[0]?.[0].gateId).not.toBe(localGateId);
+		record.mockClear();
+		const documentedLabel =
+			"Execute with ultragoal (only when spec is already implementation-ready and really simple)";
+		await new AskTool(
+			createSession({ cwd: "/tmp/approval-documented", getSessionId: () => "approval-documented" }),
+		).execute(
+			"documented-execution-choice",
+			{
+				questions: [
+					{
+						...question,
+						options: [{ label: documentedLabel }, { label: "Stop here" }],
+					},
+				],
+			},
+			undefined,
+			undefined,
+			createContext({ select: async () => documentedLabel }),
+		);
+		expect(record).toHaveBeenCalledTimes(1);
+
+		await new AskTool(
+			createSession({ cwd: "/tmp/approval-decline", getSessionId: () => "approval-decline" }),
+		).execute(
+			"decline-execution-choice",
+			{ questions: [question] },
+			undefined,
+			undefined,
+			createContext({ select: async () => "Stop here" }),
+		);
+		expect(revoke).toHaveBeenCalledWith("/tmp/approval-decline", "approval-decline");
+	});
+
+	it("aborts approval when publication capture fails", async () => {
+		spyOn(stateRuntime, "captureExecutionApprovalPresentation").mockRejectedValue(
+			new Error("publication changed while awaiting consent"),
+		);
+		const record = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
+			path: "/tmp/should-not-record.json",
+			record: {
+				transcript_boundary: { byte_length: 1, device: "1", inode: "1", leaf_id: null },
+			} as DeepInterviewExecutionApprovalRecord,
+		});
+		await expect(
+			new AskTool(
+				createSession({ cwd: "/tmp/approval-capture-failure", getSessionId: () => "capture-failure" }),
+			).execute(
+				"capture-failure-call",
+				{
+					questions: [
+						{
+							id: "capture-failure-question",
+							question: "Approve the published specification?",
+							options: [{ label: "Execute with ultragoal" }, { label: "Stop here" }],
+							workflowGate: { stage: "deep-interview", kind: "execution" },
+						},
+					],
+				},
+				undefined,
+				undefined,
+				createContext({ select: async () => "Execute with ultragoal" }),
+			),
+		).rejects.toThrow("publication could not be authenticated");
+		expect(record).not.toHaveBeenCalled();
+	});
+
+	it("does not mint execution approval after a multi-question choice is revised", async () => {
+		spyOn(stateRuntime, "captureExecutionApprovalPresentation").mockResolvedValue({
+			state_path: "/tmp/revised-state.json",
+			state_revision: 1,
+			artifact_path: "/tmp/revised-artifact.md",
+			artifact_sha256: "b".repeat(64),
+			run_id: null,
+		});
+		const record = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
+			path: "/tmp/deep-interview-execution-approval.json",
+			record: {
+				transcript_boundary: { byte_length: 1, device: "1", inode: "1", leaf_id: null },
+			} as DeepInterviewExecutionApprovalRecord,
+		});
+		let executionVisits = 0;
+		let confirmationVisits = 0;
+		const context = createContext({
+			select: async (prompt, _options, dialogOptions) => {
+				if (prompt.includes("Choose the execution path")) {
+					executionVisits += 1;
+					return executionVisits === 1 ? "Execute with ultragoal" : "Stop here";
+				}
+				confirmationVisits += 1;
+				if (confirmationVisits === 1) {
+					dialogOptions?.onLeft?.();
+					return undefined;
+				}
+				return "Done";
+			},
+		});
+		await new AskTool(
+			createSession({ cwd: "/tmp/approval-revised", getSessionId: () => "approval-revised" }),
+		).execute(
+			"revised-execution-choice",
+			{
+				questions: [
+					{
+						id: "deep-interview-execution-revised",
+						question: "Choose the execution path",
+						options: [{ label: "Execute with ultragoal" }, { label: "Stop here" }],
+						workflowGate: { stage: "deep-interview", kind: "execution" },
+					},
+					{ id: "confirmation", question: "Confirm?", options: [{ label: "Done" }] },
+				],
+			},
+			undefined,
+			undefined,
+			context,
+		);
+		expect(record).not.toHaveBeenCalled();
+	});
+
+	it("rejects multiple execution-authorizing gates across workflow stages", async () => {
+		const tool = new AskTool(createSession());
+		await expect(
+			tool.execute(
+				"conflicting-execution-gates",
+				{
+					questions: [
+						{
+							id: "first",
+							question: "Choose the execution path",
+							options: [{ label: "Execute with ultragoal" }, { label: "Stop here" }],
+							workflowGate: { stage: "deep-interview", kind: "execution" },
+						},
+						{
+							id: "second",
+							question: "Approve the final plan",
+							options: [{ label: "Approve execution via ultragoal" }, { label: "Stop here" }],
+							workflowGate: { stage: "ralplan", kind: "approval" },
+						},
+					],
+				},
+				undefined,
+				undefined,
+				createContext({ select: async () => "Execute with ultragoal" }),
+			),
+		).rejects.toThrow("at most one execution-authorizing workflow gate");
+	});
+
+	it("rejects mixed intent batches before timeout navigation can imply consent", async () => {
 		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
 			action: "created",
 			record: {} as AppendOrMergeResult["record"],
 		});
 		const tool = new AskTool(
-			createSession({ settings: Settings.isolated({ "ask.timeout": 0.001 }), getSessionId: () => "session-ask" }),
+			createSession({
+				settings: Settings.isolated({ "ask.timeout": 0.001 }),
+				getSessionId: () => "session-ask",
+				getDeepInterviewAskStage: () => "topology",
+			}),
 		);
 		let visits = 0;
 		const context = createContext({
@@ -2967,34 +3319,35 @@ describe("AskTool deep-interview recorder persistence", () => {
 				return options[0];
 			},
 		});
-		const result = await tool.execute(
-			"intent-multi-timeout",
-			{
-				questions: [
-					{
-						id: "intent-contract-timeout",
-						question: "Confirm locked intent",
-						options: [{ label: "Looks right" }, { label: "Revise" }],
-						deepInterview: {
-							round: 0,
-							component: "review-topology",
-							dimension: "topology",
-							ambiguity: 1,
-							intent_contract: {
-								items: [{ id: "artifact:report", category: "artifact", statement: "Produce report" }],
-								confirmation_options: ["Looks right"],
+		await expect(
+			tool.execute(
+				"intent-multi-timeout",
+				{
+					questions: [
+						{
+							id: "intent-contract-timeout",
+							question: "Confirm locked intent",
+							options: [{ label: "Looks right" }, { label: "Revise" }],
+							deepInterview: {
+								round: 0,
+								component: "review-topology",
+								dimension: "topology",
+								ambiguity: 1,
+								intent_contract: {
+									items: [{ id: "artifact:report", category: "artifact", statement: "Produce report" }],
+									confirmation_options: ["Looks right"],
+								},
 							},
 						},
-					},
-					{ id: "ordinary", question: "Continue?", options: [{ label: "Yes" }, { label: "No" }] },
-				],
-			},
-			undefined,
-			undefined,
-			context,
-		);
-		expect(result.details?.results?.[0]?.selectedOptions).toEqual([]);
-		expect(result.details?.results?.[1]?.selectedOptions).toEqual(["Yes"]);
+						{ id: "ordinary", question: "Continue?", options: [{ label: "Yes" }, { label: "No" }] },
+					],
+				},
+				undefined,
+				undefined,
+				context,
+			),
+		).rejects.toThrow("active deep-interview asks require exactly one question");
+		expect(visits).toBe(0);
 		expect(recorder).not.toHaveBeenCalled();
 	});
 
@@ -3181,7 +3534,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(resolveAskAnswerDeadlineMs(env("9007199254740991"))).toBeNull();
 	});
 
-	it("passes optional metadata for single, multi-question, and SDK workflow gate asks", async () => {
+	it("records single and SDK answers but rejects batched interview rounds", async () => {
 		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
 			action: "created",
 			record: {} as Awaited<ReturnType<typeof deepInterviewRecorder.appendOrMergeDeepInterviewRound>>["record"],
@@ -3198,24 +3551,26 @@ describe("AskTool deep-interview recorder persistence", () => {
 			createContext({ select: async (_prompt, options) => options[0] }),
 		);
 
-		await new AskTool(
-			createSession({ getSessionId: () => "multi-session", getDeepInterviewAskStage: () => "post-topology" }),
-		).execute(
-			"call-multi-meta",
-			{
-				questions: [
-					singleDeepInterviewQuestion(),
-					{
-						...singleDeepInterviewQuestion(),
-						id: "q-deep-2",
-						deepInterview: { ...deepInterviewMeta(), round: 3 },
-					},
-				],
-			},
-			undefined,
-			undefined,
-			createContext({ select: async (_prompt, options) => options[0] }),
-		);
+		await expect(
+			new AskTool(
+				createSession({ getSessionId: () => "multi-session", getDeepInterviewAskStage: () => "post-topology" }),
+			).execute(
+				"call-multi-meta",
+				{
+					questions: [
+						singleDeepInterviewQuestion(),
+						{
+							...singleDeepInterviewQuestion(),
+							id: "q-deep-2",
+							deepInterview: { ...deepInterviewMeta(), round: 3 },
+						},
+					],
+				},
+				undefined,
+				undefined,
+				createContext({ select: async (_prompt, options) => options[0] }),
+			),
+		).rejects.toThrow("active deep-interview asks require exactly one question");
 
 		const gateEmitter = {
 			supportsRemoteGateAnswers: () => true,
@@ -3230,16 +3585,21 @@ describe("AskTool deep-interview recorder persistence", () => {
 			}),
 		).execute("call-gate-meta", { questions: [singleDeepInterviewQuestion()] }, undefined, undefined, undefined);
 
-		expect(recorder).toHaveBeenCalledTimes(4);
+		expect(recorder).toHaveBeenCalledTimes(2);
 		expect(recorder.mock.calls.map(call => call[2])).toEqual([
 			expect.objectContaining({ round: 2, component: "Scope", dimension: "Constraints", ambiguity: 0.42 }),
-			expect.objectContaining({ round: 2, component: "Scope", dimension: "Constraints", ambiguity: 0.42 }),
-			expect.objectContaining({ round: 3, component: "Scope", dimension: "Constraints", ambiguity: 0.42 }),
 			expect.objectContaining({ round: 2, component: "Scope", dimension: "Constraints", ambiguity: 0.42 }),
 		]);
 	});
 
 	it("emits deep-interview question gates by default and honors ralplan approval overrides", async () => {
+		spyOn(stateRuntime, "captureExecutionApprovalPresentation").mockResolvedValue({
+			state_path: "/tmp/gate-state.json",
+			state_revision: 1,
+			artifact_path: "/tmp/gate-artifact.md",
+			artifact_sha256: "b".repeat(64),
+			run_id: null,
+		});
 		const defaultGateEmitter = {
 			supportsRemoteGateAnswers: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["Budget"] })),
@@ -3260,32 +3620,96 @@ describe("AskTool deep-interview recorder persistence", () => {
 			expect.objectContaining({ stage: "deep-interview", kind: "question" }),
 		);
 
+		let listener: ((gate: WorkflowGate) => void) | undefined;
+		let gateSequence = 0;
+		const stopObservation = vi.fn(() => {
+			listener = undefined;
+		});
 		const ralplanGateEmitter = {
 			supportsRemoteGateAnswers: () => true,
-			emitGate: vi.fn(async () => ({ selected: ["Approve execution via ultragoal"] })),
-		};
-		await new AskTool(
-			createSession({ hasUI: false, getWorkflowGateEmitter: () => ralplanGateEmitter } as Partial<ToolSession>),
-		).execute(
-			"call-ralplan-workflow-gate",
-			{
-				questions: [
-					{
-						id: "final-approval",
-						question: "Approve this plan?",
-						options: [{ label: "Refine further" }, { label: "Approve execution via ultragoal" }],
-						workflowGate: { stage: "ralplan", kind: "approval" },
-					},
-				],
+			onGateEmitted: (onGate: (gate: WorkflowGate) => void) => {
+				listener = onGate;
+				return stopObservation;
 			},
-			undefined,
-			undefined,
-			undefined,
+			emitGate: vi.fn(async (input: OpenGateInput) => {
+				const gate: WorkflowGate = {
+					...input,
+					type: "workflow_gate",
+					gate_id: `ralplan-run:gate:${++gateSequence}`,
+					schema_hash: "a".repeat(64),
+					context: input.context ?? {},
+					created_at: "2026-09-09T00:00:00Z",
+					required: true,
+				};
+				listener?.(gate);
+				// Unrelated emissions must not overwrite the matching durable identity.
+				listener?.({ ...gate, gate_id: "wrong-stage", stage: "deep-interview" });
+				listener?.({ ...gate, gate_id: "wrong-kind", kind: "execution" });
+				listener?.({ ...gate, gate_id: "other-execution", stage: "deep-interview", kind: "execution" });
+				listener?.({
+					...gate,
+					gate_id: "wrong-question",
+					context: { ...gate.context, stage_state: { question_id: "other-question" } },
+				});
+				return { selected: ["Approve execution via ultragoal"] };
+			}),
+		};
+		spyOn(stateRuntime, "executionApprovalLineage").mockResolvedValue("crystal");
+		const approvalRecord = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
+			path: "/tmp/ralplan-approval.json",
+			record: {
+				transcript_boundary: { byte_length: 1, device: "1", inode: "1", leaf_id: null },
+			} as DeepInterviewExecutionApprovalRecord,
+		});
+		spyOn(deepInterviewRuntime, "assertDeepInterviewCrystalCoversLiveTranscript").mockResolvedValue({
+			transcriptPath: "/tmp/ralplan-approval/session.jsonl",
+			transcriptSha256: "b".repeat(64),
+		});
+		const approvalTransition = spyOn(stateRuntime, "runNativeStateCommand").mockResolvedValue({
+			status: 0,
+			stdout: "{}\n",
+			stderr: "",
+		});
+		const tool = new AskTool(
+			createSession({
+				hasUI: false,
+				cwd: "/tmp/ralplan-approval",
+				getSessionId: () => "ralplan-approval",
+				getWorkflowGateEmitter: () => ralplanGateEmitter,
+			} as Partial<ToolSession>),
 		);
+		for (let pass = 1; pass <= 2; pass++) {
+			await tool.execute(
+				`call-ralplan-workflow-gate-${pass}`,
+				{
+					questions: [
+						{
+							id: "final-approval",
+							question: `Approve finalized plan pass ${pass}?`,
+							options: [{ label: "Refine further" }, { label: "Approve execution via ultragoal" }],
+							workflowGate: { stage: "ralplan", kind: "approval" },
+						},
+					],
+				},
+				undefined,
+				undefined,
+				undefined,
+			);
+		}
+		expect(
+			approvalRecord.mock.calls.map(([input]) => ({ questionId: input.questionId, gateId: input.gateId })),
+		).toEqual([
+			{ questionId: "final-approval", gateId: "ralplan-run:gate:1" },
+			{ questionId: "final-approval", gateId: "ralplan-run:gate:2" },
+		]);
+		expect(stopObservation).toHaveBeenCalledTimes(2);
+		expect(listener).toBeUndefined();
 
 		expect(ralplanGateEmitter.emitGate).toHaveBeenCalledWith(
 			expect.objectContaining({ stage: "ralplan", kind: "approval" }),
 		);
+		expect(approvalRecord).toHaveBeenCalledWith(expect.objectContaining({ approvalStage: "ralplan" }));
+		expect(approvalTransition).not.toHaveBeenCalled();
 	});
 
 	it("omits single-option recommendations from workflow gates", async () => {
@@ -3704,16 +4128,22 @@ describe("AskTool Round-0 intent recovery", () => {
 		expect(question).not.toHaveProperty("workflowGate");
 	});
 
-	it("normalizes a null optional deepInterview field on an ordinary ask", () => {
-		const result = validateAsk({
-			questions: [
-				{
-					id: "ordinary",
-					question: "Choose one",
-					options: [{ label: "First" }, { label: "Second" }],
-					deepInterview: null,
-				},
-			],
+	it("normalizes a null optional deepInterview field only outside an active interview", () => {
+		const tool = new AskTool(createSession());
+		const result = validateToolArguments(tool, {
+			type: "toolCall",
+			id: "ordinary-null",
+			name: "ask",
+			arguments: {
+				questions: [
+					{
+						id: "ordinary",
+						question: "Choose one",
+						options: [{ label: "First" }, { label: "Second" }],
+						deepInterview: null,
+					},
+				],
+			},
 		});
 
 		expect(result.questions[0]).not.toHaveProperty("deepInterview");

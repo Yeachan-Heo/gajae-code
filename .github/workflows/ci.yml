@@ -200,6 +200,12 @@ jobs:
            run: |
               test -f packages/natives/native/pi_natives.linux-x64-baseline.node
               test -f packages/natives/native/pi_natives.linux-x64-modern.node
+         - name: Verify producer provenance sidecars
+           shell: bash
+           run: |
+              set -euo pipefail
+              test -f packages/natives/native/pi_natives.linux-x64-baseline.node.provenance.json
+              test -f packages/natives/native/pi_natives.linux-x64-modern.node.provenance.json
          - name: Upload native addon(s)
            uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
            with:
@@ -207,6 +213,8 @@ jobs:
               path: |
                  packages/natives/native/pi_natives.linux-x64-baseline.node
                  packages/natives/native/pi_natives.linux-x64-modern.node
+                 packages/natives/native/pi_natives.linux-x64-baseline.node.provenance.json
+                 packages/natives/native/pi_natives.linux-x64-modern.node.provenance.json
               if-no-files-found: error
               retention-days: 1
               overwrite: true
@@ -277,6 +285,13 @@ jobs:
               # native shard on an expired artifact (#5715).
               echo "::notice::main-native-${{ github.run_id }} is no longer retained; rebuilding the native addon from source for this re-run."
               bun run ci:build:native
+         - name: Rebuild and verify transferred native provenance
+           if: ${{ matrix.native }}
+           shell: bash
+           run: |
+              set -euo pipefail
+              bun scripts/verify-diagnostic-artifact-provenance.ts --rebuild-from-sidecars packages/natives/native
+              bun scripts/verify-diagnostic-artifact-provenance.ts --verify packages/natives/native
          - name: Run task shard
            env:
               GITHUB_ACTIONS: ""
@@ -319,6 +334,12 @@ jobs:
               # re-run is not a code failure (#5715).
               echo "::notice::main-native-${{ github.run_id }} is no longer retained; rebuilding the native addon from source for this re-run."
               bun run ci:build:native
+         - name: Rebuild and verify transferred native provenance
+           shell: bash
+           run: |
+              set -euo pipefail
+              bun scripts/verify-diagnostic-artifact-provenance.ts --rebuild-from-sidecars packages/natives/native
+              bun scripts/verify-diagnostic-artifact-provenance.ts --verify packages/natives/native
          - name: Run ACP conformance
            run: |
               # Real (non-symlinked) seeded scratch workspace, matching the promoted baseline:
@@ -442,6 +463,14 @@ jobs:
               pattern: pi-natives-${{ matrix.platform }}-${{ matrix.arch }}*
               path: packages/natives/native
               merge-multiple: true
+         - name: Rebuild the diagnostic artifact provenance record
+           # The binaries matrix includes a Windows runner, whose default shell is
+           # PowerShell; this body is Bash.
+           shell: bash
+           run: |
+              set -euo pipefail
+              bun scripts/verify-diagnostic-artifact-provenance.ts --rebuild-from-sidecars packages/natives/native
+              bun scripts/verify-diagnostic-artifact-provenance.ts --verify packages/natives/native
          - name: Verify memory-guard native loader export
            run: bun test packages/natives/test/memory-guard-native.test.ts
 
@@ -631,6 +660,11 @@ jobs:
               pattern: pi-natives-*
               path: packages/natives/native
               merge-multiple: true
+         - name: Rebuild the diagnostic artifact provenance record
+           run: |
+              set -euo pipefail
+              bun scripts/verify-diagnostic-artifact-provenance.ts --rebuild-from-sidecars packages/natives/native
+              bun scripts/verify-diagnostic-artifact-provenance.ts --verify packages/natives/native
          - name: Prepare immutable package evidence
            env:
               RELEASE_CHANNEL: ${{ needs.release_metadata.outputs.channel }}

@@ -1,8 +1,8 @@
 /**
  * Fuzzy matching utilities for the edit tool.
  *
- * Provides both character-level and line-level fuzzy matching with progressive
- * fallback strategies for finding text in files.
+ * Provides both character-level and line-level fuzzy matching with staged
+ * strategies for finding text in files.
  */
 import type { AgentToolResult } from "@gajae-code/agent-core";
 import { markDesignedError } from "@gajae-code/utils/error-classification";
@@ -430,7 +430,7 @@ export function findContextLine(
 	lines: string[],
 	context: string,
 	startFrom: number,
-	options?: { allowFuzzy?: boolean; skipFunctionFallback?: boolean },
+	options?: { allowFuzzy?: boolean; skipParenRetry?: boolean },
 ): ContextLineResult {
 	const allowFuzzy = options?.allowFuzzy ?? true;
 	const trimmedContext = context.trim();
@@ -570,14 +570,14 @@ export function findContextLine(
 		};
 	}
 
-	if (!options?.skipFunctionFallback && trimmedContext.endsWith("()")) {
+	if (!options?.skipParenRetry && trimmedContext.endsWith("()")) {
 		const withParen = trimmedContext.replace(/\(\)\s*$/u, "(");
 		const withoutParen = trimmedContext.replace(/\(\)\s*$/u, "");
-		const parenResult = findContextLine(lines, withParen, startFrom, { allowFuzzy, skipFunctionFallback: true });
+		const parenResult = findContextLine(lines, withParen, startFrom, { allowFuzzy, skipParenRetry: true });
 		if (parenResult.index !== undefined || (parenResult.matchCount ?? 0) > 0) {
 			return parenResult;
 		}
-		return findContextLine(lines, withoutParen, startFrom, { allowFuzzy, skipFunctionFallback: true });
+		return findContextLine(lines, withoutParen, startFrom, { allowFuzzy, skipParenRetry: true });
 	}
 
 	return { index: undefined, confidence: bestScore };
