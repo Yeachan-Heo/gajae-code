@@ -8490,7 +8490,14 @@ export class AgentSession {
 		sdkRunToken?: string;
 	}): Promise<void> {
 		const continuationAdmission = this.#captureScheduledContinuationAdmission();
-		const scheduledSdkRunToken = options?.sdkRunToken;
+		const scheduledSdkRunToken =
+			options?.sdkRunToken ??
+			(options?.continueQueuedOnly
+				? undefined
+				: (this.#activeSdkRunToken ??
+						(this.#activeAttemptScope === undefined
+							? undefined
+							: this.#sdkRunTokensByAttemptScope.get(this.#activeAttemptScope))));
 		const selectionFenceGeneration =
 			options?.selectionFenceGeneration ??
 			this.#selectionFenceGenerationContext.getStore() ??
@@ -8668,7 +8675,9 @@ export class AgentSession {
 												this.#fireQueuedPromotionHooks(acceptance.consumedQueuedMessages, {
 													startsOwnRun: startsOwn,
 												});
-												if (startsOwn) this.#activeSdkRunToken = sdkRunToken;
+								if (startsOwn && (sdkRunToken !== undefined || this.#activeSdkRunToken === undefined)) {
+									this.#activeSdkRunToken = sdkRunToken;
+								}
 												this.#acceptSdkAttemptRun(
 													handle,
 													sdkRunToken,

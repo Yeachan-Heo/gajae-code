@@ -163,6 +163,17 @@ describe("AgentSession todo completion reminder", () => {
 		}
 	});
 
+	it("injects a continuation for an interactive todo reminder", async () => {
+		settings.set("todo.reminders.max", 1);
+		session.setTodoPhases(incompletePhases());
+
+		await session.prompt("do the long task");
+
+		expect(injectedReminders()).toHaveLength(1);
+		expect(mock.calls).toHaveLength(2);
+		expect(modelCallsAtAgentEnd).toEqual([2]);
+	});
+
 	it("injects nothing once the todo.reminders.max budget is exhausted", async () => {
 		settings.set("todo.reminders.max", 0);
 		session.setTodoPhases(incompletePhases());
