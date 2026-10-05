@@ -19,9 +19,20 @@ describe("custom API registry", () => {
 	const streamSimple: CustomStreamSimpleFn = () => ({}) as unknown as AssistantMessageEventStream;
 
 	test("rejects registrations that collide with built-in API names", () => {
-		expect(() => registerCustomApi("openai-responses", streamSimple)).toThrow(
-			'Cannot register custom API "openai-responses": built-in API names are reserved.',
-		);
+		const scope = new CustomApiRegistry();
+		try {
+			for (const api of ["openai-responses", "kiro-codewhisperer-stream"]) {
+				expect(() => registerCustomApi(api, streamSimple)).toThrow(
+					`Cannot register custom API "${api}": built-in API names are reserved.`,
+				);
+				expect(() => scope.register(api, streamSimple)).toThrow(
+					`Cannot register custom API "${api}": built-in API names are reserved.`,
+				);
+				expect(scope.get(api)).toBeUndefined();
+			}
+		} finally {
+			scope.dispose();
+		}
 	});
 
 	test("unregisterCustomApis removes only matching source registrations", () => {

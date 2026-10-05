@@ -27,6 +27,7 @@ const BUILTIN_APIS = new Set<KnownApi>([
 	"ollama-chat",
 	"cursor-agent",
 	"devin-acp",
+	"kiro-codewhisperer-stream",
 ]);
 
 export type CustomStreamFn = (
