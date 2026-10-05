@@ -3085,6 +3085,7 @@ describe("SDK broker identity and discovery", () => {
 			});
 			expect(await fs.readFile(external, "utf8")).toContain('"requested"');
 			expect((await fs.stat(externalArtifacts)).isDirectory()).toBe(true);
+			await managedSessionPath(dir, cwd, "legacy-owner-authority");
 			const legacyDirectory = path.join(getSessionsDir(dir), `--${cwd.replace(/^\//, "").replace(/[/:]/g, "-")}--`);
 			const legacyReplayPath = path.join(legacyDirectory, "legacy-replay.jsonl");
 			await fs.mkdir(legacyDirectory, { recursive: true });
@@ -3378,6 +3379,7 @@ describe("SDK broker identity and discovery", () => {
 		const transition = broker.ledger.transition.bind(broker.ledger);
 		let calls = 0;
 		let canonicalInjected = false;
+		let artifactPhaseSessionId: string | undefined;
 		let plannedArtifactAlias: string | undefined;
 		let postOperationArtifactAlias: string | undefined;
 		await fs.mkdir(path.dirname(sessionPath), { recursive: true });
@@ -3386,8 +3388,15 @@ describe("SDK broker identity and discovery", () => {
 		await broker.start();
 		const transitionSpy = vi.spyOn(broker.ledger, "transition").mockImplementation(async (...args) => {
 			const result = await transition(...args);
-			// #6339 reworded the durable artifact-completion response to "artifacts are removed".
-			if (!canonicalInjected && JSON.stringify(args[2]?.response).includes("artifacts are removed")) {
+			const response = args[2]?.response as BrokerResponse | undefined;
+			if (
+				!canonicalInjected &&
+				response &&
+				!response.ok &&
+				response.error.code === "cleanup_pending" &&
+				response.error.cleanup?.artifactsRemoved === true &&
+				response.error.cleanup.phase === "transcript"
+			) {
 				canonicalInjected = true;
 				await fs.mkdir(artifactsDir);
 				await fs.writeFile(path.join(artifactsDir, ".reappeared"), "reappeared");
@@ -3398,8 +3407,14 @@ describe("SDK broker identity and discovery", () => {
 			calls++;
 			if (calls === 1) {
 				plannedArtifactAlias = target.plannedArtifactsPath;
+				artifactPhaseSessionId = target.sessionId;
 				await fs.rmdir(artifactsDir);
-				return { kind: "artifacts_removed", phase: "artifacts", transcriptIdentity: target.transcriptIdentity };
+				return {
+					kind: "artifacts_removed",
+					phase: "artifacts",
+					transcriptIdentity: target.transcriptIdentity,
+					taskArtifactOwnerDeletionEvidence: target.taskArtifactOwnerDeletionEvidence,
+				};
 			}
 			if (calls === 2)
 				throw new SessionDeleteVerificationError(
@@ -3430,6 +3445,8 @@ describe("SDK broker identity and discovery", () => {
 				error: { code: "cleanup_pending", cleanup: { artifactsRemoved: true, phase: "transcript", sessionId } },
 			});
 			expect(JSON.stringify(pending)).not.toContain('"retainedArtifactsRootOnly":true');
+			expect(artifactPhaseSessionId).toBe(sessionId);
+			expect(canonicalInjected).toBe(true);
 			expect(await fs.readFile(path.join(artifactsDir, ".reappeared"), "utf8")).toBe("reappeared");
 			const repeatedPending = await broker.handleRequest(
 				"session.delete",
@@ -3990,9 +4007,13 @@ describe("SDK broker identity and discovery", () => {
 			);
 			expect(replacedParentReplay).toMatchObject({
 				ok: false,
-				error: { code: "cleanup_pending", cleanup: { phase: "transcript" } },
+				error: {
+					code: "invalid_input",
+					message: "Saved session scope is invalid: The managed scope security could not be verified.",
+				},
 			});
 			expect(calls).toBe(2);
+			expect(await fs.readdir(transcriptParent)).toEqual([]);
 			await fs.rm(transcriptParent, { recursive: true, force: true });
 			await fs.rename(renamedTranscriptParent, transcriptParent);
 			expect(await fs.readFile(path.join(retainedSidePath, ".payload"), "utf8")).toBe("payload");
