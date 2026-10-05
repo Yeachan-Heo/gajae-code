@@ -172,6 +172,8 @@ export function failedPromptOutcome(input: {
 	evidence: PromptFailureEvidence;
 	/** Revalidated here; a malformed value is dropped, never partially kept. */
 	providerDiagnostic?: ProviderDiagnostic;
+	/** Error to extract bounded diagnostic from for operator logs (#408). */
+	error?: unknown;
 }): Extract<SdkPromptTerminalOutcome, { kind: "failed" }> {
 	const category = promptFailureCategory(input.providerCode ?? input.code, input.provenance);
 	const phase = input.phase ?? promptFailurePhase(input.evidence);
@@ -184,6 +186,7 @@ export function failedPromptOutcome(input: {
 		category,
 		...(input.providerCode !== undefined ? { providerCode: input.providerCode } : {}),
 		...providerDiagnosticField(input.providerDiagnostic),
+		...(input.error !== undefined ? { failureCauseDiagnostic: failureCauseDiagnostic(input.error) } : {}),
 	};
 }
 
@@ -305,6 +308,49 @@ export function publishedPromptFailure(error: unknown): {
 	providerDiagnostic?: ProviderDiagnostic;
 } {
 	return { ...sanitizePromptFailure(error), ...providerDiagnosticField(failureProviderDiagnostic(error)) };
+}
+
+/**
+ * Extract a bounded failure cause diagnostic for operator logs: error class name,
+ * first line of message, and exit code/signal if available. Bounded to 200 chars,
+ * secrets-redacted. Used for #408 to provide real cause in terminal_failure logs.
+ */
+export function failureCauseDiagnostic(error: unknown): string | undefined {
+	try {
+		let className = "Error";
+		let message = "";
+		let exitSignal = "";
+
+		if (error instanceof Error) {
+			className = error.constructor?.name || "Error";
+			// Extract first line of message only
+			const firstLine = (error.message || "").split("\n")[0] || "";
+			message = firstLine.slice(0, 100);
+		} else if (typeof error === "string") {
+			message = error.split("\n")[0]?.slice(0, 100) || "";
+		} else if (error !== null && typeof error === "object") {
+			const candidate = error as { code?: unknown; message?: unknown; signal?: unknown; exitCode?: unknown; className?: unknown };
+			if (typeof candidate.className === "string") className = candidate.className;
+			if (typeof candidate.message === "string") {
+				const firstLine = candidate.message.split("\n")[0] || "";
+				message = firstLine.slice(0, 100);
+			}
+			if (typeof candidate.signal === "string" && ["SIGTERM", "SIGKILL", "SIGABRT", "SIGSEGV", "SIGINT"].includes(candidate.signal)) {
+				exitSignal = `signal=${candidate.signal}`;
+			} else if (typeof candidate.exitCode === "number" && Number.isInteger(candidate.exitCode) && candidate.exitCode >= 0 && candidate.exitCode <= 255) {
+				exitSignal = `exit=${candidate.exitCode}`;
+			}
+		}
+
+		const parts = [className, message, exitSignal].filter(Boolean);
+		const diagnostic = parts.join(" ");
+		// Sanitize to remove secrets
+		const sanitized = sanitizePromptFailure(diagnostic).message;
+
+		return sanitized.length > 0 ? sanitized.slice(0, 200) : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 /** Best-effort local diagnostic text that never crosses the SDK boundary. */

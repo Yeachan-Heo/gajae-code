@@ -90,24 +90,31 @@ export type SdkPromptFailureRetryability = "transient" | "terminal" | "unknown";
 export type SdkPromptTerminalOutcome =
 	| { kind: "stopped"; reason: SdkPromptStopReason; provenance: "agent" | "client_cancel" }
 	| {
-			kind: "failed";
-			code: SdkPromptFailureCode;
-			message: string;
-			provenance: "agent_failed" | "deadline";
-			/** Execution phase at failure time; never a submission rejection when post_start. */
-			phase: SdkPromptFailurePhase;
-			/** Bounded failure-origin category; `unknown` when attribution is uncertain. */
-			category: SdkPromptFailureCategory;
-			/** Bounded safe provider/transport classifier when the provider supplied one. */
-			providerCode?: string;
-			/**
-			 * Bounded provider failure family, present only when the provider adapter
-			 * classified the failure from its own structured metadata. Purely
-			 * additive: `code`, `message`, `phase`, `category` and `providerCode`
-			 * are identical with or without it, and a malformed value is dropped
-			 * rather than invalidating the outcome.
-			 */
-			providerDiagnostic?: ProviderDiagnostic;
+		kind: "failed";
+		code: SdkPromptFailureCode;
+		message: string;
+		provenance: "agent_failed" | "deadline";
+		/** Execution phase at failure time; never a submission rejection when post_start. */
+		phase: SdkPromptFailurePhase;
+		/** Bounded failure-origin category; `unknown` when attribution is uncertain. */
+		category: SdkPromptFailureCategory;
+		/** Bounded safe provider/transport classifier when the provider supplied one. */
+		providerCode?: string;
+		/**
+		 * Bounded provider failure family, present only when the provider adapter
+		 * classified the failure from its own structured metadata. Purely
+		 * additive: `code`, `message`, `phase`, `category` and `providerCode`
+		 * are identical with or without it, and a malformed value is dropped
+		 * rather than invalidating the outcome.
+		 */
+		providerDiagnostic?: ProviderDiagnostic;
+		/**
+		 * Real failure cause diagnostic for operator logs: error class name,
+		 * first line of message, and exit code/signal if a child died.
+		 * Bounded (<=200 chars), secrets-redacted. Omitted when unavailable.
+		 * This field survives the gateway->asker redaction boundary (#408).
+		 */
+		failureCauseDiagnostic?: string;
 	  };
 
 /** Exactly one selector per lookup. */
