@@ -12,7 +12,15 @@ import { crc32 } from "../src/providers/aws-eventstream";
 import { streamKiroApiKey } from "../src/providers/kiro-api-key";
 import type { KiroCodeWhispererOptions } from "../src/providers/kiro-codewhisperer";
 import { streamKiroCodeWhisperer } from "../src/providers/kiro-codewhisperer";
-import type { Context, Model } from "../src/types";
+import type {
+	AssistantMessage,
+	Context,
+	Model,
+	RedactedThinkingContent,
+	TextContent,
+	ThinkingContent,
+	ToolCall,
+} from "../src/types";
 
 // ---- Frame builder (mirrors aws-eventstream.ts for test isolation) ----
 
@@ -101,7 +109,7 @@ describe("Provider safety stop: late-refusal ordering", () => {
 	describe("CodeWhisperer transport (eventstream)", () => {
 		test("(a) text frame then refusal: text events emitted, final message has no content (refusal clears it)", async () => {
 			const emittedEvents: Array<{ type: string; delta?: string }> = [];
-			let finalMessage: any;
+			let finalMessage: AssistantMessage | undefined;
 
 			const textFrame = encodeFrame(
 				{ ":message-type": "event", ":event-type": "assistantResponseEvent" },
@@ -164,13 +172,15 @@ describe("Provider safety stop: late-refusal ordering", () => {
 			expect(finalMessage?.errorMessage).toContain("BLOCKED");
 
 			// Verify final message has no content (refusal clears it)
-			const textBlocks = (finalMessage?.content ?? []).filter((b: any) => b.type === "text");
+			const textBlocks = (finalMessage?.content ?? []).filter(
+				(b: TextContent | ThinkingContent | RedactedThinkingContent | ToolCall) => b.type === "text",
+			);
 			expect(textBlocks).toHaveLength(0);
 		});
 
 		test("(b) tool frame then refusal: NO toolcall_* events emitted, no tool block in final message", async () => {
 			const emittedEvents: Array<{ type: string }> = [];
-			let finalMessage: any;
+			let finalMessage: AssistantMessage | undefined;
 
 			const toolFrame = encodeFrame(
 				{ ":message-type": "event", ":event-type": "toolUseEvent" },
@@ -227,7 +237,9 @@ describe("Provider safety stop: late-refusal ordering", () => {
 			expect(toolcallEvents).toHaveLength(0);
 
 			// Verify final message has NO tool block
-			const toolBlocks = (finalMessage?.content ?? []).filter((b: any) => b.type === "toolCall");
+			const toolBlocks = (finalMessage?.content ?? []).filter(
+				(b: TextContent | ThinkingContent | RedactedThinkingContent | ToolCall) => b.type === "toolCall",
+			);
 			expect(toolBlocks).toHaveLength(0);
 
 			// Verify error is present
@@ -282,7 +294,7 @@ describe("Provider safety stop: late-refusal ordering", () => {
 	describe("API-key transport (JSON)", () => {
 		test("(a) ksk_ text then refusal: text events emitted, final message has no content", async () => {
 			const emittedEvents: Array<{ type: string; delta?: string }> = [];
-			let finalMessage: any;
+			let finalMessage: AssistantMessage | undefined;
 
 			globalThis.fetch = (async () => {
 				// API-key stream: JSON events in body
@@ -343,7 +355,7 @@ describe("Provider safety stop: late-refusal ordering", () => {
 
 		test("(b) ksk_ tool then refusal: NO toolcall_* events, no tool block in final message", async () => {
 			const emittedEvents: Array<{ type: string }> = [];
-			let finalMessage: any;
+			let finalMessage: AssistantMessage | undefined;
 
 			globalThis.fetch = (async () => {
 				// Tool use event followed by refusal
@@ -388,7 +400,9 @@ describe("Provider safety stop: late-refusal ordering", () => {
 			expect(toolcallEvents).toHaveLength(0);
 
 			// Verify final message has NO tool block
-			const toolBlocks = (finalMessage?.content ?? []).filter((b: any) => b.type === "toolCall");
+			const toolBlocks = (finalMessage?.content ?? []).filter(
+				(b: TextContent | ThinkingContent | RedactedThinkingContent | ToolCall) => b.type === "toolCall",
+			);
 			expect(toolBlocks).toHaveLength(0);
 
 			// Verify error present
@@ -443,7 +457,7 @@ describe("Provider safety stop: late-refusal ordering", () => {
 
 		test("ksk_ multiple tool calls before refusal: all dropped, no toolcall_* events", async () => {
 			const emittedEvents: Array<{ type: string }> = [];
-			let finalMessage: any;
+			let finalMessage: AssistantMessage | undefined;
 
 			globalThis.fetch = (async () => {
 				// Multiple tool calls followed by refusal - verifies all tools are dropped
@@ -494,7 +508,9 @@ describe("Provider safety stop: late-refusal ordering", () => {
 			expect(emittedEvents).toHaveLength(0);
 
 			// Verify final message has NO tool blocks
-			const toolBlocks = (finalMessage?.content ?? []).filter((b: any) => b.type === "toolCall");
+			const toolBlocks = (finalMessage?.content ?? []).filter(
+				(b: TextContent | ThinkingContent | RedactedThinkingContent | ToolCall) => b.type === "toolCall",
+			);
 			expect(toolBlocks).toHaveLength(0);
 		});
 	});
