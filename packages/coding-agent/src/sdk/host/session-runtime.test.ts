@@ -5584,7 +5584,7 @@ test.each([
 							cancelPendingPreflightForTerminalAbort: () => {},
 							abortPromptAndWaitWithTerminal: async () => {
 								rootAbortCalls += 1;
-								return { status: "settled", terminalScope: {} };
+								throw new Error("Queued cancellation must not invoke the foreign root terminal seam");
 							},
 						},
 					}),
