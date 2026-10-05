@@ -395,6 +395,37 @@ describe("remote compaction endpoint", () => {
 		}
 	});
 
+	test.each([
+		"https://proxy.example/api.openai.com/v1",
+		"https://api.openai.com.proxy.example/v1",
+	])("preserves explicit native model URL containing the canonical hostname: %s", async baseUrl => {
+		const previousBaseUrl = Bun.env.OPENAI_BASE_URL;
+		const requestUrls: string[] = [];
+		try {
+			Bun.env.OPENAI_BASE_URL = "https://captured-proxy.example/v1";
+			const endpointConfiguration = captureEndpointConfiguration();
+			Bun.env.OPENAI_BASE_URL = "https://live-proxy.example/v1";
+			using _hook = hookFetch(async (input, init) => {
+				const request = input instanceof Request ? input : new Request(String(input), init);
+				requestUrls.push(request.url);
+				return Response.json({ output: [{ type: "compaction_summary", summary: "explicit model" }] });
+			});
+			const result = await requestOpenAiRemoteCompaction(
+				makeOpenAiModel({ baseUrl }),
+				"shared-key",
+				[{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
+				"compact",
+				undefined,
+				{ endpointConfiguration },
+			);
+			expect(requestUrls).toEqual([`${baseUrl}/responses/compact`]);
+			expect(result.compactionItem).toEqual({ type: "compaction_summary", summary: "explicit model" });
+		} finally {
+			if (previousBaseUrl === undefined) delete Bun.env.OPENAI_BASE_URL;
+			else Bun.env.OPENAI_BASE_URL = previousBaseUrl;
+		}
+	});
+
 	test("keeps OAuth OpenAI compaction on the canonical origin despite captured and live proxies", async () => {
 		const previousBaseUrl = Bun.env.OPENAI_BASE_URL;
 		const requestCapture: { url?: string; authorization?: string | null } = {};
