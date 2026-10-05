@@ -3278,13 +3278,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			peekQueueInvoker: () => session.peekQueueInvoker(),
 			peekStandingResolveHandler: () => session.peekStandingResolveHandler(),
 			setStandingResolveHandler: handler => session.setStandingResolveHandler(handler),
-			allocateOutputArtifact: async toolType => {
-				try {
-					return await sessionManager.allocateArtifactPath(toolType);
-				} catch {
-					return {};
-				}
-			},
+			allocateOutputArtifact: toolType => sessionManager.allocateArtifactPath(toolType),
 			getArtifactManager: () => sessionManager.getArtifactManager(),
 			isArtifactManagerAuthorized: manager => sessionManager.isArtifactManagerAuthorized(manager),
 			adoptArtifactManager: manager => sessionManager.adoptArtifactManager(manager),
@@ -3359,10 +3353,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const manager = sessionManager.getArtifactManager();
 			return manager ? [manager.dir] : [];
 		};
-		toolSession.agentOutputManager = new AgentOutputManager(
-			getArtifactsDir,
-			options.parentTaskPrefix ? { parentPrefix: options.parentTaskPrefix } : undefined,
-		);
+		toolSession.agentOutputManager = new AgentOutputManager(getArtifactsDir, {
+			...(options.parentTaskPrefix ? { parentPrefix: options.parentTaskPrefix } : {}),
+			getAuthorizedArtifactsDirs: () => toolSession.getAuthorizedArtifactsDirs?.() ?? [],
+		});
 
 		// Create built-in tools (already wrapped with meta notice formatting)
 		const builtinTools = await logger.time(

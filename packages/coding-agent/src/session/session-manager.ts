@@ -247,6 +247,16 @@ import {
 	replaceSessionCommitMarkerCheckedSync,
 	SESSION_RANGE_READ_MAX_BYTES,
 } from "./session-storage";
+import {
+	ensureManagedTaskArtifactOwner,
+	type ManagedTaskArtifactOwner,
+	restoreManagedTaskArtifactOwner,
+} from "./task-artifact-owner";
+import {
+	parseTaskArtifactOwnerLocator,
+	type TaskArtifactOwnerLocator,
+	type TaskArtifactOwnerStorageContext,
+} from "./task-artifact-owner-codec";
 
 export const CURRENT_SESSION_VERSION = 5;
 
@@ -268,6 +278,7 @@ export interface SessionHeader {
 	titleSource?: "auto" | "user";
 	starredPatchVersion?: 1;
 	starred?: boolean;
+	taskArtifactOwner?: TaskArtifactOwnerLocator;
 	timestamp: string;
 	cwd: string;
 	parentSession?: string;
@@ -953,7 +964,7 @@ export type SessionEntry =
 /** Append-only replacement for mutable fields on the session header. */
 export interface HeaderPatchRecord {
 	type: "header_patch";
-	patch: Partial<Pick<SessionHeader, "title" | "titleSource" | "cwd" | "starred">>;
+	patch: Partial<Pick<SessionHeader, "title" | "titleSource" | "cwd" | "starred" | "taskArtifactOwner">>;
 }
 
 /** Append-only replacement for replay metadata on one existing session entry. */
@@ -2818,8 +2829,23 @@ function isHeaderPatchRecord(record: SessionPatchRecord): record is HeaderPatchR
 	)
 		return false;
 	const keys = Object.keys(record.patch);
-	if (!keys.every(key => key === "cwd" || key === "title" || key === "titleSource" || key === "starred")) return false;
-	const { cwd, title, titleSource, starred } = record.patch;
+	if (
+		!keys.every(
+			key =>
+				key === "cwd" ||
+				key === "title" ||
+				key === "titleSource" ||
+				key === "starred" ||
+				key === "taskArtifactOwner",
+		)
+	)
+		return false;
+	const { cwd, title, titleSource, starred, taskArtifactOwner } = record.patch;
+	try {
+		parseTaskArtifactOwnerLocator(taskArtifactOwner);
+	} catch {
+		return false;
+	}
 	return (
 		(cwd === undefined || typeof cwd === "string") &&
 		(title === undefined || typeof title === "string") &&
@@ -2832,6 +2858,11 @@ function applyHeaderPatch(header: SessionHeader, patch: HeaderPatchRecord["patch
 	if (patch.cwd !== undefined) header.cwd = patch.cwd;
 	if (patch.title !== undefined) header.title = patch.title;
 	if (patch.titleSource !== undefined) header.titleSource = patch.titleSource;
+	if (patch.taskArtifactOwner !== undefined) {
+		const locator = parseTaskArtifactOwnerLocator(patch.taskArtifactOwner);
+		if (!locator) throw new Error("task_artifact_owner_locator_missing");
+		header.taskArtifactOwner = locator;
+	}
 	if (header.starredPatchVersion === 1 && patch.starred !== undefined) header.starred = patch.starred;
 }
 
@@ -4376,6 +4407,8 @@ function buildFileEntriesFromRecords(records: Array<FileEntry | SessionPatchReco
 		if (record.type === "header_patch") {
 			if (header?.version !== undefined && header.version >= 4 && isHeaderPatchRecord(record))
 				applyHeaderPatch(header, record.patch);
+			else if (isRecord(record.patch) && Object.hasOwn(record.patch, "taskArtifactOwner"))
+				throw new Error("task_artifact_owner_patch_invalid");
 			continue;
 		}
 		if (record.type === "entry_patch") {
@@ -4384,6 +4417,12 @@ function buildFileEntriesFromRecords(records: Array<FileEntry | SessionPatchReco
 				if (entry?.type === "message" && record.patch.message) entry.message = record.patch.message;
 			}
 			continue;
+		}
+		if (record.type === "session" && record.taskArtifactOwner !== undefined) {
+			const locator = parseTaskArtifactOwnerLocator(record.taskArtifactOwner);
+			if (!locator) throw new Error("task_artifact_owner_locator_missing");
+			if (record.version === undefined || record.version < 4)
+				throw new Error("task_artifact_owner_header_unsupported");
 		}
 		entries.push(record);
 		if (record.type === "session") header ??= record;
@@ -7663,6 +7702,15 @@ export class SessionManager {
 
 	#artifactManager: ArtifactManager | null = null;
 	#artifactManagerSessionFile: string | null = null;
+	#taskArtifactOwners = new Map<string, ManagedTaskArtifactOwner & { readonly sessionId: string }>();
+	#taskArtifactOwnerPromise:
+		| { readonly sessionId: string; readonly sessionFile: string; readonly promise: Promise<ArtifactManager | null> }
+		| undefined;
+	#taskArtifactOwnerPersistenceFailure:
+		| { readonly sessionId: string; readonly sessionFile: string; readonly error: Error }
+		| undefined;
+	#taskArtifactOwnerProvisioning: { readonly sessionId: string; readonly sessionFile: string } | undefined;
+	#taskArtifactOwnersClosed = false;
 	#managedTranscriptStoreCache: { directory: string; store: ManagedSessionDescendantStore } | null = null;
 	#ownedManagedAuthority: ManagedSessionDescendantStore | undefined;
 	#managedSidecarCacheStore: EphemeralBlobStore | undefined;
@@ -9605,6 +9653,7 @@ export class SessionManager {
 		if (boundedTranscriptAdmitted && (await this.#tryInitSessionFileFromSidecar(resolvedSessionFile))) {
 			this.#writeTerminalBreadcrumb(resolvedSessionFile);
 			revalidateStrictResume();
+			this.#invalidateActiveTaskArtifactManager();
 			return;
 		}
 
@@ -9615,6 +9664,7 @@ export class SessionManager {
 			}
 			this.#writeTerminalBreadcrumb(resolvedSessionFile);
 			revalidateStrictResume();
+			this.#invalidateActiveTaskArtifactManager();
 			return;
 		}
 		revalidateStrictResume();
@@ -9700,6 +9750,7 @@ export class SessionManager {
 			this.#sessionMemoryMode = "shadow";
 			this.#sessionMemoryAutoDisabledReason = "sidecar_reload_failures";
 		}
+		this.#invalidateActiveTaskArtifactManager();
 	}
 
 	#writeTerminalBreadcrumb(sessionFile: string): void {
@@ -9789,6 +9840,7 @@ export class SessionManager {
 						await this.#initSessionFile(resolvedSessionFile);
 						if (!options?.deferEphemeralArtifactRetirement) this.#retireEphemeralArtifacts();
 						managedTransition?.settle();
+						this.#invalidateActiveTaskArtifactManager();
 						this.#pendingStrictAdoption = undefined;
 						return;
 					} catch (error) {
@@ -9884,6 +9936,7 @@ export class SessionManager {
 				this.#pendingStrictAdoption = undefined;
 				this.#flushed = true;
 				this.#ensuredOnDisk = true;
+				this.#invalidateActiveTaskArtifactManager();
 				await this.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
 				return;
 			}
@@ -11877,6 +11930,9 @@ export class SessionManager {
 			throw error;
 		}
 		if (residentTransition) this.#commitResidentTextStoreTransition(residentTransition);
+		const taskArtifactOwner = this.#taskArtifactOwners.get(this.#sessionId);
+		if (taskArtifactOwner?.manager === this.#artifactManager)
+			this.#artifactManagerSessionFile = this.#sessionFile ?? null;
 
 		// Update terminal breadcrumb only after the durable cwd transition succeeds.
 		if (this.#sessionFile) {
@@ -12339,6 +12395,8 @@ export class SessionManager {
 	#releaseOwnedManagedAuthority(): void {
 		this.#ownedManagedAuthority?.close();
 		this.#ownedManagedAuthority = undefined;
+		for (const owner of this.#taskArtifactOwners.values()) owner.manager.getManagedStore()?.close();
+		this.#taskArtifactOwners.clear();
 	}
 
 	#managedTranscriptStore(sessionFile = this.#sessionFile): ManagedSessionDescendantStore {
@@ -16281,6 +16339,7 @@ export class SessionManager {
 	}
 
 	#releaseClosedSessionState(): void {
+		this.#taskArtifactOwnersClosed = true;
 		const runtime = this.#sidecarRuntime;
 		if (runtime) {
 			runtime.enabled = false;
@@ -17101,25 +17160,217 @@ export class SessionManager {
 	}
 
 	/**
-	 * Returns the ArtifactManager this session writes through. Lazily creates
-	 * one bound to the current session file unless an external manager was
-	 * adopted via `adoptArtifactManager`. Falls back to the lazily created
-	 * ephemeral filesystem store once a non-persistent session has saved an
-	 * artifact, so `artifact://` stays resolvable. Returns null only when no
-	 * store has been established yet.
+	 * Returns an already established manager, including an adopted capability.
+	 * Managed persistent sessions expose their durable logical owner after
+	 * `ensureArtifactManager()` publishes or restores its header locator.
 	 */
 	getArtifactManager(): ArtifactManager | null {
+		if (this.destination.kind === "managed" && this.persist && this.#storage instanceof FileSessionStorage)
+			return this.#getOrCreateArtifactManager();
 		return this.#getOrCreateArtifactManager() ?? this.#ephemeralArtifactManager;
 	}
 
-	/** Linearizably establish this session's persistent or ephemeral artifact manager. */
+	/** Linearizably establish this session's durable or ephemeral artifact manager. */
 	async ensureArtifactManager(): Promise<ArtifactManager | null> {
+		if (this.#adoptedArtifactManager) return this.#adoptedArtifactManager;
+		if (this.destination.kind === "managed" && this.persist && this.#storage instanceof FileSessionStorage)
+			return this.#ensureManagedTaskArtifactManager();
 		return this.#getOrCreateArtifactManager() ?? (await this.#ensureEphemeralArtifactManager());
 	}
 
+	/** Owner locator persistence is the publication fence for a managed artifact capability. */
+	#taskArtifactOwnerStorageContext(): TaskArtifactOwnerStorageContext | null {
+		if (this.destination.kind !== "managed") return null;
+		return {
+			rootAuthority: this.destination.securityContext.rootAuthority,
+			sessionsRoot: path.resolve(this.destination.securityContext.sessionsRoot),
+			securityPolicy: managedSecurityPolicyForContext(this.destination.securityContext),
+			profileAgentDir: this.destination.securityContext.profileAgentDir,
+		};
+	}
+
+	#legacyArtifactRelativePath(context: TaskArtifactOwnerStorageContext, sessionFile: string): string {
+		const artifactDir = path.resolve(sessionFile.slice(0, -6));
+		const relative = path.relative(context.sessionsRoot, artifactDir);
+		if (relative.length === 0 || path.isAbsolute(relative) || relative.split(path.sep).includes(".."))
+			throw new Error("task_artifact_owner_source_outside_sessions_root");
+		return relative.split(path.sep).join("/");
+	}
+
+	#installManagedTaskArtifactOwner(
+		owner: ManagedTaskArtifactOwner,
+		sessionId: string,
+		sessionFile: string,
+	): ArtifactManager {
+		if (this.#taskArtifactOwnersClosed) {
+			owner.manager.getManagedStore()?.close();
+			throw new Error("task_artifact_owner_session_manager_closed");
+		}
+		const existing = this.#taskArtifactOwners.get(sessionId);
+		if (existing) {
+			const left = existing.locator;
+			const right = owner.locator;
+			if (
+				left.schemaVersion !== right.schemaVersion ||
+				left.ownerId !== right.ownerId ||
+				left.directoryDev !== right.directoryDev ||
+				left.directoryIno !== right.directoryIno
+			) {
+				owner.manager.getManagedStore()?.close();
+				throw new Error("task_artifact_owner_locator_changed");
+			}
+			if (existing.manager !== owner.manager) owner.manager.getManagedStore()?.close();
+			owner = existing;
+		} else this.#taskArtifactOwners.set(sessionId, { ...owner, sessionId });
+		this.#artifactManager = owner.manager;
+		this.#artifactManagerSessionFile = sessionFile;
+		return owner.manager;
+	}
+
+	#restoreTaskArtifactOwner(locatorValue: unknown, sessionId: string, sessionFile: string): ArtifactManager {
+		const locator = parseTaskArtifactOwnerLocator(locatorValue);
+		if (!locator) throw new Error("task_artifact_owner_locator_missing");
+		const cached = this.#taskArtifactOwners.get(sessionId);
+		if (cached && this.#artifactManager === cached.manager && this.#artifactManagerSessionFile === sessionFile) {
+			const current = cached.locator;
+			if (
+				current.schemaVersion !== locator.schemaVersion ||
+				current.ownerId !== locator.ownerId ||
+				current.directoryDev !== locator.directoryDev ||
+				current.directoryIno !== locator.directoryIno
+			)
+				throw new Error("task_artifact_owner_locator_changed");
+			cached.manager.assertManagedBinding();
+			return cached.manager;
+		}
+		const context = this.#taskArtifactOwnerStorageContext();
+		if (!context) throw new Error("task_artifact_owner_managed_destination_required");
+		const owner = restoreManagedTaskArtifactOwner(context, sessionId, locator);
+		if (cached) {
+			const current = cached.locator;
+			if (
+				current.schemaVersion !== owner.locator.schemaVersion ||
+				current.ownerId !== owner.locator.ownerId ||
+				current.directoryDev !== owner.locator.directoryDev ||
+				current.directoryIno !== owner.locator.directoryIno
+			) {
+				owner.manager.getManagedStore()?.close();
+				throw new Error("task_artifact_owner_locator_changed");
+			}
+			owner.manager.getManagedStore()?.close();
+			this.#artifactManager = cached.manager;
+			this.#artifactManagerSessionFile = sessionFile;
+			return cached.manager;
+		}
+		return this.#installManagedTaskArtifactOwner(owner, sessionId, sessionFile);
+	}
+
+	#invalidateActiveTaskArtifactManager(): void {
+		if (
+			this.#artifactManager &&
+			[...this.#taskArtifactOwners.values()].some(owner => owner.manager === this.#artifactManager)
+		) {
+			this.#artifactManager = null;
+			this.#artifactManagerSessionFile = null;
+		}
+	}
+
+	#ensureManagedTaskArtifactManager(): Promise<ArtifactManager | null> {
+		const sessionId = this.#sessionId;
+		const sessionFile = this.#sessionFile;
+		if (this.#taskArtifactOwnersClosed)
+			return Promise.reject(new Error("task_artifact_owner_session_manager_closed"));
+		if (!sessionFile) return Promise.resolve(null);
+		if (
+			this.#taskArtifactOwnerPersistenceFailure?.sessionId === sessionId &&
+			this.#taskArtifactOwnerPersistenceFailure.sessionFile === sessionFile
+		)
+			return Promise.reject(
+				new Error("task_artifact_owner_metadata_persist_uncertain", {
+					cause: this.#taskArtifactOwnerPersistenceFailure.error,
+				}),
+			);
+		if (
+			this.#taskArtifactOwnerPromise?.sessionId === sessionId &&
+			this.#taskArtifactOwnerPromise.sessionFile === sessionFile
+		)
+			return this.#taskArtifactOwnerPromise.promise;
+		const record = {
+			sessionId,
+			sessionFile,
+			promise: this.#createManagedTaskArtifactManager(sessionId, sessionFile),
+		};
+		this.#taskArtifactOwnerPromise = record;
+		return record.promise.finally(() => {
+			if (this.#taskArtifactOwnerPromise === record) this.#taskArtifactOwnerPromise = undefined;
+		});
+	}
+
+	async #createManagedTaskArtifactManager(sessionId: string, sessionFile: string): Promise<ArtifactManager | null> {
+		this.#assertRecoveryHydrationWritable();
+		const initialHeader = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
+		if (!initialHeader) throw new Error("task_artifact_owner_session_header_missing");
+		if (!parseTaskArtifactOwnerLocator(initialHeader.taskArtifactOwner))
+			this.#taskArtifactOwnerProvisioning = { sessionId, sessionFile };
+		const current = (): boolean => this.#sessionId === sessionId && this.#sessionFile === sessionFile;
+		let owner: ManagedTaskArtifactOwner | undefined;
+		try {
+			await this.ensureOnDisk();
+			if (this.#taskArtifactOwnersClosed || !current()) throw new Error("task_artifact_owner_session_changed");
+			if (this.#adoptedArtifactManager) return this.#adoptedArtifactManager;
+			const context = this.#taskArtifactOwnerStorageContext();
+			if (!context) return null;
+			const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
+			if (!header) throw new Error("task_artifact_owner_session_header_missing");
+			const locator = parseTaskArtifactOwnerLocator(header.taskArtifactOwner);
+			if (locator) return this.#restoreTaskArtifactOwner(locator, sessionId, sessionFile);
+			owner = await ensureManagedTaskArtifactOwner(
+				context,
+				sessionId,
+				undefined,
+				this.#legacyArtifactRelativePath(context, sessionFile),
+			);
+			if (this.#taskArtifactOwnersClosed || !current()) throw new Error("task_artifact_owner_session_changed");
+			if (this.#adoptedArtifactManager) {
+				owner.manager.getManagedStore()?.close();
+				owner = undefined;
+				return this.#adoptedArtifactManager;
+			}
+			try {
+				await this.#appendHeaderPatch(
+					{ taskArtifactOwner: owner.locator },
+					{ expectedSession: { sessionId, sessionFile } },
+				);
+			} catch (error) {
+				const persistenceError = toError(error);
+				if (current())
+					this.#taskArtifactOwnerPersistenceFailure = { sessionId, sessionFile, error: persistenceError };
+				throw new Error("task_artifact_owner_metadata_persist_failed", { cause: persistenceError });
+			}
+			if (this.#taskArtifactOwnersClosed || !current()) throw new Error("task_artifact_owner_session_changed");
+			if (this.#adoptedArtifactManager) {
+				owner.manager.getManagedStore()?.close();
+				owner = undefined;
+				return this.#adoptedArtifactManager;
+			}
+			const result = this.#installManagedTaskArtifactOwner(owner, sessionId, sessionFile);
+			owner = undefined;
+			return result;
+		} catch (error) {
+			owner?.manager.getManagedStore()?.close();
+			throw error;
+		} finally {
+			if (
+				this.#taskArtifactOwnerProvisioning?.sessionId === sessionId &&
+				this.#taskArtifactOwnerProvisioning.sessionFile === sessionFile
+			)
+				this.#taskArtifactOwnerProvisioning = undefined;
+		}
+	}
+
 	/**
-	 * Returns an artifact manager bound to the current session file.
-	 * Recreates the manager when the active session file changes.
+	 * Returns an artifact manager bound to the current session file. A managed
+	 * persistent session exposes one only after its durable owner locator is present.
 	 */
 	#getOrCreateArtifactManager(): ArtifactManager | null {
 		if (this.#adoptedArtifactManager) return this.#adoptedArtifactManager;
@@ -17129,16 +17380,30 @@ export class SessionManager {
 			this.#artifactManagerSessionFile = null;
 			return null;
 		}
-
-		if (this.#artifactManager && this.#artifactManagerSessionFile === sessionFile) {
-			return this.#artifactManager;
+		if (this.#taskArtifactOwnersClosed) throw new Error("task_artifact_owner_session_manager_closed");
+		if (
+			this.#taskArtifactOwnerPersistenceFailure?.sessionId === this.#sessionId &&
+			this.#taskArtifactOwnerPersistenceFailure.sessionFile === sessionFile
+		)
+			throw new Error("task_artifact_owner_metadata_persist_uncertain", {
+				cause: this.#taskArtifactOwnerPersistenceFailure.error,
+			});
+		if (
+			this.#taskArtifactOwnerProvisioning?.sessionId === this.#sessionId &&
+			this.#taskArtifactOwnerProvisioning.sessionFile === sessionFile
+		)
+			throw new Error("task_artifact_owner_initialization_pending");
+		if (this.destination.kind === "managed" && this.persist && this.#storage instanceof FileSessionStorage) {
+			const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
+			if (!header) throw new Error("task_artifact_owner_session_header_missing");
+			const locator = parseTaskArtifactOwnerLocator(header.taskArtifactOwner);
+			return locator ? this.#restoreTaskArtifactOwner(locator, this.#sessionId, sessionFile) : null;
 		}
-
+		if (this.#artifactManager && this.#artifactManagerSessionFile === sessionFile) return this.#artifactManager;
 		const artifactDir = sessionFile.slice(0, -6);
 		let artifactStorage: string | ManagedSessionDescendantStore = artifactDir;
-		if (this.destination.kind === "managed") {
+		if (this.destination.kind === "managed")
 			artifactStorage = this.#managedTranscriptStore(sessionFile).deriveSubtree(path.basename(artifactDir));
-		}
 		const manager = new ArtifactManager(artifactStorage);
 		this.#artifactManager = manager;
 		this.#artifactManagerSessionFile = sessionFile;
@@ -17150,19 +17415,18 @@ export class SessionManager {
 	 * Returns an empty object when the session is not persisted.
 	 */
 	async allocateArtifactPath(toolType: string): Promise<{ id?: string; path?: string }> {
-		const manager = this.#getOrCreateArtifactManager();
+		const manager = await this.ensureArtifactManager();
 		if (!manager) return {};
 		return manager.allocatePath(toolType);
 	}
 
 	/**
 	 * Save artifact content under the current session and return artifact ID.
-	 * Persistent sessions write into the session artifact directory; non-persistent
-	 * sessions write into a lazily created temporary directory so the content is
-	 * read back from the filesystem instead of being retained in memory.
+	 * Managed persistent sessions use their durable logical owner; non-persistent
+	 * sessions use a lazy temporary directory rather than retaining content in memory.
 	 */
 	async saveArtifact(content: string, toolType: string): Promise<string | undefined> {
-		const manager = this.#getOrCreateArtifactManager() ?? (await this.#ensureEphemeralArtifactManager());
+		const manager = await this.ensureArtifactManager();
 		return manager ? manager.save(content, toolType) : undefined;
 	}
 
@@ -17171,7 +17435,7 @@ export class SessionManager {
 	): Promise<{ manager: ArtifactManager; handle: EvictedToolOutputHandle }> {
 		const validation = validateEvictedToolOutputHandle(handle);
 		if (!validation.ok) throw new EvictedArtifactValidationError(validation.code, validation.diagnostic);
-		const manager = this.#getOrCreateArtifactManager();
+		const manager = await this.ensureArtifactManager();
 		if (!manager) throw new EvictedArtifactValidationError("unavailable", "artifact persistence unavailable");
 		return { manager, handle: validation.handle };
 	}
@@ -17271,7 +17535,7 @@ export class SessionManager {
 	 * Returns null when the artifact is missing.
 	 */
 	async getArtifactPath(id: string): Promise<string | null> {
-		const manager = this.getArtifactManager();
+		const manager = await this.ensureArtifactManager();
 		if (!manager) return null;
 		return manager.getPath(id);
 	}
@@ -17720,8 +17984,14 @@ export class SessionManager {
 
 	async #appendHeaderPatch(
 		patch: HeaderPatchRecord["patch"],
-		options?: { allowStrictClose?: boolean },
+		options?: { allowStrictClose?: boolean; expectedSession?: { sessionId: string; sessionFile: string } },
 	): Promise<void> {
+		if (
+			options?.expectedSession &&
+			(this.#sessionId !== options.expectedSession.sessionId ||
+				this.#sessionFile !== options.expectedSession.sessionFile)
+		)
+			throw new Error("task_artifact_owner_session_changed");
 		if (options?.allowStrictClose) {
 			if (this.#recoveryHydrationContext) throw new Error("recovery_hydration_not_promoted");
 		} else this.#assertRecoveryHydrationWritable();
@@ -17736,7 +18006,7 @@ export class SessionManager {
 						{ type: "header_patch", patch },
 					]
 				: [{ type: "header_patch", patch }];
-		await this.#persistPatches(records);
+		await this.#persistPatches(records, options?.expectedSession);
 	}
 
 	#appendManagedRecordsSync(records: readonly (FileEntry | SessionPatchRecord)[]): void {
@@ -17766,7 +18036,15 @@ export class SessionManager {
 		});
 	}
 
-	async #persistPatches(records: readonly SessionPatchRecord[]): Promise<void> {
+	async #persistPatches(
+		records: readonly SessionPatchRecord[],
+		expectedSession?: { sessionId: string; sessionFile: string },
+	): Promise<void> {
+		if (
+			expectedSession &&
+			(this.#sessionId !== expectedSession.sessionId || this.#sessionFile !== expectedSession.sessionFile)
+		)
+			throw new Error("task_artifact_owner_session_changed");
 		if (records.length === 0) return;
 		if (this.#coldSidecarActive()) this.#deactivateColdForBranchMutation();
 		if (!this.persist || !this.#sessionFile || !this.#storage.existsSync(this.#sessionFile)) return;
@@ -17774,6 +18052,11 @@ export class SessionManager {
 		const publishResumeBreadcrumb = this.#readOnlyResume;
 		await this.#queuePersistTask(async () => {
 			for (let attempt = 0; attempt <= 2; attempt++) {
+				if (
+					expectedSession &&
+					(this.#sessionId !== expectedSession.sessionId || this.#sessionFile !== expectedSession.sessionFile)
+				)
+					throw new Error("task_artifact_owner_session_changed");
 				const token = this.#capturePersistenceInputToken();
 				const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 				if (
@@ -17801,6 +18084,11 @@ export class SessionManager {
 				SessionManagerTestHooks.beforePersistPatchFence?.(attempt);
 				let persisted = false;
 				const written = this.#withSessionPersistenceFenceSync(() => {
+					if (
+						expectedSession &&
+						(this.#sessionId !== expectedSession.sessionId || this.#sessionFile !== expectedSession.sessionFile)
+					)
+						throw new Error("task_artifact_owner_session_changed");
 					if (!this.#persistenceInputTokenMatches(token)) return false;
 					if (this.destination.kind === "managed") {
 						this.#appendManagedRecordsSync(persistedRecords);

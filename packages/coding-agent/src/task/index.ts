@@ -782,8 +782,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	 * The session's ArtifactManager is authoritative when present: a subagent
 	 * adopts its parent's manager, so honouring it keeps the whole agent tree on
 	 * one artifact directory and one ID space instead of giving each nesting
-	 * level a private store. Sessions without a manager fall back to the session
-	 * artifacts path, then to the session-lifetime durable temp root.
+	 * level a private store. Persistent sessions with an owner provider establish
+	 * that owner before lookup and fail closed if it is uncertain; explicit
+	 * sessions without one retain the session-path and session-lifetime fallbacks.
 	 */
 	async #resolveEffectiveArtifactsDir(): Promise<{
 		sessionArtifactsDir: string | null;
@@ -791,7 +792,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		effectiveArtifactsDir: string | undefined;
 		parentArtifactManager: ArtifactManager | undefined;
 	}> {
+		const sessionFile = this.session.getSessionFile();
+		const ensureOwner = sessionFile ? this.session.ensureArtifactManager : undefined;
+		const ownerManager = ensureOwner ? await ensureOwner.call(this.session) : undefined;
+		if (ensureOwner && (!ownerManager || this.session.isArtifactManagerAuthorized?.(ownerManager) !== true)) {
+			throw new Error("task_artifact_owner_unavailable_or_unauthorized");
+		}
 		const shared = this.#sharedArtifactStore();
+		if (ownerManager && (!shared || shared.manager !== ownerManager)) {
+			throw new Error("task_artifact_owner_shared_manager_mismatch");
+		}
 		if (shared) {
 			return {
 				sessionArtifactsDir: shared.dir,
@@ -800,7 +810,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				parentArtifactManager: shared.manager,
 			};
 		}
-		const sessionFile = this.session.getSessionFile();
 		const sessionArtifactsDir = sessionFile ? sessionFile.slice(0, -6) : null;
 		if (sessionArtifactsDir) {
 			return {
