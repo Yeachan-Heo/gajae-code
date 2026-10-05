@@ -484,4 +484,46 @@ describe("Kiro API-key content filter #6150", () => {
 		const errorEvent = emittedEvents[errorIndex];
 		expect(errorEvent?.message?.errorMessage).toContain("Kiro refused the request (CYBER)");
 	});
+
+	test("records usage AND refusal when both are in the same metadata object (P1 fix)", async () => {
+		let finalError: any = null;
+
+		globalThis.fetch = (async () => {
+			// Real Kiro API response: metadata object with both refusal and usage
+			// This was the bug - usage would be emitted but refusal would be masked
+			const responseBody = JSON.stringify({
+				stopReason: "CONTENT_FILTERED",
+				stopDetails: {
+					refusal: {
+						category: "MALWARE",
+						explanation: "Cannot assist with malware creation",
+					},
+				},
+				usage: { inputTokens: 25, outputTokens: 1 },
+			});
+			return new Response(responseBody, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				if (event.type === "error") {
+					finalError = event.error;
+				}
+			}
+		} catch {
+			// Stream may throw; events are captured
+		}
+
+		globalThis.fetch = originalFetch;
+
+		// Should have captured an error event
+		expect(finalError).toBeDefined();
+		expect(finalError?.errorMessage).toContain("Kiro refused the request (MALWARE)");
+		expect(finalError?.errorMessage).toContain("Cannot assist with malware creation");
+
+		// CRITICAL: usage should be recorded even though refusal occurred
+		expect(finalError?.usage.input).toBe(25);
+		expect(finalError?.usage.output).toBe(1);
+	});
 });

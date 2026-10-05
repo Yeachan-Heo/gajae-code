@@ -433,11 +433,15 @@ export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[];
 				});
 			} else if ("stop" in parsed && parsed.contextUsagePercentage === undefined) {
 				events.push({ type: "toolUseStop", data: { stop: Boolean(parsed.stop) } });
-			} else if (parsed.usage && typeof parsed.usage === "object") {
+			}
+			// Check for usage first (before refusal) to ensure it gets processed even if refusal terminates the stream
+			if (parsed.usage && typeof parsed.usage === "object") {
 				const u = parsed.usage as { inputTokens?: number; outputTokens?: number };
 				events.push({ type: "usage", data: u });
-			} else if ((parsed.stopDetails as any)?.refusal) {
-				// Only emit refusal event if stopDetails contains actual refusal data
+			}
+			// Check for refusal after usage so that usage is processed first and recorded before refusal terminates
+			if ((parsed.stopDetails as any)?.refusal) {
+				// Emit refusal event if stopDetails contains actual refusal data
 				events.push({
 					type: "refusal",
 					data: {

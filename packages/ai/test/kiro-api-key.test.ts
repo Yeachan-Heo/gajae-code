@@ -112,4 +112,41 @@ describe("parseKiroApiEvents", () => {
 			expect(event.data.stopDetails?.refusal?.category).toBe("VIOLENCE");
 		}
 	});
+	test("parses combined usage and refusal in the same metadata object", () => {
+		// Metadata object containing both usage and refusal (P1 fix: ensure refusal is not masked)
+		const { events } = parseKiroApiEvents(
+			'{"stopReason":"CONTENT_FILTERED","stopDetails":{"refusal":{"category":"ILLEGAL","explanation":"Violates policy"}},"usage":{"inputTokens":15,"outputTokens":2}}',
+		);
+		// Should emit both refusal and usage events
+		expect(events).toHaveLength(2);
+		// First event should be refusal
+		const refusalEvent = events.find(e => e.type === "refusal");
+		expect(refusalEvent?.type).toBe("refusal");
+		if (refusalEvent?.type === "refusal") {
+			expect(refusalEvent.data.stopReason).toBe("CONTENT_FILTERED");
+			expect(refusalEvent.data.stopDetails?.refusal?.category).toBe("ILLEGAL");
+			expect(refusalEvent.data.stopDetails?.refusal?.explanation).toBe("Violates policy");
+		}
+		// Second event should be usage
+		const usageEvent = events.find(e => e.type === "usage");
+		expect(usageEvent?.type).toBe("usage");
+		if (usageEvent?.type === "usage") {
+			expect(usageEvent.data.inputTokens).toBe(15);
+			expect(usageEvent.data.outputTokens).toBe(2);
+		}
+	});
+	test("parses combined usage and stopReason:COMPLETED in the same metadata object", () => {
+		// Metadata object with usage and normal completion (no refusal)
+		const { events } = parseKiroApiEvents('{"stopReason":"COMPLETED","usage":{"inputTokens":20,"outputTokens":5}}');
+		// Should only emit usage event (normal completion without refusal is ignored)
+		const usageEvents = events.filter(e => e.type === "usage");
+		expect(usageEvents).toHaveLength(1);
+		if (usageEvents[0]?.type === "usage") {
+			expect(usageEvents[0].data.inputTokens).toBe(20);
+			expect(usageEvents[0].data.outputTokens).toBe(5);
+		}
+		// Should not emit any refusal events for COMPLETED
+		const refusalEvents = events.filter(e => e.type === "refusal");
+		expect(refusalEvents).toHaveLength(0);
+	});
 });
