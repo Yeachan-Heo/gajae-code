@@ -3997,9 +3997,12 @@ describe("SDK broker identity and discovery", () => {
 			expect(calls).toBe(2);
 			const transcriptParent = path.dirname(sessionPath);
 			const renamedTranscriptParent = `${transcriptParent}.renamed`;
+			const originalTranscriptParentIdentity = await fs.stat(transcriptParent, { bigint: true });
 			await fs.rename(transcriptParent, renamedTranscriptParent);
 			// The replacement must still pass managed-scope security (#6339) so replay reaches receipt validation.
 			await fs.mkdir(transcriptParent, { mode: 0o700 });
+			const replacementTranscript = "foreign replacement transcript must survive";
+			await Bun.write(sessionPath, replacementTranscript);
 			const replacedParentReplay = await broker.handleRequest(
 				"session.delete",
 				{ sessionId, sessionPath, cwd },
@@ -4008,12 +4011,20 @@ describe("SDK broker identity and discovery", () => {
 			expect(replacedParentReplay).toMatchObject({
 				ok: false,
 				error: {
-					code: "invalid_input",
-					message: "Saved session scope is invalid: The managed scope security could not be verified.",
+					code: "cleanup_pending",
+					cleanup: {
+						phase: "transcript",
+						retainedTranscriptUnknownPath: retainedSidePath,
+						transcriptParentIdentity: {
+							dev: String(originalTranscriptParentIdentity.dev),
+							ino: String(originalTranscriptParentIdentity.ino),
+						},
+					},
 				},
 			});
 			expect(calls).toBe(2);
-			expect(await fs.readdir(transcriptParent)).toEqual([]);
+			expect(await fs.readdir(transcriptParent)).toEqual([path.basename(sessionPath)]);
+			expect(await Bun.file(sessionPath).text()).toBe(replacementTranscript);
 			await fs.rm(transcriptParent, { recursive: true, force: true });
 			await fs.rename(renamedTranscriptParent, transcriptParent);
 			expect(await fs.readFile(path.join(retainedSidePath, ".payload"), "utf8")).toBe("payload");
