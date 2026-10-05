@@ -3555,7 +3555,7 @@ describe("scrubbed write-protocol remnant reaping", () => {
 				Array.from({ length: count }, async (_, offset) => {
 					const pathname = path.join(scope.directoryPath, `.gjc-receipt-remove-poison-${start + offset}`);
 					await Bun.write(pathname, "", { mode: 0o600, createPath: false });
-					await fs.utimes(pathname, aged, aged);
+					syncFs.utimesSync(pathname, aged, aged);
 				}),
 			);
 		}
