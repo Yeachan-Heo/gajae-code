@@ -1,0 +1,3 @@
+### SDK
+
+- Add `failureCauseDiagnostic` bounded field to `SdkPromptTerminalOutcome` for issue #408: real failure cause details (error class name, first message line, exit code/signal) now propagate through the SDK terminal outcome for operator logs. The diagnostic is extracted from Error instances with full property access (including `exitCode`, `signal`, `code`), redacted of secrets, and bounded to 200 characters. Validation gates on the reconciliation store row and public outcome republish ensure only valid diagnostics reach callers. Production failure paths thread the error through `canonicalFailedOutcome()` and `failedPromptOutcome()` so the diagnostic is captured at the point of failure.

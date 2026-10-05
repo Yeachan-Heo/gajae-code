@@ -5,6 +5,7 @@
  */
 import type { ProviderDiagnostic } from "@gajae-code/ai/core";
 import { sanitizeProviderDiagnostic } from "@gajae-code/ai/core";
+import { redactCrashSecrets } from "@gajae-code/utils";
 import type {
 	SdkPromptFailureCategory,
 	SdkPromptFailurePhase,
@@ -14,6 +15,7 @@ import type {
 
 export const PROMPT_FAILURE_CODE_MAX = 64;
 const LOCAL_FAILURE_LOG_MAX = 16_384;
+export const FAILURE_CAUSE_DIAGNOSTIC_MAX = 200; // Max length for failureCauseDiagnostic field
 
 export const PROMPT_FAILURE_MESSAGE_SUBMISSION = "Prompt submission failed.";
 export const PROMPT_FAILURE_MESSAGE_POST_START_PROVIDER = "Provider failure after execution started.";
@@ -139,7 +141,7 @@ export function promptFailureMessage(phase: SdkPromptFailurePhase, category: Sdk
 /**
  * Recompute `phase`, `category` and `message` for a failed outcome from the
  * bounded classifier plus the record's start/activity evidence. Non-failed
- * outcomes pass through untouched. Idempotent.
+ * outcomes pass through untouched. Idempotent. Revalidates failureCauseDiagnostic.
  */
 export function rephaseFailedOutcome(
 	outcome: SdkPromptTerminalOutcome,
@@ -155,11 +157,13 @@ export function rephaseFailedOutcome(
 	// arbitrary extras (and their bytes) all the way to the public result.
 	const diagnostic = sanitizeProviderDiagnostic(outcome.providerDiagnostic);
 	const diagnosticChanged = !isCanonicalDiagnostic(outcome.providerDiagnostic, diagnostic);
-	if (category === outcome.category && phase === outcome.phase && message === outcome.message && !diagnosticChanged)
+	const failureCauseDiagnosticValid = isValidFailureCauseDiagnostic(outcome.failureCauseDiagnostic);
+	if (category === outcome.category && phase === outcome.phase && message === outcome.message && !diagnosticChanged && failureCauseDiagnosticValid)
 		return outcome;
 	const rephased = { ...outcome, category, phase, message };
 	if (diagnostic === undefined) delete rephased.providerDiagnostic;
 	else rephased.providerDiagnostic = diagnostic;
+	if (!failureCauseDiagnosticValid) delete rephased.failureCauseDiagnostic;
 	return rephased;
 }
 
@@ -220,19 +224,24 @@ function isCanonicalDiagnostic(stored: unknown, canonical: ProviderDiagnostic | 
 
 /**
  * Public projection of a terminal outcome: a fresh object whose optional
- * diagnostic is re-validated and rebuilt, so a caller that mutates the returned
+ * diagnostics are re-validated and rebuilt, so a caller that mutates the returned
  * DTO cannot reach stored reconciliation state.
  */
 export function publicTerminalOutcome<T extends SdkPromptTerminalOutcome | undefined>(outcome: T): T {
 	if (outcome === undefined || outcome.kind !== "failed") return outcome;
-	// Remove the stored value FIRST, then re-add only a validated canonical
-	// snapshot: spreading an empty validation result over the original left a
+	// Remove the stored values FIRST, then re-add only validated canonical
+	// snapshots: spreading an empty validation result over the original left a
 	// rejected diagnostic in place, which is exactly the value that must not ship.
 	const failed = outcome as Extract<SdkPromptTerminalOutcome, { kind: "failed" }>;
 	const projected: Extract<SdkPromptTerminalOutcome, { kind: "failed" }> = { ...failed };
 	delete projected.providerDiagnostic;
+	delete projected.failureCauseDiagnostic;
 	const validated = providerDiagnosticField(failed.providerDiagnostic);
 	if (validated.providerDiagnostic !== undefined) projected.providerDiagnostic = validated.providerDiagnostic;
+	// Revalidate failureCauseDiagnostic: drop if invalid
+	if (isValidFailureCauseDiagnostic(failed.failureCauseDiagnostic)) {
+		projected.failureCauseDiagnostic = failed.failureCauseDiagnostic;
+	}
 	return projected as T;
 }
 
@@ -311,11 +320,21 @@ export function publishedPromptFailure(error: unknown): {
 }
 
 /**
+ * Whether a value is a valid failure cause diagnostic. Exact shape: string, non-empty,
+ * length ≤200. Extra keys, modified type, or absence makes it invalid so callers
+ * rewrite it. Used by reconciliation validation and durable outcome republish gates.
+ */
+export function isValidFailureCauseDiagnostic(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0 && value.length <= FAILURE_CAUSE_DIAGNOSTIC_MAX;
+}
+
+/**
  * Extract a bounded failure cause diagnostic for operator logs: error class name,
  * first line of message, and exit code/signal if available. Bounded to 200 chars,
  * secrets-redacted. Used for #408 to provide real cause in terminal_failure logs.
  */
 export function failureCauseDiagnostic(error: unknown): string | undefined {
+	if (error === null || error === undefined) return undefined;
 	try {
 		let className = "Error";
 		let message = "";
@@ -326,6 +345,15 @@ export function failureCauseDiagnostic(error: unknown): string | undefined {
 			// Extract first line of message only
 			const firstLine = (error.message || "").split("\n")[0] || "";
 			message = firstLine.slice(0, 100);
+			// Check for exitCode, signal, or code properties on Error instances
+			const errorAsObj = error as { signal?: unknown; exitCode?: unknown; code?: unknown };
+			if (typeof errorAsObj.signal === "string" && ["SIGTERM", "SIGKILL", "SIGABRT", "SIGSEGV", "SIGINT"].includes(errorAsObj.signal)) {
+				exitSignal = `signal=${errorAsObj.signal}`;
+			} else if (typeof errorAsObj.exitCode === "number" && Number.isInteger(errorAsObj.exitCode) && errorAsObj.exitCode >= 0 && errorAsObj.exitCode <= 255) {
+				exitSignal = `exit=${errorAsObj.exitCode}`;
+			} else if (typeof errorAsObj.code === "number" && Number.isInteger(errorAsObj.code) && errorAsObj.code >= 0 && errorAsObj.code <= 255) {
+				exitSignal = `code=${errorAsObj.code}`;
+			}
 		} else if (typeof error === "string") {
 			message = error.split("\n")[0]?.slice(0, 100) || "";
 		} else if (error !== null && typeof error === "object") {
@@ -339,15 +367,18 @@ export function failureCauseDiagnostic(error: unknown): string | undefined {
 				exitSignal = `signal=${candidate.signal}`;
 			} else if (typeof candidate.exitCode === "number" && Number.isInteger(candidate.exitCode) && candidate.exitCode >= 0 && candidate.exitCode <= 255) {
 				exitSignal = `exit=${candidate.exitCode}`;
+			} else if (typeof candidate.code === "number" && Number.isInteger(candidate.code) && candidate.code >= 0 && candidate.code <= 255) {
+				exitSignal = `code=${candidate.code}`;
 			}
 		}
 
 		const parts = [className, message, exitSignal].filter(Boolean);
 		const diagnostic = parts.join(" ");
-		// Sanitize to remove secrets
-		const sanitized = sanitizePromptFailure(diagnostic).message;
-
-		return sanitized.length > 0 ? sanitized.slice(0, 200) : undefined;
+		// Redact secrets from the diagnostic text
+		const redacted = redactCrashSecrets(diagnostic);
+		// Bound the final diagnostic to the maximum length
+		const bounded = redacted.slice(0, FAILURE_CAUSE_DIAGNOSTIC_MAX);
+		return bounded.length > 0 ? bounded : undefined;
 	} catch {
 		return undefined;
 	}

@@ -818,7 +818,7 @@ const isPreservedProviderFailure = (code: string | undefined): boolean =>
 
 /**
  * Durable reconciliation accepts only the bounded outcome vocabulary from
- * reconciliation-store.ts. Provider diagnostics keep their specific safe code
+/**
  * in `error`, while the durable outcome is normalized to the public failure
  * classifier so a failed terminal can never be quarantined on reload.
  */
@@ -828,6 +828,7 @@ function canonicalFailedOutcome(
 	evidence: PromptFailureEvidence = {},
 	providerCode?: string,
 	providerDiagnostic?: unknown,
+	error?: unknown,
 ): InvocationOutcome {
 	const deadline = provenance === "deadline" || failure?.code === "prompt_deadline_exceeded";
 	const known = typeof failure?.code === "string" ? failure.code : undefined;
@@ -842,6 +843,7 @@ function canonicalFailedOutcome(
 				: {}),
 		evidence,
 		...providerDiagnosticField(providerDiagnostic ?? failure?.providerDiagnostic),
+		...(error !== undefined ? { error } : {}),
 	});
 }
 
@@ -3141,7 +3143,7 @@ function createControlSurface(
 				...correlation,
 				error: failure,
 			});
-			publishTerminal(canonicalFailedOutcome(failure));
+			publishTerminal(canonicalFailedOutcome(failure, "agent_failed", {}, undefined, undefined, error));
 		};
 		const preflight = Promise.withResolvers<void>();
 		const preflightController = new AbortController();
@@ -6121,19 +6123,19 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const terminalEvidence = promptTerminalEvidenceFromAgentEnd(event);
 		const terminalOutcome =
 			failure !== undefined
-				? canonicalFailedOutcome(failure)
+				? canonicalFailedOutcome(failure, "agent_failed", {}, undefined, undefined, failure)
 				: event.stopReason === "cancelled" ||
 						(event.stopReason === "maintenance" && event.maintenanceOutcome === "aborted")
-					? terminalStoppedOutcome(
-							event.stopReason,
-							event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
-						)
-					: terminalEvidence.content?.text.trim() || terminalEvidence.hasActivity
-						? terminalStoppedOutcome(
-								event.stopReason,
-								event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
-							)
-						: canonicalFailedOutcome(EMPTY_PROMPT_FAILURE);
+				? terminalStoppedOutcome(
+						event.stopReason,
+						event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
+					)
+				: terminalEvidence.content?.text.trim() || terminalEvidence.hasActivity
+				? terminalStoppedOutcome(
+						event.stopReason,
+						event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
+					)
+				: canonicalFailedOutcome(EMPTY_PROMPT_FAILURE);
 		const releaseTerminalRetention = retainTerminalBoundaries(failureCandidates);
 		return trackLifecycle(async () => {
 			for (const invocation of failureCandidates) {
