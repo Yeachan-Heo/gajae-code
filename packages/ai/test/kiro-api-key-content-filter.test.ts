@@ -182,35 +182,35 @@ describe("Kiro API-key content filter #6150", () => {
 		);
 	});
 
-	test.each([undefined, "Request included ksk_test-secret"])(
-		"redacts secrets in structured refusal category and explanation (%s)",
-		async explanation => {
-			let finalError: AssistantMessage | undefined;
-			globalThis.fetch = (async () =>
-				new Response(
-					JSON.stringify({
-						stopReason: "CONTENT_FILTERED",
-						stopDetails: { refusal: { category: "ksk_test-secret", explanation } },
-					}),
-					{ status: 200 },
-				)) as unknown as typeof fetch;
+	test.each([
+		undefined,
+		"Request included ksk_test-secret",
+	])("redacts secrets in structured refusal category and explanation (%s)", async explanation => {
+		let finalError: AssistantMessage | undefined;
+		globalThis.fetch = (async () =>
+			new Response(
+				JSON.stringify({
+					stopReason: "CONTENT_FILTERED",
+					stopDetails: { refusal: { category: "ksk_test-secret", explanation } },
+				}),
+				{ status: 200 },
+			)) as unknown as typeof fetch;
 
-			try {
-				const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
-				for await (const event of stream) {
-					if (event.type === "error") finalError = event.error;
-				}
-			} finally {
-				globalThis.fetch = originalFetch;
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				if (event.type === "error") finalError = event.error;
 			}
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
 
-			expect(finalError?.errorMessage).toBe(
-				explanation
-					? "Kiro refused the request ([redacted]): Request included [redacted]"
-					: "Kiro refused the request ([redacted])",
-			);
-		},
-	);
+		expect(finalError?.errorMessage).toBe(
+			explanation
+				? "Kiro refused the request ([redacted]): Request included [redacted]"
+				: "Kiro refused the request ([redacted])",
+		);
+	});
 
 	test("ksk_ transport emits text_delta incrementally before stream ends", async () => {
 		const emittedEvents: Array<{ type: string }> = [];
@@ -722,8 +722,7 @@ describe("reasoning-before-answer contentIndex invariant #6151", () => {
 			// Simulate response with thinking tags followed by text (all in one content event)
 			// When thinking is parsed from a single content event, it's known BEFORE text starts
 			const responseBody = JSON.stringify({
-				content:
-					"<thinking>This is my reasoning about the request</thinking>The answer is 42.",
+				content: "<thinking>This is my reasoning about the request</thinking>The answer is 42.",
 			});
 			return new Response(responseBody, { status: 200 });
 		}) as unknown as typeof fetch;
@@ -735,11 +734,7 @@ describe("reasoning-before-answer contentIndex invariant #6151", () => {
 				region: "us-east-1",
 			});
 			for await (const event of stream) {
-				if (
-					event.type.includes("_start") ||
-					event.type.includes("_delta") ||
-					event.type.includes("_end")
-				) {
+				if (event.type.includes("_start") || event.type.includes("_delta") || event.type.includes("_end")) {
 					emittedEvents.push({
 						type: event.type,
 						contentIndex: (event as unknown as { contentIndex?: number }).contentIndex,
@@ -815,8 +810,7 @@ describe("reasoning-before-answer contentIndex invariant #6151", () => {
 			const responseBody =
 				JSON.stringify({
 					content: "<thinking>I need to read a file</thinking>Let me read that file for you.",
-				}) +
-				JSON.stringify({ toolUseId: "tool-123", name: "read_file", input: '{"path":"/tmp/test.txt"}' });
+				}) + JSON.stringify({ toolUseId: "tool-123", name: "read_file", input: '{"path":"/tmp/test.txt"}' });
 			return new Response(responseBody, { status: 200 });
 		}) as unknown as typeof fetch;
 
@@ -826,11 +820,7 @@ describe("reasoning-before-answer contentIndex invariant #6151", () => {
 				region: "us-east-1",
 			});
 			for await (const event of stream) {
-				if (
-					event.type.includes("_start") ||
-					event.type.includes("_delta") ||
-					event.type.includes("_end")
-				) {
+				if (event.type.includes("_start") || event.type.includes("_delta") || event.type.includes("_end")) {
 					emittedEvents.push({
 						type: event.type,
 						contentIndex: (event as unknown as { contentIndex?: number }).contentIndex,
@@ -862,9 +852,7 @@ describe("reasoning-before-answer contentIndex invariant #6151", () => {
 
 		// Each event type must have consistent contentIndex throughout its lifecycle
 		const getIndicesForType = (prefix: string) =>
-			emittedEvents
-				.filter(e => e.type.startsWith(prefix))
-				.map(e => e.contentIndex);
+			emittedEvents.filter(e => e.type.startsWith(prefix)).map(e => e.contentIndex);
 
 		const thinkingIndices = getIndicesForType("thinking");
 		const textIndices = getIndicesForType("text");
@@ -907,11 +895,7 @@ describe("reasoning-before-answer contentIndex invariant #6151", () => {
 				region: "us-east-1",
 			});
 			for await (const event of stream) {
-				if (
-					event.type.includes("_start") ||
-					event.type.includes("_delta") ||
-					event.type.includes("_end")
-				) {
+				if (event.type.includes("_start") || event.type.includes("_delta") || event.type.includes("_end")) {
 					emittedEvents.push({
 						type: event.type,
 						contentIndex: (event as unknown as { contentIndex?: number }).contentIndex,

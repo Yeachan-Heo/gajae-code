@@ -431,4 +431,151 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 			expect(msg.duration).toBeGreaterThanOrEqual(0);
 		}
 	});
+
+	test("refusal with MALWARE category produces authenticated safety stop", async () => {
+		const events: Array<{ type: string; message?: { errorMessage?: string; errorKind?: string } }> = [];
+
+		const metadataWithMalware = encodeFrame(
+			{ ":message-type": "event", ":event-type": "metadataEvent" },
+			new TextEncoder().encode(
+				JSON.stringify({
+					stopReason: "CONTENT_FILTERED",
+					stopDetails: {
+						refusal: {
+							category: "MALWARE",
+							explanation: "Request violates malware policy",
+						},
+					},
+				}),
+			),
+		);
+
+		globalThis.fetch = (async () => {
+			return new Response(streamFrom([metadataWithMalware]), {
+				status: 200,
+				headers: { "content-type": "application/vnd.amazon.eventstream" },
+			});
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = trustedStreamKiroCodeWhisperer(model, context, { apiKey: "token", region: "us-east-1" });
+			for await (const event of stream) {
+				events.push({
+					type: event.type,
+					message: "error" in event ? event.error : "partial" in event ? event.partial : undefined,
+				});
+			}
+		} catch {
+			// Stream may throw; errors are captured in events
+		}
+
+		globalThis.fetch = originalFetch;
+
+		// Should have error event with refusal message
+		const errorEvent = events.find(e => e.type === "error");
+		expect(errorEvent).toBeDefined();
+		expect(errorEvent?.message?.errorMessage).toContain("Kiro refused the request (MALWARE)");
+		expect(errorEvent?.message?.errorMessage).toContain("Request violates malware policy");
+
+		// Should have errorKind set to provider_safety_stop (authenticated, not fallback)
+		expect(errorEvent?.message?.errorKind).toBe("provider_safety_stop");
+	});
+
+	test("refusal with BLOCKED category produces authenticated safety stop", async () => {
+		const events: Array<{ type: string; message?: { errorMessage?: string; errorKind?: string } }> = [];
+
+		const metadataWithBlocked = encodeFrame(
+			{ ":message-type": "event", ":event-type": "metadataEvent" },
+			new TextEncoder().encode(
+				JSON.stringify({
+					stopReason: "CONTENT_FILTERED",
+					stopDetails: {
+						refusal: {
+							category: "BLOCKED",
+							explanation: "Request blocked by safety policy",
+						},
+					},
+				}),
+			),
+		);
+
+		globalThis.fetch = (async () => {
+			return new Response(streamFrom([metadataWithBlocked]), {
+				status: 200,
+				headers: { "content-type": "application/vnd.amazon.eventstream" },
+			});
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = trustedStreamKiroCodeWhisperer(model, context, { apiKey: "token", region: "us-east-1" });
+			for await (const event of stream) {
+				events.push({
+					type: event.type,
+					message: "error" in event ? event.error : "partial" in event ? event.partial : undefined,
+				});
+			}
+		} catch {
+			// Stream may throw; errors are captured in events
+		}
+
+		globalThis.fetch = originalFetch;
+
+		// Should have error event with refusal message
+		const errorEvent = events.find(e => e.type === "error");
+		expect(errorEvent).toBeDefined();
+		expect(errorEvent?.message?.errorMessage).toContain("Kiro refused the request (BLOCKED)");
+		expect(errorEvent?.message?.errorMessage).toContain("Request blocked by safety policy");
+
+		// Should have errorKind set to provider_safety_stop (authenticated, not fallback)
+		expect(errorEvent?.message?.errorKind).toBe("provider_safety_stop");
+	});
+
+	test("refusal with CYBER category still produces authenticated safety stop", async () => {
+		const events: Array<{ type: string; message?: { errorMessage?: string; errorKind?: string } }> = [];
+
+		const metadataWithCyber = encodeFrame(
+			{ ":message-type": "event", ":event-type": "metadataEvent" },
+			new TextEncoder().encode(
+				JSON.stringify({
+					stopReason: "CONTENT_FILTERED",
+					stopDetails: {
+						refusal: {
+							category: "CYBER",
+							explanation: "Request violates cyber security policy",
+						},
+					},
+				}),
+			),
+		);
+
+		globalThis.fetch = (async () => {
+			return new Response(streamFrom([metadataWithCyber]), {
+				status: 200,
+				headers: { "content-type": "application/vnd.amazon.eventstream" },
+			});
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = trustedStreamKiroCodeWhisperer(model, context, { apiKey: "token", region: "us-east-1" });
+			for await (const event of stream) {
+				events.push({
+					type: event.type,
+					message: "error" in event ? event.error : "partial" in event ? event.partial : undefined,
+				});
+			}
+		} catch {
+			// Stream may throw; errors are captured in events
+		}
+
+		globalThis.fetch = originalFetch;
+
+		// Should have error event with refusal message
+		const errorEvent = events.find(e => e.type === "error");
+		expect(errorEvent).toBeDefined();
+		expect(errorEvent?.message?.errorMessage).toContain("Kiro refused the request (CYBER)");
+		expect(errorEvent?.message?.errorMessage).toContain("Request violates cyber security policy");
+
+		// Should have errorKind set to provider_safety_stop (authenticated, not fallback)
+		expect(errorEvent?.message?.errorKind).toBe("provider_safety_stop");
+	});
 });

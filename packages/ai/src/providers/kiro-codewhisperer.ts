@@ -189,10 +189,12 @@ function handleKiroRefusal(
 	// Do not pass options.fetch as callerTransport: the refusal came from the
 	// provider's response, not from a caller-controlled fabrication.
 	const adapterInvocation = isProviderSafetyStopAdapterInvocation(options);
-	const useRefusalSignal = category || "refusal";
+	// Always use the generic 'refusal' signal for authentication, not the raw category
+	// (which may not be in the STRUCTURED_REFUSAL_SIGNALS allowlist). The category
+	// information is preserved in the errorMessage as diagnostic context.
 	const authenticated = mintProviderSafetyStop(
 		output,
-		useRefusalSignal,
+		"refusal",
 		PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
 		undefined,
 		adapterInvocation,
