@@ -416,7 +416,7 @@ import { type ExactMcpServerControlResult, MCPManager } from "../runtime-mcp/man
 import { attachExactMcpControls, getExactMcpControls, revokeExactMcpControls } from "../runtime-mcp/redaction";
 import type { NotificationSessionController } from "../sdk/bus/session-control";
 import { buildSyntheticModelId, syntheticNamespaceCollision } from "../sdk/model-profile-model";
-import { sanitizePromptFailure } from "../sdk/prompt-failure";
+import { failureCauseDiagnostic, isValidFailureCauseDiagnostic, sanitizePromptFailure } from "../sdk/prompt-failure";
 import type { SecretObfuscator } from "../secrets/obfuscator";
 import { formatNoCredentialOnboardingError, NoModelSelectedError } from "../setup/model-onboarding-guidance";
 import {
@@ -10011,16 +10011,19 @@ export class AgentSession {
 					deliveryScope,
 				);
 			} else if (event.type === "agent_failed") {
-				await this.#extensionRunner.emit(
-					{
-						type: "agent_failed",
-						error: sanitizePromptFailure(event.error),
-						scope: event.scope,
-						...(sdkRunToken ? { sdkRunToken } : {}),
-					},
-					undefined,
-					deliveryScope,
-				);
+				// Capture the original error diagnostic before sanitization
+				const originalDiagnostic = failureCauseDiagnostic(event.error);
+				const emittedEvent: any = {
+					type: "agent_failed",
+					error: sanitizePromptFailure(event.error),
+					scope: event.scope,
+					...(sdkRunToken ? { sdkRunToken } : {}),
+				};
+				// Add the original error diagnostic if valid
+				if (isValidFailureCauseDiagnostic(originalDiagnostic)) {
+					emittedEvent.failureCauseDiagnostic = originalDiagnostic;
+				}
+				await this.#extensionRunner.emit(emittedEvent, undefined, deliveryScope);
 			} else if (event.type === "agent_end") {
 				const extensionEvent = {
 					type: "agent_end" as const,

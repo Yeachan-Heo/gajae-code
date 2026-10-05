@@ -774,6 +774,10 @@ export interface AgentStartEvent extends SharedAgentStartEvent {
 export interface AgentFailedEvent {
 	type: "agent_failed";
 	error: AgentFailureDiagnostic;
+	/** Optional diagnostic of the original error cause captured before sanitization.
+	 * Contains class name, message, and signal/exit code information, sanitized but
+	 * untruncated, for operator diagnostics. Exact shape: string, non-empty, length ≤200. */
+	failureCauseDiagnostic?: string;
 	/** Internal SDK queue-owner binding for exact lifecycle attribution. */
 	sdkRunToken?: string;
 	/** Attempt correlation for the failing run, when scoped (matches the

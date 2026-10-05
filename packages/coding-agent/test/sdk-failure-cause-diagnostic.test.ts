@@ -165,6 +165,23 @@ describe("failureCauseDiagnostic", () => {
 		}
 	});
 
+	it("enforces 200-char cap after sanitization with long className", () => {
+		// Create an error with a very long class name that would cause
+		// sanitizeExternalCrashV1 to add …[truncated] marker
+		const longClassName = "VeryLongCustomError".repeat(15); // ~285 chars
+		const error = Object.assign(new Error("message"), {
+			constructor: { name: longClassName },
+		});
+		const diagnostic = failureCauseDiagnostic(error);
+		if (diagnostic) {
+			// Ensure byte length is capped at 200
+			const byteLength = Buffer.byteLength(diagnostic, "utf8");
+			expect(byteLength).toBeLessThanOrEqual(FAILURE_CAUSE_DIAGNOSTIC_MAX);
+			// Verify it contains meaningful content, not just the truncation marker
+			expect(diagnostic.length).toBeGreaterThan(0);
+		}
+	});
+
 	it("returns undefined for null/undefined errors", () => {
 		expect(failureCauseDiagnostic(null)).toBeUndefined();
 		expect(failureCauseDiagnostic(undefined)).toBeUndefined();

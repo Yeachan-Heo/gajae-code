@@ -423,7 +423,16 @@ export function failureCauseDiagnostic(error: unknown): string | undefined {
 		const diagnostic = parts.join(" ");
 		// Sanitize for outbound publication: strips paths, URLs, ANSI, credentials, and high-entropy identifiers
 		const verdict = sanitizeExternalCrashV1(diagnostic, FAILURE_CAUSE_DIAGNOSTIC_MAX);
-		return verdict.ok ? verdict.value : undefined;
+		if (!verdict.ok) return undefined;
+		// Enforce the cap after sanitization: sanitizeExternalCrashV1 may append …[truncated]
+		// which can exceed the original maxBytes, so re-truncate if necessary.
+		const sanitized = verdict.value;
+		if (Buffer.byteLength(sanitized, "utf8") <= FAILURE_CAUSE_DIAGNOSTIC_MAX) return sanitized;
+		const bytes = Buffer.from(sanitized, "utf8");
+		let end = FAILURE_CAUSE_DIAGNOSTIC_MAX;
+		while (end > 0 && ((bytes[end - 1] ?? 0) & 0xc0) === 0x80) end--;
+		if (end > 0 && (bytes[end - 1] ?? 0) >= 0xc0) end--;
+		return bytes.subarray(0, end).toString("utf8");
 	} catch {
 		return undefined;
 	}
