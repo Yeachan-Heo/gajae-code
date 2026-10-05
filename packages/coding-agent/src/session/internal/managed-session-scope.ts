@@ -3000,6 +3000,88 @@ export async function readManagedGcSessionRetirementReceiptReadOnly(
 	}
 }
 
+function hasManagedGcRetirementJournalWithoutWorkspace(scope: ManagedScope): boolean {
+	if (
+		path.resolve(scope.canonicalCwd) !== scope.canonicalCwd ||
+		scope.platform !== (process.platform === "win32" ? "win32" : "posix") ||
+		scope.directoryName !== `v2-${scopeDigest(scope.platform, scope.canonicalCwd)}`
+	)
+		throw new Error("managed_gc_scope_authority_mismatch");
+	const identity = fs.lstatSync(scope.directoryPath, { bigint: true });
+	if (!identity.isDirectory() || identity.isSymbolicLink()) throw new Error("managed_gc_scope_authority_mismatch");
+	const rootPath = configuredRootPath(scope);
+	const rootIdentity = fs.lstatSync(rootPath, { bigint: true });
+	const assertRoot = (): void => {
+		const security = validateNativeSecurityResult(
+			verifyExistingManagedScopeDirectory(rootPath),
+			"verify",
+			"directory",
+		);
+		const current = fs.lstatSync(rootPath, { bigint: true });
+		if (
+			!security.ok ||
+			!current.isDirectory() ||
+			current.isSymbolicLink() ||
+			current.dev !== rootIdentity.dev ||
+			current.ino !== rootIdentity.ino
+		)
+			throw new Error("managed_gc_scope_authority_mismatch");
+	};
+	assertRoot();
+	const rootAuthority = managedDirectoryRoot(rootPath);
+	if (
+		rootAuthority.dev !== BigInt.asUintN(64, rootIdentity.dev) ||
+		rootAuthority.ino !== BigInt.asUintN(64, rootIdentity.ino)
+	)
+		throw new Error("managed_gc_scope_authority_mismatch");
+	const store = new ManagedSessionDescendantStore(
+		rootAuthority,
+		scope.directoryPath,
+		undefined,
+		scope.platform === "win32" ? "windows-existing-verify-first" : "default",
+		scope.agentDir,
+		{
+			canonicalPath: scope.directoryPath,
+			dev: BigInt.asUintN(64, identity.dev),
+			ino: BigInt.asUintN(64, identity.ino),
+		},
+		"read-only",
+	);
+	try {
+		store.verifyRootSecurity();
+		const binding = store.readExpected(MANAGED_SESSION_BINDING_FILE);
+		if (!binding || validateBindingRaw(scope, binding.bytes.toString("utf8")))
+			throw new Error("managed_gc_scope_authority_mismatch");
+		const readNames = (): { identity: { dev: string; ino: string } | undefined; names: string[] } => {
+			let directoryIdentity: { dev: string; ino: string };
+			try {
+				directoryIdentity = store.captureDirectoryIdentity(MANAGED_GC_RETIREMENT_RECEIPTS);
+			} catch (error) {
+				if (hasFsCode(error, "ENOENT")) return { identity: undefined, names: [] };
+				throw error;
+			}
+			const names = fs.readdirSync(path.join(scope.directoryPath, MANAGED_GC_RETIREMENT_RECEIPTS)).sort();
+			const after = store.captureDirectoryIdentity(MANAGED_GC_RETIREMENT_RECEIPTS);
+			if (!util.isDeepStrictEqual(directoryIdentity, after)) throw new Error("managed_gc_scope_authority_mismatch");
+			return { identity: directoryIdentity, names };
+		};
+		const before = readNames();
+		const currentBinding = store.readExpected(MANAGED_SESSION_BINDING_FILE);
+		if (
+			!currentBinding ||
+			!util.isDeepStrictEqual(binding.identity, currentBinding.identity) ||
+			!binding.bytes.equals(currentBinding.bytes) ||
+			!util.isDeepStrictEqual(before, readNames())
+		)
+			throw new Error("managed_gc_scope_authority_mismatch");
+		store.verifyRootSecurity();
+		assertRoot();
+		return before.names.some(name => name.startsWith(MANAGED_GC_RETIREMENT_PREFIX));
+	} finally {
+		store.close();
+	}
+}
+
 /** Discover complete owner journals under authenticated existing v2 scopes without initializing storage. */
 export async function discoverManagedGcSessionRetirementReceipts(input: {
 	agentDir: string;
@@ -3045,6 +3127,21 @@ export async function discoverManagedGcSessionRetirementReceipts(input: {
 		if (!isBinding(bindingValue) || bindingValue.identityDigest !== entry.name.slice(3))
 			throw new Error("managed_gc_scope_authority_mismatch");
 		const resolved = resolveManagedGcScopeForRead({ cwd: bindingValue.canonicalPath, agentDir, sessionsRoot });
+		if (resolved.kind === "error" && resolved.code === "cwd_missing") {
+			const storedScope: ManagedScope = {
+				apiVersion: 1,
+				layoutVersion: MANAGED_SESSION_LAYOUT_VERSION,
+				identityVersion: MANAGED_SESSION_IDENTITY_VERSION,
+				agentDir,
+				sessionsRoot,
+				canonicalCwd: bindingValue.canonicalPath,
+				legacyLexicalCwd: bindingValue.canonicalPath,
+				directoryName: entry.name,
+				directoryPath: scopePath,
+				platform: bindingValue.platform,
+			};
+			if (!hasManagedGcRetirementJournalWithoutWorkspace(storedScope)) continue;
+		}
 		if (resolved.kind !== "resolved" || resolved.scope.directoryPath !== scopePath)
 			throw new Error("managed_gc_scope_authority_mismatch");
 		const scope = resolved.scope;
