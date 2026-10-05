@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Effort } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
-import { complete, getEnvApiKey, stream, streamSimple } from "@gajae-code/ai/stream";
+import { complete, completeSimple, getEnvApiKey, stream, streamSimple } from "@gajae-code/ai/stream";
 import type {
 	Api,
 	AssistantMessage,
@@ -12,6 +12,7 @@ import type {
 	ImageContent,
 	Model,
 	OptionsForApi,
+	SimpleStreamOptions,
 	Tool,
 	ToolResultMessage,
 } from "@gajae-code/ai/types";
@@ -246,6 +247,45 @@ describe("captured endpoint configuration in builtin stream dispatch", () => {
 		} finally {
 			setTestEnvValue("OPENAI_BASE_URL", previousBaseUrl);
 			setTestEnvValue("OPENAI_API_KEY", previousApiKey);
+		}
+	});
+});
+
+describe("simple builtin OAuth routing", () => {
+	it("keeps simple and complete requests canonical with captured and live proxies and caller fetch", async () => {
+		const previousBaseUrl = Bun.env.OPENAI_BASE_URL;
+		const requests: Array<{ url: string; authorization: string | null }> = [];
+		try {
+			Bun.env.OPENAI_BASE_URL = "https://captured-proxy.example/v1";
+			const endpointConfiguration = captureEndpointConfiguration();
+			Bun.env.OPENAI_BASE_URL = "https://live-proxy.example/v1";
+			using _hook = hookFetch(async () => {
+				throw new Error("Caller-owned fetch was dropped");
+			});
+			const options: SimpleStreamOptions = {
+				apiKey: "current-oauth-token",
+				authCredentialType: "oauth",
+				requestMaxRetries: 0,
+				streamMaxRetries: 0,
+				disableProviderRetries: true,
+				fetch: async (input, init) => {
+					const request = input instanceof Request ? input : new Request(String(input), init);
+					requests.push({ url: request.url, authorization: request.headers.get("authorization") });
+					return makeEndpointRoutingResponsesStream();
+				},
+			};
+			const model = makeEndpointRoutingModel();
+			const context: Context = { messages: [{ role: "user", content: "canonical", timestamp: 1 }] };
+			const simple = await collectCustomResult(streamSimple(model, context, { ...options, endpointConfiguration }));
+			const completed = await completeSimple(model, context, options);
+			expect(resultText(simple)).toBe("routed");
+			expect(resultText(completed)).toBe("routed");
+			expect(requests).toEqual([
+				{ url: "https://api.openai.com/v1/responses", authorization: "Bearer current-oauth-token" },
+				{ url: "https://api.openai.com/v1/responses", authorization: "Bearer current-oauth-token" },
+			]);
+		} finally {
+			setTestEnvValue("OPENAI_BASE_URL", previousBaseUrl);
 		}
 	});
 });
