@@ -2195,9 +2195,10 @@ describe("managed session write protocol", () => {
 		}
 	});
 	it.each([
+		"success",
 		"replacement-failure",
 		"destination-swap",
-	] as const)("keeps stale completion evidence when exact recertification encounters %s", async boundary => {
+	] as const)("closes exact recertification stores on %s without replaying transcript deletion", async boundary => {
 		const { cwd, sessionsRoot, scope } = await fixture();
 		const source = path.join(legacyDirectory(sessionsRoot, cwd), "recertification-boundary.jsonl");
 		await fs.mkdir(path.dirname(source), { recursive: true });
@@ -2214,6 +2215,14 @@ describe("managed session write protocol", () => {
 		const staleBytes = `${JSON.stringify(stale)}\n`;
 		await fs.writeFile(receipt, staleBytes);
 		const original = managedSessionStorage.ManagedSessionDescendantStore.prototype.replaceExpected;
+		const originalClose = managedSessionStorage.ManagedSessionDescendantStore.prototype.close;
+		const closed: managedSessionStorage.ManagedSessionDescendantStore[] = [];
+		let attemptedStore: managedSessionStorage.ManagedSessionDescendantStore | undefined;
+		const close = vi.spyOn(managedSessionStorage.ManagedSessionDescendantStore.prototype, "close");
+		close.mockImplementation(function (this: managedSessionStorage.ManagedSessionDescendantStore) {
+			closed.push(this);
+			originalClose.call(this);
+		});
 		let attempts = 0;
 		const replace = vi.spyOn(managedSessionStorage.ManagedSessionDescendantStore.prototype, "replaceExpected");
 		replace.mockImplementation(function (
@@ -2223,21 +2232,32 @@ describe("managed session write protocol", () => {
 			expected,
 		) {
 			attempts += 1;
+			attemptedStore = this;
 			if (boundary === "replacement-failure") throw new Error("test_exact_replacement_failed");
-			syncFs.renameSync(receipt, `${receipt}.retained`);
-			syncFs.copyFileSync(`${receipt}.retained`, receipt);
+			if (boundary === "destination-swap") {
+				syncFs.renameSync(receipt, `${receipt}.retained`);
+				syncFs.copyFileSync(`${receipt}.retained`, receipt);
+			}
 			return original.call(this, relative, bytes, expected);
 		});
 		try {
 			const cold = resolveManagedScope({ cwd, agentDir: path.dirname(sessionsRoot), sessionsRoot });
 			if (cold.kind !== "resolved") throw new Error(cold.message);
-			expect((await prepareManagedSessionScopeForWrite(cold.scope)).kind).toBe("error");
+			expect((await prepareManagedSessionScopeForWrite(cold.scope)).kind).toBe(
+				boundary === "success" ? "resolved" : "error",
+			);
 			expect(attempts).toBe(1);
-			expect(await fs.readFile(receipt, "utf8")).toBe(staleBytes);
+			expect(closed.filter(store => store === attemptedStore)).toHaveLength(1);
+			const observed = await fs.readFile(receipt, "utf8");
+			if (boundary === "success") {
+				const record = JSON.parse(observed) as { target: { identity: { sha256: string } } };
+				expect(record.target.identity.sha256).toBe(listed.owned[0].identity.sha256);
+			} else expect(observed).toBe(staleBytes);
 			await expect(fs.access(source)).rejects.toMatchObject({ code: "ENOENT" });
 			if (boundary === "destination-swap") expect(await fs.readFile(`${receipt}.retained`, "utf8")).toBe(staleBytes);
 		} finally {
 			replace.mockRestore();
+			close.mockRestore();
 		}
 	});
 
