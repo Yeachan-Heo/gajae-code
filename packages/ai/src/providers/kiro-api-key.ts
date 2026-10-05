@@ -674,6 +674,8 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			let thinkingIndex: number | undefined;
 			let textIndex: number | undefined;
 
+			let toolcallIndex: number | undefined;
+
 			const flushTool = () => {
 				if (!currentTool) return;
 				const args = currentTool.input.trim() ? currentTool.input : "{}";
@@ -691,6 +693,22 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				};
 				const index = blocks.length;
 				blocks.push({ ...toolCall, index });
+				if (toolcallIndex === undefined) {
+					toolcallIndex = index;
+					stream.push({ type: "toolcall_start", contentIndex: index, partial: output });
+				}
+				stream.push({
+					type: "toolcall_delta",
+					contentIndex: index,
+					delta: currentTool.input,
+					partial: output,
+				});
+				stream.push({
+					type: "toolcall_end",
+					contentIndex: index,
+					toolCall,
+					partial: output,
+				});
 				currentTool = undefined;
 			};
 
@@ -711,6 +729,15 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				const block = blocks[textIndex] as TextContent;
 				block.text += delta;
 				stream.push({ type: "text_delta", contentIndex: textIndex, delta, partial: output });
+			};
+
+			// Emit text_end if text block was opened
+			const closeTextBlock = () => {
+				if (textIndex !== undefined) {
+					const block = blocks[textIndex] as TextContent;
+					stream.push({ type: "text_end", contentIndex: textIndex, content: block.text, partial: output });
+					textIndex = undefined;
+				}
 			};
 
 			let inThink = false;
@@ -752,12 +779,19 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			const emitThinking = () => {
 				if (!thinkingAccumulated) return;
 				if (thinkingIndex === undefined) {
-					thinkingIndex = blocks.length;
-					blocks.push({
+					// Insert thinking at the beginning to preserve provider order (thinking before text)
+					thinkingIndex = 0;
+					blocks.unshift({
 						type: "thinking",
 						thinking: thinkingAccumulated,
-						index: thinkingIndex,
+						index: 0,
 					} as ThinkingContent & { index: number });
+					// Update indices of other blocks
+					for (let i = 1; i < blocks.length; i++) {
+						(blocks[i] as any).index = i;
+						if (i - 1 === textIndex) textIndex = i;
+						if (i - 1 === toolcallIndex) toolcallIndex = i;
+					}
 					stream.push({ type: "thinking_start", contentIndex: thinkingIndex, partial: output });
 					stream.push({
 						type: "thinking_delta",
@@ -782,22 +816,29 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				const { events, remaining } = parseKiroApiEvents(buffer);
 				buffer = remaining;
 
+				// Check if any terminal events (refusal/error) are present in this batch
+				const hasTerminalEvent = events.some(e => e.type === "refusal" || e.type === "error");
+
 				for (const event of events) {
 					if (event.type === "content") {
-						if (event.data === lastContent) continue;
-						lastContent = event.data;
-						consumeContent(event.data);
-					} else if (event.type === "toolUse") {
-						if (currentTool && currentTool.id !== event.data.toolUseId) flushTool();
-						if (!currentTool) {
-							currentTool = { id: event.data.toolUseId, name: event.data.name, input: event.data.input };
-						} else {
-							currentTool.input += event.data.input;
+						if (!hasTerminalEvent) {
+							if (event.data === lastContent) continue;
+							lastContent = event.data;
+							consumeContent(event.data);
 						}
-						if (event.data.stop) flushTool();
-					} else if (event.type === "toolUseInput" && currentTool) {
+					} else if (event.type === "toolUse") {
+						if (!hasTerminalEvent) {
+							if (currentTool && currentTool.id !== event.data.toolUseId) flushTool();
+							if (!currentTool) {
+								currentTool = { id: event.data.toolUseId, name: event.data.name, input: event.data.input };
+							} else {
+								currentTool.input += event.data.input;
+							}
+							if (event.data.stop) flushTool();
+						}
+					} else if (event.type === "toolUseInput" && currentTool && !hasTerminalEvent) {
 						currentTool.input += event.data.input;
-					} else if (event.type === "toolUseStop" && event.data.stop) {
+					} else if (event.type === "toolUseStop" && event.data.stop && !hasTerminalEvent) {
 						flushTool();
 					} else if (event.type === "usage") {
 						if (event.data.inputTokens !== undefined) output.usage.input = event.data.inputTokens;
@@ -855,8 +896,10 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				}
 			}
 
-			// Stream is done - emit accumulated thinking if any
+			// Stream is done - flush any pending tool, emit accumulated thinking, then close text block
+			flushTool();
 			emitThinking();
+			closeTextBlock();
 			const hasText = blocks.some(b => b.type === "text" && b.text.length > 0);
 			const hasTools = blocks.some(b => b.type === "toolCall");
 			if (!hasText && !hasTools) {
@@ -877,6 +920,11 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				output.usage.output = Math.max(1, Math.floor(text.length / 4));
 				output.usage.totalTokens = output.usage.input + output.usage.output;
 			}
+			// Rebuild output.content with reordered blocks (thinking first, then text/tools)
+			output.content = blocks.filter(
+				(b): b is TextContent | ThinkingContent | ToolCall =>
+					b.type === "text" || b.type === "thinking" || b.type === "toolCall",
+			);
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({ type: "done", reason: output.stopReason as "stop" | "toolUse", message: output });

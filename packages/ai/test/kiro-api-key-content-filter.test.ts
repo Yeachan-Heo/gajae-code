@@ -238,4 +238,139 @@ describe("Kiro API-key content filter #6150", () => {
 			expect(msg.duration).toBeGreaterThanOrEqual(0);
 		}
 	});
+
+	test("ksk_ transport emits toolcall_start/delta/end for successful tool calls", async () => {
+		const emittedEvents: Array<{ type: string; error?: string }> = [];
+
+		globalThis.fetch = (async () => {
+			// Response with a tool call (name and toolUseId indicate a tool use)
+			const responseBody = JSON.stringify({
+				toolUseId: "tool-1",
+				name: "read_file",
+				input: '{"path":"/etc/passwd"}',
+			});
+			return new Response(responseBody, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEvents.push({
+					type: event.type,
+					error:
+						event.type === "error" && "error" in event
+							? (event.error as { errorMessage?: string }).errorMessage
+							: undefined,
+				});
+			}
+		} catch (err) {
+			console.error("Stream threw:", err);
+		}
+
+		globalThis.fetch = originalFetch;
+
+		// Check that toolcall_start, toolcall_delta, and toolcall_end are emitted
+		const toolcallStart = emittedEvents.find(e => e.type === "toolcall_start");
+		const toolcallDelta = emittedEvents.find(e => e.type === "toolcall_delta");
+		const toolcallEnd = emittedEvents.find(e => e.type === "toolcall_end");
+
+		expect(toolcallStart).toBeDefined();
+		expect(toolcallDelta).toBeDefined();
+		expect(toolcallEnd).toBeDefined();
+
+		// Verify order: start -> delta -> end
+		const startIdx = emittedEvents.findIndex(e => e.type === "toolcall_start");
+		const deltaIdx = emittedEvents.findIndex(e => e.type === "toolcall_delta");
+		const endIdx = emittedEvents.findIndex(e => e.type === "toolcall_end");
+
+		expect(startIdx).toBeGreaterThanOrEqual(0);
+		expect(deltaIdx).toBeGreaterThan(startIdx);
+		expect(endIdx).toBeGreaterThan(deltaIdx);
+	});
+
+	test("ksk_ transport emits text_start/delta/end for text blocks", async () => {
+		const emittedEvents: Array<{ type: string; contentIndex?: number }> = [];
+
+		globalThis.fetch = (async () => {
+			const responseBody =
+				JSON.stringify({ content: "Hello world" }) + JSON.stringify({ usage: { inputTokens: 5, outputTokens: 2 } });
+			return new Response(responseBody, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEvents.push({
+					type: event.type,
+					contentIndex: "contentIndex" in event ? event.contentIndex : undefined,
+				});
+			}
+		} catch {
+			// Stream may throw; events are captured
+		}
+
+		globalThis.fetch = originalFetch;
+
+		// Check that text_start, text_delta, and text_end are emitted
+		const textStart = emittedEvents.find(e => e.type === "text_start");
+		const textDelta = emittedEvents.find(e => e.type === "text_delta");
+		const textEnd = emittedEvents.find(e => e.type === "text_end");
+
+		expect(textStart).toBeDefined();
+		expect(textDelta).toBeDefined();
+		expect(textEnd).toBeDefined();
+
+		// Verify order: start -> delta -> end
+		const startIdx = emittedEvents.findIndex(e => e.type === "text_start");
+		const deltaIdx = emittedEvents.findIndex(e => e.type === "text_delta");
+		const endIdx = emittedEvents.findIndex(e => e.type === "text_end");
+
+		expect(startIdx).toBeGreaterThanOrEqual(0);
+		expect(deltaIdx).toBeGreaterThan(startIdx);
+		expect(endIdx).toBeGreaterThan(deltaIdx);
+
+		// All should reference the same contentIndex
+		const textStartIdx = textStart?.contentIndex;
+		expect(textDelta?.contentIndex).toBe(textStartIdx);
+		expect(textEnd?.contentIndex).toBe(textStartIdx);
+	});
+
+	test("ksk_ transport preserves thinking before text in final message", async () => {
+		let finalMessage: unknown = undefined;
+
+		globalThis.fetch = (async () => {
+			// Response with thinking followed by text
+			const responseBody = JSON.stringify({ content: "<thinking>Let me think</thinking>Here is my answer" });
+			return new Response(responseBody, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				if (event.type === "done") {
+					finalMessage = "message" in event ? event.message : undefined;
+				}
+			}
+		} catch {
+			// Stream may throw
+		}
+
+		globalThis.fetch = originalFetch;
+
+		// Get the content blocks from the final message
+		const content = (finalMessage as { content?: unknown[] })?.content ?? [];
+		const blockTypes = (content as Array<{ type: string }>).map(b => b.type);
+
+		// Verify thinking comes before text in the final message
+		const thinkingIdx = blockTypes.indexOf("thinking");
+		const textIdx = blockTypes.indexOf("text");
+
+		if (thinkingIdx >= 0 && textIdx >= 0) {
+			expect(thinkingIdx).toBeLessThan(textIdx);
+		}
+
+		// Verify both blocks are present
+		expect(blockTypes.includes("thinking")).toBe(true);
+		expect(blockTypes.includes("text")).toBe(true);
+	});
 });
