@@ -8092,6 +8092,52 @@ describe("ModelRegistry", () => {
 			}
 		});
 
+		test("rejects discovery captured without an owned fallback when a key is granted in flight", async () => {
+			const provider = "llama.cpp";
+			const restoreKey = unsetEnvForTest("LLAMA_CPP_API_KEY");
+			const restoreBaseUrl = unsetEnvForTest("LLAMA_CPP_BASE_URL");
+			try {
+				writeRawModelsJson({
+					[provider]: {
+						baseUrl: "https://owned-fallback-absence.example.com/v1",
+						api: "openai-completions",
+						auth: "none",
+						discovery: { type: "openai-models-list" },
+					},
+				});
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				const owner = registry.getAuthStorageOwner();
+				const removeOwnedFallback = authStorage.setFallbackResolver(() => undefined, owner);
+				removeOwnedFallback();
+				expect(authStorage.hasAuth(provider, undefined, { owner })).toBe(false);
+				const { promise: response, resolve: resolveResponse } = Promise.withResolvers<Response>();
+				const requestStarted = Promise.withResolvers<void>();
+				using _hook = hookFetch(() => {
+					requestStarted.resolve();
+					return response;
+				});
+				try {
+					const refresh = registry.refreshProvider(provider, "online");
+					await requestStarted.promise;
+					authStorage.setFallbackResolver(() => "late-owned-key", owner);
+					resolveResponse(
+						new Response(JSON.stringify({ data: [{ id: "stale-absence-model" }] }), { status: 200 }),
+					);
+					await refresh;
+					expect(registry.find(provider, "stale-absence-model")).toBeUndefined();
+					// This provider is explicitly credentialless; verify the newly-owned key through AuthStorage's normal and peek APIs.
+					expect(authStorage.hasAuth(provider, undefined, { owner })).toBe(true);
+					await expect(authStorage.getApiKey(provider, undefined, { owner })).resolves.toBe("late-owned-key");
+					await expect(authStorage.peekApiKey(provider, { owner })).resolves.toBe("late-owned-key");
+				} finally {
+					await registry.dispose();
+				}
+			} finally {
+				restoreKey();
+				restoreBaseUrl();
+			}
+		});
+
 		test("keeps selected discovery evidence local to each registry", async () => {
 			writeRawModelsJson({
 				"discovery-provider": {

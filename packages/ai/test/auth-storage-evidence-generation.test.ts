@@ -70,6 +70,8 @@ describe("AuthStorage provider evidence generation", () => {
 		const ownerA = {};
 		const ownerB = {};
 		const ownerWithoutFallback = {};
+		const ownerLateFallback = {};
+		const aliasOwner = {};
 		authStorage.setFallbackResolver(() => "unowned-fallback", undefined);
 		authStorage.setFallbackResolver(() => "owner-a-v1", ownerA);
 		const forked = authStorage.forkConfigOwner(ownerA);
@@ -83,6 +85,35 @@ describe("AuthStorage provider evidence generation", () => {
 		expect(await authStorage.getApiKey(provider, undefined, { owner: ownerB })).toBe("owner-b-v2");
 		expect(await authStorage.getApiKey(provider, undefined, { owner: ownerWithoutFallback })).toBeUndefined();
 		expect(await authStorage.getApiKey(provider, undefined, { owner: forked })).toBe("owner-a-v1");
+		const lateAbsent = authStorage.getProviderConfigurationGeneration(provider, ownerLateFallback);
+		expect(await authStorage.getApiKey(provider, undefined, { owner: ownerLateFallback })).toBeUndefined();
+		const installLateFallback = authStorage.setFallbackResolver(() => "late-owner-key", ownerLateFallback);
+		expect(authStorage.getProviderConfigurationGeneration(provider, ownerLateFallback)).not.toBe(lateAbsent);
+		expect(await authStorage.getApiKey(provider, undefined, { owner: ownerLateFallback })).toBe("late-owner-key");
+		const removeLateFallback = authStorage.setFallbackResolver(() => "late-owner-reinstalled", ownerLateFallback);
+		installLateFallback();
+		expect(await authStorage.getApiKey(provider, undefined, { owner: ownerLateFallback })).toBe(
+			"late-owner-reinstalled",
+		);
+		removeLateFallback();
+		expect(await authStorage.getApiKey(provider, undefined, { owner: ownerLateFallback })).toBeUndefined();
+		const absentAgain = authStorage.getProviderConfigurationGeneration(provider, ownerLateFallback);
+		const reinstallLateFallback = authStorage.setFallbackResolver(() => "late-owner-final", ownerLateFallback);
+		expect(authStorage.getProviderConfigurationGeneration(provider, ownerLateFallback)).not.toBe(absentAgain);
+		installLateFallback();
+		expect(await authStorage.getApiKey(provider, undefined, { owner: ownerLateFallback })).toBe("late-owner-final");
+		reinstallLateFallback();
+		authStorage.setFallbackResolver(() => "canonical-codex-key", aliasOwner);
+		expect(await authStorage.getApiKey("openai-codex-device", undefined, { owner: aliasOwner })).toBe(
+			"canonical-codex-key",
+		);
+		expect(await authStorage.getApiKey("openai-codex", undefined, { owner: aliasOwner })).toBe("canonical-codex-key");
+		expect(authStorage.getProviderEvidenceGeneration("openai-codex-device", "canonical-codex-key", aliasOwner)).toBe(
+			authStorage.getProviderEvidenceGeneration("openai-codex", "canonical-codex-key", aliasOwner),
+		);
+		expect(authStorage.getProviderConfigurationGeneration("openai-codex-device", aliasOwner)).toBe(
+			authStorage.getProviderConfigurationGeneration("openai-codex", aliasOwner),
+		);
 		expect(authStorage.getProviderEvidenceGeneration(provider, "owner-a-v1", ownerA)).toBe(ownerAEvidence);
 		expect(authStorage.getProviderConfigurationGeneration(provider, ownerA)).toBe(ownerAConfiguration);
 		expect(authStorage.getProviderEvidenceGeneration(provider, "owner-b-v2", ownerB)).not.toBe(ownerAEvidence);
@@ -93,6 +124,10 @@ describe("AuthStorage provider evidence generation", () => {
 		expect(await authStorage.getApiKey(provider, undefined, { owner: forked })).toBe("owner-a-v1");
 		replaceOwnerA();
 		expect(await authStorage.getApiKey(provider, undefined, { owner: ownerA })).toBeUndefined();
+		const forkBeforeRelease = authStorage.getProviderEvidenceGeneration(provider, "owner-a-v1", forked);
+		authStorage.releaseConfigOwner(forked);
+		expect(authStorage.getProviderEvidenceGeneration(provider, "owner-a-v1", forked)).not.toBe(forkBeforeRelease);
+		expect(await authStorage.getApiKey(provider, undefined, { owner: forked })).toBeUndefined();
 	});
 
 	test("owned config changes preserve sibling evidence while shared row replacement invalidates it", async () => {

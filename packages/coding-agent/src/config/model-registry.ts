@@ -3288,6 +3288,11 @@ export class ModelRegistry {
 									result.provider,
 									this.#providerEvidenceApiKeys.get(result.provider),
 								) &&
+							result.configurationGeneration ===
+								this.authStorage.getProviderConfigurationGeneration(
+									result.provider,
+									this.#authStorageConfigOwner,
+								) &&
 							result.endpoint ===
 								this.#normalizeDiscoveryEvidenceEndpoint(
 									this.#effectiveDiscoveryProviderConfig(providerConfig).baseUrl ?? "",
@@ -3642,6 +3647,9 @@ export class ModelRegistry {
 		const isCurrentEndpoint = () =>
 			endpoint ===
 			this.#normalizeDiscoveryEvidenceEndpoint(this.#effectiveDiscoveryProviderConfig(providerConfig).baseUrl ?? "");
+		const isCurrentAuthConfiguration = () =>
+			preflightAuthConfigurationGeneration ===
+			this.authStorage.getProviderConfigurationGeneration(provider, this.#authStorageConfigOwner);
 		const isCurrentProviderRefresh = () =>
 			providerRefresh === undefined ||
 			("providerId" in providerRefresh
@@ -3713,7 +3721,7 @@ export class ModelRegistry {
 			},
 			getEvidenceGeneration: provider => this.#getProviderEvidenceGeneration(provider.provider, preflightApiKey),
 			cacheDynamicModelProvenance: cacheLookupProvenance,
-			canPublishCache: () => isCurrentEndpoint() && isCurrentProviderRefresh(),
+			canPublishCache: () => isCurrentAuthConfiguration() && isCurrentEndpoint() && isCurrentProviderRefresh(),
 		});
 		const authGeneration =
 			mergeInput.authGeneration ??
@@ -3721,6 +3729,7 @@ export class ModelRegistry {
 		const current =
 			mergeInput.current &&
 			authGeneration === this.#getProviderEvidenceGeneration(effectiveProviderConfig.provider, preflightApiKey) &&
+			isCurrentAuthConfiguration() &&
 			isCurrentEndpoint();
 		if (!current) {
 			return {

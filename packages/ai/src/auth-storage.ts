@@ -1485,6 +1485,7 @@ export class AuthStorage {
 	#ownedFallbackResolvers: Map<object, (provider: string) => string | undefined> = new Map();
 	#ownerProviderGenerations = new WeakMap<object, Map<string, number>>();
 	#ownerFallbackGenerations = new WeakMap<object, number>();
+	#observedConfigOwners = new WeakSet<object>();
 	#sharedProviderGenerations = new Map<string, number>();
 	#sharedProviderConfigurationGenerations = new Map<string, number>();
 	#fallbackGeneration = 0;
@@ -1609,6 +1610,7 @@ export class AuthStorage {
 	getProviderConfigurationGeneration(provider: string, owner?: object): number {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		if (!owner) return this.#getProviderConfigurationGeneration(storageProvider) + this.#fallbackGeneration;
+		this.#observedConfigOwners.add(owner);
 		return (
 			this.#getSharedProviderConfigurationGeneration(storageProvider) +
 			this.#getOwnerProviderGeneration(owner, storageProvider) +
@@ -1646,6 +1648,7 @@ export class AuthStorage {
 		const fork = this.#configOwnerForks.get(owner);
 		const generations = fork?.providerGenerations ?? this.#ownerProviderGenerations.get(owner) ?? new Map();
 		generations.set(key, (generations.get(key) ?? 0) + 1);
+		this.#observedConfigOwners.add(owner);
 		if (!fork) this.#ownerProviderGenerations.set(owner, generations);
 	}
 	#bumpOwnerFallbackGeneration(owner: object): void {
@@ -1656,6 +1659,7 @@ export class AuthStorage {
 	#configOverrideRegistration(provider: string, owner?: object): ConfigApiKeyRegistration | undefined {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		if (owner) {
+			this.#observedConfigOwners.add(owner);
 			const fork = this.#configOwnerForks.get(owner);
 			if (fork) return fork.registrations.get(storageProvider);
 			if (this.#disposedConfigOwnerForks.has(owner)) return undefined;
@@ -2383,9 +2387,8 @@ export class AuthStorage {
 	}
 
 	/**
-	 * Capture one owner's effective config API-key registrations in an isolated,
-	 * scoped-only owner. Stored credentials, selectors, runtime overrides, and
-	 * fallback resolvers remain shared AuthStorage authority.
+	 * Capture one owner's config API keys and fallback resolver in an isolated
+	 * scope. Credentials, selectors, runtime overrides, and OAuth remain shared.
 	 */
 	forkConfigOwner(sourceOwner: object): object {
 		if (this.#disposedConfigOwnerForks.has(sourceOwner)) {
@@ -2404,6 +2407,7 @@ export class AuthStorage {
 			registrations.set(provider, { ...registration });
 			nextRegistrationOrder = Math.max(nextRegistrationOrder, registration.order);
 		}
+		this.#observedConfigOwners.add(sourceOwner);
 		const owner = {};
 		const sourceFork = this.#configOwnerForks.get(sourceOwner);
 		this.#configOwnerForks.set(owner, {
@@ -2450,6 +2454,7 @@ export class AuthStorage {
 					order: ++fork.nextRegistrationOrder,
 				});
 				fork.providerGenerations.set(storageProvider, (fork.providerGenerations.get(storageProvider) ?? 0) + 1);
+				this.#observedConfigOwners.add(options.owner);
 				return;
 			}
 			if (this.#disposedConfigOwnerForks.has(options.owner)) {
@@ -2481,6 +2486,7 @@ export class AuthStorage {
 			if (fork) {
 				if (!fork.registrations.delete(storageProvider)) return;
 				fork.providerGenerations.set(storageProvider, (fork.providerGenerations.get(storageProvider) ?? 0) + 1);
+				this.#observedConfigOwners.add(owner);
 				return;
 			}
 			if (this.#disposedConfigOwnerForks.has(owner)) return;
@@ -2506,6 +2512,7 @@ export class AuthStorage {
 				for (const provider of fork.registrations.keys()) {
 					fork.providerGenerations.set(provider, (fork.providerGenerations.get(provider) ?? 0) + 1);
 				}
+				this.#observedConfigOwners.add(owner);
 				fork.registrations.clear();
 				return;
 			}
@@ -2529,13 +2536,13 @@ export class AuthStorage {
 	/** Permanently release an owner returned by forkConfigOwner. Idempotent for forks. */
 	releaseConfigOwner(owner: object): void {
 		if (this.#disposedConfigOwnerForks.has(owner)) return;
-		if (!this.#configOwnerForks.delete(owner)) {
-			throw new Error("Cannot release an owner that was not created by forkConfigOwner");
-		}
-		if (this.#ownedFallbackResolvers.delete(owner)) {
-			this.#fallbackGeneration += 1;
-			this.#bumpGeneration("release-fallback-resolver");
-		}
+		const fork = this.#configOwnerForks.get(owner);
+		if (!fork) throw new Error("Cannot release an owner that was not created by forkConfigOwner");
+		for (const provider of fork.registrations.keys()) this.#bumpOwnerProviderGeneration(owner, provider);
+		if (this.#ownedFallbackResolvers.delete(owner)) this.#bumpOwnerFallbackGeneration(owner);
+		this.#ownerProviderGenerations.set(owner, new Map(fork.providerGenerations));
+		this.#ownerFallbackGenerations.set(owner, fork.fallbackGeneration);
+		this.#configOwnerForks.delete(owner);
 		this.#disposedConfigOwnerForks.add(owner);
 	}
 
@@ -2571,16 +2578,15 @@ export class AuthStorage {
 			if (this.#disposedConfigOwnerForks.has(owner)) throw new Error("Cannot update a released config owner");
 			const previous = this.#ownedFallbackResolvers.get(owner);
 			this.#ownedFallbackResolvers.set(owner, resolver);
-			if (previous) {
+			if (previous || this.#observedConfigOwners.has(owner)) {
 				this.#bumpOwnerFallbackGeneration(owner);
-				this.#fallbackGeneration += 1;
-				this.#bumpGeneration("replace-fallback-resolver");
+				this.#bumpGeneration(previous ? "replace-fallback-resolver" : "set-fallback-resolver");
 			}
+			this.#observedConfigOwners.add(owner);
 			return () => {
 				if (this.#ownedFallbackResolvers.get(owner) !== resolver) return;
 				this.#ownedFallbackResolvers.delete(owner);
 				this.#bumpOwnerFallbackGeneration(owner);
-				this.#fallbackGeneration += 1;
 				this.#bumpGeneration("remove-fallback-resolver");
 			};
 		}
@@ -2596,7 +2602,10 @@ export class AuthStorage {
 	}
 
 	#resolveFallback(provider: string, owner?: object): string | undefined {
-		if (owner) return this.#ownedFallbackResolvers.get(owner)?.(provider);
+		if (owner) {
+			this.#observedConfigOwners.add(owner);
+			return this.#ownedFallbackResolvers.get(owner)?.(provider);
+		}
 		for (const resolver of [...this.#ownedFallbackResolvers.values()].reverse()) {
 			const value = resolver(provider);
 			if (value !== undefined) return value;
