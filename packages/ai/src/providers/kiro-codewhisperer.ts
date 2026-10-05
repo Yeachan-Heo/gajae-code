@@ -334,12 +334,9 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 				);
 			}
 
-			// Stage event payloads to buffer content until we confirm no refusal is present.
-			// This prevents partial text/tool-call events from being emitted if the stream
-			// ends with a refusal metadata event.
-			
-
-			// Collect all event frames from the eventstream
+			// Text and tool events stream as frames arrive. A refusal arrives as a
+			// terminal metadata frame after reasoning-only frames (#6150), so reasoning
+			// is never surfaced as the answer and nothing is buffered.
 			for await (const message of decodeEventStream(response.body)) {
 				if (options.signal?.aborted) break;
 
@@ -365,8 +362,6 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 
 				const payload = safeParsePayload(message.payload);
 				if (!payload) continue;
-
-				// Stage the event for processing after we scan for refusals
 
 				// Check for refusal in metadata events
 				if (eventType === "metadataEvent") {
@@ -446,8 +441,6 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 					throw new Error(`Kiro CodeWhisperer stream error: ${errorPayload.error.message}`);
 				}
 			}
-
-			
 
 			if (options.signal?.aborted) throw new Error("Request was aborted");
 
