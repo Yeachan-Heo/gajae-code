@@ -855,6 +855,10 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						}
 					} else if (event.type === "toolUse") {
 						if (!hasTerminalEvent) {
+							if (!firstTokenEmitted) {
+								firstTokenEmitted = true;
+								firstTokenTime = Date.now();
+							}
 							if (currentTool && currentTool.id !== event.data.toolUseId) addToolToBlocks();
 							if (!currentTool) {
 								currentTool = { id: event.data.toolUseId, name: event.data.name, input: event.data.input };
@@ -864,6 +868,10 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 							if (event.data.stop) addToolToBlocks();
 						}
 					} else if (event.type === "toolUseInput" && currentTool && !hasTerminalEvent) {
+						if (!firstTokenEmitted) {
+							firstTokenEmitted = true;
+							firstTokenTime = Date.now();
+						}
 						currentTool.input += event.data.input;
 					} else if (event.type === "toolUseStop" && event.data.stop && !hasTerminalEvent) {
 						addToolToBlocks();
