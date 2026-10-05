@@ -52,6 +52,16 @@ function mockFetchOnce(body: string): void {
 	global.fetch = Object.assign(fn, { preconnect: originalFetch.preconnect });
 }
 
+function mockFetchSequence(bodies: string[]): { requests: () => number } {
+	let requests = 0;
+	const fn = async (): Promise<Response> => {
+		const body = bodies[Math.min(requests++, bodies.length - 1)];
+		return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+	};
+	global.fetch = Object.assign(fn, { preconnect: originalFetch.preconnect });
+	return { requests: () => requests };
+}
+
 const USAGE = { input_tokens: 5, output_tokens: 3, total_tokens: 8, input_tokens_details: { cached_tokens: 0 } };
 
 describe("openai-codex: truncated tool-call detection", () => {
@@ -170,5 +180,195 @@ describe("openai-codex: truncated tool-call detection", () => {
 		result = await streamOpenAICodexResponses(model(), context(), { apiKey: token() }).result();
 		tools = result.content.filter((b): b is ToolCall => b.type === "toolCall");
 		expect(tools[0].incompleteArguments).toBeFalsy();
+	});
+
+	it("retries a timeout after only an incomplete function call", async () => {
+		setAgentDir(TempDir.createSync("@pi-codex-trunc-").path());
+		const timeout = sse([
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "read_file", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_1", output_index: 0, delta: '{"path":"' },
+			{
+				type: "error",
+				code: "request_timeout",
+				message: "stream disconnected before completion: stream closed before response.completed",
+			},
+		]);
+		const success = sse([
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "function_call", id: "fc_2", call_id: "call_2", name: "read_file", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_2", output_index: 0, delta: '{"path":"a.ts"}' },
+			{
+				type: "response.function_call_arguments.done",
+				item_id: "fc_2",
+				output_index: 0,
+				arguments: '{"path":"a.ts"}',
+			},
+			{
+				type: "response.output_item.done",
+				output_index: 0,
+				item: {
+					type: "function_call",
+					id: "fc_2",
+					call_id: "call_2",
+					name: "read_file",
+					arguments: '{"path":"a.ts"}',
+				},
+			},
+			{ type: "response.completed", response: { status: "completed", usage: USAGE } },
+		]);
+		const fetches = mockFetchSequence([timeout, success]);
+
+		const result = await streamOpenAICodexResponses(model(), context(), { apiKey: token() }).result();
+		expect(fetches.requests()).toBe(2);
+		expect(result.stopReason).toBe("toolUse");
+		const tools = result.content.filter((block): block is ToolCall => block.type === "toolCall");
+		expect(tools).toHaveLength(1);
+		expect(tools[0].id).toBe("call_2|fc_2");
+		expect(tools[0].arguments).toEqual({ path: "a.ts" });
+		expect(tools[0].incompleteArguments).toBeFalsy();
+	});
+
+	it("does not retry a timeout when non-empty text was emitted", async () => {
+		setAgentDir(TempDir.createSync("@pi-codex-trunc-").path());
+		const fetches = mockFetchSequence([
+			sse([
+				{
+					type: "response.output_item.added",
+					output_index: 0,
+					item: { type: "message", id: "msg_1", content: [] },
+				},
+				{
+					type: "response.content_part.added",
+					item_id: "msg_1",
+					output_index: 0,
+					part: { type: "output_text", text: "hello" },
+				},
+				{ type: "response.output_text.delta", item_id: "msg_1", output_index: 0, delta: "hello" },
+				{
+					type: "error",
+					code: "request_timeout",
+					message: "stream disconnected before completion: stream closed before response.completed",
+				},
+			]),
+		]);
+
+		const result = await streamOpenAICodexResponses(model(), context(), { apiKey: token() }).result();
+		expect(fetches.requests()).toBe(1);
+		expect(result.stopReason).toBe("error");
+	});
+
+	it("does not retry a second consecutive timeout", async () => {
+		setAgentDir(TempDir.createSync("@pi-codex-trunc-").path());
+		const timeout = sse([
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "read_file", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_1", output_index: 0, delta: '{"path":"' },
+			{
+				type: "error",
+				code: "request_timeout",
+				message: "stream disconnected before completion: stream closed before response.completed",
+			},
+		]);
+		const fetches = mockFetchSequence([timeout, timeout]);
+
+		const result = await streamOpenAICodexResponses(model(), context(), { apiKey: token() }).result();
+		expect(fetches.requests()).toBe(2);
+		expect(result.stopReason).toBe("error");
+	});
+
+	it("does not retry an incomplete timeout when retries are exhausted", async () => {
+		setAgentDir(TempDir.createSync("@pi-codex-trunc-").path());
+		const fetches = mockFetchSequence([
+			sse([
+				{
+					type: "response.output_item.added",
+					output_index: 0,
+					item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "read_file", arguments: "" },
+				},
+				{ type: "response.function_call_arguments.delta", item_id: "fc_1", output_index: 0, delta: '{"path":"' },
+				{ type: "error", code: "request_timeout", message: "stream closed before response.completed" },
+			]),
+		]);
+
+		const result = await streamOpenAICodexResponses(model(), context(), {
+			apiKey: token(),
+			streamMaxRetries: 0,
+		}).result();
+
+		expect(fetches.requests()).toBe(1);
+		expect(result.stopReason).toBe("error");
+	});
+
+	it("does not retry a finalized tool call followed by timeout", async () => {
+		setAgentDir(TempDir.createSync("@pi-codex-trunc-").path());
+		const fetches = mockFetchSequence([
+			sse([
+				{
+					type: "response.output_item.added",
+					output_index: 0,
+					item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "read_file", arguments: "" },
+				},
+				{
+					type: "response.function_call_arguments.delta",
+					item_id: "fc_1",
+					output_index: 0,
+					delta: '{"path":"a.ts"}',
+				},
+				{
+					type: "response.output_item.done",
+					output_index: 0,
+					item: {
+						type: "function_call",
+						id: "fc_1",
+						call_id: "call_1",
+						name: "read_file",
+						arguments: '{"path":"a.ts"}',
+					},
+				},
+				{ type: "error", code: "request_timeout", message: "stream closed before response.completed" },
+			]),
+		]);
+
+		const result = await streamOpenAICodexResponses(model(), context(), { apiKey: token() }).result();
+
+		expect(fetches.requests()).toBe(1);
+		expect(result.stopReason).toBe("toolUse");
+	});
+
+	it("does not retry an incomplete timeout after abort", async () => {
+		setAgentDir(TempDir.createSync("@pi-codex-trunc-").path());
+		const abort = new AbortController();
+		const fetches = mockFetchSequence([
+			sse([
+				{
+					type: "response.output_item.added",
+					output_index: 0,
+					item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "read_file", arguments: "" },
+				},
+				{ type: "response.function_call_arguments.delta", item_id: "fc_1", output_index: 0, delta: '{"path":"' },
+				{ type: "error", code: "request_timeout", message: "stream closed before response.completed" },
+			]),
+		]);
+
+		const result = await streamOpenAICodexResponses(model(), context(), {
+			apiKey: token(),
+			signal: abort.signal,
+			onSseEvent: event => {
+				if (event.data.includes('"request_timeout"')) abort.abort();
+			},
+		}).result();
+
+		expect(fetches.requests()).toBe(1);
+		expect(result.stopReason).toBe("aborted");
 	});
 });

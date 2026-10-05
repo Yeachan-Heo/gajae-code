@@ -789,6 +789,84 @@ describe("openai-codex streaming", () => {
 		]);
 	});
 
+	it("does not replay a released partial call after a timeout retry", async () => {
+		const firstPartial = [
+			{
+				type: "response.output_item.added",
+				item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "old_tool", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_1", delta: '{"old":' },
+		];
+		const secondTimeout = createCodexErrorSse([
+			{
+				type: "response.output_item.added",
+				item: { type: "function_call", id: "fc_2", call_id: "call_2", name: "old_tool", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_2", delta: '{"old":' },
+			{ type: "error", code: "request_timeout", message: "stream closed before response.completed" },
+		]);
+		let requestCount = 0;
+		global.fetch = vi.fn(async (_input, _init) => {
+			requestCount += 1;
+			if (requestCount === 1) return createSocketCloseCodexSse(undefined, firstPartial);
+			return new Response(secondTimeout, { status: 200, headers: { "content-type": "text/event-stream" } });
+		}) as unknown as typeof fetch;
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		const stream = streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken() },
+		);
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) events.push(event);
+		const result = await stream.result();
+
+		expect(requestCount).toBe(2);
+		expect(result.stopReason).toBe("error");
+		expect(events.filter(event => event.type === "toolcall_start")).toHaveLength(1);
+	});
+
+	it("does not replay a partial call after timeout retry consumes the replay", async () => {
+		const firstTimeout = createCodexErrorSse([
+			{
+				type: "response.output_item.added",
+				item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "old_tool", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_1", delta: '{"old":' },
+			{ type: "error", code: "request_timeout", message: "stream closed before response.completed" },
+		]);
+		const secondPartial = [
+			{
+				type: "response.output_item.added",
+				item: { type: "function_call", id: "fc_2", call_id: "call_2", name: "old_tool", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_2", delta: '{"old":' },
+		];
+		let requestCount = 0;
+		global.fetch = vi.fn(async (_input, _init) => {
+			requestCount += 1;
+			if (requestCount === 1) {
+				return new Response(firstTimeout, { status: 200, headers: { "content-type": "text/event-stream" } });
+			}
+			return createSocketCloseCodexSse(undefined, secondPartial);
+		}) as unknown as typeof fetch;
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		const stream = streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken() },
+		);
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) events.push(event);
+		const result = await stream.result();
+
+		expect(requestCount).toBe(2);
+		expect(result.stopReason).toBe("error");
+		expect(events.filter(event => event.type === "toolcall_start")).toHaveLength(1);
+	});
+
 	it("does not replay an ECONNRESET socket close after visible text", async () => {
 		const partial = [
 			{
