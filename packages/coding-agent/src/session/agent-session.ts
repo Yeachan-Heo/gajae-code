@@ -4053,6 +4053,8 @@ export class AgentSession {
 	// keep waiting on them; their own finally still runs if the stream ever ends.
 	readonly #abandonedInFlightPrompts = new Set<symbol>();
 	#agentEventHandlersInFlight = 0;
+	readonly #agentEventHandlersByScope = new Map<AttemptScope, number>();
+	readonly #sdkTerminalPublications = new Set<AgentSessionEvent>();
 	#queuedExtensionEventCount = 0;
 	#extensionTurnGeneration = 0;
 	#closedExtensionTurnGeneration: number | undefined;
@@ -5169,24 +5171,32 @@ export class AgentSession {
 		if (errors.length > 1) throw new AggregateError(errors, "Multiple deferred prompt messages failed to flush");
 	}
 
-	#flushPendingAgentEnd(): void {
-		for (const sdkPending of this.#pendingSdkAgentEnds) {
-			if (!this.#agentEndContinuationDecisions.has(sdkPending)) continue;
-			if ([...this.#pendingAgentEndContinuationHolds.values()].includes(sdkPending)) continue;
-			this.#pendingSdkAgentEnds.delete(sdkPending);
-			if (this.#pendingAgentEndEmit === sdkPending) this.#pendingAgentEndEmit = undefined;
-			const sdkLease = this.#deferredAgentEndLeases.get(sdkPending);
-			this.#deferredAgentEndLeases.delete(sdkPending);
-			this.#startAgentEndPublication(sdkPending, sdkLease);
+	#canPublishAgentEnd(event: AgentSessionEvent): boolean {
+		const scope = (event as AgentSessionEvent & { scope?: AttemptScope }).scope;
+		if (this.#livePromptsInFlight() > 0) return false;
+		const sdkRunToken = scope === undefined ? undefined : this.#sdkRunTokensByAttemptScope.get(scope);
+				if (sdkRunToken !== undefined) {
+			for (const [handlerScope, count] of this.#agentEventHandlersByScope)
+				if (count > 0 && this.#sdkRunTokensByAttemptScope.get(handlerScope) === sdkRunToken) return false;
+			for (const held of this.#pendingAgentEndContinuationHolds.values()) {
+				const heldScope = (held as AgentSessionEvent & { scope?: AttemptScope }).scope;
+				if (held === event || (heldScope !== undefined && this.#sdkRunTokensByAttemptScope.get(heldScope) === sdkRunToken)) return false;
+			}
+			return true;
 		}
+		return this.#agentEventHandlersInFlight === 0 && this.#pendingAgentEndContinuationHolds.size === 0;
+	}
+
+	#hasSdkQueuedTerminalBarrier(): boolean {
+		if (this.#sdkTerminalPublications.size > 0) return true;
 		const pending = this.#pendingAgentEndEmit;
-		if (pending && this.#pendingSdkAgentEnds.has(pending)) return;
-		if (
-			this.#livePromptsInFlight() > 0 ||
-			this.#agentEventHandlersInFlight > 0 ||
-			this.#pendingAgentEndContinuationHolds.size > 0
-		)
-			return;
+		const scope = (pending as (AgentSessionEvent & { scope?: AttemptScope }) | undefined)?.scope;
+		return pending !== undefined && scope !== undefined && this.#sdkRunTokensByAttemptScope.has(scope) && this.#deferredAgentEndLeases.has(pending);
+	}
+
+	#flushPendingAgentEnd(): void {
+		const pending = this.#pendingAgentEndEmit;
+		if (pending && !this.#canPublishAgentEnd(pending)) return;
 		if (!pending) {
 			this.#resolveSessionSettlement();
 			return;
@@ -5204,6 +5214,7 @@ export class AgentSession {
 			| AttemptScope
 			| undefined;
 		const sdkTerminal = pendingScope !== undefined && this.#sdkRunTokensByAttemptScope.has(pendingScope);
+		if (sdkTerminal) this.#sdkTerminalPublications.add(pending);
 		this.#agentEndPublicationPromise = this.#publishDeferredAgentEnd(pending, lease, sdkTerminal);
 		void this.#agentEndPublicationPromise.catch(error => {
 			logger.warn("Agent terminal publication failed", { error: sanitizePromptFailure(error) });
@@ -5239,6 +5250,7 @@ export class AgentSession {
 			}
 			lease.closeDiscovery();
 		};
+		let terminalEmitted = false;
 		const publish = async () => {
 			let workerIntegration: Promise<WorkerIntegrationOutcome> | undefined;
 			let workerIntegrationOutcome: WorkerIntegrationOutcome | undefined;
@@ -5290,6 +5302,7 @@ export class AgentSession {
 			}
 			this.#settleTrackedQueuedInputTerminal(publicationScope);
 			this.#emit(pending);
+			terminalEmitted = true;
 			void terminalPersistence.then(
 				() => {
 					if (workerIntegrationOutcome) {
@@ -5370,7 +5383,12 @@ export class AgentSession {
 			if (extensionDelivery) void extensionDelivery.then(releaseLease, releaseLease);
 			else releaseLease();
 			this.#agentEndPublicationInFlight = Math.max(0, this.#agentEndPublicationInFlight - 1);
+			const sdkPublication = this.#sdkTerminalPublications.delete(pending);
 			this.#resolveSessionSettlement();
+			if (sdkPublication && terminalEmitted && !this.#isDisposed && !this.#sessionAdmissionClosing) {
+				this.#releaseDeferredSdkFollowUps();
+				if (this.agent.hasQueuedMessages()) this.#scheduleQueuedDelivery();
+			}
 		}
 	}
 
@@ -7113,9 +7131,10 @@ export class AgentSession {
 		if ((event.type === "agent_start" || event.type === "turn_start") && eventScope !== undefined) {
 			this.#bindAttemptScopeToActiveRun(eventScope);
 		}
+		const handlerScope = eventScope ?? this.#activeAttemptScope;
 		this.#agentEventAdmission.set(event, {
-			scope: this.#activeAttemptScope,
-			sdkRunToken: this.#activeSdkRunToken,
+			scope: handlerScope,
+			sdkRunToken: eventScope === undefined ? this.#activeSdkRunToken : this.#sdkRunTokensByAttemptScope.get(eventScope),
 			persistGeneration: this.#coordinatorPersistGeneration,
 			persistBarrier: this.#coordinatorRescopeBarrier,
 		});
@@ -7167,6 +7186,7 @@ export class AgentSession {
 		const agentEndHandled = event.type === "agent_end" ? Promise.withResolvers<void>() : undefined;
 		if (agentEndHandled) this.#agentEndHandlingPromise = agentEndHandled.promise;
 		this.#agentEventHandlersInFlight++;
+		if (handlerScope) this.#agentEventHandlersByScope.set(handlerScope, (this.#agentEventHandlersByScope.get(handlerScope) ?? 0) + 1);
 		const handler = (async (): Promise<void> => {
 			try {
 				// A terminal that carries owner context must win the exact producer claim;
@@ -7207,7 +7227,7 @@ export class AgentSession {
 					const pendingAgentEnd =
 						event.type === "agent_end" &&
 						!maintenanceCheckpoint &&
-						(this.#pendingAgentEndEmit === event || this.#pendingSdkAgentEnds.has(event))
+						this.#pendingAgentEndEmit === event
 							? event
 							: undefined;
 					if (pendingAgentEnd) {
@@ -7225,7 +7245,11 @@ export class AgentSession {
 					}
 				}
 				this.#agentEventHandlersInFlight = Math.max(0, this.#agentEventHandlersInFlight - 1);
-				if (event.type === "agent_end") this.#agentEndContinuationDecisions.add(event);
+				if (handlerScope) {
+					const count = this.#agentEventHandlersByScope.get(handlerScope);
+					if (count === 1) this.#agentEventHandlersByScope.delete(handlerScope);
+					else if (count !== undefined) this.#agentEventHandlersByScope.set(handlerScope, count - 1);
+				}
 				this.#flushPendingAgentEnd();
 				agentEndHandled?.resolve();
 				// Every other in-flight counter republishes settlement when it drops; this
@@ -7474,16 +7498,15 @@ export class AgentSession {
 		if (
 			event.type === "agent_end" &&
 			sdkTerminal &&
-			this.#livePromptsInFlight() === 0 &&
-			this.#agentEventHandlersInFlight === 0 &&
-			this.#pendingAgentEndContinuationHolds.size === 0 &&
+			this.#canPublishAgentEnd(event) &&
 			this.#pendingAgentEndEmit === undefined
 		) {
 			if (eventLease) this.#deferredAgentEndLeases.set(event, eventLease);
 			this.#pendingAgentEndEmit = event;
 			return;
 		}
-		if (event.type === "agent_end" && (this.#livePromptsInFlight() > 0 || this.#agentEventHandlersInFlight > 0)) {
+		if (event.type === "agent_end" && !this.#canPublishAgentEnd(event)) {
+			if (eventLease) this.#deferredAgentEndLeases.set(event, eventLease);
 			this.#pendingAgentEndEmit = event;
 			return;
 		}
@@ -8632,7 +8655,7 @@ export class AgentSession {
 		suppressPredecessorAgentEnd?: boolean;
 		shouldContinue?: () => boolean;
 		onSkip?: (
-			reason: "generation_changed" | "aborted_signal" | "queue_drained" | "handoff_in_progress" | "terminal_turn",
+			reason: "generation_changed" | "aborted_signal" | "queue_drained" | "handoff_in_progress" | "terminal_turn" | "terminal_pending",
 		) => void;
 		allowDuringCancelAndSubmit?: boolean;
 		onError?: (error: unknown) => void;
@@ -8702,7 +8725,7 @@ export class AgentSession {
 					: undefined);
 		let terminalized = false;
 		const skip = (
-			reason: "generation_changed" | "aborted_signal" | "queue_drained" | "handoff_in_progress" | "terminal_turn",
+			reason: "generation_changed" | "aborted_signal" | "queue_drained" | "handoff_in_progress" | "terminal_turn" | "terminal_pending",
 		) => {
 			if (terminalized) return;
 			terminalized = true;
@@ -8778,6 +8801,13 @@ export class AgentSession {
 									}
 									if (options?.shouldContinue && !options.shouldContinue()) {
 										skip("queue_drained");
+										return;
+									}
+									// Recheck after every awaited fence: independently scheduled queue work
+									// must leave its messages and the genuine SDK terminal owner intact.
+									// Owning todo/retry continuations do not use continueQueuedOnly.
+									if (options?.continueQueuedOnly && this.#hasSdkQueuedTerminalBarrier()) {
+										skip("terminal_pending");
 										return;
 									}
 									// Final synchronous boundary before agent.continue* entry; no await
@@ -15068,7 +15098,7 @@ export class AgentSession {
 	 * run that would have polled the queue is gone, so nothing else owns it.
 	 */
 	#scheduleQueuedDelivery(delayMs?: number): void {
-		if (this.#cancelAndSubmitInProgress) return;
+		if (this.#cancelAndSubmitInProgress || this.#hasSdkQueuedTerminalBarrier()) return;
 		if (this.#sessionTransitionKind !== undefined || this.#handoffTransitionActive) {
 			this.#queuedDeliveryPendingWhileTransition = true;
 			return;
@@ -15249,7 +15279,7 @@ export class AgentSession {
 		// acceptance so its run token is bound to the agent_start. Releasing it
 		// behind still-queued work reproduces the token-less mid-run consumption
 		// hazard, so wait for the queue to drain; the next agent_end retries.
-		if (this.agent.state.isStreaming || this.agent.hasQueuedMessages()) return false;
+		if (this.agent.state.isStreaming || this.agent.hasQueuedMessages() || this.#hasSdkQueuedTerminalBarrier()) return false;
 		const message = this.#deferredSdkFollowUps[0];
 		if (!message) return false;
 		const batch = this.#deferredFollowUpBatches.get(message);
@@ -15281,6 +15311,7 @@ export class AgentSession {
 	 * Gate for idle-path follow-up auto-continue. See `#queueFollowUp` for rationale.
 	 */
 	#canAutoContinueForFollowUp(): boolean {
+		if (this.#hasSdkQueuedTerminalBarrier()) return false;
 		if (this.#abortUnwind) return false;
 		if (this.#sessionTransitionKind !== undefined || this.#handoffTransitionActive) return false;
 		if (this.isStreaming) return false;
@@ -15317,6 +15348,7 @@ export class AgentSession {
 	 * compaction/bash/eval owns the session and defers delivery.
 	 */
 	#canDeliverQueuedMessages(): boolean {
+		if (this.#hasSdkQueuedTerminalBarrier()) return false;
 		if (this.#abortUnwind) return false;
 		if (this.#sessionTransitionKind !== undefined || this.#handoffTransitionActive) return false;
 		if (this.agent.state.isStreaming) return false;
@@ -15335,6 +15367,7 @@ export class AgentSession {
 	 * false here because it polls the steering queue itself.
 	 */
 	#canAutoContinueForSteer(): boolean {
+		if (this.#hasSdkQueuedTerminalBarrier()) return false;
 		if (this.#abortUnwind) return false;
 		if (this.#sessionTransitionKind !== undefined || this.#handoffTransitionActive) return false;
 		if (this.agent.state.isStreaming) return false;
