@@ -138,7 +138,7 @@ describe("Kiro API-key content filter #6150", () => {
 		const events: Array<{ type: string; message?: { errorMessage?: string } }> = [];
 
 		globalThis.fetch = (async () => {
-			// Simulate refusal split across chunk boundaries - use a larger JSON
+			// Deliver incomplete JSON chunks so the parser must reassemble the refusal.
 			const fullRefusal = JSON.stringify({
 				stopReason: "CONTENT_FILTERED",
 				stopDetails: {
@@ -148,7 +148,16 @@ describe("Kiro API-key content filter #6150", () => {
 					},
 				},
 			});
-			return new Response(fullRefusal, { status: 200 });
+			const bytes = new TextEncoder().encode(fullRefusal);
+			let offset = 0;
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					controller.enqueue(bytes.subarray(offset, offset + 100));
+					offset += 100;
+					if (offset >= bytes.length) controller.close();
+				},
+			});
+			return new Response(body, { status: 200 });
 		}) as unknown as typeof fetch;
 
 		try {
@@ -172,6 +181,36 @@ describe("Kiro API-key content filter #6150", () => {
 			"This request cannot be processed due to policy restrictions",
 		);
 	});
+
+	test.each([undefined, "Request included ksk_test-secret"])(
+		"redacts secrets in structured refusal category and explanation (%s)",
+		async explanation => {
+			let finalError: AssistantMessage | undefined;
+			globalThis.fetch = (async () =>
+				new Response(
+					JSON.stringify({
+						stopReason: "CONTENT_FILTERED",
+						stopDetails: { refusal: { category: "ksk_test-secret", explanation } },
+					}),
+					{ status: 200 },
+				)) as unknown as typeof fetch;
+
+			try {
+				const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+				for await (const event of stream) {
+					if (event.type === "error") finalError = event.error;
+				}
+			} finally {
+				globalThis.fetch = originalFetch;
+			}
+
+			expect(finalError?.errorMessage).toBe(
+				explanation
+					? "Kiro refused the request ([redacted]): Request included [redacted]"
+					: "Kiro refused the request ([redacted])",
+			);
+		},
+	);
 
 	test("ksk_ transport emits text_delta incrementally before stream ends", async () => {
 		const emittedEvents: Array<{ type: string }> = [];
@@ -668,5 +707,248 @@ describe("Kiro API-key content filter #6150", () => {
 		expect(errorEvent?.message?.errorMessage).toContain("Connection lost");
 		// Should mention partial output was accumulated
 		expect(errorEvent?.message?.errorMessage).toContain("Partial output");
+	});
+});
+
+describe("reasoning-before-answer contentIndex invariant #6151", () => {
+	test("thinking then text — every contentIndex matches block final position", async () => {
+		const emittedEvents: Array<{
+			type: string;
+			contentIndex?: number;
+			message?: AssistantMessage | undefined;
+		}> = [];
+
+		globalThis.fetch = (async () => {
+			// Simulate response with thinking tags followed by text (all in one content event)
+			// When thinking is parsed from a single content event, it's known BEFORE text starts
+			const responseBody = JSON.stringify({
+				content:
+					"<thinking>This is my reasoning about the request</thinking>The answer is 42.",
+			});
+			return new Response(responseBody, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		let caughtError: unknown;
+		try {
+			const stream = streamKiroApiKey(model, context, {
+				apiKey: "ksk_test-secret",
+				region: "us-east-1",
+			});
+			for await (const event of stream) {
+				if (
+					event.type.includes("_start") ||
+					event.type.includes("_delta") ||
+					event.type.includes("_end")
+				) {
+					emittedEvents.push({
+						type: event.type,
+						contentIndex: (event as unknown as { contentIndex?: number }).contentIndex,
+					});
+				} else if (event.type === "done") {
+					emittedEvents.push({
+						type: event.type,
+						message: event.message,
+					});
+				} else if (event.type === "error") {
+					caughtError = (event as unknown as { error?: unknown }).error;
+				}
+			}
+		} catch (err) {
+			caughtError = err;
+		}
+
+		globalThis.fetch = originalFetch;
+
+		// Debug if error occurred
+		if (caughtError) {
+			console.error("Stream error:", caughtError);
+		}
+
+		// Find done event to inspect final output.content
+		const doneEvent = emittedEvents.find(e => e.type === "done");
+		expect(doneEvent?.type).toBe("done");
+		const finalMessage = doneEvent?.message as unknown as { content?: unknown[] };
+		const finalBlocks = finalMessage?.content;
+
+		// Verify blocks are in correct order: thinking first, then text
+		// (when thinking is known before text starts, it's inserted at index 0)
+		expect(finalBlocks).toBeDefined();
+		expect(finalBlocks?.length).toBeGreaterThanOrEqual(2);
+		const firstBlock = (finalBlocks?.[0] as unknown as { type?: string })?.type;
+		const secondBlock = (finalBlocks?.[1] as unknown as { type?: string })?.type;
+		expect(firstBlock).toBe("thinking");
+		expect(secondBlock).toBe("text");
+
+		// Critical invariant: every thinking_start/delta/end has contentIndex === 0
+		const thinkingEvents = emittedEvents.filter(e => e.type.startsWith("thinking"));
+		for (const ev of thinkingEvents) {
+			expect(ev.contentIndex).toBe(0);
+		}
+
+		// Critical invariant: every text_start/delta/end has contentIndex === 1
+		// (text was shifted from 0 to 1 when thinking was inserted at 0)
+		const textEvents = emittedEvents.filter(e => e.type.startsWith("text"));
+		for (const ev of textEvents) {
+			expect(ev.contentIndex).toBe(1);
+		}
+
+		// Invariant: contentIndex never changes for a given block during streaming
+		const thinkingStartIdx = emittedEvents.find(e => e.type === "thinking_start")?.contentIndex;
+		const thinkingEndIdx = emittedEvents.find(e => e.type === "thinking_end")?.contentIndex;
+		const textStartIdx = emittedEvents.find(e => e.type === "text_start")?.contentIndex;
+		const textEndIdx = emittedEvents.find(e => e.type === "text_end")?.contentIndex;
+
+		expect(thinkingStartIdx).toBe(thinkingEndIdx);
+		expect(textStartIdx).toBe(textEndIdx);
+		expect(thinkingStartIdx).not.toBe(textStartIdx);
+	});
+
+	test("thinking then text then tool — indices consistent across all blocks", async () => {
+		const emittedEvents: Array<{
+			type: string;
+			contentIndex?: number;
+			message?: AssistantMessage | undefined;
+		}> = [];
+
+		globalThis.fetch = (async () => {
+			// Simulate response with thinking, text, and tool call
+			const responseBody =
+				JSON.stringify({
+					content: "<thinking>I need to read a file</thinking>Let me read that file for you.",
+				}) +
+				JSON.stringify({ toolUseId: "tool-123", name: "read_file", input: '{"path":"/tmp/test.txt"}' });
+			return new Response(responseBody, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, {
+				apiKey: "ksk_test-secret",
+				region: "us-east-1",
+			});
+			for await (const event of stream) {
+				if (
+					event.type.includes("_start") ||
+					event.type.includes("_delta") ||
+					event.type.includes("_end")
+				) {
+					emittedEvents.push({
+						type: event.type,
+						contentIndex: (event as unknown as { contentIndex?: number }).contentIndex,
+					});
+				} else if (event.type === "done") {
+					emittedEvents.push({
+						type: event.type,
+						message: event.message,
+					});
+				}
+			}
+		} catch {
+			// Stream may throw; events are captured above
+		}
+
+		globalThis.fetch = originalFetch;
+
+		// Find done event to inspect final output.content
+		const doneEvent = emittedEvents.find(e => e.type === "done");
+		const finalMessage = doneEvent?.message as unknown as { content?: unknown[] };
+		const finalBlocks = finalMessage?.content;
+
+		// Verify block order: thinking (0), text (1), tool (2)
+		// (thinking is inserted at 0, text shifts to 1, tool remains at 2)
+		expect(finalBlocks?.length).toBeGreaterThanOrEqual(3);
+		expect((finalBlocks?.[0] as unknown as { type?: string })?.type).toBe("thinking");
+		expect((finalBlocks?.[1] as unknown as { type?: string })?.type).toBe("text");
+		expect((finalBlocks?.[2] as unknown as { type?: string })?.type).toBe("toolCall");
+
+		// Each event type must have consistent contentIndex throughout its lifecycle
+		const getIndicesForType = (prefix: string) =>
+			emittedEvents
+				.filter(e => e.type.startsWith(prefix))
+				.map(e => e.contentIndex);
+
+		const thinkingIndices = getIndicesForType("thinking");
+		const textIndices = getIndicesForType("text");
+		const toolIndices = getIndicesForType("toolcall");
+
+		// All thinking events should have the same index throughout streaming
+		const uniqueThinkingIndices = new Set(thinkingIndices);
+		expect(uniqueThinkingIndices.size).toBe(1);
+
+		// All text events should have the same index throughout streaming
+		const uniqueTextIndices = new Set(textIndices);
+		expect(uniqueTextIndices.size).toBe(1);
+
+		// All toolcall events should have the same index throughout streaming
+		const uniqueToolIndices = new Set(toolIndices);
+		expect(uniqueToolIndices.size).toBe(1);
+
+		// Indices must be distinct
+		const allIndices = [...uniqueThinkingIndices, ...uniqueTextIndices, ...uniqueToolIndices];
+		const uniqueAll = new Set(allIndices);
+		expect(uniqueAll.size).toBe(3);
+	});
+
+	test("text only — single text block at index 0", async () => {
+		const emittedEvents: Array<{
+			type: string;
+			contentIndex?: number;
+			message?: AssistantMessage | undefined;
+		}> = [];
+
+		globalThis.fetch = (async () => {
+			// Simulate response with only text, no thinking
+			const responseBody = JSON.stringify({ content: "Here is the answer without any thinking." });
+			return new Response(responseBody, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, {
+				apiKey: "ksk_test-secret",
+				region: "us-east-1",
+			});
+			for await (const event of stream) {
+				if (
+					event.type.includes("_start") ||
+					event.type.includes("_delta") ||
+					event.type.includes("_end")
+				) {
+					emittedEvents.push({
+						type: event.type,
+						contentIndex: (event as unknown as { contentIndex?: number }).contentIndex,
+					});
+				} else if (event.type === "done") {
+					emittedEvents.push({
+						type: event.type,
+						message: event.message,
+					});
+				}
+			}
+		} catch {
+			// Stream may throw; events are captured above
+		}
+
+		globalThis.fetch = originalFetch;
+
+		// Find done event to inspect final output.content
+		const doneEvent = emittedEvents.find(e => e.type === "done");
+		const finalMessage = doneEvent?.message as unknown as { content?: unknown[] };
+		const finalBlocks = finalMessage?.content;
+
+		// Verify only text block exists
+		expect(finalBlocks).toBeDefined();
+		expect(finalBlocks?.length).toBe(1);
+		const block = finalBlocks?.[0] as unknown as { type?: string };
+		expect(block?.type).toBe("text");
+
+		// All text events must have contentIndex === 0
+		const textEvents = emittedEvents.filter(e => e.type.startsWith("text"));
+		for (const ev of textEvents) {
+			expect(ev.contentIndex).toBe(0);
+		}
+
+		// Verify index is consistent across all text events
+		const textIndices = new Set(textEvents.map(e => e.contentIndex));
+		expect(textIndices.size).toBe(1);
+		expect([...textIndices][0]).toBe(0);
 	});
 });

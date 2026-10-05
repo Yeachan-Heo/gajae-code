@@ -754,6 +754,8 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				currentTool = undefined;
 			};
 
+			let textStartDeferred = false; // Track if text_start has been deferred pending thinking
+
 			const appendText = (delta: string) => {
 				// Set firstTokenTime on first real (non-thinking) text delta
 				if (!firstTokenEmitted) {
@@ -766,11 +768,42 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				if (textIndex === undefined) {
 					textIndex = blocks.length;
 					blocks.push({ type: "text", text: "", index: textIndex });
-					stream.push({ type: "text_start", contentIndex: textIndex, partial: output });
+					// Defer text_start emission if thinking might come before text.
+					// thinkingAccumulated is non-empty means we've seen thinking in this or prior content events.
+					// We don't know yet if more thinking will come, so defer text_start until stream end.
+					if (thinkingAccumulated.length === 0) {
+						// No thinking yet; safe to emit text_start now
+						stream.push({ type: "text_start", contentIndex: textIndex, partial: output });
+					} else {
+						// Thinking exists; defer text_start until we know thinking position
+						textStartDeferred = true;
+					}
 				}
 				const block = blocks[textIndex] as TextContent;
 				block.text += delta;
-				stream.push({ type: "text_delta", contentIndex: textIndex, delta, partial: output });
+				// Only emit text_delta if text_start was already emitted
+				if (!textStartDeferred) {
+					stream.push({ type: "text_delta", contentIndex: textIndex, delta, partial: output });
+				}
+			};
+
+			// Emit deferred text events if text_start was not yet sent
+			const emitDeferredTextEvents = () => {
+				if (textStartDeferred && textIndex !== undefined && textIndex < blocks.length) {
+					const block = blocks[textIndex];
+					if (block && block.type === "text") {
+						stream.push({ type: "text_start", contentIndex: textIndex, partial: output });
+						if (block.text.length > 0) {
+							stream.push({
+								type: "text_delta",
+								contentIndex: textIndex,
+								delta: block.text,
+								partial: output,
+							});
+						}
+						textStartDeferred = false;
+					}
+				}
 			};
 
 			// Emit text_end if text block was opened
@@ -821,22 +854,36 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			const emitThinking = () => {
 				if (!thinkingAccumulated) return;
 				if (thinkingIndex === undefined) {
-					// Insert thinking at the beginning to preserve provider order (thinking before text)
-					thinkingIndex = 0;
-					blocks.unshift({
-						type: "thinking",
-						thinking: thinkingAccumulated,
-						index: 0,
-					} as ThinkingContent & { index: number });
-					// Update indices of other blocks
-					for (let i = 1; i < blocks.length; i++) {
-						(blocks[i] as Block).index = i;
-						if (i - 1 === textIndex) textIndex = i;
-						if (i - 1 === toolcallIndex) toolcallIndex = i;
-					}
-					// Update indices in pending tool calls since all blocks shifted by 1
-					for (const pending of pendingToolCalls) {
-						pending.index += 1;
+					if (textIndex !== undefined && !textStartDeferred) {
+						// Text_start has already been emitted (not deferred) with contentIndex.
+						// Do NOT insert thinking before text (would change text's index).
+						// Append thinking after all emitted blocks.
+						thinkingIndex = blocks.length;
+						blocks.push({
+							type: "thinking",
+							thinking: thinkingAccumulated,
+							index: thinkingIndex,
+						} as ThinkingContent & { index: number });
+					} else {
+						// Text has not started streaming yet, or text_start was deferred.
+						// Thinking can take index 0 to preserve provider order.
+						thinkingIndex = 0;
+						blocks.unshift({
+							type: "thinking",
+							thinking: thinkingAccumulated,
+							index: 0,
+						} as ThinkingContent & { index: number });
+						// Update indices of blocks that were shifted
+						for (let i = 1; i < blocks.length; i++) {
+							(blocks[i] as Block).index = i;
+						}
+						// Update state tracking variables for shifted blocks
+						if (textIndex !== undefined) textIndex += 1;
+						if (toolcallIndex !== undefined) toolcallIndex += 1;
+						// Update indices in pending tool calls since all blocks shifted by 1
+						for (const pending of pendingToolCalls) {
+							pending.index += 1;
+						}
 					}
 					stream.push({ type: "thinking_start", contentIndex: thinkingIndex, partial: output });
 					stream.push({
@@ -915,7 +962,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 							const label = category ? `Kiro refused the request (${category})` : "Kiro refused the request";
 
 							output.stopReason = "error";
-							output.errorMessage = explanation ? `${label}: ${explanation}` : label;
+							output.errorMessage = sanitizeKiroError(explanation ? `${label}: ${explanation}` : label, apiKey);
 							output.content = [];
 
 							// Mint provider safety stop
@@ -958,9 +1005,10 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				}
 			}
 
-			// Stream is done - add any pending tool, emit accumulated thinking, then close text block
+			// Stream is done - add any pending tool, emit accumulated thinking, then deferred text, then close text block
 			addToolToBlocks();
 			emitThinking();
+			emitDeferredTextEvents();
 			// Now emit all tool call events in order (safe since no refusal occurred)
 			emitPendingToolCalls();
 			closeTextBlock();
@@ -984,7 +1032,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				output.usage.output = Math.max(1, Math.floor(text.length / 4));
 				output.usage.totalTokens = output.usage.input + output.usage.output;
 			}
-			// Rebuild output.content with reordered blocks (thinking first, then text/tools)
+			// Rebuild output.content with blocks (thinking first if inserted at index 0, otherwise append order)
 			output.content = blocks.filter(
 				(b): b is TextContent | ThinkingContent | ToolCall =>
 					b.type === "text" || b.type === "thinking" || b.type === "toolCall",
