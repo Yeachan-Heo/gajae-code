@@ -6,8 +6,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Agent, markNonDispatchedToolEvent, ThinkingLevel } from "@gajae-code/agent-core";
 import { createAttemptMinter } from "@gajae-code/agent-core/attempt-scope";
-import type { UserMessage } from "@gajae-code/ai/core";
+import { type AssistantMessage, type UserMessage } from "@gajae-code/ai/core";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { logger } from "@gajae-code/utils";
 import { createTestSession } from "../../../test/utilities";
 import { AsyncJobManager } from "../../async";
@@ -5139,60 +5140,108 @@ test("SDK turn.steer preserves its expected run token and propagates a stale-run
 	}
 });
 
-describe("post-acceptance invocation terminalization", () => {
-	test.each([
-		"todo-reminder",
-		"overflow-retry",
-	])("preserves prompt correlation across a %s continuation", async continuation => {
-		const cwd = await mkdtemp(path.join(os.tmpdir(), `gjc-${continuation}-correlation-`));
+describe.serial("post-acceptance invocation terminalization", () => {
+	test.serial("correlates the real overflow-retry continuation with one terminal agent_end", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-overflow-retry-correlation-"));
 		let harness: InvocationHarness | undefined;
+		let session: AgentSession | undefined;
+		let authStorage: AuthStorage | undefined;
 		try {
-			harness = await invocationHarness(`${continuation}-correlation`, cwd, {
-				sendUserMessage: async (_content, options) => {
-					await options?.onPreflightAcceptCommit?.();
-					await neverSettlingPromise();
-				},
-			});
-			const accepted = await harness.control("turn.prompt", { text: "finish the outstanding work" });
-			expect(accepted.ok).toBe(true);
-			const correlation = {
-				commandId: accepted.result?.commandId,
-				turnId: accepted.result?.turnId,
-			};
-			const lifecycleScope = createAttemptMinter().mint("main");
-
-			await harness.emit("agent_start", { lifecycleScope });
-			if (continuation === "todo-reminder") {
-				await harness.emit("todo_reminder", {
-					todos: [{ content: "finish the outstanding work", status: "pending" }],
-					attempt: 1,
-					maxAttempts: 3,
+			const mock = createMockModel({ responses: [{ content: ["recovered after overflow retry"] }] });
+			authStorage = await AuthStorage.create(path.join(cwd, "auth.db"));
+			authStorage.setRuntimeApiKey(mock.model.provider, "test-key");
+			let calls = 0;
+			const streamFn = (model: Parameters<typeof mock.stream>[0], context: Parameters<typeof mock.stream>[1], options: Parameters<typeof mock.stream>[2]) => {
+				calls++;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					if (calls > 1) {
+						const success: AssistantMessage = {
+							role: "assistant",
+							content: [{ type: "text", text: "recovered after overflow retry" }],
+							api: model.api,
+							provider: model.provider,
+							model: model.id,
+							usage: { input: 0, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 1, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+							stopReason: "stop",
+							timestamp: Date.now(),
+						};
+						stream.push({ type: "start", partial: success });
+						stream.push({ type: "done", reason: "stop", message: success });
+						return;
+					}
+					const failure: AssistantMessage = {
+						role: "assistant",
+						content: [],
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+						stopReason: "error",
+						errorMessage: "context_length_exceeded",
+						transportFailure: { kind: "transport", status: 400, openaiErrorCode: "context_length_exceeded" },
+						timestamp: Date.now(),
+					};
+					stream.push({ type: "start", partial: failure });
+					stream.push({ type: "error", reason: "error", error: failure });
 				});
-			}
-			await harness.emit("agent_start", { lifecycleScope });
-			await harness.emit("agent_end", {
-				messages: [{ role: "assistant", stopReason: "stop", content: "completed" }],
+				return stream;
+			};
+			session = new AgentSession({
+				agent: new Agent({ getApiKey: () => "test-key", initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] }, streamFn }),
+				sessionManager: SessionManager.inMemory(cwd),
+				settings: Settings.isolated({ "compaction.enabled": false, "contextPromotion.enabled": false, "retry.enabled": false }),
+				modelRegistry: new ModelRegistry(authStorage),
 			});
-
+			harness = await invocationHarness("overflow-retry-correlation", cwd, {
+				isIdle: () => !session!.isStreaming,
+				sendUserMessage: (content, options) => session!.sendUserMessage(content as string, options as never),
+			});
+			session.subscribe(async event => harness && (await harness.emit(event.type, event)));
+			const accepted = await harness.control("turn.prompt", { text: "recover the work" });
+			expect(accepted.ok).toBe(true);
+			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
 			const terminal = await settledStatus(harness, "turn.result", { kind: "prompt", ...correlation });
-			expect(terminal).toMatchObject({
-				status: "terminal_ok",
-				commandId: correlation.commandId,
-				turnId: correlation.turnId,
-			});
-			const ends = harness.broadcasts.filter(frame => frame.kind === "agent_end");
-			expect(ends).toHaveLength(1);
-			expect(ends[0]).toMatchObject({
-				payload: {
-					commandId: correlation.commandId,
-					turnId: correlation.turnId,
-				},
-			});
+			expect(terminal).toMatchObject({ status: "terminal_ok", ...correlation });
+			expect(harness.broadcasts.filter(frame => frame.kind === "agent_end")).toHaveLength(1);
+			expect(calls).toBe(2);
 		} finally {
+			await session?.dispose();
+			authStorage?.close();
 			await harness?.stop();
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
+
+	test.serial("todo_reminder remains advisory and does not create a correlated continuation", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-todo-reminder-advisory-"));
+		let harness: InvocationHarness | undefined;
+		let session: AgentSession | undefined;
+		let authStorage: AuthStorage | undefined;
+		try {
+			const mock = createMockModel({ responses: [{ content: ["completed"] }] });
+			authStorage = await AuthStorage.create(path.join(cwd, "auth.db"));
+			authStorage.setRuntimeApiKey(mock.model.provider, "test-key");
+			session = new AgentSession({ agent: new Agent({ getApiKey: () => "test-key", initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] }, streamFn: mock.stream }), sessionManager: SessionManager.inMemory(cwd), settings: Settings.isolated({ "compaction.enabled": false }), modelRegistry: new ModelRegistry(authStorage) });
+			session.setClientBridge({ capabilities: {}, deferAgentInitiatedTurns: true });
+			session.setTodoPhases([{ name: "Work", tasks: [{ content: "finish the work", status: "pending" }] }]);
+			harness = await invocationHarness("todo-reminder-advisory", cwd, { isIdle: () => !session!.isStreaming, sendUserMessage: (content, options) => session!.sendUserMessage(content as string, options as never) });
+			session.subscribe(async event => harness && (await harness.emit(event.type, event)));
+			const accepted = await harness.control("turn.prompt", { text: "finish the work" });
+			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			const terminal = await settledStatus(harness, "turn.result", { kind: "prompt", ...correlation });
+			expect(terminal).toMatchObject({ status: "terminal_ok", ...correlation });
+			expect(harness.broadcasts.filter(frame => frame.kind === "agent_end")).toHaveLength(1);
+			expect(harness.broadcasts.filter(frame => frame.kind === "agent_start")).toHaveLength(1);
+		} finally {
+			await session?.dispose();
+			authStorage?.close();
+			await harness?.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+
 
 	test("preserves external prompt correlation across a retryable provider error", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-retryable-provider-correlation-"));
