@@ -1054,7 +1054,13 @@ export async function backmergeReleaseIntoDev(version: string): Promise<Backmerg
 				await Bun.write(path.join(dir, BACKMERGE_CONFLICT_PATH), resolveDiagnosticArtifactBackmerge(ours, theirs));
 				await gitAt(dir, ["add", BACKMERGE_CONFLICT_PATH]).quiet();
 			}
-			await gitAt(dir, ["commit", "-m", `chore: sync main (v${version} release) into dev`]).quiet();
+			await gitAt(dir, [
+				"commit",
+				"-m",
+				`chore(release): sync the v${version} release into dev`,
+				"-m",
+				"dev must contain every released main commit, or the next release merge stops being a fast-forward and the changelog fragments that release consumed reappear as pending work.",
+			]).quiet();
 
 			const push = await gitAt(dir, ["push", "origin", "HEAD:dev"]).quiet().nothrow();
 			if (push.exitCode === 0) {
