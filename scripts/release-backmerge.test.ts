@@ -33,6 +33,14 @@ describe("backmerge conflict resolution", () => {
 		});
 		expect(resolveDiagnosticArtifactBackmerge(DEV, MAIN).endsWith("\n")).toBe(true);
 	});
+	test("keeps top-level manifest fields it does not know about", () => {
+		// The manifest churns every release; a field added later must survive the resolution.
+		const future = `{"schema":"gjc.diagnostic-artifact","artifacts":{},"builtAt":"2026-01-01T00:00:00Z"}`;
+		const resolved = JSON.parse(resolveDiagnosticArtifactBackmerge(future, MAIN)) as Record<string, unknown>;
+		expect(resolved.builtAt).toBe("2026-01-01T00:00:00Z");
+		expect(resolved.version).toBe("0.18.7");
+		expect(resolved.schema).toBe("gjc.diagnostic-artifact");
+	});
 
 	test("fails closed on any manifest field the resolution depends on", () => {
 		expect(() => resolveDiagnosticArtifactBackmerge(DEV, `{"artifacts":{}}`)).toThrow(

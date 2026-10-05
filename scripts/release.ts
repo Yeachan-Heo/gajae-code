@@ -976,7 +976,7 @@ const BACKMERGE_PUSH_ATTEMPTS = 3;
  * side lacks the field the resolution depends on.
  */
 export function resolveDiagnosticArtifactBackmerge(ours: string, theirs: string): string {
-	const oursManifest = JSON.parse(ours) as { schema?: unknown; artifacts?: unknown };
+	const oursManifest = JSON.parse(ours) as Record<string, unknown>;
 	const theirsManifest = JSON.parse(theirs) as { version?: unknown };
 	if (typeof theirsManifest.version !== "string") {
 		throw new Error(`${BACKMERGE_CONFLICT_PATH} has no string version on main`);
@@ -988,11 +988,9 @@ export function resolveDiagnosticArtifactBackmerge(ours: string, theirs: string)
 	if (artifacts === null || typeof artifacts !== "object" || Array.isArray(artifacts)) {
 		throw new Error(`${BACKMERGE_CONFLICT_PATH} has no artifacts map on dev`);
 	}
-	const resolved = {
-		schema: oursManifest.schema,
-		version: theirsManifest.version,
-		artifacts,
-	};
+	// Start from dev's manifest so any top-level field the schema gains later survives the
+	// resolution instead of being dropped by a hand-built three-key object.
+	const resolved = { ...oursManifest, version: theirsManifest.version };
 	return `${JSON.stringify(resolved, null, 2)}\n`;
 }
 
