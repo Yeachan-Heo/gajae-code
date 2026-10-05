@@ -2,6 +2,11 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { captureEndpointConfiguration, type EndpointConfiguration, hookFetch } from "@gajae-code/utils";
+import { __resetVertexTokenCache } from "../src/providers/google-auth";
+import { streamGoogleVertex } from "../src/providers/google-vertex";
+import { streamSimple } from "../src/stream";
+import type { Context, Model } from "../src/types";
 
 /**
  * The Vertex location is interpolated into the request **host**
@@ -39,6 +44,17 @@ function projectDir(dotenv?: string): string {
 	const dir = tempDir();
 	if (dotenv !== undefined) fs.writeFileSync(path.join(dir, ".env"), dotenv);
 	return dir;
+}
+
+function createVertexSseResponse(): Response {
+	const payload = {
+		candidates: [{ content: { parts: [{ text: "ok" }] }, finishReason: "STOP" }],
+		usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1, totalTokenCount: 2 },
+	};
+	return new Response(`data: ${JSON.stringify(payload)}\n\n`, {
+		status: 200,
+		headers: { "content-type": "text/event-stream" },
+	});
 }
 
 afterEach(() => {
@@ -101,5 +117,118 @@ describe("Vertex location trust boundary", () => {
 		const resolved = await resolveIn(projectDir(), { GOOGLE_CLOUD_LOCATION: value });
 		expect(resolved.origin).toBeNull();
 		expect(resolved.error).toContain("Invalid Vertex AI location");
+	});
+
+	it("pins ADC project and location on actual Vertex requests across scopes", async () => {
+		const envKeys = [
+			"GOOGLE_CLOUD_LOCATION",
+			"GOOGLE_CLOUD_PROJECT",
+			"GCLOUD_PROJECT",
+			"GOOGLE_APPLICATION_CREDENTIALS",
+			"GOOGLE_CLOUD_API_KEY",
+		] as const;
+		const previousEnv = new Map(envKeys.map(key => [key, Bun.env[key]]));
+		const credentialPath = path.join(tempDir(), "authorized-user-adc.json");
+		fs.writeFileSync(
+			credentialPath,
+			JSON.stringify({
+				type: "authorized_user",
+				client_id: "vertex-test-client",
+				client_secret: "vertex-test-secret",
+				refresh_token: "vertex-test-refresh-token",
+			}),
+		);
+		const requests: Array<{ url: string; authorization: string | null }> = [];
+		let tokenExchanges = 0;
+		const model: Model<"google-vertex"> = {
+			id: "gemini-2.5-flash",
+			name: "Gemini 2.5 Flash",
+			api: "google-vertex",
+			provider: "google-vertex",
+			baseUrl: "",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1000000,
+			maxTokens: 8192,
+		};
+		const context: Context = { messages: [{ role: "user", content: "use ADC", timestamp: Date.now() }] };
+
+		try {
+			for (const key of envKeys) delete Bun.env[key];
+			Bun.env.GCLOUD_PROJECT = "scope-a-project";
+			Bun.env.GOOGLE_CLOUD_LOCATION = "us-west1";
+			const scopeA = captureEndpointConfiguration();
+			Bun.env.GOOGLE_CLOUD_PROJECT = "scope-b-project";
+			Bun.env.GCLOUD_PROJECT = "lower-priority-project";
+			Bun.env.GOOGLE_CLOUD_LOCATION = "asia-northeast1";
+			const scopeB = captureEndpointConfiguration();
+			Bun.env.GOOGLE_APPLICATION_CREDENTIALS = credentialPath;
+
+			using _hook = hookFetch(async (input, init) => {
+				const request = input instanceof Request ? input : new Request(String(input), init);
+				if (request.url === "https://oauth2.googleapis.com/token") {
+					tokenExchanges += 1;
+					const form = new URLSearchParams(await request.clone().text());
+					expect(form.get("grant_type")).toBe("refresh_token");
+					expect(form.get("refresh_token")).toBe("vertex-test-refresh-token");
+					return Response.json({ access_token: `adc-access-${tokenExchanges}`, expires_in: 3600 });
+				}
+				requests.push({ url: request.url, authorization: request.headers.get("authorization") });
+				return createVertexSseResponse();
+			});
+
+			__resetVertexTokenCache();
+			await streamSimple(model, context, { endpointConfiguration: scopeA, streamMaxRetries: 0 }).result();
+			__resetVertexTokenCache();
+			await streamSimple(model, context, { endpointConfiguration: scopeB, streamMaxRetries: 0 }).result();
+			__resetVertexTokenCache();
+			await streamGoogleVertex(model, context, {
+				endpointConfiguration: scopeA,
+				project: "explicit-project",
+				location: "global",
+			}).result();
+
+			const beforeForgedHandle = requests.length + tokenExchanges;
+			expect(() =>
+				streamGoogleVertex(model, context, {
+					endpointConfiguration: Object.freeze({}) as EndpointConfiguration,
+				}),
+			).toThrow("Invalid endpoint configuration handle");
+			expect(requests.length + tokenExchanges).toBe(beforeForgedHandle);
+
+			for (const key of ["GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION"] as const) {
+				delete Bun.env[key];
+			}
+			const capturedAbsence = captureEndpointConfiguration();
+			Bun.env.GOOGLE_CLOUD_PROJECT = "scope-c-project";
+			Bun.env.GOOGLE_CLOUD_LOCATION = "us-central1";
+			__resetVertexTokenCache();
+			const absentResult = await streamGoogleVertex(model, context, {
+				endpointConfiguration: capturedAbsence,
+			}).result();
+			expect(absentResult.stopReason).toBe("error");
+			expect(absentResult.errorMessage).toContain("requires a project ID");
+			expect(requests).toHaveLength(3);
+			expect(tokenExchanges).toBe(3);
+
+			expect(requests.map(request => request.url)).toEqual([
+				"https://us-west1-aiplatform.googleapis.com/v1/projects/scope-a-project/locations/us-west1/publishers/google/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+				"https://asia-northeast1-aiplatform.googleapis.com/v1/projects/scope-b-project/locations/asia-northeast1/publishers/google/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+				"https://aiplatform.googleapis.com/v1/projects/explicit-project/locations/global/publishers/google/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+			]);
+			expect(requests.map(request => request.authorization)).toEqual([
+				"Bearer adc-access-1",
+				"Bearer adc-access-2",
+				"Bearer adc-access-3",
+			]);
+		} finally {
+			__resetVertexTokenCache();
+			for (const key of envKeys) {
+				const previous = previousEnv.get(key);
+				if (previous === undefined) delete Bun.env[key];
+				else Bun.env[key] = previous;
+			}
+		}
 	});
 });

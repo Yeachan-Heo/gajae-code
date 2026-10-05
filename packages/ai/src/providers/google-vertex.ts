@@ -1,4 +1,4 @@
-import { $credentialEnv, $pickCredentialEnv } from "@gajae-code/utils";
+import { $credentialEnv, assertEndpointConfiguration, readEndpointConfiguration } from "@gajae-code/utils";
 import type { Context, Model, StreamFunction } from "../types";
 import type { AssistantMessageEventStream } from "../utils/event-stream";
 import { getVertexAccessToken } from "./google-auth";
@@ -20,8 +20,9 @@ export const streamGoogleVertex: StreamFunction<"google-vertex"> = (
 	model: Model<"google-vertex">,
 	context: Context,
 	options?: GoogleVertexOptions,
-): AssistantMessageEventStream =>
-	streamGoogleGenAI({
+): AssistantMessageEventStream => {
+	assertEndpointConfiguration(options?.endpointConfiguration);
+	return streamGoogleGenAI({
 		model,
 		options,
 		api: "google-vertex",
@@ -57,6 +58,7 @@ export const streamGoogleVertex: StreamFunction<"google-vertex"> = (
 			};
 		},
 	});
+};
 
 /** Test seam: the Vertex API key as resolved from options plus trusted env. */
 export function resolveVertexApiKeyForTest(options?: GoogleVertexOptions): string | undefined {
@@ -72,7 +74,10 @@ function resolveApiKey(options?: GoogleVertexOptions): string | undefined {
 }
 
 function resolveProject(options?: GoogleVertexOptions): string {
-	const project = options?.project || $pickCredentialEnv("GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT");
+	const project =
+		options?.project ||
+		readEndpointConfiguration(options?.endpointConfiguration, "GOOGLE_CLOUD_PROJECT") ||
+		readEndpointConfiguration(options?.endpointConfiguration, "GCLOUD_PROJECT");
 	if (!project) {
 		throw new Error(
 			"Vertex AI requires a project ID. Set GOOGLE_CLOUD_PROJECT/GCLOUD_PROJECT or pass project in options.",
@@ -111,7 +116,8 @@ function assertVertexLocation(location: string): string {
 }
 
 function resolveLocation(options?: GoogleVertexOptions): string {
-	const location = options?.location || $credentialEnv("GOOGLE_CLOUD_LOCATION");
+	const location =
+		options?.location || readEndpointConfiguration(options?.endpointConfiguration, "GOOGLE_CLOUD_LOCATION");
 	if (!location) {
 		throw new Error("Vertex AI requires a location. Set GOOGLE_CLOUD_LOCATION or pass location in options.");
 	}
