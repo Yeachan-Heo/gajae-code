@@ -774,6 +774,7 @@ interface AcceptedQueueCancellation {
 	dispositionPromise: Promise<AcceptedQueueDisposition>;
 	resolveDisposition: (disposition: AcceptedQueueDisposition) => void;
 	removalTerminalization?: Promise<boolean>;
+	removalFailure?: unknown;
 }
 
 function retireAcceptedQueueCancellation(
@@ -783,8 +784,14 @@ function retireAcceptedQueueCancellation(
 	const key = `${correlation.commandId}:${correlation.turnId}`;
 	const cancellation = cancellations.get(key);
 	if (!cancellation) return;
-	cancellations.delete(key);
 	if (!cancellation.controller.signal.aborted) cancellation.controller.abort();
+	if (cancellation.disposition === "removed" && cancellation.removalTerminalization) {
+		void cancellation.removalTerminalization.then(published => {
+			if (published && cancellations.get(key) === cancellation) cancellations.delete(key);
+		});
+		return;
+	}
+	if (cancellations.get(key) === cancellation) cancellations.delete(key);
 	if (cancellation.disposition === "queued") {
 		cancellation.disposition = "teardown";
 		cancellation.resolveDisposition("teardown");
@@ -3252,9 +3259,27 @@ function createControlSurface(
 						promotionStartsOwnRun = promotion?.startsOwnRun;
 						if (promotion?.removed) {
 							queueCancellation.disposition = "removed";
-							queueCancellation.removalTerminalization = Promise.resolve(
-								onPromotedTurn?.(kind, correlation, requesterConnectionId, sdkRunToken, promotion),
-							).then(result => result === true);
+							queueCancellation.removalTerminalization = (async () => {
+								try {
+									return (
+										(await onPromotedTurn?.(
+											kind,
+											correlation,
+											requesterConnectionId,
+											sdkRunToken,
+											promotion,
+										)) === true
+									);
+								} catch (error) {
+									queueCancellation.removalFailure = error;
+									logger.error("SDK queued prompt terminal publication failed", {
+										commandId: correlation.commandId,
+										turnId: correlation.turnId,
+										error: String(error),
+									});
+									return false;
+								}
+							})();
 							queueCancellation.resolveDisposition("removed");
 							return;
 						}
@@ -4872,16 +4897,59 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		acceptedImages.get(key)?.();
 		acceptedImages.delete(key);
 	};
-	const disposeAcceptedQueueCancellations = (): void => {
+	const disposeAcceptedQueueCancellations = async (): Promise<void> => {
 		const cancellations = [...acceptedQueueCancellations.values()];
-		acceptedQueueCancellations.clear();
-		for (const cancellation of cancellations) {
+		const queuedRemovals = cancellations.filter(
+			cancellation =>
+				cancellation.accepted &&
+				cancellation.queueCandidate &&
+				(cancellation.disposition === "queued" || cancellation.disposition === "removed"),
+		);
+		for (const cancellation of cancellations)
 			if (!cancellation.controller.signal.aborted) cancellation.controller.abort();
-			if (cancellation.disposition === "queued") {
-				cancellation.disposition = "teardown";
-				cancellation.resolveDisposition("teardown");
-			}
+
+		const failures: unknown[] = [];
+		const timedOut = Promise.withResolvers<void>();
+		const timer = setTimeout(timedOut.resolve, SDK_ONLY_QUEUE_CANCELLATION_WAIT_MS);
+		timer.unref();
+		try {
+			await Promise.all(
+				queuedRemovals.map(async cancellation => {
+					const publication = (async (): Promise<boolean> => {
+						const disposition =
+							cancellation.disposition === "queued"
+								? await cancellation.dispositionPromise
+								: cancellation.disposition;
+						if (disposition === "promoted" || disposition === "consumed") return true;
+						return disposition === "removed" && (await cancellation.removalTerminalization) === true;
+					})();
+					const published = await Promise.race([publication, timedOut.promise.then(() => false)]);
+					if (published) {
+						const key = `${cancellation.correlation.commandId}:${cancellation.correlation.turnId}`;
+						if (acceptedQueueCancellations.get(key) === cancellation) acceptedQueueCancellations.delete(key);
+					} else {
+						failures.push(
+							cancellation.removalFailure ??
+								new Error(
+									`Queued prompt ${cancellation.correlation.commandId}:${cancellation.correlation.turnId} terminal publication was not confirmed during shutdown.`,
+								),
+						);
+					}
+				}),
+			);
+		} finally {
+			clearTimeout(timer);
 		}
+		for (const cancellation of cancellations) {
+			if (queuedRemovals.includes(cancellation)) continue;
+			const key = `${cancellation.correlation.commandId}:${cancellation.correlation.turnId}`;
+			if (acceptedQueueCancellations.get(key) === cancellation) acceptedQueueCancellations.delete(key);
+		}
+		if (failures.length > 0)
+			throw Object.assign(
+				new AggregateError(failures, "SDK runtime could not durably publish queued prompt cancellations."),
+				{ code: "sdk_reconciliation_teardown_failed" },
+			);
 	};
 	let currentImageUploads: PromptImageUploadStore | undefined;
 	let active:
@@ -6401,6 +6469,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	};
 	const startRuntime = async (ctx: ExtensionContext): Promise<void> => {
 		if (active) return;
+		if (acceptedQueueCancellations.size > 0) await disposeAcceptedQueueCancellations();
+		if (active) return;
 		const sessionId = ctx.sessionManager.getSessionId();
 		const stateRoot = path.join(ctx.cwd, ".gjc", "state");
 		const token = crypto.randomBytes(24).toString("base64url");
@@ -7589,8 +7659,15 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			await startupImageCapture;
 			if (!brokerRecoveryStopped) startBrokerRecovery();
 		} catch (error) {
+			runtimeOwner.quiesceInput();
+			runtimeOwner.fenceGateResolutions();
 			active = undefined;
-			disposeAcceptedQueueCancellations();
+			let queueCancellationFailure: unknown;
+			try {
+				await disposeAcceptedQueueCancellations();
+			} catch (cleanupError) {
+				queueCancellationFailure = cleanupError;
+			}
 			imageUploads.close();
 			if (currentImageUploads === imageUploads) currentImageUploads = undefined;
 			for (const release of acceptedImages.values()) release();
@@ -7634,19 +7711,42 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				};
 				lifecycleOwnerHolder.state = failedRuntimeOwner;
 				active = failedRuntimeOwner;
-				throw new AggregateError([error, cleanupError], "SDK runtime startup failed and cleanup failed.");
+				const failures = [
+					error,
+					...(queueCancellationFailure === undefined ? [] : [queueCancellationFailure]),
+					cleanupError,
+				];
+				const startupFailure = new AggregateError(failures, "SDK runtime startup failed and cleanup failed.");
+				if (queueCancellationFailure !== undefined)
+					Object.assign(startupFailure, { code: "sdk_reconciliation_teardown_failed" });
+				throw startupFailure;
 			}
 			cursors.close();
 			await revisions.close().catch(() => undefined);
+			if (queueCancellationFailure !== undefined)
+				throw Object.assign(
+					new AggregateError(
+						[error, queueCancellationFailure],
+						"SDK runtime startup failed with queued cancellation publication errors.",
+					),
+					{ code: "sdk_reconciliation_teardown_failed" },
+				);
 			throw error;
 		}
 	};
 	const stopActive = async (cancelSkillRecovery = false, unregisterReason?: "detached_idle"): Promise<void> => {
 		const current = active;
 		if (!current) return;
+		current.quiesceInput();
+		current.fenceGateResolutions();
+		let queueCancellationFailure: unknown;
+		try {
+			await disposeAcceptedQueueCancellations();
+		} catch (cleanupError) {
+			queueCancellationFailure = cleanupError;
+		}
 		currentImageUploads?.close();
 		currentImageUploads = undefined;
-		disposeAcceptedQueueCancellations();
 		for (const release of acceptedImages.values()) release();
 		acceptedImages.clear();
 		if (cancelSkillRecovery) {
@@ -7656,8 +7756,6 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		activePromptOwnerHolder.connectionIds = undefined;
 		activePromptOwnerHolder.lifecycleEpoch = undefined;
 		current.stopBrokerRecovery();
-		current.quiesceInput();
-		current.fenceGateResolutions();
 		try {
 			await current.waitForGateResolutionQuiescence();
 			if (current.lifecycleTasks.size > 0) {
@@ -7714,10 +7812,19 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			// shutdown from retrying the failed endpoint removal.
 			if (active === undefined) active = current;
 			logger.error("sdk runtime stop failed", { code: errorCode(error), error: String(error) });
+			if (queueCancellationFailure !== undefined)
+				throw Object.assign(
+					new AggregateError(
+						[queueCancellationFailure, error],
+						"SDK runtime stop and queued cancellation publication both failed.",
+					),
+					{ code: "sdk_reconciliation_teardown_failed" },
+				);
 			throw error;
 		}
 		current.cursors.close();
 		await current.revisions.close();
+		if (queueCancellationFailure !== undefined) throw queueCancellationFailure;
 	};
 	api.on("session_start", async (_event, ctx) => {
 		await startRuntime(ctx);

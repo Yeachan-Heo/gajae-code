@@ -3,14 +3,18 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { NativeExactUnlinkResult } from "@gajae-code/natives";
+import type { NativeDirectoryTreeSnapshot, NativeExactUnlinkResult } from "@gajae-code/natives";
 import * as native from "@gajae-code/natives";
 import {
 	type ManagedDirectoryRoot,
 	ManagedSessionDescendantStore,
 	prepareManagedDirectoryRoot,
 } from "../src/session/internal/managed-session-storage";
-import { captureTaskArtifactOwnerDeletionEvidence } from "../src/session/internal/task-artifact-owner-access";
+import {
+	captureOwnerTreeIfPresent,
+	captureTaskArtifactOwnerDeletionEvidence,
+	newSessionRootReaderStore,
+} from "../src/session/internal/task-artifact-owner-access";
 import {
 	OWNER_DIRECTORY,
 	OWNER_MANIFEST,
@@ -141,6 +145,100 @@ function observeActualNativeRemoval() {
 }
 
 describe("task artifact owner native retirement", () => {
+	it("passes original logical paths and current remaining metadata on repeated quarantined replay", async () => {
+		const fixture = await makeOwnerFixture();
+		fs.mkdirSync(path.join(fixture.ownerPath, "outer", "inner"), { recursive: true, mode: 0o700 });
+		fs.writeFileSync(path.join(fixture.ownerPath, "outer", "inner", "nested.bin"), "nested payload", { mode: 0o600 });
+		const evidence = captureTaskArtifactOwnerDeletionEvidence(fixture.context, fixture.sessionId, fixture.locator);
+		if (!evidence) throw new Error("fixture_evidence_missing");
+		const nameFor = (relativePath: string): string => {
+			const entry = evidence.treeSnapshot.entries.find(entry => entry.relativePath === relativePath);
+			if (!entry) throw new Error("fixture_entry_missing");
+			return `.pi-tree-detached-${crypto.createHash("sha256").update(`${entry.relativePath}\0${entry.dev}\0${entry.ino}`).digest("hex")}`;
+		};
+		const removingPath = `${fixture.ownerPath}.removing`;
+		fs.renameSync(fixture.ownerPath, removingPath);
+		const outerName = nameFor("outer");
+		const payloadName = nameFor("outer/inner/nested.bin");
+		fs.renameSync(path.join(removingPath, "outer"), path.join(removingPath, outerName));
+		fs.renameSync(
+			path.join(removingPath, outerName, "inner", "nested.bin"),
+			path.join(removingPath, outerName, "inner", payloadName),
+		);
+		const store = newSessionRootReaderStore(fixture.context);
+		let physical: NativeDirectoryTreeSnapshot;
+		try {
+			const captured = captureOwnerTreeIfPresent(fixture.context, store, fixture.locator.ownerId, removingPath);
+			if (!captured) throw new Error("fixture_physical_tree_missing");
+			physical = captured;
+		} finally {
+			store.close();
+		}
+		let continuation: TaskArtifactOwnerRetirementContinuation = {
+			schemaVersion: OWNER_RETIREMENT_SCHEMA_VERSION,
+			parentIdentity: evidence.parentIdentity,
+			retainedRootPath: removingPath,
+			retainedTreeSnapshot: physical,
+		};
+		const snapshots: NativeDirectoryTreeSnapshot[] = [];
+		const spy = vi.spyOn(native, "exactRemoveDirectoryTree").mockImplementation((_pathname, snapshot) => {
+			snapshots.push(snapshot);
+			return { ok: false, code: "cleanup_pending", detachedPath: removingPath };
+		});
+		for (let attempt = 0; attempt < 2; attempt++) {
+			verifyTaskArtifactOwnerRetirementContinuation(fixture.context, evidence, continuation);
+			const outcome = retireTaskArtifactOwner(fixture.context, evidence, continuation);
+			expect(outcome.kind).toBe("cleanup_pending");
+			if (outcome.kind === "completed") throw new Error("fixture_unexpected_completion");
+			const parsed = parseTaskArtifactOwnerRetirementOutcome(
+				fixture.context,
+				evidence,
+				JSON.parse(JSON.stringify(outcome)),
+			);
+			if (parsed.kind === "completed") throw new Error("fixture_unexpected_completed_decode");
+			continuation = parsed.continuation;
+			expect(continuation.retainedTreeSnapshot).toEqual(physical);
+			expect(snapshots[attempt].entries.map(entry => entry.relativePath).sort()).toEqual(
+				evidence.treeSnapshot.entries.map(entry => entry.relativePath).sort(),
+			);
+			const projected = snapshots[attempt].entries.find(entry => entry.relativePath === "outer/inner/nested.bin");
+			const physicalEntry = physical.entries.find(
+				entry => entry.relativePath === `${outerName}/inner/${payloadName}`,
+			);
+			if (!physicalEntry) throw new Error("fixture_physical_entry_missing");
+			expect(projected).toEqual({ ...physicalEntry, relativePath: "outer/inner/nested.bin" });
+			expect(fs.readFileSync(path.join(removingPath, outerName, "inner", payloadName), "utf8")).toBe(
+				"nested payload",
+			);
+		}
+		expect(spy).toHaveBeenCalledTimes(2);
+	});
+
+	it("refuses resurrection of an original child omitted from the prior shrinking ceiling", async () => {
+		const fixture = await makeOwnerFixture();
+		const removingPath = `${fixture.ownerPath}.removing`;
+		fs.renameSync(fixture.ownerPath, removingPath);
+		const outside = path.join(fixture.root, "held-original.bin");
+		fs.renameSync(path.join(removingPath, "artifact.bin"), outside);
+		const store = newSessionRootReaderStore(fixture.context);
+		let previous: TaskArtifactOwnerRetirementContinuation;
+		try {
+			const tree = captureOwnerTreeIfPresent(fixture.context, store, fixture.locator.ownerId, removingPath);
+			if (!tree) throw new Error("fixture_tree_missing");
+			previous = { ...continuationFor(fixture, removingPath), retainedTreeSnapshot: tree };
+		} finally {
+			store.close();
+		}
+		fs.renameSync(outside, path.join(removingPath, "artifact.bin"));
+		const spy = vi.spyOn(native, "exactRemoveDirectoryTree");
+		expect(() => verifyTaskArtifactOwnerRetirementContinuation(fixture.context, fixture.evidence, previous)).toThrow(
+			"task_artifact_owner_retained_tree_mismatch",
+		);
+		const outcome = retireTaskArtifactOwner(fixture.context, fixture.evidence, previous);
+		expect(outcome.kind).toBe("uncertain");
+		expect(spy).not.toHaveBeenCalled();
+		expect(fs.readFileSync(path.join(removingPath, "artifact.bin"), "utf8")).toBe("original-owner-payload");
+	});
 	it("forwards the actual native outcome and only verifies a completed physical removal", async () => {
 		const fixture = await makeOwnerFixture();
 		const { calls, spy } = observeActualNativeRemoval();
@@ -325,6 +423,24 @@ describe("task artifact owner native retirement", () => {
 				retainedTreeSnapshot: expandedTree,
 			}),
 		).toThrow("task_artifact_owner_continuation_invalid");
+	});
+
+	it("keeps uncertain native success from satisfying physical retirement verification", async () => {
+		const fixture = await makeOwnerFixture();
+		const uncertain = {
+			kind: "uncertain",
+			evidence: fixture.evidence,
+			continuation: continuationFor(fixture),
+			reason: "task_artifact_owner_parent_identity_changed_after_removal",
+			nativeOutcome: { ok: true },
+		};
+
+		expect(parseTaskArtifactOwnerRetirementOutcome(fixture.context, fixture.evidence, uncertain).kind).toBe(
+			"uncertain",
+		);
+		expect(() => verifyTaskArtifactOwnerPhysicalRetirement(fixture.context, fixture.evidence, uncertain)).toThrow(
+			"task_artifact_owner_physical_retirement_unverified",
+		);
 	});
 
 	it("does not treat canonical absence or historical payloadDurable as physical or fresh payload proof", async () => {

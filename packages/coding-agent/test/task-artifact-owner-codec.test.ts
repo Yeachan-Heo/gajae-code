@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import * as crypto from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
@@ -13,6 +14,7 @@ import {
 	parseTaskArtifactOwnerLocator,
 	parseTaskArtifactOwnerRetirementContinuation,
 	parseTaskArtifactOwnerRetirementOutcome,
+	retainedTreeDoesNotExpandAuthority,
 	sameTreeContents,
 	type TaskArtifactOwnerStorageContext,
 } from "../src/session/task-artifact-owner-codec";
@@ -83,6 +85,24 @@ function scrubbedTree(): typeof treeSnapshot {
 		...treeSnapshot,
 		entries: [treeSnapshot.entries[0], { ...treeSnapshot.entries[1], size: "0", sha256: EMPTY_PAYLOAD_SHA256 }],
 	};
+}
+
+function directoryEntry(relativePath: string, dev: string, ino: string) {
+	return {
+		relativePath,
+		kind: "directory" as const,
+		dev,
+		ino,
+		nlink: "1",
+		size: "0",
+		mtimeNs: "100",
+		ctimeNs: "101",
+	};
+}
+
+function quarantineName(relativePath: string, dev: string, ino: string): string {
+	const material = `${relativePath}\0${dev}\0${ino}`;
+	return `.pi-tree-detached-${crypto.createHash("sha256").update(material, "utf8").digest("hex")}`;
 }
 
 describe("task artifact owner codec", () => {
@@ -179,6 +199,113 @@ describe("task artifact owner codec", () => {
 		).toThrow();
 	});
 
+	it("maps deterministic quarantined descendants back to immutable original tree authority", () => {
+		const nestedTree = {
+			...treeSnapshot,
+			entries: [
+				treeSnapshot.entries[0],
+				directoryEntry("outer", "30", "31"),
+				directoryEntry("outer/inner", "32", "33"),
+				{ ...treeSnapshot.entries[1], relativePath: "outer/inner/payload.bin" },
+			],
+		};
+		const parsedEvidence = parseTaskArtifactOwnerDeletionEvidence({ ...evidence, treeSnapshot: nestedTree });
+		const outer = nestedTree.entries[1];
+		const inner = nestedTree.entries[2];
+		const payload = nestedTree.entries[3];
+		const outerName = quarantineName(outer.relativePath, outer.dev, outer.ino);
+		const innerName = quarantineName(inner.relativePath, inner.dev, inner.ino);
+		const payloadName = quarantineName(payload.relativePath, payload.dev, payload.ino);
+		const retainedTree = {
+			...nestedTree,
+			entries: [
+				nestedTree.entries[0],
+				{ ...outer, relativePath: outerName },
+				{ ...inner, relativePath: `${outerName}/${innerName}` },
+				{ ...payload, relativePath: `${outerName}/${innerName}/${payloadName}` },
+			],
+		};
+
+		expect(retainedTreeDoesNotExpandAuthority(parsedEvidence.treeSnapshot, retainedTree)).toBe(true);
+		expect(
+			parseTaskArtifactOwnerRetirementContinuation(
+				context,
+				parsedEvidence,
+				continuation(retainedTree, { retainedRootPath: `${ownerPath}.removing` }),
+			).retainedTreeSnapshot.entries,
+		).toHaveLength(4);
+
+		const unrelatedName = ".pi-tree-detached-not-a-digest";
+		const unrelatedTree = {
+			...retainedTree,
+			entries: [nestedTree.entries[0], { ...payload, relativePath: unrelatedName }],
+		};
+		expect(retainedTreeDoesNotExpandAuthority(parsedEvidence.treeSnapshot, unrelatedTree)).toBe(false);
+		expect(() =>
+			parseTaskArtifactOwnerRetirementContinuation(
+				context,
+				parsedEvidence,
+				continuation(unrelatedTree, { retainedRootPath: `${ownerPath}.removing` }),
+			),
+		).toThrow("task_artifact_owner_continuation_invalid");
+
+		const changedDigestName = `${payloadName.slice(0, -1)}${payloadName.endsWith("0") ? "1" : "0"}`;
+		const changedDigestTree = {
+			...retainedTree,
+			entries: [
+				nestedTree.entries[0],
+				{ ...outer, relativePath: outerName },
+				{ ...inner, relativePath: `${outerName}/${innerName}` },
+				{ ...payload, relativePath: `${outerName}/${innerName}/${changedDigestName}` },
+			],
+		};
+		expect(retainedTreeDoesNotExpandAuthority(parsedEvidence.treeSnapshot, changedDigestTree)).toBe(false);
+
+		const changedInodeTree = {
+			...retainedTree,
+			entries: [
+				nestedTree.entries[0],
+				{ ...outer, relativePath: outerName },
+				{ ...inner, relativePath: `${outerName}/${innerName}` },
+				{ ...payload, relativePath: `${outerName}/${innerName}/${payloadName}`, ino: "99" },
+			],
+		};
+		expect(retainedTreeDoesNotExpandAuthority(parsedEvidence.treeSnapshot, changedInodeTree)).toBe(false);
+
+		const misplacedNestedTree = {
+			...retainedTree,
+			entries: [
+				nestedTree.entries[0],
+				{ ...inner, relativePath: innerName },
+				{ ...payload, relativePath: `${innerName}/${payloadName}` },
+			],
+		};
+		expect(retainedTreeDoesNotExpandAuthority(parsedEvidence.treeSnapshot, misplacedNestedTree)).toBe(false);
+
+		const expandedTree = {
+			...retainedTree,
+			entries: [
+				...retainedTree.entries,
+				{
+					...payload,
+					relativePath: "unowned.bin",
+					dev: "40",
+					ino: "41",
+				},
+			],
+		};
+		expect(retainedTreeDoesNotExpandAuthority(parsedEvidence.treeSnapshot, expandedTree)).toBe(false);
+		for (const unauthorizedTree of [changedDigestTree, changedInodeTree, misplacedNestedTree, expandedTree]) {
+			expect(() =>
+				parseTaskArtifactOwnerRetirementContinuation(
+					context,
+					parsedEvidence,
+					continuation(unauthorizedTree, { retainedRootPath: `${ownerPath}.removing` }),
+				),
+			).toThrow("task_artifact_owner_continuation_invalid");
+		}
+	});
+
 	it("rejects continuation parent changes, owner-path escape, and changed payload hashes", () => {
 		const originalEvidence = parseTaskArtifactOwnerDeletionEvidence(evidence);
 		expect(() =>
@@ -270,6 +397,49 @@ describe("task artifact owner codec", () => {
 			expect(decoded.kind).toBe(outcome.kind);
 			expect<unknown>(decoded).toEqual(outcome);
 		}
+	});
+
+	it("preserves uncertain native success without granting completed status or accepting success side fields", () => {
+		const parsedEvidence = parseTaskArtifactOwnerDeletionEvidence(evidence);
+		const uncertainSuccess = {
+			kind: "uncertain",
+			evidence,
+			continuation: continuation(
+				{ ...treeSnapshot, entries: [treeSnapshot.entries[0]] },
+				{ retainedRootPath: `${ownerPath}.removing` },
+			),
+			reason: "task_artifact_owner_parent_identity_changed_after_removal",
+			nativeOutcome: { ok: true },
+		} as const;
+		const decoded = parseTaskArtifactOwnerRetirementOutcome(context, parsedEvidence, uncertainSuccess);
+		expect(decoded.kind).toBe("uncertain");
+		expect(decoded.nativeOutcome).toEqual({ ok: true });
+		expect<unknown>(decoded).toEqual(uncertainSuccess);
+
+		for (const nativeOutcome of [
+			{ ok: true, code: "cleanup_pending" },
+			{ ok: true, payloadDurable: true },
+			{ ok: true, windowsErrorCode: "0x00000005" },
+			{ ok: true, retainedUnknownPath: path.join(sessionsRoot, ".gjc-retained-unknown") },
+		]) {
+			expect(() =>
+				parseTaskArtifactOwnerRetirementOutcome(context, parsedEvidence, { ...uncertainSuccess, nativeOutcome }),
+			).toThrow("task_artifact_owner_retirement_outcome_invalid");
+		}
+		expect(() =>
+			parseTaskArtifactOwnerRetirementOutcome(context, parsedEvidence, {
+				kind: "completed",
+				evidence,
+				nativeOutcome: { ok: true, windowsErrorCode: "0x00000005" },
+			}),
+		).toThrow("task_artifact_owner_retirement_outcome_invalid");
+
+		expect(() =>
+			parseTaskArtifactOwnerRetirementOutcome(context, parsedEvidence, {
+				...uncertainSuccess,
+				continuation: { ...uncertainSuccess.continuation, nativeCodes: ["invalid code"] },
+			}),
+		).toThrow("task_artifact_owner_continuation_invalid");
 	});
 
 	it("rejects contradictory outcome claims and unknown outcome/native fields", () => {

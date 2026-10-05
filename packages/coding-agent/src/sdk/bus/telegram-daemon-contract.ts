@@ -300,8 +300,11 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * consuming run, so pre-fix owners cannot serve the generic lifecycle path.
  * Generation 202 adds complete image staging and exact accepted-capacity release
  * when queued submissions are removed, replacing generation-201 image-free owners.
+ * Generation 203 joins queued-removal terminal publication before ordinary
+ * abort acknowledgement and shutdown image-capacity release, replacing either
+ * image-free cancellation owners or image owners that acknowledge too early.
  */
-export const DAEMON_GENERATION = 202;
+export const DAEMON_GENERATION = 203;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

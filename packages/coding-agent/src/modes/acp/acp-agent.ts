@@ -3376,9 +3376,11 @@ export class AcpAgent implements Agent {
 				// publication is advisory and must never gate the settlement above.
 				void this.#publishPromptPhaseIdle(params.sessionId, record.adapter);
 			} else {
+				if (waiter && record.activePrompt === waiter && waiter.terminal && !waiter.settled)
+					this.#settlePrompt(params.sessionId, record, waiter);
 				// The acknowledgement proves the run was aborted, not that its terminal was
 				// published. Arm the bounded settlement so the turn cannot outlive the cancel.
-				this.#scheduleCancelSettlement(params.sessionId, record);
+				else this.#scheduleCancelSettlement(params.sessionId, record);
 			}
 			waiter?.cancelAttemptResolve?.(true);
 		} catch (error) {
@@ -3394,6 +3396,9 @@ export class AcpAgent implements Agent {
 				!waiter.settled
 			) {
 				if (waiter.terminalReserved) {
+					await record.frameTail;
+					if (record.activePrompt === waiter && waiter.terminal && !waiter.settled)
+						this.#settlePrompt(params.sessionId, record, waiter);
 					waiter.cancelAttemptResolve?.(true);
 					return;
 				}
@@ -3449,6 +3454,9 @@ export class AcpAgent implements Agent {
 				waiter.cancelAttempt = undefined;
 				waiter.cancelAttemptResolve = undefined;
 			}
+			const cancelWaveSettled = !waiter || waiter.cancelAcknowledged || (waiter.pendingCancelAttempts ?? 0) <= 1;
+			if (cancelWaveSettled && waiter && record.activePrompt === waiter && waiter.terminal && !waiter.settled)
+				this.#settlePrompt(params.sessionId, record, waiter);
 			throw cancellationError;
 		} finally {
 			if (waiter) {
@@ -5216,7 +5224,18 @@ export class AcpAgent implements Agent {
 			// Failure diagnostics are useful but advisory. Settle before any mapped
 			// session update can await a backpressured client transport; otherwise an
 			// already-decided failure can still lose to the inactivity watchdog.
-			this.#settlePrompt(id, record, activePrompt);
+			// A terminal that races an in-flight cancel must not settle the public prompt before
+			// the cancel request proves its outcome. Otherwise a follow-up prompt can be admitted
+			// between the stale terminal settlement and the abort acknowledgement, leaving the
+			// cancelled background request reported as `end_turn`.
+			const cancelSettlementPending =
+				activePrompt.cancelAttempt !== undefined &&
+				!activePrompt.cancelAcknowledged &&
+				record.statusRecovery !== activePrompt &&
+				!this.#ownsUncertainAbort(record, activePrompt);
+			if (!cancelSettlementPending) {
+				this.#settlePrompt(id, record, activePrompt);
+			}
 		}
 		if (!isTerminal && derivedCorrelation === undefined) return;
 		if (!isTerminal && hasCorrelation(correlation)) {

@@ -19,6 +19,7 @@ import {
 	resolveManagedScopeForWrite,
 	taskArtifactOwnerStorageContextForScope,
 } from "../src/session/internal/managed-session-scope";
+import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
 import {
 	captureTaskArtifactOwnerDeletionEvidence,
 	newSessionRootStore,
@@ -253,6 +254,65 @@ async function publishArtifactsRemoved(fixture: Fixture) {
 }
 
 describe("owner-aware disk session retirement", () => {
+	it("preserves partial failure after real native scrub when outcome publication fails", async () => {
+		const fixture = makeFixture();
+		await backdate(fixture.transcriptPath, 90);
+		writeSession(fixture.scope, "newest-session", fixture.cwd);
+		const transcript = fs.readFileSync(fixture.transcriptPath);
+		const payload = fs.readFileSync(path.join(fixture.ownerPath, "payload.bin"));
+		const originalRemove = native.exactRemoveDirectoryTree;
+		const results: NativeExactUnlinkResult[] = [];
+		vi.spyOn(native, "exactRemoveDirectoryTree").mockImplementation((pathname, tree, options) => {
+			const result = originalRemove(pathname, tree, options);
+			if (pathname === fixture.ownerPath || pathname === `${fixture.ownerPath}.removing`) results.push(result);
+			return result;
+		});
+		const originalPublish = ManagedSessionDescendantStore.prototype.publishNoReplaceSync;
+		const digest = crypto.createHash("sha256").update(path.resolve(fixture.transcriptPath)).digest("hex");
+		const pending = `.gjc-managed-session-internal/receipts/gc-retirement-${digest}-owner_pending-00000001.json`;
+		const retired = `.gjc-managed-session-internal/receipts/gc-retirement-${digest}-owner_retired.json`;
+		let blocked = false;
+		const fault = vi
+			.spyOn(ManagedSessionDescendantStore.prototype, "publishNoReplaceSync")
+			.mockImplementation(function (this: ManagedSessionDescendantStore, relative, bytes) {
+				if (!blocked && (relative === pending || relative === retired)) {
+					blocked = true;
+					throw Object.assign(new Error("Injected owner outcome publication failure"), { code: "EIO" });
+				}
+				return originalPublish.call(this, relative, bytes);
+			});
+		const first = await runGc(fixture, true);
+		fault.mockRestore();
+		expect(blocked).toBe(true);
+		expect(results.length).toBeGreaterThan(0);
+		expect(first.surfaces.sessions.records.find(record => record.path === fixture.transcriptPath)?.action).toBe(
+			"reclaim_failed",
+		);
+		const receipt = await readManagedGcSessionRetirementReceipt(fixture.scope, fixture.transcriptPath);
+		expect(receipt?.state).toBe("artifacts_removed");
+		const payloadPaths = [
+			path.join(fixture.ownerPath, "payload.bin"),
+			path.join(`${fixture.ownerPath}.removing`, "payload.bin"),
+		];
+		expect(payloadPaths.some(pathname => fs.existsSync(pathname) && fs.readFileSync(pathname).equals(payload))).toBe(
+			false,
+		);
+		const nativeCalls = results.length;
+		for (const prune of [false, true]) {
+			const before = snapshotTree(fixture.root);
+			const replay = await runGc(fixture, prune);
+			expect(replay.surfaces.sessions.records.find(record => record.path === fixture.transcriptPath)).toMatchObject({
+				action: "reclaim_failed",
+				phase: "artifacts",
+				reason: expect.stringContaining("task_artifact_owner_continuation_invalid"),
+			});
+			expect(replay.totals.failed).toBeGreaterThan(0);
+			expect(fs.readFileSync(fixture.transcriptPath)).toEqual(transcript);
+			if (!prune) expect(snapshotTree(fixture.root)).toEqual(before);
+			expect(await readManagedGcSessionRetirementReceipt(fixture.scope, fixture.transcriptPath)).toEqual(receipt);
+			expect(results.length).toBe(nativeCalls);
+		}
+	});
 	it.each([
 		false,
 		true,

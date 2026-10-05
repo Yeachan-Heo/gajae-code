@@ -25,6 +25,8 @@ type Fixture = {
 	updates: SessionNotification[];
 	promptDelivered: Promise<void>;
 	abortDelivered: Promise<void>;
+	terminalPublished: Promise<void>;
+	followUpDelivered: Promise<void>;
 	promptDeliveryCount(): number;
 	promptClientRef(): string;
 	newSessionAgain(): Promise<void>;
@@ -95,6 +97,7 @@ export function createFixture(
 		primaryControlSurface?: "cli" | "sdk";
 		liveSessionIndex?: boolean;
 		virtualPromptWatchdog?: boolean;
+		terminalOnAbortBeforeAcknowledgement?: StoppedReason;
 		abortAcknowledgement?:
 			| Record<string, unknown>
 			| (() => Record<string, unknown> | Promise<Record<string, unknown>>);
@@ -110,6 +113,8 @@ export function createFixture(
 		const queryCalls: string[] = [];
 		const delivered = Promise.withResolvers<void>();
 		const abortDelivered = Promise.withResolvers<void>();
+		const terminalPublished = Promise.withResolvers<void>();
+		const followUpDelivered = Promise.withResolvers<void>();
 		const abort = new AbortController();
 		let promptSocket: TestSocket | undefined;
 		let server!: ReturnType<typeof Bun.serve>;
@@ -288,6 +293,7 @@ export function createFixture(
 					if (frame.operation === "turn.prompt" || frame.operation === "skill.invoke") {
 						promptSocket = socket;
 						promptNumber++;
+						if (promptNumber === 2) followUpDelivered.resolve();
 						const input = frame.input as Record<string, unknown> | undefined;
 						lastPromptClientRef = typeof input?.clientRef === "string" ? input.clientRef : undefined;
 						delivered.resolve();
@@ -301,6 +307,22 @@ export function createFixture(
 						}
 					}
 					if (frame.operation === "turn.abort") abortDelivered.resolve();
+					if (frame.operation === "turn.abort" && options.terminalOnAbortBeforeAcknowledgement) {
+						const terminalCorrelation = activeCorrelation();
+						socket.send(
+							JSON.stringify({
+								type: "agent_end",
+								finalText: "cancel-race-terminal",
+								sessionId,
+								...terminalCorrelation,
+								outcome: {
+									kind: "stopped",
+									reason: options.terminalOnAbortBeforeAcknowledgement,
+									provenance: "agent",
+								},
+							}),
+						);
+					}
 					const correlation = activeCorrelation();
 					const abortAcknowledgement =
 						frame.operation === "turn.abort" && typeof options.abortAcknowledgement === "function"
@@ -369,6 +391,12 @@ export function createFixture(
 			{
 				sessionUpdate: async (update: SessionNotification) => {
 					updates.push(update);
+					if (
+						update.update.sessionUpdate === "agent_message_chunk" &&
+						update.update.content.type === "text" &&
+						update.update.content.text === "cancel-race-terminal"
+					)
+						terminalPublished.resolve();
 					if (hangUpdates) await releaseHang.promise;
 				},
 				signal: abort.signal,
@@ -391,6 +419,8 @@ export function createFixture(
 			updates,
 			promptDelivered: delivered.promise,
 			abortDelivered: abortDelivered.promise,
+			terminalPublished: terminalPublished.promise,
+			followUpDelivered: followUpDelivered.promise,
 			promptDeliveryCount: () => promptNumber,
 			promptClientRef: () => {
 				if (!lastPromptClientRef) throw new Error("Expected a turn.prompt clientRef");
@@ -1601,6 +1631,111 @@ test("an exact terminal reserved during recovery cannot let a stale query settle
 		queryResponse.resolve({});
 		cancel.mockRestore();
 		query.mockRestore();
+		fixture.dispose();
+	}
+});
+
+test("an uncertain abort settles an exact reserved terminal before returning", async () => {
+	const fixture = await createFixture({ cancelSettlementGraceMs: 25 });
+	const cancel = vi.spyOn(AcpSdkAdapter.prototype, "cancel").mockRejectedValue(
+		new SdkClientError("uncertain_after_send", "SDK abort response was lost after dispatch.", {
+			operation: "turn.abort",
+		}),
+	);
+	try {
+		const pending = prompt(fixture, "reserved terminal must settle uncertain abort").then(
+			resolved => ({ resolved }),
+			(error: unknown) => ({ rejected: error as { code?: string } }),
+		);
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		fixture.sendToolStart("reserved-terminal-pending-tool");
+		const cancellation = fixture.agent.cancel({ sessionId: fixture.sessionId }).then(
+			() => ({ resolved: true }),
+			(error: unknown) => ({ rejected: error as { code?: string } }),
+		);
+		await waitFor(() => cancel.mock.calls.length === 1, "uncertain abort dispatch");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "reserved terminal prompt settlement")).toEqual({
+			resolved: { stopReason: "cancelled" },
+		});
+		expect(await bounded(cancellation, "uncertain abort after reserved terminal")).toEqual({
+			resolved: true,
+		});
+
+		const successor = prompt(fixture, "successor after reserved terminal settlement");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "successor prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(successor, "successor terminal")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		cancel.mockRestore();
+		fixture.dispose();
+	}
+});
+
+test("a failed overlapping cancel keeps the terminal fenced until the wave settles", async () => {
+	const fixture = await createFixture();
+	const secondCancel = Promise.withResolvers<Record<string, unknown>>();
+	let cancelCalls = 0;
+	const cancel = vi.spyOn(AcpSdkAdapter.prototype, "cancel").mockImplementation(async () => {
+		cancelCalls++;
+		if (cancelCalls === 1)
+			throw new SdkClientError("abort_unacknowledged", "The first cancel was not acknowledged.", {
+				operation: "turn.abort",
+			});
+		return await secondCancel.promise;
+	});
+	try {
+		let promptSettled = false;
+		const pending = prompt(fixture, "partial cancel wave").then(
+			result => {
+				promptSettled = true;
+				return { resolved: result };
+			},
+			(error: unknown) => {
+				promptSettled = true;
+				return { rejected: error as { code?: string } };
+			},
+		);
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		fixture.sendToolStart("partial-cancel-wave-pending-tool");
+		const firstCancel = fixture.agent.cancel({ sessionId: fixture.sessionId }).then(
+			() => ({ resolved: true }),
+			(error: unknown) => ({ rejected: error as { code?: string } }),
+		);
+		const secondCancellation = fixture.agent.cancel({ sessionId: fixture.sessionId }).then(
+			() => ({ resolved: true }),
+			(error: unknown) => ({ rejected: error as { code?: string } }),
+		);
+		await waitFor(() => cancelCalls === 2, "overlapping cancel attempts");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(firstCancel, "first failed cancel")).toEqual({
+			rejected: expect.objectContaining({ code: "abort_unacknowledged" }),
+		});
+		expect(promptSettled).toBe(false);
+		const blocked = await prompt(fixture, "follow-up remains fenced during cancel wave").then(
+			() => undefined,
+			(error: unknown) => error as { code?: string },
+		);
+		expect(blocked).toMatchObject({ code: "conflict" });
+		expect(fixture.promptDeliveryCount()).toBe(1);
+
+		secondCancel.resolve({
+			ok: true,
+			selection: "turn",
+			turn: "stopped",
+			ownedWork: "left_running",
+			automaticDelivery: "enabled",
+			resumeOnOwnedCompletion: true,
+		});
+		expect(await bounded(secondCancellation, "successful overlapping cancel")).toEqual({
+			resolved: true,
+		});
+		expect(await bounded(pending, "settlement after cancel wave")).toEqual({
+			resolved: { stopReason: "cancelled" },
+		});
+	} finally {
+		secondCancel.resolve({});
+		cancel.mockRestore();
 		fixture.dispose();
 	}
 });
@@ -3314,6 +3449,47 @@ test("cancel 100ms after background prompt start settles cancelled and follow-up
 		fixture.sendStopped("end_turn");
 		expect(await bounded(followUp, "follow-up completion")).toEqual({ stopReason: "end_turn" });
 	} finally {
+		fixture.dispose();
+	}
+});
+
+test("cancel in flight before follow-up admission still settles the cancelled prompt", async () => {
+	const abortGate = Promise.withResolvers<void>();
+	const fixture = await createFixture({
+		cancelSettlementGraceMs: 0,
+		terminalOnAbortBeforeAcknowledgement: "end_turn",
+		abortAcknowledgement: async () => {
+			await abortGate.promise;
+			return {
+				ok: true,
+				selection: "turn",
+				turn: "stopped",
+				ownedWork: "left_running",
+				automaticDelivery: "enabled",
+				resumeOnOwnedCompletion: true,
+			};
+		},
+	});
+	try {
+		let backgroundSettled = false;
+		const background = prompt(fixture, "sleep 5000").then(result => {
+			backgroundSettled = true;
+			return result;
+		});
+		await bounded(fixture.promptDelivered, "background prompt delivery");
+		const cancellation = fixture.agent.cancel({ sessionId: fixture.sessionId });
+		await bounded(fixture.abortDelivered, "cancel request delivery");
+		await bounded(fixture.terminalPublished, "terminal processing before abort acknowledgement");
+		const followUp = prompt(fixture, "echo after-cancel");
+		expect(backgroundSettled).toBe(false);
+		abortGate.resolve();
+		expect(await bounded(cancellation, "cancel acknowledgement")).toBeUndefined();
+		expect(await bounded(background, "cancelled background settlement")).toEqual({ stopReason: "cancelled" });
+		await bounded(fixture.followUpDelivered, "follow-up prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(followUp, "follow-up completion")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		abortGate.resolve();
 		fixture.dispose();
 	}
 });

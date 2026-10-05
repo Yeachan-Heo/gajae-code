@@ -13,6 +13,7 @@ import {
 	EMPTY_PAYLOAD_SHA256,
 	isKnownNativeSidePath,
 	isOwnerRetainedRoot,
+	normalizeRetainedTreeSnapshot,
 	OWNER_DIRECTORY,
 	OWNER_RETIREMENT_SCHEMA_VERSION,
 	ownerAbsolutePath,
@@ -215,7 +216,9 @@ export function verifyTaskArtifactOwnerRetirementContinuation(
 			evidence.locator.ownerId,
 			continuation.retainedRootPath,
 		);
-		if (!snapshot || !retainedTreeDoesNotExpandAuthority(continuation.retainedTreeSnapshot, snapshot))
+		const prior = normalizeRetainedTreeSnapshot(evidence.treeSnapshot, continuation.retainedTreeSnapshot);
+		const current = snapshot && normalizeRetainedTreeSnapshot(evidence.treeSnapshot, snapshot);
+		if (!prior || !current || !retainedTreeDoesNotExpandAuthority(prior, current))
 			throw new Error("task_artifact_owner_retained_tree_mismatch");
 		if (
 			continuation.payloadDurable === true &&
@@ -284,7 +287,9 @@ export function retireTaskArtifactOwner(
 
 		const ownerPath = ownerAbsolutePath(context, evidence.locator.ownerId);
 		const removingPath = `${ownerPath}.removing`;
-		const baseline = previous?.retainedTreeSnapshot ?? evidence.treeSnapshot;
+		const baseline = previous
+			? normalizeRetainedTreeSnapshot(evidence.treeSnapshot, previous.retainedTreeSnapshot)
+			: evidence.treeSnapshot;
 		const candidates = [
 			...new Set(
 				[previous?.retainedRootPath, removingPath, ownerPath].filter(
@@ -294,6 +299,7 @@ export function retireTaskArtifactOwner(
 		];
 		let retainedRootPath: string | undefined;
 		let retainedTreeSnapshot: NativeDirectoryTreeSnapshot | undefined;
+		let nativeTreeSnapshot: NativeDirectoryTreeSnapshot | undefined;
 		for (const candidate of candidates) {
 			let snapshot: NativeDirectoryTreeSnapshot | undefined;
 			try {
@@ -313,12 +319,8 @@ export function retireTaskArtifactOwner(
 					continuation: fallback,
 					reason: "task_artifact_owner_writer_not_quiescent",
 				};
-			if (
-				!snapshot ||
-				snapshot.rootDev !== evidence.locator.directoryDev ||
-				snapshot.rootIno !== evidence.locator.directoryIno ||
-				!retainedTreeDoesNotExpandAuthority(baseline, snapshot)
-			)
+			const normalized = snapshot && normalizeRetainedTreeSnapshot(evidence.treeSnapshot, snapshot);
+			if (!snapshot || !normalized || !baseline || !retainedTreeDoesNotExpandAuthority(baseline, normalized))
 				continue;
 			if (candidate === ownerPath && JSON.stringify(snapshot) === JSON.stringify(evidence.treeSnapshot)) {
 				try {
@@ -341,9 +343,10 @@ export function retireTaskArtifactOwner(
 			}
 			retainedRootPath = candidate;
 			retainedTreeSnapshot = snapshot;
+			nativeTreeSnapshot = normalized;
 			break;
 		}
-		if (!retainedRootPath || !retainedTreeSnapshot)
+		if (!retainedRootPath || !retainedTreeSnapshot || !nativeTreeSnapshot)
 			return {
 				kind: "uncertain",
 				evidence,
@@ -355,7 +358,7 @@ export function retireTaskArtifactOwner(
 		try {
 			nativeOutcome = rootStore.removeTreeExpectedWithParentIdentity(
 				path.relative(context.sessionsRoot, retainedRootPath).split(path.sep).join("/"),
-				retainedTreeSnapshot,
+				nativeTreeSnapshot,
 				{ dev: BigInt(evidence.parentIdentity.dev), ino: BigInt(evidence.parentIdentity.ino) },
 			);
 		} catch {
@@ -392,13 +395,11 @@ export function retireTaskArtifactOwner(
 		let residualValid = reportedRootKnown;
 		try {
 			residualTree = captureOwnerTreeIfPresent(context, rootStore, evidence.locator.ownerId, nextRoot);
-			if (
-				residualTree &&
-				(residualTree.rootDev !== evidence.locator.directoryDev ||
-					residualTree.rootIno !== evidence.locator.directoryIno ||
-					!retainedTreeDoesNotExpandAuthority(retainedTreeSnapshot, residualTree))
-			)
-				residualValid = false;
+			if (residualTree) {
+				const normalizedResidual = normalizeRetainedTreeSnapshot(evidence.treeSnapshot, residualTree);
+				if (!normalizedResidual || !retainedTreeDoesNotExpandAuthority(nativeTreeSnapshot, normalizedResidual))
+					residualValid = false;
+			}
 		} catch {
 			residualValid = false;
 		}
