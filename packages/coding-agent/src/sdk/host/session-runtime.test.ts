@@ -11985,14 +11985,32 @@ test("SDK-only host advances a finalized stopped row when the retry replay match
 	}
 });
 
-test.each([
-	"hold",
-	"fail",
-	"removed-before-shutdown",
-	"timeout",
-	"failed-stop",
-] as const)("SDK-only shutdown joins queued terminal publication (%s)", async mode => {
+test.each(
+	(["text", "image"] as const).flatMap(kind =>
+		(["hold", "fail", "removed-before-shutdown", "timeout", "failed-stop"] as const).map(mode => ({ kind, mode })),
+	),
+)("SDK-only shutdown joins queued terminal publication ($kind/$mode)", async ({ kind, mode }) => {
 	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-queued-shutdown-"));
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	let imageReleases = 0;
+	let redeemedImages: unknown;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		redeemedImages = reservation.images;
+		return {
+			images: reservation.images,
+			release: () => {
+				imageReleases++;
+				reservation.release();
+			},
+		};
+	});
+	let admittedContent: unknown;
+	let rootAbortCalls = 0;
 	let removeQueued: (() => void) | undefined;
 	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
 	let queued = false;
@@ -12001,8 +12019,10 @@ test.each([
 		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
 			handlers.set(event, handler);
 		},
-		sendUserMessage: (_content: string, options: PreflightHooks | undefined) =>
+		sendUserMessage: (content: unknown, options: PreflightHooks | undefined) =>
 			Promise.resolve(options?.onPreflightAcceptCommit?.()).then(() => {
+				admittedContent = content;
+				if (kind === "image") options?.onDispatchDisposition?.({ startsOwnRun: false });
 				queued = true;
 				queueSignal = options?.preflightSignal;
 				removeQueued = () => {
@@ -12015,7 +12035,23 @@ test.each([
 				return {};
 			}),
 	} as unknown as ExtensionAPI;
-	const transport = memoryTransport();
+	const memory = memoryTransport();
+	let transportOpen = false;
+	const startMemory = memory.start.bind(memory);
+	const stopMemory = memory.stop.bind(memory);
+	const transport = {
+		...memory,
+		isConnectionOpen: (connectionId: string) => transportOpen && connectionId === "requester",
+		start: async () => {
+			const endpoint = await startMemory();
+			transportOpen = true;
+			return endpoint;
+		},
+		stop: async () => {
+			await stopMemory();
+			transportOpen = false;
+		},
+	};
 	let transportStops = 0;
 	const originalStop = transport.stop.bind(transport);
 	const stopSpy = spyOn(transport, "stop").mockImplementation(async () => {
@@ -12037,7 +12073,10 @@ test.each([
 			getTerminalTurnEpoch: () => 7,
 			getActivePromptHandle: () => "unrelated-handle",
 			cancelPendingPreflightForTerminalAbort: () => {},
-			abortPromptAndWaitWithTerminal: async () => ({ status: "settled", terminalScope: {} }),
+			abortPromptAndWaitWithTerminal: async () => {
+				rootAbortCalls++;
+				throw new Error("Queued shutdown must not borrow an unrelated root terminal");
+			},
 		},
 	});
 	const ctx = { ...extensionContext(transport.sessionId, cwd), isIdle: () => true } as unknown as ExtensionContext;
@@ -12048,11 +12087,13 @@ test.each([
 	let commandId: string | undefined;
 	let armed = false;
 	let interrupted = false;
+	const releasesAtTerminalAttempt: number[] = [];
 	const fault = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
 		if (armed && String(to) === target) {
 			const document = (await Bun.file(String(from)).json()) as ReconciliationStoreDocument;
 			if (document.records.some(record => record.commandId === commandId && record.terminalAt !== undefined)) {
 				interrupted = true;
+				releasesAtTerminalAttempt.push(imageReleases);
 				started.resolve();
 				if (mode === "fail" || mode === "failed-stop")
 					throw Object.assign(new Error("Injected queued terminal EIO"), { code: "EIO" });
@@ -12071,11 +12112,49 @@ test.each([
 	let shutdown: Promise<void> | undefined;
 	try {
 		await handlers.get("session_start")?.({}, ctx);
+		let imageId: string | undefined;
+		let imageBytes: Buffer | undefined;
+		if (kind === "image") {
+			imageBytes = Buffer.from(
+				await Bun.file(new URL("../../../test/fixtures/sdk-inline-image-large.png", import.meta.url)).arrayBuffer(),
+			);
+			expect(imageBytes.length).toBeGreaterThan(256 * 1024);
+			const control = async (
+				id: string,
+				operation: string,
+				input: Record<string, unknown>,
+			): Promise<ResponseFrame> => {
+				const frame = { type: "control_request", id, operation, input } as SdkFrame;
+				expect(Buffer.byteLength(JSON.stringify(frame))).toBeLessThan(256 * 1024);
+				transport.feed("requester", frame);
+				await waitFor(() => transport.sent.some(response => response.id === id), operation);
+				const response = transport.sent.find(response => response.id === id) as ResponseFrame;
+				expect(response.ok).toBe(true);
+				return response;
+			};
+			const begun = await control("image-begin", "turn.image.begin", {
+				mimeType: "image/png",
+				byteLength: imageBytes.length,
+				sha256: createHash("sha256").update(imageBytes).digest("hex"),
+			});
+			imageId = begun.result?.id;
+			if (!imageId) throw new Error("Host did not return a staged image ID");
+			let sequence = 0;
+			for (let offset = 0; offset < imageBytes.length; offset += 96 * 1024) {
+				await control(`image-append-${sequence}`, "turn.image.append", {
+					id: imageId,
+					sequence,
+					data: imageBytes.subarray(offset, offset + 96 * 1024).toString("base64"),
+				});
+				sequence++;
+			}
+			await control("image-finish", "turn.image.finish", { id: imageId });
+		}
 		transport.feed("requester", {
 			type: "control_request",
 			id: "followup",
-			operation: "turn.follow_up",
-			input: { text: "unconsumed followup" },
+			operation: kind === "image" ? "turn.prompt" : "turn.follow_up",
+			input: { text: "unconsumed followup", ...(imageId ? { stagedImages: [{ id: imageId }] } : {}) },
 		} as SdkFrame);
 		await waitFor(() => transport.sent.some(frame => frame.id === "followup"), "follow-up admission");
 		const accepted = transport.sent.find(frame => frame.id === "followup") as ResponseFrame;
@@ -12083,6 +12162,19 @@ test.each([
 		commandId = accepted.result?.commandId;
 		expect(commandId).toBeDefined();
 		await waitFor(() => queued && queueSignal !== undefined, "queued follow-up");
+		expect(imageReleases).toBe(0);
+		if (kind === "image") {
+			expect(redeemedImages).toEqual([
+				{ type: "image", data: imageBytes!.toString("base64"), mimeType: "image/png" },
+			]);
+			expect(admittedContent).toEqual([
+				{ type: "text", text: "unconsumed followup" },
+				...(redeemedImages as unknown[]),
+			]);
+		} else {
+			expect(redeemedImages).toBeUndefined();
+			expect(admittedContent).toBe("unconsumed followup");
+		}
 		armed = true;
 		if (mode === "removed-before-shutdown") {
 			removeQueued?.();
@@ -12100,6 +12192,8 @@ test.each([
 		);
 		await started.promise;
 		expect(interrupted).toBe(true);
+		expect(releasesAtTerminalAttempt[0]).toBe(0);
+		expect(rootAbortCalls).toBe(0);
 		expect(queueSignal?.aborted).toBe(true);
 		expect(queued).toBe(false);
 		if (mode === "fail" || mode === "timeout" || mode === "failed-stop") {
@@ -12136,6 +12230,7 @@ test.each([
 			await Bun.sleep(25);
 			expect(settled).toBe(false);
 			expect(transportStops).toBe(0);
+			expect(imageReleases).toBe(0);
 			transport.feed("requester", {
 				type: "control_request",
 				id: "draining-followup",
@@ -12155,11 +12250,14 @@ test.each([
 			const durable = (await Bun.file(target).json()) as ReconciliationStoreDocument;
 			expect(durable.records.find(record => record.commandId === commandId)?.terminalAt).toBeDefined();
 		}
+		expect(imageReleases).toBe(kind === "image" ? 1 : 0);
+		expect(rootAbortCalls).toBe(0);
 	} finally {
 		release.resolve();
 		await shutdown?.catch(() => undefined);
 		fault.mockRestore();
 		stopSpy.mockRestore();
+		redeemSpy.mockRestore();
 		await rm(cwd, { recursive: true, force: true });
 	}
 });
