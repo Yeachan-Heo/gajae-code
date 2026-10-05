@@ -52,6 +52,16 @@ function mockFetchOnce(body: string): void {
 	global.fetch = Object.assign(fn, { preconnect: originalFetch.preconnect });
 }
 
+function mockFetchSequence(bodies: string[]): { requests: () => number } {
+	let requests = 0;
+	const fn = async (): Promise<Response> => {
+		const body = bodies[Math.min(requests++, bodies.length - 1)];
+		return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+	};
+	global.fetch = Object.assign(fn, { preconnect: originalFetch.preconnect });
+	return { requests: () => requests };
+}
+
 const USAGE = { input_tokens: 5, output_tokens: 3, total_tokens: 8, input_tokens_details: { cached_tokens: 0 } };
 
 describe("openai-codex: truncated tool-call detection", () => {
@@ -170,5 +180,84 @@ describe("openai-codex: truncated tool-call detection", () => {
 		result = await streamOpenAICodexResponses(model(), context(), { apiKey: token() }).result();
 		tools = result.content.filter((b): b is ToolCall => b.type === "toolCall");
 		expect(tools[0].incompleteArguments).toBeFalsy();
+	});
+
+	it("retries a timeout after only an incomplete function call", async () => {
+		setAgentDir(TempDir.createSync("@pi-codex-trunc-").path());
+		const timeout = sse([
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "read_file", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_1", output_index: 0, delta: '{"path":"' },
+			{
+				type: "error",
+				code: "request_timeout",
+				message: "stream disconnected before completion: stream closed before response.completed",
+			},
+		]);
+		const success = sse([
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "function_call", id: "fc_2", call_id: "call_2", name: "read_file", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_2", output_index: 0, delta: '{"path":"a.ts"}' },
+			{
+				type: "response.function_call_arguments.done",
+				item_id: "fc_2",
+				output_index: 0,
+				arguments: '{"path":"a.ts"}',
+			},
+			{
+				type: "response.output_item.done",
+				output_index: 0,
+				item: { type: "function_call", id: "fc_2", call_id: "call_2", name: "read_file", arguments: '{"path":"a.ts"}' },
+			},
+			{ type: "response.completed", response: { status: "completed", usage: USAGE } },
+		]);
+		const fetches = mockFetchSequence([timeout, success]);
+
+		const result = await streamOpenAICodexResponses(model(), context(), { apiKey: token() }).result();
+		expect(fetches.requests()).toBe(2);
+		expect(result.stopReason).toBe("toolUse");
+		expect(result.content.filter((block): block is ToolCall => block.type === "toolCall")).toHaveLength(1);
+	});
+
+	it("does not retry a timeout when non-empty text was emitted", async () => {
+		setAgentDir(TempDir.createSync("@pi-codex-trunc-").path());
+		const fetches = mockFetchSequence([
+			sse([
+				{ type: "response.output_item.added", output_index: 0, item: { type: "message", id: "msg_1", content: [] } },
+				{ type: "response.content_part.added", item_id: "msg_1", output_index: 0, part: { type: "output_text", text: "hello" } },
+				{ type: "response.output_text.delta", item_id: "msg_1", output_index: 0, delta: "hello" },
+				{
+					type: "error",
+					code: "request_timeout",
+					message: "stream disconnected before completion: stream closed before response.completed",
+				},
+			]),
+		]);
+
+		await streamOpenAICodexResponses(model(), context(), { apiKey: token() }).result();
+		expect(fetches.requests()).toBe(1);
+	});
+
+	it("does not retry a second consecutive timeout", async () => {
+		setAgentDir(TempDir.createSync("@pi-codex-trunc-").path());
+		const timeout = sse([
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "read_file", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_1", output_index: 0, delta: '{"path":"' },
+			{ type: "error", code: "request_timeout", message: "stream disconnected before completion: stream closed before response.completed" },
+		]);
+		const fetches = mockFetchSequence([timeout, timeout]);
+
+		await streamOpenAICodexResponses(model(), context(), { apiKey: token() }).result();
+		expect(fetches.requests()).toBe(2);
 	});
 });

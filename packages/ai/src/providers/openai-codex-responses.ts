@@ -484,6 +484,7 @@ interface CodexStreamRuntime {
 	nativeOutputItemOutputIndexes: Array<number | undefined>;
 	websocketStreamRetries: number;
 	providerRetryAttempt: number;
+	incompleteToolCallRetryAttempted: boolean;
 	toolChoiceFallbackAttempted: boolean;
 	/**
 	 * Stale-anchor recovery is one-shot. Once the anchor is cleared the replay no
@@ -1250,6 +1251,7 @@ function createCodexStreamRuntime(initial: {
 		nativeOutputItemOutputIndexes: [],
 		websocketStreamRetries: 0,
 		providerRetryAttempt: 0,
+		incompleteToolCallRetryAttempted: false,
 		toolChoiceFallbackAttempted: initial.toolChoiceFallbackApplied === true,
 		previousResponseRecoveryAttempted: false,
 		sentPreviousResponseId: initial.sentPreviousResponseId === true,
@@ -2267,10 +2269,42 @@ async function recoverCodexStreamError(
 	if (await tryReplayWebsocketFailureOverSse(context, runtime, error)) {
 		return true;
 	}
+	if (isCodexIncompleteToolCallTimeoutRetryable(context, runtime, error)) {
+		const retried = await tryRetryCodexProviderError(context, runtime, error, true);
+		if (retried) runtime.incompleteToolCallRetryAttempted = true;
+		if (retried) return true;
+	}
 	if (await tryRetryCodexProviderError(context, runtime, error)) {
 		return true;
 	}
 	return false;
+}
+
+function isCodexIncompleteToolCallTimeoutRetryable(
+	context: CodexStreamProcessingContext,
+	runtime: CodexStreamRuntime,
+	error: unknown,
+): boolean {
+	if (runtime.incompleteToolCallRetryAttempted || !isCodexTransientStreamClose(error)) return false;
+	const providerCode =
+		error instanceof CodexProviderStreamError
+			? error.code?.toLowerCase()
+			: (error as { providerCode?: string }).providerCode?.toLowerCase();
+	if (providerCode !== "request_timeout") return false;
+	const toolCalls = context.output.content.filter((block): block is ToolCall => block.type === "toolCall");
+	return (
+		toolCalls.length > 0 &&
+		runtime.finalizedToolCallIds.size === 0 &&
+		!runtime.toolArgumentCorrelationFailed &&
+		context.output.content.every(
+			block =>
+				block.type === "thinking" ||
+				(block.type === "toolCall" &&
+					!runtime.finalizedToolCallIds.has(block.id) &&
+					(block as ToolCall & { argumentsComplete?: boolean }).argumentsComplete !== true) ||
+				(block.type === "text" && block.text === ""),
+		)
+	);
 }
 
 async function tryRetryWithoutForcedToolChoice(
@@ -2546,10 +2580,11 @@ async function tryRetryCodexProviderError(
 	context: CodexStreamProcessingContext,
 	runtime: CodexStreamRuntime,
 	error: unknown,
+	allowIncompleteToolCallOutput = false,
 ): Promise<boolean> {
 	if (
-		!isRetryableCodexProviderError(error) ||
-		context.output.content.length > 0 ||
+		(!isRetryableCodexProviderError(error) && !allowIncompleteToolCallOutput) ||
+		(!allowIncompleteToolCallOutput && context.output.content.length > 0) ||
 		runtime.providerRetryAttempt >= resolveRetryBudget(context.options?.streamMaxRetries, CODEX_MAX_RETRIES) ||
 		context.options?.signal?.aborted ||
 		context.options?.fallbackManaged ||
