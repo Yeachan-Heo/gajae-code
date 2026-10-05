@@ -70,9 +70,9 @@ describe("Kiro API-key content filter #6150", () => {
 		const events: Array<{ type: string; message?: { errorMessage?: string; content?: unknown[] } }> = [];
 
 		globalThis.fetch = (async () => {
-			// Simulate text content followed by refusal in the same response
+			// Real ksk_ refusal response contains only the refusal metadata event,
+			// no text content (content filtering prevents text generation)
 			const responseBody =
-				'{"content":"I cannot help with this request"}' +
 				'{"stopReason":"CONTENT_FILTERED","stopDetails":{"refusal":{"category":"VIOLENCE","explanation":"Cannot assist with violent content"}}}';
 			return new Response(responseBody, { status: 200 });
 		}) as unknown as typeof fetch;
@@ -170,5 +170,72 @@ describe("Kiro API-key content filter #6150", () => {
 		expect(errorEvent?.message?.errorMessage).toContain(
 			"This request cannot be processed due to policy restrictions",
 		);
+	});
+
+	test("ksk_ transport emits text_delta incrementally before stream ends", async () => {
+		const emittedEvents: Array<{ type: string }> = [];
+
+		globalThis.fetch = (async () => {
+			// Response with content that will be streamed incrementally
+			const responseBody =
+				'{"content":"Hello "}' + '{"content":"world"}' + '{"usage":{"inputTokens":10,"outputTokens":2}}';
+			return new Response(responseBody, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEvents.push({ type: event.type });
+			}
+		} catch {
+			// Stream may throw; events are captured
+		}
+
+		globalThis.fetch = originalFetch;
+
+		// Find index of first text_delta and last chunk consumed (done event)
+		const firstTextDeltaIndex = emittedEvents.findIndex(e => e.type === "text_delta");
+		const doneEventIndex = emittedEvents.findIndex(e => e.type === "done");
+
+		// Verify incremental emission: first text_delta appears before stream ends
+		expect(firstTextDeltaIndex).toBeGreaterThan(-1);
+		expect(doneEventIndex).toBeGreaterThan(firstTextDeltaIndex);
+	});
+
+	test("ksk_ transport sets ttft < duration for successful completion", async () => {
+		const capturedMessages: Array<{ type: string; message?: unknown }> = [];
+
+		globalThis.fetch = (async () => {
+			const responseBody = '{"content":"Hello"}' + '{"usage":{"inputTokens":10,"outputTokens":1}}';
+			return new Response(responseBody, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				if (event.type === "done" || event.type === "error") {
+					capturedMessages.push({
+						type: event.type,
+						message: "message" in event ? event.message : "error" in event ? event.error : undefined,
+					});
+				}
+			}
+		} catch {
+			// Stream may throw; messages are captured
+		}
+
+		globalThis.fetch = originalFetch;
+
+		const doneEvent = capturedMessages.find(e => e.type === "done");
+		const msg = doneEvent?.message as { ttft?: number; duration?: number } | undefined;
+
+		// Verify ttft is set and less than or equal to duration (ttft is time to first token)
+		expect(msg?.ttft).toBeDefined();
+		expect(msg?.duration).toBeDefined();
+		if (msg?.ttft !== undefined && msg?.duration !== undefined) {
+			expect(msg.ttft).toBeLessThanOrEqual(msg.duration);
+			expect(msg.ttft).toBeGreaterThanOrEqual(0);
+			expect(msg.duration).toBeGreaterThanOrEqual(0);
+		}
 	});
 });

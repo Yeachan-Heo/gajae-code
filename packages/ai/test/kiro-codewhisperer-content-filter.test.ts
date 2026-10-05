@@ -359,4 +359,87 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 		expect(errorEvent?.message?.errorMessage).toContain("Your request cannot be processed");
 		expect((errorEvent?.message as { errorKind?: string })?.errorKind).toBe("provider_safety_stop");
 	});
+
+	test("CodeWhisperer transport emits text_delta incrementally before stream ends", async () => {
+		const emittedEvents: Array<{ type: string }> = [];
+
+		const chunk1 = encodeFrame(
+			{ ":message-type": "event", ":event-type": "assistantResponseEvent" },
+			new TextEncoder().encode(JSON.stringify({ content: "Hello " })),
+		);
+		const chunk2 = encodeFrame(
+			{ ":message-type": "event", ":event-type": "assistantResponseEvent" },
+			new TextEncoder().encode(JSON.stringify({ content: "world" })),
+		);
+
+		globalThis.fetch = (async () => {
+			return new Response(streamFrom([chunk1, chunk2]), {
+				status: 200,
+				headers: { "content-type": "application/vnd.amazon.eventstream" },
+			});
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = trustedStreamKiroCodeWhisperer(model, context, { apiKey: "token", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEvents.push({ type: event.type });
+			}
+		} catch {
+			// Stream may throw; events are captured
+		}
+
+		globalThis.fetch = originalFetch;
+
+		// Find index of first text_delta and last chunk consumed (done event)
+		const firstTextDeltaIndex = emittedEvents.findIndex(e => e.type === "text_delta");
+		const doneEventIndex = emittedEvents.findIndex(e => e.type === "done");
+
+		// Verify incremental emission: first text_delta appears before stream ends
+		expect(firstTextDeltaIndex).toBeGreaterThan(-1);
+		expect(doneEventIndex).toBeGreaterThan(firstTextDeltaIndex);
+	});
+
+	test("CodeWhisperer transport sets ttft < duration for successful completion", async () => {
+		const capturedMessages: Array<{ type: string; message?: unknown }> = [];
+
+		const responseFrame = encodeFrame(
+			{ ":message-type": "event", ":event-type": "assistantResponseEvent" },
+			new TextEncoder().encode(JSON.stringify({ content: "Hello" })),
+		);
+
+		globalThis.fetch = (async () => {
+			return new Response(streamFrom([responseFrame]), {
+				status: 200,
+				headers: { "content-type": "application/vnd.amazon.eventstream" },
+			});
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = trustedStreamKiroCodeWhisperer(model, context, { apiKey: "token", region: "us-east-1" });
+			for await (const event of stream) {
+				if (event.type === "done" || event.type === "error") {
+					capturedMessages.push({
+						type: event.type,
+						message: "message" in event ? event.message : "error" in event ? event.error : undefined,
+					});
+				}
+			}
+		} catch {
+			// Stream may throw; messages are captured
+		}
+
+		globalThis.fetch = originalFetch;
+
+		const doneEvent = capturedMessages.find(e => e.type === "done");
+		const msg = doneEvent?.message as { ttft?: number; duration?: number } | undefined;
+
+		// Verify ttft is set and less than or equal to duration (ttft is time to first token)
+		expect(msg?.ttft).toBeDefined();
+		expect(msg?.duration).toBeDefined();
+		if (msg?.ttft !== undefined && msg?.duration !== undefined) {
+			expect(msg.ttft).toBeLessThanOrEqual(msg.duration);
+			expect(msg.ttft).toBeGreaterThanOrEqual(0);
+			expect(msg.duration).toBeGreaterThanOrEqual(0);
+		}
+	});
 });

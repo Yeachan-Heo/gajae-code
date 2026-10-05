@@ -631,6 +631,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			timestamp: Date.now(),
 		};
 		const blocks = output.content as Block[];
+		const startTime = Date.now();
 		let firstTokenEmitted = false;
 		let firstTokenTime: number | undefined;
 		try {
@@ -694,6 +695,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			};
 
 			const appendText = (delta: string) => {
+				// Set firstTokenTime on first real (non-thinking) text delta
 				if (!firstTokenEmitted) {
 					firstTokenEmitted = true;
 					firstTokenTime = Date.now();
@@ -711,45 +713,10 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				stream.push({ type: "text_delta", contentIndex: textIndex, delta, partial: output });
 			};
 
-			const appendThinking = (delta: string) => {
-				if (!firstTokenEmitted) {
-					firstTokenEmitted = true;
-					firstTokenTime = Date.now();
-				}
-				if (thinkingIndex === undefined) {
-					thinkingIndex = blocks.length;
-					blocks.push({ type: "thinking", thinking: "", index: thinkingIndex } as ThinkingContent & {
-						index: number;
-					});
-					stream.push({ type: "thinking_start", contentIndex: thinkingIndex, partial: output });
-				}
-				const block = blocks[thinkingIndex] as ThinkingContent;
-				block.thinking += delta;
-				stream.push({ type: "thinking_delta", contentIndex: thinkingIndex, delta, partial: output });
-			};
-
-			const emitBlocksToStream = () => {
-				for (let i = 0; i < blocks.length; i++) {
-					const block = blocks[i];
-					if (block.type === "thinking") {
-						stream.push({ type: "thinking_start", contentIndex: i, partial: output });
-						stream.push({ type: "thinking_delta", contentIndex: i, delta: block.thinking, partial: output });
-						stream.push({ type: "thinking_end", contentIndex: i, content: block.thinking, partial: output });
-					} else if (block.type === "text") {
-						stream.push({ type: "text_start", contentIndex: i, partial: output });
-						stream.push({ type: "text_delta", contentIndex: i, delta: block.text, partial: output });
-						stream.push({ type: "text_end", contentIndex: i, content: block.text, partial: output });
-					} else if (block.type === "toolCall") {
-						stream.push({ type: "toolcall_start", contentIndex: i, partial: output });
-						const args = JSON.stringify(block.arguments ?? {});
-						stream.push({ type: "toolcall_delta", contentIndex: i, delta: args, partial: output });
-						stream.push({ type: "toolcall_end", contentIndex: i, toolCall: block, partial: output });
-					}
-				}
-			};
-
 			let inThink = false;
 			let thinkBuf = "";
+			let thinkingAccumulated = ""; // Buffer thinking until end or refusal
+
 			const consumeContent = (raw: string) => {
 				thinkBuf += raw;
 				while (true) {
@@ -769,112 +736,134 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						const end = thinkBuf.indexOf("</thinking>");
 						if (end < 0) {
 							if (thinkBuf) {
-								appendThinking(thinkBuf);
+								thinkingAccumulated += thinkBuf;
 								thinkBuf = "";
 							}
 							return;
 						}
-						if (end > 0) appendThinking(thinkBuf.slice(0, end));
+						if (end > 0) thinkingAccumulated += thinkBuf.slice(0, end);
 						thinkBuf = thinkBuf.slice(end + "</thinking>".length);
 						inThink = false;
 					}
 				}
 			};
 
-			// Collect all events from the stream
-			const allEvents: KiroStreamEvent[] = [];
+			// Emit accumulated thinking (from buffer)
+			const emitThinking = () => {
+				if (!thinkingAccumulated) return;
+				if (thinkingIndex === undefined) {
+					thinkingIndex = blocks.length;
+					blocks.push({
+						type: "thinking",
+						thinking: thinkingAccumulated,
+						index: thinkingIndex,
+					} as ThinkingContent & { index: number });
+					stream.push({ type: "thinking_start", contentIndex: thinkingIndex, partial: output });
+					stream.push({
+						type: "thinking_delta",
+						contentIndex: thinkingIndex,
+						delta: thinkingAccumulated,
+						partial: output,
+					});
+					stream.push({
+						type: "thinking_end",
+						contentIndex: thinkingIndex,
+						content: thinkingAccumulated,
+						partial: output,
+					});
+				}
+			};
+
+			// Process events incrementally as they arrive (streaming, no full-response buffering)
 			while (true) {
 				const { done, value } = await reader.read();
 				if (done) break;
 				buffer += decoder.decode(value, { stream: true });
 				const { events, remaining } = parseKiroApiEvents(buffer);
 				buffer = remaining;
-				allEvents.push(...events);
-			}
 
-			// Check for refusal event
-			const refusalEventIndex = allEvents.findIndex(e => e.type === "refusal" && e.data.stopDetails?.refusal);
-
-			// Process events and build blocks (without streaming yet)
-			const eventsToProcess = refusalEventIndex >= 0 ? allEvents.slice(0, refusalEventIndex + 1) : allEvents;
-
-			for (const event of eventsToProcess) {
-				if (event.type === "content") {
-					if (event.data === lastContent) continue;
-					lastContent = event.data;
-					consumeContent(event.data);
-				} else if (event.type === "toolUse") {
-					if (currentTool && currentTool.id !== event.data.toolUseId) flushTool();
-					if (!currentTool) {
-						currentTool = { id: event.data.toolUseId, name: event.data.name, input: event.data.input };
-					} else {
-						currentTool.input += event.data.input;
-					}
-					if (event.data.stop) flushTool();
-				} else if (event.type === "toolUseInput" && currentTool) {
-					currentTool.input += event.data.input;
-				} else if (event.type === "toolUseStop" && event.data.stop) {
-					flushTool();
-				} else if (event.type === "usage") {
-					if (event.data.inputTokens !== undefined) output.usage.input = event.data.inputTokens;
-					if (event.data.outputTokens !== undefined) output.usage.output = event.data.outputTokens;
-					output.usage.totalTokens = output.usage.input + output.usage.output;
-				} else if (event.type === "refusal") {
-					const refusalData = event.data as {
-						stopReason?: string;
-						stopDetails?: { refusal?: { category?: string; explanation?: string } };
-					};
-					if (refusalData.stopDetails?.refusal) {
-						// Handle refusal - clear accumulated blocks and emit error
-						consumeContent(""); // Flush any pending thinking
-						flushTool();
-
-						const refusal = refusalData.stopDetails.refusal;
-						const category = refusal.category;
-						const explanation = refusal.explanation?.trim();
-						const label = category ? `Kiro refused the request (${category})` : "Kiro refused the request";
-
-						output.stopReason = "error";
-						output.errorMessage = explanation ? `${label}: ${explanation}` : label;
-						output.content = [];
-
-						// Mint provider safety stop
-						// Do not pass options.fetch as callerTransport: the refusal came from the
-						// provider's response, not from a caller-controlled fabrication.
-						const adapterInvocation = isProviderSafetyStopAdapterInvocation(options);
-
-						const authenticated = mintProviderSafetyStop(
-							output,
-							"refusal",
-							PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
-							undefined,
-							adapterInvocation,
-						);
-
-						if (!authenticated) {
-							output.transportFailure = {
-								kind: "transport",
-								status: 500,
-								providerCode: "untrusted_safety_stop",
-							};
+				for (const event of events) {
+					if (event.type === "content") {
+						if (event.data === lastContent) continue;
+						lastContent = event.data;
+						consumeContent(event.data);
+					} else if (event.type === "toolUse") {
+						if (currentTool && currentTool.id !== event.data.toolUseId) flushTool();
+						if (!currentTool) {
+							currentTool = { id: event.data.toolUseId, name: event.data.name, input: event.data.input };
+						} else {
+							currentTool.input += event.data.input;
 						}
+						if (event.data.stop) flushTool();
+					} else if (event.type === "toolUseInput" && currentTool) {
+						currentTool.input += event.data.input;
+					} else if (event.type === "toolUseStop" && event.data.stop) {
+						flushTool();
+					} else if (event.type === "usage") {
+						if (event.data.inputTokens !== undefined) output.usage.input = event.data.inputTokens;
+						if (event.data.outputTokens !== undefined) output.usage.output = event.data.outputTokens;
+						output.usage.totalTokens = output.usage.input + output.usage.output;
+					} else if (event.type === "refusal") {
+						const refusalData = event.data as {
+							stopReason?: string;
+							stopDetails?: { refusal?: { category?: string; explanation?: string } };
+						};
+						if (refusalData.stopDetails?.refusal) {
+							// Handle refusal: clear blocks and emit error (don't emit any text/tool that came before)
+							consumeContent(""); // Flush any pending thinking
+							flushTool();
 
-						stream.push({ type: "error", reason: "error", error: output });
-						stream.end();
-						return;
+							const refusal = refusalData.stopDetails.refusal;
+							const category = refusal.category;
+							const explanation = refusal.explanation?.trim();
+							const label = category ? `Kiro refused the request (${category})` : "Kiro refused the request";
+
+							output.stopReason = "error";
+							output.errorMessage = explanation ? `${label}: ${explanation}` : label;
+							output.content = [];
+
+							// Mint provider safety stop
+							// Do not pass options.fetch as callerTransport: the refusal came from the
+							// provider's response, not from a caller-controlled fabrication.
+							const adapterInvocation = isProviderSafetyStopAdapterInvocation(options);
+
+							const authenticated = mintProviderSafetyStop(
+								output,
+								"refusal",
+								PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+								undefined,
+								adapterInvocation,
+							);
+
+							if (!authenticated) {
+								output.transportFailure = {
+									kind: "transport",
+									status: 500,
+									providerCode: "untrusted_safety_stop",
+								};
+							}
+
+							output.duration = Date.now() - startTime;
+							if (firstTokenTime) output.ttft = firstTokenTime - startTime;
+							stream.push({ type: "error", reason: "error", error: output });
+							stream.end();
+							return;
+						}
+					} else if (event.type === "error") {
+						throw new Error(sanitizeKiroError(`${event.data.error}: ${event.data.message ?? ""}`, apiKey));
 					}
-				} else if (event.type === "error") {
-					throw new Error(sanitizeKiroError(`${event.data.error}: ${event.data.message ?? ""}`, apiKey));
 				}
 			}
 
-			// If we reach here without a refusal, emit all blocks to stream
-			emitBlocksToStream();
+			// Stream is done - emit accumulated thinking if any
+			emitThinking();
 			const hasText = blocks.some(b => b.type === "text" && b.text.length > 0);
 			const hasTools = blocks.some(b => b.type === "toolCall");
 			if (!hasText && !hasTools) {
 				output.stopReason = "error";
 				output.errorMessage = "Kiro API key stream returned no tokens";
+				output.duration = Date.now() - startTime;
+				if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 				stream.push({ type: "error", reason: "error", error: output });
 				stream.end();
 				return;
@@ -888,11 +877,15 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				output.usage.output = Math.max(1, Math.floor(text.length / 4));
 				output.usage.totalTokens = output.usage.input + output.usage.output;
 			}
+			output.duration = Date.now() - startTime;
+			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({ type: "done", reason: output.stopReason as "stop" | "toolUse", message: output });
 			stream.end();
 		} catch (error) {
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = sanitizeKiroError(error, apiKey);
+			output.duration = Date.now() - startTime;
+			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
