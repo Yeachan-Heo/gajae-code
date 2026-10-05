@@ -5,7 +5,7 @@
  */
 import type { ProviderDiagnostic } from "@gajae-code/ai/core";
 import { sanitizeProviderDiagnostic } from "@gajae-code/ai/core";
-import { redactCrashSecrets } from "@gajae-code/utils";
+import { sanitizeExternalCrashV1 } from "../crash/sanitize";
 import type {
 	SdkPromptFailureCategory,
 	SdkPromptFailurePhase,
@@ -335,17 +335,18 @@ export function isValidFailureCauseDiagnostic(value: unknown): value is string {
 	return typeof value === "string" && value.length > 0 && value.length <= FAILURE_CAUSE_DIAGNOSTIC_MAX;
 }
 
-/** Revalidate stored diagnostics; a value changed by redaction is not trusted. */
+/** Revalidate stored diagnostics with outbound sanitizer; a value changed by sanitization is not trusted. */
 export function redactedFailureCauseDiagnostic(value: unknown): string | undefined {
 	if (!isValidFailureCauseDiagnostic(value)) return undefined;
-	const redacted = redactCrashSecrets(value);
-	return redacted === value ? redacted : undefined;
+	const verdict = sanitizeExternalCrashV1(value, FAILURE_CAUSE_DIAGNOSTIC_MAX);
+	return verdict.ok && verdict.value === value ? verdict.value : undefined;
 }
 
 /**
  * Extract a bounded failure cause diagnostic for operator logs: error class name,
  * first line of message, and exit code/signal if available. Bounded to 200 chars,
- * secrets-redacted. Used for #408 to provide real cause in terminal_failure logs.
+ * sanitized for outbound publication (strips paths, URLs, ANSI, credentials, identifiers).
+ * Used for #408 to provide real cause in terminal_failure logs.
  */
 export function failureCauseDiagnostic(error: unknown): string | undefined {
 	if (error === null || error === undefined) return undefined;
@@ -420,11 +421,9 @@ export function failureCauseDiagnostic(error: unknown): string | undefined {
 
 		const parts = [className, message, exitSignal].filter(Boolean);
 		const diagnostic = parts.join(" ");
-		// Redact secrets from the diagnostic text
-		const redacted = redactCrashSecrets(diagnostic);
-		// Bound the final diagnostic to the maximum length
-		const bounded = redacted.slice(0, FAILURE_CAUSE_DIAGNOSTIC_MAX);
-		return bounded.length > 0 ? bounded : undefined;
+		// Sanitize for outbound publication: strips paths, URLs, ANSI, credentials, and high-entropy identifiers
+		const verdict = sanitizeExternalCrashV1(diagnostic, FAILURE_CAUSE_DIAGNOSTIC_MAX);
+		return verdict.ok ? verdict.value : undefined;
 	} catch {
 		return undefined;
 	}

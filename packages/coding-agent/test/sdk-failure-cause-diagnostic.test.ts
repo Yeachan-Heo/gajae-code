@@ -198,6 +198,59 @@ describe("failureCauseDiagnostic", () => {
 		};
 		expect(failureCauseDiagnostic(error)).toBeUndefined();
 	});
+
+	it("strips absolute POSIX paths from diagnostic", () => {
+		const error = new Error("Failed at /home/user/project/src/index.ts:42");
+		const diagnostic = failureCauseDiagnostic(error);
+		expect(diagnostic).toBeDefined();
+		if (diagnostic) {
+			expect(diagnostic).not.toContain("/home/user");
+			expect(diagnostic).toContain("Failed at");
+		}
+	});
+
+	it("strips absolute Windows paths from diagnostic", () => {
+		const error = new Error("Cannot read C:\\Users\\bob\\file.txt");
+		const diagnostic = failureCauseDiagnostic(error);
+		expect(diagnostic).toBeDefined();
+		if (diagnostic) {
+			expect(diagnostic).not.toContain("C:\\");
+			expect(diagnostic).toContain("Cannot read");
+		}
+	});
+
+	it("removes URL query strings and fragments", () => {
+		const error = new Error("Request failed: https://api.example.com/path?token=secret&key=value#section");
+		const diagnostic = failureCauseDiagnostic(error);
+		expect(diagnostic).toBeDefined();
+		if (diagnostic) {
+			expect(diagnostic).not.toContain("token=secret");
+			expect(diagnostic).not.toContain("#section");
+			expect(diagnostic).toContain("Request failed");
+			expect(diagnostic).toContain("example.com");
+		}
+	});
+
+	it("strips ANSI control sequences from diagnostic", () => {
+		const ansiError = new Error("\u001b[31mRed error\u001b[0m text");
+		const diagnostic = failureCauseDiagnostic(ansiError);
+		expect(diagnostic).toBeDefined();
+		if (diagnostic) {
+			expect(diagnostic).not.toContain("\u001b");
+			expect(diagnostic).toContain("Red error");
+		}
+	});
+
+	it("strips URL userinfo (credentials) from diagnostic", () => {
+		const error = new Error("Connection failed: https://user:password@database.example.com/app");
+		const diagnostic = failureCauseDiagnostic(error);
+		expect(diagnostic).toBeDefined();
+		if (diagnostic) {
+			expect(diagnostic).not.toContain("password");
+			expect(diagnostic).toContain("Connection failed");
+			expect(diagnostic).toContain("database.example.com");
+		}
+	});
 });
 
 describe("isValidFailureCauseDiagnostic", () => {
