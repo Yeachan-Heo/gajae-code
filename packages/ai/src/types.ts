@@ -1,4 +1,5 @@
 import type { ZodType, z } from "zod/v4";
+import type { CustomApiRegistry } from "./api-registry";
 import type { ProviderDiagnostic } from "./provider-diagnostic";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import type { AnthropicOptions } from "./providers/anthropic";
@@ -392,6 +393,8 @@ export interface StreamOptions {
 	 */
 	frequencyPenalty?: number;
 	maxTokens?: number;
+	/** Explicit custom API handler scope for this execution; never inferred from model metadata. */
+	customApiRegistry?: CustomApiRegistry;
 	signal?: AbortSignal;
 	apiKey?: string;
 	/** Disables all transport-level replay; the fallback controller owns retries. */

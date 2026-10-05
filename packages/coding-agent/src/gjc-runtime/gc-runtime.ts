@@ -1393,6 +1393,16 @@ async function runGcDiskSessions(input: {
 					if (probe.taskArtifactOwnerNamespaceRetained) item.record.task_artifact_owner_namespace_retained = true;
 					continue;
 				}
+				if (probe.kind === "cleanup_pending") {
+					item.record.action = "reclaim_failed";
+					item.record.reason = `retention_incomplete: ${probe.reason}`;
+					item.record.error = probe.reason;
+					if (probe.phase) item.record.phase = probe.phase;
+					if (probe.taskArtifactOwnerRetired) item.record.task_artifact_owner_retired = true;
+					if (probe.taskArtifactOwnerPayloadRetired) item.record.task_artifact_owner_payload_retired = true;
+					if (probe.taskArtifactOwnerNamespaceRetained) item.record.task_artifact_owner_namespace_retained = true;
+					continue;
+				}
 				item.record.action = "keep";
 				item.record.reason = `retention_declined: ${probe.reason}`;
 				if (probe.reason.includes("task_artifact_owner_")) item.record.error = probe.reason;

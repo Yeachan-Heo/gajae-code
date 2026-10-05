@@ -1416,6 +1416,11 @@ type IndexedStoredCredential<T extends AuthCredential = AuthCredential> = {
 };
 type OAuthCredentialSelection = IndexedStoredCredential<OAuthCredential>;
 type ConfigApiKeyRegistration = { apiKey: string; envSourced: boolean; order: number };
+type ConfigApiKeyOwnerFork = {
+	registrations: Map<string, ConfigApiKeyRegistration>;
+	providerGenerations: Map<string, number>;
+	nextRegistrationOrder: number;
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AuthStorage Class
@@ -1435,6 +1440,8 @@ export class AuthStorage {
 	#configOverrides: Map<string, string> = new Map();
 	/** Effective config override registrations, including owner-scoped model registries. */
 	#configOverrideRegistrations: Map<string, Map<object, ConfigApiKeyRegistration>> = new Map();
+	#configOwnerForks: Map<object, ConfigApiKeyOwnerFork> = new Map();
+	#disposedConfigOwnerForks = new WeakSet<object>();
 	#unownedConfigOverrides: Map<string, ConfigApiKeyRegistration> = new Map();
 	#configOverrideOrder = 0;
 	/**
@@ -1608,6 +1615,9 @@ export class AuthStorage {
 	#configOverrideRegistration(provider: string, owner?: object): ConfigApiKeyRegistration | undefined {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		if (owner) {
+			const fork = this.#configOwnerForks.get(owner);
+			if (fork) return fork.registrations.get(storageProvider);
+			if (this.#disposedConfigOwnerForks.has(owner)) return undefined;
 			return (
 				this.#configOverrideRegistrations.get(storageProvider)?.get(owner) ??
 				this.#unownedConfigOverrides.get(storageProvider)
@@ -1625,6 +1635,10 @@ export class AuthStorage {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		provider = storageProvider;
 		const configOverride = this.#configOverrideRegistration(storageProvider, owner);
+		const forkGeneration = owner
+			? this.#configOwnerForks.get(owner)?.providerGenerations.get(storageProvider)
+			: undefined;
+		const forkGenerationFingerprint = forkGeneration === undefined ? "" : `\u0000${forkGeneration}`;
 		const runtimeOverride = this.#runtimeOverrides.get(storageProvider);
 		const environmentOverride = runtimeOverride || configOverride?.apiKey ? undefined : getEnvApiKey(storageProvider);
 		// Discovery callers may fingerprint the provider before resolving its
@@ -1646,7 +1660,7 @@ export class AuthStorage {
 		if (storedLiteral) {
 			return crypto
 				.createHash("sha256")
-				.update(`stored-literal\u0000${storageProvider}\u0000${storedLiteral.key}`)
+				.update(`stored-literal\u0000${storageProvider}\u0000${storedLiteral.key}${forkGenerationFingerprint}`)
 				.digest("hex");
 		}
 		let selectedCredential: ({ index: number } & StoredCredential) | undefined;
@@ -1655,7 +1669,9 @@ export class AuthStorage {
 		} catch {
 			return crypto
 				.createHash("sha256")
-				.update(`${this.#getProviderGeneration(storageProvider)}\u0000unavailable-selector`)
+				.update(
+					`${this.#getProviderGeneration(storageProvider)}${forkGenerationFingerprint}\u0000unavailable-selector`,
+				)
 				.digest("hex");
 		}
 		const storedEntries: StoredCredential[] = selectedCredential
@@ -1735,7 +1751,7 @@ export class AuthStorage {
 		return crypto
 			.createHash("sha256")
 			.update(
-				`${this.#getProviderGeneration(storageProvider)}\u0000${effectiveEnvKey ?? ""}\u0000${storedApiKeyFingerprint}\u0000${storedOAuthFingerprint}\u0000${evidenceKeyFingerprint}`,
+				`${this.#getProviderGeneration(storageProvider)}${forkGenerationFingerprint}\u0000${effectiveEnvKey ?? ""}\u0000${storedApiKeyFingerprint}\u0000${storedOAuthFingerprint}\u0000${evidenceKeyFingerprint}`,
 			)
 			.digest("hex");
 	}
@@ -2318,6 +2334,37 @@ export class AuthStorage {
 	}
 
 	/**
+	 * Capture one owner's effective config API-key registrations in an isolated,
+	 * scoped-only owner. Stored credentials, selectors, runtime overrides, and
+	 * fallback resolvers remain shared AuthStorage authority.
+	 */
+	forkConfigOwner(sourceOwner: object): object {
+		if (this.#disposedConfigOwnerForks.has(sourceOwner)) {
+			throw new Error("Cannot fork a released config owner");
+		}
+		const registrations = new Map<string, ConfigApiKeyRegistration>();
+		const providers = new Set([
+			...this.#unownedConfigOverrides.keys(),
+			...this.#configOverrideRegistrations.keys(),
+			...(this.#configOwnerForks.get(sourceOwner)?.registrations.keys() ?? []),
+		]);
+		let nextRegistrationOrder = 0;
+		for (const provider of providers) {
+			const registration = this.#configOverrideRegistration(provider, sourceOwner);
+			if (!registration) continue;
+			registrations.set(provider, { ...registration });
+			nextRegistrationOrder = Math.max(nextRegistrationOrder, registration.order);
+		}
+		const owner = {};
+		this.#configOwnerForks.set(owner, {
+			registrations,
+			providerGenerations: new Map(),
+			nextRegistrationOrder,
+		});
+		return owner;
+	}
+
+	/**
 	 * Register a per-provider API key sourced from user configuration
 	 * (e.g. `models.yml` `providers.<name>.apiKey`). Higher priority than
 	 * stored credentials and OAuth tokens — when the user pins a key in
@@ -2339,6 +2386,21 @@ export class AuthStorage {
 	 */
 	setConfigApiKey(provider: string, apiKey: string, options: { envSourced?: boolean; owner?: object } = {}): void {
 		const storageProvider = resolveOAuthStorageProvider(provider);
+		if (options.owner) {
+			const fork = this.#configOwnerForks.get(options.owner);
+			if (fork) {
+				fork.registrations.set(storageProvider, {
+					apiKey,
+					envSourced: options.envSourced === true,
+					order: ++fork.nextRegistrationOrder,
+				});
+				fork.providerGenerations.set(storageProvider, (fork.providerGenerations.get(storageProvider) ?? 0) + 1);
+				return;
+			}
+			if (this.#disposedConfigOwnerForks.has(options.owner)) {
+				throw new Error("Cannot update a released config owner");
+			}
+		}
 		const registration = {
 			apiKey,
 			envSourced: options.envSourced === true,
@@ -2360,6 +2422,13 @@ export class AuthStorage {
 	removeConfigApiKey(provider: string, owner?: object): void {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		if (owner) {
+			const fork = this.#configOwnerForks.get(owner);
+			if (fork) {
+				if (!fork.registrations.delete(storageProvider)) return;
+				fork.providerGenerations.set(storageProvider, (fork.providerGenerations.get(storageProvider) ?? 0) + 1);
+				return;
+			}
+			if (this.#disposedConfigOwnerForks.has(owner)) return;
 			const registrations = this.#configOverrideRegistrations.get(storageProvider);
 			if (!registrations?.delete(owner)) return;
 			if (registrations.size === 0) this.#configOverrideRegistrations.delete(storageProvider);
@@ -2372,10 +2441,20 @@ export class AuthStorage {
 	/**
 	 * Drop config-sourced API keys. An owner removes only its own registrations;
 	 * the unscoped form remains an explicit global reset for callers that own the
-	 * entire AuthStorage instance.
+	 * entire AuthStorage instance. Clearing a fork retains its isolated writable
+	 * scope; call releaseConfigOwner when that owner is permanently disposed.
 	 */
 	clearConfigApiKeys(owner?: object): void {
 		if (owner) {
+			const fork = this.#configOwnerForks.get(owner);
+			if (fork) {
+				for (const provider of fork.registrations.keys()) {
+					fork.providerGenerations.set(provider, (fork.providerGenerations.get(provider) ?? 0) + 1);
+				}
+				fork.registrations.clear();
+				return;
+			}
+			if (this.#disposedConfigOwnerForks.has(owner)) return;
 			const providers = [...this.#configOverrideRegistrations.entries()]
 				.filter(([, registrations]) => registrations.has(owner))
 				.map(([provider]) => provider);
@@ -2390,6 +2469,15 @@ export class AuthStorage {
 		this.#unownedConfigOverrides.clear();
 		this.#configOverrideRegistrations.clear();
 		for (const provider of providers) this.#reconcileConfigApiKey(provider, "clear-config-api-keys", true);
+	}
+
+	/** Permanently release an owner returned by forkConfigOwner. Idempotent for forks. */
+	releaseConfigOwner(owner: object): void {
+		if (this.#disposedConfigOwnerForks.has(owner)) return;
+		if (!this.#configOwnerForks.delete(owner)) {
+			throw new Error("Cannot release an owner that was not created by forkConfigOwner");
+		}
+		this.#disposedConfigOwnerForks.add(owner);
 	}
 
 	#reconcileConfigApiKey(provider: string, reason: string, forceGeneration = false): void {
