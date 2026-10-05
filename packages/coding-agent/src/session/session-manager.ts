@@ -18450,7 +18450,10 @@ export class SessionManager {
 			if (this.#recoveryHydrationContext) throw new Error("recovery_hydration_not_promoted");
 		} else this.#assertRecoveryHydrationWritable();
 		const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
-		if (!header) return;
+		if (!header) {
+			if (options?.expectedSession) throw new Error("task_artifact_owner_session_header_missing");
+			return;
+		}
 		applyHeaderPatch(header, patch);
 		this.#headerExportRevision++;
 		const records: HeaderPatchRecord[] =
@@ -18463,7 +18466,10 @@ export class SessionManager {
 		await this.#persistPatches(records);
 	}
 
-	#appendManagedRecordsSync(records: readonly (FileEntry | SessionPatchRecord)[]): void {
+	#appendManagedRecordsSync(
+		records: readonly (FileEntry | SessionPatchRecord)[],
+		requireExistingTranscript = false,
+	): void {
 		if (!this.#sessionFile) throw new Error("Managed transcript path is unavailable");
 		this.#withSessionPersistenceFenceSync(() => {
 			const sessionFile = this.#sessionFile!;
@@ -18471,10 +18477,13 @@ export class SessionManager {
 			const relativePath = path.basename(sessionFile);
 			const bytes = Buffer.from(`${records.map(record => JSON.stringify(record)).join("\n")}\n`, "utf8");
 			let receipt: ManagedAppendReceipt;
+			if (requireExistingTranscript && !this.#managedPersistExpectedIdentity)
+				throw new Error("task_artifact_owner_transcript_identity_unavailable");
 			if (this.#managedPersistExpectedIdentity) {
 				try {
 					receipt = store.appendExpectedIdentitySync(relativePath, bytes, this.#managedPersistExpectedIdentity);
 				} catch (err) {
+					if (requireExistingTranscript) throw err;
 					const predecessorMissing = store.descriptorExpected(relativePath) === null;
 					if (!isEnoent(err) && (!(err instanceof ManagedAppendIdentityMismatchError) || !predecessorMissing))
 						throw err;
@@ -18493,7 +18502,10 @@ export class SessionManager {
 	async #persistPatches(records: readonly SessionPatchRecord[]): Promise<void> {
 		if (records.length === 0) return;
 		if (this.#coldSidecarActive()) this.#deactivateColdForBranchMutation();
-		if (!this.persist || !this.#sessionFile || !this.#storage.existsSync(this.#sessionFile)) return;
+		if (!this.persist || !this.#sessionFile || !this.#storage.existsSync(this.#sessionFile)) {
+			if (expectedSession) throw new Error("task_artifact_owner_transcript_unavailable");
+			return;
+		}
 		const sessionFile = this.#sessionFile;
 		const publishResumeBreadcrumb = this.#readOnlyResume;
 		await this.#queuePersistTask(async () => {
@@ -18505,6 +18517,7 @@ export class SessionManager {
 					!this.#flushed ||
 					(header?.version ?? 1) < CURRENT_SESSION_VERSION
 				) {
+					if (expectedSession) throw new Error("task_artifact_owner_transcript_rewrite_required");
 					await this.#rewriteFileContents();
 					if (publishResumeBreadcrumb) writeTerminalBreadcrumb(this.cwd, sessionFile);
 					this.#readOnlyResume = false;
@@ -18527,7 +18540,7 @@ export class SessionManager {
 				const written = this.#withSessionPersistenceFenceSync(() => {
 					if (!this.#persistenceInputTokenMatches(token)) return false;
 					if (this.destination.kind === "managed") {
-						this.#appendManagedRecordsSync(persistedRecords);
+						this.#appendManagedRecordsSync(persistedRecords, expectedSession !== undefined);
 						persisted = true;
 						return true;
 					}
@@ -18546,6 +18559,7 @@ export class SessionManager {
 					return true;
 				});
 				if (written) {
+					if (expectedSession && !persisted) throw new Error("task_artifact_owner_transcript_unavailable");
 					if (publishResumeBreadcrumb && persisted) writeTerminalBreadcrumb(this.cwd, sessionFile);
 					if (persisted) this.#readOnlyResume = false;
 					return;
