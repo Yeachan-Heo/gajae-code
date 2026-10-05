@@ -2922,6 +2922,7 @@ function createControlSurface(
 	armPromptDeadline: (correlation: InvocationCorrelation) => void,
 	steerReconciliation: KindAwareReconciliation,
 	imageUploads: PromptImageUploadStore,
+	hasCapturedInvocationTerminal: (kind: InvocationKind, correlation: InvocationCorrelation) => boolean,
 	onPromotedTurn?: (
 		kind: InvocationKind,
 		correlation: InvocationCorrelation,
@@ -3296,16 +3297,18 @@ function createControlSurface(
 			void submission.then(
 				result => {
 					if (settled) {
-						// A resolved submission after preflight acceptance means the work is over
-						// for every kind. `noteTransition` ignores an already-terminal record, so
-						// terminalizing here is safe — unless the submission resolved at queue time
-						// (followUp, or a prompt diverted to steer while streaming), in which case
-						// the turn's own lifecycle events drive terminalization.
+						// Queue admission is not terminal authority. A captured actual end
+						// also retains its own durable repair owner; fallback below is only
+						// for completion without that exact producer boundary.
 						// Dispatch-race P1: queuedAtDispatch is the pre-dispatch snapshot;
 						// a delayed preflight diverted to steering fires onQueuedPromoted
 						// with startsOwnRun:false and is now attached to the in-flight run.
 						// Do not terminalize from the stale snapshot — the run will.
 						if (!queuedAtDispatch && promotionStartsOwnRun !== false) {
+							// The exact actual end may still be repairing its durable write.
+							// Submission settlement cannot replace that producer's outcome
+							// or release its recovery lease with a bare completion.
+							if (hasCapturedInvocationTerminal(kind, correlation)) return;
 							// The accepted work settled without its own run still pending:
 							// retire the pending ownership entry (and with it the
 							// acceptance-anchored deadline lease, #4668 review) BEFORE
@@ -3375,15 +3378,28 @@ function createControlSurface(
 				},
 				error => {
 					if (settled) {
+						if (hasCapturedInvocationTerminal(kind, correlation)) {
+							const record = reconciliation.lookup(kind, correlation) as { status?: string };
+							logger.warn(
+								record.status === "terminal_ok" || record.status === "failed"
+									? "SDK submission cleanup failed after terminal publication"
+									: "SDK submission cleanup failed after owned terminal capture",
+								{
+									kind,
+									commandId: correlation.commandId,
+									turnId: correlation.turnId,
+									error: sanitizePromptFailure(error),
+								},
+							);
+							return;
+						}
 						releaseAcceptedImage?.(correlation);
 						retireAcceptedQueueCancellation(acceptedQueueCancellations, correlation);
-						// The submission promise rejects after preflight acceptance only when the
-						// work itself is over (provider stream interrupt, abort, queue failure).
-						// The accepted run never started (agent_start never fired), so its pending
-						// entry must be retired — otherwise a later agent-initiated
-						// monitor/cron turn's agent_start would shift the stale entry and
-						// associate the failed submission's connection as owner (review
-						// thread P1).
+						// No exact actual terminal was captured. The rejection fallback
+						// owns this settlement and must retire its pending admission so a
+						// later agent-initiated turn cannot borrow the failed requester's
+						// connection. Captured terminals return above without replacing
+						// their outcome or releasing their durable recovery lease.
 						retirePendingOwner?.(kind, correlation);
 						// agent_failed alone is diagnostic-only (agent_end is the
 						// terminal boundary), so the failure reason is recorded first
@@ -4978,6 +4994,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	const skillRecoveryControllers = new Map<string, AbortController>();
 	const skillTerminalRecoveryControllers = new Map<string, AbortController>();
 	const ambiguousLifecycleIdentities = new Set<string>();
+	const capturedPromptTerminals = new WeakSet<InvocationCorrelation>();
 	const lifecycleRunOwners = new Map<
 		string,
 		{ state: RuntimeState; batch?: LifecycleBatch; correlationKey?: string }
@@ -6149,6 +6166,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 								event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
 							)
 						: canonicalFailedOutcome(EMPTY_PROMPT_FAILURE);
+		// Capture exact private invocation objects before any durable write yields.
+		// Weak keys retain no completed invocation and cannot attest a foreign row.
+		for (const invocation of failureCandidates)
+			if (invocation.kind === "prompt") capturedPromptTerminals.add(invocation.correlation);
 		const releaseTerminalRetention = retainTerminalBoundaries(failureCandidates);
 		return trackLifecycle(async () => {
 			for (const invocation of failureCandidates) {
@@ -6908,6 +6929,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			correlation => deadlineManager.onAccepted(correlation),
 			steerReconciliation,
 			imageUploads,
+			(kind, correlation) => kind === "prompt" && capturedPromptTerminals.has(correlation),
 			(kind, correlation, connectionId, sdkRunToken, promotion) => {
 				const bindPromotedToken = (batch?: LifecycleBatch): void => {
 					const owner = lifecycleOwnerHolder.state;
