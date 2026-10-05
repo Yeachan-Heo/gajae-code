@@ -1029,7 +1029,10 @@ export async function backmergeReleaseIntoDev(version: string): Promise<Backmerg
 	const worktrees: string[] = [];
 	try {
 		for (let attempt = 1; attempt <= BACKMERGE_PUSH_ATTEMPTS; attempt += 1) {
-			await git(["fetch", "origin", "main", "dev"]).quiet();
+			// Explicit destinations: in a `--single-branch main` checkout, or any checkout whose
+			// `remote.origin.fetch` does not map `dev`, a source-only refspec fetches the objects
+			// without updating `origin/dev`, leaving it absent or stale for every command below.
+			await git(["fetch", "origin", "+refs/heads/main:refs/remotes/origin/main", "+refs/heads/dev:refs/remotes/origin/dev"]).quiet();
 			const contained = await git(["merge-base", "--is-ancestor", "origin/main", "origin/dev"]).quiet().nothrow();
 			if (contained.exitCode === 0) return { action: "skipped", detail: "dev already contains origin/main" };
 
