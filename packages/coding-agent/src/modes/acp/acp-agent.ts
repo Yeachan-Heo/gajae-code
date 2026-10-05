@@ -3071,6 +3071,9 @@ export class AcpAgent implements Agent {
 				!waiter.settled
 			) {
 				if (waiter.terminalReserved) {
+					await record.frameTail;
+					if (record.activePrompt === waiter && waiter.terminal && !waiter.settled)
+						this.#settlePrompt(params.sessionId, record, waiter);
 					waiter.cancelAttemptResolve?.(true);
 					return;
 				}
@@ -3126,7 +3129,8 @@ export class AcpAgent implements Agent {
 				waiter.cancelAttempt = undefined;
 				waiter.cancelAttemptResolve = undefined;
 			}
-			if (waiter && record.activePrompt === waiter && waiter.terminal && !waiter.settled)
+			const cancelWaveSettled = !waiter || waiter.cancelAcknowledged || (waiter.pendingCancelAttempts ?? 0) <= 1;
+			if (cancelWaveSettled && waiter && record.activePrompt === waiter && waiter.terminal && !waiter.settled)
 				this.#settlePrompt(params.sessionId, record, waiter);
 			throw cancellationError;
 		} finally {
