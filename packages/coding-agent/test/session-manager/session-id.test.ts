@@ -103,6 +103,47 @@ describe("SessionManager session ids", () => {
 		expect(session.getHeader()).not.toHaveProperty("starred");
 	});
 
+	it("preserves artifact IDs in independent fork directories across reopen and later writes", async () => {
+		using tempDir = TempDir.createSync("@pi-session-fork-artifact-independence-");
+		const destination = SessionManager.managedDestination(tempDir.path(), tempDir.path());
+		const session = SessionManager.create(tempDir.path(), destination);
+		let parent: SessionManager | undefined;
+		let child: SessionManager | undefined;
+		try {
+			const payload = "x".repeat(2 * 1024 * 1024);
+			const artifactId = await session.saveArtifact(payload, "fork-reference");
+			if (!artifactId) throw new Error("Expected an actual saved artifact");
+			await session.ensureOnDisk();
+			const forked = await session.fork();
+			if (!forked) throw new Error("Expected a persistent fork");
+			const forkArtifact = await session.getArtifactPath(artifactId);
+			if (!forkArtifact) throw new Error("Fork lost the saved artifact ID");
+			expect(await Bun.file(forkArtifact).text()).toBe(payload);
+			await session.close();
+			parent = await SessionManager.open(forked.oldSessionFile, destination);
+			child = await SessionManager.open(forked.newSessionFile, destination);
+			const parentArtifact = await parent.getArtifactPath(artifactId);
+			const childArtifact = await child.getArtifactPath(artifactId);
+			if (!parentArtifact || !childArtifact) throw new Error("Reopen lost a fork artifact ID");
+			expect(parentArtifact).not.toBe(childArtifact);
+			expect(await Bun.file(parentArtifact).text()).toBe(payload);
+			expect(await Bun.file(childArtifact).text()).toBe(payload);
+			const parentId = await parent.saveArtifact("parent-only", "independent");
+			const childId = await child.saveArtifact("child-only", "independent");
+			if (!parentId || !childId) throw new Error("Expected independent artifact writes");
+			const parentWrite = await parent.getArtifactPath(parentId);
+			const childWrite = await child.getArtifactPath(childId);
+			if (!parentWrite || !childWrite) throw new Error("Independent artifact paths unavailable");
+			expect(parentWrite).not.toBe(childWrite);
+			expect(await Bun.file(parentWrite).text()).toBe("parent-only");
+			expect(await Bun.file(childWrite).text()).toBe("child-only");
+		} finally {
+			await session.close().catch(() => {});
+			await parent?.close().catch(() => {});
+			await child?.close().catch(() => {});
+		}
+	});
+
 	it("rolls back fork identity before publishing a transcript when artifact import fails", async () => {
 		using tempDir = TempDir.createSync("@pi-session-fork-rollback-");
 		const destination = SessionManager.managedDestination(tempDir.path(), tempDir.path());
