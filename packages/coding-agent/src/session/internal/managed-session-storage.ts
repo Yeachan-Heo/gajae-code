@@ -951,8 +951,8 @@ export function reapScrubbedProtocolRemnantsSync(
 	let parentIdentity: ReaperParentIdentity | undefined;
 	for (const name of names) {
 		const terminalRemnant = SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix));
-		const replacementCandidate = REPLACEMENT_STAGING_NAME.test(name);
-		const quarantineCandidate = REAPER_QUARANTINE_NAME.test(name);
+		const replacementCandidate = !terminalRemnant && REPLACEMENT_STAGING_NAME.test(name);
+		const quarantineCandidate = !terminalRemnant && REAPER_QUARANTINE_NAME.test(name);
 		if (!terminalRemnant && !replacementCandidate && !quarantineCandidate) continue;
 		const alias = terminalRemnant
 			? undefined
@@ -1031,8 +1031,8 @@ export async function reapScrubbedProtocolRemnants(
 	let parentIdentity: ReaperParentIdentity | undefined;
 	for (const name of names) {
 		const terminalRemnant = SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix));
-		const replacementCandidate = REPLACEMENT_STAGING_NAME.test(name);
-		const quarantineCandidate = REAPER_QUARANTINE_NAME.test(name);
+		const replacementCandidate = !terminalRemnant && REPLACEMENT_STAGING_NAME.test(name);
+		const quarantineCandidate = !terminalRemnant && REAPER_QUARANTINE_NAME.test(name);
 		if (!terminalRemnant && !replacementCandidate && !quarantineCandidate) continue;
 		if (++scanned % SCRUBBED_REMNANT_REAP_BATCH_SIZE === 0) await Bun.sleep(0);
 		const alias = terminalRemnant

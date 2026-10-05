@@ -12,6 +12,7 @@ import {
 	exactUnlink,
 	exactUnlinkDirect,
 	inspectConfigFilePermissionRepair,
+	type NativeExactFileIdentity,
 	repairConfigFilePermissions,
 	snapshotDirectoryTree,
 	verifyOwnerOnlyPathSecurity,
@@ -579,6 +580,76 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 		).toEqual({ ok: false, code: "reparse_point" });
 		expect(await fs.readFile(path.join(root, "managed-retained", "state.jsonl"), "utf8")).toBe("authorized");
 	});
+
+	for (const location of ["immediate", "intermediate"] as const) {
+		it(`rejects direct unlink through a replaced ${location} parent symlink`, async () => {
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-direct-unlink-parent-"));
+			temporaryDirectories.push(root);
+			const ancestor = path.join(root, "managed");
+			const parent = path.join(ancestor, "nested");
+			const file = path.join(parent, "state.jsonl");
+			await fs.mkdir(parent, { recursive: true });
+			await fs.writeFile(file, "authorized");
+			const stat = await fs.stat(file, { bigint: true });
+			const parentStat = await fs.stat(parent, { bigint: true });
+			const identity: NativeExactFileIdentity = {
+				dev: stat.dev,
+				ino: stat.ino,
+				nlink: stat.nlink,
+				parentDev: parentStat.dev,
+				parentIno: parentStat.ino,
+				size: stat.size,
+				mtimeNs: stat.mtimeNs,
+				sha256: sha256("authorized"),
+				quarantineName: ".direct-unlink-quarantine",
+			};
+			const replaced = location === "immediate" ? parent : ancestor;
+			const retained = `${replaced}-retained`;
+			const foreign = path.join(root, "foreign");
+			const relativeFile = path.relative(replaced, file);
+			const foreignFile = path.join(foreign, relativeFile);
+			await fs.mkdir(path.dirname(foreignFile), { recursive: true });
+			await fs.writeFile(foreignFile, "foreign payload");
+			await fs.rename(replaced, retained);
+			await fs.symlink(foreign, replaced, "dir");
+
+			expect(exactUnlinkDirect(file, identity)).toEqual({ ok: false, code: "reparse_point" });
+			expect(await fs.readFile(foreignFile, "utf8")).toBe("foreign payload");
+			expect(await fs.readFile(path.join(retained, relativeFile), "utf8")).toBe("authorized");
+			await expect(fs.stat(path.join(path.dirname(foreignFile), identity.quarantineName!))).rejects.toMatchObject({
+				code: "ENOENT",
+			});
+		});
+	}
+
+	for (const replacement of ["missing", "regular"] as const) {
+		it(`preserves a ${replacement} ancestor open failure without deleting retained payload`, async () => {
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-direct-unlink-failed-parent-"));
+			temporaryDirectories.push(root);
+			const parent = path.join(root, "parent");
+			const file = path.join(parent, "state.jsonl");
+			await fs.mkdir(parent);
+			await fs.writeFile(file, "authorized");
+			const stat = await fs.stat(file, { bigint: true });
+			const parentStat = await fs.stat(parent, { bigint: true });
+			await fs.rename(parent, `${parent}-retained`);
+			if (replacement === "regular") await fs.writeFile(parent, "not a directory");
+			expect(
+				exactUnlinkDirect(file, {
+					dev: stat.dev,
+					ino: stat.ino,
+					parentDev: parentStat.dev,
+					parentIno: parentStat.ino,
+					size: stat.size,
+					mtimeNs: stat.mtimeNs,
+					sha256: sha256("authorized"),
+					quarantineName: ".direct-unlink-quarantine",
+				}),
+			).toEqual({ ok: false, code: replacement === "missing" ? "not_found" : "not_directory" });
+			expect(await fs.readFile(path.join(`${parent}-retained`, "state.jsonl"), "utf8")).toBe("authorized");
+			if (replacement === "regular") expect(await fs.readFile(parent, "utf8")).toBe("not a directory");
+		});
+	}
 
 	it("rejects final and ancestor symlinks without changing their targets", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));

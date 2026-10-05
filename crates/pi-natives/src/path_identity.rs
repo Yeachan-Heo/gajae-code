@@ -5472,26 +5472,9 @@ pub(crate) mod platform {
 				unsafe { libc::close(parent_fd) };
 				return Err(Box::new(NativeExactUnlinkResult::failure("io_error")));
 			};
-			// SAFETY: zero is a valid initialized representation for this output struct.
-			let mut named: libc::stat = unsafe { std::mem::zeroed() };
-			// SAFETY: the descriptor and CString are live; the initialized output struct is
-			// writable.
-			if unsafe {
-				libc::fstatat(parent_fd, segment.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW)
-			} != 0
-			{
-				let error = std::io::Error::last_os_error();
-				// SAFETY: this branch owns the live descriptor and closes it exactly once.
-				unsafe { libc::close(parent_fd) };
-				return Err(Box::new(NativeExactUnlinkResult::failure(security_code(&error))));
-			}
-			if named.st_mode & libc::S_IFMT == libc::S_IFLNK {
-				// SAFETY: this branch owns the live descriptor and closes it exactly once.
-				unsafe { libc::close(parent_fd) };
-				return Err(Box::new(NativeExactUnlinkResult::failure("reparse_point")));
-			}
-			// SAFETY: the live descriptor, where used, and NUL-terminated path remain
-			// valid.
+			// Each ancestor is opened no-follow; the kernel enforces the directory and
+			// symlink predicates without a redundant successful-path metadata probe.
+			// SAFETY: the parent descriptor and NUL-terminated component remain live.
 			let next_fd = unsafe {
 				libc::openat(
 					parent_fd,
@@ -5499,13 +5482,30 @@ pub(crate) mod platform {
 					libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
 				)
 			};
-			// SAFETY: this branch owns the live descriptor and closes it exactly once.
-			unsafe { libc::close(parent_fd) };
 			if next_fd < 0 {
-				return Err(Box::new(NativeExactUnlinkResult::failure(security_code(
-					&std::io::Error::last_os_error(),
-				))));
+				// Capture the failed open before a diagnostic syscall or close changes errno.
+				let error = std::io::Error::last_os_error();
+				let mut code = security_code(&error);
+				if error.raw_os_error() == Some(libc::ENOTDIR) {
+					// Darwin can report ENOTDIR for O_DIRECTORY | O_NOFOLLOW on a symlink.
+					// This probe classifies failure only: it never retries or grants authority.
+					// SAFETY: zero is valid initialized storage for this output struct.
+					let mut named: libc::stat = unsafe { std::mem::zeroed() };
+					// SAFETY: the parent descriptor, component, and writable output remain live.
+					if unsafe {
+						libc::fstatat(parent_fd, segment.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW)
+					} == 0 && named.st_mode & libc::S_IFMT == libc::S_IFLNK
+					{
+						code = "reparse_point";
+					}
+				}
+				// SAFETY: this branch owns the live descriptor and closes it exactly once.
+				unsafe { libc::close(parent_fd) };
+				return Err(Box::new(NativeExactUnlinkResult::failure(code)));
 			}
+			// SAFETY: the successful open owns next_fd; release its predecessor exactly
+			// once.
+			unsafe { libc::close(parent_fd) };
 			parent_fd = next_fd;
 		}
 		let Ok(name) = CString::new(name_bytes.as_slice()) else {

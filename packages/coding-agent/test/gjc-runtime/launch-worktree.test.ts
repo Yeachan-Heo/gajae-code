@@ -773,6 +773,19 @@ describe("GJC_WORKTREE_DIR path red-team", () => {
 	});
 });
 
+describe("resolveWorktreeBucketForPath repository names with replacement-pattern characters", () => {
+	// `{repo}` was substituted with a string replacement, so `$&`, `$$`, `` $` `` and
+	// `$'` in the directory name were expanded: `a$&b` resolved to `a{repo}b`, and
+	// `q$'z` spliced the template remainder into the path.
+	for (const name of ["a$&b", "x$$y", "x$`y", "q$'z", "$1"]) {
+		it(`keeps ${JSON.stringify(name)} verbatim`, () => {
+			const repo = `/src/${name}`;
+			expect(resolveWorktreeBucketForPath(repo, undefined, "/home/u", path.posix)).toBe(`/src/${name}/.worktrees`);
+			expect(resolveWorktreeBucketForPath(repo, "~/wt/{repo}", "/home/u", path.posix)).toBe(`/home/u/wt/${name}`);
+		});
+	}
+});
+
 describe("resolveWorktreeBucketForPath Windows semantics", () => {
 	const home = "C:\\Users\\kim";
 	const repo = "C:\\repos\\app";

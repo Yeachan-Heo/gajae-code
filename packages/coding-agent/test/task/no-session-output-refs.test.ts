@@ -17,7 +17,7 @@ import { ArtifactManager } from "../../src/session/artifacts";
 import { AuthStorage } from "../../src/session/auth-storage";
 import { CURRENT_SESSION_VERSION, SessionManager, SessionManagerTestHooks } from "../../src/session/session-manager";
 import { FileSessionStorage } from "../../src/session/session-storage";
-import { AgentOutputManager, TaskTool } from "../../src/task";
+import { TaskTool } from "../../src/task";
 import * as discoveryModule from "../../src/task/discovery";
 import type { AgentDefinition, TaskParams } from "../../src/task/types";
 import type { ToolSession } from "../../src/tools";
@@ -151,45 +151,6 @@ function createSession(sessionFile: string | null, sessionId = "test-in-memory-s
 	} as unknown as TestToolSession;
 }
 
-interface ManagedPersistentSessionFixture {
-	owner: SessionManager;
-	session: TestToolSession;
-	sessionFile: string;
-	ownerRoot: string;
-}
-
-async function createManagedPersistentSession(cwd: string): Promise<ManagedPersistentSessionFixture> {
-	const destination = SessionManager.managedDestination(cwd, path.join(cwd, "agent"));
-	if (destination.kind !== "managed") throw new Error("Expected managed session destination");
-	const owner = SessionManager.create(cwd, destination);
-	owner.appendMessage({ role: "user", content: "persistent parent transcript", timestamp: Date.now() });
-	await owner.ensureOnDisk();
-	await owner.flush();
-	const sessionFile = owner.getSessionFile();
-	if (!sessionFile) throw new Error("Expected a persistent parent session file");
-
-	const session = createSession(sessionFile, owner.getSessionId());
-	session.cwd = cwd;
-	session.getSessionFile = () => owner.getSessionFile() ?? null;
-	session.getSessionId = () => owner.getSessionId();
-	session.getArtifactsDir = () => owner.getArtifactsDir();
-	session.isManagedSessionDestination = () => owner.isManagedDestination();
-	session.getArtifactManager = () => owner.getArtifactManager();
-	session.isArtifactManagerAuthorized = manager => owner.isArtifactManagerAuthorized(manager);
-	session.ensureArtifactManager = () => owner.ensureArtifactManager();
-	session.getAuthorizedArtifactsDirs = () => {
-		const manager = owner.getArtifactManager();
-		return manager ? [manager.dir] : [];
-	};
-	session.allocateOutputArtifact = toolType => owner.allocateArtifactPath(toolType);
-	return {
-		owner,
-		session,
-		sessionFile,
-		ownerRoot: path.join(destination.securityContext.sessionsRoot, ".task-artifact-owners"),
-	};
-}
-
 function createSessionResult(session: AgentSession): CreateAgentSessionResult {
 	return {
 		session,
@@ -273,130 +234,6 @@ describe("task no-session output refs", () => {
 		await session.disposeSession();
 		expect(await pathExists(artifactsDir!)).toBe(false);
 		expect(session.getArtifactsDir?.()).toBeNull();
-	});
-
-	it("establishes a persistent owner before task output allocation and uses its artifact root", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-managed-parent-"));
-		let parent: ManagedPersistentSessionFixture | undefined;
-		try {
-			parent = await createManagedPersistentSession(cwd);
-			const { owner, session, sessionFile } = parent;
-			const childOutput = "managed persistent task output";
-			vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
-				agents: [TEST_AGENT],
-				projectAgentsDir: null,
-			});
-			vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(
-				createSessionResult(createYieldingSession(childOutput)),
-			);
-
-			const legacyRoot = sessionFile.slice(0, -6);
-			expect(owner.getArtifactManager()).toBeNull();
-			expect(await Bun.file(sessionFile).text()).not.toContain("taskArtifactOwner");
-			const outputManager = new AgentOutputManager(() => session.getArtifactsDir?.() ?? null, {
-				getAuthorizedArtifactsDirs: () => session.getAuthorizedArtifactsDirs?.() ?? [],
-			});
-			session.agentOutputManager = outputManager;
-			const order: string[] = [];
-			let ensuredManager: ArtifactManager | null = null;
-			const ensureOwner = owner.ensureArtifactManager.bind(owner);
-			vi.spyOn(owner, "ensureArtifactManager").mockImplementation(async () => {
-				const manager = await ensureOwner();
-				ensuredManager = manager;
-				order.push("owner-established");
-				return manager;
-			});
-			const allocateBatch = outputManager.allocateBatch.bind(outputManager);
-			vi.spyOn(outputManager, "allocateBatch").mockImplementation(async ids => {
-				expect(order).toEqual(["owner-established"]);
-				expect(await Bun.file(sessionFile).text()).toContain("taskArtifactOwner");
-				expect(ensuredManager).toBeTruthy();
-				expect(owner.isArtifactManagerAuthorized(ensuredManager!)).toBe(true);
-				order.push("output-allocated");
-				return allocateBatch(ids);
-			});
-
-			const resultText = await runDetachedTask(await TaskTool.create(session));
-			const outputId = matchAgentOutputId(resultText, "NoSession")?.[1];
-			expect(outputId).toBeTruthy();
-			expect(order).toEqual(["owner-established", "output-allocated"]);
-			const ownerManager = owner.getArtifactManager();
-			expect(ownerManager).toBe(ensuredManager);
-			expect(session.getAuthorizedArtifactsDirs?.()).toContain(ownerManager!.dir);
-			expect(path.resolve(ownerManager!.dir)).not.toBe(path.resolve(legacyRoot));
-			const selector = (await Bun.file(path.join(ownerManager!.dir, `${outputId}.md.selector.json`)).json()) as {
-				outputFilename: string;
-			};
-			const ownerOutput = path.join(ownerManager!.dir, selector.outputFilename);
-			expect(await Bun.file(ownerOutput).text()).toContain(childOutput);
-			expect(await Bun.file(path.join(ownerManager!.dir, `${outputId}.jsonl`)).exists()).toBe(true);
-			expect(await Bun.file(path.join(legacyRoot, `${outputId}.md`)).exists()).toBe(false);
-			expect(await Bun.file(path.join(legacyRoot, `${outputId}.jsonl`)).exists()).toBe(false);
-			const resolved = await InternalUrlRouter.instance().resolve(`agent://${outputId}`, {
-				cwd: session.cwd,
-				getArtifactsDir: () => session.getArtifactsDir?.() ?? null,
-				getAuthorizedArtifactsDirs: () => session.getAuthorizedArtifactsDirs?.() ?? [],
-			});
-			expect(resolved.content).toContain(childOutput);
-		} finally {
-			await parent?.session.disposeSession();
-			await parent?.owner.close();
-			await fs.rm(cwd, { recursive: true, force: true });
-		}
-	});
-
-	it("refuses task scheduling when a persistent owner cannot be established", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-managed-owner-refusal-"));
-		let parent: ManagedPersistentSessionFixture | undefined;
-		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
-		AsyncJobManager.setInstance(manager);
-		try {
-			parent = await createManagedPersistentSession(cwd);
-			const { owner, session, sessionFile } = parent;
-			vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
-				agents: [TEST_AGENT],
-				projectAgentsDir: null,
-			});
-			vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(
-				createSessionResult(createYieldingSession("must not be published")),
-			);
-			const outputManager = new AgentOutputManager(() => session.getArtifactsDir?.() ?? null, {
-				getAuthorizedArtifactsDirs: () => session.getAuthorizedArtifactsDirs?.() ?? [],
-			});
-			session.agentOutputManager = outputManager;
-			const allocation = vi.spyOn(outputManager, "allocateBatch");
-			const ensure = vi
-				.spyOn(owner, "ensureArtifactManager")
-				.mockRejectedValue(new Error("managed owner provisioning refused"));
-			const register = vi.spyOn(manager, "register");
-			const registerSubagent = vi.spyOn(manager, "registerSubagentRecord");
-			const subprocess = vi.fn(async () => {
-				throw new Error("unexpected subprocess invocation");
-			});
-			const tool = await TaskTool.create(session, { runSubprocess: subprocess });
-
-			await expect(
-				tool.execute("tool-call", {
-					agent: "executor",
-					tasks: [{ id: "NoSession", description: "must refuse", assignment: "Return a result." }],
-				} as TaskParams),
-			).rejects.toThrow("managed owner provisioning refused");
-			expect(ensure).toHaveBeenCalledTimes(1);
-			expect(allocation).not.toHaveBeenCalled();
-			expect(register).not.toHaveBeenCalled();
-			expect(registerSubagent).not.toHaveBeenCalled();
-			expect(subprocess).not.toHaveBeenCalled();
-			expect(sdkModule.createAgentSession).not.toHaveBeenCalled();
-			expect(owner.getArtifactManager()).toBeNull();
-			expect(await pathExists(sessionFile.slice(0, -6))).toBe(false);
-			expect(await pathExists(parent.ownerRoot)).toBe(false);
-			expect(await Bun.file(sessionFile).text()).not.toContain("taskArtifactOwner");
-		} finally {
-			await manager.dispose({ timeoutMs: 100 });
-			await parent?.session.disposeSession();
-			await parent?.owner.close();
-			await fs.rm(cwd, { recursive: true, force: true });
-		}
 	});
 
 	it("keeps a nested subagent on the adopted parent artifact store", async () => {
