@@ -4295,6 +4295,7 @@ async function invocationHarness(
 	cwd: string,
 	hooks: {
 		sendUserMessage?: (content: unknown, options?: PreflightHooks & { deliverAs?: string }) => Promise<unknown>;
+		preserveSendResult?: boolean;
 		invokeSkill?: (name: string, args?: string, options?: PreflightHooks) => Promise<unknown>;
 		abort?: () => void;
 		isIdle?: () => boolean;
@@ -4335,7 +4336,7 @@ async function invocationHarness(
 		},
 		sendUserMessage: async (content: unknown, options?: PreflightHooks & { deliverAs?: string }) => {
 			const result = await hooks.sendUserMessage?.(content, options);
-			return result === undefined ? "completed" : result;
+			return hooks.preserveSendResult ? result : result === undefined ? "completed" : result;
 		},
 	} as unknown as ExtensionAPI;
 	const interceptorStore = hooks.persistInterceptor
@@ -5826,7 +5827,7 @@ describe("post-acceptance invocation terminalization", () => {
 		}
 	});
 
-	test("terminalizes a synchronous throw during a todo-reminder continuation", async () => {
+	test("terminalizes the recovered producer after a synchronous todo-continuation throw", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-todo-reminder-throw-"));
 		let harness: InvocationHarness | undefined;
 		let session: AgentSession | undefined;
@@ -5838,7 +5839,10 @@ describe("post-acceptance invocation terminalization", () => {
 				async (model, context, options) => {
 					providerCalls++;
 					if (providerCalls === 2) throw new Error("todo continuation stream failed synchronously");
-					return createMockModel({ responses: [{ content: ["started"] }] }).stream(model, context, options);
+					if (providerCalls > 3) throw new Error("Unexpected extra provider attempt");
+					return createMockModel({
+						responses: [{ content: [providerCalls === 3 ? "recovered continuation" : "started"] }],
+					}).stream(model, context, options);
 				},
 				{ "todo.enabled": true, "todo.reminders": true, "todo.reminders.max": 1 },
 			);
@@ -5860,12 +5864,17 @@ describe("post-acceptance invocation terminalization", () => {
 			expect(correlation.commandId).toBeDefined();
 			expect(correlation.turnId).toBeDefined();
 			const terminal = await settledStatus(harness, "turn.result", { kind: "prompt", ...correlation });
-			expect(terminal).toMatchObject(correlation);
-			expect(harness.broadcasts.filter(frame => frame.kind === "agent_start")).toHaveLength(2);
+			expect(terminal).toMatchObject({
+				...correlation,
+				status: "terminal_ok",
+				content: { text: "recovered continuation" },
+			});
+			expect(harness.broadcasts.filter(frame => frame.kind === "agent_start")).toHaveLength(3);
 			const ends = harness.broadcasts.filter(frame => frame.kind === "agent_end");
 			expect(ends).toHaveLength(1);
 			expect(ends[0]).toMatchObject({ payload: correlation });
-			expect(providerCalls).toBe(2);
+			expect(harness.broadcasts.filter(frame => frame.kind === "agent_failed")).toHaveLength(0);
+			expect(providerCalls).toBe(3);
 		} finally {
 			await session?.dispose();
 			authStorage?.close();
@@ -5873,6 +5882,175 @@ describe("post-acceptance invocation terminalization", () => {
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
+
+	for (const submissionMode of [
+		"lifecycle-only",
+		"real-settlement",
+		"real-void",
+		"cancelled-real-void",
+		"cancelled-backoff-real-void",
+		"durable-recovery-real-void",
+		"durable-cancellation-real-void",
+		"cleanup-rejection-durable-real-void",
+	] as const) {
+		test(`keeps a todo continuation retry nonterminal until its actual provider completes (${submissionMode})`, async () => {
+			const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-todo-held-retry-"));
+			let harness: InvocationHarness | undefined;
+			let session: AgentSession | undefined;
+			let authStorage: AuthStorage | undefined;
+			let providerCalls = 0;
+			const thirdEntered = Promise.withResolvers<void>();
+			const retryEntered = Promise.withResolvers<void>();
+			let backoffAbort: Promise<void> | undefined;
+			const cancelledInBackoff = submissionMode === "cancelled-backoff-real-void";
+			const cancelledDuringProvider =
+				submissionMode === "cancelled-real-void" || submissionMode === "durable-cancellation-real-void";
+			const durableFault = submissionMode.includes("durable");
+			const cleanupWarning =
+				submissionMode === "cleanup-rejection-durable-real-void" ? spyOn(logger, "warn") : undefined;
+			const submissionSettled = Promise.withResolvers<void>();
+			let terminalWriteAttempts = 0;
+			let bareCompletionCommits = 0;
+			const durableTerminalCommits: Array<{ commandId?: string; turnId?: string }> = [];
+			const releaseThird = Promise.withResolvers<void>();
+			try {
+				const real = await createTerminalizationSession(
+					cwd,
+					async (model, context, options) => {
+						providerCalls++;
+						if (providerCalls === 2) throw new Error("todo continuation stream failed synchronously");
+						if (providerCalls > 3) throw new Error("Unexpected extra provider attempt");
+						if (providerCalls === 3) thirdEntered.resolve();
+						const response =
+							providerCalls === 3
+								? async () => {
+										await releaseThird.promise;
+										return { content: ["recovered continuation"] };
+									}
+								: { content: ["started"] };
+						return createMockModel({ responses: [response] }).stream(model, context, options);
+					},
+					{ "todo.enabled": true, "todo.reminders": true, "todo.reminders.max": 1 },
+				);
+				session = real.session;
+				authStorage = real.authStorage;
+				session.setTodoPhases([
+					{ name: "Work", tasks: [{ content: "finish the outstanding work", status: "pending" }] },
+				]);
+				harness = await invocationHarness("todo-held-retry", cwd, {
+					preserveSendResult: submissionMode.endsWith("real-void"),
+					...(durableFault
+						? {
+								settings: {
+									get: (key: string) =>
+										key === "sdk.promptDeadlineMs"
+											? 500
+											: key === "sdk.promptMaxRuntimeMs"
+												? 60_000
+												: undefined,
+								} as unknown as Settings,
+								agentFailedWriteFailures: 0,
+								persistInterceptor: (transition: { type: string }) => {
+									if (transition.type === "agent_end" && ++terminalWriteAttempts <= 3)
+										throw Object.assign(new Error("Controlled terminal write outage"), { code: "io_error" });
+								},
+								onDurableAttempt: (attempt: {
+									type: string | undefined;
+									commandId?: string;
+									turnId?: string;
+									outcome: "rejected" | "committed";
+								}) => {
+									if (attempt.type === "agent_end" && attempt.outcome === "committed")
+										durableTerminalCommits.push({ commandId: attempt.commandId, turnId: attempt.turnId });
+								},
+								onInvocationCompletionReconciled: () => {
+									bareCompletionCommits++;
+								},
+							}
+						: {}),
+					isIdle: () => !session?.isStreaming,
+					sendUserMessage:
+						submissionMode === "lifecycle-only"
+							? deferredRealSendUserMessage(real.session)
+							: async (content, options) => {
+									await options?.onPreflightAcceptCommit?.();
+									const { onPreflightAcceptCommit: _onPreflightAcceptCommit, ...dispatchOptions } =
+										options ?? {};
+									await real.session.sendUserMessage(content as string, dispatchOptions as never);
+									submissionSettled.resolve();
+									if (submissionMode === "cleanup-rejection-durable-real-void")
+										throw Object.assign(new Error("Controlled post-publication cleanup rejection"), {
+											code: "cleanup_failed",
+										});
+								},
+				});
+				session.subscribe(async event => {
+					if (cancelledInBackoff && event.type === "auto_retry_start") {
+						backoffAbort = real.session.abort();
+						retryEntered.resolve();
+					}
+					await harness?.emit(event.type, event);
+				});
+				const accepted = await harness.control("turn.prompt", { text: "finish the outstanding work" });
+				expect(accepted.ok).toBe(true);
+				const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+				expect(correlation.commandId).toBeDefined();
+				expect(correlation.turnId).toBeDefined();
+				await (cancelledInBackoff ? retryEntered.promise : thirdEntered.promise);
+				expect(providerCalls).toBe(cancelledInBackoff ? 2 : 3);
+				if (!cancelledInBackoff) {
+					expect(await harness.query("turn.result", { kind: "prompt", ...correlation })).toMatchObject({
+						result: { status: "in_flight", receiptState: "absent" },
+					});
+					expect(harness.broadcasts.filter(frame => frame.kind === "agent_end")).toHaveLength(0);
+				}
+				expect(harness.broadcasts.filter(frame => frame.kind === "agent_failed")).toHaveLength(0);
+				const abort = cancelledInBackoff ? backoffAbort : cancelledDuringProvider ? session.abort() : undefined;
+				releaseThird.resolve();
+				await abort;
+				await session.waitForIdle();
+				if (durableFault) await submissionSettled.promise;
+				const terminal = await settledStatus(harness, "turn.result", { kind: "prompt", ...correlation });
+				expect(terminal).toMatchObject(
+					cancelledDuringProvider || cancelledInBackoff
+						? { ...correlation, status: "terminal_ok", outcome: { kind: "stopped", reason: "cancelled" } }
+						: { ...correlation, status: "terminal_ok", content: { text: "recovered continuation" } },
+				);
+				expect(harness.broadcasts.filter(frame => frame.kind === "agent_start")).toHaveLength(
+					cancelledInBackoff ? 2 : 3,
+				);
+				const ends = harness.broadcasts.filter(frame => frame.kind === "agent_end");
+				if (durableFault) {
+					// Failed lifecycle writes withhold the wire boundary. The existing
+					// deadline owner repairs the actual durable result for readonly query;
+					// do not fake a broadcast or infer delivery from that durable commit.
+					expect(ends).toHaveLength(0);
+				} else {
+					expect(ends).toHaveLength(1);
+					expect(ends[0]).toMatchObject({ payload: correlation });
+				}
+				expect(harness.broadcasts.filter(frame => frame.kind === "agent_failed")).toHaveLength(0);
+				expect(providerCalls).toBe(cancelledInBackoff ? 2 : 3);
+				if (durableFault) {
+					expect(terminalWriteAttempts).toBe(4);
+					expect(bareCompletionCommits).toBe(0);
+					expect(durableTerminalCommits).toEqual([correlation]);
+				}
+				if (cleanupWarning)
+					expect(cleanupWarning).toHaveBeenCalledWith(
+						"SDK submission cleanup failed after owned terminal capture",
+						expect.objectContaining({ kind: "prompt", ...correlation }),
+					);
+			} finally {
+				cleanupWarning?.mockRestore();
+				releaseThird.resolve();
+				await session?.dispose();
+				authStorage?.close();
+				await harness?.stop();
+				await rm(cwd, { recursive: true, force: true });
+			}
+		});
+	}
 
 	test("terminalizes a second overflow during overflow maintenance", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-overflow-maintenance-failure-"));
