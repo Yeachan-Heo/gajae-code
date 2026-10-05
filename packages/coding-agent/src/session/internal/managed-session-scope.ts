@@ -1235,6 +1235,17 @@ export async function ensureManagedScope(
 		const preparedDirectory = fs.lstatSync(scope.directoryPath, { bigint: true });
 		if (!preparedDirectory.isDirectory() || preparedDirectory.isSymbolicLink()) throw new Error("reparse_point");
 		managedDirectoryIdentities.set(scope, { dev: preparedDirectory.dev, ino: preparedDirectory.ino });
+		if (!managedDirectoryAuthorities.has(scope)) {
+			const authority = boundManagedWriteAuthorities.get(scope);
+			const retainedAuthority =
+				authority?.retainedAuthority &&
+				authority.retainedDirectory !== undefined &&
+				path.resolve(authority.retainedDirectory) === path.resolve(scope.directoryPath)
+					? authority.retainedAuthority
+					: retainManagedDirectoryAuthority(root, scope.directoryPath, managedDirectoryIdentityForScope(scope));
+			assertRetainedManagedDirectoryIdentity(scope);
+			managedDirectoryAuthorities.set(scope, retainedAuthority);
+		}
 		return { kind: "resolved", scope };
 	} catch (error) {
 		const publication = error instanceof ManagedPublishError ? error : undefined;
@@ -5904,6 +5915,11 @@ export async function reconcileManagedTombstones(
 			continue;
 		let lock: ManagedStorageLock | undefined;
 		try {
+			const prepared = await ensureManagedScope(
+				scope,
+				scope.platform === "win32" ? "windows-existing-verify-first" : "default",
+			);
+			if (prepared.kind === "error") throw new Error(prepared.message);
 			lock = await acquireManagedLock(
 				path.join(managedInternalDirectory(scope), MANAGED_LOCKS_DIRECTORY),
 				path.basename(tombstone, ".json"),
@@ -5953,6 +5969,14 @@ export async function reconcileManagedTombstones(
 								(!target.taskArtifactOwnerDeletionEvidence ||
 									pending?.taskArtifactOwnerTranscriptDeleted === true)
 							) {
+								// Re-certify fresh completion proof without borrowing a legacy summary for owner effects.
+								if (
+									!target.taskArtifactOwnerDeletionEvidence &&
+									fs.existsSync(cleanupReceiptPath(tombstone, target, "completed", 1))
+								) {
+									await publishCleanupCompleted(scope, tombstone, target, lock);
+									continue;
+								}
 								const ownerProgress = await retireManagedGcOwnerAfterArtifacts(
 									scope,
 									target,
@@ -6247,16 +6271,6 @@ export async function prepareManagedSessionScopeForWrite(
 	try {
 		const internal = managedInternalDirectory(scope);
 		const root = scopeRoot(scope);
-		if (!managedDirectoryAuthorities.has(scope)) {
-			const retainedAuthority =
-				authority?.retainedAuthority &&
-				authority.retainedDirectory !== undefined &&
-				path.resolve(authority.retainedDirectory) === path.resolve(scope.directoryPath)
-					? authority.retainedAuthority
-					: retainManagedDirectoryAuthority(root, scope.directoryPath, managedDirectoryIdentityForScope(scope));
-			assertRetainedManagedDirectoryIdentity(scope);
-			managedDirectoryAuthorities.set(scope, retainedAuthority);
-		}
 		ensureManagedDirectory(internal, root, policy);
 		ensureManagedDirectory(path.join(internal, MANAGED_LOCKS_DIRECTORY), root, policy);
 		ensureManagedDirectory(path.join(internal, MANAGED_RECEIPTS_DIRECTORY), root, policy);
