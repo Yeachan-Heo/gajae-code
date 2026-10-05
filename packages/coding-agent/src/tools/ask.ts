@@ -15,6 +15,7 @@
  *   - Questions may time out and auto-select the recommended option (configurable, disabled in plan mode)
  */
 
+import { randomUUID } from "node:crypto";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import type { RawArgumentValidationResult } from "@gajae-code/ai/types";
 import { validateToolArguments } from "@gajae-code/ai/utils/validation";
@@ -36,12 +37,25 @@ import {
 } from "../deep-interview/render-middleware";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { appendOrMergeDeepInterviewRound, syncDeepInterviewRecorderHud } from "../gjc-runtime/deep-interview-recorder";
-import { deepInterviewStatePath } from "../gjc-runtime/deep-interview-runtime";
+import {
+	assertDeepInterviewCrystalCoversLiveTranscript,
+	authoritativeConversationSnapshot,
+	deepInterviewStatePath,
+} from "../gjc-runtime/deep-interview-runtime";
 import {
 	assertDeepInterviewInputWithinLimit,
 	assertDeepInterviewStructuredResponseWithinLimit,
 	MAX_USER_RESPONSE_LENGTH,
 } from "../gjc-runtime/deep-interview-state";
+import type { ExecutionApprovalPresentation } from "../gjc-runtime/state-runtime";
+import {
+	captureExecutionApprovalPresentation,
+	executionApprovalLineage,
+	recordDeepInterviewExecutionApproval,
+	recordNonCrystalExecutionApproval,
+	revokeDeepInterviewExecutionApproval,
+	revokeNonCrystalExecutionApproval,
+} from "../gjc-runtime/state-runtime";
 import {
 	type AskGateQuestion,
 	gateAnswerToResult,
@@ -75,7 +89,7 @@ import {
 export { askSchema } from "./ask-contract";
 
 import { formatErrorMessage, formatMeta, formatTitle } from "./render-utils";
-import { ToolAbortError } from "./tool-errors";
+import { ToolAbortError, ToolError } from "./tool-errors";
 import { assertUltragoalAskAllowed } from "./ultragoal-ask-guard";
 
 // =============================================================================
@@ -156,6 +170,23 @@ function errorMessage(error: unknown): string {
 
 function nonEmptyCustomInput(value: string | undefined): string | undefined {
 	return value !== undefined && value.trim().length > 0 ? value : undefined;
+}
+
+function deepInterviewExecutionTarget(selectedOptions: readonly string[]): "ultragoal" | undefined {
+	if (selectedOptions.length !== 1) return undefined;
+	const normalized = selectedOptions[0]
+		?.trim()
+		.replace(/\s*\(Recommended\)\s*$/i, "")
+		.toLowerCase();
+	return normalized === "approve execution via ultragoal" ||
+		/^execute with ultragoal(?: \(only when spec is already implementation-ready and really simple\))?$/.test(
+			normalized ?? "",
+		) ||
+		normalized === "ultragoal" ||
+		normalized === "/skill:ultragoal" ||
+		normalized === "gjc ultragoal"
+		? "ultragoal"
+		: undefined;
 }
 
 function isAskTimeoutError(error: unknown): boolean {
@@ -320,6 +351,8 @@ interface SelectionResult {
 	selectedOptions: string[];
 	customInput?: string;
 	clarificationQuestion?: string;
+	executionGateId?: string;
+	executionPresentation?: ExecutionApprovalPresentation;
 	timedOut: boolean;
 	navigation?: "back" | "forward";
 	cancelled?: boolean;
@@ -340,6 +373,7 @@ interface AskSingleQuestionOptions {
 	otherOptionLabel?: string;
 	clarificationOptionLabel?: string;
 	autoSelectOnTimeout?: boolean;
+	executionPresentation?: ExecutionApprovalPresentation;
 	onRemoteState?: (state: {
 		interaction: "selector" | "custom_editor" | "clarification_editor";
 		selectedCount: number;
@@ -849,6 +883,65 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		);
 	}
 
+	/**
+	 * The Deep Interview execution choice is the only ask answer that can mint
+	 * execution authority.  The runtime records only the redacted answer hash;
+	 * the subsequent CLI action must consume that record before it can approve
+	 * the canonical Crystal.
+	 */
+	async #recordDeepInterviewExecutionApproval(
+		q: AskParams["questions"][number],
+		selectedOptions: string[],
+		customInput: string | undefined,
+		toolCallId: string,
+		executionGateId?: string,
+		executionPresentation?: ExecutionApprovalPresentation,
+	): Promise<void> {
+		const deepInterviewExecution = q.workflowGate?.stage === "deep-interview" && q.workflowGate.kind === "execution";
+		const ralplanApproval = q.workflowGate?.stage === "ralplan" && q.workflowGate.kind === "approval";
+		if (!deepInterviewExecution && !ralplanApproval) return;
+		const target = deepInterviewExecutionTarget(selectedOptions);
+		const sessionId = this.session.getSessionId?.();
+		if (!target || customInput !== undefined) {
+			if (sessionId) {
+				await revokeDeepInterviewExecutionApproval(this.session.cwd, sessionId);
+				await revokeNonCrystalExecutionApproval(
+					this.session.cwd,
+					sessionId,
+					ralplanApproval ? "ralplan" : "deep-interview",
+				);
+			}
+			return;
+		}
+		if (!sessionId) throw new ToolAbortError("Deep Interview execution approval requires a session");
+		if (!executionPresentation)
+			throw new ToolAbortError("Execution approval publication could not be authenticated before consent");
+		const approvalStage = ralplanApproval ? "ralplan" : "deep-interview";
+		const lineage = await executionApprovalLineage(this.session.cwd, sessionId, approvalStage);
+		const transcriptEvidence =
+			lineage === "crystal"
+				? await assertDeepInterviewCrystalCoversLiveTranscript(this.session.cwd, sessionId, deepInterviewExecution)
+				: await authoritativeConversationSnapshot(this.session.cwd, sessionId);
+		const recordApproval =
+			lineage === "crystal" ? recordDeepInterviewExecutionApproval : recordNonCrystalExecutionApproval;
+		await recordApproval({
+			cwd: this.session.cwd,
+			sessionId,
+			questionId: q.id,
+			gateId: executionGateId ?? q.id,
+			toolCallId,
+			target,
+			selectedOptions,
+			transcriptPath: transcriptEvidence.transcriptPath,
+			transcriptSha256: transcriptEvidence.transcriptSha256,
+			approvalStage,
+			presentation: executionPresentation,
+		});
+		// Ralplan approval is consumed by the subsequent handoff, after the agent
+		// persists this Ask tool result. Consuming here would validate the boundary
+		// before the matching provider toolResult exists in the transcript.
+	}
+
 	async execute(
 		_toolCallId: string,
 		params: AskParams,
@@ -1200,6 +1293,14 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		// Send notification if waiting and not suppressed
 		this.#sendAskNotification();
 
+		if (
+			params.questions.filter(
+				question =>
+					(question.workflowGate?.stage === "deep-interview" && question.workflowGate.kind === "execution") ||
+					(question.workflowGate?.stage === "ralplan" && question.workflowGate.kind === "approval"),
+			).length > 1
+		)
+			throw new ToolError("Ask accepts at most one execution-authorizing workflow gate per invocation");
 		const askQuestion = async (
 			q: AskParams["questions"][number],
 			options?: {
@@ -1212,6 +1313,9 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			const recommended = validRecommendedIndex(q.recommended, rawOptionLabels.length);
 			const questionIndex = params.questions.indexOf(q);
 			const emptyCustomAttempt = options?.emptyCustomAttempt ?? 0;
+			const isExecutionApprovalQuestion =
+				(q.workflowGate?.stage === "deep-interview" && q.workflowGate.kind === "execution") ||
+				(q.workflowGate?.stage === "ralplan" && q.workflowGate.kind === "approval");
 			// Route headless asks through the SDK workflow-gate emitter; a connected
 			// SDK responder supplies the durable answer instead of an interactive UI.
 			if (gateEmitter && canUseWorkflowGate) {
@@ -1226,19 +1330,79 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					allowEmpty: q.multi === true && params.questions.length > 1,
 					navigationLabel: questionIndex === params.questions.length - 1 ? "Done" : "Next",
 				};
-				const answer = await awaitAskAnswer(() => gateEmitter.emitGate(questionToGate(gateQuestion)));
+				let executionGateId: string | undefined = isExecutionApprovalQuestion
+					? `interactive-${randomUUID()}`
+					: undefined;
+				let executionPresentation: ExecutionApprovalPresentation | undefined;
+				if (isExecutionApprovalQuestion) {
+					const sessionId = this.session.getSessionId?.();
+					if (!sessionId) throw new ToolAbortError("Execution approval requires a session");
+					try {
+						executionPresentation = await captureExecutionApprovalPresentation(
+							this.session.cwd,
+							sessionId,
+							q.workflowGate?.stage === "ralplan" ? "ralplan" : "deep-interview",
+						);
+					} catch (error) {
+						throw new ToolAbortError(
+							error instanceof Error
+								? `Execution approval publication could not be authenticated: ${error.message}`
+								: "Execution approval publication could not be authenticated",
+						);
+					}
+				}
+				const stopGateObservation = gateEmitter.onGateEmitted?.(gate => {
+					const stageState = gate.context?.stage_state;
+					if (
+						gate.stage === q.workflowGate?.stage &&
+						gate.kind === q.workflowGate?.kind &&
+						((gate.stage === "deep-interview" && gate.kind === "execution") ||
+							(gate.stage === "ralplan" && gate.kind === "approval")) &&
+						stageState?.question_id === q.id
+					)
+						executionGateId = gate.gate_id;
+				});
+				let answer: unknown;
+				try {
+					answer = await gateEmitter.emitGate(questionToGate(gateQuestion));
+				} finally {
+					stopGateObservation?.();
+				}
 				const decoded = gateAnswerToResult(gateQuestion, answer);
 				return {
 					optionLabels: rawOptionLabels,
 					selectedOptions: decoded.selectedOptions,
 					customInput: decoded.customInput,
 					clarificationQuestion: decoded.clarificationQuestion,
+					executionGateId,
+					executionPresentation,
 					navigation: undefined as NavigationControls | undefined,
 					cancelled: false,
 					timedOut: false,
 				};
 			}
 			try {
+				let executionPresentation: ExecutionApprovalPresentation | undefined;
+				if (isExecutionApprovalQuestion) {
+					const sessionId = this.session.getSessionId?.();
+					if (!sessionId) throw new ToolAbortError("Execution approval requires a session");
+					try {
+						executionPresentation = await captureExecutionApprovalPresentation(
+							this.session.cwd,
+							sessionId,
+							q.workflowGate?.stage === "ralplan" ? "ralplan" : "deep-interview",
+						);
+					} catch (error) {
+						throw new ToolAbortError(
+							error instanceof Error
+								? `Execution approval publication could not be authenticated: ${error.message}`
+								: "Execution approval publication could not be authenticated",
+						);
+					}
+				}
+				const executionGateId: string | undefined = isExecutionApprovalQuestion
+					? `interactive-${randomUUID()}`
+					: undefined;
 				const deepInterviewPrompt = formatDeepInterviewSelectorPrompt(q.question);
 				const isDeepInterviewQuestion = deepInterviewPrompt !== null || q.deepInterview !== undefined;
 				const baseDisplayQuestion = deepInterviewPrompt ?? q.question;
@@ -1307,6 +1471,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 						!intentReview(q.deepInterview) &&
 						(q.workflowGate === undefined || q.workflowGate.kind === "question"),
 					clarificationOptionLabel,
+					executionPresentation,
 					onRemoteState: state => {
 						activeRemoteRequest = {
 							question: displayQuestion,
@@ -1395,6 +1560,8 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					selectedOptions,
 					customInput,
 					clarificationQuestion,
+					executionGateId,
+					executionPresentation,
 					navigation,
 					cancelled,
 					timedOut,
@@ -1418,8 +1585,16 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 
 		if (params.questions.length === 1) {
 			const [q] = params.questions;
-			const { optionLabels, selectedOptions, customInput, clarificationQuestion, cancelled, timedOut } =
-				await askQuestion(q);
+			const {
+				optionLabels,
+				selectedOptions,
+				customInput,
+				clarificationQuestion,
+				executionGateId,
+				executionPresentation,
+				cancelled,
+				timedOut,
+			} = await askQuestion(q);
 
 			if (
 				!timedOut &&
@@ -1435,6 +1610,14 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			) {
 				await this.#recordDeepInterviewRound(q, selectedOptions, customInput);
 			}
+			await this.#recordDeepInterviewExecutionApproval(
+				q,
+				selectedOptions,
+				customInput,
+				_toolCallId,
+				executionGateId,
+				executionPresentation,
+			);
 			const details: AskToolDetails = {
 				question: q.question,
 				options: optionLabels,
@@ -1476,6 +1659,10 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		}
 
 		const resultsByIndex: Array<QuestionResult | undefined> = Array.from({ length: params.questions.length });
+		const executionGateIdsByIndex: Array<string | undefined> = Array.from({ length: params.questions.length });
+		const executionPresentationsByIndex: Array<ExecutionApprovalPresentation | undefined> = Array.from({
+			length: params.questions.length,
+		});
 		let questionIndex = 0;
 		while (questionIndex < params.questions.length) {
 			const q = params.questions[questionIndex]!;
@@ -1490,6 +1677,8 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				selectedOptions,
 				customInput,
 				clarificationQuestion,
+				executionGateId,
+				executionPresentation,
 				navigation: navAction,
 				cancelled,
 				timedOut,
@@ -1509,6 +1698,8 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				customInput,
 				clarificationQuestion,
 			};
+			executionGateIdsByIndex[questionIndex] = executionGateId;
+			executionPresentationsByIndex[questionIndex] = executionPresentation;
 
 			if (
 				clarificationQuestion === undefined &&
@@ -1521,7 +1712,6 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				questionIndex = Math.max(0, questionIndex - 1);
 				continue;
 			}
-
 			questionIndex += 1;
 		}
 
@@ -1538,6 +1728,15 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		});
 
 		const details: AskToolDetails = { results };
+		for (const [index, result] of results.entries())
+			await this.#recordDeepInterviewExecutionApproval(
+				params.questions[index]!,
+				result.selectedOptions,
+				result.customInput,
+				_toolCallId,
+				executionGateIdsByIndex[index],
+				executionPresentationsByIndex[index],
+			);
 		const responseLines = results.map(formatQuestionResult);
 		const responseText = `User answers:\n${responseLines.join("\n")}`;
 
