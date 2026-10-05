@@ -80,6 +80,7 @@ type SessionRetirementPlan =
 			gcContinuationReceipt?: ManagedGcSessionRetirementReceipt;
 	  }
 	| { kind: "owner_shared"; reason: string; gcContinuationReceipt?: ManagedGcSessionRetirementReceipt }
+	| { kind: "cleanup_pending"; reason: string; gcContinuationReceipt: ManagedGcSessionRetirementReceipt }
 	| { kind: "kept"; reason: string };
 
 type OwnerRetirementFields = {
@@ -92,6 +93,7 @@ type OwnerRetirementFields = {
 };
 
 export type SessionRetirementProbeOutcome =
+	| Extract<SessionRetirementOutcome, { kind: "cleanup_pending" }>
 	| {
 			kind: "retirable";
 			taskArtifactOwnerDeletionEvidence?: TaskArtifactOwnerDeletionEvidence;
@@ -222,6 +224,11 @@ async function planSessionRetirement(
 	let ownerEvidence: TaskArtifactOwnerDeletionEvidence | undefined;
 	let gcContinuationReceipt: ManagedGcSessionRetirementReceipt | undefined;
 	let managedTarget: ManagedGcSessionRetirementTarget | undefined;
+	let partialReceipt: ManagedGcSessionRetirementReceipt | undefined;
+	const continuationRefusal = (reason: string): SessionRetirementPlan =>
+		partialReceipt
+			? { kind: "cleanup_pending", reason, gcContinuationReceipt: partialReceipt }
+			: { kind: "kept", reason };
 	if (ownerLocator) {
 		if (!continuation) return { kind: "kept", reason: "task_artifact_owner_context_missing" };
 		try {
@@ -251,21 +258,22 @@ async function planSessionRetirement(
 			if (gcContinuationReceipt) {
 				if (!sameManagedGcTarget(gcContinuationReceipt, managedTarget))
 					return { kind: "kept", reason: "task_artifact_owner_continuation_transcript_replaced" };
+				if (gcContinuationReceipt.artifactsRemoved) partialReceipt = gcContinuationReceipt;
 				ownerEvidence = gcContinuationReceipt.taskArtifactOwnerDeletionEvidence;
-				if (!ownerEvidence) return { kind: "kept", reason: "task_artifact_owner_continuation_evidence_missing" };
+				if (!ownerEvidence) return continuationRefusal("task_artifact_owner_continuation_evidence_missing");
 				if (gcContinuationReceipt.state === "prepared" || gcContinuationReceipt.state === "artifacts_removed") {
 					const currentEvidence = captureTaskArtifactOwnerDeletionEvidence(ownerContext, header.id, ownerLocator);
 					if (!currentEvidence || !sameEvidence(currentEvidence, ownerEvidence))
-						return { kind: "kept", reason: "task_artifact_owner_continuation_evidence_mismatch" };
+						return continuationRefusal("task_artifact_owner_continuation_evidence_mismatch");
 				} else if (gcContinuationReceipt.state === "owner_pending") {
 					const outcome = gcContinuationReceipt.taskArtifactOwnerRetirementOutcome;
 					if (!outcome || outcome.kind === "completed")
-						return { kind: "kept", reason: "task_artifact_owner_continuation_outcome_mismatch" };
+						return continuationRefusal("task_artifact_owner_continuation_outcome_mismatch");
 					verifyTaskArtifactOwnerRetirementContinuation(ownerContext, ownerEvidence, outcome.continuation);
 				} else {
 					const outcome = gcContinuationReceipt.taskArtifactOwnerRetirementOutcome;
 					if (outcome?.kind !== "completed")
-						return { kind: "kept", reason: "task_artifact_owner_continuation_outcome_mismatch" };
+						return continuationRefusal("task_artifact_owner_continuation_outcome_mismatch");
 					verifyTaskArtifactOwnerPhysicalRetirement(ownerContext, ownerEvidence, outcome);
 				}
 			} else {
@@ -287,7 +295,7 @@ async function planSessionRetirement(
 					...(gcContinuationReceipt ? { gcContinuationReceipt } : {}),
 				};
 		} catch (error) {
-			return { kind: "kept", reason: `task_artifact_owner_continuation_invalid: ${toError(error).message}` };
+			return continuationRefusal(`task_artifact_owner_continuation_invalid: ${toError(error).message}`);
 		}
 	}
 
@@ -335,7 +343,17 @@ export async function probeSessionRetirement(
 	continuation?: SessionRetirementContinuation,
 ): Promise<SessionRetirementProbeOutcome> {
 	const plan = await planSessionRetirement(storage, sessionsRoot, transcriptPath, continuation);
-	if (plan.kind === "kept" || plan.kind === "owner_shared") return { kind: "kept", reason: plan.reason };
+	if (plan.kind === "kept") return plan;
+	if (plan.kind === "owner_shared" || plan.kind === "cleanup_pending") {
+		const receipt = plan.gcContinuationReceipt;
+		if (!receipt?.artifactsRemoved) return { kind: "kept", reason: plan.reason };
+		return cleanupPending(
+			plan.reason,
+			receipt.taskArtifactOwnerDeletionEvidence,
+			receipt.taskArtifactOwnerRetirementOutcome,
+			receipt.state === "owner_retired",
+		);
+	}
 	return planRetirementOutcome(plan);
 }
 
@@ -353,7 +371,7 @@ function cleanupPending(
 	outcome: TaskArtifactOwnerRetirementOutcome | undefined,
 	ownerRetired: boolean,
 	phase: "artifacts" | "transcript" = "artifacts",
-): SessionRetirementOutcome {
+): Extract<SessionRetirementOutcome, { kind: "cleanup_pending" }> {
 	return { kind: "cleanup_pending", reason, phase, ...ownerOutcomeFields(evidence, outcome, ownerRetired) };
 }
 
@@ -658,7 +676,7 @@ export async function retireSessionTranscript(
 ): Promise<SessionRetirementOutcome> {
 	const plan = await planSessionRetirement(storage, sessionsRoot, transcriptPath, continuation);
 	if (plan.kind === "kept") return plan;
-	if (plan.kind === "owner_shared") {
+	if (plan.kind === "owner_shared" || plan.kind === "cleanup_pending") {
 		const receipt = plan.gcContinuationReceipt;
 		if (!receipt?.artifactsRemoved) return { kind: "kept", reason: plan.reason };
 		return cleanupPending(
