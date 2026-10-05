@@ -39,6 +39,10 @@ const RETIREMENT_CONTINUATION_KEYS = new Set([
 const U64_MAX = 18_446_744_073_709_551_615n;
 
 type NativeDirectoryTreeEntry = NativeDirectoryTreeSnapshot["entries"][number];
+type ExpectedTreeChildren = {
+	readonly direct: Map<string, NativeDirectoryTreeEntry>;
+	readonly quarantined: Map<string, NativeDirectoryTreeEntry | null>;
+};
 
 export interface TaskArtifactOwnerLocator {
 	readonly schemaVersion: typeof OWNER_SCHEMA_VERSION;
@@ -231,16 +235,66 @@ export function freezeTreeSnapshot(snapshot: NativeDirectoryTreeSnapshot): Nativ
 	return Object.freeze(canonical);
 }
 
-export function retainedTreeDoesNotExpandAuthority(
+/** Windows native tree removal hashes original path and inode identity for child quarantine names. */
+function treeQuarantineName(entry: NativeDirectoryTreeEntry): string {
+	const material = `${entry.relativePath}\0${entry.dev}\0${entry.ino}`;
+	return `.pi-tree-detached-${crypto.createHash("sha256").update(material, "utf8").digest("hex")}`;
+}
+
+/** Project only authenticated remaining entries; never restore an omitted entry's authority. */
+export function normalizeRetainedTreeSnapshot(
 	expected: NativeDirectoryTreeSnapshot,
 	retained: NativeDirectoryTreeSnapshot,
-): boolean {
-	if (expected.rootDev !== retained.rootDev || expected.rootIno !== retained.rootIno) return false;
+): NativeDirectoryTreeSnapshot | undefined {
+	if (expected.rootDev !== retained.rootDev || expected.rootIno !== retained.rootIno) return undefined;
 	const expectedEntries = new Map(expected.entries.map(entry => [entry.relativePath, entry]));
-	if (retained.entries.length > expected.entries.length) return false;
-	return retained.entries.every(entry => {
-		if (entry.relativePath === "") return entry.kind === "directory";
-		const authorized = expectedEntries.get(entry.relativePath);
+	if (retained.entries.length > expected.entries.length) return undefined;
+
+	const childrenByParent = new Map<string, ExpectedTreeChildren>();
+	for (const entry of expected.entries) {
+		if (entry.relativePath === "") continue;
+		const separator = entry.relativePath.lastIndexOf("/");
+		const parent = separator < 0 ? "" : entry.relativePath.slice(0, separator);
+		const name = separator < 0 ? entry.relativePath : entry.relativePath.slice(separator + 1);
+		let children = childrenByParent.get(parent);
+		if (!children) {
+			children = { direct: new Map(), quarantined: new Map() };
+			childrenByParent.set(parent, children);
+		}
+		children.direct.set(name, entry);
+		const quarantineName = treeQuarantineName(entry);
+		children.quarantined.set(quarantineName, children.quarantined.has(quarantineName) ? null : entry);
+	}
+
+	const originalPathFor = (retainedPath: string): string | undefined => {
+		if (retainedPath === "") return "";
+		const components = retainedPath.split("/");
+		if (components.some(component => component.length === 0 || component === "." || component === ".."))
+			return undefined;
+		let parent = "";
+		for (const component of components) {
+			const children = childrenByParent.get(parent);
+			if (!children) return undefined;
+			const direct = children.direct.get(component);
+			const hasQuarantine = children.quarantined.has(component);
+			const quarantined = children.quarantined.get(component);
+			if ((direct && hasQuarantine) || quarantined === null) return undefined;
+			const matched = direct ?? quarantined;
+			if (!matched) return undefined;
+			parent = matched.relativePath;
+		}
+		return parent;
+	};
+
+	const seenOriginalPaths = new Set<string>();
+	const entries: NativeDirectoryTreeEntry[] = [];
+	const valid = retained.entries.every(entry => {
+		const originalPath = originalPathFor(entry.relativePath);
+		if (originalPath === undefined || seenOriginalPaths.has(originalPath)) return false;
+		seenOriginalPaths.add(originalPath);
+		entries.push({ ...entry, relativePath: originalPath });
+		if (originalPath === "") return entry.kind === "directory";
+		const authorized = expectedEntries.get(originalPath);
 		if (
 			authorized === undefined ||
 			authorized.kind !== entry.kind ||
@@ -257,6 +311,14 @@ export function retainedTreeDoesNotExpandAuthority(
 			entry.sha256 !== undefined || (entry.mtimeNs === authorized.mtimeNs && entry.ctimeNs === authorized.ctimeNs)
 		);
 	});
+	return valid ? { rootDev: retained.rootDev, rootIno: retained.rootIno, entries } : undefined;
+}
+
+export function retainedTreeDoesNotExpandAuthority(
+	expected: NativeDirectoryTreeSnapshot,
+	retained: NativeDirectoryTreeSnapshot,
+): boolean {
+	return normalizeRetainedTreeSnapshot(expected, retained) !== undefined;
 }
 
 export function sameTreeContents(left: NativeDirectoryTreeSnapshot, right: NativeDirectoryTreeSnapshot): boolean {
@@ -501,6 +563,7 @@ export function parseTaskArtifactOwnerRetirementOutcome(
 			"windowsErrorCode",
 		];
 		if (Object.keys(record).some(key => !allowed.includes(key)) || typeof record.ok !== "boolean") return invalid();
+		if (record.ok && Object.keys(record).length !== 1) return invalid();
 		for (const [key, paths] of [
 			["detachedPath", continuation?.detachedPaths],
 			["retainedSuccessorPath", continuation?.retainedSuccessorPaths],
@@ -547,7 +610,7 @@ export function parseTaskArtifactOwnerRetirementOutcome(
 		if (!nativeOutcome?.ok) return invalid();
 		return Object.freeze({ kind, evidence: original, nativeOutcome });
 	}
-	if (!continuation || nativeOutcome?.ok) return invalid();
+	if (!continuation || (kind !== "uncertain" && nativeOutcome?.ok)) return invalid();
 	if (kind === "payload_retired") {
 		if (
 			value.namespace !== "retained" ||
