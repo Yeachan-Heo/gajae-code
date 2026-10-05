@@ -631,6 +631,8 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			timestamp: Date.now(),
 		};
 		const blocks = output.content as Block[];
+		let firstTokenEmitted = false;
+		let firstTokenTime: number | undefined;
 		try {
 			if (!isKiroApiKey(apiKey)) {
 				throw new Error(
@@ -673,10 +675,6 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 
 			const flushTool = () => {
 				if (!currentTool) return;
-				if (!firstTokenEmitted) {
-					firstTokenEmitted = true;
-					firstTokenTime = Date.now();
-				}
 				const args = currentTool.input.trim() ? currentTool.input : "{}";
 				let parsed: unknown = {};
 				try {
@@ -692,10 +690,6 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				};
 				const index = blocks.length;
 				blocks.push({ ...toolCall, index });
-				stream.push({ type: "toolcall_start", contentIndex: index, partial: output });
-				const toolArgs = JSON.stringify(toolCall.arguments ?? {});
-				stream.push({ type: "toolcall_delta", contentIndex: index, delta: toolArgs, partial: output });
-				stream.push({ type: "toolcall_end", contentIndex: index, toolCall, partial: output });
 				currentTool = undefined;
 			};
 
@@ -734,6 +728,24 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				stream.push({ type: "thinking_delta", contentIndex: thinkingIndex, delta, partial: output });
 			};
 
+			const emitBlocksToStream = () => {
+				for (let i = 0; i < blocks.length; i++) {
+					const block = blocks[i];
+					if (block.type === "thinking") {
+						stream.push({ type: "thinking_start", contentIndex: i, partial: output });
+						stream.push({ type: "thinking_delta", contentIndex: i, delta: block.thinking, partial: output });
+						stream.push({ type: "thinking_end", contentIndex: i, content: block.thinking, partial: output });
+					} else if (block.type === "text") {
+						stream.push({ type: "text_start", contentIndex: i, partial: output });
+						stream.push({ type: "text_delta", contentIndex: i, delta: block.text, partial: output });
+						stream.push({ type: "text_end", contentIndex: i, content: block.text, partial: output });
+					} else if (block.type === "toolCall") {
+						stream.push({ type: "toolcall_start", contentIndex: i, partial: output });
+						const args = JSON.stringify(block.arguments ?? {});
+						stream.push({ type: "toolcall_delta", contentIndex: i, delta: args, partial: output });
+						stream.push({ type: "toolcall_end", contentIndex: i, toolCall: block, partial: output });
+					}
+				}
 			};
 
 			let inThink = false;
@@ -769,17 +781,24 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				}
 			};
 
-			// Process events as they arrive from the stream
-			let refusalEncountered = false;
-			let firstTokenEmitted = false;
+			// Collect all events from the stream
+			const allEvents: KiroStreamEvent[] = [];
 			while (true) {
 				const { done, value } = await reader.read();
 				if (done) break;
 				buffer += decoder.decode(value, { stream: true });
 				const { events, remaining } = parseKiroApiEvents(buffer);
 				buffer = remaining;
+				allEvents.push(...events);
+			}
 
-				for (const event of events) {
+			// Check for refusal event
+			const refusalEventIndex = allEvents.findIndex(e => e.type === "refusal" && e.data.stopDetails?.refusal);
+
+			// Process events and build blocks (without streaming yet)
+			const eventsToProcess = refusalEventIndex >= 0 ? allEvents.slice(0, refusalEventIndex + 1) : allEvents;
+
+			for (const event of eventsToProcess) {
 				if (event.type === "content") {
 					if (event.data === lastContent) continue;
 					lastContent = event.data;
@@ -823,7 +842,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						// Do not pass options.fetch as callerTransport: the refusal came from the
 						// provider's response, not from a caller-controlled fabrication.
 						const adapterInvocation = isProviderSafetyStopAdapterInvocation(options);
-						
+
 						const authenticated = mintProviderSafetyStop(
 							output,
 							"refusal",
@@ -849,13 +868,8 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				}
 			}
 
-			// Finish streaming blocks: emit any pending end events and flush final tool call
-			consumeContent(""); // Flush any pending thinking block
-			if (textIndex !== undefined) {
-				const textBlock = blocks[textIndex] as TextContent;
-				stream.push({ type: "text_end", contentIndex: textIndex, content: textBlock.text, partial: output });
-			}
-			flushTool(); // Flush the final pending tool call
+			// If we reach here without a refusal, emit all blocks to stream
+			emitBlocksToStream();
 			const hasText = blocks.some(b => b.type === "text" && b.text.length > 0);
 			const hasTools = blocks.some(b => b.type === "toolCall");
 			if (!hasText && !hasTools) {
