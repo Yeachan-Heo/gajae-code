@@ -1,0 +1,6 @@
+{
+  "schema": "gjc.diagnostic-artifact-provenance",
+  "version": "0.18.7",
+  "artifact": "pi_natives.linux-x64-modern.node",
+  "sha256": "bdf6f0df4343fbbfc4b9dc0bdc8ad70ffc9dfdbf16408bd54d234ff134c384ef"
+}

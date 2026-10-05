@@ -147,7 +147,7 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 		expect(errorEvent?.message?.errorMessage).toContain("Request violates malicious code policy");
 
 		// Should have errorKind set to provider_safety_stop
-		expect((errorEvent?.message as any)?.errorKind).toBe("provider_safety_stop");
+		expect((errorEvent?.message as { errorKind?: string })?.errorKind).toBe("provider_safety_stop");
 
 		// Should NOT have any text or tool call events before the error
 		const errorIndex = events.findIndex(e => e.type === "error");
@@ -161,8 +161,8 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 		expect(toolEventsBeforeError).toHaveLength(0);
 
 		// Should NOT have text or tool calls in final message
-		const textBlocks = (errorEvent?.message?.content ?? []).filter((b: any) => b.type === "text");
-		const toolCalls = (errorEvent?.message?.content ?? []).filter((b: any) => b.type === "toolCall");
+		const textBlocks = (errorEvent?.message?.content ?? []).filter((b: { type?: string }) => b.type === "text");
+		const toolCalls = (errorEvent?.message?.content ?? []).filter((b: { type?: string }) => b.type === "toolCall");
 		expect(textBlocks.length).toBe(0);
 		expect(toolCalls.length).toBe(0);
 	});
@@ -226,7 +226,7 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 		expect(errorEvent?.message?.errorMessage).toContain("Cannot assist with that request");
 
 		// Should have errorKind set to provider_safety_stop
-		expect((errorEvent?.message as any)?.errorKind).toBe("provider_safety_stop");
+		expect((errorEvent?.message as { errorKind?: string })?.errorKind).toBe("provider_safety_stop");
 	});
 
 	test("does not report a refusal when the metadata carries none", async () => {
@@ -309,7 +309,7 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 		const errorEvent = events.find(e => e.type === "error");
 		expect(errorEvent).toBeDefined();
 		expect(errorEvent?.message?.errorMessage).toBe("Kiro refused the request (ILLEGAL)");
-		expect((errorEvent?.message as any)?.errorKind).toBe("provider_safety_stop");
+		expect((errorEvent?.message as { errorKind?: string })?.errorKind).toBe("provider_safety_stop");
 	});
 
 	test("refusal without category is still reported", async () => {
@@ -355,6 +355,6 @@ describe("Kiro CodeWhisperer content filter #6150", () => {
 		expect(errorEvent).toBeDefined();
 		expect(errorEvent?.message?.errorMessage).toContain("Kiro refused the request");
 		expect(errorEvent?.message?.errorMessage).toContain("Your request cannot be processed");
-		expect((errorEvent?.message as any)?.errorKind).toBe("provider_safety_stop");
+		expect((errorEvent?.message as { errorKind?: string })?.errorKind).toBe("provider_safety_stop");
 	});
 });
