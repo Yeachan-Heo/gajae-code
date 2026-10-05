@@ -218,24 +218,46 @@ describe("SessionManager.moveTo", () => {
 		expect(session.getSessionFile()).not.toBe(sessionFile);
 	});
 
-	it("uses retained copy publication when a managed move cannot rename across devices", async () => {
+	it("uses retained copy publication while the durable artifact owner survives a managed move", async () => {
 		const session = SessionManager.create(cwdA);
 		session.appendMessage({ role: "user", content: "source", timestamp: 1 });
 		session.appendMessage(makeAssistantMessage());
 		await session.flush();
 		const sourceFile = session.getSessionFile()!;
-		const artifactId = await session.saveArtifact("authoritative artifact", "bash");
-		if (!artifactId) throw new Error("Expected artifact id");
-		const artifactPath = path.join(sourceFile.slice(0, -6), `${artifactId}.bash.log`);
+		const manager = await session.ensureArtifactManager();
+		if (!manager) throw new Error("Expected managed artifact owner");
+		const artifactId = await manager.save("authoritative artifact", "bash");
+		const artifactPath = await manager.getPath(artifactId);
+		if (!artifactPath) throw new Error("Expected artifact path");
+		const sourceHeader = getHeader(await loadEntriesFromFile(sourceFile));
+		if (!sourceHeader?.taskArtifactOwner) throw new Error("Expected persisted owner locator");
+		const ownerIdentity = await fsp.stat(manager.dir, { bigint: true });
+		expect(path.dirname(manager.dir)).toBe(path.join(path.resolve(getSessionsDir()), ".task-artifact-owners"));
+		expect(path.basename(manager.dir)).toBe(sourceHeader.taskArtifactOwner.ownerId);
+		expect(path.resolve(manager.dir)).not.toBe(path.resolve(sourceFile.slice(0, -6)));
 
 		const destinationFile = path.join(SessionManager.getDefaultSessionDir(cwdB), path.basename(sourceFile));
 		await session.moveTo(cwdB);
 
 		expect(fs.existsSync(sourceFile)).toBe(false);
 		expect(fs.existsSync(destinationFile)).toBe(true);
-		expect(await fsp.readFile(path.join(destinationFile.slice(0, -6), path.basename(artifactPath)), "utf8")).toBe(
-			"authoritative artifact",
+		expect(fs.existsSync(destinationFile.slice(0, -6))).toBe(false);
+		expect(await fsp.readFile(artifactPath, "utf8")).toBe("authoritative artifact");
+		expect((await fsp.stat(manager.dir, { bigint: true })).ino).toBe(ownerIdentity.ino);
+		expect(getHeader(await loadEntriesFromFile(destinationFile))?.taskArtifactOwner).toEqual(
+			sourceHeader.taskArtifactOwner,
 		);
+
+		const reopened = await SessionManager.open(destinationFile, SessionManager.managedDestination(cwdB));
+		try {
+			const restored = await reopened.ensureArtifactManager();
+			expect(restored?.dir).toBe(manager.dir);
+			expect(await reopened.getArtifactPath(artifactId)).toBe(artifactPath);
+			expect(await restored?.readRange(artifactId)).toBe("authoritative artifact");
+		} finally {
+			await reopened.close();
+			await session.close();
+		}
 	});
 
 	it("uses atomic rename without requiring hard-link support on the same device", async () => {
@@ -261,47 +283,77 @@ describe("SessionManager.moveTo", () => {
 		expect(fs.existsSync(session.getSessionFile()!)).toBe(true);
 	});
 
-	it("preserves complete nested artifact topology on a same-device move", async () => {
+	it("preserves durable owner identity and nested artifact topology on a same-device move", async () => {
 		const session = SessionManager.create(cwdA);
 		session.appendMessage({ role: "user", content: "source", timestamp: 1 });
 		session.appendMessage(makeAssistantMessage());
 		await session.flush();
 		const sourceFile = session.getSessionFile()!;
-		const artifactId = await session.saveArtifact("top-level artifact", "bash");
-		if (!artifactId) throw new Error("Expected artifact id");
-		const artifactPath = path.join(sourceFile.slice(0, -6), `${artifactId}.bash.log`);
-		const sourceArtifacts = path.dirname(artifactPath);
+		const manager = await session.ensureArtifactManager();
+		if (!manager) throw new Error("Expected managed artifact owner");
+		const artifactId = await manager.save("top-level artifact", "bash");
+		const artifactPath = await manager.getPath(artifactId);
+		if (!artifactPath) throw new Error("Expected top-level artifact path");
+		const sourceHeader = getHeader(await loadEntriesFromFile(sourceFile));
+		if (!sourceHeader?.taskArtifactOwner) throw new Error("Expected persisted owner locator");
+		const sourceArtifacts = manager.dir;
+		const sourceOwnerIdentity = await fsp.stat(sourceArtifacts, { bigint: true });
+		expect(path.dirname(sourceArtifacts)).toBe(path.join(path.resolve(getSessionsDir()), ".task-artifact-owners"));
+		expect(path.basename(sourceArtifacts)).toBe(sourceHeader.taskArtifactOwner.ownerId);
 		await fsp.mkdir(path.join(sourceArtifacts, "nested", "empty"), { recursive: true, mode: 0o700 });
 		await fsp.writeFile(path.join(sourceArtifacts, "nested", "payload.txt"), "nested artifact", { mode: 0o600 });
 
 		await session.moveTo(cwdB);
 
 		const destinationFile = session.getSessionFile()!;
-		const destinationArtifacts = destinationFile.slice(0, -6);
 		expect(fs.existsSync(sourceFile)).toBe(false);
-		expect(fs.existsSync(sourceArtifacts)).toBe(false);
-		expect(await fsp.readFile(path.join(destinationArtifacts, path.basename(artifactPath)), "utf8")).toBe(
-			"top-level artifact",
+		expect(fs.existsSync(destinationFile.slice(0, -6))).toBe(false);
+		expect(manager.dir).toBe(sourceArtifacts);
+		expect((await fsp.stat(manager.dir, { bigint: true })).ino).toBe(sourceOwnerIdentity.ino);
+		expect(await fsp.readFile(artifactPath, "utf8")).toBe("top-level artifact");
+		expect(await fsp.readFile(path.join(manager.dir, "nested", "payload.txt"), "utf8")).toBe("nested artifact");
+		expect((await fsp.stat(path.join(manager.dir, "nested", "empty"))).isDirectory()).toBe(true);
+		expect(getHeader(await loadEntriesFromFile(destinationFile))?.taskArtifactOwner).toEqual(
+			sourceHeader.taskArtifactOwner,
 		);
-		expect(await fsp.readFile(path.join(destinationArtifacts, "nested", "payload.txt"), "utf8")).toBe(
-			"nested artifact",
-		);
-		expect((await fsp.stat(path.join(destinationArtifacts, "nested", "empty"))).isDirectory()).toBe(true);
+
+		const reopened = await SessionManager.open(destinationFile, SessionManager.managedDestination(cwdB));
+		try {
+			const restored = await reopened.ensureArtifactManager();
+			expect(restored?.dir).toBe(sourceArtifacts);
+			expect(await restored?.readRange(artifactId)).toBe("top-level artifact");
+			expect(await fsp.readFile(path.join(restored!.dir, "nested", "payload.txt"), "utf8")).toBe("nested artifact");
+		} finally {
+			await reopened.close();
+			await session.close();
+		}
 	});
 
-	it("moves an artifact directory without pre-creating the copy destination", async () => {
+	it("moves an actual legacy artifact tree without pre-creating its destination", async () => {
 		const session = SessionManager.create(cwdA);
+		session.appendMessage({ role: "user", content: "legacy tree", timestamp: 1 });
+		await session.ensureOnDisk();
 		const sourceFile = session.getSessionFile()!;
-		const artifactId = await session.saveArtifact("artifact", "bash");
-		if (!artifactId) throw new Error("Expected artifact id");
-		const artifactPath = path.join(sourceFile.slice(0, -6), `${artifactId}.bash.log`);
+		const sourceArtifacts = sourceFile.slice(0, -6);
+		const legacyArtifact = path.join(sourceArtifacts, "0.bash.log");
+		await fsp.mkdir(sourceArtifacts, { recursive: true, mode: 0o700 });
+		await fsp.writeFile(legacyArtifact, "legacy artifact", { mode: 0o600 });
+		const destinationArtifacts = path.join(SessionManager.getDefaultSessionDir(cwdB), path.basename(sourceArtifacts));
+		expect(fs.existsSync(destinationArtifacts)).toBe(false);
 
 		await session.moveTo(cwdB);
 
 		const destinationFile = session.getSessionFile();
 		if (!destinationFile) throw new Error("Expected destination session file");
-		const destinationArtifact = path.join(destinationFile.slice(0, -6), path.basename(artifactPath));
-		expect(await fsp.readFile(destinationArtifact, "utf8")).toBe("artifact");
+		expect(fs.existsSync(sourceArtifacts)).toBe(false);
+		expect(await fsp.readFile(path.join(destinationArtifacts, path.basename(legacyArtifact)), "utf8")).toBe(
+			"legacy artifact",
+		);
+		const manager = await session.ensureArtifactManager();
+		if (!manager) throw new Error("Expected migrated durable artifact owner");
+		expect(manager.dir).not.toBe(destinationArtifacts);
+		expect(await manager.readRange("0")).toBe("legacy artifact");
+		expect(getHeader(await loadEntriesFromFile(destinationFile))?.taskArtifactOwner).toBeDefined();
 	});
 
 	it("succeeds on fresh session without ENOENT, then deferred persistence works", async () => {
@@ -412,27 +464,38 @@ describe("SessionManager.moveTo", () => {
 		expect(header?.cwd).toBe(path.resolve(cwdB));
 	});
 
-	it("moves artifact dir independently when session file does not exist", async () => {
+	it("moves a legacy artifact tree without a transcript, then adopts it under a durable owner", async () => {
 		const session = SessionManager.create(cwdA);
 		const oldFile = session.getSessionFile()!;
-		const artifactId = await session.saveArtifact("artifact", "bash");
-		if (!artifactId) throw new Error("Expected artifact id");
-		const artifactPath = path.join(oldFile.slice(0, -6), `${artifactId}.bash.log`);
-
-		const oldArtifactDir = path.dirname(artifactPath);
+		const oldArtifactDir = oldFile.slice(0, -6);
+		await fsp.mkdir(oldArtifactDir, { recursive: true, mode: 0o700 });
+		await fsp.writeFile(path.join(oldArtifactDir, "0.bash.log"), "legacy artifact", { mode: 0o600 });
 		expect(fs.existsSync(oldArtifactDir)).toBe(true);
 
-		// No messages — session file doesn't exist
+		// A legacy artifact directory can exist even when no session transcript was published.
 		expect(fs.existsSync(oldFile)).toBe(false);
-
 		await session.moveTo(cwdB);
 
 		expect(session.getCwd()).toBe(path.resolve(cwdB));
-		// Old artifact dir moved
 		expect(fs.existsSync(oldArtifactDir)).toBe(false);
-		// New artifact dir exists
 		const newFile = session.getSessionFile()!;
-		const newArtifactDir = newFile.slice(0, -6); // strip .jsonl
-		expect(fs.existsSync(newArtifactDir)).toBe(true);
+		const newArtifactDir = newFile.slice(0, -6);
+		expect(fs.existsSync(newFile)).toBe(false);
+		expect(await fsp.readFile(path.join(newArtifactDir, "0.bash.log"), "utf8")).toBe("legacy artifact");
+
+		const manager = await session.ensureArtifactManager();
+		if (!manager) throw new Error("Expected durable artifact owner after legacy adoption");
+		expect(fs.existsSync(newFile)).toBe(true);
+		expect(manager.dir).not.toBe(newArtifactDir);
+		expect(await manager.readRange("0")).toBe("legacy artifact");
+		const reopened = await SessionManager.open(newFile, SessionManager.managedDestination(cwdB));
+		try {
+			const restored = await reopened.ensureArtifactManager();
+			expect(restored?.dir).toBe(manager.dir);
+			expect(await restored?.readRange("0")).toBe("legacy artifact");
+		} finally {
+			await reopened.close();
+			await session.close();
+		}
 	});
 });

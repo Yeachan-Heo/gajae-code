@@ -1218,9 +1218,60 @@ describe("hashline — anchor-stale recovery via read snapshot cache", () => {
 	it("keeps a bounded number of generations per path", () => {
 		const cache = new FileReadCache();
 		const fakePath = "/tmp/__hashline-cache-generations__.ts";
-		for (let version = 0; version < 6; version++) cache.recordFull(fakePath, [`v${version}`]);
+		for (let version = 0; version < 10; version++) cache.recordFull(fakePath, [`v${version}`]);
 		const generations = cache.generations(fakePath);
-		expect(generations.map(snapshot => snapshot.lines.get(1))).toEqual(["v5", "v4", "v3", "v2"]);
+		expect(generations.map(snapshot => snapshot.lines.get(1))).toEqual([
+			"v9",
+			"v8",
+			"v7",
+			"v6",
+			"v5",
+			"v4",
+			"v3",
+			"v2",
+		]);
+	});
+
+	it("lands an edit authored against the original read after five of this session's own edits", async () => {
+		await withTempDir(async tempDir => {
+			const filePath = path.join(tempDir, "a.ts");
+			const v0Lines = ["// top", "", "const a = 1;", "const b = 2;", "", "function b() {", "  return 2;", "}"];
+			await Bun.write(filePath, `${v0Lines.join("\n")}\n`);
+			const session = makeHashlineSession(tempDir);
+			getFileReadCache(session).recordContiguous(filePath, 1, [...v0Lines, ""]);
+
+			// Five own edits, each inserting a line after line 1 (`// top`, which never moves).
+			// Each write records a new generation, pushing the original read back to the sixth.
+			for (let n = 0; n < 5; n++) {
+				const insert = `§a.ts\n»${tag(1, "// top")}\n// note ${n}\n`;
+				await executeHashlineSingle(hashlineExecuteOptions(tempDir, insert, undefined, session));
+			}
+			expect(getFileReadCache(session).generations(filePath)).toHaveLength(6);
+
+			// Anchor from the original read: line 7 was `  return 2;` there.
+			const stale = `§a.ts\n≔${sameLineRange(tag(7, "  return 2;"))}\n  return 3;\n`;
+			const result = await executeHashlineSingle(hashlineExecuteOptions(tempDir, stale, undefined, session));
+
+			expect(await Bun.file(filePath).text()).toBe(
+				[
+					"// top",
+					"// note 4",
+					"// note 3",
+					"// note 2",
+					"// note 1",
+					"// note 0",
+					"",
+					"const a = 1;",
+					"const b = 2;",
+					"",
+					"function b() {",
+					"  return 3;",
+					"}",
+					"",
+				].join("\n"),
+			);
+			expect(toolText(result)).toMatch(/Recovered from stale anchors using a previous read snapshot/);
+		});
 	});
 
 	it("lands a follow-up edit authored against the original read after this session's own edit shifted lines", async () => {

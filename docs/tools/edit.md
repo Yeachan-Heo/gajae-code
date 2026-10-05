@@ -177,7 +177,7 @@ export const done = true;
 - The visible mismatch report shows 2 lines of context on each side (`MISMATCH_CONTEXT`) in `packages/coding-agent/src/hashline/constants.ts`.
 - Stale-anchor recovery uses `fuzzFactor: 0` (`HASHLINE_RECOVERY_FUZZ_FACTOR`) in `packages/coding-agent/src/hashline/recovery.ts`.
 - The mismatch report searches 20 lines either side of a stale anchor for where its content moved (`MISMATCH_RELOCATE_WINDOW`).
-- The per-session read cache keeps at most 30 paths (`MAX_PATHS_PER_SESSION`) and 4 snapshot generations per path (`MAX_GENERATIONS_PER_PATH`) in `packages/coding-agent/src/edit/file-read-cache.ts`.
+- The per-session read cache keeps at most 30 paths (`MAX_PATHS_PER_SESSION`) and 8 snapshot generations per path (`MAX_GENERATIONS_PER_PATH`) in `packages/coding-agent/src/edit/file-read-cache.ts`.
 - Hashline streaming chunk defaults are 200 lines or 64 KiB per chunk (`packages/coding-agent/src/hashline/types.ts`, consumed by `packages/coding-agent/src/hashline/stream.ts`).
 - `HL_OP_INSERT_BEFORE` is `«`, `HL_OP_INSERT_AFTER` is `»`, `HL_OP_REPLACE` is `≔`, `HL_OP_CHARS` is `«»≔`, `HL_FILE_PREFIX` is `§`, and `HL_BODY_SEP` is `|` (`packages/coding-agent/src/hashline/hash.ts`).
 
