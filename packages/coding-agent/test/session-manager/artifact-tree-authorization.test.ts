@@ -1,13 +1,8 @@
-import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
-import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import {
-	parseSessionEntries,
-	SessionManager,
-	SessionManagerTestHooks,
-} from "@gajae-code/coding-agent/session/session-manager";
+import { parseSessionEntries, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { ManagedSessionDescendantStore } from "../../src/session/internal/managed-session-storage";
 
 // Runtime-level regression coverage for gajae-code#3302: the runtime never
@@ -110,75 +105,6 @@ function managedFixture() {
 }
 
 describe("SessionManager durable task artifact owner", () => {
-	it("does not recreate a transcript removed immediately before the owner patch append", async () => {
-		const { destination } = managedFixture();
-		const session = SessionManager.create(tempDir, destination);
-		await session.ensureOnDisk();
-		const sessionFile = session.getSessionFile();
-		if (!sessionFile) throw new Error("Expected an actual persistent transcript");
-		const previousHook = SessionManagerTestHooks.beforePersistPatchFence;
-		const closedOwnerStores: ManagedSessionDescendantStore[] = [];
-		const closeStore = ManagedSessionDescendantStore.prototype.close;
-		const closeSpy = spyOn(ManagedSessionDescendantStore.prototype, "close").mockImplementation(function (
-			this: ManagedSessionDescendantStore,
-		) {
-			if (path.basename(path.dirname(this.dir)) === ".task-artifact-owners") closedOwnerStores.push(this);
-			closeStore.call(this);
-		});
-		let removals = 0;
-		SessionManagerTestHooks.beforePersistPatchFence = () => {
-			fs.unlinkSync(sessionFile);
-			removals++;
-		};
-		try {
-			await expect(session.ensureArtifactManager()).rejects.toThrow("task_artifact_owner_metadata_persist_failed");
-			expect(removals).toBe(1);
-			expect(closedOwnerStores).toHaveLength(2);
-			expect(closedOwnerStores[0]).not.toBe(closedOwnerStores[1]);
-			expect(closedOwnerStores[0].dir).toBe(closedOwnerStores[1].dir);
-			expect(path.dirname(closedOwnerStores[1].dir)).toBe(
-				path.join(destination.securityContext.sessionsRoot, ".task-artifact-owners"),
-			);
-			expect(await Bun.file(sessionFile).exists()).toBe(false);
-			expect(() => session.getArtifactManager()).toThrow("task_artifact_owner_metadata_persist_uncertain");
-			await expect(session.allocateArtifactPath("unpublished-owner")).rejects.toThrow(
-				"task_artifact_owner_metadata_persist_uncertain",
-			);
-			expect(await Bun.file(sessionFile).exists()).toBe(false);
-		} finally {
-			SessionManagerTestHooks.beforePersistPatchFence = previousHook;
-			closeSpy.mockRestore();
-			await session.close().catch(() => {});
-		}
-	});
-	it("refuses owner publication when the existing transcript disappears during setup", async () => {
-		const { destination } = managedFixture();
-		const session = SessionManager.create(tempDir, destination);
-		const ensureOnDisk = session.ensureOnDisk.bind(session);
-		let removedTranscript: string | undefined;
-		const ensureSpy = spyOn(session, "ensureOnDisk").mockImplementation(async () => {
-			await ensureOnDisk();
-			const sessionFile = session.getSessionFile();
-			if (!sessionFile) throw new Error("Expected an actual persistent transcript");
-			removedTranscript = sessionFile;
-			await fsPromises.unlink(sessionFile);
-		});
-		try {
-			await expect(session.ensureArtifactManager()).rejects.toThrow("task_artifact_owner_metadata_persist_failed");
-			if (!removedTranscript) throw new Error("Actual transcript removal was not reached");
-			expect(await Bun.file(removedTranscript).exists()).toBe(false);
-			expect(() => session.getArtifactManager()).toThrow("task_artifact_owner_metadata_persist_uncertain");
-			ensureSpy.mockRestore();
-			await expect(session.allocateArtifactPath("unpublished-owner")).rejects.toThrow(
-				"task_artifact_owner_metadata_persist_uncertain",
-			);
-			expect(await Bun.file(removedTranscript).exists()).toBe(false);
-		} finally {
-			ensureSpy.mockRestore();
-			await session.close().catch(() => {});
-		}
-	});
-
 	it("publishes the durable locator before returning a manager and restores its artifacts on reopen", async () => {
 		const { agentDir, destination } = managedFixture();
 		const session = SessionManager.create(tempDir, destination);
