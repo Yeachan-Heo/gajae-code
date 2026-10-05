@@ -617,6 +617,49 @@ cursor contract and returns `error.code: "cursor_expired"` with
 `error.restartQuery: true`. Malformed cursor strings return `invalid_cursor`;
 cross-query or selector mismatches return `invalid_input`.
 
+## Project progress snapshot (Q32)
+
+`Q32` / `session.progress` returns one read-only snapshot of the session's
+project progress for orchestrators that supervise GJC as a subordinate agent.
+It is the same projection the human `/progress` command renders — one
+computation over durable session state (goal mode, todos, the session ultragoal
+plan `goals.json`, active workflow state and HUD chips, subagent lifecycle
+records, recorded quality-gate receipts and review verdicts) — so the two views
+cannot disagree. The query accepts no input fields, writes nothing, and never
+invokes a model.
+
+ACP clients call it through `_gjc/sdk/query`:
+
+```json
+{ "method": "_gjc/sdk/query", "params": { "sessionId": "…", "query": "session.progress" } }
+```
+
+MCP (`gjc_session_query`) and `gjc sdk session raw query` use the same query
+name. The response is a single-item page whose item has
+`schema: "gjc.project_progress.v1"`:
+
+| Field | Meaning |
+| --- | --- |
+| `state` | Completion state: `complete`, `awaiting-completion`, `blocked`, `in-progress`, `not-started`, `paused`, `dropped`, or `no-tracked-work`. |
+| `completion` | `basis` (`ultragoal-stories`, `todos`, `goal-status`, or `none`), `done`/`total` counted units, `percent` (`null` when `basis` is `none`), `allUnitsDone`, `complete`, and a plain-language `explanation`. |
+| `execution` | `goal`, `ultragoal` (story counts plus bounded per-story status and receipt flag), and `todos` (counts plus bounded items); each is `null` when not recorded. |
+| `activeWork` | Active (or next) story, in-progress (or next) todo, active workflows with their phase and HUD chips, and subagent counts. |
+| `verification` | `storyReceipts` (complete stories with and without a quality-gate receipt; `null` until a story is complete) and published `reviewVerdicts`. |
+| `attention` | Blockers, pending items, and notes, each with `kind`, `source` (`ultragoal`, `workflow`, `subagents`, `todos`, `goal`, `state`), a stable `ref` (story id, workflow skill, or source key) when one exists, and text. |
+| `sources` | `sessionStateRead` and `unreadable` durable sources (`workflow-state`, `ultragoal-plan`), which are excluded from every count. |
+
+Semantics are deliberately conservative. Units count equally and open units
+earn no partial credit; `percent` is never 100 while a unit is open and never 0
+once one is done. `complete` requires every counted unit done, the session goal
+(if any) complete, and no subagent running or queued; otherwise a finished unit
+set reports `awaiting-completion`. Verification reports only recorded receipts
+and verdicts: receipt freshness is not validated and no confidence score is
+derived. Subagent counts come from the session's in-memory job records and
+reset with the process. Lists are bounded (`omittedStories`, `omittedItems`,
+`omittedAttention` report the remainder) and durable text is stripped of
+control characters and length-bounded. A session without a progress source
+returns `unavailable`; input fields return `invalid_request`.
+
 ## Answer semantics
 
 A remote reply answers a pending ask in every session state:

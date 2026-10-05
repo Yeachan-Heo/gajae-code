@@ -9,6 +9,14 @@ export {
 	type UnknownModelProfileDetails,
 	UnknownModelProfileError,
 } from "../config/model-profile-contract";
+export {
+	PROJECT_PROGRESS_SNAPSHOT_SCHEMA,
+	type ProgressSnapshotAttention,
+	type ProgressSnapshotStory,
+	type ProgressSnapshotTodo,
+	type ProgressSnapshotWorkflow,
+	type ProjectProgressSnapshot,
+} from "../progress/progress-snapshot";
 export type {
 	QueuedInputAdmission,
 	QueuedInputDelivery,

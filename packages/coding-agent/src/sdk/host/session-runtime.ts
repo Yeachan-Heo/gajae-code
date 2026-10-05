@@ -2468,6 +2468,9 @@ function createQuerySurface(
 		getExtensions: () => ctx.getExtensions(),
 		getArtifactRange: (artifactId, offset, length) => ctx.getArtifactRange?.(artifactId, offset, length),
 		getJobs: () => ctx.getJobs(),
+		...(typeof (ctx as Partial<ExtensionContext>).getProjectProgress === "function"
+			? { getProjectProgress: () => ctx.getProjectProgress!() }
+			: {}),
 		getPromptStatus: (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
 			reconciliation.lookup("prompt", selector),
 		getSkillInvokeStatus: (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
