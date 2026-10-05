@@ -95,6 +95,7 @@ export function createFixture(
 		primaryControlSurface?: "cli" | "sdk";
 		liveSessionIndex?: boolean;
 		virtualPromptWatchdog?: boolean;
+		terminalOnAbortBeforeAcknowledgement?: StoppedReason;
 		abortAcknowledgement?:
 			| Record<string, unknown>
 			| (() => Record<string, unknown> | Promise<Record<string, unknown>>);
@@ -301,6 +302,21 @@ export function createFixture(
 						}
 					}
 					if (frame.operation === "turn.abort") abortDelivered.resolve();
+					if (frame.operation === "turn.abort" && options.terminalOnAbortBeforeAcknowledgement) {
+						const terminalCorrelation = activeCorrelation();
+						socket.send(
+							JSON.stringify({
+								type: "agent_end",
+								sessionId,
+								...terminalCorrelation,
+								outcome: {
+									kind: "stopped",
+									reason: options.terminalOnAbortBeforeAcknowledgement,
+									provenance: "agent",
+								},
+							}),
+						);
+					}
 					const correlation = activeCorrelation();
 					const abortAcknowledgement =
 						frame.operation === "turn.abort" && typeof options.abortAcknowledgement === "function"
@@ -3306,6 +3322,40 @@ test("cancel 100ms after background prompt start settles cancelled and follow-up
 		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "background cancel acknowledgement");
 		expect(await bounded(background, "background cancelled settlement")).toEqual({ stopReason: "cancelled" });
 		const followUp = prompt(fixture, "follow-up");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "follow-up prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(followUp, "follow-up completion")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("cancel in flight before follow-up admission still settles the cancelled prompt", async () => {
+	const abortGate = Promise.withResolvers<void>();
+	const fixture = await createFixture({
+		cancelSettlementGraceMs: 0,
+		terminalOnAbortBeforeAcknowledgement: "end_turn",
+		abortAcknowledgement: async () => {
+			await abortGate.promise;
+			return {
+				ok: true,
+				selection: "turn",
+				turn: "stopped",
+				ownedWork: "left_running",
+				automaticDelivery: "enabled",
+				resumeOnOwnedCompletion: true,
+			};
+		},
+	});
+	try {
+		const background = prompt(fixture, "sleep 5000");
+		await bounded(fixture.promptDelivered, "background prompt delivery");
+		const cancellation = fixture.agent.cancel({ sessionId: fixture.sessionId });
+		await bounded(fixture.abortDelivered, "cancel request delivery");
+		const followUp = prompt(fixture, "echo after-cancel");
+		abortGate.resolve();
+		expect(await bounded(cancellation, "cancel acknowledgement")).toBeUndefined();
+		expect(await bounded(background, "cancelled background settlement")).toEqual({ stopReason: "cancelled" });
 		await waitFor(() => fixture.promptDeliveryCount() === 2, "follow-up prompt delivery");
 		fixture.sendStopped("end_turn");
 		expect(await bounded(followUp, "follow-up completion")).toEqual({ stopReason: "end_turn" });
