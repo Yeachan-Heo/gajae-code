@@ -790,7 +790,10 @@ export async function scanSkillsFromDir(
 		try {
 			const skillPath = await fs.promises.realpath(candidatePath);
 			if (!isWithinRoot(skillPath)) {
-				warnings.push(`Refusing skill path outside scan root: ${candidatePath}`);
+				// Name the resolved directory and the setting that loads it, so a symlinked skills repo is fixable (#6355).
+				warnings.push(
+					`Refusing skill path outside scan root: ${candidatePath} (resolves to ${skillPath}; add ${path.dirname(path.dirname(skillPath))} to skills.customDirectories to load it)`,
+				);
 				return;
 			}
 			const stat = await fs.promises.stat(skillPath);
