@@ -1,12 +1,17 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as path from "node:path";
+import { TempDir } from "@gajae-code/utils";
 import { AsyncJobManager } from "../../src/async";
 import type { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
 import * as repositoryBindingModule from "../../src/gjc-runtime/repository-binding";
 import { InternalUrlRouter } from "../../src/internal-urls/router";
+import { ArtifactManager } from "../../src/session/artifacts";
+import { SessionManager } from "../../src/session/session-manager";
 import { TaskTool } from "../../src/task";
 import * as discoveryModule from "../../src/task/discovery";
 import * as executorModule from "../../src/task/executor";
+import { createManagedTaskPersistence } from "../../src/task/executor";
 import type { AgentDefinition, SingleResult, TaskParams } from "../../src/task/types";
 import type { IsolationHandle, WorktreeBaseline } from "../../src/task/worktree";
 import * as worktreeModule from "../../src/task/worktree";
@@ -117,6 +122,92 @@ async function runTask(tool: TaskTool, tasks: TaskParams["tasks"]): Promise<stri
 function task(id: string): TaskParams["tasks"][number] {
 	return { id, description: id, assignment: "Exercise persistence." };
 }
+
+describe("generic managed Task persistence authority", () => {
+	it("restores genuine child rollback authority without closing the borrowed parent store", async () => {
+		using root = TempDir.createSync("gjc-task-generic-rollback-");
+		const parent = SessionManager.create(root.path(), SessionManager.managedDestination(root.path(), root.path()));
+		try {
+			parent.appendMessage({ role: "user", content: "parent transcript", timestamp: 1 });
+			await parent.ensureOnDisk();
+			await parent.saveArtifact("parent artifact", "task");
+			const artifacts = parent.getArtifactManager();
+			if (!artifacts) throw new Error("Expected managed parent artifacts");
+			const persistence = createManagedTaskPersistence(artifacts, "0-Rollback");
+			const child = await persistence.openSession(root.path());
+			try {
+				child.appendMessage({ role: "user", content: "real Task child transcript", timestamp: 2 });
+				await child.ensureOnDisk();
+				child.adoptArtifactManager(artifacts);
+				const snapshot = await child.captureRollbackState();
+				const replacement = new ArtifactManager(artifacts.dir);
+				child.adoptArtifactManager(replacement);
+				await expect(child.restoreRollbackState({ ...snapshot })).rejects.toThrow("not authentic");
+				expect(child.getArtifactManager()).toBe(replacement);
+				await child.restoreRollbackState(snapshot);
+				expect(child.getArtifactManager()).toBe(artifacts);
+				expect(child.getSessionFile()).toBe(path.join(artifacts.dir, "0-Rollback.jsonl"));
+				const id = await child.saveArtifact("child artifact after rollback", "task");
+				expect(await artifacts.readRange(id!)).toBe("child artifact after rollback");
+				child.appendMessage({ role: "user", content: "child persistence still works", timestamp: 3 });
+				await child.flush();
+				expect(await Bun.file(child.getSessionFile()!).text()).toContain("child persistence still works");
+			} finally {
+				await child.close();
+			}
+			artifacts.assertManagedBinding();
+			const id = await parent.saveArtifact("parent remains independently writable", "task");
+			expect(await artifacts.readRange(id!)).toBe("parent remains independently writable");
+			await persistence.publishOutput("real Task output", Buffer.from('{"status":"completed"}', "utf8"));
+			expect(await Bun.file(path.join(artifacts.dir, "0-Rollback.md.selector.json")).json()).toMatchObject({
+				outputSizeBytes: Buffer.byteLength("real Task output", "utf8"),
+			});
+		} finally {
+			await parent.close();
+		}
+	});
+
+	it("rejects a child save when its borrowed live manager is replaced after allocation", async () => {
+		using root = TempDir.createSync("gjc-task-generic-continuation-");
+		const parent = SessionManager.create(root.path(), SessionManager.managedDestination(root.path(), root.path()));
+		await parent.saveArtifact("initialize real managed store", "task");
+		const artifacts = parent.getArtifactManager();
+		if (!artifacts) throw new Error("Expected managed artifacts");
+		const child = await createManagedTaskPersistence(artifacts, "0-Continuation").openSession(root.path());
+		child.adoptArtifactManager(artifacts);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const allocate = artifacts.allocatePath.bind(artifacts);
+		let reservedId: string | undefined;
+		const allocation = vi.spyOn(artifacts, "allocatePath").mockImplementation(async toolType => {
+			const reserved = await allocate(toolType);
+			reservedId = reserved.id;
+			entered.resolve();
+			await release.promise;
+			return reserved;
+		});
+		const pending = child.saveArtifact("stale Task payload", "task");
+		try {
+			await entered.promise;
+			child.adoptArtifactManager(new ArtifactManager(path.join(root.path(), "replacement")));
+			release.resolve();
+			await expect(pending).rejects.toThrow("no longer authorized");
+			expect(reservedId).toBeDefined();
+			expect(await Bun.file(path.join(artifacts.dir, `${reservedId}.task.log`)).exists()).toBe(false);
+			allocation.mockRestore();
+			await child.close();
+			artifacts.assertManagedBinding();
+			const id = await parent.saveArtifact("parent unaffected by child rejection", "task");
+			expect(await artifacts.readRange(id!)).toBe("parent unaffected by child rejection");
+		} finally {
+			release.resolve();
+			await pending.catch(() => undefined);
+			allocation.mockRestore();
+			await child.close();
+			await parent.close();
+		}
+	});
+});
 
 describe("isolated task persistence recovery", () => {
 	afterEach(() => {

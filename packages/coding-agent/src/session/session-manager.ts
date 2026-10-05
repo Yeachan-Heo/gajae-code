@@ -131,6 +131,7 @@ import {
 	type ManagedSessionSecurityPolicy,
 	managedDirectoryRoot,
 	mayCleanManagedTreeStaging,
+	publishManagedFileNoReplaceSync,
 	retainManagedDirectoryAuthority,
 } from "./internal/managed-session-storage";
 import { classifyNativePublishOutcome, formatNativePublishDiagnostic } from "./internal/native-publish-outcome";
@@ -248,6 +249,7 @@ import {
 	replaceSessionCommitMarkerCheckedSync,
 	SESSION_RANGE_READ_MAX_BYTES,
 } from "./session-storage";
+import { DEFAULT_ARTIFACT_MAX_BYTES, truncateHeadBytes } from "./streaming-output";
 
 export const CURRENT_SESSION_VERSION = 5;
 
@@ -7303,8 +7305,8 @@ interface SessionManagerStateSnapshot {
 	flushed: boolean;
 	ensuredOnDisk: boolean;
 	needsFullRewriteOnNextPersist: boolean;
-	fileEntries: FileEntry[];
-	materializedFileEntries: FileEntry[];
+	fileEntries: readonly FileEntry[];
+	materializedFileEntries: readonly FileEntry[];
 	adoptedArtifactManager: ArtifactManager | null;
 	coldRestoreFile?: string;
 }
@@ -7611,6 +7613,19 @@ function validateEvictedToolOutputHandle(
 	return { ok: true, handle: value as EvictedToolOutputHandle };
 }
 export class SessionManager {
+	readonly #stateSnapshots = new WeakMap<SessionManagerStateSnapshot, Readonly<SessionManagerStateSnapshot>>();
+	#artifactLifecycle = Symbol("session-artifact-lifecycle");
+	#artifactLifecycleSessionId = "";
+	#artifactLifecycleSessionFile: string | undefined;
+	#artifactClosing = false;
+	#managedRollbackIdentity:
+		| Readonly<{
+				sessionId: string;
+				sessionFile: string;
+				before: Readonly<ManagedFileIdentity>;
+				after: Readonly<ManagedFileIdentity>;
+		  }>
+		| undefined;
 	#sessionId: string = "";
 	/** True once a lifecycle pre-allocated id has been adopted (consume-once). */
 	#lifecycleIdAdopted: boolean = false;
@@ -8396,10 +8411,85 @@ export class SessionManager {
 		return this.#blobStore.put(data);
 	}
 
+	#issueStateSnapshot(snapshot: SessionManagerStateSnapshot): SessionManagerStateSnapshot {
+		// The public snapshot is rollback data, not transferable authority. Keep a
+		// separate identity copy so editing a nested expectation cannot edit its issuer.
+		snapshot.managedPersistExpectedIdentity = snapshot.managedPersistExpectedIdentity
+			? { ...snapshot.managedPersistExpectedIdentity }
+			: undefined;
+		this.#stateSnapshots.set(
+			snapshot,
+			Object.freeze({
+				...snapshot,
+				fileEntries: Object.freeze(
+					snapshot.fileEntries.map(entry => (entry.type === "session" ? Object.freeze({ ...entry }) : entry)),
+				),
+				materializedFileEntries: Object.freeze(
+					snapshot.materializedFileEntries.map(entry =>
+						entry.type === "session" ? Object.freeze({ ...entry }) : entry,
+					),
+				),
+				managedPersistExpectedIdentity: snapshot.managedPersistExpectedIdentity
+					? Object.freeze({ ...snapshot.managedPersistExpectedIdentity })
+					: undefined,
+			}),
+		);
+		return snapshot;
+	}
+
+	#authenticateStateSnapshot(snapshot: SessionManagerStateSnapshot): Readonly<SessionManagerStateSnapshot> {
+		this.#assertArtifactOpen();
+		const issued = this.#stateSnapshots.get(snapshot);
+		if (
+			!issued ||
+			snapshot.sessionId !== issued.sessionId ||
+			snapshot.sessionFile !== issued.sessionFile ||
+			snapshot.sessionName !== issued.sessionName ||
+			snapshot.titleSource !== issued.titleSource ||
+			snapshot.coldRestoreFile !== issued.coldRestoreFile ||
+			snapshot.adoptedArtifactManager !== issued.adoptedArtifactManager ||
+			snapshot.flushed !== issued.flushed ||
+			snapshot.ensuredOnDisk !== issued.ensuredOnDisk ||
+			snapshot.needsFullRewriteOnNextPersist !== issued.needsFullRewriteOnNextPersist ||
+			!util.isDeepStrictEqual(snapshot.managedPersistExpectedIdentity, issued.managedPersistExpectedIdentity) ||
+			!util.isDeepStrictEqual(
+				snapshot.fileEntries.filter(entry => entry.type === "session"),
+				issued.fileEntries.filter(entry => entry.type === "session"),
+			) ||
+			!util.isDeepStrictEqual(
+				snapshot.materializedFileEntries.filter(entry => entry.type === "session"),
+				issued.materializedFileEntries.filter(entry => entry.type === "session"),
+			)
+		) {
+			throw new Error("Session rollback snapshot is not authentic.");
+		}
+		return issued;
+	}
+
+	#assertSnapshotPersistenceIdentity(
+		snapshot: Readonly<SessionManagerStateSnapshot>,
+		store?: ManagedSessionDescendantStore,
+	): ManagedFileIdentity | undefined {
+		if (!snapshot.managedPersistExpectedIdentity || !snapshot.sessionFile) return undefined;
+		const current = this.#captureManagedPersistIdentity(snapshot.sessionFile, store);
+		if (util.isDeepStrictEqual(current, snapshot.managedPersistExpectedIdentity)) return current;
+		const rollback = this.#managedRollbackIdentity;
+		if (
+			rollback &&
+			rollback.sessionId === snapshot.sessionId &&
+			rollback.sessionFile === snapshot.sessionFile &&
+			util.isDeepStrictEqual(rollback.before, snapshot.managedPersistExpectedIdentity) &&
+			util.isDeepStrictEqual(rollback.after, current)
+		)
+			return current;
+		throw new Error("Session rollback persistence identity changed.");
+	}
+
 	/** Capture rollback authority without materializing an active cold transcript. @internal */
 	async captureRollbackState(): Promise<SessionManagerStateSnapshot> {
+		this.#assertArtifactOpen();
 		if (this.#coldSidecarActive() && this.#sessionFile) {
-			return {
+			return this.#issueStateSnapshot({
 				sessionId: this.#sessionId,
 				sessionName: this.#sessionName,
 				titleSource: this.#titleSource,
@@ -8412,46 +8502,63 @@ export class SessionManager {
 				materializedFileEntries: [],
 				adoptedArtifactManager: this.#adoptedArtifactManager,
 				coldRestoreFile: this.#sessionFile,
-			};
+			});
 		}
 		return this.captureState();
 	}
 
 	/** Restore a rollback snapshot, reopening cold authority instead of hydrating it. @internal */
 	async restoreRollbackState(snapshot: SessionManagerStateSnapshot): Promise<void> {
-		if (!snapshot.coldRestoreFile) {
+		const issued = this.#authenticateStateSnapshot(snapshot);
+		if (!issued.coldRestoreFile) {
 			this.restoreState(snapshot);
 			return;
 		}
-		await this.#closePersistWriter();
-		this.#persistChain = Promise.resolve();
-		this.#persistError = undefined;
-		this.#persistErrorReported = false;
+		const lifecycle = this.#syncArtifactLifecycle();
 		const managedTransition =
 			this.destination.kind === "managed"
-				? this.#prepareManagedDestinationTransition(path.resolve(path.dirname(snapshot.coldRestoreFile)))
+				? this.#prepareManagedDestinationTransition(path.resolve(path.dirname(issued.coldRestoreFile)))
 				: undefined;
 		try {
+			this.#assertSnapshotPersistenceIdentity(issued, managedTransition?.store);
+			await this.#closePersistWriter();
+			this.#authenticateStateSnapshot(snapshot);
+			if (lifecycle !== this.#syncArtifactLifecycle()) throw new Error("Session changed before rollback commit.");
+			this.#assertSnapshotPersistenceIdentity(issued, managedTransition?.store);
 			managedTransition?.adopt();
-			await this.#initSessionFile(snapshot.coldRestoreFile);
+			await this.#initSessionFile(issued.coldRestoreFile, false, undefined, true, true);
+			this.#authenticateStateSnapshot(snapshot);
+			if (
+				this.#artifactLifecycle !== lifecycle ||
+				this.#sessionId !== issued.sessionId ||
+				this.#sessionFile !== issued.coldRestoreFile
+			)
+				throw new Error("Session changed before rollback commit.");
+			const restoredIdentity = this.#assertSnapshotPersistenceIdentity(issued);
+			this.#flushed = issued.flushed;
+			this.#ensuredOnDisk = issued.ensuredOnDisk;
+			this.#needsFullRewriteOnNextPersist = issued.needsFullRewriteOnNextPersist;
+			this.#managedPersistExpectedIdentity = restoredIdentity;
+			this.#artifactManager = null;
+			this.#artifactManagerSessionFile = null;
+			this.#adoptedArtifactManager = issued.adoptedArtifactManager;
+			this.#artifactLifecycle = Symbol("session-artifact-rollback");
 			managedTransition?.settle();
 		} catch (error) {
 			managedTransition?.rollback();
 			throw error;
+		} finally {
+			managedTransition?.dispose();
 		}
-		this.#flushed = snapshot.flushed;
-		this.#ensuredOnDisk = snapshot.ensuredOnDisk;
-		this.#needsFullRewriteOnNextPersist = snapshot.needsFullRewriteOnNextPersist;
-		this.#managedPersistExpectedIdentity = snapshot.managedPersistExpectedIdentity;
-		this.#adoptedArtifactManager = snapshot.adoptedArtifactManager;
 	}
 	captureState(): SessionManagerStateSnapshot {
+		this.#assertArtifactOpen();
 		this.#ensureFullHotView();
 		const materializedFileEntries = materializeResidentEntriesForReadSync(
 			this.#fileEntries,
 			this.#residentBlobStores(),
 		);
-		return {
+		return this.#issueStateSnapshot({
 			sessionId: this.#sessionId,
 			sessionName: this.#sessionName,
 			titleSource: this.#titleSource,
@@ -8462,52 +8569,74 @@ export class SessionManager {
 			managedPersistExpectedIdentity: this.#managedPersistExpectedIdentity,
 			// Snapshot entry objects by reference: switch/reload replaces the active entry array,
 			// so rollback does not need structured cloning of extension/custom details.
-			fileEntries: [...this.#fileEntries],
+			fileEntries: this.#fileEntries.map(entry => (entry.type === "session" ? { ...entry } : entry)),
 			// Rollback snapshots must own resident data before another session reset disposes
 			// the ephemeral store backing the resident sentinels above.
-			materializedFileEntries,
+			materializedFileEntries: materializedFileEntries.map(entry =>
+				entry.type === "session" ? { ...entry } : entry,
+			),
 			adoptedArtifactManager: this.#adoptedArtifactManager,
-		};
+		});
 	}
 
 	restoreState(snapshot: SessionManagerStateSnapshot): void {
-		const restoredFileEntries = [...snapshot.materializedFileEntries];
-		const prepared = this.#prepareResidentTextStoreTransition(
-			{
-				target: { sessionId: snapshot.sessionId, sessionFile: snapshot.sessionFile ?? "" },
-				primary: {
-					mode: "materialize",
-					sourceEntries: restoredFileEntries,
-					sourceStores: { textStore: null, imageStore: this.#residentImageBlobStore },
+		const issued = this.#authenticateStateSnapshot(snapshot);
+		if (issued.coldRestoreFile) throw new Error("Cold rollback requires restoreRollbackState.");
+		const managedTransition =
+			this.destination.kind === "managed" && issued.sessionFile
+				? this.#prepareManagedDestinationTransition(path.resolve(path.dirname(issued.sessionFile)))
+				: undefined;
+		try {
+			const restoredIdentity = this.#assertSnapshotPersistenceIdentity(issued, managedTransition?.store);
+			const restoredFileEntries = issued.materializedFileEntries.map(entry =>
+				entry.type === "session" ? { ...entry } : entry,
+			);
+			const prepared = this.#prepareResidentTextStoreTransition(
+				{
+					target: { sessionId: issued.sessionId, sessionFile: issued.sessionFile ?? "" },
+					primary: {
+						mode: "materialize",
+						sourceEntries: restoredFileEntries,
+						sourceStores: { textStore: null, imageStore: this.#residentImageBlobStore },
+					},
 				},
-			},
-			"retain-and-throw",
-		);
-		const retainsPersistWriter =
-			this.#persistWriter?.isOpen() === true &&
-			this.#sessionId === snapshot.sessionId &&
-			this.#sessionFile === snapshot.sessionFile &&
-			this.#persistWriterPath === snapshot.sessionFile;
-		this.#sessionId = snapshot.sessionId;
-		this.#sessionName = snapshot.sessionName;
-		this.#titleSource = snapshot.titleSource;
-		this.#sessionFile = snapshot.sessionFile;
-		this.#flushed = snapshot.flushed;
-		this.#ensuredOnDisk = snapshot.ensuredOnDisk;
-		this.#needsFullRewriteOnNextPersist = snapshot.needsFullRewriteOnNextPersist;
-		this.#managedPersistExpectedIdentity = snapshot.managedPersistExpectedIdentity;
-		if (!retainsPersistWriter) {
-			this.#persistWriter = undefined;
-			this.#persistWriterPath = undefined;
+				"retain-and-throw",
+			);
+			const retainsPersistWriter =
+				this.#persistWriter?.isOpen() === true &&
+				this.#sessionId === issued.sessionId &&
+				this.#sessionFile === issued.sessionFile &&
+				this.#persistWriterPath === issued.sessionFile;
+			if (!retainsPersistWriter) {
+				try {
+					this.#closePersistWriterInternalSync();
+				} catch (error) {
+					prepared.dispose();
+					throw this.#recordPersistError(error);
+				}
+			}
+			managedTransition?.adopt();
+			this.#sessionId = issued.sessionId;
+			this.#sessionName = issued.sessionName;
+			this.#titleSource = issued.titleSource;
+			this.#sessionFile = issued.sessionFile;
+			this.#flushed = issued.flushed;
+			this.#ensuredOnDisk = issued.ensuredOnDisk;
+			this.#needsFullRewriteOnNextPersist = issued.needsFullRewriteOnNextPersist;
+			this.#managedPersistExpectedIdentity = restoredIdentity;
+			this.#artifactManager = null;
+			this.#artifactManagerSessionFile = null;
+			this.#adoptedArtifactManager = issued.adoptedArtifactManager;
+			this.#artifactLifecycle = Symbol("session-artifact-rollback");
+			this.#commitResidentTextStoreTransition(prepared);
+			managedTransition?.settle();
+			if (this.#sessionFile) writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+		} catch (error) {
+			managedTransition?.rollback();
+			throw error;
+		} finally {
+			managedTransition?.dispose();
 		}
-		this.#persistChain = Promise.resolve();
-		this.#persistError = undefined;
-		this.#persistErrorReported = false;
-		this.#artifactManager = null;
-		this.#artifactManagerSessionFile = null;
-		this.#adoptedArtifactManager = snapshot.adoptedArtifactManager;
-		this.#commitResidentTextStoreTransition(prepared);
-		if (this.#sessionFile) writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 	}
 
 	#freshSessionState(options?: NewSessionOptions, sessionFileOverride?: string): FreshSessionState {
@@ -9842,8 +9971,12 @@ export class SessionManager {
 
 	/** Switch to a different session file (used for resume and branching). */
 	async setSessionFile(sessionFile: string, options?: { deferEphemeralArtifactRetirement?: boolean }): Promise<void> {
+		this.#assertArtifactOpen();
 		this.#assertRecoveryHydrationWritable();
 		const resolvedSessionFile = this.#storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
+		const lifecycle = this.#syncArtifactLifecycle();
+		const predecessorId = this.#sessionId;
+		const predecessorFile = this.#sessionFile;
 		const strictAdoption = this.#pendingStrictAdoption;
 		let managedTransition: ManagedDestinationTransition | undefined;
 		if (this.destination.kind === "managed") {
@@ -9876,31 +10009,77 @@ export class SessionManager {
 					targetSize <= BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES &&
 					this.#effectiveSessionMemoryMode(targetSize) === "enabled";
 				if (boundedTarget) {
+					const expectedIdentity =
+						this.destination.kind === "managed"
+							? this.#captureManagedPersistIdentity(resolvedSessionFile, managedTransition?.store)
+							: undefined;
+					const expectedStat = this.#storage.statSync(resolvedSessionFile);
 					const previous = await this.captureRollbackState();
 					try {
 						await this.#closePersistWriter();
+						await SessionManagerTestHooks.beforeManagedSwitchIdentity?.(resolvedSessionFile, this.#storage);
+						this.#assertArtifactOpen();
+						if (
+							lifecycle !== this.#syncArtifactLifecycle() ||
+							predecessorId !== this.#sessionId ||
+							predecessorFile !== this.#sessionFile
+						)
+							throw new Error("Session changed before adoption commit.");
+						if (!util.isDeepStrictEqual(expectedStat, this.#storage.statSync(resolvedSessionFile)))
+							throw new Error("Prepared session changed before adoption commit.");
+						if (
+							expectedIdentity &&
+							!util.isDeepStrictEqual(
+								expectedIdentity,
+								this.#captureManagedPersistIdentity(resolvedSessionFile, managedTransition?.store),
+							)
+						)
+							throw new Error("Prepared session changed before adoption commit.");
 						managedTransition?.adopt();
-						await this.#initSessionFile(resolvedSessionFile);
+						await this.#initSessionFile(resolvedSessionFile, false, undefined, true, true);
+						this.#assertArtifactOpen();
+						if (this.#artifactLifecycle !== lifecycle || this.#sessionFile !== resolvedSessionFile)
+							throw new Error("Session changed before adoption commit.");
+						if (expectedIdentity) {
+							if (
+								!util.isDeepStrictEqual(
+									expectedIdentity,
+									this.#captureManagedPersistIdentity(resolvedSessionFile),
+								)
+							)
+								throw new Error("Prepared session changed before adoption commit.");
+						} else if (!util.isDeepStrictEqual(expectedStat, this.#storage.statSync(resolvedSessionFile))) {
+							throw new Error("Prepared session changed before adoption commit.");
+						}
+						this.#artifactManager = null;
+						this.#artifactManagerSessionFile = null;
+						this.#artifactLifecycle = Symbol("session-artifact-adoption");
+						this.#persistError = undefined;
+						this.#persistErrorReported = false;
 						if (!options?.deferEphemeralArtifactRetirement) this.#retireEphemeralArtifacts();
 						managedTransition?.settle();
 						this.#pendingStrictAdoption = undefined;
 						return;
 					} catch (error) {
 						managedTransition?.rollback();
+						// A rejected attempt cannot erase the predecessor's retry evidence.
 						await this.restoreRollbackState(previous);
 						throw error;
 					}
 				}
 			}
 			let entries: FileEntry[];
+			let candidateIdentity: ResumeSessionIdentity | undefined;
 			let candidateMigrationApplied = false;
 			if (strictAdoption?.inspection && resolvedSessionFile === strictAdoption.canonicalPath) {
 				entries = strictAdoption.inspection.entries;
+				candidateIdentity = strictAdoption.identity;
 				candidateMigrationApplied = strictAdoption.inspection.migrationApplied;
 			} else if (this.#storage.existsSync(resolvedSessionFile)) {
 				const inspected = inspectResumeSessionFile(resolvedSessionFile, this.#storage);
 				if ("kind" in inspected) throw new Error(`Could not switch session: ${inspected.reason}`);
 				entries = inspected.entries;
+				candidateIdentity = inspected.identity;
 				candidateMigrationApplied = inspected.migrationApplied;
 			} else {
 				entries = await loadEntriesFromFile(resolvedSessionFile, this.#storage);
@@ -9933,45 +10112,42 @@ export class SessionManager {
 					prepared.dispose();
 					throw error;
 				}
-				if (strictAdoption) {
-					const inspected = inspectResumeSessionFile(resolvedSessionFile, this.#storage);
-					if ("kind" in inspected || !sameResumeIdentity(strictAdoption.identity, inspected.identity)) {
-						prepared.dispose();
-						throw new Error("Prepared session changed before strict adoption commit.");
+				let expectedIdentity: ManagedFileIdentity | undefined;
+				try {
+					await SessionManagerTestHooks.beforeManagedSwitchIdentity?.(resolvedSessionFile, this.#storage);
+					this.#assertArtifactOpen();
+					if (
+						lifecycle !== this.#syncArtifactLifecycle() ||
+						predecessorId !== this.#sessionId ||
+						predecessorFile !== this.#sessionFile
+					)
+						throw new Error("Session changed before adoption commit.");
+					const expected = strictAdoption?.identity ?? candidateIdentity;
+					if (expected) {
+						const inspected = inspectResumeSessionFile(resolvedSessionFile, this.#storage);
+						if ("kind" in inspected || !sameResumeIdentity(expected, inspected.identity))
+							throw new Error("Prepared session changed before adoption commit.");
 					}
+					if (this.destination.kind === "managed")
+						expectedIdentity = this.#captureManagedPersistIdentity(resolvedSessionFile, managedTransition?.store);
+					writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
+				} catch (error) {
+					prepared.dispose();
+					throw error;
 				}
-				const previous = {
-					sessionId: this.#sessionId,
-					sessionName: this.#sessionName,
-					titleSource: this.#titleSource,
-					sessionFile: this.#sessionFile,
-					needsFullRewriteOnNextPersist: this.#needsFullRewriteOnNextPersist,
-					managedPersistExpectedIdentity: this.#managedPersistExpectedIdentity,
-				};
-				this.#persistError = undefined;
-				this.#persistErrorReported = false;
+				managedTransition?.adopt();
 				this.#sessionFile = resolvedSessionFile;
 				this.#sessionId = sessionId;
 				this.#sessionName = header?.title;
 				this.#titleSource = header?.titleSource;
 				this.#needsFullRewriteOnNextPersist = migrationApplied;
-				try {
-					managedTransition?.adopt();
-					writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
-					await SessionManagerTestHooks.beforeManagedSwitchIdentity?.(resolvedSessionFile, this.#storage);
-					this.#adoptManagedPersistIdentity(resolvedSessionFile);
-					this.#commitResidentTextStoreTransition(prepared);
-				} catch (error) {
-					managedTransition?.rollback();
-					this.#sessionId = previous.sessionId;
-					this.#sessionName = previous.sessionName;
-					this.#titleSource = previous.titleSource;
-					this.#sessionFile = previous.sessionFile;
-					this.#needsFullRewriteOnNextPersist = previous.needsFullRewriteOnNextPersist;
-					this.#managedPersistExpectedIdentity = previous.managedPersistExpectedIdentity;
-					prepared.dispose();
-					throw error;
-				}
+				this.#managedPersistExpectedIdentity = expectedIdentity;
+				this.#artifactManager = null;
+				this.#artifactManagerSessionFile = null;
+				this.#artifactLifecycle = Symbol("session-artifact-adoption");
+				this.#commitResidentTextStoreTransition(prepared);
+				this.#persistError = undefined;
+				this.#persistErrorReported = false;
 				entries.length = 0;
 				if (!options?.deferEphemeralArtifactRetirement) this.#retireEphemeralArtifacts();
 				managedTransition?.settle();
@@ -9985,6 +10161,15 @@ export class SessionManager {
 			const prepared = this.#prepareFreshSessionTransition(fresh, "retain-and-throw");
 			try {
 				await this.#closePersistWriter();
+				this.#assertArtifactOpen();
+				if (
+					lifecycle !== this.#syncArtifactLifecycle() ||
+					predecessorId !== this.#sessionId ||
+					predecessorFile !== this.#sessionFile
+				)
+					throw new Error("Session changed before adoption commit.");
+				if (this.#storage.existsSync(resolvedSessionFile))
+					throw new Error("Prepared missing session changed before adoption commit.");
 			} catch (error) {
 				prepared.dispose();
 				throw error;
@@ -10466,6 +10651,14 @@ export class SessionManager {
 			transition.dispose();
 			throw error;
 		}
+		let expectedIdentity: ManagedFileIdentity | undefined;
+		try {
+			if (stage.flushed && stage.sessionFile && this.destination.kind === "managed")
+				expectedIdentity = this.#captureManagedPersistIdentity(stage.sessionFile);
+		} catch (error) {
+			transition.dispose();
+			throw error;
+		}
 		const predecessorRuntime = this.#sidecarRuntime;
 		if (predecessorRuntime) this.#clearColdRuntimeAfterHydration(predecessorRuntime);
 		this.#sidecarRuntime = undefined;
@@ -10490,8 +10683,8 @@ export class SessionManager {
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
 		this.#adoptedArtifactManager = null;
+		this.#managedPersistExpectedIdentity = expectedIdentity;
 		this.#commitResidentTextStoreTransition(transition);
-		if (stage.flushed) this.#adoptManagedPersistIdentity(stage.sessionFile);
 		this.#retireEphemeralArtifacts();
 		stage.committed = true;
 		this.#preparedNewSessions.delete(stage);
@@ -11574,6 +11767,7 @@ export class SessionManager {
 		const previousSessionDir = this.sessionDir;
 		const previousSessionFile = this.#sessionFile;
 		const previousDestination = this.destination;
+		const previousPersistIdentity = this.#managedPersistExpectedIdentity;
 
 		const nextDestination =
 			this.#storage instanceof FileSessionStorage
@@ -11895,6 +12089,7 @@ export class SessionManager {
 				throw error;
 			}
 		}
+		this.#artifactLifecycle = Symbol("session-artifact-move");
 		this.#cwdGeneration += 1;
 		const readLease = cwdReadLeaseAls.getStore();
 		if (readLease?.owner === this.#cwdReadLeaseOwner) {
@@ -11957,6 +12152,14 @@ export class SessionManager {
 				// transcript actually existed (and was thus restorable) before the failed move.
 				if (hadSessionFile) this.#adoptManagedPersistIdentity(previousSessionFile);
 				else this.#managedPersistExpectedIdentity = undefined;
+				if (previousSessionFile && previousPersistIdentity && this.#managedPersistExpectedIdentity) {
+					this.#managedRollbackIdentity = Object.freeze({
+						sessionId: this.#sessionId,
+						sessionFile: previousSessionFile,
+						before: Object.freeze({ ...previousPersistIdentity }),
+						after: Object.freeze({ ...this.#managedPersistExpectedIdentity }),
+					});
+				}
 				const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 				if (header) applyHeaderPatch(header, { cwd: previousCwd });
 				this.#headerExportRevision++;
@@ -15803,8 +16006,11 @@ export class SessionManager {
 	}
 
 	/** Capture one descriptor-bound digest for a future metadata-drift comparison. */
-	#captureManagedPersistIdentity(sessionFile: string): ManagedFileIdentity {
-		const store = this.#managedTranscriptStore(sessionFile);
+	#captureManagedPersistIdentity(
+		sessionFile: string,
+		candidateStore?: ManagedSessionDescendantStore,
+	): ManagedFileIdentity {
+		const store = candidateStore ?? this.#managedTranscriptStore(sessionFile);
 		const relativePath = path.basename(sessionFile);
 		const bounded = store.captureBoundedAppendExpectation(relativePath);
 		const descriptor = store.descriptorExpected(relativePath);
@@ -16465,6 +16671,7 @@ export class SessionManager {
 
 	/** Close the persistent writer after flushing all pending data. */
 	async close(): Promise<void> {
+		this.#beginArtifactClose();
 		await this.closeCwdMoveAdmission();
 		await this.joinCwdTransition();
 		await this.joinCwdReaders();
@@ -16532,6 +16739,7 @@ export class SessionManager {
 	 * writer closure before any destructive operation.
 	 */
 	async closeStrict(): Promise<SessionManagerCloseOutcome> {
+		this.#beginArtifactClose();
 		this.#strictClosePending = true;
 		await this.closeCwdMoveAdmission();
 		await this.joinCwdTransition();
@@ -17171,27 +17379,72 @@ export class SessionManager {
 	 * the parent session's artifact directory and ID counter.
 	 */
 	adoptArtifactManager(manager: ArtifactManager, parent?: ArtifactManager): void {
+		this.#assertArtifactOpen();
+		if (this.#adoptedArtifactManager !== manager) this.#artifactLifecycle = Symbol("artifact-adoption");
 		this.#adoptedArtifactManager = manager;
 		if (parent) this.#stagedArtifactParent = parent;
 	}
 
 	/** Release only the matching externally adopted manager. */
 	releaseArtifactManager(manager: ArtifactManager): void {
-		if (this.#adoptedArtifactManager === manager) this.#adoptedArtifactManager = null;
+		if (this.#adoptedArtifactManager === manager) {
+			this.#adoptedArtifactManager = null;
+			this.#artifactLifecycle = Symbol("artifact-release");
+		}
 	}
 
 	/** Temporarily release adopted authority while an outer transition validates its successor. */
 	stageAdoptedArtifactManagerForTransition(): void {
-		this.#adoptedArtifactManager = null;
+		if (this.#adoptedArtifactManager) this.releaseArtifactManager(this.#adoptedArtifactManager);
 	}
 
 	/** Prove manager authority by exact object identity, never by pathname shape. */
 	isArtifactManagerAuthorized(manager: ArtifactManager): boolean {
-		return (
-			manager === this.#adoptedArtifactManager ||
-			manager === this.#artifactManager ||
-			manager === this.#ephemeralArtifactManager
-		);
+		if (this.#artifactClosing || this.#strictClosePending) return false;
+		if (this.#adoptedArtifactManager) return manager === this.#adoptedArtifactManager;
+		if (this.#sessionFile)
+			return manager === this.#artifactManager && this.#artifactManagerSessionFile === this.#sessionFile;
+		return manager === this.#ephemeralArtifactManager;
+	}
+
+	#syncArtifactLifecycle(): symbol {
+		if (
+			this.#artifactLifecycleSessionId !== this.#sessionId ||
+			this.#artifactLifecycleSessionFile !== this.#sessionFile
+		) {
+			this.#artifactLifecycleSessionId = this.#sessionId;
+			this.#artifactLifecycleSessionFile = this.#sessionFile;
+			this.#artifactLifecycle = Symbol("session-artifact-transition");
+		}
+		return this.#artifactLifecycle;
+	}
+
+	#assertArtifactOpen(): void {
+		if (this.#artifactClosing || this.#strictClosePending) throw new Error("Session manager is closing.");
+	}
+
+	#beginArtifactClose(): void {
+		if (!this.#artifactClosing) {
+			this.#artifactClosing = true;
+			this.#artifactLifecycle = Symbol("session-artifact-close");
+		}
+	}
+
+	#assertArtifactContinuation(
+		token: symbol,
+		sessionId: string,
+		sessionFile: string | undefined,
+		manager: ArtifactManager,
+	): void {
+		this.#assertArtifactOpen();
+		if (
+			token !== this.#syncArtifactLifecycle() ||
+			sessionId !== this.#sessionId ||
+			sessionFile !== this.#sessionFile ||
+			!this.isArtifactManagerAuthorized(manager)
+		)
+			throw new Error("Session artifact continuation is no longer authorized.");
+		manager.assertManagedBinding();
 	}
 
 	/**
@@ -17208,7 +17461,13 @@ export class SessionManager {
 
 	/** Linearizably establish this session's persistent or ephemeral artifact manager. */
 	async ensureArtifactManager(): Promise<ArtifactManager | null> {
-		return this.#getOrCreateArtifactManager() ?? (await this.#ensureEphemeralArtifactManager());
+		this.#assertArtifactOpen();
+		const token = this.#syncArtifactLifecycle();
+		const sessionId = this.#sessionId;
+		const sessionFile = this.#sessionFile;
+		const manager = this.#getOrCreateArtifactManager() ?? (await this.#ensureEphemeralArtifactManager());
+		if (manager) this.#assertArtifactContinuation(token, sessionId, sessionFile, manager);
+		return manager;
 	}
 
 	/**
@@ -17216,6 +17475,8 @@ export class SessionManager {
 	 * Recreates the manager when the active session file changes.
 	 */
 	#getOrCreateArtifactManager(): ArtifactManager | null {
+		this.#assertArtifactOpen();
+		this.#syncArtifactLifecycle();
 		if (this.#adoptedArtifactManager) return this.#adoptedArtifactManager;
 		const sessionFile = this.#sessionFile;
 		if (!sessionFile) {
@@ -17246,7 +17507,14 @@ export class SessionManager {
 	async allocateArtifactPath(toolType: string): Promise<{ id?: string; path?: string }> {
 		const manager = this.#getOrCreateArtifactManager();
 		if (!manager) return {};
-		return manager.allocatePath(toolType);
+		const token = this.#syncArtifactLifecycle();
+		const sessionId = this.#sessionId;
+		const sessionFile = this.#sessionFile;
+		const allocation = await manager.allocatePath(toolType);
+		// A reservation is not a grant to a caller whose session changed during
+		// initialization. No writable pathname escapes before the final fence.
+		this.#assertArtifactContinuation(token, sessionId, sessionFile, manager);
+		return allocation;
 	}
 
 	/**
@@ -17256,8 +17524,27 @@ export class SessionManager {
 	 * read back from the filesystem instead of being retained in memory.
 	 */
 	async saveArtifact(content: string, toolType: string): Promise<string | undefined> {
+		this.#assertArtifactOpen();
+		const token = this.#syncArtifactLifecycle();
+		const sessionId = this.#sessionId;
+		const sessionFile = this.#sessionFile;
 		const manager = this.#getOrCreateArtifactManager() ?? (await this.#ensureEphemeralArtifactManager());
-		return manager ? manager.save(content, toolType) : undefined;
+		if (!manager) return undefined;
+		this.#assertArtifactContinuation(token, sessionId, sessionFile, manager);
+		const { id } = await manager.allocatePath(toolType);
+		this.#assertArtifactContinuation(token, sessionId, sessionFile, manager);
+		const contentBytes = Buffer.byteLength(content, "utf-8");
+		const truncated =
+			contentBytes > DEFAULT_ARTIFACT_MAX_BYTES ? truncateHeadBytes(content, DEFAULT_ARTIFACT_MAX_BYTES) : undefined;
+		const published = truncated
+			? `${truncated.text}\n[artifact truncated after ${truncated.bytes} bytes; omitted at least ${contentBytes - truncated.bytes} bytes]\n`
+			: content;
+		if (!/^[a-zA-Z0-9_-]+$/.test(toolType)) throw new Error("Unsafe artifact tool type");
+		const filename = `${id}.${toolType}.log`;
+		const store = manager.getManagedStore();
+		if (store) store.publishNoReplaceSync(filename, Buffer.from(published, "utf8"));
+		else publishManagedFileNoReplaceSync(path.join(manager.dir, filename), Buffer.from(published, "utf8"));
+		return id;
 	}
 
 	async #validatedEvictedToolOutputHandle(

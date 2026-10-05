@@ -2,7 +2,9 @@ import { describe, expect, it, vi } from "bun:test";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { ArtifactManager } from "@gajae-code/coding-agent/session/artifacts";
+import { SessionManager, SessionManagerTestHooks } from "@gajae-code/coding-agent/session/session-manager";
+import { FileSessionStorage } from "@gajae-code/coding-agent/session/session-storage";
 import * as native from "@gajae-code/natives";
 import { TempDir } from "@gajae-code/utils";
 import {
@@ -500,6 +502,196 @@ describe("SessionManager session ids", () => {
 
 		expect(session.getSessionId()).toBe(existingId);
 		expect(session.getHeader()?.id).toBe(existingId);
+	});
+});
+
+describe("authenticated generic rollback", () => {
+	it.each([
+		"clone",
+		"id",
+		"file",
+		"managed-identity",
+		"adopted-manager",
+		"header",
+		"cold-file",
+	] as const)("rejects %s snapshot substitution without changing the active session", async alteration => {
+		using root = TempDir.createSync("gjc-rollback-auth-");
+		const session = SessionManager.create(root.path(), SessionManager.managedDestination(root.path(), root.path()));
+		const borrowed = new ArtifactManager(path.join(root.path(), "borrowed"));
+		try {
+			session.appendMessage({ role: "user", content: "predecessor", timestamp: 1 });
+			await session.ensureOnDisk();
+			session.adoptArtifactManager(borrowed);
+			let snapshot = await session.captureRollbackState();
+			await session.newSession();
+			session.appendMessage({ role: "user", content: "successor", timestamp: 2 });
+			await session.ensureOnDisk();
+			const activeId = session.getSessionId();
+			const activeFile = session.getSessionFile();
+			if (!activeFile) throw new Error("Expected active transcript");
+			const activeBytes = await Bun.file(activeFile).text();
+			const activeManager = session.getArtifactManager();
+			if (alteration === "clone") snapshot = { ...snapshot };
+			else if (alteration === "id") snapshot.sessionId = activeId;
+			else if (alteration === "file") snapshot.sessionFile = activeFile;
+			else if (alteration === "managed-identity") {
+				if (!snapshot.managedPersistExpectedIdentity) throw new Error("Expected managed identity");
+				snapshot.managedPersistExpectedIdentity.ino += 1n;
+			} else if (alteration === "adopted-manager") {
+				snapshot.adoptedArtifactManager = new ArtifactManager(borrowed.dir);
+			} else if (alteration === "cold-file") snapshot.coldRestoreFile = activeFile;
+			else {
+				const header = snapshot.materializedFileEntries.find(entry => entry.type === "session");
+				if (!header) throw new Error("Expected rollback header");
+				header.id = activeId;
+			}
+			expect(() => session.restoreState(snapshot)).toThrow("not authentic");
+			await expect(session.restoreRollbackState(snapshot)).rejects.toThrow("not authentic");
+			expect(session.getSessionId()).toBe(activeId);
+			expect(session.getSessionFile()).toBe(activeFile);
+			expect(session.getArtifactManager()).toBe(activeManager);
+			expect(await Bun.file(activeFile).text()).toBe(activeBytes);
+			expect(session.buildSessionContext().messages).toEqual([{ role: "user", content: "successor", timestamp: 2 }]);
+		} finally {
+			await session.close();
+		}
+	});
+
+	it("restores genuine managed identity and caller-owned artifact authority across directory adoption", async () => {
+		using root = TempDir.createSync("gjc-rollback-genuine-");
+		const cwdA = path.join(root.path(), "a");
+		const cwdB = path.join(root.path(), "b");
+		await fs.mkdir(cwdA);
+		await fs.mkdir(cwdB);
+		const session = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, root.path()));
+		const target = SessionManager.create(cwdB, SessionManager.managedDestination(cwdB, root.path()));
+		const borrowed = new ArtifactManager(path.join(root.path(), "borrowed"));
+		try {
+			session.appendMessage({ role: "user", content: "rollback data", timestamp: 1 });
+			await session.ensureOnDisk();
+			session.adoptArtifactManager(borrowed);
+			const snapshot = await session.captureRollbackState();
+			target.appendMessage({ role: "user", content: "target data", timestamp: 2 });
+			await target.ensureOnDisk();
+			const targetFile = target.getSessionFile();
+			if (!targetFile) throw new Error("Expected target transcript");
+			await target.close();
+			session.stageAdoptedArtifactManagerForTransition();
+			await session.setSessionFile(targetFile);
+			await session.restoreRollbackState(snapshot);
+			expect(session.getSessionId()).toBe(snapshot.sessionId);
+			expect(session.getSessionFile()).toBe(snapshot.sessionFile);
+			expect(session.getArtifactManager()).toBe(borrowed);
+			expect(session.isArtifactManagerAuthorized(borrowed)).toBe(true);
+			const restoredIdentity = session.captureState().managedPersistExpectedIdentity;
+			expect(restoredIdentity).toEqual(snapshot.managedPersistExpectedIdentity);
+			expect(restoredIdentity).not.toBe(snapshot.managedPersistExpectedIdentity);
+			session.appendMessage({ role: "user", content: "after rollback", timestamp: 3 });
+			await session.flush();
+			expect(await Bun.file(snapshot.sessionFile!).text()).toContain("after rollback");
+			await session.close();
+			const id = await borrowed.save("still caller-owned", "test");
+			expect(await borrowed.readRange(id)).toBe("still caller-owned");
+		} finally {
+			await session.close();
+			await target.close();
+		}
+	});
+
+	it("authenticates real cold rollback snapshots and restores them after bounded adoption", async () => {
+		using root = TempDir.createSync("gjc-cold-generic-rollback-");
+		const destination = SessionManager.managedDestination(root.path(), root.path());
+		const source = SessionManager.create(root.path(), destination);
+		const target = SessionManager.create(root.path(), destination);
+		let reopened: SessionManager | undefined;
+		try {
+			await source.ensureOnDisk();
+			const oldId = source.appendCustomEntry("node", { payload: "old rollback entry" });
+			const keptId = source.appendCustomEntry("node", { payload: "kept rollback entry" });
+			source.appendCompaction("rollback summary", undefined, keptId, 1);
+			await source.flush();
+			const sourceFile = source.getSessionFile();
+			if (!sourceFile) throw new Error("Expected cold predecessor transcript");
+			await source.close();
+			target.appendMessage({ role: "user", content: "bounded successor", timestamp: 1 });
+			await target.ensureOnDisk();
+			const targetFile = target.getSessionFile();
+			if (!targetFile) throw new Error("Expected successor transcript");
+			await target.close();
+			SessionManagerTestHooks.eagerHydrationMaxBytesOverride = 1;
+			reopened = await SessionManager.open(
+				sourceFile,
+				destination,
+				new FileSessionStorage(),
+				"copy-retain",
+				"enabled",
+			);
+			expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(true);
+			const snapshot = await reopened.captureRollbackState();
+			expect(snapshot.coldRestoreFile).toBe(sourceFile);
+			await reopened.setSessionFile(targetFile);
+			const activeId = reopened.getSessionId();
+			await expect(reopened.restoreRollbackState({ ...snapshot })).rejects.toThrow("not authentic");
+			snapshot.coldRestoreFile = targetFile;
+			await expect(reopened.restoreRollbackState(snapshot)).rejects.toThrow("not authentic");
+			expect(reopened.getSessionId()).toBe(activeId);
+			expect(reopened.getSessionFile()).toBe(targetFile);
+			snapshot.coldRestoreFile = sourceFile;
+			await reopened.restoreRollbackState(snapshot);
+			expect(reopened.getSessionId()).toBe(snapshot.sessionId);
+			expect(reopened.getSessionFile()).toBe(sourceFile);
+			expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(true);
+			expect(reopened.getEntry(oldId)).toMatchObject({ id: oldId, data: { payload: "old rollback entry" } });
+		} finally {
+			SessionManagerTestHooks.eagerHydrationMaxBytesOverride = undefined;
+			await reopened?.close();
+			await source.close();
+			await target.close();
+		}
+	});
+
+	it("keeps a real storage EIO through rejected adoption and rollback, then accepts a stabilized retry", async () => {
+		using root = TempDir.createSync("gjc-adoption-eio-");
+		const storage = new FileSessionStorage();
+		const session = SessionManager.create(root.path(), root.path(), storage);
+		const target = SessionManager.create(root.path(), root.path());
+		const eio = Object.assign(new Error("EIO: transcript replacement failed"), { code: "EIO" });
+		const rename = vi.spyOn(storage, "renameSync").mockImplementationOnce(() => {
+			throw eio;
+		});
+		try {
+			session.appendMessage({ role: "user", content: "pending predecessor", timestamp: 1 });
+			const snapshot = session.captureState();
+			await expect(session.ensureOnDisk()).rejects.toBe(eio);
+			rename.mockRestore();
+			target.appendMessage({ role: "user", content: "accepted target", timestamp: 2 });
+			await target.ensureOnDisk();
+			const targetFile = target.getSessionFile();
+			if (!targetFile) throw new Error("Expected target transcript");
+			await target.close();
+			const stable = await Bun.file(targetFile).text();
+			SessionManagerTestHooks.beforeManagedSwitchIdentity = async file => {
+				await Bun.write(file, stable.replace(target.getSessionId(), "replacement-session"));
+			};
+			await expect(session.setSessionFile(targetFile)).rejects.toThrow("changed before adoption commit");
+			expect(session.getSessionId()).toBe(snapshot.sessionId);
+			await expect(session.flush()).rejects.toBe(eio);
+			session.restoreState(snapshot);
+			await expect(session.flush()).rejects.toBe(eio);
+			SessionManagerTestHooks.beforeManagedSwitchIdentity = undefined;
+			await Bun.write(targetFile, stable);
+			await session.setSessionFile(targetFile);
+			await session.flush();
+			expect(session.getSessionId()).toBe(target.getSessionId());
+			session.appendMessage({ role: "user", content: "stabilized retry persisted", timestamp: 3 });
+			await session.flush();
+			expect(await Bun.file(targetFile).text()).toContain("stabilized retry persisted");
+		} finally {
+			SessionManagerTestHooks.beforeManagedSwitchIdentity = undefined;
+			rename.mockRestore();
+			await session.closeStrict();
+			await target.closeStrict();
+		}
 	});
 });
 
