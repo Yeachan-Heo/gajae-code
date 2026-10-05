@@ -12,4 +12,5 @@
 - Validate staged images and their SDK envelope before publishing any user echo; renew the local watchdog only for this request's validated staging progress.
 - Authenticate existing managed scope bindings and retained filesystem identities before cold cleanup recovery; never initialize or repair missing storage as a recovery shortcut.
 - Re-certify a stale cleanup-completion digest only after independently verified completion through an exact descriptor-backed replacement; refuse destination swaps and replacement failures without replaying transcript deletion.
-- Omit explicitly cleared optional owner fields from SDK cleanup replay decoding, matching their persisted JSON shape while retaining strict validation of present owner evidence and refusing replaced scope authority.
+- Omit explicitly cleared optional owner fields from SDK cleanup replay decoding, matching their persisted JSON shape while retaining strict validation of present owner evidence and refusing replaced scope.
+- Refuse task-owner capability publication when the existing transcript cannot durably accept its locator; retain uncertainty and close the unreturned owner without recreating a removed transcript.
