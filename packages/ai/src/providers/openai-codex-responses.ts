@@ -489,6 +489,7 @@ interface CodexStreamRuntime {
 	partialToolCallReplayAttempted: boolean;
 	bufferedEvents: AssistantMessageEvent[];
 	eventsReleased: boolean;
+	incompleteToolCallRetryAttempted: boolean;
 	toolChoiceFallbackAttempted: boolean;
 	/**
 	 * Stale-anchor recovery is one-shot. Once the anchor is cleared the replay no
@@ -1258,6 +1259,7 @@ function createCodexStreamRuntime(initial: {
 		partialToolCallReplayAttempted: false,
 		bufferedEvents: [],
 		eventsReleased: false,
+		incompleteToolCallRetryAttempted: false,
 		toolChoiceFallbackAttempted: initial.toolChoiceFallbackApplied === true,
 		previousResponseRecoveryAttempted: false,
 		sentPreviousResponseId: initial.sentPreviousResponseId === true,
@@ -2349,10 +2351,49 @@ async function recoverCodexStreamError(
 	if (await tryReplayWebsocketFailureOverSse(context, runtime, error)) {
 		return true;
 	}
+	if (isCodexIncompleteToolCallTimeoutRetryable(context, runtime, error)) {
+		runtime.incompleteToolCallRetryAttempted = true;
+		const retried = await tryRetryCodexProviderError(context, runtime, error, true);
+		if (retried) return true;
+	}
 	if (await tryRetryCodexProviderError(context, runtime, error)) {
 		return true;
 	}
 	return false;
+}
+
+function isCodexIncompleteToolCallTimeoutRetryable(
+	context: CodexStreamProcessingContext,
+	runtime: CodexStreamRuntime,
+	error: unknown,
+): boolean {
+	if (
+		runtime.incompleteToolCallRetryAttempted ||
+		runtime.partialToolCallReplayAttempted ||
+		runtime.eventsReleased ||
+		!isCodexTransientStreamClose(error)
+	) {
+		return false;
+	}
+	const providerCode =
+		error instanceof CodexProviderStreamError
+			? error.code?.toLowerCase()
+			: (error as { providerCode?: string }).providerCode?.toLowerCase();
+	if (providerCode !== "request_timeout") return false;
+	const toolCalls = context.output.content.filter((block): block is ToolCall => block.type === "toolCall");
+	return (
+		toolCalls.length > 0 &&
+		runtime.finalizedToolCallIds.size === 0 &&
+		!runtime.toolArgumentCorrelationFailed &&
+		context.output.content.every(
+			block =>
+				block.type === "thinking" ||
+				(block.type === "toolCall" &&
+					!runtime.finalizedToolCallIds.has(block.id) &&
+					(block as ToolCall & { argumentsComplete?: boolean }).argumentsComplete !== true) ||
+				(block.type === "text" && block.text === ""),
+		)
+	);
 }
 
 async function tryRetryWithoutForcedToolChoice(
@@ -2634,6 +2675,7 @@ async function tryRetryCodexProviderError(
 	context: CodexStreamProcessingContext,
 	runtime: CodexStreamRuntime,
 	error: unknown,
+	allowIncompleteToolCallOutput = false,
 ): Promise<boolean> {
 	const hasUnfinalizedToolCall = context.output.content.some(
 		block => block.type === "toolCall" && !runtime.finalizedToolCallIds.has(block.id),
@@ -2644,9 +2686,12 @@ async function tryRetryCodexProviderError(
 		hasUnfinalizedToolCall &&
 		!runtime.partialToolCallReplayAttempted &&
 		isCodexPartialOutputReplayEligible(context.output, runtime);
+	const canRetryWithOutput =
+		canReplayPartialToolCall ||
+		(allowIncompleteToolCallOutput && !runtime.partialToolCallReplayAttempted && !runtime.eventsReleased);
 	if (
-		(!isRetryableCodexProviderError(error) && !canReplayPartialToolCall) ||
-		(context.output.content.length > 0 && !canReplayPartialToolCall) ||
+		(!isRetryableCodexProviderError(error) && !canRetryWithOutput) ||
+		(context.output.content.length > 0 && !canRetryWithOutput) ||
 		runtime.providerRetryAttempt >= resolveRetryBudget(context.options?.streamMaxRetries, CODEX_MAX_RETRIES) ||
 		context.options?.signal?.aborted ||
 		context.options?.fallbackManaged ||
@@ -2656,7 +2701,7 @@ async function tryRetryCodexProviderError(
 	}
 
 	runtime.providerRetryAttempt += 1;
-	if (context.output.content.length > 0 && canReplayPartialToolCall) runtime.partialToolCallReplayAttempted = true;
+	if (context.output.content.length > 0 && canRetryWithOutput) runtime.partialToolCallReplayAttempted = true;
 	const websocketState = context.requestContext.websocketState;
 	if (runtime.transport === "websocket" && websocketState) {
 		resetCodexWebSocketAppendState(websocketState);
@@ -2677,7 +2722,7 @@ async function tryRetryCodexProviderError(
 	runtime.nativeOutputItemOutputIndexes.length = 0;
 	runtime.finalizedToolCallIds.clear();
 	runtime.toolArgumentCorrelationFailed = false;
-	if (canReplayPartialToolCall) discardCodexEvents(runtime, true);
+	if (canRetryWithOutput) discardCodexEvents(runtime, true);
 	resetOutputState(context.output);
 	context.firstTokenTime = undefined;
 	await scheduler.wait(CODEX_RETRY_DELAY_MS * runtime.providerRetryAttempt, {

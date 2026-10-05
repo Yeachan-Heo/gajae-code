@@ -770,7 +770,9 @@
         if (offset !== undefined || limit !== undefined) {
           const start = offset == null ? 1 : offset;
           const end = limit !== undefined ? start + limit - 1 : '';
-          html += '<span class="line-numbers">:' + start + (end ? '-' + end : '') + '</span>';
+          const startText = escapeHtml(String(start));
+          const endText = end ? `-${escapeHtml(String(end))}` : "";
+          html += `<span class="line-numbers">:${startText}${endText}</span>`;
         }
         return html;
       }
@@ -994,7 +996,7 @@
         } else if (args.file === '*') {
           head += ' <span class="tool-badge">workspace</span>';
         }
-        if (args.line) head += '<span class="line-numbers">:' + args.line + '</span>';
+        if (args.line) head += `<span class="line-numbers">:${escapeHtml(String(args.line))}</span>`;
         if (args.symbol) head += ' <span class="tool-arg-val">' + escapeHtml(String(args.symbol)) + '</span>';
         if (args.query) head += ' <span class="tool-arg-key">query=</span><span class="tool-arg-val">' + escapeHtml(String(args.query)) + '</span>';
         if (args.new_name) head += ' <span class="tool-arg-key">→</span> <span class="tool-arg-val">' + escapeHtml(String(args.new_name)) + '</span>';
@@ -1041,9 +1043,12 @@
             html += '<div class="todo-phase">' + escapeHtml(phaseLabel) + '</div>';
             if (Array.isArray(phase.tasks)) {
               for (const task of phase.tasks) {
-                const status = task.status || 'pending';
+                const rawStatus = String(task.status || 'pending');
+                const status = rawStatus === 'completed' || rawStatus === 'in_progress' || rawStatus === 'abandoned' || rawStatus === 'pending'
+                  ? rawStatus
+                  : 'pending';
                 const icon = status === 'completed' ? '✓' : status === 'in_progress' ? '→' : status === 'abandoned' ? '✕' : '○';
-                html += '<div class="todo-task todo-' + status + '"><span class="todo-icon">' + icon + '</span> ' + escapeHtml(String(task.content || '')) + '</div>';
+                html += `<div class="todo-task todo-${status}"><span class="todo-icon">${icon}</span> ${escapeHtml(String(task.content || ''))}</div>`;
               }
             }
           }

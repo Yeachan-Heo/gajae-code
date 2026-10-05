@@ -3998,7 +3998,8 @@ describe("SDK broker identity and discovery", () => {
 			const transcriptParent = path.dirname(sessionPath);
 			const renamedTranscriptParent = `${transcriptParent}.renamed`;
 			await fs.rename(transcriptParent, renamedTranscriptParent);
-			await fs.mkdir(transcriptParent);
+			// The replacement must still pass managed-scope security (#6339) so replay reaches receipt validation.
+			await fs.mkdir(transcriptParent, { mode: 0o700 });
 			const replacedParentReplay = await broker.handleRequest(
 				"session.delete",
 				{ sessionId, sessionPath, cwd },
