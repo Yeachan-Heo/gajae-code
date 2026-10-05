@@ -1028,20 +1028,24 @@ function gitAt(dir: string, args: readonly string[]) {
  * release backmerge exception to the exact-head review rule, and this path is refused rather
  * than retried when the credential lacks the bypass.
  */
-export async function backmergeReleaseIntoDev(version: string): Promise<BackmergeOutcome> {
+export async function backmergeReleaseIntoDev(
+	version: string,
+	options: { repoDir?: string } = {},
+): Promise<BackmergeOutcome> {
+	const repoDir = options.repoDir ?? process.cwd();
 	const worktrees: string[] = [];
 	try {
 		for (let attempt = 1; attempt <= BACKMERGE_PUSH_ATTEMPTS; attempt += 1) {
 			// Explicit destinations: in a `--single-branch main` checkout, or any checkout whose
 			// `remote.origin.fetch` does not map `dev`, a source-only refspec fetches the objects
 			// without updating `origin/dev`, leaving it absent or stale for every command below.
-			await git(["fetch", "origin", "+refs/heads/main:refs/remotes/origin/main", "+refs/heads/dev:refs/remotes/origin/dev"]).quiet();
-			const contained = await git(["merge-base", "--is-ancestor", "origin/main", "origin/dev"]).quiet().nothrow();
+			await gitAt(repoDir, ["fetch", "origin", "+refs/heads/main:refs/remotes/origin/main", "+refs/heads/dev:refs/remotes/origin/dev"]).quiet();
+			const contained = await gitAt(repoDir, ["merge-base", "--is-ancestor", "origin/main", "origin/dev"]).quiet().nothrow();
 			if (contained.exitCode === 0) return { action: "skipped", detail: "dev already contains origin/main" };
 
 			const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-backmerge-"));
 			worktrees.push(dir);
-			await git(["worktree", "add", "--detach", dir, "origin/dev"]).quiet();
+			await gitAt(repoDir, ["worktree", "add", "--detach", dir, "origin/dev"]).quiet();
 
 			const merge = await gitAt(dir, ["merge", "--no-commit", "--no-ff", "origin/main"]).quiet().nothrow();
 			if (merge.exitCode !== 0) {
@@ -1081,9 +1085,9 @@ export async function backmergeReleaseIntoDev(version: string): Promise<Backmerg
 		return { action: "blocked", detail: `unexpected error: ${detail}` };
 	} finally {
 		for (const dir of worktrees) {
-			await git(["worktree", "remove", "--force", dir]).quiet().nothrow();
+			await gitAt(repoDir, ["worktree", "remove", "--force", dir]).quiet().nothrow();
 		}
-		await git(["worktree", "prune"]).quiet().nothrow();
+		await gitAt(repoDir, ["worktree", "prune"]).quiet().nothrow();
 	}
 }
 
