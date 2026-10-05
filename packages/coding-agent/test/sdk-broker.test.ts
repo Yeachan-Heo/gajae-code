@@ -3386,7 +3386,8 @@ describe("SDK broker identity and discovery", () => {
 		await broker.start();
 		const transitionSpy = vi.spyOn(broker.ledger, "transition").mockImplementation(async (...args) => {
 			const result = await transition(...args);
-			if (!canonicalInjected && JSON.stringify(args[2]?.response).includes("artifacts were removed")) {
+			// #6339 reworded the durable artifact-completion response to "artifacts are removed".
+			if (!canonicalInjected && JSON.stringify(args[2]?.response).includes("artifacts are removed")) {
 				canonicalInjected = true;
 				await fs.mkdir(artifactsDir);
 				await fs.writeFile(path.join(artifactsDir, ".reappeared"), "reappeared");
@@ -3980,7 +3981,8 @@ describe("SDK broker identity and discovery", () => {
 			const transcriptParent = path.dirname(sessionPath);
 			const renamedTranscriptParent = `${transcriptParent}.renamed`;
 			await fs.rename(transcriptParent, renamedTranscriptParent);
-			await fs.mkdir(transcriptParent);
+			// The replacement must still pass managed-scope security (#6339) so replay reaches receipt validation.
+			await fs.mkdir(transcriptParent, { mode: 0o700 });
 			const replacedParentReplay = await broker.handleRequest(
 				"session.delete",
 				{ sessionId, sessionPath, cwd },

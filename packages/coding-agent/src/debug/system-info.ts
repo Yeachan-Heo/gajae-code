@@ -99,7 +99,19 @@ export function formatSystemInfo(info: SystemInfo): string {
 
 /** Sanitize environment variables by redacting sensitive values */
 export function sanitizeEnv(env: Record<string, string | undefined>): Record<string, string> {
-	const SENSITIVE_PATTERNS = [/key/i, /secret/i, /token/i, /pass/i, /auth/i, /credential/i, /api/i, /private/i];
+	const SENSITIVE_PATTERNS = [
+		/key/i,
+		/secret/i,
+		/token/i,
+		/pass/i,
+		/auth/i,
+		/credential/i,
+		/api/i,
+		/private/i,
+		/cookie/i,
+		/dsn/i,
+		/url$/i,
+	];
 
 	const result: Record<string, string> = {};
 	for (const [k, v] of Object.entries(env)) {
