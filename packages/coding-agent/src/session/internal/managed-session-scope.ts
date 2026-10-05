@@ -5100,7 +5100,6 @@ async function publishCleanupCompleted(
 		lock.assertOwned();
 		if (await cleanupCompleted(scope, tombstone, target)) return;
 		const trusted = managedGcTrustedScope(scope);
-		const store = managedGcScopeStore(scope, trusted);
 		const stale = captureManagedFileNoFollow(completedPath);
 		const value: unknown = JSON.parse(stale.bytes.toString("utf8"));
 		if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("durability_failed");
@@ -5120,14 +5119,19 @@ async function publishCleanupCompleted(
 			target: { ...targetRecord, identity: { ...identityRecord, sha256: target.identity.sha256 } },
 		};
 		if (!deepSame(recertified, JSON.parse(serialized))) throw new Error("durability_failed");
-		lock.assertOwned();
-		store.replaceExpected(
-			path.relative(scope.directoryPath, completedPath),
-			new TextEncoder().encode(serialized),
-			stale,
-		);
-		lock.assertOwned();
-		assertRetainedManagedDirectoryIdentity(scope);
+		const store = managedGcScopeStore(scope, trusted);
+		try {
+			lock.assertOwned();
+			store.replaceExpected(
+				path.relative(scope.directoryPath, completedPath),
+				new TextEncoder().encode(serialized),
+				stale,
+			);
+			lock.assertOwned();
+			assertRetainedManagedDirectoryIdentity(scope);
+		} finally {
+			store.close();
+		}
 	}
 	if (!(await cleanupCompleted(scope, tombstone, target))) throw new Error("durability_failed");
 }
