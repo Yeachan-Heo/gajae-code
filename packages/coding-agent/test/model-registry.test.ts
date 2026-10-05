@@ -7975,6 +7975,123 @@ describe("ModelRegistry", () => {
 			expect(requestKeys).toEqual(["Bearer credential-a", "Bearer credential-b"]);
 			expect(registry.find("discovery-provider", "discovered-model-2")).toBeDefined();
 		});
+		test("keeps config and fallback auth local across registries sharing one AuthStorage", async () => {
+			const provider = "owned-config-fallback-discovery";
+			const modelsBPath = path.join(tempDir, "models-b.json");
+			const config = (apiKey: string) => ({
+				baseUrl: "https://owned-config.example.com/v1",
+				api: "openai-responses",
+				apiKey,
+				discovery: { type: "openai-models-list" },
+			});
+			writeRawModelsJson({ [provider]: config("owner-a-static") });
+			fs.writeFileSync(modelsBPath, JSON.stringify({ providers: { [provider]: config("owner-b-static") } }));
+			const firstRegistry = new ModelRegistry(authStorage, modelsJsonPath);
+			const secondRegistry = new ModelRegistry(authStorage, modelsBPath);
+			const ownerA = firstRegistry.getAuthStorageOwner();
+			const ownerB = secondRegistry.getAuthStorageOwner();
+			const requests: string[] = [];
+			using _hook = hookFetch((_input, init) => {
+				requests.push((init?.headers as Record<string, string>).Authorization);
+				return new Response(JSON.stringify({ data: [{ id: "owned-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+			try {
+				await expect(firstRegistry.getApiKeyForProvider(provider)).resolves.toBe("owner-a-static");
+				await expect(secondRegistry.getApiKeyForProvider(provider)).resolves.toBe("owner-b-static");
+				const evidenceA = authStorage.getProviderEvidenceGeneration(provider, "owner-a-static", ownerA);
+				const configA = authStorage.getProviderConfigurationGeneration(provider, ownerA);
+
+				secondRegistry.registerProvider(provider, {
+					api: "openai-responses",
+					baseUrl: "https://owned-config.example.com/v1",
+					apiKey: "owner-b-runtime-v2",
+				});
+				await expect(secondRegistry.getApiKeyForProvider(provider)).resolves.toBe("owner-b-runtime-v2");
+				await expect(firstRegistry.getApiKeyForProvider(provider)).resolves.toBe("owner-a-static");
+				expect(authStorage.getProviderEvidenceGeneration(provider, "owner-a-static", ownerA)).toBe(evidenceA);
+				expect(authStorage.getProviderConfigurationGeneration(provider, ownerA)).toBe(configA);
+
+				authStorage.removeConfigApiKey(provider, ownerA);
+				authStorage.removeConfigApiKey(provider, ownerB);
+				await expect(firstRegistry.getApiKeyForProvider(provider)).resolves.toBe("owner-a-static");
+				await expect(secondRegistry.getApiKeyForProvider(provider)).resolves.toBe("owner-b-runtime-v2");
+				await firstRegistry.refreshProvider(provider, "online");
+				await secondRegistry.refreshProvider(provider, "online");
+				expect(requests.slice(-2)).toEqual(["Bearer owner-a-static", "Bearer owner-b-runtime-v2"]);
+
+				await secondRegistry.dispose();
+				await expect(firstRegistry.getApiKeyForProvider(provider)).resolves.toBe("owner-a-static");
+				await firstRegistry.refreshProvider(provider, "online");
+				expect(requests.at(-1)).toBe("Bearer owner-a-static");
+			} finally {
+				await Promise.all([firstRegistry.dispose(), secondRegistry.dispose()]);
+			}
+		});
+
+		test("publishes discovery across sibling config changes but rejects own or shared-row changes", async () => {
+			const provider = "owned-config-publication-discovery";
+			const modelsBPath = path.join(tempDir, "models-publication-b.json");
+			const config = (apiKey: string) => ({
+				baseUrl: "https://owned-publication.example.com/v1",
+				api: "openai-responses",
+				apiKey,
+				discovery: { type: "openai-models-list" },
+			});
+			writeRawModelsJson({ [provider]: config("publication-a") });
+			fs.writeFileSync(modelsBPath, JSON.stringify({ providers: { [provider]: config("publication-b") } }));
+			const firstRegistry = new ModelRegistry(authStorage, modelsJsonPath);
+			const secondRegistry = new ModelRegistry(authStorage, modelsBPath);
+			const responses = Array.from({ length: 3 }, () => Promise.withResolvers<Response>());
+			const started = Array.from({ length: 3 }, () => Promise.withResolvers<void>());
+			let requestIndex = 0;
+			using _hook = hookFetch(() => {
+				const index = requestIndex++;
+				started[index]!.resolve();
+				return responses[index]!.promise;
+			});
+			try {
+				const siblingRefresh = firstRegistry.refreshProvider(provider, "online");
+				await started[0]!.promise;
+				secondRegistry.registerProvider(provider, {
+					api: "openai-responses",
+					baseUrl: "https://owned-publication.example.com/v1",
+					apiKey: "publication-b-v2",
+				});
+				responses[0]!.resolve(
+					new Response(JSON.stringify({ data: [{ id: "sibling-config-change" }] }), { status: 200 }),
+				);
+				await siblingRefresh;
+				expect(firstRegistry.find(provider, "sibling-config-change")).toBeDefined();
+
+				const ownRefresh = firstRegistry.refreshProvider(provider, "online");
+				await started[1]!.promise;
+				firstRegistry.registerProvider(provider, {
+					api: "openai-responses",
+					baseUrl: "https://owned-publication.example.com/v1",
+					apiKey: "publication-a-v2",
+				});
+				responses[1]!.resolve(
+					new Response(JSON.stringify({ data: [{ id: "own-config-change" }] }), { status: 200 }),
+				);
+				await ownRefresh;
+				expect(firstRegistry.find(provider, "own-config-change")).toBeUndefined();
+
+				const rowRefresh = firstRegistry.refreshProvider(provider, "online");
+				await started[2]!.promise;
+				await authStorage.set(provider, [{ type: "api_key", key: "shared-row-change" }]);
+				responses[2]!.resolve(
+					new Response(JSON.stringify({ data: [{ id: "shared-row-change" }] }), { status: 200 }),
+				);
+				await rowRefresh;
+				expect(firstRegistry.find(provider, "shared-row-change")).toBeUndefined();
+			} finally {
+				await Promise.all([firstRegistry.dispose(), secondRegistry.dispose()]);
+			}
+		});
+
 		test("keeps selected discovery evidence local to each registry", async () => {
 			writeRawModelsJson({
 				"discovery-provider": {

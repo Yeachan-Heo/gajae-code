@@ -235,6 +235,34 @@ describe("AuthStorage config-override apiKey", () => {
 		});
 	});
 
+	test("owned fallback lookup is strict, copied by forks, and protected from stale disposers", async () => {
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			if (!authStorage) throw new Error("test setup failed");
+			const ownerA = {};
+			const ownerB = {};
+			const ownerWithoutFallback = {};
+			const removeGlobal = authStorage.setFallbackResolver(() => "global-fallback");
+			const removeA1 = authStorage.setFallbackResolver(() => "owner-a-v1", ownerA);
+			const forkA = authStorage.forkConfigOwner(ownerA);
+			const removeA2 = authStorage.setFallbackResolver(() => "owner-a-v2", ownerA);
+			removeA1();
+			const removeB1 = authStorage.setFallbackResolver(() => "owner-b-v1", ownerB);
+			const removeB2 = authStorage.setFallbackResolver(() => "owner-b-v2", ownerB);
+			removeB1();
+
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: ownerA })).toBe("owner-a-v2");
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: forkA })).toBe("owner-a-v1");
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: ownerB })).toBe("owner-b-v2");
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: ownerWithoutFallback })).toBeUndefined();
+
+			removeA2();
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: ownerA })).toBeUndefined();
+			removeGlobal();
+			removeB2();
+			authStorage.releaseConfigOwner(forkA);
+		});
+	});
+
 	test("forkConfigOwner captures config provenance while shared credential authorities remain live", async () => {
 		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
 			if (!authStorage) throw new Error("test setup failed");

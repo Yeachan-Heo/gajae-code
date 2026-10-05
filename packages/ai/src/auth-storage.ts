@@ -1419,6 +1419,7 @@ type ConfigApiKeyRegistration = { apiKey: string; envSourced: boolean; order: nu
 type ConfigApiKeyOwnerFork = {
 	registrations: Map<string, ConfigApiKeyRegistration>;
 	providerGenerations: Map<string, number>;
+	fallbackGeneration: number;
 	nextRegistrationOrder: number;
 };
 
@@ -1482,6 +1483,11 @@ export class AuthStorage {
 	#usageLogger?: UsageLogger;
 	#fallbackResolver?: (provider: string) => string | undefined;
 	#ownedFallbackResolvers: Map<object, (provider: string) => string | undefined> = new Map();
+	#ownerProviderGenerations = new WeakMap<object, Map<string, number>>();
+	#ownerFallbackGenerations = new WeakMap<object, number>();
+	#sharedProviderGenerations = new Map<string, number>();
+	#sharedProviderConfigurationGenerations = new Map<string, number>();
+	#fallbackGeneration = 0;
 	#store: AuthCredentialStore;
 	#configValueResolver: (config: string, cacheScope?: string) => Promise<string | undefined>;
 	#resolvedStoredApiKeyValues: Map<string, Map<string, { fingerprint: string; usable: boolean }>> = new Map();
@@ -1600,8 +1606,14 @@ export class AuthStorage {
 	allocateMonotonicSequence(key: string, expiresAtSec: number): number {
 		return this.#store.allocateMonotonicSequence(key, expiresAtSec);
 	}
-	getProviderConfigurationGeneration(provider: string): number {
-		return this.#getProviderConfigurationGeneration(provider);
+	getProviderConfigurationGeneration(provider: string, owner?: object): number {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		if (!owner) return this.#getProviderConfigurationGeneration(storageProvider) + this.#fallbackGeneration;
+		return (
+			this.#getSharedProviderConfigurationGeneration(storageProvider) +
+			this.#getOwnerProviderGeneration(owner, storageProvider) +
+			this.#getOwnerFallbackGeneration(owner)
+		);
 	}
 	getProviderOAuthRefreshGeneration(provider: string): number {
 		return this.#providerOAuthRefreshGenerations.get(resolveOAuthStorageProvider(provider)) ?? 0;
@@ -1611,6 +1623,35 @@ export class AuthStorage {
 	}
 	#getProviderConfigurationGeneration(provider: string): number {
 		return this.#providerConfigurationGenerations.get(resolveOAuthStorageProvider(provider)) ?? 1;
+	}
+	#getSharedProviderGeneration(provider: string): number {
+		return this.#sharedProviderGenerations.get(resolveOAuthStorageProvider(provider)) ?? 1;
+	}
+	#getSharedProviderConfigurationGeneration(provider: string): number {
+		return this.#sharedProviderConfigurationGenerations.get(resolveOAuthStorageProvider(provider)) ?? 1;
+	}
+	#getOwnerProviderGeneration(owner: object, provider: string): number {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		return (
+			this.#configOwnerForks.get(owner)?.providerGenerations.get(storageProvider) ??
+			this.#ownerProviderGenerations.get(owner)?.get(storageProvider) ??
+			0
+		);
+	}
+	#getOwnerFallbackGeneration(owner: object): number {
+		return this.#configOwnerForks.get(owner)?.fallbackGeneration ?? this.#ownerFallbackGenerations.get(owner) ?? 0;
+	}
+	#bumpOwnerProviderGeneration(owner: object, provider: string): void {
+		const key = resolveOAuthStorageProvider(provider);
+		const fork = this.#configOwnerForks.get(owner);
+		const generations = fork?.providerGenerations ?? this.#ownerProviderGenerations.get(owner) ?? new Map();
+		generations.set(key, (generations.get(key) ?? 0) + 1);
+		if (!fork) this.#ownerProviderGenerations.set(owner, generations);
+	}
+	#bumpOwnerFallbackGeneration(owner: object): void {
+		const fork = this.#configOwnerForks.get(owner);
+		if (fork) fork.fallbackGeneration += 1;
+		else this.#ownerFallbackGenerations.set(owner, this.#getOwnerFallbackGeneration(owner) + 1);
 	}
 	#configOverrideRegistration(provider: string, owner?: object): ConfigApiKeyRegistration | undefined {
 		const storageProvider = resolveOAuthStorageProvider(provider);
@@ -1635,10 +1676,13 @@ export class AuthStorage {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		provider = storageProvider;
 		const configOverride = this.#configOverrideRegistration(storageProvider, owner);
-		const forkGeneration = owner
-			? this.#configOwnerForks.get(owner)?.providerGenerations.get(storageProvider)
-			: undefined;
-		const forkGenerationFingerprint = forkGeneration === undefined ? "" : `\u0000${forkGeneration}`;
+		const ownerGeneration = owner ? this.#getOwnerProviderGeneration(owner, storageProvider) : 0;
+		const ownerFallbackGeneration = owner ? this.#getOwnerFallbackGeneration(owner) : this.#fallbackGeneration;
+		const generation = owner
+			? this.#getSharedProviderGeneration(storageProvider) + ownerGeneration + ownerFallbackGeneration
+			: this.#getProviderGeneration(storageProvider) + this.#fallbackGeneration;
+		const forkGenerationFingerprint =
+			ownerGeneration || ownerFallbackGeneration ? `\u0000${ownerGeneration}\u0000${ownerFallbackGeneration}` : "";
 		const runtimeOverride = this.#runtimeOverrides.get(storageProvider);
 		const environmentOverride = runtimeOverride || configOverride?.apiKey ? undefined : getEnvApiKey(storageProvider);
 		// Discovery callers may fingerprint the provider before resolving its
@@ -1660,7 +1704,9 @@ export class AuthStorage {
 		if (storedLiteral) {
 			return crypto
 				.createHash("sha256")
-				.update(`stored-literal\u0000${storageProvider}\u0000${storedLiteral.key}${forkGenerationFingerprint}`)
+				.update(
+					`${generation}\u0000stored-literal\u0000${storageProvider}\u0000${storedLiteral.key}${forkGenerationFingerprint}`,
+				)
 				.digest("hex");
 		}
 		let selectedCredential: ({ index: number } & StoredCredential) | undefined;
@@ -1669,9 +1715,7 @@ export class AuthStorage {
 		} catch {
 			return crypto
 				.createHash("sha256")
-				.update(
-					`${this.#getProviderGeneration(storageProvider)}${forkGenerationFingerprint}\u0000unavailable-selector`,
-				)
+				.update(`${generation}${forkGenerationFingerprint}\u0000unavailable-selector`)
 				.digest("hex");
 		}
 		const storedEntries: StoredCredential[] = selectedCredential
@@ -1751,7 +1795,7 @@ export class AuthStorage {
 		return crypto
 			.createHash("sha256")
 			.update(
-				`${this.#getProviderGeneration(storageProvider)}${forkGenerationFingerprint}\u0000${effectiveEnvKey ?? ""}\u0000${storedApiKeyFingerprint}\u0000${storedOAuthFingerprint}\u0000${evidenceKeyFingerprint}`,
+				`${generation}${forkGenerationFingerprint}\u0000${effectiveEnvKey ?? ""}\u0000${storedApiKeyFingerprint}\u0000${storedOAuthFingerprint}\u0000${evidenceKeyFingerprint}`,
 			)
 			.digest("hex");
 	}
@@ -1766,16 +1810,21 @@ export class AuthStorage {
 		this.#generationListeners.delete(listener);
 	}
 
-	#bumpGeneration(reason: string, provider?: string): void {
+	#bumpGeneration(reason: string, provider?: string, owner?: object): void {
 		this.#generation += 1;
 		if (provider) {
-			const storageProvider = resolveOAuthStorageProvider(provider);
-			this.#providerGenerations.set(storageProvider, this.#getProviderGeneration(storageProvider) + 1);
+			const key = resolveOAuthStorageProvider(provider);
+			this.#providerGenerations.set(key, this.#getProviderGeneration(key) + 1);
+			if (owner) this.#bumpOwnerProviderGeneration(owner, key);
+			else this.#sharedProviderGenerations.set(key, this.#getSharedProviderGeneration(key) + 1);
 			if (reason !== "stored-api-key-usability") {
-				this.#providerConfigurationGenerations.set(
-					storageProvider,
-					this.#getProviderConfigurationGeneration(storageProvider) + 1,
-				);
+				this.#providerConfigurationGenerations.set(key, this.#getProviderConfigurationGeneration(key) + 1);
+				if (!owner) {
+					this.#sharedProviderConfigurationGenerations.set(
+						key,
+						this.#getSharedProviderConfigurationGeneration(key) + 1,
+					);
+				}
 			}
 		}
 		for (const listener of [...this.#generationListeners]) {
@@ -2356,11 +2405,17 @@ export class AuthStorage {
 			nextRegistrationOrder = Math.max(nextRegistrationOrder, registration.order);
 		}
 		const owner = {};
+		const sourceFork = this.#configOwnerForks.get(sourceOwner);
 		this.#configOwnerForks.set(owner, {
 			registrations,
-			providerGenerations: new Map(),
+			providerGenerations: new Map(
+				sourceFork?.providerGenerations ?? this.#ownerProviderGenerations.get(sourceOwner),
+			),
+			fallbackGeneration: this.#getOwnerFallbackGeneration(sourceOwner),
 			nextRegistrationOrder,
 		});
+		const resolver = this.#ownedFallbackResolvers.get(sourceOwner);
+		if (resolver) this.#ownedFallbackResolvers.set(owner, resolver);
 		return owner;
 	}
 
@@ -2413,7 +2468,7 @@ export class AuthStorage {
 		} else {
 			this.#unownedConfigOverrides.set(storageProvider, registration);
 		}
-		this.#reconcileConfigApiKey(storageProvider, "set-config-api-key", true);
+		this.#reconcileConfigApiKey(storageProvider, "set-config-api-key", true, options.owner);
 	}
 
 	/**
@@ -2435,7 +2490,7 @@ export class AuthStorage {
 		} else {
 			if (!this.#unownedConfigOverrides.delete(storageProvider)) return;
 		}
-		this.#reconcileConfigApiKey(storageProvider, "remove-config-api-key", true);
+		this.#reconcileConfigApiKey(storageProvider, "remove-config-api-key", true, owner);
 	}
 
 	/**
@@ -2477,10 +2532,14 @@ export class AuthStorage {
 		if (!this.#configOwnerForks.delete(owner)) {
 			throw new Error("Cannot release an owner that was not created by forkConfigOwner");
 		}
+		if (this.#ownedFallbackResolvers.delete(owner)) {
+			this.#fallbackGeneration += 1;
+			this.#bumpGeneration("release-fallback-resolver");
+		}
 		this.#disposedConfigOwnerForks.add(owner);
 	}
 
-	#reconcileConfigApiKey(provider: string, reason: string, forceGeneration = false): void {
+	#reconcileConfigApiKey(provider: string, reason: string, forceGeneration = false, owner?: object): void {
 		const previous = this.#configOverrides.get(provider);
 		const previousEnvSourced = this.#configOverrideEnvSourced.has(provider);
 		let winner: { apiKey: string; envSourced: boolean; order: number } | undefined =
@@ -2499,7 +2558,7 @@ export class AuthStorage {
 		const current = this.#configOverrides.get(provider);
 		const currentEnvSourced = this.#configOverrideEnvSourced.has(provider);
 		if (forceGeneration || previous !== current || previousEnvSourced !== currentEnvSourced) {
-			this.#bumpGeneration(reason, provider);
+			this.#bumpGeneration(reason, provider, owner);
 		}
 	}
 
@@ -2509,22 +2568,35 @@ export class AuthStorage {
 	 */
 	setFallbackResolver(resolver: (provider: string) => string | undefined, owner?: object): () => void {
 		if (owner) {
+			if (this.#disposedConfigOwnerForks.has(owner)) throw new Error("Cannot update a released config owner");
+			const previous = this.#ownedFallbackResolvers.get(owner);
 			this.#ownedFallbackResolvers.set(owner, resolver);
+			if (previous) {
+				this.#bumpOwnerFallbackGeneration(owner);
+				this.#fallbackGeneration += 1;
+				this.#bumpGeneration("replace-fallback-resolver");
+			}
 			return () => {
 				if (this.#ownedFallbackResolvers.get(owner) !== resolver) return;
 				this.#ownedFallbackResolvers.delete(owner);
+				this.#bumpOwnerFallbackGeneration(owner);
+				this.#fallbackGeneration += 1;
+				this.#bumpGeneration("remove-fallback-resolver");
 			};
 		}
 		this.#fallbackResolver = resolver;
+		this.#fallbackGeneration += 1;
+		this.#bumpGeneration("set-fallback-resolver");
 		return () => {
-			if (this.#fallbackResolver === resolver) this.#fallbackResolver = undefined;
+			if (this.#fallbackResolver !== resolver) return;
+			this.#fallbackResolver = undefined;
+			this.#fallbackGeneration += 1;
+			this.#bumpGeneration("remove-fallback-resolver");
 		};
 	}
 
 	#resolveFallback(provider: string, owner?: object): string | undefined {
-		if (owner) {
-			return this.#ownedFallbackResolvers.get(owner)?.(provider) ?? this.#fallbackResolver?.(provider);
-		}
+		if (owner) return this.#ownedFallbackResolvers.get(owner)?.(provider);
 		for (const resolver of [...this.#ownedFallbackResolvers.values()].reverse()) {
 			const value = resolver(provider);
 			if (value !== undefined) return value;
@@ -6231,7 +6303,7 @@ export class AuthStorage {
 
 	async #resolveStoredApiKey(provider: string, key: string): Promise<string | undefined> {
 		const storageProvider = resolveOAuthStorageProvider(provider);
-		const configurationGeneration = this.#getProviderConfigurationGeneration(storageProvider);
+		const configurationGeneration = this.#getSharedProviderConfigurationGeneration(storageProvider);
 		const resolutions =
 			this.#storedApiKeyResolutionInFlight.get(storageProvider) ?? new Map<string, Promise<string | undefined>>();
 		this.#storedApiKeyResolutionInFlight.set(storageProvider, resolutions);
@@ -6240,13 +6312,13 @@ export class AuthStorage {
 
 		const { promise, resolve, reject } = Promise.withResolvers<string | undefined>();
 		resolutions.set(key, promise);
-		const publish = (value: string | undefined) => {
+		const publish = (value: string | undefined): boolean => {
 			if (
-				configurationGeneration !== this.#getProviderConfigurationGeneration(storageProvider) ||
+				configurationGeneration !== this.#getSharedProviderConfigurationGeneration(storageProvider) ||
 				this.#storedApiKeyResolutionInFlight.get(storageProvider) !== resolutions ||
 				resolutions.get(key) !== promise
 			) {
-				return;
+				return false;
 			}
 			const values =
 				this.#resolvedStoredApiKeyValues.get(storageProvider) ??
@@ -6261,15 +6333,15 @@ export class AuthStorage {
 			if (key.startsWith("!") && wasUsable !== isUsable) {
 				this.#bumpGeneration("stored-api-key-usability", storageProvider);
 			}
+			return true;
 		};
 		void (async () => {
 			try {
 				const value = await this.#configValueResolver(key, String(configurationGeneration));
-				publish(value);
-				resolve(value);
+				resolve(publish(value) ? value : undefined);
 			} catch (error) {
-				publish(undefined);
-				reject(error);
+				if (publish(undefined)) reject(error);
+				else resolve(undefined);
 			} finally {
 				if (
 					this.#storedApiKeyResolutionInFlight.get(storageProvider) === resolutions &&
@@ -6552,12 +6624,9 @@ export class AuthStorage {
 
 	async #credentialMatchesApiKey(provider: string, credential: AuthCredential, apiKey: string): Promise<boolean> {
 		if (credential.type === "api_key") {
-			return (
-				(await this.#configValueResolver(
-					credential.key,
-					String(this.#getProviderConfigurationGeneration(provider)),
-				)) === apiKey
-			);
+			const generation = this.#getSharedProviderConfigurationGeneration(provider);
+			const resolved = await this.#configValueResolver(credential.key, String(generation));
+			return generation === this.#getSharedProviderConfigurationGeneration(provider) && resolved === apiKey;
 		}
 		if (credential.access === apiKey) return true;
 		return this.#extractStructuredApiKeyToken(apiKey) === credential.access;
