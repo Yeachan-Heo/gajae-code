@@ -232,6 +232,8 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 		let firstTokenTime: number | undefined;
 		// Accumulator for streaming tool input fragments, keyed by toolUseId
 		const toolInputAccumulator = new Map<string, { name: string; input: string }>();
+		// Pending tool calls to be emitted at stream end (after refusal is ruled out)
+		const pendingToolCalls: Array<{ id: string; toolCall: ToolCall; index: number }> = [];
 
 		const output: AssistantMessage = {
 			role: "assistant",
@@ -369,6 +371,8 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 					if (ev.stopDetails?.refusal) {
 						output.duration = Date.now() - startTime;
 						if (firstTokenTime) output.ttft = firstTokenTime - startTime;
+						// Clear pending tool calls without emitting events (on refusal, drop any pending tool)
+						pendingToolCalls.length = 0;
 						handleKiroRefusal(output, stream, model, ev.stopDetails.refusal, options);
 						stream.end();
 						return;
@@ -379,6 +383,8 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 					if (ev.stopDetails?.refusal) {
 						output.duration = Date.now() - startTime;
 						if (firstTokenTime) output.ttft = firstTokenTime - startTime;
+						// Clear pending tool calls without emitting events (on refusal, drop any pending tool)
+						pendingToolCalls.length = 0;
 						handleKiroRefusal(output, stream, model, ev.stopDetails.refusal, options);
 						stream.end();
 						return;
@@ -407,7 +413,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 							stream.push({ type: "start", partial: output });
 							started = true;
 						}
-						handleToolUseEvent(ev, blocks, output, stream, toolInputAccumulator);
+						handleToolUseEvent(ev, blocks, output, stream, toolInputAccumulator, pendingToolCalls);
 						// Clear accumulator for completed tool
 						if (ev.stop) {
 							toolInputAccumulator.delete(ev.toolUseId ?? "");
@@ -449,6 +455,12 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 				const unfinishedIds = Array.from(toolInputAccumulator.keys()).join(", ");
 				throw new Error(`Kiro CodeWhisperer stream ended with incomplete tool calls: ${unfinishedIds}`);
 			}
+
+			// Emit all pending tool call events (safe since no refusal occurred)
+			for (const { toolCall, index } of pendingToolCalls) {
+				stream.push({ type: "toolcall_end", contentIndex: index, toolCall, partial: output });
+			}
+			pendingToolCalls.length = 0;
 
 			// Finalize blocks
 			for (const block of blocks) {
@@ -698,9 +710,10 @@ function handleTextDelta(
 function handleToolUseEvent(
 	ev: ToolUseEventPayload,
 	blocks: Block[],
-	output: AssistantMessage,
-	stream: AssistantMessageEventStream,
+	_output: AssistantMessage,
+	_stream: AssistantMessageEventStream,
 	accumulator: Map<string, { name: string; input: string }>,
+	pendingToolCalls: Array<{ id: string; toolCall: ToolCall; index: number }>,
 ): void {
 	const name = ev.name ?? "";
 	const input = ev.input ?? "";
@@ -732,7 +745,7 @@ function handleToolUseEvent(
 		accumulated.name = name;
 	}
 
-	// Emit toolcall_end only when we have a stop signal
+	// Defer toolcall_end emission until stream end (after refusal is ruled out)
 	if (ev.stop) {
 		const inputStr = accumulated.input;
 		const toolCall: ToolCall = {
@@ -746,7 +759,8 @@ function handleToolUseEvent(
 		const newBlock: Block = { ...toolCall, index: blocks.length };
 		captureUnicodeEscapeEvidence(newBlock, inputStr);
 		blocks.push(newBlock);
-		stream.push({ type: "toolcall_end", contentIndex: newBlock.index!, toolCall, partial: output });
+		// Track pending tool call to emit at stream end
+		pendingToolCalls.push({ id: toolUseId, toolCall, index: newBlock.index! });
 		accumulator.delete(toolUseId);
 	}
 }

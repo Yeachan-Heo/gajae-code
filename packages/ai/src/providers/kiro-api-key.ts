@@ -675,8 +675,10 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			let textIndex: number | undefined;
 
 			let toolcallIndex: number | undefined;
+			const pendingToolCalls: Array<{ input: string; toolCall: ToolCall; index: number }> = [];
 
-			const flushTool = () => {
+			// Add tool to blocks without emitting events (deferred until stream end)
+			const addToolToBlocks = () => {
 				if (!currentTool) return;
 				const args = currentTool.input.trim() ? currentTool.input : "{}";
 				let parsed: unknown = {};
@@ -695,20 +697,34 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				blocks.push({ ...toolCall, index });
 				if (toolcallIndex === undefined) {
 					toolcallIndex = index;
-					stream.push({ type: "toolcall_start", contentIndex: index, partial: output });
 				}
-				stream.push({
-					type: "toolcall_delta",
-					contentIndex: index,
-					delta: currentTool.input,
-					partial: output,
-				});
-				stream.push({
-					type: "toolcall_end",
-					contentIndex: index,
-					toolCall,
-					partial: output,
-				});
+				pendingToolCalls.push({ input: currentTool.input, toolCall, index });
+				currentTool = undefined;
+			};
+
+			// Emit accumulated tool call events (only called at stream end if no refusal)
+			const emitPendingToolCalls = () => {
+				for (const { input, toolCall, index } of pendingToolCalls) {
+					stream.push({ type: "toolcall_start", contentIndex: index, partial: output });
+					stream.push({
+						type: "toolcall_delta",
+						contentIndex: index,
+						delta: input,
+						partial: output,
+					});
+					stream.push({
+						type: "toolcall_end",
+						contentIndex: index,
+						toolCall,
+						partial: output,
+					});
+				}
+				pendingToolCalls.length = 0;
+			};
+
+			// Clear pending tool calls without emitting events (on refusal)
+			const clearPendingToolCalls = () => {
+				pendingToolCalls.length = 0;
 				currentTool = undefined;
 			};
 
@@ -828,18 +844,18 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						}
 					} else if (event.type === "toolUse") {
 						if (!hasTerminalEvent) {
-							if (currentTool && currentTool.id !== event.data.toolUseId) flushTool();
+							if (currentTool && currentTool.id !== event.data.toolUseId) addToolToBlocks();
 							if (!currentTool) {
 								currentTool = { id: event.data.toolUseId, name: event.data.name, input: event.data.input };
 							} else {
 								currentTool.input += event.data.input;
 							}
-							if (event.data.stop) flushTool();
+							if (event.data.stop) addToolToBlocks();
 						}
 					} else if (event.type === "toolUseInput" && currentTool && !hasTerminalEvent) {
 						currentTool.input += event.data.input;
 					} else if (event.type === "toolUseStop" && event.data.stop && !hasTerminalEvent) {
-						flushTool();
+						addToolToBlocks();
 					} else if (event.type === "usage") {
 						if (event.data.inputTokens !== undefined) output.usage.input = event.data.inputTokens;
 						if (event.data.outputTokens !== undefined) output.usage.output = event.data.outputTokens;
@@ -852,7 +868,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						if (refusalData.stopDetails?.refusal) {
 							// Handle refusal: clear blocks and emit error (don't emit any text/tool that came before)
 							consumeContent(""); // Flush any pending thinking
-							flushTool();
+							clearPendingToolCalls(); // DROP any pending tool call without emitting events
 
 							const refusal = refusalData.stopDetails.refusal;
 							const category = refusal.category;
@@ -896,9 +912,11 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				}
 			}
 
-			// Stream is done - flush any pending tool, emit accumulated thinking, then close text block
-			flushTool();
+			// Stream is done - add any pending tool, emit accumulated thinking, then close text block
+			addToolToBlocks();
 			emitThinking();
+			// Now emit all tool call events in order (safe since no refusal occurred)
+			emitPendingToolCalls();
 			closeTextBlock();
 			const hasText = blocks.some(b => b.type === "text" && b.text.length > 0);
 			const hasTools = blocks.some(b => b.type === "toolCall");
