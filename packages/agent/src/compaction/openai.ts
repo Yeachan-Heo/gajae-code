@@ -28,7 +28,12 @@ import {
 	neutralizeResponsesInputControlTokens,
 	normalizeResponsesToolCallId,
 } from "@gajae-code/ai/utils";
-import { $credentialEnv, logger } from "@gajae-code/utils";
+import {
+	assertEndpointConfiguration,
+	type EndpointConfiguration,
+	logger,
+	readEndpointConfiguration,
+} from "@gajae-code/utils";
 
 const OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1";
 
@@ -76,28 +81,38 @@ export function shouldUseOpenAiRemoteCompaction(model: Model): boolean {
 	return model.provider === "openai" || model.provider === "openai-codex";
 }
 
-function resolveOpenAiCompactEndpoint(model: Model, authCredentialType?: "api_key" | "oauth"): string {
+function resolveOpenAiCompactEndpoint(
+	model: Model,
+	authCredentialType?: "api_key" | "oauth",
+	endpointConfiguration?: EndpointConfiguration,
+): string {
+	assertEndpointConfiguration(endpointConfiguration);
 	if (model.provider === "openai-codex") {
 		return resolveOpenAiCodexCompactEndpoint(model.baseUrl);
 	}
+	if (authCredentialType === "oauth") {
+		return `${OPENAI_DEFAULT_BASE_URL}/responses/compact`;
+	}
 
 	// Trusted sources only: the compaction endpoint carries the OpenAI credential.
-	const envBaseUrl = $credentialEnv("OPENAI_BASE_URL");
+	const envBaseUrl = readEndpointConfiguration(endpointConfiguration, "OPENAI_BASE_URL");
 	const configuredBaseUrl = model.baseUrl?.trim();
 	const rawBase =
-		authCredentialType === "oauth"
-			? OPENAI_DEFAULT_BASE_URL
-			: envBaseUrl && (!configuredBaseUrl || configuredBaseUrl.toLowerCase().includes("api.openai.com"))
-				? envBaseUrl
-				: configuredBaseUrl || envBaseUrl || OPENAI_DEFAULT_BASE_URL;
+		envBaseUrl && (!configuredBaseUrl || configuredBaseUrl.toLowerCase().includes("api.openai.com"))
+			? envBaseUrl
+			: configuredBaseUrl || envBaseUrl || OPENAI_DEFAULT_BASE_URL;
 	const normalizedBase = rawBase.endsWith("/") ? rawBase.slice(0, -1) : rawBase;
 	if (normalizedBase.endsWith("/v1")) return `${normalizedBase}/responses/compact`;
 	return `${normalizedBase}/v1/responses/compact`;
 }
 
 /** Test seam: the compaction endpoint as resolved from trusted env. */
-export function resolveOpenAiCompactEndpointForTest(model: Model, authCredentialType?: "api_key" | "oauth"): string {
-	return resolveOpenAiCompactEndpoint(model, authCredentialType);
+export function resolveOpenAiCompactEndpointForTest(
+	model: Model,
+	authCredentialType?: "api_key" | "oauth",
+	endpointConfiguration?: EndpointConfiguration,
+): string {
+	return resolveOpenAiCompactEndpoint(model, authCredentialType, endpointConfiguration);
 }
 
 function resolveOpenAiCodexCompactEndpoint(baseUrl: string | undefined): string {
@@ -482,9 +497,13 @@ export async function requestOpenAiRemoteCompaction(
 	compactInput: Array<Record<string, unknown>>,
 	instructions: string,
 	signal?: AbortSignal,
-	options?: { authCredentialType?: "api_key" | "oauth" },
+	options?: {
+		authCredentialType?: "api_key" | "oauth";
+		endpointConfiguration?: EndpointConfiguration;
+	},
 ): Promise<OpenAiRemoteCompactionResponse> {
-	const endpoint = resolveOpenAiCompactEndpoint(model, options?.authCredentialType);
+	assertEndpointConfiguration(options?.endpointConfiguration);
+	const endpoint = resolveOpenAiCompactEndpoint(model, options?.authCredentialType, options?.endpointConfiguration);
 	const request: OpenAiRemoteCompactionRequest = {
 		model: model.id,
 		input: neutralizeResponsesInputControlTokens(

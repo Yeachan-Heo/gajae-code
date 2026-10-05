@@ -15,7 +15,7 @@ import type {
 	Tool,
 	ToolResultMessage,
 } from "@gajae-code/ai/types";
-import { $which } from "@gajae-code/utils";
+import { $which, captureEndpointConfiguration, hookFetch } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import {
 	CustomApiRegistry,
@@ -47,6 +47,80 @@ function hasBedrockCredentials(): boolean {
 		(Bun.env.AWS_ACCESS_KEY_ID && Bun.env.AWS_SECRET_ACCESS_KEY) ||
 			(Bun.env.AWS_PROFILE && Bun.env.AWS_PROFILE.length > 0),
 	);
+}
+
+function setTestEnvValue(name: string, value: string | undefined): void {
+	if (value === undefined) delete Bun.env[name];
+	else Bun.env[name] = value;
+}
+
+function makeEndpointRoutingResponsesStream(): Response {
+	const messageItem = {
+		id: "msg_endpoint_routing",
+		type: "message",
+		role: "assistant",
+		status: "completed",
+		content: [{ type: "output_text", text: "routed", annotations: [] }],
+	};
+	const events = [
+		{ type: "response.created", response: { id: "resp_endpoint_routing" } },
+		{
+			type: "response.output_item.added",
+			output_index: 0,
+			item: { id: messageItem.id, type: "message", role: "assistant", content: [] },
+		},
+		{
+			type: "response.content_part.added",
+			item_id: messageItem.id,
+			output_index: 0,
+			content_index: 0,
+			part: { type: "output_text", text: "", annotations: [] },
+		},
+		{
+			type: "response.output_text.delta",
+			item_id: messageItem.id,
+			output_index: 0,
+			content_index: 0,
+			delta: "routed",
+		},
+		{ type: "response.output_item.done", output_index: 0, item: messageItem },
+		{
+			type: "response.completed",
+			response: {
+				id: "resp_endpoint_routing",
+				object: "response",
+				created_at: 1,
+				status: "completed",
+				model: "gpt-endpoint-routing",
+				output: [messageItem],
+				usage: {
+					input_tokens: 1,
+					input_tokens_details: { cached_tokens: 0 },
+					output_tokens: 1,
+					output_tokens_details: { reasoning_tokens: 0 },
+					total_tokens: 2,
+				},
+			},
+		},
+	];
+	const body = events.map(event => `data: ${JSON.stringify(event)}\n\n`).join("");
+	return new Response(body, { headers: { "content-type": "text/event-stream" } });
+}
+
+function makeEndpointRoutingModel(): Model<"openai-responses"> {
+	return {
+		id: "gpt-endpoint-routing",
+		name: "Endpoint routing test model",
+		api: "openai-responses",
+		provider: "openai",
+		baseUrl: "https://api.openai.com/v1",
+		reasoning: false,
+		input: ["text"],
+		output: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 8192,
+		maxTokens: 1024,
+	};
 }
 
 function createCustomApiModel(api: string): Model<Api> {
@@ -105,6 +179,75 @@ async function collectCustomResult(events: AssistantMessageEventStream): Promise
 
 afterEach(() => {
 	clearCustomApis();
+});
+
+describe("captured endpoint configuration in builtin stream dispatch", () => {
+	it("preserves captured routing through streamSimple and typed stream while credentials stay live", async () => {
+		const previousBaseUrl = Bun.env.OPENAI_BASE_URL;
+		const previousApiKey = Bun.env.OPENAI_API_KEY;
+		const requests: Array<{ url: string; authorization: string | null }> = [];
+		let callerFetchCalls = 0;
+		try {
+			Bun.env.OPENAI_BASE_URL = "https://endpoint-a.example.com/v1";
+			Bun.env.OPENAI_API_KEY = "key-before-capture";
+			const endpointA = captureEndpointConfiguration();
+			Bun.env.OPENAI_BASE_URL = "https://endpoint-b.example.com/v1";
+			Bun.env.OPENAI_API_KEY = "key-rotated-after-capture";
+
+			using _hook = hookFetch(async (input, init) => {
+				const request = input instanceof Request ? input : new Request(String(input), init);
+				requests.push({ url: request.url, authorization: request.headers.get("authorization") });
+				return makeEndpointRoutingResponsesStream();
+			});
+
+			const model = makeEndpointRoutingModel();
+			const context: Context = {
+				messages: [{ role: "user", content: "route this request", timestamp: 1 }],
+			};
+			const sharedOptions = {
+				requestMaxRetries: 0,
+				streamMaxRetries: 0,
+				disableProviderRetries: true,
+			};
+			const simple = await collectCustomResult(
+				streamSimple(model, context, {
+					...sharedOptions,
+					endpointConfiguration: endpointA,
+					fetch: async (input, init) => {
+						callerFetchCalls++;
+						return fetch(input instanceof Request ? input : new Request(String(input), init));
+					},
+				}),
+			);
+
+			delete Bun.env.OPENAI_BASE_URL;
+			const capturedAbsence = captureEndpointConfiguration();
+			Bun.env.OPENAI_BASE_URL = "https://endpoint-b.example.com/v1";
+			Bun.env.OPENAI_API_KEY = "key-rotated-again";
+			const typedOptions: OptionsForApi<"openai-responses"> = {
+				...sharedOptions,
+				endpointConfiguration: capturedAbsence,
+			};
+			const typed = await collectCustomResult(stream(model, context, typedOptions));
+
+			expect(resultText(simple)).toBe("routed");
+			expect(resultText(typed)).toBe("routed");
+			expect(callerFetchCalls).toBe(1);
+			expect(requests).toEqual([
+				{
+					url: "https://endpoint-a.example.com/v1/responses",
+					authorization: "Bearer key-rotated-after-capture",
+				},
+				{
+					url: "https://api.openai.com/v1/responses",
+					authorization: "Bearer key-rotated-again",
+				},
+			]);
+		} finally {
+			setTestEnvValue("OPENAI_BASE_URL", previousBaseUrl);
+			setTestEnvValue("OPENAI_API_KEY", previousApiKey);
+		}
+	});
 });
 
 describe("scoped custom API stream dispatch", () => {
