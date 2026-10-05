@@ -4246,7 +4246,7 @@ test("SDK host text-only stop/restart isolates late predecessor progress and ter
 			leaseClock.mockRestore();
 		}
 	}
-}, 30_000);
+});
 
 test("SDK host correlates follow-up acknowledgements with the later agent start", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-follow-up-correlation-"));
