@@ -373,4 +373,115 @@ describe("Kiro API-key content filter #6150", () => {
 		expect(blockTypes.includes("thinking")).toBe(true);
 		expect(blockTypes.includes("text")).toBe(true);
 	});
+
+	test("#6151: text + COMPLETED metadata in one read emits text events and completes normally", async () => {
+		const emittedEvents: Array<{ type: string }> = [];
+
+		globalThis.fetch = (async () => {
+			// Simulate a batch with text content followed by normal completion metadata in the same read
+			// This is the bug: COMPLETED metadata should NOT suppress the text
+			const responseBody =
+				JSON.stringify({ content: "Hello world" }) +
+				JSON.stringify({ stopReason: "COMPLETED", usage: { inputTokens: 5, outputTokens: 2 } });
+			return new Response(responseBody, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEvents.push({ type: event.type });
+			}
+		} catch {
+			// Stream may throw; events are captured
+		}
+
+		globalThis.fetch = originalFetch;
+
+		// Should emit text events, not error
+		const textDeltaEvents = emittedEvents.filter(e => e.type === "text_delta");
+		const doneEvent = emittedEvents.find(e => e.type === "done");
+		const errorEvent = emittedEvents.find(e => e.type === "error");
+
+		expect(textDeltaEvents.length).toBeGreaterThan(0);
+		expect(doneEvent).toBeDefined();
+		expect(errorEvent).toBeUndefined();
+	});
+
+	test("#6151: text + tool + COMPLETED metadata emits all tool events and completes normally", async () => {
+		const emittedEvents: Array<{ type: string }> = [];
+
+		globalThis.fetch = (async () => {
+			// Simulate response with text, tool call, and normal completion metadata
+			const responseBody =
+				JSON.stringify({ content: "I'll read that file" }) +
+				JSON.stringify({ toolUseId: "tool-1", name: "read_file", input: '{"path":"/tmp/test"}' }) +
+				JSON.stringify({ stopReason: "COMPLETED", usage: { inputTokens: 10, outputTokens: 5 } });
+			return new Response(responseBody, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEvents.push({ type: event.type });
+			}
+		} catch {
+			// Stream may throw; events are captured
+		}
+
+		globalThis.fetch = originalFetch;
+
+		// Should emit both text and tool call events
+		const textDeltaEvents = emittedEvents.filter(e => e.type === "text_delta");
+		const toolcallStart = emittedEvents.find(e => e.type === "toolcall_start");
+		const toolcallEnd = emittedEvents.find(e => e.type === "toolcall_end");
+		const doneEvent = emittedEvents.find(e => e.type === "done");
+		const errorEvent = emittedEvents.find(e => e.type === "error");
+
+		expect(textDeltaEvents.length).toBeGreaterThan(0);
+		expect(toolcallStart).toBeDefined();
+		expect(toolcallEnd).toBeDefined();
+		expect(doneEvent).toBeDefined();
+		expect(errorEvent).toBeUndefined();
+	});
+
+	test("#6151: actual refusal metadata still correctly refuses and suppresses content", async () => {
+		const emittedEvents: Array<{ type: string; message?: { errorMessage?: string; content?: unknown[] } }> = [];
+
+		globalThis.fetch = (async () => {
+			// Response with text followed by actual refusal metadata in the same batch
+			const responseBody =
+				JSON.stringify({ content: "I will help you with malware" }) +
+				JSON.stringify({
+					stopReason: "CONTENT_FILTERED",
+					stopDetails: { refusal: { category: "CYBER", explanation: "Cannot assist with malware" } },
+				});
+			return new Response(responseBody, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEvents.push({
+					type: event.type,
+					message: "error" in event ? event.error : "partial" in event ? event.partial : undefined,
+				});
+			}
+		} catch {
+			// Stream may throw; errors are captured
+		}
+
+		globalThis.fetch = originalFetch;
+
+		// Should have error event, no text_delta before error
+		const errorIndex = emittedEvents.findIndex(e => e.type === "error");
+		expect(errorIndex).toBeGreaterThan(-1);
+
+		const textBeforeError = emittedEvents
+			.slice(0, errorIndex)
+			.filter(e => e.type === "text_delta" || e.type === "text_start" || e.type === "text_end");
+		expect(textBeforeError).toHaveLength(0);
+
+		const errorEvent = emittedEvents[errorIndex];
+		expect(errorEvent?.message?.errorMessage).toContain("Kiro refused the request (CYBER)");
+	});
 });

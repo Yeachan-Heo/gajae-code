@@ -436,17 +436,16 @@ export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[];
 			} else if (parsed.usage && typeof parsed.usage === "object") {
 				const u = parsed.usage as { inputTokens?: number; outputTokens?: number };
 				events.push({ type: "usage", data: u });
-			} else if (parsed.stopReason || parsed.stopDetails) {
-				// Refusal or terminal metadata event
+			} else if ((parsed.stopDetails as any)?.refusal) {
+				// Only emit refusal event if stopDetails contains actual refusal data
 				events.push({
 					type: "refusal",
 					data: {
 						stopReason: parsed.stopReason as string | undefined,
-						stopDetails: parsed.stopDetails as
-							| { refusal?: { category?: string; explanation?: string } }
-							| undefined,
+						stopDetails: parsed.stopDetails as { refusal?: { category?: string; explanation?: string } },
 					},
 				});
+				// Normal terminal metadata (stopReason: "COMPLETED", etc.) without refusal data is ignored
 			} else if (parsed.error || parsed.Error) {
 				events.push({
 					type: "error",
