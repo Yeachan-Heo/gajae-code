@@ -345,7 +345,30 @@ async function pauseOwnerWriter(fixture: OwnerFixture, phase: "staging" | "repla
 	return { release };
 }
 
-function deleteRequest(fixture: OwnerFixture, sessionId = fixture.sessionId, sessionPath = fixture.transcript) {
+async function createLegacyOnlyFixture(): Promise<
+	Pick<OwnerFixture, "root" | "cwd" | "agentDir" | "sessionId" | "transcript">
+> {
+	const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "sdk-legacy-only-delete-")));
+	const cwd = path.join(root, "workspace");
+	const agentDir = path.join(root, "profile");
+	await fs.mkdir(cwd, { mode: 0o700 });
+	const encoded = cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-");
+	const legacyDirectory = path.join(agentDir, "sessions", `--${encoded}--`);
+	await fs.mkdir(legacyDirectory, { recursive: true, mode: 0o700 });
+	const sessionId = crypto.randomUUID();
+	const transcript = path.join(legacyDirectory, `${sessionId}.jsonl`);
+	await Bun.write(
+		transcript,
+		`${JSON.stringify({ type: "session", version: 3, id: sessionId, timestamp: new Date().toISOString(), cwd })}\n`,
+	);
+	return { root, cwd, agentDir, sessionId, transcript };
+}
+
+function deleteRequest(
+	fixture: Pick<OwnerFixture, "cwd" | "sessionId" | "transcript">,
+	sessionId = fixture.sessionId,
+	sessionPath = fixture.transcript,
+) {
 	return {
 		cwd: fixture.cwd,
 		stateRoot: path.join(fixture.cwd, ".gjc", "state"),
@@ -354,10 +377,109 @@ function deleteRequest(fixture: OwnerFixture, sessionId = fixture.sessionId, ses
 	};
 }
 
-it("SDK refuses an unauthenticated protocol alias before artifact or owner payload effects", async () => {
-	const fixture = await createFixture();
+it.each([
+	false,
+	true,
+])("SDK deletes an owner-free legacy-only session without initializing v2 (restart=%s)", async restart => {
+	const { root, cwd, agentDir, sessionId, transcript: sessionPath } = await createLegacyOnlyFixture();
+	const sessionsRoot = path.join(agentDir, "sessions");
+	let broker = new Broker({ agentDir });
+	const originalUnlink = native.exactUnlink;
+	const unlink = vi
+		.spyOn(native, "exactUnlink")
+		.mockImplementation((pathname, identity) =>
+			restart && pathname === sessionPath ? { ok: false, code: "io_error" } : originalUnlink(pathname, identity),
+		);
+	const request = { cwd, stateRoot: path.join(cwd, ".gjc", "state"), sessionId, sessionPath };
+	try {
+		await broker.start();
+		let response = await broker.handleRequest("session.delete", request, "legacy-only-delete");
+		if (restart) {
+			expect(response).toMatchObject({
+				ok: false,
+				error: { code: "cleanup_pending", cleanup: { phase: "transcript" } },
+			});
+			unlink.mockRestore();
+			await broker.stop();
+			broker = new Broker({ agentDir });
+			await broker.start();
+			response = await broker.handleRequest("session.delete", request, "legacy-only-delete");
+		}
+		expect(response).toMatchObject({ ok: true, result: { sessionId } });
+		expect(await Bun.file(sessionPath).exists()).toBe(false);
+		expect((await fs.readdir(sessionsRoot)).filter(name => name.startsWith("v2-"))).toEqual([]);
+	} finally {
+		unlink.mockRestore();
+		await broker.stop();
+		await safeRm(root, { recursive: true, force: true });
+	}
+}, 30_000);
+
+it.each([
+	false,
+	true,
+])("SDK retries same-Broker transcript cleanup after canonical artifact reappearance (owned=%s)", async owned => {
+	const fixture = owned ? await createFixture() : await createLegacyOnlyFixture();
 	const broker = new Broker({ agentDir: fixture.agentDir });
 	const artifacts = fixture.transcript.slice(0, -6);
+	const transcriptBefore = await fs.readFile(fixture.transcript);
+	let injected = false;
+	const transition = broker.ledger.transition.bind(broker.ledger);
+	const publish = vi.spyOn(broker.ledger, "transition").mockImplementation(async (identity, state, fields) => {
+		const result = await transition(identity, state, fields);
+		const error = record(record(fields?.response)?.error);
+		if (
+			!injected &&
+			error?.message ===
+				"Saved session artifacts and owner cleanup are durably recorded; transcript cleanup is preauthorized."
+		) {
+			injected = true;
+			await fs.mkdir(artifacts, { mode: 0o700 });
+			await Bun.write(path.join(artifacts, "replacement.txt"), "unowned replacement");
+		}
+		return result;
+	});
+	try {
+		await broker.start();
+		const request = deleteRequest(fixture);
+		const first = await broker.handleRequest("session.delete", request, "canonical-artifact-reappearance");
+		expect(injected).toBe(true);
+		expect(first).toMatchObject({
+			ok: false,
+			error: { code: "cleanup_pending", message: expect.stringContaining("canonical artifact path reappeared") },
+		});
+		const cleanup = cleanupOf(first);
+		expect(
+			Object.entries(cleanup).filter(([key, value]) => key.startsWith("taskArtifactOwner") && value === undefined),
+		).toEqual([]);
+		if (!owned) expect(Object.keys(cleanup).filter(key => key.startsWith("taskArtifactOwner"))).toEqual([]);
+		expect(await fs.readFile(fixture.transcript)).toEqual(transcriptBefore);
+		expect(await Bun.file(path.join(artifacts, "replacement.txt")).text()).toBe("unowned replacement");
+		publish.mockRestore();
+		await safeRm(artifacts, { recursive: true, force: true });
+		const replay = await broker.handleRequest("session.delete", request, "canonical-artifact-reappearance");
+		if (owned && !replay.ok) expectPayloadRetired(replay, fixture.sessionId);
+		else expect(replay).toMatchObject({ ok: true, result: { sessionId: fixture.sessionId } });
+		expect(await Bun.file(fixture.transcript).exists()).toBe(false);
+		if (!owned)
+			expect(
+				(await fs.readdir(path.join(fixture.agentDir, "sessions"))).filter(name => name.startsWith("v2-")),
+			).toEqual([]);
+	} finally {
+		publish.mockRestore();
+		await broker.stop();
+		await safeRm(fixture.root, { recursive: true, force: true });
+	}
+}, 30_000);
+
+it.each([
+	false,
+	true,
+])("SDK refuses a protocol alias before artifact effects and retries after its removal (restart=%s)", async restart => {
+	const fixture = await createFixture();
+	let broker = new Broker({ agentDir: fixture.agentDir });
+	const artifacts = fixture.transcript.slice(0, -6);
+	const unlink = vi.spyOn(native, "exactUnlink");
 	await fs.mkdir(artifacts, { mode: 0o700 });
 	await Bun.write(path.join(artifacts, "retained.txt"), "retained artifact");
 	await fs.mkdir(path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal.saved"), { mode: 0o700 });
@@ -376,6 +498,8 @@ it("SDK refuses an unauthenticated protocol alias before artifact or owner paylo
 		expect(response).toMatchObject({ ok: false, error: { code: "cleanup_pending" } });
 		const cleanup = cleanupOf(response);
 		expect(cleanup.phase).toBe("artifacts");
+		expect(cleanup.artifactsRemoved).toBeUndefined();
+		expect(cleanup.artifactTree?.snapshot).toBeDefined();
 		expect(cleanup.taskArtifactOwnerRetired).toBeUndefined();
 		expect(cleanup.taskArtifactOwnerTranscriptDeleted).toBeUndefined();
 		expect(await fs.readFile(fixture.transcript)).toEqual(transcriptBefore);
@@ -394,7 +518,26 @@ it("SDK refuses an unauthenticated protocol alias before artifact or owner paylo
 			});
 		}
 		await preserveNewerSession(fixture);
+		expect(unlink.mock.calls.some(([pathname]) => pathname === artifacts)).toBe(false);
+		await fs.rmdir(path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal.saved"));
+		if (restart) {
+			await broker.stop();
+			broker = new Broker({ agentDir: fixture.agentDir });
+			await broker.start();
+		}
+		const replay = await broker.handleRequest(
+			"session.delete",
+			deleteRequest(fixture),
+			"unauthenticated-protocol-delete",
+		);
+		expect(unlink.mock.calls.some(([pathname]) => pathname === artifacts)).toBe(true);
+		if (!replay.ok) {
+			expect(replay.error.code).toBe("cleanup_pending");
+			expect(replay.error.message).not.toContain("canonical artifact path reappeared");
+		}
+		await preserveNewerSession(fixture);
 	} finally {
+		unlink.mockRestore();
 		await broker.stop();
 		await safeRm(fixture.root, { recursive: true, force: true });
 	}
@@ -586,6 +729,74 @@ it.each([
 	}
 }, 30_000);
 
+it.each([
+	{ phase: "staging", replaceTranscript: false, restart: false },
+	{ phase: "replacement", replaceTranscript: false, restart: false },
+	{ phase: "staging", replaceTranscript: false, restart: true },
+	{ phase: "replacement", replaceTranscript: false, restart: true },
+	{ phase: "staging", replaceTranscript: true, restart: true },
+] as const)("SDK retries initial writer capture only for its original transcript (%j)", async ({
+	phase,
+	replaceTranscript,
+	restart,
+}) => {
+	const fixture = await createFixture();
+	let broker = new Broker({ agentDir: fixture.agentDir });
+	let writer: PausedOwnerWriter | undefined;
+	const transcriptBefore = await fs.readFile(fixture.transcript);
+	try {
+		writer = await pauseOwnerWriter(fixture, phase);
+		await broker.start();
+		const request = deleteRequest(fixture);
+		const first = await broker.handleRequest("session.delete", request, `initial-${phase}-capture`);
+		const firstCleanup = cleanupOf(first);
+		expect(firstCleanup).toMatchObject({
+			phase: "artifacts",
+			taskArtifactOwnerCleanupError: "task_artifact_owner_writer_not_quiescent",
+		});
+		expect(firstCleanup.taskArtifactOwnerDeletionEvidence).toBeUndefined();
+		expect(firstCleanup.artifactsRemoved).toBeUndefined();
+		expect(await fs.readFile(fixture.transcript)).toEqual(transcriptBefore);
+		if (restart) {
+			await broker.stop();
+			broker = new Broker({ agentDir: fixture.agentDir });
+			await broker.start();
+		}
+		const stillWriting = await broker.handleRequest("session.delete", request, `initial-${phase}-capture`);
+		expect(cleanupOf(stillWriting).taskArtifactOwnerCleanupError).toBe("task_artifact_owner_writer_not_quiescent");
+		expect(cleanupOf(stillWriting).taskArtifactOwnerDeletionEvidence).toBeUndefined();
+		expect(await fs.readFile(fixture.transcript)).toEqual(transcriptBefore);
+		await writer.release();
+		writer = undefined;
+		const ownerBeforeReplay = await regularFiles(fixture.ownerDirectory);
+		if (replaceTranscript) {
+			await fs.rename(fixture.transcript, `${fixture.transcript}.original`);
+			await Bun.write(fixture.transcript, transcriptBefore);
+		}
+		if (restart) {
+			await broker.stop();
+			broker = new Broker({ agentDir: fixture.agentDir });
+			await broker.start();
+		}
+		const replay = await broker.handleRequest("session.delete", request, `initial-${phase}-capture`);
+		if (replaceTranscript) {
+			expect(cleanupOf(replay).taskArtifactOwnerCleanupError).toBe(
+				"task_artifact_owner_transcript_identity_mismatch",
+			);
+			expect(await fs.readFile(fixture.transcript)).toEqual(transcriptBefore);
+			expect(await regularFiles(fixture.ownerDirectory)).toEqual(ownerBeforeReplay);
+		} else {
+			if (!replay.ok) expectPayloadRetired(replay, fixture.sessionId);
+			expect(await Bun.file(fixture.transcript).exists()).toBe(false);
+		}
+		await preserveNewerSession(fixture);
+	} finally {
+		if (writer) await writer.release();
+		await broker.stop();
+		await safeRm(fixture.root, { recursive: true, force: true });
+	}
+}, 30_000);
+
 it("SDK deletion refuses a shared owner when a sibling transcript carries the same locator", async () => {
 	const fixture = await createFixture();
 	const broker = new Broker({ agentDir: fixture.agentDir });
@@ -615,10 +826,11 @@ it("SDK deletion refuses a shared owner when a sibling transcript carries the sa
 		const cleanup = cleanupOf(response);
 		expect(cleanup).toMatchObject({
 			phase: "artifacts",
-			artifactsRemoved: true,
+			artifactsAbsentAtAuthorization: true,
 			taskArtifactOwnerCleanupError: "task_artifact_owner_shared_with_sibling_transcript",
 			taskArtifactOwnerDeletionEvidence: { schemaVersion: OWNER_DELETION_SCHEMA_VERSION },
 		});
+		expect(cleanup.artifactsRemoved).toBeUndefined();
 		expect(await fs.readFile(fixture.transcript)).toEqual(originalTranscript);
 		expect(await regularFiles(fixture.ownerDirectory)).toEqual(ownerBefore);
 		expect(

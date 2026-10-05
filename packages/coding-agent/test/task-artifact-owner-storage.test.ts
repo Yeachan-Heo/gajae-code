@@ -441,7 +441,7 @@ describe("verified storage consumes task artifact owners", () => {
 		expect(recoveryOpen).not.toHaveBeenCalled();
 		expect(retain).not.toHaveBeenCalled();
 		expect(result.kind).toBe("cleanup_pending");
-		expect(result.kind === "cleanup_pending" ? result.phase : undefined).toBe("task_artifact_owner");
+		expect(result).toMatchObject({ kind: "cleanup_pending", phase: "task_artifact_owner", artifactsRemoved: false });
 		expect(filesystemSnapshot(fixture.root)).toEqual(before);
 		expect(nativeRemoval.spy).not.toHaveBeenCalled();
 		expect(fs.readFileSync(fixture.ownerPayloadPath, "utf8")).toBe("owner-payload");
@@ -459,7 +459,7 @@ describe("verified storage consumes task artifact owners", () => {
 		const nativeRemoval = recordActualOwnerRemoval();
 		const artifactPhase = await deleteVerified(fixture, targetFor(fixture));
 		if (artifactPhase.kind === "cleanup_pending") {
-			expect(artifactPhase.phase).toBe("task_artifact_owner");
+			expect(artifactPhase).toMatchObject({ phase: "task_artifact_owner", artifactsRemoved: true });
 			expect(artifactPhase.taskArtifactOwnerRetired).toBeUndefined();
 			expect(artifactPhase.taskArtifactOwnerRetirementOutcome?.nativeOutcome).toEqual(nativeRemoval.calls[0]);
 			expect(fs.existsSync(fixture.transcriptPath)).toBe(true);
@@ -616,7 +616,7 @@ describe("verified storage consumes task artifact owners", () => {
 			targetFor(fixture, { deferTaskArtifactOwnerRetirement: true }),
 			managedGcProtocolScopeInspectorForScope(fixture.scope),
 		);
-		expect(result).toMatchObject({ kind: "cleanup_pending", phase: "task_artifact_owner" });
+		expect(result).toMatchObject({ kind: "cleanup_pending", phase: "task_artifact_owner", artifactsRemoved: false });
 		expect(nativeRemoval.spy).not.toHaveBeenCalled();
 		expect(filesystemSnapshot(fixture.root)).toEqual(before);
 	});

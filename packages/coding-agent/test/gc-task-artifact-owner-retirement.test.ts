@@ -9,6 +9,8 @@ import { collectGcDiskReport, resolveGcDiskPolicy } from "../src/gjc-runtime/gc-
 import { Broker } from "../src/sdk/broker/broker";
 import {
 	bindManagedGcSessionRetirementTarget,
+	discoverManagedGcSessionRetirementReceipts,
+	MANAGED_SESSION_BINDING_FILE,
 	type ManagedScope,
 	managedGcProtocolScopeInspectorForScope,
 	prepareManagedSessionScopeForWriteSync,
@@ -66,6 +68,20 @@ function writeSession(scope: ManagedScope, id: string, cwd: string, locator?: Ta
 	const header = { type: "session", id, cwd, version: 3, ...(locator ? { taskArtifactOwner: locator } : {}) };
 	fs.writeFileSync(transcriptPath, `${JSON.stringify(header)}\n`, { mode: 0o600 });
 	return transcriptPath;
+}
+
+function makeHistoricalExternalScope() {
+	const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gc-external-historical-scope-")));
+	roots.push(root);
+	const agentDir = path.join(root, "profile");
+	const configuredRoot = path.join(root, "external");
+	const sessionsRoot = path.join(configuredRoot, "sessions");
+	const cwd = path.join(root, "workspace");
+	for (const directory of [agentDir, configuredRoot, cwd]) fs.mkdirSync(directory, { mode: 0o700 });
+	const scope = managedScope(agentDir, sessionsRoot, cwd);
+	writeSession(scope, crypto.randomUUID(), cwd);
+	fs.rmSync(cwd, { recursive: true });
+	return { root, agentDir, configuredRoot, sessionsRoot };
 }
 
 function makeFixture(): Fixture {
@@ -237,6 +253,112 @@ async function publishArtifactsRemoved(fixture: Fixture) {
 }
 
 describe("owner-aware disk session retirement", () => {
+	it.each([
+		false,
+		true,
+	])("keeps owner-free GC usable after its historical workspace is removed (prune=%s)", async prune => {
+		const fixture = makeFixture();
+		writeSession(fixture.scope, fixture.sessionId, fixture.cwd);
+		await fs.promises.rm(fixture.ownerPath, { recursive: true });
+		await backdate(fixture.transcriptPath, 90);
+		writeSession(fixture.scope, "newest-session", fixture.cwd);
+		await fs.promises.rm(fixture.cwd, { recursive: true });
+		const report = await runGc(fixture, prune);
+		expect(report.errors).toEqual([]);
+		const oldSession = report.surfaces.sessions.records.find(record => record.path === fixture.transcriptPath);
+		expect(oldSession?.action).toBe(prune ? "reclaimed" : "would_reclaim");
+		expect(fs.existsSync(fixture.transcriptPath)).toBe(!prune);
+		expect(fs.existsSync(path.join(fixture.scope.directoryPath, "newest-session.jsonl"))).toBe(true);
+	});
+	it.each([
+		"binding-bytes",
+		"binding-digest",
+		"protocol-symlink",
+		"journal",
+	] as const)("refuses unauthenticated or journal-bearing historical scopes after workspace deletion (%s)", async obstruction => {
+		const fixture = makeFixture();
+		const bindingPath = path.join(fixture.scope.directoryPath, MANAGED_SESSION_BINDING_FILE);
+		if (obstruction === "binding-bytes") {
+			const bytes = await Bun.file(bindingPath).text();
+			await Bun.write(bindingPath, bytes.trim());
+		} else if (obstruction === "binding-digest") {
+			const binding = await Bun.file(bindingPath).json();
+			await Bun.write(bindingPath, `${JSON.stringify({ ...binding, identityDigest: "a".repeat(52) })}\n`);
+		} else if (obstruction === "protocol-symlink") {
+			const protocol = path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal");
+			await fs.promises.rm(protocol, { recursive: true, force: true });
+			const foreign = path.join(fixture.root, "foreign-protocol");
+			await fs.promises.mkdir(foreign, { mode: 0o700 });
+			await fs.promises.symlink(foreign, protocol, process.platform === "win32" ? "junction" : "dir");
+		} else {
+			await publishPrepared(fixture);
+		}
+		await fs.promises.rm(fixture.cwd, { recursive: true });
+		const before = snapshotTree(fixture.scope.directoryPath);
+		const report = await runGc(fixture, false);
+		expect(JSON.stringify(report.errors)).toContain(
+			obstruction === "protocol-symlink"
+				? "Managed descendant path escapes retained store"
+				: "managed_gc_scope_authority_mismatch",
+		);
+		expect(snapshotTree(fixture.scope.directoryPath)).toEqual(before);
+	});
+
+	it("authenticates an external configured root for empty historical journal discovery without mutation", async () => {
+		const fixture = makeHistoricalExternalScope();
+		const before = snapshotTree(fixture.configuredRoot);
+		expect(await discoverManagedGcSessionRetirementReceipts(fixture)).toEqual([]);
+		expect(snapshotTree(fixture.configuredRoot)).toEqual(before);
+	});
+
+	it.skipIf(process.platform === "win32")(
+		"rejects insecure POSIX configured-root permissions without repair",
+		async () => {
+			const fixture = makeHistoricalExternalScope();
+			fs.chmodSync(fixture.configuredRoot, 0o777);
+			const before = snapshotTree(fixture.configuredRoot);
+			await expect(discoverManagedGcSessionRetirementReceipts(fixture)).rejects.toThrow(
+				"managed_gc_scope_authority_mismatch",
+			);
+			expect(snapshotTree(fixture.configuredRoot)).toEqual(before);
+		},
+	);
+
+	it("rejects configured-parent replacement even when the original sessions subtree is preserved", async () => {
+		const fixture = makeHistoricalExternalScope();
+		const originalParent = fs.lstatSync(fixture.configuredRoot, { bigint: true });
+		const originalSessions = fs.lstatSync(fixture.sessionsRoot, { bigint: true });
+		let checks = 0;
+		let retainedSnapshot: string[] | undefined;
+		const replaceAfterVerification = (pathname: string): void => {
+			if (pathname !== fixture.configuredRoot || ++checks !== 2) return;
+			const retained = `${fixture.configuredRoot}.original`;
+			fs.renameSync(fixture.configuredRoot, retained);
+			fs.mkdirSync(fixture.configuredRoot, { mode: 0o700 });
+			fs.renameSync(path.join(retained, "sessions"), fixture.sessionsRoot);
+			retainedSnapshot = snapshotTree(fixture.sessionsRoot);
+		};
+		const originalVerify = native.verifyOwnerOnlyPathSecurity;
+		vi.spyOn(native, "verifyOwnerOnlyPathSecurity").mockImplementation((pathname, kind) => {
+			const result = originalVerify(pathname, kind);
+			replaceAfterVerification(pathname);
+			return result;
+		});
+		const originalExpected = native.verifyOwnerOnlyPathSecurityExpected;
+		vi.spyOn(native, "verifyOwnerOnlyPathSecurityExpected").mockImplementation((pathname, kind, dev, ino) => {
+			const result = originalExpected(pathname, kind, dev, ino);
+			replaceAfterVerification(pathname);
+			return result;
+		});
+		await expect(discoverManagedGcSessionRetirementReceipts(fixture)).rejects.toThrow(
+			process.platform === "win32" ? "identity_mismatch" : "managed_gc_scope_authority_mismatch",
+		);
+		if (!retainedSnapshot) throw new Error("Configured-parent replacement did not reach the verified boundary");
+		expect(fs.lstatSync(fixture.configuredRoot, { bigint: true }).ino).not.toBe(originalParent.ino);
+		expect(fs.lstatSync(fixture.sessionsRoot, { bigint: true }).ino).toBe(originalSessions.ino);
+		expect(snapshotTree(fixture.sessionsRoot)).toEqual(retainedSnapshot);
+	});
+
 	for (const phase of ["prepared", "artifacts_removed"] as const) {
 		for (const transcriptAuthority of ["retained", "absent", "fsync-empty"] as const) {
 			it(`retains a genuine legacy SDK receipt after GC ${phase} with ${transcriptAuthority} authority`, async () => {
