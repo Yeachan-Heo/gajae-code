@@ -2467,6 +2467,7 @@ test.each([
 	"busy-at-dispatch",
 	"joined-progress",
 	"held-terminal",
+	"held-ordinary-abort",
 	"claim-failure",
 	"finalize-failure",
 ] as const)("a diverted text-only prompt keeps exact lifecycle ownership (%s)", async mode => {
@@ -2501,7 +2502,7 @@ test.each([
 	let releaseQueueAbort: (() => void) | undefined;
 	const warnSpy = spyOn(logger, "warn").mockImplementation(() => {});
 	const heldCommit =
-		mode === "held-terminal"
+		mode === "held-terminal" || mode === "held-ordinary-abort"
 			? pauseNextReconciliationCommit(path.join(cwd, "session.jsonl"), sessionId, true)
 			: undefined;
 	const failedCommit =
@@ -2621,13 +2622,14 @@ test.each([
 			return frames.find(frame => frame.id === id)!;
 		};
 		if (heldCommit || failedCommit) {
+			const terminalCancellation = mode !== "held-ordinary-abort";
 			socket.send(
 				JSON.stringify({
 					type: "control_request",
 					id: "persist-cancel",
 					operation: "turn.abort",
-					input: { mode: "terminal" },
-					idempotencyKey: "persist-cancel",
+					input: terminalCancellation ? { mode: "terminal" } : {},
+					...(terminalCancellation ? { idempotencyKey: "persist-cancel" } : {}),
 				}),
 			);
 			if (heldCommit) {

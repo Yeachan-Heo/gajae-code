@@ -6724,9 +6724,15 @@ export function createNotificationsExtension(
 							return { aborted: true, disposition: "cancelled" as const };
 						}
 					}
-					await terminalizePrompt({ commandId, turnId }, cancellationOutcome, {
-						fence: hasExecutionHandle || !submission.preflightAbort,
-					});
+					const removal = queuedRemovalTerminals.get(key);
+					if (removal) {
+						if (!(await removal))
+							throw new TypedControlError("busy", "Queued prompt cancellation could not be durably confirmed.");
+					} else {
+						await terminalizePrompt({ commandId, turnId }, cancellationOutcome, {
+							fence: hasExecutionHandle || !submission.preflightAbort,
+						});
+					}
 				}
 				return { aborted: true, disposition: "cancelled" as const };
 			},
