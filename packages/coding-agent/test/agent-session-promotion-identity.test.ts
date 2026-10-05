@@ -639,6 +639,158 @@ describe("queued promotion run identity (#4668)", () => {
 		expect(session.pendingMessageCounts.followUp).toBe(0);
 	});
 
+	for (const disposition of ["resume", "remove"] as const) {
+		it(`parks previously scheduled ordinary queue work released from startup during SDK publication (${disposition})`, async () => {
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+			const mock = createMockModel({ responses: [{ content: ["SDK answer"] }, { content: ["ordinary answer"] }] });
+			const agent = new Agent({
+				getApiKey: provider => `${provider}-test-key`,
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: mock.stream,
+			});
+			const startupFence = Promise.withResolvers<void>();
+			const publisherHeld = Promise.withResolvers<void>();
+			const releasePublisher = Promise.withResolvers<void>();
+			const rawEndObserved = Promise.withResolvers<void>();
+			const ordinaryStarted = Promise.withResolvers<void>();
+			let queueAdmission: Promise<void> | undefined;
+			let rawObservation:
+				| {
+						rawStreaming: boolean;
+						sessionStreaming: boolean;
+						generation?: number;
+						initialQueueSize: number;
+						admittedQueueSize: number;
+				  }
+				| undefined;
+			let publisherGeneration: number | undefined;
+			let publisherFinished = false;
+			const ordinaryText = "ordinary scheduled before SDK terminal barrier";
+			const observations: {
+				kind: "terminal" | "ordinary";
+				generation?: number;
+				publisherFinished?: boolean;
+				queued?: number;
+			}[] = [];
+			// Register before AgentSession, exactly as the existing genuine unwind fixture.
+			const unsubscribeRaw = agent.subscribe(event => {
+				if (event.type === "agent_end" && queueAdmission === undefined) {
+					const current = session!;
+					const initialQueueSize = agent.snapshotFollowUp().length;
+					const rawStreaming = agent.state.isStreaming;
+					const sessionStreaming = current.isStreaming;
+					current.extendStartupTurnBarrier(startupFence.promise);
+					queueAdmission = current.followUp(ordinaryText);
+					rawObservation = {
+						rawStreaming,
+						sessionStreaming,
+						generation: event.scope?.generation,
+						initialQueueSize,
+						admittedQueueSize: agent.snapshotFollowUp().length,
+					};
+					rawEndObserved.resolve();
+				}
+				if (event.type !== "message_start" || event.message.role !== "user") return;
+				const content =
+					typeof event.message.content === "string"
+						? event.message.content
+						: event.message.content.map(part => (part.type === "text" ? part.text : "")).join("");
+				if (content === ordinaryText) {
+					observations.push({ kind: "ordinary", publisherFinished });
+					ordinaryStarted.resolve();
+				}
+			});
+			const extensionRunner = {
+				hasHandlers: vi.fn((eventType: string) => eventType === "agent_end"),
+				hasToolResultMediation: vi.fn().mockReturnValue(false),
+				emitBeforeAgentStart: vi.fn().mockResolvedValue({ messages: [] }),
+				emit: vi.fn(async (event: unknown, _continueWhile: unknown, deliveryScope?: { generation: number }) => {
+					const typedEvent = event as { type?: string; sdkRunToken?: string };
+					if (typedEvent.type === "agent_end" && typedEvent.sdkRunToken !== undefined) {
+						publisherGeneration = deliveryScope?.generation;
+						publisherHeld.resolve();
+						await releasePublisher.promise;
+						publisherFinished = true;
+					}
+				}),
+			};
+			const settings = Settings.isolated({ "compaction.enabled": false });
+			settings.setModelRole("default", `${model.provider}/${model.id}`);
+			session = new AgentSession({
+				agent,
+				sessionManager: SessionManager.inMemory(),
+				settings,
+				modelRegistry,
+				extensionRunner: extensionRunner as never,
+			});
+			const unsubscribeTerminal = session.subscribe(event => {
+				if (event.type === "agent_end")
+					observations.push({
+						kind: "terminal",
+						generation: event.scope?.generation,
+						queued: agent.snapshotFollowUp().length,
+					});
+			});
+			const sdkPrompt = session.sendUserMessage("actual SDK root", {
+				sdkRunCapability: createSdkRunCapability("scheduled-startup-fence-owner"),
+			});
+			try {
+				await withTimeout(rawEndObserved.promise, 5_000, "actual SDK raw end before session listener");
+				expect(rawObservation).toMatchObject({
+					rawStreaming: false,
+					sessionStreaming: true,
+					initialQueueSize: 0,
+					admittedQueueSize: 1,
+				});
+				expect(rawObservation?.generation).toBeDefined();
+				if (!queueAdmission) throw new Error("Expected actual pre-barrier ordinary queue admission");
+				await withTimeout(queueAdmission, 5_000, "pre-barrier ordinary admission");
+				await withTimeout(publisherHeld.promise, 5_000, "actual SDK publisher owns active boundary");
+				expect(publisherGeneration).toBe(rawObservation?.generation);
+				expect(mock.calls).toHaveLength(1);
+				expect(agent.snapshotFollowUp()).toHaveLength(1);
+				startupFence.resolve();
+				expect(
+					await Promise.race([ordinaryStarted.promise.then(() => "started"), Bun.sleep(20).then(() => "pending")]),
+				).toBe("pending");
+				expect(mock.calls).toHaveLength(1);
+				expect(agent.snapshotFollowUp()).toHaveLength(1);
+				if (disposition === "remove") {
+					const queued = session.getQueuedMessageEntries().find(entry => entry.text === ordinaryText);
+					if (!queued) throw new Error("Expected original parked ordinary queue identity");
+					expect(session.removeQueuedMessageForEditing(queued.id)).toBe(ordinaryText);
+					expect(agent.snapshotFollowUp()).toHaveLength(0);
+				}
+				releasePublisher.resolve();
+				await expect(withTimeout(sdkPrompt, 5_000, "real SDK void submission settlement")).resolves.toBeUndefined();
+				if (disposition === "resume")
+					await withTimeout(ordinaryStarted.promise, 5_000, "actual publication resumes preexisting queued task");
+				await withTimeout(session.waitForIdle(), 5_000, "fenced queued task complete settlement");
+				expect(mock.calls).toHaveLength(disposition === "resume" ? 2 : 1);
+				expect(agent.snapshotFollowUp()).toHaveLength(0);
+				expect(
+					observations.filter(
+						event => event.kind === "ordinary" || event.generation === rawObservation?.generation,
+					),
+				).toEqual([
+					{ kind: "terminal", generation: rawObservation?.generation, queued: 1 },
+					...(disposition === "resume" ? [{ kind: "ordinary" as const, publisherFinished: true }] : []),
+				]);
+			} finally {
+				startupFence.resolve();
+				releasePublisher.resolve();
+				unsubscribeRaw();
+				unsubscribeTerminal();
+				await withTimeout(
+					sdkPrompt.catch(() => {}),
+					5_000,
+					"fenced fixture submission disposal",
+				);
+			}
+		});
+	}
+
 	it("returns a stable handle for same-run steering and its terminal scope", async () => {
 		const gate = Promise.withResolvers<void>();
 		const toolStarted = Promise.withResolvers<void>();
