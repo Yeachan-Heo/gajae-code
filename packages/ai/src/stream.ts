@@ -1017,6 +1017,7 @@ function mapOptionsForApi<TApi extends Api>(
 		streamFirstEventTimeoutMs: options?.streamFirstEventTimeoutMs,
 		streamIdleTimeoutMs: options?.streamIdleTimeoutMs,
 		apiKey: apiKey || options?.apiKey,
+		authCredentialType: options?.authCredentialType,
 		fallbackManaged: options?.fallbackManaged,
 		fallbackAttempt: options?.fallbackAttempt,
 		cacheRetention: options?.cacheRetention ?? model.cacheRetention,
