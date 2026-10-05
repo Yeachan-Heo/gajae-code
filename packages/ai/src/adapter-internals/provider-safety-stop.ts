@@ -7,6 +7,7 @@ const PROVIDER_SAFETY_STOP_INVOCATION_KEY = Symbol("provider-safety-stop-invocat
 
 type ProviderSafetyStopModelIdentity = Pick<Model<Api>, "api" | "provider" | "id" | "baseUrl">;
 const trustedProviderSafetyStopModels = new WeakMap<object, string>();
+const trustedProviderSafetyStopIdentities = new Set<string>();
 
 function providerSafetyStopModelIdentity(model: ProviderSafetyStopModelIdentity): string {
 	return `${model.api}\u0000${model.provider}\u0000${model.id}\u0000${model.baseUrl ?? ""}`;
@@ -15,7 +16,9 @@ function providerSafetyStopModelIdentity(model: ProviderSafetyStopModelIdentity)
 /** Register an immutable catalog identity for first-party provider dispatch. */
 export function registerProviderSafetyStopModel(model: Model<Api>): void {
 	try {
-		trustedProviderSafetyStopModels.set(model, providerSafetyStopModelIdentity(model));
+		const identity = providerSafetyStopModelIdentity(model);
+		trustedProviderSafetyStopModels.set(model, identity);
+		trustedProviderSafetyStopIdentities.add(identity);
 	} catch {
 		// A malformed/hostile model must remain fallback-eligible.
 	}
@@ -24,10 +27,9 @@ export function registerProviderSafetyStopModel(model: Model<Api>): void {
 /** Verify that a model is the unchanged identity of a bundled catalog entry. */
 export function isProviderSafetyStopModelTrusted(model: unknown): boolean {
 	if (typeof model !== "object" || model === null) return false;
-	const expected = trustedProviderSafetyStopModels.get(model);
-	if (expected === undefined) return false;
 	try {
-		return expected === providerSafetyStopModelIdentity(model as ProviderSafetyStopModelIdentity);
+		const identity = providerSafetyStopModelIdentity(model as ProviderSafetyStopModelIdentity);
+		return trustedProviderSafetyStopIdentities.has(identity);
 	} catch {
 		return false;
 	}
