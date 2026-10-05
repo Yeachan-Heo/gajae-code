@@ -767,7 +767,7 @@ function createEmptyUsage(): AssistantMessage["usage"] {
 
 /** @internal Exported for tests. */
 export function formatCodexUserAgent(platform: string, release: string, arch: string): string {
-	return `pi/${packageJson.version} (${sanitizeHeaderComponent(platform)} ${sanitizeHeaderComponent(release)}; ${sanitizeHeaderComponent(arch)})`;
+	return `${OPENAI_HEADER_VALUES.ORIGINATOR_CODEX}/${packageJson.version} (${sanitizeHeaderComponent(platform)} ${sanitizeHeaderComponent(release)}; ${sanitizeHeaderComponent(arch)})`;
 }
 
 function getCodexUserAgent(): string {
