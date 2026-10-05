@@ -27,7 +27,11 @@ import {
 import { Broker } from "../broker/broker";
 import { createKindAwareReconciliation } from "../bus/kind-aware-reconciliation";
 import { createPromptReconciliation } from "../bus/prompt-reconciliation";
-import { createReconciliationStore, type ReconciliationStoreDocument } from "../bus/reconciliation-store";
+import {
+	createReconciliationStore,
+	type ReconciliationStoreDocument,
+	reconciliationStorePath,
+} from "../bus/reconciliation-store";
 import { PromptDeadlineManager } from "../prompt-deadline-manager";
 import { BROKER_RUNTIME_ABORT_CAPABILITY_FIELD, setBrokerRuntimeAbortCapabilityForTest } from "./control/runtime-gate";
 import { SESSION_HOST_OBSERVER_CAPABILITY, TURN_STREAM_CAPABILITY } from "./host";
@@ -3026,12 +3030,10 @@ describe("SessionSdkSessionRuntime", () => {
 			on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
 				handlers.set(event, handler);
 			},
-			sendUserMessage: (
-				_content: string,
-				options: { onPreflightAccepted?: () => void; onPreflightAcceptCommit?: () => void } | undefined,
-			) =>
+			sendUserMessage: (_content: string, options: PreflightHooks | undefined) =>
 				Promise.resolve(options?.onPreflightAcceptCommit?.()).then(() => {
 					options?.onPreflightAccepted?.();
+					if (!idle) options?.onQueuedPromoted?.({ startsOwnRun: false });
 					return {};
 				}),
 		} as unknown as ExtensionAPI;
@@ -7281,6 +7283,11 @@ describe("post-acceptance invocation terminalization", () => {
 				sendUserMessage: async (_content, options) => {
 					if (options?.deliverAs === "followUp") {
 						await options?.onPreflightAcceptCommit?.();
+						options.preflightSignal?.addEventListener(
+							"abort",
+							() => options.onQueuedPromoted?.({ startsOwnRun: false, removed: true }),
+							{ once: true },
+						);
 						// #queueFollowUp resolves immediately; the turn has not run yet.
 						return;
 					}
@@ -7343,6 +7350,11 @@ describe("post-acceptance invocation terminalization", () => {
 				sendUserMessage: async (_content, options) => {
 					// Session is streaming: sendUserMessage diverts to #queueSteer and resolves.
 					await options?.onPreflightAcceptCommit?.();
+					options?.preflightSignal?.addEventListener(
+						"abort",
+						() => options.onQueuedPromoted?.({ startsOwnRun: false, removed: true }),
+						{ once: true },
+					);
 				},
 				isIdle: () => false,
 			});
@@ -7367,6 +7379,11 @@ describe("post-acceptance invocation terminalization", () => {
 					// The session is streaming when the submission starts (divert to steer).
 					// During accept()->persist(), the prior turn unwinds and isIdle flips to true.
 					await options?.onPreflightAcceptCommit?.();
+					options?.preflightSignal?.addEventListener(
+						"abort",
+						() => options.onQueuedPromoted?.({ startsOwnRun: false, removed: true }),
+						{ once: true },
+					);
 					idle = true;
 				},
 				isIdle: () => idle,
@@ -9045,6 +9062,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			expect((await statusOf(idsB, "inrun-status-b")).result?.status).toBe("terminal_ok");
 			// A separate later turn starts: the consumed correlation must NOT be
 			// drained into it, so conn-b owns nothing and its abort is refused.
+			idle = true;
 			transport.feed("conn-c", {
 				type: "control_request",
 				id: "inrun-c",
@@ -10639,6 +10657,185 @@ test("SDK-only host advances a finalized stopped row when the retry replay match
 		expect(discardCalls).toBe(1);
 	} finally {
 		await handlers.get("session_shutdown")?.({}, ctx);
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test.each([
+	"hold",
+	"fail",
+	"removed-before-shutdown",
+	"timeout",
+	"failed-stop",
+] as const)("SDK-only shutdown joins queued terminal publication (%s)", async mode => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-queued-shutdown-"));
+	let removeQueued: (() => void) | undefined;
+	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+	let queued = false;
+	let queueSignal: AbortSignal | undefined;
+	const api = {
+		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
+			handlers.set(event, handler);
+		},
+		sendUserMessage: (_content: string, options: PreflightHooks | undefined) =>
+			Promise.resolve(options?.onPreflightAcceptCommit?.()).then(() => {
+				queued = true;
+				queueSignal = options?.preflightSignal;
+				removeQueued = () => {
+					if (!queued) return;
+					queued = false;
+					options?.onQueuedPromoted?.({ startsOwnRun: false, removed: true });
+				};
+				queueSignal?.addEventListener("abort", removeQueued, { once: true });
+				options?.onPreflightAccepted?.();
+				return {};
+			}),
+	} as unknown as ExtensionAPI;
+	const transport = memoryTransport();
+	let transportStops = 0;
+	const originalStop = transport.stop.bind(transport);
+	const stopSpy = spyOn(transport, "stop").mockImplementation(async () => {
+		transportStops++;
+		if (mode === "failed-stop" && transportStops === 1) throw new Error("Injected first transport stop failure");
+		await originalStop();
+	});
+	const sessionFile = path.join(cwd, "session.json");
+	const store = createReconciliationStore({ sessionFile, sessionId: transport.sessionId });
+	let transportCreations = 0;
+	createSdkSessionRuntimeExtension(api, {
+		agentDir: cwd,
+		createTransport: async () => {
+			transportCreations++;
+			return transport;
+		},
+		terminalAbortSeams: {
+			getReconciliationStore: () => store,
+			getTerminalTurnEpoch: () => 7,
+			getActivePromptHandle: () => "unrelated-handle",
+			cancelPendingPreflightForTerminalAbort: () => {},
+			abortPromptAndWaitWithTerminal: async () => ({ status: "settled", terminalScope: {} }),
+		},
+	});
+	const ctx = { ...extensionContext(transport.sessionId, cwd), isIdle: () => true } as unknown as ExtensionContext;
+	const started = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const target = reconciliationStorePath(sessionFile, transport.sessionId);
+	const originalRename = fsPromises.rename.bind(fsPromises);
+	let commandId: string | undefined;
+	let armed = false;
+	let interrupted = false;
+	const fault = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
+		if (armed && String(to) === target) {
+			const document = (await Bun.file(String(from)).json()) as ReconciliationStoreDocument;
+			if (document.records.some(record => record.commandId === commandId && record.terminalAt !== undefined)) {
+				interrupted = true;
+				started.resolve();
+				if (mode === "fail" || mode === "failed-stop")
+					throw Object.assign(new Error("Injected queued terminal EIO"), { code: "EIO" });
+				await release.promise;
+			}
+		}
+		return originalRename(from, to);
+	});
+	const waitFor = async (predicate: () => boolean, label: string): Promise<void> => {
+		const deadline = Date.now() + 15_000;
+		while (!predicate()) {
+			if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
+			await Bun.sleep(10);
+		}
+	};
+	let shutdown: Promise<void> | undefined;
+	try {
+		await handlers.get("session_start")?.({}, ctx);
+		transport.feed("requester", {
+			type: "control_request",
+			id: "followup",
+			operation: "turn.follow_up",
+			input: { text: "unconsumed followup" },
+		} as SdkFrame);
+		await waitFor(() => transport.sent.some(frame => frame.id === "followup"), "follow-up admission");
+		const accepted = transport.sent.find(frame => frame.id === "followup") as ResponseFrame;
+		expect(accepted.ok).toBe(true);
+		commandId = accepted.result?.commandId;
+		expect(commandId).toBeDefined();
+		await waitFor(() => queued && queueSignal !== undefined, "queued follow-up");
+		armed = true;
+		if (mode === "removed-before-shutdown") {
+			removeQueued?.();
+			await started.promise;
+		}
+		let settled = false;
+		shutdown = Promise.resolve(handlers.get("session_shutdown")?.({}, ctx));
+		void shutdown.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+		await started.promise;
+		expect(interrupted).toBe(true);
+		expect(queueSignal?.aborted).toBe(true);
+		expect(queued).toBe(false);
+		if (mode === "fail" || mode === "timeout" || mode === "failed-stop") {
+			await expect(shutdown).rejects.toMatchObject({ code: "sdk_reconciliation_teardown_failed" });
+			expect(transportStops).toBe(1);
+			if (mode === "fail" || mode === "timeout") {
+				await expect(Promise.resolve(handlers.get("session_start")?.({}, ctx))).rejects.toMatchObject({
+					code: "sdk_reconciliation_teardown_failed",
+				});
+				expect(transportCreations).toBe(1);
+				if (mode === "timeout") {
+					release.resolve();
+					const deadline = Date.now() + 5_000;
+					while (
+						!((await Bun.file(target).json()) as ReconciliationStoreDocument).records.some(
+							record => record.commandId === commandId && record.terminalAt !== undefined,
+						)
+					) {
+						if (Date.now() > deadline) throw new Error("Timed out awaiting original publisher after teardown");
+						await Bun.sleep(10);
+					}
+					await handlers.get("session_start")?.({}, ctx);
+					expect(transportCreations).toBe(2);
+					await handlers.get("session_shutdown")?.({}, ctx);
+				}
+			}
+			if (mode === "failed-stop") {
+				await expect(Promise.resolve(handlers.get("session_shutdown")?.({}, ctx))).rejects.toMatchObject({
+					code: "sdk_reconciliation_teardown_failed",
+				});
+				expect(transportStops).toBe(2);
+			}
+		} else {
+			await Bun.sleep(25);
+			expect(settled).toBe(false);
+			expect(transportStops).toBe(0);
+			transport.feed("requester", {
+				type: "control_request",
+				id: "draining-followup",
+				operation: "turn.follow_up",
+				input: { text: "must not enter during drain" },
+			} as SdkFrame);
+			await waitFor(() => transport.sent.some(frame => frame.id === "draining-followup"), "fenced admission");
+			expect(transport.sent.find(frame => frame.id === "draining-followup")).toMatchObject({
+				ok: false,
+				error: { code: "session_quiescing" },
+			});
+			const pending = (await Bun.file(target).json()) as ReconciliationStoreDocument;
+			expect(pending.records.find(record => record.commandId === commandId)?.terminalAt).toBeUndefined();
+			release.resolve();
+			await shutdown;
+			expect(transportStops).toBe(1);
+			const durable = (await Bun.file(target).json()) as ReconciliationStoreDocument;
+			expect(durable.records.find(record => record.commandId === commandId)?.terminalAt).toBeDefined();
+		}
+	} finally {
+		release.resolve();
+		await shutdown?.catch(() => undefined);
+		fault.mockRestore();
+		stopSpy.mockRestore();
 		await rm(cwd, { recursive: true, force: true });
 	}
 });
