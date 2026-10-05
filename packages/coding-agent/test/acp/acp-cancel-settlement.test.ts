@@ -25,6 +25,8 @@ type Fixture = {
 	updates: SessionNotification[];
 	promptDelivered: Promise<void>;
 	abortDelivered: Promise<void>;
+	terminalPublished: Promise<void>;
+	followUpDelivered: Promise<void>;
 	promptDeliveryCount(): number;
 	promptClientRef(): string;
 	newSessionAgain(): Promise<void>;
@@ -111,6 +113,8 @@ export function createFixture(
 		const queryCalls: string[] = [];
 		const delivered = Promise.withResolvers<void>();
 		const abortDelivered = Promise.withResolvers<void>();
+		const terminalPublished = Promise.withResolvers<void>();
+		const followUpDelivered = Promise.withResolvers<void>();
 		const abort = new AbortController();
 		let promptSocket: TestSocket | undefined;
 		let server!: ReturnType<typeof Bun.serve>;
@@ -289,6 +293,7 @@ export function createFixture(
 					if (frame.operation === "turn.prompt" || frame.operation === "skill.invoke") {
 						promptSocket = socket;
 						promptNumber++;
+						if (promptNumber === 2) followUpDelivered.resolve();
 						const input = frame.input as Record<string, unknown> | undefined;
 						lastPromptClientRef = typeof input?.clientRef === "string" ? input.clientRef : undefined;
 						delivered.resolve();
@@ -307,6 +312,7 @@ export function createFixture(
 						socket.send(
 							JSON.stringify({
 								type: "agent_end",
+								finalText: "cancel-race-terminal",
 								sessionId,
 								...terminalCorrelation,
 								outcome: {
@@ -385,6 +391,12 @@ export function createFixture(
 			{
 				sessionUpdate: async (update: SessionNotification) => {
 					updates.push(update);
+					if (
+						update.update.sessionUpdate === "agent_message_chunk" &&
+						update.update.content.type === "text" &&
+						update.update.content.text === "cancel-race-terminal"
+					)
+						terminalPublished.resolve();
 					if (hangUpdates) await releaseHang.promise;
 				},
 				signal: abort.signal,
@@ -407,6 +419,8 @@ export function createFixture(
 			updates,
 			promptDelivered: delivered.promise,
 			abortDelivered: abortDelivered.promise,
+			terminalPublished: terminalPublished.promise,
+			followUpDelivered: followUpDelivered.promise,
 			promptDeliveryCount: () => promptNumber,
 			promptClientRef: () => {
 				if (!lastPromptClientRef) throw new Error("Expected a turn.prompt clientRef");
@@ -3348,18 +3362,25 @@ test("cancel in flight before follow-up admission still settles the cancelled pr
 		},
 	});
 	try {
-		const background = prompt(fixture, "sleep 5000");
+		let backgroundSettled = false;
+		const background = prompt(fixture, "sleep 5000").then(result => {
+			backgroundSettled = true;
+			return result;
+		});
 		await bounded(fixture.promptDelivered, "background prompt delivery");
 		const cancellation = fixture.agent.cancel({ sessionId: fixture.sessionId });
 		await bounded(fixture.abortDelivered, "cancel request delivery");
+		await bounded(fixture.terminalPublished, "terminal processing before abort acknowledgement");
 		const followUp = prompt(fixture, "echo after-cancel");
+		expect(backgroundSettled).toBe(false);
 		abortGate.resolve();
 		expect(await bounded(cancellation, "cancel acknowledgement")).toBeUndefined();
 		expect(await bounded(background, "cancelled background settlement")).toEqual({ stopReason: "cancelled" });
-		await waitFor(() => fixture.promptDeliveryCount() === 2, "follow-up prompt delivery");
+		await bounded(fixture.followUpDelivered, "follow-up prompt delivery");
 		fixture.sendStopped("end_turn");
 		expect(await bounded(followUp, "follow-up completion")).toEqual({ stopReason: "end_turn" });
 	} finally {
+		abortGate.resolve();
 		fixture.dispose();
 	}
 });
