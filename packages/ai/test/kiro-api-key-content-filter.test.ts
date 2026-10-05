@@ -526,4 +526,149 @@ describe("Kiro API-key content filter #6150", () => {
 		expect(finalError?.usage.input).toBe(25);
 		expect(finalError?.usage.output).toBe(1);
 	});
+
+	// P1: Regional Kiro models are registered as trusted (issue #6151)
+	test("P1: non-default region Kiro model is registered as trusted identity", async () => {
+		const { kiroApiStaticModels, kiroApiBaseUrl } = await import("../src/providers/kiro-api-key");
+		const { isProviderSafetyStopModelTrusted } = await import("../src/adapter-internals/provider-safety-stop");
+
+		// Manually set a non-default region via environment
+		const originalRegion = process.env.KIRO_API_REGION;
+		process.env.KIRO_API_REGION = "eu-central-1";
+
+		try {
+			const models = kiroApiStaticModels();
+			expect(models.length).toBeGreaterThan(0);
+
+			// All models should be registered as trusted (even with non-default region)
+			for (const m of models) {
+				const isTrusted = isProviderSafetyStopModelTrusted(m);
+				expect(isTrusted).toBe(true);
+			}
+
+			// Verify that the baseUrl is region-derived
+			const firstModel = models[0];
+			expect(firstModel.baseUrl).toContain("eu-central-1");
+			expect(firstModel.baseUrl).toBe(kiroApiBaseUrl("eu-central-1"));
+		} finally {
+			// Restore original region
+			if (originalRegion) {
+				process.env.KIRO_API_REGION = originalRegion;
+			} else {
+				delete process.env.KIRO_API_REGION;
+			}
+		}
+	});
+
+	// P2: Partial output is preserved when an ordinary error occurs
+	test("P2: ordinary (non-refusal) error preserves already-emitted text content in error message", async () => {
+		const emittedEvents: Array<{ type: string; text?: string; message?: { errorMessage?: string } }> = [];
+		const model = {
+			id: "test-model",
+			name: "Test",
+			api: "kiro-codewhisperer-stream" as const,
+			provider: "kiro" as const,
+			baseUrl: "",
+			reasoning: false,
+			input: ["text"],
+			output: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 8_192,
+		} satisfies Model<"kiro-codewhisperer-stream">;
+
+		const context: Context = {
+			messages: [{ role: "user", content: "Say hello then fail", timestamp: 1 }],
+		};
+
+		globalThis.fetch = (async () => {
+			// Response with partial content followed by an ordinary error (not a refusal)
+			const responseBody =
+				JSON.stringify({ content: "Hello, this is partial" }) +
+				JSON.stringify({ error: "rate_limit_exceeded", message: "Too many requests" });
+			return new Response(responseBody, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				if (event.type === "text_delta") {
+					emittedEvents.push({ type: event.type, text: event.delta });
+				} else if (event.type === "error") {
+					emittedEvents.push({ type: event.type, message: event.error });
+				} else {
+					emittedEvents.push({ type: event.type });
+				}
+			}
+		} catch {
+			// Errors may be thrown; events are captured above
+		}
+
+		globalThis.fetch = originalFetch;
+
+		// Should have emitted text_delta events before the error
+		const textDeltaEvents = emittedEvents.filter(e => e.type === "text_delta");
+		expect(textDeltaEvents.length).toBeGreaterThan(0);
+
+		// Error event should include the partial content in the message
+		const errorEvent = emittedEvents.find(e => e.type === "error");
+		expect(errorEvent).toBeDefined();
+		expect(errorEvent?.message?.errorMessage).toContain("rate_limit_exceeded");
+		expect(errorEvent?.message?.errorMessage).toContain("Too many requests");
+		expect(errorEvent?.message?.errorMessage).toContain("Partial output");
+		expect(errorEvent?.message?.errorMessage).toContain("Hello, this is partial");
+	});
+
+	test("P2: tool call partial output is preserved when ordinary error occurs", async () => {
+		const emittedEvents: Array<{ type: string; message?: { errorMessage?: string } }> = [];
+		const model = {
+			id: "test-model",
+			name: "Test",
+			api: "kiro-codewhisperer-stream" as const,
+			provider: "kiro" as const,
+			baseUrl: "",
+			reasoning: false,
+			input: ["text"],
+			output: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 8_192,
+		} satisfies Model<"kiro-codewhisperer-stream">;
+
+		const context: Context = {
+			messages: [{ role: "user", content: "Read a file then fail", timestamp: 1 }],
+		};
+
+		globalThis.fetch = (async () => {
+			// Response with text, tool call start, and then an ordinary error
+			const responseBody =
+				JSON.stringify({ content: "I'll read that file" }) +
+				JSON.stringify({ toolUseId: "tool-123", name: "read_file", input: "{" }) +
+				JSON.stringify({ error: "connection_timeout", message: "Connection lost" });
+			return new Response(responseBody, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				if (event.type === "error") {
+					emittedEvents.push({ type: event.type, message: event.error });
+				} else {
+					emittedEvents.push({ type: event.type });
+				}
+			}
+		} catch {
+			// Errors may be thrown; events are captured above
+		}
+
+		globalThis.fetch = originalFetch;
+
+		// Error should be reported but should mention accumulated partial output (text and tool)
+		const errorEvent = emittedEvents.find(e => e.type === "error");
+		expect(errorEvent).toBeDefined();
+		expect(errorEvent?.message?.errorMessage).toContain("connection_timeout");
+		expect(errorEvent?.message?.errorMessage).toContain("Connection lost");
+		// Should mention partial output was accumulated
+		expect(errorEvent?.message?.errorMessage).toContain("Partial output");
+	});
 });

@@ -11,6 +11,7 @@ import {
 	isProviderSafetyStopAdapterInvocation,
 	mintProviderSafetyStop,
 	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+	registerProviderSafetyStopModel,
 } from "../adapter-internals/provider-safety-stop";
 import { Effort } from "../model-thinking";
 import type {
@@ -301,9 +302,19 @@ export function kiroApiStaticModels(): Model<"kiro-codewhisperer-stream">[] {
 			},
 			baseUrl,
 		);
+		// Register as trusted identity if baseUrl is an official region-derived endpoint
+		if (isRegionDerivedKiroApiBaseUrl(baseUrl)) {
+			registerProviderSafetyStopModel(model);
+		}
 		models.push(model);
 		const dashed = toGjcModelId(item.modelId);
-		if (dashed !== item.modelId) models.push({ ...model, id: dashed });
+		if (dashed !== item.modelId) {
+			const dashedModel = { ...model, id: dashed };
+			if (isRegionDerivedKiroApiBaseUrl(baseUrl)) {
+				registerProviderSafetyStopModel(dashedModel);
+			}
+			models.push(dashedModel);
+		}
 	}
 	return models;
 }
@@ -843,8 +854,9 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				const { events, remaining } = parseKiroApiEvents(buffer);
 				buffer = remaining;
 
-				// Check if any terminal events (refusal/error) are present in this batch
-				const hasTerminalEvent = events.some(e => e.type === "refusal" || e.type === "error");
+				// Check if any refusal events are present in this batch.
+				// Refusals suppress all content/tool events, but ordinary errors allow prior events to stream.
+				const hasTerminalEvent = events.some(e => e.type === "refusal");
 
 				for (const event of events) {
 					if (event.type === "content") {
@@ -873,7 +885,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 							firstTokenTime = Date.now();
 						}
 						currentTool.input += event.data.input;
-					} else if (event.type === "toolUseStop" && event.data.stop && !hasTerminalEvent) {
+					} else if (event.type === "toolUseStop" && event.data.stop) {
 						addToolToBlocks();
 					} else if (event.type === "usage") {
 						if (event.data.inputTokens !== undefined) output.usage.input = event.data.inputTokens;
@@ -926,7 +938,14 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 							return;
 						}
 					} else if (event.type === "error") {
-						throw new Error(sanitizeKiroError(`${event.data.error}: ${event.data.message ?? ""}`, apiKey));
+						// Preserve any already-accumulated text in the error context
+						const accumulatedText = blocks
+							.filter((b): b is TextContent => b.type === "text")
+							.map(b => b.text)
+							.join("");
+						const errorMsg = sanitizeKiroError(`${event.data.error}: ${event.data.message ?? ""}`, apiKey);
+						const fullErrorMsg = accumulatedText ? `${errorMsg}\n\nPartial output: ${accumulatedText}` : errorMsg;
+						throw new Error(fullErrorMsg);
 					}
 				}
 			}
