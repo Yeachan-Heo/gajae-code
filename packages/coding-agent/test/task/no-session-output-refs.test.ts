@@ -1060,44 +1060,60 @@ describe("task no-session output refs", () => {
 		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(
 			createSessionResult(createYieldingSession("output that must remain durable")),
 		);
-		vi.spyOn(fs, "mkdtemp").mockRejectedValueOnce(new Error("EACCES: permission denied"));
-
+		const fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-allocation-models-"));
+		const authStorage = await AuthStorage.create(":memory:");
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		const session = createSession(null, `alloc-fail-${Snowflake.next()}`);
-		const tool = await TaskTool.create(session);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(fixtureRoot, "models.yml"), session.settings, {
+			agentDir: fixtureRoot,
+			automaticRefresh: false,
+		});
+		session.authStorage = authStorage;
+		session.modelRegistry = modelRegistry;
+		vi.spyOn(fs, "mkdtemp").mockRejectedValueOnce(new Error("EACCES: permission denied"));
 		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
-		AsyncJobManager.setInstance(manager);
-		const execute = async () => {
-			const started = await tool.execute("tool-call", {
-				agent: "executor",
-				tasks: [{ id: "NoSession", description: "produce output", assignment: "Return a result." }],
-			} as TaskParams);
-			const jobId = started.details?.async?.jobId;
-			if (!jobId) throw new Error("Expected detached task job id");
+		try {
+			const tool = await TaskTool.create(session);
+			AsyncJobManager.setInstance(manager);
+			const execute = async () => {
+				const started = await tool.execute("tool-call", {
+					agent: "executor",
+					tasks: [{ id: "NoSession", description: "produce output", assignment: "Return a result." }],
+				} as TaskParams);
+				const jobId = started.details?.async?.jobId;
+				if (!jobId) throw new Error("Expected detached task job id");
+				await manager.waitForAll();
+				return manager.getJob(jobId)?.resultText ?? "";
+			};
+
+			const failedText = await execute();
+			expect(failedText).toContain("Task completed; output artifact unavailable.");
+			expect(matchAgentOutputId(failedText, "NoSession")).toBeNull();
+			expect(session.getArtifactsDir?.()).toBeNull();
+
+			const record = manager.getSubagentRecords()[0];
+			expect(record?.resumable).toBe(true);
+			const resumed = manager.resumeSubagent(record!.subagentId, undefined, "continue");
+			expect(resumed.ok).toBe(true);
 			await manager.waitForAll();
-			return manager.getJob(jobId)?.resultText ?? "";
-		};
+			const resumedText = manager.getJob(resumed.jobId!)?.resultText ?? "";
+			expect(resumedText).toContain("Task completed; output artifact unavailable.");
+			expect(matchAgentOutputId(resumedText, record!.subagentId)).toBeNull();
+			expect(session.getArtifactsDir?.()).toBeNull();
 
-		const failedText = await execute();
-		expect(failedText).toContain("Task completed; output artifact unavailable.");
-		expect(matchAgentOutputId(failedText, "NoSession")).toBeNull();
-		expect(session.getArtifactsDir?.()).toBeNull();
-
-		const record = manager.getSubagentRecords()[0];
-		expect(record?.resumable).toBe(true);
-		const resumed = manager.resumeSubagent(record!.subagentId, undefined, "continue");
-		expect(resumed.ok).toBe(true);
-		await manager.waitForAll();
-		const resumedText = manager.getJob(resumed.jobId!)?.resultText ?? "";
-		expect(resumedText).toContain("Task completed; output artifact unavailable.");
-		expect(matchAgentOutputId(resumedText, record!.subagentId)).toBeNull();
-		expect(session.getArtifactsDir?.()).toBeNull();
-
-		const retriedText = await execute();
-		expect(matchAgentOutputId(retriedText, "NoSession")).toBeTruthy();
-		const artifactsDir = session.getArtifactsDir?.();
-		expect(artifactsDir).toBeTruthy();
-		await manager.dispose({ timeoutMs: 100 });
-		await session.disposeSession();
-		expect(await pathExists(artifactsDir!)).toBe(false);
+			const retriedText = await execute();
+			expect(matchAgentOutputId(retriedText, "NoSession")).toBeTruthy();
+			const artifactsDir = session.getArtifactsDir?.();
+			expect(artifactsDir).toBeTruthy();
+			await manager.dispose({ timeoutMs: 100 });
+			await session.disposeSession();
+			expect(await pathExists(artifactsDir!)).toBe(false);
+		} finally {
+			await manager.dispose({ timeoutMs: 100 });
+			await session.disposeSession();
+			modelRegistry.dispose();
+			authStorage.close();
+			await fs.rm(fixtureRoot, { recursive: true, force: true });
+		}
 	});
 });
