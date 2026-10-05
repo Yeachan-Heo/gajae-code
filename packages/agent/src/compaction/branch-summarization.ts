@@ -6,7 +6,7 @@
  */
 
 import type { Model, ProviderSessionState } from "@gajae-code/ai";
-import { prompt } from "@gajae-code/utils";
+import { assertEndpointConfiguration, type EndpointConfiguration, prompt } from "@gajae-code/utils";
 import { type AgentTelemetry, instrumentedCompleteSimple } from "../telemetry";
 import type { AgentMessage } from "../types";
 import { estimateMessageTokensHeuristic } from "./compaction";
@@ -67,6 +67,8 @@ export interface CollectEntriesResult {
 }
 
 export interface GenerateBranchSummaryOptions {
+	/** Opaque captured endpoint routing shared with the originating request. */
+	endpointConfiguration?: EndpointConfiguration;
 	/** Model to use for summarization */
 	model: Model;
 	/** API key for the model */
@@ -291,6 +293,7 @@ export async function generateBranchSummary(
 	entries: SessionEntry[],
 	options: GenerateBranchSummaryOptions,
 ): Promise<BranchSummaryResult> {
+	assertEndpointConfiguration(options.endpointConfiguration);
 	const {
 		model,
 		apiKey,
@@ -345,6 +348,7 @@ export async function generateBranchSummary(
 			providerSessionState,
 			maintenanceCall: options.maintenanceCall,
 			preferWebsockets,
+			endpointConfiguration: options.endpointConfiguration,
 		},
 		{ telemetry: options.telemetry, oneshotKind: "branch_summary" },
 	);

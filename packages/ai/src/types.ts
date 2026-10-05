@@ -1,3 +1,4 @@
+import type { EndpointConfiguration } from "@gajae-code/utils";
 import type { ZodType, z } from "zod/v4";
 import type { CustomApiRegistry } from "./api-registry";
 import type { ProviderDiagnostic } from "./provider-diagnostic";
@@ -395,6 +396,8 @@ export interface StreamOptions {
 	maxTokens?: number;
 	/** Explicit custom API handler scope for this execution; never inferred from model metadata. */
 	customApiRegistry?: CustomApiRegistry;
+	/** Opaque captured endpoint routing; credentials and callback authority remain live/shared. */
+	endpointConfiguration?: EndpointConfiguration;
 	signal?: AbortSignal;
 	apiKey?: string;
 	/** Disables all transport-level replay; the fallback controller owns retries. */

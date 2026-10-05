@@ -16,7 +16,7 @@ import {
 	type ProviderSessionState,
 	type Usage,
 } from "@gajae-code/ai";
-import { logger, prompt } from "@gajae-code/utils";
+import { assertEndpointConfiguration, type EndpointConfiguration, logger, prompt } from "@gajae-code/utils";
 import { type AgentTelemetry, instrumentedCompleteSimple } from "../telemetry";
 import type { AgentMessage, AgentTool } from "../types";
 import type { AdaptiveCompactionDecisionState, AdaptiveCompactionOptions } from "./adaptive";
@@ -877,6 +877,8 @@ function formatAdditionalContext(context: string[] | undefined): string {
  * If previousSummary is provided, uses the update prompt to merge.
  */
 export interface SummaryOptions {
+	/** Opaque captured endpoint routing shared with the originating request. */
+	endpointConfiguration?: EndpointConfiguration;
 	promptOverride?: string;
 	extraContext?: string[];
 	remoteEndpoint?: string;
@@ -993,6 +995,7 @@ export async function generateSummary(
 	previousSummary?: string,
 	options?: SummaryOptions,
 ): Promise<string> {
+	assertEndpointConfiguration(options?.endpointConfiguration);
 	const maxTokens = Math.floor(0.8 * reserveTokens);
 
 	// Use update prompt if we have a previous summary, otherwise initial prompt
@@ -1052,6 +1055,7 @@ export async function generateSummary(
 			providerSessionId: options?.providerSessionId,
 			providerSessionState: options?.providerSessionState,
 			preferWebsockets: options?.preferWebsockets,
+			endpointConfiguration: options?.endpointConfiguration,
 		},
 		{ telemetry: options?.telemetry, oneshotKind: "compaction_summary" },
 	);
@@ -1073,6 +1077,8 @@ export async function generateSummary(
 // ============================================================================
 
 export interface HandoffOptions {
+	/** Opaque captured endpoint routing shared with the originating request. */
+	endpointConfiguration?: EndpointConfiguration;
 	/** Live agent system prompt — passed verbatim so providers hit the cached prefix. */
 	systemPrompt: string[];
 	/** Live agent tool list — same purpose. Forced to `toolChoice: "none"`. */
@@ -1127,6 +1133,7 @@ export async function generateHandoff(
 	options: HandoffOptions,
 	signal?: AbortSignal,
 ): Promise<string> {
+	assertEndpointConfiguration(options.endpointConfiguration);
 	const llmMessages = (options.convertToLlm ?? convertToLlm)(messages);
 	const requestMessages: Message[] = [
 		...llmMessages,
@@ -1157,6 +1164,7 @@ export async function generateHandoff(
 			providerSessionId: options.providerSessionId,
 			providerSessionState: options.providerSessionState,
 			preferWebsockets: options.preferWebsockets,
+			endpointConfiguration: options.endpointConfiguration,
 		},
 		{ telemetry: options.telemetry, oneshotKind: "handoff" },
 	);
@@ -1432,6 +1440,7 @@ export async function compact(
 	signal?: AbortSignal,
 	options?: SummaryOptions,
 ): Promise<CompactionResult> {
+	assertEndpointConfiguration(options?.endpointConfiguration);
 	const {
 		firstKeptEntryId,
 		messagesToSummarize,
@@ -1446,6 +1455,7 @@ export async function compact(
 	} = preparation;
 
 	const summaryOptions: SummaryOptions = {
+		endpointConfiguration: options?.endpointConfiguration,
 		promptOverride: options?.promptOverride,
 		extraContext: options?.extraContext,
 		remoteEndpoint: settings.remoteEnabled === false ? undefined : settings.remoteEndpoint,
@@ -1483,7 +1493,10 @@ export async function compact(
 					remoteHistory,
 					summaryOptions.remoteInstructions ?? SUMMARIZATION_SYSTEM_PROMPT,
 					signal,
-					{ authCredentialType: options?.authCredentialType },
+					{
+						authCredentialType: options?.authCredentialType,
+						endpointConfiguration: summaryOptions.endpointConfiguration,
+					},
 				);
 				preserveData = withOpenAiRemoteCompactionPreserveData(previousPreserveData, remote);
 				summaryOptions.remoteCompactionFallbackHealth?.recordRemoteCompactionFallback({
@@ -1607,6 +1620,7 @@ async function generateTurnPrefixSummary(
 	signal?: AbortSignal,
 	options?: SummaryOptions,
 ): Promise<string> {
+	assertEndpointConfiguration(options?.endpointConfiguration);
 	const maxTokens = Math.floor(0.5 * reserveTokens); // Smaller budget for turn prefix
 
 	const llmMessages = (options?.convertToLlm ?? convertToLlm)(messages);
@@ -1635,6 +1649,7 @@ async function generateTurnPrefixSummary(
 			providerSessionId: options?.providerSessionId,
 			providerSessionState: options?.providerSessionState,
 			preferWebsockets: options?.preferWebsockets,
+			endpointConfiguration: options?.endpointConfiguration,
 		},
 		{ telemetry: options?.telemetry, oneshotKind: "compaction_turn_prefix" },
 	);

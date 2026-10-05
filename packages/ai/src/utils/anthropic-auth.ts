@@ -8,7 +8,7 @@
  * `authStorage.getApiKey("anthropic", sessionId)` first, then pass the result
  * through {@link buildAnthropicAuthConfig} for header/URL shaping.
  */
-import { $credentialEnv } from "@gajae-code/utils";
+import { type EndpointConfiguration, readEndpointConfiguration } from "@gajae-code/utils";
 import {
 	buildAnthropicHeaders as buildProviderAnthropicHeaders,
 	normalizeAnthropicBaseUrl,
@@ -37,12 +37,12 @@ function normalizeBaseUrl(baseUrl: string | undefined): string | undefined {
  * authenticated traffic. `$env` merges the caller's `cwd/.env`, so reading it
  * there would let repository content choose where credentials are sent.
  */
-export function resolveAnthropicBaseUrlFromEnv(): string | undefined {
-	if (isFoundryEnabled()) {
-		const foundryBaseUrl = normalizeBaseUrl($credentialEnv("FOUNDRY_BASE_URL"));
+export function resolveAnthropicBaseUrlFromEnv(endpointConfiguration?: EndpointConfiguration): string | undefined {
+	if (isFoundryEnabled(endpointConfiguration)) {
+		const foundryBaseUrl = normalizeBaseUrl(readEndpointConfiguration(endpointConfiguration, "FOUNDRY_BASE_URL"));
 		if (foundryBaseUrl) return foundryBaseUrl;
 	}
-	const anthropicBaseUrl = normalizeBaseUrl($credentialEnv("ANTHROPIC_BASE_URL"));
+	const anthropicBaseUrl = normalizeBaseUrl(readEndpointConfiguration(endpointConfiguration, "ANTHROPIC_BASE_URL"));
 	return anthropicBaseUrl || undefined;
 }
 
@@ -64,10 +64,14 @@ export function isOAuthToken(apiKey: string): boolean {
  * `isOAuth` is derived from the token prefix so the helper stays pure: callers
  * never have to thread the OAuth flag through their own resolution logic.
  */
-export function buildAnthropicAuthConfig(apiKey: string, baseUrl?: string): AnthropicAuthConfig {
+export function buildAnthropicAuthConfig(
+	apiKey: string,
+	baseUrl?: string,
+	endpointConfiguration?: EndpointConfiguration,
+): AnthropicAuthConfig {
 	return {
 		apiKey,
-		baseUrl: normalizeBaseUrl(baseUrl) ?? resolveAnthropicBaseUrlFromEnv() ?? DEFAULT_BASE_URL,
+		baseUrl: normalizeBaseUrl(baseUrl) ?? resolveAnthropicBaseUrlFromEnv(endpointConfiguration) ?? DEFAULT_BASE_URL,
 		isOAuth: isOAuthToken(apiKey),
 	};
 }

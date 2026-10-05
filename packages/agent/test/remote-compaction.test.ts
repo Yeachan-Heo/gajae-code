@@ -1,11 +1,13 @@
 import { describe, expect, test } from "bun:test";
+import { type CompactionPreparation, compact } from "@gajae-code/agent-core/compaction";
 import {
 	buildOpenAiNativeHistory,
+	getPreservedOpenAiRemoteCompactionData,
 	requestOpenAiRemoteCompaction,
 	requestRemoteCompaction,
 } from "@gajae-code/agent-core/compaction/openai";
 import type { AssistantMessage, Model, ToolResultMessage } from "@gajae-code/ai/types";
-import { hookFetch } from "@gajae-code/utils";
+import { captureEndpointConfiguration, type EndpointConfiguration, hookFetch } from "@gajae-code/utils";
 
 function setEnvForTest(key: string, value: string): () => void {
 	const previous = Bun.env[key];
@@ -16,6 +18,21 @@ function setEnvForTest(key: string, value: string): () => void {
 		} else {
 			Bun.env[key] = previous;
 		}
+	};
+}
+
+function makeCompactionPreparation(messages: CompactionPreparation["recentMessages"]): CompactionPreparation {
+	return {
+		firstKeptEntryId: "kept-entry",
+		messagesToSummarize: [],
+		turnPrefixMessages: [],
+		recentMessages: messages,
+		isSplitTurn: false,
+		tokensBefore: 1,
+		previousSummary: "existing summary",
+		fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+		settings: { enabled: true, reserveTokens: 1024, keepRecentTokens: 1024, remoteEnabled: true },
+		tokenCorrection: { ratio: 1, keepRecentTokensCorrected: 0 },
 	};
 }
 
@@ -216,6 +233,144 @@ describe("remote compaction input trimming", () => {
 });
 
 describe("remote compaction endpoint", () => {
+	test("uses captured routing through the maintenance caller and returns preserve data", async () => {
+		const previousBaseUrl = Bun.env.OPENAI_BASE_URL;
+		const requestCapture: { url?: string; authorization?: string | null } = {};
+		try {
+			Bun.env.OPENAI_BASE_URL = "https://endpoint-a.example.com/v1";
+			const endpointConfiguration = captureEndpointConfiguration();
+			Bun.env.OPENAI_BASE_URL = "https://endpoint-b.example.com/v1";
+			using _hook = hookFetch(async (input, init) => {
+				const request = input instanceof Request ? input : new Request(String(input), init);
+				requestCapture.url = request.url;
+				requestCapture.authorization = request.headers.get("authorization");
+				return Response.json({
+					output: [{ type: "compaction_summary", summary: "remote preserve summary" }],
+				});
+			});
+
+			const result = await compact(
+				makeCompactionPreparation([{ role: "user", content: "preserve this", timestamp: 1 }]),
+				makeOpenAiModel(),
+				"shared-current-key",
+				undefined,
+				undefined,
+				{ endpointConfiguration },
+			);
+
+			expect(requestCapture.url).toBe("https://endpoint-a.example.com/v1/responses/compact");
+			expect(requestCapture.authorization).toBe("Bearer shared-current-key");
+			expect(result.summary).toBe("existing summary");
+			const preserved = getPreservedOpenAiRemoteCompactionData(result.preserveData);
+			expect(preserved?.compactionItem).toEqual({ type: "compaction_summary", summary: "remote preserve summary" });
+			expect(preserved?.replacementHistory.length).toBeGreaterThan(0);
+		} finally {
+			if (previousBaseUrl === undefined) delete Bun.env.OPENAI_BASE_URL;
+			else Bun.env.OPENAI_BASE_URL = previousBaseUrl;
+		}
+	});
+
+	test("captured absence does not adopt a later OPENAI_BASE_URL", async () => {
+		const previousBaseUrl = Bun.env.OPENAI_BASE_URL;
+		const requestCapture: { url?: string; authorization?: string | null } = {};
+		try {
+			delete Bun.env.OPENAI_BASE_URL;
+			const endpointConfiguration = captureEndpointConfiguration();
+			Bun.env.OPENAI_BASE_URL = "https://endpoint-b.example.com/v1";
+			using _hook = hookFetch(async (input, init) => {
+				const request = input instanceof Request ? input : new Request(String(input), init);
+				requestCapture.url = request.url;
+				requestCapture.authorization = request.headers.get("authorization");
+				return Response.json({
+					output: [{ type: "compaction_summary", summary: "compact" }],
+				});
+			});
+
+			await requestOpenAiRemoteCompaction(
+				makeOpenAiModel({ baseUrl: "https://api.openai.com/v1" }),
+				"shared-live-key",
+				[{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
+				"compact",
+				undefined,
+				{ endpointConfiguration },
+			);
+
+			expect(requestCapture.url).toBe("https://api.openai.com/v1/responses/compact");
+			expect(requestCapture.authorization).toBe("Bearer shared-live-key");
+		} finally {
+			if (previousBaseUrl === undefined) delete Bun.env.OPENAI_BASE_URL;
+			else Bun.env.OPENAI_BASE_URL = previousBaseUrl;
+		}
+	});
+
+	test("uses the current shared authorization token without recapturing endpoint routing", async () => {
+		const previousBaseUrl = Bun.env.OPENAI_BASE_URL;
+		const requestUrls: string[] = [];
+		const authorizations: Array<string | null> = [];
+		try {
+			Bun.env.OPENAI_BASE_URL = "https://endpoint-a.example.com/v1";
+			const endpointConfiguration = captureEndpointConfiguration();
+			Bun.env.OPENAI_BASE_URL = "https://endpoint-b.example.com/v1";
+			using _hook = hookFetch(async (input, init) => {
+				const request = input instanceof Request ? input : new Request(String(input), init);
+				requestUrls.push(request.url);
+				authorizations.push(request.headers.get("authorization"));
+				return Response.json({
+					output: [{ type: "compaction_summary", summary: "compact" }],
+				});
+			});
+			const input = [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }];
+
+			await requestOpenAiRemoteCompaction(makeOpenAiModel(), "rotated-key-one", input, "compact", undefined, {
+				endpointConfiguration,
+			});
+			await requestOpenAiRemoteCompaction(makeOpenAiModel(), "rotated-key-two", input, "compact", undefined, {
+				endpointConfiguration,
+			});
+
+			expect(requestUrls).toEqual([
+				"https://endpoint-a.example.com/v1/responses/compact",
+				"https://endpoint-a.example.com/v1/responses/compact",
+			]);
+			expect(authorizations).toEqual(["Bearer rotated-key-one", "Bearer rotated-key-two"]);
+		} finally {
+			if (previousBaseUrl === undefined) delete Bun.env.OPENAI_BASE_URL;
+			else Bun.env.OPENAI_BASE_URL = previousBaseUrl;
+		}
+	});
+
+	test("rejects forged endpoint handles before early compaction routes or fetch", async () => {
+		const previousBaseUrl = Bun.env.OPENAI_BASE_URL;
+		let fetchCalls = 0;
+		try {
+			using _hook = hookFetch(async () => {
+				fetchCalls += 1;
+				return Response.json({ output: [{ type: "compaction_summary", summary: "compact" }] });
+			});
+			const forged = Object.freeze({}) as EndpointConfiguration;
+			const emptyPreparation = makeCompactionPreparation([]);
+			await expect(
+				compact(emptyPreparation, makeOpenAiModel(), "key", undefined, undefined, {
+					endpointConfiguration: forged,
+				}),
+			).rejects.toThrow("Invalid endpoint configuration handle");
+			await expect(
+				requestOpenAiRemoteCompaction(
+					makeOpenAiModel(),
+					"key",
+					[{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
+					"compact",
+					undefined,
+					{ endpointConfiguration: forged },
+				),
+			).rejects.toThrow("Invalid endpoint configuration handle");
+			expect(fetchCalls).toBe(0);
+		} finally {
+			if (previousBaseUrl === undefined) delete Bun.env.OPENAI_BASE_URL;
+			else Bun.env.OPENAI_BASE_URL = previousBaseUrl;
+		}
+	});
+
 	test("uses OPENAI_BASE_URL for OpenAI compaction when bundled metadata has the default OpenAI URL", async () => {
 		const restore = setEnvForTest("OPENAI_BASE_URL", "https://openai-proxy.example.com/v1");
 		let requestUrl: string | undefined;
@@ -240,12 +395,17 @@ describe("remote compaction endpoint", () => {
 		}
 	});
 
-	test("keeps OAuth OpenAI compaction on the default API base URL when OPENAI_BASE_URL is set", async () => {
-		const restore = setEnvForTest("OPENAI_BASE_URL", "https://openai-proxy.example.com/v1");
-		let requestUrl: string | undefined;
+	test("keeps OAuth OpenAI compaction on the canonical origin despite captured and live proxies", async () => {
+		const previousBaseUrl = Bun.env.OPENAI_BASE_URL;
+		const requestCapture: { url?: string; authorization?: string | null } = {};
 		try {
-			using _hook = hookFetch(async input => {
-				requestUrl = String(input instanceof Request ? input.url : input);
+			Bun.env.OPENAI_BASE_URL = "https://captured-proxy.example.com/v1";
+			const endpointConfiguration = captureEndpointConfiguration();
+			Bun.env.OPENAI_BASE_URL = "https://later-proxy.example.com/v1";
+			using _hook = hookFetch(async (input, init) => {
+				const request = input instanceof Request ? input : new Request(String(input), init);
+				requestCapture.url = request.url;
+				requestCapture.authorization = request.headers.get("authorization");
 				return Response.json({
 					output: [{ type: "compaction_summary", summary: "compact" }],
 				});
@@ -257,12 +417,14 @@ describe("remote compaction endpoint", () => {
 				[{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
 				"compact",
 				undefined,
-				{ authCredentialType: "oauth" },
+				{ authCredentialType: "oauth", endpointConfiguration },
 			);
 
-			expect(requestUrl).toBe("https://api.openai.com/v1/responses/compact");
+			expect(requestCapture.url).toBe("https://api.openai.com/v1/responses/compact");
+			expect(requestCapture.authorization).toBe("Bearer oauth-token");
 		} finally {
-			restore();
+			if (previousBaseUrl === undefined) delete Bun.env.OPENAI_BASE_URL;
+			else Bun.env.OPENAI_BASE_URL = previousBaseUrl;
 		}
 	});
 });

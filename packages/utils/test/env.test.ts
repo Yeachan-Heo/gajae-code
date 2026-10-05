@@ -46,6 +46,55 @@ function runEnvIsolationScript(script: string, env: Record<string, string>, cwd:
 	}
 }
 
+describe("captured endpoint configuration", () => {
+	it("retains routing values and absence without capturing credentials or accepting reconstructed handles", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-endpoint-"));
+		tempDirs.push(dir);
+		const moduleUrl = pathToFileURL(path.resolve(import.meta.dir, "../src/env.ts")).href;
+		const routing = {
+			OPENAI_BASE_URL: "https://a.example/v1",
+			AZURE_OPENAI_BASE_URL: "https://azure-a.example",
+			AZURE_OPENAI_RESOURCE_NAME: "resource-a",
+			AZURE_OPENAI_DEPLOYMENT_NAME_MAP: '{"model":"deployment-a"}',
+			AZURE_OPENAI_API_VERSION: "version-a",
+			GOOGLE_CLOUD_PROJECT: "project-a",
+			GCLOUD_PROJECT: "alias-a",
+			GOOGLE_CLOUD_LOCATION: "location-a",
+			FOUNDRY_BASE_URL: "https://foundry-a.example",
+			CLAUDE_CODE_USE_FOUNDRY: "1",
+			CUSTOM_PROVIDER_BASE_URL: "https://custom-a.example",
+		};
+		runEnvIsolationScript(
+			`
+import * as assert from "node:assert/strict";
+import { assertEndpointConfiguration, captureEndpointConfiguration, readEndpointConfiguration, $credentialEnv } from ${JSON.stringify(moduleUrl)};
+const expected = ${JSON.stringify(routing)};
+const captured = captureEndpointConfiguration();
+assertEndpointConfiguration(captured);
+for (const [name, value] of Object.entries(expected)) {
+  Bun.env[name] = "successor-value";
+  assert.equal(readEndpointConfiguration(captured, name), value);
+}
+for (const name of ["ZCODE_PLAN_ANTHROPIC_BASE_URL", "LATER_PROVIDER_BASE_URL"]) {
+  Bun.env[name] = "https://introduced-later.example";
+  assert.equal(readEndpointConfiguration(captured, name), undefined);
+}
+assert.equal(readEndpointConfiguration(undefined, "AZURE_OPENAI_API_VERSION"), "successor-value");
+Bun.env.OPENAI_API_KEY = "rotated-shared-key";
+assert.equal($credentialEnv("OPENAI_API_KEY"), "rotated-shared-key");
+assert.throws(() => readEndpointConfiguration(captured, "OPENAI_API_KEY"), /Not an endpoint-routing/);
+for (const forged of [Object.freeze({}), Object.freeze(Object.create(Object.getPrototypeOf(captured))), JSON.parse(JSON.stringify(captured)), { ...captured }]) {
+  assert.throws(() => assertEndpointConfiguration(forged), /Invalid endpoint configuration handle/);
+  assert.throws(() => readEndpointConfiguration(forged, "OPENAI_BASE_URL"), /Invalid endpoint configuration handle/);
+}
+assert.deepEqual(Object.keys(captured), []);
+`,
+			{ HOME: dir, GJC_CODING_AGENT_DIR: dir, PI_CODING_AGENT_DIR: dir, ...routing },
+			dir,
+		);
+	});
+});
+
 describe("parseEnvFile", () => {
 	it("ignores malformed names and nul-containing values", () => {
 		const filePath = writeTempEnv(

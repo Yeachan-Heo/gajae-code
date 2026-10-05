@@ -2,10 +2,12 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import {
 	$credentialEnv,
-	$env,
 	$pickCredentialEnv,
+	assertEndpointConfiguration,
+	type EndpointConfiguration,
 	extractHttpStatusFromError,
 	getTrustedHomeDir,
+	readEndpointConfiguration,
 } from "@gajae-code/utils";
 import {
 	copyProviderSafetyStopAdapterInvocation,
@@ -123,7 +125,7 @@ function hasVertexAdcCredentials(): boolean {
 	return cachedVertexAdcCredentialsExists;
 }
 
-type KeyResolver = string | (() => string | undefined);
+type KeyResolver = string | ((endpointConfiguration?: EndpointConfiguration) => string | undefined);
 
 const serviceProviderMap: Record<string, KeyResolver> = {
 	"alibaba-token-plan": "ALIBABA_TOKEN_PLAN_API_KEY",
@@ -171,19 +173,22 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	// GitHub Copilot uses GitHub personal access token
 	"github-copilot": () => $pickCredentialEnv("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"),
 	// Foundry mode optionally switches Anthropic auth to enterprise gateway credentials.
-	anthropic: () =>
-		isFoundryEnabled()
+	anthropic: endpointConfiguration =>
+		isFoundryEnabled(endpointConfiguration)
 			? $pickCredentialEnv("ANTHROPIC_FOUNDRY_API_KEY", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
 			: $pickCredentialEnv("ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"),
 	"gitlab-duo": "GITLAB_TOKEN",
 	// Vertex AI supports either GOOGLE_CLOUD_API_KEY or Application Default Credentials.
-	"google-vertex": () => {
+	"google-vertex": endpointConfiguration => {
 		const googleCloudApiKey = $credentialEnv("GOOGLE_CLOUD_API_KEY");
 		if (googleCloudApiKey) return googleCloudApiKey;
 
 		const hasCredentials = hasVertexAdcCredentials();
-		const hasProject = !!($env.GOOGLE_CLOUD_PROJECT || $env.GCLOUD_PROJECT);
-		const hasLocation = !!$env.GOOGLE_CLOUD_LOCATION;
+		const hasProject = !!(
+			readEndpointConfiguration(endpointConfiguration, "GOOGLE_CLOUD_PROJECT") ||
+			readEndpointConfiguration(endpointConfiguration, "GCLOUD_PROJECT")
+		);
+		const hasLocation = !!readEndpointConfiguration(endpointConfiguration, "GOOGLE_CLOUD_LOCATION");
 		if (hasCredentials && hasProject && hasLocation) {
 			return "<authenticated>";
 		}
@@ -228,12 +233,12 @@ const serviceProviderMap: Record<string, KeyResolver> = {
  * Provider authentication intentionally excludes cwd/.env values. Project dotenv files are
  * loaded into $env for app/tool execution, but must not silently fund GJC model requests.
  */
-export function getEnvApiKey(provider: string): string | undefined {
+export function getEnvApiKey(provider: string, endpointConfiguration?: EndpointConfiguration): string | undefined {
 	const resolver = serviceProviderMap[provider];
 	if (typeof resolver === "string") {
 		return $credentialEnv(resolver);
 	}
-	return resolver?.();
+	return resolver?.(endpointConfiguration);
 }
 
 /**
@@ -364,6 +369,7 @@ export function stream<TApi extends Api>(
 	options?: OptionsForApi<TApi>,
 	onStreamCreated?: () => void,
 ): AssistantMessageEventStream {
+	assertEndpointConfiguration(options?.endpointConfiguration);
 	assertCustomApiRegistryActive(options?.customApiRegistry);
 	if (!hasValidatedManagedAttempt(options)) assertManagedAttempt(options);
 	if (options?.fallbackManaged) {
@@ -387,7 +393,9 @@ export function stream<TApi extends Api>(
 	}
 
 	if (model.provider === "gitlab-duo") {
-		const apiKey = (options as StreamOptions | undefined)?.apiKey || getEnvApiKey(model.provider);
+		const apiKey =
+			(options as StreamOptions | undefined)?.apiKey ||
+			getEnvApiKey(model.provider, (options as StreamOptions | undefined)?.endpointConfiguration);
 		if (!apiKey) {
 			throw new Error(formatMissingApiKeyError(model.provider));
 		}
@@ -435,7 +443,9 @@ export function stream<TApi extends Api>(
 		return streamDevinAcp(model as Model<"devin-acp">, context, (options || {}) as DevinAcpOptions, onStreamCreated);
 	}
 
-	const apiKey = options?.apiKey || (model.provider === "opencodex" ? "local" : getEnvApiKey(model.provider));
+	const apiKey =
+		options?.apiKey ||
+		(model.provider === "opencodex" ? "local" : getEnvApiKey(model.provider, options?.endpointConfiguration));
 	if (!apiKey) {
 		throw new Error(formatMissingApiKeyError(model.provider));
 	}
@@ -613,6 +623,7 @@ export function streamSimple<TApi extends Api>(
 	context: Context,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
+	assertEndpointConfiguration(options?.endpointConfiguration);
 	assertCustomApiRegistryActive(options?.customApiRegistry);
 	assertManagedAttempt(options);
 	if (options?.fallbackManaged) {
@@ -624,7 +635,9 @@ export function streamSimple<TApi extends Api>(
 		};
 		options = markManagedAttemptValidated(options);
 	}
-	const retryApiKey = options?.onAuthError ? (options.apiKey ?? getEnvApiKey(model.provider)) : undefined;
+	const retryApiKey = options?.onAuthError
+		? (options.apiKey ?? getEnvApiKey(model.provider, options?.endpointConfiguration))
+		: undefined;
 	if (retryApiKey) {
 		const consumerAbortController = new AbortController();
 		const outer = new AssistantMessageEventStream(() => consumerAbortController.abort());
@@ -776,7 +789,7 @@ export function streamSimple<TApi extends Api>(
 		return events;
 	}
 
-	const apiKey = options?.apiKey || getEnvApiKey(model.provider);
+	const apiKey = options?.apiKey || getEnvApiKey(model.provider, options?.endpointConfiguration);
 	if (!apiKey) {
 		throw new Error(formatMissingApiKeyError(model.provider));
 	}
@@ -989,6 +1002,8 @@ function mapOptionsForApi<TApi extends Api>(
 		repetitionPenalty: options?.repetitionPenalty,
 		maxTokens: resolveDefaultRequestMaxTokens(model, options?.maxTokens),
 		customApiRegistry: options?.customApiRegistry,
+		endpointConfiguration: options?.endpointConfiguration,
+		fetch: options?.fetch,
 		signal: options?.signal,
 		streamFirstEventTimeoutMs: options?.streamFirstEventTimeoutMs,
 		streamIdleTimeoutMs: options?.streamIdleTimeoutMs,
