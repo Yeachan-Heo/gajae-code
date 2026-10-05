@@ -467,7 +467,7 @@ async function runImport(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 	if (!target) {
 		throw new Error("Usage: gjc auth-broker import <file|dir> [--provider=<id>] [--include-disabled] [--dry-run]");
 	}
-	const resolvedTarget = path.resolve(target.startsWith("~") ? target.replace(/^~/, os.homedir()) : target);
+	const resolvedTarget = path.resolve(target.startsWith("~") ? target.replace(/^~/, () => os.homedir()) : target);
 	const { entries, skipped } = await loadImportPlan(resolvedTarget, flags.provider, flags.includeDisabled === true);
 
 	if (flags.json) {

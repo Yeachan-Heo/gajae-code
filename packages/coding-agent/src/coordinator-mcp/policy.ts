@@ -122,8 +122,9 @@ function parseRootList(value: string | undefined): string[] {
 }
 
 function resolveManagedWorktreeRoot(root: string, configured: string | undefined): string {
-	const template = (configured?.trim() || "{repo}/.worktrees").replace(/^~(?=\/|$)/, os.homedir());
-	const resolved = template.replaceAll("{repo}", path.basename(root));
+	// Function replacers so a `$` in the home or repository path is kept verbatim.
+	const template = (configured?.trim() || "{repo}/.worktrees").replace(/^~(?=\/|$)/, () => os.homedir());
+	const resolved = template.replaceAll("{repo}", () => path.basename(root));
 	return path.resolve(path.isAbsolute(resolved) ? resolved : path.join(path.dirname(root), resolved));
 }
 

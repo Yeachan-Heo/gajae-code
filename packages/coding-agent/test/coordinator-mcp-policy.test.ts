@@ -152,6 +152,16 @@ describe("Hermes MCP safety policy", () => {
 		await expect(assertCoordinatorWorkdir(config, worktree)).resolves.toBe(worktree);
 	});
 
+	it("derives the managed worktree root from a repository name containing replacement-pattern characters", () => {
+		// `{repo}` used a string replacement, so `$&` in the directory name expanded to
+		// the placeholder itself and `$'` spliced the template remainder into the path.
+		for (const name of ["a$&b", "x$$y", "q$'z"]) {
+			const root = path.join(os.tmpdir(), name);
+			const config = buildCoordinatorMcpConfig({ GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root });
+			expect(config.managedWorktreeRoots).toEqual([path.join(root, ".worktrees")]);
+		}
+	});
+
 	it("rejects artifact symlink escapes and enforces byte caps", async () => {
 		const root = await tempRoot();
 		const outside = await tempRoot();
