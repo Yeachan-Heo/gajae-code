@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -128,13 +128,25 @@ function createYieldingSession(output: string): AgentSession {
 }
 
 type TestToolSession = ToolSession & { disposeSession: () => Promise<void> };
+let fixtureAuthStorage: AuthStorage | undefined;
+let fixtureModelRoot: string | undefined;
+const fixtureRegistries = new Set<ModelRegistry>();
 
 function createSession(sessionFile: string | null, sessionId = "test-in-memory-session"): TestToolSession {
+	if (!fixtureAuthStorage || !fixtureModelRoot) throw new Error("Parent model fixture is not initialized");
+	const settings = Settings.isolated();
+	const modelRegistry = new ModelRegistry(fixtureAuthStorage, path.join(fixtureModelRoot, "models.yml"), settings, {
+		agentDir: fixtureModelRoot,
+		automaticRefresh: false,
+	});
+	fixtureRegistries.add(modelRegistry);
 	const cleanups = new Set<() => Promise<void> | void>();
 	return {
 		cwd: "/tmp",
 		hasUI: false,
-		settings: Settings.isolated(),
+		settings,
+		authStorage: fixtureAuthStorage,
+		modelRegistry,
 		getSessionFile: () => sessionFile,
 		getSessionId: () => sessionId,
 		getArtifactsDir: () => (sessionFile ? sessionFile.slice(0, -6) : null),
@@ -183,10 +195,21 @@ async function runDetachedTask(
 }
 
 describe("task no-session output refs", () => {
-	afterEach(() => {
+	beforeEach(async () => {
+		fixtureModelRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-model-fixture-"));
+		fixtureAuthStorage = await AuthStorage.create(":memory:");
+		fixtureAuthStorage.setRuntimeApiKey("anthropic", "test-key");
+	});
+	afterEach(async () => {
 		AsyncJobManager.resetForTests();
 		InternalUrlRouter.resetForTests();
 		vi.restoreAllMocks();
+		for (const registry of fixtureRegistries) registry.dispose();
+		fixtureRegistries.clear();
+		fixtureAuthStorage?.close();
+		fixtureAuthStorage = undefined;
+		if (fixtureModelRoot) await fs.rm(fixtureModelRoot, { recursive: true, force: true });
+		fixtureModelRoot = undefined;
 	});
 
 	it("advertises durable agent:// output refs for in-memory parents and keeps them readable", async () => {
@@ -1060,16 +1083,7 @@ describe("task no-session output refs", () => {
 		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(
 			createSessionResult(createYieldingSession("output that must remain durable")),
 		);
-		const fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-allocation-models-"));
-		const authStorage = await AuthStorage.create(":memory:");
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		const session = createSession(null, `alloc-fail-${Snowflake.next()}`);
-		const modelRegistry = new ModelRegistry(authStorage, path.join(fixtureRoot, "models.yml"), session.settings, {
-			agentDir: fixtureRoot,
-			automaticRefresh: false,
-		});
-		session.authStorage = authStorage;
-		session.modelRegistry = modelRegistry;
 		vi.spyOn(fs, "mkdtemp").mockRejectedValueOnce(new Error("EACCES: permission denied"));
 		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
 		try {
@@ -1111,9 +1125,6 @@ describe("task no-session output refs", () => {
 		} finally {
 			await manager.dispose({ timeoutMs: 100 });
 			await session.disposeSession();
-			modelRegistry.dispose();
-			authStorage.close();
-			await fs.rm(fixtureRoot, { recursive: true, force: true });
 		}
 	});
 });
