@@ -336,7 +336,7 @@ describe("Kiro API-key content filter #6150", () => {
 	});
 
 	test("ksk_ transport preserves thinking before text in final message", async () => {
-		let finalMessage: unknown = undefined;
+		let finalMessage: unknown;
 
 		globalThis.fetch = (async () => {
 			// Response with thinking followed by text

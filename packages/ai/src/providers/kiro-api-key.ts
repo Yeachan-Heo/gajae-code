@@ -440,7 +440,11 @@ export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[];
 				events.push({ type: "usage", data: u });
 			}
 			// Check for refusal after usage so that usage is processed first and recorded before refusal terminates
-			if ((parsed.stopDetails as any)?.refusal) {
+			if (
+				typeof parsed.stopDetails === "object" &&
+				parsed.stopDetails !== null &&
+				(parsed.stopDetails as Record<string, unknown>).refusal
+			) {
 				// Emit refusal event if stopDetails contains actual refusal data
 				events.push({
 					type: "refusal",
@@ -810,6 +814,10 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						(blocks[i] as any).index = i;
 						if (i - 1 === textIndex) textIndex = i;
 						if (i - 1 === toolcallIndex) toolcallIndex = i;
+					}
+					// Update indices in pending tool calls since all blocks shifted by 1
+					for (const pending of pendingToolCalls) {
+						pending.index += 1;
 					}
 					stream.push({ type: "thinking_start", contentIndex: thinkingIndex, partial: output });
 					stream.push({
