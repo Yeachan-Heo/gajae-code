@@ -5178,8 +5178,7 @@ describe.serial("post-acceptance invocation terminalization", () => {
 						model: model.id,
 						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 						stopReason: "error",
-						errorMessage: "context_length_exceeded",
-						transportFailure: { kind: "transport", status: 400, openaiErrorCode: "context_length_exceeded" },
+						errorMessage: "prompt is too long: context window exceeded",
 						timestamp: Date.now(),
 					};
 					stream.push({ type: "start", partial: failure });
@@ -5190,7 +5189,7 @@ describe.serial("post-acceptance invocation terminalization", () => {
 			session = new AgentSession({
 				agent: new Agent({ getApiKey: () => "test-key", initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] }, streamFn }),
 				sessionManager: SessionManager.inMemory(cwd),
-				settings: Settings.isolated({ "compaction.enabled": false, "contextPromotion.enabled": false, "retry.enabled": false }),
+				settings: Settings.isolated({ "compaction.enabled": true, "compaction.autoContinue": true, "contextPromotion.enabled": false, "retry.enabled": false }),
 				modelRegistry: new ModelRegistry(authStorage),
 			});
 			harness = await invocationHarness("overflow-retry-correlation", cwd, {
