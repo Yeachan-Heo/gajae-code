@@ -1024,6 +1024,9 @@ function gitAt(dir: string, args: readonly string[]) {
  * fast-forward. Runs in throwaway worktrees so the release checkout is untouched, and
  * returns a blocked outcome instead of throwing: the release is already published, so
  * a failed backmerge must never fail the release.
+ * Pushes `dev` directly rather than opening a pull request: CONTRIBUTING.md documents the
+ * release backmerge exception to the exact-head review rule, and this path is refused rather
+ * than retried when the credential lacks the bypass.
  */
 export async function backmergeReleaseIntoDev(version: string): Promise<BackmergeOutcome> {
 	const worktrees: string[] = [];
