@@ -345,9 +345,17 @@ export async function fetchKiroApiModels(
 		if (!item.modelId) continue;
 		const model = toModel(item, baseUrl);
 		models.push(model);
+		// Register as trusted identity if baseUrl is an official region-derived endpoint
+		if (isRegionDerivedKiroApiBaseUrl(baseUrl)) {
+			registerProviderSafetyStopModel(model);
+		}
 		const dashed = toGjcModelId(item.modelId);
 		if (dashed !== item.modelId) {
-			models.push({ ...model, id: dashed });
+			const dashedModel = { ...model, id: dashed };
+			if (isRegionDerivedKiroApiBaseUrl(baseUrl)) {
+				registerProviderSafetyStopModel(dashedModel);
+			}
+			models.push(dashedModel);
 		}
 	}
 	return models;
@@ -822,7 +830,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 					} as ThinkingContent & { index: number });
 					// Update indices of other blocks
 					for (let i = 1; i < blocks.length; i++) {
-						(blocks[i] as any).index = i;
+						(blocks[i] as Block).index = i;
 						if (i - 1 === textIndex) textIndex = i;
 						if (i - 1 === toolcallIndex) toolcallIndex = i;
 					}

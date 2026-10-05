@@ -75,7 +75,7 @@ describe("P2: Tool-only TTFT", () => {
 				status: 200,
 				headers: { "Content-Type": "application/json" },
 			});
-		}) as any;
+		}) as unknown as typeof fetch;
 
 		const result = await streamKiroApiKey(model, context, {
 			apiKey,
@@ -128,7 +128,7 @@ describe("P2: Tool-only TTFT", () => {
 				status: 200,
 				headers: { "Content-Type": "application/json" },
 			});
-		}) as any;
+		}) as unknown as typeof fetch;
 
 		const result = await streamKiroApiKey(model, context, {
 			apiKey,

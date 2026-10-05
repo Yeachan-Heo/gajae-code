@@ -5,8 +5,9 @@
  * "Kiro API key stream returned no tokens".
  */
 import { describe, expect, test } from "bun:test";
-import { streamKiroApiKey } from "../src/providers/kiro-api-key";
-import type { Context, Model } from "../src/types";
+import { isProviderSafetyStopModelTrusted } from "../src/adapter-internals/provider-safety-stop";
+import { kiroApiBaseUrl, kiroApiStaticModels, streamKiroApiKey } from "../src/providers/kiro-api-key";
+import type { AssistantMessage, Context, Model } from "../src/types";
 
 const originalFetch = globalThis.fetch;
 
@@ -486,7 +487,7 @@ describe("Kiro API-key content filter #6150", () => {
 	});
 
 	test("records usage AND refusal when both are in the same metadata object (P1 fix)", async () => {
-		let finalError: any = null;
+		let finalError: AssistantMessage | undefined;
 
 		globalThis.fetch = (async () => {
 			// Real Kiro API response: metadata object with both refusal and usage
@@ -529,9 +530,6 @@ describe("Kiro API-key content filter #6150", () => {
 
 	// P1: Regional Kiro models are registered as trusted (issue #6151)
 	test("P1: non-default region Kiro model is registered as trusted identity", async () => {
-		const { kiroApiStaticModels, kiroApiBaseUrl } = await import("../src/providers/kiro-api-key");
-		const { isProviderSafetyStopModelTrusted } = await import("../src/adapter-internals/provider-safety-stop");
-
 		// Manually set a non-default region via environment
 		const originalRegion = process.env.KIRO_API_REGION;
 		process.env.KIRO_API_REGION = "eu-central-1";
