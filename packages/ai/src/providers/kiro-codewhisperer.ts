@@ -340,11 +340,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 			// Stage event payloads to buffer content until we confirm no refusal is present.
 			// This prevents partial text/tool-call events from being emitted if the stream
 			// ends with a refusal metadata event.
-			interface StagedEvent {
-				eventType: string;
-				payload: unknown;
-			}
-			const stagedEvents: StagedEvent[] = [];
+			
 
 			// Collect all event frames from the eventstream
 			for await (const message of decodeEventStream(response.body)) {
@@ -374,44 +370,30 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 				if (!payload) continue;
 
 				// Stage the event for processing after we scan for refusals
-				stagedEvents.push({ eventType, payload });
 
-				const errorPayload = payload as ErrorPayload;
-				if (errorPayload.error?.message) {
-					throw new Error(`Kiro CodeWhisperer stream error: ${errorPayload.error.message}`);
-				}
-			}
-
-			// Scan for refusal in staged events before emitting any content
-			let refusalEvent: { eventType: string; refusal: { category?: string; explanation?: string } } | undefined;
-			for (const { eventType, payload } of stagedEvents) {
+				// Check for refusal in metadata events
 				if (eventType === "metadataEvent") {
 					const ev = payload as MetadataEvent;
 					if (ev.stopDetails?.refusal) {
-						refusalEvent = { eventType, refusal: ev.stopDetails.refusal };
-						break;
+						output.duration = Date.now() - startTime;
+						if (firstTokenTime) output.ttft = firstTokenTime - startTime;
+						handleKiroRefusal(output, stream, model, ev.stopDetails.refusal, options);
+						stream.end();
+						return;
 					}
 				}
 				if (eventType === "messageMetadataEvent") {
 					const ev = payload as MessageMetadataEvent;
 					if (ev.messageMetadataEvent?.stopDetails?.refusal) {
-						refusalEvent = { eventType, refusal: ev.messageMetadataEvent.stopDetails.refusal };
-						break;
+						output.duration = Date.now() - startTime;
+						if (firstTokenTime) output.ttft = firstTokenTime - startTime;
+						handleKiroRefusal(output, stream, model, ev.messageMetadataEvent.stopDetails.refusal, options);
+						stream.end();
+						return;
 					}
 				}
-			}
 
-			// If refusal found, emit error and return without emitting content events
-			if (refusalEvent) {
-				output.duration = Date.now() - startTime;
-				if (firstTokenTime) output.ttft = firstTokenTime - startTime;
-				handleKiroRefusal(output, stream, model, refusalEvent.refusal, options);
-				stream.end();
-				return;
-			}
-
-			// No refusal found, process all staged events
-			for (const { eventType, payload } of stagedEvents) {
+				// Process content events as they arrive
 				switch (eventType) {
 					case "assistantResponseEvent": {
 						const ev = payload as AssistantResponseEvent;
@@ -454,11 +436,15 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 					case "invalidStateEvent":
 						// Known but unhandled events — ignore gracefully
 						break;
-					default:
-						// Unknown event types — ignore (forward compatibility)
-						break;
+				}
+
+				const errorPayload = payload as ErrorPayload;
+				if (errorPayload.error?.message) {
+					throw new Error(`Kiro CodeWhisperer stream error: ${errorPayload.error.message}`);
 				}
 			}
+
+			
 
 			if (options.signal?.aborted) throw new Error("Request was aborted");
 
