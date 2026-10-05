@@ -359,6 +359,7 @@ export async function persistManagedGcStorageOwnerDisposition(
 	const evidence = parseTaskArtifactOwnerDeletionEvidence(deletion.taskArtifactOwnerDeletionEvidence);
 	if (!target.taskArtifactOwnerDeletionEvidence || !deepSame(evidence, target.taskArtifactOwnerDeletionEvidence))
 		throw new Error("task_artifact_owner_continuation_evidence_mismatch");
+	if (!deletion.artifactsRemoved) return { state: "pending", message: deletion.error.message };
 	const receipt = await publishManagedGcArtifactsRemoved(authority, target);
 	if (!receipt) throw new Error("task_artifact_owner_continuation_state_missing");
 	const outcomeValue = deletion.taskArtifactOwnerRetirementOutcome;

@@ -24,6 +24,7 @@ import {
 	type ManagedGcOwnerCleanupAuthority,
 	type ManagedGcOwnerCleanupTarget,
 	managedGcOwnerDeleteFields,
+	persistManagedGcStorageOwnerDisposition,
 	prepareManagedGcOwnerTarget,
 	retireManagedGcOwnerAfterArtifacts,
 } from "../src/session/internal/managed-task-owner-cleanup";
@@ -31,6 +32,7 @@ import {
 	captureTaskArtifactOwnerDeletionEvidence,
 	newSessionRootStore,
 } from "../src/session/internal/task-artifact-owner-access";
+import { FileSessionStorage } from "../src/session/session-storage";
 import {
 	OWNER_DIRECTORY,
 	OWNER_MANIFEST,
@@ -315,6 +317,35 @@ describe("managed GC owner-cleanup API", () => {
 				sessionId: fixture.sessionId,
 				taskArtifactOwnerDeletionEvidence: fixture.evidence,
 			});
+		});
+	});
+
+	it("does not advance prepared artifact authority after a real owner preflight refusal", async () => {
+		const fixture = makeFixture();
+		await withAuthority(fixture, async authority => {
+			const prepared = await prepareManagedGcOwnerTarget(authority, fixture.candidate);
+			const fields = await managedGcOwnerDeleteFields(authority, prepared);
+			fs.mkdirSync(path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal.saved"), { mode: 0o700 });
+			const deletion = await new FileSessionStorage().deleteSessionVerified(
+				{
+					sessionsRoot: fixture.sessionsRoot,
+					...authority.bindTarget(fixture.transcriptPath),
+					...fields,
+					plannedArtifactsPath: path.join(fixture.scope.directoryPath, ".gjc-delete-api-preflight-artifacts"),
+					plannedTranscriptPath: path.join(fixture.scope.directoryPath, ".gjc-delete-api-preflight-transcript"),
+				},
+				authority.inspectProtocol,
+			);
+			if (deletion.kind !== "cleanup_pending" || deletion.phase !== "task_artifact_owner")
+				throw new Error(`Expected real owner preflight refusal, got ${deletion.kind}`);
+			expect(deletion.artifactsRemoved).toBe(false);
+			const progress = await persistManagedGcStorageOwnerDisposition(authority, prepared, deletion);
+			expect(progress.state).toBe("pending");
+			const receipt = await authority.readReceipt(fixture.transcriptPath);
+			expect(receipt?.state).toBe("prepared");
+			expect(receipt?.artifactsRemoved).toBeUndefined();
+			expect(fs.existsSync(fixture.transcriptPath)).toBe(true);
+			expect(fs.readFileSync(path.join(fixture.ownerPath, "payload.bin"), "utf8")).toBe("real-owner-payload");
 		});
 	});
 

@@ -553,6 +553,8 @@ export type VerifiedSessionDeleteResult =
 	| {
 			kind: "cleanup_pending";
 			phase: "task_artifact_owner";
+			/** True only after verified artifact completion, never inferred from the failure phase. */
+			artifactsRemoved: boolean;
 			error: Error;
 			transcriptIdentity: SessionStorageFileIdentity;
 			taskArtifactOwnerDeletionEvidence: TaskArtifactOwnerDeletionEvidence;
@@ -2675,9 +2677,10 @@ export class FileSessionStorage implements SessionStorage {
 			...(ownerPayloadRetired ? { taskArtifactOwnerPayloadRetired: true as const } : {}),
 			...(ownerNamespaceRetained ? { taskArtifactOwnerNamespaceRetained: true as const } : {}),
 		});
-		const ownerCleanupPending = (error: Error): VerifiedSessionDeleteResult => ({
+		const ownerCleanupPending = (error: Error, completedArtifacts: boolean): VerifiedSessionDeleteResult => ({
 			kind: "cleanup_pending",
 			phase: "task_artifact_owner",
+			artifactsRemoved: completedArtifacts,
 			error,
 			transcriptIdentity,
 			taskArtifactOwnerDeletionEvidence: ownerEvidence!,
@@ -2685,7 +2688,7 @@ export class FileSessionStorage implements SessionStorage {
 		});
 		const finishArtifactPhase = async (): Promise<VerifiedSessionDeleteResult> => {
 			const ownerError = await retireOwnerIfRequired();
-			if (ownerError && ownerEvidence) return ownerCleanupPending(ownerError);
+			if (ownerError && ownerEvidence) return ownerCleanupPending(ownerError, true);
 			if (ownerTranscriptDeleted) return { kind: "deleted", ...ownerResultFields() };
 			return {
 				kind: "artifacts_removed",
@@ -2695,7 +2698,8 @@ export class FileSessionStorage implements SessionStorage {
 			};
 		};
 		const ownerPreflightError = await ownerSiblingRefusal();
-		if (ownerPreflightError && ownerEvidence) return ownerCleanupPending(ownerPreflightError);
+		if (ownerPreflightError && ownerEvidence)
+			return ownerCleanupPending(ownerPreflightError, artifactsRemoved === true);
 		if (detachedArtifactsPath && !artifactsRemoved) {
 			if (
 				!expectedArtifactsIdentity ||
@@ -3013,7 +3017,7 @@ export class FileSessionStorage implements SessionStorage {
 			};
 		}
 		const ownerError = await retireOwnerIfRequired();
-		if (ownerError && ownerEvidence) return ownerCleanupPending(ownerError);
+		if (ownerError && ownerEvidence) return ownerCleanupPending(ownerError, true);
 		if (ownerTranscriptDeleted) return { kind: "deleted", ...ownerResultFields() };
 		if (hasDetachedTranscript) {
 			const deletion = nativeExactUnlink(cleanupTranscriptPath, {
