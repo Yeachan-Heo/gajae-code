@@ -1,11 +1,46 @@
 import { describe, expect, it } from "bun:test";
+import { createInvocationReconciliation } from "../src/sdk/host/session-runtime";
 import {
+	FAILURE_CAUSE_DIAGNOSTIC_MAX,
+	failedPromptOutcome,
 	failureCauseDiagnostic,
 	isValidFailureCauseDiagnostic,
-	FAILURE_CAUSE_DIAGNOSTIC_MAX,
+	publicTerminalOutcome,
+	redactedFailureCauseDiagnostic,
 } from "../src/sdk/prompt-failure";
-import { failedPromptOutcome, publicTerminalOutcome } from "../src/sdk/prompt-failure";
 import type { SdkPromptTerminalOutcome } from "../src/sdk/prompt-status";
+
+describe("host terminal outcome failure cause preservation", () => {
+	it("preserves the failure cause through canonicalization, staging, and finalization", async () => {
+		const reconciliation = createInvocationReconciliation();
+		const ids = { commandId: "diagnostic-command", turnId: "diagnostic-turn" };
+		reconciliation.admit("prompt", "diagnostic-ref");
+		await reconciliation.noteAccepted("prompt", ids, "diagnostic-ref");
+		await reconciliation.noteTransition("prompt", ids, { type: "agent_start" });
+		const outcome = failedPromptOutcome({
+			code: "prompt_failed",
+			provenance: "agent_failed",
+			evidence: {},
+			error: new Error("Network timeout"),
+		});
+		expect(outcome.kind).toBe("failed");
+		if (outcome.kind !== "failed") throw new Error("Expected failed prompt outcome");
+		expect(outcome.failureCauseDiagnostic).toBe("Error Network timeout");
+
+		// Staging routes the failed outcome through canonicalTerminalOutcome.
+		const staged = await reconciliation.stagePendingTerminalOutcome("prompt", ids, outcome);
+		expect(staged).toMatchObject({
+			kind: "failed",
+			phase: "post_start",
+			failureCauseDiagnostic: outcome.failureCauseDiagnostic,
+		});
+		await reconciliation.finalizeOutcome("prompt", ids);
+		expect(reconciliation.lookup("prompt", { clientRef: "diagnostic-ref" })).toMatchObject({
+			status: "failed",
+			outcome: { kind: "failed", failureCauseDiagnostic: outcome.failureCauseDiagnostic },
+		});
+	});
+});
 
 describe("failureCauseDiagnostic", () => {
 	it("extracts class name and message from Error instances", () => {
@@ -189,7 +224,36 @@ describe("isValidFailureCauseDiagnostic", () => {
 	});
 });
 
+describe("redactedFailureCauseDiagnostic", () => {
+	it("preserves a valid diagnostic unchanged by redaction", () => {
+		expect(redactedFailureCauseDiagnostic("Error: Network timeout")).toBe("Error: Network timeout");
+	});
+
+	it("preserves diagnostics already redacted at construction", () => {
+		const diagnostic = failureCauseDiagnostic(new Error("Failed with token: sk-1234567890abcdef"));
+		expect(diagnostic).toBeDefined();
+		expect(diagnostic).not.toContain("sk-1234567890abcdef");
+		expect(redactedFailureCauseDiagnostic(diagnostic)).toBe(diagnostic);
+	});
+
+	it("rejects invalid values and unredacted secrets", () => {
+		for (const value of [null, undefined, 123, {}, [], "", "x".repeat(201), "Error sk-1234567890abcdef"]) {
+			expect(redactedFailureCauseDiagnostic(value)).toBeUndefined();
+		}
+	});
+});
+
 describe("publicTerminalOutcome validation of failureCauseDiagnostic", () => {
+	it("drops a tampered diagnostic containing an unredacted secret", () => {
+		const outcome = {
+			...failedPromptOutcome({ code: "prompt_failed", provenance: "agent_failed", evidence: {} }),
+			failureCauseDiagnostic: "Error sk-1234567890abcdef",
+		};
+		const projected = publicTerminalOutcome(outcome);
+		expect(projected.failureCauseDiagnostic).toBeUndefined();
+		expect(outcome.failureCauseDiagnostic).toBe("Error sk-1234567890abcdef");
+	});
+
 	it("preserves valid failureCauseDiagnostic in public projection", () => {
 		const error = new Error("test failure");
 		const outcome = failedPromptOutcome({

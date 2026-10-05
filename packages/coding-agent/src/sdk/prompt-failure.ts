@@ -158,7 +158,13 @@ export function rephaseFailedOutcome(
 	const diagnostic = sanitizeProviderDiagnostic(outcome.providerDiagnostic);
 	const diagnosticChanged = !isCanonicalDiagnostic(outcome.providerDiagnostic, diagnostic);
 	const failureCauseDiagnosticValid = isValidFailureCauseDiagnostic(outcome.failureCauseDiagnostic);
-	if (category === outcome.category && phase === outcome.phase && message === outcome.message && !diagnosticChanged && failureCauseDiagnosticValid)
+	if (
+		category === outcome.category &&
+		phase === outcome.phase &&
+		message === outcome.message &&
+		!diagnosticChanged &&
+		failureCauseDiagnosticValid
+	)
 		return outcome;
 	const rephased = { ...outcome, category, phase, message };
 	if (diagnostic === undefined) delete rephased.providerDiagnostic;
@@ -238,9 +244,10 @@ export function publicTerminalOutcome<T extends SdkPromptTerminalOutcome | undef
 	delete projected.failureCauseDiagnostic;
 	const validated = providerDiagnosticField(failed.providerDiagnostic);
 	if (validated.providerDiagnostic !== undefined) projected.providerDiagnostic = validated.providerDiagnostic;
-	// Revalidate failureCauseDiagnostic: drop if invalid
-	if (isValidFailureCauseDiagnostic(failed.failureCauseDiagnostic)) {
-		projected.failureCauseDiagnostic = failed.failureCauseDiagnostic;
+	// Drop malformed or tampered diagnostics rather than republishing secrets.
+	const diagnostic = redactedFailureCauseDiagnostic(failed.failureCauseDiagnostic);
+	if (diagnostic !== undefined) {
+		projected.failureCauseDiagnostic = diagnostic;
 	}
 	return projected as T;
 }
@@ -328,6 +335,13 @@ export function isValidFailureCauseDiagnostic(value: unknown): value is string {
 	return typeof value === "string" && value.length > 0 && value.length <= FAILURE_CAUSE_DIAGNOSTIC_MAX;
 }
 
+/** Revalidate stored diagnostics; a value changed by redaction is not trusted. */
+export function redactedFailureCauseDiagnostic(value: unknown): string | undefined {
+	if (!isValidFailureCauseDiagnostic(value)) return undefined;
+	const redacted = redactCrashSecrets(value);
+	return redacted === value ? redacted : undefined;
+}
+
 /**
  * Extract a bounded failure cause diagnostic for operator logs: error class name,
  * first line of message, and exit code/signal if available. Bounded to 200 chars,
@@ -347,27 +361,59 @@ export function failureCauseDiagnostic(error: unknown): string | undefined {
 			message = firstLine.slice(0, 100);
 			// Check for exitCode, signal, or code properties on Error instances
 			const errorAsObj = error as { signal?: unknown; exitCode?: unknown; code?: unknown };
-			if (typeof errorAsObj.signal === "string" && ["SIGTERM", "SIGKILL", "SIGABRT", "SIGSEGV", "SIGINT"].includes(errorAsObj.signal)) {
+			if (
+				typeof errorAsObj.signal === "string" &&
+				["SIGTERM", "SIGKILL", "SIGABRT", "SIGSEGV", "SIGINT"].includes(errorAsObj.signal)
+			) {
 				exitSignal = `signal=${errorAsObj.signal}`;
-			} else if (typeof errorAsObj.exitCode === "number" && Number.isInteger(errorAsObj.exitCode) && errorAsObj.exitCode >= 0 && errorAsObj.exitCode <= 255) {
+			} else if (
+				typeof errorAsObj.exitCode === "number" &&
+				Number.isInteger(errorAsObj.exitCode) &&
+				errorAsObj.exitCode >= 0 &&
+				errorAsObj.exitCode <= 255
+			) {
 				exitSignal = `exit=${errorAsObj.exitCode}`;
-			} else if (typeof errorAsObj.code === "number" && Number.isInteger(errorAsObj.code) && errorAsObj.code >= 0 && errorAsObj.code <= 255) {
+			} else if (
+				typeof errorAsObj.code === "number" &&
+				Number.isInteger(errorAsObj.code) &&
+				errorAsObj.code >= 0 &&
+				errorAsObj.code <= 255
+			) {
 				exitSignal = `code=${errorAsObj.code}`;
 			}
 		} else if (typeof error === "string") {
 			message = error.split("\n")[0]?.slice(0, 100) || "";
 		} else if (error !== null && typeof error === "object") {
-			const candidate = error as { code?: unknown; message?: unknown; signal?: unknown; exitCode?: unknown; className?: unknown };
+			const candidate = error as {
+				code?: unknown;
+				message?: unknown;
+				signal?: unknown;
+				exitCode?: unknown;
+				className?: unknown;
+			};
 			if (typeof candidate.className === "string") className = candidate.className;
 			if (typeof candidate.message === "string") {
 				const firstLine = candidate.message.split("\n")[0] || "";
 				message = firstLine.slice(0, 100);
 			}
-			if (typeof candidate.signal === "string" && ["SIGTERM", "SIGKILL", "SIGABRT", "SIGSEGV", "SIGINT"].includes(candidate.signal)) {
+			if (
+				typeof candidate.signal === "string" &&
+				["SIGTERM", "SIGKILL", "SIGABRT", "SIGSEGV", "SIGINT"].includes(candidate.signal)
+			) {
 				exitSignal = `signal=${candidate.signal}`;
-			} else if (typeof candidate.exitCode === "number" && Number.isInteger(candidate.exitCode) && candidate.exitCode >= 0 && candidate.exitCode <= 255) {
+			} else if (
+				typeof candidate.exitCode === "number" &&
+				Number.isInteger(candidate.exitCode) &&
+				candidate.exitCode >= 0 &&
+				candidate.exitCode <= 255
+			) {
 				exitSignal = `exit=${candidate.exitCode}`;
-			} else if (typeof candidate.code === "number" && Number.isInteger(candidate.code) && candidate.code >= 0 && candidate.code <= 255) {
+			} else if (
+				typeof candidate.code === "number" &&
+				Number.isInteger(candidate.code) &&
+				candidate.code >= 0 &&
+				candidate.code <= 255
+			) {
 				exitSignal = `code=${candidate.code}`;
 			}
 		}

@@ -90,6 +90,7 @@ import {
 	providerDiagnosticField,
 	publicTerminalOutcome,
 	publishedPromptFailure,
+	redactedFailureCauseDiagnostic,
 	rephaseFailedOutcome,
 	sanitizePromptFailure,
 } from "../prompt-failure";
@@ -829,11 +830,12 @@ function canonicalFailedOutcome(
 	providerCode?: string,
 	providerDiagnostic?: unknown,
 	error?: unknown,
+	failureCauseDiagnostic?: unknown,
 ): InvocationOutcome {
 	const deadline = provenance === "deadline" || failure?.code === "prompt_deadline_exceeded";
 	const known = typeof failure?.code === "string" ? failure.code : undefined;
 	const explicit = providerCode ?? (typeof failure?.providerCode === "string" ? failure.providerCode : undefined);
-	return failedPromptOutcome({
+	const outcome = failedPromptOutcome({
 		code: deadline ? "prompt_deadline_exceeded" : "prompt_failed",
 		provenance: deadline ? "deadline" : "agent_failed",
 		...(explicit !== undefined
@@ -845,6 +847,8 @@ function canonicalFailedOutcome(
 		...providerDiagnosticField(providerDiagnostic ?? failure?.providerDiagnostic),
 		...(error !== undefined ? { error } : {}),
 	});
+	const diagnostic = redactedFailureCauseDiagnostic(failureCauseDiagnostic);
+	return diagnostic === undefined ? outcome : { ...outcome, failureCauseDiagnostic: diagnostic };
 }
 
 function canonicalTerminalOutcome(
@@ -859,6 +863,7 @@ function canonicalTerminalOutcome(
 			provenance?: unknown;
 			code?: unknown;
 			providerCode?: unknown;
+			failureCauseDiagnostic?: unknown;
 		};
 		if (candidate.kind === "stopped") {
 			if (candidate.reason === "cancelled" && candidate.provenance === "client_cancel")
@@ -874,6 +879,8 @@ function canonicalTerminalOutcome(
 				evidence,
 				typeof candidate.providerCode === "string" ? candidate.providerCode : undefined,
 				(outcome as { providerDiagnostic?: unknown }).providerDiagnostic,
+				undefined,
+				candidate.failureCauseDiagnostic,
 			);
 	}
 	if (failure !== undefined) return canonicalFailedOutcome(failure, "agent_failed", evidence);
@@ -1012,8 +1019,11 @@ function canonicalizeHydratedDiagnostics(record: InvocationRecord): InvocationRe
 		// rejected value can never survive by being spread over with nothing.
 		const next = { ...outcome };
 		delete next.providerDiagnostic;
+		delete next.failureCauseDiagnostic;
 		const field = providerDiagnosticField((outcome as { providerDiagnostic?: unknown }).providerDiagnostic);
 		if (field.providerDiagnostic !== undefined) next.providerDiagnostic = field.providerDiagnostic;
+		const diagnostic = redactedFailureCauseDiagnostic(outcome.failureCauseDiagnostic);
+		if (diagnostic !== undefined) next.failureCauseDiagnostic = diagnostic;
 		return next;
 	};
 	if (canonical.outcome !== undefined) canonical.outcome = rewrite(canonical.outcome);
@@ -6126,16 +6136,16 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				? canonicalFailedOutcome(failure, "agent_failed", {}, undefined, undefined, failure)
 				: event.stopReason === "cancelled" ||
 						(event.stopReason === "maintenance" && event.maintenanceOutcome === "aborted")
-				? terminalStoppedOutcome(
-						event.stopReason,
-						event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
-					)
-				: terminalEvidence.content?.text.trim() || terminalEvidence.hasActivity
-				? terminalStoppedOutcome(
-						event.stopReason,
-						event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
-					)
-				: canonicalFailedOutcome(EMPTY_PROMPT_FAILURE);
+					? terminalStoppedOutcome(
+							event.stopReason,
+							event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
+						)
+					: terminalEvidence.content?.text.trim() || terminalEvidence.hasActivity
+						? terminalStoppedOutcome(
+								event.stopReason,
+								event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
+							)
+						: canonicalFailedOutcome(EMPTY_PROMPT_FAILURE);
 		const releaseTerminalRetention = retainTerminalBoundaries(failureCandidates);
 		return trackLifecycle(async () => {
 			for (const invocation of failureCandidates) {
