@@ -82,6 +82,7 @@ import {
 import {
 	assistantFailureCode,
 	failedPromptOutcome,
+	failureCauseDiagnostic,
 	failureEvidence,
 	failureProviderDiagnostic,
 	formatPromptFailureForLocalLog,
@@ -4959,6 +4960,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				lifecycleEpoch: number;
 				failureDiagnosticKeys: Set<string>;
 				failureDiagnosticCodes: Map<string, string>;
+				failureDiagnosticCauses: Map<string, string | undefined>;
 				lifecycleTasks: Set<Promise<void>>;
 				/** Failure reasons whose durable agent_failed write failed; the
 				 * subsequent agent_end must re-record them before terminalizing or
@@ -5048,6 +5050,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		// no longer eligible to receive a delayed event.
 		owner.failureDiagnosticKeys.clear();
 		owner.failureDiagnosticCodes.clear();
+		owner.failureDiagnosticCauses.clear();
 		owner.unrecordedFailureReasons?.clear();
 		for (const [token, binding] of lifecycleRunOwners) if (binding.state === owner) lifecycleRunOwners.delete(token);
 	};
@@ -5671,10 +5674,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			const diagnosticCode = sanitizePromptFailure(
 				failureCause ?? Object.assign(new Error("agent run failed"), { code: "agent_failed" }),
 			).code;
+			const failureCauseDiag = failureCauseDiagnostic(failureCause);
 			for (const invocation of transitions)
 				current.failureDiagnosticKeys.add(correlationKey(invocation.correlation));
 			for (const invocation of transitions)
 				current.failureDiagnosticCodes.set(correlationKey(invocation.correlation), diagnosticCode);
+			for (const invocation of transitions)
+				current.failureDiagnosticCauses.set(correlationKey(invocation.correlation), failureCauseDiag);
 		}
 		// Observe whether the lifecycle publication actually landed: a terminal
 		// abort awaits this result so its durable row only claims
@@ -6012,6 +6018,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						current.failureDiagnosticKeys.delete(correlationKey(invocation.correlation));
 					if (!failedKeys.has(correlationKey(invocation.correlation)))
 						current.failureDiagnosticCodes.delete(correlationKey(invocation.correlation));
+					if (!failedKeys.has(correlationKey(invocation.correlation)))
+						current.failureDiagnosticCauses.delete(correlationKey(invocation.correlation));
 				}
 				options.onFailureDiagnosticKeyCountForTests?.(current.failureDiagnosticKeys.size);
 				resolveTerminalPublicationWaiters(observed, terminalPublicationByCorrelation);
@@ -6039,6 +6047,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				current.failureDiagnosticKeys.delete(correlationKey(invocation.correlation));
 			for (const invocation of transitions)
 				current.failureDiagnosticCodes.delete(correlationKey(invocation.correlation));
+			for (const invocation of transitions)
+				current.failureDiagnosticCauses.delete(correlationKey(invocation.correlation));
 			options.onFailureDiagnosticKeyCountForTests?.(current.failureDiagnosticKeys.size);
 			for (const invocation of transitions)
 				if (
@@ -6117,6 +6127,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const recordedFailureCode = failureCandidates
 			.map(({ correlation }) => owner?.failureDiagnosticCodes.get(lifecycleCorrelationKey(correlation)))
 			.find((code): code is string => code !== undefined);
+		const recordedFailureCauseCorrelationKey = failureCandidates
+			.map(({ correlation }) => lifecycleCorrelationKey(correlation))
+			.find(key => owner?.failureDiagnosticCauses.has(key));
+		const recordedFailureCause = recordedFailureCauseCorrelationKey
+			? owner?.failureDiagnosticCauses.get(recordedFailureCauseCorrelationKey)
+			: undefined;
 		const failure =
 			eventFailure ??
 			(recordedFailureCode === undefined
@@ -6133,7 +6149,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const terminalEvidence = promptTerminalEvidenceFromAgentEnd(event);
 		const terminalOutcome =
 			failure !== undefined
-				? canonicalFailedOutcome(failure, "agent_failed", {}, undefined, undefined, failure)
+				? canonicalFailedOutcome(failure, "agent_failed", {}, undefined, undefined, failure, recordedFailureCause)
 				: event.stopReason === "cancelled" ||
 						(event.stopReason === "maintenance" && event.maintenanceOutcome === "aborted")
 					? terminalStoppedOutcome(
@@ -7574,6 +7590,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			lifecycleEpoch: 0,
 			failureDiagnosticKeys: new Set(),
 			failureDiagnosticCodes: new Map(),
+			failureDiagnosticCauses: new Map(),
 			lifecycleTasks: new Set(),
 		};
 		// Capture the SDK turn that owns a headless workflow gate before it is
@@ -7645,6 +7662,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					lifecycleEpoch: 0,
 					failureDiagnosticKeys: new Set(),
 					failureDiagnosticCodes: new Map(),
+					failureDiagnosticCauses: new Map(),
 					lifecycleTasks: new Set(),
 				};
 				lifecycleOwnerHolder.state = failedRuntimeOwner;

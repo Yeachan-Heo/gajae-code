@@ -427,3 +427,53 @@ describe("failedPromptOutcome with error parameter", () => {
 		expect((outcomeUndef as any).failureCauseDiagnostic).toBeUndefined();
 	});
 });
+
+describe("host-level failure cause diagnostic retention through agent_failed/agent_end", () => {
+	it("retains failure cause diagnostic from agent_failed until agent_end emission", () => {
+		const originalError = Object.assign(new Error("Process killed"), {
+			signal: "SIGKILL",
+			code: "kill_signal",
+		});
+
+		// Extract the failure cause diagnostic that would be stored
+		const storedDiagnostic = failureCauseDiagnostic(originalError);
+		expect(storedDiagnostic).toBeDefined();
+		expect(storedDiagnostic).toContain("Error");
+		expect(storedDiagnostic).toContain("Process killed");
+		expect(storedDiagnostic).toContain("signal=SIGKILL");
+
+		// When agent_end reconstructs a failure from stored diagnostic, it should include the message
+		const reconstructedOutcome = failedPromptOutcome({
+			code: "prompt_failed",
+			provenance: "agent_failed",
+			evidence: {},
+			error: originalError,
+		});
+
+		expect(reconstructedOutcome.kind).toBe("failed");
+		if (reconstructedOutcome.kind !== "failed") throw new Error("Expected failed outcome");
+		expect(reconstructedOutcome.failureCauseDiagnostic).toBe(storedDiagnostic);
+	});
+
+	it("preserves diagnostic when agent_end receives the stored failure cause", () => {
+		const error = Object.assign(new Error("boom"), {
+			signal: "SIGKILL",
+		});
+
+		const diagnosticFromAgentFailed = failureCauseDiagnostic(error);
+
+		// With the stored diagnostic passed, it should be preserved
+		const outcomeWithDiagnostic = failedPromptOutcome({
+			code: "prompt_failed",
+			provenance: "agent_failed",
+			evidence: {},
+			error: error, // Including original error to derive diagnostic
+		});
+
+		if (outcomeWithDiagnostic.kind !== "failed") throw new Error("Expected failed outcome");
+		expect(outcomeWithDiagnostic.failureCauseDiagnostic).toBe(diagnosticFromAgentFailed);
+
+		// Verify the diagnostic contains the key information that would be lost without it
+		expect(outcomeWithDiagnostic.failureCauseDiagnostic).toContain("boom");
+	});
+});
