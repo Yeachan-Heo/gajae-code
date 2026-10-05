@@ -16,7 +16,7 @@ export {
 	type ProgressSnapshotTodo,
 	type ProgressSnapshotWorkflow,
 	type ProjectProgressSnapshot,
-} from "../progress/progress-snapshot";
+} from "../progress/progress-contract";
 export type {
 	QueuedInputAdmission,
 	QueuedInputDelivery,

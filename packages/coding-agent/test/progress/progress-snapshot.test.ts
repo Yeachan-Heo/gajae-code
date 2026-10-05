@@ -5,8 +5,8 @@ import { buildSessionProjectProgress } from "@gajae-code/coding-agent/progress/c
 import {
 	PROGRESS_SNAPSHOT_LIMITS,
 	PROJECT_PROGRESS_SNAPSHOT_SCHEMA,
-	toProjectProgressSnapshot,
-} from "@gajae-code/coding-agent/progress/progress-snapshot";
+} from "@gajae-code/coding-agent/progress/progress-contract";
+import { toProjectProgressSnapshot } from "@gajae-code/coding-agent/progress/progress-snapshot";
 import { computeProjectProgress, type ProjectProgressInput } from "@gajae-code/coding-agent/progress/project-progress";
 import { CursorRegistry } from "@gajae-code/coding-agent/sdk/host/query/cursor";
 import { QueryHandlers, type SessionSurface } from "@gajae-code/coding-agent/sdk/host/query/handlers";
@@ -17,7 +17,15 @@ import { renderProgressReportLines } from "@gajae-code/coding-agent/slash-comman
 import { TempDir } from "@gajae-code/utils";
 
 function input(overrides: Partial<ProjectProgressInput> = {}): ProjectProgressInput {
-	return { todos: [], workflows: [], subagents: [], sessionStateRead: true, unreadable: [], ...overrides };
+	return {
+		todos: [],
+		workflows: [],
+		subagents: [],
+		sessionStateRead: true,
+		unreadable: [],
+		recovered: [],
+		...overrides,
+	};
 }
 
 function story(id: string, status: UltragoalGoalStatus, receipt = false) {
@@ -115,7 +123,7 @@ describe("toProjectProgressSnapshot", () => {
 			ref: "G4",
 			text: "Story G4 is blocked: Story G4",
 		});
-		expect(snapshot.sources).toEqual({ sessionStateRead: true, unreadable: [] });
+		expect(snapshot.sources).toEqual({ sessionStateRead: true, unreadable: [], recovered: [] });
 		// The snapshot is plain JSON: no undefined holes for wire clients.
 		expect(JSON.parse(JSON.stringify(snapshot))).toEqual(snapshot);
 	});
@@ -156,6 +164,26 @@ describe("toProjectProgressSnapshot", () => {
 			["state", "workflow-state"],
 		]);
 		expect(snapshot.completion.basis).toBe("none");
+	});
+
+	it("reports workflows beyond the bound as omitted instead of silently truncating", () => {
+		const workflows = (count: number) =>
+			Array.from({ length: count }, (_, index) => ({ skill: `wf-${index}`, phase: `phase-${index}`, chips: [] }));
+		const atLimit = toProjectProgressSnapshot(
+			computeProjectProgress(input({ workflows: workflows(PROGRESS_SNAPSHOT_LIMITS.workflows) })),
+		);
+		expect(atLimit.activeWork.workflows).toHaveLength(PROGRESS_SNAPSHOT_LIMITS.workflows);
+		expect(atLimit.activeWork.omittedWorkflows).toBe(0);
+
+		const report = computeProjectProgress(input({ workflows: workflows(PROGRESS_SNAPSHOT_LIMITS.workflows + 1) }));
+		const snapshot = toProjectProgressSnapshot(report);
+		expect(snapshot.activeWork.workflows).toHaveLength(PROGRESS_SNAPSHOT_LIMITS.workflows);
+		expect(snapshot.activeWork.workflows.at(-1)?.skill).toBe(`wf-${PROGRESS_SNAPSHOT_LIMITS.workflows - 1}`);
+		expect(snapshot.activeWork.omittedWorkflows).toBe(1);
+		const human = renderProgressReportLines(report).join("\n");
+		expect(human).toContain(`wf-${PROGRESS_SNAPSHOT_LIMITS.workflows - 1}: phase-`);
+		expect(human).not.toContain(`wf-${PROGRESS_SNAPSHOT_LIMITS.workflows}:`);
+		expect(human).toContain("… 1 more active workflow not shown");
 	});
 
 	it("bounds list sizes with explicit omission counts and strips terminal control text", () => {

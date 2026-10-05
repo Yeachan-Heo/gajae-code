@@ -1,16 +1,24 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { activeEntryPath, activeSnapshotPath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import type { UltragoalGoalStatus } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
-import { collectProjectProgressInput } from "@gajae-code/coding-agent/progress/collect-project-progress";
+import { acpProgressReportText } from "@gajae-code/coding-agent/modes/acp/acp-agent";
+import {
+	buildSessionProjectProgress,
+	collectProjectProgressInput,
+} from "@gajae-code/coding-agent/progress/collect-project-progress";
+import { toProjectProgressSnapshot } from "@gajae-code/coding-agent/progress/progress-snapshot";
 import {
 	computeProjectProgress,
 	displayPercent,
 	type ProjectProgressInput,
 } from "@gajae-code/coding-agent/progress/project-progress";
 import {
-	ACP_BUILTIN_SLASH_COMMANDS,
-	executeAcpBuiltinSlashCommand,
-} from "@gajae-code/coding-agent/slash-commands/acp-builtins";
+	readVisibleSkillActiveState,
+	readVisibleSkillActiveStateWithStatus,
+} from "@gajae-code/coding-agent/skill-state/active-state";
+import { executeAcpBuiltinSlashCommand } from "@gajae-code/coding-agent/slash-commands/acp-builtins";
 import { renderProgressReportLines } from "@gajae-code/coding-agent/slash-commands/helpers/progress-report";
 import type { SlashCommandRuntime } from "@gajae-code/coding-agent/slash-commands/types";
 import { TempDir } from "@gajae-code/utils";
@@ -18,7 +26,15 @@ import { TempDir } from "@gajae-code/utils";
 const SESSION_ID = "sess-progress";
 
 function input(overrides: Partial<ProjectProgressInput> = {}): ProjectProgressInput {
-	return { todos: [], workflows: [], subagents: [], sessionStateRead: true, unreadable: [], ...overrides };
+	return {
+		todos: [],
+		workflows: [],
+		subagents: [],
+		sessionStateRead: true,
+		unreadable: [],
+		recovered: [],
+		...overrides,
+	};
 }
 
 function story(id: string, status: UltragoalGoalStatus, receipt = false) {
@@ -166,12 +182,38 @@ describe("computeProjectProgress", () => {
 		]);
 	});
 
+	it("never points at blocked, review-blocked, or failed stories as the next story", () => {
+		const nextOf = (...statuses: UltragoalGoalStatus[]) =>
+			computeProjectProgress(
+				input({
+					ultragoal: { objective: "x", stories: statuses.map((status, index) => story(`G${index + 1}`, status)) },
+				}),
+			);
+		// The reviewer's case: no active story, plan ordered [blocked, pending].
+		const blockedFirst = nextOf("blocked", "pending");
+		expect(blockedFirst.stories?.current).toEqual({ id: "G2", title: "Story G2" });
+		expect(toProjectProgressSnapshot(blockedFirst).activeWork.story).toEqual({ id: "G2", title: "Story G2" });
+		expect(renderProgressReportLines(blockedFirst).join("\n")).toContain("next: G2 Story G2");
+		// The blocker is still reported; it just is not the next schedulable story.
+		expect(blockedFirst.signals[0]).toMatchObject({ kind: "blocker", ref: "G1" });
+
+		expect(nextOf("review_blocked", "failed", "pending").stories?.current?.id).toBe("G3");
+		expect(nextOf("pending", "active").stories?.current?.id).toBe("G2");
+
+		// Failed stories are retried only on an explicit `--retry-failed`, which a read-only view never requests.
+		const nothingSchedulable = nextOf("complete", "blocked", "review_blocked", "failed", "superseded");
+		expect(nothingSchedulable.stories?.current).toBeUndefined();
+		expect(toProjectProgressSnapshot(nothingSchedulable).activeWork.story).toBeNull();
+		expect(renderProgressReportLines(nothingSchedulable).join("\n")).not.toContain("next:");
+		expect(nothingSchedulable.headline).toBe("blocked");
+	});
+
 	it("sanitizes untrusted durable text to single display lines", () => {
 		const report = computeProjectProgress(
 			input({ goal: { objective: "line one\nline two\t\u001b[31mred", status: "active", timeUsedSeconds: 90 } }),
 		);
 		const goalLine = renderProgressReportLines(report).find(line => line.startsWith("Goal"));
-		expect(goalLine).toBe("Goal          active · 1m · line one line two   red");
+		expect(goalLine).toBe("Goal          active · 1m · line one line two red");
 	});
 });
 
@@ -227,7 +269,78 @@ describe("collectProjectProgressInput", () => {
 		expect(report.signals.some(signal => signal.text.startsWith("Ultragoal plan could not be read"))).toBe(true);
 	});
 
-	it("renders plain text through the text-mode builtin dispatcher", async () => {
+	const snapshotPath = () => activeSnapshotPath(tempDir.path(), SESSION_ID);
+	const ralplanEntry = { skill: "ralplan", phase: "critic", active: true, session_id: SESSION_ID };
+
+	it("reports a corrupt legacy root-only workflow record as unreadable, not as no active workflows", async () => {
+		// Legacy root-only record (no per-skill active/<skill>.json entry), truncated on disk.
+		await Bun.write(snapshotPath(), '{"active": true, "skill": "ralplan", "phase": "crit');
+		// The tolerant HUD/guard reader keeps its semantics: unreadable reads as nothing active.
+		expect(await readVisibleSkillActiveState(tempDir.path(), SESSION_ID)).toBeNull();
+		expect(await readVisibleSkillActiveStateWithStatus(tempDir.path(), SESSION_ID)).toEqual({
+			status: "failed",
+			state: null,
+		});
+
+		const collected = await collectProjectProgressInput(view());
+		expect(collected.workflows).toEqual([]);
+		expect(collected.unreadable).toEqual(["workflow-state"]);
+		expect(collected.recovered).toEqual([]);
+		const snapshot = toProjectProgressSnapshot(computeProjectProgress(collected));
+		expect(snapshot.sources).toEqual({ sessionStateRead: true, unreadable: ["workflow-state"], recovered: [] });
+		expect(snapshot.attention).toContainEqual({
+			kind: "note",
+			source: "state",
+			ref: "workflow-state",
+			text: "Workflow state could not be read and is excluded from the estimate.",
+		});
+		const human = renderProgressReportLines(computeProjectProgress(collected)).join("\n");
+		expect(human).toContain("unknown: workflow state could not be read");
+		expect(human).not.toContain("none active");
+	});
+
+	it("reports a non-object or I/O-failing workflow snapshot as unreadable", async () => {
+		await Bun.write(snapshotPath(), "42");
+		expect((await collectProjectProgressInput(view())).unreadable).toEqual(["workflow-state"]);
+		await fs.rm(snapshotPath());
+		await fs.mkdir(snapshotPath(), { recursive: true }); // EISDIR on read
+		expect((await collectProjectProgressInput(view())).unreadable).toEqual(["workflow-state"]);
+	});
+
+	it("recovers workflows from authoritative per-skill entries when the snapshot is unreadable", async () => {
+		await Bun.write(snapshotPath(), "{not json");
+		await Bun.write(activeEntryPath(tempDir.path(), SESSION_ID, "ralplan"), JSON.stringify(ralplanEntry));
+		const read = await readVisibleSkillActiveStateWithStatus(tempDir.path(), SESSION_ID);
+		expect(read.status).toBe("recovered");
+		expect(read.state?.active_skills?.map(entry => [entry.skill, entry.phase])).toEqual([["ralplan", "critic"]]);
+
+		const collected = await collectProjectProgressInput(view());
+		expect(collected.workflows.map(workflow => [workflow.skill, workflow.phase])).toEqual([["ralplan", "critic"]]);
+		expect(collected.unreadable).toEqual([]);
+		expect(collected.recovered).toEqual(["workflow-state"]);
+		const snapshot = toProjectProgressSnapshot(computeProjectProgress(collected));
+		expect(snapshot.sources).toEqual({ sessionStateRead: true, unreadable: [], recovered: ["workflow-state"] });
+		expect(snapshot.attention).toContainEqual(
+			expect.objectContaining({ kind: "note", source: "state", ref: "workflow-state" }),
+		);
+	});
+
+	it("distinguishes absent workflow state from a successful read", async () => {
+		expect(await readVisibleSkillActiveStateWithStatus(tempDir.path(), SESSION_ID)).toEqual({
+			status: "absent",
+			state: null,
+		});
+		const absent = await collectProjectProgressInput(view());
+		expect([absent.workflows, absent.unreadable, absent.recovered]).toEqual([[], [], []]);
+
+		await Bun.write(snapshotPath(), JSON.stringify({ version: 1, active: true, skill: "ralplan", phase: "critic" }));
+		expect((await readVisibleSkillActiveStateWithStatus(tempDir.path(), SESSION_ID)).status).toBe("read");
+		const legacy = await collectProjectProgressInput(view());
+		expect(legacy.workflows.map(workflow => workflow.skill)).toEqual(["ralplan"]);
+		expect([legacy.unreadable, legacy.recovered]).toEqual([[], []]);
+	});
+
+	it("renders the same plain text through the text-mode dispatcher as production ACP", async () => {
 		await Bun.write(
 			goalsPath(),
 			JSON.stringify({
@@ -253,11 +366,14 @@ describe("collectProjectProgressInput", () => {
 			},
 		} as unknown as SlashCommandRuntime;
 
-		expect(ACP_BUILTIN_SLASH_COMMANDS.some(command => command.name === "progress")).toBe(true);
 		await expect(executeAcpBuiltinSlashCommand("/progress", runtime)).resolves.toEqual({ consumed: true });
 		expect(output).toHaveLength(1);
 		expect(output[0]).toContain("~50%  1 of 2 ultragoal stories complete");
 		expect(output[0]).not.toContain("\u001b[");
+		const snapshot = toProjectProgressSnapshot(
+			await buildSessionProjectProgress(runtime.session, runtime.sessionManager),
+		);
+		expect(acpProgressReportText({ page: { items: [snapshot], complete: true } })).toBe(output[0]);
 	});
 
 	it("reads no workflow state without a session id", async () => {

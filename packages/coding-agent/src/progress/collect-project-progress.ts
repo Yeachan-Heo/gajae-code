@@ -2,11 +2,15 @@ import type { SubagentLifecycle } from "../async/job-manager";
 import { readUltragoalPlan } from "../gjc-runtime/ultragoal-runtime";
 import type { Goal, GoalModeState } from "../goals/state";
 import type { SessionManager } from "../session/session-manager";
-import { normalizeWorkflowHudSummary, readVisibleSkillActiveState } from "../skill-state/active-state";
+import {
+	normalizeWorkflowHudSummary,
+	readVisibleSkillActiveStateWithStatus,
+	type VisibleSkillActiveStateReadStatus,
+} from "../skill-state/active-state";
 import type { TodoPhase } from "../tools/todo-write";
+import type { ProgressDurableSource } from "./progress-contract";
 import {
 	computeProjectProgress,
-	type ProgressDurableSource,
 	type ProgressUltragoalInput,
 	type ProgressWorkflowInput,
 	type ProjectProgressInput,
@@ -23,9 +27,14 @@ export interface ProjectProgressSessionView {
 	subagents: readonly SubagentLifecycle[];
 }
 
-async function readWorkflows(cwd: string, sessionId: string): Promise<ProgressWorkflowInput[]> {
-	const state = await readVisibleSkillActiveState(cwd, sessionId);
-	return (state?.active_skills ?? [])
+async function readWorkflows(
+	cwd: string,
+	sessionId: string,
+): Promise<{ status: VisibleSkillActiveStateReadStatus; workflows: ProgressWorkflowInput[] }> {
+	// The tolerant HUD reader maps an unreadable session snapshot to "nothing
+	// active"; this projection must report that as unreadable, not as absence.
+	const { status, state } = await readVisibleSkillActiveStateWithStatus(cwd, sessionId);
+	const workflows = (state?.active_skills ?? [])
 		.filter(entry => entry.active !== false)
 		.map(entry => {
 			const hud = normalizeWorkflowHudSummary(entry.hud);
@@ -40,6 +49,7 @@ async function readWorkflows(cwd: string, sessionId: string): Promise<ProgressWo
 				})),
 			};
 		});
+	return { status, workflows };
 }
 
 async function readUltragoal(cwd: string, sessionId: string): Promise<ProgressUltragoalInput | undefined> {
@@ -59,10 +69,12 @@ async function readUltragoal(cwd: string, sessionId: string): Promise<ProgressUl
 /**
  * Gather progress input strictly by reading state. A source that fails to read
  * is reported as unreadable and excluded; it never aborts the overview and is
- * never replaced by a guess.
+ * never replaced by a guess. A source rebuilt from authoritative per-entry
+ * records after its snapshot failed to read is reported as recovered.
  */
 export async function collectProjectProgressInput(view: ProjectProgressSessionView): Promise<ProjectProgressInput> {
 	const unreadable: ProgressDurableSource[] = [];
+	const recovered: ProgressDurableSource[] = [];
 	const sessionId = view.sessionId?.trim() || undefined;
 	let workflows: ProgressWorkflowInput[] = [];
 	let ultragoal: ProgressUltragoalInput | undefined;
@@ -71,8 +83,12 @@ export async function collectProjectProgressInput(view: ProjectProgressSessionVi
 			readWorkflows(view.cwd, sessionId),
 			readUltragoal(view.cwd, sessionId),
 		]);
-		if (workflowResult.status === "fulfilled") workflows = workflowResult.value;
-		else unreadable.push("workflow-state");
+		if (workflowResult.status === "rejected" || workflowResult.value.status === "failed") {
+			unreadable.push("workflow-state");
+		} else {
+			workflows = workflowResult.value.workflows;
+			if (workflowResult.value.status === "recovered") recovered.push("workflow-state");
+		}
 		if (ultragoalResult.status === "fulfilled") ultragoal = ultragoalResult.value;
 		else unreadable.push("ultragoal-plan");
 	}
@@ -94,6 +110,7 @@ export async function collectProjectProgressInput(view: ProjectProgressSessionVi
 		subagents: [...view.subagents],
 		sessionStateRead: sessionId !== undefined,
 		unreadable,
+		recovered,
 	};
 }
 

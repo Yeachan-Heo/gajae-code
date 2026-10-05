@@ -667,13 +667,17 @@ async function mergeVisibleEntries(
 	cwd: string,
 	sessionState: SkillActiveState | null,
 	sessionId: string,
+	perSkillEntries?: readonly SkillActiveEntry[],
 ): Promise<SkillActiveEntry[]> {
 	// Use the raw (active + inactive) rows so a handoff demotion stays visible
 	// long enough to supersede a stale same-skill row before the active filter.
 	// Per-skill files in active/<skill>.json are authoritative and are merged
 	// after the derived snapshot cache, so a stale skill-active-state.json row
 	// cannot override the latest entry file.
-	const entries = [...rawActiveEntries(sessionState), ...(await readActiveEntries(cwd, { sessionId }))];
+	const entries = [
+		...rawActiveEntries(sessionState),
+		...(perSkillEntries ?? (await readActiveEntries(cwd, { sessionId }))),
+	];
 	const merged = new Map(entries.map(entry => [entryKey(entry), entry]));
 	const canonicalRalplanPhase = await readModeStatePhase(cwd, sessionId, "ralplan");
 	const visibleEntries = dedupeVisibleBySkill([...merged.values()], sessionId)
@@ -788,7 +792,16 @@ async function readVisibleSkillActiveStateUncached(
 ): Promise<SkillActiveState | null> {
 	const { sessionPath } = getSkillActiveStatePaths(cwd, resolvedSessionId);
 	const sessionState = await readRawActiveStateForHandoff(sessionPath, false);
-	const activeSkills = await mergeVisibleEntries(cwd, sessionState, resolvedSessionId);
+	return await buildVisibleSkillActiveState(cwd, sessionState, resolvedSessionId);
+}
+
+async function buildVisibleSkillActiveState(
+	cwd: string,
+	sessionState: SkillActiveState | null,
+	resolvedSessionId: string,
+	perSkillEntries?: readonly SkillActiveEntry[],
+): Promise<SkillActiveState | null> {
+	const activeSkills = await mergeVisibleEntries(cwd, sessionState, resolvedSessionId, perSkillEntries);
 	if (activeSkills.length === 0) return null;
 	const primary = activeSkills[0];
 	return {
@@ -804,6 +817,65 @@ async function readVisibleSkillActiveStateUncached(
 }
 
 setActiveStateCacheInvalidator(invalidateVisibleSkillActiveStateCache);
+
+/**
+ * Outcome of a failure-observable workflow-state read:
+ * - `absent`: neither a session snapshot nor a per-skill entry is recorded.
+ * - `read`: every recorded source was read.
+ * - `recovered`: the session snapshot was unreadable, but authoritative per-skill
+ *   entries (which the snapshot is rebuilt from) supplied the visible state.
+ * - `failed`: the session snapshot was unreadable and no per-skill entry could
+ *   replace it (e.g. a corrupt legacy root-only record), so the state is unknown.
+ */
+export type VisibleSkillActiveStateReadStatus = "absent" | "read" | "recovered" | "failed";
+
+export interface VisibleSkillActiveStateRead {
+	status: VisibleSkillActiveStateReadStatus;
+	/** Visible active state; `null` when nothing is active or the read failed. */
+	state: SkillActiveState | null;
+}
+
+/** Strict snapshot read: `undefined` when absent; throws on I/O errors, invalid JSON, or a non-object record. */
+async function readSessionSnapshotStrict(filePath: string): Promise<SkillActiveState | undefined> {
+	let raw: string;
+	try {
+		raw = await Bun.file(filePath).text();
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
+	const parsed: unknown = JSON.parse(raw);
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+		throw new Error(`skill-active-state at ${filePath} is not a JSON object`);
+	return parsed as SkillActiveState;
+}
+
+/**
+ * Uncached, failure-observable counterpart of `readVisibleSkillActiveState` for
+ * read-only projections that must not present unreadable state as absence. The
+ * tolerant reader keeps mapping an unreadable session snapshot to `null` for
+ * HUD and guard callers; this variant reports `failed` or `recovered` instead.
+ * Per-skill entry read failures propagate, as they do from the tolerant reader.
+ */
+export async function readVisibleSkillActiveStateWithStatus(
+	cwd: string,
+	sessionId: string,
+): Promise<VisibleSkillActiveStateRead> {
+	const resolvedCwd = path.resolve(cwd);
+	const { sessionPath } = getSkillActiveStatePaths(resolvedCwd, sessionId);
+	let sessionState: SkillActiveState | undefined;
+	let snapshotUnreadable = false;
+	try {
+		sessionState = await readSessionSnapshotStrict(sessionPath);
+	} catch {
+		snapshotUnreadable = true;
+	}
+	const perSkillEntries = await readActiveEntries(resolvedCwd, { sessionId });
+	if (snapshotUnreadable && perSkillEntries.length === 0) return { status: "failed", state: null };
+	const state = await buildVisibleSkillActiveState(resolvedCwd, sessionState ?? null, sessionId, perSkillEntries);
+	if (snapshotUnreadable) return { status: "recovered", state };
+	return { status: sessionState === undefined && perSkillEntries.length === 0 ? "absent" : "read", state };
+}
 
 export async function readVisibleSkillActiveState(
 	cwd: string,

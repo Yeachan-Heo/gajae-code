@@ -1,7 +1,8 @@
 /**
- * Read-only project progress projection. One report feeds both the
- * human-facing `/progress` view and the machine-facing `session.progress`
- * SDK snapshot (see `progress-snapshot.ts`).
+ * Read-only project progress projection. One report is re-shaped into the
+ * machine-facing `session.progress` SDK snapshot (`progress-snapshot.ts`), and
+ * the human-facing `/progress` view renders that same snapshot
+ * (`render-progress.ts`) in the TUI, text mode, and ACP.
  *
  * The completion indicator is derived exclusively from countable units that
  * carry a durable completion status. It never weights units by size, never
@@ -10,10 +11,19 @@
  * exists the indicator is reported as unknown instead of guessed.
  */
 import type { SubagentLifecycle } from "../async/job-manager";
-import type { UltragoalGoalStatus } from "../gjc-runtime/ultragoal-runtime";
+import { selectNextSchedulableGoal, type UltragoalGoalStatus } from "../gjc-runtime/ultragoal-runtime";
 import type { GoalStatus } from "../goals/state";
 import type { WorkflowHudSeverity } from "../skill-state/active-state";
 import type { TodoStatus } from "../tools/todo-write";
+import type {
+	ProgressAgentCounts,
+	ProgressBasisKind,
+	ProgressDurableSource,
+	ProgressHeadline,
+	ProgressReviewVerdict,
+	ProgressSignalKind,
+	ProgressSignalSource,
+} from "./progress-contract";
 
 export interface ProgressGoalInput {
 	objective: string;
@@ -52,9 +62,6 @@ export interface ProgressUltragoalInput {
 	stories: ProgressStoryInput[];
 }
 
-/** Durable `.gjc` session-state sources that can fail to read. */
-export type ProgressDurableSource = "workflow-state" | "ultragoal-plan";
-
 export const PROGRESS_SOURCE_LABELS: Record<ProgressDurableSource, string> = {
 	"workflow-state": "Workflow state",
 	"ultragoal-plan": "Ultragoal plan",
@@ -70,24 +77,12 @@ export interface ProjectProgressInput {
 	sessionStateRead: boolean;
 	/** Durable sources that exist but could not be read; excluded from the estimate. */
 	unreadable: ProgressDurableSource[];
+	/** Durable sources whose primary record was unreadable but whose contents were recovered from authoritative per-entry records. */
+	recovered: ProgressDurableSource[];
 }
 
-export type ProgressBasisKind = "ultragoal-stories" | "todos" | "goal-status" | "none";
-
-export type ProgressHeadline =
-	| "complete"
-	| "awaiting-completion"
-	| "blocked"
-	| "in-progress"
-	| "not-started"
-	| "paused"
-	| "dropped"
-	| "no-tracked-work";
-
-export type ProgressSignalSource = "ultragoal" | "workflow" | "subagents" | "todos" | "goal" | "state";
-
 export interface ProgressSignal {
-	kind: "blocker" | "pending" | "note";
+	kind: ProgressSignalKind;
 	/** Which durable state produced the signal. */
 	source: ProgressSignalSource;
 	/** Stable identifier inside the source: story id, workflow skill, or durable source key. */
@@ -114,6 +109,7 @@ export interface ProgressStoryCounts {
 	blocked: number;
 	superseded: number;
 	verified: number;
+	/** Active story, else the next pending one; blocked, review-blocked, and failed stories are never selected. */
 	current?: { id: string; title: string };
 }
 
@@ -124,20 +120,6 @@ export interface ProgressTodoCounts {
 	pending: number;
 	abandoned: number;
 	current?: string;
-}
-
-export interface ProgressAgentCounts {
-	total: number;
-	running: number;
-	waiting: number;
-	completed: number;
-	failed: number;
-	cancelled: number;
-}
-
-export interface ProgressReviewVerdict {
-	skill: string;
-	verdict: string;
 }
 
 /** Verification evidence that durable state actually records; nothing is inferred. */
@@ -165,6 +147,7 @@ export interface ProjectProgressReport {
 	signals: ProgressSignal[];
 	sessionStateRead: boolean;
 	unreadable: ProgressDurableSource[];
+	recovered: ProgressDurableSource[];
 }
 
 const BLOCKING_STORY_STATUSES: ReadonlySet<UltragoalGoalStatus> = new Set(["failed", "blocked", "review_blocked"]);
@@ -196,9 +179,9 @@ function countStories(ultragoal: ProgressUltragoalInput): ProgressStoryCounts {
 		else if (story.status === "pending") counts.pending++;
 		else if (BLOCKING_STORY_STATUSES.has(story.status)) counts.blocked++;
 	}
-	const current =
-		ultragoal.stories.find(story => story.status === "active") ??
-		ultragoal.stories.find(story => story.status !== "complete" && story.status !== "superseded");
+	// Mirror the Ultragoal scheduler. A read-only projection never opts into
+	// `--retry-failed`, so failed stories are not presented as next work.
+	const current = selectNextSchedulableGoal(ultragoal.stories, false);
 	if (current) counts.current = { id: current.id, title: current.title };
 	return counts;
 }
@@ -319,19 +302,6 @@ function collectVerification(
 	};
 }
 
-/** Human-readable verification lines; the structured form is `ProgressVerification`. */
-export function verificationLines(verification: ProgressVerification): string[] {
-	const lines: string[] = [];
-	const receipts = verification.storyReceipts;
-	if (receipts) {
-		lines.push(
-			`${receipts.withReceipt} of ${plural(receipts.complete, "complete story", "complete stories")} carry a recorded quality-gate receipt`,
-		);
-	}
-	for (const { skill, verdict } of verification.reviewVerdicts) lines.push(`${skill} review verdict: ${verdict}`);
-	return lines;
-}
-
 export function computeProjectProgress(input: ProjectProgressInput): ProjectProgressReport {
 	const stories = input.ultragoal ? countStories(input.ultragoal) : undefined;
 	const todos = input.todos.length > 0 ? countTodos(input.todos) : undefined;
@@ -386,6 +356,14 @@ export function computeProjectProgress(input: ProjectProgressInput): ProjectProg
 			text: `${PROGRESS_SOURCE_LABELS[source]} could not be read and is excluded from the estimate.`,
 		});
 	}
+	for (const source of input.recovered) {
+		signals.push({
+			kind: "note",
+			source: "state",
+			ref: source,
+			text: `${PROGRESS_SOURCE_LABELS[source]} snapshot could not be read; its contents were recovered from authoritative per-entry records.`,
+		});
+	}
 
 	const headline = selectHeadline(input, completion, stories, todos, agents, signals);
 	if (headline === "awaiting-completion" && input.goal && input.goal.status !== "complete") {
@@ -411,6 +389,7 @@ export function computeProjectProgress(input: ProjectProgressInput): ProjectProg
 		signals,
 		sessionStateRead: input.sessionStateRead,
 		unreadable: input.unreadable,
+		recovered: input.recovered,
 	};
 }
 
@@ -440,157 +419,4 @@ function selectHeadline(
 	if (somethingMoving) return "in-progress";
 	if (completion.total > 0) return "not-started";
 	return input.workflows.length > 0 ? "in-progress" : "no-tracked-work";
-}
-
-export const PROGRESS_HEADLINE_LABELS: Record<ProgressHeadline, string> = {
-	complete: "Complete",
-	"awaiting-completion": "Tracked work done, awaiting completion",
-	blocked: "Blocked",
-	"in-progress": "In progress",
-	"not-started": "Not started",
-	paused: "Paused",
-	dropped: "Dropped",
-	"no-tracked-work": "No tracked work",
-};
-
-const BASIS_UNIT_LABELS: Record<Exclude<ProgressBasisKind, "none">, string> = {
-	"ultragoal-stories": "ultragoal stories complete",
-	todos: "todo items completed",
-	"goal-status": "session goal complete",
-};
-
-/** Styling hooks so the TUI can colour output while ACP/text mode stays plain. */
-export interface ProgressRenderStyle {
-	bold(text: string): string;
-	fg(color: "accent" | "success" | "warning" | "error" | "dim" | "muted", text: string): string;
-}
-
-export interface ProgressRenderOptions {
-	style?: ProgressRenderStyle;
-	/** Sanitizes and bounds untrusted durable text to one display line of at most `max` columns. */
-	clip: (text: string, max: number) => string;
-	barWidth?: number;
-}
-
-const PLAIN_STYLE: ProgressRenderStyle = { bold: text => text, fg: (_color, text) => text };
-
-function headlineColor(headline: ProgressHeadline): "success" | "warning" | "error" | "accent" | "muted" {
-	switch (headline) {
-		case "complete":
-			return "success";
-		case "blocked":
-			return "error";
-		case "awaiting-completion":
-		case "paused":
-			return "warning";
-		case "dropped":
-		case "no-tracked-work":
-			return "muted";
-		default:
-			return "accent";
-	}
-}
-
-function formatElapsed(seconds: number): string {
-	const minutes = Math.floor(Math.max(0, seconds) / 60);
-	if (minutes < 1) return "<1m";
-	const hours = Math.floor(minutes / 60);
-	return hours > 0 ? `${hours}h ${minutes % 60}m` : `${minutes}m`;
-}
-
-/** Render the overview as display lines (no trailing newline). */
-export function renderProjectProgress(report: ProjectProgressReport, options: ProgressRenderOptions): string[] {
-	const style = options.style ?? PLAIN_STYLE;
-	const clip = options.clip;
-	const width = options.barWidth ?? 24;
-	const label = (text: string) => style.fg("dim", text.padEnd(14));
-	const lines: string[] = [];
-	const color = headlineColor(report.headline);
-
-	lines.push(`${style.bold("Project progress")}  ${style.fg(color, PROGRESS_HEADLINE_LABELS[report.headline])}`);
-	const { completion } = report;
-	if (completion.percent === undefined) {
-		lines.push(`${style.fg("dim", `[${"·".repeat(width)}]`)} unknown`);
-	} else {
-		const filled = Math.round((completion.percent / 100) * width);
-		const bar = `${style.fg(color, "█".repeat(filled))}${style.fg("dim", "░".repeat(width - filled))}`;
-		const unit = BASIS_UNIT_LABELS[completion.basis as Exclude<ProgressBasisKind, "none">];
-		lines.push(
-			`[${bar}] ~${completion.percent}%  ${style.fg("muted", `${completion.done} of ${completion.total} ${unit}`)}`,
-		);
-	}
-	lines.push(style.fg("dim", `Basis: ${report.basisExplanation}`));
-	lines.push("");
-
-	if (report.goal) {
-		lines.push(
-			`${label("Goal")}${report.goal.status} · ${formatElapsed(report.goal.timeUsedSeconds)} · ${clip(report.goal.objective, 100)}`,
-		);
-	}
-	if (report.stories) {
-		const s = report.stories;
-		const parts = [`${s.complete}/${s.total} complete`];
-		if (s.active > 0) parts.push(`${s.active} active`);
-		if (s.pending > 0) parts.push(`${s.pending} pending`);
-		if (s.blocked > 0) parts.push(style.fg("error", `${s.blocked} blocked`));
-		if (s.superseded > 0) parts.push(`${s.superseded} superseded`);
-		lines.push(`${label("Ultragoal")}${parts.join(" · ")}`);
-		if (s.current) lines.push(`${label("")}next: ${s.current.id} ${clip(s.current.title, 90)}`);
-	}
-	if (report.todos) {
-		const t = report.todos;
-		const parts = [`${t.completed}/${t.total} completed`];
-		if (t.inProgress > 0) parts.push(`${t.inProgress} in progress`);
-		if (t.pending > 0) parts.push(`${t.pending} pending`);
-		if (t.abandoned > 0) parts.push(`${t.abandoned} abandoned`);
-		lines.push(`${label("Todos")}${parts.join(" · ")}`);
-		if (t.current) lines.push(`${label("")}now: ${clip(t.current, 90)}`);
-	}
-	if (report.workflows.length === 0) {
-		lines.push(`${label("Workflows")}${style.fg("dim", "none active")}`);
-	} else {
-		report.workflows.forEach((workflow, index) => {
-			const chips = workflow.chips
-				.filter(chip => chip.value)
-				.slice(0, 4)
-				.map(chip => `${chip.label} ${clip(chip.value ?? "", 40)}`);
-			const detail = [workflow.phase, ...chips].join(" · ");
-			lines.push(`${label(index === 0 ? "Workflows" : "")}${clip(workflow.skill, 24)}: ${clip(detail, 110)}`);
-			if (workflow.summary) lines.push(`${label("")}${style.fg("muted", clip(workflow.summary, 100))}`);
-		});
-	}
-	const a = report.agents;
-	if (a.total === 0) {
-		lines.push(`${label("Agents")}${style.fg("dim", "no subagents this session")}`);
-	} else {
-		const parts: string[] = [];
-		if (a.running > 0) parts.push(`${a.running} running`);
-		if (a.waiting > 0) parts.push(`${a.waiting} queued/paused`);
-		if (a.completed > 0) parts.push(`${a.completed} completed`);
-		if (a.failed > 0) parts.push(style.fg("error", `${a.failed} failed`));
-		if (a.cancelled > 0) parts.push(`${a.cancelled} cancelled`);
-		lines.push(`${label("Agents")}${parts.join(" · ")}`);
-	}
-	const verification = verificationLines(report.verification);
-	if (verification.length === 0) {
-		lines.push(`${label("Verification")}${style.fg("dim", "no durable verification evidence recorded")}`);
-	} else {
-		verification.forEach((line, index) => {
-			lines.push(`${label(index === 0 ? "Verification" : "")}${clip(line, 110)}`);
-		});
-	}
-
-	if (report.signals.length > 0) {
-		lines.push("", style.bold("Attention"));
-		for (const signal of report.signals) {
-			const marker =
-				signal.kind === "blocker"
-					? style.fg("error", "✖")
-					: signal.kind === "pending"
-						? style.fg("warning", "…")
-						: style.fg("dim", "·");
-			lines.push(`  ${marker} ${clip(signal.text, 140)}`);
-		}
-	}
-	return lines;
 }
