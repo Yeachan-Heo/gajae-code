@@ -3859,12 +3859,10 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 			terminal.bufferOverflow!.maxStagedBytes,
 		);
 	});
-	it("commits a typed statusless Responses overload instead of discarding the transaction (#5018)", async () => {
+	it("discards a content-free typed statusless Responses overload for managed retry (#5018)", async () => {
 		// Issue #5018 gives the shared Responses parser typed overload facts.
-		// Those facts must not become managed transaction authority: before the
-		// code survived transport, this failure produced no facts and the staged
-		// attempt was always committed, so the managed outcome stays the
-		// ordinary run_terminal error even though the code classifies "server".
+		// Content-free overloads have no observable output to replay, so the
+		// managed transaction can be discarded before session retry policy runs.
 		const mock = createMockModel();
 		const streamFn = () => {
 			const stream = new AssistantMessageEventStream();
@@ -3891,14 +3889,59 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 			streamFn,
 		});
 
-		await agent.prompt("run", { fallbackManaged: true });
+		await agent.prompt("run", {
+			fallbackManaged: true,
+			onManagedAttemptOutcome: outcome => {
+				outcomes.push(outcome);
+				return { type: "terminal", terminal: { stopReason: "error" } };
+			},
+		});
+
+		expect(outcomes).toHaveLength(1);
+		expect(outcomes[0]?.type).toBe("retryable_discarded");
+	});
+	it("commits a typed statusless Responses overload after streamed output (#5018)", async () => {
+		const mock = createMockModel();
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			const message: AssistantMessage = {
+				...assistantMessage(mock.model),
+				api: "openai-responses",
+				stopReason: "error",
+				errorMessage: "server_is_overloaded: Our servers are currently overloaded. Please try again later.",
+				content: [{ type: "text", text: "already streamed" }],
+				transportFailure: {
+					kind: "transport",
+					providerCode: "server_is_overloaded",
+					openaiErrorCode: "server_is_overloaded",
+				},
+			};
+			queueMicrotask(() => {
+				stream.push({ type: "start", partial: assistantMessage(mock.model) });
+				stream.push({ type: "text_start", contentIndex: 0, partial: message });
+				stream.push({ type: "text_delta", contentIndex: 0, delta: "already streamed", partial: message });
+				stream.push({ type: "error", reason: "error", error: message });
+			});
+			return stream;
+		};
+		const outcomes: ManagedAttemptOutcome[] = [];
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+		});
+
+		await agent.prompt("run", {
+			fallbackManaged: true,
+			onManagedAttemptOutcome: outcome => {
+				outcomes.push(outcome);
+				return { type: "terminal", terminal: { stopReason: "error" } };
+			},
+		});
 
 		expect(outcomes).toHaveLength(0);
-		const terminal = agent.state.messages.at(-1);
-		expect(terminal?.role).toBe("assistant");
-		expect(terminal).toMatchObject({
+		expect(agent.state.messages.at(-1)).toMatchObject({
 			stopReason: "error",
-			errorMessage: "server_is_overloaded: Our servers are currently overloaded. Please try again later.",
+			content: [{ type: "text", text: "already streamed" }],
 		});
 	});
 });
