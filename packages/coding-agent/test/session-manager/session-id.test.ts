@@ -3,7 +3,12 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { ArtifactManager } from "@gajae-code/coding-agent/session/artifacts";
-import { SessionManager, SessionManagerTestHooks } from "@gajae-code/coding-agent/session/session-manager";
+import {
+	BOUNDED_FIRST_OPEN_MAX_LINE_BYTES,
+	BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES,
+	SessionManager,
+	SessionManagerTestHooks,
+} from "@gajae-code/coding-agent/session/session-manager";
 import { FileSessionStorage } from "@gajae-code/coding-agent/session/session-storage";
 import * as native from "@gajae-code/natives";
 import { TempDir } from "@gajae-code/utils";
@@ -506,6 +511,25 @@ describe("SessionManager session ids", () => {
 });
 
 describe("authenticated generic rollback", () => {
+	it("rejects unsafe artifact types before allocating an artifact id", async () => {
+		using root = TempDir.createSync("gjc-artifact-type-no-allocation-");
+		const session = SessionManager.create(root.path(), root.path());
+		try {
+			session.appendMessage({ role: "user", content: "artifact owner", timestamp: 1 });
+			await session.ensureOnDisk();
+			const artifacts = session.getArtifactManager();
+			if (!artifacts) throw new Error("Expected explicit artifact manager");
+			const allocate = vi.spyOn(artifacts, "allocatePath");
+			await expect(session.saveArtifact("rejected", "unsafe/type")).rejects.toThrow("Unsafe artifact tool type");
+			expect(allocate).not.toHaveBeenCalled();
+			expect(await session.saveArtifact("accepted", "test")).toBe("0");
+			expect(allocate).toHaveBeenCalledTimes(1);
+			expect(await artifacts.readRange("0")).toBe("accepted");
+		} finally {
+			await session.close();
+		}
+	});
+
 	it.each([
 		"clone",
 		"id",
@@ -912,6 +936,381 @@ describe("authenticated generic rollback", () => {
 			]);
 		} finally {
 			await stable.close();
+		}
+	});
+
+	it.each([
+		{ label: "an unterminated header at EOF", form: "eof", capture: "state" },
+		{ label: "an unterminated header at EOF", form: "eof", capture: "rollback" },
+		{ label: "leading empty JSONL records", form: "leading-empty", capture: "state" },
+		{ label: "leading empty JSONL records", form: "leading-empty", capture: "rollback" },
+	] as const)("preserves explicit rollback for $label via capture $capture", async ({ form, capture }) => {
+		using root = TempDir.createSync("gjc-explicit-header-rollback-form-");
+		const storage = new FileSessionStorage();
+		const seed = SessionManager.create(root.path(), root.path(), storage);
+		let session: SessionManager | undefined;
+		try {
+			await seed.ensureOnDisk();
+			const file = seed.getSessionFile();
+			if (!file) throw new Error("Expected explicit transcript");
+			const header = JSON.parse((await Bun.file(file).text()).trim()) as Record<string, unknown>;
+			await seed.close();
+			const headerLine = JSON.stringify(header);
+			fsSync.writeFileSync(file, form === "eof" ? headerLine : `\n\n${headerLine}\n`);
+			session = await SessionManager.open(file, root.path(), storage, "copy-retain", "shadow");
+			const originalId = session.getSessionId();
+			const snapshot = capture === "state" ? session.captureState() : await session.captureRollbackState();
+			await session.newSession();
+			await session.ensureOnDisk();
+			if (capture === "state") session.restoreState(snapshot);
+			else await session.restoreRollbackState(snapshot);
+			expect(session.getSessionId()).toBe(originalId);
+			expect(session.getSessionFile()).toBe(file);
+		} finally {
+			await session?.close();
+			await seed.close();
+		}
+	});
+
+	it.each([
+		"invalid-utf8",
+		"mismatched-id",
+	] as const)("rejects explicit rollback capture with %s header", async alteration => {
+		using root = TempDir.createSync("gjc-explicit-header-rollback-invalid-");
+		const storage = new FileSessionStorage();
+		const seed = SessionManager.create(root.path(), root.path(), storage);
+		let session: SessionManager | undefined;
+		try {
+			seed.appendMessage({ role: "user", content: "header identity", timestamp: 1 });
+			await seed.ensureOnDisk();
+			const file = seed.getSessionFile();
+			if (!file) throw new Error("Expected explicit transcript");
+			await seed.close();
+			session = await SessionManager.open(file, root.path(), storage, "copy-retain", "shadow");
+			const originalBytes = fsSync.readFileSync(file);
+			if (alteration === "invalid-utf8") {
+				const headerType = originalBytes.indexOf(Buffer.from('"session"'));
+				if (headerType < 0) throw new Error("Expected JSON session header");
+				originalBytes[headerType + 1] = 0xff;
+				fsSync.writeFileSync(file, originalBytes);
+			} else {
+				const newline = originalBytes.indexOf(0x0a);
+				if (newline < 0) throw new Error("Expected header record terminator");
+				const header = JSON.parse(originalBytes.subarray(0, newline).toString("utf8")) as Record<string, unknown>;
+				header.id = `${String(header.id)}-replacement`;
+				fsSync.writeFileSync(
+					file,
+					Buffer.concat([Buffer.from(`${JSON.stringify(header)}\n`), originalBytes.subarray(newline + 1)]),
+				);
+			}
+			if (alteration === "invalid-utf8") {
+				expect(() => session!.captureState()).toThrow("persistence identity is unavailable");
+			} else {
+				await expect(session.captureRollbackState()).rejects.toThrow("persistence identity is unavailable");
+			}
+		} finally {
+			await session?.close();
+			await seed.close();
+		}
+	});
+
+	it.each(["at-limit", "over-limit"] as const)("bounds explicit rollback header lines %s", async boundary => {
+		using root = TempDir.createSync("gjc-explicit-header-rollback-prefix-");
+		const storage = new FileSessionStorage();
+		const session = SessionManager.create(root.path(), root.path(), storage);
+		try {
+			session.appendMessage({ role: "user", content: "bounded header prefix", timestamp: 1 });
+			await session.ensureOnDisk();
+			const file = session.getSessionFile();
+			if (!file) throw new Error("Expected explicit transcript");
+			const contents = fsSync.readFileSync(file);
+			const newline = contents.indexOf(0x0a);
+			if (newline < 0) throw new Error("Expected header record terminator");
+			const header = JSON.parse(contents.subarray(0, newline).toString("utf8")) as Record<string, unknown>;
+			const emptyTitleBytes = Buffer.byteLength(JSON.stringify({ ...header, title: "" }));
+			const titleBytes = BOUNDED_FIRST_OPEN_MAX_LINE_BYTES - 1 - emptyTitleBytes;
+			if (titleBytes < 0) throw new Error("Session header exceeds the bounded line size");
+			header.title = "x".repeat(titleBytes + (boundary === "over-limit" ? 1 : 0));
+			const boundedHeader = Buffer.from(`${JSON.stringify(header)}\n`);
+			expect(boundedHeader.byteLength).toBe(BOUNDED_FIRST_OPEN_MAX_LINE_BYTES + (boundary === "over-limit" ? 1 : 0));
+			fsSync.writeFileSync(file, boundedHeader);
+			const rangeRead = vi.spyOn(storage, "readRangeSync");
+			try {
+				if (boundary === "at-limit") expect(() => session.captureState()).not.toThrow();
+				else expect(() => session.captureState()).toThrow("persistence identity is unavailable");
+				expect(rangeRead.mock.calls).toHaveLength(1);
+				expect(rangeRead.mock.calls[0]?.[2]).toBe(
+					BOUNDED_FIRST_OPEN_MAX_LINE_BYTES + (boundary === "over-limit" ? 1 : 0),
+				);
+			} finally {
+				rangeRead.mockRestore();
+			}
+		} finally {
+			await session.close();
+		}
+	});
+
+	it.each([
+		{ label: "empty", size: 0 },
+		{ label: "above admission", size: BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES + 1 },
+	] as const)("rejects explicit rollback identity for %s transcripts before range reads", async ({ size }) => {
+		using root = TempDir.createSync("gjc-explicit-rollback-size-bound-");
+		const storage = new FileSessionStorage();
+		const session = SessionManager.create(root.path(), root.path(), storage);
+		try {
+			session.appendMessage({ role: "user", content: "bounded identity size", timestamp: 1 });
+			await session.ensureOnDisk();
+			const sourceFile = session.getSessionFile();
+			if (!sourceFile) throw new Error("Expected explicit source transcript");
+			const stat = storage.statSync.bind(storage);
+			const statOverride = vi.spyOn(storage, "statSync").mockImplementation(filePath => {
+				const current = stat(filePath);
+				return path.resolve(filePath) === path.resolve(sourceFile) ? { ...current, size } : current;
+			});
+			const rangeRead = vi.spyOn(storage, "readRangeSync");
+			try {
+				expect(() => session.captureState()).toThrow("persistence identity is unavailable");
+				expect(rangeRead).not.toHaveBeenCalled();
+			} finally {
+				rangeRead.mockRestore();
+				statOverride.mockRestore();
+			}
+		} finally {
+			await session.close();
+		}
+	});
+
+	it("rejects unsampled explicit transcript drift when mtime is restored but ctime changes", async () => {
+		using root = TempDir.createSync("gjc-explicit-rollback-ctime-");
+		const storage = new FileSessionStorage();
+		const session = SessionManager.create(root.path(), root.path(), storage);
+		const target = SessionManager.create(root.path(), root.path(), storage);
+		try {
+			const payload = "x".repeat(3 * 1024 * 1024);
+			for (let timestamp = 1; timestamp <= 3; timestamp++)
+				session.appendMessage({ role: "user", content: payload, timestamp });
+			await session.ensureOnDisk();
+			const sourceFile = session.getSessionFile();
+			if (!sourceFile) throw new Error("Expected explicit source transcript");
+			await session.flush();
+			const header = session.getHeader();
+			if (!header) throw new Error("Expected the explicit transcript header");
+			fsSync.writeFileSync(
+				sourceFile,
+				`${[header, ...session.getEntries()].map(entry => JSON.stringify(entry)).join("\n")}\n`,
+			);
+			const fixedMtimeSeconds = 1_700_000_000;
+			fsSync.utimesSync(sourceFile, fixedMtimeSeconds, fixedMtimeSeconds);
+			const originalStat = fsSync.statSync(sourceFile, { bigint: true });
+			const snapshot = await session.captureRollbackState();
+
+			target.appendMessage({ role: "user", content: "active target", timestamp: 2 });
+			await target.ensureOnDisk();
+			const targetFile = target.getSessionFile();
+			if (!targetFile) throw new Error("Expected target transcript");
+			await target.close();
+			await session.setSessionFile(targetFile);
+
+			const firstUnsampled = BOUNDED_FIRST_OPEN_MAX_LINE_BYTES + 1;
+			const lastSampleStart = Number(originalStat.size) - 64 * 1024;
+			const editOffset = Math.floor((firstUnsampled + lastSampleStart) / 2);
+			if (editOffset <= firstUnsampled || editOffset + 64 * 1024 >= lastSampleStart)
+				throw new Error("Expected an unsampled transcript offset");
+			const descriptor = fsSync.openSync(sourceFile, "r+");
+			try {
+				fsSync.writeSync(descriptor, Buffer.from("y"), 0, 1, editOffset);
+			} finally {
+				fsSync.closeSync(descriptor);
+			}
+			fsSync.utimesSync(sourceFile, fixedMtimeSeconds, fixedMtimeSeconds);
+			const driftedStat = fsSync.statSync(sourceFile, { bigint: true });
+			expect(driftedStat.mtimeNs).toBe(originalStat.mtimeNs);
+			expect(driftedStat.ctimeNs).not.toBe(originalStat.ctimeNs);
+			expect(driftedStat.size).toBe(originalStat.size);
+			await expect(session.restoreRollbackState(snapshot)).rejects.toThrow("persistence identity changed");
+			expect(session.getSessionFile()).toBe(targetFile);
+			expect(session.buildSessionContext().messages).toEqual([
+				{ role: "user", content: "active target", timestamp: 2 },
+			]);
+		} finally {
+			await session.close();
+			await target.close();
+		}
+	});
+
+	it("rejects a file replacement between bounded explicit identity ranges", async () => {
+		using root = TempDir.createSync("gjc-explicit-rollback-range-replacement-");
+		const storage = new FileSessionStorage();
+		const session = SessionManager.create(root.path(), root.path(), storage);
+		let restoreRangeRead: (() => void) | undefined;
+		try {
+			const payload = "x".repeat(3 * 1024 * 1024);
+			for (let timestamp = 1; timestamp <= 3; timestamp++)
+				session.appendMessage({ role: "user", content: payload, timestamp });
+			await session.ensureOnDisk();
+			const sourceFile = session.getSessionFile();
+			if (!sourceFile) throw new Error("Expected explicit source transcript");
+			await session.flush();
+			const header = session.getHeader();
+			if (!header) throw new Error("Expected the explicit transcript header");
+			fsSync.writeFileSync(
+				sourceFile,
+				`${[header, ...session.getEntries()].map(entry => JSON.stringify(entry)).join("\n")}\n`,
+			);
+			const originalRead = storage.readRangeSync.bind(storage);
+			let replaced = false;
+			const replacement = `${sourceFile}.replacement`;
+			const original = `${sourceFile}.original`;
+			const rangeRead = vi.spyOn(storage, "readRangeSync").mockImplementation((filePath, start, length) => {
+				const result = originalRead(filePath, start, length);
+				if (!replaced && filePath === sourceFile) {
+					replaced = true;
+					fsSync.copyFileSync(sourceFile, replacement);
+					fsSync.renameSync(sourceFile, original);
+					fsSync.renameSync(replacement, sourceFile);
+				}
+				return result;
+			});
+			restoreRangeRead = () => rangeRead.mockRestore();
+			expect(() => session.captureState()).toThrow("persistence identity is unavailable");
+			expect(replaced).toBe(true);
+			expect(rangeRead.mock.calls.length).toBeGreaterThan(1);
+			expect(rangeRead.mock.calls[0]?.[2]).toBe(BOUNDED_FIRST_OPEN_MAX_LINE_BYTES + 1);
+		} finally {
+			restoreRangeRead?.();
+			await session.close();
+		}
+	});
+
+	it("captures and restores an explicit cold transcript above 128 MiB with bounded rollback identity reads", async () => {
+		using root = TempDir.createSync("gjc-explicit-cold-rollback-large-");
+		const storage = new FileSessionStorage();
+		const seed = SessionManager.create(root.path(), root.path(), storage);
+		const target = SessionManager.create(root.path(), root.path(), storage);
+		let source: SessionManager | undefined;
+		let restoreRangeRead: (() => void) | undefined;
+		const asRecord = (value: unknown): Record<string, unknown> => {
+			if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Expected transcript record");
+			return value as Record<string, unknown>;
+		};
+		try {
+			seed.appendMessage({ role: "user", content: "large transcript template", timestamp: 1 });
+			const keptId = seed.appendMessage({ role: "user", content: "retained suffix", timestamp: 2 });
+			seed.appendCompaction("large transcript summary", undefined, keptId, 3);
+			await seed.ensureOnDisk();
+			await seed.flush();
+			const sourceFile = seed.getSessionFile();
+			if (!sourceFile) throw new Error("Expected explicit source transcript");
+			const seedLines = (await Bun.file(sourceFile).text()).trimEnd().split("\n");
+			const seedRecords = seedLines.map(line => asRecord(JSON.parse(line) as unknown));
+			const header = seedRecords[0];
+			const messageTemplates = seedRecords.filter(entry => entry.type === "message");
+			const compactionTemplate = seedRecords.find(entry => entry.type === "compaction");
+			const largeTemplate = messageTemplates[0];
+			const keptTemplate = messageTemplates[1];
+			if (!header || typeof header.id !== "string" || !largeTemplate || !keptTemplate || !compactionTemplate)
+				throw new Error("Expected seeded header, messages, and compaction");
+			const templateMessage = asRecord(largeTemplate.message);
+			const keptMessage = asRecord(keptTemplate.message);
+			const payload = "x".repeat(7 * 1024 * 1024);
+			const entries = 19;
+			const lastLargeId = `large-${entries - 1}`;
+			const keptEntryId = "kept-large-session-entry";
+			await seed.close();
+			fsSync.writeFileSync(sourceFile, `${JSON.stringify(header)}\n`);
+			let parentId: string | null = null;
+			for (let index = 0; index < entries; index++) {
+				const id = `large-${index}`;
+				const entry = {
+					...largeTemplate,
+					id,
+					parentId,
+					message: { ...templateMessage, content: payload },
+				};
+				fsSync.appendFileSync(sourceFile, `${JSON.stringify(entry)}\n`);
+				parentId = id;
+			}
+			const keptEntry = {
+				...keptTemplate,
+				id: keptEntryId,
+				parentId: lastLargeId,
+				message: keptMessage,
+			};
+			fsSync.appendFileSync(sourceFile, `${JSON.stringify(keptEntry)}\n`);
+			const compaction = {
+				...compactionTemplate,
+				parentId: keptEntryId,
+				firstKeptEntryId: keptEntryId,
+			};
+			fsSync.appendFileSync(sourceFile, `${JSON.stringify(compaction)}\n`);
+			expect(fsSync.statSync(sourceFile).size).toBeGreaterThan(128 * 1024 * 1024);
+
+			target.appendMessage({ role: "user", content: "active target", timestamp: 4 });
+			await target.ensureOnDisk();
+			const targetFile = target.getSessionFile();
+			if (!targetFile) throw new Error("Expected target transcript");
+			await target.close();
+
+			SessionManagerTestHooks.eagerHydrationMaxBytesOverride = 1;
+			source = await SessionManager.open(sourceFile, root.path(), storage, "copy-retain", "enabled");
+			SessionManagerTestHooks.eagerHydrationMaxBytesOverride = undefined;
+			expect(source.getSessionMemoryStats().coldRetirementActive).toBe(true);
+
+			const rangeRead = vi.spyOn(storage, "readRangeSync");
+			restoreRangeRead = () => rangeRead.mockRestore();
+			const maximumIdentityReadBytes = BOUNDED_FIRST_OPEN_MAX_LINE_BYTES + 1 + 3 * 64 * 1024;
+			const sourceReadBytesSince = (callIndex: number): number =>
+				rangeRead.mock.calls
+					.slice(callIndex)
+					.reduce((total, [filePath, , length]) => total + (filePath === sourceFile ? length : 0), 0);
+			const beforeCaptureReadCount = rangeRead.mock.calls.length;
+			const snapshot = await source.captureRollbackState();
+			const identityReadBytes = sourceReadBytesSince(beforeCaptureReadCount);
+			expect(snapshot.coldRestoreFile).toBe(sourceFile);
+			expect(identityReadBytes).toBeLessThanOrEqual(maximumIdentityReadBytes);
+			await source.setSessionFile(targetFile);
+			const restoreReadStart = rangeRead.mock.calls.length;
+			let preCommitSourceReadBytes: number | undefined;
+			SessionManagerTestHooks.beforeColdRollbackCommit = async candidateFile => {
+				expect(candidateFile).toBe(sourceFile);
+				// This interval includes the initial identity check and candidate initialization.
+				preCommitSourceReadBytes = sourceReadBytesSince(restoreReadStart);
+			};
+			await source.restoreRollbackState(snapshot);
+			SessionManagerTestHooks.beforeColdRollbackCommit = undefined;
+			if (preCommitSourceReadBytes === undefined) throw new Error("Expected staged cold rollback checkpoint");
+			const candidateTranscriptRangeReadBytes = preCommitSourceReadBytes - identityReadBytes;
+			expect(candidateTranscriptRangeReadBytes).toBeGreaterThan(0);
+			const postCandidateIdentityReadBytes = sourceReadBytesSince(restoreReadStart) - preCommitSourceReadBytes;
+			expect(postCandidateIdentityReadBytes).toBeLessThanOrEqual(3 * maximumIdentityReadBytes);
+			expect(source.getSessionFile()).toBe(sourceFile);
+			expect(source.getSessionId()).toBe(header.id);
+			expect(source.getSessionMemoryStats().coldRetirementActive).toBe(true);
+
+			const replacementSnapshot = await source.captureRollbackState();
+			await source.setSessionFile(targetFile);
+			const originalFile = `${sourceFile}.original`;
+			const replacementFile = `${sourceFile}.replacement`;
+			fsSync.copyFileSync(sourceFile, replacementFile);
+			fsSync.renameSync(sourceFile, originalFile);
+			fsSync.renameSync(replacementFile, sourceFile);
+			const beforeReplacementValidationReadCount = rangeRead.mock.calls.length;
+			await expect(source.restoreRollbackState(replacementSnapshot)).rejects.toThrow("persistence identity changed");
+			const replacementValidationReadBytes = rangeRead.mock.calls
+				.slice(beforeReplacementValidationReadCount)
+				.reduce((total, [, , length]) => total + length, 0);
+			expect(replacementValidationReadBytes).toBeLessThan(9 * 1024 * 1024);
+			expect(source.getSessionFile()).toBe(targetFile);
+			expect(source.buildSessionContext().messages).toEqual([
+				{ role: "user", content: "active target", timestamp: 4 },
+			]);
+		} finally {
+			SessionManagerTestHooks.eagerHydrationMaxBytesOverride = undefined;
+			SessionManagerTestHooks.beforeColdRollbackCommit = undefined;
+			restoreRangeRead?.();
+			await source?.close();
+			await seed.close();
+			await target.close();
 		}
 	});
 

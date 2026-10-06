@@ -2143,6 +2143,12 @@ export interface ResumeSessionIdentity {
 	sha256: string;
 }
 
+/** Descriptor-bound bounded fingerprint for private explicit-session rollback authority. */
+type ExplicitPersistIdentity = Pick<
+	SessionStorageStat,
+	"dev" | "ino" | "nlink" | "size" | "mtimeMs" | "mtimeNs" | "ctimeNs"
+> & { canonicalPath: string; sessionId: string; fingerprintSha256: string };
+
 export interface ResumeTailResumable {
 	kind: "resumable";
 	identity: ResumeSessionIdentity;
@@ -2178,6 +2184,7 @@ export const RESUME_TRANSCRIPT_MAX_BYTES = MANAGED_ARTIFACT_MAX_FILE_BYTES;
  */
 export const BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES = 2 * 1024 * 1024 * 1024 + 1024 * 1024;
 const EAGER_RESUME_TRANSCRIPT_MAX_BYTES = MANAGED_ARTIFACT_MAX_FILE_BYTES;
+const EXPLICIT_PERSIST_FINGERPRINT_RANGE_BYTES = 64 * 1024;
 
 /**
  * Recovery actions offered when a live transcript is at or past the managed
@@ -7616,7 +7623,7 @@ function validateEvictedToolOutputHandle(
 export class SessionManager {
 	readonly #stateSnapshots = new WeakMap<
 		SessionManagerStateSnapshot,
-		Readonly<SessionManagerStateSnapshot> & { readonly explicitPersistIdentity?: ResumeSessionIdentity }
+		Readonly<SessionManagerStateSnapshot> & { readonly explicitPersistIdentity?: ExplicitPersistIdentity }
 	>();
 	#artifactLifecycle = Symbol("session-artifact-lifecycle");
 	#artifactLifecycleSessionId = "";
@@ -8433,6 +8440,8 @@ export class SessionManager {
 			snapshot.sessionFile
 				? this.#captureExplicitPersistIdentity(snapshot.sessionFile)
 				: undefined;
+		if (explicitPersistIdentity && explicitPersistIdentity.sessionId !== snapshot.sessionId)
+			throw new Error("Session rollback persistence identity is unavailable.");
 		this.#stateSnapshots.set(
 			snapshot,
 			Object.freeze({
@@ -8474,13 +8483,13 @@ export class SessionManager {
 	}
 
 	#assertSnapshotPersistenceIdentity(
-		snapshot: Readonly<SessionManagerStateSnapshot> & { readonly explicitPersistIdentity?: ResumeSessionIdentity },
+		snapshot: Readonly<SessionManagerStateSnapshot> & { readonly explicitPersistIdentity?: ExplicitPersistIdentity },
 		store?: ManagedSessionDescendantStore,
 	): ManagedFileIdentity | undefined {
 		if (!snapshot.managedPersistExpectedIdentity || !snapshot.sessionFile) {
 			if (snapshot.explicitPersistIdentity && snapshot.sessionFile) {
 				const current = this.#captureExplicitPersistIdentity(snapshot.sessionFile);
-				if (!sameResumeIdentity(current, snapshot.explicitPersistIdentity))
+				if (!util.isDeepStrictEqual(current, snapshot.explicitPersistIdentity))
 					throw new Error("Session rollback persistence identity changed.");
 			}
 			return undefined;
@@ -16172,10 +16181,83 @@ export class SessionManager {
 		this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(sessionFile);
 	}
 
-	#captureExplicitPersistIdentity(sessionFile: string): ResumeSessionIdentity {
-		const result = inspectTranscriptBounded(sessionFile, this.#storage);
-		if (!result.ok) throw new Error("Session rollback persistence identity is unavailable.");
-		return result.inspection.identity;
+	#captureExplicitPersistIdentity(sessionFile: string): ExplicitPersistIdentity {
+		const storage = this.#storage;
+		if (!(storage instanceof FileSessionStorage) || !storage.readRangeSync)
+			throw new Error("Session rollback persistence identity is unavailable.");
+		const canonicalPath = resolveEquivalentPath(path.resolve(sessionFile));
+		let before: SessionStorageStat;
+		try {
+			before = storage.statSync(canonicalPath);
+		} catch {
+			throw new Error("Session rollback persistence identity is unavailable.");
+		}
+		const nlink = before.nlink;
+		if (
+			!before.isFile ||
+			typeof nlink !== "bigint" ||
+			nlink !== 1n ||
+			before.size <= 0 ||
+			before.size > BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES
+		)
+			throw new Error("Session rollback persistence identity is unavailable.");
+
+		const fingerprint = crypto.createHash("sha256");
+		const addRange = (start: number, length: number): Uint8Array => {
+			const range = storage.readRangeSync!(canonicalPath, start, length);
+			if (range.bytes.byteLength !== length || !sameResumeStat(before, range.stat))
+				throw new Error("Session rollback persistence identity is unavailable.");
+			const frame = Buffer.allocUnsafe(12);
+			frame.writeBigUInt64BE(BigInt(start), 0);
+			frame.writeUInt32BE(length, 8);
+			fingerprint.update(frame).update(range.bytes);
+			return range.bytes;
+		};
+		let sessionId: string | undefined;
+		try {
+			const prefixLength = Math.min(before.size, BOUNDED_FIRST_OPEN_MAX_LINE_BYTES + 1);
+			const prefix = addRange(0, prefixLength);
+			const consumer = createBoundedLineChunkConsumer((_lineStart, lineBytes) => {
+				if (lineBytes.byteLength === 1 && lineBytes[0] === 0x0a) return;
+				if (lineBytes.at(-1) !== 0x0a && prefixLength !== before.size) return false;
+				try {
+					const header = JSON.parse(decodeBoundedJsonLine(lineBytes)) as Partial<SessionHeader>;
+					if (header.type !== "session" || typeof header.id !== "string") return false;
+					sessionId = header.id;
+					return false;
+				} catch {
+					return false;
+				}
+			});
+			const consumeFailure = consumer.consume(Buffer.from(prefix.buffer, prefix.byteOffset, prefix.byteLength), 0);
+			const prefixFailure = consumeFailure ?? consumer.finish(prefixLength === before.size);
+			if (prefixFailure !== "aborted" || sessionId === undefined) throw new Error("invalid_session_header");
+
+			const rangeLength = Math.min(EXPLICIT_PERSIST_FINGERPRINT_RANGE_BYTES, before.size);
+			const lastStart = before.size - rangeLength;
+			const starts = new Set([Math.floor(lastStart / 3), Math.floor((lastStart * 2) / 3), lastStart]);
+			for (const start of starts) {
+				if (start + rangeLength <= prefixLength) continue;
+				addRange(start, rangeLength);
+			}
+			const after = storage.statSync(canonicalPath);
+			if (!sameResumeStat(before, after)) throw new Error("source_changed");
+		} catch {
+			throw new Error("Session rollback persistence identity is unavailable.");
+		}
+		if (sessionId === undefined) throw new Error("Session rollback persistence identity is unavailable.");
+		return {
+			canonicalPath,
+			sessionId,
+			dev: before.dev,
+			ino: before.ino,
+			nlink,
+			size: before.size,
+			mtimeMs: before.mtimeMs,
+			mtimeNs: before.mtimeNs,
+			ctimeNs: before.ctimeNs,
+			fingerprintSha256: fingerprint.digest("hex"),
+		};
 	}
 
 	/** Capture one descriptor-bound digest for a future metadata-drift comparison. */
@@ -17698,6 +17780,7 @@ export class SessionManager {
 	 */
 	async saveArtifact(content: string, toolType: string): Promise<string | undefined> {
 		this.#assertArtifactOpen();
+		if (!/^[a-zA-Z0-9_-]+$/.test(toolType)) throw new Error("Unsafe artifact tool type");
 		const token = this.#syncArtifactLifecycle();
 		const sessionId = this.#sessionId;
 		const sessionFile = this.#sessionFile;
@@ -17712,7 +17795,6 @@ export class SessionManager {
 		const published = truncated
 			? `${truncated.text}\n[artifact truncated after ${truncated.bytes} bytes; omitted at least ${contentBytes - truncated.bytes} bytes]\n`
 			: content;
-		if (!/^[a-zA-Z0-9_-]+$/.test(toolType)) throw new Error("Unsafe artifact tool type");
 		const filename = `${id}.${toolType}.log`;
 		const store = manager.getManagedStore();
 		if (store) store.publishNoReplaceSync(filename, Buffer.from(published, "utf8"));
