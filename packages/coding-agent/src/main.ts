@@ -515,11 +515,24 @@ async function applyStartupModelProfilesWithPolicy(
 			return true;
 		} catch (error) {
 			if (error instanceof ModelProfileCredentialError && (onCredentialError || options.tolerateCredentialError)) {
+				// The toast/stderr warning is transient; keep a log record so a session
+				// left on the provisional model can be diagnosed afterwards.
+				logger.warn("Startup model profile not applied: missing provider credentials", {
+					profile: profileName,
+					errorClass: error.name,
+					providers: error.providers,
+					role: error.role,
+				});
 				if (onCredentialError) onCredentialError(error);
 				else process.stderr.write(`${chalk.yellow(`Warning: ${error.message}`)}\n`);
 				return false;
 			}
 			if (error instanceof UnknownModelProfileError && options.tolerateUnknownDefault) {
+				logger.warn("Startup model profile not applied: unknown profile", {
+					profile: profileName,
+					errorClass: error.name,
+					catalogRefreshUnavailable: profileCatalogRefreshUnavailable,
+				});
 				if (onUnknownDefault) onUnknownDefault(error, profileCatalogRefreshUnavailable);
 				else
 					process.stderr.write(
