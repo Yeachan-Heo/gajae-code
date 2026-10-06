@@ -385,19 +385,9 @@ type KiroStreamEvent =
 	  }
 	| { type: "error"; data: { error: string; message?: string } };
 
-const EVENT_PATTERNS = [
-	'{"content":',
-	'{"name":',
-	'{"input":',
-	'{"stop":',
-	'{"contextUsagePercentage":',
-	'{"usage":',
-	'{"toolUseId":',
-	'{"stopReason":',
-	'{"stopDetails":',
-	'{"error":',
-	'{"Error":',
-];
+// Removed EVENT_PATTERNS: now scans for any '{' and parses complete JSON objects,
+// independent of property order (fixes #6150 where refusal was missed when
+// stopReason/stopDetails was not the first property)
 
 function findJsonEnd(text: string, start: number): number {
 	let brace = 0;
@@ -431,16 +421,17 @@ export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[];
 	const events: KiroStreamEvent[] = [];
 	let pos = 0;
 	while (pos < buffer.length) {
-		let start = -1;
-		for (const pattern of EVENT_PATTERNS) {
-			const idx = buffer.indexOf(pattern, pos);
-			if (idx >= 0 && (start < 0 || idx < start)) start = idx;
-		}
+		// Find next '{' character (property-order independent scan)
+		const start = buffer.indexOf("{", pos);
 		if (start < 0) break;
+
 		const end = findJsonEnd(buffer, start);
 		if (end < 0) return { events, remaining: buffer.slice(start) };
+
 		try {
 			const parsed = JSON.parse(buffer.slice(start, end + 1)) as Record<string, unknown>;
+
+			// Classify event based on fields present (order-independent)
 			if (typeof parsed.content === "string") {
 				events.push({ type: "content", data: parsed.content });
 			} else if (parsed.name && parsed.toolUseId) {
@@ -463,12 +454,15 @@ export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[];
 			} else if ("stop" in parsed && parsed.contextUsagePercentage === undefined) {
 				events.push({ type: "toolUseStop", data: { stop: Boolean(parsed.stop) } });
 			}
+
 			// Check for usage first (before refusal) to ensure it gets processed even if refusal terminates the stream
 			if (parsed.usage && typeof parsed.usage === "object") {
 				const u = parsed.usage as { inputTokens?: number; outputTokens?: number };
 				events.push({ type: "usage", data: u });
 			}
+
 			// Check for refusal after usage so that usage is processed first and recorded before refusal terminates
+			// This check is now order-independent: stopDetails can appear at any position in the JSON object
 			if (
 				typeof parsed.stopDetails === "object" &&
 				parsed.stopDetails !== null &&
@@ -495,6 +489,7 @@ export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[];
 		} catch {
 			// skip malformed frame
 		}
+
 		pos = end + 1;
 	}
 	return { events, remaining: "" };

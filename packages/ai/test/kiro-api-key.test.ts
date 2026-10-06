@@ -149,4 +149,49 @@ describe("parseKiroApiEvents", () => {
 		const refusalEvents = events.filter(e => e.type === "refusal");
 		expect(refusalEvents).toHaveLength(0);
 	});
+	test("detects refusal even when stopReason/stopDetails is not the first property (order-independent parsing)", () => {
+		// P1 fix (#6150): refusal must be detected regardless of property order
+		// Previously, pattern-based matching would miss this because stopReason is not first
+		const { events } = parseKiroApiEvents(
+			'{"conversationId":"xyz123","stopReason":"CONTENT_FILTERED","stopDetails":{"refusal":{"category":"VIOLENCE","explanation":"Harmful content"}}}',
+		);
+		expect(events).toHaveLength(1);
+		const event = events[0];
+		expect(event?.type).toBe("refusal");
+		if (event?.type === "refusal") {
+			expect(event.data.stopReason).toBe("CONTENT_FILTERED");
+			expect(event.data.stopDetails?.refusal?.category).toBe("VIOLENCE");
+			expect(event.data.stopDetails?.refusal?.explanation).toBe("Harmful content");
+		}
+	});
+	test("does not treat COMPLETED with leading field as a refusal (order-independent, no false positive)", () => {
+		// P1 fix (#6150): ensure normal completion is not mistaken for refusal when property order changes
+		const { events } = parseKiroApiEvents(
+			'{"conversationId":"xyz123","stopReason":"COMPLETED","usage":{"inputTokens":10,"outputTokens":3}}',
+		);
+		// Should emit only usage event, not refusal
+		const usageEvents = events.filter(e => e.type === "usage");
+		expect(usageEvents).toHaveLength(1);
+		const refusalEvents = events.filter(e => e.type === "refusal");
+		expect(refusalEvents).toHaveLength(0);
+	});
+	test("records usage and detects refusal together, with leading unknown field", () => {
+		// P1 fix (#6150): both usage and refusal should be recorded even with reordered properties
+		const { events } = parseKiroApiEvents(
+			'{"conversationId":"xyz123","stopReason":"CONTENT_FILTERED","stopDetails":{"refusal":{"category":"ILLEGAL","explanation":"Cannot assist"}},"usage":{"inputTokens":25,"outputTokens":1}}',
+		);
+		expect(events).toHaveLength(2);
+		const refusalEvent = events.find(e => e.type === "refusal");
+		const usageEvent = events.find(e => e.type === "usage");
+		expect(refusalEvent?.type).toBe("refusal");
+		if (refusalEvent?.type === "refusal") {
+			expect(refusalEvent.data.stopReason).toBe("CONTENT_FILTERED");
+			expect(refusalEvent.data.stopDetails?.refusal?.category).toBe("ILLEGAL");
+		}
+		expect(usageEvent?.type).toBe("usage");
+		if (usageEvent?.type === "usage") {
+			expect(usageEvent.data.inputTokens).toBe(25);
+			expect(usageEvent.data.outputTokens).toBe(1);
+		}
+	});
 });
