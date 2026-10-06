@@ -1,12 +1,15 @@
 import { describe, expect, it } from "bun:test";
 import { createInvocationReconciliation } from "../src/sdk/host/session-runtime";
 import {
+	agentFailedLifecycleCause,
 	FAILURE_CAUSE_DIAGNOSTIC_MAX,
 	failedPromptOutcome,
 	failureCauseDiagnostic,
 	isValidFailureCauseDiagnostic,
+	lifecycleFailureCauseDiagnostic,
 	publicTerminalOutcome,
 	redactedFailureCauseDiagnostic,
+	sanitizePromptFailure,
 } from "../src/sdk/prompt-failure";
 import type { SdkPromptTerminalOutcome } from "../src/sdk/prompt-status";
 
@@ -492,5 +495,36 @@ describe("host-level failure cause diagnostic retention through agent_failed/age
 
 		// Verify the diagnostic contains the key information that would be lost without it
 		expect(outcomeWithDiagnostic.failureCauseDiagnostic).toContain("boom");
+	});
+});
+
+describe("agent_failed lifecycle carries the original diagnostic past the public sanitizer", () => {
+	const original = Object.assign(new Error("boom"), { signal: "SIGKILL" });
+	const sanitized = sanitizePromptFailure(original);
+	const captured = failureCauseDiagnostic(original);
+
+	it("captures the real cause before sanitization", () => {
+		expect(sanitized.message).toBe("Prompt submission failed.");
+		expect(captured).toContain("boom");
+		expect(captured).toContain("SIGKILL");
+	});
+
+	it("re-deriving from the sanitized error alone loses the cause", () => {
+		expect(lifecycleFailureCauseDiagnostic(sanitized)).not.toContain("boom");
+	});
+
+	it("retains the carried diagnostic instead of the sanitized message", () => {
+		const cause = agentFailedLifecycleCause(sanitized, captured);
+		expect(lifecycleFailureCauseDiagnostic(cause)).toBe(captured);
+		expect(sanitizePromptFailure(cause).code).toBe(sanitized.code);
+	});
+
+	it("rejects a carried diagnostic that the outbound sanitizer would change", () => {
+		const cause = agentFailedLifecycleCause(sanitized, "Error sk-1234567890abcdef");
+		expect(lifecycleFailureCauseDiagnostic(cause)).not.toContain("sk-1234567890abcdef");
+	});
+
+	it("passes the error through unchanged when no diagnostic was captured", () => {
+		expect(agentFailedLifecycleCause(sanitized, undefined)).toBe(sanitized);
 	});
 });

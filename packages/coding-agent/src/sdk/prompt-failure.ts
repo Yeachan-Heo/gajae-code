@@ -343,6 +343,25 @@ export function redactedFailureCauseDiagnostic(value: unknown): string | undefin
 }
 
 /**
+ * `agent_failed` events carry an error already sanitized to the fixed public
+ * message, plus the diagnostic AgentSession captured from the original error.
+ * Attach that diagnostic to the lifecycle failure cause so the host retains it.
+ */
+export function agentFailedLifecycleCause(error: unknown, diagnostic: string | undefined): unknown {
+	if (diagnostic === undefined || error === null || typeof error !== "object") return error;
+	return { ...error, failureCauseDiagnostic: diagnostic };
+}
+
+/** Diagnostic for a lifecycle failure cause: a carried diagnostic wins over re-deriving one from the (sanitized) error. */
+export function lifecycleFailureCauseDiagnostic(failureCause: unknown): string | undefined {
+	if (failureCause !== null && typeof failureCause === "object" && "failureCauseDiagnostic" in failureCause) {
+		const carried = redactedFailureCauseDiagnostic(failureCause.failureCauseDiagnostic);
+		if (carried !== undefined) return carried;
+	}
+	return failureCauseDiagnostic(failureCause);
+}
+
+/**
  * Extract a bounded failure cause diagnostic for operator logs: error class name,
  * first line of message, and exit code/signal if available. Bounded to 200 chars,
  * sanitized for outbound publication (strips paths, URLs, ANSI, credentials, identifiers).

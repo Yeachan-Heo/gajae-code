@@ -80,12 +80,13 @@ import {
 	type PromptTerminalTransitionEvidence,
 } from "../prompt-deadline-manager";
 import {
+	agentFailedLifecycleCause,
 	assistantFailureCode,
 	failedPromptOutcome,
-	failureCauseDiagnostic,
 	failureEvidence,
 	failureProviderDiagnostic,
 	formatPromptFailureForLocalLog,
+	lifecycleFailureCauseDiagnostic,
 	PROMPT_FAILURE_MESSAGE_SUBMISSION,
 	type PromptFailureEvidence,
 	providerDiagnosticField,
@@ -5674,7 +5675,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			const diagnosticCode = sanitizePromptFailure(
 				failureCause ?? Object.assign(new Error("agent run failed"), { code: "agent_failed" }),
 			).code;
-			const failureCauseDiag = failureCauseDiagnostic(failureCause);
+			const failureCauseDiag = lifecycleFailureCauseDiagnostic(failureCause);
 			for (const invocation of transitions)
 				current.failureDiagnosticKeys.add(correlationKey(invocation.correlation));
 			for (const invocation of transitions)
@@ -6249,7 +6250,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				emitLifecycle(
 					"agent_failed",
 					ctx,
-					event.error,
+					agentFailedLifecycleCause(event.error, event.failureCauseDiagnostic),
 					undefined,
 					owner
 						? {
