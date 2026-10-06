@@ -13,7 +13,7 @@ function nativeLifecycle(): typeof import("@gajae-code/natives") {
 	return nativeLifecycleBindings;
 }
 
-import { $credentialEnv, logger, resolveEquivalentPath } from "@gajae-code/utils";
+import { $credentialEnv, getSessionsDir, logger, resolveEquivalentPath } from "@gajae-code/utils";
 import {
 	loadAcceptedModelPresetRegistry,
 	loadAcceptedModelPresetRegistryAsync,
@@ -6402,6 +6402,20 @@ async function validateDeletePath(
 			canonicalExistingPath(replay.metadataRoot) !== canonicalRequestedRoot
 		)
 			return fail("invalid_input", "Cleanup receipt does not match the requested saved-session locator.");
+		const ownerFields = brokerTaskArtifactOwnerCleanupFields(cleanup);
+		if (Object.keys(ownerFields).length === 0) {
+			const sessionsRoot = canonicalExistingPath(getSessionsDir(broker.settings.agentDir));
+			const relative = path.relative(sessionsRoot, replay.target.transcriptPath);
+			if (
+				path.resolve(replay.target.sessionsRoot) !== sessionsRoot ||
+				relative === "" ||
+				relative === ".." ||
+				relative.startsWith(`..${path.sep}`) ||
+				path.isAbsolute(relative)
+			)
+				return fail("terminal_uncertain", "Cleanup receipt does not match the configured session root.");
+			return replay;
+		}
 		const inventory = await managedCandidates(broker, cwd, "Saved");
 		if ("ok" in inventory) return inventory;
 		const transcriptRelative = path.relative(inventory.scope.sessionsRoot, replay.target.transcriptPath);
@@ -6414,8 +6428,6 @@ async function validateDeletePath(
 		)
 			return fail("terminal_uncertain", "Cleanup receipt does not match the current managed session authority.");
 		replay.target.sessionsRoot = inventory.scope.sessionsRoot;
-		const ownerFields = brokerTaskArtifactOwnerCleanupFields(cleanup);
-		if (Object.keys(ownerFields).length === 0) return replay;
 		let ownerContext: TaskArtifactOwnerStorageContext;
 		let ownerScope: ManagedScope;
 		try {
