@@ -5311,7 +5311,6 @@ export class AgentSession {
 		try {
 			if (lease) await this.#runResourceLeaseContext.run(lease, publish);
 			else await publish();
-			if (extensionDelivery) await extensionDelivery;
 			for (const waiter of publicationWaiters) waiter?.resolve();
 		} catch (error) {
 			for (const waiter of publicationWaiters) {
