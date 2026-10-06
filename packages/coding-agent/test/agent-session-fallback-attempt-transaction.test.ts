@@ -179,7 +179,7 @@ function oversizedEventStream(model: Model): AssistantMessageEventStream {
 	return stream;
 }
 
-function zeroTokenEmptyStopStream(model: Model): AssistantMessageEventStream {
+function zeroTokenEmptyStopStream(model: Model, typed = true): AssistantMessageEventStream {
 	const stream = new AssistantMessageEventStream();
 	queueMicrotask(() => {
 		const message: AssistantMessage = {
@@ -197,7 +197,7 @@ function zeroTokenEmptyStopStream(model: Model): AssistantMessageEventStream {
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
 			stopReason: "stop",
-			transportFailure: { kind: "transport", providerCode: "empty_response" },
+			...(typed ? { transportFailure: { kind: "transport" as const, providerCode: "empty_response" } } : {}),
 			timestamp: Date.now(),
 		};
 		stream.push({ type: "start", partial: message });
@@ -456,6 +456,30 @@ describe("AgentSession managed fallback attempt transaction", () => {
 		expect(handlerCalls).toBe(1);
 		expect(calls).toHaveLength(1);
 		expect(session!.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "error" });
+	});
+
+	it("does not replay an untyped promoted empty response after a managed context handler participates", async () => {
+		const calls: string[] = [];
+		let handlerCalls = 0;
+		createSession(
+			(model, _context, _options) => {
+				calls.push(selector(model));
+				return zeroTokenEmptyStopStream(model, false);
+			},
+			3,
+			{ handler: "context", onHandler: () => handlerCalls++ },
+		);
+
+		await session!.prompt("do not replay an untyped extension-observable empty response");
+		await session!.waitForIdle();
+
+		expect(handlerCalls).toBe(1);
+		expect(calls).toHaveLength(1);
+		expect(session!.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "error",
+			transportFailure: { kind: "transport", providerCode: "empty_response" },
+		});
 	});
 
 	it("emits exhausted completion exactly once through the agent finalizer", async () => {

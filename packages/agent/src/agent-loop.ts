@@ -10,6 +10,7 @@ import {
 	type Context,
 	classifyContextOverflow,
 	classifyFallbackTrigger,
+	EMPTY_RESPONSE_PROVIDER_CODE,
 	EventStream,
 	isProviderSafetyStopAuthenticated,
 	isZodSchema,
@@ -824,7 +825,7 @@ function managedRetryableFailure(failure: unknown): boolean {
 	);
 }
 
-function promoteTypedEmptyResponseStop(message: AssistantMessage): void {
+function promoteEmptyResponseStop(message: AssistantMessage): void {
 	if (
 		message.stopReason !== "stop" ||
 		message.content.length !== 0 ||
@@ -838,6 +839,12 @@ function promoteTypedEmptyResponseStop(message: AssistantMessage): void {
 	}
 	message.stopReason = "error";
 	message.errorMessage = "Provider returned an empty response with zero token usage";
+	// Preserve the runtime-owned retry classification for untyped provider
+	// payloads; AgentSession must not infer replay safety from this message text.
+	message.transportFailure = {
+		...(message.transportFailure ?? { kind: "transport" }),
+		providerCode: EMPTY_RESPONSE_PROVIDER_CODE,
+	};
 }
 /**
  * Terminal safety-stop authority is provenance-bound, not data-bound: a
@@ -4981,7 +4988,7 @@ async function streamAssistantResponse(
 							const finalMessage = config.fallbackManaged
 								? managedAssistantShell(finished, config.model, managedDegradedFieldDiagnostics, true)
 								: finished;
-							promoteTypedEmptyResponseStop(finalMessage);
+							promoteEmptyResponseStop(finalMessage);
 							if (promptPrefix) finalMessage.promptPrefix = promptPrefix;
 							if (addedPartial) {
 								context.messages[context.messages.length - 1] = finalMessage;
