@@ -961,13 +961,41 @@ export class SessionRouter {
 			dispatchFence?: (dispatch: () => Promise<Record<string, unknown>>) => Promise<Record<string, unknown>>;
 		},
 	): Promise<Record<string, unknown>> {
+		const { deadline, beforeDispatch, onDispatch, dispatchFence, ...requestOptions } = options ?? {};
+		const remainingDeadlineMs = (): number =>
+			deadline === undefined ? Number.POSITIVE_INFINITY : Math.max(0, deadline - Date.now());
+		const reconcileWithinDeadline = async (): Promise<void> => {
+			if (deadline === undefined) {
+				await this.#serialReconcile(this.#runEpoch, true, true);
+				return;
+			}
+			const remaining = remainingDeadlineMs();
+			if (remaining <= 0)
+				throw new SessionRouterError("pre_send", "SDK session request deadline elapsed during router preparation.");
+			const reconciliation = this.#serialReconcile(this.#runEpoch, true, true);
+			const expired = Promise.withResolvers<never>();
+			const timer = setTimeout(
+				() =>
+					expired.reject(
+						new SessionRouterError("pre_send", "SDK session request deadline elapsed during router preparation."),
+					),
+				remaining,
+			);
+			try {
+				await Promise.race([reconciliation, expired.promise]);
+			} finally {
+				clearTimeout(timer);
+			}
+		};
 		const matchesExpectedAuthority = (attachment: SessionAttachment): boolean =>
 			expectedAttachment === undefined ||
 			attachment === expectedAttachment ||
 			(expectedAttachment.authorityId !== undefined && attachment.authorityId === expectedAttachment.authorityId);
 		const publishing = this.#sessions.get(sessionId);
 		if (!publishing || !matchesExpectedAuthority(publishing.capability) || !publishing.initializingPublication)
-			await this.#serialReconcile(this.#runEpoch, true, true);
+			await reconcileWithinDeadline();
+		if (remainingDeadlineMs() <= 0)
+			throw new SessionRouterError("pre_send", "SDK session request deadline elapsed during router preparation.");
 		const attached = this.#sessions.get(sessionId);
 		if (!attached || !this.#attachmentPublished(attached))
 			throw new SessionRouterError("pre_send", "SDK session attachment is unavailable: session not published.");
@@ -996,9 +1024,6 @@ export class SessionRouter {
 		// token: the wire frame alone carries credentials, and the observer
 		// context is a deep-frozen, token-redacted copy (#4640 review).
 		const wireFrame = this.#prepareFrame(attached, frame);
-		const { beforeDispatch, onDispatch, dispatchFence, deadline, ...requestOptions } = options ?? {};
-		const remainingDeadlineMs = (): number =>
-			deadline === undefined ? Number.POSITIVE_INFINITY : Math.max(0, deadline - Date.now());
 		if (remainingDeadlineMs() <= 0) throw new SessionRouterError("pre_send", "SDK session request deadline elapsed.");
 		try {
 			const connecting = attached.client.connect?.();

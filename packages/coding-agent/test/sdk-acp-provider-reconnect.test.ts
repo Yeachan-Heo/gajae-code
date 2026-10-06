@@ -2,8 +2,8 @@ import { expect, spyOn, test } from "bun:test";
 import { AcpSdkAdapter } from "../src/sdk/acp";
 import { PROVIDER_ACTIVATION_BUDGET_MS, PROVIDER_ACTIVATION_MAX_ATTEMPTS } from "../src/sdk/acp/adapter";
 import { SdkClientError } from "../src/sdk/client";
-
 import type { SessionAttachment } from "../src/sdk/router";
+import { SessionRouter } from "../src/sdk/router/session-router";
 
 const waitFor = async (predicate: () => boolean, label: string): Promise<void> => {
 	const deadline = Date.now() + 2_000;
@@ -13,6 +13,156 @@ const waitFor = async (predicate: () => boolean, label: string): Promise<void> =
 	}
 	throw new Error(`Timed out waiting for ${label}`);
 };
+
+test("SessionRouter rejects request preparation when reconciliation outlives its deadline", async () => {
+	let refreshes = 0;
+	let reconciliationFinished = false;
+	let dispatches = 0;
+	const reconciliationGate = Promise.withResolvers<void>();
+	const index = {
+		indexSeq: 0,
+		open: async () => index,
+		refresh: async () => {
+			refreshes += 1;
+			if (refreshes > 1) {
+				reconciliationFinished = false;
+				await reconciliationGate.promise;
+			}
+			reconciliationFinished = true;
+			return index;
+		},
+		refreshIfChanged: async () => false,
+		listSessions: () => ({ sessions: [], warnings: [] }),
+	};
+	const router = new SessionRouter({
+		agentDir: "/tmp/sdk-router-deadline-repro",
+		deps: {
+			createIndex: () => index as never,
+			setInterval: (() => 0) as never,
+			clearInterval: (() => {}) as never,
+		},
+	});
+	await router.start();
+	try {
+		await expect(
+			router.request("missing", { type: "command" }, undefined, undefined, {
+				deadline: Date.now() + 5,
+				beforeDispatch: () => {
+					dispatches += 1;
+				},
+			}),
+		).rejects.toMatchObject({
+			phase: "pre_send",
+			message: "SDK session request deadline elapsed during router preparation.",
+		});
+		expect(reconciliationFinished).toBe(false);
+		expect(dispatches).toBe(0);
+	} finally {
+		reconciliationGate.resolve();
+		await router.stop();
+	}
+});
+
+test("SessionRouter preserves reconciliation throws without dispatching", async () => {
+	let refreshes = 0;
+	const index = {
+		indexSeq: 0,
+		open: async () => index,
+		refresh: async () => {
+			refreshes += 1;
+			if (refreshes > 1) throw new Error("reconcile failed");
+			return index;
+		},
+		refreshIfChanged: async () => false,
+		listSessions: () => ({ sessions: [], warnings: [] }),
+	};
+	let dispatches = 0;
+	const router = new SessionRouter({
+		agentDir: "/tmp/sdk-router-reconcile-throw",
+		deps: {
+			createIndex: () => index as never,
+			createClient: async () => {
+				dispatches += 1;
+				throw new Error("unexpected dispatch");
+			},
+		},
+	});
+	await router.start();
+	try {
+		await expect(
+			router.request("missing", { type: "command" }, undefined, undefined, { deadline: Date.now() + 500 }),
+		).rejects.toThrow("reconcile failed");
+		expect(dispatches).toBe(0);
+	} finally {
+		await expect(router.stop()).rejects.toThrow("SessionRouter shutdown failed.");
+	}
+});
+
+test("SessionRouter does not reconcile an already expired request", async () => {
+	let refreshes = 0;
+	const index = {
+		indexSeq: 0,
+		open: async () => index,
+		refresh: async () => {
+			refreshes += 1;
+			return index;
+		},
+		refreshIfChanged: async () => false,
+		listSessions: () => ({ sessions: [], warnings: [] }),
+	};
+	const router = new SessionRouter({
+		agentDir: "/tmp/sdk-router-expired",
+		deps: { createIndex: () => index as never },
+	});
+	await router.start();
+	const before = refreshes;
+	try {
+		await expect(
+			router.request("missing", { type: "command" }, undefined, undefined, { deadline: Date.now() - 1 }),
+		).rejects.toMatchObject({
+			phase: "pre_send",
+			message: "SDK session request deadline elapsed during router preparation.",
+		});
+		expect(refreshes).toBe(before);
+	} finally {
+		await router.stop();
+	}
+});
+
+test("SessionRouter cancels pending reconciliation during teardown without dispatch", async () => {
+	let refreshes = 0;
+	const gate = Promise.withResolvers<void>();
+	const index = {
+		indexSeq: 0,
+		open: async () => index,
+		refresh: async () => {
+			refreshes += 1;
+			if (refreshes > 1) await gate.promise;
+			return index;
+		},
+		refreshIfChanged: async () => false,
+		listSessions: () => ({ sessions: [], warnings: [] }),
+	};
+	let dispatches = 0;
+	const router = new SessionRouter({
+		agentDir: "/tmp/sdk-router-teardown",
+		deps: {
+			createIndex: () => index as never,
+			createClient: async () => {
+				dispatches += 1;
+				throw new Error("unexpected dispatch");
+			},
+		},
+	});
+	await router.start();
+	const request = router.request("missing", { type: "command" }, undefined, undefined, { deadline: Date.now() + 500 });
+	await Bun.sleep(5);
+	const stopping = router.stop();
+	gate.resolve();
+	await stopping;
+	await expect(request).rejects.toMatchObject({ phase: "pre_send" });
+	expect(dispatches).toBe(0);
+});
 
 test("ACP provider activation retries the current Router attachment after rotation during registration", async () => {
 	let currentGeneration = 1;
