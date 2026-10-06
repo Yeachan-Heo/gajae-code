@@ -557,6 +557,49 @@ describe("authenticated generic rollback", () => {
 		}
 	});
 
+	it("rejects nested message and custom-entry edits without aliasing the live transcript", async () => {
+		using root = TempDir.createSync("gjc-rollback-nested-edit-");
+		const session = SessionManager.create(root.path(), SessionManager.managedDestination(root.path(), root.path()));
+		try {
+			const messageId = session.appendMessage({
+				role: "user",
+				content: [{ type: "text", text: "original message" }],
+				timestamp: 1,
+			});
+			const customId = session.appendCustomEntry("nested", { payload: { value: "original custom" } });
+			await session.ensureOnDisk();
+			await session.flush();
+			const file = session.getSessionFile();
+			if (!file) throw new Error("Expected persisted transcript");
+			const originalBytes = await Bun.file(file).text();
+			const snapshot = await session.captureRollbackState();
+			const message = snapshot.fileEntries.find(entry => entry.type === "message");
+			const custom = snapshot.materializedFileEntries.find(entry => entry.type === "custom");
+			if (
+				message?.type !== "message" ||
+				message.message.role !== "user" ||
+				!Array.isArray(message.message.content) ||
+				message.message.content[0]?.type !== "text" ||
+				custom?.type !== "custom"
+			)
+				throw new Error("Expected issued message and custom entries");
+			message.message.content[0].text = "edited message";
+			(custom.data as { payload: { value: string } }).payload.value = "edited custom";
+
+			await expect(session.restoreRollbackState(snapshot)).rejects.toThrow("not authentic");
+			const liveMessage = session.getEntry(messageId);
+			expect(
+				liveMessage?.type === "message" && liveMessage.message.role === "user"
+					? liveMessage.message.content
+					: undefined,
+			).toEqual([{ type: "text", text: "original message" }]);
+			expect(session.getEntry(customId)).toMatchObject({ data: { payload: { value: "original custom" } } });
+			expect(await Bun.file(file).text()).toBe(originalBytes);
+		} finally {
+			await session.close();
+		}
+	});
+
 	it("restores genuine managed identity and caller-owned artifact authority across directory adoption", async () => {
 		using root = TempDir.createSync("gjc-rollback-genuine-");
 		const cwdA = path.join(root.path(), "a");
@@ -647,6 +690,228 @@ describe("authenticated generic rollback", () => {
 			await reopened?.close();
 			await source.close();
 			await target.close();
+		}
+	});
+
+	it("rejects cold rollback after staging when its persisted transcript changes", async () => {
+		using root = TempDir.createSync("gjc-cold-rollback-reject-");
+		const cwdA = path.join(root.path(), "a");
+		const cwdB = path.join(root.path(), "b");
+		const cwdC = path.join(root.path(), "c");
+		await fs.mkdir(cwdA);
+		await fs.mkdir(cwdB);
+		await fs.mkdir(cwdC);
+		const destinationA = SessionManager.managedDestination(cwdA, root.path());
+		const destinationB = SessionManager.managedDestination(cwdB, root.path());
+		const destinationC = SessionManager.managedDestination(cwdC, root.path());
+		const source = SessionManager.create(cwdA, destinationA);
+		const target = SessionManager.create(cwdB, destinationB);
+		const newerTarget = SessionManager.create(cwdC, destinationC);
+		let reopened: SessionManager | undefined;
+		try {
+			source.appendMessage({ role: "user", content: "cold predecessor", timestamp: 1 });
+			await source.ensureOnDisk();
+			source.appendCustomEntry("node", { payload: "retired predecessor entry" });
+			const keptId = source.appendCustomEntry("node", { payload: "kept predecessor entry" });
+			source.appendCompaction("cold predecessor summary", undefined, keptId, 1);
+			await source.flush();
+			const sourceFile = source.getSessionFile();
+			if (!sourceFile) throw new Error("Expected cold rollback transcript");
+			await source.close();
+			target.appendMessage({ role: "user", content: "active target", timestamp: 2 });
+			await target.ensureOnDisk();
+			const targetFile = target.getSessionFile();
+			if (!targetFile) throw new Error("Expected active target transcript");
+			await target.close();
+			newerTarget.appendMessage({ role: "user", content: "unselected newer target", timestamp: 3 });
+			await newerTarget.ensureOnDisk();
+			await newerTarget.close();
+			expect(path.dirname(sourceFile)).not.toBe(path.dirname(targetFile));
+			SessionManagerTestHooks.eagerHydrationMaxBytesOverride = 1;
+			reopened = await SessionManager.open(
+				sourceFile,
+				destinationA,
+				new FileSessionStorage(),
+				"copy-retain",
+				"enabled",
+			);
+			expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(true);
+			const snapshot = await reopened.captureRollbackState();
+			await reopened.setSessionFile(targetFile);
+			const activeId = reopened.getSessionId();
+			const activeFile = reopened.getSessionFile();
+			if (!activeFile) throw new Error("Expected current transcript after adoption");
+			const activeBytes = await Bun.file(activeFile).text();
+			const activeManager = reopened.getArtifactManager();
+			if (!activeManager) throw new Error("Expected active artifact authority");
+			const sourceBytes = await Bun.file(sourceFile).text();
+			const driftedSourceBytes = `${sourceBytes} `;
+			SessionManagerTestHooks.beforeColdRollbackCommit = async filePath => {
+				expect(filePath).toBe(sourceFile);
+				await Bun.write(sourceFile, driftedSourceBytes);
+			};
+			await expect(reopened.restoreRollbackState(snapshot)).rejects.toThrow("persistence identity changed");
+			SessionManagerTestHooks.beforeColdRollbackCommit = undefined;
+			expect(reopened.getSessionId()).toBe(activeId);
+			expect(reopened.getSessionFile()).toBe(activeFile);
+			expect(reopened.getArtifactManager()).toBe(activeManager);
+			expect(reopened.isArtifactManagerAuthorized(activeManager)).toBe(true);
+			expect(await Bun.file(activeFile).text()).toBe(activeBytes);
+			expect(await Bun.file(sourceFile).text()).toBe(driftedSourceBytes);
+			expect(reopened.buildSessionContext().messages).toEqual([
+				{ role: "user", content: "active target", timestamp: 2 },
+			]);
+			reopened.appendMessage({ role: "user", content: "still active after rejected rollback", timestamp: 4 });
+			await reopened.flush();
+			const artifactId = await reopened.saveArtifact("target authority remains writable", "test");
+			if (!artifactId) throw new Error("Expected artifact id");
+			expect(await Bun.file(activeFile).text()).toContain("still active after rejected rollback");
+			expect(path.dirname((await reopened.getArtifactPath(artifactId))!)).toBe(activeFile.slice(0, -6));
+		} finally {
+			SessionManagerTestHooks.beforeColdRollbackCommit = undefined;
+			SessionManagerTestHooks.eagerHydrationMaxBytesOverride = undefined;
+			await reopened?.close();
+			await source.close();
+			await target.close();
+			await newerTarget.close();
+		}
+	});
+
+	it("rejects stale bounded adoption without overwriting a newer managed switch", async () => {
+		using root = TempDir.createSync("gjc-bounded-adoption-stale-");
+		const cwdA = path.join(root.path(), "a");
+		const cwdB = path.join(root.path(), "b");
+		const cwdC = path.join(root.path(), "c");
+		await fs.mkdir(cwdA);
+		await fs.mkdir(cwdB);
+		await fs.mkdir(cwdC);
+		const destinationA = SessionManager.managedDestination(cwdA, root.path());
+		const destinationB = SessionManager.managedDestination(cwdB, root.path());
+		const destinationC = SessionManager.managedDestination(cwdC, root.path());
+		const session = SessionManager.create(cwdA, destinationA);
+		const newerTarget = SessionManager.create(cwdB, destinationB);
+		const outerTarget = SessionManager.create(cwdC, destinationC);
+		try {
+			SessionManagerTestHooks.eagerHydrationMaxBytesOverride = 1;
+			session.appendMessage({ role: "user", content: "predecessor M", timestamp: 1 });
+			await session.ensureOnDisk();
+			await session.flush();
+			session.setSessionMemoryMode("enabled");
+			newerTarget.appendMessage({ role: "user", content: "accepted newer N", timestamp: 2 });
+			await newerTarget.ensureOnDisk();
+			outerTarget.appendMessage({ role: "user", content: "rejected outer target", timestamp: 3 });
+			await outerTarget.ensureOnDisk();
+			const newerFile = newerTarget.getSessionFile();
+			const outerFile = outerTarget.getSessionFile();
+			if (!newerFile || !outerFile) throw new Error("Expected managed adoption targets");
+			expect(path.dirname(newerFile)).not.toBe(path.dirname(session.getSessionFile()!));
+			const newerBytes = await Bun.file(newerFile).text();
+			await newerTarget.close();
+			await outerTarget.close();
+			let newerSwitchAccepted = false;
+			SessionManagerTestHooks.beforeManagedSwitchIdentity = async filePath => {
+				if (filePath !== outerFile) throw new Error("Unexpected nested managed switch");
+				SessionManagerTestHooks.beforeManagedSwitchIdentity = undefined;
+				await session.setSessionFile(newerFile);
+				newerSwitchAccepted = true;
+			};
+			await expect(session.setSessionFile(outerFile)).rejects.toThrow("Session changed before adoption commit.");
+			SessionManagerTestHooks.beforeManagedSwitchIdentity = undefined;
+			expect(newerSwitchAccepted).toBe(true);
+			expect(session.getSessionId()).toBe(newerTarget.getSessionId());
+			expect(session.getSessionFile()).toBe(newerFile);
+			expect(session.buildSessionContext().messages).toEqual([
+				{ role: "user", content: "accepted newer N", timestamp: 2 },
+			]);
+			expect(await Bun.file(newerFile).text()).toBe(newerBytes);
+			const manager = session.getArtifactManager();
+			if (!manager) throw new Error("Expected newer artifact authority");
+			expect(session.isArtifactManagerAuthorized(manager)).toBe(true);
+			session.appendMessage({ role: "user", content: "N remains writable", timestamp: 4 });
+			await session.flush();
+			const artifactId = await session.saveArtifact("newer N artifact", "test");
+			if (!artifactId) throw new Error("Expected artifact id");
+			expect(session.getArtifactManager()).toBe(manager);
+			expect(await Bun.file(newerFile).text()).toContain("N remains writable");
+			expect(path.dirname((await session.getArtifactPath(artifactId))!)).toBe(newerFile.slice(0, -6));
+		} finally {
+			SessionManagerTestHooks.beforeManagedSwitchIdentity = undefined;
+			SessionManagerTestHooks.eagerHydrationMaxBytesOverride = undefined;
+			await session.close();
+			await newerTarget.close();
+			await outerTarget.close();
+		}
+	});
+
+	it("rejects explicit persisted transcript drift through both rollback APIs and accepts unchanged identity", async () => {
+		using root = TempDir.createSync("gjc-explicit-rollback-identity-");
+		const storage = new FileSessionStorage();
+		const session = SessionManager.create(root.path(), root.path(), storage);
+		try {
+			session.appendMessage({ role: "user", content: "persisted predecessor", timestamp: 1 });
+			await session.ensureOnDisk();
+			await session.flush();
+			const snapshot = await session.captureRollbackState();
+			const predecessorFile = session.getSessionFile();
+			if (!predecessorFile) throw new Error("Expected explicit persisted transcript");
+			await session.newSession();
+			session.appendMessage({ role: "user", content: "active successor", timestamp: 2 });
+			await session.ensureOnDisk();
+			const activeId = session.getSessionId();
+			const activeFile = session.getSessionFile();
+			if (!activeFile) throw new Error("Expected active explicit transcript");
+			await session.flush();
+			const activeBytes = await Bun.file(activeFile).text();
+			const activeManager = session.getArtifactManager();
+			if (!activeManager) throw new Error("Expected active explicit artifact authority");
+			const predecessorBytes = await Bun.file(predecessorFile).text();
+			const driftedPredecessorBytes = predecessorBytes.replace(
+				"persisted predecessor",
+				"persisted predecessor drift",
+			);
+			await Bun.write(predecessorFile, driftedPredecessorBytes);
+			expect(() => session.restoreState(snapshot)).toThrow("persistence identity changed");
+			await expect(session.restoreRollbackState(snapshot)).rejects.toThrow("persistence identity changed");
+			expect(session.getSessionId()).toBe(activeId);
+			expect(session.getSessionFile()).toBe(activeFile);
+			expect(session.getArtifactManager()).toBe(activeManager);
+			expect(session.isArtifactManagerAuthorized(activeManager)).toBe(true);
+			expect(await Bun.file(activeFile).text()).toBe(activeBytes);
+			expect(await Bun.file(predecessorFile).text()).toBe(driftedPredecessorBytes);
+			expect(session.buildSessionContext().messages).toEqual([
+				{ role: "user", content: "active successor", timestamp: 2 },
+			]);
+			session.appendMessage({ role: "user", content: "active explicit authority remains writable", timestamp: 3 });
+			await session.flush();
+			const id = await session.saveArtifact("active explicit artifact", "test");
+			if (!id) throw new Error("Expected artifact id");
+			expect(await Bun.file(activeFile).text()).toContain("active explicit authority remains writable");
+			expect(path.dirname((await session.getArtifactPath(id))!)).toBe(activeFile.slice(0, -6));
+		} finally {
+			await session.close();
+		}
+
+		const stable = SessionManager.create(root.path(), root.path(), storage);
+		try {
+			stable.appendMessage({ role: "user", content: "unchanged predecessor", timestamp: 4 });
+			await stable.ensureOnDisk();
+			const unchangedSnapshot = await stable.captureRollbackState();
+			const unchangedId = stable.getSessionId();
+			await stable.newSession();
+			await stable.ensureOnDisk();
+			stable.restoreState(unchangedSnapshot);
+			expect(stable.getSessionId()).toBe(unchangedId);
+			await stable.flush();
+			const asyncSnapshot = await stable.captureRollbackState();
+			await stable.newSession();
+			await stable.ensureOnDisk();
+			await stable.restoreRollbackState(asyncSnapshot);
+			expect(stable.getSessionId()).toBe(unchangedId);
+			expect(stable.buildSessionContext().messages).toEqual([
+				{ role: "user", content: "unchanged predecessor", timestamp: 4 },
+			]);
+		} finally {
+			await stable.close();
 		}
 	});
 

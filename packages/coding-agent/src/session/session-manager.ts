@@ -7332,6 +7332,7 @@ export const SessionManagerTestHooks: {
 	beforeManagedMissingReturn?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
 	afterManagedMissingAssertion?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
 	beforeManagedSwitchIdentity?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
+	beforeColdRollbackCommit?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
 	/** Internal first-open GC strategy override; omitted means current. */
 	firstOpenGcStrategy?: SessionMemoryGcStrategy;
 	/** Internal first-open secondary-artifact mode override; omitted means auto. */
@@ -7613,7 +7614,10 @@ function validateEvictedToolOutputHandle(
 	return { ok: true, handle: value as EvictedToolOutputHandle };
 }
 export class SessionManager {
-	readonly #stateSnapshots = new WeakMap<SessionManagerStateSnapshot, Readonly<SessionManagerStateSnapshot>>();
+	readonly #stateSnapshots = new WeakMap<
+		SessionManagerStateSnapshot,
+		Readonly<SessionManagerStateSnapshot> & { readonly explicitPersistIdentity?: ResumeSessionIdentity }
+	>();
 	#artifactLifecycle = Symbol("session-artifact-lifecycle");
 	#artifactLifecycleSessionId = "";
 	#artifactLifecycleSessionFile: string | undefined;
@@ -8412,25 +8416,34 @@ export class SessionManager {
 	}
 
 	#issueStateSnapshot(snapshot: SessionManagerStateSnapshot): SessionManagerStateSnapshot {
-		// The public snapshot is rollback data, not transferable authority. Keep a
-		// separate identity copy so editing a nested expectation cannot edit its issuer.
+		const cloneEntry = (entry: FileEntry): FileEntry =>
+			entry.type === "session" ? { ...entry } : cloneSessionEntry(entry);
+		// Public rollback data must not alias either the live graph or its private issuer copy.
+		const fileEntries = snapshot.fileEntries.map(cloneEntry);
+		const materializedFileEntries = snapshot.materializedFileEntries.map(cloneEntry);
+		snapshot.fileEntries = fileEntries;
+		snapshot.materializedFileEntries = materializedFileEntries;
 		snapshot.managedPersistExpectedIdentity = snapshot.managedPersistExpectedIdentity
 			? { ...snapshot.managedPersistExpectedIdentity }
 			: undefined;
+		const explicitPersistIdentity =
+			this.destination.kind === "explicit" &&
+			this.#storage instanceof FileSessionStorage &&
+			snapshot.ensuredOnDisk &&
+			snapshot.sessionFile
+				? this.#captureExplicitPersistIdentity(snapshot.sessionFile)
+				: undefined;
 		this.#stateSnapshots.set(
 			snapshot,
 			Object.freeze({
 				...snapshot,
-				fileEntries: Object.freeze(
-					snapshot.fileEntries.map(entry => (entry.type === "session" ? Object.freeze({ ...entry }) : entry)),
-				),
-				materializedFileEntries: Object.freeze(
-					snapshot.materializedFileEntries.map(entry =>
-						entry.type === "session" ? Object.freeze({ ...entry }) : entry,
-					),
-				),
+				fileEntries: Object.freeze(fileEntries.map(cloneEntry)),
+				materializedFileEntries: Object.freeze(materializedFileEntries.map(cloneEntry)),
 				managedPersistExpectedIdentity: snapshot.managedPersistExpectedIdentity
 					? Object.freeze({ ...snapshot.managedPersistExpectedIdentity })
+					: undefined,
+				explicitPersistIdentity: explicitPersistIdentity
+					? Object.freeze({ ...explicitPersistIdentity })
 					: undefined,
 			}),
 		);
@@ -8452,14 +8465,8 @@ export class SessionManager {
 			snapshot.ensuredOnDisk !== issued.ensuredOnDisk ||
 			snapshot.needsFullRewriteOnNextPersist !== issued.needsFullRewriteOnNextPersist ||
 			!util.isDeepStrictEqual(snapshot.managedPersistExpectedIdentity, issued.managedPersistExpectedIdentity) ||
-			!util.isDeepStrictEqual(
-				snapshot.fileEntries.filter(entry => entry.type === "session"),
-				issued.fileEntries.filter(entry => entry.type === "session"),
-			) ||
-			!util.isDeepStrictEqual(
-				snapshot.materializedFileEntries.filter(entry => entry.type === "session"),
-				issued.materializedFileEntries.filter(entry => entry.type === "session"),
-			)
+			!util.isDeepStrictEqual(snapshot.fileEntries, issued.fileEntries) ||
+			!util.isDeepStrictEqual(snapshot.materializedFileEntries, issued.materializedFileEntries)
 		) {
 			throw new Error("Session rollback snapshot is not authentic.");
 		}
@@ -8467,10 +8474,17 @@ export class SessionManager {
 	}
 
 	#assertSnapshotPersistenceIdentity(
-		snapshot: Readonly<SessionManagerStateSnapshot>,
+		snapshot: Readonly<SessionManagerStateSnapshot> & { readonly explicitPersistIdentity?: ResumeSessionIdentity },
 		store?: ManagedSessionDescendantStore,
 	): ManagedFileIdentity | undefined {
-		if (!snapshot.managedPersistExpectedIdentity || !snapshot.sessionFile) return undefined;
+		if (!snapshot.managedPersistExpectedIdentity || !snapshot.sessionFile) {
+			if (snapshot.explicitPersistIdentity && snapshot.sessionFile) {
+				const current = this.#captureExplicitPersistIdentity(snapshot.sessionFile);
+				if (!sameResumeIdentity(current, snapshot.explicitPersistIdentity))
+					throw new Error("Session rollback persistence identity changed.");
+			}
+			return undefined;
+		}
 		const current = this.#captureManagedPersistIdentity(snapshot.sessionFile, store);
 		if (util.isDeepStrictEqual(current, snapshot.managedPersistExpectedIdentity)) return current;
 		const rollback = this.#managedRollbackIdentity;
@@ -8515,40 +8529,148 @@ export class SessionManager {
 			return;
 		}
 		const lifecycle = this.#syncArtifactLifecycle();
+		const predecessorId = this.#sessionId;
+		const predecessorFile = this.#sessionFile;
 		const managedTransition =
 			this.destination.kind === "managed"
 				? this.#prepareManagedDestinationTransition(path.resolve(path.dirname(issued.coldRestoreFile)))
 				: undefined;
+		const candidateDestination = managedTransition?.destination ?? this.destination;
+		let candidate: SessionManager;
+		try {
+			candidate = new SessionManager(
+				this.cwd,
+				this.sessionDir,
+				this.persist,
+				this.#storage,
+				candidateDestination,
+				true,
+			);
+		} catch (error) {
+			managedTransition?.dispose();
+			throw error;
+		}
+		candidate.#sessionMemoryMode = this.#sessionMemoryMode;
+		candidate.#sessionMemoryAutoDisabledReason = this.#sessionMemoryAutoDisabledReason;
+		candidate.#residentImageBlobStore = this.#residentImageBlobStore;
+		candidate.#memoryGuardCheckpointBlobs = this.#memoryGuardCheckpointBlobs;
+		let installed = false;
+		const disposeCandidate = (): void => {
+			const residentStore = candidate.#residentTextBlobStore;
+			candidate.#residentTextBlobStore = new MemoryBlobStore();
+			candidate.#disposeResidentTextStore(residentStore);
+			try {
+				candidate.#releaseManagedSidecarCache();
+			} catch (error) {
+				logger.warn("Failed to dispose staged rollback sidecar authority", { error: toError(error).message });
+			}
+			try {
+				candidate.#managedTranscriptStoreCache?.store.close();
+			} catch (error) {
+				logger.warn("Failed to dispose staged rollback transcript authority", { error: toError(error).message });
+			}
+			candidate.#managedTranscriptStoreCache = null;
+			try {
+				candidate.#releaseOwnedManagedAuthority();
+				candidate.#clearBoundedManagedSource();
+			} catch (error) {
+				logger.warn("Failed to dispose staged rollback managed authority", { error: toError(error).message });
+			}
+		};
 		try {
 			this.#assertSnapshotPersistenceIdentity(issued, managedTransition?.store);
-			await this.#closePersistWriter();
-			this.#authenticateStateSnapshot(snapshot);
-			if (lifecycle !== this.#syncArtifactLifecycle()) throw new Error("Session changed before rollback commit.");
-			this.#assertSnapshotPersistenceIdentity(issued, managedTransition?.store);
-			managedTransition?.adopt();
-			await this.#initSessionFile(issued.coldRestoreFile, false, undefined, true, true);
+			await candidate.#initSessionFile(issued.coldRestoreFile, false, undefined, true, true, true);
+			await SessionManagerTestHooks.beforeColdRollbackCommit?.(issued.coldRestoreFile, this.#storage);
 			this.#authenticateStateSnapshot(snapshot);
 			if (
-				this.#artifactLifecycle !== lifecycle ||
-				this.#sessionId !== issued.sessionId ||
-				this.#sessionFile !== issued.coldRestoreFile
+				lifecycle !== this.#syncArtifactLifecycle() ||
+				this.#sessionId !== predecessorId ||
+				this.#sessionFile !== predecessorFile
 			)
 				throw new Error("Session changed before rollback commit.");
-			const restoredIdentity = this.#assertSnapshotPersistenceIdentity(issued);
+			this.#assertSnapshotPersistenceIdentity(issued, managedTransition?.store);
+			if (candidate.#sessionId !== issued.sessionId || candidate.#sessionFile !== issued.coldRestoreFile)
+				throw new Error("Session rollback candidate identity changed.");
+			await this.#closePersistWriter();
+			this.#assertArtifactOpen();
+			this.#authenticateStateSnapshot(snapshot);
+			if (
+				lifecycle !== this.#syncArtifactLifecycle() ||
+				this.#sessionId !== predecessorId ||
+				this.#sessionFile !== predecessorFile
+			)
+				throw new Error("Session changed before rollback commit.");
+			const restoredIdentity = this.#assertSnapshotPersistenceIdentity(issued, managedTransition?.store);
+			managedTransition?.adopt();
+			const predecessorStore = this.#residentTextBlobStore;
+			try {
+				this.#releaseManagedSidecarCache();
+			} catch (error) {
+				logger.warn("Failed to release predecessor rollback sidecar authority", { error: toError(error).message });
+			}
+			this.#sessionId = issued.sessionId;
+			this.#sessionName = issued.sessionName;
+			this.#titleSource = issued.titleSource;
+			this.#sessionFile = issued.coldRestoreFile;
+			this.#fileEntries = candidate.#fileEntries;
+			this.#residentTextBlobStore = candidate.#residentTextBlobStore;
+			candidate.#residentTextBlobStore = new MemoryBlobStore();
+			this.#byId = candidate.#byId;
+			this.#labelsById = candidate.#labelsById;
+			this.#leafId = candidate.#leafId;
+			this.#usageStatistics = candidate.#usageStatistics;
+			this.#sidecarRuntime = candidate.#sidecarRuntime;
+			candidate.#sidecarRuntime = undefined;
+			this.#commitGen = candidate.#commitGen;
+			this.#managedRangeExpectedDescriptor = candidate.#managedRangeExpectedDescriptor;
+			this.#managedPersistExpectedIdentity = restoredIdentity;
 			this.#flushed = issued.flushed;
 			this.#ensuredOnDisk = issued.ensuredOnDisk;
 			this.#needsFullRewriteOnNextPersist = issued.needsFullRewriteOnNextPersist;
-			this.#managedPersistExpectedIdentity = restoredIdentity;
+			this.#sessionMemoryMode = candidate.#sessionMemoryMode;
+			this.#sessionMemoryAutoDisabledReason = candidate.#sessionMemoryAutoDisabledReason;
+			this.#lazyReopenAttempted = candidate.#lazyReopenAttempted;
+			this.#lazyReopenSucceeded = candidate.#lazyReopenSucceeded;
+			this.#lazyReopenFallbackReason = candidate.#lazyReopenFallbackReason;
+			this.#boundedFirstOpenBuildSuppressed = candidate.#boundedFirstOpenBuildSuppressed;
+			this.#consecutiveSidecarBuildFailures = candidate.#consecutiveSidecarBuildFailures;
+			this.#retirementFallbackReason = candidate.#retirementFallbackReason;
+			this.#sidecarBranchActivationDirty = candidate.#sidecarBranchActivationDirty;
+			this.#firstOpenTelemetry = candidate.#firstOpenTelemetry;
+			this.#managedSidecarAuthorityStore = candidate.#managedSidecarAuthorityStore;
+			this.#managedSidecarSecurityContext = candidate.#managedSidecarSecurityContext;
+			this.#managedSidecarCacheStore = candidate.#managedSidecarCacheStore;
+			this.#managedSidecarCacheSessionFile = candidate.#managedSidecarCacheSessionFile;
+			candidate.#managedSidecarAuthorityStore = undefined;
+			candidate.#managedSidecarSecurityContext = undefined;
+			candidate.#managedSidecarCacheStore = undefined;
+			candidate.#managedSidecarCacheSessionFile = undefined;
+			candidate.#managedRangeExpectedDescriptor = undefined;
+			this.#boundedReadStorageProxy = undefined;
+			this.#bumpAllRevisions();
+			this.#residentBlobRevision++;
 			this.#artifactManager = null;
 			this.#artifactManagerSessionFile = null;
 			this.#adoptedArtifactManager = issued.adoptedArtifactManager;
 			this.#artifactLifecycle = Symbol("session-artifact-rollback");
-			managedTransition?.settle();
+			installed = true;
+			this.#disposeResidentTextStore(predecessorStore);
+			try {
+				managedTransition?.settle();
+			} catch (error) {
+				logger.warn("Failed to settle managed authority after cold rollback", { error: toError(error).message });
+			}
+			try {
+				this.#writeTerminalBreadcrumb(issued.coldRestoreFile);
+			} catch (error) {
+				logger.warn("Failed to update terminal breadcrumb after cold rollback", { error: toError(error).message });
+			}
 		} catch (error) {
-			managedTransition?.rollback();
+			if (!installed) managedTransition?.rollback();
 			throw error;
 		} finally {
 			managedTransition?.dispose();
+			disposeCandidate();
 		}
 	}
 	captureState(): SessionManagerStateSnapshot {
@@ -8567,8 +8689,6 @@ export class SessionManager {
 			ensuredOnDisk: this.#ensuredOnDisk,
 			needsFullRewriteOnNextPersist: this.#needsFullRewriteOnNextPersist,
 			managedPersistExpectedIdentity: this.#managedPersistExpectedIdentity,
-			// Snapshot entry objects by reference: switch/reload replaces the active entry array,
-			// so rollback does not need structured cloning of extension/custom details.
 			fileEntries: this.#fileEntries.map(entry => (entry.type === "session" ? { ...entry } : entry)),
 			// Rollback snapshots must own resident data before another session reset disposes
 			// the ephemeral store backing the resident sentinels above.
@@ -8702,7 +8822,7 @@ export class SessionManager {
 		);
 	}
 
-	async #tryInitSessionFileFromSidecar(sessionFile: string): Promise<boolean> {
+	async #tryInitSessionFileFromSidecar(sessionFile: string, stagedCandidate = false): Promise<boolean> {
 		SessionManagerTestHooks.lastSidecarInitError = undefined;
 		if (
 			(this.#sessionMemoryMode !== "enabled" && this.#sessionMemoryMode !== "auto") ||
@@ -8721,7 +8841,7 @@ export class SessionManager {
 		this.#lazyReopenSucceeded = false;
 		this.#lazyReopenFallbackReason = "proof_invalid";
 		this.#sessionFile = sessionFile;
-		const runtime = this.#resetSidecarRuntime();
+		const runtime = this.#resetSidecarRuntime(false, stagedCandidate);
 		runtime.enabled = true;
 		let initialized = false;
 		try {
@@ -9794,6 +9914,7 @@ export class SessionManager {
 		strictResume?: { inspection: ResumeInspectionSnapshot; storage: SessionStorage; reuseEntries?: boolean },
 		requireExisting = false,
 		deferPersistenceUntilAccepted = false,
+		stagedRollbackCandidate = false,
 	): Promise<void> {
 		let strictManagedFallbackEntries: FileEntry[] | undefined;
 		let strictManagedFallbackMigrationApplied = false;
@@ -9825,18 +9946,25 @@ export class SessionManager {
 			boundedTranscriptAdmitted &&
 			this.#effectiveSessionMemoryMode(transcriptSize) === "enabled" &&
 			this.#storage.existsSync(`${sidecarRoot}/.session-memory.spill.commit`);
-		if (boundedTranscriptAdmitted && (await this.#tryInitSessionFileFromSidecar(resolvedSessionFile))) {
-			this.#writeTerminalBreadcrumb(resolvedSessionFile);
+		if (
+			boundedTranscriptAdmitted &&
+			(await this.#tryInitSessionFileFromSidecar(resolvedSessionFile, stagedRollbackCandidate))
+		) {
+			if (!stagedRollbackCandidate) this.#writeTerminalBreadcrumb(resolvedSessionFile);
 			revalidateStrictResume();
 			return;
 		}
 
-		if (boundedTranscriptAdmitted && (await this.#tryBoundedFirstOpen(resolvedSessionFile))) {
+		if (
+			!stagedRollbackCandidate &&
+			boundedTranscriptAdmitted &&
+			(await this.#tryBoundedFirstOpen(resolvedSessionFile))
+		) {
 			if (publishedSidecarWasPresent && this.#lazyReopenAttempted && !this.#lazyReopenSucceeded) {
 				this.#sessionMemoryMode = "shadow";
 				this.#sessionMemoryAutoDisabledReason = "sidecar_reload_failures";
 			}
-			this.#writeTerminalBreadcrumb(resolvedSessionFile);
+			if (!stagedRollbackCandidate) this.#writeTerminalBreadcrumb(resolvedSessionFile);
 			revalidateStrictResume();
 			return;
 		}
@@ -9847,12 +9975,13 @@ export class SessionManager {
 			!this.#storage.existsSync(resolvedSessionFile);
 		if ((strictResume || requireExisting) && transcriptMissing) throw new Error("Could not open session: unstable");
 		if (initializeMissing && transcriptMissing) {
+			if (stagedRollbackCandidate) throw new Error("Could not open session: unstable");
 			const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
 			const prepared = this.#prepareFreshSessionTransition(fresh, "memory-fallback");
 			this.#applyFreshSessionMetadata(fresh);
 			this.#commitResidentTextStoreTransition(prepared);
 			this.#retireEphemeralArtifacts();
-			this.#writeTerminalBreadcrumb(resolvedSessionFile);
+			if (!stagedRollbackCandidate) this.#writeTerminalBreadcrumb(resolvedSessionFile);
 			await this.#rewriteFile();
 			this.#flushed = true;
 			this.#ensuredOnDisk = true;
@@ -9875,12 +10004,13 @@ export class SessionManager {
 		const entries = strictManagedFallbackEntries ?? (await loadEntriesFromFile(resolvedSessionFile, this.#storage));
 		revalidateStrictResume();
 		if (entries.length === 0) {
+			if (stagedRollbackCandidate) throw new Error("Could not open session: unstable");
 			const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
 			const prepared = this.#prepareFreshSessionTransition(fresh, "memory-fallback");
 			this.#applyFreshSessionMetadata(fresh);
 			this.#commitResidentTextStoreTransition(prepared);
 			this.#retireEphemeralArtifacts();
-			this.#writeTerminalBreadcrumb(resolvedSessionFile);
+			if (!stagedRollbackCandidate) this.#writeTerminalBreadcrumb(resolvedSessionFile);
 			await this.#rewriteFile();
 			this.#flushed = true;
 			this.#ensuredOnDisk = true;
@@ -9913,7 +10043,7 @@ export class SessionManager {
 		this.#titleSource = header?.titleSource;
 		this.#needsFullRewriteOnNextPersist = migrationApplied;
 		this.#commitResidentTextStoreTransition(prepared);
-		this.#writeTerminalBreadcrumb(resolvedSessionFile);
+		if (!stagedRollbackCandidate) this.#writeTerminalBreadcrumb(resolvedSessionFile);
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
 		this.#adoptManagedPersistIdentity(resolvedSessionFile);
@@ -10015,6 +10145,9 @@ export class SessionManager {
 							: undefined;
 					const expectedStat = this.#storage.statSync(resolvedSessionFile);
 					const previous = await this.captureRollbackState();
+					let installedGeneration: symbol | undefined;
+					let installedSessionId: string | undefined;
+					let installedSessionFile: string | undefined;
 					try {
 						await this.#closePersistWriter();
 						await SessionManagerTestHooks.beforeManagedSwitchIdentity?.(resolvedSessionFile, this.#storage);
@@ -10037,6 +10170,11 @@ export class SessionManager {
 							throw new Error("Prepared session changed before adoption commit.");
 						managedTransition?.adopt();
 						await this.#initSessionFile(resolvedSessionFile, false, undefined, true, true);
+						if (this.#artifactLifecycle === lifecycle && this.#sessionFile === resolvedSessionFile) {
+							installedGeneration = this.#artifactLifecycle;
+							installedSessionId = this.#sessionId;
+							installedSessionFile = this.#sessionFile;
+						}
 						this.#assertArtifactOpen();
 						if (this.#artifactLifecycle !== lifecycle || this.#sessionFile !== resolvedSessionFile)
 							throw new Error("Session changed before adoption commit.");
@@ -10054,16 +10192,45 @@ export class SessionManager {
 						this.#artifactManager = null;
 						this.#artifactManagerSessionFile = null;
 						this.#artifactLifecycle = Symbol("session-artifact-adoption");
+						installedGeneration = this.#artifactLifecycle;
+						installedSessionId = this.#sessionId;
+						installedSessionFile = this.#sessionFile;
 						this.#persistError = undefined;
 						this.#persistErrorReported = false;
 						if (!options?.deferEphemeralArtifactRetirement) this.#retireEphemeralArtifacts();
-						managedTransition?.settle();
 						this.#pendingStrictAdoption = undefined;
+						try {
+							managedTransition?.settle();
+						} catch (settleError) {
+							logger.warn("Failed to settle managed authority after bounded adoption", {
+								error: toError(settleError).message,
+							});
+						}
 						return;
 					} catch (error) {
-						managedTransition?.rollback();
-						// A rejected attempt cannot erase the predecessor's retry evidence.
-						await this.restoreRollbackState(previous);
+						const ownsInstalledGeneration =
+							installedGeneration !== undefined &&
+							this.#artifactLifecycle === installedGeneration &&
+							this.#sessionId === installedSessionId &&
+							this.#sessionFile === installedSessionFile;
+						const ownsPredecessorGeneration =
+							this.#artifactLifecycle === lifecycle &&
+							this.#sessionId === predecessorId &&
+							this.#sessionFile === predecessorFile;
+						if (ownsInstalledGeneration) {
+							managedTransition?.rollback();
+							await this.restoreRollbackState(previous);
+						} else if (ownsPredecessorGeneration) {
+							managedTransition?.rollback();
+						} else {
+							try {
+								managedTransition?.settle();
+							} catch (settleError) {
+								logger.warn("Failed to settle superseded managed authority", {
+									error: toError(settleError).message,
+								});
+							}
+						}
 						throw error;
 					}
 				}
@@ -12967,9 +13134,9 @@ export class SessionManager {
 	// =========================================================================
 
 	/** Create (or reset) the sidecar runtime for the current lifecycle. */
-	#resetSidecarRuntime(ineligible = false): SessionMemorySidecarRuntime {
+	#resetSidecarRuntime(ineligible = false, preserveLegacySidecars = false): SessionMemorySidecarRuntime {
 		this.#sidecarBranchActivationDirty = false;
-		if (this.#sessionFile && this.destination.kind !== "managed") {
+		if (!preserveLegacySidecars && this.#sessionFile && this.destination.kind !== "managed") {
 			for (const legacyPath of [
 				`${this.#sessionFile}.spill.idx`,
 				`${this.#sessionFile}.spill.tail`,
@@ -16003,6 +16170,12 @@ export class SessionManager {
 			return;
 		}
 		this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(sessionFile);
+	}
+
+	#captureExplicitPersistIdentity(sessionFile: string): ResumeSessionIdentity {
+		const result = inspectTranscriptBounded(sessionFile, this.#storage);
+		if (!result.ok) throw new Error("Session rollback persistence identity is unavailable.");
+		return result.inspection.identity;
 	}
 
 	/** Capture one descriptor-bound digest for a future metadata-drift comparison. */
