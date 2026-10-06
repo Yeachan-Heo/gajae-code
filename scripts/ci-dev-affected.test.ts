@@ -1146,6 +1146,7 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		"packages/coding-agent/test/other/index.test.ts",
 		"packages/coding-agent/test/sdk-client.test.ts",
 		"packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts",
+		"packages/coding-agent/test/session/session-memory-integration.test.ts",
 	];
 
 	function targeted(paths: readonly string[]) {
@@ -1480,6 +1481,32 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			task => task.key,
 		);
 		expect(keys).toContain("test:packages/coding-agent/test/managed-scope-self-heal-budget.test.ts");
+	});
+	test("session-manager changes select session-memory integration exactly once without broad shards", () => {
+		const testKey = "test:packages/coding-agent/test/session/session-memory-integration.test.ts";
+		const tasks = targeted(["packages/coding-agent/src/session/session-manager.ts"]);
+		const keys = tasks.map(task => task.key);
+		expect(keys.filter(key => key === testKey)).toHaveLength(1);
+		expect(tasks.find(task => task.key === testKey)?.command).toEqual([
+			"bun",
+			"test",
+			"packages/coding-agent/test/session/session-memory-integration.test.ts",
+		]);
+		expect(keys).not.toContain("test:@gajae-code/coding-agent");
+		expect(keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-"))).toEqual([]);
+	});
+	test("unrelated session sources do not select the session-memory integration test", () => {
+		const keys = targeted(["packages/coding-agent/src/session/session-storage.ts"]).map(task => task.key);
+		expect(keys).not.toContain("test:packages/coding-agent/test/session/session-memory-integration.test.ts");
+	});
+	test("duplicate session-manager changes still select the integration test once", () => {
+		const keys = targeted([
+			"packages/coding-agent/src/session/session-manager.ts",
+			"packages/coding-agent/src/session/session-manager.ts",
+		]).map(task => task.key);
+		expect(
+			keys.filter(key => key === "test:packages/coding-agent/test/session/session-memory-integration.test.ts"),
+		).toHaveLength(1);
 	});
 	const extensibilityOwnerTests = [
 		"packages/coding-agent/test/function-hooks.test.ts",
