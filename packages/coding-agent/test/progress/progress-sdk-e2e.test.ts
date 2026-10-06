@@ -1,6 +1,10 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { activeSnapshotPath, activeStateDir } from "../../src/gjc-runtime/session-layout";
+import * as stateWriter from "../../src/gjc-runtime/state-writer";
 import { createSdkMcpServer } from "../../src/sdk/mcp";
+import { syncSkillActiveState } from "../../src/skill-state/active-state";
 import { type AdapterFixture, fixture, runDaemonCli } from "../helpers/sdk-adapter-dispositions-shared";
 
 /**
@@ -68,5 +72,37 @@ describe("session.progress through production SDK adapters", () => {
 		});
 		expect(exitCode).toBeUndefined();
 		expect(output).toMatchObject({ type: "query_response", ok: true, page: { items: [expected], complete: true } });
+	}, 60_000);
+
+	it("does not report a workflow that only a stale derived snapshot still lists", async () => {
+		const cwd = host.repo;
+		const sessionId = host.sessionId;
+		await syncSkillActiveState({ cwd, skill: "autoresearch", phase: "research", active: true, sessionId });
+		const rebuild = vi
+			.spyOn(stateWriter, "rebuildActiveSnapshot")
+			.mockRejectedValue(new Error("simulated crash before snapshot rebuild"));
+		await expect(syncSkillActiveState({ cwd, skill: "autoresearch", active: false, sessionId })).rejects.toThrow(
+			"simulated crash before snapshot rebuild",
+		);
+		rebuild.mockRestore();
+		const mcp = createSdkMcpServer({ agentDir: host.agentDir });
+		try {
+			expect(await Bun.file(activeSnapshotPath(cwd, sessionId)).text()).toContain('"autoresearch"');
+			const result = (await mcp.callTool("gjc_session_query", {
+				sessionId,
+				query: "session.progress",
+				input: {},
+			})) as { ok?: boolean; result?: { page?: { items?: unknown[] } }; page?: { items?: unknown[] } };
+			expect(result.ok).toBe(true);
+			const page = result.page ?? result.result?.page;
+			expect(page?.items?.[0]).toMatchObject({
+				activeWork: { workflows: [] },
+				sources: { unreadable: [], recovered: [], discarded: ["workflow-state"], unresolved: [] },
+			});
+		} finally {
+			await mcp.close();
+			await fs.rm(activeSnapshotPath(cwd, sessionId), { force: true });
+			await fs.rm(activeStateDir(cwd, sessionId), { recursive: true, force: true });
+		}
 	}, 60_000);
 });

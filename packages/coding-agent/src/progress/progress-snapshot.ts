@@ -133,6 +133,8 @@ export function toProjectProgressSnapshot(report: ProjectProgressReport): Projec
 			sessionStateRead: report.sessionStateRead,
 			unreadable: [...report.unreadable],
 			recovered: [...report.recovered],
+			discarded: [...report.discarded],
+			unresolved: [...report.unresolved],
 		},
 	};
 }

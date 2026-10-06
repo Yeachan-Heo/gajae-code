@@ -79,6 +79,10 @@ export interface ProjectProgressInput {
 	unreadable: ProgressDurableSource[];
 	/** Durable sources whose primary record was unreadable but whose contents were recovered from authoritative per-entry records. */
 	recovered: ProgressDurableSource[];
+	/** Durable sources whose readable derived snapshot listed entries the authoritative per-entry records do not; those stale entries were discarded. */
+	discarded: ProgressDurableSource[];
+	/** Durable sources listing entries whose authority could not be established; those entries are excluded and their absence is unconfirmed. */
+	unresolved: ProgressDurableSource[];
 }
 
 export interface ProgressSignal {
@@ -148,6 +152,8 @@ export interface ProjectProgressReport {
 	sessionStateRead: boolean;
 	unreadable: ProgressDurableSource[];
 	recovered: ProgressDurableSource[];
+	discarded: ProgressDurableSource[];
+	unresolved: ProgressDurableSource[];
 }
 
 const BLOCKING_STORY_STATUSES: ReadonlySet<UltragoalGoalStatus> = new Set(["failed", "blocked", "review_blocked"]);
@@ -364,6 +370,22 @@ export function computeProjectProgress(input: ProjectProgressInput): ProjectProg
 			text: `${PROGRESS_SOURCE_LABELS[source]} snapshot could not be read; its contents were recovered from authoritative per-entry records.`,
 		});
 	}
+	for (const source of input.discarded) {
+		signals.push({
+			kind: "note",
+			source: "state",
+			ref: source,
+			text: `${PROGRESS_SOURCE_LABELS[source]} snapshot is stale; workflows it lists without an authoritative per-entry record were discarded, not reported as active.`,
+		});
+	}
+	for (const source of input.unresolved) {
+		signals.push({
+			kind: "note",
+			source: "state",
+			ref: source,
+			text: `${PROGRESS_SOURCE_LABELS[source]} lists workflows whose authority cannot be established; they are not reported as active, and their absence is unconfirmed.`,
+		});
+	}
 
 	const headline = selectHeadline(input, completion, stories, todos, agents, signals);
 	if (headline === "awaiting-completion" && input.goal && input.goal.status !== "complete") {
@@ -390,6 +412,8 @@ export function computeProjectProgress(input: ProjectProgressInput): ProjectProg
 		sessionStateRead: input.sessionStateRead,
 		unreadable: input.unreadable,
 		recovered: input.recovered,
+		discarded: input.discarded,
+		unresolved: input.unresolved,
 	};
 }
 

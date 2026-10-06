@@ -32,7 +32,8 @@ async function readWorkflows(
 	sessionId: string,
 ): Promise<{ status: VisibleSkillActiveStateReadStatus; workflows: ProgressWorkflowInput[] }> {
 	// The tolerant HUD reader maps an unreadable session snapshot to "nothing
-	// active"; this projection must report that as unreadable, not as absence.
+	// active" and lets snapshot-only rows survive; this projection must report
+	// unreadable state as unreadable, and never report a row without authority.
 	const { status, state } = await readVisibleSkillActiveStateWithStatus(cwd, sessionId);
 	const workflows = (state?.active_skills ?? [])
 		.filter(entry => entry.active !== false)
@@ -70,11 +71,15 @@ async function readUltragoal(cwd: string, sessionId: string): Promise<ProgressUl
  * Gather progress input strictly by reading state. A source that fails to read
  * is reported as unreadable and excluded; it never aborts the overview and is
  * never replaced by a guess. A source rebuilt from authoritative per-entry
- * records after its snapshot failed to read is reported as recovered.
+ * records after its snapshot failed to read is reported as recovered; one whose
+ * readable derived snapshot listed stale rows is reported as discarded; one whose
+ * rows could not be attributed to an authority is reported as unresolved.
  */
 export async function collectProjectProgressInput(view: ProjectProgressSessionView): Promise<ProjectProgressInput> {
 	const unreadable: ProgressDurableSource[] = [];
 	const recovered: ProgressDurableSource[] = [];
+	const discarded: ProgressDurableSource[] = [];
+	const unresolved: ProgressDurableSource[] = [];
 	const sessionId = view.sessionId?.trim() || undefined;
 	let workflows: ProgressWorkflowInput[] = [];
 	let ultragoal: ProgressUltragoalInput | undefined;
@@ -88,6 +93,8 @@ export async function collectProjectProgressInput(view: ProjectProgressSessionVi
 		} else {
 			workflows = workflowResult.value.workflows;
 			if (workflowResult.value.status === "recovered") recovered.push("workflow-state");
+			else if (workflowResult.value.status === "discarded") discarded.push("workflow-state");
+			else if (workflowResult.value.status === "unresolved") unresolved.push("workflow-state");
 		}
 		if (ultragoalResult.status === "fulfilled") ultragoal = ultragoalResult.value;
 		else unreadable.push("ultragoal-plan");
@@ -111,6 +118,8 @@ export async function collectProjectProgressInput(view: ProjectProgressSessionVi
 		sessionStateRead: sessionId !== undefined,
 		unreadable,
 		recovered,
+		discarded,
+		unresolved,
 	};
 }
 

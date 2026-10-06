@@ -33,6 +33,8 @@ function input(overrides: Partial<ProjectProgressInput> = {}): ProjectProgressIn
 		sessionStateRead: true,
 		unreadable: [],
 		recovered: [],
+		discarded: [],
+		unresolved: [],
 		...overrides,
 	};
 }
@@ -304,7 +306,13 @@ describe("collectProjectProgressInput", () => {
 		expect(collected.unreadable).toEqual(["workflow-state"]);
 		expect(collected.recovered).toEqual([]);
 		const snapshot = toProjectProgressSnapshot(computeProjectProgress(collected));
-		expect(snapshot.sources).toEqual({ sessionStateRead: true, unreadable: ["workflow-state"], recovered: [] });
+		expect(snapshot.sources).toEqual({
+			sessionStateRead: true,
+			unreadable: ["workflow-state"],
+			recovered: [],
+			discarded: [],
+			unresolved: [],
+		});
 		expect(snapshot.attention).toContainEqual({
 			kind: "note",
 			source: "state",
@@ -336,7 +344,13 @@ describe("collectProjectProgressInput", () => {
 		expect(collected.unreadable).toEqual([]);
 		expect(collected.recovered).toEqual(["workflow-state"]);
 		const snapshot = toProjectProgressSnapshot(computeProjectProgress(collected));
-		expect(snapshot.sources).toEqual({ sessionStateRead: true, unreadable: [], recovered: ["workflow-state"] });
+		expect(snapshot.sources).toEqual({
+			sessionStateRead: true,
+			unreadable: [],
+			recovered: ["workflow-state"],
+			discarded: [],
+			unresolved: [],
+		});
 		expect(snapshot.attention).toContainEqual(
 			expect.objectContaining({ kind: "note", source: "state", ref: "workflow-state" }),
 		);

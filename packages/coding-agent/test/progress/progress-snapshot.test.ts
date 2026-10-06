@@ -33,6 +33,8 @@ function input(overrides: Partial<ProjectProgressInput> = {}): ProjectProgressIn
 		sessionStateRead: true,
 		unreadable: [],
 		recovered: [],
+		discarded: [],
+		unresolved: [],
 		...overrides,
 	};
 }
@@ -132,7 +134,13 @@ describe("toProjectProgressSnapshot", () => {
 			ref: "G4",
 			text: "Story G4 is blocked: Story G4",
 		});
-		expect(snapshot.sources).toEqual({ sessionStateRead: true, unreadable: [], recovered: [] });
+		expect(snapshot.sources).toEqual({
+			sessionStateRead: true,
+			unreadable: [],
+			recovered: [],
+			discarded: [],
+			unresolved: [],
+		});
 		// The snapshot is plain JSON: no undefined holes for wire clients.
 		expect(JSON.parse(JSON.stringify(snapshot))).toEqual(snapshot);
 	});

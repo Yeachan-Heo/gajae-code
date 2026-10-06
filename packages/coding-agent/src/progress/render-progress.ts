@@ -149,6 +149,8 @@ export function renderProgressSnapshot(
 	}
 	if (activeWork.workflows.length === 0 && snapshot.sources.unreadable.includes("workflow-state")) {
 		lines.push(`${label("Workflows")}${style.fg("warning", "unknown: workflow state could not be read")}`);
+	} else if (activeWork.workflows.length === 0 && snapshot.sources.unresolved.includes("workflow-state")) {
+		lines.push(`${label("Workflows")}${style.fg("warning", "unknown: workflow state could not be reconciled")}`);
 	} else if (activeWork.workflows.length === 0 && activeWork.omittedWorkflows === 0) {
 		lines.push(`${label("Workflows")}${style.fg("dim", "none active")}`);
 	} else {

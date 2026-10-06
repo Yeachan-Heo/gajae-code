@@ -158,6 +158,10 @@ export interface ProjectProgressSnapshot {
 		unreadable: ProgressDurableSource[];
 		/** Sources whose primary record was unreadable but whose contents were recovered from authoritative per-entry records. */
 		recovered: ProgressDurableSource[];
+		/** Sources whose readable derived snapshot listed entries the authoritative per-entry records do not; those stale entries were discarded. */
+		discarded: ProgressDurableSource[];
+		/** Sources listing entries whose authority could not be established; those entries are excluded and their absence is unconfirmed. */
+		unresolved: ProgressDurableSource[];
 	};
 }
 
