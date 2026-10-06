@@ -171,7 +171,7 @@ type FixtureOptions = {
 	imageProgressMs?: number;
 	allowLiveSessionRecovery?: boolean;
 	recoveryListGate?: { started: () => void; release: Promise<void> };
-	imageControlGate?: { operation: string; started: () => void; release: Promise<void> };
+	imageControlGate?: { operation: string; started: () => void; release: Promise<void>; completed?: () => void };
 };
 
 async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
@@ -425,8 +425,8 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 					imageUploadCount++;
 					imageSocket = socket;
 					void (async () => {
+						const gate = options.imageControlGate;
 						try {
-							const gate = options.imageControlGate;
 							if (gate && frame.operation === gate.operation) {
 								gate.started();
 								await gate.release;
@@ -455,6 +455,8 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 									error: { code: failure.code ?? "internal", message: failure.message },
 								}),
 							);
+						} finally {
+							if (gate && frame.operation === gate.operation) gate.completed?.();
 						}
 					})();
 					return;
@@ -822,8 +824,9 @@ for (const operation of ["turn.image.begin", "turn.image.append", "turn.image.fi
 	test(`cancelling held ${operation} is local and cannot publish a late image echo`, async () => {
 		const entered = Promise.withResolvers<void>();
 		const gate = Promise.withResolvers<void>();
+		const completed = Promise.withResolvers<void>();
 		const fixture = await createFixture({
-			imageControlGate: { operation, started: entered.resolve, release: gate.promise },
+			imageControlGate: { operation, started: entered.resolve, release: gate.promise, completed: completed.resolve },
 		});
 		try {
 			const image = Buffer.from(
@@ -843,6 +846,7 @@ for (const operation of ["turn.image.begin", "turn.image.append", "turn.image.fi
 			expect(fixture.promptDeliveryCount()).toBe(0);
 			expect(fixture.updates.filter(update => update.update.sessionUpdate === "user_message_chunk")).toHaveLength(0);
 			gate.resolve();
+			await bounded(completed.promise, "held image response completion");
 			await waitFor(() => fixture.liveImageUploadCount() === 0, "cancelled upload cleanup");
 			await Bun.sleep(20);
 			expect(fixture.promptDeliveryCount()).toBe(0);
