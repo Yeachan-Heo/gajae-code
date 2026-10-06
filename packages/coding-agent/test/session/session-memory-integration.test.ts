@@ -3748,8 +3748,8 @@ describe("whole-session persistence freshness", () => {
 	it("retires a close-origin error after rewrite debt resolves", async () => {
 		class CloseSequenceStorage extends MemorySessionStorage {
 			readonly events: string[] = [];
-			private sessionCloseFailures = 1;
-			private rewriteCloseFailures = 1;
+			#sessionCloseFailures = 1;
+			#rewriteCloseFailures = 1;
 			sessionCloseDispatches = 0;
 			rewriteCloseDispatches = 0;
 
@@ -3762,16 +3762,16 @@ describe("whole-session persistence freshness", () => {
 							if (filePath.includes(".tmp")) {
 								this.rewriteCloseDispatches++;
 								this.events.push(`rewrite-close-${this.rewriteCloseDispatches}`);
-								if (this.rewriteCloseFailures > 0) {
-									this.rewriteCloseFailures--;
+								if (this.#rewriteCloseFailures > 0) {
+									this.#rewriteCloseFailures--;
 									throw new Error("rewrite_debt_error_y");
 								}
 								return;
 							}
 							this.sessionCloseDispatches++;
 							this.events.push(`session-close-${this.sessionCloseDispatches}`);
-							if (this.sessionCloseFailures > 0) {
-								this.sessionCloseFailures--;
+							if (this.#sessionCloseFailures > 0) {
+								this.#sessionCloseFailures--;
 								throw new SessionStorageWriterRetryableCloseError("writer_close_error_x");
 							}
 						},
@@ -3805,21 +3805,50 @@ describe("whole-session persistence freshness", () => {
 			"off",
 		);
 
-		manager.appendCustomEntry("initial", { value: 1 });
+		const initialId = manager.appendCustomEntry("initial", { value: 1 });
 		await manager.flush();
+		const beforeRewrite = storage.readTextSync(sessionFile);
 		const existing = manager.getEntry("existing");
 		if (existing?.type !== "message") throw new Error("test fixture message missing");
+		existing.message = { role: "user", content: "rewritten after close retry", timestamp: 0 };
 		manager.applyEntryMessageUpdates([existing]);
+		const expectedRecords = [manager.getHeader(), ...manager.getEntries()];
+		expect(manager.hotRetainedMessageCharsForTests()).toBeGreaterThan(0);
 
 		await expect(manager.close()).rejects.toThrow("writer_close_error_x");
+		expect(storage.readTextSync(sessionFile)).toBe(beforeRewrite);
+		expect(manager.getEntry("existing")).toEqual(existing);
+		expect(manager.getEntries()).toHaveLength(2);
 		await expect(manager.close()).rejects.toThrow("rewrite_debt_error_y");
 		expect(storage.events).toEqual(["session-close-1", "session-close-2", "rewrite-close-1"]);
+		expect(storage.readTextSync(sessionFile)).toBe(beforeRewrite);
+		expect(manager.getEntry("existing")).toEqual(existing);
+		expect(manager.getEntries()).toHaveLength(2);
 
+		// The real close body must finish the rewrite and release resident state,
+		// even though the second attempt already closed and released its writer.
 		await expect(manager.close()).resolves.toBeUndefined();
 		expect(storage.events).toEqual(["session-close-1", "session-close-2", "rewrite-close-1", "rewrite-close-2"]);
+		expect(manager.getEntries()).toHaveLength(0);
+		expect(manager.getHeader()).toBeNull();
+		expect(manager.hasHistoryEntries()).toBe(false);
+		expect(manager.getCanonicalEntryForTests("existing")).toBeUndefined();
+		expect(manager.getEntry(initialId)).toBeUndefined();
+		expect(manager.getLeafEntry()).toBeUndefined();
+		expect(manager.getBranch()).toHaveLength(0);
+		expect(manager.hotRetainedMessageCharsForTests()).toBe(0);
+		const afterRewrite = storage.readTextSync(sessionFile);
+		const persistedRecords = afterRewrite
+			.trimEnd()
+			.split("\n")
+			.map(line => JSON.parse(line));
+		expect(persistedRecords).toEqual(expectedRecords);
 		const closeDispatchesAfterRecovery = storage.sessionCloseDispatches + storage.rewriteCloseDispatches;
 		await expect(manager.close()).resolves.toBeUndefined();
 		expect(storage.sessionCloseDispatches + storage.rewriteCloseDispatches).toBe(closeDispatchesAfterRecovery);
+		expect(storage.readTextSync(sessionFile)).toBe(afterRewrite);
+		expect(manager.getEntries()).toHaveLength(0);
+		expect(manager.hotRetainedMessageCharsForTests()).toBe(0);
 	});
 	it("reprepares queued patches when a direct append invalidates their persistence token", async () => {
 		const storage = new MemorySessionStorage();
