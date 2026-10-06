@@ -1348,7 +1348,7 @@ export class AsyncJobManager {
 			ownerId: job.ownerId,
 			status: job.status,
 			expiresAt: Date.now() + MONITOR_TOMBSTONE_TTL_MS,
-			purge: () => (lifecycle?.onTombstonePurge ?? lifecycle?.onEvict)?.(job),
+			purge: () => lifecycle?.onTombstonePurge?.(job),
 		});
 	}
 
@@ -1556,33 +1556,36 @@ export class AsyncJobManager {
 		};
 		for (const record of this.#subagentRecords.values()) {
 			if (record.ownerId !== ownerId) continue;
+			const backingExecution =
+				record.currentJobId && record.currentJobGeneration
+					? findExecution(record.currentJobId, record.currentJobGeneration)
+					: undefined;
 			records.set(record.subagentId, {
 				record,
 				currentJobId: record.currentJobId,
 				currentJobGeneration: record.currentJobGeneration,
 			});
-			if (this.#isTerminalSubagentStatus(record.status)) continue;
+			if (this.#isTerminalSubagentStatus(record.status) && backingExecution?.physicallySettled !== false) continue;
 			targets.set(record.subagentId, {
 				subagentId: record.subagentId,
 				jobId: record.status === "queued" ? null : record.currentJobId,
 				source: "record",
 			});
-			if (record.status !== "queued" && record.currentJobId) {
-				addBackingExecution(record.subagentId, findExecution(record.currentJobId, record.currentJobGeneration));
-			}
+			addBackingExecution(record.subagentId, backingExecution);
 		}
 		const candidateJobs = new Set<AsyncJob>(this.#jobs.values());
 		for (const execution of this.#activeExecutions) candidateJobs.add(execution.job);
 		for (const job of candidateJobs) {
 			const subagentId = job.metadata?.subagent?.id;
+			const execution = this.#executionsByJob.get(job);
+			const physicallyActive = execution !== undefined && !execution.physicallySettled;
 			if (
 				job.ownerId !== ownerId ||
 				!subagentId ||
-				(job.status !== "running" && job.status !== "paused" && job.status !== "cancelled")
+				(!physicallyActive && job.status !== "running" && job.status !== "paused" && job.status !== "cancelled")
 			) {
 				continue;
 			}
-			const execution = this.#executionsByJob.get(job);
 			if (job.status === "cancelled" && execution?.physicallySettled && !this.#subagentRecords.has(subagentId))
 				continue;
 			if (!targets.has(subagentId)) {

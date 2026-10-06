@@ -844,7 +844,7 @@ describe("AsyncJobManager", () => {
 		}
 	});
 
-	test("purgeMonitorTombstone after eviction returns found and runs purge once", async () => {
+	test("purgeMonitorTombstone after eviction does not rerun eviction cleanup", async () => {
 		let evictCount = 0;
 		const manager = new AsyncJobManager({ retentionMs: 0, onJobComplete: async () => {} });
 		const jobId = manager.register("bash", "monitor", async () => "done", {
@@ -860,9 +860,9 @@ describe("AsyncJobManager", () => {
 		await manager.waitForAll();
 		expect(evictCount).toBe(1);
 		expect(manager.purgeMonitorTombstone(jobId, { ownerId: "0-Test" })).toEqual({ found: true, status: "completed" });
-		expect(evictCount).toBe(2);
+		expect(evictCount).toBe(1);
 		expect(manager.purgeMonitorTombstone(jobId, { ownerId: "0-Test" })).toEqual({ found: false });
-		expect(evictCount).toBe(2);
+		expect(evictCount).toBe(1);
 	});
 
 	test("tombstone purge uses the dedicated onTombstonePurge hook, not the evict phase", async () => {
@@ -918,7 +918,47 @@ describe("AsyncJobManager", () => {
 
 		expect(phases.filter(p => p === "cancel")).toHaveLength(1);
 		expect(phases.filter(p => p === "terminal")).toHaveLength(1);
-		expect(phases.filter(p => p === "evict")).toHaveLength(2);
+		expect(phases.filter(p => p === "evict")).toHaveLength(1);
+	});
+
+	test("held monitor eviction defers onEvict across tombstone purge and disposal", async () => {
+		for (const mode of ["public-purge", "dispose"] as const) {
+			const gate = Promise.withResolvers<string>();
+			let evictCount = 0;
+			let tombstonePurgeCount = 0;
+			const manager = new AsyncJobManager({ retentionMs: 0, onJobComplete: async () => {} });
+			const jobId = manager.register("bash", `held monitor ${mode}`, () => gate.promise, {
+				metadata: { monitor: true },
+				lifecycle: {
+					onEvict: () => {
+						evictCount += 1;
+					},
+					onTombstonePurge: () => {
+						tombstonePurgeCount += 1;
+					},
+				},
+			});
+			manager.cancelAll();
+			expect(manager.getJob(jobId)).toBeUndefined();
+			expect(evictCount).toBe(0);
+
+			if (mode === "public-purge") {
+				expect(manager.purgeMonitorTombstone(jobId)).toMatchObject({ found: true, status: "cancelled" });
+				expect(tombstonePurgeCount).toBe(1);
+				expect(evictCount).toBe(0);
+			} else {
+				expect(await manager.dispose({ timeoutMs: 10 })).toBe(false);
+				expect(tombstonePurgeCount).toBe(1);
+				expect(evictCount).toBe(0);
+			}
+
+			gate.resolve("late monitor result");
+			await manager.waitForAll();
+			if (mode === "dispose") await manager.awaitRetainedDisposalCompletion();
+			expect(evictCount).toBe(1);
+			expect(tombstonePurgeCount).toBe(1);
+			if (mode === "public-purge") await manager.dispose({ timeoutMs: 100 });
+		}
 	});
 
 	test("cancelling a job retires its owned registration", async () => {
