@@ -10,7 +10,6 @@ import {
 	type Context,
 	classifyContextOverflow,
 	classifyFallbackTrigger,
-	EMPTY_RESPONSE_PROVIDER_CODE,
 	EventStream,
 	isProviderSafetyStopAuthenticated,
 	isZodSchema,
@@ -833,8 +832,7 @@ function promoteTypedEmptyResponseStop(message: AssistantMessage): void {
 		message.usage.output !== 0 ||
 		message.usage.cacheRead !== 0 ||
 		message.usage.cacheWrite !== 0 ||
-		message.usage.totalTokens !== 0 ||
-		managedTransportFailure(message)?.providerCode?.toLowerCase() !== EMPTY_RESPONSE_PROVIDER_CODE
+		message.usage.totalTokens !== 0
 	) {
 		return;
 	}

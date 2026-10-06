@@ -1864,6 +1864,33 @@ describe("agentLoop - empty response overflow detection", () => {
 		});
 	});
 
+	it("promotes an untyped zero-token empty stop so idle runs cannot look successful", async () => {
+		const context: AgentContext = { systemPrompt: ["You are helpful."], messages: [], tools: [] };
+		const mock = createMockModel({
+			responses: [{ content: [], stopReason: "stop", usage: { input: 0, output: 0 } }],
+		});
+		const stream = agentLoop(
+			[createUserMessage("Make a change")],
+			context,
+			{
+				model: mock.model,
+				convertToLlm: identityConverter,
+			},
+			undefined,
+			mock.stream,
+		);
+		for await (const _ of stream) {
+			// drain
+		}
+
+		const messages = await stream.result();
+		const assistantMessage = messages.find(m => m.role === "assistant") as AssistantMessage | undefined;
+		expect(assistantMessage).toMatchObject({
+			stopReason: "error",
+			errorMessage: "Provider returned an empty response with zero token usage",
+		});
+	});
+
 	it("does not promote a zero-token stop that contains a content block", async () => {
 		const context: AgentContext = {
 			systemPrompt: ["You are helpful."],
