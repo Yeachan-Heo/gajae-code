@@ -347,6 +347,21 @@ export class PromptDeadlineManager {
 		} catch {
 			// claim may fail if already claimed (e.g., cancellation won); ignore.
 		}
+		// The claim and the first lookup are separated by an await. A real
+		// agent_end can therefore commit terminal_ok while the deadline path is
+		// still preparing its synthetic failure. Re-read the durable state before
+		// invoking terminalization so a completed turn cannot be reported later as
+		// prompt_deadline_exceeded.
+		try {
+			const settled = this.#reconciliation.lookup("prompt", correlation) as { status: string };
+			if (settled.status === "terminal_ok" || settled.status === "failed") {
+				this.clear(correlation);
+				return;
+			}
+		} catch {
+			// Keep the existing uncertainty recovery path below when the durable
+			// read is unavailable.
+		}
 		// A real terminal may win between lookup and this claim. A diagnostic-only
 		// failure is not terminal evidence; preserve it privately until the host hook
 		// proves the exact run/tool settlement and captures its correlated agent_end.
