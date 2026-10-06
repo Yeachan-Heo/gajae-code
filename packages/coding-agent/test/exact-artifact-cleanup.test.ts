@@ -101,136 +101,148 @@ describe("exact managed artifact cleanup", () => {
 		}
 	});
 
-	it("quiesces its owned child, then propagates native quarantine evidence without sweeping parent siblings", async () => {
-		const fixture = makeArtifactFixture();
-		const attemptId = "cleanup-attempt";
-		const staging = fixture.manager.createAttemptStaging(attemptId);
-		const stagingStore = staging.getManagedStore();
-		if (!stagingStore) throw new Error("managed_attempt_store_missing");
-		const stagingRelativePath = path.posix.join(".staging", attemptId);
-		const foreignPlaceholder = path.join(fixture.root, ".staging", ".gjc-remove-foreign");
-		const foreignQuarantine = path.join(fixture.root, ".staging", `${attemptId}.foreign.removing`);
-		fixtureStores.push(stagingStore);
-		await staging.publishNamedNoReplace("1.bash.log", Buffer.from("owned staged artifact", "utf8"));
+	it.skipIf(process.platform !== "linux")(
+		"quiesces its owned child, then propagates native quarantine evidence without sweeping parent siblings",
+		async () => {
+			const fixture = makeArtifactFixture();
+			const attemptId = "cleanup-attempt";
+			const staging = fixture.manager.createAttemptStaging(attemptId);
+			const stagingStore = staging.getManagedStore();
+			if (!stagingStore) throw new Error("managed_attempt_store_missing");
+			const stagingRelativePath = path.posix.join(".staging", attemptId);
+			const foreignPlaceholder = path.join(fixture.root, ".staging", ".gjc-remove-foreign");
+			const foreignQuarantine = path.join(fixture.root, ".staging", `${attemptId}.foreign.removing`);
+			fixtureStores.push(stagingStore);
+			await staging.publishNamedNoReplace("1.bash.log", Buffer.from("owned staged artifact", "utf8"));
 
-		const nativeResults: native.RecoveryFsRetainedCleanupResult[] = [];
-		const realNativeRemove = native.RecoveryFsRoot.prototype.removeManagedTree;
-		const nativeRemoveSpy = vi
-			.spyOn(native.RecoveryFsRoot.prototype, "removeManagedTree")
-			.mockImplementation(function (this: native.RecoveryFsRoot, relativePath, expected) {
-				const result = realNativeRemove.call(this, relativePath, expected);
-				nativeResults.push(result);
-				return result;
-			});
-		const removeTreeExpected = fixture.store.removeTreeExpected.bind(fixture.store);
-		const removalSpy = vi.spyOn(fixture.store, "removeTreeExpected").mockImplementation((relativePath, expected) => {
-			// Native tree retirement detaches the exact captured tree to retained
-			// quarantine and reports cleanup_pending; it does not physically reclaim
-			// that payload. The siblings belong to a concurrent parent publisher.
-			let childAuthorityClosed = false;
+			const nativeResults: native.RecoveryFsRetainedCleanupResult[] = [];
+			const realNativeRemove = native.RecoveryFsRoot.prototype.removeManagedTree;
+			const nativeRemoveSpy = vi
+				.spyOn(native.RecoveryFsRoot.prototype, "removeManagedTree")
+				.mockImplementation(function (this: native.RecoveryFsRoot, relativePath, expected) {
+					const result = realNativeRemove.call(this, relativePath, expected);
+					nativeResults.push(result);
+					return result;
+				});
+			const removeTreeExpected = fixture.store.removeTreeExpected.bind(fixture.store);
+			const removalSpy = vi
+				.spyOn(fixture.store, "removeTreeExpected")
+				.mockImplementation((relativePath, expected) => {
+					// Native tree retirement detaches the exact captured tree to retained
+					// quarantine and reports cleanup_pending; it does not physically reclaim
+					// that payload. The siblings belong to a concurrent parent publisher.
+					let childAuthorityClosed = false;
+					try {
+						stagingStore.assertBound();
+					} catch {
+						childAuthorityClosed = true;
+					}
+					expect(childAuthorityClosed).toBe(true);
+					fs.writeFileSync(foreignPlaceholder, "foreign placeholder bytes", { flag: "wx" });
+					fs.mkdirSync(foreignQuarantine);
+					fs.writeFileSync(path.join(foreignQuarantine, "payload"), "foreign quarantine bytes", { flag: "wx" });
+					removeTreeExpected(relativePath, expected);
+				});
 			try {
-				stagingStore.assertBound();
-			} catch {
-				childAuthorityClosed = true;
+				await expect(staging.discardAttemptStaging()).rejects.toThrow("cleanup_pending");
+				expect(removalSpy).toHaveBeenCalledTimes(1);
+				expect(removalSpy).toHaveBeenCalledWith(stagingRelativePath, expect.anything());
+				expect(nativeRemoveSpy).toHaveBeenCalledTimes(1);
+				const nativeResult = nativeResults[0];
+				if (!nativeResult?.recoveryPath || !nativeResult.treeSnapshot)
+					throw new Error("native_quarantine_evidence_missing");
+				expect(nativeResult).toMatchObject({ ok: false, code: "cleanup_pending" });
+				expect(nativeResult.treeSnapshot.rootDev).toBe(stagingStore.subtreeRootAuthority.dev.toString());
+				expect(nativeResult.treeSnapshot.rootIno).toBe(stagingStore.subtreeRootAuthority.ino.toString());
+				expect(fs.existsSync(staging.dir)).toBe(false);
+				expect(fs.readFileSync(path.join(fixture.root, nativeResult.recoveryPath, "1.bash.log"), "utf8")).toBe(
+					"owned staged artifact",
+				);
+				expect(fs.readFileSync(foreignPlaceholder, "utf8")).toBe("foreign placeholder bytes");
+				expect(fs.readFileSync(path.join(foreignQuarantine, "payload"), "utf8")).toBe("foreign quarantine bytes");
+			} finally {
+				removalSpy.mockRestore();
+				nativeRemoveSpy.mockRestore();
 			}
-			expect(childAuthorityClosed).toBe(true);
-			fs.writeFileSync(foreignPlaceholder, "foreign placeholder bytes", { flag: "wx" });
-			fs.mkdirSync(foreignQuarantine);
-			fs.writeFileSync(path.join(foreignQuarantine, "payload"), "foreign quarantine bytes", { flag: "wx" });
-			removeTreeExpected(relativePath, expected);
-		});
-		try {
-			await expect(staging.discardAttemptStaging()).rejects.toThrow("cleanup_pending");
-			expect(removalSpy).toHaveBeenCalledTimes(1);
-			expect(removalSpy).toHaveBeenCalledWith(stagingRelativePath, expect.anything());
-			expect(nativeRemoveSpy).toHaveBeenCalledTimes(1);
-			const nativeResult = nativeResults[0];
-			if (!nativeResult?.recoveryPath || !nativeResult.treeSnapshot)
-				throw new Error("native_quarantine_evidence_missing");
-			expect(nativeResult).toMatchObject({ ok: false, code: "cleanup_pending" });
-			expect(nativeResult.treeSnapshot.rootDev).toBe(stagingStore.subtreeRootAuthority.dev.toString());
-			expect(nativeResult.treeSnapshot.rootIno).toBe(stagingStore.subtreeRootAuthority.ino.toString());
-			expect(fs.existsSync(staging.dir)).toBe(false);
-			expect(fs.readFileSync(path.join(fixture.root, nativeResult.recoveryPath, "1.bash.log"), "utf8")).toBe(
-				"owned staged artifact",
-			);
-			expect(fs.readFileSync(foreignPlaceholder, "utf8")).toBe("foreign placeholder bytes");
-			expect(fs.readFileSync(path.join(foreignQuarantine, "payload"), "utf8")).toBe("foreign quarantine bytes");
-		} finally {
-			removalSpy.mockRestore();
-			nativeRemoveSpy.mockRestore();
-		}
-	});
+		},
+	);
 
-	it("propagates the same native quarantine outcome with a separate writable child still retained", async () => {
-		const fixture = makeArtifactFixture();
-		const attemptId = "live-child-attempt";
-		const stagingRelativePath = path.posix.join(".staging", attemptId);
-		const staging = fixture.manager.createAttemptStaging(attemptId);
-		const stagingStore = staging.getManagedStore();
-		if (!stagingStore) throw new Error("managed_attempt_store_missing");
-		fixtureStores.push(stagingStore);
-		await staging.publishNamedNoReplace("3.bash.log", Buffer.from("owned staged artifact", "utf8"));
+	it.skipIf(process.platform !== "linux")(
+		"propagates the same native quarantine outcome with a separate writable child still retained",
+		async () => {
+			const fixture = makeArtifactFixture();
+			const attemptId = "live-child-attempt";
+			const stagingRelativePath = path.posix.join(".staging", attemptId);
+			const staging = fixture.manager.createAttemptStaging(attemptId);
+			const stagingStore = staging.getManagedStore();
+			if (!stagingStore) throw new Error("managed_attempt_store_missing");
+			fixtureStores.push(stagingStore);
+			await staging.publishNamedNoReplace("3.bash.log", Buffer.from("owned staged artifact", "utf8"));
 
-		// This separate store owns its own retained writable child authority. Keeping
-		// it open confirms the operation does not depend on closing every observer;
-		// native cleanup_pending is the documented quarantine disposition, not proof
-		// of an FD refusal.
-		const independentLiveStore = fixture.store.deriveSubtree(stagingRelativePath);
-		fixtureStores.push(independentLiveStore);
-		const independentClose = independentLiveStore.close.bind(independentLiveStore);
-		const independentCloseSpy = vi.spyOn(independentLiveStore, "close").mockImplementation(() => independentClose());
-		const stagingClose = stagingStore.close.bind(stagingStore);
-		const stagingCloseSpy = vi.spyOn(stagingStore, "close").mockImplementation(() => stagingClose());
-		const nativeResults: native.RecoveryFsRetainedCleanupResult[] = [];
-		const realNativeRemove = native.RecoveryFsRoot.prototype.removeManagedTree;
-		const nativeRemoveSpy = vi
-			.spyOn(native.RecoveryFsRoot.prototype, "removeManagedTree")
-			.mockImplementation(function (this: native.RecoveryFsRoot, relativePath, expected) {
-				const result = realNativeRemove.call(this, relativePath, expected);
-				nativeResults.push(result);
-				return result;
-			});
-		const removeTreeExpected = fixture.store.removeTreeExpected.bind(fixture.store);
-		const removalSpy = vi.spyOn(fixture.store, "removeTreeExpected").mockImplementation((relativePath, expected) => {
-			let attemptAuthorityClosed = false;
+			// This separate store owns its own retained writable child authority. Keeping
+			// it open confirms the operation does not depend on closing every observer;
+			// native cleanup_pending is the documented quarantine disposition, not proof
+			// of an FD refusal.
+			const independentLiveStore = fixture.store.deriveSubtree(stagingRelativePath);
+			fixtureStores.push(independentLiveStore);
+			const independentClose = independentLiveStore.close.bind(independentLiveStore);
+			const independentCloseSpy = vi
+				.spyOn(independentLiveStore, "close")
+				.mockImplementation(() => independentClose());
+			const stagingClose = stagingStore.close.bind(stagingStore);
+			const stagingCloseSpy = vi.spyOn(stagingStore, "close").mockImplementation(() => stagingClose());
+			const nativeResults: native.RecoveryFsRetainedCleanupResult[] = [];
+			const realNativeRemove = native.RecoveryFsRoot.prototype.removeManagedTree;
+			const nativeRemoveSpy = vi
+				.spyOn(native.RecoveryFsRoot.prototype, "removeManagedTree")
+				.mockImplementation(function (this: native.RecoveryFsRoot, relativePath, expected) {
+					const result = realNativeRemove.call(this, relativePath, expected);
+					nativeResults.push(result);
+					return result;
+				});
+			const removeTreeExpected = fixture.store.removeTreeExpected.bind(fixture.store);
+			const removalSpy = vi
+				.spyOn(fixture.store, "removeTreeExpected")
+				.mockImplementation((relativePath, expected) => {
+					let attemptAuthorityClosed = false;
+					try {
+						stagingStore.assertBound();
+					} catch {
+						attemptAuthorityClosed = true;
+					}
+					expect(attemptAuthorityClosed).toBe(true);
+					const liveStoreStillBound = (() => {
+						try {
+							independentLiveStore.assertBound();
+							return true;
+						} catch {
+							return false;
+						}
+					})();
+					expect(liveStoreStillBound).toBe(true);
+					removeTreeExpected(relativePath, expected);
+				});
 			try {
-				stagingStore.assertBound();
-			} catch {
-				attemptAuthorityClosed = true;
+				await expect(staging.discardAttemptStaging()).rejects.toThrow("cleanup_pending");
+				expect(removalSpy).toHaveBeenCalledTimes(1);
+				expect(stagingCloseSpy).toHaveBeenCalled();
+				expect(independentCloseSpy).not.toHaveBeenCalled();
+				const nativeResult = nativeResults[0];
+				if (!nativeResult?.recoveryPath || !nativeResult.treeSnapshot)
+					throw new Error("native_quarantine_evidence_missing");
+				expect(nativeResult).toMatchObject({ ok: false, code: "cleanup_pending" });
+				expect(fs.readFileSync(path.join(fixture.root, nativeResult.recoveryPath, "3.bash.log"), "utf8")).toBe(
+					"owned staged artifact",
+				);
+			} finally {
+				removalSpy.mockRestore();
+				nativeRemoveSpy.mockRestore();
+				stagingCloseSpy.mockRestore();
+				independentCloseSpy.mockRestore();
+				independentLiveStore.close();
 			}
-			expect(attemptAuthorityClosed).toBe(true);
-			const liveStoreStillBound = (() => {
-				try {
-					independentLiveStore.assertBound();
-					return true;
-				} catch {
-					return false;
-				}
-			})();
-			expect(liveStoreStillBound).toBe(true);
-			removeTreeExpected(relativePath, expected);
-		});
-		try {
-			await expect(staging.discardAttemptStaging()).rejects.toThrow("cleanup_pending");
-			expect(removalSpy).toHaveBeenCalledTimes(1);
-			expect(stagingCloseSpy).toHaveBeenCalled();
-			expect(independentCloseSpy).not.toHaveBeenCalled();
-			const nativeResult = nativeResults[0];
-			if (!nativeResult?.recoveryPath || !nativeResult.treeSnapshot)
-				throw new Error("native_quarantine_evidence_missing");
-			expect(nativeResult).toMatchObject({ ok: false, code: "cleanup_pending" });
-			expect(fs.readFileSync(path.join(fixture.root, nativeResult.recoveryPath, "3.bash.log"), "utf8")).toBe(
-				"owned staged artifact",
-			);
-		} finally {
-			removalSpy.mockRestore();
-			nativeRemoveSpy.mockRestore();
-			stagingCloseSpy.mockRestore();
-			independentCloseSpy.mockRestore();
-			independentLiveStore.close();
-		}
-	});
+		},
+	);
 
 	it("does not adopt a replacement at the issued attempt-root name", async () => {
 		const fixture = makeArtifactFixture();
