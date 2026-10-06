@@ -497,18 +497,23 @@ test("ACP SDK adapter exposes SDK event frames while rejecting raw lifecycle glo
 			idempotencyKey: "generic-lifecycle-key",
 		}),
 	).rejects.toMatchObject({ code: "operation_prohibited" });
-	await adapter.global("session.create", { cwd: "/workspace" }, "lifecycle-key");
-	sdk.emit({ type: "event", payload: { type: "turn_end" } });
-	expect(sdk.frames).toContainEqual({
-		type: "broker_request",
-		operation: "session.create",
-		input: { cwd: "/workspace" },
-		idempotencyKey: "lifecycle-key",
-		timeoutMs: 21_000,
-	});
-	expect(received).toContainEqual({ type: "event", payload: { type: "turn_end" } });
-	unsubscribe();
-	await adapter.close();
+	const clock = spyOn(Date, "now").mockReturnValue(Date.now());
+	try {
+		await adapter.global("session.create", { cwd: "/workspace" }, "lifecycle-key");
+		sdk.emit({ type: "event", payload: { type: "turn_end" } });
+		expect(sdk.frames).toContainEqual({
+			type: "broker_request",
+			operation: "session.create",
+			input: { cwd: "/workspace" },
+			idempotencyKey: "lifecycle-key",
+			timeoutMs: 21_000,
+		});
+		expect(received).toContainEqual({ type: "event", payload: { type: "turn_end" } });
+	} finally {
+		clock.mockRestore();
+		unsubscribe();
+		await adapter.close();
+	}
 });
 
 test("ACP lifecycle recovers a committed create with the original operation, input and key", async () => {
