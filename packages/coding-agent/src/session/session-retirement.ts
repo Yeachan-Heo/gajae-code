@@ -489,8 +489,6 @@ async function retireGcOwnerTranscript(
 				managedGcProtocolScopeInspectorForScope(continuation.managedScope),
 			);
 			if (artifactPhase.kind === "cleanup_pending") {
-				if (artifactPhase.phase === "task_artifact_owner" && artifactPhase.artifactsRemoved === false)
-					return { kind: "kept", reason: artifactPhase.error.message };
 				return cleanupPending(
 					`cleanup_pending_${artifactPhase.phase}: ${artifactPhase.error.message}`,
 					evidence,
