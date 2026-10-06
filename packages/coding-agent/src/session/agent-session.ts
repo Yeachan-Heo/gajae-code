@@ -3460,16 +3460,17 @@ export class AgentSession {
 			this.#skipPostPromptRecoveryWaitByAttemptScope.delete(predecessorScope);
 		this.#acceptRunHandle(handle);
 		this.#settleTrackedOwnRunPromotions(handle);
+		// Logical continuation lineage is causal even without an SDK submission.
+		if (predecessorScope) {
+			this.#lifecycleScopesByAttemptScope.set(
+				handle.scope,
+				this.#lifecycleScopesByAttemptScope.get(predecessorScope) ?? predecessorScope,
+			);
+		}
 		if (sdkRunToken !== undefined) {
 			this.#activeSdkRunToken = sdkRunToken;
 			this.#sdkRunTokensByAttemptScope.set(handle.scope, sdkRunToken);
 			this.#sdkRunCohortsByAttemptScope.set(handle.scope, sdkRunTokens ?? [sdkRunToken]);
-			if (predecessorScope) {
-				this.#lifecycleScopesByAttemptScope.set(
-					handle.scope,
-					this.#lifecycleScopesByAttemptScope.get(predecessorScope) ?? predecessorScope,
-				);
-			}
 			for (const token of this.#sdkRunCohortsByAttemptScope.get(handle.scope) ?? []) {
 				if (this.#sdkTerminalPublications.has(token)) continue;
 				const publication = Promise.withResolvers<void>();
@@ -8745,6 +8746,10 @@ export class AgentSession {
 													options?.continueQueuedOnly || startsQueuedSuccessor
 														? undefined
 														: (scheduledSdkOwnership ?? predecessorSdkOwnership);
+												const inheritedPredecessorScope =
+													options?.continueQueuedOnly || startsQueuedSuccessor
+														? undefined
+														: (inheritedSdkOwnership?.scope ?? predecessorScope);
 												const consumedSdkRunTokens = acceptance.consumedQueuedMessages
 													.map(message => this.#sdkRunTokensByQueuedMessage.get(message))
 													.filter((token): token is string => token !== undefined);
@@ -8760,7 +8765,7 @@ export class AgentSession {
 													handle,
 													sdkRunToken,
 													sdkRunTokens.length > 0 ? sdkRunTokens : undefined,
-													inheritedSdkOwnership?.scope,
+													inheritedPredecessorScope,
 												);
 												options?.onRunAccepted?.(handle);
 												// Keep the queued token available through the acceptance callback;
