@@ -505,6 +505,24 @@ test("ACP SDK adapter exposes SDK event frames while rejecting raw lifecycle glo
 	await adapter.close();
 });
 
+test("ACP lifecycle replays an uncertain send with the same idempotency key", async () => {
+	const sdk = new FakeSdkClient();
+	let calls = 0;
+	sdk.global = async (operation, input, options) => {
+		calls++;
+		if (calls === 1) throw new SdkClientError("uncertain_after_send", "response lost", { operation });
+		sdk.frames.push({ type: "broker_request", operation, input, ...options });
+		return { result: { sessionId: "committed" } };
+	};
+	const adapter = new AcpSdkAdapter({ client: sdk as never });
+	await adapter.start();
+	await expect(adapter.global("session.create", { cwd: "/workspace" }, "replay-key")).resolves.toEqual({
+		result: { sessionId: "committed" },
+	});
+	expect(calls).toBe(2);
+	await adapter.close();
+});
+
 test("ACP reconcile_uncertain validates proof and projects an opaque result", async () => {
 	const sdk = new FakeSdkClient();
 	sdk.globalResponse = {

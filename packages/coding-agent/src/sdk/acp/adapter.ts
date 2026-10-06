@@ -603,11 +603,18 @@ export class AcpSdkAdapter {
 		// request that named no readiness budget is queued for the default one, so it
 		// needs the same extension rather than the client's generic request deadline.
 		const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
-		const response = await this.#client.global(operation, input, {
+		const options = {
 			idempotencyKey,
 			...(timeoutMs === undefined ? {} : { timeoutMs }),
-		});
-		return response;
+		};
+		try {
+			return await this.#client.global(operation, input, options);
+		} catch (error) {
+			// A request can commit in the Broker after the transport response is lost.
+			// Replay the same idempotency key so lifecycle callers recover the committed result.
+			if (!(error instanceof SdkClientError) || error.code !== "uncertain_after_send") throw error;
+			return await this.#client.global(operation, input, options);
+		}
 	}
 
 	async sdkControl(params: { operation: string; input?: JsonObject }): Promise<unknown> {
@@ -691,13 +698,14 @@ export class AcpSdkAdapter {
 			for (let attempt = 1; ; attempt++) {
 				if (attempt > PROVIDER_ACTIVATION_MAX_ATTEMPTS || Date.now() - startedAt >= PROVIDER_ACTIVATION_BUDGET_MS)
 					throw this.#providerActivationExhausted(attempt - 1, startedAt);
-				const remainingMs = PROVIDER_ACTIVATION_BUDGET_MS - (Date.now() - startedAt);
 				const attachment = this.#attachment;
 				const connectionId = attachment?.connectionId;
 				try {
 					for (const provider of this.#providers) {
+						const providerRemainingMs = PROVIDER_ACTIVATION_BUDGET_MS - (Date.now() - startedAt);
+						if (providerRemainingMs <= 0) throw this.#providerActivationExhausted(attempt, startedAt);
 						try {
-							await this.registerProvider(provider, Math.max(1, remainingMs));
+							await this.registerProvider(provider, Math.max(1, providerRemainingMs));
 						} catch (error) {
 							if (Date.now() - startedAt >= PROVIDER_ACTIVATION_BUDGET_MS)
 								throw this.#providerActivationExhausted(attempt, startedAt);
