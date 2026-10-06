@@ -1541,23 +1541,6 @@ function isExactTypedOverloadFacts(
 		facts.retryMaxAttempts === undefined
 	);
 }
-/**
- * True when transport facts are exactly the provider's statusless typed
- * capacity-overload code (the provider code verbatim and, when present, the
- * OpenAI code verbatim, with no status). The agent loop must not treat the new
- * facts as managed transaction authority, and managed session fallback must
- * not gain retry/advance authority from them, so this predicate keeps both
- * guards reading only typed facts, never error prose.
- */
-function isStatuslessTypedOverloadFacts(facts: TransportFailureFacts | undefined): boolean {
-	if (!facts) return false;
-	return (
-		facts.status === undefined &&
-		facts.providerCode === SERVER_OVERLOADED_PROVIDER_CODE &&
-		(facts.openaiErrorCode === undefined || facts.openaiErrorCode === SERVER_OVERLOADED_PROVIDER_CODE)
-	);
-}
-
 // Deterministic auth/request/model diagnostics must surface even when a provider
 // labels the failure with a transient code.
 const TERMINAL_ERROR_MESSAGE =
@@ -23689,18 +23672,6 @@ export class AgentSession {
 				},
 			};
 		}
-		// Issue #5018 preserves managed behavior for the typed statusless
-		// Responses overload: before the code survived transport, this failure
-		// reached the session as an ordinary committed error, so the chain never
-		// discarded or advanced on it. Route it to the exhaustion decision
-		// directly, before the retryable path can classify its new facts.
-		if (isStatuslessTypedOverloadFacts(outcome.failure.transportFailure)) {
-			this.#defaultFallbackChain().resetAttemptBudget();
-			return this.#managedFallbackExhaustionDecision(
-				outcome.failure.message,
-				outcome.failure.message.errorMessage || "Model fallback attempt failed",
-			);
-		}
 		return this.#handleRetryableError(
 			outcome.failure.message,
 			true,
@@ -24462,21 +24433,6 @@ export class AgentSession {
 			| undefined = canReplayCodexProviderOverload || canReplayBareDefaultCodexFailure
 				? { class: "server" }
 				: fallbackTrigger;
-		// OpenAI's typed statusless capacity-overload code (issue #5018) must not
-		// gain managed-chain retry/advance authority from its new facts. Before
-		// the code survived transport, this failure reached the session as an
-		// ordinary committed error and surfaced immediately, so mirror that
-		// behavior with the existing exhaustion decision. However, when called from
-		// the agent_end path (managedOutcome=false), we must return false to allow
-		// proper session termination handling.
-		if (managedFallback && isStatuslessTypedOverloadFacts(transportFailure)) {
-			return managedOutcome
-				? this.#managedFallbackExhaustionDecision(
-						message,
-						message.errorMessage || "Model fallback attempt failed",
-					)
-				: false;
-		}
 		if (!trigger) {
 			return managedOutcome
 				? this.#managedFallbackExhaustionDecision(message, message.errorMessage || "Model fallback attempt failed")
