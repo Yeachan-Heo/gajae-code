@@ -51,6 +51,7 @@ export const MANAGED_ARTIFACT_MAX_DEPTH = 32;
 export const MANAGED_ARTIFACT_MAX_FILES = 50_000;
 export const MANAGED_ARTIFACT_MAX_FILE_BYTES = 128 * 1024 * 1024;
 export const MANAGED_ARTIFACT_MAX_TOTAL_BYTES = 512 * 1024 * 1024;
+export const MANAGED_SESSION_READ_RANGE_MAX_BYTES = 64 * 1024 * 1024;
 const REPLACEMENT_CLEANUP_RECEIPT_MAX_BYTES = 64 * 1024;
 const REPLACEMENT_CLEANUP_RECEIPT_SCAN_LIMIT = MANAGED_ARTIFACT_MAX_FILES;
 export const MANAGED_ARTIFACT_COPY_BATCH_SIZE = 256;
@@ -2719,7 +2720,8 @@ export class ManagedSessionDescendantStore {
 		if (!Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(length) || length < 0)
 			throw new RangeError("Invalid managed range read");
 		if (start > Number.MAX_SAFE_INTEGER - length) throw new RangeError("Managed range read start overflows");
-		if (length > 64 * 1024 * 1024) throw new RangeError("Managed range read exceeds the bounded maximum");
+		if (length > MANAGED_SESSION_READ_RANGE_MAX_BYTES)
+			throw new RangeError("Managed range read exceeds the bounded maximum");
 		this.#assertPathBackedReadRelative(relativePath);
 		this.#assertBound();
 		const rootBefore = fs.lstatSync(this.#baseDir, { bigint: true });
