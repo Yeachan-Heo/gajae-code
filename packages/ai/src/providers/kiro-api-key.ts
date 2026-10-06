@@ -433,10 +433,8 @@ export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[];
 
 		const end = findJsonEnd(buffer, start);
 		if (end < 0) {
-			// Unclosed brace at 'start'. This could be an incomplete top-level event that will close
-			// in a later chunk. Resync only if we find a candidate that:
-			// 1. Closes properly AND
-			// 2. Starts at or after a position past the stray brace (with only whitespace/commas between)
+			// Unclosed brace at 'start'. Could be incomplete JSON waiting for more data, or junk/corruption.
+			// Resync by looking for valid JSON objects within MAX_RESCAN_DISTANCE that parse successfully.
 			const strayBraceEnd = Math.min(start + MAX_RESCAN_DISTANCE, buffer.length);
 			let resyncPos = start + 1;
 			let found = false;
@@ -444,20 +442,14 @@ export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[];
 				const nextStart = buffer.indexOf("{", resyncPos);
 				if (nextStart < 0) break;
 
-				// Check if there's anything between 'start' and 'nextStart' other than whitespace/commas.
-				// If there is, nextStart is likely a nested object inside the stray brace, not a top-level event.
-				const betweenText = buffer.slice(start + 1, nextStart).trim();
-				const isLikelyNested =
-					/[^\s,]/.test(betweenText) && !betweenText.endsWith(",") && !betweenText.endsWith("}");
-
 				// Try to find the end of this candidate
 				const nextEnd = findJsonEnd(buffer, nextStart);
-				if (nextEnd >= 0 && !isLikelyNested) {
-					// Found a candidate that closes and is at a valid event boundary. Try to parse it.
+				if (nextEnd >= 0) {
+					// Found a candidate that closes. Try to parse it as valid JSON.
 					try {
 						const candidate = buffer.slice(nextStart, nextEnd + 1);
 						JSON.parse(candidate);
-						// Valid JSON found at a likely event boundary. Resync to this position.
+						// Valid JSON found. Resync to this position and continue processing.
 						pos = nextStart;
 						found = true;
 						break;
@@ -468,8 +460,8 @@ export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[];
 				resyncPos = nextStart + 1;
 			}
 			if (!found) {
-				// No valid JSON found after the stray brace within MAX_RESCAN_DISTANCE, or all candidates
-				// appear to be nested objects. Retain the incomplete outer candidate for more data.
+				// No valid JSON found within MAX_RESCAN_DISTANCE. Retain the stray brace and all following data
+				// as remaining for the next parse call (bounded by MAX_RESCAN_DISTANCE cap).
 				return { events, remaining: buffer.slice(start) };
 			}
 			// Loop will continue with the resynced pos

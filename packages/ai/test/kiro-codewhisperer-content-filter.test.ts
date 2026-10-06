@@ -4,7 +4,7 @@
  * the error should surface the explicit refusal category and explanation
  * instead of the generic "Kiro API key stream returned no tokens".
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { withProviderSafetyStopAdapterInvocation } from "../src/adapter-internals/provider-safety-stop";
 import { crc32 } from "../src/providers/aws-eventstream";
 import type { KiroCodeWhispererOptions } from "../src/providers/kiro-codewhisperer";
@@ -95,6 +95,10 @@ const context: Context = {
 };
 
 describe("Kiro CodeWhisperer content filter #6150", () => {
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+
 	test("surfaces refusal from metadataEvent with category and explanation", async () => {
 		const events: Array<{ type: string; message?: { errorMessage?: string; content?: unknown[] } }> = [];
 
