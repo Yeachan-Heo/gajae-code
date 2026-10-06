@@ -1551,6 +1551,15 @@ function isExactTypedOverloadFacts(
 		facts.retryMaxAttempts === undefined
 	);
 }
+
+function isStatuslessTypedOverloadFacts(facts: TransportFailureFacts | undefined): boolean {
+	if (!facts) return false;
+	return (
+		facts.status === undefined &&
+		facts.providerCode === SERVER_OVERLOADED_PROVIDER_CODE &&
+		(facts.openaiErrorCode === undefined || facts.openaiErrorCode === SERVER_OVERLOADED_PROVIDER_CODE)
+	);
+}
 // Deterministic auth/request/model diagnostics must surface even when a provider
 // labels the failure with a transient code.
 const TERMINAL_ERROR_MESSAGE =
@@ -23957,6 +23966,16 @@ export class AgentSession {
 				},
 			};
 		}
+		// Content-free typed statusless overloads are safe for managed retry, but
+		// preserve the committed failure path when the agent loop already exposed
+		// streamed output to consumers.
+		if (isStatuslessTypedOverloadFacts(outcome.failure.transportFailure) && !this.#hasCleanRetryReplaySafety) {
+			this.#defaultFallbackChain().resetAttemptBudget();
+			return this.#managedFallbackExhaustionDecision(
+				outcome.failure.message,
+				outcome.failure.message.errorMessage || "Model fallback attempt failed",
+			);
+		}
 		return this.#handleRetryableError(
 			outcome.failure.message,
 			true,
@@ -24615,6 +24634,17 @@ export class AgentSession {
 		}
 		if (retryCancelled()) {
 			return managedOutcome ? { type: "terminal", terminal: { stopReason: "cancelled" } } : false;
+		}
+		if (
+			transportFailure?.status === undefined &&
+			transportFailure?.providerCode === SERVER_OVERLOADED_PROVIDER_CODE &&
+			(transportFailure.openaiErrorCode === undefined ||
+				transportFailure.openaiErrorCode === SERVER_OVERLOADED_PROVIDER_CODE) &&
+			!this.#hasCleanRetryReplaySafety
+		) {
+			return managedOutcome
+				? { type: "terminal", terminal: { stopReason: "error", messages: [message] } }
+				: false;
 		}
 		// A local machinery failure must never stay charged against the provider
 		// fallback budget, no matter which local exit follows (disabled retry,
