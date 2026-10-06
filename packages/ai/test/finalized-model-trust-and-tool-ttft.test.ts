@@ -36,9 +36,13 @@ describe("P1: Finalized model trust", () => {
 		// Before registration, the finalized clone should NOT be trusted (different object)
 		expect(isProviderSafetyStopModelTrusted(finalized)).toBe(false);
 
-		// After calling registerFinalizedModelClone, the clone should be trusted
-		registerFinalizedModelClone(original, finalized);
-		expect(isProviderSafetyStopModelTrusted(finalized)).toBe(true);
+		// After calling registerFinalizedModelClone, use the returned trusted clone
+		const trustedClone = registerFinalizedModelClone(original, finalized);
+		expect(trustedClone).toBeDefined();
+		// The returned clone should be trusted
+		expect(isProviderSafetyStopModelTrusted(trustedClone)).toBe(true);
+		// The caller-supplied finalized object should remain untrusted
+		expect(isProviderSafetyStopModelTrusted(finalized)).toBe(false);
 	});
 
 	test("model clone with modified baseUrl should not be trusted even after trying to register", () => {
