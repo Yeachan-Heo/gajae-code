@@ -16953,8 +16953,6 @@ export class SessionManager {
 				},
 				{ ignoreError: this.#closeRetryPending },
 			);
-			this.#persistError = undefined;
-			this.#persistErrorReported = false;
 			this.#closeRetryPending = false;
 			this.#retireEphemeralArtifacts();
 			await this.#drainEphemeralArtifactCleanups();
@@ -16964,6 +16962,8 @@ export class SessionManager {
 		}
 		const terminalError = closeError ?? this.#persistError;
 		if (terminalError) throw terminalError;
+		this.#persistError = undefined;
+		this.#persistErrorReported = false;
 		this.#releaseResidentTextStore();
 		if (this.#preparedNewSessions.size === 0) this.#releaseOwnedManagedAuthority();
 		this.#releaseClosedSessionState();
