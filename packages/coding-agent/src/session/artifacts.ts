@@ -15,6 +15,7 @@ import {
 	publishManagedFileNoReplace,
 	publishManagedFileNoReplaceSync,
 } from "./internal/managed-session-storage";
+import type { SessionStorageStat } from "./session-storage";
 import { DEFAULT_ARTIFACT_MAX_BYTES, truncateHeadBytes } from "./streaming-output";
 
 export interface ManagedOutputGeneration {
@@ -67,6 +68,21 @@ function parseManagedOutputGeneration(value: Uint8Array, outputFilenamePrefix: s
 function sameGeneration(left: ManagedOutputGeneration, right: ManagedOutputGeneration): boolean {
 	return left.outputFilename === right.outputFilename && left.metadataFilename === right.metadataFilename;
 }
+
+function normalizeByteRange(size: number, range: ArtifactByteRange): { start: number; endExclusive: number } {
+	const start = Math.max(0, Math.min(size, range.start ?? 0));
+	const endExclusive = Math.max(start, Math.min(size, range.endExclusive ?? size));
+	const normalizedStart = Number.isNaN(start) ? 0 : Math.trunc(start);
+	const normalizedEnd = Number.isNaN(endExclusive) ? 0 : Math.trunc(endExclusive);
+	return {
+		start: normalizedStart,
+		endExclusive: Math.max(normalizedStart, normalizedEnd),
+	};
+}
+
+const ARTIFACT_STREAM_CHUNK_BYTES = 64 * 1024;
+const ARTIFACT_RANGE_READ_CHUNK_BYTES = 64 * 1024 * 1024;
+
 export interface ArtifactSaveOptions {
 	maxBytes?: number;
 }
@@ -650,7 +666,69 @@ export class ArtifactManager {
 		}
 	}
 
+	#captureManagedArtifact(id: string): {
+		filename: string;
+		size: number;
+		expectedDescriptor: Pick<SessionStorageStat, "dev" | "ino" | "nlink" | "size" | "mtimeNs" | "ctimeNs">;
+	} | null {
+		if (!this.#store) return null;
+		try {
+			const entry = this.#store
+				.captureTree("")
+				.entries.find(candidate => candidate.kind === "file" && candidate.relativePath.startsWith(`${id}.`));
+			if (!entry) return null;
+			const size = Number(BigInt(entry.size));
+			if (!Number.isSafeInteger(size) || size < 0) return null;
+			return {
+				filename: entry.relativePath,
+				size,
+				expectedDescriptor: {
+					dev: BigInt(entry.dev),
+					ino: BigInt(entry.ino),
+					nlink: BigInt(entry.nlink),
+					size,
+					mtimeNs: BigInt(entry.mtimeNs),
+					ctimeNs: BigInt(entry.ctimeNs),
+				},
+			};
+		} catch {
+			// listFiles historically hides an unavailable managed tree as no artifacts.
+			return null;
+		}
+	}
+
 	async readRange(id: string, range: ArtifactByteRange = {}): Promise<string> {
+		if (this.#store) {
+			const artifact = this.#captureManagedArtifact(id);
+			if (!artifact) throw new Error(`artifact://${id} not found`);
+			const { start, endExclusive } = normalizeByteRange(artifact.size, range);
+			const length = Math.max(0, endExclusive - start);
+			let bytes: Uint8Array;
+			if (length <= ARTIFACT_RANGE_READ_CHUNK_BYTES) {
+				bytes = this.#store.readRangeExpectedSync(
+					artifact.filename,
+					start,
+					length,
+					artifact.expectedDescriptor,
+				).bytes;
+			} else {
+				const complete = Buffer.allocUnsafe(length);
+				let offset = 0;
+				while (offset < length) {
+					const chunkLength = Math.min(ARTIFACT_RANGE_READ_CHUNK_BYTES, length - offset);
+					const chunk = this.#store.readRangeExpectedSync(
+						artifact.filename,
+						start + offset,
+						chunkLength,
+						artifact.expectedDescriptor,
+					).bytes;
+					complete.set(chunk, offset);
+					offset += chunk.byteLength;
+				}
+				bytes = complete;
+			}
+			return new TextDecoder().decode(bytes);
+		}
 		const artifactPath = await this.getPath(id);
 		if (!artifactPath) throw new Error(`artifact://${id} not found`);
 		const file = Bun.file(artifactPath);
@@ -661,6 +739,59 @@ export class ArtifactManager {
 	}
 
 	async openReadStream(id: string, range: ArtifactByteRange = {}): Promise<ReadableStream<Uint8Array>> {
+		if (this.#store) {
+			const artifact = this.#captureManagedArtifact(id);
+			if (!artifact) throw new Error(`artifact://${id} not found`);
+			const { start, endExclusive } = normalizeByteRange(artifact.size, range);
+			const lease = this.#store.openReadLease(artifact.filename, artifact.expectedDescriptor);
+			let offset = start;
+			let closed = false;
+			const closeLease = (): void => {
+				if (closed) return;
+				closed = true;
+				lease.close();
+			};
+			const closeAfterFailure = (): void => {
+				try {
+					closeLease();
+				} catch {
+					// Keep the read failure as the stream's observable error.
+				}
+			};
+			return new ReadableStream<Uint8Array>(
+				{
+					start: controller => {
+						if (offset !== endExclusive) return;
+						try {
+							closeLease();
+							controller.close();
+						} catch (error) {
+							closeAfterFailure();
+							controller.error(error);
+						}
+					},
+					pull: controller => {
+						if (closed) return;
+						try {
+							const length = Math.min(ARTIFACT_STREAM_CHUNK_BYTES, endExclusive - offset);
+							const bytes = lease.readRange(offset, length);
+							if (bytes.byteLength !== length) throw new Error("range_not_present");
+							offset += bytes.byteLength;
+							if (offset === endExclusive) closeLease();
+							controller.enqueue(bytes);
+							if (offset === endExclusive) controller.close();
+						} catch (error) {
+							closeAfterFailure();
+							controller.error(error);
+						}
+					},
+					cancel: () => {
+						closeLease();
+					},
+				},
+				{ highWaterMark: 0 },
+			);
+		}
 		const artifactPath = await this.getPath(id);
 		if (!artifactPath) throw new Error(`artifact://${id} not found`);
 		const file = Bun.file(artifactPath);

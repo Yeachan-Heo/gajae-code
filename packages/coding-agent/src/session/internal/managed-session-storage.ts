@@ -8,7 +8,9 @@ import type {
 	NativeExactFileIdentity,
 	NativeExactUnlinkResult,
 	NativeOwnerOnlySecurityResult,
+	RecoveryFsFile,
 	RecoveryFsIdentity,
+	RecoveryFsResult,
 	RecoveryFsRoot,
 } from "@gajae-code/natives";
 import { isEnoent, logger } from "@gajae-code/utils";
@@ -1485,6 +1487,12 @@ function secureManagedDirectory(pathname: string, created: boolean, policy: Mana
 	secure(pathname, "directory");
 }
 
+/** Exact, identity-bound read access retained for the lifetime of one managed stream. */
+export interface ManagedSessionReadLease {
+	readRange(start: number, length: number): Uint8Array;
+	close(): void;
+}
+
 /** Internal retained-root capability for one managed descendant subtree. */
 export class ManagedSessionDescendantStore {
 	readonly #root: ManagedDirectoryRoot;
@@ -2811,6 +2819,123 @@ export class ManagedSessionDescendantStore {
 			fs.closeSync(fd);
 		}
 	}
+
+	/** Open an identity-bound stream lease; Darwin uses exact bounded range reads per chunk. */
+	openReadLease(
+		relativePath: string,
+		expectedDescriptor: Pick<SessionStorageStat, "dev" | "ino" | "nlink" | "size" | "mtimeNs" | "ctimeNs">,
+	): ManagedSessionReadLease {
+		if (!Number.isSafeInteger(expectedDescriptor.size) || expectedDescriptor.size < 0)
+			throw new RangeError("Invalid managed read identity size");
+		this.#assertPathBackedReadRelative(relativePath);
+		this.#assertBound();
+		if (!this.#authority) {
+			this.readRangeExpectedSync(relativePath, 0, 0, expectedDescriptor);
+			let closed = false;
+			return {
+				readRange: (start, length) => {
+					if (closed) throw new Error("closed");
+					return this.readRangeExpectedSync(relativePath, start, length, expectedDescriptor).bytes;
+				},
+				close: () => {
+					if (closed) return;
+					closed = true;
+					this.readRangeExpectedSync(relativePath, 0, 0, expectedDescriptor);
+				},
+			};
+		}
+
+		const relative = this.#relative(this.#resolve(relativePath));
+		const authority = this.#authority;
+		const matchesExpected = (identity: RecoveryFsIdentity | undefined): boolean => {
+			if (!identity) return false;
+			const actual = managedFileIdentityFromNative(identity);
+			return (
+				actual.dev === expectedDescriptor.dev &&
+				actual.ino === expectedDescriptor.ino &&
+				(expectedDescriptor.nlink === undefined || actual.nlink === expectedDescriptor.nlink) &&
+				actual.size === expectedDescriptor.size &&
+				actual.mtimeNs === expectedDescriptor.mtimeNs &&
+				actual.ctimeNs === expectedDescriptor.ctimeNs
+			);
+		};
+		const assertCurrentBinding = (): void => {
+			this.#assertBound();
+			const named = authority.stat(relative);
+			if (!named.ok || !matchesExpected(named.identity)) throw new Error("source_changed");
+			this.#assertBound();
+		};
+
+		let file: RecoveryFsFile | undefined;
+		try {
+			file = authority.openFile(relative);
+			const opened = file.identity();
+			if (!opened.ok || !matchesExpected(opened.identity)) throw new Error("source_changed");
+			assertCurrentBinding();
+		} catch (error) {
+			try {
+				file?.close();
+			} catch {
+				// Preserve the identity/open failure; closing is still attempted.
+			}
+			throw error;
+		}
+
+		let closed = false;
+		return {
+			readRange: (start, length) => {
+				if (closed) throw new Error("closed");
+				if (
+					!Number.isSafeInteger(start) ||
+					start < 0 ||
+					!Number.isSafeInteger(length) ||
+					length < 0 ||
+					start > Number.MAX_SAFE_INTEGER - length
+				)
+					throw new RangeError("Invalid managed range read");
+				if (length > 1024 * 1024) throw new RangeError("Managed read chunk exceeds the bounded maximum");
+				if (start + length > expectedDescriptor.size) throw new Error("range_not_present");
+				assertCurrentBinding();
+				const before = file!.identity();
+				if (!before.ok || !matchesExpected(before.identity)) throw new Error("source_changed");
+				const chunk = file!.readChunk(start, length);
+				if (!chunk.ok || !chunk.data || !chunk.identity) throw new Error(chunk.code ?? "managed_read_failed");
+				if (!matchesExpected(chunk.identity)) throw new Error("source_changed");
+				if (chunk.data.byteLength !== length) throw new Error("range_not_present");
+				const after = file!.identity();
+				if (!after.ok || !matchesExpected(after.identity)) throw new Error("source_changed");
+				assertCurrentBinding();
+				return chunk.data;
+			},
+			close: () => {
+				if (closed) return;
+				closed = true;
+				let failure: unknown;
+				try {
+					assertCurrentBinding();
+				} catch (error) {
+					failure = error;
+				}
+				let result: RecoveryFsResult | undefined;
+				try {
+					result = file!.close();
+				} catch (error) {
+					failure ??= error;
+				}
+				if (failure === undefined && (!result?.ok || !matchesExpected(result.identity)))
+					failure = new Error(result?.code ?? "source_changed");
+				if (failure === undefined) {
+					try {
+						assertCurrentBinding();
+					} catch (error) {
+						failure = error;
+					}
+				}
+				if (failure !== undefined) throw failure;
+			},
+		};
+	}
+
 	/** Read an exact managed file without exposing its pathname as authority. */
 	readExpected(relativePath: string): ManagedFileSnapshot | null {
 		this.#assertBound();
