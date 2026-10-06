@@ -5013,6 +5013,7 @@ async function streamAssistantResponse(
 			const trailing = config.fallbackManaged
 				? managedAssistantShell(finished, config.model, managedDegradedFieldDiagnostics, true)
 				: finished;
+			promoteEmptyResponseStop(trailing);
 			if (promptPrefix) trailing.promptPrefix = promptPrefix;
 			await finishChat(trailing);
 			return trailing;
