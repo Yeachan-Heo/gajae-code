@@ -635,7 +635,10 @@ export class AcpSdkAdapter {
 					}));
 		const options = {
 			idempotencyKey,
-			...(timeoutMs === undefined ? {} : { timeoutMs }),
+			// SdkClient reads this after connecting, so reconnect and replay spend the same allowance.
+			get timeoutMs() {
+				return timeoutMs === undefined ? undefined : Math.max(0, deadline - Date.now());
+			},
 			beforeDispatch: () => {
 				if (Date.now() >= deadline) throw deadlineFailure();
 			},
@@ -773,6 +776,7 @@ export class AcpSdkAdapter {
 							if (Date.now() - startedAt >= PROVIDER_ACTIVATION_BUDGET_MS)
 								throw this.#providerActivationExhausted(attempt, startedAt);
 						} catch (error) {
+							if (providerErrorCode(error) === "uncertain_after_send") throw error;
 							if (Date.now() - startedAt >= PROVIDER_ACTIVATION_BUDGET_MS)
 								throw this.#providerActivationExhausted(attempt, startedAt);
 							if (providerErrorCode(error) === "provider_lease_conflict") {
@@ -803,6 +807,7 @@ export class AcpSdkAdapter {
 					this.#providersActivated = true;
 					return;
 				} catch (error) {
+					if (providerErrorCode(error) === "uncertain_after_send") throw error;
 					if (this.#router && attachment !== this.#attachment && !this.#closed) {
 						this.#providersActivated = false;
 						continue;

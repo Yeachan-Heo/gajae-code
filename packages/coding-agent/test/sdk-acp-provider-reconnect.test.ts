@@ -225,6 +225,87 @@ test("ACP provider activation retries the current Router attachment after rotati
 	}
 });
 
+test("ACP provider activation preserves registration uncertainty at the deadline", async () => {
+	const startedAt = 1_000;
+	let now = startedAt;
+	const clock = spyOn(Date, "now").mockImplementation(() => now);
+	const uncertainty = new SdkClientError(
+		"uncertain_after_send",
+		"Provider registration response was lost after dispatch.",
+		{ operation: "register_provider", idempotencyKey: "registration-1" },
+	);
+	let registrations = 0;
+	const attachment: SessionAttachment = {
+		authorityId: "session-1:stable",
+		sessionId: "session-1",
+		generation: 1,
+		isCurrent: () => true,
+		send: async () => {},
+		sendMaintenance: () => {},
+	};
+	const adapter = new AcpSdkAdapter({
+		router: {
+			request: async () => {
+				registrations += 1;
+				now = startedAt + PROVIDER_ACTIVATION_BUDGET_MS;
+				throw uncertainty;
+			},
+		} as never,
+		attachment,
+		sessionId: attachment.sessionId,
+		providers: [{ capability: "ui", definitions: [{ name: "select" }] }],
+	});
+	try {
+		await expect(adapter.start()).rejects.toBe(uncertainty);
+		expect(registrations).toBe(1);
+		expect(adapter.leaseIds.size).toBe(0);
+	} finally {
+		clock.mockRestore();
+		await adapter.close();
+	}
+});
+
+test("ACP provider activation preserves registration uncertainty when the attachment rotates at the deadline", async () => {
+	const startedAt = 1_000;
+	let now = startedAt;
+	const clock = spyOn(Date, "now").mockImplementation(() => now);
+	const uncertainty = new SdkClientError(
+		"uncertain_after_send",
+		"Provider registration response was lost after dispatch.",
+		{ operation: "register_provider", idempotencyKey: "registration-rotated" },
+	);
+	let adapter!: AcpSdkAdapter;
+	const attachment = (generation: number, isCurrent: () => boolean): SessionAttachment => ({
+		authorityId: `session-1:${generation}`,
+		sessionId: "session-1",
+		generation,
+		isCurrent,
+		send: async () => {},
+		sendMaintenance: () => {},
+	});
+	const firstAttachment = attachment(1, () => true);
+	const rotatedAttachment = attachment(2, () => false);
+	adapter = new AcpSdkAdapter({
+		router: {
+			request: async () => {
+				adapter.acceptAttachment(rotatedAttachment);
+				now = startedAt + PROVIDER_ACTIVATION_BUDGET_MS;
+				throw uncertainty;
+			},
+		} as never,
+		attachment: firstAttachment,
+		sessionId: firstAttachment.sessionId,
+		providers: [{ capability: "ui", definitions: [{ name: "select" }] }],
+	});
+	try {
+		await expect(adapter.start()).rejects.toBe(uncertainty);
+		expect(adapter.leaseIds.size).toBe(0);
+	} finally {
+		clock.mockRestore();
+		await adapter.close();
+	}
+});
+
 test("ACP provider activation gives up with an attributable error when the attachment rotates on every attempt", async () => {
 	let currentGeneration = 1;
 	let registrations = 0;

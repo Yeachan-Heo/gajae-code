@@ -532,6 +532,7 @@ test("ACP lifecycle recovers a committed create with the original operation, inp
 	};
 	const adapter = new AcpSdkAdapter({ client: sdk as never });
 	await adapter.start();
+	const clock = spyOn(Date, "now").mockReturnValue(Date.now());
 	try {
 		await expect(adapter.global("session.create", input, "replay-key")).resolves.toEqual(committed);
 		expect(creates).toBe(1);
@@ -547,6 +548,7 @@ test("ACP lifecycle recovers a committed create with the original operation, inp
 		expect(sdk.frames[0]?.input).toBe(input);
 		expect(sdk.frames[1]?.input).toBe(input);
 	} finally {
+		clock.mockRestore();
 		await adapter.close();
 	}
 });
@@ -693,6 +695,34 @@ test("ACP lifecycle teardown during recovery preserves the original uncertainty"
 		expect(sdk.reconnectListeners.size).toBe(0);
 		expect(sdk.reconnectFailedListeners.size).toBe(0);
 	} finally {
+		await adapter.close();
+	}
+});
+
+test("ACP lifecycle replay gives the SDK only the remaining caller budget", async () => {
+	const sdk = new FakeSdkClient();
+	let now = Date.now();
+	const clock = spyOn(Date, "now").mockImplementation(() => now);
+	let attempts = 0;
+	let replayTimeout: number | undefined;
+	sdk.global = async (_operation, _input, options) => {
+		attempts++;
+		if (attempts === 1) {
+			now += 20_000;
+			throw new SdkClientError("uncertain_after_send", "committed response lost");
+		}
+		replayTimeout = options?.timeoutMs;
+		return { result: { sessionId: "committed" } };
+	};
+	const adapter = new AcpSdkAdapter({ client: sdk as never });
+	try {
+		await expect(adapter.lifecycle("session.create", { cwd: "/workspace" }, "remaining-budget")).resolves.toEqual({
+			result: { sessionId: "committed" },
+		});
+		expect(replayTimeout).toBe(1_000);
+		expect(attempts).toBe(2);
+	} finally {
+		clock.mockRestore();
 		await adapter.close();
 	}
 });
