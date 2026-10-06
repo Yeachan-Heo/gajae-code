@@ -2101,7 +2101,188 @@ describe.skipIf(process.platform !== "linux")("managed native security result va
 	});
 });
 
+describe("path-backed managed descendant binding", () => {
+	it("rejects a base-directory symlink to the same inode for reads and tree capture", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-path-binding-"));
+		const artifacts = path.join(root, "artifacts");
+		const detached = path.join(root, "detached-artifacts");
+		fs.mkdirSync(artifacts, { mode: 0o700 });
+		fs.writeFileSync(path.join(artifacts, "payload.bin"), "unchanged payload", { mode: 0o600 });
+		const expected = managedDirectoryRoot(artifacts);
+		const store = new ManagedSessionDescendantStore(
+			managedDirectoryRoot(root),
+			artifacts,
+			undefined,
+			"default",
+			root,
+			expected,
+			"read-only",
+		);
+		try {
+			expect(store.readExpected("payload.bin")?.bytes).toEqual(Buffer.from("unchanged payload"));
+			expect(store.captureTree("").rootIno).toBe(expected.ino.toString());
+
+			fs.renameSync(artifacts, detached);
+			fs.symlinkSync(detached, artifacts, "dir");
+			const followed = fs.statSync(artifacts, { bigint: true });
+			expect(followed.dev).toBe(expected.dev);
+			expect(followed.ino).toBe(expected.ino);
+			expect(fs.lstatSync(artifacts).isSymbolicLink()).toBe(true);
+
+			expect(() => store.assertBound()).toThrow("root binding changed");
+			expect(() => store.readExpected("payload.bin")).toThrow("root binding changed");
+			expect(() => store.captureDirectoryIdentity("")).toThrow("root binding changed");
+			expect(() => store.captureTree("")).toThrow("root binding changed");
+			expect(fs.readFileSync(path.join(detached, "payload.bin"), "utf8")).toBe("unchanged payload");
+		} finally {
+			store.close();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
+describe.skipIf(process.platform !== "darwin")("path-backed managed descendant publication binding", () => {
+	it("refuses publication through a base symlink and preserves its unchanged target", async () => {
+		const root = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-managed-path-publish-binding-"));
+		const artifacts = path.join(root, "artifacts");
+		const detached = path.join(root, "detached-artifacts");
+		await fsp.mkdir(artifacts, { mode: 0o700 });
+		await fsp.writeFile(path.join(artifacts, "payload.bin"), "unchanged payload", { mode: 0o600 });
+		const expected = managedDirectoryRoot(artifacts);
+		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), artifacts);
+		try {
+			expect(store.readExpected("payload.bin")?.bytes).toEqual(Buffer.from("unchanged payload"));
+			await store.publishNoReplace("control.bin", Buffer.from("authorized control"));
+			expect(store.captureTree("").rootIno).toBe(expected.ino.toString());
+
+			await fsp.rename(artifacts, detached);
+			await fsp.symlink(detached, artifacts, "dir");
+			const followed = await fsp.stat(artifacts, { bigint: true });
+			expect(followed.dev).toBe(expected.dev);
+			expect(followed.ino).toBe(expected.ino);
+			expect(() => store.assertBound()).toThrow("root binding changed");
+			expect(() => store.readExpected("payload.bin")).toThrow("root binding changed");
+			expect(() => store.captureTree("")).toThrow("root binding changed");
+			await expect(store.publishNoReplace("must-not-publish.bin", Buffer.from("unauthorized"))).rejects.toThrow(
+				"root binding changed",
+			);
+			expect(await fsp.readdir(detached)).toEqual(expect.arrayContaining(["control.bin", "payload.bin"]));
+			expect(await fsp.readdir(detached)).toHaveLength(2);
+			expect(await fsp.readFile(path.join(detached, "control.bin"), "utf8")).toBe("authorized control");
+			expect(await fsp.readFile(path.join(detached, "payload.bin"), "utf8")).toBe("unchanged payload");
+		} finally {
+			store.close();
+			await fsp.rm(root, { recursive: true, force: true });
+		}
+	});
+});
+
 describe.skipIf(process.platform !== "linux")("managed descendant retained binding", () => {
+	it("owns only a newly derived authority and closes it once", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-derived-owner-"));
+		const rootIdentity = managedDirectoryRoot(root);
+		const parent = new ManagedSessionDescendantStore(rootIdentity, root);
+		const borrowedAuthority = parent.retainAuthority();
+		if (!borrowedAuthority) throw new Error("Expected a retained native authority");
+		const borrowedStore = new ManagedSessionDescendantStore(rootIdentity, root, {
+			authority: borrowedAuthority,
+			authorityBaseDir: root,
+		});
+		const realRetain = native.RecoveryFsRoot.prototype.retainManagedDirectory;
+		const realClose = native.RecoveryFsRoot.prototype.close;
+		const retainedChildren: native.RecoveryFsRoot[] = [];
+		const closedAuthorities: native.RecoveryFsRoot[] = [];
+		const retainSpy = vi
+			.spyOn(native.RecoveryFsRoot.prototype, "retainManagedDirectory")
+			.mockImplementation(function (this: native.RecoveryFsRoot, relativePath, expectedDev, expectedIno) {
+				const retained = realRetain.call(this, relativePath, expectedDev, expectedIno);
+				retainedChildren.push(retained);
+				return retained;
+			});
+		const closeSpy = vi.spyOn(native.RecoveryFsRoot.prototype, "close").mockImplementation(function (
+			this: native.RecoveryFsRoot,
+		) {
+			closedAuthorities.push(this);
+			return realClose.call(this);
+		});
+		let derived: ManagedSessionDescendantStore | undefined;
+		try {
+			borrowedStore.close();
+			expect(borrowedAuthority.identity()).toMatchObject({ ok: true });
+
+			derived = parent.deriveSubtree("derived");
+			expect(retainedChildren).toHaveLength(1);
+			const childAuthority = retainedChildren[0];
+			if (!childAuthority) throw new Error("Expected the real retained child authority");
+			derived.close();
+			derived.close();
+			expect(closedAuthorities.filter(authority => authority === childAuthority)).toHaveLength(1);
+			expect(childAuthority.identity()).toMatchObject({ ok: false, code: "closed" });
+			expect(borrowedAuthority.identity()).toMatchObject({ ok: true });
+
+			parent.assertBound();
+			parent.publishNoReplaceSync("parent-after-child-close.bin", Buffer.from("parent remains open"));
+			expect(borrowedAuthority.readManaged("parent-after-child-close.bin")).toMatchObject({ ok: true });
+		} finally {
+			closeSpy.mockRestore();
+			retainSpy.mockRestore();
+			derived?.close();
+			borrowedStore.close();
+			borrowedAuthority.close();
+			parent.close();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("closes a newly retained child when constructor binding fails", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-derived-constructor-failure-"));
+		const rootIdentity = managedDirectoryRoot(root);
+		const parent = new ManagedSessionDescendantStore(rootIdentity, root);
+		const childPath = path.join(root, "derived");
+		const displacedPath = path.join(root, "displaced-derived");
+		const realRetain = native.RecoveryFsRoot.prototype.retainManagedDirectory;
+		const realClose = native.RecoveryFsRoot.prototype.close;
+		let retainedChild: native.RecoveryFsRoot | undefined;
+		const closeCalls: native.RecoveryFsRoot[] = [];
+		const retainSpy = vi
+			.spyOn(native.RecoveryFsRoot.prototype, "retainManagedDirectory")
+			.mockImplementation(function (this: native.RecoveryFsRoot, relativePath, expectedDev, expectedIno) {
+				const retained = realRetain.call(this, relativePath, expectedDev, expectedIno);
+				if (relativePath === "derived") {
+					retainedChild = retained;
+					fs.renameSync(childPath, displacedPath);
+					fs.symlinkSync(displacedPath, childPath, "dir");
+				}
+				return retained;
+			});
+		const closeSpy = vi.spyOn(native.RecoveryFsRoot.prototype, "close").mockImplementation(function (
+			this: native.RecoveryFsRoot,
+		) {
+			closeCalls.push(this);
+			return realClose.call(this);
+		});
+		try {
+			expect(() => parent.deriveSubtree("derived")).toThrow("Managed descendant root binding changed");
+			if (!retainedChild) throw new Error("Expected the real retained child authority");
+			expect(closeCalls.filter(authority => authority === retainedChild)).toHaveLength(1);
+			expect(retainedChild.identity()).toMatchObject({ ok: false, code: "closed" });
+			parent.assertBound();
+			parent.publishNoReplaceSync("parent-after-constructor-failure.bin", Buffer.from("parent remains open"));
+			expect(fs.readFileSync(path.join(root, "parent-after-constructor-failure.bin"), "utf8")).toBe(
+				"parent remains open",
+			);
+		} finally {
+			closeSpy.mockRestore();
+			retainSpy.mockRestore();
+			if (fs.lstatSync(childPath).isSymbolicLink()) {
+				fs.unlinkSync(childPath);
+				fs.renameSync(displacedPath, childPath);
+			}
+			parent.close();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("rejects publication after the retained subtree pathname is replaced", async () => {
 		const root = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-managed-store-binding-"));
 		try {

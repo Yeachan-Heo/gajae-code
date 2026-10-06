@@ -1646,16 +1646,23 @@ export class ManagedSessionDescendantStore {
 			child.dev.toString(),
 			child.ino.toString(),
 		);
-		return new ManagedSessionDescendantStore(
-			this.#root,
-			resolved,
-			{
-				authority: retainedChild,
-				authorityBaseDir: resolved,
-			},
-			this.#policy,
-			this.#profileAgentDir,
-		);
+		try {
+			const derived = new ManagedSessionDescendantStore(
+				this.#root,
+				resolved,
+				{
+					authority: retainedChild,
+					authorityBaseDir: resolved,
+				},
+				this.#policy,
+				this.#profileAgentDir,
+			);
+			derived.#ownsAuthority = true;
+			return derived;
+		} catch (error) {
+			retainedChild.close();
+			throw error;
+		}
 	}
 
 	retainAuthority(): RecoveryFsRoot | undefined {
@@ -1755,9 +1762,10 @@ export class ManagedSessionDescendantStore {
 
 	#assertBound(): void {
 		if (!this.#authority) {
-			const named = fs.statSync(this.#baseDir, { bigint: true });
+			const named = fs.lstatSync(this.#baseDir, { bigint: true });
 			if (
 				!named.isDirectory() ||
+				named.isSymbolicLink() ||
 				canonicalFileId(named.dev) !== this.#subtreeRoot.dev ||
 				canonicalFileId(named.ino) !== this.#subtreeRoot.ino
 			)
