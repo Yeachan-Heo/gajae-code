@@ -447,7 +447,12 @@ describe("AgentSession managed fallback attempt transaction", () => {
 				return zeroTokenEmptyStopStream(model);
 			},
 			3,
-			{ handler: "context", onHandler: () => handlerCalls++ },
+			{
+				handler: "context",
+				onHandler: () => {
+					handlerCalls++;
+				},
+			},
 		);
 
 		await session!.prompt("do not replay an extension-observable empty response");
@@ -467,7 +472,12 @@ describe("AgentSession managed fallback attempt transaction", () => {
 				return zeroTokenEmptyStopStream(model, false);
 			},
 			3,
-			{ handler: "context", onHandler: () => handlerCalls++ },
+			{
+				handler: "context",
+				onHandler: () => {
+					handlerCalls++;
+				},
+			},
 		);
 
 		await session!.prompt("do not replay an untyped extension-observable empty response");
