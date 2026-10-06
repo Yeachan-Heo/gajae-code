@@ -1,8 +1,10 @@
 import { describe, expect, test, vi } from "bun:test";
 import {
+	isProviderSafetyStopModelTrusted,
 	mintProviderSafetyStop,
 	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
 	PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
+	registerProviderSafetyStopModel,
 } from "../src/adapter-internals/provider-safety-stop";
 import * as publicAi from "../src/index";
 import { getBundledModel } from "../src/models";
@@ -10,6 +12,7 @@ import { streamOpenAICompletions } from "../src/providers/openai-completions";
 import { stream, streamSimple } from "../src/stream";
 import type { AssistantMessage, Context, FetchImpl, Model } from "../src/types";
 import { isProviderSafetyStopAuthenticated } from "../src/utils/provider-safety-stop";
+import { createTrustedStrippedModelClone, registerFinalizedModelClone } from "../src/utils/trusted-model-clone";
 
 function message(): AssistantMessage {
 	return {
@@ -251,5 +254,122 @@ describe("provider safety-stop provenance authority", () => {
 		const manifest = (await import("../package.json", { with: { type: "json" } })).default;
 		expect(manifest.exports["./adapter-internals/*"]).toBeNull();
 		expect(manifest.exports["./adapter-internals/*.js"]).toBeNull();
+	});
+
+	describe("model identity snapshot and clone registration", () => {
+		test("clone with changed baseUrl is rejected as untrusted", () => {
+			const original = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
+			if (!original) throw new Error("Expected bundled OpenAI model");
+
+			registerProviderSafetyStopModel(original);
+			expect(isProviderSafetyStopModelTrusted(original)).toBe(true);
+
+			const cloneWithDifferentBaseUrl = { ...original, baseUrl: "https://attacker.example/v1" };
+			registerFinalizedModelClone(original, cloneWithDifferentBaseUrl);
+
+			// Clone with arbitrary baseUrl is not trusted
+			expect(isProviderSafetyStopModelTrusted(cloneWithDifferentBaseUrl)).toBe(false);
+		});
+
+		test("clone with changed provider is rejected as untrusted", () => {
+			const original = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
+			if (!original) throw new Error("Expected bundled OpenAI model");
+
+			registerProviderSafetyStopModel(original);
+			expect(isProviderSafetyStopModelTrusted(original)).toBe(true);
+
+			const cloneWithDifferentProvider = { ...original, provider: "attacker" };
+			registerFinalizedModelClone(original, cloneWithDifferentProvider);
+
+			// Clone with changed provider is not trusted
+			expect(isProviderSafetyStopModelTrusted(cloneWithDifferentProvider)).toBe(false);
+		});
+
+		test("clone with changed id is rejected as untrusted", () => {
+			const original = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
+			if (!original) throw new Error("Expected bundled OpenAI model");
+
+			registerProviderSafetyStopModel(original);
+			expect(isProviderSafetyStopModelTrusted(original)).toBe(true);
+
+			const cloneWithDifferentId = { ...original, id: "attacker-model" };
+			registerFinalizedModelClone(original, cloneWithDifferentId);
+
+			// Clone with changed id is not trusted
+			expect(isProviderSafetyStopModelTrusted(cloneWithDifferentId)).toBe(false);
+		});
+
+		test("clone with changed api is rejected as untrusted", () => {
+			const original = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
+			if (!original) throw new Error("Expected bundled OpenAI model");
+
+			registerProviderSafetyStopModel(original);
+			expect(isProviderSafetyStopModelTrusted(original)).toBe(true);
+
+			const cloneWithDifferentApi = { ...original, api: "attacker-api" as any };
+			registerFinalizedModelClone(original, cloneWithDifferentApi);
+
+			// Clone with changed api is not trusted
+			expect(isProviderSafetyStopModelTrusted(cloneWithDifferentApi)).toBe(false);
+		});
+
+		test("mutating registered clone's baseUrl makes it untrusted", () => {
+			const original = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
+			if (!original) throw new Error("Expected bundled OpenAI model");
+
+			registerProviderSafetyStopModel(original);
+			expect(isProviderSafetyStopModelTrusted(original)).toBe(true);
+
+			// Identical clone is trusted
+			const clone = { ...original };
+			registerFinalizedModelClone(original, clone);
+			expect(isProviderSafetyStopModelTrusted(clone)).toBe(true);
+
+			// Mutate the clone's baseUrl
+			(clone as any).baseUrl = "https://attacker.example";
+
+			// Mutated clone is no longer trusted
+			expect(isProviderSafetyStopModelTrusted(clone)).toBe(false);
+		});
+
+		test("createTrustedStrippedModelClone strips userinfo/query/hash and registers as trusted", () => {
+			const original = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
+			if (!original) throw new Error("Expected bundled OpenAI model");
+
+			const modelWithUserinfo = {
+				...original,
+				baseUrl: "https://user:pass@example.com/v1?key=secret#section",
+			};
+
+			registerProviderSafetyStopModel(modelWithUserinfo);
+			expect(isProviderSafetyStopModelTrusted(modelWithUserinfo)).toBe(true);
+
+			const stripped = createTrustedStrippedModelClone(modelWithUserinfo);
+
+			// Stripped clone should have userinfo/query/hash removed
+			expect(stripped.baseUrl).toBe("https://example.com/v1");
+			// Stripped clone is trusted
+			expect(isProviderSafetyStopModelTrusted(stripped)).toBe(true);
+		});
+
+		test("createTrustedStrippedModelClone handles invalid URLs gracefully", () => {
+			const original = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
+			if (!original) throw new Error("Expected bundled OpenAI model");
+
+			const modelWithInvalidUrl = {
+				...original,
+				baseUrl: "not-a-valid-url",
+			};
+
+			registerProviderSafetyStopModel(modelWithInvalidUrl);
+			expect(isProviderSafetyStopModelTrusted(modelWithInvalidUrl)).toBe(true);
+
+			const stripped = createTrustedStrippedModelClone(modelWithInvalidUrl);
+
+			// Stripped clone should not have baseUrl
+			expect(stripped.baseUrl).toBeUndefined();
+			// Stripped clone is still trusted
+			expect(isProviderSafetyStopModelTrusted(stripped)).toBe(true);
+		});
 	});
 });

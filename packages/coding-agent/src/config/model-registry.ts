@@ -13,6 +13,7 @@ import {
 	type Context,
 	codexContextOverrideKey,
 	createModelManager,
+	createTrustedStrippedModelClone,
 	Effort,
 	enrichModelThinking,
 	getBundledModels,
@@ -33,6 +34,7 @@ import {
 	PROVIDER_DESCRIPTORS,
 	readModelCache,
 	registerCustomApi,
+	registerFinalizedModelClone,
 	resolveOAuthStorageProvider,
 	type SimpleStreamOptions,
 	type ThinkingConfig,
@@ -49,7 +51,6 @@ import {
 	readBoundedModelsJson,
 	resolveLoopbackOpenAIBaseUrl,
 } from "@gajae-code/ai/utils/discovery/openai-compatible";
-import { registerTrustedModelClone } from "@gajae-code/ai/utils/provider-safety-stop";
 
 // Sentinels for local-only OAuth tokens — declared inline to avoid loading provider
 // modules at startup. Must match the provider OAuth modules.
@@ -2747,24 +2748,7 @@ export class ModelRegistry {
 		}));
 	}
 	#stripModelBaseUrlQueries(models: readonly Model<Api>[]): Model<Api>[] {
-		return models.map(model => {
-			if (!model.baseUrl) return model;
-			try {
-				const parsed = new URL(model.baseUrl);
-				parsed.username = "";
-				parsed.password = "";
-				parsed.search = "";
-				parsed.hash = "";
-				const clone = { ...model, baseUrl: parsed.toString().replace(/\/$/, "") };
-				registerTrustedModelClone(model, clone);
-				return clone;
-			} catch {
-				const { baseUrl: _baseUrl, ...withoutBaseUrl } = model;
-				const clone = withoutBaseUrl as Model<Api>;
-				registerTrustedModelClone(model, clone);
-				return clone;
-			}
-		});
+		return models.map(model => createTrustedStrippedModelClone(model));
 	}
 	#stripUrlUserinfo(url: string | undefined): string | undefined {
 		if (!url) return url;
@@ -5011,7 +4995,7 @@ export class ModelRegistry {
 			const generated = this.#generatedAuthHeaders.get(models[index]!);
 			if (generated) this.#generatedAuthHeaders.set(result[index]!, generated);
 			// Register finalized clone as trusted if the original is trusted
-			if (result[index]) registerTrustedModelClone(models[index]!, result[index]);
+			if (result[index]) registerFinalizedModelClone(models[index]!, result[index]);
 		}
 		return result;
 	}

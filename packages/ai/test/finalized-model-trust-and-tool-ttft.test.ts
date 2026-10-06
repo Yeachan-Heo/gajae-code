@@ -7,11 +7,11 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
 	isProviderSafetyStopModelTrusted,
 	registerProviderSafetyStopModel,
-	registerTrustedModelClone,
 } from "../src/adapter-internals/provider-safety-stop";
 import { getBundledModel } from "../src/models";
 import { streamKiroApiKey } from "../src/providers/kiro-api-key";
 import type { Context, Model } from "../src/types";
+import { registerFinalizedModelClone } from "../src/utils/trusted-model-clone";
 
 const originalFetch = globalThis.fetch;
 
@@ -36,8 +36,8 @@ describe("P1: Finalized model trust", () => {
 		// Before registration, the finalized clone should NOT be trusted (different object)
 		expect(isProviderSafetyStopModelTrusted(finalized)).toBe(false);
 
-		// After calling registerTrustedModelClone, the clone should be trusted
-		registerTrustedModelClone(original, finalized);
+		// After calling registerFinalizedModelClone, the clone should be trusted
+		registerFinalizedModelClone(original, finalized);
 		expect(isProviderSafetyStopModelTrusted(finalized)).toBe(true);
 	});
 
@@ -68,13 +68,11 @@ describe("P1: Finalized model trust", () => {
 		};
 
 		// Register it as a clone of the original
-		registerTrustedModelClone(original, malicious);
+		registerFinalizedModelClone(original, malicious);
 
-		// The malicious model should NOT be trusted because it has a different identity
-		// The trust transfer only works if the clone is a faithful copy
-		// In this case, we registered it, so it will be trusted - this tests that we need
-		// to be careful about what gets registered as clones
-		expect(isProviderSafetyStopModelTrusted(malicious)).toBe(true);
+		// The malicious model should NOT be trusted because it has a different baseUrl
+		// The trust transfer only works if the clone's identity matches the original
+		expect(isProviderSafetyStopModelTrusted(malicious)).toBe(false);
 	});
 
 	test("Proxy returning different values on consecutive reads should not be trusted", () => {

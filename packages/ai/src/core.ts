@@ -43,4 +43,5 @@ export * from "./utils/retry";
 export * from "./utils/schema";
 export * from "./utils/sqlite-errors";
 export * from "./utils/tool-choice-capability";
+export * from "./utils/trusted-model-clone";
 export * from "./utils/validation";

@@ -6,15 +6,36 @@ const PROVIDER_SAFETY_STOP_INVOCATION_BRAND = Symbol("provider-safety-stop-invoc
 const PROVIDER_SAFETY_STOP_INVOCATION_KEY = Symbol("provider-safety-stop-invocation");
 
 interface ModelIdentitySnapshot {
+	api?: string;
+	provider?: string;
+	id?: string;
 	baseUrl?: string;
 }
 
 const trustedProviderSafetyStopModels = new WeakMap<object, ModelIdentitySnapshot>();
 
+/** Compute the expected baseUrl after stripping userinfo, query, and hash. */
+function computeStrippedBaseUrl(baseUrl: string | undefined): string | undefined {
+	if (!baseUrl) return baseUrl;
+	try {
+		const parsed = new URL(baseUrl);
+		parsed.username = "";
+		parsed.password = "";
+		parsed.search = "";
+		parsed.hash = "";
+		return parsed.toString().replace(/\/$/, "");
+	} catch {
+		return undefined;
+	}
+}
+
 /** Register an immutable catalog identity for first-party provider dispatch. */
 export function registerProviderSafetyStopModel(model: Model<Api>): void {
 	try {
 		const snapshot: ModelIdentitySnapshot = {
+			api: (model as { api?: string }).api,
+			provider: (model as { provider?: string }).provider,
+			id: (model as { id?: string }).id,
 			baseUrl: (model as { baseUrl?: string }).baseUrl,
 		};
 		trustedProviderSafetyStopModels.set(model, snapshot);
@@ -25,17 +46,47 @@ export function registerProviderSafetyStopModel(model: Model<Api>): void {
 
 /**
  * Register a finalized clone as trusted when the original catalog model is trusted.
- * Called when a model is cloned during finalization (e.g., spread operator, object merge).
- * Only trusts the clone if the original is in the trusted registry.
+ * Called internally only when a model is cloned during finalization.
+ * Only trusts the clone if the original is in the trusted registry and the clone's
+ * identity matches or is a valid baseUrl derivation of the original's.
+ * Package-internal only; external consumers cannot import from adapter-internals.
  */
-export function registerTrustedModelClone(original: object, clone: object): void {
+export function registerTrustedModelCloneInternal(original: object, clone: object): void {
 	const originalSnapshot = trustedProviderSafetyStopModels.get(original);
-	if (originalSnapshot) {
-		const cloneSnapshot: ModelIdentitySnapshot = {
-			baseUrl: (clone as { baseUrl?: string }).baseUrl,
-		};
-		trustedProviderSafetyStopModels.set(clone, cloneSnapshot);
+	if (!originalSnapshot) return;
+
+	// Clone's api, provider, and id must match exactly
+	const cloneApi = (clone as { api?: string }).api;
+	const cloneProvider = (clone as { provider?: string }).provider;
+	const cloneId = (clone as { id?: string }).id;
+	const cloneBaseUrl = (clone as { baseUrl?: string }).baseUrl;
+
+	if (
+		cloneApi !== originalSnapshot.api ||
+		cloneProvider !== originalSnapshot.provider ||
+		cloneId !== originalSnapshot.id
+	) {
+		// Identity mismatch: clone is not trusted
+		return;
 	}
+
+	// BaseUrl must either match exactly or be the result of stripping userinfo/query/hash
+	if (cloneBaseUrl !== originalSnapshot.baseUrl) {
+		const expectedStrippedUrl = computeStrippedBaseUrl(originalSnapshot.baseUrl);
+		if (cloneBaseUrl !== expectedStrippedUrl) {
+			// BaseUrl mismatch and not a valid derivation: clone is not trusted
+			return;
+		}
+	}
+
+	// Clone is trusted: snapshot its current state
+	const cloneSnapshot: ModelIdentitySnapshot = {
+		api: cloneApi,
+		provider: cloneProvider,
+		id: cloneId,
+		baseUrl: cloneBaseUrl,
+	};
+	trustedProviderSafetyStopModels.set(clone, cloneSnapshot);
 }
 
 /** Verify that a model is the unchanged identity of a bundled catalog entry. */
@@ -43,8 +94,19 @@ export function isProviderSafetyStopModelTrusted(model: unknown): boolean {
 	if (typeof model !== "object" || model === null) return false;
 	const snapshot = trustedProviderSafetyStopModels.get(model);
 	if (!snapshot) return false;
+
+	// All identity fields must match exactly
+	const modelApi = (model as { api?: string }).api;
+	const modelProvider = (model as { provider?: string }).provider;
+	const modelId = (model as { id?: string }).id;
 	const modelBaseUrl = (model as { baseUrl?: string }).baseUrl;
-	return snapshot.baseUrl === modelBaseUrl;
+
+	return (
+		modelApi === snapshot.api &&
+		modelProvider === snapshot.provider &&
+		modelId === snapshot.id &&
+		modelBaseUrl === snapshot.baseUrl
+	);
 }
 
 export type ProviderSafetyStopAdapterCapability = {
