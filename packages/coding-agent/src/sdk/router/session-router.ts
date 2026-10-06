@@ -203,6 +203,7 @@ export interface SessionRouterClient {
 		frame: Record<string, unknown>,
 		options?: {
 			timeoutMs?: number;
+			deadline?: number;
 			connectedOnly?: boolean;
 			/** Synchronous pre-send observer; a throw aborts the dispatch before the wire. */
 			beforeDispatch?: (context: SdkDispatchContext) => void;
@@ -954,6 +955,7 @@ export class SessionRouter {
 		expectedAttachment?: SessionAttachment,
 		options?: {
 			timeoutMs?: number;
+			deadline?: number;
 			beforeDispatch?: (context: SdkDispatchContext) => void;
 			onDispatch?: SdkDispatchHandler;
 			dispatchFence?: (dispatch: () => Promise<Record<string, unknown>>) => Promise<Record<string, unknown>>;
@@ -994,20 +996,47 @@ export class SessionRouter {
 		// token: the wire frame alone carries credentials, and the observer
 		// context is a deep-frozen, token-redacted copy (#4640 review).
 		const wireFrame = this.#prepareFrame(attached, frame);
-		const { beforeDispatch, onDispatch, dispatchFence, ...requestOptions } = options ?? {};
+		const { beforeDispatch, onDispatch, dispatchFence, deadline, ...requestOptions } = options ?? {};
+		const remainingDeadlineMs = (): number =>
+			deadline === undefined ? Number.POSITIVE_INFINITY : Math.max(0, deadline - Date.now());
+		if (remainingDeadlineMs() <= 0) throw new SessionRouterError("pre_send", "SDK session request deadline elapsed.");
 		try {
-			await attached.client.connect?.();
+			const connecting = attached.client.connect?.();
+			if (connecting) {
+				if (deadline === undefined) await connecting;
+				else {
+					const expired = Promise.withResolvers<never>();
+					const timer = setTimeout(
+						() =>
+							expired.reject(
+								new SessionRouterError(
+									"pre_send",
+									"SDK session request deadline elapsed during transport preparation.",
+								),
+							),
+						remainingDeadlineMs(),
+					);
+					try {
+						await Promise.race([connecting, expired.promise]);
+					} finally {
+						clearTimeout(timer);
+					}
+				}
+			}
 		} catch (error) {
 			if (error instanceof SdkClientError) throw new SdkPreparedDispatchError(error);
 			throw error;
 		}
 		if (!this.#attachmentPublished(attached))
 			throw new SessionRouterError("pre_send", "SDK session attachment changed during transport preparation.");
-		const dispatch = () =>
-			attached.client.request(wireFrame, {
+		const dispatch = () => {
+			const dispatchRemaining = remainingDeadlineMs();
+			if (dispatchRemaining <= 0)
+				throw new SessionRouterError("pre_send", "SDK session request deadline elapsed before dispatch.");
+			return attached.client.request(wireFrame, {
 				...requestOptions,
 				connectedOnly: true,
-				timeoutMs: requestOptions.timeoutMs ?? SESSION_REQUEST_TIMEOUT_MS,
+				timeoutMs: Math.min(requestOptions.timeoutMs ?? SESSION_REQUEST_TIMEOUT_MS, dispatchRemaining),
 				...(beforeDispatch
 					? {
 							beforeDispatch: (context: SdkDispatchContext) =>
@@ -1021,6 +1050,7 @@ export class SessionRouter {
 						}
 					: {}),
 			});
+		};
 		const response = await (dispatchFence ? dispatchFence(dispatch) : dispatch());
 		const settled = this.#sessions.get(sessionId);
 		if (

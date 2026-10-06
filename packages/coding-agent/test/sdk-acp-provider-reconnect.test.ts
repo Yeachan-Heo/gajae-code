@@ -1,6 +1,6 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { AcpSdkAdapter } from "../src/sdk/acp";
-import { PROVIDER_ACTIVATION_MAX_ATTEMPTS } from "../src/sdk/acp/adapter";
+import { PROVIDER_ACTIVATION_BUDGET_MS, PROVIDER_ACTIVATION_MAX_ATTEMPTS } from "../src/sdk/acp/adapter";
 import { SdkClientError } from "../src/sdk/client";
 
 import type { SessionAttachment } from "../src/sdk/router";
@@ -110,6 +110,153 @@ test("ACP provider activation gives up with an attributable error when the attac
 		// The budget is spent in attempts, not wall clock, so the loop terminates promptly.
 		expect(registrations).toBe(PROVIDER_ACTIVATION_MAX_ATTEMPTS);
 	} finally {
+		await adapter.close();
+	}
+});
+
+test("ACP sequential provider registrations share one activation deadline", async () => {
+	const startedAt = 1_000;
+	let now = startedAt;
+	const clock = spyOn(Date, "now").mockImplementation(() => now);
+	const registrations: Array<{ capability: unknown; timeoutMs?: number; deadline?: number }> = [];
+	const attachment: SessionAttachment = {
+		authorityId: "session-1:stable",
+		sessionId: "session-1",
+		generation: 1,
+		isCurrent: () => true,
+		send: async () => {},
+		sendMaintenance: () => {},
+	};
+	const adapter = new AcpSdkAdapter({
+		router: {
+			request: async (
+				_sessionId: string,
+				frame: Record<string, unknown>,
+				_generation?: number,
+				_attachment?: SessionAttachment,
+				options?: { timeoutMs: number; deadline?: number },
+			) => {
+				registrations.push({ capability: frame.capability, ...options });
+				if (registrations.length === 1) now += PROVIDER_ACTIVATION_BUDGET_MS - 1;
+				if (registrations.length === 2) now += 2;
+				return { ok: true, result: { leaseId: `lease-${String(frame.capability)}` } };
+			},
+		} as never,
+		attachment,
+		sessionId: attachment.sessionId,
+		providers: [
+			{ capability: "fs", definitions: [] },
+			{ capability: "permission", definitions: [] },
+		],
+	});
+	try {
+		await expect(adapter.start()).rejects.toMatchObject({ code: "provider_activation_exhausted" });
+		expect(registrations).toEqual([
+			{
+				capability: "fs",
+				timeoutMs: PROVIDER_ACTIVATION_BUDGET_MS,
+				deadline: startedAt + PROVIDER_ACTIVATION_BUDGET_MS,
+			},
+			{ capability: "permission", timeoutMs: 1, deadline: startedAt + PROVIDER_ACTIVATION_BUDGET_MS },
+		]);
+		expect(adapter.leaseIds.get("fs")).toBe("lease-fs");
+		expect(adapter.leaseIds.get("permission")).toBeUndefined();
+		await adapter.start();
+		expect(registrations.map(registration => registration.capability)).toEqual([
+			"fs",
+			"permission",
+			"fs",
+			"permission",
+		]);
+		expect(adapter.leaseIds.get("permission")).toBe("lease-permission");
+	} finally {
+		clock.mockRestore();
+		await adapter.close();
+	}
+});
+
+test("ACP provider activation includes delayed Router transport preparation in its deadline", async () => {
+	const startedAt = 1_000;
+	let now = startedAt;
+	const clock = spyOn(Date, "now").mockImplementation(() => now);
+	let registrationOptions: { timeoutMs: number; deadline?: number } | undefined;
+	let registrations = 0;
+	const attachment: SessionAttachment = {
+		authorityId: "session-1:stable",
+		sessionId: "session-1",
+		generation: 1,
+		isCurrent: () => true,
+		send: async () => {},
+		sendMaintenance: () => {},
+	};
+	const adapter = new AcpSdkAdapter({
+		router: {
+			request: async (
+				_sessionId: string,
+				_frame: Record<string, unknown>,
+				_generation?: number,
+				_attachment?: SessionAttachment,
+				options?: { timeoutMs: number; deadline?: number },
+			) => {
+				registrations += 1;
+				registrationOptions = options;
+				if (registrations === 1) now += PROVIDER_ACTIVATION_BUDGET_MS + 1;
+				return { ok: true, result: { leaseId: "lease-1" } };
+			},
+		} as never,
+		attachment,
+		sessionId: attachment.sessionId,
+		providers: [{ capability: "permission", definitions: [] }],
+	});
+	try {
+		await expect(adapter.start()).rejects.toMatchObject({ code: "provider_activation_exhausted" });
+		expect(registrationOptions).toEqual({
+			timeoutMs: PROVIDER_ACTIVATION_BUDGET_MS,
+			deadline: startedAt + PROVIDER_ACTIVATION_BUDGET_MS,
+		});
+		expect(adapter.leaseIds.size).toBe(0);
+		now = startedAt + PROVIDER_ACTIVATION_BUDGET_MS + 1;
+		await adapter.start();
+		expect(registrations).toBe(2);
+		expect(adapter.leaseIds.get("permission")).toBe("lease-1");
+	} finally {
+		clock.mockRestore();
+		await adapter.close();
+	}
+});
+
+test("ACP rejects a successful final provider registration at the activation deadline without caching activation", async () => {
+	let now = 1_000;
+	const clock = spyOn(Date, "now").mockImplementation(() => now);
+	let registrations = 0;
+	const attachment: SessionAttachment = {
+		authorityId: "session-1:stable",
+		sessionId: "session-1",
+		generation: 1,
+		isCurrent: () => true,
+		send: async () => {},
+		sendMaintenance: () => {},
+	};
+	const adapter = new AcpSdkAdapter({
+		router: {
+			request: async () => {
+				registrations += 1;
+				if (registrations === 1) now += PROVIDER_ACTIVATION_BUDGET_MS;
+				return { ok: true, result: { leaseId: "lease-1" } };
+			},
+		} as never,
+		attachment,
+		sessionId: attachment.sessionId,
+		providers: [{ capability: "ui", definitions: [{ name: "select" }] }],
+	});
+	try {
+		await expect(adapter.start()).rejects.toMatchObject({ code: "provider_activation_exhausted" });
+		expect(adapter.leaseIds.size).toBe(0);
+		await adapter.start();
+		expect(registrations).toBe(2);
+		expect(adapter.leaseIds.get("ui")).toBe("lease-1");
+	} finally {
+		clock.mockRestore();
 		await adapter.close();
 	}
 });

@@ -476,6 +476,138 @@ describe("MCP 2026-07-28 authorization conformance", () => {
 		});
 	}
 
+	it("rejects token endpoint redirects instead of forwarding to a private destination", async () => {
+		let privateForwarded = false;
+		using _hook = hookFetch((input, init) => {
+			const url = String(input);
+			if (url === "https://provider.example/token") {
+				const redirect = new Response(null, { status: 307, headers: { Location: "http://private.example/token" } });
+				if (init?.redirect !== "error") {
+					privateForwarded = true;
+					return new Response(JSON.stringify({ access_token: "forwarded" }), { status: 200 });
+				}
+				throw new TypeError(`redirect mode error (${redirect.status})`);
+			}
+			if (url === "http://private.example/token") {
+				privateForwarded = true;
+				return new Response(JSON.stringify({ access_token: "forwarded" }), { status: 200 });
+			}
+			throw new Error(`Unexpected fetch: ${url}`);
+		});
+
+		const flow = new MCPOAuthFlow({ ...baseConfig, tokenUrl: "https://provider.example/token" }, {});
+		await expect(flow.exchangeToken("test-code", "state", "http://127.0.0.1/callback")).rejects.toThrow(
+			"redirect mode error",
+		);
+		expect(privateForwarded).toBe(false);
+	});
+
+	it("rejects dynamic registration redirects instead of forwarding to a private destination", async () => {
+		let privateForwarded = false;
+		using _hook = hookFetch((input, init) => {
+			const url = String(input);
+			if (url === "https://provider.example/.well-known/oauth-authorization-server") {
+				return new Response(JSON.stringify({ registration_endpoint: "https://provider.example/register" }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			if (url === "https://provider.example/register") {
+				const redirect = new Response(null, {
+					status: 308,
+					headers: { Location: "http://private.example/register" },
+				});
+				if (init?.redirect !== "error") {
+					privateForwarded = true;
+					return new Response(JSON.stringify({ client_id: "forwarded" }), { status: 200 });
+				}
+				throw new TypeError(`redirect mode error (${redirect.status})`);
+			}
+			if (url === "http://private.example/register") {
+				privateForwarded = true;
+				return new Response(JSON.stringify({ client_id: "forwarded" }), { status: 200 });
+			}
+			if (url === "https://provider.example/authorize") return new Response("ok", { status: 200 });
+			throw new Error(`Unexpected fetch: ${url}`);
+		});
+
+		const flow = new MCPOAuthFlow(
+			{ ...baseConfig, clientId: undefined, authorizationUrl: "https://provider.example/authorize" },
+			{},
+		);
+		await flow.generateAuthUrl("state", "http://127.0.0.1/callback");
+		expect(flow.resolvedClientId).toBeUndefined();
+		expect(privateForwarded).toBe(false);
+	});
+
+	it("rejects private token endpoints before the first fetch", async () => {
+		const lookup = vi.spyOn(dns, "lookup");
+		lookup.mockImplementation((async (hostname: string) => {
+			if (hostname === "private.example") return { address: "127.0.0.1", family: 4 };
+			return { address: "1.1.1.1", family: 4 };
+		}) as typeof dns.lookup);
+		let fetchCalled = false;
+		using _hook = hookFetch(() => {
+			fetchCalled = true;
+			return new Response("unexpected", { status: 500 });
+		});
+
+		const flow = new MCPOAuthFlow({ ...baseConfig, tokenUrl: "https://private.example/token" }, {});
+		await expect(flow.exchangeToken("test-code", "state", "http://127.0.0.1/callback")).rejects.toThrow(
+			/Refusing non-public OAuth endpoint/,
+		);
+		expect(fetchCalled).toBe(false);
+	});
+
+	it("rejects private registration endpoints before the registration POST", async () => {
+		const lookup = vi.spyOn(dns, "lookup");
+		lookup.mockImplementation((async (hostname: string) => {
+			if (hostname === "private.example") return { address: "127.0.0.1", family: 4 };
+			return { address: "1.1.1.1", family: 4 };
+		}) as typeof dns.lookup);
+		let registrationCalled = false;
+		using _hook = hookFetch((input, init) => {
+			const url = String(input);
+			if (url === "https://provider.example/.well-known/oauth-authorization-server") {
+				return new Response(JSON.stringify({ registration_endpoint: "https://private.example/register" }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			if (url === "https://private.example/register") {
+				registrationCalled = true;
+				return new Response(JSON.stringify({ client_id: "unexpected" }), { status: 200 });
+			}
+			if (url === "https://provider.example/authorize") return new Response("ok", { status: 200 });
+			throw new Error(`Unexpected fetch: ${url} ${String(init?.method ?? "GET")}`);
+		});
+
+		const flow = new MCPOAuthFlow({ ...baseConfig, clientId: undefined }, {});
+		await flow.generateAuthUrl("state", "http://127.0.0.1/callback");
+		expect(registrationCalled).toBe(false);
+		expect(flow.resolvedClientId).toBeUndefined();
+	});
+
+	it("propagates abort and network failures from direct token exchange", async () => {
+		const controller = new AbortController();
+		controller.abort(new Error("cancelled"));
+		let fetchCalled = false;
+		using _hook = hookFetch(() => {
+			fetchCalled = true;
+			throw new Error("network failure");
+		});
+		const abortedFlow = new MCPOAuthFlow(baseConfig, { signal: controller.signal });
+		await expect(abortedFlow.exchangeToken("code", "state", "http://127.0.0.1/callback")).rejects.toThrow(
+			"cancelled",
+		);
+		expect(fetchCalled).toBe(false);
+
+		const networkFlow = new MCPOAuthFlow(baseConfig, {});
+		await expect(networkFlow.exchangeToken("code", "state", "http://127.0.0.1/callback")).rejects.toThrow(
+			"network failure",
+		);
+	});
+
 	function driveCallback(onAuthUrl: (authUrl: URL) => Record<string, string>) {
 		return (info: { url: string; instructions?: string }) => {
 			const authUrl = new URL(info.url);

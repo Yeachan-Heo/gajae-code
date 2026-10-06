@@ -531,7 +531,11 @@ export class AcpSdkAdapter {
 		return envelope?.result ?? response;
 	}
 
-	async #requestSession(frame: JsonObject, raw = false, options?: { timeoutMs: number }): Promise<unknown> {
+	async #requestSession(
+		frame: JsonObject,
+		raw = false,
+		options?: { timeoutMs: number; deadline?: number },
+	): Promise<unknown> {
 		const router = this.#router;
 		if (!router)
 			throw new AcpSdkAdapterError(
@@ -609,11 +613,15 @@ export class AcpSdkAdapter {
 		};
 		try {
 			return await this.#client.global(operation, input, options);
-		} catch (error) {
-			// A request can commit in the Broker after the transport response is lost.
-			// Replay the same idempotency key so lifecycle callers recover the committed result.
-			if (!(error instanceof SdkClientError) || error.code !== "uncertain_after_send") throw error;
-			return await this.#client.global(operation, input, options);
+		} catch (firstError) {
+			if (!(firstError instanceof SdkClientError) || firstError.code !== "uncertain_after_send") throw firstError;
+			// Same-key replay joins the Broker's original durable claim, never another create.
+			// Failure to recover does not prove that the committed operation failed.
+			try {
+				return await client.global(operation, input, options);
+			} catch {
+				throw firstError;
+			}
 		}
 	}
 
@@ -653,7 +661,7 @@ export class AcpSdkAdapter {
 		throw new AcpSdkAdapterError("method_not_found", `Unsupported ACP SDK method: ${method}`);
 	}
 
-	async registerProvider(provider: AcpProviderRegistration, timeoutMs?: number): Promise<void> {
+	async registerProvider(provider: AcpProviderRegistration, timeoutMs?: number, deadline?: number): Promise<void> {
 		if (!this.#router)
 			throw new AcpSdkAdapterError(
 				"operation_prohibited",
@@ -672,11 +680,15 @@ export class AcpSdkAdapter {
 				...(previousLeaseId ? { expectedLeaseId: previousLeaseId } : {}),
 			},
 			true,
-			timeoutMs === undefined ? undefined : { timeoutMs },
+			timeoutMs === undefined ? undefined : { timeoutMs, ...(deadline === undefined ? {} : { deadline }) },
 		);
 		const result = object(object(response)?.result) ?? object(response) ?? {};
 		if (typeof result.leaseId !== "string")
 			throw new AcpSdkAdapterError("invalid_reverse_frame", "Provider registration omitted leaseId.");
+		if (this.#closed)
+			throw new AcpSdkAdapterError("connection_closed", "ACP provider activation closed before acknowledgement.");
+		if (deadline !== undefined && Date.now() >= deadline)
+			throw new AcpSdkAdapterError("provider_activation_exhausted", "ACP provider activation deadline elapsed.");
 		this.#leases.set(provider.capability, result.leaseId);
 		if (previousLeaseId && previousLeaseId !== result.leaseId) this.#abortReverseForCapability(provider.capability);
 	}
@@ -705,7 +717,13 @@ export class AcpSdkAdapter {
 						const providerRemainingMs = PROVIDER_ACTIVATION_BUDGET_MS - (Date.now() - startedAt);
 						if (providerRemainingMs <= 0) throw this.#providerActivationExhausted(attempt, startedAt);
 						try {
-							await this.registerProvider(provider, Math.max(1, providerRemainingMs));
+							await this.registerProvider(
+								provider,
+								Math.max(1, providerRemainingMs),
+								startedAt + PROVIDER_ACTIVATION_BUDGET_MS,
+							);
+							if (Date.now() - startedAt >= PROVIDER_ACTIVATION_BUDGET_MS)
+								throw this.#providerActivationExhausted(attempt, startedAt);
 						} catch (error) {
 							if (Date.now() - startedAt >= PROVIDER_ACTIVATION_BUDGET_MS)
 								throw this.#providerActivationExhausted(attempt, startedAt);
