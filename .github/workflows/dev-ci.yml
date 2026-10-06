@@ -386,6 +386,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           bun test ./packages/coding-agent/test/sdk-session-index-lock-contention.test.ts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          bun test ./packages/coding-agent/test/file-lock-signed-identity.test.ts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # The session-state lock's owner-record create/retract protocol depends on
           # Windows handle-sharing semantics (no FILE_SHARE_DELETE on the create
           # descriptor), so its suite is proven here rather than on Ubuntu (#4990).

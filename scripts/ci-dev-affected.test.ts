@@ -257,6 +257,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/session/managed-lock-lease.windows.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/sdk-session-index-fsync.windows.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/sdk-session-index-lock-contention.test.ts");
+		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/file-lock-signed-identity.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/session-state-lock.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/natives/test/windows-runtime-install.windows.test.ts");
 		// The required predicate must textually match the job gate so the aggregate
@@ -1326,6 +1327,7 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"packages/coding-agent/test/sdk-session-directory.windows.test.ts",
 			"packages/coding-agent/test/sdk-session-index-fsync.windows.test.ts",
 			"packages/coding-agent/test/sdk-session-index-lock-contention.test.ts",
+			"packages/coding-agent/test/file-lock-signed-identity.test.ts",
 			"packages/coding-agent/src/sdk/broker/process-incarnation.ts",
 			"packages/coding-agent/src/config/file-lock.ts",
 			// Session-state lock / empty-delete receipt GC bind the native identity
