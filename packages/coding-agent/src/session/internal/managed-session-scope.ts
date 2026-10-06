@@ -3442,9 +3442,17 @@ function isManagedGcPendingCleanupReceiptPath(relativePath: string): boolean {
 function isManagedGcCleanupReceiptPath(relativePath: string): boolean {
 	const prefix = `${MANAGED_INTERNAL_DIRECTORY}/${MANAGED_TOMBSTONES_DIRECTORY}/`;
 	if (!relativePath.startsWith(prefix)) return false;
-	return /\.cleanup-(?:pending|artifacts_removed|completed)-[1-9][0-9]*\.json$/u.test(
-		relativePath.slice(prefix.length),
-	);
+	const match =
+		/^[a-f0-9]{64}\.[a-f0-9]{64}\.cleanup-(pending|artifacts_removed|completed)-([1-9][0-9]*)\.json$/u.exec(
+			relativePath.slice(prefix.length),
+		);
+	if (!match) return false;
+	const attempt = Number(match[2]);
+	return Number.isSafeInteger(attempt) && String(attempt) === match[2] && (match[1] !== "completed" || attempt === 1);
+}
+
+function isManagedGcCleanupLikeName(name: string): boolean {
+	return name.includes(".cleanup-") && name.endsWith(".json");
 }
 
 function managedGcProtocolRecord(
@@ -3700,6 +3708,9 @@ export function managedGcProtocolScopeInspectorForScope(scope: ManagedScope): Ma
 						if (!name || path.basename(name) !== name || name.includes(".jsonl"))
 							throw new Error(`managed_gc_protocol_entry_invalid:${role}/${name}`);
 						const relative = `${MANAGED_INTERNAL_DIRECTORY}/${role}/${name}`;
+						const cleanupLike = role === MANAGED_TOMBSTONES_DIRECTORY && isManagedGcCleanupLikeName(name);
+						if (cleanupLike && !isManagedGcCleanupReceiptPath(relative))
+							throw new Error("managed_gc_protocol_tombstone_role_invalid");
 						const pendingCleanup =
 							role === MANAGED_TOMBSTONES_DIRECTORY && isManagedGcPendingCleanupReceiptPath(relative);
 						let captured: ReturnType<typeof managedGcProtocolFileSnapshot>;

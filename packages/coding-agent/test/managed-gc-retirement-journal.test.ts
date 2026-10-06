@@ -34,6 +34,7 @@ import {
 import {
 	acquireManagedLock,
 	captureManagedFileNoFollow,
+	captureManagedFileNoFollowBounded,
 	MANAGED_SESSION_READ_RANGE_MAX_BYTES,
 	ManagedSessionDescendantStore,
 } from "../src/session/internal/managed-session-storage";
@@ -838,6 +839,70 @@ describe("bounded cleanup receipt replay", () => {
 		expect(fs.existsSync(fixture.transcriptPath)).toBe(true);
 	});
 
+	it("keeps bounded protocol snapshots readable for nested cleanup receipts", async () => {
+		const { fixture } = await injectedCleanupHistory(1);
+		const inspect = managedGcProtocolScopeInspectorForScope(fixture.scope);
+		const snapshots = await inspect([protocolInputFor(fixture.scope)]);
+		expect(snapshots).toHaveLength(1);
+		expect(snapshots[0]?.directories.find(directory => directory.role === "tombstones")?.files).toContainEqual(
+			expect.objectContaining({ name: expect.stringContaining(".cleanup-pending-1.json") }),
+		);
+	});
+
+	it("rejects oversized noncanonical cleanup-like protocol names before opening or allocating the file", async () => {
+		const { fixture, tombstonePath } = await injectedCleanupHistory(1);
+		const directory = path.dirname(tombstonePath);
+		const valid = fs
+			.readdirSync(directory)
+			.find(name => name.includes(".cleanup-pending-") && /-1\.json$/u.test(name));
+		if (!valid) throw new Error("cleanup_receipt_name_missing");
+		const prefix = /^(.*\.cleanup-pending-)\d+\.json$/u.exec(valid);
+		if (!prefix) throw new Error("cleanup_receipt_prefix_missing");
+		const malformedPath = path.join(directory, `${prefix[1]}01.json`);
+		const descriptor = fs.openSync(malformedPath, "wx", 0o600);
+		try {
+			fs.ftruncateSync(descriptor, 64 * 1024 * 1024 + 1);
+		} finally {
+			fs.closeSync(descriptor);
+		}
+		let openedMalformed = false;
+		const originalOpen = fs.openSync.bind(fs);
+		vi.spyOn(fs, "openSync").mockImplementation(((pathname: fs.PathLike, flags: string | number, mode?: number) => {
+			if (typeof pathname === "string" && path.resolve(pathname) === malformedPath) openedMalformed = true;
+			return originalOpen(pathname, flags, mode);
+		}) as typeof fs.openSync);
+		const allocate = vi.spyOn(Buffer, "alloc");
+		const inspect = managedGcProtocolScopeInspectorForScope(fixture.scope);
+		await expect(inspect([protocolInputFor(fixture.scope)])).rejects.toThrow(
+			"managed_gc_protocol_tombstone_role_invalid",
+		);
+		expect(openedMalformed).toBe(false);
+		expect(allocate.mock.calls.some(([size]) => size === 64 * 1024 * 1024 + 1)).toBe(false);
+	});
+
+	it("rejects a zero-link open receipt descriptor before allocating its contents", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "managed-gc-zero-link-"));
+		temporaryRoots.push(root);
+		const pathname = path.join(root, "unlinked-receipt.json");
+		const size = 8 * 1024 * 1024;
+		const seedDescriptor = fs.openSync(pathname, "wx", 0o600);
+		try {
+			fs.ftruncateSync(seedDescriptor, size);
+		} finally {
+			fs.closeSync(seedDescriptor);
+		}
+		const originalOpen = fs.openSync.bind(fs);
+		vi.spyOn(fs, "openSync").mockImplementation(((openedPath: fs.PathLike, flags: string | number, mode?: number) => {
+			const fd = originalOpen(openedPath, flags, mode);
+			if (typeof openedPath === "string" && path.resolve(openedPath) === pathname) fs.unlinkSync(pathname);
+			return fd;
+		}) as typeof fs.openSync);
+		const allocate = vi.spyOn(Buffer, "alloc");
+		expect(() => captureManagedFileNoFollowBounded(pathname, size)).toThrow("source_changed");
+		expect(fs.existsSync(pathname)).toBe(false);
+		expect(allocate.mock.calls.some(([allocationSize]) => allocationSize === size)).toBe(false);
+	});
+
 	it("admits every inventory entry and refuses the 50,001st before replay reads or retains entries", async () => {
 		const { fixture, tombstonePath } = await injectedCleanupHistory(1);
 		const directory = path.dirname(tombstonePath);
@@ -906,7 +971,10 @@ describe("bounded cleanup receipt replay", () => {
 		const originalFstat = fs.fstatSync.bind(fs);
 		const originalLstat = fs.lstatSync.bind(fs);
 		const originalOpendir = fs.opendirSync.bind(fs);
+		const originalOpen = fs.openSync.bind(fs);
+		const originalClose = fs.closeSync.bind(fs);
 		const originalAlloc = Buffer.alloc.bind(Buffer);
+		const descriptorPaths = new Map<number, string>();
 		const withReceiptSize = <T extends fs.Stats | fs.BigIntStats>(stat: T): T =>
 			new Proxy(stat, {
 				get: (value, property) =>
@@ -934,10 +1002,22 @@ describe("bounded cleanup receipt replay", () => {
 				},
 			} as fs.Dir;
 		});
+		vi.spyOn(fs, "openSync").mockImplementation(((pathname: fs.PathLike, flags: string | number, mode?: number) => {
+			const fd = originalOpen(pathname, flags, mode);
+			if (typeof pathname === "string") descriptorPaths.set(fd, path.resolve(pathname));
+			return fd;
+		}) as typeof fs.openSync);
+		vi.spyOn(fs, "closeSync").mockImplementation(fd => {
+			try {
+				originalClose(fd);
+			} finally {
+				descriptorPaths.delete(fd);
+			}
+		});
 		vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, options?: { bigint?: boolean }) => {
-			const pathname = fs.readlinkSync(`/proc/self/fd/${fd}`);
+			const pathname = descriptorPaths.get(fd);
 			const stat = originalFstat(fd, options as never);
-			if (!receiptPaths.has(pathname)) return stat;
+			if (!pathname || !receiptPaths.has(pathname)) return stat;
 			allocatingPath = pathname;
 			return withReceiptSize(stat);
 		}) as typeof fs.fstatSync);

@@ -2981,9 +2981,22 @@ export class ManagedSessionDescendantStore {
 		admitSize?: (size: number) => void,
 	): ManagedFileSnapshot | null {
 		if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new Error("invalid_capture_limit");
+		this.#assertBound();
+		const resolved = this.#resolve(relativePath);
+		if (!this.#authority) {
+			try {
+				this.#assertPathBackedDirectoryChain(resolved);
+				const captured = captureManagedFileNoFollowBounded(resolved, maxBytes, admitSize);
+				this.#assertBound();
+				return captured;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+				throw error;
+			}
+		}
 		let descriptor: SessionStorageRangeSnapshot;
 		try {
-			descriptor = this.readRangeExpectedSync(relativePath, 0, 0);
+			descriptor = this.readRangeExpectedSync(this.#relative(resolved), 0, 0);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
 			throw error;
@@ -2994,7 +3007,7 @@ export class ManagedSessionDescendantStore {
 		if (stat.size > maxBytes) throw new Error("artifact_capacity_exceeded");
 		admitSize?.(stat.size);
 		const bytes = Buffer.alloc(stat.size);
-		const lease = this.openReadLease(relativePath, stat);
+		const lease = this.openReadLease(this.#relative(resolved), stat);
 		let failed = false;
 		let failure: unknown;
 		try {
@@ -3699,7 +3712,8 @@ function captureManagedFileNoFollowLimit(
 	const fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0));
 	try {
 		const before = fs.fstatSync(fd, { bigint: true });
-		if (!before.isFile() || before.nlink > 1) throw new Error("source_changed");
+		if (!before.isFile() || (rejectOversized ? before.nlink !== 1n : before.nlink > 1n))
+			throw new Error("source_changed");
 		const fileSize = Number(before.size);
 		if (!Number.isSafeInteger(fileSize) || fileSize < 0) throw new Error("source_changed");
 		if (rejectOversized && maxBytes !== undefined && fileSize > maxBytes)
