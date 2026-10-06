@@ -12678,7 +12678,14 @@ export class SessionManager {
 
 	async #closePersistWriterInternal(): Promise<void> {
 		if (this.#persistWriter) {
-			await this.#persistWriter.close();
+			const writer = this.#persistWriter;
+			try {
+				await writer.close();
+			} catch (error) {
+				if (writer.getCloseState() === "close_failed_retryable" && !this.#closeRetryOriginError)
+					this.#closeRetryOriginError = writer.getCloseError() ?? toError(error);
+				throw error;
+			}
 			this.#persistWriter = undefined;
 		}
 		this.#persistWriterPath = undefined;
@@ -17025,6 +17032,7 @@ export class SessionManager {
 		}
 		let closeError: unknown;
 		let taskStarted = false;
+		const closeRetryOriginError = this.#closeRetryOriginError;
 		try {
 			await this.#queuePersistTask(
 				async () => {
@@ -17037,6 +17045,19 @@ export class SessionManager {
 				},
 				{ ignoreError: this.#closeRetryPending },
 			);
+			if (
+				closeRetryOriginError &&
+				!this.#persistWriter &&
+				!this.#needsFullRewriteOnNextPersist &&
+				!this.#strictResumeMutationPending &&
+				this.#persistError === closeRetryOriginError
+			) {
+				// Only the original certified writer-close failure becomes obsolete
+				// after closure. Lifecycle/publication errors must remain observable.
+				this.#persistError = undefined;
+				this.#persistErrorReported = false;
+				this.#closeRetryOriginError = undefined;
+			}
 			this.#closeRetryPending = false;
 			this.#retireEphemeralArtifacts();
 			await this.#drainEphemeralArtifactCleanups();

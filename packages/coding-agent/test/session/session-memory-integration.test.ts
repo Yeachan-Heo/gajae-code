@@ -3698,6 +3698,129 @@ describe("whole-session persistence freshness", () => {
 			await expect(manager.close()).rejects.toThrow("session_persistence_lifecycle_changed");
 		}
 	});
+	it.each([1, 2])("clears the original certified writer-close error after %i failed attempts", async failures => {
+		class RetryableCloseStorage extends MemorySessionStorage {
+			closeFailures = failures;
+			closeDispatches = 0;
+			override openWriter(filePath: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter {
+				if (filePath.includes(".spill.")) return super.openWriter(filePath, options);
+				return super.openWriter(filePath, {
+					...options,
+					closeAdapter: {
+						close: () => {
+							this.closeDispatches++;
+							if (this.closeFailures > 0) {
+								this.closeFailures--;
+								throw new SessionStorageWriterRetryableCloseError(
+									`injected_retryable_close_${this.closeDispatches}`,
+								);
+							}
+						},
+					},
+				});
+			}
+		}
+		const storage = new RetryableCloseStorage();
+		const sessionFile = "/sessions/retryable-close.jsonl";
+		storage.writeTextSync(
+			sessionFile,
+			`${JSON.stringify({ type: "session", version: 5, id: "retryable-close", timestamp: "0", cwd: "/cwd" })}\n`,
+		);
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"off",
+		);
+		const entryId = manager.appendCustomEntry("retryable-close", { value: 1 });
+		await manager.flush();
+		for (let attempt = 1; attempt <= failures; attempt++) {
+			await expect(manager.close()).rejects.toThrow(`injected_retryable_close_${attempt}`);
+		}
+		await expect(manager.close()).resolves.toBeUndefined();
+		expect(storage.closeDispatches).toBe(failures + 1);
+		expect(manager.getEntries()).toHaveLength(0);
+		expect(storage.readTextSync(sessionFile)).toContain(`"id":"${entryId}"`);
+		await expect(manager.close()).resolves.toBeUndefined();
+		expect(storage.closeDispatches).toBe(failures + 1);
+	});
+	it("retires a close-origin error after rewrite debt resolves", async () => {
+		class CloseSequenceStorage extends MemorySessionStorage {
+			readonly events: string[] = [];
+			private sessionCloseFailures = 1;
+			private rewriteCloseFailures = 1;
+			sessionCloseDispatches = 0;
+			rewriteCloseDispatches = 0;
+
+			override openWriter(filePath: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter {
+				if (filePath.includes(".spill.")) return super.openWriter(filePath, options);
+				return super.openWriter(filePath, {
+					...options,
+					closeAdapter: {
+						close: () => {
+							if (filePath.includes(".tmp")) {
+								this.rewriteCloseDispatches++;
+								this.events.push(`rewrite-close-${this.rewriteCloseDispatches}`);
+								if (this.rewriteCloseFailures > 0) {
+									this.rewriteCloseFailures--;
+									throw new Error("rewrite_debt_error_y");
+								}
+								return;
+							}
+							this.sessionCloseDispatches++;
+							this.events.push(`session-close-${this.sessionCloseDispatches}`);
+							if (this.sessionCloseFailures > 0) {
+								this.sessionCloseFailures--;
+								throw new SessionStorageWriterRetryableCloseError("writer_close_error_x");
+							}
+						},
+					},
+				});
+			}
+		}
+
+		const storage = new CloseSequenceStorage();
+		const sessionFile = "/sessions/retryable-close-rewrite-debt.jsonl";
+		storage.writeTextSync(
+			sessionFile,
+			`${[
+				{ type: "session", version: 5, id: "retryable-close-rewrite-debt", timestamp: "0", cwd: "/cwd" },
+				{
+					type: "message",
+					id: "existing",
+					parentId: null,
+					timestamp: "0",
+					message: { role: "user", content: "existing", timestamp: 0 },
+				},
+			]
+				.map(entry => JSON.stringify(entry))
+				.join("\n")}\n`,
+		);
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"off",
+		);
+
+		manager.appendCustomEntry("initial", { value: 1 });
+		await manager.flush();
+		const existing = manager.getEntry("existing");
+		if (existing?.type !== "message") throw new Error("test fixture message missing");
+		manager.applyEntryMessageUpdates([existing]);
+
+		await expect(manager.close()).rejects.toThrow("writer_close_error_x");
+		await expect(manager.close()).rejects.toThrow("rewrite_debt_error_y");
+		expect(storage.events).toEqual(["session-close-1", "session-close-2", "rewrite-close-1"]);
+
+		await expect(manager.close()).resolves.toBeUndefined();
+		expect(storage.events).toEqual(["session-close-1", "session-close-2", "rewrite-close-1", "rewrite-close-2"]);
+		const closeDispatchesAfterRecovery = storage.sessionCloseDispatches + storage.rewriteCloseDispatches;
+		await expect(manager.close()).resolves.toBeUndefined();
+		expect(storage.sessionCloseDispatches + storage.rewriteCloseDispatches).toBe(closeDispatchesAfterRecovery);
+	});
 	it("reprepares queued patches when a direct append invalidates their persistence token", async () => {
 		const storage = new MemorySessionStorage();
 		const sessionFile = "/sessions/patch-race.jsonl";
