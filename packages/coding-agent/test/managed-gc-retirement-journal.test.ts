@@ -910,7 +910,7 @@ describe("managed GC retirement journal", () => {
 		});
 		const candidate = pendingReceipt(fixture, "valid_large_continuation_candidate");
 		const outcome = candidate.taskArtifactOwnerRetirementOutcome;
-		if (!outcome || outcome.kind !== "uncertain") throw new Error("fixture_uncertain_outcome_missing");
+		if (outcome?.kind !== "uncertain") throw new Error("fixture_uncertain_outcome_missing");
 		expect(candidate.taskArtifactOwnerRetirementContinuation).toBe(outcome.continuation);
 		expect(outcome.continuation.retainedTreeSnapshot).toBe(fixture.evidence.treeSnapshot);
 
