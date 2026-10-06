@@ -143,7 +143,9 @@ export function registerTrustedModelCloneInternal(
 
 	// If a clone was provided, merge it with the built identity
 	// (identity fields take precedence from the trusted snapshot)
-	const result = clone ? ({ ...clone, ...builtIdentity } as any) : builtIdentity;
+	const result = clone
+		? ({ ...clone, ...builtIdentity } as { api: string; provider: string; id: string; baseUrl: string | undefined })
+		: builtIdentity;
 
 	// Create a snapshot for the final result with the actual baseUrl
 	const resultSnapshot: ModelIdentitySnapshot = {

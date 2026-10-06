@@ -516,6 +516,13 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 				delete (block as Block).index;
 				delete (block as Block).partialJson;
 			}
+			// On ordinary errors, emit pending tool call events before the error terminal
+			// This preserves content consistency: completed tools should emit their events
+			for (const { toolCall, index } of pendingToolCalls) {
+				stream.push({ type: "toolcall_end", contentIndex: index, toolCall, partial: output });
+			}
+			pendingToolCalls.length = 0;
+
 			output.stopReason = options.signal?.aborted ? "aborted" : "error";
 			// The non-eventstream diagnostic embeds untrusted body text; never parse a status out of it.
 			output.errorStatus = error instanceof KiroNonEventStreamError ? undefined : extractHttpStatusFromError(error);

@@ -495,4 +495,77 @@ describe("kiro-codewhisperer wire protocol", () => {
 		expect(toolcallEvent?.toolCall.name).toBe("test-tool");
 		expect(toolcallEvent?.toolCall.arguments).toEqual({ data: "world" });
 	});
+
+	test("Bearer token emits tool events before ordinary error", async () => {
+		const context: Context = {
+			messages: [{ role: "user", content: "test", timestamp: 1 }],
+		};
+
+		// Prepare mock response: tool event followed by error in metadata event
+		const toolEventFrame = encodeFrame(
+			{ ":message-type": "event", ":event-type": "toolUseEvent" },
+			new TextEncoder().encode(
+				JSON.stringify({
+					toolUseId: "tool-123",
+					name: "test-tool",
+					input: '{"action":"test"}',
+					stop: true,
+				}),
+			),
+		);
+
+		// Error frame with message indicating an error
+		const errorEventFrame = encodeFrame(
+			{ ":message-type": "event", ":event-type": "messageMetadataEvent" },
+			new TextEncoder().encode(
+				JSON.stringify({
+					error: { message: "Rate limit exceeded" },
+				}),
+			),
+		);
+
+		mockFetch.mockImplementation(async () => {
+			return new Response(
+				new ReadableStream({
+					start(controller) {
+						controller.enqueue(toolEventFrame);
+						controller.enqueue(errorEventFrame);
+						controller.close();
+					},
+				}),
+				{
+					status: 200,
+					headers: { "content-type": "application/vnd.amazon.eventstream" },
+				},
+			);
+		});
+
+		const stream = streamKiroCodeWhisperer(mockModel, context, {
+			apiKey: "test-token",
+		});
+
+		const events: any[] = [];
+		try {
+			for await (const event of stream) {
+				events.push(event);
+			}
+		} catch {
+			// Error caught in events
+		}
+
+		// When an ordinary error follows a tool, tool events should be emitted before the error
+		const toolcallEnd = events.find(e => e.type === "toolcall_end");
+		const errorEvent = events.find(e => e.type === "error");
+
+		expect(toolcallEnd).toBeDefined();
+		expect(errorEvent).toBeDefined();
+
+		// Verify tool event comes before error
+		const toolEndIdx = events.findIndex(e => e.type === "toolcall_end");
+		const errorIdx = events.findIndex(e => e.type === "error");
+
+		if (toolEndIdx >= 0 && errorIdx >= 0) {
+			expect(toolEndIdx).toBeLessThan(errorIdx);
+		}
+	});
 });

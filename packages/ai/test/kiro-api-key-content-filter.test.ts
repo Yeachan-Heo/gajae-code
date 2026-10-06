@@ -935,4 +935,83 @@ describe("reasoning-before-answer contentIndex invariant #6151", () => {
 		expect(textIndices.size).toBe(1);
 		expect([...textIndices][0]).toBe(0);
 	});
+
+	test("ksk_ emits tool call events before ordinary error", async () => {
+		const emittedEvents: Array<{ type: string; error?: string }> = [];
+
+		globalThis.fetch = (async () => {
+			// Tool-use frame followed by ordinary error (not refusal)
+			const responseBody =
+				JSON.stringify({ toolUseId: "tool-1", name: "read_file", input: '{"path":"/tmp/test"}', stop: true }) +
+				JSON.stringify({ error: "rate_limit", message: "Too many requests" });
+			return new Response(responseBody, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEvents.push({
+					type: event.type,
+					error: event.type === "error" && "error" in event ? (event.error as any).errorMessage : undefined,
+				});
+			}
+		} catch {
+			// Stream may throw; errors are captured in events
+		}
+
+		globalThis.fetch = originalFetch;
+
+		// When an ordinary error follows a tool, tool events should be emitted before the error
+		const toolcallStart = emittedEvents.find(e => e.type === "toolcall_start");
+		const toolcallEnd = emittedEvents.find(e => e.type === "toolcall_end");
+		const errorEvent = emittedEvents.find(e => e.type === "error");
+
+		expect(toolcallStart).toBeDefined();
+		expect(toolcallEnd).toBeDefined();
+		expect(errorEvent).toBeDefined();
+
+		// Verify tool events come before error
+		const toolStartIdx = emittedEvents.findIndex(e => e.type === "toolcall_start");
+		const toolEndIdx = emittedEvents.findIndex(e => e.type === "toolcall_end");
+		const errorIdx = emittedEvents.findIndex(e => e.type === "error");
+
+		expect(toolStartIdx).toBeLessThan(errorIdx);
+		expect(toolEndIdx).toBeLessThan(errorIdx);
+	});
+
+	test("ksk_ drops tool events on refusal (no error event)", async () => {
+		const emittedEvents: Array<{ type: string }> = [];
+
+		globalThis.fetch = (async () => {
+			// Tool-use frame followed by refusal (content filtered)
+			const responseBody =
+				JSON.stringify({ toolUseId: "tool-1", name: "read_file", input: '{"path":"/tmp/test"}', stop: true }) +
+				JSON.stringify({
+					stopReason: "CONTENT_FILTERED",
+					stopDetails: { refusal: { category: "CYBER", explanation: "Malicious" } },
+				});
+			return new Response(responseBody, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEvents.push({ type: event.type });
+			}
+		} catch {
+			// Stream may throw; errors are captured in events
+		}
+
+		globalThis.fetch = originalFetch;
+
+		// On refusal, tool events should not be emitted
+		const toolcallStart = emittedEvents.find(e => e.type === "toolcall_start");
+		const toolcallEnd = emittedEvents.find(e => e.type === "toolcall_end");
+
+		expect(toolcallStart).toBeUndefined();
+		expect(toolcallEnd).toBeUndefined();
+		// Error event should be present for refusal
+		const errorEvent = emittedEvents.find(e => e.type === "error");
+		expect(errorEvent).toBeDefined();
+	});
 });

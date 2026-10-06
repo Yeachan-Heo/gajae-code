@@ -1040,6 +1040,11 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 							return;
 						}
 					} else if (event.type === "error") {
+						// On ordinary errors, flush pending tool events before the error terminal
+						// (refusals drop them, but ordinary errors preserve content consistency)
+						addToolToBlocks();
+						emitPendingToolCalls();
+
 						// Preserve any already-accumulated text in the error context
 						const accumulatedText = blocks
 							.filter((b): b is TextContent => b.type === "text")
