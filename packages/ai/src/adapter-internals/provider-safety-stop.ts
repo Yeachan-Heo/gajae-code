@@ -272,6 +272,15 @@ const STRUCTURED_REFUSAL_SIGNALS: ReadonlySet<string> = new Set([
  * pass those seams explicitly and fail closed when one is present. An
  * unrecognized structured signal fails closed, so adapter mistakes remain
  * fallback-eligible.
+ *
+ * Trust assumption: Providers that do not accept caller-controlled transport
+ * seams (e.g., Kiro's kiro-codewhisperer-stream and kiro-api-key) assume that
+ * globalThis.fetch is the system-provided implementation and is not replaced
+ * by user code after module load. This is safe in runtime contexts (production,
+ * secure integration tests) but may not hold in test environments where modules
+ * are loaded once and globalThis.fetch is mocked for multiple test cases.
+ * Tests must mock providers at a higher level or use the provider test harness
+ * rather than relying on globalThis.fetch replacement after import.
  */
 export function mintProviderSafetyStop(
 	message: AssistantMessage,

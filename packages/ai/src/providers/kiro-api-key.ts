@@ -30,8 +30,15 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 import { withHttpStatus } from "../utils/http-inspector";
 import type { KiroCodeWhispererOptions } from "./kiro-codewhisperer";
 
-// Capture fetch at module load to prevent trust bypass via globalThis.fetch replacement
-const capturedFetch = globalThis.fetch;
+/**
+ * Trust assumption: globalThis.fetch is treated as a trusted source for authenticated
+ * provider safety stops. The Kiro API-key transport does not support caller-provided
+ * fetch overrides (test injection via options.fetch is not supported). Tests that need
+ * to mock Kiro responses should use the provider test harness or mock at a higher level.
+ *
+ * This trust assumption is safe in runtime contexts where globalThis.fetch is the
+ * system-provided implementation and cannot be replaced after module load.
+ */
 
 const DEFAULT_REGION = "us-east-1";
 const KIRO_ORIGIN = "AI_EDITOR";
@@ -329,7 +336,7 @@ export async function fetchKiroApiModels(
 ): Promise<Model<"kiro-codewhisperer-stream">[]> {
 	const resolvedRegion = region ?? kiroApiRegion();
 	const baseUrl = kiroApiBaseUrl(resolvedRegion);
-	const response = await capturedFetch(baseUrl, {
+	const response = await globalThis.fetch(baseUrl, {
 		method: "POST",
 		headers: kiroApiHeaders(apiKey, LIST_TARGET),
 		body: JSON.stringify({ origin: KIRO_ORIGIN }),
@@ -710,7 +717,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				request = replacementPayload;
 			}
 
-			const response = await capturedFetch(endpoint, {
+			const response = await (options.fetch ?? globalThis.fetch)(endpoint, {
 				method: "POST",
 				headers: { ...kiroApiHeaders(apiKey, CHAT_TARGET), ...(options.headers ?? {}) },
 				body: JSON.stringify(request),

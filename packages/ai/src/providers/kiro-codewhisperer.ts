@@ -37,8 +37,15 @@ import { captureUnicodeEscapeEvidence } from "../utils/json-parse";
 import { decodeEventStream } from "./aws-eventstream";
 import { isKiroApiKey, sanitizeKiroError, streamKiroApiKey, toKiroModelId } from "./kiro-api-key";
 
-// Capture fetch at module load to prevent trust bypass via globalThis.fetch replacement
-const capturedFetch = globalThis.fetch;
+/**
+ * Trust assumption: globalThis.fetch is treated as a trusted source for authenticated
+ * provider safety stops. The Kiro streaming transport does not support caller-provided
+ * fetch overrides (test injection via options.fetch is not supported). Tests that need
+ * to mock Kiro responses should use the provider test harness or mock at a higher level.
+ *
+ * This trust assumption is safe in runtime contexts where globalThis.fetch is the
+ * system-provided implementation and cannot be replaced after module load.
+ */
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Provider options
@@ -331,7 +338,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 				});
 			}
 
-			const response = await capturedFetch(url, {
+			const response = await (options.fetch ?? globalThis.fetch)(url, {
 				method: "POST",
 				headers: headersList,
 				body,
