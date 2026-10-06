@@ -2826,6 +2826,48 @@ class ManagedAttemptTransaction {
 		this.#stagedBytes += retainedBytes;
 	}
 
+	hasObservableAssistantOutput(): boolean {
+		return this.#batch.some(item => {
+			if (item.type === "assistant_event") {
+				if (managedAssistantMessageHasContent(item.message)) return true;
+				const event = item.event;
+				if (
+					event.type === "text_delta" ||
+					event.type === "thinking_delta" ||
+					event.type === "reasoning_summary_delta" ||
+					event.type === "text_end" ||
+					event.type === "thinking_end" ||
+					event.type === "reasoning_summary_end"
+				) {
+					if (event.type === "text_end" || event.type === "thinking_end" || event.type === "reasoning_summary_end")
+						return event.content.length > 0;
+					return event.delta.length > 0;
+				}
+				return event.type === "toolcall_start" || event.type === "toolcall_delta" || event.type === "toolcall_end";
+			}
+			const event = item.event;
+			if ("message" in event && managedAssistantMessageHasContent(event.message)) return true;
+			if (event.type === "message_update") {
+				const update = event.assistantMessageEvent;
+				if (
+					update.type === "text_delta" ||
+					update.type === "thinking_delta" ||
+					update.type === "reasoning_summary_delta"
+				)
+					return update.delta.length > 0;
+				if (update.type === "text_end" || update.type === "thinking_end" || update.type === "reasoning_summary_end")
+					return update.content.length > 0;
+				return (
+					update.type === "toolcall_start" || update.type === "toolcall_delta" || update.type === "toolcall_end"
+				);
+			}
+			return (
+				event.type === "tool_execution_start" ||
+				event.type === "tool_execution_update" ||
+				event.type === "tool_execution_end"
+			);
+		});
+	}
 	flush(): void {
 		if (this.#discarded) return;
 		for (const item of this.#batch) {
