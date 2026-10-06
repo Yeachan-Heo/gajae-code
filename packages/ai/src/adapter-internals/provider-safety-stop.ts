@@ -5,34 +5,32 @@ const PROVIDER_SAFETY_STOP_ADAPTER_BRAND = Symbol("provider-safety-stop-adapter-
 const PROVIDER_SAFETY_STOP_INVOCATION_BRAND = Symbol("provider-safety-stop-invocation-brand");
 const PROVIDER_SAFETY_STOP_INVOCATION_KEY = Symbol("provider-safety-stop-invocation");
 
-type ProviderSafetyStopModelIdentity = Pick<Model<Api>, "api" | "provider" | "id" | "baseUrl">;
-const trustedProviderSafetyStopModels = new WeakMap<object, string>();
-const trustedProviderSafetyStopIdentities = new Set<string>();
-
-function providerSafetyStopModelIdentity(model: ProviderSafetyStopModelIdentity): string {
-	return `${model.api}\u0000${model.provider}\u0000${model.id}\u0000${model.baseUrl ?? ""}`;
-}
+const trustedProviderSafetyStopModels = new WeakMap<object, true>();
 
 /** Register an immutable catalog identity for first-party provider dispatch. */
 export function registerProviderSafetyStopModel(model: Model<Api>): void {
 	try {
-		const identity = providerSafetyStopModelIdentity(model);
-		trustedProviderSafetyStopModels.set(model, identity);
-		trustedProviderSafetyStopIdentities.add(identity);
+		trustedProviderSafetyStopModels.set(model, true);
 	} catch {
 		// A malformed/hostile model must remain fallback-eligible.
+	}
+}
+
+/**
+ * Register a finalized clone as trusted when the original catalog model is trusted.
+ * Called when a model is cloned during finalization (e.g., spread operator, object merge).
+ * Only trusts the clone if the original is in the trusted registry.
+ */
+export function registerTrustedModelClone(original: object, clone: object): void {
+	if (trustedProviderSafetyStopModels.has(original)) {
+		trustedProviderSafetyStopModels.set(clone, true);
 	}
 }
 
 /** Verify that a model is the unchanged identity of a bundled catalog entry. */
 export function isProviderSafetyStopModelTrusted(model: unknown): boolean {
 	if (typeof model !== "object" || model === null) return false;
-	try {
-		const identity = providerSafetyStopModelIdentity(model as ProviderSafetyStopModelIdentity);
-		return trustedProviderSafetyStopIdentities.has(identity);
-	} catch {
-		return false;
-	}
+	return trustedProviderSafetyStopModels.has(model);
 }
 
 export type ProviderSafetyStopAdapterCapability = {

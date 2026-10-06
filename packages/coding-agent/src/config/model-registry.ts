@@ -33,6 +33,7 @@ import {
 	PROVIDER_DESCRIPTORS,
 	readModelCache,
 	registerCustomApi,
+	registerTrustedModelClone,
 	resolveOAuthStorageProvider,
 	type SimpleStreamOptions,
 	type ThinkingConfig,
@@ -5005,6 +5006,8 @@ export class ModelRegistry {
 			}
 			const generated = this.#generatedAuthHeaders.get(models[index]!);
 			if (generated) this.#generatedAuthHeaders.set(result[index]!, generated);
+			// Register finalized clone as trusted if the original is trusted
+			if (result[index]) registerTrustedModelClone(models[index]!, result[index]);
 		}
 		return result;
 	}
