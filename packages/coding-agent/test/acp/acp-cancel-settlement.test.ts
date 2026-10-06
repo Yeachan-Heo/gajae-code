@@ -1632,16 +1632,34 @@ test("an exact terminal reserved during recovery cannot let a stale query settle
 });
 
 test("an uncertain abort settles an exact reserved terminal before returning", async () => {
-	const fixture = await createFixture({ cancelSettlementGraceMs: 25 });
-	const cancel = vi.spyOn(AcpSdkAdapter.prototype, "cancel").mockRejectedValue(
-		new SdkClientError("uncertain_after_send", "SDK abort response was lost after dispatch.", {
+	const fixture = await createFixture({
+		cancelSettlementGraceMs: 25,
+		terminalOnAbortBeforeAcknowledgement: "end_turn",
+	});
+	const abortOutcome = Promise.withResolvers<void>();
+	const sendAbort = AcpSdkAdapter.prototype.cancel;
+	// The abort reaches the host, whose exact terminal is reserved before the abort response is lost.
+	const cancel = vi.spyOn(AcpSdkAdapter.prototype, "cancel").mockImplementation(async function (
+		this: AcpSdkAdapter,
+		...args: Parameters<AcpSdkAdapter["cancel"]>
+	) {
+		await sendAbort.apply(this, args);
+		await abortOutcome.promise;
+		throw new SdkClientError("uncertain_after_send", "SDK abort response was lost after dispatch.", {
 			operation: "turn.abort",
-		}),
-	);
+		});
+	});
 	try {
+		let promptSettled = false;
 		const pending = prompt(fixture, "reserved terminal must settle uncertain abort").then(
-			resolved => ({ resolved }),
-			(error: unknown) => ({ rejected: error as { code?: string } }),
+			resolved => {
+				promptSettled = true;
+				return { resolved };
+			},
+			(error: unknown) => {
+				promptSettled = true;
+				return { rejected: error as { code?: string } };
+			},
 		);
 		await bounded(fixture.promptDelivered, "prompt delivery");
 		fixture.sendToolStart("reserved-terminal-pending-tool");
@@ -1649,13 +1667,14 @@ test("an uncertain abort settles an exact reserved terminal before returning", a
 			() => ({ resolved: true }),
 			(error: unknown) => ({ rejected: error as { code?: string } }),
 		);
-		await waitFor(() => cancel.mock.calls.length === 1, "uncertain abort dispatch");
-		fixture.sendStopped("end_turn");
-		expect(await bounded(pending, "reserved terminal prompt settlement")).toEqual({
-			resolved: { stopReason: "cancelled" },
-		});
+		await bounded(fixture.terminalPublished, "reserved terminal before uncertain abort");
+		expect(promptSettled).toBe(false);
+		abortOutcome.resolve();
 		expect(await bounded(cancellation, "uncertain abort after reserved terminal")).toEqual({
 			resolved: true,
+		});
+		expect(await bounded(pending, "reserved terminal prompt settlement")).toEqual({
+			resolved: { stopReason: "cancelled" },
 		});
 
 		const successor = prompt(fixture, "successor after reserved terminal settlement");
@@ -1663,22 +1682,40 @@ test("an uncertain abort settles an exact reserved terminal before returning", a
 		fixture.sendStopped("end_turn");
 		expect(await bounded(successor, "successor terminal")).toEqual({ stopReason: "end_turn" });
 	} finally {
+		abortOutcome.resolve();
 		cancel.mockRestore();
 		fixture.dispose();
 	}
 });
 
 test("a failed overlapping cancel keeps the terminal fenced until the wave settles", async () => {
-	const fixture = await createFixture();
-	const secondCancel = Promise.withResolvers<Record<string, unknown>>();
+	const fixture = await createFixture({ terminalOnAbortBeforeAcknowledgement: "end_turn" });
+	const firstOutcome = Promise.withResolvers<void>();
+	const secondOutcome = Promise.withResolvers<void>();
+	const sendAbort = AcpSdkAdapter.prototype.cancel;
 	let cancelCalls = 0;
-	const cancel = vi.spyOn(AcpSdkAdapter.prototype, "cancel").mockImplementation(async () => {
+	// Only the first attempt reaches the host, so its terminal is deferred while both attempts are pending.
+	const cancel = vi.spyOn(AcpSdkAdapter.prototype, "cancel").mockImplementation(async function (
+		this: AcpSdkAdapter,
+		...args: Parameters<AcpSdkAdapter["cancel"]>
+	) {
 		cancelCalls++;
-		if (cancelCalls === 1)
+		if (cancelCalls === 1) {
+			await sendAbort.apply(this, args);
+			await firstOutcome.promise;
 			throw new SdkClientError("abort_unacknowledged", "The first cancel was not acknowledged.", {
 				operation: "turn.abort",
 			});
-		return await secondCancel.promise;
+		}
+		await secondOutcome.promise;
+		return {
+			ok: true,
+			selection: "turn",
+			turn: "stopped",
+			ownedWork: "left_running",
+			automaticDelivery: "enabled",
+			resumeOnOwnedCompletion: true,
+		};
 	});
 	try {
 		let promptSettled = false;
@@ -1703,7 +1740,8 @@ test("a failed overlapping cancel keeps the terminal fenced until the wave settl
 			(error: unknown) => ({ rejected: error as { code?: string } }),
 		);
 		await waitFor(() => cancelCalls === 2, "overlapping cancel attempts");
-		fixture.sendStopped("end_turn");
+		await bounded(fixture.terminalPublished, "terminal deferred during cancel wave");
+		firstOutcome.resolve();
 		expect(await bounded(firstCancel, "first failed cancel")).toEqual({
 			rejected: expect.objectContaining({ code: "abort_unacknowledged" }),
 		});
@@ -1715,14 +1753,7 @@ test("a failed overlapping cancel keeps the terminal fenced until the wave settl
 		expect(blocked).toMatchObject({ code: "conflict" });
 		expect(fixture.promptDeliveryCount()).toBe(1);
 
-		secondCancel.resolve({
-			ok: true,
-			selection: "turn",
-			turn: "stopped",
-			ownedWork: "left_running",
-			automaticDelivery: "enabled",
-			resumeOnOwnedCompletion: true,
-		});
+		secondOutcome.resolve();
 		expect(await bounded(secondCancellation, "successful overlapping cancel")).toEqual({
 			resolved: true,
 		});
@@ -1730,7 +1761,8 @@ test("a failed overlapping cancel keeps the terminal fenced until the wave settl
 			resolved: { stopReason: "cancelled" },
 		});
 	} finally {
-		secondCancel.resolve({});
+		firstOutcome.resolve();
+		secondOutcome.resolve();
 		cancel.mockRestore();
 		fixture.dispose();
 	}
