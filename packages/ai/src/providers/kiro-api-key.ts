@@ -638,13 +638,23 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 ): AssistantMessageEventStream => {
 	const stream = new AssistantMessageEventStream();
 	(async () => {
+		// Snapshot model identity fields at stream start to prevent TOCTOU attacks where
+		// a Proxy/getter model could return different values on successive reads.
+		const modelSnapshot = Object.freeze({
+			provider: model.provider,
+			id: model.id,
+			wireModelId: model.wireModelId,
+			baseUrl: model.baseUrl,
+			api: "kiro-codewhisperer-stream" as Api,
+		});
+
 		const apiKey = options.apiKey?.trim() ?? "";
 		const output: AssistantMessage = {
 			role: "assistant",
 			content: [],
-			api: "kiro-codewhisperer-stream" as Api,
-			provider: model.provider,
-			model: model.id,
+			api: modelSnapshot.api,
+			provider: modelSnapshot.provider,
+			model: modelSnapshot.id,
 			usage: {
 				input: 0,
 				output: 0,
@@ -666,11 +676,24 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 					"Kiro API key missing. Set KIRO_API_KEY to a ksk_ key from https://app.kiro.dev/settings/api-keys.",
 				);
 			}
-			const configuredBaseUrl = model.baseUrl;
+			const configuredBaseUrl = modelSnapshot.baseUrl;
 			const usesExplicitBaseUrl = Boolean(configuredBaseUrl) && !isRegionDerivedKiroApiBaseUrl(configuredBaseUrl);
 			const endpoint = configuredBaseUrl || kiroApiBaseUrl(kiroApiRegion(options));
-			let request = buildApiKeyRequest(model, context, options);
-			const replacementPayload = await options?.onPayload?.(request, model, options?.attemptScope, options?.signal);
+			// Create a snapshotted model view for downstream functions to use
+			const snapshotModel: Model<"kiro-codewhisperer-stream"> = {
+				...model,
+				provider: modelSnapshot.provider,
+				id: modelSnapshot.id,
+				baseUrl: modelSnapshot.baseUrl,
+				wireModelId: modelSnapshot.wireModelId,
+			};
+			let request = buildApiKeyRequest(snapshotModel, context, options);
+			const replacementPayload = await options?.onPayload?.(
+				request,
+				snapshotModel,
+				options?.attemptScope,
+				options?.signal,
+			);
 			if (replacementPayload !== undefined) {
 				request = replacementPayload;
 			}

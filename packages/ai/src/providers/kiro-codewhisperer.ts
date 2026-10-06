@@ -170,10 +170,18 @@ type Block = (TextContent | ToolCall) & { index?: number; partialJson?: string }
 // Refusal handling (shared between bearer token and API-key paths)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Immutable snapshot of model identity fields to prevent TOCTOU vulnerabilities. */
+type ModelIdentitySnapshot = Readonly<{
+	provider: string;
+	id: string;
+	api: Api;
+	baseUrl: string | undefined;
+}>;
+
 function handleKiroRefusal(
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
-	_model: Model<Api>,
+	_modelSnapshot: ModelIdentitySnapshot,
 	refusal: { category?: string; explanation?: string } | undefined,
 	options?: KiroCodeWhispererOptions,
 ): boolean {
@@ -230,6 +238,15 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 	const stream = new AssistantMessageEventStream();
 
 	(async () => {
+		// Snapshot model identity fields at stream start to prevent TOCTOU attacks where
+		// a Proxy/getter model could return different values on successive reads.
+		const modelSnapshot: ModelIdentitySnapshot = Object.freeze({
+			provider: model.provider,
+			id: model.id,
+			api: "kiro-codewhisperer-stream" as Api,
+			baseUrl: model.baseUrl,
+		});
+
 		const startTime = Date.now();
 		let firstTokenTime: number | undefined;
 		// Accumulator for streaming tool input fragments, keyed by toolUseId
@@ -240,9 +257,9 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 		const output: AssistantMessage = {
 			role: "assistant",
 			content: [],
-			api: "kiro-codewhisperer-stream" as Api,
-			provider: model.provider,
-			model: model.id,
+			api: modelSnapshot.api,
+			provider: modelSnapshot.provider,
+			model: modelSnapshot.id,
 			usage: {
 				input: 0,
 				output: 0,
@@ -375,7 +392,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 						if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 						// Clear pending tool calls without emitting events (on refusal, drop any pending tool)
 						pendingToolCalls.length = 0;
-						handleKiroRefusal(output, stream, model, ev.stopDetails.refusal, options);
+						handleKiroRefusal(output, stream, modelSnapshot, ev.stopDetails.refusal, options);
 						stream.end();
 						return;
 					}
@@ -387,7 +404,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 						if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 						// Clear pending tool calls without emitting events (on refusal, drop any pending tool)
 						pendingToolCalls.length = 0;
-						handleKiroRefusal(output, stream, model, ev.stopDetails.refusal, options);
+						handleKiroRefusal(output, stream, modelSnapshot, ev.stopDetails.refusal, options);
 						stream.end();
 						return;
 					}
