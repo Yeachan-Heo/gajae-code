@@ -34,7 +34,6 @@ import {
 	PROVIDER_DESCRIPTORS,
 	readModelCache,
 	registerCustomApi,
-	registerFinalizedModelClone,
 	resolveOAuthStorageProvider,
 	type SimpleStreamOptions,
 	type ThinkingConfig,
@@ -51,6 +50,8 @@ import {
 	readBoundedModelsJson,
 	resolveLoopbackOpenAIBaseUrl,
 } from "@gajae-code/ai/utils/discovery/openai-compatible";
+// Internal-only: registerFinalizedModelClone is not part of the public @gajae-code/ai surface
+import { registerFinalizedModelClone } from "@gajae-code/ai/utils/trusted-model-clone";
 
 // Sentinels for local-only OAuth tokens — declared inline to avoid loading provider
 // modules at startup. Must match the provider OAuth modules.

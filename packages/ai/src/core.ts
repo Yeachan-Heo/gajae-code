@@ -43,5 +43,7 @@ export * from "./utils/retry";
 export * from "./utils/schema";
 export * from "./utils/sqlite-errors";
 export * from "./utils/tool-choice-capability";
-export * from "./utils/trusted-model-clone";
+// createTrustedStrippedModelClone is exported for public use
+// registerFinalizedModelClone is internal-only and not exported
+export { createTrustedStrippedModelClone } from "./utils/trusted-model-clone";
 export * from "./utils/validation";

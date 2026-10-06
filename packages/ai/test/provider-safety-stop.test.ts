@@ -371,5 +371,71 @@ describe("provider safety-stop provenance authority", () => {
 			// Stripped clone is still trusted
 			expect(isProviderSafetyStopModelTrusted(stripped)).toBe(true);
 		});
+
+		test("registerFinalizedModelClone rejects getter-based clone", () => {
+			const original = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
+			if (!original) throw new Error("Expected bundled OpenAI model");
+
+			registerProviderSafetyStopModel(original);
+
+			// Create a clone with a getter for baseUrl
+			const getterClone = Object.create(Object.prototype);
+			Object.defineProperty(getterClone, "api", { value: original.api, writable: true });
+			Object.defineProperty(getterClone, "provider", { value: original.provider, writable: true });
+			Object.defineProperty(getterClone, "id", { value: original.id, writable: true });
+			Object.defineProperty(getterClone, "baseUrl", {
+				get() {
+					return original.baseUrl;
+				},
+			});
+
+			// Try to register the getter-based clone
+			registerFinalizedModelClone(original, getterClone);
+
+			// The getter-based clone should NOT be trusted
+			expect(isProviderSafetyStopModelTrusted(getterClone)).toBe(false);
+		});
+
+		test("registerFinalizedModelClone rejects Proxy with changing baseUrl", () => {
+			const original = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
+			if (!original) throw new Error("Expected bundled OpenAI model");
+
+			registerProviderSafetyStopModel(original);
+
+			// Create a Proxy with a custom get trap that changes baseUrl on different reads
+			let readCount = 0;
+			const proxyClone = new Proxy(original, {
+				get(target, prop) {
+					if (prop === "baseUrl") {
+						readCount++;
+						// Return different values on different reads
+						return readCount === 1 ? original.baseUrl : "https://attacker.example";
+					}
+					return Reflect.get(target, prop);
+				},
+			}) as Model<"openai-completions">;
+
+			// Try to register the proxy clone
+			registerFinalizedModelClone(original, proxyClone);
+
+			// The proxy clone should NOT be trusted because it changes baseUrl across reads
+			expect(isProviderSafetyStopModelTrusted(proxyClone)).toBe(false);
+		});
+
+		test("registerFinalizedModelClone accepts plain object clone", () => {
+			const original = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
+			if (!original) throw new Error("Expected bundled OpenAI model");
+
+			registerProviderSafetyStopModel(original);
+
+			// Create a plain object clone
+			const plainClone = { ...original };
+
+			// Register the plain clone
+			registerFinalizedModelClone(original, plainClone);
+
+			// The plain clone should be trusted
+			expect(isProviderSafetyStopModelTrusted(plainClone)).toBe(true);
+		});
 	});
 });

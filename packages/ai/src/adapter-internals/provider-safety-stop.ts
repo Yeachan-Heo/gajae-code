@@ -44,49 +44,115 @@ export function registerProviderSafetyStopModel(model: Model<Api>): void {
 	}
 }
 
+/** Check if a value is a plain object with only data properties. Rejects Proxies and non-plain prototypes. */
+function isPlainDataObject(obj: unknown): boolean {
+	if (typeof obj !== "object" || obj === null) return false;
+	// Check prototype chain - must be Object.prototype or null
+	const proto = Object.getPrototypeOf(obj);
+	if (proto !== null && proto !== Object.prototype) return false;
+	// Attempt to detect Proxies by using Object.getOwnPropertyNames.
+	// For plain objects, this returns the property names.
+	// For some Proxies, this might fail or return unexpected results.
+	try {
+		Object.getOwnPropertyNames(obj);
+	} catch {
+		// If getOwnPropertyNames throws, this is not a plain object
+		return false;
+	}
+	// Additional Proxy detection: test if toString works without side effects
+	try {
+		const str = Object.prototype.toString.call(obj);
+		// Must return "[object Object]" for plain objects
+		if (str !== "[object Object]") return false;
+	} catch {
+		return false;
+	}
+	return true;
+}
+
 /**
  * Register a finalized clone as trusted when the original catalog model is trusted.
  * Called internally only when a model is cloned during finalization.
  * Only trusts the clone if the original is in the trusted registry and the clone's
  * identity matches or is a valid baseUrl derivation of the original's.
+ * Rejects clones with accessor/getter identity properties or non-plain prototypes.
  * Package-internal only; external consumers cannot import from adapter-internals.
  */
 export function registerTrustedModelCloneInternal(original: object, clone: object): void {
 	const originalSnapshot = trustedProviderSafetyStopModels.get(original);
 	if (!originalSnapshot) return;
 
-	// Clone's api, provider, and id must match exactly
+	// Validate clone is a plain object with data properties for identity fields
+	if (!isPlainDataObject(clone)) return;
+	// Each identity field must either not exist or be a data property (no accessors)
+	for (const prop of ["api", "provider", "id", "baseUrl"]) {
+		const desc = Object.getOwnPropertyDescriptor(clone, prop);
+		if (desc && ("get" in desc || "set" in desc)) {
+			// Has an accessor - reject
+			return;
+		}
+	}
+
+	// Read identity fields from clone. To defend against Proxies that change
+	// their return values across reads, we create a snapshot immediately.
 	const cloneApi = (clone as { api?: string }).api;
 	const cloneProvider = (clone as { provider?: string }).provider;
 	const cloneId = (clone as { id?: string }).id;
 	const cloneBaseUrl = (clone as { baseUrl?: string }).baseUrl;
 
+	// Create a frozen plain-object snapshot to prevent mutation and proxy attacks
+	const frozenSnapshot = Object.freeze({
+		api: cloneApi,
+		provider: cloneProvider,
+		id: cloneId,
+		baseUrl: cloneBaseUrl,
+	});
+
 	if (
-		cloneApi !== originalSnapshot.api ||
-		cloneProvider !== originalSnapshot.provider ||
-		cloneId !== originalSnapshot.id
+		frozenSnapshot.api !== originalSnapshot.api ||
+		frozenSnapshot.provider !== originalSnapshot.provider ||
+		frozenSnapshot.id !== originalSnapshot.id
 	) {
 		// Identity mismatch: clone is not trusted
 		return;
 	}
 
 	// BaseUrl must either match exactly or be the result of stripping userinfo/query/hash
-	if (cloneBaseUrl !== originalSnapshot.baseUrl) {
+	if (frozenSnapshot.baseUrl !== originalSnapshot.baseUrl) {
 		const expectedStrippedUrl = computeStrippedBaseUrl(originalSnapshot.baseUrl);
-		if (cloneBaseUrl !== expectedStrippedUrl) {
+		if (frozenSnapshot.baseUrl !== expectedStrippedUrl) {
 			// BaseUrl mismatch and not a valid derivation: clone is not trusted
 			return;
 		}
 	}
 
-	// Clone is trusted: snapshot its current state
-	const cloneSnapshot: ModelIdentitySnapshot = {
-		api: cloneApi,
-		provider: cloneProvider,
-		id: cloneId,
-		baseUrl: cloneBaseUrl,
-	};
-	trustedProviderSafetyStopModels.set(clone, cloneSnapshot);
+	// Register the frozen snapshot with the original clone object as the key.
+	// To ensure we don't register Proxies, we verify that we can create a clean
+	// spread copy and that it has the same identity values as the original clone.
+	const spreadCopy = { ...clone };
+	const spreadApi = (spreadCopy as { api?: string }).api;
+	const spreadProvider = (spreadCopy as { provider?: string }).provider;
+	const spreadId = (spreadCopy as { id?: string }).id;
+	const spreadBaseUrl = (spreadCopy as { baseUrl?: string }).baseUrl;
+
+	// If the spread copy has different values than the frozen snapshot,
+	// the clone is likely a Proxy with custom get traps - reject it
+	if (
+		spreadApi !== frozenSnapshot.api ||
+		spreadProvider !== frozenSnapshot.provider ||
+		spreadId !== frozenSnapshot.id ||
+		spreadBaseUrl !== frozenSnapshot.baseUrl
+	) {
+		// Proxy-like object with inconsistent values across reads - not trusted
+		return;
+	}
+
+	// Safe to register the frozen snapshot
+	try {
+		trustedProviderSafetyStopModels.set(clone, frozenSnapshot);
+	} catch {
+		// If setting in the WeakMap fails, fail closed and don't register the clone
+	}
 }
 
 /** Verify that a model is the unchanged identity of a bundled catalog entry. */
