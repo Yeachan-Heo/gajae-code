@@ -1077,6 +1077,14 @@ export class SessionRouter {
 			});
 		};
 		const response = await (dispatchFence ? dispatchFence(dispatch) : dispatch());
+		// A late acknowledgement cannot activate a provider after the caller's budget.
+		// Keep the sent identity for reconciliation: expiry does not undo registration.
+		if (remainingDeadlineMs() <= 0)
+			throw new SdkClientError("uncertain_after_send", "SDK session request deadline elapsed after dispatch.", {
+				id: wireFrame.id,
+				operation: wireFrame.operation ?? wireFrame.type,
+				idempotencyKey: wireFrame.idempotencyKey,
+			});
 		const settled = this.#sessions.get(sessionId);
 		if (
 			!settled ||
