@@ -19,7 +19,6 @@ export * from "./model-thinking";
 export * from "./models";
 export * from "./provider-diagnostic";
 export * from "./provider-models";
-export * from "./provider-trust";
 export {
 	getProviderRuntimeDescriptor,
 	PROVIDER_RUNTIME_DESCRIPTORS,

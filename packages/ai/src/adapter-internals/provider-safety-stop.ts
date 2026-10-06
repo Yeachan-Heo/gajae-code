@@ -5,12 +5,19 @@ const PROVIDER_SAFETY_STOP_ADAPTER_BRAND = Symbol("provider-safety-stop-adapter-
 const PROVIDER_SAFETY_STOP_INVOCATION_BRAND = Symbol("provider-safety-stop-invocation-brand");
 const PROVIDER_SAFETY_STOP_INVOCATION_KEY = Symbol("provider-safety-stop-invocation");
 
-const trustedProviderSafetyStopModels = new WeakMap<object, true>();
+interface ModelIdentitySnapshot {
+	baseUrl?: string;
+}
+
+const trustedProviderSafetyStopModels = new WeakMap<object, ModelIdentitySnapshot>();
 
 /** Register an immutable catalog identity for first-party provider dispatch. */
 export function registerProviderSafetyStopModel(model: Model<Api>): void {
 	try {
-		trustedProviderSafetyStopModels.set(model, true);
+		const snapshot: ModelIdentitySnapshot = {
+			baseUrl: (model as { baseUrl?: string }).baseUrl,
+		};
+		trustedProviderSafetyStopModels.set(model, snapshot);
 	} catch {
 		// A malformed/hostile model must remain fallback-eligible.
 	}
@@ -22,15 +29,22 @@ export function registerProviderSafetyStopModel(model: Model<Api>): void {
  * Only trusts the clone if the original is in the trusted registry.
  */
 export function registerTrustedModelClone(original: object, clone: object): void {
-	if (trustedProviderSafetyStopModels.has(original)) {
-		trustedProviderSafetyStopModels.set(clone, true);
+	const originalSnapshot = trustedProviderSafetyStopModels.get(original);
+	if (originalSnapshot) {
+		const cloneSnapshot: ModelIdentitySnapshot = {
+			baseUrl: (clone as { baseUrl?: string }).baseUrl,
+		};
+		trustedProviderSafetyStopModels.set(clone, cloneSnapshot);
 	}
 }
 
 /** Verify that a model is the unchanged identity of a bundled catalog entry. */
 export function isProviderSafetyStopModelTrusted(model: unknown): boolean {
 	if (typeof model !== "object" || model === null) return false;
-	return trustedProviderSafetyStopModels.has(model);
+	const snapshot = trustedProviderSafetyStopModels.get(model);
+	if (!snapshot) return false;
+	const modelBaseUrl = (model as { baseUrl?: string }).baseUrl;
+	return snapshot.baseUrl === modelBaseUrl;
 }
 
 export type ProviderSafetyStopAdapterCapability = {

@@ -33,7 +33,6 @@ import {
 	PROVIDER_DESCRIPTORS,
 	readModelCache,
 	registerCustomApi,
-	registerTrustedModelClone,
 	resolveOAuthStorageProvider,
 	type SimpleStreamOptions,
 	type ThinkingConfig,
@@ -50,6 +49,7 @@ import {
 	readBoundedModelsJson,
 	resolveLoopbackOpenAIBaseUrl,
 } from "@gajae-code/ai/utils/discovery/openai-compatible";
+import { registerTrustedModelClone } from "@gajae-code/ai/utils/provider-safety-stop";
 
 // Sentinels for local-only OAuth tokens — declared inline to avoid loading provider
 // modules at startup. Must match the provider OAuth modules.
@@ -2755,10 +2755,14 @@ export class ModelRegistry {
 				parsed.password = "";
 				parsed.search = "";
 				parsed.hash = "";
-				return { ...model, baseUrl: parsed.toString().replace(/\/$/, "") };
+				const clone = { ...model, baseUrl: parsed.toString().replace(/\/$/, "") };
+				registerTrustedModelClone(model, clone);
+				return clone;
 			} catch {
 				const { baseUrl: _baseUrl, ...withoutBaseUrl } = model;
-				return withoutBaseUrl as Model<Api>;
+				const clone = withoutBaseUrl as Model<Api>;
+				registerTrustedModelClone(model, clone);
+				return clone;
 			}
 		});
 	}
