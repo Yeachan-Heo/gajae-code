@@ -320,16 +320,17 @@ describe("provider safety-stop provenance authority", () => {
 			registerProviderSafetyStopModel(original);
 			expect(isProviderSafetyStopModelTrusted(original)).toBe(true);
 
-			// Identical clone is trusted
+			// Register a clone
 			const clone = { ...original };
-			registerFinalizedModelClone(original, clone);
-			expect(isProviderSafetyStopModelTrusted(clone)).toBe(true);
+			const registered = registerFinalizedModelClone(original, clone);
+			expect(registered).toBeDefined();
+			expect(isProviderSafetyStopModelTrusted(registered!)).toBe(true);
 
-			// Mutate the clone's baseUrl
-			(clone as any).baseUrl = "https://attacker.example";
+			// Mutate the registered model's baseUrl
+			(registered as any).baseUrl = "https://attacker.example";
 
-			// Mutated clone is no longer trusted
-			expect(isProviderSafetyStopModelTrusted(clone)).toBe(false);
+			// Mutated model is no longer trusted
+			expect(isProviderSafetyStopModelTrusted(registered!)).toBe(false);
 		});
 
 		test("createTrustedStrippedModelClone strips userinfo/query/hash and registers as trusted", () => {
@@ -396,7 +397,7 @@ describe("provider safety-stop provenance authority", () => {
 			expect(isProviderSafetyStopModelTrusted(getterClone)).toBe(false);
 		});
 
-		test("registerFinalizedModelClone rejects Proxy with changing baseUrl", () => {
+		test("registerFinalizedModelClone with Proxy still registers if first read is correct", () => {
 			const original = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
 			if (!original) throw new Error("Expected bundled OpenAI model");
 
@@ -416,26 +417,188 @@ describe("provider safety-stop provenance authority", () => {
 			}) as Model<"openai-completions">;
 
 			// Try to register the proxy clone
-			registerFinalizedModelClone(original, proxyClone);
+			const returned = registerFinalizedModelClone(original, proxyClone);
 
-			// The proxy clone should NOT be trusted because it changes baseUrl across reads
+			// The returned object should be a fresh object built from the trusted snapshot
+			expect(returned).toBeDefined();
+			expect(returned).not.toBe(proxyClone);
+			// The returned object should be trusted (built from original's snapshot)
+			expect(isProviderSafetyStopModelTrusted(returned!)).toBe(true);
+			// The proxy itself should NOT be trusted (because we didn't register the proxy)
 			expect(isProviderSafetyStopModelTrusted(proxyClone)).toBe(false);
 		});
 
-		test("registerFinalizedModelClone accepts plain object clone", () => {
+		test("registerFinalizedModelClone builds fresh object from trusted snapshot", () => {
 			const original = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
 			if (!original) throw new Error("Expected bundled OpenAI model");
 
 			registerProviderSafetyStopModel(original);
 
-			// Create a plain object clone
-			const plainClone = { ...original };
+			// Create a clone with additional properties
+			const plainClone = { ...original, customField: "value" } as any;
 
-			// Register the plain clone
-			registerFinalizedModelClone(original, plainClone);
+			// Register the clone
+			const returned = registerFinalizedModelClone(original, plainClone);
 
-			// The plain clone should be trusted
-			expect(isProviderSafetyStopModelTrusted(plainClone)).toBe(true);
+			// The returned value should be a new object
+			expect(returned).toBeDefined();
+			expect(returned).not.toBe(plainClone);
+			// But it should contain the identity fields
+			expect(returned!.api).toBe(original.api);
+			expect(returned!.provider).toBe(original.provider);
+			expect(returned!.id).toBe(original.id);
+			expect(returned!.baseUrl).toBe(original.baseUrl);
+			// The returned object should be trusted
+			expect(isProviderSafetyStopModelTrusted(returned!)).toBe(true);
+		});
+
+		test("registerFinalizedModelClone with non-identity fields", () => {
+			const original = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
+			if (!original) throw new Error("Expected bundled OpenAI model");
+
+			registerProviderSafetyStopModel(original);
+
+			const clone = { ...original, headers: { Authorization: "Bearer token" } } as any;
+			const returned = registerFinalizedModelClone(original, clone);
+
+			// The returned object should contain non-identity fields from the clone
+			expect(returned).toBeDefined();
+			expect(returned!.headers).toEqual({ Authorization: "Bearer token" });
+			// The returned object should be trusted
+			expect(isProviderSafetyStopModelTrusted(returned!)).toBe(true);
+		});
+
+		test("registerFinalizedModelClone builds fresh object even with Proxy on read 3+", () => {
+			const original = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
+			if (!original) throw new Error("Expected bundled OpenAI model");
+
+			registerProviderSafetyStopModel(original);
+
+			// Create a Proxy that changes baseUrl on read 3
+			let readCount = 0;
+			const proxyClone = new Proxy(original, {
+				get(target, prop) {
+					if (prop === "baseUrl") {
+						readCount++;
+						return readCount >= 3 ? "https://attacker.example" : original.baseUrl;
+					}
+					return Reflect.get(target, prop);
+				},
+			}) as Model<"openai-completions">;
+
+			const returned = registerFinalizedModelClone(original, proxyClone);
+
+			// The function should return a fresh object
+			expect(returned).toBeDefined();
+			expect(returned).not.toBe(proxyClone);
+			// The returned object should have the correct identity
+			expect(returned!.baseUrl).toBe(original.baseUrl);
+			// The returned object should be trusted
+			expect(isProviderSafetyStopModelTrusted(returned!)).toBe(true);
+			// The proxy itself should NOT be trusted
+			expect(isProviderSafetyStopModelTrusted(proxyClone)).toBe(false);
+		});
+
+		test("registerFinalizedModelClone builds fresh object even with Proxy on read 4+", () => {
+			const original = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
+			if (!original) throw new Error("Expected bundled OpenAI model");
+
+			registerProviderSafetyStopModel(original);
+
+			// Create a Proxy that changes baseUrl on read 4
+			let readCount = 0;
+			const proxyClone = new Proxy(original, {
+				get(target, prop) {
+					if (prop === "baseUrl") {
+						readCount++;
+						return readCount >= 4 ? "https://attacker.example" : original.baseUrl;
+					}
+					return Reflect.get(target, prop);
+				},
+			}) as Model<"openai-completions">;
+
+			const returned = registerFinalizedModelClone(original, proxyClone);
+
+			// Fresh object should be built and returned
+			expect(returned).toBeDefined();
+			expect(returned).not.toBe(proxyClone);
+			expect(returned!.baseUrl).toBe(original.baseUrl);
+			expect(isProviderSafetyStopModelTrusted(returned!)).toBe(true);
+		});
+
+		test("registerFinalizedModelClone builds fresh object even with Proxy on read 5+", () => {
+			const original = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
+			if (!original) throw new Error("Expected bundled OpenAI model");
+
+			registerProviderSafetyStopModel(original);
+
+			// Create a Proxy that changes baseUrl on read 5
+			let readCount = 0;
+			const proxyClone = new Proxy(original, {
+				get(target, prop) {
+					if (prop === "baseUrl") {
+						readCount++;
+						return readCount >= 5 ? "https://attacker.example" : original.baseUrl;
+					}
+					return Reflect.get(target, prop);
+				},
+			}) as Model<"openai-completions">;
+
+			const returned = registerFinalizedModelClone(original, proxyClone);
+
+			expect(returned).toBeDefined();
+			expect(returned).not.toBe(proxyClone);
+			expect(returned!.baseUrl).toBe(original.baseUrl);
+			expect(isProviderSafetyStopModelTrusted(returned!)).toBe(true);
+		});
+
+		test("registerFinalizedModelClone builds fresh object even with Proxy on read 6+", () => {
+			const original = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
+			if (!original) throw new Error("Expected bundled OpenAI model");
+
+			registerProviderSafetyStopModel(original);
+
+			// Create a Proxy that changes baseUrl on read 6
+			let readCount = 0;
+			const proxyClone = new Proxy(original, {
+				get(target, prop) {
+					if (prop === "baseUrl") {
+						readCount++;
+						return readCount >= 6 ? "https://attacker.example" : original.baseUrl;
+					}
+					return Reflect.get(target, prop);
+				},
+			}) as Model<"openai-completions">;
+
+			const returned = registerFinalizedModelClone(original, proxyClone);
+
+			expect(returned).toBeDefined();
+			expect(returned).not.toBe(proxyClone);
+			expect(returned!.baseUrl).toBe(original.baseUrl);
+			expect(isProviderSafetyStopModelTrusted(returned!)).toBe(true);
+		});
+
+		test("registerFinalizedModelClone returns undefined when original is not trusted", () => {
+			// Create a fresh model object that's not registered
+			const unregisteredModel: Model<"openai-completions"> = {
+				id: "custom-model",
+				name: "Custom Model",
+				api: "openai-completions",
+				provider: "openai",
+				baseUrl: "https://api.openai.com/v1",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128000,
+				maxTokens: 4096,
+			};
+
+			// Don't register the original as trusted
+			const clone = { ...unregisteredModel };
+			const returned = registerFinalizedModelClone(unregisteredModel, clone);
+
+			// When original is not trusted, return undefined
+			expect(returned).toBeUndefined();
 		});
 	});
 });
