@@ -3663,22 +3663,15 @@ describe("whole-session persistence freshness", () => {
 			destinationFile,
 			`${JSON.stringify({ type: "session", version: 5, id: "rewrite-destination", timestamp: "0", cwd: "/cwd" })}\n`,
 		);
-		const destinationManager = await SessionManager.open(
+		const manager = await SessionManager.open(
 			destinationFile,
 			SessionManager.explicitDestination("/sessions"),
 			storage,
 			"copy-retain",
 			"off",
 		);
-		const destinationSnapshot = destinationManager.captureState();
-		await destinationManager.close();
-		const manager = await SessionManager.open(
-			sourceFile,
-			SessionManager.explicitDestination("/sessions"),
-			storage,
-			"copy-retain",
-			"off",
-		);
+		const destinationSnapshot = manager.captureState();
+		await manager.setSessionFile(sourceFile);
 		try {
 			const sourceEntryId = manager.appendCustomEntry("before-lifecycle-switch", { value: 1 });
 			await manager.flush();
