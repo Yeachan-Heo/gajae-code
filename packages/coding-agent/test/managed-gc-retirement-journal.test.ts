@@ -594,8 +594,11 @@ function preparedReceiptLineByteLength(fixture: Fixture): number {
 	);
 }
 
-function exactLimitSessionId(fixture: Fixture, transcriptFileName: string): string | undefined {
-	const recordBytes = preparedReceiptLineByteLength(fixture);
+function exactLimitSessionId(
+	fixture: Fixture,
+	transcriptFileName: string,
+	recordBytes = preparedReceiptLineByteLength(fixture),
+): string | undefined {
 	const pathByteDelta =
 		Buffer.byteLength(transcriptFileName, "utf8") - Buffer.byteLength(path.basename(fixture.transcriptPath), "utf8");
 	const manifest = fixture.evidence.treeSnapshot.entries.find(entry => entry.relativePath === OWNER_MANIFEST);
@@ -713,6 +716,44 @@ function readReceiptSuffix(fixture: Fixture, suffix: string): unknown {
 	}
 }
 
+async function cleanupRetryCandidate(fixture: Fixture) {
+	await Bun.write(
+		fixture.transcriptPath,
+		`${JSON.stringify({ type: "session", version: 3, id: fixture.target.sessionId, cwd: fixture.cwd })}\n`,
+	);
+	const listed = listManagedCandidates(fixture.scope);
+	if (listed.kind !== "complete") throw new Error(listed.message);
+	const candidate = listed.owned.find(value => value.path === fixture.transcriptPath);
+	if (!candidate) throw new Error("cleanup_retry_candidate_missing");
+	return candidate;
+}
+
+function injectPendingTranscriptDelete() {
+	// This seeds replay history through the API; it is not evidence of native deletion.
+	return vi.spyOn(FileSessionStorage.prototype, "deleteSessionVerified").mockImplementation(async target => {
+		if (!target.plannedTranscriptPath) throw new Error("cleanup_retry_plan_missing");
+		return {
+			kind: "cleanup_pending",
+			phase: "transcript",
+			detachedTranscriptPath: target.plannedTranscriptPath,
+			error: new Error("injected_cleanup_pending"),
+		} as never;
+	});
+}
+
+async function injectedCleanupHistory(apiCalls: number) {
+	const fixture = makeFixture();
+	const candidate = await cleanupRetryCandidate(fixture);
+	injectPendingTranscriptDelete();
+	let tombstonePath = "";
+	for (let attempt = 0; attempt < apiCalls; attempt++) {
+		const result = await deleteManagedSessionCandidate(fixture.scope, candidate);
+		if (result.kind !== "cleanup_pending") throw new Error(`cleanup_retry_injection_failed:${result.kind}`);
+		tombstonePath = result.tombstonePath;
+	}
+	return { fixture, candidate, tombstonePath };
+}
+
 function snapshotTree(root: string): unknown[] {
 	const entries: unknown[] = [];
 	const visit = (pathname: string, relative: string): void => {
@@ -767,6 +808,190 @@ function isNestedCandidateContinuationJsonValue(value: unknown, marker: string):
 	);
 }
 
+describe("bounded cleanup receipt replay", () => {
+	it("replays at least ten persisted contiguous attempts from injected deletes while retaining plan evidence", async () => {
+		const { fixture, tombstonePath } = await injectedCleanupHistory(9);
+		const directory = path.dirname(tombstonePath);
+		const records = fs
+			.readdirSync(directory)
+			.filter(name => name.includes(".cleanup-pending-") && name.endsWith(".json"))
+			.map(name => ({ name, attempt: Number(/-([0-9]+)\.json$/u.exec(name)?.[1]) }))
+			.sort((left, right) => left.attempt - right.attempt);
+		expect(records.length).toBeGreaterThanOrEqual(10);
+		expect(records.map(record => record.attempt)).toEqual(
+			Array.from({ length: records.length }, (_, index) => index + 1),
+		);
+		const last = JSON.parse(fs.readFileSync(path.join(directory, records.at(-1)!.name), "utf8")) as Record<
+			string,
+			unknown
+		>;
+		const priorPlans = records
+			.slice(0, -1)
+			.map(
+				({ name }) =>
+					(JSON.parse(fs.readFileSync(path.join(directory, name), "utf8")) as Record<string, unknown>)
+						.plannedTranscriptPath,
+			);
+		expect(last.attempt).toBe(records.length);
+		expect(priorPlans).toContain(last.detachedTranscriptPath);
+		expect(last.target).toMatchObject({ path: fixture.transcriptPath, sessionId: fixture.target.sessionId });
+		expect(fs.existsSync(fixture.transcriptPath)).toBe(true);
+	});
+
+	it("admits every inventory entry and refuses the 50,001st before replay reads or retains entries", async () => {
+		const { fixture, tombstonePath } = await injectedCleanupHistory(1);
+		const directory = path.dirname(tombstonePath);
+		const originalOpen = fs.opendirSync.bind(fs);
+		let entriesRead = 0;
+		let closed = false;
+		const open = vi.spyOn(fs, "opendirSync").mockImplementation(pathname => {
+			if (pathname !== directory) return originalOpen(pathname);
+			return {
+				readSync: () => {
+					entriesRead++;
+					return { name: `unrelated-${entriesRead}` } as fs.Dirent;
+				},
+				closeSync: () => {
+					closed = true;
+				},
+			} as fs.Dir;
+		});
+		const allocate = vi.spyOn(Buffer, "alloc");
+		const inspect = managedGcProtocolScopeInspectorForScope(fixture.scope);
+		await expect(inspect([protocolInputFor(fixture.scope)])).rejects.toThrow("managed_gc_journal_capacity_exceeded");
+		expect(entriesRead).toBe(50_001);
+		expect(closed).toBe(true);
+		expect(allocate.mock.calls.some(([size]) => typeof size === "number" && size >= 64 * 1024 * 1024)).toBe(false);
+		open.mockRestore();
+	});
+
+	it("refuses an oversized receipt from its descriptor size before Buffer allocation", async () => {
+		const { fixture, tombstonePath } = await injectedCleanupHistory(1);
+		const directory = path.dirname(tombstonePath);
+		const records = fs
+			.readdirSync(directory)
+			.filter(name => name.includes(".cleanup-pending-") && name.endsWith(".json"));
+		const latestAttempt = Math.max(...records.map(name => Number(/-([0-9]+)\.json$/u.exec(name)?.[1])));
+		const prefix = /^(.*\.cleanup-pending-)\d+\.json$/u.exec(records[0]!);
+		if (!prefix) throw new Error("cleanup_receipt_prefix_missing");
+		const oversizedPath = path.join(directory, `${prefix[1]}${latestAttempt + 1}.json`);
+		const descriptor = fs.openSync(oversizedPath, "wx", 0o600);
+		try {
+			fs.ftruncateSync(descriptor, 64 * 1024 * 1024 + 1);
+		} finally {
+			fs.closeSync(descriptor);
+		}
+		const allocate = vi.spyOn(Buffer, "alloc");
+		const inspect = managedGcProtocolScopeInspectorForScope(fixture.scope);
+		await expect(inspect([protocolInputFor(fixture.scope)])).rejects.toThrow("managed_gc_journal_capacity_exceeded");
+		expect(allocate.mock.calls.some(([size]) => size === 64 * 1024 * 1024 + 1)).toBe(false);
+	});
+
+	it("refuses simulated aggregate descriptor bytes before allocating the ninth receipt", async () => {
+		const { fixture, tombstonePath } = await injectedCleanupHistory(9);
+		const directory = path.dirname(tombstonePath);
+		const names = fs
+			.readdirSync(directory)
+			.filter(name => name.includes(".cleanup-pending-") && name.endsWith(".json"))
+			.sort(
+				(left, right) => Number(/-([0-9]+)\.json$/u.exec(left)?.[1]) - Number(/-([0-9]+)\.json$/u.exec(right)?.[1]),
+			);
+		const receiptPaths = new Set(names.map(name => path.join(directory, name)));
+		const actualSizes = new Map([...receiptPaths].map(pathname => [pathname, fs.statSync(pathname).size]));
+		const admitted = new Set<string>();
+		let allocatingPath: string | undefined;
+		const readers: Array<{ matchingEntries: number; allocations: number; inventoryClosed: boolean }> = [];
+		let activeReader: (typeof readers)[number] | undefined;
+		const receiptSize = 64 * 1024 * 1024;
+		const originalFstat = fs.fstatSync.bind(fs);
+		const originalLstat = fs.lstatSync.bind(fs);
+		const originalOpendir = fs.opendirSync.bind(fs);
+		const originalAlloc = Buffer.alloc.bind(Buffer);
+		const withReceiptSize = <T extends fs.Stats | fs.BigIntStats>(stat: T): T =>
+			new Proxy(stat, {
+				get: (value, property) =>
+					property === "size"
+						? typeof value.size === "bigint"
+							? BigInt(receiptSize)
+							: receiptSize
+						: Reflect.get(value, property, value),
+			}) as T;
+		vi.spyOn(fs, "opendirSync").mockImplementation(pathname => {
+			const handle = originalOpendir(pathname);
+			if (pathname !== directory) return handle;
+			const reader = { matchingEntries: 0, allocations: 0, inventoryClosed: false };
+			readers.push(reader);
+			activeReader = reader;
+			return {
+				readSync: () => {
+					const entry = handle.readSync();
+					if (entry?.name.includes(".cleanup-pending-") && entry.name.endsWith(".json")) reader.matchingEntries++;
+					return entry;
+				},
+				closeSync: () => {
+					handle.closeSync();
+					reader.inventoryClosed = true;
+				},
+			} as fs.Dir;
+		});
+		vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, options?: { bigint?: boolean }) => {
+			const pathname = fs.readlinkSync(`/proc/self/fd/${fd}`);
+			const stat = originalFstat(fd, options as never);
+			if (!receiptPaths.has(pathname)) return stat;
+			allocatingPath = pathname;
+			return withReceiptSize(stat);
+		}) as typeof fs.fstatSync);
+		vi.spyOn(fs, "lstatSync").mockImplementation(((pathname: fs.PathLike, options?: { bigint?: boolean }) => {
+			const stat = originalLstat(pathname, options as never);
+			return typeof pathname === "string" && receiptPaths.has(pathname) ? withReceiptSize(stat) : stat;
+		}) as typeof fs.lstatSync);
+		vi.spyOn(Buffer, "alloc").mockImplementation(((
+			size: number,
+			fill?: string | Uint8Array | number,
+			encoding?: BufferEncoding,
+		) => {
+			if (size !== receiptSize) return originalAlloc(size, fill as number, encoding);
+			if (!allocatingPath) throw new Error("cleanup_receipt_allocation_path_missing");
+			const pathname = allocatingPath;
+			allocatingPath = undefined;
+			admitted.add(pathname);
+			if (activeReader?.inventoryClosed) activeReader.allocations++;
+			return originalAlloc(actualSizes.get(pathname) ?? size);
+		}) as typeof Buffer.alloc);
+		const inspect = managedGcProtocolScopeInspectorForScope(fixture.scope);
+		await expect(inspect([protocolInputFor(fixture.scope)])).rejects.toThrow("managed_gc_journal_capacity_exceeded");
+		expect(readers).toHaveLength(1);
+		expect(readers[0]).toMatchObject({ inventoryClosed: true, allocations: 8 });
+		expect(readers[0]!.matchingEntries).toBeGreaterThan(8);
+		expect(admitted.size).toBe(8);
+	});
+
+	it("rejects noncanonical suffixes, filename-record mismatches, and gaps", async () => {
+		for (const defect of ["suffix", "mismatch", "gap"] as const) {
+			const { fixture, candidate, tombstonePath } = await injectedCleanupHistory(1);
+			const directory = path.dirname(tombstonePath);
+			const names = fs
+				.readdirSync(directory)
+				.filter(name => name.includes(".cleanup-pending-") && name.endsWith(".json"));
+			const first = names.find(name => /-1\.json$/u.test(name));
+			if (!first) throw new Error("cleanup_first_attempt_missing");
+			if (defect === "suffix") {
+				const prefix = /^(.*\.cleanup-pending-)\d+\.json$/u.exec(first);
+				if (!prefix) throw new Error("cleanup_receipt_prefix_missing");
+				fs.writeFileSync(path.join(directory, `${prefix[1]}03.json`), "{}\n", { mode: 0o600 });
+			} else if (defect === "mismatch") {
+				const pathname = path.join(directory, first);
+				const record = JSON.parse(fs.readFileSync(pathname, "utf8")) as Record<string, unknown>;
+				fs.writeFileSync(pathname, `${JSON.stringify({ ...record, attempt: 2 })}\n`);
+			} else {
+				fs.unlinkSync(path.join(directory, first));
+			}
+			const result = await deleteManagedSessionCandidate(fixture.scope, candidate);
+			expect(result).toMatchObject({ kind: "error", code: "durability_failed" });
+		}
+	});
+});
+
 describe("managed GC retirement journal", () => {
 	it("publishes a canonical receipt exactly at the UTF-8 byte limit and rejects limit plus one before encoding", async () => {
 		const seed = makeFixture();
@@ -777,10 +1002,24 @@ describe("managed GC retirement journal", () => {
 			if (sessionId !== undefined) exactChoice = { transcriptFileName, sessionId };
 		}
 		if (!exactChoice) throw new Error("fixture_exact_receipt_size_unavailable");
-		const fixture = makeFixture(exactChoice.sessionId, exactChoice.transcriptFileName);
+		let fixture: Fixture | undefined;
+		let exactSessionId = exactChoice.sessionId;
+		let measuredBytes: number | undefined;
+		for (let measurement = 0; measurement < 2; measurement++) {
+			fixture = makeFixture(exactSessionId, exactChoice.transcriptFileName);
+			measuredBytes = preparedReceiptLineByteLength(fixture);
+			if (measuredBytes === MANAGED_SESSION_READ_RANGE_MAX_BYTES) break;
+			if (measurement === 1) throw new Error("fixture_exact_receipt_size_did_not_converge");
+			const corrected = exactLimitSessionId(fixture, exactChoice.transcriptFileName, measuredBytes);
+			if (!corrected) throw new Error("fixture_exact_receipt_size_unavailable");
+			exactSessionId = corrected;
+		}
+		if (!fixture || measuredBytes !== MANAGED_SESSION_READ_RANGE_MAX_BYTES)
+			throw new Error("fixture_exact_receipt_size_unavailable");
+		expect(measuredBytes).toBe(MANAGED_SESSION_READ_RANGE_MAX_BYTES);
 		const published = await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
 		expect(published.state).toBe("prepared");
-		expect(published.sessionId).toBe(exactChoice.sessionId);
+		expect(published.sessionId).toBe(exactSessionId);
 
 		const key = crypto.createHash("sha256").update(path.resolve(fixture.transcriptPath), "utf8").digest("hex");
 		const receiptPath = path.join(
@@ -809,7 +1048,7 @@ describe("managed GC retirement journal", () => {
 				Buffer.from(
 					`${JSON.stringify({
 						type: "session",
-						id: exactChoice.sessionId,
+						id: exactSessionId,
 						cwd: fixture.cwd,
 						version: 3,
 						taskArtifactOwner: fixture.target.taskArtifactOwnerLocator,
