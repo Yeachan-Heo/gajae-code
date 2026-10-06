@@ -48,6 +48,7 @@ export type ProgressSignalSource = "ultragoal" | "workflow" | "subagents" | "tod
 export interface ProgressAgentCounts {
 	total: number;
 	running: number;
+	/** Subagents that are queued or paused. */
 	waiting: number;
 	completed: number;
 	failed: number;
@@ -104,7 +105,7 @@ export interface ProjectProgressSnapshot {
 		percent: number | null;
 		/** Every counted unit is done (the session may still be awaiting goal completion or subagents). */
 		allUnitsDone: boolean;
-		/** `state === "complete"`: units done, goal (if any) complete, no subagents running or queued. */
+		/** `state === "complete"`: units done, goal (if any) complete, no subagents running, queued, or paused. */
 		complete: boolean;
 		explanation: string;
 	};

@@ -1,10 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
+import { Agent } from "@gajae-code/agent-core";
+import { getBundledModel } from "@gajae-code/ai";
+import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { UltragoalGoalStatus } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
 import { buildSessionProjectProgress } from "@gajae-code/coding-agent/progress/collect-project-progress";
 import {
 	PROGRESS_SNAPSHOT_LIMITS,
 	PROJECT_PROGRESS_SNAPSHOT_SCHEMA,
+	type ProjectProgressSnapshot,
 } from "@gajae-code/coding-agent/progress/progress-contract";
 import { toProjectProgressSnapshot } from "@gajae-code/coding-agent/progress/progress-snapshot";
 import { computeProjectProgress, type ProjectProgressInput } from "@gajae-code/coding-agent/progress/project-progress";
@@ -13,7 +18,11 @@ import { QueryHandlers, type SessionSurface } from "@gajae-code/coding-agent/sdk
 import { RevisionStore } from "@gajae-code/coding-agent/sdk/host/query/revision-store";
 import { createSdkSurfacePolicy } from "@gajae-code/coding-agent/sdk/host/surface-policy";
 import { findOperation } from "@gajae-code/coding-agent/sdk/protocol/operation-registry";
+import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
+import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { renderProgressReportLines } from "@gajae-code/coding-agent/slash-commands/helpers/progress-report";
+import { type TodoPhase, USER_TODO_EDIT_CUSTOM_TYPE } from "@gajae-code/coding-agent/tools/todo-write";
 import { TempDir } from "@gajae-code/utils";
 
 function input(overrides: Partial<ProjectProgressInput> = {}): ProjectProgressInput {
@@ -290,7 +299,7 @@ describe("session.progress SDK query (Q32)", () => {
 			getTodoPhases: () => [],
 			getSubagentLifecycleStatuses: () => [],
 		};
-		const sessionManager = { getCwd: () => tempDir.path(), getSessionId: () => sessionId };
+		const sessionManager = { getCwd: () => tempDir.path(), getSessionId: () => sessionId, getBranch: () => [] };
 		const source = surface(async () =>
 			toProjectProgressSnapshot(await buildSessionProjectProgress(session, sessionManager)),
 		);
@@ -321,5 +330,167 @@ describe("session.progress SDK query (Q32)", () => {
 			ok: false,
 			error: { code: "unavailable" },
 		});
+	});
+});
+
+describe("session.progress on a resumed session reads durable todo history", () => {
+	let tempDir: TempDir;
+	const sessions: AgentSession[] = [];
+	const authStorages: AuthStorage[] = [];
+	beforeEach(() => {
+		tempDir = TempDir.createSync("@gjc-progress-resume-");
+	});
+	afterEach(async () => {
+		for (const session of sessions.splice(0)) await session.dispose();
+		for (const authStorage of authStorages.splice(0)) authStorage.close();
+		tempDir.removeSync();
+	});
+
+	const terminalOnly: TodoPhase[] = [
+		{
+			name: "Build",
+			tasks: [
+				{ content: "design schema", status: "completed" },
+				{ content: "legacy importer", status: "abandoned" },
+			],
+		},
+	];
+	const mixed: TodoPhase[] = [
+		...terminalOnly,
+		{
+			name: "Ship",
+			tasks: [
+				{ content: "wire query", status: "in_progress" },
+				{ content: "write docs", status: "pending" },
+			],
+		},
+	];
+
+	/** Persist a successful `todo_write` call exactly as the tool records it on the branch. */
+	function persistTodoWrite(manager: SessionManager, toolCallId: string, phases: TodoPhase[]): void {
+		manager.appendMessage({
+			role: "assistant",
+			content: [{ type: "toolCall", id: toolCallId, name: "todo_write", arguments: { ops: [] } }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "test-model",
+			stopReason: "toolUse",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		});
+		manager.appendMessage({
+			role: "toolResult",
+			toolCallId,
+			toolName: "todo_write",
+			content: [{ type: "text", text: "todos updated" }],
+			details: { phases },
+			isError: false,
+			timestamp: Date.now(),
+		});
+	}
+
+	/** Write a session to disk, close it, and resume it into a real `AgentSession`. */
+	async function resume(record: (manager: SessionManager) => void): Promise<AgentSession> {
+		const root = tempDir.path();
+		const original = SessionManager.create(root, path.join(root, "sessions"));
+		original.appendMessage({ role: "user", content: "plan the work", timestamp: Date.now() });
+		record(original);
+		await original.ensureOnDisk();
+		await original.flush();
+		const sessionFile = original.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a persisted session file");
+		await original.close();
+
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Test model not found in registry");
+		const authStorage = await AuthStorage.create(path.join(root, "auth.db"));
+		authStorages.push(authStorage);
+		const session = new AgentSession({
+			agent: new Agent({ getApiKey: () => "test", initialState: { model, systemPrompt: ["test"], tools: [] } }),
+			sessionManager: await SessionManager.open(sessionFile),
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(authStorage),
+		});
+		sessions.push(session);
+		return session;
+	}
+
+	/** Q32 through the query dispatcher, bound the way `modes/runtime-init.ts` binds it. */
+	async function queryProgress(session: AgentSession): Promise<ProjectProgressSnapshot> {
+		const source = surface(async () =>
+			toProjectProgressSnapshot(await buildSessionProjectProgress(session, session.sessionManager)),
+		);
+		const response = await dispatch(source, "session.progress");
+		expect(response.ok).toBe(true);
+		const [snapshot] = response.page?.items ?? [];
+		return snapshot as ProjectProgressSnapshot;
+	}
+
+	it("counts completed and abandoned items alongside open ones", async () => {
+		const session = await resume(manager => persistTodoWrite(manager, "todo-1", mixed));
+		// Resume strips terminal items from the live list; progress must not inherit that.
+		expect(session.getTodoPhases()).toEqual([mixed[1]]);
+
+		const snapshot = await queryProgress(session);
+		expect(snapshot.state).toBe("in-progress");
+		expect(snapshot.completion).toMatchObject({ basis: "todos", done: 1, total: 3, percent: 33 });
+		expect(snapshot.execution.todos).toEqual({
+			counts: { total: 3, completed: 1, inProgress: 1, pending: 1, abandoned: 1 },
+			items: [
+				{ content: "design schema", status: "completed" },
+				{ content: "legacy importer", status: "abandoned" },
+				{ content: "wire query", status: "in_progress" },
+				{ content: "write docs", status: "pending" },
+			],
+			omittedItems: 0,
+		});
+		expect(snapshot.activeWork.todo).toBe("wire query");
+	});
+
+	it("reports an all-terminal todo list as finished work, not as no tracked work", async () => {
+		const session = await resume(manager => persistTodoWrite(manager, "todo-1", terminalOnly));
+		expect(session.getTodoPhases()).toEqual([]);
+
+		const snapshot = await queryProgress(session);
+		expect(snapshot.state).toBe("complete");
+		expect(snapshot.completion).toMatchObject({ basis: "todos", done: 1, total: 1, percent: 100, complete: true });
+		expect(snapshot.execution.todos?.counts).toEqual({
+			total: 1,
+			completed: 1,
+			inProgress: 0,
+			pending: 0,
+			abandoned: 1,
+		});
+	});
+
+	it("treats a persisted empty list as authoritative over unpersisted live state", async () => {
+		const session = await resume(manager => {
+			persistTodoWrite(manager, "todo-1", mixed);
+			manager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases: [] });
+		});
+		session.setTodoPhases([{ name: "Live", tasks: [{ content: "never persisted", status: "pending" }] }]);
+
+		const snapshot = await queryProgress(session);
+		expect(snapshot.state).toBe("no-tracked-work");
+		expect(snapshot.completion).toMatchObject({ basis: "none", total: 0, percent: null });
+		expect(snapshot.execution.todos).toBeNull();
+		expect(snapshot.activeWork.todo).toBeNull();
+	});
+
+	it("falls back to live todo state only when no todo state was ever persisted", async () => {
+		const session = await resume(() => {});
+		session.setTodoPhases([{ name: "Live", tasks: [{ content: "live only", status: "in_progress" }] }]);
+
+		const snapshot = await queryProgress(session);
+		expect(snapshot.completion).toMatchObject({ basis: "todos", done: 0, total: 1 });
+		expect(snapshot.execution.todos?.items).toEqual([{ content: "live only", status: "in_progress" }]);
+		expect(snapshot.activeWork.todo).toBe("live only");
 	});
 });

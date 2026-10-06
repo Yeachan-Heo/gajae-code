@@ -332,7 +332,7 @@ export function computeProjectProgress(input: ProjectProgressInput): ProjectProg
 		signals.push({
 			kind: "pending",
 			source: "subagents",
-			text: `${plural(agents.running + agents.waiting, "subagent")} still running or queued; their work counts only once it is recorded in the plan or todos.`,
+			text: `${plural(agents.running + agents.waiting, "subagent")} still running, queued, or paused; their work counts only once it is recorded in the plan or todos.`,
 		});
 	}
 	if (agents.failed > 0)

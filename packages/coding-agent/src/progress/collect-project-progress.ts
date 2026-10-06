@@ -7,7 +7,7 @@ import {
 	readVisibleSkillActiveStateWithStatus,
 	type VisibleSkillActiveStateReadStatus,
 } from "../skill-state/active-state";
-import type { TodoPhase } from "../tools/todo-write";
+import { findLatestTodoPhasesFromEntries, type TodoPhase } from "../tools/todo-write";
 import type { ProgressDurableSource } from "./progress-contract";
 import {
 	computeProjectProgress,
@@ -121,16 +121,23 @@ export interface ProjectProgressSessionSource {
 	getSubagentLifecycleStatuses(): SubagentLifecycle[];
 }
 
-/** Single entry point shared by the human view and the machine snapshot. */
+/**
+ * Single entry point shared by the human view and the machine snapshot.
+ *
+ * Todos come from the persisted branch history, as `/todo` reads them: the live
+ * list drops completed and abandoned items when a session is resumed, so it is
+ * only the fallback when no todo state was ever persisted. A persisted empty
+ * list is authoritative and is not replaced by live state.
+ */
 export async function buildSessionProjectProgress(
 	session: ProjectProgressSessionSource,
-	sessionManager: Pick<SessionManager, "getCwd" | "getSessionId">,
+	sessionManager: Pick<SessionManager, "getCwd" | "getSessionId" | "getBranch">,
 ): Promise<ProjectProgressReport> {
 	const input = await collectProjectProgressInput({
 		cwd: sessionManager.getCwd(),
 		sessionId: sessionManager.getSessionId(),
 		goal: session.getGoalModeState()?.goal,
-		todoPhases: session.getTodoPhases(),
+		todoPhases: findLatestTodoPhasesFromEntries(sessionManager.getBranch()) ?? session.getTodoPhases(),
 		subagents: session.getSubagentLifecycleStatuses(),
 	});
 	return computeProjectProgress(input);

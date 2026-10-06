@@ -651,7 +651,7 @@ name. The response is a single-item page whose item has
 | `state` | Completion state: `complete`, `awaiting-completion`, `blocked`, `in-progress`, `not-started`, `paused`, `dropped`, or `no-tracked-work`. |
 | `completion` | `basis` (`ultragoal-stories`, `todos`, `goal-status`, or `none`), `done`/`total` counted units, `percent` (`null` when `basis` is `none`), `allUnitsDone`, `complete`, and a plain-language `explanation`. |
 | `execution` | `goal`, `ultragoal` (story counts plus bounded per-story status and receipt flag), and `todos` (counts plus bounded items); each is `null` when not recorded. |
-| `activeWork` | `story`: the active story, else the next pending one, in Ultragoal scheduler order — blocked, review-blocked, and failed stories are never reported as next (failed stories are only retried on an explicit `--retry-failed`), so it is `null` when nothing is schedulable. `todo`: the in-progress (or next pending) todo. `workflows`: active workflows with their phase and HUD chips, bounded, with `omittedWorkflows` counting the rest. Subagent counts. |
+| `activeWork` | `story`: the active story, else the next pending one, in Ultragoal scheduler order — blocked, review-blocked, and failed stories are never reported as next (failed stories are only retried on an explicit `--retry-failed`), so it is `null` when nothing is schedulable. `todo`: the in-progress (or next pending) todo. `workflows`: active workflows with their phase and HUD chips, bounded, with `omittedWorkflows` counting the rest. `agents`: subagent counts, where `waiting` is queued or paused subagents. |
 | `verification` | `storyReceipts` (complete stories with and without a quality-gate receipt; `null` until a story is complete) and published `reviewVerdicts`. |
 | `attention` | Blockers, pending items, and notes, each with `kind`, `source` (`ultragoal`, `workflow`, `subagents`, `todos`, `goal`, `state`), a stable `ref` (story id, workflow skill, or source key) when one exists, and text. |
 | `sources` | `sessionStateRead`; `unreadable` durable sources (`workflow-state`, `ultragoal-plan`), which are excluded from every count; and `recovered` sources whose snapshot record was unreadable but whose contents were rebuilt from authoritative per-entry records (per-workflow `active/<skill>.json` entries). An unreadable workflow snapshot with nothing to recover from is `unreadable`, never reported as "no active workflows". |
@@ -659,10 +659,10 @@ name. The response is a single-item page whose item has
 Semantics are deliberately conservative. Units count equally and open units
 earn no partial credit; `percent` is never 100 while a unit is open and never 0
 once one is done. `complete` requires every counted unit done, the session goal
-(if any) complete, and no subagent running or queued; otherwise a finished unit
-set reports `awaiting-completion`. Verification reports only recorded receipts
-and verdicts: receipt freshness is not validated and no confidence score is
-derived. Subagent counts come from the session's in-memory job records and
+(if any) complete, and no subagent running, queued, or paused; otherwise a
+finished unit set reports `awaiting-completion`. Verification reports only
+recorded receipts and verdicts: receipt freshness is not validated and no
+confidence score is derived. Subagent counts come from the session's in-memory job records and
 reset with the process. Lists are bounded (`omittedStories`, `omittedItems`,
 `omittedWorkflows`, `omittedAttention` report the remainder) and durable text is stripped of
 control characters and length-bounded. A session without a progress source

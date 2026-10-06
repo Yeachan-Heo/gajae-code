@@ -110,7 +110,7 @@ describe("computeProjectProgress", () => {
 		expect(text).not.toMatch(/\d+%/);
 	});
 
-	it("does not claim completion while the goal is open or subagents are still running", () => {
+	it("does not claim completion while the goal is open or subagents are running, queued, or paused", () => {
 		const todos = [{ content: "a", status: "completed" as const }];
 		const goalOpen = computeProjectProgress(
 			input({ todos, goal: { objective: "x", status: "active", timeUsedSeconds: 0 } }),
@@ -122,6 +122,23 @@ describe("computeProjectProgress", () => {
 		const agentsRunning = computeProjectProgress(input({ todos, subagents: ["running", "completed"] }));
 		expect(agentsRunning.headline).toBe("awaiting-completion");
 		expect(agentsRunning.agents).toMatchObject({ total: 2, running: 1, completed: 1 });
+
+		const goalComplete = { objective: "x", status: "complete" as const, timeUsedSeconds: 0 };
+		for (const status of ["queued", "paused"] as const) {
+			const deferred = computeProjectProgress(
+				input({ todos, goal: goalComplete, subagents: [status, "completed"] }),
+			);
+			expect(deferred.headline).toBe("awaiting-completion");
+			expect(deferred.agents).toMatchObject({ total: 2, running: 0, waiting: 1, completed: 1 });
+			const snapshot = toProjectProgressSnapshot(deferred);
+			expect(snapshot.completion).toMatchObject({ allUnitsDone: true, complete: false });
+			expect(snapshot.attention).toContainEqual({
+				kind: "pending",
+				source: "subagents",
+				ref: null,
+				text: "1 subagent still running, queued, or paused; their work counts only once it is recorded in the plan or todos.",
+			});
+		}
 
 		expect(computeProjectProgress(input({ todos })).headline).toBe("complete");
 	});
@@ -360,7 +377,7 @@ describe("collectProjectProgressInput", () => {
 				getTodoPhases: () => [],
 				getSubagentLifecycleStatuses: () => [],
 			},
-			sessionManager: { getCwd: () => tempDir.path(), getSessionId: () => SESSION_ID },
+			sessionManager: { getCwd: () => tempDir.path(), getSessionId: () => SESSION_ID, getBranch: () => [] },
 			output: (text: string) => {
 				output.push(text);
 			},
