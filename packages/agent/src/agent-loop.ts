@@ -2817,6 +2817,7 @@ class ManagedAttemptTransaction {
 	hasObservableAssistantOutput(): boolean {
 		return this.#batch.some(item => {
 			if (item.type === "assistant_event") {
+				if (managedAssistantMessageHasContent(item.message)) return true;
 				const event = item.event;
 				if (
 					event.type === "text_delta" ||
@@ -2833,6 +2834,7 @@ class ManagedAttemptTransaction {
 				return event.type === "toolcall_start" || event.type === "toolcall_delta" || event.type === "toolcall_end";
 			}
 			const event = item.event;
+			if ("message" in event && managedAssistantMessageHasContent(event.message)) return true;
 			if (event.type === "message_update") {
 				const update = event.assistantMessageEvent;
 				if (
