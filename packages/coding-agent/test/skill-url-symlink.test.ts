@@ -13,7 +13,9 @@ describe("realSkillPath", () => {
 		await writeFile(outside, "secret");
 		await symlink(outside, path.join(skillDir, "leak.txt"));
 		await expect(realSkillPath(skillDir, path.join(skillDir, "leak.txt"))).rejects.toThrow(/Path traversal/);
-		expect(await realSkillPath(skillDir, path.join(skillDir, "note.txt")).catch(() => "missing")).toBe("missing");
+		await expect(realSkillPath(skillDir, path.join(skillDir, "note.txt"))).rejects.toThrow("File not found");
+		await symlink(path.join(root, "gone.txt"), path.join(skillDir, "dangling.txt"));
+		await expect(realSkillPath(skillDir, path.join(skillDir, "dangling.txt"))).rejects.toThrow("File not found");
 		await writeFile(path.join(skillDir, "note.txt"), "ok");
 		const inside = await realSkillPath(skillDir, path.join(skillDir, "note.txt"));
 		expect(inside.endsWith(`${path.sep}note.txt`)).toBe(true);
