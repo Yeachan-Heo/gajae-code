@@ -463,10 +463,11 @@ function resolveOptionalWorktreeName(args: string[], index: number): { name: str
 	// the launch prompt and must remain in the forwarded arguments.
 	const trimmed = next.trim();
 	if (!trimmed || /\s/.test(trimmed)) return { name: null, nextIndex: index };
-	const valid = Bun.spawnSync(["git", "check-ref-format", "--branch", trimmed], {
-		stdout: "ignore",
-		stderr: "ignore",
-	}).exitCode === 0;
+	const valid =
+		Bun.spawnSync(["git", "check-ref-format", "--branch", trimmed], {
+			stdout: "ignore",
+			stderr: "ignore",
+		}).exitCode === 0;
 	return valid ? { name: trimmed, nextIndex: index + 1 } : { name: null, nextIndex: index };
 }
 
