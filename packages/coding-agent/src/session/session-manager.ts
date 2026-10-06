@@ -3414,11 +3414,10 @@ function retainedTreeSnapshotEqualsAfterRename(
 /**
  * True when a cleanup error only reports the authorized POSIX quarantine.
  *
- * `exact_remove_directory_tree` and `removeManagedTree` cannot bind the final
- * unlink to the verified root descriptor on POSIX, so they detach the tree to a
- * no-replace `<name>.removing` name and report `cleanup_pending`. No live
- * artifact survives that outcome, so it is a SUCCESSFUL cleanup and must never
- * supersede the primary failure that triggered it.
+ * Exact managed-tree removal durably detaches its captured tree into native
+ * quarantine and reports `cleanup_pending`. This is a completed cleanup
+ * disposition, not proof of physical reclamation or authority to replay the
+ * quarantine. Callers may accept it only at the specific cleanup boundary.
  */
 function isAuthorizedPendingCleanup(cleanupError: Error): boolean {
 	return cleanupError.message === "cleanup_pending";
@@ -21289,7 +21288,13 @@ export class SessionManager {
 					await parentArtifacts.commitAttemptStaging(stagedManager, staged.attemptId, {
 						beforePublish: idMap => this.remapStagedArtifactReferences(idMap),
 					});
-				} else await stagedManager.discardAttemptStaging();
+				} else {
+					try {
+						await stagedManager.discardAttemptStaging();
+					} catch (error) {
+						if (!isAuthorizedPendingCleanup(toError(error))) throw error;
+					}
+				}
 			}
 			if (staged.managedParentStore && staged.managedStagingStore) {
 				const stagedName = path.basename(staged.stagedSessionFile);

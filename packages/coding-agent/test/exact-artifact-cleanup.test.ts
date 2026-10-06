@@ -270,12 +270,17 @@ describe("exact managed artifact cleanup", () => {
 			return captureTree(relativePath);
 		});
 		try {
-			await expect(staging.discardAttemptStaging()).rejects.toThrow("artifact_staging_root_changed");
-			expect(captureSpy).toHaveBeenCalledTimes(1);
+			await expect(fixture.manager.commitAttemptStaging(staging, attemptId)).rejects.toThrow(
+				"artifact_staging_root_changed",
+			);
+			expect(captureSpy.mock.calls.map(([relativePath]) => relativePath)).toContain(stagingRelativePath);
+			expect(replaced).toBe(true);
 			expect(closeSpy).toHaveBeenCalled();
 			expect(() => stagingStore.assertBound()).toThrow();
 			expect(fs.readFileSync(replacementPayload, "utf8")).toBe("foreign replacement root");
 			expect(fs.readFileSync(path.join(displacedRoot, "2.bash.log"), "utf8")).toBe("owned staged artifact");
+			expect(fs.existsSync(path.join(fixture.root, "0.bash.log"))).toBe(false);
+			expect(await fixture.manager.save("rollback reused the available ID", "bash")).toBe("0");
 		} finally {
 			captureSpy.mockRestore();
 			closeSpy.mockRestore();
@@ -290,5 +295,71 @@ describe("exact managed artifact cleanup", () => {
 		await fixture.manager.discardAttemptStaging();
 
 		expect(fs.readFileSync(path.join(fixture.root, "parent.log"), "utf8")).toBe("parent artifact");
+	});
+
+	it.skipIf(process.platform !== "linux")(
+		"keeps published artifacts and their rollback reservation after native attempt-tree quarantine",
+		async () => {
+			const fixture = makeArtifactFixture();
+			await fixture.manager.save("preexisting parent artifact", "tool");
+			const attemptId = "commit-quarantined-attempt";
+			const staging = fixture.manager.createAttemptStaging(attemptId);
+			const stagedId = await staging.save("published candidate artifact", "tool");
+
+			const nativeResults: native.RecoveryFsRetainedCleanupResult[] = [];
+			const realNativeRemove = native.RecoveryFsRoot.prototype.removeManagedTree;
+			const nativeRemoveSpy = vi
+				.spyOn(native.RecoveryFsRoot.prototype, "removeManagedTree")
+				.mockImplementation(function (this: native.RecoveryFsRoot, relativePath, expected) {
+					const result = realNativeRemove.call(this, relativePath, expected);
+					nativeResults.push(result);
+					return result;
+				});
+			try {
+				const mapping = await fixture.manager.commitAttemptStaging(staging, attemptId);
+				expect(mapping.get(stagedId)).toBe("1");
+				expect(await Bun.file(path.join(fixture.root, "1.tool.log")).text()).toBe("published candidate artifact");
+				expect(nativeRemoveSpy).toHaveBeenCalledTimes(1);
+				const nativeResult = nativeResults[0];
+				if (!nativeResult?.recoveryPath || !nativeResult.treeSnapshot)
+					throw new Error("native_quarantine_evidence_missing");
+				expect(nativeResult).toMatchObject({ ok: false, code: "cleanup_pending" });
+				expect(
+					await Bun.file(path.join(fixture.root, nativeResult.recoveryPath, `${stagedId}.tool.log`)).text(),
+				).toBe("published candidate artifact");
+				expect(fs.existsSync(staging.dir)).toBe(false);
+
+				// A real reservation must remain so explicit rollback removes exactly
+				// the parent publication instead of treating this commit as unreserved.
+				await fixture.manager.rollbackLastAttemptCommit(attemptId);
+				expect(await fixture.manager.exists("1")).toBe(false);
+				expect(await Bun.file(path.join(fixture.root, "0.tool.log")).text()).toBe("preexisting parent artifact");
+			} finally {
+				nativeRemoveSpy.mockRestore();
+			}
+		},
+	);
+
+	it("does not classify a publication error named cleanup_pending as staging cleanup success", async () => {
+		const fixture = makeArtifactFixture();
+		const attemptId = "publication-pending-error";
+		const staging = fixture.manager.createAttemptStaging(attemptId);
+		const stagingStore = staging.getManagedStore();
+		if (!stagingStore) throw new Error("managed_attempt_store_missing");
+		fixtureStores.push(stagingStore);
+		await staging.save("must not publish", "tool");
+
+		const publishSpy = vi.spyOn(fixture.store, "publishNoReplace").mockImplementation(async () => {
+			throw new Error("cleanup_pending");
+		});
+		try {
+			await expect(fixture.manager.commitAttemptStaging(staging, attemptId)).rejects.toThrow("cleanup_pending");
+			expect(publishSpy).toHaveBeenCalledTimes(1);
+			publishSpy.mockRestore();
+			expect(await fixture.manager.save("publication error remained a failure", "tool")).toBe("0");
+			expect(await fixture.manager.exists("0")).toBe(true);
+		} finally {
+			publishSpy.mockRestore();
+		}
 	});
 });

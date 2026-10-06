@@ -268,6 +268,7 @@ afterAll(async () => {
 				"gen5-fence-disposition",
 				"gen6-diagnostic-redaction-unicode",
 				"gen6-uri-whole-token-shapes",
+				"gen11-empty-managed-staged-commit-quarantine",
 			].includes(item.id),
 		),
 	};
@@ -995,6 +996,105 @@ describe("autorouting boundary red-team: routing evidence, retries, and residue"
 		);
 		expect(pass).toBe(true);
 	});
+
+	it.skipIf(process.platform !== "linux")(
+		"managed empty staged-session commit accepts only its authorized attempt-root quarantine",
+		async () => {
+			const root = await mkdtemp(path.join(tmpdir(), "autorouting-empty-managed-staging-"));
+			const cwd = path.join(root, "cwd");
+			const agentDir = path.join(root, "agent");
+			await mkdir(cwd, { recursive: true });
+			await mkdir(agentDir, { recursive: true });
+			const parent = SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
+			let staged: SessionManager | undefined;
+			let nativeResult: native.RecoveryFsRetainedCleanupResult | undefined;
+			const realRemove = native.RecoveryFsRoot.prototype.removeManagedTree;
+			const removeSpy = vi.spyOn(native.RecoveryFsRoot.prototype, "removeManagedTree").mockImplementation(function (
+				this: native.RecoveryFsRoot,
+				relativePath,
+				expected,
+			) {
+				const result = realRemove.call(this, relativePath, expected);
+				nativeResult = result;
+				return result;
+			});
+			try {
+				await parent.flush();
+				const parentArtifacts = parent.getArtifactManager();
+				if (!parentArtifacts) throw new Error("managed parent artifact manager unavailable");
+				const parentStore = parentArtifacts.getManagedStore();
+				if (!parentStore) throw new Error("managed parent artifact store unavailable");
+				const finalPath = path.join(parentArtifacts.dir, "empty-candidate.jsonl");
+				const attemptId = "empty-managed-attempt";
+				const destination = SessionManager.nestedManagedDestination(parentStore, parentArtifacts.dir);
+				staged = await SessionManager.openStagedNestedManaged(
+					finalPath,
+					destination,
+					parentStore,
+					undefined,
+					attemptId,
+				);
+				const stagedArtifacts = staged.getArtifactManager();
+				if (!stagedArtifacts) throw new Error("staged artifact manager unavailable");
+				expect(await stagedArtifacts.listFiles()).toEqual([]);
+				expect(stagedArtifacts.getAllocatedIds()).toEqual([]);
+
+				await staged.commitStaged();
+				const finalText = await readFile(finalPath, "utf8").catch(() => null);
+				const finalHeaderLine = finalText?.split("\n", 1)[0];
+				let finalHeaderIsSession = false;
+				if (finalHeaderLine) {
+					try {
+						const parsed: unknown = JSON.parse(finalHeaderLine);
+						finalHeaderIsSession =
+							typeof parsed === "object" && parsed !== null && "type" in parsed && parsed.type === "session";
+					} catch {
+						finalHeaderIsSession = false;
+					}
+				}
+				const resultHasQuarantine =
+					nativeResult !== undefined &&
+					nativeResult.ok === false &&
+					nativeResult.code === "cleanup_pending" &&
+					typeof nativeResult.recoveryPath === "string" &&
+					nativeResult.treeSnapshot !== undefined;
+				const observed = {
+					finalPublished: finalText !== null,
+					finalHasSessionHeader: finalHeaderIsSession,
+					nativeCalls: removeSpy.mock.calls.length,
+					cleanup: nativeResult
+						? {
+								ok: nativeResult.ok,
+								code: nativeResult.code,
+								recoveryPath: nativeResult.recoveryPath,
+								treeRoot: nativeResult.treeSnapshot
+									? [nativeResult.treeSnapshot.rootDev, nativeResult.treeSnapshot.rootIno]
+									: undefined,
+							}
+						: undefined,
+				};
+				const pass =
+					observed.finalPublished &&
+					observed.finalHasSessionHeader &&
+					observed.nativeCalls === 1 &&
+					resultHasQuarantine;
+				record(
+					"gen11-empty-managed-staged-commit-quarantine",
+					"AC13",
+					`${rootCommand} -t gen11-empty-managed-staged-commit-quarantine`,
+					observed,
+					pass,
+					"An empty managed staged-session commit treated the authorized attempt-tree quarantine as publication failure or failed to publish its transcript.",
+				);
+				expect(pass).toBe(true);
+			} finally {
+				removeSpy.mockRestore();
+				await staged?.close().catch(() => undefined);
+				await parent.close().catch(() => undefined);
+				await rm(root, { recursive: true, force: true });
+			}
+		},
+	);
 
 	it("injection: rejects traversal attempt IDs before any outside-staging write", async () => {
 		const root = await mkdtemp(path.join(tmpdir(), "autorouting-attempt-id-"));
@@ -3052,7 +3152,34 @@ describe("autorouting boundary red-team generation 8 delta re-attacks", () => {
 			publishSpy.mockRestore();
 			removeSpy.mockRestore();
 		}
-		await staged.discardAttemptStaging();
+		const discardResults: native.RecoveryFsRetainedCleanupResult[] = [];
+		const realRemoveTree = native.RecoveryFsRoot.prototype.removeManagedTree;
+		const discardSpy = vi.spyOn(native.RecoveryFsRoot.prototype, "removeManagedTree").mockImplementation(function (
+			this: native.RecoveryFsRoot,
+			relativePath,
+			expected,
+		) {
+			const result = realRemoveTree.call(this, relativePath, expected);
+			discardResults.push(result);
+			return result;
+		});
+		try {
+			if (process.platform === "linux")
+				await expect(staged.discardAttemptStaging()).rejects.toThrow("cleanup_pending");
+			else await staged.discardAttemptStaging();
+		} finally {
+			discardSpy.mockRestore();
+		}
+		if (process.platform === "linux") {
+			expect(discardResults).toHaveLength(1);
+			expect(discardResults[0]).toMatchObject({ ok: false, code: "cleanup_pending" });
+			const quarantine = discardResults[0];
+			if (!quarantine?.recoveryPath || !quarantine.treeSnapshot)
+				throw new Error("native_quarantine_evidence_missing");
+			expect(await readFile(path.join(parentDir, quarantine.recoveryPath, "0.tool.log"), "utf8")).toBe("first");
+			expect(await readFile(path.join(parentDir, quarantine.recoveryPath, "1.tool.log"), "utf8")).toBe("second");
+			expect(await readFile(path.join(parentDir, "1.tool.log"), "utf8")).toBe("first");
+		}
 		const errors = failure instanceof AggregateError ? failure.errors : [];
 		const nextIds = [parent.allocateId(), parent.allocateId()];
 		const observed = {
@@ -3099,7 +3226,27 @@ describe("autorouting boundary red-team generation 8 delta re-attacks", () => {
 		const staged = parent.createAttemptStaging("gen8-rollback-retire");
 		await staged.save("first", "tool");
 		await staged.save("second", "tool");
-		const mapping = await parent.commitAttemptStaging(staged, "gen8-rollback-retire");
+		const nativeResults: native.RecoveryFsRetainedCleanupResult[] = [];
+		const realRemoveTree = native.RecoveryFsRoot.prototype.removeManagedTree;
+		const nativeRemoveSpy = vi
+			.spyOn(native.RecoveryFsRoot.prototype, "removeManagedTree")
+			.mockImplementation(function (this: native.RecoveryFsRoot, relativePath, expected) {
+				const result = realRemoveTree.call(this, relativePath, expected);
+				nativeResults.push(result);
+				return result;
+			});
+		let mapping: ReadonlyMap<string, string>;
+		try {
+			mapping = await parent.commitAttemptStaging(staged, "gen8-rollback-retire");
+		} finally {
+			nativeRemoveSpy.mockRestore();
+		}
+		if (process.platform === "linux") {
+			expect(nativeResults).toHaveLength(1);
+			expect(nativeResults[0]).toMatchObject({ ok: false, code: "cleanup_pending" });
+			expect(nativeResults[0]?.recoveryPath).toBeDefined();
+			expect(nativeResults[0]?.treeSnapshot).toBeDefined();
+		}
 		const removalAttempts: string[] = [];
 		const removeSpy = vi.spyOn(parent, "removeNamedBestEffort").mockImplementation(async filename => {
 			removalAttempts.push(filename);
@@ -3123,7 +3270,24 @@ describe("autorouting boundary red-team generation 8 delta re-attacks", () => {
 		await successParent.save("sibling", "tool");
 		const successStaged = successParent.createAttemptStaging("gen8-rollback-success");
 		await successStaged.save("candidate", "tool");
-		const successMapping = await successParent.commitAttemptStaging(successStaged, "gen8-rollback-success");
+		const successNativeResults: native.RecoveryFsRetainedCleanupResult[] = [];
+		const successNativeRemoveSpy = vi
+			.spyOn(native.RecoveryFsRoot.prototype, "removeManagedTree")
+			.mockImplementation(function (this: native.RecoveryFsRoot, relativePath, expected) {
+				const result = realRemoveTree.call(this, relativePath, expected);
+				successNativeResults.push(result);
+				return result;
+			});
+		let successMapping: ReadonlyMap<string, string>;
+		try {
+			successMapping = await successParent.commitAttemptStaging(successStaged, "gen8-rollback-success");
+		} finally {
+			successNativeRemoveSpy.mockRestore();
+		}
+		if (process.platform === "linux") {
+			expect(successNativeResults).toHaveLength(1);
+			expect(successNativeResults[0]).toMatchObject({ ok: false, code: "cleanup_pending" });
+		}
 		await successParent.rollbackLastAttemptCommit("gen8-rollback-success");
 		const rewoundId = successParent.allocateId();
 		const successPublishedId = successMapping.get("0") ?? "missing";

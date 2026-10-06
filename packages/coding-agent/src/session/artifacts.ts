@@ -83,6 +83,13 @@ function normalizeByteRange(size: number, range: ArtifactByteRange): { start: nu
 const ARTIFACT_STREAM_CHUNK_BYTES = 64 * 1024;
 const ARTIFACT_RANGE_READ_CHUNK_BYTES = 64 * 1024 * 1024;
 
+type AttemptStagingCleanupClassification = { kind: "authorized_quarantine" } | { kind: "failure"; error: unknown };
+
+function classifyAttemptStagingCleanupFailure(error: unknown): AttemptStagingCleanupClassification {
+	return error instanceof Error && error.message === "cleanup_pending"
+		? { kind: "authorized_quarantine" }
+		: { kind: "failure", error };
+}
 export interface ArtifactSaveOptions {
 	maxBytes?: number;
 }
@@ -508,7 +515,13 @@ export class ArtifactManager {
 				publishedNames.push(mappedFilename);
 			}
 			this.#reservations.set(attemptId, { start, count: ids.length, names: [...publishedNames] });
-			await staging.discardAttemptStaging();
+			try {
+				await staging.discardAttemptStaging();
+			} catch (error) {
+				const cleanup = classifyAttemptStagingCleanupFailure(error);
+				if (cleanup.kind === "authorized_quarantine") return frozenMap;
+				throw cleanup.error;
+			}
 			return frozenMap;
 		} catch (error) {
 			// Cleanup is best-effort, but a durable removal failure must never be silent: it leaves a
