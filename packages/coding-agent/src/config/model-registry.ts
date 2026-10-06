@@ -4996,7 +4996,13 @@ export class ModelRegistry {
 			const generated = this.#generatedAuthHeaders.get(models[index]!);
 			if (generated) this.#generatedAuthHeaders.set(result[index]!, generated);
 			// Register finalized clone as trusted if the original is trusted
-			if (result[index]) registerFinalizedModelClone(models[index]!, result[index]);
+			// registerFinalizedModelClone builds a fresh trusted object from the original's snapshot
+			if (result[index]) {
+				const registeredClone = registerFinalizedModelClone(models[index]!, result[index]);
+				if (registeredClone) {
+					result[index] = registeredClone;
+				}
+			}
 		}
 		return result;
 	}
