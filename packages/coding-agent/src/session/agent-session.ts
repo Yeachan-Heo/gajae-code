@@ -5160,17 +5160,26 @@ export class AgentSession {
 	}
 
 	#flushPendingAgentEnd(): void {
+		// Collect SDK agent_ends to publish before modifying the set to avoid iterator issues (PR #6388).
+		// Publish both handled SDK agent_ends (with decisions) and deferred ones (without decisions).
+		const sdkPendingsToPublish: Array<[AgentSessionEvent, RunResourceProducerLease | undefined]> = [];
 		for (const sdkPending of this.#pendingSdkAgentEnds) {
-			if (!this.#agentEndContinuationDecisions.has(sdkPending)) continue;
+			// Skip only if it's being held for a continuation
 			if ([...this.#pendingAgentEndContinuationHolds.values()].includes(sdkPending)) continue;
+			const sdkLease = this.#deferredAgentEndLeases.get(sdkPending);
+			sdkPendingsToPublish.push([sdkPending, sdkLease]);
+		}
+		// Now publish collected items.
+		for (const [sdkPending, sdkLease] of sdkPendingsToPublish) {
 			this.#pendingSdkAgentEnds.delete(sdkPending);
 			if (this.#pendingAgentEndEmit === sdkPending) this.#pendingAgentEndEmit = undefined;
-			const sdkLease = this.#deferredAgentEndLeases.get(sdkPending);
 			this.#deferredAgentEndLeases.delete(sdkPending);
 			this.#startAgentEndPublication(sdkPending, sdkLease);
 		}
 		const pending = this.#pendingAgentEndEmit;
-		if (pending && this.#pendingSdkAgentEnds.has(pending)) return;
+		// Skip fallback publish if the pending agent_end is a held SDK agent_end WITH a decision (already handled by loop above).
+		// But allow publishing held SDK agent_ends without decisions through the fallback path.
+		if (pending && this.#pendingSdkAgentEnds.has(pending) && this.#agentEndContinuationDecisions.has(pending)) return;
 		if (
 			this.#livePromptsInFlight() > 0 ||
 			this.#agentEventHandlersInFlight > 0 ||
@@ -10425,7 +10434,13 @@ export class AgentSession {
 			const publicationFailure = Object.assign(new Error("Session disposed before SDK terminal publication."), {
 				code: "cancelled",
 			});
-			for (const publication of this.#sdkTerminalPublications.values()) publication.reject(publicationFailure);
+			// Only reject publications that are not currently being published (PR #6388 deferral).
+			// Deferred publications should be allowed to complete naturally.
+			for (const publication of this.#sdkTerminalPublications.values()) {
+				if (!this.#publishingSdkTerminals.has(publication)) {
+					publication.reject(publicationFailure);
+				}
+			}
 			this.#sdkTerminalPublications.clear();
 			// Invalidate every coordinator event admitted before disposal. Handlers may
 			// still unwind, but their captured generation can no longer enqueue a write.
