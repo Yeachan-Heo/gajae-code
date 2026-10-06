@@ -756,7 +756,9 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				if (toolcallIndex === undefined) {
 					toolcallIndex = index;
 				}
-				pendingToolCalls.push({ input: currentTool.input, toolCall, index });
+			const toolArgs = typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+			const normalizedArgs = JSON.stringify(toolArgs);
+			pendingToolCalls.push({ input: normalizedArgs, toolCall, index });
 				currentTool = undefined;
 			};
 
