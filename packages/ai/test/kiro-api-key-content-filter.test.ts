@@ -1184,4 +1184,66 @@ describe("Regression tests for #6151 issues", () => {
 		const MAX_RESCAN_DISTANCE = 64 * 1024;
 		expect(result.remaining.length).toBeLessThanOrEqual(MAX_RESCAN_DISTANCE);
 	});
+
+	test("#4199282140: balanced junk wrapper around valid refusal event is rescanned", async () => {
+		const { parseKiroApiEvents } = await import("../src/providers/kiro-api-key");
+
+		// Codex finding: balanced junk wrapper around a valid event
+		// e.g. '{junk{"stopReason":"CONTENT_FILTERED",...}}' should not be discarded
+		const balancedJunkWrapper =
+			'{junk{"stopReason":"CONTENT_FILTERED","stopDetails":{"refusal":{"category":"CYBER","explanation":"Malicious"}}}}}';
+
+		const result = parseKiroApiEvents(balancedJunkWrapper);
+
+		// Should parse the refusal event from inside the junk wrapper
+		const refusalEvent = result.events.find(e => e.type === "refusal");
+		expect(refusalEvent).toBeDefined();
+		if (refusalEvent?.type === "refusal") {
+			expect(refusalEvent.data.stopReason).toBe("CONTENT_FILTERED");
+			expect(refusalEvent.data.stopDetails?.refusal?.category).toBe("CYBER");
+		}
+	});
+
+	test("#4199282147: ordinary error after incomplete toolUse does not emit unfinished tool", async () => {
+		const emittedEventTypes: string[] = [];
+
+		globalThis.fetch = (async () => {
+			// Incomplete toolUse (no stop flag) followed by ordinary error
+			// Error occurs after toolUse start but before stop
+			const incompleteToolJson = JSON.stringify({
+				toolUseId: "tool-incomplete",
+				name: "search",
+				input: '{"query": "incomplete',
+				// Note: no 'stop: true' - tool is not complete
+			});
+			const errorJson = JSON.stringify({
+				error: "rate_limit",
+				message: "Too many requests",
+			});
+			const responseBody = incompleteToolJson + errorJson;
+			return new Response(responseBody, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEventTypes.push(event.type);
+			}
+		} catch {
+			// Stream may throw; errors are captured in events
+		}
+
+		// Incomplete tools (no stop flag) must NOT be emitted, only error
+		const toolcallStart = emittedEventTypes.indexOf("toolcall_start");
+		const toolcallEnd = emittedEventTypes.indexOf("toolcall_end");
+		const errorIdx = emittedEventTypes.indexOf("error");
+
+		// REGRESSION: The incomplete tool should NOT be emitted
+		// Currently (buggy behavior), toolcall_start/end are emitted
+		// After fix: toolcall_start/end should NOT appear
+		expect(toolcallStart).toBe(-1);
+		expect(toolcallEnd).toBe(-1);
+		// Only error event should be present
+		expect(errorIdx).toBeGreaterThan(-1);
+	});
 });

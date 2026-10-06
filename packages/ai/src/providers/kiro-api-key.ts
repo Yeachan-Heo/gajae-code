@@ -468,8 +468,9 @@ export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[];
 			continue;
 		}
 
+		let parsed: Record<string, unknown> | undefined;
 		try {
-			const parsed = JSON.parse(buffer.slice(start, end + 1)) as Record<string, unknown>;
+			parsed = JSON.parse(buffer.slice(start, end + 1)) as Record<string, unknown>;
 
 			// Classify event based on fields present (order-independent)
 			if (typeof parsed.content === "string") {
@@ -527,7 +528,37 @@ export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[];
 				});
 			}
 		} catch {
-			// skip malformed frame
+			// JSON parsing failed for a balanced frame: could be a junk wrapper like '{junk{...}}'
+			// Rescan for valid JSON objects inside the failed frame
+			const strayBraceEnd = Math.min(start + MAX_RESCAN_DISTANCE, buffer.length);
+			let resyncPos = start + 1;
+			let found = false;
+			while (resyncPos < strayBraceEnd) {
+				const nextStart = buffer.indexOf("{", resyncPos);
+				if (nextStart < 0 || nextStart > end) break; // Don't go past the found end
+
+				// Try to find the end of this candidate
+				const nextEnd = findJsonEnd(buffer, nextStart);
+				if (nextEnd >= 0) {
+					// Found a candidate that closes. Try to parse it as valid JSON.
+					try {
+						const candidate = buffer.slice(nextStart, nextEnd + 1);
+						JSON.parse(candidate);
+						// Valid JSON found. Resync to this position and continue processing.
+						pos = nextStart;
+						found = true;
+						break;
+					} catch {
+						// Not valid JSON, keep looking
+					}
+				}
+				resyncPos = nextStart + 1;
+			}
+			if (found) {
+				// Found valid JSON inside the junk wrapper, continue processing from there
+				continue;
+			}
+			// No valid JSON found; just skip this malformed frame
 		}
 
 		pos = end + 1;
@@ -710,6 +741,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 
 		// Variables for streaming tool calls (initialized before try block so they're accessible in catch)
 		let currentTool: { id: string; name: string; input: string } | undefined;
+		let toolComplete = false; // Track whether the current tool has been completed (has stop flag)
 		let toolcallIndex: number | undefined;
 		const pendingToolCalls: Array<{ input: string; toolCall: ToolCall; index: number }> = [];
 
@@ -840,6 +872,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			const clearPendingToolCalls = () => {
 				pendingToolCalls.length = 0;
 				currentTool = undefined;
+				toolComplete = false; // Reset tool completion flag
 			};
 
 			let textStartDeferred = false; // Track if text_start has been deferred pending thinking
@@ -1017,10 +1050,14 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 							if (currentTool && currentTool.id !== event.data.toolUseId) addToolToBlocks();
 							if (!currentTool) {
 								currentTool = { id: event.data.toolUseId, name: event.data.name, input: event.data.input };
+								toolComplete = false; // New tool starts as incomplete
 							} else {
 								currentTool.input += event.data.input;
 							}
-							if (event.data.stop) addToolToBlocks();
+							if (event.data.stop) {
+								toolComplete = true; // Mark tool as complete when stop flag is set
+								addToolToBlocks();
+							}
 						}
 					} else if (event.type === "toolUseInput" && currentTool && !hasTerminalEvent) {
 						if (!firstTokenEmitted) {
@@ -1029,6 +1066,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						}
 						currentTool.input += event.data.input;
 					} else if (event.type === "toolUseStop" && event.data.stop) {
+						toolComplete = true; // Mark tool as complete when toolUseStop is received
 						addToolToBlocks();
 					} else if (event.type === "usage") {
 						if (event.data.inputTokens !== undefined) output.usage.input = event.data.inputTokens;
@@ -1081,9 +1119,10 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 							return;
 						}
 					} else if (event.type === "error") {
-						// On ordinary errors, flush pending tool events before the error terminal
-						// (refusals drop them, but ordinary errors preserve content consistency)
-						addToolToBlocks();
+						// On ordinary errors, flush pending COMPLETED tool events before the error terminal
+						// (refusals drop them, incomplete tools must not be emitted)
+						// Only emit the tool if it was explicitly completed (has stop flag)
+						if (toolComplete) addToolToBlocks();
 						emitPendingToolCalls();
 
 						// Preserve any already-accumulated text in the error context
