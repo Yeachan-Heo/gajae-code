@@ -51,6 +51,12 @@ Migration does not automatically clean up legacy files, copied files, locks, art
 
 Managed storage enforces owner-only directory/file security and refuses unsafe symlinks or malformed bindings on the paths it verifies. This is a local storage-integrity boundary, not authentication, authorization, encryption, or a guarantee against a hostile concurrent local actor/race outside the verified operations. Callers must still protect the agent directory and session contents.
 
+Path-backed descendant stores reject a final pathname symlink even when it points to the original directory with the same device and inode. A derived subtree store owns its newly retained native authority: closing the store releases that authority once, and failed construction releases it before returning an error. Directly supplied authorities remain borrowed and caller-owned.
+
+GC retirement receipt publication rejects a candidate exceeding 64 MiB of canonical UTF-8 JSON, including its trailing newline, before candidate codec serialization or receipt-buffer allocation. Strict authority and continuation validation still applies to admitted receipts. This individual-receipt limit does not bound aggregate journal history or prove writer quiescence or physical retirement.
+
+Managed artifact rollback removes only the exact captured named artifact or an attempt's issued subtree identity; newly observed `.gjc-*` or `.removing` names are not deletion authority. Attempt cleanup releases its own retained child on every outcome without closing the borrowed parent or independent authorities. Native tree removal can durably detach the exact tree into recovery quarantine and report `cleanup_pending`; direct discard propagates that outcome. At the post-publication staging cleanup boundary, authorized pending cleanup preserves the completed artifact mapping and reservation rather than rolling back published files, including for empty-artifact staged sessions. Publication and identity failures still fail normally. Canonical absence or returned quarantine evidence does not prove physical reclamation or authorize a residue sweep.
+
 On Linux filesystems where the exact POSIX ACL xattr operation returns `ENOTSUP`/`EOPNOTSUPP`, GJC treats that result only as proof that the filesystem cannot store that ACL attribute. The ACL gate still requires the same opened object to pass effective-owner, exact `0700` directory or `0600` file mode, safe-type, no-follow traversal, and identity/replacement checks. Permission denial, I/O errors, present or malformed ACL data, and unknown results remain failures. Managed descriptors use close-on-exec and are not delegated as authority to subprocesses. This compatibility rule does not change explicit `--session-dir`, macOS ACL, or Windows DACL policy.
 
 Managed migration-lock release checks its retained descriptor before native security verification. On Linux, a closed or reused descriptor can be replaced only by reopening the same lock file with no-follow, owner-only security and original file identity checks; the original attempt id must still own the lock before its released record is written. A successor or an insecure replacement is never release authority. Repeated release is inert and cannot retire a successor.
@@ -536,6 +542,8 @@ Implementations:
 - `MemorySessionStorage`: map-backed in-memory implementation for tests/non-persistent sessions
 
 `SessionStorageWriter` exposes `writeLine`, `flush`, `fsync`, `close`, `getError`.
+
+Rollback snapshots are authenticated by the issuing live manager; copied, modified, or foreign objects cannot redirect restoration. Explicit persisted-file identity checks support already-admitted cold transcripts above 128 MiB without hashing the entire file: each check requests at most 8,585,217 bytes and compares the canonical pathname, session ID, file identity, size, and modification/change timestamps across bounded reads. This metadata-dependent fingerprint is not whole-file cryptographic coverage or one retained descriptor; unsampled changes preserving every compared field remain outside its detection boundary. Rejected cold restoration leaves the current session installed.
 
 ## Session Discovery Utilities
 

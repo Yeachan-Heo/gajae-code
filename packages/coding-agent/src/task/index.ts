@@ -1738,6 +1738,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const parentActiveModelProfile = (
 			this.session as { getActiveModelProfile?: () => string | undefined }
 		).getActiveModelProfile?.();
+		// Propagate the parent session's ownership marker when a session-local profile is active.
+		const parentModelProfileOwnershipMarker = (
+			this.session as { sessionManager?: { getModelProfileOwnershipMarker?: () => unknown } }
+		).sessionManager?.getModelProfileOwnershipMarker?.();
 		const parentProfileDefinition = parentActiveModelProfile
 			? this.session.modelRegistry?.getModelProfile?.(parentActiveModelProfile)
 			: undefined;
@@ -2273,6 +2277,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						modelOverride: effectivePatterns(index),
 						parentActiveModelPattern,
 						parentActiveModelProfile: parentOwnedModelProfile,
+						parentModelProfileOwnershipMarker: parentModelProfileOwnershipMarker as any,
 						parentSessionId: this.session.getSessionId?.() ?? undefined,
 						parentCredentialSessionId:
 							this.session.getCredentialSessionId?.() ?? this.session.getSessionId?.() ?? undefined,
@@ -2360,6 +2365,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						modelOverride: effectivePatterns(index),
 						parentActiveModelPattern,
 						parentActiveModelProfile: parentOwnedModelProfile,
+						parentModelProfileOwnershipMarker: parentModelProfileOwnershipMarker as any,
 						parentSessionId: this.session.getSessionId?.() ?? undefined,
 						parentCredentialSessionId:
 							this.session.getCredentialSessionId?.() ?? this.session.getSessionId?.() ?? undefined,

@@ -33,6 +33,7 @@ import * as canonicalSdk from "@gajae-code/coding-agent/sdk";
 import { logger, prompt, untilAborted } from "@gajae-code/utils";
 import { AsyncJobManager } from "../async";
 import { AUTOROUTING_SELECTOR_MAX_LENGTH, type AutoroutingReasonCode } from "../config/autorouting-contract";
+import type { ModelProfileOwnershipMarker } from "../config/model-profile-ownership";
 import { ModelRegistry } from "../config/model-registry";
 import {
 	formatModelString,
@@ -262,6 +263,8 @@ export interface ExecutorOptions {
 	 * Manual/direct parents (no active profile) keep exact resolution.
 	 */
 	parentActiveModelProfile?: string;
+	/** Parent session's model profile ownership marker for propagating to subagent sessions. */
+	parentModelProfileOwnershipMarker?: ModelProfileOwnershipMarker;
 	parentSessionId?: string;
 	parentCredentialSessionId?: string;
 	thinkingLevel?: ThinkingLevel;
@@ -2026,6 +2029,7 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 					model,
 					thinkingLevel: effectiveThinkingLevel,
 					activeModelProfile: options.parentActiveModelProfile,
+					modelProfileOwnershipMarker: options.parentModelProfileOwnershipMarker,
 					credentialSessionId: options.parentCredentialSessionId ?? options.parentSessionId,
 					modelSubstitution:
 						modelSubstitutionWarning?.reason === "auth_unavailable" && requestedModel

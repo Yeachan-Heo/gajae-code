@@ -1,6 +1,7 @@
 import { describe, expect, spyOn, test, vi } from "bun:test";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import { type Model, THINKING_EFFORTS } from "@gajae-code/ai";
+import { logger } from "@gajae-code/utils";
 import { CliParseError } from "@gajae-code/utils/cli";
 import { parseArgs } from "../src/cli/args";
 import { ROOT_THINKING_LEVELS } from "../src/cli/root-flags";
@@ -851,6 +852,76 @@ test("interactive resume keeps a session open when its default profile requires 
 	expect(getApiKeyForProvider).not.toHaveBeenCalled();
 	expect(session.model).toBeUndefined();
 	expect(settings.get("modelProfile.default")).toBe(profile.name);
+});
+
+test("interactive startup logs a default profile skipped for missing credentials", async () => {
+	const profile: ModelProfileDefinition = {
+		name: "logged-pinned-default",
+		requiredProviders: ["profile-provider"],
+		modelMapping: { default: "profile-provider/default" },
+		source: "user",
+	};
+	const session = fakeSession(null);
+	const settings = Settings.isolated({ "modelProfile.default": profile.name });
+	const registry = {
+		...fakeRegistry([profile]),
+		getApiKeyForProvider: vi.fn(async () => "another-account-key"),
+		authStorage: {
+			hasRuntimeApiKey: () => false,
+			hasLiteralConfigApiKey: () => false,
+			hasSessionCredentialUnavailable: (provider: string, scope: string) =>
+				provider === "profile-provider" && scope === session.credentialSessionId,
+		},
+	};
+	const warnSpy = spyOn(logger, "warn").mockImplementation(() => {});
+	try {
+		const result = await applyStartupModelProfilesForRoot({
+			session,
+			settings,
+			modelRegistry: registry as never,
+			parsedArgs: { resume: "saved-session" },
+			isInteractive: true,
+			hasInteractiveTerminal: true,
+			initialMessage: undefined,
+			initialMessages: [],
+			resumeAction: undefined,
+		});
+		expect(result.recoverableErrors).toHaveLength(1);
+		expect(warnSpy).toHaveBeenCalledWith(
+			"Startup model profile not applied: missing provider credentials",
+			expect.objectContaining({
+				profile: profile.name,
+				errorClass: "ModelProfileCredentialError",
+				providers: ["profile-provider"],
+			}),
+		);
+	} finally {
+		warnSpy.mockRestore();
+	}
+});
+
+test("input-free interactive startup logs a stale persisted default", async () => {
+	const warnSpy = spyOn(logger, "warn").mockImplementation(() => {});
+	try {
+		const result = await applyStartupModelProfilesForRoot({
+			session: fakeSession(null),
+			settings: Settings.isolated({ "modelProfile.default": "deleted-profile" }),
+			modelRegistry: fakeRegistry([]) as never,
+			parsedArgs: {},
+			isInteractive: true,
+			hasInteractiveTerminal: true,
+			initialMessage: undefined,
+			initialMessages: [],
+			resumeAction: undefined,
+		});
+		expect(result.recoverableErrors).toHaveLength(1);
+		expect(warnSpy).toHaveBeenCalledWith(
+			"Startup model profile not applied: unknown profile",
+			expect.objectContaining({ profile: "deleted-profile", errorClass: "UnknownModelProfileError" }),
+		);
+	} finally {
+		warnSpy.mockRestore();
+	}
 });
 
 test("interactive resume honors a runtime API key over an unavailable pin for the default profile", async () => {

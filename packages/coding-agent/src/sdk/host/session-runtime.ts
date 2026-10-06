@@ -773,12 +773,13 @@ interface AcceptedQueueCancellation {
 function retireAcceptedQueueCancellation(
 	cancellations: Map<string, AcceptedQueueCancellation>,
 	correlation: InvocationCorrelation,
+	durableTerminalConfirmed = false,
 ): void {
 	const key = `${correlation.commandId}:${correlation.turnId}`;
 	const cancellation = cancellations.get(key);
 	if (!cancellation) return;
 	if (!cancellation.controller.signal.aborted) cancellation.controller.abort();
-	if (cancellation.disposition === "removed" && cancellation.removalTerminalization) {
+	if (!durableTerminalConfirmed && cancellation.disposition === "removed" && cancellation.removalTerminalization) {
 		void cancellation.removalTerminalization.then(published => {
 			if (published && cancellations.get(key) === cancellation) cancellations.delete(key);
 		});
@@ -4854,8 +4855,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						return disposition === "removed" && (await cancellation.removalTerminalization) === true;
 					})();
 					const published = await Promise.race([publication, timedOut.promise.then(() => false)]);
-					if (published) {
-						const key = `${cancellation.correlation.commandId}:${cancellation.correlation.turnId}`;
+					const key = `${cancellation.correlation.commandId}:${cancellation.correlation.turnId}`;
+					if (published || acceptedQueueCancellations.get(key) !== cancellation) {
 						if (acceptedQueueCancellations.get(key) === cancellation) acceptedQueueCancellations.delete(key);
 					} else {
 						failures.push(
@@ -5038,13 +5039,18 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		owner.unrecordedFailureReasons?.clear();
 		for (const [token, binding] of lifecycleRunOwners) if (binding.state === owner) lifecycleRunOwners.delete(token);
 	};
+	const hasQueuedTerminalRecovery = (owner: RuntimeState): boolean =>
+		[...acceptedQueueCancellations.values()].some(
+			cancellation => cancellation.disposition === "removed" && owner.deadlineManager.has(cancellation.correlation),
+		);
 	const maybeRetireLifecycleOwner = (owner: RuntimeState): void => {
 		if (
 			owner.pending.length > 0 ||
 			owner.openLifecycleBatches.length > 0 ||
 			(owner.attachedInvocations?.length ?? 0) > 0 ||
 			(owner.drainedInvocations?.length ?? 0) > 0 ||
-			owner.lifecycleTasks.size > 0
+			owner.lifecycleTasks.size > 0 ||
+			hasQueuedTerminalRecovery(owner)
 		)
 			return;
 		removeRetiredLifecycleOwner(owner);
@@ -6231,7 +6237,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	api.on("turn_start", async (_event, ctx) => {
 		const current = lifecycleStateForContext(ctx, "agent_start");
 		if (!current) return;
-		await current.registerBroker();
+		// Optional broker discovery must not hold an interactive extension event open.
+		// registerBroker owns single-flight recovery and optional-failure diagnostics.
+		const registration = current.registerBroker();
+		if (options.brokerRegistrationRequired) await registration;
 		current.runtime.emitEvent({ type: "turn_start", sessionId: ctx.sessionManager.getSessionId() });
 	});
 	const consumedMasterNonces = new Map<string, number>();
@@ -6632,6 +6641,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				});
 			},
 			onExpired: correlation => {
+				retireAcceptedQueueCancellation(acceptedQueueCancellations, correlation, true);
 				const owner = lifecycleOwnerHolder.state;
 				if (!owner) return;
 				removeLifecycleReferences(owner, correlation);
@@ -7325,7 +7335,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		const startupImageCapture = captureStartupRuntimeImage();
 		const registerBroker = async (): Promise<void> => {
-			if (brokerRegistered) return;
+			if (brokerRecoveryStopped || brokerRegistered) return;
 			if (brokerRegistrationInFlight !== undefined) {
 				await brokerRegistrationInFlight;
 				return;
@@ -7358,6 +7368,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 								throw new Error("SDK transport endpoint was not published before broker registration.");
 							const endpointPath = path.join(input.stateRoot, "sdk", `${input.sessionId}.json`);
 							const file = await readEndpointFile(endpointPath);
+							if (brokerRecoveryStopped) return;
 							if (!file) throw new Error("SDK endpoint could not be read as a stable regular file.");
 							const endpoint = JSON.parse(file.source) as Record<string, unknown>;
 							if (
@@ -7561,11 +7572,22 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		active = runtimeOwner;
 		try {
 			publishedEndpointUrl = (await runtime.start()).url;
-			await registerBroker();
+			// Required lifecycle hosts remain fail-closed; optional hosts publish locally
+			// and recover broker availability outside the extension watchdog.
+			const registration = registerBroker();
+			if (options.brokerRegistrationRequired) await registration;
 			// Await the startup runtime image capture before arming recovery.
 			// This ensures replacement detection works correctly on the first recovery check.
 			await startupImageCapture;
-			if (!brokerRecoveryStopped) startBrokerRecovery();
+			// Recovery arms only after the startup attempt settles, so no tick overlaps it, and
+			// a failed startup attempt holds the backoff like a failed recovery registration.
+			const armBrokerRecovery = (): void => {
+				if (brokerRecoveryStopped) return;
+				if (!brokerRegistered) brokerRecoveryBackoff.recordFailure(options.agentDir);
+				startBrokerRecovery();
+			};
+			if (options.brokerRegistrationRequired) armBrokerRecovery();
+			else void registration.then(armBrokerRecovery);
 		} catch (error) {
 			runtimeOwner.quiesceInput();
 			runtimeOwner.fenceGateResolutions();
@@ -7676,7 +7698,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				current.openLifecycleBatches.length > 0 ||
 				(current.attachedInvocations?.length ?? 0) > 0 ||
 				(current.drainedInvocations?.length ?? 0) > 0 ||
-				current.lifecycleTasks.size > 0;
+				current.lifecycleTasks.size > 0 ||
+				hasQueuedTerminalRecovery(current);
 			if (retainsLifecycleWork) {
 				const owners = retiredLifecycleOwners.get(current.sessionId) ?? [];
 				if (!owners.includes(current)) owners.push(current);
@@ -7688,7 +7711,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						current.openLifecycleBatches.length > 0 ||
 						(current.attachedInvocations?.length ?? 0) > 0 ||
 						(current.drainedInvocations?.length ?? 0) > 0 ||
-						current.lifecycleTasks.size > 0
+						current.lifecycleTasks.size > 0 ||
+						hasQueuedTerminalRecovery(current)
 					) {
 						const retry = setTimeout(retryCleanup, LIFECYCLE_QUIESCENCE_MS);
 						retry.unref();

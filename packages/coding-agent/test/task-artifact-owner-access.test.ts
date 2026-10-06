@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
+import { ArtifactManager } from "../src/session/artifacts";
 import {
 	type ManagedDirectoryRoot,
 	ManagedSessionDescendantStore,
@@ -14,6 +15,7 @@ import {
 	newSessionRootStore,
 	openOwnerStore,
 } from "../src/session/internal/task-artifact-owner-access";
+import { SessionManager } from "../src/session/session-manager";
 import {
 	OWNER_DIRECTORY,
 	OWNER_MANIFEST,
@@ -127,6 +129,126 @@ async function replaceManifest(fixture: OwnerFixture, value: Uint8Array): Promis
 		ownerStore.close();
 	}
 }
+
+describe("generic artifact continuation without owner publication", () => {
+	it.each([
+		["allocate", "replace"],
+		["allocate", "close"],
+		["save", "replace"],
+		["save", "close"],
+		["allocate", "switch"],
+		["save", "switch"],
+	] as const)("fences %s after %s during the final allocation await", async (operation, transition) => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-artifact-final-await-"));
+		fixtureRoots.push(root);
+		const session = SessionManager.create(root, SessionManager.managedDestination(root, root));
+		session.appendMessage({ role: "user", content: "real managed transcript", timestamp: 1 });
+		await session.ensureOnDisk();
+		const manager = session.getArtifactManager();
+		if (!manager) throw new Error("Expected live artifact manager");
+		let targetFile: string | undefined;
+		if (transition === "switch") {
+			const target = SessionManager.create(root, SessionManager.managedDestination(root, root));
+			try {
+				target.appendMessage({ role: "user", content: "switched transcript", timestamp: 2 });
+				await target.ensureOnDisk();
+				targetFile = target.getSessionFile();
+			} finally {
+				await target.close();
+			}
+			session.adoptArtifactManager(manager);
+		}
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const allocate = manager.allocatePath.bind(manager);
+		let reservedId: string | undefined;
+		const allocation = vi.spyOn(manager, "allocatePath").mockImplementation(async toolType => {
+			const reserved = await allocate(toolType);
+			reservedId = reserved.id;
+			entered.resolve();
+			await release.promise;
+			return reserved;
+		});
+		const pending =
+			operation === "allocate"
+				? session.allocateArtifactPath("continuation")
+				: session.saveArtifact("must not be published", "continuation");
+		try {
+			await Promise.race([
+				entered.promise,
+				pending.then(() => {
+					throw new Error("Artifact operation completed before the allocation gate.");
+				}),
+			]);
+			if (transition === "replace")
+				session.adoptArtifactManager(new ArtifactManager(path.join(root, "replacement")));
+			else if (transition === "switch") {
+				if (!targetFile) throw new Error("Expected genuine switch target");
+				await session.setSessionFile(targetFile);
+				expect(session.getArtifactManager()).toBe(manager);
+				expect(session.getSessionFile()).toBe(targetFile);
+			} else await session.close();
+			release.resolve();
+			await expect(pending).rejects.toThrow(transition === "close" ? "closing" : "no longer authorized");
+			expect(reservedId).toBeDefined();
+			expect(await Bun.file(path.join(manager.dir, `${reservedId}.continuation.log`)).exists()).toBe(false);
+			expect(fs.existsSync(path.join(root, "replacement", `${reservedId}.continuation.log`))).toBe(false);
+			if (transition === "replace") {
+				allocation.mockRestore();
+				const freshId = await session.saveArtifact("current manager works", "continuation");
+				const freshPath = await session.getArtifactPath(freshId!);
+				if (!freshPath) throw new Error("Expected current-manager artifact");
+				expect(await Bun.file(freshPath).text()).toBe("current manager works");
+			}
+		} finally {
+			release.resolve();
+			await pending.catch(() => undefined);
+			allocation.mockRestore();
+			await session.close();
+		}
+	});
+
+	it("invalidates an awaited save even when rollback restores the same session and adopted manager", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-artifact-rollback-aba-"));
+		fixtureRoots.push(root);
+		const session = SessionManager.create(root, SessionManager.managedDestination(root, root));
+		const borrowed = new ArtifactManager(path.join(root, "shared"));
+		session.adoptArtifactManager(borrowed);
+		const snapshot = session.captureState();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const allocate = borrowed.allocatePath.bind(borrowed);
+		const allocation = vi.spyOn(borrowed, "allocatePath").mockImplementation(async toolType => {
+			const reserved = await allocate(toolType);
+			entered.resolve();
+			await release.promise;
+			return reserved;
+		});
+		const pending = session.saveArtifact("stale ABA payload", "aba");
+		try {
+			await Promise.race([
+				entered.promise,
+				pending.then(() => {
+					throw new Error("Artifact operation completed before the allocation gate.");
+				}),
+			]);
+			session.restoreState(snapshot);
+			expect(session.getSessionId()).toBe(snapshot.sessionId);
+			expect(session.getArtifactManager()).toBe(borrowed);
+			release.resolve();
+			await expect(pending).rejects.toThrow("no longer authorized");
+			expect(await borrowed.exists("0")).toBe(false);
+			allocation.mockRestore();
+			const freshId = await session.saveArtifact("fresh rollback payload", "aba");
+			expect(await borrowed.readRange(freshId!)).toBe("fresh rollback payload");
+		} finally {
+			release.resolve();
+			await pending.catch(() => undefined);
+			allocation.mockRestore();
+			await session.close();
+		}
+	});
+});
 
 describe("task artifact owner read-only access", () => {
 	it("captures immutable evidence from a complete managed owner and tolerates only a missing locator", async () => {

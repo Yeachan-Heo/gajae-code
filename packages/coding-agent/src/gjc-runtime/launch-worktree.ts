@@ -457,9 +457,18 @@ function isWorktreeDirty(worktreePath: string): boolean {
 function resolveOptionalWorktreeName(args: string[], index: number): { name: string | null; nextIndex: number } {
 	const next = args[index + 1];
 	if (!next) return { name: null, nextIndex: index };
-	if (next === "--") return { name: null, nextIndex: index };
-	if (next.startsWith("-")) return { name: null, nextIndex: index };
-	return { name: next.trim() || null, nextIndex: index + 1 };
+	if (next === "--" || next.startsWith("-")) return { name: null, nextIndex: index };
+	// A bare --worktree is the detached selector. Only consume the following
+	// positional token as a branch name when it is a valid ref; otherwise it is
+	// the launch prompt and must remain in the forwarded arguments.
+	const trimmed = next.trim();
+	if (!trimmed || /\s/.test(trimmed)) return { name: null, nextIndex: index };
+	const valid =
+		Bun.spawnSync(["git", "check-ref-format", "--branch", trimmed], {
+			stdout: "ignore",
+			stderr: "ignore",
+		}).exitCode === 0;
+	return valid ? { name: trimmed, nextIndex: index + 1 } : { name: null, nextIndex: index };
 }
 
 export function parseLaunchWorktreeMode(args: string[]): ParsedLaunchWorktreeMode {
