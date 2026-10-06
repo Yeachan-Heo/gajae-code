@@ -149,6 +149,11 @@ operation reference used for later reconciliation.
   terminal state or the wait window (`--timeout-ms`, default 30s) elapses.
   `send --wait` never cancels a running turn; a window that elapses before a
   terminal state is reported as `wait_timeout` with the last observed status.
+- `send` only starts a new turn. While the session is running a turn the host
+  refuses `turn.prompt` before admission, and the CLI reports error code `busy`
+  with `outcomeCertainty: "not-applied"`. To correct the running turn use
+  `raw control <sessionId> --op turn.steer --json-input '{"text":"..."}'`;
+  otherwise wait for the session to become idle and send again.
 
 - `--text` and the JSON input sources (`--json-input`,
   `--json-input-file` — which must be a `0600` regular file —
@@ -261,6 +266,10 @@ operation and returns the broker/host response:
 
 - `raw control <sessionId> --op <operation>` — one control operation with
   `--json-input*`; `--confirm` confirms destructive control operations.
+  Turn control ids are `turn.prompt`, `turn.steer` (`{"text":...}`),
+  `turn.follow_up`, `turn.abort` and `turn.abort_and_prompt`. An unknown id is
+  a usage error (exit `2`, diagnostic `sdk_unknown_operation`) and is never
+  dispatched.
 - `raw query <sessionId> --query <operation>` — one query; `--cursor` passes a
   continuation cursor.
 - `raw global --op <operation>` — one broker global. Lifecycle globals
@@ -376,6 +385,10 @@ and stacks are not public error evidence. Do not infer non-execution from a
 nonzero exit or timeout: `wait_timeout` after acceptance means applied work,
 whereas `uncertain_after_send` means the outcome is unknown. Preserve session,
 operation, idempotency, claim, command and turn references when supplied.
+A `busy` refusal from `send` is definite: the prompt was never admitted, so
+there is no operation record to reconcile. A `session list` whose scope needs a
+Git repository but runs outside one is a usage error with diagnostic
+`sdk_scope_requires_repository`.
 
 Error guidance performs no additional probes, status calls, retries, restarts or
 kills. Execute an appropriate explicit observation only when the task warrants
