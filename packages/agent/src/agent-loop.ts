@@ -792,12 +792,10 @@ function isManagedProviderSafetyStopAuthenticated(value: unknown): boolean {
 function managedRetryableFailure(failure: unknown, transaction?: ManagedAttemptTransaction): boolean {
 	const facts = managedTransportFailure(failure);
 	if (!facts) return false;
-	// OpenAI's typed statusless capacity-overload code (issue #5018) never
-	// becomes managed transaction authority. Before the code survived as
-	// transport facts this failure produced none, so the staged attempt was
-	// always committed; the shared Responses parser and Codex events now carry
-	// it, and this check preserves that committed-failure behavior instead of
-	// discarding the transaction. It reads only typed facts, never error text.
+	// OpenAI's typed statusless capacity-overload code (issue #5018) is
+	// discardable only while the current managed attempt has no observable
+	// output. The session owns the retry decision; this check only protects the
+	// transaction boundary and reads typed facts, never error text.
 	if (
 		facts.status === undefined &&
 		facts.providerCode === SERVER_OVERLOADED_PROVIDER_CODE &&

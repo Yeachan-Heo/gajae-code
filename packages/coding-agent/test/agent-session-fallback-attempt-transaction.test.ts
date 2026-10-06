@@ -93,6 +93,37 @@ function typedFirstEventTimeoutStream(model: Model): AssistantMessageEventStream
 	});
 	return stream;
 }
+function typedStatuslessOverloadStream(model: Model): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorMessage: "server_is_overloaded: Please try again later.",
+			transportFailure: {
+				kind: "transport",
+				providerCode: "server_is_overloaded",
+				openaiErrorCode: "server_is_overloaded",
+			},
+			timestamp: Date.now(),
+		};
+		stream.push({ type: "start", partial: message });
+		stream.push({ type: "error", reason: "error", error: message });
+	});
+	return stream;
+}
 function collapsedSnapshotStream(model: Model): AssistantMessageEventStream {
 	const stream = new AssistantMessageEventStream();
 	queueMicrotask(() => {
@@ -728,6 +759,42 @@ describe("AgentSession managed fallback attempt transaction", () => {
 			role: "assistant",
 			stopReason: "stop",
 			content: [{ type: "text", text: "fallback accepted" }],
+		});
+	});
+	it("admits a clean typed overload successor after a committed tool attempt", async () => {
+		const toolCall: ToolCall = { type: "toolCall", id: "overload-tool", name: "counted", arguments: {} };
+		const tool: AgentTool = {
+			name: "counted",
+			label: "Counted",
+			description: "Records a committed tool attempt",
+			parameters: z.object({}),
+			execute: async () => ({ content: [{ type: "text", text: "counted" }] }),
+		};
+		let streamCalls = 0;
+		createSession(
+			(model, context, options) => {
+				streamCalls++;
+				if (streamCalls === 1) return toolUseStream(model, toolCall);
+				if (streamCalls === 2) return typedStatuslessOverloadStream(model);
+				return createMockModel({ responses: [{ content: ["overload recovered"] }] }).stream(
+					model,
+					context,
+					options,
+				);
+			},
+			1,
+			{ tools: [tool] },
+		);
+
+		await session!.prompt("commit tool then admit clean typed overload successor");
+		await session!.waitForIdle();
+
+		expect(streamCalls).toBe(3);
+		expect(session!.messages.filter(message => message.role === "toolResult")).toHaveLength(1);
+		expect(session!.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "stop",
+			content: [{ type: "text", text: "overload recovered" }],
 		});
 	});
 

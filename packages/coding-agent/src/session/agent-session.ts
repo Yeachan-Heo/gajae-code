@@ -23966,10 +23966,14 @@ export class AgentSession {
 				},
 			};
 		}
-		// Content-free typed statusless overloads are safe for managed retry, but
-		// preserve the committed failure path when the agent loop already exposed
-		// streamed output to consumers.
-		if (isStatuslessTypedOverloadFacts(outcome.failure.transportFailure) && !this.#hasCleanRetryReplaySafety) {
+		// Content-free typed statusless overloads are safe for managed retry when
+		// this discarded attempt is clean, even after earlier committed work in
+		// the same prompt. Preserve the committed failure path when this attempt
+		// itself is not replay-safe.
+		if (
+			isStatuslessTypedOverloadFacts(outcome.failure.transportFailure) &&
+			!this.#isRetryScopeClean(outcome.scope)
+		) {
 			this.#defaultFallbackChain().resetAttemptBudget();
 			return this.#managedFallbackExhaustionDecision(
 				outcome.failure.message,
@@ -24640,7 +24644,7 @@ export class AgentSession {
 			transportFailure?.providerCode === SERVER_OVERLOADED_PROVIDER_CODE &&
 			(transportFailure.openaiErrorCode === undefined ||
 				transportFailure.openaiErrorCode === SERVER_OVERLOADED_PROVIDER_CODE) &&
-			!this.#hasCleanRetryReplaySafety
+			(managedOutcome ? !scopeWasClean : !this.#hasCleanRetryReplaySafety)
 		) {
 			return managedOutcome
 				? { type: "terminal", terminal: { stopReason: "error", messages: [message] } }
