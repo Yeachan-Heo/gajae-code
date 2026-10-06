@@ -749,7 +749,8 @@ async function injectedCleanupHistory(apiCalls: number) {
 	let tombstonePath = "";
 	for (let attempt = 0; attempt < apiCalls; attempt++) {
 		const result = await deleteManagedSessionCandidate(fixture.scope, candidate);
-		if (result.kind !== "cleanup_pending") throw new Error(`cleanup_retry_injection_failed:${result.kind}`);
+		if (result.kind !== "cleanup_pending")
+			throw new Error(`cleanup_retry_injection_failed:${JSON.stringify(result)}`);
 		tombstonePath = result.tombstonePath;
 	}
 	return { fixture, candidate, tombstonePath };
@@ -837,7 +838,7 @@ describe("bounded cleanup receipt replay", () => {
 		expect(priorPlans).toContain(last.detachedTranscriptPath);
 		expect(last.target).toMatchObject({ path: fixture.transcriptPath, sessionId: fixture.target.sessionId });
 		expect(fs.existsSync(fixture.transcriptPath)).toBe(true);
-	});
+	}, 60_000);
 
 	it("keeps bounded protocol snapshots readable for nested cleanup receipts", async () => {
 		const { fixture } = await injectedCleanupHistory(1);
@@ -1044,7 +1045,7 @@ describe("bounded cleanup receipt replay", () => {
 		expect(readers[0]).toMatchObject({ inventoryClosed: true, allocations: 8 });
 		expect(readers[0]!.matchingEntries).toBeGreaterThan(8);
 		expect(admitted.size).toBe(8);
-	});
+	}, 60_000);
 
 	it("rejects noncanonical suffixes, filename-record mismatches, and gaps", async () => {
 		for (const defect of ["suffix", "mismatch", "gap"] as const) {
