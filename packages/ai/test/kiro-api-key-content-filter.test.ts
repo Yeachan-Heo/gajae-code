@@ -1015,3 +1015,115 @@ describe("reasoning-before-answer contentIndex invariant #6151", () => {
 		expect(errorEvent).toBeDefined();
 	});
 });
+
+describe("reader.read() error handling with pending tools #6151", () => {
+	test("emits completed tool events before error when reader.read() throws", async () => {
+		const emittedEventTypes: string[] = [];
+
+		globalThis.fetch = (async () => {
+			// Stream that has a completed tool, then reader.read() throws
+			const toolJson = JSON.stringify({
+				stopReason: "TOOL_USE",
+				toolUseId: "tool-123",
+				name: "calculate",
+				input: '{"x": 5}',
+				stop: true,
+			});
+			const bytes = new TextEncoder().encode(toolJson);
+
+			let pullCount = 0;
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					pullCount++;
+					if (pullCount === 1) {
+						// First pull: deliver the completed tool event
+						controller.enqueue(bytes);
+					} else if (pullCount === 2) {
+						// Second pull: simulate reader.read() error (network reset)
+						controller.error(new Error("Network connection reset"));
+					}
+				},
+			});
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEventTypes.push(event.type);
+			}
+		} catch {
+			// Stream may throw; errors are captured in events
+		}
+
+		globalThis.fetch = originalFetch;
+
+		// Should have tool call events before error
+		const startIdx = emittedEventTypes.indexOf("toolcall_start");
+		const deltaIdx = emittedEventTypes.indexOf("toolcall_delta");
+		const endIdx = emittedEventTypes.indexOf("toolcall_end");
+		const errorIdx = emittedEventTypes.indexOf("error");
+
+		expect(startIdx).toBeGreaterThan(-1);
+		expect(deltaIdx).toBeGreaterThan(-1);
+		expect(endIdx).toBeGreaterThan(-1);
+		expect(errorIdx).toBeGreaterThan(-1);
+		// Tool events should come before error
+		expect(startIdx).toBeLessThan(errorIdx);
+		expect(deltaIdx).toBeLessThan(errorIdx);
+		expect(endIdx).toBeLessThan(errorIdx);
+	});
+
+	test("emits incomplete tool before error when reader.read() throws mid-tool", async () => {
+		const emittedEventTypes: string[] = [];
+
+		globalThis.fetch = (async () => {
+			// Stream that has an incomplete tool, then reader.read() throws
+			const toolJsonStart = JSON.stringify({
+				stopReason: "TOOL_USE",
+				toolUseId: "tool-456",
+				name: "search",
+				input: '{"query',
+			});
+			const bytes = new TextEncoder().encode(toolJsonStart);
+
+			let pullCount = 0;
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					pullCount++;
+					if (pullCount === 1) {
+						// First pull: deliver the incomplete tool event
+						controller.enqueue(bytes);
+					} else if (pullCount === 2) {
+						// Second pull: simulate reader.read() error
+						controller.error(new Error("Connection closed unexpectedly"));
+					}
+				},
+			});
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEventTypes.push(event.type);
+			}
+		} catch {
+			// Stream may throw; errors are captured in events
+		}
+
+		globalThis.fetch = originalFetch;
+
+		// Even incomplete tools should have events emitted before error
+		const startIdx = emittedEventTypes.indexOf("toolcall_start");
+		const endIdx = emittedEventTypes.indexOf("toolcall_end");
+		const errorIdx = emittedEventTypes.indexOf("error");
+
+		expect(startIdx).toBeGreaterThan(-1);
+		expect(endIdx).toBeGreaterThan(-1);
+		expect(errorIdx).toBeGreaterThan(-1);
+		// Tool events should come before error
+		expect(startIdx).toBeLessThan(errorIdx);
+		expect(endIdx).toBeLessThan(errorIdx);
+	});
+});

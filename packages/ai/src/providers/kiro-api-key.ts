@@ -668,6 +668,11 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 		};
 		const blocks = output.content as Block[];
 
+		// Variables for streaming tool calls (initialized before try block so they're accessible in catch)
+		let currentTool: { id: string; name: string; input: string } | undefined;
+		let toolcallIndex: number | undefined;
+		const pendingToolCalls: Array<{ input: string; toolCall: ToolCall; index: number }> = [];
+
 		try {
 			// Snapshot model identity fields at stream start to prevent TOCTOU attacks where
 			// a Proxy/getter model could return different values on successive reads.
@@ -733,12 +738,8 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			const decoder = new TextDecoder();
 			let buffer = "";
 			let lastContent = "";
-			let currentTool: { id: string; name: string; input: string } | undefined;
 			let thinkingIndex: number | undefined;
 			let textIndex: number | undefined;
-
-			let toolcallIndex: number | undefined;
-			const pendingToolCalls: Array<{ input: string; toolCall: ToolCall; index: number }> = [];
 
 			// Add tool to blocks without emitting events (deferred until stream end)
 			const addToolToBlocks = () => {
@@ -1089,6 +1090,57 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			stream.push({ type: "done", reason: output.stopReason as "stop" | "toolUse", message: output });
 			stream.end();
 		} catch (error) {
+			// On ordinary errors (including reader.read() throws), emit pending completed tool events
+			// before the error terminal (same semantics as the ordinary-error flush in the event loop).
+			// Refusals drop them via clearPendingToolCalls, but ordinary errors preserve content consistency.
+
+			// Finalize any in-progress tool (inline of addToolToBlocks logic)
+			if (currentTool) {
+				const args = currentTool.input.trim() ? currentTool.input : "{}";
+				let parsed: unknown = {};
+				try {
+					parsed = JSON.parse(args);
+				} catch {
+					parsed = {};
+				}
+				const toolCall: ToolCall = {
+					type: "toolCall",
+					id: currentTool.id,
+					name: currentTool.name,
+					arguments: parsed as Record<string, unknown>,
+				};
+				const index = blocks.length;
+				blocks.push({ ...toolCall, index });
+				if (toolcallIndex === undefined) {
+					toolcallIndex = index;
+				}
+				const toolArgs =
+					typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+						? (parsed as Record<string, unknown>)
+						: {};
+				const normalizedArgs = JSON.stringify(toolArgs);
+				pendingToolCalls.push({ input: normalizedArgs, toolCall, index });
+				currentTool = undefined;
+			}
+
+			// Emit all pending tool call events (inline of emitPendingToolCalls logic)
+			for (const { input, toolCall, index } of pendingToolCalls) {
+				stream.push({ type: "toolcall_start", contentIndex: index, partial: output });
+				stream.push({
+					type: "toolcall_delta",
+					contentIndex: index,
+					delta: input,
+					partial: output,
+				});
+				stream.push({
+					type: "toolcall_end",
+					contentIndex: index,
+					toolCall,
+					partial: output,
+				});
+			}
+			pendingToolCalls.length = 0;
+
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = sanitizeKiroError(error, apiKey);
 			output.duration = Date.now() - startTime;
