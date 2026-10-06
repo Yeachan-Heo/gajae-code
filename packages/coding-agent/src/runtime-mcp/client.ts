@@ -451,6 +451,9 @@ function isModernMethodNotFound(error: unknown): boolean {
  * The original request is retried with `inputResponses` and a verbatim
  * `requestState` echo under a fresh JSON-RPC id, at most MAX_MRTR_RETRIES times;
  * the retry is fenced to the originating exchange by a stable correlation id.
+ * `roots/list` input requests are answered locally; every other input request
+ * requires `options.inputHandler`, and its absence fails the exchange before any
+ * retry is sent (no write replay, no implicit accept).
  */
 async function requestWithInputHandling<T>(
 	connection: MCPServerConnection,
@@ -474,17 +477,20 @@ async function requestWithInputHandling<T>(
 	if (!inputRequired) return stripResultType(initial);
 
 	const handler = options?.inputHandler;
-	if (!handler) {
-		throw new MCPExpectedFailure(
+	const correlationId = crypto.randomUUID();
+
+	const missingHandler = () =>
+		new MCPExpectedFailure(
 			new Error(
 				`MCP server "${connection.name}" requested additional input (input_required) for ${method}, but no interactive input handler is available`,
 			),
 		);
-	}
-	const correlationId = crypto.randomUUID();
 
 	for (let attempt = 0; attempt < MAX_MRTR_RETRIES; attempt++) {
 		const inputResponses: Record<string, unknown> = {};
+		// A requestState-only round has no local answer to give; without an
+		// interactive handler it is never replayed unattended.
+		if (!handler && Object.keys(inputRequired.inputRequests).length === 0) throw missingHandler();
 		for (const [key, request] of Object.entries(inputRequired.inputRequests)) {
 			if (options?.signal?.aborted) {
 				throw options.signal.reason instanceof Error ? options.signal.reason : new Error("Aborted");
@@ -494,6 +500,9 @@ async function requestWithInputHandling<T>(
 				inputResponses[key] = await defaultRequestHandler("roots/list", undefined);
 				continue;
 			}
+			// Everything else (elicitation, sampling, ...) needs a real interactive
+			// handler. It is never answered implicitly; fail before any retry is sent.
+			if (!handler) throw missingHandler();
 			const outcome = await handler(key, request, {
 				serverName: connection.name,
 				originMethod: method,

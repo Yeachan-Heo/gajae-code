@@ -144,6 +144,7 @@ function start(
 	settings: Settings,
 	acceptFailure: AcceptFailure = { armed: false },
 	ledgerTools?: LedgerTools,
+	onSubmission?: (options: Parameters<ExtensionActions["sendUserMessage"]>[1]) => void,
 ): Map<string, (event: unknown, context: unknown) => unknown> {
 	const handlers = new Map<string, (event: unknown, context: unknown) => unknown>();
 	const api = {
@@ -154,6 +155,7 @@ function start(
 			_content: Parameters<ExtensionActions["sendUserMessage"]>[0],
 			options?: Parameters<ExtensionActions["sendUserMessage"]>[1],
 		) => {
+			onSubmission?.(options);
 			const commit = options?.onPreflightAcceptCommit;
 			const accepted = options?.onPreflightAccepted;
 			// The prompt never settles on its own: the deadline is the only terminal.
@@ -249,6 +251,7 @@ async function acceptPrompt(
 		captureSchedule?: boolean;
 		abortPromptAndWait?: (handle: string, options: { graceMs: number }) => Promise<RunSettlementProof>;
 		ledgerTools?: LedgerTools;
+		onSubmission?: (options: Parameters<ExtensionActions["sendUserMessage"]>[1]) => void;
 		/** Seed the session cwd before the bus starts (e.g. a real git repo). */
 		prepareCwd?: (cwd: string) => Promise<void>;
 		/** Replace the settings double, e.g. to opt out of the autosave. */
@@ -268,6 +271,7 @@ async function acceptPrompt(
 		options.settings?.(cwd) ?? deadlineSettings(cwd, leaseMs, maxRuntimeMs),
 		acceptFailure,
 		options.ledgerTools,
+		options.onSubmission,
 	);
 	const scheduled: (() => void)[] = [];
 	const scheduledDelays: number[] = [];
@@ -714,14 +718,16 @@ test("a prompt accepted with no agent_start keeps its pre-change public outcome"
 	}
 }, 30_000);
 
-test("current-run tool progress cannot renew a co-accepted follow-up correlation", async () => {
-	// Attribution invariant, on the real bus. Unlike `turn.prompt` (which sets
-	// rejectWhenBusy), `turn.follow_up` is admitted while a run is active, so a
-	// SECOND accepted correlation genuinely co-exists with the running one.
-	// Renewal resolves its submission by the active correlation's own key, so the
-	// running prompt's tool progress must not extend the follow-up's lease.
+test("current-run progress leaves a queued follow-up suspended until its own promotion", async () => {
+	// An accepted follow-up has not consumed execution yet. Its lease is suspended
+	// independently of root progress, then starts fresh at exact queue promotion.
 	const leaseMs = 900;
-	const session = await acceptPrompt("followup", leaseMs, 60_000);
+	let promoteFollowUp: ((promotion: { startsOwnRun?: boolean; removed?: boolean }) => void) | undefined;
+	const session = await acceptPrompt("followup", leaseMs, 60_000, {
+		onSubmission: options => {
+			if (options?.deliverAs === "followUp") promoteFollowUp = options.onQueuedPromoted;
+		},
+	});
 	const progress = setInterval(() => {
 		session.handlers.get("tool_execution_end")?.(
 			{ type: "tool_execution_end", toolCallId: `fu-tool-${Date.now()}`, toolName: "read", isError: false },
@@ -749,13 +755,25 @@ test("current-run tool progress cannot renew a co-accepted follow-up correlation
 		expect(ack.ok).toBe(true);
 		const followUp = { commandId: String(ack.result?.commandId), turnId: String(ack.result?.turnId) };
 		expect(followUp.commandId).not.toBe(session.correlation.commandId);
-		const followUpAcceptedAt = Date.now();
+		await Bun.sleep(leaseMs * 2);
+		expect(session.terminals(followUp)).toHaveLength(0);
+		expect(session.terminals(session.correlation)).toHaveLength(0);
+		expect(promoteFollowUp).toBeDefined();
 
-		// The follow-up is bounded by ITS OWN acceptance despite continuous
-		// attributable progress attributed to the running correlation.
-		await waitFor(() => session.terminals(followUp).length > 0, "co-accepted follow-up terminal");
-		expect(Date.now() - followUpAcceptedAt).toBeLessThan(leaseMs * 2);
-		// The running prompt is the one being renewed, so it has no deadline terminal.
+		const promotedAt = Date.now();
+		promoteFollowUp!({ startsOwnRun: true });
+		await Bun.sleep(leaseMs / 2);
+		expect(session.terminals(followUp)).toHaveLength(0);
+		await waitFor(() => session.terminals(followUp).length > 0, "promoted follow-up terminal");
+		expect(Date.now() - promotedAt).toBeGreaterThanOrEqual(leaseMs);
+		expect(Date.now() - promotedAt).toBeLessThan(leaseMs * 2);
+		// No agent_start attested the promoted run: expiry remains uncertain and
+		// must never borrow the unrelated root's abort authority or emit its deadline.
+		expect(session.terminals(followUp)[0]).toMatchObject({
+			type: "agent_failed",
+			error: { code: "terminal_uncertain" },
+		});
+		expect(session.terminals(session.correlation)).toHaveLength(0);
 		expect(session.deadlineTerminals()).toHaveLength(0);
 	} finally {
 		clearInterval(progress);

@@ -97,6 +97,7 @@ Lifecycle and exact state names:
 - Conceptual scheduling path: `pending` (only task-progress bookkeeping before work starts) → `running` → `completed` / `failed`; cancellation changes a running async job to `cancelled`; a run that returns `{ kind: "paused" }` (subagent safe-boundary pause, folded work awaiting resume) leaves the job non-terminal and resumable as `paused`.
 - Exact `AsyncJob.status` values in `packages/coding-agent/src/async/job-manager.ts`: `"running" | "paused" | "completed" | "failed" | "cancelled"`.
 - Exact per-task progress values in `packages/coding-agent/src/task/types.ts`: `"pending" | "running" | "completed" | "failed" | "aborted"`.
+- Lifecycle hooks, settlement bookkeeping, and retention timers belong to the original job object. Reusing an evicted job ID does not transfer an older job's cleanup or eviction deadline to its replacement; monitor tombstones retain their original cleanup owner.
 
 ## Side Effects
 - Filesystem

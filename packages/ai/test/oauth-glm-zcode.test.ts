@@ -151,6 +151,18 @@ describe("GLM ZCode OAuth login provider", () => {
 		expect(instructions ?? "").toMatch(/cancel/i);
 	});
 
+	it("explains the pasted zcode:// redirect shape and where to copy it from", async () => {
+		const flow = new GlmZcodeOAuthFlow({ onAuth: () => {}, onPrompt: async () => "" });
+		const { instructions } = await flow.generateAuthUrl("state-1", GLM_ZCODE_OAUTH_REDIRECT_URI);
+		// The custom-protocol redirect never lands in the browser address bar, so
+		// the guidance must name the URL shape and the DevTools Network source;
+		// otherwise users paste the address-bar URL and the login stalls.
+		expect(instructions ?? "").toContain("zcode://oauth/callback");
+		expect(instructions ?? "").toMatch(/address bar/i);
+		expect(instructions ?? "").toMatch(/devtools/i);
+		expect(instructions ?? "").toMatch(/network tab/i);
+	});
+
 	it("scopes the desktop-app warning to glm-zcode without exposing login values", async () => {
 		const glmFlow = new GlmZcodeOAuthFlow({ onAuth: () => {}, onPrompt: async () => "" });
 		const { instructions: glmInstructions } = await glmFlow.generateAuthUrl("state-1", GLM_ZCODE_OAUTH_REDIRECT_URI);
@@ -262,6 +274,30 @@ describe("GLM ZCode OAuth login provider", () => {
 		await withEnv(SUPPRESS_ENV, async () => {
 			expect(await authStorage?.getApiKey("glm-zcode", "session-glm")).toBe(MINTED_KEY);
 		});
+	});
+
+	it("prompts manual input with the zcode-specific URL guidance when no manual handler is set", async () => {
+		if (!store || !authStorage) throw new Error("test setup failed");
+		const fetchMock = routingFetch();
+		global.fetch = fetchMock as unknown as typeof fetch;
+		let capturedState: string | undefined;
+		const prompts: string[] = [];
+		await authStorage.login("glm-zcode", {
+			onAuth: info => {
+				capturedState = new URL(info.url).searchParams.get("state") ?? undefined;
+			},
+			onPrompt: async prompt => {
+				prompts.push(prompt.message);
+				return `zcode://oauth/callback?code=login-code&state=${capturedState ?? ""}`;
+			},
+		});
+		// The fallback prompt must name the expected URL shape itself: the generic
+		// "authorization code (or full redirect URL)" wording sends users to the
+		// address bar, which never shows the zcode:// callback.
+		expect(prompts).toHaveLength(1);
+		expect(prompts[0]).toContain("zcode://oauth/callback");
+		expect(prompts[0]).toMatch(/devtools/i);
+		expect(store.listAuthCredentials("glm-zcode")).toHaveLength(1);
 	});
 
 	it("coexists with the legacy zai API-key provider without cross-contamination", async () => {

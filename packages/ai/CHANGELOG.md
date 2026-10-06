@@ -2,6 +2,79 @@
 
 ## [Unreleased]
 
+## [0.18.7] - 2026-10-04
+
+### Fixed
+
+- Explicitly emit `strict: false` for non-strict OpenAI Responses and Codex Responses function tools.
+
+- Salvage finalized Codex tool calls when an empty assistant message item opens before a transient stream close, while still failing closed on non-empty text.
+
+- Preserve finalized Codex tool calls when the stream ends without a terminal event, including an empty trailing message; unfinished calls and visible text still fail closed.
+
+- Add Codex request-timeout salvage refusal diagnostics and replay coverage for complete `todo_write` calls.
+
+- Salvage complete Codex function calls when the SSE or WebSocket idle watchdog ends a stalled stream.
+
+- **Kiro OAuth CodeWhisperer wire protocol**: Corrected critical wire protocol issues in the streaming transport:
+  - Fixed typo in request header `amzn-X-amz-target` → `x-amz-target`
+  - Changed streaming service target from `AmazonCodeWhispererService.GenerateAssistantResponse` to `AmazonCodeWhispererStreamingService.GenerateAssistantResponse`
+  - Fixed content-type from `application/json` to `application/x-amz-json-1.0`
+  - Moved `profileArn` from header to request body `conversationState`
+  - Flattened `userInputMessageContext.tools` from nested `{tools: [...]}` to direct array
+  - Fixed event payload handling for flat `{content}` structure (not nested `{assistantResponseEvent: {content}}`)
+  - Implemented accumulation of streaming tool input fragments per `toolUseId` until `stop` signal
+  - Cross-verified against kiro-api-key.ts headers implementation
+  - Reported by: nomo via wire protocol validation failures
+
+## [0.18.6] - 2026-10-03
+
+### Added
+
+- `AuthStorage.hasLiteralConfigApiKey(provider, owner?)` reports whether a provider's config override is a literal `apiKey` rather than an `apiKeyEnv` indirection.
+
+- Bundled GPT-6.1 Sol for the Codex provider: `openai-codex/gpt-6.1-sol` (272K context, 128K output, reasoning effort low..max) with $2/$10 per MTok and $0.10 cached-input pricing (#6147).
+
+### Changed
+
+- GLM Coding Plan (`glm-zcode`) GLM-5.3 and GLM-5.3-Flash now expose the `max` thinking level on top of the existing `minimal`–`xhigh` budget ladder. These models ride the Anthropic Messages-compatible endpoint where thinking is a token budget, and the generic anthropic-messages fallback capped non-Anthropic models at `xhigh` (32768 tokens). The endpoint accepts budgets up to 65536 and reasoning volume scales with the budget, so the previous ceiling silently limited the GLM-5.3 generation.
+
+- The `glm-zcode` OAuth login guidance now names the exact `zcode://oauth/callback?code=…&state=…` redirect shape and tells users to copy it from the browser DevTools Network tab, because a custom-protocol redirect never appears in the address bar; the manual-code prompt is now `glm-zcode`-specific instead of the generic authorization-code wording, which previously led users to paste the address-bar URL and stall the login.
+
+### Fixed
+
+- Anthropic-adaptive models with high/xhigh/max reasoning now receive sufficient `max_tokens` to accommodate both thinking output and message completion. Previously, adaptive requests used the default 32,000-token budget, consuming all tokens for thinking and leaving no output. When reasoning is enabled with adaptive thinking, the budget is now raised to `model.maxTokens` to allow room for both thinking and output. Explicit or configured `maxTokens` values remain authoritative and are not overridden. The fix also treats `maxTokens: 0` (documented as unspecified) the same as `undefined`, matching the behavior of `resolveDefaultRequestMaxTokens` (#6156).
+
+- A Kiro CodeWhisperer HTTP 200 response whose body is not an AWS event stream (for example a JSON or HTML error) now reports its status, content type, and the first 1000 characters of the body. Previously the body was parsed as event-stream frames and surfaced only as `eventstream: truncated message at end of stream`. The event-stream media type is matched case-insensitively, and the truncation error now reports how many trailing bytes were left (#6158). The error carries the `provider_protocol_mismatch` code, so session retry and managed fallback surface it instead of replaying the request.
+
+- Kiro (OAuth CodeWhisperer transport) now sets `userInputMessage.origin: AI_EDITOR`. Without it the service ignored `modelId` and answered every request with `auto`, so selecting a specific Kiro model had no effect.
+- Kiro (OAuth CodeWhisperer transport) now sends every trailing result of a parallel tool batch in `currentMessage`. The earlier results were left as a separate history entry, so the turn after two or more parallel tool calls failed with HTTP 400 `TOOL_USE_RESULT_MISMATCH`.
+
+- Salvage Codex function calls when complete JSON arguments arrive but the stream closes before `response.output_item.done`, including empty-object no-argument calls and idle SSE stalls.
+- Fail closed on mismatched argument events, explicit non-transient errors, and unauthoritative whitespace-only deltas; close open reasoning blocks before salvage.
+
+- Codex SSE progress classification reads each event's `delta` once, so the idle-watchdog classifier added in #6226 can no longer observe a different value than the stream handler assembles.
+
+- End a silent Codex WebSocket stream at its idle bound after a completed `todo_write` tool-call start with zero usage.
+- Preserve Codex transport errors and eligible SSE recovery when provisional tool arguments parse to null or another non-record value.
+
+- Recover expired Codex websocket continuation anchors with one anchor-free full-context replay on the same model when fallback is managed, while still honoring disabled provider retries.
+
+- Preserve bounded session retries for content-free Codex `server_is_overloaded` stream errors with generic or absent prose.
+
+- Codex websocket streams with an idle or first-event timeout above `2147483647` ms (about 24.9 days), such as `PI_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS=99999999999` meant as "effectively never", no longer time out right after the request. `setTimeout` treats longer delays as 1 ms; the wait is now capped at the timer maximum.
+
+- Treat trailing whitespace after complete Codex function-call arguments as idle SSE events without changing WebSocket progress or replay semantics.
+
+- Prevent Cursor inline MCP, todo, and native tool announcements from being replayed locally after a completed or aborted turn. Keep one canonical provider-owned MCP call for its inline execution.
+
+- Release the cross-process OAuth refresh lease when a token refresh fails, and keep credentials active when their OAuth provider has not registered yet.
+
+- Start SQLite auth-storage read-then-write transactions immediately to prevent concurrent OAuth refresh processes from failing with `database is locked`.
+- Advance the OAuth lease clock by time spent waiting for the immediate write reservation so busy-timeout waits do not shorten leases.
+
+- Stream idle and first-event watchdogs with a timeout above `2147483647` ms (about 24.9 days), such as `PI_STREAM_IDLE_TIMEOUT_MS=99999999999` meant as "effectively never", no longer abort the stream right away. `setTimeout` treats longer delays as 1 ms; the watchdog delay is now capped at the timer maximum. `0` still disables the watchdog.
+
 ## [0.18.5] - 2026-09-30
 
 ## [0.18.4] - 2026-09-30

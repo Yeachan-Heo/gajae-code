@@ -325,6 +325,15 @@ describe("safe discovery boundaries", () => {
 			expect(result.warnings).toEqual(
 				expect.arrayContaining([expect.stringContaining("Refusing skill path outside scan root")]),
 			);
+			const realRoot = await fs.realpath(root);
+			// The outside-dir and outside-file links share one target, so whichever is scanned first gets the refusal.
+			expect(result.warnings).toEqual(
+				expect.arrayContaining([
+					expect.stringContaining(
+						` (resolves to ${path.join(realRoot, "outside", "SKILL.md")}; add ${realRoot} to skills.customDirectories to load it)`,
+					),
+				]),
+			);
 
 			const directSkill = result.items.find(skill => skill.path === path.join(insideDir, "SKILL.md"));
 			expect(directSkill).toBeDefined();

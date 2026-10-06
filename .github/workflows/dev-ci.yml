@@ -513,6 +513,142 @@ jobs:
           bun test ./packages/natives/test/path-identity-windows.test.ts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+  # RSS checkpoint compare: runs the existing harness scripts/verify-rss-checkpoints.ts
+  # against the compiled gjc binary and compares it with the previous published
+  # stable release binary (same baseline convention and same --advisory stage as the
+  # release rss_checkpoint job in ci.yml). Regressions over tolerance are reported in
+  # the job summary, not failed; a missing baseline or harness error still fails the
+  # job. Only the cheap subset runs by default:
+  # S1(--help startup), S2(--version), S3(interactive first render). Each scenario
+  # costs 13 short-lived runs, so the gate stays minutes-scale; the heavy
+  # tool-workload scenarios S4(1 MiB read), S5(8 MiB bash) and S7(MCP echo) remain
+  # in the release rss_checkpoint job. The cheap subset still spans the startup,
+  # version-print and interactive entrypoints where bundle-splitting changes and
+  # session-manager residency show up first.
+  #
+  # Trigger scoping follows the affected-plan machinery like every sibling job:
+  # skipped entirely for metadata-only PR edits and head-only dispatch (affected-plan
+  # is skipped there, so this job never schedules), runs on dev push and PR, and
+  # only when RSS-relevant paths changed (binary build path, compiled-binary boot
+  # entrypoints -- cli.ts, cli-main.ts, cli-ordinary.ts, cli-commands.ts, whose module
+  # graph decides what the measured startup processes load -- native addon sources,
+  # session manager, or the harness itself).
+  rss-checkpoint:
+    name: RSS checkpoint compare (S1,S2,S3)
+    needs: [affected-plan]
+    if: ${{ needs.affected-plan.outputs.relevant == 'true' && (contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/scripts/build-binary.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/scripts/compile-args.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/cli.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/cli-main.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/cli-ordinary.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/cli-commands.ts') || contains(needs.affected-plan.outputs.changed_paths, 'scripts/verify-rss-checkpoints.ts') || contains(needs.affected-plan.outputs.changed_paths, 'scripts/ci-build-native.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/natives/native') || contains(needs.affected-plan.outputs.changed_paths, 'packages/natives/scripts') || contains(needs.affected-plan.outputs.changed_paths, 'crates/pi-natives/src') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/session/session-manager.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/session/blob-store.ts')) }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      CI_DEV_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify checked-out source head
+        shell: bash
+        run: |
+          head="$(git rev-parse HEAD)"
+          test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: "1.4.0"
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
+        with:
+          toolchain: nightly-2026-08-12
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          shared-key: dev-rss-checkpoint-linux-x64
+          cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+          cache-workspace-crates: true
+      - name: Cache bun dependencies
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-1.4.0-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+      - name: Install system deps
+        run: bash scripts/ci-install-system-deps.sh
+      - run: bun install --frozen-lockfile
+      - name: Build required Linux native addon variants
+        env:
+          TARGET_PLATFORM: linux
+          TARGET_ARCH: x64
+          TARGET_VARIANTS: baseline modern
+        run: bun run ci:build:native
+      - name: Build compiled gjc binary
+        run: bun run --cwd=packages/coding-agent build
+      - name: Install GNU time
+        run: test -x /usr/bin/time || { sudo apt-get update -qq && sudo apt-get install -y -qq time; }
+      - name: Resolve previous published stable release
+        id: previous
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Fail closed on a missing baseline: with no published stable release
+          # there is no comparable baseline for the measured commit, so the job
+          # stops with an actionable diagnostic instead of passing silently.
+          previous="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+             --jq ".[] | select(.draft == false and .prerelease == false) | .tag_name" \
+             | sed -n 1p)"
+          if [ -z "$previous" ]; then
+            echo "::error::No comparable RSS baseline: this repository has no published stable release to measure as the baseline. Publish one stable release (its rss_checkpoint artifact ships gjc-linux-x64) and re-run this job."
+            exit 1
+          fi
+          echo "tag=$previous" >> "$GITHUB_OUTPUT"
+          git fetch --quiet --force origin "refs/tags/$previous:refs/tags/$previous"
+          echo "commit=$(git rev-parse "$previous^{commit}")" >> "$GITHUB_OUTPUT"
+          gh release download "$previous" --pattern gjc-linux-x64 --dir "$RUNNER_TEMP/rss/previous"
+          chmod +x "$RUNNER_TEMP/rss/previous/gjc-linux-x64"
+      - name: Write previous-release RSS baseline
+        env:
+          PREVIOUS_COMMIT: ${{ steps.previous.outputs.commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/rss/checkpoints"
+          bun scripts/verify-rss-checkpoints.ts --scenario S1,S2,S3 --write-baseline --matrix dev-ci \
+             --binary "$RUNNER_TEMP/rss/previous/gjc-linux-x64" --commit "$PREVIOUS_COMMIT" --output-dir "$out"
+      - name: Measure and compare current binary (advisory)
+        env:
+          PREVIOUS_TAG: ${{ steps.previous.outputs.tag }}
+          PREVIOUS_COMMIT: ${{ steps.previous.outputs.commit }}
+          CURRENT_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/rss/checkpoints"
+          # Stage 1 of the threshold-promotion process (docs/perf-profiling-corpus.md):
+          # RSS thresholds stay advisory until variance is characterized and a human
+          # approves enforcement. --advisory reports regressions in the job summary
+          # without failing; every other harness error (missing baseline, bad binary,
+          # usage) still exits non-zero, and pipefail keeps tee from masking it.
+          # The baseline is the previous stable release, so a reported delta is
+          # release-to-head drift, not a delta caused by this commit alone.
+          {
+            echo "### RSS checkpoint compare (advisory)"
+            echo "Baseline: \`$PREVIOUS_TAG\` (\`$PREVIOUS_COMMIT\`). Deltas are release-to-head drift, not attributable to this commit alone."
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          bun scripts/verify-rss-checkpoints.ts --scenario S1,S2,S3 --compare --advisory --allow-baseline-drift --matrix dev-ci \
+             --baseline "$out/$PREVIOUS_COMMIT.json" \
+             --binary packages/coding-agent/dist/gjc --commit "$CURRENT_COMMIT" --output-dir "$out" 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload RSS checkpoint evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: dev-rss-checkpoint-${{ github.run_id }}
+          path: ${{ runner.temp }}/rss/checkpoints
+          if-no-files-found: ignore
+          retention-days: 1
+          overwrite: true
+
+
   # Native addon build runs at most once per run and publishes the built `.node`
   # files as an artifact the runtime-dependent shards download. A content-hash
   # cache of the native sources lets PRs that don't touch crates/natives restore
@@ -576,6 +712,12 @@ jobs:
         run: |
           test -f packages/natives/native/pi_natives.linux-x64-baseline.node
           test -f packages/natives/native/pi_natives.linux-x64-modern.node
+      # `if-no-files-found: error` only proves the glob matched something, so assert every
+      # named producer sidecar exists before the upload claims to transport trust.
+      - name: Verify producer provenance sidecars
+        run: |
+          test -f packages/natives/native/pi_natives.linux-x64-baseline.node.provenance.json
+          test -f packages/natives/native/pi_natives.linux-x64-modern.node.provenance.json
       - name: Upload native addon(s)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
@@ -583,6 +725,8 @@ jobs:
           path: |
             packages/natives/native/pi_natives.linux-x64-baseline.node
             packages/natives/native/pi_natives.linux-x64-modern.node
+            packages/natives/native/pi_natives.linux-x64-baseline.node.provenance.json
+            packages/natives/native/pi_natives.linux-x64-modern.node.provenance.json
           if-no-files-found: error
           retention-days: 1
           overwrite: true
@@ -741,6 +885,16 @@ jobs:
         with:
           name: dev-affected-native-${{ github.run_id }}
           path: packages/natives/native
+      # The transferred addons are only trusted through their producer sidecars: rebuild
+      # the record from them and verify every addon in the directory before anything in
+      # the shard can load one. Version/digest mismatches stay fail-closed.
+      - name: Rebuild and verify transferred native provenance
+        if: ${{ matrix.native }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun scripts/verify-diagnostic-artifact-provenance.ts --rebuild-from-sidecars packages/natives/native
+          bun scripts/verify-diagnostic-artifact-provenance.ts --verify packages/natives/native
       - name: Run affected task shard
         env:
           AFFECTED_TASK_KEY: ${{ matrix.key }}

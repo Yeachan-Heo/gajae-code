@@ -1293,6 +1293,51 @@ describe("file lock cleanup failure handling (#2478)", () => {
 	);
 
 	test.skipIf(process.platform === "win32")(
+		"keeps contending when a dead transition owner cannot be reclaimed and reports it at exhaustion (#6253)",
+		async () => {
+			const lockedFile = path.join(await makeTemp(), "dead-transition-refused.json");
+			const detachedPath = `${lockedFile}.lock.removing`;
+			await writeInfo(detachedPath, {
+				pid: DEAD_PID,
+				timestamp: Date.now(),
+				owner_token: "dead-transition-refused",
+			});
+			const retainedInfo = await fs.readFile(path.join(detachedPath, "info"), "utf8");
+			let removalAttempts = 0;
+			FileLockTestHooks.nativeQuarantineBindings = () => ({
+				snapshotDirectoryTree,
+				exactRemoveDirectoryTree: target => {
+					removalAttempts++;
+					expect(target).toBe(detachedPath);
+					// The identity-bound guard refuses: the tree is no longer the one the
+					// stale verdict judged. No path-only fallback may be attempted.
+					return { ok: false, code: "identity_mismatch" } as NativeExactUnlinkResult;
+				},
+			});
+
+			let entered = false;
+			const failure = await withFileLock(
+				lockedFile,
+				async () => {
+					entered = true;
+				},
+				{ retries: 2, retryDelayMs: 1 },
+			).catch(error => error);
+			expect(failure).toBeInstanceOf(FileLockAcquireError);
+			expect(failure).toMatchObject({
+				code: "acquire_timeout",
+				reason: "acquire_timeout",
+				attempts: 2,
+				holder: expect.stringContaining("blocked by abandoned removal transition"),
+			});
+			expect(entered).toBe(false);
+			expect(removalAttempts).toBe(2);
+			expect(await fs.exists(detachedPath)).toBe(true);
+			expect(await fs.readFile(path.join(detachedPath, "info"), "utf8")).toBe(retainedInfo);
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
 		"refuses transition rollback when the published lock is replaced",
 		async () => {
 			const lockedFile = path.join(await makeTemp(), "state.json");

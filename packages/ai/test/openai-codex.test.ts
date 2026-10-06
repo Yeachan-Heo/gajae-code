@@ -19,14 +19,14 @@ describe("openai-codex user agent", () => {
 	it("removes non-ASCII kernel release characters before constructing the header", () => {
 		const userAgent = formatCodexUserAgent("linux", "4.4.302-Minimal™-EAS-QTI_Haptic-R26", "arm64");
 
-		expect(userAgent).toMatch(/^pi\/[^ ]+ \(linux 4\.4\.302-Minimal-EAS-QTI_Haptic-R26; arm64\)$/);
+		expect(userAgent).toMatch(/^codex_cli_rs\/[^ ]+ \(linux 4\.4\.302-Minimal-EAS-QTI_Haptic-R26; arm64\)$/);
 		expect(() => new Headers({ "User-Agent": userAgent })).not.toThrow();
 	});
 
 	it("removes control characters from dynamic platform values", () => {
 		const userAgent = formatCodexUserAgent("linux\n", "6.8.0\t-generic", "arm64\r");
 
-		expect(userAgent).toMatch(/^pi\/[^ ]+ \(linux 6\.8\.0-generic; arm64\)$/);
+		expect(userAgent).toMatch(/^codex_cli_rs\/[^ ]+ \(linux 6\.8\.0-generic; arm64\)$/);
 	});
 });
 
@@ -58,6 +58,7 @@ describe("openai-codex tool schemas", () => {
 			name: "list_outgoing_messages",
 			description: "List outgoing messages",
 			parameters: { type: "object", properties: {} },
+			strict: false,
 		});
 	});
 });

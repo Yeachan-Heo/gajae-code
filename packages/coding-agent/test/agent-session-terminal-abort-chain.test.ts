@@ -1288,7 +1288,6 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		expect(session.agent.hasQueuedSteering()).toBe(false);
 		expect(promoted).toBe(1);
 		await session.waitForIdle();
-		await session.awaitCoordinatorRuntimeStatePersistenceForTests();
 	}, 60_000);
 
 	it("rejects a steering snapshot token captured for an earlier turn", async () => {

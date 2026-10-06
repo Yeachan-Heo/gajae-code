@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { $which, APP_NAME, getToolsDir, logger, ptree, TempDir } from "@gajae-code/utils";
+import { assertFileMatchesSha256, requireAssetSha256 } from "./tools-checksum";
 
 const TOOLS_DIR = getToolsDir();
 const TOOL_DOWNLOAD_TIMEOUT_MS = 120_000;
@@ -112,8 +113,18 @@ export function getToolPath(tool: ToolName): string | null {
 	return $which(config.binaryName);
 }
 
-// Fetch latest release version from GitHub
-async function getLatestVersion(repo: string, signal?: AbortSignal): Promise<string> {
+interface GithubReleaseAsset {
+	name?: string;
+	digest?: string | null;
+}
+
+interface GithubRelease {
+	version: string;
+	assets: GithubReleaseAsset[];
+}
+
+// Fetch latest release metadata from GitHub, including asset digests.
+async function getLatestRelease(repo: string, signal?: AbortSignal): Promise<GithubRelease> {
 	let response: Response;
 	try {
 		response = await fetch(`https://api.github.com/repos/${repo}/releases/latest`, {
@@ -131,8 +142,11 @@ async function getLatestVersion(repo: string, signal?: AbortSignal): Promise<str
 		throw new Error(`GitHub API error: ${response.status}`);
 	}
 
-	const data = (await response.json()) as { tag_name: string };
-	return data.tag_name.replace(/^v/, "");
+	const data = (await response.json()) as { tag_name?: string; assets?: GithubReleaseAsset[] };
+	if (!data.tag_name) {
+		throw new Error("GitHub API error: missing tag_name");
+	}
+	return { version: data.tag_name.replace(/^v/, ""), assets: data.assets ?? [] };
 }
 
 // Download a file from URL
@@ -164,14 +178,16 @@ async function downloadTool(tool: ToolName, signal?: AbortSignal): Promise<strin
 	const plat = os.platform();
 	const architecture = os.arch();
 
-	// Get latest version
-	const version = await getLatestVersion(config.repo, signal);
+	// Get latest version and the published digest for this asset.
+	const release = await getLatestRelease(config.repo, signal);
+	const version = release.version;
 
 	// Get asset name for this platform
 	const assetName = config.getAssetName(version, plat, architecture);
 	if (!assetName) {
 		throw new Error(`Unsupported platform: ${plat}/${architecture}`);
 	}
+	const expectedSha256 = requireAssetSha256(release.assets, assetName);
 
 	// Create tools directory
 	await fs.promises.mkdir(TOOLS_DIR, { recursive: true });
@@ -183,6 +199,7 @@ async function downloadTool(tool: ToolName, signal?: AbortSignal): Promise<strin
 	// Handle direct binary downloads (no archive extraction needed)
 	if (config.isDirectBinary) {
 		await downloadFile(downloadUrl, binaryPath, signal);
+		await assertFileMatchesSha256(binaryPath, expectedSha256);
 		if (plat !== "win32") {
 			await fs.promises.chmod(binaryPath, 0o755);
 		}
@@ -192,6 +209,7 @@ async function downloadTool(tool: ToolName, signal?: AbortSignal): Promise<strin
 	// Download archive
 	const archivePath = path.join(TOOLS_DIR, assetName);
 	await downloadFile(downloadUrl, archivePath, signal);
+	await assertFileMatchesSha256(archivePath, expectedSha256);
 
 	// Extract
 	const tmp = await TempDir.create("@gjc-tools-extract-");

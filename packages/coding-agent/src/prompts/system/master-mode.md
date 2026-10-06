@@ -25,4 +25,5 @@ You are running as a GJC master session. You coordinate peer GJC sessions throug
 ## Delegation discipline
 
 - Give each spawned child one bounded task with explicit acceptance criteria in the seed prompt; monitor via broker-routed status/tail and aggregate results yourself.
+- `gjc sdk session send` only starts a new turn; on a child that is mid-turn it fails with `busy` and was not applied. Correct a running child you spawned with `gjc sdk session raw control <id> --op turn.steer --json-input '{"text":"<instruction>"}' --idempotency-key <key>`, and stop its active turn with `--op turn.abort --json-input '{}'`. There are no `session.steer` or `session.abort` operations.
 - Clean up children you created with `gjc sdk session raw global --op session.close --json-input '{"sessionId":"<id>"}' --idempotency-key <key>` when their work is integrated. Orphaned children are reaped automatically after the configured grace period, but explicit close is the polite default.

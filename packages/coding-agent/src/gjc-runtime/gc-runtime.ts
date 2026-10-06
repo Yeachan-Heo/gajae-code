@@ -30,7 +30,22 @@ import {
 	listCanonicalBlobs,
 	removeCanonicalBlob,
 } from "../session/blob-store";
-import { FileSessionStorage, probeSessionRetirement, retireSessionTranscript } from "../session/session-storage";
+import type { ManagedGcSessionRetirementReceipt } from "../session/internal/managed-gc-retirement-codec";
+import {
+	discoverManagedGcSessionRetirementReceipts,
+	type ManagedScope,
+	resolveManagedGcScopeForRead,
+} from "../session/internal/managed-session-scope";
+import { taskArtifactOwnerLocatorFromTranscriptBytes } from "../session/internal/task-artifact-owner-transcript";
+import {
+	probeSessionRetirement,
+	retireOrphanSessionTranscript,
+	retireSessionTranscript,
+	type SessionRetirementContinuation,
+	type SessionRetirementOutcome,
+} from "../session/session-retirement";
+import { FileSessionStorage, type SessionStorageSnapshot } from "../session/session-storage";
+import { parseFirstJsonlLine } from "../session/session-transcript-header";
 import {
 	collectEmptyDeleteReceipts,
 	type EmptyDeleteGcRecord,
@@ -756,6 +771,11 @@ export interface GcDiskRecord {
 	action: GcDiskAction;
 	reason: string;
 	error?: string;
+	/** Exact incomplete retirement phase surfaced by the owning session adapter. */
+	phase?: "artifacts" | "transcript";
+	task_artifact_owner_retired?: true;
+	task_artifact_owner_payload_retired?: true;
+	task_artifact_owner_namespace_retained?: true;
 	/** Set when `bytes` is a floor because a walk was capped or partially unreadable. */
 	partial?: true;
 	/** Set when this entry was a reclaim candidate that its surface withheld on incomplete evidence. */
@@ -1201,6 +1221,59 @@ async function discoverGcDiskTranscripts(sessionsRoot: string, errors: GcDiskErr
  * Classify (and optionally retire) session transcripts. Returns the transcripts
  * that survived, which is exactly the mark set for the blob sweep.
  */
+function sessionRetirementContinuation(
+	storage: FileSessionStorage,
+	sessionsRoot: string,
+	transcriptPath: string,
+	agentDir: string,
+): SessionRetirementContinuation | undefined {
+	let snapshot: SessionStorageSnapshot;
+	try {
+		snapshot = storage.readSnapshotSync(transcriptPath);
+	} catch {
+		return undefined;
+	}
+	const header = parseFirstJsonlLine(snapshot.bytes);
+	if (header?.type !== "session" || typeof header.id !== "string" || typeof header.cwd !== "string") return undefined;
+	try {
+		if (!taskArtifactOwnerLocatorFromTranscriptBytes(snapshot.bytes, header.id)) return undefined;
+	} catch {
+		return undefined;
+	}
+	const resolved = resolveManagedGcScopeForRead({ cwd: header.cwd, agentDir, sessionsRoot });
+	if (
+		resolved.kind !== "resolved" ||
+		path.resolve(resolved.scope.sessionsRoot) !== path.resolve(sessionsRoot) ||
+		path.resolve(resolved.scope.directoryPath) !== path.resolve(path.dirname(transcriptPath))
+	)
+		return undefined;
+	return { managedScope: resolved.scope };
+}
+
+function orphanRetirementRecord(
+	receipt: ManagedGcSessionRetirementReceipt,
+	now: number,
+	reason: string,
+	withheld = false,
+): GcDiskRecord {
+	const mtimeMs = Number(receipt.transcriptIdentity.mtimeNs / 1_000_000n);
+	const outcome = receipt.taskArtifactOwnerRetirementOutcome;
+	return {
+		surface: "sessions",
+		id: receipt.sessionId,
+		path: receipt.transcriptPath,
+		bytes: 0,
+		age_days: gcDiskAgeDays(now, mtimeMs),
+		action: "keep",
+		reason,
+		...(withheld ? { withheld: true as const } : {}),
+		...(receipt.state === "owner_retired" ? { task_artifact_owner_retired: true as const } : {}),
+		...(outcome?.kind === "payload_retired"
+			? { task_artifact_owner_payload_retired: true as const, task_artifact_owner_namespace_retained: true as const }
+			: {}),
+	};
+}
+
 async function runGcDiskSessions(input: {
 	surface: GcDiskSurfaceReport;
 	transcripts: GcDiskTranscript[];
@@ -1208,8 +1281,35 @@ async function runGcDiskSessions(input: {
 	policy: GcDiskPolicy;
 	now: number;
 	prune: boolean;
+	agentDir: string;
+	errors: GcDiskError[];
 }): Promise<GcDiskTranscript[]> {
-	const { surface, transcripts, references, policy, now, prune } = input;
+	const { surface, transcripts, references, policy, now, prune, agentDir, errors } = input;
+	const storage = new FileSessionStorage();
+	let orphanReceipts: readonly {
+		readonly scope: ManagedScope;
+		readonly receipt: ManagedGcSessionRetirementReceipt;
+	}[] = [];
+	let receiptDiscoveryError: string | undefined;
+	try {
+		const entries = await fsp.readdir(surface.root, { withFileTypes: true });
+		if (entries.some(entry => entry.name.startsWith("v2-"))) {
+			orphanReceipts = (
+				await discoverManagedGcSessionRetirementReceipts({
+					agentDir,
+					sessionsRoot: surface.root,
+				})
+			).filter(
+				item =>
+					!storage.existsSync(item.receipt.transcriptPath) &&
+					!transcripts.some(
+						transcript => path.resolve(transcript.path) === path.resolve(item.receipt.transcriptPath),
+					),
+			);
+		}
+	} catch (error) {
+		if (!isEnoent(error)) receiptDiscoveryError = gcDiskErrorText(error);
+	}
 	const maxAgeMs = policy.sessions_max_age_days * GC_DISK_DAY_MS;
 
 	// The newest transcript in each project directory is the `--continue` resume
@@ -1278,18 +1378,54 @@ async function runGcDiskSessions(input: {
 		}
 	}
 
-	const storage = new FileSessionStorage();
 	if (!prune) {
 		// Dry run must project the prune verdict, not just the policy verdict: the
 		// retention pass re-checks its own preconditions before it may call the
 		// delete authority, and a candidate that fails them is never removable.
 		for (const item of classified) {
 			if (item.record.action !== "would_reclaim") continue;
-			const probe = probeSessionRetirement(storage, surface.root, item.transcript.path);
-			if (probe.kind === "retirable") continue;
-			item.record.action = "keep";
-			item.record.reason = `retention_declined: ${probe.reason}`;
+			try {
+				const continuation = sessionRetirementContinuation(storage, surface.root, item.transcript.path, agentDir);
+				const probe = await probeSessionRetirement(storage, surface.root, item.transcript.path, continuation);
+				if (probe.kind === "retirable") {
+					if (probe.taskArtifactOwnerRetired) item.record.task_artifact_owner_retired = true;
+					if (probe.taskArtifactOwnerPayloadRetired) item.record.task_artifact_owner_payload_retired = true;
+					if (probe.taskArtifactOwnerNamespaceRetained) item.record.task_artifact_owner_namespace_retained = true;
+					continue;
+				}
+				if (probe.kind === "cleanup_pending") {
+					item.record.action = "reclaim_failed";
+					item.record.reason = `retention_incomplete: ${probe.reason}`;
+					item.record.error = probe.reason;
+					if (probe.phase) item.record.phase = probe.phase;
+					if (probe.taskArtifactOwnerRetired) item.record.task_artifact_owner_retired = true;
+					if (probe.taskArtifactOwnerPayloadRetired) item.record.task_artifact_owner_payload_retired = true;
+					if (probe.taskArtifactOwnerNamespaceRetained) item.record.task_artifact_owner_namespace_retained = true;
+					continue;
+				}
+				item.record.action = "keep";
+				item.record.reason = `retention_declined: ${probe.reason}`;
+				if (probe.reason.includes("task_artifact_owner_")) item.record.error = probe.reason;
+			} catch (error) {
+				const message = gcDiskErrorText(error);
+				item.record.action = "keep";
+				item.record.reason = `retention_declined: ${message}`;
+				item.record.error = message;
+				item.record.withheld = true;
+			}
 		}
+		for (const { receipt } of orphanReceipts) {
+			let reason = "transcript_missing_without_verified_retirement";
+			if (!references.complete) reason = `reference_scan_incomplete: ${references.notes.join(", ")}`;
+			else if (references.ids.has(receipt.sessionId)) reason = "referenced_by_live_surface";
+			surface.records.push(orphanRetirementRecord(receipt, now, reason, true));
+		}
+		if (receiptDiscoveryError)
+			errors.push({
+				surface: "sessions",
+				scope: surface.root,
+				message: `managed_gc_retirement_discovery_incomplete: ${receiptDiscoveryError}`,
+			});
 		return classified.filter(item => item.record.action !== "would_reclaim").map(item => item.transcript);
 	}
 
@@ -1303,9 +1439,21 @@ async function runGcDiskSessions(input: {
 			survivors.push(item.transcript);
 			continue;
 		}
-		const outcome = await retireSessionTranscript(storage, surface.root, item.transcript.path);
+		let outcome: SessionRetirementOutcome;
+		try {
+			const continuation = sessionRetirementContinuation(storage, surface.root, item.transcript.path, agentDir);
+			outcome = await retireSessionTranscript(storage, surface.root, item.transcript.path, continuation);
+		} catch (error) {
+			const message = gcDiskErrorText(error);
+			item.record.action = "reclaim_failed";
+			item.record.reason = `retention_failed: ${message}`;
+			item.record.error = message;
+			survivors.push(item.transcript);
+			continue;
+		}
 		if (outcome.kind === "retired") {
 			item.record.action = "reclaimed";
+			if (outcome.taskArtifactOwnerRetired) item.record.task_artifact_owner_retired = true;
 			continue;
 		}
 		if (outcome.kind === "cleanup_pending") {
@@ -1315,13 +1463,61 @@ async function runGcDiskSessions(input: {
 			item.record.action = "reclaim_failed";
 			item.record.reason = `retention_incomplete: ${outcome.reason}`;
 			item.record.error = outcome.reason;
+			if (outcome.phase) item.record.phase = outcome.phase;
+			if (outcome.taskArtifactOwnerRetired) item.record.task_artifact_owner_retired = true;
+			if (outcome.taskArtifactOwnerPayloadRetired) item.record.task_artifact_owner_payload_retired = true;
+			if (outcome.taskArtifactOwnerNamespaceRetained) item.record.task_artifact_owner_namespace_retained = true;
 			survivors.push(item.transcript);
 			continue;
 		}
 		item.record.action = "keep";
 		item.record.reason = `retention_declined: ${outcome.reason}`;
+		if (outcome.reason.includes("task_artifact_owner_")) item.record.error = outcome.reason;
 		survivors.push(item.transcript);
 	}
+	for (const { scope, receipt } of orphanReceipts) {
+		const record = orphanRetirementRecord(
+			receipt,
+			now,
+			!references.complete
+				? `reference_scan_incomplete: ${references.notes.join(", ")}`
+				: references.ids.has(receipt.sessionId)
+					? "referenced_by_live_surface"
+					: "transcript_missing_without_verified_retirement",
+			true,
+		);
+		if (!references.complete || references.ids.has(receipt.sessionId)) {
+			surface.records.push(record);
+			continue;
+		}
+		try {
+			const outcome = await retireOrphanSessionTranscript(storage, surface.root, { managedScope: scope }, receipt);
+			if (outcome.kind === "cleanup_pending") {
+				record.action = "reclaim_failed";
+				record.reason = `retention_incomplete: ${outcome.reason}`;
+				record.error = outcome.reason;
+				if (outcome.phase) record.phase = outcome.phase;
+				if (outcome.taskArtifactOwnerRetired) record.task_artifact_owner_retired = true;
+				if (outcome.taskArtifactOwnerPayloadRetired) record.task_artifact_owner_payload_retired = true;
+				if (outcome.taskArtifactOwnerNamespaceRetained) record.task_artifact_owner_namespace_retained = true;
+			} else {
+				record.reason = outcome.kind === "kept" ? outcome.reason : "transcript_missing_without_verified_retirement";
+				if (outcome.kind === "kept") record.error = outcome.reason;
+			}
+		} catch (error) {
+			const message = gcDiskErrorText(error);
+			record.action = "reclaim_failed";
+			record.reason = `retention_failed: ${message}`;
+			record.error = message;
+		}
+		surface.records.push(record);
+	}
+	if (receiptDiscoveryError)
+		errors.push({
+			surface: "sessions",
+			scope: surface.root,
+			message: `managed_gc_retirement_discovery_incomplete: ${receiptDiscoveryError}`,
+		});
 	return survivors;
 }
 
@@ -2203,6 +2399,8 @@ export async function collectGcDiskReport(input: {
 		policy,
 		now,
 		prune,
+		agentDir,
+		errors,
 	});
 	await runGcDiskBlobs({
 		surface: surfaces.blobs,

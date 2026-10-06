@@ -252,6 +252,47 @@ const profileSuffix = ` (${profileLabel})`;
 
 const buildOutputDirPrefix = resolveBuildOutputDirPrefix(profileLabel);
 
+/**
+ * Record the package-owned trusted digest of the built addon.
+ *
+ * The read-only diagnostic loader (`native/diagnostic-loader.js`) refuses to hand
+ * any bytes to the runtime loader unless their SHA-256 matches the entry recorded
+ * here, because an addon's own `nativeBuildInfo()` is self-reported by code that
+ * has already been executed. Entries for other platform artifacts are preserved
+ * so a multi-platform release accumulates one record per artifact.
+ */
+async function recordDiagnosticArtifactDigest(addonPath: string): Promise<void> {
+	const manifestPath = path.join(nativeDir, "diagnostic-artifact.json");
+	const digest = new Bun.CryptoHasher("sha256").update(await Bun.file(addonPath).bytes()).digest("hex");
+	const existing = (await Bun.file(manifestPath).exists())
+		? ((await Bun.file(manifestPath).json()) as { version?: string; artifacts?: Record<string, string> })
+		: {};
+	const { version } = (await Bun.file(packageJsonPath).json()) as { version: string };
+	const artifacts = existing.version === version ? { ...(existing.artifacts ?? {}) } : {};
+	artifacts[path.basename(addonPath)] = digest;
+	await Bun.write(
+		manifestPath,
+		`${JSON.stringify({ schema: "gjc.diagnostic-artifact", version, artifacts }, null, 2)}\n`,
+	);
+	// Release addons travel to other checkouts as bare `.node` uploads, so the digest
+	// travels beside each artifact and `scripts/verify-diagnostic-artifact-provenance.ts`
+	// rebuilds the record there from these sidecars.
+	await Bun.write(
+		`${addonPath}.provenance.json`,
+		`${JSON.stringify(
+			{
+				schema: "gjc.diagnostic-artifact-provenance",
+				version,
+				artifact: path.basename(addonPath),
+				sha256: digest,
+			},
+			null,
+			2,
+		)}\n`,
+	);
+	console.log(`Recorded trusted diagnostic artifact digest for ${path.basename(addonPath)}`);
+}
+
 // Build napi args
 const napiArgs = [
 	"build",
@@ -325,6 +366,8 @@ try {
 		`${canonicalAddonPath}.build.json`,
 		`${JSON.stringify({ languageSet, profile: profileLabel, builtAt: new Date().toISOString() }, null, 2)}\n`,
 	);
+
+	await recordDiagnosticArtifactDigest(canonicalAddonPath);
 
 	await generateEnumExports();
 	await normalizeGeneratedDeclarationSpacing();

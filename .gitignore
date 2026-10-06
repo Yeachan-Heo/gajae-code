@@ -12,6 +12,7 @@ target/
 *.tsbuildinfo
 *.node
 *.node.build.json
+*.node.provenance.json
 *.b64.js
 # `bun build --compile` leaves these next to the entrypoint when it is interrupted.
 *.bun-build

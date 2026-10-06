@@ -17,6 +17,7 @@ import {
 	resolveEquivalentPath,
 } from "@gajae-code/utils";
 import type { CpuProfile, HeapSnapshot } from "./profiler";
+import { sessionBelongsToParent } from "./report-bundle-parent";
 import { collectSystemInfo, sanitizeEnv } from "./system-info";
 
 /** Maximum number of log lines to load into memory at once. */
@@ -283,6 +284,8 @@ async function addSubagentSessions(
 			const archivePath = `subagents/${filename}`;
 			try {
 				const content = await Bun.file(filePath).text();
+				const headerLine = content.split("\n", 1)[0] ?? "";
+				if (!sessionBelongsToParent(headerLine, parentBasename)) continue;
 				data[archivePath] = content;
 				files.push(archivePath);
 

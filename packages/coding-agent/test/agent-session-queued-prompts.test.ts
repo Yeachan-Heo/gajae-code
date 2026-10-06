@@ -259,6 +259,74 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		expect(userTexts(session)).toEqual(["p1", "steer me", "queue me"]);
 	});
 
+	it("cancels only an implicit diverted text before queue consumption", async () => {
+		const gate = Promise.withResolvers<void>();
+		session = buildSession([
+			async () => {
+				await gate.promise;
+				return { content: ["original completed"] };
+			},
+			{ content: ["unrelated steer completed"] },
+		]);
+		const first = session.prompt("original");
+		try {
+			await waitUntil(() => session!.agent.state.isStreaming);
+			await session.sendUserMessage("keep steer", { deliverAs: "steer" });
+			const cancelled = new AbortController();
+			const promotions: Array<{ startsOwnRun?: boolean; removed?: boolean }> = [];
+			const dispositions: Array<{ startsOwnRun: boolean }> = [];
+			await session.sendUserMessage("cancel only this text", {
+				preflightSignal: cancelled.signal,
+				onDispatchDisposition: disposition => dispositions.push(disposition),
+				onQueuedPromoted: promotion => promotions.push(promotion),
+			});
+			expect(dispositions).toEqual([{ startsOwnRun: false }]);
+			expect(session.getQueuedMessages().steering).toEqual(["keep steer", "cancel only this text"]);
+			cancelled.abort();
+			expect(session.getQueuedMessages().steering).toEqual(["keep steer"]);
+			expect(promotions).toEqual([{ startsOwnRun: false, removed: true }]);
+			expect(session.agent.state.isStreaming).toBe(true);
+			gate.resolve();
+			await first;
+			await session.waitForIdle();
+			expect(userTexts(session)).toEqual(["original", "keep steer"]);
+			expect(assistantCount(session)).toBe(2);
+		} finally {
+			gate.resolve();
+			await first;
+		}
+	});
+
+	it("removes an implicit diverted submission when its admission callback rejects", async () => {
+		const gate = Promise.withResolvers<void>();
+		session = buildSession([
+			async () => {
+				await gate.promise;
+				return { content: ["original completed"] };
+			},
+		]);
+		const first = session.prompt("original");
+		try {
+			await waitUntil(() => session!.agent.state.isStreaming);
+			await expect(
+				session.sendUserMessage("rejected queue entry", {
+					onPreflightAccepted: () => {
+						throw new Error("admission observer rejected");
+					},
+				}),
+			).rejects.toThrow("admission observer rejected");
+			expect(session.getQueuedMessages().steering).toEqual([]);
+			expect(session.agent.state.isStreaming).toBe(true);
+			gate.resolve();
+			await first;
+			await session.waitForIdle();
+			expect(userTexts(session)).toEqual(["original"]);
+		} finally {
+			gate.resolve();
+			await first;
+		}
+	});
+
 	it("removes an arbitrary queued prompt selected for editing", async () => {
 		const gate = Promise.withResolvers<void>();
 		session = buildSession([

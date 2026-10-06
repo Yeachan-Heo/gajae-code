@@ -7,7 +7,6 @@ import { getProjectDir, isEnoent, logger, prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { AsyncJobManager, type FoldReason } from "../async";
 import { type BashArtifactSaveResult, type BashResult, executeBash } from "../exec/bash-executor";
-
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { buildGjcRuntimeSessionEnv } from "../gjc-runtime/goal-mode-request";
 import {
@@ -60,7 +59,6 @@ import {
 	registerOwnedIfLineaged,
 	unregisterOwnedRegistration,
 } from "../session/terminal-abort";
-
 import { renderStatusLine } from "../tui";
 import { CachedOutputBlock, getOutputBlockContentWidth } from "../tui/output-block";
 import { truncateToWidth } from "../tui/utils";
@@ -84,6 +82,7 @@ import {
 } from "./output-meta";
 import { resolveToCwd } from "./path-utils";
 import { formatToolWorkingDirectory, replaceTabs } from "./render-utils";
+import { assertCwdInsideWorkspace } from "./restricted-cwd";
 import { steerFoldReasonLine, watchSteerForFold } from "./steer-fold";
 import { checkTmuxSelfInjection } from "./tmux-self-injection-guard";
 import { ToolAbortError, ToolError } from "./tool-errors";
@@ -1560,6 +1559,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		}
 		if (!cwdStat.isDirectory()) {
 			throw new ToolError(`Working directory is not a directory: ${commandCwd}`);
+		}
+		if (this.session.bashRestrictionProfile === "read-only" || (allowedPrefixes?.length ?? 0) > 0) {
+			await assertCwdInsideWorkspace(this.session.cwd, commandCwd);
 		}
 
 		const requestedTimeoutSec = input.timeout ?? 300;

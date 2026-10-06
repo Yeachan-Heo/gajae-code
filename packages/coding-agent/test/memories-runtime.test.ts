@@ -34,11 +34,13 @@ async function makeTempDir(prefix: string): Promise<string> {
 	return dir;
 }
 
-function createModel(id = "test-model"): Model {
+function createModel(id = "test-model", reasoning = false): Model {
 	return {
 		provider: "openai",
 		id,
 		name: id,
+		reasoning,
+		...(reasoning ? { thinking: { mode: "effort", minLevel: ai.Effort.Low, maxLevel: ai.Effort.High } } : {}),
 		contextWindow: 32_000,
 	} as Model;
 }
@@ -51,7 +53,10 @@ function createModelRegistry(model: Model): any {
 	};
 }
 
-async function createFixture(overrides?: Partial<Record<string, unknown>>): Promise<SessionFixture> {
+async function createFixture(
+	overrides?: Partial<Record<string, unknown>>,
+	model = createModel(),
+): Promise<SessionFixture> {
 	const agentDir = await makeTempDir("memories-runtime-agent");
 	const sessionDir = path.join(agentDir, "sessions");
 	await fs.mkdir(sessionDir, { recursive: true });
@@ -66,7 +71,6 @@ async function createFixture(overrides?: Partial<Record<string, unknown>>): Prom
 		"memories.phase2HeartbeatSeconds": 1,
 		...(overrides ?? {}),
 	});
-	const model = createModel();
 	const modelRegistry = createModelRegistry(model);
 	const refreshBaseSystemPrompt = vi.fn(async () => undefined);
 	const session = {
@@ -176,25 +180,22 @@ describe("memories runtime", () => {
 		];
 		await fs.writeFile(rolloutPath, `${rolloutRows.map(row => JSON.stringify(row)).join("\n")}\n`);
 
-		vi.spyOn(ai, "completeSimple")
-			.mockResolvedValueOnce(
-				createAssistantMessage(
-					JSON.stringify({
-						rollout_summary: "Rollout summary A",
-						rollout_slug: "thread-a-rollout",
-						raw_memory: "Raw memory A",
-					}),
-				),
-			)
-			.mockResolvedValueOnce(
-				createAssistantMessage(
-					JSON.stringify({
-						memory_md: "# Memory\n\nConsolidated body",
-						memory_summary: "Consolidated summary",
-						skills: [{ name: "deploy-playbook", content: "# Deploy\nUse blue/green." }],
-					}),
-				),
+		const completeSpy = vi.spyOn(ai, "completeSimple").mockImplementation(async (_model, _context, options) => {
+			expect(options?.reasoning).toBeUndefined();
+			return createAssistantMessage(
+				completeSpy.mock.calls.length === 1
+					? JSON.stringify({
+							rollout_summary: "Rollout summary A",
+							rollout_slug: "thread-a-rollout",
+							raw_memory: "Raw memory A",
+						})
+					: JSON.stringify({
+							memory_md: "# Memory\n\nConsolidated body",
+							memory_summary: "Consolidated summary",
+							skills: [{ name: "deploy-playbook", content: "# Deploy\nUse blue/green." }],
+						}),
 			);
+		});
 
 		startMemoryStartupTask({
 			session: fx.session,
@@ -220,8 +221,41 @@ describe("memories runtime", () => {
 		await waitFor(() => {
 			expect(fx.session.refreshBaseSystemPrompt).toHaveBeenCalledTimes(1);
 		});
-		expect(ai.completeSimple).toHaveBeenCalled();
-		expect(ai.completeSimple).toHaveBeenCalledTimes(2);
+		expect(completeSpy).toHaveBeenCalledTimes(2);
+	});
+
+	test("keeps supported reasoning efforts for thinking-capable memory models", async () => {
+		const fx = await createFixture(undefined, createModel("reasoning-model", true));
+		const rolloutPath = path.join(fx.sessionDir, "thread-reasoning.jsonl");
+		await fs.writeFile(
+			rolloutPath,
+			`${JSON.stringify({ type: "session", id: "thread-reasoning", cwd: fx.agentDir })}\n${JSON.stringify({ type: "message", message: { role: "user", content: "summarize this rollout" } })}\n`,
+		);
+
+		const completeSpy = vi
+			.spyOn(ai, "completeSimple")
+			.mockResolvedValueOnce(
+				createAssistantMessage(
+					JSON.stringify({ rollout_summary: "Summary", rollout_slug: "reasoning", raw_memory: "Raw" }),
+				),
+			)
+			.mockResolvedValueOnce(
+				createAssistantMessage(
+					JSON.stringify({ memory_md: "# Memory\n\nMerged", memory_summary: "Summary", skills: [] }),
+				),
+			);
+
+		startMemoryStartupTask({
+			session: fx.session,
+			settings: fx.settings,
+			modelRegistry: fx.modelRegistry,
+			agentDir: fx.agentDir,
+			taskDepth: 0,
+		});
+
+		await waitFor(() => expect(completeSpy).toHaveBeenCalledTimes(2));
+		expect(completeSpy.mock.calls[0]?.[2]).toMatchObject({ reasoning: ai.Effort.Low });
+		expect(completeSpy.mock.calls[1]?.[2]).toMatchObject({ reasoning: ai.Effort.Medium });
 	});
 
 	test("falls back to the most recently used model instead of registry order when no role or session model is set", async () => {

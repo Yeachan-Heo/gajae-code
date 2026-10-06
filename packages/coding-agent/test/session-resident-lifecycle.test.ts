@@ -42,7 +42,10 @@ function failedNativeRename(): native.NativeNoReplaceResult {
 	};
 }
 function installVerifiedNativeCleanup(): void {
+	const exactUnlink = native.exactUnlink;
 	vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+		if (path.dirname(pathname).endsWith(path.join(".gjc-managed-session-internal", "locks")))
+			return exactUnlink(pathname, identity);
 		const parent = fs.lstatSync(path.dirname(pathname), { bigint: true });
 		if (
 			identity.parentDev === undefined ||

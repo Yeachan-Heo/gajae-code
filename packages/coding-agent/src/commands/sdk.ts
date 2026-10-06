@@ -1,9 +1,15 @@
-import { createHash } from "node:crypto";
+import { type ChildProcess, spawn } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { exactRemoveDirectoryTree, type NativeDirectoryTreeSnapshot, snapshotDirectoryTree } from "@gajae-code/natives";
+import {
+	exactRemoveDirectoryTree,
+	exactUnlinkDirect,
+	type NativeDirectoryTreeSnapshot,
+	snapshotDirectoryTree,
+} from "@gajae-code/natives";
 import { logger, postmortem } from "@gajae-code/utils";
 import { CliParseError, Command } from "@gajae-code/utils/cli";
 import type { Args as ParsedArgs } from "../cli/args";
@@ -23,6 +29,7 @@ import {
 	writeBrokerStartupExitRecordBounded,
 } from "../sdk/broker/broker-exit";
 import { readBrokerDiscovery } from "../sdk/broker/discovery";
+import { type EndpointFileRead, readEndpointFile } from "../sdk/broker/endpoint-authority";
 import {
 	emitBrokerStartupTestSignal,
 	reconcileBrokerGenerationForStartup,
@@ -42,6 +49,7 @@ import {
 	writeSessionLifecycleReady,
 } from "../sdk/broker/lifecycle";
 import { processIncarnation } from "../sdk/broker/process-incarnation";
+import { resolveSdkInternalSpawnCommand } from "../sdk/broker/runtime";
 import { writeBrokerStartupFailureMarker } from "../sdk/broker/startup-failure";
 import { runSdkStderrDrainer } from "../sdk/broker/stderr-drainer";
 import { renderSdkSearchTable, runSdkSearch, runSdkSessionCli } from "../sdk/cli";
@@ -651,6 +659,7 @@ export async function runSessionHost(
 	let startupComplete = false;
 	let readinessPublicationCleanupComplete = true;
 	let revokePendingReadinessMarker: (() => Promise<boolean>) | undefined;
+	let revokePublishedReadinessMarker: (() => Promise<boolean>) | undefined;
 	let readinessRevocation: Promise<boolean> | undefined;
 	let startupInterruption: SdkStartupFailure | undefined;
 	const interrupted = Promise.withResolvers<SdkStartupFailure>();
@@ -1265,20 +1274,76 @@ export async function runSessionHost(
 		return failureRollback;
 	};
 	const sessionEndpointPath = path.join(request.stateRoot, "sdk", `${request.sessionId}.json`);
-	const exitAfterSessionDisposal = async (reason?: "detached_idle"): Promise<void> => {
-		await disposeSession(reason);
+	const removeOwnedSessionEndpoint = async (): Promise<boolean> => {
+		try {
+			await fs.stat(sessionEndpointPath);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+			return false;
+		}
+		const endpoint: EndpointFileRead | undefined = await readEndpointFile(sessionEndpointPath);
+		if (!endpoint) return false;
+		let parsed: { pid?: unknown; sessionId?: unknown };
+		try {
+			parsed = JSON.parse(endpoint.source) as { pid?: unknown; sessionId?: unknown };
+		} catch {
+			return false;
+		}
+		if (parsed.pid !== process.pid || parsed.sessionId !== request.sessionId) {
+			return false;
+		}
+		const removal = (() => {
+			try {
+				return exactUnlinkDirect(sessionEndpointPath, {
+					dev: endpoint.dev,
+					ino: endpoint.ino,
+					nlink: endpoint.nlink,
+					size: endpoint.size,
+					mtimeNs: endpoint.mtimeNs,
+					quarantineName: `.gjc-delete-endpoint-${request.sessionId}-${randomUUID()}`,
+					sha256: createHash("sha256").update(endpoint.source).digest("hex"),
+					allowHardLink: true,
+				});
+			} catch (error) {
+				logger.warn("SDK host endpoint cleanup failed", { error: String(error) });
+				return undefined;
+			}
+		})();
+		if (!removal) return false;
+		return (
+			removal.ok ||
+			removal.code === "not_found" ||
+			(removal.code === "cleanup_pending" &&
+				removal.payloadDurable === true &&
+				!removal.retainedSuccessorPath &&
+				!removal.retainedUnknownPath)
+		);
+	};
+	let unregisterHostPostmortem: (() => void) | undefined;
+	let sessionDisposalExit: Promise<void> | undefined;
+	const exitAfterSessionDisposal = async (reason?: "detached_idle", exitProcess = true): Promise<void> => {
 		let failure: SdkStartupFailure | undefined;
+		let ownsEndpoint = false;
+		const endpointCleanup = (async (): Promise<boolean> => {
+			let complete = await removeOwnedSessionEndpoint();
+			for (let attempt = 0; !complete && attempt < 20; attempt += 1) {
+				await Bun.sleep(25);
+				complete = await removeOwnedSessionEndpoint();
+			}
+			return complete;
+		})();
+		let [endpointCleanupComplete, readinessRevoked] = await Promise.all([
+			endpointCleanup,
+			revokePublishedReadinessMarker?.() ?? Promise.resolve(true),
+		]);
+		await disposeSession(reason);
+		endpointCleanupComplete = await removeOwnedSessionEndpoint();
 		try {
 			const endpoint = JSON.parse(await fs.readFile(sessionEndpointPath, "utf8")) as {
 				pid?: unknown;
 				sessionId?: unknown;
 			};
-			if (endpoint.pid === process.pid && endpoint.sessionId === request.sessionId)
-				failure = {
-					phase: "startup",
-					reason: "failed",
-					message: `SDK host endpoint remained after graceful shutdown: ${request.sessionId}`,
-				};
+			ownsEndpoint = endpoint.pid === process.pid && endpoint.sessionId === request.sessionId;
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
 				failure = {
@@ -1286,27 +1351,57 @@ export async function runSessionHost(
 					reason: "failed",
 					message: `SDK host endpoint cleanup could not be verified: ${request.sessionId}`,
 				};
-			}
+			} else endpointCleanupComplete = true;
 		}
+		if (!ownsEndpoint && !failure && !readinessRevoked && revokePublishedReadinessMarker) {
+			failure = {
+				phase: "startup",
+				reason: "failed",
+				message: `SDK host readiness marker cleanup could not be verified: ${request.sessionId}`,
+			};
+		}
+		if (ownsEndpoint && !endpointCleanupComplete && !failure)
+			failure = {
+				phase: "startup",
+				reason: "failed",
+				message: `SDK host endpoint remained after graceful shutdown: ${request.sessionId}`,
+			};
 		if (failure) {
 			process.exitCode = 1;
 			process.stderr.write(`${failure.message}\n`);
 			await writeFailure(failure, rollback.result).catch(() => {});
 		}
-		process.exit(process.exitCode ?? 0);
+		unregisterHostPostmortem?.();
+		unregisterHostPostmortem = undefined;
+		if (exitProcess) process.exit(process.exitCode ?? 0);
 	};
 	let stopping = false;
+	const requestSessionStop = (reason?: "detached_idle", exitProcess = true): Promise<void> => {
+		if (stopping) return sessionDisposalExit ?? Promise.resolve();
+		stopping = true;
+		sessionDisposalExit = exitAfterSessionDisposal(reason, exitProcess);
+		return sessionDisposalExit;
+	};
 	const stop = (reason?: "detached_idle") => {
 		if (startupComplete) {
-			if (stopping) return;
-			stopping = true;
-			void exitAfterSessionDisposal(reason);
+			void requestSessionStop(reason);
 			return;
 		}
 		const failure = capability.normalizeFailure("startup", "failed", "SDK lifecycle host terminated.");
 		interruptStartup(failure);
 	};
-	const onReadySignal = (): void => stop();
+	const registerHostPostmortem = (): void => {
+		if (unregisterHostPostmortem) return;
+		unregisterHostPostmortem = postmortem.register("sdk-session-host:exit", async reason => {
+			if (reason !== postmortem.Reason.SIGTERM && reason !== postmortem.Reason.SIGINT) return;
+			// The postmortem signal authority defaults to 143/130; a session host
+			// signal is graceful and must preserve its cleanup result instead.
+			await requestSessionStop(undefined, false);
+			process.exitCode = 0;
+			process.exit(0);
+		});
+	};
+	registerHostPostmortem();
 
 	try {
 		const startupThinkingLevel = request.modelId ? parseModelString(request.modelId)?.thinkingLevel : undefined;
@@ -1354,6 +1449,7 @@ export async function runSessionHost(
 						effectMarker,
 						() => startupInterruption === undefined && now() < request.semanticReadyDeadlineAt,
 						revoke => {
+							revokePublishedReadinessMarker = revoke;
 							revokePendingReadinessMarker = revoke;
 							if (startupInterruption !== undefined) startReadinessRevocation(revoke);
 							else if (now() >= request.semanticReadyDeadlineAt) {
@@ -1388,8 +1484,6 @@ export async function runSessionHost(
 		revokePendingReadinessMarker = undefined;
 		readinessRevocation = undefined;
 		removeStartupSignalHandlers();
-		process.once("SIGTERM", onReadySignal);
-		process.once("SIGINT", onReadySignal);
 	} catch (error) {
 		if (error instanceof LifecycleReadinessCleanupError) constructionCleanupComplete = false;
 		const failure =
@@ -1402,8 +1496,6 @@ export async function runSessionHost(
 			await failAfterRollback(durableFailure);
 		} finally {
 			removeStartupSignalHandlers();
-			process.removeListener("SIGTERM", onReadySignal);
-			process.removeListener("SIGINT", onReadySignal);
 		}
 		throw error;
 	}
@@ -1441,6 +1533,7 @@ export async function runSessionHost(
 
 export type SdkInternalArgv =
 	| { action: "broker-internal"; agentDir: string }
+	| { action: "broker-trampoline-internal"; agentDir: string }
 	| { action: "session-host-internal" }
 	| { action: "stderr-drain-internal"; logPath: string; maxBytes: number };
 
@@ -1455,6 +1548,14 @@ export function parseSdkInternalArgv(argv: readonly string[]): SdkInternalArgv {
 		isSafeSdkInternalAgentDir(argv[2])
 	)
 		return { action: "broker-internal", agentDir: argv[2] };
+	if (
+		argv[0] === "broker-trampoline-internal" &&
+		argv.length === 3 &&
+		argv[1] === "--agent-dir" &&
+		typeof argv[2] === "string" &&
+		isSafeSdkInternalAgentDir(argv[2])
+	)
+		return { action: "broker-trampoline-internal", agentDir: argv[2] };
 	if (
 		argv[0] === "stderr-drain-internal" &&
 		argv.length === 5 &&
@@ -1494,6 +1595,7 @@ export default class Sdk extends Command {
 	async run(): Promise<void> {
 		if (
 			this.argv[0] !== "broker-internal" &&
+			this.argv[0] !== "broker-trampoline-internal" &&
 			this.argv[0] !== "session-host-internal" &&
 			this.argv[0] !== "stderr-drain-internal"
 		) {
@@ -1596,7 +1698,55 @@ export default class Sdk extends Command {
 		}
 
 		const internal = parseSdkInternalArgv(this.argv);
-		if (internal.action === "broker-internal") usePostmortemSignalExitAuthority();
+		if (internal.action === "broker-trampoline-internal") {
+			if (process.platform === "win32") throw new CliParseError("Broker trampoline is unavailable on Windows.");
+			const command = resolveSdkInternalSpawnCommand("broker-internal");
+			let child: ChildProcess;
+			try {
+				child = spawn(command.file, [...command.args, "--agent-dir", internal.agentDir], {
+					detached: true,
+					stdio: ["ignore", "ignore", "inherit"],
+					env: command.env,
+					...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
+				});
+			} catch (error) {
+				throw new Error("Broker trampoline could not start broker.", { cause: error });
+			}
+			let spawnError: Error | undefined;
+			child.once("error", error => {
+				spawnError = error;
+			});
+			if (child.pid === undefined) throw new Error("Broker trampoline could not start broker.");
+			const incarnation = processIncarnation(child.pid);
+			if (!incarnation) {
+				try {
+					child.kill("SIGKILL");
+				} catch {
+					// The child may already have exited; either way identity was not established.
+				}
+				throw new Error("Broker trampoline could not observe broker identity.");
+			}
+			if (spawnError) throw new Error("Broker trampoline could not start broker.", { cause: spawnError });
+			const stdoutWrite = Promise.withResolvers<void>();
+			process.stdout.write(`${child.pid}\t${incarnation}\n`, error => {
+				if (error) stdoutWrite.reject(error);
+				else stdoutWrite.resolve();
+			});
+			try {
+				await stdoutWrite.promise;
+			} catch (error) {
+				try {
+					child.kill("SIGKILL");
+				} catch {
+					// The child may already have exited; reporting failure remains authoritative.
+				}
+				throw error;
+			}
+			child.unref();
+			return;
+		}
+		if (internal.action === "broker-internal" || internal.action === "session-host-internal")
+			usePostmortemSignalExitAuthority();
 		if (internal.action === "session-host-internal") {
 			await runSessionHost();
 			return;

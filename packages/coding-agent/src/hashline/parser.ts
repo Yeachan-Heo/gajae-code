@@ -2,6 +2,7 @@ import { ABORT_MARKER, ABORT_WARNING, BEGIN_PATCH_MARKER, END_PATCH_MARKER, RANG
 import {
 	computeLineHash,
 	describeAnchorExamples,
+	HL_BODY_SEP,
 	HL_BODY_SEP_RE_RAW,
 	HL_FILE_PREFIX,
 	HL_HASH_CAPTURE_RE_RAW,
@@ -206,11 +207,43 @@ export function cloneCursor(cursor: HashlineCursor): HashlineCursor {
 	return cursor;
 }
 
+/** Context for diagnosing an insert op that ended up with no payload lines. */
+interface EmptyInsertContext {
+	/** The op token as written, without any `|TEXT` body (e.g. `»300rk`). */
+	op: string;
+	/** True when the op line carried `|TEXT` that only echoed the anchored line. */
+	echoedAnchorText: boolean;
+}
+
+function formatEmptyInsertError(opLineNum: number, context: EmptyInsertContext): string {
+	const base = `line ${opLineNum}: ${HL_OP_INSERT_BEFORE} and ${HL_OP_INSERT_AFTER} operations require at least one verbatim payload line.`;
+	if (context.echoedAnchorText) {
+		return (
+			`${base} The text after "${HL_BODY_SEP}" on "${context.op}${HL_BODY_SEP}…" matches the supplied anchor hash, ` +
+			`so it was read as an anchor echo, not as new content. Put the lines to insert on the lines after "${context.op}".`
+		);
+	}
+	return (
+		`${base} To insert a single blank line, put one empty line after "${context.op}" ` +
+		`(when it is the last op, the edit input ends with two newlines).`
+	);
+}
+
+/** Payload is required only when the op line carried no usable inline `|TEXT` body. */
+function emptyInsertContext(
+	sigil: string,
+	match: RegExpExecArray,
+	inlineBody: string | undefined,
+): EmptyInsertContext | undefined {
+	if (inlineBody !== undefined) return undefined;
+	return { op: `${sigil}${match[1]}`, echoedAnchorText: match[2] !== undefined };
+}
+
 function collectPayload(
 	lines: string[],
 	startIndex: number,
 	opLineNum: number,
-	requirePayload: boolean,
+	emptyInsert: EmptyInsertContext | undefined,
 ): { payload: string[]; nextIndex: number } {
 	const payload: string[] = [];
 	let index = startIndex;
@@ -220,11 +253,7 @@ function collectPayload(
 		payload.push(line);
 		index++;
 	}
-	if (payload.length === 0 && requirePayload) {
-		throw new Error(
-			`line ${opLineNum}: ${HL_OP_INSERT_BEFORE} and ${HL_OP_INSERT_AFTER} operations require at least one verbatim payload line.`,
-		);
-	}
+	if (payload.length === 0 && emptyInsert) throw new Error(formatEmptyInsertError(opLineNum, emptyInsert));
 	return { payload, nextIndex: index };
 }
 
@@ -267,7 +296,12 @@ export function parseHashlineWithWarnings(diff: string): { edits: HashlineEdit[]
 		if (insertBeforeMatch) {
 			const cursor = parseInsertTarget(insertBeforeMatch[1], lineNum, "before");
 			const inlineBody = resolveInlineInsertBody(cursor, insertBeforeMatch[2]);
-			const { payload, nextIndex } = collectPayload(lines, i + 1, lineNum, inlineBody === undefined);
+			const { payload, nextIndex } = collectPayload(
+				lines,
+				i + 1,
+				lineNum,
+				emptyInsertContext(HL_OP_INSERT_BEFORE, insertBeforeMatch, inlineBody),
+			);
 			if (inlineBody !== undefined) pushInsert(cursor, inlineBody, lineNum);
 			for (const text of payload) pushInsert(cursor, text, lineNum);
 			i = nextIndex;
@@ -278,7 +312,12 @@ export function parseHashlineWithWarnings(diff: string): { edits: HashlineEdit[]
 		if (insertAfterMatch) {
 			const cursor = parseInsertTarget(insertAfterMatch[1], lineNum, "after");
 			const inlineBody = resolveInlineInsertBody(cursor, insertAfterMatch[2]);
-			const { payload, nextIndex } = collectPayload(lines, i + 1, lineNum, inlineBody === undefined);
+			const { payload, nextIndex } = collectPayload(
+				lines,
+				i + 1,
+				lineNum,
+				emptyInsertContext(HL_OP_INSERT_AFTER, insertAfterMatch, inlineBody),
+			);
 			if (inlineBody !== undefined) pushInsert(cursor, inlineBody, lineNum);
 			for (const text of payload) pushInsert(cursor, text, lineNum);
 			i = nextIndex;
@@ -288,7 +327,7 @@ export function parseHashlineWithWarnings(diff: string): { edits: HashlineEdit[]
 		const replaceMatch = REPLACE_OP_RE.exec(line);
 		if (replaceMatch) {
 			const range = parseRange(replaceMatch[1], lineNum, HL_OP_REPLACE);
-			const { payload, nextIndex } = collectPayload(lines, i + 1, lineNum, false);
+			const { payload, nextIndex } = collectPayload(lines, i + 1, lineNum, undefined);
 			if (payload.length > 0) {
 				for (const text of payload) {
 					edits.push({

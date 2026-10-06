@@ -128,6 +128,36 @@ describe("EventController textless length stop", () => {
 		expect(fixture.showWarning).not.toHaveBeenCalled();
 	});
 
+	it("does not recommend token changes when the provider supplied an incomplete-response diagnostic", async () => {
+		const terminalNotification = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		settings.override("completion.notify", "on");
+		settings.set("completion.notifyCommand", "notify-test");
+		const spawn = vi
+			.spyOn(Bun, "spawn")
+			.mockImplementation(
+				() =>
+					({ exited: Promise.resolve(0), kill: () => {}, unref: () => {} }) as unknown as Bun.Subprocess<
+						"ignore",
+						"ignore",
+						"ignore"
+					>,
+			);
+		const message = assistantMessage([]);
+		message.errorMessage =
+			"Provider reported content_filter: the response was stopped by content filtering, not an output-token limit.";
+		const fixture = await runAgentEnd(message);
+		const warning =
+			"Response ended before producing visible text or a tool call. See the provider diagnostic for the reason.";
+
+		expect(fixture.showWarning).toHaveBeenCalledTimes(1);
+		expect(fixture.showWarning).toHaveBeenCalledWith(warning);
+		expect(fixture.continueSession).not.toHaveBeenCalled();
+		expect(terminalNotification).toHaveBeenCalledWith("length-stop-test: Response incomplete");
+		const [, options] = spawn.mock.calls[0] as unknown as [string[], { env?: Record<string, string> }];
+		expect(options.env?.GJC_NOTIFICATION_TITLE).toBe("length-stop-test: Response incomplete");
+		expect(options.env?.GJC_NOTIFICATION_BODY).toBe(warning);
+	});
+
 	it("does not warn when a length stop contains a tool call", async () => {
 		const fixture = await runAgentEnd(
 			assistantMessage([{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "README.md" } }]),

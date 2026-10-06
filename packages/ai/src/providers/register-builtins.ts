@@ -11,6 +11,7 @@
  * loader: heavy SDKs stay out of the CLI startup parse graph.
  */
 
+import { $env } from "@gajae-code/utils";
 import type {
 	Api,
 	AssistantMessage,
@@ -280,16 +281,33 @@ function forwardStream<TApi extends Api>(
 					model.provider,
 					limits?.defaultFirstEventTimeoutMs,
 				);
+				const firstEventTimeoutMs =
+					options.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs, firstEventFallbackMs);
+				const firstEventTimeoutSource =
+					options.streamFirstEventTimeoutMs !== undefined
+						? "stream-option"
+						: $env.PI_STREAM_FIRST_EVENT_TIMEOUT_MS !== undefined &&
+								Number.isFinite(Number($env.PI_STREAM_FIRST_EVENT_TIMEOUT_MS))
+							? "env"
+							: idleTimeoutMs !== undefined &&
+									(firstEventFallbackMs === undefined || idleTimeoutMs >= firstEventFallbackMs)
+								? "idle-timeout"
+								: firstEventFallbackMs !== undefined
+									? "provider-fallback"
+									: "default";
 				watchedSource = iterateWithIdleTimeout(source, {
 					idleTimeoutMs,
-					firstItemTimeoutMs:
-						options.streamFirstEventTimeoutMs ??
-						getStreamFirstEventTimeoutMs(idleTimeoutMs, firstEventFallbackMs),
+					firstItemTimeoutMs: firstEventTimeoutMs,
 					errorMessage: LAZY_STREAM_IDLE_TIMEOUT_ERROR,
 					firstItemErrorMessage: LAZY_STREAM_FIRST_EVENT_TIMEOUT_ERROR,
 					onIdle: () => abortTracker.abortLocally(new Error(LAZY_STREAM_IDLE_TIMEOUT_ERROR)),
 					onFirstItemTimeout: () =>
-						abortTracker.abortLocally(new FirstEventTimeoutError(LAZY_STREAM_FIRST_EVENT_TIMEOUT_ERROR)),
+						abortTracker.abortLocally(
+							new FirstEventTimeoutError(LAZY_STREAM_FIRST_EVENT_TIMEOUT_ERROR, {
+								firstEventTimeoutMs,
+								firstEventTimeoutSource,
+							}),
+						),
 					abortSignal: options.signal,
 					// Synthetic starts and tool-capability negotiation are control-plane events,
 					// not model progress. Keep the first-event window active until assistant output
@@ -313,7 +331,7 @@ function forwardStream<TApi extends Api>(
 			}
 		} catch (error) {
 			const stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
-			const message = createLazyLoadErrorMessage(model, error, stopReason);
+			const message = createLazyLoadErrorMessage(model, error, stopReason, source);
 			target.push({ type: "error", reason: stopReason, error: message });
 			target.end(message);
 		}
@@ -324,8 +342,37 @@ function createLazyLoadErrorMessage<TApi extends Api>(
 	model: Model<TApi>,
 	error: unknown,
 	stopReason: Extract<AssistantMessage["stopReason"], "aborted" | "error"> = "error",
+	source?: AsyncIterable<AssistantMessageEvent>,
 ): AssistantMessage {
 	const transportFailure = transportFailureFacts(error);
+	const carriedDiagnostics =
+		source && typeof source === "object"
+			? (source as { googleGeminiCliDiagnostics?: AssistantMessage["googleGeminiCliDiagnostics"] })
+					.googleGeminiCliDiagnostics
+			: undefined;
+	const diagnostics =
+		carriedDiagnostics ??
+		(error instanceof FirstEventTimeoutError
+			? (
+					error as FirstEventTimeoutError & {
+						googleGeminiCliDiagnostics?: AssistantMessage["googleGeminiCliDiagnostics"];
+					}
+				).googleGeminiCliDiagnostics
+			: undefined);
+	if (diagnostics && typeof error === "object" && error !== null) {
+		const timeoutFacts = error as {
+			firstEventTimeoutMs?: unknown;
+			firstEventTimeoutSource?: unknown;
+		};
+		if (typeof timeoutFacts.firstEventTimeoutMs === "number") {
+			diagnostics.firstEventTimeoutMs = timeoutFacts.firstEventTimeoutMs;
+		}
+		if (typeof timeoutFacts.firstEventTimeoutSource === "string") {
+			diagnostics.firstEventTimeoutSource = timeoutFacts.firstEventTimeoutSource as NonNullable<
+				AssistantMessage["googleGeminiCliDiagnostics"]
+			>["firstEventTimeoutSource"];
+		}
+	}
 	return {
 		role: "assistant",
 		content: [],
@@ -344,6 +391,7 @@ function createLazyLoadErrorMessage<TApi extends Api>(
 		errorMessage:
 			stopReason === "aborted" ? "Request was aborted" : error instanceof Error ? error.message : String(error),
 		...(transportFailure ? { transportFailure } : {}),
+		...(diagnostics ? { googleGeminiCliDiagnostics: diagnostics } : {}),
 		timestamp: Date.now(),
 	};
 }

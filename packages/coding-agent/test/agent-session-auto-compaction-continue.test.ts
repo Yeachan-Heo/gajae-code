@@ -1063,4 +1063,47 @@ describe("AgentSession auto-compaction continuation", () => {
 			),
 		).toBe(true);
 	});
+
+	it("allows prompting after overflow compaction completes", async () => {
+		// Verify that prompts can be submitted after overflow auto-compaction completes.
+		// This test exercises the overflow path to ensure that compaction transitions
+		// are handled correctly and don't block subsequent prompt admission.
+
+		// First, fill the message history to trigger overflow (threshold + some buffer)
+		const largeMessage = assistantMessage({
+			usage: {
+				input: 350_000, // Exceeds the default threshold of 300K
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 350_000,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+		});
+
+		// Trigger overflow auto-compaction by emitting agent_end
+		sessionManager.appendMessage(largeMessage);
+		session.agent.emitExternalEvent({ type: "message_end", message: largeMessage });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [largeMessage] });
+
+		// Wait for compaction to complete
+		for (let i = 0; i < 20; i++) await Promise.resolve();
+		await session.waitForIdle();
+
+		// Now try to prompt - this should succeed without timing out
+		let promptError: Error | undefined;
+		try {
+			await Promise.race([
+				session.prompt("message after overflow compaction"),
+				new Promise<void>((_, reject) =>
+					setTimeout(() => reject(new Error("Timed out waiting for prompt after compaction")), 3000),
+				),
+			]);
+			// The prompt should have been queued without timing out
+		} catch (error) {
+			promptError = error instanceof Error ? error : new Error(String(error));
+		}
+
+		expect(promptError, "prompt should succeed after overflow compaction").toBeUndefined();
+	});
 });

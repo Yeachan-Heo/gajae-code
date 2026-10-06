@@ -40,6 +40,7 @@ import { CommandPalette, type CommandPaletteAction, type CommandPaletteEntry } f
 import type { PasteTextContext } from "../components/custom-editor";
 import { QueuePaneComponent } from "../components/queue-pane";
 import { type QueuedMessageMoveDirection, QueuedMessageSelectorComponent } from "../components/queued-message-selector";
+import { focusedUiOwnsInterrupt } from "../utils/interrupt-ownership";
 import { matchesAppInterrupt } from "../utils/keybinding-matchers";
 
 const QUEUE_SELECTOR_NAVIGATION_ACTIONS = [
@@ -546,15 +547,23 @@ export class InputController {
 			if (!isInterruptKey && !isClearKey) {
 				return undefined;
 			}
-			if (isClearKey && !isInterruptKey && this.ctx.hasActiveBtw() && this.ctx.handleBtwEscape()) {
-				this.#resetEscapeGestures();
-				return { consume: true };
-			}
-			if (isClearKey && !isInterruptKey && this.ctx.hookSelector?.hasActiveInlineInput?.() === true) {
+			// Listeners run before focused handleInput. Yield interrupt/back to the
+			// focused UI before touching BTW, maintenance, retries or workflow state.
+			// Clear (Ctrl+C by default) remains a global abort, even if the same
+			// key is also configured as interrupt.
+			if (isInterruptKey && !isClearKey && focusedUiOwnsInterrupt(this.ctx)) {
 				this.#resetEscapeGestures();
 				return undefined;
 			}
-			if (isClearKey && !isInterruptKey) {
+			if (isClearKey && this.ctx.hasActiveBtw() && this.ctx.handleBtwEscape()) {
+				this.#resetEscapeGestures();
+				return { consume: true };
+			}
+			if (isClearKey && this.ctx.hookSelector?.hasActiveInlineInput?.() === true) {
+				this.#resetEscapeGestures();
+				return undefined;
+			}
+			if (isClearKey) {
 				if (this.#handlePendingSteerInterrupt()) return { consume: true };
 				if (
 					this.#handleCancellableWorkEscape({

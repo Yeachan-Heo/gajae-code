@@ -6,7 +6,11 @@ import { currentExecutablePath } from "@gajae-code/natives";
 
 import internalSourceMarker from "./internal-source-marker-2178.txt" with { type: "file" };
 
-export type SdkInternalAction = "broker-internal" | "session-host-internal" | "stderr-drain-internal";
+export type SdkInternalAction =
+	| "broker-internal"
+	| "broker-trampoline-internal"
+	| "session-host-internal"
+	| "stderr-drain-internal";
 
 export type SdkInternalSpawnCommand =
 	| {

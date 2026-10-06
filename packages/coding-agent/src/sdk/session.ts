@@ -162,6 +162,7 @@ import {
 	type MCPToolCache,
 	resolveMCPToolCache,
 } from "../runtime-mcp";
+import { createMCPFormInputHandler } from "../runtime-mcp/elicitation";
 import type { MCPLoadResult } from "../runtime-mcp/manager";
 import { MCP_STARTUP_WAIT_GRACE_MS } from "../runtime-mcp/startup-policy";
 import type { MCPServerConfig } from "../runtime-mcp/types";
@@ -584,6 +585,12 @@ export interface CreateAgentSessionOptions {
 	 * @internal CLI-only ordering guard; SDK callers retain immediate startup by default.
 	 */
 	deferMemoryBackendStartup?: boolean;
+	/**
+	 * Skip optional model-catalog discovery during lifecycle startup. ACP hosts must
+	 * publish their endpoint before unrelated provider credential refreshes begin.
+	 * @internal lifecycle-only startup guard.
+	 */
+	deferOptionalModelRefresh?: boolean;
 
 	/**
 	 * Defer model profile activation until explicit model pin validation occurs.
@@ -706,6 +713,22 @@ export interface CreateAgentSessionResult {
 	 * this session published. Undefined when no GJC bundles participated.
 	 */
 	gjcRuntimeSnapshot?: GjcRuntimeSnapshotProvider;
+}
+
+/**
+ * Start optional provider/model discovery only when it is safe to add work to
+ * the caller's startup graph. Lifecycle hosts deliberately skip this during
+ * construction: discovery preflights every configured provider and may refresh
+ * an unrelated OAuth credential while several hosts are opening the same DB.
+ */
+export function startOptionalModelRefresh(
+	modelRegistry: Pick<ModelRegistry, "refreshInBackground">,
+	credentialSessionId: string | undefined,
+	deferred: boolean,
+): boolean {
+	if (deferred) return false;
+	modelRegistry.refreshInBackground("online-if-uncached", credentialSessionId);
+	return true;
 }
 
 export interface DeferredMcpConfigStartupResult {
@@ -2172,7 +2195,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				settings,
 			);
 			await refreshMissingQualifiedModelProviders(startupModelSelectors, modelRegistry, credentialSessionId);
-			modelRegistry.refreshInBackground("online-if-uncached", credentialSessionId);
+			startOptionalModelRefresh(modelRegistry, credentialSessionId, options.deferOptionalModelRefresh === true);
 		}
 
 		const hasExplicitModel = options.model !== undefined || options.modelPattern !== undefined;
@@ -2646,7 +2669,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let ownedMcpManagerTools: readonly CustomTool[] = [];
 		let publishOwnedMcpTools = false;
 		const notificationDebounceTimers = new Map<string, Timer>();
+		const installMcpInputHandler = (manager: MCPManager): void => {
+			manager.setInputRequestHandler(
+				createMCPFormInputHandler({
+					getUi: () => {
+						const context = toolContextStore.getContext();
+						return { ui: context.ui, hasUI: context.hasUI === true };
+					},
+					getAskAnswerSource: () => session.getAskAnswerSource(),
+				}),
+			);
+		};
 		const wireMcpManagerCallbacks = (manager: MCPManager): void => {
+			installMcpInputHandler(manager);
 			manager.setOnPromptsChanged(serverName => {
 				const promptCommands = buildMCPPromptCommands(manager);
 				session.setMCPPromptCommands(promptCommands);
@@ -3678,6 +3713,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					: {}),
 			});
 			owned.setAuthStorage(authStorage);
+			installMcpInputHandler(owned);
 			mcpManager = owned;
 			ownsMcpManager = true;
 			registerOwnedMcpManagerCleanup(owned);
@@ -4007,6 +4043,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							// INTERNAL terminal-abort seams, threaded directly from the
 							// owning session (NOT on the public extension context).
 							terminalAbortSeams: {
+								getTerminalRunOwnerForEvent: event => {
+									if (!session) throw new Error("Terminal owner session is not initialized.");
+									return session.getTerminalRunOwnerForEvent(event);
+								},
+								getRunOwnerDomain: handle => {
+									if (!session) throw new Error("Terminal owner session is not initialized.");
+									return session.getRunOwnerDomain(handle);
+								},
 								getTerminalTurnEpoch: () => {
 									if (!session) throw new Error("Terminal abort session is not initialized.");
 									return session.getTerminalTurnEpoch();

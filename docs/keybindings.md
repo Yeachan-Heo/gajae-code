@@ -200,6 +200,10 @@ Authoritative inventory of the keybinding registry, one row per action. Generate
 
 Cross-context default reuse (`ctrl+s`, `ctrl+r`, `ctrl+d`, `ctrl+left`/`ctrl+right`, `enter`, `escape`, `ctrl+c`) is intentional: each pair is active in a different focused context and is disambiguated at dispatch time. Use `detectDefaultKeyCollisions()` (above) to re-derive this list from the registry.
 
+A focused menu owns `app.interrupt` (Escape by default) before background work: Escape closes the menu or returns from its nested page without cancelling manual/automatic/overflow/idle compaction, handoff, retry backoff, or MCP/Smithery browser authorization. This includes composer-replacement selectors, their focused inner lists, and overlays. The focused component uses its own cancel binding; remapping `app.interrupt` does not remap every menu's `tui.select.cancel` binding. Once focus returns to the composer, interrupt resumes its normal work-cancellation behavior. A focused menu also takes precedence over an open `/btw` panel.
+
+`app.clear` (Ctrl+C by default) remains a global work-abort action while a menu is open, and wins when a key is configured for both clear and interrupt; it is not an alternative way to dismiss a menu safely during active work. Hook workflow prompts deliberately retain workflow-level interrupt behavior outside inline custom input. Inline hook input handles Escape locally to return to its option list.
+
 ### Not yet registry-managed
 
 A few contexts still match chords directly instead of resolving through the registry, and are tracked for a later phase:

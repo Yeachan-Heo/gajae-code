@@ -8,19 +8,12 @@ import "@gajae-code/utils/postmortem";
 import { Args, type CliConfig, Command, type CommandEntry, run } from "@gajae-code/utils/cli";
 import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
 import { time } from "@gajae-code/utils/logger";
-import { runFixtureReport } from "./cli/fixture-report";
 import { ROOT_LAUNCH_FLAGS } from "./cli/root-flags";
-import QuickLane from "./commands/quick-lane";
-import { runBashShellGuardian } from "./exec/bash-shell-guardian";
-import { runBashShellSupervisor } from "./exec/bash-shell-supervisor";
-import { runBashShellWorker } from "./exec/bash-shell-worker";
 import {
 	BASH_SHELL_RUNTIME_ARG,
 	BASH_SHELL_SUPERVISOR_ARG,
 	BASH_SHELL_WORKER_ARG,
 } from "./exec/bash-shell-worker-protocol";
-import { smokeTestIsolatedShell } from "./exec/isolated-shell";
-import { smokeTestTabWorker } from "./tools/browser/tab-worker-smoke";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 	process.stderr.write(
@@ -81,7 +74,7 @@ export const commands: CommandEntry[] = [
 	{ name: "plugin", load: () => import("./commands/plugin").then(m => m.default) },
 	{ name: "completion", load: () => import("./commands/completion").then(m => m.default) },
 	{ name: "launch", load: () => import("./commands/launch").then(m => m.default) },
-	{ name: "quick-lane", load: async () => QuickLane },
+	{ name: "quick-lane", load: () => import("./commands/quick-lane").then(m => m.default) },
 ];
 
 async function showHelp(config: CliConfig): Promise<void> {
@@ -346,6 +339,8 @@ async function runSmokeTest(): Promise<void> {
 	await smokeTestSyncWorker();
 	const { runNativeSmokeTest } = await import("./cli/native-smoke");
 	await runNativeSmokeTest();
+	const { smokeTestTabWorker } = await import("./tools/browser/tab-worker-smoke");
+	const { smokeTestIsolatedShell } = await import("./exec/isolated-shell");
 	await smokeTestTabWorker();
 	await smokeTestIsolatedShell();
 	process.stdout.write("smoke-test: ok\n");
@@ -401,14 +396,17 @@ export function routeRootArgv(argv: readonly string[]): string[] {
 /** Run the CLI with the given argv (no `process.argv` prefix). */
 export async function runCliAfterAdmission(argv: string[]): Promise<void> {
 	if (argv.length === 1 && argv[0] === BASH_SHELL_WORKER_ARG) {
+		const { runBashShellGuardian } = await import("./exec/bash-shell-guardian");
 		await runBashShellGuardian();
 		return;
 	}
 	if (argv.length === 1 && argv[0] === BASH_SHELL_SUPERVISOR_ARG) {
+		const { runBashShellSupervisor } = await import("./exec/bash-shell-supervisor");
 		await runBashShellSupervisor();
 		return;
 	}
 	if (argv.length === 1 && argv[0] === BASH_SHELL_RUNTIME_ARG) {
+		const { runBashShellWorker } = await import("./exec/bash-shell-worker");
 		await runBashShellWorker();
 		return;
 	}
@@ -478,6 +476,7 @@ export async function runCliAfterAdmission(argv: string[]): Promise<void> {
 			process.exitCode = 1;
 			return;
 		}
+		const { runFixtureReport } = await import("./cli/fixture-report");
 		process.exitCode = await runFixtureReport(id);
 		return;
 	}

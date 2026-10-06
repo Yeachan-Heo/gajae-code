@@ -621,7 +621,7 @@ if (process.argv[2] === CHILD_FLAG) {
 				"us-iso-east-1",
 				"https://codewhisperer.us-iso-east-1.amazonaws.com/",
 				"bearer",
-				"AmazonCodeWhispererService.GenerateAssistantResponse",
+				"AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
 			],
 			[
 				"kiro-discovery",

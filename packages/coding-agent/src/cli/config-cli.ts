@@ -63,29 +63,19 @@ type CliSettingDef = {
 const ALL_SETTING_PATHS = Object.keys(SETTINGS_SCHEMA) as SettingPath[];
 const REDACTED_SECRET_VALUE = "<redacted>";
 const SECRET_SETTING_WORDS = new Set(["token", "secret", "password", "passwd", "pwd", "credential", "credentials"]);
-const SECRET_SETTING_COMPOUND_PREFIXES = [
-	"api",
-	"auth",
-	"access",
-	"refresh",
-	"bearer",
-	"session",
-	"client",
-	"broker",
-	"bot",
-	"basic",
-];
-const SECRET_SETTING_COMPOUND_SUFFIXES = ["token", "secret", "password", "credential"];
+/**
+ * camelCase segments (`appToken`, `basicPassword`) do not split on `-`/`_`, so any segment whose
+ * normalized form ends in a secret word is secret. Plural budget names (`maxTokens`) and words that
+ * merely contain one (`showTokenUsage`) stay visible.
+ */
+const SECRET_SETTING_SUFFIX = /(?:token|secret|password|passwd|pwd|credentials?)$/;
 
 function isSecretSettingSegment(segment: string): boolean {
 	const normalized = segment.toLowerCase();
-	if (SECRET_SETTING_WORDS.has(normalized)) return true;
+	if (SECRET_SETTING_SUFFIX.test(normalized)) return true;
 	if (/api[-_]?key/i.test(segment)) return true;
 	const words = normalized.split(/[-_]/).filter(Boolean);
-	if (words.some(word => SECRET_SETTING_WORDS.has(word))) return true;
-	return SECRET_SETTING_COMPOUND_PREFIXES.some(prefix =>
-		SECRET_SETTING_COMPOUND_SUFFIXES.some(suffix => normalized === `${prefix}${suffix}`),
-	);
+	return words.some(word => SECRET_SETTING_WORDS.has(word));
 }
 
 function isSecretSettingPath(path: string): boolean {

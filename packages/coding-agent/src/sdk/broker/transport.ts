@@ -1,4 +1,5 @@
 import { createHash, timingSafeEqual } from "node:crypto";
+import { logger } from "@gajae-code/utils";
 import type { ServerWebSocket } from "bun";
 import type { Broker } from "./broker";
 
@@ -7,6 +8,8 @@ const PROTOCOL_VERSION = 3;
 const MAX_BROKER_JSON_FRAME_BYTES = 4 * 1024 * 1024;
 
 const BROKER_OPERATIONS = new Set([
+	// Observation-only published diagnostics; it starts, ensures and recovers nothing.
+	"broker.diagnostics",
 	"session.list",
 	"session.get_endpoint",
 	"session.create",
@@ -160,7 +163,8 @@ export class BrokerTransport {
 		try {
 			const result = await this.#broker.handleRequest(frame.operation, frame.input, frame.idempotencyKey);
 			send(socket, { type: "broker_response", id: frame.id, ...result });
-		} catch {
+		} catch (error) {
+			logger.warn(`sdk broker request failed: ${error instanceof Error ? error.message : String(error)}`);
 			sendError(socket, frame.id, "unavailable", "broker request failed");
 		}
 	}

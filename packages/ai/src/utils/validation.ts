@@ -960,6 +960,11 @@ export function validateToolCall(tools: Tool[], toolCall: ToolCall): ToolCall["a
 }
 
 const RAW_ARGUMENT_REJECTION_MESSAGES: Record<RawArgumentRejectionCode, string> = {
+	"ask-question-body-required": "ask question bodies must contain non-whitespace text; remove empty extra questions",
+	"ask-deep-interview-metadata-required":
+		"active deep-interview questions require structured deepInterview metadata; question prose and workflowGate do not record an answer",
+	"ask-deep-interview-single-question-required":
+		"active deep-interview asks require exactly one question; include metadata on that question, never as an extra question",
 	"ask-deep-interview-question-body-required":
 		"deep-interview question bodies must contain a specific question, not a placeholder",
 	"ask-intent-review-requires-positive-round":

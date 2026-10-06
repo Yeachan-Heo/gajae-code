@@ -113,6 +113,22 @@ export declare class MacAppearanceObserver {
   stop(): void
 }
 
+/**
+ * Exclusive read-only lease over one already published broker document.
+ *
+ * The lease exposes no descriptor, no path, no write method and no publication
+ * authority: it can only copy bounded bytes, re-prove the retained descriptor
+ * and name edges, and close. `close` is idempotent and never throws; every use
+ * after close reports `unsafe_discovery`.
+ */
+export declare class NativeDiagnosticSnapshot {
+  get ok(): boolean
+  get reason(): string | null
+  read(): NativeDiagnosticSnapshotRead
+  revalidate(): NativeDiagnosticSnapshotStatus
+  close(): void
+}
+
 /** Retained no-follow authority for the SDK publication namespace. */
 export declare class NativeRetainedBrokerPublication {
   /**
@@ -671,7 +687,7 @@ export declare function __piNativesPublishOutcomeV1(): void
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV0_18_5(): void
+export declare function __piNativesV0_18_7(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.
@@ -988,6 +1004,14 @@ export interface DependentIdleDeliveryResult {
  * Returns `"dark"` or `"light"` on macOS, `null` on other platforms.
  */
 export declare function detectMacOSAppearance(): MacOSAppearance | null
+
+/**
+ * Open a read-only lease over the fixed broker publication under `agentDir`.
+ *
+ * The caller supplies only the agent directory: the publication name, the
+ * ancestor policy and the read budget are fixed by this adapter.
+ */
+export declare function diagnosticSnapshotOpen(agentDir: string, budgetMs: number): NativeDiagnosticSnapshot
 
 /** One jsdiff change object: a run of added, removed, or common tokens. */
 export interface DiffChange {
@@ -2077,6 +2101,19 @@ export type NativeCanonicalDirectoryIdentity =
 			canonicalPath?: never;
 			code: "not_found" | "not_directory" | "not_utf8" | "network_unsupported" | "identity_unavailable" | "io_error";
 	  }
+
+/** Bytes copied out of one read-only broker publication observation. */
+export interface NativeDiagnosticSnapshotRead {
+  ok: boolean
+  reason?: string
+  bytes?: Uint8Array
+}
+
+/** Outcome of a read-only publication revalidation. */
+export interface NativeDiagnosticSnapshotStatus {
+  ok: boolean
+  reason?: string
+}
 
 export interface NativeDirectoryParentIdentity {
   dev: bigint

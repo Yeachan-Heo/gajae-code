@@ -74,7 +74,7 @@ interface WireUserMessage {
 		content: string;
 		modelId?: string;
 		userInputMessageContext?: {
-			tools?: { tools: WireToolSpec[] };
+			tools?: WireToolSpec[];
 			toolResults?: WireToolResult[];
 			editorStateContext?: Record<string, unknown>;
 		};
@@ -108,25 +108,19 @@ interface GenerateAssistantResponseRequest {
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface AssistantResponseEvent {
-	assistantResponseEvent?: {
-		content?: string;
-	};
+	content?: string;
 }
 
 interface ToolUseEventPayload {
-	toolUseEvent?: {
-		toolUseId?: string;
-		name?: string;
-		input?: unknown;
-		stop?: { stopReason?: string };
-	};
+	toolUseId?: string;
+	name?: string;
+	input?: string;
+	stop?: boolean;
 }
 
 interface MessageMetadataEvent {
-	messageMetadataEvent?: {
-		conversationId?: string;
-		utteranceId?: string;
-	};
+	conversationId?: string;
+	utteranceId?: string;
 }
 
 interface ErrorPayload {
@@ -169,6 +163,8 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 	(async () => {
 		const startTime = Date.now();
 		let firstTokenTime: number | undefined;
+		// Accumulator for streaming tool input fragments, keyed by toolUseId
+		const toolInputAccumulator = new Map<string, { name: string; input: string }>();
 
 		const output: AssistantMessage = {
 			role: "assistant",
@@ -190,6 +186,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 
 		const blocks = output.content as Block[];
 		const region = options.region ?? $env.KIRO_REGION ?? $env.AWS_REGION ?? $env.AWS_DEFAULT_REGION ?? DEFAULT_REGION;
+		let started = false; // Track whether start event has been emitted
 
 		try {
 			assertAwsRegionLabel(region);
@@ -222,24 +219,24 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 			const bodyText = JSON.stringify(requestBody);
 			const body = new TextEncoder().encode(bodyText);
 			const requestHeaders: Record<string, string> = {
-				"content-type": "application/json",
-				accept: "application/vnd.amazon.eventstream",
-				authorization: `Bearer ${bearerToken}`,
-				"amzn-X-amz-target": "AmazonCodeWhispererService.GenerateAssistantResponse",
+				"Content-Type": "application/x-amz-json-1.0",
+				Accept: "application/vnd.amazon.eventstream",
+				Authorization: `Bearer ${bearerToken}`,
+				"X-Amz-Target": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
 			};
 
-			if (options.profileArn) {
-				requestHeaders["x-amzn-codewhisperer-proflearn"] = options.profileArn;
-			}
-
-			// Merge user-provided headers
+			// Merge user-provided headers (case-insensitively)
+			const headersList = new Headers(requestHeaders);
 			if (options.headers) {
-				Object.assign(requestHeaders, options.headers);
+				const userHeaders = new Headers(options.headers);
+				userHeaders.forEach((value, key) => {
+					headersList.set(key, value);
+				});
 			}
 
 			const response = await fetch(url, {
 				method: "POST",
-				headers: requestHeaders,
+				headers: headersList,
 				body,
 				redirect: "error",
 				signal: options.signal,
@@ -300,11 +297,12 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 				switch (eventType) {
 					case "assistantResponseEvent": {
 						const ev = payload as AssistantResponseEvent;
-						const content = ev.assistantResponseEvent?.content;
+						const content = ev.content;
 						if (content) {
 							if (!firstTokenTime) firstTokenTime = Date.now();
-							if (blocks.length === 0) {
+							if (!started) {
 								stream.push({ type: "start", partial: output });
+								started = true;
 							}
 							handleTextDelta(content, blocks, output, stream);
 						}
@@ -313,16 +311,21 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 					case "toolUseEvent": {
 						const ev = payload as ToolUseEventPayload;
 						if (!firstTokenTime) firstTokenTime = Date.now();
-						if (blocks.length === 0) {
+						if (!started) {
 							stream.push({ type: "start", partial: output });
+							started = true;
 						}
-						handleToolUseEvent(ev, blocks, output, stream);
+						handleToolUseEvent(ev, blocks, output, stream, toolInputAccumulator);
+						// Clear accumulator for completed tool
+						if (ev.stop) {
+							toolInputAccumulator.delete(ev.toolUseId ?? "");
+						}
 						break;
 					}
 					case "messageMetadataEvent": {
 						const ev = payload as MessageMetadataEvent;
-						if (ev.messageMetadataEvent?.conversationId) {
-							output.responseId = ev.messageMetadataEvent.conversationId;
+						if (ev.conversationId) {
+							output.responseId = ev.conversationId;
 						}
 						break;
 					}
@@ -348,6 +351,12 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 			}
 
 			if (options.signal?.aborted) throw new Error("Request was aborted");
+
+			// Reject EOF while tool input is still being accumulated
+			if (toolInputAccumulator.size > 0) {
+				const unfinishedIds = Array.from(toolInputAccumulator.keys()).join(", ");
+				throw new Error(`Kiro CodeWhisperer stream ended with incomplete tool calls: ${unfinishedIds}`);
+			}
 
 			// Finalize blocks
 			for (const block of blocks) {
@@ -456,9 +465,7 @@ function buildConversationState(
 		if (!currentMessage.userInputMessage.userInputMessageContext) {
 			currentMessage.userInputMessage.userInputMessageContext = {};
 		}
-		currentMessage.userInputMessage.userInputMessageContext.tools = {
-			tools: convertTools(context.tools),
-		};
+		currentMessage.userInputMessage.userInputMessageContext.tools = convertTools(context.tools);
 	}
 
 	return {
@@ -601,44 +608,55 @@ function handleToolUseEvent(
 	blocks: Block[],
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
+	accumulator: Map<string, { name: string; input: string }>,
 ): void {
-	const toolEvent = ev.toolUseEvent;
-	if (!toolEvent) return;
+	const name = ev.name ?? "";
+	const input = ev.input ?? "";
 
-	const toolUseId = toolEvent.toolUseId ?? "";
-	const name = toolEvent.name ?? "";
+	// Determine the tool ID: use provided ID, or find the currently active tool call
+	let toolUseId = ev.toolUseId;
+	if (!toolUseId) {
+		// ID-less fragment: associate with the currently active tool call
+		// Find the last tool call being accumulated (the most recently started tool)
+		const keys = Array.from(accumulator.keys());
+		if (keys.length > 0) {
+			toolUseId = keys[keys.length - 1];
+		} else {
+			// No active tool calls; create a placeholder entry (should rarely happen)
+			toolUseId = "";
+		}
+	}
 
-	// If input is provided as a complete object, emit toolcall_end
-	if (toolEvent.input !== undefined && toolEvent.input !== null) {
-		const inputStr = typeof toolEvent.input === "string" ? toolEvent.input : JSON.stringify(toolEvent.input);
+	// Accumulate input fragments per toolUseId
+	let accumulated = accumulator.get(toolUseId);
+	if (!accumulated) {
+		accumulated = { name, input: "" };
+		accumulator.set(toolUseId, accumulated);
+	}
+	accumulated.input += input;
+
+	// Update name if provided and not yet set
+	if (name && !accumulated.name) {
+		accumulated.name = name;
+	}
+
+	// Emit toolcall_end only when we have a stop signal
+	if (ev.stop) {
+		const inputStr = accumulated.input;
 		const toolCall: ToolCall = {
 			type: "toolCall",
 			id: toolUseId,
-			name,
+			name: accumulated.name,
 			arguments: safeParseJson(inputStr) as Record<string, any>,
 		};
-		if (typeof toolEvent.input === "string") captureUnicodeEscapeEvidence(toolCall, inputStr);
+		captureUnicodeEscapeEvidence(toolCall, inputStr);
 
 		const newBlock: Block = { ...toolCall, index: blocks.length };
-		if (typeof toolEvent.input === "string") captureUnicodeEscapeEvidence(newBlock, inputStr);
+		captureUnicodeEscapeEvidence(newBlock, inputStr);
 		blocks.push(newBlock);
 		stream.push({ type: "toolcall_end", contentIndex: newBlock.index!, toolCall, partial: output });
-		return;
+		accumulator.delete(toolUseId);
 	}
-
-	// Otherwise, accumulate partial input (if the service streams it in chunks)
-	// The published model does not document chunked tool input for CodeWhisperer,
-	// so this path handles the case defensively but expects complete input per event.
-	const toolCall: ToolCall = {
-		type: "toolCall",
-		id: toolUseId,
-		name,
-		arguments: {},
-	};
-
-	const newBlock: Block = { ...toolCall, index: blocks.length };
-	blocks.push(newBlock);
-	stream.push({ type: "toolcall_end", contentIndex: newBlock.index!, toolCall, partial: output });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

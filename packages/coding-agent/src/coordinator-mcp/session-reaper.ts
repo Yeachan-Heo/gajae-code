@@ -22,6 +22,11 @@ export const DEFAULT_SESSION_IDLE_TTL_MS = 30 * 60_000; // 30 min idle → reap
 export const DEFAULT_SESSION_SWEEP_INTERVAL_MS = 5 * 60_000; // sweep every 5 min
 export const MIN_SESSION_IDLE_TTL_MS = 60_000; // never reap a <1min-idle session
 export const MIN_SESSION_SWEEP_INTERVAL_MS = 30_000;
+/**
+ * Longest delay setTimeout honors. Bun, like Node, treats any larger delay as 1 ms,
+ * so an operator's very long sweep interval would otherwise re-sweep back to back.
+ */
+export const MAX_SESSION_SWEEP_INTERVAL_MS = 2 ** 31 - 1;
 /** After this many consecutive reap failures the session is force-evicted from the index. */
 export const MAX_REAP_FAILURES = 3;
 
@@ -92,7 +97,10 @@ export interface SessionReaper {
 
 export function createSessionReaper(deps: SessionReaperDeps, policy: SessionReaperPolicy): SessionReaper {
 	const idleTtlMs = Math.max(MIN_SESSION_IDLE_TTL_MS, policy.idleTtlMs);
-	const sweepIntervalMs = Math.max(MIN_SESSION_SWEEP_INTERVAL_MS, policy.sweepIntervalMs);
+	const sweepIntervalMs = Math.min(
+		MAX_SESSION_SWEEP_INTERVAL_MS,
+		Math.max(MIN_SESSION_SWEEP_INTERVAL_MS, policy.sweepIntervalMs),
+	);
 	let timer: ReturnType<typeof setTimeout> | null = null;
 	let generation = 0;
 	let inProgress = false;

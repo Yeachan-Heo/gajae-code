@@ -90,6 +90,9 @@ type Fixture = {
 	sendStopped(reason: StoppedReason): void;
 	sendToolStart(toolCallId: string): void;
 	sendToolEnd(toolCallId: string): void;
+	sendSessionClosed(): void;
+	sendSessionTerminated(): void;
+	acknowledgeCancel(): void;
 	acknowledgePrompt(): void;
 	dispose(): void;
 };
@@ -128,6 +131,16 @@ function idleUpdates(updates: SessionNotification[]): number {
 	).length;
 }
 
+function latestPhase(updateList: SessionNotification[]): { phase?: string; running?: boolean } | undefined {
+	for (let index = updateList.length - 1; index >= 0; index--) {
+		const update = updateList[index]?.update;
+		if (update?.sessionUpdate !== "session_info_update") continue;
+		const meta = (update as { _meta?: { gjcPhase?: string; gjcRunning?: boolean } })._meta;
+		if (meta) return { phase: meta.gjcPhase, running: meta.gjcRunning };
+	}
+	return undefined;
+}
+
 function textChunks(updates: SessionNotification[]): number {
 	return updates.filter(update => update.update.sessionUpdate === "agent_message_chunk").length;
 }
@@ -147,6 +160,7 @@ type FixtureOptions = {
 	deferFirstPromptAcknowledgement?: boolean;
 	cancelSettlementGraceMs?: number;
 	preflightCancelAcknowledgement?: boolean;
+	deferCancelAcknowledgement?: boolean;
 };
 
 async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
@@ -166,6 +180,7 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 	let deferredPromptAcknowledgement:
 		| { socket: TestSocket; id: unknown; result: { commandId: string; turnId: string; accepted: true } }
 		| undefined;
+	let deferredCancelAcknowledgement: { socket: TestSocket; id: unknown; result: Record<string, unknown> } | undefined;
 
 	const send = (frame: Record<string, unknown>): void => {
 		if (!promptSocket) throw new Error("Expected a prompt socket");
@@ -182,6 +197,14 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 				ok: true,
 				result: deferred.result,
 			}),
+		);
+	};
+	const acknowledgeCancel = (): void => {
+		const deferred = deferredCancelAcknowledgement;
+		if (!deferred) throw new Error("Expected a deferred cancel acknowledgement");
+		deferredCancelAcknowledgement = undefined;
+		deferred.socket.send(
+			JSON.stringify({ type: "control_response", id: deferred.id, ok: true, result: deferred.result }),
 		);
 	};
 	const sendAssistantText = (text: string): void => {
@@ -260,6 +283,26 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 					result: { content: [{ type: "text", text: "done" }] },
 				},
 			},
+		});
+	};
+	const sendSessionClosed = (): void => {
+		send({
+			type: "event",
+			kind: "session_closed",
+			sessionId,
+			payload: {
+				type: "session_closed",
+				sessionId,
+				reason: "host_exit",
+			},
+		});
+	};
+	const sendSessionTerminated = (): void => {
+		send({
+			type: "event",
+			kind: "session_terminated",
+			sessionId,
+			payload: { type: "session_terminated", sessionId, reason: "host_exit" },
 		});
 	};
 
@@ -342,6 +385,8 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 						id: frame.id,
 						result: { commandId, turnId, accepted: true },
 					};
+				} else if (frame.operation === "turn.abort" && options.deferCancelAcknowledgement) {
+					deferredCancelAcknowledgement = { socket, id: frame.id, result };
 				} else {
 					socket.send(
 						JSON.stringify({
@@ -417,6 +462,9 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 		sendStopped,
 		sendToolStart,
 		sendToolEnd,
+		sendSessionClosed,
+		sendSessionTerminated,
+		acknowledgeCancel,
 		acknowledgePrompt,
 		dispose: () => {
 			abort.abort();
@@ -503,6 +551,7 @@ test("a prompt awaiting the model past the inference bound is rejected instead o
 		expect(message).toContain("ACP prompt was abandoned");
 		expect(message).toContain(`${Math.round(ACP_PROMPT_INFERENCE_TIMEOUT_MS / 1_000)}s of silence`);
 		expect(message).toContain("the SDK session host stopped producing frames");
+		expect(message).toContain("the session still accepts the next prompt");
 		expect(message).toContain('"agent_start"');
 		expect(message).toContain(`commandId=${commandId}`);
 		expect(message).toContain(`turnId=${turnId}`);
@@ -742,6 +791,150 @@ test("a prompt stalled in provider preflight is rejected at the bound instead of
 		releasePreflight.resolve();
 		ensureProviders.mockRestore();
 		diagnostic.mockRestore();
+		fixture.dispose();
+	}
+});
+
+test("a session host close settles an active prompt immediately", async () => {
+	const fixture = await createFixture();
+	try {
+		const { pending } = await startTurn(fixture);
+		const idleBefore = idleUpdates(fixture.updates);
+		fixture.sendToolStart("host-exit-tool");
+		await waitFor(() => toolCalls(fixture.updates) > 0, "tool start");
+		fixture.sendSessionClosed();
+		const error = await Promise.race([
+			pending.then(
+				() => undefined,
+				reason => reason,
+			),
+			Bun.sleep(3_000).then(() => {
+				throw new Error("prompt did not settle after the session host closed");
+			}),
+		]);
+		expect(error).toBeInstanceOf(Error);
+		expect(error).toMatchObject({ code: "prompt_abandoned" });
+		expect((error as { message: string }).message).toContain("host_exit");
+		expect((error as { message: string }).message).not.toContain("still accepts the next prompt");
+		await waitFor(() => idleUpdates(fixture.updates) > idleBefore, "host-close idle phase");
+		expect(latestPhase(fixture.updates)).toMatchObject({
+			phase: "idle",
+			running: false,
+		});
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("host-close settlement preserves independent background busy state", async () => {
+	const fixture = await createFixture();
+	try {
+		const first = await startTurn(fixture);
+		fixture.sendSessionClosed();
+		await expect(bounded(first.pending, "first host-close settlement")).rejects.toMatchObject({
+			code: "prompt_abandoned",
+		});
+		fixture.send({ type: "activity", sessionId: fixture.sessionId, state: "busy" });
+		const { pending } = await startTurn(fixture);
+		fixture.sendSessionClosed();
+		await expect(bounded(pending, "host-close settlement")).rejects.toMatchObject({ code: "prompt_abandoned" });
+		expect(latestPhase(fixture.updates)).toMatchObject({
+			phase: "working",
+			running: true,
+		});
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("an acknowledged cancel wins over session_closed", async () => {
+	const fixture = await createFixture({ cancelSettlementGraceMs: 25 });
+	try {
+		const { pending } = await startTurn(fixture);
+		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel acknowledgement");
+		fixture.sendSessionClosed();
+		expect(await bounded(pending, "cancelled host close settlement")).toEqual({ stopReason: "cancelled" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("an acknowledged cancel wins over session_terminated", async () => {
+	const fixture = await createFixture({ cancelSettlementGraceMs: 25 });
+	try {
+		const { pending } = await startTurn(fixture);
+		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel acknowledgement");
+		fixture.sendSessionTerminated();
+		expect(await bounded(pending, "cancelled host termination settlement")).toEqual({ stopReason: "cancelled" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("a host close before cancel acknowledgement keeps abandonment behavior", async () => {
+	const fixture = await createFixture({ deferCancelAcknowledgement: true });
+	try {
+		const { pending } = await startTurn(fixture);
+		const cancel = fixture.agent.cancel({ sessionId: fixture.sessionId });
+		void cancel.catch(() => undefined);
+		fixture.sendSessionClosed();
+		const error = await bounded(
+			pending.then(
+				() => undefined,
+				reason => reason,
+			),
+			"unacknowledged cancel host close settlement",
+		);
+		expect(error).toMatchObject({ code: "prompt_abandoned" });
+		fixture.acknowledgeCancel();
+		await Bun.sleep(0);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("an acknowledged cancel followed by a late terminal settles exactly once", async () => {
+	const fixture = await createFixture({ cancelSettlementGraceMs: 25 });
+	try {
+		const { pending } = await startTurn(fixture);
+		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel acknowledgement");
+		fixture.sendSessionClosed();
+		expect(await bounded(pending, "cancelled host close settlement")).toEqual({ stopReason: "cancelled" });
+		fixture.sendStopped("end_turn");
+		await Bun.sleep(0);
+		expect(await bounded(pending, "already settled prompt")).toEqual({ stopReason: "cancelled" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("an acknowledged cancel remains cancelled when its grace timeout fires", async () => {
+	const fixture = await createFixture({ cancelSettlementGraceMs: 25 });
+	try {
+		const { pending } = await startTurn(fixture);
+		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel acknowledgement");
+		fixture.clock.advance(25);
+		expect(await bounded(pending, "grace cancellation settlement")).toEqual({ stopReason: "cancelled" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("a dispatched prompt without acknowledgement enters uncertain recovery after host close", async () => {
+	const fixture = await createFixture({ deferFirstPromptAcknowledgement: true });
+	try {
+		const pending = prompt(fixture, "uncertain host close");
+		await waitFor(() => fixture.correlation().commandId.length > 0, "prompt dispatch");
+		fixture.sendSessionClosed();
+		const error = await bounded(
+			pending.then(
+				() => undefined,
+				reason => reason,
+			),
+			"uncertain host close recovery",
+		);
+		expect(error).toMatchObject({ code: "terminal_uncertain" });
+	} finally {
 		fixture.dispose();
 	}
 });

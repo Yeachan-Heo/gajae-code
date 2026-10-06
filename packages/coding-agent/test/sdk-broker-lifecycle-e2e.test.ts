@@ -555,6 +555,70 @@ async function liveLifecycleSession(root: string, agentDir: string, sessionId: s
 	}
 }
 
+test("readiness polling avoids repeated heartbeat checkpoints and full index refreshes", async () => {
+	if (process.platform !== "linux") return;
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-ready-poll-cost-"));
+	const agentDir = path.join(root, "agent");
+	const fixture = path.join(root, "ready-poll-cost.ts");
+	const pollingStartedPath = path.join(root, "polling-started");
+	const broker = new Broker({ agentDir, heartbeatTtlMs: 60_000 });
+	let nowMs = 1_000;
+	await fs.writeFile(
+		fixture,
+		`const request = JSON.parse(process.env.GJC_SDK_LIFECYCLE_REQUEST ?? "{}");
+const stateRoot = request.stateRoot;
+const sessionId = request.sessionId;
+const marker = JSON.stringify({ pid: process.pid, effectMarker: request.effectMarker, incarnation: "fixture-incarnation" });
+await Bun.write(stateRoot + "/sdk/" + sessionId + ".lifecycle.json", marker);
+const readyPath = stateRoot + "/sdk/" + sessionId + ".lifecycle.ready.json";
+const endpointPath = stateRoot + "/sdk/" + sessionId + ".json";
+await Bun.write(readyPath, marker);
+await Bun.write(endpointPath, JSON.stringify({ sessionId, url: "ws://127.0.0.1:1", token: "fixture-token", pid: process.pid }));
+await Bun.write(${JSON.stringify(pollingStartedPath)}, "ready");
+setInterval(() => {}, 1_000_000);
+`,
+	);
+	const heartbeatSpy = vi.spyOn(Broker.prototype, "heartbeatSessions");
+	const refreshSpy = vi.spyOn(SessionIndex.prototype, "refresh");
+	const pollingStarted = Promise.withResolvers<void>();
+	const watcher = syncFs.watch(root, (_event, filename) => {
+		if (filename?.toString() === path.basename(pollingStartedPath)) pollingStarted.resolve();
+	});
+	setProcessIncarnationForTest(broker, () => "fixture-incarnation");
+	setLifecycleCommandResolverForTest(broker, () => ({ file: process.execPath, args: ["run", fixture] }));
+	setLifecycleTimingForTest(broker, {
+		now: () => nowMs,
+		sleep: async ms => {
+			nowMs += Math.max(ms, 1);
+			await Bun.sleep(0);
+		},
+	});
+	try {
+		await broker.start();
+		const responsePromise = broker.handleRequest(
+			"session.create",
+			{ cwd: root, readinessTimeoutMs: 4_000 },
+			"ready-poll-cost",
+		);
+		await pollingStarted.promise;
+		heartbeatSpy.mockClear();
+		refreshSpy.mockClear();
+		const response = await responsePromise;
+		expect(response).toMatchObject({ ok: false });
+		expect(heartbeatSpy.mock.calls.length).toBeLessThanOrEqual(1);
+		expect(refreshSpy.mock.calls.length).toBeLessThanOrEqual(2);
+	} finally {
+		watcher.close();
+		setLifecycleTimingForTest(broker, undefined);
+		setLifecycleCommandResolverForTest(broker, undefined);
+		setProcessIncarnationForTest(broker, undefined);
+		heartbeatSpy.mockRestore();
+		refreshSpy.mockRestore();
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 20_000);
+
 test("lifecycle child ignores a stale marker until its current effect marker replaces it", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-stale-marker-"));
 	const agentDir = path.join(root, "agent");
@@ -813,13 +877,14 @@ test("shipped session host exits promptly after publishing a cutoff receipt", as
 		});
 		if (!child.pid) throw new Error("session host has no pid");
 		const childIncarnation = await incarnation(child.pid);
-		const cutoffStartedAt = performance.now();
 		await fs.writeFile(
 			path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
 			JSON.stringify({ pid: child.pid, effectMarker, incarnation: childIncarnation }),
 		);
+		await waitFor(async () => ((await Bun.file(failurePath).exists()) ? true : undefined), "cutoff receipt");
+		const receiptPublishedAt = performance.now();
 		const outcome = await Promise.race([
-			child.exited.then(code => ({ code, latencyMs: performance.now() - cutoffStartedAt })),
+			child.exited.then(code => ({ code, latencyMs: performance.now() - receiptPublishedAt })),
 			Bun.sleep(1_500).then(() => undefined),
 		]);
 		expect(outcome).toBeDefined();
@@ -4387,7 +4452,7 @@ test("broker directly resumes and forks a canonical cold saved session with scop
 				() => true,
 				() => false,
 			),
-		).toBe(true);
+		).toBe(false);
 		expect(await broker.handleRequest("session.get_endpoint", { sessionId: sourceId })).toMatchObject({
 			ok: false,
 			error: { code: "resource_gone" },
@@ -4455,7 +4520,7 @@ test("broker directly resumes and forks a canonical cold saved session with scop
 				() => true,
 				() => false,
 			),
-		).toBe(true);
+		).toBe(false);
 		expect(await broker.handleRequest("session.get_endpoint", { sessionId: forkId })).toMatchObject({
 			ok: false,
 			error: { code: "resource_gone" },
@@ -4588,7 +4653,7 @@ test("broker replays one identity-bound lifecycle metadata cleanup plan after th
 		const markerPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`);
 		const readyPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.ready.json`);
 		await expect(fs.stat(markerPath)).resolves.toBeDefined();
-		await expect(fs.stat(readyPath)).resolves.toBeDefined();
+		await expect(fs.stat(readyPath)).rejects.toThrow();
 		setLifecycleCleanupHookForTest(crashing, () => {});
 		const deleteInput = { cwd: root, stateRoot, sessionId, sessionPath };
 		await expect(
@@ -5713,24 +5778,60 @@ test("broker preserves a code-less lifecycle startup failure message", async () 
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-startup-message-"));
 	const agentDir = path.join(root, "agent");
 	const fixture = path.join(root, "startup-failure.ts");
-	const previousCommand = process.env.GJC_SDK_SESSION_COMMAND;
+	const requestPath = path.join(root, "child-request.json");
+	const pidPath = path.join(root, "child.pid");
+	const exitPath = path.join(root, "child-exit");
+	const deadlines = deriveLifecycleDeadlines(1_000, 4_000);
+	let nowMs = deadlines.receivedAt;
+	let publishedAt: number | undefined;
 	const broker = new Broker({ agentDir });
 	try {
 		await fs.writeFile(
 			fixture,
-			`import { writeSessionLifecycleFailure } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/sdk/broker/lifecycle.ts"))};
-const request = JSON.parse(process.env.GJC_SDK_LIFECYCLE_REQUEST!);
-await writeSessionLifecycleFailure(
-	request.stateRoot,
-	request.sessionId,
-	request.effectMarker,
-	{ phase: "startup", reason: "failed", message: "owned synthetic startup failure" },
-	{ endpointGeneration: null, fenced: true, runtimeRemoved: true, hostStopped: true, brokerRegistrationReleased: true },
-);
-await Bun.sleep(60_000);
+			`await Bun.write(${JSON.stringify(requestPath)}, process.env.GJC_SDK_LIFECYCLE_REQUEST!);
+await Bun.write(${JSON.stringify(pidPath)}, String(process.pid));
+const deadline = Date.now() + 15_000;
+while (!(await Bun.file(${JSON.stringify(exitPath)}).exists()) && Date.now() < deadline) await Bun.sleep(1);
 `,
 		);
-		process.env.GJC_SDK_SESSION_COMMAND = `${process.execPath} ${fixture}`;
+		setLifecycleCommandResolverForTest(broker, () => ({ file: process.execPath, args: ["run", fixture] }));
+		setLifecycleTimingForTest(broker, {
+			now: () => nowMs,
+			sleep: async ms => {
+				if (!(await Bun.file(pidPath).exists())) {
+					await Bun.sleep(1);
+					return;
+				}
+				nowMs += ms;
+				if (publishedAt === undefined) {
+					const request = (await Bun.file(requestPath).json()) as SessionLifecycleLaunchRequest;
+					if (!request.stateRoot || !request.sessionId || !request.effectMarker)
+						throw new Error("Expected the real startup fixture locator and effect marker.");
+					const pid = Number(await Bun.file(pidPath).text());
+					const incarnation = processIncarnation(pid);
+					if (!incarnation) throw new Error("Expected the real startup fixture child incarnation.");
+					await writeSessionLifecycleFailure(
+						request.stateRoot,
+						request.sessionId,
+						request.effectMarker,
+						{ phase: "startup", reason: "failed", message: "owned synthetic startup failure" },
+						{
+							endpointGeneration: null,
+							fenced: true,
+							runtimeRemoved: true,
+							hostStopped: true,
+							brokerRegistrationReleased: true,
+						},
+						undefined,
+						incarnation,
+						pid,
+					);
+					publishedAt = nowMs;
+					await Bun.write(exitPath, "exit\n");
+				}
+				await Bun.sleep(1);
+			},
+		});
 		await broker.start();
 		const response = await broker.handleRequest(
 			"session.create",
@@ -5740,10 +5841,17 @@ await Bun.sleep(60_000);
 		expect(response).toMatchObject({
 			ok: false,
 			error: { code: "spawn_failed", message: "owned synthetic startup failure" },
+			startupFailure: {
+				message: "owned synthetic startup failure",
+				cleanupProof: { processExited: true, endpointRemoved: true, hostUnregistered: { state: "not_registered" } },
+			},
 		});
+		expect(publishedAt).toBeDefined();
+		expect(publishedAt!).toBeLessThan(deadlines.semanticReadyDeadlineAt);
+		expect(nowMs).toBeLessThan(deadlines.lifecycleCleanupDeadlineAt);
 	} finally {
-		if (previousCommand === undefined) delete process.env.GJC_SDK_SESSION_COMMAND;
-		else process.env.GJC_SDK_SESSION_COMMAND = previousCommand;
+		setLifecycleTimingForTest(broker, undefined);
+		setLifecycleCommandResolverForTest(broker, undefined);
 		await broker.stop();
 		await fs.rm(root, { recursive: true, force: true });
 	}

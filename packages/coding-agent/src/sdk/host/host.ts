@@ -107,6 +107,12 @@ export const TOOL_ACTIVITY_CAPABILITY = "tool_activity_v2";
 export const TURN_STREAM_CAPABILITY = "turn_stream";
 /** Capability used by notification adapters that observe a host without owning its work. */
 export const SESSION_HOST_OBSERVER_CAPABILITY = "session_host_observer_v1";
+/**
+ * Opts notification adapters into positioned-only delivery for matching live
+ * effects: the host excludes a negotiating connection from the raw native leg
+ * of every frame its positioned envelope already reached.
+ */
+export const POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY = "positioned_notification_effects_v1";
 export const CAP_GATED_FRAME_KINDS: ReadonlySet<string> = new Set(["tool_activity", "reasoning_summary"]);
 const EMPTY_CAPABILITIES: ReadonlySet<string> = new Set();
 

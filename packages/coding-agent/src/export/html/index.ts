@@ -6,6 +6,7 @@ import { APP_NAME, isEnoent } from "@gajae-code/utils";
 import { getResolvedThemeColors, getThemeExportColors } from "../../modes/theme/theme";
 import { SessionManager } from "../../session/session-manager";
 // Pre-generated template (created by scripts/generate-template.ts at publish time)
+import { cssColorOrFallback } from "./css-color";
 import { TEMPLATE } from "./template.generated";
 
 export interface ExportOptions {
@@ -78,16 +79,16 @@ async function generateThemeVars(themeName?: string): Promise<string> {
 	const colors = await getResolvedThemeColors(themeName);
 	const lines: string[] = [];
 	for (const [key, value] of Object.entries(colors)) {
-		lines.push(`--${key}: ${value};`);
+		lines.push(`--${key}: ${cssColorOrFallback(value, "transparent")};`);
 	}
 
 	const themeExport = await getThemeExportColors(themeName);
 	const userMessageBg = colors.userMessageBg || "#343541";
 	const derived = deriveExportColors(userMessageBg);
 
-	lines.push(`--body-bg: ${themeExport.pageBg ?? derived.pageBg};`);
-	lines.push(`--container-bg: ${themeExport.cardBg ?? derived.cardBg};`);
-	lines.push(`--info-bg: ${themeExport.infoBg ?? derived.infoBg};`);
+	lines.push(`--body-bg: ${cssColorOrFallback(themeExport.pageBg, derived.pageBg)};`);
+	lines.push(`--container-bg: ${cssColorOrFallback(themeExport.cardBg, derived.cardBg)};`);
+	lines.push(`--info-bg: ${cssColorOrFallback(themeExport.infoBg, derived.infoBg)};`);
 
 	return lines.join(" ");
 }

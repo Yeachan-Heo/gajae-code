@@ -88,6 +88,7 @@ async function setup(
 			getCwd: () => cwd,
 		},
 		resolveTool: () => tool,
+		getActivePromptHandle: () => undefined,
 	} as never;
 	await handlers.get("session_start")!({ type: "session_start" } as never, ctx);
 

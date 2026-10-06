@@ -179,6 +179,7 @@ export interface FirstEventTimeoutFacts {
 	requestBytes?: number;
 	firstEventElapsedMs?: number;
 	firstEventTimeoutMs?: number;
+	firstEventTimeoutSource?: "stream-option" | "env" | "idle-timeout" | "provider-fallback" | "default";
 	endpointClass?: "canonical" | "custom";
 	retryMaxAttempts?: number;
 }
@@ -188,6 +189,7 @@ export class FirstEventTimeoutError extends Error {
 	readonly requestBytes?: number;
 	readonly firstEventElapsedMs?: number;
 	readonly firstEventTimeoutMs?: number;
+	readonly firstEventTimeoutSource?: FirstEventTimeoutFacts["firstEventTimeoutSource"];
 	readonly endpointClass?: "canonical" | "custom";
 	readonly retryMaxAttempts?: number;
 
@@ -197,10 +199,18 @@ export class FirstEventTimeoutError extends Error {
 		this.requestBytes = facts.requestBytes;
 		this.firstEventElapsedMs = facts.firstEventElapsedMs;
 		this.firstEventTimeoutMs = facts.firstEventTimeoutMs;
+		this.firstEventTimeoutSource = facts.firstEventTimeoutSource;
 		this.endpointClass = facts.endpointClass;
 		this.retryMaxAttempts = facts.retryMaxAttempts;
 	}
 }
+
+/**
+ * Longest delay setTimeout honors. Bun, like Node, fires any larger delay after 1 ms,
+ * so a very long timeout (for example an env value meant as "effectively never")
+ * would otherwise abort the stream immediately.
+ */
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 
 const dummyWatchdog = setTimeout(() => {}, 1);
 clearTimeout(dummyWatchdog);
@@ -211,7 +221,7 @@ clearTimeout(dummyWatchdog);
  */
 export function createWatchdog(timeoutMs: number | undefined, onTimeout: () => void): Watchdog {
 	if (timeoutMs !== undefined && timeoutMs > 0) {
-		return setTimeout(onTimeout, timeoutMs);
+		return setTimeout(onTimeout, Math.min(timeoutMs, MAX_TIMER_DELAY_MS));
 	}
 	return undefined;
 }
@@ -335,10 +345,10 @@ export async function* iterateWithIdleTimeout<T>(
 			let timer: NodeJS.Timeout | undefined;
 			let resolveTimeout: ((value: { kind: "timeout" }) => void) | undefined;
 			const enforceTimeout = !noTimeoutEnforced && activeTimeoutMs !== undefined && activeTimeoutMs >= 0;
-			if (enforceTimeout) {
+			if (enforceTimeout && activeTimeoutMs !== undefined) {
 				const { promise, resolve } = Promise.withResolvers<{ kind: "timeout" }>();
 				resolveTimeout = resolve;
-				timer = setTimeout(() => resolve({ kind: "timeout" }), activeTimeoutMs);
+				timer = setTimeout(() => resolve({ kind: "timeout" }), Math.min(activeTimeoutMs, MAX_TIMER_DELAY_MS));
 				racers.push(promise);
 			}
 

@@ -334,7 +334,9 @@ Coordinator MCP currently exposes durable polling/await tools, not push subscrip
 | --- | --- |
 | `GJC_COORDINATOR_MCP_WORKDIR_ROOTS` | Required allowlist for workdir and artifact paths. `gjc setup hermes` renders absolute normalized paths joined with the platform path delimiter (`:` on POSIX, `;` on Windows). The bridge parser also accepts commas, semicolons, and newlines for legacy manual configs. |
 | `GJC_COORDINATOR_MCP_MUTATIONS` | Enables mutating tool classes as a comma-separated list (`sessions`, `questions`, `reports`) or `all`. `sessions` covers session startup, prompt delivery, durable turn journal updates, queue, and force operations. Per-call `allow_mutation: true` is still required. |
-| `GJC_COORDINATOR_MCP_ARTIFACT_BYTE_CAP` | Max bytes returned by Linux-only artifact reads (default `65536`, capped at `1048576`). On macOS and Windows, artifact reads fail closed with generic `artifact_unavailable`; detect support through MCP `tools/list`; use the controller's approved repository/worktree reader and report bounded results instead. |
+| `GJC_COORDINATOR_MCP_ARTIFACT_BYTE_CAP` | Max bytes returned by Linux-only artifact reads (default `65536`, capped at `1048576`). The value must be plain decimal digits (surrounding whitespace is ignored); anything else, such as `64KB`, `1e6`, or `0`, falls back to the default. On macOS and Windows, artifact reads fail closed with generic `artifact_unavailable`; detect support through MCP `tools/list`; use the controller's approved repository/worktree reader and report bounded results instead. |
+| `GJC_COORDINATOR_MCP_SESSION_IDLE_TTL_MS` | Idle time in milliseconds before the coordinator reaps an idle coordinator-created session (never a registered resident session) (default `1800000`, 30 minutes; values below `60000` are raised to `60000`). Plain decimal digits only; anything else falls back to the default. |
+| `GJC_COORDINATOR_MCP_SESSION_SWEEP_INTERVAL_MS` | Interval in milliseconds between idle-session sweeps (default `300000`, 5 minutes; values below `30000` are raised to `30000`, and values above `2147483647`, the longest timer delay, are lowered to it). Plain decimal digits only; anything else falls back to the default. |
 | `GJC_COORDINATOR_MCP_STATE_ROOT` | Bridge coordination state root (default `<cwd>/.gjc/state/coordinator-mcp`). Coordinator durable state only — it does **not** select the broker agent directory; that is `GJC_CODING_AGENT_DIR`, rendered by `gjc setup hermes --coding-agent-dir <abs-path>` (absolute path required; home/filesystem-root refused; preserved across managed re-installs unless the flag overrides it). |
 | `GJC_COORDINATOR_MCP_CODEX_TOKEN_ROOT` | Root for managed Codex handoff token files (default `<state-root>/codex-tokens`). Registered files must be owner-only regular non-symlink files beneath this root. Authenticated token-file handoff is unavailable on native Windows unless an equivalent secure ACL proof is provided; registration fails closed with `codex_authenticated_handoff_unavailable_windows`. |
 | `GJC_COORDINATOR_MCP_PROFILE` | Optional profile namespace for session/question/report state. Missing scope never widens to global session enumeration. |
@@ -346,8 +348,8 @@ Coordinator MCP currently exposes durable polling/await tools, not push subscrip
 | `GJC_COORDINATOR_MCP_EVENT_WEBHOOK_URL` | Opt-in webhook destination for existing `watch_events` journal rows (`https:` anywhere, or `http:` loopback only). Unset or empty = the feature is fully off. Resolved through the trusted credential environment, never the checkout's `.env`; a project `.env` cannot select where coordinator rows are POSTed. No redirect following. |
 | `GJC_COORDINATOR_MCP_EVENT_WEBHOOK_TOKEN_FILE` | Absolute path to a file whose trimmed content is sent as `Authorization: Bearer …`; raw tokens are never accepted inline in env. Resolved through the trusted credential environment. |
 | `GJC_COORDINATOR_MCP_EVENT_WEBHOOK_SESSION_IDS` | Optional comma-separated session-id allowlist; only journal rows carrying one of these `session_id` values are delivered. |
-| `GJC_COORDINATOR_MCP_EVENT_WEBHOOK_TIMEOUT_MS` | Per-attempt webhook POST timeout (default `5000`, capped at `30000`). |
-| `GJC_COORDINATOR_MCP_EVENT_WEBHOOK_MAX_ATTEMPTS` | Delivery attempts per journal row (default `5`, capped at `10`) with exponential backoff (`500ms` base, `15s` cap) through a durable per-row outbox. |
+| `GJC_COORDINATOR_MCP_EVENT_WEBHOOK_TIMEOUT_MS` | Per-attempt webhook POST timeout (default `5000`, capped at `30000`). Plain decimal digits only; anything else uses the default. |
+| `GJC_COORDINATOR_MCP_EVENT_WEBHOOK_MAX_ATTEMPTS` | Delivery attempts per journal row (plain decimal digits; default `5`, capped at `10`) with exponential backoff (`500ms` base, `15s` cap) through a durable per-row outbox. |
 
 ### Google Vertex AI
 
@@ -369,6 +371,15 @@ Coordinator MCP currently exposes durable polling/await tools, not push subscrip
 | `KIMI_CODE_BASE_URL`   | Overrides Kimi usage endpoint base URL (`usage/kimi.ts`) |
 
 OAuth host chain: `KIMI_CODE_OAUTH_HOST` → `KIMI_OAUTH_HOST` → `https://auth.kimi.com`.
+
+### Grok Build (Grok CLI) provider
+
+| Variable | Default / behavior |
+| -------- | ------------------ |
+| `GJC_GROK_CLI_BASE_URL` | Base URL override for the bundled Grok Build provider (default `https://cli-chat-proxy.grok.com/v1`; trailing slashes are trimmed). `GROK_CLI_BASE_URL` is read when it is unset. To keep OAuth credentials on the Grok host, an override is honored only for `https://cli-chat-proxy.grok.com`; any other URL is ignored with a session warning and the default is used. |
+| `GJC_GROK_CLI_ALLOW_UNSAFE_BASE_URL` | Exactly `1` honors a base URL override on any other host. For trusted local testing only: the OAuth bearer token is sent to that host. |
+| `GJC_GROK_CLI_MODELS` | Comma-separated model ids that replace the built-in model list, in that order. Known ids keep their built-in metadata; unknown ids are added as text-only reasoning models with a 1,000,000-token context window. |
+| `GROK_CLI_OAUTH_TOKEN` | Bearer token bypass for local use. No refresh and no model discovery; a session warning recommends `/login grok-build` instead. |
 
 ### Gemini CLI compatibility
 
@@ -482,6 +493,7 @@ Extra conditional behavior:
 | `GJC_MODEL_PRESET_REGISTRY_DISABLED` | `1`, `true`, `yes`, or `on` disables registry network refresh and excludes cached registry data without deleting accepted history. Embedded presets and user `models.yml` remain available. |
 | `GJC_NO_TITLE`                | If set (any non-empty value), disables auto session title generation on first user message         |
 | `GJC_NO_CMUX_RENAME`         | If set (any non-empty value), disables renaming the containing cmux workspace to the current session name |
+| `GJC_NO_WEBP`                | `1` or `true` (case-insensitive) keeps WebP out of image re-encoding: results are PNG or JPEG, and a WebP input is re-encoded even when it already fits. Use it for backends that cannot decode WebP (for example llama.cpp's STB loader). Read on every resize; any other value leaves WebP enabled. |
 | `NULL_PROMPT`                | If `true`, system prompt builder returns empty string                                              |
 | `GJC_BLOCKED_AGENT`           | Blocks a specific subagent type in task tool                                                       |
 | `GJC_SUBPROCESS_CMD`          | Overrides subagent spawn command (`gjc` / `gjc.cmd` resolution bypass)                             |

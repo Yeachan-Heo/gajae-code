@@ -7,6 +7,7 @@ interface WorkflowStep {
 	if?: string;
 	uses?: string;
 	run?: string;
+	shell?: string;
 	"continue-on-error"?: boolean;
 	env?: Record<string, string>;
 	with?: Record<string, string | number>;
@@ -26,6 +27,7 @@ interface WorkflowDocument {
 const RUN_SCOPED_ARTIFACT = "main-native-${{ github.run_id }}";
 const RESTORE_STEP = "Restore native addon(s) from this run";
 const REBUILD_STEP = "Rebuild native addon(s) when this run's artifact has expired";
+const PROVENANCE_STEP = "Rebuild and verify transferred native provenance";
 
 async function workflow(): Promise<WorkflowDocument> {
 	return parse(await Bun.file(".github/workflows/ci.yml").text()) as WorkflowDocument;
@@ -49,6 +51,42 @@ function step(target: WorkflowJob, name: string): WorkflowStep {
 // though the code under test was fine. The contract is: restore tolerantly, then
 // rebuild the same variants from the same source when nothing was restored.
 describe("main CI native addon recovery", () => {
+	test("the native producer uploads both provenance sidecars", async () => {
+		const document = await workflow();
+		const producer = job(document, "main_native");
+		const upload = step(producer, "Upload native addon(s)");
+		const uploadPath = upload.with?.path;
+		if (typeof uploadPath !== "string") throw new Error("Native producer upload paths must be a string");
+		const uploaded = uploadPath.split(/\s+/);
+		for (const variant of ["baseline", "modern"]) {
+			expect(uploaded).toContain(`packages/natives/native/pi_natives.linux-x64-${variant}.node.provenance.json`);
+		}
+		const sidecarCheck = step(producer, "Verify producer provenance sidecars");
+		expect(producer.steps.indexOf(sidecarCheck)).toBeLessThan(producer.steps.indexOf(upload));
+	});
+
+	test("native consumers rebuild and verify transferred provenance before tests", async () => {
+		const document = await workflow();
+		const consumers: Array<{ job: string; testStep: string; condition?: string }> = [
+			{ job: "main_shards", testStep: "Run task shard", condition: "${{ matrix.native }}" },
+			{ job: "acp_conformance", testStep: "Run ACP conformance" },
+		];
+		for (const consumer of consumers) {
+			const target = job(document, consumer.job);
+			const provenance = step(target, PROVENANCE_STEP);
+			const testExecution = step(target, consumer.testStep);
+			expect(provenance.shell).toBe("bash");
+			expect(provenance.if).toBe(consumer.condition);
+			expect(provenance.run).toContain(
+				"bun scripts/verify-diagnostic-artifact-provenance.ts --rebuild-from-sidecars packages/natives/native",
+			);
+			expect(provenance.run).toContain(
+				"bun scripts/verify-diagnostic-artifact-provenance.ts --verify packages/natives/native",
+			);
+			expect(target.steps.indexOf(provenance)).toBeLessThan(target.steps.indexOf(testExecution));
+		}
+	});
+
 	test("the shard lane restores tolerantly and rebuilds the same variants on a miss", async () => {
 		const document = await workflow();
 		const shards = job(document, "main_shards");

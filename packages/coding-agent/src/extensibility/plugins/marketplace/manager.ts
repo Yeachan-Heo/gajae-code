@@ -19,7 +19,13 @@ import {
 } from "@gajae-code/natives";
 import { isEnoent, logger, pathIsWithin } from "@gajae-code/utils";
 import { withFileLock } from "../../../config/file-lock";
-import { cachePlugin, getCachedPluginPath, inspectCachedPlugin, stageCachedPlugin } from "./cache";
+import {
+	cachePlugin,
+	getCachedPluginPath,
+	inspectCachedPlugin,
+	stageCachedPlugin,
+	writeCachedRegularFile,
+} from "./cache";
 import { classifySource, fetchMarketplace, parseMarketplaceCatalog, promoteCloneToCache } from "./fetcher";
 import {
 	addInstalledPlugin,
@@ -1430,12 +1436,14 @@ export class MarketplaceManager {
 			if (!pathIsWithin(cachePath, sourcePath)) {
 				throw new Error(`Plugin "${entry.name}" lspServers path escapes the plugin directory`);
 			}
+			const sourceStat = await fs.lstat(sourcePath);
+			if (sourceStat.isSymbolicLink()) throw new Error(`Plugin "${entry.name}" lspServers path is a symlink`);
 			const content = await Bun.file(sourcePath).text();
-			await Bun.write(targetPath, content);
+			await writeCachedRegularFile(targetPath, content);
 			return;
 		}
 
-		await Bun.write(targetPath, `${JSON.stringify({ servers: lspServers }, null, 2)}\n`);
+		await writeCachedRegularFile(targetPath, `${JSON.stringify({ servers: lspServers }, null, 2)}\n`);
 	}
 
 	/**

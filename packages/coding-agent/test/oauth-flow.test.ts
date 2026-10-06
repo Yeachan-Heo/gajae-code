@@ -1,8 +1,21 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as dns from "node:dns/promises";
 import { hookFetch } from "../../utils/src/hook-fetch";
 import { canonicalMCPResourceUri, MCPOAuthFlow } from "../src/runtime-mcp/oauth-flow";
 
 const originalFetch = global.fetch;
+
+beforeEach(() => {
+	// Token URLs in this file are fictional. The public-URL check resolves them
+	// before fetch, and these tests already mock that fetch.
+	vi.spyOn(dns, "lookup").mockImplementation(((...args: unknown[]) => {
+		const options = args[1];
+		if (options && typeof options === "object" && "all" in options && options.all === true) {
+			return Promise.resolve([{ address: "1.1.1.1", family: 4 }]);
+		}
+		return Promise.resolve({ address: "1.1.1.1", family: 4 });
+	}) as typeof dns.lookup);
+});
 
 afterEach(() => {
 	vi.restoreAllMocks();

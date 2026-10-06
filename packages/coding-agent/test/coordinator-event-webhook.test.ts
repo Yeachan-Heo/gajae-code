@@ -159,6 +159,29 @@ describe("parseEventWebhookConfig", () => {
 			}),
 		).toThrow("coordinator_event_webhook_token_file_invalid");
 	});
+
+	it("falls back to the defaults for timeout and attempts values that are not plain digits", () => {
+		for (const raw of ["1.5", "1e4", "10s", "+3", "-2", "0", "0x10"]) {
+			const config = parseEventWebhookConfig({
+				GJC_COORDINATOR_MCP_EVENT_WEBHOOK_URL: "https://sink.example.test",
+				GJC_COORDINATOR_MCP_EVENT_WEBHOOK_TIMEOUT_MS: raw,
+				GJC_COORDINATOR_MCP_EVENT_WEBHOOK_MAX_ATTEMPTS: raw,
+			});
+			expect({ raw, timeoutMs: config?.timeoutMs, maxAttempts: config?.maxAttempts }).toEqual({
+				raw,
+				timeoutMs: DEFAULT_EVENT_WEBHOOK_TIMEOUT_MS,
+				maxAttempts: DEFAULT_EVENT_WEBHOOK_MAX_ATTEMPTS,
+			});
+		}
+
+		const padded = parseEventWebhookConfig({
+			GJC_COORDINATOR_MCP_EVENT_WEBHOOK_URL: "https://sink.example.test",
+			GJC_COORDINATOR_MCP_EVENT_WEBHOOK_TIMEOUT_MS: " 2500 ",
+			GJC_COORDINATOR_MCP_EVENT_WEBHOOK_MAX_ATTEMPTS: "99999999999999999999",
+		});
+		expect(padded?.timeoutMs).toBe(2500);
+		expect(padded?.maxAttempts).toBe(MAX_EVENT_WEBHOOK_MAX_ATTEMPTS);
+	});
 });
 describe("webhook egress provenance", () => {
 	it("never selects the egress destination from a checkout .env overlay", async () => {

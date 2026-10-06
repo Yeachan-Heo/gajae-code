@@ -163,6 +163,12 @@ const ACP_FIRST_PROMPT_MAX_RETRIES = 2;
 /** Backoff before each first-prompt retry, scaled by attempt (250ms, then 500ms). */
 const ACP_FIRST_PROMPT_RETRY_BASE_DELAY_MS = 250;
 const ACP_BUSY_SETTLE_WAIT_MS = 5_000;
+/**
+ * Default model settlement timeout: when no --model is passed but modelRoles.default is configured,
+ * we wait for the SDK to apply the default before answering session/new, so the model option is present.
+ * The SDK applies defaults synchronously for known models, so this is a bounded safety timeout.
+ */
+const ACP_MODEL_SETTLEMENT_TIMEOUT_MS = 500;
 
 type JsonObject = Record<string, unknown>;
 interface PromptWaiter {
@@ -1420,6 +1426,21 @@ const THINKING_CONFIG_OPTIONS = ["off", "minimal", "low", "medium", "high", "xhi
 	name: value,
 }));
 
+function thinkingConfigOptions(query: unknown, currentModel: string | undefined): { value: string; name: string }[] {
+	if (!currentModel) return THINKING_CONFIG_OPTIONS;
+	const separator = currentModel.indexOf("/");
+	if (separator <= 0 || separator === currentModel.length - 1) return THINKING_CONFIG_OPTIONS;
+	const provider = currentModel.slice(0, separator);
+	const id = currentModel.slice(separator + 1);
+	const model = pageItems(query)
+		.map(item => object(item))
+		.find(item => item?.provider === provider && item.id === id);
+	const validLevels = object(model?.thinking)?.validLevels;
+	if (!Array.isArray(validLevels) || validLevels.length === 0) return THINKING_CONFIG_OPTIONS;
+	const levels = validLevels.filter((value): value is string => typeof value === "string");
+	return levels.length === 0 ? THINKING_CONFIG_OPTIONS : levels.map(value => ({ value, name: value }));
+}
+
 /** Maps live canonical SDK config and the selected model catalog into the ACP 1.2.1 session state surface. */
 export function acpSessionStateFromConfig(
 	query: unknown,
@@ -1430,6 +1451,7 @@ export function acpSessionStateFromConfig(
 	const values = configValues(query);
 	const useModelPresets = modelPreset !== undefined;
 	const currentModeId = values.get(MODE_CONFIG_ID) === ACP_PLAN_MODE_ID ? ACP_PLAN_MODE_ID : ACP_DEFAULT_MODE_ID;
+	const thinkingOptions = thinkingConfigOptions(modelCatalogQuery, values.get(MODEL_CONFIG_ID));
 	return {
 		configOptions: [
 			{
@@ -1455,7 +1477,7 @@ export function acpSessionStateFromConfig(
 							? modelPresetConfigOptions(modelCatalogQuery, value)
 							: modelConfigOptions(modelCatalogQuery, value, activeProviders)
 						: option.id === THINKING_CONFIG_ID
-							? THINKING_CONFIG_OPTIONS
+							? thinkingOptions
 							: [...option.options];
 				return [
 					{
@@ -1765,6 +1787,10 @@ export class AcpAgent implements Agent {
 		this.#agentDir = typeof candidate?.agentDir === "string" ? candidate.agentDir : getAgentDir();
 		this.#router = new SessionRouter({
 			agentDir: this.#agentDir,
+			attachFilter: sessionId =>
+				this.#sessions.has(sessionId) ||
+				this.#pendingRouterAdapters.has(sessionId) ||
+				this.#pendingRouterFrames.has(sessionId),
 			deps: {
 				onAttachment: attachment => {
 					const record = this.#sessions.get(attachment.sessionId);
@@ -1788,11 +1814,13 @@ export class AcpAgent implements Agent {
 					if (adapter) adapter.acceptFrame(acpFrame);
 					else this.#pendingRouterFrames.get(attachment.sessionId)?.push(acpFrame);
 				},
-				onSessionRemoved: attachment => {
+				onSessionRemoved: (attachment, removalReason) => {
 					const adapter =
 						this.#sessions.get(attachment.sessionId)?.adapter ??
 						this.#pendingRouterAdapters.get(attachment.sessionId);
 					adapter?.revokeAttachment(attachment);
+					if (adapter && removalReason !== "replaced_same_generation")
+						this.#settlePromptAfterHostClose(attachment.sessionId, removalReason ?? "host_exit");
 				},
 			},
 		});
@@ -1864,33 +1892,62 @@ export class AcpAgent implements Agent {
 		const mcpServers = this.#mcpServers(params);
 		this.#assertAbsoluteCwd(params.cwd);
 		this.#assertNoAdditionalDirectories(params.additionalDirectories);
-		const result = await this.#launchSessionWithMcp(
-			"session.create",
-			{
-				cwd: params.cwd,
-				target: { path: params.cwd },
-				...(this.#startupOptions?.modelPreset ? { modelPreset: this.#startupOptions.modelPreset } : {}),
-				readinessTimeoutMs: ACP_SESSION_READINESS_TIMEOUT_MS,
-				...(mcpServers.length > 0 ? { mcpServers } : {}),
-			},
-			randomUUID(),
-			mcpServers,
-		);
-		const id = sessionId(result);
-		this.#knownSessionCwds.set(id, params.cwd);
-		this.#knownSessionMcpServers.set(id, mcpServers);
-		// This connection launched the host, so it owns the broker lifecycle before the
-		// attachment reports a control surface. Without it a failed attach discards the
-		// session as unowned and masks the real error with cleanup uncertainty.
-		this.#ownedSessionIds.add(id);
+		const startedAt = performance.now();
+		const phases: Record<string, number> = {};
+		let id: string | undefined;
 		try {
+			let phaseStartedAt = performance.now();
+			const result = await this.#launchSessionWithMcp(
+				"session.create",
+				{
+					cwd: params.cwd,
+					target: { path: params.cwd },
+					...(this.#startupOptions?.modelPreset ? { modelPreset: this.#startupOptions.modelPreset } : {}),
+					readinessTimeoutMs: ACP_SESSION_READINESS_TIMEOUT_MS,
+					...(mcpServers.length > 0 ? { mcpServers } : {}),
+				},
+				randomUUID(),
+				mcpServers,
+			);
+			phases.launchMs = performance.now() - phaseStartedAt;
+			id = sessionId(result);
+			this.#knownSessionCwds.set(id, params.cwd);
+			this.#knownSessionMcpServers.set(id, mcpServers);
+			// This connection launched the host, so it owns the broker lifecycle before the
+			// attachment reports a control surface. Without it a failed attach discards the
+			// session as unowned and masks the real error with cleanup uncertainty.
+			this.#ownedSessionIds.add(id);
+			phaseStartedAt = performance.now();
 			await this.#attach(id, params.cwd, undefined, result);
+			phases.attachMs = performance.now() - phaseStartedAt;
+			phaseStartedAt = performance.now();
 			await applyAcpStartupOptions(this.#adapter(id), this.#startupOptions);
+			phases.startupOptionsMs = performance.now() - phaseStartedAt;
+			phaseStartedAt = performance.now();
+			await this.#waitForModelSettle(id);
+			phases.modelSettleMs = performance.now() - phaseStartedAt;
+			phaseStartedAt = performance.now();
 			const response = { sessionId: id, ...(await this.#sessionState(id, true)) };
+			phases.sessionStateMs = performance.now() - phaseStartedAt;
 			this.#scheduleBootstrap(id);
+			logger.debug("acp_session_new_phases", {
+				sessionId: id,
+				...phases,
+				outcome: "ok",
+				totalMs: performance.now() - startedAt,
+			});
 			return response;
 		} catch (error) {
-			await this.#discardNewSession(id);
+			try {
+				if (id !== undefined) await this.#discardNewSession(id);
+			} finally {
+				logger.debug("acp_session_new_phases", {
+					...(id !== undefined ? { sessionId: id } : {}),
+					...phases,
+					outcome: "error",
+					totalMs: performance.now() - startedAt,
+				});
+			}
 			throw error;
 		}
 	}
@@ -2119,7 +2176,22 @@ export class AcpAgent implements Agent {
 				}
 				break;
 			case THINKING_CONFIG_ID:
-				await this.#adapter(params.sessionId).control("thinking.set", { level: params.value });
+				{
+					const before = await this.#sessionState(params.sessionId);
+					const thinkingOption = before.configOptions?.find(option => option.id === THINKING_CONFIG_ID);
+					if (
+						thinkingOption?.type !== "select" ||
+						!thinkingOption.options.some(option => "value" in option && option.value === params.value)
+					)
+						throw new Error(`Unsupported thinking level: ${params.value}`);
+					await this.#adapter(params.sessionId).control("thinking.set", { level: params.value });
+					const after = await this.#sessionState(params.sessionId);
+					const currentValue = after.configOptions?.find(option => option.id === THINKING_CONFIG_ID)?.currentValue;
+					if (currentValue !== params.value)
+						throw new Error(
+							`Thinking level was not applied: requested ${params.value}, current ${currentValue ?? "unknown"}`,
+						);
+				}
 				break;
 			default: {
 				const operation = ACP_CONFIG_CONTROL_OPERATIONS[params.configId];
@@ -2979,9 +3051,11 @@ export class AcpAgent implements Agent {
 				// publication is advisory and must never gate the settlement above.
 				void this.#publishPromptPhaseIdle(params.sessionId, record.adapter);
 			} else {
+				if (waiter && record.activePrompt === waiter && waiter.terminal && !waiter.settled)
+					this.#settlePrompt(params.sessionId, record, waiter);
 				// The acknowledgement proves the run was aborted, not that its terminal was
 				// published. Arm the bounded settlement so the turn cannot outlive the cancel.
-				this.#scheduleCancelSettlement(params.sessionId, record);
+				else this.#scheduleCancelSettlement(params.sessionId, record);
 			}
 			waiter?.cancelAttemptResolve?.(true);
 		} catch (error) {
@@ -2997,6 +3071,9 @@ export class AcpAgent implements Agent {
 				!waiter.settled
 			) {
 				if (waiter.terminalReserved) {
+					await record.frameTail;
+					if (record.activePrompt === waiter && waiter.terminal && !waiter.settled)
+						this.#settlePrompt(params.sessionId, record, waiter);
 					waiter.cancelAttemptResolve?.(true);
 					return;
 				}
@@ -3052,6 +3129,9 @@ export class AcpAgent implements Agent {
 				waiter.cancelAttempt = undefined;
 				waiter.cancelAttemptResolve = undefined;
 			}
+			const cancelWaveSettled = !waiter || waiter.cancelAcknowledged || (waiter.pendingCancelAttempts ?? 0) <= 1;
+			if (cancelWaveSettled && waiter && record.activePrompt === waiter && waiter.terminal && !waiter.settled)
+				this.#settlePrompt(params.sessionId, record, waiter);
 			throw cancellationError;
 		} finally {
 			if (waiter) {
@@ -3383,6 +3463,7 @@ export class AcpAgent implements Agent {
 		this.#pendingRouterFrames.set(id, bufferedFrames);
 		try {
 			await this.#ensureRouterReady();
+			await this.#router.reconcile({ waitForReplay: false });
 			if (lifecycleResult) await this.#router.adoptLifecycleResult(lifecycleResult, { sessionId: id, cwd });
 			let currentAttachment = this.#router.attachment(id);
 			for (let attempt = 0; !currentAttachment && attempt < 40; attempt++) {
@@ -4419,6 +4500,37 @@ export class AcpAgent implements Agent {
 		return undefined;
 	}
 
+	/** Settles the active prompt when the host explicitly reports that its session closed. */
+	#settlePromptAfterHostClose(id: string, reason: string): void {
+		const record = this.#sessions.get(id);
+		if (!record) return;
+		const waiter = record.activePrompt;
+		if (!waiter || waiter.settled || waiter.terminalReserved) return;
+		if (record.cancelRequested && waiter.cancelAcknowledged) {
+			void this.#settleCancelledPrompt(id, record, waiter);
+			return;
+		}
+		// An accepted mutation without its acknowledgement remains uncertain. Keep the
+		// existing reconciliation path so a host exit never turns an ambiguous prompt
+		// into a retryable failure.
+		if (waiter.dispatched && !waiter.acknowledged) {
+			this.#startUncertainPromptRecovery(id, record, waiter);
+			return;
+		}
+		record.busy = record.backgroundBusy;
+		void this.#rejectPrompt(
+			record,
+			id,
+			waiter,
+			new AcpPromptAbandonedError(
+				"prompt_abandoned",
+				`ACP prompt was abandoned because the SDK session host closed (${reason}). The turn was settled so the ` +
+					`client stops waiting; a new prompt requires a valid or re-established session attachment.`,
+				waiter.planSnapshot,
+			),
+		);
+	}
+
 	/**
 	 * Settles the ACP prompt only. The agent's own work is left alone: this reports that the
 	 * turn can no longer be observed, it does not cancel or tear down the session.
@@ -4490,6 +4602,14 @@ export class AcpAgent implements Agent {
 					record.activePrompt?.correlation,
 				);
 			else logger.warn(`ACP session ${id} dropped an event from a foreign session identity.`);
+			return;
+		}
+		if (ingressEvent?.type === "session_closed" || ingressEvent?.type === "session_terminated") {
+			const reason =
+				typeof ingressEvent.reason === "string" && ingressEvent.reason.length > 0
+					? ingressEvent.reason
+					: ingressEvent.type;
+			this.#settlePromptAfterHostClose(id, reason);
 			return;
 		}
 		if (frame.type !== "hello" && frame.type !== "server_hello" && typeof frame.connectionId === "string")
@@ -4773,7 +4893,18 @@ export class AcpAgent implements Agent {
 			// Failure diagnostics are useful but advisory. Settle before any mapped
 			// session update can await a backpressured client transport; otherwise an
 			// already-decided failure can still lose to the inactivity watchdog.
-			this.#settlePrompt(id, record, activePrompt);
+			// A terminal that races an in-flight cancel must not settle the public prompt before
+			// the cancel request proves its outcome. Otherwise a follow-up prompt can be admitted
+			// between the stale terminal settlement and the abort acknowledgement, leaving the
+			// cancelled background request reported as `end_turn`.
+			const cancelSettlementPending =
+				activePrompt.cancelAttempt !== undefined &&
+				!activePrompt.cancelAcknowledged &&
+				record.statusRecovery !== activePrompt &&
+				!this.#ownsUncertainAbort(record, activePrompt);
+			if (!cancelSettlementPending) {
+				this.#settlePrompt(id, record, activePrompt);
+			}
 		}
 		if (!isTerminal && derivedCorrelation === undefined) return;
 		if (!isTerminal && hasCorrelation(correlation)) {
@@ -5162,7 +5293,9 @@ export class AcpAgent implements Agent {
 		const { outcome } = waiter.terminal;
 		this.#rememberSettledPromptCorrelation(id, record, waiter.correlation);
 		if (outcome.kind === "stopped") {
-			waiter.resolve({ stopReason: outcome.reason });
+			// Once the SDK has acknowledged a client cancel, the cancellation owns the
+			// turn even if a stale terminal frame races in with another stopped reason.
+			waiter.resolve({ stopReason: waiter.cancelAcknowledged ? "cancelled" : outcome.reason });
 			return;
 		}
 		// `phase` is the host's own claim, and a host that omits it leaves `terminalOutcome`
@@ -5296,6 +5429,78 @@ export class AcpAgent implements Agent {
 			await this.#failSession(id, record.adapter, failure);
 			throw failure;
 		}
+	}
+
+	/**
+	 * Wait for the model to settle when no explicit --model was passed but a default might be configured.
+	 * Give each probe its own timeout clamped to the remaining budget so wedged probes cannot exceed 500ms total.
+	 * Catch probe errors as advisory so a rejected probe does not discard the session (issue #6009).
+	 */
+	async #waitForModelSettle(id: string): Promise<void> {
+		const record = this.#sessions.get(id);
+		if (!record) return; // Session was closed; skip settlement wait.
+
+		// If an explicit --model was passed, it's already settled by applyAcpStartupOptions.
+		if (this.#startupOptions?.modelId) return;
+
+		// Set the deadline once for all probes (including the first).
+		const deadline = Date.now() + ACP_MODEL_SETTLEMENT_TIMEOUT_MS;
+
+		// Query the config once to check if the model is already settled.
+		// Even the first probe gets its own timeout clamped to the remaining budget.
+		let config: unknown;
+		const remaining = deadline - Date.now();
+		if (remaining > 0) {
+			try {
+				const controller = new AbortController();
+				const timeoutHandle = setTimeout(() => controller.abort(), remaining);
+				try {
+					const { promise: timeoutPromise, reject: rejectTimeout } = Promise.withResolvers<never>();
+					const listener = () => rejectTimeout(new Error("probe_timeout"));
+					controller.signal.addEventListener("abort", listener);
+					config = await Promise.race([record.adapter.query("config.list/get"), timeoutPromise]);
+				} finally {
+					clearTimeout(timeoutHandle);
+				}
+			} catch {
+				// Advisory: ignore first probe error and proceed to retry loop.
+				// The first probe's failure doesn't mean the model won't settle later.
+				config = undefined;
+			}
+		}
+		const currentModel = config !== undefined ? configValues(config).get(MODEL_CONFIG_ID) : undefined;
+		if (currentModel !== undefined) return; // Model is settled.
+		if (remaining <= 0) return; // Budget exhausted before entering retry loop.
+
+		// No explicit model and no settled value: the SDK may be applying a default.
+		// Retry with a bounded timeout, where each probe gets its own timeout clamped to the remaining budget.
+		// Only wait if there's a reasonable chance a default is configured (no model after first probe).
+		while (Date.now() < deadline) {
+			await Bun.sleep(50); // Small delay before retry.
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) break; // Budget exhausted.
+
+			let nextConfig: unknown;
+			try {
+				// Give this probe its own timeout clamped to the remaining budget.
+				// A wedged probe will timeout after `remaining` ms, not the full SDK timeout.
+				const controller = new AbortController();
+				const timeoutHandle = setTimeout(() => controller.abort(), remaining);
+				try {
+					const { promise: timeoutPromise, reject: rejectTimeout } = Promise.withResolvers<never>();
+					const listener = () => rejectTimeout(new Error("probe_timeout"));
+					controller.signal.addEventListener("abort", listener);
+					nextConfig = await Promise.race([record.adapter.query("config.list/get"), timeoutPromise]);
+				} finally {
+					clearTimeout(timeoutHandle);
+				}
+			} catch {
+				// Advisory: probe failed or timed out; continue retrying while budget remains.
+				continue;
+			}
+			if (configValues(nextConfig).get(MODEL_CONFIG_ID) !== undefined) return; // Settled.
+		}
+		// Budget exhausted: proceed without model. The model option may be missing from the response.
 	}
 
 	async #sessionState(

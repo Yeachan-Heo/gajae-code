@@ -1,0 +1,3 @@
+### Fixed
+
+- A running Slack or Discord chat daemon now retires on its own once its notifications are disabled (`notifications.enabled: false`, the provider's `enabled: false`, or the notification config file removed — the same conditions under which a new daemon would not start): the owner re-reads the config on its 5-second heartbeat tick, and after two consecutive disabled reads it stops its transport and releases ownership as stopped, so `gjc daemon status` reports `stopped` and lifecycle posts end within about 10 seconds. Unreadable or half-written config keeps the daemon serving. Before this fix, the daemon kept posting `GJC session ready.` / `Session closed.` until you ran `gjc daemon stop`.

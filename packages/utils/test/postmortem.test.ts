@@ -160,6 +160,14 @@ describe("postmortem cleanup deadline contract (issue #2556)", () => {
 		expect(result.stderr).toContain("cleanup deadline (300ms) expired for uncaught_exception");
 	});
 
+	it("a deadline above the setTimeout maximum still lets cleanup finish", async () => {
+		const result = await runScenario("cleanup-deadline-above-timer-max");
+
+		expect(result.exitCode).toBe(7);
+		expect(parseResult(result.stdout).count).toBe(1);
+		expect(result.stderr).not.toContain("cleanup deadline");
+	});
+
 	it("quit drains backpressured stderr before preserving the requested exit code", async () => {
 		const proc = Bun.spawn([process.execPath, fixturePath, "quit-drains-backpressured-stderr"], {
 			cwd: utilsDirectory,
