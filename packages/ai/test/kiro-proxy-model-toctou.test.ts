@@ -176,4 +176,58 @@ describe("Kiro TOCTOU protection with Proxy models #6151", () => {
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toBeDefined();
 	});
+
+	test("model baseUrl getter that throws is caught and yields error result", async () => {
+		// Create a Proxy model where baseUrl getter throws
+		const model: Model<"kiro-codewhisperer-stream"> = new Proxy(
+			{ ...baseModel, baseUrl: "https://trusted.example.com/" },
+			{
+				get(target, prop) {
+					if (prop === "baseUrl") {
+						throw new Error("Synthetic error from throwing baseUrl getter");
+					}
+					return (target as any)[prop];
+				},
+			},
+		) as any;
+
+		process.env.KIRO_API_KEY = "";
+
+		const stream = streamKiroApiKey(model, context, {
+			apiKey: "ksk_test-key",
+		});
+		const result = await stream.result();
+
+		// Throwing getter should be caught and reported as an error, not thrown
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBeDefined();
+		expect(result.errorMessage).toContain("Synthetic error from throwing baseUrl getter");
+	});
+
+	test("model provider/id getter that throws is caught and yields error result", async () => {
+		// Create a Proxy model where provider getter throws
+		const model: Model<"kiro-codewhisperer-stream"> = new Proxy(
+			{ ...baseModel, baseUrl: "https://example.com/" },
+			{
+				get(target, prop) {
+					if (prop === "provider") {
+						throw new Error("Synthetic error from throwing provider getter");
+					}
+					return (target as any)[prop];
+				},
+			},
+		) as any;
+
+		process.env.KIRO_API_KEY = "";
+
+		const stream = streamKiroCodeWhisperer(model, context, {
+			apiKey: "AWS_BEARER_TOKEN",
+		});
+		const result = await stream.result();
+
+		// Throwing getter should be caught and reported as an error, not thrown
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBeDefined();
+		expect(result.errorMessage).toContain("Synthetic error from throwing provider getter");
+	});
 });

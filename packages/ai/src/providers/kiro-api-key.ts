@@ -638,23 +638,18 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 ): AssistantMessageEventStream => {
 	const stream = new AssistantMessageEventStream();
 	(async () => {
-		// Snapshot model identity fields at stream start to prevent TOCTOU attacks where
-		// a Proxy/getter model could return different values on successive reads.
-		const modelSnapshot = Object.freeze({
-			provider: model.provider,
-			id: model.id,
-			wireModelId: model.wireModelId,
-			baseUrl: model.baseUrl,
-			api: "kiro-codewhisperer-stream" as Api,
-		});
-
 		const apiKey = options.apiKey?.trim() ?? "";
+		const startTime = Date.now();
+		let firstTokenEmitted = false;
+		let firstTokenTime: number | undefined;
+
+		// Initialize output with default values; will be updated inside try block with snapshotted model identity
 		const output: AssistantMessage = {
 			role: "assistant",
 			content: [],
-			api: modelSnapshot.api,
-			provider: modelSnapshot.provider,
-			model: modelSnapshot.id,
+			api: "kiro-codewhisperer-stream" as Api,
+			provider: "",
+			model: "",
 			usage: {
 				input: 0,
 				output: 0,
@@ -667,15 +662,29 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			timestamp: Date.now(),
 		};
 		const blocks = output.content as Block[];
-		const startTime = Date.now();
-		let firstTokenEmitted = false;
-		let firstTokenTime: number | undefined;
+
 		try {
+			// Snapshot model identity fields at stream start to prevent TOCTOU attacks where
+			// a Proxy/getter model could return different values on successive reads.
+			const modelSnapshot = Object.freeze({
+				provider: model.provider,
+				id: model.id,
+				wireModelId: model.wireModelId,
+				baseUrl: model.baseUrl,
+				api: "kiro-codewhisperer-stream" as Api,
+			});
+
+			// Update output with snapshotted model identity
+			output.api = modelSnapshot.api;
+			output.provider = modelSnapshot.provider;
+			output.model = modelSnapshot.id;
+
 			if (!isKiroApiKey(apiKey)) {
 				throw new Error(
 					"Kiro API key missing. Set KIRO_API_KEY to a ksk_ key from https://app.kiro.dev/settings/api-keys.",
 				);
 			}
+
 			const configuredBaseUrl = modelSnapshot.baseUrl;
 			const usesExplicitBaseUrl = Boolean(configuredBaseUrl) && !isRegionDerivedKiroApiBaseUrl(configuredBaseUrl);
 			const endpoint = configuredBaseUrl || kiroApiBaseUrl(kiroApiRegion(options));

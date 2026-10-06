@@ -238,15 +238,6 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 	const stream = new AssistantMessageEventStream();
 
 	(async () => {
-		// Snapshot model identity fields at stream start to prevent TOCTOU attacks where
-		// a Proxy/getter model could return different values on successive reads.
-		const modelSnapshot: ModelIdentitySnapshot = Object.freeze({
-			provider: model.provider,
-			id: model.id,
-			api: "kiro-codewhisperer-stream" as Api,
-			baseUrl: model.baseUrl,
-		});
-
 		const startTime = Date.now();
 		let firstTokenTime: number | undefined;
 		// Accumulator for streaming tool input fragments, keyed by toolUseId
@@ -254,12 +245,16 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 		// Pending tool calls to be emitted at stream end (after refusal is ruled out)
 		const pendingToolCalls: Array<{ id: string; toolCall: ToolCall; index: number }> = [];
 
+		const region = options.region ?? $env.KIRO_REGION ?? $env.AWS_REGION ?? $env.AWS_DEFAULT_REGION ?? DEFAULT_REGION;
+		let started = false; // Track whether start event has been emitted
+
+		// Initialize output with default values; will be updated inside try block with snapshotted model identity
 		const output: AssistantMessage = {
 			role: "assistant",
 			content: [],
-			api: modelSnapshot.api,
-			provider: modelSnapshot.provider,
-			model: modelSnapshot.id,
+			api: "kiro-codewhisperer-stream" as Api,
+			provider: "",
+			model: "",
 			usage: {
 				input: 0,
 				output: 0,
@@ -273,10 +268,21 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 		};
 
 		const blocks = output.content as Block[];
-		const region = options.region ?? $env.KIRO_REGION ?? $env.AWS_REGION ?? $env.AWS_DEFAULT_REGION ?? DEFAULT_REGION;
-		let started = false; // Track whether start event has been emitted
 
 		try {
+			// Snapshot model identity fields at stream start to prevent TOCTOU attacks where
+			// a Proxy/getter model could return different values on successive reads.
+			const modelSnapshot: ModelIdentitySnapshot = Object.freeze({
+				provider: model.provider,
+				id: model.id,
+				api: "kiro-codewhisperer-stream" as Api,
+				baseUrl: model.baseUrl,
+			});
+
+			// Update output with snapshotted model identity
+			output.api = modelSnapshot.api;
+			output.provider = modelSnapshot.provider;
+			output.model = modelSnapshot.id;
 			assertAwsRegionLabel(region);
 			// Resolve bearer token
 			const bearerToken = resolveBearerToken(options.apiKey);
