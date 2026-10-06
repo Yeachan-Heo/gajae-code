@@ -8332,6 +8332,16 @@ export class SessionManager {
 		prepared.releaseReferences();
 	}
 
+	/**
+	 * Adopt the resident store of a fully prepared rollback candidate. The candidate
+	 * owns the store it built for the restored lifecycle, so the swap happens here,
+	 * inside the resident-store seams, instead of at the call site.
+	 */
+	#installRollbackCandidateResidentStore(candidate: SessionManager): void {
+		this.#residentTextBlobStore = candidate.#residentTextBlobStore;
+		candidate.#residentTextBlobStore = new MemoryBlobStore();
+	}
+
 	#releaseResidentTextStore(): void {
 		const predecessor = this.#residentTextBlobStore;
 		this.#residentTextBlobStore = new MemoryBlobStore();
@@ -8456,6 +8466,21 @@ export class SessionManager {
 			}),
 		);
 		return snapshot;
+	}
+
+	/**
+	 * Resolve the state source for an explicit adoption (`restoreState`). Adoption is
+	 * caller-driven state, not rollback authority: a snapshot may come from another
+	 * manager or from a caller-adjusted copy of one, so those are adopted as given and
+	 * constrained only by the live-state assertions inside `restoreState`. A snapshot
+	 * issued by this manager resolves to its frozen issuer copy, which carries the
+	 * explicit persistence identity captured at issuance. The rollback lane
+	 * (`restoreRollbackState`) keeps requiring an authenticated issuance.
+	 */
+	#resolveAdoptedStateSnapshot(
+		snapshot: SessionManagerStateSnapshot,
+	): Readonly<SessionManagerStateSnapshot> & { readonly explicitPersistIdentity?: ExplicitPersistIdentity } {
+		return this.#stateSnapshots.get(snapshot) ?? snapshot;
 	}
 
 	#authenticateStateSnapshot(snapshot: SessionManagerStateSnapshot): Readonly<SessionManagerStateSnapshot> {
@@ -8621,8 +8646,7 @@ export class SessionManager {
 			this.#titleSource = issued.titleSource;
 			this.#sessionFile = issued.coldRestoreFile;
 			this.#fileEntries = candidate.#fileEntries;
-			this.#residentTextBlobStore = candidate.#residentTextBlobStore;
-			candidate.#residentTextBlobStore = new MemoryBlobStore();
+			this.#installRollbackCandidateResidentStore(candidate);
 			this.#byId = candidate.#byId;
 			this.#labelsById = candidate.#labelsById;
 			this.#leafId = candidate.#leafId;
@@ -8708,7 +8732,7 @@ export class SessionManager {
 	}
 
 	restoreState(snapshot: SessionManagerStateSnapshot): void {
-		const issued = this.#authenticateStateSnapshot(snapshot);
+		const issued = this.#resolveAdoptedStateSnapshot(snapshot);
 		if (issued.coldRestoreFile) throw new Error("Cold rollback requires restoreRollbackState.");
 		const managedTransition =
 			this.destination.kind === "managed" && issued.sessionFile
@@ -17706,10 +17730,14 @@ export class SessionManager {
 	 * one bound to the current session file unless an external manager was
 	 * adopted via `adoptArtifactManager`. Falls back to the lazily created
 	 * ephemeral filesystem store once a non-persistent session has saved an
-	 * artifact, so `artifact://` stays resolvable. Returns null only when no
-	 * store has been established yet.
+	 * artifact, so `artifact://` stays resolvable. Returns null when no store has
+	 * been established yet and once the manager has released its artifact
+	 * authority while closing — released authority stays observable as absence
+	 * (matching `isArtifactManagerAuthorized`), while artifact *operations* are
+	 * fenced by `#assertArtifactOpen()` and keep throwing.
 	 */
 	getArtifactManager(): ArtifactManager | null {
+		if (this.#artifactClosing || this.#strictClosePending) return null;
 		return this.#getOrCreateArtifactManager() ?? this.#ephemeralArtifactManager;
 	}
 
