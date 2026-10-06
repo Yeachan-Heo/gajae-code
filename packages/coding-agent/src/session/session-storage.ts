@@ -3822,6 +3822,23 @@ export class MemorySessionStorage implements SessionStorage {
 				new SessionDeleteVerificationError("containment", "Transcript is outside the sessions root"),
 			);
 		}
+		if (
+			[
+				target.taskArtifactOwnerStorageContext,
+				target.taskArtifactOwnerDeletionEvidence,
+				target.taskArtifactOwnerRetirementOutcome,
+				target.taskArtifactOwnerTranscriptDeleted,
+				target.deferTaskArtifactOwnerRetirement,
+				target.taskArtifactOwnerRetired,
+				target.taskArtifactOwnerRetirementContinuation,
+				target.taskArtifactOwnerPayloadRetired,
+				target.taskArtifactOwnerNamespaceRetained,
+			].some(value => value !== undefined)
+		) {
+			return Promise.reject(
+				new SessionDeleteVerificationError("artifacts", "task_artifact_owner_memory_backend_unsupported"),
+			);
+		}
 		const entry = this.#files.get(transcriptPath);
 		if (!entry) return Promise.resolve({ kind: "deleted" });
 		const snapshot = this.readSnapshotSync(transcriptPath);
@@ -3853,6 +3870,21 @@ export class MemorySessionStorage implements SessionStorage {
 		}
 		if (path.resolve(header.cwd) !== path.resolve(cwd)) {
 			return Promise.reject(new SessionDeleteVerificationError("cwd", "Transcript header cwd mismatch"));
+		}
+		let ownerLocator: TaskArtifactOwnerLocator | undefined;
+		try {
+			ownerLocator = taskArtifactOwnerLocatorFromTranscriptBytes(snapshot.bytes, sessionId);
+		} catch (error) {
+			return Promise.reject(
+				new SessionDeleteVerificationError("artifacts", "task_artifact_owner_memory_backend_unsupported", {
+					cause: toError(error),
+				}),
+			);
+		}
+		if (ownerLocator) {
+			return Promise.reject(
+				new SessionDeleteVerificationError("artifacts", "task_artifact_owner_memory_backend_unsupported"),
+			);
 		}
 		// Compatible artifact semantics: the memory backend models no directories, so
 		// a key at the artifact path is a non-directory sibling that must fail closed

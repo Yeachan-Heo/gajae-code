@@ -3627,6 +3627,7 @@ describe("MemorySessionStorage.deleteSessionVerified parity", () => {
 	it("deletes a verified matching transcript", async () => {
 		const transcriptPath = path.join(sessionsRoot, "s.jsonl");
 		seedTranscript(transcriptPath);
+		storage.writeTextSync(`${transcriptPath}.spill.idx`, "index\n");
 		const result = await storage.deleteSessionVerified({
 			sessionsRoot,
 			transcriptPath,
@@ -3636,6 +3637,105 @@ describe("MemorySessionStorage.deleteSessionVerified parity", () => {
 		});
 		expect(result).toEqual({ kind: "deleted" });
 		expect(storage.existsSync(transcriptPath)).toBe(false);
+		expect(storage.existsSync(`${transcriptPath}.spill.idx`)).toBe(false);
+	});
+
+	it("refuses a task-artifact owner in the header without mutating the transcript or spill keys", async () => {
+		const transcriptPath = path.join(sessionsRoot, "owned-header.jsonl");
+		const ownerLocator = {
+			schemaVersion: 1,
+			ownerId: "a".repeat(64),
+			directoryDev: "1",
+			directoryIno: "2",
+		};
+		seedTranscript(transcriptPath, {
+			type: "session",
+			id: "session-id",
+			cwd: "/cwd",
+			taskArtifactOwner: ownerLocator,
+		});
+		storage.writeTextSync(`${transcriptPath}.spill.idx`, "index\n");
+		storage.writeTextSync(`${transcriptPath}.spill.commit`, "commit\n");
+		const transcriptBefore = storage.readTextSync(transcriptPath);
+
+		const err = await storage
+			.deleteSessionVerified({
+				sessionsRoot,
+				transcriptPath,
+				sessionId: "session-id",
+				cwd: "/cwd",
+				transcriptIdentity: verifiedIdentity(transcriptPath),
+			})
+			.catch(error => error);
+
+		expect(err).toBeInstanceOf(SessionDeleteVerificationError);
+		expect((err as SessionDeleteVerificationError).kind).toBe("artifacts");
+		expect(storage.readTextSync(transcriptPath)).toBe(transcriptBefore);
+		expect(storage.readTextSync(`${transcriptPath}.spill.idx`)).toBe("index\n");
+		expect(storage.readTextSync(`${transcriptPath}.spill.commit`)).toBe("commit\n");
+	});
+
+	it("refuses a replayed task-artifact owner header patch without mutating transcript or spill keys", async () => {
+		const transcriptPath = path.join(sessionsRoot, "owned-patch.jsonl");
+		const ownerLocator = {
+			schemaVersion: 1,
+			ownerId: "b".repeat(64),
+			directoryDev: "3",
+			directoryIno: "4",
+		};
+		storage.writeTextSync(
+			transcriptPath,
+			`${JSON.stringify({ type: "session", id: "session-id", cwd: "/cwd", version: 4 })}\n${JSON.stringify({
+				type: "header_patch",
+				patch: { taskArtifactOwner: ownerLocator },
+			})}\n`,
+		);
+		storage.writeTextSync(`${transcriptPath}.spill.idx`, "index\n");
+		storage.writeTextSync(`${transcriptPath}.spill.commit`, "commit\n");
+		const transcriptBefore = storage.readTextSync(transcriptPath);
+
+		const err = await storage
+			.deleteSessionVerified({
+				sessionsRoot,
+				transcriptPath,
+				sessionId: "session-id",
+				cwd: "/cwd",
+				transcriptIdentity: verifiedIdentity(transcriptPath),
+			})
+			.catch(error => error);
+
+		expect(err).toBeInstanceOf(SessionDeleteVerificationError);
+		expect((err as SessionDeleteVerificationError).kind).toBe("artifacts");
+		expect(storage.readTextSync(transcriptPath)).toBe(transcriptBefore);
+		expect(storage.readTextSync(`${transcriptPath}.spill.idx`)).toBe("index\n");
+		expect(storage.readTextSync(`${transcriptPath}.spill.commit`)).toBe("commit\n");
+	});
+
+	it("rejects an absent-transcript retry carrying durable owner retirement proof", async () => {
+		const transcriptPath = path.join(sessionsRoot, "owner-retired.jsonl");
+		seedTranscript(transcriptPath);
+		const transcriptIdentity = verifiedIdentity(transcriptPath);
+		storage.unlinkSync(transcriptPath);
+		storage.writeTextSync(`${transcriptPath}.spill.idx`, "index\n");
+		storage.writeTextSync(`${transcriptPath}.spill.commit`, "commit\n");
+
+		const err = await storage
+			.deleteSessionVerified({
+				sessionsRoot,
+				transcriptPath,
+				sessionId: "session-id",
+				cwd: "/cwd",
+				transcriptIdentity,
+				taskArtifactOwnerRetired: true,
+				taskArtifactOwnerTranscriptDeleted: true,
+			})
+			.catch(error => error);
+
+		expect(err).toBeInstanceOf(SessionDeleteVerificationError);
+		expect((err as SessionDeleteVerificationError).kind).toBe("artifacts");
+		expect(storage.existsSync(transcriptPath)).toBe(false);
+		expect(storage.readTextSync(`${transcriptPath}.spill.idx`)).toBe("index\n");
+		expect(storage.readTextSync(`${transcriptPath}.spill.commit`)).toBe("commit\n");
 	});
 
 	it("rejects a transcript outside the sessions root (containment parity)", async () => {
