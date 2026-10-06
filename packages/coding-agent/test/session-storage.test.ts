@@ -3600,6 +3600,17 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 describe("MemorySessionStorage.deleteSessionVerified parity", () => {
 	let storage: MemorySessionStorage;
 	const sessionsRoot = "/sessions";
+	const ownerTargetFields = [
+		"taskArtifactOwnerStorageContext",
+		"taskArtifactOwnerDeletionEvidence",
+		"taskArtifactOwnerRetirementOutcome",
+		"taskArtifactOwnerTranscriptDeleted",
+		"deferTaskArtifactOwnerRetirement",
+		"taskArtifactOwnerRetired",
+		"taskArtifactOwnerRetirementContinuation",
+		"taskArtifactOwnerPayloadRetired",
+		"taskArtifactOwnerNamespaceRetained",
+	] as const satisfies readonly (keyof VerifiedSessionDeleteTarget)[];
 
 	beforeEach(() => {
 		storage = new MemorySessionStorage();
@@ -3736,6 +3747,62 @@ describe("MemorySessionStorage.deleteSessionVerified parity", () => {
 		expect(storage.existsSync(transcriptPath)).toBe(false);
 		expect(storage.readTextSync(`${transcriptPath}.spill.idx`)).toBe("index\n");
 		expect(storage.readTextSync(`${transcriptPath}.spill.commit`)).toBe("commit\n");
+	});
+
+	it.each([
+		true,
+		false,
+	])("refuses every defined owner field before mutation (transcript present=%s)", async present => {
+		for (const field of ownerTargetFields) {
+			for (const [valueIndex, value] of [false, null, {}].entries()) {
+				const transcriptPath = path.join(sessionsRoot, `${field}-${valueIndex}.jsonl`);
+				seedTranscript(transcriptPath);
+				const transcriptBefore = storage.readTextSync(transcriptPath);
+				const target: VerifiedSessionDeleteTarget = {
+					sessionsRoot,
+					transcriptPath,
+					sessionId: "session-id",
+					cwd: "/cwd",
+					transcriptIdentity: verifiedIdentity(transcriptPath),
+				};
+				if (!present) storage.unlinkSync(transcriptPath);
+				storage.writeTextSync(`${transcriptPath}.spill.idx`, "index\n");
+				storage.writeTextSync(`${transcriptPath}.spill.commit`, "commit\n");
+				Object.defineProperty(target, field, { value, enumerable: true });
+				const failure: unknown = await storage.deleteSessionVerified(target).catch((error: unknown) => error);
+				if (!(failure instanceof SessionDeleteVerificationError)) throw new Error(`Missing refusal for ${field}`);
+				expect(failure.kind).toBe("artifacts");
+				expect(failure.message).toBe("task_artifact_owner_memory_backend_unsupported");
+				expect(storage.existsSync(transcriptPath)).toBe(present);
+				if (present) expect(storage.readTextSync(transcriptPath)).toBe(transcriptBefore);
+				expect(storage.readTextSync(`${transcriptPath}.spill.idx`)).toBe("index\n");
+				expect(storage.readTextSync(`${transcriptPath}.spill.commit`)).toBe("commit\n");
+			}
+		}
+	});
+
+	it.each([
+		true,
+		false,
+	])("treats explicitly undefined owner fields as omitted (transcript present=%s)", async present => {
+		const transcriptPath = path.join(sessionsRoot, "undefined-owner-fields.jsonl");
+		seedTranscript(transcriptPath);
+		const target: VerifiedSessionDeleteTarget = {
+			sessionsRoot,
+			transcriptPath,
+			sessionId: "session-id",
+			cwd: "/cwd",
+			transcriptIdentity: verifiedIdentity(transcriptPath),
+		};
+		if (!present) storage.unlinkSync(transcriptPath);
+		storage.writeTextSync(`${transcriptPath}.spill.idx`, "index\n");
+		storage.writeTextSync(`${transcriptPath}.spill.commit`, "commit\n");
+		for (const field of ownerTargetFields)
+			Object.defineProperty(target, field, { value: undefined, enumerable: true });
+		expect(await storage.deleteSessionVerified(target)).toEqual({ kind: "deleted" });
+		expect(storage.existsSync(transcriptPath)).toBe(false);
+		expect(storage.existsSync(`${transcriptPath}.spill.idx`)).toBe(!present);
+		expect(storage.existsSync(`${transcriptPath}.spill.commit`)).toBe(!present);
 	});
 
 	it("rejects a transcript outside the sessions root (containment parity)", async () => {
