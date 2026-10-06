@@ -8480,7 +8480,18 @@ export class SessionManager {
 	#resolveAdoptedStateSnapshot(
 		snapshot: SessionManagerStateSnapshot,
 	): Readonly<SessionManagerStateSnapshot> & { readonly explicitPersistIdentity?: ExplicitPersistIdentity } {
-		return this.#stateSnapshots.get(snapshot) ?? snapshot;
+		const issued = this.#stateSnapshots.get(snapshot);
+		if (issued) return issued;
+		// Preserve explicit identity from cross-manager adoptions where the target
+		// manager has no #stateSnapshots entry but the snapshot itself carries the identity.
+		const explicit = (snapshot as any).explicitPersistIdentity as ExplicitPersistIdentity | undefined;
+		if (explicit) {
+			return Object.freeze({
+				...snapshot,
+				explicitPersistIdentity: explicit,
+			}) as Readonly<SessionManagerStateSnapshot> & { readonly explicitPersistIdentity?: ExplicitPersistIdentity };
+		}
+		return snapshot;
 	}
 
 	#authenticateStateSnapshot(snapshot: SessionManagerStateSnapshot): Readonly<SessionManagerStateSnapshot> {
@@ -8732,6 +8743,7 @@ export class SessionManager {
 	}
 
 	restoreState(snapshot: SessionManagerStateSnapshot): void {
+		this.#assertArtifactOpen();
 		const issued = this.#resolveAdoptedStateSnapshot(snapshot);
 		if (issued.coldRestoreFile) throw new Error("Cold rollback requires restoreRollbackState.");
 		const managedTransition =
@@ -17934,6 +17946,7 @@ export class SessionManager {
 	 * Returns null when the artifact is missing.
 	 */
 	async getArtifactPath(id: string): Promise<string | null> {
+		this.#assertArtifactOpen();
 		const manager = this.getArtifactManager();
 		if (!manager) return null;
 		return manager.getPath(id);
