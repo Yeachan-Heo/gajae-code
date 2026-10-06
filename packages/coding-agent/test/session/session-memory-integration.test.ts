@@ -26,6 +26,8 @@ import {
 	FileSessionStorage,
 	MemorySessionStorage,
 	type SessionStorageWriter,
+	type SessionStorageWriterOpenOptions,
+	SessionStorageWriterRetryableCloseError,
 	type StagedStreamingWriter,
 } from "../../src/session/session-storage";
 
@@ -3663,15 +3665,6 @@ describe("whole-session persistence freshness", () => {
 			destinationFile,
 			`${JSON.stringify({ type: "session", version: 5, id: "rewrite-destination", timestamp: "0", cwd: "/cwd" })}\n`,
 		);
-		const destinationManager = await SessionManager.open(
-			destinationFile,
-			SessionManager.explicitDestination("/sessions"),
-			storage,
-			"copy-retain",
-			"off",
-		);
-		const destinationSnapshot = destinationManager.captureState();
-		await destinationManager.close();
 		const manager = await SessionManager.open(
 			sourceFile,
 			SessionManager.explicitDestination("/sessions"),
@@ -3680,6 +3673,13 @@ describe("whole-session persistence freshness", () => {
 			"off",
 		);
 		try {
+			// Snapshots are authenticated by their issuing manager. Build the
+			// destination snapshot on this manager, then return to the source so the
+			// lifecycle race exercises the real restore path rather than failing at
+			// the fixture boundary.
+			await manager.setSessionFile(destinationFile);
+			const destinationSnapshot = manager.captureState();
+			await manager.setSessionFile(sourceFile);
 			const sourceEntryId = manager.appendCustomEntry("before-lifecycle-switch", { value: 1 });
 			await manager.flush();
 			const sourceBeforeRewrite = storage.readTextSync(sourceFile);
@@ -3697,6 +3697,53 @@ describe("whole-session persistence freshness", () => {
 			storage.releaseFlush.resolve();
 			await expect(manager.close()).rejects.toThrow("session_persistence_lifecycle_changed");
 		}
+	});
+	it.each([1, 2])("clears the original certified writer-close error after %i failed attempts", async failures => {
+		class RetryableCloseStorage extends MemorySessionStorage {
+			closeFailures = failures;
+			closeDispatches = 0;
+			override openWriter(filePath: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter {
+				if (filePath.includes(".spill.")) return super.openWriter(filePath, options);
+				return super.openWriter(filePath, {
+					...options,
+					closeAdapter: {
+						close: () => {
+							this.closeDispatches++;
+							if (this.closeFailures > 0) {
+								this.closeFailures--;
+								throw new SessionStorageWriterRetryableCloseError(
+									`injected_retryable_close_${this.closeDispatches}`,
+								);
+							}
+						},
+					},
+				});
+			}
+		}
+		const storage = new RetryableCloseStorage();
+		const sessionFile = "/sessions/retryable-close.jsonl";
+		storage.writeTextSync(
+			sessionFile,
+			`${JSON.stringify({ type: "session", version: 5, id: "retryable-close", timestamp: "0", cwd: "/cwd" })}\n`,
+		);
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"off",
+		);
+		const entryId = manager.appendCustomEntry("retryable-close", { value: 1 });
+		await manager.flush();
+		for (let attempt = 1; attempt <= failures; attempt++) {
+			await expect(manager.close()).rejects.toThrow(`injected_retryable_close_${attempt}`);
+		}
+		await expect(manager.close()).resolves.toBeUndefined();
+		expect(storage.closeDispatches).toBe(failures + 1);
+		expect(manager.getEntries()).toHaveLength(0);
+		expect(storage.readTextSync(sessionFile)).toContain(`"id":"${entryId}"`);
+		await expect(manager.close()).resolves.toBeUndefined();
+		expect(storage.closeDispatches).toBe(failures + 1);
 	});
 	it("reprepares queued patches when a direct append invalidates their persistence token", async () => {
 		const storage = new MemorySessionStorage();

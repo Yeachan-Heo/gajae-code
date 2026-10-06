@@ -7675,6 +7675,8 @@ export class SessionManager {
 	/** Defense-in-depth (#4443): one-shot warn for adjacent private thinking blocks in persisted assistant transcripts. */
 	#warnedAdjacentThinkingPersist = false;
 	#closeRetryPending = false;
+	/** First certified writer-close error; retained across repeated retries. */
+	#closeRetryOriginError: Error | undefined;
 	#strictClosePending = false;
 	/** Serializes model, SDK, and ACP cwd transitions; dispose joins this tail. */
 	#cwdTransitionTail: Promise<void> = Promise.resolve();
@@ -16941,6 +16943,9 @@ export class SessionManager {
 		}
 		let closeError: unknown;
 		let taskStarted = false;
+		const retryingCertifiedWriterClose =
+			this.#closeRetryPending && this.#persistWriter?.getCloseState() === "close_failed_retryable";
+		const retryingCertifiedWriterError = retryingCertifiedWriterClose ? this.#closeRetryOriginError : undefined;
 		try {
 			await this.#queuePersistTask(
 				async () => {
@@ -16953,15 +16958,33 @@ export class SessionManager {
 				},
 				{ ignoreError: this.#closeRetryPending },
 			);
+			if (
+				retryingCertifiedWriterClose &&
+				!this.#persistWriter &&
+				!this.#needsFullRewriteOnNextPersist &&
+				!this.#strictResumeMutationPending &&
+				this.#persistError === retryingCertifiedWriterError
+			) {
+				// Only the original certified writer-close failure becomes obsolete
+				// after closure. Lifecycle/publication errors must remain observable.
+				this.#persistError = undefined;
+				this.#persistErrorReported = false;
+				this.#closeRetryOriginError = undefined;
+			}
 			this.#closeRetryPending = false;
 			this.#retireEphemeralArtifacts();
 			await this.#drainEphemeralArtifactCleanups();
 		} catch (error) {
 			closeError = error;
-			if (taskStarted) this.#closeRetryPending = true;
+			if (taskStarted) {
+				this.#closeRetryPending = true;
+				if (this.#persistWriter?.getCloseState() === "close_failed_retryable" && !this.#closeRetryOriginError)
+					this.#closeRetryOriginError = this.#persistWriter.getCloseError() ?? toError(error);
+			}
 		}
 		const terminalError = closeError ?? this.#persistError;
 		if (terminalError) throw terminalError;
+		this.#closeRetryOriginError = undefined;
 		this.#persistError = undefined;
 		this.#persistErrorReported = false;
 		this.#releaseResidentTextStore();
