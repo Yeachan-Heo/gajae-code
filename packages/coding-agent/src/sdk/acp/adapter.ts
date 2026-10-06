@@ -150,7 +150,12 @@ const ACP_MCP_PRESERVED_LAUNCH_CODES = new Set([
  * must retain their original retry semantics. The `transport` origin marker is required because
  * broker ERROR frames are also represented as SdkClientError instances with these same codes.
  */
-const ACP_MCP_PRESERVED_TRANSPORT_CODES = new Set(["connection_closed", "unavailable", "timeout"]);
+const ACP_MCP_PRESERVED_TRANSPORT_CODES = new Set([
+	"connection_closed",
+	"unavailable",
+	"timeout",
+	"uncertain_after_send",
+]);
 
 /**
  * The error an ACP session launch must throw once a lifecycle request that carried MCP

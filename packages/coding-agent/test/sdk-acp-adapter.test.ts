@@ -873,6 +873,17 @@ test("the ACP MCP launch wrapper reports broker refusal and re-attributes spawn 
 		new SdkClientError("connection_closed", "SDK request failed", undefined, undefined, { transport: true }),
 		new SdkClientError("unavailable", "SDK request failed", undefined, undefined, { transport: true }),
 		new SdkClientError("timeout", "SDK request failed", undefined, undefined, { transport: true }),
+		new SdkClientError(
+			"uncertain_after_send",
+			"SDK request outcome is uncertain after the frame was sent.",
+			{
+				id: "request-1",
+				operation: "session.create",
+				idempotencyKey: "same-key",
+			},
+			undefined,
+			{ transport: true },
+		),
 	];
 	for (const marked of markedTransportFailures) expect(acpMcpLaunchFailure(marked, mcpServers)).toBe(marked);
 	expect(acpMcpLaunchFailure(transportFailure, mcpServers)).not.toBe(transportFailure);
