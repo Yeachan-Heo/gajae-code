@@ -1889,7 +1889,7 @@ describe("agentLoop - empty response overflow detection", () => {
 		expect(assistantMessage).toMatchObject({
 			stopReason: "error",
 			errorMessage: "Provider returned an empty response with zero token usage",
-			transportFailure: { kind: "transport", providerCode: "empty_response" },
+			errorKind: "local_empty_response",
 		});
 	});
 
@@ -1942,7 +1942,7 @@ describe("agentLoop - empty response overflow detection", () => {
 		expect(assistantMessage).toMatchObject({
 			stopReason: "error",
 			errorMessage: "Provider returned an empty response with zero token usage",
-			transportFailure: { kind: "transport", providerCode: "empty_response" },
+			errorKind: "local_empty_response",
 		});
 	});
 

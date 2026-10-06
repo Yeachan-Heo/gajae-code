@@ -23206,6 +23206,7 @@ export class AgentSession {
 		if (message.errorKind === "local_snapshot_failure") return "local_snapshot";
 		if (message.errorKind === "local_buffer_overflow") return "local_buffer_overflow";
 		if (this.#isTypedFirstEventTimeout(message)) return "first_event_timeout";
+		if (message.errorKind === "local_empty_response") return "empty_response";
 		if (this.#isTypedEmptyResponse(message)) return "empty_response";
 		if (this.#isCodexCredentialModelUnavailable(message)) {
 			return this.#canRotateCodexCredential(message) ? "unknown" : "terminal";

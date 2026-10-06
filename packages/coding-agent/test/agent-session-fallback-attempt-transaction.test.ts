@@ -236,7 +236,7 @@ function extensionRunnerForHandler(
 	sessionManager: SessionManager,
 	modelRegistry: ModelRegistry,
 	eventType: "context" | "message_end",
-	onHandler?: () => void,
+	onHandler?: () => void | Promise<void>,
 ): ExtensionRunner {
 	const extension: Extension = {
 		path: "test-extension",
@@ -342,7 +342,7 @@ describe("AgentSession managed fallback attempt transaction", () => {
 		options: {
 			tools?: AgentTool[];
 			handler?: "context" | "message_end";
-			onHandler?: () => void;
+			onHandler?: () => void | Promise<void>;
 			settings?: Record<string, unknown>;
 			singleModelChain?: boolean;
 		} = {},
@@ -478,8 +478,46 @@ describe("AgentSession managed fallback attempt transaction", () => {
 		expect(session!.messages.at(-1)).toMatchObject({
 			role: "assistant",
 			stopReason: "error",
-			transportFailure: { kind: "transport", providerCode: "empty_response" },
+			errorKind: "local_empty_response",
 		});
+	});
+
+	it("does not replay a promoted untyped empty stop after message_end emits a custom message", async () => {
+		let providerCalls = 0;
+		let messageEndCalls = 0;
+		createSession(
+			model => {
+				providerCalls++;
+				return zeroTokenEmptyStopStream(model, false);
+			},
+			3,
+			{
+				handler: "message_end",
+				onHandler: async () => {
+					messageEndCalls++;
+					if (messageEndCalls > 1) return;
+					await session!.sendCustomMessage({
+						customType: "empty-response-hook",
+						content: "observed empty response",
+						display: true,
+					});
+				},
+			},
+		);
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
+
+		await session!.prompt("do not repeat the executed message_end hook");
+		await session!.waitForIdle();
+
+		expect(messageEndCalls).toBeGreaterThan(0);
+		expect(providerCalls).toBe(1);
+		expect(events.filter(event => event.type === "auto_retry_start")).toHaveLength(0);
+		expect(events.filter(event => event.type === "model_fallback_switched")).toHaveLength(0);
+		const terminal = session!.messages.findLast(message => message.role === "assistant");
+		expect(terminal).toMatchObject({ stopReason: "error" });
+		if (terminal?.role !== "assistant") throw new Error("Expected terminal assistant message");
+		expect(terminal.transportFailure).toBeUndefined();
 	});
 
 	it("emits exhausted completion exactly once through the agent finalizer", async () => {

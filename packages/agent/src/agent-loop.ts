@@ -10,7 +10,6 @@ import {
 	type Context,
 	classifyContextOverflow,
 	classifyFallbackTrigger,
-	EMPTY_RESPONSE_PROVIDER_CODE,
 	EventStream,
 	isProviderSafetyStopAuthenticated,
 	isZodSchema,
@@ -776,6 +775,7 @@ function managedTransportFailure(failure: unknown) {
 // arbitrary destination. A destination is marked only while this managed
 // runtime is rebuilding a source that AI authenticated.
 const managedProviderSafetyStops = new WeakSet<object>();
+const managedLocalEmptyResponses = new WeakSet<object>();
 
 function isManagedProviderSafetyStopAuthenticated(value: unknown): boolean {
 	return (
@@ -785,6 +785,12 @@ function isManagedProviderSafetyStopAuthenticated(value: unknown): boolean {
 }
 
 function managedRetryableFailure(failure: unknown): boolean {
+	if (
+		managedProperty(failure, "stopReason") === "error" &&
+		managedProperty(failure, "errorKind") === "local_empty_response"
+	) {
+		return true;
+	}
 	const facts = managedTransportFailure(failure);
 	if (!facts) return false;
 	// OpenAI's typed statusless capacity-overload code (issue #5018) never
@@ -840,11 +846,9 @@ function promoteEmptyResponseStop(message: AssistantMessage): void {
 	message.stopReason = "error";
 	message.errorMessage = "Provider returned an empty response with zero token usage";
 	// Preserve the runtime-owned retry classification for untyped provider
-	// payloads; AgentSession must not infer replay safety from this message text.
-	message.transportFailure = {
-		...(message.transportFailure ?? { kind: "transport" }),
-		providerCode: EMPTY_RESPONSE_PROVIDER_CODE,
-	};
+	// payloads without inventing provider transport facts.
+	message.errorKind = "local_empty_response";
+	managedLocalEmptyResponses.add(message);
 }
 /**
  * Terminal safety-stop authority is provenance-bound, not data-bound: a
@@ -872,6 +876,7 @@ function sanitizeProviderSafetyStopProvenance(
 	const errorKindRead = managedPropertyRead(message, "errorKind");
 	if (
 		errorKindRead.ok &&
+		errorKindRead.value !== "local_empty_response" &&
 		(errorKindRead.value !== "provider_safety_stop" || isManagedProviderSafetyStopAuthenticated(message))
 	) {
 		return message;
@@ -2143,7 +2148,11 @@ function managedAssistantShell(
 	const errorKind =
 		stopReason === "error" && managedProperty(source, "errorKind") === "provider_safety_stop"
 			? ("provider_safety_stop" as const)
-			: undefined;
+			: stopReason === "error" &&
+					((typeof value === "object" && value !== null && managedLocalEmptyResponses.has(value)) ||
+						(typeof source === "object" && source !== null && managedLocalEmptyResponses.has(source)))
+				? ("local_empty_response" as const)
+				: undefined;
 	const safeMetadata: Record<string, unknown> = {};
 	if (isManagedPlainRecord(detailed.snapshot)) {
 		for (const key of Object.keys(detailed.snapshot)) {
@@ -2190,6 +2199,7 @@ function managedAssistantShell(
 		revokeProviderSafetyStop(value);
 		if (typeof value === "object" && value !== null) managedProviderSafetyStops.delete(value);
 	}
+	if (errorKind === "local_empty_response") managedLocalEmptyResponses.add(rebuilt);
 	return rebuilt;
 }
 
