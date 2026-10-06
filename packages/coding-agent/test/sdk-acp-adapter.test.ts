@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -7,7 +7,7 @@ import packageJson from "../package.json" with { type: "json" };
 import { AcpAgent, acpRequestFailure } from "../src/modes/acp/acp-agent";
 import { AcpSdkAdapter, type AcpSdkAdapterError, acpMcpLaunchFailure } from "../src/sdk/acp";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
-import { SdkClientError } from "../src/sdk/client";
+import { SdkClientError, type SdkRequestOptions } from "../src/sdk/client";
 import { MAX_REVERSE_PAYLOAD_BYTES } from "../src/sdk/host";
 import type { SessionAttachment } from "../src/sdk/router";
 import { SESSION_ABORT_TIMEOUT_MS, SESSION_REQUEST_TIMEOUT_MS } from "../src/sdk/session-reconnect";
@@ -35,12 +35,14 @@ class FakeSdkClient {
 		this.frames.push({ type: "query_request", query, input, cursor });
 		return { ok: true };
 	}
-	async global(
-		operation: string,
-		input: Record<string, unknown>,
-		options?: { idempotencyKey?: string; timeoutMs?: number },
-	) {
-		this.frames.push({ type: "broker_request", operation, input, ...options });
+	async global(operation: string, input: Record<string, unknown>, options?: SdkRequestOptions) {
+		this.frames.push({
+			type: "broker_request",
+			operation,
+			input,
+			...(options?.idempotencyKey === undefined ? {} : { idempotencyKey: options.idempotencyKey }),
+			...(options?.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+		});
 		return this.globalResponse;
 	}
 	async request(frame: Record<string, unknown>) {
@@ -575,8 +577,12 @@ for (const replayFailure of [
 	new SdkClientError("timeout", "replay timed out before send", undefined, undefined, { transport: true }),
 	new SdkClientError("connection_closed", "replay connection closed", undefined, undefined, { transport: true }),
 	new Error("replay failed before dispatch"),
+	new DOMException("replay cancelled", "AbortError"),
 ]) {
-	test(`ACP lifecycle preserves original uncertainty after replay ${replayFailure instanceof SdkClientError ? replayFailure.code : "throw"}`, async () => {
+	let failureKind = "throw";
+	if (replayFailure instanceof SdkClientError) failureKind = replayFailure.code;
+	else if (replayFailure instanceof DOMException) failureKind = "cancel";
+	test(`ACP lifecycle preserves original uncertainty after replay ${failureKind}`, async () => {
 		const sdk = new FakeSdkClient();
 		const original = new SdkClientError("uncertain_after_send", "committed response lost", {
 			operation: "session.create",
@@ -690,6 +696,89 @@ test("ACP lifecycle teardown during recovery preserves the original uncertainty"
 		await adapter.close();
 	}
 });
+
+for (const phase of ["before replay", "reconnect before send", "late acknowledgment"] as const) {
+	test(`ACP lifecycle shares its absolute deadline through ${phase}`, async () => {
+		const sdk = new FakeSdkClient();
+		const input = { cwd: "/workspace", mcpServers: [{ name: "docs", command: "docs-mcp", args: [] }] };
+		const original = new SdkClientError("uncertain_after_send", "committed response lost", {
+			operation: "session.create",
+		});
+		let now = Date.now();
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		let firstOptions: SdkRequestOptions | undefined;
+		sdk.global = async (operation, payload, options) => {
+			sdk.frames.push({ operation, input: payload, ...options });
+			if (sdk.frames.length === 1) {
+				firstOptions = options;
+				now += phase === "before replay" ? 21_000 : 20_000;
+				throw original;
+			}
+			expect(options).toBe(firstOptions);
+			now += 1_000;
+			if (phase === "reconnect before send")
+				options?.beforeDispatch?.({ frame: {}, connectionId: "new", generation: 2 });
+			return { result: { sessionId: "committed" } };
+		};
+		const adapter = new AcpSdkAdapter({ client: sdk as never });
+		try {
+			const failure = await adapter.lifecycle("session.create", input, "deadline-key").catch(error => error);
+			expect(failure).toBe(original);
+			expect(acpMcpLaunchFailure(failure, input.mcpServers)).toBe(original);
+			expect(sdk.frames).toHaveLength(phase === "before replay" ? 1 : 2);
+			for (const frame of sdk.frames) {
+				expect(frame.operation).toBe("session.create");
+				expect(frame.input).toBe(input);
+				expect(frame.idempotencyKey).toBe("deadline-key");
+			}
+		} finally {
+			clock.mockRestore();
+			await adapter.close();
+		}
+	});
+}
+
+for (const phase of ["before send", "after send", "replay"] as const) {
+	test(`ACP lifecycle deadline bounds pending work ${phase}`, async () => {
+		const sdk = new FakeSdkClient();
+		const pending = Promise.withResolvers<unknown>();
+		const original = new SdkClientError("uncertain_after_send", "committed response lost");
+		let expire: (() => void) | undefined;
+		const schedule = globalThis.setTimeout;
+		const interceptTimer = (handler: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => {
+			if (delay === 21_000 && typeof handler === "function") expire = () => handler(...args);
+			return schedule(handler, delay, ...args);
+		};
+		const timer = spyOn(globalThis, "setTimeout").mockImplementation(interceptTimer as typeof setTimeout);
+		sdk.global = async (operation, input, options) => {
+			sdk.frames.push({ operation, input, ...options });
+			if (phase === "replay" && sdk.frames.length === 1) throw original;
+			if (phase === "after send") options?.onDispatch?.({ frame: {}, generation: 1, connectionId: "broker" });
+			return await pending.promise;
+		};
+		const adapter = new AcpSdkAdapter({ client: sdk as never });
+		const recovery = adapter.lifecycle("session.create", { cwd: "/workspace" }, "pending-key");
+		const failure = recovery.catch(error => error);
+		try {
+			await waitFor(() => sdk.frames.length === (phase === "replay" ? 2 : 1), "pending lifecycle dispatch");
+			expect(expire).toBeDefined();
+			expire?.();
+			if (phase === "replay") expect(await failure).toBe(original);
+			else if (phase === "after send")
+				expect(await failure).toMatchObject({
+					code: "uncertain_after_send",
+					details: { operation: "session.create", idempotencyKey: "pending-key" },
+				});
+			else expect(await failure).toMatchObject({ code: "timeout", transport: true });
+			pending.resolve({ result: { sessionId: "too-late" } });
+			expect(sdk.frames).toHaveLength(phase === "replay" ? 2 : 1);
+		} finally {
+			pending.resolve({ result: { sessionId: "too-late" } });
+			timer.mockRestore();
+			await adapter.close();
+		}
+	});
+}
 
 test("ACP reconcile_uncertain validates proof and projects an opaque result", async () => {
 	const sdk = new FakeSdkClient();

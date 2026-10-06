@@ -1,7 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { logger } from "@gajae-code/utils";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
-import { type SdkClient, SdkClientError } from "../client";
+import {
+	DEFAULT_SDK_REQUEST_TIMEOUT_MS,
+	type SdkClient,
+	SdkClientError,
+	type SdkDispatchContext,
+	type SdkSentRecord,
+} from "../client";
 import type { AbortScope } from "../host/control/operations";
 import { assertReverseResponseFrame, ReverseLeaseError } from "../host/reverse-leases";
 import {
@@ -143,6 +149,7 @@ const ACP_MCP_PRESERVED_LAUNCH_CODES = new Set([
 	"readiness_timeout",
 	"spawn_failed",
 	"worktree_in_use",
+	"uncertain_after_send",
 ]);
 
 /**
@@ -607,21 +614,62 @@ export class AcpSdkAdapter {
 		// request that named no readiness budget is queued for the default one, so it
 		// needs the same extension rather than the client's generic request deadline.
 		const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
+		const budgetMs = timeoutMs ?? DEFAULT_SDK_REQUEST_TIMEOUT_MS;
+		const deadline = Date.now() + budgetMs;
+		let sent = false;
+		let sentRecord: SdkSentRecord | undefined;
+		let uncertainty: SdkClientError | undefined;
+		const deadlineFailure = () =>
+			uncertainty ??
+			(sent
+				? new SdkClientError(
+						"uncertain_after_send",
+						"ACP lifecycle deadline elapsed after dispatch.",
+						sentRecord ?? {
+							operation,
+							idempotencyKey,
+						},
+					)
+				: new SdkClientError("timeout", "ACP lifecycle deadline elapsed before dispatch.", undefined, undefined, {
+						transport: true,
+					}));
 		const options = {
 			idempotencyKey,
 			...(timeoutMs === undefined ? {} : { timeoutMs }),
+			beforeDispatch: () => {
+				if (Date.now() >= deadline) throw deadlineFailure();
+			},
+			onDispatch: (context: SdkDispatchContext) => {
+				sent = true;
+				if (typeof context.frame.id === "string") sentRecord = client.getSentRecord(context.frame.id);
+			},
+		};
+		const expired = Promise.withResolvers<never>();
+		const timer = setTimeout(() => expired.reject(deadlineFailure()), budgetMs);
+		const recover = async () => {
+			try {
+				const result = await client.global(operation, input, options);
+				if (Date.now() >= deadline) throw deadlineFailure();
+				return result;
+			} catch (firstError) {
+				if (!(firstError instanceof SdkClientError) || firstError.code !== "uncertain_after_send") throw firstError;
+				uncertainty = firstError;
+				// Same-key replay joins the original durable claim, within the original deadline.
+				// Failure to recover does not prove that the committed operation failed.
+				if (Date.now() >= deadline) throw firstError;
+				try {
+					const result = await client.global(operation, input, options);
+					if (Date.now() >= deadline) throw firstError;
+					return result;
+				} catch {
+					throw firstError;
+				}
+			}
 		};
 		try {
-			return await this.#client.global(operation, input, options);
-		} catch (firstError) {
-			if (!(firstError instanceof SdkClientError) || firstError.code !== "uncertain_after_send") throw firstError;
-			// Same-key replay joins the Broker's original durable claim, never another create.
-			// Failure to recover does not prove that the committed operation failed.
-			try {
-				return await client.global(operation, input, options);
-			} catch {
-				throw firstError;
-			}
+			return await Promise.race([recover(), expired.promise]);
+		} finally {
+			clearTimeout(timer);
 		}
 	}
 
