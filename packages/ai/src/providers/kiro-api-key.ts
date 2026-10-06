@@ -460,9 +460,9 @@ export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[];
 				resyncPos = nextStart + 1;
 			}
 			if (!found) {
-				// No valid JSON found within MAX_RESCAN_DISTANCE. Retain the stray brace and all following data
-				// as remaining for the next parse call (bounded by MAX_RESCAN_DISTANCE cap).
-				return { events, remaining: buffer.slice(start) };
+				// No valid JSON found within MAX_RESCAN_DISTANCE. Retain the stray brace and data up to the cap
+				// for the next parse call. Enforce the MAX_RESCAN_DISTANCE cap to prevent unbounded buffering.
+				return { events, remaining: buffer.slice(start, start + MAX_RESCAN_DISTANCE) };
 			}
 			// Loop will continue with the resynced pos
 			continue;
@@ -1135,38 +1135,10 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			stream.push({ type: "done", reason: output.stopReason as "stop" | "toolUse", message: output });
 			stream.end();
 		} catch (error) {
-			// On ordinary errors (including reader.read() throws), emit pending completed tool events
+			// On ordinary errors (including reader.read() throws), emit only COMPLETED tool events
 			// before the error terminal (same semantics as the ordinary-error flush in the event loop).
+			// Incomplete currentTool is NOT finalized/emitted (only completed tools in pendingToolCalls flush).
 			// Refusals drop them via clearPendingToolCalls, but ordinary errors preserve content consistency.
-
-			// Finalize any in-progress tool (inline of addToolToBlocks logic)
-			if (currentTool) {
-				const args = currentTool.input.trim() ? currentTool.input : "{}";
-				let parsed: unknown = {};
-				try {
-					parsed = JSON.parse(args);
-				} catch {
-					parsed = {};
-				}
-				const toolCall: ToolCall = {
-					type: "toolCall",
-					id: currentTool.id,
-					name: currentTool.name,
-					arguments: parsed as Record<string, unknown>,
-				};
-				const index = blocks.length;
-				blocks.push({ ...toolCall, index });
-				if (toolcallIndex === undefined) {
-					toolcallIndex = index;
-				}
-				const toolArgs =
-					typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
-						? (parsed as Record<string, unknown>)
-						: {};
-				const normalizedArgs = JSON.stringify(toolArgs);
-				pendingToolCalls.push({ input: normalizedArgs, toolCall, index });
-				currentTool = undefined;
-			}
 
 			// Emit all pending tool call events (inline of emitPendingToolCalls logic)
 			for (const { input, toolCall, index } of pendingToolCalls) {

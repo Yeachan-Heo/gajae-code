@@ -1032,25 +1032,26 @@ describe("reader.read() error handling with pending tools #6151", () => {
 		expect(endIdx).toBeLessThan(errorIdx);
 	});
 
-	test("emits incomplete tool before error when reader.read() throws mid-tool", async () => {
+	test("does NOT emit incomplete tool when reader.read() throws mid-tool", async () => {
 		const emittedEventTypes: string[] = [];
 
 		globalThis.fetch = (async () => {
-			// Stream that has an incomplete tool, then reader.read() throws
-			const toolJsonStart = JSON.stringify({
+			// Stream that has an incomplete tool (no stop flag), then reader.read() throws
+			const incompleteToolJson = JSON.stringify({
 				stopReason: "TOOL_USE",
 				toolUseId: "tool-456",
 				name: "search",
 				input: '{"query',
+				// Note: no 'stop: true' - tool is incomplete
 			});
-			const bytes = new TextEncoder().encode(toolJsonStart);
+			const bytes = new TextEncoder().encode(incompleteToolJson);
 
 			let pullCount = 0;
 			const body = new ReadableStream<Uint8Array>({
 				pull(controller) {
 					pullCount++;
 					if (pullCount === 1) {
-						// First pull: deliver the incomplete tool event
+						// First pull: deliver the incomplete tool
 						controller.enqueue(bytes);
 					} else if (pullCount === 2) {
 						// Second pull: simulate reader.read() error
@@ -1070,16 +1071,117 @@ describe("reader.read() error handling with pending tools #6151", () => {
 			// Stream may throw; errors are captured in events
 		}
 
-		// Even incomplete tools should have events emitted before error
+		// Incomplete tools (no stop flag) should NOT be emitted, only error
 		const startIdx = emittedEventTypes.indexOf("toolcall_start");
 		const endIdx = emittedEventTypes.indexOf("toolcall_end");
 		const errorIdx = emittedEventTypes.indexOf("error");
 
-		expect(startIdx).toBeGreaterThan(-1);
-		expect(endIdx).toBeGreaterThan(-1);
+		expect(startIdx).toBe(-1);
+		expect(endIdx).toBe(-1);
 		expect(errorIdx).toBeGreaterThan(-1);
-		// Tool events should come before error
-		expect(startIdx).toBeLessThan(errorIdx);
-		expect(endIdx).toBeLessThan(errorIdx);
+	});
+});
+
+describe("Regression tests for #6151 issues", () => {
+	test("#4199034431: incomplete JSON frame without valid nested objects preserves data for next call", async () => {
+		const { parseKiroApiEvents } = await import("../src/providers/kiro-api-key");
+
+		// Simulate a malformed chunk with a stray opening brace (no complete nested JSON)
+		// This tests that when there's incomplete JSON with no valid nested objects to resync to,
+		// the data is preserved in remaining for the next parse call
+		const malformedChunk = '{"content": "hello'; // Opening { but no closing }, incomplete value
+
+		// First parse should recognize the incomplete frame
+		const result1 = parseKiroApiEvents(malformedChunk);
+		// Should not parse any complete events (frame is incomplete)
+		expect(result1.events).toHaveLength(0);
+		// Should preserve incomplete frame in remaining for next parse
+		expect(result1.remaining).toBeTruthy();
+		expect(result1.remaining.length).toBeGreaterThan(0);
+		// Should start with the incomplete frame
+		expect(result1.remaining[0]).toBe("{");
+
+		// Second parse with completion of the frame (complete the content and close the object)
+		const completed = `${result1.remaining}"}`;
+		const result2 = parseKiroApiEvents(completed);
+		// Should now parse a content event from the completed frame
+		const contentEvent = result2.events.find(e => e.type === "content");
+		expect(contentEvent).toBeDefined();
+		expect(contentEvent?.type).toBe("content");
+	});
+
+	test("#4199034439: incomplete tool should NOT be emitted when reader.read() throws mid-tool", async () => {
+		const emittedEventTypes: string[] = [];
+
+		globalThis.fetch = (async () => {
+			// Stream that has an incomplete tool (no stop flag), then reader.read() throws
+			const incompleteToolJson = JSON.stringify({
+				stopReason: "TOOL_USE",
+				toolUseId: "tool-incomplete",
+				name: "search",
+				input: '{"query": "incomplete',
+				// Note: no 'stop: true' - tool is not complete
+			});
+			const bytes = new TextEncoder().encode(incompleteToolJson);
+
+			let pullCount = 0;
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					pullCount++;
+					if (pullCount === 1) {
+						// First pull: deliver the incomplete tool
+						controller.enqueue(bytes);
+					} else if (pullCount === 2) {
+						// Second pull: simulate reader.read() error
+						controller.error(new Error("Stream interrupted"));
+					}
+				},
+			});
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEventTypes.push(event.type);
+			}
+		} catch {
+			// Stream may throw; errors are captured in events
+		}
+
+		// Incomplete tool (no stop flag) should NOT have toolcall_start/end events emitted
+		// Only the error event should be present
+		const toolcallStart = emittedEventTypes.indexOf("toolcall_start");
+		const toolcallEnd = emittedEventTypes.indexOf("toolcall_end");
+		const errorIdx = emittedEventTypes.indexOf("error");
+
+		// REGRESSION: The incomplete tool should NOT be emitted
+		// Currently (buggy behavior), toolcall_start/end are emitted
+		// After fix: toolcall_start/end should NOT appear
+		expect(toolcallStart).toBe(-1);
+		expect(toolcallEnd).toBe(-1);
+		// Only error event should be present
+		expect(errorIdx).toBeGreaterThan(-1);
+	});
+
+	test("#4199034444: 64KiB retention cap enforced for stray brace with no valid JSON", async () => {
+		const { parseKiroApiEvents } = await import("../src/providers/kiro-api-key");
+
+		// Create a buffer with a stray opening brace followed by 100KB of garbage
+		// This should be truncated to 64KB max when returned as remaining
+		const strayBrace = "{";
+		const garbage = "x".repeat(100 * 1024); // 100KB of non-JSON data
+		const buffer = strayBrace + garbage;
+
+		const result = parseKiroApiEvents(buffer);
+
+		// Should not parse any events
+		expect(result.events).toHaveLength(0);
+
+		// REGRESSION: The remaining buffer should be capped at 64KB
+		// Currently (buggy behavior), remaining could contain 100KB+
+		// After fix: remaining should be truncated to 64KB
+		const MAX_RESCAN_DISTANCE = 64 * 1024;
+		expect(result.remaining.length).toBeLessThanOrEqual(MAX_RESCAN_DISTANCE);
 	});
 });

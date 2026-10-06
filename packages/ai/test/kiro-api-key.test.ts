@@ -231,17 +231,18 @@ describe("parseKiroApiEvents", () => {
 		expect(remaining).toBe("");
 	});
 	test("bounded retention: stray brace followed by garbage beyond MAX_RESCAN_DISTANCE", () => {
-		// Regression test for P2 id 4197329342: bounded retention prevents infinite buffering.
+		// Regression test for P2 id 4197329342 and #4199034444: bounded retention prevents infinite buffering.
 		// Create a large buffer with a stray brace followed by garbage beyond the rescan limit.
 		const largeGarbage = "x".repeat(70 * 1024); // 70KB > 64KB MAX_RESCAN_DISTANCE
 		const input = `{broken${largeGarbage}`;
 		const { events, remaining } = parseKiroApiEvents(input);
 
 		// No valid JSON found after the stray brace (within the rescan distance),
-		// so we should return the remaining buffer starting from the stray brace.
-		// This prevents indefinite buffering of the large garbage data.
+		// so we should return only the data up to MAX_RESCAN_DISTANCE to prevent unbounded buffering.
+		const MAX_RESCAN_DISTANCE = 64 * 1024; // 64KB
 		expect(events).toHaveLength(0);
-		expect(remaining).toEqual(input); // All of the input is returned as remaining
+		expect(remaining.length).toBeLessThanOrEqual(MAX_RESCAN_DISTANCE);
+		expect(remaining.length).toBeGreaterThan(0); // Still preserve some data
 		// The remaining buffer will be re-parsed in the next call when new data arrives
 	});
 });
