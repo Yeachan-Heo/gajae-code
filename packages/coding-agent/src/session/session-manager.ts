@@ -16494,9 +16494,13 @@ export class SessionManager {
 	}
 
 	async #rewriteFile(): Promise<void> {
-		await this.#queuePersistTask(async () => {
-			await this.#rewriteFileContents();
-		});
+		try {
+			await this.#queuePersistTask(async () => {
+				await this.#rewriteFileContents();
+			});
+		} catch (error) {
+			throw this.#recordPersistError(error);
+		}
 	}
 
 	#rewriteFileSync(): void {
@@ -16819,7 +16823,12 @@ export class SessionManager {
 		if (!this.persist || !this.#sessionFile) return;
 		if (this.#readOnlyResume) return;
 		if (this.#flushed && !this.#needsFullRewriteOnNextPersist) return;
-		await this.#rewriteFile();
+		try {
+			await this.#rewriteFile();
+		} catch (error) {
+			this.#recordPersistError(error);
+			throw error;
+		}
 		this.#ensuredOnDisk = true;
 	}
 
@@ -16940,6 +16949,7 @@ export class SessionManager {
 			});
 		}
 		let closeError: unknown;
+		const priorPersistError = this.#persistError;
 		let taskStarted = false;
 		try {
 			await this.#queuePersistTask(
@@ -16960,7 +16970,7 @@ export class SessionManager {
 			closeError = error;
 			if (taskStarted) this.#closeRetryPending = true;
 		}
-		const terminalError = closeError ?? this.#persistError;
+		const terminalError = closeError ?? this.#persistError ?? priorPersistError;
 		if (terminalError) throw terminalError;
 		this.#persistError = undefined;
 		this.#persistErrorReported = false;
