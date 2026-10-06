@@ -3944,4 +3944,46 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 			content: [{ type: "text", text: "already streamed" }],
 		});
 	});
+	it("commits terminal-only statusless overload content without a delta (#6426)", async () => {
+		const mock = createMockModel();
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			const message: AssistantMessage = {
+				...assistantMessage(mock.model),
+				api: "openai-responses",
+				stopReason: "error",
+				errorMessage: "server_is_overloaded: Our servers are currently overloaded. Please try again later.",
+				content: [{ type: "text", text: "terminal-only content" }],
+				transportFailure: {
+					kind: "transport",
+					providerCode: "server_is_overloaded",
+					openaiErrorCode: "server_is_overloaded",
+				},
+			};
+			queueMicrotask(() => {
+				stream.push({ type: "start", partial: message });
+				stream.push({ type: "error", reason: "error", error: message });
+			});
+			return stream;
+		};
+		const outcomes: ManagedAttemptOutcome[] = [];
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+		});
+
+		await agent.prompt("run", {
+			fallbackManaged: true,
+			onManagedAttemptOutcome: outcome => {
+				outcomes.push(outcome);
+				return { type: "terminal", terminal: { stopReason: "error" } };
+			},
+		});
+
+		expect(outcomes).toHaveLength(0);
+		expect(agent.state.messages.at(-1)).toMatchObject({
+			stopReason: "error",
+			content: [{ type: "text", text: "terminal-only content" }],
+		});
+	});
 });
