@@ -81,6 +81,79 @@ describe("AsyncJobManager", () => {
 		}
 	});
 
+	test("waitForAll and dispose retain an evicted cancelled runner until physical unwind", async () => {
+		const gate = Promise.withResolvers<string>();
+		let evictions = 0;
+		let waitForAllSettled = false;
+		const manager = new AsyncJobManager({ onJobComplete: async () => {}, retentionMs: 0 });
+		const jobId = manager.register("task", "evicted held runner", () => gate.promise, {
+			lifecycle: {
+				onEvict: () => {
+					evictions += 1;
+				},
+			},
+		});
+		const job = manager.getJob(jobId);
+		if (!job) throw new Error("Job was not registered");
+		manager.cancelAll();
+		expect(manager.getJob(jobId)).toBeUndefined();
+		expect(evictions).toBe(0);
+
+		const waiting = manager.waitForAll().then(() => {
+			waitForAllSettled = true;
+		});
+		await Bun.sleep(10);
+		expect(waitForAllSettled).toBe(false);
+		expect(await manager.dispose({ timeoutMs: 10 })).toBe(false);
+		expect(manager.getLastDisposeDiagnostics()).toMatchObject({ stuckJobIds: [jobId], deliveriesDrained: false });
+		expect(evictions).toBe(0);
+
+		gate.resolve("late result");
+		await Promise.all([job.promise, waiting, manager.awaitRetainedDisposalCompletion()]);
+		expect(waitForAllSettled).toBe(true);
+		expect(evictions).toBe(1);
+	});
+
+	test("physical eviction cleanup runs exactly once for success, rejection, cancellation, and failNow", async () => {
+		for (const mode of ["success", "rejection", "cancellation", "failNow"] as const) {
+			const gate = Promise.withResolvers<void>();
+			let evictions = 0;
+			const manager = new AsyncJobManager({ onJobComplete: async () => {}, retentionMs: 0 });
+			const jobId = manager.register(
+				"task",
+				`${mode} held runner`,
+				async () => {
+					await gate.promise;
+					if (mode === "rejection") throw new Error("runner rejected");
+					return "runner completed";
+				},
+				{
+					lifecycle: {
+						onEvict: () => {
+							evictions += 1;
+						},
+					},
+				},
+			);
+			const job = manager.getJob(jobId);
+			if (!job) throw new Error(`${mode} job was not registered`);
+			if (mode === "cancellation") manager.cancelAll();
+			if (mode === "failNow") {
+				if (!manager.failNow(jobId, job.generation, "forced failure")) {
+					throw new Error("failNow did not settle the running job");
+				}
+			}
+			if (mode === "cancellation" || mode === "failNow") expect(manager.getJob(jobId)).toBeUndefined();
+			expect(evictions).toBe(0);
+
+			gate.resolve();
+			await job.promise;
+			expect(evictions).toBe(1);
+			await manager.dispose({ timeoutMs: 100 });
+			expect(evictions).toBe(1);
+		}
+	});
+
 	test("forwards progress updates and delivers completion", async () => {
 		const progressEvents: Array<{ text: string; details?: Record<string, unknown> }> = [];
 		const completions: Array<{ jobId: string; text: string }> = [];
