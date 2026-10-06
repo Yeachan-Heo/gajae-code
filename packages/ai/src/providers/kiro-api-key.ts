@@ -8,6 +8,8 @@
 import { $env } from "@gajae-code/utils";
 import { assertAwsRegionLabel } from "../adapter-internals/aws-region";
 import {
+	getProviderSafetyStopModelIdentity,
+	getProviderSafetyStopWireModelId,
 	isProviderSafetyStopAdapterInvocation,
 	mintProviderSafetyStop,
 	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
@@ -431,22 +433,31 @@ export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[];
 
 		const end = findJsonEnd(buffer, start);
 		if (end < 0) {
-			// Unclosed brace at 'start'. Try to find the next '{' within bounded distance
-			// and check if it closes properly.
+			// Unclosed brace at 'start'. This could be an incomplete top-level event that will close
+			// in a later chunk. Resync only if we find a candidate that:
+			// 1. Closes properly AND
+			// 2. Starts at or after a position past the stray brace (with only whitespace/commas between)
 			const strayBraceEnd = Math.min(start + MAX_RESCAN_DISTANCE, buffer.length);
 			let resyncPos = start + 1;
 			let found = false;
 			while (resyncPos < strayBraceEnd) {
 				const nextStart = buffer.indexOf("{", resyncPos);
 				if (nextStart < 0) break;
+
+				// Check if there's anything between 'start' and 'nextStart' other than whitespace/commas.
+				// If there is, nextStart is likely a nested object inside the stray brace, not a top-level event.
+				const betweenText = buffer.slice(start + 1, nextStart).trim();
+				const isLikelyNested =
+					/[^\s,]/.test(betweenText) && !betweenText.endsWith(",") && !betweenText.endsWith("}");
+
 				// Try to find the end of this candidate
 				const nextEnd = findJsonEnd(buffer, nextStart);
-				if (nextEnd >= 0) {
-					// Found a candidate that closes. Try to parse it.
+				if (nextEnd >= 0 && !isLikelyNested) {
+					// Found a candidate that closes and is at a valid event boundary. Try to parse it.
 					try {
 						const candidate = buffer.slice(nextStart, nextEnd + 1);
 						JSON.parse(candidate);
-						// Valid JSON found after the stray brace. Resync to this position.
+						// Valid JSON found at a likely event boundary. Resync to this position.
 						pos = nextStart;
 						found = true;
 						break;
@@ -457,8 +468,8 @@ export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[];
 				resyncPos = nextStart + 1;
 			}
 			if (!found) {
-				// No valid JSON found after the stray brace within MAX_RESCAN_DISTANCE.
-				// Return what we have, with bounded retention of the stray brace.
+				// No valid JSON found after the stray brace within MAX_RESCAN_DISTANCE, or all candidates
+				// appear to be nested objects. Retain the incomplete outer candidate for more data.
 				return { events, remaining: buffer.slice(start) };
 			}
 			// Loop will continue with the resynced pos
@@ -711,20 +722,25 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 		const pendingToolCalls: Array<{ input: string; toolCall: ToolCall; index: number }> = [];
 
 		try {
-			// Snapshot model identity fields at stream start to prevent TOCTOU attacks where
-			// a Proxy/getter model could return different values on successive reads.
-			const modelSnapshot = Object.freeze({
-				provider: model.provider,
-				id: model.id,
-				wireModelId: model.wireModelId,
-				baseUrl: model.baseUrl,
-				api: "kiro-codewhisperer-stream" as Api,
-			});
+			// Use validated identity snapshot from trust check if available (no second read of getters),
+			// otherwise snapshot model properties now to prevent TOCTOU attacks.
+			let modelSnapshot = getProviderSafetyStopModelIdentity(options);
+			let wireModelIdFromSnapshot = getProviderSafetyStopWireModelId(options);
+			if (!modelSnapshot) {
+				// Trust check didn't provide snapshot; snapshot properties now
+				modelSnapshot = Object.freeze({
+					provider: model.provider,
+					id: model.id,
+					baseUrl: model.baseUrl,
+					api: "kiro-codewhisperer-stream" as Api,
+				});
+				wireModelIdFromSnapshot = model.wireModelId;
+			}
 
 			// Update output with snapshotted model identity
-			output.api = modelSnapshot.api;
-			output.provider = modelSnapshot.provider;
-			output.model = modelSnapshot.id;
+			output.api = (modelSnapshot.api as Api) || ("kiro-codewhisperer-stream" as Api);
+			output.provider = modelSnapshot.provider || "";
+			output.model = modelSnapshot.id || "";
 
 			if (!isKiroApiKey(apiKey)) {
 				throw new Error(
@@ -732,16 +748,16 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				);
 			}
 
-			const configuredBaseUrl = modelSnapshot.baseUrl;
+			const configuredBaseUrl = modelSnapshot.baseUrl || "";
 			const usesExplicitBaseUrl = Boolean(configuredBaseUrl) && !isRegionDerivedKiroApiBaseUrl(configuredBaseUrl);
 			const endpoint = configuredBaseUrl || kiroApiBaseUrl(kiroApiRegion(options));
 			// Create a snapshotted model view for downstream functions to use
 			const snapshotModel: Model<"kiro-codewhisperer-stream"> = {
 				...model,
-				provider: modelSnapshot.provider,
-				id: modelSnapshot.id,
-				baseUrl: modelSnapshot.baseUrl,
-				wireModelId: modelSnapshot.wireModelId,
+				provider: (modelSnapshot.provider || model.provider) as string,
+				id: (modelSnapshot.id || model.id) as string,
+				baseUrl: (modelSnapshot.baseUrl ?? model.baseUrl) as string,
+				wireModelId: wireModelIdFromSnapshot ?? model.wireModelId,
 			};
 			let request = buildApiKeyRequest(snapshotModel, context, options);
 			const replacementPayload = await options?.onPayload?.(

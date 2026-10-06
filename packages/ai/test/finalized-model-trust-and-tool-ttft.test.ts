@@ -22,7 +22,7 @@ describe("P1: Finalized model trust", () => {
 		if (!original) throw new Error("Expected bundled Kiro model");
 
 		// The bundled model should be trusted (registered during module load)
-		expect(isProviderSafetyStopModelTrusted(original)).toBe(true);
+		expect(isProviderSafetyStopModelTrusted(original)).toBeTruthy();
 	});
 
 	test("finalized (cloned) Kiro model should be trusted after explicit clone registration", () => {
@@ -40,7 +40,7 @@ describe("P1: Finalized model trust", () => {
 		const trustedClone = registerFinalizedModelClone(original, finalized);
 		expect(trustedClone).toBeDefined();
 		// The returned clone should be trusted
-		expect(isProviderSafetyStopModelTrusted(trustedClone)).toBe(true);
+		expect(isProviderSafetyStopModelTrusted(trustedClone)).toBeTruthy();
 		// The caller-supplied finalized object should remain untrusted
 		expect(isProviderSafetyStopModelTrusted(finalized)).toBe(false);
 	});
@@ -63,7 +63,7 @@ describe("P1: Finalized model trust", () => {
 
 		// Register the original
 		registerProviderSafetyStopModel(original);
-		expect(isProviderSafetyStopModelTrusted(original)).toBe(true);
+		expect(isProviderSafetyStopModelTrusted(original)).toBeTruthy();
 
 		// Create a malicious clone with a different baseUrl
 		const malicious = {

@@ -344,7 +344,7 @@ describe("provider safety-stop provenance authority", () => {
 			if (!original) throw new Error("Expected bundled OpenAI model");
 
 			registerProviderSafetyStopModel(original);
-			expect(isProviderSafetyStopModelTrusted(original)).toBe(true);
+			expect(isProviderSafetyStopModelTrusted(original)).toBeTruthy();
 
 			const cloneWithDifferentBaseUrl = { ...original, baseUrl: "https://attacker.example/v1" };
 			registerFinalizedModelClone(original, cloneWithDifferentBaseUrl);
@@ -358,7 +358,7 @@ describe("provider safety-stop provenance authority", () => {
 			if (!original) throw new Error("Expected bundled OpenAI model");
 
 			registerProviderSafetyStopModel(original);
-			expect(isProviderSafetyStopModelTrusted(original)).toBe(true);
+			expect(isProviderSafetyStopModelTrusted(original)).toBeTruthy();
 
 			const cloneWithDifferentProvider = { ...original, provider: "attacker" };
 			registerFinalizedModelClone(original, cloneWithDifferentProvider);
@@ -372,7 +372,7 @@ describe("provider safety-stop provenance authority", () => {
 			if (!original) throw new Error("Expected bundled OpenAI model");
 
 			registerProviderSafetyStopModel(original);
-			expect(isProviderSafetyStopModelTrusted(original)).toBe(true);
+			expect(isProviderSafetyStopModelTrusted(original)).toBeTruthy();
 
 			const cloneWithDifferentId = { ...original, id: "attacker-model" };
 			registerFinalizedModelClone(original, cloneWithDifferentId);
@@ -386,7 +386,7 @@ describe("provider safety-stop provenance authority", () => {
 			if (!original) throw new Error("Expected bundled OpenAI model");
 
 			registerProviderSafetyStopModel(original);
-			expect(isProviderSafetyStopModelTrusted(original)).toBe(true);
+			expect(isProviderSafetyStopModelTrusted(original)).toBeTruthy();
 
 			const cloneWithDifferentApi = { ...original, api: "attacker-api" as any };
 			registerFinalizedModelClone(original, cloneWithDifferentApi);
@@ -400,13 +400,13 @@ describe("provider safety-stop provenance authority", () => {
 			if (!original) throw new Error("Expected bundled OpenAI model");
 
 			registerProviderSafetyStopModel(original);
-			expect(isProviderSafetyStopModelTrusted(original)).toBe(true);
+			expect(isProviderSafetyStopModelTrusted(original)).toBeTruthy();
 
 			// Register a clone
 			const clone = { ...original };
 			const registered = registerFinalizedModelClone(original, clone);
 			expect(registered).toBeDefined();
-			expect(isProviderSafetyStopModelTrusted(registered!)).toBe(true);
+			expect(isProviderSafetyStopModelTrusted(registered!)).toBeTruthy();
 
 			// Mutate the registered model's baseUrl
 			(registered as any).baseUrl = "https://attacker.example";
@@ -425,14 +425,14 @@ describe("provider safety-stop provenance authority", () => {
 			};
 
 			registerProviderSafetyStopModel(modelWithUserinfo);
-			expect(isProviderSafetyStopModelTrusted(modelWithUserinfo)).toBe(true);
+			expect(isProviderSafetyStopModelTrusted(modelWithUserinfo)).toBeTruthy();
 
 			const stripped = createTrustedStrippedModelClone(modelWithUserinfo);
 
 			// Stripped clone should have userinfo/query/hash removed
 			expect(stripped.baseUrl).toBe("https://example.com/v1");
 			// Stripped clone is trusted
-			expect(isProviderSafetyStopModelTrusted(stripped)).toBe(true);
+			expect(isProviderSafetyStopModelTrusted(stripped)).toBeTruthy();
 		});
 
 		test("createTrustedStrippedModelClone handles invalid URLs gracefully", () => {
@@ -445,14 +445,14 @@ describe("provider safety-stop provenance authority", () => {
 			};
 
 			registerProviderSafetyStopModel(modelWithInvalidUrl);
-			expect(isProviderSafetyStopModelTrusted(modelWithInvalidUrl)).toBe(true);
+			expect(isProviderSafetyStopModelTrusted(modelWithInvalidUrl)).toBeTruthy();
 
 			const stripped = createTrustedStrippedModelClone(modelWithInvalidUrl);
 
 			// Stripped clone should not have baseUrl
 			expect(stripped.baseUrl).toBeUndefined();
 			// Stripped clone is still trusted
-			expect(isProviderSafetyStopModelTrusted(stripped)).toBe(true);
+			expect(isProviderSafetyStopModelTrusted(stripped)).toBeTruthy();
 		});
 
 		test("registerFinalizedModelClone rejects getter-based clone", () => {
@@ -505,7 +505,7 @@ describe("provider safety-stop provenance authority", () => {
 			expect(returned).toBeDefined();
 			expect(returned).not.toBe(proxyClone);
 			// The returned object should be trusted (built from original's snapshot)
-			expect(isProviderSafetyStopModelTrusted(returned!)).toBe(true);
+			expect(isProviderSafetyStopModelTrusted(returned!)).toBeTruthy();
 			// The proxy itself should NOT be trusted (because we didn't register the proxy)
 			expect(isProviderSafetyStopModelTrusted(proxyClone)).toBe(false);
 		});
@@ -531,7 +531,7 @@ describe("provider safety-stop provenance authority", () => {
 			expect(returned!.id).toBe(original.id);
 			expect(returned!.baseUrl).toBe(original.baseUrl);
 			// The returned object should be trusted
-			expect(isProviderSafetyStopModelTrusted(returned!)).toBe(true);
+			expect(isProviderSafetyStopModelTrusted(returned!)).toBeTruthy();
 		});
 
 		test("registerFinalizedModelClone with non-identity fields", () => {
@@ -547,7 +547,7 @@ describe("provider safety-stop provenance authority", () => {
 			expect(returned).toBeDefined();
 			expect(returned!.headers).toEqual({ Authorization: "Bearer token" });
 			// The returned object should be trusted
-			expect(isProviderSafetyStopModelTrusted(returned!)).toBe(true);
+			expect(isProviderSafetyStopModelTrusted(returned!)).toBeTruthy();
 		});
 
 		test("registerFinalizedModelClone builds fresh object even with Proxy on read 3+", () => {
@@ -576,7 +576,7 @@ describe("provider safety-stop provenance authority", () => {
 			// The returned object should have the correct identity
 			expect(returned!.baseUrl).toBe(original.baseUrl);
 			// The returned object should be trusted
-			expect(isProviderSafetyStopModelTrusted(returned!)).toBe(true);
+			expect(isProviderSafetyStopModelTrusted(returned!)).toBeTruthy();
 			// The proxy itself should NOT be trusted
 			expect(isProviderSafetyStopModelTrusted(proxyClone)).toBe(false);
 		});
@@ -605,7 +605,7 @@ describe("provider safety-stop provenance authority", () => {
 			expect(returned).toBeDefined();
 			expect(returned).not.toBe(proxyClone);
 			expect(returned!.baseUrl).toBe(original.baseUrl);
-			expect(isProviderSafetyStopModelTrusted(returned!)).toBe(true);
+			expect(isProviderSafetyStopModelTrusted(returned!)).toBeTruthy();
 		});
 
 		test("registerFinalizedModelClone builds fresh object even with Proxy on read 5+", () => {
@@ -631,7 +631,7 @@ describe("provider safety-stop provenance authority", () => {
 			expect(returned).toBeDefined();
 			expect(returned).not.toBe(proxyClone);
 			expect(returned!.baseUrl).toBe(original.baseUrl);
-			expect(isProviderSafetyStopModelTrusted(returned!)).toBe(true);
+			expect(isProviderSafetyStopModelTrusted(returned!)).toBeTruthy();
 		});
 
 		test("registerFinalizedModelClone builds fresh object even with Proxy on read 6+", () => {
@@ -657,7 +657,7 @@ describe("provider safety-stop provenance authority", () => {
 			expect(returned).toBeDefined();
 			expect(returned).not.toBe(proxyClone);
 			expect(returned!.baseUrl).toBe(original.baseUrl);
-			expect(isProviderSafetyStopModelTrusted(returned!)).toBe(true);
+			expect(isProviderSafetyStopModelTrusted(returned!)).toBeTruthy();
 		});
 
 		test("registerFinalizedModelClone returns undefined when original is not trusted", () => {

@@ -4,7 +4,7 @@
  * the explicit refusal category and explanation instead of the generic
  * "Kiro API key stream returned no tokens".
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { isProviderSafetyStopModelTrusted } from "../src/adapter-internals/provider-safety-stop";
 import { kiroApiBaseUrl, kiroApiStaticModels, streamKiroApiKey } from "../src/providers/kiro-api-key";
 import type { AssistantMessage, Context, Model } from "../src/types";
@@ -30,6 +30,10 @@ const context: Context = {
 };
 
 describe("Kiro API-key content filter #6150", () => {
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+
 	test("surfaces refusal from ksk_ stream with category and explanation", async () => {
 		const events: Array<{ type: string; message?: { errorMessage?: string; content?: unknown[] } }> = [];
 
@@ -51,8 +55,6 @@ describe("Kiro API-key content filter #6150", () => {
 		} catch {
 			// Stream may throw; errors are captured in events
 		}
-
-		globalThis.fetch = originalFetch;
 
 		// Should have error event with refusal message
 		const errorEvent = events.find(e => e.type === "error");
@@ -90,8 +92,6 @@ describe("Kiro API-key content filter #6150", () => {
 			// Stream may throw; errors are captured in events
 		}
 
-		globalThis.fetch = originalFetch;
-
 		// Verify no text_delta events before error
 		const errorIndex = events.findIndex(e => e.type === "error");
 		expect(errorIndex).toBeGreaterThan(-1);
@@ -126,8 +126,6 @@ describe("Kiro API-key content filter #6150", () => {
 		} catch {
 			// Stream may throw; errors are captured in events
 		}
-
-		globalThis.fetch = originalFetch;
 
 		const errorEvent = events.find(e => e.type === "error");
 		expect(errorEvent).toBeDefined();
@@ -172,8 +170,6 @@ describe("Kiro API-key content filter #6150", () => {
 			// Stream may throw; errors are captured in events
 		}
 
-		globalThis.fetch = originalFetch;
-
 		const errorEvent = events.find(e => e.type === "error");
 		expect(errorEvent).toBeDefined();
 		expect(errorEvent?.message?.errorMessage).toContain("Kiro refused the request (ILLEGAL)");
@@ -196,13 +192,9 @@ describe("Kiro API-key content filter #6150", () => {
 				{ status: 200 },
 			)) as unknown as typeof fetch;
 
-		try {
-			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
-			for await (const event of stream) {
-				if (event.type === "error") finalError = event.error;
-			}
-		} finally {
-			globalThis.fetch = originalFetch;
+		const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+		for await (const event of stream) {
+			if (event.type === "error") finalError = event.error;
 		}
 
 		expect(finalError?.errorMessage).toBe(
@@ -230,8 +222,6 @@ describe("Kiro API-key content filter #6150", () => {
 		} catch {
 			// Stream may throw; events are captured
 		}
-
-		globalThis.fetch = originalFetch;
 
 		// Find index of first text_delta and last chunk consumed (done event)
 		const firstTextDeltaIndex = emittedEvents.findIndex(e => e.type === "text_delta");
@@ -263,8 +253,6 @@ describe("Kiro API-key content filter #6150", () => {
 		} catch {
 			// Stream may throw; messages are captured
 		}
-
-		globalThis.fetch = originalFetch;
 
 		const doneEvent = capturedMessages.find(e => e.type === "done");
 		const msg = doneEvent?.message as { ttft?: number; duration?: number } | undefined;
@@ -307,8 +295,6 @@ describe("Kiro API-key content filter #6150", () => {
 			console.error("Stream threw:", err);
 		}
 
-		globalThis.fetch = originalFetch;
-
 		// Check that toolcall_start, toolcall_delta, and toolcall_end are emitted
 		const toolcallStart = emittedEvents.find(e => e.type === "toolcall_start");
 		const toolcallDelta = emittedEvents.find(e => e.type === "toolcall_delta");
@@ -348,8 +334,6 @@ describe("Kiro API-key content filter #6150", () => {
 		} catch {
 			// Stream may throw; events are captured
 		}
-
-		globalThis.fetch = originalFetch;
 
 		// Check that text_start, text_delta, and text_end are emitted
 		const textStart = emittedEvents.find(e => e.type === "text_start");
@@ -395,8 +379,6 @@ describe("Kiro API-key content filter #6150", () => {
 			// Stream may throw
 		}
 
-		globalThis.fetch = originalFetch;
-
 		// Get the content blocks from the final message
 		const content = (finalMessage as { content?: unknown[] })?.content ?? [];
 		const blockTypes = (content as Array<{ type: string }>).map(b => b.type);
@@ -435,8 +417,6 @@ describe("Kiro API-key content filter #6150", () => {
 			// Stream may throw; events are captured
 		}
 
-		globalThis.fetch = originalFetch;
-
 		// Should emit text events, not error
 		const textDeltaEvents = emittedEvents.filter(e => e.type === "text_delta");
 		const doneEvent = emittedEvents.find(e => e.type === "done");
@@ -467,8 +447,6 @@ describe("Kiro API-key content filter #6150", () => {
 		} catch {
 			// Stream may throw; events are captured
 		}
-
-		globalThis.fetch = originalFetch;
 
 		// Should emit both text and tool call events
 		const textDeltaEvents = emittedEvents.filter(e => e.type === "text_delta");
@@ -509,8 +487,6 @@ describe("Kiro API-key content filter #6150", () => {
 		} catch {
 			// Stream may throw; errors are captured
 		}
-
-		globalThis.fetch = originalFetch;
 
 		// Should have error event, no text_delta before error
 		const errorIndex = emittedEvents.findIndex(e => e.type === "error");
@@ -555,8 +531,6 @@ describe("Kiro API-key content filter #6150", () => {
 			// Stream may throw; events are captured
 		}
 
-		globalThis.fetch = originalFetch;
-
 		// Should have captured an error event
 		expect(finalError).toBeDefined();
 		expect(finalError?.errorMessage).toContain("Kiro refused the request (MALWARE)");
@@ -580,7 +554,7 @@ describe("Kiro API-key content filter #6150", () => {
 			// All models should be registered as trusted (even with non-default region)
 			for (const m of models) {
 				const isTrusted = isProviderSafetyStopModelTrusted(m);
-				expect(isTrusted).toBe(true);
+				expect(isTrusted).toBeTruthy();
 			}
 
 			// Verify that the baseUrl is region-derived
@@ -641,8 +615,6 @@ describe("Kiro API-key content filter #6150", () => {
 			// Errors may be thrown; events are captured above
 		}
 
-		globalThis.fetch = originalFetch;
-
 		// Should have emitted text_delta events before the error
 		const textDeltaEvents = emittedEvents.filter(e => e.type === "text_delta");
 		expect(textDeltaEvents.length).toBeGreaterThan(0);
@@ -698,8 +670,6 @@ describe("Kiro API-key content filter #6150", () => {
 			// Errors may be thrown; events are captured above
 		}
 
-		globalThis.fetch = originalFetch;
-
 		// Error should be reported but should mention accumulated partial output (text and tool)
 		const errorEvent = emittedEvents.find(e => e.type === "error");
 		expect(errorEvent).toBeDefined();
@@ -751,8 +721,6 @@ describe("reasoning-before-answer contentIndex invariant #6151", () => {
 		} catch (err) {
 			caughtError = err;
 		}
-
-		globalThis.fetch = originalFetch;
 
 		// Debug if error occurred
 		if (caughtError) {
@@ -836,8 +804,6 @@ describe("reasoning-before-answer contentIndex invariant #6151", () => {
 			// Stream may throw; events are captured above
 		}
 
-		globalThis.fetch = originalFetch;
-
 		// Find done event to inspect final output.content
 		const doneEvent = emittedEvents.find(e => e.type === "done");
 		const finalMessage = doneEvent?.message as unknown as { content?: unknown[] };
@@ -911,8 +877,6 @@ describe("reasoning-before-answer contentIndex invariant #6151", () => {
 			// Stream may throw; events are captured above
 		}
 
-		globalThis.fetch = originalFetch;
-
 		// Find done event to inspect final output.content
 		const doneEvent = emittedEvents.find(e => e.type === "done");
 		const finalMessage = doneEvent?.message as unknown as { content?: unknown[] };
@@ -959,8 +923,6 @@ describe("reasoning-before-answer contentIndex invariant #6151", () => {
 			// Stream may throw; errors are captured in events
 		}
 
-		globalThis.fetch = originalFetch;
-
 		// When an ordinary error follows a tool, tool events should be emitted before the error
 		const toolcallStart = emittedEvents.find(e => e.type === "toolcall_start");
 		const toolcallEnd = emittedEvents.find(e => e.type === "toolcall_end");
@@ -1001,8 +963,6 @@ describe("reasoning-before-answer contentIndex invariant #6151", () => {
 		} catch {
 			// Stream may throw; errors are captured in events
 		}
-
-		globalThis.fetch = originalFetch;
 
 		// On refusal, tool events should not be emitted
 		const toolcallStart = emittedEvents.find(e => e.type === "toolcall_start");
@@ -1055,8 +1015,6 @@ describe("reader.read() error handling with pending tools #6151", () => {
 		} catch {
 			// Stream may throw; errors are captured in events
 		}
-
-		globalThis.fetch = originalFetch;
 
 		// Should have tool call events before error
 		const startIdx = emittedEventTypes.indexOf("toolcall_start");
@@ -1111,8 +1069,6 @@ describe("reader.read() error handling with pending tools #6151", () => {
 		} catch {
 			// Stream may throw; errors are captured in events
 		}
-
-		globalThis.fetch = originalFetch;
 
 		// Even incomplete tools should have events emitted before error
 		const startIdx = emittedEventTypes.indexOf("toolcall_start");

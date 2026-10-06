@@ -1,7 +1,7 @@
 import { afterAll, afterEach, describe, expect, test, vi } from "bun:test";
 import { crc32 } from "../src/providers/aws-eventstream";
 import { streamKiroCodeWhisperer } from "../src/providers/kiro-codewhisperer";
-import type { Context, Model } from "../src/types";
+import type { AssistantMessageEvent, Context, Model } from "../src/types";
 
 // Frame encoder (copied from aws-eventstream.test.ts for use in fixtures)
 function encodeStringHeader(name: string, value: string): Uint8Array {
@@ -260,7 +260,7 @@ describe("kiro-codewhisperer wire protocol", () => {
 			apiKey: "test-token",
 		});
 
-		const events: any[] = [];
+		const events: AssistantMessageEvent[] = [];
 		for await (const event of stream) {
 			events.push(event);
 		}
@@ -321,7 +321,7 @@ describe("kiro-codewhisperer wire protocol", () => {
 			apiKey: "test-token",
 		});
 
-		const events: any[] = [];
+		const events: AssistantMessageEvent[] = [];
 		for await (const event of stream) {
 			events.push(event);
 		}
@@ -394,7 +394,7 @@ describe("kiro-codewhisperer wire protocol", () => {
 			apiKey: "test-token",
 		});
 
-		const events: any[] = [];
+		const events: AssistantMessageEvent[] = [];
 		for await (const event of stream) {
 			events.push(event);
 		}
@@ -479,7 +479,7 @@ describe("kiro-codewhisperer wire protocol", () => {
 			apiKey: "test-token",
 		});
 
-		const events: any[] = [];
+		const events: AssistantMessageEvent[] = [];
 		for await (const event of stream) {
 			events.push(event);
 		}
@@ -544,7 +544,7 @@ describe("kiro-codewhisperer wire protocol", () => {
 			apiKey: "test-token",
 		});
 
-		const events: any[] = [];
+		const events: AssistantMessageEvent[] = [];
 		try {
 			for await (const event of stream) {
 				events.push(event);

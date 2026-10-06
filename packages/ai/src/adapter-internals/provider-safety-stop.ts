@@ -4,6 +4,8 @@ import type { Api, AssistantMessage, Model } from "../types";
 const PROVIDER_SAFETY_STOP_ADAPTER_BRAND = Symbol("provider-safety-stop-adapter-brand");
 const PROVIDER_SAFETY_STOP_INVOCATION_BRAND = Symbol("provider-safety-stop-invocation-brand");
 const PROVIDER_SAFETY_STOP_INVOCATION_KEY = Symbol("provider-safety-stop-invocation");
+const PROVIDER_SAFETY_STOP_MODEL_IDENTITY_KEY = Symbol("provider-safety-stop-model-identity");
+const PROVIDER_SAFETY_STOP_WIRE_MODEL_ID_KEY = Symbol("provider-safety-stop-wire-model-id");
 
 interface ModelIdentitySnapshot {
 	api?: string;
@@ -166,8 +168,8 @@ export function registerTrustedModelCloneInternal(
 	return result;
 }
 
-/** Verify that a model is the unchanged identity of a bundled catalog entry. */
-export function isProviderSafetyStopModelTrusted(model: unknown): boolean {
+/** Verify that a model is the unchanged identity of a bundled catalog entry. Returns the frozen snapshot if trusted, false otherwise. */
+export function isProviderSafetyStopModelTrusted(model: unknown): ModelIdentitySnapshot | false {
 	if (typeof model !== "object" || model === null) return false;
 	const snapshot = trustedProviderSafetyStopModels.get(model);
 	if (!snapshot) return false;
@@ -178,12 +180,15 @@ export function isProviderSafetyStopModelTrusted(model: unknown): boolean {
 	const modelId = (model as { id?: string }).id;
 	const modelBaseUrl = (model as { baseUrl?: string }).baseUrl;
 
-	return (
+	if (
 		modelApi === snapshot.api &&
 		modelProvider === snapshot.provider &&
 		modelId === snapshot.id &&
 		modelBaseUrl === snapshot.baseUrl
-	);
+	) {
+		return Object.freeze({ ...snapshot });
+	}
+	return false;
 }
 
 export type ProviderSafetyStopAdapterCapability = {
@@ -262,6 +267,42 @@ export function copyProviderSafetyStopAdapterInvocation<T extends object>(source
 	return isProviderSafetyStopAdapterInvocation(source)
 		? ({ ...destination, [PROVIDER_SAFETY_STOP_INVOCATION_KEY]: PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION } as T)
 		: destination;
+}
+
+/** Attach the validated model identity snapshot to options to prevent TOCTOU on getters. */
+export function attachProviderSafetyStopModelIdentity<T extends object>(
+	options: T,
+	snapshot: ModelIdentitySnapshot,
+	wireModelId?: string,
+): T {
+	if (!snapshot) return options;
+	return {
+		...options,
+		[PROVIDER_SAFETY_STOP_MODEL_IDENTITY_KEY]: snapshot,
+		[PROVIDER_SAFETY_STOP_WIRE_MODEL_ID_KEY]: wireModelId,
+	} as T;
+}
+
+/** Retrieve the validated model identity snapshot from options, or null if not attached. */
+export function getProviderSafetyStopModelIdentity(options: unknown): ModelIdentitySnapshot | null {
+	if (!options || typeof options !== "object") return null;
+	try {
+		const snapshot = Reflect.get(options, PROVIDER_SAFETY_STOP_MODEL_IDENTITY_KEY);
+		return snapshot && typeof snapshot === "object" ? (snapshot as ModelIdentitySnapshot) : null;
+	} catch {
+		return null;
+	}
+}
+
+/** Retrieve the wireModelId from options, or undefined if not attached. */
+export function getProviderSafetyStopWireModelId(options: unknown): string | undefined {
+	if (!options || typeof options !== "object") return undefined;
+	try {
+		const wireModelId = Reflect.get(options, PROVIDER_SAFETY_STOP_WIRE_MODEL_ID_KEY);
+		return typeof wireModelId === "string" ? wireModelId : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 const authenticatedProviderSafetyStops = new WeakSet<object>();
