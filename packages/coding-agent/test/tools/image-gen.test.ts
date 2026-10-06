@@ -243,7 +243,7 @@ describe("imageGenTool", () => {
 		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
 
 		const originatorRegex = new RegExp(
-			`^${OPENAI_HEADER_VALUES.ORIGINATOR_CODEX}/[^\s]+ \\(linux 4\\.4\\.302-Minimal-EAS-QTI_Haptic-R26; arm64\\)$`,
+			`^${OPENAI_HEADER_VALUES.ORIGINATOR_CODEX}/[^\\s]+ \\(linux 4\\.4\\.302-Minimal-EAS-QTI_Haptic-R26; arm64\\)$`,
 		);
 		expect(userAgent).toMatch(originatorRegex);
 		expect(userAgent).toMatch(/^[\x20-\x7e]+$/);
