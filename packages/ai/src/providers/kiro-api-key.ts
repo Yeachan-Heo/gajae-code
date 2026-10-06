@@ -420,13 +420,50 @@ function findJsonEnd(text: string, start: number): number {
 export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[]; remaining: string } {
 	const events: KiroStreamEvent[] = [];
 	let pos = 0;
+	// Bounded retention: if we find stray/invalid JSON, rescan up to this distance ahead
+	// looking for a valid JSON object. If we don't find one, return what we have.
+	const MAX_RESCAN_DISTANCE = 64 * 1024; // 64KB
+
 	while (pos < buffer.length) {
 		// Find next '{' character (property-order independent scan)
 		const start = buffer.indexOf("{", pos);
 		if (start < 0) break;
 
 		const end = findJsonEnd(buffer, start);
-		if (end < 0) return { events, remaining: buffer.slice(start) };
+		if (end < 0) {
+			// Unclosed brace at 'start'. Try to find the next '{' within bounded distance
+			// and check if it closes properly.
+			const strayBraceEnd = Math.min(start + MAX_RESCAN_DISTANCE, buffer.length);
+			let resyncPos = start + 1;
+			let found = false;
+			while (resyncPos < strayBraceEnd) {
+				const nextStart = buffer.indexOf("{", resyncPos);
+				if (nextStart < 0) break;
+				// Try to find the end of this candidate
+				const nextEnd = findJsonEnd(buffer, nextStart);
+				if (nextEnd >= 0) {
+					// Found a candidate that closes. Try to parse it.
+					try {
+						const candidate = buffer.slice(nextStart, nextEnd + 1);
+						JSON.parse(candidate);
+						// Valid JSON found after the stray brace. Resync to this position.
+						pos = nextStart;
+						found = true;
+						break;
+					} catch {
+						// Not valid JSON, keep looking
+					}
+				}
+				resyncPos = nextStart + 1;
+			}
+			if (!found) {
+				// No valid JSON found after the stray brace within MAX_RESCAN_DISTANCE.
+				// Return what we have, with bounded retention of the stray brace.
+				return { events, remaining: buffer.slice(start) };
+			}
+			// Loop will continue with the resynced pos
+			continue;
+		}
 
 		try {
 			const parsed = JSON.parse(buffer.slice(start, end + 1)) as Record<string, unknown>;

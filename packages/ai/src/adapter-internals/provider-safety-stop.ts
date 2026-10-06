@@ -203,18 +203,47 @@ export const PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION = Object.freeze({
 	[PROVIDER_SAFETY_STOP_INVOCATION_BRAND]: true,
 }) as ProviderSafetyStopAdapterInvocation;
 
-function hasCallerTransport(options: object): boolean {
+/**
+ * Snapshot transport fields (fetch, client) exactly once to prevent Proxy/getter-based TOCTOU
+ * where the same property returns different values on successive reads.
+ * Returns { fetch, client, hasTransport }.
+ */
+function snapshotCallerTransport(options: object): {
+	fetch: unknown;
+	client: unknown;
+	hasTransport: boolean;
+} {
+	let fetch: unknown;
+	let client: unknown;
 	try {
-		return Reflect.get(options, "fetch") !== undefined || Reflect.get(options, "client") !== undefined;
+		fetch = Reflect.get(options, "fetch");
+		client = Reflect.get(options, "client");
 	} catch {
-		return true;
+		// If getter throws, treat as having transport (caller-provided error handling takes precedence)
+		fetch = {}; // Non-undefined to signal transport presence
 	}
+	const hasTransport = fetch !== undefined || client !== undefined;
+	return { fetch, client, hasTransport };
 }
 
 /** Attach runtime-owned adapter authority only when no caller transport seam is present. */
 export function withProviderSafetyStopAdapterInvocation<T extends object>(options: T): T {
-	if (hasCallerTransport(options)) return options;
-	return { ...options, [PROVIDER_SAFETY_STOP_INVOCATION_KEY]: PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION } as T;
+	// Snapshot transport fields exactly once to prevent Proxy getters from returning different
+	// values on successive reads (TOCTOU). After this snapshot, all authority decisions and
+	// object construction MUST use only the snapshotted values, never reading from options again.
+	const { fetch, client, hasTransport } = snapshotCallerTransport(options);
+	if (hasTransport) return options;
+
+	// No caller transport detected. Add the runtime adapter invocation marker.
+	// Always assign fetch and client from the snapshot (even if undefined) to ensure that
+	// if options is a Proxy, our snapshot values take precedence over any subsequent getter calls.
+	const result = {
+		...options,
+		fetch,
+		client,
+		[PROVIDER_SAFETY_STOP_INVOCATION_KEY]: PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
+	} as T;
+	return result;
 }
 
 export function isProviderSafetyStopAdapterInvocation(value: unknown): ProviderSafetyStopAdapterInvocation | undefined {

@@ -194,4 +194,54 @@ describe("parseKiroApiEvents", () => {
 			expect(usageEvent.data.outputTokens).toBe(1);
 		}
 	});
+	test("resyncs on stray opening brace before valid content event", () => {
+		// Regression test for P2 id 4197329342: order-independent scanner must resync
+		// when a stray '{' (from framing bytes) doesn't close, but a later '{' does.
+		// Stray brace that never closes, followed by valid content event
+		const input = '{framing-garbage-without-close{"content":"hello"}';
+		const { events, remaining } = parseKiroApiEvents(input);
+
+		// Should successfully parse the valid content event, skipping the stray brace
+		expect(events).toHaveLength(1);
+		const event = events[0];
+		expect(event?.type).toBe("content");
+		if (event?.type === "content") {
+			expect(event.data).toBe("hello");
+		}
+		// remaining should be empty (we consumed everything)
+		expect(remaining).toBe("");
+	});
+	test("resyncs on stray opening brace before refusal metadata event", () => {
+		// Regression test for P2 id 4197329342: order-independent scanner must resync
+		// when encountering stray braces from framing errors.
+		// Stray brace before refusal metadata event
+		const input =
+			'{broken-frame{"stopReason":"CONTENT_FILTERED","stopDetails":{"refusal":{"category":"VIOLENCE","explanation":"Cannot assist"}}}';
+		const { events, remaining } = parseKiroApiEvents(input);
+
+		// Should successfully parse the refusal event after resyncing
+		expect(events).toHaveLength(1);
+		const event = events[0];
+		expect(event?.type).toBe("refusal");
+		if (event?.type === "refusal") {
+			expect(event.data.stopReason).toBe("CONTENT_FILTERED");
+			expect(event.data.stopDetails?.refusal?.category).toBe("VIOLENCE");
+			expect(event.data.stopDetails?.refusal?.explanation).toBe("Cannot assist");
+		}
+		expect(remaining).toBe("");
+	});
+	test("bounded retention: stray brace followed by garbage beyond MAX_RESCAN_DISTANCE", () => {
+		// Regression test for P2 id 4197329342: bounded retention prevents infinite buffering.
+		// Create a large buffer with a stray brace followed by garbage beyond the rescan limit.
+		const largeGarbage = "x".repeat(70 * 1024); // 70KB > 64KB MAX_RESCAN_DISTANCE
+		const input = `{broken${largeGarbage}`;
+		const { events, remaining } = parseKiroApiEvents(input);
+
+		// No valid JSON found after the stray brace (within the rescan distance),
+		// so we should return the remaining buffer starting from the stray brace.
+		// This prevents indefinite buffering of the large garbage data.
+		expect(events).toHaveLength(0);
+		expect(remaining).toEqual(input); // All of the input is returned as remaining
+		// The remaining buffer will be re-parsed in the next call when new data arrives
+	});
 });

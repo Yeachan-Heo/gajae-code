@@ -5,6 +5,7 @@ import {
 	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
 	PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
 	registerProviderSafetyStopModel,
+	withProviderSafetyStopAdapterInvocation,
 } from "../src/adapter-internals/provider-safety-stop";
 import * as publicAi from "../src/index";
 import { getBundledModel } from "../src/models";
@@ -172,6 +173,87 @@ describe("provider safety-stop provenance authority", () => {
 			expect(forged.errorKind).toBeUndefined();
 			expect(isProviderSafetyStopAuthenticated(forged)).toBe(false);
 		}
+	});
+
+	test("snapshots caller transport to prevent Proxy TOCTOU on spread", () => {
+		// Regression test for P1 id 4197329335: ensure the snapshotted fetch/client values
+		// are used in the result, even if a Proxy would return different values on re-read.
+		let fetchReadCount = 0;
+		const targetOptions = { apiKey: "test-key" };
+		// Define fetch as a getter so spread will re-read it
+		Object.defineProperty(targetOptions, "fetch", {
+			get() {
+				fetchReadCount++;
+				// Return undefined on first read, function on second read
+				if (fetchReadCount === 1) return undefined;
+				return () => new Response();
+			},
+			enumerable: true,
+		});
+		Object.defineProperty(targetOptions, "client", {
+			get() {
+				return undefined;
+			},
+			enumerable: true,
+		});
+
+		// First, verify that the getter logic works as expected
+		const firstRead = Reflect.get(targetOptions, "fetch");
+		const firstReadCount = fetchReadCount;
+		const secondRead = Reflect.get(targetOptions, "fetch");
+		const secondReadCount = fetchReadCount;
+
+		// First read should return undefined, second should return function
+		expect(firstRead).toBeUndefined();
+		expect(typeof secondRead).toBe("function");
+		expect(firstReadCount).toBe(1);
+		expect(secondReadCount).toBe(2);
+
+		// Create a fresh target for the actual test with a fresh counter
+		let testFetchReadCount = 0;
+		const testTargetOptions = { apiKey: "test-key" };
+		Object.defineProperty(testTargetOptions, "fetch", {
+			get() {
+				testFetchReadCount++;
+				if (testFetchReadCount === 1) return undefined;
+				return () => new Response();
+			},
+			enumerable: true,
+		});
+		Object.defineProperty(testTargetOptions, "client", {
+			get() {
+				return undefined;
+			},
+			enumerable: true,
+		});
+
+		const result = withProviderSafetyStopAdapterInvocation(testTargetOptions as any);
+
+		// The snapshot reads fetch (read 1 = undefined).
+		// The spread operation in the object literal reads it again (read 2 = function).
+		// However, the explicit assignment `fetch` after the spread overwrites with the
+		// snapshotted value (undefined), preventing the caller-controlled function.
+		// This ensures the caller cannot inject fetch after the authority check.
+		expect(testFetchReadCount).toBe(2);
+
+		// Since the snapshotted fetch is undefined, hasTransport should be false
+		// and the adapter should add the invocation marker
+		// The result should be a different object than the target (indicating we created a new one with the marker)
+		expect(result).not.toBe(testTargetOptions);
+
+		// The result should have at least one symbol property (the invocation marker)
+		const resultSymbols = Object.getOwnPropertySymbols(result);
+		expect(resultSymbols.length).toBeGreaterThan(0);
+
+		// At least one of those symbols should have the value PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION
+		const hasMarkerWithCorrectValue = resultSymbols.some(
+			sym => Reflect.get(result, sym) === PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
+		);
+		expect(hasMarkerWithCorrectValue).toBe(true);
+
+		// Crucially, fetch should be undefined (the snapshotted value), not the function
+		// This proves the Proxy couldn't inject its function despite returning it on the second read
+		expect(result.fetch).toBeUndefined();
 	});
 
 	test("requires the runtime-owned adapter invocation token", () => {
