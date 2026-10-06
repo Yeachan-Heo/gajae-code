@@ -646,7 +646,7 @@ export class AcpSdkAdapter {
 		throw new AcpSdkAdapterError("method_not_found", `Unsupported ACP SDK method: ${method}`);
 	}
 
-	async registerProvider(provider: AcpProviderRegistration): Promise<void> {
+	async registerProvider(provider: AcpProviderRegistration, timeoutMs?: number): Promise<void> {
 		if (!this.#router)
 			throw new AcpSdkAdapterError(
 				"operation_prohibited",
@@ -665,6 +665,7 @@ export class AcpSdkAdapter {
 				...(previousLeaseId ? { expectedLeaseId: previousLeaseId } : {}),
 			},
 			true,
+			timeoutMs === undefined ? undefined : { timeoutMs },
 		);
 		const result = object(object(response)?.result) ?? object(response) ?? {};
 		if (typeof result.leaseId !== "string")
@@ -690,13 +691,16 @@ export class AcpSdkAdapter {
 			for (let attempt = 1; ; attempt++) {
 				if (attempt > PROVIDER_ACTIVATION_MAX_ATTEMPTS || Date.now() - startedAt >= PROVIDER_ACTIVATION_BUDGET_MS)
 					throw this.#providerActivationExhausted(attempt - 1, startedAt);
+				const remainingMs = PROVIDER_ACTIVATION_BUDGET_MS - (Date.now() - startedAt);
 				const attachment = this.#attachment;
 				const connectionId = attachment?.connectionId;
 				try {
 					for (const provider of this.#providers) {
 						try {
-							await this.registerProvider(provider);
+							await this.registerProvider(provider, Math.max(1, remainingMs));
 						} catch (error) {
+							if (Date.now() - startedAt >= PROVIDER_ACTIVATION_BUDGET_MS)
+								throw this.#providerActivationExhausted(attempt, startedAt);
 							if (providerErrorCode(error) === "provider_lease_conflict") {
 								this.#leases.delete(provider.capability);
 								this.#abortReverseForCapability(provider.capability);

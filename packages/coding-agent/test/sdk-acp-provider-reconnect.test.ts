@@ -21,6 +21,7 @@ test("ACP provider activation retries the current Router attachment after rotati
 		frame: Record<string, unknown>;
 		generation: number | undefined;
 		attachment: SessionAttachment | undefined;
+		options: Record<string, unknown> | undefined;
 	}> = [];
 	const router = {
 		request: async (
@@ -28,8 +29,9 @@ test("ACP provider activation retries the current Router attachment after rotati
 			frame: Record<string, unknown>,
 			generation?: number,
 			attachment?: SessionAttachment,
+			options?: Record<string, unknown>,
 		) => {
-			registrations.push({ frame, generation, attachment });
+			registrations.push({ frame, generation, attachment, options });
 			if (registrations.length === 1) return await firstRegistration.promise;
 			return {
 				ok: true,
@@ -62,6 +64,7 @@ test("ACP provider activation retries the current Router attachment after rotati
 		await start;
 		await waitFor(() => registrations.length === 2, "provider registration on rotated attachment");
 		expect(registrations[0]).toMatchObject({ generation: 1, attachment: firstAttachment });
+		expect(registrations[0]?.options?.timeoutMs).toBeGreaterThan(0);
 		expect(registrations[1]).toMatchObject({
 			generation: 2,
 			attachment: secondAttachment,
