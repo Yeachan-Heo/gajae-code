@@ -279,7 +279,7 @@ describe("exact managed artifact cleanup", () => {
 			expect(() => stagingStore.assertBound()).toThrow();
 			expect(fs.readFileSync(replacementPayload, "utf8")).toBe("foreign replacement root");
 			expect(fs.readFileSync(path.join(displacedRoot, "2.bash.log"), "utf8")).toBe("owned staged artifact");
-			expect(fs.existsSync(path.join(fixture.root, "0.bash.log"))).toBe(false);
+			expect(fs.existsSync(path.join(fixture.root, "2.bash.log"))).toBe(false);
 			expect(await fixture.manager.save("rollback reused the available ID", "bash")).toBe("0");
 		} finally {
 			captureSpy.mockRestore();
