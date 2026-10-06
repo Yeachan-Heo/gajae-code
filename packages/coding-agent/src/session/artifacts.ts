@@ -325,26 +325,16 @@ export class ArtifactManager {
 	 * Best-effort removal of a previously published named artifact. Used to roll
 	 * back staged publications when a transactional operation (e.g. gated
 	 * maintenance pruning) is rejected after publication succeeded. Returns false
-	 * when the artifact could not be removed so callers can log the failure
-	 * instead of silently treating the rollback as complete.
+	 * when the exact named artifact is absent or could not be removed; success does
+	 * not claim that unrelated native cleanup residue was reclaimed.
 	 */
 	async removeNamedBestEffort(filename: string): Promise<boolean> {
 		if (!/^[a-zA-Z0-9_.-]+$/.test(filename)) return false;
 		try {
 			if (this.#store) {
-				const beforePaths = new Set(await fs.readdir(this.#store.dir));
 				const staged = this.#store.readExpected(filename);
-				if (staged) this.#store.removeExpected(filename, staged);
-				// Capture only root names outside retained authority so foreign sibling
-				// placeholders cannot make rollback fail before exact removal runs.
-				for (const basename of await fs.readdir(this.#store.dir)) {
-					const nativeResidue = /^\.gjc-/u.test(basename);
-					const ownQuarantine = basename === `${filename}.removing` || basename.startsWith(`${filename}.`);
-					if (beforePaths.has(basename) || (!nativeResidue && !ownQuarantine)) continue;
-					const residuePath = path.join(this.#store.dir, basename);
-					const stat = await fs.lstat(residuePath);
-					await fs.rm(residuePath, { recursive: stat.isDirectory(), force: true });
-				}
+				if (!staged) return false;
+				this.#store.removeExpected(filename, staged);
 			} else {
 				await fs.unlink(path.join(this.#dir, filename));
 			}
@@ -566,64 +556,34 @@ export class ArtifactManager {
 
 	async discardAttemptStaging(): Promise<void> {
 		if (this.#store) {
-			const cleanupStore = this.#stagingParentStore ?? this.#store;
-			const cleanupPath = this.#stagingParentStore ? this.#stagingRelativePath! : "";
-			const parentCleanupPath = cleanupPath ? path.posix.dirname(cleanupPath) : "";
-			let parentBefore: ReturnType<ManagedSessionDescendantStore["captureTree"]> | undefined;
-			if (this.#stagingParentStore) {
-				try {
-					parentBefore = cleanupStore.captureTree(parentCleanupPath);
-				} catch {
-					parentBefore = undefined;
-				}
-			}
+			// Only an attempt manager owns a managed subtree that it may retire. A
+			// normal manager's store is borrowed by this cleanup method and its root
+			// must never become a deletion target.
+			if (!this.#stagingParentStore || !this.#stagingRelativePath) return;
+			const cleanupStore = this.#stagingParentStore;
 			try {
-				const snapshot = cleanupStore.captureTree(cleanupPath);
-				cleanupStore.removeTreeExpected(cleanupPath, snapshot);
+				const snapshot = cleanupStore.captureTree(this.#stagingRelativePath);
+				const issuedRoot = this.#store.subtreeRootAuthority;
+				if (
+					issuedRoot.canonicalPath !== path.resolve(this.#dir) ||
+					snapshot.rootDev !== issuedRoot.dev.toString() ||
+					snapshot.rootIno !== issuedRoot.ino.toString()
+				)
+					throw new Error("artifact_staging_root_changed");
+				// Stop using and release this attempt's retained writable root before
+				// asking the parent authority to retire the tree. The exact tree snapshot
+				// above is still checked by native removal; a concurrent change therefore
+				// remains a refusal rather than being adopted. Never close the borrowed
+				// parent store.
+				this.#store.close();
+				cleanupStore.removeTreeExpected(this.#stagingRelativePath, snapshot);
 			} catch (error) {
-				if (!(error instanceof Error && (error.message === "not_found" || error.message === "cleanup_pending")))
-					throw error;
+				if (!(error instanceof Error && error.message === "not_found")) throw error;
+			} finally {
+				// Replacement, snapshot, and native cleanup failures also release only
+				// the capability owned by this attempt manager.
+				this.#store.close();
 			}
-			if (this.#stagingParentStore && parentBefore) {
-				try {
-					const after = cleanupStore.captureTree(parentCleanupPath);
-					const beforePaths = new Set(parentBefore.entries.map(entry => entry.relativePath));
-					for (const entry of after.entries) {
-						if (
-							entry.kind === "directory" &&
-							entry.relativePath.length > 0 &&
-							!beforePaths.has(entry.relativePath) &&
-							/\.removing$/u.test(path.posix.basename(entry.relativePath))
-						) {
-							await fs.rm(path.join(cleanupStore.dir, parentCleanupPath, entry.relativePath), {
-								recursive: true,
-								force: true,
-							});
-							continue;
-						}
-						if (
-							entry.kind !== "file" ||
-							beforePaths.has(entry.relativePath) ||
-							!/^\\.gjc-(?:exact-unlink-placeholder|remove)-/u.test(path.posix.basename(entry.relativePath))
-						)
-							continue;
-						const relative = path.posix.join(parentCleanupPath, entry.relativePath);
-						const expected = cleanupStore.readExpected(relative);
-						if (expected) {
-							try {
-								cleanupStore.removeExpected(relative, expected);
-							} catch (cleanupError) {
-								if (!(cleanupError instanceof Error && cleanupError.message === "cleanup_pending"))
-									throw cleanupError;
-							}
-						}
-						await fs.rm(path.join(cleanupStore.dir, relative), { force: true }).catch(() => undefined);
-					}
-				} catch {
-					// Retained cleanup evidence is safe to leave for a later maintenance pass.
-				}
-			}
-			this.#store.close();
 		} else {
 			await fs.rm(this.#dir, { recursive: true, force: true });
 		}
