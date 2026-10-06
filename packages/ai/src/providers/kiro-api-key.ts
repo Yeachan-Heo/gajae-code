@@ -30,6 +30,9 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 import { withHttpStatus } from "../utils/http-inspector";
 import type { KiroCodeWhispererOptions } from "./kiro-codewhisperer";
 
+// Capture fetch at module load to prevent trust bypass via globalThis.fetch replacement
+const capturedFetch = globalThis.fetch;
+
 const DEFAULT_REGION = "us-east-1";
 const KIRO_ORIGIN = "AI_EDITOR";
 const LIST_TARGET = "AmazonCodeWhispererService.ListAvailableModels";
@@ -326,7 +329,7 @@ export async function fetchKiroApiModels(
 ): Promise<Model<"kiro-codewhisperer-stream">[]> {
 	const resolvedRegion = region ?? kiroApiRegion();
 	const baseUrl = kiroApiBaseUrl(resolvedRegion);
-	const response = await fetch(baseUrl, {
+	const response = await capturedFetch(baseUrl, {
 		method: "POST",
 		headers: kiroApiHeaders(apiKey, LIST_TARGET),
 		body: JSON.stringify({ origin: KIRO_ORIGIN }),
@@ -707,7 +710,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				request = replacementPayload;
 			}
 
-			const response = await fetch(endpoint, {
+			const response = await capturedFetch(endpoint, {
 				method: "POST",
 				headers: { ...kiroApiHeaders(apiKey, CHAT_TARGET), ...(options.headers ?? {}) },
 				body: JSON.stringify(request),

@@ -37,6 +37,9 @@ import { captureUnicodeEscapeEvidence } from "../utils/json-parse";
 import { decodeEventStream } from "./aws-eventstream";
 import { isKiroApiKey, sanitizeKiroError, streamKiroApiKey, toKiroModelId } from "./kiro-api-key";
 
+// Capture fetch at module load to prevent trust bypass via globalThis.fetch replacement
+const capturedFetch = globalThis.fetch;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Provider options
 // ─────────────────────────────────────────────────────────────────────────────
@@ -328,7 +331,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 				});
 			}
 
-			const response = await fetch(url, {
+			const response = await capturedFetch(url, {
 				method: "POST",
 				headers: headersList,
 				body,
