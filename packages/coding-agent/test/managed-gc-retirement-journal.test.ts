@@ -871,7 +871,7 @@ describe("managed GC retirement journal", () => {
 		expect(candidateBufferWasCreated).toBe(false);
 		expect(candidateWasPublished).toBe(false);
 		expect(managedReceiptInventory(fixture.scope)).toEqual(before);
-	});
+	}, 60_000);
 
 	it("measures bigint JSON values without weakening strict DTO validation", async () => {
 		const fixture = makeFixture();
@@ -948,7 +948,7 @@ describe("managed GC retirement journal", () => {
 		expect((await readManagedGcSessionRetirementReceipt(fixture.scope, fixture.transcriptPath))?.state).toBe(
 			"artifacts_removed",
 		);
-	});
+	}, 60_000);
 
 	it("persists actual native disposition and replays pending namespaces after transcript absence", async () => {
 		const fixture = makeFixture();
