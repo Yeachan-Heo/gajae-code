@@ -1,3 +1,3 @@
 ### Fixed
-- Bound committed GC retirement history in existing readers, publishers, discovery, and protocol inspection before retaining inventory or allocating oversized receipts; reject projected per-target capacity before publication and noncontiguous or expanding continuations without granting broader deletion authority.
+- Bound committed GC retirement history with a 50,000-entry receipt-directory limit shared across each scope and per-transcript limits of 50,000 state files and 512 MiB stored bytes (64 MiB per receipt); serialize cross-transcript appends under a scope-wide lease and reject projected capacity before candidate serialization, allocation, or publication while retaining continuation and authority checks.
 - Revalidate every originally processed scope's receipt inventory or absence before discovery returns, refusing late journals and populated scopes without adopting new authority.
