@@ -81,6 +81,79 @@ describe("AsyncJobManager", () => {
 		}
 	});
 
+	test("waitForAll and dispose retain an evicted cancelled runner until physical unwind", async () => {
+		const gate = Promise.withResolvers<string>();
+		let evictions = 0;
+		let waitForAllSettled = false;
+		const manager = new AsyncJobManager({ onJobComplete: async () => {}, retentionMs: 0 });
+		const jobId = manager.register("task", "evicted held runner", () => gate.promise, {
+			lifecycle: {
+				onEvict: () => {
+					evictions += 1;
+				},
+			},
+		});
+		const job = manager.getJob(jobId);
+		if (!job) throw new Error("Job was not registered");
+		manager.cancelAll();
+		expect(manager.getJob(jobId)).toBeUndefined();
+		expect(evictions).toBe(0);
+
+		const waiting = manager.waitForAll().then(() => {
+			waitForAllSettled = true;
+		});
+		await Bun.sleep(10);
+		expect(waitForAllSettled).toBe(false);
+		expect(await manager.dispose({ timeoutMs: 10 })).toBe(false);
+		expect(manager.getLastDisposeDiagnostics()).toMatchObject({ stuckJobIds: [jobId], deliveriesDrained: false });
+		expect(evictions).toBe(0);
+
+		gate.resolve("late result");
+		await Promise.all([job.promise, waiting, manager.awaitRetainedDisposalCompletion()]);
+		expect(waitForAllSettled).toBe(true);
+		expect(evictions).toBe(1);
+	});
+
+	test("physical eviction cleanup runs exactly once for success, rejection, cancellation, and failNow", async () => {
+		for (const mode of ["success", "rejection", "cancellation", "failNow"] as const) {
+			const gate = Promise.withResolvers<void>();
+			let evictions = 0;
+			const manager = new AsyncJobManager({ onJobComplete: async () => {}, retentionMs: 0 });
+			const jobId = manager.register(
+				"task",
+				`${mode} held runner`,
+				async () => {
+					await gate.promise;
+					if (mode === "rejection") throw new Error("runner rejected");
+					return "runner completed";
+				},
+				{
+					lifecycle: {
+						onEvict: () => {
+							evictions += 1;
+						},
+					},
+				},
+			);
+			const job = manager.getJob(jobId);
+			if (!job) throw new Error(`${mode} job was not registered`);
+			if (mode === "cancellation") manager.cancelAll();
+			if (mode === "failNow") {
+				if (!manager.failNow(jobId, job.generation, "forced failure")) {
+					throw new Error("failNow did not settle the running job");
+				}
+			}
+			if (mode === "cancellation" || mode === "failNow") expect(manager.getJob(jobId)).toBeUndefined();
+			expect(evictions).toBe(0);
+
+			gate.resolve();
+			await job.promise;
+			expect(evictions).toBe(1);
+			await manager.dispose({ timeoutMs: 100 });
+			expect(evictions).toBe(1);
+		}
+	});
+
 	test("forwards progress updates and delivers completion", async () => {
 		const progressEvents: Array<{ text: string; details?: Record<string, unknown> }> = [];
 		const completions: Array<{ jobId: string; text: string }> = [];
@@ -771,7 +844,7 @@ describe("AsyncJobManager", () => {
 		}
 	});
 
-	test("purgeMonitorTombstone after eviction returns found and runs purge once", async () => {
+	test("purgeMonitorTombstone after eviction does not rerun eviction cleanup", async () => {
 		let evictCount = 0;
 		const manager = new AsyncJobManager({ retentionMs: 0, onJobComplete: async () => {} });
 		const jobId = manager.register("bash", "monitor", async () => "done", {
@@ -787,9 +860,9 @@ describe("AsyncJobManager", () => {
 		await manager.waitForAll();
 		expect(evictCount).toBe(1);
 		expect(manager.purgeMonitorTombstone(jobId, { ownerId: "0-Test" })).toEqual({ found: true, status: "completed" });
-		expect(evictCount).toBe(2);
+		expect(evictCount).toBe(1);
 		expect(manager.purgeMonitorTombstone(jobId, { ownerId: "0-Test" })).toEqual({ found: false });
-		expect(evictCount).toBe(2);
+		expect(evictCount).toBe(1);
 	});
 
 	test("tombstone purge uses the dedicated onTombstonePurge hook, not the evict phase", async () => {
@@ -845,7 +918,47 @@ describe("AsyncJobManager", () => {
 
 		expect(phases.filter(p => p === "cancel")).toHaveLength(1);
 		expect(phases.filter(p => p === "terminal")).toHaveLength(1);
-		expect(phases.filter(p => p === "evict")).toHaveLength(2);
+		expect(phases.filter(p => p === "evict")).toHaveLength(1);
+	});
+
+	test("held monitor eviction defers onEvict across tombstone purge and disposal", async () => {
+		for (const mode of ["public-purge", "dispose"] as const) {
+			const gate = Promise.withResolvers<string>();
+			let evictCount = 0;
+			let tombstonePurgeCount = 0;
+			const manager = new AsyncJobManager({ retentionMs: 0, onJobComplete: async () => {} });
+			const jobId = manager.register("bash", `held monitor ${mode}`, () => gate.promise, {
+				metadata: { monitor: true },
+				lifecycle: {
+					onEvict: () => {
+						evictCount += 1;
+					},
+					onTombstonePurge: () => {
+						tombstonePurgeCount += 1;
+					},
+				},
+			});
+			manager.cancelAll();
+			expect(manager.getJob(jobId)).toBeUndefined();
+			expect(evictCount).toBe(0);
+
+			if (mode === "public-purge") {
+				expect(manager.purgeMonitorTombstone(jobId)).toMatchObject({ found: true, status: "cancelled" });
+				expect(tombstonePurgeCount).toBe(1);
+				expect(evictCount).toBe(0);
+			} else {
+				expect(await manager.dispose({ timeoutMs: 10 })).toBe(false);
+				expect(tombstonePurgeCount).toBe(1);
+				expect(evictCount).toBe(0);
+			}
+
+			gate.resolve("late monitor result");
+			await manager.waitForAll();
+			if (mode === "dispose") await manager.awaitRetainedDisposalCompletion();
+			expect(evictCount).toBe(1);
+			expect(tombstonePurgeCount).toBe(1);
+			if (mode === "public-purge") await manager.dispose({ timeoutMs: 100 });
+		}
 	});
 
 	test("cancelling a job retires its owned registration", async () => {

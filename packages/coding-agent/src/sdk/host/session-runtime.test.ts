@@ -6,6 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Agent, type AgentOptions, markNonDispatchedToolEvent, ThinkingLevel } from "@gajae-code/agent-core";
 import { createAttemptMinter } from "@gajae-code/agent-core/attempt-scope";
+import { CompactionCancelledError } from "@gajae-code/agent-core/compaction";
 import { type AssistantMessage, getBundledModel, type Model, type UserMessage } from "@gajae-code/ai/core";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
@@ -15,6 +16,7 @@ import { AsyncJobManager } from "../../async";
 import { ModelRegistry } from "../../config/model-registry";
 import { Settings } from "../../config/settings";
 import type { ExtensionAPI, ExtensionContext, ExtensionTranscriptEntry } from "../../extensibility/extensions";
+import { ExtensionRunner } from "../../extensibility/extensions/runner";
 import { AgentSession } from "../../session/agent-session";
 import { AuthStorage } from "../../session/auth-storage";
 import { SessionManager } from "../../session/session-manager";
@@ -25,6 +27,8 @@ import {
 	unregisterOwnedRegistration,
 } from "../../session/terminal-abort";
 import { Broker } from "../broker/broker";
+import type { BrokerDiscovery } from "../broker/discovery";
+import { SessionIndex, type SessionIndexEvent } from "../broker/session-index";
 import { createKindAwareReconciliation } from "../bus/kind-aware-reconciliation";
 import { createPromptReconciliation } from "../bus/prompt-reconciliation";
 import {
@@ -37,6 +41,7 @@ import { BROKER_RUNTIME_ABORT_CAPABILITY_FIELD, setBrokerRuntimeAbortCapabilityF
 import { SESSION_HOST_OBSERVER_CAPABILITY, TURN_STREAM_CAPABILITY } from "./host";
 import { CursorRegistry, QueryHandlers, type QueryResponse, RevisionStore } from "./query";
 import {
+	type CreateSdkSessionRuntimeOptions,
 	createInvocationReconciliation,
 	createSdkSessionRuntimeExtension,
 	createSdkSurfaceFactory,
@@ -1706,7 +1711,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sendUserMessage: async () => {},
 		} as unknown as ExtensionAPI;
 		const transport = memoryTransport();
-		createSdkSessionRuntimeExtension(api, { agentDir: cwd, createTransport: async () => transport });
+		createTestRuntimeExtension(api, { agentDir: cwd, createTransport: async () => transport });
 		const listeners = new Set<(event: { jobId: string; generation: string; reason: string }) => void>();
 		const ctx = {
 			...extensionContext(transport.sessionId, cwd),
@@ -1762,7 +1767,7 @@ describe("SessionSdkSessionRuntime", () => {
 			}
 			broadcastFrame?.(frame);
 		};
-		createSdkSessionRuntimeExtension(api, { agentDir: cwd, createTransport: async () => transport });
+		createTestRuntimeExtension(api, { agentDir: cwd, createTransport: async () => transport });
 		const listeners = new Set<(event: { jobId: string; generation: string; reason: string }) => void>();
 		const ctx = {
 			...extensionContext(transport.sessionId, cwd),
@@ -1823,7 +1828,7 @@ describe("SessionSdkSessionRuntime", () => {
 		let activeHandle: string | undefined = "exact-run-handle";
 		let activeEpoch: number | undefined = 7;
 		let captureCalls = 0;
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			onSdkRequest: undefined,
@@ -2022,7 +2027,7 @@ describe("SessionSdkSessionRuntime", () => {
 		});
 		const seamCalls: Array<{ handle: string; scope: string }> = [];
 		let captureCalls = 0;
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -2119,7 +2124,7 @@ describe("SessionSdkSessionRuntime", () => {
 		// exactly the window where writeNoEffect awaits the store.
 		let promptReads = 0;
 		let captureCalls = 0;
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -2204,7 +2209,7 @@ describe("SessionSdkSessionRuntime", () => {
 		});
 		const seamCalls: string[] = [];
 		let promptReads = 0;
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -2274,7 +2279,7 @@ describe("SessionSdkSessionRuntime", () => {
 		// (review thread P1).
 		let reads = 0;
 		let captureCalls = 0;
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -2367,7 +2372,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sessionId: transport.sessionId,
 		});
 		let captureCalls = 0;
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -2434,7 +2439,7 @@ describe("SessionSdkSessionRuntime", () => {
 		const seamCalls: Array<{ handle: string; scope: string }> = [];
 		let seamCount = 0;
 		let captureCalls = 0;
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -2543,7 +2548,7 @@ describe("SessionSdkSessionRuntime", () => {
 		let activeHandle = "predecessor";
 		let abortCalls = 0;
 		const abortRelease = Promise.withResolvers<void>();
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -2631,7 +2636,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sessionFile: path.join(cwd, "session.json"),
 			sessionId: transport.sessionId,
 		});
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -2709,7 +2714,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sessionFile: path.join(cwd, "session.json"),
 			sessionId: transport.sessionId,
 		});
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -2821,7 +2826,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sessionId: transport.sessionId,
 		});
 		const seamCalls: Array<{ handle: string; scope: string }> = [];
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -2939,7 +2944,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sessionId: transport.sessionId,
 		});
 		const seamCalls: Array<{ handle: string; scope: string }> = [];
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -3044,7 +3049,7 @@ describe("SessionSdkSessionRuntime", () => {
 		});
 		const seamCalls: Array<{ handle: string; scope: string }> = [];
 		let idle = true;
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -3145,7 +3150,7 @@ describe("SessionSdkSessionRuntime", () => {
 		});
 		const seamCalls: Array<{ handle: string; scope: string }> = [];
 		let idle = true;
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -3304,7 +3309,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sessionId: transport.sessionId,
 		});
 		const seamCalls: Array<{ handle: string; scope: string }> = [];
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -3424,7 +3429,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sessionId: transport.sessionId,
 		});
 		const seamCalls: Array<{ handle: string; scope: string }> = [];
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -3486,7 +3491,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sessionFile: path.join(cwd, "session.json"),
 			sessionId: transport.sessionId,
 		});
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -3577,7 +3582,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sessionFile: path.join(cwd, "session.json"),
 			sessionId: transport.sessionId,
 		});
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -3669,7 +3674,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sessionId: transport.sessionId,
 		});
 		const seamCalls: Array<{ handle: string; scope: string }> = [];
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			onFrameAdmitted: admissions.onFrameAdmitted,
@@ -3760,7 +3765,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sessionId: transport.sessionId,
 		});
 		const seamCalls: Array<{ handle: string; scope: string }> = [];
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -3856,7 +3861,7 @@ describe("SessionSdkSessionRuntime", () => {
 			};
 			registerOwnedRegistration(registration as never, { isJobTerminal: () => false });
 			const seamCalls: Array<{ handle: string; scope: string }> = [];
-			createSdkSessionRuntimeExtension(api, {
+			createTestRuntimeExtension(api, {
 				agentDir: cwd,
 				createTransport: async () => transport,
 				terminalAbortSeams: {
@@ -3931,7 +3936,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sessionFile: path.join(cwd, "session.json"),
 			sessionId: transport.sessionId,
 		});
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			onFrameAdmitted: admissions.onFrameAdmitted,
@@ -3992,7 +3997,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sessionFile: path.join(cwd, "session.json"),
 			sessionId: transport.sessionId,
 		});
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			onFrameAdmitted: admissions.onFrameAdmitted,
@@ -4082,7 +4087,7 @@ describe("SessionSdkSessionRuntime", () => {
 			},
 		} as unknown as ExtensionAPI;
 		const transports: Array<{ starts: number; stops: number }> = [];
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: path.join(cwd, ".gjc", "agent"),
 			createTransport: async ({ sessionId, stateRoot, token }) => {
 				const stats = { starts: 0, stops: 0 };
@@ -4153,8 +4158,12 @@ describe("SessionSdkSessionRuntime", () => {
 		} as any;
 		const sessionId = "broker-recovery";
 		const endpointUrl = "ws://127.0.0.1:1";
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir,
+			ensureBrokerImpl: async () => {
+				if (!broker) throw Object.assign(new Error("injected unavailable broker"), { code: "acquire_timeout" });
+				return testBrokerDiscovery;
+			},
 			createTransport: async ({ stateRoot, token }) => ({
 				sessionId,
 				stateRoot,
@@ -4179,13 +4188,19 @@ describe("SessionSdkSessionRuntime", () => {
 			await chmod(agentDir, 0o700);
 			broker = new Broker({ agentDir });
 			await broker.start();
+			// Optional registration now completes independently of the event handler.
+			const deadline = Date.now() + 15_000;
 			await handlers.get("turn_start")?.({}, context);
-			expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 })).toMatchObject(
-				{
-					ok: true,
-					result: { sessionId, token: expect.any(String) },
-				},
-			);
+			let endpoint = await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 });
+			while (!endpoint.ok && Date.now() < deadline) {
+				await Bun.sleep(20);
+				await handlers.get("turn_start")?.({}, context);
+				endpoint = await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 });
+			}
+			expect(endpoint).toMatchObject({
+				ok: true,
+				result: { sessionId, token: expect.any(String) },
+			});
 			await handlers.get("session_shutdown")?.({}, context);
 			// DR-1 keeps the unregistered row listed, so the two refusals stay distinct:
 			// a matching generation on a terminal row is terminally gone (no endpoint will
@@ -4209,6 +4224,185 @@ describe("SessionSdkSessionRuntime", () => {
 		}
 	});
 
+	test("optional blocked broker registration leaves startup and turns responsive and fences shutdown", async () => {
+		const gate = Promise.withResolvers<BrokerDiscovery>();
+		let attempts = 0;
+		const harness = await brokerRegistrationHarness({
+			ensureBrokerImpl: () => {
+				attempts += 1;
+				return gate.promise;
+			},
+		});
+		const publication = spyOn(SessionSdkSessionRuntime.prototype, "registerWithBroker");
+		try {
+			await harness.emit("session_start");
+			await Promise.all([harness.emit("turn_start"), harness.emit("turn_start")]);
+			expect(attempts).toBe(1);
+			expect(harness.turnStarts()).toBe(2);
+			// Recovery arms only once the startup attempt settles.
+			expect(harness.recoveryActive()).toBe(false);
+			await harness.emit("session_shutdown");
+			expect(harness.stops()).toBe(1);
+			gate.resolve(testBrokerDiscovery);
+			await Bun.sleep(0);
+			await harness.emit("turn_start");
+			expect(attempts).toBe(1);
+			expect(publication).not.toHaveBeenCalled();
+			// An attempt that settles after shutdown must not arm recovery either.
+			expect(harness.recoveryActive()).toBe(false);
+		} finally {
+			gate.resolve(testBrokerDiscovery);
+			await harness.dispose();
+			publication.mockRestore();
+		}
+	});
+
+	test("optional rejected broker registration reports diagnostics and retries without blocking turns", async () => {
+		const first = Promise.withResolvers<BrokerDiscovery>();
+		const retry = Promise.withResolvers<BrokerDiscovery>();
+		let attempts = 0;
+		const warning = spyOn(logger, "warn").mockImplementation(() => {});
+		const harness = await brokerRegistrationHarness({
+			ensureBrokerImpl: () => (++attempts === 1 ? first.promise : retry.promise),
+		});
+		try {
+			await harness.emit("session_start");
+			first.reject(Object.assign(new Error("injected broker contention"), { code: "acquire_timeout" }));
+			await Bun.sleep(0);
+			expect(warning).toHaveBeenCalledWith("sdk broker registration unavailable", { code: "acquire_timeout" });
+			// The settled startup attempt armed recovery, and its failure holds the next tick.
+			expect(harness.recoveryActive()).toBe(true);
+			harness.recover();
+			await harness.emit("turn_start");
+			harness.recover();
+			expect(attempts).toBe(2);
+			expect(harness.turnStarts()).toBe(1);
+			expect(harness.stops()).toBe(0);
+			retry.reject(Object.assign(new Error("injected retry failure"), { code: "acquire_timeout" }));
+			await Bun.sleep(0);
+			expect(
+				warning.mock.calls.filter(([message]) => message === "sdk broker registration unavailable"),
+			).toHaveLength(2);
+		} finally {
+			first.resolve(testBrokerDiscovery);
+			retry.resolve(testBrokerDiscovery);
+			await harness.dispose();
+			warning.mockRestore();
+		}
+	});
+
+	test("optional broker publication completing after shutdown is unregistered with its ownership proof", async () => {
+		const published = Promise.withResolvers<SessionIndexEvent>();
+		const release = Promise.withResolvers<void>();
+		const unregistered = Promise.withResolvers<void>();
+		const append = SessionIndex.prototype.append;
+		const unregister = SessionIndex.prototype.unregisterIfCurrent;
+		const publication = spyOn(SessionIndex.prototype, "append").mockImplementation(async function (
+			this: SessionIndex,
+			input,
+		) {
+			const event = await append.call(this, input);
+			if (input.type === "host_registered") {
+				published.resolve(event);
+				await release.promise;
+			}
+			return event;
+		});
+		const cleanup = spyOn(SessionIndex.prototype, "unregisterIfCurrent").mockImplementation(async function (
+			this: SessionIndex,
+			...args
+		) {
+			const result = await unregister.apply(this, args);
+			unregistered.resolve();
+			return result;
+		});
+		const harness = await brokerRegistrationHarness({ ensureBrokerImpl: async () => testBrokerDiscovery });
+		try {
+			await harness.emit("session_start");
+			const ownership = await published.promise;
+			await harness.emit("session_shutdown");
+			expect(cleanup).not.toHaveBeenCalled();
+			release.resolve();
+			await unregistered.promise;
+			expect(cleanup).toHaveBeenCalledWith(ownership);
+			expect(harness.recoveryActive()).toBe(false);
+		} finally {
+			release.resolve();
+			await harness.dispose();
+			publication.mockRestore();
+			cleanup.mockRestore();
+		}
+	});
+
+	for (const outcome of ["success", "failure"] as const) {
+		test(`required broker registration blocks startup and turns until ${outcome}`, async () => {
+			const gate = Promise.withResolvers<BrokerDiscovery>();
+			const entered = Promise.withResolvers<void>();
+			let attempts = 0;
+			const harness = await brokerRegistrationHarness({
+				brokerRegistrationRequired: true,
+				lifecycleRequestId: "required-registration-marker",
+				ensureBrokerImpl: () => {
+					attempts += 1;
+					entered.resolve();
+					return gate.promise;
+				},
+			});
+			let startupSettled = false;
+			let turnSettled = false;
+			const startup = harness.emit("session_start").then(
+				() => {
+					startupSettled = true;
+					return undefined;
+				},
+				error => {
+					startupSettled = true;
+					return error;
+				},
+			);
+			await entered.promise;
+			const turn = harness.emit("turn_start").then(
+				() => {
+					turnSettled = true;
+					return undefined;
+				},
+				error => {
+					turnSettled = true;
+					return error;
+				},
+			);
+			try {
+				await Bun.sleep(0);
+				expect(startupSettled).toBe(false);
+				expect(turnSettled).toBe(false);
+				expect(harness.turnStarts()).toBe(0);
+				expect(attempts).toBe(1);
+				expect(harness.recoveryActive()).toBe(false);
+				if (outcome === "failure") {
+					const error = Object.assign(new Error("required broker unavailable"), { code: "acquire_timeout" });
+					gate.reject(error);
+					expect(await startup).toBe(error);
+					expect(await turn).toBe(error);
+					expect(harness.stops()).toBe(1);
+					expect(harness.turnStarts()).toBe(0);
+					expect(harness.recoveryActive()).toBe(false);
+				} else {
+					gate.resolve(testBrokerDiscovery);
+					expect(await startup).toBeUndefined();
+					expect(await turn).toBeUndefined();
+					expect(harness.turnStarts()).toBe(1);
+					expect(harness.recoveryActive()).toBe(true);
+					await harness.emit("turn_start");
+					expect(attempts).toBe(1);
+				}
+			} finally {
+				gate.resolve(testBrokerDiscovery);
+				await Promise.all([startup, turn]);
+				await harness.dispose();
+			}
+		});
+	}
+
 	test("rejects lifecycle-required SDK-only startup when broker registration fails", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-broker-required-"));
 		const agentDir = path.join(cwd, ".gjc", "agent");
@@ -4220,7 +4414,7 @@ describe("SessionSdkSessionRuntime", () => {
 				handlers.set(event, handler);
 			},
 		} as any;
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir,
 			brokerRegistrationRequired: true,
 			lifecycleRequestId: "broker-required-marker",
@@ -4243,6 +4437,105 @@ describe("SessionSdkSessionRuntime", () => {
 		}
 	});
 });
+
+// Production discovery deliberately launches a daemon that outlives its caller.
+// Unit fixtures must never launch it: shutting down a host does not own that daemon.
+function createTestRuntimeExtension(api: ExtensionAPI, options: CreateSdkSessionRuntimeOptions): void {
+	createSdkSessionRuntimeExtension(api, {
+		...options,
+		ensureBrokerImpl: options.ensureBrokerImpl ?? (async () => testBrokerDiscovery),
+	});
+}
+
+const testBrokerDiscovery: BrokerDiscovery = {
+	version: 1,
+	protocolVersion: 3,
+	packageGeneration: "test",
+	ownerId: "test-broker",
+	pid: process.pid,
+	incarnation: "test-incarnation",
+	host: "127.0.0.1",
+	port: 1,
+	url: "ws://127.0.0.1:1",
+	token: "test-token",
+	startedAt: 0,
+	heartbeatAt: 0,
+};
+
+async function brokerRegistrationHarness(
+	options: Pick<
+		CreateSdkSessionRuntimeOptions,
+		"ensureBrokerImpl" | "brokerRegistrationRequired" | "lifecycleRequestId"
+	>,
+) {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-registration-"));
+	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+	const broadcasts: SdkFrame[] = [];
+	let stops = 0;
+	let recovery: (() => void) | undefined;
+	let recoveryActive = false;
+	const timer = { unref() {} } as NodeJS.Timeout;
+	const api = {
+		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
+			handlers.set(event, handler);
+		},
+	} as unknown as ExtensionAPI;
+	createTestRuntimeExtension(api, {
+		...options,
+		agentDir: path.join(cwd, "agent"),
+		setIntervalImpl: ((callback: () => void) => {
+			recovery = callback;
+			recoveryActive = true;
+			return timer;
+		}) as typeof setInterval,
+		clearIntervalImpl: (() => {
+			recoveryActive = false;
+		}) as typeof clearInterval,
+		createTransport: async ({ sessionId, stateRoot, token }) => ({
+			sessionId,
+			stateRoot,
+			token,
+			onFrame: () => undefined,
+			sendFrame: () => {},
+			broadcastFrame: frame => {
+				broadcasts.push(frame);
+			},
+			start: async () => {
+				const url = "ws://127.0.0.1:1";
+				await Bun.write(
+					path.join(stateRoot, "sdk", `${sessionId}.json`),
+					JSON.stringify({
+						sessionId,
+						token,
+						pid: process.pid,
+						url,
+					}),
+				);
+				return { url };
+			},
+			stop: async () => {
+				stops += 1;
+			},
+		}),
+	});
+	const context = extensionContext("broker-registration", cwd);
+	const emit = async (event: string): Promise<void> => {
+		await handlers.get(event)?.({}, context);
+	};
+	return {
+		emit,
+		recover: () => recovery?.(),
+		recoveryActive: () => recoveryActive,
+		stops: () => stops,
+		turnStarts: () => broadcasts.filter(frame => frame.type === "event" && frame.kind === "turn_start").length,
+		dispose: async () => {
+			await emit("session_shutdown");
+			await Bun.sleep(0);
+			await rm(cwd, { recursive: true, force: true });
+		},
+	};
+}
+
 interface PreflightHooks {
 	onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
 	onPreflightAccepted?: () => void;
@@ -4344,7 +4637,7 @@ async function invocationHarness(
 				hooks.onDurableAttempt,
 			)
 		: undefined;
-	createSdkSessionRuntimeExtension(api, {
+	createTestRuntimeExtension(api, {
 		agentDir: cwd,
 		...(hooks.onLifecycleDrainTimeout ? { onLifecycleDrainTimeoutForTests: hooks.onLifecycleDrainTimeout } : {}),
 		...(interceptorStore || hooks.terminalAbortSeams
@@ -5145,6 +5438,7 @@ async function createTerminalizationSession(
 	cwd: string,
 	streamFn: AgentOptions["streamFn"],
 	settingsOverrides: Record<string, unknown> = {},
+	withExtensions = false,
 ): Promise<{ session: AgentSession; authStorage: AuthStorage; model: Model }> {
 	const authStorage = await AuthStorage.create(path.join(cwd, "testauth.db"));
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -5165,11 +5459,24 @@ async function createTerminalizationSession(
 		initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
 		streamFn,
 	});
+	const sessionManager = SessionManager.inMemory(cwd);
+	const modelRegistry = new ModelRegistry(authStorage);
 	const session = new AgentSession({
 		agent,
-		sessionManager: SessionManager.inMemory(cwd),
+		sessionManager,
 		settings,
-		modelRegistry: new ModelRegistry(authStorage),
+		modelRegistry,
+		extensionRunner: withExtensions
+			? new ExtensionRunner(
+					[],
+					{ flagValues: new Map(), pendingProviderRegistrations: [] } as never,
+					cwd,
+					sessionManager,
+					modelRegistry,
+					undefined,
+					settings,
+				)
+			: undefined,
 	});
 	session.setConfiguredModelChain("default", [selector(model), selector(fallback)], "test");
 	return { session, authStorage, model };
@@ -5183,6 +5490,319 @@ function deferredRealSendUserMessage(session: AgentSession) {
 		await neverSettlingPromise();
 	};
 }
+
+function realSendUserMessage(session: AgentSession) {
+	return async (content: unknown, options?: PreflightHooks & { deliverAs?: string }): Promise<void> => {
+		await options?.onPreflightAcceptCommit?.();
+		const { onPreflightAcceptCommit: _onPreflightAcceptCommit, ...dispatchOptions } = options ?? {};
+		await session.sendUserMessage(content as string, dispatchOptions as never);
+	};
+}
+
+test.each([
+	"clearContext",
+	"newSession",
+	"compact",
+] as const)("SDK %s disconnect cancels only its accepted publication owner before disposal", async operation => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), `gjc-sdk-${operation}-publication-`));
+	const entered = Promise.withResolvers<void>();
+	const freshEntered = Promise.withResolvers<void>();
+	const aborted = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	let session: AgentSession | undefined;
+	let authStorage: AuthStorage | undefined;
+	let harness: InvocationHarness | undefined;
+	let submission: Promise<void> | undefined;
+	let providerCalls = 0;
+	try {
+		const real = await createTerminalizationSession(cwd, (model, context, options) => {
+			providerCalls++;
+			if (providerCalls === 2) freshEntered.resolve();
+			if (providerCalls === 1)
+				options?.signal?.addEventListener(
+					"abort",
+					() => {
+						if (operation === "compact") session?.abortCompaction();
+						aborted.resolve();
+					},
+					{ once: true },
+				);
+			return createMockModel({
+				responses: [
+					async () => {
+						if (providerCalls === 1) {
+							entered.resolve();
+							await release.promise;
+						}
+						return { content: ["fresh independent completion"] };
+					},
+				],
+			}).stream(model, context, options);
+		});
+		session = real.session;
+		authStorage = real.authStorage;
+		const send = realSendUserMessage(session);
+		harness = await invocationHarness(`disconnect-publication-${operation}`, cwd, {
+			isIdle: () => !session?.isStreaming,
+			sendUserMessage: (content, options) => {
+				submission = send(content, options);
+				void submission.catch(() => undefined);
+				return submission;
+			},
+		});
+		session.subscribe(event => harness?.emit(event.type, event));
+		expect((await harness.control("turn.prompt", { text: "cancel this disconnected owner" })).ok).toBe(true);
+		await entered.promise;
+		const transition = operation === "compact" ? session.compact() : session[operation]();
+		void transition.catch(() => undefined);
+		await aborted.promise;
+		release.resolve();
+		if (operation === "compact") await expect(transition).rejects.toBeInstanceOf(CompactionCancelledError);
+		else expect(await transition).toBe(true);
+		if (!submission) throw new Error("Expected the accepted actual SDK submission promise.");
+		await expect(submission).rejects.toMatchObject({ code: "cancelled" });
+		const fresh = await harness.control("turn.prompt", { text: "run a fresh independent prompt" });
+		expect(fresh.ok).toBe(true);
+		await freshEntered.promise;
+		await expect(submission).resolves.toBeUndefined();
+		expect(
+			await settledStatus(harness, "turn.result", {
+				kind: "prompt",
+				commandId: fresh.result?.commandId,
+				turnId: fresh.result?.turnId,
+			}),
+		).toMatchObject({ status: "terminal_ok" });
+		expect(session.agent.state.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			content: [{ type: "text", text: "fresh independent completion" }],
+		});
+		expect(providerCalls).toBe(2);
+	} finally {
+		release.resolve();
+		await session?.dispose();
+		authStorage?.close();
+		await harness?.stop();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test("SDK disconnect preserves an already published projected terminal's actual submission", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-publishing-disconnect-"));
+	const delivered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	let session: AgentSession | undefined;
+	let authStorage: AuthStorage | undefined;
+	let harness: InvocationHarness | undefined;
+	let submission: Promise<void> | undefined;
+	let restoreEmission: (() => void) | undefined;
+	let terminalCount = 0;
+	try {
+		const real = await createTerminalizationSession(
+			cwd,
+			(model, context, options) =>
+				createMockModel({ responses: [{ content: ["projected completion"] }] }).stream(model, context, options),
+			{},
+			true,
+		);
+		session = real.session;
+		authStorage = real.authStorage;
+		const send = realSendUserMessage(session);
+		harness = await invocationHarness("publishing-disconnect", cwd, {
+			isIdle: () => !session?.isStreaming,
+			sendUserMessage: (content, options) => {
+				submission = send(content, options);
+				void submission.catch(() => undefined);
+				return submission;
+			},
+		});
+		session.subscribe(event => (event.type === "agent_end" ? undefined : harness?.emit(event.type, event)));
+		const runner = session.extensionRunner;
+		if (!runner) throw new Error("Expected the real projected terminal extension bridge.");
+		const emit = runner.emit.bind(runner);
+		const emission = spyOn(runner, "emit").mockImplementation(async event => {
+			const result = await emit(event);
+			if (event.type === "agent_end") {
+				terminalCount++;
+				await harness?.emit(event.type, event);
+				delivered.resolve();
+				await release.promise;
+			}
+			return result;
+		});
+		restoreEmission = () => emission.mockRestore();
+		const accepted = await harness.control("turn.prompt", { text: "publish then disconnect this owner" });
+		expect(accepted.ok).toBe(true);
+		await delivered.promise;
+		expect(
+			await settledStatus(harness, "turn.result", {
+				kind: "prompt",
+				commandId: accepted.result?.commandId,
+				turnId: accepted.result?.turnId,
+			}),
+		).toMatchObject({ status: "terminal_ok", content: { text: "projected completion" } });
+		const transition = session.clearContext();
+		release.resolve();
+		expect(await transition).toBe(true);
+		if (!submission) throw new Error("Expected the actual publishing SDK submission promise.");
+		await expect(submission).resolves.toBeUndefined();
+		expect(terminalCount).toBe(1);
+	} finally {
+		release.resolve();
+		restoreEmission?.();
+		await session?.dispose();
+		authStorage?.close();
+		await harness?.stop();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test("SDK disposal rejects an accepted real submission whose terminal bridge is disconnected", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-dispose-publication-"));
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	let session: AgentSession | undefined;
+	let authStorage: AuthStorage | undefined;
+	let harness: InvocationHarness | undefined;
+	let submission: Promise<void> | undefined;
+	try {
+		const real = await createTerminalizationSession(cwd, (model, context, options) =>
+			createMockModel({
+				responses: [
+					async () => {
+						entered.resolve();
+						await release.promise;
+						return { content: ["completed"] };
+					},
+				],
+			}).stream(model, context, options),
+		);
+		session = real.session;
+		authStorage = real.authStorage;
+		const send = realSendUserMessage(session);
+		harness = await invocationHarness("dispose-publication", cwd, {
+			isIdle: () => !session?.isStreaming,
+			sendUserMessage: (content, options) => {
+				submission = send(content, options);
+				void submission.catch(() => undefined);
+				return submission;
+			},
+		});
+		session.subscribe(event => harness?.emit(event.type, event));
+		expect((await harness.control("turn.prompt", { text: "dispose this accepted prompt" })).ok).toBe(true);
+		await entered.promise;
+		const disposal = session.dispose();
+		release.resolve();
+		if (!submission) throw new Error("Expected the actual accepted submission promise.");
+		await expect(submission).rejects.toMatchObject({ code: "cancelled" });
+		await disposal;
+	} finally {
+		release.resolve();
+		await session?.dispose();
+		authStorage?.close();
+		await harness?.stop();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test.each([
+	false,
+	true,
+])("SDK terminal publication rejection is observed independently of its cohort waiter (queued=%s)", async queued => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-publication-rejection-"));
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const rejected = Promise.withResolvers<void>();
+	const failure = new Error("Injected terminal extension delivery failure.");
+	const unhandled: unknown[] = [];
+	const onUnhandled = (reason: unknown) => {
+		unhandled.push(reason);
+	};
+	let session: AgentSession | undefined;
+	let authStorage: AuthStorage | undefined;
+	let harness: InvocationHarness | undefined;
+	let rootSubmission: Promise<void> | undefined;
+	let providerCalls = 0;
+	let targetToken: string | undefined;
+	let injected = false;
+	const projectedTerminals: Array<{ calls: number; token: string | undefined }> = [];
+	let restoreFault: (() => void) | undefined;
+	process.on("unhandledRejection", onUnhandled);
+	try {
+		const real = await createTerminalizationSession(
+			cwd,
+			(model, context, options) => {
+				providerCalls++;
+				return createMockModel({
+					responses: [
+						async () => {
+							if (providerCalls === 1) {
+								entered.resolve();
+								await release.promise;
+							}
+							return { content: ["completed"] };
+						},
+					],
+				}).stream(model, context, options);
+			},
+			{},
+			true,
+		);
+		session = real.session;
+		authStorage = real.authStorage;
+		const runner = session.extensionRunner;
+		if (!runner) throw new Error("Expected the actual extension runner.");
+		const emit = runner.emit.bind(runner);
+		const fault = spyOn(runner, "emit").mockImplementation(async (event, ...args) => {
+			if (event.type === "agent_end") projectedTerminals.push({ calls: providerCalls, token: event.sdkRunToken });
+			if (!injected && event.type === "agent_end" && event.sdkRunToken === targetToken) {
+				injected = true;
+				rejected.resolve();
+				throw failure;
+			}
+			return emit(event, ...args);
+		});
+		restoreFault = () => fault.mockRestore();
+		const send = realSendUserMessage(session);
+		harness = await invocationHarness("publication-rejection", cwd, {
+			isIdle: () => !session?.isStreaming,
+			sendUserMessage: (content, options) => {
+				const submission = send(content, options);
+				if (!rootSubmission) rootSubmission = submission;
+				void submission.catch(() => undefined);
+				return submission;
+			},
+		});
+		session.subscribe(event => harness?.emit(event.type, event));
+		const active = await harness.control("turn.prompt", { text: "active prompt" });
+		expect(active.ok).toBe(true);
+		await entered.promise;
+		const target = queued ? await harness.control("turn.follow_up", { text: "queued prompt" }) : active;
+		expect(target.ok).toBe(true);
+		targetToken = `${target.result?.commandId}:${target.result?.turnId}`;
+		release.resolve();
+		await rejected.promise;
+		if (!rootSubmission) throw new Error("Expected the actual root submission promise.");
+		if (queued) await rootSubmission;
+		else await expect(rootSubmission).rejects.toBe(failure);
+		await Bun.sleep(0);
+		await Bun.sleep(0);
+		expect(injected).toBe(true);
+		expect(providerCalls).toBe(queued ? 2 : 1);
+		expect(projectedTerminals).toHaveLength(queued ? 2 : 1);
+		expect(unhandled).toEqual([]);
+	} finally {
+		process.off("unhandledRejection", onUnhandled);
+		restoreFault?.();
+		release.resolve();
+		await session?.dispose().catch(error => {
+			expect(error).toBeInstanceOf(AggregateError);
+			expect((error as AggregateError).errors).toEqual([failure]);
+		});
+		authStorage?.close();
+		await harness?.stop();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
 
 test("SDK turn.steer preserves its expected run token and propagates a stale-run rejection", async () => {
 	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-turn-steer-run-token-"));
@@ -5222,6 +5842,93 @@ test("SDK turn.steer preserves its expected run token and propagates a stale-run
 });
 
 describe("post-acceptance invocation terminalization", () => {
+	test.each([
+		false,
+		true,
+	])("a returning SDK bridge waits for its real overflow continuation terminal (managed=%s)", async managed => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-overflow-returning-bridge-"));
+		let harness: InvocationHarness | undefined;
+		let session: AgentSession | undefined;
+		let authStorage: AuthStorage | undefined;
+		let submission: Promise<void> | undefined;
+		let submissionSettled = false;
+		let providerCalls = 0;
+		const recoveryEntered = Promise.withResolvers<void>();
+		const releaseRecovery = Promise.withResolvers<void>();
+		try {
+			const real = await createTerminalizationSession(cwd, (model, context, options) => {
+				providerCalls++;
+				if (providerCalls === 1) return typedContextOverflowStream(model);
+				return createMockModel({
+					responses: [
+						async () => {
+							recoveryEntered.resolve();
+							await releaseRecovery.promise;
+							return { content: ["FINAL_OVERFLOW_RECOVERY"] };
+						},
+					],
+				}).stream(model, context, options);
+			});
+			session = real.session;
+			authStorage = real.authStorage;
+			if (!managed) session.setConfiguredModelChain("default", [selector(real.model)], "returning-overflow-test");
+			const send = realSendUserMessage(session);
+			harness = await invocationHarness("overflow-returning-bridge", cwd, {
+				isIdle: () => !session?.isStreaming,
+				sendUserMessage: (content, options) => {
+					submission = send(content, options);
+					void submission.then(
+						() => {
+							submissionSettled = true;
+						},
+						() => {
+							submissionSettled = true;
+						},
+					);
+					return submission;
+				},
+			});
+			session.subscribe(event => harness?.emit(event.type, event));
+			const accepted = await harness.control("turn.prompt", { text: "finish after the context overflow" });
+			expect(accepted.ok).toBe(true);
+			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			expect(correlation.commandId).toBeDefined();
+			expect(correlation.turnId).toBeDefined();
+			await recoveryEntered.promise;
+			expect(submissionSettled).toBe(false);
+			expect(harness.broadcasts.filter(frame => frame.kind === "agent_end")).toHaveLength(0);
+			expect((await harness.query("turn.result", { kind: "prompt", ...correlation })).result).toMatchObject({
+				status: expect.stringMatching(/^(accepted|in_flight)$/),
+			});
+			releaseRecovery.resolve();
+			const terminal = await settledStatus(harness, "turn.result", { kind: "prompt", ...correlation });
+			expect(terminal).toMatchObject({
+				...correlation,
+				status: "terminal_ok",
+				content: { text: "FINAL_OVERFLOW_RECOVERY" },
+				outcome: { kind: "stopped", reason: "end_turn" },
+			});
+			expect(terminal.error).toBeUndefined();
+			if (!submission) throw new Error("Expected the actual accepted overflow submission promise.");
+			await submission;
+			expect(submissionSettled).toBe(true);
+			await session.waitForIdle();
+			const ends = harness.broadcasts.filter(frame => frame.kind === "agent_end");
+			expect(ends).toHaveLength(1);
+			expect(ends[0]).toMatchObject({
+				payload: { ...correlation, outcome: { kind: "stopped", reason: "end_turn" } },
+			});
+			expect(harness.broadcasts.filter(frame => frame.kind === "agent_start")).toHaveLength(managed ? 1 : 2);
+			expect(providerCalls).toBe(2);
+		} finally {
+			releaseRecovery.resolve();
+			await session?.dispose();
+			authStorage?.close();
+			await harness?.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("preserves prompt correlation across a real overflow retry", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-overflow-retry-correlation-"));
 		let harness: InvocationHarness | undefined;
@@ -5280,12 +5987,24 @@ describe("post-acceptance invocation terminalization", () => {
 		let session: AgentSession | undefined;
 		let authStorage: AuthStorage | undefined;
 		let providerCalls = 0;
+		const secondEntered = Promise.withResolvers<void>();
+		const releaseSecond = Promise.withResolvers<void>();
 		try {
 			const real = await createTerminalizationSession(
 				cwd,
 				async (model, context, options) => {
 					providerCalls++;
-					return createMockModel({ responses: [{ content: ["completed"] }] }).stream(model, context, options);
+					return createMockModel({
+						responses: [
+							providerCalls === 2
+								? async () => {
+										secondEntered.resolve();
+										await releaseSecond.promise;
+										return { content: ["FINAL"] };
+									}
+								: { content: ["FIRST"] },
+						],
+					}).stream(model, context, options);
 				},
 				{ "todo.enabled": true, "todo.reminders": true, "todo.reminders.max": 1 },
 			);
@@ -5297,7 +6016,7 @@ describe("post-acceptance invocation terminalization", () => {
 			]);
 			harness = await invocationHarness("todo-reminder-continuation", cwd, {
 				isIdle: () => !session?.isStreaming,
-				sendUserMessage: deferredRealSendUserMessage(session),
+				sendUserMessage: realSendUserMessage(session),
 			});
 			session.subscribe(async event => {
 				await harness?.emit(event.type, event);
@@ -5310,12 +6029,20 @@ describe("post-acceptance invocation terminalization", () => {
 			};
 			expect(correlation.commandId).toBeDefined();
 			expect(correlation.turnId).toBeDefined();
+			await secondEntered.promise;
+			expect(harness.broadcasts.filter(frame => frame.kind === "agent_end")).toHaveLength(0);
+			expect((await harness.query("turn.result", { kind: "prompt", ...correlation })).result).toMatchObject({
+				status: expect.stringMatching(/^(accepted|in_flight)$/),
+			});
+			releaseSecond.resolve();
 			const terminal = await settledStatus(harness, "turn.result", { kind: "prompt", ...correlation });
 			expect(terminal).toMatchObject({
 				status: "terminal_ok",
 				commandId: correlation.commandId,
 				turnId: correlation.turnId,
+				content: { text: "FINAL" },
 			});
+			expect(terminal.error).toBeUndefined();
 			expect(harness.broadcasts.filter(frame => frame.kind === "agent_start")).toHaveLength(2);
 			const ends = harness.broadcasts.filter(frame => frame.kind === "agent_end");
 			expect(ends).toHaveLength(1);
@@ -5327,6 +6054,7 @@ describe("post-acceptance invocation terminalization", () => {
 			});
 			expect(providerCalls).toBe(2);
 		} finally {
+			releaseSecond.resolve();
 			await session?.dispose();
 			authStorage?.close();
 			await harness?.stop();
@@ -5370,7 +6098,7 @@ describe("post-acceptance invocation terminalization", () => {
 			]);
 			harness = await invocationHarness("todo-reminder-cancel", cwd, {
 				isIdle: () => !session?.isStreaming,
-				sendUserMessage: deferredRealSendUserMessage(session),
+				sendUserMessage: realSendUserMessage(session),
 			});
 			session.subscribe(async event => {
 				await harness?.emit(event.type, event);
@@ -5411,21 +6139,22 @@ describe("post-acceptance invocation terminalization", () => {
 		try {
 			const real = await createTerminalizationSession(
 				cwd,
-				async (model, context, options) => {
+				(model, context, options) => {
 					providerCalls++;
 					if (providerCalls === 2) throw new Error("todo continuation stream failed synchronously");
 					return createMockModel({ responses: [{ content: ["started"] }] }).stream(model, context, options);
 				},
-				{ "todo.enabled": true, "todo.reminders": true, "todo.reminders.max": 1 },
+				{ "todo.enabled": true, "todo.reminders": true, "todo.reminders.max": 1, "retry.enabled": false },
 			);
 			session = real.session;
+			session.setConfiguredModelChain("default", [selector(real.model)], "terminal-throw-test");
 			authStorage = real.authStorage;
 			session.setTodoPhases([
 				{ name: "Work", tasks: [{ content: "finish the outstanding work", status: "pending" }] },
 			]);
 			harness = await invocationHarness("todo-reminder-throw", cwd, {
 				isIdle: () => !session?.isStreaming,
-				sendUserMessage: deferredRealSendUserMessage(session),
+				sendUserMessage: realSendUserMessage(session),
 			});
 			session.subscribe(async event => {
 				await harness?.emit(event.type, event);
@@ -5436,12 +6165,23 @@ describe("post-acceptance invocation terminalization", () => {
 			expect(correlation.commandId).toBeDefined();
 			expect(correlation.turnId).toBeDefined();
 			const terminal = await settledStatus(harness, "turn.result", { kind: "prompt", ...correlation });
-			expect(terminal).toMatchObject(correlation);
+			expect(terminal).toMatchObject({
+				...correlation,
+				status: "failed",
+				outcome: { kind: "failed" },
+				error: { code: "provider_rejected" },
+			});
 			expect(harness.broadcasts.filter(frame => frame.kind === "agent_start")).toHaveLength(2);
 			const ends = harness.broadcasts.filter(frame => frame.kind === "agent_end");
 			expect(ends).toHaveLength(1);
-			expect(ends[0]).toMatchObject({ payload: correlation });
+			expect(ends[0]).toMatchObject({ payload: { ...correlation, outcome: { kind: "failed" } } });
 			expect(providerCalls).toBe(2);
+			await session.waitForIdle();
+			expect((await harness.query("turn.result", { kind: "prompt", ...correlation })).result).toMatchObject({
+				...correlation,
+				status: "failed",
+				outcome: { kind: "failed" },
+			});
 		} finally {
 			await session?.dispose();
 			authStorage?.close();
@@ -7004,104 +7744,101 @@ describe("post-acceptance invocation terminalization", () => {
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
-	test("fails closed without independent terminal evidence", async () => {
-		const cases = [
-			{ name: "usage-omitted", content: [{ type: "thinking", thinking: "" }], omitUsage: true },
-			{ name: "usage-null", content: [{ type: "thinking", thinking: "" }], usage: null },
-			{ name: "primitive-usage", content: [{ type: "thinking", thinking: "" }], usage: "bad" },
-			{ name: "array-usage", content: [{ type: "thinking", thinking: "" }], usage: [] },
-			{ name: "missing-total-tokens", content: [{ type: "thinking", thinking: "" }], usage: { input: 0 } },
-			{
-				name: "undefined-total-tokens",
-				content: [{ type: "thinking", thinking: "" }],
-				usage: { totalTokens: undefined },
-			},
-			{ name: "negative-total-tokens", content: [{ type: "thinking", thinking: "" }], usage: { totalTokens: -1 } },
-			{
-				name: "nan-total-tokens",
-				content: [{ type: "thinking", thinking: "" }],
-				usage: { totalTokens: Number.NaN },
-			},
-			{
-				name: "infinite-total-tokens",
-				content: [{ type: "thinking", thinking: "" }],
-				usage: { totalTokens: Number.POSITIVE_INFINITY },
-			},
-			{
-				name: "incomplete-tool-call",
-				content: [
+	test.each([
+		{ name: "usage-omitted", content: [{ type: "thinking", thinking: "" }], omitUsage: true },
+		{ name: "usage-null", content: [{ type: "thinking", thinking: "" }], usage: null },
+		{ name: "primitive-usage", content: [{ type: "thinking", thinking: "" }], usage: "bad" },
+		{ name: "array-usage", content: [{ type: "thinking", thinking: "" }], usage: [] },
+		{ name: "missing-total-tokens", content: [{ type: "thinking", thinking: "" }], usage: { input: 0 } },
+		{
+			name: "undefined-total-tokens",
+			content: [{ type: "thinking", thinking: "" }],
+			usage: { totalTokens: undefined },
+		},
+		{ name: "negative-total-tokens", content: [{ type: "thinking", thinking: "" }], usage: { totalTokens: -1 } },
+		{
+			name: "nan-total-tokens",
+			content: [{ type: "thinking", thinking: "" }],
+			usage: { totalTokens: Number.NaN },
+		},
+		{
+			name: "infinite-total-tokens",
+			content: [{ type: "thinking", thinking: "" }],
+			usage: { totalTokens: Number.POSITIVE_INFINITY },
+		},
+		{
+			name: "incomplete-tool-call",
+			content: [
+				{
+					type: "toolCall",
+					id: "call-1",
+					name: "read",
+					arguments: {},
+					incompleteArguments: true,
+					incompleteArgumentsReason: "truncated",
+				},
+			],
+			usage: { totalTokens: 0 },
+		},
+		{
+			name: "malformed-tool-arguments",
+			content: [{ type: "toolCall", id: "call-1", name: "read", arguments: null }],
+			usage: { totalTokens: 0 },
+		},
+		{
+			name: "orphaned-incomplete-reason",
+			content: [
+				{
+					type: "toolCall",
+					id: "call-1",
+					name: "read",
+					arguments: {},
+					incompleteArgumentsReason: "malformed",
+				},
+			],
+			usage: { totalTokens: 0 },
+		},
+	] as const)("fails closed without independent terminal evidence ($name)", async testCase => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), `gjc-terminal-malformed-${testCase.name}-`));
+		try {
+			const harness = await invocationHarness(`terminal-malformed-${testCase.name}`, cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await Promise.withResolvers<void>().promise;
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "hello" });
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", {
+				messages: [
 					{
-						type: "toolCall",
-						id: "call-1",
-						name: "read",
-						arguments: {},
-						incompleteArguments: true,
-						incompleteArgumentsReason: "truncated",
+						role: "assistant",
+						content: testCase.content,
+						...("omitUsage" in testCase ? {} : { usage: testCase.usage }),
 					},
 				],
-				usage: { totalTokens: 0 },
-			},
-			{
-				name: "malformed-tool-arguments",
-				content: [{ type: "toolCall", id: "call-1", name: "read", arguments: null }],
-				usage: { totalTokens: 0 },
-			},
-			{
-				name: "orphaned-incomplete-reason",
-				content: [
-					{
-						type: "toolCall",
-						id: "call-1",
-						name: "read",
-						arguments: {},
-						incompleteArgumentsReason: "malformed",
-					},
-				],
-				usage: { totalTokens: 0 },
-			},
-		] as const;
-		for (const testCase of cases) {
-			const cwd = await mkdtemp(path.join(os.tmpdir(), `gjc-terminal-malformed-${testCase.name}-`));
-			try {
-				const harness = await invocationHarness(`terminal-malformed-${testCase.name}`, cwd, {
-					sendUserMessage: async (_content, options) => {
-						await options?.onPreflightAcceptCommit?.();
-						await Promise.withResolvers<void>().promise;
-					},
-				});
-				const accepted = await harness.control("turn.prompt", { text: "hello" });
-				await harness.emit("agent_start");
-				await harness.emit("agent_end", {
-					messages: [
-						{
-							role: "assistant",
-							content: testCase.content,
-							...("omitUsage" in testCase ? {} : { usage: testCase.usage }),
-						},
-					],
-				});
-				expect(
-					await settledStatus(harness, "turn.result", {
-						kind: "prompt",
-						commandId: accepted.result?.commandId,
-						turnId: accepted.result?.turnId,
-					}),
-				).toMatchObject({
-					status: "failed",
-					error: { code: "prompt_failed", message: "Agent run failed after execution started." },
-					outcome: {
-						kind: "failed",
-						code: "prompt_failed",
-						message: "Agent run failed after execution started.",
-						provenance: "agent_failed",
-						phase: "post_start",
-						category: "agent_runtime",
-					},
-				});
-				await harness.stop();
-			} finally {
-				await rm(cwd, { recursive: true, force: true });
-			}
+			});
+			expect(
+				await settledStatus(harness, "turn.result", {
+					kind: "prompt",
+					commandId: accepted.result?.commandId,
+					turnId: accepted.result?.turnId,
+				}),
+			).toMatchObject({
+				status: "failed",
+				error: { code: "prompt_failed", message: "Agent run failed after execution started." },
+				outcome: {
+					kind: "failed",
+					code: "prompt_failed",
+					message: "Agent run failed after execution started.",
+					provenance: "agent_failed",
+					phase: "post_start",
+					category: "agent_runtime",
+				},
+			});
+			await harness.stop();
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
 		}
 	});
 	test("preserves explicit cancellation for an empty zero-token turn", async () => {
@@ -7165,114 +7902,111 @@ describe("post-acceptance invocation terminalization", () => {
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
-	test("reconciles contract-valid skill completion and agent_end ordering", async () => {
-		const cases = [
-			{
-				name: "completion-real-agent-real",
-				order: "completion-first",
-				completion: "completion",
-				agent: "agent",
-				expected: "completion",
-			},
-			{
-				name: "completion-blank-agent-real",
-				order: "completion-first",
-				completion: " ",
-				agent: "agent",
-				expected: "agent",
-			},
-			{
-				name: "completion-none-agent-real",
-				order: "completion-first",
-				completion: null,
-				agent: "agent",
-				expected: "agent",
-			},
-			{
-				name: "agent-real-completion-real",
-				order: "agent-first",
-				completion: "completion",
-				agent: "agent",
-				expected: "agent",
-			},
-			{
-				name: "agent-real-completion-blank",
-				order: "agent-first",
-				completion: " ",
-				agent: "agent",
-				expected: "agent",
-			},
-			{
-				name: "agent-blank-completion-real",
-				order: "agent-first",
-				completion: "completion",
-				agent: " ",
-				expected: "completion",
-			},
-			{
-				name: "agent-blank-completion-none",
-				order: "agent-first",
-				completion: null,
-				agent: " ",
-				expected: undefined,
-			},
-			{
-				name: "agent-none-completion-real",
-				order: "agent-first",
-				completion: "completion",
-				agent: null,
-				expected: "completion",
-			},
-			{
-				name: "agent-none-completion-blank",
-				order: "agent-first",
-				completion: " ",
-				agent: null,
-				expected: undefined,
-			},
-		] as const;
-		for (const testCase of cases) {
-			const cwd = await mkdtemp(path.join(os.tmpdir(), `gjc-skill-terminal-order-${testCase.name}-`));
-			const completion = Promise.withResolvers<unknown>();
-			const completionReconciled = Promise.withResolvers<void>();
-			try {
-				const harness = await invocationHarness(`skill-terminal-order-${testCase.name}`, cwd, {
-					onInvocationCompletionReconciled: kind => {
-						if (kind === "skill") completionReconciled.resolve();
-					},
-					invokeSkill: async (_name, _args, options) => {
-						await options?.onPreflightAcceptCommit?.();
-						return await completion.promise;
-					},
+	test.each([
+		{
+			name: "completion-real-agent-real",
+			order: "completion-first",
+			completion: "completion",
+			agent: "agent",
+			expected: "completion",
+		},
+		{
+			name: "completion-blank-agent-real",
+			order: "completion-first",
+			completion: " ",
+			agent: "agent",
+			expected: "agent",
+		},
+		{
+			name: "completion-none-agent-real",
+			order: "completion-first",
+			completion: null,
+			agent: "agent",
+			expected: "agent",
+		},
+		{
+			name: "agent-real-completion-real",
+			order: "agent-first",
+			completion: "completion",
+			agent: "agent",
+			expected: "agent",
+		},
+		{
+			name: "agent-real-completion-blank",
+			order: "agent-first",
+			completion: " ",
+			agent: "agent",
+			expected: "agent",
+		},
+		{
+			name: "agent-blank-completion-real",
+			order: "agent-first",
+			completion: "completion",
+			agent: " ",
+			expected: "completion",
+		},
+		{
+			name: "agent-blank-completion-none",
+			order: "agent-first",
+			completion: null,
+			agent: " ",
+			expected: undefined,
+		},
+		{
+			name: "agent-none-completion-real",
+			order: "agent-first",
+			completion: "completion",
+			agent: null,
+			expected: "completion",
+		},
+		{
+			name: "agent-none-completion-blank",
+			order: "agent-first",
+			completion: " ",
+			agent: null,
+			expected: undefined,
+		},
+	] as const)("reconciles contract-valid skill completion and agent_end ordering ($name)", async testCase => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), `gjc-skill-terminal-order-${testCase.name}-`));
+		const completion = Promise.withResolvers<unknown>();
+		const completionReconciled = Promise.withResolvers<void>();
+		try {
+			const harness = await invocationHarness(`skill-terminal-order-${testCase.name}`, cwd, {
+				onInvocationCompletionReconciled: kind => {
+					if (kind === "skill") completionReconciled.resolve();
+				},
+				invokeSkill: async (_name, _args, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					return await completion.promise;
+				},
+			});
+			const accepted = await harness.control("skill.invoke", { name: "ralplan" });
+			const selector = {
+				kind: "skill" as const,
+				commandId: accepted.result?.commandId,
+				turnId: accepted.result?.turnId,
+			};
+			await harness.emit("agent_start");
+			const emitAgentEnd = () =>
+				harness.emit("agent_end", {
+					messages: testCase.agent === null ? [] : [{ role: "assistant", content: testCase.agent }],
 				});
-				const accepted = await harness.control("skill.invoke", { name: "ralplan" });
-				const selector = {
-					kind: "skill" as const,
-					commandId: accepted.result?.commandId,
-					turnId: accepted.result?.turnId,
-				};
-				await harness.emit("agent_start");
-				const emitAgentEnd = () =>
-					harness.emit("agent_end", {
-						messages: testCase.agent === null ? [] : [{ role: "assistant", content: testCase.agent }],
-					});
-				if (testCase.order === "completion-first") {
-					completion.resolve(testCase.completion);
-					await completionReconciled.promise;
-					await emitAgentEnd();
-				} else {
-					await emitAgentEnd();
-					completion.resolve(testCase.completion);
-					await completionReconciled.promise;
-				}
-				const result = await harness.query("turn.result", selector);
-				const content = (result.result as { content?: { text?: string } } | undefined)?.content;
-				expect(content?.text).toBe(testCase.expected);
-				await harness.stop();
-			} finally {
-				completion.resolve(undefined);
-				await rm(cwd, { recursive: true, force: true });
+			if (testCase.order === "completion-first") {
+				completion.resolve(testCase.completion);
+				await completionReconciled.promise;
+				await emitAgentEnd();
+			} else {
+				await emitAgentEnd();
+				completion.resolve(testCase.completion);
+				await completionReconciled.promise;
 			}
+			const result = await harness.query("turn.result", selector);
+			const content = (result.result as { content?: { text?: string } } | undefined)?.content;
+			expect(content?.text).toBe(testCase.expected);
+			await harness.stop();
+		} finally {
+			completion.resolve(undefined);
+			await rm(cwd, { recursive: true, force: true });
 		}
 	}, 30_000);
 	test("a queued follow-up prompt is not terminalized before the turn runs", async () => {
@@ -8999,7 +9733,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			sessionId: transport.sessionId,
 		});
 		const seamCalls: Array<{ handle: string; scope: string }> = [];
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -10073,7 +10807,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			sessionId: transport.sessionId,
 		});
 		const seamCalls: Array<{ handle: string; scope: string }> = [];
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -10214,7 +10948,7 @@ test("SDK-only host never advances a finalized uncertain row for a mismatched re
 		sessionId: transport.sessionId,
 	});
 	const seamCalls: Array<{ handle: string; scope: string }> = [];
-	createSdkSessionRuntimeExtension(api, {
+	createTestRuntimeExtension(api, {
 		agentDir: cwd,
 		createTransport: async () => transport,
 		terminalAbortSeams: {
@@ -10307,7 +11041,7 @@ test("SDK-only host FIFO-expires tombstones instead of failing the finalization 
 		sessionFile: path.join(cwd, "session.json"),
 		sessionId: transport.sessionId,
 	});
-	createSdkSessionRuntimeExtension(api, {
+	createTestRuntimeExtension(api, {
 		agentDir: cwd,
 		createTransport: async () => transport,
 		terminalAbortSeams: {
@@ -10383,7 +11117,7 @@ test("SDK-only host cancels only the aborting requester's preflight while anothe
 		sessionFile: path.join(cwd, "session.json"),
 		sessionId: transport.sessionId,
 	});
-	createSdkSessionRuntimeExtension(api, {
+	createTestRuntimeExtension(api, {
 		agentDir: cwd,
 		createTransport: async () => transport,
 		terminalAbortSeams: {
@@ -10473,7 +11207,7 @@ test("SDK-only host keeps the idle-submitted prompt's owner when isIdle flips du
 		sessionFile: path.join(cwd, "session.json"),
 		sessionId: transport.sessionId,
 	});
-	createSdkSessionRuntimeExtension(api, {
+	createTestRuntimeExtension(api, {
 		agentDir: cwd,
 		createTransport: async () => transport,
 		terminalAbortSeams: {
@@ -10546,7 +11280,7 @@ test("SDK-only host advances a finalized stopped row when the retry replay match
 	});
 	let captureCalls = 0;
 	let discardCalls = 0;
-	createSdkSessionRuntimeExtension(api, {
+	createTestRuntimeExtension(api, {
 		agentDir: cwd,
 		createTransport: async () => transport,
 		terminalAbortSeams: {
@@ -10840,6 +11574,139 @@ test.each([
 	}
 });
 
+test.each([
+	false,
+	true,
+])("SDK-only queued terminal recovery permits replacement after EIO (early shutdown=%s)", async earlyShutdown => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-terminal-recovery-"));
+	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+	let transport = memoryTransport();
+	const sessionId = transport.sessionId;
+	const sessionFile = path.join(cwd, `${sessionId}.json`);
+	const store = createReconciliationStore({ sessionFile, sessionId });
+	let creations = 0;
+	let queued = false;
+	let queueSignal: AbortSignal | undefined;
+	const api = {
+		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
+			handlers.set(event, handler);
+		},
+		sendUserMessage: (_content: string, hooks?: PreflightHooks) =>
+			Promise.resolve(hooks?.onPreflightAcceptCommit?.()).then(() => {
+				queued = true;
+				queueSignal = hooks?.preflightSignal;
+				queueSignal?.addEventListener(
+					"abort",
+					() => {
+						if (!queued) return;
+						queued = false;
+						hooks?.onQueuedPromoted?.({ startsOwnRun: false, removed: true });
+					},
+					{ once: true },
+				);
+				hooks?.onPreflightAccepted?.();
+				return {};
+			}),
+	} as unknown as ExtensionAPI;
+	createSdkSessionRuntimeExtension(api, {
+		agentDir: cwd,
+		settings: {
+			get: (key: string) =>
+				key === "sdk.promptDeadlineMs" ? 1_500 : key === "sdk.promptMaxRuntimeMs" ? 15_000 : undefined,
+		} as unknown as Settings,
+		createTransport: async () => {
+			creations++;
+			transport = memoryTransport();
+			return transport;
+		},
+		terminalAbortSeams: {
+			getReconciliationStore: () => store,
+			getTerminalTurnEpoch: () => 7,
+			getActivePromptHandle: () => "unrelated-handle",
+			cancelPendingPreflightForTerminalAbort: () => {},
+			abortPromptAndWaitWithTerminal: async () => ({ status: "settled", terminalScope: {} }),
+		},
+	});
+	const ctx = { ...extensionContext(sessionId, cwd), isIdle: () => true } as unknown as ExtensionContext;
+	const target = reconciliationStorePath(sessionFile, sessionId);
+	const waitFor = async (predicate: () => boolean | Promise<boolean>, label: string): Promise<void> => {
+		const deadline = Date.now() + 10_000;
+		while (!(await predicate())) {
+			if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
+			await Bun.sleep(10);
+		}
+	};
+	let requestId = 0;
+	const request = async (frame: Record<string, unknown>): Promise<ResponseFrame> => {
+		const id = `terminal-recovery-${++requestId}`;
+		transport.feed("requester", { ...frame, id } as SdkFrame);
+		await waitFor(() => transport.sent.some(candidate => candidate.id === id), id);
+		return transport.sent.find(candidate => candidate.id === id) as ResponseFrame;
+	};
+	const originalRename = fsPromises.rename.bind(fsPromises);
+	let commandId: string | undefined;
+	let injected = false;
+	const fault = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
+		if (!injected && commandId && String(to) === target) {
+			const document = (await Bun.file(String(from)).json()) as ReconciliationStoreDocument;
+			if (document.records.some(record => record.commandId === commandId && record.terminalAt !== undefined)) {
+				injected = true;
+				throw Object.assign(new Error("Injected terminal publication failure"), { code: "EIO" });
+			}
+		}
+		return originalRename(from, to);
+	});
+	try {
+		await handlers.get("session_start")?.({}, ctx);
+		const accepted = await request({
+			type: "control_request",
+			operation: "turn.follow_up",
+			input: { text: "queued input" },
+		});
+		expect(accepted.ok).toBe(true);
+		commandId = accepted.result?.commandId;
+		const turnId = accepted.result?.turnId;
+		expect(commandId).toBeDefined();
+		await waitFor(() => queued && queueSignal !== undefined, "queued admission");
+		expect(await request({ type: "control_request", operation: "turn.abort", input: {} })).toMatchObject({
+			ok: true,
+			result: { aborted: false, reason: "queue_terminal_unconfirmed" },
+		});
+		expect(injected).toBe(true);
+		expect(queueSignal?.aborted).toBe(true);
+		expect(queued).toBe(false);
+		fault.mockRestore();
+		const initial = (await Bun.file(target).json()) as ReconciliationStoreDocument;
+		expect(initial.records.find(record => record.commandId === commandId)?.terminalAt).toBeUndefined();
+		if (earlyShutdown)
+			await expect(Promise.resolve(handlers.get("session_shutdown")?.({}, ctx))).rejects.toMatchObject({
+				code: "sdk_reconciliation_teardown_failed",
+			});
+		await waitFor(async () => {
+			const durable = (await Bun.file(target).json()) as ReconciliationStoreDocument;
+			return durable.records.some(record => record.commandId === commandId && record.terminalAt !== undefined);
+		}, "original-owner terminal recovery");
+		const durable = (await Bun.file(target).json()) as ReconciliationStoreDocument;
+		expect(durable.records.find(record => record.commandId === commandId)).toMatchObject({
+			status: "failed",
+			error: { code: "cancelled" },
+		});
+		if (!earlyShutdown) await handlers.get("session_shutdown")?.({}, ctx);
+		await handlers.get("session_start")?.({}, ctx);
+		expect(creations).toBe(2);
+		expect(
+			await request({ type: "query_request", query: "turn.result", input: { kind: "prompt", commandId, turnId } }),
+		).toMatchObject({
+			ok: true,
+			result: { status: "failed", error: { code: "cancelled" } },
+		});
+	} finally {
+		fault.mockRestore();
+		await Promise.resolve(handlers.get("session_shutdown")?.({}, ctx)).catch(() => undefined);
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
 test("SDK-only host does not assign a follow-up requester ownership until the follow-up actually starts", async () => {
 	// Review thread P1: a turn.follow_up accepted while ctx.isIdle() is true
 	// but the follow-up is never promoted (compaction, transcript ending in a
@@ -10884,7 +11751,7 @@ test("SDK-only host does not assign a follow-up requester ownership until the fo
 		sessionId: transport.sessionId,
 	});
 	const seamCalls: Array<{ handle: string; scope: string }> = [];
-	createSdkSessionRuntimeExtension(api, {
+	createTestRuntimeExtension(api, {
 		agentDir: cwd,
 		createTransport: async () => transport,
 		terminalAbortSeams: {
@@ -11006,7 +11873,7 @@ test("SDK-only host lets every connection whose follow-up was promoted abort the
 		sessionId: transport.sessionId,
 	});
 	const seamCalls: Array<{ handle: string; scope: string }> = [];
-	createSdkSessionRuntimeExtension(api, {
+	createTestRuntimeExtension(api, {
 		agentDir: cwd,
 		createTransport: async () => transport,
 		terminalAbortSeams: {
@@ -11131,7 +11998,7 @@ test("SDK-only host rebinds the steering snapshot when the requester's turn wins
 	let ownerReads = 0;
 	let rebindCalls = 0;
 	const settledOptions: Array<{ scope?: string; steeringSnapshotToken?: number }> = [];
-	createSdkSessionRuntimeExtension(api, {
+	createTestRuntimeExtension(api, {
 		agentDir: cwd,
 		createTransport: async () => transport,
 		terminalAbortSeams: {

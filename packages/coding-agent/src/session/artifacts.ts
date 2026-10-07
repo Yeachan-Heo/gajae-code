@@ -15,6 +15,7 @@ import {
 	publishManagedFileNoReplace,
 	publishManagedFileNoReplaceSync,
 } from "./internal/managed-session-storage";
+import type { SessionStorageStat } from "./session-storage";
 import { DEFAULT_ARTIFACT_MAX_BYTES, truncateHeadBytes } from "./streaming-output";
 
 export interface ManagedOutputGeneration {
@@ -66,6 +67,28 @@ function parseManagedOutputGeneration(value: Uint8Array, outputFilenamePrefix: s
 
 function sameGeneration(left: ManagedOutputGeneration, right: ManagedOutputGeneration): boolean {
 	return left.outputFilename === right.outputFilename && left.metadataFilename === right.metadataFilename;
+}
+
+function normalizeByteRange(size: number, range: ArtifactByteRange): { start: number; endExclusive: number } {
+	const start = Math.max(0, Math.min(size, range.start ?? 0));
+	const endExclusive = Math.max(start, Math.min(size, range.endExclusive ?? size));
+	const normalizedStart = Number.isNaN(start) ? 0 : Math.trunc(start);
+	const normalizedEnd = Number.isNaN(endExclusive) ? 0 : Math.trunc(endExclusive);
+	return {
+		start: normalizedStart,
+		endExclusive: Math.max(normalizedStart, normalizedEnd),
+	};
+}
+
+const ARTIFACT_STREAM_CHUNK_BYTES = 64 * 1024;
+const ARTIFACT_RANGE_READ_CHUNK_BYTES = 64 * 1024 * 1024;
+
+type AttemptStagingCleanupClassification = { kind: "authorized_quarantine" } | { kind: "failure"; error: unknown };
+
+function classifyAttemptStagingCleanupFailure(error: unknown): AttemptStagingCleanupClassification {
+	return error instanceof Error && error.message === "cleanup_pending"
+		? { kind: "authorized_quarantine" }
+		: { kind: "failure", error };
 }
 export interface ArtifactSaveOptions {
 	maxBytes?: number;
@@ -309,26 +332,16 @@ export class ArtifactManager {
 	 * Best-effort removal of a previously published named artifact. Used to roll
 	 * back staged publications when a transactional operation (e.g. gated
 	 * maintenance pruning) is rejected after publication succeeded. Returns false
-	 * when the artifact could not be removed so callers can log the failure
-	 * instead of silently treating the rollback as complete.
+	 * when the exact named artifact is absent or could not be removed; success does
+	 * not claim that unrelated native cleanup residue was reclaimed.
 	 */
 	async removeNamedBestEffort(filename: string): Promise<boolean> {
 		if (!/^[a-zA-Z0-9_.-]+$/.test(filename)) return false;
 		try {
 			if (this.#store) {
-				const beforePaths = new Set(await fs.readdir(this.#store.dir));
 				const staged = this.#store.readExpected(filename);
-				if (staged) this.#store.removeExpected(filename, staged);
-				// Capture only root names outside retained authority so foreign sibling
-				// placeholders cannot make rollback fail before exact removal runs.
-				for (const basename of await fs.readdir(this.#store.dir)) {
-					const nativeResidue = /^\.gjc-/u.test(basename);
-					const ownQuarantine = basename === `${filename}.removing` || basename.startsWith(`${filename}.`);
-					if (beforePaths.has(basename) || (!nativeResidue && !ownQuarantine)) continue;
-					const residuePath = path.join(this.#store.dir, basename);
-					const stat = await fs.lstat(residuePath);
-					await fs.rm(residuePath, { recursive: stat.isDirectory(), force: true });
-				}
+				if (!staged) return false;
+				this.#store.removeExpected(filename, staged);
 			} else {
 				await fs.unlink(path.join(this.#dir, filename));
 			}
@@ -502,7 +515,13 @@ export class ArtifactManager {
 				publishedNames.push(mappedFilename);
 			}
 			this.#reservations.set(attemptId, { start, count: ids.length, names: [...publishedNames] });
-			await staging.discardAttemptStaging();
+			try {
+				await staging.discardAttemptStaging();
+			} catch (error) {
+				const cleanup = classifyAttemptStagingCleanupFailure(error);
+				if (cleanup.kind === "authorized_quarantine") return frozenMap;
+				throw cleanup.error;
+			}
 			return frozenMap;
 		} catch (error) {
 			// Cleanup is best-effort, but a durable removal failure must never be silent: it leaves a
@@ -550,64 +569,34 @@ export class ArtifactManager {
 
 	async discardAttemptStaging(): Promise<void> {
 		if (this.#store) {
-			const cleanupStore = this.#stagingParentStore ?? this.#store;
-			const cleanupPath = this.#stagingParentStore ? this.#stagingRelativePath! : "";
-			const parentCleanupPath = cleanupPath ? path.posix.dirname(cleanupPath) : "";
-			let parentBefore: ReturnType<ManagedSessionDescendantStore["captureTree"]> | undefined;
-			if (this.#stagingParentStore) {
-				try {
-					parentBefore = cleanupStore.captureTree(parentCleanupPath);
-				} catch {
-					parentBefore = undefined;
-				}
-			}
+			// Only an attempt manager owns a managed subtree that it may retire. A
+			// normal manager's store is borrowed by this cleanup method and its root
+			// must never become a deletion target.
+			if (!this.#stagingParentStore || !this.#stagingRelativePath) return;
+			const cleanupStore = this.#stagingParentStore;
 			try {
-				const snapshot = cleanupStore.captureTree(cleanupPath);
-				cleanupStore.removeTreeExpected(cleanupPath, snapshot);
+				const snapshot = cleanupStore.captureTree(this.#stagingRelativePath);
+				const issuedRoot = this.#store.subtreeRootAuthority;
+				if (
+					issuedRoot.canonicalPath !== path.resolve(this.#dir) ||
+					snapshot.rootDev !== issuedRoot.dev.toString() ||
+					snapshot.rootIno !== issuedRoot.ino.toString()
+				)
+					throw new Error("artifact_staging_root_changed");
+				// Stop using and release this attempt's retained writable root before
+				// asking the parent authority to retire the tree. The exact tree snapshot
+				// above is still checked by native removal; a concurrent change therefore
+				// remains a refusal rather than being adopted. Never close the borrowed
+				// parent store.
+				this.#store.close();
+				cleanupStore.removeTreeExpected(this.#stagingRelativePath, snapshot);
 			} catch (error) {
-				if (!(error instanceof Error && (error.message === "not_found" || error.message === "cleanup_pending")))
-					throw error;
+				if (!(error instanceof Error && error.message === "not_found")) throw error;
+			} finally {
+				// Replacement, snapshot, and native cleanup failures also release only
+				// the capability owned by this attempt manager.
+				this.#store.close();
 			}
-			if (this.#stagingParentStore && parentBefore) {
-				try {
-					const after = cleanupStore.captureTree(parentCleanupPath);
-					const beforePaths = new Set(parentBefore.entries.map(entry => entry.relativePath));
-					for (const entry of after.entries) {
-						if (
-							entry.kind === "directory" &&
-							entry.relativePath.length > 0 &&
-							!beforePaths.has(entry.relativePath) &&
-							/\.removing$/u.test(path.posix.basename(entry.relativePath))
-						) {
-							await fs.rm(path.join(cleanupStore.dir, parentCleanupPath, entry.relativePath), {
-								recursive: true,
-								force: true,
-							});
-							continue;
-						}
-						if (
-							entry.kind !== "file" ||
-							beforePaths.has(entry.relativePath) ||
-							!/^\\.gjc-(?:exact-unlink-placeholder|remove)-/u.test(path.posix.basename(entry.relativePath))
-						)
-							continue;
-						const relative = path.posix.join(parentCleanupPath, entry.relativePath);
-						const expected = cleanupStore.readExpected(relative);
-						if (expected) {
-							try {
-								cleanupStore.removeExpected(relative, expected);
-							} catch (cleanupError) {
-								if (!(cleanupError instanceof Error && cleanupError.message === "cleanup_pending"))
-									throw cleanupError;
-							}
-						}
-						await fs.rm(path.join(cleanupStore.dir, relative), { force: true }).catch(() => undefined);
-					}
-				} catch {
-					// Retained cleanup evidence is safe to leave for a later maintenance pass.
-				}
-			}
-			this.#store.close();
 		} else {
 			await fs.rm(this.#dir, { recursive: true, force: true });
 		}
@@ -650,7 +639,69 @@ export class ArtifactManager {
 		}
 	}
 
+	#captureManagedArtifact(id: string): {
+		filename: string;
+		size: number;
+		expectedDescriptor: Pick<SessionStorageStat, "dev" | "ino" | "nlink" | "size" | "mtimeNs" | "ctimeNs">;
+	} | null {
+		if (!this.#store) return null;
+		try {
+			const entry = this.#store
+				.captureTree("")
+				.entries.find(candidate => candidate.kind === "file" && candidate.relativePath.startsWith(`${id}.`));
+			if (!entry) return null;
+			const size = Number(BigInt(entry.size));
+			if (!Number.isSafeInteger(size) || size < 0) return null;
+			return {
+				filename: entry.relativePath,
+				size,
+				expectedDescriptor: {
+					dev: BigInt(entry.dev),
+					ino: BigInt(entry.ino),
+					nlink: BigInt(entry.nlink),
+					size,
+					mtimeNs: BigInt(entry.mtimeNs),
+					ctimeNs: BigInt(entry.ctimeNs),
+				},
+			};
+		} catch {
+			// listFiles historically hides an unavailable managed tree as no artifacts.
+			return null;
+		}
+	}
+
 	async readRange(id: string, range: ArtifactByteRange = {}): Promise<string> {
+		if (this.#store) {
+			const artifact = this.#captureManagedArtifact(id);
+			if (!artifact) throw new Error(`artifact://${id} not found`);
+			const { start, endExclusive } = normalizeByteRange(artifact.size, range);
+			const length = Math.max(0, endExclusive - start);
+			let bytes: Uint8Array;
+			if (length <= ARTIFACT_RANGE_READ_CHUNK_BYTES) {
+				bytes = this.#store.readRangeExpectedSync(
+					artifact.filename,
+					start,
+					length,
+					artifact.expectedDescriptor,
+				).bytes;
+			} else {
+				const complete = Buffer.allocUnsafe(length);
+				let offset = 0;
+				while (offset < length) {
+					const chunkLength = Math.min(ARTIFACT_RANGE_READ_CHUNK_BYTES, length - offset);
+					const chunk = this.#store.readRangeExpectedSync(
+						artifact.filename,
+						start + offset,
+						chunkLength,
+						artifact.expectedDescriptor,
+					).bytes;
+					complete.set(chunk, offset);
+					offset += chunk.byteLength;
+				}
+				bytes = complete;
+			}
+			return new TextDecoder().decode(bytes);
+		}
 		const artifactPath = await this.getPath(id);
 		if (!artifactPath) throw new Error(`artifact://${id} not found`);
 		const file = Bun.file(artifactPath);
@@ -661,6 +712,59 @@ export class ArtifactManager {
 	}
 
 	async openReadStream(id: string, range: ArtifactByteRange = {}): Promise<ReadableStream<Uint8Array>> {
+		if (this.#store) {
+			const artifact = this.#captureManagedArtifact(id);
+			if (!artifact) throw new Error(`artifact://${id} not found`);
+			const { start, endExclusive } = normalizeByteRange(artifact.size, range);
+			const lease = this.#store.openReadLease(artifact.filename, artifact.expectedDescriptor);
+			let offset = start;
+			let closed = false;
+			const closeLease = (): void => {
+				if (closed) return;
+				closed = true;
+				lease.close();
+			};
+			const closeAfterFailure = (): void => {
+				try {
+					closeLease();
+				} catch {
+					// Keep the read failure as the stream's observable error.
+				}
+			};
+			return new ReadableStream<Uint8Array>(
+				{
+					start: controller => {
+						if (offset !== endExclusive) return;
+						try {
+							closeLease();
+							controller.close();
+						} catch (error) {
+							closeAfterFailure();
+							controller.error(error);
+						}
+					},
+					pull: controller => {
+						if (closed) return;
+						try {
+							const length = Math.min(ARTIFACT_STREAM_CHUNK_BYTES, endExclusive - offset);
+							const bytes = lease.readRange(offset, length);
+							if (bytes.byteLength !== length) throw new Error("range_not_present");
+							offset += bytes.byteLength;
+							if (offset === endExclusive) closeLease();
+							controller.enqueue(bytes);
+							if (offset === endExclusive) controller.close();
+						} catch (error) {
+							closeAfterFailure();
+							controller.error(error);
+						}
+					},
+					cancel: () => {
+						closeLease();
+					},
+				},
+				{ highWaterMark: 0 },
+			);
+		}
 		const artifactPath = await this.getPath(id);
 		if (!artifactPath) throw new Error(`artifact://${id} not found`);
 		const file = Bun.file(artifactPath);

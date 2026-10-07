@@ -57,6 +57,60 @@ function toolBlocks(output: AssistantMessage): ToolCall[] {
 }
 
 describe("Responses provider: truncated tool-call detection", () => {
+	test.each([
+		["response.incomplete", "incomplete"],
+		["response.incomplete", undefined],
+		["response.incomplete", "completed"],
+		["response.completed", "incomplete"],
+	])("preserves content-filter diagnostics and tool guards for %s / %s", async (type, status) => {
+		const output = makeOutput();
+		const { stream } = makeCapture();
+		await processResponsesStream(
+			makeStream([
+				{
+					type: "response.output_item.added",
+					output_index: 0,
+					item: {
+						type: "function_call",
+						id: "fc_filter",
+						call_id: "call_filter",
+						name: "write_file",
+						arguments: "",
+					},
+				},
+				{
+					type: "response.function_call_arguments.delta",
+					item_id: "fc_filter",
+					output_index: 0,
+					delta: '{"path":"unfinished',
+				},
+				{
+					type,
+					response: {
+						id: "resp_filter",
+						status,
+						incomplete_details: {
+							reason: "content_filter",
+							message: "untrusted provider text",
+							retryable: false,
+						},
+					},
+				},
+			]),
+			output,
+			stream,
+			makeModel(),
+		);
+
+		expect(output.stopReason).toBe("length");
+		expect(output.errorMessage).toBe(
+			"Provider reported content_filter: the response was stopped by content filtering, not an output-token limit.",
+		);
+		expect(output.errorKind).toBeUndefined();
+		expect(toolBlocks(output)[0].incompleteArguments).toBe(true);
+		expect(toolBlocks(output)[0].incompleteArgumentsReason).toBe("truncated");
+	});
+
 	test("flags a tool call whose arguments were cut off (status incomplete)", async () => {
 		const events = [
 			{
@@ -81,6 +135,7 @@ describe("Responses provider: truncated tool-call detection", () => {
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
 		expect(output.stopReason).toBe("length");
+		expect(output.errorMessage).toBeUndefined();
 		const tools = toolBlocks(output);
 		expect(tools).toHaveLength(1);
 		expect(tools[0].name).toBe("write_file");

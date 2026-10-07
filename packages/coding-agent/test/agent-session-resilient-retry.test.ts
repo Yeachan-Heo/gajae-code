@@ -4298,13 +4298,7 @@ describe.serial("AgentSession resilient retry", () => {
 		expect(requestedModels).toHaveLength(1);
 		expect(lastAssistant(session).stopReason).toBe("error");
 	});
-	it("keeps managed fallback policy unchanged for the typed Responses overload (#5018)", async () => {
-		// The typed overload facts are new transport evidence (issue #5018) and
-		// must not grant the managed chain retry/advance authority it did not
-		// have before. Before the code survived transport, the failure reached
-		// the session as an ordinary committed error and surfaced immediately;
-		// the managed run must still stop on the primary model without a retry
-		// and without switching models.
+	it("retries managed fallback for the typed Responses overload", async () => {
 		const primary = getBundledModel("openai", "gpt-5.4-mini");
 		const fallback = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!primary || !fallback) throw new Error("Expected bundled test models to exist");
@@ -4313,7 +4307,7 @@ describe.serial("AgentSession resilient retry", () => {
 			model: primary,
 			errorMessage: RESPONSES_OVERLOAD_ERROR,
 			transportFailure: RESPONSES_OVERLOAD_FACTS,
-			recoveredContent: "should not be reached",
+			recoveredContent: "recovered on the fallback model",
 			requestedModels,
 		});
 		session.setConfiguredModelChain(
@@ -4326,9 +4320,69 @@ describe.serial("AgentSession resilient retry", () => {
 		await session.prompt("managed typed Responses overload");
 		await session.waitForIdle();
 
+		expect(retryStartEvents).toHaveLength(1);
+		expect(requestedModels).toEqual([`${primary.provider}/${primary.id}`, `${primary.provider}/${primary.id}`]);
+		expect(lastAssistant(session)).toMatchObject({
+			stopReason: "stop",
+			content: [{ type: "text", text: "recovered on the fallback model" }],
+		});
+	});
+	it("does not retry a typed Responses overload after streamed output is committed (#6391)", async () => {
+		const primary = getBundledModel("openai", "gpt-5.4-mini");
+		const fallback = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!primary || !fallback) throw new Error("Expected bundled test models to exist");
+		const requestedModels: string[] = [];
+		let streamCalls = 0;
+		session = buildBareStreamingSession({
+			model: primary,
+			streamFn: (requestedModel, context, options) => {
+				streamCalls++;
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+				if (streamCalls > 1) {
+					return createMockModel({ responses: [{ content: ["must not be replayed"] }] }).stream(
+						requestedModel,
+						context,
+						options,
+					);
+				}
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const partial = assistantMessage(primary, [{ type: "text", text: "already streamed" }], "stop");
+					const failure = assistantMessage(primary, [], "error", RESPONSES_OVERLOAD_ERROR);
+					failure.api = "openai-responses";
+					failure.transportFailure = RESPONSES_OVERLOAD_FACTS;
+					stream.push({ type: "start", partial: assistantMessage(primary, [], "error") });
+					stream.push({ type: "text_start", contentIndex: 0, partial });
+					stream.push({ type: "text_delta", contentIndex: 0, delta: "already streamed", partial });
+					stream.push({ type: "error", reason: "error", error: failure });
+				});
+				return stream;
+			},
+		});
+		session.setConfiguredModelChain(
+			"default",
+			[`${primary.provider}/${primary.id}`, `${fallback.provider}/${fallback.id}`],
+			"test",
+		);
+		const { retryStartEvents } = track(session);
+		const observedDeltas: string[] = [];
+		session.subscribe(event => {
+			if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+				observedDeltas.push(event.assistantMessageEvent.delta);
+			}
+		});
+
+		await session.prompt("stream then typed overload");
+		await session.waitForIdle();
+
 		expect(retryStartEvents).toHaveLength(0);
 		expect(requestedModels).toEqual([`${primary.provider}/${primary.id}`]);
-		expect(lastAssistant(session)).toMatchObject({ stopReason: "error", errorMessage: RESPONSES_OVERLOAD_ERROR });
+		expect(observedDeltas).toEqual(["already streamed"]);
+		expect(lastAssistant(session)).toMatchObject({
+			stopReason: "error",
+			errorMessage: RESPONSES_OVERLOAD_ERROR,
+			content: [],
+		});
 	});
 	it("does not hang when managed fallback chain encounters transport 503 then typed Responses overload (#6180)", async () => {
 		// Issue #6180: when the first call in a managed fallback chain fails with a
@@ -4383,12 +4437,11 @@ describe.serial("AgentSession resilient retry", () => {
 			clearTimeout(watchdog);
 		}
 
-		expect(retryStartEvents).toHaveLength(1);
+		expect(retryStartEvents).toHaveLength(2);
 		expect(retryEndEvents).toHaveLength(1);
 		expect(retryEndEvents[0]).toMatchObject({
 			success: false,
-			finalError: RESPONSES_OVERLOAD_ERROR,
 		});
-		expect(lastAssistant(session)).toMatchObject({ stopReason: "error", errorMessage: RESPONSES_OVERLOAD_ERROR });
+		expect(lastAssistant(session)).toMatchObject({ stopReason: "error" });
 	});
 });

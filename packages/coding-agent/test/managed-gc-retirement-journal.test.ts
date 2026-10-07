@@ -34,6 +34,7 @@ import {
 import {
 	acquireManagedLock,
 	captureManagedFileNoFollow,
+	MANAGED_SESSION_READ_RANGE_MAX_BYTES,
 	ManagedSessionDescendantStore,
 } from "../src/session/internal/managed-session-storage";
 import {
@@ -70,6 +71,7 @@ interface Fixture {
 	readonly transcriptPath: string;
 	readonly target: ManagedGcSessionRetirementTarget;
 	readonly evidence: TaskArtifactOwnerDeletionEvidence;
+	readonly largeOwnerTreeMarker?: string;
 }
 
 const temporaryRoots: string[] = [];
@@ -460,7 +462,18 @@ function openScopeStore(scope: ManagedScope): ManagedSessionDescendantStore {
 	);
 }
 
-function makeFixture(): Fixture {
+const LARGE_OWNER_TREE_DIRECTORY_NAME = "d".repeat(200);
+const LARGE_OWNER_TREE_FILLER_FILE_COUNT = 49_996;
+
+function largeOwnerTreeFileName(index: number): string {
+	return `${String(index).padStart(5, "0")}${"a".repeat(250)}`;
+}
+
+function makeFixture(
+	sessionId = "managed-gc-journal-fixture",
+	transcriptFileName = "fixture.jsonl",
+	expandOwnerTree = false,
+): Fixture {
 	const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-gc-retirement-journal-"));
 	temporaryRoots.push(temporaryRoot);
 	const agentDir = path.join(temporaryRoot, "profile");
@@ -470,7 +483,6 @@ function makeFixture(): Fixture {
 	fs.mkdirSync(cwd, { recursive: true });
 	const scope = makeScope(agentDir, sessionsRoot, cwd);
 	const ownerContext = taskArtifactOwnerStorageContextForScope(scope);
-	const sessionId = "managed-gc-journal-fixture";
 	const ownerId = ownerIdForSession(sessionId);
 	const rootStore = newSessionRootStore(ownerContext);
 	let locator: TaskArtifactOwnerLocator | undefined;
@@ -507,11 +519,21 @@ function makeFixture(): Fixture {
 		rootStore.close();
 	}
 	if (!locator) throw new Error("fixture_owner_locator_missing");
-	const transcriptPath = path.join(scope.directoryPath, "fixture.jsonl");
+	const largeOwnerTreeMarker = expandOwnerTree
+		? `${LARGE_OWNER_TREE_DIRECTORY_NAME}/${largeOwnerTreeFileName(LARGE_OWNER_TREE_FILLER_FILE_COUNT - 1)}`
+		: undefined;
+	if (expandOwnerTree) {
+		const ownerDirectory = ownerAbsolutePath(ownerContext, ownerId);
+		const fillerDirectory = path.join(ownerDirectory, LARGE_OWNER_TREE_DIRECTORY_NAME);
+		fs.mkdirSync(fillerDirectory, { mode: 0o700 });
+		for (let index = 0; index < LARGE_OWNER_TREE_FILLER_FILE_COUNT; index++)
+			fs.writeFileSync(path.join(fillerDirectory, largeOwnerTreeFileName(index)), "", { flag: "wx", mode: 0o600 });
+	}
+	const transcriptPath = path.join(scope.directoryPath, transcriptFileName);
 	const transcriptStore = openScopeStore(scope);
 	try {
 		transcriptStore.publishNoReplaceSync(
-			"fixture.jsonl",
+			transcriptFileName,
 			Buffer.from(
 				`${JSON.stringify({
 					type: "session",
@@ -529,7 +551,17 @@ function makeFixture(): Fixture {
 	const target = bindManagedGcSessionRetirementTarget(scope, transcriptPath);
 	const evidence = captureTaskArtifactOwnerDeletionEvidence(ownerContext, sessionId, locator);
 	if (!evidence) throw new Error("fixture_owner_evidence_missing");
-	return { temporaryRoot, agentDir, sessionsRoot, cwd, scope, transcriptPath, target, evidence };
+	return {
+		temporaryRoot,
+		agentDir,
+		sessionsRoot,
+		cwd,
+		scope,
+		transcriptPath,
+		target,
+		evidence,
+		...(largeOwnerTreeMarker ? { largeOwnerTreeMarker } : {}),
+	};
 }
 
 function preparedReceipt(fixture: Fixture): ManagedGcSessionRetirementReceipt {
@@ -538,6 +570,66 @@ function preparedReceipt(fixture: Fixture): ManagedGcSessionRetirementReceipt {
 		state: "prepared",
 		taskArtifactOwnerDeletionEvidence: fixture.evidence,
 	};
+}
+
+function preparedReceiptRecordForMeasurement(fixture: Fixture): Record<string, unknown> {
+	return {
+		schemaVersion: 1,
+		state: "prepared",
+		scope: computeManagedScopeDigest(fixture.scope.platform, fixture.scope.canonicalCwd),
+		transcriptPath: fixture.target.transcriptPath,
+		sessionId: fixture.target.sessionId,
+		cwd: fixture.target.cwd,
+		transcriptIdentity: managedGcRetirementIdentityRecord(fixture.target.transcriptIdentity),
+		taskArtifactOwnerDeletionEvidence: fixture.evidence,
+	};
+}
+
+function preparedReceiptLineByteLength(fixture: Fixture): number {
+	return Buffer.byteLength(
+		`${JSON.stringify(preparedReceiptRecordForMeasurement(fixture), (_key, value: unknown) =>
+			typeof value === "bigint" ? value.toString() : value,
+		)}\n`,
+		"utf8",
+	);
+}
+
+function exactLimitSessionId(fixture: Fixture, transcriptFileName: string): string | undefined {
+	const recordBytes = preparedReceiptLineByteLength(fixture);
+	const pathByteDelta =
+		Buffer.byteLength(transcriptFileName, "utf8") - Buffer.byteLength(path.basename(fixture.transcriptPath), "utf8");
+	const manifest = fixture.evidence.treeSnapshot.entries.find(entry => entry.relativePath === OWNER_MANIFEST);
+	if (!manifest) throw new Error("fixture_owner_manifest_snapshot_missing");
+	const baseManifestSize = BigInt(manifest.size);
+	const baseTranscriptSize = fixture.target.transcriptIdentity.size;
+	const prefix = '\n"\\\u0001é😀\ud800';
+	const encodedContentBytes = (value: string) => Buffer.byteLength(JSON.stringify(value), "utf8") - 2;
+	const addedPrefixBytes = encodedContentBytes(prefix) - encodedContentBytes(fixture.target.sessionId);
+	const sizeForPadding = (padding: number): number => {
+		const delta = addedPrefixBytes + padding;
+		const transcriptSize = baseTranscriptSize + delta;
+		const manifestSize = baseManifestSize + BigInt(delta);
+		return (
+			recordBytes +
+			pathByteDelta +
+			2 * delta +
+			String(transcriptSize).length -
+			String(baseTranscriptSize).length +
+			manifestSize.toString().length -
+			baseManifestSize.toString().length
+		);
+	};
+	let low = 0;
+	let high = MANAGED_SESSION_READ_RANGE_MAX_BYTES;
+	while (low < high) {
+		const middle = Math.ceil((low + high) / 2);
+		if (sizeForPadding(middle) <= MANAGED_SESSION_READ_RANGE_MAX_BYTES) low = middle;
+		else high = middle - 1;
+	}
+	for (let padding = Math.max(0, low - 4); padding <= low + 4; padding++) {
+		if (sizeForPadding(padding) === MANAGED_SESSION_READ_RANGE_MAX_BYTES) return `${prefix}${"a".repeat(padding)}`;
+	}
+	return undefined;
 }
 
 function uncertainContinuation(fixture: Fixture): TaskArtifactOwnerRetirementContinuation {
@@ -645,7 +737,219 @@ function snapshotTree(root: string): unknown[] {
 	return entries;
 }
 
+function managedReceiptInventory(scope: ManagedScope): Array<{ name: string; size: number; sha256: string }> {
+	const directory = path.join(scope.directoryPath, ".gjc-managed-session-internal", "receipts");
+	if (!fs.existsSync(directory)) return [];
+	return fs
+		.readdirSync(directory)
+		.sort()
+		.map(name => {
+			const bytes = fs.readFileSync(path.join(directory, name));
+			return { name, size: bytes.byteLength, sha256: crypto.createHash("sha256").update(bytes).digest("hex") };
+		});
+}
+
+function isNestedCandidateContinuationJsonValue(value: unknown, marker: string): boolean {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const continuation = value as Record<string, unknown>;
+	const snapshot = continuation.retainedTreeSnapshot;
+	if (typeof snapshot !== "object" || snapshot === null || Array.isArray(snapshot)) return false;
+	const entries = (snapshot as Record<string, unknown>).entries;
+	return (
+		Array.isArray(entries) &&
+		entries.some(
+			entry =>
+				typeof entry === "object" &&
+				entry !== null &&
+				!Array.isArray(entry) &&
+				(entry as Record<string, unknown>).relativePath === marker,
+		)
+	);
+}
+
 describe("managed GC retirement journal", () => {
+	it("publishes a canonical receipt exactly at the UTF-8 byte limit and rejects limit plus one before encoding", async () => {
+		const seed = makeFixture();
+		let exactChoice: { readonly transcriptFileName: string; readonly sessionId: string } | undefined;
+		for (let extra = 0; extra < 16 && !exactChoice; extra++) {
+			const transcriptFileName = `fixture${"x".repeat(extra)}.jsonl`;
+			const sessionId = exactLimitSessionId(seed, transcriptFileName);
+			if (sessionId !== undefined) exactChoice = { transcriptFileName, sessionId };
+		}
+		if (!exactChoice) throw new Error("fixture_exact_receipt_size_unavailable");
+		const fixture = makeFixture(exactChoice.sessionId, exactChoice.transcriptFileName);
+		const published = await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		expect(published.state).toBe("prepared");
+		expect(published.sessionId).toBe(exactChoice.sessionId);
+
+		const key = crypto.createHash("sha256").update(path.resolve(fixture.transcriptPath), "utf8").digest("hex");
+		const receiptPath = path.join(
+			fixture.scope.directoryPath,
+			".gjc-managed-session-internal",
+			"receipts",
+			`gc-retirement-${key}-prepared.json`,
+		);
+		const exactStat = fs.statSync(receiptPath);
+		expect(exactStat.size).toBe(MANAGED_SESSION_READ_RANGE_MAX_BYTES);
+		const finalByte = Buffer.alloc(1);
+		const receiptFd = fs.openSync(receiptPath, "r");
+		try {
+			expect(fs.readSync(receiptFd, finalByte, 0, 1, exactStat.size - 1)).toBe(1);
+			expect(finalByte[0]).toBe(0x0a);
+		} finally {
+			fs.closeSync(receiptFd);
+		}
+
+		const overName = `${path.basename(exactChoice.transcriptFileName, ".jsonl")}x.jsonl`;
+		const transcriptStore = openScopeStore(fixture.scope);
+		let overTarget: ManagedGcSessionRetirementTarget;
+		try {
+			transcriptStore.publishNoReplaceSync(
+				overName,
+				Buffer.from(
+					`${JSON.stringify({
+						type: "session",
+						id: exactChoice.sessionId,
+						cwd: fixture.cwd,
+						version: 3,
+						taskArtifactOwner: fixture.target.taskArtifactOwnerLocator,
+					})}\n`,
+					"utf8",
+				),
+			);
+		} finally {
+			transcriptStore.close();
+		}
+		overTarget = bindManagedGcSessionRetirementTarget(
+			fixture.scope,
+			path.join(fixture.scope.directoryPath, overName),
+		);
+		const exactIdentityBytes = Buffer.byteLength(
+			JSON.stringify(managedGcRetirementIdentityRecord(fixture.target.transcriptIdentity)),
+			"utf8",
+		);
+		const overIdentityBytes = Buffer.byteLength(
+			JSON.stringify(managedGcRetirementIdentityRecord(overTarget.transcriptIdentity)),
+			"utf8",
+		);
+		expect(overIdentityBytes).toBe(exactIdentityBytes);
+		const overReceipt: ManagedGcSessionRetirementReceipt = {
+			...overTarget,
+			state: "prepared",
+			taskArtifactOwnerDeletionEvidence: fixture.evidence,
+		};
+		const before = managedReceiptInventory(fixture.scope);
+		const stringify = spyOn(JSON, "stringify");
+		const from = spyOn(Buffer, "from");
+		const publish = spyOn(ManagedSessionDescendantStore.prototype, "publishNoReplaceSync");
+		let candidateWasStringified = false;
+		let candidateBufferWasCreated = false;
+		let candidateWasPublished = false;
+		try {
+			await expect(publishManagedGcSessionRetirementReceipt(fixture.scope, overReceipt)).rejects.toThrow(
+				"managed_gc_receipt_capacity_exceeded",
+			);
+			candidateWasStringified = stringify.mock.calls.some(([value]) => {
+				if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+				const record = value as Record<string, unknown>;
+				return record.transcriptPath === overTarget.transcriptPath && record.state === "prepared";
+			});
+			candidateBufferWasCreated = from.mock.calls.some(
+				([value]) =>
+					typeof value === "string" &&
+					Buffer.byteLength(value, "utf8") > MANAGED_SESSION_READ_RANGE_MAX_BYTES - 1024,
+			);
+			candidateWasPublished = publish.mock.calls.some(([relativePath]) =>
+				String(relativePath).includes("gc-retirement-"),
+			);
+		} finally {
+			publish.mockRestore();
+			from.mockRestore();
+			stringify.mockRestore();
+		}
+		expect(candidateWasStringified).toBe(false);
+		expect(candidateBufferWasCreated).toBe(false);
+		expect(candidateWasPublished).toBe(false);
+		expect(managedReceiptInventory(fixture.scope)).toEqual(before);
+	}, 60_000);
+
+	it("measures bigint JSON values without weakening strict DTO validation", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, {
+			...preparedReceipt(fixture),
+			state: "artifacts_removed",
+			artifactsRemoved: true,
+		});
+		const pending = pendingReceipt(fixture, "strict_dto_validation");
+		const outcome = pending.taskArtifactOwnerRetirementOutcome;
+		if (!outcome) throw new Error("fixture_pending_outcome_missing");
+		const invalidOutcome = Object.assign({}, outcome, {
+			unexpectedBigint: 18_446_744_073_709_551_616n,
+		}) as typeof outcome;
+		await expect(
+			publishManagedGcSessionRetirementReceipt(fixture.scope, {
+				...pending,
+				taskArtifactOwnerRetirementOutcome: invalidOutcome,
+			}),
+		).rejects.toThrow("task_artifact_owner_retirement_outcome_invalid");
+	});
+
+	it("rejects an oversized valid pending candidate before serializing its nested continuation", async () => {
+		const fixture = makeFixture("managed-gc-oversized-pending-fixture", "fixture.jsonl", true);
+		const marker = fixture.largeOwnerTreeMarker;
+		if (!marker) throw new Error("fixture_large_owner_tree_marker_missing");
+		expect(fixture.evidence.treeSnapshot.entries).toHaveLength(50_000);
+		expect(fixture.evidence.treeSnapshot.entries.some(entry => entry.relativePath === marker)).toBe(true);
+
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, {
+			...preparedReceipt(fixture),
+			state: "artifacts_removed",
+			artifactsRemoved: true,
+		});
+		const candidate = pendingReceipt(fixture, "valid_large_continuation_candidate");
+		const outcome = candidate.taskArtifactOwnerRetirementOutcome;
+		if (outcome?.kind !== "uncertain") throw new Error("fixture_uncertain_outcome_missing");
+		expect(candidate.taskArtifactOwnerRetirementContinuation).toBe(outcome.continuation);
+		expect(outcome.continuation.retainedTreeSnapshot).toBe(fixture.evidence.treeSnapshot);
+
+		const before = managedReceiptInventory(fixture.scope);
+		const stringify = spyOn(JSON, "stringify");
+		const from = spyOn(Buffer, "from");
+		const publish = spyOn(ManagedSessionDescendantStore.prototype, "publishNoReplaceSync");
+		let nestedCandidateWasStringified = false;
+		let oversizedReceiptBufferWasCreated = false;
+		let candidateReceiptWasPublished = false;
+		try {
+			await expect(publishManagedGcSessionRetirementReceipt(fixture.scope, candidate)).rejects.toThrow(
+				"managed_gc_receipt_capacity_exceeded",
+			);
+			nestedCandidateWasStringified = stringify.mock.calls.some(([value]) =>
+				isNestedCandidateContinuationJsonValue(value, marker),
+			);
+			oversizedReceiptBufferWasCreated = from.mock.calls.some(([value]) => {
+				if (typeof value === "string")
+					return Buffer.byteLength(value, "utf8") > MANAGED_SESSION_READ_RANGE_MAX_BYTES;
+				return ArrayBuffer.isView(value) && value.byteLength > MANAGED_SESSION_READ_RANGE_MAX_BYTES;
+			});
+			candidateReceiptWasPublished = publish.mock.calls.some(([relativePath]) =>
+				String(relativePath).startsWith(".gjc-managed-session-internal/receipts/gc-retirement-"),
+			);
+		} finally {
+			publish.mockRestore();
+			from.mockRestore();
+			stringify.mockRestore();
+		}
+		expect(nestedCandidateWasStringified).toBe(false);
+		expect(oversizedReceiptBufferWasCreated).toBe(false);
+		expect(candidateReceiptWasPublished).toBe(false);
+		expect(managedReceiptInventory(fixture.scope)).toEqual(before);
+		expect((await readManagedGcSessionRetirementReceipt(fixture.scope, fixture.transcriptPath))?.state).toBe(
+			"artifacts_removed",
+		);
+	}, 60_000);
+
 	it("persists actual native disposition and replays pending namespaces after transcript absence", async () => {
 		const fixture = makeFixture();
 		const prepared = await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));

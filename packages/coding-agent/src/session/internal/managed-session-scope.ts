@@ -62,6 +62,7 @@ import {
 	MANAGED_ARTIFACT_COPY_BATCH_SIZE,
 	MANAGED_ARTIFACT_MAX_FILES,
 	MANAGED_ARTIFACT_MAX_TOTAL_BYTES,
+	MANAGED_SESSION_READ_RANGE_MAX_BYTES,
 	type ManagedDirectoryRoot,
 	type ManagedFileSnapshot,
 	ManagedPublishError,
@@ -2537,6 +2538,103 @@ function managedGcRetirementReceiptRelativePath(
 	const suffix = state === "owner_pending" ? `${state}-${String(attempt).padStart(8, "0")}` : state;
 	return `${MANAGED_GC_RETIREMENT_RECEIPTS}/${MANAGED_GC_RETIREMENT_PREFIX}${managedGcRetirementTranscriptKey(transcriptPath)}-${suffix}.json`;
 }
+
+const MANAGED_GC_RECEIPT_MAX_BYTES = MANAGED_SESSION_READ_RANGE_MAX_BYTES;
+
+function managedGcReceiptCapacity(): never {
+	throw new Error("managed_gc_receipt_capacity_exceeded");
+}
+
+function managedGcJsonStringByteLength(value: string, add: (amount: number) => void): void {
+	add(2);
+	for (let index = 0; index < value.length; index++) {
+		const unit = value.charCodeAt(index);
+		if (unit === 0x22 || unit === 0x5c) add(2);
+		else if (unit < 0x20)
+			add(unit === 0x08 || unit === 0x09 || unit === 0x0a || unit === 0x0c || unit === 0x0d ? 2 : 6);
+		else if (unit >= 0xd800 && unit <= 0xdbff) {
+			const low = value.charCodeAt(index + 1);
+			if (low >= 0xdc00 && low <= 0xdfff) {
+				add(4);
+				index++;
+			} else add(6);
+		} else if (unit >= 0xdc00 && unit <= 0xdfff) add(6);
+		else if (unit <= 0x7f) add(1);
+		else if (unit <= 0x7ff) add(2);
+		else add(3);
+	}
+}
+
+/** Measure the canonical JSON encoding before JSON.stringify or Buffer allocation. */
+function managedGcJsonByteLength(value: unknown): number {
+	let bytes = 0;
+	const active = new Set<object>();
+	const add = (amount: number): void => {
+		if (!Number.isSafeInteger(amount) || amount < 0 || amount > MANAGED_GC_RECEIPT_MAX_BYTES - bytes)
+			managedGcReceiptCapacity();
+		bytes += amount;
+	};
+	const visit = (item: unknown, depth: number, inArray = false): void => {
+		if (depth > 32) throw new Error("task_artifact_owner_continuation_corrupt");
+		if (item === null) {
+			add(4);
+			return;
+		}
+		if (typeof item === "string") {
+			managedGcJsonStringByteLength(item, add);
+			return;
+		}
+		if (typeof item === "bigint") {
+			managedGcJsonStringByteLength(item.toString(), add);
+			return;
+		}
+		if (typeof item === "boolean") {
+			add(item ? 4 : 5);
+			return;
+		}
+		if (typeof item === "number") {
+			add(Number.isFinite(item) ? (Object.is(item, -0) ? 1 : String(item).length) : 4);
+			return;
+		}
+		if (typeof item === "undefined" || typeof item === "function" || typeof item === "symbol") {
+			if (inArray) add(4);
+			return;
+		}
+		if (typeof item !== "object") managedGcReceiptCapacity();
+		if (active.has(item)) throw new Error("task_artifact_owner_continuation_corrupt");
+		active.add(item);
+		const array = Array.isArray(item);
+		if (array) {
+			const values = item as unknown[];
+			if (values.length > MANAGED_GC_RECEIPT_MAX_BYTES) managedGcReceiptCapacity();
+			add(2);
+			let emitted = false;
+			for (let index = 0; index < values.length; index++) {
+				if (emitted) add(1);
+				emitted = true;
+				visit(values[index], depth + 1, true);
+			}
+		} else {
+			add(2);
+			let emitted = false;
+			for (const key in item) {
+				if (!Object.hasOwn(item, key)) continue;
+				const child = (item as Record<string, unknown>)[key];
+				if (child === undefined || typeof child === "function" || typeof child === "symbol") continue;
+				if (emitted) add(1);
+				emitted = true;
+				managedGcJsonStringByteLength(key, add);
+				add(1);
+				visit(child, depth + 1);
+			}
+		}
+		active.delete(item);
+	};
+	visit(value, 0);
+	add(1);
+	return bytes;
+}
+
 function validateManagedGcTranscriptPath(scope: ManagedScope, transcriptPath: string): string {
 	if (
 		typeof transcriptPath !== "string" ||
@@ -3488,14 +3586,35 @@ export function managedGcProtocolScopeInspectorForScope(scope: ManagedScope): Ma
 				agentDir: scope.agentDir,
 				sessionsRoot: scope.sessionsRoot,
 			});
-			if (resolved.kind !== "resolved" || resolved.scope.directoryPath !== input.scopePath)
+			let candidateScope: ManagedScope;
+			let candidateTrusted: ManagedGcTrustedScope | undefined;
+			if (resolved.kind === "error" && resolved.code === "cwd_missing") {
+				candidateScope = {
+					apiVersion: 1,
+					layoutVersion: MANAGED_SESSION_LAYOUT_VERSION,
+					identityVersion: MANAGED_SESSION_IDENTITY_VERSION,
+					agentDir: scope.agentDir,
+					sessionsRoot: scope.sessionsRoot,
+					canonicalCwd: bindingValue.canonicalPath,
+					legacyLexicalCwd: bindingValue.canonicalPath,
+					directoryName: path.basename(input.scopePath),
+					directoryPath: input.scopePath,
+					platform: bindingValue.platform,
+				};
+				if (hasManagedGcRetirementJournalWithoutWorkspace(candidateScope))
+					throw new Error("managed_gc_protocol_scope_unrecognized");
+			} else if (resolved.kind === "resolved" && resolved.scope.directoryPath === input.scopePath) {
+				candidateScope = resolved.scope;
+				candidateTrusted = managedGcTrustedScope(candidateScope);
+			} else {
 				throw new Error("managed_gc_protocol_scope_unrecognized");
-			const candidateScope = resolved.scope;
-			const candidateTrusted = managedGcTrustedScope(candidateScope);
+			}
 			if (
-				candidateTrusted.root.canonicalPath !== trusted.root.canonicalPath ||
-				candidateTrusted.root.dev !== trusted.root.dev ||
-				candidateTrusted.root.ino !== trusted.root.ino ||
+				configuredRootPath(candidateScope) !== trusted.root.canonicalPath ||
+				(candidateTrusted &&
+					(candidateTrusted.root.canonicalPath !== trusted.root.canonicalPath ||
+						candidateTrusted.root.dev !== trusted.root.dev ||
+						candidateTrusted.root.ino !== trusted.root.ino)) ||
 				candidateScope.agentDir !== scope.agentDir ||
 				candidateScope.sessionsRoot !== scope.sessionsRoot
 			)
@@ -3503,7 +3622,21 @@ export function managedGcProtocolScopeInspectorForScope(scope: ManagedScope): Ma
 			const scopeIdentity = managedGcProtocolPathIdentity(candidateScope.directoryPath);
 			if (scopeIdentity.dev !== input.scopeIdentity.dev || scopeIdentity.ino !== input.scopeIdentity.ino)
 				throw new Error("managed_gc_protocol_scope_identity_mismatch");
-			const store = managedGcScopeReader(candidateScope, candidateTrusted);
+			const store = candidateTrusted
+				? managedGcScopeReader(candidateScope, candidateTrusted)
+				: new ManagedSessionDescendantStore(
+						trusted.root,
+						candidateScope.directoryPath,
+						undefined,
+						trusted.policy,
+						candidateScope.agentDir,
+						{
+							canonicalPath: candidateScope.directoryPath,
+							dev: BigInt(scopeIdentity.dev),
+							ino: BigInt(scopeIdentity.ino),
+						},
+						"read-only",
+					);
 			try {
 				store.verifyRootSecurity();
 				const checkedBinding = managedGcProtocolFileSnapshot(candidateScope, store, MANAGED_SESSION_BINDING_FILE);
@@ -3694,13 +3827,16 @@ function managedGcReceiptForPublication(
 	readonly parsed: ManagedGcSessionRetirementReceipt;
 } {
 	validateManagedGcTranscriptPath(scope, receipt.transcriptPath);
-	const record = managedGcReceiptRecord(scope, receipt, attempt);
+	const candidateRecord = managedGcReceiptRecord(scope, receipt, attempt);
+	managedGcJsonByteLength(candidateRecord);
 	const parsed = parseManagedGcRetirementReceipt(
-		record,
+		candidateRecord,
 		scopeDigest(scope.platform, scope.canonicalCwd),
 		ownerContext,
 		receipt,
 	);
+	const record = managedGcReceiptRecord(scope, parsed, attempt);
+	managedGcJsonByteLength(record);
 	return { target: receipt, record, parsed };
 }
 
@@ -3710,12 +3846,17 @@ function publishManagedGcReceiptNoReplace(
 	relativePath: string,
 	record: Record<string, unknown>,
 ): void {
-	const bytes = Buffer.from(
-		`${JSON.stringify(record, (_key, value: unknown) => (typeof value === "bigint" ? value.toString() : value))}\n`,
-		"utf8",
-	);
 	lock.assertOwned();
 	store.assertBound();
+	const expectedByteLength = managedGcJsonByteLength(record);
+	const serializedJson = JSON.stringify(record, (_key, value: unknown) =>
+		typeof value === "bigint" ? value.toString() : value,
+	);
+	const serialized = `${serializedJson}\n`;
+	const actualByteLength = Buffer.byteLength(serialized, "utf8");
+	if (actualByteLength > MANAGED_GC_RECEIPT_MAX_BYTES) managedGcReceiptCapacity();
+	if (actualByteLength !== expectedByteLength) throw new Error("managed_gc_receipt_encoding_mismatch");
+	const bytes = Buffer.from(serialized, "utf8");
 	try {
 		store.publishNoReplaceSync(relativePath, bytes);
 	} catch (error) {

@@ -1,9 +1,10 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import type { Dirent } from "node:fs";
-import { mkdir, mkdtemp, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { FallbackTriggerClass } from "@gajae-code/ai/utils/fallback-transport";
+import * as native from "@gajae-code/natives";
 import { getTerminalId } from "@gajae-code/tui";
 import { getTerminalSessionsDir } from "@gajae-code/utils";
 import { AsyncJobManager } from "../src/async";
@@ -939,22 +940,67 @@ describe("autorouting preflight contract", () => {
 		await mkdir(cwd, { recursive: true });
 		await mkdir(agentDir, { recursive: true });
 		const parentManager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
-		await parentManager.flush();
-		const parent = parentManager.getArtifactManager();
-		if (!parent) throw new Error("managed parent artifacts unavailable");
-		await parent.save("sibling", "tool");
-		const staged = parent.createAttemptStaging("managed-reservation");
-		await staged.save("candidate", "tool");
-		const before = { tree: await snapshotTree(parent.dir, true), ids: parent.getAllocatedIds() };
-		(staged as unknown as { listFiles: () => Promise<string[]> }).listFiles = async () => {
-			throw new Error("managed reservation failure");
-		};
-		await expect(parent.commitAttemptStaging(staged, "managed-reservation")).rejects.toThrow(
-			"managed reservation failure",
-		);
-		await staged.discardAttemptStaging();
-		expect(await snapshotTree(parent.dir, true)).toBe(before.tree);
-		expect(parent.getAllocatedIds()).toEqual(before.ids);
+		try {
+			await parentManager.flush();
+			const parent = parentManager.getArtifactManager();
+			if (!parent) throw new Error("managed parent artifacts unavailable");
+			const parentStore = parent.getManagedStore();
+			if (!parentStore) throw new Error("managed parent artifact store unavailable");
+			await parent.save("sibling", "tool");
+			const staged = parent.createAttemptStaging("managed-reservation");
+			const candidateId = await staged.save("candidate", "tool");
+			const before = { ids: parent.getAllocatedIds() };
+			(staged as unknown as { listFiles: () => Promise<string[]> }).listFiles = async () => {
+				throw new Error("managed reservation failure");
+			};
+			await expect(parent.commitAttemptStaging(staged, "managed-reservation")).rejects.toThrow(
+				"managed reservation failure",
+			);
+
+			const nativeResults: native.RecoveryFsRetainedCleanupResult[] = [];
+			const realRemoveTree = native.RecoveryFsRoot.prototype.removeManagedTree;
+			const removeSpy = spyOn(native.RecoveryFsRoot.prototype, "removeManagedTree").mockImplementation(function (
+				this: native.RecoveryFsRoot,
+				relativePath,
+				expected,
+			) {
+				const result = realRemoveTree.call(this, relativePath, expected);
+				nativeResults.push(result);
+				return result;
+			});
+			try {
+				if (process.platform === "linux")
+					await expect(staged.discardAttemptStaging()).rejects.toThrow("cleanup_pending");
+				else await staged.discardAttemptStaging();
+			} finally {
+				removeSpy.mockRestore();
+			}
+			if (process.platform === "linux") {
+				expect(nativeResults).toHaveLength(1);
+				expect(nativeResults[0]).toMatchObject({ ok: false, code: "cleanup_pending" });
+				const quarantine = nativeResults[0];
+				if (!quarantine?.recoveryPath || !quarantine.treeSnapshot)
+					throw new Error("native_quarantine_evidence_missing");
+				expect(
+					await readFile(
+						path.join(
+							parentStore.rootAuthority.canonicalPath,
+							quarantine.recoveryPath,
+							`${candidateId}.tool.log`,
+						),
+						"utf8",
+					),
+				).toBe("candidate");
+				expect(await stat(path.join(parent.dir, ".staging", "managed-reservation")).catch(() => undefined)).toBe(
+					undefined,
+				);
+			}
+			expect(await readFile(path.join(parent.dir, "0.tool.log"), "utf8")).toBe("sibling");
+			expect(parent.getAllocatedIds()).toEqual(before.ids);
+		} finally {
+			await parentManager.close().catch(() => undefined);
+			await rm(root, { recursive: true, force: true });
+		}
 	});
 
 	it("T3 cross-phase exhaustion consumes three unique candidates and leaves no final, breadcrumb, staging, or discovery residue", async () => {

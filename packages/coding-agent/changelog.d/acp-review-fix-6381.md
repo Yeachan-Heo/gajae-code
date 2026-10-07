@@ -1,3 +1,3 @@
 ### Fixed
 
-- Preserve ACP lifecycle recovery across uncertain Broker sends, enforce provider activation deadlines through reconnects, and reject credential-bearing OAuth POST redirects.
+- Preserve uncertain ACP lifecycle recovery, enforce aggregate provider activation deadlines, and reject OAuth POST redirects.

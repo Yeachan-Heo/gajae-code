@@ -98,6 +98,7 @@ Lifecycle and exact state names:
 - Exact `AsyncJob.status` values in `packages/coding-agent/src/async/job-manager.ts`: `"running" | "paused" | "completed" | "failed" | "cancelled"`.
 - Exact per-task progress values in `packages/coding-agent/src/task/types.ts`: `"pending" | "running" | "completed" | "failed" | "aborted"`.
 - Lifecycle hooks, settlement bookkeeping, and retention timers belong to the original job object. Reusing an evicted job ID does not transfer an older job's cleanup or eviction deadline to its replacement; monitor tombstones retain their original cleanup owner.
+- Owner shutdown, `waitForAll`, and manager disposal track the original runner until it physically unwinds, even after its visible row is evicted. A captured shutdown lease cannot cancel a same-ID replacement. Cancellation or row absence alone is not settlement proof; deadlines preserve uncertainty, and physical-dependent eviction cleanup runs only after the original runner finishes.
 
 ## Side Effects
 - Filesystem
