@@ -134,6 +134,9 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		scopedModels: [],
 		modelRegistry: createRegistry(options),
 		markUserModelSelection,
+		async withSdkControlMutation<T>(body: () => Promise<T>): Promise<T> {
+			return body();
+		},
 		configuredChains: {} as Record<string, readonly string[]>,
 		getConfiguredModelChain(role: string): readonly string[] | undefined {
 			return this.configuredChains[role];

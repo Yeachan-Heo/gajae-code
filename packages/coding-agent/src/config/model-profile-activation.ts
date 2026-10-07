@@ -37,6 +37,11 @@ import {
 import { type ModelSelectorValue, normalizeModelSelectorValue } from "./model-selector-value";
 import type { Settings } from "./settings";
 
+type UserCanonicalVariantSelection = {
+	revision: number;
+	canonicalVariant: string | undefined;
+};
+
 type ModelProfileActivationSession = Pick<
 	AgentSession,
 	"model" | "thinkingLevel" | "sessionId" | "getConfiguredModelChain" | "setConfiguredModelChain"
@@ -59,6 +64,7 @@ type ModelProfileActivationSession = Pick<
 	syncEagerDelegation?: () => Promise<void>;
 	getSessionDefaultModelSelector?: () => string | undefined;
 	recordResumeDefaultModel?: (selector: string | undefined) => void;
+	getUserCanonicalVariantSelection?: () => UserCanonicalVariantSelection;
 	seedDefaultFallbackResolution?: (activeIndex: number, skips: Array<{ selector: string; reason: string }>) => void;
 	getDefaultFallbackRuntimeState?: () => DefaultFallbackRuntimeState;
 	restoreDefaultFallbackRuntimeState?: (state: DefaultFallbackRuntimeState) => void;
@@ -178,6 +184,7 @@ export interface PreparedModelProfileActivation {
 	 * so a stale provider cannot silently resurrect.
 	 */
 	previousCanonicalVariant: string | undefined;
+	previousUserCanonicalVariantSelection: UserCanonicalVariantSelection | undefined;
 	/** Registry used to resolve and restore the session sticky canonical variant. */
 	modelRegistry: PrepareModelProfileActivationOptions["modelRegistry"];
 }
@@ -1325,6 +1332,25 @@ function restoreCanonicalVariant(
 		modelRegistry.clearCanonicalVariant?.(sessionId);
 	}
 }
+
+function restoreCanonicalVariantAfterPreparation(
+	modelRegistry: PrepareModelProfileActivationOptions["modelRegistry"],
+	session: ModelProfileActivationSession,
+	previousCanonicalVariant: string | undefined,
+	previousUserSelection: UserCanonicalVariantSelection | undefined,
+): void {
+	const currentUserSelection = session.getUserCanonicalVariantSelection?.();
+	const userSelectionChanged =
+		previousUserSelection !== undefined &&
+		currentUserSelection !== undefined &&
+		currentUserSelection.revision !== previousUserSelection.revision;
+	restoreCanonicalVariant(
+		modelRegistry,
+		session.sessionId,
+		userSelectionChanged ? currentUserSelection.canonicalVariant : previousCanonicalVariant,
+	);
+}
+
 export async function prepareModelProfileActivation(
 	options: PrepareModelProfileActivationOptions,
 ): Promise<PreparedModelProfileActivation> {
@@ -1339,6 +1365,7 @@ export async function prepareModelProfileActivation(
 	// genuinely-sticky provider even when the live model is a transient switch.
 	const credentialSessionId = options.session.credentialSessionId ?? options.session.sessionId;
 	const previousCanonicalVariant = options.modelRegistry.getSessionCanonicalVariant?.(options.session.sessionId);
+	const previousUserCanonicalVariantSelection = options.session.getUserCanonicalVariantSelection?.();
 
 	// Explicit profile activation/reselection invalidates the session's sticky
 	// canonical variant BEFORE the new profile's aliases resolve, so the old
@@ -1564,6 +1591,7 @@ export async function prepareModelProfileActivation(
 			modelRegistry: options.modelRegistry,
 			previousModel,
 			previousCanonicalVariant,
+			previousUserCanonicalVariantSelection,
 			previousThinkingLevel: options.session.thinkingLevel,
 			previousAgentModelOverrides: { ...options.settings.get("task.agentModelOverrides") },
 			previousModelRoles: { ...options.settings.get("modelRoles") },
@@ -1604,7 +1632,12 @@ export async function prepareModelProfileActivation(
 		};
 	} catch (error) {
 		try {
-			restoreCanonicalVariant(options.modelRegistry, options.session.sessionId, previousCanonicalVariant);
+			restoreCanonicalVariantAfterPreparation(
+				options.modelRegistry,
+				options.session,
+				previousCanonicalVariant,
+				previousUserCanonicalVariantSelection,
+			);
 		} catch (rollbackError) {
 			throw incompleteModelProfileRollbackError("preparation", "profile preflight", error, [
 				{ stage: "restore canonical model variant", error: rollbackError },
@@ -1901,14 +1934,15 @@ export async function applyPreparedModelProfileActivation(
 			restore("restore active profile", () =>
 				prepared.session.setActiveModelProfile?.(prepared.previousActiveModelProfile),
 			);
-			restore("restore canonical model variant", () =>
-				restoreCanonicalVariant(
-					prepared.modelRegistry,
-					prepared.session.sessionId,
-					prepared.previousCanonicalVariant,
-				),
-			);
 		}
+		restore("restore canonical model variant", () =>
+			restoreCanonicalVariantAfterPreparation(
+				prepared.modelRegistry,
+				prepared.session,
+				prepared.previousCanonicalVariant,
+				prepared.previousUserCanonicalVariantSelection,
+			),
+		);
 		if (persistentMutationStarted) {
 			try {
 				await prepared.settings.flushOrThrow();
@@ -2189,7 +2223,15 @@ export async function activateModelProfile(
 ): Promise<void> {
 	if (applyOptions.isCurrent && !applyOptions.isCurrent()) return;
 	const prepared = await prepareModelProfileActivation(options);
-	if (applyOptions.isCurrent && !applyOptions.isCurrent()) return;
+	if (applyOptions.isCurrent && !applyOptions.isCurrent()) {
+		restoreCanonicalVariantAfterPreparation(
+			prepared.modelRegistry,
+			prepared.session,
+			prepared.previousCanonicalVariant,
+			prepared.previousUserCanonicalVariantSelection,
+		);
+		return;
+	}
 	await applyPreparedModelProfileActivation(prepared, applyOptions);
 }
 
@@ -2201,7 +2243,6 @@ export async function applyModelProfileRuntimeBindings(
 ): Promise<void> {
 	if (isCurrent && !isCurrent()) return;
 	const prepared = await prepareModelProfileActivation(options);
-	if (isCurrent && !isCurrent()) return;
 	try {
 		if (isCurrent && !isCurrent()) return;
 		prepared.settings.override("modelRoles", {
@@ -2227,7 +2268,14 @@ export async function applyModelProfileRuntimeBindings(
 			});
 		}
 	} finally {
-		if (!isCurrent || isCurrent()) {
+		if (isCurrent && !isCurrent()) {
+			restoreCanonicalVariantAfterPreparation(
+				prepared.modelRegistry,
+				prepared.session,
+				prepared.previousCanonicalVariant,
+				prepared.previousUserCanonicalVariantSelection,
+			);
+		} else {
 			restoreCanonicalVariant(prepared.modelRegistry, prepared.session.sessionId, prepared.previousCanonicalVariant);
 		}
 	}

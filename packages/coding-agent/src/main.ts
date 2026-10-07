@@ -511,7 +511,8 @@ async function applyStartupModelProfilesWithPolicy(
 				? undefined
 				: () => args.session.getUserModelSelectionRevision() === options.userSelectionRevision;
 		if (isCurrent && !isCurrent()) return false;
-		try {
+		const apply = async (): Promise<boolean> => {
+			if (isCurrent && !isCurrent()) return false;
 			if (options.runtimeBindingsOnly) {
 				await applyModelProfileRuntimeBindings(
 					{
@@ -533,6 +534,9 @@ async function applyStartupModelProfilesWithPolicy(
 				);
 			}
 			return true;
+		};
+		try {
+			return isCurrent ? await args.session.withSdkControlMutation(apply) : await apply();
 		} catch (error) {
 			if (error instanceof ModelProfileCredentialError && (onCredentialError || options.tolerateCredentialError)) {
 				profilePassFailures.push({ profileName, error });
@@ -681,11 +685,11 @@ async function applyStartupModelProfilesWithPolicy(
 	if (preferCachedProfiles) {
 		let applied: boolean;
 		let refreshedOnline = false;
+		const selectionRevision = args.session.getUserModelSelectionRevision();
 		try {
-			applied = await applyConfiguredProfiles(false);
+			applied = await applyConfiguredProfiles(false, undefined, selectionRevision);
 		} catch (error) {
 			if (error instanceof ModelProfileCredentialError) throw error;
-			const selectionRevision = args.session.getUserModelSelectionRevision();
 			if (error instanceof UnknownModelProfileError) {
 				await refreshAuthAndCatalog(onCredentialError !== undefined || onUnknownDefault !== undefined);
 			} else {
@@ -703,14 +707,18 @@ async function applyStartupModelProfilesWithPolicy(
 			);
 			if (args.session.getUserModelSelectionRevision() !== selectionRevision) return;
 		}
+		if (args.session.getUserModelSelectionRevision() !== selectionRevision) {
+			modelSelectionChangedDuringRecovery = true;
+			applied = false;
+		}
 		if (
+			!modelSelectionChangedDuringRecovery &&
 			!applied &&
 			profilePassFailures.length > 0 &&
 			(onCredentialError !== undefined || onUnknownDefault !== undefined)
 		) {
 			if (!refreshedOnline) {
 				const failedProfiles = new Set(profilePassFailures.map(failure => failure.profileName));
-				const selectionRevision = args.session.getUserModelSelectionRevision();
 				await refreshAuthAndCatalog(true);
 				refreshedOnline = true;
 				if (args.session.getUserModelSelectionRevision() !== selectionRevision) {

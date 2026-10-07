@@ -67,6 +67,9 @@ function createControllerContext(
 		sessionId: "session-1",
 		scopedModels: [],
 		markUserModelSelection: vi.fn(),
+		async withSdkControlMutation<T>(body: () => Promise<T>): Promise<T> {
+			return body();
+		},
 		setModelTemporaryCalls: [] as Array<{ model: Model; thinkingLevel?: ThinkingLevel }>,
 		async setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel) {
 			this.setModelTemporaryCalls.push({ model: next, thinkingLevel });
