@@ -11,7 +11,7 @@ import {
 	sanitizedDetachedClone,
 } from "@gajae-code/agent-core/agent-loop";
 import type { AgentContext, AgentEvent, AgentLoopConfig } from "@gajae-code/agent-core/types";
-import type { AssistantMessage, AssistantMessageEvent, Message } from "@gajae-code/ai";
+import type { AssistantMessage, AssistantMessageEvent, Message, Model } from "@gajae-code/ai";
 import { classifyFallbackTrigger, transportFailureFacts } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
@@ -3900,29 +3900,32 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 		expect(outcomes).toHaveLength(1);
 		expect(outcomes[0]?.type).toBe("retryable_discarded");
 	});
+	const overloadFailure = {
+		kind: "transport",
+		providerCode: "server_is_overloaded",
+		openaiErrorCode: "server_is_overloaded",
+	} as const;
+	function responsesPlaceholder(model: Model<"mock">): AssistantMessage {
+		return {
+			...assistantMessage(model),
+			api: "openai-responses",
+			content: [{ type: "text", text: "" }],
+		};
+	}
 	async function runPlaceholderOverload(content: AssistantMessage["content"] = []) {
 		const mock = createMockModel();
 		const streamFn = () => {
 			const stream = new AssistantMessageEventStream();
-			const started: AssistantMessage = {
-				...assistantMessage(mock.model),
-				api: "openai-responses",
-				content: [{ type: "text", text: "" }],
-			};
 			const failure: AssistantMessage = {
 				...assistantMessage(mock.model),
 				api: "openai-responses",
 				stopReason: "error",
 				errorMessage: "server_is_overloaded: Our servers are currently overloaded. Please try again later.",
 				content,
-				transportFailure: {
-					kind: "transport",
-					providerCode: "server_is_overloaded",
-					openaiErrorCode: "server_is_overloaded",
-				},
+				transportFailure: overloadFailure,
 			};
 			queueMicrotask(() => {
-				stream.push({ type: "start", partial: started });
+				stream.push({ type: "start", partial: responsesPlaceholder(mock.model) });
 				stream.push({ type: "error", reason: "error", error: failure });
 			});
 			return stream;
@@ -4021,11 +4024,7 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
 			streamFn: async () => {
 				throw Object.assign(new Error("server_is_overloaded"), {
-					transportFailure: {
-						kind: "transport",
-						providerCode: "server_is_overloaded",
-						openaiErrorCode: "server_is_overloaded",
-					},
+					transportFailure: overloadFailure,
 				});
 			},
 		});
@@ -4058,13 +4057,8 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
 			streamFn: () => {
 				const stream = new AssistantMessageEventStream();
-				const started: AssistantMessage = {
-					...assistantMessage(mock.model),
-					api: "openai-responses",
-					content: [{ type: "text", text: "" }],
-				};
 				queueMicrotask(async () => {
-					stream.push({ type: "start", partial: started });
+					stream.push({ type: "start", partial: responsesPlaceholder(mock.model) });
 					await stream.waitForConsumerDrain(new AbortController().signal);
 					placeholderStaged.resolve();
 				});
@@ -4086,14 +4080,12 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 	});
 	it("tears down an aborted provider iterator exactly once", async () => {
 		const mock = createMockModel();
-		const factoryStarted = Promise.withResolvers<void>();
 		const iteratorReadStarted = Promise.withResolvers<void>();
 		let first = true;
 		let returnCalls = 0;
 		const agent = new Agent({
 			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
 			streamFn: () => {
-				factoryStarted.resolve();
 				return {
 					async next() {
 						if (first) {
@@ -4102,11 +4094,7 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 								done: false,
 								value: {
 									type: "start",
-									partial: {
-										...assistantMessage(mock.model),
-										api: "openai-responses",
-										content: [{ type: "text", text: "" }],
-									},
+									partial: responsesPlaceholder(mock.model),
 								},
 							};
 						}
@@ -4126,7 +4114,6 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 		const events: AgentEvent[] = [];
 		agent.subscribe(event => events.push(event));
 		const run = agent.prompt("run", { fallbackManaged: true });
-		await factoryStarted.promise;
 		await iteratorReadStarted.promise;
 		agent.abort();
 		await run;
@@ -4144,16 +4131,9 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 		const lateStream = {
 			async next() {
 				nextCalls += 1;
-				return {
-					done: false,
-					value: {
-						type: "start",
-						partial: {
-							...assistantMessage(mock.model),
-							content: [{ type: "text", text: "late content" }],
-						},
-					},
-				};
+				const partial = assistantMessage(mock.model);
+				partial.content = [{ type: "text", text: "late content" }];
+				return { done: false, value: { type: "start", partial } };
 			},
 			async return() {
 				returnCalls += 1;

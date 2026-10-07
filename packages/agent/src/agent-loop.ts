@@ -10,7 +10,6 @@ import {
 	type Context,
 	classifyContextOverflow,
 	classifyFallbackTrigger,
-	EMPTY_RESPONSE_PROVIDER_CODE,
 	EventStream,
 	isProviderSafetyStopAuthenticated,
 	isZodSchema,
@@ -798,6 +797,7 @@ function managedAssistantMessageHasContent(failure: unknown): boolean {
 // arbitrary destination. A destination is marked only while this managed
 // runtime is rebuilding a source that AI authenticated.
 const managedProviderSafetyStops = new WeakSet<object>();
+const managedLocalEmptyResponses = new WeakSet<object>();
 
 function isManagedProviderSafetyStopAuthenticated(value: unknown): boolean {
 	return (
@@ -807,6 +807,12 @@ function isManagedProviderSafetyStopAuthenticated(value: unknown): boolean {
 }
 
 function managedRetryableFailure(failure: unknown, transaction?: ManagedAttemptTransaction): boolean {
+	if (
+		managedProperty(failure, "stopReason") === "error" &&
+		managedProperty(failure, "errorKind") === "local_empty_response"
+	) {
+		return true;
+	}
 	const facts = managedTransportFailure(failure);
 	if (!facts) return false;
 	// OpenAI's typed statusless capacity-overload code (issue #5018) is
@@ -845,7 +851,7 @@ function managedRetryableFailure(failure: unknown, transaction?: ManagedAttemptT
 	);
 }
 
-function promoteTypedEmptyResponseStop(message: AssistantMessage): void {
+function promoteEmptyResponseStop(message: AssistantMessage): void {
 	if (
 		message.stopReason !== "stop" ||
 		message.content.length !== 0 ||
@@ -853,13 +859,16 @@ function promoteTypedEmptyResponseStop(message: AssistantMessage): void {
 		message.usage.output !== 0 ||
 		message.usage.cacheRead !== 0 ||
 		message.usage.cacheWrite !== 0 ||
-		message.usage.totalTokens !== 0 ||
-		managedTransportFailure(message)?.providerCode?.toLowerCase() !== EMPTY_RESPONSE_PROVIDER_CODE
+		message.usage.totalTokens !== 0
 	) {
 		return;
 	}
 	message.stopReason = "error";
 	message.errorMessage = "Provider returned an empty response with zero token usage";
+	// Preserve the runtime-owned retry classification for untyped provider
+	// payloads without inventing provider transport facts.
+	message.errorKind = "local_empty_response";
+	managedLocalEmptyResponses.add(message);
 }
 /**
  * Terminal safety-stop authority is provenance-bound, not data-bound: a
@@ -887,6 +896,7 @@ function sanitizeProviderSafetyStopProvenance(
 	const errorKindRead = managedPropertyRead(message, "errorKind");
 	if (
 		errorKindRead.ok &&
+		errorKindRead.value !== "local_empty_response" &&
 		(errorKindRead.value !== "provider_safety_stop" || isManagedProviderSafetyStopAuthenticated(message))
 	) {
 		return message;
@@ -2158,7 +2168,11 @@ function managedAssistantShell(
 	const errorKind =
 		stopReason === "error" && managedProperty(source, "errorKind") === "provider_safety_stop"
 			? ("provider_safety_stop" as const)
-			: undefined;
+			: stopReason === "error" &&
+					((typeof value === "object" && value !== null && managedLocalEmptyResponses.has(value)) ||
+						(typeof source === "object" && source !== null && managedLocalEmptyResponses.has(source)))
+				? ("local_empty_response" as const)
+				: undefined;
 	const safeMetadata: Record<string, unknown> = {};
 	if (isManagedPlainRecord(detailed.snapshot)) {
 		for (const key of Object.keys(detailed.snapshot)) {
@@ -2205,6 +2219,7 @@ function managedAssistantShell(
 		revokeProviderSafetyStop(value);
 		if (typeof value === "object" && value !== null) managedProviderSafetyStops.delete(value);
 	}
+	if (errorKind === "local_empty_response") managedLocalEmptyResponses.add(rebuilt);
 	return rebuilt;
 }
 
@@ -5053,7 +5068,7 @@ async function streamAssistantResponse(
 							const finalMessage = config.fallbackManaged
 								? managedAssistantShell(finished, config.model, managedDegradedFieldDiagnostics, true)
 								: finished;
-							promoteTypedEmptyResponseStop(finalMessage);
+							promoteEmptyResponseStop(finalMessage);
 							if (promptPrefix) finalMessage.promptPrefix = promptPrefix;
 							if (addedPartial) {
 								context.messages[context.messages.length - 1] = finalMessage;
@@ -5078,6 +5093,7 @@ async function streamAssistantResponse(
 			const trailing = config.fallbackManaged
 				? managedAssistantShell(finished, config.model, managedDegradedFieldDiagnostics, true)
 				: finished;
+			promoteEmptyResponseStop(trailing);
 			if (promptPrefix) trailing.promptPrefix = promptPrefix;
 			await finishChat(trailing);
 			return trailing;

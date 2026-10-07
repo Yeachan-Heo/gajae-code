@@ -932,10 +932,7 @@ describe("AgentSession managed fallback attempt transaction", () => {
 										}
 									},
 								}),
-								{
-									status: 200,
-									headers: { "content-type": "text/event-stream" },
-								},
+								{ status: 200, headers: { "content-type": "text/event-stream" } },
 							),
 						streamFirstEventTimeoutMs: 20,
 						streamIdleTimeoutMs: 5,
@@ -946,11 +943,8 @@ describe("AgentSession managed fallback attempt transaction", () => {
 					});
 					return stream;
 				}
-				return createMockModel({ responses: [{ content: ["real timeout recovered"] }] }).stream(
-					model,
-					context,
-					options,
-				);
+				const recovery = createMockModel({ responses: [{ content: ["real timeout recovered"] }] });
+				return recovery.stream(model, context, options);
 			},
 			1,
 			{ primaryModel: primary, fallbackModel: fallback },
