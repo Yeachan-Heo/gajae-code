@@ -634,6 +634,39 @@ describe("MCP 2026-07-28 authorization conformance", () => {
 		}
 	});
 
+	it("discards registration credentials when cancellation happens during response parsing", async () => {
+		const controller = new AbortController();
+		const bodyRead = Promise.withResolvers<void>();
+		const releaseBody = Promise.withResolvers<void>();
+		const response = Response.json({ client_id: "late-client-id", client_secret: "late-client-secret" });
+		const parseBody = response.json.bind(response);
+		vi.spyOn(response, "json").mockImplementation(async () => {
+			bodyRead.resolve();
+			await releaseBody.promise;
+			return parseBody();
+		});
+		using _hook = hookFetch(input => {
+			if (String(input) === "https://provider.example/.well-known/oauth-authorization-server") {
+				return Response.json({ registration_endpoint: "https://provider.example/register" });
+			}
+			if (String(input) === "https://provider.example/register") return response;
+			throw new Error(`Unexpected fetch: ${String(input)}`);
+		});
+		const flow = new MCPOAuthFlow({ ...baseConfig, clientId: undefined }, { signal: controller.signal });
+
+		const operation = flow.generateAuthUrl("state", "https://client.example/callback");
+		try {
+			await bodyRead.promise;
+			controller.abort(new Error("registration cancelled"));
+			releaseBody.resolve();
+			await expect(operation).rejects.toThrow("registration cancelled");
+			expect(flow.resolvedClientId).toBeUndefined();
+			expect(flow.registeredClientSecret).toBeUndefined();
+		} finally {
+			releaseBody.resolve();
+		}
+	});
+
 	it("rejects private token endpoints before the first fetch", async () => {
 		const lookup = vi.spyOn(dns, "lookup");
 		lookup.mockImplementation((async (hostname: string) => {
@@ -837,6 +870,34 @@ describe("MCP 2026-07-28 authorization conformance", () => {
 		} finally {
 			releaseToken.resolve();
 			server.stop(true);
+		}
+	});
+
+	it("rejects token credentials when cancellation happens during response parsing", async () => {
+		const controller = new AbortController();
+		const bodyRead = Promise.withResolvers<void>();
+		const releaseBody = Promise.withResolvers<void>();
+		const response = Response.json({ access_token: "late-access-token" });
+		const parseBody = response.json.bind(response);
+		vi.spyOn(response, "json").mockImplementation(async () => {
+			bodyRead.resolve();
+			await releaseBody.promise;
+			return parseBody();
+		});
+		using _hook = hookFetch(input => {
+			if (String(input) === "https://provider.example/token") return response;
+			throw new Error(`Unexpected fetch: ${String(input)}`);
+		});
+		const flow = new MCPOAuthFlow(baseConfig, { signal: controller.signal });
+
+		const operation = flow.exchangeToken("code", "state", "https://client.example/callback");
+		try {
+			await bodyRead.promise;
+			controller.abort(new Error("token exchange cancelled"));
+			releaseBody.resolve();
+			await expect(operation).rejects.toThrow("token exchange cancelled");
+		} finally {
+			releaseBody.resolve();
 		}
 	});
 
