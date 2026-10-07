@@ -227,6 +227,7 @@ export async function runManagedEmptyStopScenario(
 				"contextPromotion.enabled": false,
 				"todo.reminders": false,
 				"fallback.maxAttempts": 1,
+				"retry.enabled": false,
 				"retry.baseDelayMs": 1,
 				"fallback.circuitCooldownMs": 0,
 			});
@@ -346,7 +347,6 @@ export async function runManagedEmptyStopScenario(
 					.map(({ from, to, reason }) => ({ from, to, reason })),
 				managedTranscriptExists: transcript !== undefined && (await Bun.file(transcript).exists()),
 			};
-			if (scenario === "fallback-enabled") throw new Error(JSON.stringify(report));
 			assertScenarioReport(report);
 			return report;
 		});
