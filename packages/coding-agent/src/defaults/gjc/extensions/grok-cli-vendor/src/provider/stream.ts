@@ -7,7 +7,13 @@ import type {
   SimpleStreamOptions,
 } from '@gajae-code/ai/core';
 import { streamOpenAIResponses } from '@gajae-code/ai/providers/openai-responses';
-import { getGrokCliVersion, updateVersionFromError } from './version-manager';
+import {
+  getGrokCliVersion,
+  parseMinimumVersionFrom426,
+  updateVersionFromError,
+} from './version-manager';
+
+type FetchInput = Parameters<FetchImpl>[0];
 
 /**
  * Stream function that adds Grok CLI-specific headers to requests.
@@ -16,7 +22,7 @@ import { getGrokCliVersion, updateVersionFromError } from './version-manager';
  *   - x-grok-conv-id: <session/conversation ID>
  *   - x-grok-model-override: <model ID>
  *   - x-xai-token-auth: xai-grok-cli
- *   - x-grok-client-version: learned from HTTP 426 responses; defaults to 1.0.13
+ *   - x-grok-client-version: learned from HTTP 426 responses; defaults to 1.0.13 and retries once on upgrade
  */
 export function streamGrokCli(
   model: Model<Api>,
@@ -53,39 +59,54 @@ export function streamGrokCli(
     ...options,
     headers,
     fetch: wrappedFetch,
-    onResponse(response) {
-      options?.onResponse?.(response, model);
+    onResponse(response, _responseModel, scope, signal) {
+      return options?.onResponse?.(response, model, scope, signal);
     },
   });
 }
 
 /**
- * Wraps a fetch function to intercept HTTP 426 responses and extract version info.
- * When a 426 error is received, reads the response body and updates the version cache.
+ * Wraps a fetch function to learn from HTTP 426 responses and retry once with a newer version.
  */
 function wrapFetchForVersionHandling(baseFetch: FetchImpl): FetchImpl {
   return Object.assign(
-    async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-      const response = await baseFetch(input, init);
+    async (input: FetchInput, init?: RequestInit): Promise<Response> => {
+      const firstInput =
+        input instanceof Request ? (input.clone() as unknown as FetchInput) : input;
+      const response = await baseFetch(firstInput, init);
 
-      // Handle HTTP 426 "version outdated" errors by reading the body and updating the cache
-      if (response.status === 426) {
+      if (response.status !== 426) return response;
+
+      let errorText: string;
+      try {
+        errorText = await response.clone().text();
+      } catch {
+        return response;
+      }
+
+      if (!parseMinimumVersionFrom426(errorText)) return response;
+
+      const retryHeaders = new Headers(
+        init?.headers ?? (input instanceof Request ? input.headers : undefined),
+      );
+      const requestedVersion = retryHeaders.get('x-grok-client-version');
+      const learnedVersion = updateVersionFromError(errorText);
+      if (!requestedVersion || learnedVersion === requestedVersion) return response;
+
+      retryHeaders.set('x-grok-client-version', learnedVersion);
+      const retryInput =
+        input instanceof Request ? (input.clone() as unknown as FetchInput) : input;
+      const retryResponse = await baseFetch(retryInput, { ...init, headers: retryHeaders });
+
+      if (retryResponse.status === 426) {
         try {
-          const errorText = await response.text();
-          updateVersionFromError(errorText);
-          // Return a new response since we consumed the body
-          return new Response(errorText, {
-            status: response.status,
-            statusText: response.statusText,
-            headers: response.headers,
-          });
+          updateVersionFromError(await retryResponse.clone().text());
         } catch {
-          // If body reading fails, return the original response
-          return response;
+          // Keep the retry response intact if its body cannot be inspected.
         }
       }
 
-      return response;
+      return retryResponse;
     },
     { preconnect: baseFetch.preconnect },
   ) as FetchImpl;

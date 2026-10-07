@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import type * as nodeFs from "node:fs";
+import * as nodeFs from "node:fs";
 import { constants as fsConstants, type Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import * as fs from "node:fs/promises";

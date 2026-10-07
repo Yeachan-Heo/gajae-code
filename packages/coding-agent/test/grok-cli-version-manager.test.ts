@@ -37,11 +37,10 @@ describe("Grok CLI version manager", () => {
 			expect(version).toBeNull();
 		});
 
-		it("handles malformed version numbers gracefully", () => {
+		it("rejects malformed version numbers", () => {
 			const errorBody = "Your Grok CLI version (0.2.33) is outdated. Please update to version x.y.z or later";
 			const version = parseMinimumVersionFrom426(errorBody);
-			// Should still extract even if format is unusual
-			expect(version).toBe("x.y.z");
+			expect(version).toBeNull();
 		});
 	});
 
@@ -69,6 +68,13 @@ describe("Grok CLI version manager", () => {
 	});
 
 	describe("version caching and monotonic updates", () => {
+		it("does not learn a minimum below the active fallback", () => {
+			const errorBody = "Your Grok CLI version (0.2.33) is outdated. Please update to version 1.0.12 or later";
+
+			expect(updateVersionFromError(errorBody)).toBe(getFallbackVersion());
+			expect(getGrokCliVersion()).toBe(getFallbackVersion());
+		});
+
 		it("uses cached version on subsequent calls", () => {
 			// Set a version via 426 error handling
 			const errorBody = "Your Grok CLI version (0.2.33) is outdated. Please update to version 1.2.3 or later";
