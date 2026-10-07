@@ -271,11 +271,12 @@ describe("Kiro API-key content filter #6150", () => {
 		const emittedEvents: Array<{ type: string; error?: string }> = [];
 
 		globalThis.fetch = (async () => {
-			// Response with a tool call (name and toolUseId indicate a tool use)
+			// Response with a complete tool call (stop flag indicates tool is complete)
 			const responseBody = JSON.stringify({
 				toolUseId: "tool-1",
 				name: "read_file",
 				input: '{"path":"/etc/passwd"}',
+				stop: true,
 			});
 			return new Response(responseBody, { status: 200 });
 		}) as unknown as typeof fetch;
@@ -427,11 +428,11 @@ describe("Kiro API-key content filter #6150", () => {
 		expect(errorEvent).toBeUndefined();
 	});
 
-	test("#6151: text + tool + COMPLETED metadata emits all tool events and completes normally", async () => {
+	test("#6151: text + tool + COMPLETED metadata emits text events and completes normally (incomplete tool dropped)", async () => {
 		const emittedEvents: Array<{ type: string }> = [];
 
 		globalThis.fetch = (async () => {
-			// Simulate response with text, tool call, and normal completion metadata
+			// Simulate response with text, tool call (incomplete - no stop flag), and normal completion metadata
 			const responseBody =
 				JSON.stringify({ content: "I'll read that file" }) +
 				JSON.stringify({ toolUseId: "tool-1", name: "read_file", input: '{"path":"/tmp/test"}' }) +
@@ -448,7 +449,7 @@ describe("Kiro API-key content filter #6150", () => {
 			// Stream may throw; events are captured
 		}
 
-		// Should emit both text and tool call events
+		// Should emit text events but NOT incomplete tool call events
 		const textDeltaEvents = emittedEvents.filter(e => e.type === "text_delta");
 		const toolcallStart = emittedEvents.find(e => e.type === "toolcall_start");
 		const toolcallEnd = emittedEvents.find(e => e.type === "toolcall_end");
@@ -456,8 +457,8 @@ describe("Kiro API-key content filter #6150", () => {
 		const errorEvent = emittedEvents.find(e => e.type === "error");
 
 		expect(textDeltaEvents.length).toBeGreaterThan(0);
-		expect(toolcallStart).toBeDefined();
-		expect(toolcallEnd).toBeDefined();
+		expect(toolcallStart).toBeUndefined();
+		expect(toolcallEnd).toBeUndefined();
 		expect(doneEvent).toBeDefined();
 		expect(errorEvent).toBeUndefined();
 	});
@@ -778,11 +779,11 @@ describe("reasoning-before-answer contentIndex invariant #6151", () => {
 		}> = [];
 
 		globalThis.fetch = (async () => {
-			// Simulate response with thinking, text, and tool call
+			// Simulate response with thinking, text, and tool call (complete with stop flag)
 			const responseBody =
 				JSON.stringify({
 					content: "<thinking>I need to read a file</thinking>Let me read that file for you.",
-				}) + JSON.stringify({ toolUseId: "tool-123", name: "read_file", input: '{"path":"/tmp/test.txt"}' });
+				}) + JSON.stringify({ toolUseId: "tool-123", name: "read_file", input: '{"path":"/tmp/test.txt"}', stop: true });
 			return new Response(responseBody, { status: 200 });
 		}) as unknown as typeof fetch;
 
@@ -1303,17 +1304,17 @@ describe("P1 Regression: incomplete tool emission at tool-ID rollover", () => {
 		expect(toolcallEndIds).toEqual(["tool-2"]);
 	});
 
-	test("P1: tool without stop is implicitly completed at clean stream end", async () => {
+	test("P1: tool without stop is dropped at clean stream end", async () => {
 		const emittedEventTypes: string[] = [];
 		const toolcallEndIds: string[] = [];
 
 		globalThis.fetch = (async () => {
-			// Tool without stop flag at stream end
+			// Tool without stop flag at stream end - should be dropped per P1 behavior
 			const tool = JSON.stringify({
 				toolUseId: "tool-incomplete",
 				name: "read_file",
 				input: '{"path": "/tmp/test"}',
-				// NOTE: no "stop": true — tool is incomplete
+				// NOTE: no "stop": true — tool is incomplete and should be dropped
 			});
 			const completion = JSON.stringify({
 				stopReason: "COMPLETED",
@@ -1334,9 +1335,9 @@ describe("P1 Regression: incomplete tool emission at tool-ID rollover", () => {
 		}
 
 		expect(emittedEventTypes).toContain("done");
-		expect(emittedEventTypes.filter(type => type === "toolcall_start")).toHaveLength(1);
-		expect(emittedEventTypes.filter(type => type === "toolcall_end")).toHaveLength(1);
-		expect(toolcallEndIds).toEqual(["tool-incomplete"]);
+		expect(emittedEventTypes.filter(type => type === "toolcall_start")).toHaveLength(0);
+		expect(emittedEventTypes.filter(type => type === "toolcall_end")).toHaveLength(0);
+		expect(toolcallEndIds).toEqual([]);
 	});
 });
 
