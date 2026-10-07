@@ -94,37 +94,6 @@ function typedFirstEventTimeoutStream(model: Model): AssistantMessageEventStream
 	});
 	return stream;
 }
-function typedStatuslessOverloadStream(model: Model): AssistantMessageEventStream {
-	const stream = new AssistantMessageEventStream();
-	queueMicrotask(() => {
-		const message: AssistantMessage = {
-			role: "assistant",
-			content: [],
-			api: model.api,
-			provider: model.provider,
-			model: model.id,
-			usage: {
-				input: 0,
-				output: 0,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 0,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-			stopReason: "error",
-			errorMessage: "server_is_overloaded: Please try again later.",
-			transportFailure: {
-				kind: "transport",
-				providerCode: "server_is_overloaded",
-				openaiErrorCode: "server_is_overloaded",
-			},
-			timestamp: Date.now(),
-		};
-		stream.push({ type: "start", partial: message });
-		stream.push({ type: "error", reason: "error", error: message });
-	});
-	return stream;
-}
 function collapsedSnapshotStream(model: Model): AssistantMessageEventStream {
 	const stream = new AssistantMessageEventStream();
 	queueMicrotask(() => {
@@ -858,6 +827,11 @@ describe("AgentSession managed fallback attempt transaction", () => {
 		});
 	});
 	it("admits a clean typed overload successor after a committed tool attempt", async () => {
+		const primary = getBundledModel("openai", "gpt-5-mini");
+		const fallback = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!primary || !fallback || primary.api !== "openai-responses") {
+			throw new Error("Expected bundled OpenAI Responses and Anthropic test models");
+		}
 		const toolCall: ToolCall = { type: "toolCall", id: "overload-tool", name: "counted", arguments: {} };
 		const tool: AgentTool = {
 			name: "counted",
@@ -871,7 +845,42 @@ describe("AgentSession managed fallback attempt transaction", () => {
 			(model, context, options) => {
 				streamCalls++;
 				if (streamCalls === 1) return toolUseStream(model, toolCall);
-				if (streamCalls === 2) return typedStatuslessOverloadStream(model);
+				if (streamCalls === 2) {
+					const events = [
+						{ type: "response.created", response: { id: "resp_local", status: "in_progress" } },
+						{
+							type: "response.output_item.added",
+							output_index: 0,
+							item: { id: "msg_local", type: "message", role: "assistant", content: [] },
+						},
+						{
+							type: "response.content_part.added",
+							item_id: "msg_local",
+							output_index: 0,
+							content_index: 0,
+							part: { type: "output_text", text: "" },
+						},
+						{
+							type: "response.failed",
+							response: {
+								error: {
+									code: "server_is_overloaded",
+									message: "Our servers are currently overloaded. Please try again later.",
+								},
+							},
+						},
+					];
+					return streamOpenAIResponses(model as Model<"openai-responses">, context, {
+						...options,
+						apiKey: "local-test-key",
+						fetch: async () =>
+							new Response(`${events.map(event => `data: ${JSON.stringify(event)}`).join("\n\n")}\n\n`, {
+								status: 200,
+								headers: { "content-type": "text/event-stream" },
+							}),
+						requestMaxRetries: 0,
+					});
+				}
 				return createMockModel({ responses: [{ content: ["overload recovered"] }] }).stream(
 					model,
 					context,
@@ -879,7 +888,7 @@ describe("AgentSession managed fallback attempt transaction", () => {
 				);
 			},
 			1,
-			{ tools: [tool] },
+			{ tools: [tool], primaryModel: primary, fallbackModel: fallback },
 		);
 
 		await session!.prompt("commit tool then admit clean typed overload successor");
