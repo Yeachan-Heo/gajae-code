@@ -1503,7 +1503,7 @@ async function recordRalplanLaneAdmissionRejected(
 	reason: string,
 ): Promise<void> {
 	const runDir = path.join(sessionPlansDir(cwd, sessionId), "ralplan", runId);
-	await appendJsonlIdempotent(
+	await appendRalplanIndexIdempotent(
 		path.join(runDir, "index.jsonl"),
 		{
 			event: "planning_admission_rejected",
@@ -1597,7 +1597,7 @@ async function recordRalplanAdmissionRecoveries(
 	}
 	for (const [identity, admission] of rejected) {
 		if (admission.generation >= currentGeneration || recovered.has(identity)) continue;
-		await appendJsonlIdempotent(
+		await appendRalplanIndexIdempotent(
 			indexPath,
 			{
 				event: "planning_admission_recovered",
@@ -2594,6 +2594,15 @@ async function handleArtifactWrite(
 	const resolved = await resolveArtifactArgs(args, persistCwd, cwd, {
 		confineArtifactRoot: target.explicit ? cwd : undefined,
 	});
+	// Lock creation can create `.gjc` parents. Validate repository ownership before
+	// acquiring either publication or admission locks so a rejected linked-worktree
+	// write cannot mutate a target that does not own this run. Recheck under the
+	// admission lock below to keep the write fence race-safe.
+	if (!runAdmissionLockHeld) {
+		await enforceRalplanRepositoryBinding(persistCwd, resolved.sessionId, {
+			exactWorktreeRoot: target.explicit,
+		});
+	}
 	if (resolved.stage === "final" && !finalPublicationLockHeld) {
 		const publicationLockPath = path.join(
 			sessionPlansDir(persistCwd, resolved.sessionId),
@@ -2711,11 +2720,7 @@ async function handleArtifactWrite(
 						persistCwd,
 						resolved.sessionId,
 						resolved.runId,
-						applyRalplanAdmissionOverrides(
-							existingArtifact.autoHandoff,
-							planningStuck,
-							planningAdmissionPending,
-						),
+						applyRalplanAdmissionOverrides(existingArtifact.autoHandoff, planningStuck, planningAdmissionPending),
 						publication,
 					);
 				}
