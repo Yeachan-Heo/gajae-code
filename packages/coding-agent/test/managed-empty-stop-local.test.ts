@@ -9,6 +9,7 @@ import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { ExtensionRuntime, loadExtensionFromFactory } from "../src/extensibility/extensions/loader";
 import { ExtensionRunner } from "../src/extensibility/extensions/runner";
+import type { ExtensionFactory } from "../src/extensibility/extensions/types";
 import { createAgentSession } from "../src/sdk";
 import { createSdkSessionRuntimeExtension } from "../src/sdk/host/session-runtime";
 import { AgentSession, type AgentSessionEvent } from "../src/session/agent-session";
@@ -72,26 +73,26 @@ test.each(
 			initialization === "sdk"
 				? SessionManager.create(root, SessionManager.managedDestination(root, root))
 				: SessionManager.inMemory();
-		const runtime = new ExtensionRuntime();
-		const extension = await loadExtensionFromFactory(
-			api => {
-				// Exercise production registration and delivery with the real provider
-				// stream. Without session_start, this local test never starts a broker.
-				createSdkSessionRuntimeExtension(api, {
-					agentDir: process.cwd(),
-					createTransport: () => {
-						throw new Error("Local integration must not launch an SDK transport");
-					},
-				});
-			},
-			process.cwd(),
-			new EventBus(),
-			runtime,
-			"sdk-lifecycle-observer-test",
-		);
-		const runner = new ExtensionRunner([extension], runtime, process.cwd(), manager, registry, undefined, settings);
-		expect(runner.hasHandlers("agent_start")).toBe(true);
+		const sdkObserver: ExtensionFactory = api => {
+			// Register on the runner that actually drives each session. Without
+			// session_start, production lifecycle observation needs no transport.
+			createSdkSessionRuntimeExtension(api, {
+				agentDir: root,
+				createTransport: () => {
+					throw new Error("Local integration must not launch an SDK transport");
+				},
+			});
+		};
 		if (initialization === "direct") {
+			const runtime = new ExtensionRuntime();
+			const extension = await loadExtensionFromFactory(
+				sdkObserver,
+				root,
+				new EventBus(),
+				runtime,
+				"sdk-lifecycle-observer-test",
+			);
+			const runner = new ExtensionRunner([extension], runtime, root, manager, registry, undefined, settings);
 			const agent = new Agent({
 				initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
 				getApiKey: async () => registry.getApiKeyForProvider("empty-stop-fixture"),
@@ -113,6 +114,7 @@ test.each(
 				sessionManager: manager,
 				modelRegistry: registry,
 				disableExtensionDiscovery: true,
+				extensions: [sdkObserver],
 				enableMCP: false,
 				enableMcpAutoload: false,
 				enableLsp: false,
@@ -127,6 +129,7 @@ test.each(
 				slashCommands: [],
 			}));
 		}
+		expect(session.extensionRunner?.hasHandlers("agent_start")).toBe(true);
 		session.setConfiguredModelChain(
 			"default",
 			scenario === "nonzero-usage" || scenario.endsWith("disabled")
