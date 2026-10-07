@@ -1,4 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import { isFileLockAcquireTimeout } from "../../config/file-lock";
 import { type BrokerDiscovery, readBrokerDiscovery, readBrokerRestartIntent } from "./discovery";
 import { withBrokerStartupLock } from "./ensure";
 import { isProcessIncarnation, observeProcessIncarnation } from "./process-incarnation";
@@ -22,7 +23,8 @@ export type AuthorizedBrokerSuccessorResult =
 				| "intent_not_committed"
 				| "spawn_failed"
 				| "spawn_exited_before_publication"
-				| "publication_timeout";
+				| "publication_timeout"
+				| "startup_lock_unavailable";
 			detail?: string;
 	  };
 
@@ -43,64 +45,76 @@ const SUCCESSOR_SPAWN_POLL_MS = 25;
 export async function launchAuthorizedBrokerSuccessor(
 	options: AuthorizedBrokerSuccessorOptions,
 ): Promise<AuthorizedBrokerSuccessorResult> {
-	const spawnOutcome = await withBrokerStartupLock(options.agentDir, async deadline => {
-		if (Date.now() >= Math.min(deadline, options.deadlineAt))
-			return { kind: "refused" as const, reason: "deadline_elapsed" as const };
-		// Only a durably COMMITTED intent for this exact requestId authorizes a
-		// spawn. A prepared-but-not-committed or absent intent means the owner
-		// side of the protocol never reached its commit boundary, so no successor
-		// may exist yet -- spawning here would double-launch a broker the owner
-		// might still be about to retire cleanly on its own.
-		const intent = await readBrokerRestartIntent(options.agentDir);
-		if (intent?.phase !== "committed" || intent.requestId !== options.requestId)
-			return { kind: "refused" as const, reason: "intent_not_committed" as const };
-		const existing = await readBrokerDiscovery(options.agentDir);
-		if (
-			existing &&
-			existing.packageGeneration === options.packageGeneration &&
-			existing.restartRequestId === options.requestId
-		)
-			return { kind: "adopted" as const, discovery: existing };
-		const command = resolveSdkInternalSpawnCommand(
-			process.platform === "win32" ? "broker-internal" : "broker-trampoline-internal",
-		);
-		let child: ChildProcess;
-		const isTrampoline = process.platform !== "win32";
-		try {
-			child = spawn(command.file, [...command.args, "--agent-dir", options.agentDir], {
-				detached: true,
-				stdio: isTrampoline ? ["ignore", "pipe", "ignore"] : "ignore",
-				env: { ...command.env, GJC_BROKER_RESTART_REQUEST: options.requestId },
-				...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
+	let spawnOutcome: any;
+	try {
+		spawnOutcome = await withBrokerStartupLock(options.agentDir, async deadline => {
+			if (Date.now() >= Math.min(deadline, options.deadlineAt))
+				return { kind: "refused" as const, reason: "deadline_elapsed" as const };
+			// Only a durably COMMITTED intent for this exact requestId authorizes a
+			// spawn. A prepared-but-not-committed or absent intent means the owner
+			// side of the protocol never reached its commit boundary, so no successor
+			// may exist yet -- spawning here would double-launch a broker the owner
+			// might still be about to retire cleanly on its own.
+			const intent = await readBrokerRestartIntent(options.agentDir);
+			if (intent?.phase !== "committed" || intent.requestId !== options.requestId)
+				return { kind: "refused" as const, reason: "intent_not_committed" as const };
+			const existing = await readBrokerDiscovery(options.agentDir);
+			if (
+				existing &&
+				existing.packageGeneration === options.packageGeneration &&
+				existing.restartRequestId === options.requestId
+			)
+				return { kind: "adopted" as const, discovery: existing };
+			const command = resolveSdkInternalSpawnCommand(
+				process.platform === "win32" ? "broker-internal" : "broker-trampoline-internal",
+			);
+			let child: ChildProcess;
+			const isTrampoline = process.platform !== "win32";
+			try {
+				child = spawn(command.file, [...command.args, "--agent-dir", options.agentDir], {
+					detached: true,
+					stdio: isTrampoline ? ["ignore", "pipe", "ignore"] : "ignore",
+					env: { ...command.env, GJC_BROKER_RESTART_REQUEST: options.requestId },
+					...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
+				});
+			} catch (spawnError) {
+				return {
+					kind: "refused" as const,
+					reason: "spawn_failed" as const,
+					detail: spawnError instanceof Error ? spawnError.message : String(spawnError),
+				};
+			}
+			let spawnError: Error | undefined;
+			let trampolineOutput = "";
+			let trampolineOutputEnded = !isTrampoline;
+			if (child.stdout)
+				child.stdout
+					.setEncoding("utf8")
+					.on("data", chunk => (trampolineOutput += chunk))
+					.once("end", () => (trampolineOutputEnded = true));
+			child.once("error", childError => {
+				spawnError = childError;
 			});
-		} catch (spawnError) {
+			child.unref();
+			return {
+				kind: "spawned" as const,
+				child,
+				isTrampoline,
+				trampolineOutput: () => trampolineOutput,
+				trampolineOutputEnded: () => trampolineOutputEnded,
+				spawnError: () => spawnError,
+			};
+		});
+	} catch (error) {
+		if (isFileLockAcquireTimeout(error)) {
 			return {
 				kind: "refused" as const,
-				reason: "spawn_failed" as const,
-				detail: spawnError instanceof Error ? spawnError.message : String(spawnError),
+				reason: "startup_lock_unavailable" as const,
+				detail: (error as Error).message,
 			};
 		}
-		let spawnError: Error | undefined;
-		let trampolineOutput = "";
-		let trampolineOutputEnded = !isTrampoline;
-		if (child.stdout)
-			child.stdout
-				.setEncoding("utf8")
-				.on("data", chunk => (trampolineOutput += chunk))
-				.once("end", () => (trampolineOutputEnded = true));
-		child.once("error", childError => {
-			spawnError = childError;
-		});
-		child.unref();
-		return {
-			kind: "spawned" as const,
-			child,
-			isTrampoline,
-			trampolineOutput: () => trampolineOutput,
-			trampolineOutputEnded: () => trampolineOutputEnded,
-			spawnError: () => spawnError,
-		};
-	});
+		throw error;
+	}
 	if (spawnOutcome.kind !== "spawned") return spawnOutcome;
 	const { child } = spawnOutcome;
 	let successorPid: number | undefined;
@@ -109,7 +123,7 @@ export async function launchAuthorizedBrokerSuccessor(
 	let trampolineExitCode: number | null = null;
 	let trampolineSignal: NodeJS.Signals | null = null;
 	if (spawnOutcome.isTrampoline)
-		child.once("exit", (code, signal) => {
+		child.once("exit", (code: number | null, signal: NodeJS.Signals | null) => {
 			trampolineExitCode = code;
 			trampolineSignal = signal;
 			trampolineExited = true;

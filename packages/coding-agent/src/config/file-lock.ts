@@ -107,8 +107,14 @@ const DEFAULT_OPTIONS: Required<
 const PUBLICATION_SHARING_RETRY_ATTEMPTS = 3;
 const PUBLICATION_SHARING_RETRY_DELAY_MS = 10;
 
-/** Ownerless empty residue must outlive both this grace and the acquire budget. */
+/** Grace period after which an unpublished removal transition becomes reclaimable as orphan. */
 const REMOVAL_TRANSITION_GRACE_MS = 10_000;
+/**
+ * Additional buffer beyond the grace period to ensure a retained removal transition
+ * whose owner died is reclaimed promptly, decoupled from acquisition retry budget.
+ * This bounds how long a dead owner's transition can block lock acquisition.
+ */
+const REMOVAL_TRANSITION_ADOPTION_BUFFER_MS = 5_000;
 
 /** Release retries cover transient handle denial and a competing exact-removal quarantine cleanup. */
 export const FILE_LOCK_RELEASE_RETRY_ATTEMPTS = 20;
@@ -2499,7 +2505,7 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 	if (options.previousOwnerHostIds?.some(hostId => !hostId))
 		throw new Error("previousOwnerHostIds must contain only non-empty identities");
 	const opts = { ...DEFAULT_OPTIONS, ...options };
-	const orphanTransitionAgeMs = Math.max(REMOVAL_TRANSITION_GRACE_MS, opts.retries * opts.retryDelayMs);
+	const orphanTransitionAgeMs = REMOVAL_TRANSITION_GRACE_MS + REMOVAL_TRANSITION_ADOPTION_BUFFER_MS;
 
 	if (opts.signal?.aborted) throw opts.signal.reason ?? new Error("File lock acquisition aborted");
 	const lockPath = getLockPath(filePath);
