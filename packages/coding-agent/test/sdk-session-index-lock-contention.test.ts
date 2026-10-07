@@ -310,8 +310,9 @@ describe("SDK session index lock contention (#4544)", () => {
 			incarnation.mockRestore();
 			vi.restoreAllMocks();
 		}
-		// The next pass, on a fast replay, re-probes and writes normally.
-		expect(await index.checkpointLiveHeartbeats()).toBe(1);
+		// The heartbeat written by the fresh re-probe is still within the
+		// interval, so the next pass has nothing to checkpoint.
+		expect(await index.checkpointLiveHeartbeats()).toBe(0);
 	});
 
 	it("fails closed on a stale batch even when the wall clock steps backward", async () => {
@@ -369,30 +370,38 @@ describe("SDK session index lock contention (#4544)", () => {
 		const index = await new SessionIndex(dir).open();
 		// The FIRST bound (SESSION_INDEX_PROBE_FRESHNESS_MS = 50ms) fires at lock
 		// acquisition, before the replay: a probe batch that queues behind even a
-		// short legitimate holder is discarded. Advance the monotonic clock during
-		// acquisition (inside the lock wrapper, before the callback body).
+		// short legitimate holder is discarded. Stall EVERY acquisition so each
+		// bounded re-probe attempt also goes stale: the pass must still write
+		// nothing rather than fall back to a stale observation.
 		let incarnationCalls = 0;
 		const realProcessIncarnation = incarnationModule.processIncarnation;
 		const incarnation = vi.spyOn(incarnationModule, "processIncarnation").mockImplementation(pid => {
 			incarnationCalls++;
 			return realProcessIncarnation(pid);
 		});
+		const realMono = performance.now.bind(performance);
+		let offset = 0;
+		const mono = vi.spyOn(performance, "now").mockImplementation(() => realMono() + offset);
 		const realWithFileLock = lockModule.withFileLock;
+		let stalls = 0;
 		const spy = vi
 			.spyOn(lockModule, "withFileLock")
 			.mockImplementation(async (filePath: Parameters<typeof realWithFileLock>[0], fn, options) => {
 				if (incarnationCalls > 0 && String(filePath).endsWith("index.jsonl")) {
-					const realMono = performance.now.bind(performance);
-					vi.spyOn(performance, "now").mockImplementation(() => realMono() + 100);
+					stalls++;
+					offset += 100;
 				}
 				return await realWithFileLock(filePath, fn, options);
 			});
 		try {
 			expect(await index.checkpointLiveHeartbeats()).toBe(0);
+			expect(stalls).toBeGreaterThanOrEqual(2);
+			expect(incarnationCalls).toBe(stalls);
 			const rows = index.listSessions().sessions;
 			expect(rows[0]?.lastHeartbeatAt).toBeUndefined();
 		} finally {
 			spy.mockRestore();
+			mono.mockRestore();
 			incarnation.mockRestore();
 			vi.restoreAllMocks();
 		}
