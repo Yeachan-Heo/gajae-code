@@ -479,8 +479,8 @@ export interface ScanSkillsFromDirOptions {
 	linkContainmentRoot?: string;
 	/** Filesystem authority for explicit-home reads. */
 	scope?: ReadScope;
-	/** When true and level is "user", permit skill symlinks resolving outside the scan root. */
-	trustUserSkills?: boolean;
+	/** User-owned permission to follow symlinks outside a user-scope scan root. */
+	allowExternalUserSkillSymlinks?: boolean;
 }
 
 // Stable ordering used for skill lists in prompts: name (case-insensitive), then name, then path.
@@ -795,7 +795,7 @@ export async function scanSkillsFromDir(
 					: true,
 				skillPathAndLinksAreCurrent(expectedFile, linkIdentities),
 			]);
-			const allowOutsideRoot = options.trustUserSkills && level === "user";
+			const allowOutsideRoot = options.allowExternalUserSkillSymlinks && level === "user";
 			if (
 				!opened.isFile() ||
 				opened.nlink !== 1n ||
@@ -885,7 +885,7 @@ export async function scanSkillsFromDir(
 				])
 			).filter((identity): identity is SkillLinkIdentity => identity !== null);
 			const skillPath = await fs.promises.realpath(candidatePath);
-			const allowOutsideRoot = options.trustUserSkills && level === "user";
+			const allowOutsideRoot = options.allowExternalUserSkillSymlinks && level === "user";
 			if (!isWithinRoot(skillPath) && !allowOutsideRoot) {
 				const remedy =
 					level === "user"

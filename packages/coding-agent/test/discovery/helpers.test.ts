@@ -852,7 +852,7 @@ describe("safe discovery boundaries", () => {
 					providerId: "test",
 					level: "user",
 					requireDescription: true,
-					trustUserSkills: false,
+					allowExternalUserSkillSymlinks: false,
 				},
 			);
 			expect(resultWithoutTrust.items).toHaveLength(0);
@@ -871,7 +871,7 @@ describe("safe discovery boundaries", () => {
 					providerId: "test",
 					level: "user",
 					requireDescription: true,
-					trustUserSkills: true,
+					allowExternalUserSkillSymlinks: true,
 				},
 			);
 			expect(resultWithTrust.items).toHaveLength(1);
@@ -914,7 +914,7 @@ describe("safe discovery boundaries", () => {
 					providerId: "test",
 					level: "user",
 					requireDescription: true,
-					trustUserSkills: true,
+					allowExternalUserSkillSymlinks: true,
 				},
 			);
 			const loadContent = result.items[0]?.loadContent;
@@ -950,7 +950,7 @@ describe("safe discovery boundaries", () => {
 					providerId: "test",
 					level: "user",
 					requireDescription: true,
-					trustUserSkills: true,
+					allowExternalUserSkillSymlinks: true,
 				},
 			);
 			const loadContent = result.items[0]?.loadContent;

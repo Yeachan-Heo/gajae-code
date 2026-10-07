@@ -125,6 +125,8 @@ export interface LoadSkillsOptions extends SkillsSettings {
 	agentDir?: string;
 	/** Resolver-owned classification for the selected agent directory. */
 	profileAuthority?: "default" | "custom";
+	/** User-owned permission to follow symlinks outside user skill scan roots. */
+	allowExternalUserSkillSymlinks?: boolean;
 }
 
 /**
@@ -167,6 +169,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 
 	const projectTrusted = resolveSkillScopeTrust(options, "project");
 	const userTrusted = resolveSkillScopeTrust(options, "user");
+	const allowExternalUserSkillSymlinks = options.allowExternalUserSkillSymlinks ?? userTrusted;
 
 	// Skill scope trust decides which canonical locations are loaded: project
 	// scope covers `.gjc/skills` (walk-up), user scope covers `~/.gjc/agent/skills`
@@ -197,7 +200,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		userAgentDir: agentDir,
 		profileAuthority,
 		repoRoot: await findRepoRoot(cwd),
-		trustUserSkills: userTrusted,
+		allowExternalUserSkillSymlinks,
 	};
 	const providerResults = await Promise.all(
 		providers.map(async provider => {
@@ -318,7 +321,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 					providerId: "custom",
 					level: "user",
 					requireDescription: true,
-					trustUserSkills: userTrusted,
+					allowExternalUserSkillSymlinks,
 				},
 			);
 			return { expandedDir, scanResult };

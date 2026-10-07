@@ -32,7 +32,7 @@ import { type SlashCommand, slashCommandCapability } from "../capability/slash-c
 import { type CustomTool, toolCapability } from "../capability/tool";
 import type { Capability, LoadContext, LoadResult, SourceMeta } from "../capability/types";
 import { Settings, type Settings as SettingsInstance } from "../config/settings";
-import { resolveSkillScopeTrust } from "../config/skill-settings-defaults";
+import { resolveGlobalUserSkillLinkTrust, resolveSkillScopeTrust } from "../config/skill-settings-defaults";
 import { getEmbeddedDefaultGjcSkills } from "../defaults/gjc-defaults";
 import { initializeWithSettings, loadCapability } from "../discovery";
 import { inspectClaudeConvention } from "../discovery/claude";
@@ -683,6 +683,10 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 			...activeSettings.getGroup("skills"),
 			cwd,
 			disabledExtensions: activeSettings.get("disabledExtensions"),
+			allowExternalUserSkillSymlinks: resolveGlobalUserSkillLinkTrust({
+				trustUserSkills: activeSettings.getGlobal("skills.trustUserSkills"),
+				enablePiUser: activeSettings.getGlobal("skills.enablePiUser"),
+			}),
 		});
 		for (const skill of result.skills) loadedNames.add(getSkillFilesystemIdentity(skill.name));
 	}
@@ -803,7 +807,10 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 				providerId: "custom",
 				level: "user",
 				requireDescription: true,
-				trustUserSkills: resolveSkillScopeTrust(activeSettings.getGroup("skills"), "user"),
+				allowExternalUserSkillSymlinks: resolveGlobalUserSkillLinkTrust({
+					trustUserSkills: activeSettings.getGlobal("skills.trustUserSkills"),
+					enablePiUser: activeSettings.getGlobal("skills.enablePiUser"),
+				}),
 			},
 		);
 		for (const skill of scan.items) {

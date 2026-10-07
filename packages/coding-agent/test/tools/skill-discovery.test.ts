@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { getSessionSlashCommands } from "@gajae-code/coding-agent/extensibility/extensions/get-commands-handler";
-import type { Skill } from "@gajae-code/coding-agent/extensibility/skills";
+import { loadSkills, type Skill } from "@gajae-code/coding-agent/extensibility/skills";
 import { buildSystemPrompt } from "@gajae-code/coding-agent/system-prompt";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { SkillTool } from "@gajae-code/coding-agent/tools/skill";
@@ -156,6 +156,60 @@ describe("SkillDiscoveryTool", () => {
 			await new SkillTool(session).execute("invoke-user-link", { name: skillName });
 			expect(sent).toHaveLength(1);
 			expect(sent[0]).toContain("External user skill body.");
+		} finally {
+			await safeRm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not let project policy grant access to external user skill symlinks", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-skill-link-project-trust-"));
+		const cwd = path.join(root, "project");
+		const home = path.join(root, "home");
+		const userSkillsRoot = path.join(home, ".gjc", "agent", "skills");
+		const sharedSkillsRoot = path.join(root, "shared-skills");
+		const skillName = "project-granted-skill";
+		try {
+			await fs.mkdir(cwd, { recursive: true });
+			await fs.mkdir(userSkillsRoot, { recursive: true });
+			await makeSkill(sharedSkillsRoot, skillName, "Project-granted skill", "User-owned linked body.");
+			await fs.symlink(path.join(sharedSkillsRoot, skillName), path.join(userSkillsRoot, skillName), "dir");
+
+			const settings = Settings.isolated(
+				{
+					"skill.enabled": true,
+					"skills.enabled": true,
+					"skills.trustUserSkills": false,
+				},
+				{ overrides: { "skills.trustUserSkills": true } },
+			);
+			expect(settings.getGroup("skills").trustUserSkills).toBe(true);
+			expect(settings.getGlobal("skills.trustUserSkills")).toBe(false);
+			const sessionSkills = await loadSkills({
+				cwd,
+				home,
+				...settings.getGroup("skills"),
+				allowExternalUserSkillSymlinks: false,
+			});
+			expect(sessionSkills.skills.map(skill => skill.name)).not.toContain(skillName);
+
+			const sent: string[] = [];
+			const session = createSession(cwd, {
+				home,
+				settings,
+				skills: [],
+				sendCustomMessage: async message => {
+					sent.push(String(message.content));
+				},
+			});
+			const discovered = await new SkillDiscoveryTool(session).execute("discover-project-grant", { source: "user" });
+			expect(discovered.details?.candidates.map(candidate => candidate.name)).not.toContain(skillName);
+			expect(
+				discovered.details?.diagnostics?.some(message => message.includes("Refusing skill path outside scan root")),
+			).toBe(true);
+			await expect(new SkillTool(session).execute("invoke-project-grant", { name: skillName })).rejects.toThrow(
+				/unknown skill/i,
+			);
+			expect(sent).toHaveLength(0);
 		} finally {
 			await safeRm(root, { recursive: true, force: true });
 		}

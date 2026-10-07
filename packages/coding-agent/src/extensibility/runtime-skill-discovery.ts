@@ -9,7 +9,7 @@ import {
 import { findRepoRoot } from "../capability/fs";
 import type { Skill as CapabilitySkill } from "../capability/skill";
 import type { SkillsSettings } from "../config/settings-schema";
-import { resolveSkillScopeTrust } from "../config/skill-settings-defaults";
+import { resolveGlobalUserSkillLinkTrust, resolveSkillScopeTrust } from "../config/skill-settings-defaults";
 import { BUNDLED_GJC_SKILL_CATALOG } from "../defaults/gjc-skills.generated";
 import { scanClaudeProjectSkills, scanClaudeUserSkills } from "../discovery/claude";
 import { loadMarketplaceSkills } from "../discovery/claude-plugins";
@@ -79,6 +79,8 @@ export interface DiscoverRuntimeSkillsOptions {
 	offset?: number;
 	source?: RuntimeSkillDiscoveryScope | "all";
 	policy?: SkillsSettings;
+	/** User-owned permission to read external user skill symlinks; defaults to the direct policy value. */
+	allowExternalUserSkillSymlinks?: boolean;
 }
 
 function getRuntimeHome(): string {
@@ -296,7 +298,7 @@ async function scanProjectOrUserDir(
 	source: RuntimeSkillDiscoveryScope,
 	providerPriority: number,
 	authorityRoot?: string,
-	trustUserSkills?: boolean,
+	allowExternalUserSkillSymlinks?: boolean,
 ): Promise<ScanJobResult> {
 	const result = await scanSkillsFromDir(ctx, {
 		dir,
@@ -305,7 +307,7 @@ async function scanProjectOrUserDir(
 		providerId: "runtime",
 		level,
 		requireDescription: true,
-		trustUserSkills,
+		allowExternalUserSkillSymlinks,
 	});
 	return {
 		items: result.items.map(skill => ({ skill, source, providerPriority })),
@@ -451,7 +453,8 @@ export async function discoverRuntimeSkills(
 	const home = options.home ?? getRuntimeHome();
 	const source = options.source ?? "all";
 	const policy = options.policy;
-	const trustUserSkills = resolveSkillScopeTrust(policy ?? {}, "user");
+	const allowExternalUserSkillSymlinks =
+		options.allowExternalUserSkillSymlinks ?? resolveGlobalUserSkillLinkTrust(policy ?? {});
 	const diagnostics: string[] = [];
 	const agentDir = resolveRuntimeAgentDir(home, options.agentDir, hasExplicitHome);
 	const profileAuthority =
@@ -481,7 +484,7 @@ export async function discoverRuntimeSkills(
 					"user",
 					100,
 					path.resolve(dir) === path.resolve(agentDir, "skills") ? agentDir : undefined,
-					trustUserSkills,
+					allowExternalUserSkillSymlinks,
 				),
 			);
 		}
@@ -497,7 +500,7 @@ export async function discoverRuntimeSkills(
 					"user",
 					0,
 					undefined,
-					trustUserSkills,
+					allowExternalUserSkillSymlinks,
 				),
 			);
 		}
@@ -643,6 +646,7 @@ export async function findRuntimeSkillByName(
 	home?: string,
 	agentDir?: string,
 	profileAuthority?: "default" | "custom",
+	allowExternalUserSkillSymlinks?: boolean,
 ): Promise<Skill | undefined> {
 	const normalized = name.trim();
 	if (!normalized) return undefined;
@@ -663,6 +667,7 @@ export async function findRuntimeSkillByName(
 		home: resolvedHome,
 		agentDir: resolvedAgentDir,
 		profileAuthority: resolvedProfileAuthority,
+		allowExternalUserSkillSymlinks: allowExternalUserSkillSymlinks ?? resolveGlobalUserSkillLinkTrust(policy ?? {}),
 	});
 	return loaded.skills.find(skill => skill.name === normalized);
 }
