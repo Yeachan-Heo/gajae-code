@@ -132,6 +132,38 @@ describe("skill-management", () => {
 				await fs.rm(outside, { recursive: true, force: true });
 			});
 		});
+
+		it("requires user-owned trust to list an external user skill symlink", async () => {
+			await withTempDirs(async (cwd, home) => {
+				const sharedSkills = path.join(path.dirname(cwd), "shared-user-skills");
+				await makeSkill(sharedSkills, "external-helper", "Shared user helper");
+				const userSkills = path.join(home, ".gjc", "agent", "skills");
+				await fs.mkdir(userSkills, { recursive: true });
+				await fs.symlink(
+					path.join(sharedSkills, "external-helper"),
+					path.join(userSkills, "external-helper"),
+					"dir",
+				);
+
+				const untrusted = await listNativeSkillsForManagement({
+					cwd,
+					home,
+					policy: { trustUserSkills: true },
+					allowExternalUserSkillSymlinks: false,
+				});
+				expect(untrusted.some(record => record.name === "external-helper")).toBe(false);
+
+				const trusted = await listNativeSkillsForManagement({
+					cwd,
+					home,
+					policy: { trustUserSkills: true },
+					allowExternalUserSkillSymlinks: true,
+				});
+				expect(trusted).toContainEqual(
+					expect.objectContaining({ name: "external-helper", scope: "user", enabled: true }),
+				);
+			});
+		});
 	});
 
 	describe("writeNativeSkill", () => {

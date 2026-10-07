@@ -299,8 +299,10 @@ export async function listNativeSkillsForManagement(options: {
 	cwd: string;
 	home?: string;
 	agentDir?: string;
-	/** Resolver-owned profile classification; unlike path comparison, this survives HOME refreshes. */
+	/** Resolver-owned profile classification; unlike path comparison, this survives HOME/config refreshes. */
 	profileAuthority?: "default" | "custom";
+	/** User-owned permission to follow symlinks outside user skill scan roots. */
+	allowExternalUserSkillSymlinks?: boolean;
 	policy?: SkillManagementPolicy;
 }): Promise<ManagedSkillRecord[]> {
 	const homeWasInjected = options.home !== undefined;
@@ -321,6 +323,7 @@ export async function listNativeSkillsForManagement(options: {
 	const policy = options.policy;
 	const projectTrusted = resolveSkillScopeTrust(policy ?? {}, "project");
 	const userTrusted = resolveSkillScopeTrust(policy ?? {}, "user");
+	const allowExternalUserSkillSymlinks = options.allowExternalUserSkillSymlinks ?? userTrusted;
 
 	const scanJobs: Array<Promise<{ dir: string; scope: SkillScope; items: CapabilitySkill[] }>> = [];
 	const projectDirs = await getProjectSkillDirs(options.cwd, home);
@@ -351,7 +354,7 @@ export async function listNativeSkillsForManagement(options: {
 						providerId: "runtime",
 						level: "user",
 						requireDescription: true,
-						trustUserSkills: userTrusted,
+						allowExternalUserSkillSymlinks,
 					},
 				).then(result => ({ dir, scope: "user" as const, items: result.items })),
 			);
