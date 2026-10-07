@@ -40,3 +40,32 @@ test.each([false, true])("SDK observation retains replay safety unless user work
 	expect(delivered).toEqual(userHandler ? ["sdk", "user"] : ["sdk"]);
 	expect(records.isClean(scope)).toBe(!userHandler);
 });
+
+test("SDK observer tags do not exempt context handlers from replay invalidation", async () => {
+	const authority = createAttemptScopeAuthority();
+	const scope = authority.mintMain();
+	const records = new AttemptRecordStore(authority);
+	records.register(scope);
+	records.establishClean(scope);
+	const runtime = new ExtensionRuntime();
+	let delivered = 0;
+	const extension = await loadExtensionFromFactory(
+		api => {
+			api.on(
+				"context",
+				tagSdkLifecycleObserver(() => {
+					delivered++;
+				}),
+			);
+		},
+		process.cwd(),
+		new EventBus(),
+		runtime,
+		"sdk-observer-context-replay-test",
+	);
+	const runner = new ExtensionRunner([extension], runtime, process.cwd(), SessionManager.inMemory(), {} as never);
+	runner.setAttemptRecordStore(records);
+	await runner.emit({ type: "context", messages: [] }, undefined, scope);
+	expect(delivered).toBe(1);
+	expect(records.isClean(scope)).toBe(false);
+});
