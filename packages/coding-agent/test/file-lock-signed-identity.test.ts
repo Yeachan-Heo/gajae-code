@@ -90,21 +90,28 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 		})),
 	});
 	const originals = new Map<string, NativeDirectoryTreeSnapshot>();
-	const remove = vi.fn((target: string, snapshot: NativeDirectoryTreeSnapshot, parentIdentity?: { dev: bigint; ino: bigint }, detachOnly?: boolean) => {
-		const original = originals.get(target);
-		if (!original) throw new Error("Removal without captured authority");
-		expect(snapshot).toEqual(nativeSnapshot(original));
-		if (detach) {
-			expect(parentIdentity?.ino).toBe(ROOT_ID);
-			renameSync(target, parked);
-			return { ok: true, detachedPath: parked };
-		}
-		// Only simulate the native commit after both the adapted authority and
-		// the original filesystem generation match the captured snapshot.
-		expect(snapshotDirectoryTree(target).snapshot).toEqual(original);
-		rmSync(target, { recursive: true, force: true });
-		return { ok: true };
-	});
+	const remove = vi.fn(
+		(
+			target: string,
+			snapshot: NativeDirectoryTreeSnapshot,
+			parentIdentity?: { dev: bigint; ino: bigint },
+			_detachOnly?: boolean,
+		) => {
+			const original = originals.get(target);
+			if (!original) throw new Error("Removal without captured authority");
+			expect(snapshot).toEqual(nativeSnapshot(original));
+			if (detach) {
+				expect(parentIdentity?.ino).toBe(ROOT_ID);
+				renameSync(target, parked);
+				return { ok: true, detachedPath: parked };
+			}
+			// Only simulate the native commit after both the adapted authority and
+			// the original filesystem generation match the captured snapshot.
+			expect(snapshotDirectoryTree(target).snapshot).toEqual(original);
+			rmSync(target, { recursive: true, force: true });
+			return { ok: true };
+		},
+	);
 	FileLockTestHooks.nativeExactRemovalProbe = () => !detach;
 	FileLockTestHooks.nativeQuarantineBindings = () => ({
 		snapshotDirectoryTree: target => {
