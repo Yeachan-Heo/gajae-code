@@ -143,16 +143,7 @@ export const FileLockTestHooks: {
 	};
 	nativeQuarantineBindings?: () => NativeFileLockBindings;
 	nativeExactRemovalProbe?: () => boolean | Promise<boolean>;
-	/** @internal For testing only: direct access to removeEmptyFileLockDir */
-	removeEmptyFileLockDir?: (
-		lockDir: string,
-		expected: GenericFileLockDirIdentity,
-		ownerHostId?: string,
-	) => Promise<EmptyLockDirClaim>;
 } = {};
-
-/** @internal Module-private test seam; not exported to prevent runtime POSIX safety bypass */
-const internalTestSeams: { forceEnableEmptyLockDirRemovalForTest?: boolean } = {};
 
 /**
  * Returns the OS-provided process start timestamp for PID-reuse detection.
@@ -1905,9 +1896,7 @@ async function staleLockSnapshot(
 		// On POSIX: There is a concept of legacy directory-lock holders that are real
 		// holders. An empty directory must not be removed automatically.
 		//
-		// For all cases: Fail closed and retry (return stale: false) on POSIX,
-		// unless the internal test seam forceEnableEmptyLockDirRemovalForTest is set.
-		if (process.platform === "win32" || internalTestSeams.forceEnableEmptyLockDirRemovalForTest) {
+		if (process.platform === "win32") {
 			let emptyDirIdentity: GenericFileLockDirIdentity | null = null;
 			try {
 				emptyDirIdentity = await captureEmptyFileLockDirIdentity(lockPath, _staleMs);
@@ -2028,17 +2017,20 @@ function manualLockCleanupCommand(lockPath: string): string {
  * but left the directory. If the root identity matches, the directory is safe to claim
  * by creating an info file with exclusive-create (O_EXCL).
  *
- * Uses exclusive-create (open 'wx' / O_EXCL) for atomicity and TOCTOU race prevention.
- * If exclusive-create succeeds, this process now owns the lock. If it fails with EEXIST,
- * a concurrent reclaimer has already claimed it, and we back off safely.
- * After successful creation, re-verify that the directory identity still matches
- * to ensure no replacement occurred.
+ * Revalidates identity and emptiness immediately before exclusive creation. That
+ * exclusive create is the ownership transfer: once it succeeds, the caller adopts
+ * the returned owner without a fallible pathname lookup or cleanup through a path
+ * that could now refer to a successor directory.
  */
 async function removeEmptyFileLockDir(
 	lockDir: string,
 	expected: GenericFileLockDirIdentity,
 	ownerHostId?: string,
 ): Promise<EmptyLockDirClaim> {
+	// Test hook: allow injection of a concurrent change before our final checks
+	if (FileLockTestHooks.beforeEmptyLockDirClaim) {
+		await FileLockTestHooks.beforeEmptyLockDirClaim(lockDir);
+	}
 	let root: BigIntStats;
 	try {
 		root = await fs.lstat(lockDir, { bigint: true });
@@ -2047,114 +2039,82 @@ async function removeEmptyFileLockDir(
 		if (isTransientReleaseError(error)) throw error;
 		return "cleanup_failed";
 	}
-
-	if (root.isSymbolicLink() || !root.isDirectory()) return "owner_changed";
-
-	// Verify root identity matches
-	if (String(root.dev) !== expected.rootDev || String(root.ino) !== expected.rootIno) {
+	if (
+		root.isSymbolicLink() ||
+		!root.isDirectory() ||
+		String(root.dev) !== expected.rootDev ||
+		String(root.ino) !== expected.rootIno
+	) {
 		return "owner_changed";
 	}
-
-	// Verify info file still doesn't exist (to ensure it's still empty)
-	let infoExists = false;
+	let entries: string[];
 	try {
-		await fs.lstat(path.join(lockDir, "info"), { bigint: true });
-		infoExists = true;
+		entries = await fs.readdir(lockDir, { withFileTypes: false });
 	} catch (error) {
-		if (!isEnoent(error)) throw error;
+		if (isEnoent(error)) return "missing";
+		if (isTransientReleaseError(error)) throw error;
+		return "cleanup_failed";
 	}
-	if (infoExists) return "owner_changed";
-
-	// Test hook: allow injection of a concurrent claim before our attempt
-	if (FileLockTestHooks.beforeEmptyLockDirClaim) {
-		await FileLockTestHooks.beforeEmptyLockDirClaim(lockDir);
-	}
+	if (entries.length !== 0) return "owner_changed";
 
 	// Claim ownership by exclusive-creating the info file.
-	// This is atomic: either we create it first (and own the lock), or EEXIST
-	// means another process created it concurrently.
+	// This is the ownership transfer: either we create it first, or EEXIST means
+	// another process claimed the directory. Do not do a fallible pathname lookup
+	// after this point; the caller must adopt a successfully published claim.
 	const infoPath = path.join(lockDir, "info");
 	const claimedOwner = lockInfo(ownerHostId, crypto.randomUUID());
-	const claimedInfoBytes = JSON.stringify(claimedOwner);
+	const claimedInfoBytes = Buffer.from(JSON.stringify(claimedOwner), "utf8");
 
+	let infoCreated = false;
 	let writeSucceeded = false;
 	try {
 		// Use exclusive create: open(infoPath, O_WRONLY | O_CREAT | O_EXCL)
 		const fd = await fs.open(infoPath, "wx", 0o600);
+		infoCreated = true;
 		try {
-			const { bytesWritten } = await fd.write(claimedInfoBytes);
-			// Ensure all bytes were written; a short write can leave malformed JSON
-			if (bytesWritten === claimedInfoBytes.length) {
-				writeSucceeded = true;
+			// FileHandle.writeFile completes the entire buffer; a single write() may not.
+			await fd.writeFile(claimedInfoBytes);
+			writeSucceeded = true;
+		} catch (error) {
+			try {
+				await fd.close();
+			} catch (closeError) {
+				logger.debug("Failed to close file-lock owner info after a failed claim write", {
+					lockDir,
+					error: String(closeError),
+				});
 			}
-		} finally {
+			throw error;
+		}
+		try {
 			await fd.close();
+		} catch (error) {
+			logger.debug("Failed to close file-lock owner info after a complete claim write", {
+				lockDir,
+				error: String(error),
+			});
 		}
 	} catch (error) {
-		if (isEexist(error)) {
+		if (!infoCreated && isEexist(error)) {
 			// Another process claimed it first, back off safely
 			return "owner_changed";
 		}
+		// A failed write must not leave malformed owner metadata. Do this only when
+		// our exclusive create succeeded; an open error may belong to a contender.
+		if (infoCreated && !writeSucceeded) {
+			try {
+				await fs.unlink(infoPath);
+			} catch {
+				// Best effort; ignore failure
+			}
+		}
 		if (isTransientReleaseError(error)) throw error;
-		// Write or close failed. If file was created, clean it up to avoid wedging the lock.
-		if (!writeSucceeded) {
-			try {
-				await fs.unlink(infoPath);
-			} catch {
-				// Best effort; ignore failure
-			}
-		}
 		return "cleanup_failed";
 	}
-
-	// After successful exclusive-create, re-verify the directory identity
-	// to ensure it hasn't been replaced between our check and claim.
-	let verifyRoot: BigIntStats;
-	try {
-		verifyRoot = await fs.lstat(lockDir, { bigint: true });
-	} catch (error) {
-		if (isEnoent(error)) {
-			// The directory was removed after we claimed it. Clean up our info file.
-			try {
-				await fs.unlink(infoPath);
-			} catch {
-				// Best effort; ignore failure
-			}
-			return "owner_changed";
-		}
-		if (isTransientReleaseError(error)) {
-			// Transient verification failure: clean up the info file to avoid stranding
-			// a live-PID owner record without an adoption/release handle. This allows
-			// the acquisition to retry, and the directory to be reclaimed if needed.
-			try {
-				await fs.unlink(infoPath);
-			} catch {
-				// Best effort; if cleanup fails, we wedged the lock and must not adopt
-			}
-			// Return a retryable failure, not throw: the acquisition will try again
-			return "cleanup_failed";
-		}
-		return "cleanup_failed";
-	}
-
-	if (String(verifyRoot.dev) !== expected.rootDev || String(verifyRoot.ino) !== expected.rootIno) {
-		// The directory was replaced (mounted or link changed). Clean up our info file.
-		try {
-			await fs.unlink(infoPath);
-		} catch {
-			// Best effort; ignore failure
-		}
-		return "owner_changed";
-	}
-
-	// Successfully claimed the empty lock directory by creating the info file.
-	// Return the owner record that was written so the caller can use it directly
-	// without needing to re-read it (which could fail transiently on Windows).
+	// Return the record just published so the caller can adopt it without a
+	// fallible read after the ownership transfer.
 	return claimedOwner;
 }
-
-// Set the default removeEmptyFileLockDir implementation in test hooks for test access
-FileLockTestHooks.removeEmptyFileLockDir = removeEmptyFileLockDir;
 
 type FileLockRemovalAttempt =
 	| { removed: true; claimedOwner?: FileLockOwnerToken }
@@ -2170,8 +2130,7 @@ async function removeStaleLockForAcquire(
 		// Empty lock directories (marker identity with infoDev="-1") are claimed directly
 		// by exclusively creating an owner info file; the claim returns that owner record.
 		if (snapshot.owner === undefined && snapshot.identity.infoDev === "-1") {
-			const removalFn = FileLockTestHooks.removeEmptyFileLockDir || removeEmptyFileLockDir;
-			const outcome = await removalFn(lockPath, snapshot.identity, ownerHostId);
+			const outcome = await removeEmptyFileLockDir(lockPath, snapshot.identity, ownerHostId);
 			if (typeof outcome === "object") return { removed: true, claimedOwner: outcome };
 			// The directory vanished between the snapshot and the claim: retry immediately.
 			if (outcome === "missing") return { removed: true };
@@ -3056,13 +3015,4 @@ export async function reapOrphanedLockStagingDirs(lockPath: string): Promise<{
 		else summary.retained.push(result);
 	}
 	return summary;
-}
-
-/**
- * @internal For testing only: enables empty lock directory removal on POSIX platforms.
- * This is intentionally not part of the public FileLockTestHooks object to prevent
- * runtime consumers from bypassing the POSIX fail-closed platform contract.
- */
-export function __testSeam_setForceEnableEmptyLockDirRemoval(enable: boolean): void {
-	internalTestSeams.forceEnableEmptyLockDirRemovalForTest = enable;
 }
