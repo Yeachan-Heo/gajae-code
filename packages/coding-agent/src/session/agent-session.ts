@@ -4822,7 +4822,11 @@ export class AgentSession {
 		const scope = (pending as (AgentSessionEvent & { scope?: AttemptScope }) | undefined)?.scope;
 		if (pending) {
 			if (scope && this.#sdkRunTokensByAttemptScope.has(scope)) this.#pendingSdkAgentEnds.add(pending);
-			if (!this.#pendingAgentEndEmit) {
+			const hasEarlierNonSdkTerminal =
+				this.#pendingAgentEndEmit !== undefined ||
+				this.#restoredAgentEndsPendingPublication.size > 0 ||
+				this.#agentEndPublicationInFlight > 0;
+			if (!hasEarlierNonSdkTerminal) {
 				this.#pendingAgentEndEmit = pending;
 				this.#restoredAgentEndsPendingPublication.delete(pending);
 			} else if (this.#pendingAgentEndEmit !== pending && !this.#pendingSdkAgentEnds.has(pending)) {
@@ -11118,6 +11122,15 @@ export class AgentSession {
 
 	flushParkedAgentEndForCoordinatorPersistForTests(): void {
 		this.#flushPendingAgentEnd();
+	}
+
+	releaseDeferredAgentEndsForTests(events: readonly Extract<AgentSessionEvent, { type: "agent_end" }>[]): void {
+		for (const event of events) {
+			const hold = Symbol("test-deferred-agent-end");
+			this.#pendingAgentEndContinuationHolds.set(hold, event);
+			this.#deferredAgentEndWorkLeases.set(hold, this.#sessionWorkLease.acquire());
+		}
+		this.#releaseDeferredAgentEndContinuations();
 	}
 
 	async drainAsyncJobDeliveriesForAcp(options?: { timeoutMs?: number }): Promise<boolean> {

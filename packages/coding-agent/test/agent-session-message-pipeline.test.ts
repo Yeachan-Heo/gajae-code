@@ -1231,9 +1231,62 @@ describe("AgentSession message pipeline", () => {
 			),
 		).toBe(true);
 		const compactionEndIndex = events.findIndex(event => event.type === "auto_compaction_end");
+		const queuedAnswerIndex = events.findIndex(
+			event =>
+				event.type === "message_end" &&
+				event.message.role === "assistant" &&
+				event.message.content.some(content => content.type === "text" && content.text === "queued answer"),
+		);
 		const agentEndIndex = events.findIndex(event => event.type === "agent_end");
-		expect(agentEndIndex).toBeGreaterThan(compactionEndIndex);
+		expect(queuedAnswerIndex).toBeGreaterThan(compactionEndIndex);
+		expect(agentEndIndex).toBeGreaterThan(queuedAnswerIndex);
 		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+	});
+	it("serializes distinct restored non-SDK terminal publications", async () => {
+		const firstIntegrationStarted = Promise.withResolvers<void>();
+		const releaseFirstIntegration = Promise.withResolvers<void>();
+		let integrationRequests = 0;
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: testModelRegistry as never,
+			workerIntegrationRequest: async () => {
+				integrationRequests++;
+				if (integrationRequests === 1) {
+					firstIntegrationStarted.resolve();
+					await releaseFirstIntegration.promise;
+				}
+			},
+			workerIntegrationTimeoutMs: 10_000,
+		});
+		sessions.push(session);
+		const events: Extract<AgentSessionEvent, { type: "agent_end" }>[] = [];
+		session.subscribe(event => {
+			if (event.type === "agent_end") events.push(event);
+		});
+		const terminals = ["restored first", "restored second", "restored third"].map(text => ({
+			type: "agent_end" as const,
+			messages: [createAssistantMessage(text)],
+		}));
+
+		session.releaseDeferredAgentEndsForTests(terminals);
+		await firstIntegrationStarted.promise;
+		expect(integrationRequests).toBe(1);
+		expect(events).toHaveLength(0);
+		releaseFirstIntegration.resolve();
+		await session.waitForIdle();
+
+		expect(integrationRequests).toBe(3);
+		expect(
+			events.map(event =>
+				event.messages.flatMap(message =>
+					message.role === "assistant"
+						? message.content.flatMap(content => (content.type === "text" ? [content.text] : []))
+						: [],
+				),
+			),
+		).toEqual([["restored first"], ["restored second"], ["restored third"]]);
 	});
 	it("starts SDK worker reconciliation before a slow extension delivery", async () => {
 		const extensionStarted = Promise.withResolvers<void>();
