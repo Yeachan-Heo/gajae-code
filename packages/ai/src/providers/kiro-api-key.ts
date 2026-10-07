@@ -1110,7 +1110,12 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 								firstTokenEmitted = true;
 								firstTokenTime = Date.now();
 							}
-							if (currentTool && currentTool.id !== event.data.toolUseId) addToolToBlocks();
+							if (currentTool && currentTool.id !== event.data.toolUseId) {
+						// Only emit previous tool if it was completed
+						if (toolComplete) addToolToBlocks();
+						currentTool = undefined; // Clear the incomplete tool
+						toolComplete = false; // Reset for new tool
+					}
 							if (!currentTool) {
 								currentTool = { id: event.data.toolUseId, name: event.data.name, input: event.data.input };
 								toolComplete = false; // New tool starts as incomplete
@@ -1201,7 +1206,8 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			}
 
 			// Stream is done - add any pending tool, emit accumulated thinking, then deferred text, then close text block
-			addToolToBlocks();
+			// Only emit the tool if it was explicitly completed (has stop flag)
+			if (toolComplete) addToolToBlocks();
 			emitThinking();
 			emitDeferredTextEvents();
 			// Now emit all tool call events in order (safe since no refusal occurred)
