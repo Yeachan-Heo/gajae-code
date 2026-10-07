@@ -78,10 +78,10 @@ describe("managed empty-stop harness local contracts (no connected scenarios)", 
 		expect(() => assertExecutedScenarios(count)).toThrow("Zero scenarios executed");
 	});
 
-	test("fails CLI validation with exit one and explicitly reports zero executions", async () => {
+	test.each(["invalid-scenario", ""])("rejects CLI selection %j with zero executions", async selection => {
 		// Invalid selection never constructs a session or binds a server.
 		const child = Bun.spawn(
-			[process.execPath, path.resolve(import.meta.dir, "../scripts/verify-managed-empty-stop.ts"), "unknown"],
+			[process.execPath, path.resolve(import.meta.dir, "../scripts/verify-managed-empty-stop.ts"), selection],
 			{ stdout: "pipe", stderr: "pipe" },
 		);
 		const [exit, stdout, stderr] = await Promise.all([
