@@ -49,9 +49,9 @@ export const PROVIDER_ACTIVATION_MAX_ATTEMPTS = 8;
  * with this error — which names the contended capability — with room to spare before the
  * ACP prompt watchdog reports the same stall as undifferentiated silence.
  *
- * It gates *starting* another round, never interrupting one in flight: a single slow but
- * healthy registration keeps whatever time it needs, and only a retry decided after the
- * deadline is refused.
+ * One absolute deadline covers Router preparation, reconnect, and every registration.
+ * Expiry before dispatch refuses the request; expiry after dispatch preserves uncertainty
+ * because the deadline cannot undo a registration the host may already have committed.
  */
 export const PROVIDER_ACTIVATION_BUDGET_MS = Math.floor(ACP_PROMPT_INACTIVITY_TIMEOUT_MS / 3);
 

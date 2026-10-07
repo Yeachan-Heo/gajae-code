@@ -1279,6 +1279,129 @@ describe("SessionRouter dispatch authority", () => {
 		}
 	});
 
+	for (const preparation of ["proof", "retirement"] as const) {
+		for (const completion of ["resolution", "rejection", "teardown"] as const) {
+			test(`bounds initializing publication ${preparation} by the absolute deadline and never dispatches after late ${completion}`, async () => {
+				const entered = Promise.withResolvers<void>();
+				const release = Promise.withResolvers<void>();
+				const settled = Promise.withResolvers<unknown>();
+				const deadlines = manualTimeouts();
+				let now = Date.now();
+				const deadline = now + 100;
+				let preparing = false;
+				let fixture: RouterFixture;
+				let timerSpy: { mockRestore(): void } | undefined;
+				let clearTimerSpy: { mockRestore(): void } | undefined;
+				const clock = spyOn(Date, "now").mockImplementation(() => now);
+				fixture = await routerFixture({
+					start: false,
+					onIndexRefresh: async () => {
+						if (!preparing) return;
+						if (preparation === "retirement" && fixture.authority.indexed) {
+							fixture.authority.indexed = false;
+							return;
+						}
+						entered.resolve();
+						await release.promise;
+					},
+					onAttachmentReady: async attachment => {
+						preparing = true;
+						timerSpy = spyOn(globalThis, "setTimeout").mockImplementation(deadlines.setTimeout);
+						clearTimerSpy = spyOn(globalThis, "clearTimeout").mockImplementation(deadlines.clearTimeout);
+						try {
+							const response = await fixture.router.request(
+								attachment.sessionId,
+								{ type: "register_provider", capability: "ui" },
+								attachment.generation,
+								attachment,
+								{ deadline },
+							);
+							settled.resolve(response);
+						} catch (error) {
+							settled.resolve(error);
+						} finally {
+							preparing = false;
+							timerSpy?.mockRestore();
+							clearTimerSpy?.mockRestore();
+						}
+					},
+				});
+				const starting = fixture.router.start();
+				try {
+					await entered.promise;
+					expect(fixture.clients[0]?.requests).toEqual([]);
+					now = deadline;
+					if (deadlines.pending() > 0) deadlines.fire();
+					const outcome = await Promise.race([settled.promise, Bun.sleep(100).then(() => "still pending")]);
+					expect(outcome).toBeInstanceOf(SessionRouterError);
+					expect(outcome).toMatchObject({ phase: "pre_send" });
+					expect(deadlines.pending()).toBe(0);
+					const stopping = completion === "teardown" ? fixture.router.stop() : undefined;
+					if (completion === "rejection") release.reject(new Error("late preparation rejection"));
+					else release.resolve();
+					await starting;
+					await stopping;
+					expect(fixture.clients[0]?.requests.filter(frame => frame.type === "register_provider")).toEqual([]);
+				} finally {
+					release.resolve();
+					await starting;
+					timerSpy?.mockRestore();
+					clearTimerSpy?.mockRestore();
+					clock.mockRestore();
+					await fixture.router.stop();
+				}
+			});
+		}
+
+		test(`initializing publication ${preparation} throws without dispatch or deadline leakage`, async () => {
+			const failure = new Error("publication preparation failed");
+			const deadlines = manualTimeouts();
+			let preparing = false;
+			let outcome: unknown;
+			let fixture: RouterFixture;
+			fixture = await routerFixture({
+				start: false,
+				onIndexRefresh: async () => {
+					if (!preparing) return;
+					if (preparation === "retirement" && fixture.authority.indexed) {
+						fixture.authority.indexed = false;
+						return;
+					}
+					throw failure;
+				},
+				onAttachmentReady: async attachment => {
+					preparing = true;
+					const timer = spyOn(globalThis, "setTimeout").mockImplementation(deadlines.setTimeout);
+					const clearTimer = spyOn(globalThis, "clearTimeout").mockImplementation(deadlines.clearTimeout);
+					try {
+						await fixture.router.request(
+							attachment.sessionId,
+							{ type: "register_provider", capability: "ui" },
+							attachment.generation,
+							attachment,
+							{ deadline: Date.now() + 1_000 },
+						);
+					} catch (error) {
+						outcome = error;
+					} finally {
+						preparing = false;
+						timer.mockRestore();
+						clearTimer.mockRestore();
+					}
+				},
+			});
+			try {
+				await fixture.router.start();
+				if (preparation === "proof") expect(outcome).toBe(failure);
+				else expect(outcome).toMatchObject({ phase: "pre_send" });
+				expect(deadlines.pending()).toBe(0);
+				expect(fixture.clients[0]?.requests.filter(frame => frame.type === "register_provider")).toEqual([]);
+			} finally {
+				await fixture.router.stop();
+			}
+		});
+	}
+
 	test("rejects an exact publication-time request after endpoint replacement", async () => {
 		let router: SessionRouter | undefined;
 		let endpointFile = "";

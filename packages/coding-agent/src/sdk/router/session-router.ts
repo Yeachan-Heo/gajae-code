@@ -964,15 +964,12 @@ export class SessionRouter {
 		const { deadline, beforeDispatch, onDispatch, dispatchFence, ...requestOptions } = options ?? {};
 		const remainingDeadlineMs = (): number =>
 			deadline === undefined ? Number.POSITIVE_INFINITY : Math.max(0, deadline - Date.now());
-		const reconcileWithinDeadline = async (): Promise<void> => {
-			if (deadline === undefined) {
-				await this.#serialReconcile(this.#runEpoch, true, true);
-				return;
-			}
+		const prepareWithinDeadline = async <T>(prepare: () => Promise<T>): Promise<T> => {
+			if (deadline === undefined) return await prepare();
 			const remaining = remainingDeadlineMs();
 			if (remaining <= 0)
 				throw new SessionRouterError("pre_send", "SDK session request deadline elapsed during router preparation.");
-			const reconciliation = this.#serialReconcile(this.#runEpoch, true, true);
+			const preparation = prepare();
 			const expired = Promise.withResolvers<never>();
 			const timer = setTimeout(
 				() =>
@@ -982,7 +979,7 @@ export class SessionRouter {
 				remaining,
 			);
 			try {
-				await Promise.race([reconciliation, expired.promise]);
+				return await Promise.race([preparation, expired.promise]);
 			} finally {
 				clearTimeout(timer);
 			}
@@ -993,7 +990,7 @@ export class SessionRouter {
 			(expectedAttachment.authorityId !== undefined && attachment.authorityId === expectedAttachment.authorityId);
 		const publishing = this.#sessions.get(sessionId);
 		if (!publishing || !matchesExpectedAuthority(publishing.capability) || !publishing.initializingPublication)
-			await reconcileWithinDeadline();
+			await prepareWithinDeadline(() => this.#serialReconcile(this.#runEpoch, true, true));
 		if (remainingDeadlineMs() <= 0)
 			throw new SessionRouterError("pre_send", "SDK session request deadline elapsed during router preparation.");
 		const attached = this.#sessions.get(sessionId);
@@ -1004,7 +1001,7 @@ export class SessionRouter {
 		if (!matchesExpectedAuthority(attached.capability))
 			throw new SessionRouterError("pre_send", "SDK session attachment changed before command dispatch.");
 		if (attached.initializingPublication) {
-			const proven = await this.#readProvenEndpoint(attached.indexed);
+			const proven = await prepareWithinDeadline(() => this.#readProvenEndpoint(attached.indexed));
 			if (
 				!proven ||
 				proven.endpoint.url !== attached.endpoint.url ||
@@ -1012,7 +1009,9 @@ export class SessionRouter {
 				proven.endpoint.pid !== attached.pid ||
 				!sameEndpointIdentity(attached.endpointIdentity, proven.identity)
 			) {
-				await this.#retireAttachment(attached, proven ? "replaced_same_generation" : undefined);
+				await prepareWithinDeadline(() =>
+					this.#retireAttachment(attached, proven ? "replaced_same_generation" : undefined),
+				);
 				throw new SessionRouterError("pre_send", "SDK session attachment changed during publication.");
 			}
 		}
