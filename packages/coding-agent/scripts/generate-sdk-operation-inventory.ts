@@ -29,6 +29,12 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal model-profile fallback warning state used by session presentation; not a public SDK operation",
 	"agent_session:getUnavailableModelProfile":
 		"internal model-profile fallback warning state used by session presentation; not a public SDK operation",
+	"agent_session:getUserModelSelectionRevision":
+		"internal revision fence for deferred model-profile recovery after a concrete user selection; not a public SDK operation",
+	"agent_session:getUserCanonicalVariantSelection":
+		"internal revision and sticky canonical-variant state used by deferred profile recovery; not a public SDK operation",
+	"agent_session:markUserModelSelection":
+		"internal mutation that invalidates deferred model-profile recovery after a concrete user selection; not a public SDK operation",
 	"slash_command:routing":
 		"visual/local-only autorouting settings toggle and smart-routing panel entry, not a user-facing SDK control seam",
 	"slash_command:mcp":
