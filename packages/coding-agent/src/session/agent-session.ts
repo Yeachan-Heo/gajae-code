@@ -4786,6 +4786,7 @@ export class AgentSession {
 		if (this.#pendingAgentEndEmit && this.#pendingAgentEndEmit !== pending) {
 			throw new Error("Cannot restore a deferred agent_end over a different pending terminal event");
 		}
+		this.#restoredAgentEndsPendingPublication.delete(pending);
 		this.#pendingAgentEndEmit = pending;
 		const scope = (pending as AgentSessionEvent & { scope?: AttemptScope }).scope;
 		if (scope && this.#sdkRunTokensByAttemptScope.has(scope)) this.#pendingSdkAgentEnds.add(pending);
@@ -4799,6 +4800,7 @@ export class AgentSession {
 		if (!hold) return undefined;
 		const pending = this.#pendingAgentEndContinuationHolds.get(hold);
 		this.#pendingAgentEndContinuationHolds.delete(hold);
+		if (pending) this.#restoredAgentEndsPendingPublication.delete(pending);
 		if (pending) this.#pendingSdkAgentEnds.delete(pending);
 		this.#deferredAgentEndWorkLeases.get(hold)?.release();
 		this.#deferredAgentEndWorkLeases.delete(hold);
@@ -4820,8 +4822,10 @@ export class AgentSession {
 		const scope = (pending as (AgentSessionEvent & { scope?: AttemptScope }) | undefined)?.scope;
 		if (pending) {
 			if (scope && this.#sdkRunTokensByAttemptScope.has(scope)) this.#pendingSdkAgentEnds.add(pending);
-			if (!this.#pendingAgentEndEmit) this.#pendingAgentEndEmit = pending;
-			else if (this.#pendingAgentEndEmit !== pending && !this.#pendingSdkAgentEnds.has(pending)) {
+			if (!this.#pendingAgentEndEmit) {
+				this.#pendingAgentEndEmit = pending;
+				this.#restoredAgentEndsPendingPublication.delete(pending);
+			} else if (this.#pendingAgentEndEmit !== pending && !this.#pendingSdkAgentEnds.has(pending)) {
 				this.#restoredAgentEndsPendingPublication.add(pending);
 			}
 		}
@@ -4833,6 +4837,7 @@ export class AgentSession {
 		pending: AgentSessionEvent | undefined,
 	): void {
 		if (!hold || !pending) return;
+		this.#restoredAgentEndsPendingPublication.delete(pending);
 		this.#pendingAgentEndEmit = pending;
 		const scope = (pending as AgentSessionEvent & { scope?: AttemptScope }).scope;
 		if (scope && this.#sdkRunTokensByAttemptScope.has(scope)) this.#pendingSdkAgentEnds.add(pending);
@@ -5201,6 +5206,7 @@ export class AgentSession {
 			this.#pendingAgentEndContinuationHolds.size > 0
 		)
 			return;
+		if (this.#restoredAgentEndsPendingPublication.size > 0 && this.#agentEndPublicationInFlight > 0) return;
 		if (!pending) {
 			pending = this.#restoredAgentEndsPendingPublication.values().next().value;
 			if (!pending) {
@@ -7444,6 +7450,7 @@ export class AgentSession {
 		if (event.type === "agent_end" && attemptScope && this.#sdkRunTokensByAttemptScope.has(attemptScope)) {
 			this.#pendingSdkAgentEnds.add(event);
 			if (eventLease) this.#deferredAgentEndLeases.set(event, eventLease);
+			this.#restoredAgentEndsPendingPublication.delete(event);
 			this.#pendingAgentEndEmit = event;
 			return;
 		}
@@ -7462,6 +7469,7 @@ export class AgentSession {
 					this.#settleTrackedQueuedInputTerminal(pendingScope);
 				}
 			}
+			this.#restoredAgentEndsPendingPublication.delete(event);
 			this.#pendingAgentEndEmit = event;
 			return;
 		}
@@ -11104,6 +11112,7 @@ export class AgentSession {
 			persistGeneration: this.#coordinatorPersistGeneration,
 			persistBarrier: this.#coordinatorRescopeBarrier,
 		});
+		this.#restoredAgentEndsPendingPublication.delete(event);
 		this.#pendingAgentEndEmit = event;
 	}
 
