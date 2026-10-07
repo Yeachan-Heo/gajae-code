@@ -290,12 +290,10 @@ const snapshotFor = (agentDir: string) => path.join(dirFor(agentDir), "index.sna
 const auditFor = (agentDir: string) => path.join(dirFor(agentDir), "index-audit.jsonl");
 const SESSION_PROJECTION_VERSION = 1;
 const sessionProjectionsDirFor = (agentDir: string) => path.join(dirFor(agentDir), "index-projections");
-const sessionProjectionManifestFor = (agentDir: string) => path.join(sessionProjectionsDirFor(agentDir), "manifest.json");
+const sessionProjectionManifestFor = (agentDir: string) =>
+	path.join(sessionProjectionsDirFor(agentDir), "manifest.json");
 const sessionProjectionFor = (agentDir: string, sessionId: string) =>
-	path.join(
-		sessionProjectionsDirFor(agentDir),
-		`${createHash("sha256").update(sessionId).digest("hex")}.json`,
-	);
+	path.join(sessionProjectionsDirFor(agentDir), `${createHash("sha256").update(sessionId).digest("hex")}.json`);
 /**
  * Idle-poll change stamp over the two index files (#4689). A polling reader
  * that has already replayed the index must be able to prove "nothing changed"
@@ -398,10 +396,7 @@ function serializedIndexChangeStamp(stamp: SessionIndexChangeStamp): SessionProj
 	});
 	return { log: serialize(stamp.log), snapshot: serialize(stamp.snapshot) };
 }
-function sameSerializedIndexChangeStamp(
-	a: SessionProjectionManifest["stamp"],
-	b: SessionIndexChangeStamp,
-): boolean {
+function sameSerializedIndexChangeStamp(a: SessionProjectionManifest["stamp"], b: SessionIndexChangeStamp): boolean {
 	const fileMatches = (serialized: SerializedSessionIndexFileStamp, current: SessionIndexFileStamp) =>
 		serialized.exists === current.exists &&
 		serialized.size === current.size &&
@@ -445,7 +440,8 @@ function parseSessionProjectionManifest(value: unknown): SessionProjectionManife
 	)
 		return undefined;
 	const stamp = manifest.stamp as Record<string, unknown>;
-	if (!isSerializedSessionIndexFileStamp(stamp.log) || !isSerializedSessionIndexFileStamp(stamp.snapshot)) return undefined;
+	if (!isSerializedSessionIndexFileStamp(stamp.log) || !isSerializedSessionIndexFileStamp(stamp.snapshot))
+		return undefined;
 	const { checksum, ...unsigned } = manifest;
 	if (checksum !== projectionChecksum(unsigned)) return undefined;
 	return manifest as unknown as SessionProjectionManifest;
@@ -1336,15 +1332,38 @@ export class SessionIndex {
 		await fs.mkdir(directory, { recursive: true, mode: 0o700 });
 		await fs.chmod(directory, 0o700);
 		const sessionIds = new Set(this.#events.map(event => event.sessionId));
-		for (const sessionId of sessionIds) await this.#publishSessionProjectionUnderLock(sessionId);
-		const projectionKeys = new Set(
+		// Incremental rebuild: only publish sessions that don't have cached projections.
+		// This avoids re-publishing all 7500+ sessions when index size changes.
+		const projectionKeys = new Set<string>();
+		for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+			if (entry.isFile() && entry.name !== "manifest.json" && entry.name.endsWith(".json")) {
+				const key = entry.name.slice(0, -".json".length);
+				projectionKeys.add(key);
+			}
+		}
+		// Only rebuild new/missing sessions instead of iterating all.
+		for (const sessionId of sessionIds) {
+			const key = createHash("sha256").update(sessionId).digest("hex");
+			if (!projectionKeys.has(key)) {
+				await this.#publishSessionProjectionUnderLock(sessionId);
+				projectionKeys.add(key);
+			}
+		}
+		// Defer cleanup of stale projections to background (not critical path).
+		const expectedKeys = new Set(
 			[...sessionIds].map(sessionId => createHash("sha256").update(sessionId).digest("hex")),
 		);
-		for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
-			if (!entry.isFile() || entry.name === "manifest.json" || !entry.name.endsWith(".json")) continue;
-			const key = entry.name.slice(0, -".json".length);
-			if (!projectionKeys.has(key)) await fs.rm(path.join(directory, entry.name), { force: true });
-		}
+		void (async () => {
+			try {
+				for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+					if (!entry.isFile() || entry.name === "manifest.json" || !entry.name.endsWith(".json")) continue;
+					const key = entry.name.slice(0, -".json".length);
+					if (!expectedKeys.has(key)) await fs.rm(path.join(directory, entry.name), { force: true });
+				}
+			} catch {
+				// Cleanup is best-effort; ignore errors.
+			}
+		})();
 		await this.#publishProjectionManifestUnderLock();
 	}
 	async #ensureSessionProjectionsUnderLock(): Promise<void> {
@@ -1359,7 +1378,9 @@ export class SessionIndex {
 			sameSerializedIndexChangeStamp(manifest.stamp, stamp)
 		)
 			return;
-		// Mark projections as incomplete/outdated; rebuild is deferred until actually needed.
+		// Mark projections as incomplete; rebuild is deferred until actually needed (#6477).
+		// This avoids the expensive full rebuild every time the index changes.
+		// Actual reads will trigger on-demand rebuilds for specific sessions.
 		await this.#publishProjectionManifestUnderLock(false);
 	}
 	async #readSessionProjectionUnderLock(
@@ -1375,7 +1396,11 @@ export class SessionIndex {
 				? { status: "ok", indexSeq: 0, events: [], warnings: [] }
 				: { status: "incomplete" };
 		}
-		if (!manifest.complete) return { status: "incomplete", indexSeq: manifest.indexSeq };
+		if (!manifest.complete) {
+			// Rebuild this specific session's projection on-demand rather than waiting for full rebuild.
+			await this.#publishSessionProjectionUnderLock(sessionId);
+			// Continue to validate the rebuilt projection below.
+		}
 		const before = await readIndexChangeStamp(this.#agentDir);
 		if (!sameSerializedIndexChangeStamp(manifest.stamp, before))
 			return { status: "incomplete", indexSeq: manifest.indexSeq };

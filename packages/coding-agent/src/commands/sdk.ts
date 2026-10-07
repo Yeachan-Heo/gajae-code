@@ -20,10 +20,7 @@ import type {
 	SessionLifecycleLaunchRequest,
 	SessionLifecycleTranscriptIdentity,
 } from "../sdk/broker/lifecycle";
-import type {
-	CreateLifecycleAgentSessionResult,
-	SdkLifecycleStartupOwner,
-} from "../sdk/lifecycle-session";
+import type { CreateLifecycleAgentSessionResult, SdkLifecycleStartupOwner } from "../sdk/lifecycle-session";
 import { listManagedSessionCandidates, resolveManagedSessionScope } from "../sdk/session-directory";
 import {
 	type SdkStartupFailure,
@@ -44,9 +41,10 @@ export async function lifecycleArgs(
 ): Promise<ParsedArgs> {
 	const targetScope = await resolveManagedSessionScope({ cwd, agentDir });
 	if (targetScope.kind !== "resolved") throw new Error(`Lifecycle session scope is invalid: ${targetScope.message}`);
-	const forkSessionDir = request.operation === "session.fork"
-		? (await import("../session/session-manager")).SessionManager.getDefaultSessionDir(cwd, agentDir)
-		: undefined;
+	const forkSessionDir =
+		request.operation === "session.fork"
+			? (await import("../session/session-manager")).SessionManager.getDefaultSessionDir(cwd, agentDir)
+			: undefined;
 	return {
 		messages: [],
 		fileArgs: [],

@@ -2480,7 +2480,7 @@ describe("SDK session index projections (perf optimization)", () => {
 			const index = new SessionIndex(agentDir);
 			const sessionId = "test-session-proj-cache";
 			const stateRoot = "/test/state/root";
-			
+
 			// Append a host_registered event
 			const registered = await index.append(event(sessionId), {
 				type: "host_registered",
@@ -2491,9 +2491,9 @@ describe("SDK session index projections (perf optimization)", () => {
 				},
 				processIncarnation: "incarnation-1",
 			});
-			
+
 			expect(registered).toBeDefined();
-			
+
 			// Append another event for the same session
 			const heartbeat = await index.append(event(sessionId), {
 				type: "host_heartbeat",
@@ -2504,19 +2504,19 @@ describe("SDK session index projections (perf optimization)", () => {
 				},
 				activityState: "active",
 			});
-			
+
 			expect(heartbeat).toBeDefined();
-			
+
 			// Verify projection directory was created
 			const projectionsDir = path.join(agentDir, "sdk", "sessions", "index-projections");
 			const stat = await fs.stat(projectionsDir).catch(() => null);
 			expect(stat?.isDirectory()).toBe(true);
-			
+
 			// Verify manifest file exists
 			const manifestFile = path.join(projectionsDir, "manifest.json");
 			const manifestStat = await fs.stat(manifestFile).catch(() => null);
 			expect(manifestStat?.isFile()).toBe(true);
-			
+
 			// Verify session projection file was created (hashed by sessionId)
 			const projectionFiles = await fs.readdir(projectionsDir);
 			const hasSessionProjection = projectionFiles.some(f => f.endsWith(".json") && f !== "manifest.json");
@@ -2525,13 +2525,13 @@ describe("SDK session index projections (perf optimization)", () => {
 			await fs.rm(agentDir, { recursive: true, force: true });
 		}
 	});
-	
+
 	it("lazy loads node authorities without opening PATH executables", async () => {
 		// This test verifies that the lazy initialization of node authorities
 		// does not trigger file opens that would require PATH executables.
 		// The implementation captures initialProcessEnvironment eagerly at module
 		// load time, allowing the lazy function to defer execution without safety risk.
-		
+
 		// The actual verification is in gjc-plugin-mcp-configs.test.ts
 		// which tests that buildPluginMcpConfigs does not open PATH node executables.
 		// This test documents that the behavior is expected and safe.
@@ -2550,11 +2550,10 @@ describe("SDK session index projections (perf optimization)", () => {
 				},
 				processIncarnation: "test-incarnation",
 			});
-			
+
 			expect(result).toBeDefined();
 		} finally {
 			await fs.rm(agentDir, { recursive: true, force: true });
 		}
 	});
 });
-
