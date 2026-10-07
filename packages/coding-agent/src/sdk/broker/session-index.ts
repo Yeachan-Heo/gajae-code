@@ -2361,6 +2361,7 @@ export class SessionIndex {
 		now = Date.now(),
 		abortSignal?: AbortSignal,
 		deadlineAt = performance.now() + SESSION_HEARTBEAT_CHECKPOINT_BUDGET_MS,
+		waitForSettlement = false,
 	): Promise<number> {
 		// A stale observation batch fails closed (no heartbeat), but on a busy
 		// machine a single contended lock acquisition is enough to discard the
@@ -2389,6 +2390,12 @@ export class SessionIndex {
 			}
 		};
 		try {
+			// For startup, we must not publish broker discovery until the checkpoint
+			// transaction settles and releases the lock. For periodic checkpoints, we can
+			// return early via Promise.race.
+			if (waitForSettlement) {
+				return await checkpoint();
+			}
 			// Release the startup waiter even if this operation is queued. Late
 			// queued/acquired work checks the same signal before it can write.
 			return await Promise.race([checkpoint(), expired.promise]);

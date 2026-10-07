@@ -4277,8 +4277,8 @@ export class Broker {
 		if (publication) await this.#writeHeartbeat(publication);
 	}
 	/** Re-observes provably live session hosts and checkpoints their liveness. */
-	async heartbeatSessions(now = Date.now(), abortSignal?: AbortSignal, deadlineAt?: number): Promise<number> {
-		return await this.index.checkpointLiveHeartbeats(now, abortSignal, deadlineAt);
+	async heartbeatSessions(now = Date.now(), abortSignal?: AbortSignal, deadlineAt?: number, waitForSettlement = false): Promise<number> {
+		return await this.index.checkpointLiveHeartbeats(now, abortSignal, deadlineAt, waitForSettlement);
 	}
 	async #checkpointSessionHeartbeats(abortSignal?: AbortSignal, startupCheckpointDeadline?: number): Promise<void> {
 		if (this.#checkpointInFlight || this.#stopping) return;
@@ -4286,7 +4286,10 @@ export class Broker {
 		try {
 			// The CLI reserves publication headroom in this startup deadline.
 			// Periodic passes use their own budget, not a retired startup signal.
-			await this.heartbeatSessions(Date.now(), abortSignal, startupCheckpointDeadline);
+			// For startup, wait for the checkpoint transaction to settle before returning
+			// to ensure the lock is released before we publish broker discovery.
+			const isStartup = startupCheckpointDeadline !== undefined && abortSignal === this.#startupAbortSignal;
+			await this.heartbeatSessions(Date.now(), abortSignal, startupCheckpointDeadline, isStartup);
 		} catch (error) {
 			if (
 				error instanceof FileLockAcquireError &&
