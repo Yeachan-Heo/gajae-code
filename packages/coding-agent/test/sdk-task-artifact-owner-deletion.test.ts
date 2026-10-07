@@ -415,6 +415,42 @@ it.each([
 	}
 }, 30_000);
 
+it("SDK resumes owner-free cleanup after its workspace is removed", async () => {
+	const fixture = await createLegacyOnlyFixture();
+	let broker = new Broker({ agentDir: fixture.agentDir });
+	const originalUnlink = native.exactUnlink;
+	const unlink = vi
+		.spyOn(native, "exactUnlink")
+		.mockImplementation((pathname, identity) =>
+			pathname === fixture.transcript ? { ok: false, code: "io_error" } : originalUnlink(pathname, identity),
+		);
+	const request = deleteRequest(fixture);
+	try {
+		await broker.start();
+		expect(await broker.handleRequest("session.delete", request, "removed-workspace-replay")).toMatchObject({
+			ok: false,
+			error: { code: "cleanup_pending", cleanup: { phase: "transcript" } },
+		});
+		unlink.mockRestore();
+		await broker.stop();
+		await fs.rm(fixture.cwd, { recursive: true });
+		broker = new Broker({ agentDir: fixture.agentDir });
+		await broker.start();
+		expect(await broker.handleRequest("session.delete", request, "removed-workspace-replay")).toMatchObject({
+			ok: true,
+			result: { sessionId: fixture.sessionId },
+		});
+		expect(await Bun.file(fixture.transcript).exists()).toBe(false);
+		expect(
+			(await fs.readdir(path.join(fixture.agentDir, "sessions"))).filter(name => name.startsWith("v2-")),
+		).toEqual([]);
+	} finally {
+		unlink.mockRestore();
+		await broker.stop();
+		await safeRm(fixture.root, { recursive: true, force: true });
+	}
+}, 30_000);
+
 it.each([
 	false,
 	true,

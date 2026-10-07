@@ -1,9 +1,3 @@
-### Reverted
+### Fixed
 
-- The verified SDK recovery and session cleanup contracts from #6388 have been reverted in this PR to address terminal publication edge flakes. The following aspects of #6388 were reverted:
-  - SDK terminal publication and submission completion ownership changes
-  - Verified session cleanup and owner-free deletion handling
-  - Durable terminal recovery coordination
-  - Historical sibling session authentication
-
-Cleanup and task-owner features that newer dev commits depend on were preserved.
+- Narrowed revert of specific SDK terminal publication edges from #6388 to address managed-receipt-process-ownership race conditions causing terminal publication flakes (failed 4/6 test runs). Only agent-session.ts publication-edge revert applied; lifecycle, session-scope, retirement, and artifact-owner paths restored to dev to preserve cleanup and task-owner features.
