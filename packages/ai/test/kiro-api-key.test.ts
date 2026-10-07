@@ -138,7 +138,7 @@ describe("parseKiroApiEvents", () => {
 	test("parses combined usage and stopReason:COMPLETED in the same metadata object", () => {
 		// Metadata object with usage and normal completion (no refusal)
 		const { events } = parseKiroApiEvents('{"stopReason":"COMPLETED","usage":{"inputTokens":20,"outputTokens":5}}');
-		// Should only emit usage event (normal completion without refusal is ignored)
+		// Usage and the successful terminal marker are both exposed to the stream consumer.
 		const usageEvents = events.filter(e => e.type === "usage");
 		expect(usageEvents).toHaveLength(1);
 		if (usageEvents[0]?.type === "usage") {
@@ -148,6 +148,10 @@ describe("parseKiroApiEvents", () => {
 		// Should not emit any refusal events for COMPLETED
 		const refusalEvents = events.filter(e => e.type === "refusal");
 		expect(refusalEvents).toHaveLength(0);
+		expect(events.find(e => e.type === "terminal")).toEqual({
+			type: "terminal",
+			data: { stopReason: "COMPLETED" },
+		});
 	});
 	test("detects refusal even when stopReason/stopDetails is not the first property (order-independent parsing)", () => {
 		// P1 fix (#6150): refusal must be detected regardless of property order
@@ -169,11 +173,16 @@ describe("parseKiroApiEvents", () => {
 		const { events } = parseKiroApiEvents(
 			'{"conversationId":"xyz123","stopReason":"COMPLETED","usage":{"inputTokens":10,"outputTokens":3}}',
 		);
-		// Should emit only usage event, not refusal
+		// Should emit usage and successful completion, not refusal.
 		const usageEvents = events.filter(e => e.type === "usage");
 		expect(usageEvents).toHaveLength(1);
 		const refusalEvents = events.filter(e => e.type === "refusal");
 		expect(refusalEvents).toHaveLength(0);
+		expect(events.find(e => e.type === "terminal")?.type).toBe("terminal");
+	});
+	test("recognizes TOOL_USE as successful terminal metadata", () => {
+		const { events } = parseKiroApiEvents('{"stopReason":"TOOL_USE"}');
+		expect(events).toEqual([{ type: "terminal", data: { stopReason: "TOOL_USE" } }]);
 	});
 	test("records usage and detects refusal together, with leading unknown field", () => {
 		// P1 fix (#6150): both usage and refusal should be recorded even with reordered properties

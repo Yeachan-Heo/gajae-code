@@ -228,6 +228,8 @@ describe("Kiro API-key content filter #6150", () => {
 						controller.enqueue(encoder.encode('{"content":"Hello "}'));
 					} else if (pullCount === 2) {
 						controller.enqueue(encoder.encode('{"content":"world"}'));
+					} else if (pullCount === 3) {
+						controller.enqueue(encoder.encode(JSON.stringify({ stopReason: "COMPLETED" })));
 					} else {
 						nextReadRequested.resolve();
 					}
@@ -1415,7 +1417,7 @@ describe("P1 Regression: content leaking across batches", () => {
 		expect(emittedEvents.filter(event => event.type.startsWith("text_")).length).toBe(0);
 	});
 
-	test("P1: content is suppressed when refusal arrives in a later response chunk", async () => {
+	test("P1: content is suppressed when refusal arrives after multiple response chunks", async () => {
 		const emittedEvents: Array<{ type: string; errorMessage?: string }> = [];
 
 		globalThis.fetch = (async () => {
@@ -1425,8 +1427,10 @@ describe("P1 Regression: content leaking across batches", () => {
 				pull(controller) {
 					pullCount++;
 					if (pullCount === 1) {
-						controller.enqueue(encoder.encode(JSON.stringify({ content: "This is harmful content" })));
+						controller.enqueue(encoder.encode(JSON.stringify({ content: "This is harmful " })));
 					} else if (pullCount === 2) {
+						controller.enqueue(encoder.encode(JSON.stringify({ content: "content across a second chunk" })));
+					} else if (pullCount === 3) {
 						controller.enqueue(
 							encoder.encode(
 								JSON.stringify({

@@ -445,6 +445,7 @@ type KiroStreamEvent =
 	| { type: "toolUseInput"; data: { input: string } }
 	| { type: "toolUseStop"; data: { stop: boolean } }
 	| { type: "usage"; data: { inputTokens?: number; outputTokens?: number } }
+	| { type: "terminal"; data: { stopReason: "COMPLETED" | "TOOL_USE" } }
 	| {
 			type: "refusal";
 			data: { stopReason?: string; stopDetails?: { refusal?: { category?: string; explanation?: string } } };
@@ -568,20 +569,21 @@ export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[];
 
 			// Check for refusal after usage so that usage is processed first and recorded before refusal terminates
 			// This check is now order-independent: stopDetails can appear at any position in the JSON object
-			if (
+			const refusal =
 				typeof parsed.stopDetails === "object" &&
 				parsed.stopDetails !== null &&
-				(parsed.stopDetails as Record<string, unknown>).refusal
-			) {
+				(parsed.stopDetails as Record<string, unknown>).refusal;
+			if (refusal || parsed.stopReason === "CONTENT_FILTERED") {
 				// Emit refusal event if stopDetails contains actual refusal data
 				events.push({
 					type: "refusal",
 					data: {
 						stopReason: parsed.stopReason as string | undefined,
-						stopDetails: parsed.stopDetails as { refusal?: { category?: string; explanation?: string } },
+						stopDetails: parsed.stopDetails as
+							| { refusal?: { category?: string; explanation?: string } }
+							| undefined,
 					},
 				});
-				// Normal terminal metadata (stopReason: "COMPLETED", etc.) without refusal data is ignored
 			} else if (parsed.error || parsed.Error) {
 				events.push({
 					type: "error",
@@ -590,6 +592,8 @@ export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[];
 						message: (parsed.message || parsed.Message) as string | undefined,
 					},
 				});
+			} else if (parsed.stopReason === "COMPLETED" || parsed.stopReason === "TOOL_USE") {
+				events.push({ type: "terminal", data: { stopReason: parsed.stopReason } });
 			}
 		} catch {
 			// JSON parsing failed for a balanced frame: could be a junk wrapper like '{junk{...}}'
@@ -888,7 +892,6 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			const reader = response.body.getReader();
 			const decoder = new TextDecoder();
 			let buffer = "";
-			let hasPendingTextBatch = false;
 			let lastContent = "";
 			let thinkingIndex: number | undefined;
 			let textIndex: number | undefined;
@@ -1097,7 +1100,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				}
 			};
 
-			// Parse incrementally and hold one complete text batch for a refusal in the following batch.
+			// Hold text until terminal metadata confirms success; a refusal at any earlier point drops it.
 			while (true) {
 				const { done, value } = await reader.read();
 				if (done) break;
@@ -1105,23 +1108,18 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				const { events, remaining } = parseKiroApiEvents(buffer);
 				buffer = remaining;
 
-				const hasCompleteEventBatch = events.length > 0 && buffer.length === 0;
-				// Don't release the previous text batch until this complete batch rules out a refusal.
-				const hasTerminalEvent = events.some(e => e.type === "refusal");
-				if (!hasTerminalEvent && hasCompleteEventBatch && hasPendingTextBatch) {
-					flushPendingTextEvents();
-					hasPendingTextBatch = false;
-				}
+				const hasRefusalEvent = events.some(e => e.type === "refusal");
+				let hasSuccessfulTerminalEvent = false;
 
 				for (const event of events) {
 					if (event.type === "content") {
-						if (!hasTerminalEvent) {
+						if (!hasRefusalEvent) {
 							if (event.data === lastContent) continue;
 							lastContent = event.data;
 							consumeContent(event.data);
 						}
 					} else if (event.type === "toolUse") {
-						if (!hasTerminalEvent) {
+						if (!hasRefusalEvent) {
 							if (!firstTokenEmitted) {
 								firstTokenEmitted = true;
 								firstTokenTime = Date.now();
@@ -1143,7 +1141,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 								addToolToBlocks();
 							}
 						}
-					} else if (event.type === "toolUseInput" && currentTool && !hasTerminalEvent) {
+					} else if (event.type === "toolUseInput" && currentTool && !hasRefusalEvent) {
 						if (!firstTokenEmitted) {
 							firstTokenEmitted = true;
 							firstTokenTime = Date.now();
@@ -1156,19 +1154,21 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						if (event.data.inputTokens !== undefined) output.usage.input = event.data.inputTokens;
 						if (event.data.outputTokens !== undefined) output.usage.output = event.data.outputTokens;
 						output.usage.totalTokens = output.usage.input + output.usage.output;
+					} else if (event.type === "terminal") {
+						hasSuccessfulTerminalEvent = true;
 					} else if (event.type === "refusal") {
 						const refusalData = event.data as {
 							stopReason?: string;
 							stopDetails?: { refusal?: { category?: string; explanation?: string } };
 						};
-						if (refusalData.stopDetails?.refusal) {
+						if (refusalData.stopDetails?.refusal || refusalData.stopReason === "CONTENT_FILTERED") {
 							// Handle refusal: clear blocks and emit error (don't emit any text/tool that came before)
 							consumeContent(""); // Flush any pending thinking
 							clearPendingToolCalls(); // DROP any pending tool call without emitting events
 
-							const refusal = refusalData.stopDetails.refusal;
-							const category = refusal.category;
-							const explanation = refusal.explanation?.trim();
+							const refusal = refusalData.stopDetails?.refusal;
+							const category = refusal?.category;
+							const explanation = refusal?.explanation?.trim();
 							const label = category ? `Kiro refused the request (${category})` : "Kiro refused the request";
 
 							output.stopReason = "error";
@@ -1204,7 +1204,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 							return;
 						}
 					} else if (event.type === "error") {
-						if (hasTerminalEvent) continue;
+						if (hasRefusalEvent) continue;
 						flushPendingTextEvents();
 						// On ordinary errors, flush pending COMPLETED tool events before the error terminal
 						// (refusals drop them, incomplete tools must not be emitted)
@@ -1222,8 +1222,8 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						throw new Error(fullErrorMsg);
 					}
 				}
-				if (!hasTerminalEvent && hasCompleteEventBatch && pendingTextEvents.length > 0) {
-					hasPendingTextBatch = true;
+				if (!hasRefusalEvent && hasSuccessfulTerminalEvent && buffer.length === 0) {
+					flushPendingTextEvents();
 				}
 			}
 
