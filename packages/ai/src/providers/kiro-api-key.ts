@@ -1143,8 +1143,8 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			}
 
 			// Stream is done - add any pending tool, emit accumulated thinking, then deferred text, then close text block
-			// Only emit the tool if it was explicitly completed (has stop flag)
-			if (toolComplete) addToolToBlocks();
+			// Emit tool if explicitly completed or if stream end (implicit completion)
+			if (currentTool) addToolToBlocks();
 			emitThinking();
 			emitDeferredTextEvents();
 			// Now emit all tool call events in order (safe since no refusal occurred)
