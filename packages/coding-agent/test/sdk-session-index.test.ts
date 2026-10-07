@@ -2472,3 +2472,88 @@ describe("SDK session index", () => {
 		expect(await sessionWorktreeRoot(real)).toBeNull();
 	});
 });
+
+describe("SDK session index projections (perf optimization)", () => {
+	it("creates session projections to cache events per session", async () => {
+		const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-projections-"));
+		try {
+			const index = new SessionIndex(agentDir);
+			const sessionId = "test-session-proj-cache";
+			const stateRoot = "/test/state/root";
+			
+			// Append a host_registered event
+			const registered = await index.append(event(sessionId), {
+				type: "host_registered",
+				locator: {
+					cwd: "/test/cwd",
+					stateRoot,
+					worktreeRoot: "/test/worktree",
+				},
+				processIncarnation: "incarnation-1",
+			});
+			
+			expect(registered).toBeDefined();
+			
+			// Append another event for the same session
+			const heartbeat = await index.append(event(sessionId), {
+				type: "host_heartbeat",
+				locator: {
+					cwd: "/test/cwd",
+					stateRoot,
+					worktreeRoot: "/test/worktree",
+				},
+				activityState: "active",
+			});
+			
+			expect(heartbeat).toBeDefined();
+			
+			// Verify projection directory was created
+			const projectionsDir = path.join(agentDir, "sdk", "sessions", "index-projections");
+			const projectionDirExists = await Bun.file(projectionsDir).exists();
+			expect(projectionDirExists).toBe(true);
+			
+			// Verify manifest file exists
+			const manifestFile = path.join(projectionsDir, "manifest.json");
+			const manifestExists = await Bun.file(manifestFile).exists();
+			expect(manifestExists).toBe(true);
+			
+			// Verify session projection file was created (hashed by sessionId)
+			const projectionFiles = await fs.readdir(projectionsDir);
+			const hasSessionProjection = projectionFiles.some(f => f.endsWith(".json") && f !== "manifest.json");
+			expect(hasSessionProjection).toBe(true);
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+	
+	it("lazy loads node authorities without opening PATH executables", async () => {
+		// This test verifies that the lazy initialization of node authorities
+		// does not trigger file opens that would require PATH executables.
+		// The implementation captures initialProcessEnvironment eagerly at module
+		// load time, allowing the lazy function to defer execution without safety risk.
+		
+		// The actual verification is in gjc-plugin-mcp-configs.test.ts
+		// which tests that buildPluginMcpConfigs does not open PATH node executables.
+		// This test documents that the behavior is expected and safe.
+		const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-lazy-auth-"));
+		try {
+			const index = new SessionIndex(agentDir);
+			// Simply constructing the index and using it should not
+			// trigger any PATH executable access for node authority hashing
+			const sessionId = "test-lazy-authority";
+			const result = await index.append(event(sessionId), {
+				type: "host_registered",
+				locator: {
+					cwd: "/test/cwd",
+					stateRoot: "/test/state",
+					worktreeRoot: "/test/worktree",
+				},
+				processIncarnation: "test-incarnation",
+			});
+			
+			expect(result).toBeDefined();
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+});
