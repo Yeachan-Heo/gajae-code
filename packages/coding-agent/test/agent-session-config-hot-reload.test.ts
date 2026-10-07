@@ -528,18 +528,15 @@ describe("AgentSession configuration reload", () => {
 	});
 
 	it("preserves a newer temporary model selection while applying the active profile reload", async () => {
-		const apiKeyEnv = "GJC_TEST_RELOAD_USER_SELECTION_KEY";
-		const restoreEnvironment = unsetEnvironmentVariables(apiKeyEnv);
-		Bun.env[apiKeyEnv] = "reload-selection-test-key";
 		const releasePublicationFence = Promise.withResolvers<void>();
 		let publicationFenceEntered = false;
 		let restorePublicationFence: (() => void) | undefined;
+		let restoreModelRegistryApiKey: (() => void) | undefined;
 		try {
 			const { configPath, modelsPath } = await createSession({
 				modelId: "default-model",
 				additionalModelId: "manual-model",
 				withProfile: true,
-				apiKeyEnv,
 			});
 			session!.settings.set("modelRoles", { planner: `${provider}/manual-model` });
 			await session!.settings.flushOrThrow();
@@ -564,9 +561,8 @@ describe("AgentSession configuration reload", () => {
 				modelId: "next-default-model",
 				additionalModelId: "manual-model",
 				name: "After",
-				baseUrl: "https://before.example/v1",
+				baseUrl: "https://after.example/v1",
 				withProfile: true,
-				apiKeyEnv,
 			});
 			const staged = candidate(
 				20,
@@ -578,12 +574,14 @@ describe("AgentSession configuration reload", () => {
 			const reload = session!.reloadConfiguration(staged, new AbortController().signal);
 			await waitFor(() => publicationFenceEntered);
 
+			const apiKeySpy = vi.spyOn(modelRegistry!, "getApiKey").mockResolvedValue("temporary-cycle-key");
+			restoreModelRegistryApiKey = () => apiKeySpy.mockRestore();
 			const cycled = await session!.cycleRoleModels(["default", "planner"], { temporary: true });
 			expect(cycled?.model.id).toBe("manual-model");
 			releasePublicationFence.resolve();
 			await expect(reload).resolves.toMatchObject({ applied: true, modelsChanged: true });
 
-			expect(session!.model?.id).toBe("manual-model");
+			expect(session!.model).toMatchObject({ id: "manual-model", baseUrl: "https://after.example/v1" });
 			expect(session!.getConfiguredModelChainState("default")).toMatchObject({
 				entries: [`${provider}/next-default-model`],
 				origin: "profile-activation",
@@ -592,7 +590,67 @@ describe("AgentSession configuration reload", () => {
 		} finally {
 			releasePublicationFence.resolve();
 			restorePublicationFence?.();
-			restoreEnvironment();
+			restoreModelRegistryApiKey?.();
+		}
+	});
+
+	it("keeps a newer selection when the staged catalog removes that model", async () => {
+		const releasePublicationFence = Promise.withResolvers<void>();
+		let publicationFenceEntered = false;
+		let restorePublicationFence: (() => void) | undefined;
+		let restoreModelRegistryApiKey: (() => void) | undefined;
+		try {
+			const { configPath, modelsPath } = await createSession({
+				modelId: "default-model",
+				additionalModelId: "manual-model",
+				withProfile: true,
+			});
+			session!.settings.set("modelRoles", { planner: `${provider}/manual-model` });
+			await session!.settings.flushOrThrow();
+			await session!.activateModelProfileForControl("active-profile");
+
+			const originalAcquirePublicationFence = modelRegistry!.acquirePublicationFence.bind(modelRegistry!);
+			const publicationFenceSpy = vi
+				.spyOn(modelRegistry!, "acquirePublicationFence")
+				.mockImplementation(async signal => {
+					publicationFenceEntered = true;
+					await releasePublicationFence.promise;
+					return await originalAcquirePublicationFence(signal);
+				});
+			restorePublicationFence = () => publicationFenceSpy.mockRestore();
+
+			const staged = candidate(
+				21,
+				configPath,
+				modelsPath,
+				settingsText({ todoEnabled: false, compactionEnabled: false }),
+				modelsText({
+					modelId: "next-default-model",
+					name: "After",
+					baseUrl: "https://after.example/v1",
+					withProfile: true,
+				}),
+			);
+			const reload = session!.reloadConfiguration(staged, new AbortController().signal);
+			await waitFor(() => publicationFenceEntered);
+
+			const apiKeySpy = vi.spyOn(modelRegistry!, "getApiKey").mockResolvedValue("temporary-cycle-key");
+			restoreModelRegistryApiKey = () => apiKeySpy.mockRestore();
+			const cycled = await session!.cycleRoleModels(["default", "planner"], { temporary: true });
+			expect(cycled?.model.id).toBe("manual-model");
+			releasePublicationFence.resolve();
+			await expect(reload).rejects.toMatchObject({ code: "MODEL_UNAVAILABLE" });
+
+			expect(session!.model?.id).toBe("manual-model");
+			expect(modelRegistry!.find(provider, "default-model")).toBeDefined();
+			expect(session!.getConfiguredModelChainState("default")).toMatchObject({
+				entries: [`${provider}/default-model`],
+				identity: "active-profile",
+			});
+		} finally {
+			releasePublicationFence.resolve();
+			restorePublicationFence?.();
+			restoreModelRegistryApiKey?.();
 		}
 	});
 

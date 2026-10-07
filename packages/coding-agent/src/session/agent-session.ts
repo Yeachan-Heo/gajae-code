@@ -18679,6 +18679,32 @@ export class AgentSession {
 					) {
 						preparedLiveModelSelection = undefined;
 					}
+					if (preserveLiveModelSelection && this.model) {
+						const currentModel = this.model;
+						const updatedModel = this.#updatedCurrentModel(stagedModels.registry);
+						if (!updatedModel) {
+							throw new ConfigurationReloadError(
+								"MODEL_UNAVAILABLE",
+								new Error("The current model is unavailable in the staged registry"),
+							);
+						}
+						if (!util.isDeepStrictEqual(currentModel, updatedModel)) {
+							const selectionRevision = this.getUserModelSelectionRevision();
+							preparedLiveModelSelection = await this.prepareModelSelectionForProfileActivation(
+								updatedModel,
+								this.thinkingLevel,
+								reloadSignal,
+							);
+							preparedLiveModelSelectionRevision = selectionRevision;
+							reloadSignal.throwIfAborted();
+							if (this.getUserModelSelectionRevision() !== selectionRevision) {
+								throw new ConfigurationReloadError(
+									"PUBLICATION_FAILED",
+									new Error("A newer model selection arrived while preparing the reload model"),
+								);
+							}
+						}
+					}
 					const modelsChanged = stagedModels.changed;
 					const settingsChanged = changedSettings.length > 0;
 					if (!settingsChanged && !modelsChanged) {
