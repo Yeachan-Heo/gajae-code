@@ -792,7 +792,10 @@ function resolveManagedScopeInternal(
 			"verify",
 			"directory",
 		);
-		if (!security.ok && (!allowRepairableAclFailure || security.code !== "acl_verify_failed")) {
+		if (
+			!security.ok &&
+			(!allowRepairableAclFailure || (security.code !== "acl_verify_failed" && security.code !== "owner_mismatch"))
+		) {
 			return {
 				kind: "error",
 				code: "binding_invalid",

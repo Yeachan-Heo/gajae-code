@@ -1465,7 +1465,6 @@ describe("managed GC retirement journal", () => {
 			capture.mockRestore();
 		}
 	});
-
 	it("fails public GC consumers at 50,001 streamed entries (resource-pressure simulation only)", async () => {
 		const fixture = makeFixture();
 		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
