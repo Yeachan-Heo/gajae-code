@@ -116,37 +116,63 @@ export function countTerminalCriticVerdicts(ledger: readonly UltragoalLedgerEven
 	return ledger.filter(event => event.event === CRITIC_VERDICT_EVENT && event.planGeneration === planGeneration)
 		.length;
 }
-/** Pure: count every non-OKAY terminal critic verdict recorded for this run. */
+/** Pure: count non-OKAY terminal critic verdicts for one acceptance/change generation. */
 export function countNonOkayTerminalCriticVerdicts(
 	ledger: readonly UltragoalLedgerEvent[],
-	_legacyPlanGeneration?: string,
+	planGeneration?: string,
 ): number {
-	return ledger.filter(event => event.event === CRITIC_VERDICT_EVENT && event.verdict !== "OKAY").length;
+	return ledger.filter(
+		event =>
+			event.event === CRITIC_VERDICT_EVENT &&
+			event.verdict !== "OKAY" &&
+			(planGeneration === undefined || event.planGeneration === planGeneration),
+	).length;
 }
 
 export function terminalCriticHardStopReached(
 	ledger: readonly UltragoalLedgerEvent[],
-	_legacyPlanGeneration?: string,
+	planGeneration?: string,
 ): boolean {
-	return ledger.some(event => event.event === CRITIC_GATE_HARD_STOP_EVENT);
+	return ledger.some(
+		event =>
+			event.event === CRITIC_GATE_HARD_STOP_EVENT &&
+			(planGeneration === undefined || event.planGeneration === planGeneration),
+	);
 }
 
-export function terminalCriticGateOverridden(ledger: readonly UltragoalLedgerEvent[]): boolean {
-	let overrideAfterLatestHardStop = false;
+export function terminalCriticGateOverridden(
+	ledger: readonly UltragoalLedgerEvent[],
+	planGeneration?: string,
+): boolean {
+	let hardStopIndex = -1;
 	for (let index = ledger.length - 1; index >= 0; index--) {
 		const event = ledger[index];
-		if (event.event === CRITIC_GATE_OVERRIDE_EVENT) overrideAfterLatestHardStop = true;
-		if (event.event === CRITIC_GATE_HARD_STOP_EVENT) return overrideAfterLatestHardStop;
+		if (
+			event.event === CRITIC_GATE_HARD_STOP_EVENT &&
+			(planGeneration === undefined || event.planGeneration === planGeneration)
+		) {
+			hardStopIndex = index;
+			break;
+		}
 	}
-	return false;
+	if (hardStopIndex < 0) return false;
+	const hardStopGeneration = ledger[hardStopIndex]?.planGeneration;
+	return ledger
+		.slice(hardStopIndex + 1)
+		.some(
+			event =>
+				event.event === CRITIC_GATE_OVERRIDE_EVENT &&
+				(typeof event.planGeneration !== "string" || event.planGeneration === hardStopGeneration),
+		);
 }
 
 export function terminalCriticCeilingReached(
 	ledger: readonly UltragoalLedgerEvent[],
-	_legacyPlanGeneration?: string,
+	planGeneration?: string,
 ): boolean {
 	return (
-		countNonOkayTerminalCriticVerdicts(ledger) >= TERMINAL_CRITIC_CEILING || terminalCriticHardStopReached(ledger)
+		countNonOkayTerminalCriticVerdicts(ledger, planGeneration) >= TERMINAL_CRITIC_CEILING ||
+		terminalCriticHardStopReached(ledger, planGeneration)
 	);
 }
 

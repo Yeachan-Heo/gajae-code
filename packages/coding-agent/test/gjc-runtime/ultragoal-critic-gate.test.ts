@@ -331,7 +331,7 @@ describe("ultragoal terminal critic gate", () => {
 		expect(countUltragoalNudges(ledger, "G001")).toBe(2);
 	});
 
-	it("accumulates completion verdicts across reopened plan generations and hard-stops on the fifth", async () => {
+	it("resets the critic attempt budget on a new plan generation while preserving the audit history", async () => {
 		const root = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd: root, brief: "Ship the story" });
@@ -366,10 +366,50 @@ describe("ultragoal terminal critic gate", () => {
 		const ledger = await readUltragoalLedger(root);
 		expect(new Set(generations).size).toBe(TERMINAL_CRITIC_CEILING);
 		expect(countNonOkayTerminalCriticVerdicts(ledger)).toBe(TERMINAL_CRITIC_CEILING);
-		expect(terminalCriticCeilingReached(ledger)).toBe(true);
-		expect(terminalCriticHardStopReached(ledger)).toBe(true);
-		expect(ledger.some(event => event.event === CRITIC_GATE_HARD_STOP_EVENT)).toBe(true);
-	});
+		const currentPlan = await readUltragoalPlan(root);
+		const currentGeneration = computeCriticVerdictPlanGeneration(currentPlan!);
+		expect(countNonOkayTerminalCriticVerdicts(ledger, currentGeneration)).toBe(0);
+		expect(terminalCriticCeilingReached(ledger, currentGeneration)).toBe(false);
+		expect(terminalCriticHardStopReached(ledger, currentGeneration)).toBe(false);
+		expect(ledger.some(event => event.event === CRITIC_GATE_HARD_STOP_EVENT)).toBe(false);
+		for (let attempt = 1; attempt <= TERMINAL_CRITIC_CEILING; attempt++) {
+			await recordUltragoalCriticVerdict({
+				cwd: root,
+				terminus: "completion",
+				verdict: "REJECT",
+				evidence: `Current generation rejection ${attempt}`,
+				blockers: [`Current generation blocker ${attempt}`],
+			});
+		}
+		const currentLedger = await readUltragoalLedger(root);
+		expect(countNonOkayTerminalCriticVerdicts(currentLedger, currentGeneration)).toBe(TERMINAL_CRITIC_CEILING);
+		expect(terminalCriticCeilingReached(currentLedger, currentGeneration)).toBe(true);
+		expect(terminalCriticHardStopReached(currentLedger, currentGeneration)).toBe(true);
+		const recovery = await runNativeUltragoalCommand(
+			[
+				"steer",
+				"--kind",
+				"add_subgoal",
+				"--title",
+				"Resolve current-generation finding",
+				"--objective",
+				"Resolve the current critic finding and verify the correction.",
+				"--evidence",
+				"The prior plan generation has a concrete recovery action.",
+				"--rationale",
+				"A new acceptance generation was created to address the blocker.",
+			],
+			root,
+		);
+		expect(recovery.status).toBe(0);
+		const recoveredPlan = await readUltragoalPlan(root);
+		const recoveredGeneration = computeCriticVerdictPlanGeneration(recoveredPlan!);
+		const recoveredLedger = await readUltragoalLedger(root);
+		expect(countNonOkayTerminalCriticVerdicts(recoveredLedger)).toBe(TERMINAL_CRITIC_CEILING * 2);
+		expect(terminalCriticCeilingReached(recoveredLedger, recoveredGeneration)).toBe(false);
+		expect(terminalCriticHardStopReached(recoveredLedger, recoveredGeneration)).toBe(false);
+		expect(recoveredLedger.some(event => event.event === CRITIC_GATE_HARD_STOP_EVENT)).toBe(true);
+	}, 120_000);
 
 	it("rejects final aggregate completion at the hard stop until a gate override is recorded", async () => {
 		const root = await tempDir();

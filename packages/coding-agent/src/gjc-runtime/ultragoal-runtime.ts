@@ -2914,8 +2914,9 @@ async function validateCompletionQualityGate(
 	if (isFinalAggregate) {
 		if (
 			options.ledger &&
-			terminalCriticCeilingReached(options.ledger) &&
-			!terminalCriticGateOverridden(options.ledger)
+			options.plan &&
+			terminalCriticCeilingReached(options.ledger, computeCriticVerdictPlanGeneration(options.plan)) &&
+			!terminalCriticGateOverridden(options.ledger, computeCriticVerdictPlanGeneration(options.plan))
 		) {
 			found.add(
 				"criticReview",
@@ -4550,8 +4551,8 @@ export async function recordUltragoalCriticVerdict(input: {
 				resolvedSessionId,
 			);
 			const updatedLedger = [...ledger, criticVerdict];
-			const count = countNonOkayTerminalCriticVerdicts(updatedLedger);
-			if (count >= TERMINAL_CRITIC_CEILING && !terminalCriticHardStopReached(updatedLedger)) {
+			const count = countNonOkayTerminalCriticVerdicts(updatedLedger, planGeneration);
+			if (count >= TERMINAL_CRITIC_CEILING && !terminalCriticHardStopReached(updatedLedger, planGeneration)) {
 				await appendLedger(
 					input.cwd,
 					{
@@ -4583,10 +4584,17 @@ export async function recordUltragoalCriticGateOverride(input: {
 		paths.ledgerPath,
 		async () => {
 			const ledger = await readUltragoalLedger(input.cwd, resolvedSessionId);
-			if (!terminalCriticHardStopReached(ledger)) {
+			const plan = await readUltragoalPlan(input.cwd, resolvedSessionId);
+			if (!plan) throw new Error("record-critic-gate-override requires an active ultragoal plan");
+			const planGeneration = computeCriticVerdictPlanGeneration(plan);
+			if (!terminalCriticHardStopReached(ledger, planGeneration)) {
 				throw new Error("record-critic-gate-override requires a durably recorded terminal critic hard stop");
 			}
-			return appendLedger(input.cwd, { event: CRITIC_GATE_OVERRIDE_EVENT, evidence }, resolvedSessionId);
+			return appendLedger(
+				input.cwd,
+				{ event: CRITIC_GATE_OVERRIDE_EVENT, evidence, planGeneration },
+				resolvedSessionId,
+			);
 		},
 		{ cwd: input.cwd },
 	);
