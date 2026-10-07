@@ -102,6 +102,17 @@ describe("AgentSession profile resume defaults", () => {
 		expect(session.getUserModelSelectionRevision()).toBeGreaterThan(revision);
 	});
 
+	it("fences explicit model selections assigned to non-default roles", async () => {
+		const { base, profileMain } = resolveModels();
+		session = makeSession(base);
+		const revision = session.getUserModelSelectionRevision();
+
+		await session.setModel(profileMain, "executor");
+
+		expect(session.model).toEqual(profileMain);
+		expect(session.getUserModelSelectionRevision()).toBe(revision + 1);
+	});
+
 	it("advances the recovery fence for explicit control-surface selections", () => {
 		const { base } = resolveModels();
 		session = makeSession(base);
