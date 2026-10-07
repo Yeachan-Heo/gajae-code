@@ -7,6 +7,39 @@ import { TempDir } from "@gajae-code/utils";
 type SessionStateSnapshot = Parameters<SessionManager["restoreState"]>[0];
 
 describe("lifecycle contracts regression (PR #6428)", () => {
+	it("rebinds close retry origin after replacing the session", async () => {
+		using root = TempDir.createSync("@pi-close-retry-session-replacement-");
+		const storage = new FileSessionStorage();
+		const initial = `${root.path()}/initial.jsonl`;
+		const replacement = `${root.path()}/replacement.jsonl`;
+		await fs.writeFile(
+			initial,
+			`${JSON.stringify({ type: "session", version: 5, id: "initial", timestamp: new Date().toISOString(), cwd: root.path() })}\n`,
+		);
+		const manager = await SessionManager.open(initial, SessionManager.explicitDestination(root.path()), storage);
+
+		try {
+			await fs.writeFile(
+				replacement,
+				`${JSON.stringify({ type: "session", version: 5, id: "replacement", timestamp: new Date().toISOString(), cwd: root.path() })}\n`,
+			);
+			await manager.setSessionFile(replacement);
+			manager.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: "after replacement" }],
+				timestamp: 2,
+			});
+			await manager.ensureOnDisk();
+			await expect(manager.close()).resolves.toBeUndefined();
+		} finally {
+			try {
+				await manager.close();
+			} catch {
+				// Cleanup is best effort if the assertion already closed the manager.
+			}
+		}
+	});
+
 	it("rejects restoreState during strict close", async () => {
 		using root = TempDir.createSync("@pi-restore-state-strict-close-");
 		const destination = SessionManager.managedDestination(root.path(), root.path());
