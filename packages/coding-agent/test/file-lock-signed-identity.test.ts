@@ -157,14 +157,23 @@ test("acquires and releases after reclaiming a signed-ID dead-owner lock", async
 });
 
 test.skipIf(process.platform !== "win32")(
-	"reclaims signed IDs and cleans up through a temporary-root drive-letter alias",
+	"reclaims signed IDs and cleans up through a temporary-root case alias",
 	async () => {
 		const tempRoot = os.tmpdir();
 		const canonicalTempRoot = await fs.realpath(tempRoot);
-		const driveLetter = canonicalTempRoot[0];
+		const volumeRoot = path.win32.parse(canonicalTempRoot).root;
+		const isDriveRoot = /^[a-z]:[\\/]/i.test(volumeRoot);
+		const caseableSuffixOffset = canonicalTempRoot.slice(volumeRoot.length).search(/[a-z]/i);
+		if (!isDriveRoot && caseableSuffixOffset < 0) {
+			throw new Error("Expected a caseable Windows temporary-root path");
+		}
+		const caseableOffset = isDriveRoot ? 0 : volumeRoot.length + caseableSuffixOffset;
+		const rootCharacter = canonicalTempRoot[caseableOffset];
+		if (!rootCharacter) throw new Error("Expected a caseable Windows temporary-root character");
 		const alternateCase =
-			driveLetter === driveLetter.toUpperCase() ? driveLetter.toLowerCase() : driveLetter.toUpperCase();
-		const aliasedTempRoot = alternateCase + tempRoot.slice(1);
+			rootCharacter === rootCharacter.toUpperCase() ? rootCharacter.toLowerCase() : rootCharacter.toUpperCase();
+		const aliasedTempRoot =
+			canonicalTempRoot.slice(0, caseableOffset) + alternateCase + canonicalTempRoot.slice(caseableOffset + 1);
 		expect(aliasedTempRoot).not.toBe(canonicalTempRoot);
 		const fixture = await signedIdentityFixture("both", false, aliasedTempRoot);
 		const observed = await readFileLockObservationForGc(fixture.lock);
