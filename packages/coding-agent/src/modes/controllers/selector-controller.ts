@@ -3334,6 +3334,10 @@ export class SelectorController {
 							return;
 						}
 
+						// Retire predecessor: clear streaming component from abandoned branch before rebuilding.
+						// This prevents the ghost of the old partial answer from appearing in the selected transcript.
+						this.#clearTransientSessionUi();
+
 						// Update UI — pass the context built by navigateTree to skip a second O(N) walk.
 						this.ctx.rebuildInitialMessages("reconcile-same-transcript", result.sessionContext);
 						await this.ctx.reloadTodos();
