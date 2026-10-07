@@ -97,12 +97,14 @@ describe("lifecycle contracts regression (PR #6428)", () => {
 			if (!sessionFileA) throw new Error("Expected explicit session file");
 
 			// Copy the snapshot via spread operator (documented caller-adjusted path)
-			// The explicit identity should survive this copy. When the snapshot is copied,
-			// the non-enumerable property is lost, but the identity should still be available.
+			// The explicit identity is now stored as an enumerable property so it survives
+			// the spread copy, ensuring adoption preserves the captured identity.
 			const copiedSnapshot = { ...snapshotA };
 
-			// Verify the non-enumerable property is not present in the copy
-			expect((copiedSnapshot as any).explicitPersistIdentity).toBeUndefined();
+			// Verify the explicit identity IS present in the copy (now enumerable)
+			const copiedIdentity = (copiedSnapshot as any).explicitPersistIdentity;
+			expect(copiedIdentity).toBeTruthy();
+			expect(copiedIdentity.sessionId).toBe(snapshotA.sessionId);
 
 			// Create a second manager that will adopt the copied snapshot
 			const managerB = SessionManager.create(root.path(), root.path(), storage);
@@ -132,7 +134,7 @@ describe("lifecycle contracts regression (PR #6428)", () => {
 		}
 	});
 
-	it("adopts snapshot with implicit explicit identity reconstruction for copied state", async () => {
+	it("adopts snapshot with preserved explicit identity through spread copy", async () => {
 		using root = TempDir.createSync("@pi-cross-manager-explicit-identity-adopt-");
 		const storage = new FileSessionStorage();
 
@@ -146,17 +148,19 @@ describe("lifecycle contracts regression (PR #6428)", () => {
 			if (!sessionFileA) throw new Error("Expected explicit session file");
 
 			// Copy the snapshot via spread operator (documented caller-adjusted path)
-			// This simulates a caller making a clean copy of the snapshot
+			// The explicit identity is now stored as an enumerable property and survives the copy
 			const copiedSnapshot = { ...snapshotA };
 
-			// Verify the non-enumerable property is not present in the copy
-			expect((copiedSnapshot as any).explicitPersistIdentity).toBeUndefined();
+			// Verify the explicit identity IS preserved in the copy (enumerable property)
+			const copiedIdentity = (copiedSnapshot as any).explicitPersistIdentity;
+			expect(copiedIdentity).toBeTruthy();
+			expect(copiedIdentity.sessionId).toBe(snapshotA.sessionId);
 
 			// Create a second manager that will adopt the copied snapshot
 			const managerB = SessionManager.create(root.path(), root.path(), storage);
 			try {
-				// Adopt the copied snapshot - the explicit identity should be implicitly reconstructed
-				// from the sessionFile even though it was lost during the spread copy
+				// Adopt the copied snapshot - the explicit identity is preserved through the
+				// spread copy, so adoption restores the captured identity
 				managerB.restoreState(copiedSnapshot);
 
 				// Verify the state was restored with proper identity

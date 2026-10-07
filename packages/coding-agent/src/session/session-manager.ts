@@ -8451,12 +8451,14 @@ export class SessionManager {
 				: undefined;
 		if (explicitPersistIdentity && explicitPersistIdentity.sessionId !== snapshot.sessionId)
 			throw new Error("Session rollback persistence identity is unavailable.");
-		// Store the explicit identity as a non-enumerable property on the snapshot itself
-		// so that cross-manager adoptions can access it without relying on the #stateSnapshots map.
+		// Store the explicit identity as an enumerable property on the snapshot itself
+		// so that it survives documented caller-adjusted copies (spread, JSON round-trip,
+		// structuredClone, etc.) and cross-manager adoptions can access the captured
+		// identity instead of reconstructing it from the current file state.
 		if (explicitPersistIdentity) {
 			Object.defineProperty(snapshot, "explicitPersistIdentity", {
 				value: Object.freeze({ ...explicitPersistIdentity }),
-				enumerable: false,
+				enumerable: true,
 				configurable: false,
 				writable: false,
 			});
@@ -8492,17 +8494,15 @@ export class SessionManager {
 	): Readonly<SessionManagerStateSnapshot> & { readonly explicitPersistIdentity?: ExplicitPersistIdentity } {
 		const issued = this.#stateSnapshots.get(snapshot);
 		if (issued) return issued;
-		// Preserve explicit identity from cross-manager adoptions where the target
-		// manager has no #stateSnapshots entry but the snapshot itself carries the identity.
-		// When the snapshot is copied through documented caller-adjusted paths (spread,
-		// JSON round-trip, structuredClone, etc.), the non-enumerable property is lost.
-		// Reconstruct it from the sessionFile to ensure stale file checks are not bypassed.
+		// Preserve explicit identity from cross-manager adoptions. The identity is now
+		// stored as an enumerable property on the snapshot so it survives documented
+		// caller-adjusted copies (spread, JSON round-trip, structuredClone, etc.).
+		// Adoption must restore the identity captured in the snapshot, not the current
+		// state of the sessionFile, to ensure stale file checks use the captured identity.
 		let explicit = (snapshot as any).explicitPersistIdentity as ExplicitPersistIdentity | undefined;
+		// Only attempt reconstruction for explicit-storage sessions that don't already
+		// have an explicit identity (e.g., snapshots captured before this change).
 		if (!explicit && snapshot.sessionFile && !snapshot.managedPersistExpectedIdentity) {
-			// Only attempt reconstruction for explicit-storage sessions (no managed identity).
-			// When a snapshot is copied through documented caller-adjusted paths (spread,
-			// JSON round-trip, structuredClone, etc.), the non-enumerable property is lost.
-			// Reconstruct it from the sessionFile to enable stale file checks in validation.
 			try {
 				explicit = this.#captureExplicitPersistIdentity(snapshot.sessionFile);
 				// Verify the reconstructed identity matches the snapshot's sessionId
