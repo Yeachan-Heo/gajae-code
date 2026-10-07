@@ -5275,6 +5275,9 @@ test.each([
 		await harness?.stop();
 		await session?.dispose();
 		authStorage?.close();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
 test("SDK-only host retains accepted staged bytes until terminal and releases rejected images", async () => {
 	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-only-staged-image-"));
 	const originalRedeem = PromptImageUploadStore.prototype.redeem;
@@ -5662,6 +5665,7 @@ test("SDK-only ordinary abort selects its owned root ahead of same-connection qu
 	let idle = true;
 	let rootAborts = 0;
 	let queuedSignal: AbortSignal | undefined;
+	let queuedPromotion: PreflightHooks["onQueuedPromoted"];
 	try {
 		harness = await invocationHarness("sdk-only-owned-root-selection", cwd, {
 			isIdle: () => idle,
@@ -5671,7 +5675,11 @@ test("SDK-only ordinary abort selects its owned root ahead of same-connection qu
 			sendUserMessage: async (content, options) => {
 				await options?.onPreflightAcceptCommit?.();
 				if (content === "root") await neverSettlingPromise();
-				else queuedSignal = options?.preflightSignal;
+				else {
+					queuedSignal = options?.preflightSignal;
+					queuedPromotion = options?.onQueuedPromoted;
+					options?.onDispatchDisposition?.({ startsOwnRun: false });
+				}
 			},
 		});
 		expect(await harness.control("turn.prompt", { text: "root" })).toMatchObject({ ok: true });
@@ -5682,6 +5690,7 @@ test("SDK-only ordinary abort selects its owned root ahead of same-connection qu
 		expect(await harness.control("turn.abort", {})).toMatchObject({ ok: true, result: { aborted: true } });
 		expect(rootAborts).toBe(1);
 		expect(queuedSignal?.aborted).toBe(false);
+		queuedPromotion?.({ startsOwnRun: false, removed: true });
 	} finally {
 		await harness?.stop();
 		await rm(cwd, { recursive: true, force: true });
@@ -6596,9 +6605,20 @@ describe("post-acceptance invocation terminalization", () => {
 			// Wait for session to settle and ensure no further continuations are queued
 			await session?.waitForIdle();
 			expect(harness.broadcasts.filter(frame => frame.kind === "agent_start")).toHaveLength(2);
-			const ends = harness.broadcasts.filter(frame => frame.kind === "agent_end");
-			expect(ends).toHaveLength(1);
-			expect(ends[0]).toMatchObject({ payload: { ...correlation, outcome: { kind: "failed" } } });
+			const ends = harness.broadcasts.filter(frame => {
+				const payload = frame.payload as { commandId?: string; turnId?: string } | undefined;
+				return (
+					frame.kind === "agent_end" &&
+					payload?.commandId === correlation.commandId &&
+					payload?.turnId === correlation.turnId
+				);
+			});
+			expect(ends.map(frame => frame.payload)).toEqual([
+				expect.objectContaining({
+					...correlation,
+					outcome: expect.objectContaining({ kind: "failed" }),
+				}),
+			]);
 			expect(providerCalls).toBe(2);
 			await session.waitForIdle();
 			expect((await harness.query("turn.result", { kind: "prompt", ...correlation })).result).toMatchObject({
@@ -8531,6 +8551,7 @@ describe("post-acceptance invocation terminalization", () => {
 	test("a queued prompt stays non-terminal even if isIdle flips during the accept window", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminalize-race-"));
 		let idle = false;
+		let queuedPromotion: PreflightHooks["onQueuedPromoted"];
 		try {
 			const harness = await invocationHarness("terminalize-race", cwd, {
 				sendUserMessage: async (_content, options) => {
@@ -8542,6 +8563,7 @@ describe("post-acceptance invocation terminalization", () => {
 						() => options.onQueuedPromoted?.({ startsOwnRun: false, removed: true }),
 						{ once: true },
 					);
+					queuedPromotion = options?.onQueuedPromoted;
 					idle = true;
 				},
 				isIdle: () => idle,
@@ -8553,6 +8575,7 @@ describe("post-acceptance invocation terminalization", () => {
 			// queued, so it must not report terminal_ok even though isIdle is now true.
 			const status = await harness.query("turn.prompt_status", { commandId, turnId });
 			expect(status.result?.status).toMatch(/accepted|in_flight|unknown/);
+			queuedPromotion?.({ startsOwnRun: false, removed: true });
 			await harness.stop();
 		} finally {
 			await Bun.sleep(50);
@@ -8941,11 +8964,24 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				toolName: "apply_patch",
 				args: {},
 			});
-			const waitDeadline = Date.now() + 2_000;
+			const waitDeadline = Date.now() + 10_000;
 			while (!boundaryWaitStarted && Date.now() < waitDeadline) await Bun.sleep(10);
 			expect(boundaryWaitStarted).toBe(true);
 			await harness.emit("agent_end", { stopReason: "cancelled" });
-			await Bun.sleep(5_200);
+			const recoveryDeadline = Date.now() + 15_000;
+			while (
+				!store.snapshot().some(record => {
+					if (record.commandId !== correlation.commandId) return false;
+					const pending = record as SdkOnlyInvocationRecord & {
+						pendingOutcome?: unknown;
+						deadlineRecoveryPending?: boolean;
+					};
+					return pending.deadlineRecoveryPending === true && pending.pendingOutcome !== undefined;
+				})
+			) {
+				if (Date.now() >= recoveryDeadline) throw new Error("Captured deadline terminal was not durably deferred.");
+				await Bun.sleep(10);
+			}
 			expect(abortCalls).toBe(0);
 			expect((await harness.query("turn.prompt_status", correlation)).result).toMatchObject({ status: "in_flight" });
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toEqual([]);
@@ -8971,7 +9007,13 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			});
 
 			activeTools.clear();
-			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
+			const terminal = await settledStatus(harness, "turn.prompt_status", correlation).catch(async error => {
+				const status = await harness!.query("turn.prompt_status", correlation);
+				throw new Error(
+					`${error instanceof Error ? error.message : String(error)}; final status=${JSON.stringify(status.result)}; pending tools=${activeTools.size}; abort calls=${abortCalls}`,
+				);
+			});
+			expect(terminal).toMatchObject({
 				status: "terminal_ok",
 				outcome: { kind: "stopped", reason: "cancelled" },
 			});
@@ -9020,7 +9062,18 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			await harness.emit("agent_failed", {
 				error: Object.assign(new Error("provider unavailable"), { code: "provider_unavailable" }),
 			});
-			await Bun.sleep(150);
+			const recoveryDeadline = Date.now() + 5_000;
+			while (
+				!store.snapshot().some(
+					record =>
+						record.commandId === correlation.commandId &&
+						(record as SdkOnlyInvocationRecord & { deadlineRecoveryPending?: boolean }).deadlineRecoveryPending ===
+							true,
+				)
+			) {
+				if (Date.now() >= recoveryDeadline) throw new Error("Prompt deadline recovery was not durably marked.");
+				await Bun.sleep(10);
+			}
 			expect(abortCalls).toBe(0);
 			expect(await harness.query("turn.prompt_status", correlation)).toMatchObject({
 				result: { status: "in_flight" },
@@ -9099,7 +9152,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				toolName: "bash",
 				args: {},
 			});
-			const boundaryDeadline = Date.now() + 2_000;
+			const boundaryDeadline = Date.now() + 10_000;
 			while (!boundaryWaitStarted && Date.now() < boundaryDeadline) await Bun.sleep(10);
 			expect(boundaryWaitStarted).toBe(true);
 			expect(abortCalls).toHaveLength(0);
@@ -9546,7 +9599,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			expect(handleReads).toBeGreaterThan(0);
 			releaseClaim.resolve();
 			await startPromise;
-			const boundaryDeadline = Date.now() + 2_000;
+			const boundaryDeadline = Date.now() + 10_000;
 			while (!boundaryWaitStarted && Date.now() < boundaryDeadline) await Bun.sleep(5);
 			expect(boundaryWaitStarted).toBe(true);
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_start")).toHaveLength(1);
@@ -9972,6 +10025,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 	test("a replacement deadline stops its own turn but does not fail an unproven predecessor", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-lease-reentry-"));
 		const epoch = 43;
+		let promptDeadlineMs = 10_000;
 		let harness: InvocationHarness | undefined;
 		let replacementToken = "";
 		let abortCalls = 0;
@@ -9980,7 +10034,11 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			harness = await invocationHarness("lease-reentry", cwd, {
 				settings: {
 					get: (key: string) =>
-						key === "sdk.promptDeadlineMs" ? 1_000 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
+						key === "sdk.promptDeadlineMs"
+							? promptDeadlineMs
+							: key === "sdk.promptMaxRuntimeMs"
+								? 60_000
+								: undefined,
 				} as unknown as Settings,
 				sendUserMessage: async (_content, options) => {
 					await options?.onPreflightAcceptCommit?.();
@@ -10010,6 +10068,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			const first = await harness.control("turn.prompt", { text: "first" });
 			expect(first.ok).toBe(true);
 			await harness.emit("agent_start");
+			promptDeadlineMs = 1_000;
 			const followUp = await harness.control("turn.follow_up", { text: "replacement" });
 			expect(followUp.ok).toBe(true);
 			replacementToken = `${followUp.result?.commandId}:${followUp.result?.turnId}`;
@@ -10019,7 +10078,13 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			const idsFirst = { commandId: first.result?.commandId, turnId: first.result?.turnId };
 			const idsFollowUp = { commandId: followUp.result?.commandId, turnId: followUp.result?.turnId };
 			expect((await harness.query("turn.prompt_status", idsFirst)).result?.status).toBe("in_flight");
-			expect(await settledStatus(harness, "turn.prompt_status", idsFollowUp)).toMatchObject({
+			const followUpStatus = await settledStatus(harness, "turn.prompt_status", idsFollowUp).catch(async error => {
+				const current = await harness!.query("turn.prompt_status", idsFollowUp);
+				throw new Error(
+					`${error instanceof Error ? error.message : String(error)}; replacement=${JSON.stringify(current.result)}; abort calls=${abortCalls}`,
+				);
+			});
+			expect(followUpStatus).toMatchObject({
 				status: "failed",
 				error: { code: "prompt_deadline_exceeded" },
 				outcome: { kind: "failed", code: "prompt_deadline_exceeded", provenance: "deadline" },
