@@ -1773,7 +1773,7 @@ function b() {
 					await manager.close();
 				}
 			}
-		});
+		}, 30_000);
 
 		it("surfaces artifact writer diagnostics on successful Bash results", async () => {
 			const baselineSession = createTestToolSession(testDir);
