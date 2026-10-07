@@ -32,7 +32,6 @@ function sameFixturePath(left: string, right: string): boolean {
 async function cleanupFixtureRoots() {
 	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 }
-}
 
 afterEach(async () => {
 	vi.restoreAllMocks();
