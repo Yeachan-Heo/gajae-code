@@ -21,6 +21,14 @@ const INFO_ID = 11_529_215_046_068_470_561n;
 const DEVICE_ID = 0xf1234567n;
 const DEAD_PID = 2_147_483_647;
 
+function sameFixturePath(left: string, right: string): boolean {
+	const normalize = (value: string): string => {
+		const resolved = path.resolve(value).replace(/^\\\\\?\\/, "");
+		return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+	};
+	return normalize(left) === normalize(right);
+}
+
 afterEach(async () => {
 	vi.restoreAllMocks();
 	FileLockTestHooks.nativeQuarantineBindings = undefined;
@@ -39,8 +47,10 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 	let nativeIdentityChanged = false;
 	const realLstat = fs.lstat;
 	const transformStat = (target: string, stat: BigIntStats): BigIntStats => {
-		const isRoot = target === lock || target === parked || (detach && target === root);
-		const isInfo = target === path.join(lock, "info") || target === path.join(parked, "info");
+		const isRoot =
+			sameFixturePath(target, lock) || sameFixturePath(target, parked) || (detach && sameFixturePath(target, root));
+		const isInfo =
+			sameFixturePath(target, path.join(lock, "info")) || sameFixturePath(target, path.join(parked, "info"));
 		const id = isRoot && component !== "info" ? ROOT_ID : isInfo && component !== "root" ? INFO_ID : null;
 		if (!isRoot && !isInfo) return stat;
 		return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, {
@@ -55,7 +65,7 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 	const realOpen = fs.open;
 	vi.spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
 		const handle = await realOpen(target, flags, mode);
-		if (String(target) === path.join(lock, "info")) {
+		if (sameFixturePath(String(target), path.join(lock, "info"))) {
 			const realStat = handle.stat.bind(handle);
 			vi.spyOn(handle, "stat").mockImplementation((async options => {
 				const stat = await realStat(options);
