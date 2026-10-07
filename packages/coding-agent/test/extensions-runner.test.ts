@@ -5,9 +5,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { getBundledModel } from "@gajae-code/ai";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import type { Settings } from "@gajae-code/coding-agent/config/settings";
-import { discoverAndLoadExtensions } from "@gajae-code/coding-agent/extensibility/extensions/loader";
+import {
+	discoverAndLoadExtensions,
+	ExtensionRuntime,
+	loadExtensionFromFactory,
+} from "@gajae-code/coding-agent/extensibility/extensions/loader";
 import {
 	EXTENSION_HANDLER_TIMEOUT_MS,
 	ExtensionRunner,
@@ -23,7 +28,9 @@ import {
 
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { EventBus } from "@gajae-code/coding-agent/utils/event-bus";
 import { getProjectAgentDir, logger, TempDir } from "@gajae-code/utils";
+import { tagProviderRequestHandler } from "../src/extensibility/extensions/function-hooks-internal";
 
 describe("ExtensionRunner", () => {
 	let tempDir: TempDir;
@@ -596,6 +603,37 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("before_provider_request chaining", () => {
+		it("executes provider-scoped handlers only for the matching provider after registration", async () => {
+			const runtime = new ExtensionRuntime();
+			let calls = 0;
+			const extension = await loadExtensionFromFactory(
+				api => {
+					api.on(
+						"before_provider_request",
+						tagProviderRequestHandler("openai", event => {
+							calls += 1;
+							return { ...(event.payload as Record<string, unknown>), sanitized: true };
+						}),
+					);
+				},
+				tempDir.path(),
+				new EventBus(),
+				runtime,
+				"provider-scoped-test",
+			);
+			const runner = new ExtensionRunner([extension], runtime, tempDir.path(), sessionManager, modelRegistry);
+			let currentModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+			runner.initialize({} as never, { getModel: () => currentModel } as never);
+			await expect(runner.emitBeforeProviderRequest({ original: true })).resolves.toEqual({ original: true });
+			expect(calls).toBe(0);
+			currentModel = getBundledModel("openai", "gpt-4o");
+			await expect(runner.emitBeforeProviderRequest({ original: true })).resolves.toEqual({
+				original: true,
+				sanitized: true,
+			});
+			expect(calls).toBe(1);
+		});
+
 		it("chains payload replacements across handlers in load order", async () => {
 			const extCode1 = `
 				export default function(pi) {
