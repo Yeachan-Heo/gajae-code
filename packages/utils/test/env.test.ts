@@ -93,6 +93,42 @@ assert.deepEqual(Object.keys(captured), []);
 			dir,
 		);
 	});
+	it("captures platform-effective mixed-case base URL names without expanding later routing", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-endpoint-case-"));
+		tempDirs.push(dir);
+		const moduleUrl = pathToFileURL(path.resolve(import.meta.dir, "../src/env.ts")).href;
+		runEnvIsolationScript(
+			`
+import * as assert from "node:assert/strict";
+import { captureEndpointConfiguration, readEndpointConfiguration, $credentialEnv } from ${JSON.stringify(moduleUrl)};
+const windows = process.platform === "win32";
+const mixedUrl = "https://mixed.example/v1";
+const lowercaseUrl = "https://lowercase.example/v1";
+assert.equal($credentialEnv("OPENAI_BASE_URL"), windows ? mixedUrl : undefined);
+assert.equal($credentialEnv("CUSTOM_PROVIDER_BASE_URL"), windows ? lowercaseUrl : undefined);
+const captured = captureEndpointConfiguration();
+assert.equal(readEndpointConfiguration(captured, "OPENAI_BASE_URL"), windows ? mixedUrl : undefined);
+assert.equal(readEndpointConfiguration(captured, "CUSTOM_PROVIDER_BASE_URL"), windows ? lowercaseUrl : undefined);
+delete Bun.env.OpenAI_BASE_URL;
+delete Bun.env.custom_provider_base_url;
+Bun.env.OPENAI_BASE_URL = "https://successor.example/v1";
+Bun.env.CUSTOM_PROVIDER_BASE_URL = "https://successor-custom.example/v1";
+assert.equal(readEndpointConfiguration(captured, "OPENAI_BASE_URL"), windows ? mixedUrl : undefined);
+assert.equal(readEndpointConfiguration(captured, "CUSTOM_PROVIDER_BASE_URL"), windows ? lowercaseUrl : undefined);
+assert.equal(readEndpointConfiguration(undefined, "OPENAI_BASE_URL"), "https://successor.example/v1");
+assert.equal(readEndpointConfiguration(undefined, "CUSTOM_PROVIDER_BASE_URL"), "https://successor-custom.example/v1");
+`,
+			{
+				HOME: dir,
+				USERPROFILE: dir,
+				GJC_CODING_AGENT_DIR: dir,
+				PI_CODING_AGENT_DIR: dir,
+				OpenAI_BASE_URL: "https://mixed.example/v1",
+				custom_provider_base_url: "https://lowercase.example/v1",
+			},
+			dir,
+		);
+	});
 });
 
 describe("parseEnvFile", () => {

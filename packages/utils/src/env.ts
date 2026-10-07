@@ -315,7 +315,8 @@ export function captureEndpointConfiguration(): EndpointConfiguration {
 		...Object.keys(homeShellEnv),
 		...Object.keys(Bun.env),
 	]);
-	for (const name of baseUrlNames) {
+	for (const rawName of baseUrlNames) {
+		const name = canonicalEnvKey(rawName);
 		if (name.endsWith("_BASE_URL") && isSafeEnvName(name)) values.set(name, $credentialEnv(name));
 	}
 
