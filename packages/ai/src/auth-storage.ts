@@ -6489,8 +6489,13 @@ export class AuthStorage {
 		void (async () => {
 			try {
 				const value = await this.#configValueResolver(key, String(configurationGeneration));
-				publish(value);
-				resolve(value);
+				const published = publish(value);
+				const sameKeyStillConfigured =
+					published ||
+					this.#getCredentialsForProvider(storageProvider).some(
+						credential => credential.type === "api_key" && credential.key === key,
+					);
+				resolve(sameKeyStillConfigured ? value : undefined);
 			} catch (error) {
 				if (publish(undefined)) reject(error);
 				else resolve(undefined);
