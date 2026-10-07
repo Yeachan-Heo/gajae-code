@@ -556,6 +556,177 @@ describe("FileSessionStorageWriter certainty-aware close", () => {
 	});
 });
 
+describe("MemorySessionStorageWriter owned append publication", () => {
+	let storage: MemorySessionStorage;
+
+	beforeEach(() => {
+		storage = new MemorySessionStorage();
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("publishes unbuffered appends immediately and keeps read snapshots isolated", () => {
+		const sessionPath = "/sessions/immediate.jsonl";
+		const writer = storage.openWriter(sessionPath, { flags: "w" });
+		writer.writeLineSync("first\n");
+
+		const firstStat = storage.statSync(sessionPath);
+		const snapshot = storage.readSnapshotSync(sessionPath);
+		const range = storage.readRangeSync(sessionPath, 0, firstStat.size);
+		expect(Buffer.from(snapshot.bytes).toString("utf8")).toBe("first\n");
+		expect(Buffer.from(range.bytes).toString("utf8")).toBe("first\n");
+		expect(firstStat.size).toBe(6);
+
+		writer.writeLineSync("second\n");
+		expect(storage.readTextSync(sessionPath)).toBe("first\nsecond\n");
+		expect(storage.statSync(sessionPath).size).toBe(13);
+		expect(storage.statSync(sessionPath).ino).toBe(firstStat.ino);
+		expect(Buffer.from(snapshot.bytes).toString("utf8")).toBe("first\n");
+		expect(Buffer.from(range.bytes).toString("utf8")).toBe("first\n");
+
+		snapshot.bytes[0] = 0;
+		range.bytes[0] = 0;
+		expect(storage.readTextSync(sessionPath)).toBe("first\nsecond\n");
+		writer.closeSync();
+		expect(writer.getCloseState()).toBe("closed");
+	});
+
+	it("keeps appended input isolated and publishes buffered bytes only on flush", () => {
+		const sessionPath = "/sessions/buffered.jsonl";
+		const writer = storage.openBufferedWriter(sessionPath, { flags: "w" });
+		const input = Buffer.from("first");
+		writer.writeBytesSync(input);
+		input.fill(0);
+
+		expect(storage.statSync(sessionPath).size).toBe(0);
+		expect(storage.readTextSync(sessionPath)).toBe("");
+		writer.flushSync();
+		expect(storage.readTextSync(sessionPath)).toBe("first");
+		const inode = storage.statSync(sessionPath).ino;
+
+		const nextInput = Buffer.from("+second");
+		writer.writeBytesSync(nextInput);
+		nextInput.fill(0);
+		expect(storage.readTextSync(sessionPath)).toBe("first");
+		writer.flushSync();
+		expect(storage.readTextSync(sessionPath)).toBe("first+second");
+		expect(storage.statSync(sessionPath).size).toBe(12);
+		expect(storage.statSync(sessionPath).ino).toBe(inode);
+		writer.closeSync();
+		expect(writer.getCloseState()).toBe("closed");
+	});
+
+	it("grows at the visible-length boundary without changing the prior prefix", () => {
+		const sessionPath = "/sessions/growth.jsonl";
+		const writer = storage.openWriter(sessionPath, { flags: "w" });
+		const prefix = `${"a".repeat(4095)}\n`;
+		writer.writeLineSync(prefix);
+		const snapshot = storage.readSnapshotSync(sessionPath);
+		const range = storage.readRangeSync(sessionPath, 0, prefix.length);
+
+		writer.writeLineSync("b\n");
+		expect(storage.statSync(sessionPath).size).toBe(prefix.length + 2);
+		expect(storage.readTextSync(sessionPath)).toBe(`${prefix}b\n`);
+		expect(Buffer.from(snapshot.bytes).toString("utf8")).toBe(prefix);
+		expect(Buffer.from(range.bytes).toString("utf8")).toBe(prefix);
+		writer.closeSync();
+	});
+
+	it("retains a renamed published prefix while the writer continues at its old path", () => {
+		const sessionPath = "/sessions/renamed.jsonl";
+		const retainedPath = "/sessions/retained.jsonl";
+		const writer = storage.openWriter(sessionPath, { flags: "w" });
+		writer.writeLineSync("prefix\n");
+		const retainedInode = storage.statSync(sessionPath).ino;
+
+		storage.renameSync(sessionPath, retainedPath);
+		writer.writeLineSync("continued\n");
+		expect(storage.readTextSync(retainedPath)).toBe("prefix\n");
+		expect(storage.readTextSync(sessionPath)).toBe("prefix\ncontinued\n");
+		expect(storage.statSync(retainedPath).ino).toBe(retainedInode);
+		expect(storage.statSync(sessionPath).ino).not.toBe(retainedInode);
+		writer.closeSync();
+	});
+
+	it("retains an exactly replaced prefix while its source writer continues", () => {
+		const sessionPath = "/sessions/replacement-source.jsonl";
+		const retainedPath = "/sessions/replacement-destination.jsonl";
+		const writer = storage.openWriter(sessionPath, { flags: "w" });
+		try {
+			writer.writeLineSync("prefix\n");
+			const retainedInode = storage.statSync(sessionPath).ino;
+			storage.writeTextSync(retainedPath, "original destination\n");
+			const destination = storage.readSnapshotSync(retainedPath);
+			expect(
+				storage.replaceExactSync(sessionPath, retainedPath, {
+					stat: destination.stat,
+					sha256: createHash("sha256").update(destination.bytes).digest("hex"),
+				}),
+			).toBe(true);
+			writer.writeLineSync("continued\n");
+			expect(storage.readTextSync(retainedPath)).toBe("prefix\n");
+			expect(storage.readTextSync(sessionPath)).toBe("prefix\ncontinued\n");
+			expect(storage.statSync(retainedPath).ino).toBe(retainedInode);
+			expect(storage.statSync(sessionPath).ino).not.toBe(retainedInode);
+		} finally {
+			writer.closeSync();
+		}
+	});
+
+	it("reuses geometric backing allocations across many complete publications", () => {
+		const sessionPath = "/sessions/allocations.jsonl";
+		const seed = "s".repeat(32 * 1024);
+		storage.writeTextSync(sessionPath, seed);
+		const writer = storage.openWriter(sessionPath);
+		const realWriteBytesOwnedSync = storage.writeBytesOwnedSync.bind(storage);
+		const publishedBackings = new Set<ArrayBufferLike>();
+		const publishSpy = vi.spyOn(storage, "writeBytesOwnedSync").mockImplementation((path, content) => {
+			publishedBackings.add(content.buffer);
+			realWriteBytesOwnedSync(path, content);
+		});
+		const chunk = `${"x".repeat(8192)}\n`;
+		const appendCount = 20;
+
+		for (let index = 0; index < appendCount; index++) writer.writeLineSync(chunk);
+
+		const expected = seed + chunk.repeat(appendCount);
+		expect(storage.readTextSync(sessionPath)).toBe(expected);
+		expect(storage.statSync(sessionPath).size).toBe(Buffer.byteLength(expected));
+		// The writer grows geometrically (four backing buffers here); copying each
+		// whole visible prefix would instead allocate one distinct 8 KiB+ buffer per append.
+		expect(publishedBackings.size).toBeLessThanOrEqual(5);
+		publishSpy.mockRestore();
+		writer.closeSync();
+	});
+
+	it("keeps close errors stable and rejects writes after an uncertain close", () => {
+		const sessionPath = "/sessions/close-error.jsonl";
+		let closeCalls = 0;
+		const writer = storage.openWriter(sessionPath, {
+			flags: "w",
+			closeAdapter: {
+				close() {
+					closeCalls++;
+					throw new Error("memory close outcome unknown");
+				},
+			},
+		});
+		writer.writeLineSync("published\n");
+
+		expect(() => writer.closeSync()).toThrow("memory close outcome unknown");
+		const closeError = writer.getCloseError();
+		expect(closeError?.message).toBe("memory close outcome unknown");
+		expect(writer.getCloseState()).toBe("close_unknown");
+		expect(() => writer.closeSync()).toThrow("memory close outcome unknown");
+		expect(writer.getCloseError()).toBe(closeError);
+		expect(closeCalls).toBe(1);
+		expect(() => writer.writeLineSync("rejected\n")).toThrow("memory close outcome unknown");
+		expect(storage.readTextSync(sessionPath)).toBe("published\n");
+	});
+});
+
 describe("managed descriptor reads", () => {
 	it("returns transcript identity without exposing file bytes", () => {
 		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-descriptor-")));
