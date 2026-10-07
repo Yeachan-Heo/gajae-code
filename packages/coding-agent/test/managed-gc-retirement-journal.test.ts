@@ -1412,6 +1412,60 @@ describe("managed GC retirement journal", () => {
 		);
 	}, 60_000);
 
+	it("canonicalizes signed high-bit IDs in GC receipt-directory evidence", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		const receiptDirectory = path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal", "receipts");
+		const relativeReceiptDirectory = ".gjc-managed-session-internal/receipts";
+		const canonicalDev = (1n << 63n) + 0x1234n;
+		const canonicalIno = (1n << 63n) + 0x5678n;
+		const signedDev = BigInt.asIntN(64, canonicalDev);
+		const signedIno = BigInt.asIntN(64, canonicalIno);
+		// Read-only preflight captures the directory once; inventory passes then use before/after capture pairs.
+		let receiptIdentityCaptures = 0;
+		let inventoryActive = false;
+		const originalCapture = ManagedSessionDescendantStore.prototype.captureDirectoryIdentity;
+		const capture = vi
+			.spyOn(ManagedSessionDescendantStore.prototype, "captureDirectoryIdentity")
+			.mockImplementation(function (this: ManagedSessionDescendantStore, relativePath: string) {
+				if (relativePath === relativeReceiptDirectory) {
+					receiptIdentityCaptures++;
+					inventoryActive = receiptIdentityCaptures > 1 && receiptIdentityCaptures % 2 === 0;
+					return { dev: canonicalDev.toString(), ino: canonicalIno.toString() };
+				}
+				return originalCapture.call(this, relativePath);
+			});
+		const originalLstat = fs.lstatSync.bind(fs);
+		let inventoryStats = 0;
+		const lstat = vi.spyOn(fs, "lstatSync").mockImplementation(((
+			pathname: fs.PathLike,
+			options?: { bigint?: boolean },
+		) => {
+			const stat = originalLstat(pathname, options as never);
+			if (
+				typeof pathname !== "string" ||
+				path.resolve(pathname) !== receiptDirectory ||
+				options?.bigint !== true ||
+				!inventoryActive
+			)
+				return stat;
+			inventoryStats++;
+			return new Proxy(stat, {
+				get: (value, property) =>
+					property === "dev" ? signedDev : property === "ino" ? signedIno : Reflect.get(value, property, value),
+			}) as typeof stat;
+		}) as typeof fs.lstatSync);
+		try {
+			expect(
+				(await readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath))?.state,
+			).toBe("prepared");
+			expect(inventoryStats).toBeGreaterThanOrEqual(3);
+		} finally {
+			lstat.mockRestore();
+			capture.mockRestore();
+		}
+	});
+
 	it("fails public GC consumers at 50,001 streamed entries (resource-pressure simulation only)", async () => {
 		const fixture = makeFixture();
 		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));

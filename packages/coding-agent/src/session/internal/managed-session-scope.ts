@@ -2597,8 +2597,8 @@ function managedGcJournalCapacity(): never {
 
 function managedGcDirectoryEvidence(stat: fs.BigIntStats): ManagedGcDirectoryEvidence {
 	return {
-		dev: stat.dev.toString(),
-		ino: stat.ino.toString(),
+		dev: BigInt.asUintN(64, stat.dev).toString(),
+		ino: BigInt.asUintN(64, stat.ino).toString(),
 		mtimeNs: stat.mtimeNs.toString(),
 		ctimeNs: stat.ctimeNs.toString(),
 		mode: stat.mode.toString(),
