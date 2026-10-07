@@ -15,11 +15,13 @@ const LM_STUDIO_FIRST_EVENT_TIMEOUT_MS = 300_000;
 // the first streamed token; 300s matches kimi-code's floor for long-reasoning silence.
 const OLLAMA_CLOUD_FIRST_EVENT_TIMEOUT_MS = 300_000;
 
-const ANTHROPIC_STREAM_IDLE_TIMEOUT_MS = 300_000;
+const ANTHROPIC_STREAM_IDLE_TIMEOUT_MS = 600_000;
+const LONG_REASONING_STREAM_IDLE_TIMEOUT_MS = 300_000;
 
 export function getProviderStreamIdleTimeoutFallbackMs(provider: string): number | undefined {
-	if (provider === "anthropic" || provider === "xai" || provider === "grok-build") {
-		return ANTHROPIC_STREAM_IDLE_TIMEOUT_MS;
+	if (provider === "anthropic") return ANTHROPIC_STREAM_IDLE_TIMEOUT_MS;
+	if (provider === "xai" || provider === "grok-build") {
+		return LONG_REASONING_STREAM_IDLE_TIMEOUT_MS;
 	}
 	return undefined;
 }
@@ -81,7 +83,7 @@ export function getOpenAIStreamIdleTimeoutMs(provider?: string, modelId?: string
 	return normalizeIdleTimeoutMs(
 		$env.GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS ?? $env.PI_STREAM_IDLE_TIMEOUT_MS ?? $env.PI_OPENAI_STREAM_IDLE_TIMEOUT_MS,
 		getProviderStreamIdleTimeoutFallbackMs(provider ?? "") ??
-			(isGrokModelId(modelId) ? ANTHROPIC_STREAM_IDLE_TIMEOUT_MS : undefined) ??
+			(isGrokModelId(modelId) ? LONG_REASONING_STREAM_IDLE_TIMEOUT_MS : undefined) ??
 			DEFAULT_STREAM_IDLE_TIMEOUT_MS,
 	);
 }
