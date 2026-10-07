@@ -21,7 +21,7 @@ async function fixture() {
 describe("SDK heartbeat checkpoint deadline (#6459)", () => {
 	it("returns no heartbeat before the startup fence when successive holders take 10s and 10.5s", async () => {
 		// Given: two legitimate holders, each shorter than the 20-second fence.
-		// Advance only the unmockable clock; every admitted callback and lock body
+		// Advance only the monotonic clock; every admitted callback and lock body
 		// executes. The acquisition adapter respects the supplied retry budget.
 		const { dir, index } = await fixture();
 		let elapsed = 0;
