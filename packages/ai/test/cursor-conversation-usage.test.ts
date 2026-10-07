@@ -151,8 +151,8 @@ describe("cursor cost calculation with realistic pricing (issue #6036)", () => {
 		const usage = finalizeCursorUsageForTest(10_000, 500);
 		// Cursor models typically cost $2-6/1M input, $6-18/1M output
 		// Assuming a mid-tier model at $3/1M input, $9/1M output
-		const input = usage.input * 3 / 1_000_000;
-		const output = usage.output * 9 / 1_000_000;
+		const input = (usage.input * 3) / 1_000_000;
+		const output = (usage.output * 9) / 1_000_000;
 
 		expect(input).toBeGreaterThan(0);
 		expect(output).toBeGreaterThan(0);
@@ -183,8 +183,6 @@ describe("cursor cost calculation with realistic pricing (issue #6036)", () => {
 	});
 
 	it("derives input from context checkpoint on second and later turns", () => {
-		// First turn
-		const firstTurn = finalizeCursorUsageForTest(0, 512);
 		// Second turn: context checkpoint provides accumulated total
 		const secondTurn = finalizeCursorUsageForTest(15_000, 400);
 
