@@ -47,11 +47,29 @@ describe("SessionLease", () => {
 		await writeFile(filePath, JSON.stringify({ ownerId: "owner-a" }), "utf8");
 		const old = new Date(Date.now() - 120_000);
 		await utimes(path.join(orphanPath, "info"), old, old);
+		// A scrubbed transition retains the remover's sibling record. Age and
+		// zero-byte info alone cannot prove an ownerless generation abandoned.
+		const orphan = await stat(orphanPath, { bigint: true });
+		await writeFile(
+			`${orphanPath}.owner`,
+			JSON.stringify({
+				owner: { pid: 2_147_483_647, timestamp: old.getTime(), owner_token: "dead-remover" },
+				rootDev: orphan.dev.toString(),
+				rootIno: orphan.ino.toString(),
+			}),
+			"utf8",
+		);
 
 		await releaseLease(root, SID, "owner-a");
 
 		expect(
 			await stat(orphanPath).then(
+				() => true,
+				() => false,
+			),
+		).toBe(false);
+		expect(
+			await stat(`${orphanPath}.owner`).then(
 				() => true,
 				() => false,
 			),
