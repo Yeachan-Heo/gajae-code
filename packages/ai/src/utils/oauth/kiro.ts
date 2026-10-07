@@ -20,6 +20,7 @@ const BUILDER_ID_START_URL = "https://view.awsapps.com/start";
 
 /** Default AWS region for SSO OIDC. */
 const DEFAULT_REGION = "us-east-1";
+const KIRO_SOCIAL_REFRESH_URL = "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken";
 
 /** Client registration metadata for the Gajae Code application. */
 const CLIENT_NAME = "gajae-code";
@@ -306,13 +307,17 @@ export async function pollForToken(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Refresh an expired access token using the stored refresh token via
- * `CreateToken` with `grantType: "refresh_token"`.
+ * Refresh an expired Kiro access token. Social-login credentials use the Kiro
+ * desktop auth service; Builder ID credentials use SSO OIDC `CreateToken` with
+ * `grantType: "refresh_token"`.
  *
- * Rotation is published behavior: the response includes a new `refreshToken`.
- * If the server does not return a new one, the old refresh token is retained.
+ * Builder ID refresh tokens may rotate; if the SSO endpoint omits a new one,
+ * the existing refresh token is retained. Social refresh tokens are preserved
+ * unless the Kiro auth service explicitly returns a replacement.
  */
 export async function refreshKiroToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
+	if (credentials.profileArn) return refreshKiroSocialToken(credentials);
+
 	const region = DEFAULT_REGION;
 
 	// We need client registration to refresh. If we have a cached one, use it;
@@ -366,6 +371,58 @@ export async function refreshKiroToken(credentials: OAuthCredentials): Promise<O
 	}
 
 	throw new Error("Kiro token refresh: unrecognized response");
+}
+
+async function refreshKiroSocialToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
+	const response = await fetch(KIRO_SOCIAL_REFRESH_URL, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ refreshToken: credentials.refresh }),
+		redirect: "error",
+	});
+	if (!response.ok) {
+		if (response.status === 401) {
+			throw new Error("Kiro social refresh token is invalid or expired. Run 'kiro-cli login' to re-authenticate.");
+		}
+		throw new Error(`Kiro social token refresh failed (HTTP ${response.status})`);
+	}
+
+	let payload: unknown;
+	try {
+		payload = await response.json();
+	} catch {
+		throw new Error("Kiro social token refresh returned invalid JSON");
+	}
+	if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+		throw new Error("Kiro social token refresh returned an invalid response");
+	}
+	const data = payload as {
+		accessToken?: unknown;
+		expiresIn?: unknown;
+		profileArn?: unknown;
+		refreshToken?: unknown;
+	};
+	if (
+		typeof data.accessToken !== "string" ||
+		data.accessToken.length === 0 ||
+		typeof data.expiresIn !== "number" ||
+		!Number.isFinite(data.expiresIn) ||
+		data.expiresIn <= 0
+	) {
+		throw new Error("Kiro social token refresh returned invalid token metadata");
+	}
+
+	return {
+		...credentials,
+		access: data.accessToken,
+		refresh:
+			typeof data.refreshToken === "string" && data.refreshToken.length > 0
+				? data.refreshToken
+				: credentials.refresh,
+		expires: Date.now() + data.expiresIn * 1000,
+		profileArn:
+			typeof data.profileArn === "string" && data.profileArn.length > 0 ? data.profileArn : credentials.profileArn,
+	};
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

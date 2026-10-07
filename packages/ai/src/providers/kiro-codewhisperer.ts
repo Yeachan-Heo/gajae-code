@@ -2,7 +2,7 @@
  * Kiro / Amazon Q Developer / CodeWhisperer streaming transport.
  *
  * Talks directly to the CodeWhisperer streaming service over HTTPS using
- * a bearer token from AWS SSO OIDC. The response is an
+ * bearer token from AWS SSO OIDC or Kiro social OAuth. The response is an
  * `application/vnd.amazon.eventstream`, decoded by the shared
  * `decodeEventStream` primitive from `aws-eventstream.ts`.
  *
@@ -26,6 +26,7 @@ import type {
 	StreamFunction,
 	StreamOptions,
 	TextContent,
+	ThinkingContent,
 	Tool,
 	ToolCall,
 	ToolResultMessage,
@@ -35,7 +36,13 @@ import { PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE, transportFailureFacts } from "..
 import { withHttpStatus } from "../utils/http-inspector";
 import { captureUnicodeEscapeEvidence } from "../utils/json-parse";
 import { decodeEventStream } from "./aws-eventstream";
-import { isKiroApiKey, sanitizeKiroError, streamKiroApiKey, toKiroModelId } from "./kiro-api-key";
+import {
+	buildKiroThinkingPrefix,
+	isKiroApiKey,
+	sanitizeKiroError,
+	streamKiroApiKey,
+	toKiroModelId,
+} from "./kiro-api-key";
 
 /**
  * Trust assumption: globalThis.fetch is treated as a trusted source for authenticated
@@ -52,11 +59,11 @@ import { isKiroApiKey, sanitizeKiroError, streamKiroApiKey, toKiroModelId } from
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface KiroCodeWhispererOptions extends StreamOptions {
-	/** Effort level for Kiro API-key reasoning. */
+	/** Reasoning effort to request from Kiro. */
 	reasoning?: Effort | boolean;
 	/** AWS region for the CodeWhisperer streaming endpoint. */
 	region?: string;
-	/** Profile ARN for enterprise IAM Identity Center accounts. */
+	/** Kiro profile ARN used by social-login credentials. */
 	profileArn?: string;
 }
 
@@ -174,7 +181,7 @@ const DEFAULT_REGION = "us-east-1";
  */
 const KIRO_ORIGIN = "AI_EDITOR";
 
-type Block = (TextContent | ToolCall) & { index?: number; partialJson?: string };
+type Block = (TextContent | ThinkingContent | ToolCall) & { index?: number; partialJson?: string };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Refusal handling (shared between bearer token and API-key paths)
@@ -240,9 +247,13 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 	context: Context,
 	options: KiroCodeWhispererOptions,
 ): AssistantMessageEventStream => {
-	const token = resolveBearerToken(options.apiKey);
-	if (isKiroApiKey(token)) {
-		return streamKiroApiKey(model, context, { ...options, apiKey: token });
+	const credentials = resolveKiroCredentials(options.apiKey);
+	if (isKiroApiKey(credentials.accessToken)) {
+		return streamKiroApiKey(model, context, {
+			...options,
+			apiKey: credentials.accessToken,
+			profileArn: options.profileArn ?? credentials.profileArn,
+		});
 	}
 
 	const stream = new AssistantMessageEventStream();
@@ -278,6 +289,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 		};
 
 		const blocks = output.content as Block[];
+		const thinkingParser = createInlineThinkingParser(blocks, output, stream);
 
 		try {
 			// Snapshot model identity fields at stream start to prevent TOCTOU attacks where
@@ -295,7 +307,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 			output.model = modelSnapshot.id;
 			assertAwsRegionLabel(region);
 			// Resolve bearer token
-			const bearerToken = resolveBearerToken(options.apiKey);
+			const bearerToken = credentials.accessToken;
 			if (!bearerToken) {
 				throw new Error(
 					"No Kiro credentials found. Set KIRO_API_KEY (ksk_ from https://app.kiro.dev/settings/api-keys) or run 'gjc auth-broker login kiro'.",
@@ -303,7 +315,10 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 			}
 
 			// Build request
-			const conversationState = buildConversationState(context, model, options);
+			const conversationState = buildConversationState(context, model, {
+				...options,
+				profileArn: options.profileArn ?? credentials.profileArn,
+			});
 			let requestBody: GenerateAssistantResponseRequest = {
 				conversationState,
 			};
@@ -437,7 +452,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 								stream.push({ type: "start", partial: output });
 								started = true;
 							}
-							handleTextDelta(content, blocks, output, stream);
+							thinkingParser.push(content);
 						}
 						break;
 					}
@@ -490,6 +505,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 				const unfinishedIds = Array.from(toolInputAccumulator.keys()).join(", ");
 				throw new Error(`Kiro CodeWhisperer stream ended with incomplete tool calls: ${unfinishedIds}`);
 			}
+			thinkingParser.finish();
 
 			// Emit all pending tool call events (safe since no refusal occurred)
 			for (const { toolCall, index } of pendingToolCalls) {
@@ -512,6 +528,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 			stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
 			stream.end();
 		} catch (error) {
+			thinkingParser.finish();
 			for (const block of output.content) {
 				delete (block as Block).index;
 				delete (block as Block).partialJson;
@@ -562,7 +579,13 @@ function buildConversationState(
 
 	// Build history from all messages except the last
 	const history: WireHistoryMessage[] = [];
-	const systemPrompt = context.systemPrompt?.join("\n") ?? "";
+	const thinkingPrefix = buildKiroThinkingPrefix(options.reasoning);
+	const baseSystemPrompt = context.systemPrompt?.join("\n") ?? "";
+	const systemPrompt = thinkingPrefix
+		? baseSystemPrompt
+			? `${thinkingPrefix}\n${baseSystemPrompt}`
+			: thinkingPrefix
+		: baseSystemPrompt;
 
 	// Parallel tool calls end the conversation with several consecutive toolResult
 	// messages. They all answer the last assistant turn, so they must travel
@@ -749,6 +772,99 @@ function handleTextDelta(
 	stream.push({ type: "text_delta", contentIndex: lastBlock.index!, delta, partial: output });
 }
 
+function createInlineThinkingParser(
+	blocks: Block[],
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+): { push: (delta: string) => void; finish: () => void } {
+	const openTag = "<thinking>";
+	const closeTag = "</thinking>";
+	let pending = "";
+	let currentThinking: (ThinkingContent & { index: number }) | undefined;
+	let finished = false;
+
+	const startThinking = (): void => {
+		currentThinking = { type: "thinking", thinking: "", index: blocks.length };
+		blocks.push(currentThinking);
+		stream.push({ type: "thinking_start", contentIndex: currentThinking.index, partial: output });
+	};
+	const appendThinking = (delta: string): void => {
+		if (!currentThinking || delta.length === 0) return;
+		currentThinking.thinking += delta;
+		stream.push({
+			type: "thinking_delta",
+			contentIndex: currentThinking.index,
+			delta,
+			partial: output,
+		});
+	};
+	const endThinking = (): void => {
+		if (!currentThinking) return;
+		stream.push({
+			type: "thinking_end",
+			contentIndex: currentThinking.index,
+			content: currentThinking.thinking,
+			partial: output,
+		});
+		currentThinking = undefined;
+	};
+	const retainedSuffixLength = (text: string, tag: string): number => {
+		for (let length = Math.min(text.length, tag.length - 1); length > 0; length--) {
+			if (text.endsWith(tag.slice(0, length))) return length;
+		}
+		return 0;
+	};
+	const consume = (): void => {
+		while (pending.length > 0) {
+			if (!currentThinking) {
+				const start = pending.indexOf(openTag);
+				if (start >= 0) {
+					if (start > 0) handleTextDelta(pending.slice(0, start), blocks, output, stream);
+					pending = pending.slice(start + openTag.length);
+					startThinking();
+					continue;
+				}
+				const safeLength = pending.length - retainedSuffixLength(pending, openTag);
+				if (safeLength > 0) handleTextDelta(pending.slice(0, safeLength), blocks, output, stream);
+				pending = pending.slice(safeLength);
+				return;
+			}
+
+			const end = pending.indexOf(closeTag);
+			if (end >= 0) {
+				appendThinking(pending.slice(0, end));
+				pending = pending.slice(end + closeTag.length);
+				endThinking();
+				continue;
+			}
+			const safeLength = pending.length - retainedSuffixLength(pending, closeTag);
+			if (safeLength > 0) appendThinking(pending.slice(0, safeLength));
+			pending = pending.slice(safeLength);
+			return;
+		}
+	};
+
+	return {
+		push(delta) {
+			if (finished || delta.length === 0) return;
+			pending += delta;
+			consume();
+		},
+		finish() {
+			if (finished) return;
+			finished = true;
+			if (currentThinking) {
+				appendThinking(pending);
+				pending = "";
+				endThinking();
+			} else {
+				if (pending.length > 0) handleTextDelta(pending, blocks, output, stream);
+				pending = "";
+			}
+		},
+	};
+}
+
 function handleToolUseEvent(
 	ev: ToolUseEventPayload,
 	blocks: Block[],
@@ -847,20 +963,25 @@ async function readBodyPrefix(response: Response): Promise<string> {
 	return new TextDecoder().decode(bytes);
 }
 
-function resolveBearerToken(apiKey: string | undefined): string | undefined {
-	if (!apiKey) {
-		return $credentialEnv("KIRO_API_KEY") ?? $credentialEnv("AWS_BEARER_TOKEN_KIRO") ?? undefined;
-	}
-
-	// Structured API key (from getOAuthApiKey) contains the access token as JSON
+function resolveKiroCredentials(apiKey: string | undefined): { accessToken?: string; profileArn?: string } {
+	const value = apiKey ?? $credentialEnv("KIRO_API_KEY") ?? $credentialEnv("AWS_BEARER_TOKEN_KIRO") ?? undefined;
+	if (!value) return {};
 	try {
-		const parsed = JSON.parse(apiKey) as { token?: string };
-		if (parsed.token) return parsed.token;
+		const parsed: unknown = JSON.parse(value);
+		if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+			const token = (parsed as { token?: unknown }).token;
+			if (typeof token === "string" && token.length > 0) {
+				const profileArn = (parsed as { profileArn?: unknown }).profileArn;
+				return {
+					accessToken: token,
+					profileArn: typeof profileArn === "string" ? profileArn : undefined,
+				};
+			}
+		}
 	} catch {
 		// Plain bearer token
 	}
-
-	return apiKey;
+	return { accessToken: value };
 }
 
 function safeParsePayload(payload: Uint8Array): unknown {
