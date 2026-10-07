@@ -161,16 +161,19 @@ describe("usage authentication recovery", () => {
 		expect(refresh).not.toHaveBeenCalled();
 	});
 
-	it("does not start a refresh after caller cancellation", async () => {
+	it("propagates caller cancellation without caching a failed credential check", async () => {
 		const controller = new AbortController();
 		respond = async () => {
-			controller.abort();
+			controller.abort(new Error("usage check canceled"));
 			return unauthorized();
 		};
 		const refresh = vi.spyOn(oauth, "refreshOAuthToken");
-		await storage.checkCredentials({ provider: "openai-codex", signal: controller.signal });
+		await expect(storage.checkCredentials({ provider: "openai-codex", signal: controller.signal })).rejects.toThrow(
+			"usage check canceled",
+		);
 		expect(refresh).not.toHaveBeenCalled();
 		expect(requests).toHaveLength(1);
+		expect(storage.getCachedCredentialHealth(rowId).status).toBe("unknown");
 	});
 
 	it("adopts a peer rotation observed after the rejected usage request", async () => {
