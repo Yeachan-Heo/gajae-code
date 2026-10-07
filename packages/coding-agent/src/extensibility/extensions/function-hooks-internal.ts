@@ -4,6 +4,19 @@ import { type FunctionHookRegistration, validateFunctionHookTarget } from "./fun
 
 export type TaggedFunctionHookHandler = (...args: unknown[]) => Promise<unknown>;
 
+// Host SDK lifecycle observers publish the accepted run's bookkeeping. They do
+// not execute user work and must not consume provider-attempt replay authority.
+const sdkLifecycleObservers = new WeakSet<(...args: never[]) => unknown>();
+
+export function tagSdkLifecycleObserver<T extends (...args: never[]) => unknown>(handler: T): T {
+	sdkLifecycleObservers.add(handler);
+	return handler;
+}
+
+export function isSdkLifecycleObserver(handler: (...args: never[]) => unknown): boolean {
+	return sdkLifecycleObservers.has(handler);
+}
+
 const registrations = new WeakMap<TaggedFunctionHookHandler, FunctionHookRegistration>();
 const registrationOrders = new WeakMap<(...args: never[]) => unknown, number>();
 
@@ -21,6 +34,7 @@ export function wrapExtensionHandlerRegistration<T extends (...args: never[]) =>
 ): T {
 	const registered = ((...args: never[]) => handler(...args)) as T;
 	registrationOrders.set(registered, registrationOrder);
+	if (sdkLifecycleObservers.has(handler)) sdkLifecycleObservers.add(registered);
 	return registered;
 }
 
