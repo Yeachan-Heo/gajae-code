@@ -24,17 +24,12 @@ describe("broker startup heartbeat budget", () => {
 		const settled = Promise.withResolvers<void>();
 		const realWithFileLock = lockModule.withFileLock;
 		const locking = vi.spyOn(lockModule, "withFileLock").mockImplementation(async (file, callback, options) => {
-			if (file !== log || !options?.signal) return await realWithFileLock(file, callback, options);
+			if (file !== log) return await realWithFileLock(file, callback, options);
+			expect(file).toBe(log);
+			entered.resolve();
+			await release.promise;
 			try {
-				return await realWithFileLock(
-					file,
-					async () => {
-						entered.resolve();
-						await release.promise;
-						return await callback();
-					},
-					options,
-				);
+				return await callback();
 			} finally {
 				settled.resolve();
 			}
