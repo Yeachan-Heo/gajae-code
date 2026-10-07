@@ -127,7 +127,7 @@ async function hashAddedFiles(cwd: string, paths: readonly UltragoalChangeSetPat
 }
 
 /** Hash file contents in bounded chunks instead of materializing large assets in memory. */
-async function updateHashFromFile(hasher: ReturnType<typeof crypto.createHash>, filePath: string): Promise<void> {
+async function updateHashFromFile(hasher: crypto.Hash, filePath: string): Promise<void> {
 	const reader = Bun.file(filePath).stream().getReader();
 	try {
 		while (true) {
@@ -395,8 +395,9 @@ export async function computeCheckpointChangeSet(cwd: string): Promise<Ultragoal
 /**
  * A content witness of overall repository state. HEAD and porcelain status are
  * retained for cheap structural diagnostics, but the authoritative comparison
- * also digests every changed tracked and non-ignored untracked path. HEAD binds
- * immutable committed content, so unchanged baseline files need not be reread. A
+ * binds full index blob IDs and digests every changed tracked and non-ignored
+ * untracked path. HEAD binds immutable committed content, so unchanged baseline
+ * files need not be reread. A
  * same-status edit therefore cannot pass merely because Git's status text stayed
  * unchanged.
  */
@@ -410,16 +411,20 @@ export function __setRepositoryStateWitnessTestHookForTests(hook: RepositoryStat
 }
 
 async function repositoryStateWitness(cwd: string): Promise<string | undefined> {
-	const [head, status, changed, untracked] = await Promise.all([
+	const [head, status, index, changed, untracked] = await Promise.all([
 		spawnText(["git", "rev-parse", "HEAD"], { cwd, timeoutMs: GIT_METADATA_TIMEOUT_MS }),
 		spawnText(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], {
 			cwd,
 			timeoutMs: GIT_STATUS_TIMEOUT_MS,
 		}),
+		spawnText(["git", "diff", "--cached", "--raw", "-z", "--no-abbrev", "HEAD"], {
+			cwd,
+			timeoutMs: GIT_DIFF_TIMEOUT_MS,
+		}),
 		spawnText(["git", "diff", "--name-only", "-z", "HEAD"], { cwd, timeoutMs: GIT_DIFF_TIMEOUT_MS }),
 		spawnText(["git", "ls-files", "--others", "--exclude-standard", "-z"], { cwd, timeoutMs: GIT_STATUS_TIMEOUT_MS }),
 	]);
-	if (!head.ok || !status.ok || !changed.ok || !untracked.ok) return undefined;
+	if (!head.ok || !status.ok || !index.ok || !changed.ok || !untracked.ok) return undefined;
 	// HEAD identifies every committed byte. Only working-tree/index differences and
 	// non-ignored untracked files need content hashing; scanning every unchanged
 	// baseline file makes completion cost proportional to the entire repository.
@@ -456,7 +461,7 @@ async function repositoryStateWitness(cwd: string): Promise<string | undefined> 
 	} catch {
 		return undefined;
 	}
-	return `${head.stdout.trim()}\u0000${status.stdout}\u0000sha256:${content.digest("hex")}`;
+	return `${head.stdout.trim()}\u0000${status.stdout}\u0000${index.stdout}\u0000sha256:${content.digest("hex")}`;
 }
 
 export function parseUnifiedDiffPaths(diff: string): UltragoalChangeSetPath[] {

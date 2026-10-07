@@ -263,6 +263,49 @@ describe("ultragoal change-set extraction", () => {
 		}
 	}, 30_000);
 
+	it("fails closed on a concurrent index-only mutation with unchanged status and worktree", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-index-witness-race-"));
+		try {
+			const git = (...args: string[]) => spawnText(["git", ...args], { cwd: root, timeoutMs: 10_000 });
+			expect((await git("init")).ok).toBe(true);
+			const tracked = path.join(root, "tracked.txt");
+			await Bun.write(tracked, "baseline\n");
+			expect((await git("add", "tracked.txt")).ok).toBe(true);
+			expect(
+				(await git("-c", "user.name=GJC Test", "-c", "user.email=test@example.invalid", "commit", "-m", "baseline"))
+					.ok,
+			).toBe(true);
+			expect((await git("branch", "dev")).ok).toBe(true);
+			await Bun.write(tracked, "staged replacement\n");
+			const replacement = await git("hash-object", "-w", "tracked.txt");
+			expect(replacement.ok).toBe(true);
+			await Bun.write(tracked, "staged original\n");
+			expect((await git("add", "tracked.txt")).ok).toBe(true);
+			await Bun.write(tracked, "baseline\n");
+			const beforeStatus = await git("status", "--porcelain=v1", "-z");
+			expect(beforeStatus.stdout).toContain("MM tracked.txt");
+			expect((await git("diff", "--name-only", "-z", "HEAD")).stdout).toBe("");
+			__setRepositoryStateWitnessTestHookForTests(async () => {
+				expect(
+					(await git("update-index", "--cacheinfo", "100644", replacement.stdout.trim(), "tracked.txt")).ok,
+				).toBe(true);
+				expect((await git("status", "--porcelain=v1", "-z")).stdout).toBe(beforeStatus.stdout);
+				expect(await Bun.file(tracked).text()).toBe("baseline\n");
+			});
+			const raced = await computeCheckpointChangeSet(root);
+			expect(raced?.captureIncomplete).toBe(true);
+			expect(computeUltragoalReviewSourceHash(raced)).toBeUndefined();
+			__setRepositoryStateWitnessTestHookForTests(undefined);
+			const stable = await computeCheckpointChangeSet(root);
+			expect(stable?.captureIncomplete).toBe(false);
+			expect(stable?.rawDiff).toContain("staged replacement");
+			expect(computeUltragoalReviewSourceHash(stable)).toMatch(/^sha256:[0-9a-f]{64}$/);
+		} finally {
+			__setRepositoryStateWitnessTestHookForTests(undefined);
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	}, 60_000);
+
 	it("rejects trusted added paths without a verified untracked content hash", () => {
 		expect(
 			computeUltragoalReviewSourceHash({
