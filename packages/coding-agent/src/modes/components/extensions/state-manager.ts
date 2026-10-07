@@ -14,7 +14,6 @@ import type { Skill } from "../../../capability/skill";
 import type { SlashCommand } from "../../../capability/slash-command";
 import type { CustomTool } from "../../../capability/tool";
 import type { SourceMeta } from "../../../capability/types";
-import type { Settings } from "../../../config/settings";
 import {
 	disableProvider,
 	enableProvider,
@@ -44,11 +43,7 @@ export interface ExtensionSettingsManager {
 /**
  * Load all extensions from all capabilities.
  */
-export async function loadAllExtensions(
-	cwd?: string,
-	disabledIds?: string[],
-	settings?: Settings,
-): Promise<Extension[]> {
+export async function loadAllExtensions(cwd?: string, disabledIds?: string[]): Promise<Extension[]> {
 	const extensions: Extension[] = [];
 	const disabledExtensions = new Set<string>(disabledIds ?? []);
 
@@ -102,7 +97,7 @@ export async function loadAllExtensions(
 		}
 	}
 
-	const loadOpts = cwd ? { cwd, includeDisabled: true, settings } : { includeDisabled: true, settings };
+	const loadOpts = cwd ? { cwd, includeDisabled: true } : { includeDisabled: true };
 
 	// Load skills
 	try {
@@ -558,12 +553,8 @@ export function applyDisabledExtensionsToState(state: DashboardState, disabledId
 /**
  * Create initial dashboard state.
  */
-export async function createInitialState(
-	cwd?: string,
-	disabledIds?: string[],
-	settings?: Settings,
-): Promise<DashboardState> {
-	const extensions = await loadAllExtensions(cwd, disabledIds, settings);
+export async function createInitialState(cwd?: string, disabledIds?: string[]): Promise<DashboardState> {
+	const extensions = await loadAllExtensions(cwd, disabledIds);
 	const tabs = buildProviderTabs(extensions);
 	const tabFiltered = extensions; // "all" tab by default
 	const searchFiltered = tabFiltered;
@@ -601,9 +592,8 @@ export async function refreshState(
 	state: DashboardState,
 	cwd?: string,
 	disabledIds?: string[],
-	settings?: Settings,
 ): Promise<DashboardState> {
-	const extensions = await loadAllExtensions(cwd, disabledIds, settings);
+	const extensions = await loadAllExtensions(cwd, disabledIds);
 	const tabs = buildProviderTabs(extensions);
 
 	// Get current provider from tabs
