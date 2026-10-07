@@ -1,7 +1,7 @@
 ---
 name: ralplan
 description: Consensus planning entrypoint that auto-gates vague ultragoal requests before execution
-argument-hint: "[--interactive] [--deliberate] [--architect openai-code] [--critic openai-code] <task description>"
+argument-hint: "[--interactive] [--deliberate] [--resume|--new-run] [--architect openai-code] [--critic openai-code] <task description>"
 level: 4
 
 source: "forked from upstream ralplan skill and rebranded for GJC"
@@ -21,6 +21,8 @@ Ralplan is the consensus planning workflow. It triggers iterative planning with 
 
 - `--interactive`: Adds draft-review prompts and one-at-a-time reconciliation. When the final receipt resolves `auto_handoff.effectiveTarget` to `off` without `degradationReason: "planning_stuck"`, final approval uses an `ask` workflow gate; a configured automatic admission is handled by step 8.
 - `--deliberate`: Forces high-risk deliberation: pre-mortem plus expanded test planning. It may also auto-enable for explicit auth/security, migration, destructive, incident, compliance/PII, or public-API-breakage risk.
+- `--resume`: Explicitly resumes the active Ralplan run in this session. It retains the run ID, current phase, role-agent identities, review verdicts, and admission history; a supplied task must match the persisted task. If the task is already stored, the flag may be used without positional task text.
+- `--new-run`: Explicitly replaces the active Ralplan state pointer with a fresh run ID. Join or cancel prior role workers before using it; the new run fences their state updates but does not terminate their processes or delete their old artifacts.
 - `--architect openai-code` / `--critic openai-code`: Use OpenAI code for that review pass when available; otherwise note the fallback and use default GJC review.
 - `gjc.ralplan.autoHandoff`: Selects final-plan admission: `off` (default), `ultragoal`, or `autoresearch`. An `autoresearch` target admits `/skill:autoresearch` to continue research from the approved plan rather than implement it; it needs no availability probe. `PLANNING-STUCK` also resolves every target to `off`. Invalid settings reject the final write before any final artifact is persisted. The final receipt's ledger-backed runtime-owned `auto_handoff.effectiveTarget` is authoritative across state loss and run switching.
 - `--write --stage <type> --stage_n <N> --artifact <markdown file path or markdown string>`: Native writer for Planner/Architect/Critic/revision/ADR/final pending-approval markdown under `.gjc/_session-{sessionid}/plans/ralplan/<run-id>/`; do not edit `.gjc/` directly.
@@ -28,6 +30,8 @@ Ralplan is the consensus planning workflow. It triggers iterative planning with 
 ## Corrupt current-session state recovery
 
 For corrupt, tampered, unreadable, or stale current-session ralplan state, run `gjc state clear --force --mode ralplan` scoped by `--session-id`, command payload, or `GJC_SESSION_ID`; it clears only ralplan state for that session.
+
+An active run cannot be reseeded implicitly. Use `gjc ralplan --resume` to continue the same task, or `gjc ralplan --new-run "<different task>"` to deliberately create a new run while preserving the previous run's artifacts and ledger. A terminal/inactive run is never silently reused as the next run.
 
 ## Behavior
 

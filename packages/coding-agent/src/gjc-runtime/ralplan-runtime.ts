@@ -41,6 +41,8 @@ import {
 	appendJsonl,
 	detectWorkflowEnvelopeIntegrityMismatch,
 	readExistingStateForMutation,
+	type StateWriterAuditContext,
+	type StateWriterReceiptContext,
 	withWorkflowStateLock,
 	writeArtifact,
 	writeTextAtomic,
@@ -753,7 +755,7 @@ function defaultRunId(now: Date = new Date()): string {
 	const dd = now.getUTCDate().toString().padStart(2, "0");
 	const hh = now.getUTCHours().toString().padStart(2, "0");
 	const min = now.getUTCMinutes().toString().padStart(2, "0");
-	const suffix = randomBytes(2).toString("hex");
+	const suffix = randomBytes(8).toString("hex");
 	return `${yyyy}-${mm}-${dd}-${hh}${min}-${suffix}`;
 }
 
@@ -2967,6 +2969,8 @@ async function buildDeduplicatedResult(
 interface ConsensusHandoffArgs {
 	interactive: boolean;
 	deliberate: boolean;
+	resume: boolean;
+	newRun: boolean;
 	architectKind?: string;
 	criticKind?: string;
 	sessionId: string;
@@ -2986,7 +2990,15 @@ function extractPositionalTask(args: readonly string[]): string {
 			skipNext = true;
 			continue;
 		}
-		if (arg === "--interactive" || arg === "--deliberate" || arg === "--write" || arg === "--json") continue;
+		if (
+			arg === "--interactive" ||
+			arg === "--deliberate" ||
+			arg === "--resume" ||
+			arg === "--new-run" ||
+			arg === "--write" ||
+			arg === "--json"
+		)
+			continue;
 		if (arg.startsWith("-")) {
 			throw new RalplanCommandError(2, `unknown flag for gjc ralplan: ${arg}`);
 		}
@@ -2999,6 +3011,9 @@ function resolveConsensusArgs(args: readonly string[], cwd: string): ConsensusHa
 	if (hasFlag(args, "--lane-verdict")) {
 		throw new RalplanCommandError(2, "--lane-verdict is only supported with gjc ralplan --write.");
 	}
+	const resume = hasFlag(args, "--resume");
+	const newRun = hasFlag(args, "--new-run");
+	if (resume && newRun) throw new RalplanCommandError(2, "--resume and --new-run are mutually exclusive.");
 	const architectKind = flagValue(args, "--architect")?.trim() || undefined;
 	if (architectKind && !KNOWN_ARCHITECT_KINDS.has(architectKind)) {
 		throw new RalplanCommandError(
@@ -3023,6 +3038,8 @@ function resolveConsensusArgs(args: readonly string[], cwd: string): ConsensusHa
 	return {
 		interactive: hasFlag(args, "--interactive"),
 		deliberate: hasFlag(args, "--deliberate"),
+		resume,
+		newRun,
 		architectKind,
 		criticKind,
 		sessionId,
@@ -3035,70 +3052,148 @@ async function seedRalplanState(
 	cwd: string,
 	resolved: ConsensusHandoffArgs,
 	explicitTarget = false,
-): Promise<{ statePath: string; runId: string; repositoryBinding: RepositoryBinding }> {
+): Promise<{
+	statePath: string;
+	runId: string;
+	repositoryBinding: RepositoryBinding;
+	currentPhase: string;
+	mode: "short" | "deliberate";
+	interactive: boolean;
+}> {
 	const statePath = ralplanStatePath(cwd, resolved.sessionId);
-	return withWorkflowStateLock(
+	const seeded = await withWorkflowStateLock(
 		statePath,
 		async () => {
-			const existingStateRead = await readExistingStateForMutation(statePath);
-			if (existingStateRead.kind === "corrupt")
+			const existingRead = await readExistingStateForMutation(statePath);
+			if (existingRead.kind === "corrupt") {
 				throw new RalplanCommandError(
 					2,
-					`existing ralplan state is corrupt or tampered (${existingStateRead.error}); refusing to overwrite ${statePath}`,
+					`existing ralplan state is corrupt or tampered (${existingRead.error}); refusing to overwrite ${statePath}`,
 				);
-			const existingRunId =
-				existingStateRead.kind === "valid" && typeof existingStateRead.value.run_id === "string"
-					? existingStateRead.value.run_id.trim() || undefined
-					: undefined;
-			const runId = existingRunId ?? resolved.sessionId ?? defaultRunId();
-			assertSafePathComponent(runId, "run-id");
+			}
+			const existing = existingRead.kind === "valid" ? existingRead.value : undefined;
 			const now = new Date().toISOString();
-			const repositoryBinding = existingRunId
-				? await enforceRalplanRepositoryBinding(cwd, resolved.sessionId, { exactWorktreeRoot: explicitTarget })
-				: publicRepositoryBinding(await captureRepositoryBinding(cwd, { displayPath: cwd }));
+			const receipt: StateWriterReceiptContext = {
+				cwd,
+				skill: "ralplan",
+				owner: "gjc-runtime",
+				command: resolved.resume ? "gjc ralplan resume" : "gjc ralplan seed",
+				sessionId: resolved.sessionId,
+			};
+			const audit: StateWriterAuditContext = {
+				category: "state" as const,
+				verb: "write" as const,
+				owner: "gjc-runtime",
+				skill: "ralplan",
+				sessionId: resolved.sessionId,
+			};
+
+			if (resolved.resume) {
+				if (existing?.active !== true) {
+					throw new RalplanCommandError(2, "--resume requires an active ralplan run in this session.");
+				}
+				const runId = typeof existing.run_id === "string" ? existing.run_id.trim() : "";
+				const currentPhase = typeof existing.current_phase === "string" ? existing.current_phase.trim() : "";
+				if (!runId || !currentPhase || getSkillManifest("ralplan").phaseLock.includes(currentPhase)) {
+					throw new RalplanCommandError(
+						2,
+						"--resume requires an active, non-terminal ralplan run identity and phase.",
+					);
+				}
+				assertSafePathComponent(runId, "run-id");
+				const existingTask = typeof existing.task === "string" ? existing.task.trim() : "";
+				if (existingTask && resolved.task && existingTask !== resolved.task) {
+					throw new RalplanCommandError(
+						2,
+						"--resume task does not match the active ralplan task; use --new-run to start a different planning run.",
+					);
+				}
+				const task = existingTask || resolved.task;
+				if (!task)
+					throw new RalplanCommandError(
+						2,
+						"--resume found no persisted task; provide the original task description.",
+					);
+				const repositoryBinding = await enforceRalplanRepositoryBinding(cwd, resolved.sessionId, {
+					exactWorktreeRoot: explicitTarget,
+				});
+				const payload: Record<string, unknown> = {
+					...existing,
+					active: true,
+					current_phase: currentPhase,
+					task,
+					run_id: runId,
+					updated_at: now,
+					repository_binding: repositoryBinding,
+				};
+				if (resolved.deliberate) payload.mode = "deliberate";
+				if (resolved.interactive) payload.interactive = true;
+				if (resolved.architectKind) payload.architect_kind = resolved.architectKind;
+				if (resolved.criticKind) payload.critic_kind = resolved.criticKind;
+				if (resolved.sessionId) payload.session_id = resolved.sessionId;
+				await writeWorkflowEnvelopeAtomic(statePath, payload, {
+					cwd,
+					lockHeld: true,
+					receipt,
+					audit: { ...audit, fromPhase: currentPhase },
+				});
+				return {
+					statePath,
+					runId,
+					repositoryBinding,
+					currentPhase,
+					mode: payload.mode === "deliberate" ? ("deliberate" as const) : ("short" as const),
+					interactive: payload.interactive === true,
+				};
+			}
+
+			if (existing?.active === true && !resolved.newRun) {
+				throw new RalplanCommandError(
+					2,
+					"an active ralplan run already owns this session; use --resume to continue it or --new-run to deliberately start another run.",
+				);
+			}
+			const runId = defaultRunId();
+			assertSafePathComponent(runId, "run-id");
+			const repositoryBinding = publicRepositoryBinding(await captureRepositoryBinding(cwd, { displayPath: cwd }));
+			const mode: "short" | "deliberate" = resolved.deliberate ? "deliberate" : "short";
 			const payload: Record<string, unknown> = {
 				active: true,
 				current_phase: "planner",
 				skill: "ralplan",
 				version: WORKFLOW_STATE_VERSION,
-				mode: resolved.deliberate ? "deliberate" : "short",
+				mode,
 				interactive: resolved.interactive,
 				task: resolved.task,
 				run_id: runId,
 				updated_at: now,
 				repository_binding: repositoryBinding,
 			};
-			if (existingStateRead.kind === "valid" && existingStateRead.value.active === true) {
-				for (const field of ["handoff_from", "handoff_at"] as const) {
-					if (typeof existingStateRead.value[field] === "string") payload[field] = existingStateRead.value[field];
-				}
-			}
 			if (resolved.architectKind) payload.architect_kind = resolved.architectKind;
 			if (resolved.criticKind) payload.critic_kind = resolved.criticKind;
 			if (resolved.sessionId) payload.session_id = resolved.sessionId;
 			await writeWorkflowEnvelopeAtomic(statePath, payload, {
 				cwd,
 				lockHeld: true,
-				receipt: {
-					cwd,
-					skill: "ralplan",
-					owner: "gjc-runtime",
-					command: "gjc ralplan seed",
-					sessionId: resolved.sessionId,
-				},
+				receipt,
 				audit: {
-					category: "state",
-					verb: "write",
-					owner: "gjc-runtime",
-					skill: "ralplan",
-					sessionId: resolved.sessionId,
+					...audit,
+					...(existing && typeof existing.current_phase === "string" ? { fromPhase: existing.current_phase } : {}),
 				},
 			});
-			await writeSessionActivityMarker(cwd, resolved.sessionId, { writer: "ralplan-runtime", path: statePath });
-			return { statePath, runId, repositoryBinding };
+			return {
+				statePath,
+				runId,
+				repositoryBinding,
+				currentPhase: "planner",
+				mode,
+				interactive: resolved.interactive,
+			};
 		},
 		{ cwd },
 	);
+	await writeSessionActivityMarker(cwd, resolved.sessionId, { writer: "ralplan-runtime", path: statePath });
+	return seeded;
 }
 
 async function handleConsensusHandoff(args: readonly string[], cwd: string): Promise<RalplanCommandResult> {
@@ -3107,19 +3202,22 @@ async function handleConsensusHandoff(args: readonly string[], cwd: string): Pro
 	const target = await resolveRalplanTargetRoot(args, cwd);
 	if (target.explicit) await assertExplicitTargetGjcNotSymlinked(target.root);
 	const resolved = resolveConsensusArgs(args, target.root);
-	if (!resolved.task) {
+	if (!resolved.task && !resolved.resume) {
 		throw new RalplanCommandError(2, 'gjc ralplan requires a task description, e.g. `gjc ralplan "<task>"`.');
 	}
-	const { statePath, runId, repositoryBinding } = await seedRalplanState(target.root, resolved, target.explicit);
-	const mode = resolved.deliberate ? "deliberate" : "short";
+	const { statePath, runId, repositoryBinding, currentPhase, mode, interactive } = await seedRalplanState(
+		target.root,
+		resolved,
+		target.explicit,
+	);
 	await syncRalplanHud({
 		cwd: target.root,
 		sessionId: resolved.sessionId,
-		stage: "planner",
+		stage: currentPhase as RalplanStage,
 		runId,
-		pendingApproval: false,
+		pendingApproval: currentPhase === "final",
 		iteration: 1,
-		latestSummary: `${mode} run · ${resolved.interactive ? "interactive" : "automated"}`,
+		latestSummary: `${mode} ${resolved.resume ? "resumed" : "run"} · ${interactive ? "interactive" : "automated"}`,
 	});
 
 	const summary = {

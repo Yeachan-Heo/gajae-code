@@ -177,24 +177,76 @@ describe("native gjc ralplan runtime — consensus handoff", () => {
 		expect(await fs.readFile(statePath, "utf-8")).toBe("{broken json");
 	});
 
-	it("reuses a valid active run id during consensus handoff seeding", async () => {
+	it("requires explicit resume or new-run when a run is active and resume preserves continuity", async () => {
 		const root = await tempDir();
+		const seeded = await runNativeRalplanCommand(["--json", "continue existing"], root);
+		expect(seeded.status).toBe(0);
 		const statePath = ralplanStatePath(root);
-		await fs.mkdir(path.dirname(statePath), { recursive: true });
+		const before = JSON.parse(await fs.readFile(statePath, "utf-8")) as Record<string, unknown>;
+		const runId = before.run_id as string;
 		await fs.writeFile(
 			statePath,
-			JSON.stringify({ skill: "ralplan", active: true, current_phase: "planner", run_id: "existing-run" }),
+			JSON.stringify({
+				...before,
+				current_phase: "revision",
+				planner_subagent_id: "planner-resume-1",
+				planner_resumable: true,
+				architect_id: "architect-resume-1",
+				critic_id: "critic-resume-1",
+				last_review_verdict: "OKAY",
+				auto_handoff: { configuredTarget: "ultragoal", effectiveTarget: "ultragoal" },
+				planning_stuck: { marker: "PLANNING-STUCK", reason: "preserved historical diagnostic" },
+			}),
 			"utf-8",
 		);
 
-		const result = await runNativeRalplanCommand(["--json", "continue existing"], root);
+		const defaultSeed = await runNativeRalplanCommand(["--json", "different task"], root);
+		expect(defaultSeed.status).toBe(2);
+		expect(defaultSeed.stderr).toContain("use --resume to continue it or --new-run");
+
+		const result = await runNativeRalplanCommand(["--resume", "--json"], root);
 
 		expect(result.status).toBe(0);
-		const payload = JSON.parse(result.stdout ?? "{}") as { run_id: string };
-		expect(payload.run_id).toBe("existing-run");
-		const state = JSON.parse(await fs.readFile(statePath, "utf-8")) as { run_id: string; task: string };
-		expect(state.run_id).toBe("existing-run");
+		const payload = JSON.parse(result.stdout ?? "{}") as { run_id: string; mode: string };
+		expect(payload.run_id).toBe(runId);
+		const state = JSON.parse(await fs.readFile(statePath, "utf-8")) as Record<string, unknown>;
+		expect(state.run_id).toBe(runId);
 		expect(state.task).toBe("continue existing");
+		expect(state.current_phase).toBe("revision");
+		expect(state.planner_subagent_id).toBe("planner-resume-1");
+		expect(state.architect_id).toBe("architect-resume-1");
+		expect(state.critic_id).toBe("critic-resume-1");
+		expect(state.last_review_verdict).toBe("OKAY");
+		expect(state.auto_handoff).toEqual({ configuredTarget: "ultragoal", effectiveTarget: "ultragoal" });
+		expect(state.planning_stuck).toEqual({ marker: "PLANNING-STUCK", reason: "preserved historical diagnostic" });
+		expect(payload.mode).toBe("short");
+
+		const mismatch = await runNativeRalplanCommand(["--resume", "different task"], root);
+		expect(mismatch.status).toBe(2);
+		expect(mismatch.stderr).toContain("--resume task does not match");
+
+		const fresh = await runNativeRalplanCommand(["--new-run", "--json", "different task"], root);
+		expect(fresh.status).toBe(0);
+		const freshPayload = JSON.parse(fresh.stdout ?? "{}") as { run_id: string };
+		expect(freshPayload.run_id).not.toBe(runId);
+		const freshState = JSON.parse(await fs.readFile(statePath, "utf-8")) as Record<string, unknown>;
+		expect(freshState.current_phase).toBe("planner");
+		expect(freshState.planner_subagent_id).toBeUndefined();
+		expect(freshState.architect_id).toBeUndefined();
+		expect(freshState.critic_id).toBeUndefined();
+		expect(freshState.last_review_verdict).toBeUndefined();
+		expect(freshState.auto_handoff).toBeUndefined();
+		expect(freshState.planning_stuck).toBeUndefined();
+
+		await fs.writeFile(
+			statePath,
+			JSON.stringify({ ...freshState, active: false, current_phase: "complete" }),
+			"utf-8",
+		);
+		const afterTerminal = await runNativeRalplanCommand(["--json", "after terminal"], root);
+		expect(afterTerminal.status).toBe(0);
+		const afterTerminalPayload = JSON.parse(afterTerminal.stdout ?? "{}") as { run_id: string };
+		expect(afterTerminalPayload.run_id).not.toBe(freshPayload.run_id);
 	});
 
 	it("--architect openai-code seeds the kind into state", async () => {
