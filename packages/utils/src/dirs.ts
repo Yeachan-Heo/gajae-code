@@ -83,6 +83,48 @@ export function pathIdentityKey(inputPath: string): string {
 	return resolvedPath;
 }
 
+/**
+ * Return a key for a path whose final file can be created or replaced after
+ * registration. On Windows, use the parent directory's stable identity and the
+ * final entry name rather than the file's inode. Existing case-insensitive
+ * aliases share the directory's recorded entry spelling; case-sensitive
+ * entries retain distinct names.
+ */
+export function stablePathKey(inputPath: string): string {
+	const resolvedPath = path.resolve(inputPath);
+
+	let entryPath = resolvedPath;
+	let entryExists = false;
+	try {
+		const entryStats = fs.lstatSync(entryPath);
+		entryExists = true;
+		if (entryStats.isSymbolicLink()) entryPath = fs.realpathSync(entryPath);
+	} catch {}
+
+	const parentPath = path.dirname(entryPath);
+	let entryName = path.basename(entryPath);
+	if (process.platform !== "win32") {
+		try {
+			return path.join(fs.realpathSync(parentPath), entryName);
+		} catch {
+			return resolvedPath;
+		}
+	}
+	try {
+		const parentStats = fs.statSync(parentPath, { bigint: true });
+		if (parentStats.ino === 0n) return resolvedPath;
+		const entries = fs.readdirSync(parentPath);
+		const exactEntry = entries.find(name => name === entryName);
+		if (exactEntry !== undefined) entryName = exactEntry;
+		else if (entryExists) {
+			const caseAliases = entries.filter(name => name.toLowerCase() === entryName.toLowerCase());
+			if (caseAliases.length === 1) entryName = caseAliases[0] ?? entryName;
+		}
+		return JSON.stringify(["win32-path-entry", parentStats.dev.toString(), parentStats.ino.toString(), entryName]);
+	} catch {}
+	return resolvedPath;
+}
+
 export function normalizePathForComparison(inputPath: string, platform: NodeJS.Platform = process.platform): string {
 	const pathApi = platform === "win32" ? path.win32 : path;
 	const resolvedPath = platform === process.platform ? resolveEquivalentPath(inputPath) : pathApi.resolve(inputPath);

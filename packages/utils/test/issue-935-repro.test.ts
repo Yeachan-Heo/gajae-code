@@ -16,7 +16,7 @@ describe("issue #935 path equivalence", () => {
 			throw error;
 		}) as unknown as typeof fs.realpathSync);
 
-		expect(resolveEquivalentPath(inputPath)).toBe(inputPath);
+		expect(resolveEquivalentPath(inputPath)).toBe(path.resolve(inputPath));
 		expect(realpathSpy).toHaveBeenCalledWith(inputPath);
 	});
 });
@@ -42,6 +42,6 @@ describe("issue #6446 Windows path casing", () => {
 			throw error;
 		}) as unknown as typeof fs.realpathSync);
 
-		expect(resolveEquivalentPath(inputPath)).toBe(inputPath);
+		expect(resolveEquivalentPath(inputPath)).toBe(path.resolve(inputPath));
 	});
 });
