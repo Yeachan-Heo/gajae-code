@@ -25,6 +25,10 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal terminal-abort fencing seam, threaded via terminalAbortSeams; not a user-facing SDK control seam",
 	"agent_session:pendingToolExecutions":
 		"internal read-only run-resource-ledger view, threaded via terminalAbortSeams so the prompt deadline can find a tool-call boundary; not a user-facing SDK control seam",
+	"agent_session:setUnavailableModelProfile":
+		"internal model-profile fallback warning state used by session presentation; not a public SDK operation",
+	"agent_session:getUnavailableModelProfile":
+		"internal model-profile fallback warning state used by session presentation; not a public SDK operation",
 	"slash_command:routing":
 		"visual/local-only autorouting settings toggle and smart-routing panel entry, not a user-facing SDK control seam",
 	"slash_command:mcp":
