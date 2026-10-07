@@ -7684,6 +7684,7 @@ export class SessionManager {
 	#persistWriterPath: string | undefined;
 	#persistChain: Promise<void> = Promise.resolve();
 	#persistError: Error | undefined;
+	#closeRetryOriginError: Error | undefined;
 	#persistErrorReported = false;
 	/** Defense-in-depth (#4443): one-shot warn for adjacent private thinking blocks in persisted assistant transcripts. */
 	#warnedAdjacentThinkingPersist = false;

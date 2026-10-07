@@ -26,6 +26,8 @@ import {
 	FileSessionStorage,
 	MemorySessionStorage,
 	type SessionStorageWriter,
+	type SessionStorageWriterOpenOptions,
+	SessionStorageWriterRetryableCloseError,
 	type StagedStreamingWriter,
 } from "../../src/session/session-storage";
 
@@ -3663,15 +3665,6 @@ describe("whole-session persistence freshness", () => {
 			destinationFile,
 			`${JSON.stringify({ type: "session", version: 5, id: "rewrite-destination", timestamp: "0", cwd: "/cwd" })}\n`,
 		);
-		const destinationManager = await SessionManager.open(
-			destinationFile,
-			SessionManager.explicitDestination("/sessions"),
-			storage,
-			"copy-retain",
-			"off",
-		);
-		const destinationSnapshot = destinationManager.captureState();
-		await destinationManager.close();
 		const manager = await SessionManager.open(
 			sourceFile,
 			SessionManager.explicitDestination("/sessions"),
@@ -3680,6 +3673,13 @@ describe("whole-session persistence freshness", () => {
 			"off",
 		);
 		try {
+			// Snapshots are authenticated by their issuing manager. Build the
+			// destination snapshot on this manager, then return to the source so the
+			// lifecycle race exercises the real restore path rather than failing at
+			// the fixture boundary.
+			await manager.setSessionFile(destinationFile);
+			const destinationSnapshot = manager.captureState();
+			await manager.setSessionFile(sourceFile);
 			const sourceEntryId = manager.appendCustomEntry("before-lifecycle-switch", { value: 1 });
 			await manager.flush();
 			const sourceBeforeRewrite = storage.readTextSync(sourceFile);
