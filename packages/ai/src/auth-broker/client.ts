@@ -283,8 +283,14 @@ export class AuthBrokerClient {
 		return this.#request("GET", path, { schema: usageResponseSchema, signal }) as Promise<UsageResponse>;
 	}
 
-	async refreshCredential(id: number, signal?: AbortSignal): Promise<CredentialRefreshResponse> {
+	async refreshCredential(
+		id: number,
+		signal?: AbortSignal,
+		expectedRevision?: number,
+	): Promise<CredentialRefreshResponse> {
+		const body = expectedRevision === undefined ? undefined : { expectedRevision };
 		return this.#request("POST", `/v1/credential/${id}/refresh`, {
+			...(body === undefined ? {} : { body }),
 			schema: credentialRefreshResponseSchema,
 			signal,
 		}) as Promise<CredentialRefreshResponse>;

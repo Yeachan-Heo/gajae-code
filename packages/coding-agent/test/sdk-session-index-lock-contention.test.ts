@@ -297,20 +297,22 @@ describe("SDK session index lock contention (#4544)", () => {
 			return result;
 		}) as typeof fs.readFile);
 		try {
-			expect(await index.checkpointLiveHeartbeats()).toBe(0);
+			// The stale pre-replay batch is discarded; the pass re-probes from
+			// scratch and only that fresh observation may write the heartbeat.
+			expect(await index.checkpointLiveHeartbeats()).toBe(1);
 			expect(jumped).toBe(true);
-			// No heartbeat was written for the still-live host: the cycle failed
-			// closed instead of trusting the pre-replay observation set.
+			expect(incarnationCalls).toBeGreaterThanOrEqual(2);
 			const rows = index.listSessions().sessions;
 			expect(rows).toHaveLength(1);
-			expect(rows[0]?.lastHeartbeatAt).toBeUndefined();
+			expect(rows[0]?.lastHeartbeatAt).toBeDefined();
 		} finally {
 			readFileSpy.mockRestore();
 			incarnation.mockRestore();
 			vi.restoreAllMocks();
 		}
-		// The next pass, on a fast replay, re-probes and writes normally.
-		expect(await index.checkpointLiveHeartbeats()).toBe(1);
+		// The heartbeat written by the fresh re-probe is still within the
+		// interval, so the next pass has nothing to checkpoint.
+		expect(await index.checkpointLiveHeartbeats()).toBe(0);
 	});
 
 	it("fails closed on a stale batch even when the wall clock steps backward", async () => {
@@ -348,10 +350,11 @@ describe("SDK session index lock contention (#4544)", () => {
 			return result;
 		}) as typeof fs.readFile);
 		try {
-			expect(await index.checkpointLiveHeartbeats()).toBe(0);
+			// The stale batch is still rejected by the monotonic bound; only a
+			// fresh re-probe inside the same pass writes the heartbeat.
+			expect(await index.checkpointLiveHeartbeats()).toBe(1);
 			expect(regressed).toBe(true);
-			const rows = index.listSessions().sessions;
-			expect(rows[0]?.lastHeartbeatAt).toBeUndefined();
+			expect(incarnationCalls).toBeGreaterThanOrEqual(2);
 		} finally {
 			readFileSpy.mockRestore();
 			incarnation.mockRestore();
@@ -367,8 +370,54 @@ describe("SDK session index lock contention (#4544)", () => {
 		const index = await new SessionIndex(dir).open();
 		// The FIRST bound (SESSION_INDEX_PROBE_FRESHNESS_MS = 50ms) fires at lock
 		// acquisition, before the replay: a probe batch that queues behind even a
-		// short legitimate holder is discarded. Advance the monotonic clock during
-		// acquisition (inside the lock wrapper, before the callback body).
+		// short legitimate holder is discarded. Stall EVERY acquisition so each
+		// bounded re-probe attempt also goes stale: the pass must still write
+		// nothing rather than fall back to a stale observation.
+		let incarnationCalls = 0;
+		const realProcessIncarnation = incarnationModule.processIncarnation;
+		const incarnation = vi.spyOn(incarnationModule, "processIncarnation").mockImplementation(pid => {
+			incarnationCalls++;
+			return realProcessIncarnation(pid);
+		});
+		const realMono = performance.now.bind(performance);
+		let offset = 0;
+		const mono = vi.spyOn(performance, "now").mockImplementation(() => realMono() + offset);
+		const realWithFileLock = lockModule.withFileLock;
+		let stalls = 0;
+		const spy = vi
+			.spyOn(lockModule, "withFileLock")
+			.mockImplementation(async (filePath: Parameters<typeof realWithFileLock>[0], fn, options) => {
+				if (incarnationCalls > 0 && String(filePath).endsWith("index.jsonl")) {
+					stalls++;
+					offset += 100;
+				}
+				return await realWithFileLock(filePath, fn, options);
+			});
+		try {
+			expect(await index.checkpointLiveHeartbeats()).toBe(0);
+			expect(stalls).toBeGreaterThanOrEqual(2);
+			expect(stalls).toBe(4);
+			expect(incarnationCalls).toBeGreaterThanOrEqual(stalls);
+			const rows = index.listSessions().sessions;
+			expect(rows[0]?.lastHeartbeatAt).toBeUndefined();
+		} finally {
+			spy.mockRestore();
+			mono.mockRestore();
+			incarnation.mockRestore();
+			vi.restoreAllMocks();
+		}
+		expect(await index.checkpointLiveHeartbeats()).toBe(1);
+	});
+
+	it("recovers within one pass when only the first lock acquisition is contended", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hb-retry-"));
+		const seed = await new SessionIndex(dir).open();
+		await seed.append(event("hb-retry"));
+		const index = await new SessionIndex(dir).open();
+		// Busy-machine starvation: one contended acquisition used to drop the whole
+		// cycle, and repeated drops aged live hosts out of the freshness window so
+		// attached prompts were abandoned as "removed". A transient stall must not
+		// cost the cycle; a fresh re-probe in the same pass writes the heartbeat.
 		let incarnationCalls = 0;
 		const realProcessIncarnation = incarnationModule.processIncarnation;
 		const incarnation = vi.spyOn(incarnationModule, "processIncarnation").mockImplementation(pid => {
@@ -376,25 +425,30 @@ describe("SDK session index lock contention (#4544)", () => {
 			return realProcessIncarnation(pid);
 		});
 		const realWithFileLock = lockModule.withFileLock;
+		let stalled = false;
+		const realMono = performance.now.bind(performance);
+		let offset = 0;
+		const mono = vi.spyOn(performance, "now").mockImplementation(() => realMono() + offset);
 		const spy = vi
 			.spyOn(lockModule, "withFileLock")
 			.mockImplementation(async (filePath: Parameters<typeof realWithFileLock>[0], fn, options) => {
-				if (incarnationCalls > 0 && String(filePath).endsWith("index.jsonl")) {
-					const realMono = performance.now.bind(performance);
-					vi.spyOn(performance, "now").mockImplementation(() => realMono() + 100);
+				if (!stalled && incarnationCalls > 0 && String(filePath).endsWith("index.jsonl")) {
+					stalled = true;
+					offset += 100;
 				}
 				return await realWithFileLock(filePath, fn, options);
 			});
 		try {
-			expect(await index.checkpointLiveHeartbeats()).toBe(0);
-			const rows = index.listSessions().sessions;
-			expect(rows[0]?.lastHeartbeatAt).toBeUndefined();
+			expect(await index.checkpointLiveHeartbeats()).toBe(1);
+			expect(stalled).toBe(true);
+			expect(incarnationCalls).toBeGreaterThanOrEqual(2);
+			expect(index.listSessions().sessions[0]?.lastHeartbeatAt).toBeDefined();
 		} finally {
 			spy.mockRestore();
+			mono.mockRestore();
 			incarnation.mockRestore();
 			vi.restoreAllMocks();
 		}
-		expect(await index.checkpointLiveHeartbeats()).toBe(1);
 	});
 
 	it("keeps the unregister pass's OS incarnation probes outside the lock-held section", async () => {

@@ -797,6 +797,14 @@ const SESSION_INDEX_PROBE_FRESHNESS_MS = 50;
  * and the next pass re-probes from scratch.
  */
 const SESSION_INDEX_REPLAY_FRESHNESS_MS = 2_000;
+/**
+ * Fresh re-probe attempts one heartbeat checkpoint pass makes when its
+ * observation batch goes stale under lock contention. Each attempt is fully
+ * fail-closed; the bound only prevents a contended machine from writing no
+ * heartbeat for long enough that live hosts project as dead.
+ */
+const SESSION_HEARTBEAT_CHECKPOINT_ATTEMPTS = 4;
+const STALE_OBSERVATION: unique symbol = Symbol("stale-heartbeat-observation");
 /** Maximum distinct live identity probes admitted by one public status query. */
 const SESSION_GENERATION_PROBE_LIMIT = 32;
 
@@ -2327,14 +2335,33 @@ export class SessionIndex {
 	 * Production coalesced heartbeat checkpoint pass (C2): appends one
 	 * `host_heartbeat` per session at most once per {@link SESSION_HEARTBEAT_INTERVAL_MS}.
 	 * The pass observes liveness the same way the projection does — the host process
-	 * must be alive and, for composite identities, still carry the recorded OS process
+	/**
 	 * incarnation (a reused PID is never checkpointed). Stopped, terminal, and ambiguous rows
 	 * and rows whose heartbeat is still fresh are skipped. After a broker restart, sessions whose
 	 * host survived are re-observed as live on the first pass; sessions whose host died
 	 * while the broker was down keep their stale or missing heartbeat and read as
 	 * unknown/not-live (never fresh forever). Returns the number of checkpoints written.
 	 */
-	async checkpointLiveHeartbeats(now = Date.now()): Promise<number> {
+	async checkpointLiveHeartbeats(now = Date.now(), deadlineAt?: number): Promise<number> {
+		// A stale observation batch fails closed (no heartbeat), but on a busy
+		// machine a single contended lock acquisition is enough to discard the
+		// whole cycle. With the broker's 5s cadence repeatedly losing that race,
+		// every live host's heartbeat aged past the 2-interval freshness window
+		// and the router retired attached sessions as "removed" mid-prompt.
+		// Re-probe from scratch a bounded number of times inside this pass: each
+		// attempt keeps the exact fail-closed contract (fresh probes, freshness
+		// bounds re-checked under the lock); only the starvation is removed.
+		// When a deadline is supplied, stop retrying if the deadline is exhausted.
+		for (let attempt = 0; ; attempt++) {
+			if (deadlineAt !== undefined && Date.now() >= deadlineAt) return 0;
+			const result = await this.#checkpointLiveHeartbeatsOnce(now, deadlineAt);
+			if (result !== STALE_OBSERVATION || attempt + 1 >= SESSION_HEARTBEAT_CHECKPOINT_ATTEMPTS)
+				return result === STALE_OBSERVATION ? 0 : result;
+			now = Date.now();
+		}
+	}
+
+	async #checkpointLiveHeartbeatsOnce(now: number, deadlineAt?: number): Promise<number | typeof STALE_OBSERVATION> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		return await SessionIndex.#enqueue(indexPath, async () => {
 			// An absent index holds no registration to checkpoint, so this pass must read
@@ -2378,7 +2405,7 @@ export class SessionIndex {
 				// the OS is never probed while the machine-global lock is held. The
 				// bound tolerates scheduler jitter on an uncontended acquisition —
 				// which is the only path where the evidence is trustworthy.
-				if (performance.now() - probedAt > SESSION_INDEX_PROBE_FRESHNESS_MS) return 0;
+				if (performance.now() - probedAt > SESSION_INDEX_PROBE_FRESHNESS_MS) return STALE_OBSERVATION;
 				await this.#replayUnderLock();
 				// Recheck AFTER the awaited replay too (#4544 review round 4): the
 				// replay re-reads the whole log (up to the 4 MiB rotation bound) and
@@ -2389,7 +2416,11 @@ export class SessionIndex {
 				// process as the dead row. The replay bound covers the full locked
 				// replay cost envelope of a healthy machine; anything slower fails
 				// closed (no heartbeat this cycle) and the next pass re-probes.
-				if (performance.now() - probedAt > SESSION_INDEX_REPLAY_FRESHNESS_MS) return 0;
+				if (performance.now() - probedAt > SESSION_INDEX_REPLAY_FRESHNESS_MS) return STALE_OBSERVATION;
+				// If a startup deadline is supplied, abandon the write if it is exhausted:
+				// the startup watchdog will exit the process shortly, so persisting
+				// incomplete checkpoint work is not progress.
+				if (deadlineAt !== undefined && Date.now() >= deadlineAt) return 0;
 				if (this.#corruptSuffix) return 0;
 				const events: SessionIndexEvent[] = [];
 				const rows = reduceEvents(this.#events, now, this.#agentDir, probed).sessions;
