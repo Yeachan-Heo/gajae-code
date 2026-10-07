@@ -1342,6 +1342,23 @@ for (const { label, providerCode, category, retryability } of [
 	});
 }
 
+test("ACP surfaces Codex request_timeout before the prompt watchdog expires", async () => {
+	const fixture = await createFixture({ virtualPromptWatchdog: true });
+	try {
+		const pending = prompt(fixture, "incomplete Codex arguments");
+		const rejected = pending.catch((error: unknown) => error);
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		fixture.sendFailed("prompt_failed", undefined, "request_timeout");
+		const failure = acpRequestFailure(await bounded(rejected, "provider terminal")) as RequestError;
+		expect(failure).toBeInstanceOf(RequestError);
+		expect(failure.data).toMatchObject({ code: "prompt_failed", providerCode: "request_timeout" });
+		expect(JSON.stringify(failure)).not.toContain("prompt_deadline_exceeded");
+		expect(fixture.promptDeliveryCount()).toBe(1);
+	} finally {
+		fixture.dispose();
+	}
+});
+
 test("ACP retries a first-turn prompt_failed after the turn started, then recovers (issue #5574)", async () => {
 	const fixture = await createFixture();
 	try {
