@@ -49,7 +49,7 @@ function getDb(dbPath?: string): Database {
 		return sharedDb;
 	}
 	if (sharedDb) {
-		sharedDb.close();
+		sharedDb.close(true);
 	}
 	const db = new Database(resolvedPath, { create: true });
 	db.run("PRAGMA journal_mode = WAL");
@@ -77,7 +77,7 @@ function getDb(dbPath?: string): Database {
 export function closeModelCache(dbPath?: string): boolean {
 	const resolvedPath = dbPath ?? getModelDbPath();
 	if (!sharedDb || sharedDbPath !== resolvedPath) return false;
-	sharedDb.close();
+	sharedDb.close(true);
 	sharedDb = null;
 	sharedDbPath = null;
 	return true;
