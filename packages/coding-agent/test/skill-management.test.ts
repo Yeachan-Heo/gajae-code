@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { removeSkill } from "../src/customization/mutations";
 import {
 	isNativeSkillEnabled,
 	listConventionSkillImportSources,
@@ -130,6 +131,49 @@ describe("skill-management", () => {
 				const records = await listNativeSkillsForManagement({ cwd, home });
 				expect(records.some(record => record.name === "outside-helper")).toBe(false);
 				await fs.rm(outside, { recursive: true, force: true });
+			});
+		});
+
+		it("requires user-owned trust to list an external user skill symlink", async () => {
+			await withTempDirs(async (cwd, home) => {
+				const sharedSkills = path.join(path.dirname(cwd), "shared-user-skills");
+				await makeSkill(sharedSkills, "external-helper", "Shared user helper");
+				const userSkills = path.join(home, ".gjc", "agent", "skills");
+				await fs.mkdir(userSkills, { recursive: true });
+				await fs.symlink(
+					path.join(sharedSkills, "external-helper"),
+					path.join(userSkills, "external-helper"),
+					"dir",
+				);
+
+				const untrusted = await listNativeSkillsForManagement({
+					cwd,
+					home,
+					policy: { trustUserSkills: true },
+					allowExternalUserSkillSymlinks: false,
+				});
+				expect(untrusted.some(record => record.name === "external-helper")).toBe(false);
+
+				const trusted = await listNativeSkillsForManagement({
+					cwd,
+					home,
+					policy: { trustUserSkills: true },
+					allowExternalUserSkillSymlinks: true,
+				});
+				const record = trusted.find(skill => skill.name === "external-helper");
+				expect(record).toEqual(
+					expect.objectContaining({
+						name: "external-helper",
+						scope: "user",
+						enabled: true,
+						path: path.join(userSkills, "external-helper", "SKILL.md"),
+					}),
+				);
+				if (!record) throw new Error("Expected trusted external skill record");
+
+				const removal = await removeSkill(record);
+				expect(removal).toMatchObject({ ok: false });
+				await fs.stat(path.join(sharedSkills, "external-helper", "SKILL.md"));
 			});
 		});
 	});
