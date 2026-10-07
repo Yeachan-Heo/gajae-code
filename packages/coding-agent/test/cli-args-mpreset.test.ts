@@ -73,7 +73,7 @@ function fakeSession(initial: Model | null = model("initial-provider", "initial"
 		model: initial ?? undefined,
 		thinkingLevel: undefined as ThinkingLevel | undefined,
 		unavailableModelProfile: undefined as string | undefined,
-		defaultModelSelectionMutationRevision: 0,
+		userModelSelectionRevision: 0,
 		sessionId: "session-1",
 		credentialSessionId: "credential-session-1",
 		setModelTemporaryCalls: [] as Array<{
@@ -89,14 +89,21 @@ function fakeSession(initial: Model | null = model("initial-provider", "initial"
 		async setModelTemporary(
 			next: Model,
 			thinkingLevel?: ThinkingLevel,
-			options?: { persistAsSessionDefault?: boolean; cause?: string },
+			options?: {
+				persistAsSessionDefault?: boolean;
+				cause?: string;
+				shouldMutate?: () => boolean;
+				onMutationStarted?: () => void;
+			},
 		) {
-			session.defaultModelSelectionMutationRevision++;
+			if (options?.shouldMutate && !options.shouldMutate()) return;
+			options?.onMutationStarted?.();
+			if (options?.cause === "user-selection") session.userModelSelectionRevision++;
 			session.setModelTemporaryCalls.push({ model: next, thinkingLevel, options });
 			session.model = next;
 			session.thinkingLevel = thinkingLevel;
 		},
-		getDefaultModelSelectionMutationRevision: () => session.defaultModelSelectionMutationRevision,
+		getUserModelSelectionRevision: () => session.userModelSelectionRevision,
 		getConfiguredModelChain: () => undefined,
 		hasRecoveredDefaultFallbackChain: () => false,
 		setUnavailableModelProfile(name: string | undefined) {
@@ -1073,6 +1080,58 @@ test("interactive startup does not retry a profile after a user selects a model 
 
 	expect(authStorage.reload).toHaveBeenCalledTimes(1);
 	expect(result.recoverableErrors).toHaveLength(1);
+	expect(session.model).toBe(selectedModel);
+	expect(session.setModelTemporaryCalls.map(call => call.model)).toEqual([selectedModel]);
+});
+
+test("interactive startup cancels profile activation when selection changes during profile preparation", async () => {
+	const profile: ModelProfileDefinition = {
+		name: "prepared-profile",
+		requiredProviders: ["profile-provider"],
+		modelMapping: { default: "profile-provider/default" },
+		source: "user",
+	};
+	const session = fakeSession(model("fallback-provider", "provisional"));
+	const selectedModel = model("user-provider", "selected");
+	const base = fakeRegistry([profile]);
+	let credentialAvailable = false;
+	let selectedDuringPreparation = false;
+	const authStorage = {
+		reload: vi.fn(async () => {
+			credentialAvailable = true;
+		}),
+		hasRuntimeApiKey: () => credentialAvailable,
+		hasLiteralConfigApiKey: () => false,
+		hasSessionCredentialUnavailable: () => false,
+	};
+	const registry = {
+		...base,
+		authStorage,
+		getApiKeyForProvider: async () => {
+			if (!credentialAvailable) return undefined;
+			if (!selectedDuringPreparation) {
+				selectedDuringPreparation = true;
+				await session.setModelTemporary(selectedModel, undefined, { cause: "user-selection" });
+			}
+			return "fresh-key";
+		},
+	};
+
+	const result = await applyStartupModelProfilesForRoot({
+		session,
+		settings: Settings.isolated(),
+		modelRegistry: registry as never,
+		parsedArgs: { mpreset: profile.name },
+		isInteractive: true,
+		hasInteractiveTerminal: true,
+		initialMessage: undefined,
+		initialMessages: [],
+		resumeAction: undefined,
+	});
+
+	expect(authStorage.reload).toHaveBeenCalledTimes(1);
+	expect(selectedDuringPreparation).toBe(true);
+	expect(result.recoverableErrors).toEqual([]);
 	expect(session.model).toBe(selectedModel);
 	expect(session.setModelTemporaryCalls.map(call => call.model)).toEqual([selectedModel]);
 });

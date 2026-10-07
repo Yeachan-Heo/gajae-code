@@ -503,6 +503,7 @@ async function applyStartupModelProfilesWithPolicy(
 			tolerateCredentialError?: boolean;
 			tolerateUnknownDefault?: boolean;
 			runtimeBindingsOnly?: boolean;
+			userSelectionRevision?: number;
 		} = {},
 	): Promise<boolean> => {
 		try {
@@ -516,7 +517,14 @@ async function applyStartupModelProfilesWithPolicy(
 			} else {
 				await activateModelProfile(
 					{ session: args.session, modelRegistry: args.modelRegistry, settings: args.settings, profileName },
-					{ persistDefault, thinkingLevelOverride: options.thinkingLevelOverride },
+					{
+						persistDefault,
+						thinkingLevelOverride: options.thinkingLevelOverride,
+						isCurrent:
+							options.userSelectionRevision === undefined
+								? undefined
+								: () => args.session.getUserModelSelectionRevision() === options.userSelectionRevision,
+					},
 				);
 			}
 			return true;
@@ -569,6 +577,7 @@ async function applyStartupModelProfilesWithPolicy(
 	const applyConfiguredProfiles = async (
 		allowMissingDefault: boolean,
 		profileNames?: ReadonlySet<string>,
+		userSelectionRevision?: number,
 	): Promise<boolean> => {
 		profilePassFailures = [];
 		unhandledProfileName = undefined;
@@ -583,10 +592,14 @@ async function applyStartupModelProfilesWithPolicy(
 					tolerateUnknownDefault:
 						onUnknownDefault !== undefined || (allowMissingDefault && tolerateDefaultProfileFailure),
 					runtimeBindingsOnly: args.session.hasRecoveredDefaultFallbackChain(),
+					userSelectionRevision,
 				})) && applied;
 		}
 		if (args.parsedArgs.mpreset && (!profileNames || profileNames.has(args.parsedArgs.mpreset))) {
-			applied = (await applyProfile(args.parsedArgs.mpreset, args.parsedArgs.default === true)) && applied;
+			applied =
+				(await applyProfile(args.parsedArgs.mpreset, args.parsedArgs.default === true, {
+					userSelectionRevision,
+				})) && applied;
 		}
 		return applied;
 	};
@@ -597,8 +610,11 @@ async function applyStartupModelProfilesWithPolicy(
 		const firstFailureIndex = orderedProfiles.findIndex(name => failedProfiles.has(name));
 		return firstFailureIndex === -1 ? failedProfiles : new Set(orderedProfiles.slice(firstFailureIndex));
 	};
-	const applyFailedProfiles = async (failedProfiles: ReadonlySet<string>): Promise<boolean> => {
-		const applied = await applyConfiguredProfiles(true, failedProfiles);
+	const applyFailedProfiles = async (
+		failedProfiles: ReadonlySet<string>,
+		userSelectionRevision: number,
+	): Promise<boolean> => {
+		const applied = await applyConfiguredProfiles(true, failedProfiles, userSelectionRevision);
 		if (
 			applied &&
 			defaultProfile !== undefined &&
@@ -606,7 +622,7 @@ async function applyStartupModelProfilesWithPolicy(
 			args.parsedArgs.mpreset !== undefined &&
 			!failedProfiles.has(args.parsedArgs.mpreset)
 		) {
-			return applyProfile(args.parsedArgs.mpreset, args.parsedArgs.default === true);
+			return applyProfile(args.parsedArgs.mpreset, args.parsedArgs.default === true, { userSelectionRevision });
 		}
 		return applied;
 	};
@@ -656,7 +672,7 @@ async function applyStartupModelProfilesWithPolicy(
 	};
 
 	// Deferred --mpreset startup can overlap selector input; never reapply its
-	// captured profile after the user has changed the session model state.
+	// captured profile after the user has selected a newer model.
 	if (preferCachedProfiles) {
 		let applied: boolean;
 		let refreshedOnline = false;
@@ -664,18 +680,23 @@ async function applyStartupModelProfilesWithPolicy(
 			applied = await applyConfiguredProfiles(false);
 		} catch (error) {
 			if (error instanceof ModelProfileCredentialError) throw error;
-			const selectionRevision = args.session.getDefaultModelSelectionMutationRevision();
+			const selectionRevision = args.session.getUserModelSelectionRevision();
 			if (error instanceof UnknownModelProfileError) {
 				await refreshAuthAndCatalog(onCredentialError !== undefined || onUnknownDefault !== undefined);
 			} else {
 				await args.modelRegistry.refresh("online-if-uncached", args.session.credentialSessionId);
 			}
-			if (args.session.getDefaultModelSelectionMutationRevision() !== selectionRevision) return;
+			if (args.session.getUserModelSelectionRevision() !== selectionRevision) return;
 			refreshedOnline = true;
 			const failedProfiles = new Set(profilePassFailures.map(failure => failure.profileName));
 			if (unhandledProfileName) failedProfiles.add(unhandledProfileName);
 			const profilesToRetry = profilesFromFirstFailure(failedProfiles);
-			applied = await applyConfiguredProfiles(true, profilesToRetry.size > 0 ? profilesToRetry : undefined);
+			applied = await applyConfiguredProfiles(
+				true,
+				profilesToRetry.size > 0 ? profilesToRetry : undefined,
+				selectionRevision,
+			);
+			if (args.session.getUserModelSelectionRevision() !== selectionRevision) return;
 		}
 		if (
 			!applied &&
@@ -684,14 +705,18 @@ async function applyStartupModelProfilesWithPolicy(
 		) {
 			if (!refreshedOnline) {
 				const failedProfiles = new Set(profilePassFailures.map(failure => failure.profileName));
-				const selectionRevision = args.session.getDefaultModelSelectionMutationRevision();
+				const selectionRevision = args.session.getUserModelSelectionRevision();
 				await refreshAuthAndCatalog(true);
 				refreshedOnline = true;
-				if (args.session.getDefaultModelSelectionMutationRevision() !== selectionRevision) {
+				if (args.session.getUserModelSelectionRevision() !== selectionRevision) {
 					modelSelectionChangedDuringRecovery = true;
 					applied = false;
 				} else {
-					applied = await applyFailedProfiles(failedProfiles);
+					applied = await applyFailedProfiles(failedProfiles, selectionRevision);
+					if (args.session.getUserModelSelectionRevision() !== selectionRevision) {
+						modelSelectionChangedDuringRecovery = true;
+						applied = false;
+					}
 				}
 			}
 			if (applied) args.session.setUnavailableModelProfile(undefined);

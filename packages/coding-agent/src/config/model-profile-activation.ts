@@ -123,6 +123,8 @@ export interface PrepareModelProfileActivationOptions {
 export interface ApplyModelProfileActivationOptions {
 	persistDefault?: boolean;
 	thinkingLevelOverride?: ThinkingLevel;
+	/** Cancels deferred activation if a newer user model selection exists. */
+	isCurrent?: () => boolean;
 }
 export interface PreparedModelProfileActivation {
 	profileName: string;
@@ -1652,6 +1654,7 @@ export async function applyPreparedModelProfileActivation(
 	prepared: PreparedModelProfileActivation,
 	options: ApplyModelProfileActivationOptions = {},
 ): Promise<void> {
+	if (options.isCurrent && !options.isCurrent()) return;
 	let activationStage = "default chain";
 	let modelMutationStarted = false;
 	let overridesChanged = false;
@@ -1661,6 +1664,21 @@ export async function applyPreparedModelProfileActivation(
 	let resumeDefaultChanged = false;
 
 	try {
+		if (prepared.defaultModel) {
+			activationStage = "model selection";
+			await prepared.session.setModelTemporary(
+				prepared.defaultModel,
+				options.thinkingLevelOverride ?? prepared.defaultThinkingLevel,
+				{
+					cause: "profile-activation",
+					shouldMutate: options.isCurrent,
+					onMutationStarted: () => {
+						modelMutationStarted = true;
+					},
+				},
+			);
+			if (options.isCurrent && (!modelMutationStarted || !options.isCurrent())) return;
+		}
 		const ownedDefaultChain =
 			prepared.defaultChain.length > 0
 				? prepared.defaultChain
@@ -1681,19 +1699,6 @@ export async function applyPreparedModelProfileActivation(
 					prepared.defaultResolutionSkips,
 				);
 			}
-		}
-		if (prepared.defaultModel) {
-			activationStage = "model selection";
-			await prepared.session.setModelTemporary(
-				prepared.defaultModel,
-				options.thinkingLevelOverride ?? prepared.defaultThinkingLevel,
-				{
-					cause: "profile-activation",
-					onMutationStarted: () => {
-						modelMutationStarted = true;
-					},
-				},
-			);
 		}
 		// Always reinstall the model role layer from the durable base plus the
 		// new profile's roles so omitted roles from the previous profile are dropped.
@@ -1727,6 +1732,7 @@ export async function applyPreparedModelProfileActivation(
 			activationStage = "forward settings flush";
 			await prepared.settings.flushOrThrow();
 		}
+		if (options.isCurrent && !options.isCurrent()) return;
 		activationStage = "active profile marker";
 		prepared.session.setActiveModelProfile?.(prepared.profileName);
 		if (prepared.defaultModel) {
@@ -2113,6 +2119,7 @@ export async function activateModelProfile(
 	applyOptions: ApplyModelProfileActivationOptions = {},
 ): Promise<void> {
 	const prepared = await prepareModelProfileActivation(options);
+	if (applyOptions.isCurrent && !applyOptions.isCurrent()) return;
 	await applyPreparedModelProfileActivation(prepared, applyOptions);
 }
 

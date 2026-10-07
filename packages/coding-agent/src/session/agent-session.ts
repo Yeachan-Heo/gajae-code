@@ -2794,6 +2794,7 @@ export class AgentSession {
 	#followUpReservationTransitionWaiters = new Set<() => void>();
 	#selectionFenceGeneration = 0;
 	#defaultModelSelectionMutationRevision = 0;
+	#userModelSelectionRevision = 0;
 	#thinkingLevelMutationRevision = 0;
 	#thinkingVisibilityMutationRevision = 0;
 	#thinkingLevelLiveMutationRevision = 0;
@@ -18209,6 +18210,7 @@ export class AgentSession {
 
 		options?.onMutationStarted?.();
 		const cause = options?.cause ?? "user-selection";
+		if (role === "default" && cause === "user-selection") this.#userModelSelectionRevision++;
 		this.#setModelAuthoritatively(model, cause);
 		if (cause === "user-selection") this.#unavailableModelProfile = undefined;
 		this.#seedSessionCanonicalVariant(model);
@@ -18273,9 +18275,9 @@ export class AgentSession {
 		return this.#unavailableModelProfile;
 	}
 
-	/** Revision fence for deferred startup profile recovery. */
-	getDefaultModelSelectionMutationRevision(): number {
-		return this.#defaultModelSelectionMutationRevision;
+	/** Revision fence for deferred activation after a user model selection. */
+	getUserModelSelectionRevision(): number {
+		return this.#userModelSelectionRevision;
 	}
 
 	/**
@@ -18757,6 +18759,7 @@ export class AgentSession {
 			reason?: TemporaryModelReason;
 			providerSessionScope?: TemporaryProviderSessionScope;
 			signal?: AbortSignal;
+			shouldMutate?: () => boolean;
 			onMutationStarted?: () => void;
 		},
 		// biome-ignore lint/suspicious/noConfusingVoidType: Existing session adapters return Promise<void>; a scope is optional.
@@ -18775,6 +18778,8 @@ export class AgentSession {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
 		if (suppliedScope && this.#temporaryProviderSessionScopes.at(-1)?.token !== suppliedScope) return;
+		if (options?.shouldMutate && !options.shouldMutate()) return;
+		if (options?.cause === "user-selection") this.#userModelSelectionRevision++;
 		options?.onMutationStarted?.();
 
 		const isTemporaryOperation = options?.cause === undefined || options.cause === "temporary-operation";
@@ -18935,6 +18940,7 @@ export class AgentSession {
 		// session-scoped updates occur during the promotion phase after ownership
 		// is committed. Session ownership is captured in the promotion logic above.
 		this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: true });
+		this.#userModelSelectionRevision++;
 		this.#setModelWithProviderSessionReset(model);
 		this.#seedSessionCanonicalVariant(model);
 		const thinkingLevelChanged = this.#thinkingLevel !== thinkingLevel;
