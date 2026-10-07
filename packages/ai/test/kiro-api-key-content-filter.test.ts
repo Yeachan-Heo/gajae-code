@@ -204,32 +204,64 @@ describe("Kiro API-key content filter #6150", () => {
 		);
 	});
 
-	test("ksk_ transport emits text_delta incrementally before stream ends", async () => {
-		const emittedEvents: Array<{ type: string }> = [];
+	test("ksk_ transport emits text_delta while a successful response is still open", async () => {
+		const textDeltaReceived = Promise.withResolvers<void>();
+		const nextReadRequested = Promise.withResolvers<void>();
+		const emittedEventTypes: string[] = [];
+		let pullCount = 0;
+		let closeResponse: (() => void) | undefined;
+		let responseClosed = false;
+		let responseClosedAtTextDelivery: boolean | undefined;
 
 		globalThis.fetch = (async () => {
-			// Response with content that will be streamed incrementally
-			const responseBody =
-				'{"content":"Hello "}' + '{"content":"world"}' + '{"usage":{"inputTokens":10,"outputTokens":2}}';
-			return new Response(responseBody, { status: 200 });
+			const encoder = new TextEncoder();
+			const body = new ReadableStream<Uint8Array>({
+				start(controller) {
+					closeResponse = () => {
+						responseClosed = true;
+						controller.close();
+					};
+				},
+				pull(controller) {
+					pullCount++;
+					if (pullCount === 1) {
+						controller.enqueue(encoder.encode('{"content":"Hello "}'));
+					} else if (pullCount === 2) {
+						controller.enqueue(encoder.encode('{"content":"world"}'));
+					} else {
+						nextReadRequested.resolve();
+					}
+				},
+			});
+			return new Response(body, { status: 200 });
 		}) as unknown as typeof fetch;
 
-		try {
-			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+		const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+		const consume = (async () => {
 			for await (const event of stream) {
-				emittedEvents.push({ type: event.type });
+				emittedEventTypes.push(event.type);
+				if (event.type === "text_delta") {
+					responseClosedAtTextDelivery = responseClosed;
+					textDeltaReceived.resolve();
+				}
 			}
-		} catch {
-			// Stream may throw; events are captured
+		})();
+
+		let textDeliveredBeforeEof = false;
+		try {
+			await nextReadRequested.promise;
+			textDeliveredBeforeEof = await Promise.race([
+				textDeltaReceived.promise.then(() => true),
+				Bun.sleep(1_000).then(() => false),
+			]);
+			expect(textDeliveredBeforeEof).toBe(true);
+			expect(responseClosedAtTextDelivery).toBe(false);
+		} finally {
+			closeResponse?.();
+			await consume;
 		}
 
-		// Find index of first text_delta and last chunk consumed (done event)
-		const firstTextDeltaIndex = emittedEvents.findIndex(e => e.type === "text_delta");
-		const doneEventIndex = emittedEvents.findIndex(e => e.type === "done");
-
-		// Verify incremental emission: first text_delta appears before stream ends
-		expect(firstTextDeltaIndex).toBeGreaterThan(-1);
-		expect(doneEventIndex).toBeGreaterThan(firstTextDeltaIndex);
+		expect(emittedEventTypes).toContain("done");
 	});
 
 	test("ksk_ transport sets ttft < duration for successful completion", async () => {
@@ -783,7 +815,8 @@ describe("reasoning-before-answer contentIndex invariant #6151", () => {
 			const responseBody =
 				JSON.stringify({
 					content: "<thinking>I need to read a file</thinking>Let me read that file for you.",
-				}) + JSON.stringify({ toolUseId: "tool-123", name: "read_file", input: '{"path":"/tmp/test.txt"}', stop: true });
+				}) +
+				JSON.stringify({ toolUseId: "tool-123", name: "read_file", input: '{"path":"/tmp/test.txt"}', stop: true });
 			return new Response(responseBody, { status: 200 });
 		}) as unknown as typeof fetch;
 
@@ -1387,23 +1420,28 @@ describe("P1 Regression: content leaking across batches", () => {
 
 		globalThis.fetch = (async () => {
 			const encoder = new TextEncoder();
+			let pullCount = 0;
 			const body = new ReadableStream<Uint8Array>({
-				start(controller) {
-					controller.enqueue(encoder.encode(JSON.stringify({ content: "This is harmful content" })));
-					controller.enqueue(
-						encoder.encode(
-							JSON.stringify({
-								stopReason: "CONTENT_FILTERED",
-								stopDetails: {
-									refusal: {
-										category: "VIOLENCE",
-										explanation: "Violent content not allowed",
+				pull(controller) {
+					pullCount++;
+					if (pullCount === 1) {
+						controller.enqueue(encoder.encode(JSON.stringify({ content: "This is harmful content" })));
+					} else if (pullCount === 2) {
+						controller.enqueue(
+							encoder.encode(
+								JSON.stringify({
+									stopReason: "CONTENT_FILTERED",
+									stopDetails: {
+										refusal: {
+											category: "VIOLENCE",
+											explanation: "Violent content not allowed",
+										},
 									},
-								},
-							}),
-						),
-					);
-					controller.close();
+								}),
+							),
+						);
+						controller.close();
+					}
 				},
 			});
 			return new Response(body, { status: 200 });

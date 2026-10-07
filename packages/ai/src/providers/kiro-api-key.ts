@@ -810,7 +810,12 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 		const pendingToolCalls: Array<{ input: string; toolCall: ToolCall; index: number }> = [];
 		const pendingTextEvents: AssistantMessageEvent[] = [];
 		const flushPendingTextEvents = () => {
-			for (const event of pendingTextEvents) stream.push(event);
+			for (const event of pendingTextEvents) {
+				if (event.type === "text_delta" && firstTokenTime === undefined) {
+					firstTokenTime = Date.now();
+				}
+				stream.push(event);
+			}
 			pendingTextEvents.length = 0;
 		};
 
@@ -883,6 +888,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			const reader = response.body.getReader();
 			const decoder = new TextDecoder();
 			let buffer = "";
+			let hasPendingTextBatch = false;
 			let lastContent = "";
 			let thinkingIndex: number | undefined;
 			let textIndex: number | undefined;
@@ -947,11 +953,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			let textStartDeferred = false; // Track if text_start has been deferred pending thinking
 
 			const appendText = (delta: string) => {
-				// Set firstTokenTime on first real (non-thinking) text delta
-				if (!firstTokenEmitted) {
-					firstTokenEmitted = true;
-					firstTokenTime = Date.now();
-				}
+				firstTokenEmitted = true;
 				if (thinkingIndex !== undefined) {
 					thinkingIndex = undefined;
 				}
@@ -962,7 +964,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 					// thinkingAccumulated is non-empty means we've seen thinking in this or prior content events.
 					// We don't know yet if more thinking will come, so defer text_start until stream end.
 					if (thinkingAccumulated.length === 0) {
-						// Hold text until the response confirms it was not refused.
+						// Hold this batch until the next complete batch has been checked for refusal metadata.
 						pendingTextEvents.push({ type: "text_start", contentIndex: textIndex, partial: output });
 					} else {
 						// Thinking exists; defer text_start until we know thinking position
@@ -1095,7 +1097,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				}
 			};
 
-			// Parse events incrementally, but defer text events until a refusal can no longer arrive.
+			// Parse incrementally and hold one complete text batch for a refusal in the following batch.
 			while (true) {
 				const { done, value } = await reader.read();
 				if (done) break;
@@ -1103,9 +1105,13 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				const { events, remaining } = parseKiroApiEvents(buffer);
 				buffer = remaining;
 
-				// Check if any refusal events are present in this batch.
-				// Refusals suppress all content/tool events, but ordinary errors allow prior events to stream.
+				const hasCompleteEventBatch = events.length > 0 && buffer.length === 0;
+				// Don't release the previous text batch until this complete batch rules out a refusal.
 				const hasTerminalEvent = events.some(e => e.type === "refusal");
+				if (!hasTerminalEvent && hasCompleteEventBatch && hasPendingTextBatch) {
+					flushPendingTextEvents();
+					hasPendingTextBatch = false;
+				}
 
 				for (const event of events) {
 					if (event.type === "content") {
@@ -1215,6 +1221,9 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						const fullErrorMsg = accumulatedText ? `${errorMsg}\n\nPartial output: ${accumulatedText}` : errorMsg;
 						throw new Error(fullErrorMsg);
 					}
+				}
+				if (!hasTerminalEvent && hasCompleteEventBatch && pendingTextEvents.length > 0) {
+					hasPendingTextBatch = true;
 				}
 			}
 
