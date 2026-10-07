@@ -1483,8 +1483,8 @@ function secureExistingManagedDirectory(pathname: string, kind: "directory" | "f
 	);
 	if (!repaired.ok) {
 		// If initial verification was owner_mismatch and repair failed (typically io_error
-		// when the user lacks SeTakeOwnershipPrivilege), provide clear context.
-		if (verified.code === "owner_mismatch" && repaired.code === "io_error") {
+		// or owner_mismatch when the user lacks SeTakeOwnershipPrivilege), provide clear context.
+		if (verified.code === "owner_mismatch" && (repaired.code === "io_error" || repaired.code === "owner_mismatch")) {
 			throw new Error(
 				`${kind} owner mismatch: unable to take ownership (need administrator privileges or file ownership): ${pathname}`,
 			);
