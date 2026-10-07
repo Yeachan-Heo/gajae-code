@@ -351,6 +351,7 @@ export async function listNativeSkillsForManagement(options: {
 						providerId: "runtime",
 						level: "user",
 						requireDescription: true,
+						trustUserSkills: userTrusted,
 					},
 				).then(result => ({ dir, scope: "user" as const, items: result.items })),
 			);

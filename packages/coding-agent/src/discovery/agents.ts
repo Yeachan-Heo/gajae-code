@@ -15,6 +15,7 @@ import { type Skill, skillCapability } from "../capability/skill";
 import { type SlashCommand, slashCommandCapability } from "../capability/slash-command";
 import { type SystemPrompt, systemPromptCapability } from "../capability/system-prompt";
 import type { LoadContext, LoadResult } from "../capability/types";
+import { resolveSkillScopeTrust } from "../config/skill-settings-defaults";
 import {
 	buildRuleFromMarkdown,
 	calculateDepth,
@@ -78,8 +79,9 @@ async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 	const projectScans = getProjectPathCandidates(ctx, "skills").map(dir =>
 		scanSkillsFromDir(ctx, { dir, providerId: PROVIDER_ID, level: "project" }),
 	);
+	const userTrusted = ctx.trustUserSkills ?? resolveSkillScopeTrust(ctx.settings?.getGroup("skills") ?? {}, "user");
 	const userScans = getUserPathCandidates(ctx, "skills").map(dir =>
-		scanSkillsFromDir(ctx, { dir, providerId: PROVIDER_ID, level: "user" }),
+		scanSkillsFromDir(ctx, { dir, providerId: PROVIDER_ID, level: "user", trustUserSkills: userTrusted }),
 	);
 
 	const results = await Promise.all([...projectScans, ...userScans]);
