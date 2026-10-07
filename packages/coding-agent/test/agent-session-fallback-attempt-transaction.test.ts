@@ -99,7 +99,7 @@ function typedStatuslessOverloadStream(model: Model): AssistantMessageEventStrea
 	queueMicrotask(() => {
 		const message: AssistantMessage = {
 			role: "assistant",
-			content: [],
+			content: [{ type: "text", text: "" }],
 			api: model.api,
 			provider: model.provider,
 			model: model.id,
@@ -764,7 +764,7 @@ describe("AgentSession managed fallback attempt transaction", () => {
 			content: [{ type: "text", text: "fallback accepted" }],
 		});
 	});
-	it("admits a clean typed overload successor after a committed tool attempt", async () => {
+	it("admits a clean typed overload successor after an empty placeholder on a committed tool attempt", async () => {
 		const toolCall: ToolCall = { type: "toolCall", id: "overload-tool", name: "counted", arguments: {} };
 		const tool: AgentTool = {
 			name: "counted",
