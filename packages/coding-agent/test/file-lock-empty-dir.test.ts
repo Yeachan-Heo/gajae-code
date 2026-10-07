@@ -1,25 +1,22 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import {
-	__testSeam_setForceEnableEmptyLockDirRemoval,
-	FileLockAcquireError,
-	FileLockTestHooks,
-	withFileLock,
-} from "@gajae-code/coding-agent/config/file-lock";
+import { FileLockAcquireError, FileLockTestHooks, withFileLock } from "@gajae-code/coding-agent/config/file-lock";
 
 const tempDirs: string[] = [];
+let originalPlatform: PropertyDescriptor | undefined;
 
 beforeEach(() => {
-	// Enable empty lock directory removal on all platforms for testing
-	__testSeam_setForceEnableEmptyLockDirRemoval(true);
+	originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+	if (!originalPlatform?.configurable) throw new Error("process.platform descriptor is not configurable");
+	Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
 });
 
 afterEach(async () => {
-	// Disable the test hook
-	__testSeam_setForceEnableEmptyLockDirRemoval(false);
 	FileLockTestHooks.beforeEmptyLockDirClaim = undefined;
+	vi.restoreAllMocks();
+	if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
 
 	for (const dir of tempDirs.splice(0)) {
 		await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
@@ -100,10 +97,10 @@ describe("empty lock directory (issue #6008, claim-based ownership)", () => {
 			if (!hookCalled) {
 				hookCalled = true;
 				// Simulate a concurrent process:
-				// 1. Remove the stale directory
+				// 1. Move the stale directory aside so its inode cannot be reused
 				// 2. Create a fresh empty directory (ABA race)
 				try {
-					await fs.rmdir(checkDir);
+					await fs.rename(checkDir, `${checkDir}.displaced`);
 					await fs.mkdir(checkDir);
 				} catch {
 					// Ignore if directory disappears between rmdir and mkdir
@@ -111,38 +108,53 @@ describe("empty lock directory (issue #6008, claim-based ownership)", () => {
 			}
 		};
 
-		// Attempt to acquire the stale lock
-		// The hook will remove and recreate the directory during our claim attempt
-		// The claim logic should detect identity mismatch and back off safely
-		try {
-			await withFileLock(filePath, async () => {}, {
-				retries: 5,
-				retryDelayMs: 10,
-				staleMs: 10_000,
-			});
-		} catch (error) {
-			// Timeout is acceptable if the race causes contention
-			if (error instanceof FileLockAcquireError) {
-				expect(error.code).toBe("acquire_timeout");
-			}
-		}
+		// The hook replaces the directory after stale identity capture. The claim
+		// must reject the replacement and must not run the protected callback.
+		let callbackEntered = false;
+		await expect(
+			withFileLock(
+				filePath,
+				async () => {
+					callbackEntered = true;
+				},
+				{
+					retries: 5,
+					retryDelayMs: 10,
+					staleMs: 10_000,
+				},
+			),
+		).rejects.toMatchObject({ code: "acquire_timeout" });
 
-		// The hook should have been called
 		expect(hookCalled).toBe(true);
+		expect(callbackEntered).toBe(false);
+		expect(await fs.readdir(lockDir)).toEqual([]);
+	});
 
-		// Most importantly: no info file should be left behind from a failed claim
-		// that was only partially created before identity mismatch was detected
-		const lockDirStat = await fs.stat(lockDir).catch(() => null);
-		if (lockDirStat?.isDirectory()) {
-			const infoPath = path.join(lockDir, "info");
-			const infoStat = await fs.stat(infoPath).catch(() => null);
+	test("does not claim a directory that gains an unrelated entry before claim", async () => {
+		const filePath = path.join(await makeTemp(), "index.jsonl");
+		const lockDir = `${filePath}.lock`;
+		const childPath = path.join(lockDir, "unrelated");
+		await fs.mkdir(lockDir);
+		const pastTime = new Date(Date.now() - 15_000);
+		await fs.utimes(lockDir, pastTime, pastTime);
+		FileLockTestHooks.beforeEmptyLockDirClaim = async () => {
+			await fs.writeFile(childPath, "preserve");
+		};
 
-			// If info exists, verify it's valid (not a partially written file)
-			if (infoStat?.isFile()) {
-				const content = await fs.readFile(infoPath, "utf-8");
-				expect(() => JSON.parse(content)).not.toThrow();
-			}
-		}
+		let callbackEntered = false;
+		await expect(
+			withFileLock(
+				filePath,
+				async () => {
+					callbackEntered = true;
+				},
+				{ retries: 2, retryDelayMs: 1, staleMs: 10_000 },
+			),
+		).rejects.toMatchObject({ code: "acquire_timeout" });
+
+		expect(callbackEntered).toBe(false);
+		expect(await fs.readFile(childPath, "utf8")).toBe("preserve");
+		expect(await fs.readdir(lockDir)).toEqual(["unrelated"]);
 	});
 
 	test("a claim on the final attempt is adopted, not leaked as a live-pid lock", async () => {
@@ -177,25 +189,21 @@ describe("empty lock directory (issue #6008, claim-based ownership)", () => {
 		await fs.utimes(lockDir, pastTime, pastTime);
 
 		const controller = new AbortController();
-		const original = FileLockTestHooks.removeEmptyFileLockDir!;
-		FileLockTestHooks.removeEmptyFileLockDir = async (dir, expected, ownerHostId) => {
-			const outcome = await original(dir, expected, ownerHostId);
-			controller.abort();
-			return outcome;
-		};
-		try {
-			let ran = false;
-			await withFileLock(
-				filePath,
-				async () => {
-					ran = true;
-				},
-				{ retries: 5, retryDelayMs: 1, staleMs: 10_000, signal: controller.signal },
-			);
-			expect(ran).toBe(true);
-		} finally {
-			FileLockTestHooks.removeEmptyFileLockDir = original;
-		}
+		let ran = false;
+		await withFileLock(
+			filePath,
+			async () => {
+				ran = true;
+			},
+			{
+				retries: 5,
+				retryDelayMs: 1,
+				staleMs: 10_000,
+				signal: controller.signal,
+				onAcquired: () => controller.abort(),
+			},
+		);
+		expect(ran).toBe(true);
 		await expect(fs.stat(lockDir)).rejects.toMatchObject({ code: "ENOENT" });
 	});
 });
