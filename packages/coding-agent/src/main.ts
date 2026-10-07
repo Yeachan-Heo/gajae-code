@@ -494,6 +494,7 @@ async function applyStartupModelProfilesWithPolicy(
 ): Promise<void> {
 	let profileCatalogRefreshUnavailable = false;
 	let profilePassFailures: StartupModelProfileFailure[] = [];
+	let unhandledProfileName: string | undefined;
 	const applyProfile = async (
 		profileName: string,
 		persistDefault: boolean,
@@ -544,6 +545,7 @@ async function applyStartupModelProfilesWithPolicy(
 					);
 				return false;
 			}
+			unhandledProfileName = profileName;
 			throw error;
 		}
 	};
@@ -563,10 +565,15 @@ async function applyStartupModelProfilesWithPolicy(
 	const preferCachedProfiles =
 		(args.preferCachedModels === true && args.parsedArgs.mpreset !== undefined) ||
 		(args.preferCachedDefaultProfile === true && defaultProfile !== undefined);
-	const applyConfiguredProfiles = async (allowMissingDefault: boolean): Promise<boolean> => {
+	let modelSelectionChangedDuringRecovery = false;
+	const applyConfiguredProfiles = async (
+		allowMissingDefault: boolean,
+		profileNames?: ReadonlySet<string>,
+	): Promise<boolean> => {
 		profilePassFailures = [];
+		unhandledProfileName = undefined;
 		let applied = true;
-		if (defaultProfile) {
+		if (defaultProfile && (!profileNames || profileNames.has(defaultProfile))) {
 			applied =
 				(await applyProfile(defaultProfile, false, {
 					thinkingLevelOverride: args.settings.has("defaultThinkingLevel")
@@ -578,7 +585,7 @@ async function applyStartupModelProfilesWithPolicy(
 					runtimeBindingsOnly: args.session.hasRecoveredDefaultFallbackChain(),
 				})) && applied;
 		}
-		if (args.parsedArgs.mpreset) {
+		if (args.parsedArgs.mpreset && (!profileNames || profileNames.has(args.parsedArgs.mpreset))) {
 			applied = (await applyProfile(args.parsedArgs.mpreset, args.parsedArgs.default === true)) && applied;
 		}
 		return applied;
@@ -609,7 +616,7 @@ async function applyStartupModelProfilesWithPolicy(
 			});
 		}
 	};
-	const reportFinalProfileFailures = (): void => {
+	const reportFinalProfileFailures = (markDefaultUnavailable = true): void => {
 		for (const failure of profilePassFailures) {
 			if (failure.error instanceof ModelProfileCredentialError) {
 				onCredentialError?.(failure.error);
@@ -618,6 +625,7 @@ async function applyStartupModelProfilesWithPolicy(
 			}
 		}
 		if (
+			markDefaultUnavailable &&
 			(onCredentialError || onUnknownDefault) &&
 			args.parsedArgs.mpreset === undefined &&
 			args.parsedArgs.model === undefined
@@ -627,6 +635,8 @@ async function applyStartupModelProfilesWithPolicy(
 		}
 	};
 
+	// Deferred --mpreset startup can overlap selector input; never reapply its
+	// captured profile after the user has changed the session model state.
 	if (preferCachedProfiles) {
 		let applied: boolean;
 		let refreshedOnline = false;
@@ -634,13 +644,17 @@ async function applyStartupModelProfilesWithPolicy(
 			applied = await applyConfiguredProfiles(false);
 		} catch (error) {
 			if (error instanceof ModelProfileCredentialError) throw error;
+			const selectionRevision = args.session.getDefaultModelSelectionMutationRevision();
 			if (error instanceof UnknownModelProfileError) {
 				await refreshAuthAndCatalog(onCredentialError !== undefined || onUnknownDefault !== undefined);
 			} else {
-				throw error;
+				await args.modelRegistry.refresh("online-if-uncached", args.session.credentialSessionId);
 			}
+			if (args.session.getDefaultModelSelectionMutationRevision() !== selectionRevision) return;
 			refreshedOnline = true;
-			applied = await applyConfiguredProfiles(true);
+			const failedProfiles = new Set(profilePassFailures.map(failure => failure.profileName));
+			if (unhandledProfileName) failedProfiles.add(unhandledProfileName);
+			applied = await applyConfiguredProfiles(true, failedProfiles.size > 0 ? failedProfiles : undefined);
 		}
 		if (
 			!applied &&
@@ -648,12 +662,19 @@ async function applyStartupModelProfilesWithPolicy(
 			(onCredentialError !== undefined || onUnknownDefault !== undefined)
 		) {
 			if (!refreshedOnline) {
+				const failedProfiles = new Set(profilePassFailures.map(failure => failure.profileName));
+				const selectionRevision = args.session.getDefaultModelSelectionMutationRevision();
 				await refreshAuthAndCatalog(true);
 				refreshedOnline = true;
-				applied = await applyConfiguredProfiles(true);
+				if (args.session.getDefaultModelSelectionMutationRevision() !== selectionRevision) {
+					modelSelectionChangedDuringRecovery = true;
+					applied = false;
+				} else {
+					applied = await applyConfiguredProfiles(true, failedProfiles);
+				}
 			}
 			if (applied) args.session.setUnavailableModelProfile(undefined);
-			else reportFinalProfileFailures();
+			else reportFinalProfileFailures(!modelSelectionChangedDuringRecovery);
 		}
 		if (applied && !refreshedOnline)
 			args.modelRegistry.refreshInBackground("online-if-uncached", args.session.credentialSessionId);
@@ -665,7 +686,7 @@ async function applyStartupModelProfilesWithPolicy(
 	}
 
 	// Explicit CLI --model/--thinking must win over any activated or skipped profile.
-	if (explicitModel) {
+	if (explicitModel && !modelSelectionChangedDuringRecovery) {
 		await args.session.setModelTemporary(explicitModel, args.startupThinkingLevel ?? args.parsedArgs.thinking, {
 			persistAsSessionDefault: true,
 			cause: "startup-override",
@@ -673,7 +694,7 @@ async function applyStartupModelProfilesWithPolicy(
 		const selector = `${explicitModel.provider}/${explicitModel.id}`;
 		args.session.setConfiguredModelChain("default", [selector], "startup-override", undefined, true);
 		args.session.seedDefaultFallbackResolution(0, []);
-	} else if (args.parsedArgs.thinking && args.session.model) {
+	} else if (!modelSelectionChangedDuringRecovery && args.parsedArgs.thinking && args.session.model) {
 		await args.session.setModelTemporary(args.session.model, args.parsedArgs.thinking, { cause: "startup-override" });
 	}
 }
