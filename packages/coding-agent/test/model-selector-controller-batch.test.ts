@@ -39,6 +39,7 @@ function createControllerContext() {
 		};
 	}> = [];
 	const setModelTemporary = vi.fn(async () => {});
+	const markUserModelSelection = vi.fn();
 	const setDefaultFallbackRuntimeModel = vi.fn();
 
 	const session = {
@@ -78,6 +79,7 @@ function createControllerContext() {
 			this.model = nextModel;
 			if (options?.thinkingLevel) this.thinkingLevel = options.thinkingLevel;
 		},
+		markUserModelSelection,
 		setModelTemporary,
 		setDefaultFallbackRuntimeModel,
 		async restoreModelSelectionForRollback(nextModel: Model | undefined, thinkingLevel: ThinkingLevel | undefined) {
@@ -458,7 +460,7 @@ describe("SelectorController model batch assignments", () => {
 	});
 
 	test("temporary selection replaces the live fallback chain with the selected model", async () => {
-		const { ctx, settings, setModelTemporary, setDefaultFallbackRuntimeModel } = createControllerContext();
+		const { ctx, settings, session, setModelTemporary, setDefaultFallbackRuntimeModel } = createControllerContext();
 		const selector = await openSelector(ctx);
 
 		await selector.__testSelectAssignment({
@@ -472,6 +474,7 @@ describe("SelectorController model batch assignments", () => {
 			cause: "temporary-operation",
 			reason: "other",
 		});
+		expect(session.markUserModelSelection).toHaveBeenCalledTimes(1);
 		expect(setDefaultFallbackRuntimeModel).toHaveBeenCalledWith("provider-a/selected:low");
 		expect(settings.getModelRole("default")).toBe("provider-a/original-default:medium");
 	});

@@ -18209,7 +18209,7 @@ export class AgentSession {
 
 		options?.onMutationStarted?.();
 		const cause = options?.cause ?? "user-selection";
-		if (role === "default" && cause === "user-selection") this.#userModelSelectionRevision++;
+		if (role === "default" && cause === "user-selection") this.markUserModelSelection();
 		this.#setModelAuthoritatively(model, cause);
 		if (cause === "user-selection") this.#unavailableModelProfile = undefined;
 		this.#seedSessionCanonicalVariant(model);
@@ -18277,6 +18277,11 @@ export class AgentSession {
 	/** Revision fence for deferred activation after a user model selection. */
 	getUserModelSelectionRevision(): number {
 		return this.#userModelSelectionRevision;
+	}
+
+	/** Fence deferred startup profile recovery before an explicit control-surface selection. */
+	markUserModelSelection(): void {
+		this.#userModelSelectionRevision++;
 	}
 
 	/**
@@ -18440,6 +18445,7 @@ export class AgentSession {
 	 * Session-scoped only: does not persist `modelProfile.default`.
 	 */
 	async activateModelProfileForControl(profileName: string): Promise<boolean> {
+		this.markUserModelSelection();
 		await activateModelProfile({
 			session: this,
 			modelRegistry: this.#modelRegistry,
@@ -18480,6 +18486,7 @@ export class AgentSession {
 			onAfterActivation?: () => void;
 		},
 	): Promise<{ changed: boolean; id: string }> {
+		this.markUserModelSelection();
 		// Do not hold selection admission while waiting for a scheduled continuation:
 		// the continuation may need prompt admission to settle the current turn.
 		await this.waitForIdle();
@@ -18778,7 +18785,7 @@ export class AgentSession {
 		}
 		if (suppliedScope && this.#temporaryProviderSessionScopes.at(-1)?.token !== suppliedScope) return;
 		if (options?.shouldMutate && !options.shouldMutate()) return;
-		if (options?.cause === "user-selection") this.#userModelSelectionRevision++;
+		if (options?.cause === "user-selection") this.markUserModelSelection();
 		options?.onMutationStarted?.();
 
 		const isTemporaryOperation = options?.cause === undefined || options.cause === "temporary-operation";
@@ -18939,7 +18946,7 @@ export class AgentSession {
 		// session-scoped updates occur during the promotion phase after ownership
 		// is committed. Session ownership is captured in the promotion logic above.
 		this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: true });
-		this.#userModelSelectionRevision++;
+		this.markUserModelSelection();
 		this.#setModelWithProviderSessionReset(model);
 		this.#seedSessionCanonicalVariant(model);
 		const thinkingLevelChanged = this.#thinkingLevel !== thinkingLevel;
@@ -19281,6 +19288,7 @@ export class AgentSession {
 		const next = roleModels[nextIndex];
 
 		if (options?.temporary) {
+			this.markUserModelSelection();
 			await this.setModelTemporary(next.model, next.explicitThinkingLevel ? next.thinkingLevel : undefined, {
 				cause: "temporary-operation",
 				reason: "temporary-cycle",

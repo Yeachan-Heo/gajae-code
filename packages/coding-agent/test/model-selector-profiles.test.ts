@@ -121,6 +121,7 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 	const flush = vi.fn(async () => {});
 	settings.flushOrThrow = flush as typeof settings.flushOrThrow;
 	const setCalls: Array<{ path: string; value: unknown }> = [];
+	const markUserModelSelection = vi.fn();
 	const originalSet = settings.set.bind(settings);
 	settings.set = ((path: never, value: never) => {
 		setCalls.push({ path: path as string, value });
@@ -132,6 +133,7 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		sessionId: "session-1",
 		scopedModels: [],
 		modelRegistry: createRegistry(options),
+		markUserModelSelection,
 		configuredChains: {} as Record<string, readonly string[]>,
 		getConfiguredModelChain(role: string): readonly string[] | undefined {
 			return this.configuredChains[role];
@@ -882,6 +884,7 @@ describe("model selector profiles", () => {
 		const controller = new SelectorController(ctx as never);
 		await selectFirstProfile(controller);
 
+		expect(session.markUserModelSelection).toHaveBeenCalledTimes(1);
 		expect(session.setModelTemporaryCalls).toHaveLength(1);
 		expect(session.model).toBe(defaultModel);
 		expect(session.thinkingLevel).toBe(ThinkingLevel.High);
