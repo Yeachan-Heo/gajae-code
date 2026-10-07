@@ -86,6 +86,7 @@ async function routerFixture(
 		initiallyIndexed?: boolean;
 		onIndexRefresh?: () => void | Promise<void>;
 		onClientCreated?: () => void | Promise<void>;
+		connect?: (options?: { deadline?: number }) => Promise<void>;
 		createBrokerClient?: () => Promise<SessionRouterClient>;
 		indexedRepo?: string;
 		onRequest?: (operation: Record<string, unknown>) => Promise<Record<string, unknown>> | Record<string, unknown>;
@@ -167,6 +168,7 @@ async function routerFixture(
 							if (reconnectHandler === next) reconnectHandler = undefined;
 						};
 					},
+					...(options.connect ? { connect: options.connect } : {}),
 					request: async (operation, requestOption) => {
 						requests.push(operation);
 						requestOptions.push(requestOption);
@@ -3226,4 +3228,135 @@ describe("SessionRouter dispatch authority", () => {
 			await router.stop();
 		}
 	});
+	test("expires during connect before dispatch without closing the shared transport", async () => {
+		let connectCalls = 0;
+		const entered = Promise.withResolvers<void>();
+		const reconnect = Promise.withResolvers<void>();
+		const connect = async (): Promise<void> => {
+			connectCalls++;
+			if (connectCalls > 1) {
+				entered.resolve();
+				await reconnect.promise;
+			}
+		};
+		const fixture = await routerFixture({ connect });
+		let now = Date.now();
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		try {
+			const request = fixture.router.request(fixture.sessionId, { type: "deadline-connect" }, undefined, undefined, {
+				deadline: now + 100,
+			});
+			await entered.promise;
+			now += 100;
+			reconnect.resolve();
+			await expect(request).rejects.toMatchObject({ phase: "pre_send" });
+			expect(connectCalls).toBe(2);
+			expect(fixture.clients[0]?.requests.filter(operation => operation.type === "deadline-connect")).toEqual([]);
+		} finally {
+			clock.mockRestore();
+			reconnect.resolve();
+			await fixture.router.stop();
+		}
+	});
+	test("rechecks the deadline after a dispatch fence and never dispatches late", async () => {
+		const fixture = await routerFixture();
+		const entered = Promise.withResolvers<void>();
+		const fence = Promise.withResolvers<void>();
+		let now = Date.now();
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		try {
+			const request = fixture.router.request(fixture.sessionId, { type: "deadline-fence" }, undefined, undefined, {
+				deadline: now + 100,
+				dispatchFence: async dispatch => {
+					entered.resolve();
+					await fence.promise;
+					return dispatch();
+				},
+			});
+			await entered.promise;
+			now += 100;
+			fence.resolve();
+			await expect(request).rejects.toMatchObject({ phase: "pre_send" });
+			expect(fixture.clients[0]?.requests.filter(operation => operation.type === "deadline-fence")).toEqual([]);
+		} finally {
+			clock.mockRestore();
+			fence.resolve();
+			await fixture.router.stop();
+		}
+	});
+	test("classifies a response that arrives after dispatch deadline as ambiguous", async () => {
+		const entered = Promise.withResolvers<void>();
+		const acknowledgement = Promise.withResolvers<void>();
+		const fixture = await routerFixture({
+			onRequest: async operation => {
+				if (operation.type === "deadline-late-response") {
+					entered.resolve();
+					await acknowledgement.promise;
+				}
+				return { ok: true };
+			},
+		});
+		let now = Date.now();
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		try {
+			const request = fixture.router.request(
+				fixture.sessionId,
+				{ type: "deadline-late-response" },
+				undefined,
+				undefined,
+				{
+					deadline: now + 100,
+				},
+			);
+			await entered.promise;
+			now += 100;
+			acknowledgement.resolve();
+			await expect(request).rejects.toMatchObject({ phase: "ambiguous" });
+			expect(
+				fixture.clients[0]?.requests.filter(operation => operation.type === "deadline-late-response"),
+			).toHaveLength(1);
+		} finally {
+			clock.mockRestore();
+			acknowledgement.resolve();
+			await fixture.router.stop();
+		}
+	});
+	for (const path of ["throw", "cancel", "teardown"] as const) {
+		test(`deadline-bounded Router preparation preserves ${path} without dispatch`, async () => {
+			const entered = Promise.withResolvers<void>();
+			const reconnect = Promise.withResolvers<void>();
+			let connects = 0;
+			const fixture = await routerFixture({
+				connect: async () => {
+					if (++connects > 1) {
+						entered.resolve();
+						await reconnect.promise;
+					}
+				},
+			});
+			const failure = path === "cancel" ? new DOMException("Cancelled", "AbortError") : new Error("Connect failed");
+			const request = fixture.router
+				.request(fixture.sessionId, { type: "deadline-failure" }, undefined, undefined, {
+					deadline: Date.now() + 1_000,
+				})
+				.then(
+					() => undefined,
+					(error: unknown) => error,
+				);
+			try {
+				await entered.promise;
+				if (path === "teardown") {
+					await fixture.router.stop();
+					reconnect.resolve();
+				} else reconnect.reject(failure);
+				const outcome = await request;
+				if (path === "teardown") expect(outcome).toMatchObject({ phase: "pre_send" });
+				else expect(outcome).toBe(failure);
+				expect(fixture.clients[0]?.requests.filter(operation => operation.type === "deadline-failure")).toEqual([]);
+			} finally {
+				reconnect.resolve();
+				await fixture.router.stop();
+			}
+		});
+	}
 });
