@@ -578,19 +578,14 @@ async function formatParkedAsyncResult(
 ): Promise<string> {
 	if (result.length <= ASYNC_INLINE_RESULT_MAX_CHARS) return result;
 	const preview = `${result.slice(0, ASYNC_PREVIEW_MAX_CHARS)}\n\n[Output truncated. Showing first ${ASYNC_PREVIEW_MAX_CHARS.toLocaleString()} characters.]`;
-	try {
-		if (!allowArtifact) return preview;
-		const { path: artifactPath, id: artifactId } = await sessionManager.allocateArtifactPath("async");
-		if (artifactPath && artifactId) {
-			await Bun.write(artifactPath, result);
-			return `${preview}\nFull output: artifact://${artifactId}`;
-		}
-	} catch (error) {
-		logger.warn("Failed to persist parked async follow-up artifact", {
-			error: error instanceof Error ? error.message : String(error),
-		});
-	}
-	return preview;
+	if (!allowArtifact) return preview;
+	const artifactId = await sessionManager.saveArtifact(result, "async");
+	if (artifactId === undefined) throw new Error("Artifact storage unavailable for parked async follow-up output.");
+	const saved = summarizeAgentBashArtifactSave(artifactId, result);
+	const completeness = saved.complete
+		? "Full output"
+		: `Saved output artifact (truncated; omitted ${saved.omittedBytes} UTF-8 bytes)`;
+	return `${preview}\n${completeness}: artifact://${saved.artifactId}`;
 }
 
 /**
