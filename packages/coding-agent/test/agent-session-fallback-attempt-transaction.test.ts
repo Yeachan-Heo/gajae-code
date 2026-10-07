@@ -800,7 +800,7 @@ describe("AgentSession managed fallback attempt transaction", () => {
 			content: [{ type: "text", text: "overload recovered" }],
 		});
 	});
-	it("reaches the managed guard through a real Responses first-event timeout", async () => {
+	it("reaches the managed guard through a real Responses idle timeout", async () => {
 		const primary = getBundledModel("openai", "gpt-5-mini");
 		const fallback = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!primary || !fallback || primary.api !== "openai-responses") {
@@ -816,12 +816,36 @@ describe("AgentSession managed fallback attempt transaction", () => {
 						...options,
 						apiKey: "local-test-key",
 						fetch: async () =>
-							new Response(new ReadableStream<Uint8Array>({ start() {} }), {
-								status: 200,
-								headers: { "content-type": "text/event-stream" },
-							}),
-						streamFirstEventTimeoutMs: 5,
-						streamIdleTimeoutMs: 20,
+							new Response(
+								new ReadableStream<Uint8Array>({
+									start(controller) {
+										const encoder = new TextEncoder();
+										for (const event of [
+											{ type: "response.created", response: { id: "resp_local", status: "in_progress" } },
+											{
+												type: "response.output_item.added",
+												output_index: 0,
+												item: { id: "msg_local", type: "message", role: "assistant", content: [] },
+											},
+											{
+												type: "response.content_part.added",
+												item_id: "msg_local",
+												output_index: 0,
+												content_index: 0,
+												part: { type: "output_text", text: "" },
+											},
+										]) {
+											controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+										}
+									},
+								}),
+								{
+									status: 200,
+									headers: { "content-type": "text/event-stream" },
+								},
+							),
+						streamFirstEventTimeoutMs: 20,
+						streamIdleTimeoutMs: 5,
 						requestMaxRetries: 0,
 					});
 					void stream.result().then(result => {
@@ -845,10 +869,10 @@ describe("AgentSession managed fallback attempt transaction", () => {
 		expect(calls).toBe(2);
 		expect(timeoutResult).toMatchObject({
 			role: "assistant",
-			content: [],
+			content: [{ type: "text", text: "" }],
 			stopReason: "error",
 			usage: { input: 0, output: 0, totalTokens: 0 },
-			transportFailure: { kind: "transport", providerCode: "stream_first_event_timeout" },
+			errorMessage: "OpenAI responses stream stalled while waiting for the next event",
 		});
 		expect(session!.messages.at(-1)).toMatchObject({
 			role: "assistant",
