@@ -4225,6 +4225,7 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 		const mock = createMockModel();
 		const factoryStarted = Promise.withResolvers<void>();
 		const iteratorReadStarted = Promise.withResolvers<void>();
+		const neverSettle = Promise.withResolvers<IteratorResult<never>>();
 		let first = true;
 		let returnCalls = 0;
 		const agent = new Agent({
@@ -4248,7 +4249,7 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 							};
 						}
 						iteratorReadStarted.resolve();
-						return await new Promise<IteratorResult<never>>(() => {});
+						return await neverSettle.promise;
 					},
 					async return() {
 						returnCalls += 1;
