@@ -147,6 +147,96 @@ function createAnthropicMockStream({
 	};
 }
 
+/**
+ * The event sequence Anthropic sends for `thinking.display: "omitted"`: a thinking
+ * block opens, only `ping` keepalives arrive while the model thinks, then one
+ * empty thinking delta plus the signature closes it before the visible answer.
+ */
+function silentThinkingEvents(phase: "open" | "close"): MockAnthropicEvent[] {
+	if (phase === "open") {
+		return [
+			{
+				type: "message_start",
+				message: {
+					id: "msg_silent_thinking",
+					usage: {
+						input_tokens: 12,
+						output_tokens: 0,
+						cache_read_input_tokens: 0,
+						cache_creation_input_tokens: 0,
+					},
+				},
+			},
+			{ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "", signature: "" } },
+		];
+	}
+	return [
+		{ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "" } },
+		{ type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "sig_silent" } },
+		{ type: "content_block_stop", index: 0 },
+		{ type: "content_block_start", index: 1, content_block: { type: "text", text: "" } },
+		{ type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "answer" } },
+		{ type: "content_block_stop", index: 1 },
+		{
+			type: "message_delta",
+			delta: { stop_reason: "end_turn" },
+			usage: { input_tokens: 12, output_tokens: 900, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+		},
+		{ type: "message_stop" },
+	];
+}
+
+async function* silentThinkingEventStream({
+	thinkingMs,
+	pingEveryMs,
+	signal,
+}: {
+	thinkingMs: number;
+	pingEveryMs: number;
+	signal?: AbortSignal;
+}): AsyncGenerator<MockAnthropicEvent> {
+	yield* silentThinkingEvents("open");
+	const thinkingEndsAt = Date.now() + thinkingMs;
+	while (Date.now() < thinkingEndsAt) {
+		if (signal?.aborted) return;
+		await Bun.sleep(pingEveryMs);
+		yield { type: "ping" };
+	}
+	yield* silentThinkingEvents("close");
+}
+
+function createSilentThinkingRequest(options: {
+	thinkingMs: number;
+	pingEveryMs: number;
+	signal?: AbortSignal;
+}): MockAnthropicRequest {
+	return {
+		async withResponse() {
+			return {
+				data: { [Symbol.asyncIterator]: () => silentThinkingEventStream(options) },
+				response: new Response(null, { status: 200, headers: { "request-id": "req_silent" } }),
+				request_id: "req_silent",
+			};
+		},
+	};
+}
+
+function createSilentThinkingSseBody(options: { thinkingMs: number; pingEveryMs: number }): ReadableStream<Uint8Array> {
+	const encoder = new TextEncoder();
+	const events = silentThinkingEventStream(options);
+	return new ReadableStream({
+		async pull(controller) {
+			const next = await events.next();
+			if (next.done) {
+				controller.close();
+				return;
+			}
+			const event = next.value;
+			controller.enqueue(encoder.encode(`event: ${String(event.type)}\ndata: ${JSON.stringify(event)}\n\n`));
+		},
+	});
+}
+
 afterEach(() => {
 	vi.useRealTimers();
 });
@@ -1341,6 +1431,98 @@ describe("anthropic first-event timeouts", () => {
 
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toBe("Anthropic stream stalled while waiting for the next event");
+	});
+
+	it("keeps a hidden-thinking block alive on pings and finishes the response", async () => {
+		const requests: Array<{ thinking?: { display?: string } }> = [];
+		const create = ((body: unknown) => {
+			requests.push(body as { thinking?: { display?: string } });
+			return createSilentThinkingRequest({ thinkingMs: 50, pingEveryMs: 5 }) as never;
+		}) as unknown as Anthropic["messages"]["create"];
+
+		const result = await streamAnthropic(model, context, {
+			client: { messages: { create } } as Anthropic,
+			thinkingEnabled: true,
+			thinkingDisplay: "omitted",
+			streamFirstEventTimeoutMs: 5000,
+			streamIdleTimeoutMs: 25,
+			streamMaxRetries: 0,
+		}).result();
+
+		expect(requests[0]?.thinking?.display).toBe("omitted");
+		expect(result.errorMessage).toBeUndefined();
+		expect(result.stopReason).toBe("stop");
+		expect(result.content.find(block => block.type === "text")).toEqual({ type: "text", text: "answer" });
+	});
+
+	it("keeps a hidden-thinking block alive through the raw SSE transport", async () => {
+		const create = (() => ({
+			async asResponse() {
+				return new Response(createSilentThinkingSseBody({ thinkingMs: 50, pingEveryMs: 5 }), {
+					status: 200,
+					headers: { "content-type": "text/event-stream", "request-id": "req_raw_silent" },
+				});
+			},
+		})) as unknown as Anthropic["messages"]["create"];
+
+		const result = await streamAnthropic(model, context, {
+			client: { messages: { create } } as Anthropic,
+			thinkingEnabled: true,
+			thinkingDisplay: "omitted",
+			streamFirstEventTimeoutMs: 5000,
+			streamIdleTimeoutMs: 25,
+			streamMaxRetries: 0,
+		}).result();
+
+		expect(result.errorMessage).toBeUndefined();
+		expect(result.stopReason).toBe("stop");
+		expect(result.content.find(block => block.type === "text")).toEqual({ type: "text", text: "answer" });
+	});
+
+	it("still stalls a hidden-thinking block that pings past the silent-thinking ceiling", async () => {
+		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) =>
+			createSilentThinkingRequest({
+				thinkingMs: Number.POSITIVE_INFINITY,
+				pingEveryMs: 1,
+				signal: requestOptions?.signal,
+			}) as never) as unknown as Anthropic["messages"]["create"];
+
+		const startedAt = Date.now();
+		const result = await streamAnthropic(model, context, {
+			client: { messages: { create } } as Anthropic,
+			thinkingEnabled: true,
+			thinkingDisplay: "omitted",
+			streamFirstEventTimeoutMs: 5000,
+			streamIdleTimeoutMs: 25,
+			streamMaxRetries: 0,
+		}).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("Anthropic stream stalled while waiting for the next event");
+		// Three 25ms windows of keepalive credit, then one more idle window.
+		expect(Date.now() - startedAt).toBeGreaterThanOrEqual(75);
+	});
+
+	it("does not credit pings to a summarized thinking block, which streams real deltas", async () => {
+		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) =>
+			createSilentThinkingRequest({
+				thinkingMs: Number.POSITIVE_INFINITY,
+				pingEveryMs: 1,
+				signal: requestOptions?.signal,
+			}) as never) as unknown as Anthropic["messages"]["create"];
+
+		const startedAt = Date.now();
+		const result = await streamAnthropic(model, context, {
+			client: { messages: { create } } as Anthropic,
+			thinkingEnabled: true,
+			streamFirstEventTimeoutMs: 5000,
+			streamIdleTimeoutMs: 25,
+			streamMaxRetries: 0,
+		}).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("Anthropic stream stalled while waiting for the next event");
+		expect(Date.now() - startedAt).toBeLessThan(75);
 	});
 
 	it("does not let pre-message_start pings rearm the first-event deadline", async () => {
