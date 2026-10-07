@@ -3854,9 +3854,19 @@ describe("whole-session persistence freshness", () => {
 		class ReplacementCloseStorage extends MemorySessionStorage {
 			readonly closeDispatches = new Map<string, number>();
 			#failures = new Map<string, number>();
+			#missingEmptyFiles = new Set<string>();
 
 			failNextClose(filePath: string): void {
 				this.#failures.set(filePath, 1);
+			}
+
+			treatMissingAsEmpty(filePath: string): void {
+				this.#missingEmptyFiles.add(filePath);
+			}
+
+			override readText(filePath: string): Promise<string> {
+				if (this.#missingEmptyFiles.has(filePath) && !this.existsSync(filePath)) return Promise.resolve("");
+				return super.readText(filePath);
 			}
 
 			override openWriter(filePath: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter {
@@ -3917,6 +3927,38 @@ describe("whole-session persistence freshness", () => {
 			expect(manager.getHeader()).toBeNull();
 		} finally {
 			await manager.close().catch(() => {});
+		}
+
+		const freshSourceFile = "/sessions/fresh-replacement-source.jsonl";
+		const freshTargetFile = "/sessions/fresh-replacement-target.jsonl";
+		storage.writeTextSync(
+			freshSourceFile,
+			`${JSON.stringify({ type: "session", version: 5, id: "fresh-replacement-source", timestamp: "0", cwd: "/cwd" })}\n`,
+		);
+		storage.treatMissingAsEmpty(freshTargetFile);
+		storage.failNextClose(freshSourceFile);
+		storage.failNextClose(freshTargetFile);
+		const freshManager = await SessionManager.open(
+			freshSourceFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"off",
+		);
+		try {
+			freshManager.appendCustomEntry("fresh-source-entry", { value: 1 });
+			await freshManager.flush();
+			await expect(freshManager.setSessionFile(freshTargetFile)).rejects.toThrow("writer_close_error_x");
+			await expect(freshManager.setSessionFile(freshTargetFile)).resolves.toBeUndefined();
+			expect(storage.closeDispatches.get(freshSourceFile)).toBe(2);
+			freshManager.appendCustomEntry("fresh-target-entry", { value: 2 });
+			await freshManager.flush();
+
+			await expect(freshManager.close()).rejects.toThrow("writer_close_error_y");
+			await expect(freshManager.close()).resolves.toBeUndefined();
+			expect(storage.closeDispatches.get(freshTargetFile)).toBe(2);
+		} finally {
+			await freshManager.close().catch(() => {});
 		}
 	});
 	it("reprepares queued patches when a direct append invalidates their persistence token", async () => {
