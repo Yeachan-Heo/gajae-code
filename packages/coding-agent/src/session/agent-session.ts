@@ -7333,18 +7333,6 @@ export class AgentSession {
 		// have unwound. Subscribers treat this event as the ready signal; flushing it
 		// from abort while either barrier is active permits a successor to race the
 		// prior prompt's cleanup.
-		const sdkTerminal =
-			event.type === "agent_end" && attemptScope !== undefined && this.#sdkRunTokensByAttemptScope.has(attemptScope);
-		if (
-			event.type === "agent_end" &&
-			sdkTerminal &&
-			this.#pendingAgentEndContinuationHolds.size === 0 &&
-			this.#pendingAgentEndEmit === undefined
-		) {
-			if (eventLease) this.#deferredAgentEndLeases.set(event, eventLease);
-			this.#startAgentEndPublication(event, eventLease);
-			return;
-		}
 		if (event.type === "agent_end" && (this.#livePromptsInFlight() > 0 || this.#agentEventHandlersInFlight > 0)) {
 			this.#pendingAgentEndEmit = event;
 			return;
@@ -8510,8 +8498,8 @@ export class AgentSession {
 		predecessorAgentEndHold?: symbol;
 		/** Internal predecessor terminal event sequestered while waiting behind selection. */
 		deferredPredecessorAgentEnd?: AgentSessionEvent;
-		/** Internal causal SDK owner captured when this continuation was scheduled. */
-		sdkOwnership?: SdkContinuationOwnership;
+		/** Internal SDK run owner carried into this continuation. */
+		sdkRunToken?: string;
 		/** Disable managed fallback retries for this continuation (used for terminal server-initiated turns). */
 		disableManagedFallback?: boolean;
 	}): Promise<void> {

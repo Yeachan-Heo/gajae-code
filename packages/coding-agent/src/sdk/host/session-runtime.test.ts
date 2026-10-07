@@ -5428,6 +5428,35 @@ function typedContextOverflowStream(model: Model, onEmitted?: () => void): Assis
 	return stream;
 }
 
+function typedServerErrorStream(model: Model): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorMessage: "Provider server error",
+			errorStatus: 503,
+			transportFailure: { kind: "transport", status: 503 },
+			timestamp: Date.now(),
+		};
+		stream.push({ type: "start", partial: message });
+		stream.push({ type: "error", reason: "error", error: message });
+	});
+	return stream;
+}
+
 function selector(model: Model): string {
 	return `${model.provider}/${model.id}`;
 }
@@ -5558,6 +5587,82 @@ describe("post-acceptance invocation terminalization", () => {
 			});
 			expect(providerCalls).toBe(2);
 		} finally {
+			await session?.dispose();
+			authStorage?.close();
+			await harness?.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("keeps an SDK prompt in flight until its retry publishes the final terminal", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-retry-final-terminal-"));
+		let harness: InvocationHarness | undefined;
+		let session: AgentSession | undefined;
+		let authStorage: AuthStorage | undefined;
+		let providerCalls = 0;
+		const retryEntered = Promise.withResolvers<void>();
+		const releaseRetry = Promise.withResolvers<void>();
+		const recoveredAttempt = createMockModel({ responses: [{ content: ["recovered"] }] });
+		try {
+			const real = await createTerminalizationSession(
+				cwd,
+				async (model, context, options) => {
+					providerCalls++;
+					if (providerCalls === 1) return typedServerErrorStream(model);
+					retryEntered.resolve();
+					await releaseRetry.promise;
+					return recoveredAttempt.stream(model, context, options);
+				},
+				{ "retry.enabled": true, "retry.maxRetries": 1, "retry.baseDelayMs": 1 },
+			);
+			session = real.session;
+			authStorage = real.authStorage;
+			session.setConfiguredModelChain("default", [selector(real.model)], "test");
+			harness = await invocationHarness("sdk-retry-final-terminal", cwd, {
+				isIdle: () => !session?.isStreaming,
+				sendUserMessage: deferredRealSendUserMessage(session),
+			});
+			session.subscribe(async event => {
+				await harness?.emit(event.type, event);
+			});
+			const accepted = await harness.control("turn.prompt", { text: "recover after a provider overload" });
+			expect(accepted.ok).toBe(true);
+			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+
+			let duringRetry = await harness.query("turn.prompt_status", correlation);
+			const retryDeadline = Date.now() + 10_000;
+			while (
+				providerCalls < 2 &&
+				duringRetry.result?.status !== "failed" &&
+				duringRetry.result?.status !== "terminal_ok" &&
+				Date.now() < retryDeadline
+			) {
+				await Bun.sleep(10);
+				duringRetry = await harness.query("turn.prompt_status", correlation);
+			}
+			expect(providerCalls).toBeGreaterThanOrEqual(2);
+			await retryEntered.promise;
+			expect(duringRetry.result?.status).not.toBe("failed");
+			expect(duringRetry.result?.status).not.toBe("terminal_ok");
+			const correlatedEnds = () =>
+				harness?.broadcasts.filter(
+					frame =>
+						frame.kind === "agent_end" &&
+						(frame.payload as { commandId?: string } | undefined)?.commandId === correlation.commandId,
+				) ?? [];
+			expect(correlatedEnds()).toHaveLength(0);
+
+			releaseRetry.resolve();
+			const terminal = await settledStatus(harness, "turn.result", { kind: "prompt", ...correlation });
+			expect(terminal).toMatchObject({
+				status: "terminal_ok",
+				commandId: correlation.commandId,
+				turnId: correlation.turnId,
+			});
+			expect(correlatedEnds()).toHaveLength(1);
+			expect(providerCalls).toBeGreaterThanOrEqual(2);
+		} finally {
+			releaseRetry.resolve();
 			await session?.dispose();
 			authStorage?.close();
 			await harness?.stop();
