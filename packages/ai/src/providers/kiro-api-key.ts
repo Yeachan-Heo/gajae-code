@@ -19,6 +19,7 @@ import { Effort } from "../model-thinking";
 import type {
 	Api,
 	AssistantMessage,
+	AssistantMessageEvent,
 	Context,
 	Model,
 	StreamFunction,
@@ -807,6 +808,11 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 		let toolComplete = false; // Track whether the current tool has been completed (has stop flag)
 		let toolcallIndex: number | undefined;
 		const pendingToolCalls: Array<{ input: string; toolCall: ToolCall; index: number }> = [];
+		const pendingTextEvents: AssistantMessageEvent[] = [];
+		const flushPendingTextEvents = () => {
+			for (const event of pendingTextEvents) stream.push(event);
+			pendingTextEvents.length = 0;
+		};
 
 		try {
 			// Use validated identity snapshot from trust check if available (no second read of getters),
@@ -956,8 +962,8 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 					// thinkingAccumulated is non-empty means we've seen thinking in this or prior content events.
 					// We don't know yet if more thinking will come, so defer text_start until stream end.
 					if (thinkingAccumulated.length === 0) {
-						// No thinking yet; safe to emit text_start now
-						stream.push({ type: "text_start", contentIndex: textIndex, partial: output });
+						// Hold text until the response confirms it was not refused.
+						pendingTextEvents.push({ type: "text_start", contentIndex: textIndex, partial: output });
 					} else {
 						// Thinking exists; defer text_start until we know thinking position
 						textStartDeferred = true;
@@ -965,9 +971,9 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				}
 				const block = blocks[textIndex] as TextContent;
 				block.text += delta;
-				// Only emit text_delta if text_start was already emitted
+				// Only queue text_delta if text_start was already queued
 				if (!textStartDeferred) {
-					stream.push({ type: "text_delta", contentIndex: textIndex, delta, partial: output });
+					pendingTextEvents.push({ type: "text_delta", contentIndex: textIndex, delta, partial: output });
 				}
 			};
 
@@ -976,9 +982,9 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				if (textStartDeferred && textIndex !== undefined && textIndex < blocks.length) {
 					const block = blocks[textIndex];
 					if (block && block.type === "text") {
-						stream.push({ type: "text_start", contentIndex: textIndex, partial: output });
+						pendingTextEvents.push({ type: "text_start", contentIndex: textIndex, partial: output });
 						if (block.text.length > 0) {
-							stream.push({
+							pendingTextEvents.push({
 								type: "text_delta",
 								contentIndex: textIndex,
 								delta: block.text,
@@ -994,7 +1000,12 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			const closeTextBlock = () => {
 				if (textIndex !== undefined) {
 					const block = blocks[textIndex] as TextContent;
-					stream.push({ type: "text_end", contentIndex: textIndex, content: block.text, partial: output });
+					pendingTextEvents.push({
+						type: "text_end",
+						contentIndex: textIndex,
+						content: block.text,
+						partial: output,
+					});
 					textIndex = undefined;
 				}
 			};
@@ -1039,9 +1050,8 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				if (!thinkingAccumulated) return;
 				if (thinkingIndex === undefined) {
 					if (textIndex !== undefined && !textStartDeferred) {
-						// Text_start has already been emitted (not deferred) with contentIndex.
-						// Do NOT insert thinking before text (would change text's index).
-						// Append thinking after all emitted blocks.
+						// Text precedes thinking in the block order, so preserve that event order.
+						flushPendingTextEvents();
 						thinkingIndex = blocks.length;
 						blocks.push({
 							type: "thinking",
@@ -1085,7 +1095,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				}
 			};
 
-			// Process events incrementally as they arrive (streaming, no full-response buffering)
+			// Parse events incrementally, but defer text events until a refusal can no longer arrive.
 			while (true) {
 				const { done, value } = await reader.read();
 				if (done) break;
@@ -1111,11 +1121,11 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 								firstTokenTime = Date.now();
 							}
 							if (currentTool && currentTool.id !== event.data.toolUseId) {
-						// Only emit previous tool if it was completed
-						if (toolComplete) addToolToBlocks();
-						currentTool = undefined; // Clear the incomplete tool
-						toolComplete = false; // Reset for new tool
-					}
+								// Only emit previous tool if it was completed
+								if (toolComplete) addToolToBlocks();
+								currentTool = undefined; // Clear the incomplete tool
+								toolComplete = false; // Reset for new tool
+							}
 							if (!currentTool) {
 								currentTool = { id: event.data.toolUseId, name: event.data.name, input: event.data.input };
 								toolComplete = false; // New tool starts as incomplete
@@ -1158,6 +1168,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 							output.stopReason = "error";
 							output.errorMessage = sanitizeKiroError(explanation ? `${label}: ${explanation}` : label, apiKey);
 							output.content = [];
+							pendingTextEvents.length = 0;
 
 							// Mint provider safety stop
 							// Do not pass options.fetch as callerTransport: the refusal came from the
@@ -1187,6 +1198,8 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 							return;
 						}
 					} else if (event.type === "error") {
+						if (hasTerminalEvent) continue;
+						flushPendingTextEvents();
 						// On ordinary errors, flush pending COMPLETED tool events before the error terminal
 						// (refusals drop them, incomplete tools must not be emitted)
 						// Only emit the tool if it was explicitly completed (has stop flag)
@@ -1210,9 +1223,11 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			if (currentTool) addToolToBlocks();
 			emitThinking();
 			emitDeferredTextEvents();
+			flushPendingTextEvents();
 			// Now emit all tool call events in order (safe since no refusal occurred)
 			emitPendingToolCalls();
 			closeTextBlock();
+			flushPendingTextEvents();
 			const hasText = blocks.some(b => b.type === "text" && b.text.length > 0);
 			const hasTools = blocks.some(b => b.type === "toolCall");
 			if (!hasText && !hasTools) {
@@ -1247,6 +1262,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			// before the error terminal (same semantics as the ordinary-error flush in the event loop).
 			// Incomplete currentTool is NOT finalized/emitted (only completed tools in pendingToolCalls flush).
 			// Refusals drop them via clearPendingToolCalls, but ordinary errors preserve content consistency.
+			flushPendingTextEvents();
 
 			// Emit all pending tool call events (inline of emitPendingToolCalls logic)
 			for (const { input, toolCall, index } of pendingToolCalls) {
