@@ -908,12 +908,12 @@ export async function scanSkillsFromDir(
 			const pinExternalTarget = !isWithinRoot(skillPath) && allowOutsideRoot;
 			const fileLink = linkIdentities.find(identity => identity.path === candidatePath);
 			const parentLink = linkIdentities.find(identity => identity.path === path.dirname(candidatePath));
-			const capturedLinkTargetPath =
-				fileLink?.target.kind === "file"
-					? fileLink.target.realPath
-					: parentLink?.target.kind === "directory"
-						? path.join(parentLink.target.realPath, path.basename(candidatePath))
-						: undefined;
+			let capturedLinkTargetPath: string | undefined;
+			if (fileLink?.target.kind === "file") {
+				capturedLinkTargetPath = fileLink.target.realPath;
+			} else if (parentLink?.target.kind === "directory") {
+				capturedLinkTargetPath = path.join(parentLink.target.realPath, path.basename(candidatePath));
+			}
 			if (
 				pinExternalTarget &&
 				(!capturedLinkTargetPath ||
