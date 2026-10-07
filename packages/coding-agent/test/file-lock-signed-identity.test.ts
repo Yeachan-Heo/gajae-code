@@ -36,7 +36,15 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 	await Bun.write(path.join(lock, "info"), JSON.stringify({ pid: DEAD_PID, timestamp: 1000 }));
 	let nativeIdentityChanged = false;
 	const realLstat = fs.lstat;
-	const normalizePath = (p: string): string => path.normalize(p).toLowerCase();
+	// Windows realpath may add an extended-length prefix absent from fixture paths.
+	const normalizePath = (p: string): string => {
+		const normalized = path.normalize(p).toLowerCase();
+		const extendedUncPrefix = "\\\\?\\unc\\";
+		const extendedPathPrefix = "\\\\?\\";
+		if (normalized.startsWith(extendedUncPrefix)) return `\\\\${normalized.slice(extendedUncPrefix.length)}`;
+		return normalized.startsWith(extendedPathPrefix) ? normalized.slice(extendedPathPrefix.length) : normalized;
+	};
+	expect(normalizePath(`\\\\?\\${lock}`)).toBe(normalizePath(lock));
 	const transformStat = (target: string, stat: BigIntStats): BigIntStats => {
 		const normalized = normalizePath(target);
 		const isRoot =
