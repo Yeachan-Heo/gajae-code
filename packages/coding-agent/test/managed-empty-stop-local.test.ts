@@ -107,8 +107,11 @@ test.each([
 			scenario === "nonzero-usage" || failed ? [] : [{ type: "text", text: "fallback-ok" }],
 		);
 	} finally {
-		await session?.dispose();
-		auth.close();
-		server.stop(true);
+		try {
+			await session?.dispose();
+		} finally {
+			auth.close();
+			server.stop(true);
+		}
 	}
 }, 15_000);
