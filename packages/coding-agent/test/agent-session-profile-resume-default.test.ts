@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
 import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
@@ -96,10 +96,10 @@ describe("AgentSession profile resume defaults", () => {
 		expect(session.getUnavailableModelProfile()).toBeUndefined();
 
 		session.setUnavailableModelProfile("stale-profile");
-		const revision = session.getDefaultModelSelectionMutationRevision();
+		const revision = session.getUserModelSelectionRevision();
 		await session.setModel(base);
 		expect(session.getUnavailableModelProfile()).toBeUndefined();
-		expect(session.getDefaultModelSelectionMutationRevision()).toBeGreaterThan(revision);
+		expect(session.getUserModelSelectionRevision()).toBeGreaterThan(revision);
 	});
 
 	it("preserves an unavailable-profile marker when the active profile is reset", () => {
@@ -121,6 +121,33 @@ describe("AgentSession profile resume defaults", () => {
 		await session.setModelTemporary(base, ThinkingLevel.High, { cause: "startup-override" });
 
 		expect(session.getUnavailableModelProfile()).toBe("unavailable-profile");
+	});
+
+	it("cancels a guarded profile model change after a newer user selection", async () => {
+		const { base, profileMain } = resolveModels();
+		session = makeSession(base);
+		const apiKey = Promise.withResolvers<string | undefined>();
+		const getApiKey = spyOn(modelRegistry, "getApiKey").mockImplementation(() => apiKey.promise);
+		let selectionIsCurrent = true;
+		let mutationStarted = false;
+
+		try {
+			const activation = session.setModelTemporary(profileMain, undefined, {
+				cause: "profile-activation",
+				shouldMutate: () => selectionIsCurrent,
+				onMutationStarted: () => {
+					mutationStarted = true;
+				},
+			});
+			selectionIsCurrent = false;
+			apiKey.resolve("test-key");
+			await activation;
+
+			expect(session.model).toEqual(base);
+			expect(mutationStarted).toBe(false);
+		} finally {
+			getApiKey.mockRestore();
+		}
 	});
 
 	it("keeps a transient switch as role=temporary so resume does not adopt it", async () => {
