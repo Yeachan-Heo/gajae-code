@@ -1914,7 +1914,7 @@ export default class Sdk extends Command {
 					Number.isSafeInteger(testWatchdogMs) && testWatchdogMs > 0 && testWatchdogMs <= remainingMs
 						? testWatchdogMs
 						: remainingMs;
-				const startupDeadline = performance.now() + watchdogMs;
+				const startupCheckpointDeadline = performance.now() + watchdogMs - 1_000;
 				const startupWatchdog = setTimeout(() => {
 					startupAbortController.abort();
 					void exitDuringStartup("startup-deadline", 1, null, watchdogMs).then(async started => {
@@ -2012,7 +2012,7 @@ export default class Sdk extends Command {
 					const candidate = new Broker({
 						agentDir,
 						startupAbortSignal: startupAbortController.signal,
-						startupDeadline,
+						startupCheckpointDeadline,
 						onStartupReady: () => clearTimeout(startupWatchdog),
 						masterOrphanGraceMs: (await Settings.loadForScope({ cwd: process.cwd(), agentDir })).get(
 							"sdk.masterOrphanGraceMs",
