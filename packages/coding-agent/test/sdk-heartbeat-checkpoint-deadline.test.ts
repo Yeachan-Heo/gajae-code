@@ -229,7 +229,7 @@ test("Broker.start passes its shorter deadline and publishes after a skipped che
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-checkpoint-startup-"));
 	roots.push(root);
 	const deadline = performance.now() - 1;
-	const broker = new Broker({ agentDir: root, startupCheckpointDeadline: deadline });
+	const broker = new Broker({ agentDir: root, port: 0, startupCheckpointDeadline: deadline });
 	const checkpoint = vi.spyOn(broker.index, "checkpointLiveHeartbeats");
 	try {
 		const discovery = await broker.start();
