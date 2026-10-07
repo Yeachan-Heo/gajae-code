@@ -100,6 +100,8 @@ export interface SdkClientOptions {
 
 export interface SdkRequestOptions {
 	timeoutMs?: number;
+	/** Absolute wall-clock deadline for this request, including connection setup. */
+	deadline?: number;
 	idempotencyKey?: string;
 	confirm?: boolean;
 	/**
@@ -496,6 +498,14 @@ export class SdkClient {
 			if (options.connectedOnly && error instanceof SdkClientError) throw new SdkPreparedDispatchError(error);
 			throw error;
 		}
+		const requestDeadline =
+			typeof options.deadline === "number" && Number.isFinite(options.deadline)
+				? Math.min(options.deadline, this.#deadline ?? Number.POSITIVE_INFINITY)
+				: this.#deadline;
+		if (requestDeadline !== undefined && Date.now() >= requestDeadline) {
+			const error = this.#deadlineError();
+			throw options.connectedOnly ? new SdkPreparedDispatchError(error) : error;
+		}
 		let incarnation: Incarnation;
 		if (options.connectedOnly) {
 			try {
@@ -504,8 +514,8 @@ export class SdkClient {
 				if (error instanceof SdkClientError) throw new SdkPreparedDispatchError(error);
 				throw error;
 			}
-		} else incarnation = await this.#connect();
-		const timeoutMs = this.#remainingTimeout(options.timeoutMs ?? this.#timeoutMs);
+		} else incarnation = await this.#connect(requestDeadline);
+		const timeoutMs = this.#remainingTimeout(options.timeoutMs ?? this.#timeoutMs, requestDeadline);
 		if (timeoutMs <= 0) {
 			const error = this.#deadlineError();
 			throw options.connectedOnly ? new SdkPreparedDispatchError(error) : error;
@@ -615,7 +625,7 @@ export class SdkClient {
 				);
 			return await deferred.promise;
 		}
-		if (this.#deadline !== undefined && Date.now() >= this.#deadline) {
+		if (requestDeadline !== undefined && Date.now() >= requestDeadline) {
 			const error = this.#deadlineError();
 			this.#settlePending(id, pending, options.connectedOnly ? new SdkPreparedDispatchError(error) : error);
 			return await deferred.promise;
@@ -686,17 +696,18 @@ export class SdkClient {
 		return transportError("timeout", "SDK client deadline elapsed.", undefined, reconnect);
 	}
 
-	#remainingTimeout(limit = this.#timeoutMs): number {
-		if (this.#deadline === undefined) return limit;
-		return Math.min(limit, Math.max(0, this.#deadline - Date.now()));
+	#remainingTimeout(limit = this.#timeoutMs, deadline = this.#deadline): number {
+		if (deadline === undefined) return limit;
+		return Math.min(limit, Math.max(0, deadline - Date.now()));
 	}
 
 	#throwIfDeadlineElapsed(): void {
 		if (this.#deadline !== undefined && Date.now() >= this.#deadline) throw this.#deadlineError();
 	}
 
-	async #connect(): Promise<Incarnation> {
+	async #connect(requestDeadline?: number): Promise<Incarnation> {
 		this.#throwIfDeadlineElapsed();
+		if (requestDeadline !== undefined && Date.now() >= requestDeadline) throw this.#deadlineError();
 		const current = this.#currentSocketRecord;
 		if (current && this.#isActive(current) && current.socket.readyState === WebSocket.OPEN) return current;
 		if (current)
@@ -708,7 +719,16 @@ export class SdkClient {
 			this.#opening = cycle;
 			cycle.promise = this.#openWithRetry(cycle);
 		}
-		return await cycle.promise!;
+		if (requestDeadline === undefined) return await cycle.promise!;
+		const remaining = requestDeadline - Date.now();
+		if (remaining <= 0) throw this.#deadlineError();
+		const expired = Promise.withResolvers<never>();
+		const timer = setTimeout(() => expired.reject(this.#deadlineError()), remaining);
+		try {
+			return await Promise.race([cycle.promise!, expired.promise]);
+		} finally {
+			clearTimeout(timer);
+		}
 	}
 
 	#requireConnectedIncarnation(): Incarnation {

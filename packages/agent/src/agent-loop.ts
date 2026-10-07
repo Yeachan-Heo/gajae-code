@@ -731,7 +731,7 @@ function managedContextOverflow(message: AssistantMessage, config: AgentLoopConf
 	return classifyContextOverflow(message, transportFailure, config.model.contextWindow);
 }
 
-/** Managed fallback owns retry policy; only attached typed transport facts may discard an attempt. */
+/** Managed fallback owns retry policy; typed transport facts or runtime-promoted empty stops authorize discard. */
 function managedPropertyRead(value: unknown, key: string): { ok: boolean; value: unknown } {
 	if (!value || typeof value !== "object") return { ok: true, value: undefined };
 	try {
@@ -769,6 +769,11 @@ function managedTransportFailure(failure: unknown) {
 	return facts && typeof facts === "object" ? transportFailureFacts(facts) : undefined;
 }
 
+function managedAssistantMessageHasContent(failure: unknown): boolean {
+	const content = managedProperty(failure, "content");
+	return Array.isArray(content) && content.length > 0;
+}
+
 // AI owns provider-originated authority. The agent loop owns authority for
 // the rebuilt message objects it creates; this second WeakSet is deliberately
 // module-private so a public AI consumer cannot transfer authority to an
@@ -784,7 +789,7 @@ function isManagedProviderSafetyStopAuthenticated(value: unknown): boolean {
 	);
 }
 
-function managedRetryableFailure(failure: unknown): boolean {
+function managedRetryableFailure(failure: unknown, transaction?: ManagedAttemptTransaction): boolean {
 	if (
 		managedProperty(failure, "stopReason") === "error" &&
 		managedProperty(failure, "errorKind") === "local_empty_response"
@@ -793,18 +798,16 @@ function managedRetryableFailure(failure: unknown): boolean {
 	}
 	const facts = managedTransportFailure(failure);
 	if (!facts) return false;
-	// OpenAI's typed statusless capacity-overload code (issue #5018) never
-	// becomes managed transaction authority. Before the code survived as
-	// transport facts this failure produced none, so the staged attempt was
-	// always committed; the shared Responses parser and Codex events now carry
-	// it, and this check preserves that committed-failure behavior instead of
-	// discarding the transaction. It reads only typed facts, never error text.
+	// OpenAI's typed statusless capacity-overload code (issue #5018) is
+	// discardable only while the current managed attempt has no observable
+	// output. The session owns the retry decision; this check only protects
+	// the transaction boundary and reads typed facts, never error text.
 	if (
 		facts.status === undefined &&
 		facts.providerCode === SERVER_OVERLOADED_PROVIDER_CODE &&
 		(facts.openaiErrorCode === undefined || facts.openaiErrorCode === SERVER_OVERLOADED_PROVIDER_CODE)
 	) {
-		return false;
+		return !(transaction?.hasObservableAssistantOutput() ?? managedAssistantMessageHasContent(failure));
 	}
 	// A typed provider safety stop is terminal evidence ahead of any transport
 	// class, but only with adapter-minted provenance: unauthenticated labels
@@ -2946,6 +2949,27 @@ class ManagedAttemptTransaction {
 			}
 		}
 		return snapshot;
+	}
+
+	hasObservableAssistantOutput(): boolean {
+		return this.#batch.some(item => {
+			if (item.type === "assistant_event") {
+				const event = item.event;
+				if (
+					event.type === "text_delta" ||
+					event.type === "thinking_delta" ||
+					event.type === "reasoning_summary_delta" ||
+					event.type === "text_end" ||
+					event.type === "thinking_end" ||
+					event.type === "reasoning_summary_end"
+				) {
+					if (event.type === "text_end" || event.type === "thinking_end" || event.type === "reasoning_summary_end")
+						return event.content.length > 0;
+					return event.delta.length > 0;
+				}
+			}
+			return false;
+		});
 	}
 
 	discard(): void {

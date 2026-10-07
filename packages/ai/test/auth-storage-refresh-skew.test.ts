@@ -181,7 +181,8 @@ describe("AuthStorage OAuth refresh skew", () => {
 		const currentEvidence = commandStorage.getProviderEvidenceGeneration("xai");
 
 		firstResolution.resolve("old-command-key");
-		await expect(first).resolves.toBe("old-command-key");
+		// A retired configuration generation must neither return its key nor invalidate current evidence.
+		await expect(first).resolves.toBeUndefined();
 		expect(commandStorage.getProviderEvidenceGeneration("xai")).toBe(currentEvidence);
 	});
 	test("matches command credentials with their resolution scope", async () => {
