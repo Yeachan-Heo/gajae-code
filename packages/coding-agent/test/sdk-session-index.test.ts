@@ -1900,7 +1900,7 @@ describe("SDK session index", () => {
 			spy.mockRestore();
 		}
 	});
-	it("refreshIfChanged waits for queued local writes before accepting an unchanged stamp", async () => {
+	it("locked refresh waits for queued local writes before reconciling authority", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-poll-queued-write-"));
 		const writer = new SessionIndex(dir);
 		await writer.append(event("first"));
@@ -1932,14 +1932,14 @@ describe("SDK session index", () => {
 		try {
 			await lockEntered.promise;
 			trackStampReads = true;
-			const refresh = reader.refreshIfChanged();
-			// The fast path must observe the in-process operation queue first; otherwise
-			// its pre-lock stamp check can return while this append is still pending.
+			const refresh = reader.refresh();
+			// Authority consumers must serialize behind pending writes even when the
+			// last completed filesystem stamp is unchanged.
 			expect(stampReads).toBe(0);
 
 			releaseLock.resolve();
 			await append;
-			expect(await refresh).toBe(true);
+			await refresh;
 			expect(reader.listSessions().sessions).toEqual(
 				expect.arrayContaining([
 					expect.objectContaining({ sessionId: "first" }),
