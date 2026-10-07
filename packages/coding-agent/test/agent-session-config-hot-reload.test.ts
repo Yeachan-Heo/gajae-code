@@ -527,6 +527,75 @@ describe("AgentSession configuration reload", () => {
 		expect(modelRegistry!.getModelProfile("active-profile")?.name).toBe("active-profile");
 	});
 
+	it("preserves a newer temporary model selection while applying the active profile reload", async () => {
+		const apiKeyEnv = "GJC_TEST_RELOAD_USER_SELECTION_KEY";
+		const restoreEnvironment = unsetEnvironmentVariables(apiKeyEnv);
+		Bun.env[apiKeyEnv] = "reload-selection-test-key";
+		const releasePublicationFence = Promise.withResolvers<void>();
+		let publicationFenceEntered = false;
+		let restorePublicationFence: (() => void) | undefined;
+		try {
+			const { configPath, modelsPath } = await createSession({
+				modelId: "default-model",
+				additionalModelId: "manual-model",
+				withProfile: true,
+				apiKeyEnv,
+			});
+			session!.settings.set("modelRoles", { planner: `${provider}/manual-model` });
+			await session!.settings.flushOrThrow();
+			await session!.activateModelProfileForControl("active-profile");
+			expect(session!.getConfiguredModelChainState("default")).toMatchObject({
+				entries: [`${provider}/default-model`],
+				origin: "profile-activation",
+				identity: "active-profile",
+			});
+
+			const originalAcquirePublicationFence = modelRegistry!.acquirePublicationFence.bind(modelRegistry!);
+			const publicationFenceSpy = vi
+				.spyOn(modelRegistry!, "acquirePublicationFence")
+				.mockImplementation(async signal => {
+					publicationFenceEntered = true;
+					await releasePublicationFence.promise;
+					return await originalAcquirePublicationFence(signal);
+				});
+			restorePublicationFence = () => publicationFenceSpy.mockRestore();
+
+			const nextModels = modelsText({
+				modelId: "next-default-model",
+				additionalModelId: "manual-model",
+				name: "After",
+				baseUrl: "https://before.example/v1",
+				withProfile: true,
+				apiKeyEnv,
+			});
+			const staged = candidate(
+				20,
+				configPath,
+				modelsPath,
+				settingsText({ todoEnabled: false, compactionEnabled: false }),
+				nextModels,
+			);
+			const reload = session!.reloadConfiguration(staged, new AbortController().signal);
+			await waitFor(() => publicationFenceEntered);
+
+			const cycled = await session!.cycleRoleModels(["default", "planner"], { temporary: true });
+			expect(cycled?.model.id).toBe("manual-model");
+			releasePublicationFence.resolve();
+			await expect(reload).resolves.toMatchObject({ applied: true, modelsChanged: true });
+
+			expect(session!.model?.id).toBe("manual-model");
+			expect(session!.getConfiguredModelChainState("default")).toMatchObject({
+				entries: [`${provider}/next-default-model`],
+				origin: "profile-activation",
+				identity: "active-profile",
+			});
+		} finally {
+			releasePublicationFence.resolve();
+			restorePublicationFence?.();
+			restoreEnvironment();
+		}
+	});
+
 	it("keeps an expired refreshable OAuth provider eligible during a read-only reload preflight", async () => {
 		const oauthProvider = "anthropic";
 		const oauthModelId = "claude-sonnet-4-5";

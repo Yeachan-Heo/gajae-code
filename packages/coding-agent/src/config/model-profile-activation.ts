@@ -164,6 +164,7 @@ export interface ApplyModelProfileActivationOptions {
 	persistDefault?: boolean;
 	thinkingLevelOverride?: ThinkingLevel;
 	preserveDefaultModelSelection?: boolean;
+	preserveLiveModelSelection?: boolean;
 	deferRuntimePublication?: boolean;
 	signal?: AbortSignal;
 }
@@ -1403,6 +1404,23 @@ function selectorValuesEqual(left: ModelSelectorValue | undefined, right: ModelS
 	);
 }
 
+function restoreCanonicalVariantAfterPreparation(
+	modelRegistry: Partial<Pick<ModelRegistry, "restoreSessionCanonicalVariant" | "clearCanonicalVariant">>,
+	session: ModelProfileActivationSession,
+	previousCanonicalVariant: string | undefined,
+	previousUserSelection: UserCanonicalVariantSelection | undefined,
+): void {
+	const currentUserSelection = session.getUserCanonicalVariantSelection?.();
+	const userSelectionChanged =
+		previousUserSelection !== undefined &&
+		currentUserSelection !== undefined &&
+		currentUserSelection.revision !== previousUserSelection.revision;
+	restoreCanonicalVariant(
+		modelRegistry,
+		session.sessionId,
+		userSelectionChanged ? currentUserSelection.canonicalVariant : previousCanonicalVariant,
+	);
+}
 export async function prepareModelProfileActivation(
 	options: PrepareModelProfileActivationOptions,
 ): Promise<PreparedModelProfileActivation> {
@@ -1793,7 +1811,10 @@ function incompleteModelProfileRollbackError(
 /** Publish the prepared model selection and role layer without awaiting. */
 export function publishPreparedModelProfileActivation(
 	prepared: PreparedModelProfileActivation,
-	options: Pick<ApplyModelProfileActivationOptions, "preserveDefaultModelSelection"> = {},
+	options: Pick<
+		ApplyModelProfileActivationOptions,
+		"preserveDefaultModelSelection" | "preserveLiveModelSelection"
+	> = {},
 ): void {
 	if (!options.preserveDefaultModelSelection && prepared.preparedDefaultModelSelection) {
 		const ownedDefaultChain =
@@ -1817,6 +1838,12 @@ export function publishPreparedModelProfileActivation(
 				);
 			}
 		}
+	}
+	if (
+		!options.preserveDefaultModelSelection &&
+		!options.preserveLiveModelSelection &&
+		prepared.preparedDefaultModelSelection
+	) {
 		prepared.defaultModelPublished = true;
 		if (!prepared.session.commitPreparedProfileModelSelection) {
 			throw new Error("Session cannot commit a prepared profile model selection");
@@ -1901,9 +1928,16 @@ export async function applyPreparedModelProfileActivation(
 						prepared.defaultResolutionSkips,
 					);
 				}
+				activatedDefaultChainState = prepared.session.getConfiguredModelChainState?.("default");
+				activatedFallbackRuntimeState = prepared.session.getDefaultFallbackRuntimeState?.();
 			}
 		}
-		if (!options.deferRuntimePublication && !options.preserveDefaultModelSelection && prepared.defaultModel) {
+		if (
+			!options.deferRuntimePublication &&
+			!options.preserveDefaultModelSelection &&
+			!options.preserveLiveModelSelection &&
+			prepared.defaultModel
+		) {
 			activationStage = "model selection";
 			await prepared.session.setModelTemporary(
 				prepared.defaultModel,
@@ -1939,8 +1973,25 @@ export async function applyPreparedModelProfileActivation(
 			activationStage = "forward settings flush";
 			await prepared.settings.flushOrThrow();
 		}
-		if (!options.deferRuntimePublication) activationStage = "active profile marker";
-		if (!options.deferRuntimePublication && !options.preserveDefaultModelSelection && prepared.defaultModel) {
+		if (options.isCurrent && !options.isCurrent()) throw new ModelProfileActivationSupersededError();
+		if (!options.deferRuntimePublication) {
+			activationStage = "active profile marker";
+			prepared.session.setActiveModelProfile?.(prepared.profileName);
+			activationStage = "installed role tracking";
+			prepared.session.noteProfileInstalledOverrides?.(
+				Object.keys(prepared.modelRoles),
+				Object.keys(prepared.agentModelOverrides),
+				prepared.previousModel,
+				{ modelRoles: prepared.baseModelRoles, agentModelOverrides: prepared.baseAgentModelOverrides },
+				{ modelRoles: prepared.modelRoles, agentModelOverrides: prepared.agentModelOverrides },
+			);
+		}
+		if (
+			!options.deferRuntimePublication &&
+			!options.preserveDefaultModelSelection &&
+			!options.preserveLiveModelSelection &&
+			prepared.defaultModel
+		) {
 			activationStage = "canonical model variant";
 			prepared.modelRegistry.seedCanonicalVariant?.(prepared.session.sessionId, prepared.defaultModel);
 			resumeDefaultChanged = true;
@@ -2136,6 +2187,7 @@ export async function rollbackPreparedModelProfileActivation(
 			failures.push({ stage, error });
 		}
 	};
+	const selectionSuperseded = options.isCurrent?.() === false;
 
 	if (options.persistDefault) {
 		restore("restore persisted default profile", () =>
@@ -2189,7 +2241,12 @@ export async function rollbackPreparedModelProfileActivation(
 				),
 			);
 		}
-		if (prepared.defaultModelPublished && prepared.defaultModel) {
+		if (
+			!options.preserveLiveModelSelection &&
+			!selectionSuperseded &&
+			prepared.defaultModelPublished &&
+			prepared.defaultModel
+		) {
 			await restoreAsync("restore live model", async () => {
 				if (prepared.session.restoreModelSelectionForRollback) {
 					await prepared.session.restoreModelSelectionForRollback(
@@ -2217,19 +2274,22 @@ export async function rollbackPreparedModelProfileActivation(
 			);
 		}
 	}
-	restore("restore active profile", () =>
-		prepared.session.setActiveModelProfile?.(prepared.previousActiveModelProfile),
-	);
+	if (!selectionSuperseded) {
+		restore("restore active profile", () =>
+			prepared.session.setActiveModelProfile?.(prepared.previousActiveModelProfile),
+		);
+	}
 	if (prepared.previousProfileInstalledOverrideState) {
 		restore("restore installed role tracking", () =>
 			prepared.session.restoreProfileInstalledOverrideState?.(prepared.previousProfileInstalledOverrideState!),
 		);
 	}
 	restore("restore canonical model variant", () =>
-		restoreCanonicalVariant(
+		restoreCanonicalVariantAfterPreparation(
 			prepared.session.modelRegistry ?? prepared.modelRegistry,
-			prepared.session.sessionId,
+			prepared.session,
 			prepared.previousCanonicalVariant,
+			prepared.previousUserCanonicalVariantSelection,
 		),
 	);
 	if (options.persistDefault) {

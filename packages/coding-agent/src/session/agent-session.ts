@@ -18546,9 +18546,17 @@ export class AgentSession {
 		}
 	}
 
-	async reloadConfiguration(
+	reloadConfiguration(
 		candidate: ConfigHotReloadCandidate,
 		signal: AbortSignal,
+	): Promise<ConfigurationReloadResult> {
+		return this.#reloadConfiguration(candidate, signal, this.getUserModelSelectionRevision());
+	}
+
+	async #reloadConfiguration(
+		candidate: ConfigHotReloadCandidate,
+		signal: AbortSignal,
+		userModelSelectionRevision: number,
 	): Promise<ConfigurationReloadResult> {
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) throw new ConfigurationReloadError("SESSION_UNAVAILABLE");
@@ -18631,6 +18639,7 @@ export class AgentSession {
 					);
 					let prepared: PreparedModelProfileActivation | undefined;
 					let preparedLiveModelSelection: PreparedProfileModelSelection | undefined;
+					let preparedLiveModelSelectionRevision = userModelSelectionRevision;
 					let preserveDefaultModelSelection = true;
 					const activeProfile = this.getActiveModelProfile();
 					if (activeProfile) {
@@ -18651,6 +18660,7 @@ export class AgentSession {
 					if (preserveDefaultModelSelection && this.#currentModelConfigurationChanged(stagedModels.registry)) {
 						const updatedModel = this.#updatedCurrentModel(stagedModels.registry);
 						if (updatedModel) {
+							preparedLiveModelSelectionRevision = this.getUserModelSelectionRevision();
 							preparedLiveModelSelection = await this.prepareModelSelectionForProfileActivation(
 								updatedModel,
 								this.thinkingLevel,
@@ -18661,6 +18671,14 @@ export class AgentSession {
 					reloadSignal.throwIfAborted();
 					publicationFenceRelease = await this.#modelRegistry.acquirePublicationFence(reloadSignal);
 					reloadSignal.throwIfAborted();
+					const preserveLiveModelSelection =
+						this.getUserModelSelectionRevision() !== userModelSelectionRevision;
+					if (
+						preparedLiveModelSelection &&
+						this.getUserModelSelectionRevision() !== preparedLiveModelSelectionRevision
+					) {
+						preparedLiveModelSelection = undefined;
+					}
 					const modelsChanged = stagedModels.changed;
 					const settingsChanged = changedSettings.length > 0;
 					if (!settingsChanged && !modelsChanged) {
@@ -18679,7 +18697,10 @@ export class AgentSession {
 							stagedModels!.commit();
 							if (prepared) {
 								activationPublicationStarted = true;
-								publishPreparedModelProfileActivation(prepared, { preserveDefaultModelSelection });
+								publishPreparedModelProfileActivation(prepared, {
+									preserveDefaultModelSelection,
+									preserveLiveModelSelection,
+								});
 							}
 							if (preparedLiveModelSelection) {
 								liveModelSelectionCommitted = true;
@@ -18698,12 +18719,20 @@ export class AgentSession {
 						}
 						if (prepared && activationPublicationStarted) {
 							try {
-								await rollbackPreparedModelProfileActivation(prepared, { preserveDefaultModelSelection });
+								await rollbackPreparedModelProfileActivation(prepared, {
+									preserveDefaultModelSelection,
+									preserveLiveModelSelection,
+									isCurrent: () => this.getUserModelSelectionRevision() === userModelSelectionRevision,
+								});
 							} catch (rollbackError) {
 								rollbackErrors.push(rollbackError);
 							}
 						}
-						if (liveModelSelectionCommitted && preparedLiveModelSelection) {
+						if (
+							liveModelSelectionCommitted &&
+							preparedLiveModelSelection &&
+							this.getUserModelSelectionRevision() === preparedLiveModelSelectionRevision
+						) {
 							try {
 								await this.restoreModelSelectionForRollback(
 									preparedLiveModelSelection.previousModel,
@@ -18792,7 +18821,7 @@ export class AgentSession {
 		}
 		if (retryAfterSessionTransition) {
 			await this.#waitForSessionTransitionEnd(AbortSignal.any([signal, this.#disposeAbortController.signal]));
-			return await this.reloadConfiguration(candidate, signal);
+			return await this.#reloadConfiguration(candidate, signal, userModelSelectionRevision);
 		}
 		throw new Error("Configuration reload exited without a result or a session-transition retry.");
 	}

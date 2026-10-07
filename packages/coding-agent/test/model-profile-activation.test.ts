@@ -17,6 +17,7 @@ import {
 	resolveModelProfileDefaultChain,
 	restoreMaterializedModelProfileForDeletion,
 	rewriteSelectorForProxy,
+	rollbackPreparedModelProfileActivation,
 } from "../src/config/model-profile-activation";
 
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
@@ -240,6 +241,23 @@ describe("model profile activation", () => {
 			executor: "provider-b/executor",
 			architect: "provider-a/architect",
 		});
+	});
+
+	it("does not restore a captured model over a newer user selection during rollback", async () => {
+		const session = fakeSession();
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: fakeRegistry(),
+			settings: Settings.isolated(),
+			profileName: "profile-a",
+		});
+		const newerSelection = model("provider-c", "user-selection");
+		session.model = newerSelection;
+		prepared.defaultModelPublished = true;
+
+		await rollbackPreparedModelProfileActivation(prepared, { isCurrent: () => false });
+
+		expect(session.model).toBe(newerSelection);
 	});
 
 	test("skips profile preparation when the recovery fence is already stale", async () => {
