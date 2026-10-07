@@ -7,3 +7,4 @@
 
 ### Fixed
 - Align OpenAI remote compaction endpoint resolution with provider implementations: both now use URL parsing to identify default OpenAI base URLs, ignoring port differences. This ensures consistent routing when a proxy is captured and a custom-port model URL is configured (e.g., `https://api.openai.com:8443/v1`).
+- Classify model URLs before compaction path normalization so explicit slash-suffixed routes are not silently redirected to a captured proxy.

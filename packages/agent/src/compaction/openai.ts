@@ -97,10 +97,13 @@ function resolveOpenAiCompactEndpoint(
 
 	// Trusted sources only: the compaction endpoint carries the OpenAI credential.
 	const envBaseUrl = readEndpointConfiguration(endpointConfiguration, "OPENAI_BASE_URL");
-	const configuredBaseUrl = model.baseUrl?.trim().replace(/\/+$/, "");
+	const configuredBaseUrl = model.baseUrl?.trim();
+	const normalizedConfiguredBaseUrl = configuredBaseUrl?.replace(/\/+$/, "");
 	const isDefaultBaseUrl = !configuredBaseUrl || isDefaultOpenAIBaseUrl(configuredBaseUrl);
 	const rawBase =
-		envBaseUrl && isDefaultBaseUrl ? envBaseUrl : configuredBaseUrl || envBaseUrl || OPENAI_DEFAULT_BASE_URL;
+		envBaseUrl && isDefaultBaseUrl
+			? envBaseUrl
+			: normalizedConfiguredBaseUrl || envBaseUrl || OPENAI_DEFAULT_BASE_URL;
 	const normalizedBase = rawBase.endsWith("/") ? rawBase.slice(0, -1) : rawBase;
 	if (normalizedBase.endsWith("/v1")) return `${normalizedBase}/responses/compact`;
 	return `${normalizedBase}/v1/responses/compact`;
