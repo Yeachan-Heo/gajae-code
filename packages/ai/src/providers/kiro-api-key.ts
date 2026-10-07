@@ -815,6 +815,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			const decoder = new TextDecoder();
 			let buffer = "";
 			let lastContent = "";
+			let hasRefusalEncountered = false; // Track if refusal has been encountered in any batch
 			let thinkingIndex: number | undefined;
 			let textIndex: number | undefined;
 
@@ -889,23 +890,13 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				if (textIndex === undefined) {
 					textIndex = blocks.length;
 					blocks.push({ type: "text", text: "", index: textIndex });
-					// Defer text_start emission if thinking might come before text.
-					// thinkingAccumulated is non-empty means we've seen thinking in this or prior content events.
-					// We don't know yet if more thinking will come, so defer text_start until stream end.
-					if (thinkingAccumulated.length === 0) {
-						// No thinking yet; safe to emit text_start now
-						stream.push({ type: "text_start", contentIndex: textIndex, partial: output });
-					} else {
-						// Thinking exists; defer text_start until we know thinking position
-						textStartDeferred = true;
-					}
+					// ALWAYS defer text_start/delta to prevent content leakage if refusal comes in a later batch.
+					// Text events are only emitted at stream end after all batches are processed.
+					textStartDeferred = true;
 				}
 				const block = blocks[textIndex] as TextContent;
 				block.text += delta;
-				// Only emit text_delta if text_start was already emitted
-				if (!textStartDeferred) {
-					stream.push({ type: "text_delta", contentIndex: textIndex, delta, partial: output });
-				}
+				// Never emit text_delta immediately; always defer to prevent leakage across batches
 			};
 
 			// Emit deferred text events if text_start was not yet sent
@@ -1083,8 +1074,9 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 							stopDetails?: { refusal?: { category?: string; explanation?: string } };
 						};
 						if (refusalData.stopDetails?.refusal) {
+							hasRefusalEncountered = true; // Mark that refusal has been encountered
 							// Handle refusal: clear blocks and emit error (don't emit any text/tool that came before)
-							consumeContent(""); // Flush any pending thinking
+							consomeContent(""); // Flush any pending thinking
 							clearPendingToolCalls(); // DROP any pending tool call without emitting events
 
 							const refusal = refusalData.stopDetails.refusal;
