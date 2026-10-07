@@ -1,1 +1,3 @@
-Owned Windows child processes are now tracked through root exit, and teardown reports unresolved or unobservable process trees instead of treating root exit or a failed process snapshot as proof that every descendant stopped.
+### Fixed
+
+- Owned Windows child processes are now tracked through root exit, and teardown reports unresolved or unobservable process trees instead of treating root exit or a failed process snapshot as proof that every descendant stopped.
