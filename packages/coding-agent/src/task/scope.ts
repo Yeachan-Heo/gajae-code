@@ -13,6 +13,8 @@ export interface TaskScopeAuthority {
 	getTaskScopeIdentity?: () => TaskScopeIdentity;
 	getTaskScopeSettings?: () => Settings;
 	runWithTaskAdmission?<T>(admit: () => Promise<T>): Promise<T>;
+	/** Resolve the live artifact owner under a short cwd lease without reloading task settings. */
+	runWithTaskOwnerReadLease?<T>(resolve: () => Promise<T>): Promise<T>;
 }
 
 /** Retain execution inputs while leaving shared services and output allocation owned by the parent. */
@@ -67,6 +69,7 @@ export function snapshotTaskSession(
 		getTaskScopeIdentity: undefined,
 		getTaskScopeSettings: undefined,
 		runWithTaskAdmission: undefined,
+		runWithTaskOwnerReadLease: undefined,
 	};
 	return snapshot;
 }

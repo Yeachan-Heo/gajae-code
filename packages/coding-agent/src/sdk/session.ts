@@ -2937,6 +2937,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					await refreshTaskScopeSettings();
 					return admit();
 				}),
+			runWithTaskOwnerReadLease: resolve => sessionManager.runWithCwdReadLease(resolve),
 			hasUI: options.hasUI ?? false,
 			profileAuthority,
 			workflowGateEligible: true,

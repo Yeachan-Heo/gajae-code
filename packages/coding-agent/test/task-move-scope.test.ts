@@ -108,6 +108,7 @@ async function harness(isolated = false, persistent = false) {
 		contextFiles: [{ path: path.join(a, "AGENTS.md"), content: "Original A instructions" }],
 		getTaskScopeIdentity: () => ({ cwd: sessionManager.getCwd(), generation: sessionManager.getCwdGeneration() }),
 		runWithTaskAdmission: admit => sessionManager.runWithCwdReadLease(admit),
+		runWithTaskOwnerReadLease: resolve => sessionManager.runWithCwdReadLease(resolve),
 		getSessionFile: () => null,
 		getSessionId: () => sessionManager.getSessionId(),
 		getSessionSpawns: () => "*",
@@ -200,6 +201,40 @@ afterEach(async () => {
 });
 
 describe("task admission after trusted committed moves", () => {
+	it("rejects parent-disallowed batches before output IDs or jobs are allocated", async () => {
+		const h = await harness();
+		h.session.getSessionSpawns = () => "another-agent";
+		const tool = await TaskTool.create(h.session, { runSubprocess: complete });
+		const allocateBatch = vi.spyOn(h.allocator, "allocateBatch");
+		const register = vi.spyOn(h.jobs, "register");
+
+		const result = await start(tool, [task("DeniedByParent")]);
+
+		expect(text(result)).toContain("Cannot spawn 'scope-probe'. Allowed: none");
+		expect(allocateBatch).not.toHaveBeenCalled();
+		expect(register).not.toHaveBeenCalled();
+	});
+
+	it("rejects recursion-blocked batches before output IDs or jobs are allocated", async () => {
+		const h = await harness();
+		const previousBlockedAgent = process.env.GJC_BLOCKED_AGENT;
+		process.env.GJC_BLOCKED_AGENT = "scope-probe";
+		try {
+			const tool = await TaskTool.create(h.session, { runSubprocess: complete });
+			const allocateBatch = vi.spyOn(h.allocator, "allocateBatch");
+			const register = vi.spyOn(h.jobs, "register");
+
+			const result = await start(tool, [task("DeniedByRecursion")]);
+
+			expect(text(result)).toContain("recursion prevention");
+			expect(allocateBatch).not.toHaveBeenCalled();
+			expect(register).not.toHaveBeenCalled();
+		} finally {
+			if (previousBlockedAgent === undefined) delete process.env.GJC_BLOCKED_AGENT;
+			else process.env.GJC_BLOCKED_AGENT = previousBlockedAgent;
+		}
+	});
+
 	for (const state of ["eager", "unused-lazy", "discovery-only", "warmed"] as const) {
 		it(`executes B using a ${state} task facade and preserves the output allocator`, async () => {
 			const h = await harness();
@@ -660,9 +695,10 @@ describe("task admission after trusted committed moves", () => {
 		}
 	}, 30_000);
 
-	it("keeps queued output readable after a persistent explicit-destination session moves", async () => {
+	it("keeps queued output readable when an explicit-destination session moves and target settings cannot reload", async () => {
 		const h = await harness(false, true);
 		expect(h.sessionManager.isManagedDestination()).toBe(false);
+		h.sourceSettings.override("task.maxConcurrency", 1);
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
 		const seen: ExecutorOptions[] = [];
@@ -704,18 +740,23 @@ describe("task admission after trusted committed moves", () => {
 			const taskTool = session.getToolByName("task");
 			const readTool = session.getToolByName("read");
 			if (!taskTool || !readTool) throw new Error("Expected task and read tools");
+			const snapshotForCwd = vi.spyOn(h.sourceSettings, "snapshotForCwd").mockImplementation(async () => {
+				throw new Error("injected persistent target settings read failure");
+			});
 			const sourceArtifactsDir = h.sessionManager.getArtifactsDir();
 			expect(sourceArtifactsDir).not.toBeNull();
 			const started = await start(taskTool, [task("Running"), task("Queued")]);
 			expect(text(started)).toContain("background task");
 			await entered.promise;
 			await h.sessionManager.moveTo(h.b);
+			expect(snapshotForCwd).toHaveBeenCalledTimes(1);
 			release.resolve();
 			const jobs = AsyncJobManager.instance();
 			if (!jobs) throw new Error("Expected the SDK-owned async manager");
 			await jobs.waitForAll();
 			expect(jobs.getJob("0-Running")?.status).toBe("completed");
 			expect(jobs.getJob("1-Queued")?.status).toBe("completed");
+			expect(snapshotForCwd).toHaveBeenCalledTimes(1);
 			expect(seen.map(worker => worker.cwd)).toEqual([h.a, h.a]);
 			expect(seen[1]?.artifactsDir).not.toBe(sourceArtifactsDir);
 			const queuedOutput = await readTool.execute("read-queued-output", { path: "agent://1-Queued" });

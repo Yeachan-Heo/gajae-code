@@ -872,8 +872,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	async #resolveCurrentArtifactOwnerArtifacts(): Promise<TaskArtifacts> {
 		const artifactOwner = this.#artifactOwner ?? this;
 		const resolve = () => artifactOwner.#resolveEffectiveArtifactsDir();
-		return artifactOwner.session.runWithTaskAdmission
-			? artifactOwner.session.runWithTaskAdmission(resolve)
+		return artifactOwner.session.runWithTaskOwnerReadLease
+			? artifactOwner.session.runWithTaskOwnerReadLease(resolve)
 			: resolve();
 	}
 
@@ -933,6 +933,25 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		return (
 			this.session.getAsyncJobManager?.() ?? AsyncJobManager.forEndpoint(endpointId) ?? AsyncJobManager.instance()
 		);
+	}
+
+	#getSpawnAuthorizationError(agentName: string): string | undefined {
+		if (this.#blockedAgent && agentName === this.#blockedAgent) {
+			return `Cannot spawn ${this.#blockedAgent} agent from within itself (recursion prevention). Use a different agent type.`;
+		}
+
+		const parentSpawns = this.session.getSessionSpawns() ?? "*";
+		const allowedSpawns = parentSpawns.split(",").map(name => name.trim());
+		if (parentSpawns === "*" || (parentSpawns !== "" && allowedSpawns.includes(agentName))) return undefined;
+
+		const allowed =
+			parentSpawns === ""
+				? "none (spawns disabled for this agent)"
+				: filterVisibleAgents(this.#discoveredAgents)
+						.filter(candidate => allowedSpawns.includes(candidate.name))
+						.map(candidate => candidate.name)
+						.join(", ") || "none";
+		return `Cannot spawn '${agentName}'. Allowed: ${allowed}`;
 	}
 
 	async execute(
@@ -1041,6 +1060,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					},
 				],
 				details: { projectAgentsDir: null, results: [], totalDurationMs: 0 },
+			};
+		}
+
+		const spawnAuthorizationError = this.#getSpawnAuthorizationError(params.agent);
+		if (spawnAuthorizationError) {
+			return {
+				content: [{ type: "text", text: spawnAuthorizationError }],
+				details: { projectAgentsDir: this.projectAgentsDir, results: [], totalDurationMs: 0 },
 			};
 		}
 
@@ -2089,42 +2116,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		};
 
 		try {
-			// Check self-recursion prevention
-			if (this.#blockedAgent && agentName === this.#blockedAgent) {
+			const spawnAuthorizationError = this.#getSpawnAuthorizationError(agentName);
+			if (spawnAuthorizationError) {
 				return {
-					content: [
-						{
-							type: "text",
-							text: `Cannot spawn ${this.#blockedAgent} agent from within itself (recursion prevention). Use a different agent type.`,
-						},
-					],
-					details: {
-						projectAgentsDir,
-						results: [],
-						totalDurationMs: Date.now() - startTime,
-					},
-				};
-			}
-
-			// Check spawn restrictions from parent
-			const parentSpawns = this.session.getSessionSpawns() ?? "*";
-			const allowedSpawns = parentSpawns.split(",").map(s => s.trim());
-			const isSpawnAllowed = (): boolean => {
-				if (parentSpawns === "") return false; // Empty = deny all
-				if (parentSpawns === "*") return true; // Wildcard = allow all
-				return allowedSpawns.includes(agentName);
-			};
-
-			if (!isSpawnAllowed()) {
-				const allowed =
-					parentSpawns === ""
-						? "none (spawns disabled for this agent)"
-						: filterVisibleAgents(agents)
-								.filter(candidate => allowedSpawns.includes(candidate.name))
-								.map(candidate => candidate.name)
-								.join(", ") || "none";
-				return {
-					content: [{ type: "text", text: `Cannot spawn '${agentName}'. Allowed: ${allowed}` }],
+					content: [{ type: "text", text: spawnAuthorizationError }],
 					details: {
 						projectAgentsDir,
 						results: [],
