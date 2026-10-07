@@ -1625,6 +1625,64 @@ test("recoverable blocked --mpreset still reapplies explicit CLI override after 
 	).toEqual(["profile-provider/default:medium", "cli-provider/explicit:xhigh"]);
 });
 
+test("retrying a recovered default preserves explicit --mpreset precedence", async () => {
+	const settings = Settings.isolated({ "modelProfile.default": "blocked-default" });
+	const session = fakeSession();
+	let defaultCredentialAvailable = false;
+	const base = fakeRegistry(
+		[
+			{
+				name: "blocked-default",
+				requiredProviders: ["blocked-provider"],
+				modelMapping: { default: "blocked-provider/default" },
+				source: "user",
+			},
+			{
+				name: "healthy-session",
+				requiredProviders: ["cli-provider"],
+				modelMapping: { default: "cli-provider/explicit" },
+				source: "user",
+			},
+		],
+		{ modelsAfterRefresh: [model("blocked-provider", "default"), model("cli-provider", "explicit")] },
+	);
+	const authStorage = {
+		reload: vi.fn(async () => {
+			defaultCredentialAvailable = true;
+		}),
+		hasRuntimeApiKey: (provider: string) => provider === "blocked-provider" && defaultCredentialAvailable,
+		hasLiteralConfigApiKey: () => false,
+		hasSessionCredentialUnavailable: () => false,
+	};
+	const registry = {
+		...base,
+		authStorage,
+		getApiKeyForProvider: async (provider: string) =>
+			provider === "blocked-provider" ? (defaultCredentialAvailable ? "fresh-key" : undefined) : "key",
+	};
+
+	const result = await applyStartupModelProfilesForRoot({
+		session,
+		settings,
+		modelRegistry: registry as never,
+		parsedArgs: { mpreset: "healthy-session" },
+		isInteractive: true,
+		hasInteractiveTerminal: true,
+		initialMessage: undefined,
+		initialMessages: [],
+		resumeAction: undefined,
+	});
+
+	expect(authStorage.reload).toHaveBeenCalledTimes(1);
+	expect(result.recoverableErrors).toEqual([]);
+	expect(session.setModelTemporaryCalls.map(call => `${call.model.provider}/${call.model.id}`)).toEqual([
+		"cli-provider/explicit",
+		"blocked-provider/default",
+		"cli-provider/explicit",
+	]);
+	expect(session.model).toMatchObject({ provider: "cli-provider", id: "explicit" });
+});
+
 test("thinking-only startup uses authoritative override semantics", async () => {
 	const settings = Settings.isolated();
 	const session = fakeSession();
