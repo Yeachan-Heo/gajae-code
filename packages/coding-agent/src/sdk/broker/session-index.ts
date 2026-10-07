@@ -2335,14 +2335,14 @@ export class SessionIndex {
 	 * Production coalesced heartbeat checkpoint pass (C2): appends one
 	 * `host_heartbeat` per session at most once per {@link SESSION_HEARTBEAT_INTERVAL_MS}.
 	 * The pass observes liveness the same way the projection does — the host process
-	/**
+	 * must be alive and, for composite identities, still carry the recorded OS process
 	 * incarnation (a reused PID is never checkpointed). Stopped, terminal, and ambiguous rows
 	 * and rows whose heartbeat is still fresh are skipped. After a broker restart, sessions whose
 	 * host survived are re-observed as live on the first pass; sessions whose host died
 	 * while the broker was down keep their stale or missing heartbeat and read as
 	 * unknown/not-live (never fresh forever). Returns the number of checkpoints written.
 	 */
-	async checkpointLiveHeartbeats(now = Date.now(), deadlineAt?: number): Promise<number> {
+	async checkpointLiveHeartbeats(now = Date.now(), abortSignal?: AbortSignal): Promise<number> {
 		// A stale observation batch fails closed (no heartbeat), but on a busy
 		// machine a single contended lock acquisition is enough to discard the
 		// whole cycle. With the broker's 5s cadence repeatedly losing that race,
@@ -2351,17 +2351,18 @@ export class SessionIndex {
 		// Re-probe from scratch a bounded number of times inside this pass: each
 		// attempt keeps the exact fail-closed contract (fresh probes, freshness
 		// bounds re-checked under the lock); only the starvation is removed.
-		// When a deadline is supplied, stop retrying if the deadline is exhausted.
+		// Startup caller must not exceed its deadline across all retries; once
+		// the startup fence is exhausted, stop retrying and fail closed.
 		for (let attempt = 0; ; attempt++) {
-			if (deadlineAt !== undefined && Date.now() >= deadlineAt) return 0;
-			const result = await this.#checkpointLiveHeartbeatsOnce(now, deadlineAt);
+			if (abortSignal?.aborted) return 0;
+			const result = await this.#checkpointLiveHeartbeatsOnce(now);
 			if (result !== STALE_OBSERVATION || attempt + 1 >= SESSION_HEARTBEAT_CHECKPOINT_ATTEMPTS)
 				return result === STALE_OBSERVATION ? 0 : result;
 			now = Date.now();
 		}
 	}
 
-	async #checkpointLiveHeartbeatsOnce(now: number, deadlineAt?: number): Promise<number | typeof STALE_OBSERVATION> {
+	async #checkpointLiveHeartbeatsOnce(now: number): Promise<number | typeof STALE_OBSERVATION> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		return await SessionIndex.#enqueue(indexPath, async () => {
 			// An absent index holds no registration to checkpoint, so this pass must read
@@ -2417,10 +2418,6 @@ export class SessionIndex {
 				// replay cost envelope of a healthy machine; anything slower fails
 				// closed (no heartbeat this cycle) and the next pass re-probes.
 				if (performance.now() - probedAt > SESSION_INDEX_REPLAY_FRESHNESS_MS) return STALE_OBSERVATION;
-				// If a startup deadline is supplied, abandon the write if it is exhausted:
-				// the startup watchdog will exit the process shortly, so persisting
-				// incomplete checkpoint work is not progress.
-				if (deadlineAt !== undefined && Date.now() >= deadlineAt) return 0;
 				if (this.#corruptSuffix) return 0;
 				const events: SessionIndexEvent[] = [];
 				const rows = reduceEvents(this.#events, now, this.#agentDir, probed).sessions;
