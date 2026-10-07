@@ -18550,13 +18550,19 @@ export class AgentSession {
 		candidate: ConfigHotReloadCandidate,
 		signal: AbortSignal,
 	): Promise<ConfigurationReloadResult> {
-		return this.#reloadConfiguration(candidate, signal, this.getUserModelSelectionRevision());
+		return this.#reloadConfiguration(
+			candidate,
+			signal,
+			this.getUserModelSelectionRevision(),
+			this.model,
+		);
 	}
 
 	async #reloadConfiguration(
 		candidate: ConfigHotReloadCandidate,
 		signal: AbortSignal,
 		userModelSelectionRevision: number,
+		userModelSelectionModel: Model | undefined,
 	): Promise<ConfigurationReloadResult> {
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) throw new ConfigurationReloadError("SESSION_UNAVAILABLE");
@@ -18660,27 +18666,41 @@ export class AgentSession {
 					if (preserveDefaultModelSelection && this.#currentModelConfigurationChanged(stagedModels.registry)) {
 						const updatedModel = this.#updatedCurrentModel(stagedModels.registry);
 						if (updatedModel) {
-							preparedLiveModelSelectionRevision = this.getUserModelSelectionRevision();
-							preparedLiveModelSelection = await this.prepareModelSelectionForProfileActivation(
+							const previousModel = this.model;
+							const previousThinkingLevel = this.thinkingLevel;
+							const selectionRevision = this.getUserModelSelectionRevision();
+							const preparedSelection = await this.prepareModelSelectionForProfileActivation(
 								updatedModel,
-								this.thinkingLevel,
+								previousThinkingLevel,
 								reloadSignal,
 							);
+							if (
+								this.getUserModelSelectionRevision() === selectionRevision &&
+								this.model === previousModel &&
+								this.thinkingLevel === previousThinkingLevel
+							) {
+								preparedLiveModelSelectionRevision = selectionRevision;
+								preparedLiveModelSelection = preparedSelection;
+							}
 						}
 					}
 					reloadSignal.throwIfAborted();
 					publicationFenceRelease = await this.#modelRegistry.acquirePublicationFence(reloadSignal);
 					reloadSignal.throwIfAborted();
 					const preserveLiveModelSelection =
-						this.getUserModelSelectionRevision() !== userModelSelectionRevision;
+						this.getUserModelSelectionRevision() !== userModelSelectionRevision ||
+						this.model !== userModelSelectionModel;
 					if (
 						preparedLiveModelSelection &&
-						this.getUserModelSelectionRevision() !== preparedLiveModelSelectionRevision
+						(this.getUserModelSelectionRevision() !== preparedLiveModelSelectionRevision ||
+							this.model !== preparedLiveModelSelection.previousModel ||
+							this.thinkingLevel !== preparedLiveModelSelection.previousThinkingLevel)
 					) {
 						preparedLiveModelSelection = undefined;
 					}
 					if (preserveLiveModelSelection && this.model) {
 						const currentModel = this.model;
+						const currentThinkingLevel = this.thinkingLevel;
 						const updatedModel = this.#updatedCurrentModel(stagedModels.registry);
 						if (!updatedModel) {
 							throw new ConfigurationReloadError(
@@ -18692,15 +18712,19 @@ export class AgentSession {
 							const selectionRevision = this.getUserModelSelectionRevision();
 							preparedLiveModelSelection = await this.prepareModelSelectionForProfileActivation(
 								updatedModel,
-								this.thinkingLevel,
+								currentThinkingLevel,
 								reloadSignal,
 							);
 							preparedLiveModelSelectionRevision = selectionRevision;
 							reloadSignal.throwIfAborted();
-							if (this.getUserModelSelectionRevision() !== selectionRevision) {
+							if (
+								this.getUserModelSelectionRevision() !== selectionRevision ||
+								this.model !== currentModel ||
+								this.thinkingLevel !== currentThinkingLevel
+							) {
 								throw new ConfigurationReloadError(
 									"PUBLICATION_FAILED",
-									new Error("A newer model selection arrived while preparing the reload model"),
+									new Error("The live model selection changed while preparing the reload model"),
 								);
 							}
 						}
@@ -18729,6 +18753,7 @@ export class AgentSession {
 								});
 							}
 							if (preparedLiveModelSelection) {
+								this.#assertPreparedProfileModelSelectionCurrent(preparedLiveModelSelection);
 								liveModelSelectionCommitted = true;
 								this.commitPreparedProfileModelSelection(preparedLiveModelSelection);
 							}
@@ -18847,7 +18872,12 @@ export class AgentSession {
 		}
 		if (retryAfterSessionTransition) {
 			await this.#waitForSessionTransitionEnd(AbortSignal.any([signal, this.#disposeAbortController.signal]));
-			return await this.#reloadConfiguration(candidate, signal, userModelSelectionRevision);
+			return await this.#reloadConfiguration(
+				candidate,
+				signal,
+				userModelSelectionRevision,
+				userModelSelectionModel,
+			);
 		}
 		throw new Error("Configuration reload exited without a result or a session-transition retry.");
 	}
@@ -19558,6 +19588,15 @@ export class AgentSession {
 	}
 
 	commitPreparedProfileModelSelection(prepared: PreparedProfileModelSelection): void {
+		this.#assertPreparedProfileModelSelectionCurrent(prepared);
+		this.#setModelAuthoritatively(prepared.model, "profile-activation");
+		this.#syncAppendOnlyContext(prepared.model);
+		this.sessionManager.appendModelChange(`${prepared.model.provider}/${prepared.model.id}`, "temporary");
+		this.settings.getStorage()?.recordModelUsage(`${prepared.model.provider}/${prepared.model.id}`);
+		this.setThinkingLevel(prepared.thinkingLevel ?? prepared.model.thinking?.defaultLevel ?? this.thinkingLevel);
+	}
+
+	#assertPreparedProfileModelSelectionCurrent(prepared: PreparedProfileModelSelection): void {
 		prepared.signal?.throwIfAborted();
 		if (
 			this.sessionId !== prepared.sessionId ||
@@ -19566,11 +19605,6 @@ export class AgentSession {
 		) {
 			throw new Error("Session model changed while preparing profile activation");
 		}
-		this.#setModelAuthoritatively(prepared.model, "profile-activation");
-		this.#syncAppendOnlyContext(prepared.model);
-		this.sessionManager.appendModelChange(`${prepared.model.provider}/${prepared.model.id}`, "temporary");
-		this.settings.getStorage()?.recordModelUsage(`${prepared.model.provider}/${prepared.model.id}`);
-		this.setThinkingLevel(prepared.thinkingLevel ?? prepared.model.thinking?.defaultLevel ?? this.thinkingLevel);
 	}
 
 	finishPreparedProfileModelSelection(prepared: PreparedProfileModelSelection): Promise<void> {

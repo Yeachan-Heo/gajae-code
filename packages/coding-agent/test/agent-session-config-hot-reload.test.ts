@@ -654,6 +654,101 @@ describe("AgentSession configuration reload", () => {
 		}
 	});
 
+	it("does not restore a stale selection when a cycle finishes during reload preparation", async () => {
+		const releasePublicationFence = Promise.withResolvers<void>();
+		const cycleApiKey = Promise.withResolvers<string>();
+		const releasePreparedSelection = Promise.withResolvers<void>();
+		let publicationFenceEntered = false;
+		let cycleApiKeyRequested = false;
+		let livePreparationEntered = false;
+		let restorePublicationFence: (() => void) | undefined;
+		let restoreModelRegistryApiKey: (() => void) | undefined;
+		let restorePrepareModelSelection: (() => void) | undefined;
+		let reload: Promise<unknown> | undefined;
+		let cycle: Promise<unknown> | undefined;
+		try {
+			const { configPath, modelsPath } = await createSession({
+				modelId: "default-model",
+				additionalModelId: "manual-model",
+				withProfile: true,
+			});
+			session!.settings.set("modelRoles", { planner: `${provider}/manual-model` });
+			await session!.settings.flushOrThrow();
+			await session!.activateModelProfileForControl("active-profile");
+
+			const originalAcquirePublicationFence = modelRegistry!.acquirePublicationFence.bind(modelRegistry!);
+			const publicationFenceSpy = vi
+				.spyOn(modelRegistry!, "acquirePublicationFence")
+				.mockImplementation(async signal => {
+					publicationFenceEntered = true;
+					await releasePublicationFence.promise;
+					return await originalAcquirePublicationFence(signal);
+				});
+			restorePublicationFence = () => publicationFenceSpy.mockRestore();
+
+			const staged = candidate(
+				22,
+				configPath,
+				modelsPath,
+				settingsText({ todoEnabled: false, compactionEnabled: false }),
+				modelsText({
+					modelId: "manual-model",
+					additionalModelId: "default-model",
+					name: "After",
+					baseUrl: "https://after.example/v1",
+					withProfile: true,
+				}),
+			);
+			reload = session!.reloadConfiguration(staged, new AbortController().signal);
+			await waitFor(() => publicationFenceEntered);
+
+			const apiKeySpy = vi.spyOn(modelRegistry!, "getApiKey").mockImplementation(async () => {
+				cycleApiKeyRequested = true;
+				return await cycleApiKey.promise;
+			});
+			restoreModelRegistryApiKey = () => apiKeySpy.mockRestore();
+			cycle = session!.cycleRoleModels(["default", "planner"], { temporary: true });
+
+			const originalPrepareModelSelection = session!.prepareModelSelectionForProfileActivation.bind(session!);
+			const prepareSpy = vi
+				.spyOn(session!, "prepareModelSelectionForProfileActivation")
+				.mockImplementation(async (model, thinkingLevel, signal) => {
+					const prepared = await originalPrepareModelSelection(model, thinkingLevel, signal);
+					if (model.id === "default-model") {
+						livePreparationEntered = true;
+						await releasePreparedSelection.promise;
+					}
+					return prepared;
+				});
+			restorePrepareModelSelection = () => prepareSpy.mockRestore();
+
+			await waitFor(() => cycleApiKeyRequested);
+			releasePublicationFence.resolve();
+			await waitFor(() => livePreparationEntered);
+			cycleApiKey.resolve("temporary-cycle-key");
+			await expect(cycle).resolves.toMatchObject({ model: { id: "manual-model" } });
+			releasePreparedSelection.resolve();
+			await expect(reload).rejects.toMatchObject({ code: "PUBLICATION_FAILED" });
+
+			expect(session!.model).toMatchObject({ id: "manual-model", baseUrl: "https://before.example/v1" });
+			expect(session!.getConfiguredModelChainState("default")).toMatchObject({
+				entries: [`${provider}/default-model`],
+				identity: "active-profile",
+			});
+			expect(modelRegistry!.find(provider, "default-model")?.baseUrl).toBe("https://before.example/v1");
+		} finally {
+			releasePublicationFence.resolve();
+			cycleApiKey.resolve("cleanup-cycle-key");
+			releasePreparedSelection.resolve();
+			await Promise.allSettled(
+				[reload, cycle].filter((operation): operation is Promise<unknown> => operation !== undefined),
+			);
+			restorePublicationFence?.();
+			restoreModelRegistryApiKey?.();
+			restorePrepareModelSelection?.();
+		}
+	});
+
 	it("keeps an expired refreshable OAuth provider eligible during a read-only reload preflight", async () => {
 		const oauthProvider = "anthropic";
 		const oauthModelId = "claude-sonnet-4-5";
