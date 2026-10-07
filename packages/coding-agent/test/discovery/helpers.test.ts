@@ -928,6 +928,33 @@ describe("safe discovery boundaries", () => {
 		}
 	});
 
+	test("loads an in-root skill after an atomic file replacement", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-in-root-skill-atomic-save-"));
+		try {
+			const skillsDir = path.join(root, "skills");
+			const skillDir = path.join(skillsDir, "edited-skill");
+			const skillPath = path.join(skillDir, "SKILL.md");
+			const replacementPath = path.join(skillDir, "SKILL.md.next");
+			const previousPath = path.join(skillDir, "SKILL.md.previous");
+			await fs.mkdir(skillDir, { recursive: true });
+			await fs.writeFile(skillPath, "---\nname: edited-skill\ndescription: Editable skill\n---\nOriginal body");
+
+			const result = await scanSkillsFromDir(
+				{ cwd: root, home: root, repoRoot: root },
+				{ dir: skillsDir, providerId: "test", level: "user", requireDescription: true },
+			);
+			const loadContent = result.items[0]?.loadContent;
+			if (!loadContent) throw new Error("Expected the in-root skill body loader");
+
+			await fs.writeFile(replacementPath, "---\nname: edited-skill\ndescription: Editable skill\n---\nUpdated body");
+			await fs.rename(skillPath, previousPath);
+			await fs.rename(replacementPath, skillPath);
+			expect(await loadContent()).toContain("Updated body");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	test("rejects a trusted user skill when its target directory identity changes", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-skill-target-identity-"));
 		try {
