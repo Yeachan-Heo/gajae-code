@@ -9956,6 +9956,99 @@ describe("ModelRegistry config reload", () => {
 		}
 	});
 
+	test("keeps a pinned session credential authoritative across offline static refresh", async () => {
+		const pinnedModelsPath = path.join(tempDir, "pinned-offline-refresh-models.json");
+		const pinnedSessionId = "pinned-offline-refresh-session";
+		const authProvider = "anthropic";
+		const apiKeyEnv = "GJC_TEST_PINNED_OFFLINE_REFRESH_API_KEY";
+		const apiKeyEnvNames = [apiKeyEnv, "ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_FOUNDRY_API_KEY"];
+		const previousApiKeys = new Map(apiKeyEnvNames.map(name => [name, Bun.env[name]] as const));
+		for (const name of apiKeyEnvNames) delete Bun.env[name];
+		const initialConfig = {
+			providers: {
+				[authProvider]: {
+					baseUrl: "https://pinned.example/v1",
+					api: "anthropic-messages",
+					auth: "oauth",
+					apiKeyEnv,
+					models: [{ id: "pinned-model" }],
+				},
+			},
+		};
+		const conflictingConfig = {
+			providers: {
+				[authProvider]: {
+					...initialConfig.providers[authProvider],
+					apiKey: "conflicting-literal-key",
+				},
+			},
+		};
+		let pinnedRegistry: ModelRegistry | undefined;
+		let capturedCandidate: ModelsConfigReloadCandidate | undefined;
+		let rejectedCandidate: ModelsConfigReloadCandidate | undefined;
+		try {
+			const capturedText = JSON.stringify(initialConfig);
+			await Bun.write(pinnedModelsPath, capturedText);
+			pinnedRegistry = new ModelRegistry(authStorage, pinnedModelsPath, undefined, { automaticRefresh: false });
+			await authStorage.set(authProvider, [
+				{
+					type: "oauth",
+					access: "pinned-oauth-access",
+					refresh: "pinned-oauth-refresh",
+					expires: Date.now() + 60_000,
+					email: "pinned@example.com",
+				},
+			]);
+			authStorage.setSessionCredentialSelector(pinnedSessionId, authProvider, {
+				kind: "email",
+				value: "pinned@example.com",
+			});
+
+			capturedCandidate = await pinnedRegistry.stageModelsConfigReload(
+				{ path: pinnedModelsPath, text: capturedText, identity: "captured-valid-snapshot" },
+				undefined,
+				pinnedSessionId,
+			);
+			expect(capturedCandidate.diagnostics.errors.map(String)).toEqual([]);
+			expect(capturedCandidate.valid).toBe(true);
+
+			const conflictingText = JSON.stringify(conflictingConfig);
+			await Bun.write(pinnedModelsPath, conflictingText);
+			rejectedCandidate = await pinnedRegistry.stageModelsConfigReload(
+				{ path: pinnedModelsPath, text: conflictingText, identity: "newer-conflicting-snapshot" },
+				undefined,
+				pinnedSessionId,
+			);
+			expect(rejectedCandidate.valid).toBe(false);
+			expect(rejectedCandidate.diagnostics.errors.join(" ")).toContain("credential selector is active");
+			rejectedCandidate.rollback();
+
+			capturedCandidate.commit();
+			capturedCandidate.finalize();
+			expect(authStorage.hasEffectiveCredentialSelector(authProvider, pinnedSessionId)).toBe(true);
+			await pinnedRegistry.refresh("offline", pinnedSessionId);
+
+			expect(authStorage.hasEffectiveCredentialSelector(authProvider, pinnedSessionId)).toBe(true);
+			expect(authStorage.hasConfigApiKey(authProvider, pinnedRegistry.getAuthStorageOwner())).toBe(false);
+			await expect(authStorage.peekApiKey(authProvider, { sessionId: pinnedSessionId })).resolves.toBe(
+				"pinned-oauth-access",
+			);
+			authStorage.clearSessionCredentialSelector(authProvider, pinnedSessionId);
+			expect(await pinnedRegistry.getApiKeyForProvider(authProvider, pinnedSessionId)).not.toBe(
+				"conflicting-literal-key",
+			);
+		} finally {
+			rejectedCandidate?.rollback();
+			capturedCandidate?.rollback();
+			authStorage.clearSessionCredentialSelector(authProvider, pinnedSessionId);
+			await pinnedRegistry?.dispose();
+			for (const [name, value] of previousApiKeys) {
+				if (value === undefined) delete Bun.env[name];
+				else Bun.env[name] = value;
+			}
+		}
+	});
+
 	test("rejects malformed snapshots and deletion of an accepted file without changing auth", async () => {
 		const malformed = await registry.stageModelsConfigReload({ path: modelsPath, text: "{", identity: "invalid" });
 		expect(malformed.valid).toBe(false);

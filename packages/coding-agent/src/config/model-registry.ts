@@ -2817,7 +2817,7 @@ export class ModelRegistry {
 			};
 			this.#suspendRebuild();
 			try {
-				this.#reloadStaticModels();
+				this.#reloadStaticModels(credentialSessionId);
 				this.#suppressedSelectors.clear();
 				this.#selectorCircuits.clear();
 				await this.#refreshRuntimeDiscoveries(
@@ -2965,7 +2965,7 @@ export class ModelRegistry {
 		return resolveProviderModelReference(providerId, modelId, staticModels);
 	}
 
-	#getStaticLoadEnvironmentFingerprint(): string {
+	#getStaticLoadEnvironmentFingerprint(credentialSessionId?: string): string {
 		const providerBaseUrlEnvKeys = new Set(
 			[
 				...getBundledProviders(),
@@ -2975,6 +2975,14 @@ export class ModelRegistry {
 		);
 		return JSON.stringify({
 			apiKeyEnv: [...this.#configuredApiKeyEnvNames].sort().map(name => [name, Bun.env[name] ?? ""]),
+			credentialSelectors: this.#stagedReloadCandidate
+				? []
+				: [...this.#configuredProviderIds]
+						.sort()
+						.map(provider => [
+							provider,
+							this.authStorage.hasEffectiveCredentialSelector(provider, credentialSessionId),
+						]),
 			implicitEndpoints: [
 				["OLLAMA_BASE_URL", Bun.env.OLLAMA_BASE_URL || ""],
 				["LLAMA_CPP_BASE_URL", Bun.env.LLAMA_CPP_BASE_URL || ""],
@@ -2984,10 +2992,10 @@ export class ModelRegistry {
 		});
 	}
 
-	#reloadStaticModels(): void {
+	#reloadStaticModels(credentialSessionId?: string): void {
 		const currentMtime = this.#modelsConfigFile.getMtimeMs();
 		const disabledProviderKey = [...getDisabledProviderIdsFromSettings(this.#settings)].sort().join("\u0000");
-		const environmentFingerprint = this.#getStaticLoadEnvironmentFingerprint();
+		const environmentFingerprint = this.#getStaticLoadEnvironmentFingerprint(credentialSessionId);
 		const acceptedPresets = loadAcceptedModelPresetProfiles(
 			this.#modelPresetRegistryAgentDir,
 			this.#modelPresetRegistryDependencies,
@@ -3005,7 +3013,7 @@ export class ModelRegistry {
 			environmentFingerprint === this.#lastStaticLoadEnvironmentFingerprint &&
 			modelPresetRegistryFingerprint === this.#lastModelPresetRegistryFingerprint
 		) {
-			// models.json and settings-derived implicit provider state are unchanged.
+			// Config, settings-derived provider state, and effective credential selectors are unchanged.
 			return;
 		}
 		this.#modelsConfigFile.invalidate();
@@ -3031,7 +3039,7 @@ export class ModelRegistry {
 		this.#equivalenceConfig = undefined;
 		this.#modelBindingsApplier.setBindings(undefined);
 		this.#configError = undefined;
-		this.#loadModels();
+		this.#loadModels(credentialSessionId);
 		for (const [provider, apiKeyConfig] of this.#runtimeProviderApiKeys) {
 			const resolved = this.#runtimeProviderApiKeyEnvNames.has(provider)
 				? $rotatingCredentialEnv(this.#runtimeProviderApiKeyEnvNames.get(provider)!)
@@ -3087,7 +3095,7 @@ export class ModelRegistry {
 				});
 			}
 		}
-		this.#loadModels();
+		this.#loadModels(credentialSessionId);
 		for (const [provider, apiKeyConfig] of this.#runtimeProviderApiKeys) {
 			const resolved = this.#runtimeProviderApiKeyEnvNames.has(provider)
 				? $rotatingCredentialEnv(this.#runtimeProviderApiKeyEnvNames.get(provider)!)
@@ -3108,7 +3116,7 @@ export class ModelRegistry {
 		return this.#configError;
 	}
 
-	#loadModels() {
+	#loadModels(credentialSessionId?: string) {
 		// Load custom models from models.json first (to know which providers to override)
 		const {
 			models: customModels = [],
@@ -3121,7 +3129,7 @@ export class ModelRegistry {
 			modelBindings,
 			profiles,
 			error: configError,
-		} = this.#loadCustomModels();
+		} = this.#loadCustomModels(credentialSessionId);
 		this.#keylessProviders = keylessProviders;
 		this.#discoveryManager.setProviders(discoverableProviders);
 		this.#configuredProviderIds = new Set(configuredProviders);
@@ -3177,7 +3185,7 @@ export class ModelRegistry {
 		this.#rebuildProviderActivity();
 		this.#rebuildCanonicalIndex();
 		this.#lastStaticLoadMtime = this.#modelsConfigFile.getMtimeMs();
-		this.#lastStaticLoadEnvironmentFingerprint = this.#getStaticLoadEnvironmentFingerprint();
+		this.#lastStaticLoadEnvironmentFingerprint = this.#getStaticLoadEnvironmentFingerprint(credentialSessionId);
 		this.#lastModelPresetRegistryFingerprint = JSON.stringify({
 			revision: acceptedPresets.revision,
 			manifestSha256: acceptedPresets.manifestSha256,
@@ -3656,7 +3664,7 @@ export class ModelRegistry {
 		}
 	}
 
-	#loadCustomModels(): CustomModelsResult {
+	#loadCustomModels(credentialSessionId?: string): CustomModelsResult {
 		this.#configuredApiKeyEnvNames.clear();
 		const loaded = this.#modelsConfigSource ?? this.#modelsConfigFile.tryLoad();
 		const { value, error, status } = loaded;
@@ -3696,6 +3704,9 @@ export class ModelRegistry {
 		const configuredProviders = new Set(Object.keys(value.providers ?? {}));
 
 		for (const [providerName, providerConfig] of providerEntries) {
+			const credentialSelectorActive =
+				!this.#stagedReloadCandidate &&
+				this.authStorage.hasEffectiveCredentialSelector(providerName, credentialSessionId);
 			const authMode = (providerConfig.auth ?? "apiKey") as ProviderAuthMode;
 			const isOAuth = resolveCustomModelIsOAuth(
 				(providerConfig.api as Api | undefined) ?? "openai-completions",
@@ -3710,28 +3721,34 @@ export class ModelRegistry {
 			if (providerConfig.openaiCompat?.apiKey)
 				this.#configuredApiKeyEnvNames.add(providerConfig.openaiCompat.apiKey);
 			if (providerConfig.webSearch) this.#providerWebSearchModes.set(providerName, providerConfig.webSearch);
-			const providerApiKeyConfig = providerConfig.apiKey
-				? resolveApiKeyConfig(providerConfig.apiKey)
-				: resolveApiKeyEnvConfig(providerConfig.apiKeyEnv);
-			const localOpenAICompat = providerConfig.openaiCompat;
-			const rotatingApiKeyEnv = providerConfig.apiKey
+			const providerApiKeyConfig = credentialSelectorActive
 				? undefined
-				: (providerConfig.apiKeyEnv ?? (localOpenAICompat?.apiKey ? undefined : localOpenAICompat?.apiKeyEnv));
+				: providerConfig.apiKey
+					? resolveApiKeyConfig(providerConfig.apiKey)
+					: resolveApiKeyEnvConfig(providerConfig.apiKeyEnv);
+			const localOpenAICompat = providerConfig.openaiCompat;
+			const rotatingApiKeyEnv =
+				credentialSelectorActive || providerConfig.apiKey
+					? undefined
+					: (providerConfig.apiKeyEnv ?? (localOpenAICompat?.apiKey ? undefined : localOpenAICompat?.apiKeyEnv));
 			if (rotatingApiKeyEnv) this.#customProviderApiKeyEnvNames.set(providerName, rotatingApiKeyEnv);
 			if (providerConfig.authHeader !== undefined)
 				this.#customProviderAuthHeaders.set(providerName, providerConfig.authHeader);
-			const localOpenAICompatApiKeyConfig = localOpenAICompat
-				? localOpenAICompat.apiKey
-					? resolveApiKeyConfig(localOpenAICompat.apiKey)
-					: resolveApiKeyEnvConfig(localOpenAICompat.apiKeyEnv)
-				: undefined;
+			const localOpenAICompatApiKeyConfig =
+				localOpenAICompat && !credentialSelectorActive
+					? localOpenAICompat.apiKey
+						? resolveApiKeyConfig(localOpenAICompat.apiKey)
+						: resolveApiKeyEnvConfig(localOpenAICompat.apiKeyEnv)
+					: undefined;
 			if (localOpenAICompat) {
 				const localOpenAICompatBaseUrl = normalizeLocalOpenAICompatBaseUrl(localOpenAICompat.baseUrl);
-				const localCompatResolvedKey = localOpenAICompat.apiKey
-					? resolveApiKeyConfig(localOpenAICompat.apiKey)
-					: localOpenAICompat.apiKeyEnv
-						? resolveApiKeyEnvConfig(localOpenAICompat.apiKeyEnv)
-						: undefined;
+				const localCompatResolvedKey = credentialSelectorActive
+					? undefined
+					: localOpenAICompat.apiKey
+						? resolveApiKeyConfig(localOpenAICompat.apiKey)
+						: localOpenAICompat.apiKeyEnv
+							? resolveApiKeyEnvConfig(localOpenAICompat.apiKeyEnv)
+							: undefined;
 				overrides.set(providerName, {
 					api: "openai-completions",
 					baseUrl: localOpenAICompatBaseUrl,
@@ -3841,15 +3858,16 @@ export class ModelRegistry {
 			}
 
 			// Store API key for fallback resolver AND register as config override
-			// so it wins over OAuth tokens from the broker — when the user pins a
-			// bearer in models.yml (e.g. for an auth-gateway baseUrl), that bearer
-			// must authenticate the outbound request.
+			// so it wins over OAuth tokens from the broker. A selector-bearing
+			// refresh omits config keys so they cannot override the selected account.
 			if (providerConfig.apiKey || providerConfig.apiKeyEnv) {
-				const resolved = providerConfig.apiKey
-					? resolveApiKeyConfig(providerConfig.apiKey)
-					: providerConfig.apiKeyEnv
-						? resolveApiKeyEnvConfig(providerConfig.apiKeyEnv)
-						: undefined;
+				const resolved = credentialSelectorActive
+					? undefined
+					: providerConfig.apiKey
+						? resolveApiKeyConfig(providerConfig.apiKey)
+						: providerConfig.apiKeyEnv
+							? resolveApiKeyEnvConfig(providerConfig.apiKeyEnv)
+							: undefined;
 				if (resolved) this.#customProviderApiKeys.set(providerName, resolved);
 				if (resolved) {
 					this.#setOwnedConfigApiKey(providerName, resolved, !providerConfig.apiKey);
@@ -3867,7 +3885,7 @@ export class ModelRegistry {
 		}
 
 		return {
-			models: this.#parseModels(value),
+			models: this.#parseModels(value, credentialSessionId),
 			overrides,
 			modelOverrides: allModelOverrides,
 			keylessProviders,
@@ -5968,20 +5986,25 @@ export class ModelRegistry {
 		}
 	}
 
-	#parseModels(config: ModelsConfig): CustomModelOverlay[] {
+	#parseModels(config: ModelsConfig, credentialSessionId?: string): CustomModelOverlay[] {
 		const models: CustomModelOverlay[] = [];
 
 		for (const [providerName, providerConfig] of Object.entries(config.providers ?? {})) {
 			const modelDefs = providerConfig.models ?? [];
 			if (modelDefs.length === 0) continue; // Override-only, no custom models
-			if (providerConfig.apiKey || providerConfig.apiKeyEnv) {
-				const resolved = providerConfig.apiKey
+			const credentialSelectorActive =
+				!this.#stagedReloadCandidate &&
+				this.authStorage.hasEffectiveCredentialSelector(providerName, credentialSessionId);
+			const apiKey = credentialSelectorActive
+				? undefined
+				: providerConfig.apiKey
 					? resolveApiKeyConfig(providerConfig.apiKey)
 					: providerConfig.apiKeyEnv
 						? resolveApiKeyEnvConfig(providerConfig.apiKeyEnv)
 						: undefined;
-				if (resolved) this.#customProviderApiKeys.set(providerName, resolved);
-				if (resolved) this.#setOwnedConfigApiKey(providerName, resolved, !providerConfig.apiKey);
+			if (providerConfig.apiKey || providerConfig.apiKeyEnv) {
+				if (apiKey) this.#customProviderApiKeys.set(providerName, apiKey);
+				if (apiKey) this.#setOwnedConfigApiKey(providerName, apiKey, !providerConfig.apiKey);
 			}
 			for (const modelDef of modelDefs) {
 				const providerCompat = providerConfig.disableStrictTools
@@ -5992,11 +6015,7 @@ export class ModelRegistry {
 					providerConfig.baseUrl!,
 					providerConfig.api as Api | undefined,
 					providerConfig.headers,
-					providerConfig.apiKey
-						? resolveApiKeyConfig(providerConfig.apiKey)
-						: providerConfig.apiKeyEnv
-							? resolveApiKeyEnvConfig(providerConfig.apiKeyEnv)
-							: undefined,
+					apiKey,
 					providerConfig.authHeader,
 					providerCompat,
 					providerConfig.requestTransform,
