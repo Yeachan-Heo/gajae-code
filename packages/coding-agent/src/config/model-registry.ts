@@ -3288,6 +3288,11 @@ export class ModelRegistry {
 									result.provider,
 									this.#providerEvidenceApiKeys.get(result.provider),
 								) &&
+							result.configurationGeneration ===
+								this.authStorage.getProviderConfigurationGeneration(
+									result.provider,
+									this.#authStorageConfigOwner,
+								) &&
 							result.endpoint ===
 								this.#normalizeDiscoveryEvidenceEndpoint(
 									this.#effectiveDiscoveryProviderConfig(providerConfig).baseUrl ?? "",
@@ -3309,7 +3314,10 @@ export class ModelRegistry {
 									this.#providerEvidenceApiKeys.get(result.provider),
 								) ||
 							result.configurationGeneration !==
-								this.authStorage.getProviderConfigurationGeneration(result.provider) ||
+								this.authStorage.getProviderConfigurationGeneration(
+									result.provider,
+									this.#authStorageConfigOwner,
+								) ||
 							result.endpoint !==
 								this.#normalizeDiscoveryEvidenceEndpoint(
 									this.#effectiveDiscoveryProviderConfig(providerConfig).baseUrl ?? "",
@@ -3540,7 +3548,10 @@ export class ModelRegistry {
 			? this.authStorage.has(provider) ||
 				this.authStorage.hasAuth(provider, undefined, { owner: this.#authStorageConfigOwner })
 			: !this.#isCredentiallessProvider(provider);
-		let preflightAuthConfigurationGeneration = this.authStorage.getProviderConfigurationGeneration(provider);
+		let preflightAuthConfigurationGeneration = this.authStorage.getProviderConfigurationGeneration(
+			provider,
+			this.#authStorageConfigOwner,
+		);
 		let preflightOAuthRefreshGeneration = this.authStorage.getProviderOAuthRefreshGeneration(provider);
 		if (shouldPreflightAuth) {
 			if (optionalAuth && isCurrentPreflight()) this.#credentiallessAuthFallbackProviders.delete(provider);
@@ -3555,7 +3566,10 @@ export class ModelRegistry {
 						credentialSessionId,
 					}),
 				);
-				const currentAuthConfigurationGeneration = this.authStorage.getProviderConfigurationGeneration(provider);
+				const currentAuthConfigurationGeneration = this.authStorage.getProviderConfigurationGeneration(
+					provider,
+					this.#authStorageConfigOwner,
+				);
 				if (preflightAuthConfigurationGeneration !== currentAuthConfigurationGeneration) {
 					const currentOAuthRefreshGeneration = this.authStorage.getProviderOAuthRefreshGeneration(provider);
 					if (
@@ -3633,6 +3647,9 @@ export class ModelRegistry {
 		const isCurrentEndpoint = () =>
 			endpoint ===
 			this.#normalizeDiscoveryEvidenceEndpoint(this.#effectiveDiscoveryProviderConfig(providerConfig).baseUrl ?? "");
+		const isCurrentAuthConfiguration = () =>
+			preflightAuthConfigurationGeneration ===
+			this.authStorage.getProviderConfigurationGeneration(provider, this.#authStorageConfigOwner);
 		const isCurrentProviderRefresh = () =>
 			providerRefresh === undefined ||
 			("providerId" in providerRefresh
@@ -3704,7 +3721,7 @@ export class ModelRegistry {
 			},
 			getEvidenceGeneration: provider => this.#getProviderEvidenceGeneration(provider.provider, preflightApiKey),
 			cacheDynamicModelProvenance: cacheLookupProvenance,
-			canPublishCache: () => isCurrentEndpoint() && isCurrentProviderRefresh(),
+			canPublishCache: () => isCurrentAuthConfiguration() && isCurrentEndpoint() && isCurrentProviderRefresh(),
 		});
 		const authGeneration =
 			mergeInput.authGeneration ??
@@ -3712,6 +3729,7 @@ export class ModelRegistry {
 		const current =
 			mergeInput.current &&
 			authGeneration === this.#getProviderEvidenceGeneration(effectiveProviderConfig.provider, preflightApiKey) &&
+			isCurrentAuthConfiguration() &&
 			isCurrentEndpoint();
 		if (!current) {
 			return {
@@ -3899,9 +3917,15 @@ export class ModelRegistry {
 		// The token is only needed if the dynamic fetch fires (cache miss),
 		// and failures there are handled gracefully.
 		const peekKey = async (descriptor: { providerId: string }) => {
-			const configurationGeneration = this.authStorage.getProviderConfigurationGeneration(descriptor.providerId);
+			const configurationGeneration = this.authStorage.getProviderConfigurationGeneration(
+				descriptor.providerId,
+				this.#authStorageConfigOwner,
+			);
 			const apiKey = await this.#peekApiKeyForProvider(descriptor.providerId, { credentialSessionId });
-			if (configurationGeneration !== this.authStorage.getProviderConfigurationGeneration(descriptor.providerId)) {
+			if (
+				configurationGeneration !==
+				this.authStorage.getProviderConfigurationGeneration(descriptor.providerId, this.#authStorageConfigOwner)
+			) {
 				return { apiKey: undefined, authGeneration: undefined };
 			}
 			return {
