@@ -6,6 +6,7 @@ import path from "node:path";
 import type { NativeBrokerRestartIntent, NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
 import packageJson from "../../../package.json" with { type: "json" };
+import { FileLockAcquireError } from "../../config/file-lock";
 import type { ModelProfileErrorDetails } from "../../config/model-profile-contract";
 import { planLaunchWorktree } from "../../gjc-runtime/launch-worktree";
 import { readExistingStateForMutation, withWorkflowStateLock } from "../../gjc-runtime/state-writer";
@@ -4281,6 +4282,18 @@ export class Broker {
 		try {
 			await this.heartbeatSessions();
 		} catch (error) {
+			if (
+				error instanceof FileLockAcquireError &&
+				error.orphanPath &&
+				this.#publication !== null &&
+				this.#publicationState === "healthy-owned" &&
+				this.#fenceReason === null &&
+				this.#completionTask === null &&
+				this.#provenOwnedRoot()
+			) {
+				await this.#complete("owned-root", "heartbeat-renewal-blocked", null, error.orphanPath);
+				return;
+			}
 			logger.warn(`sdk broker: session heartbeat checkpoint failed: ${String(error)}`);
 		} finally {
 			this.#checkpointInFlight = false;
@@ -4290,6 +4303,7 @@ export class Broker {
 		mode: BrokerExitMode,
 		reason: BrokerExitReason,
 		signal: BrokerExitRecord["signal"] = null,
+		blockingLockPath?: string,
 	): Promise<void> {
 		if (this.#completionTask) return this.#completionTask;
 		const now = process.hrtime.bigint();
@@ -4301,11 +4315,19 @@ export class Broker {
 			fenceReason: this.#fenceReason,
 			fencedForMs: fenceStartedAt === null ? 0 : Math.max(0, Number((now - fenceStartedAt) / 1_000_000n)),
 			uptimeMs: this.#startedAt === null ? 0 : Math.max(0, Number((now - this.#startedAt) / 1_000_000n)),
+			...(blockingLockPath === undefined ? {} : { blockingLockPath }),
 			pid: process.pid,
 			signal,
 			writtenAt: Date.now(),
 		};
-		(mode === "lost-root" ? logger.warn : logger.info)("sdk broker: exiting", exitRecord);
+		const message =
+			reason === "heartbeat-renewal-blocked" && blockingLockPath
+				? `blocked by retained removal transition ${blockingLockPath}`
+				: undefined;
+		(mode === "lost-root" || message !== undefined ? logger.warn : logger.info)("sdk broker: exiting", {
+			...exitRecord,
+			...(message === undefined ? {} : { message }),
+		});
 		this.#stopping = true;
 		this.#checkpointInFlight = false;
 		this.#publicationState = "stopping";

@@ -22,6 +22,7 @@ export type BrokerFenceReason = "suspect-unpublished" | "observation-ambiguous" 
 export type BrokerExitReason =
 	| "ownership-fence-expired"
 	| "publication-liveness-timeout"
+	| "heartbeat-renewal-blocked"
 	| "restart-committed"
 	| "shutdown-request"
 	| "startup-failure"
@@ -39,6 +40,8 @@ export interface BrokerExitRecord {
 	fenceReason: BrokerFenceReason | null;
 	fencedForMs: number;
 	uptimeMs: number;
+	/** For a blocked heartbeat renewal: retained removal transition path. */
+	blockingLockPath?: string;
 	pid: number;
 	signal: "SIGINT" | "SIGTERM" | null;
 	writtenAt: number;
@@ -47,7 +50,7 @@ export interface BrokerExitRecord {
 export interface BrokerStartupExitRecord {
 	version: 1;
 	mode: "startup";
-	reason: "startup-deadline" | "startup-signal";
+	reason: "startup-deadline" | "startup-signal" | "startup-lock-blocked";
 	fenceReason: null;
 	fencedForMs: 0;
 	uptimeMs: number;
@@ -56,6 +59,8 @@ export interface BrokerStartupExitRecord {
 	exitCode: 1 | 130 | 143;
 	timeoutMs: number | null;
 	writtenAt: number;
+	/** For lock-blocked reason: path to the retained removal transition. */
+	blockingLockPath?: string;
 }
 
 export type BrokerStartupExitWriteStatus =
@@ -71,6 +76,7 @@ const lastWriteGenerationByPath = new Map<string, number>();
 const EXIT_REASONS = new Set<BrokerExitReason>([
 	"ownership-fence-expired",
 	"publication-liveness-timeout",
+	"heartbeat-renewal-blocked",
 	"restart-committed",
 	"shutdown-request",
 	"startup-failure",
@@ -94,11 +100,20 @@ function isBrokerExitRecord(value: unknown): value is BrokerExitRecord {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 	const record = value as Partial<BrokerExitRecord>;
 	const keys = Object.keys(record).sort();
+	const requiredKeys = [
+		"fenceReason",
+		"fencedForMs",
+		"mode",
+		"pid",
+		"reason",
+		"signal",
+		"uptimeMs",
+		"version",
+		"writtenAt",
+	];
 	return (
-		keys.join(",") ===
-			["fenceReason", "fencedForMs", "mode", "pid", "reason", "signal", "uptimeMs", "version", "writtenAt"]
-				.sort()
-				.join(",") &&
+		keys.every(key => requiredKeys.includes(key) || key === "blockingLockPath") &&
+		requiredKeys.every(key => keys.includes(key)) &&
 		record.version === 1 &&
 		(record.mode === "owned-root" || record.mode === "lost-root") &&
 		typeof record.reason === "string" &&
@@ -115,6 +130,14 @@ function isBrokerExitRecord(value: unknown): value is BrokerExitRecord {
 		(record.pid as number) > 0 &&
 		(record.signal === null || record.signal === "SIGINT" || record.signal === "SIGTERM") &&
 		(record.reason === "signal") === (record.signal !== null) &&
+		(record.reason === "heartbeat-renewal-blocked"
+			? record.mode === "owned-root" &&
+				record.fenceReason === null &&
+				record.fencedForMs === 0 &&
+				record.signal === null &&
+				typeof record.blockingLockPath === "string" &&
+				record.blockingLockPath.length > 0
+			: record.blockingLockPath === undefined) &&
 		Number.isSafeInteger(record.writtenAt) &&
 		(record.writtenAt as number) > 0
 	);
@@ -125,26 +148,29 @@ function isBrokerStartupExitRecord(value: unknown): value is BrokerStartupExitRe
 	const record = value as Partial<BrokerStartupExitRecord>;
 	const signalExitCode = record.signal === "SIGINT" ? 130 : record.signal === "SIGTERM" ? 143 : null;
 	const keys = Object.keys(record).sort();
+	const requiredKeys = [
+		"exitCode",
+		"fenceReason",
+		"fencedForMs",
+		"mode",
+		"pid",
+		"reason",
+		"signal",
+		"timeoutMs",
+		"uptimeMs",
+		"version",
+		"writtenAt",
+	];
+	const isValidShape =
+		keys.every(k => requiredKeys.includes(k) || k === "blockingLockPath") &&
+		requiredKeys.every(k => keys.includes(k));
 	return (
-		keys.join(",") ===
-			[
-				"exitCode",
-				"fenceReason",
-				"fencedForMs",
-				"mode",
-				"pid",
-				"reason",
-				"signal",
-				"timeoutMs",
-				"uptimeMs",
-				"version",
-				"writtenAt",
-			]
-				.sort()
-				.join(",") &&
+		isValidShape &&
 		record.version === 1 &&
 		record.mode === "startup" &&
-		(record.reason === "startup-deadline" || record.reason === "startup-signal") &&
+		(record.reason === "startup-deadline" ||
+			record.reason === "startup-signal" ||
+			record.reason === "startup-lock-blocked") &&
 		record.fenceReason === null &&
 		record.fencedForMs === 0 &&
 		Number.isSafeInteger(record.uptimeMs) &&
@@ -154,7 +180,10 @@ function isBrokerStartupExitRecord(value: unknown): value is BrokerStartupExitRe
 		(record.signal === null || record.signal === "SIGINT" || record.signal === "SIGTERM") &&
 		(record.exitCode === 1 || record.exitCode === 130 || record.exitCode === 143) &&
 		(record.timeoutMs === null || (Number.isSafeInteger(record.timeoutMs) && (record.timeoutMs as number) > 0)) &&
-		(record.reason === "startup-deadline"
+		(record.reason === "startup-lock-blocked"
+			? typeof record.blockingLockPath === "string" && record.blockingLockPath.length > 0
+			: record.blockingLockPath === undefined) &&
+		(record.reason === "startup-deadline" || record.reason === "startup-lock-blocked"
 			? record.exitCode === 1 && record.signal === null && record.timeoutMs !== null
 			: record.exitCode === signalExitCode && signalExitCode !== null && record.timeoutMs === null) &&
 		Number.isSafeInteger(record.writtenAt) &&
