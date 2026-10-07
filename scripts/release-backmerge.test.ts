@@ -150,28 +150,64 @@ async function backmergeFixture(options: { devManifest?: string; secondConflict?
 }
 
 describe("backmerge orchestration", () => {
-	test("merges a diverged dev, resolves the manifest, and lands a conventional commit", async () => {
+	test("creates a backmerge branch and PR for a diverged dev", async () => {
 		const { origin, work } = await backmergeFixture();
+		
+		// Mock gh to simulate successful PR creation
+		let ghCalls: string[][] = [];
+		const mockGh = async (args: readonly string[]) => {
+			ghCalls.push([...args]);
+			if (args[0] === "pr" && args[1] === "create") {
+				// Simulate successful PR creation output
+				const prUrl = "https://github.com/Yeachan-Heo/gajae-code/pull/9999";
+				return {
+					exitCode: 0,
+					stdout: new TextEncoder().encode(prUrl),
+					stderr: new Uint8Array(),
+				};
+			}
+			return { exitCode: 0, stdout: new Uint8Array(), stderr: new Uint8Array() };
+		};
 
-		const outcome = await backmergeReleaseIntoDev("0.18.7", { repoDir: work });
-		expect(outcome.action).toBe("merged");
+		const outcome = await backmergeReleaseIntoDev("0.18.7", { repoDir: work, gh: mockGh });
+		expect(outcome.action).toBe("pr-opened");
+		if (outcome.action === "pr-opened") {
+			expect(outcome.prUrl).toContain("github.com");
+			expect(outcome.branch).toBe("refs/heads/backmerge/0.18.7");
+		}
 
-		// The released version wins while dev's digests and its own work survive.
-		const merged = JSON.parse(await git(origin, "show", `dev:${BACKMERGE_CONFLICT_PATH}`)) as Record<string, unknown>;
+		// Verify gh pr create was called with the backmerge branch
+		const prCreateCall = ghCalls.find(args => args[0] === "pr" && args[1] === "create");
+		expect(prCreateCall).toBeDefined();
+		if (prCreateCall) {
+			expect(prCreateCall.join(" ")).toContain("backmerge/0.18.7");
+		}
+
+		// The backmerge branch (not dev!) contains the merged and resolved content
+		// Fetch to ensure we see the backmerge branch
+		await git(work, "fetch", "origin");
+		const merged = JSON.parse(await git(work, "show", `origin/backmerge/0.18.7:${BACKMERGE_CONFLICT_PATH}`)) as Record<string, unknown>;
 		expect(merged).toEqual({
 			schema: "gjc.diagnostic-artifact",
 			version: "0.18.7",
 			artifacts: { "pi_natives.darwin-arm64.node": "dev-digest" },
 		});
-		expect(await git(origin, "show", "dev:released.txt")).toBe("released\n");
-		expect(await git(origin, "show", "dev:dev-only.txt")).toBe("dev\n");
+		expect(await git(work, "show", "origin/backmerge/0.18.7:released.txt")).toBe("released\n");
+		expect(await git(work, "show", "origin/backmerge/0.18.7:dev-only.txt")).toBe("dev\n");
 
 		// The generated commit carries the required conventional subject and why body.
-		expect((await git(origin, "log", "-1", "--format=%s", "dev")).trim()).toBe("chore(release): sync the v0.18.7 release into dev");
-		expect(await git(origin, "log", "-1", "--format=%b", "dev")).toContain("fast-forward");
+		expect((await git(work, "log", "-1", "--format=%s", "origin/backmerge/0.18.7")).trim()).toBe("chore(release): sync the v0.18.7 release into dev");
+		expect(await git(work, "log", "-1", "--format=%b", "origin/backmerge/0.18.7")).toContain("fast-forward");
 
-		// dev now contains main, so a repeat run has nothing to do.
-		const repeat = await backmergeReleaseIntoDev("0.18.7", { repoDir: work });
+		// After the PR is merged (simulated by updating dev), a repeat run would have nothing to do.
+		// For now, manually merge the backmerge branch into dev to simulate PR merge
+		await git(work, "fetch", "origin");
+		await git(work, "checkout", "dev");
+		await git(work, "merge", "origin/backmerge/0.18.7");
+		await git(work, "push", "origin", "dev");
+
+		// Now dev contains main, so a repeat run has nothing to do.
+		const repeat = await backmergeReleaseIntoDev("0.18.7", { repoDir: work, gh: mockGh });
 		expect(repeat.action).toBe("skipped");
 
 		// The throwaway worktree is deregistered rather than left behind.
@@ -198,10 +234,90 @@ describe("backmerge orchestration", () => {
 		});
 		const before = await git(origin, "rev-parse", "dev");
 
-		const outcome = await backmergeReleaseIntoDev("0.18.7", { repoDir: work });
+		const mockGh = async () => ({ exitCode: 0, stdout: new Uint8Array(), stderr: new Uint8Array() });
+		const outcome = await backmergeReleaseIntoDev("0.18.7", { repoDir: work, gh: mockGh });
 
 		expect(outcome.action).toBe("blocked");
 		expect(outcome.detail).toContain("no artifacts map on dev");
 		expect(await git(origin, "rev-parse", "dev")).toBe(before);
+	});
+
+	test("detects existing PR and returns pr-opened without error", async () => {
+		const { origin, work } = await backmergeFixture();
+
+		// Mock gh to simulate PR already exists error, then successful query
+		let callCount = 0;
+		const mockGh = async (args: readonly string[]) => {
+			if (args[0] === "pr" && args[1] === "create") {
+				// Simulate PR already exists error
+				return {
+					exitCode: 1,
+					stdout: new Uint8Array(),
+					stderr: new TextEncoder().encode("pull request already exists for backmerge/0.18.7"),
+				};
+			}
+			if (args[0] === "pr" && args[1] === "list") {
+				// Simulate PR list query returning the existing PR
+				return {
+					exitCode: 0,
+					stdout: new TextEncoder().encode(JSON.stringify([{ url: "https://github.com/Yeachan-Heo/gajae-code/pull/1000" }])),
+					stderr: new Uint8Array(),
+				};
+			}
+			return { exitCode: 0, stdout: new Uint8Array(), stderr: new Uint8Array() };
+		};
+
+		const outcome = await backmergeReleaseIntoDev("0.18.7", { repoDir: work, gh: mockGh });
+		expect(outcome.action).toBe("pr-opened");
+		if (outcome.action === "pr-opened") {
+			expect(outcome.prUrl).toContain("github.com");
+		}
+	});
+
+	test("reports gh PR creation failure as blocked", async () => {
+		const { origin, work } = await backmergeFixture();
+
+		// Mock gh to simulate genuine failure
+		const mockGh = async (args: readonly string[]) => {
+			if (args[0] === "pr" && args[1] === "create") {
+				return {
+					exitCode: 1,
+					stdout: new Uint8Array(),
+					stderr: new TextEncoder().encode("fatal: Authentication failed for 'https://github.com/Yeachan-Heo/gajae-code.git/'"),
+				};
+			}
+			return { exitCode: 0, stdout: new Uint8Array(), stderr: new Uint8Array() };
+		};
+
+		const outcome = await backmergeReleaseIntoDev("0.18.7", { repoDir: work, gh: mockGh });
+		expect(outcome.action).toBe("blocked");
+		expect(outcome.detail).toContain("failed to create backmerge PR");
+	});
+
+	test("never pushes to dev directly", async () => {
+		const { origin, work } = await backmergeFixture();
+
+		// Verify by checking git refs - dev should not be updated yet (only backmerge branch)
+		const mockGh = async (args: readonly string[]) => {
+			if (args[0] === "pr" && args[1] === "create") {
+				return {
+					exitCode: 0,
+					stdout: new TextEncoder().encode("https://github.com/Yeachan-Heo/gajae-code/pull/9999"),
+					stderr: new Uint8Array(),
+				};
+			}
+			return { exitCode: 0, stdout: new Uint8Array(), stderr: new Uint8Array() };
+		};
+
+		const devBefore = await git(origin, "rev-parse", "dev");
+		await backmergeReleaseIntoDev("0.18.7", { repoDir: work, gh: mockGh });
+		const devAfter = await git(origin, "rev-parse", "dev");
+
+		// dev should be unchanged - only backmerge branch exists
+		expect(devAfter).toBe(devBefore);
+
+		// Verify backmerge branch exists
+		const branches = await git(work, "branch", "-r");
+		expect(branches).toContain("origin/backmerge/0.18.7");
 	});
 });

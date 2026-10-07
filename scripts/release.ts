@@ -998,7 +998,7 @@ export function resolveDiagnosticArtifactBackmerge(ours: string, theirs: string)
 
 export type BackmergeOutcome =
 	| { action: "skipped"; detail: string }
-	| { action: "merged"; detail: string }
+	| { action: "pr-opened"; detail: string; prUrl: string; branch: string }
 	| { action: "blocked"; detail: string };
 
 /** First non-empty line of command output, for a bounded user-facing detail. */
@@ -1022,6 +1022,13 @@ function gitAt(dir: string, args: readonly string[]) {
 }
 
 /**
+ * Interface for calling gh commands. Allows injection for testing.
+ */
+export interface GhCommand {
+	(args: readonly string[]): Promise<{ exitCode: number | null; stdout: Uint8Array; stderr: Uint8Array }>;
+}
+
+/**
  * Sync the just-pushed release commit into `dev` so the next release merge stays a
  * fast-forward. Runs in throwaway worktrees so the release checkout is untouched, and
  * returns a blocked outcome instead of throwing: the release is already published, so
@@ -1034,9 +1041,10 @@ function gitAt(dir: string, args: readonly string[]) {
  */
 export async function backmergeReleaseIntoDev(
 	version: string,
-	options: { repoDir?: string } = {},
+	options: { repoDir?: string; gh?: GhCommand } = {},
 ): Promise<BackmergeOutcome> {
 	const repoDir = options.repoDir ?? process.cwd();
+	const ghFn = options.gh ?? (args => $`gh ${args}`.quiet().nothrow());
 	const worktrees: string[] = [];
 	try {
 		// Explicit destinations: in a `--single-branch main` checkout, or any checkout whose
@@ -1088,16 +1096,54 @@ The PR requires maintainer review and approval before it can be merged.
 
 The change resolves the deterministic conflict in \`packages/natives/native/diagnostic-artifact.json\` by adopting the released version from main and the artifact digests from dev.`;
 
-		const prCreate = await $`gh pr create --head ${backmergeRef} --base dev --title "chore(release): backmerge v${version} into dev" --body ${prBody}`.quiet().nothrow();
+		const prCreate = await ghFn([
+			"pr", "create",
+			"--head", backmergeRef,
+			"--base", "dev",
+			"--title", `chore(release): backmerge v${version} into dev`,
+			"--body", prBody,
+		]);
+		let prUrl = "";
 		if (prCreate.exitCode !== 0) {
-			const error = prCreate.stderr.toString().trim();
-			// If PR already exists, that's okay - just report success
-			if (!error.includes("already exists") && !error.toLowerCase().includes("pull request")) {
+			const error = Buffer.from(prCreate.stderr).toString().trim();
+			// If PR already exists, try to find its URL
+			if (error.includes("already exists") || error.toLowerCase().includes("pull request")) {
+				// Query existing PR to get its URL
+				const prQuery = await ghFn([
+					"pr", "list",
+					"--head", backmergeRef,
+					"--base", "dev",
+					"--json", "url",
+					"--limit", "1",
+				]);
+				if (prQuery.exitCode === 0) {
+					try {
+						const results = JSON.parse(Buffer.from(prQuery.stdout).toString()) as { url?: string }[];
+						if (results.length > 0 && results[0]?.url) {
+							prUrl = results[0].url;
+						}
+					} catch {
+						// Continue without URL if parsing fails
+					}
+				}
+			} else {
 				return { action: "blocked", detail: `failed to create backmerge PR: ${firstLine(error)}` };
+			}
+		} else {
+			// Extract PR URL from successful creation output
+			const output = Buffer.from(prCreate.stdout).toString().trim();
+			const urlMatch = output.match(/https:\/\/github\.com\/[^\/]+\/[^\/]+\/pull\/\d+/);
+			if (urlMatch) {
+				prUrl = urlMatch[0];
 			}
 		}
 
-		return { action: "merged", detail: `created backmerge PR for v${version}; requires manual review and merge` };
+		return {
+			action: "pr-opened",
+			detail: `created backmerge PR for v${version}; requires manual review and merge`,
+			prUrl: prUrl || `backmerge/${version}`,
+			branch: backmergeRef,
+		};
 	} catch (error) {
 		const detail = error instanceof Error ? error.message : String(error);
 		return { action: "blocked", detail: `unexpected error: ${detail}` };
