@@ -330,6 +330,7 @@ describe("task fork-context provider identity", () => {
 		const previousSessionId = session.sessionManager.getSessionId();
 		const previousSessionFile = session.sessionManager.getSessionFile();
 		expect(previousSessionFile).toBeDefined();
+		expect(fs.existsSync(previousSessionFile!)).toBe(false);
 		const previousEndpoint = JSON.stringify([
 			"async-job-endpoint",
 			providerSessionId,
@@ -337,6 +338,20 @@ describe("task fork-context provider identity", () => {
 		]);
 		const manager = AsyncJobManager.forEndpoint(previousEndpoint);
 		expect(manager).toBeDefined();
+		session.sessionManager.appendMessage({
+			role: "user",
+			content: "persist endpoint identity",
+			timestamp: Date.now(),
+		});
+		await session.sessionManager.ensureOnDisk();
+		await session.sessionManager.flush();
+		expect(fs.existsSync(previousSessionFile!)).toBe(true);
+		expect(asyncJobEndpointId(providerSessionId, previousSessionId, previousSessionFile)).toBe(previousEndpoint);
+		expect(AsyncJobManager.forEndpoint(previousEndpoint)).toBe(manager);
+
+		await session.sessionManager.rewriteEntries();
+		expect(asyncJobEndpointId(providerSessionId, previousSessionId, previousSessionFile)).toBe(previousEndpoint);
+		expect(AsyncJobManager.forEndpoint(previousEndpoint)).toBe(manager);
 
 		expect(await session.newSession()).toBe(true);
 		const successorSessionFile = session.sessionManager.getSessionFile();
