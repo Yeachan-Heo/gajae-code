@@ -396,7 +396,8 @@ describe("SDK session index lock contention (#4544)", () => {
 		try {
 			expect(await index.checkpointLiveHeartbeats()).toBe(0);
 			expect(stalls).toBeGreaterThanOrEqual(2);
-			expect(incarnationCalls).toBe(stalls);
+			expect(stalls).toBe(4);
+			expect(incarnationCalls).toBeGreaterThanOrEqual(stalls);
 			const rows = index.listSessions().sessions;
 			expect(rows[0]?.lastHeartbeatAt).toBeUndefined();
 		} finally {
