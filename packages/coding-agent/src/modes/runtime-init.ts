@@ -11,6 +11,8 @@ import { ThinkingLevel } from "@gajae-code/agent-core";
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
 import type { ExtensionError, ExtensionUIContext } from "../extensibility/extensions/types";
+import { buildSessionProjectProgress } from "../progress/collect-project-progress";
+import { toProjectProgressSnapshot } from "../progress/progress-snapshot";
 import {
 	parseSyntheticModelId,
 	resolveSyntheticModelSelection,
@@ -201,6 +203,8 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 				return { bytes: new Uint8Array(await file.slice(start, end).arrayBuffer()), totalBytes: file.size };
 			},
 			getJobs: () => session.getAsyncJobSnapshot(),
+			getProjectProgress: async () =>
+				toProjectProgressSnapshot(await buildSessionProjectProgress(session, session.sessionManager)),
 			onJobFold: listener => session.onJobFold(listener),
 			onSessionEvent: listener => session.subscribe(listener),
 			setSdkPermissionProvider: provider => session.setSdkPermissionProvider(provider),

@@ -2143,11 +2143,22 @@ export interface ResumeSessionIdentity {
 	sha256: string;
 }
 
-/** Descriptor-bound bounded fingerprint for private explicit-session rollback authority. */
-type ExplicitPersistIdentity = Pick<
-	SessionStorageStat,
-	"dev" | "ino" | "nlink" | "size" | "mtimeMs" | "mtimeNs" | "ctimeNs"
-> & { canonicalPath: string; sessionId: string; fingerprintSha256: string };
+/** Descriptor-bound bounded fingerprint for private explicit-session rollback authority.
+ * JSON-safe: all bigint fields are stored as strings to survive JSON serialization,
+ * spread, structuredClone, and JSON round-trip. */
+export type ExplicitPersistIdentity = {
+	// All bigint fields stored as base-10 strings for JSON safety
+	dev: string;
+	ino: string;
+	nlink?: string;
+	size: number;
+	mtimeMs: number;
+	mtimeNs: string;
+	ctimeNs?: string;
+	canonicalPath: string;
+	sessionId: string;
+	fingerprintSha256: string;
+};
 
 export interface ResumeTailResumable {
 	kind: "resumable";
@@ -7315,6 +7326,8 @@ interface SessionManagerStateSnapshot {
 	materializedFileEntries: readonly FileEntry[];
 	adoptedArtifactManager: ArtifactManager | null;
 	coldRestoreFile?: string;
+	/** Explicit persistence identity for snapshot serialization safety. Preserved across cross-manager adoptions. */
+	readonly explicitPersistIdentity?: ExplicitPersistIdentity;
 }
 
 /** Benchmark-derived cap for strong materialized session snapshots. */
@@ -8332,6 +8345,16 @@ export class SessionManager {
 		prepared.releaseReferences();
 	}
 
+	/**
+	 * Adopt the resident store of a fully prepared rollback candidate. The candidate
+	 * owns the store it built for the restored lifecycle, so the swap happens here,
+	 * inside the resident-store seams, instead of at the call site.
+	 */
+	#installRollbackCandidateResidentStore(candidate: SessionManager): void {
+		this.#residentTextBlobStore = candidate.#residentTextBlobStore;
+		candidate.#residentTextBlobStore = new MemoryBlobStore();
+	}
+
 	#releaseResidentTextStore(): void {
 		const predecessor = this.#residentTextBlobStore;
 		this.#residentTextBlobStore = new MemoryBlobStore();
@@ -8441,6 +8464,18 @@ export class SessionManager {
 				: undefined;
 		if (explicitPersistIdentity && explicitPersistIdentity.sessionId !== snapshot.sessionId)
 			throw new Error("Session rollback persistence identity is unavailable.");
+		// Store the explicit identity as an enumerable property on the snapshot itself
+		// so that it survives documented caller-adjusted copies (spread, JSON round-trip,
+		// structuredClone, etc.) and cross-manager adoptions can access the captured
+		// identity instead of reconstructing it from the current file state.
+		if (explicitPersistIdentity) {
+			Object.defineProperty(snapshot, "explicitPersistIdentity", {
+				value: Object.freeze({ ...explicitPersistIdentity }),
+				enumerable: true,
+				configurable: false,
+				writable: false,
+			});
+		}
 		this.#stateSnapshots.set(
 			snapshot,
 			Object.freeze({
@@ -8455,6 +8490,54 @@ export class SessionManager {
 					: undefined,
 			}),
 		);
+		return snapshot;
+	}
+
+	/**
+	 * Resolve the state source for an explicit adoption (`restoreState`). Adoption is
+	 * caller-driven state, not rollback authority: a snapshot may come from another
+	 * manager or from a caller-adjusted copy of one, so those are adopted as given and
+	 * constrained only by the live-state assertions inside `restoreState`. A snapshot
+	 * issued by this manager resolves to its frozen issuer copy, which carries the
+	 * explicit persistence identity captured at issuance. The rollback lane
+	 * (`restoreRollbackState`) keeps requiring an authenticated issuance.
+	 */
+	#resolveAdoptedStateSnapshot(
+		snapshot: SessionManagerStateSnapshot,
+	): Readonly<SessionManagerStateSnapshot> & { readonly explicitPersistIdentity?: ExplicitPersistIdentity } {
+		const issued = this.#stateSnapshots.get(snapshot);
+		if (issued) return issued;
+		if (snapshot.adoptedArtifactManager !== null && !(snapshot.adoptedArtifactManager instanceof ArtifactManager)) {
+			throw new Error("Session rollback adopted artifact manager is not live.");
+		}
+		// Preserve explicit identity from cross-manager adoptions. The identity is now
+		// stored as an enumerable property on the snapshot so it survives documented
+		// caller-adjusted copies (spread, JSON round-trip, structuredClone, etc.).
+		// Adoption must restore the identity captured in the snapshot, not the current
+		// state of the sessionFile, to ensure stale file checks use the captured identity.
+		let explicit = snapshot.explicitPersistIdentity;
+		// Only attempt reconstruction for explicit-storage sessions that don't already
+		// have an explicit identity (e.g., snapshots captured before this change).
+		if (!explicit && snapshot.sessionFile && !snapshot.managedPersistExpectedIdentity) {
+			try {
+				explicit = this.#captureExplicitPersistIdentity(snapshot.sessionFile);
+				// Verify the reconstructed identity matches the snapshot's sessionId
+				if (explicit.sessionId !== snapshot.sessionId) {
+					// Session ID mismatch indicates the snapshot is for a different session
+					explicit = undefined;
+				}
+			} catch {
+				// If reconstruction fails (e.g., storage doesn't support readRangeSync),
+				// continue without it; validation will handle missing identity
+				explicit = undefined;
+			}
+		}
+		if (explicit) {
+			return Object.freeze({
+				...snapshot,
+				explicitPersistIdentity: explicit,
+			}) as Readonly<SessionManagerStateSnapshot> & { readonly explicitPersistIdentity?: ExplicitPersistIdentity };
+		}
 		return snapshot;
 	}
 
@@ -8621,8 +8704,7 @@ export class SessionManager {
 			this.#titleSource = issued.titleSource;
 			this.#sessionFile = issued.coldRestoreFile;
 			this.#fileEntries = candidate.#fileEntries;
-			this.#residentTextBlobStore = candidate.#residentTextBlobStore;
-			candidate.#residentTextBlobStore = new MemoryBlobStore();
+			this.#installRollbackCandidateResidentStore(candidate);
 			this.#byId = candidate.#byId;
 			this.#labelsById = candidate.#labelsById;
 			this.#leafId = candidate.#leafId;
@@ -8708,7 +8790,8 @@ export class SessionManager {
 	}
 
 	restoreState(snapshot: SessionManagerStateSnapshot): void {
-		const issued = this.#authenticateStateSnapshot(snapshot);
+		this.#assertArtifactOpen();
+		const issued = this.#resolveAdoptedStateSnapshot(snapshot);
 		if (issued.coldRestoreFile) throw new Error("Cold rollback requires restoreRollbackState.");
 		const managedTransition =
 			this.destination.kind === "managed" && issued.sessionFile
@@ -16248,13 +16331,14 @@ export class SessionManager {
 		return {
 			canonicalPath,
 			sessionId,
-			dev: before.dev,
-			ino: before.ino,
-			nlink,
+			// Convert bigints to strings for JSON safety
+			dev: String(before.dev),
+			ino: String(before.ino),
+			nlink: nlink !== undefined ? String(nlink) : undefined,
 			size: before.size,
 			mtimeMs: before.mtimeMs,
-			mtimeNs: before.mtimeNs,
-			ctimeNs: before.ctimeNs,
+			mtimeNs: String(before.mtimeNs),
+			ctimeNs: before.ctimeNs !== undefined ? String(before.ctimeNs) : undefined,
 			fingerprintSha256: fingerprint.digest("hex"),
 		};
 	}
@@ -17706,10 +17790,14 @@ export class SessionManager {
 	 * one bound to the current session file unless an external manager was
 	 * adopted via `adoptArtifactManager`. Falls back to the lazily created
 	 * ephemeral filesystem store once a non-persistent session has saved an
-	 * artifact, so `artifact://` stays resolvable. Returns null only when no
-	 * store has been established yet.
+	 * artifact, so `artifact://` stays resolvable. Returns null when no store has
+	 * been established yet and once the manager has released its artifact
+	 * authority while closing — released authority stays observable as absence
+	 * (matching `isArtifactManagerAuthorized`), while artifact *operations* are
+	 * fenced by `#assertArtifactOpen()` and keep throwing.
 	 */
 	getArtifactManager(): ArtifactManager | null {
+		if (this.#artifactClosing || this.#strictClosePending) return null;
 		return this.#getOrCreateArtifactManager() ?? this.#ephemeralArtifactManager;
 	}
 
@@ -17906,6 +17994,7 @@ export class SessionManager {
 	 * Returns null when the artifact is missing.
 	 */
 	async getArtifactPath(id: string): Promise<string | null> {
+		this.#assertArtifactOpen();
 		const manager = this.getArtifactManager();
 		if (!manager) return null;
 		return manager.getPath(id);

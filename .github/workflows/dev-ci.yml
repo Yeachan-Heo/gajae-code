@@ -344,7 +344,7 @@ jobs:
         with:
           shared-key: windows-dev-doctor-win32-x64
           cache-on-failure: true
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' || github.event_name == 'pull_request' }}
           cache-workspace-crates: true
       - name: Cache bun dependencies
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
@@ -385,6 +385,8 @@ jobs:
           bun test ./packages/coding-agent/test/sdk-session-index-fsync.windows.test.ts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           bun test ./packages/coding-agent/test/sdk-session-index-lock-contention.test.ts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          bun test ./packages/coding-agent/test/file-lock-signed-identity.test.ts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # The session-state lock's owner-record create/retract protocol depends on
           # Windows handle-sharing semantics (no FILE_SHARE_DELETE on the create
@@ -696,7 +698,7 @@ jobs:
         with:
           shared-key: dev-affected-native-linux-x64
           cache-on-failure: true
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' || github.event_name == 'pull_request' }}
           cache-workspace-crates: true
       - name: Cache bun dependencies
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
@@ -765,7 +767,7 @@ jobs:
         with:
           shared-key: dev-affected-darwin-arm64-tab-worker
           cache-on-failure: true
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' || github.event_name == 'pull_request' }}
           cache-workspace-crates: true
       - name: Cache bun dependencies
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
@@ -869,7 +871,7 @@ jobs:
         with:
           shared-key: dev-affected-rust-linux-x64
           cache-on-failure: true
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' || github.event_name == 'pull_request' }}
           cache-workspace-crates: true
       - name: Cache bun dependencies
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
@@ -1135,7 +1137,7 @@ jobs:
         with:
           shared-key: dev-state-gates-native-linux-x64
           cache-on-failure: true
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' || github.event_name == 'pull_request' }}
           cache-workspace-crates: true
       - name: Restore bun dependency cache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4

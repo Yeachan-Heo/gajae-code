@@ -325,6 +325,7 @@ export class ExtensionRunner {
 	#getArtifactRangeFn: ExtensionContextActions["getArtifactRange"] = undefined;
 
 	#getJobsFn: ExtensionContextActions["getJobs"] = undefined;
+	#getProjectProgressFn: ExtensionContextActions["getProjectProgress"] = undefined;
 	#onJobFoldFn: ExtensionContextActions["onJobFold"] = undefined;
 	#onSessionEventFn: ExtensionContextActions["onSessionEvent"] = undefined;
 	#sdkControlFn: ExtensionContextActions["sdkControl"] = undefined;
@@ -482,6 +483,7 @@ export class ExtensionRunner {
 		this.#getArtifactRangeFn = contextActions.getArtifactRange;
 
 		this.#getJobsFn = contextActions.getJobs;
+		this.#getProjectProgressFn = contextActions.getProjectProgress;
 		this.#onJobFoldFn = contextActions.onJobFold;
 		this.#onSessionEventFn = contextActions.onSessionEvent;
 		this.#sdkControlFn = contextActions.sdkControl;
@@ -848,6 +850,7 @@ export class ExtensionRunner {
 			getArtifactRange: (id, offset, length) => this.#getArtifactRangeFn?.(id, offset, length),
 
 			getJobs: () => this.#getJobsFn?.(),
+			...(this.#getProjectProgressFn ? { getProjectProgress: this.#getProjectProgressFn } : {}),
 			onJobFold: listener => this.#onJobFoldFn?.(listener) ?? (() => {}),
 			onSessionEvent: listener => this.#onSessionEventFn?.(listener) ?? (() => {}),
 			sdkControl: (operation, input) => this.#sdkControlFn?.(operation, input),
@@ -867,6 +870,7 @@ export class ExtensionRunner {
 				...(this.#getExtensionsFn ? ["getExtensions"] : []),
 				...(this.#getArtifactRangeFn ? ["getArtifactRange"] : []),
 				...(this.#getJobsFn ? ["getJobs"] : []),
+				...(this.#getProjectProgressFn ? ["getProjectProgress"] : []),
 				...(this.#onJobFoldFn ? ["onJobFold"] : []),
 				...(this.#sdkControlFn ? ["sdkControl"] : []),
 				...(this.#invokeSkillFn ? ["invokeSkill"] : []),

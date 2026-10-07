@@ -617,6 +617,57 @@ cursor contract and returns `error.code: "cursor_expired"` with
 `error.restartQuery: true`. Malformed cursor strings return `invalid_cursor`;
 cross-query or selector mismatches return `invalid_input`.
 
+## Project progress snapshot (Q32)
+
+`Q32` / `session.progress` returns one read-only snapshot of the session's
+project progress for orchestrators that supervise GJC as a subordinate agent.
+It is the same projection the human `/progress` command renders — one
+computation over durable session state (goal mode, todos, the session ultragoal
+plan `goals.json`, active workflow state and HUD chips, subagent lifecycle
+records, recorded quality-gate receipts and review verdicts) — so the two views
+cannot disagree. The query accepts no input fields, writes nothing, and never
+invokes a model.
+
+ACP clients call it through `_gjc/sdk/query`:
+
+```json
+{ "method": "_gjc/sdk/query", "params": { "sessionId": "…", "query": "session.progress" } }
+```
+
+ACP clients also get the human view as the builtin `/progress` command: it is
+advertised in `available_commands_update`, and a prompt consisting of exactly
+`/progress` is answered by rendering this query's snapshot as plain text
+(`end_turn`, no model turn). Like any prompt it holds the session's prompt
+slot until the report is published, so a concurrent prompt gets `conflict`;
+`session/cancel` ends it with `cancelled` without aborting a host turn.
+`/progress` with arguments is an ordinary prompt, as in the TUI.
+
+MCP (`gjc_session_query`) and `gjc sdk session raw query` use the same query
+name. The response is a single-item page whose item has
+`schema: "gjc.project_progress.v1"`:
+
+| Field | Meaning |
+| --- | --- |
+| `state` | Completion state: `complete`, `awaiting-completion`, `blocked`, `in-progress`, `not-started`, `paused`, `dropped`, or `no-tracked-work`. |
+| `completion` | `basis` (`ultragoal-stories`, `todos`, `goal-status`, or `none`), `done`/`total` counted units, `percent` (`null` when `basis` is `none`), `allUnitsDone`, `complete`, and a plain-language `explanation`. |
+| `execution` | `goal`, `ultragoal` (story counts plus bounded per-story status and receipt flag), and `todos` (counts plus bounded items); each is `null` when not recorded. |
+| `activeWork` | `story`: the active story, else the next pending one, in Ultragoal scheduler order — blocked, review-blocked, and failed stories are never reported as next (failed stories are only retried on an explicit `--retry-failed`), so it is `null` when nothing is schedulable. `todo`: the in-progress (or next pending) todo. `workflows`: active workflows with their phase and HUD chips, bounded, with `omittedWorkflows` counting the rest. `agents`: subagent counts, where `waiting` is queued or paused subagents. |
+| `verification` | `storyReceipts` (complete stories with and without a quality-gate receipt; `null` until a story is complete) and published `reviewVerdicts`. |
+| `attention` | Blockers, pending items, and notes, each with `kind`, `source` (`ultragoal`, `workflow`, `subagents`, `todos`, `goal`, `state`), a stable `ref` (story id, workflow skill, or source key) when one exists, and text. |
+| `sources` | `sessionStateRead`; `unreadable` durable sources (`workflow-state`, `ultragoal-plan`), which are excluded from every count; `recovered` sources whose snapshot record was unreadable but whose contents were rebuilt from authoritative per-entry records (per-workflow `active/<skill>.json` entries); `discarded` sources whose readable derived snapshot still listed workflows without an active per-entry record (for example, a deactivation whose snapshot rebuild never ran), which are dropped as stale and never reported as active; and `unresolved` sources listing workflows without an active per-entry record in a snapshot that cannot be identified as legacy state or a derived snapshot, which are neither reported as active nor confirmed absent. An unreadable workflow snapshot with nothing to recover from is `unreadable`, never reported as "no active workflows". Workflows are always projected from the per-entry records; only a legacy root-only snapshot without `active_skills` keeps its own workflow. A per-entry record that exists but cannot be read or holds no usable workflow entry (for example `{}`) makes `workflow-state` `unreadable`; it is never treated as a deleted entry. |
+
+Semantics are deliberately conservative. Units count equally and open units
+earn no partial credit; `percent` is never 100 while a unit is open and never 0
+once one is done. `complete` requires every counted unit done, the session goal
+(if any) complete, and no subagent running, queued, or paused; otherwise a
+finished unit set reports `awaiting-completion`. Verification reports only
+recorded receipts and verdicts: receipt freshness is not validated and no
+confidence score is derived. Subagent counts come from the session's in-memory job records and
+reset with the process. Lists are bounded (`omittedStories`, `omittedItems`,
+`omittedWorkflows`, `omittedAttention` report the remainder) and durable text is stripped of
+control characters and length-bounded. A session without a progress source
+returns `unavailable`; input fields return `invalid_request`.
+
 ## Answer semantics
 
 A remote reply answers a pending ask in every session state:

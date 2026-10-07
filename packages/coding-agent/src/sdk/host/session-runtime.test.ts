@@ -6171,6 +6171,8 @@ describe("post-acceptance invocation terminalization", () => {
 				outcome: { kind: "failed" },
 				error: { code: "provider_rejected" },
 			});
+			// Wait for session to settle and ensure no further continuations are queued
+			await session?.waitForIdle();
 			expect(harness.broadcasts.filter(frame => frame.kind === "agent_start")).toHaveLength(2);
 			const ends = harness.broadcasts.filter(frame => frame.kind === "agent_end");
 			expect(ends).toHaveLength(1);

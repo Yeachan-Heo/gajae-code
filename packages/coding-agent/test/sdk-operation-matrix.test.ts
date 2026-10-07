@@ -109,6 +109,14 @@ const expectedDispositions: Record<string, Record<string, AdapterDisposition>> =
 		acp: "generic_safe",
 		daemonCli: "generic_safe",
 	},
+	Q32: {
+		telegram: "prohibited",
+		discord: "prohibited",
+		slack: "prohibited",
+		mcp: "generic_safe",
+		acp: "generic_safe",
+		daemonCli: "generic_safe",
+	},
 	C52: {
 		telegram: "prohibited",
 		discord: "prohibited",
@@ -168,7 +176,7 @@ describe("SDK operation matrix", () => {
 	it("keeps control errors, query continuity, counts, and the stage-05 adapter partition explicit", () => {
 		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(53);
 		expect(OPERATIONS.filter(operation => operation.kind === "global")).toHaveLength(10);
-		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(30);
+		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(31);
 		expect(OPERATIONS.filter(operation => operation.kind === "reverse")).toHaveLength(6);
 		for (const operation of OPERATIONS.filter(operation => operation.kind === "control"))
 			expect(operation.errorCodes.length).toBeGreaterThan(0);

@@ -988,6 +988,21 @@ export async function runInteractiveMode(
 		);
 	}
 
+	// Startup input bypasses the editor submit path, so seed the automatic title
+	// here. Only text that `prompt` actually dispatches to a loaded skill is
+	// skipped; unknown `/skill:` text is submitted as an ordinary prompt and is
+	// titled like one. It must run before the prompt (the title gate skips
+	// sessions that already hold a user message), and a title failure must never
+	// drop the prompt.
+	const maybeGenerateStartupTitle = (text: string, images?: readonly unknown[]): void => {
+		try {
+			if (session.resolvePromptSkillInvocation(text, images) || session.isLocallyHandledSlashCommand(text)) return;
+			mode.maybeGenerateSessionTitle(text);
+		} catch (error: unknown) {
+			logger.warn("Startup session title generation failed", { error: String(error) });
+		}
+	};
+
 	const runStartupInputAndPromptLoop = async (): Promise<never> => {
 		const hasStartupInput = initialMessage !== undefined || initialMessages.length > 0;
 		if (!hasStartupInput && resumeAction === "continue-tail") {
@@ -1001,6 +1016,7 @@ export async function runInteractiveMode(
 
 		if (initialMessage !== undefined) {
 			try {
+				maybeGenerateStartupTitle(initialMessage, initialImages);
 				await session.prompt(initialMessage, { images: initialImages });
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
@@ -1017,6 +1033,7 @@ export async function runInteractiveMode(
 				});
 				if (slashResult === true) continue;
 				if (typeof slashResult === "string") text = slashResult;
+				maybeGenerateStartupTitle(text);
 				await session.prompt(text);
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
