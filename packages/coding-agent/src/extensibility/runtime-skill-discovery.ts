@@ -296,6 +296,7 @@ async function scanProjectOrUserDir(
 	source: RuntimeSkillDiscoveryScope,
 	providerPriority: number,
 	authorityRoot?: string,
+	trustUserSkills?: boolean,
 ): Promise<ScanJobResult> {
 	const result = await scanSkillsFromDir(ctx, {
 		dir,
@@ -304,6 +305,7 @@ async function scanProjectOrUserDir(
 		providerId: "runtime",
 		level,
 		requireDescription: true,
+		trustUserSkills,
 	});
 	return {
 		items: result.items.map(skill => ({ skill, source, providerPriority })),
@@ -478,6 +480,7 @@ export async function discoverRuntimeSkills(
 					"user",
 					100,
 					path.resolve(dir) === path.resolve(agentDir, "skills") ? agentDir : undefined,
+					policy?.trustUserSkills,
 				),
 			);
 		}
@@ -485,7 +488,16 @@ export async function discoverRuntimeSkills(
 	if ((source === "all" || source === "user") && policy?.enabled === true) {
 		for (const dir of getCustomSkillDirs(policy, home)) {
 			scanJobs.push(
-				scanProjectOrUserDir({ cwd: options.cwd, home, repoRoot: home }, dir, "user", `custom ${dir}`, "user", 0),
+				scanProjectOrUserDir(
+					{ cwd: options.cwd, home, repoRoot: home },
+					dir,
+					"user",
+					`custom ${dir}`,
+					"user",
+					0,
+					undefined,
+					policy?.trustUserSkills,
+				),
 			);
 		}
 	}
