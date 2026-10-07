@@ -20,6 +20,7 @@
  */
 import { Container, matchesKey, type SelectItem, SelectList, Text } from "@gajae-code/tui";
 import { sanitizeText } from "@gajae-code/utils";
+import { resolveGlobalUserSkillLinkTrust } from "../../../config/skill-settings-defaults";
 import { type CustomizationInventory, loadCustomizationInventory } from "../../../customization/inventory";
 import {
 	removeHookFile,
@@ -47,6 +48,7 @@ import { ImportWizard } from "./import-wizard";
 /** Minimal settings slice the dashboard reads and writes. */
 export interface CustomizationSettingsSlice {
 	get(key: string): unknown;
+	getGlobal?(key: string): unknown;
 	set?(key: string, value: unknown): void;
 }
 
@@ -150,6 +152,16 @@ export class CustomizationDashboard extends Container {
 			cwd: this.#cwd,
 			home: this.#homeDir,
 			policy: this.#skillPolicy(),
+			allowExternalUserSkillSymlinks: resolveGlobalUserSkillLinkTrust({
+				trustUserSkills:
+					typeof this.#settings?.getGlobal === "function"
+						? (this.#settings.getGlobal("skills.trustUserSkills") as boolean | undefined)
+						: undefined,
+				enablePiUser:
+					typeof this.#settings?.getGlobal === "function"
+						? (this.#settings.getGlobal("skills.enablePiUser") as boolean | undefined)
+						: undefined,
+			}),
 			disabledExtensions: this.#getStringArray("disabledExtensions"),
 		});
 	}

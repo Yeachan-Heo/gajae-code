@@ -315,7 +315,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		customDirectories.map(async dir => {
 			const expandedDir = expandTilde(dir, home);
 			const scanResult = await scanSkillsFromDir(
-				{ cwd, home, repoRoot: null, trustUserSkills: userTrusted },
+				{ cwd, home, repoRoot: null, allowExternalUserSkillSymlinks },
 				{
 					dir: expandedDir,
 					providerId: "custom",
