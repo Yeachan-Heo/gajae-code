@@ -30,7 +30,7 @@ import {
 } from "@gajae-code/ai/utils/fallback-transport";
 import { type JsonSchemaValidationIssue, validateJsonSchemaValue } from "@gajae-code/ai/utils/schema";
 import * as canonicalSdk from "@gajae-code/coding-agent/sdk";
-import { logger, prompt, untilAborted } from "@gajae-code/utils";
+import { logger, prompt } from "@gajae-code/utils";
 import { AsyncJobManager } from "../async";
 import { AUTOROUTING_SELECTOR_MAX_LENGTH, type AutoroutingReasonCode } from "../config/autorouting-contract";
 import type { ModelProfileOwnershipMarker } from "../config/model-profile-ownership";
@@ -56,7 +56,12 @@ import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.m
 import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md" with { type: "text" };
 import { AgentRegistry } from "../registry/agent-registry";
 import { discoverAuthStorage } from "../sdk";
-import type { AgentSession, AgentSessionEvent, ForkContextSeed } from "../session/agent-session";
+import {
+	type AgentSession,
+	type AgentSessionEvent,
+	type ForkContextSeed,
+	isSessionDisposalIncompleteError,
+} from "../session/agent-session";
 import { ArtifactManager } from "../session/artifacts";
 import type { AuthStorage } from "../session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
@@ -97,6 +102,7 @@ import {
 	TASK_SUBAGENT_EVENT_CHANNEL,
 	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
 	TASK_SUBAGENT_PROGRESS_CHANNEL,
+	type TaskCleanupSettlement,
 	type TaskRoutingEvidence,
 	type TaskToolDetails,
 } from "./types";
@@ -133,6 +139,84 @@ const providerStreamingUpdateTypes = new Set<string>([
 	"toolcall_delta",
 	"toolcall_end",
 ]);
+
+type PendingSessionDisposal = {
+	cleanup: TaskCleanupSettlement;
+	completion: Promise<"settled" | "failed">;
+};
+
+const pendingSessionDisposals = new Map<string, PendingSessionDisposal>();
+
+/** Number of retained AgentSession teardowns still settling after task return. */
+export function pendingSubagentSessionDisposalCount(): number {
+	return pendingSessionDisposals.size;
+}
+
+async function disposeSubagentSession(session: AgentSession, ownerId: string): Promise<TaskCleanupSettlement> {
+	const cleanup: TaskCleanupSettlement = { owner: "agent_session", status: "pending" };
+	try {
+		await session.dispose();
+		cleanup.status = "settled";
+		return cleanup;
+	} catch (error) {
+		if (!isSessionDisposalIncompleteError(error)) {
+			cleanup.status = "failed";
+			logger.warn("agent session disposal failed", {
+				ownerId,
+				errorType: error instanceof Error ? error.name : "unknown",
+			});
+			return cleanup;
+		}
+	}
+
+	let retainedTeardown: Promise<void>;
+	try {
+		retainedTeardown = session.awaitDisposeCompletion();
+	} catch (error) {
+		cleanup.status = "failed";
+		logger.warn("retained agent session disposal could not be joined", {
+			ownerId,
+			errorType: error instanceof Error ? error.name : "unknown",
+		});
+		return cleanup;
+	}
+
+	let completed = false;
+	const completion = retainedTeardown.then(
+		() => {
+			completed = true;
+			cleanup.status = "settled";
+			return "settled" as const;
+		},
+		error => {
+			completed = true;
+			cleanup.status = "failed";
+			logger.warn("retained agent session disposal failed", {
+				ownerId,
+				errorType: error instanceof Error ? error.name : "unknown",
+			});
+			return "failed" as const;
+		},
+	);
+	const pendingOwner: PendingSessionDisposal = { cleanup, completion };
+	pendingSessionDisposals.set(ownerId, pendingOwner);
+	void completion.then(() => {
+		if (pendingSessionDisposals.get(ownerId) === pendingOwner) pendingSessionDisposals.delete(ownerId);
+	});
+
+	let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+	const timeout = new Promise<"pending">(resolve => {
+		timeoutHandle = setTimeout(() => resolve("pending"), 5_000);
+		timeoutHandle.unref?.();
+	});
+	try {
+		const outcome = await Promise.race([completion, timeout]);
+		if (outcome === "pending" && !completed) cleanup.status = "pending";
+	} finally {
+		if (timeoutHandle) clearTimeout(timeoutHandle);
+	}
+	return cleanup;
+}
 
 const isAgentEvent = (event: AgentSessionEvent): event is AgentEvent =>
 	agentEventTypes.has(event.type as AgentEvent["type"]);
@@ -1680,6 +1764,7 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 		preflightFailure?: AutoroutingPreflightFailure;
 		preflightFenceCrossed?: boolean;
 		preflightCommitFailure?: boolean;
+		cleanupSettlement?: TaskCleanupSettlement;
 		durationMs: number;
 	}> => {
 		let openedSessionManager: SessionManager | null = null;
@@ -1692,6 +1777,7 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 		let aborted = false;
 		let abortReasonText: string | undefined;
 		let setupFailure: SetupFailureSummary | undefined;
+		let cleanupSettlement: TaskCleanupSettlement | undefined;
 		const checkAbort = () => {
 			if (abortSignal.aborted) {
 				aborted = abortReason === "signal" || runtimeLimitExceeded || abortReason === undefined;
@@ -2583,11 +2669,7 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			if (activeSession) {
 				const session = activeSession;
 				activeSession = null;
-				try {
-					await untilAborted(AbortSignal.timeout(5000), () => session.dispose());
-				} catch {
-					// Ignore cleanup errors
-				}
+				cleanupSettlement = await disposeSubagentSession(session, `${options.parentSessionId ?? "parent"}:${id}`);
 			}
 			ownedModelRegistry?.dispose();
 			ownedModelRegistry = undefined;
@@ -2606,6 +2688,7 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			preflightFailure,
 			preflightFenceCrossed,
 			preflightCommitFailure,
+			cleanupSettlement,
 			durationMs: Date.now() - startTime,
 		};
 	};
@@ -2771,6 +2854,7 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 		modelSubstitutionWarning,
 		fastMode: progress.fastMode,
 		error: exitCode !== 0 && stderr ? stderr : undefined,
+		cleanup: done.cleanupSettlement,
 		setupFailure: done.setupFailure,
 		localErrorSummary: done.localErrorSummary,
 		preflightFailure: done.preflightFailure,

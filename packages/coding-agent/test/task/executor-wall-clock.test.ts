@@ -4,8 +4,14 @@ import { Settings } from "../../src/config/settings";
 import type { LoadExtensionsResult } from "../../src/extensibility/extensions/types";
 import type { CreateAgentSessionResult } from "../../src/sdk";
 import * as sdkModule from "../../src/sdk";
-import type { AgentSession, AgentSessionEvent, PromptOptions } from "../../src/session/agent-session";
-import { runSubprocess } from "../../src/task/executor";
+import {
+	type AgentSession,
+	type AgentSessionEvent,
+	type PromptOptions,
+	SessionDisposalIncompleteError,
+} from "../../src/session/agent-session";
+import { pendingSubagentSessionDisposalCount, runSubprocess } from "../../src/task/executor";
+import { buildTaskReceipt } from "../../src/task/receipt";
 import type { AgentDefinition } from "../../src/task/types";
 import { EventBus } from "../../src/utils/event-bus";
 
@@ -168,6 +174,7 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		index: 0,
 		id: "subagent-walltime",
 		modelRegistry: {
+			authStorage: {} as never,
 			refresh: async () => {},
 			getAvailable: () => [],
 			getApiKey: async () => kNoAuth,
@@ -532,5 +539,61 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 			totalTokens: 55,
 			cost: { input: 10, output: 22, cacheRead: 33, cacheWrite: 44, total: 109 },
 		});
+	});
+
+	it("records a pending session teardown separately and tracks its eventual settlement", async () => {
+		vi.useFakeTimers();
+		const retained = Promise.withResolvers<void>();
+		const joinStarted = Promise.withResolvers<void>();
+		const session = createUsageSession(usageWithRawCost({ ...completeRawCost }));
+		session.dispose = async () => {
+			throw new SessionDisposalIncompleteError("controlled slow cleanup");
+		};
+		session.awaitDisposeCompletion = () => {
+			joinStarted.resolve();
+			return retained.promise;
+		};
+		mockCreateAgentSession(session);
+
+		const pending = runSubprocess({
+			...baseOptions,
+			id: "subagent-pending-cleanup",
+			settings: Settings.isolated({ "task.maxRuntimeMs": 0 }),
+		});
+		await joinStarted.promise;
+		vi.advanceTimersByTime(5_000);
+		const result = await pending;
+
+		expect(result.cleanup).toEqual({ owner: "agent_session", status: "pending" });
+		expect(pendingSubagentSessionDisposalCount()).toBe(1);
+		const receipt = buildTaskReceipt(result);
+		expect(receipt.cleanup).toEqual({ owner: "agent_session", status: "pending" });
+		expect(receipt.errorSummary).toBe("Agent session cleanup is still pending.");
+
+		retained.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(result.cleanup?.status).toBe("settled");
+		expect(pendingSubagentSessionDisposalCount()).toBe(0);
+	});
+
+	it("records terminal session cleanup errors in the receipt", async () => {
+		const session = createUsageSession(usageWithRawCost({ ...completeRawCost }));
+		session.dispose = async () => {
+			throw new AggregateError([new Error("controlled teardown failure")]);
+		};
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-failed-cleanup",
+			settings: Settings.isolated({ "task.maxRuntimeMs": 0 }),
+		});
+		const receipt = buildTaskReceipt(result);
+
+		expect(result.cleanup).toEqual({ owner: "agent_session", status: "failed" });
+		expect(receipt.cleanup?.status).toBe("failed");
+		expect(receipt.errorSummary).toBe("Agent session cleanup failed.");
 	});
 });

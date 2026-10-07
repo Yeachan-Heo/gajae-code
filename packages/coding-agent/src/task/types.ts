@@ -779,6 +779,12 @@ export function assertRoutingEvidenceInvariant(evidence: TaskRoutingEvidence): v
 }
 
 /** Result from a single agent execution */
+export interface TaskCleanupSettlement {
+	/** Cleanup outcome is independent from the agent's work result. */
+	status: "settled" | "pending" | "failed";
+	owner: "agent_session";
+}
+
 export interface SingleResult {
 	index: number;
 	id: string;
@@ -806,6 +812,8 @@ export interface SingleResult {
 	/** Whether the resolved subagent model ran under the effective fast service tier. */
 	fastMode?: boolean;
 	error?: string;
+	/** Receipt-safe state of session teardown, separate from task outcome. */
+	cleanup?: TaskCleanupSettlement;
 	/** Safe summary of a terminal local (non-provider) failure kind, e.g. `local_buffer_overflow`. */
 	localErrorSummary?: LocalErrorSummary;
 	/** Safe diagnostic for a failure before the subagent sent its first LLM request. */
