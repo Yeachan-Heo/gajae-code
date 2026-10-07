@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import type { AssistantMessage } from "@gajae-code/ai";
@@ -12,7 +13,7 @@ import { createAgentSession } from "../src/sdk";
 import { createSdkSessionRuntimeExtension } from "../src/sdk/host/session-runtime";
 import { AgentSession, type AgentSessionEvent } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
-import { SessionManager } from "../src/session/session-manager";
+import { type SessionEntry, SessionManager } from "../src/session/session-manager";
 import { EventBus } from "../src/utils/event-bus";
 import { type EmptyStopScenario, handleProviderRequest } from "./helpers/managed-empty-stop-harness";
 
@@ -32,7 +33,7 @@ test.each(
 		port: 0,
 		fetch: request => handleProviderRequest(request, scenario, models),
 	});
-	const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-empty-stop-local-"));
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-empty-stop-local-"));
 	const auth = await AuthStorage.create(":memory:");
 	let session: AgentSession | undefined;
 	try {
@@ -63,7 +64,10 @@ test.each(
 		const primary = registry.find("empty-stop-fixture", "primary");
 		expect(primary).toBeDefined();
 		if (!primary) throw new Error("Missing local provider model");
-		const manager = SessionManager.inMemory();
+		const manager =
+			initialization === "sdk"
+				? SessionManager.create(root, SessionManager.managedDestination(root, root))
+				: SessionManager.inMemory();
 		const runtime = new ExtensionRuntime();
 		const extension = await loadExtensionFromFactory(
 			api => {
@@ -110,7 +114,8 @@ test.each(
 				enableLsp: false,
 				skipPythonPreflight: true,
 				deferOptionalModelRefresh: true,
-				toolNames: [],
+				// Retain the connected harness's default tools and managed destination.
+				// An empty tool selection can hide startup/prompt wiring regressions.
 				skills: [],
 				rules: [],
 				contextFiles: [],
@@ -171,6 +176,18 @@ test.each(
 		if (failed || scenario === "nonzero-usage") {
 			expect(session.model?.id).toBe("primary");
 			expect(switches).toEqual([]);
+		}
+		if (initialization === "sdk") {
+			await manager.ensureOnDisk();
+			await manager.flush();
+			const transcript = manager.getSessionFile();
+			expect(transcript).toBeDefined();
+			if (!transcript) throw new Error("Missing managed transcript");
+			const entries = Bun.JSONL.parse(await Bun.file(transcript).text()) as SessionEntry[];
+			const persistedAssistants = entries.flatMap(entry =>
+				entry.type === "message" && entry.message.role === "assistant" ? [entry.message] : [],
+			);
+			expect(persistedAssistants).toEqual(assistants);
 		}
 	} finally {
 		try {
