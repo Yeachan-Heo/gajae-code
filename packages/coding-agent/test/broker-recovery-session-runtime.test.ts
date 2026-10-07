@@ -56,6 +56,7 @@ async function startRuntime(options: {
 	let ensureCount = 0;
 	let recoveryTick: (() => void) | undefined;
 	let cleared = false;
+	const armed = Promise.withResolvers<void>();
 	const clock = { value: 1_000_000 };
 
 	createSdkSessionRuntimeExtension(api, {
@@ -69,6 +70,7 @@ async function startRuntime(options: {
 		},
 		setIntervalImpl: ((callback: () => void) => {
 			recoveryTick = callback;
+			armed.resolve();
 			return { callback } as unknown as NodeJS.Timeout;
 		}) as typeof setInterval,
 		clearIntervalImpl: (() => {
@@ -103,6 +105,8 @@ async function startRuntime(options: {
 	const stop = handlers.get("session_shutdown");
 	if (!start || !stop) throw new Error("SDK lifecycle handlers were not installed.");
 	await start({}, context);
+	// Optional registration settles outside session_start; recovery arms once it has.
+	await armed.promise;
 
 	return {
 		async tick() {
@@ -176,6 +180,9 @@ test("failed optional registration still backs off instead of resetting every ti
 	// Recovery then retries through registerBroker(), which also only logs on failure.
 	const harness = await startRuntime({ replaced: () => false, failStartupRegistration: true });
 	try {
+		// The failed startup attempt already holds the backoff, so an immediate tick waits.
+		await harness.tick();
+		expect(harness.ensureCalls()).toBe(0);
 		for (let i = 0; i < 40; i++) {
 			await harness.tick();
 			harness.advance(30_000);

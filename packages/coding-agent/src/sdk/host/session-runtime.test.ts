@@ -25,6 +25,8 @@ import {
 	unregisterOwnedRegistration,
 } from "../../session/terminal-abort";
 import { Broker } from "../broker/broker";
+import type { BrokerDiscovery } from "../broker/discovery";
+import { SessionIndex, type SessionIndexEvent } from "../broker/session-index";
 import { createKindAwareReconciliation } from "../bus/kind-aware-reconciliation";
 import { createPromptReconciliation } from "../bus/prompt-reconciliation";
 import {
@@ -37,6 +39,7 @@ import { BROKER_RUNTIME_ABORT_CAPABILITY_FIELD, setBrokerRuntimeAbortCapabilityF
 import { SESSION_HOST_OBSERVER_CAPABILITY, TURN_STREAM_CAPABILITY } from "./host";
 import { CursorRegistry, QueryHandlers, type QueryResponse, RevisionStore } from "./query";
 import {
+	type CreateSdkSessionRuntimeOptions,
 	createInvocationReconciliation,
 	createSdkSessionRuntimeExtension,
 	createSdkSurfaceFactory,
@@ -1706,7 +1709,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sendUserMessage: async () => {},
 		} as unknown as ExtensionAPI;
 		const transport = memoryTransport();
-		createSdkSessionRuntimeExtension(api, { agentDir: cwd, createTransport: async () => transport });
+		createTestRuntimeExtension(api, { agentDir: cwd, createTransport: async () => transport });
 		const listeners = new Set<(event: { jobId: string; generation: string; reason: string }) => void>();
 		const ctx = {
 			...extensionContext(transport.sessionId, cwd),
@@ -1762,7 +1765,7 @@ describe("SessionSdkSessionRuntime", () => {
 			}
 			broadcastFrame?.(frame);
 		};
-		createSdkSessionRuntimeExtension(api, { agentDir: cwd, createTransport: async () => transport });
+		createTestRuntimeExtension(api, { agentDir: cwd, createTransport: async () => transport });
 		const listeners = new Set<(event: { jobId: string; generation: string; reason: string }) => void>();
 		const ctx = {
 			...extensionContext(transport.sessionId, cwd),
@@ -1823,7 +1826,7 @@ describe("SessionSdkSessionRuntime", () => {
 		let activeHandle: string | undefined = "exact-run-handle";
 		let activeEpoch: number | undefined = 7;
 		let captureCalls = 0;
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			onSdkRequest: undefined,
@@ -2022,7 +2025,7 @@ describe("SessionSdkSessionRuntime", () => {
 		});
 		const seamCalls: Array<{ handle: string; scope: string }> = [];
 		let captureCalls = 0;
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -2119,7 +2122,7 @@ describe("SessionSdkSessionRuntime", () => {
 		// exactly the window where writeNoEffect awaits the store.
 		let promptReads = 0;
 		let captureCalls = 0;
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -2204,7 +2207,7 @@ describe("SessionSdkSessionRuntime", () => {
 		});
 		const seamCalls: string[] = [];
 		let promptReads = 0;
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -2274,7 +2277,7 @@ describe("SessionSdkSessionRuntime", () => {
 		// (review thread P1).
 		let reads = 0;
 		let captureCalls = 0;
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -2367,7 +2370,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sessionId: transport.sessionId,
 		});
 		let captureCalls = 0;
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -2434,7 +2437,7 @@ describe("SessionSdkSessionRuntime", () => {
 		const seamCalls: Array<{ handle: string; scope: string }> = [];
 		let seamCount = 0;
 		let captureCalls = 0;
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -2543,7 +2546,7 @@ describe("SessionSdkSessionRuntime", () => {
 		let activeHandle = "predecessor";
 		let abortCalls = 0;
 		const abortRelease = Promise.withResolvers<void>();
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -2631,7 +2634,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sessionFile: path.join(cwd, "session.json"),
 			sessionId: transport.sessionId,
 		});
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -2709,7 +2712,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sessionFile: path.join(cwd, "session.json"),
 			sessionId: transport.sessionId,
 		});
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -2821,7 +2824,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sessionId: transport.sessionId,
 		});
 		const seamCalls: Array<{ handle: string; scope: string }> = [];
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -2939,7 +2942,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sessionId: transport.sessionId,
 		});
 		const seamCalls: Array<{ handle: string; scope: string }> = [];
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -3044,7 +3047,7 @@ describe("SessionSdkSessionRuntime", () => {
 		});
 		const seamCalls: Array<{ handle: string; scope: string }> = [];
 		let idle = true;
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -3145,7 +3148,7 @@ describe("SessionSdkSessionRuntime", () => {
 		});
 		const seamCalls: Array<{ handle: string; scope: string }> = [];
 		let idle = true;
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -3304,7 +3307,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sessionId: transport.sessionId,
 		});
 		const seamCalls: Array<{ handle: string; scope: string }> = [];
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -3424,7 +3427,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sessionId: transport.sessionId,
 		});
 		const seamCalls: Array<{ handle: string; scope: string }> = [];
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -3486,7 +3489,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sessionFile: path.join(cwd, "session.json"),
 			sessionId: transport.sessionId,
 		});
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -3577,7 +3580,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sessionFile: path.join(cwd, "session.json"),
 			sessionId: transport.sessionId,
 		});
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -3669,7 +3672,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sessionId: transport.sessionId,
 		});
 		const seamCalls: Array<{ handle: string; scope: string }> = [];
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			onFrameAdmitted: admissions.onFrameAdmitted,
@@ -3760,7 +3763,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sessionId: transport.sessionId,
 		});
 		const seamCalls: Array<{ handle: string; scope: string }> = [];
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -3856,7 +3859,7 @@ describe("SessionSdkSessionRuntime", () => {
 			};
 			registerOwnedRegistration(registration as never, { isJobTerminal: () => false });
 			const seamCalls: Array<{ handle: string; scope: string }> = [];
-			createSdkSessionRuntimeExtension(api, {
+			createTestRuntimeExtension(api, {
 				agentDir: cwd,
 				createTransport: async () => transport,
 				terminalAbortSeams: {
@@ -3931,7 +3934,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sessionFile: path.join(cwd, "session.json"),
 			sessionId: transport.sessionId,
 		});
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			onFrameAdmitted: admissions.onFrameAdmitted,
@@ -3992,7 +3995,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sessionFile: path.join(cwd, "session.json"),
 			sessionId: transport.sessionId,
 		});
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			onFrameAdmitted: admissions.onFrameAdmitted,
@@ -4082,7 +4085,7 @@ describe("SessionSdkSessionRuntime", () => {
 			},
 		} as unknown as ExtensionAPI;
 		const transports: Array<{ starts: number; stops: number }> = [];
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: path.join(cwd, ".gjc", "agent"),
 			createTransport: async ({ sessionId, stateRoot, token }) => {
 				const stats = { starts: 0, stops: 0 };
@@ -4153,8 +4156,12 @@ describe("SessionSdkSessionRuntime", () => {
 		} as any;
 		const sessionId = "broker-recovery";
 		const endpointUrl = "ws://127.0.0.1:1";
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir,
+			ensureBrokerImpl: async () => {
+				if (!broker) throw Object.assign(new Error("injected unavailable broker"), { code: "acquire_timeout" });
+				return testBrokerDiscovery;
+			},
 			createTransport: async ({ stateRoot, token }) => ({
 				sessionId,
 				stateRoot,
@@ -4179,13 +4186,19 @@ describe("SessionSdkSessionRuntime", () => {
 			await chmod(agentDir, 0o700);
 			broker = new Broker({ agentDir });
 			await broker.start();
+			// Optional registration now completes independently of the event handler.
+			const deadline = Date.now() + 15_000;
 			await handlers.get("turn_start")?.({}, context);
-			expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 })).toMatchObject(
-				{
-					ok: true,
-					result: { sessionId, token: expect.any(String) },
-				},
-			);
+			let endpoint = await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 });
+			while (!endpoint.ok && Date.now() < deadline) {
+				await Bun.sleep(20);
+				await handlers.get("turn_start")?.({}, context);
+				endpoint = await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 });
+			}
+			expect(endpoint).toMatchObject({
+				ok: true,
+				result: { sessionId, token: expect.any(String) },
+			});
 			await handlers.get("session_shutdown")?.({}, context);
 			// DR-1 keeps the unregistered row listed, so the two refusals stay distinct:
 			// a matching generation on a terminal row is terminally gone (no endpoint will
@@ -4209,6 +4222,185 @@ describe("SessionSdkSessionRuntime", () => {
 		}
 	});
 
+	test("optional blocked broker registration leaves startup and turns responsive and fences shutdown", async () => {
+		const gate = Promise.withResolvers<BrokerDiscovery>();
+		let attempts = 0;
+		const harness = await brokerRegistrationHarness({
+			ensureBrokerImpl: () => {
+				attempts += 1;
+				return gate.promise;
+			},
+		});
+		const publication = spyOn(SessionSdkSessionRuntime.prototype, "registerWithBroker");
+		try {
+			await harness.emit("session_start");
+			await Promise.all([harness.emit("turn_start"), harness.emit("turn_start")]);
+			expect(attempts).toBe(1);
+			expect(harness.turnStarts()).toBe(2);
+			// Recovery arms only once the startup attempt settles.
+			expect(harness.recoveryActive()).toBe(false);
+			await harness.emit("session_shutdown");
+			expect(harness.stops()).toBe(1);
+			gate.resolve(testBrokerDiscovery);
+			await Bun.sleep(0);
+			await harness.emit("turn_start");
+			expect(attempts).toBe(1);
+			expect(publication).not.toHaveBeenCalled();
+			// An attempt that settles after shutdown must not arm recovery either.
+			expect(harness.recoveryActive()).toBe(false);
+		} finally {
+			gate.resolve(testBrokerDiscovery);
+			await harness.dispose();
+			publication.mockRestore();
+		}
+	});
+
+	test("optional rejected broker registration reports diagnostics and retries without blocking turns", async () => {
+		const first = Promise.withResolvers<BrokerDiscovery>();
+		const retry = Promise.withResolvers<BrokerDiscovery>();
+		let attempts = 0;
+		const warning = spyOn(logger, "warn").mockImplementation(() => {});
+		const harness = await brokerRegistrationHarness({
+			ensureBrokerImpl: () => (++attempts === 1 ? first.promise : retry.promise),
+		});
+		try {
+			await harness.emit("session_start");
+			first.reject(Object.assign(new Error("injected broker contention"), { code: "acquire_timeout" }));
+			await Bun.sleep(0);
+			expect(warning).toHaveBeenCalledWith("sdk broker registration unavailable", { code: "acquire_timeout" });
+			// The settled startup attempt armed recovery, and its failure holds the next tick.
+			expect(harness.recoveryActive()).toBe(true);
+			harness.recover();
+			await harness.emit("turn_start");
+			harness.recover();
+			expect(attempts).toBe(2);
+			expect(harness.turnStarts()).toBe(1);
+			expect(harness.stops()).toBe(0);
+			retry.reject(Object.assign(new Error("injected retry failure"), { code: "acquire_timeout" }));
+			await Bun.sleep(0);
+			expect(
+				warning.mock.calls.filter(([message]) => message === "sdk broker registration unavailable"),
+			).toHaveLength(2);
+		} finally {
+			first.resolve(testBrokerDiscovery);
+			retry.resolve(testBrokerDiscovery);
+			await harness.dispose();
+			warning.mockRestore();
+		}
+	});
+
+	test("optional broker publication completing after shutdown is unregistered with its ownership proof", async () => {
+		const published = Promise.withResolvers<SessionIndexEvent>();
+		const release = Promise.withResolvers<void>();
+		const unregistered = Promise.withResolvers<void>();
+		const append = SessionIndex.prototype.append;
+		const unregister = SessionIndex.prototype.unregisterIfCurrent;
+		const publication = spyOn(SessionIndex.prototype, "append").mockImplementation(async function (
+			this: SessionIndex,
+			input,
+		) {
+			const event = await append.call(this, input);
+			if (input.type === "host_registered") {
+				published.resolve(event);
+				await release.promise;
+			}
+			return event;
+		});
+		const cleanup = spyOn(SessionIndex.prototype, "unregisterIfCurrent").mockImplementation(async function (
+			this: SessionIndex,
+			...args
+		) {
+			const result = await unregister.apply(this, args);
+			unregistered.resolve();
+			return result;
+		});
+		const harness = await brokerRegistrationHarness({ ensureBrokerImpl: async () => testBrokerDiscovery });
+		try {
+			await harness.emit("session_start");
+			const ownership = await published.promise;
+			await harness.emit("session_shutdown");
+			expect(cleanup).not.toHaveBeenCalled();
+			release.resolve();
+			await unregistered.promise;
+			expect(cleanup).toHaveBeenCalledWith(ownership);
+			expect(harness.recoveryActive()).toBe(false);
+		} finally {
+			release.resolve();
+			await harness.dispose();
+			publication.mockRestore();
+			cleanup.mockRestore();
+		}
+	});
+
+	for (const outcome of ["success", "failure"] as const) {
+		test(`required broker registration blocks startup and turns until ${outcome}`, async () => {
+			const gate = Promise.withResolvers<BrokerDiscovery>();
+			const entered = Promise.withResolvers<void>();
+			let attempts = 0;
+			const harness = await brokerRegistrationHarness({
+				brokerRegistrationRequired: true,
+				lifecycleRequestId: "required-registration-marker",
+				ensureBrokerImpl: () => {
+					attempts += 1;
+					entered.resolve();
+					return gate.promise;
+				},
+			});
+			let startupSettled = false;
+			let turnSettled = false;
+			const startup = harness.emit("session_start").then(
+				() => {
+					startupSettled = true;
+					return undefined;
+				},
+				error => {
+					startupSettled = true;
+					return error;
+				},
+			);
+			await entered.promise;
+			const turn = harness.emit("turn_start").then(
+				() => {
+					turnSettled = true;
+					return undefined;
+				},
+				error => {
+					turnSettled = true;
+					return error;
+				},
+			);
+			try {
+				await Bun.sleep(0);
+				expect(startupSettled).toBe(false);
+				expect(turnSettled).toBe(false);
+				expect(harness.turnStarts()).toBe(0);
+				expect(attempts).toBe(1);
+				expect(harness.recoveryActive()).toBe(false);
+				if (outcome === "failure") {
+					const error = Object.assign(new Error("required broker unavailable"), { code: "acquire_timeout" });
+					gate.reject(error);
+					expect(await startup).toBe(error);
+					expect(await turn).toBe(error);
+					expect(harness.stops()).toBe(1);
+					expect(harness.turnStarts()).toBe(0);
+					expect(harness.recoveryActive()).toBe(false);
+				} else {
+					gate.resolve(testBrokerDiscovery);
+					expect(await startup).toBeUndefined();
+					expect(await turn).toBeUndefined();
+					expect(harness.turnStarts()).toBe(1);
+					expect(harness.recoveryActive()).toBe(true);
+					await harness.emit("turn_start");
+					expect(attempts).toBe(1);
+				}
+			} finally {
+				gate.resolve(testBrokerDiscovery);
+				await Promise.all([startup, turn]);
+				await harness.dispose();
+			}
+		});
+	}
+
 	test("rejects lifecycle-required SDK-only startup when broker registration fails", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-broker-required-"));
 		const agentDir = path.join(cwd, ".gjc", "agent");
@@ -4220,7 +4412,7 @@ describe("SessionSdkSessionRuntime", () => {
 				handlers.set(event, handler);
 			},
 		} as any;
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir,
 			brokerRegistrationRequired: true,
 			lifecycleRequestId: "broker-required-marker",
@@ -4243,6 +4435,105 @@ describe("SessionSdkSessionRuntime", () => {
 		}
 	});
 });
+
+// Production discovery deliberately launches a daemon that outlives its caller.
+// Unit fixtures must never launch it: shutting down a host does not own that daemon.
+function createTestRuntimeExtension(api: ExtensionAPI, options: CreateSdkSessionRuntimeOptions): void {
+	createSdkSessionRuntimeExtension(api, {
+		...options,
+		ensureBrokerImpl: options.ensureBrokerImpl ?? (async () => testBrokerDiscovery),
+	});
+}
+
+const testBrokerDiscovery: BrokerDiscovery = {
+	version: 1,
+	protocolVersion: 3,
+	packageGeneration: "test",
+	ownerId: "test-broker",
+	pid: process.pid,
+	incarnation: "test-incarnation",
+	host: "127.0.0.1",
+	port: 1,
+	url: "ws://127.0.0.1:1",
+	token: "test-token",
+	startedAt: 0,
+	heartbeatAt: 0,
+};
+
+async function brokerRegistrationHarness(
+	options: Pick<
+		CreateSdkSessionRuntimeOptions,
+		"ensureBrokerImpl" | "brokerRegistrationRequired" | "lifecycleRequestId"
+	>,
+) {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-registration-"));
+	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+	const broadcasts: SdkFrame[] = [];
+	let stops = 0;
+	let recovery: (() => void) | undefined;
+	let recoveryActive = false;
+	const timer = { unref() {} } as NodeJS.Timeout;
+	const api = {
+		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
+			handlers.set(event, handler);
+		},
+	} as unknown as ExtensionAPI;
+	createTestRuntimeExtension(api, {
+		...options,
+		agentDir: path.join(cwd, "agent"),
+		setIntervalImpl: ((callback: () => void) => {
+			recovery = callback;
+			recoveryActive = true;
+			return timer;
+		}) as typeof setInterval,
+		clearIntervalImpl: (() => {
+			recoveryActive = false;
+		}) as typeof clearInterval,
+		createTransport: async ({ sessionId, stateRoot, token }) => ({
+			sessionId,
+			stateRoot,
+			token,
+			onFrame: () => undefined,
+			sendFrame: () => {},
+			broadcastFrame: frame => {
+				broadcasts.push(frame);
+			},
+			start: async () => {
+				const url = "ws://127.0.0.1:1";
+				await Bun.write(
+					path.join(stateRoot, "sdk", `${sessionId}.json`),
+					JSON.stringify({
+						sessionId,
+						token,
+						pid: process.pid,
+						url,
+					}),
+				);
+				return { url };
+			},
+			stop: async () => {
+				stops += 1;
+			},
+		}),
+	});
+	const context = extensionContext("broker-registration", cwd);
+	const emit = async (event: string): Promise<void> => {
+		await handlers.get(event)?.({}, context);
+	};
+	return {
+		emit,
+		recover: () => recovery?.(),
+		recoveryActive: () => recoveryActive,
+		stops: () => stops,
+		turnStarts: () => broadcasts.filter(frame => frame.type === "event" && frame.kind === "turn_start").length,
+		dispose: async () => {
+			await emit("session_shutdown");
+			await Bun.sleep(0);
+			await rm(cwd, { recursive: true, force: true });
+		},
+	};
+}
+
 interface PreflightHooks {
 	onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
 	onPreflightAccepted?: () => void;
@@ -4344,7 +4635,7 @@ async function invocationHarness(
 				hooks.onDurableAttempt,
 			)
 		: undefined;
-	createSdkSessionRuntimeExtension(api, {
+	createTestRuntimeExtension(api, {
 		agentDir: cwd,
 		...(hooks.onLifecycleDrainTimeout ? { onLifecycleDrainTimeoutForTests: hooks.onLifecycleDrainTimeout } : {}),
 		...(interceptorStore || hooks.terminalAbortSeams
@@ -9039,7 +9330,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			sessionId: transport.sessionId,
 		});
 		const seamCalls: Array<{ handle: string; scope: string }> = [];
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -10113,7 +10404,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			sessionId: transport.sessionId,
 		});
 		const seamCalls: Array<{ handle: string; scope: string }> = [];
-		createSdkSessionRuntimeExtension(api, {
+		createTestRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
 			terminalAbortSeams: {
@@ -10254,7 +10545,7 @@ test("SDK-only host never advances a finalized uncertain row for a mismatched re
 		sessionId: transport.sessionId,
 	});
 	const seamCalls: Array<{ handle: string; scope: string }> = [];
-	createSdkSessionRuntimeExtension(api, {
+	createTestRuntimeExtension(api, {
 		agentDir: cwd,
 		createTransport: async () => transport,
 		terminalAbortSeams: {
@@ -10347,7 +10638,7 @@ test("SDK-only host FIFO-expires tombstones instead of failing the finalization 
 		sessionFile: path.join(cwd, "session.json"),
 		sessionId: transport.sessionId,
 	});
-	createSdkSessionRuntimeExtension(api, {
+	createTestRuntimeExtension(api, {
 		agentDir: cwd,
 		createTransport: async () => transport,
 		terminalAbortSeams: {
@@ -10423,7 +10714,7 @@ test("SDK-only host cancels only the aborting requester's preflight while anothe
 		sessionFile: path.join(cwd, "session.json"),
 		sessionId: transport.sessionId,
 	});
-	createSdkSessionRuntimeExtension(api, {
+	createTestRuntimeExtension(api, {
 		agentDir: cwd,
 		createTransport: async () => transport,
 		terminalAbortSeams: {
@@ -10513,7 +10804,7 @@ test("SDK-only host keeps the idle-submitted prompt's owner when isIdle flips du
 		sessionFile: path.join(cwd, "session.json"),
 		sessionId: transport.sessionId,
 	});
-	createSdkSessionRuntimeExtension(api, {
+	createTestRuntimeExtension(api, {
 		agentDir: cwd,
 		createTransport: async () => transport,
 		terminalAbortSeams: {
@@ -10586,7 +10877,7 @@ test("SDK-only host advances a finalized stopped row when the retry replay match
 	});
 	let captureCalls = 0;
 	let discardCalls = 0;
-	createSdkSessionRuntimeExtension(api, {
+	createTestRuntimeExtension(api, {
 		agentDir: cwd,
 		createTransport: async () => transport,
 		terminalAbortSeams: {
@@ -10924,7 +11215,7 @@ test("SDK-only host does not assign a follow-up requester ownership until the fo
 		sessionId: transport.sessionId,
 	});
 	const seamCalls: Array<{ handle: string; scope: string }> = [];
-	createSdkSessionRuntimeExtension(api, {
+	createTestRuntimeExtension(api, {
 		agentDir: cwd,
 		createTransport: async () => transport,
 		terminalAbortSeams: {
@@ -11046,7 +11337,7 @@ test("SDK-only host lets every connection whose follow-up was promoted abort the
 		sessionId: transport.sessionId,
 	});
 	const seamCalls: Array<{ handle: string; scope: string }> = [];
-	createSdkSessionRuntimeExtension(api, {
+	createTestRuntimeExtension(api, {
 		agentDir: cwd,
 		createTransport: async () => transport,
 		terminalAbortSeams: {
@@ -11171,7 +11462,7 @@ test("SDK-only host rebinds the steering snapshot when the requester's turn wins
 	let ownerReads = 0;
 	let rebindCalls = 0;
 	const settledOptions: Array<{ scope?: string; steeringSnapshotToken?: number }> = [];
-	createSdkSessionRuntimeExtension(api, {
+	createTestRuntimeExtension(api, {
 		agentDir: cwd,
 		createTransport: async () => transport,
 		terminalAbortSeams: {

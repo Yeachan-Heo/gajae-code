@@ -226,6 +226,11 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 		"packages/coding-agent/test/agent-session-promotion-identity.test.ts",
 		"packages/coding-agent/test/agent-session-terminal-abort-chain.test.ts",
 	],
+	// Session-manager owns the in-memory session lifecycle, whose integration
+	// contract is not basename-matched and needs explicit behavioral-owner coverage.
+	"packages/coding-agent/src/session/session-manager.ts": [
+		"packages/coding-agent/test/session/session-memory-integration.test.ts",
+	],
 	// The managed-scope owner-only self-heal budget/latency contract is verified by
 	// a dedicated suite that exercises the bounded walk, targeted repair, and
 	// deferred tail directly (prepare only runs the walk behind a Linux-only
