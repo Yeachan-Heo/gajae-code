@@ -1,6 +1,6 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
-import { Agent } from "@gajae-code/agent-core";
+import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
 import {
 	applyPreparedModelProfileActivation,
@@ -96,8 +96,96 @@ describe("AgentSession profile resume defaults", () => {
 		expect(session.getUnavailableModelProfile()).toBeUndefined();
 
 		session.setUnavailableModelProfile("stale-profile");
+		const revision = session.getUserModelSelectionRevision();
 		await session.setModel(base);
 		expect(session.getUnavailableModelProfile()).toBeUndefined();
+		expect(session.getUserModelSelectionRevision()).toBeGreaterThan(revision);
+	});
+
+	it("fences explicit model selections assigned to non-default roles", async () => {
+		const { base, profileMain } = resolveModels();
+		session = makeSession(base);
+		const revision = session.getUserModelSelectionRevision();
+
+		await session.setModel(profileMain, "executor");
+
+		expect(session.model).toEqual(profileMain);
+		expect(session.getUserModelSelectionRevision()).toBe(revision + 1);
+	});
+
+	it("records the concrete sticky canonical selector for a user model choice", async () => {
+		const { base, profileMain } = resolveModels();
+		session = makeSession(base);
+		const canonicalId = modelRegistry.getCanonicalId(profileMain);
+		if (!canonicalId) throw new Error("Expected profile model to have a canonical identity");
+
+		await session.setModel(profileMain);
+
+		expect(session.getUserCanonicalVariantSelection()).toEqual({
+			revision: 1,
+			canonicalVariant: `${profileMain.provider}/${profileMain.id}`,
+		});
+		expect(session.getUserCanonicalVariantSelection().canonicalVariant).toBe(
+			modelRegistry.getSessionCanonicalVariant(session.sessionId),
+		);
+	});
+
+	it("advances the recovery fence for explicit control-surface selections", () => {
+		const { base } = resolveModels();
+		session = makeSession(base);
+		const revision = session.getUserModelSelectionRevision();
+
+		session.markUserModelSelection();
+
+		expect(session.getUserModelSelectionRevision()).toBe(revision + 1);
+	});
+
+	it("preserves an unavailable-profile marker when the active profile is reset", () => {
+		const { base } = resolveModels();
+		session = makeSession(base);
+
+		session.setActiveModelProfile("unavailable-profile");
+		session.setUnavailableModelProfile("unavailable-profile");
+		session.setActiveModelProfile(undefined);
+
+		expect(session.getUnavailableModelProfile()).toBe("unavailable-profile");
+	});
+
+	it("preserves the unavailable-profile marker when startup only overrides thinking", async () => {
+		const { base } = resolveModels();
+		session = makeSession(base);
+		session.setUnavailableModelProfile("unavailable-profile");
+
+		await session.setModelTemporary(base, ThinkingLevel.High, { cause: "startup-override" });
+
+		expect(session.getUnavailableModelProfile()).toBe("unavailable-profile");
+	});
+
+	it("cancels a guarded profile model change after a newer user selection", async () => {
+		const { base, profileMain } = resolveModels();
+		session = makeSession(base);
+		const apiKey = Promise.withResolvers<string | undefined>();
+		const getApiKey = spyOn(modelRegistry, "getApiKey").mockImplementation(() => apiKey.promise);
+		let selectionIsCurrent = true;
+		let mutationStarted = false;
+
+		try {
+			const activation = session.setModelTemporary(profileMain, undefined, {
+				cause: "profile-activation",
+				shouldMutate: () => selectionIsCurrent,
+				onMutationStarted: () => {
+					mutationStarted = true;
+				},
+			});
+			selectionIsCurrent = false;
+			apiKey.resolve("test-key");
+			await activation;
+
+			expect(session.model).toEqual(base);
+			expect(mutationStarted).toBe(false);
+		} finally {
+			getApiKey.mockRestore();
+		}
 	});
 
 	it("keeps a transient switch as role=temporary so resume does not adopt it", async () => {

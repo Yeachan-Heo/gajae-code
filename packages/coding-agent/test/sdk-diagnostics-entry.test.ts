@@ -57,7 +57,7 @@ let fixtureHome: string;
 let fixtureAgentDir: string;
 let absentAgentDir: string;
 
-const TRAP_PRELOAD = String.raw`
+const TRAP_PRELOAD = `
 const nodeFs = require("node:fs");
 const nodeFsPromises = require("node:fs/promises");
 const childProcess = require("node:child_process");
