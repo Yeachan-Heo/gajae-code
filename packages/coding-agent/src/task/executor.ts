@@ -145,11 +145,29 @@ type PendingSessionDisposal = {
 	completion: Promise<"settled" | "failed">;
 };
 
-const pendingSessionDisposals = new Map<string, PendingSessionDisposal>();
+const pendingSessionDisposals = new Set<PendingSessionDisposal>();
 
 /** Number of retained AgentSession teardowns still settling after task return. */
 export function pendingSubagentSessionDisposalCount(): number {
 	return pendingSessionDisposals.size;
+}
+
+function aggregateSessionCleanup(settlements: readonly TaskCleanupSettlement[]): TaskCleanupSettlement | undefined {
+	if (settlements.length === 0) return undefined;
+	if (settlements.length === 1) return settlements[0];
+	const aggregate: TaskCleanupSettlement = { owner: "agent_session", status: "settled" };
+	const refresh = () => {
+		aggregate.status = settlements.some(cleanup => cleanup.status === "failed")
+			? "failed"
+			: settlements.some(cleanup => cleanup.status === "pending")
+				? "pending"
+				: "settled";
+	};
+	refresh();
+	for (const pending of pendingSessionDisposals) {
+		if (settlements.includes(pending.cleanup)) void pending.completion.then(refresh);
+	}
+	return aggregate;
 }
 
 async function disposeSubagentSession(session: AgentSession, ownerId: string): Promise<TaskCleanupSettlement> {
@@ -199,12 +217,12 @@ async function disposeSubagentSession(session: AgentSession, ownerId: string): P
 		},
 	);
 	const pendingOwner: PendingSessionDisposal = { cleanup, completion };
-	pendingSessionDisposals.set(ownerId, pendingOwner);
+	pendingSessionDisposals.add(pendingOwner);
 	void completion.then(() => {
-		if (pendingSessionDisposals.get(ownerId) === pendingOwner) pendingSessionDisposals.delete(ownerId);
+		pendingSessionDisposals.delete(pendingOwner);
 	});
 
-	let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+	let timeoutHandle: NodeJS.Timeout | undefined;
 	const timeout = new Promise<"pending">(resolve => {
 		timeoutHandle = setTimeout(() => resolve("pending"), 5_000);
 		timeoutHandle.unref?.();
@@ -2973,6 +2991,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		return runSubprocessOnce(options);
 	}
 	const attempts: AutoroutingAttempt[] = [];
+	const cleanups: TaskCleanupSettlement[] = [];
+	const withAttemptCleanup = (result: SingleResult): SingleResult => ({
+		...result,
+		cleanup: aggregateSessionCleanup(cleanups) ?? result.cleanup,
+	});
 	const consumed = new Set<string>();
 	const skips = buildBoundedRoutingSkips(options.autoroutingSkips);
 	// Candidates were already validated and pinned against the live model snapshot by
@@ -2998,7 +3021,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const failure = classifyAutoroutingPreflightFailure(preflightError, "auth_resolve");
 			const { code } = autoroutingAttemptDisposition(failure);
 			attempts.push({ selector, phase: "probe", code });
-			return preflightTerminalResult({ ...options, routing: routedOptions }, attempts, "preflight_exhausted");
+			return withAttemptCleanup(
+				preflightTerminalResult({ ...options, routing: routedOptions }, attempts, "preflight_exhausted"),
+			);
 		}
 		const probe = await runSubprocessOnce({
 			...options,
@@ -3016,17 +3041,15 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			parentArtifactManager: undefined,
 			routing: undefined,
 		});
+		if (probe.cleanup) cleanups.push(probe.cleanup);
 		prior = probe;
 		if (!probe.preflightProbeAccepted) {
 			const failure = probe.preflightFailure ?? { kind: "local", op: "preflight_validation", transient: false };
 			const { code, advance } = autoroutingAttemptDisposition(failure);
 			attempts.push({ selector, phase: "probe", code });
 			if (!advance)
-				return preflightTerminalResult(
-					{ ...options, routing: routedOptions },
-					attempts,
-					"preflight_exhausted",
-					probe,
+				return withAttemptCleanup(
+					preflightTerminalResult({ ...options, routing: routedOptions }, attempts, "preflight_exhausted", probe),
 				);
 			continue;
 		}
@@ -3047,29 +3070,38 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			autoroutingSkips: undefined,
 			routing: routedOptions,
 		});
+		if (durable.cleanup) cleanups.push(durable.cleanup);
 		prior = durable;
 		if (durable.preflightCommitFailure) {
 			attempts.push({ selector, phase: "durable", code: "post_acceptance_failure" });
-			return { ...durable, routing: evidenceWithAttempts(durable.routing ?? routedOptions, attempts) };
+			return withAttemptCleanup({
+				...durable,
+				routing: evidenceWithAttempts(durable.routing ?? routedOptions, attempts),
+			});
 		}
 		if (durable.preflightFenceCrossed) {
 			if (durable.exitCode === 0) {
 				attempts.push({ selector, phase: "durable", code: "accepted" });
-				return { ...durable, routing: evidenceWithAttempts(durable.routing ?? routedOptions, attempts) };
+				return withAttemptCleanup({
+					...durable,
+					routing: evidenceWithAttempts(durable.routing ?? routedOptions, attempts),
+				});
 			}
 			attempts.push({ selector, phase: "durable", code: "post_acceptance_failure" });
-			return { ...durable, routing: evidenceWithAttempts(durable.routing ?? routedOptions, attempts) };
+			return withAttemptCleanup({
+				...durable,
+				routing: evidenceWithAttempts(durable.routing ?? routedOptions, attempts),
+			});
 		}
 		const failure = durable.preflightFailure ?? { kind: "local", op: "preflight_validation", transient: false };
 		const { code, advance } = autoroutingAttemptDisposition(failure);
 		attempts.push({ selector, phase: "durable", code });
 		if (!advance)
-			return preflightTerminalResult(
-				{ ...options, routing: routedOptions },
-				attempts,
-				"preflight_exhausted",
-				durable,
+			return withAttemptCleanup(
+				preflightTerminalResult({ ...options, routing: routedOptions }, attempts, "preflight_exhausted", durable),
 			);
 	}
-	return preflightTerminalResult({ ...options, routing: routedOptions }, attempts, "preflight_exhausted", prior);
+	return withAttemptCleanup(
+		preflightTerminalResult({ ...options, routing: routedOptions }, attempts, "preflight_exhausted", prior),
+	);
 }

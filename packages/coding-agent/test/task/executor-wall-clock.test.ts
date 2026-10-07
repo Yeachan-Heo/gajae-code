@@ -80,6 +80,34 @@ function mockCreateAgentSession(session: AgentSession) {
 	} satisfies CreateAgentSessionResult);
 }
 
+function mockCreateAgentSessions(sessions: AgentSession[]) {
+	let next = 0;
+	return vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async () => {
+		const session = sessions[next++];
+		if (!session) throw new Error("Unexpected extra session attempt");
+		return {
+			session,
+			extensionsResult: {} as unknown as LoadExtensionsResult,
+			setToolUIContext: () => {},
+			eventBus: new EventBus(),
+		} satisfies CreateAgentSessionResult;
+	});
+}
+
+function createPendingCleanupSession() {
+	const retained = Promise.withResolvers<void>();
+	const joinStarted = Promise.withResolvers<void>();
+	const session = createUsageSession(usageWithRawCost({ ...completeRawCost }));
+	session.dispose = async () => {
+		throw new SessionDisposalIncompleteError("controlled slow cleanup");
+	};
+	session.awaitDisposeCompletion = () => {
+		joinStarted.resolve();
+		return retained.promise;
+	};
+	return { session, retained, joinStarted };
+}
+
 function createUsageSession(usages: unknown | readonly unknown[]): AgentSession {
 	const session: Partial<AgentSession> = {
 		state: { messages: [] } as never,
@@ -180,6 +208,49 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 			getApiKey: async () => kNoAuth,
 		} as unknown as ModelRegistry,
 		enableLsp: false,
+	};
+	const routedModel = {
+		provider: "fixture",
+		id: "model",
+		name: "Fixture model",
+		api: "openai-completions",
+		contextWindow: 128_000,
+		maxTokens: 4_096,
+		input: ["text"],
+		reasoning: false,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	};
+	const routedOptions = {
+		...baseOptions,
+		modelRegistry: {
+			authStorage: {},
+			getAvailable: () => [routedModel],
+			getApiKey: async () => kNoAuth,
+		} as unknown as ModelRegistry,
+		autoroutingPreflight: true,
+		autoroutingCandidates: ["fixture/model"],
+	};
+	const configurePreflightSession = (session: AgentSession) => {
+		let emit: ((event: AgentSessionEvent) => void) | undefined;
+		session.subscribe = listener => {
+			emit = listener;
+			return () => {
+				emit = undefined;
+			};
+		};
+		session.prompt = async (_text, options) => {
+			await options?.onPreflightAcceptCommit?.();
+			emit?.({
+				type: "tool_execution_end",
+				toolCallId: "accepted-yield",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { value: "ok" } },
+				},
+				isError: false,
+			} as AgentSessionEvent);
+		};
 	};
 
 	it("aborts a stalled subagent and surfaces a runtime-limit reason", async () => {
@@ -595,5 +666,153 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		expect(result.cleanup).toEqual({ owner: "agent_session", status: "failed" });
 		expect(receipt.cleanup?.status).toBe("failed");
 		expect(receipt.errorSummary).toBe("Agent session cleanup failed.");
+	});
+
+	it("keeps overlapping teardown attempts for the same task independently visible", async () => {
+		vi.useFakeTimers();
+		const first = createPendingCleanupSession();
+		const second = createPendingCleanupSession();
+		mockCreateAgentSessions([first.session, second.session]);
+		const options = {
+			...baseOptions,
+			id: "same-task-pending-cleanup",
+			parentSessionId: "same-parent",
+			settings: Settings.isolated({ "task.maxRuntimeMs": 0 }),
+		};
+		try {
+			const firstRun = runSubprocess(options);
+			await first.joinStarted.promise;
+			vi.advanceTimersByTime(5_000);
+			const firstResult = await firstRun;
+			const secondRun = runSubprocess(options);
+			await second.joinStarted.promise;
+			vi.advanceTimersByTime(5_000);
+			const secondResult = await secondRun;
+			expect(pendingSubagentSessionDisposalCount()).toBe(2);
+			second.retained.resolve();
+			await Promise.resolve();
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(pendingSubagentSessionDisposalCount()).toBe(1);
+			expect(firstResult.cleanup?.status).toBe("pending");
+			expect(secondResult.cleanup?.status).toBe("settled");
+			first.retained.resolve();
+			await Promise.resolve();
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(pendingSubagentSessionDisposalCount()).toBe(0);
+			expect(firstResult.cleanup?.status).toBe("settled");
+		} finally {
+			first.retained.resolve();
+			second.retained.resolve();
+			await Promise.resolve();
+			await Promise.resolve();
+			await Promise.resolve();
+		}
+	});
+
+	for (const outcome of ["settled", "failed"] as const) {
+		it(`preserves a pending probe cleanup and its delayed ${outcome} outcome after the durable attempt settles`, async () => {
+			vi.useFakeTimers();
+			const probe = createPendingCleanupSession();
+			const durable = createUsageSession(usageWithRawCost({ ...completeRawCost }));
+			configurePreflightSession(probe.session);
+			configurePreflightSession(durable);
+			const bootstrap = mockCreateAgentSessions([probe.session, durable]);
+			try {
+				const pending = runSubprocess({
+					...routedOptions,
+					id: `probe-pending-durable-settled-${outcome}`,
+					settings: Settings.isolated({ "task.maxRuntimeMs": 0 }),
+				});
+				await probe.joinStarted.promise;
+				vi.advanceTimersByTime(5_000);
+				const result = await pending;
+				expect(bootstrap).toHaveBeenCalledTimes(2);
+				expect(result.exitCode).toBe(0);
+				expect(result.cleanup?.status).toBe("pending");
+				expect(pendingSubagentSessionDisposalCount()).toBe(1);
+				const pendingReceipt = buildTaskReceipt(result);
+				expect(pendingReceipt.errorSummary).toBe("Agent session cleanup is still pending.");
+				if (outcome === "failed") probe.retained.reject(new Error("controlled late probe teardown failure"));
+				else probe.retained.resolve();
+				await Promise.resolve();
+				await Promise.resolve();
+				await Promise.resolve();
+				expect(result.cleanup?.status).toBe(outcome);
+				expect(pendingSubagentSessionDisposalCount()).toBe(0);
+				expect(buildTaskReceipt(result).cleanup?.status).toBe(outcome);
+				expect(pendingReceipt.cleanup?.status).toBe("pending");
+			} finally {
+				probe.retained.resolve();
+				await Promise.resolve();
+				await Promise.resolve();
+				await Promise.resolve();
+			}
+		});
+	}
+
+	it("keeps both routed teardown attempts visible and preserves failure while the other is pending", async () => {
+		vi.useFakeTimers();
+		const probe = createPendingCleanupSession();
+		const durable = createPendingCleanupSession();
+		configurePreflightSession(probe.session);
+		configurePreflightSession(durable.session);
+		const bootstrap = mockCreateAgentSessions([probe.session, durable.session]);
+		try {
+			const pending = runSubprocess({
+				...routedOptions,
+				id: "probe-and-durable-pending",
+				settings: Settings.isolated({ "task.maxRuntimeMs": 0 }),
+			});
+			await probe.joinStarted.promise;
+			vi.advanceTimersByTime(5_000);
+			await durable.joinStarted.promise;
+			vi.advanceTimersByTime(5_000);
+			const result = await pending;
+			expect(bootstrap).toHaveBeenCalledTimes(2);
+			expect(result.exitCode).toBe(0);
+			expect(result.cleanup?.status).toBe("pending");
+			expect(pendingSubagentSessionDisposalCount()).toBe(2);
+			probe.retained.reject(new Error("controlled earlier attempt teardown failure"));
+			await Promise.resolve();
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(result.cleanup?.status).toBe("failed");
+			expect(pendingSubagentSessionDisposalCount()).toBe(1);
+			expect(buildTaskReceipt(result).errorSummary).toBe("Agent session cleanup failed.");
+			durable.retained.resolve();
+			await Promise.resolve();
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(result.cleanup?.status).toBe("failed");
+			expect(pendingSubagentSessionDisposalCount()).toBe(0);
+		} finally {
+			probe.retained.resolve();
+			durable.retained.resolve();
+			await Promise.resolve();
+			await Promise.resolve();
+			await Promise.resolve();
+		}
+	});
+
+	it("preserves a failed probe cleanup after its durable attempt succeeds", async () => {
+		const probe = createUsageSession(usageWithRawCost({ ...completeRawCost }));
+		const durable = createUsageSession(usageWithRawCost({ ...completeRawCost }));
+		configurePreflightSession(probe);
+		configurePreflightSession(durable);
+		probe.dispose = async () => {
+			throw new Error("controlled probe teardown failure");
+		};
+		const bootstrap = mockCreateAgentSessions([probe, durable]);
+		const result = await runSubprocess({
+			...routedOptions,
+			id: "probe-failed-durable-success",
+			settings: Settings.isolated({ "task.maxRuntimeMs": 0 }),
+		});
+		expect(bootstrap).toHaveBeenCalledTimes(2);
+		expect(result.exitCode).toBe(0);
+		expect(result.cleanup?.status).toBe("failed");
+		expect(buildTaskReceipt(result).errorSummary).toBe("Agent session cleanup failed.");
 	});
 });
