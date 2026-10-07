@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { resolveEquivalentPath } from "../src/dirs";
+import { resolveEquivalentPath, stablePathKey } from "../src/dirs";
 
 describe("issue #935 path equivalence", () => {
 	afterEach(() => {
@@ -43,5 +43,38 @@ describe("issue #6446 Windows path casing", () => {
 		}) as unknown as typeof fs.realpathSync);
 
 		expect(resolveEquivalentPath(inputPath)).toBe(path.resolve(inputPath));
+	});
+
+	it("canonicalizes existing Windows short-name aliases", () => {
+		if (process.platform !== "win32") return;
+
+		const shortPath = "C:\\sessions\\SESSION~1.JSONL";
+		const canonicalPath = "C:\\sessions\\long-session-name.jsonl";
+		vi.spyOn(fs, "lstatSync").mockImplementation((() => ({})) as unknown as typeof fs.lstatSync);
+		vi.spyOn(fs, "realpathSync").mockImplementation((() => canonicalPath) as unknown as typeof fs.realpathSync);
+		vi.spyOn(fs, "statSync").mockImplementation((() => ({ dev: 1n, ino: 2n })) as unknown as typeof fs.statSync);
+		vi.spyOn(fs, "readdirSync").mockImplementation((() => [
+			"long-session-name.jsonl",
+		]) as unknown as typeof fs.readdirSync);
+
+		expect(stablePathKey(shortPath)).toBe(stablePathKey(canonicalPath));
+	});
+
+	it("keeps distinct existing Windows entries separate when names differ by case", () => {
+		if (process.platform !== "win32") return;
+
+		const firstPath = "C:\\sessions\\Session.jsonl";
+		const secondPath = "C:\\sessions\\session.jsonl";
+		vi.spyOn(fs, "lstatSync").mockImplementation((() => ({})) as unknown as typeof fs.lstatSync);
+		vi.spyOn(fs, "realpathSync").mockImplementation(
+			((inputPath: string) => inputPath) as unknown as typeof fs.realpathSync,
+		);
+		vi.spyOn(fs, "statSync").mockImplementation((() => ({ dev: 1n, ino: 2n })) as unknown as typeof fs.statSync);
+		vi.spyOn(fs, "readdirSync").mockImplementation((() => [
+			"Session.jsonl",
+			"session.jsonl",
+		]) as unknown as typeof fs.readdirSync);
+
+		expect(stablePathKey(firstPath)).not.toBe(stablePathKey(secondPath));
 	});
 });
