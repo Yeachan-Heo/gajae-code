@@ -914,24 +914,29 @@ test("ACP lifecycle aliases forward caller idempotency keys outside operation in
 		{ method: "closeSession", operation: "session.close", input: { sessionId: "close" } },
 	];
 
-	await adapter.start();
-	for (const alias of aliases)
-		await expect(adapter.handle(alias.method, alias.input)).rejects.toMatchObject({ code: "invalid_input" });
+	const clock = spyOn(Date, "now").mockReturnValue(Date.now());
+	try {
+		await adapter.start();
+		for (const alias of aliases)
+			await expect(adapter.handle(alias.method, alias.input)).rejects.toMatchObject({ code: "invalid_input" });
 
-	for (const [index, alias] of aliases.entries())
-		await adapter.handle(alias.method, { ...alias.input, idempotencyKey: `alias-${index}` });
+		for (const [index, alias] of aliases.entries())
+			await adapter.handle(alias.method, { ...alias.input, idempotencyKey: `alias-${index}` });
 
-	expect(sdk.frames).toEqual(
-		aliases.map((alias, index) => ({
-			type: "broker_request",
-			operation: alias.operation,
-			input: alias.input,
-			idempotencyKey: `alias-${index}`,
-			...(alias.operation === "session.close" ? { timeoutMs: 10_000 } : { timeoutMs: 21_000 }),
-			deadline: expect.any(Number),
-		})),
-	);
-	await adapter.close();
+		expect(sdk.frames).toEqual(
+			aliases.map((alias, index) => ({
+				type: "broker_request",
+				operation: alias.operation,
+				input: alias.input,
+				idempotencyKey: `alias-${index}`,
+				...(alias.operation === "session.close" ? { timeoutMs: 10_000 } : { timeoutMs: 21_000 }),
+				deadline: expect.any(Number),
+			})),
+		);
+	} finally {
+		await adapter.close();
+		clock.mockRestore();
+	}
 });
 
 test("ACP reverse dispatch captures Router identity before reverse dispatch and rejects duplicates", async () => {

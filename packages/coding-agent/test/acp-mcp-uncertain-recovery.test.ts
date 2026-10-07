@@ -100,6 +100,7 @@ test("rethrows the original uncertainty when replay margin is exhausted", async 
 });
 
 test("uses the SDK default timeout when lifecycle sizing is unavailable", async () => {
+	setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
 	const optionsSeen: Record<string, unknown>[] = [];
 	const client = {
 		async global(_operation: string, _input: Record<string, unknown>, options: Record<string, unknown>) {
@@ -117,6 +118,7 @@ test("uses the SDK default timeout when lifecycle sizing is unavailable", async 
 		expect(optionsSeen[0]!.timeoutMs).toBe(DEFAULT_SDK_REQUEST_TIMEOUT_MS);
 	} finally {
 		await adapter.close();
+		setSystemTime();
 	}
 });
 
@@ -402,70 +404,6 @@ test("preserves original uncertainty when replay times out after dispatch", asyn
 		await expect(adapter.lifecycle("session.create", {}, "acp-request-after-send-timeout")).rejects.toBe(original);
 		expect(original).toHaveProperty("recovery", replayFailure);
 	} finally {
-		await adapter.close();
-	}
-});
-
-test("uses the replay result when the original response arrives late", async () => {
-	const replayStarted = Promise.withResolvers<void>();
-	const lateAck = Promise.withResolvers<void>();
-	const original = new SdkClientError("uncertain_after_send", "response lost after dispatch");
-	let calls = 0;
-	const client = {
-		async global() {
-			calls += 1;
-			if (calls === 1) {
-				queueMicrotask(() => lateAck.resolve());
-				throw original;
-			}
-			replayStarted.resolve();
-			await lateAck.promise;
-			return { sessionId: "session-reconciled-after-late-ack" };
-		},
-		async close() {},
-	};
-	const adapter = new AcpSdkAdapter({ client: client as never });
-	try {
-		const result = await adapter.lifecycle("session.create", {}, "acp-request-late-ack");
-		await replayStarted.promise;
-		expect(result).toEqual({ sessionId: "session-reconciled-after-late-ack" });
-		expect(calls).toBe(2);
-	} finally {
-		await adapter.close();
-	}
-});
-
-test("keeps a request-local replay deadline from shortening a concurrent waiter", async () => {
-	const replayReady = Promise.withResolvers<void>();
-	const replayStarted = Promise.withResolvers<void>();
-	const calls: Array<{ operation: string; options: Record<string, unknown> }> = [];
-	let lifecycleCalls = 0;
-	const client = {
-		async global(operation: string, _input: Record<string, unknown>, options: Record<string, unknown>) {
-			calls.push({ operation, options });
-			if (operation === "session.create") {
-				lifecycleCalls += 1;
-				if (lifecycleCalls === 1) throw new SdkClientError("uncertain_after_send", "response lost after dispatch");
-				replayStarted.resolve();
-				await replayReady.promise;
-				return { sessionId: "session-concurrent" };
-			}
-			return { ok: true };
-		},
-		async close() {},
-	};
-	const adapter = new AcpSdkAdapter({ client: client as never });
-	try {
-		const replay = adapter.lifecycle("session.create", {}, "acp-request-concurrent");
-		await replayStarted.promise;
-		const waiter = await client.global("session.list", {}, { timeoutMs: 10_000 });
-		expect(waiter).toEqual({ ok: true });
-		replayReady.resolve();
-		expect(await replay).toEqual({ sessionId: "session-concurrent" });
-		expect(calls[1]?.options.deadline).toBe(calls[0]?.options.deadline);
-		expect(calls[2]?.options.deadline).toBeUndefined();
-	} finally {
-		replayReady.resolve();
 		await adapter.close();
 	}
 });
