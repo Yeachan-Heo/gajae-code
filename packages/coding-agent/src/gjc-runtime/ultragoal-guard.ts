@@ -25,6 +25,7 @@ import {
 	type UltragoalPlan,
 	type UltragoalReceiptKind,
 } from "./ultragoal-runtime";
+import { isLowRiskTerminalCriticOmissionSelection } from "./ultragoal-validation-policy";
 
 export type UltragoalGuardState =
 	| "inactive"
@@ -261,31 +262,6 @@ export function validateCompletionReceipt(input: {
 			goalId: input.goal.id,
 		};
 	}
-	if (input.receiptKind === "final-aggregate") {
-		const checkpointEvent = findLedgerReceiptEvent(input.ledger, receipt);
-		if (checkpointEvent) {
-			const qualityGate =
-				typeof checkpointEvent.qualityGateJson === "object" &&
-				checkpointEvent.qualityGateJson !== null &&
-				!Array.isArray(checkpointEvent.qualityGateJson)
-					? (checkpointEvent.qualityGateJson as Record<string, unknown>)
-					: undefined;
-			const criticReview =
-				qualityGate &&
-				typeof qualityGate.criticReview === "object" &&
-				qualityGate.criticReview !== null &&
-				!Array.isArray(qualityGate.criticReview)
-					? (qualityGate.criticReview as Record<string, unknown>)
-					: undefined;
-			if (criticReview?.verdict !== "OKAY") {
-				return {
-					state: "active_missing_critic_verdict",
-					message: `Ultragoal ${input.goal.id} final aggregate receipt checkpoint requires criticReview with verdict OKAY.`,
-					goalId: input.goal.id,
-				};
-			}
-		}
-	}
 	if (receipt.validationBatch?.role === "deferred-member") {
 		return validateDeferredMemberReceiptFresh({
 			plan: input.plan,
@@ -304,6 +280,32 @@ export function validateCompletionReceipt(input: {
 		receiptKind: input.receiptKind,
 	});
 	if (baseDiagnostic) return baseDiagnostic;
+	if (input.receiptKind === "final-aggregate") {
+		const checkpointEvent = findLedgerReceiptEvent(input.ledger, receipt);
+		const qualityGate =
+			typeof checkpointEvent?.qualityGateJson === "object" &&
+			checkpointEvent.qualityGateJson !== null &&
+			!Array.isArray(checkpointEvent.qualityGateJson)
+				? (checkpointEvent.qualityGateJson as Record<string, unknown>)
+				: undefined;
+		const criticReview =
+			qualityGate &&
+			typeof qualityGate.criticReview === "object" &&
+			qualityGate.criticReview !== null &&
+			!Array.isArray(qualityGate.criticReview)
+				? (qualityGate.criticReview as Record<string, unknown>)
+				: undefined;
+		if (
+			criticReview?.verdict !== "OKAY" &&
+			!isLowRiskTerminalCriticOmissionSelection(qualityGate?.validationLaneSelection)
+		) {
+			return {
+				state: "active_missing_critic_verdict",
+				message: `Ultragoal ${input.goal.id} final aggregate receipt checkpoint requires criticReview with verdict OKAY unless its fresh, runtime-validated lane selection proves the low-risk unchanged-basis omission.`,
+				goalId: input.goal.id,
+			};
+		}
+	}
 	if (input.receiptKind === "final-aggregate") {
 		if (terminalCriticCeilingReached(input.ledger) && !terminalCriticGateOverridden(input.ledger)) {
 			return {

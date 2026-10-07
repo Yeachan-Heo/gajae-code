@@ -160,6 +160,36 @@ export function validationLaneSelectionFor(
 	};
 }
 
+/**
+ * Recognize the only durable lane-selection shape that can justify omitting a
+ * terminal critic at the completion guard. The validator separately proves
+ * these declared facts against the computed change set, plan, and ledger; the
+ * guard calls this only after the receipt hash has tied the gate to that
+ * runtime-validated checkpoint.
+ */
+export function isLowRiskTerminalCriticOmissionSelection(value: unknown): boolean {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const selection = value as Record<string, unknown>;
+	if (selection.riskClass !== "low") return false;
+	if (
+		!Array.isArray(selection.reasons) ||
+		selection.reasons.length !== 2 ||
+		selection.reasons[0] !== "riskClass=low" ||
+		selection.reasons[1] !== "basisUnchanged=true"
+	) {
+		return false;
+	}
+	if (!Array.isArray(selection.omittedLanes) || selection.omittedLanes.length !== 3) return false;
+	const omitted = new Set(selection.omittedLanes);
+	return (
+		omitted.size === 3 &&
+		omitted.has("architect") &&
+		omitted.has("cleaner") &&
+		omitted.has("terminal-critic") &&
+		!omitted.has("qa")
+	);
+}
+
 export function isMigrationChangePath(row: UltragoalChangeSetPath): boolean {
 	const candidates = [row.path, row.oldPath]
 		.filter((value): value is string => typeof value === "string")

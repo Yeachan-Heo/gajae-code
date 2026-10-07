@@ -86,6 +86,7 @@ import {
 	runUltragoalSuccessionCommand,
 } from "./ultragoal-succession";
 import {
+	isLowRiskTerminalCriticOmissionSelection,
 	resolveUltragoalValidationApplicability,
 	type UltragoalValidationApplicability,
 	type UltragoalValidationLane,
@@ -2930,7 +2931,10 @@ async function validateCompletionQualityGate(
 		// of duplicating the already-joined review with another read pass.
 		const criticReview = qualityGateObject(gate.criticReview);
 		const criticProportionallySatisfied =
-			lowRiskReduced && applicability.basisUnchanged && !applicability.hasOpenReviewBlockers;
+			lowRiskReduced &&
+			applicability.basisUnchanged &&
+			!applicability.hasOpenReviewBlockers &&
+			isLowRiskTerminalCriticOmissionSelection(laneSelection);
 		if (criticReview?.verdict !== "OKAY" && !criticProportionallySatisfied) {
 			found.add(
 				"criticReview.verdict",

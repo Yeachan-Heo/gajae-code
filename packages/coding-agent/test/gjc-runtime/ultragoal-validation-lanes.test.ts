@@ -3,14 +3,21 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { UltragoalChangeSetPath } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-change-set";
+import { validateCompletionReceipt } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-guard";
 import {
+	checkpointUltragoalGoal,
 	computeCheckpointChangeSet,
 	computeUltragoalReviewSourceHash,
 	createUltragoalPlan,
+	readUltragoalLedger,
 	runNativeUltragoalCommand,
+	startNextUltragoalGoal,
 	validateUltragoalQualityGateReadOnly,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
-import { isHighRiskChangePath } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-validation-policy";
+import {
+	isHighRiskChangePath,
+	isLowRiskTerminalCriticOmissionSelection,
+} from "@gajae-code/coding-agent/gjc-runtime/ultragoal-validation-policy";
 
 const TEST_SESSION_ID = "test-session-4560";
 
@@ -146,6 +153,22 @@ describe("ultragoal validation lane selection gate (#4560)", () => {
 		expect(isHighRiskChangePath(path("packages/natives/native/index.js", "generated-binding"))).toBe(true);
 	});
 
+	it("recognizes only the exact low-risk terminal-critic omission proof shape", () => {
+		const valid = {
+			riskClass: "low",
+			reasons: ["riskClass=low", "basisUnchanged=true"],
+			omittedLanes: ["cleaner", "architect", "terminal-critic"],
+		};
+		expect(isLowRiskTerminalCriticOmissionSelection(valid)).toBe(true);
+		expect(
+			isLowRiskTerminalCriticOmissionSelection({ ...valid, reasons: ["riskClass=low", "basisUnchanged=false"] }),
+		).toBe(false);
+		expect(isLowRiskTerminalCriticOmissionSelection({ ...valid, omittedLanes: ["cleaner", "architect", "qa"] })).toBe(
+			false,
+		);
+		expect(isLowRiskTerminalCriticOmissionSelection({ ...valid, riskClass: "high" })).toBe(false);
+	});
+
 	async function sourceHash(): Promise<string> {
 		const result = await runNativeUltragoalCommand(["quality-gate", "source-hash", "--json"], root);
 		expect(result.status).toBe(0);
@@ -252,6 +275,38 @@ describe("ultragoal validation lane selection gate (#4560)", () => {
 		});
 		expect(result.errors).toEqual([]);
 		expect(result.valid).toBe(true);
+	});
+
+	it("accepts a fresh final receipt when the validated low-risk proof omits terminal critic", async () => {
+		await seedPlan(1, { "packages/utils/src/helper.ts": "export const x = 1;\n" });
+		const frozen = await sourceHash();
+		await seedPriorCohort(frozen);
+		const gate = baseGate(frozen, { qa: lane(frozen) });
+		gate.validationLaneSelection = {
+			riskClass: "low",
+			reasons: ["riskClass=low", "basisUnchanged=true"],
+			omittedLanes: ["cleaner", "architect", "terminal-critic"],
+		};
+		const validation = await validateUltragoalQualityGateReadOnly({
+			cwd: root,
+			qualityGateJson: JSON.stringify(gate),
+			goalId: "G001",
+		});
+		expect(validation.valid).toBe(true);
+		await startNextUltragoalGoal({ cwd: root });
+		const plan = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "QA passed for unchanged low-risk source basis",
+			qualityGateJson: JSON.stringify(gate),
+		});
+		const goal = plan.goals.find(item => item.id === "G001");
+		expect(goal?.completionVerification?.receiptKind).toBe("final-aggregate");
+		const ledger = await readUltragoalLedger(root);
+		expect(validateCompletionReceipt({ plan, ledger, goal: goal!, receiptKind: "final-aggregate" }).state).toBe(
+			"active_verified_complete",
+		);
 	});
 
 	it("rejects the reduced cohort when the runtime computes high risk", async () => {

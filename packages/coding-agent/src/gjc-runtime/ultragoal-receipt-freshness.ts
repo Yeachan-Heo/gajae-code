@@ -7,6 +7,7 @@ import type {
 	UltragoalPlan,
 	UltragoalReceiptKind,
 } from "./ultragoal-runtime";
+import { isLowRiskTerminalCriticOmissionSelection } from "./ultragoal-validation-policy";
 
 export const CRITIC_VERDICT_EVENT = "critic_verdict";
 export const CRITIC_GATE_HARD_STOP_EVENT = "critic_gate_hard_stop";
@@ -306,11 +307,10 @@ export function findLedgerReceiptEvent(
 	);
 }
 /**
- * A final-aggregate receipt whose recorded ledger checkpoint quality gate is
- * missing a clean `criticReview` OKAY can never satisfy the completion guard,
- * yet is not "stale" under {@link validateReceiptFreshBase}. Detect it so an
- * identical-evidence complete replay can re-verify and re-mint with a
- * corrected gate instead of no-opping into a permanently blocked run.
+ * A final-aggregate receipt whose recorded checkpoint has neither a clean
+ * critic verdict nor the runtime-validated low-risk omission proof can never
+ * satisfy the completion guard. Detect it so identical-evidence replay can
+ * re-verify it instead of no-opping into a permanently blocked run.
  */
 export function finalAggregateReceiptMissingCriticOkay(
 	ledger: readonly UltragoalLedgerEvent[],
@@ -321,9 +321,14 @@ export function finalAggregateReceiptMissingCriticOkay(
 	if (!event) return false;
 	const gate = event.qualityGateJson;
 	if (typeof gate !== "object" || gate === null || Array.isArray(gate)) return true;
-	const criticReview = (gate as Record<string, unknown>).criticReview;
-	if (typeof criticReview !== "object" || criticReview === null || Array.isArray(criticReview)) return true;
-	return (criticReview as Record<string, unknown>).verdict !== "OKAY";
+	const gateObject = gate as Record<string, unknown>;
+	const criticReview = gateObject.criticReview;
+	const hasOkayCritic =
+		typeof criticReview === "object" &&
+		criticReview !== null &&
+		!Array.isArray(criticReview) &&
+		(criticReview as Record<string, unknown>).verdict === "OKAY";
+	return !hasOkayCritic && !isLowRiskTerminalCriticOmissionSelection(gateObject.validationLaneSelection);
 }
 
 export function validateReceiptFreshBase(input: {
