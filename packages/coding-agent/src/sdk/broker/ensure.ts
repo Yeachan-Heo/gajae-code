@@ -1153,7 +1153,7 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 			exitedBeforeDiscovery &&
 			(trustedMarker?.reason.startsWith(`Failed to acquire lock for ${startupLockPath} after `) === true ||
 				brokerStartupFailureCleanupTargetsLock(trustedMarker, `${startupLockPath}.lock`));
-		if (!startupFenceContention && exitedBeforeDiscovery && child.exitCode !== 0) {
+		if (!startupFenceContention && exitedBeforeDiscovery) {
 			try {
 				startupFenceContention = (await fs.stat(`${startupLockPath}.lock`)).isDirectory();
 			} catch {
