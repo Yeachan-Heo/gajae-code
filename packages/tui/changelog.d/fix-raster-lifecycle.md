@@ -6,4 +6,3 @@
 ### Fixed
 
 - Render commits queued behind held raster operations are now properly fenced and deferred until raster operations complete or the TUI is disposed.
-- Display consistency is preserved when orphan assistant output is recovered after forced abort scenarios.

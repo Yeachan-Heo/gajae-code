@@ -3320,18 +3320,13 @@ export class SelectorController {
 							return;
 						}
 
-						// Update UI — pass the context built by navigateTree to skip a second O(N) walk.
-						// Detach the live streaming component before the disposing clear() so the
-						// component we re-add below is not torn down (detach != dispose).
-						if (this.ctx.streamingComponent) {
-							this.ctx.chatContainer.detachChild(this.ctx.streamingComponent);
-						}
+						// Navigation committed a different transcript, so retire transient UI from
+						// the predecessor turn instead of carrying its partial response into the
+						// selected branch.
+						this.#clearTransientSessionUi({ clearSpecializedLoaders: true });
+
+						// Pass the context built by navigateTree to skip a second O(N) walk.
 						this.ctx.rebuildInitialMessages("reconcile-same-transcript", result.sessionContext);
-						// If streaming, re-add the streaming component with current content and re-render
-						if (this.ctx.streamingComponent && this.ctx.streamingMessage) {
-							this.ctx.streamingComponent.updateContent(this.ctx.streamingMessage, { streaming: true });
-							this.ctx.chatContainer.addChild(this.ctx.streamingComponent);
-						}
 						await this.ctx.reloadTodos();
 						if (this.ctx.isStopped?.()) return;
 						if (result.editorText && !this.ctx.editor.getText().trim()) {
