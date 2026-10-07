@@ -8745,6 +8745,7 @@ export class SessionManager {
 			this.#adoptedArtifactManager = issued.adoptedArtifactManager;
 			this.#artifactLifecycle = Symbol("session-artifact-rollback");
 			installed = true;
+			this.#resetCloseRetryOriginForLifecycleCommit();
 			this.#disposeResidentTextStore(predecessorStore);
 			try {
 				managedTransition?.settle();
@@ -8841,6 +8842,7 @@ export class SessionManager {
 			this.#adoptedArtifactManager = issued.adoptedArtifactManager;
 			this.#artifactLifecycle = Symbol("session-artifact-rollback");
 			this.#commitResidentTextStoreTransition(prepared);
+			this.#resetCloseRetryOriginForLifecycleCommit();
 			managedTransition?.settle();
 			if (this.#sessionFile) writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 		} catch (error) {
@@ -12604,6 +12606,15 @@ export class SessionManager {
 			});
 		}
 		return normalized;
+	}
+	/** A successful lifecycle commit replaces the writer/session that certified this retry origin. */
+	#resetCloseRetryOriginForLifecycleCommit(): void {
+		const closeRetryOriginError = this.#closeRetryOriginError;
+		this.#closeRetryOriginError = undefined;
+		if (closeRetryOriginError && this.#persistError === closeRetryOriginError) {
+			this.#persistError = undefined;
+			this.#persistErrorReported = false;
+		}
 	}
 
 	#queuePersistTask(task: () => Promise<void>, options?: { ignoreError?: boolean }): Promise<void> {

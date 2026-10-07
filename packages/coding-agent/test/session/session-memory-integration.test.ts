@@ -3961,6 +3961,61 @@ describe("whole-session persistence freshness", () => {
 			await freshManager.close().catch(() => {});
 		}
 	});
+	it("resets a stale close origin when rollback replaces the writer", async () => {
+		class RollbackCloseStorage extends MemorySessionStorage {
+			closeDispatches = 0;
+			override openWriter(filePath: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter {
+				if (filePath.includes(".spill.")) return super.openWriter(filePath, options);
+				return super.openWriter(filePath, {
+					...options,
+					closeAdapter: {
+						close: () => {
+							this.closeDispatches++;
+							if (this.closeDispatches === 1)
+								throw new SessionStorageWriterRetryableCloseError("writer_close_error_x");
+							if (this.closeDispatches === 3)
+								throw new SessionStorageWriterRetryableCloseError("writer_close_error_y");
+						},
+					},
+				});
+			}
+		}
+
+		const storage = new RollbackCloseStorage();
+		const sessionFile = "/sessions/rollback-close-origin.jsonl";
+		storage.writeTextSync(
+			sessionFile,
+			`${JSON.stringify({ type: "session", version: 5, id: "rollback-close-origin", timestamp: "0", cwd: "/cwd" })}\n`,
+		);
+		storage.writeTextSync(
+			"/sessions/rollback-close-origin-successor.jsonl",
+			`${JSON.stringify({ type: "session", version: 5, id: "rollback-close-origin-successor", timestamp: "0", cwd: "/cwd" })}\n`,
+		);
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"off",
+		);
+		try {
+			manager.appendCustomEntry("before-close-retry", { value: 1 });
+			await manager.flush();
+			const rollback = await manager.captureRollbackState();
+			await expect(manager.setSessionFile("/sessions/rollback-close-origin-successor.jsonl")).rejects.toThrow(
+				"writer_close_error_x",
+			);
+			await manager.restoreRollbackState(rollback);
+			manager.appendCustomEntry("after-rollback", { value: 2 });
+			await manager.flush();
+			await expect(manager.close()).rejects.toThrow("writer_close_error_y");
+			await expect(manager.close()).resolves.toBeUndefined();
+			expect(storage.closeDispatches).toBe(4);
+			expect(storage.readTextSync(sessionFile)).toContain('"value":2');
+		} finally {
+			await manager.close().catch(() => {});
+		}
+	});
 	it("reprepares queued patches when a direct append invalidates their persistence token", async () => {
 		const storage = new MemorySessionStorage();
 		const sessionFile = "/sessions/patch-race.jsonl";
