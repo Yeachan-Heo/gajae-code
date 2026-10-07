@@ -4,6 +4,8 @@ import { SessionManager } from "@gajae-code/coding-agent/session/session-manager
 import { FileSessionStorage } from "@gajae-code/coding-agent/session/session-storage";
 import { TempDir } from "@gajae-code/utils";
 
+type SessionStateSnapshot = Parameters<SessionManager["restoreState"]>[0];
+
 describe("lifecycle contracts regression (PR #6428)", () => {
 	it("rejects restoreState during strict close", async () => {
 		using root = TempDir.createSync("@pi-restore-state-strict-close-");
@@ -219,23 +221,28 @@ describe("lifecycle contracts regression (PR #6428)", () => {
 	it("serializes explicit persist identity through all JSON-safe operations", async () => {
 		const testCases: Array<{
 			name: string;
-			transform: (snapshot: any) => any;
+			transform: (snapshot: SessionStateSnapshot) => SessionStateSnapshot;
+			adoptedArtifactManager: "preserved" | "rejected";
 		}> = [
 			{
 				name: "direct snapshot",
-				transform: (s: any) => s,
+				transform: (snapshot: SessionStateSnapshot) => snapshot,
+				adoptedArtifactManager: "preserved",
 			},
 			{
 				name: "spread operator copy",
-				transform: (s: any) => ({ ...s }),
+				transform: (snapshot: SessionStateSnapshot) => ({ ...snapshot }),
+				adoptedArtifactManager: "preserved",
 			},
 			{
 				name: "structuredClone copy",
-				transform: (s: any) => structuredClone(s),
+				transform: (snapshot: SessionStateSnapshot) => structuredClone(snapshot),
+				adoptedArtifactManager: "rejected",
 			},
 			{
 				name: "JSON.stringify/parse round-trip",
-				transform: (s: any) => JSON.parse(JSON.stringify(s)),
+				transform: (snapshot: SessionStateSnapshot) => JSON.parse(JSON.stringify(snapshot)) as SessionStateSnapshot,
+				adoptedArtifactManager: "rejected",
 			},
 		];
 
@@ -276,6 +283,28 @@ describe("lifecycle contracts regression (PR #6428)", () => {
 						throw new Error(`${testCase.name}: Expected identity to survive transformation`);
 					expect(transformedIdentity).toBeTruthy();
 					expect(transformedIdentity.sessionId).toBe(snapshotA.sessionId);
+
+					// Live adopted artifact managers survive reference-preserving copies,
+					// but JSON-safe deep copies must not install their plain-object shells.
+					const artifactManager = managerA.getArtifactManager();
+					if (!artifactManager) throw new Error(`${testCase.name}: Expected artifact manager`);
+					managerA.adoptArtifactManager(artifactManager);
+					const snapshotWithArtifactManager = managerA.captureState();
+					const transformedArtifactSnapshot = testCase.transform(snapshotWithArtifactManager);
+					const managerWithArtifactSnapshot = SessionManager.create(root.path(), root.path(), storage);
+					try {
+						if (testCase.adoptedArtifactManager === "preserved") {
+							managerWithArtifactSnapshot.restoreState(transformedArtifactSnapshot);
+							expect(managerWithArtifactSnapshot.getArtifactManager()).toBe(artifactManager);
+						} else {
+							expect(transformedArtifactSnapshot.adoptedArtifactManager).not.toBe(artifactManager);
+							expect(() => managerWithArtifactSnapshot.restoreState(transformedArtifactSnapshot)).toThrow(
+								"Session rollback adopted artifact manager is not live.",
+							);
+						}
+					} finally {
+						await managerWithArtifactSnapshot.close();
+					}
 
 					// Scenario 1a: same-manager restore
 					managerA.restoreState(transformedSnapshot);
@@ -369,16 +398,18 @@ describe("lifecycle contracts regression (PR #6428)", () => {
 			const serialized = JSON.stringify(snapshot);
 			const deserialized = JSON.parse(serialized);
 
-			// The deserialized snapshot no longer has the adoptedArtifactManager
-			// since ArtifactManager is a live object that cannot be serialized.
-			// JSON.stringify loses the manager reference; it becomes an empty object or null.
+			// JSON serialization turns the live manager into a plain object, which
+			// cannot safely be adopted by another session manager.
 			expect(deserialized.adoptedArtifactManager).not.toBe(snapshot.adoptedArtifactManager);
 
 			// Create a new manager and restore the deserialized snapshot
 			const restoringManager = SessionManager.create(root.path(), root.path(), storage);
 			try {
-				restoringManager.restoreState(deserialized);
-				// The restored manager no longer has the adopted artifact manager
+				const originalSessionId = restoringManager.getSessionId();
+				expect(() => restoringManager.restoreState(deserialized)).toThrow(
+					"Session rollback adopted artifact manager is not live.",
+				);
+				expect(restoringManager.getSessionId()).toBe(originalSessionId);
 				expect(restoringManager.getArtifactManager()?.dir).not.toBe(parentArtifactManager.dir);
 			} finally {
 				await restoringManager.close();

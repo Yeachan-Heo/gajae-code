@@ -8507,6 +8507,9 @@ export class SessionManager {
 	): Readonly<SessionManagerStateSnapshot> & { readonly explicitPersistIdentity?: ExplicitPersistIdentity } {
 		const issued = this.#stateSnapshots.get(snapshot);
 		if (issued) return issued;
+		if (snapshot.adoptedArtifactManager !== null && !(snapshot.adoptedArtifactManager instanceof ArtifactManager)) {
+			throw new Error("Session rollback adopted artifact manager is not live.");
+		}
 		// Preserve explicit identity from cross-manager adoptions. The identity is now
 		// stored as an enumerable property on the snapshot so it survives documented
 		// caller-adjusted copies (spread, JSON round-trip, structuredClone, etc.).
