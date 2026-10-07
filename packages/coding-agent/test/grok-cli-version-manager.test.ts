@@ -1,29 +1,15 @@
-import { beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { beforeEach, describe, expect, it } from "bun:test";
 import {
 	getFallbackVersion,
 	getGrokCliVersion,
 	parseMinimumVersionFrom426,
-	resetVersionCacheAndWaitForPending,
+	resetVersionCache,
 	updateVersionFromError,
 } from "../src/defaults/gjc/extensions/grok-cli-vendor/src/provider/version-manager";
 
 describe("Grok CLI version manager", () => {
-	beforeEach(async () => {
-		await resetVersionCacheAndWaitForPending();
-	});
-
-	it("returns fallback version when GitHub API is unavailable", async () => {
-		const fetchSpy = spyOn(globalThis, "fetch").mockRejectedValueOnce(new Error("Network error"));
-		try {
-			const version = getGrokCliVersion();
-			// First call returns fallback while background fetch fails
-			expect(version).toBe(getFallbackVersion());
-			expect(version).toBe("1.0.13");
-			// Wait for background fetch to complete
-			await resetVersionCacheAndWaitForPending();
-		} finally {
-			fetchSpy.mockRestore();
-		}
+	beforeEach(() => {
+		resetVersionCache();
 	});
 
 	describe("parseMinimumVersionFrom426", () => {
@@ -123,56 +109,6 @@ describe("Grok CLI version manager", () => {
 		it("returns fallback when no version is cached or learned", () => {
 			const version = getGrokCliVersion();
 			expect(version).toBe(getFallbackVersion());
-		});
-	});
-
-	describe("GitHub release fetching", () => {
-		it("triggers background fetch on first call when no version is cached", async () => {
-			const fetchSpy = spyOn(globalThis, "fetch").mockResponseOnce(JSON.stringify({ tag_name: "v1.2.3" }));
-
-			try {
-				// First call should return fallback and start background fetch
-				const version1 = getGrokCliVersion();
-				expect(version1).toBe(getFallbackVersion());
-
-				// Wait for background fetch to complete
-				await resetVersionCacheAndWaitForPending();
-
-				// Next call should use the fetched version
-				const version2 = getGrokCliVersion();
-				expect(version2).toBe("1.2.3");
-
-				// Verify fetch was called
-				expect(fetchSpy).toHaveBeenCalledWith(
-					"https://api.github.com/repos/xai-org/grok-cli/releases/latest",
-					expect.any(Object),
-				);
-			} finally {
-				fetchSpy.mockRestore();
-			}
-		});
-
-		it("learned version takes priority over GitHub-fetched version", async () => {
-			const fetchSpy = spyOn(globalThis, "fetch").mockResponseOnce(JSON.stringify({ tag_name: "v1.0.10" }));
-
-			try {
-				// First, learn a newer version from 426 error
-				const errorBody = "Your Grok CLI version (0.2.33) is outdated. Please update to version 2.0.0 or later";
-				updateVersionFromError(errorBody);
-
-				// Learned version should be returned (higher priority)
-				const version1 = getGrokCliVersion();
-				expect(version1).toBe("2.0.0");
-
-				// Wait for any background fetch
-				await resetVersionCacheAndWaitForPending();
-
-				// Still returns the learned version since it's higher priority
-				const version2 = getGrokCliVersion();
-				expect(version2).toBe("2.0.0");
-			} finally {
-				fetchSpy.mockRestore();
-			}
 		});
 	});
 });

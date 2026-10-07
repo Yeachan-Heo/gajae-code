@@ -1,108 +1,23 @@
 /**
  * Grok CLI version manager with 426 error handling.
  *
- * Resolves the Grok CLI version from GitHub releases with a 24-hour cache,
- * falls back to a hardcoded version if GitHub is unavailable,
- * and learns versions from xAI HTTP 426 "version outdated" responses.
+ * Learns the minimum required Grok CLI version from xAI HTTP 426 "version outdated" responses.
+ * Falls back to a hardcoded version if no 426 has been received.
  * Version updates are monotonic: learned versions never downgrade.
  */
 
 const FALLBACK_VERSION = '1.0.13';
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
-interface VersionCache {
-  version: string;
-  timestamp: number;
-}
-
-// Minimum version xAI demanded in its last HTTP 426 response.
+// Minimum version xAI demanded in its latest HTTP 426 response.
 // A server-stated minimum never becomes less true, so it has no expiry.
 let learnedVersion: string | null = null;
 
-// Cached version from GitHub releases with timestamp for TTL tracking.
-let versionCache: VersionCache | null = null;
-
-// Background GitHub fetch promise to avoid concurrent requests.
-let fetchPromise: Promise<string | null> | null = null;
-
-/**
- * Fetch the latest Grok CLI version from GitHub releases.
- * Returns null if the fetch fails or times out.
- */
-async function fetchLatestVersionFromGitHub(): Promise<string | null> {
-  try {
-    // Fetch latest release from xAI/grok-cli repository
-    const response = await fetch(
-      'https://api.github.com/repos/xai-org/grok-cli/releases/latest',
-      { signal: AbortSignal.timeout(5000) }, // 5 second timeout
-    );
-
-    if (!response.ok) return null;
-
-    const data = (await response.json()) as { tag_name?: string };
-    // Extract version from tag name (e.g., "v1.0.20" -> "1.0.20")
-    const tag = data.tag_name;
-    if (tag && typeof tag === 'string') {
-      return tag.replace(/^v/, '');
-    }
-    return null;
-  } catch {
-    // Network errors, timeouts, and JSON parse errors all return null
-    return null;
-  }
-}
-
 /**
  * Get the current Grok CLI version: learned from 426 responses (never downgrades),
- * then cached from GitHub (with 24-hour TTL), otherwise the fallback version.
- * The GitHub fetch happens in the background on first call and does not block.
+ * otherwise the fallback version.
  */
 export function getGrokCliVersion(): string {
-  // Learned versions (from 426 errors) have priority and never expire
-  if (learnedVersion) {
-    return learnedVersion;
-  }
-
-  // Check if cached version is still fresh
-  if (versionCache) {
-    const age = Date.now() - versionCache.timestamp;
-    if (age < CACHE_TTL_MS) {
-      return versionCache.version;
-    }
-  }
-
-  // Return the last known cached version (stale but better than fallback)
-  // while a fresh fetch happens in the background
-  if (versionCache) {
-    startBackgroundVersionFetch();
-    return versionCache.version;
-  }
-
-  // No cached version and no learned version: start background fetch
-  startBackgroundVersionFetch();
-  return FALLBACK_VERSION;
-}
-
-/**
- * Trigger a background GitHub version fetch without blocking the caller.
- * Prevents concurrent fetch requests by tracking the promise.
- */
-function startBackgroundVersionFetch(): void {
-  // Avoid concurrent GitHub fetches
-  if (fetchPromise) return;
-
-  fetchPromise = fetchLatestVersionFromGitHub()
-    .then((freshVersion) => {
-      // Cache the fetched version if successful
-      if (freshVersion) {
-        versionCache = { version: freshVersion, timestamp: Date.now() };
-      }
-      return freshVersion;
-    })
-    .finally(() => {
-      // Allow the next fetch to proceed
-      fetchPromise = null;
-    });
+  return learnedVersion ?? FALLBACK_VERSION;
 }
 
 /**
@@ -151,30 +66,10 @@ function isVersionGreater(version1: string, version2: string): boolean {
 }
 
 /**
- * Reset all version caches (mainly for testing).
- * Clears both the GitHub-fetched cache and the learned version from 426 errors.
+ * Reset the learned version (mainly for testing).
  */
 export function resetVersionCache(): void {
   learnedVersion = null;
-  versionCache = null;
-  // Note: we do NOT cancel fetchPromise here since it's an async background operation
-  // and callers may need to await its completion to properly clear state
-}
-
-/**
- * Reset and wait for any pending background fetch to complete.
- * Used in tests to ensure clean state before assertions.
- */
-export async function resetVersionCacheAndWaitForPending(): Promise<void> {
-  resetVersionCache();
-  if (fetchPromise) {
-    try {
-      await fetchPromise;
-    } catch {
-      // Ignore errors in pending fetch
-    }
-    fetchPromise = null;
-  }
 }
 
 /**

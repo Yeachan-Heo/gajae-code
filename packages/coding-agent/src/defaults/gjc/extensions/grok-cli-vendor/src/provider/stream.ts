@@ -16,7 +16,7 @@ import { getGrokCliVersion, updateVersionFromError } from './version-manager';
  *   - x-grok-conv-id: <session/conversation ID>
  *   - x-grok-model-override: <model ID>
  *   - x-xai-token-auth: xai-grok-cli
- *   - x-grok-client-version: resolved dynamically from GitHub releases (cached)
+ *   - x-grok-client-version: learned from HTTP 426 responses; defaults to 1.0.13
  */
 export function streamGrokCli(
   model: Model<Api>,
@@ -25,8 +25,7 @@ export function streamGrokCli(
 ): AssistantMessageEventStream {
   const sessionId = options?.sessionId;
 
-  // Get the cached Grok CLI version (or fallback if not yet fetched)
-  // The version manager fetches from GitHub in the background on first call
+  // Get the Grok CLI version: learned from 426 responses or fallback
   const grokCliVersion = getGrokCliVersion();
 
   const headers: Record<string, string> = {
@@ -54,6 +53,9 @@ export function streamGrokCli(
     ...options,
     headers,
     fetch: wrappedFetch,
+    onResponse(response) {
+      options?.onResponse?.(response, model);
+    },
   });
 }
 
