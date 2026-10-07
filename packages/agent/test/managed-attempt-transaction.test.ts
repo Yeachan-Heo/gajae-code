@@ -3987,7 +3987,13 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 			content: [{ type: "text", text: "already streamed" }],
 		});
 	});
-	it("commits terminal-only statusless overload content without a delta (#6426)", async () => {
+	it.each<[string, AssistantMessage["content"]]>([
+		["text", [{ type: "text", text: "terminal-only content" }]],
+		["thinking", [{ type: "thinking", thinking: "terminal-only thinking" }]],
+		["thinkingSignature", [{ type: "thinking", thinking: "", thinkingSignature: "terminal-signature" }]],
+		["toolCall", [{ type: "toolCall", id: "terminal-tool", name: "unused", arguments: {} }]],
+		["redactedThinking", [{ type: "redactedThinking", data: "terminal-redacted" }]],
+	])("commits terminal-only statusless overload %s without a delta (#6426)", async (_kind, content) => {
 		const mock = createMockModel();
 		const streamFn = () => {
 			const stream = new AssistantMessageEventStream();
@@ -4001,7 +4007,7 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 				api: "openai-responses",
 				stopReason: "error",
 				errorMessage: "server_is_overloaded: Our servers are currently overloaded. Please try again later.",
-				content: [{ type: "text", text: "terminal-only content" }],
+				content,
 				transportFailure: {
 					kind: "transport",
 					providerCode: "server_is_overloaded",
@@ -4019,6 +4025,8 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
 			streamFn,
 		});
+		const events: AgentEvent[] = [];
+		agent.subscribe(event => events.push(event));
 
 		await agent.prompt("run", {
 			fallbackManaged: true,
@@ -4029,11 +4037,15 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 		});
 
 		expect(outcomes).toHaveLength(0);
-		expect(agent.state.messages.at(-1)).toMatchObject({
+		expect(agent.state.messages.find(message => message.role === "assistant")).toMatchObject({
 			stopReason: "error",
-			content: [{ type: "text", text: "terminal-only content" }],
+			content,
 		});
 		expect(agent.state.messages.filter(message => message.role === "assistant")).toHaveLength(1);
+		expect(events.filter(event => event.type === "message_end" && event.message.role === "assistant")).toHaveLength(
+			1,
+		);
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
 	});
 	it("discards a typed statusless overload thrown by the provider factory", async () => {
 		const mock = createMockModel();
