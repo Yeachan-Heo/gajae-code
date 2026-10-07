@@ -79,6 +79,26 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal terminal-abort steering snapshot cleanup, not a user-facing SDK control seam",
 	"agent_session:getConfiguredModelChainState":
 		"internal model-profile transaction snapshot, not a user-facing SDK control seam",
+	"agent_session:setUnavailableModelProfile":
+		"internal startup-profile recovery marker, not a user-facing SDK control seam",
+	"agent_session:getUnavailableModelProfile":
+		"internal startup-profile recovery marker, not a user-facing SDK control seam",
+	"agent_session:getConfigurationPaths":
+		"internal config hot-reload path identity projection, not a user-facing SDK control seam",
+	"agent_session:validateConfiguration":
+		"internal read-only config hot-reload preflight, not an independent SDK operation",
+	"agent_session:reloadConfiguration":
+		"internal transactional config hot-reload publication, not a user-facing SDK control seam",
+	"agent_session:getProfileInstalledOverrideState":
+		"internal model-profile activation rollback snapshot, not a user-facing SDK control seam",
+	"agent_session:restoreProfileInstalledOverrideState":
+		"internal model-profile activation rollback restoration, not a user-facing SDK control seam",
+	"agent_session:prepareModelSelectionForProfileActivation":
+		"internal staged model-selection preparation for profile activation, not a user-facing SDK control seam",
+	"agent_session:commitPreparedProfileModelSelection":
+		"internal model-selection commit for profile activation, not a user-facing SDK control seam",
+	"agent_session:finishPreparedProfileModelSelection":
+		"internal post-commit model-selection refresh for profile activation, not a user-facing SDK control seam",
 	"agent_session:getDefaultFallbackRuntimeState":
 		"internal model-profile transaction snapshot, not a user-facing SDK control seam",
 	"agent_session:restoreDefaultFallbackRuntimeState":
