@@ -472,6 +472,8 @@ export interface AgentPromptOptions {
 	toolChoice?: ToolChoice;
 	/** Disable transport replay; fallback accounting is owned by the caller. */
 	fallbackManaged?: boolean;
+	/** Session policy owns context overflow; successful empty stops remain terminal. */
+	contextOverflowManaged?: boolean;
 	/** Continue a cooperative maintenance checkpoint under its existing logical run and cancellation domain. */
 	maintenanceContinuation?: boolean;
 	/**
@@ -2020,6 +2022,7 @@ export class Agent {
 			maxRetryDelayMs: this.#maxRetryDelayMs,
 			requestMaxRetries: this.#requestMaxRetries,
 			streamMaxRetries: this.#streamMaxRetries,
+			contextOverflowManaged: options?.contextOverflowManaged,
 			streamFirstEventTimeoutMs: this.#streamFirstEventTimeoutMs,
 			...(fallbackManaged
 				? {
