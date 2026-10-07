@@ -10459,6 +10459,9 @@ export class SessionManager {
 				managedTransition?.adopt();
 				writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 				this.#commitResidentTextStoreTransition(prepared);
+				// A session replacement starts a new writer lifecycle; never let a
+				// certified close error from the predecessor authorize clearing its state.
+				this.#closeRetryOriginError = undefined;
 				if (!options?.deferEphemeralArtifactRetirement) this.#retireEphemeralArtifacts();
 			} catch (error) {
 				managedTransition?.rollback();
