@@ -5,6 +5,7 @@ import * as path from "node:path";
 import {
 	applyOwnerOnlyPathSecurity,
 	canonicalExistingDirectoryIdentity,
+	snapshotEmptyDirectory,
 	verifyOwnerOnlyPathSecurity,
 } from "../native/index.js";
 
@@ -95,5 +96,58 @@ describe("native path identity", () => {
 		await fs.writeFile(file, "{}");
 
 		expect(applyOwnerOnlyPathSecurity(file, "directory")).toMatchObject({ ok: false, code: "not_directory" });
+	});
+
+	it.skipIf(process.platform !== "linux")("snapshots an empty directory with its opened native metadata", async () => {
+		const root = await temporaryDirectory();
+		const before = await fs.lstat(root, { bigint: true });
+
+		const result = snapshotEmptyDirectory(root);
+
+		expect(result.ok).toBe(true);
+		if (!result.ok || !result.snapshot) throw new Error("Missing empty-directory snapshot");
+		expect(result.snapshot.entries).toHaveLength(1);
+		expect(result.snapshot.entries[0]).toMatchObject({
+			relativePath: "",
+			kind: "directory",
+			dev: before.dev.toString(),
+			ino: before.ino.toString(),
+			size: before.size.toString(),
+			mtimeNs: before.mtimeNs.toString(),
+		});
+		expect(result.snapshot.entries[0]?.sha256).toBeUndefined();
+		expect(result.snapshot.rootDev).toBe(before.dev.toString());
+		expect(result.snapshot.rootIno).toBe(before.ino.toString());
+	});
+
+	it.skipIf(process.platform !== "linux")(
+		"refuses ordinary files and nested directories at the empty-root boundary",
+		async () => {
+			const root = await temporaryDirectory();
+			const fileDirectory = path.join(root, "file-root");
+			const nestedDirectory = path.join(root, "nested-root");
+			await fs.mkdir(fileDirectory);
+			await fs.writeFile(path.join(fileDirectory, "payload"), Buffer.alloc(64 * 1024, 0x5a));
+			await fs.mkdir(nestedDirectory);
+			await fs.mkdir(path.join(nestedDirectory, "child"));
+			await fs.writeFile(path.join(nestedDirectory, "child", "payload"), "untouched");
+
+			expect(snapshotEmptyDirectory(fileDirectory)).toMatchObject({ ok: false, code: "directory_not_empty" });
+			expect(snapshotEmptyDirectory(nestedDirectory)).toMatchObject({
+				ok: false,
+				code: "directory_not_empty",
+			});
+			expect(await fs.readFile(path.join(nestedDirectory, "child", "payload"), "utf8")).toBe("untouched");
+		},
+	);
+
+	it.skipIf(process.platform !== "linux")("does not follow a symlink used as the root path", async () => {
+		const root = await temporaryDirectory();
+		const target = path.join(root, "target");
+		const alias = path.join(root, "alias");
+		await fs.mkdir(target);
+		await fs.symlink(target, alias);
+
+		expect(snapshotEmptyDirectory(alias).ok).toBe(false);
 	});
 });
