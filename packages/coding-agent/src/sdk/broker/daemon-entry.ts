@@ -92,6 +92,14 @@ export async function launchAuthorizedBrokerSuccessor(
 							env,
 							...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
 						});
+			if (launched.error)
+				return { kind: "refused" as const, reason: "spawn_failed" as const, detail: launched.error.message };
+			if (launched.realBrokerPid === undefined || launched.realBrokerIncarnation === undefined)
+				return {
+					kind: "refused" as const,
+					reason: "spawn_failed" as const,
+					detail: "Broker launcher returned no verified process identity.",
+				};
 			const child: ChildProcess = launched.process;
 			child.unref();
 			return {
@@ -99,7 +107,6 @@ export async function launchAuthorizedBrokerSuccessor(
 				child,
 				realBrokerPid: launched.realBrokerPid,
 				realBrokerIncarnation: launched.realBrokerIncarnation,
-				spawnError: () => launched.error,
 			};
 		} catch (spawnError) {
 			return {
@@ -114,19 +121,14 @@ export async function launchAuthorizedBrokerSuccessor(
 	const realBrokerPid = spawnOutcome.realBrokerPid ?? child.pid;
 	let expectedBrokerIncarnation =
 		spawnOutcome.realBrokerIncarnation ??
-		(realBrokerPid === undefined ? undefined : brokerProcessIncarnation(realBrokerPid));
+		(realBrokerPid !== undefined && realBrokerPid === child.pid
+			? brokerProcessIncarnation(realBrokerPid)
+			: undefined);
 	const until = Math.min(Date.now() + Math.max(1, options.deadlineAt - Date.now()), options.deadlineAt);
 	for (;;) {
-		if (spawnOutcome.spawnError())
-			return {
-				kind: "refused",
-				reason: "spawn_failed",
-				detail: spawnOutcome.spawnError()?.message,
-			};
-		// Break the poll loop only on spawn error or actual failure (signal or non-zero exit).
-		// The detached broker runs independently after spawn.
-		const failedSpawn =
-			spawnOutcome.spawnError() || child.signalCode !== null || (child.exitCode !== null && child.exitCode !== 0);
+		// The launcher exits successfully before the broker publishes; only a failed
+		// launcher or the broker's own identity observation can terminate this wait.
+		const failedSpawn = child.signalCode !== null || (child.exitCode !== null && child.exitCode !== 0);
 		if (failedSpawn) return { kind: "refused", reason: "spawn_exited_before_publication" };
 		if (realBrokerPid !== undefined) {
 			const observation = observeProcessIncarnation(realBrokerPid);
@@ -137,7 +139,11 @@ export async function launchAuthorizedBrokerSuccessor(
 					observation.incarnation !== expectedBrokerIncarnation)
 			)
 				return { kind: "refused", reason: "spawn_exited_before_publication" };
-			if (observation.status === "present" && expectedBrokerIncarnation === undefined) {
+			if (
+				observation.status === "present" &&
+				expectedBrokerIncarnation === undefined &&
+				realBrokerPid === child.pid
+			) {
 				expectedBrokerIncarnation = observation.incarnation;
 			}
 		}

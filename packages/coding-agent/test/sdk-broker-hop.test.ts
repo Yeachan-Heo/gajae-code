@@ -58,7 +58,7 @@ describe("SDK broker hop protocol", () => {
 	test("hop reports a live detached broker pid that outlives the hop, and reap targets that pid", async () => {
 		// Use Bun for cross-platform sleep instead of shell utility
 		const sleepScript = path.join(tempDir, "sleep-broker.js");
-		await fs.writeFile(sleepScript, `await Bun.sleep(30000);`);
+		await Bun.write(sleepScript, `await Bun.sleep(30000);`);
 		const launched = await launchBrokerViaHop(
 			{ command: { file: process.execPath, args: [sleepScript] }, cwd: tempDir },
 			{ env: process.env, cwd: tempDir },
@@ -73,10 +73,8 @@ describe("SDK broker hop protocol", () => {
 		expect(isPidAlive(pid)).toBe(true);
 
 		// Reaping through the exited hop's ChildProcess must signal the reported broker pid.
-		const observed = observeProcessIncarnation(pid);
-		const incarnation =
-			launched.realBrokerIncarnation ?? (observed.status === "present" ? observed.incarnation : undefined);
-		expect(typeof incarnation).toBe("string");
+		const incarnation = launched.realBrokerIncarnation;
+		if (incarnation === undefined) throw new Error("Hop response did not include the broker incarnation.");
 		await reapSpawnedBrokerForTest(launched.process, pid, incarnation, {
 			gracefulMs: 2_000,
 			killVerifyMs: 2_000,
@@ -100,7 +98,7 @@ describe("SDK broker hop protocol", () => {
 		const marker = `SECRET_${randomUUID()}`;
 		// Use Bun for cross-platform environment variable printing
 		const echoScript = path.join(tempDir, "echo-env.js");
-		await fs.writeFile(echoScript, `console.error(process.env.GJC_HOP_TEST_VALUE);`);
+		await Bun.write(echoScript, `console.error(process.env.GJC_HOP_TEST_VALUE); await Bun.sleep(1000);`);
 		const message = {
 			command: { file: process.execPath, args: [echoScript] },
 			stderrLogPath: logPath,
@@ -115,11 +113,15 @@ describe("SDK broker hop protocol", () => {
 		if (pid === undefined) throw new Error("Hop response did not include the broker pid.");
 		const deadline = Date.now() + 5_000;
 		while (isPidAlive(pid) && Date.now() < deadline) await Bun.sleep(20);
-		expect((await fs.readFile(logPath, "utf8")).trim()).toBe(marker);
+		expect((await Bun.file(logPath).text()).trim()).toBe(marker);
 	});
 
-	test("parseBrokerHopReply accepts only a positive integer pid from a clean exit", () => {
-		expect(parseBrokerHopReply(0, '{"pid":4321}\n')).toEqual({ realBrokerPid: 4321, error: undefined });
+	test("parseBrokerHopReply requires a positive pid and valid incarnation from a clean exit", () => {
+		expect(parseBrokerHopReply(0, '{"pid":4321,"incarnation":"linux:123"}\n')).toEqual({
+			realBrokerPid: 4321,
+			realBrokerIncarnation: "linux:123",
+			error: undefined,
+		});
 		for (const [code, stdout] of [
 			[1, '{"pid":4321}'],
 			[0, ""],
@@ -127,6 +129,8 @@ describe("SDK broker hop protocol", () => {
 			[0, '{"pid":"4321"}'],
 			[0, '{"pid":0}'],
 			[0, '{"pid":1.5}'],
+			[0, '{"pid":4321}'],
+			[0, '{"pid":4321,"incarnation":"invalid"}'],
 		] as const) {
 			const parsed = parseBrokerHopReply(code, stdout);
 			expect(parsed.realBrokerPid).toBeUndefined();

@@ -184,7 +184,7 @@ export function parseBrokerHopReply(
 	stdout: string,
 	spawnError?: Error,
 	stderr = "",
-): { realBrokerPid: number | undefined; error: Error | undefined } {
+): { realBrokerPid: number | undefined; realBrokerIncarnation?: string; error: Error | undefined } {
 	const fail = (reason: string) => ({
 		realBrokerPid: undefined,
 		error: new BrokerHopError({ exitCode: code, stdout, stderr, reason }),
@@ -202,7 +202,9 @@ export function parseBrokerHopReply(
 	const pid = (reply as { pid?: unknown } | null)?.pid;
 	if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0)
 		return fail(`hop response missing or invalid pid: ${String(pid)}`);
-	return { realBrokerPid: pid, error: undefined };
+	const incarnation = (reply as { incarnation?: unknown } | null)?.incarnation;
+	if (!isProcessIncarnation(incarnation)) return fail("hop response missing or invalid process incarnation");
+	return { realBrokerPid: pid, realBrokerIncarnation: incarnation, error: undefined };
 }
 
 /** POSIX only: a short-lived CLI trampoline detaches the broker from the client tree. */
@@ -1003,6 +1005,7 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 			spawnResult = {
 				process: launched.process,
 				realBrokerPid: launched.realBrokerPid,
+				realBrokerIncarnation: launched.realBrokerIncarnation,
 			};
 			spawnError = launched.error;
 		} else if (launchMode === "posix-trampoline") {
@@ -1033,7 +1036,7 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		const realBrokerPid = spawnResult.realBrokerPid;
 		let childIncarnation =
 			spawnResult.realBrokerIncarnation ??
-			(realBrokerPid === undefined ? undefined : brokerProcessIncarnation(realBrokerPid));
+			(launchMode === "direct" && realBrokerPid !== undefined ? brokerProcessIncarnation(realBrokerPid) : undefined);
 		let owner = registerBrokerOwner(settings.agentDir, child, realBrokerPid, childIncarnation);
 		child.unref();
 		// The child holds its own duplicate of the descriptor. Failure to close the
@@ -1063,7 +1066,11 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 					brokerExitedBeforeDiscovery = true;
 					break;
 				}
-				if (brokerObservation.status === "present" && childIncarnation === undefined) {
+				if (
+					brokerObservation.status === "present" &&
+					childIncarnation === undefined &&
+					realBrokerPid === child.pid
+				) {
 					childIncarnation = brokerObservation.incarnation;
 					owner = registerBrokerOwner(settings.agentDir, child, realBrokerPid, childIncarnation);
 				}
@@ -1095,7 +1102,12 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 						await ensureBrokerTiming.sleep(50);
 						continue;
 					}
-					if (childIncarnation === undefined && realBrokerPid !== undefined && discovered.pid === realBrokerPid) {
+					if (
+						childIncarnation === undefined &&
+						realBrokerPid !== undefined &&
+						realBrokerPid === child.pid &&
+						discovered.pid === realBrokerPid
+					) {
 						const verifiedIncarnation = brokerProcessIncarnation(realBrokerPid);
 						if (verifiedIncarnation === discovered.incarnation) {
 							childIncarnation = verifiedIncarnation;

@@ -1,7 +1,8 @@
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import process from "node:process";
 import type { BrokerHopMessage } from "./ensure";
+import { observeProcessIncarnation } from "./process-incarnation";
 
 /**
  * Windows broker hop: spawns the real broker with detached:true and reports its pid.
@@ -15,7 +16,7 @@ import type { BrokerHopMessage } from "./ensure";
  * Invoked by gjc internals only. Usage:
  *   gjc internal broker-hop <json-encoded-args>
  *
- * Exits with code 0 after writing the broker pid to stdout as JSON.
+ * Exits with code 0 after writing the broker pid and incarnation to stdout as JSON.
  * Exits with code 1 on spawn failure (error logged to stderr).
  */
 
@@ -46,11 +47,41 @@ export async function runBrokerHopFromArgv(argv: string[]): Promise<void> {
 		child.once("error", spawned.reject);
 		await spawned.promise;
 		if (child.pid === undefined) fail("broker hop spawn succeeded but child pid unavailable");
+		const observation = observeProcessIncarnation(child.pid);
+		if (observation.status !== "present") {
+			if (observation.status === "unknown" && !(await terminateUnverifiedChild(child))) {
+				fail(
+					`broker process identity is unavailable (${observation.reasonCode}) and the child could not be terminated`,
+				);
+			}
+			fail(
+				observation.status === "absent"
+					? "broker exited before its process identity could be verified"
+					: `broker process identity is unavailable (${observation.reasonCode})`,
+			);
+		}
 		child.unref();
-		process.stdout.write(`${JSON.stringify({ pid: child.pid })}\n`, () => process.exit(0));
+		process.stdout.write(`${JSON.stringify({ pid: child.pid, incarnation: observation.incarnation })}\n`, () =>
+			process.exit(0),
+		);
 	} catch (error) {
 		fail(`broker hop spawn failed: ${error instanceof Error ? error.message : String(error)}`);
 	}
+}
+
+async function terminateUnverifiedChild(child: ChildProcess): Promise<boolean> {
+	if (child.exitCode !== null || child.signalCode !== null) return true;
+	const exited = Promise.withResolvers<void>();
+	child.once("exit", exited.resolve);
+	child.once("close", exited.resolve);
+	child.on("error", () => {});
+	try {
+		child.kill("SIGKILL");
+	} catch {
+		// The exit events below still distinguish an already-exited child.
+	}
+	await Promise.race([exited.promise, Bun.sleep(2_000)]);
+	return child.exitCode !== null || child.signalCode !== null;
 }
 
 function fail(message: string): never {
