@@ -35,10 +35,11 @@ files are not admitted.
 
 In user scope, an individual skill symlink inside `~/.gjc/agent/skills` or a configured
 custom directory may resolve outside its scan root when `skills.trustUserSkills` is
-enabled (on by default). The skill link, target, and file identities are checked again
-when loading the body. Symlinked user/profile authority roots remain refused. Native
-skill creation/import writes still refuse symlinked destination roots; manage shared
-source files directly rather than replacing the project link with a copy.
+enabled in user/global settings (on by default); project settings cannot grant this
+permission. The skill link, target, and file identities are checked again when loading
+the body. Symlinked user/profile authority roots remain refused. Native skill
+creation/import writes still refuse symlinked destination roots; manage shared source
+files directly rather than replacing the project link with a copy.
 
 User scope (installed once, available in every project):
 
