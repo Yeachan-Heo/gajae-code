@@ -11,9 +11,9 @@ import {
 	sanitizedDetachedClone,
 } from "@gajae-code/agent-core/agent-loop";
 import type { AgentContext, AgentEvent, AgentLoopConfig } from "@gajae-code/agent-core/types";
-import type { AssistantMessage, AssistantMessageEvent, Message, Model } from "@gajae-code/ai";
+import type { AssistantMessage, AssistantMessageEvent, Message } from "@gajae-code/ai";
 import { classifyFallbackTrigger, transportFailureFacts } from "@gajae-code/ai";
-import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { createMockModel, type MockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { attachUnicodeEscapeEvidence, collectUnicodeEscapeEvidence } from "@gajae-code/ai/utils/json-parse";
 import { logger } from "@gajae-code/utils";
@@ -3905,7 +3905,7 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 		providerCode: "server_is_overloaded",
 		openaiErrorCode: "server_is_overloaded",
 	} as const;
-	function responsesPlaceholder(model: Model<"mock">): AssistantMessage {
+	function responsesPlaceholder(model: MockModel): AssistantMessage {
 		return {
 			...assistantMessage(model),
 			api: "openai-responses",
