@@ -160,20 +160,18 @@ test.skipIf(process.platform !== "win32")(
 	"reclaims signed IDs and cleans up through a temporary-root case alias when available",
 	async () => {
 		const tempRoot = os.tmpdir();
-		const canonicalTempRoot = await fs.realpath(tempRoot);
-		const volumeRoot = path.win32.parse(canonicalTempRoot).root;
+		const volumeRoot = path.win32.parse(tempRoot).root;
 		const isDriveRoot = /^[a-z]:[\\/]/i.test(volumeRoot);
-		const aliasOffset = canonicalTempRoot.slice(volumeRoot.length).search(/[a-z]/i);
+		const aliasOffset = tempRoot.slice(volumeRoot.length).search(/[a-z]/i);
 		const caseableOffset = isDriveRoot ? 0 : aliasOffset < 0 ? -1 : volumeRoot.length + aliasOffset;
-		let aliasedTempRoot = canonicalTempRoot;
+		let aliasedTempRoot = tempRoot;
 		if (caseableOffset >= 0) {
-			const rootCharacter = canonicalTempRoot[caseableOffset];
+			const rootCharacter = tempRoot[caseableOffset];
 			if (!rootCharacter) throw new Error("Expected a caseable Windows temporary-root character");
 			const alternateCase =
 				rootCharacter === rootCharacter.toUpperCase() ? rootCharacter.toLowerCase() : rootCharacter.toUpperCase();
-			aliasedTempRoot =
-				canonicalTempRoot.slice(0, caseableOffset) + alternateCase + canonicalTempRoot.slice(caseableOffset + 1);
-			expect(aliasedTempRoot).not.toBe(canonicalTempRoot);
+			aliasedTempRoot = tempRoot.slice(0, caseableOffset) + alternateCase + tempRoot.slice(caseableOffset + 1);
+			expect(aliasedTempRoot).not.toBe(tempRoot);
 		}
 		const fixture = await signedIdentityFixture("both", false, aliasedTempRoot);
 		const observed = await readFileLockObservationForGc(fixture.lock);
