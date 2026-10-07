@@ -3991,7 +3991,12 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 		const mock = createMockModel();
 		const streamFn = () => {
 			const stream = new AssistantMessageEventStream();
-			const message: AssistantMessage = {
+			const started: AssistantMessage = {
+				...assistantMessage(mock.model),
+				api: "openai-responses",
+				content: [{ type: "text", text: "" }],
+			};
+			const terminal: AssistantMessage = {
 				...assistantMessage(mock.model),
 				api: "openai-responses",
 				stopReason: "error",
@@ -4004,8 +4009,8 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 				},
 			};
 			queueMicrotask(() => {
-				stream.push({ type: "start", partial: message });
-				stream.push({ type: "error", reason: "error", error: message });
+				stream.push({ type: "start", partial: started });
+				stream.push({ type: "error", reason: "error", error: terminal });
 			});
 			return stream;
 		};
@@ -4028,6 +4033,7 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 			stopReason: "error",
 			content: [{ type: "text", text: "terminal-only content" }],
 		});
+		expect(agent.state.messages.filter(message => message.role === "assistant")).toHaveLength(1);
 	});
 	it("discards a typed statusless overload thrown by the provider factory", async () => {
 		const mock = createMockModel();
@@ -4101,6 +4107,7 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 		const mock = createMockModel();
 		const factoryStarted = Promise.withResolvers<void>();
 		const iteratorReadStarted = Promise.withResolvers<void>();
+		let first = true;
 		let returnCalls = 0;
 		const agent = new Agent({
 			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
@@ -4108,6 +4115,20 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 				factoryStarted.resolve();
 				return {
 					async next() {
+						if (first) {
+							first = false;
+							return {
+								done: false,
+								value: {
+									type: "start",
+									partial: {
+										...assistantMessage(mock.model),
+										api: "openai-responses",
+										content: [{ type: "text", text: "" }],
+									},
+								},
+							};
+						}
 						iteratorReadStarted.resolve();
 						return await new Promise<IteratorResult<never>>(() => {});
 					},
@@ -4141,13 +4162,26 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 		const mock = createMockModel();
 		const factory = Promise.withResolvers<AssistantMessageEventStream>();
 		const factoryStarted = Promise.withResolvers<void>();
+		const streamClosed = Promise.withResolvers<void>();
 		let returnCalls = 0;
+		let nextCalls = 0;
 		const lateStream = {
 			async next() {
-				return await new Promise<IteratorResult<never>>(() => {});
+				nextCalls += 1;
+				return {
+					done: false,
+					value: {
+						type: "start",
+						partial: {
+							...assistantMessage(mock.model),
+							content: [{ type: "text", text: "late content" }],
+						},
+					},
+				};
 			},
 			async return() {
 				returnCalls += 1;
+				streamClosed.resolve();
 				return { done: true, value: undefined };
 			},
 			[Symbol.asyncIterator]() {
@@ -4168,9 +4202,10 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 		agent.abort();
 		factory.resolve(lateStream);
 		await run;
-		for (let index = 0; index < 20 && returnCalls === 0; index += 1) await Bun.sleep(1);
+		await streamClosed.promise;
 
 		expect(returnCalls).toBe(1);
+		expect(nextCalls).toBe(0);
 		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
 		expect(events.filter(event => event.type === "message_update")).toHaveLength(0);
 		expect(events.filter(event => event.type === "message_end" && event.message.role === "assistant")).toHaveLength(
