@@ -109,6 +109,10 @@ const modelSegment: StatusLineSegment = {
 		const modelName = shortenModelId(state.model?.id ?? state.model?.name);
 
 		let content = withIcon(theme.icon.model, modelName);
+		const unavailableProfile = ctx.session.getUnavailableModelProfile();
+		if (unavailableProfile) {
+			content = `${theme.fg("warning", `profile unavailable: ${sanitizeStatusText(unavailableProfile)}`)} ${content}`;
+		}
 
 		if (ctx.session.isFastModeActive() && theme.icon.fast) {
 			content += ` ${theme.icon.fast}`;

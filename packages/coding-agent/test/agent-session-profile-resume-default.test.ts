@@ -87,6 +87,19 @@ describe("AgentSession profile resume defaults", () => {
 		expect(session.settings.getModelRole("default")).toBe(globalDefaultBefore);
 	});
 
+	it("clears an unavailable-profile marker after recovery or a concrete user model selection", async () => {
+		const { base } = resolveModels();
+		session = makeSession(base);
+
+		session.setUnavailableModelProfile("stale-profile");
+		session.setActiveModelProfile("recovered-profile");
+		expect(session.getUnavailableModelProfile()).toBeUndefined();
+
+		session.setUnavailableModelProfile("stale-profile");
+		await session.setModel(base);
+		expect(session.getUnavailableModelProfile()).toBeUndefined();
+	});
+
 	it("keeps a transient switch as role=temporary so resume does not adopt it", async () => {
 		const { base, profileMain } = resolveModels();
 		session = makeSession(base);
