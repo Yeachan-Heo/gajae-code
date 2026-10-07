@@ -58,9 +58,13 @@ export function standardizeMacOSPath(p: string): string {
 export function resolveEquivalentPath(inputPath: string): string {
 	const resolvedPath = path.resolve(inputPath);
 	try {
-		return fs.realpathSync(resolvedPath);
+		const realPath = fs.realpathSync(resolvedPath);
+		// On Windows, normalize path casing for consistent session keying.
+		// Paths like C:\Users\User\project and c:\users\user\project must resolve to the same key.
+		return process.platform === "win32" ? realPath.toLowerCase() : realPath;
 	} catch {
-		return resolvedPath;
+		// If realpathSync fails, still apply Windows normalization to the resolved path.
+		return process.platform === "win32" ? resolvedPath.toLowerCase() : resolvedPath;
 	}
 }
 
