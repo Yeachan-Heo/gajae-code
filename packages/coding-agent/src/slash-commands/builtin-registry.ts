@@ -1050,6 +1050,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 						runtime,
 					);
 				}
+				if (targetIds.some(targetId => targetId !== "default")) runtime.session.markUserModelSelection();
 				// Preset shortcut: when the selector names a known model profile
 				// (optionally `gajae-code/`-prefixed) and the target is implicit,
 				// activate the profile immediately instead of treating the preset name
@@ -1062,14 +1063,17 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 							const profileLabel = formatModelProfileDisplayLabel(
 								runtime.session.modelRegistry.getModelProfile(presetName) ?? { name: presetName },
 							);
-							await activateModelProfile(
-								{
-									session: runtime.session,
-									modelRegistry: runtime.session.modelRegistry,
-									settings: runtime.settings,
-									profileName: presetName,
-								},
-								{ persistDefault: false },
+							runtime.session.markUserModelSelection();
+							await runtime.session.withSdkControlMutation(() =>
+								activateModelProfile(
+									{
+										session: runtime.session,
+										modelRegistry: runtime.session.modelRegistry,
+										settings: runtime.settings,
+										profileName: presetName,
+									},
+									{ persistDefault: false },
+								),
 							);
 							await runtime.output(`Model profile: ${profileLabel}`);
 							await runtime.notifyTitleChanged?.();
@@ -1139,7 +1143,6 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 							runtime.session.setThinkingLevel(existingDefaultThinkingLevel);
 						}
 					}
-
 					const materializedProfile = materializeActiveModelProfileAssignments({
 						session: runtime.session,
 						settings: runtime.settings,
