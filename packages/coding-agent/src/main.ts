@@ -475,6 +475,11 @@ type StartupModelProfileArgs = {
 	preferCachedDefaultProfile?: boolean;
 };
 
+type StartupModelProfileFailure = {
+	profileName: string;
+	error: ModelProfileCredentialError | UnknownModelProfileError;
+};
+
 function staleDefaultProfileMessage(error: UnknownModelProfileError, profileCatalogRefreshUnavailable = false): string {
 	const refreshNotice = profileCatalogRefreshUnavailable
 		? " The online profile catalog could not be refreshed; continuing with the last accepted catalog."
@@ -488,6 +493,7 @@ async function applyStartupModelProfilesWithPolicy(
 	onUnknownDefault?: (error: UnknownModelProfileError, profileCatalogRefreshUnavailable: boolean) => void,
 ): Promise<void> {
 	let profileCatalogRefreshUnavailable = false;
+	let profilePassFailures: StartupModelProfileFailure[] = [];
 	const applyProfile = async (
 		profileName: string,
 		persistDefault: boolean,
@@ -515,26 +521,24 @@ async function applyStartupModelProfilesWithPolicy(
 			return true;
 		} catch (error) {
 			if (error instanceof ModelProfileCredentialError && (onCredentialError || options.tolerateCredentialError)) {
-				// The toast/stderr warning is transient; keep a log record so a session
-				// left on the provisional model can be diagnosed afterwards.
+				profilePassFailures.push({ profileName, error });
 				logger.warn("Startup model profile not applied: missing provider credentials", {
 					profile: profileName,
 					errorClass: error.name,
 					providers: error.providers,
 					role: error.role,
 				});
-				if (onCredentialError) onCredentialError(error);
-				else process.stderr.write(`${chalk.yellow(`Warning: ${error.message}`)}\n`);
+				if (!onCredentialError) process.stderr.write(`${chalk.yellow(`Warning: ${error.message}`)}\n`);
 				return false;
 			}
 			if (error instanceof UnknownModelProfileError && options.tolerateUnknownDefault) {
+				profilePassFailures.push({ profileName, error });
 				logger.warn("Startup model profile not applied: unknown profile", {
 					profile: profileName,
 					errorClass: error.name,
 					catalogRefreshUnavailable: profileCatalogRefreshUnavailable,
 				});
-				if (onUnknownDefault) onUnknownDefault(error, profileCatalogRefreshUnavailable);
-				else
+				if (!onUnknownDefault)
 					process.stderr.write(
 						`${chalk.yellow(`Warning: ${staleDefaultProfileMessage(error, profileCatalogRefreshUnavailable)}`)}\n`,
 					);
@@ -560,6 +564,7 @@ async function applyStartupModelProfilesWithPolicy(
 		(args.preferCachedModels === true && args.parsedArgs.mpreset !== undefined) ||
 		(args.preferCachedDefaultProfile === true && defaultProfile !== undefined);
 	const applyConfiguredProfiles = async (allowMissingDefault: boolean): Promise<boolean> => {
+		profilePassFailures = [];
 		let applied = true;
 		if (defaultProfile) {
 			applied =
@@ -569,7 +574,7 @@ async function applyStartupModelProfilesWithPolicy(
 						: undefined,
 					tolerateCredentialError: tolerateDefaultProfileFailure,
 					tolerateUnknownDefault:
-						allowMissingDefault && (onUnknownDefault !== undefined || tolerateDefaultProfileFailure),
+						onUnknownDefault !== undefined || (allowMissingDefault && tolerateDefaultProfileFailure),
 					runtimeBindingsOnly: args.session.hasRecoveredDefaultFallbackChain(),
 				})) && applied;
 		}
@@ -577,6 +582,49 @@ async function applyStartupModelProfilesWithPolicy(
 			applied = (await applyProfile(args.parsedArgs.mpreset, args.parsedArgs.default === true)) && applied;
 		}
 		return applied;
+	};
+	const refreshAuthAndCatalog = async (continueOnRefreshError: boolean): Promise<void> => {
+		try {
+			await args.modelRegistry.authStorage?.reload();
+		} catch (error) {
+			logger.warn("Failed to reload auth before startup model profile recovery", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+		try {
+			await args.modelRegistry.refreshModelPresetProfilesFromRegistry();
+		} catch (error) {
+			if (!continueOnRefreshError && args.modelRegistry.getError()) throw error;
+			profileCatalogRefreshUnavailable = true;
+			logger.warn("Failed to refresh model profile catalog before startup recovery", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+		try {
+			await args.modelRegistry.refresh("online-if-uncached", args.session.credentialSessionId);
+		} catch (error) {
+			if (!continueOnRefreshError) throw error;
+			logger.warn("Failed to refresh model catalog before startup profile recovery", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	};
+	const reportFinalProfileFailures = (): void => {
+		for (const failure of profilePassFailures) {
+			if (failure.error instanceof ModelProfileCredentialError) {
+				onCredentialError?.(failure.error);
+			} else {
+				onUnknownDefault?.(failure.error, profileCatalogRefreshUnavailable);
+			}
+		}
+		if (
+			(onCredentialError || onUnknownDefault) &&
+			args.parsedArgs.mpreset === undefined &&
+			args.parsedArgs.model === undefined
+		) {
+			const defaultFailure = profilePassFailures.find(failure => failure.profileName === defaultProfile);
+			if (defaultFailure) args.session.setUnavailableModelProfile(defaultFailure.profileName);
+		}
 	};
 
 	if (preferCachedProfiles) {
@@ -587,19 +635,25 @@ async function applyStartupModelProfilesWithPolicy(
 		} catch (error) {
 			if (error instanceof ModelProfileCredentialError) throw error;
 			if (error instanceof UnknownModelProfileError) {
-				try {
-					await args.modelRegistry.refreshModelPresetProfilesFromRegistry();
-				} catch (refreshError) {
-					if (args.modelRegistry.getError()) throw refreshError;
-					profileCatalogRefreshUnavailable = true;
-					logger.warn("Failed to refresh model profile catalog before startup recovery", {
-						error: refreshError instanceof Error ? refreshError.message : String(refreshError),
-					});
-				}
+				await refreshAuthAndCatalog(onCredentialError !== undefined || onUnknownDefault !== undefined);
+			} else {
+				throw error;
 			}
-			await args.modelRegistry.refresh("online-if-uncached", args.session.credentialSessionId);
 			refreshedOnline = true;
 			applied = await applyConfiguredProfiles(true);
+		}
+		if (
+			!applied &&
+			profilePassFailures.length > 0 &&
+			(onCredentialError !== undefined || onUnknownDefault !== undefined)
+		) {
+			if (!refreshedOnline) {
+				await refreshAuthAndCatalog(true);
+				refreshedOnline = true;
+				applied = await applyConfiguredProfiles(true);
+			}
+			if (applied) args.session.setUnavailableModelProfile(undefined);
+			else reportFinalProfileFailures();
 		}
 		if (applied && !refreshedOnline)
 			args.modelRegistry.refreshInBackground("online-if-uncached", args.session.credentialSessionId);

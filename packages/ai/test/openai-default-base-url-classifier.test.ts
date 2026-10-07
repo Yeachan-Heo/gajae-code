@@ -18,7 +18,7 @@ describe("isDefaultOpenAIBaseUrl", () => {
 	});
 
 	it("treats a mixed-case hostname as default (ignores case)", () => {
-		expect(isDefaultOpenAIBaseUrl("https://api.openai.com/v1")).toBe(true);
+		expect(isDefaultOpenAIBaseUrl("https://API.OpenAI.com/v1")).toBe(true);
 	});
 
 	it("treats non-api.openai.com hosts as non-default", () => {
