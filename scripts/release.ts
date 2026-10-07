@@ -1088,11 +1088,11 @@ The PR requires maintainer review and approval before it can be merged.
 
 The change resolves the deterministic conflict in \`packages/natives/native/diagnostic-artifact.json\` by adopting the released version from main and the artifact digests from dev.`;
 
-		const prCreate = await $`gh pr create --repo origin --head ${backmergeRef} --base dev --title "chore(release): backmerge v${version} into dev" --body ${prBody}`.quiet().nothrow();
+		const prCreate = await $`gh pr create --head ${backmergeRef} --base dev --title "chore(release): backmerge v${version} into dev" --body ${prBody}`.quiet().nothrow();
 		if (prCreate.exitCode !== 0) {
 			const error = prCreate.stderr.toString().trim();
-			// If PR already exists, that's okay - continue
-			if (!error.includes("already exists")) {
+			// If PR already exists, that's okay - just report success
+			if (!error.includes("already exists") && !error.toLowerCase().includes("pull request")) {
 				return { action: "blocked", detail: `failed to create backmerge PR: ${firstLine(error)}` };
 			}
 		}
