@@ -773,12 +773,13 @@ interface AcceptedQueueCancellation {
 function retireAcceptedQueueCancellation(
 	cancellations: Map<string, AcceptedQueueCancellation>,
 	correlation: InvocationCorrelation,
+	durableTerminalConfirmed = false,
 ): void {
 	const key = `${correlation.commandId}:${correlation.turnId}`;
 	const cancellation = cancellations.get(key);
 	if (!cancellation) return;
 	if (!cancellation.controller.signal.aborted) cancellation.controller.abort();
-	if (cancellation.disposition === "removed" && cancellation.removalTerminalization) {
+	if (!durableTerminalConfirmed && cancellation.disposition === "removed" && cancellation.removalTerminalization) {
 		void cancellation.removalTerminalization.then(published => {
 			if (published && cancellations.get(key) === cancellation) cancellations.delete(key);
 		});
@@ -4862,8 +4863,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						return disposition === "removed" && (await cancellation.removalTerminalization) === true;
 					})();
 					const published = await Promise.race([publication, timedOut.promise.then(() => false)]);
-					if (published) {
-						const key = `${cancellation.correlation.commandId}:${cancellation.correlation.turnId}`;
+					const key = `${cancellation.correlation.commandId}:${cancellation.correlation.turnId}`;
+					if (published || acceptedQueueCancellations.get(key) !== cancellation) {
 						if (acceptedQueueCancellations.get(key) === cancellation) acceptedQueueCancellations.delete(key);
 					} else {
 						failures.push(
@@ -5046,13 +5047,18 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		owner.unrecordedFailureReasons?.clear();
 		for (const [token, binding] of lifecycleRunOwners) if (binding.state === owner) lifecycleRunOwners.delete(token);
 	};
+	const hasQueuedTerminalRecovery = (owner: RuntimeState): boolean =>
+		[...acceptedQueueCancellations.values()].some(
+			cancellation => cancellation.disposition === "removed" && owner.deadlineManager.has(cancellation.correlation),
+		);
 	const maybeRetireLifecycleOwner = (owner: RuntimeState): void => {
 		if (
 			owner.pending.length > 0 ||
 			owner.openLifecycleBatches.length > 0 ||
 			(owner.attachedInvocations?.length ?? 0) > 0 ||
 			(owner.drainedInvocations?.length ?? 0) > 0 ||
-			owner.lifecycleTasks.size > 0
+			owner.lifecycleTasks.size > 0 ||
+			hasQueuedTerminalRecovery(owner)
 		)
 			return;
 		removeRetiredLifecycleOwner(owner);
@@ -6643,6 +6649,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				});
 			},
 			onExpired: correlation => {
+				retireAcceptedQueueCancellation(acceptedQueueCancellations, correlation, true);
 				const owner = lifecycleOwnerHolder.state;
 				if (!owner) return;
 				removeLifecycleReferences(owner, correlation);
@@ -7699,7 +7706,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				current.openLifecycleBatches.length > 0 ||
 				(current.attachedInvocations?.length ?? 0) > 0 ||
 				(current.drainedInvocations?.length ?? 0) > 0 ||
-				current.lifecycleTasks.size > 0;
+				current.lifecycleTasks.size > 0 ||
+				hasQueuedTerminalRecovery(current);
 			if (retainsLifecycleWork) {
 				const owners = retiredLifecycleOwners.get(current.sessionId) ?? [];
 				if (!owners.includes(current)) owners.push(current);
@@ -7711,7 +7719,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						current.openLifecycleBatches.length > 0 ||
 						(current.attachedInvocations?.length ?? 0) > 0 ||
 						(current.drainedInvocations?.length ?? 0) > 0 ||
-						current.lifecycleTasks.size > 0
+						current.lifecycleTasks.size > 0 ||
+						hasQueuedTerminalRecovery(current)
 					) {
 						const retry = setTimeout(retryCleanup, LIFECYCLE_QUIESCENCE_MS);
 						retry.unref();
