@@ -8451,6 +8451,16 @@ export class SessionManager {
 				: undefined;
 		if (explicitPersistIdentity && explicitPersistIdentity.sessionId !== snapshot.sessionId)
 			throw new Error("Session rollback persistence identity is unavailable.");
+		// Store the explicit identity as a non-enumerable property on the snapshot itself
+		// so that cross-manager adoptions can access it without relying on the #stateSnapshots map.
+		if (explicitPersistIdentity) {
+			Object.defineProperty(snapshot, "explicitPersistIdentity", {
+				value: Object.freeze({ ...explicitPersistIdentity }),
+				enumerable: false,
+				configurable: false,
+				writable: false,
+			});
+		}
 		this.#stateSnapshots.set(
 			snapshot,
 			Object.freeze({

@@ -49,6 +49,12 @@ describe("lifecycle contracts regression (PR #6428)", () => {
 
 			if (!sessionFileA) throw new Error("Expected explicit session file");
 
+			// Verify that the snapshot carries explicit identity
+			// (it should be stored as a non-enumerable property for cross-manager adoption)
+			const explicitIdentity = (snapshotA as any).explicitPersistIdentity;
+			expect(explicitIdentity).toBeTruthy();
+			expect(explicitIdentity.sessionId).toBe(snapshotA.sessionId);
+
 			// Create a second manager that will adopt the snapshot
 			const managerB = SessionManager.create(root.path(), root.path(), storage);
 			try {
