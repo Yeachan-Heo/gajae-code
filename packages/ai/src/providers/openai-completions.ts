@@ -117,6 +117,7 @@ import {
 	applyOpenAIRequestTransformHeaders,
 	wrapFetchForOpenAIRequestTransform,
 } from "./openai-request-transform";
+import { isDefaultOpenAIBaseUrl } from "./openai-responses";
 import { createInitialResponsesAssistantMessage } from "./openai-responses-shared";
 import {
 	applyOpenCodeGoSessionHeader,
@@ -127,16 +128,6 @@ import { transformMessages } from "./transform-messages";
 import { joinTextWithImagePlaceholder, NON_VISION_IMAGE_PLACEHOLDER } from "./vision-guard";
 
 const OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1";
-const OPENAI_DEFAULT_BASE_URL_HOST = "api.openai.com";
-
-function isDefaultOpenAIBaseUrl(baseUrl: string): boolean {
-	try {
-		const url = new URL(baseUrl);
-		return url.hostname === OPENAI_DEFAULT_BASE_URL_HOST && (url.pathname === "" || url.pathname === "/v1");
-	} catch {
-		return baseUrl === OPENAI_DEFAULT_BASE_URL;
-	}
-}
 
 function resolveOpenAIProviderBaseUrl(
 	baseUrl: string | undefined,
