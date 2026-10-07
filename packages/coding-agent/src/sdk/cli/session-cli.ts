@@ -549,10 +549,12 @@ async function withRouter<T>(
 	sessionIds: readonly string[],
 	action: (router: SessionRouter) => Promise<T>,
 	onFrame?: (attachment: SessionAttachment, frame: SessionRouterFrame) => void,
+	lightweight?: boolean,
 ): Promise<T> {
 	const router = new SessionRouter({
 		agentDir,
 		sessionIds,
+		lightweight,
 		...(onFrame === undefined ? {} : { deps: { onFrame } }),
 	});
 	let result!: T;
@@ -1276,20 +1278,32 @@ async function runStatus(
 ): Promise<unknown> {
 	assertClientRef(opRef);
 	await ensureBroker({ agentDir });
-	return await withRouter(agentDir, [sessionId], async router => {
-		const response = await requestQuery(router, sessionId, "turn.result", { kind: "prompt", clientRef: opRef }, args);
-		const status = resultObject(response) ?? {};
-		const raw = typeof status.status === "string" ? status.status : "unknown";
-		return {
-			ok: true,
-			result: {
-				version: SESSION_ROWS_VERSION,
-				operationRef: opRef,
-				status,
-				summary: { completed: raw === "terminal_ok" || raw === "failed" },
-			},
-		};
-	});
+	return await withRouter(
+		agentDir,
+		[sessionId],
+		async router => {
+			const response = await requestQuery(
+				router,
+				sessionId,
+				"turn.result",
+				{ kind: "prompt", clientRef: opRef },
+				args,
+			);
+			const status = resultObject(response) ?? {};
+			const raw = typeof status.status === "string" ? status.status : "unknown";
+			return {
+				ok: true,
+				result: {
+					version: SESSION_ROWS_VERSION,
+					operationRef: opRef,
+					status,
+					summary: { completed: raw === "terminal_ok" || raw === "failed" },
+				},
+			};
+		},
+		undefined,
+		true,
+	);
 }
 
 type CheckpointExtraction = {

@@ -138,32 +138,53 @@ const initialProcessEnvironment =
 				() => new Map<string, string>(),
 			)
 		: Promise.resolve(new Map<string, string>());
-const initialTemporaryRoots = initialProcessEnvironment.then(async environment => {
-	const candidates = [environment.get("TMPDIR"), environment.get("TEMP"), environment.get("TMP"), "/tmp", "/var/tmp"]
-		.filter((root): root is string => typeof root === "string" && path.isAbsolute(root))
-		.map(root => path.resolve(root));
-	const roots = new Set<string>();
-	for (const candidate of candidates) {
-		roots.add(candidate);
-		roots.add(await fs.realpath(candidate).catch(() => candidate));
-	}
-	return [...roots];
-});
-const initialNodeAuthorities = initialProcessEnvironment.then(async environment => {
-	const authorities = new Map<string, string>();
-	const temporaryRoots = await initialTemporaryRoots;
-	for (const pathEntry of (environment.get("PATH") ?? "").split(path.delimiter).filter(path.isAbsolute)) {
-		const lexical = path.join(pathEntry, process.platform === "win32" ? "node.exe" : "node");
-		try {
-			const real = await fs.realpath(lexical);
-			if (temporaryRoots.some(root => isWithin(root, real))) continue;
-			authorities.set(real, await hashStableFile(real, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES));
-		} catch {
-			// Missing or unstable startup candidates do not become authority.
+// Lazy-initialized caches to defer import-time overhead
+let cachedInitialTemporaryRoots: Promise<string[]> | undefined;
+let cachedInitialNodeAuthorities: Promise<Map<string, string>> | undefined;
+
+async function getInitialTemporaryRoots(): Promise<string[]> {
+	if (cachedInitialTemporaryRoots) return cachedInitialTemporaryRoots;
+	cachedInitialTemporaryRoots = (async () => {
+		const environment = await initialProcessEnvironment;
+		const candidates = [
+			environment.get("TMPDIR"),
+			environment.get("TEMP"),
+			environment.get("TMP"),
+			"/tmp",
+			"/var/tmp",
+		]
+			.filter((root): root is string => typeof root === "string" && path.isAbsolute(root))
+			.map(root => path.resolve(root));
+		const roots = new Set<string>();
+		for (const candidate of candidates) {
+			roots.add(candidate);
+			roots.add(await fs.realpath(candidate).catch(() => candidate));
 		}
-	}
-	return authorities;
-});
+		return [...roots];
+	})();
+	return cachedInitialTemporaryRoots;
+}
+
+async function getInitialNodeAuthorities(): Promise<Map<string, string>> {
+	if (cachedInitialNodeAuthorities) return cachedInitialNodeAuthorities;
+	cachedInitialNodeAuthorities = (async () => {
+		const environment = await initialProcessEnvironment;
+		const authorities = new Map<string, string>();
+		const temporaryRoots = await getInitialTemporaryRoots();
+		for (const pathEntry of (environment.get("PATH") ?? "").split(path.delimiter).filter(path.isAbsolute)) {
+			const lexical = path.join(pathEntry, process.platform === "win32" ? "node.exe" : "node");
+			try {
+				const real = await fs.realpath(lexical);
+				if (temporaryRoots.some(root => isWithin(root, real))) continue;
+				authorities.set(real, await hashStableFile(real, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES));
+			} catch {
+				// Missing or unstable startup candidates do not become authority.
+			}
+		}
+		return authorities;
+	})();
+	return cachedInitialNodeAuthorities;
+}
 
 async function snapshotExistingFile(filePath: string): Promise<FileSnapshot | null> {
 	try {
@@ -514,8 +535,8 @@ async function isInitialManagedNodeLauncherPath(
 	if (process.platform !== "linux") return false;
 	const real = await fs.realpath(executablePath);
 	if (untrustedRoots.some(root => isWithin(root, real))) return false;
-	if ((await initialTemporaryRoots).some(root => isWithin(root, real))) return false;
-	const expected = (await initialNodeAuthorities).get(real);
+	if ((await getInitialTemporaryRoots()).some(root => isWithin(root, real))) return false;
+	const expected = (await getInitialNodeAuthorities()).get(real);
 	if (!expected) return false;
 	return (await hashStableFile(real, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES)) === expected;
 }
@@ -671,7 +692,7 @@ async function prepareVerifiedStdioLaunch(input: {
 		true,
 	);
 	const launcherReal = await fs.realpath(input.launcherPath);
-	const expectedLauncherHash = (await initialNodeAuthorities).get(launcherReal);
+	const expectedLauncherHash = (await getInitialNodeAuthorities()).get(launcherReal);
 	if (!expectedLauncherHash || sha256(launcherBytes) !== expectedLauncherHash) {
 		throw new Error("Plugin MCP Node interpreter drifted from startup authority");
 	}
