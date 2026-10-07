@@ -2949,9 +2949,6 @@ export class SelectorController {
 							const value =
 								selectedSelector ?? formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel);
 							const assignments = new Map<GjcModelAssignmentTargetId, string>([[role, value]]);
-							// Advance revision for role-only assignments to prevent deferred profile
-							// recovery from overwriting concurrent user selections
-							await this.ctx.session.setModel(model, role, { cause: "user-selection" });
 							const materializedProfile = materializeActiveModelProfileAssignments({
 								session: this.ctx.session,
 								settings: this.ctx.settings,

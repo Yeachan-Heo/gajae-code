@@ -1143,23 +1143,6 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 							runtime.session.setThinkingLevel(existingDefaultThinkingLevel);
 						}
 					}
-					if (includesRoleAgent) {
-						// Advance revision for role-only assignments to prevent deferred profile
-						// recovery from overwriting concurrent user selections
-						for (const targetId of targetIds) {
-							if (targetId !== "default") {
-								const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetId];
-								const selector = assignments.get(targetId) ?? "";
-								// Call setModel to advance revision even though we're setting a role, not default
-								if (target.settingsPath === "modelRoles") {
-									await runtime.session.setModel(selection.model, targetId, {
-										cause: "user-selection",
-									});
-								}
-							}
-						}
-					}
-
 					const materializedProfile = materializeActiveModelProfileAssignments({
 						session: runtime.session,
 						settings: runtime.settings,

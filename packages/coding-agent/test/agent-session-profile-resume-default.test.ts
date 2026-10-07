@@ -113,6 +113,23 @@ describe("AgentSession profile resume defaults", () => {
 		expect(session.getUserModelSelectionRevision()).toBe(revision + 1);
 	});
 
+	it("records the concrete sticky canonical selector for a user model choice", async () => {
+		const { base, profileMain } = resolveModels();
+		session = makeSession(base);
+		const canonicalId = modelRegistry.getCanonicalId(profileMain);
+		if (!canonicalId) throw new Error("Expected profile model to have a canonical identity");
+
+		await session.setModel(profileMain);
+
+		expect(session.getUserCanonicalVariantSelection()).toEqual({
+			revision: 1,
+			canonicalVariant: `${profileMain.provider}/${profileMain.id}`,
+		});
+		expect(session.getUserCanonicalVariantSelection().canonicalVariant).toBe(
+			modelRegistry.getSessionCanonicalVariant(session.sessionId),
+		);
+	});
+
 	it("advances the recovery fence for explicit control-surface selections", () => {
 		const { base } = resolveModels();
 		session = makeSession(base);
