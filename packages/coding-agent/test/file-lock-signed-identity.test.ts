@@ -29,20 +29,31 @@ function sameFixturePath(left: string, right: string): boolean {
 	return normalize(left) === normalize(right);
 }
 
+async function cleanupFixtureRoots() {
+	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
+}
+}
+
 afterEach(async () => {
 	vi.restoreAllMocks();
 	FileLockTestHooks.nativeQuarantineBindings = undefined;
 	FileLockTestHooks.nativeExactRemovalProbe = undefined;
-	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
+	await cleanupFixtureRoots();
 });
 
 async function signedIdentityFixture(component: "root" | "info" | "both", detach = false, tempRoot = os.tmpdir()) {
+	const cleanupRoot = await fs.mkdtemp(path.join(tempRoot, "file-lock-signed-id-"));
+	// The cleanup guard uses realpathSync, which preserves Windows short names.
+	// Retain mkdtemp's spelling for cleanup against that captured temp boundary.
+	roots.push(cleanupRoot);
 	// Exact removal resolves parent aliases before re-reading stat identity.
 	// Keep the fixture's path-matched stat spies on that same canonical path.
-	const root = await fs.realpath(await fs.mkdtemp(path.join(tempRoot, "file-lock-signed-id-")));
-	roots.push(root);
-	const file = path.join(root, "index.jsonl");
-	const lock = `${file}.lock`;
+	const root = await fs.realpath(cleanupRoot);
+	// Acquisition cleans staging paths using the caller's spelling too.
+	const file = path.join(cleanupRoot, "index.jsonl");
+	const cleanupLock = `${file}.lock`;
+	const cleanupParked = `${cleanupLock}.removing`;
+	const lock = path.join(root, "index.jsonl.lock");
 	const parked = `${lock}.removing`;
 	await fs.mkdir(lock);
 	await Bun.write(path.join(lock, "info"), JSON.stringify({ pid: DEAD_PID, timestamp: 1000 }));
@@ -50,9 +61,9 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 	const realLstat = fs.lstat;
 	const transformStat = (target: string, stat: BigIntStats): BigIntStats => {
 		const isRoot =
-			sameFixturePath(target, lock) || sameFixturePath(target, parked) || (detach && sameFixturePath(target, root));
+			sameFixturePath(target, lock) || sameFixturePath(target, parked) || sameFixturePath(target, cleanupLock) || sameFixturePath(target, cleanupParked) || (detach && (sameFixturePath(target, root) || sameFixturePath(target, cleanupRoot)));
 		const isInfo =
-			sameFixturePath(target, path.join(lock, "info")) || sameFixturePath(target, path.join(parked, "info"));
+			sameFixturePath(target, path.join(lock, "info")) || sameFixturePath(target, path.join(parked, "info")) || sameFixturePath(target, path.join(cleanupLock, "info")) || sameFixturePath(target, path.join(cleanupParked, "info"));
 		const id = isRoot && component !== "info" ? ROOT_ID : isInfo && component !== "root" ? INFO_ID : null;
 		if (!isRoot && !isInfo) return stat;
 		return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, {
@@ -67,7 +78,7 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 	const realOpen = fs.open;
 	vi.spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
 		const handle = await realOpen(target, flags, mode);
-		if (sameFixturePath(String(target), path.join(lock, "info"))) {
+		if (sameFixturePath(String(target), path.join(lock, "info")) || sameFixturePath(String(target), path.join(cleanupLock, "info"))) {
 			const realStat = handle.stat.bind(handle);
 			vi.spyOn(handle, "stat").mockImplementation((async options => {
 				const stat = await realStat(options);
@@ -98,8 +109,8 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 		expect(snapshot).toEqual(nativeSnapshot(original));
 		if (detach) {
 			expect(parent?.ino).toBe(ROOT_ID);
-			renameSync(target, parked);
-			return { ok: true, detachedPath: parked };
+			renameSync(target, cleanupParked);
+			return { ok: true, detachedPath: cleanupParked };
 		}
 		// Only simulate the native commit after both the adapted authority and
 		// the original filesystem generation match the captured snapshot.
@@ -146,13 +157,14 @@ test("acquires and releases after reclaiming a signed-ID dead-owner lock", async
 });
 
 test.skipIf(process.platform !== "win32")(
-	"reclaims signed IDs through a temporary-root drive-letter alias",
+	"reclaims signed IDs and cleans up through a temporary-root drive-letter alias",
 	async () => {
-		const canonicalTempRoot = await fs.realpath(os.tmpdir());
+		const tempRoot = os.tmpdir();
+		const canonicalTempRoot = await fs.realpath(tempRoot);
 		const driveLetter = canonicalTempRoot[0];
 		const alternateCase =
 			driveLetter === driveLetter.toUpperCase() ? driveLetter.toLowerCase() : driveLetter.toUpperCase();
-		const aliasedTempRoot = alternateCase + canonicalTempRoot.slice(1);
+		const aliasedTempRoot = alternateCase + tempRoot.slice(1);
 		expect(aliasedTempRoot).not.toBe(canonicalTempRoot);
 		const fixture = await signedIdentityFixture("both", false, aliasedTempRoot);
 		const observed = await readFileLockObservationForGc(fixture.lock);
@@ -160,6 +172,15 @@ test.skipIf(process.platform !== "win32")(
 		expect(await removeFileLockDirForGc(fixture.lock, observed.info, observed.identity)).toBe("removed");
 		expect(fixture.remove).toHaveBeenCalledTimes(1);
 		expect(await fs.exists(fixture.lock)).toBe(false);
+		expect(path.dirname(fixture.lock)).toBe(await fs.realpath(path.dirname(fixture.file)));
+		const cleanup = vi.spyOn(fs, "rm");
+		await cleanupFixtureRoots();
+		expect(cleanup).toHaveBeenCalledTimes(1);
+		expect(cleanup).toHaveBeenCalledWith(path.join(aliasedTempRoot, path.basename(path.dirname(fixture.lock))), {
+			recursive: true,
+			force: true,
+		});
+		expect(await fs.exists(path.dirname(fixture.file))).toBe(false);
 	},
 );
 
