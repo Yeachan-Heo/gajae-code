@@ -139,6 +139,22 @@ describe("async job endpoint id derivation", () => {
 			asyncJobEndpointId("provider-b", "logical-id", first),
 		);
 	});
+
+	it("normalizes path casing on Windows for consistent session keying", () => {
+		// On Windows, paths with different casings should key to the same endpoint.
+		// This prevents silent attachment failures when Telegram or other sources
+		// provide paths with different casings (e.g., C:\Users\User\project vs c:\users\user\project).
+		if (process.platform !== "win32") return;
+
+		const sessionFile1 = "C:\\Users\\User\\Project\\session.jsonl";
+		const sessionFile2 = "c:\\users\\user\\project\\session.jsonl";
+
+		const endpoint1 = asyncJobEndpointId("provider", "logical-id", sessionFile1);
+		const endpoint2 = asyncJobEndpointId("provider", "logical-id", sessionFile2);
+
+		// Both paths should normalize to the same endpoint key
+		expect(endpoint1).toBe(endpoint2);
+	});
 });
 
 describe("task fork-context provider identity", () => {
