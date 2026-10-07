@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createAttemptScopeAuthority } from "@gajae-code/agent-core/attempt-scope";
+import { getBundledModel } from "@gajae-code/ai";
 import { isDesignedError } from "@gajae-code/utils/error-classification";
 import {
 	type FunctionHook,
@@ -12,7 +13,10 @@ import {
 	functionHookGrantHash,
 	normalizeFunctionHookGrant,
 } from "../src/extensibility/extensions/function-hooks";
-import { tagFunctionHookHandler } from "../src/extensibility/extensions/function-hooks-internal";
+import {
+	tagFunctionHookHandler,
+	tagHostObserverHandler,
+} from "../src/extensibility/extensions/function-hooks-internal";
 import { ExtensionRuntime, loadExtensionFromFactory } from "../src/extensibility/extensions/loader";
 import {
 	EXTENSION_HANDLER_TIMEOUT_MS,
@@ -1596,5 +1600,67 @@ describe("capability-scoped function hooks", () => {
 		await runner.emitAfterProviderResponse({ status: 200, headers: {} }, undefined, scope);
 
 		expect(store.isClean(scope)).toBe(false);
+	});
+
+	test.each(["openai", "grok-build"])("dispatches scoped provider hooks only for %s", async provider => {
+		const runtime = new ExtensionRuntime();
+		let calls = 0;
+		const extension = await loadExtensionFromFactory(
+			api => {
+				api.on(
+					"before_provider_request",
+					() => {
+						calls += 1;
+					},
+					{ provider },
+				);
+			},
+			process.cwd(),
+			new EventBus(),
+			runtime,
+			"provider-scope",
+		);
+		const runner = new ExtensionRunner([extension], runtime, process.cwd(), SessionManager.inMemory(), {} as never);
+		runner.initialize({} as never, { getModel: () => getBundledModel("openai", "gpt-4o-mini") } as never);
+		const authority = createAttemptScopeAuthority();
+		const store = new AttemptRecordStore(authority);
+		const scope = authority.mintMain();
+		store.register(scope);
+		store.establishClean(scope);
+		runner.setAttemptRecordStore(store);
+
+		await runner.emitBeforeProviderRequest({ prompt: "fixture" }, scope);
+
+		expect(calls).toBe(provider === "openai" ? 1 : 0);
+		expect(store.isClean(scope)).toBe(provider !== "openai");
+	});
+
+	test.each([false, true])("preserves replay safety only for host observer=%s", async observer => {
+		const runtime = new ExtensionRuntime();
+		let calls = 0;
+		const extension = await loadExtensionFromFactory(
+			api => {
+				const handler = () => {
+					calls += 1;
+				};
+				api.on("agent_start", observer ? tagHostObserverHandler(handler) : handler);
+			},
+			process.cwd(),
+			new EventBus(),
+			runtime,
+			"lifecycle-observer",
+		);
+		const runner = new ExtensionRunner([extension], runtime, process.cwd(), SessionManager.inMemory(), {} as never);
+		const authority = createAttemptScopeAuthority();
+		const store = new AttemptRecordStore(authority);
+		const scope = authority.mintMain();
+		store.register(scope);
+		store.establishClean(scope);
+		runner.setAttemptRecordStore(store);
+
+		await runner.emit({ type: "agent_start" }, undefined, scope);
+
+		expect(calls).toBe(1);
+		expect(store.isClean(scope)).toBe(observer);
 	});
 });

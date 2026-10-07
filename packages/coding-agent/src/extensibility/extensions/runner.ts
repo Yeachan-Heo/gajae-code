@@ -49,8 +49,10 @@ import {
 	sanitizeFunctionHookReason,
 } from "./function-hooks";
 import {
+	getExtensionHandlerProvider,
 	getExtensionHandlerRegistrationOrder,
 	getFunctionHookRegistration,
+	isHostObserverHandler,
 	readConstrainedFunctionHookFile,
 } from "./function-hooks-internal";
 import type {
@@ -918,6 +920,8 @@ export class ExtensionRunner {
 		const wildcard = this.#handlersByEvent.get("*") ?? [];
 		const matches: IndexedHandler[] = [];
 		for (const indexed of [...exact, ...wildcard]) {
+			const provider = getExtensionHandlerProvider(indexed.handler);
+			if (provider !== undefined && provider !== this.#getModel()?.provider) continue;
 			const registration = getFunctionHookRegistration(indexed.handler);
 			if (!registration) {
 				if (includeLegacyToolHandlers && indexed.registrationOrder >= 0 && exact.includes(indexed))
@@ -1076,7 +1080,7 @@ export class ExtensionRunner {
 		if (handlers.length === 0) return { action: "continue", event };
 		const includesLegacy = handlers.some(indexed => getFunctionHookRegistration(indexed.handler) === undefined);
 		if (includesLegacy) this.#requireScopeOrFailClosed(options.scope, event.type);
-		this.#markAttemptExecuted(options.scope);
+		if (handlers.some(indexed => !isHostObserverHandler(indexed.handler))) this.#markAttemptExecuted(options.scope);
 		const functionHookDepth = this.#functionHookDepth.getStore() ?? 0;
 		if (functionHookDepth >= 16) {
 			const reason = "Function hook re-entry depth exceeded";

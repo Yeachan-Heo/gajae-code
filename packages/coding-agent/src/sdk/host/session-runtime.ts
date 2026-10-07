@@ -35,7 +35,8 @@ import {
 	validateSettingPatch,
 } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
-import type { AgentEndEvent } from "../../extensibility/shared-events";
+import { tagHostObserverHandler } from "../../extensibility/extensions/function-hooks-internal";
+import type { AgentEndEvent, AgentStartEvent, TurnEndEvent, TurnStartEvent } from "../../extensibility/shared-events";
 import { normalizeGoal } from "../../goals/state";
 import { toAgentWireEventPayload } from "../../modes/shared/agent-wire/event-envelope";
 import type { AgentSessionEvent } from "../../session/agent-session";
@@ -6051,174 +6052,182 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			resolveTerminalPublicationWaiters(observed, terminalPublicationByCorrelation);
 		}
 	};
-	api.on("agent_start", (event, ctx) => {
-		const owner = lifecycleStateForEvent(ctx, "agent_start", event.sdkRunToken);
-		// The activity checkpoint is already fire-and-forget and does not depend on
-		// the handler awaiting trackLifecycle, so it composes with #5683 unchanged.
-		void (owner?.runtime ?? lifecycleStateForContext(ctx, "agent_start")?.runtime)
-			?.reportActivity("active")
-			.catch(error => logger.warn(`sdk: active activity checkpoint failed: ${String(error)}`));
-		// Interactive/skill turns must not wait on durable start persist. Keep
-		// trackLifecycle so drain, persist-then-publish, content-hold release, and
-		// shutdown still run; do not return that promise to the extension runner
-		// (EXTENSION_HANDLER_TIMEOUT_MS would otherwise stall the prompt).
-		void trackLifecycle(
-			async () =>
-				emitLifecycle(
-					"agent_start",
-					ctx,
-					undefined,
-					undefined,
-					owner ? { state: owner, sessionId: owner.sessionId } : undefined,
-					undefined,
-					false,
-					undefined,
-					undefined,
-					typeof event.sdkRunToken === "string" ? event.sdkRunToken : undefined,
-					event.sdkRunTokens,
-					event.lifecycleScope,
-				),
-			owner,
-		).catch(error => {
-			logger.error("SDK agent_start lifecycle task failed", {
-				error: sanitizePromptFailure(error),
+	api.on(
+		"agent_start",
+		tagHostObserverHandler((event: AgentStartEvent, ctx: ExtensionContext) => {
+			const owner = lifecycleStateForEvent(ctx, "agent_start", event.sdkRunToken);
+			// The activity checkpoint is already fire-and-forget and does not depend on
+			// the handler awaiting trackLifecycle, so it composes with #5683 unchanged.
+			void (owner?.runtime ?? lifecycleStateForContext(ctx, "agent_start")?.runtime)
+				?.reportActivity("active")
+				.catch(error => logger.warn(`sdk: active activity checkpoint failed: ${String(error)}`));
+			// Interactive/skill turns must not wait on durable start persist. Keep
+			// trackLifecycle so drain, persist-then-publish, content-hold release, and
+			// shutdown still run; do not return that promise to the extension runner
+			// (EXTENSION_HANDLER_TIMEOUT_MS would otherwise stall the prompt).
+			void trackLifecycle(
+				async () =>
+					emitLifecycle(
+						"agent_start",
+						ctx,
+						undefined,
+						undefined,
+						owner ? { state: owner, sessionId: owner.sessionId } : undefined,
+						undefined,
+						false,
+						undefined,
+						undefined,
+						typeof event.sdkRunToken === "string" ? event.sdkRunToken : undefined,
+						event.sdkRunTokens,
+						event.lifecycleScope,
+					),
+				owner,
+			).catch(error => {
+				logger.error("SDK agent_start lifecycle task failed", {
+					error: sanitizePromptFailure(error),
+				});
 			});
-		});
-	});
-	api.on("agent_end", (event, ctx) => {
-		const tokenBinding =
-			typeof event.sdkRunToken === "string" ? lifecycleRunOwners.get(event.sdkRunToken) : undefined;
-		const owner = tokenBinding?.state ?? lifecycleStateForEvent(ctx, "agent_end", event.sdkRunToken);
-		void (owner?.runtime ?? lifecycleStateForContext(ctx, "agent_end")?.runtime)
-			?.reportActivity("idle")
-			.catch(error => logger.warn(`sdk: idle activity checkpoint failed: ${String(error)}`));
-		// Capture the oldest unmatched batch synchronously. A successor may start
-		// while the failed diagnostic persists; that must not retarget the
-		// predecessor's reason or terminal boundary to the successor invocation.
-		const endedBatch = tokenBinding?.batch ?? owner?.openLifecycleBatches[0];
-		const lifecycleOwner = owner
-			? {
-					state: owner,
-					sessionId: owner.sessionId,
-					...(endedBatch ? { batch: endedBatch } : {}),
-				}
-			: undefined;
-		const currentInvocation = endedBatch?.invocations[0] ?? owner?.activeInvocation;
-		const failureCandidates = endedBatch
-			? [...endedBatch.invocations, ...endedBatch.attachedInvocations]
-			: currentInvocation
-				? [currentInvocation]
-				: [];
-		const eventFailure = providerFailureFromAgentEnd(event);
-		const recordedFailureCode = failureCandidates
-			.map(({ correlation }) => owner?.failureDiagnosticCodes.get(lifecycleCorrelationKey(correlation)))
-			.find((code): code is string => code !== undefined);
-		const failure =
-			eventFailure ??
-			(recordedFailureCode === undefined
-				? undefined
-				: Object.assign(new Error("agent run failed"), { code: recordedFailureCode }));
-		const genericFailureKeys = failureCandidates
-			.map(({ correlation }) => lifecycleCorrelationKey(correlation))
-			.filter(key => owner?.failureDiagnosticCodes.get(key) === "agent_failed");
-		const hasExistingFailure = failureCandidates.some(({ correlation }) =>
-			owner?.failureDiagnosticKeys.has(lifecycleCorrelationKey(correlation)),
-		);
-		const failureAlreadyPublished =
-			eventFailure === undefined || (hasExistingFailure && genericFailureKeys.length === 0);
-		const terminalEvidence = promptTerminalEvidenceFromAgentEnd(event);
-		const terminalOutcome =
-			failure !== undefined
-				? canonicalFailedOutcome(failure)
-				: event.stopReason === "cancelled" ||
-						(event.stopReason === "maintenance" && event.maintenanceOutcome === "aborted")
-					? terminalStoppedOutcome(
-							event.stopReason,
-							event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
-						)
-					: terminalEvidence.content?.text.trim() || terminalEvidence.hasActivity
+		}),
+	);
+	api.on(
+		"agent_end",
+		tagHostObserverHandler((event: AgentEndEvent, ctx: ExtensionContext) => {
+			const tokenBinding =
+				typeof event.sdkRunToken === "string" ? lifecycleRunOwners.get(event.sdkRunToken) : undefined;
+			const owner = tokenBinding?.state ?? lifecycleStateForEvent(ctx, "agent_end", event.sdkRunToken);
+			void (owner?.runtime ?? lifecycleStateForContext(ctx, "agent_end")?.runtime)
+				?.reportActivity("idle")
+				.catch(error => logger.warn(`sdk: idle activity checkpoint failed: ${String(error)}`));
+			// Capture the oldest unmatched batch synchronously. A successor may start
+			// while the failed diagnostic persists; that must not retarget the
+			// predecessor's reason or terminal boundary to the successor invocation.
+			const endedBatch = tokenBinding?.batch ?? owner?.openLifecycleBatches[0];
+			const lifecycleOwner = owner
+				? {
+						state: owner,
+						sessionId: owner.sessionId,
+						...(endedBatch ? { batch: endedBatch } : {}),
+					}
+				: undefined;
+			const currentInvocation = endedBatch?.invocations[0] ?? owner?.activeInvocation;
+			const failureCandidates = endedBatch
+				? [...endedBatch.invocations, ...endedBatch.attachedInvocations]
+				: currentInvocation
+					? [currentInvocation]
+					: [];
+			const eventFailure = providerFailureFromAgentEnd(event);
+			const recordedFailureCode = failureCandidates
+				.map(({ correlation }) => owner?.failureDiagnosticCodes.get(lifecycleCorrelationKey(correlation)))
+				.find((code): code is string => code !== undefined);
+			const failure =
+				eventFailure ??
+				(recordedFailureCode === undefined
+					? undefined
+					: Object.assign(new Error("agent run failed"), { code: recordedFailureCode }));
+			const genericFailureKeys = failureCandidates
+				.map(({ correlation }) => lifecycleCorrelationKey(correlation))
+				.filter(key => owner?.failureDiagnosticCodes.get(key) === "agent_failed");
+			const hasExistingFailure = failureCandidates.some(({ correlation }) =>
+				owner?.failureDiagnosticKeys.has(lifecycleCorrelationKey(correlation)),
+			);
+			const failureAlreadyPublished =
+				eventFailure === undefined || (hasExistingFailure && genericFailureKeys.length === 0);
+			const terminalEvidence = promptTerminalEvidenceFromAgentEnd(event);
+			const terminalOutcome =
+				failure !== undefined
+					? canonicalFailedOutcome(failure)
+					: event.stopReason === "cancelled" ||
+							(event.stopReason === "maintenance" && event.maintenanceOutcome === "aborted")
 						? terminalStoppedOutcome(
 								event.stopReason,
 								event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
 							)
-						: canonicalFailedOutcome(EMPTY_PROMPT_FAILURE);
-		const releaseTerminalRetention = retainTerminalBoundaries(failureCandidates);
-		return trackLifecycle(async () => {
-			for (const invocation of failureCandidates) {
-				if (
-					invocation.kind !== "prompt" ||
-					!owner?.deadlineManager.shouldDeferTerminalTransition(invocation.correlation)
-				)
-					continue;
-				const key = lifecycleCorrelationKey(invocation.correlation);
-				const observation = deadlineTerminalizationObservations.get(key);
-				const failureReason =
-					owner.unrecordedFailureReasons?.get(key) ??
-					(failure !== undefined && !failureAlreadyPublished ? sanitizePromptFailure(failure) : undefined);
-				owner.deadlineManager.noteTerminalTransition(
-					invocation.correlation,
-					failureReason,
-					terminalEvidence.content !== undefined || terminalEvidence.hasActivity || terminalOutcome !== undefined
-						? {
-								content: terminalEvidence.content,
-								hasActivity: terminalEvidence.hasActivity,
-								...(terminalOutcome === undefined ? {} : { outcome: terminalOutcome }),
-							}
-						: undefined,
-					true,
-				);
-				let capturedOutcome = terminalOutcome;
-				if (observation) {
-					observation.owner = owner;
-					observation.eventCaptured = true;
-					observation.terminalContent = terminalEvidence.content;
-					observation.terminalHasActivity = terminalEvidence.hasActivity;
-					if (capturedOutcome !== undefined) observation.terminalOutcome = capturedOutcome;
-					observation.sessionId = owner.sessionId;
-					observation.clearUnrecordedFailure = () => owner.unrecordedFailureReasons?.delete(key);
-				}
-				if (capturedOutcome !== undefined) {
-					try {
-						const staged = await owner.reconciliation.stagePendingTerminalOutcome(
-							"prompt",
-							invocation.correlation,
-							capturedOutcome,
-							true,
-							observation?.deadlineMaxAt,
-						);
-						if (staged !== undefined) capturedOutcome = staged;
-					} catch {
-						// Keep the exact outcome in the observation while the manager's
-						// live retry owner waits for durable storage to recover.
+						: terminalEvidence.content?.text.trim() || terminalEvidence.hasActivity
+							? terminalStoppedOutcome(
+									event.stopReason,
+									event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
+								)
+							: canonicalFailedOutcome(EMPTY_PROMPT_FAILURE);
+			const releaseTerminalRetention = retainTerminalBoundaries(failureCandidates);
+			return trackLifecycle(async () => {
+				for (const invocation of failureCandidates) {
+					if (
+						invocation.kind !== "prompt" ||
+						!owner?.deadlineManager.shouldDeferTerminalTransition(invocation.correlation)
+					)
+						continue;
+					const key = lifecycleCorrelationKey(invocation.correlation);
+					const observation = deadlineTerminalizationObservations.get(key);
+					const failureReason =
+						owner.unrecordedFailureReasons?.get(key) ??
+						(failure !== undefined && !failureAlreadyPublished ? sanitizePromptFailure(failure) : undefined);
+					owner.deadlineManager.noteTerminalTransition(
+						invocation.correlation,
+						failureReason,
+						terminalEvidence.content !== undefined ||
+							terminalEvidence.hasActivity ||
+							terminalOutcome !== undefined
+							? {
+									content: terminalEvidence.content,
+									hasActivity: terminalEvidence.hasActivity,
+									...(terminalOutcome === undefined ? {} : { outcome: terminalOutcome }),
+								}
+							: undefined,
+						true,
+					);
+					let capturedOutcome = terminalOutcome;
+					if (observation) {
+						observation.owner = owner;
+						observation.eventCaptured = true;
+						observation.terminalContent = terminalEvidence.content;
+						observation.terminalHasActivity = terminalEvidence.hasActivity;
+						if (capturedOutcome !== undefined) observation.terminalOutcome = capturedOutcome;
+						observation.sessionId = owner.sessionId;
+						observation.clearUnrecordedFailure = () => owner.unrecordedFailureReasons?.delete(key);
+					}
+					if (capturedOutcome !== undefined) {
+						try {
+							const staged = await owner.reconciliation.stagePendingTerminalOutcome(
+								"prompt",
+								invocation.correlation,
+								capturedOutcome,
+								true,
+								observation?.deadlineMaxAt,
+							);
+							if (staged !== undefined) capturedOutcome = staged;
+						} catch {
+							// Keep the exact outcome in the observation while the manager's
+							// live retry owner waits for durable storage to recover.
+						}
+					}
+					if (observation) {
+						if (capturedOutcome !== undefined) observation.terminalOutcome = capturedOutcome;
+						observation.eventPrepared = true;
+						observation.resolveEventCapture();
 					}
 				}
-				if (observation) {
-					if (capturedOutcome !== undefined) observation.terminalOutcome = capturedOutcome;
-					observation.eventPrepared = true;
-					observation.resolveEventCapture();
+				if (failure && !failureAlreadyPublished) {
+					for (const key of genericFailureKeys) owner?.failureDiagnosticKeys.delete(key);
+					await emitLifecycle("agent_failed", ctx, failure, undefined, lifecycleOwner);
 				}
-			}
-			if (failure && !failureAlreadyPublished) {
-				for (const key of genericFailureKeys) owner?.failureDiagnosticKeys.delete(key);
-				await emitLifecycle("agent_failed", ctx, failure, undefined, lifecycleOwner);
-			}
-			await emitLifecycle(
-				"agent_end",
-				ctx,
-				undefined,
-				event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
-				lifecycleOwner,
-				terminalEvidence.content,
-				terminalEvidence.hasActivity,
-				terminalOutcome,
-				event.stopReason,
-			);
-		}, owner).finally(() => {
-			releaseTerminalRetention();
-			if (typeof event.sdkRunToken === "string" && lifecycleRunOwners.get(event.sdkRunToken)?.state === owner)
-				lifecycleRunOwners.delete(event.sdkRunToken);
-		});
-	});
+				await emitLifecycle(
+					"agent_end",
+					ctx,
+					undefined,
+					event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
+					lifecycleOwner,
+					terminalEvidence.content,
+					terminalEvidence.hasActivity,
+					terminalOutcome,
+					event.stopReason,
+				);
+			}, owner).finally(() => {
+				releaseTerminalRetention();
+				if (typeof event.sdkRunToken === "string" && lifecycleRunOwners.get(event.sdkRunToken)?.state === owner)
+					lifecycleRunOwners.delete(event.sdkRunToken);
+			});
+		}),
+	);
 	api.on("agent_failed", (event, ctx) => {
 		const tokenBinding =
 			typeof event.sdkRunToken === "string" ? lifecycleRunOwners.get(event.sdkRunToken) : undefined;
@@ -6242,21 +6251,27 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			owner,
 		);
 	});
-	api.on("turn_start", async (_event, ctx) => {
-		const current = lifecycleStateForContext(ctx, "agent_start");
-		if (!current) return;
-		// Optional broker discovery must not hold an interactive extension event open.
-		// registerBroker owns single-flight recovery and optional-failure diagnostics.
-		const registration = current.registerBroker();
-		if (options.brokerRegistrationRequired) await registration;
-		current.runtime.emitEvent({ type: "turn_start", sessionId: ctx.sessionManager.getSessionId() });
-	});
-	const consumedMasterNonces = new Map<string, number>();
-	api.on("turn_end", (_event, ctx) =>
-		lifecycleStateForContext(ctx, "agent_end")?.runtime.emitEvent({
-			type: "turn_end",
-			sessionId: ctx.sessionManager.getSessionId(),
+	api.on(
+		"turn_start",
+		tagHostObserverHandler(async (_event: TurnStartEvent, ctx: ExtensionContext) => {
+			const current = lifecycleStateForContext(ctx, "agent_start");
+			if (!current) return;
+			// Optional broker discovery must not hold an interactive extension event open.
+			// registerBroker owns single-flight recovery and optional-failure diagnostics.
+			const registration = current.registerBroker();
+			if (options.brokerRegistrationRequired) await registration;
+			current.runtime.emitEvent({ type: "turn_start", sessionId: ctx.sessionManager.getSessionId() });
 		}),
+	);
+	const consumedMasterNonces = new Map<string, number>();
+	api.on(
+		"turn_end",
+		tagHostObserverHandler((_event: TurnEndEvent, ctx: ExtensionContext) =>
+			lifecycleStateForContext(ctx, "agent_end")?.runtime.emitEvent({
+				type: "turn_end",
+				sessionId: ctx.sessionManager.getSessionId(),
+			}),
+		),
 	);
 	// Tool activity renews the deadline of EVERY prompt correlation attached to
 	// the active run — the root invocation plus any in-run consumed follow-ups

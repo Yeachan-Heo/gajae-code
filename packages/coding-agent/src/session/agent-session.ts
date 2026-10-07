@@ -20949,6 +20949,7 @@ export class AgentSession {
 		if (
 			sameModel &&
 			!errorIsFromBeforeCompaction &&
+			assistantMessage.stopReason === "error" &&
 			classifyContextOverflow(assistantMessage, assistantMessage.transportFailure, contextWindow)
 		) {
 			this.#overflowMaintenanceAttempts += 1;

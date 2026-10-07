@@ -277,9 +277,12 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 	) {}
 	#handlerRegistrationOrder = 0;
 
-	on<F extends HandlerFn>(event: string, handler: F): void {
+	on<F extends HandlerFn>(event: string, handler: F, options?: { provider: string }): void {
+		if (options && event !== "before_provider_request") {
+			throw new Error("Provider filters are only valid for before_provider_request handlers");
+		}
 		const list = this.extension.handlers.get(event) ?? [];
-		list.push(wrapExtensionHandlerRegistration(handler, this.#handlerRegistrationOrder++));
+		list.push(wrapExtensionHandlerRegistration(handler, this.#handlerRegistrationOrder++, options?.provider));
 		this.extension.handlers.set(event, list);
 	}
 

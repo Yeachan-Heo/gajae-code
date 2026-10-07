@@ -6,6 +6,18 @@ export type TaggedFunctionHookHandler = (...args: unknown[]) => Promise<unknown>
 
 const registrations = new WeakMap<TaggedFunctionHookHandler, FunctionHookRegistration>();
 const registrationOrders = new WeakMap<(...args: never[]) => unknown, number>();
+const handlerProviders = new WeakMap<(...args: never[]) => unknown, string>();
+const hostObserverHandlers = new WeakSet<(...args: never[]) => unknown>();
+
+/** Host lifecycle projections do not execute user work in the provider attempt. */
+export function tagHostObserverHandler<T extends (...args: never[]) => unknown>(handler: T): T {
+	hostObserverHandlers.add(handler);
+	return handler;
+}
+
+export function isHostObserverHandler(value: unknown): boolean {
+	return typeof value === "function" && hostObserverHandlers.has(value as (...args: never[]) => unknown);
+}
 
 export function tagExtensionHandlerRegistrationOrder<T extends (...args: never[]) => unknown>(
 	handler: T,
@@ -18,10 +30,17 @@ export function tagExtensionHandlerRegistrationOrder<T extends (...args: never[]
 export function wrapExtensionHandlerRegistration<T extends (...args: never[]) => unknown>(
 	handler: T,
 	registrationOrder: number,
+	provider?: string,
 ): T {
 	const registered = ((...args: never[]) => handler(...args)) as T;
 	registrationOrders.set(registered, registrationOrder);
+	if (provider !== undefined) handlerProviders.set(registered, provider);
+	if (isHostObserverHandler(handler)) hostObserverHandlers.add(registered);
 	return registered;
+}
+
+export function getExtensionHandlerProvider(value: unknown): string | undefined {
+	return typeof value === "function" ? handlerProviders.get(value as (...args: never[]) => unknown) : undefined;
 }
 
 export function getExtensionHandlerRegistrationOrder(value: unknown): number | undefined {

@@ -227,7 +227,7 @@ export async function runManagedEmptyStopScenario(
 				"contextPromotion.enabled": false,
 				"todo.reminders": false,
 				"fallback.maxAttempts": 1,
-				"retry.baseDelayMs": 1,
+				"retry.enabled": false,
 				"fallback.circuitCooldownMs": 0,
 			});
 			settings.setModelRole("default", `${PROVIDER}/${PRIMARY}`);
@@ -269,7 +269,9 @@ export async function runManagedEmptyStopScenario(
 			}));
 			session.setConfiguredModelChain(
 				"default",
-				usesFallback(scenario) ? [`${PROVIDER}/${PRIMARY}`, `${PROVIDER}/${FALLBACK}`] : [`${PROVIDER}/${PRIMARY}`],
+				usesFallback(scenario) || scenario === "nonzero-usage"
+					? [`${PROVIDER}/${PRIMARY}`, `${PROVIDER}/${FALLBACK}`]
+					: [`${PROVIDER}/${PRIMARY}`],
 				"connected-local",
 			);
 			const events: AgentSessionEvent[] = [];
@@ -346,7 +348,6 @@ export async function runManagedEmptyStopScenario(
 					.map(({ from, to, reason }) => ({ from, to, reason })),
 				managedTranscriptExists: transcript !== undefined && (await Bun.file(transcript).exists()),
 			};
-			if (scenario === "fallback-enabled") throw new Error(JSON.stringify(report));
 			assertScenarioReport(report);
 			return report;
 		});

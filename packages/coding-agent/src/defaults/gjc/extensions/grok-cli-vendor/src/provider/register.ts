@@ -102,13 +102,15 @@ export default function registerGrokCli(api: ExtensionAPI) {
     }
   });
 
-  api.on('before_provider_request', (event, ctx) => {
-    if (ctx.model?.provider !== 'grok-build') return;
-
-    const modelId = ctx.model?.id ?? '';
-    const sessionId = ctx.sessionManager?.getSessionId();
-    return sanitizePayload(event.payload as Record<string, unknown>, modelId, sessionId, ctx.cwd);
-  });
+  api.on(
+    'before_provider_request',
+    (event, ctx) => {
+      const modelId = ctx.model?.id ?? '';
+      const sessionId = ctx.sessionManager?.getSessionId();
+      return sanitizePayload(event.payload as Record<string, unknown>, modelId, sessionId, ctx.cwd);
+    },
+    { provider: 'grok-build' },
+  );
 
   registerUsageCommand(api);
 }
