@@ -25,17 +25,7 @@ afterEach(() => {
 async function dispatchLocalCallback(callbackUrl: string): Promise<void> {
 	const url = new URL(callbackUrl);
 	url.hostname = "127.0.0.1";
-	let lastError: unknown;
-	for (let attempt = 0; attempt < 20; attempt++) {
-		try {
-			await originalFetch(url.toString());
-			return;
-		} catch (error) {
-			lastError = error;
-			await Bun.sleep(10);
-		}
-	}
-	throw lastError instanceof Error ? lastError : new Error(String(lastError));
+	await originalFetch(url.toString());
 }
 
 /**

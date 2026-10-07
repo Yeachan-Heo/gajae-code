@@ -5,15 +5,6 @@ import { SdkClientError } from "../src/sdk/client";
 import type { SessionAttachment } from "../src/sdk/router";
 import { SessionRouter } from "../src/sdk/router/session-router";
 
-const waitFor = async (predicate: () => boolean, label: string): Promise<void> => {
-	const deadline = Date.now() + 2_000;
-	while (Date.now() < deadline) {
-		if (predicate()) return;
-		await Bun.sleep(5);
-	}
-	throw new Error(`Timed out waiting for ${label}`);
-};
-
 test("SessionRouter rejects request preparation when reconciliation outlives its deadline", async () => {
 	let refreshes = 0;
 	let reconciliationFinished = false;
@@ -132,12 +123,16 @@ test("SessionRouter does not reconcile an already expired request", async () => 
 test("SessionRouter cancels pending reconciliation during teardown without dispatch", async () => {
 	let refreshes = 0;
 	const gate = Promise.withResolvers<void>();
+	const refreshStarted = Promise.withResolvers<void>();
 	const index = {
 		indexSeq: 0,
 		open: async () => index,
 		refresh: async () => {
 			refreshes += 1;
-			if (refreshes > 1) await gate.promise;
+			if (refreshes > 1) {
+				refreshStarted.resolve();
+				await gate.promise;
+			}
 			return index;
 		},
 		refreshIfChanged: async () => false,
@@ -156,7 +151,7 @@ test("SessionRouter cancels pending reconciliation during teardown without dispa
 	});
 	await router.start();
 	const request = router.request("missing", { type: "command" }, undefined, undefined, { deadline: Date.now() + 500 });
-	await Bun.sleep(5);
+	await refreshStarted.promise;
 	const stopping = router.stop();
 	gate.resolve();
 	await stopping;
@@ -167,6 +162,8 @@ test("SessionRouter cancels pending reconciliation during teardown without dispa
 test("ACP provider activation retries the current Router attachment after rotation during registration", async () => {
 	let currentGeneration = 1;
 	const firstRegistration = Promise.withResolvers<Record<string, unknown>>();
+	const firstRegistrationStarted = Promise.withResolvers<void>();
+	const secondRegistrationStarted = Promise.withResolvers<void>();
 	const registrations: Array<{
 		frame: Record<string, unknown>;
 		generation: number | undefined;
@@ -182,7 +179,11 @@ test("ACP provider activation retries the current Router attachment after rotati
 			options?: Record<string, unknown>,
 		) => {
 			registrations.push({ frame, generation, attachment, options });
-			if (registrations.length === 1) return await firstRegistration.promise;
+			if (registrations.length === 1) {
+				firstRegistrationStarted.resolve();
+				return await firstRegistration.promise;
+			}
+			secondRegistrationStarted.resolve();
 			return {
 				ok: true,
 				result: { leaseId: typeof frame.expectedLeaseId === "string" ? frame.expectedLeaseId : "lease-1" },
@@ -207,12 +208,12 @@ test("ACP provider activation retries the current Router attachment after rotati
 	});
 	const start = adapter.start();
 	try {
-		await waitFor(() => registrations.length === 1, "initial provider registration");
+		await firstRegistrationStarted.promise;
 		currentGeneration = 2;
 		adapter.acceptAttachment(secondAttachment);
 		firstRegistration.resolve({ ok: true, result: { leaseId: "lease-1" } });
 		await start;
-		await waitFor(() => registrations.length === 2, "provider registration on rotated attachment");
+		await secondRegistrationStarted.promise;
 		expect(registrations[0]).toMatchObject({ generation: 1, attachment: firstAttachment });
 		expect(registrations[0]?.options?.timeoutMs).toBeGreaterThan(0);
 		expect(registrations[1]).toMatchObject({
@@ -548,6 +549,7 @@ test("Broker lifecycle client cannot activate per-session providers", async () =
 
 test("ACP provider readiness rebinds expired reverse leases on the live attachment (#4909)", async () => {
 	const registrations: Record<string, unknown>[] = [];
+	const rebound = Promise.withResolvers<void>();
 	const attachment: SessionAttachment = {
 		authorityId: "session-1:stable",
 		sessionId: "session-1",
@@ -562,6 +564,7 @@ test("ACP provider readiness rebinds expired reverse leases on the live attachme
 		router: {
 			request: async (_sessionId: string, frame: Record<string, unknown>) => {
 				registrations.push(frame);
+				if (registrations.length === 3) rebound.resolve();
 				return {
 					ok: true,
 					result: { leaseId: typeof frame.expectedLeaseId === "string" ? frame.expectedLeaseId : "lease-1" },
@@ -591,7 +594,7 @@ test("ACP provider readiness rebinds expired reverse leases on the live attachme
 			ok: false,
 			error: { code: "lease_expired", message: "Lease expired." },
 		});
-		await waitFor(() => registrations.length === 3, "permission rebind after lease_expired");
+		await rebound.promise;
 		expect(registrations[2]).toMatchObject({
 			type: "register_provider",
 			capability: "permission",
@@ -635,7 +638,6 @@ test("ACP provider rebind ignores lease errors from a foreign connection (#4909)
 			ok: false,
 			error: { code: "lease_expired", message: "Lease expired." },
 		});
-		await Bun.sleep(30);
 		expect(registrations).toHaveLength(1);
 	} finally {
 		await adapter.close();
@@ -667,7 +669,11 @@ test("ACP provider rebind reports non-conflict adapter failures as provider_rebi
 	});
 	try {
 		const failures: SdkClientError[] = [];
-		adapter.onReconnectFailed(error => failures.push(error));
+		const failureReported = Promise.withResolvers<void>();
+		adapter.onReconnectFailed(error => {
+			failures.push(error);
+			if (error.code === "provider_rebind_failed") failureReported.resolve();
+		});
 		await adapter.start();
 		adapter.acceptFrame({
 			type: "reverse_response",
@@ -677,10 +683,7 @@ test("ACP provider rebind reports non-conflict adapter failures as provider_rebi
 			ok: false,
 			error: { code: "lease_expired", message: "Lease expired." },
 		});
-		await waitFor(
-			() => failures.some(error => error.code === "provider_rebind_failed"),
-			"provider_rebind_failed after omitted leaseId",
-		);
+		await failureReported.promise;
 		expect(failures.some(error => error.code === "reconnect_exhausted")).toBe(false);
 	} finally {
 		await adapter.close();
@@ -689,6 +692,7 @@ test("ACP provider rebind reports non-conflict adapter failures as provider_rebi
 
 test("ACP provider rebind observes lease_expired through the Router event wrapper (#4909)", async () => {
 	const registrations: Record<string, unknown>[] = [];
+	const rebound = Promise.withResolvers<void>();
 	const attachment: SessionAttachment = {
 		authorityId: "session-1:stable",
 		sessionId: "session-1",
@@ -702,6 +706,7 @@ test("ACP provider rebind observes lease_expired through the Router event wrappe
 		router: {
 			request: async (_sessionId: string, frame: Record<string, unknown>) => {
 				registrations.push(frame);
+				if (registrations.length === 2) rebound.resolve();
 				return {
 					ok: true,
 					result: { leaseId: typeof frame.expectedLeaseId === "string" ? frame.expectedLeaseId : "lease-1" },
@@ -726,7 +731,7 @@ test("ACP provider rebind observes lease_expired through the Router event wrappe
 				error: { code: "lease_expired", message: "Lease expired." },
 			},
 		});
-		await waitFor(() => registrations.length === 2, "permission rebind after wrapped lease_expired");
+		await rebound.promise;
 		expect(registrations[1]).toMatchObject({
 			type: "register_provider",
 			capability: "permission",
@@ -743,6 +748,7 @@ test("ACP lease rebind does not abort in-flight reverse permission requests (#49
 		AbortSignal | undefined
 	>();
 	const { promise: permissionGate, resolve: resolvePermissionGate } = Promise.withResolvers<void>();
+	const responseSent = Promise.withResolvers<void>();
 	const sent: Record<string, unknown>[] = [];
 
 	const attachment: SessionAttachment = {
@@ -753,6 +759,7 @@ test("ACP lease rebind does not abort in-flight reverse permission requests (#49
 		isCurrent: () => true,
 		send: async frame => {
 			sent.push(frame);
+			if (frame.type === "reverse_response" && frame.id === "perm-1") responseSent.resolve();
 		},
 
 		sendMaintenance: () => {},
@@ -795,12 +802,9 @@ test("ACP lease rebind does not abort in-flight reverse permission requests (#49
 		expect(registrations.length).toBeGreaterThanOrEqual(2);
 		expect(signal?.aborted).toBe(false);
 		resolvePermissionGate();
-		await waitFor(
-			() =>
-				sent.some(
-					frame => frame.type === "reverse_response" && frame.id === "perm-1" && frame.leaseId === "lease-1",
-				),
-			"admitted reverse response on original lease",
+		await responseSent.promise;
+		expect(sent).toContainEqual(
+			expect.objectContaining({ type: "reverse_response", id: "perm-1", leaseId: "lease-1" }),
 		);
 	} finally {
 		resolvePermissionGate();
@@ -815,6 +819,7 @@ test("ACP still answers an admitted reverse request after a later lease conflict
 		AbortSignal | undefined
 	>();
 	const { promise: permissionGate, resolve: resolvePermissionGate } = Promise.withResolvers<void>();
+	const responseSent = Promise.withResolvers<void>();
 	const attachment: SessionAttachment = {
 		authorityId: "session-1:stable",
 		sessionId: "session-1",
@@ -823,6 +828,7 @@ test("ACP still answers an admitted reverse request after a later lease conflict
 		isCurrent: () => true,
 		send: async frame => {
 			sent.push(frame);
+			if (frame.type === "reverse_response" && frame.id === "perm-1") responseSent.resolve();
 		},
 		sendMaintenance: () => {},
 	};
@@ -863,16 +869,14 @@ test("ACP still answers an admitted reverse request after a later lease conflict
 		await expect(adapter.ensureProviders()).rejects.toMatchObject({ code: "provider_lease_conflict" });
 		expect(adapter.leaseIds.get("permission")).toBeUndefined();
 		expect(signal?.aborted).toBe(true);
-		await waitFor(
-			() =>
-				sent.some(
-					frame =>
-						frame.type === "reverse_response" &&
-						frame.id === "perm-1" &&
-						frame.ok === false &&
-						(frame.error as { code?: string } | undefined)?.code === "provider_disconnected",
-				),
-			"host reverse settlement after foreign quarantine",
+		await responseSent.promise;
+		expect(sent).toContainEqual(
+			expect.objectContaining({
+				type: "reverse_response",
+				id: "perm-1",
+				ok: false,
+				error: expect.objectContaining({ code: "provider_disconnected" }),
+			}),
 		);
 	} finally {
 		resolvePermissionGate();
@@ -920,6 +924,7 @@ test("ACP provider rebind leaves a live foreign permission lease in place (#4909
 
 test("ACP provider refresh coalesces concurrent ensureProviders calls (#4909)", async () => {
 	const registrations: Record<string, unknown>[] = [];
+	const secondRegistrationStarted = Promise.withResolvers<void>();
 	const { promise: secondRegistration, resolve: resolveSecondRegistration } = Promise.withResolvers<void>();
 	const attachment: SessionAttachment = {
 		authorityId: "session-1:stable",
@@ -933,6 +938,7 @@ test("ACP provider refresh coalesces concurrent ensureProviders calls (#4909)", 
 		router: {
 			request: async (_sessionId: string, frame: Record<string, unknown>) => {
 				registrations.push(frame);
+				if (registrations.length === 2) secondRegistrationStarted.resolve();
 				if (registrations.length === 2) await secondRegistration;
 				return { ok: true, result: { leaseId: "lease-1" } };
 			},
@@ -945,7 +951,7 @@ test("ACP provider refresh coalesces concurrent ensureProviders calls (#4909)", 
 		await adapter.start();
 		expect(registrations).toHaveLength(1);
 		const first = adapter.ensureProviders();
-		await waitFor(() => registrations.length === 2, "forced refresh registration");
+		await secondRegistrationStarted.promise;
 		const second = adapter.ensureProviders();
 		resolveSecondRegistration();
 		await Promise.all([first, second]);
@@ -958,6 +964,7 @@ test("ACP provider refresh coalesces concurrent ensureProviders calls (#4909)", 
 
 test("ACP provider rebind keeps successfully registered capabilities after a later conflict (#4909)", async () => {
 	const sent: Record<string, unknown>[] = [];
+	const responseSent = Promise.withResolvers<void>();
 	const attachment: SessionAttachment = {
 		authorityId: "session-1:stable",
 		sessionId: "session-1",
@@ -966,6 +973,7 @@ test("ACP provider rebind keeps successfully registered capabilities after a lat
 		isCurrent: () => true,
 		send: async frame => {
 			sent.push(frame);
+			if (frame.type === "reverse_response" && frame.id === "fs-1") responseSent.resolve();
 		},
 		sendMaintenance: () => {},
 	};
@@ -996,10 +1004,8 @@ test("ACP provider rebind keeps successfully registered capabilities after a lat
 			leaseId: "lease-fs",
 			payload: { method: "fs.readTextFile", payload: { path: "/tmp/x" } },
 		});
-		await waitFor(
-			() => sent.some(frame => frame.type === "reverse_response" && frame.id === "fs-1"),
-			"fs reverse still owned after permission conflict",
-		);
+		await responseSent.promise;
+		expect(sent).toContainEqual(expect.objectContaining({ type: "reverse_response", id: "fs-1" }));
 	} finally {
 		await adapter.close();
 	}
