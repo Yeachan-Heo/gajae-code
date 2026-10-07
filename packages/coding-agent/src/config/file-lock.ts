@@ -339,10 +339,10 @@ function sameLockInfoPathState(left: LockInfoPathState, right: LockInfoPathState
 
 function fileLockDirIdentityFromPathState(state: LockInfoPathState, bytes: string): GenericFileLockDirIdentity {
 	return {
-		rootDev: String(state.root.dev),
-		rootIno: String(state.root.ino),
-		infoDev: String(state.file.dev),
-		infoIno: String(state.file.ino),
+		rootDev: canonicalLockDeviceId(state.root.dev).toString(),
+		rootIno: canonicalLockFileId(state.root.ino).toString(),
+		infoDev: canonicalLockDeviceId(state.file.dev).toString(),
+		infoIno: canonicalLockFileId(state.file.ino).toString(),
 		infoNlink: String(state.file.nlink),
 		infoSize: String(state.file.size),
 		infoMtimeNs: String(state.file.mtimeNs),
