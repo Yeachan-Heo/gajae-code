@@ -4164,7 +4164,7 @@ describe("SessionManager.inventorySessionsStrict root inspection failures", () =
 	});
 });
 
-describe.skipIf(process.platform === "win32")("managed session security: owner_mismatch repair", () => {
+describe.skipIf(process.platform !== "win32")("managed session security: owner_mismatch repair", () => {
 	let tempRoot: string;
 	let tempDir: string;
 
@@ -4188,7 +4188,7 @@ describe.skipIf(process.platform === "win32")("managed session security: owner_m
 			code: "owner_mismatch",
 		} as const);
 
-		const repairMock = vi.spyOn(native, "repairOwnerOnlyPathSecurityExpected").mockReturnValue({ ok: true } as const);
+		const repairMock = vi.spyOn(native, "repairOwnerOnlyPathSecurityExpected").mockReturnValue({ ok: true });
 
 		expect(() => ensureManagedDirectory(tempDir, root, "windows-existing-verify-first")).not.toThrow();
 
@@ -4241,7 +4241,7 @@ describe.skipIf(process.platform === "win32")("managed session security: owner_m
 			code: "acl_verify_failed",
 		} as const);
 
-		const repairMock = vi.spyOn(native, "repairOwnerOnlyPathSecurityExpected").mockReturnValue({ ok: true } as const);
+		const repairMock = vi.spyOn(native, "repairOwnerOnlyPathSecurityExpected").mockReturnValue({ ok: true });
 
 		expect(() => ensureManagedDirectory(tempDir, root, "windows-existing-verify-first")).not.toThrow();
 
@@ -4252,7 +4252,7 @@ describe.skipIf(process.platform === "win32")("managed session security: owner_m
 	it("verify ok immediately returns without calling repair", () => {
 		const root = managedDirectoryRoot(tempRoot);
 
-		const verifyMock = vi.spyOn(native, "verifyOwnerOnlyPathSecurityExpected").mockReturnValue({ ok: true } as const);
+		const verifyMock = vi.spyOn(native, "verifyOwnerOnlyPathSecurityExpected").mockReturnValue({ ok: true });
 
 		const repairMock = vi.spyOn(native, "repairOwnerOnlyPathSecurityExpected");
 
@@ -4265,9 +4265,9 @@ describe.skipIf(process.platform === "win32")("managed session security: owner_m
 	it("default policy applies security without repair attempt", () => {
 		const root = managedDirectoryRoot(tempRoot);
 
-		vi.spyOn(native, "applyOwnerOnlyPathSecurity").mockReturnValue({ ok: true } as const);
+		vi.spyOn(native, "applyOwnerOnlyPathSecurity").mockReturnValue({ ok: true });
 
-		vi.spyOn(native, "verifyOwnerOnlyPathSecurity").mockReturnValue({ ok: true } as const);
+		vi.spyOn(native, "verifyOwnerOnlyPathSecurity").mockReturnValue({ ok: true });
 
 		const repairMock = vi.spyOn(native, "repairOwnerOnlyPathSecurityExpected");
 
