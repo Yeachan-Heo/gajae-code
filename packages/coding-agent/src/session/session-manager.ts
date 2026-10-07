@@ -2146,7 +2146,7 @@ export interface ResumeSessionIdentity {
 /** Descriptor-bound bounded fingerprint for private explicit-session rollback authority.
  * JSON-safe: all bigint fields are stored as strings to survive JSON serialization,
  * spread, structuredClone, and JSON round-trip. */
-type ExplicitPersistIdentity = {
+export type ExplicitPersistIdentity = {
 	// All bigint fields stored as base-10 strings for JSON safety
 	dev: string;
 	ino: string;
@@ -7326,6 +7326,8 @@ interface SessionManagerStateSnapshot {
 	materializedFileEntries: readonly FileEntry[];
 	adoptedArtifactManager: ArtifactManager | null;
 	coldRestoreFile?: string;
+	/** Explicit persistence identity for snapshot serialization safety. Preserved across cross-manager adoptions. */
+	readonly explicitPersistIdentity?: ExplicitPersistIdentity;
 }
 
 /** Benchmark-derived cap for strong materialized session snapshots. */
@@ -8510,7 +8512,7 @@ export class SessionManager {
 		// caller-adjusted copies (spread, JSON round-trip, structuredClone, etc.).
 		// Adoption must restore the identity captured in the snapshot, not the current
 		// state of the sessionFile, to ensure stale file checks use the captured identity.
-		let explicit = (snapshot as any).explicitPersistIdentity as ExplicitPersistIdentity | undefined;
+		let explicit = snapshot.explicitPersistIdentity;
 		// Only attempt reconstruction for explicit-storage sessions that don't already
 		// have an explicit identity (e.g., snapshots captured before this change).
 		if (!explicit && snapshot.sessionFile && !snapshot.managedPersistExpectedIdentity) {

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { FileSessionStorage } from "@gajae-code/coding-agent/session/session-storage";
 import { TempDir } from "@gajae-code/utils";
@@ -51,7 +52,8 @@ describe("lifecycle contracts regression (PR #6428)", () => {
 
 			// Verify that the snapshot carries explicit identity
 			// (it should be stored as a non-enumerable property for cross-manager adoption)
-			const explicitIdentity = (snapshotA as any).explicitPersistIdentity;
+			const explicitIdentity = snapshotA.explicitPersistIdentity;
+			if (!explicitIdentity) throw new Error("Expected explicit persist identity");
 			expect(explicitIdentity).toBeTruthy();
 			expect(explicitIdentity.sessionId).toBe(snapshotA.sessionId);
 
@@ -102,7 +104,8 @@ describe("lifecycle contracts regression (PR #6428)", () => {
 			const copiedSnapshot = { ...snapshotA };
 
 			// Verify the explicit identity IS present in the copy (now enumerable)
-			const copiedIdentity = (copiedSnapshot as any).explicitPersistIdentity;
+			const copiedIdentity = copiedSnapshot.explicitPersistIdentity;
+			if (!copiedIdentity) throw new Error("Expected explicit persist identity in copied snapshot");
 			expect(copiedIdentity).toBeTruthy();
 			expect(copiedIdentity.sessionId).toBe(snapshotA.sessionId);
 
@@ -152,7 +155,8 @@ describe("lifecycle contracts regression (PR #6428)", () => {
 			const copiedSnapshot = { ...snapshotA };
 
 			// Verify the explicit identity IS preserved in the copy (enumerable property)
-			const copiedIdentity = (copiedSnapshot as any).explicitPersistIdentity;
+			const copiedIdentity = copiedSnapshot.explicitPersistIdentity;
+			if (!copiedIdentity) throw new Error("Expected explicit persist identity in adopted copied snapshot");
 			expect(copiedIdentity).toBeTruthy();
 			expect(copiedIdentity.sessionId).toBe(snapshotA.sessionId);
 
@@ -251,7 +255,8 @@ describe("lifecycle contracts regression (PR #6428)", () => {
 					if (!sessionFileA) throw new Error(`${testCase.name}: Expected explicit session file`);
 
 					// Verify explicit identity is present and is JSON-safe
-					const explicitIdentity = (snapshotA as any).explicitPersistIdentity;
+					const explicitIdentity = snapshotA.explicitPersistIdentity;
+					if (!explicitIdentity) throw new Error(`${testCase.name}: Expected explicit persist identity`);
 					expect(explicitIdentity).toBeTruthy();
 					expect(explicitIdentity.sessionId).toBe(snapshotA.sessionId);
 
@@ -266,7 +271,9 @@ describe("lifecycle contracts regression (PR #6428)", () => {
 					const transformedSnapshot = testCase.transform(snapshotA);
 
 					// Verify the identity survived the transformation
-					const transformedIdentity = (transformedSnapshot as any).explicitPersistIdentity;
+					const transformedIdentity = transformedSnapshot.explicitPersistIdentity;
+					if (!transformedIdentity)
+						throw new Error(`${testCase.name}: Expected identity to survive transformation`);
 					expect(transformedIdentity).toBeTruthy();
 					expect(transformedIdentity.sessionId).toBe(snapshotA.sessionId);
 
@@ -289,7 +296,6 @@ describe("lifecycle contracts regression (PR #6428)", () => {
 					// Scenario 2: identity changed after capture is detected
 					// Capture a snapshot first, then modify the file externally,
 					// then try to restore the stale snapshot
-					const fs = await import("fs/promises");
 					const sessionFile = managerA.getSessionFile();
 					if (!sessionFile) throw new Error("Expected session file");
 
@@ -336,6 +342,50 @@ describe("lifecycle contracts regression (PR #6428)", () => {
 			} finally {
 				root.removeSync();
 			}
+		}
+	});
+
+	// Test for handling adoptedArtifactManager in snapshot serialization
+	it("rejects restoring snapshot with serialized adoptedArtifactManager", async () => {
+		using root = TempDir.createSync("@pi-adopted-artifact-manager-serialization-");
+		const storage = new FileSessionStorage();
+
+		// Create a parent manager with an ArtifactManager
+		const parentManager = SessionManager.create(root.path(), root.path(), storage);
+		const parentArtifactManager = parentManager.getArtifactManager();
+		if (!parentArtifactManager) throw new Error("Expected artifact manager from parent");
+
+		// Create a child manager that adopts the parent's artifact manager
+		const childManager = SessionManager.create(root.path(), root.path(), storage);
+		childManager.adoptArtifactManager(parentArtifactManager);
+		await childManager.ensureOnDisk();
+
+		try {
+			// Capture a snapshot that includes the adopted artifact manager
+			const snapshot = childManager.captureState();
+			if (!snapshot.adoptedArtifactManager) throw new Error("Expected adopted artifact manager in snapshot");
+
+			// Serialize the snapshot using JSON (which will lose the adoptedArtifactManager)
+			const serialized = JSON.stringify(snapshot);
+			const deserialized = JSON.parse(serialized);
+
+			// The deserialized snapshot no longer has the adoptedArtifactManager
+			// since ArtifactManager is a live object that cannot be serialized.
+			// JSON.stringify loses the manager reference; it becomes an empty object or null.
+			expect(deserialized.adoptedArtifactManager).not.toBe(snapshot.adoptedArtifactManager);
+
+			// Create a new manager and restore the deserialized snapshot
+			const restoringManager = SessionManager.create(root.path(), root.path(), storage);
+			try {
+				restoringManager.restoreState(deserialized);
+				// The restored manager no longer has the adopted artifact manager
+				expect(restoringManager.getArtifactManager()?.dir).not.toBe(parentArtifactManager.dir);
+			} finally {
+				await restoringManager.close();
+			}
+		} finally {
+			await childManager.close();
+			await parentManager.close();
 		}
 	});
 });
