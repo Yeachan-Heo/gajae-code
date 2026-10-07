@@ -395,7 +395,7 @@ export async function listNativeSkillsForManagement(options: {
 				records.push({
 					name: skill.name,
 					description: typeof skill.frontmatter?.description === "string" ? skill.frontmatter.description : "",
-					path: skill.path,
+					path: skill.discoveryPath ?? skill.path,
 					scope,
 					source,
 					hidden: skill.frontmatter?.hide === true,

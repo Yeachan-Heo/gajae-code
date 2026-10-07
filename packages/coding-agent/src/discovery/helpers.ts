@@ -952,6 +952,7 @@ export async function scanSkillsFromDir(
 			items.push({
 				name,
 				path: skillPath,
+				discoveryPath: candidatePath,
 				loadContent: async () => {
 					const content = await readSkillContentSafely(skillPath, fileIdentity, pinnedLinkIdentities);
 					return parseFrontmatter(content, { source: skillPath }).body;
