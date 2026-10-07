@@ -71,6 +71,18 @@ async function chunks(response: Response): Promise<Array<Record<string, unknown>
 		.map(line => JSON.parse(line.slice(6)));
 }
 
+function withPortBase(value: string | undefined, assertion: () => void): void {
+	const previous = process.env.PORT_BASE;
+	if (value === undefined) delete process.env.PORT_BASE;
+	else process.env.PORT_BASE = value;
+	try {
+		assertion();
+	} finally {
+		if (previous === undefined) delete process.env.PORT_BASE;
+		else process.env.PORT_BASE = previous;
+	}
+}
+
 describe("managed empty-stop harness local contracts (no connected scenarios)", () => {
 	test("rejects missing accepted messages and leaked provisional attempts on disk", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-empty-stop-transcript-"));
@@ -129,11 +141,44 @@ describe("managed empty-stop harness local contracts (no connected scenarios)", 
 	test.each(["", " ", "30199", "30220", "8000", "30200.5", "invalid"])("rejects port %s", value => {
 		expect(() => parseHarnessPort(value)).toThrow("PORT_BASE");
 	});
-	test.each(["52440", "52459"])("accepts r3 isolated port %s", value => {
-		expect(parseHarnessPort(value)).toBe(Number(value));
+	test.each(["52440", "52459"])("accepts assigned isolated port %s", value => {
+		withPortBase("52440", () => {
+			expect(parseHarnessPort(value)).toBe(Number(value));
+		});
 	});
-	test.each(["52439", "52460", "52440.5"])("rejects port outside the r3 isolation range %s", value => {
-		expect(() => parseHarnessPort(value)).toThrow("PORT_BASE");
+	test.each(["52439", "52460", "52440.5"])("rejects port outside the assigned isolation range %s", value => {
+		withPortBase("52440", () => {
+			expect(() => parseHarnessPort(value)).toThrow("PORT_BASE");
+		});
+	});
+
+	test("uses the assigned range without whitelisting a previous dispatch", () => {
+		withPortBase("55440", () => {
+			expect(parseHarnessPort()).toBe(55440);
+			expect(parseHarnessPort("55459")).toBe(55459);
+			for (const value of ["55439", "55460", "55440.5", "52440", "52459"]) {
+				expect(() => parseHarnessPort(value)).toThrow("PORT_BASE");
+			}
+		});
+	});
+
+	test("does not retain dispatch ports when no range is assigned", () => {
+		withPortBase(undefined, () => {
+			expect(parseHarnessPort()).toBe(30200);
+			for (const value of ["52440", "52459", "55440"]) {
+				expect(() => parseHarnessPort(value)).toThrow("PORT_BASE");
+			}
+		});
+	});
+
+	test("bounds the assigned range by the TCP port limit", () => {
+		withPortBase("65520", () => {
+			expect(parseHarnessPort()).toBe(65520);
+			expect(parseHarnessPort("65535")).toBe(65535);
+			for (const value of ["65519", "65536", "65539"]) {
+				expect(() => parseHarnessPort(value)).toThrow("PORT_BASE");
+			}
+		});
 	});
 
 	test("emits explicit zero-usage stop and a real SSE terminator", async () => {
