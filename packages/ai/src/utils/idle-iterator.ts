@@ -72,6 +72,17 @@ export function getStreamIdleTimeoutMs(fallbackMs: number = DEFAULT_STREAM_IDLE_
 }
 
 /**
+ * Returns the `PI_STREAM_IDLE_TIMEOUT_MS` value to suggest after a stream idle
+ * watchdog fired. The suggestion must exceed the window that just elapsed, so it
+ * doubles the larger of the configured override and the longest built-in
+ * provider fallback; suggesting a provider's own default changes nothing.
+ */
+export function getStreamIdleTimeoutRemediationMs(): number {
+	const configuredMs = getStreamIdleTimeoutMs(ANTHROPIC_STREAM_IDLE_TIMEOUT_MS) ?? 0;
+	return 2 * Math.max(configuredMs, ANTHROPIC_STREAM_IDLE_TIMEOUT_MS);
+}
+
+/**
  * Returns the idle timeout used for OpenAI-family streaming transports.
  *
  * Honors `GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS` first (`PI_OPENAI_STREAM_IDLE_TIMEOUT_MS` is the legacy alias). Set `=0` to disable.
