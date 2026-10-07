@@ -84,6 +84,7 @@ Renderer behavior in `packages/coding-agent/src/tools/eval.ts`:
 Side-channel artifacts:
 
 - `session.allocateOutputArtifact?.("eval")` may allocate an `artifact://...` backing store for spilled output.
+- SDK tool contexts propagate allocation refusal before backend execution; they do not convert it into an empty successful allocation. Disposal during allocation remains subject to the existing execution-continuation check.
 - Truncated output metadata points at that artifact when available.
 
 ## Flow

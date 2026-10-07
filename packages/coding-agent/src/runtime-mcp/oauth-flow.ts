@@ -265,6 +265,7 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 		await assertPublicOAuthUrl(this.config.tokenUrl);
 		const response = await fetch(this.config.tokenUrl, {
 			method: "POST",
+			redirect: "error",
 			headers: {
 				"Content-Type": "application/x-www-form-urlencoded",
 			},
@@ -345,6 +346,7 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 			await assertPublicOAuthUrl(registrationEndpoint);
 			const response = await fetch(registrationEndpoint, {
 				method: "POST",
+				redirect: "error",
 				headers: {
 					"Content-Type": "application/json",
 					Accept: "application/json",

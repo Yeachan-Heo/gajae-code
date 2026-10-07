@@ -2974,6 +2974,75 @@ export class ManagedSessionDescendantStore {
 		};
 	}
 
+	/** Read one complete managed file through retained authority after descriptor-size admission. */
+	readExpectedBounded(
+		relativePath: string,
+		maxBytes: number,
+		admitSize?: (size: number) => void,
+	): ManagedFileSnapshot | null {
+		if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new Error("invalid_capture_limit");
+		this.#assertBound();
+		const resolved = this.#resolve(relativePath);
+		if (!this.#authority) {
+			try {
+				this.#assertPathBackedDirectoryChain(resolved);
+				const captured = captureManagedFileNoFollowBounded(resolved, maxBytes, admitSize);
+				this.#assertBound();
+				return captured;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+				throw error;
+			}
+		}
+		let descriptor: SessionStorageRangeSnapshot;
+		try {
+			descriptor = this.readRangeExpectedSync(this.#relative(resolved), 0, 0);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+			throw error;
+		}
+		const { stat } = descriptor;
+		if (stat.nlink !== 1n) throw new Error("source_changed");
+		if (!Number.isSafeInteger(stat.size) || stat.size < 0) throw new Error("source_changed");
+		if (stat.size > maxBytes) throw new Error("artifact_capacity_exceeded");
+		admitSize?.(stat.size);
+		const bytes = Buffer.alloc(stat.size);
+		const lease = this.openReadLease(this.#relative(resolved), stat);
+		let failed = false;
+		let failure: unknown;
+		try {
+			for (let offset = 0; offset < bytes.byteLength; ) {
+				const length = Math.min(1024 * 1024, bytes.byteLength - offset);
+				bytes.set(lease.readRange(offset, length), offset);
+				offset += length;
+			}
+		} catch (error) {
+			failed = true;
+			failure = error;
+		}
+		try {
+			lease.close();
+		} catch (error) {
+			if (!failed) {
+				failed = true;
+				failure = error;
+			}
+		}
+		if (failed) throw failure;
+		return {
+			bytes,
+			identity: {
+				dev: stat.dev,
+				ino: stat.ino,
+				nlink: stat.nlink,
+				size: stat.size,
+				mtimeNs: stat.mtimeNs,
+				ctimeNs: stat.ctimeNs,
+				sha256: createHash("sha256").update(bytes).digest("hex"),
+			},
+		};
+	}
+
 	/** Remove an exact captured file without reopening its pathname as authority. */
 	removeExpected(relativePath: string, expected: ManagedFileSnapshot): void {
 		this.#beforeMutation();
@@ -3619,17 +3688,38 @@ export function captureManagedFilePrefixNoFollow(pathname: string, maxBytes: num
 	return captureManagedFileNoFollowLimit(pathname, maxBytes);
 }
 
+/** Captures a complete no-follow file only after descriptor-size admission and before allocating its bytes. */
+export function captureManagedFileNoFollowBounded(
+	pathname: string,
+	maxBytes: number,
+	admitSize?: (size: number) => void,
+): ManagedFileSnapshot {
+	if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new Error("invalid_capture_limit");
+	return captureManagedFileNoFollowLimit(pathname, maxBytes, true, admitSize);
+}
+
 /** Captures header/hash/copy input from one no-follow descriptor and rechecks the pathname before use. */
 export function captureManagedFileNoFollow(pathname: string): ManagedFileSnapshot {
 	return captureManagedFileNoFollowLimit(pathname);
 }
 
-function captureManagedFileNoFollowLimit(pathname: string, maxBytes?: number): ManagedFileSnapshot {
+function captureManagedFileNoFollowLimit(
+	pathname: string,
+	maxBytes?: number,
+	rejectOversized = false,
+	admitSize?: (size: number) => void,
+): ManagedFileSnapshot {
 	const fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0));
 	try {
 		const before = fs.fstatSync(fd, { bigint: true });
-		if (!before.isFile() || before.nlink > 1) throw new Error("source_changed");
-		const captureSize = maxBytes === undefined ? Number(before.size) : Math.min(Number(before.size), maxBytes);
+		if (!before.isFile() || (rejectOversized ? before.nlink !== 1n : before.nlink > 1n))
+			throw new Error("source_changed");
+		const fileSize = Number(before.size);
+		if (!Number.isSafeInteger(fileSize) || fileSize < 0) throw new Error("source_changed");
+		if (rejectOversized && maxBytes !== undefined && fileSize > maxBytes)
+			throw new Error("artifact_capacity_exceeded");
+		admitSize?.(fileSize);
+		const captureSize = maxBytes === undefined ? fileSize : Math.min(fileSize, maxBytes);
 		const bytes = Buffer.alloc(captureSize);
 		let offset = 0;
 		while (offset < bytes.byteLength) {
