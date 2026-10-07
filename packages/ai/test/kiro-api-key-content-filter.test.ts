@@ -783,7 +783,8 @@ describe("reasoning-before-answer contentIndex invariant #6151", () => {
 			const responseBody =
 				JSON.stringify({
 					content: "<thinking>I need to read a file</thinking>Let me read that file for you.",
-				}) + JSON.stringify({ toolUseId: "tool-123", name: "read_file", input: '{"path":"/tmp/test.txt"}', stop: true });
+				}) +
+				JSON.stringify({ toolUseId: "tool-123", name: "read_file", input: '{"path":"/tmp/test.txt"}', stop: true });
 			return new Response(responseBody, { status: 200 });
 		}) as unknown as typeof fetch;
 
