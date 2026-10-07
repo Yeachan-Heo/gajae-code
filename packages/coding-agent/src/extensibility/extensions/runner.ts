@@ -51,6 +51,7 @@ import {
 import {
 	getExtensionHandlerRegistrationOrder,
 	getFunctionHookRegistration,
+	isSdkLifecycleObserver,
 	readConstrainedFunctionHookFile,
 } from "./function-hooks-internal";
 import type {
@@ -1076,7 +1077,8 @@ export class ExtensionRunner {
 		if (handlers.length === 0) return { action: "continue", event };
 		const includesLegacy = handlers.some(indexed => getFunctionHookRegistration(indexed.handler) === undefined);
 		if (includesLegacy) this.#requireScopeOrFailClosed(options.scope, event.type);
-		this.#markAttemptExecuted(options.scope);
+		if (handlers.some(indexed => event.type !== "agent_start" || !isSdkLifecycleObserver(indexed.handler)))
+			this.#markAttemptExecuted(options.scope);
 		const functionHookDepth = this.#functionHookDepth.getStore() ?? 0;
 		if (functionHookDepth >= 16) {
 			const reason = "Function hook re-entry depth exceeded";
