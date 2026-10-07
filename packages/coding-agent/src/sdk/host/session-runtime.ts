@@ -6084,7 +6084,6 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			});
 		}),
 	);
-
 	api.on("agent_end", (event, ctx) => {
 		const tokenBinding =
 			typeof event.sdkRunToken === "string" ? lifecycleRunOwners.get(event.sdkRunToken) : undefined;
