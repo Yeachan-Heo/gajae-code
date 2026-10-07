@@ -47,20 +47,20 @@ describe("Kiro TOCTOU protection with Proxy models #6151", () => {
 		let getterCallCount = 0;
 
 		// Create a Proxy model where baseUrl returns different values on successive reads
-		const model: Model<"kiro-codewhisperer-stream"> = new Proxy(
+		const model = new Proxy<Model<"kiro-codewhisperer-stream">>(
 			{ ...baseModel, baseUrl: trustedUrl },
 			{
-				get(target, prop) {
+				get(target, prop): unknown {
 					if (prop === "baseUrl") {
 						getterCallCount++;
 						// First read (snapshot): return trusted URL
 						// Subsequent reads (request construction): would return attacker URL
 						return getterCallCount === 1 ? trustedUrl : attackerUrl;
 					}
-					return (target as any)[prop];
+					return Reflect.get(target, prop);
 				},
 			},
-		) as any;
+		);
 
 		globalThis.fetch = (async (url: string | URL | Request) => {
 			requestUrl = String(url);
@@ -90,15 +90,15 @@ describe("Kiro TOCTOU protection with Proxy models #6151", () => {
 		const trustedRegion = "us-east-1";
 
 		// Create a Proxy model where a custom property might change
-		const model: Model<"kiro-codewhisperer-stream"> = new Proxy(
+		const model = new Proxy<Model<"kiro-codewhisperer-stream">>(
 			{ ...baseModel, baseUrl: "" },
 			{
-				get(target, prop) {
+				get(target, prop): unknown {
 					// Just pass through - the important thing is that we snapshot the model
-					return (target as any)[prop];
+					return Reflect.get(target, prop);
 				},
 			},
-		) as any;
+		);
 
 		// Mock fetch to capture the URL (unused in this test)
 		globalThis.fetch = (async (_url: string | URL | Request, _init?: RequestInit) => {
@@ -130,20 +130,20 @@ describe("Kiro TOCTOU protection with Proxy models #6151", () => {
 		let actualUrl: string | undefined;
 
 		// Create a Proxy model where baseUrl changes after first read
-		const model: Model<"kiro-codewhisperer-stream"> = new Proxy(
+		const model = new Proxy<Model<"kiro-codewhisperer-stream">>(
 			{ ...baseModel, baseUrl: trustedUrl },
 			{
-				get(target, prop) {
+				get(target, prop): unknown {
 					if (prop === "baseUrl") {
 						fetchCount++;
 						// First read (snapshot): return trusted URL
 						// Later reads: would return attacker URL
 						return fetchCount === 1 ? trustedUrl : attackerUrl;
 					}
-					return (target as any)[prop];
+					return Reflect.get(target, prop);
 				},
 			},
-		) as any;
+		);
 
 		globalThis.fetch = (async (url: string | URL | Request) => {
 			actualUrl = String(url);
@@ -179,17 +179,17 @@ describe("Kiro TOCTOU protection with Proxy models #6151", () => {
 
 	test("model baseUrl getter that throws is caught and yields error result", async () => {
 		// Create a Proxy model where baseUrl getter throws
-		const model: Model<"kiro-codewhisperer-stream"> = new Proxy(
+		const model = new Proxy<Model<"kiro-codewhisperer-stream">>(
 			{ ...baseModel, baseUrl: "https://trusted.example.com/" },
 			{
-				get(target, prop) {
+				get(target, prop): unknown {
 					if (prop === "baseUrl") {
 						throw new Error("Synthetic error from throwing baseUrl getter");
 					}
-					return (target as any)[prop];
+					return Reflect.get(target, prop);
 				},
 			},
-		) as any;
+		);
 
 		process.env.KIRO_API_KEY = "";
 
@@ -206,17 +206,17 @@ describe("Kiro TOCTOU protection with Proxy models #6151", () => {
 
 	test("model provider/id getter that throws is caught and yields error result", async () => {
 		// Create a Proxy model where provider getter throws
-		const model: Model<"kiro-codewhisperer-stream"> = new Proxy(
+		const model = new Proxy<Model<"kiro-codewhisperer-stream">>(
 			{ ...baseModel, baseUrl: "https://example.com/" },
 			{
-				get(target, prop) {
+				get(target, prop): unknown {
 					if (prop === "provider") {
 						throw new Error("Synthetic error from throwing provider getter");
 					}
-					return (target as any)[prop];
+					return Reflect.get(target, prop);
 				},
 			},
-		) as any;
+		);
 
 		process.env.KIRO_API_KEY = "";
 

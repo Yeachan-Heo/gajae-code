@@ -681,6 +681,10 @@ describe("Kiro API-key content filter #6150", () => {
 });
 
 describe("reasoning-before-answer contentIndex invariant #6151", () => {
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+
 	test("thinking then text — every contentIndex matches block final position", async () => {
 		const emittedEvents: Array<{
 			type: string;
@@ -916,7 +920,7 @@ describe("reasoning-before-answer contentIndex invariant #6151", () => {
 			for await (const event of stream) {
 				emittedEvents.push({
 					type: event.type,
-					error: event.type === "error" && "error" in event ? (event.error as any).errorMessage : undefined,
+					error: event.type === "error" ? event.error.errorMessage : undefined,
 				});
 			}
 		} catch {
@@ -977,6 +981,10 @@ describe("reasoning-before-answer contentIndex invariant #6151", () => {
 });
 
 describe("reader.read() error handling with pending tools #6151", () => {
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+
 	test("emits completed tool events before error when reader.read() throws", async () => {
 		const emittedEventTypes: string[] = [];
 
@@ -1083,6 +1091,10 @@ describe("reader.read() error handling with pending tools #6151", () => {
 });
 
 describe("Regression tests for #6151 issues", () => {
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+
 	test("#4199034431: incomplete JSON frame without valid nested objects preserves data for next call", async () => {
 		const { parseKiroApiEvents } = await import("../src/providers/kiro-api-key");
 
