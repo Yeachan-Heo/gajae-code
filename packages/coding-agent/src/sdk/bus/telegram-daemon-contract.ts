@@ -302,7 +302,7 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * abort acknowledgement, replacing owners that still acknowledge cancellation
  * before its terminal record is durable.
  */
-export const DAEMON_GENERATION = 202;
+export const DAEMON_GENERATION = 203;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
