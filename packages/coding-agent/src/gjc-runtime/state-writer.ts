@@ -1370,9 +1370,16 @@ export async function removeActiveEntry(
 	);
 }
 
-export async function readActiveEntries(
+/**
+ * Read every per-skill active entry. Unreadable JSON propagates; a parsed record
+ * that is not a skill entry (not an object, or without a `skill`) is skipped, or
+ * rejected when `strict` is set so status-bearing readers can tell an existing
+ * but unusable authoritative entry apart from a deleted one.
+ */
+async function readActiveEntriesFromDir(
 	cwd: string,
-	sessionScope?: string | ActiveSessionScope,
+	sessionScope: string | ActiveSessionScope | undefined,
+	strict: boolean,
 ): Promise<SkillActiveEntry[]> {
 	const dir = activeStateDir(path.resolve(cwd), sessionScope);
 	let names: string[];
@@ -1385,13 +1392,36 @@ export async function readActiveEntries(
 	const entries: SkillActiveEntry[] = [];
 	for (const name of names.sort()) {
 		if (!name.endsWith(".json")) continue;
-		const raw = await readJsonIfPresent(path.join(dir, name));
-		if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
-		const skill = safeString((raw as SkillActiveEntry).skill).trim();
-		if (!skill) continue;
+		const filePath = path.join(dir, name);
+		const raw = await readJsonIfPresent(filePath);
+		if (raw === undefined) continue;
+		const skill = isPlainObject(raw) ? safeString(raw.skill).trim() : "";
+		if (!skill) {
+			if (strict) throw new Error(`active entry at ${filePath} is not a skill entry record`);
+			continue;
+		}
 		entries.push(raw as SkillActiveEntry);
 	}
 	return entries;
+}
+
+export async function readActiveEntries(
+	cwd: string,
+	sessionScope?: string | ActiveSessionScope,
+): Promise<SkillActiveEntry[]> {
+	return readActiveEntriesFromDir(cwd, sessionScope, false);
+}
+
+/**
+ * Failure-observable counterpart of `readActiveEntries`: an entry file that exists
+ * but holds no usable skill entry throws instead of being skipped, so its absence
+ * from the result always means the entry does not exist.
+ */
+export async function readActiveEntriesStrict(
+	cwd: string,
+	sessionScope?: string | ActiveSessionScope,
+): Promise<SkillActiveEntry[]> {
+	return readActiveEntriesFromDir(cwd, sessionScope, true);
 }
 
 export async function rebuildActiveSnapshot(

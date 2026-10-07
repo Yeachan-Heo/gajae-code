@@ -66,6 +66,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"local transcript-discovery metadata command; no SDK operation counterpart or runtime/retention authority",
 	"slash_command:unstar":
 		"local transcript-discovery metadata command; no SDK operation counterpart or runtime/retention authority",
+	"agent_session:getSubagentLifecycleStatuses":
+		"internal read-only subagent status projection consumed through session.progress (Q32), not a separate SDK seam",
 	"agent_session:constructor": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getSessionAgentDir":
 		"internal session-scoped agent-directory accessor, not a user-facing SDK control seam",
@@ -389,6 +391,7 @@ const SEAM_TO_SDK: Readonly<Record<string, string>> = {
 	"slash_command:session": "session.list",
 	"slash_command:jobs": "runtime.jobs.list",
 	"slash_command:context": "context.get",
+	"slash_command:progress": "session.progress",
 	"slash_command:usage": "usage.get",
 	"slash_command:tools": "tools.list",
 	"slash_command:login": "auth.login",

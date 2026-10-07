@@ -49,6 +49,7 @@ import type { ExecOptions, ExecResult } from "../../exec/exec";
 import type { CustomEditor } from "../../modes/components/custom-editor";
 import type { WorkflowGateEmitter } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import type { Theme } from "../../modes/theme/theme";
+import type { ProjectProgressSnapshot } from "../../progress/progress-contract";
 import type { AgentSessionEventListener } from "../../session/agent-session";
 import type {
 	ClientBridge,
@@ -538,6 +539,8 @@ export interface ExtensionContext {
 		| Promise<{ bytes: Uint8Array; totalBytes: number } | undefined>;
 
 	getJobs(): unknown;
+	/** Read-only project progress snapshot (`session.progress`), derived from durable session state. */
+	getProjectProgress?(): Promise<ProjectProgressSnapshot>;
 	/** Subscribe to foreground-wait folds (`bash_folded`). Returns an unsubscribe function. */
 	onJobFold?(listener: (event: JobFoldEvent) => void): () => void;
 	/** Observe session events synchronously in producer order. Returns an unsubscribe function. */
@@ -1725,6 +1728,8 @@ export interface ExtensionContextActions {
 		| undefined
 		| Promise<{ bytes: Uint8Array; totalBytes: number } | undefined>;
 	getJobs?: () => unknown;
+	/** Read-only project progress snapshot backing the `session.progress` SDK query. */
+	getProjectProgress?: () => Promise<ProjectProgressSnapshot>;
 	/** Subscribe to foreground-wait folds so the SDK host can publish `bash_folded`. Returns an unsubscribe. */
 	onJobFold?: (listener: (event: JobFoldEvent) => void) => () => void;
 	/** Ordered, synchronous AgentSession subscription, independent of async extension hooks. */

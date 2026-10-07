@@ -219,6 +219,7 @@ import {
 	type FoldReason,
 	type JobFoldEvent,
 	type OwnerSubagentShutdownLease,
+	type SubagentLifecycle,
 } from "../async";
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
@@ -6732,6 +6733,17 @@ export class AgentSession {
 		}));
 		const delivery = manager.getDeliveryState(ownerFilter);
 		return { running, recent, delivery };
+	}
+
+	/**
+	 * Lifecycle status of every subagent owned by this session, read from the
+	 * manager's stable control-plane records (they outlive AsyncJob eviction).
+	 */
+	getSubagentLifecycleStatuses(): SubagentLifecycle[] {
+		const manager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
+		if (!manager) return [];
+		const ownerFilter = this.#agentId ? { ownerId: this.#agentId } : undefined;
+		return manager.getSubagentRecords(ownerFilter).map(record => record.status);
 	}
 
 	/**

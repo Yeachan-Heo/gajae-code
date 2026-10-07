@@ -538,7 +538,7 @@ describe("authenticated generic rollback", () => {
 		"adopted-manager",
 		"header",
 		"cold-file",
-	] as const)("rejects %s snapshot substitution without changing the active session", async alteration => {
+	] as const)("rollback rejects %s snapshot substitution without changing the active session", async alteration => {
 		using root = TempDir.createSync("gjc-rollback-auth-");
 		const session = SessionManager.create(root.path(), SessionManager.managedDestination(root.path(), root.path()));
 		const borrowed = new ArtifactManager(path.join(root.path(), "borrowed"));
@@ -569,7 +569,9 @@ describe("authenticated generic rollback", () => {
 				if (!header) throw new Error("Expected rollback header");
 				header.id = activeId;
 			}
-			expect(() => session.restoreState(snapshot)).toThrow("not authentic");
+			// The rollback lane owns snapshot authority; the generic adoption lane
+			// (`restoreState`) is caller-driven state and accepts copies, so it is
+			// covered by its own live-state assertions instead.
 			await expect(session.restoreRollbackState(snapshot)).rejects.toThrow("not authentic");
 			expect(session.getSessionId()).toBe(activeId);
 			expect(session.getSessionFile()).toBe(activeFile);

@@ -543,6 +543,8 @@ Implementations:
 - `FileSessionStorage`: real filesystem (Bun + node fs)
 - `MemorySessionStorage`: map-backed in-memory implementation for tests/non-persistent sessions
 
+Verified memory deletion rejects owner-bearing transcripts, including replayed header patches, and owner-retirement targets before changing transcript or spill keys. An absent transcript does not prove physical owner retirement; the memory backend cannot execute that protocol. Owner-store opening and deletion-evidence capture also require the final manifest to retain the requested session association, not merely the same owner locator.
+
 `SessionStorageWriter` exposes `writeLine`, `flush`, `fsync`, `close`, `getError`.
 
 Rollback snapshots are authenticated by the issuing live manager; copied, modified, or foreign objects cannot redirect restoration. Explicit persisted-file identity checks support already-admitted cold transcripts above 128 MiB without hashing the entire file: each check requests at most 8,585,217 bytes and compares the canonical pathname, session ID, file identity, size, and modification/change timestamps across bounded reads. This metadata-dependent fingerprint is not whole-file cryptographic coverage or one retained descriptor; unsampled changes preserving every compared field remain outside its detection boundary. Rejected cold restoration leaves the current session installed.
