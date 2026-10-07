@@ -590,6 +590,26 @@ async function applyStartupModelProfilesWithPolicy(
 		}
 		return applied;
 	};
+	const profilesFromFirstFailure = (failedProfiles: ReadonlySet<string>): ReadonlySet<string> => {
+		const orderedProfiles = [defaultProfile, args.parsedArgs.mpreset].filter(
+			(name): name is string => name !== undefined,
+		);
+		const firstFailureIndex = orderedProfiles.findIndex(name => failedProfiles.has(name));
+		return firstFailureIndex === -1 ? failedProfiles : new Set(orderedProfiles.slice(firstFailureIndex));
+	};
+	const applyFailedProfiles = async (failedProfiles: ReadonlySet<string>): Promise<boolean> => {
+		const applied = await applyConfiguredProfiles(true, failedProfiles);
+		if (
+			applied &&
+			defaultProfile !== undefined &&
+			failedProfiles.has(defaultProfile) &&
+			args.parsedArgs.mpreset !== undefined &&
+			!failedProfiles.has(args.parsedArgs.mpreset)
+		) {
+			return applyProfile(args.parsedArgs.mpreset, args.parsedArgs.default === true);
+		}
+		return applied;
+	};
 	const refreshAuthAndCatalog = async (continueOnRefreshError: boolean): Promise<void> => {
 		try {
 			await args.modelRegistry.authStorage?.reload();
@@ -654,7 +674,8 @@ async function applyStartupModelProfilesWithPolicy(
 			refreshedOnline = true;
 			const failedProfiles = new Set(profilePassFailures.map(failure => failure.profileName));
 			if (unhandledProfileName) failedProfiles.add(unhandledProfileName);
-			applied = await applyConfiguredProfiles(true, failedProfiles.size > 0 ? failedProfiles : undefined);
+			const profilesToRetry = profilesFromFirstFailure(failedProfiles);
+			applied = await applyConfiguredProfiles(true, profilesToRetry.size > 0 ? profilesToRetry : undefined);
 		}
 		if (
 			!applied &&
@@ -670,7 +691,7 @@ async function applyStartupModelProfilesWithPolicy(
 					modelSelectionChangedDuringRecovery = true;
 					applied = false;
 				} else {
-					applied = await applyConfiguredProfiles(true, failedProfiles);
+					applied = await applyFailedProfiles(failedProfiles);
 				}
 			}
 			if (applied) args.session.setUnavailableModelProfile(undefined);
