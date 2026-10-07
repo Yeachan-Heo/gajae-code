@@ -3628,6 +3628,7 @@ export class AgentSession {
 	#restoreManagedFallbackGetApiKey: (() => void) | undefined;
 	// Todo completion reminder state
 	#todoReminderCount = 0;
+	#todoReminderContinuationGeneration: number | undefined;
 	#deepInterviewUserIntentEpoch = 0;
 	#deepInterviewTurnOwnerEpoch = 0;
 	#deepInterviewGenuineUserMessageEpochs = new WeakMap<object, number>();
@@ -8320,7 +8321,9 @@ export class AgentSession {
 			}
 
 			// Check for retryable errors first (overloaded, rate limit, server errors)
-			if (this.#isRetryableError(msg)) {
+			// Skip retry for todo reminder continuations - they should fail silently without retrying
+			const isReminderContinuationError = this.#todoReminderContinuationGeneration === agentEndGeneration && agentEndGeneration !== undefined;
+			if (!isReminderContinuationError && this.#isRetryableError(msg)) {
 				const transportFailure = (msg as AssistantMessage & { transportFailure?: TransportFailureFacts })
 					.transportFailure;
 				const messageScope = this.#assistantAttemptScopes.get(msg);
@@ -8332,6 +8335,10 @@ export class AgentSession {
 					messageScope?.wasClean ?? false,
 				);
 				if (didRetry) return; // Retry was initiated, don't proceed to compaction
+			}
+			// Clear the reminder continuation flag after processing
+			if (isReminderContinuationError) {
+				this.#todoReminderContinuationGeneration = undefined;
 			}
 			if (this.#retryAttempt > 0) {
 				// A prior retry ended on a non-retryable (terminal) message: emit
@@ -8578,6 +8585,8 @@ export class AgentSession {
 		deferredPredecessorAgentEnd?: AgentSessionEvent;
 		/** Internal causal SDK owner captured when this continuation was scheduled. */
 		sdkOwnership?: SdkContinuationOwnership;
+		/** Disable managed fallback retries for this continuation (used for terminal server-initiated turns). */
+		disableManagedFallback?: boolean;
 	}): Promise<void> {
 		const continuationAdmission = this.#captureScheduledContinuationAdmission();
 		const scheduledSdkOwnership = options?.sdkOwnership;
@@ -8745,7 +8754,7 @@ export class AgentSession {
 										: this.agent.continue.bind(this.agent);
 									try {
 										await continueQueued({
-											...this.#managedFallbackPromptOptions(),
+											...(options?.disableManagedFallback ? { fallbackManaged: false } : this.#managedFallbackPromptOptions()),
 											maintenanceContinuation: options?.maintenanceContinuation,
 											// Reset only after continue() has claimed the queued turn. Skipped or stale
 											// continuations retain predecessor accounting, and resetAttemptBudget keeps
@@ -21762,7 +21771,9 @@ export class AgentSession {
 		// The reminder continues the current prompt, so the predecessor `agent_end`
 		// must stay held until the continuation turn produces the real terminal.
 		// Publishing it here would settle the caller's prompt mid-reminder.
-		this.#scheduleAgentContinue({ skipCompactionCheck: true, suppressPredecessorAgentEnd: true });
+		// Disable managed fallback to prevent indefinite retries for this server-initiated turn.
+		this.#todoReminderContinuationGeneration = this.#promptGeneration;
+		this.#scheduleAgentContinue({ skipCompactionCheck: true, suppressPredecessorAgentEnd: true, disableManagedFallback: true });
 	}
 
 	/**
