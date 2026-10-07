@@ -4,10 +4,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ImageContent } from "@gajae-code/ai/core";
 import { formatBytes, parseImageMetadata } from "@gajae-code/utils";
+import { MAX_IMAGE_INPUT_BYTES, MAX_PASTED_IMAGE_SOURCE_BYTES } from "./image-limits";
 import {
 	ImageInputTooLargeError,
 	type LoadedImageInput,
-	MAX_IMAGE_INPUT_BYTES,
 	materializeImageInput,
 	type TransformedImageInput,
 	transformImageInputBytes,
@@ -15,7 +15,6 @@ import {
 import { DEFAULT_IMAGE_RESIZE_MAX_BYTES } from "./image-resize";
 import { MAX_PASTED_IMAGE_COUNT } from "./pasted-image-path";
 
-export const MAX_PASTED_IMAGE_SOURCE_BYTES = 64 * 1024 * 1024;
 export const MAX_PASTED_IMAGE_OUTPUT_BYTES = 64 * 1024 * 1024;
 export const MAX_PASTED_IMAGE_DIMENSION = 20_000;
 export const MAX_PASTED_IMAGE_PIXELS = 40_000_000;

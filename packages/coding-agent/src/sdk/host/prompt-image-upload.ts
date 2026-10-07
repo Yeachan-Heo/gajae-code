@@ -1,12 +1,8 @@
 import * as crypto from "node:crypto";
 import type { ImageContent } from "@gajae-code/ai/core";
 import { parseImageMetadata } from "@gajae-code/utils";
-import { MAX_IMAGE_INPUT_BYTES } from "../../utils/image-loading";
-import {
-	MAX_PASTED_IMAGE_DIMENSION,
-	MAX_PASTED_IMAGE_PIXELS,
-	MAX_PASTED_IMAGE_SOURCE_BYTES,
-} from "../../utils/pasted-image-loading";
+import { MAX_IMAGE_INPUT_BYTES, MAX_PASTED_IMAGE_SOURCE_BYTES } from "../../utils/image-limits";
+import { MAX_PASTED_IMAGE_DIMENSION, MAX_PASTED_IMAGE_PIXELS } from "../../utils/pasted-image-loading";
 import { TypedControlError } from "./control/dispatch";
 
 const MAX_CHUNK_BYTES = 96 * 1024;

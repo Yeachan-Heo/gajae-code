@@ -76,8 +76,7 @@ import {
 import { validateRequiredPromptText } from "../../sdk/protocol/adapter-validation";
 import { type SessionAttachment, SessionRouter, type SessionRouterFrame } from "../../sdk/router";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../../sdk/session-list";
-import { MAX_IMAGE_INPUT_BYTES } from "../../utils/image-loading";
-import { MAX_PASTED_IMAGE_SOURCE_BYTES } from "../../utils/pasted-image-loading";
+import { MAX_IMAGE_INPUT_BYTES, MAX_PASTED_IMAGE_SOURCE_BYTES } from "../../utils/image-limits";
 import { resolveAcpAbortScope } from "./abort-scope";
 import {
 	type AgentSessionEvent,
