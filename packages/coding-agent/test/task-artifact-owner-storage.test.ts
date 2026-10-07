@@ -309,10 +309,7 @@ describe("verified storage consumes task artifact owners", () => {
 		const inspect = managedGcProtocolScopeInspectorForScope(fixture.scope);
 		const lock = await acquireManagedLock(
 			path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal", "locks"),
-			`gc-retirement-${crypto
-				.createHash("sha256")
-				.update("managed-gc-retirement-scope-lock-v1", "utf8")
-				.digest("hex")}`,
+			`gc-retirement-${crypto.createHash("sha256").update(path.resolve(fixture.transcriptPath)).digest("hex")}`,
 			fixture.context.rootAuthority,
 		);
 		try {
