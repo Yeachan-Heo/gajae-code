@@ -17061,7 +17061,6 @@ export class SessionManager {
 		}
 		let closeError: unknown;
 		let taskStarted = false;
-		const closeRetryOriginError = this.#closeRetryOriginError;
 		try {
 			await this.#queuePersistTask(
 				async () => {
@@ -17075,11 +17074,11 @@ export class SessionManager {
 				{ ignoreError: this.#closeRetryPending },
 			);
 			if (
-				closeRetryOriginError &&
+				this.#closeRetryOriginError &&
 				!this.#persistWriter &&
 				!this.#needsFullRewriteOnNextPersist &&
 				!this.#strictResumeMutationPending &&
-				this.#persistError === closeRetryOriginError
+				this.#persistError === this.#closeRetryOriginError
 			) {
 				// Only the original certified writer-close failure becomes obsolete
 				// after closure. Lifecycle/publication errors must remain observable.
