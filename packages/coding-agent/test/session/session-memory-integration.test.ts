@@ -3868,7 +3868,6 @@ describe("whole-session persistence freshness", () => {
 				if (this.#missingEmptyFiles.has(filePath) && !this.existsSync(filePath)) return Promise.resolve("");
 				return super.readText(filePath);
 			}
-
 			override openWriter(filePath: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter {
 				if (filePath.includes(".spill.")) return super.openWriter(filePath, options);
 				return super.openWriter(filePath, {
