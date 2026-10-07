@@ -161,10 +161,11 @@ test("the deadline timer cancels a contended acquisition before its holder relea
 	const lock = locks.withFileLock;
 	const schedule = globalThis.setTimeout;
 	let expire: (() => void) | undefined;
-	const timer = vi.spyOn(globalThis, "setTimeout").mockImplementation((callback, ms, ...args) => {
-		if (ms !== undefined && ms > 14_000 && ms <= 15_000) expire = () => callback(...args);
-		return schedule(callback, ms, ...args);
-	});
+	const captureTimeout: typeof setTimeout = Object.assign((...args: Parameters<typeof setTimeout>) => {
+		if (args[1] !== undefined && args[1] > 14_000 && args[1] <= 15_000) expire = () => args[0](...args.slice(2));
+		return schedule(...args);
+	}, schedule);
+	const timer = vi.spyOn(globalThis, "setTimeout").mockImplementation(captureTimeout);
 	let holder: Promise<void> | undefined;
 	const spy = vi.spyOn(locks, "withFileLock").mockImplementation(async (file, fn, options) => {
 		const acquired = Promise.withResolvers<void>();
