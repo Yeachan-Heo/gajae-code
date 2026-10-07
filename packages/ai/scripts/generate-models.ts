@@ -535,13 +535,23 @@ function applyGlobalModelsDevFallback(models: readonly Model[], modelsDevModels:
 		if (!reference) {
 			return model;
 		}
+		// For Codex models, inherit all metadata from models.dev to ensure consistency.
+		// For provider-specific models (kiro, junie, etc.), only inherit limits to preserve
+		// their own capability definitions and naming.
+		if (model.provider === "openai-codex") {
+			return {
+				...model,
+				name: reference.name,
+				reasoning: reference.reasoning,
+				input: reference.input,
+				// Fill unknown endpoint limits from same-id models.dev references.
+				contextWindow: inheritModelsDevLimit(model.contextWindow, reference.contextWindow, UNK_CONTEXT_WINDOW),
+				maxTokens: inheritModelsDevLimit(model.maxTokens, reference.maxTokens, UNK_MAX_TOKENS),
+			};
+		}
+		// For other providers, only fill unknown limits, preserving provider-specific metadata.
 		return {
 			...model,
-			name: reference.name,
-			reasoning: reference.reasoning,
-			input: reference.input,
-			// Fill unknown endpoint limits from same-id models.dev references, but keep
-			// provider-specific values when discovery returned them explicitly.
 			contextWindow: inheritModelsDevLimit(model.contextWindow, reference.contextWindow, UNK_CONTEXT_WINDOW),
 			maxTokens: inheritModelsDevLimit(model.maxTokens, reference.maxTokens, UNK_MAX_TOKENS),
 		};
@@ -790,7 +800,9 @@ async function generateModels() {
 	// credentials are unavailable, and ad-hoc model additions all persist
 	// through the existing models.json seed.
 	// Discovery-only providers (local inference servers) — never bundle static models.
+	// Skip Codex gpt-6 models: they will be re-injected with UNK limits to inherit from models.dev.
 	const discoveryOnlyProviders = new Set(["ollama", "sglang", "vllm"]);
+	const codexGpt6Ids = new Set(["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]);
 	const fetchedKeys = new Set(allModels.map(model => `${model.provider}/${model.id}`));
 
 	for (const models of Object.values(prevModelsJson as Record<string, Record<string, Model>>)) {
@@ -798,7 +810,8 @@ async function generateModels() {
 			if (
 				!fetchedKeys.has(`${model.provider}/${model.id}`) &&
 				!discoveryOnlyProviders.has(model.provider) &&
-				!isRetiredBundledModel(model)
+				!isRetiredBundledModel(model) &&
+				!(model.provider === "openai-codex" && codexGpt6Ids.has(model.id))
 			) {
 				allModels.push(model.provider === "openai" ? { ...model, baseUrl: "" } : model);
 			}
