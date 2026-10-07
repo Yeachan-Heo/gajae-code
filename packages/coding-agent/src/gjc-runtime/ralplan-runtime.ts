@@ -985,6 +985,10 @@ function ralplanStatePath(cwd: string, sessionId: string): string {
 	return modeStatePath(cwd, sessionId, "ralplan");
 }
 
+function ralplanRunWriteAdmissionLockPath(cwd: string, sessionId: string, runId: string): string {
+	return path.join(sessionPlansDir(cwd, sessionId), "ralplan", runId, ".write-admission");
+}
+
 async function readActiveRunId(cwd: string, sessionId: string): Promise<string | undefined> {
 	const statePath = ralplanStatePath(cwd, sessionId);
 	const existingRead = await readExistingStateForMutation(statePath);
@@ -1099,6 +1103,23 @@ async function persistActiveRunId(cwd: string, sessionId: string, runId: string,
 				);
 			}
 			let existing: Record<string, unknown> = existingRead.kind === "valid" ? existingRead.value : {};
+			if (existing.run_id !== runId && existing.active === true) {
+				throw new RalplanCommandError(
+					2,
+					`ralplan run ${runId} is no longer the active session owner; current run ${String(existing.run_id)} remains active. Resume or retire that run before writing.`,
+				);
+			}
+			if (
+				existing.run_id === runId &&
+				existing.active !== true &&
+				typeof existing.current_phase === "string" &&
+				getSkillManifest("ralplan").phaseLock.includes(existing.current_phase)
+			) {
+				throw new RalplanCommandError(
+					2,
+					`ralplan run ${runId} is terminal (${existing.current_phase}); start a fresh run instead of reopening its artifacts.`,
+				);
+			}
 
 			// A new run_id is a fresh run, not a stray write on the prior run: never inherit a
 			// previous run's terminal/locked phase (which would start the new run already
@@ -2562,6 +2583,7 @@ async function handleArtifactWrite(
 	cwd: string,
 	agentDir?: string,
 	finalPublicationLockHeld = false,
+	runAdmissionLockHeld = false,
 ): Promise<RalplanCommandResult> {
 	// #4693: explicit --worktree-root binds every persistence root to the selected
 	// canonical worktree; the invocation cwd survives only for --artifact input
@@ -2579,9 +2601,18 @@ async function handleArtifactWrite(
 			resolved.runId,
 			"final-publication",
 		);
-		return await withWorkflowStateLock(publicationLockPath, () => handleArtifactWrite(args, cwd, agentDir, true), {
-			cwd: persistCwd,
-		});
+		return await withWorkflowStateLock(
+			publicationLockPath,
+			() => handleArtifactWrite(args, cwd, agentDir, true, runAdmissionLockHeld),
+			{ cwd: persistCwd },
+		);
+	}
+	if (!runAdmissionLockHeld) {
+		return await withWorkflowStateLock(
+			ralplanRunWriteAdmissionLockPath(persistCwd, resolved.sessionId, resolved.runId),
+			() => handleArtifactWrite(args, cwd, agentDir, finalPublicationLockHeld, true),
+			{ cwd: persistCwd },
+		);
 	}
 	const persistedRoleState = parsePersistedRoleStateArgs(args, resolved.stage);
 	const laneVerdict = parseLaneVerdictArgs(args, resolved.stage, resolved.stageN);

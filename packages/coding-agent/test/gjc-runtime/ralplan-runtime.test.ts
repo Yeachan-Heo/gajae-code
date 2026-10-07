@@ -237,6 +237,9 @@ describe("native gjc ralplan runtime — consensus handoff", () => {
 		expect(freshState.last_review_verdict).toBeUndefined();
 		expect(freshState.auto_handoff).toBeUndefined();
 		expect(freshState.planning_stuck).toBeUndefined();
+		const staleWrite = await writeRalplanArtifact(root, runId, "revision", 2, "# stale prior run write");
+		expect(staleWrite.status).toBe(2);
+		expect(staleWrite.stderr).toContain("no longer the active session owner");
 
 		await fs.writeFile(
 			statePath,
@@ -1125,14 +1128,12 @@ describe("native gjc ralplan runtime — duplicate --write guard", () => {
 		expect(indexLines.length).toBe(2);
 	});
 
-	it("collapses concurrent identical writes to a single index.jsonl row (#660 TOCTOU)", async () => {
+	it("collapses concurrent identical writes to a single index.jsonl row (#660)", async () => {
 		const root = await tempDir();
 		const args = ["--write", "--stage", "planner", "--stage_n", "1", "--artifact", "# Plan", "--run-id", "race-run"];
 
-		// The command-level dedup (findExistingStageArtifact) and the ledger append
-		// are not under one lock, so racing identical writes can both observe an
-		// empty index and both append. The ledger writer serializes the append, so
-		// exactly one row survives regardless of the race.
+		// A per-run admission lock serializes the dedupe snapshot through publication;
+		// appendJsonlIdempotent remains the ledger's own idempotency boundary.
 		const results = await Promise.all(Array.from({ length: 6 }, () => runNativeRalplanCommand([...args], root)));
 		for (const result of results) {
 			expect(result.status).toBe(0);
@@ -1145,7 +1146,7 @@ describe("native gjc ralplan runtime — duplicate --write guard", () => {
 		expect(indexLines.length).toBe(1);
 		expect(JSON.parse(indexLines[0]).stage).toBe("planner");
 	});
-	it("uses one pre-persist ledger snapshot without claiming cross-process exclusivity", async () => {
+	it("uses one ledger snapshot inside the run admission critical section", async () => {
 		const root = await tempDir();
 		const runId = "sequential-snapshot";
 		const indexPath = path.join(ralplanRunDir(root, runId), "index.jsonl");
@@ -1159,14 +1160,37 @@ describe("native gjc ralplan runtime — duplicate --write guard", () => {
 		}) as typeof fs.lstat;
 		const readSpy = spyOn(fs, "lstat").mockImplementation(lstatImplementation);
 		try {
-			// One invocation only: the documented sequence is intentionally not a
-			// cross-process admission claim, lock, or CAS test.
+			// One invocation still uses a single immutable snapshot while its run lock is held.
 			const result = await writeRalplanArtifact(root, runId, "planner", 1, "# plan");
 			expect(result.status).toBe(0);
 		} finally {
 			readSpy.mockRestore();
 		}
 		expect(prePersistLedgerReads).toBe(1);
+	});
+
+	it("serializes distinct review-lane passes against the configured budget", async () => {
+		const root = await tempDir();
+		const runId = "concurrent-review-budget";
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { maxIterations: 5, maxReviewPassesPerLane: 1 } } }, null, 2),
+			"utf-8",
+		);
+		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# plan")).status).toBe(0);
+		const results = await Promise.all([
+			writeRalplanArtifact(root, runId, "architect", 2, "# architect pass 2"),
+			writeRalplanArtifact(root, runId, "architect", 3, "# architect pass 3"),
+		]);
+		expect(results.map(result => result.status).sort()).toEqual([0, 3]);
+		const indexText = await fs.readFile(path.join(ralplanRunDir(root, runId), "index.jsonl"), "utf-8");
+		const architectRows = indexText
+			.split(/\r?\n/)
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as { stage?: string })
+			.filter(row => row.stage === "architect");
+		 expect(architectRows).toHaveLength(1);
 	});
 	it("compacts oversized ralplan ledgers while retaining the current final receipt", async () => {
 		const root = await tempDir();
@@ -1842,16 +1866,18 @@ describe("native gjc ralplan runtime — post-clear re-activation (#644)", () =>
 
 		await fs.writeFile(statePath, JSON.stringify({ ...seeded, active: false, current_phase: "complete" }), "utf-8");
 
-		// A stray --write reusing the SAME (cleared) run_id must not silently re-arm a finished run.
+		// A stray --write reusing the SAME (cleared) terminal run must be rejected before artifact publication.
 		const result = await runNativeRalplanCommand(
 			["--write", "--stage", "planner", "--stage_n", "1", "--artifact", "# Plan", "--run-id", seededRunId],
 			root,
 		);
-		expect(result.status).toBe(0);
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("is terminal (complete)");
 
 		const after = await readState(root);
 		expect(after.active).toBe(false);
 		expect(after.current_phase).toBe("complete");
+		expect(existsSync(path.join(ralplanRunDir(root, seededRunId), "stage-01-planner.md"))).toBe(false);
 	});
 });
 describe("ralplan automatic handoff admission (#3398)", () => {
