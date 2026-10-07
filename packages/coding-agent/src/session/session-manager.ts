@@ -8879,6 +8879,7 @@ export class SessionManager {
 		if (state.adoptsLifecycleId) this.#lifecycleIdAdopted = true;
 		this.#persistChain = Promise.resolve();
 		this.#persistError = undefined;
+		this.#closeRetryOriginError = undefined;
 		this.#persistErrorReported = false;
 		this.#sessionId = state.sessionId;
 		this.#sessionName = state.header.title;
@@ -10287,6 +10288,7 @@ export class SessionManager {
 						installedSessionId = this.#sessionId;
 						installedSessionFile = this.#sessionFile;
 						this.#persistError = undefined;
+						this.#closeRetryOriginError = undefined;
 						this.#persistErrorReported = false;
 						if (!options?.deferEphemeralArtifactRetirement) this.#retireEphemeralArtifacts();
 						this.#pendingStrictAdoption = undefined;
@@ -10405,6 +10407,7 @@ export class SessionManager {
 				this.#artifactLifecycle = Symbol("session-artifact-adoption");
 				this.#commitResidentTextStoreTransition(prepared);
 				this.#persistError = undefined;
+				this.#closeRetryOriginError = undefined;
 				this.#persistErrorReported = false;
 				entries.length = 0;
 				if (!options?.deferEphemeralArtifactRetirement) this.#retireEphemeralArtifacts();
@@ -10927,6 +10930,7 @@ export class SessionManager {
 			this.#lifecycleIdAdopted = true;
 		this.#persistChain = Promise.resolve();
 		this.#persistError = undefined;
+		this.#closeRetryOriginError = undefined;
 		this.#persistErrorReported = false;
 		this.#sessionId = stage.sessionId;
 		this.#sessionName = stage.sessionName;
@@ -11152,6 +11156,7 @@ export class SessionManager {
 		await this.#closePersistWriter();
 		this.#persistChain = Promise.resolve();
 		this.#persistError = undefined;
+		this.#closeRetryOriginError = undefined;
 		this.#persistErrorReported = false;
 		let forkArtifactPublication: ForkArtifactPublication | undefined;
 		let forkTranscriptPublication: ForkTranscriptPublication | undefined;
@@ -12075,6 +12080,7 @@ export class SessionManager {
 			}
 			this.#persistChain = Promise.resolve();
 			this.#persistError = undefined;
+			this.#closeRetryOriginError = undefined;
 			this.#persistErrorReported = false;
 
 			const oldSessionFile = this.#sessionFile;
@@ -12386,6 +12392,7 @@ export class SessionManager {
 			await this.#closePersistWriter().catch(() => {});
 			this.#persistChain = Promise.resolve();
 			this.#persistError = undefined;
+			this.#closeRetryOriginError = undefined;
 			this.#persistErrorReported = false;
 			if (rollbackManagedMove) {
 				try {
@@ -17127,6 +17134,7 @@ export class SessionManager {
 			this.#strictResumeMutationPending = false;
 			this.#managedPersistExpectedIdentity = undefined;
 			this.#persistError = undefined;
+			this.#closeRetryOriginError = undefined;
 			this.#persistErrorReported = false;
 		}
 		let priorPersistError = this.#persistError;
