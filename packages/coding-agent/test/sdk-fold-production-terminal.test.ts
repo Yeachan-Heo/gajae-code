@@ -481,7 +481,8 @@ describe("SDK production async completion paths", () => {
 	test("does not label a bounded ordinary SDK completion artifact as full output", async () => {
 		const mock = await createProductionSession(false);
 		if (!sessionManager || !created) throw new Error("SDK session fixture unavailable");
-		const fullOutput = `ORDINARY-CAPPED-HEAD\n${"界".repeat(40_000)}\nORDINARY-CAPPED-TAIL`;
+		const fullOutput = `ORDINARY-CAPPED-HEAD\n${"h".repeat(40_000)}\nOMITTED-MIDDLE\n${"t".repeat(40_000)}\nORDINARY-CAPPED-TAIL`;
+		const expectedPayload = `${fullOutput.slice(0, 32 * 1024)}\n\n[async delivery output truncated from ${Buffer.byteLength(fullOutput, "utf8")} bytes]\n\n${fullOutput.slice(-32 * 1024)}`;
 		const saveArtifact = trackSpy(spyOn(SessionManager.prototype, "saveArtifact"));
 		const callsBeforeWake = mock.calls.length;
 		registerOrdinarySdkJob(fullOutput, "ordinary SDK bounded delivery");
@@ -506,15 +507,10 @@ describe("SDK production async completion paths", () => {
 		if (!publication) throw new Error("expected genuine bounded completion publication");
 		expect(publication[1]).toBe("async");
 		const callbackOutput = publication[0];
-		expect(callbackOutput).toContain("ORDINARY-CAPPED-HEAD");
-		expect(callbackOutput).toContain("ORDINARY-CAPPED-TAIL");
-		expect(callbackOutput).toContain(
-			`[async delivery output truncated from ${Buffer.byteLength(fullOutput, "utf8")} bytes]`,
-		);
-		expect(Buffer.byteLength(callbackOutput, "utf8")).toBeLessThan(Buffer.byteLength(fullOutput, "utf8"));
+		expect(callbackOutput).toBe(expectedPayload);
 		const artifactPath = await sessionManager.getArtifactPath(uri.slice("artifact://".length));
 		if (!artifactPath) throw new Error("expected resolvable bounded completion artifact");
-		expect(await Bun.file(artifactPath).text()).toBe(callbackOutput);
+		expect(await Bun.file(artifactPath).text()).toBe(expectedPayload);
 	});
 
 	for (const scenario of ["symlink", "replacement", "contended", "unavailable"] as const) {
