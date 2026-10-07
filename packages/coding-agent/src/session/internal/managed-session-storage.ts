@@ -1465,7 +1465,12 @@ function secureExistingManagedDirectory(pathname: string, kind: "directory" | "f
 	);
 	assertManagedPathIdentity(pathname, kind, named);
 	if (verified.ok) return;
-	if (verified.code !== "acl_verify_failed") throw securityError(pathname, verified);
+	// owner_mismatch: directory owner is not the current user. Repair attempts ownership transfer.
+	// If the user lacks SeTakeOwnershipPrivilege (non-elevated), the repair will fail with
+	// io_error, which is caught as a security error with clear context below.
+	if (verified.code !== "acl_verify_failed" && verified.code !== "owner_mismatch") {
+		throw securityError(pathname, verified);
+	}
 	const repaired = validateNativeSecurityResult(
 		nativeSessionStorage().repairOwnerOnlyPathSecurityExpected(
 			pathname,
@@ -1476,7 +1481,16 @@ function secureExistingManagedDirectory(pathname: string, kind: "directory" | "f
 		"verify",
 		kind,
 	);
-	if (!repaired.ok) throw securityError(pathname, repaired);
+	if (!repaired.ok) {
+		// If initial verification was owner_mismatch and repair failed (typically io_error
+		// when the user lacks SeTakeOwnershipPrivilege), provide clear context.
+		if (verified.code === "owner_mismatch" && repaired.code === "io_error") {
+			throw new Error(
+				`${kind} owner mismatch: unable to take ownership (need administrator privileges or file ownership): ${pathname}`,
+			);
+		}
+		throw securityError(pathname, repaired);
+	}
 	assertManagedPathIdentity(pathname, kind, named);
 }
 
