@@ -603,11 +603,19 @@ export class AcpSdkAdapter {
 		// request that named no readiness budget is queued for the default one, so it
 		// needs the same extension rather than the client's generic request deadline.
 		const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
-		const response = await this.#client.global(operation, input, {
-			idempotencyKey,
-			...(timeoutMs === undefined ? {} : { timeoutMs }),
-		});
-		return response;
+		let lastError: unknown;
+		for (let attempt = 0; attempt < 3; attempt++) {
+			try {
+				return await this.#client.global(operation, input, {
+					idempotencyKey,
+					...(timeoutMs === undefined ? {} : { timeoutMs }),
+				});
+			} catch (error) {
+				lastError = error;
+				if (!(error instanceof SdkClientError) || error.code !== "uncertain_after_send") throw error;
+			}
+		}
+		throw lastError;
 	}
 
 	async sdkControl(params: { operation: string; input?: JsonObject }): Promise<unknown> {
@@ -646,7 +654,7 @@ export class AcpSdkAdapter {
 		throw new AcpSdkAdapterError("method_not_found", `Unsupported ACP SDK method: ${method}`);
 	}
 
-	async registerProvider(provider: AcpProviderRegistration): Promise<void> {
+	async registerProvider(provider: AcpProviderRegistration, timeoutMs?: number): Promise<void> {
 		if (!this.#router)
 			throw new AcpSdkAdapterError(
 				"operation_prohibited",
@@ -665,6 +673,7 @@ export class AcpSdkAdapter {
 				...(previousLeaseId ? { expectedLeaseId: previousLeaseId } : {}),
 			},
 			true,
+			timeoutMs === undefined ? undefined : { timeoutMs },
 		);
 		const result = object(object(response)?.result) ?? object(response) ?? {};
 		if (typeof result.leaseId !== "string")
@@ -694,8 +703,10 @@ export class AcpSdkAdapter {
 				const connectionId = attachment?.connectionId;
 				try {
 					for (const provider of this.#providers) {
+						const remainingMs = PROVIDER_ACTIVATION_BUDGET_MS - (Date.now() - startedAt);
+						if (remainingMs <= 0) throw this.#providerActivationExhausted(attempt - 1, startedAt);
 						try {
-							await this.registerProvider(provider);
+							await this.registerProvider(provider, remainingMs);
 						} catch (error) {
 							if (providerErrorCode(error) === "provider_lease_conflict") {
 								this.#leases.delete(provider.capability);
