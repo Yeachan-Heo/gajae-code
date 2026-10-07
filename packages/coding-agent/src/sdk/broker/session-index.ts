@@ -1203,9 +1203,10 @@ export class SessionIndex {
 	 * stamp of the last completed locked pass, the in-memory projection is
 	 * already current and the locked rescan is skipped entirely — this is what
 	 * keeps an idle SessionRouter reconcile (2s cadence) from re-parsing and
-	 * re-checksumming the whole index forever. The check waits behind queued
-	 * same-process index operations, so a pending append cannot be mistaken for
-	 * an unchanged projection. An append committed before the stat always changes
+	 * re-checksumming the whole index forever. The unchanged check runs before
+	 * the local queue so unrelated heartbeat work cannot delay ordinary creates.
+	 * Admission that requires serialized authority must use refresh() instead.
+	 * An append committed before the stat always changes
 	 * the stamp; a change landing after the stat is seen on the next poll, the
 	 * same TOCTOU envelope a locked read has. A corrupt suffix never takes the fast path: re-scanning
 	 * preserves the existing re-diagnosis behavior. Returns true when state was
@@ -1219,6 +1220,8 @@ export class SessionIndex {
 			await this.refresh();
 			return true;
 		}
+		const stamp = await readIndexChangeStamp(this.#agentDir);
+		if (sameIndexChangeStamp(this.#changeStamp, stamp)) return false;
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		return await SessionIndex.#enqueue(indexPath, async () => {
 			if (this.#changeStamp === undefined || this.#corruptSuffix) {
