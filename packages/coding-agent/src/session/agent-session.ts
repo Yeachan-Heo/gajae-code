@@ -4076,6 +4076,7 @@ export class AgentSession {
 	// async event handlers settle. Subscribers treat agent_end as readiness, so
 	// publishing it earlier lets a successor corrupt the prior prompt's lifecycle.
 	#pendingAgentEndEmit: AgentSessionEvent | undefined;
+	#restoredAgentEndsPendingPublication = new Set<AgentSessionEvent>();
 	#agentEndContinuationDecisions = new WeakSet<AgentSessionEvent>();
 	#pendingSdkAgentEnds = new Set<AgentSessionEvent>();
 	// A scheduled continuation owns this terminal boundary until it either starts
@@ -4817,9 +4818,12 @@ export class AgentSession {
 
 	#restoreDeferredAgentEndAfterContinuationFailure(pending: AgentSessionEvent | undefined): void {
 		const scope = (pending as (AgentSessionEvent & { scope?: AttemptScope }) | undefined)?.scope;
-		if (pending && scope && this.#sdkRunTokensByAttemptScope.has(scope)) this.#pendingSdkAgentEnds.add(pending);
-		if (pending && !this.#pendingAgentEndEmit) {
-			this.#pendingAgentEndEmit = pending;
+		if (pending) {
+			if (scope && this.#sdkRunTokensByAttemptScope.has(scope)) this.#pendingSdkAgentEnds.add(pending);
+			if (!this.#pendingAgentEndEmit) this.#pendingAgentEndEmit = pending;
+			else if (this.#pendingAgentEndEmit !== pending && !this.#pendingSdkAgentEnds.has(pending)) {
+				this.#restoredAgentEndsPendingPublication.add(pending);
+			}
 		}
 		this.#flushPendingAgentEnd();
 	}
@@ -4845,15 +4849,11 @@ export class AgentSession {
 	}
 
 	#releaseDeferredAgentEndContinuations(): void {
-		let pending: AgentSessionEvent | undefined;
-		for (const candidate of this.#pendingAgentEndContinuationHolds.values()) {
-			pending = candidate;
-			break;
-		}
+		const pendingAgentEnds = new Set(this.#pendingAgentEndContinuationHolds.values());
 		this.#pendingAgentEndContinuationHolds.clear();
 		for (const lease of this.#deferredAgentEndWorkLeases.values()) lease.release();
 		this.#deferredAgentEndWorkLeases.clear();
-		this.#restoreDeferredAgentEndAfterContinuationFailure(pending);
+		for (const pending of pendingAgentEnds) this.#restoreDeferredAgentEndAfterContinuationFailure(pending);
 	}
 
 	#releaseDeferredAgentEndLease(pending: AgentSessionEvent | undefined): void {
@@ -5001,6 +5001,7 @@ export class AgentSession {
 			this.#agentEventHandlersInFlight > 0 ||
 			this.#agentEndPublicationInFlight > 0 ||
 			this.#pendingAgentEndContinuationHolds.size > 0 ||
+			this.#restoredAgentEndsPendingPublication.size > 0 ||
 			this.#pendingSelectionFenceDeferredContinuations(ignoreSelectionFenceGeneration) > 0 ||
 			this.#pendingAgentEndEmit !== undefined
 		);
@@ -5035,6 +5036,7 @@ export class AgentSession {
 			this.#livePromptsInFlight() > 0 ||
 			this.#agentEventHandlersInFlight > 0 ||
 			this.#pendingAgentEndEmit !== undefined ||
+			this.#restoredAgentEndsPendingPublication.size > 0 ||
 			this.#agentEndPublicationInFlight > 0
 		);
 	}
@@ -5191,7 +5193,7 @@ export class AgentSession {
 			this.#deferredAgentEndLeases.delete(sdkPending);
 			this.#startAgentEndPublication(sdkPending, sdkLease);
 		}
-		const pending = this.#pendingAgentEndEmit;
+		let pending = this.#pendingAgentEndEmit;
 		if (pending && this.#pendingSdkAgentEnds.has(pending)) return;
 		if (
 			this.#livePromptsInFlight() > 0 ||
@@ -5200,10 +5202,14 @@ export class AgentSession {
 		)
 			return;
 		if (!pending) {
-			this.#resolveSessionSettlement();
-			return;
+			pending = this.#restoredAgentEndsPendingPublication.values().next().value;
+			if (!pending) {
+				this.#resolveSessionSettlement();
+				return;
+			}
+			this.#restoredAgentEndsPendingPublication.delete(pending);
 		}
-		this.#pendingAgentEndEmit = undefined;
+		if (this.#pendingAgentEndEmit === pending) this.#pendingAgentEndEmit = undefined;
 		const lease = this.#deferredAgentEndLeases.get(pending);
 		if (lease) this.#deferredAgentEndLeases.delete(pending);
 		this.#startAgentEndPublication(pending, lease);
@@ -5346,6 +5352,7 @@ export class AgentSession {
 			if (extensionDelivery) void extensionDelivery.then(releaseLease, releaseLease);
 			else releaseLease();
 			this.#agentEndPublicationInFlight = Math.max(0, this.#agentEndPublicationInFlight - 1);
+			this.#flushPendingAgentEnd();
 			this.#resolveSessionSettlement();
 		}
 	}
@@ -7567,6 +7574,8 @@ export class AgentSession {
 		const attemptScope = (event as AgentEvent & { scope?: AttemptScope }).scope;
 		const terminalSdkOwnership =
 			event.type === "agent_end" ? this.#captureSdkContinuationOwnership(attemptScope) : undefined;
+		const activeDeepInterviewAtAgentEnd =
+			event.type === "agent_end" && this.getEffectiveActiveWorkflowSkillState()?.skill === "deep-interview";
 
 		// These lifecycle boundaries can be delivered without awaiting this listener.
 		// Revoke streaming-edit cache generations before any admission, spill, or
@@ -8411,10 +8420,13 @@ export class AgentSession {
 				if (this.#enforceRewindBeforeYield()) {
 					return;
 				}
-				if (
-					(await this.#checkActiveDeepInterviewCompletion(msg, agentEndGeneration, agentEndOwnerEpoch)) !==
-					"not_applicable"
-				) {
+				// SDK terminal settlement must not wait on a filesystem stop-hook read
+				// when this session has no active deep-interview workflow to continue.
+				const deepInterviewResult =
+					terminalSdkOwnership && !activeDeepInterviewAtAgentEnd
+						? "not_applicable"
+						: await this.#checkActiveDeepInterviewCompletion(msg, agentEndGeneration, agentEndOwnerEpoch);
+				if (deepInterviewResult !== "not_applicable") {
 					return;
 				}
 				if (await this.#checkGoalCompletion(msg)) {
@@ -8641,7 +8653,9 @@ export class AgentSession {
 			const deferredPredecessorAgentEnd =
 				options?.deferredPredecessorAgentEnd ??
 				(options?.suppressPredecessorAgentEnd
-					? this.#claimDeferredAgentEndForContinuation(this.#reserveDeferredAgentEndForContinuation())
+					? this.#claimDeferredAgentEndForContinuation(
+							this.#reserveDeferredAgentEndForContinuation(scheduledSdkOwnership?.scope),
+						)
 					: undefined);
 			const precedingSelectionFence = this.#selectionFenceTail;
 			const deferredPromptGeneration = options?.generation ?? this.#promptGeneration;
@@ -8669,7 +8683,7 @@ export class AgentSession {
 			(options?.deferredPredecessorAgentEnd
 				? this.#restoreAndReserveDeferredAgentEndForContinuation(options.deferredPredecessorAgentEnd)
 				: options?.suppressPredecessorAgentEnd
-					? this.#reserveDeferredAgentEndForContinuation()
+					? this.#reserveDeferredAgentEndForContinuation(scheduledSdkOwnership?.scope)
 					: undefined);
 		let terminalized = false;
 		const skip = (
@@ -8772,11 +8786,12 @@ export class AgentSession {
 									}
 									const predecessorAgentEnd =
 										this.#claimDeferredAgentEndForContinuation(predecessorAgentEndHold);
-									let predecessorAccepted = false;
-									const releasePredecessor = () => {
-										if (predecessorAccepted) return;
-										predecessorAccepted = true;
-										this.#releaseDeferredAgentEndLease(predecessorAgentEnd);
+									let predecessorSettled = false;
+									const settlePredecessor = (hasSuccessorRun: boolean) => {
+										if (predecessorSettled) return;
+										predecessorSettled = true;
+										if (hasSuccessorRun) this.#releaseDeferredAgentEndLease(predecessorAgentEnd);
+										else this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
 									};
 									const hasQueuedMessages = this.agent.hasQueuedMessages();
 									const startsQueuedSuccessor =
@@ -8800,9 +8815,8 @@ export class AgentSession {
 												// agent_start (review P1); their queued messages are in-run
 												// consumptions, not own-run promotions.
 												const startsOwn = options?.maintenanceContinuation !== true;
-												const inheritedSdkRunToken = options?.continueQueuedOnly
-													? undefined
-													: (scheduledSdkOwnership?.token ?? options?.sdkRunToken ?? scheduledSdkRunToken);
+												const inheritedSdkRunToken =
+													scheduledSdkOwnership?.token ?? options?.sdkRunToken ?? scheduledSdkRunToken;
 												const consumedSdkRunTokens = acceptance.consumedQueuedMessages
 													.map(message => this.#sdkRunTokensByQueuedMessage.get(message))
 													.filter((token): token is string => token !== undefined);
@@ -8811,6 +8825,18 @@ export class AgentSession {
 													scheduledSdkOwnership?.scope ??
 													(predecessorAgentEnd &&
 														this.#agentEventAdmission.get(predecessorAgentEnd)?.scope);
+												// The accepted successor publishes the terminal boundary for the
+												// predecessor as well as for every SDK follow-up it consumes.
+												const sdkRunTokens = Array.from(
+													new Set([
+														...(scheduledSdkOwnership?.cohort ?? []),
+														...(scheduledSdkRunToken === undefined ? [] : [scheduledSdkRunToken]),
+														...(predecessorScope === undefined
+															? []
+															: (this.#sdkRunCohortsByAttemptScope.get(predecessorScope) ?? [])),
+														...consumedSdkRunTokens,
+													]),
+												);
 												this.#fireQueuedPromotionHooks(acceptance.consumedQueuedMessages, {
 													startsOwnRun: startsOwn,
 												});
@@ -8818,9 +8844,7 @@ export class AgentSession {
 												this.#acceptSdkAttemptRun(
 													handle,
 													sdkRunToken,
-													consumedSdkRunTokens.length > 0
-														? consumedSdkRunTokens
-														: scheduledSdkOwnership?.cohort,
+													sdkRunTokens.length > 0 ? sdkRunTokens : undefined,
 													predecessorScope,
 												);
 												options?.onRunAccepted?.(handle);
@@ -8829,7 +8853,10 @@ export class AgentSession {
 												for (const message of acceptance.consumedQueuedMessages)
 													this.#sdkRunTokensByQueuedMessage.delete(message);
 												settleLease();
-												releasePredecessor();
+												settlePredecessor(
+													options?.continueQueuedOnly !== true ||
+														acceptance.consumedQueuedMessages.length > 0,
+												);
 												if (startsQueuedSuccessor) {
 													this.#defaultFallbackChain().resetAttemptBudget();
 													this.#escapedNonAsciiManagedRetries = 0;
@@ -8838,12 +8865,12 @@ export class AgentSession {
 												}
 											},
 										});
-										releasePredecessor();
+										settlePredecessor(options?.continueQueuedOnly !== true);
 									} catch (error) {
 										if (
 											options?.rescheduleOnBusy &&
 											this.#isAgentBusyError(error) &&
-											!predecessorAccepted &&
+											!predecessorSettled &&
 											!terminalized &&
 											canContinue()
 										) {
@@ -8867,7 +8894,7 @@ export class AgentSession {
 												error: error.message,
 											});
 										}
-										if (!predecessorAccepted) {
+										if (!predecessorSettled) {
 											this.#settleTrackedOwnRunPromotionFailures();
 											this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
 										}
@@ -9068,7 +9095,9 @@ export class AgentSession {
 		if (this.#pendingSelectionFences > 0 && selectionFenceGeneration === this.#selectionFenceGeneration) {
 			const predecessorAgentEnd =
 				deferredPredecessorAgentEnd ??
-				this.#claimDeferredAgentEndForContinuation(this.#reserveDeferredAgentEndForContinuation());
+				this.#claimDeferredAgentEndForContinuation(
+					this.#reserveDeferredAgentEndForContinuation(scheduledSdkOwnership?.scope),
+				);
 			const precedingSelectionFence = this.#selectionFenceTail;
 			const deferredScheduling = precedingSelectionFence.then(() => {
 				try {
@@ -9090,7 +9119,7 @@ export class AgentSession {
 		}
 		const predecessorAgentEndHold = deferredPredecessorAgentEnd
 			? this.#restoreAndReserveDeferredAgentEndForContinuation(deferredPredecessorAgentEnd)
-			: this.#reserveDeferredAgentEndForContinuation();
+			: this.#reserveDeferredAgentEndForContinuation(scheduledSdkOwnership?.scope);
 		void this.#schedulePostPromptTask(
 			async signal => {
 				try {
@@ -14235,7 +14264,7 @@ export class AgentSession {
 			this.#promptPreflightAbortController = new AbortController();
 		}
 		const predecessorAgentEndHold =
-			options?.predecessorAgentEndHold ?? this.#reserveDeferredAgentEndForContinuation();
+			options?.predecessorAgentEndHold ?? this.#reserveDeferredAgentEndForContinuation(options?.sdkPredecessorScope);
 		const generation = this.#promptGeneration;
 		// Mint the immutable lineage identity for this prompt turn before the
 		// model runs; beforeToolCall attaches this lineage + attempt epoch to
@@ -14596,6 +14625,7 @@ export class AgentSession {
 			await this.#promptAgentWithIdleRetry(preSubmit, agentPromptOptions, predecessorAgentEndHold, {
 				signal: preflightSignal,
 				resourceRunId: this.#runResourceLeaseContext.getStore()?.resourceRunId,
+				sdkPredecessorScope: options?.sdkPredecessorScope,
 				onPreflightAccepted: async () => {
 					this.#assertExternalSessionIngress({ allowCancelAndSubmit: true });
 					this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
@@ -22913,6 +22943,7 @@ export class AgentSession {
 						shouldContinue: () => this.agent.hasQueuedMessages(),
 						rescheduleOnBusy: true,
 						continueQueuedOnly: true,
+						sdkOwnership: options?.sdkOwnership,
 						onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
 						onError: error => this.#logCompactionContinuationError("queued_continue", error),
 						resourceRunId: options?.resourceRunId,
@@ -25496,6 +25527,7 @@ export class AgentSession {
 		seam?: {
 			signal?: AbortSignal;
 			resourceRunId?: string;
+			sdkPredecessorScope?: AttemptScope;
 			onPreflightAccepted?: () => void | Promise<void>;
 		},
 	): Promise<void> {
@@ -25508,7 +25540,7 @@ export class AgentSession {
 		for (;;) {
 			try {
 				const predecessorAgentEnd = this.#claimDeferredAgentEndForContinuation(
-					continuationHold ?? this.#reserveDeferredAgentEndForContinuation(),
+					continuationHold ?? this.#reserveDeferredAgentEndForContinuation(seam?.sdkPredecessorScope),
 				);
 				continuationHold = undefined;
 				try {

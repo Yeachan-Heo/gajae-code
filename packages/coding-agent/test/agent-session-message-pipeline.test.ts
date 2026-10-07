@@ -1142,6 +1142,99 @@ describe("AgentSession message pipeline", () => {
 		await session.waitForIdle();
 		expect(events.filter(event => event.type === "agent_end")).toHaveLength(6);
 	});
+	it("preserves the SDK predecessor cohort through a no-preparation queued continuation", async () => {
+		const model: Model = {
+			id: "sdk-compaction-owner-model",
+			name: "sdk-compaction-owner-model",
+			provider: "mock",
+			api: "mock",
+			baseUrl: "mock://",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 32_768,
+		};
+		let responseCount = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["system prompt"], messages: [], tools: [] },
+			streamFn: () => {
+				const index = responseCount++;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					const message = createAssistantMessage(index === 0 ? "initial answer" : "queued answer");
+					if (index === 0) {
+						message.usage = {
+							...message.usage,
+							input: 191_000,
+							totalTokens: 191_000,
+						};
+					}
+					stream.push({ type: "done", reason: "stop", message });
+				});
+				return stream;
+			},
+		});
+		const sessionManager = SessionManager.inMemory();
+		vi.spyOn(sessionManager, "getBranch").mockReturnValue([]);
+		const session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({
+				"compaction.enabled": true,
+				"compaction.keepRecentTokens": 300_000,
+				"compaction.autoContinue": true,
+				"contextPromotion.enabled": false,
+				"todo.reminders": false,
+			}),
+			modelRegistry: { ...testModelRegistry, getAvailable: () => [model] } as never,
+		});
+		sessions.push(session);
+		const events: AgentSessionEvent[] = [];
+		const firstTurnEnded = Promise.withResolvers<void>();
+		let turnEndReported = false;
+		session.subscribe(event => {
+			events.push(event);
+			if (event.type === "turn_end" && !turnEndReported) {
+				turnEndReported = true;
+				firstTurnEnded.resolve();
+			}
+		});
+
+		const prompt = session.sendUserMessage("SDK predecessor", {
+			sdkRunCapability: createSdkRunCapability("no-preparation-compaction-owner"),
+		} as never);
+		await firstTurnEnded.promise;
+		const queuedSubmission = await session.submitUserMessage("SDK successor", {
+			deliverAs: "followUp",
+			trackSubmission: true,
+			sdkRunCapability: createSdkRunCapability("no-preparation-compaction-successor"),
+		} as never);
+		await prompt;
+		await queuedSubmission.execution;
+		await queuedSubmission.terminal;
+		await session.waitForIdle();
+
+		expect(turnEndReported).toBe(true);
+		expect(events.filter(event => event.type === "auto_compaction_end")[0]).toEqual(
+			expect.objectContaining({ skipped: true, willRetry: false }),
+		);
+		expect(responseCount, "the queued continuation should make a second model call").toBe(2);
+		expect(
+			events.some(
+				event =>
+					event.type === "message_start" &&
+					event.message.role === "user" &&
+					JSON.stringify(event.message.content).includes("SDK successor"),
+			),
+		).toBe(true);
+		const compactionEndIndex = events.findIndex(event => event.type === "auto_compaction_end");
+		const agentEndIndex = events.findIndex(event => event.type === "agent_end");
+		expect(agentEndIndex).toBeGreaterThan(compactionEndIndex);
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+	});
 	it("starts SDK worker reconciliation before a slow extension delivery", async () => {
 		const extensionStarted = Promise.withResolvers<void>();
 		const releaseExtension = Promise.withResolvers<void>();
