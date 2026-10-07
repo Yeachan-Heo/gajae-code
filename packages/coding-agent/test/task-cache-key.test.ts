@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai/models";
 import type { Message, ProviderSessionState } from "@gajae-code/ai/types";
-import { pathIdentityKey, Snowflake } from "@gajae-code/utils";
+import { Snowflake, stablePathKey } from "@gajae-code/utils";
 import { AsyncJobManager, asyncJobEndpointId } from "../src/async";
 import { Settings } from "../src/config/settings";
 import { createAgentSession } from "../src/sdk";
@@ -101,6 +101,20 @@ describe("async job endpoint id derivation", () => {
 		expect(asyncJobEndpointId("provider", "logical-id", undefined)).toBe("logical-id");
 	});
 
+	it("keeps endpoint keys stable as a transcript is created and replaced", () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-endpoint-persist-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const sessionFile = path.join(tempDir, "session.jsonl");
+		const beforeCreate = asyncJobEndpointId("provider", "logical-id", sessionFile);
+
+		fs.writeFileSync(sessionFile, "first");
+		expect(asyncJobEndpointId("provider", "logical-id", sessionFile)).toBe(beforeCreate);
+
+		fs.rmSync(sessionFile);
+		fs.writeFileSync(sessionFile, "replacement");
+		expect(asyncJobEndpointId("provider", "logical-id", sessionFile)).toBe(beforeCreate);
+	});
+
 	it("collapses symlink and dot-segment transcript aliases onto one endpoint key", () => {
 		if (process.platform === "win32") return;
 		const tempDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), `pi-endpoint-alias-${Snowflake.next()}-`)));
@@ -140,7 +154,7 @@ describe("async job endpoint id derivation", () => {
 		);
 	});
 
-	it("keys Windows path aliases by filesystem identity without merging case-sensitive files", () => {
+	it("keys Windows path aliases stably without merging case-sensitive files", () => {
 		if (process.platform !== "win32") return;
 
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-endpoint-case-${Snowflake.next()}-`));
@@ -148,6 +162,7 @@ describe("async job endpoint id derivation", () => {
 		const sessionFile1 = path.join(tempDir, "Session.jsonl");
 		const sessionFile2 = path.join(tempDir, "session.jsonl");
 		fs.writeFileSync(sessionFile1, "");
+		const endpoint1 = asyncJobEndpointId("provider", "logical-id", sessionFile1);
 
 		let distinctCaseSensitiveFiles = false;
 		try {
@@ -157,11 +172,10 @@ describe("async job endpoint id derivation", () => {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 		}
 
-		const endpoint1 = asyncJobEndpointId("provider", "logical-id", sessionFile1);
 		const endpoint2 = asyncJobEndpointId("provider", "logical-id", sessionFile2);
 
-		// Case-insensitive Windows directories resolve both spellings to the same
-		// file ID; case-sensitive directories allow distinct files and IDs.
+		// Case-insensitive Windows directories resolve aliases to the recorded
+		// entry spelling; case-sensitive directories allow distinct files and keys.
 		expect(endpoint1 === endpoint2).toBe(!distinctCaseSensitiveFiles);
 	});
 });
@@ -319,7 +333,7 @@ describe("task fork-context provider identity", () => {
 		const previousEndpoint = JSON.stringify([
 			"async-job-endpoint",
 			providerSessionId,
-			pathIdentityKey(path.resolve(previousSessionFile!)),
+			stablePathKey(path.resolve(previousSessionFile!)),
 		]);
 		const manager = AsyncJobManager.forEndpoint(previousEndpoint);
 		expect(manager).toBeDefined();
@@ -331,7 +345,7 @@ describe("task fork-context provider identity", () => {
 		const successorEndpoint = JSON.stringify([
 			"async-job-endpoint",
 			providerSessionId,
-			pathIdentityKey(path.resolve(successorSessionFile!)),
+			stablePathKey(path.resolve(successorSessionFile!)),
 		]);
 		expect(AsyncJobManager.forEndpoint(previousEndpoint)).toBeUndefined();
 		expect(AsyncJobManager.forEndpoint(successorEndpoint)).toBe(manager);
