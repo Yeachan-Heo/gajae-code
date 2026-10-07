@@ -20985,6 +20985,7 @@ export class AgentSession {
 		const successfulEmptyStop =
 			assistantMessage.stopReason === "stop" &&
 			assistantMessage.content.length === 0 &&
+			assistantMessage.usage.totalTokens > 0 &&
 			assistantMessage.usage.input + assistantMessage.usage.cacheRead + assistantMessage.usage.cacheWrite <=
 				contextWindow;
 		if (
