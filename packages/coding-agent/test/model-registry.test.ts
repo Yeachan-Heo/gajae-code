@@ -3858,7 +3858,7 @@ describe("ModelRegistry", () => {
 			expect(model?.id).toBe("cline-pass/deepseek-v4-flash");
 			expect(model?.name).toBe("DeepSeek V4 Flash via ClinePass");
 			expect(model?.contextWindow).toBe(1_000_000);
-			expect(model?.maxTokens).toBe(384_000);
+			expect(model?.maxTokens).toBe(393_216);
 			expect(model?.maxTokensSource).toBeUndefined();
 			expect(model?.reasoning).toBe(true);
 			expect(model?.baseUrl).toBe("https://api.cline.bot/api/v1");

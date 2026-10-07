@@ -12,6 +12,7 @@ const LIVE_OPENCODE_GO_MODEL_IDS = [
 	"kimi-k2.7-code",
 	"kimi-k2.6",
 	"longcat-2.0",
+	"longcat-2.5-preview-free",
 	"kimi-k2.5",
 	"glm-5.2",
 	"glm-5.3-flash",
@@ -38,11 +39,13 @@ const LIVE_OPENCODE_GO_MODEL_IDS = [
 	"hy3",
 	"hy3-preview",
 	"gpt-5.6-luna",
+	"gpt-6-luna",
 	"grok-4.5",
 	"grok-4.6",
 	"grok-4.7",
 	"muse-spark-1.2-contributor",
 	"muse-spark-1.3-contributor",
+	"space-bunny-free",
 	"union-alpha",
 ] as const;
 
