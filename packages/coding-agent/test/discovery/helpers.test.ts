@@ -928,6 +928,64 @@ describe("safe discovery boundaries", () => {
 		}
 	});
 
+	test("rejects a trusted skill resolved through an uncaptured intermediate symlink target", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-skill-intermediate-link-"));
+		try {
+			const userSkillsDir = path.join(root, ".gjc", "agent", "skills");
+			const skillLink = path.join(userSkillsDir, "external-skill");
+			const intermediateLink = path.join(root, "shared", "current");
+			const safeTarget = path.join(root, "shared", "safe");
+			const alternateTarget = path.join(root, "shared", "alternate");
+			const candidatePath = path.join(skillLink, "SKILL.md");
+			const writeSkill = async (dir: string, body: string) => {
+				await fs.mkdir(dir, { recursive: true });
+				await fs.writeFile(
+					path.join(dir, "SKILL.md"),
+					`---\nname: external-skill\ndescription: External skill\n---\n${body}`,
+				);
+			};
+			await writeSkill(safeTarget, "Safe body");
+			await writeSkill(alternateTarget, "Unbound alternate body");
+			await fs.mkdir(userSkillsDir, { recursive: true });
+			await fs.mkdir(path.dirname(intermediateLink), { recursive: true });
+			await fs.symlink(safeTarget, intermediateLink, "dir");
+			await fs.symlink(intermediateLink, skillLink, "dir");
+
+			SkillDiscoveryTestHooks.afterSkillLinksCaptured = async validatedCandidate => {
+				if (validatedCandidate !== candidatePath) return;
+				await fs.unlink(intermediateLink);
+				await fs.symlink(alternateTarget, intermediateLink, "dir");
+			};
+			SkillDiscoveryTestHooks.afterSkillPathResolved = async resolvedCandidate => {
+				if (resolvedCandidate !== candidatePath) return;
+				await fs.unlink(intermediateLink);
+				await fs.symlink(safeTarget, intermediateLink, "dir");
+			};
+			try {
+				const result = await scanSkillsFromDir(
+					{ cwd: root, home: root, repoRoot: root },
+					{
+						dir: userSkillsDir,
+						providerId: "test",
+						level: "user",
+						requireDescription: true,
+						allowExternalUserSkillSymlinks: true,
+					},
+				);
+
+				expect(result.items).toEqual([]);
+				expect(result.warnings).toEqual(
+					expect.arrayContaining([expect.stringContaining("not bound to its captured external link target")]),
+				);
+			} finally {
+				delete SkillDiscoveryTestHooks.afterSkillLinksCaptured;
+				delete SkillDiscoveryTestHooks.afterSkillPathResolved;
+			}
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	test("loads an in-root skill after an atomic file replacement", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-in-root-skill-atomic-save-"));
 		try {
