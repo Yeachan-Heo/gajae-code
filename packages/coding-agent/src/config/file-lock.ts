@@ -258,6 +258,19 @@ type LockInfoPathState = {
 	file: LockInfoFileState;
 };
 
+/** Bun/libuv may expose Windows file IDs as i64; native snapshots use u64. */
+function canonicalLockFileId(value: bigint): bigint {
+	if (value < -(1n << 63n) || value > (1n << 64n) - 1n) throw new Error("file_lock_identity_out_of_range");
+	return BigInt.asUintN(64, value);
+}
+
+/** Windows volume serials are u32 even when Bun returns a signed `stat.dev`. */
+function canonicalLockDeviceId(value: bigint): bigint {
+	if (process.platform !== "win32") return canonicalLockFileId(value);
+	if (value < -(1n << 31n) || value > (1n << 32n) - 1n) throw new Error("file_lock_identity_out_of_range");
+	return BigInt.asUintN(32, value);
+}
+
 function lockInfoFileState(stats: BigIntStats): LockInfoFileState | null {
 	if (stats.isSymbolicLink() || !stats.isFile()) return null;
 	// Some supported filesystems report creation time as missing or epoch zero. Keep
@@ -265,8 +278,8 @@ function lockInfoFileState(stats: BigIntStats): LockInfoFileState | null {
 	// acquire/release/GC on a metadata field the filesystem cannot provide.
 	const birthtimeNs = typeof stats.birthtimeNs === "bigint" && stats.birthtimeNs > 0n ? stats.birthtimeNs : 0n;
 	return {
-		dev: stats.dev,
-		ino: stats.ino,
+		dev: canonicalLockDeviceId(stats.dev),
+		ino: canonicalLockFileId(stats.ino),
 		mode: stats.mode,
 		size: stats.size,
 		mtimeNs: stats.mtimeNs,
@@ -310,7 +323,7 @@ async function lockInfoPathState(lockPath: string): Promise<LockInfoPathState | 
 	const file = lockInfoFileState(info);
 	if (!file) return null;
 	return {
-		root: { dev: root.dev, ino: root.ino, mode: root.mode },
+		root: { dev: canonicalLockDeviceId(root.dev), ino: canonicalLockFileId(root.ino), mode: root.mode },
 		file,
 	};
 }
@@ -539,8 +552,8 @@ async function removeDetachedLockQuarantineOnDisk(
 	if (
 		!current.isDirectory() ||
 		current.isSymbolicLink() ||
-		current.dev.toString() !== rootDev ||
-		current.ino.toString() !== rootIno
+		canonicalLockDeviceId(current.dev).toString() !== rootDev ||
+		canonicalLockFileId(current.ino).toString() !== rootIno
 	) {
 		return false;
 	}
@@ -556,8 +569,8 @@ async function finishDetachedLockCleanup(owner: FileLockOwnerToken): Promise<boo
 		if (
 			!current.isDirectory() ||
 			current.isSymbolicLink() ||
-			current.dev.toString() !== pending.rootDev ||
-			current.ino.toString() !== pending.rootIno
+			canonicalLockDeviceId(current.dev).toString() !== pending.rootDev ||
+			canonicalLockFileId(current.ino).toString() !== pending.rootIno
 		) {
 			throw new Error("Detached file lock cleanup identity changed; refusing removal");
 		}
@@ -859,8 +872,8 @@ async function rollbackPublishedFileLock(
 				if (
 					!current.isDirectory() ||
 					current.isSymbolicLink() ||
-					current.dev !== BigInt(`0x${identity[1]}`) ||
-					current.ino !== BigInt(`0x${identity[2]}`)
+					canonicalLockDeviceId(current.dev) !== BigInt(`0x${identity[1]}`) ||
+					canonicalLockFileId(current.ino) !== BigInt(`0x${identity[2]}`)
 				) {
 					throw new Error("File lock rollback placeholder identity changed; refusing removal");
 				}
@@ -1264,7 +1277,7 @@ async function removeVerifiedLockDirWithoutNative(
 	const removal = nativeFileLockBindings().exactRemoveDirectoryTree(
 		lockDir,
 		expected,
-		{ dev: parent.dev, ino: parent.ino },
+		{ dev: canonicalLockDeviceId(parent.dev), ino: canonicalLockFileId(parent.ino) },
 		true,
 	);
 	if (removal.ok && !removal.detachedPath) return "removed";
@@ -2441,8 +2454,8 @@ export async function inspectFileLockStagingDir(
 	if (
 		!captured.ok ||
 		!captured.snapshot ||
-		captured.snapshot.rootDev !== root.dev.toString() ||
-		captured.snapshot.rootIno !== root.ino.toString()
+		captured.snapshot.rootDev !== canonicalLockDeviceId(root.dev).toString() ||
+		captured.snapshot.rootIno !== canonicalLockFileId(root.ino).toString()
 	)
 		return kept;
 	const observation = await readFileLockObservationForGc(canonical);
@@ -2505,8 +2518,8 @@ export async function inspectFileLockStagingDir(
 		if (
 			detached?.isDirectory() &&
 			!detached.isSymbolicLink() &&
-			detached.dev.toString() === captured.snapshot.rootDev &&
-			detached.ino.toString() === captured.snapshot.rootIno
+			canonicalLockDeviceId(detached.dev).toString() === captured.snapshot.rootDev &&
+			canonicalLockFileId(detached.ino).toString() === captured.snapshot.rootIno
 		) {
 			try {
 				await fs.rmdir(removal.detachedPath);

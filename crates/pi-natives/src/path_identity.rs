@@ -12248,6 +12248,16 @@ mod platform {
 		}
 		Ok(sid_bytes[..sid_length].to_vec())
 	}
+	fn administrators_sid() -> Vec<u8> {
+		// BUILTIN\Administrators SID: S-1-5-32-544
+		vec![
+			0x01, // Revision
+			0x02, // SubAuthority count (2)
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x05, // Authority (5 = NT_AUTHORITY)
+			0x20, 0x00, 0x00, 0x00, // SubAuthority 0 (32)
+			0x30, 0x02, 0x00, 0x00, // SubAuthority 1 (544)
+		]
+	}
 
 	const OBJECT_INHERIT_ACE: u8 = 0x01;
 	const CONTAINER_INHERIT_ACE: u8 = 0x02;
@@ -12390,7 +12400,18 @@ mod platform {
 		} else {
 			// SAFETY: GetSecurityInfo returned owner within the live security
 			// descriptor; `sid` is a validated current-user SID.
-			let owner_matches = unsafe { EqualSid(owner, sid.as_ptr().cast_mut().cast()) } != 0;
+			let owner_matches_user = unsafe { EqualSid(owner, sid.as_ptr().cast_mut().cast()) } != 0;
+
+			// On Windows, also accept Administrators as a trusted owner to support
+			// elevated installation paths (issue #6420)
+			let owner_matches_admin = if !owner_matches_user {
+				let admin_sid = administrators_sid();
+				(unsafe { EqualSid(owner, admin_sid.as_ptr().cast_mut().cast()) }) != 0
+			} else {
+				false
+			};
+
+			let owner_matches = owner_matches_user || owner_matches_admin;
 			if !owner_matches {
 				Ok(OwnerOnlyAclState::OwnerMismatch)
 			} else {

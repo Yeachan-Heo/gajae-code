@@ -31,6 +31,8 @@ import {
 	type InteractiveModeContext,
 } from "../modes/types";
 import { parseUiLanguage, resolveUiLanguage, UI_LANGUAGE_LABELS, UI_LANGUAGES, uiString } from "../modes/ui-language";
+import { buildSessionProjectProgress } from "../progress/collect-project-progress";
+import { PROGRESS_COMMAND_ACP_DESCRIPTION } from "../progress/render-progress";
 // W1b/W5b: notification-service and daemon controllers stay off the static
 // import graph; the /notify handlers import them lazily at first use.
 import type { NotificationProvider } from "../sdk/bus/config";
@@ -63,6 +65,7 @@ import { switchSessionCredentialCommand } from "./helpers/credential-switch";
 import { buildFastStatusReport } from "./helpers/fast-status-report";
 import { formatDuration } from "./helpers/format";
 import { commandConsumed, errorMessage, parseSlashCommand, parseSubcommand, usage } from "./helpers/parse";
+import { renderProgressReportLines, renderProgressReportText } from "./helpers/progress-report";
 import { handleSshAcp } from "./helpers/ssh";
 import { buildUsageReportText, collectCachedUsageReports } from "./helpers/usage-report";
 import type {
@@ -1582,6 +1585,30 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		handleTui: (_command, runtime) => {
 			runtime.ctx.handleContextCommand();
 			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "progress",
+		description:
+			"Show a read-only project progress overview from durable goal, todo, workflow, agent, and verification state",
+		// Production ACP advertises and dispatches `/progress` itself over the
+		// `session.progress` SDK query (modes/acp/acp-agent.ts) with the same copy.
+		acpDescription: PROGRESS_COMMAND_ACP_DESCRIPTION,
+		allowArgs: false,
+		handle: async (_command, runtime) => {
+			const report = await buildSessionProjectProgress(runtime.session, runtime.sessionManager);
+			await runtime.output(renderProgressReportText(report));
+			return commandConsumed();
+		},
+		handleTui: async (_command, runtime) => {
+			const ctx = runtime.ctx;
+			const report = await buildSessionProjectProgress(ctx.session, ctx.sessionManager);
+			ctx.chatContainer.addChild(new Spacer(1));
+			ctx.chatContainer.addChild(new DynamicBorder());
+			ctx.chatContainer.addChild(new Text(renderProgressReportLines(report, theme).join("\n"), 1, 0));
+			ctx.chatContainer.addChild(new DynamicBorder());
+			ctx.ui.requestRender();
+			ctx.editor.setText("");
 		},
 	},
 	{

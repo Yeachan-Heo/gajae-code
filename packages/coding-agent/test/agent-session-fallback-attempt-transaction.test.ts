@@ -1,11 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
-import { Agent, type AgentOptions, type AgentTool } from "@gajae-code/agent-core";
+import { Agent, type AgentEvent, type AgentOptions, type AgentTool } from "@gajae-code/agent-core";
 import * as compactionModule from "@gajae-code/agent-core/compaction";
 import { type AssistantMessage, getBundledModel, type Model, type ToolCall } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
-import { streamOpenAIResponses } from "@gajae-code/ai/providers/openai-responses";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -99,7 +98,7 @@ function typedStatuslessOverloadStream(model: Model): AssistantMessageEventStrea
 	queueMicrotask(() => {
 		const message: AssistantMessage = {
 			role: "assistant",
-			content: [{ type: "text", text: "" }],
+			content: [],
 			api: model.api,
 			provider: model.provider,
 			model: model.id,
@@ -121,6 +120,44 @@ function typedStatuslessOverloadStream(model: Model): AssistantMessageEventStrea
 			timestamp: Date.now(),
 		};
 		stream.push({ type: "start", partial: message });
+		stream.push({ type: "error", reason: "error", error: message });
+	});
+	return stream;
+}
+function typedStatuslessOverloadWithTextStream(model: Model): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		const partial: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		const message: AssistantMessage = {
+			...partial,
+			content: [{ type: "text", text: "already streamed" }],
+			stopReason: "error",
+			errorMessage: "server_is_overloaded: Our servers are currently overloaded. Please try again later.",
+			transportFailure: {
+				kind: "transport",
+				providerCode: "server_is_overloaded",
+				openaiErrorCode: "server_is_overloaded",
+			},
+		};
+		stream.push({ type: "start", partial });
+		stream.push({ type: "text_start", contentIndex: 0, partial: message });
+		stream.push({ type: "text_delta", contentIndex: 0, delta: "already streamed", partial: message });
 		stream.push({ type: "error", reason: "error", error: message });
 	});
 	return stream;
@@ -211,7 +248,7 @@ function oversizedEventStream(model: Model): AssistantMessageEventStream {
 	return stream;
 }
 
-function zeroTokenEmptyStopStream(model: Model): AssistantMessageEventStream {
+function zeroTokenEmptyStopStream(model: Model, typed = true, teardown = false): AssistantMessageEventStream {
 	const stream = new AssistantMessageEventStream();
 	queueMicrotask(() => {
 		const message: AssistantMessage = {
@@ -229,11 +266,12 @@ function zeroTokenEmptyStopStream(model: Model): AssistantMessageEventStream {
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
 			stopReason: "stop",
-			transportFailure: { kind: "transport", providerCode: "empty_response" },
+			...(typed ? { transportFailure: { kind: "transport" as const, providerCode: "empty_response" } } : {}),
 			timestamp: Date.now(),
 		};
 		stream.push({ type: "start", partial: message });
-		stream.push({ type: "done", reason: "stop", message });
+		if (teardown) stream.end(message);
+		else stream.push({ type: "done", reason: "stop", message });
 	});
 	return stream;
 }
@@ -268,7 +306,7 @@ function extensionRunnerForHandler(
 	sessionManager: SessionManager,
 	modelRegistry: ModelRegistry,
 	eventType: "context" | "message_end",
-	onHandler?: () => void,
+	onHandler?: () => void | Promise<void>,
 ): ExtensionRunner {
 	const extension: Extension = {
 		path: "test-extension",
@@ -374,15 +412,13 @@ describe("AgentSession managed fallback attempt transaction", () => {
 		options: {
 			tools?: AgentTool[];
 			handler?: "context" | "message_end";
-			onHandler?: () => void;
+			onHandler?: () => void | Promise<void>;
 			settings?: Record<string, unknown>;
 			singleModelChain?: boolean;
-			primaryModel?: Model;
-			fallbackModel?: Model;
 		} = {},
 	): { agent: Agent; primary: Model; fallback: Model } {
-		const primary = options.primaryModel ?? getBundledModel("anthropic", "claude-sonnet-4-5");
-		const fallback = options.fallbackModel ?? getBundledModel("openai", "gpt-4o-mini");
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
 		if (!primary || !fallback) throw new Error("Expected bundled test models");
 		const sessionManager = SessionManager.inMemory();
 		const modelRegistry = new ModelRegistry(authStorage);
@@ -472,6 +508,162 @@ describe("AgentSession managed fallback attempt transaction", () => {
 		]);
 	});
 
+	it.each([false, true])("falls back after a clean untyped zero-token empty stop (teardown=%s)", async teardown => {
+		const calls: string[] = [];
+		const { agent, primary, fallback } = createSession((model, context, options) => {
+			calls.push(selector(model));
+			return calls.length === 1
+				? zeroTokenEmptyStopStream(model, false, teardown)
+				: createMockModel({ responses: [{ content: ["accepted"] }] }).stream(model, context, options);
+		}, 1);
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
+
+		await session!.prompt("recover from an untyped empty response");
+		await session!.waitForIdle();
+
+		expect(calls).toEqual([selector(primary), selector(fallback)]);
+		expect(session!.model).toEqual(fallback);
+		expect(events.filter(event => event.type === "model_fallback_switched")).toHaveLength(1);
+		const lifecycle = assistantLifecycleEvents(events);
+		expect(lifecycle.filter(event => event.type === "message_start")).toHaveLength(1);
+		expect(lifecycle.filter(event => event.type === "message_end")).toHaveLength(1);
+		expect(events.filter(event => event.type === "turn_end")).toHaveLength(1);
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+		expect(
+			events
+				.filter(
+					event =>
+						event.type === "turn_end" ||
+						event.type === "agent_end" ||
+						(event.type === "message_end" && event.message.role === "assistant"),
+				)
+				.map(event => event.type),
+		).toEqual(["message_end", "turn_end", "agent_end"]);
+		expect(session!.messages.filter(message => message.role === "assistant")).toEqual([
+			expect.objectContaining({
+				stopReason: "stop",
+				content: [expect.objectContaining({ type: "text", text: "accepted" })],
+			}),
+		]);
+		expect(agent.activeRunId).toBeUndefined();
+		expect(agent.currentManagedLogicalRunId).toBeUndefined();
+	});
+
+	it.each([
+		"throw",
+		"teardown",
+		"timeout",
+	] as const)("settles a %s failure after local empty fallback", async failure => {
+		const calls: string[] = [];
+		const { agent, primary, fallback } = createSession(model => {
+			calls.push(selector(model));
+			if (calls.length === 1) return zeroTokenEmptyStopStream(model, false);
+			if (failure === "throw") throw new Error("fallback stream failed");
+			if (failure === "timeout") return typedFirstEventTimeoutStream(model);
+			return zeroTokenEmptyStopStream(model, false, true);
+		}, 1);
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
+
+		await withTimeout(session!.prompt("settle failed local empty fallback"), "prompt");
+		await withTimeout(session!.waitForIdle(), "waitForIdle");
+
+		expect(calls).toEqual([selector(primary), selector(fallback)]);
+		expect(events.filter(event => event.type === "model_fallback_switched")).toHaveLength(1);
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+		expect(session!.messages.filter(message => message.role === "assistant")).toEqual([
+			expect.objectContaining({ stopReason: "error" }),
+		]);
+		expect(session!.isStreaming).toBe(false);
+		expect(session!.isRetrying).toBe(false);
+		expect(agent.activeRunId).toBeUndefined();
+		expect(agent.currentManagedLogicalRunId).toBeUndefined();
+	});
+
+	it.each([
+		false,
+		true,
+	])("cancels local empty fallback without accepting a late acknowledgement (late=%s)", async late => {
+		const calls: string[] = [];
+		const pending = new AssistantMessageEventStream();
+		const entered = Promise.withResolvers<void>();
+		const { agent, primary, fallback } = createSession(model => {
+			calls.push(selector(model));
+			if (calls.length === 1) return zeroTokenEmptyStopStream(model, false);
+			entered.resolve();
+			return pending;
+		}, 1);
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
+		const run = session!.prompt("cancel after local empty fallback selection");
+		await withTimeout(entered.promise, "fallback entered");
+		await session!.abort();
+		if (late) {
+			const accepted = createMockModel({ responses: [{ content: ["late accepted"] }] }).stream(fallback, {
+				systemPrompt: [],
+				messages: [],
+				tools: [],
+			});
+			for await (const event of accepted) pending.push(event);
+		}
+		await withTimeout(run, "prompt");
+		await withTimeout(session!.waitForIdle(), "waitForIdle");
+
+		expect(calls).toEqual([selector(primary), selector(fallback)]);
+		expect(events.filter(event => event.type === "agent_end")).toEqual([
+			expect.objectContaining({ stopReason: "cancelled" }),
+		]);
+		expect(
+			session!.messages.filter(message => message.role === "assistant" && message.stopReason === "stop"),
+		).toHaveLength(0);
+		expect(session!.isStreaming).toBe(false);
+		expect(session!.isRetrying).toBe(false);
+		expect(agent.activeRunId).toBeUndefined();
+		expect(agent.currentManagedLogicalRunId).toBeUndefined();
+	});
+
+	it("disposes a pending local empty fallback once and rejects late stream output", async () => {
+		const calls: string[] = [];
+		const pending = new AssistantMessageEventStream();
+		const entered = Promise.withResolvers<void>();
+		const { agent, primary, fallback } = createSession(model => {
+			calls.push(selector(model));
+			if (calls.length === 1) return zeroTokenEmptyStopStream(model, false);
+			entered.resolve();
+			return pending;
+		}, 1);
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
+		const run = session!.prompt("dispose during local empty fallback");
+		const terminals: AgentEvent[] = [];
+		agent.subscribe(event => {
+			if (event.type === "agent_end") terminals.push(event);
+		});
+		await withTimeout(entered.promise, "fallback entered");
+		await session!.dispose();
+		const disposedEventCount = events.length;
+
+		const late = createMockModel({ responses: [{ content: ["late accepted"] }] }).stream(fallback, {
+			systemPrompt: [],
+			messages: [],
+			tools: [],
+		});
+		for await (const event of late) pending.push(event);
+		await withTimeout(run, "disposed prompt");
+
+		expect(calls).toEqual([selector(primary), selector(fallback)]);
+		// Disposal disconnects the session bridge before cancelling the agent.
+		expect(events).toHaveLength(disposedEventCount);
+		expect(terminals).toEqual([expect.objectContaining({ stopReason: "cancelled" })]);
+		expect(
+			session!.messages.filter(message => message.role === "assistant" && message.stopReason === "stop"),
+		).toHaveLength(0);
+		expect(agent.activeRunId).toBeUndefined();
+		expect(agent.currentManagedLogicalRunId).toBeUndefined();
+		session = undefined;
+	});
+
 	it("does not replay a typed empty response after a managed context handler participates", async () => {
 		const calls: string[] = [];
 		let handlerCalls = 0;
@@ -481,7 +673,12 @@ describe("AgentSession managed fallback attempt transaction", () => {
 				return zeroTokenEmptyStopStream(model);
 			},
 			3,
-			{ handler: "context", onHandler: () => handlerCalls++ },
+			{
+				handler: "context",
+				onHandler: () => {
+					handlerCalls++;
+				},
+			},
 		);
 
 		await session!.prompt("do not replay an extension-observable empty response");
@@ -490,6 +687,73 @@ describe("AgentSession managed fallback attempt transaction", () => {
 		expect(handlerCalls).toBe(1);
 		expect(calls).toHaveLength(1);
 		expect(session!.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "error" });
+	});
+
+	it("does not replay an untyped promoted empty response after a managed context handler participates", async () => {
+		const calls: string[] = [];
+		let handlerCalls = 0;
+		createSession(
+			(model, _context, _options) => {
+				calls.push(selector(model));
+				return zeroTokenEmptyStopStream(model, false);
+			},
+			3,
+			{
+				handler: "context",
+				onHandler: () => {
+					handlerCalls++;
+				},
+			},
+		);
+
+		await session!.prompt("do not replay an untyped extension-observable empty response");
+		await session!.waitForIdle();
+
+		expect(handlerCalls).toBe(1);
+		expect(calls).toHaveLength(1);
+		expect(session!.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "error",
+			errorKind: "local_empty_response",
+		});
+	});
+
+	it("does not replay a promoted untyped empty stop after message_end emits a custom message", async () => {
+		let providerCalls = 0;
+		let messageEndCalls = 0;
+		createSession(
+			model => {
+				providerCalls++;
+				return zeroTokenEmptyStopStream(model, false);
+			},
+			3,
+			{
+				handler: "message_end",
+				onHandler: async () => {
+					messageEndCalls++;
+					if (messageEndCalls > 1) return;
+					await session!.sendCustomMessage({
+						customType: "empty-response-hook",
+						content: "observed empty response",
+						display: true,
+					});
+				},
+			},
+		);
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
+
+		await session!.prompt("do not repeat the executed message_end hook");
+		await session!.waitForIdle();
+
+		expect(messageEndCalls).toBeGreaterThan(0);
+		expect(providerCalls).toBe(1);
+		expect(events.filter(event => event.type === "auto_retry_start")).toHaveLength(0);
+		expect(events.filter(event => event.type === "model_fallback_switched")).toHaveLength(0);
+		const terminal = session!.messages.findLast(message => message.role === "assistant");
+		expect(terminal).toMatchObject({ stopReason: "error" });
+		if (terminal?.role !== "assistant") throw new Error("Expected terminal assistant message");
+		expect(terminal.transportFailure).toBeUndefined();
 	});
 
 	it("emits exhausted completion exactly once through the agent finalizer", async () => {
@@ -764,7 +1028,7 @@ describe("AgentSession managed fallback attempt transaction", () => {
 			content: [{ type: "text", text: "fallback accepted" }],
 		});
 	});
-	it("admits a clean typed overload successor after an empty placeholder on a committed tool attempt", async () => {
+	it("admits a clean typed overload successor after a committed tool attempt", async () => {
 		const toolCall: ToolCall = { type: "toolCall", id: "overload-tool", name: "counted", arguments: {} };
 		const tool: AgentTool = {
 			name: "counted",
@@ -800,62 +1064,38 @@ describe("AgentSession managed fallback attempt transaction", () => {
 			content: [{ type: "text", text: "overload recovered" }],
 		});
 	});
-	it("reaches the managed guard through a real Responses first-event timeout", async () => {
-		const primary = getBundledModel("openai", "gpt-5-mini");
-		const fallback = getBundledModel("anthropic", "claude-sonnet-4-5");
-		if (!primary || !fallback || primary.api !== "openai-responses") {
-			throw new Error("Expected bundled OpenAI Responses and Anthropic test models");
-		}
-		let timeoutResult: AssistantMessage | undefined;
-		let calls = 0;
-		createSession(
-			(model, context, options) => {
-				calls++;
-				if (selector(model) === selector(primary)) {
-					const stream = streamOpenAIResponses(model as Model<"openai-responses">, context, {
-						...options,
-						apiKey: "local-test-key",
-						fetch: async () =>
-							new Response(new ReadableStream<Uint8Array>({ start() {} }), {
-								status: 200,
-								headers: { "content-type": "text/event-stream" },
-							}),
-						streamFirstEventTimeoutMs: 5,
-						streamIdleTimeoutMs: 20,
-						requestMaxRetries: 0,
-					});
-					void stream.result().then(result => {
-						timeoutResult = result;
-					});
-					return stream;
-				}
-				return createMockModel({ responses: [{ content: ["real timeout recovered"] }] }).stream(
-					model,
-					context,
-					options,
-				);
+	it("commits observable typed statusless overload output without replaying or re-running context hooks", async () => {
+		let streamCalls = 0;
+		let handlerCalls = 0;
+		const { primary } = createSession(
+			model => {
+				streamCalls++;
+				return typedStatuslessOverloadWithTextStream(model);
 			},
 			1,
-			{ primaryModel: primary, fallbackModel: fallback },
+			{
+				handler: "context",
+				onHandler: () => {
+					handlerCalls++;
+				},
+			},
 		);
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
 
-		await session!.prompt("exercise real local Responses timeout");
+		await session!.prompt("commit observable typed overload output");
 		await session!.waitForIdle();
 
-		expect(calls).toBe(2);
-		expect(timeoutResult).toMatchObject({
-			role: "assistant",
-			content: [],
-			stopReason: "error",
-			usage: { input: 0, output: 0, totalTokens: 0 },
-			transportFailure: { kind: "transport", providerCode: "stream_first_event_timeout" },
-		});
+		expect(streamCalls).toBe(1);
+		expect(handlerCalls).toBe(1);
+		expect(events.filter(event => event.type === "model_fallback_switched")).toHaveLength(0);
+		expect(events.filter(event => event.type === "auto_retry_start")).toHaveLength(0);
+		expect(session!.model).toEqual(primary);
 		expect(session!.messages.at(-1)).toMatchObject({
 			role: "assistant",
-			stopReason: "stop",
-			content: [{ type: "text", text: "real timeout recovered" }],
+			stopReason: "error",
+			content: [{ type: "text", text: "already streamed" }],
 		});
-		expect(session!.messages.filter(message => message.role === "assistant")).toHaveLength(1);
 	});
 
 	it("rejects a context-handler execution in a managed timeout successor without publishing duplicate content", async () => {

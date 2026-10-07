@@ -237,6 +237,7 @@ describe("anthropic first-event timeouts", () => {
 		expect(attempt).toBe(2);
 		expect(result.stopReason).toBe("error");
 		expect(result.transportFailure?.providerCode).toBe("stream_first_event_timeout");
+		expect(result.transportFailure?.providerCode).not.toBe("empty_response");
 		expect(result.transportFailure?.retryMaxAttempts).toBe(1);
 	});
 
@@ -1403,9 +1404,9 @@ describe("anthropic SDK request timeout (stalled before headers)", () => {
 		}
 	});
 
-	it("bounds the connect/headers phase at the 300s Anthropic first-event window by default", () => {
+	it("bounds the connect/headers phase at the 600s Anthropic first-event window by default", () => {
 		const options = buildAnthropicClientOptions({ model, apiKey: "sk-ant-test" });
-		expect(options.timeout).toBe(300_000);
+		expect(options.timeout).toBe(600_000);
 	});
 
 	it("floors a short caller first-event override so slow setup is not killed", () => {
@@ -1414,7 +1415,7 @@ describe("anthropic SDK request timeout (stalled before headers)", () => {
 			apiKey: "sk-ant-test",
 			streamFirstEventTimeoutMs: 1,
 		});
-		expect(options.timeout).toBe(300_000);
+		expect(options.timeout).toBe(600_000);
 	});
 
 	it("omits the SDK timeout when the first-event watchdog is explicitly disabled", () => {

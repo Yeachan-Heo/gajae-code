@@ -13,6 +13,7 @@ import {
 	type Context,
 	codexContextOverrideKey,
 	createModelManager,
+	createTrustedStrippedModelClone,
 	Effort,
 	enrichModelThinking,
 	getBundledModels,
@@ -49,6 +50,8 @@ import {
 	readBoundedModelsJson,
 	resolveLoopbackOpenAIBaseUrl,
 } from "@gajae-code/ai/utils/discovery/openai-compatible";
+// Internal-only: registerFinalizedModelClone is not part of the public @gajae-code/ai surface
+import { registerFinalizedModelClone } from "@gajae-code/ai/utils/trusted-model-clone";
 
 // Sentinels for local-only OAuth tokens — declared inline to avoid loading provider
 // modules at startup. Must match the provider OAuth modules.
@@ -2746,20 +2749,7 @@ export class ModelRegistry {
 		}));
 	}
 	#stripModelBaseUrlQueries(models: readonly Model<Api>[]): Model<Api>[] {
-		return models.map(model => {
-			if (!model.baseUrl) return model;
-			try {
-				const parsed = new URL(model.baseUrl);
-				parsed.username = "";
-				parsed.password = "";
-				parsed.search = "";
-				parsed.hash = "";
-				return { ...model, baseUrl: parsed.toString().replace(/\/$/, "") };
-			} catch {
-				const { baseUrl: _baseUrl, ...withoutBaseUrl } = model;
-				return withoutBaseUrl as Model<Api>;
-			}
-		});
+		return models.map(model => createTrustedStrippedModelClone(model));
 	}
 	#stripUrlUserinfo(url: string | undefined): string | undefined {
 		if (!url) return url;
@@ -5029,6 +5019,14 @@ export class ModelRegistry {
 			}
 			const generated = this.#generatedAuthHeaders.get(models[index]!);
 			if (generated) this.#generatedAuthHeaders.set(result[index]!, generated);
+			// Register finalized clone as trusted if the original is trusted
+			// registerFinalizedModelClone builds a fresh trusted object from the original's snapshot
+			if (result[index]) {
+				const registeredClone = registerFinalizedModelClone(models[index]!, result[index]);
+				if (registeredClone) {
+					result[index] = registeredClone;
+				}
+			}
 		}
 		return result;
 	}
