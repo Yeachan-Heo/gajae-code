@@ -25,8 +25,8 @@ describe("lifecycle contracts regression (PR #6428)", () => {
 			);
 			await manager.setSessionFile(replacement);
 			manager.appendMessage({
-				role: "assistant",
-				content: [{ type: "text", text: "after replacement" }],
+				role: "user",
+				content: "after replacement",
 				timestamp: 2,
 			});
 			await manager.ensureOnDisk();
