@@ -4298,6 +4298,8 @@ export class AgentSession {
 	 * exposes an unowned history rewrite.
 	 */
 	#sessionTransitionKind: string | undefined;
+	// Detects transitions that begin and finish while an async preflight is staging.
+	#sessionTransitionGeneration = 0;
 	#sessionTransitionCompletion: Promise<void> = Promise.resolve();
 	#resolveSessionTransitionCompletion: (() => void) | undefined;
 	#queuedDeliveryPendingWhileTransition = false;
@@ -4380,6 +4382,7 @@ export class AgentSession {
 		if (["new-session", "switch-session", "clear-context", "fork", "branch", "navigate-tree"].includes(kind)) {
 			for (const controller of this.#configurationReloadControllers) controller.abort();
 		}
+		this.#sessionTransitionGeneration += 1;
 		this.#sessionTransitionKind = kind;
 		const completion = Promise.withResolvers<void>();
 		this.#sessionTransitionCompletion = completion.promise;
@@ -18483,49 +18486,65 @@ export class AgentSession {
 	}
 
 	async validateConfiguration(candidate: ConfigHotReloadCandidate): Promise<void> {
-		this.#assertConfigurationReloadAvailable(candidate);
-		let modelsCandidate: ModelsConfigReloadCandidate | undefined;
-		let validationError: ConfigurationReloadError | undefined;
-		try {
-			let settingsCandidate: SettingsGlobalConfigCandidate;
+		while (true) {
+			if (this.#sessionTransitionKind !== undefined) {
+				await this.#waitForSessionTransitionEnd(this.#disposeAbortController.signal);
+			}
+			this.#assertConfigurationReloadAvailable(candidate);
+			const transitionGeneration = this.#sessionTransitionGeneration;
+			let modelsCandidate: ModelsConfigReloadCandidate | undefined;
+			let validationError: ConfigurationReloadError | undefined;
 			try {
-				settingsCandidate = await this.settings.stageGlobalConfigReload(candidate.config);
-			} catch (error) {
-				throw new ConfigurationReloadError("SETTINGS_INVALID", error);
-			}
-			if (!settingsCandidate.diagnostics.valid) throw new ConfigurationReloadError("SETTINGS_INVALID");
-			try {
-				modelsCandidate = await this.#modelRegistry.stageModelsConfigReload(
-					candidate.models,
-					settingsCandidate,
-					this.credentialSessionId,
-				);
-			} catch (error) {
-				throw new ConfigurationReloadError("MODELS_INVALID", error);
-			}
-			if (!modelsCandidate.valid || !modelsCandidate.diagnostics.valid) {
-				throw new ConfigurationReloadError("MODELS_INVALID");
-			}
-			const prepared = await this.#preflightActiveProfile(settingsCandidate, modelsCandidate);
-			const chain = this.getConfiguredModelChainState("default");
-			if (!prepared || chain?.origin !== "profile-activation" || chain.identity !== this.getActiveModelProfile()) {
-				this.#updatedCurrentModel(modelsCandidate.registry);
-			}
-		} catch (error) {
-			validationError =
-				error instanceof ConfigurationReloadError
-					? error
-					: new ConfigurationReloadError("ACTIVE_PROFILE_INVALID", error);
-		} finally {
-			if (modelsCandidate) {
+				let settingsCandidate: SettingsGlobalConfigCandidate;
 				try {
-					modelsCandidate.rollback();
+					settingsCandidate = await this.settings.stageGlobalConfigReload(candidate.config);
 				} catch (error) {
-					validationError ??= new ConfigurationReloadError("VALIDATION_CLEANUP_FAILED", error);
+					throw new ConfigurationReloadError("SETTINGS_INVALID", error);
+				}
+				if (!settingsCandidate.diagnostics.valid) throw new ConfigurationReloadError("SETTINGS_INVALID");
+				try {
+					modelsCandidate = await this.#modelRegistry.stageModelsConfigReload(
+						candidate.models,
+						settingsCandidate,
+						this.credentialSessionId,
+					);
+				} catch (error) {
+					throw new ConfigurationReloadError("MODELS_INVALID", error);
+				}
+				if (!modelsCandidate.valid || !modelsCandidate.diagnostics.valid) {
+					throw new ConfigurationReloadError("MODELS_INVALID");
+				}
+				const prepared = await this.#preflightActiveProfile(settingsCandidate, modelsCandidate);
+				const chain = this.getConfiguredModelChainState("default");
+				if (!prepared || chain?.origin !== "profile-activation" || chain.identity !== this.getActiveModelProfile()) {
+					this.#updatedCurrentModel(modelsCandidate.registry);
+				}
+			} catch (error) {
+				validationError =
+					error instanceof ConfigurationReloadError
+						? error
+						: new ConfigurationReloadError("ACTIVE_PROFILE_INVALID", error);
+			} finally {
+				if (modelsCandidate) {
+					try {
+						modelsCandidate.rollback();
+					} catch (error) {
+						validationError ??= new ConfigurationReloadError("VALIDATION_CLEANUP_FAILED", error);
+					}
 				}
 			}
+
+			// A transition may have completed while staging, so checking only the active kind is insufficient.
+			if (transitionGeneration !== this.#sessionTransitionGeneration) {
+				await this.#waitForSessionTransitionEnd(this.#disposeAbortController.signal);
+				this.#assertConfigurationReloadAvailable(candidate);
+				continue;
+			}
+
+			this.#assertConfigurationReloadAvailable(candidate);
+			if (validationError) throw validationError;
+			return;
 		}
-		if (validationError) throw validationError;
 	}
 
 	async reloadConfiguration(

@@ -64,6 +64,7 @@ describe("AgentSession configuration reload", () => {
 	function modelsText(options: {
 		providerId?: string;
 		modelId?: string;
+		additionalModelId?: string;
 		api?: string;
 		name: string;
 		baseUrl: string;
@@ -91,6 +92,14 @@ describe("AgentSession configuration reload", () => {
 			`        name: ${options.name}`,
 			"        contextWindow: 32768",
 			"        maxTokens: 4096",
+			...(options.additionalModelId
+				? [
+						`      - id: ${options.additionalModelId}`,
+						"        name: Destination",
+						"        contextWindow: 32768",
+						"        maxTokens: 4096",
+					]
+				: []),
 			...(options.withProfile
 				? [
 						"profiles:",
@@ -107,11 +116,13 @@ describe("AgentSession configuration reload", () => {
 	async function createSession(options?: {
 		providerId?: string;
 		modelId?: string;
+		additionalModelId?: string;
 		api?: string;
 		withProfile?: boolean;
 		requiresProvider?: boolean;
 		apiKeyEnv?: string;
 		credentialSessionId?: string;
+		persistentSession?: boolean;
 	}) {
 		const evidenceRoot = path.resolve(import.meta.dir, "../../../.gjc/evidence/config-hot-reload");
 		await fs.mkdir(evidenceRoot, { recursive: true });
@@ -124,6 +135,7 @@ describe("AgentSession configuration reload", () => {
 			modelsText({
 				providerId: options?.providerId,
 				modelId: options?.modelId,
+				additionalModelId: options?.additionalModelId,
 				api: options?.api,
 				name: "Before",
 				baseUrl: "https://before.example/v1",
@@ -145,14 +157,17 @@ describe("AgentSession configuration reload", () => {
 			);
 		if (!initialModel) throw new Error("Expected configured test model in the real model registry");
 		const agent = new Agent({ initialState: { model: initialModel, systemPrompt: ["Test"], tools: [] } });
+		const sessionManager = options?.persistentSession
+			? SessionManager.create(tempDir!, tempDir!)
+			: SessionManager.inMemory();
 		session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager,
 			settings,
 			modelRegistry,
 			credentialSessionId: options?.credentialSessionId,
 		});
-		return { configPath, modelsPath, initialModel };
+		return { configPath, modelsPath, initialModel, sessionManager };
 	}
 
 	function candidate(
@@ -332,6 +347,126 @@ describe("AgentSession configuration reload", () => {
 			resumePublicationFence.resolve();
 			watcher.dispose();
 			publicationFenceSpy.mockRestore();
+		}
+	});
+
+	it("revalidates a watcher snapshot after an overlapping session transition", async () => {
+		const destinationModelId = "destination-model";
+		const { configPath, modelsPath, sessionManager } = await createSession({
+			additionalModelId: destinationModelId,
+			persistentSession: true,
+		});
+		const targetSessionManager = SessionManager.create(tempDir!, tempDir!);
+		targetSessionManager.appendModelChange(`${provider}/${destinationModelId}`);
+		await targetSessionManager.ensureOnDisk();
+		await targetSessionManager.flush();
+		const targetSessionFile = targetSessionManager.getSessionFile();
+		await targetSessionManager.close();
+		if (!targetSessionFile) throw new Error("Expected target session file");
+
+		const releaseTransitionFlush = Promise.withResolvers<void>();
+		const transitionFlushEntered = Promise.withResolvers<void>();
+		const originalFlush = sessionManager.flush.bind(sessionManager);
+		let heldTransitionFlush = false;
+		const flushSpy = vi.spyOn(sessionManager, "flush").mockImplementation(async () => {
+			if (!heldTransitionFlush) {
+				heldTransitionFlush = true;
+				transitionFlushEntered.resolve();
+				await releaseTransitionFlush.promise;
+			}
+			await originalFlush();
+		});
+
+		const originalStage = modelRegistry!.stageModelsConfigReload.bind(modelRegistry!);
+		const transitionStarted = Promise.withResolvers<void>();
+		const firstAvailabilityCheck = Promise.withResolvers<void>();
+		let transition: Promise<boolean> | undefined;
+		let stagedCandidateCount = 0;
+		let firstCheckModelId: string | undefined;
+		let recordedFirstCheck = false;
+		const stageSpy = vi.spyOn(modelRegistry!, "stageModelsConfigReload").mockImplementation(async (...args) => {
+			stagedCandidateCount += 1;
+			const staged = await originalStage(...args);
+			if (!transition) {
+				const originalGetAvailable = staged.registry.getAvailable.bind(staged.registry);
+				vi.spyOn(staged.registry, "getAvailable").mockImplementation(() => {
+					if (!recordedFirstCheck) {
+						recordedFirstCheck = true;
+						firstCheckModelId = session!.model?.id;
+						firstAvailabilityCheck.resolve();
+					}
+					return originalGetAvailable();
+				});
+				transition = session!.switchSession(targetSessionFile);
+				transitionStarted.resolve();
+				await transitionFlushEntered.promise;
+			}
+			return staged;
+		});
+
+		const validationResult = Promise.withResolvers<{ error?: unknown }>();
+		const applyFinished = Promise.withResolvers<void>();
+		const watcherErrors: unknown[] = [];
+		let validationStageCount = 0;
+		let applyError: unknown;
+		let applyResult: unknown;
+		const watcher = new ConfigHotReloadWatcher({
+			onValidate: async candidate => {
+				try {
+					await session!.validateConfiguration(candidate);
+					validationStageCount = stagedCandidateCount;
+					validationResult.resolve({});
+				} catch (error) {
+					validationResult.resolve({ error });
+					throw error;
+				}
+			},
+			onCandidate: async (candidate, signal) => {
+				try {
+					applyResult = await session!.reloadConfiguration(candidate, signal);
+				} catch (error) {
+					applyError = error;
+					throw error;
+				} finally {
+					applyFinished.resolve();
+				}
+			},
+			onError: error => watcherErrors.push(error),
+		});
+		try {
+			await watcher.start({ configPath, modelsPath });
+			const nextConfig = settingsText({ todoEnabled: true, compactionEnabled: false });
+			const nextModels = modelsText({
+				modelId: destinationModelId,
+				name: "Destination",
+				baseUrl: "https://before.example/v1",
+			});
+			await Promise.all([Bun.write(configPath, nextConfig), Bun.write(modelsPath, nextModels)]);
+
+			await transitionStarted.promise;
+			await firstAvailabilityCheck.promise;
+			expect(firstCheckModelId).toBe(modelId);
+			expect(session!.model?.id).toBe(modelId);
+			releaseTransitionFlush.resolve();
+			if (!transition) throw new Error("Expected overlapping session transition");
+			await expect(transition).resolves.toBe(true);
+
+			const validation = await validationResult.promise;
+			expect(validation.error).toBeUndefined();
+			expect(validationStageCount).toBeGreaterThanOrEqual(2);
+			await applyFinished.promise;
+
+			expect(applyError).toBeUndefined();
+			expect(applyResult).toMatchObject({ applied: true, settingsChanged: true });
+			expect(session!.model?.id).toBe(destinationModelId);
+			expect(session!.settings.get("todo.enabled")).toBe(true);
+			expect(watcherErrors).toEqual([]);
+		} finally {
+			releaseTransitionFlush.resolve();
+			watcher.dispose();
+			stageSpy.mockRestore();
+			flushSpy.mockRestore();
+			await transition?.catch(() => {});
 		}
 	});
 
