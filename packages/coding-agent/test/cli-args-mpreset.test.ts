@@ -73,6 +73,7 @@ function fakeSession(initial: Model | null = model("initial-provider", "initial"
 		model: initial ?? undefined,
 		thinkingLevel: undefined as ThinkingLevel | undefined,
 		unavailableModelProfile: undefined as string | undefined,
+		defaultModelSelectionMutationRevision: 0,
 		sessionId: "session-1",
 		credentialSessionId: "credential-session-1",
 		setModelTemporaryCalls: [] as Array<{
@@ -90,10 +91,12 @@ function fakeSession(initial: Model | null = model("initial-provider", "initial"
 			thinkingLevel?: ThinkingLevel,
 			options?: { persistAsSessionDefault?: boolean; cause?: string },
 		) {
+			session.defaultModelSelectionMutationRevision++;
 			session.setModelTemporaryCalls.push({ model: next, thinkingLevel, options });
 			session.model = next;
 			session.thinkingLevel = thinkingLevel;
 		},
+		getDefaultModelSelectionMutationRevision: () => session.defaultModelSelectionMutationRevision,
 		getConfiguredModelChain: () => undefined,
 		hasRecoveredDefaultFallbackChain: () => false,
 		setUnavailableModelProfile(name: string | undefined) {
@@ -1028,6 +1031,50 @@ test("interactive startup keeps the provisional model and marks a default profil
 	expect(session.model).toBe(provisionalModel);
 	expect(session.getUnavailableModelProfile()).toBe(profile.name);
 	expect(base.refreshInBackgroundCalls).toEqual([]);
+});
+
+test("interactive startup does not retry a profile after a user selects a model during recovery", async () => {
+	const profile: ModelProfileDefinition = {
+		name: "deferred-profile",
+		requiredProviders: ["profile-provider"],
+		modelMapping: { default: "profile-provider/default" },
+		source: "user",
+	};
+	const session = fakeSession(model("fallback-provider", "provisional"));
+	const selectedModel = model("user-provider", "selected");
+	const base = fakeRegistry([profile]);
+	let credentialAvailable = false;
+	const authStorage = {
+		reload: vi.fn(async () => {
+			credentialAvailable = true;
+			await session.setModelTemporary(selectedModel, undefined, { cause: "user-selection" });
+		}),
+		hasRuntimeApiKey: () => credentialAvailable,
+		hasLiteralConfigApiKey: () => false,
+		hasSessionCredentialUnavailable: () => false,
+	};
+	const registry = {
+		...base,
+		authStorage,
+		getApiKeyForProvider: async () => (credentialAvailable ? "fresh-key" : undefined),
+	};
+
+	const result = await applyStartupModelProfilesForRoot({
+		session,
+		settings: Settings.isolated(),
+		modelRegistry: registry as never,
+		parsedArgs: { mpreset: profile.name },
+		isInteractive: true,
+		hasInteractiveTerminal: true,
+		initialMessage: undefined,
+		initialMessages: [],
+		resumeAction: undefined,
+	});
+
+	expect(authStorage.reload).toHaveBeenCalledTimes(1);
+	expect(result.recoverableErrors).toHaveLength(1);
+	expect(session.model).toBe(selectedModel);
+	expect(session.setModelTemporaryCalls.map(call => call.model)).toEqual([selectedModel]);
 });
 
 test("interactive startup refreshes and applies an unknown default profile when it appears in the catalog", async () => {
