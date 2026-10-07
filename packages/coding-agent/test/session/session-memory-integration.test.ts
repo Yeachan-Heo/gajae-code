@@ -3745,6 +3745,60 @@ describe("whole-session persistence freshness", () => {
 		await expect(manager.close()).resolves.toBeUndefined();
 		expect(storage.closeDispatches).toBe(failures + 1);
 	});
+	it("retires a close error after a later rewrite-debt retry succeeds", async () => {
+		class RewriteDebtCloseStorage extends MemorySessionStorage {
+			closeDispatches = 0;
+			rewriteCloseFailures = 1;
+			override openWriter(filePath: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter {
+				if (filePath.includes(".spill.")) return super.openWriter(filePath, options);
+				return super.openWriter(filePath, {
+					...options,
+					closeAdapter: {
+						close: () => {
+							if (options?.flags === "w" && this.rewriteCloseFailures > 0) {
+								this.rewriteCloseFailures--;
+								throw new SessionStorageWriterRetryableCloseError("injected_rewrite_close");
+							}
+							this.closeDispatches++;
+							if (this.closeDispatches === 1)
+								throw new SessionStorageWriterRetryableCloseError("injected_writer_close");
+						},
+					},
+				});
+			}
+		}
+		const storage = new RewriteDebtCloseStorage();
+		const sessionFile = "/sessions/retryable-rewrite-debt.jsonl";
+		storage.writeTextSync(
+			sessionFile,
+			`${JSON.stringify({ type: "session", version: 5, id: "retryable-rewrite-debt", timestamp: "0", cwd: "/cwd" })}\n`,
+		);
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"off",
+		);
+		try {
+			const entryId = manager.appendCustomMessageEntry("retryable-rewrite-debt", "before", true);
+			await manager.flush();
+			await expect(manager.close()).rejects.toThrow("injected_writer_close");
+
+			const entry = manager.getEntry(entryId);
+			if (entry?.type !== "custom_message") throw new Error("Expected custom message entry");
+			manager.applyCustomMessageEntryUpdates([{ ...entry, content: "after" }]);
+			await expect(manager.close()).rejects.toThrow("injected_rewrite_close");
+
+			// The writer-close error is now resolved, while the rewrite debt remains.
+			// A later close must finish that rewrite and retire the obsolete error.
+			await expect(manager.close()).resolves.toBeUndefined();
+			expect(storage.readTextSync(sessionFile)).toContain('"content":"after"');
+			await expect(manager.close()).resolves.toBeUndefined();
+		} finally {
+			await manager.close().catch(() => {});
+		}
+	});
 	it("reprepares queued patches when a direct append invalidates their persistence token", async () => {
 		const storage = new MemorySessionStorage();
 		const sessionFile = "/sessions/patch-race.jsonl";

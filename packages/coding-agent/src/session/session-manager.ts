@@ -16943,9 +16943,6 @@ export class SessionManager {
 		}
 		let closeError: unknown;
 		let taskStarted = false;
-		const retryingCertifiedWriterClose =
-			this.#closeRetryPending && this.#persistWriter?.getCloseState() === "close_failed_retryable";
-		const retryingCertifiedWriterError = retryingCertifiedWriterClose ? this.#closeRetryOriginError : undefined;
 		try {
 			await this.#queuePersistTask(
 				async () => {
@@ -16959,11 +16956,11 @@ export class SessionManager {
 				{ ignoreError: this.#closeRetryPending },
 			);
 			if (
-				retryingCertifiedWriterClose &&
+				this.#closeRetryOriginError &&
 				!this.#persistWriter &&
 				!this.#needsFullRewriteOnNextPersist &&
 				!this.#strictResumeMutationPending &&
-				this.#persistError === retryingCertifiedWriterError
+				this.#persistError === this.#closeRetryOriginError
 			) {
 				// Only the original certified writer-close failure becomes obsolete
 				// after closure. Lifecycle/publication errors must remain observable.
