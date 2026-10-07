@@ -10440,6 +10440,7 @@ export class SessionManager {
 				lifecycleIdAdopted: this.#lifecycleIdAdopted,
 				persistChain: this.#persistChain,
 				persistError: this.#persistError,
+				closeRetryOriginError: this.#closeRetryOriginError,
 				persistErrorReported: this.#persistErrorReported,
 				sessionId: this.#sessionId,
 				sessionName: this.#sessionName,
@@ -10464,6 +10465,7 @@ export class SessionManager {
 				this.#lifecycleIdAdopted = previous.lifecycleIdAdopted;
 				this.#persistChain = previous.persistChain;
 				this.#persistError = previous.persistError;
+				this.#closeRetryOriginError = previous.closeRetryOriginError;
 				this.#persistErrorReported = previous.persistErrorReported;
 				this.#sessionId = previous.sessionId;
 				this.#sessionName = previous.sessionName;
