@@ -790,6 +790,7 @@ function managedAssistantMessageHasContent(failure: unknown): boolean {
 		return type === "redactedThinking" || type === "toolCall";
 	});
 }
+
 // AI owns provider-originated authority. The agent loop owns authority for
 // the rebuilt message objects it creates; this second WeakSet is deliberately
 // module-private so a public AI consumer cannot transfer authority to an
@@ -805,7 +806,7 @@ function isManagedProviderSafetyStopAuthenticated(value: unknown): boolean {
 	);
 }
 
-function managedRetryableFailure(failure: unknown): boolean {
+function managedRetryableFailure(failure: unknown, transaction?: ManagedAttemptTransaction): boolean {
 	if (
 		managedProperty(failure, "stopReason") === "error" &&
 		managedProperty(failure, "errorKind") === "local_empty_response"
@@ -814,18 +815,16 @@ function managedRetryableFailure(failure: unknown): boolean {
 	}
 	const facts = managedTransportFailure(failure);
 	if (!facts) return false;
-	// OpenAI's typed statusless capacity-overload code (issue #5018) never
-	// becomes managed transaction authority. Before the code survived as
-	// transport facts this failure produced none, so the staged attempt was
-	// always committed; the shared Responses parser and Codex events now carry
-	// it, and this check preserves that committed-failure behavior instead of
-	// discarding the transaction. It reads only typed facts, never error text.
+	// OpenAI's typed statusless capacity-overload code (issue #5018) is
+	// discardable only while the current managed attempt has no observable
+	// output. The session owns the retry decision; this check only protects the
+	// transaction boundary and reads typed facts, never error text.
 	if (
 		facts.status === undefined &&
 		facts.providerCode === SERVER_OVERLOADED_PROVIDER_CODE &&
 		(facts.openaiErrorCode === undefined || facts.openaiErrorCode === SERVER_OVERLOADED_PROVIDER_CODE)
 	) {
-		return false;
+		return !(transaction?.hasObservableAssistantOutput() ?? managedAssistantMessageHasContent(failure));
 	}
 	// A typed provider safety stop is terminal evidence ahead of any transport
 	// class, but only with adapter-minted provenance: unauthenticated labels
@@ -2892,6 +2891,7 @@ class ManagedAttemptTransaction {
 			);
 		});
 	}
+
 	flush(): void {
 		if (this.#discarded) return;
 		for (const item of this.#batch) {
@@ -4017,7 +4017,7 @@ async function runLoopBody(
 						stream.end(newMessages);
 						return;
 					}
-					if (config.fallbackManaged && transaction && managedRetryableFailure(err)) {
+					if (config.fallbackManaged && transaction && managedRetryableFailure(err, transaction)) {
 						transaction.discard();
 						currentContext.messages.splice(contextMessageCount);
 						newMessages.splice(newMessageCount);
@@ -4289,7 +4289,11 @@ async function runLoopBody(
 					: "Provider returned an empty response with anomalously low token usage (possible context overflow via proxy)";
 			}
 
-			if (config.fallbackManaged && message.stopReason === "error" && managedRetryableFailure(message)) {
+			if (
+				config.fallbackManaged &&
+				message.stopReason === "error" &&
+				managedRetryableFailure(message, transaction)
+			) {
 				transaction?.discard();
 				currentContext.messages.splice(contextMessageCount);
 				newMessages.splice(newMessageCount);
