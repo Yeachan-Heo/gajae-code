@@ -5,10 +5,13 @@ import * as path from "node:path";
 import * as url from "node:url";
 import * as zlib from "node:zlib";
 import type { AgentToolContext } from "@gajae-code/agent-core";
+import { getBundledModel } from "@gajae-code/ai";
 import { AsyncJobManager } from "@gajae-code/coding-agent/async";
 import { DEFAULT_BASH_INTERCEPTOR_RULES, Settings } from "@gajae-code/coding-agent/config/settings";
 import { EditTool } from "@gajae-code/coding-agent/edit";
+import { type CreateAgentSessionResult, createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { saveAgentBashOriginalArtifact } from "@gajae-code/coding-agent/session/agent-session";
+import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import type { ClientBridge } from "@gajae-code/coding-agent/session/client-bridge";
 import type { FoldAdapter } from "@gajae-code/coding-agent/session/fold-coordinator";
 import { type PreparedNewSession, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
@@ -1461,23 +1464,196 @@ function b() {
 			}
 		});
 
-		it("does not expose nonpersistent user-bang artifact ids", async () => {
-			let savedType: string | undefined;
-			const result = await saveAgentBashOriginalArtifact(
-				{
-					saveArtifact: async (_content, type) => {
-						savedType = type;
-						return "memory-only-id";
-					},
-					getArtifactPath: async () => null,
-				},
-				"raw user-bang output",
+		it("does not expose ids from a retired session artifact publisher", async () => {
+			const sessionFile = path.join(testDir, "retired-publisher.jsonl");
+			await Bun.write(
+				sessionFile,
+				`${JSON.stringify({ type: "session", version: 5, id: "retired-publisher", timestamp: "0", cwd: testDir })}\n`,
 			);
+			const manager = await SessionManager.open(
+				sessionFile,
+				SessionManager.explicitDestination(testDir),
+				new FileSessionStorage(),
+			);
+			let prepared: PreparedNewSession | undefined;
+			try {
+				const publication = manager.captureArtifactPublication();
+				prepared = await manager.prepareFork();
+				if (!prepared) throw new Error("expected a prepared successor session");
+				manager.commitPreparedNewSession(prepared);
+				prepared = undefined;
 
-			expect(savedType).toBe("bash-original");
-			expect(result).toEqual({ status: "unavailable" });
-			expect(JSON.stringify(result)).not.toContain("artifact://");
+				const result = await saveAgentBashOriginalArtifact(publication, "raw output from a retired publisher");
+				expect(result.status).toBe("failed");
+				if (result.status !== "failed") throw new Error("expected retired publication to fail closed");
+				expect(result.diagnostic).toContain("Session artifact continuation is no longer authorized.");
+				expect(JSON.stringify(result)).not.toContain("artifact://");
+			} finally {
+				if (prepared) await manager.discardPreparedNewSession(prepared);
+				await manager.close();
+			}
 		});
+
+		it("publishes direct SDK Bash originals only to the session active at execution entry", async () => {
+			const bashCwd = path.join(testDir, "sdk-bash-cwd");
+			fs.mkdirSync(bashCwd);
+			const changedFile = path.join(bashCwd, "output.txt");
+			const git = (...args: string[]): void => {
+				const result = Bun.spawnSync(["git", "-C", bashCwd, ...args], { stdout: "pipe", stderr: "pipe" });
+				if (result.exitCode !== 0) {
+					throw new Error(`git ${args.join(" ")} failed: ${result.stderr.toString("utf8")}`);
+				}
+			};
+			git("init", "--quiet");
+			git("config", "user.name", "GJC test");
+			git("config", "user.email", "gjc-test@example.invalid");
+			await Bun.write(changedFile, "baseline\n");
+			git("add", "--", "output.txt");
+			git("commit", "--quiet", "-m", "baseline");
+			const expectedOriginal = `${Array.from({ length: 6_000 }, (_, index) => `changed-${index}-界`).join("\n")}\n`;
+			await Bun.write(changedFile, expectedOriginal);
+			const bashCommand = "git diff --no-color --unified=0 -- output.txt";
+			const expectedDiff = Bun.spawnSync(
+				["git", "-C", bashCwd, "diff", "--no-color", "--unified=0", "--", "output.txt"],
+				{ stdout: "pipe", stderr: "pipe" },
+			).stdout.toString("utf8");
+			const sessionFile = path.join(testDir, "sdk-bash-session.jsonl");
+			await Bun.write(
+				sessionFile,
+				`${JSON.stringify({ type: "session", version: 5, id: "sdk-bash-source", timestamp: "0", cwd: bashCwd })}\n`,
+			);
+			const manager = await SessionManager.open(
+				sessionFile,
+				SessionManager.explicitDestination(testDir),
+				new FileSessionStorage(),
+			);
+			const authStorage = await AuthStorage.create(path.join(testDir, "sdk-bash-auth.db"));
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("expected bundled Anthropic test model");
+			const hookStarted = Promise.withResolvers<void>();
+			const releaseHook = Promise.withResolvers<void>();
+			let holdHook = false;
+			let created: CreateAgentSessionResult | undefined;
+			let prepared: PreparedNewSession | undefined;
+			const captureSpy = vi.spyOn(manager, "captureArtifactPublication");
+			try {
+				created = await createAgentSession({
+					cwd: bashCwd,
+					agentDir: testDir,
+					authStorage,
+					model,
+					sessionManager: manager,
+					settings: Settings.isolated({ "shellMinimizer.enabled": true, "compaction.enabled": false }),
+					disableExtensionDiscovery: true,
+					extensions: [
+						pi => {
+							pi.on("user_bash", async event => {
+								if (!holdHook || event.command !== bashCommand) return;
+								holdHook = false;
+								hookStarted.resolve();
+								await releaseHook.promise;
+							});
+						},
+					],
+					skills: [],
+					contextFiles: [],
+					promptTemplates: [],
+					slashCommands: [],
+					enableMCP: false,
+					enableLsp: false,
+					notificationHostModeSupported: false,
+					sdkHostModeSupported: false,
+				});
+				captureSpy.mockClear();
+
+				const sourceResult = await created.session.executeBash(bashCommand);
+				const sourceArtifactId = /\[raw output: artifact:\/\/([^\]\s]+)\]/u.exec(sourceResult.output)?.[1];
+				expect(sourceArtifactId).toBeDefined();
+				if (!sourceArtifactId) throw new Error("expected direct SDK Bash to publish its minimized original output");
+				const sourceArtifactPath = await manager.getArtifactPath(sourceArtifactId);
+				expect(sourceArtifactPath).toBe(
+					path.join(sessionFile.slice(0, -6), `${sourceArtifactId}.bash-original.log`),
+				);
+				if (!sourceArtifactPath) throw new Error("expected direct SDK Bash original artifact path");
+				expect(await Bun.file(sourceArtifactPath).bytes()).toEqual(Buffer.from(expectedDiff, "utf8"));
+				expect(captureSpy).toHaveBeenCalledTimes(1);
+
+				prepared = await manager.prepareFork();
+				if (!prepared?.sessionFile) throw new Error("expected a prepared SDK successor session");
+				const successorSessionFile = prepared.sessionFile;
+				const successorArtifactsDir = successorSessionFile.slice(0, -6);
+				const readSuccessorInventory = async (): Promise<Map<string, Uint8Array<ArrayBuffer> | null>> => {
+					const inventory = new Map<string, Uint8Array<ArrayBuffer> | null>();
+					const visit = async (relativeDirectory: string): Promise<void> => {
+						const entries = fs.readdirSync(path.join(successorArtifactsDir, relativeDirectory), {
+							withFileTypes: true,
+						});
+						entries.sort((left, right) => left.name.localeCompare(right.name));
+						for (const entry of entries) {
+							const relativePath = path.join(relativeDirectory, entry.name);
+							if (entry.isDirectory()) {
+								inventory.set(`${relativePath}/`, null);
+								await visit(relativePath);
+							} else if (entry.isFile()) {
+								inventory.set(
+									relativePath,
+									await Bun.file(path.join(successorArtifactsDir, relativePath)).bytes(),
+								);
+							} else {
+								throw new Error(`unexpected successor artifact entry: ${relativePath}`);
+							}
+						}
+					};
+					if (fs.existsSync(successorArtifactsDir)) await visit("");
+					return inventory;
+				};
+				const successorInventoryBefore = await readSuccessorInventory();
+				expect(successorInventoryBefore.get(`${sourceArtifactId}.bash-original.log`)).toEqual(
+					Buffer.from(expectedDiff, "utf8"),
+				);
+				expect(successorInventoryBefore.has(`.artifact-id-${sourceArtifactId}`)).toBe(true);
+				captureSpy.mockClear();
+
+				holdHook = true;
+				const staleExecution = created.session.executeBash(bashCommand);
+				await hookStarted.promise;
+				expect(captureSpy).toHaveBeenCalledTimes(1);
+				manager.commitPreparedNewSession(prepared);
+				prepared = undefined;
+				releaseHook.resolve();
+				const staleResult = await staleExecution;
+				expect(staleResult.output).toContain("File: output.txt");
+				expect(staleResult.output).toContain("Bash output artifact save failed");
+				expect(staleResult.output).not.toContain("artifact://");
+				expect(await readSuccessorInventory()).toEqual(successorInventoryBefore);
+
+				const successorResult = await created.session.executeBash(bashCommand);
+				const successorArtifactId = /\[raw output: artifact:\/\/([^\]\s]+)\]/u.exec(successorResult.output)?.[1];
+				expect(successorArtifactId).toBeDefined();
+				if (!successorArtifactId) throw new Error("expected fresh successor Bash original publication");
+				expect(successorArtifactId).not.toBe(sourceArtifactId);
+				const successorArtifactPath = await manager.getArtifactPath(successorArtifactId);
+				expect(successorArtifactPath).toBe(
+					path.join(successorArtifactsDir, `${successorArtifactId}.bash-original.log`),
+				);
+				if (!successorArtifactPath) throw new Error("expected successor Bash original artifact path");
+				expect(await Bun.file(successorArtifactPath).bytes()).toEqual(Buffer.from(expectedDiff, "utf8"));
+				const inheritedArtifactPath = await manager.getArtifactPath(sourceArtifactId);
+				expect(inheritedArtifactPath).toBe(
+					path.join(successorArtifactsDir, `${sourceArtifactId}.bash-original.log`),
+				);
+				if (!inheritedArtifactPath) throw new Error("expected inherited source Bash original artifact path");
+				expect(await Bun.file(inheritedArtifactPath).bytes()).toEqual(Buffer.from(expectedDiff, "utf8"));
+				expect(captureSpy).toHaveBeenCalledTimes(2);
+			} finally {
+				releaseHook.resolve();
+				if (prepared) await manager.discardPreparedNewSession(prepared);
+				captureSpy.mockRestore();
+				if (created) await created.session.dispose();
+				else await manager.close();
+				authStorage.close();
+			}
+		}, 30_000);
 
 		it("executes Bash with a captured original publisher across async preparation and session commit", async () => {
 			const firstCwd = path.join(testDir, "first-cwd");
@@ -1588,7 +1764,6 @@ function b() {
 				await manager.close();
 			}
 		});
-
 		it(
 			"keeps real Bash and Monitor publishers bound across preparation and session commits",
 			async () => {
@@ -1796,7 +1971,6 @@ function b() {
 			if (!baselinePath) throw new Error("expected the published baseline artifact path");
 			expect(path.basename(baselinePath)).toBe(`${baselineId}.bash.log`);
 			expect(await Bun.file(baselinePath).text()).toBe("enabled publisher baseline");
-
 			const blockedArtifactDirectory = path.join(testDir, "missing-bash-artifact-parent");
 			await Bun.write(blockedArtifactDirectory, "not a directory");
 			const blockedSessionFile = `${blockedArtifactDirectory}.jsonl`;

@@ -49,6 +49,7 @@ Stdout and stderr are merged before the model sees them. Non-zero exit codes are
 
 ## Flow
 Before asynchronous preparation, Bash and Monitor capture the originating session's private artifact publisher. That same callback follows foreground, background, managed, client-terminal, and PTY output; a committed session transition or closed owner cannot redirect retained output into its successor.
+Direct SDK `AgentSession.executeBash()` also captures its minimized-original publisher before awaited `user_bash` hooks. Its original-output helper consumes that retained callback directly rather than looking up the current manager or artifact path after execution.
 
 1. `BashTool.execute()` in `packages/coding-agent/src/tools/bash.ts` reads `command`, normalizes `env`, and defaults `timeout` to `300`.
 2. If `cwd` is absent, it rewrites a leading `cd <path> && ...` into the structured `cwd` field and strips that prefix from `command`.
