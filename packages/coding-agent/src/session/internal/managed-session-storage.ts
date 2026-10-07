@@ -33,6 +33,7 @@ type NativeManagedSessionStorage = Pick<
 	| "exactUnlinkDirect"
 	| "linkNoReplacePath"
 	| "linkNoReplacePathAsync"
+	| "migrateAdministratorsOwnerIfExpected"
 	| "openRecoveryFsRoot"
 	| "renameNoReplacePath"
 	| "renameNoReplacePathAsync"
@@ -40,7 +41,7 @@ type NativeManagedSessionStorage = Pick<
 	| "snapshotDirectoryTree"
 	| "verifyOwnerOnlyFdSecurity"
 	| "verifyOwnerOnlyPathSecurity"
-	| "verifyOwnerOnlyPathSecurityExpected"
+	| "verifyOwnerOnlyPathSecurityExpected";
 >;
 
 function nativeSessionStorage(): NativeManagedSessionStorage {
@@ -1465,6 +1466,30 @@ function secureExistingManagedDirectory(pathname: string, kind: "directory" | "f
 	);
 	assertManagedPathIdentity(pathname, kind, named);
 	if (verified.ok) return;
+
+	// Handle owner mismatch by attempting to migrate Administrators-owned roots.
+	// This provides a recovery path for existing managed roots on Windows that were
+	// created with elevated privileges and have Administrators ownership.
+	if (verified.code === "owner_mismatch" && process.platform === "win32") {
+		const migrated = validateNativeSecurityResult(
+			nativeSessionStorage().migrateAdministratorsOwnerIfExpected(
+				pathname,
+				kind,
+				canonicalFileId(named.dev),
+				canonicalFileId(named.ino),
+			),
+			"migrate",
+			kind,
+		);
+		if (migrated.ok) {
+			assertManagedPathIdentity(pathname, kind, named);
+			return;
+		}
+		// If migration fails, fall through to throw the original error.
+		// This could happen if the owner is not Administrators or the migration failed for another reason.
+		throw securityError(pathname, verified);
+	}
+
 	if (verified.code !== "acl_verify_failed") throw securityError(pathname, verified);
 	const repaired = validateNativeSecurityResult(
 		nativeSessionStorage().repairOwnerOnlyPathSecurityExpected(
