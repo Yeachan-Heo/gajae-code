@@ -51,13 +51,6 @@ export function resolveSkillScopeTrust(
 	return DEFAULT_SKILL_SCOPE_TRUST;
 }
 
-/** Resolve permission to read a user's external skill symlinks from user-owned config only. */
-export function resolveGlobalUserSkillLinkTrust(
-	settings: Pick<SkillDiscoverySettings, "trustUserSkills" | "enablePiUser">,
-): boolean {
-	return resolveSkillScopeTrust(settings, "user");
-}
-
 export const DEFAULT_SKILL_DISCOVERY_SETTINGS: SkillDiscoverySettings = {
 	enabled: true,
 	enableSkillCommands: true,

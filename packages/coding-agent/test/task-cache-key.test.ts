@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai/models";
 import type { Message, ProviderSessionState } from "@gajae-code/ai/types";
-import { Snowflake } from "@gajae-code/utils";
+import { Snowflake, stablePathKey } from "@gajae-code/utils";
 import { AsyncJobManager, asyncJobEndpointId } from "../src/async";
 import { Settings } from "../src/config/settings";
 import { createAgentSession } from "../src/sdk";
@@ -161,8 +161,6 @@ describe("async job endpoint id derivation", () => {
 		tempDirs.push(tempDir);
 		const sessionFile1 = path.join(tempDir, "Session.jsonl");
 		const sessionFile2 = path.join(tempDir, "session.jsonl");
-		const endpoint1Before = asyncJobEndpointId("provider", "logical-id", sessionFile1);
-		const endpoint2Before = asyncJobEndpointId("provider", "logical-id", sessionFile2);
 		fs.writeFileSync(sessionFile1, "");
 		const endpoint1 = asyncJobEndpointId("provider", "logical-id", sessionFile1);
 
@@ -176,11 +174,8 @@ describe("async job endpoint id derivation", () => {
 
 		const endpoint2 = asyncJobEndpointId("provider", "logical-id", sessionFile2);
 
-		// Case-insensitive Windows directories resolve aliases even before creation;
-		// case-sensitive directories keep distinct names separate.
-		expect(endpoint1Before === endpoint2Before).toBe(!distinctCaseSensitiveFiles);
-		expect(endpoint1).toBe(endpoint1Before);
-		expect(endpoint2).toBe(endpoint2Before);
+		// Case-insensitive Windows directories resolve aliases to the recorded
+		// entry spelling; case-sensitive directories allow distinct files and keys.
 		expect(endpoint1 === endpoint2).toBe(!distinctCaseSensitiveFiles);
 	});
 });
@@ -336,7 +331,11 @@ describe("task fork-context provider identity", () => {
 		const previousSessionFile = session.sessionManager.getSessionFile();
 		expect(previousSessionFile).toBeDefined();
 		expect(fs.existsSync(previousSessionFile!)).toBe(false);
-		const previousEndpoint = asyncJobEndpointId(providerSessionId, previousSessionId, previousSessionFile);
+		const previousEndpoint = JSON.stringify([
+			"async-job-endpoint",
+			providerSessionId,
+			stablePathKey(path.resolve(previousSessionFile!)),
+		]);
 		const manager = AsyncJobManager.forEndpoint(previousEndpoint);
 		expect(manager).toBeDefined();
 		session.sessionManager.appendMessage({
@@ -358,11 +357,11 @@ describe("task fork-context provider identity", () => {
 		const successorSessionFile = session.sessionManager.getSessionFile();
 		expect(successorSessionFile).toBeDefined();
 		expect(session.sessionManager.getSessionId()).not.toBe(previousSessionId);
-		const successorEndpoint = asyncJobEndpointId(
+		const successorEndpoint = JSON.stringify([
+			"async-job-endpoint",
 			providerSessionId,
-			session.sessionManager.getSessionId(),
-			successorSessionFile,
-		);
+			stablePathKey(path.resolve(successorSessionFile!)),
+		]);
 		expect(AsyncJobManager.forEndpoint(previousEndpoint)).toBeUndefined();
 		expect(AsyncJobManager.forEndpoint(successorEndpoint)).toBe(manager);
 

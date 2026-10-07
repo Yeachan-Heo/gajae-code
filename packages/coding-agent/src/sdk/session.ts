@@ -91,7 +91,6 @@ import type { BashRestrictionProfile } from "../tools/bash-allowed-prefixes";
 import { SearchTool } from "../tools/search";
 import "../discovery";
 import { resolveConfigValue } from "../config/resolve-config-value";
-import { resolveGlobalUserSkillLinkTrust } from "../config/skill-settings-defaults";
 import { getEmbeddedDefaultGjcSkills } from "../defaults/gjc-defaults";
 import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } from "../defaults/gjc-grok-cli";
 import { initializeWithSettings, releaseSettingsScope } from "../discovery";
@@ -2431,10 +2430,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				profileAuthority,
 				cwd,
 				disabledExtensions: settings.get("disabledExtensions"),
-				allowExternalUserSkillSymlinks: resolveGlobalUserSkillLinkTrust({
-					trustUserSkills: settings.getGlobal("skills.trustUserSkills"),
-					enablePiUser: settings.getGlobal("skills.enablePiUser"),
-				}),
 			});
 			skills = withEmbeddedDefaultGjcSkills(skillsResult.skills);
 			skillWarnings = skillsResult.warnings;
@@ -5408,10 +5403,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 									profileAuthority,
 									cwd: reloadCwd,
 									disabledExtensions: settings.get("disabledExtensions"),
-									allowExternalUserSkillSymlinks: resolveGlobalUserSkillLinkTrust({
-										trustUserSkills: settings.getGlobal("skills.trustUserSkills"),
-										enablePiUser: settings.getGlobal("skills.enablePiUser"),
-									}),
 								});
 								return { skills: withEmbeddedDefaultGjcSkills(reloaded.skills), warnings: reloaded.warnings };
 							}

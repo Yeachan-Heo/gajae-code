@@ -766,7 +766,7 @@ async function confirmImport(count: number): Promise<boolean> {
 }
 
 /**
- * Discover existing Claude Code / Codex CLI / Kiro CLI credentials and import them into the
+ * Discover existing Claude Code / Codex CLI credentials and import them into the
  * gjc credential store after a redacted preview + confirmation. Falls back to
  * manual-setup guidance when nothing importable is found.
  */
@@ -834,7 +834,7 @@ export async function handleCredentialsSetup(
 			for (const line of formatDiscoverySummary(filteredResult)) process.stdout.write(`  ${line}\n`);
 			process.stdout.write(
 				chalk.yellow(
-					`\nNo importable Claude/Codex/Kiro CLI credentials found. Continue with manual setup:\n` +
+					`\nNo importable Claude/Codex credentials found. Continue with manual setup:\n` +
 						`  ${APP_NAME} setup provider   (add an API-compatible provider)\n` +
 						`  ${APP_NAME} (then /login)     (interactive OAuth/subscription login)\n`,
 				),
@@ -930,7 +930,7 @@ ${chalk.bold("Components:")}
   provider  Optional: add a preset, OpenAI-compatible, or Anthropic-compatible API provider
   python    Optional: verify a Python 3 interpreter is reachable for code execution
   stt       Optional: install speech-to-text dependencies (openai-whisper, recording tools)
-  credentials Optional: import existing Claude Code / Codex CLI / Kiro CLI credentials
+  credentials Optional: import existing Claude Code / Codex CLI credentials
 
 
 ${chalk.bold("Provider example:")}
@@ -998,7 +998,7 @@ ${chalk.bold("Examples:")}
   ${APP_NAME} setup stt              Install speech-to-text dependencies
   ${APP_NAME} setup stt --check      Check if STT dependencies are available
   ${APP_NAME} setup python --check   Check if Python execution is available
-  ${APP_NAME} setup credentials      Discover & import existing Claude/Codex/Kiro CLI credentials
+  ${APP_NAME} setup credentials      Discover & import existing Claude/Codex credentials
   ${APP_NAME} setup credentials --dry-run  Preview importable credentials (redacted)
   ${APP_NAME} setup credentials --yes      Import without an interactive prompt
   ${APP_NAME} setup paseo            Register GJC as a Paseo ACP provider
