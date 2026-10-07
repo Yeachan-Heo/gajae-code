@@ -6,6 +6,7 @@ import { createMockModel, registerMockApi } from "@gajae-code/ai/providers/mock"
 import { logger, TempDir } from "@gajae-code/utils";
 import { AsyncJobManager } from "../src/async";
 import { Settings } from "../src/config/settings";
+import { __sessionStateSidecarTestHooks } from "../src/gjc-runtime/session-state-sidecar";
 import { createAcpClientBridge } from "../src/modes/acp/acp-client-bridge";
 import { type CreateAgentSessionResult, createAgentSession } from "../src/sdk";
 import { ArtifactManager } from "../src/session/artifacts";
@@ -25,6 +26,7 @@ let authStorage: AuthStorage | undefined;
 let tempDir: TempDir | undefined;
 let sessionManager: SessionManager | undefined;
 const restoreSpies: Array<() => void> = [];
+const terminalExits = new Set<PromiseWithResolvers<{ exitCode: number | null; signal: string | null }>>();
 
 function trackSpy<T extends { mockRestore(): void }>(spy: T): T {
 	restoreSpies.push(() => spy.mockRestore());
@@ -56,6 +58,7 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<voi
 }
 
 async function createProductionSession(modelStartsBash = false, persist = true, bashRuns = 1) {
+	if (created) throw new Error("Previous SDK fixture teardown has not settled.");
 	const fixtureTempDir = TempDir.createSync("@gjc-sdk-fold-acp-");
 	tempDir = fixtureTempDir;
 	registerMockApi();
@@ -107,6 +110,7 @@ async function createProductionSession(modelStartsBash = false, persist = true, 
 async function foldClientTerminal(output: string, callId: string, modelStartsBash = false): Promise<FoldedTerminal> {
 	if (!created) throw new Error("SDK session was not created");
 	const exit = Promise.withResolvers<{ exitCode: number | null; signal: string | null }>();
+	terminalExits.add(exit);
 	let releaseCount = 0;
 	const terminal: ClientBridgeTerminalHandle = {
 		terminalId: `sdk-acp-fold-terminal-${callId}`,
@@ -184,24 +188,110 @@ async function cancelFoldedTerminal(folded: FoldedTerminal): Promise<void> {
 }
 
 async function disposeProductionSession(): Promise<void> {
+	const failures: unknown[] = [];
+	let teardownSettled = created === undefined;
+	for (const exit of terminalExits) exit.resolve({ exitCode: 0, signal: null });
 	try {
-		await created?.session.dispose();
+		if (created) {
+			try {
+				await created.session.dispose();
+			} catch (error) {
+				failures.push(error);
+			}
+			try {
+				await created.session.awaitDisposeCompletion();
+				teardownSettled = true;
+			} catch (error) {
+				if (!failures.includes(error)) failures.push(error);
+			}
+		}
+		if (!teardownSettled) throw new AggregateError(failures, "SDK fixture retained teardown failed.");
 		authStorage?.close();
 		tempDir?.removeSync();
 	} finally {
-		created = undefined;
-		authStorage = undefined;
-		tempDir = undefined;
-		sessionManager = undefined;
-		AsyncJobManager.resetForTests();
-		resetTerminalAbortRegistriesForTests();
-		for (const restore of restoreSpies.splice(0)) restore();
+		if (teardownSettled) {
+			created = undefined;
+			authStorage = undefined;
+			tempDir = undefined;
+			sessionManager = undefined;
+			terminalExits.clear();
+			AsyncJobManager.resetForTests();
+			resetTerminalAbortRegistriesForTests();
+			for (const restore of restoreSpies.splice(0)) restore();
+		}
 	}
+	if (failures.length === 1) throw failures[0];
+	if (failures.length > 1) throw new AggregateError(failures, "SDK fixture bounded disposal failed.");
 }
 
 describe("SDK production ACP fold path", () => {
 	afterEach(async () => {
 		await disposeProductionSession();
+	});
+
+	test("retains fixture resources until teardown settles and preserves the bounded disposal failure", async () => {
+		await createProductionSession();
+		if (!created || !authStorage || !tempDir) throw new Error("SDK session fixture unavailable");
+		const fixtureSession = created.session;
+		const fixtureAuthStorage = authStorage;
+		const fixtureTempDir = tempDir;
+		const writeStarted = Promise.withResolvers<void>();
+		const releaseWrite = Promise.withResolvers<void>();
+		const boundedFailure = Promise.withResolvers<unknown>();
+		const previousHook = __sessionStateSidecarTestHooks.beforePersistFromEvent;
+		let held = false;
+		__sessionStateSidecarTestHooks.beforePersistFromEvent = async (eventType, cwd) => {
+			await previousHook?.(eventType, cwd);
+			if (!held && cwd === fixtureTempDir.path()) {
+				held = true;
+				writeStarted.resolve();
+				await releaseWrite.promise;
+			}
+		};
+		const originalDispose = fixtureSession.dispose.bind(fixtureSession);
+		trackSpy(
+			spyOn(fixtureSession, "dispose").mockImplementation(options =>
+				originalDispose(options).catch(error => {
+					boundedFailure.resolve(error);
+					throw error;
+				}),
+			),
+		);
+		let cleanup: Promise<unknown> | undefined;
+		let cleanupSettled = false;
+		try {
+			await fixtureSession.prompt("complete a genuine SDK turn before fixture disposal");
+			await writeStarted.promise;
+			cleanup = disposeProductionSession().then(
+				() => {
+					cleanupSettled = true;
+					return undefined;
+				},
+				error => {
+					cleanupSettled = true;
+					return error;
+				},
+			);
+			const failure = await boundedFailure.promise;
+			expect(failure).toBeInstanceOf(Error);
+			if (!(failure instanceof Error)) throw new Error("expected the genuine bounded disposal error");
+			expect(failure.message).toContain("Session disposal exceeded its bounded caller deadline");
+			expect(cleanupSettled).toBe(false);
+			expect(created?.session).toBe(fixtureSession);
+			expect(authStorage).toBe(fixtureAuthStorage);
+			expect(tempDir).toBe(fixtureTempDir);
+			expect(fs.existsSync(fixtureTempDir.path())).toBe(true);
+			releaseWrite.resolve();
+			expect(await cleanup).toBe(failure);
+			expect(created).toBeUndefined();
+			expect(authStorage).toBeUndefined();
+			expect(tempDir).toBeUndefined();
+			expect(fs.existsSync(fixtureTempDir.path())).toBe(false);
+		} finally {
+			releaseWrite.resolve();
+			await cleanup;
+			__sessionStateSidecarTestHooks.beforePersistFromEvent = previousHook;
+		}
 	});
 
 	test("creates, folds, wakes, and releases through the SDK ToolSession and ACP adapter", async () => {
