@@ -69,7 +69,7 @@ describe("ultragoal change-set extraction", () => {
 				fs.rm(root, { recursive: true, force: true }),
 			]);
 		}
-	});
+	}, 30_000);
 
 	it("preserves rename paths and categories", () => {
 		expect(parseGitNameStatus("R100\told.ts\tpackages/coding-agent/src/tools/computer.ts\n")).toEqual([
@@ -192,7 +192,7 @@ describe("ultragoal change-set extraction", () => {
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}
-	});
+	}, 30_000);
 
 	it("authenticates a committed file addition in the cumulative change set", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-tracked-addition-"));
@@ -231,7 +231,7 @@ describe("ultragoal change-set extraction", () => {
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}
-	});
+	}, 30_000);
 
 	it("fails closed on a concurrent same-status content mutation", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-witness-race-"));
@@ -261,7 +261,7 @@ describe("ultragoal change-set extraction", () => {
 			__setRepositoryStateWitnessTestHookForTests(undefined);
 			await fs.rm(root, { recursive: true, force: true });
 		}
-	});
+	}, 30_000);
 
 	it("rejects trusted added paths without a verified untracked content hash", () => {
 		expect(

@@ -114,7 +114,7 @@ async function hashAddedFiles(cwd: string, paths: readonly UltragoalChangeSetPat
 				hasher.update(await fs.readlink(filePath));
 			} else if (stat.isFile()) {
 				hasher.update("file\0");
-				hasher.update(Buffer.from(await Bun.file(filePath).arrayBuffer()));
+				await updateHashFromFile(hasher, filePath);
 			} else {
 				return undefined;
 			}
@@ -125,6 +125,24 @@ async function hashAddedFiles(cwd: string, paths: readonly UltragoalChangeSetPat
 		return undefined;
 	}
 }
+
+/** Hash file contents in bounded chunks instead of materializing large assets in memory. */
+async function updateHashFromFile(hasher: ReturnType<typeof crypto.createHash>, filePath: string): Promise<void> {
+	const reader = Bun.file(filePath).stream().getReader();
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) return;
+			hasher.update(value);
+		}
+	} finally {
+		reader.releaseLock();
+	}
+}
+
+const GIT_METADATA_TIMEOUT_MS = 10_000;
+const GIT_STATUS_TIMEOUT_MS = 30_000;
+const GIT_DIFF_TIMEOUT_MS = 60_000;
 
 export async function spawnText(
 	command: string[],
@@ -154,7 +172,10 @@ export async function spawnText(
 
 export async function resolveGitBase(cwd: string, branch?: string): Promise<string> {
 	if (branch) {
-		const exists = await spawnText(["git", "rev-parse", "--verify", branch], { cwd, timeoutMs: 3000 });
+		const exists = await spawnText(["git", "rev-parse", "--verify", branch], {
+			cwd,
+			timeoutMs: GIT_METADATA_TIMEOUT_MS,
+		});
 		if (exists.ok) return branch;
 	} else {
 		// Prefer the NEAREST integration base (the branch this work actually forks
@@ -166,13 +187,19 @@ export async function resolveGitBase(cwd: string, branch?: string): Promise<stri
 		const candidates = ["origin/dev", "dev", "origin/main", "origin/master", "main", "master"];
 		let best: { ref: string; ahead: number } | undefined;
 		for (const candidate of candidates) {
-			const exists = await spawnText(["git", "rev-parse", "--verify", candidate], { cwd, timeoutMs: 3000 });
+			const exists = await spawnText(["git", "rev-parse", "--verify", candidate], {
+				cwd,
+				timeoutMs: GIT_METADATA_TIMEOUT_MS,
+			});
 			if (!exists.ok) continue;
-			const mergeBase = await spawnText(["git", "merge-base", "HEAD", candidate], { cwd, timeoutMs: 3000 });
+			const mergeBase = await spawnText(["git", "merge-base", "HEAD", candidate], {
+				cwd,
+				timeoutMs: GIT_METADATA_TIMEOUT_MS,
+			});
 			if (!mergeBase.ok || !mergeBase.stdout.trim()) continue;
 			const count = await spawnText(["git", "rev-list", "--count", `${mergeBase.stdout.trim()}..HEAD`], {
 				cwd,
-				timeoutMs: 3000,
+				timeoutMs: GIT_METADATA_TIMEOUT_MS,
 			});
 			const ahead = Number.parseInt(count.stdout.trim(), 10);
 			if (!Number.isFinite(ahead)) continue;
@@ -270,11 +297,14 @@ export function mergeChangeSetPaths(groups: UltragoalChangeSetPath[][]): Ultrago
 
 export async function computeCheckpointChangeSet(cwd: string): Promise<UltragoalChangeSet | undefined> {
 	let ciChangedPaths = ciDevChangedPathRows();
-	const inGit = await spawnText(["git", "rev-parse", "--is-inside-work-tree"], { cwd, timeoutMs: 3000 });
+	const inGit = await spawnText(["git", "rev-parse", "--is-inside-work-tree"], {
+		cwd,
+		timeoutMs: GIT_METADATA_TIMEOUT_MS,
+	});
 	const workspace = process.env.GITHUB_WORKSPACE?.trim();
 	if (workspace) {
 		const topLevel = inGit.ok
-			? await spawnText(["git", "rev-parse", "--show-toplevel"], { cwd, timeoutMs: 3000 })
+			? await spawnText(["git", "rev-parse", "--show-toplevel"], { cwd, timeoutMs: GIT_METADATA_TIMEOUT_MS })
 			: undefined;
 		if (!topLevel?.ok || path.resolve(topLevel.stdout.trim()) !== path.resolve(workspace)) ciChangedPaths = [];
 	}
@@ -287,16 +317,19 @@ export async function computeCheckpointChangeSet(cwd: string): Promise<Ultragoal
 	await repositoryStateWitnessTestHook?.("after-initial", cwd);
 	const baseRef = await resolveGitBase(cwd);
 	const base = baseRef;
-	const mergeBase = await spawnText(["git", "merge-base", "HEAD", baseRef], { cwd, timeoutMs: 3000 });
+	const mergeBase = await spawnText(["git", "merge-base", "HEAD", baseRef], {
+		cwd,
+		timeoutMs: GIT_METADATA_TIMEOUT_MS,
+	});
 	const [committed, unstaged, staged, untracked, stat, committedDiff, unstagedDiff, stagedDiff] = await Promise.all([
-		spawnText(["git", "diff", "--name-status", "-z", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
-		spawnText(["git", "diff", "--name-status", "-z"], { cwd, timeoutMs: 5000 }),
-		spawnText(["git", "diff", "--cached", "--name-status", "-z"], { cwd, timeoutMs: 5000 }),
-		spawnText(["git", "ls-files", "--others", "--exclude-standard", "-z"], { cwd, timeoutMs: 5000 }),
-		spawnText(["git", "diff", "--stat", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
-		spawnText(["git", "diff", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
-		spawnText(["git", "diff"], { cwd, timeoutMs: 5000 }),
-		spawnText(["git", "diff", "--cached"], { cwd, timeoutMs: 5000 }),
+		spawnText(["git", "diff", "--name-status", "-z", `${base}...HEAD`], { cwd, timeoutMs: GIT_DIFF_TIMEOUT_MS }),
+		spawnText(["git", "diff", "--name-status", "-z"], { cwd, timeoutMs: GIT_DIFF_TIMEOUT_MS }),
+		spawnText(["git", "diff", "--cached", "--name-status", "-z"], { cwd, timeoutMs: GIT_DIFF_TIMEOUT_MS }),
+		spawnText(["git", "ls-files", "--others", "--exclude-standard", "-z"], { cwd, timeoutMs: GIT_STATUS_TIMEOUT_MS }),
+		spawnText(["git", "diff", "--stat", `${base}...HEAD`], { cwd, timeoutMs: GIT_DIFF_TIMEOUT_MS }),
+		spawnText(["git", "diff", `${base}...HEAD`], { cwd, timeoutMs: GIT_DIFF_TIMEOUT_MS }),
+		spawnText(["git", "diff"], { cwd, timeoutMs: GIT_DIFF_TIMEOUT_MS }),
+		spawnText(["git", "diff", "--cached"], { cwd, timeoutMs: GIT_DIFF_TIMEOUT_MS }),
 	]);
 	if (!committed.ok || !unstaged.ok || !staged.ok || !untracked.ok) {
 		const paths = mergeChangeSetPaths([
@@ -362,9 +395,10 @@ export async function computeCheckpointChangeSet(cwd: string): Promise<Ultragoal
 /**
  * A content witness of overall repository state. HEAD and porcelain status are
  * retained for cheap structural diagnostics, but the authoritative comparison
- * also digests every tracked and non-ignored untracked path. A same-status edit
- * therefore cannot pass the capture boundary merely because Git's status text
- * stayed unchanged.
+ * also digests every changed tracked and non-ignored untracked path. HEAD binds
+ * immutable committed content, so unchanged baseline files need not be reread. A
+ * same-status edit therefore cannot pass merely because Git's status text stayed
+ * unchanged.
  */
 type RepositoryStateWitnessTestHook = (phase: "after-initial", cwd: string) => void | Promise<void>;
 
@@ -376,18 +410,23 @@ export function __setRepositoryStateWitnessTestHookForTests(hook: RepositoryStat
 }
 
 async function repositoryStateWitness(cwd: string): Promise<string | undefined> {
-	const [head, status, tracked, untracked] = await Promise.all([
-		spawnText(["git", "rev-parse", "HEAD"], { cwd, timeoutMs: 3000 }),
-		spawnText(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], { cwd, timeoutMs: 5000 }),
-		spawnText(["git", "ls-files", "-z"], { cwd, timeoutMs: 5000 }),
-		spawnText(["git", "ls-files", "--others", "--exclude-standard", "-z"], { cwd, timeoutMs: 5000 }),
+	const [head, status, changed, untracked] = await Promise.all([
+		spawnText(["git", "rev-parse", "HEAD"], { cwd, timeoutMs: GIT_METADATA_TIMEOUT_MS }),
+		spawnText(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], {
+			cwd,
+			timeoutMs: GIT_STATUS_TIMEOUT_MS,
+		}),
+		spawnText(["git", "diff", "--name-only", "-z", "HEAD"], { cwd, timeoutMs: GIT_DIFF_TIMEOUT_MS }),
+		spawnText(["git", "ls-files", "--others", "--exclude-standard", "-z"], { cwd, timeoutMs: GIT_STATUS_TIMEOUT_MS }),
 	]);
-	if (!head.ok || !status.ok || !tracked.ok || !untracked.ok) return undefined;
+	if (!head.ok || !status.ok || !changed.ok || !untracked.ok) return undefined;
+	// HEAD identifies every committed byte. Only working-tree/index differences and
+	// non-ignored untracked files need content hashing; scanning every unchanged
+	// baseline file makes completion cost proportional to the entire repository.
 	const paths = [
-		...new Set([
-			...parseGitUntrackedPaths(tracked.stdout).map(row => row.path),
-			...parseGitUntrackedPaths(untracked.stdout).map(row => row.path),
-		]),
+		...new Set(
+			[...parseGitUntrackedPaths(changed.stdout), ...parseGitUntrackedPaths(untracked.stdout)].map(row => row.path),
+		),
 	].sort((left, right) => left.localeCompare(right));
 	const content = crypto.createHash("sha256");
 	const root = path.resolve(cwd);
@@ -408,7 +447,7 @@ async function repositoryStateWitness(cwd: string): Promise<string | undefined> 
 				content.update(await fs.readlink(filePath));
 			} else if (stat.isFile()) {
 				content.update("file\u0000");
-				content.update(Buffer.from(await Bun.file(filePath).arrayBuffer()));
+				await updateHashFromFile(content, filePath);
 			} else {
 				content.update("other\u0000");
 			}

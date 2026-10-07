@@ -1,0 +1,1 @@
+Ultragoal checkpoint witness hashes changed and untracked files with bounded-memory streaming instead of rescanning every unchanged repository file. Git deadlines are sized by metadata, status, and diff operation.
