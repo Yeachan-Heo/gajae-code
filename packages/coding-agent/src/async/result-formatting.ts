@@ -33,7 +33,7 @@ export async function formatAsyncResultForFollowUp(
 
 	const saved = summarizeAgentBashArtifactSave(artifactId, result);
 	const completeness = saved.complete
-		? "Full output"
+		? "Saved completion output"
 		: `Saved output artifact (truncated; omitted ${saved.omittedBytes} UTF-8 bytes)`;
 	return `${preview}\n${completeness}: artifact://${saved.artifactId}`;
 }

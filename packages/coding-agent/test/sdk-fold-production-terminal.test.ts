@@ -472,10 +472,49 @@ describe("SDK production async completion paths", () => {
 		expect(allocateArtifactPath).not.toHaveBeenCalled();
 		const uri = wakeMessages.match(/artifact:\/\/(\d+)/u)?.[0];
 		if (!uri) throw new Error("expected ordinary async-job artifact URI in model wake");
-		expect(wakeMessages).toContain(`Full output: ${uri}`);
+		expect(wakeMessages).toContain(`Saved completion output: ${uri}`);
 		const artifactPath = await sessionManager.getArtifactPath(uri.slice("artifact://".length));
 		if (!artifactPath) throw new Error("expected resolvable ordinary async-job artifact");
 		expect(await Bun.file(artifactPath).text()).toBe(fullOutput);
+	});
+
+	test("does not label a bounded ordinary SDK completion artifact as full output", async () => {
+		const mock = await createProductionSession(false);
+		if (!sessionManager || !created) throw new Error("SDK session fixture unavailable");
+		const fullOutput = `ORDINARY-CAPPED-HEAD\n${"界".repeat(40_000)}\nORDINARY-CAPPED-TAIL`;
+		const saveArtifact = trackSpy(spyOn(SessionManager.prototype, "saveArtifact"));
+		const callsBeforeWake = mock.calls.length;
+		registerOrdinarySdkJob(fullOutput, "ordinary SDK bounded delivery");
+		await waitFor(() => created!.session.yieldQueue.has("async-result"));
+		await created.session.yieldQueue.flush("idle");
+		expect(mock.calls.length).toBe(callsBeforeWake + 1);
+		const wakeMessages = mock.calls[mock.calls.length - 1]?.context.messages
+			.filter(message => message.role === "user")
+			.flatMap(message =>
+				typeof message.content === "string"
+					? [message.content]
+					: message.content.flatMap(content => (content.type === "text" ? [content.text] : [])),
+			)
+			.join("\n");
+		if (wakeMessages === undefined) throw new Error("expected bounded ordinary async-job model wake");
+		expect(wakeMessages).not.toContain("Full output");
+		const uri = wakeMessages.match(/artifact:\/\/(\d+)/u)?.[0];
+		if (!uri) throw new Error("expected bounded ordinary async-job artifact URI");
+		expect(wakeMessages).toContain(`Saved completion output: ${uri}`);
+		expect(saveArtifact).toHaveBeenCalledTimes(1);
+		const publication = saveArtifact.mock.calls[0];
+		if (!publication) throw new Error("expected genuine bounded completion publication");
+		expect(publication[1]).toBe("async");
+		const callbackOutput = publication[0];
+		expect(callbackOutput).toContain("ORDINARY-CAPPED-HEAD");
+		expect(callbackOutput).toContain("ORDINARY-CAPPED-TAIL");
+		expect(callbackOutput).toContain(
+			`[async delivery output truncated from ${Buffer.byteLength(fullOutput, "utf8")} bytes]`,
+		);
+		expect(Buffer.byteLength(callbackOutput, "utf8")).toBeLessThan(Buffer.byteLength(fullOutput, "utf8"));
+		const artifactPath = await sessionManager.getArtifactPath(uri.slice("artifact://".length));
+		if (!artifactPath) throw new Error("expected resolvable bounded completion artifact");
+		expect(await Bun.file(artifactPath).text()).toBe(callbackOutput);
 	});
 
 	for (const scenario of ["symlink", "replacement", "contended", "unavailable"] as const) {
@@ -566,7 +605,7 @@ describe("SDK production async completion paths", () => {
 
 			if (scenario.complete) {
 				expect(fullBytes).toBe(DEFAULT_ARTIFACT_MAX_BYTES);
-				expect(wakeMessages).toContain(`Full output: ${uri}`);
+				expect(wakeMessages).toContain(`Saved completion output: ${uri}`);
 				expect(wakeMessages).not.toContain("Saved output artifact (truncated;");
 				expect(saved).toBe(output);
 			} else {
