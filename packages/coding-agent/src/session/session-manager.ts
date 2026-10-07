@@ -2143,11 +2143,22 @@ export interface ResumeSessionIdentity {
 	sha256: string;
 }
 
-/** Descriptor-bound bounded fingerprint for private explicit-session rollback authority. */
-type ExplicitPersistIdentity = Pick<
-	SessionStorageStat,
-	"dev" | "ino" | "nlink" | "size" | "mtimeMs" | "mtimeNs" | "ctimeNs"
-> & { canonicalPath: string; sessionId: string; fingerprintSha256: string };
+/** Descriptor-bound bounded fingerprint for private explicit-session rollback authority.
+ * JSON-safe: all bigint fields are stored as strings to survive JSON serialization,
+ * spread, structuredClone, and JSON round-trip. */
+type ExplicitPersistIdentity = {
+	// All bigint fields stored as base-10 strings for JSON safety
+	dev: string;
+	ino: string;
+	nlink?: string;
+	size: number;
+	mtimeMs: number;
+	mtimeNs: string;
+	ctimeNs?: string;
+	canonicalPath: string;
+	sessionId: string;
+	fingerprintSha256: string;
+};
 
 export interface ResumeTailResumable {
 	kind: "resumable";
@@ -16315,13 +16326,14 @@ export class SessionManager {
 		return {
 			canonicalPath,
 			sessionId,
-			dev: before.dev,
-			ino: before.ino,
-			nlink,
+			// Convert bigints to strings for JSON safety
+			dev: String(before.dev),
+			ino: String(before.ino),
+			nlink: nlink !== undefined ? String(nlink) : undefined,
 			size: before.size,
 			mtimeMs: before.mtimeMs,
-			mtimeNs: before.mtimeNs,
-			ctimeNs: before.ctimeNs,
+			mtimeNs: String(before.mtimeNs),
+			ctimeNs: before.ctimeNs !== undefined ? String(before.ctimeNs) : undefined,
 			fingerprintSha256: fingerprint.digest("hex"),
 		};
 	}

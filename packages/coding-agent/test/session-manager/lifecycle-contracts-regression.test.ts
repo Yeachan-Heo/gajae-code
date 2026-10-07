@@ -210,4 +210,132 @@ describe("lifecycle contracts regression (PR #6428)", () => {
 			}
 		}
 	});
+
+	// Comprehensive table-driven test for JSON serialization of ExplicitPersistIdentity
+	it("serializes explicit persist identity through all JSON-safe operations", async () => {
+		const testCases: Array<{
+			name: string;
+			transform: (snapshot: any) => any;
+		}> = [
+			{
+				name: "direct snapshot",
+				transform: (s: any) => s,
+			},
+			{
+				name: "spread operator copy",
+				transform: (s: any) => ({ ...s }),
+			},
+			{
+				name: "structuredClone copy",
+				transform: (s: any) => structuredClone(s),
+			},
+			{
+				name: "JSON.stringify/parse round-trip",
+				transform: (s: any) => JSON.parse(JSON.stringify(s)),
+			},
+		];
+
+		for (const testCase of testCases) {
+			// Use a separate temp directory for each test case to avoid cross-contamination
+			const root = TempDir.createSync(`@pi-json-case-${testCase.name.replace(/[/\s]+/g, "-")}-`);
+			const storage = new FileSessionStorage();
+			try {
+				// Scenario 1: same-manager restore & cross-manager restore
+				const managerA = SessionManager.create(root.path(), root.path(), storage);
+				try {
+					managerA.appendMessage({ role: "user", content: "message in A", timestamp: 1 });
+					await managerA.ensureOnDisk();
+					const snapshotA = managerA.captureState();
+					const sessionFileA = managerA.getSessionFile();
+
+					if (!sessionFileA) throw new Error(`${testCase.name}: Expected explicit session file`);
+
+					// Verify explicit identity is present and is JSON-safe
+					const explicitIdentity = (snapshotA as any).explicitPersistIdentity;
+					expect(explicitIdentity).toBeTruthy();
+					expect(explicitIdentity.sessionId).toBe(snapshotA.sessionId);
+
+					// Verify all fields are JSON-safe (strings or numbers, no bigints)
+					expect(typeof explicitIdentity.dev).toBe("string");
+					expect(typeof explicitIdentity.ino).toBe("string");
+					if (explicitIdentity.nlink !== undefined) expect(typeof explicitIdentity.nlink).toBe("string");
+					expect(typeof explicitIdentity.mtimeNs).toBe("string");
+					if (explicitIdentity.ctimeNs !== undefined) expect(typeof explicitIdentity.ctimeNs).toBe("string");
+
+					// Apply the transformation (spread, clone, JSON round-trip, etc.)
+					const transformedSnapshot = testCase.transform(snapshotA);
+
+					// Verify the identity survived the transformation
+					const transformedIdentity = (transformedSnapshot as any).explicitPersistIdentity;
+					expect(transformedIdentity).toBeTruthy();
+					expect(transformedIdentity.sessionId).toBe(snapshotA.sessionId);
+
+					// Scenario 1a: same-manager restore
+					managerA.restoreState(transformedSnapshot);
+					expect(managerA.getSessionId()).toBe(snapshotA.sessionId);
+
+					// Scenario 1b: cross-manager restore
+					const managerB = SessionManager.create(root.path(), root.path(), storage);
+					try {
+						managerB.restoreState(transformedSnapshot);
+						expect(managerB.getSessionId()).toBe(snapshotA.sessionId);
+						expect(managerB.getSessionFile()).toBe(sessionFileA);
+						managerB.appendMessage({ role: "user", content: "response", timestamp: 2 });
+						await managerB.ensureOnDisk();
+					} finally {
+						await managerB.close();
+					}
+
+					// Scenario 2: identity changed after capture is detected
+					// Capture a snapshot first, then modify the file externally,
+					// then try to restore the stale snapshot
+					const fs = await import("fs/promises");
+					const sessionFile = managerA.getSessionFile();
+					if (!sessionFile) throw new Error("Expected session file");
+
+					const snapshotForMutation = managerA.captureState();
+					const transformedForMutation = testCase.transform(snapshotForMutation);
+
+					// Now externally modify the session file to change its identity
+					await fs.appendFile(sessionFile, "\n");
+
+					const managerC = SessionManager.create(root.path(), root.path(), storage);
+					try {
+						// Try to restore the snapshot that was captured before the file changed
+						// This should reject because the file has changed since the snapshot was captured
+						await expect(() => {
+							managerC.restoreState(transformedForMutation);
+						}).toThrow(/Session rollback persistence identity changed/);
+					} finally {
+						await managerC.close();
+					}
+
+					// Scenario 3: restore during closeStrict rejects
+					const snapshotForClose = managerA.captureState();
+					const transformedForClose = testCase.transform(snapshotForClose);
+
+					const managerD = SessionManager.create(root.path(), root.path(), storage);
+					try {
+						const closePromise = managerD.closeStrict();
+
+						await expect(() => {
+							managerD.restoreState(transformedForClose);
+						}).toThrow(/Session manager is closing/);
+
+						await closePromise;
+					} finally {
+						try {
+							await managerD.close();
+						} catch {
+							// May be already closed
+						}
+					}
+				} finally {
+					await managerA.close();
+				}
+			} finally {
+				root.removeSync();
+			}
+		}
+	});
 });
