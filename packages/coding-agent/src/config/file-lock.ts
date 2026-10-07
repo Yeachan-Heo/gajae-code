@@ -264,6 +264,13 @@ function canonicalLockFileId(value: bigint): bigint {
 	return BigInt.asUintN(64, value);
 }
 
+/** Windows volume serials are u32 even when Bun returns a signed `stat.dev`. */
+function canonicalLockDeviceId(value: bigint): bigint {
+	if (process.platform !== "win32") return canonicalLockFileId(value);
+	if (value < -(1n << 31n) || value > (1n << 32n) - 1n) throw new Error("file_lock_identity_out_of_range");
+	return BigInt.asUintN(32, value);
+}
+
 function lockInfoFileState(stats: BigIntStats): LockInfoFileState | null {
 	if (stats.isSymbolicLink() || !stats.isFile()) return null;
 	// Some supported filesystems report creation time as missing or epoch zero. Keep
@@ -271,7 +278,7 @@ function lockInfoFileState(stats: BigIntStats): LockInfoFileState | null {
 	// acquire/release/GC on a metadata field the filesystem cannot provide.
 	const birthtimeNs = typeof stats.birthtimeNs === "bigint" && stats.birthtimeNs > 0n ? stats.birthtimeNs : 0n;
 	return {
-		dev: canonicalLockFileId(stats.dev),
+		dev: canonicalLockDeviceId(stats.dev),
 		ino: canonicalLockFileId(stats.ino),
 		mode: stats.mode,
 		size: stats.size,
@@ -316,7 +323,7 @@ async function lockInfoPathState(lockPath: string): Promise<LockInfoPathState | 
 	const file = lockInfoFileState(info);
 	if (!file) return null;
 	return {
-		root: { dev: canonicalLockFileId(root.dev), ino: canonicalLockFileId(root.ino), mode: root.mode },
+		root: { dev: canonicalLockDeviceId(root.dev), ino: canonicalLockFileId(root.ino), mode: root.mode },
 		file,
 	};
 }
@@ -332,10 +339,10 @@ function sameLockInfoPathState(left: LockInfoPathState, right: LockInfoPathState
 
 function fileLockDirIdentityFromPathState(state: LockInfoPathState, bytes: string): GenericFileLockDirIdentity {
 	return {
-		rootDev: String(state.root.dev),
-		rootIno: String(state.root.ino),
-		infoDev: String(state.file.dev),
-		infoIno: String(state.file.ino),
+		rootDev: canonicalLockDeviceId(state.root.dev).toString(),
+		rootIno: canonicalLockFileId(state.root.ino).toString(),
+		infoDev: canonicalLockDeviceId(state.file.dev).toString(),
+		infoIno: canonicalLockFileId(state.file.ino).toString(),
 		infoNlink: String(state.file.nlink),
 		infoSize: String(state.file.size),
 		infoMtimeNs: String(state.file.mtimeNs),
@@ -545,7 +552,7 @@ async function removeDetachedLockQuarantineOnDisk(
 	if (
 		!current.isDirectory() ||
 		current.isSymbolicLink() ||
-		canonicalLockFileId(current.dev).toString() !== rootDev ||
+		canonicalLockDeviceId(current.dev).toString() !== rootDev ||
 		canonicalLockFileId(current.ino).toString() !== rootIno
 	) {
 		return false;
@@ -562,7 +569,7 @@ async function finishDetachedLockCleanup(owner: FileLockOwnerToken): Promise<boo
 		if (
 			!current.isDirectory() ||
 			current.isSymbolicLink() ||
-			canonicalLockFileId(current.dev).toString() !== pending.rootDev ||
+			canonicalLockDeviceId(current.dev).toString() !== pending.rootDev ||
 			canonicalLockFileId(current.ino).toString() !== pending.rootIno
 		) {
 			throw new Error("Detached file lock cleanup identity changed; refusing removal");
@@ -865,7 +872,7 @@ async function rollbackPublishedFileLock(
 				if (
 					!current.isDirectory() ||
 					current.isSymbolicLink() ||
-					canonicalLockFileId(current.dev) !== BigInt(`0x${identity[1]}`) ||
+					canonicalLockDeviceId(current.dev) !== BigInt(`0x${identity[1]}`) ||
 					canonicalLockFileId(current.ino) !== BigInt(`0x${identity[2]}`)
 				) {
 					throw new Error("File lock rollback placeholder identity changed; refusing removal");
@@ -1270,7 +1277,7 @@ async function removeVerifiedLockDirWithoutNative(
 	const removal = nativeFileLockBindings().exactRemoveDirectoryTree(
 		lockDir,
 		expected,
-		{ dev: canonicalLockFileId(parent.dev), ino: canonicalLockFileId(parent.ino) },
+		{ dev: canonicalLockDeviceId(parent.dev), ino: canonicalLockFileId(parent.ino) },
 		true,
 	);
 	if (removal.ok && !removal.detachedPath) return "removed";
@@ -2447,7 +2454,7 @@ export async function inspectFileLockStagingDir(
 	if (
 		!captured.ok ||
 		!captured.snapshot ||
-		captured.snapshot.rootDev !== canonicalLockFileId(root.dev).toString() ||
+		captured.snapshot.rootDev !== canonicalLockDeviceId(root.dev).toString() ||
 		captured.snapshot.rootIno !== canonicalLockFileId(root.ino).toString()
 	)
 		return kept;
@@ -2511,7 +2518,7 @@ export async function inspectFileLockStagingDir(
 		if (
 			detached?.isDirectory() &&
 			!detached.isSymbolicLink() &&
-			canonicalLockFileId(detached.dev).toString() === captured.snapshot.rootDev &&
+			canonicalLockDeviceId(detached.dev).toString() === captured.snapshot.rootDev &&
 			canonicalLockFileId(detached.ino).toString() === captured.snapshot.rootIno
 		) {
 			try {
