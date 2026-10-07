@@ -3900,6 +3900,49 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 		expect(outcomes).toHaveLength(1);
 		expect(outcomes[0]?.type).toBe("retryable_discarded");
 	});
+	it("discards an empty Responses start placeholder before a typed statusless overload (#6426)", async () => {
+		const mock = createMockModel();
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			const started: AssistantMessage = {
+				...assistantMessage(mock.model),
+				api: "openai-responses",
+				content: [{ type: "text", text: "" }],
+			};
+			const failure: AssistantMessage = {
+				...assistantMessage(mock.model),
+				api: "openai-responses",
+				stopReason: "error",
+				errorMessage: "server_is_overloaded: Our servers are currently overloaded. Please try again later.",
+				transportFailure: {
+					kind: "transport",
+					providerCode: "server_is_overloaded",
+					openaiErrorCode: "server_is_overloaded",
+				},
+			};
+			queueMicrotask(() => {
+				stream.push({ type: "start", partial: started });
+				stream.push({ type: "error", reason: "error", error: failure });
+			});
+			return stream;
+		};
+		const outcomes: ManagedAttemptOutcome[] = [];
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+		});
+
+		await agent.prompt("run", {
+			fallbackManaged: true,
+			onManagedAttemptOutcome: outcome => {
+				outcomes.push(outcome);
+				return { type: "terminal", terminal: { stopReason: "error" } };
+			},
+		});
+
+		expect(outcomes).toHaveLength(1);
+		expect(outcomes[0]?.type).toBe("retryable_discarded");
+	});
 	it("commits a typed statusless Responses overload after streamed output (#5018)", async () => {
 		const mock = createMockModel();
 		const streamFn = () => {
@@ -3985,5 +4028,113 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 			stopReason: "error",
 			content: [{ type: "text", text: "terminal-only content" }],
 		});
+	});
+	it("discards a typed statusless overload thrown by the provider factory", async () => {
+		const mock = createMockModel();
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: async () => {
+				throw Object.assign(new Error("server_is_overloaded"), {
+					transportFailure: {
+						kind: "transport",
+						providerCode: "server_is_overloaded",
+						openaiErrorCode: "server_is_overloaded",
+					},
+				});
+			},
+		});
+		const outcomes: ManagedAttemptOutcome[] = [];
+
+		await agent.prompt("run", {
+			fallbackManaged: true,
+			onManagedAttemptOutcome: outcome => {
+				outcomes.push(outcome);
+				return { type: "terminal", terminal: { stopReason: "error" } };
+			},
+		});
+
+		expect(outcomes).toHaveLength(1);
+		expect(outcomes[0]?.type).toBe("retryable_discarded");
+		expect(agent.state.messages.filter(message => message.role === "assistant")).toHaveLength(0);
+	});
+	it("discards a provisional placeholder on cancellation without terminal duplication", async () => {
+		const mock = createMockModel();
+		const pending = new AssistantMessageEventStream();
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: () => pending,
+		});
+		const events: AgentEvent[] = [];
+		agent.subscribe(event => events.push(event));
+		const run = agent.prompt("run", { fallbackManaged: true });
+		for (let index = 0; index < 20 && !agent.state.isStreaming; index += 1) await Bun.sleep(1);
+		agent.abort();
+		await run;
+
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+		expect(events.filter(event => event.type === "message_end")).toHaveLength(1);
+		expect(agent.state.messages.filter(message => message.role === "assistant")).toHaveLength(0);
+	});
+	it("tears down an aborted provider iterator exactly once", async () => {
+		const mock = createMockModel();
+		const factoryStarted = Promise.withResolvers<void>();
+		let returnCalls = 0;
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: () => {
+				factoryStarted.resolve();
+				return {
+					async next() {
+						return await new Promise<IteratorResult<never>>(() => {});
+					},
+					async return() {
+						returnCalls += 1;
+						return { done: true, value: undefined };
+					},
+					[Symbol.asyncIterator]() {
+						return this;
+					},
+				} as unknown as AssistantMessageEventStream;
+			},
+		});
+		const run = agent.prompt("run", { fallbackManaged: true });
+		await factoryStarted.promise;
+		agent.abort();
+		await run;
+
+		expect(returnCalls).toBe(1);
+	});
+	it("closes a late provider factory response after cancellation", async () => {
+		const mock = createMockModel();
+		const factory = Promise.withResolvers<AssistantMessageEventStream>();
+		const factoryStarted = Promise.withResolvers<void>();
+		let returnCalls = 0;
+		const lateStream = {
+			async next() {
+				return await new Promise<IteratorResult<never>>(() => {});
+			},
+			async return() {
+				returnCalls += 1;
+				return { done: true, value: undefined };
+			},
+			[Symbol.asyncIterator]() {
+				return this;
+			},
+		} as unknown as AssistantMessageEventStream;
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: () => {
+				factoryStarted.resolve();
+				return factory.promise;
+			},
+		});
+		const run = agent.prompt("run", { fallbackManaged: true });
+		await factoryStarted.promise;
+		agent.abort();
+		factory.resolve(lateStream);
+		await run;
+		for (let index = 0; index < 20 && returnCalls === 0; index += 1) await Bun.sleep(1);
+
+		expect(returnCalls).toBe(1);
 	});
 });
