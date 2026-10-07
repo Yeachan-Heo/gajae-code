@@ -9,7 +9,7 @@ import { SessionIndex } from "../src/sdk/broker/session-index";
 
 describe("broker startup heartbeat budget", () => {
 	it("does not publish while the checkpoint transaction is still holding the index lock", async () => {
-		const dir = await fs.mkdtemp(path.join("/private/tmp", "gjc-startup-heartbeat-settlement-"));
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-startup-heartbeat-settlement-"));
 		const index = await new SessionIndex(dir).open();
 		await index.append({
 			type: "host_registered",
@@ -22,23 +22,28 @@ describe("broker startup heartbeat budget", () => {
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
 		const settled = Promise.withResolvers<void>();
-		const realWithFileLock = lockModule.withFileLock;
-		const locking = vi.spyOn(lockModule, "withFileLock").mockImplementation(async (file, callback, options) => {
-			if (file !== log) return await realWithFileLock(file, callback, options);
-			expect(file).toBe(log);
-			entered.resolve();
-			await release.promise;
-			try {
-				return await callback();
-			} finally {
-				settled.resolve();
+		const realOpen = fs.open;
+		const opening = vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+			const handle = await realOpen(...args);
+			if (args[0] === log && args[1] === "a") {
+				const realSync = handle.sync.bind(handle);
+				vi.spyOn(handle, "sync").mockImplementationOnce(async () => {
+					entered.resolve();
+					await release.promise;
+					try {
+						await realSync();
+					} finally {
+						settled.resolve();
+					}
+				});
 			}
+			return handle;
 		});
 		let ready = false;
 		const broker = new Broker({
 			agentDir: dir,
 			port: 0,
-			startupCheckpointDeadline: performance.now() + 50,
+			startupCheckpointDeadline: performance.now() + 1_000,
 			onStartupReady: () => {
 				ready = true;
 			},
@@ -46,7 +51,7 @@ describe("broker startup heartbeat budget", () => {
 		const startup = broker.start();
 		try {
 			await entered.promise;
-			await Bun.sleep(100);
+			await Bun.sleep(1_100);
 			expect(ready).toBe(false);
 			expect(await readBrokerDiscovery(dir)).toBeNull();
 			release.resolve();
@@ -58,7 +63,7 @@ describe("broker startup heartbeat budget", () => {
 			release.resolve();
 			await settled.promise;
 			await broker.stop();
-			locking.mockRestore();
+			opening.mockRestore();
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});

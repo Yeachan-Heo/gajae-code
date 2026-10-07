@@ -213,6 +213,8 @@ test("cancellation while locally queued cannot perform a late checkpoint", async
 	const checkpoint = index.checkpointLiveHeartbeats(Date.now(), controller.signal);
 	try {
 		controller.abort();
+		release.resolve();
+		await previous;
 		expect(await checkpoint).toBe(0);
 		expect(spy).toHaveBeenCalledTimes(1);
 	} finally {
@@ -238,4 +240,41 @@ test("Broker.start passes its shorter deadline and publishes after a skipped che
 	} finally {
 		await broker.stop();
 	}
+});
+
+test("checkpoint waits for lock release even if deadline expires during write", async () => {
+	const index = await liveIndex();
+	let elapsed = 0;
+	vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+
+	let lockHeld = false;
+	let checkpointReturned = false;
+	const lock = locks.withFileLock;
+	const spy = vi.spyOn(locks, "withFileLock").mockImplementation(async (file, fn, options) => {
+		lockHeld = true;
+		try {
+			// Simulate the deadline expiring while lock is held
+			const result = await lock(
+				file,
+				async () => {
+					elapsed = 16_000; // Past the 15s budget
+					return await fn();
+				},
+				options,
+			);
+			return result;
+		} finally {
+			lockHeld = false;
+		}
+	});
+
+	const checkpoint = index.checkpointLiveHeartbeats().then(() => {
+		checkpointReturned = true;
+		// When checkpoint returns, lock must be released
+		expect(lockHeld).toBe(false);
+	});
+
+	await checkpoint;
+	expect(checkpointReturned).toBe(true);
+	spy.mockRestore();
 });
