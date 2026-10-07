@@ -1,6 +1,6 @@
-import { expect, test } from "bun:test";
+import { expect, test, vi } from "bun:test";
 import { AcpSdkAdapter } from "../src/sdk/acp";
-import { PROVIDER_ACTIVATION_MAX_ATTEMPTS } from "../src/sdk/acp/adapter";
+import { PROVIDER_ACTIVATION_BUDGET_MS, PROVIDER_ACTIVATION_MAX_ATTEMPTS } from "../src/sdk/acp/adapter";
 import { SdkClientError } from "../src/sdk/client";
 
 import type { SessionAttachment } from "../src/sdk/router";
@@ -166,6 +166,135 @@ test("Broker lifecycle client cannot activate per-session providers", async () =
 	});
 	await expect(adapter.start()).rejects.toMatchObject({ code: "operation_prohibited" });
 	await adapter.close();
+});
+
+test("ACP lifecycle recovery looks up an uncertain send with the original idempotency key", async () => {
+	const calls: Array<{ operation: string; input: Record<string, unknown>; options?: Record<string, unknown> }> = [];
+	const client = {
+		global: async (operation: string, input: Record<string, unknown>, options?: Record<string, unknown>) => {
+			calls.push({ operation, input, options });
+			throw new SdkClientError("uncertain_after_send", "response lost after dispatch", {
+				id: "request-1",
+				operation,
+				idempotencyKey: options?.idempotencyKey,
+				fingerprint: "fingerprint-1",
+			});
+		},
+		lookupLifecycle: async (record: Record<string, unknown>) => {
+			calls.push({ operation: "broker.lookup_lifecycle", input: record });
+			return { ok: true, result: { sessionId: "session-1" } };
+		},
+		close: async () => {},
+	};
+	const adapter = new AcpSdkAdapter({ client: client as never });
+	try {
+		await expect(adapter.global("session.create", { cwd: "/workspace" }, "create-key")).resolves.toEqual({
+			ok: true,
+			result: { sessionId: "session-1" },
+		});
+		expect(calls).toHaveLength(2);
+		expect(calls[1]).toMatchObject({ operation: "broker.lookup_lifecycle" });
+	} finally {
+		await adapter.close();
+	}
+});
+
+test.each([
+	["lookup throws", new Error("lookup failed")],
+	["lookup times out", new SdkClientError("timeout", "lookup timed out")],
+])("ACP lifecycle recovery preserves uncertain outcome when %s", async (_label, lookupError) => {
+	const client = {
+		global: async () => {
+			throw new SdkClientError("uncertain_after_send", "response lost after dispatch", {
+				id: "request-1",
+				operation: "session.create",
+				idempotencyKey: "create-key",
+				fingerprint: "fingerprint-1",
+			});
+		},
+		lookupLifecycle: async () => {
+			throw lookupError;
+		},
+		close: async () => {},
+	};
+	const adapter = new AcpSdkAdapter({ client: client as never });
+	try {
+		await expect(adapter.global("session.create", { cwd: "/workspace" }, "create-key")).rejects.toMatchObject({
+			code: "uncertain_after_send",
+		});
+	} finally {
+		await adapter.close();
+	}
+});
+
+test("ACP provider activation recomputes the remaining aggregate budget per provider", async () => {
+	const timeouts: number[] = [];
+	const attachment: SessionAttachment = {
+		authorityId: "session-1:stable",
+		sessionId: "session-1",
+		generation: 1,
+		isCurrent: () => true,
+		send: async () => {},
+		sendMaintenance: () => {},
+	};
+	const adapter = new AcpSdkAdapter({
+		router: {
+			request: async (
+				_sessionId: string,
+				frame: Record<string, unknown>,
+				_generation?: number,
+				_attachment?: SessionAttachment,
+				options?: Record<string, unknown>,
+			) => {
+				timeouts.push(Number(options?.timeoutMs));
+				if (frame.capability === "first") await Bun.sleep(20);
+				return { ok: true, result: { leaseId: `lease-${String(frame.capability)}` } };
+			},
+		} as never,
+		attachment,
+		sessionId: attachment.sessionId,
+		providers: [
+			{ capability: "first", definitions: [] },
+			{ capability: "second", definitions: [] },
+		],
+	});
+	try {
+		await adapter.start();
+		expect(timeouts).toHaveLength(2);
+		expect(timeouts[1]).toBeLessThan(timeouts[0]);
+	} finally {
+		await adapter.close();
+	}
+});
+
+test("ACP provider activation rejects a registration that succeeds after the aggregate deadline", async () => {
+	let currentTime = 0;
+	const now = vi.spyOn(Date, "now").mockImplementation(() => currentTime);
+	const attachment: SessionAttachment = {
+		authorityId: "session-1:stable",
+		sessionId: "session-1",
+		generation: 1,
+		isCurrent: () => true,
+		send: async () => {},
+		sendMaintenance: () => {},
+	};
+	const adapter = new AcpSdkAdapter({
+		router: {
+			request: async () => {
+				currentTime = PROVIDER_ACTIVATION_BUDGET_MS + 1;
+				return { ok: true, result: { leaseId: "late-lease" } };
+			},
+		} as never,
+		attachment,
+		sessionId: attachment.sessionId,
+		providers: [{ capability: "ui", definitions: [] }],
+	});
+	try {
+		await expect(adapter.start()).rejects.toMatchObject({ code: "provider_activation_exhausted" });
+	} finally {
+		await adapter.close();
+		now.mockRestore();
+	}
 });
 
 test("ACP provider readiness rebinds expired reverse leases on the live attachment (#4909)", async () => {

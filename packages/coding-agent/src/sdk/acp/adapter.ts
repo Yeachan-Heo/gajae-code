@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { logger } from "@gajae-code/utils";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
-import { type SdkClient, SdkClientError } from "../client";
+import { type SdkClient, SdkClientError, type SdkSentRecord } from "../client";
 import type { AbortScope } from "../host/control/operations";
 import { assertReverseResponseFrame, ReverseLeaseError } from "../host/reverse-leases";
 import {
@@ -531,7 +531,11 @@ export class AcpSdkAdapter {
 		return envelope?.result ?? response;
 	}
 
-	async #requestSession(frame: JsonObject, raw = false, options?: { timeoutMs: number }): Promise<unknown> {
+	async #requestSession(
+		frame: JsonObject,
+		raw = false,
+		options?: { timeoutMs?: number; deadline?: number },
+	): Promise<unknown> {
 		const router = this.#router;
 		if (!router)
 			throw new AcpSdkAdapterError(
@@ -601,13 +605,33 @@ export class AcpSdkAdapter {
 		// clock even starts, so the caller deadline covers the queue wait too; sizing
 		// it on readiness alone times out requests the broker is still running. A
 		// request that named no readiness budget is queued for the default one, so it
-		// needs the same extension rather than the client's generic request deadline.
+		// it needs the same extension rather than the client's generic request deadline.
 		const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
-		const response = await this.#client.global(operation, input, {
-			idempotencyKey,
-			...(timeoutMs === undefined ? {} : { timeoutMs }),
-		});
-		return response;
+		const deadline = timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
+		try {
+			return await this.#client.global(operation, input, {
+				idempotencyKey,
+				...(timeoutMs === undefined ? {} : { timeoutMs }),
+			});
+		} catch (error) {
+			if (!(error instanceof SdkClientError) || error.code !== "uncertain_after_send") throw error;
+			const sent = object(error.details);
+			if (
+				!sent ||
+				typeof sent.id !== "string" ||
+				sent.operation !== operation ||
+				typeof sent.idempotencyKey !== "string" ||
+				typeof sent.fingerprint !== "string"
+			)
+				throw error;
+			try {
+				const remainingMs = deadline === undefined ? undefined : deadline - Date.now();
+				if (remainingMs !== undefined && remainingMs <= 0) throw error;
+				return await this.#client.lookupLifecycle(sent as unknown as SdkSentRecord, remainingMs);
+			} catch {
+				throw error;
+			}
+		}
 	}
 
 	async sdkControl(params: { operation: string; input?: JsonObject }): Promise<unknown> {
@@ -646,7 +670,7 @@ export class AcpSdkAdapter {
 		throw new AcpSdkAdapterError("method_not_found", `Unsupported ACP SDK method: ${method}`);
 	}
 
-	async registerProvider(provider: AcpProviderRegistration, timeoutMs?: number): Promise<void> {
+	async registerProvider(provider: AcpProviderRegistration, timeoutMs?: number, deadline?: number): Promise<void> {
 		if (!this.#router)
 			throw new AcpSdkAdapterError(
 				"operation_prohibited",
@@ -665,7 +689,7 @@ export class AcpSdkAdapter {
 				...(previousLeaseId ? { expectedLeaseId: previousLeaseId } : {}),
 			},
 			true,
-			timeoutMs === undefined ? undefined : { timeoutMs },
+			timeoutMs === undefined && deadline === undefined ? undefined : { timeoutMs, deadline },
 		);
 		const result = object(object(response)?.result) ?? object(response) ?? {};
 		if (typeof result.leaseId !== "string")
@@ -686,18 +710,20 @@ export class AcpSdkAdapter {
 
 		const activation = (async () => {
 			const startedAt = Date.now();
+			const deadline = startedAt + PROVIDER_ACTIVATION_BUDGET_MS;
 			// Exhaustion is checked here, outside the try below, so the throw cannot be caught
 			// by the same `continue` branch that spent the budget.
 			for (let attempt = 1; ; attempt++) {
-				if (attempt > PROVIDER_ACTIVATION_MAX_ATTEMPTS || Date.now() - startedAt >= PROVIDER_ACTIVATION_BUDGET_MS)
+				if (attempt > PROVIDER_ACTIVATION_MAX_ATTEMPTS || Date.now() >= deadline)
 					throw this.#providerActivationExhausted(attempt - 1, startedAt);
-				const remainingMs = PROVIDER_ACTIVATION_BUDGET_MS - (Date.now() - startedAt);
 				const attachment = this.#attachment;
 				const connectionId = attachment?.connectionId;
 				try {
 					for (const provider of this.#providers) {
 						try {
-							await this.registerProvider(provider, Math.max(1, remainingMs));
+							if (Date.now() >= deadline) throw this.#providerActivationExhausted(attempt, startedAt);
+							await this.registerProvider(provider, Math.max(1, deadline - Date.now()), deadline);
+							if (Date.now() >= deadline) throw this.#providerActivationExhausted(attempt, startedAt);
 						} catch (error) {
 							if (Date.now() - startedAt >= PROVIDER_ACTIVATION_BUDGET_MS)
 								throw this.#providerActivationExhausted(attempt, startedAt);

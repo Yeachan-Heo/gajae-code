@@ -82,6 +82,55 @@ function mockProviderTokenEndpoint(onBody: (body: string) => void) {
 }
 
 describe("mcp oauth flow", () => {
+	it("does not follow redirects for credential-bearing token POSTs", async () => {
+		let requestInit: RequestInit | undefined;
+		using _hook = hookFetch((input, init) => {
+			if (String(input) !== "https://provider.example/token") return new Response("not found", { status: 404 });
+			requestInit = init;
+			return new Response("redirect", { status: 307, headers: { location: "http://127.0.0.1/private" } });
+		});
+
+		const flow = new MCPOAuthFlow(
+			{
+				authorizationUrl: "https://provider.example/authorize",
+				tokenUrl: "https://provider.example/token",
+				clientId: "client-id",
+			},
+			{},
+		);
+		await expect(flow.exchangeToken("code", "state", "http://127.0.0.1/callback")).rejects.toThrow(
+			"Token exchange failed",
+		);
+		expect(requestInit?.redirect).toBe("error");
+	});
+
+	it("does not follow redirects for credential-bearing dynamic registration POSTs", async () => {
+		let requestInit: RequestInit | undefined;
+		using _hook = hookFetch((input, init) => {
+			const url = String(input);
+			if (url === "https://provider.example/.well-known/oauth-authorization-server")
+				return new Response(JSON.stringify({ registration_endpoint: "https://provider.example/register" }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			if (url === "https://provider.example/register") {
+				requestInit = init;
+				return new Response("redirect", { status: 307, headers: { location: "http://127.0.0.1/private" } });
+			}
+			return new Response("not found", { status: 404 });
+		});
+
+		const flow = new MCPOAuthFlow(
+			{
+				authorizationUrl: "https://provider.example/authorize",
+				tokenUrl: "https://provider.example/token",
+			},
+			{},
+		);
+		await flow.generateAuthUrl("state", "http://127.0.0.1:3001/callback");
+		expect(requestInit?.redirect).toBe("error");
+	});
+
 	it("uses Codex client name for dynamic client registration", async () => {
 		let registrationPayload: Record<string, unknown> | null = null;
 

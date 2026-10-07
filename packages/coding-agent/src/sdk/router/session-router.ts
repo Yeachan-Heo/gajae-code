@@ -203,6 +203,8 @@ export interface SessionRouterClient {
 		frame: Record<string, unknown>,
 		options?: {
 			timeoutMs?: number;
+			/** Absolute deadline shared by connection preparation and request dispatch. */
+			deadline?: number;
 			connectedOnly?: boolean;
 			/** Synchronous pre-send observer; a throw aborts the dispatch before the wire. */
 			beforeDispatch?: (context: SdkDispatchContext) => void;
@@ -954,6 +956,8 @@ export class SessionRouter {
 		expectedAttachment?: SessionAttachment,
 		options?: {
 			timeoutMs?: number;
+			/** Absolute deadline shared by connection preparation and request dispatch. */
+			deadline?: number;
 			beforeDispatch?: (context: SdkDispatchContext) => void;
 			onDispatch?: SdkDispatchHandler;
 			dispatchFence?: (dispatch: () => Promise<Record<string, unknown>>) => Promise<Record<string, unknown>>;
@@ -994,9 +998,43 @@ export class SessionRouter {
 		// token: the wire frame alone carries credentials, and the observer
 		// context is a deep-frozen, token-redacted copy (#4640 review).
 		const wireFrame = this.#prepareFrame(attached, frame);
-		const { beforeDispatch, onDispatch, dispatchFence, ...requestOptions } = options ?? {};
+		const { beforeDispatch, onDispatch, dispatchFence, deadline, ...requestOptions } = options ?? {};
+		const requestDeadline =
+			deadline ?? (requestOptions.timeoutMs === undefined ? undefined : Date.now() + requestOptions.timeoutMs);
+		const remainingTimeoutMs = (): number | undefined =>
+			requestDeadline === undefined ? requestOptions.timeoutMs : Math.max(0, requestDeadline - Date.now());
 		try {
-			await attached.client.connect?.();
+			const connect = attached.client.connect?.();
+			if (connect && requestDeadline !== undefined) {
+				const remaining = remainingTimeoutMs() ?? 0;
+				if (remaining <= 0)
+					throw new SdkClientError("timeout", "SDK session request timed out before transport connection.", {
+						requestSent: false,
+					});
+				let timer: ReturnType<typeof setTimeout> | undefined;
+				try {
+					await Promise.race([
+						connect,
+						new Promise<never>((_, reject) => {
+							timer = setTimeout(
+								() =>
+									reject(
+										new SdkClientError(
+											"timeout",
+											"SDK session request timed out during transport connection.",
+											{ requestSent: false },
+										),
+									),
+								remaining,
+							);
+						}),
+					]);
+				} finally {
+					if (timer !== undefined) clearTimeout(timer);
+				}
+			} else {
+				await connect;
+			}
 		} catch (error) {
 			if (error instanceof SdkClientError) throw new SdkPreparedDispatchError(error);
 			throw error;
@@ -1007,7 +1045,7 @@ export class SessionRouter {
 			attached.client.request(wireFrame, {
 				...requestOptions,
 				connectedOnly: true,
-				timeoutMs: requestOptions.timeoutMs ?? SESSION_REQUEST_TIMEOUT_MS,
+				timeoutMs: remainingTimeoutMs() ?? SESSION_REQUEST_TIMEOUT_MS,
 				...(beforeDispatch
 					? {
 							beforeDispatch: (context: SdkDispatchContext) =>
