@@ -682,10 +682,10 @@ async function applyStartupModelProfilesWithPolicy(
 
 	// Deferred --mpreset startup can overlap selector input; never reapply its
 	// captured profile after the user has selected a newer model.
-	const selectionRevision = args.session.getUserModelSelectionRevision();
 	if (preferCachedProfiles) {
 		let applied: boolean;
 		let refreshedOnline = false;
+		const selectionRevision = args.session.getUserModelSelectionRevision();
 		try {
 			applied = await applyConfiguredProfiles(false, undefined, selectionRevision);
 		} catch (error) {
