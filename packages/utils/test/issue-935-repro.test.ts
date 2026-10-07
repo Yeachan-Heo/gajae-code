@@ -32,7 +32,7 @@ describe("issue #6446 Windows path casing", () => {
 
 		// Mock realpathSync to return an uppercase path
 		const upperPath = "C:\\Users\\User\\Project\\session.jsonl";
-		vi.spyOn(fs, "realpathSync").mockReturnValue(upperPath);
+		vi.spyOn(fs, "realpathSync").mockImplementation((() => upperPath) as unknown as typeof fs.realpathSync);
 
 		const result = resolveEquivalentPath(upperPath);
 
@@ -44,11 +44,11 @@ describe("issue #6446 Windows path casing", () => {
 		if (process.platform !== "win32") return;
 
 		const upperPath = "C:\\Users\\User\\Project\\session.jsonl";
-		vi.spyOn(fs, "realpathSync").mockImplementation(() => {
+		vi.spyOn(fs, "realpathSync").mockImplementation((() => {
 			const error = new Error("ENOENT: no such file or directory, realpath");
 			(error as NodeJS.ErrnoException).code = "ENOENT";
 			throw error;
-		});
+		}) as unknown as typeof fs.realpathSync);
 
 		const result = resolveEquivalentPath(upperPath);
 
