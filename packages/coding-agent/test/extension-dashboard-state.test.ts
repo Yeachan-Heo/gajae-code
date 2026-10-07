@@ -1,6 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { applyDisabledExtensionsToState } from "@gajae-code/coding-agent/modes/components/extensions/state-manager";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { Settings } from "@gajae-code/coding-agent/config/settings";
+import {
+	applyDisabledExtensionsToState,
+	loadAllExtensions,
+} from "@gajae-code/coding-agent/modes/components/extensions/state-manager";
 import type { DashboardState, Extension } from "@gajae-code/coding-agent/modes/components/extensions/types";
+import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 
 function extension(overrides: Partial<Extension> & Pick<Extension, "id">): Extension {
 	return {
@@ -73,5 +81,42 @@ describe("applyDisabledExtensionsToState", () => {
 			shadowedBy: "skill:shadowing",
 		});
 		expect(next.selected).toMatchObject({ id: "skill:shadowed", state: "shadowed", disabledReason: "shadowed" });
+	});
+});
+
+describe("loadAllExtensions user skill trust", () => {
+	test("preserves global user-link trust when dashboard cwd differs from settings cwd", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-extension-moved-cwd-"));
+		const previousAgentDir = getAgentDir();
+		try {
+			const cwd = path.join(root, "moved-project");
+			const agentDir = path.join(root, "agent");
+			const skillsDir = path.join(agentDir, "skills");
+			const externalSkillDir = path.join(root, "shared-skills", "external-helper");
+			await fs.mkdir(cwd, { recursive: true });
+			await fs.mkdir(externalSkillDir, { recursive: true });
+			await fs.mkdir(skillsDir, { recursive: true });
+			await fs.writeFile(
+				path.join(externalSkillDir, "SKILL.md"),
+				"---\nname: external-helper\ndescription: User-owned helper\n---\nExternal body",
+			);
+			await fs.symlink(externalSkillDir, path.join(skillsDir, "external-helper"), "dir");
+			setAgentDir(agentDir);
+
+			const settings = Settings.isolated(
+				{ "skills.trustUserSkills": false },
+				{ overrides: { "skills.trustUserSkills": true } },
+			);
+			expect(settings.getGroup("skills").trustUserSkills).toBe(true);
+			expect(settings.getGlobal("skills.trustUserSkills")).toBe(false);
+
+			const extensions = await loadAllExtensions(cwd, [], settings);
+			expect(extensions.some(extension => extension.kind === "skill" && extension.name === "external-helper")).toBe(
+				false,
+			);
+		} finally {
+			setAgentDir(previousAgentDir);
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 });
