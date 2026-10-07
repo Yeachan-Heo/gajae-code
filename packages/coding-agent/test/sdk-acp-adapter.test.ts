@@ -617,8 +617,12 @@ for (const initialFailure of [
 	new SdkClientError("timeout", "initial request timed out before send", undefined, undefined, { transport: true }),
 	new SdkClientError("connection_closed", "initial connection closed", undefined, undefined, { transport: true }),
 	new Error("initial dispatch failed"),
+	new DOMException("initial dispatch cancelled", "AbortError"),
 ]) {
-	test(`ACP lifecycle does not replay definite initial ${initialFailure instanceof SdkClientError ? initialFailure.code : "throw"}`, async () => {
+	let failureKind = "throw";
+	if (initialFailure instanceof SdkClientError) failureKind = initialFailure.code;
+	else if (initialFailure instanceof DOMException) failureKind = "cancel";
+	test(`ACP lifecycle does not replay definite initial ${failureKind}`, async () => {
 		const sdk = new FakeSdkClient();
 		sdk.global = async (operation, input, options) => {
 			sdk.frames.push({ type: "broker_request", operation, input, ...options });
@@ -640,9 +644,11 @@ for (const initialFailure of [
 test("ACP lifecycle waits for a late replay acknowledgment without another create", async () => {
 	const sdk = new FakeSdkClient();
 	const acknowledgment = Promise.withResolvers<unknown>();
+	const replayStarted = Promise.withResolvers<void>();
 	sdk.global = async (operation, input, options) => {
 		sdk.frames.push({ type: "broker_request", operation, input, ...options });
 		if (sdk.frames.length === 1) throw new SdkClientError("uncertain_after_send", "response lost", { operation });
+		replayStarted.resolve();
 		return await acknowledgment.promise;
 	};
 	const adapter = new AcpSdkAdapter({ client: sdk as never });
@@ -654,7 +660,7 @@ test("ACP lifecycle waits for a late replay acknowledgment without another creat
 		() => (settled = true),
 	);
 	try {
-		await waitFor(() => sdk.frames.length === 2, "same-key replay");
+		await replayStarted.promise;
 		expect(settled).toBe(false);
 		acknowledgment.resolve({ result: { sessionId: "late-committed" } });
 		await expect(recovery).resolves.toEqual({ result: { sessionId: "late-committed" } });
@@ -669,6 +675,7 @@ test("ACP lifecycle waits for a late replay acknowledgment without another creat
 test("ACP lifecycle teardown during recovery preserves the original uncertainty", async () => {
 	const sdk = new FakeSdkClient();
 	const acknowledgment = Promise.withResolvers<unknown>();
+	const replayStarted = Promise.withResolvers<void>();
 	const original = new SdkClientError("uncertain_after_send", "committed response lost", {
 		operation: "session.create",
 	});
@@ -676,6 +683,7 @@ test("ACP lifecycle teardown during recovery preserves the original uncertainty"
 	sdk.global = async (operation, input, options) => {
 		sdk.frames.push({ type: "broker_request", operation, input, ...options });
 		if (sdk.frames.length === 1) throw original;
+		replayStarted.resolve();
 		return await acknowledgment.promise;
 	};
 	sdk.close = async () => {
@@ -690,7 +698,7 @@ test("ACP lifecycle teardown during recovery preserves the original uncertainty"
 	// Observe the rejection before closing the transport to avoid an unhandled rejection.
 	const failure = recovery.catch(error => error);
 	try {
-		await waitFor(() => sdk.frames.length === 2, "replay before teardown");
+		await replayStarted.promise;
 		await adapter.close();
 		expect(await failure).toBe(original);
 		expect(closes).toBe(1);
@@ -777,6 +785,7 @@ for (const phase of ["before send", "after send", "replay"] as const) {
 	test(`ACP lifecycle deadline bounds pending work ${phase}`, async () => {
 		const sdk = new FakeSdkClient();
 		const pending = Promise.withResolvers<unknown>();
+		const pendingStarted = Promise.withResolvers<void>();
 		const original = new SdkClientError("uncertain_after_send", "committed response lost");
 		let expire: (() => void) | undefined;
 		const schedule = globalThis.setTimeout;
@@ -789,13 +798,14 @@ for (const phase of ["before send", "after send", "replay"] as const) {
 			sdk.frames.push({ operation, input, ...options });
 			if (phase === "replay" && sdk.frames.length === 1) throw original;
 			if (phase === "after send") options?.onDispatch?.({ frame: {}, generation: 1, connectionId: "broker" });
+			pendingStarted.resolve();
 			return await pending.promise;
 		};
 		const adapter = new AcpSdkAdapter({ client: sdk as never });
 		const recovery = adapter.lifecycle("session.create", { cwd: "/workspace" }, "pending-key");
 		const failure = recovery.catch(error => error);
 		try {
-			await waitFor(() => sdk.frames.length === (phase === "replay" ? 2 : 1), "pending lifecycle dispatch");
+			await pendingStarted.promise;
 			expect(expire).toBeDefined();
 			expire?.();
 			if (phase === "replay") expect(await failure).toBe(original);
