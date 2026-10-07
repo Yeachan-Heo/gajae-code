@@ -13,7 +13,7 @@ import { SdkClient } from "../../src/sdk/client";
 import type { TurnResultPage } from "../../src/sdk/turn-result";
 import type { AgentSession, AgentSessionEvent } from "../../src/session/agent-session";
 import { AuthStorage } from "../../src/session/auth-storage";
-import { SessionManager } from "../../src/session/session-manager";
+import { type SessionEntry, SessionManager } from "../../src/session/session-manager";
 import { createFixtureBrokerEnvironment, withFixtureBrokerEnvironment } from "./fixture-broker-cleanup";
 
 export const EMPTY_STOP_SCENARIOS = [
@@ -117,6 +117,23 @@ export function responseResult(value: unknown): Record<string, unknown> {
 	return record(response.result);
 }
 
+export async function assertManagedTranscript(
+	manager: SessionManager,
+	assistants: readonly AssistantMessage[],
+): Promise<void> {
+	await manager.ensureOnDisk();
+	await manager.flush();
+	const transcript = manager.getSessionFile();
+	assert.ok(transcript, "Missing managed transcript path");
+	const entries = Bun.JSONL.parse(await Bun.file(transcript).text()) as SessionEntry[];
+	const persisted = entries.flatMap(entry =>
+		entry.type === "message" && entry.message.role === "assistant" ? [entry.message] : [],
+	);
+	// JSONL omits optional undefined fields (for example, errorMessage on a stop).
+	const expected: unknown = JSON.parse(JSON.stringify(assistants));
+	assert.deepEqual(persisted, expected, "Managed transcript must contain only accepted assistant messages");
+}
+
 export function assertScenarioReport(report: ScenarioReport): void {
 	const fallback = usesFallback(report.scenario);
 	const failed = report.scenario === "fallback-disabled" || report.scenario === "untyped-disabled";
@@ -173,14 +190,6 @@ export function assertScenarioReport(report: ScenarioReport): void {
 		assert.equal(report.switches[0].to, `${PROVIDER}/${FALLBACK}`);
 		assert.equal(report.switches[0].reason, "server", "Session fallback classification");
 	} else assert.deepEqual(report.switches, [], "Unexpected fallback switch");
-}
-
-async function waitUntil(predicate: () => boolean | Promise<boolean>, label: string): Promise<void> {
-	const deadline = Date.now() + WAIT_MS;
-	while (!(await predicate())) {
-		if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${label}`);
-		await Bun.sleep(10);
-	}
 }
 
 export async function runManagedEmptyStopScenario(
@@ -280,7 +289,7 @@ export async function runManagedEmptyStopScenario(
 				reportRuntimeError: error => runtimeErrors.push(error),
 			});
 			const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${session.sessionId}.json`);
-			await waitUntil(() => Bun.file(endpointFile).exists(), "SDK endpoint");
+			assert.ok(await Bun.file(endpointFile).exists(), "SDK endpoint missing after initialization");
 			assert.deepEqual(runtimeErrors, [], "SDK startup errors");
 			const endpoint = record(await Bun.file(endpointFile).json());
 			assert.equal(typeof endpoint.url, "string");
@@ -291,34 +300,46 @@ export async function runManagedEmptyStopScenario(
 				timeoutMs: WAIT_MS,
 			});
 			const frames: Record<string, unknown>[] = [];
-			unsubscribeFrames = client.onFrame(frame => frames.push(frame));
+			const terminalFrame = Promise.withResolvers<void>();
+			let correlation: { commandId: string; turnId: string } | undefined;
+			const correlatedFrames = () =>
+				frames.filter(frame => {
+					if (!correlation || frame.kind !== "agent_end" || frame.payload === undefined) return false;
+					const payload = record(frame.payload);
+					return payload.commandId === correlation.commandId && payload.turnId === correlation.turnId;
+				});
+			unsubscribeFrames = client.onFrame(frame => {
+				frames.push(frame);
+				if (correlatedFrames().length > 0) terminalFrame.resolve();
+			});
 			const accepted = responseResult(
 				await client.control("turn.prompt", { text: "Exercise empty stop", clientRef: scenario }),
 			);
 			assert.equal(accepted.accepted, true);
 			assert.equal(typeof accepted.commandId, "string");
 			assert.equal(typeof accepted.turnId, "string");
+			correlation = { commandId: accepted.commandId as string, turnId: accepted.turnId as string };
 			const input = { kind: "prompt", commandId: accepted.commandId, turnId: accepted.turnId };
-			let terminal: TurnResultPage | undefined;
-			await waitUntil(async () => {
-				assert.ok(client);
-				const result = responseResult(await client.query("turn.result", input)) as unknown as TurnResultPage;
-				if (result.status !== "terminal_ok" && result.status !== "failed") return false;
-				terminal = result;
-				return true;
-			}, "durable terminal result");
+			// The terminal frame is published after reconciliation persists the result.
+			// Recheck buffered frames in case the run ended before prompt acceptance arrived.
+			if (correlatedFrames().length > 0) terminalFrame.resolve();
+			const timeout = setTimeout(
+				() => terminalFrame.reject(new Error("Timed out waiting for correlated terminal lifecycle")),
+				WAIT_MS,
+			);
+			try {
+				await terminalFrame.promise;
+			} finally {
+				clearTimeout(timeout);
+			}
 			await session.waitForIdle();
-			assert.ok(terminal);
-			const correlatedFrames = () =>
-				frames.filter(frame => {
-					if (frame.kind !== "agent_end" || frame.payload === undefined) return false;
-					const payload = record(frame.payload);
-					return payload.commandId === accepted.commandId && payload.turnId === accepted.turnId;
-				});
-			await waitUntil(() => correlatedFrames().length > 0, "correlated terminal lifecycle");
+			const terminal = responseResult(await client.query("turn.result", input)) as unknown as TurnResultPage;
 			assert.deepEqual(runtimeErrors, [], "Provider/SDK runtime errors");
 			const replay = responseResult(await client.query("turn.result", input)) as unknown as TurnResultPage;
-			await session.sessionManager.ensureOnDisk();
+			const assistantMessages = session.messages.filter(
+				(message): message is AssistantMessage => message.role === "assistant",
+			);
+			await assertManagedTranscript(session.sessionManager, assistantMessages);
 			const transcript = session.sessionManager.getSessionFile();
 			const report: ScenarioReport = {
 				scenario,
@@ -327,9 +348,7 @@ export async function runManagedEmptyStopScenario(
 				replay,
 				terminalFrames: correlatedFrames(),
 				selectedModel: `${session.model?.provider}/${session.model?.id}`,
-				assistantMessages: session.messages.filter(
-					(message): message is AssistantMessage => message.role === "assistant",
-				),
+				assistantMessages,
 				lifecycle: events
 					.filter(
 						event =>
@@ -363,12 +382,12 @@ export async function runManagedEmptyStopScenario(
 			}
 		};
 		await clean(async () => await client?.close());
-		await clean(async () => await session?.extensionRunner?.emit({ type: "session_shutdown" }));
 		await clean(async () => await session?.dispose());
 		await clean(() => auth?.close());
 		await clean(async () => await lease?.close());
 		await clean(async () => await server?.stop(true));
-		await clean(async () => await fs.rm(root, { recursive: true, force: true }));
+		// Keep failure evidence and never remove storage beneath an unclosed owner.
+		if (errors.length === 0) await clean(async () => await fs.rm(root, { recursive: true, force: true }));
 	}
 	if (errors.length > 0)
 		throw new AggregateError(
