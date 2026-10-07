@@ -1764,7 +1764,6 @@ function b() {
 				await manager.close();
 			}
 		});
-
 		it(
 			"keeps real Bash and Monitor publishers bound across preparation and session commits",
 			async () => {
@@ -1972,7 +1971,6 @@ function b() {
 			if (!baselinePath) throw new Error("expected the published baseline artifact path");
 			expect(path.basename(baselinePath)).toBe(`${baselineId}.bash.log`);
 			expect(await Bun.file(baselinePath).text()).toBe("enabled publisher baseline");
-
 			const blockedArtifactDirectory = path.join(testDir, "missing-bash-artifact-parent");
 			await Bun.write(blockedArtifactDirectory, "not a directory");
 			const blockedSessionFile = `${blockedArtifactDirectory}.jsonl`;
