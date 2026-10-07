@@ -14,7 +14,7 @@ import { createAgentSession } from "../src/sdk";
 import { createSdkSessionRuntimeExtension } from "../src/sdk/host/session-runtime";
 import { AgentSession, type AgentSessionEvent } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
-import { type SessionEntry, SessionManager } from "../src/session/session-manager";
+import { SessionManager } from "../src/session/session-manager";
 import { EventBus } from "../src/utils/event-bus";
 import {
 	assertManagedTranscript,
@@ -185,16 +185,6 @@ test.each(
 			expect(switches).toEqual([]);
 		}
 		if (initialization === "sdk") {
-			await manager.ensureOnDisk();
-			await manager.flush();
-			const transcript = manager.getSessionFile();
-			expect(transcript).toBeDefined();
-			if (!transcript) throw new Error("Missing managed transcript");
-			const entries = Bun.JSONL.parse(await Bun.file(transcript).text()) as SessionEntry[];
-			const persistedAssistants = entries.flatMap(entry =>
-				entry.type === "message" && entry.message.role === "assistant" ? [entry.message] : [],
-			);
-			expect(persistedAssistants).toEqual(assistants);
 			await assertManagedTranscript(manager, assistants);
 		}
 	} finally {
