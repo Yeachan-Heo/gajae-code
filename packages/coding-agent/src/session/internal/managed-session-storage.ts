@@ -1478,7 +1478,7 @@ function secureExistingManagedDirectory(pathname: string, kind: "directory" | "f
 				canonicalFileId(named.dev),
 				canonicalFileId(named.ino),
 			),
-			"migrate",
+			"verify",
 			kind,
 		);
 		if (migrated.ok) {
