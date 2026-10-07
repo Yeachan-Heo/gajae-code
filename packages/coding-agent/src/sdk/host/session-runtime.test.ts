@@ -194,6 +194,7 @@ function memoryTransport(onSend?: (frame: SdkFrame) => void): SessionSdkTranspor
 		stop: async () => {
 			started = false;
 		},
+		isConnectionOpen: () => started,
 		broadcastFrame(frame) {
 			broadcasts.push(frame);
 		},
@@ -4601,6 +4602,7 @@ async function invocationHarness(
 		persistHold?: { type: string; onEntered: () => void; release: Promise<void> };
 		/** Hold successive matching durable transitions, consumed in arrival order. */
 		persistHolds?: Array<{ type: string; onEntered: () => void; release: Promise<void> }>;
+		supportsConnectionLiveness?: boolean;
 		/** Throw to inject a publication failure for a matching broadcast frame. */
 		broadcastInterceptor?: (frame: SdkFrame) => void;
 		onLifecycleDrainTimeout?: () => void;
@@ -4670,7 +4672,7 @@ async function invocationHarness(
 				sessionId: id,
 				stateRoot,
 				token,
-				isConnectionOpen: () => open,
+				...(hooks.supportsConnectionLiveness === false ? {} : { isConnectionOpen: () => open }),
 				onFrame(handler) {
 					deliver = handler;
 					deliveries.set(id, handler);
@@ -4785,6 +4787,24 @@ async function invocationHarness(
 		sent: sessionId => sentFrames.get(sessionId) ?? [],
 	};
 }
+
+test("does not install staged image controls without transport connection liveness", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-image-liveness-"));
+	let harness: InvocationHarness | undefined;
+	try {
+		harness = await invocationHarness("sdk-image-no-liveness", cwd, { supportsConnectionLiveness: false });
+		await expect(
+			harness.control("turn.image.begin", {
+				mimeType: "image/png",
+				byteLength: 1,
+				sha256: "0".repeat(64),
+			}),
+		).resolves.toMatchObject({ ok: false, error: { code: "operation_not_session_owned" } });
+	} finally {
+		await harness?.stop();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
 
 test("SDK-only host retains accepted staged bytes until terminal and releases rejected images", async () => {
 	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-only-staged-image-"));

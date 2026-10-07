@@ -2921,7 +2921,7 @@ function createControlSurface(
 	) => void,
 	armPromptDeadline: (correlation: InvocationCorrelation) => void,
 	steerReconciliation: KindAwareReconciliation,
-	imageUploads: PromptImageUploadStore,
+	imageUploads: PromptImageUploadStore | undefined,
 	hasCapturedInvocationTerminal: (kind: InvocationKind, correlation: InvocationCorrelation) => boolean,
 	onPromotedTurn?: (
 		kind: InvocationKind,
@@ -6888,9 +6888,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 
 		// Never fall back to the runtime's frame-observer set: it is not the
 		// transport's authoritative socket membership. Missing liveness fails closed.
-		const imageUploads = new PromptImageUploadStore(
-			connectionId => transport.isConnectionOpen?.(connectionId) === true,
-		);
+		const imageUploads =
+			typeof transport.isConnectionOpen === "function"
+				? new PromptImageUploadStore(connectionId => transport.isConnectionOpen?.(connectionId) === true)
+				: undefined;
 		currentImageUploads = imageUploads;
 		const controlSurface = createControlSurface(
 			ctx,
@@ -7190,7 +7191,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		runtime = new SessionSdkSessionRuntime({
 			transport,
-			onDisconnected: connectionId => imageUploads.disconnect(connectionId),
+			onDisconnected: connectionId => imageUploads?.disconnect(connectionId),
 			eventRevision: () =>
 				typeof (ctx as Partial<ExtensionContext>).getTranscript === "function"
 					? ctx.getTranscript().length
@@ -7642,8 +7643,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			runtimeOwner.quiesceInput();
 			runtimeOwner.fenceGateResolutions();
 			active = undefined;
-			disposeAcceptedQueueCancellations();
-			imageUploads.close();
+			let queueCancellationFailure: unknown;
+			try {
+				await disposeAcceptedQueueCancellations();
+			} catch (cleanupError) {
+				queueCancellationFailure = cleanupError;
+			}
+			imageUploads?.close();
 			if (currentImageUploads === imageUploads) currentImageUploads = undefined;
 			for (const release of acceptedImages.values()) release();
 			acceptedImages.clear();
