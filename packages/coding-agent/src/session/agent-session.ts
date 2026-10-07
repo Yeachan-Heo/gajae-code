@@ -32,7 +32,6 @@ import {
 	type AgentState,
 	type AgentTerminalOwnerContext,
 	type AgentTool,
-	type AgentTerminalOwnerContext,
 	assertImagePlaceholdersHavePayload,
 	type ContextMaintenanceResult,
 	canContinuePersistedHistory,

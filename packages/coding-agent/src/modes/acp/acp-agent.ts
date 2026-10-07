@@ -3363,7 +3363,6 @@ export class AcpAgent implements Agent {
 			record.cancelRequested = false;
 			return;
 		}
-		const waiter = record.activePrompt;
 		const waiterWasUnacknowledged = waiter !== undefined && !waiter.acknowledged;
 		const waiterWasBeforeActivity = waiter !== undefined && !waiter.observedTurnActivity;
 		if (waiter) {
