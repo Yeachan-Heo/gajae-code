@@ -18,6 +18,7 @@ import {
 	OPENAI_HEADER_VALUES,
 	OPENAI_HEADERS,
 } from "@gajae-code/ai/providers/openai-codex/constants";
+import { isDefaultOpenAIBaseUrl } from "@gajae-code/ai/providers/openai-responses";
 import { parseTextSignature } from "@gajae-code/ai/providers/openai-responses-shared";
 import { transformMessages } from "@gajae-code/ai/providers/transform-messages";
 import type { AssistantMessage, Message, Model } from "@gajae-code/ai/types";
@@ -97,10 +98,7 @@ function resolveOpenAiCompactEndpoint(
 	// Trusted sources only: the compaction endpoint carries the OpenAI credential.
 	const envBaseUrl = readEndpointConfiguration(endpointConfiguration, "OPENAI_BASE_URL");
 	const configuredBaseUrl = model.baseUrl?.trim().replace(/\/+$/, "");
-	const isDefaultBaseUrl =
-		!configuredBaseUrl ||
-		configuredBaseUrl === OPENAI_DEFAULT_BASE_URL ||
-		configuredBaseUrl === "https://api.openai.com";
+	const isDefaultBaseUrl = !configuredBaseUrl || isDefaultOpenAIBaseUrl(configuredBaseUrl);
 	const rawBase =
 		envBaseUrl && isDefaultBaseUrl ? envBaseUrl : configuredBaseUrl || envBaseUrl || OPENAI_DEFAULT_BASE_URL;
 	const normalizedBase = rawBase.endsWith("/") ? rawBase.slice(0, -1) : rawBase;
