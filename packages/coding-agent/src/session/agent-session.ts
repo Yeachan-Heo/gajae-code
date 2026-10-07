@@ -4298,6 +4298,8 @@ export class AgentSession {
 	 * exposes an unowned history rewrite.
 	 */
 	#sessionTransitionKind: string | undefined;
+	#sessionTransitionCompletion: Promise<void> = Promise.resolve();
+	#resolveSessionTransitionCompletion: (() => void) | undefined;
 	#queuedDeliveryPendingWhileTransition = false;
 	#deferredAutoContinueDuringTransition: (() => void) | undefined;
 	#coordinatorPersistGeneration = 0;
@@ -4379,8 +4381,17 @@ export class AgentSession {
 			for (const controller of this.#configurationReloadControllers) controller.abort();
 		}
 		this.#sessionTransitionKind = kind;
+		const completion = Promise.withResolvers<void>();
+		this.#sessionTransitionCompletion = completion.promise;
+		this.#resolveSessionTransitionCompletion = completion.resolve;
 		this.#coordinatorPersistGeneration += 1;
 		this.#wakeFollowUpReservationTransitionWaiters();
+	}
+
+	async #waitForSessionTransitionEnd(signal: AbortSignal): Promise<void> {
+		while (this.#sessionTransitionKind !== undefined) {
+			await awaitPromptInvocationPreflight(this.#sessionTransitionCompletion, signal);
+		}
 	}
 
 	async #settleActivePromptForHistoryTransition(): Promise<void> {
@@ -4403,6 +4414,10 @@ export class AgentSession {
 
 	#endSessionTransition(): void {
 		this.#sessionTransitionKind = undefined;
+		const resolveCompletion = this.#resolveSessionTransitionCompletion;
+		this.#resolveSessionTransitionCompletion = undefined;
+		this.#sessionTransitionCompletion = Promise.resolve();
+		resolveCompletion?.();
 		const deferredAutoContinue = this.#deferredAutoContinueDuringTransition;
 		this.#deferredAutoContinueDuringTransition = undefined;
 		if (!this.#isDisposed && !this.#sessionAdmissionClosing) deferredAutoContinue?.();
@@ -18519,6 +18534,9 @@ export class AgentSession {
 	): Promise<ConfigurationReloadResult> {
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) throw new ConfigurationReloadError("SESSION_UNAVAILABLE");
+		if (this.#sessionTransitionKind !== undefined) {
+			await this.#waitForSessionTransitionEnd(AbortSignal.any([signal, this.#disposeAbortController.signal]));
+		}
 		this.#assertConfigurationReloadAvailable(candidate);
 
 		const transitionAbortController = new AbortController();
@@ -18544,6 +18562,7 @@ export class AgentSession {
 		let stagedModels: ModelsConfigReloadCandidate | undefined;
 		let modelRollbackAttempted = false;
 		let modelCommitSucceeded = false;
+		let retryAfterSessionTransition = false;
 		try {
 			reloadSignal.throwIfAborted();
 			await awaitPromptInvocationPreflight(priorSelectionFence, reloadSignal);
@@ -18730,8 +18749,17 @@ export class AgentSession {
 					throw new ConfigurationReloadError("PUBLICATION_FAILED", new AggregateError([error, rollbackError]));
 				}
 			}
-			if (error instanceof ConfigurationReloadError) throw error;
-			throw new ConfigurationReloadError("PUBLICATION_FAILED", error);
+			if (
+				transitionAbortController.signal.aborted &&
+				!signal.aborted &&
+				!this.#disposeAbortController.signal.aborted
+			) {
+				retryAfterSessionTransition = true;
+			} else if (error instanceof ConfigurationReloadError) {
+				throw error;
+			} else {
+				throw new ConfigurationReloadError("PUBLICATION_FAILED", error);
+			}
 		} finally {
 			publicationFenceRelease?.();
 			if (this.#selectionAwaitingMutationTransaction === selectionTransaction) {
@@ -18745,6 +18773,11 @@ export class AgentSession {
 			this.#configurationReloadControllers.delete(transitionAbortController);
 			this.#resolveSessionSettlement();
 		}
+		if (retryAfterSessionTransition) {
+			await this.#waitForSessionTransitionEnd(AbortSignal.any([signal, this.#disposeAbortController.signal]));
+			return await this.reloadConfiguration(candidate, signal);
+		}
+		throw new Error("Configuration reload exited without a result or a session-transition retry.");
 	}
 
 	#updatedCurrentModel(registry: ModelRegistry): Model | undefined {

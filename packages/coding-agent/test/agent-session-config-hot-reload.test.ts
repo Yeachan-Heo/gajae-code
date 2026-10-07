@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
-import type { ConfigHotReloadCandidate } from "../src/config/config-hot-reload";
+import { type ConfigHotReloadCandidate, ConfigHotReloadWatcher } from "../src/config/config-hot-reload";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { AgentSession } from "../src/session/agent-session";
@@ -11,6 +11,14 @@ import { SessionManager } from "../src/session/session-manager";
 
 const provider = "reload-test";
 const modelId = "active-model";
+
+async function waitFor(predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!predicate()) {
+		if (Date.now() >= deadline) throw new Error("Timed out waiting for configuration reload");
+		await Bun.sleep(10);
+	}
+}
 
 describe("AgentSession configuration reload", () => {
 	let tempDir: string | undefined;
@@ -272,6 +280,59 @@ describe("AgentSession configuration reload", () => {
 		await session!.runWithPromptAdmissionForTests(async () => {
 			expect(modelRegistry!.find(provider, modelId)?.name).toBe("Before");
 		});
+	});
+
+	it("retries a validated reload after a session transition cancels publication", async () => {
+		const { configPath, modelsPath } = await createSession();
+		const resumePublicationFence = Promise.withResolvers<void>();
+		const originalAcquirePublicationFence = modelRegistry!.acquirePublicationFence.bind(modelRegistry!);
+		let publicationFenceEntered = false;
+		const publicationFenceSpy = vi
+			.spyOn(modelRegistry!, "acquirePublicationFence")
+			.mockImplementation(async signal => {
+				if (!publicationFenceEntered) {
+					publicationFenceEntered = true;
+					await resumePublicationFence.promise;
+				}
+				return await originalAcquirePublicationFence(signal);
+			});
+		let applyFinished = false;
+		let applyResult: unknown;
+		let applyError: unknown;
+		const watcherErrors: unknown[] = [];
+		const watcher = new ConfigHotReloadWatcher({
+			onValidate: candidate => session!.validateConfiguration(candidate),
+			onCandidate: async (candidate, signal) => {
+				try {
+					applyResult = await session!.reloadConfiguration(candidate, signal);
+				} catch (error) {
+					applyError = error;
+					throw error;
+				} finally {
+					applyFinished = true;
+				}
+			},
+			onError: error => watcherErrors.push(error),
+		});
+		try {
+			await watcher.start({ configPath, modelsPath });
+			await Bun.write(configPath, settingsText({ todoEnabled: true, compactionEnabled: false }));
+			await waitFor(() => publicationFenceEntered);
+
+			const transition = session!.newSession();
+			resumePublicationFence.resolve();
+			await expect(transition).resolves.toBe(true);
+			await waitFor(() => applyFinished);
+
+			expect(applyError).toBeUndefined();
+			expect(applyResult).toMatchObject({ applied: true, settingsChanged: true });
+			expect(session!.settings.get("todo.enabled")).toBe(true);
+			expect(watcherErrors).toEqual([]);
+		} finally {
+			resumePublicationFence.resolve();
+			watcher.dispose();
+			publicationFenceSpy.mockRestore();
+		}
 	});
 
 	it("publishes global setting changes even when a runtime override shadows their effective value", async () => {
