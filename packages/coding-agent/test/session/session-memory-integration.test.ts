@@ -3850,6 +3850,75 @@ describe("whole-session persistence freshness", () => {
 		expect(manager.getEntries()).toHaveLength(0);
 		expect(manager.hotRetainedMessageCharsForTests()).toBe(0);
 	});
+	it("resets a stale close origin across session replacement", async () => {
+		class ReplacementCloseStorage extends MemorySessionStorage {
+			readonly closeDispatches = new Map<string, number>();
+			#failures = new Map<string, number>();
+
+			failNextClose(filePath: string): void {
+				this.#failures.set(filePath, 1);
+			}
+
+			override openWriter(filePath: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter {
+				if (filePath.includes(".spill.")) return super.openWriter(filePath, options);
+				return super.openWriter(filePath, {
+					...options,
+					closeAdapter: {
+						close: () => {
+							const dispatches = (this.closeDispatches.get(filePath) ?? 0) + 1;
+							this.closeDispatches.set(filePath, dispatches);
+							const failures = this.#failures.get(filePath) ?? 0;
+							if (failures > 0) {
+								this.#failures.set(filePath, failures - 1);
+								throw new SessionStorageWriterRetryableCloseError(
+									filePath.includes("source") ? "writer_close_error_x" : "writer_close_error_y",
+								);
+							}
+						},
+					},
+				});
+			}
+		}
+
+		const storage = new ReplacementCloseStorage();
+		const sourceFile = "/sessions/replacement-source.jsonl";
+		const targetFile = "/sessions/replacement-target.jsonl";
+		for (const [file, id] of [
+			[sourceFile, "replacement-source"],
+			[targetFile, "replacement-target"],
+		] as const) {
+			storage.writeTextSync(
+				file,
+				`${JSON.stringify({ type: "session", version: 5, id, timestamp: "0", cwd: "/cwd" })}\n`,
+			);
+		}
+		storage.failNextClose(sourceFile);
+		storage.failNextClose(targetFile);
+		const manager = await SessionManager.open(
+			sourceFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"off",
+		);
+		try {
+			manager.appendCustomEntry("source-entry", { value: 1 });
+			await manager.flush();
+			await expect(manager.setSessionFile(targetFile)).rejects.toThrow("writer_close_error_x");
+			await expect(manager.setSessionFile(targetFile)).resolves.toBeUndefined();
+			expect(storage.closeDispatches.get(sourceFile)).toBe(2);
+			manager.appendCustomEntry("target-entry", { value: 2 });
+			await manager.flush();
+
+			await expect(manager.close()).rejects.toThrow("writer_close_error_y");
+			await expect(manager.close()).resolves.toBeUndefined();
+			expect(storage.closeDispatches.get(targetFile)).toBe(2);
+			expect(manager.getEntries()).toHaveLength(0);
+			expect(manager.getHeader()).toBeNull();
+		} finally {
+			await manager.close().catch(() => {});
+		}
+	});
 	it("reprepares queued patches when a direct append invalidates their persistence token", async () => {
 		const storage = new MemorySessionStorage();
 		const sessionFile = "/sessions/patch-race.jsonl";
