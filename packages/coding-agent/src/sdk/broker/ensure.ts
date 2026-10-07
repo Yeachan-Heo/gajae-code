@@ -128,6 +128,7 @@ export interface BrokerLaunchResult {
 
 const MAX_LAUNCHER_OUTPUT_CHARS = 4_096;
 const DEFAULT_LAUNCHER_TIMEOUT_MS = 30_000;
+const HOP_HANDOFF_CLEANUP_TIMEOUT_MS = 1_000;
 
 function appendBoundedOutput(current: string, chunk: Buffer | string): string {
 	const next = current + chunk.toString();
@@ -163,6 +164,7 @@ async function terminateLauncher(child: ChildProcess): Promise<boolean> {
 async function awaitLauncherCloseBeforeDeadline(
 	child: ChildProcess,
 	timeoutMs: number,
+	onTimeout?: () => void,
 ): Promise<
 	{ kind: "closed"; outcome: { code: number | null; spawnError?: Error } } | { kind: "timeout"; terminated: boolean }
 > {
@@ -172,6 +174,14 @@ async function awaitLauncherCloseBeforeDeadline(
 		Bun.sleep(timeoutMs).then(() => ({ kind: "timeout" as const })),
 	]);
 	if (result.kind === "closed") return result;
+	if (onTimeout) {
+		onTimeout();
+		const cleanupFinished = await Promise.race([
+			closed.then(() => true),
+			Bun.sleep(HOP_HANDOFF_CLEANUP_TIMEOUT_MS).then(() => false),
+		]);
+		if (cleanupFinished) return { kind: "timeout", terminated: true };
+	}
 	return { kind: "timeout", terminated: await terminateLauncher(child) };
 }
 
@@ -179,8 +189,9 @@ async function awaitLauncherCloseBeforeDeadline(
 export async function awaitBrokerLauncherForTest(
 	child: ChildProcess,
 	timeoutMs: number,
+	onTimeout?: () => void,
 ): Promise<{ kind: "closed" } | { kind: "timeout"; terminated: boolean }> {
-	const result = await awaitLauncherCloseBeforeDeadline(child, timeoutMs);
+	const result = await awaitLauncherCloseBeforeDeadline(child, timeoutMs, onTimeout);
 	return result.kind === "closed" ? { kind: "closed" } : result;
 }
 
@@ -216,9 +227,9 @@ export async function launchBrokerViaHop(
 	hop.stderr?.on("data", chunk => {
 		stderr = appendBoundedOutput(stderr, chunk);
 	});
-	const wait = await awaitLauncherCloseBeforeDeadline(hop, timeoutMs);
+	const wait = await awaitLauncherCloseBeforeDeadline(hop, timeoutMs, () => hop.stdout?.destroy());
 	if (wait.kind === "timeout") {
-		const detail = wait.terminated ? "hop was terminated" : "hop did not exit after termination";
+		const detail = wait.terminated ? "hop exited after handoff cleanup" : "hop did not exit after termination";
 		return {
 			process: hop,
 			realBrokerPid: undefined,

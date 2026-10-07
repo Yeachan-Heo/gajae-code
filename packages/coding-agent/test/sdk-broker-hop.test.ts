@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import * as childProcess from "node:child_process";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
-import path from "node:path";
+import * as path from "node:path";
+import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { type BrokerDiscovery, isPidAlive } from "../src/sdk/broker/discovery";
 import {
 	awaitBrokerLauncherForTest,
@@ -15,13 +16,14 @@ import {
 	reapDetachedBrokerPidForTest,
 	reapSpawnedBrokerForTest,
 } from "../src/sdk/broker/ensure";
+import { writeBrokerHopReplyForTest } from "../src/sdk/broker/hop";
 import { observeProcessIncarnation } from "../src/sdk/broker/process-incarnation";
 
 describe("SDK broker hop protocol", () => {
 	let tempDir: string;
 
 	beforeEach(async () => {
-		tempDir = path.join(os.tmpdir(), `gjc-hop-test-${randomUUID()}`);
+		tempDir = path.join(os.tmpdir(), `gjc-hop-test-${crypto.randomUUID()}`);
 		await fs.mkdir(tempDir, { recursive: true });
 	});
 
@@ -85,6 +87,31 @@ describe("SDK broker hop protocol", () => {
 		expect(observeProcessIncarnation(pid).status).toBe("absent");
 	});
 
+	test("failed hop handoff terminates the pinned broker process", async () => {
+		const child = childProcess.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+		const spawned = Promise.withResolvers<void>();
+		child.once("spawn", spawned.resolve);
+		await spawned.promise;
+		const pid = child.pid;
+		if (pid === undefined) throw new Error("Test broker did not expose its pid.");
+		const reference = nativeProcessBindings().Process.fromPid(pid);
+		if (!reference) throw new Error("Test broker process could not be pinned.");
+		expect(reference.ppid).toBe(process.pid);
+
+		try {
+			const result = await writeBrokerHopReplyForTest(child, reference, pid, (_chunk, callback) => {
+				callback(new Error("EPIPE: broken pipe, write"));
+			});
+			expect(result.kind).toBe("failed");
+			if (result.kind !== "failed") throw new Error("Expected failed handoff result.");
+			expect(result.reason).toContain("broker terminated");
+			expect(reference.status()).not.toBe("running");
+		} finally {
+			if (reference.status() === "running") reference.signalRoot(os.constants.signals.SIGKILL);
+			await reference.waitForExit({ timeoutMs: 1_000 });
+		}
+	});
+
 	test("hop launch errors preserve the underlying spawn diagnostic", async () => {
 		const launched = await launchBrokerViaHop(
 			{ command: { file: path.join(tempDir, "missing-broker"), args: [] } },
@@ -101,7 +128,7 @@ describe("SDK broker hop protocol", () => {
 	});
 
 	test("launcher wait terminates a child when its startup deadline expires", async () => {
-		const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+		const child = childProcess.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
 		const spawned = Promise.withResolvers<void>();
 		const closed = Promise.withResolvers<void>();
 		child.once("spawn", spawned.resolve);
@@ -120,9 +147,35 @@ describe("SDK broker hop protocol", () => {
 		}
 	});
 
+	test("launcher deadline runs the bounded handoff cleanup before forced termination", async () => {
+		const child = childProcess.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		const spawned = Promise.withResolvers<void>();
+		const closed = Promise.withResolvers<void>();
+		child.once("spawn", spawned.resolve);
+		child.once("close", closed.resolve);
+		await spawned.promise;
+		let cleanupRequested = false;
+		try {
+			const result = await awaitBrokerLauncherForTest(child, 10, () => {
+				cleanupRequested = true;
+				child.stdout?.destroy();
+				child.kill("SIGKILL");
+			});
+			expect(result).toEqual({ kind: "timeout", terminated: true });
+			expect(cleanupRequested).toBe(true);
+		} finally {
+			if (child.exitCode === null && child.signalCode === null) {
+				child.kill("SIGKILL");
+				await closed.promise;
+			}
+		}
+	});
+
 	test("broker inherits the hop environment and writes stderr to the log path (no fd numbers, no env on argv)", async () => {
 		const logPath = path.join(tempDir, "broker-spawn.log");
-		const marker = `SECRET_${randomUUID()}`;
+		const marker = `SECRET_${crypto.randomUUID()}`;
 		// Use Bun for cross-platform environment variable printing
 		const echoScript = path.join(tempDir, "echo-env.js");
 		await Bun.write(echoScript, `console.error(process.env.GJC_HOP_TEST_VALUE); await Bun.sleep(1000);`);
