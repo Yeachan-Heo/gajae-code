@@ -100,6 +100,8 @@ export interface SdkClientOptions {
 
 export interface SdkRequestOptions {
 	timeoutMs?: number;
+	/** Absolute wall-clock deadline for this call, including connection and reconnect waits. */
+	deadline?: number;
 	idempotencyKey?: string;
 	confirm?: boolean;
 	/**
@@ -188,6 +190,7 @@ type Incarnation = {
 type Pending = {
 	readonly incarnation: Incarnation;
 	readonly connectedOnly: boolean;
+	readonly deadline: number;
 	resolve: (value: unknown) => void;
 	reject: (error: Error) => void;
 	timer: NodeJS.Timeout;
@@ -343,8 +346,11 @@ export class SdkClient {
 		return client;
 	}
 
-	async connect(): Promise<void> {
-		await this.#connect();
+	async connect(options: { deadline?: number } = {}): Promise<void> {
+		const deadline = this.#effectiveDeadline(options.deadline);
+		await (options.deadline === undefined || deadline === undefined
+			? this.#connect()
+			: this.#connectBeforeDeadline(deadline));
 	}
 
 	/** Resolves once the current WebSocket has received its server hello frame. */
@@ -486,12 +492,14 @@ export class SdkClient {
 	}
 
 	async #request(frame: Frame, options: SdkRequestOptions, onResponse?: () => void): Promise<unknown> {
+		const deadline = this.#effectiveDeadline(options.deadline);
 		if (this.#closed) {
 			const error = transportError("connection_closed", "SDK client closed");
 			throw options.connectedOnly ? new SdkPreparedDispatchError(error) : error;
 		}
 		try {
 			this.#throwIfDeadlineElapsed();
+			if (deadline !== undefined && Date.now() >= deadline) throw this.#deadlineError();
 		} catch (error) {
 			if (options.connectedOnly && error instanceof SdkClientError) throw new SdkPreparedDispatchError(error);
 			throw error;
@@ -504,8 +512,14 @@ export class SdkClient {
 				if (error instanceof SdkClientError) throw new SdkPreparedDispatchError(error);
 				throw error;
 			}
-		} else incarnation = await this.#connect();
-		const timeoutMs = this.#remainingTimeout(options.timeoutMs ?? this.#timeoutMs);
+		} else
+			incarnation = await (options.deadline === undefined || deadline === undefined
+				? this.#connect()
+				: this.#connectBeforeDeadline(deadline));
+		const timeoutMs = Math.min(
+			this.#remainingTimeout(options.timeoutMs ?? this.#timeoutMs),
+			deadline === undefined ? Infinity : Math.max(0, deadline - Date.now()),
+		);
 		if (timeoutMs <= 0) {
 			const error = this.#deadlineError();
 			throw options.connectedOnly ? new SdkPreparedDispatchError(error) : error;
@@ -535,6 +549,7 @@ export class SdkClient {
 		const pending: Pending = {
 			incarnation,
 			connectedOnly: options.connectedOnly === true,
+			deadline: Math.min(Date.now() + timeoutMs, deadline ?? Infinity),
 			resolve: deferred.resolve,
 			reject: deferred.reject,
 			sent: false,
@@ -615,7 +630,7 @@ export class SdkClient {
 				);
 			return await deferred.promise;
 		}
-		if (this.#deadline !== undefined && Date.now() >= this.#deadline) {
+		if (Date.now() >= pending.deadline) {
 			const error = this.#deadlineError();
 			this.#settlePending(id, pending, options.connectedOnly ? new SdkPreparedDispatchError(error) : error);
 			return await deferred.promise;
@@ -684,6 +699,28 @@ export class SdkClient {
 
 	#deadlineError(reconnect?: SdkReconnectExhaustedDetails): SdkClientError {
 		return transportError("timeout", "SDK client deadline elapsed.", undefined, reconnect);
+	}
+
+	#effectiveDeadline(deadline?: number): number | undefined {
+		const callDeadline = typeof deadline === "number" && Number.isFinite(deadline) ? deadline : undefined;
+		if (callDeadline === undefined) return this.#deadline;
+		return this.#deadline === undefined ? callDeadline : Math.min(callDeadline, this.#deadline);
+	}
+
+	async #connectBeforeDeadline(deadline: number): Promise<Incarnation> {
+		if (Date.now() >= deadline) throw this.#deadlineError();
+		const expired = Promise.withResolvers<Incarnation>();
+		const timer = setTimeout(() => expired.reject(this.#deadlineError()), deadline - Date.now());
+		timer.unref?.();
+		try {
+			// Only this waiter expires: the shared connection/reconnect cycle remains
+			// live for other requests, and its eventual rejection stays observed.
+			const incarnation = await Promise.race([this.#connect(), expired.promise]);
+			if (Date.now() >= deadline) throw this.#deadlineError();
+			return incarnation;
+		} finally {
+			clearTimeout(timer);
+		}
 	}
 
 	#remainingTimeout(limit = this.#timeoutMs): number {
@@ -1062,6 +1099,11 @@ export class SdkClient {
 		responseReceived = false,
 	): void {
 		if (this.#pending.get(id) !== pending) return;
+		if (responseReceived && Date.now() >= pending.deadline) {
+			result = this.#deadlineError();
+			transportFailure = true;
+			responseReceived = false;
+		}
 		this.#pending.delete(id);
 		clearTimeout(pending.timer);
 		if (responseReceived) pending.onResponse?.();

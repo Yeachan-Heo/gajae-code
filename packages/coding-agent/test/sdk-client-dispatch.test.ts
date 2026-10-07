@@ -1162,6 +1162,245 @@ test("a send that throws after a reentrant close keeps the reentrant settlement"
 	});
 });
 
+test("per-call deadline bounds delayed connect without cancelling shared hello", async () => {
+	await withFakeTransport(async clock => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		let outcome: unknown;
+		const limited = client.connect({ deadline: clock.now + 10 });
+		limited.then(
+			() => {
+				outcome = "success";
+			},
+			error => {
+				outcome = error;
+			},
+		);
+		const shared = client.connect();
+		const socket = FakeWebSocket.instances.at(-1)!;
+		clock.advance(10);
+		for (let i = 0; i < 12; i++) await flush();
+		expect(outcome).toMatchObject({ code: "timeout", transport: true });
+		expect(socket.closeCalls).toHaveLength(0);
+		socket.open();
+		socket.message({ type: "hello", connectionId: "shared" });
+		await shared;
+		await client.close();
+		expect(clock.tasks.size).toBe(0);
+	});
+});
+
+test("per-call deadline expires a reconnect waiter without dispatch or poisoning recovery", async () => {
+	await withFakeTransport(async clock => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 1, reconnectBackoffMs: 20 });
+		const first = await connect(client);
+		first.readyState = FakeWebSocket.CLOSED;
+		first.emit("close");
+		let outcome: unknown;
+		const request = client.request(
+			{ type: "control_request", operation: "session.list" },
+			{ deadline: clock.now + 10 },
+		);
+		request.then(
+			() => {
+				outcome = "success";
+			},
+			error => {
+				outcome = error;
+			},
+		);
+		const shared = client.connect();
+		const failed = FakeWebSocket.instances.at(-1)!;
+		failed.emit("error");
+		for (let i = 0; i < 12; i++) await flush();
+		clock.advance(10);
+		for (let i = 0; i < 12; i++) await flush();
+		expect(outcome).toMatchObject({ code: "timeout" });
+		clock.advance(10);
+		for (let i = 0; i < 12; i++) await flush();
+		const recovered = FakeWebSocket.instances.at(-1)!;
+		recovered.open();
+		recovered.message({ type: "hello", connectionId: "recovered" });
+		await shared;
+		for (let i = 0; i < 12; i++) await flush();
+		expect(recovered.sent).toHaveLength(0);
+		await client.close();
+		expect(clock.tasks.size).toBe(0);
+	});
+});
+
+test("per-call deadline rejects late hello even before its timer runs", async () => {
+	await withFakeTransport(async clock => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		const pending = client.connect({ deadline: clock.now + 10 });
+		pending.catch(() => undefined);
+		const socket = FakeWebSocket.instances.at(-1)!;
+		clock.now += 10;
+		socket.open();
+		socket.message({ type: "hello", connectionId: "late" });
+		await expect(pending).rejects.toMatchObject({ code: "timeout" });
+		await client.connect();
+		expect(socket.closeCalls).toHaveLength(0);
+		await client.close();
+	});
+});
+
+test("per-call deadline revalidates after beforeDispatch in prepared and ordinary requests", async () => {
+	await withFakeTransport(async clock => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		const socket = await connect(client);
+		for (const connectedOnly of [false, true]) {
+			let outcome: unknown;
+			const request = client.request(
+				{ type: "control_request", operation: "session.list" },
+				{
+					deadline: clock.now + 10,
+					connectedOnly,
+					beforeDispatch: () => {
+						clock.now += 10;
+					},
+				},
+			);
+			request.then(
+				() => {
+					outcome = "success";
+				},
+				error => {
+					outcome = error;
+				},
+			);
+			for (let i = 0; i < 12; i++) await flush();
+			expect(outcome).toMatchObject({ code: "timeout" });
+			if (connectedOnly) await expect(request).rejects.toBeInstanceOf(SdkPreparedDispatchError);
+		}
+		expect(socket.sent).toHaveLength(0);
+		expect(clock.tasks.size).toBe(0);
+		await client.close();
+	});
+});
+
+test("per-call deadline timer retains sent uncertainty and permits client reuse after late ack", async () => {
+	await withFakeTransport(async clock => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		const socket = await connect(client);
+		let outcome: unknown;
+		const request = client.request(
+			{ type: "control_request", operation: "session.create" },
+			{
+				deadline: clock.now + 10,
+				idempotencyKey: "deadline-claim",
+			},
+		);
+		request.then(
+			() => {
+				outcome = "success";
+			},
+			error => {
+				outcome = error;
+			},
+		);
+		for (let i = 0; i < 12; i++) await flush();
+		const frame = sentFrame(socket);
+		clock.advance(10);
+		for (let i = 0; i < 12; i++) await flush();
+		expect(outcome).toMatchObject({
+			code: "uncertain_after_send",
+			details: { id: frame.id, idempotencyKey: "deadline-claim" },
+		});
+		socket.message({ type: "control_response", id: frame.id, ok: true });
+		expect(client.getSentRecord(frame.id as string)).toMatchObject({ idempotencyKey: "deadline-claim" });
+		const reused = client.request(
+			{ type: "control_request", operation: "session.list" },
+			{ deadline: clock.now + 10 },
+		);
+		for (let i = 0; i < 12; i++) await flush();
+		socket.message({ type: "control_response", id: sentFrame(socket, 1).id, ok: true });
+		await expect(reused).resolves.toMatchObject({ ok: true });
+		expect(socket.closeCalls).toHaveLength(0);
+		await client.close();
+		expect(clock.tasks.size).toBe(0);
+	});
+});
+
+test("per-call deadline rejects expired requests before opening a socket", async () => {
+	await withFakeTransport(async clock => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		await expect(client.request({ type: "control_request" }, { deadline: clock.now })).rejects.toMatchObject({
+			code: "timeout",
+		});
+		await expect(client.connect({ deadline: clock.now })).rejects.toMatchObject({ code: "timeout" });
+		expect(FakeWebSocket.instances).toHaveLength(0);
+		expect(clock.tasks.size).toBe(0);
+		await client.close();
+	});
+});
+
+test("per-call deadline cleans waiter timers when connect is cancelled or exhausts retries", async () => {
+	await withFakeTransport(async clock => {
+		for (const cancel of [false, true]) {
+			const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+			const pending = client.connect({ deadline: clock.now + 100 });
+			pending.catch(() => undefined);
+			const socket = FakeWebSocket.instances.at(-1)!;
+			if (cancel) await client.close();
+			else socket.emit("error");
+			await expect(pending).rejects.toMatchObject({ code: cancel ? "connection_closed" : "reconnect_exhausted" });
+			expect(clock.tasks.size).toBe(0);
+			await client.close();
+		}
+	});
+});
+
+test("per-call deadline preserves throw and teardown settlement and clears request timers", async () => {
+	await withFakeTransport(async clock => {
+		for (const failure of ["before", "send", "close"] as const) {
+			const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+			const socket = await connect(client);
+			const aborted = new Error("pre-dispatch abort");
+			if (failure === "send") socket.throwOnSend = new Error("EPIPE");
+			const request = client.request(
+				{ type: "control_request", operation: "session.list" },
+				{
+					deadline: clock.now + 100,
+					beforeDispatch: () => {
+						if (failure === "before") throw aborted;
+					},
+					onDispatch: () => {
+						if (failure === "close") void client.close();
+					},
+				},
+			);
+			if (failure === "before") await expect(request).rejects.toBe(aborted);
+			else
+				await expect(request).rejects.toMatchObject({
+					code: failure === "send" ? "unavailable" : "uncertain_after_send",
+				});
+			if (failure !== "close") expect(socket.sent).toHaveLength(0);
+			await client.close();
+			expect(clock.tasks.size).toBe(0);
+		}
+	});
+});
+
+test("per-call deadline rejects reentrant late success without waiting for timer execution", async () => {
+	await withFakeTransport(async clock => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		const socket = await connect(client);
+		socket.onSendReentrant = value => {
+			clock.now += 10;
+			const frame = JSON.parse(value) as Record<string, unknown>;
+			socket.message({ type: "control_response", id: frame.id, ok: true });
+		};
+		const request = client.request(
+			{ type: "control_request", operation: "session.create" },
+			{ deadline: clock.now + 10 },
+		);
+		await expect(request).rejects.toMatchObject({ code: "uncertain_after_send" });
+		expect(client.getSentRecord(sentFrame(socket).id as string)).toBeDefined();
+		await client.close();
+		expect(clock.tasks.size).toBe(0);
+	});
+});
+
 type FakeTimerHandle = { readonly id: number; unref: () => FakeTimerHandle };
 type FakeTimerTask = { readonly callback: () => void; readonly due: number; readonly order: number };
 
@@ -1183,6 +1422,13 @@ class FakeClock {
 
 	clearTimeout(handle: FakeTimerHandle): void {
 		this.tasks.delete(handle);
+	}
+
+	advance(ms: number): void {
+		this.now += ms;
+		for (const [handle, task] of [...this.tasks].sort((a, b) => a[1].due - b[1].due || a[1].order - b[1].order)) {
+			if (task.due <= this.now && this.tasks.delete(handle)) task.callback();
+		}
 	}
 }
 
