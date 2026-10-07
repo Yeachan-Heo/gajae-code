@@ -33,6 +33,7 @@ import { createKindAwareReconciliation } from "../bus/kind-aware-reconciliation"
 import { createPromptReconciliation } from "../bus/prompt-reconciliation";
 import {
 	createReconciliationStore,
+	type ReconciliationStore,
 	type ReconciliationStoreDocument,
 	reconciliationStorePath,
 } from "../bus/reconciliation-store";
@@ -8482,7 +8483,25 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		await Bun.write(sessionFile, "");
 		const store = createReconciliationStore({ sessionFile, sessionId });
 		const activeTools = new Set(["unfenced-tool"]);
-		let boundaryWaitStarted = false;
+		const boundaryWait = Promise.withResolvers<void>();
+		const recoveryPersisted = Promise.withResolvers<void>();
+		const terminalPublished = Promise.withResolvers<void>();
+		let correlation: { commandId?: string; turnId?: string } = {};
+		// Observe the real serialized store after its durable commit, rather than
+		// assuming the deadline's uncertainty retry ran during a fixed sleep.
+		const observedStore: ReconciliationStore = {
+			...store,
+			async transact(mutator) {
+				await store.transact(mutator);
+				const record = store.snapshot().find(row => row.commandId === correlation.commandId);
+				if (
+					record?.status === "in_flight" &&
+					record.deadlineRecoveryPending === true &&
+					record.pendingOutcome?.kind === "stopped"
+				)
+					recoveryPersisted.resolve();
+			},
+		};
 		let abortCalls = 0;
 		let harness: InvocationHarness | undefined;
 		try {
@@ -8495,12 +8514,21 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 					await options?.onPreflightAcceptCommit?.();
 					await neverSettlingPromise();
 				},
+				broadcastInterceptor: frame => {
+					const payload = frame.payload as { commandId?: string; turnId?: string } | undefined;
+					if (
+						frame.kind === "agent_end" &&
+						payload?.commandId === correlation.commandId &&
+						payload?.turnId === correlation.turnId
+					)
+						terminalPublished.resolve();
+				},
 				terminalAbortSeams: {
-					getReconciliationStore: () => store,
+					getReconciliationStore: () => observedStore,
 					getTerminalTurnEpoch: () => 109,
 					getActivePromptHandle: () => "deadline-captured-uncertain-run",
 					pendingToolExecutions: () => {
-						if (activeTools.size > 0) boundaryWaitStarted = true;
+						if (activeTools.size > 0) boundaryWait.resolve();
 						return [...activeTools];
 					},
 					abortPromptAndWaitWithTerminal: async () => {
@@ -8511,7 +8539,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			});
 			const accepted = await harness.control("turn.prompt", { text: "capture uncertain end" });
 			expect(accepted.ok).toBe(true);
-			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
 			await harness.emit("agent_start");
 			await harness.emit("tool_execution_start", {
 				type: "tool_execution_start",
@@ -8519,11 +8547,9 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				toolName: "apply_patch",
 				args: {},
 			});
-			const waitDeadline = Date.now() + 2_000;
-			while (!boundaryWaitStarted && Date.now() < waitDeadline) await Bun.sleep(10);
-			expect(boundaryWaitStarted).toBe(true);
+			await boundaryWait.promise;
 			await harness.emit("agent_end", { stopReason: "cancelled" });
-			await Bun.sleep(5_200);
+			await recoveryPersisted.promise;
 			expect(abortCalls).toBe(0);
 			expect((await harness.query("turn.prompt_status", correlation)).result).toMatchObject({ status: "in_flight" });
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toEqual([]);
@@ -8549,17 +8575,17 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			});
 
 			activeTools.clear();
-			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
+			await terminalPublished.promise;
+			expect((await harness.query("turn.prompt_status", correlation)).result).toMatchObject({
 				status: "terminal_ok",
 				outcome: { kind: "stopped", reason: "cancelled" },
 			});
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toHaveLength(1);
 		} finally {
 			await harness?.stop();
-			await Bun.sleep(10);
 			await rm(cwd, { recursive: true, force: true });
 		}
-	});
+	}, 30_000);
 
 	test("an unproven real end stays private until exact settlement evidence exists", async () => {
 		// A matching lifecycle end still cannot settle a recovered deadline record
