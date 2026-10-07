@@ -76,7 +76,10 @@ describe("SDK broker hop protocol", () => {
 	});
 
 	test("hop reports a live detached broker pid that outlives the hop, and reap targets that pid", async () => {
-		const { hop, stdout, code } = await runHop({ command: { file: "sleep", args: ["30"] }, cwd: tempDir });
+		// Use Bun for cross-platform sleep instead of shell utility
+		const sleepScript = path.join(tempDir, "sleep-broker.js");
+		await fs.writeFile(sleepScript, `await Bun.sleep(30000);`);
+		const { hop, stdout, code } = await runHop({ command: { file: process.execPath, args: [sleepScript] }, cwd: tempDir });
 		expect(code).toBe(0);
 		const reported = JSON.parse(stdout.trim()) as { pid: number };
 		expect(Number.isInteger(reported.pid)).toBe(true);
@@ -99,8 +102,11 @@ describe("SDK broker hop protocol", () => {
 	test("broker inherits the hop environment and writes stderr to the log path (no fd numbers, no env on argv)", async () => {
 		const logPath = path.join(tempDir, "broker-spawn.log");
 		const marker = `SECRET_${randomUUID()}`;
+		// Use Bun for cross-platform environment variable printing
+		const echoScript = path.join(tempDir, "echo-env.js");
+		await fs.writeFile(echoScript, `console.error(process.env.GJC_HOP_TEST_VALUE);`);
 		const message = {
-			command: { file: "sh", args: ["-c", 'echo "$GJC_HOP_TEST_VALUE" >&2'] },
+			command: { file: process.execPath, args: [echoScript] },
 			stderrLogPath: logPath,
 		};
 		expect(JSON.stringify(message)).not.toContain(marker);
