@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
 import {
+	activateModelProfile,
 	applyPreparedModelProfileActivation,
 	prepareModelProfileActivation,
 } from "@gajae-code/coding-agent/config/model-profile-activation";
@@ -183,6 +184,40 @@ describe("AgentSession profile resume defaults", () => {
 
 			expect(session.model).toEqual(base);
 			expect(mutationStarted).toBe(false);
+		} finally {
+			getApiKey.mockRestore();
+		}
+	});
+
+	it("restores prior fallback state when profile model mutation is canceled", async () => {
+		const { base } = resolveModels();
+		session = makeSession(base);
+		session.setConfiguredModelChain("default", ["openai-codex/gpt-5.5"], "model_selection", "explicit", true);
+		session.setDefaultFallbackRuntimeModel("openai-codex/gpt-5.5");
+		const previousChain = session.getConfiguredModelChainState("default");
+		const previousFallbackState = session.getDefaultFallbackRuntimeState();
+		const apiKey = Promise.withResolvers<string | undefined>();
+		const mutationWaiting = Promise.withResolvers<void>();
+		const getApiKey = spyOn(modelRegistry, "getApiKey").mockImplementation(() => {
+			mutationWaiting.resolve();
+			return apiKey.promise;
+		});
+		const selectionRevision = session.getUserModelSelectionRevision();
+
+		try {
+			const activation = activateModelProfile(
+				{ session, modelRegistry, settings: session.settings, profileName: "claude-opus" },
+				{ isCurrent: () => session.getUserModelSelectionRevision() === selectionRevision },
+			);
+			await mutationWaiting.promise;
+			session.markUserModelSelection();
+			apiKey.resolve("test-key");
+			await activation;
+
+			expect(session.model).toEqual(base);
+			expect(session.getConfiguredModelChainState("default")).toEqual(previousChain);
+			expect(session.getDefaultFallbackRuntimeState()).toEqual(previousFallbackState);
+			expect(session.getActiveModelProfile()).toBeUndefined();
 		} finally {
 			getApiKey.mockRestore();
 		}

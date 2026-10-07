@@ -1830,6 +1830,10 @@ export async function applyPreparedModelProfileActivation(
 	} catch (error) {
 		const activationWasCancelled = error instanceof ModelProfileActivationSupersededError;
 		const selectionSuperseded = options.isCurrent?.() === false;
+		const shouldRestoreFallbackRuntimeState =
+			prepared.previousDefaultFallbackRuntimeState !== undefined &&
+			(!selectionSuperseded ||
+				sameSerializedValue(prepared.session.getDefaultFallbackRuntimeState?.(), activatedFallbackRuntimeState));
 		const rollbackErrors: Array<{ stage: string; error: unknown }> = [];
 		const restore = (stage: string, action: () => void): void => {
 			try {
@@ -1955,11 +1959,7 @@ export async function applyPreparedModelProfileActivation(
 				),
 			);
 		}
-		if (
-			prepared.previousDefaultFallbackRuntimeState &&
-			(!selectionSuperseded ||
-				sameSerializedValue(prepared.session.getDefaultFallbackRuntimeState?.(), activatedFallbackRuntimeState))
-		) {
+		if (shouldRestoreFallbackRuntimeState) {
 			restore("restore fallback runtime", () =>
 				prepared.session.restoreDefaultFallbackRuntimeState?.(prepared.previousDefaultFallbackRuntimeState!),
 			);
