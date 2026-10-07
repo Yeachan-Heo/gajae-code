@@ -2410,7 +2410,9 @@ function managedAssistantContent(value: unknown): AssistantMessage["content"][nu
 	}
 	if (type === "thinking") {
 		const thinking = managedProperty(value, "thinking");
-		return typeof thinking === "string" ? { type, thinking } : undefined;
+		const thinkingSignature = managedProperty(value, "thinkingSignature");
+		if (typeof thinking !== "string") return undefined;
+		return { type, thinking, ...(typeof thinkingSignature === "string" ? { thinkingSignature } : {}) };
 	}
 	if (type === "redactedThinking") {
 		const data = managedProperty(value, "data");
