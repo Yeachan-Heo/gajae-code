@@ -80,6 +80,9 @@ function createRuntime() {
 		model: undefined as { provider: string; id: string; contextWindow?: number } | undefined,
 		thinkingLevel: undefined as string | undefined,
 		markUserModelSelection: vi.fn(),
+		async withSdkControlMutation<T>(body: () => Promise<T>): Promise<T> {
+			return body();
+		},
 		modelRegistry: {
 			async getApiKey(_model: { provider: string; id: string }, _sessionId?: string) {
 				return "test-api-key";

@@ -2795,6 +2795,8 @@ export class AgentSession {
 	#selectionFenceGeneration = 0;
 	#defaultModelSelectionMutationRevision = 0;
 	#userModelSelectionRevision = 0;
+	#userCanonicalVariantSelectionRevision = 0;
+	#userCanonicalVariantSelection: string | undefined;
 	#thinkingLevelMutationRevision = 0;
 	#thinkingVisibilityMutationRevision = 0;
 	#thinkingLevelLiveMutationRevision = 0;
@@ -18214,6 +18216,7 @@ export class AgentSession {
 		this.#setModelAuthoritatively(model, cause);
 		if (cause === "user-selection") this.#unavailableModelProfile = undefined;
 		this.#seedSessionCanonicalVariant(model);
+		if (cause === "user-selection") this.#recordUserCanonicalVariantSelection(model);
 		this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, role);
 		this.settings.setModelRole(
 			role,
@@ -18278,6 +18281,14 @@ export class AgentSession {
 	/** Revision fence for deferred activation after a user model selection. */
 	getUserModelSelectionRevision(): number {
 		return this.#userModelSelectionRevision;
+	}
+
+	/** Latest concrete user choice that seeded or cleared the session's sticky canonical variant. */
+	getUserCanonicalVariantSelection(): { revision: number; canonicalVariant: string | undefined } {
+		return {
+			revision: this.#userCanonicalVariantSelectionRevision,
+			canonicalVariant: this.#userCanonicalVariantSelection,
+		};
 	}
 
 	/** Fence deferred startup profile recovery before an explicit control-surface selection. */
@@ -18447,12 +18458,14 @@ export class AgentSession {
 	 */
 	async activateModelProfileForControl(profileName: string): Promise<boolean> {
 		this.markUserModelSelection();
-		await activateModelProfile({
-			session: this,
-			modelRegistry: this.#modelRegistry,
-			settings: this.settings,
-			profileName,
-		});
+		await this.withSdkControlMutation(() =>
+			activateModelProfile({
+				session: this,
+				modelRegistry: this.#modelRegistry,
+				settings: this.settings,
+				profileName,
+			}),
+		);
 		return this.getActiveModelProfile() === profileName;
 	}
 
@@ -18823,6 +18836,7 @@ export class AgentSession {
 			this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
 			if (options?.persistAsSessionDefault) {
 				this.#seedSessionCanonicalVariant(model);
+				if (options.cause === "user-selection") this.#recordUserCanonicalVariantSelection(model);
 			}
 
 			// Apply explicit thinking level if given; otherwise prefer the model's
@@ -18950,6 +18964,7 @@ export class AgentSession {
 		this.markUserModelSelection();
 		this.#setModelWithProviderSessionReset(model);
 		this.#seedSessionCanonicalVariant(model);
+		this.#recordUserCanonicalVariantSelection(model);
 		const thinkingLevelChanged = this.#thinkingLevel !== thinkingLevel;
 		this.#thinkingLevelMutationRevision++;
 		this.#thinkingLevelLiveMutationRevision++;
@@ -21944,6 +21959,11 @@ export class AgentSession {
 		} else {
 			this.#modelRegistry.clearCanonicalVariant?.(this.sessionId);
 		}
+	}
+
+	#recordUserCanonicalVariantSelection(model: Model): void {
+		this.#userCanonicalVariantSelectionRevision++;
+		this.#userCanonicalVariantSelection = this.#modelRegistry.getCanonicalId?.(model);
 	}
 
 	#closeCodexProviderSessionsForHistoryRewrite(): void {

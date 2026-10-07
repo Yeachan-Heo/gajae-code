@@ -3189,6 +3189,81 @@ describe("preset-equivalent profile activation", () => {
 		expect(seedCanonicalVariant).not.toHaveBeenCalled();
 	});
 
+	test("canceled recovered runtime preparation restores sticky state for temporary choices", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "credential-gated",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "opus" },
+			source: "user",
+		};
+		const { registry, sticky } = stickyAliasRegistry({ profiles: [profile] });
+		const session = fakeSession(model("provider-a", "opus-real"));
+		sticky.set(session.sessionId, "provider-a/opus-real");
+		Object.assign(session, {
+			getUserCanonicalVariantSelection: () => ({ revision: 0, canonicalVariant: "provider-a/opus-real" }),
+		});
+		const apiKey = Promise.withResolvers<string | undefined>();
+		const probeStarted = Promise.withResolvers<void>();
+		let probeBlocked = false;
+		vi.spyOn(registry, "getApiKeyForProvider").mockImplementation(async () => {
+			if (probeBlocked) return "key-provider-a";
+			probeBlocked = true;
+			probeStarted.resolve();
+			return apiKey.promise;
+		});
+		let current = true;
+		const activation = applyModelProfileRuntimeBindings(
+			{ session, modelRegistry: registry, settings: Settings.isolated(), profileName: profile.name },
+			() => current,
+		);
+
+		await probeStarted.promise;
+		current = false;
+		apiKey.resolve("key-provider-a");
+		await activation;
+
+		expect(sticky.get(session.sessionId)).toBe("provider-a/opus-real");
+		expect(session.getActiveModelProfile()).toBeUndefined();
+	});
+
+	test("canceled preparation preserves a newer concrete canonical selection", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "credential-gated",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "opus" },
+			source: "user",
+		};
+		const { registry, sticky } = stickyAliasRegistry({ profiles: [profile] });
+		const session = fakeSession(model("provider-a", "opus-real"));
+		sticky.set(session.sessionId, "provider-a/opus-real");
+		let userCanonicalSelection = { revision: 0, canonicalVariant: "provider-a/opus-real" as string | undefined };
+		Object.assign(session, { getUserCanonicalVariantSelection: () => userCanonicalSelection });
+		const apiKey = Promise.withResolvers<string | undefined>();
+		const probeStarted = Promise.withResolvers<void>();
+		let probeBlocked = false;
+		vi.spyOn(registry, "getApiKeyForProvider").mockImplementation(async () => {
+			if (probeBlocked) return "key-provider-a";
+			probeBlocked = true;
+			probeStarted.resolve();
+			return apiKey.promise;
+		});
+		let current = true;
+		const activation = applyModelProfileRuntimeBindings(
+			{ session, modelRegistry: registry, settings: Settings.isolated(), profileName: profile.name },
+			() => current,
+		);
+
+		await probeStarted.promise;
+		userCanonicalSelection = { revision: 1, canonicalVariant: "provider-b/opus-real" };
+		sticky.set(session.sessionId, "provider-b/opus-real");
+		current = false;
+		apiKey.resolve("key-provider-a");
+		await activation;
+
+		expect(sticky.get(session.sessionId)).toBe("provider-b/opus-real");
+		expect(session.getActiveModelProfile()).toBeUndefined();
+	});
+
 	test("prepare failure restores the prior canonical sticky", async () => {
 		const profile: ModelProfileDefinition = {
 			name: "credential-gated",

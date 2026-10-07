@@ -5,6 +5,7 @@ import { logger } from "@gajae-code/utils";
 import { CliParseError } from "@gajae-code/utils/cli";
 import { parseArgs } from "../src/cli/args";
 import { ROOT_THINKING_LEVELS } from "../src/cli/root-flags";
+import { activateModelProfile } from "../src/config/model-profile-activation";
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { Settings } from "../src/config/settings";
 import {
@@ -69,6 +70,7 @@ function fakeRegistry(
 }
 
 function fakeSession(initial: Model | null = model("initial-provider", "initial")) {
+	let mutationTail = Promise.resolve();
 	const session = {
 		model: initial ?? undefined,
 		thinkingLevel: undefined as ThinkingLevel | undefined,
@@ -107,6 +109,17 @@ function fakeSession(initial: Model | null = model("initial-provider", "initial"
 		markUserModelSelection() {
 			session.userModelSelectionRevision++;
 		},
+		async withSdkControlMutation<T>(body: () => Promise<T>): Promise<T> {
+			const previous = mutationTail;
+			const next = Promise.withResolvers<void>();
+			mutationTail = next.promise;
+			await previous;
+			try {
+				return await body();
+			} finally {
+				next.resolve();
+			}
+		},
 		getConfiguredModelChain: () => undefined,
 		hasRecoveredDefaultFallbackChain: () => false,
 		setUnavailableModelProfile(name: string | undefined) {
@@ -126,6 +139,7 @@ function fakeSession(initial: Model | null = model("initial-provider", "initial"
 		configuredModelChains: typeof session.configuredModelChains;
 		seedDefaultFallbackResolutionCalls: typeof session.seedDefaultFallbackResolutionCalls;
 		markUserModelSelection: typeof session.markUserModelSelection;
+		withSdkControlMutation: typeof session.withSdkControlMutation;
 	};
 }
 describe("CLI model profile args", () => {
@@ -1271,6 +1285,77 @@ test("interactive retry skips later profile preparation after a newer selection"
 	expect(authStorage.reload).toHaveBeenCalledTimes(1);
 	expect(explicitProviderRequests).toBe(1);
 	expect(session.model).toBe(selectedModel);
+});
+
+test("serializes replacement profile preparation after stale recovery rollback", async () => {
+	const startupProfile: ModelProfileDefinition = {
+		name: "stale-startup-profile",
+		requiredProviders: ["startup-provider"],
+		modelMapping: { default: "startup-provider/default", executor: "startup-provider/executor" },
+		source: "user",
+	};
+	const replacementProfile: ModelProfileDefinition = {
+		name: "replacement-profile",
+		requiredProviders: ["replacement-provider"],
+		modelMapping: { default: "replacement-provider/default" },
+		source: "user",
+	};
+	const session = fakeSession(model("fallback-provider", "provisional"));
+	const models = [
+		model("startup-provider", "default"),
+		model("startup-provider", "executor"),
+		model("replacement-provider", "default"),
+	];
+	const registry = fakeRegistry([startupProfile, replacementProfile]);
+	registry.getAll = () => models;
+	registry.getAvailableForProfileActivation = () => models;
+	const settings = Settings.isolated();
+	const flushStarted = Promise.withResolvers<void>();
+	const allowFlush = Promise.withResolvers<void>();
+	let flushCount = 0;
+	settings.flushOrThrow = async () => {
+		flushCount += 1;
+		if (flushCount === 1) {
+			flushStarted.resolve();
+			await allowFlush.promise;
+		}
+	};
+	const startup = applyStartupModelProfilesForRoot({
+		session,
+		settings,
+		modelRegistry: registry as never,
+		parsedArgs: { mpreset: startupProfile.name, default: true },
+		isInteractive: true,
+		hasInteractiveTerminal: true,
+		initialMessage: undefined,
+		initialMessages: [],
+		resumeAction: undefined,
+	});
+
+	await flushStarted.promise;
+	session.markUserModelSelection();
+	let replacementStarted = false;
+	const replacement = session.withSdkControlMutation(async () => {
+		replacementStarted = true;
+		await activateModelProfile({
+			session,
+			modelRegistry: registry as never,
+			settings,
+			profileName: replacementProfile.name,
+		});
+	});
+	await Promise.resolve();
+	expect(replacementStarted).toBe(false);
+
+	allowFlush.resolve();
+	await startup;
+	await replacement;
+
+	expect(replacementStarted).toBe(true);
+	expect(session.model).toMatchObject({ provider: "replacement-provider", id: "default" });
+	expect(settings.get("modelProfile.default")).toBeUndefined();
+	expect(settings.getOverride("modelRoles")?.executor).toBeUndefined();
+	expect(flushCount).toBe(2);
 });
 
 test("interactive startup refreshes and applies an unknown default profile when it appears in the catalog", async () => {

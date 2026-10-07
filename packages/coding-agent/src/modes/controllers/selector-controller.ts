@@ -2498,14 +2498,16 @@ export class SelectorController {
 		const profileLabel = formatModelProfileDisplayLabel(
 			this.ctx.session.modelRegistry.getModelProfile(profileName) ?? { name: profileName },
 		);
-		await activateModelProfile(
-			{
-				session: this.ctx.session,
-				modelRegistry: this.ctx.session.modelRegistry,
-				settings: this.ctx.settings,
-				profileName,
-			},
-			{ persistDefault },
+		await this.ctx.session.withSdkControlMutation(() =>
+			activateModelProfile(
+				{
+					session: this.ctx.session,
+					modelRegistry: this.ctx.session.modelRegistry,
+					settings: this.ctx.settings,
+					profileName,
+				},
+				{ persistDefault },
+			),
 		);
 		this.ctx.statusLine.invalidate();
 		this.ctx.updateEditorBorderColor();
@@ -3680,12 +3682,14 @@ export class SelectorController {
 		}
 
 		this.ctx.session.markUserModelSelection();
-		await activateModelProfile({
-			session: this.ctx.session,
-			modelRegistry: this.ctx.session.modelRegistry,
-			settings: this.ctx.settings,
-			profileName: recommendedProfile.name,
-		});
+		await this.ctx.session.withSdkControlMutation(() =>
+			activateModelProfile({
+				session: this.ctx.session,
+				modelRegistry: this.ctx.session.modelRegistry,
+				settings: this.ctx.settings,
+				profileName: recommendedProfile.name,
+			}),
+		);
 	}
 
 	async #handleOAuthLogin(providerId: string, options?: OAuthSelectorOptions): Promise<void> {
