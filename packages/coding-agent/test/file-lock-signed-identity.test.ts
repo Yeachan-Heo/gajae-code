@@ -36,9 +36,16 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 	await Bun.write(path.join(lock, "info"), JSON.stringify({ pid: DEAD_PID, timestamp: 1000 }));
 	let nativeIdentityChanged = false;
 	const realLstat = fs.lstat;
+	const normalizePath = (p: string): string => path.normalize(p).toLowerCase();
 	const transformStat = (target: string, stat: BigIntStats): BigIntStats => {
-		const isRoot = target === lock || target === parked || (detach && target === root);
-		const isInfo = target === path.join(lock, "info") || target === path.join(parked, "info");
+		const normalized = normalizePath(target);
+		const isRoot =
+			normalized === normalizePath(lock) ||
+			normalized === normalizePath(parked) ||
+			(detach && normalized === normalizePath(root));
+		const isInfo =
+			normalized === normalizePath(path.join(lock, "info")) ||
+			normalized === normalizePath(path.join(parked, "info"));
 		const id = isRoot && component !== "info" ? ROOT_ID : isInfo && component !== "root" ? INFO_ID : null;
 		if (id === null) return stat;
 		return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { ino: BigInt.asIntN(64, id) });
@@ -50,7 +57,7 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 	const realOpen = fs.open;
 	vi.spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
 		const handle = await realOpen(target, flags, mode);
-		if (String(target) === path.join(lock, "info")) {
+		if (normalizePath(String(target)) === normalizePath(path.join(lock, "info"))) {
 			const realStat = handle.stat.bind(handle);
 			vi.spyOn(handle, "stat").mockImplementation((async options => {
 				const stat = await realStat(options);
