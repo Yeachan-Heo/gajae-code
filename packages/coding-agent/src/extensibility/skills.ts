@@ -197,6 +197,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		userAgentDir: agentDir,
 		profileAuthority,
 		repoRoot: await findRepoRoot(cwd),
+		trustUserSkills: userTrusted,
 	};
 	const providerResults = await Promise.all(
 		providers.map(async provider => {
@@ -317,6 +318,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 					providerId: "custom",
 					level: "user",
 					requireDescription: true,
+					trustUserSkills: userTrusted,
 				},
 			);
 			return { expandedDir, scanResult };

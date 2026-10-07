@@ -128,6 +128,39 @@ describe("SkillDiscoveryTool", () => {
 		expect(details!.candidates[0]?.useWhen).toContain("**/*.ts");
 	});
 
+	it("discovers and invokes a trusted user skill symlink outside its scan root", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-skill-link-tool-"));
+		const cwd = path.join(root, "project");
+		const home = path.join(root, "home");
+		const userSkillsRoot = path.join(home, ".gjc", "agent", "skills");
+		const sharedSkillsRoot = path.join(root, "shared-skills");
+		const skillName = "linked-user-helper";
+		try {
+			await fs.mkdir(cwd, { recursive: true });
+			await fs.mkdir(userSkillsRoot, { recursive: true });
+			await makeSkill(sharedSkillsRoot, skillName, "Linked user helper", "External user skill body.");
+			await fs.symlink(path.join(sharedSkillsRoot, skillName), path.join(userSkillsRoot, skillName), "dir");
+
+			const sent: string[] = [];
+			const session = createSession(cwd, {
+				home,
+				settings: runtimeSkillSettings({ "skills.trustUserSkills": true }),
+				skills: [],
+				sendCustomMessage: async message => {
+					sent.push(String(message.content));
+				},
+			});
+			const discovered = await new SkillDiscoveryTool(session).execute("discover-user-link", { source: "user" });
+			expect(discovered.details?.candidates).toEqual([expect.objectContaining({ name: skillName, source: "user" })]);
+
+			await new SkillTool(session).execute("invoke-user-link", { name: skillName });
+			expect(sent).toHaveLength(1);
+			expect(sent[0]).toContain("External user skill body.");
+		} finally {
+			await safeRm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("preserves exact skill-name tokens without broadening unnamed partial matches", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-exact-name-skill-"));
 		await makeSkill(path.join(cwd, ".gjc", "skills"), "aws", "Cloud operations router");
