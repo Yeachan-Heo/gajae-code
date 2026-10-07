@@ -1459,6 +1459,37 @@ pub fn apply_owner_only_fd_security(
 	platform::apply_owner_only_fd_security(Path::new(&path), &kind, caller_fd)
 }
 
+/// Migrate an Administrators-owned root to current-user ownership, updating the DACL.
+/// This is a narrowly scoped migration path for existing managed roots that were created
+/// with Administrators ownership. It is only called when `verify_owner_only_path_security_expected`
+/// returns `owner_mismatch` to provide a recovery path for existing installations.
+///
+/// If the owner is Administrators, changes ownership to the current user and repairs the DACL.
+/// If the owner is anything other than Administrators or the current user, returns an error.
+/// Verifies the result after migration.
+#[napi]
+pub fn migrate_administrators_owner_if_expected(
+	path: String,
+	kind: String,
+	expected_dev: BigInt,
+	expected_ino: BigInt,
+) -> NativeOwnerOnlySecurityResult {
+	if path.contains('\0') {
+		return NativeOwnerOnlySecurityResult::failure("io_error");
+	}
+	let (dev_negative, expected_dev, dev_lossless) = expected_dev.get_u64();
+	let (ino_negative, expected_ino, ino_lossless) = expected_ino.get_u64();
+	if dev_negative || ino_negative || !dev_lossless || !ino_lossless {
+		return NativeOwnerOnlySecurityResult::failure("identity_mismatch");
+	}
+	platform::migrate_administrators_owner_if_expected(
+		Path::new(&path),
+		&kind,
+		expected_dev,
+		expected_ino,
+	)
+}
+
 /// Verify owner-only security for the exact caller descriptor and retained
 /// no-follow path. The descriptor is duplicated with close-on-exec and is never
 /// returned to JavaScript.
@@ -4454,6 +4485,16 @@ pub(crate) mod platform {
 		_: u64,
 		_: u64,
 	) -> NativeOwnerOnlySecurityResult {
+		NativeOwnerOnlySecurityResult::failure("acl_unavailable")
+	}
+
+	pub(super) fn migrate_administrators_owner_if_expected(
+		_: &Path,
+		_: &str,
+		_: u64,
+		_: u64,
+	) -> NativeOwnerOnlySecurityResult {
+		// Only available on Windows where Administrators ownership can occur.
 		NativeOwnerOnlySecurityResult::failure("acl_unavailable")
 	}
 
@@ -12749,6 +12790,134 @@ mod platform {
 		verified
 	}
 
+	fn administrators_sid() -> Vec<u8> {
+		// BUILTIN\Administrators SID: S-1-5-32-544
+		// This is only used for migration detection, not for permanent acceptance.
+		vec![
+			0x01,                          // Revision
+			0x02,                          // SubAuthority count (2)
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x05, // Authority (5 = NT_AUTHORITY)
+			0x20, 0x00, 0x00, 0x00,       // SubAuthority 0 (32)
+			0x30, 0x02, 0x00, 0x00,       // SubAuthority 1 (544)
+		]
+	}
+
+	pub(super) fn migrate_administrators_owner_if_expected(
+		path: &Path,
+		kind: &str,
+		expected_dev: u64,
+		expected_ino: u64,
+	) -> NativeOwnerOnlySecurityResult {
+		// Narrowly scoped migration path for existing Administrators-owned roots.
+		// If the owner is exactly Administrators, changes it to the current user and repairs the DACL.
+		// If the owner is the current user or any other SID, returns failure.
+		let mut handle = match open_exact(path, kind, READ_CONTROL) {
+			Ok(handle) => handle,
+			Err(result) => return result,
+		};
+		let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(handle.target, &mut information) } == 0 {
+			return NativeOwnerOnlySecurityResult::failure(last_error_code());
+		}
+		if !expected_handle_identity_matches(&information, expected_dev, expected_ino) {
+			return NativeOwnerOnlySecurityResult::failure("identity_mismatch");
+		}
+
+		// Query the owner
+		let mut owner = null_mut();
+		let mut descriptor = null_mut();
+		let status = unsafe {
+			GetSecurityInfo(
+				handle.target,
+				SE_FILE_OBJECT,
+				OWNER_SECURITY_INFORMATION,
+				&mut owner,
+				null_mut(),
+				null_mut(),
+				null_mut(),
+				&mut descriptor,
+			)
+		};
+
+		if status != 0 {
+			if !descriptor.is_null() {
+				unsafe { LocalFree(descriptor) };
+			}
+			return NativeOwnerOnlySecurityResult::failure(last_error_code());
+		}
+
+		if descriptor.is_null() || owner.is_null() {
+			if !descriptor.is_null() {
+				unsafe { LocalFree(descriptor) };
+			}
+			return NativeOwnerOnlySecurityResult::failure("acl_unavailable");
+		}
+
+		// Check if the owner is Administrators
+		let admin_sid = administrators_sid();
+		let owner_is_admin = unsafe { EqualSid(owner, admin_sid.as_ptr().cast_mut().cast()) } != 0;
+
+		if !owner_is_admin {
+			unsafe { LocalFree(descriptor) };
+			// Owner is not Administrators, so no migration needed.
+			// This could be the current user (no migration needed) or some other owner (error).
+			return NativeOwnerOnlySecurityResult::failure("acl_unavailable");
+		}
+
+		unsafe { LocalFree(descriptor) };
+
+		// Owner is Administrators, proceed with migration.
+		// Get current user SID
+		let sid = match current_user_sid() {
+			Ok(sid) => sid,
+			Err(()) => return NativeOwnerOnlySecurityResult::failure("acl_unavailable"),
+		};
+
+		// Re-open with WRITE_OWNER | WRITE_DAC | READ_CONTROL to allow ownership change
+		let owner_handle = match open_exact(path, kind, WRITE_OWNER | WRITE_DAC | READ_CONTROL) {
+			Ok(handle) => handle,
+			Err(result) => return result,
+		};
+
+		let mut owner_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(owner_handle.target, &mut owner_information) } == 0 {
+			return NativeOwnerOnlySecurityResult::failure(last_error_code());
+		}
+		if !expected_handle_identity_matches(&owner_information, expected_dev, expected_ino) {
+			return NativeOwnerOnlySecurityResult::failure("identity_mismatch");
+		}
+
+		// Apply new ownership and DACL to current user (repair_owner=true)
+		let applied = set_owner_only_acl(owner_handle.target, kind, &sid, true);
+		if !applied.ok {
+			return applied;
+		}
+
+		// Verify the change
+		let mut final_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(owner_handle.target, &mut final_information) } == 0 {
+			return NativeOwnerOnlySecurityResult::failure(last_error_code());
+		}
+		if !expected_handle_identity_matches(&final_information, expected_dev, expected_ino) {
+			return NativeOwnerOnlySecurityResult::failure("identity_mismatch");
+		}
+
+		// Verify the security state after migration
+		let verified = verify_owner_only_handle(owner_handle.target, kind);
+		let reopened = match open_exact(path, kind, READ_CONTROL) {
+			Ok(handle) => handle,
+			Err(result) => return result,
+		};
+		let mut rebound_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(reopened.target, &mut rebound_information) } == 0 {
+			return NativeOwnerOnlySecurityResult::failure(last_error_code());
+		}
+		if !expected_handle_identity_matches(&rebound_information, expected_dev, expected_ino) {
+			return NativeOwnerOnlySecurityResult::failure("identity_mismatch");
+		}
+		verified
+	}
+
 	fn uv_osfhandle(caller_fd: i32) -> Option<isize> {
 		let module = unsafe { GetModuleHandleW(null()) };
 		if module.is_null() {
@@ -13590,6 +13759,15 @@ mod platform {
 		_: u64,
 		_: u64,
 	) -> NativeOwnerOnlySecurityResult {
+		NativeOwnerOnlySecurityResult::failure("acl_unavailable")
+	}
+	pub(super) fn migrate_administrators_owner_if_expected(
+		_: &Path,
+		_: &str,
+		_: u64,
+		_: u64,
+	) -> NativeOwnerOnlySecurityResult {
+		// Only available on Windows where Administrators ownership can occur.
 		NativeOwnerOnlySecurityResult::failure("acl_unavailable")
 	}
 	pub(super) fn apply_owner_only_fd_security(
