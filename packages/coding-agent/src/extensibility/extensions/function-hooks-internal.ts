@@ -7,6 +7,17 @@ export type TaggedFunctionHookHandler = (...args: unknown[]) => Promise<unknown>
 // Host SDK lifecycle observers publish the accepted run's bookkeeping. They do
 // not execute user work and must not consume provider-attempt replay authority.
 const sdkLifecycleObservers = new WeakSet<(...args: never[]) => unknown>();
+const providerRequestHandlers = new WeakMap<(...args: never[]) => unknown, string>();
+
+/** Host-owned provider adapters must not consume replay authority for other providers. */
+export function tagProviderRequestHandler<T extends (...args: never[]) => unknown>(provider: string, handler: T): T {
+	providerRequestHandlers.set(handler, provider);
+	return handler;
+}
+
+export function getProviderRequestHandlerProvider(handler: (...args: never[]) => unknown): string | undefined {
+	return providerRequestHandlers.get(handler);
+}
 
 export function tagSdkLifecycleObserver<T extends (...args: never[]) => unknown>(handler: T): T {
 	sdkLifecycleObservers.add(handler);
@@ -35,6 +46,8 @@ export function wrapExtensionHandlerRegistration<T extends (...args: never[]) =>
 	const registered = ((...args: never[]) => handler(...args)) as T;
 	registrationOrders.set(registered, registrationOrder);
 	if (sdkLifecycleObservers.has(handler)) sdkLifecycleObservers.add(registered);
+	const provider = providerRequestHandlers.get(handler);
+	if (provider !== undefined) providerRequestHandlers.set(registered, provider);
 	return registered;
 }
 
