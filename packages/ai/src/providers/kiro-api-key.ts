@@ -1219,8 +1219,9 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			}
 
 			// Stream is done - add any pending tool, emit accumulated thinking, then deferred text, then close text block
-			// Emit tool if explicitly completed or if stream end (implicit completion)
-			if (currentTool) addToolToBlocks();
+			// Only emit the tool if it was explicitly completed (has stop flag)
+			if (currentTool && toolComplete) addToolToBlocks();
+			currentTool = undefined;
 			emitThinking();
 			emitDeferredTextEvents();
 			flushPendingTextEvents();
@@ -1230,7 +1231,9 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			flushPendingTextEvents();
 			const hasText = blocks.some(b => b.type === "text" && b.text.length > 0);
 			const hasTools = blocks.some(b => b.type === "toolCall");
-			if (!hasText && !hasTools) {
+			// If stream ends with no content and no completed tools (but may have started incomplete tools),
+			// treat as an error only if the stream provided no response data at all
+			if (!hasText && !hasTools && !firstTokenEmitted) {
 				output.stopReason = "error";
 				output.errorMessage = "Kiro API key stream returned no tokens";
 				output.duration = Date.now() - startTime;
