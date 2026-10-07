@@ -1359,11 +1359,8 @@ export class SessionIndex {
 			sameSerializedIndexChangeStamp(manifest.stamp, stamp)
 		)
 			return;
-		if (!this.#projectionComplete()) {
-			await this.#publishProjectionManifestUnderLock(false);
-			return;
-		}
-		await this.#rebuildSessionProjectionsUnderLock();
+		// Mark projections as incomplete/outdated; rebuild is deferred until actually needed.
+		await this.#publishProjectionManifestUnderLock(false);
 	}
 	async #readSessionProjectionUnderLock(
 		sessionId: string,

@@ -1990,7 +1990,7 @@ describe("SDK session index", () => {
 		// And the fast path must not resurrect pre-compaction state.
 		expect(await index.refreshIfChanged()).toBe(false);
 		expect(index.listSessions().sessions).toEqual(fresh.listSessions().sessions);
-	}, 30_000);
+	});
 	it("refreshIfChanged never fast-paths a corrupt suffix (#4689 review)", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-poll-corrupt-"));
 		const writer = new SessionIndex(dir);
@@ -2557,3 +2557,4 @@ describe("SDK session index projections (perf optimization)", () => {
 		}
 	});
 });
+
