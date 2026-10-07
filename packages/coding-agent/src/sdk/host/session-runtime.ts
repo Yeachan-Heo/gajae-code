@@ -6453,7 +6453,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				const seams = options.terminalAbortSeams;
 				const handle = seams?.getActivePromptHandle();
 				const epoch = seams?.getTerminalTurnEpoch();
-				if (!seams || !handle || epoch === undefined || !seams.pendingToolExecutions) return;
+				if (!seams || !handle || epoch === undefined) return;
 				const existing = deadlineTerminalizationObservations.get(key);
 				if (existing) return () => cleanupDeadlineTerminalizationObservation(key, existing);
 
