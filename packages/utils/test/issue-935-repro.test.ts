@@ -26,33 +26,22 @@ describe("issue #6446 Windows path casing", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("normalizes path casing on Windows for consistent path comparison", () => {
-		// Simulate Windows behavior: resolveEquivalentPath should lowercase paths
-		if (process.platform !== "win32") return;
+	it("preserves the filesystem's canonical path spelling", () => {
+		const inputPath = path.resolve("C:/Users/User/Project/session.jsonl");
+		const canonicalPath = "C:\\Users\\User\\Project\\session.jsonl";
+		vi.spyOn(fs, "realpathSync").mockImplementation((() => canonicalPath) as unknown as typeof fs.realpathSync);
 
-		// Mock realpathSync to return an uppercase path
-		const upperPath = "C:\\Users\\User\\Project\\session.jsonl";
-		vi.spyOn(fs, "realpathSync").mockImplementation((() => upperPath) as unknown as typeof fs.realpathSync);
-
-		const result = resolveEquivalentPath(upperPath);
-
-		// Result should be lowercased
-		expect(result).toBe(upperPath.toLowerCase());
+		expect(resolveEquivalentPath(inputPath)).toBe(canonicalPath);
 	});
 
-	it("lowercases paths when realpath fails on Windows", () => {
-		if (process.platform !== "win32") return;
-
-		const upperPath = "C:\\Users\\User\\Project\\session.jsonl";
+	it("preserves unresolved path spelling instead of folding potentially case-sensitive names", () => {
+		const inputPath = path.resolve("C:/Users/User/Project/session.jsonl");
 		vi.spyOn(fs, "realpathSync").mockImplementation((() => {
 			const error = new Error("ENOENT: no such file or directory, realpath");
 			(error as NodeJS.ErrnoException).code = "ENOENT";
 			throw error;
 		}) as unknown as typeof fs.realpathSync);
 
-		const result = resolveEquivalentPath(upperPath);
-
-		// Result should still be lowercased even when realpath fails
-		expect(result).toBe(upperPath.toLowerCase());
+		expect(resolveEquivalentPath(inputPath)).toBe(inputPath);
 	});
 });

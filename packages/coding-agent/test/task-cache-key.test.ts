@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai/models";
 import type { Message, ProviderSessionState } from "@gajae-code/ai/types";
-import { resolveEquivalentPath, Snowflake } from "@gajae-code/utils";
+import { pathIdentityKey, Snowflake } from "@gajae-code/utils";
 import { AsyncJobManager, asyncJobEndpointId } from "../src/async";
 import { Settings } from "../src/config/settings";
 import { createAgentSession } from "../src/sdk";
@@ -140,20 +140,29 @@ describe("async job endpoint id derivation", () => {
 		);
 	});
 
-	it("normalizes path casing on Windows for consistent session keying", () => {
-		// On Windows, paths with different casings should key to the same endpoint.
-		// This prevents silent attachment failures when Telegram or other sources
-		// provide paths with different casings (e.g., C:\Users\User\project vs c:\users\user\project).
+	it("keys Windows path aliases by filesystem identity without merging case-sensitive files", () => {
 		if (process.platform !== "win32") return;
 
-		const sessionFile1 = "C:\\Users\\User\\Project\\session.jsonl";
-		const sessionFile2 = "c:\\users\\user\\project\\session.jsonl";
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-endpoint-case-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const sessionFile1 = path.join(tempDir, "Session.jsonl");
+		const sessionFile2 = path.join(tempDir, "session.jsonl");
+		fs.writeFileSync(sessionFile1, "");
+
+		let distinctCaseSensitiveFiles = false;
+		try {
+			fs.writeFileSync(sessionFile2, "", { flag: "wx" });
+			distinctCaseSensitiveFiles = true;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		}
 
 		const endpoint1 = asyncJobEndpointId("provider", "logical-id", sessionFile1);
 		const endpoint2 = asyncJobEndpointId("provider", "logical-id", sessionFile2);
 
-		// Both paths should normalize to the same endpoint key
-		expect(endpoint1).toBe(endpoint2);
+		// Case-insensitive Windows directories resolve both spellings to the same
+		// file ID; case-sensitive directories allow distinct files and IDs.
+		expect(endpoint1 === endpoint2).toBe(!distinctCaseSensitiveFiles);
 	});
 });
 
@@ -310,7 +319,7 @@ describe("task fork-context provider identity", () => {
 		const previousEndpoint = JSON.stringify([
 			"async-job-endpoint",
 			providerSessionId,
-			resolveEquivalentPath(path.resolve(previousSessionFile!)),
+			pathIdentityKey(path.resolve(previousSessionFile!)),
 		]);
 		const manager = AsyncJobManager.forEndpoint(previousEndpoint);
 		expect(manager).toBeDefined();
@@ -322,7 +331,7 @@ describe("task fork-context provider identity", () => {
 		const successorEndpoint = JSON.stringify([
 			"async-job-endpoint",
 			providerSessionId,
-			resolveEquivalentPath(path.resolve(successorSessionFile!)),
+			pathIdentityKey(path.resolve(successorSessionFile!)),
 		]);
 		expect(AsyncJobManager.forEndpoint(previousEndpoint)).toBeUndefined();
 		expect(AsyncJobManager.forEndpoint(successorEndpoint)).toBe(manager);
