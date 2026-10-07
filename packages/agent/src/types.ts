@@ -814,6 +814,13 @@ export interface AgentFailureDiagnostic {
 	 * are unchanged by its presence or absence.
 	 */
 	providerDiagnostic?: ProviderDiagnostic;
+	/**
+	 * Bounded real failure cause for operator logs: error class name, first line
+	 * of message, and exit code/signal if available. Bounded to 200 chars,
+	 * secrets-redacted. Omitted when unavailable. Enables diagnostics of opaque
+	 * failures while keeping user-facing messages unchanged.
+	 */
+	cause?: string;
 }
 
 /**

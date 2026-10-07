@@ -14,13 +14,13 @@ describe("Agent", () => {
 				throw Object.assign(new Error(secret), { code: "provider_down", request: { secret } });
 			},
 		});
-		const failures: Array<{ code?: string; message?: string }> = [];
+		const failures: Array<Record<string, unknown>> = [];
 		agent.subscribe(event => {
-			if (event.type === "agent_failed") failures.push(event.error as { code?: string; message?: string });
+			if (event.type === "agent_failed") failures.push(event.error as Record<string, unknown>);
 		});
 		await agent.prompt("trigger failure", { fallbackManaged: true });
 		expect(failures).toHaveLength(1);
-		expect(failures[0]).toEqual({ code: "provider_down", message: "Agent run failed." });
+		expect(failures[0]).toMatchObject({ code: "provider_down", message: "Agent run failed." });
 		expect(JSON.stringify(failures[0])).not.toContain("super-secret");
 		expect(JSON.stringify(failures[0])).not.toContain("hunter2");
 	});
@@ -35,14 +35,14 @@ describe("Agent", () => {
 				throw Object.assign(new Error(`HTTP ${status}`), { status });
 			},
 		});
-		const failures: Array<{ code?: string; message?: string }> = [];
+		const failures: Array<Record<string, unknown>> = [];
 		agent.subscribe(event => {
 			if (event.type === "agent_failed") failures.push(event.error);
 		});
 
 		await agent.prompt("trigger status failure", { fallbackManaged: true });
 
-		expect(failures).toEqual([{ code, message: "Agent run failed." }]);
+		expect(failures[0]).toMatchObject({ code, message: "Agent run failed." });
 	});
 
 	it.each([
@@ -55,14 +55,14 @@ describe("Agent", () => {
 				throw Object.assign(new Error(`carrier HTTP ${status}`), { transportFailure: { status } });
 			},
 		});
-		const failures: Array<{ code?: string; message?: string }> = [];
+		const failures: Array<Record<string, unknown>> = [];
 		agent.subscribe(event => {
 			if (event.type === "agent_failed") failures.push(event.error);
 		});
 
 		await agent.prompt("trigger carrier status failure", { fallbackManaged: false });
 
-		expect(failures).toEqual([{ code, message: "Agent run failed." }]);
+		expect(failures[0]).toMatchObject({ code, message: "Agent run failed." });
 	});
 
 	it("maps provider-forged lifecycle classifiers to the generic failure class", async () => {

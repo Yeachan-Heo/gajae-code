@@ -27,7 +27,7 @@ import {
 	CURSOR_COMPOSER_BASH_POLICY_RECOVERY_PROMPT,
 	isCurrentComposerBashPolicyBlockedError,
 } from "@gajae-code/ai/providers/composer-discipline";
-import { extractHttpStatusFromError, logger, redactCrashSecrets } from "@gajae-code/utils";
+import { extractHttpStatusFromError, logger, redactCrashSecrets, sanitizeText } from "@gajae-code/utils";
 import { agentLoop, agentLoopContinue, managedLocalErrorDiagnostic } from "./agent-loop";
 import type { AppendOnlyContextManager } from "./append-only-context";
 import type { AttemptRunHandle, AttemptScope } from "./attempt-scope";
@@ -97,10 +97,109 @@ const PROVIDER_ACCEPTABLE_FAILURE_CODES = new Set([
 	"execution",
 ]);
 
+/** Redact sensitive values from failure cause text. */
+function redactSensitiveFromCause(text: string): string {
+	// Redact various secret patterns
+	let redacted = redactCrashSecrets(text); // Redact tokens and JWTs
+	// Redact key=value patterns that look like secrets (password, token, key, etc.)
+	redacted = redacted.replace(/\b(?:password|passwd|pwd|secret|token|key|api[_-]?key|auth|credential)\s*=\s*\S+/gi, "«redacted»");
+	// Redact URLs with embedded credentials
+	redacted = redacted.replace(/https?:\/\/[^\s@]*@[^\s]/g, "«redacted-url»");
+	return redacted;
+}
+
+/** Extract bounded failure cause for operator logs: error class name, first line of message, exit code/signal. */
+function extractAgentFailureCause(error: unknown): string | undefined {
+	if (error === null || error === undefined) return undefined;
+	try {
+		let className = "Error";
+		let message = "";
+		let exitSignal = "";
+
+		if (error instanceof Error) {
+			className = TRUSTED_ERROR_CONSTRUCTORS.get(error.constructor) ?? error.constructor?.name ?? "Error";
+			const firstLine = (error.message || "").split("\n")[0] || "";
+			message = firstLine.slice(0, 100);
+			const errorAsObj = error as { signal?: unknown; exitCode?: unknown; code?: unknown };
+			if (
+				typeof errorAsObj.signal === "string" &&
+				["SIGTERM", "SIGKILL", "SIGABRT", "SIGSEGV", "SIGINT"].includes(errorAsObj.signal)
+			) {
+				exitSignal = `signal=${errorAsObj.signal}`;
+			} else if (
+				typeof errorAsObj.exitCode === "number" &&
+				Number.isInteger(errorAsObj.exitCode) &&
+				errorAsObj.exitCode >= 0 &&
+				errorAsObj.exitCode <= 255
+			) {
+				exitSignal = `exit=${errorAsObj.exitCode}`;
+			} else if (
+				typeof errorAsObj.code === "number" &&
+				Number.isInteger(errorAsObj.code) &&
+				errorAsObj.code >= 0 &&
+				errorAsObj.code <= 255
+			) {
+				exitSignal = `code=${errorAsObj.code}`;
+			}
+		} else if (typeof error === "string") {
+			message = error.split("\n")[0]?.slice(0, 100) || "";
+		} else if (error !== null && typeof error === "object") {
+			const candidate = error as {
+				code?: unknown;
+				message?: unknown;
+				signal?: unknown;
+				exitCode?: unknown;
+				className?: unknown;
+			};
+			if (typeof candidate.className === "string") className = candidate.className;
+			if (typeof candidate.message === "string") {
+				const firstLine = candidate.message.split("\n")[0] || "";
+				message = firstLine.slice(0, 100);
+			}
+			if (
+				typeof candidate.signal === "string" &&
+				["SIGTERM", "SIGKILL", "SIGABRT", "SIGSEGV", "SIGINT"].includes(candidate.signal)
+			) {
+				exitSignal = `signal=${candidate.signal}`;
+			} else if (
+				typeof candidate.exitCode === "number" &&
+				Number.isInteger(candidate.exitCode) &&
+				candidate.exitCode >= 0 &&
+				candidate.exitCode <= 255
+			) {
+				exitSignal = `exit=${candidate.exitCode}`;
+			} else if (
+				typeof candidate.code === "number" &&
+				Number.isInteger(candidate.code) &&
+				candidate.code >= 0 &&
+				candidate.code <= 255
+			) {
+				exitSignal = `code=${candidate.code}`;
+			}
+		}
+
+		const parts = [className, message, exitSignal].filter(Boolean);
+		const diagnostic = parts.join(" ");
+		// Sanitize for outbound publication: remove ANSI/control chars, redact secrets
+		const cleaned = sanitizeText(diagnostic);
+		const sanitized = redactSensitiveFromCause(cleaned);
+		if (sanitized.length > 200) {
+			const bytes = Buffer.from(sanitized, "utf8");
+			let end = 200;
+			while (end > 0 && ((bytes[end - 1] ?? 0) & 0xc0) === 0x80) end--;
+			if (end > 0 && (bytes[end - 1] ?? 0) >= 0xc0) end--;
+			return bytes.subarray(0, end).toString("utf8");
+		}
+		return sanitized.length > 0 ? sanitized : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 function sanitizeAgentFailure(
 	error: unknown,
 	runtimeClassifiedCode?: string,
-): { code: string; message: string; providerDiagnostic?: ProviderDiagnostic } {
+): { code: string; message: string; providerDiagnostic?: ProviderDiagnostic; cause?: string } {
 	let code = "agent_failed";
 	try {
 		if (runtimeClassifiedCode !== undefined) {
@@ -123,10 +222,12 @@ function sanitizeAgentFailure(
 	// Provenance is the adapter's private carrier, never a property the error
 	// declares about itself: a foreign error cannot label its own failure family.
 	const providerDiagnostic = readProviderDiagnostic(error);
+	const cause = extractAgentFailureCause(error);
 	return {
 		code,
 		message: "Agent run failed.",
 		...(providerDiagnostic === undefined ? {} : { providerDiagnostic }),
+		...(cause === undefined ? {} : { cause }),
 	};
 }
 
