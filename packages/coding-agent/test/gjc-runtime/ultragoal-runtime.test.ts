@@ -3691,6 +3691,67 @@ describe("native GJC ultragoal runtime", () => {
 		});
 	});
 
+	it("repairs an interrupted complete checkpoint when the ledger append failed", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+		const qualityGateJson = await passingLiveQualityGate(root);
+		const goalsPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json");
+		const ledgerPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "ledger.jsonl");
+		const originalAppendFile = fs.appendFile;
+		let failLedgerAppend = true;
+		const appendSpy = spyOn(fs, "appendFile").mockImplementation(async (...args: any[]) => {
+			const target = typeof args[0] === "string" ? args[0] : String(args[0]);
+			if (path.resolve(target) === path.resolve(ledgerPath) && failLedgerAppend) {
+				failLedgerAppend = false;
+				throw new Error("injected checkpoint ledger append failure");
+			}
+			return await (originalAppendFile as (...writeArgs: any[]) => Promise<any>)(...args);
+		});
+		try {
+			await expect(
+				checkpointUltragoalGoal({
+					cwd: root,
+					goalId: "G001",
+					status: "complete",
+					evidence: "tests passed",
+					qualityGateJson,
+				}),
+			).rejects.toThrow("injected checkpoint ledger append failure");
+		} finally {
+			appendSpy.mockRestore();
+		}
+
+		const interruptedPlan = await readUltragoalPlan(root);
+		const interruptedReceipt = interruptedPlan?.goals[0]?.completionVerification;
+		expect(interruptedPlan?.goals[0]?.status).toBe("complete");
+		expect(interruptedReceipt?.checkpointLedgerEventId).toBeTruthy();
+		expect(
+			(await readUltragoalLedger(root)).some(event => event.eventId === interruptedReceipt?.checkpointLedgerEventId),
+		).toBe(false);
+
+		const repairedPlan = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "tests passed",
+			qualityGateJson,
+		});
+		const repairedReceipt = repairedPlan.goals[0]?.completionVerification;
+		const repairedEvents = (await readUltragoalLedger(root)).filter(
+			event => event.eventId === interruptedReceipt?.checkpointLedgerEventId,
+		);
+		expect(repairedReceipt?.checkpointLedgerEventId).toBe(interruptedReceipt?.checkpointLedgerEventId);
+		expect(repairedEvents).toHaveLength(1);
+		expect(repairedEvents[0]).toMatchObject({
+			event: "goal_checkpointed",
+			goalId: "G001",
+			status: "complete",
+			evidence: "tests passed",
+		});
+		expect(JSON.parse(await fs.readFile(goalsPath, "utf-8")).goals[0].status).toBe("complete");
+	});
+
 	it("dedups duplicate checkpoint ledger entries for an unchanged status and evidence (#645)", async () => {
 		const root = await tempDir();
 		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
