@@ -29,7 +29,9 @@
  * full pipe. That draining is the adopter's responsibility.
  */
 import * as fs from "node:fs";
+import type { Process } from "@gajae-code/natives";
 import { logger, postmortem, ptree } from "@gajae-code/utils";
+import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { type LinuxProcPidProbeResult, probeLinuxProcPidSync } from "../gjc-runtime/linux-proc";
 
 const DEFAULT_GRACEFUL_MS = 2_000;
@@ -138,11 +140,7 @@ export interface SpawnOwnedOptions {
 	signal?: AbortSignal;
 	/** Grace period (ms) between SIGTERM and SIGKILL on dispose. Default 2000. */
 	gracefulMs?: number;
-	/**
-	 * Spawn the child as its own process-group leader so the whole descendant
-	 * tree can be signalled on dispose. Defaults to `true` on POSIX. Has no
-	 * effect on Windows, where teardown falls back to single-process kill.
-	 */
+	/** Spawn the child as its own process-group leader on POSIX. Defaults to `true`. */
 	processGroup?: boolean;
 	/** Label used in diagnostics. */
 	name?: string;
@@ -218,6 +216,21 @@ export function spawnOwnedProcess(cmd: string[], opts: SpawnOwnedOptions = {}): 
 		stdin: opts.stdin ?? "ignore",
 		detached: useGroup,
 	});
+	// Pin the Windows root incarnation before returning control to any caller.
+	// Native tree teardown uses this stable handle and reports inconclusive
+	// descendant snapshots instead of silently treating them as empty.
+	let windowsRootProcess: Process | undefined;
+	if (!isPosix && child.pid !== undefined) {
+		try {
+			windowsRootProcess = nativeProcessBindings().Process.fromPid(child.pid) ?? undefined;
+		} catch (err) {
+			logger.warn("could not pin owned Windows process identity", {
+				name: opts.name,
+				pid: child.pid,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
 
 	// On POSIX with `detached`, the child is its own process-group leader, so the
 	// group id equals its pid. `undefined` => single-process (Windows/opt-out).
@@ -349,7 +362,28 @@ export function spawnOwnedProcess(cmd: string[], opts: SpawnOwnedOptions = {}): 
 						});
 						return result("still_running");
 					}
-					// Single-process fallback (Windows / processGroup:false).
+					// Windows has no POSIX process group. Use the native stable process
+					// reference captured at spawn and await its verified tree teardown;
+					// child.kill() only exposes a best-effort wrapper and does not report
+					// whether descendant discovery or cleanup succeeded.
+					if (!isPosix) {
+						if (!windowsRootProcess) return result("identity_unverified");
+						try {
+							const treeTerminated = await windowsRootProcess.terminate({
+								gracefulMs: -1,
+								timeoutMs: SIGKILL_REAP_CAP_MS,
+							});
+							return result(treeTerminated ? "terminated" : "still_running");
+						} catch (err) {
+							logger.warn("owned Windows process tree could not be verified during teardown", {
+								name: opts.name,
+								pid: child.pid,
+								error: err instanceof Error ? err.message : String(err),
+							});
+							return result("identity_unverified");
+						}
+					}
+					// Single-process fallback (processGroup:false on POSIX).
 					if (child.exitCode !== null) return result("terminated");
 					signalTree("SIGTERM");
 					if ((await owner.awaitExit({ timeoutMs: gracefulMs })).exited) return result("terminated");
@@ -371,6 +405,11 @@ export function spawnOwnedProcess(cmd: string[], opts: SpawnOwnedOptions = {}): 
 				if (res.status === "terminated") {
 					deregister(true);
 				} else {
+					logger.warn("owned process teardown remains unresolved", {
+						name: opts.name,
+						pid: child.pid,
+						status: res.status,
+					});
 					disposePromise = undefined;
 					disposed = false;
 				}
@@ -391,6 +430,24 @@ export function spawnOwnedProcess(cmd: string[], opts: SpawnOwnedOptions = {}): 
 		.catch(() => undefined)
 		.finally(() => {
 			if (disposed) return; // dispose() owns deregistration
+			if (!isPosix) {
+				// Root exit is not proof that Windows descendants have exited. Keep
+				// the owner registered through a short drain window, then reconcile
+				// the pinned root's full descendant tree via native Process.terminate.
+				void (async () => {
+					await delay(ROOT_EXIT_DRAIN_MS);
+					if (disposed) return;
+					const result = await owner.dispose();
+					if (result.status !== "terminated") {
+						logger.warn("owned Windows process tree remains unresolved after root exit", {
+							name: opts.name,
+							pid: child.pid,
+							status: result.status,
+						});
+					}
+				})();
+				return;
+			}
 			if (pgid === undefined) {
 				deregister();
 				return;

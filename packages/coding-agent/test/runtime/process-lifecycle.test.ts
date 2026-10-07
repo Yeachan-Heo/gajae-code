@@ -7,8 +7,11 @@ import {
 	resourceOwnerCount,
 	spawnOwnedProcess,
 } from "@gajae-code/coding-agent/runtime/process-lifecycle";
+import type { Process } from "@gajae-code/natives";
+import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 
 const isPosix = process.platform !== "win32";
+const isWindows = process.platform === "win32";
 
 async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
@@ -29,7 +32,7 @@ function alive(pid: number): boolean {
 }
 
 describe("spawnOwnedProcess (F1a)", () => {
-	test("awaits clean exit and deregisters from the live set", async () => {
+	test.skipIf(!isPosix)("awaits clean exit and deregisters from the live set", async () => {
 		const before = liveOwnedProcessCount();
 		const owner = spawnOwnedProcess(["sh", "-c", "exit 0"], { name: "clean-exit" });
 		const result = await owner.awaitExit();
@@ -38,7 +41,7 @@ describe("spawnOwnedProcess (F1a)", () => {
 		await waitFor(() => liveOwnedProcessCount() === before);
 	});
 
-	test("awaitExit honors a bounded timeout for a long runner", async () => {
+	test.skipIf(!isPosix)("awaitExit honors a bounded timeout for a long runner", async () => {
 		const owner = spawnOwnedProcess(["sh", "-c", "sleep 30"], { name: "timeout-probe" });
 		try {
 			const result = await owner.awaitExit({ timeoutMs: 100 });
@@ -48,7 +51,7 @@ describe("spawnOwnedProcess (F1a)", () => {
 		}
 	});
 
-	test("dispose terminates a long runner and is idempotent", async () => {
+	test.skipIf(!isPosix)("dispose terminates a long runner and is idempotent", async () => {
 		const before = liveOwnedProcessCount();
 		const owner = spawnOwnedProcess(["sh", "-c", "sleep 30"], { name: "dispose-probe" });
 		await Bun.sleep(50);
@@ -59,7 +62,7 @@ describe("spawnOwnedProcess (F1a)", () => {
 		await waitFor(() => liveOwnedProcessCount() === before);
 	});
 
-	test("an already-aborted signal disposes the process immediately", async () => {
+	test.skipIf(!isPosix)("an already-aborted signal disposes the process immediately", async () => {
 		const before = liveOwnedProcessCount();
 		const owner = spawnOwnedProcess(["sh", "-c", "sleep 30"], {
 			name: "pre-aborted",
@@ -70,7 +73,7 @@ describe("spawnOwnedProcess (F1a)", () => {
 		await waitFor(() => liveOwnedProcessCount() === before);
 	});
 
-	test("aborting mid-run disposes and removes the abort listener", async () => {
+	test.skipIf(!isPosix)("aborting mid-run disposes and removes the abort listener", async () => {
 		const before = liveOwnedProcessCount();
 		const controller = new AbortController();
 		const owner = spawnOwnedProcess(["sh", "-c", "sleep 30"], {
@@ -199,7 +202,7 @@ describe("ownership regression: group liveness drives teardown (F1a)", () => {
 		}
 	});
 
-	test("owner stays tracked until dispose teardown completes", async () => {
+	test.skipIf(!isPosix)("owner stays tracked until dispose teardown completes", async () => {
 		const before = liveOwnedProcessCount();
 		const owner = spawnOwnedProcess(["sh", "-c", "sleep 30"], { name: "tracked-until-done", gracefulMs: 300 });
 		await Bun.sleep(50);
@@ -209,6 +212,38 @@ describe("ownership regression: group liveness drives teardown (F1a)", () => {
 		expect(liveOwnedProcessCount()).toBe(before + 1);
 		await disposing;
 		await waitFor(() => liveOwnedProcessCount() === before);
+	});
+
+	test.skipIf(!isWindows)("reconciles a Windows descendant after its root exits", async () => {
+		const before = liveOwnedProcessCount();
+		const script =
+			"$child = Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile -NonInteractive -Command Start-Sleep -Seconds 30' -PassThru; [Console]::Out.WriteLine($child.Id); Start-Sleep -Milliseconds 100";
+		const owner = spawnOwnedProcess(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], {
+			name: "windows-root-exits-first",
+		});
+		let descendant: Process | null = null;
+		try {
+			const [rootExit, stdout] = await Promise.all([
+				owner.awaitExit({ timeoutMs: 5_000 }),
+				new Response(owner.child.stdout).text(),
+			]);
+			expect(rootExit.exited).toBe(true);
+			const descendantPid = Number(stdout.trim());
+			expect(Number.isInteger(descendantPid)).toBe(true);
+			descendant = nativeProcessBindings().Process.fromPid(descendantPid);
+			expect(descendant).not.toBeNull();
+			if (!descendant) throw new Error("could not pin the fixture descendant");
+			const pinnedDescendant = descendant;
+			const processBindings = nativeProcessBindings();
+			expect(pinnedDescendant.status()).toBe(processBindings.ProcessStatus.Running);
+			await waitFor(() => pinnedDescendant.status() === processBindings.ProcessStatus.Exited, 5_000);
+			await waitFor(() => liveOwnedProcessCount() === before, 5_000);
+		} finally {
+			await owner.dispose();
+			if (descendant && descendant.status() === nativeProcessBindings().ProcessStatus.Running) {
+				await descendant.terminate({ gracefulMs: -1, timeoutMs: 1_000 }).catch(() => false);
+			}
+		}
 	});
 
 	test.skipIf(!isPosix)("disposeAllOwnedProcesses escalates SIGKILL for a SIGTERM-ignoring child", async () => {
