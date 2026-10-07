@@ -757,11 +757,12 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 			dispatcher,
 		);
 		expect(stuck.status).toBe(3);
-		expect(stuck.stderr ?? "").toMatch(/PLANNING-STUCK/);
+		expect(stuck.stderr ?? "").toMatch(/RALPLAN-ADMISSION-REJECTED/);
 		const index = await fs.readFile(path.join(runDir(target, session, session), "index.jsonl"), "utf-8");
-		expect(index).toMatch(/planning_stuck/);
+		expect(index).toMatch(/planning_admission_rejected/);
+		expect(index).not.toMatch(/"event":"planning_stuck"/);
 		const state = await readState(target, session);
-		expect(state.planning_stuck).toEqual(expect.objectContaining({ marker: "PLANNING-STUCK" }));
+		expect(state.planning_stuck).toBeUndefined();
 		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
 	});
 	it("rejects a fake .git directory that is not a valid worktree before mutation", async () => {

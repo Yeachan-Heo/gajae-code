@@ -6,6 +6,7 @@ import * as path from "node:path";
 import {
 	evaluateRalplanIterationCap,
 	evaluateRalplanReviewLaneBudget,
+	PLANNING_ADMISSION_REJECTED_MARKER,
 	PLANNING_STUCK_MARKER,
 	RALPLAN_DEFAULT_MAX_ITERATIONS,
 	RALPLAN_DEFAULT_MAX_REVIEW_PASSES_PER_LANE,
@@ -2946,6 +2947,88 @@ describe("ralplan review lane budget config.yml", () => {
 });
 
 describe("ralplan review lane budget replays", () => {
+	it("keeps lane admission recoverable and preserves handoff after a new opener generation", async () => {
+		const root = await tempDir();
+		const runId = "recoverable-lane-admission";
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal", maxIterations: 5 } } }, null, 2),
+			"utf-8",
+		);
+		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# initial plan")).status).toBe(0);
+		expect((await writeRalplanArtifact(root, runId, "architect", 1, "# architect pass 1")).status).toBe(0);
+		const rejected = await writeRalplanArtifact(root, runId, "architect", 2, "# architect pass 2");
+		expect(rejected.status).toBe(3);
+		expect(JSON.parse(rejected.stdout ?? "{}")).toMatchObject({
+			admission_rejected: true,
+			recoverable: true,
+			marker: PLANNING_ADMISSION_REJECTED_MARKER,
+		});
+		const pendingFinal = JSON.parse(
+			(await writeRalplanArtifact(root, runId, "final", 2, "# pending plan")).stdout ?? "{}",
+		);
+		expect(pendingFinal.auto_handoff).toMatchObject({
+			configuredTarget: "ultragoal",
+			effectiveTarget: "off",
+			degradationReason: "planning_admission_pending",
+		});
+		expect((await writeRalplanArtifact(root, runId, "revision", 2, "# justified revision")).status).toBe(0);
+
+		const indexText = await fs.readFile(path.join(ralplanRunDir(root, runId), "index.jsonl"), "utf-8");
+		const rows = indexText
+			.split(/\r?\n/)
+			.filter(Boolean)
+			.map(line => JSON.parse(line));
+		expect(rows).toContainEqual(
+			expect.objectContaining({ event: "planning_admission_rejected", generation: 1, lane: "architect" }),
+		);
+		expect(rows).toContainEqual(
+			expect.objectContaining({
+				event: "planning_admission_recovered",
+				generation: 1,
+				recovered_by_generation: 2,
+				lane: "architect",
+			}),
+		);
+		expect(JSON.parse(await fs.readFile(ralplanStatePath(root), "utf-8")).planning_stuck).toBeUndefined();
+
+		const final = JSON.parse((await writeRalplanArtifact(root, runId, "final", 3, "# approved plan")).stdout ?? "{}");
+		expect(final.auto_handoff).toMatchObject({
+			configuredTarget: "ultragoal",
+			effectiveTarget: "ultragoal",
+			degradationReason: null,
+		});
+	});
+
+	it("keeps legacy lane-overflow stuck rows nonterminal but pending until a valid recovery event", async () => {
+		const root = await tempDir();
+		const runId = "legacy-lane-overflow";
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal" } } }, null, 2),
+			"utf-8",
+		);
+		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# plan")).status).toBe(0);
+		expect((await writeRalplanArtifact(root, runId, "final", 2, "# final")).status).toBe(0);
+		await fs.appendFile(
+			path.join(ralplanRunDir(root, runId), "index.jsonl"),
+			`${JSON.stringify({
+				event: "planning_stuck",
+				planning_stuck: true,
+				reason: "ralplan review lane budget exceeded: architect pass 2 of max 1 in consensus iteration 1",
+			})}\n`,
+		);
+
+		const final = JSON.parse((await writeRalplanArtifact(root, runId, "final", 2, "# final")).stdout ?? "{}");
+		expect(final.auto_handoff).toMatchObject({
+			configuredTarget: "ultragoal",
+			effectiveTarget: "off",
+			degradationReason: "planning_admission_pending",
+		});
+	});
+
 	it("refuses only the pathological same-iteration lane retries and preserves final escalation", async () => {
 		const root = await tempDir();
 		await seedProjectRalplanMaxIterations(root);
@@ -2983,13 +3066,40 @@ describe("ralplan review lane budget replays", () => {
 		}
 		for (const label of ["a2", "a6", "c6", "a8"]) {
 			const payload = JSON.parse(results.get(label)?.stdout ?? "{}");
-			expect(payload).toMatchObject({ planning_stuck: true, marker: PLANNING_STUCK_MARKER });
+			expect(payload).toMatchObject({
+				admission_rejected: true,
+				recoverable: true,
+				marker: PLANNING_ADMISSION_REJECTED_MARKER,
+			});
+			expect(payload.planning_stuck).toBeUndefined();
 			expect(["architect", "critic"]).toContain(payload.lane);
 			expect(typeof payload.passes).toBe("number");
 			expect(typeof payload.max_review_passes_per_lane).toBe("number");
 		}
 		const openerPayload = JSON.parse(results.get("rev6")?.stdout ?? "{}");
 		expect(openerPayload).toMatchObject({ planning_stuck: true, max_iterations: 5, projected_iteration: 6 });
+		const indexText = await fs.readFile(path.join(ralplanRunDir(root, runId), "index.jsonl"), "utf-8");
+		const indexRows = indexText
+			.split(/\r?\n/)
+			.filter(Boolean)
+			.map(line => JSON.parse(line));
+		expect(indexRows).toContainEqual(
+			expect.objectContaining({
+				event: "planning_admission_rejected",
+				generation: 1,
+				lane: "architect",
+				recoverable: true,
+			}),
+		);
+		expect(indexRows).toContainEqual(
+			expect.objectContaining({
+				event: "planning_admission_recovered",
+				generation: 1,
+				recovered_by_generation: 2,
+				lane: "architect",
+			}),
+		);
+		expect(indexRows.filter(row => row.event === "planning_stuck")).toHaveLength(1);
 
 		const final = await writeRalplanArtifact(root, runId, "final", sequence.length + 1, "# best effort final");
 		expect(final.status).toBe(0);
@@ -3067,13 +3177,15 @@ describe("ralplan review lane budget rigor and receipts", () => {
 		const stuckPayload = JSON.parse(third.stdout ?? "{}");
 		expect(stuckPayload).toMatchObject({
 			ok: false,
-			planning_stuck: true,
-			marker: PLANNING_STUCK_MARKER,
+			admission_rejected: true,
+			recoverable: true,
+			marker: PLANNING_ADMISSION_REJECTED_MARKER,
 			lane: "architect",
 			passes: 2,
 			projected_passes: 3,
 			max_review_passes_per_lane: 2,
 		});
+		expect(stuckPayload.planning_stuck).toBeUndefined();
 		expect(stuckPayload.iteration).toBeUndefined();
 		expect(stuckPayload.max_iterations).toBeUndefined();
 
@@ -3092,8 +3204,8 @@ describe("ralplan review lane budget rigor and receipts", () => {
 		expect(textSecond.stdout).toContain("Warning: ralplan architect review budget final slot used (2/2).");
 		const textThird = await writeRalplanArtifact(textRoot, textRunId, "architect", 4, "# architect three", false);
 		expect(textThird.status).toBe(3);
-		expect(textThird.stdout).toBe(`${PLANNING_STUCK_MARKER}\n`);
-		expect(textThird.stderr).toContain("Stop re-invoking the architect review lane");
+		expect(textThird.stdout).toBe(`${PLANNING_ADMISSION_REJECTED_MARKER}\n`);
+		expect(textThird.stderr).toContain("lane is rejected for this generation only");
 
 		const defaultRoot = await tempDir();
 		const defaultResult = await writeRalplanArtifact(

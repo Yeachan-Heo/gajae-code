@@ -159,6 +159,76 @@ describe("workflow recovery projection (#4560)", () => {
 		expect(projection?.nextAction).toEqual({ actionClass: "awaiting-approval", detail: "planning-stuck" });
 	});
 
+	it("resumes unresolved lane admission at recovery and refreshes a final written before recovery", async () => {
+		const runId = "recoverable-lane-admission";
+		const runDir = ralplanRunDir(tempDir.path(), runId);
+		const digest = crypto.createHash("sha256").update(FINAL_PLAN).digest("hex");
+		await Bun.write(path.join(runDir, "stage-01-final.md"), FINAL_PLAN);
+		await Bun.write(
+			path.join(runDir, "index.jsonl"),
+			`${JSON.stringify({ stage: "final", stage_n: 1, path: "stage-01-final.md", sha256: digest })}\n${JSON.stringify(
+				{
+					event: "planning_admission_rejected",
+					admission_rejected: true,
+					recoverable: true,
+					generation: 1,
+					stage_n: 2,
+					lane: "architect",
+				},
+			)}\n`,
+		);
+		await Bun.write(
+			path.join(tempDir.path(), ".gjc", `_session-${SESSION_ID}`, "state", "ralplan-state.json"),
+			JSON.stringify({ run_id: runId }),
+		);
+		let projection = await projectLatestRalplanRun({ cwd: tempDir.path(), sessionId: SESSION_ID });
+		expect(projection?.nextAction).toEqual({
+			actionClass: "recover-plan-admission",
+			detail: "review-lane-admission-unresolved",
+		});
+
+		await fs.appendFile(
+			path.join(runDir, "index.jsonl"),
+			`${JSON.stringify({
+				event: "planning_admission_recovered",
+				generation: 1,
+				recovered_by_generation: 2,
+				lane: "architect",
+			})}\n`,
+		);
+		projection = await projectLatestRalplanRun({ cwd: tempDir.path(), sessionId: SESSION_ID });
+		expect(projection?.nextAction).toEqual({
+			actionClass: "run-plan-review",
+			detail: "refresh-final-after-admission-recovery",
+		});
+	});
+
+	it("recognizes legacy lane-overflow markers as recoverable instead of terminal", async () => {
+		const runId = "legacy-lane-overflow-recovery";
+		const runDir = ralplanRunDir(tempDir.path(), runId);
+		const digest = crypto.createHash("sha256").update(FINAL_PLAN).digest("hex");
+		await Bun.write(path.join(runDir, "stage-01-final.md"), FINAL_PLAN);
+		await Bun.write(
+			path.join(runDir, "index.jsonl"),
+			`${JSON.stringify({ stage: "final", stage_n: 1, path: "stage-01-final.md", sha256: digest })}\n${JSON.stringify(
+				{
+					event: "planning_stuck",
+					planning_stuck: true,
+					reason: "ralplan review lane budget exceeded: architect pass 2 of max 1 in consensus iteration 1",
+				},
+			)}\n`,
+		);
+		await Bun.write(
+			path.join(tempDir.path(), ".gjc", `_session-${SESSION_ID}`, "state", "ralplan-state.json"),
+			JSON.stringify({ run_id: runId }),
+		);
+		const projection = await projectLatestRalplanRun({ cwd: tempDir.path(), sessionId: SESSION_ID });
+		expect(projection?.nextAction).toEqual({
+			actionClass: "recover-plan-admission",
+			detail: "review-lane-admission-unresolved",
+		});
+	});
+
 	it("resumes a planner-only run at intent reconciliation, not at consensus review", async () => {
 		// Regression for #4560 review P1-1: the manifest requires planner -> intent
 		// before Architect/Critic consensus. A compaction in that window previously

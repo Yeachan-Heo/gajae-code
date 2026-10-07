@@ -75,6 +75,7 @@ export interface WorkflowRecoveryProjection {
 			| "run-plan-review"
 			| "revise-plan"
 			| "reconcile-intent"
+			| "recover-plan-admission"
 			| "final-aggregate-checkpoint"
 			| "awaiting-approval"
 			| "unknown";
@@ -275,6 +276,37 @@ interface RalplanProjectionRow {
 	sha256?: unknown;
 	event?: unknown;
 	planning_stuck?: unknown;
+	generation?: unknown;
+	recovered_by_generation?: unknown;
+	lane?: unknown;
+	reason?: unknown;
+}
+
+function ralplanLaneAdmissionIdentity(row: RalplanProjectionRow): string | undefined {
+	if (
+		row.event === "planning_admission_rejected" &&
+		typeof row.generation === "number" &&
+		Number.isInteger(row.generation) &&
+		(row.lane === "architect" || row.lane === "critic")
+	) {
+		return `${row.generation}\u0000${row.lane}`;
+	}
+	if (row.event === "planning_stuck" && typeof row.reason === "string") {
+		const legacy =
+			/^ralplan review lane budget exceeded: (architect|critic) pass .* in consensus iteration (\d+)/.exec(
+				row.reason,
+			);
+		if (legacy) return `${Number(legacy[2])}\u0000${legacy[1]}`;
+	}
+	return undefined;
+}
+
+function isLegacyRalplanLaneOverflow(row: RalplanProjectionRow): boolean {
+	return (
+		row.event === "planning_stuck" &&
+		typeof row.reason === "string" &&
+		row.reason.startsWith("ralplan review lane budget exceeded:")
+	);
 }
 
 /**
@@ -343,10 +375,37 @@ async function projectRalplanRunInternal(
 	if (!/^sha256:[0-9a-f]{64}$/.test(recorded) || recorded !== sha256) return undefined;
 	const stage = typeof artifactRow.stage === "string" ? artifactRow.stage : "unknown";
 	const latestStage = typeof rows.at(-1)?.stage === "string" ? rows.at(-1)?.stage : undefined;
-	const planningStuck = rows.some(row => row.event === "planning_stuck" && row.planning_stuck === true);
+	const planningStuck = rows.some(
+		row => row.event === "planning_stuck" && row.planning_stuck === true && !isLegacyRalplanLaneOverflow(row),
+	);
+	const rejectedAdmissions = new Set<string>();
+	const recoveredAdmissions = new Set<string>();
+	for (const row of rows) {
+		const identity = ralplanLaneAdmissionIdentity(row);
+		if (identity) rejectedAdmissions.add(identity);
+		if (
+			row.event === "planning_admission_recovered" &&
+			typeof row.generation === "number" &&
+			Number.isInteger(row.generation) &&
+			typeof row.recovered_by_generation === "number" &&
+			Number.isInteger(row.recovered_by_generation) &&
+			row.recovered_by_generation > row.generation &&
+			(row.lane === "architect" || row.lane === "critic")
+		) {
+			recoveredAdmissions.add(`${row.generation}\u0000${row.lane}`);
+		}
+	}
+	const planningAdmissionPending = [...rejectedAdmissions].some(identity => !recoveredAdmissions.has(identity));
+	const finalRowIndex = finalRow ? rows.lastIndexOf(finalRow) : -1;
+	const recoveryAfterFinal =
+		finalRowIndex >= 0 && rows.slice(finalRowIndex + 1).some(row => row.event === "planning_admission_recovered");
 	let nextAction: WorkflowRecoveryProjection["nextAction"];
 	if (planningStuck) {
 		nextAction = { actionClass: "awaiting-approval", detail: "planning-stuck" };
+	} else if (planningAdmissionPending) {
+		nextAction = { actionClass: "recover-plan-admission", detail: "review-lane-admission-unresolved" };
+	} else if (recoveryAfterFinal) {
+		nextAction = { actionClass: "run-plan-review", detail: "refresh-final-after-admission-recovery" };
 	} else if (stage === "final") {
 		nextAction = { actionClass: "awaiting-approval" };
 	} else if (latestStage === "critic") {

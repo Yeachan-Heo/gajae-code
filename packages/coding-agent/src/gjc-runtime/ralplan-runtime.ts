@@ -100,6 +100,8 @@ export const RALPLAN_DEFAULT_MAX_ITERATIONS = 5;
 export const RALPLAN_MAX_ITERATIONS_LIMIT = 20;
 /** Operator-visible stuck signal for headless/CI orchestration (#3165). */
 export const PLANNING_STUCK_MARKER = "PLANNING-STUCK";
+/** Operator-visible signal for a review-lane rejection that a new opener can recover. */
+export const PLANNING_ADMISSION_REJECTED_MARKER = "RALPLAN-ADMISSION-REJECTED";
 /** Default architect/critic review passes per consensus iteration. */
 export const RALPLAN_DEFAULT_MAX_REVIEW_PASSES_PER_LANE = 1;
 /** Inclusive upper bound for `gjc.ralplan.maxReviewPassesPerLane` settings overrides. */
@@ -518,6 +520,7 @@ function parseRalplanAutoHandoffTarget(value: unknown): RalplanAutoHandoffTarget
 
 type RalplanAutoHandoffOptions = {
 	planningStuck?: boolean;
+	planningAdmissionPending?: boolean;
 	/** The session's effective agent directory (see resolveWorkflowSetting). */
 	agentDir?: string;
 };
@@ -550,6 +553,9 @@ function resolveRalplanAutoHandoffTarget(
 ): RalplanAutoHandoffResolution {
 	if (options.planningStuck) {
 		return { configuredTarget, effectiveTarget: "off", degradationReason: "planning_stuck", source };
+	}
+	if (options.planningAdmissionPending) {
+		return { configuredTarget, effectiveTarget: "off", degradationReason: "planning_admission_pending", source };
 	}
 	return { configuredTarget, effectiveTarget: configuredTarget, degradationReason: null, source };
 }
@@ -618,29 +624,32 @@ function buildPlanningStuckResult(input: {
 	};
 }
 
-function buildLaneBudgetStuckResult(input: {
+function buildLaneAdmissionRejectedResult(input: {
 	json: boolean;
 	stage: RalplanStage;
 	stageN: number;
 	runId: string;
+	generation: number;
 	decision: Extract<RalplanReviewLaneBudgetDecision, { allowed: false }>;
 	source: string;
 }): RalplanCommandResult {
 	const detail =
-		`${PLANNING_STUCK_MARKER}: ${input.decision.reason} ` +
+		`${PLANNING_ADMISSION_REJECTED_MARKER}: ${input.decision.reason} ` +
 		`(run_id=${input.runId}, stage=${input.stage}, stage_n=${input.stageN}, source=${input.source}). ` +
-		`Stop re-invoking the ${input.decision.lane} review lane in this consensus iteration; ` +
-		"route a rule-2-justified blocker through a Planner revision opener (fresh lane budget) while opener budget remains, " +
-		"or escalate the best existing plan via post-interview/adr/final without auto-implementation.";
+		`The ${input.decision.lane} lane is rejected for this generation only. Do not retry with an incremented stage_n; ` +
+		"continue with another eligible lane, or route a justified blocker through a Planner revision opener. " +
+		"This admission rejection does not poison the run; terminal opener exhaustion remains PLANNING-STUCK.";
 	if (input.json) {
 		return {
 			status: 3,
 			stdout: `${JSON.stringify(
 				{
 					ok: false,
-					planning_stuck: true,
-					marker: PLANNING_STUCK_MARKER,
+					admission_rejected: true,
+					recoverable: true,
+					marker: PLANNING_ADMISSION_REJECTED_MARKER,
 					run_id: input.runId,
+					generation: input.generation,
 					stage: input.stage,
 					stage_n: input.stageN,
 					lane: input.decision.lane,
@@ -649,6 +658,7 @@ function buildLaneBudgetStuckResult(input: {
 					max_review_passes_per_lane: input.decision.maxReviewPassesPerLane,
 					max_review_passes_source: input.source,
 					reason: input.decision.reason,
+					recovery: "continue_within_generation_or_open_a_valid_revision_generation",
 				},
 				null,
 				2,
@@ -658,7 +668,7 @@ function buildLaneBudgetStuckResult(input: {
 	}
 	return {
 		status: 3,
-		stdout: `${PLANNING_STUCK_MARKER}\n`,
+		stdout: `${PLANNING_ADMISSION_REJECTED_MARKER}\n`,
 		stderr: `${detail}\n`,
 	};
 }
@@ -1445,6 +1455,158 @@ function ralplanPlanningStuckIndexKey(entry: unknown): string | undefined {
 	return record.planning_stuck === true ? "planning_stuck" : undefined;
 }
 
+function ralplanAdmissionEventIndexKey(entry: unknown): string | undefined {
+	if (!entry || typeof entry !== "object" || Array.isArray(entry)) return undefined;
+	const record = entry as Record<string, unknown>;
+	if (
+		(record.event !== "planning_admission_rejected" && record.event !== "planning_admission_recovered") ||
+		typeof record.generation !== "number" ||
+		!Number.isInteger(record.generation) ||
+		(record.lane !== "architect" && record.lane !== "critic")
+	) {
+		return undefined;
+	}
+	const stageN = typeof record.stage_n === "number" && Number.isInteger(record.stage_n) ? record.stage_n : "";
+	return `${record.event}\u0000${record.generation}\u0000${record.lane}\u0000${stageN}`;
+}
+
+async function recordRalplanLaneAdmissionRejected(
+	cwd: string,
+	sessionId: string,
+	runId: string,
+	generation: number,
+	stageN: number,
+	lane: RalplanReviewLane,
+	reason: string,
+): Promise<void> {
+	const runDir = path.join(sessionPlansDir(cwd, sessionId), "ralplan", runId);
+	await appendJsonlIdempotent(
+		path.join(runDir, "index.jsonl"),
+		{
+			event: "planning_admission_rejected",
+			admission_rejected: true,
+			recoverable: true,
+			generation,
+			stage_n: stageN,
+			lane,
+			marker: PLANNING_ADMISSION_REJECTED_MARKER,
+			reason,
+			created_at: new Date().toISOString(),
+		},
+		{
+			cwd,
+			audit: {
+				category: "ledger",
+				verb: "append",
+				owner: "gjc-runtime",
+				skill: "ralplan",
+				sessionId,
+			},
+			key: ralplanAdmissionEventIndexKey,
+		},
+	);
+}
+
+function parseLaneAdmissionGeneration(
+	row: Record<string, unknown>,
+): { generation: number; lane: RalplanReviewLane } | undefined {
+	if (
+		row.event === "planning_admission_rejected" &&
+		typeof row.generation === "number" &&
+		Number.isInteger(row.generation) &&
+		(row.lane === "architect" || row.lane === "critic")
+	) {
+		return { generation: row.generation, lane: row.lane };
+	}
+	// Upgrade pre-E02 lane overflows: the old event shared the terminal marker but
+	// encoded the lane and generation in its reason string.
+	if (row.event === "planning_stuck" && typeof row.reason === "string") {
+		const legacy =
+			/^ralplan review lane budget exceeded: (architect|critic) pass .* in consensus iteration (\d+)/.exec(
+				row.reason,
+			);
+		if (legacy) return { lane: legacy[1] as RalplanReviewLane, generation: Number(legacy[2]) };
+	}
+	return undefined;
+}
+
+async function recordRalplanAdmissionRecoveries(
+	cwd: string,
+	sessionId: string,
+	runId: string,
+	currentGeneration: number,
+): Promise<void> {
+	if (!Number.isInteger(currentGeneration) || currentGeneration < 1) return;
+	const runDir = path.join(sessionPlansDir(cwd, sessionId), "ralplan", runId);
+	const indexPath = path.join(runDir, "index.jsonl");
+	let rawText: string;
+	try {
+		rawText = await fs.readFile(indexPath, "utf8");
+	} catch (error) {
+		if (getErrorCode(error) === "ENOENT") return;
+		throw error;
+	}
+	const rejected = new Map<string, { generation: number; lane: RalplanReviewLane }>();
+	const recovered = new Set<string>();
+	for (const line of rawText.split(/\r?\n/)) {
+		if (!line.trim()) continue;
+		let value: unknown;
+		try {
+			value = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+		const row = value as Record<string, unknown>;
+		const admission = parseLaneAdmissionGeneration(row);
+		if (admission) rejected.set(`${admission.generation}\u0000${admission.lane}`, admission);
+		if (
+			row.event === "planning_admission_recovered" &&
+			typeof row.generation === "number" &&
+			Number.isInteger(row.generation) &&
+			(row.lane === "architect" || row.lane === "critic") &&
+			typeof row.recovered_by_generation === "number" &&
+			Number.isInteger(row.recovered_by_generation) &&
+			row.recovered_by_generation > row.generation
+		) {
+			recovered.add(`${row.generation}\u0000${row.lane}`);
+		}
+	}
+	for (const [identity, admission] of rejected) {
+		if (admission.generation >= currentGeneration || recovered.has(identity)) continue;
+		await appendJsonlIdempotent(
+			indexPath,
+			{
+				event: "planning_admission_recovered",
+				generation: admission.generation,
+				recovered_by_generation: currentGeneration,
+				lane: admission.lane,
+				created_at: new Date().toISOString(),
+			},
+			{
+				cwd,
+				audit: {
+					category: "ledger",
+					verb: "append",
+					owner: "gjc-runtime",
+					skill: "ralplan",
+					sessionId,
+				},
+				key: ralplanAdmissionEventIndexKey,
+			},
+		);
+	}
+}
+
+async function recordRalplanAdmissionRecoveryForOpener(
+	cwd: string,
+	resolved: Pick<ResolvedArtifactArgs, "sessionId" | "runId" | "stage">,
+): Promise<void> {
+	if (resolved.stage !== "planner" && resolved.stage !== "revision") return;
+	const generation = await countRalplanOnDiskOpeners(cwd, resolved.sessionId, resolved.runId);
+	await recordRalplanAdmissionRecoveries(cwd, resolved.sessionId, resolved.runId, generation);
+}
+
 async function recordRalplanPlanningStuck(
 	cwd: string,
 	sessionId: string,
@@ -1524,10 +1686,45 @@ async function readRalplanPlanningStuck(cwd: string, sessionId: string, runId: s
 		if (!line.trim()) continue;
 		try {
 			const row = JSON.parse(line) as Record<string, unknown>;
-			if (row.planning_stuck === true) return true;
+			if (row.event === "planning_stuck" && row.planning_stuck === true) {
+				const legacyLaneOverflow =
+					typeof row.reason === "string" && row.reason.startsWith("ralplan review lane budget exceeded:");
+				if (!legacyLaneOverflow) return true;
+			}
 		} catch {
 			return true;
 		}
+	}
+	return false;
+}
+
+async function readRalplanPlanningAdmissionPending(cwd: string, sessionId: string, runId: string): Promise<boolean> {
+	const index = await loadRalplanIndexForCap(cwd, sessionId, runId);
+	if (index.rawText === undefined) return false;
+	const rejected = new Map<string, { generation: number; lane: RalplanReviewLane }>();
+	const recovered = new Set<string>();
+	for (const line of index.rawText.split(/\r?\n/)) {
+		if (!line.trim()) continue;
+		try {
+			const row = JSON.parse(line) as Record<string, unknown>;
+			const admission = parseLaneAdmissionGeneration(row);
+			if (admission) rejected.set(`${admission.generation}\u0000${admission.lane}`, admission);
+			if (
+				row.event === "planning_admission_recovered" &&
+				typeof row.generation === "number" &&
+				Number.isInteger(row.generation) &&
+				typeof row.recovered_by_generation === "number" &&
+				row.recovered_by_generation > row.generation &&
+				(row.lane === "architect" || row.lane === "critic")
+			) {
+				recovered.add(`${row.generation}\u0000${row.lane}`);
+			}
+		} catch {
+			// The terminal stuck reader fails closed on malformed rows.
+		}
+	}
+	for (const identity of rejected.keys()) {
+		if (!recovered.has(identity)) return true;
 	}
 	return false;
 }
@@ -2462,6 +2659,11 @@ async function handleArtifactWrite(
 			// crash in the gap, before returning the deduplicated receipt.
 			if (existingArtifact.autoHandoff) {
 				const planningStuck = await readRalplanPlanningStuck(persistCwd, resolved.sessionId, resolved.runId);
+				const planningAdmissionPending = await readRalplanPlanningAdmissionPending(
+					persistCwd,
+					resolved.sessionId,
+					resolved.runId,
+				);
 				const publication = { id: randomUUID(), sha256: existingArtifact.sha256 };
 				if (
 					await markRalplanFinalPublicationPending(
@@ -2476,12 +2678,17 @@ async function handleArtifactWrite(
 						persistCwd,
 						resolved.sessionId,
 						resolved.runId,
-						applyRalplanPlanningStuckOverride(existingArtifact.autoHandoff, planningStuck),
+						applyRalplanAdmissionOverrides(
+							existingArtifact.autoHandoff,
+							planningStuck,
+							planningAdmissionPending,
+						),
 						publication,
 					);
 				}
 			}
 		}
+		await recordRalplanAdmissionRecoveryForOpener(persistCwd, resolved);
 		return await buildDeduplicatedResult(resolved, existingArtifact, sha256, persistCwd, repositoryBinding);
 	}
 
@@ -2534,6 +2741,7 @@ async function handleArtifactWrite(
 		if (laneVerdict && (await applyLaneVerdictUpdate(persistCwd, resolved.sessionId, laneVerdict, resolved.runId))) {
 			appliedLaneVerdict = laneVerdict;
 		}
+		await recordRalplanAdmissionRecoveryForOpener(persistCwd, resolved);
 		return await buildDeduplicatedResult(
 			resolved,
 			repairedArtifact,
@@ -2585,12 +2793,22 @@ async function handleArtifactWrite(
 		onDiskLaneCounts: onDiskLaneArtifacts,
 	});
 	if (!laneBudgetDecision.allowed) {
-		await recordRalplanPlanningStuck(persistCwd, resolved.sessionId, resolved.runId, laneBudgetDecision.reason);
-		return buildLaneBudgetStuckResult({
+		const generation = Math.max(1, capDecision.currentIterations, onDiskOpeners);
+		await recordRalplanLaneAdmissionRejected(
+			persistCwd,
+			resolved.sessionId,
+			resolved.runId,
+			generation,
+			resolved.stageN,
+			laneBudgetDecision.lane,
+			laneBudgetDecision.reason,
+		);
+		return buildLaneAdmissionRejectedResult({
 			json: resolved.json,
 			stage: resolved.stage,
 			stageN: resolved.stageN,
 			runId: resolved.runId,
+			generation,
 			decision: laneBudgetDecision,
 			source: laneLimit.source,
 		});
@@ -2605,6 +2823,11 @@ async function handleArtifactWrite(
 		autoHandoff = await resolveRalplanAutoHandoff(persistCwd, {
 			agentDir,
 			planningStuck: await readRalplanPlanningStuck(persistCwd, resolved.sessionId, resolved.runId),
+			planningAdmissionPending: await readRalplanPlanningAdmissionPending(
+				persistCwd,
+				resolved.sessionId,
+				resolved.runId,
+			),
 		});
 		finalPublication = { id: randomUUID(), sha256 };
 		await markRalplanFinalPublicationPending(persistCwd, resolved.sessionId, resolved.runId, finalPublication);
@@ -2612,6 +2835,7 @@ async function handleArtifactWrite(
 	// Keep run-state `current_phase` coherent with the stage being persisted.
 	await persistActiveRunId(persistCwd, resolved.sessionId, resolved.runId, resolved.stage);
 	const persisted = await persistArtifact(resolved, persistCwd, content, sha256, autoHandoff);
+	await recordRalplanAdmissionRecoveryForOpener(persistCwd, resolved);
 	if (persistedRoleState) {
 		await applyPersistedRoleStateUpdate(persistCwd, resolved.sessionId, persistedRoleState);
 	}
@@ -2677,11 +2901,16 @@ async function handleArtifactWrite(
  * do not rewrite artifacts, append rows, or churn run state; a crash-gap repair may
  * complete riding persisted role/lane metadata before returning this receipt.
  */
-function applyRalplanPlanningStuckOverride(
+function applyRalplanAdmissionOverrides(
 	admission: RalplanAutoHandoffResolution,
 	planningStuck: boolean,
+	planningAdmissionPending: boolean,
 ): RalplanAutoHandoffResolution {
-	return planningStuck ? { ...admission, effectiveTarget: "off", degradationReason: "planning_stuck" } : admission;
+	if (planningStuck) return { ...admission, effectiveTarget: "off", degradationReason: "planning_stuck" };
+	if (planningAdmissionPending) {
+		return { ...admission, effectiveTarget: "off", degradationReason: "planning_admission_pending" };
+	}
+	return admission;
 }
 
 async function buildDeduplicatedResult(
@@ -2716,9 +2945,15 @@ async function buildDeduplicatedResult(
 			"pending-approval.md",
 		);
 		const planningStuck = await readRalplanPlanningStuck(cwd, resolved.sessionId, resolved.runId);
-		payload.auto_handoff = applyRalplanPlanningStuckOverride(
+		const planningAdmissionPending = await readRalplanPlanningAdmissionPending(
+			cwd,
+			resolved.sessionId,
+			resolved.runId,
+		);
+		payload.auto_handoff = applyRalplanAdmissionOverrides(
 			existing.autoHandoff ?? unavailableRalplanFinalAdmission(),
 			planningStuck,
+			planningAdmissionPending,
 		);
 	}
 	const stdout = resolved.json
