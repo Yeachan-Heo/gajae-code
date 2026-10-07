@@ -13,10 +13,12 @@ import {
 } from "../src/config/file-lock";
 
 const roots: string[] = [];
-// A real NTFS lock directory exhibited this signed/unsigned pair under Bun and
-// the native snapshot API. The fixture makes it deterministic on every OS.
+// A real NTFS lock directory exhibited this signed/unsigned file-ID pair
+// under Bun and the native snapshot API. The fixture also models the Windows
+// volume-serial representation deterministically.
 const ROOT_ID = 15_821_989_915_882_833_371n;
 const INFO_ID = 11_529_215_046_068_470_561n;
+const DEVICE_ID = 0xf1234567n;
 const DEAD_PID = 2_147_483_647;
 
 afterEach(async () => {
@@ -40,8 +42,11 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 		const isRoot = target === lock || target === parked || (detach && target === root);
 		const isInfo = target === path.join(lock, "info") || target === path.join(parked, "info");
 		const id = isRoot && component !== "info" ? ROOT_ID : isInfo && component !== "root" ? INFO_ID : null;
-		if (id === null) return stat;
-		return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { ino: BigInt.asIntN(64, id) });
+		if (!isRoot && !isInfo) return stat;
+		return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, {
+			...(process.platform === "win32" ? { dev: BigInt.asIntN(32, DEVICE_ID) } : {}),
+			...(id === null ? {} : { ino: BigInt.asIntN(64, id) }),
+		});
 	};
 	vi.spyOn(fs, "lstat").mockImplementation((async (target, options) => {
 		const stat = await realLstat(target, options);
@@ -61,9 +66,11 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 	});
 	const nativeSnapshot = (snapshot: NativeDirectoryTreeSnapshot): NativeDirectoryTreeSnapshot => ({
 		...snapshot,
+		rootDev: process.platform === "win32" ? DEVICE_ID.toString() : snapshot.rootDev,
 		rootIno: component === "info" ? snapshot.rootIno : ROOT_ID.toString(),
 		entries: snapshot.entries.map(entry => ({
 			...entry,
+			dev: process.platform === "win32" ? DEVICE_ID.toString() : entry.dev,
 			ino:
 				entry.relativePath === "" && component !== "info"
 					? ROOT_ID.toString()
