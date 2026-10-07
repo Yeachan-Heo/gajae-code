@@ -18215,7 +18215,7 @@ export class AgentSession {
 		this.#setModelAuthoritatively(model, cause);
 		if (cause === "user-selection") this.#unavailableModelProfile = undefined;
 		this.#seedSessionCanonicalVariant(model);
-		if (cause === "user-selection") this.#recordUserCanonicalVariantSelection(model);
+		if (cause === "user-selection") this.#recordUserCanonicalVariantSelection();
 		this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, role);
 		this.settings.setModelRole(
 			role,
@@ -18835,7 +18835,7 @@ export class AgentSession {
 			this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
 			if (options?.persistAsSessionDefault) {
 				this.#seedSessionCanonicalVariant(model);
-				if (options.cause === "user-selection") this.#recordUserCanonicalVariantSelection(model);
+				if (options.cause === "user-selection") this.#recordUserCanonicalVariantSelection();
 			}
 
 			// Apply explicit thinking level if given; otherwise prefer the model's
@@ -18963,7 +18963,7 @@ export class AgentSession {
 		this.markUserModelSelection();
 		this.#setModelWithProviderSessionReset(model);
 		this.#seedSessionCanonicalVariant(model);
-		this.#recordUserCanonicalVariantSelection(model);
+		this.#recordUserCanonicalVariantSelection();
 		const thinkingLevelChanged = this.#thinkingLevel !== thinkingLevel;
 		this.#thinkingLevelMutationRevision++;
 		this.#thinkingLevelLiveMutationRevision++;
@@ -21960,9 +21960,9 @@ export class AgentSession {
 		}
 	}
 
-	#recordUserCanonicalVariantSelection(model: Model): void {
+	#recordUserCanonicalVariantSelection(): void {
 		this.#userCanonicalVariantSelectionRevision++;
-		this.#userCanonicalVariantSelection = this.#modelRegistry.getCanonicalId?.(model);
+		this.#userCanonicalVariantSelection = this.#modelRegistry.getSessionCanonicalVariant?.(this.sessionId);
 	}
 
 	#closeCodexProviderSessionsForHistoryRewrite(): void {

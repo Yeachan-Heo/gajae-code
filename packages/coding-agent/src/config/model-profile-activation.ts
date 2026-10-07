@@ -1694,6 +1694,29 @@ function sameSerializedValue(left: unknown, right: unknown): boolean {
 	return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function restoreConcurrentProfileOverrides(
+	previous: Readonly<Record<string, ModelSelectorValue>> | undefined,
+	activated: Readonly<Record<string, ModelSelectorValue>> | undefined,
+	current: Readonly<Record<string, ModelSelectorValue>> | undefined,
+): Readonly<Record<string, ModelSelectorValue>> | undefined {
+	if (sameSerializedValue(current, activated)) return previous;
+	const restored = { ...(previous ?? {}) };
+	const keys = new Set([
+		...Object.keys(previous ?? {}),
+		...Object.keys(activated ?? {}),
+		...Object.keys(current ?? {}),
+	]);
+	for (const key of keys) {
+		const wasActivated = activated !== undefined && Object.hasOwn(activated, key);
+		const isCurrent = current !== undefined && Object.hasOwn(current, key);
+		if (wasActivated === isCurrent && sameSerializedValue(activated?.[key], current?.[key])) continue;
+		const currentValue = current?.[key];
+		if (isCurrent && currentValue !== undefined) restored[key] = currentValue;
+		else delete restored[key];
+	}
+	return Object.keys(restored).length > 0 || previous !== undefined ? restored : undefined;
+}
+
 export async function applyPreparedModelProfileActivation(
 	prepared: PreparedModelProfileActivation,
 	options: ApplyModelProfileActivationOptions = {},
@@ -1751,16 +1774,7 @@ export async function applyPreparedModelProfileActivation(
 					},
 				},
 			);
-			if (options.isCurrent && !modelMutationStarted) {
-				// Restore canonical variant before returning due to canceled prepare
-				restoreCanonicalVariantAfterPreparation(
-					prepared.modelRegistry,
-					prepared.session,
-					prepared.previousCanonicalVariant,
-					prepared.previousUserCanonicalVariantSelection,
-				);
-				return;
-			}
+			if (options.isCurrent && !modelMutationStarted) throw new ModelProfileActivationSupersededError();
 			if (options.isCurrent && !options.isCurrent()) throw new ModelProfileActivationSupersededError();
 		}
 		// Always reinstall the model role layer from the durable base plus the
@@ -1845,13 +1859,21 @@ export async function applyPreparedModelProfileActivation(
 					? prepared.settings.unset("modelRoles")
 					: prepared.settings.set("modelRoles", restoredModelRoles),
 			);
-			if (!selectionSuperseded || sameSerializedValue(prepared.settings.getGlobal("task.agentModelOverrides"), {})) {
-				restore("restore agent role setting", () =>
-					prepared.previousPersistedAgentModelOverrides === undefined
-						? prepared.settings.unset("task.agentModelOverrides")
-						: prepared.settings.set("task.agentModelOverrides", prepared.previousPersistedAgentModelOverrides),
-				);
-			}
+			const currentPersistedAgentModelOverrides = prepared.settings.getGlobal("task.agentModelOverrides");
+			const restoredPersistedAgentModelOverrides =
+				selectionSuperseded &&
+				currentPersistedAgentModelOverrides &&
+				!sameSerializedValue(currentPersistedAgentModelOverrides, {})
+					? {
+							...(prepared.previousPersistedAgentModelOverrides ?? {}),
+							...currentPersistedAgentModelOverrides,
+						}
+					: prepared.previousPersistedAgentModelOverrides;
+			restore("restore agent role setting", () =>
+				restoredPersistedAgentModelOverrides === undefined
+					? prepared.settings.unset("task.agentModelOverrides")
+					: prepared.settings.set("task.agentModelOverrides", restoredPersistedAgentModelOverrides),
+			);
 			const activatedThinkingLevel =
 				prepared.defaultThinkingLevel !== undefined && prepared.defaultThinkingLevel !== ThinkingLevel.Inherit
 					? prepared.defaultThinkingLevel
@@ -2255,22 +2277,24 @@ export async function applyModelProfileRuntimeBindings(
 ): Promise<void> {
 	if (isCurrent && !isCurrent()) return;
 	const prepared = await prepareModelProfileActivation(options);
+	const previousModelRolesOverride = prepared.settings.getOverride("modelRoles");
+	const previousAgentModelOverridesOverride = prepared.settings.getOverride("task.agentModelOverrides");
+	const previousActiveModelProfile = prepared.session.getActiveModelProfile?.();
+	let activatedModelRolesOverride: Readonly<Record<string, ModelSelectorValue>> | undefined;
+	let activatedAgentModelOverridesOverride: Readonly<Record<string, ModelSelectorValue>> | undefined;
 	try {
 		if (isCurrent && !isCurrent()) return;
 		prepared.settings.override("modelRoles", {
 			...prepared.baseModelRoles,
 			...prepared.modelRoles,
 		});
+		activatedModelRolesOverride = prepared.settings.getOverride("modelRoles");
 		prepared.settings.override("task.agentModelOverrides", {
 			...prepared.baseAgentModelOverrides,
 			...prepared.agentModelOverrides,
 		});
+		activatedAgentModelOverridesOverride = prepared.settings.getOverride("task.agentModelOverrides");
 		prepared.session.setActiveModelProfile?.(prepared.profileName);
-		prepared.session.noteProfileInstalledOverrides?.(
-			Object.keys(prepared.modelRoles),
-			Object.keys(prepared.agentModelOverrides),
-			prepared.previousModel,
-		);
 		try {
 			await prepared.session.syncEagerDelegation?.();
 		} catch (error) {
@@ -2279,6 +2303,40 @@ export async function applyModelProfileRuntimeBindings(
 				error: error instanceof Error ? error.message : String(error),
 			});
 		}
+		if (isCurrent && !isCurrent()) {
+			const restoredModelRolesOverride = restoreConcurrentProfileOverrides(
+				previousModelRolesOverride,
+				activatedModelRolesOverride,
+				prepared.settings.getOverride("modelRoles"),
+			);
+			if (restoredModelRolesOverride === undefined) prepared.settings.clearOverride("modelRoles");
+			else prepared.settings.override("modelRoles", restoredModelRolesOverride);
+			const restoredAgentModelOverridesOverride = restoreConcurrentProfileOverrides(
+				previousAgentModelOverridesOverride,
+				activatedAgentModelOverridesOverride,
+				prepared.settings.getOverride("task.agentModelOverrides"),
+			);
+			if (restoredAgentModelOverridesOverride === undefined)
+				prepared.settings.clearOverride("task.agentModelOverrides");
+			else prepared.settings.override("task.agentModelOverrides", restoredAgentModelOverridesOverride);
+			if (prepared.session.getActiveModelProfile?.() === prepared.profileName) {
+				prepared.session.setActiveModelProfile?.(previousActiveModelProfile);
+			}
+			try {
+				await prepared.session.syncEagerDelegation?.();
+			} catch (error) {
+				logger.warn("Failed to sync eager delegation after canceled recovered profile runtime bindings", {
+					profile: prepared.profileName,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+			return;
+		}
+		prepared.session.noteProfileInstalledOverrides?.(
+			Object.keys(prepared.modelRoles),
+			Object.keys(prepared.agentModelOverrides),
+			prepared.previousModel,
+		);
 	} finally {
 		if (isCurrent && !isCurrent()) {
 			restoreCanonicalVariantAfterPreparation(

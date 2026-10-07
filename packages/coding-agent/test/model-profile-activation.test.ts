@@ -196,8 +196,9 @@ function fakeSession(initial = model("provider-a", "initial")) {
 		async setModelTemporary(
 			next: Model,
 			thinkingLevel?: ThinkingLevel,
-			options?: { onMutationStarted?: () => void },
+			options?: { shouldMutate?: () => boolean; onMutationStarted?: () => void },
 		) {
+			if (options?.shouldMutate && !options.shouldMutate()) return;
 			options?.onMutationStarted?.();
 			this.setModelTemporaryCalls.push({ model: next, thinkingLevel });
 			this.model = next;
@@ -291,6 +292,40 @@ describe("model profile activation", () => {
 		});
 	});
 
+	test("rolls back a staged fallback chain when the guarded model mutation is skipped", async () => {
+		const session = fakeSession();
+		const registry = fakeRegistry();
+		const modelMutationStarted = Promise.withResolvers<void>();
+		const allowModelMutation = Promise.withResolvers<void>();
+		const originalSetModelTemporary = session.setModelTemporary.bind(session);
+		session.setModelTemporary = async (next, thinkingLevel, options) => {
+			modelMutationStarted.resolve();
+			await allowModelMutation.promise;
+			await originalSetModelTemporary(next, thinkingLevel, options);
+		};
+		let selectionIsCurrent = true;
+		const activation = activateModelProfile(
+			{
+				session,
+				modelRegistry: registry as never,
+				settings: Settings.isolated(),
+				profileName: "profile-a",
+			},
+			{ isCurrent: () => selectionIsCurrent },
+		);
+
+		await modelMutationStarted.promise;
+		selectionIsCurrent = false;
+		session.setConfiguredModelChain("default", ["provider-c/selected"], "model-selection", "user-selection", true);
+		allowModelMutation.resolve();
+		await activation;
+
+		expect(session.setModelTemporaryCalls).toEqual([]);
+		expect(session.getConfiguredModelChain("default")).toEqual(["provider-c/selected"]);
+		expect(session.getConfiguredModelChainState("default")).toMatchObject({ origin: "model-selection" });
+		expect(session.getActiveModelProfile()).toBeUndefined();
+	});
+
 	test("cancels recovered runtime bindings when selection changes during preparation", async () => {
 		const session = fakeSession();
 		const registry = fakeRegistry();
@@ -318,6 +353,52 @@ describe("model profile activation", () => {
 		expect(session.getActiveModelProfile()).toBeUndefined();
 		expect(settings.getOverride("modelRoles")).toBeUndefined();
 		expect(settings.getOverride("task.agentModelOverrides")).toBeUndefined();
+	});
+
+	test("restores recovered runtime bindings when selection changes during delegation sync", async () => {
+		const session = fakeSession();
+		session.setActiveModelProfile("previous-profile");
+		const registry = fakeRegistry();
+		const settings = Settings.isolated({
+			modelRoles: { default: "provider-c/global-default", critic: "provider-c/global-critic" },
+			"task.agentModelOverrides": { planner: "provider-c/global-planner" },
+		});
+		const previousModelRolesOverride = { default: "provider-c/old-default", critic: "provider-c/old-critic" };
+		const previousAgentModelOverridesOverride = { planner: "provider-c/old-planner" };
+		settings.override("modelRoles", previousModelRolesOverride);
+		settings.override("task.agentModelOverrides", previousAgentModelOverridesOverride);
+		const syncStarted = Promise.withResolvers<void>();
+		const allowSync = Promise.withResolvers<void>();
+		let syncCalls = 0;
+		const syncEagerDelegation = vi.fn(async () => {
+			syncCalls += 1;
+			if (syncCalls === 1) {
+				syncStarted.resolve();
+				await allowSync.promise;
+			}
+		});
+		const noteProfileInstalledOverrides = vi.fn();
+		Object.assign(session, { syncEagerDelegation, noteProfileInstalledOverrides });
+		let selectionIsCurrent = true;
+		const activation = applyModelProfileRuntimeBindings(
+			{ session, modelRegistry: registry as never, settings, profileName: "profile-a" },
+			() => selectionIsCurrent,
+		);
+
+		await syncStarted.promise;
+		selectionIsCurrent = false;
+		settings.setAgentModelOverride("executor", "provider-c/user-executor");
+		allowSync.resolve();
+		await activation;
+
+		expect(settings.getOverride("modelRoles")).toEqual(previousModelRolesOverride);
+		expect(settings.getOverride("task.agentModelOverrides")).toEqual({
+			...previousAgentModelOverridesOverride,
+			executor: "provider-c/user-executor",
+		});
+		expect(session.getActiveModelProfile()).toBe("previous-profile");
+		expect(noteProfileInstalledOverrides).not.toHaveBeenCalled();
+		expect(syncEagerDelegation).toHaveBeenCalledTimes(2);
 	});
 
 	test("built-in claude-opus falls back to Opus 4.6 when Opus 5.5 is absent", async () => {
@@ -2650,6 +2731,7 @@ describe("model profile activation", () => {
 			settings.setModelRole("default", "provider-c/selected");
 			settings.clearOverride("modelRoles");
 			settings.clearOverride("task.agentModelOverrides");
+			settings.setAgentModelOverride("executor", "provider-c/selected-executor");
 			settings.unset("modelProfile.default");
 			session.setConfiguredModelChain("default", ["provider-c/selected"], "model_selection");
 		};
@@ -2667,7 +2749,10 @@ describe("model profile activation", () => {
 			architect: "provider-c/previous-architect",
 		});
 		expect(settings.get("modelProfile.default")).toBeUndefined();
-		expect(settings.get("task.agentModelOverrides")).toEqual({ critic: "provider-c/previous-critic" });
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			critic: "provider-c/previous-critic",
+			executor: "provider-c/selected-executor",
+		});
 		expect(settings.getOverride("modelRoles")).toBeUndefined();
 		expect(settings.getOverride("task.agentModelOverrides")).toBeUndefined();
 		expect(settings.get("defaultThinkingLevel")).toBe(ThinkingLevel.Low);
