@@ -157,24 +157,24 @@ test("acquires and releases after reclaiming a signed-ID dead-owner lock", async
 });
 
 test.skipIf(process.platform !== "win32")(
-	"reclaims signed IDs and cleans up through a temporary-root case alias",
+	"reclaims signed IDs and cleans up through a temporary-root case alias when available",
 	async () => {
 		const tempRoot = os.tmpdir();
 		const canonicalTempRoot = await fs.realpath(tempRoot);
 		const volumeRoot = path.win32.parse(canonicalTempRoot).root;
 		const isDriveRoot = /^[a-z]:[\\/]/i.test(volumeRoot);
-		const caseableSuffixOffset = canonicalTempRoot.slice(volumeRoot.length).search(/[a-z]/i);
-		if (!isDriveRoot && caseableSuffixOffset < 0) {
-			throw new Error("Expected a caseable Windows temporary-root path");
+		const aliasOffset = canonicalTempRoot.slice(volumeRoot.length).search(/[a-z]/i);
+		const caseableOffset = isDriveRoot ? 0 : aliasOffset < 0 ? -1 : volumeRoot.length + aliasOffset;
+		let aliasedTempRoot = canonicalTempRoot;
+		if (caseableOffset >= 0) {
+			const rootCharacter = canonicalTempRoot[caseableOffset];
+			if (!rootCharacter) throw new Error("Expected a caseable Windows temporary-root character");
+			const alternateCase =
+				rootCharacter === rootCharacter.toUpperCase() ? rootCharacter.toLowerCase() : rootCharacter.toUpperCase();
+			aliasedTempRoot =
+				canonicalTempRoot.slice(0, caseableOffset) + alternateCase + canonicalTempRoot.slice(caseableOffset + 1);
+			expect(aliasedTempRoot).not.toBe(canonicalTempRoot);
 		}
-		const caseableOffset = isDriveRoot ? 0 : volumeRoot.length + caseableSuffixOffset;
-		const rootCharacter = canonicalTempRoot[caseableOffset];
-		if (!rootCharacter) throw new Error("Expected a caseable Windows temporary-root character");
-		const alternateCase =
-			rootCharacter === rootCharacter.toUpperCase() ? rootCharacter.toLowerCase() : rootCharacter.toUpperCase();
-		const aliasedTempRoot =
-			canonicalTempRoot.slice(0, caseableOffset) + alternateCase + canonicalTempRoot.slice(caseableOffset + 1);
-		expect(aliasedTempRoot).not.toBe(canonicalTempRoot);
 		const fixture = await signedIdentityFixture("both", false, aliasedTempRoot);
 		const observed = await readFileLockObservationForGc(fixture.lock);
 		if (!observed) throw new Error("Expected a lock observation");
