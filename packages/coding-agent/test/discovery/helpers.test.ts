@@ -330,7 +330,7 @@ describe("safe discovery boundaries", () => {
 			expect(result.warnings).toEqual(
 				expect.arrayContaining([
 					expect.stringContaining(
-						` (resolves to ${path.join(realRoot, "outside", "SKILL.md")}; add ${realRoot} to skills.customDirectories to load it)`,
+						` (resolves to ${path.join(realRoot, "outside", "SKILL.md")}; add ${realRoot} to skills.customDirectories to load it, or enable skills.trustUserSkills)`,
 					),
 				]),
 			);
@@ -811,6 +811,69 @@ describe("safe discovery boundaries", () => {
 			);
 			expect(result.items).toEqual([]);
 			expect(result.warnings?.filter(warning => warning.includes("not a regular file"))).toHaveLength(2);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("follows user-level symlinks resolving outside scan root when trustUserSkills is true (issue #6355)", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-trust-user-skills-"));
+		try {
+			const skillsRepo = path.join(root, "skills-repo");
+			const userSkillsDir = path.join(root, ".gjc", "agent", "skills");
+			const linkedSkillName = "external-skill";
+			const linkedSkillDir = path.join(skillsRepo, linkedSkillName);
+
+			// Create a skills directory outside the scan root
+			await fs.mkdir(linkedSkillDir, { recursive: true });
+			await fs.writeFile(
+				path.join(linkedSkillDir, "SKILL.md"),
+				"---\nname: external-skill\ndescription: Skill in external repo\n---\nExternal skill body",
+			);
+
+			// Create user skills directory and symlink to the external skill
+			await fs.mkdir(userSkillsDir, { recursive: true });
+			await fs.symlink(linkedSkillDir, path.join(userSkillsDir, linkedSkillName), "dir");
+
+			// Without trustUserSkills, the symlink should be rejected
+			const resultWithoutTrust = await scanSkillsFromDir(
+				{ cwd: root, home: root, repoRoot: root },
+				{
+					dir: userSkillsDir,
+					providerId: "test",
+					level: "user",
+					requireDescription: true,
+					trustUserSkills: false,
+				},
+			);
+			expect(resultWithoutTrust.items).toHaveLength(0);
+			expect(resultWithoutTrust.warnings).toEqual(
+				expect.arrayContaining([
+					expect.stringContaining("Refusing skill path outside scan root"),
+					expect.stringContaining("skills.trustUserSkills"),
+				]),
+			);
+
+			// With trustUserSkills, the symlink should be followed and the skill loaded
+			const resultWithTrust = await scanSkillsFromDir(
+				{ cwd: root, home: root, repoRoot: root },
+				{
+					dir: userSkillsDir,
+					providerId: "test",
+					level: "user",
+					requireDescription: true,
+					trustUserSkills: true,
+				},
+			);
+			expect(resultWithTrust.items).toHaveLength(1);
+			expect(resultWithTrust.items[0].name).toBe("external-skill");
+			expect(resultWithTrust.warnings).toEqual([]);
+
+			// Verify the skill body can be loaded
+			const loadContent = resultWithTrust.items[0].loadContent;
+			if (!loadContent) throw new Error("Expected skill body loader");
+			const body = await loadContent();
+			expect(body).toContain("External skill body");
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}

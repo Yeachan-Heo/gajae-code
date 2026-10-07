@@ -479,6 +479,8 @@ export interface ScanSkillsFromDirOptions {
 	linkContainmentRoot?: string;
 	/** Filesystem authority for explicit-home reads. */
 	scope?: ReadScope;
+	/** When true and level is "user", permit skill symlinks resolving outside the scan root. */
+	trustUserSkills?: boolean;
 }
 
 // Stable ordering used for skill lists in prompts: name (case-insensitive), then name, then path.
@@ -716,6 +718,7 @@ export async function scanSkillsFromDir(
 					? directoryIdentityIsCurrent(options.authorityRoot, authorityIdentity)
 					: true,
 			]);
+			const allowOutsideRoot = options.trustUserSkills && level === "user";
 			if (
 				!opened.isFile() ||
 				opened.nlink !== 1n ||
@@ -723,7 +726,7 @@ export async function scanSkillsFromDir(
 				!observed.isFile() ||
 				opened.dev !== observed.dev ||
 				opened.ino !== observed.ino ||
-				!isWithinRoot(currentPath) ||
+				(!isWithinRoot(currentPath) && !allowOutsideRoot) ||
 				!currentScanRoot ||
 				!currentAuthorityRoot
 			) {
@@ -789,10 +792,11 @@ export async function scanSkillsFromDir(
 	const loadSkill = async (candidatePath: string) => {
 		try {
 			const skillPath = await fs.promises.realpath(candidatePath);
-			if (!isWithinRoot(skillPath)) {
+			const allowOutsideRoot = options.trustUserSkills && level === "user";
+			if (!isWithinRoot(skillPath) && !allowOutsideRoot) {
 				// Name the resolved directory and the setting that loads it, so a symlinked skills repo is fixable (#6355).
 				warnings.push(
-					`Refusing skill path outside scan root: ${candidatePath} (resolves to ${skillPath}; add ${path.dirname(path.dirname(skillPath))} to skills.customDirectories to load it)`,
+					`Refusing skill path outside scan root: ${candidatePath} (resolves to ${skillPath}; add ${path.dirname(path.dirname(skillPath))} to skills.customDirectories to load it, or enable skills.trustUserSkills)`,
 				);
 				return;
 			}
