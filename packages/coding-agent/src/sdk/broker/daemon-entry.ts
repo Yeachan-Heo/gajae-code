@@ -76,6 +76,7 @@ export async function launchAuthorizedBrokerSuccessor(
 			const env = { ...command.env, GJC_BROKER_RESTART_REQUEST: options.requestId };
 			const launchMode = resolveBrokerLaunchMode(process.platform, "discovery");
 			if (launchMode === "direct") throw new Error("Broker successor launch cannot use a fixture child.");
+			const timeoutMs = Math.max(0, Math.min(deadline, options.deadlineAt) - Date.now());
 			const launched =
 				launchMode === "windows-hop"
 					? await launchBrokerViaHop(
@@ -86,11 +87,16 @@ export async function launchAuthorizedBrokerSuccessor(
 								},
 								...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
 							},
-							{ env, cwd: command.kind === "bun-source" ? command.cwd : undefined },
+							{
+								env,
+								cwd: command.kind === "bun-source" ? command.cwd : undefined,
+								timeoutMs,
+							},
 						)
 					: await launchBrokerViaPosixTrampoline(options.agentDir, {
 							env,
 							...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
+							timeoutMs,
 						});
 			if (launched.error)
 				return { kind: "refused" as const, reason: "spawn_failed" as const, detail: launched.error.message };

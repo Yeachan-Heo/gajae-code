@@ -1,12 +1,15 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
 import { type BrokerDiscovery, isPidAlive } from "../src/sdk/broker/discovery";
 import {
+	awaitBrokerLauncherForTest,
 	BrokerHopError,
 	brokerOwnerIdentityMatchesForTest,
+	brokerSpawnFailureErrorForTest,
 	launchBrokerViaHop,
 	parseBrokerHopReply,
 	reapDetachedBrokerPidForTest,
@@ -91,6 +94,30 @@ describe("SDK broker hop protocol", () => {
 		const error = launched.error as BrokerHopError;
 		expect(error.hopStderr.trim()).not.toBe("");
 		expect(error.message).toContain(error.hopStderr.trim());
+		expect(brokerSpawnFailureErrorForTest(error)).toBe(error);
+		expect(brokerSpawnFailureErrorForTest(new Error("ENOENT")).message).toBe(
+			"Failed to spawn detached SDK broker: ENOENT",
+		);
+	});
+
+	test("launcher wait terminates a child when its startup deadline expires", async () => {
+		const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+		const spawned = Promise.withResolvers<void>();
+		const closed = Promise.withResolvers<void>();
+		child.once("spawn", spawned.resolve);
+		child.once("close", closed.resolve);
+		await spawned.promise;
+		try {
+			const result = await awaitBrokerLauncherForTest(child, 10);
+			if (result.kind !== "timeout") throw new Error("Expected launcher timeout.");
+			expect(result.terminated).toBe(true);
+			expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
+		} finally {
+			if (child.exitCode === null && child.signalCode === null) {
+				child.kill("SIGKILL");
+				await closed.promise;
+			}
+		}
 	});
 
 	test("broker inherits the hop environment and writes stderr to the log path (no fd numbers, no env on argv)", async () => {

@@ -127,6 +127,7 @@ export interface BrokerLaunchResult {
 }
 
 const MAX_LAUNCHER_OUTPUT_CHARS = 4_096;
+const DEFAULT_LAUNCHER_TIMEOUT_MS = 30_000;
 
 function appendBoundedOutput(current: string, chunk: Buffer | string): string {
 	const next = current + chunk.toString();
@@ -144,6 +145,45 @@ function awaitLauncherClose(child: ChildProcess): Promise<{ code: number | null;
 	return promise;
 }
 
+async function terminateLauncher(child: ChildProcess): Promise<boolean> {
+	if (child.exitCode !== null || child.signalCode !== null) return true;
+	const exited = Promise.withResolvers<void>();
+	child.once("exit", exited.resolve);
+	child.once("close", exited.resolve);
+	child.on("error", () => {});
+	try {
+		child.kill("SIGKILL");
+	} catch {
+		// The exit events below still distinguish a launcher that already exited.
+	}
+	await Promise.race([exited.promise, Bun.sleep(1_000)]);
+	return child.exitCode !== null || child.signalCode !== null;
+}
+
+async function awaitLauncherCloseBeforeDeadline(
+	child: ChildProcess,
+	timeoutMs: number,
+): Promise<
+	{ kind: "closed"; outcome: { code: number | null; spawnError?: Error } } | { kind: "timeout"; terminated: boolean }
+> {
+	const closed = awaitLauncherClose(child);
+	const result = await Promise.race([
+		closed.then(outcome => ({ kind: "closed" as const, outcome })),
+		Bun.sleep(timeoutMs).then(() => ({ kind: "timeout" as const })),
+	]);
+	if (result.kind === "closed") return result;
+	return { kind: "timeout", terminated: await terminateLauncher(child) };
+}
+
+/** Test hook: proves a stuck launcher is terminated at its deadline. */
+export async function awaitBrokerLauncherForTest(
+	child: ChildProcess,
+	timeoutMs: number,
+): Promise<{ kind: "closed" } | { kind: "timeout"; terminated: boolean }> {
+	const result = await awaitLauncherCloseBeforeDeadline(child, timeoutMs);
+	return result.kind === "closed" ? { kind: "closed" } : result;
+}
+
 /**
  * Windows only: launch the broker through the internal hop and await its reply.
  *
@@ -156,8 +196,10 @@ function awaitLauncherClose(child: ChildProcess): Promise<{ code: number | null;
  */
 export async function launchBrokerViaHop(
 	message: BrokerHopMessage,
-	options: { env: NodeJS.ProcessEnv; cwd?: string },
+	options: { env: NodeJS.ProcessEnv; cwd?: string; timeoutMs?: number },
 ): Promise<BrokerLaunchResult> {
+	const timeoutMs = options.timeoutMs ?? DEFAULT_LAUNCHER_TIMEOUT_MS;
+	if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("Windows broker hop startup deadline elapsed.");
 	const hopCmd = resolveHopInvocation(JSON.stringify(message));
 	const hop = spawn(hopCmd.file, hopCmd.args, {
 		detached: false,
@@ -174,8 +216,21 @@ export async function launchBrokerViaHop(
 	hop.stderr?.on("data", chunk => {
 		stderr = appendBoundedOutput(stderr, chunk);
 	});
-	const outcome = await awaitLauncherClose(hop);
-	return { process: hop, ...parseBrokerHopReply(outcome.code, stdout, outcome.spawnError, stderr) };
+	const wait = await awaitLauncherCloseBeforeDeadline(hop, timeoutMs);
+	if (wait.kind === "timeout") {
+		const detail = wait.terminated ? "hop was terminated" : "hop did not exit after termination";
+		return {
+			process: hop,
+			realBrokerPid: undefined,
+			error: new BrokerHopError({
+				exitCode: hop.exitCode,
+				stdout,
+				stderr,
+				reason: `hop exceeded its ${timeoutMs}ms startup deadline; ${detail}`,
+			}),
+		};
+	}
+	return { process: hop, ...parseBrokerHopReply(wait.outcome.code, stdout, wait.outcome.spawnError, stderr) };
 }
 
 /** Parses the hop's single-line pid/incarnation reply into broker identity or a typed error. */
@@ -210,8 +265,11 @@ export function parseBrokerHopReply(
 /** POSIX only: a short-lived CLI trampoline detaches the broker from the client tree. */
 export async function launchBrokerViaPosixTrampoline(
 	agentDir: string,
-	options: { env: NodeJS.ProcessEnv; cwd?: string; stderrFd?: number },
+	options: { env: NodeJS.ProcessEnv; cwd?: string; stderrFd?: number; timeoutMs?: number },
 ): Promise<BrokerLaunchResult> {
+	const timeoutMs = options.timeoutMs ?? DEFAULT_LAUNCHER_TIMEOUT_MS;
+	if (!Number.isFinite(timeoutMs) || timeoutMs <= 0)
+		throw new Error("POSIX broker trampoline startup deadline elapsed.");
 	const command = resolveSdkInternalSpawnCommand("broker-trampoline-internal");
 	const child = spawn(command.file, [...command.args, "--agent-dir", agentDir], {
 		detached: false,
@@ -223,8 +281,16 @@ export async function launchBrokerViaPosixTrampoline(
 	child.stdout?.on("data", chunk => {
 		stdout = appendBoundedOutput(stdout, chunk);
 	});
-	const outcome = await awaitLauncherClose(child);
-	const parsed = parseBrokerTrampolineReply(outcome.code, stdout, outcome.spawnError);
+	const wait = await awaitLauncherCloseBeforeDeadline(child, timeoutMs);
+	if (wait.kind === "timeout") {
+		const detail = wait.terminated ? "trampoline was terminated" : "trampoline did not exit after termination";
+		return {
+			process: child,
+			realBrokerPid: undefined,
+			error: new Error(`POSIX broker trampoline exceeded its ${timeoutMs}ms startup deadline; ${detail}`),
+		};
+	}
+	const parsed = parseBrokerTrampolineReply(wait.outcome.code, stdout, wait.outcome.spawnError);
 	return { process: child, ...parsed };
 }
 
@@ -256,6 +322,12 @@ function brokerStartupFailureReason(marker: BrokerStartupFailureMarker | undefin
 	if (!marker) return "Detached SDK broker exited before publishing discovery.";
 	if (marker.cleanupCommand && marker.reason.endsWith(": ")) return `${marker.reason}${marker.cleanupCommand}`;
 	return marker.reason;
+}
+
+function brokerSpawnFailureError(spawnError: Error): Error {
+	return spawnError instanceof BrokerHopError
+		? spawnError
+		: new Error(`Failed to spawn detached SDK broker: ${spawnError.message}`);
 }
 
 function brokerStartupExitReason(record: BrokerStartupExitRecord | undefined): string | undefined {
@@ -1000,7 +1072,11 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 					...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
 					...(spawnLog ? { stderrLogPath: spawnLog.path } : {}),
 				},
-				{ env, cwd: command.kind === "bun-source" ? command.cwd : undefined },
+				{
+					env,
+					cwd: command.kind === "bun-source" ? command.cwd : undefined,
+					timeoutMs: Math.max(0, deadline - ensureBrokerTiming.now()),
+				},
 			);
 			spawnResult = {
 				process: launched.process,
@@ -1013,6 +1089,7 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 				env,
 				...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
 				...(spawnLog ? { stderrFd: spawnLog.handle.fd } : {}),
+				timeoutMs: Math.max(0, deadline - ensureBrokerTiming.now()),
 			});
 			spawnResult = {
 				process: launched.process,
@@ -1195,7 +1272,7 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		// rejects that marker instead of misattributing a foreign failure to this
 		// spawn's caller.
 		const failure = spawnError
-			? new Error(`Failed to spawn detached SDK broker: ${spawnError.message}`)
+			? brokerSpawnFailureError(spawnError)
 			: exitedBeforeDiscovery
 				? new BrokerStartupError({
 						exitCode: child.exitCode ?? trustedStartupExitRecord?.exitCode ?? null,
@@ -1354,4 +1431,8 @@ export function registerBrokerOwnerForTest(
 /** Test hook: exercises the same trusted-marker reason reconstruction used by ensureBroker. */
 export function brokerStartupFailureReasonForTest(marker: BrokerStartupFailureMarker | undefined): string {
 	return brokerStartupFailureReason(marker);
+}
+/** Test hook: verifies typed hop errors survive ensureBroker's spawn-failure mapping. */
+export function brokerSpawnFailureErrorForTest(spawnError: Error): Error {
+	return brokerSpawnFailureError(spawnError);
 }
