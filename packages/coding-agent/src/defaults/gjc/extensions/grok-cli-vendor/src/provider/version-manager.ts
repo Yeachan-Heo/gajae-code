@@ -25,7 +25,7 @@ export function getGrokCliVersion(): string {
  * Expected format: "Your Grok CLI version (X.Y.Z) is outdated. Please update to version A.B.C or later"
  */
 export function parseMinimumVersionFrom426(errorBody: string): string | null {
-  const versionMatch = errorBody.match(/update to version (\S+) or later/i);
+  const versionMatch = errorBody.match(/update to version (\d+\.\d+\.\d+) or later\b/i);
   return versionMatch?.[1] ?? null;
 }
 
@@ -40,12 +40,12 @@ export function updateVersionFromError(errorBody: string): string {
     return getGrokCliVersion();
   }
 
-  // Only update if this is a newer version (monotonic constraint)
-  if (!learnedVersion || isVersionGreater(minVersion, learnedVersion)) {
+  // Compare against the active value so an older minimum cannot downgrade the fallback.
+  if (isVersionGreater(minVersion, getGrokCliVersion())) {
     learnedVersion = minVersion;
   }
 
-  return learnedVersion;
+  return getGrokCliVersion();
 }
 
 /**

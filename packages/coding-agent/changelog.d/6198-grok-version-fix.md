@@ -1,3 +1,3 @@
 ### Fixed
 
-- **Grok CLI version management**: When xAI rejects requests with HTTP 426 "version outdated" errors, learn the minimum required version from the response body and use it for subsequent requests. Falls back to version 1.0.13 if no 426 has been received. Version updates are monotonic: learned versions from 426 responses never downgrade, ensuring that out-of-order responses cannot degrade service.
+- **Grok CLI version management**: Defaults the client version to xAI's known minimum, 1.0.13. When xAI responds with HTTP 426 and a newer required version, retries the request once with that version and keeps it for subsequent requests. Learned minimums never downgrade, even when responses arrive out of order.
