@@ -1861,8 +1861,11 @@ async function removeEmptyFileLockDir(
 		// Use exclusive create: open(infoPath, O_WRONLY | O_CREAT | O_EXCL)
 		const fd = await fs.open(infoPath, "wx", 0o600);
 		try {
-			await fd.write(claimedInfoBytes);
-			writeSucceeded = true;
+			const { bytesWritten } = await fd.write(claimedInfoBytes);
+			// Ensure all bytes were written; a short write can leave malformed JSON
+			if (bytesWritten === claimedInfoBytes.length) {
+				writeSucceeded = true;
+			}
 		} finally {
 			await fd.close();
 		}
@@ -1898,7 +1901,18 @@ async function removeEmptyFileLockDir(
 			}
 			return "owner_changed";
 		}
-		if (isTransientReleaseError(error)) throw error;
+		if (isTransientReleaseError(error)) {
+			// Transient verification failure: clean up the info file to avoid stranding
+			// a live-PID owner record without an adoption/release handle. This allows
+			// the acquisition to retry, and the directory to be reclaimed if needed.
+			try {
+				await fs.unlink(infoPath);
+			} catch {
+				// Best effort; if cleanup fails, we wedged the lock and must not adopt
+			}
+			// Return a retryable failure, not throw: the acquisition will try again
+			return "cleanup_failed";
+		}
 		return "cleanup_failed";
 	}
 
