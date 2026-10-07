@@ -2150,7 +2150,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			}
 			emitProgress();
 
-			const buildForkContextSeed = async (task: (typeof tasksWithUniqueIds)[number]) => {
+			const buildForkContextSeed = async (task: (typeof tasksWithUniqueIds)[number], taskSignal?: AbortSignal) => {
 				if (!requestsForkContext(task)) return undefined;
 				if (!this.session.buildForkContextSeed) {
 					throw new Error("Current session cannot build fork-context seeds.");
@@ -2168,20 +2168,22 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				if (!params) return undefined;
 				return await this.session.buildForkContextSeed({
 					...params,
-					signal,
+					signal: taskSignal ?? signal,
 				});
 			};
 
 			const runTask = async (
 				task: (typeof tasksWithUniqueIds)[number],
 				index: number,
+				taskSignal: AbortSignal,
 				overrides?: {
 					runMode?: "initial" | "resume" | "message";
 					resumeMessage?: string;
 					sessionFile?: string | null;
 				},
 			) => {
-				const forkContextSeed = prebuiltForkContextSeeds?.get(task.id) ?? (await buildForkContextSeed(task));
+				const forkContextSeed =
+					prebuiltForkContextSeeds?.get(task.id) ?? (await buildForkContextSeed(task, taskSignal));
 				// The session's ENDPOINT-owned manager (resolved once per task so
 				// model metadata and live handles land in the SAME manager the
 				// job runs in — review thread P1).
@@ -2290,7 +2292,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						contextFile: contextFilePath,
 						ircAvailable: hasAvailableIrcTool(this.session),
 						enableLsp: subagentLspEnabled,
-						signal,
+						signal: taskSignal,
 						eventBus: this.session.eventBus,
 						routing: routingForRun,
 						autoroutingCandidates: autoroutingInitial ? autoroutingData.candidates : undefined,
@@ -2378,7 +2380,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						contextFile: contextFilePath,
 						ircAvailable: hasAvailableIrcTool(this.session),
 						enableLsp: subagentLspEnabled,
-						signal,
+						signal: taskSignal,
 						eventBus: this.session.eventBus,
 						routing: routingForRun,
 						autoroutingCandidates: autoroutingInitial ? autoroutingData.candidates : undefined,
@@ -2535,7 +2537,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			const { results: partialResults, aborted } = await mapWithConcurrencyLimit(
 				tasksWithUniqueIds,
 				maxConcurrency,
-				runTask,
+				(task, index, taskSignal) => runTask(task, index, taskSignal),
 				signal,
 			);
 

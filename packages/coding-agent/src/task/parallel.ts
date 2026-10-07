@@ -9,6 +9,11 @@ export interface ParallelResult<R> {
 	aborted: boolean;
 }
 
+function isAbortFailure(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	return error.name === "AbortError" || ("code" in error && error.code === "ABORT_ERR");
+}
+
 /**
  * Execute items with a concurrency limit using a worker pool pattern.
  * Results are returned in the same order as input items.
@@ -16,7 +21,10 @@ export interface ParallelResult<R> {
  * On abort: returns partial results with `aborted: true`. Completed tasks are preserved,
  * in-progress tasks will complete with their abort handling, skipped tasks are `undefined`.
  *
- * On error: fails fast - does not wait for other workers to complete.
+ * On error: aborts peer workers, stops scheduling new items, waits for every
+ * in-flight worker (including its cleanup) to settle, then rethrows the first
+ * failure. Worker functions must honor the supplied signal for cancellation
+ * to complete promptly.
  *
  * @param items - Items to process
  * @param concurrency - Maximum concurrent operations
@@ -26,7 +34,7 @@ export interface ParallelResult<R> {
 export async function mapWithConcurrencyLimit<T, R>(
 	items: T[],
 	concurrency: number,
-	fn: (item: T, index: number) => Promise<R>,
+	fn: (item: T, index: number, signal: AbortSignal) => Promise<R>,
 	signal?: AbortSignal,
 ): Promise<ParallelResult<R>> {
 	const normalizedConcurrency = Number.isFinite(concurrency) ? Math.floor(concurrency) : items.length;
@@ -39,11 +47,7 @@ export async function mapWithConcurrencyLimit<T, R>(
 	const abortController = new AbortController();
 	const workerSignal = signal ? AbortSignal.any([signal, abortController.signal]) : abortController.signal;
 
-	// Promise that rejects on first error - used to fail fast (not for abort)
-	let rejectFirst: (error: unknown) => void;
-	const firstErrorPromise = new Promise<never>((_, reject) => {
-		rejectFirst = reject;
-	});
+	let firstError: { error: unknown } | undefined;
 
 	const worker = async (): Promise<void> => {
 		while (true) {
@@ -52,15 +56,17 @@ export async function mapWithConcurrencyLimit<T, R>(
 			const index = nextIndex++;
 			if (index >= items.length) return;
 			try {
-				results[index] = await fn(items[index], index);
+				results[index] = await fn(items[index], index, workerSignal);
 			} catch (error) {
-				// On abort, the fn itself handles it and returns a result
-				// Only propagate non-abort errors
-				if (!workerSignal.aborted) {
+				// External cancellation is an ordinary partial-result outcome. A
+				// worker failure aborts peers, but is not surfaced until all their
+				// in-flight cleanup has settled below.
+				const expectedExternalAbort = signal?.aborted && isAbortFailure(error);
+				if (!expectedExternalAbort && !firstError) {
+					firstError = { error };
 					abortController.abort();
-					rejectFirst(error);
-					throw error;
 				}
+				return;
 			}
 		}
 	};
@@ -70,15 +76,10 @@ export async function mapWithConcurrencyLimit<T, R>(
 		.fill(null)
 		.map(() => worker());
 
-	try {
-		await Promise.race([Promise.all(workers), firstErrorPromise]);
-	} catch (error) {
-		// If aborted, don't rethrow - return partial results
-		if (signal?.aborted) {
-			return { results, aborted: true };
-		}
-		throw error;
-	}
+	// Do not release the batch while sibling workers are still unwinding. Their
+	// finally blocks may own subprocess, worktree, or session cleanup.
+	await Promise.allSettled(workers);
+	if (firstError) throw firstError.error;
 
 	return { results, aborted: signal?.aborted ?? false };
 }
