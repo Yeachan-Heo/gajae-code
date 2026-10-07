@@ -1,6 +1,6 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { AcpSdkAdapter } from "../src/sdk/acp";
-import { PROVIDER_ACTIVATION_MAX_ATTEMPTS } from "../src/sdk/acp/adapter";
+import { PROVIDER_ACTIVATION_BUDGET_MS, PROVIDER_ACTIVATION_MAX_ATTEMPTS } from "../src/sdk/acp/adapter";
 import { SdkClientError } from "../src/sdk/client";
 
 import type { SessionAttachment } from "../src/sdk/router";
@@ -146,6 +146,149 @@ test("ACP provider readiness renews leases on the same attachment after transpor
 		await adapter.close();
 	}
 });
+
+test("ACP provider activation rejects late acknowledgement without accepting a lease", async () => {
+	let now = 1_000;
+	const clock = spyOn(Date, "now").mockImplementation(() => now);
+	const attachment: SessionAttachment = {
+		sessionId: "session-1",
+		generation: 1,
+		isCurrent: () => true,
+		send: async () => {},
+		sendMaintenance: () => {},
+	};
+	const adapter = new AcpSdkAdapter({
+		router: {
+			request: async () => {
+				now += PROVIDER_ACTIVATION_BUDGET_MS;
+				return { ok: true, result: { leaseId: "late-lease" } };
+			},
+		} as never,
+		attachment,
+		sessionId: "session-1",
+		providers: [{ capability: "ui", definitions: [] }],
+	});
+	try {
+		await expect(adapter.start()).rejects.toMatchObject({ code: "provider_activation_exhausted" });
+		expect(adapter.leaseIds.size).toBe(0);
+	} finally {
+		clock.mockRestore();
+		await adapter.close();
+	}
+});
+
+test("ACP provider activation maps sent deadline uncertainty to exhaustion without losing its cause", async () => {
+	let now = 1_000;
+	const clock = spyOn(Date, "now").mockImplementation(() => now);
+	const uncertain = new SdkClientError("uncertain_after_send", "Registration response lost", { id: "registration" });
+	const attachment: SessionAttachment = {
+		sessionId: "session-1",
+		generation: 1,
+		isCurrent: () => true,
+		send: async () => {},
+		sendMaintenance: () => {},
+	};
+	const adapter = new AcpSdkAdapter({
+		router: {
+			request: async () => {
+				now += PROVIDER_ACTIVATION_BUDGET_MS;
+				throw uncertain;
+			},
+		} as never,
+		attachment,
+		sessionId: "session-1",
+		providers: [{ capability: "ui", definitions: [] }],
+	});
+	try {
+		await expect(adapter.start()).rejects.toMatchObject({ code: "provider_activation_exhausted", cause: uncertain });
+		expect(adapter.leaseIds.size).toBe(0);
+	} finally {
+		clock.mockRestore();
+		await adapter.close();
+	}
+});
+
+test("ACP providers share one activation deadline across sequential registrations", async () => {
+	let now = 1_000;
+	const clock = spyOn(Date, "now").mockImplementation(() => now);
+	const options: Array<{ timeoutMs?: number; deadline?: number } | undefined> = [];
+	const attachment: SessionAttachment = {
+		sessionId: "session-1",
+		generation: 1,
+		isCurrent: () => true,
+		send: async () => {},
+		sendMaintenance: () => {},
+	};
+	const adapter = new AcpSdkAdapter({
+		router: {
+			request: async (
+				_session: string,
+				frame: Record<string, unknown>,
+				_generation: number,
+				_attachment: SessionAttachment,
+				option?: { timeoutMs?: number; deadline?: number },
+			) => {
+				options.push(option);
+				now += PROVIDER_ACTIVATION_BUDGET_MS / 2;
+				return { ok: true, result: { leaseId: `lease-${String(frame.capability)}` } };
+			},
+		} as never,
+		attachment,
+		sessionId: "session-1",
+		providers: [
+			{ capability: "ui", definitions: [] },
+			{ capability: "permission", definitions: [] },
+		],
+	});
+	try {
+		await expect(adapter.start()).rejects.toMatchObject({ code: "provider_activation_exhausted" });
+		expect(options).toEqual([
+			{ deadline: 1_000 + PROVIDER_ACTIVATION_BUDGET_MS, timeoutMs: PROVIDER_ACTIVATION_BUDGET_MS },
+			{ deadline: 1_000 + PROVIDER_ACTIVATION_BUDGET_MS, timeoutMs: PROVIDER_ACTIVATION_BUDGET_MS / 2 },
+		]);
+		expect(adapter.leaseIds.has("permission")).toBe(false);
+	} finally {
+		clock.mockRestore();
+		await adapter.close();
+	}
+});
+
+for (const path of ["throw", "cancel", "teardown"] as const) {
+	test(`ACP provider ${path} cannot publish a late lease`, async () => {
+		const attachment: SessionAttachment = {
+			sessionId: "session-1",
+			generation: 1,
+			isCurrent: () => true,
+			send: async () => {},
+			sendMaintenance: () => {},
+		};
+		const failure =
+			path === "cancel" ? new DOMException("Cancelled", "AbortError") : new Error("Registration failed");
+		const registration = Promise.withResolvers<Record<string, unknown>>();
+		const adapter = new AcpSdkAdapter({
+			router: { request: async () => await registration.promise } as never,
+			attachment,
+			sessionId: "session-1",
+			providers: [{ capability: "ui", definitions: [] }],
+		});
+		const started = adapter.start().then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		try {
+			if (path === "teardown") {
+				await adapter.close();
+				registration.resolve({ result: { leaseId: "late" } });
+			} else registration.reject(failure);
+			const outcome = await started;
+			if (path === "teardown") expect(outcome).toMatchObject({ code: "connection_closed" });
+			else expect(outcome).toBe(failure);
+			expect(adapter.leaseIds.size).toBe(0);
+		} finally {
+			await adapter.close();
+		}
+	});
+}
 
 test("Broker lifecycle client cannot activate per-session providers", async () => {
 	const client = {
