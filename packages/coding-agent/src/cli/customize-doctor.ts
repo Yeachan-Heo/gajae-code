@@ -798,7 +798,13 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 	for (const dir of [...customDirs].sort()) {
 		const scan = await scanSkillsFromDir(
 			{ cwd, home: os.homedir(), repoRoot: null },
-			{ dir: expandTilde(dir), providerId: "custom", level: "user", requireDescription: true },
+			{
+				dir: expandTilde(dir),
+				providerId: "custom",
+				level: "user",
+				requireDescription: true,
+				trustUserSkills: resolveSkillScopeTrust(activeSettings.getGroup("skills"), "user"),
+			},
 		);
 		for (const skill of scan.items) {
 			const base: Omit<CustomizeDoctorItem, "status" | "reason" | "detail" | "remediation"> = {

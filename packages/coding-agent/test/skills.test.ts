@@ -13,6 +13,7 @@ import {
 	type Skill,
 } from "@gajae-code/coding-agent/extensibility/skills";
 import { safeRm } from "../../../scripts/safe-cleanup";
+import { discoverRuntimeSkills, findRuntimeSkillByName } from "../src/extensibility/runtime-skill-discovery";
 
 const fixturesDir = path.resolve(import.meta.dirname, "fixtures/skills");
 const collisionFixturesDir = path.resolve(import.meta.dirname, "fixtures/skills-collision");
@@ -626,6 +627,78 @@ description: Skill loaded from a tilde-expanded custom directory.
 				await safeRm(tempHome, { recursive: true, force: true });
 			}
 		});
+
+		it("loads trusted user and custom skill symlinks through discovery and session lookup", async () => {
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-trusted-skill-loaders-"));
+			try {
+				const cwd = path.join(root, "project");
+				const home = path.join(root, "home");
+				const userSkillsRoot = path.join(home, ".gjc", "agent", "skills");
+				const customSkillsRoot = path.join(root, "custom-skills");
+				const sharedSkillsRoot = path.join(root, "shared-skills");
+				const userTarget = path.join(sharedSkillsRoot, "native-helper");
+				const customTarget = path.join(sharedSkillsRoot, "custom-helper");
+				const writeSkill = async (dir: string, name: string) => {
+					await fs.mkdir(dir, { recursive: true });
+					await fs.writeFile(
+						path.join(dir, "SKILL.md"),
+						`---\nname: ${name}\ndescription: ${name} description\n---\n${name} body`,
+					);
+				};
+				await fs.mkdir(cwd, { recursive: true });
+				await fs.mkdir(userSkillsRoot, { recursive: true });
+				await fs.mkdir(customSkillsRoot, { recursive: true });
+				await writeSkill(userTarget, "native-helper");
+				await writeSkill(customTarget, "custom-helper");
+				await fs.symlink(userTarget, path.join(userSkillsRoot, "native-helper"), "dir");
+				await fs.symlink(customTarget, path.join(customSkillsRoot, "custom-helper"), "dir");
+
+				const policy = {
+					enabled: true,
+					trustUserSkills: true,
+					customDirectories: [customSkillsRoot],
+				};
+				const discovered = await discoverRuntimeSkills({ cwd, home, source: "user", policy });
+				expect(discovered.candidates.map(skill => skill.name)).toEqual(
+					expect.arrayContaining(["native-helper", "custom-helper"]),
+				);
+				expect(discovered.candidates).toHaveLength(2);
+
+				const loaded = await loadSkills({ cwd, home, ...policy });
+				expect(loaded.skills.map(skill => skill.name)).toEqual(
+					expect.arrayContaining(["native-helper", "custom-helper"]),
+				);
+				expect(loaded.skills).toHaveLength(2);
+				const nativeSkill = loaded.skills.find(skill => skill.name === "native-helper");
+				if (!nativeSkill?.loadContent) throw new Error("Expected the native user skill body loader");
+				expect(await nativeSkill.loadContent()).toContain("native-helper body");
+				const customSkill = loaded.skills.find(skill => skill.name === "custom-helper");
+				if (!customSkill?.loadContent) throw new Error("Expected the custom user skill body loader");
+				expect(await customSkill.loadContent()).toContain("custom-helper body");
+
+				const fallback = await findRuntimeSkillByName(cwd, "native-helper", policy, home);
+				if (!fallback?.loadContent) throw new Error("Expected the runtime skill lookup to find the user skill");
+				expect(await fallback.loadContent()).toContain("native-helper body");
+
+				const defaultLoaded = await loadSkills({ cwd, home });
+				expect(defaultLoaded.skills.map(skill => skill.name)).toContain("native-helper");
+
+				const defaultTrust = await discoverRuntimeSkills({ cwd, home, source: "user", policy: { enabled: true } });
+				expect(defaultTrust.candidates.map(skill => skill.name)).toContain("native-helper");
+
+				const untrusted = await discoverRuntimeSkills({
+					cwd,
+					home,
+					source: "user",
+					policy: { ...policy, trustUserSkills: false },
+				});
+				expect(untrusted.candidates.map(skill => skill.name)).not.toContain("native-helper");
+				expect(untrusted.candidates.map(skill => skill.name)).not.toContain("custom-helper");
+			} finally {
+				await safeRm(root, { recursive: true, force: true });
+			}
+		});
+
 		it("should filter skills with includeSkills glob patterns", async () => {
 			// Load all skills from fixtures
 			const { skills: allSkills } = await loadSkills({

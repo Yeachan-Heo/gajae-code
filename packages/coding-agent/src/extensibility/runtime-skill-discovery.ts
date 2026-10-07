@@ -451,6 +451,7 @@ export async function discoverRuntimeSkills(
 	const home = options.home ?? getRuntimeHome();
 	const source = options.source ?? "all";
 	const policy = options.policy;
+	const trustUserSkills = resolveSkillScopeTrust(policy ?? {}, "user");
 	const diagnostics: string[] = [];
 	const agentDir = resolveRuntimeAgentDir(home, options.agentDir, hasExplicitHome);
 	const profileAuthority =
@@ -480,7 +481,7 @@ export async function discoverRuntimeSkills(
 					"user",
 					100,
 					path.resolve(dir) === path.resolve(agentDir, "skills") ? agentDir : undefined,
-					policy?.trustUserSkills,
+					trustUserSkills,
 				),
 			);
 		}
@@ -496,7 +497,7 @@ export async function discoverRuntimeSkills(
 					"user",
 					0,
 					undefined,
-					policy?.trustUserSkills,
+					trustUserSkills,
 				),
 			);
 		}

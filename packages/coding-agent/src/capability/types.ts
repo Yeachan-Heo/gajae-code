@@ -44,6 +44,8 @@ export interface LoadContext {
 	bypassCache?: boolean;
 	/** Owning session settings for provider policy decisions. */
 	settings?: Settings;
+	/** Effective user-scope trust policy for native skill-link scanning. */
+	trustUserSkills?: boolean;
 }
 
 /**

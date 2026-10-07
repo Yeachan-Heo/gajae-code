@@ -22,6 +22,7 @@ import {
 } from "@gajae-code/utils";
 
 import type { Settings } from "../config/settings";
+import { resolveSkillScopeTrust } from "../config/skill-settings-defaults";
 import { clearCache as clearFsCache, findRepoRoot, cacheStats as fsCacheStats, invalidate as invalidateFs } from "./fs";
 import type {
 	Capability,
@@ -429,6 +430,7 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 		repoRoot,
 		isolatedHome: false,
 		settings: ordinaryOptions.settings,
+		trustUserSkills: resolveSkillScopeTrust(ordinaryOptions.settings?.getGroup("skills") ?? {}, "user"),
 		bypassCache: ordinaryOptions.bypassCache,
 	};
 	const providers = filterProviders(capability, ordinaryOptions);
@@ -521,6 +523,7 @@ export async function loadCapabilityForHome<T>(
 		isolatedHome,
 		homeIdentity,
 		settings: isolatedOptions.settings,
+		trustUserSkills: resolveSkillScopeTrust(isolatedOptions.settings?.getGroup("skills") ?? {}, "user"),
 	};
 
 	return await loadImpl(capability, providers, ctx, isolatedOptions);
