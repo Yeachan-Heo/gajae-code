@@ -1216,7 +1216,8 @@ export function planTargetedTasks(
 			if (owner.manifest.scripts?.check) {
 				add(tasks, `check:${owner.name}`, `Check ${owner.name}`, packageScriptCommand("check"), resolvePackageCwd(owner.dir));
 			}
-			if (isCodingAgentRuntimePath(changedPath)) {
+			const needsCliSmoke = isCodingAgentRuntimePath(changedPath) || (isTestFilePath(changedPath) && mappedTests.length === 0);
+			if (needsCliSmoke) {
 				add(tasks, "cli-smoke", "GJC CLI smoke test", ["bun", "run", "ci:test:smoke"]);
 			}
 			if (isUnscopedWrapperPath(changedPath)) {
@@ -1574,8 +1575,8 @@ function isInstallPath(changedPath: string): boolean {
 }
 
 function isCodingAgentRuntimePath(changedPath: string): boolean {
-	// Test files and changelog don't constitute runtime changes requiring native build
-	if (isTestFilePath(changedPath) || isDocOrChangelogPath(changedPath)) return false;
+	// Changelogs don't constitute runtime changes requiring native build or validation
+	if (isDocOrChangelogPath(changedPath)) return false;
 	return changedPath.startsWith("packages/coding-agent/") || changedPath.startsWith("packages/agent/") || changedPath.startsWith("packages/ai/");
 }
 
