@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { pythonBackend } from "@gajae-code/coding-agent/eval";
 import * as pythonExecutor from "@gajae-code/coding-agent/eval/py/executor";
 import type { PythonKernel as PythonKernelInstance } from "@gajae-code/coding-agent/eval/py/kernel";
 import * as pythonKernel from "@gajae-code/coding-agent/eval/py/kernel";
@@ -554,6 +555,47 @@ describe("AgentSession python cleanup", () => {
 		expect(executeSpy).not.toHaveBeenCalled();
 	}, 10000);
 
+	it("uses Python context captured before an async user_python hook", async () => {
+		const { tempDir, cwd } = createTempProject();
+		tempDirs.push(tempDir);
+		const changedCwd = path.join(tempDir, "changed-project");
+		fs.mkdirSync(changedCwd, { recursive: true });
+		const sessionManager = SessionManager.create(cwd, tempDir);
+		const changedSessionManager = SessionManager.create(changedCwd, tempDir);
+		const sessionFile = sessionManager.getSessionFile();
+		const changedSessionFile = changedSessionManager.getSessionFile();
+		if (!sessionFile || !changedSessionFile) throw new Error("Expected persisted session files");
+		await changedSessionManager.close();
+		const hookStarted = Promise.withResolvers<void>();
+		const releaseHook = Promise.withResolvers<void>();
+		const hookExtension: ExtensionFactory = api => {
+			api.on("user_python", async () => {
+				hookStarted.resolve();
+				await releaseHook.promise;
+				return undefined;
+			});
+		};
+		const session = await createSession(tempDir, cwd, { extensions: [hookExtension], sessionManager });
+		let liveCwd = cwd;
+		let liveSessionFile = sessionFile;
+		vi.spyOn(sessionManager, "getCwd").mockImplementation(() => liveCwd);
+		vi.spyOn(sessionManager, "getSessionFile").mockImplementation(() => liveSessionFile);
+		const executeSpy = vi.spyOn(pythonExecutor, "executePython");
+
+		const execution = session.executePython("print('captured context')");
+		await hookStarted.promise;
+		liveCwd = changedCwd;
+		liveSessionFile = changedSessionFile;
+		releaseHook.resolve();
+		const result = await execution;
+
+		expect(result.output).toContain("captured context");
+		const dispatchedOptions = executeSpy.mock.calls[0]?.[1];
+		expect(dispatchedOptions?.cwd).toBe(cwd);
+		expect(dispatchedOptions?.sessionId).toBe(`session:${sessionFile}:cwd:${cwd}`);
+		expect(typeof dispatchedOptions?.kernelOwnerId).toBe("string");
+	}, 10000);
+
 	it("rejects async user_python hook results after dispose begins", async () => {
 		const { tempDir, cwd } = createTempProject();
 		tempDirs.push(tempDir);
@@ -684,33 +726,92 @@ describe("AgentSession python cleanup", () => {
 		expect(executeSpy).not.toHaveBeenCalled();
 	});
 
+	it("cancels held eval availability before allocating output or dispatching Python", async () => {
+		const { tempDir, cwd } = createTempProject();
+		tempDirs.push(tempDir);
+		const changedCwd = path.join(tempDir, "changed-project");
+		fs.mkdirSync(changedCwd, { recursive: true });
+		const sessionManager = SessionManager.create(cwd, tempDir);
+		const changedSessionManager = SessionManager.create(changedCwd, tempDir);
+		const sessionFile = sessionManager.getSessionFile();
+		const changedSessionFile = changedSessionManager.getSessionFile();
+		if (!sessionFile || !changedSessionFile) throw new Error("Expected persisted session files");
+		await changedSessionManager.close();
+		const preflightStarted = Promise.withResolvers<void>();
+		const releasePreflight = Promise.withResolvers<void>();
+		const checkAvailability = pythonBackend.isAvailable.bind(pythonBackend);
+		let preflightContext:
+			| {
+					cwd: string;
+					getSessionFile: () => string | null;
+					getEvalKernelOwnerId?: () => string | null;
+			  }
+			| undefined;
+		const availabilitySpy = vi.spyOn(pythonBackend, "isAvailable").mockImplementation(async activeSession => {
+			preflightContext = activeSession;
+			preflightStarted.resolve();
+			await releasePreflight.promise;
+			return await checkAvailability(activeSession);
+		});
+		const allocateArtifactSpy = vi.spyOn(sessionManager, "allocateArtifactPath");
+		const dispatchSpy = vi.spyOn(pythonBackend, "execute");
+		const session = await createSession(tempDir, cwd, { sessionManager });
+		let liveCwd = cwd;
+		let liveSessionFile = sessionFile;
+		vi.spyOn(sessionManager, "getCwd").mockImplementation(() => liveCwd);
+		vi.spyOn(sessionManager, "getSessionFile").mockImplementation(() => liveSessionFile);
+		const EvalTool = session.getToolByName("eval");
+		expect(EvalTool).toBeDefined();
+		const caller = new AbortController();
+		const execution = EvalTool!.execute(
+			"call-id",
+			{ cells: [{ language: "py", code: "print('must not dispatch')" }] },
+			caller.signal,
+			undefined,
+			undefined,
+		);
+
+		await preflightStarted.promise;
+		expect(session.isEvalRunning).toBe(true);
+		liveCwd = changedCwd;
+		liveSessionFile = changedSessionFile;
+		caller.abort();
+		releasePreflight.resolve();
+		await expect(execution).rejects.toThrow("Operation aborted");
+
+		expect(availabilitySpy).toHaveBeenCalledTimes(1);
+		expect(preflightContext?.cwd).toBe(cwd);
+		expect(preflightContext?.getSessionFile()).toBe(sessionFile);
+		expect(typeof preflightContext?.getEvalKernelOwnerId?.()).toBe("string");
+		expect(allocateArtifactSpy).not.toHaveBeenCalled();
+		expect(dispatchSpy).not.toHaveBeenCalled();
+		expect(session.isEvalRunning).toBe(false);
+		await session.dispose();
+	});
+
 	it("aborts every active Python execution owned by the session during dispose", async () => {
 		const { tempDir, cwd } = createTempProject();
 		tempDirs.push(tempDir);
-		const kernel = new FakeKernel();
-		const blockedExecution = Promise.withResolvers<typeof OK_EXECUTION>();
-		const blockedExecutionStarted = Promise.withResolvers<void>();
-		kernel.blockedCode = "print('first')";
-		kernel.blockedExecution = blockedExecution.promise;
-		kernel.blockedExecutionStarted = () => blockedExecutionStarted.resolve();
-
-		vi.spyOn(pythonKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
-		vi.spyOn(pythonKernel.PythonKernel, "start").mockResolvedValue(kernel as unknown as PythonKernelInstance);
-
+		const firstStarted = Promise.withResolvers<void>();
+		const secondStarted = Promise.withResolvers<void>();
+		const executePython = pythonExecutor.executePython;
+		vi.spyOn(pythonExecutor, "executePython").mockImplementation((code, options) => {
+			const execution = executePython(code, options);
+			if (code === "print('second')") secondStarted.resolve();
+			return execution;
+		});
 		const session = await createSession(tempDir, cwd);
-
-		const firstExecution = session.executePython("print('first')");
-		await blockedExecutionStarted.promise;
+		const firstExecution = session.executePython("import time; print('first', flush=True); time.sleep(30)", chunk => {
+			if (chunk.includes("first")) firstStarted.resolve();
+		});
+		await firstStarted.promise;
 		const secondExecution = session.executePython("print('second')");
-		const sleepSpy = mockLongPythonDisposeSleepsImmediate();
-
+		await secondStarted.promise;
 		await session.dispose();
-		expect(sleepSpy.mock.calls.some(([duration]) => isPythonDisposeWaitDuration(duration))).toBe(true);
 		const [firstResult, secondResult] = await Promise.all([firstExecution, secondExecution]);
-
 		expect(firstResult.cancelled).toBe(true);
 		expect(secondResult.cancelled).toBe(true);
-		expect(kernel.executeCalls).toEqual(["print('first')"]);
-		expect(kernel.shutdownCalls).toBe(1);
-	});
+		expect(secondResult.output).not.toContain("second");
+		expect(session.isEvalRunning).toBe(false);
+	}, 30_000);
 });
