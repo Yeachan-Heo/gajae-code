@@ -60,9 +60,16 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 	const realLstat = fs.lstat;
 	const transformStat = (target: string, stat: BigIntStats): BigIntStats => {
 		const isRoot =
-			sameFixturePath(target, lock) || sameFixturePath(target, parked) || sameFixturePath(target, cleanupLock) || sameFixturePath(target, cleanupParked) || (detach && (sameFixturePath(target, root) || sameFixturePath(target, cleanupRoot)));
+			sameFixturePath(target, lock) ||
+			sameFixturePath(target, parked) ||
+			sameFixturePath(target, cleanupLock) ||
+			sameFixturePath(target, cleanupParked) ||
+			(detach && (sameFixturePath(target, root) || sameFixturePath(target, cleanupRoot)));
 		const isInfo =
-			sameFixturePath(target, path.join(lock, "info")) || sameFixturePath(target, path.join(parked, "info")) || sameFixturePath(target, path.join(cleanupLock, "info")) || sameFixturePath(target, path.join(cleanupParked, "info"));
+			sameFixturePath(target, path.join(lock, "info")) ||
+			sameFixturePath(target, path.join(parked, "info")) ||
+			sameFixturePath(target, path.join(cleanupLock, "info")) ||
+			sameFixturePath(target, path.join(cleanupParked, "info"));
 		const id = isRoot && component !== "info" ? ROOT_ID : isInfo && component !== "root" ? INFO_ID : null;
 		if (!isRoot && !isInfo) return stat;
 		return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, {
@@ -77,7 +84,10 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 	const realOpen = fs.open;
 	vi.spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
 		const handle = await realOpen(target, flags, mode);
-		if (sameFixturePath(String(target), path.join(lock, "info")) || sameFixturePath(String(target), path.join(cleanupLock, "info"))) {
+		if (
+			sameFixturePath(String(target), path.join(lock, "info")) ||
+			sameFixturePath(String(target), path.join(cleanupLock, "info"))
+		) {
 			const realStat = handle.stat.bind(handle);
 			vi.spyOn(handle, "stat").mockImplementation((async options => {
 				const stat = await realStat(options);
@@ -102,21 +112,28 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 		})),
 	});
 	const originals = new Map<string, NativeDirectoryTreeSnapshot>();
-	const remove = vi.fn((target: string, snapshot: NativeDirectoryTreeSnapshot, parentIdentity?: { dev: bigint; ino: bigint }, detachOnly?: boolean) => {
-		const original = originals.get(target);
-		if (!original) throw new Error("Removal without captured authority");
-		expect(snapshot).toEqual(nativeSnapshot(original));
-		if (detach) {
-			expect(parentIdentity?.ino).toBe(ROOT_ID);
-			renameSync(target, cleanupParked);
-			return { ok: true, detachedPath: cleanupParked };
-		}
-		// Only simulate the native commit after both the adapted authority and
-		// the original filesystem generation match the captured snapshot.
-		expect(snapshotDirectoryTree(target).snapshot).toEqual(original);
-		rmSync(target, { recursive: true, force: true });
-		return { ok: true };
-	});
+	const remove = vi.fn(
+		(
+			target: string,
+			snapshot: NativeDirectoryTreeSnapshot,
+			parentIdentity?: { dev: bigint; ino: bigint },
+			_detachOnly?: boolean,
+		) => {
+			const original = originals.get(target);
+			if (!original) throw new Error("Removal without captured authority");
+			expect(snapshot).toEqual(nativeSnapshot(original));
+			if (detach) {
+				expect(parentIdentity?.ino).toBe(ROOT_ID);
+				renameSync(target, cleanupParked);
+				return { ok: true, detachedPath: cleanupParked };
+			}
+			// Only simulate the native commit after both the adapted authority and
+			// the original filesystem generation match the captured snapshot.
+			expect(snapshotDirectoryTree(target).snapshot).toEqual(original);
+			rmSync(target, { recursive: true, force: true });
+			return { ok: true };
+		},
+	);
 	FileLockTestHooks.nativeExactRemovalProbe = () => !detach;
 	FileLockTestHooks.nativeQuarantineBindings = () => ({
 		snapshotDirectoryTree: target => {
