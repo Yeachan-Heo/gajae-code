@@ -263,6 +263,7 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 
 		const response = await fetch(this.config.tokenUrl, {
 			method: "POST",
+			redirect: "error",
 			headers: {
 				"Content-Type": "application/x-www-form-urlencoded",
 			},
@@ -342,6 +343,7 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 		try {
 			const response = await fetch(registrationEndpoint, {
 				method: "POST",
+				redirect: "error",
 				headers: {
 					"Content-Type": "application/json",
 					Accept: "application/json",
