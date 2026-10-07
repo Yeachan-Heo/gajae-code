@@ -8662,6 +8662,7 @@ export class SessionManager {
 			this.#artifactManagerSessionFile = null;
 			this.#adoptedArtifactManager = issued.adoptedArtifactManager;
 			this.#artifactLifecycle = Symbol("session-artifact-rollback");
+			this.#closeRetryOriginError = undefined;
 			installed = true;
 			this.#disposeResidentTextStore(predecessorStore);
 			try {
@@ -8757,6 +8758,7 @@ export class SessionManager {
 			this.#artifactManagerSessionFile = null;
 			this.#adoptedArtifactManager = issued.adoptedArtifactManager;
 			this.#artifactLifecycle = Symbol("session-artifact-rollback");
+			this.#closeRetryOriginError = undefined;
 			this.#commitResidentTextStoreTransition(prepared);
 			managedTransition?.settle();
 			if (this.#sessionFile) writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
