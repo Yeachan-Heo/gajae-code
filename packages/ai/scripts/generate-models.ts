@@ -827,6 +827,9 @@ async function generateModels() {
 	injectAlibabaTokenPlanModels(allModels);
 	injectJetBrainsJunieModels(allModels);
 	injectKiroModels(allModels);
+	// Re-apply models.dev fallback after injections to inherit context/token limits
+	// from models.dev for injected models that use UNK_CONTEXT_WINDOW and UNK_MAX_TOKENS.
+	allModels = applyGlobalModelsDevFallback(allModels, modelsDevModels);
 	applyGeneratedModelPolicies(allModels);
 	// This provider-specific correction must run after generic policy inference,
 	// which otherwise caps unknown OpenAI-compatible models at `high`.
