@@ -1,12 +1,13 @@
 import { expect, test } from "bun:test";
 import { Agent } from "@gajae-code/agent-core";
 import type { AssistantMessage } from "@gajae-code/ai";
+import { classifyFallbackTrigger } from "@gajae-code/ai/utils/fallback-transport";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { tagSdkLifecycleObserver } from "../src/extensibility/extensions/function-hooks-internal";
 import { ExtensionRuntime, loadExtensionFromFactory } from "../src/extensibility/extensions/loader";
 import { ExtensionRunner } from "../src/extensibility/extensions/runner";
-import { AgentSession } from "../src/session/agent-session";
+import { AgentSession, type AgentSessionEvent } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
 import { EventBus } from "../src/utils/event-bus";
@@ -93,6 +94,8 @@ test.each([
 				: ["empty-stop-fixture/primary", "empty-stop-fixture/fallback"],
 			"test",
 		);
+		const events: AgentSessionEvent[] = [];
+		session.subscribe(event => events.push(event));
 		await session.prompt("Exercise empty stop");
 		await session.waitForIdle();
 		const failed = scenario.endsWith("disabled");
@@ -106,6 +109,39 @@ test.each([
 		expect(assistants[0].content).toEqual(
 			scenario === "nonzero-usage" || failed ? [] : [{ type: "text", text: "fallback-ok" }],
 		);
+		expect(
+			events
+				.filter(
+					event =>
+						event.type === "turn_end" ||
+						event.type === "agent_end" ||
+						((event.type === "message_start" || event.type === "message_end") &&
+							event.message.role === "assistant"),
+				)
+				.map(event => event.type),
+		).toEqual(["message_start", "message_end", "turn_end", "agent_end"]);
+		const switches = events.filter(event => event.type === "model_fallback_switched");
+		if (failed) {
+			expect(assistants[0].usage.totalTokens).toBe(0);
+			expect(assistants[0].errorMessage).toMatch(/empty response with zero token usage/i);
+			if (scenario === "untyped-disabled") {
+				expect(assistants[0].errorKind).toBe("local_empty_response");
+			} else {
+				expect(assistants[0].transportFailure?.providerCode).toBe("empty_response");
+				expect(classifyFallbackTrigger(assistants[0].transportFailure).class).toBe("server");
+			}
+		} else if (scenario === "nonzero-usage") {
+			expect(assistants[0].usage.totalTokens).toBeGreaterThan(0);
+		} else {
+			expect(session.model?.id).toBe("fallback");
+			expect(switches.map(({ from, to, reason }) => ({ from, to, reason }))).toEqual([
+				{ from: "empty-stop-fixture/primary", to: "empty-stop-fixture/fallback", reason: "server" },
+			]);
+		}
+		if (failed || scenario === "nonzero-usage") {
+			expect(session.model?.id).toBe("primary");
+			expect(switches).toEqual([]);
+		}
 	} finally {
 		try {
 			await session?.dispose();
