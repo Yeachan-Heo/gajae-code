@@ -3900,7 +3900,7 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 		expect(outcomes).toHaveLength(1);
 		expect(outcomes[0]?.type).toBe("retryable_discarded");
 	});
-	it("discards an empty Responses start placeholder before a typed statusless overload (#6426)", async () => {
+	async function runPlaceholderOverload(content: AssistantMessage["content"] = []) {
 		const mock = createMockModel();
 		const streamFn = () => {
 			const stream = new AssistantMessageEventStream();
@@ -3914,6 +3914,7 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 				api: "openai-responses",
 				stopReason: "error",
 				errorMessage: "server_is_overloaded: Our servers are currently overloaded. Please try again later.",
+				content,
 				transportFailure: {
 					kind: "transport",
 					providerCode: "server_is_overloaded",
@@ -3931,6 +3932,8 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
 			streamFn,
 		});
+		const events: AgentEvent[] = [];
+		agent.subscribe(event => events.push(event));
 
 		await agent.prompt("run", {
 			fallbackManaged: true,
@@ -3940,6 +3943,11 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 			},
 		});
 
+		return { agent, events, outcomes };
+	}
+
+	it("discards an empty Responses start placeholder before a typed statusless overload (#6426)", async () => {
+		const { outcomes } = await runPlaceholderOverload();
 		expect(outcomes).toHaveLength(1);
 		expect(outcomes[0]?.type).toBe("retryable_discarded");
 	});
@@ -3994,47 +4002,7 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 		["toolCall", [{ type: "toolCall", id: "terminal-tool", name: "unused", arguments: {} }]],
 		["redactedThinking", [{ type: "redactedThinking", data: "terminal-redacted" }]],
 	])("commits terminal-only statusless overload %s without a delta (#6426)", async (_kind, content) => {
-		const mock = createMockModel();
-		const streamFn = () => {
-			const stream = new AssistantMessageEventStream();
-			const started: AssistantMessage = {
-				...assistantMessage(mock.model),
-				api: "openai-responses",
-				content: [{ type: "text", text: "" }],
-			};
-			const terminal: AssistantMessage = {
-				...assistantMessage(mock.model),
-				api: "openai-responses",
-				stopReason: "error",
-				errorMessage: "server_is_overloaded: Our servers are currently overloaded. Please try again later.",
-				content,
-				transportFailure: {
-					kind: "transport",
-					providerCode: "server_is_overloaded",
-					openaiErrorCode: "server_is_overloaded",
-				},
-			};
-			queueMicrotask(() => {
-				stream.push({ type: "start", partial: started });
-				stream.push({ type: "error", reason: "error", error: terminal });
-			});
-			return stream;
-		};
-		const outcomes: ManagedAttemptOutcome[] = [];
-		const agent = new Agent({
-			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
-			streamFn,
-		});
-		const events: AgentEvent[] = [];
-		agent.subscribe(event => events.push(event));
-
-		await agent.prompt("run", {
-			fallbackManaged: true,
-			onManagedAttemptOutcome: outcome => {
-				outcomes.push(outcome);
-				return { type: "terminal", terminal: { stopReason: "error" } };
-			},
-		});
+		const { agent, events, outcomes } = await runPlaceholderOverload(content);
 
 		expect(outcomes).toHaveLength(0);
 		expect(agent.state.messages.find(message => message.role === "assistant")).toMatchObject({
@@ -4075,6 +4043,14 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 		expect(outcomes[0]?.type).toBe("retryable_discarded");
 		expect(agent.state.messages.filter(message => message.role === "assistant")).toHaveLength(0);
 	});
+	function expectNoAssistantOutput(agent: Agent, events: AgentEvent[]) {
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+		expect(events.filter(event => event.type === "message_update")).toHaveLength(0);
+		expect(events.filter(event => event.type === "message_end" && event.message.role === "assistant")).toHaveLength(
+			0,
+		);
+		expect(agent.state.messages.filter(message => message.role === "assistant")).toHaveLength(0);
+	}
 	it("discards a provisional placeholder on cancellation without terminal duplication", async () => {
 		const mock = createMockModel();
 		const placeholderStaged = Promise.withResolvers<void>();
@@ -4102,18 +4078,11 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 		agent.abort();
 		await run;
 
-		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
-		const assistantMessageEnds = events.filter(
-			(event): event is Extract<AgentEvent, { type: "message_end" }> =>
-				event.type === "message_end" && event.message.role === "assistant",
-		);
-		expect(assistantMessageEnds).toHaveLength(0);
+		expectNoAssistantOutput(agent, events);
 		expect(events.filter(event => event.type === "message_end")).toHaveLength(1);
 		expect(events.filter(event => event.type === "message_end" && event.message.role !== "assistant")).toHaveLength(
 			1,
 		);
-		expect(events.filter(event => event.type === "message_update")).toHaveLength(0);
-		expect(agent.state.messages.filter(message => message.role === "assistant")).toHaveLength(0);
 	});
 	it("tears down an aborted provider iterator exactly once", async () => {
 		const mock = createMockModel();
@@ -4142,7 +4111,7 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 							};
 						}
 						iteratorReadStarted.resolve();
-						return await new Promise<IteratorResult<never>>(() => {});
+						return await Promise.withResolvers<IteratorResult<never>>().promise;
 					},
 					async return() {
 						returnCalls += 1;
@@ -4163,12 +4132,7 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 		await run;
 
 		expect(returnCalls).toBe(1);
-		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
-		expect(events.filter(event => event.type === "message_update")).toHaveLength(0);
-		expect(events.filter(event => event.type === "message_end" && event.message.role === "assistant")).toHaveLength(
-			0,
-		);
-		expect(agent.state.messages.filter(message => message.role === "assistant")).toHaveLength(0);
+		expectNoAssistantOutput(agent, events);
 	});
 	it("closes a late provider factory response after cancellation", async () => {
 		const mock = createMockModel();
@@ -4218,11 +4182,6 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 
 		expect(returnCalls).toBe(1);
 		expect(nextCalls).toBe(0);
-		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
-		expect(events.filter(event => event.type === "message_update")).toHaveLength(0);
-		expect(events.filter(event => event.type === "message_end" && event.message.role === "assistant")).toHaveLength(
-			0,
-		);
-		expect(agent.state.messages.filter(message => message.role === "assistant")).toHaveLength(0);
+		expectNoAssistantOutput(agent, events);
 	});
 });
