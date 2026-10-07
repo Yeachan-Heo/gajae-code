@@ -7446,6 +7446,15 @@ export class AgentSession {
 		// from abort while either barrier is active permits a successor to race the
 		// prior prompt's cleanup.
 		if (event.type === "agent_end" && (this.#livePromptsInFlight() > 0 || this.#agentEventHandlersInFlight > 0)) {
+			// If there's already a pending agent_end from a different scope, settle its tracked
+			// inputs before replacing it. This ensures that each run's tracked SDK submissions
+			// have their terminals settled when the run ends, even if agent_end publication is deferred.
+			if (this.#pendingAgentEndEmit && this.#pendingAgentEndEmit !== event) {
+				const pendingScope = (this.#pendingAgentEndEmit as AgentSessionEvent & { scope?: AttemptScope }).scope;
+				if (pendingScope !== attemptScope) {
+					this.#settleTrackedQueuedInputTerminal(pendingScope);
+				}
+			}
 			this.#pendingAgentEndEmit = event;
 			return;
 		}
