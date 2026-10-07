@@ -109,9 +109,10 @@ async function runTask(tool: TaskTool, tasks: TaskParams["tasks"]): Promise<stri
 	const started = await tool.execute("tool-call", { agent: "executor", tasks, isolated: true });
 	if (!started.details?.async?.jobId) throw new Error("Expected detached task job id");
 	await manager.waitForAll();
-	const resultText = tasks
-		.map((item, index) => {
-			const job = manager.getJob(`${index}-${item.id}`);
+	const resultText = manager
+		.getSubagentRecords()
+		.map(record => {
+			const job = record.currentJobId ? manager.getJob(record.currentJobId) : undefined;
 			return job?.resultText ?? job?.errorText ?? "";
 		})
 		.join("\n");

@@ -207,6 +207,7 @@ import {
 	loadProjectContextFilesResult as loadContextFilesResultInternal,
 } from "../system-prompt";
 import { AgentOutputManager } from "../task/output-manager";
+import type { TaskScopeAuthority } from "../task/scope";
 import { parseThinkingLevel, resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
 import { isMCPBridgeTool, selectRestorableDiscoveredBuiltinToolNames } from "../tool-discovery/tool-index";
 import {
@@ -1802,6 +1803,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	);
 	const evalKernelOwnerId = `agent-session:${Snowflake.next()}`;
 	let disposeLocalProtocolOverride: (() => void) | undefined;
+	let unregisterTaskScopeSettings: (() => void) | undefined;
+	const releaseTaskScopeSettings = (): void => {
+		const unregister = unregisterTaskScopeSettings;
+		unregisterTaskScopeSettings = undefined;
+		unregister?.();
+	};
 	let localProtocolOverrideReleased = false;
 	const releaseLocalProtocolOverride = (): void => {
 		if (localProtocolOverrideReleased) return;
@@ -2845,18 +2852,23 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		 * root's AGENTS.md and tree, and subagents inherit the same mismatch.
 		 */
 		const applyRescopedReadState = async (to: string): Promise<void> => {
-			try {
-				const rediscovered = await loadContextFilesResultInternal({ cwd: to, agentDir, profileAuthority });
-				contextFiles = rediscovered.contextFiles;
-			} catch (error) {
-				logger.warn("Failed to re-discover context files after session rescope", {
-					error: safeErrorForLog(error),
-				});
+			if (options.contextFiles === undefined) {
+				contextFiles = [];
+				try {
+					const rediscovered = await loadContextFilesResultInternal({ cwd: to, agentDir, profileAuthority });
+					contextFiles = rediscovered.contextFiles;
+				} catch (error) {
+					logger.warn("Failed to re-discover context files after session rescope", {
+						error: safeErrorForLog(error),
+					});
+				}
 			}
-			if (options.skills === undefined && settings.get("skills.enabled")) {
+			if (options.skills === undefined) {
 				try {
 					await session?.reloadSkills(to);
 				} catch (error) {
+					skills = getEmbeddedDefaultGjcSkills();
+					skillWarnings = [];
 					logger.warn("Failed to reload skills after session rescope", { error: safeErrorForLog(error) });
 				}
 			}
@@ -2882,10 +2894,50 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 		};
 
-		const toolSession: ToolSession = {
+		const taskScopeOriginGeneration = sessionManager.getCwdGeneration();
+		let taskScopeSettings = settings;
+		const refreshTaskScopeSettings = async (): Promise<void> => {
+			taskScopeSettings =
+				sessionManager.getCwdGeneration() === taskScopeOriginGeneration
+					? settings
+					: await settings.snapshotForCwd(sessionManager.getCwd());
+		};
+		const refreshTaskScopeAfterMove = async (): Promise<void> => {
+			let settingsRefreshFailure: { error: unknown } | undefined;
+			try {
+				await refreshTaskScopeSettings();
+			} catch (error) {
+				settingsRefreshFailure = { error };
+			}
+			await applyRescopedReadState(sessionManager.getCwd());
+			if (options.promptTemplates === undefined) {
+				toolSession.promptTemplates = [];
+				try {
+					toolSession.promptTemplates = await discoverPromptTemplates(sessionManager.getCwd(), agentDir);
+				} catch (error) {
+					logger.warn("Failed to rediscover task prompt templates after session rescope", {
+						error: safeErrorForLog(error),
+					});
+				}
+			}
+			if (settingsRefreshFailure) throw settingsRefreshFailure.error;
+		};
+
+		const toolSession: ToolSession & TaskScopeAuthority = {
 			get cwd() {
 				return sessionManager.getCwd();
 			},
+			getTaskScopeIdentity: () => ({
+				cwd: sessionManager.getCwd(),
+				generation: sessionManager.getCwdGeneration(),
+			}),
+			getTaskScopeSettings: () => taskScopeSettings,
+			runWithTaskAdmission: admit =>
+				sessionManager.runWithCwdReadLease(async () => {
+					await refreshTaskScopeSettings();
+					return admit();
+				}),
+			runWithTaskOwnerReadLease: resolve => sessionManager.runWithCwdReadLease(resolve),
 			hasUI: options.hasUI ?? false,
 			profileAuthority,
 			workflowGateEligible: true,
@@ -3182,7 +3234,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 											// Cwd-derived read-only state the prompt and subagents consume.
 											// Best-effort by design: the move is committed, and a failed
 											// re-discovery must not present a committed move as a failure.
-											await applyRescopedReadState(sessionManager.getCwd());
 											try {
 												await session?.refreshSshTool({ activateIfAvailable: true });
 											} catch (error) {
@@ -5394,15 +5445,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			reloadSkills:
 				options.skills === undefined
 					? async reloadCwd => {
-							if (!settings.get("skills.enabled")) {
+							const scopedSettings =
+								sessionManager.getCwdGeneration() === taskScopeOriginGeneration
+									? settings
+									: await settings.snapshotForCwd(sessionManager.getCwd());
+							if (!scopedSettings.get("skills.enabled")) {
 								return { skills: getEmbeddedDefaultGjcSkills(), warnings: [] };
 							} else {
 								const reloaded = await loadSkills({
-									...settings.getGroup("skills"),
+									...scopedSettings.getGroup("skills"),
 									agentDir,
 									profileAuthority,
 									cwd: reloadCwd,
-									disabledExtensions: settings.get("disabledExtensions"),
+									disabledExtensions: scopedSettings.get("disabledExtensions"),
 								});
 								return { skills: withEmbeddedDefaultGjcSkills(reloaded.skills), warnings: reloaded.warnings };
 							}
@@ -5487,6 +5542,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// carried by the host replay ring through the internal runtime seam above.
 		if (autoroutingInactive) session.configWarnings.push(AUTOROUTING_INACTIVE_WARNING);
 		hasSession = true;
+		unregisterTaskScopeSettings = sessionManager.registerAfterMoveListener(refreshTaskScopeAfterMove);
 		const cleanupOwnedManager = cleanupOwnedMcpManager;
 		const sessionOwnedMcpManager = ownsMcpManager ? mcpManager : undefined;
 		if (cleanupOwnedManager && cleanupOwnedMcpManagerOwner !== sessionOwnedMcpManager) {
@@ -5558,6 +5614,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					try {
 						agentRegistry.unregister(resolvedAgentId);
 						releaseCredentialDisabledSubscription();
+						releaseTaskScopeSettings();
 						releaseLocalProtocolOverride();
 					} catch (error) {
 						failures.push(error);
@@ -6121,6 +6178,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				SessionManager.releaseProcessCwdOwnership(sessionManager);
 				processCwdClaimed = false;
 			});
+		await attemptCleanup(releaseTaskScopeSettings);
 		await attemptCleanup(releaseLocalProtocolOverride);
 		await attemptCleanup(closeOwnedAuthStorage);
 		if (cleanupDiagnostic !== undefined) {

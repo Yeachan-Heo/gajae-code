@@ -37,6 +37,7 @@ interface DescriptionSettings {
 
 interface DescriptionSession {
 	settings: DescriptionSettings;
+	getTaskScopeSettings?: () => DescriptionSettings;
 	getSessionSpawns?: () => string | null;
 	hasEditTool?: boolean;
 }
@@ -89,12 +90,13 @@ export function searchToolDescriptionForSession(session: DescriptionSession): st
 }
 
 export function renderTaskDescription(session: DescriptionSession): string {
-	const simpleMode = session.settings.get("task.simple") as TaskSimpleMode;
+	const settings = session.getTaskScopeSettings?.() ?? session.settings;
+	const simpleMode = settings.get("task.simple") as TaskSimpleMode;
 	const { contextEnabled, customSchemaEnabled } = getTaskSimpleModeCapabilities(simpleMode);
-	const isolationMode = session.settings.get("task.isolation.mode");
+	const isolationMode = settings.get("task.isolation.mode");
 	const parentSpawns = session.getSessionSpawns?.() ?? "*";
 	const spawningDisabled = parentSpawns === "";
-	const disabledSetting = session.settings.get("task.disabledAgents");
+	const disabledSetting = settings.get("task.disabledAgents");
 	const disabledAgents = Array.isArray(disabledSetting)
 		? disabledSetting.filter((agent): agent is string => typeof agent === "string")
 		: [];
@@ -116,7 +118,7 @@ export function renderTaskDescription(session: DescriptionSession): string {
 	return prompt.render(taskDescription, {
 		agents: agents.map(({ name }) => ({ name })),
 		spawningDisabled,
-		MAX_CONCURRENCY: session.settings.get("task.maxConcurrency"),
+		MAX_CONCURRENCY: settings.get("task.maxConcurrency"),
 		isolationEnabled: isolationMode !== "none",
 		asyncEnabled: true,
 		contextEnabled,
@@ -124,12 +126,13 @@ export function renderTaskDescription(session: DescriptionSession): string {
 		defaultMode: simpleMode === "default",
 		schemaFreeMode: simpleMode === "schema-free",
 		independentMode: simpleMode === "independent",
-		autoroutingActive: session.settings.getEffectiveAutorouting().active,
+		autoroutingActive: settings.getEffectiveAutorouting().active,
 	});
 }
 
 export function taskParametersForSession(session?: DescriptionSession): TaskToolSchemaInstance {
-	const simpleMode = session ? (session.settings.get("task.simple") as TaskSimpleMode) : "default";
-	const isolationMode = session?.settings.get("task.isolation.mode");
+	const settings = session?.getTaskScopeSettings?.() ?? session?.settings;
+	const simpleMode = settings ? (settings.get("task.simple") as TaskSimpleMode) : "default";
+	const isolationMode = settings?.get("task.isolation.mode");
 	return getTaskSchema({ isolationEnabled: session !== undefined && isolationMode !== "none", simpleMode });
 }
