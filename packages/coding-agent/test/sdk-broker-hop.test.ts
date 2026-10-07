@@ -1,44 +1,24 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { type ChildProcess, spawn } from "node:child_process";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import path from "node:path";
 import { type BrokerDiscovery, isPidAlive } from "../src/sdk/broker/discovery";
 import {
 	BrokerHopError,
 	brokerOwnerIdentityMatchesForTest,
+	launchBrokerViaHop,
 	parseBrokerHopReply,
+	reapDetachedBrokerPidForTest,
 	reapSpawnedBrokerForTest,
 } from "../src/sdk/broker/ensure";
-
-const HOP_ENTRY = path.join(import.meta.dir, "..", "src", "sdk", "broker", "hop.ts");
-
-async function runHop(
-	message: unknown,
-	env: NodeJS.ProcessEnv = process.env,
-): Promise<{ hop: ChildProcess; stdout: string; code: number | null }> {
-	const hop = spawn(
-		process.execPath,
-		[
-			"-e",
-			`import(${JSON.stringify(HOP_ENTRY)}).then(m => m.runBrokerHopFromArgv(process.argv.slice(1)))`,
-			JSON.stringify(message),
-		],
-		{ stdio: ["ignore", "pipe", "pipe"], env },
-	);
-	let stdout = "";
-	hop.stdout?.on("data", chunk => {
-		stdout += chunk.toString();
-	});
-	const code = await new Promise<number | null>(resolve => hop.on("close", resolve));
-	return { hop, stdout, code };
-}
+import { observeProcessIncarnation } from "../src/sdk/broker/process-incarnation";
 
 describe("SDK broker hop protocol", () => {
 	let tempDir: string;
 
 	beforeEach(async () => {
-		tempDir = path.join("/tmp", `gjc-hop-test-${randomUUID()}`);
+		tempDir = path.join(os.tmpdir(), `gjc-hop-test-${randomUUID()}`);
 		await fs.mkdir(tempDir, { recursive: true });
 	});
 
@@ -79,24 +59,40 @@ describe("SDK broker hop protocol", () => {
 		// Use Bun for cross-platform sleep instead of shell utility
 		const sleepScript = path.join(tempDir, "sleep-broker.js");
 		await fs.writeFile(sleepScript, `await Bun.sleep(30000);`);
-		const { hop, stdout, code } = await runHop({ command: { file: process.execPath, args: [sleepScript] }, cwd: tempDir });
-		expect(code).toBe(0);
-		const reported = JSON.parse(stdout.trim()) as { pid: number };
-		expect(Number.isInteger(reported.pid)).toBe(true);
-		expect(reported.pid).not.toBe(hop.pid);
+		const launched = await launchBrokerViaHop(
+			{ command: { file: process.execPath, args: [sleepScript] }, cwd: tempDir },
+			{ env: process.env, cwd: tempDir },
+		);
+		expect(launched.error).toBeUndefined();
+		const pid = launched.realBrokerPid;
+		if (pid === undefined) throw new Error("Hop response did not include the broker pid.");
+		expect(Number.isInteger(pid)).toBe(true);
+		expect(pid).not.toBe(launched.process.pid);
 		// The hop has exited, but the broker it launched is still running.
-		expect(hop.exitCode).toBe(0);
-		expect(isPidAlive(reported.pid)).toBe(true);
+		expect(launched.process.exitCode).toBe(0);
+		expect(isPidAlive(pid)).toBe(true);
 
 		// Reaping through the exited hop's ChildProcess must signal the reported broker pid.
-		await reapSpawnedBrokerForTest(hop, reported.pid, undefined, { gracefulMs: 2_000, killVerifyMs: 2_000 });
-		expect(isPidAlive(reported.pid)).toBe(false);
+		const observed = observeProcessIncarnation(pid);
+		const incarnation =
+			launched.realBrokerIncarnation ?? (observed.status === "present" ? observed.incarnation : undefined);
+		expect(typeof incarnation).toBe("string");
+		await reapSpawnedBrokerForTest(launched.process, pid, incarnation, {
+			gracefulMs: 2_000,
+			killVerifyMs: 2_000,
+		});
+		expect(observeProcessIncarnation(pid).status).toBe("absent");
 	});
 
-	test("hop exits non-zero without a pid when the broker command cannot be spawned", async () => {
-		const { stdout, code } = await runHop({ command: { file: path.join(tempDir, "missing-broker"), args: [] } });
-		expect(stdout.trim()).toBe("");
-		expect(code).not.toBe(0);
+	test("hop launch errors preserve the underlying spawn diagnostic", async () => {
+		const launched = await launchBrokerViaHop(
+			{ command: { file: path.join(tempDir, "missing-broker"), args: [] } },
+			{ env: process.env },
+		);
+		expect(launched.error).toBeInstanceOf(BrokerHopError);
+		const error = launched.error as BrokerHopError;
+		expect(error.hopStderr.trim()).not.toBe("");
+		expect(error.message).toContain(error.hopStderr.trim());
 	});
 
 	test("broker inherits the hop environment and writes stderr to the log path (no fd numbers, no env on argv)", async () => {
@@ -110,9 +106,13 @@ describe("SDK broker hop protocol", () => {
 			stderrLogPath: logPath,
 		};
 		expect(JSON.stringify(message)).not.toContain(marker);
-		const { stdout, code } = await runHop(message, { ...process.env, GJC_HOP_TEST_VALUE: marker });
-		expect(code).toBe(0);
-		const { pid } = JSON.parse(stdout.trim()) as { pid: number };
+		const launched = await launchBrokerViaHop(message, {
+			env: { ...process.env, GJC_HOP_TEST_VALUE: marker },
+			cwd: tempDir,
+		});
+		expect(launched.error).toBeUndefined();
+		const pid = launched.realBrokerPid;
+		if (pid === undefined) throw new Error("Hop response did not include the broker pid.");
 		const deadline = Date.now() + 5_000;
 		while (isPidAlive(pid) && Date.now() < deadline) await Bun.sleep(20);
 		expect((await fs.readFile(logPath, "utf8")).trim()).toBe(marker);
@@ -134,22 +134,54 @@ describe("SDK broker hop protocol", () => {
 		}
 	});
 
-	test("hop failure produces typed BrokerHopError", async () => {
-		// This test verifies that when the hop fails, a typed BrokerHopError is produced
-		// The actual hop invocation is complex, so we test the error class exists and can be constructed
-		const { BrokerHopError } = await import("../src/sdk/broker/ensure");
+	test("detached reaping never escalates after the PID changes incarnation", async () => {
+		const kill = spyOn(process, "kill").mockImplementation(() => true);
+		const observations = [
+			{ status: "present", incarnation: "linux:11" },
+			{ status: "present", incarnation: "linux:11" },
+			{ status: "present", incarnation: "linux:12" },
+		] as const;
+		let index = 0;
+		try {
+			await reapDetachedBrokerPidForTest(
+				12345,
+				"linux:11",
+				{ gracefulMs: 5, killVerifyMs: 5 },
+				() => observations[index++] ?? { status: "unknown", reasonCode: "test_exhausted" },
+			);
+			expect(kill).toHaveBeenCalledTimes(1);
+			expect(kill).toHaveBeenCalledWith(12345, "SIGTERM");
+		} finally {
+			kill.mockRestore();
+		}
+	});
 
-		const error = new BrokerHopError({
-			exitCode: 1,
-			stdout: "invalid json",
-			reason: "test hop failure",
-		});
+	test("detached reaping does not signal a PID that was already reused", async () => {
+		const kill = spyOn(process, "kill").mockImplementation(() => true);
+		try {
+			await reapDetachedBrokerPidForTest(12345, "linux:11", { gracefulMs: 1, killVerifyMs: 1 }, () => ({
+				status: "present",
+				incarnation: "linux:12",
+			}));
+			expect(kill).not.toHaveBeenCalled();
+		} finally {
+			kill.mockRestore();
+		}
+	});
 
-		expect(error).toBeInstanceOf(Error);
-		expect(error.code).toBe("broker_hop_failed");
-		expect(error.hopExitCode).toBe(1);
-		expect(error.hopStdout).toBe("invalid json");
-		expect(error.reason).toBe("test hop failure");
+	test("detached reaping refuses to signal without a verified incarnation", async () => {
+		const kill = spyOn(process, "kill").mockImplementation(() => true);
+		try {
+			await expect(
+				reapDetachedBrokerPidForTest(12345, undefined, { gracefulMs: 1, killVerifyMs: 1 }, () => ({
+					status: "present",
+					incarnation: "linux:11",
+				})),
+			).rejects.toThrow("without a verified process incarnation");
+			expect(kill).not.toHaveBeenCalled();
+		} finally {
+			kill.mockRestore();
+		}
 	});
 
 	test("broker owner identity matching requires exact pid and incarnation", () => {

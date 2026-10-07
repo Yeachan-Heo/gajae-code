@@ -41,6 +41,10 @@ export async function runBrokerHopFromArgv(argv: string[]): Promise<void> {
 			...(message.cwd ? { cwd: message.cwd } : {}),
 		});
 		if (typeof stderr === "number") fs.closeSync(stderr);
+		const spawned = Promise.withResolvers<void>();
+		child.once("spawn", spawned.resolve);
+		child.once("error", spawned.reject);
+		await spawned.promise;
 		if (child.pid === undefined) fail("broker hop spawn succeeded but child pid unavailable");
 		child.unref();
 		process.stdout.write(`${JSON.stringify({ pid: child.pid })}\n`, () => process.exit(0));

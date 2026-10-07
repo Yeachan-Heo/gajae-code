@@ -3,8 +3,8 @@
  * This module owns the effectful bootstrap (startup timing, stderr drainer,
  * bash-shell worker protocol) plus the unchanged ordinary routing order:
  * bash-shell workers -> darwin malloc re-exec -> internal smoke -> tmux owner
- * isolation -> managed-owner supervisor/admission/recovery -> private sdk
- * stderr drainer -> public family dispatch -> community app -> doctor worker /
+ * isolation -> managed-owner supervisor/admission/recovery -> broker hop ->
+ * private sdk stderr drainer -> public family dispatch -> community app -> doctor worker /
  * probe / cli -> full registry. `cli.ts` imports it lazily, only after argv has
  * been proven not to be a `sdk diagnostics` observation. */
 
@@ -16,6 +16,7 @@ import {
 	BASH_SHELL_SUPERVISOR_ARG,
 	BASH_SHELL_WORKER_ARG,
 } from "./exec/bash-shell-worker-protocol";
+import { runBrokerHopFromArgv } from "./sdk/broker/hop";
 import { runSdkStderrDrainerFromArgv } from "./sdk/broker/stderr-drainer";
 
 export { commands };
@@ -127,6 +128,10 @@ export async function runOrdinaryCli(argv: string[]): Promise<void> {
 			await completeManagedOwnerRecovery(admission.context);
 			return;
 		}
+	}
+	if (argv.length >= 2 && argv[0] === "internal" && argv[1] === "broker-hop") {
+		await runBrokerHopFromArgv(argv.slice(2));
+		return;
 	}
 	if (argv[0] === "sdk" && argv[1] === "stderr-drain-internal") {
 		// Private lifecycle stderr drainer: must stay ahead of the public sdk family

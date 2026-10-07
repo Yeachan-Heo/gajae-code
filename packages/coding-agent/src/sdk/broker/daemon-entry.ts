@@ -1,6 +1,16 @@
-import { type ChildProcess, spawn } from "node:child_process";
-import { type BrokerDiscovery, readBrokerDiscovery, readBrokerRestartIntent } from "./discovery";
-import { launchBrokerViaHop, resolveBrokerSpawnOptionsForProduction, withBrokerStartupLock } from "./ensure";
+import type { ChildProcess } from "node:child_process";
+import {
+	type BrokerDiscovery,
+	brokerProcessIncarnation,
+	readBrokerDiscovery,
+	readBrokerRestartIntent,
+} from "./discovery";
+import {
+	launchBrokerViaHop,
+	launchBrokerViaPosixTrampoline,
+	resolveBrokerLaunchMode,
+	withBrokerStartupLock,
+} from "./ensure";
 import { observeProcessIncarnation } from "./process-incarnation";
 import { resolveSdkInternalSpawnCommand } from "./runtime";
 
@@ -62,39 +72,35 @@ export async function launchAuthorizedBrokerSuccessor(
 		)
 			return { kind: "adopted" as const, discovery: existing };
 		const command = resolveSdkInternalSpawnCommand("broker-internal");
-		let child: ChildProcess;
 		try {
-			const brokerSpawnOpts = resolveBrokerSpawnOptionsForProduction(command.file, [
-				...command.args,
-				"--agent-dir",
-				options.agentDir,
-			]);
 			const env = { ...command.env, GJC_BROKER_RESTART_REQUEST: options.requestId };
-
-			let spawnError: Error | undefined;
-			if (process.platform === "win32") {
-				const launched = await launchBrokerViaHop(
-					{
-						command: { file: brokerSpawnOpts.file, args: brokerSpawnOpts.args },
-						...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
-					},
-					{ env, cwd: command.kind === "bun-source" ? command.cwd : undefined },
-				);
-				child = launched.process;
-				spawnError = launched.error;
-			} else {
-				child = spawn(brokerSpawnOpts.file, brokerSpawnOpts.args, {
-					detached: true,
-					stdio: "ignore",
-					env,
-					...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
-				});
-				child.once("error", error => {
-					spawnError = error;
-				});
-			}
+			const launchMode = resolveBrokerLaunchMode(process.platform, "discovery");
+			if (launchMode === "direct") throw new Error("Broker successor launch cannot use a fixture child.");
+			const launched =
+				launchMode === "windows-hop"
+					? await launchBrokerViaHop(
+							{
+								command: {
+									file: command.file,
+									args: [...command.args, "--agent-dir", options.agentDir],
+								},
+								...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
+							},
+							{ env, cwd: command.kind === "bun-source" ? command.cwd : undefined },
+						)
+					: await launchBrokerViaPosixTrampoline(options.agentDir, {
+							env,
+							...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
+						});
+			const child: ChildProcess = launched.process;
 			child.unref();
-			return { kind: "spawned" as const, child, spawnError: () => spawnError };
+			return {
+				kind: "spawned" as const,
+				child,
+				realBrokerPid: launched.realBrokerPid,
+				realBrokerIncarnation: launched.realBrokerIncarnation,
+				spawnError: () => launched.error,
+			};
 		} catch (spawnError) {
 			return {
 				kind: "refused" as const,
@@ -105,6 +111,10 @@ export async function launchAuthorizedBrokerSuccessor(
 	});
 	if (spawnOutcome.kind !== "spawned") return spawnOutcome;
 	const { child } = spawnOutcome;
+	const realBrokerPid = spawnOutcome.realBrokerPid ?? child.pid;
+	let expectedBrokerIncarnation =
+		spawnOutcome.realBrokerIncarnation ??
+		(realBrokerPid === undefined ? undefined : brokerProcessIncarnation(realBrokerPid));
 	const until = Math.min(Date.now() + Math.max(1, options.deadlineAt - Date.now()), options.deadlineAt);
 	for (;;) {
 		if (spawnOutcome.spawnError())
@@ -118,6 +128,19 @@ export async function launchAuthorizedBrokerSuccessor(
 		const failedSpawn =
 			spawnOutcome.spawnError() || child.signalCode !== null || (child.exitCode !== null && child.exitCode !== 0);
 		if (failedSpawn) return { kind: "refused", reason: "spawn_exited_before_publication" };
+		if (realBrokerPid !== undefined) {
+			const observation = observeProcessIncarnation(realBrokerPid);
+			if (
+				observation.status === "absent" ||
+				(observation.status === "present" &&
+					expectedBrokerIncarnation !== undefined &&
+					observation.incarnation !== expectedBrokerIncarnation)
+			)
+				return { kind: "refused", reason: "spawn_exited_before_publication" };
+			if (observation.status === "present" && expectedBrokerIncarnation === undefined) {
+				expectedBrokerIncarnation = observation.incarnation;
+			}
+		}
 		const discovered = await readBrokerDiscovery(options.agentDir);
 		if (
 			discovered &&
