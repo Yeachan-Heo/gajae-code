@@ -1,3 +1,3 @@
 ### Fixed
 
-- Narrowed revert of specific SDK terminal publication edges from #6388 to address managed-receipt-process-ownership race conditions causing terminal publication flakes (failed 4/6 test runs). Only agent-session.ts publication-edge revert applied; lifecycle, session-scope, retirement, and artifact-owner paths restored to dev to preserve cleanup and task-owner features.
+- Revert the unvalidated #6388 task-owner/session-cleanup changes while retaining per-token SDK terminal publication, event ordering, and continuation ownership needed to settle accepted prompts. Durable task-artifact ownership remains deferred; established lifecycle, retirement, and artifact-owner paths stay unchanged.
