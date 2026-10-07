@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import * as fs from "node:fs";
-import process from "node:process";
+import * as process from "node:process";
 import type { BrokerHopMessage } from "./ensure";
 import { observeProcessIncarnation } from "./process-incarnation";
 
