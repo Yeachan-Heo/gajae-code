@@ -15,7 +15,11 @@ import { AgentSession, type AgentSessionEvent } from "../src/session/agent-sessi
 import { AuthStorage } from "../src/session/auth-storage";
 import { type SessionEntry, SessionManager } from "../src/session/session-manager";
 import { EventBus } from "../src/utils/event-bus";
-import { type EmptyStopScenario, handleProviderRequest } from "./helpers/managed-empty-stop-harness";
+import {
+	assertManagedTranscript,
+	type EmptyStopScenario,
+	handleProviderRequest,
+} from "./helpers/managed-empty-stop-harness";
 
 // Local session integration: real provider HTTP/SSE, without launching the SDK
 // broker or running the connected verification scenarios owned by the tester.
@@ -188,6 +192,7 @@ test.each(
 				entry.type === "message" && entry.message.role === "assistant" ? [entry.message] : [],
 			);
 			expect(persistedAssistants).toEqual(assistants);
+			await assertManagedTranscript(manager, assistants);
 		}
 	} finally {
 		try {
