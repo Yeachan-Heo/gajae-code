@@ -9,13 +9,17 @@ import { lifecycleRequestTimeoutMs } from "../src/sdk/broker/startup-budget";
 import { DEFAULT_SDK_REQUEST_TIMEOUT_MS, SdkClientError } from "../src/sdk/client";
 
 test("replays an uncertain ACP lifecycle launch with the same idempotency key", async () => {
+	setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
 	const calls: Array<{ operation: string; input: Record<string, unknown>; options: Record<string, unknown> }> = [];
 	let attempts = 0;
 	const client = {
 		async global(operation: string, input: Record<string, unknown>, options: Record<string, unknown>) {
-			calls.push({ operation, input, options });
+			calls.push({ operation, input, options: { ...options } });
 			attempts += 1;
-			if (attempts === 1) throw new SdkClientError("uncertain_after_send", "response lost after dispatch");
+			if (attempts === 1) {
+				setSystemTime(new Date("2026-01-01T00:00:00.100Z"));
+				throw new SdkClientError("uncertain_after_send", "response lost after dispatch");
+			}
 			return { sessionId: "session-reconciled" };
 		},
 		async close() {},
@@ -45,6 +49,7 @@ test("replays an uncertain ACP lifecycle launch with the same idempotency key", 
 		expect(calls[1]?.input).toEqual(calls[0]?.input);
 	} finally {
 		await adapter.close();
+		setSystemTime();
 	}
 });
 
@@ -53,7 +58,7 @@ test("replay timeout consumes the original lifecycle budget", async () => {
 	const calls: Array<Record<string, unknown>> = [];
 	const client = {
 		async global(_operation: string, _input: Record<string, unknown>, options: Record<string, unknown>) {
-			calls.push(options);
+			calls.push({ ...options });
 			if (calls.length === 1) {
 				setSystemTime(new Date("2026-01-01T00:00:03.000Z"));
 				throw new SdkClientError("uncertain_after_send", "response lost after dispatch");
@@ -65,7 +70,7 @@ test("replay timeout consumes the original lifecycle budget", async () => {
 	const adapter = new AcpSdkAdapter({ client: client as never });
 	try {
 		await expect(adapter.lifecycle("session.close", {}, "consumed-budget")).resolves.toEqual({ ok: true });
-		expect(calls[1]!.timeoutMs).toBe(5_000);
+		expect(calls[1]!.timeoutMs).toBe(DEFAULT_SDK_REQUEST_TIMEOUT_MS - 3_000);
 	} finally {
 		await adapter.close();
 		setSystemTime();
@@ -79,7 +84,7 @@ test("rethrows the original uncertainty when replay margin is exhausted", async 
 	const client = {
 		async global() {
 			attempts += 1;
-			setSystemTime(new Date("2026-01-01T00:00:09.000Z"));
+			setSystemTime(new Date("2026-01-01T00:00:11.000Z"));
 			throw original;
 		},
 		async close() {},
@@ -98,7 +103,7 @@ test("uses the SDK default timeout when lifecycle sizing is unavailable", async 
 	const optionsSeen: Record<string, unknown>[] = [];
 	const client = {
 		async global(_operation: string, _input: Record<string, unknown>, options: Record<string, unknown>) {
-			optionsSeen.push(options);
+			optionsSeen.push({ ...options });
 			if (optionsSeen.length === 1) throw new SdkClientError("uncertain_after_send", "response lost after dispatch");
 			return { ok: true };
 		},
@@ -256,7 +261,7 @@ test("keeps sent uncertainty when replay is refused while broker publication is 
 	}
 });
 
-test("throws a reconciled terminal replay error instead of original uncertainty", async () => {
+test("preserves original uncertainty and records a terminal replay failure", async () => {
 	const original = new SdkClientError("uncertain_after_send", "response lost after dispatch");
 	const replayFailure = new SdkClientError("spawn_failed", "spawn failed during reconciliation");
 	let calls = 0;
@@ -272,7 +277,8 @@ test("throws a reconciled terminal replay error instead of original uncertainty"
 		const error = await adapter
 			.lifecycle("session.create", { cwd: "/tmp/workspace", target: { path: "/tmp/workspace" } }, "acp-request-7")
 			.catch(value => value);
-		expect(error).toBe(replayFailure);
+		expect(error).toBe(original);
+		expect(error).toHaveProperty("recovery", replayFailure);
 		expect(calls).toBe(2);
 	} finally {
 		await adapter.close();
@@ -374,7 +380,7 @@ test("keeps sent uncertainty when the replay client is disposed", async () => {
 	}
 });
 
-test("propagates a replay timeout that occurs after dispatch", async () => {
+test("preserves original uncertainty when replay times out after dispatch", async () => {
 	const original = new SdkClientError("uncertain_after_send", "response lost after dispatch");
 	const replayFailure = new SdkClientError(
 		"timeout",
@@ -393,9 +399,8 @@ test("propagates a replay timeout that occurs after dispatch", async () => {
 	};
 	const adapter = new AcpSdkAdapter({ client: client as never });
 	try {
-		await expect(adapter.lifecycle("session.create", {}, "acp-request-after-send-timeout")).rejects.toBe(
-			replayFailure,
-		);
+		await expect(adapter.lifecycle("session.create", {}, "acp-request-after-send-timeout")).rejects.toBe(original);
+		expect(original).toHaveProperty("recovery", replayFailure);
 	} finally {
 		await adapter.close();
 	}

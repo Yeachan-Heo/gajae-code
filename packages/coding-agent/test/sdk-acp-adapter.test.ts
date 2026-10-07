@@ -43,6 +43,7 @@ class FakeSdkClient {
 			input,
 			...(options?.idempotencyKey === undefined ? {} : { idempotencyKey: options.idempotencyKey }),
 			...(options?.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+			...(options?.deadline === undefined ? {} : { deadline: options.deadline }),
 		});
 		return this.globalResponse;
 	}
@@ -389,6 +390,7 @@ test("ACP lifecycle startup deadline is bounded by the broker startup budget", a
 	const sdk = new FakeSdkClient();
 	const adapter = new AcpSdkAdapter({ client: sdk as never });
 	const startedAt = Date.now();
+	const clock = spyOn(Date, "now").mockReturnValue(startedAt);
 	try {
 		const input = { cwd: "/workspace", target: { path: "/workspace" } };
 		await adapter.global("session.create", input, "bounded-startup-key");
@@ -400,6 +402,7 @@ test("ACP lifecycle startup deadline is bounded by the broker startup budget", a
 		expect(frame?.timeoutMs).toBe(expected);
 	} finally {
 		await adapter.close();
+		clock.mockRestore();
 	}
 });
 
@@ -679,7 +682,9 @@ test("ACP lifecycle waits for a late replay acknowledgment without another creat
 		acknowledgment.resolve({ result: { sessionId: "late-committed" } });
 		await expect(recovery).resolves.toEqual({ result: { sessionId: "late-committed" } });
 		expect(sdk.frames).toHaveLength(2);
-		expect(sdk.frames[1]).toEqual(sdk.frames[0]);
+		expect(sdk.frames[1]).toEqual({ ...sdk.frames[0], timeoutMs: expect.any(Number) });
+		expect(sdk.frames[1]?.timeoutMs).toBeLessThanOrEqual(sdk.frames[0]?.timeoutMs as number);
+		expect(sdk.frames[1]?.timeoutMs).toBeGreaterThan(0);
 	} finally {
 		acknowledgment.resolve({ result: { sessionId: "late-committed" } });
 		await adapter.close();

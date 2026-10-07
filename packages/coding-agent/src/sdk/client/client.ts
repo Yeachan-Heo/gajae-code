@@ -722,16 +722,12 @@ export class SdkClient {
 		if (requestDeadline === undefined) return await cycle.promise!;
 		const remaining = requestDeadline - Date.now();
 		if (remaining <= 0) throw this.#deadlineError();
-		let timer: NodeJS.Timeout | undefined;
+		const expired = Promise.withResolvers<never>();
+		const timer = setTimeout(() => expired.reject(this.#deadlineError()), remaining);
 		try {
-			return await Promise.race([
-				cycle.promise!,
-				new Promise<Incarnation>((_, reject) => {
-					timer = setTimeout(() => reject(this.#deadlineError()), remaining);
-				}),
-			]);
+			return await Promise.race([cycle.promise!, expired.promise]);
 		} finally {
-			if (timer) clearTimeout(timer);
+			clearTimeout(timer);
 		}
 	}
 
