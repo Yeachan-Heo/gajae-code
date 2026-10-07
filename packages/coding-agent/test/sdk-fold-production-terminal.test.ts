@@ -104,6 +104,7 @@ async function createProductionSession(modelStartsBash = false, persist = true, 
 		sdkHostModeSupported: false,
 		notificationHostModeSupported: false,
 	});
+	created.session.trackCoordinatorRuntimeStatePersistenceFailuresForTests();
 	return mock;
 }
 
@@ -181,10 +182,13 @@ async function deliverDuringFoldCapture(folded: FoldedTerminal, output: string):
 async function cancelFoldedTerminal(folded: FoldedTerminal): Promise<void> {
 	if (!created) throw new Error("SDK session was not created");
 	const manager = AsyncJobManager.forEndpoint(created.session.sessionId);
-	manager?.cancel(folded.jobId);
+	if (!manager) throw new Error("expected the SDK fixture's original async job manager");
+	manager.cancel(folded.jobId);
 	folded.exit.resolve({ exitCode: 0, signal: null });
 	await waitFor(() => folded.releaseCalls() === 1);
 	await folded.promptRun;
+	await manager.waitForAll();
+	await created.session.awaitCoordinatorRuntimeStatePersistenceForTests();
 }
 
 function registerOrdinarySdkJob(output: string, label: string) {
