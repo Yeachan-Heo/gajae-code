@@ -866,13 +866,13 @@ export class PromptDeadlineManager {
 		this.#captureDeadlineStart(key, correlation, lease.acceptedAt + lease.maxMs);
 	}
 
-	/** Whether a deadline has captured exact active-run terminal evidence for this prompt. */
+	/** Whether expiry owns terminal settlement, even when exact observation is unavailable. */
 	shouldDeferTerminalTransition(correlation: InvocationCorrelation): boolean {
 		const key = leaseKey(correlation);
 		return (
 			this.#deadlineDeferredTerminalTransitions.has(key) ||
 			this.#uncertaintyRecoveryPending.has(key) ||
-			(this.#expiring.has(key) && this.#deadlineStartCleanup.has(key))
+			(this.#expiring.has(key) && this.#onDeadlineTerminalization !== undefined)
 		);
 	}
 

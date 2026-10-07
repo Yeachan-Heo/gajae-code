@@ -5394,6 +5394,44 @@ async function settledStatus(
 	}
 }
 
+test("deadline settlement stays fenced during a pending claim without an observable run", async () => {
+	const reconciliation = createInvocationReconciliation();
+	const correlation = { commandId: "unobservable-claim-command", turnId: "unobservable-claim-turn" };
+	await reconciliation.noteAccepted("prompt", correlation);
+	await reconciliation.noteTransition("prompt", correlation, { type: "agent_start" });
+	const claimStarted = Promise.withResolvers<void>();
+	const releaseClaim = Promise.withResolvers<void>();
+	const claim = reconciliation.claimPendingOutcome.bind(reconciliation);
+	const pendingClaim: typeof reconciliation.claimPendingOutcome = async (kind, target, outcome, deadlineMaxAt) => {
+		claimStarted.resolve();
+		await releaseClaim.promise;
+		return claim(kind, target, outcome, deadlineMaxAt);
+	};
+	const manager = new PromptDeadlineManager({
+		reconciliation: {
+			...reconciliation,
+			claimPendingOutcome: pendingClaim,
+		},
+		getLeaseMs: () => 1,
+		getMaxMs: () => 60_000,
+		onDeadlineStarted: () => undefined,
+		onDeadlineTerminalization: async () => "uncertain" as const,
+	});
+	try {
+		manager.onAccepted(correlation);
+		await claimStarted.promise;
+		expect(manager.shouldDeferTerminalTransition(correlation)).toBe(true);
+		manager.noteTerminalTransition(correlation, undefined, undefined, true);
+		releaseClaim.resolve();
+		await Bun.sleep(20);
+		expect(reconciliation.lookup("prompt", correlation)).toMatchObject({ status: "in_flight" });
+		expect(manager.shouldDeferTerminalTransition(correlation)).toBe(true);
+	} finally {
+		releaseClaim.resolve();
+		manager.clearAll();
+	}
+});
+
 function neverSettlingPromise(): Promise<void> {
 	return Promise.withResolvers<void>().promise;
 }
