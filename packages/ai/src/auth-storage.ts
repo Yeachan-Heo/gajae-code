@@ -6490,12 +6490,8 @@ export class AuthStorage {
 			try {
 				const value = await this.#configValueResolver(key, String(configurationGeneration));
 				const published = publish(value);
-				const sameKeyStillConfigured =
-					published ||
-					this.#getCredentialsForProvider(storageProvider).some(
-						credential => credential.type === "api_key" && credential.key === key,
-					);
-				resolve(sameKeyStillConfigured ? value : undefined);
+				// A retired generation must not return a value it could no longer publish.
+				resolve(published ? value : undefined);
 			} catch (error) {
 				if (publish(undefined)) reject(error);
 				else resolve(undefined);
