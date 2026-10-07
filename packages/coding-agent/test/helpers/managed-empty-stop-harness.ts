@@ -45,8 +45,12 @@ export interface ScenarioReport {
 
 export function parseHarnessPort(value: string | undefined = process.env.PORT_BASE): number {
 	const port = value === undefined ? 30200 : Number(value);
-	if (value?.trim() === "" || !Number.isInteger(port) || (port !== 0 && (port < 30200 || port > 30219)))
-		throw new Error("PORT_BASE must be 0 or between 30200 and 30219");
+	if (
+		value?.trim() === "" ||
+		!Number.isInteger(port) ||
+		(port !== 0 && (port < 30200 || port > 30219) && (port < 52440 || port > 52459))
+	)
+		throw new Error("PORT_BASE must be 0, between 30200 and 30219, or between 52440 and 52459");
 	return port;
 }
 

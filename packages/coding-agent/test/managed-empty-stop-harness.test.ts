@@ -129,6 +129,12 @@ describe("managed empty-stop harness local contracts (no connected scenarios)", 
 	test.each(["", " ", "30199", "30220", "8000", "30200.5", "invalid"])("rejects port %s", value => {
 		expect(() => parseHarnessPort(value)).toThrow("PORT_BASE");
 	});
+	test.each(["52440", "52459"])("accepts r3 isolated port %s", value => {
+		expect(parseHarnessPort(value)).toBe(Number(value));
+	});
+	test.each(["52439", "52460", "52440.5"])("rejects port outside the r3 isolation range %s", value => {
+		expect(() => parseHarnessPort(value)).toThrow("PORT_BASE");
+	});
 
 	test("emits explicit zero-usage stop and a real SSE terminator", async () => {
 		const response = providerSse("primary", "", 0);
