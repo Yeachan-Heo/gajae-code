@@ -1900,6 +1900,60 @@ describe("SDK session index", () => {
 			spy.mockRestore();
 		}
 	});
+	it("refreshIfChanged waits for queued local writes before accepting an unchanged stamp", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-poll-queued-write-"));
+		const writer = new SessionIndex(dir);
+		await writer.append(event("first"));
+		const reader = new SessionIndex(dir);
+		expect(await reader.refreshIfChanged()).toBe(true);
+
+		const lockEntered = deferred();
+		const releaseLock = deferred();
+		const previousHook = FileLockTestHooks.afterParentMkdir;
+		let blocked = false;
+		FileLockTestHooks.afterParentMkdir = async () => {
+			if (blocked) return;
+			blocked = true;
+			lockEntered.resolve();
+			await releaseLock.promise;
+		};
+
+		let trackStampReads = false;
+		let stampReads = 0;
+		const logPath = path.join(dir, "sdk", "sessions", "index.jsonl");
+		const snapshotPath = path.join(dir, "sdk", "sessions", "index.snapshot.json");
+		const stat = fs.stat.bind(fs);
+		const statSpy = vi.spyOn(fs, "stat").mockImplementation((async (file, options) => {
+			if (trackStampReads && (path.resolve(String(file)) === logPath || path.resolve(String(file)) === snapshotPath))
+				stampReads++;
+			return await stat(file as Parameters<typeof fs.stat>[0], options as Parameters<typeof fs.stat>[1]);
+		}) as typeof fs.stat);
+		const append = writer.append(event("queued"));
+		try {
+			await lockEntered.promise;
+			trackStampReads = true;
+			const refresh = reader.refreshIfChanged();
+			// The fast path must observe the in-process operation queue first; otherwise
+			// its pre-lock stamp check can return while this append is still pending.
+			expect(stampReads).toBe(0);
+
+			releaseLock.resolve();
+			await append;
+			expect(await refresh).toBe(true);
+			expect(reader.listSessions().sessions).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({ sessionId: "first" }),
+					expect.objectContaining({ sessionId: "queued" }),
+				]),
+			);
+		} finally {
+			releaseLock.resolve();
+			FileLockTestHooks.afterParentMkdir = previousHook;
+			statSpy.mockRestore();
+			await append.catch(() => {});
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
 	it("a changed index still takes the session-index lock, so the no-lock assertion discriminates (#4689)", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-poll-lock-"));
 		const writer = new SessionIndex(dir);
