@@ -1195,32 +1195,36 @@ export class SessionIndex {
 	 * stamp of the last completed locked pass, the in-memory projection is
 	 * already current and the locked rescan is skipped entirely — this is what
 	 * keeps an idle SessionRouter reconcile (2s cadence) from re-parsing and
-	 * re-checksumming the whole index forever. An append committed before the
-	 * stat always changes the stamp, so a miss is impossible; a change landing
-	 * after the stat is seen on the next poll, the same TOCTOU envelope a
-	 * locked read has. A corrupt suffix never takes the fast path: re-scanning
+	 * re-checksumming the whole index forever. The check waits behind queued
+	 * same-process index operations, so a pending append cannot be mistaken for
+	 * an unchanged projection. An append committed before the stat always changes
+	 * the stamp; a change landing after the stat is seen on the next poll, the
+	 * same TOCTOU envelope a locked read has. A corrupt suffix never takes the fast path: re-scanning
 	 * preserves the existing re-diagnosis behavior. Returns true when state was
 	 * reloaded. Authority revalidation that needs the strongest available
 	 * snapshot inside an already-locked write (append, unregister) keeps using
 	 * the exact locked paths.
 	 */
 	async refreshIfChanged(): Promise<boolean> {
-		if (this.#changeStamp !== undefined && !this.#corruptSuffix) {
+		if (this.#changeStamp === undefined || this.#corruptSuffix) {
+			await this.open();
+			await this.refresh();
+			return true;
+		}
+		const indexPath = path.resolve(logFor(this.#agentDir));
+		return await SessionIndex.#enqueue(indexPath, async () => {
+			if (this.#changeStamp === undefined || this.#corruptSuffix) {
+				await withSessionIndexLock("poll-refresh", this.#agentDir, () => this.#refreshUnderLock());
+				return true;
+			}
 			const stamp = await readIndexChangeStamp(this.#agentDir);
 			if (sameIndexChangeStamp(this.#changeStamp, stamp)) return false;
 			// A possible change is re-classified UNDER the lock (#4689 review):
 			// writers mutate these files only while holding it, so the locked
-			// observation is atomic with the tail/replay it selects. The
-			// unlocked stamp above is only the cheap "definitely unchanged" cut.
-			const indexPath = path.resolve(logFor(this.#agentDir));
-			await SessionIndex.#enqueue(indexPath, () =>
-				withSessionIndexLock("poll-refresh", this.#agentDir, () => this.#refreshOrReplayUnderLock()),
-			);
+			// observation is atomic with the tail/replay it selects.
+			await withSessionIndexLock("poll-refresh", this.#agentDir, () => this.#refreshOrReplayUnderLock());
 			return true;
-		}
-		await this.open();
-		await this.refresh();
-		return true;
+		});
 	}
 	/**
 	 * Locked change classification (#4689). Append-only log growth with an
