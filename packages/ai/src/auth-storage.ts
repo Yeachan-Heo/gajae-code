@@ -2317,6 +2317,19 @@ export class AuthStorage {
 		return this.#getCredentialSelector(provider, undefined, sessionId) !== undefined;
 	}
 
+	/** Whether any runtime/session scope has a credential pin, including an unavailable hard pin. */
+	hasAnyCredentialPin(provider: string): boolean {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		if (this.#runtimeCredentialSelectors.has(storageProvider)) return true;
+		for (const selectors of this.#sessionCredentialSelectors.values()) {
+			if (selectors.has(storageProvider)) return true;
+		}
+		for (const unavailable of this.#sessionCredentialUnavailable.values()) {
+			if (unavailable.has(storageProvider)) return true;
+		}
+		return false;
+	}
+
 	/**
 	 * Opaque stored row id of the credential this session is currently using.
 	 *

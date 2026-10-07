@@ -10412,7 +10412,6 @@ export class AgentSession {
 		this.#resetAdaptiveCompactionState();
 		this.#reasoningControlContextGeneration++;
 		const sid = this.#providerSessionId ?? sessionId ?? this.sessionManager.getSessionId();
-		this.#modelRegistry.setActiveCredentialSessionId(this.credentialSessionId);
 		this.agent.sessionId = sid;
 		this.agent.providerSessionId = this.#providerCacheSessionId ?? sid;
 		this.agent.setMetadataResolver(context =>
@@ -18507,7 +18506,6 @@ export class AgentSession {
 					modelsCandidate = await this.#modelRegistry.stageModelsConfigReload(
 						candidate.models,
 						settingsCandidate,
-						this.credentialSessionId,
 					);
 				} catch (error) {
 					throw new ConfigurationReloadError("MODELS_INVALID", error);
@@ -18614,7 +18612,6 @@ export class AgentSession {
 						stagedModels = await this.#modelRegistry.stageModelsConfigReload(
 							candidate.models,
 							stagedSettings,
-							this.credentialSessionId,
 						);
 					} catch (error) {
 						throw new ConfigurationReloadError("MODELS_INVALID", error);

@@ -2084,7 +2084,6 @@ export class ModelRegistry {
 	#optionalAuthPreflightGenerations = new Map<string, number>();
 	#optionalAuthPreflightEpoch = 0;
 	#stagedReloadCandidate = false;
-	#activeCredentialSessionId: string | undefined;
 	#leaseWaiters: RegistryLeaseWaiter[] = [];
 	#activeConsumerLeases = 0;
 	#publicationFenceHeld = false;
@@ -2165,7 +2164,6 @@ export class ModelRegistry {
 		this.#runtimeProviderResolvedApiKeys = new Map(source.#runtimeProviderResolvedApiKeys);
 		this.#runtimeProviderCredentialInstalled = new Set(source.#runtimeProviderCredentialInstalled);
 		this.#runtimeProviderApiKeyEnvNames = new Map(source.#runtimeProviderApiKeyEnvNames);
-		this.#activeCredentialSessionId = source.#activeCredentialSessionId;
 		this.#runtimeProviderOverrides = new Map(source.#runtimeProviderOverrides);
 		this.#runtimeProviderAuthHeaders = new Map(source.#runtimeProviderAuthHeaders);
 		this.#generatedAuthHeaderProviders = new Set(source.#generatedAuthHeaderProviders);
@@ -2412,7 +2410,6 @@ export class ModelRegistry {
 			identity: string;
 		},
 		registrySettings: Pick<Settings, "get" | "getGlobal"> = this.#settings,
-		credentialSessionId?: string,
 	): Promise<ModelsConfigReloadCandidate> {
 		if (this.#disposed) throw new Error("Model registry is disposed");
 		const pathMatches = path.resolve(snapshot.path) === path.resolve(this.#modelsConfigFile.path());
@@ -2454,10 +2451,12 @@ export class ModelRegistry {
 			diagnostics.errors.push(registry.getError()!);
 		}
 		for (const provider of registry.#ownedConfigApiKeys.keys()) {
-			if (!this.authStorage.hasEffectiveCredentialSelector(provider, credentialSessionId)) continue;
+			if (!this.authStorage.hasAnyCredentialPin(provider)) continue;
 			diagnostics.valid = false;
 			diagnostics.errors.push(
-				new Error(`Cannot configure an API key override for ${provider} while a credential selector is active`),
+				new Error(
+					`Cannot configure an API key override for ${provider} while a credential pin is active or unavailable`,
+				),
 			);
 		}
 		let committed = false;
@@ -2569,9 +2568,9 @@ export class ModelRegistry {
 				throw new Error("Model catalog changed during configuration preflight");
 			}
 			for (const provider of registry.#ownedConfigApiKeys.keys()) {
-				if (this.authStorage.hasEffectiveCredentialSelector(provider, credentialSessionId)) {
+				if (this.authStorage.hasAnyCredentialPin(provider)) {
 					throw new Error(
-						`Cannot configure an API key override for ${provider} while a credential selector is active`,
+						`Cannot configure an API key override for ${provider} while a credential pin is active or unavailable`,
 					);
 				}
 			}
@@ -2766,11 +2765,6 @@ export class ModelRegistry {
 		};
 	}
 
-	/** @internal Scope unscoped static reloads to the active interactive session. */
-	setActiveCredentialSessionId(credentialSessionId: string): void {
-		this.#activeCredentialSessionId = credentialSessionId;
-	}
-
 	/** Replace the read-only settings snapshot used by profile-scoped resolution. */
 	setScopedSettings(settingsReader: Pick<Settings, "get" | "getGlobal">): void {
 		this.#catalogRefreshGeneration++;
@@ -2816,8 +2810,6 @@ export class ModelRegistry {
 	 */
 	async refresh(strategy: ModelRefreshStrategy = "online-if-uncached", credentialSessionId?: string): Promise<void> {
 		if (this.#disposed) return;
-		if (credentialSessionId !== undefined) this.#activeCredentialSessionId = credentialSessionId;
-		const effectiveCredentialSessionId = credentialSessionId ?? this.#activeCredentialSessionId;
 		await this.#enqueueCatalogMutation(async () => {
 			if (this.#disposed) return;
 			const refreshGeneration = ++this.#catalogRefreshGeneration;
@@ -2826,7 +2818,7 @@ export class ModelRegistry {
 			};
 			this.#suspendRebuild();
 			try {
-				this.#reloadStaticModels(effectiveCredentialSessionId);
+				this.#reloadStaticModels();
 				this.#suppressedSelectors.clear();
 				this.#selectorCircuits.clear();
 				await this.#refreshRuntimeDiscoveries(
@@ -2834,7 +2826,7 @@ export class ModelRegistry {
 					undefined,
 					refreshGeneration,
 					providerRefreshFence,
-					effectiveCredentialSessionId,
+					credentialSessionId,
 				);
 				if (refreshGeneration === this.#catalogRefreshGeneration) this.#modelBindingsApplier.apply();
 			} finally {
@@ -2974,9 +2966,7 @@ export class ModelRegistry {
 		return resolveProviderModelReference(providerId, modelId, staticModels);
 	}
 
-	#getStaticLoadEnvironmentFingerprint(
-		credentialSessionId: string | undefined = this.#activeCredentialSessionId,
-	): string {
+	#getStaticLoadEnvironmentFingerprint(): string {
 		const providerBaseUrlEnvKeys = new Set(
 			[
 				...getBundledProviders(),
@@ -2986,14 +2976,11 @@ export class ModelRegistry {
 		);
 		return JSON.stringify({
 			apiKeyEnv: [...this.#configuredApiKeyEnvNames].sort().map(name => [name, Bun.env[name] ?? ""]),
-			credentialSelectors: this.#stagedReloadCandidate
+			credentialPins: this.#stagedReloadCandidate
 				? []
 				: [...this.#configuredProviderIds]
 						.sort()
-						.map(provider => [
-							provider,
-							this.authStorage.hasEffectiveCredentialSelector(provider, credentialSessionId),
-						]),
+						.map(provider => [provider, this.authStorage.hasAnyCredentialPin(provider)]),
 			implicitEndpoints: [
 				["OLLAMA_BASE_URL", Bun.env.OLLAMA_BASE_URL || ""],
 				["LLAMA_CPP_BASE_URL", Bun.env.LLAMA_CPP_BASE_URL || ""],
@@ -3003,10 +2990,10 @@ export class ModelRegistry {
 		});
 	}
 
-	#reloadStaticModels(credentialSessionId: string | undefined = this.#activeCredentialSessionId): void {
+	#reloadStaticModels(): void {
 		const currentMtime = this.#modelsConfigFile.getMtimeMs();
 		const disabledProviderKey = [...getDisabledProviderIdsFromSettings(this.#settings)].sort().join("\u0000");
-		const environmentFingerprint = this.#getStaticLoadEnvironmentFingerprint(credentialSessionId);
+		const environmentFingerprint = this.#getStaticLoadEnvironmentFingerprint();
 		const acceptedPresets = loadAcceptedModelPresetProfiles(
 			this.#modelPresetRegistryAgentDir,
 			this.#modelPresetRegistryDependencies,
@@ -3050,7 +3037,7 @@ export class ModelRegistry {
 		this.#equivalenceConfig = undefined;
 		this.#modelBindingsApplier.setBindings(undefined);
 		this.#configError = undefined;
-		this.#loadModels(credentialSessionId);
+		this.#loadModels();
 		for (const [provider, apiKeyConfig] of this.#runtimeProviderApiKeys) {
 			const resolved = this.#runtimeProviderApiKeyEnvNames.has(provider)
 				? $rotatingCredentialEnv(this.#runtimeProviderApiKeyEnvNames.get(provider)!)
@@ -3106,7 +3093,7 @@ export class ModelRegistry {
 				});
 			}
 		}
-		this.#loadModels(credentialSessionId);
+		this.#loadModels();
 		for (const [provider, apiKeyConfig] of this.#runtimeProviderApiKeys) {
 			const resolved = this.#runtimeProviderApiKeyEnvNames.has(provider)
 				? $rotatingCredentialEnv(this.#runtimeProviderApiKeyEnvNames.get(provider)!)
@@ -3127,7 +3114,7 @@ export class ModelRegistry {
 		return this.#configError;
 	}
 
-	#loadModels(credentialSessionId: string | undefined = this.#activeCredentialSessionId) {
+	#loadModels() {
 		// Load custom models from models.json first (to know which providers to override)
 		const {
 			models: customModels = [],
@@ -3140,7 +3127,7 @@ export class ModelRegistry {
 			modelBindings,
 			profiles,
 			error: configError,
-		} = this.#loadCustomModels(credentialSessionId);
+		} = this.#loadCustomModels();
 		this.#keylessProviders = keylessProviders;
 		this.#discoveryManager.setProviders(discoverableProviders);
 		this.#configuredProviderIds = new Set(configuredProviders);
@@ -3196,7 +3183,7 @@ export class ModelRegistry {
 		this.#rebuildProviderActivity();
 		this.#rebuildCanonicalIndex();
 		this.#lastStaticLoadMtime = this.#modelsConfigFile.getMtimeMs();
-		this.#lastStaticLoadEnvironmentFingerprint = this.#getStaticLoadEnvironmentFingerprint(credentialSessionId);
+		this.#lastStaticLoadEnvironmentFingerprint = this.#getStaticLoadEnvironmentFingerprint();
 		this.#lastModelPresetRegistryFingerprint = JSON.stringify({
 			revision: acceptedPresets.revision,
 			manifestSha256: acceptedPresets.manifestSha256,
@@ -3675,7 +3662,7 @@ export class ModelRegistry {
 		}
 	}
 
-	#loadCustomModels(credentialSessionId: string | undefined = this.#activeCredentialSessionId): CustomModelsResult {
+	#loadCustomModels(): CustomModelsResult {
 		this.#configuredApiKeyEnvNames.clear();
 		const loaded = this.#modelsConfigSource ?? this.#modelsConfigFile.tryLoad();
 		const { value, error, status } = loaded;
@@ -3715,9 +3702,7 @@ export class ModelRegistry {
 		const configuredProviders = new Set(Object.keys(value.providers ?? {}));
 
 		for (const [providerName, providerConfig] of providerEntries) {
-			const credentialSelectorActive =
-				!this.#stagedReloadCandidate &&
-				this.authStorage.hasEffectiveCredentialSelector(providerName, credentialSessionId);
+			const credentialPinActive = !this.#stagedReloadCandidate && this.authStorage.hasAnyCredentialPin(providerName);
 			const authMode = (providerConfig.auth ?? "apiKey") as ProviderAuthMode;
 			const isOAuth = resolveCustomModelIsOAuth(
 				(providerConfig.api as Api | undefined) ?? "openai-completions",
@@ -3732,28 +3717,28 @@ export class ModelRegistry {
 			if (providerConfig.openaiCompat?.apiKey)
 				this.#configuredApiKeyEnvNames.add(providerConfig.openaiCompat.apiKey);
 			if (providerConfig.webSearch) this.#providerWebSearchModes.set(providerName, providerConfig.webSearch);
-			const providerApiKeyConfig = credentialSelectorActive
+			const providerApiKeyConfig = credentialPinActive
 				? undefined
 				: providerConfig.apiKey
 					? resolveApiKeyConfig(providerConfig.apiKey)
 					: resolveApiKeyEnvConfig(providerConfig.apiKeyEnv);
 			const localOpenAICompat = providerConfig.openaiCompat;
 			const rotatingApiKeyEnv =
-				credentialSelectorActive || providerConfig.apiKey
+				credentialPinActive || providerConfig.apiKey
 					? undefined
 					: (providerConfig.apiKeyEnv ?? (localOpenAICompat?.apiKey ? undefined : localOpenAICompat?.apiKeyEnv));
 			if (rotatingApiKeyEnv) this.#customProviderApiKeyEnvNames.set(providerName, rotatingApiKeyEnv);
 			if (providerConfig.authHeader !== undefined)
 				this.#customProviderAuthHeaders.set(providerName, providerConfig.authHeader);
 			const localOpenAICompatApiKeyConfig =
-				localOpenAICompat && !credentialSelectorActive
+				localOpenAICompat && !credentialPinActive
 					? localOpenAICompat.apiKey
 						? resolveApiKeyConfig(localOpenAICompat.apiKey)
 						: resolveApiKeyEnvConfig(localOpenAICompat.apiKeyEnv)
 					: undefined;
 			if (localOpenAICompat) {
 				const localOpenAICompatBaseUrl = normalizeLocalOpenAICompatBaseUrl(localOpenAICompat.baseUrl);
-				const localCompatResolvedKey = credentialSelectorActive
+				const localCompatResolvedKey = credentialPinActive
 					? undefined
 					: localOpenAICompat.apiKey
 						? resolveApiKeyConfig(localOpenAICompat.apiKey)
@@ -3868,11 +3853,11 @@ export class ModelRegistry {
 				});
 			}
 
-			// Store API key for fallback resolver AND register as config override
-			// so it wins over OAuth tokens from the broker. A selector-bearing
-			// refresh omits config keys so they cannot override the selected account.
+			// Store API keys for fallback resolution and register config overrides.
+			// A pin in any session suppresses shared config keys so a reload cannot
+			// override another session's selected account.
 			if (providerConfig.apiKey || providerConfig.apiKeyEnv) {
-				const resolved = credentialSelectorActive
+				const resolved = credentialPinActive
 					? undefined
 					: providerConfig.apiKey
 						? resolveApiKeyConfig(providerConfig.apiKey)
@@ -3896,7 +3881,7 @@ export class ModelRegistry {
 		}
 
 		return {
-			models: this.#parseModels(value, credentialSessionId),
+			models: this.#parseModels(value),
 			overrides,
 			modelOverrides: allModelOverrides,
 			keylessProviders,
@@ -5997,19 +5982,14 @@ export class ModelRegistry {
 		}
 	}
 
-	#parseModels(
-		config: ModelsConfig,
-		credentialSessionId: string | undefined = this.#activeCredentialSessionId,
-	): CustomModelOverlay[] {
+	#parseModels(config: ModelsConfig): CustomModelOverlay[] {
 		const models: CustomModelOverlay[] = [];
 
 		for (const [providerName, providerConfig] of Object.entries(config.providers ?? {})) {
 			const modelDefs = providerConfig.models ?? [];
 			if (modelDefs.length === 0) continue; // Override-only, no custom models
-			const credentialSelectorActive =
-				!this.#stagedReloadCandidate &&
-				this.authStorage.hasEffectiveCredentialSelector(providerName, credentialSessionId);
-			const apiKey = credentialSelectorActive
+			const credentialPinActive = !this.#stagedReloadCandidate && this.authStorage.hasAnyCredentialPin(providerName);
+			const apiKey = credentialPinActive
 				? undefined
 				: providerConfig.apiKey
 					? resolveApiKeyConfig(providerConfig.apiKey)

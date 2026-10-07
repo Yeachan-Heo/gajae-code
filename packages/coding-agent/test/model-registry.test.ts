@@ -9930,17 +9930,13 @@ describe("ModelRegistry config reload", () => {
 					},
 				},
 			};
-			candidate = await pinnedRegistry.stageModelsConfigReload(
-				{
-					path: pinnedModelsPath,
-					text: JSON.stringify(nextConfig),
-					identity: "pinned-literal-key",
-				},
-				undefined,
-				pinnedSessionId,
-			);
+			candidate = await pinnedRegistry.stageModelsConfigReload({
+				path: pinnedModelsPath,
+				text: JSON.stringify(nextConfig),
+				identity: "pinned-literal-key",
+			});
 			expect(candidate.valid).toBe(false);
-			expect(candidate.diagnostics.errors.join(" ")).toContain("credential selector is active");
+			expect(candidate.diagnostics.errors.join(" ")).toContain("credential pin is active");
 			candidate.rollback();
 			expect(pinnedRegistry.find("pinned-provider", "pinned-model")).toBeDefined();
 			expect(await authStorage.peekApiKey("pinned-provider", { sessionId: pinnedSessionId })).toBe(
@@ -10004,29 +10000,28 @@ describe("ModelRegistry config reload", () => {
 				value: "pinned@example.com",
 			});
 
-			capturedCandidate = await pinnedRegistry.stageModelsConfigReload(
-				{ path: pinnedModelsPath, text: capturedText, identity: "captured-valid-snapshot" },
-				undefined,
-				pinnedSessionId,
-			);
+			capturedCandidate = await pinnedRegistry.stageModelsConfigReload({
+				path: pinnedModelsPath,
+				text: capturedText,
+				identity: "captured-valid-snapshot",
+			});
 			expect(capturedCandidate.diagnostics.errors.map(String)).toEqual([]);
 			expect(capturedCandidate.valid).toBe(true);
 
 			const conflictingText = JSON.stringify(conflictingConfig);
 			await Bun.write(pinnedModelsPath, conflictingText);
-			rejectedCandidate = await pinnedRegistry.stageModelsConfigReload(
-				{ path: pinnedModelsPath, text: conflictingText, identity: "newer-conflicting-snapshot" },
-				undefined,
-				pinnedSessionId,
-			);
+			rejectedCandidate = await pinnedRegistry.stageModelsConfigReload({
+				path: pinnedModelsPath,
+				text: conflictingText,
+				identity: "newer-conflicting-snapshot",
+			});
 			expect(rejectedCandidate.valid).toBe(false);
-			expect(rejectedCandidate.diagnostics.errors.join(" ")).toContain("credential selector is active");
+			expect(rejectedCandidate.diagnostics.errors.join(" ")).toContain("credential pin is active");
 			rejectedCandidate.rollback();
 
 			capturedCandidate.commit();
 			capturedCandidate.finalize();
 			expect(authStorage.hasEffectiveCredentialSelector(authProvider, pinnedSessionId)).toBe(true);
-			pinnedRegistry.setActiveCredentialSessionId(pinnedSessionId);
 			await pinnedRegistry.refreshStatic();
 
 			expect(authStorage.hasEffectiveCredentialSelector(authProvider, pinnedSessionId)).toBe(true);
@@ -10054,6 +10049,71 @@ describe("ModelRegistry config reload", () => {
 				if (value === undefined) delete Bun.env[name];
 				else Bun.env[name] = value;
 			}
+		}
+	});
+
+	test("does not install config keys over an unavailable session pin", async () => {
+		const unavailableModelsPath = path.join(tempDir, "unavailable-pinned-refresh-models.json");
+		const provider = "anthropic";
+		const sessionId = "unavailable-pinned-refresh-session";
+		const initialConfig = {
+			providers: {
+				[provider]: {
+					baseUrl: "https://unavailable-pin.example/v1",
+					api: "anthropic-messages",
+					auth: "oauth",
+					models: [{ id: "unavailable-pin-model" }],
+				},
+			},
+		};
+		let unavailableRegistry: ModelRegistry | undefined;
+		try {
+			await Bun.write(unavailableModelsPath, JSON.stringify(initialConfig));
+			await authStorage.set(provider, [
+				{
+					type: "oauth",
+					access: "unavailable-oauth-access",
+					refresh: "unavailable-oauth-refresh",
+					expires: Date.now() + 60_000,
+					email: "unavailable@example.com",
+				},
+			]);
+			authStorage.acquireCredentialScope(sessionId);
+			authStorage.setSessionCredentialSelector(sessionId, provider, {
+				kind: "email",
+				value: "unavailable@example.com",
+			});
+			authStorage.markSessionCredentialUnavailable(sessionId, provider, {
+				kind: "email",
+				value: "unavailable@example.com",
+			});
+
+			unavailableRegistry = new ModelRegistry(authStorage, unavailableModelsPath, undefined, {
+				automaticRefresh: false,
+			});
+			await Bun.write(
+				unavailableModelsPath,
+				JSON.stringify({
+					providers: {
+						[provider]: {
+							...initialConfig.providers[provider],
+							apiKey: "conflicting-config-key",
+						},
+					},
+				}),
+			);
+			await unavailableRegistry.refreshStatic();
+
+			expect(authStorage.hasConfigApiKey(provider, unavailableRegistry.getAuthStorageOwner())).toBe(false);
+			await expect(
+				authStorage.peekApiKey(provider, { sessionId, owner: unavailableRegistry.getAuthStorageOwner() }),
+			).resolves.toBeUndefined();
+			await expect(
+				authStorage.getApiKey(provider, sessionId, { owner: unavailableRegistry.getAuthStorageOwner() }),
+			).rejects.toThrow(/Selected credential.*unavailable/);
+		} finally {
+			authStorage.releaseCredentialScope(sessionId);
+			await unavailableRegistry?.dispose();
 		}
 	});
 
