@@ -3199,7 +3199,7 @@ async function seedRalplanState(
 			const repositoryBinding = publicRepositoryBinding(await captureRepositoryBinding(cwd, { displayPath: cwd }));
 			const mode: "short" | "deliberate" = resolved.deliberate ? "deliberate" : "short";
 			const payload: Record<string, unknown> = {
-				...(existing && existing.run_id === undefined
+				...(existing?.active === true && existing.run_id === undefined
 					? {
 							...(typeof existing.handoff_from === "string" ? { handoff_from: existing.handoff_from } : {}),
 							...(typeof existing.handoff_at === "string" ? { handoff_at: existing.handoff_at } : {}),

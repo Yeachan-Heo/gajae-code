@@ -33,7 +33,7 @@ For corrupt, tampered, unreadable, or stale current-session ralplan state, run `
 
 An active run cannot be reseeded implicitly. Use `gjc ralplan --resume` to continue the same task, or `gjc ralplan --new-run "<different task>"` to deliberately create a new run while preserving the previous run's artifacts and ledger. A terminal/inactive run is never silently reused as the next run.
 
-A handoff-created Ralplan state without `run_id` is only an unseeded envelope, not an active run. The first Ralplan invocation may seed it normally and must preserve its incoming handoff lineage. Use `--new-run` to replace an actual run that already has a `run_id`.
+A live, active handoff-created Ralplan state without `run_id` is only an unseeded envelope, not an active run. The first Ralplan invocation may seed it normally and must preserve its incoming handoff lineage. Terminal or inactive state is a fresh-task boundary and does not carry old handoff lineage forward. Use `--new-run` to replace an actual run that already has a `run_id`.
 
 ## Behavior
 
