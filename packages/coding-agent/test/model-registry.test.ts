@@ -10052,6 +10052,140 @@ describe("ModelRegistry config reload", () => {
 		}
 	});
 
+	test("keeps unresolved apiKeyEnv candidates safe while a session pin is active", async () => {
+		const modelsPathForTest = path.join(tempDir, "unresolved-pinned-api-key-env-models.json");
+		const apiKeyEnv = `GJC_TEST_UNRESOLVED_PINNED_KEY_${Snowflake.next()}`;
+		const previousApiKey = Bun.env[apiKeyEnv];
+		delete Bun.env[apiKeyEnv];
+		const provider = "anthropic";
+		const sessionId = "unresolved-pinned-api-key-env-session";
+		const initialConfig = {
+			providers: {
+				[provider]: {
+					baseUrl: "https://unresolved-pin.example/v1",
+					api: "anthropic-messages",
+					auth: "oauth",
+					models: [{ id: "unresolved-pin-model" }],
+				},
+			},
+		};
+		let pinnedRegistry: ModelRegistry | undefined;
+		let candidate: ModelsConfigReloadCandidate | undefined;
+		try {
+			await Bun.write(modelsPathForTest, JSON.stringify(initialConfig));
+			pinnedRegistry = new ModelRegistry(authStorage, modelsPathForTest, undefined, {
+				automaticRefresh: false,
+			});
+			await authStorage.set(provider, [
+				{
+					type: "oauth",
+					access: "unresolved-pin-oauth-access",
+					refresh: "unresolved-pin-oauth-refresh",
+					expires: Date.now() + 60_000,
+					email: "unresolved-pin@example.com",
+				},
+			]);
+			authStorage.acquireCredentialScope(sessionId);
+			authStorage.setSessionCredentialSelector(sessionId, provider, {
+				kind: "email",
+				value: "unresolved-pin@example.com",
+			});
+
+			candidate = await pinnedRegistry.stageModelsConfigReload({
+				path: modelsPathForTest,
+				text: JSON.stringify({
+					providers: {
+						[provider]: {
+							...initialConfig.providers[provider],
+							apiKeyEnv,
+						},
+					},
+				}),
+				identity: "unresolved-key-env-with-session-pin",
+			});
+
+			expect(candidate.valid).toBe(true);
+			candidate.commit();
+			candidate.finalize();
+			expect(authStorage.hasConfigApiKey(provider, pinnedRegistry.getAuthStorageOwner())).toBe(false);
+			Bun.env[apiKeyEnv] = "late-conflicting-config-key";
+			const controller = new AbortController();
+			controller.abort(new Error("stop after credential refresh check"));
+			await expect(
+				pinnedRegistry.getApiKeyForProvider(provider, sessionId, undefined, { signal: controller.signal }),
+			).rejects.toThrow(/aborted/);
+			expect(authStorage.hasConfigApiKey(provider, pinnedRegistry.getAuthStorageOwner())).toBe(false);
+			await expect(
+				authStorage.peekApiKey(provider, { sessionId, owner: pinnedRegistry.getAuthStorageOwner() }),
+			).resolves.toBe("unresolved-pin-oauth-access");
+		} finally {
+			candidate?.rollback();
+			authStorage.releaseCredentialScope(sessionId);
+			await pinnedRegistry?.dispose();
+			if (previousApiKey === undefined) delete Bun.env[apiKeyEnv];
+			else Bun.env[apiKeyEnv] = previousApiKey;
+		}
+	});
+
+	test("does not rotate an unresolved apiKeyEnv over a later session pin", async () => {
+		const modelsPathForTest = path.join(tempDir, "rotating-pinned-api-key-env-models.json");
+		const apiKeyEnv = `GJC_TEST_ROTATING_PINNED_KEY_${Snowflake.next()}`;
+		const previousApiKey = Bun.env[apiKeyEnv];
+		delete Bun.env[apiKeyEnv];
+		const provider = "anthropic";
+		const sessionId = "rotating-pinned-api-key-env-session";
+		const initialConfig = {
+			providers: {
+				[provider]: {
+					baseUrl: "https://rotating-pin.example/v1",
+					api: "anthropic-messages",
+					auth: "oauth",
+					apiKeyEnv,
+					models: [{ id: "rotating-pin-model" }],
+				},
+			},
+		};
+		let pinnedRegistry: ModelRegistry | undefined;
+		try {
+			await Bun.write(modelsPathForTest, JSON.stringify(initialConfig));
+			await authStorage.set(provider, [
+				{
+					type: "oauth",
+					access: "rotating-pin-oauth-access",
+					refresh: "rotating-pin-oauth-refresh",
+					expires: Date.now() + 60 * 60_000,
+					email: "rotating-pin@example.com",
+				},
+			]);
+			pinnedRegistry = new ModelRegistry(authStorage, modelsPathForTest, undefined, {
+				automaticRefresh: false,
+			});
+			authStorage.acquireCredentialScope(sessionId);
+			authStorage.setSessionCredentialSelector(sessionId, provider, {
+				kind: "email",
+				value: "rotating-pin@example.com",
+			});
+			expect(authStorage.hasEffectiveCredentialSelector(provider, sessionId)).toBe(true);
+			await expect(authStorage.peekApiKey(provider, { sessionId })).resolves.toBe("rotating-pin-oauth-access");
+			Bun.env[apiKeyEnv] = "late-conflicting-config-key";
+			const controller = new AbortController();
+			controller.abort(new Error("stop after credential refresh check"));
+
+			await expect(
+				pinnedRegistry.getApiKeyForProvider(provider, sessionId, undefined, { signal: controller.signal }),
+			).rejects.toThrow(/aborted/);
+			expect(authStorage.hasConfigApiKey(provider, pinnedRegistry.getAuthStorageOwner())).toBe(false);
+			await expect(
+				authStorage.peekApiKey(provider, { sessionId, owner: pinnedRegistry.getAuthStorageOwner() }),
+			).resolves.toBe("rotating-pin-oauth-access");
+		} finally {
+			authStorage.releaseCredentialScope(sessionId);
+			await pinnedRegistry?.dispose();
+			if (previousApiKey === undefined) delete Bun.env[apiKeyEnv];
+			else Bun.env[apiKeyEnv] = previousApiKey;
+		}
+	});
+
 	test("does not install config keys over an unavailable session pin", async () => {
 		const unavailableModelsPath = path.join(tempDir, "unavailable-pinned-refresh-models.json");
 		const provider = "anthropic";

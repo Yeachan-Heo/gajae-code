@@ -6845,6 +6845,7 @@ export class ModelRegistry {
 			: this.#customProviderApiKeyEnvNames.get(provider);
 		if (!envName) return;
 		const resolved = $rotatingCredentialEnv(envName);
+		if (resolved !== undefined && this.authStorage.hasAnyCredentialPin(provider)) return;
 		const previous = runtimeOwned
 			? this.#runtimeProviderResolvedApiKeys.get(provider)
 			: this.#customProviderApiKeys.get(provider);
