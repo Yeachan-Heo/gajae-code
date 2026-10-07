@@ -3047,27 +3047,6 @@ class ManagedAttemptTransaction {
 		return snapshot;
 	}
 
-	hasObservableAssistantOutput(): boolean {
-		return this.#batch.some(item => {
-			if (item.type === "assistant_event") {
-				const event = item.event;
-				if (
-					event.type === "text_delta" ||
-					event.type === "thinking_delta" ||
-					event.type === "reasoning_summary_delta" ||
-					event.type === "text_end" ||
-					event.type === "thinking_end" ||
-					event.type === "reasoning_summary_end"
-				) {
-					if (event.type === "text_end" || event.type === "thinking_end" || event.type === "reasoning_summary_end")
-						return event.content.length > 0;
-					return event.delta.length > 0;
-				}
-			}
-			return false;
-		});
-	}
-
 	discard(): void {
 		if (!this.#discarded) {
 			this.#lastStagedShape = {
