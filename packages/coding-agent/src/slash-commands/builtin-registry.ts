@@ -1050,6 +1050,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 						runtime,
 					);
 				}
+				if (targetIds.some(targetId => targetId !== "default")) runtime.session.markUserModelSelection();
 				// Preset shortcut: when the selector names a known model profile
 				// (optionally `gajae-code/`-prefixed) and the target is implicit,
 				// activate the profile immediately instead of treating the preset name
