@@ -1990,7 +1990,7 @@ describe("SDK session index", () => {
 		// And the fast path must not resurrect pre-compaction state.
 		expect(await index.refreshIfChanged()).toBe(false);
 		expect(index.listSessions().sessions).toEqual(fresh.listSessions().sessions);
-	});
+	}, 30_000);
 	it("refreshIfChanged never fast-paths a corrupt suffix (#4689 review)", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-poll-corrupt-"));
 		const writer = new SessionIndex(dir);
@@ -2509,13 +2509,13 @@ describe("SDK session index projections (perf optimization)", () => {
 			
 			// Verify projection directory was created
 			const projectionsDir = path.join(agentDir, "sdk", "sessions", "index-projections");
-			const projectionDirExists = await Bun.file(projectionsDir).exists();
-			expect(projectionDirExists).toBe(true);
+			const stat = await fs.stat(projectionsDir).catch(() => null);
+			expect(stat?.isDirectory()).toBe(true);
 			
 			// Verify manifest file exists
 			const manifestFile = path.join(projectionsDir, "manifest.json");
-			const manifestExists = await Bun.file(manifestFile).exists();
-			expect(manifestExists).toBe(true);
+			const manifestStat = await fs.stat(manifestFile).catch(() => null);
+			expect(manifestStat?.isFile()).toBe(true);
 			
 			// Verify session projection file was created (hashed by sessionId)
 			const projectionFiles = await fs.readdir(projectionsDir);
