@@ -606,9 +606,13 @@ describe("Kiro API-key content filter #6150", () => {
 		}
 	});
 
-	// P2: Partial output is preserved when an ordinary error occurs
-	test("P2: ordinary (non-refusal) error preserves already-emitted text content in error message", async () => {
-		const emittedEvents: Array<{ type: string; text?: string; message?: { errorMessage?: string } }> = [];
+	// Text stays quarantined until successful terminal metadata or clean EOF.
+	test("discards quarantined text when an ordinary error arrives before terminal metadata", async () => {
+		const emittedEvents: Array<{
+			type: string;
+			text?: string;
+			message?: { errorMessage?: string; content?: unknown[] };
+		}> = [];
 		const model = {
 			id: "test-model",
 			name: "Test",
@@ -650,20 +654,20 @@ describe("Kiro API-key content filter #6150", () => {
 			// Errors may be thrown; events are captured above
 		}
 
-		// Should have emitted text_delta events before the error
+		// Text is discarded because successful terminal metadata never arrived.
 		const textDeltaEvents = emittedEvents.filter(e => e.type === "text_delta");
-		expect(textDeltaEvents.length).toBeGreaterThan(0);
+		expect(textDeltaEvents).toHaveLength(0);
 
-		// Error event should include the partial content in the message
 		const errorEvent = emittedEvents.find(e => e.type === "error");
 		expect(errorEvent).toBeDefined();
 		expect(errorEvent?.message?.errorMessage).toContain("rate_limit_exceeded");
 		expect(errorEvent?.message?.errorMessage).toContain("Too many requests");
-		expect(errorEvent?.message?.errorMessage).toContain("Partial output");
-		expect(errorEvent?.message?.errorMessage).toContain("Hello, this is partial");
+		expect(errorEvent?.message?.errorMessage).not.toContain("Partial output");
+		expect(errorEvent?.message?.errorMessage).not.toContain("Hello, this is partial");
+		expect(errorEvent?.message?.content).toEqual([]);
 	});
 
-	test("P2: tool call partial output is preserved when ordinary error occurs", async () => {
+	test("does not include quarantined text in a tool-call error before terminal metadata", async () => {
 		const emittedEvents: Array<{ type: string; message?: { errorMessage?: string } }> = [];
 		const model = {
 			id: "test-model",
@@ -705,13 +709,13 @@ describe("Kiro API-key content filter #6150", () => {
 			// Errors may be thrown; events are captured above
 		}
 
-		// Error should be reported but should mention accumulated partial output (text and tool)
+		// The error is reported without exposing text that was never confirmed by terminal metadata.
 		const errorEvent = emittedEvents.find(e => e.type === "error");
 		expect(errorEvent).toBeDefined();
 		expect(errorEvent?.message?.errorMessage).toContain("connection_timeout");
 		expect(errorEvent?.message?.errorMessage).toContain("Connection lost");
-		// Should mention partial output was accumulated
-		expect(errorEvent?.message?.errorMessage).toContain("Partial output");
+		expect(errorEvent?.message?.errorMessage).not.toContain("Partial output");
+		expect(errorEvent?.message?.errorMessage).not.toContain("I'll read that file");
 	});
 });
 
@@ -1074,6 +1078,55 @@ describe("reader.read() error handling with pending tools #6151", () => {
 		expect(startIdx).toBeLessThan(errorIdx);
 		expect(deltaIdx).toBeLessThan(errorIdx);
 		expect(endIdx).toBeLessThan(errorIdx);
+	});
+
+	test.each([
+		"network read rejection",
+		"request abort",
+	] as const)("discards quarantined text when %s occurs before terminal metadata", async failure => {
+		const abortController = new AbortController();
+		const emittedEvents: Array<{ type: string; errorMessage?: string; content?: unknown[] }> = [];
+
+		globalThis.fetch = (async () => {
+			let pullCount = 0;
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					pullCount++;
+					if (pullCount === 1) {
+						controller.enqueue(new TextEncoder().encode(JSON.stringify({ content: "unconfirmed content" })));
+					} else if (failure === "network read rejection") {
+						controller.error(new Error("network read failed"));
+					} else {
+						abortController.abort();
+						controller.error(new DOMException("request aborted", "AbortError"));
+					}
+				},
+			});
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		const stream = streamKiroApiKey(model, context, {
+			apiKey: "ksk_test-secret",
+			region: "us-east-1",
+			signal: abortController.signal,
+		});
+		for await (const event of stream) {
+			if (event.type === "error") {
+				emittedEvents.push({
+					type: event.type,
+					errorMessage: event.error.errorMessage,
+					content: event.error.content,
+				});
+			} else {
+				emittedEvents.push({ type: event.type });
+			}
+		}
+
+		expect(emittedEvents.filter(event => event.type.startsWith("text_"))).toHaveLength(0);
+		const errorEvent = emittedEvents.find(event => event.type === "error");
+		expect(errorEvent).toBeDefined();
+		expect(errorEvent?.content).toEqual([]);
+		expect(errorEvent?.errorMessage).not.toContain("unconfirmed content");
 	});
 
 	test("does NOT emit incomplete tool when reader.read() throws mid-tool", async () => {

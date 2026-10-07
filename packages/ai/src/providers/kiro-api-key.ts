@@ -813,6 +813,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 		let toolcallIndex: number | undefined;
 		const pendingToolCalls: Array<{ input: string; toolCall: ToolCall; index: number }> = [];
 		const pendingTextEvents: AssistantMessageEvent[] = [];
+		let hasSuccessfulTerminalEvent = false;
 		const flushPendingTextEvents = () => {
 			for (const event of pendingTextEvents) {
 				if (event.type === "text_delta" && firstTokenTime === undefined) {
@@ -1109,7 +1110,6 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				buffer = remaining;
 
 				const hasRefusalEvent = events.some(e => e.type === "refusal");
-				let hasSuccessfulTerminalEvent = false;
 
 				for (const event of events) {
 					if (event.type === "content") {
@@ -1205,18 +1205,23 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						}
 					} else if (event.type === "error") {
 						if (hasRefusalEvent) continue;
-						flushPendingTextEvents();
+						if (!hasSuccessfulTerminalEvent) {
+							pendingTextEvents.length = 0;
+							output.content = [];
+						}
 						// On ordinary errors, flush pending COMPLETED tool events before the error terminal
 						// (refusals drop them, incomplete tools must not be emitted)
 						// Only emit the tool if it was explicitly completed (has stop flag)
 						if (toolComplete) addToolToBlocks();
 						emitPendingToolCalls();
 
-						// Preserve any already-accumulated text in the error context
-						const accumulatedText = blocks
-							.filter((b): b is TextContent => b.type === "text")
-							.map(b => b.text)
-							.join("");
+						// Include partial text only if successful terminal metadata already confirmed it.
+						const accumulatedText = hasSuccessfulTerminalEvent
+							? blocks
+									.filter((b): b is TextContent => b.type === "text")
+									.map(b => b.text)
+									.join("")
+							: "";
 						const errorMsg = sanitizeKiroError(`${event.data.error}: ${event.data.message ?? ""}`, apiKey);
 						const fullErrorMsg = accumulatedText ? `${errorMsg}\n\nPartial output: ${accumulatedText}` : errorMsg;
 						throw new Error(fullErrorMsg);
@@ -1273,8 +1278,11 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			// On ordinary errors (including reader.read() throws), emit only COMPLETED tool events
 			// before the error terminal (same semantics as the ordinary-error flush in the event loop).
 			// Incomplete currentTool is NOT finalized/emitted (only completed tools in pendingToolCalls flush).
-			// Refusals drop them via clearPendingToolCalls, but ordinary errors preserve content consistency.
-			flushPendingTextEvents();
+			// Discard quarantined text unless successful terminal metadata already confirmed it.
+			if (!hasSuccessfulTerminalEvent) {
+				pendingTextEvents.length = 0;
+				output.content = [];
+			}
 
 			// Emit all pending tool call events (inline of emitPendingToolCalls logic)
 			for (const { input, toolCall, index } of pendingToolCalls) {
