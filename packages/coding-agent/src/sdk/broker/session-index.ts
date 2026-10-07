@@ -2456,6 +2456,7 @@ export class SessionIndex {
 				"heartbeat checkpoint",
 				this.#agentDir,
 				async () => {
+					if (signal.aborted || performance.now() >= deadline) return 0;
 					// Contended or delayed acquisition invalidates the observation set:
 					// never trust identity evidence gathered meaningfully before the
 					// lock was held. The checkpoint is skipped this cycle (fail-closed);
