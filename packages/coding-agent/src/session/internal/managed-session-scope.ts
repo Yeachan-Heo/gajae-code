@@ -2573,6 +2573,15 @@ interface ManagedGcReceiptHistory {
 	readonly directoryInventory: ManagedGcDirectoryInventory;
 }
 
+interface ManagedGcDiscoveryScopeFence {
+	readonly scope: ManagedScope;
+	readonly scopeIdentity: { readonly dev: string; readonly ino: string };
+	readonly binding: ManagedFileSnapshot;
+	readonly internalDirectoryIdentity: { readonly dev: string; readonly ino: string };
+	readonly receiptInventory: ManagedGcDirectoryInventory | undefined;
+	readonly openReader: () => ManagedSessionDescendantStore;
+}
+
 interface MutableManagedGcReceiptHistory {
 	encodedBytes: number;
 	readonly admittedFiles: Set<string>;
@@ -3252,6 +3261,76 @@ function managedGcSameReceiptDirectoryInventory(
 	);
 }
 
+function managedGcOptionalReceiptDirectoryInventory(
+	scope: ManagedScope,
+	store: ManagedSessionDescendantStore,
+): ManagedGcDirectoryInventory | undefined {
+	try {
+		store.captureDirectoryIdentity(MANAGED_GC_RETIREMENT_RECEIPTS);
+	} catch (error) {
+		if (hasFsCode(error, "ENOENT")) return undefined;
+		throw error;
+	}
+	return managedGcReceiptDirectoryInventory(scope, store);
+}
+
+function managedGcDiscoveryScopeFence(
+	scope: ManagedScope,
+	store: ManagedSessionDescendantStore,
+	scopeIdentity: { readonly dev: string; readonly ino: string },
+	binding: ManagedFileSnapshot,
+	openReader: () => ManagedSessionDescendantStore,
+): ManagedGcDiscoveryScopeFence {
+	const internalDirectoryIdentity = store.captureDirectoryIdentity(MANAGED_INTERNAL_DIRECTORY);
+	return {
+		scope,
+		scopeIdentity,
+		binding,
+		internalDirectoryIdentity,
+		receiptInventory: managedGcOptionalReceiptDirectoryInventory(scope, store),
+		openReader,
+	};
+}
+
+function managedGcAssertDiscoveryScopeFence(fence: ManagedGcDiscoveryScopeFence): void {
+	const store = fence.openReader();
+	try {
+		store.verifyRootSecurity();
+		const currentScope = fs.lstatSync(fence.scope.directoryPath, { bigint: true });
+		if (
+			!currentScope.isDirectory() ||
+			currentScope.isSymbolicLink() ||
+			currentScope.dev.toString() !== fence.scopeIdentity.dev ||
+			currentScope.ino.toString() !== fence.scopeIdentity.ino
+		)
+			throw new Error("managed_gc_scope_authority_mismatch");
+		const currentBinding = store.readExpected(MANAGED_SESSION_BINDING_FILE);
+		if (
+			!currentBinding ||
+			!util.isDeepStrictEqual(currentBinding.identity, fence.binding.identity) ||
+			!currentBinding.bytes.equals(fence.binding.bytes)
+		)
+			throw new Error("managed_gc_scope_authority_mismatch");
+		const internalDirectoryIdentity = store.captureDirectoryIdentity(MANAGED_INTERNAL_DIRECTORY);
+		if (
+			internalDirectoryIdentity.dev !== fence.internalDirectoryIdentity.dev ||
+			internalDirectoryIdentity.ino !== fence.internalDirectoryIdentity.ino
+		)
+			throw new Error("managed_gc_scope_authority_mismatch");
+		const currentReceipts = managedGcOptionalReceiptDirectoryInventory(fence.scope, store);
+		if (
+			(fence.receiptInventory === undefined) !== (currentReceipts === undefined) ||
+			(fence.receiptInventory !== undefined &&
+				currentReceipts !== undefined &&
+				!managedGcSameReceiptDirectoryInventory(fence.receiptInventory, currentReceipts))
+		)
+			throw new Error("task_artifact_owner_continuation_authority_mismatch");
+		store.assertBound();
+	} finally {
+		store.close();
+	}
+}
+
 function assertManagedGcReceiptHistoryDirectoryUnchanged(
 	scope: ManagedScope,
 	store: ManagedSessionDescendantStore,
@@ -3353,7 +3432,10 @@ export async function readManagedGcSessionRetirementReceiptReadOnly(
 	}
 }
 
-function hasManagedGcRetirementJournalWithoutWorkspace(scope: ManagedScope): boolean {
+function hasManagedGcRetirementJournalWithoutWorkspace(
+	scope: ManagedScope,
+	onEmptyInventory?: (fence: ManagedGcDiscoveryScopeFence) => void,
+): boolean {
 	if (
 		path.resolve(scope.canonicalCwd) !== scope.canonicalCwd ||
 		scope.platform !== (process.platform === "win32" ? "win32" : "posix") ||
@@ -3426,7 +3508,34 @@ function hasManagedGcRetirementJournalWithoutWorkspace(scope: ManagedScope): boo
 			throw new Error("managed_gc_scope_authority_mismatch");
 		store.verifyRootSecurity();
 		assertRoot();
-		return before?.entries.some(entry => entry.name.startsWith(MANAGED_GC_RETIREMENT_PREFIX)) ?? false;
+		const hasJournal = before?.entries.some(entry => entry.name.startsWith(MANAGED_GC_RETIREMENT_PREFIX)) ?? false;
+		if (!hasJournal && onEmptyInventory) {
+			const internalDirectoryIdentity = store.captureDirectoryIdentity(MANAGED_INTERNAL_DIRECTORY);
+			const policy: ManagedSessionSecurityPolicy =
+				scope.platform === "win32" ? "windows-existing-verify-first" : "default";
+			onEmptyInventory({
+				scope,
+				scopeIdentity: { dev: identity.dev.toString(), ino: identity.ino.toString() },
+				binding,
+				internalDirectoryIdentity,
+				receiptInventory: before,
+				openReader: () =>
+					new ManagedSessionDescendantStore(
+						rootAuthority,
+						scope.directoryPath,
+						undefined,
+						policy,
+						scope.agentDir,
+						{
+							canonicalPath: scope.directoryPath,
+							dev: BigInt.asUintN(64, identity.dev),
+							ino: BigInt.asUintN(64, identity.ino),
+						},
+						"read-only",
+					),
+			});
+		}
+		return hasJournal;
 	} finally {
 		store.close();
 	}
@@ -3468,6 +3577,7 @@ export async function discoverManagedGcSessionRetirementReceipts(input: {
 		throw new Error("managed_gc_scope_authority_mismatch");
 	const entries = rootInventory.entries;
 	const result: Array<{ readonly scope: ManagedScope; readonly receipt: ManagedGcSessionRetirementReceipt }> = [];
+	const scopeFences: ManagedGcDiscoveryScopeFence[] = [];
 	// Fail closed for the whole root: a partial inventory cannot prove live sibling absence.
 	for (const entry of entries) {
 		if (!/^v2-[a-z2-7]{52}$/u.test(entry.name)) continue;
@@ -3497,7 +3607,12 @@ export async function discoverManagedGcSessionRetirementReceipts(input: {
 				directoryPath: scopePath,
 				platform: bindingValue.platform,
 			};
-			if (!hasManagedGcRetirementJournalWithoutWorkspace(storedScope)) continue;
+			if (
+				!hasManagedGcRetirementJournalWithoutWorkspace(storedScope, fence => {
+					scopeFences.push(fence);
+				})
+			)
+				continue;
 		}
 		if (resolved.kind !== "resolved" || resolved.scope.directoryPath !== scopePath)
 			throw new Error("managed_gc_scope_authority_mismatch");
@@ -3505,19 +3620,23 @@ export async function discoverManagedGcSessionRetirementReceipts(input: {
 		const trusted = managedGcTrustedScope(scope);
 		const store = managedGcScopeReader(scope, trusted);
 		try {
-			let directoryIdentity: { dev: string; ino: string };
-			try {
-				directoryIdentity = store.captureDirectoryIdentity(MANAGED_GC_RETIREMENT_RECEIPTS);
-			} catch (error) {
-				if (hasFsCode(error, "ENOENT")) continue;
-				throw error;
-			}
-			const receiptInventory = managedGcReceiptDirectoryInventory(scope, store);
+			const binding = store.readExpected(MANAGED_SESSION_BINDING_FILE);
 			if (
-				receiptInventory.evidence.dev !== directoryIdentity.dev ||
-				receiptInventory.evidence.ino !== directoryIdentity.ino
+				!binding ||
+				validateBindingRaw(scope, binding.bytes.toString("utf8")) ||
+				!binding.bytes.equals(bindingBytes)
 			)
-				throw new Error("task_artifact_owner_continuation_authority_mismatch");
+				throw new Error("managed_gc_scope_authority_mismatch");
+			const scopeFence = managedGcDiscoveryScopeFence(
+				scope,
+				store,
+				{ dev: trusted.identity.dev.toString(), ino: trusted.identity.ino.toString() },
+				binding,
+				() => managedGcScopeReader(scope, trusted),
+			);
+			scopeFences.push(scopeFence);
+			const receiptInventory = scopeFence.receiptInventory;
+			if (!receiptInventory) continue;
 			const groups = new Map<string, string[]>();
 			for (const item of receiptInventory.entries) {
 				if (!item.name.startsWith(MANAGED_GC_RETIREMENT_PREFIX)) continue;
@@ -3583,6 +3702,7 @@ export async function discoverManagedGcSessionRetirementReceipts(input: {
 			store.close();
 		}
 	}
+	for (const fence of scopeFences) managedGcAssertDiscoveryScopeFence(fence);
 	const rootInventoryAfter = managedGcStreamDirectoryInventory(
 		sessionsRoot,
 		entry => /^v2-[a-z2-7]{52}$/u.test(entry.name),
