@@ -136,15 +136,15 @@ describe("SDK heartbeat checkpoint failure paths (#6459)", () => {
 			await bounded(entered.promise);
 			const queued = index.checkpointLiveHeartbeats(Date.now(), second.signal);
 			second.abort();
-			expect(await bounded(queued)).toBe(0);
 			if (mode === "cancel") first.abort();
 			else {
 				expect(expire).toBeDefined();
 				elapsed = 15_000;
 				expire?.();
 			}
-			expect(await bounded(pending)).toBe(0);
 			grant.resolve();
+			expect(await bounded(pending)).toBe(0);
+			expect(await bounded(queued)).toBe(0);
 			await bounded(settled.promise);
 			expect(await fs.exists(`${log}.lock`)).toBe(false);
 			expect(index.listSessions().sessions[0]?.lastHeartbeatAt).toBeUndefined();

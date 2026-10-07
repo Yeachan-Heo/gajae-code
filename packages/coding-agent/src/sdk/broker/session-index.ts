@@ -2374,9 +2374,6 @@ export class SessionIndex {
 		if (abortSignal?.aborted || performance.now() >= deadline) return 0;
 		const budget = new AbortController();
 		const signal = abortSignal ? AbortSignal.any([abortSignal, budget.signal]) : budget.signal;
-		const expired = Promise.withResolvers<number>();
-		const onAbort = (): void => expired.resolve(0);
-		signal.addEventListener("abort", onAbort, { once: true });
 		const timer = setTimeout(() => budget.abort(), deadline - performance.now());
 		timer.unref?.();
 		const checkpoint = async (): Promise<number> => {
@@ -2389,9 +2386,11 @@ export class SessionIndex {
 			}
 		};
 		try {
-			// Release the startup waiter even if this operation is queued. Late
-			// queued/acquired work checks the same signal before it can write.
-			return await Promise.race([checkpoint(), expired.promise]);
+			// The deadline aborts queued work and prevents a late callback from
+			// entering its write section, but it cannot cancel an append/fsync that
+			// has already started. Keep the caller tied to the lock-owning operation
+			// so startup readiness never overtakes lock release.
+			return await checkpoint();
 		} catch (error) {
 			if (signal.aborted && error === signal.reason) return 0;
 			if (
@@ -2404,7 +2403,6 @@ export class SessionIndex {
 			throw error;
 		} finally {
 			clearTimeout(timer);
-			signal.removeEventListener("abort", onAbort);
 			budget.abort();
 		}
 	}

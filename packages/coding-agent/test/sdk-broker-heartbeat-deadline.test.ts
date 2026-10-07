@@ -8,6 +8,66 @@ import { brokerDiscoveryPath, readBrokerDiscovery } from "../src/sdk/broker/disc
 import { SessionIndex } from "../src/sdk/broker/session-index";
 
 describe("broker startup heartbeat budget", () => {
+	it("does not publish while the checkpoint transaction is still holding the index lock", async () => {
+		const dir = await fs.mkdtemp(path.join("/private/tmp", "gjc-startup-heartbeat-settlement-"));
+		const index = await new SessionIndex(dir).open();
+		await index.append({
+			type: "host_registered",
+			sessionId: "settlement-host",
+			locator: { cwd: dir, worktreeRoot: null, stateRoot: dir },
+			endpointGeneration: 1,
+			pid: process.pid,
+		});
+		const log = path.join(dir, "sdk", "sessions", "index.jsonl");
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const settled = Promise.withResolvers<void>();
+		const realWithFileLock = lockModule.withFileLock;
+		const locking = vi.spyOn(lockModule, "withFileLock").mockImplementation(async (file, callback, options) => {
+			if (file !== log || !options?.signal) return await realWithFileLock(file, callback, options);
+			try {
+				return await realWithFileLock(
+					file,
+					async () => {
+						entered.resolve();
+						await release.promise;
+						return await callback();
+					},
+					options,
+				);
+			} finally {
+				settled.resolve();
+			}
+		});
+		let ready = false;
+		const broker = new Broker({
+			agentDir: dir,
+			port: 0,
+			startupCheckpointDeadline: performance.now() + 50,
+			onStartupReady: () => {
+				ready = true;
+			},
+		});
+		const startup = broker.start();
+		try {
+			await entered.promise;
+			await Bun.sleep(100);
+			expect(ready).toBe(false);
+			expect(await readBrokerDiscovery(dir)).toBeNull();
+			release.resolve();
+			await startup;
+			expect(ready).toBe(true);
+			expect((await readBrokerDiscovery(dir))?.ownerId).toBe(broker.discovery?.ownerId);
+			await settled.promise;
+		} finally {
+			release.resolve();
+			await settled.promise;
+			await broker.stop();
+			locking.mockRestore();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
 	it.each([
 		20_000, 11_200,
 	])("publishes before its %i-ms fence despite repeated checkpoint contention", async startupDeadline => {
