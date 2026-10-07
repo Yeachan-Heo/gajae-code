@@ -69,6 +69,8 @@ function fakeSessionResult(): CreateAgentSessionResult {
 		setModelTemporary: async (model: typeof testModel) => {
 			activeModel = model;
 		},
+		setUnavailableModelProfile: () => {},
+		getUnavailableModelProfile: () => undefined,
 		subscribe: () => () => {},
 		dispose: async () => {},
 	} as unknown as AgentSession;
