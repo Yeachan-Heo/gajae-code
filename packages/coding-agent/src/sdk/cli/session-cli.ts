@@ -1254,6 +1254,76 @@ async function runSend(agentDir: string, sessionId: string, args: SdkSessionCliA
 	}
 }
 
+/**
+ * Fast-path for session status that bypasses SessionRouter and session index.
+ * Queries the session endpoint directly via broker endpoint discovery.
+ * Reduces latency from ~1000ms (full Router init + index replay) to ~100-200ms.
+ */
+async function runStatusDirect(
+	agentDir: string,
+	sessionId: string,
+	opRef: string,
+	args: SdkSessionCliArgs,
+): Promise<unknown> {
+	const discovery = await readSdkBrokerDiscovery(agentDir);
+	if (!discovery) {
+		throw new SdkSessionCliError("session_unavailable", "SDK broker discovery is unavailable.", 1);
+	}
+
+	const timeoutMs = args.timeoutMs ?? SESSION_REQUEST_TIMEOUT_MS;
+	const brokerClient = await SdkClient.connect(discovery.url, discovery.token, {
+		timeoutMs,
+		reconnectAttempts: 0,
+	});
+
+	try {
+		// Get endpoint info via broker (no session index needed)
+		const endpointResponse = await brokerClient.global("session.get_endpoint", { sessionId });
+		const endpointData = object(endpointResponse);
+		if (!endpointData?.url || !endpointData?.token) {
+			throw new SdkSessionCliError("session_unavailable", `Session ${sessionId} endpoint is unavailable.`, 1);
+		}
+
+		// Connect directly to session endpoint
+		const endpointClient = await SdkClient.connect(endpointData.url as string, endpointData.token as string, {
+			timeoutMs,
+			reconnectAttempts: 0,
+		});
+
+		try {
+			// Query for turn result
+			const response = await endpointClient.query("turn.result", {
+				kind: "prompt",
+				clientRef: opRef,
+			});
+
+			const status = resultObject(response) ?? {};
+			const raw = typeof status.status === "string" ? status.status : "unknown";
+			return {
+				ok: true,
+				result: {
+					version: SESSION_ROWS_VERSION,
+					operationRef: opRef,
+					status,
+					summary: { completed: raw === "terminal_ok" || raw === "failed" },
+				},
+			};
+		} finally {
+			try {
+				await endpointClient.close();
+			} catch {
+				// Ignore cleanup failures
+			}
+		}
+	} finally {
+		try {
+			await brokerClient.close();
+		} catch {
+			// Ignore cleanup failures
+		}
+	}
+}
+
 async function runStatus(
 	agentDir: string,
 	sessionId: string,
@@ -1262,20 +1332,36 @@ async function runStatus(
 ): Promise<unknown> {
 	assertClientRef(opRef);
 	await ensureBroker({ agentDir });
-	return await withRouter(agentDir, [sessionId], async router => {
-		const response = await requestQuery(router, sessionId, "turn.result", { kind: "prompt", clientRef: opRef }, args);
-		const status = resultObject(response) ?? {};
-		const raw = typeof status.status === "string" ? status.status : "unknown";
-		return {
-			ok: true,
-			result: {
-				version: SESSION_ROWS_VERSION,
-				operationRef: opRef,
-				status,
-				summary: { completed: raw === "terminal_ok" || raw === "failed" },
-			},
-		};
-	});
+	// Try fast direct-endpoint path first
+	try {
+		return await runStatusDirect(agentDir, sessionId, opRef, args);
+	} catch (error) {
+		// Fall back to full SessionRouter if direct path fails
+		if (error instanceof SdkSessionCliError || error instanceof PublicCommandFailure) {
+			throw error;
+		}
+		// Fallback to original path for compatibility
+		return await withRouter(agentDir, [sessionId], async router => {
+			const response = await requestQuery(
+				router,
+				sessionId,
+				"turn.result",
+				{ kind: "prompt", clientRef: opRef },
+				args,
+			);
+			const status = resultObject(response) ?? {};
+			const raw = typeof status.status === "string" ? status.status : "unknown";
+			return {
+				ok: true,
+				result: {
+					version: SESSION_ROWS_VERSION,
+					operationRef: opRef,
+					status,
+					summary: { completed: raw === "terminal_ok" || raw === "failed" },
+				},
+			};
+		});
+	}
 }
 
 type CheckpointExtraction = {
