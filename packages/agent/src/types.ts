@@ -235,6 +235,8 @@ export function isContinuingMidRunMaintenanceOutcome(outcome: unknown): boolean 
  * Configuration for the agent loop.
  */
 export interface AgentLoopConfig extends SimpleStreamOptions {
+	/** Session policy owns context overflow; successful empty stops remain terminal. */
+	contextOverflowManaged?: boolean;
 	model: Model;
 	/**
 	 * Supplies a fresh opaque token at each concrete managed transport invocation.
