@@ -12,6 +12,8 @@ import { SessionManager } from "@gajae-code/coding-agent/session/session-manager
 import * as tabSupervisor from "@gajae-code/coding-agent/tools/browser/tab-supervisor";
 import { TempDir } from "@gajae-code/utils";
 
+const disposeOwnedPythonKernels = pyExecutor.disposeKernelSessionsByOwner;
+
 describe("AgentSession.disposeChildSubprocesses (#698 signal teardown)", () => {
 	let tempDir: TempDir | undefined;
 	let authStorage: AuthStorage | undefined;
@@ -64,6 +66,33 @@ describe("AgentSession.disposeChildSubprocesses (#698 signal teardown)", () => {
 		// Browser and eval kernels share no owner id, but both teardowns must fire.
 		expect(disposeKernels.mock.calls[0]?.[0]).toBe(disposeVms.mock.calls[0]?.[0]);
 	});
+
+	it("aborts and joins a live Python invocation before signal teardown completes", async () => {
+		const pythonStarted = Promise.withResolvers<void>();
+		disposeKernels.mockImplementation((ownerId: string) => disposeOwnedPythonKernels(ownerId));
+		const execution = session!.executePython(
+			"import time; print('signal-ready', flush=True); time.sleep(60)",
+			chunk => {
+				if (chunk.includes("signal-ready")) pythonStarted.resolve();
+			},
+		);
+		await pythonStarted.promise;
+		let executionSettled = false;
+		void execution.then(
+			() => {
+				executionSettled = true;
+			},
+			() => {
+				executionSettled = true;
+			},
+		);
+
+		await session!.disposeChildSubprocesses();
+		const result = await execution;
+		expect(executionSettled).toBe(true);
+		expect(session!.isEvalRunning).toBe(false);
+		expect(result.cancelled).toBe(true);
+	}, 15000);
 
 	it("is idempotent across repeated calls", async () => {
 		await session!.disposeChildSubprocesses();

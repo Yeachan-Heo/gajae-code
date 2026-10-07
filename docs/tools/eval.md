@@ -24,6 +24,12 @@
   - `packages/coding-agent/src/session/streaming-output.ts` — truncation, artifacts, streamed chunks
   - `docs/python-repl.md` — Python runner and kernel internals
 
+## Invocation lifetime
+
+Local eval captures its working directory, session file, kernel namespace and existing owner identifier before backend availability checks. Its complete invocation is registered with session cleanup before asynchronous preflight, and remains tracked through output finalization. Direct SDK Python likewise captures context and registers its invocation before awaited `user_python` hooks. Cancellation or disposal is checked again before allocating output artifacts or dispatching backend execution.
+
+Signal teardown fences new eval admission, aborts active invocation controllers and joins their actual futures within the existing bounded caller deadline. Unsettled work remains tracked and is reported rather than treated as physically stopped. A held hook or availability check cannot be forcibly interrupted merely by aborting its controller. This invocation boundary does not replace string kernel-owner identity, repair same-name owner reuse, or grant transcript/audit filesystem authority.
+
 ## Inputs
 
 Tool parameters are a JSON object with a single `cells` field — an ordered array of cell objects. Each cell is a structured record; there is no `*** Cell` header parsing, no language sniffing, and no implicit single-cell fallback. Cells run in array order; state persists within each language across cells and across tool calls.
