@@ -53,11 +53,8 @@ describe("issue #6446 Windows path casing", () => {
 		vi.spyOn(fs, "lstatSync").mockImplementation((() => ({})) as unknown as typeof fs.lstatSync);
 		vi.spyOn(fs, "realpathSync").mockImplementation((() => canonicalPath) as unknown as typeof fs.realpathSync);
 		vi.spyOn(fs, "statSync").mockImplementation((() => ({ dev: 1n, ino: 2n })) as unknown as typeof fs.statSync);
-		vi.spyOn(fs, "readdirSync").mockImplementation((() => [
-			"long-session-name.jsonl",
-		]) as unknown as typeof fs.readdirSync);
 
-		expect(stablePathKey(shortPath)).toBe(stablePathKey(canonicalPath));
+		expect(stablePathKey(shortPath, false)).toBe(stablePathKey(canonicalPath, false));
 	});
 
 	it("keeps distinct existing Windows entries separate when names differ by case", () => {
@@ -70,11 +67,23 @@ describe("issue #6446 Windows path casing", () => {
 			((inputPath: string) => inputPath) as unknown as typeof fs.realpathSync,
 		);
 		vi.spyOn(fs, "statSync").mockImplementation((() => ({ dev: 1n, ino: 2n })) as unknown as typeof fs.statSync);
-		vi.spyOn(fs, "readdirSync").mockImplementation((() => [
-			"Session.jsonl",
-			"session.jsonl",
-		]) as unknown as typeof fs.readdirSync);
 
-		expect(stablePathKey(firstPath)).not.toBe(stablePathKey(secondPath));
+		expect(stablePathKey(firstPath, true)).not.toBe(stablePathKey(secondPath, true));
+	});
+
+	it("normalizes missing aliases only when the parent is case-insensitive", () => {
+		if (process.platform !== "win32") return;
+
+		const firstPath = "C:\\sessions\\Session.jsonl";
+		const secondPath = "C:\\sessions\\session.jsonl";
+		vi.spyOn(fs, "lstatSync").mockImplementation((() => {
+			const error = new Error("ENOENT");
+			(error as NodeJS.ErrnoException).code = "ENOENT";
+			throw error;
+		}) as unknown as typeof fs.lstatSync);
+		vi.spyOn(fs, "statSync").mockImplementation((() => ({ dev: 1n, ino: 2n })) as unknown as typeof fs.statSync);
+
+		expect(stablePathKey(firstPath, false)).toBe(stablePathKey(secondPath, false));
+		expect(stablePathKey(firstPath, true)).not.toBe(stablePathKey(secondPath, true));
 	});
 });

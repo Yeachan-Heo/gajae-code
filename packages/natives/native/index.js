@@ -50,6 +50,7 @@ export const diagnosticSnapshotOpen = nativeBindings.diagnosticSnapshotOpen;
 export const diffLineRuns = nativeBindings.diffLineRuns;
 export const diffLines = nativeBindings.diffLines;
 export const diffWords = nativeBindings.diffWords;
+export const directoryCaseSensitive = nativeBindings.directoryCaseSensitive;
 export const editFindMatch = nativeBindings.editFindMatch;
 export const editParseApplyPatch = nativeBindings.editParseApplyPatch;
 export const editPatchApplyText = nativeBindings.editPatchApplyText;

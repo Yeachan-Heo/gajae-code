@@ -1383,6 +1383,24 @@ pub fn canonical_existing_directory_identity(
 	platform::canonical_existing_directory_identity(&path)
 }
 
+/// Returns whether the directory's child names are case-sensitive when the
+/// platform can query that property.
+#[napi]
+pub fn directory_case_sensitive(path: String) -> Option<bool> {
+	if path.contains('\0') {
+		return None;
+	}
+	#[cfg(windows)]
+	{
+		platform::directory_case_sensitive(Path::new(&path))
+	}
+	#[cfg(not(windows))]
+	{
+		let _ = path;
+		None
+	}
+}
+
 #[cfg(unix)]
 pub(crate) fn verify_descriptor_acl_absent(
 	file: &std::fs::File,
@@ -10555,6 +10573,12 @@ mod platform {
 	unsafe extern "system" {
 		fn GetModuleHandleW(module_name: *const u16) -> *mut c_void;
 		fn GetProcAddress(module: *mut c_void, procedure_name: *const u8) -> *mut c_void;
+		fn GetFileInformationByHandleEx(
+			file: HANDLE,
+			file_information_class: i32,
+			file_information: *mut c_void,
+			buffer_size: u32,
+		) -> i32;
 	}
 
 	// Test-only fault injection for the exact-replace destination open retry:
@@ -10597,6 +10621,13 @@ mod platform {
 		DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
 
 	const FILE_RENAME_INFORMATION_CLASS: i32 = 10;
+	const FILE_CASE_SENSITIVE_INFO_CLASS: i32 = 23;
+	const FILE_CS_FLAG_CASE_SENSITIVE_DIR: u32 = 0x1;
+
+	#[repr(C)]
+	struct FileCaseSensitiveInfo {
+		flags: u32,
+	}
 
 	#[repr(C)]
 	struct HandleRenameInformation {
@@ -10726,6 +10757,32 @@ mod platform {
 			CloseHandle(handle);
 		}
 		result
+	}
+
+	pub(super) fn directory_case_sensitive(path: &Path) -> Option<bool> {
+		let handle = open_path(path, false, FILE_READ_ATTRIBUTES).ok()?;
+		let result = (|| {
+			let attributes = handle_attributes(handle).ok()?;
+			if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+				return None;
+			}
+
+			let mut information = FileCaseSensitiveInfo { flags: 0 };
+			let succeeded = unsafe {
+				GetFileInformationByHandleEx(
+					handle,
+					FILE_CASE_SENSITIVE_INFO_CLASS,
+					(&mut information as *mut FileCaseSensitiveInfo).cast(),
+					size_of::<FileCaseSensitiveInfo>() as u32,
+				)
+			};
+			if succeeded == 0 {
+				return None;
+			}
+			Some(information.flags & FILE_CS_FLAG_CASE_SENSITIVE_DIR != 0)
+		})();
+		let closed = unsafe { CloseHandle(handle) } != 0;
+		if closed { result } else { None }
 	}
 
 	#[repr(C)]

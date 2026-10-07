@@ -86,18 +86,17 @@ export function pathIdentityKey(inputPath: string): string {
 /**
  * Return a key for a path whose final file can be created or replaced after
  * registration. On Windows, use the parent directory's stable identity and the
- * final entry name rather than the file's inode. Existing case-insensitive
- * aliases share the directory's recorded entry spelling; case-sensitive
- * entries retain distinct names.
+ * final entry name rather than the file's inode. Pass the parent's case-
+ * sensitivity when available: case-insensitive directories fold names even
+ * before the entry exists, while case-sensitive directories retain exact names.
+ * Unknown directory semantics conservatively preserve the spelling.
  */
-export function stablePathKey(inputPath: string): string {
+export function stablePathKey(inputPath: string, caseSensitiveDirectory?: boolean): string {
 	const resolvedPath = path.resolve(inputPath);
 
 	let entryPath = resolvedPath;
-	let entryExists = false;
 	try {
 		fs.lstatSync(entryPath);
-		entryExists = true;
 		// Resolve existing entries before using their name so 8.3 aliases and
 		// symlinks share the canonical entry name without depending on its inode.
 		entryPath = fs.realpathSync(entryPath);
@@ -115,13 +114,7 @@ export function stablePathKey(inputPath: string): string {
 	try {
 		const parentStats = fs.statSync(parentPath, { bigint: true });
 		if (parentStats.ino === 0n) return resolvedPath;
-		const entries = fs.readdirSync(parentPath);
-		const exactEntry = entries.find(name => name === entryName);
-		if (exactEntry !== undefined) entryName = exactEntry;
-		else if (entryExists) {
-			const caseAliases = entries.filter(name => name.toLowerCase() === entryName.toLowerCase());
-			if (caseAliases.length === 1) entryName = caseAliases[0] ?? entryName;
-		}
+		if (caseSensitiveDirectory === false) entryName = entryName.toLowerCase();
 		return JSON.stringify(["win32-path-entry", parentStats.dev.toString(), parentStats.ino.toString(), entryName]);
 	} catch {}
 	return resolvedPath;

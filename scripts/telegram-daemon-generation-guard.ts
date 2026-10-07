@@ -36,6 +36,7 @@ const nativeAuthorityDeclarations = {
 	"crates/pi-natives/src/path_identity.rs": [
 		"retain_broker_publication",
 		"canonical_existing_directory_identity",
+		"directory_case_sensitive",
 		"apply_owner_only_path_security",
 		"verify_owner_only_path_security",
 		"verify_owner_only_path_security_expected",
