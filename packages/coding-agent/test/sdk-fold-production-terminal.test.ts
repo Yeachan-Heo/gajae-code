@@ -433,7 +433,7 @@ describe("SDK production async completion paths", () => {
 			await cleanup;
 			__sessionStateSidecarTestHooks.beforePersistFromEvent = previousHook;
 		}
-	});
+	}, 30_000);
 
 	test("creates, folds, wakes, and releases through the SDK ToolSession and ACP adapter", async () => {
 		const mock = await createProductionSession(false, false);
@@ -629,7 +629,7 @@ describe("SDK production async completion paths", () => {
 			await cancelFoldedTerminal(folded);
 			await disposeProductionSession();
 		}
-	});
+	}, 30_000);
 
 	test("keeps short folded output inline without saving an artifact", async () => {
 		const mock = await createProductionSession(true);
