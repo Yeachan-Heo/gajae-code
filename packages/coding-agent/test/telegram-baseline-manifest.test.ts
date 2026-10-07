@@ -71,14 +71,14 @@ async function fakeBun(directory: string): Promise<{ binDirectory: string; log: 
 		const source = path.join(directory, "fake-bun.ts");
 		await Bun.write(
 			source,
-			'import { appendFile } from "node:fs/promises";\n\nconst args = process.argv.slice(2);\nawait appendFile(process.env.GJC_MANIFEST_RECEIPT_LOG!, args.join(" ") + "\\n");\nif (args.includes("fail-command.test.ts")) {\n\tconsole.log("1 fail");\n\tprocess.exit(1);\n}\nconsole.log("1 pass");\n',
+			'import { appendFile } from "node:fs/promises";\n\nconst args = process.argv.slice(2);\nawait appendFile(process.env.GJC_MANIFEST_RECEIPT_LOG!, args.join(" ") + "\\n");\nconst trace = process.env.GJC_MANIFEST_RECEIPT_TRACE;\nif (trace) {\n\tawait appendFile(trace, "start " + args.join(" ") + "\\n");\n\tawait Bun.sleep(50);\n\tawait appendFile(trace, "finish " + args.join(" ") + "\\n");\n}\nif (args.includes("fail-command.test.ts")) {\n\tconsole.log("1 fail");\n\tprocess.exit(1);\n}\nconsole.log("1 pass");\n',
 		);
 		const build = Bun.spawnSync([process.execPath, "build", source, "--compile", "--outfile", command]);
 		if (build.exitCode !== 0) throw new Error(`failed to compile fake Bun: ${build.stderr?.toString() ?? ""}`);
 	} else {
 		await Bun.write(
 			command,
-			'#!/bin/sh\nprintf "%s\\n" "$*" >> "$GJC_MANIFEST_RECEIPT_LOG"\ncase "$*" in\n*fail-command.test.ts*) echo "1 fail"; exit 1 ;;\n*) echo "1 pass" ;;\nesac\n',
+			'#!/bin/sh\nprintf "%s\\n" "$*" >> "$GJC_MANIFEST_RECEIPT_LOG"\nif [ -n "$GJC_MANIFEST_RECEIPT_TRACE" ]; then printf "start %s\\n" "$*" >> "$GJC_MANIFEST_RECEIPT_TRACE"; sleep 0.05; printf "finish %s\\n" "$*" >> "$GJC_MANIFEST_RECEIPT_TRACE"; fi\ncase "$*" in\n*fail-command.test.ts*) echo "1 fail"; exit 1 ;;\n*) echo "1 pass" ;;\nesac\n',
 		);
 		await fs.chmod(command, 0o755);
 	}
@@ -303,6 +303,40 @@ describe("test manifest runner", () => {
 		expect(output(result)).toContain(
 			`Manifest required file is not covered by executable commands: ${daemonCliFile}`,
 		);
+	});
+	it("honors a separate command receipt concurrency limit", async () => {
+		const directory = await tempDir();
+		const manifest: BaselineManifest = {
+			version: 1,
+			commands: ["first", "second", "third"].map(name => ({ argv: ["bun", "test", `${name}.test.ts`] })),
+			excluded: [],
+		};
+		const manifestPath = await writeManifest(directory, manifest);
+		const fake = await fakeBun(directory);
+		const trace = path.join(directory, "receipt-trace.log");
+		const result = run(runner, [manifestPath], {
+			GJC_MANIFEST_RECEIPT_LOG: fake.log,
+			GJC_MANIFEST_RECEIPT_TRACE: trace,
+			GJC_MANIFEST_COMMAND_RECEIPT_CONCURRENCY: "1",
+			GJC_MANIFEST_RECEIPT_CONCURRENCY: "8",
+			PATH: `${fake.binDirectory}${path.delimiter}${process.env.PATH ?? ""}`,
+		});
+
+		expect(result.exitCode, output(result)).toBe(0);
+		const events = (await Bun.file(trace).text()).trim().split("\n");
+		let active = 0;
+		let maximumActive = 0;
+		for (const event of events) {
+			if (event.startsWith("start ")) {
+				active++;
+				maximumActive = Math.max(maximumActive, active);
+			} else {
+				expect(event.startsWith("finish ")).toBe(true);
+				active--;
+			}
+		}
+		expect(maximumActive).toBe(1);
+		expect(active).toBe(0);
 	});
 	it("does not run parity rows after a behavioral command fails", async () => {
 		const directory = await tempDir();
