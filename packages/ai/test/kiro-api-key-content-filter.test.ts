@@ -1266,7 +1266,8 @@ describe("P1 Regression: incomplete tool emission at tool-ID rollover", () => {
 	});
 
 	test("P1: incomplete tool is not emitted when tool ID changes", async () => {
-		const emittedEventTypes: string[] = [];
+		const toolcallEndIds: string[] = [];
+		let toolcallStarts = 0;
 
 		globalThis.fetch = (async () => {
 			// First tool incomplete (no stop), then new tool ID changes
@@ -1289,27 +1290,22 @@ describe("P1 Regression: incomplete tool emission at tool-ID rollover", () => {
 		try {
 			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
 			for await (const event of stream) {
-				emittedEventTypes.push(event.type);
+				if (event.type === "toolcall_start") toolcallStarts++;
+				if (event.type === "toolcall_end") toolcallEndIds.push(event.toolCall.id);
 			}
 		} catch {
 			// Errors captured
 		}
 
-		// Count toolcall events
-		const tool1Start = emittedEventTypes.indexOf("toolcall_start");
-		const tool1End = emittedEventTypes.indexOf("toolcall_end");
-
 		// tool-1 was incomplete, so should NOT be emitted (both start AND end should be absent)
 		// tool-2 was complete (stop: true), so SHOULD be emitted
-		const toolcallStarts = emittedEventTypes.filter(e => e === "toolcall_start").length;
-		const toolcallEnds = emittedEventTypes.filter(e => e === "toolcall_end").length;
-
-		expect(toolcallStarts).toBe(1); // Only tool-2 should have toolcall_start
-		expect(toolcallEnds).toBe(1); // Only tool-2 should have toolcall_end
+		expect(toolcallStarts).toBe(1);
+		expect(toolcallEndIds).toEqual(["tool-2"]);
 	});
 
-	test("P1: incomplete tool is not emitted at stream end", async () => {
+	test("P1: tool without stop is implicitly completed at clean stream end", async () => {
 		const emittedEventTypes: string[] = [];
+		const toolcallEndIds: string[] = [];
 
 		globalThis.fetch = (async () => {
 			// Tool without stop flag at stream end
@@ -1331,22 +1327,16 @@ describe("P1 Regression: incomplete tool emission at tool-ID rollover", () => {
 			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
 			for await (const event of stream) {
 				emittedEventTypes.push(event.type);
+				if (event.type === "toolcall_end") toolcallEndIds.push(event.toolCall.id);
 			}
 		} catch {
 			// Errors captured
 		}
 
-		// With the P1 fix: incomplete tool should NOT emit toolcall_start/end
-		// (Without fix, incomplete tool would be forced into blocks at stream end)
-		const toolcallStart = emittedEventTypes.find(e => e === "toolcall_start");
-		const toolcallEnd = emittedEventTypes.find(e => e === "toolcall_end");
-		const done = emittedEventTypes.find(e => e === "done");
-
-		// Stream completes normally with done event
-		expect(done).toBeDefined();
-		// But incomplete tool is NOT emitted
-		// NOTE: After adjustment, tools at stream end ARE emitted even without explicit stop
-		// So this test should expect the tool to exist. Removing this assertion as behavior changed.
+		expect(emittedEventTypes).toContain("done");
+		expect(emittedEventTypes.filter(type => type === "toolcall_start")).toHaveLength(1);
+		expect(emittedEventTypes.filter(type => type === "toolcall_end")).toHaveLength(1);
+		expect(toolcallEndIds).toEqual(["tool-incomplete"]);
 	});
 });
 
@@ -1387,11 +1377,53 @@ describe("P1 Regression: content leaking across batches", () => {
 		const errorIndex = emittedEvents.findIndex(e => e.type === "error");
 		expect(errorIndex).toBeGreaterThan(-1);
 
-		const textBeforeError = emittedEvents
-			.slice(0, errorIndex)
-			.filter(e => e.type === "text_delta" || e.type === "text_start");
-
 		// Content should be suppressed because refusal was in same batch
-		expect(textBeforeError).toHaveLength(0);
+		expect(emittedEvents.filter(event => event.type.startsWith("text_")).length).toBe(0);
+	});
+
+	test("P1: content is suppressed when refusal arrives in a later response chunk", async () => {
+		const emittedEvents: Array<{ type: string; errorMessage?: string }> = [];
+
+		globalThis.fetch = (async () => {
+			const encoder = new TextEncoder();
+			const body = new ReadableStream<Uint8Array>({
+				start(controller) {
+					controller.enqueue(encoder.encode(JSON.stringify({ content: "This is harmful content" })));
+					controller.enqueue(
+						encoder.encode(
+							JSON.stringify({
+								stopReason: "CONTENT_FILTERED",
+								stopDetails: {
+									refusal: {
+										category: "VIOLENCE",
+										explanation: "Violent content not allowed",
+									},
+								},
+							}),
+						),
+					);
+					controller.close();
+				},
+			});
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEvents.push({
+					type: event.type,
+					errorMessage: event.type === "error" ? event.error.errorMessage : undefined,
+				});
+			}
+		} catch {
+			// Errors captured
+		}
+
+		const errorIndex = emittedEvents.findIndex(event => event.type === "error");
+		expect(errorIndex).toBeGreaterThan(-1);
+		expect(emittedEvents[errorIndex]?.errorMessage).toContain("Kiro refused the request (VIOLENCE)");
+		expect(emittedEvents[errorIndex]?.errorMessage).toContain("Violent content not allowed");
+		expect(emittedEvents.filter(event => event.type.startsWith("text_")).length).toBe(0);
 	});
 });
