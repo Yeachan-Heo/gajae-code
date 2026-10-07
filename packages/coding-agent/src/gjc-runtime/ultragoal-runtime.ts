@@ -1275,12 +1275,24 @@ export async function createUltragoalPlan(input: {
 	return plan;
 }
 
-function chooseNextGoal(plan: UltragoalPlan, retryFailed: boolean): UltragoalGoal | undefined {
+/**
+ * Scheduler order shared with read-only projections: active, then pending, then failed
+ * only when the caller explicitly opts into retrying failed goals. Blocked,
+ * review_blocked, complete, and superseded goals are never schedulable.
+ */
+export function selectNextSchedulableGoal<T extends { status: UltragoalGoalStatus }>(
+	goals: readonly T[],
+	retryFailed: boolean,
+): T | undefined {
 	return (
-		plan.goals.find(goal => goal.status === "active") ??
-		plan.goals.find(goal => goal.status === "pending") ??
-		(retryFailed ? plan.goals.find(goal => goal.status === "failed") : undefined)
+		goals.find(goal => goal.status === "active") ??
+		goals.find(goal => goal.status === "pending") ??
+		(retryFailed ? goals.find(goal => goal.status === "failed") : undefined)
 	);
+}
+
+function chooseNextGoal(plan: UltragoalPlan, retryFailed: boolean): UltragoalGoal | undefined {
+	return selectNextSchedulableGoal(plan.goals, retryFailed);
 }
 export interface UltragoalRunCompletionState {
 	requiredGoals: UltragoalGoal[];

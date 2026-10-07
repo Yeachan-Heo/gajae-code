@@ -219,6 +219,7 @@ import {
 	type FoldReason,
 	type JobFoldEvent,
 	type OwnerSubagentShutdownLease,
+	type SubagentLifecycle,
 } from "../async";
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
@@ -6810,6 +6811,17 @@ export class AgentSession {
 		}));
 		const delivery = manager.getDeliveryState(ownerFilter);
 		return { running, recent, delivery };
+	}
+
+	/**
+	 * Lifecycle status of every subagent owned by this session, read from the
+	 * manager's stable control-plane records (they outlive AsyncJob eviction).
+	 */
+	getSubagentLifecycleStatuses(): SubagentLifecycle[] {
+		const manager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
+		if (!manager) return [];
+		const ownerFilter = this.#agentId ? { ownerId: this.#agentId } : undefined;
+		return manager.getSubagentRecords(ownerFilter).map(record => record.status);
 	}
 
 	/**
@@ -23448,6 +23460,7 @@ export class AgentSession {
 		if (message.errorKind === "local_snapshot_failure") return "local_snapshot";
 		if (message.errorKind === "local_buffer_overflow") return "local_buffer_overflow";
 		if (this.#isTypedFirstEventTimeout(message)) return "first_event_timeout";
+		if (message.errorKind === "local_empty_response") return "empty_response";
 		if (this.#isTypedEmptyResponse(message)) return "empty_response";
 		if (this.#isCodexCredentialModelUnavailable(message)) {
 			return this.#canRotateCodexCredential(message) ? "unknown" : "terminal";
@@ -24038,6 +24051,10 @@ export class AgentSession {
 		if (classification === "transient" || classification === "first_event_timeout") {
 			return { class: "server" };
 		}
+		// A locally promoted empty response is retryable only when the managed
+		// attempt stayed clean; authorize the configured fallback chain without
+		// fabricating provider transport facts for the runtime-owned failure.
+		if (classification === "empty_response") return { class: "server" };
 		if (classification === "unknown") return { class: "unknown" };
 		return undefined;
 	}

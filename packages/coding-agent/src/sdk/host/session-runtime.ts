@@ -2468,6 +2468,9 @@ function createQuerySurface(
 		getExtensions: () => ctx.getExtensions(),
 		getArtifactRange: (artifactId, offset, length) => ctx.getArtifactRange?.(artifactId, offset, length),
 		getJobs: () => ctx.getJobs(),
+		...(typeof (ctx as Partial<ExtensionContext>).getProjectProgress === "function"
+			? { getProjectProgress: () => ctx.getProjectProgress!() }
+			: {}),
 		getPromptStatus: (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
 			reconciliation.lookup("prompt", selector),
 		getSkillInvokeStatus: (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
@@ -2740,6 +2743,11 @@ export function providerFailureFromAgentEnd(
 			return undefined;
 		}
 		if (errorKind === "local_snapshot_failure" || errorKind === "local_buffer_overflow") return undefined;
+		if (errorKind === "local_empty_response")
+			return {
+				code: "empty_response",
+				message: PROMPT_FAILURE_MESSAGE_SUBMISSION,
+			};
 		let errorMessage: unknown;
 		try {
 			errorMessage = assistant.errorMessage;

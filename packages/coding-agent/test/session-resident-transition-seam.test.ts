@@ -1060,7 +1060,10 @@ describe("resident-store transition seam", () => {
 		expect(setSessionFileEnd).toBeGreaterThan(setSessionFileStart);
 
 		const residentStoreAssignments = [...source.matchAll(/this\.#residentTextBlobStore\s*=(?!=)/g)];
-		expect(residentStoreAssignments).toHaveLength(2);
+		// Three audited swap sites: the commit seam, the dedicated cold-rollback
+		// candidate adoption seam (`#installRollbackCandidateResidentStore`), and the
+		// release seam. Every one of them must sit inside the store-seam windows below.
+		expect(residentStoreAssignments).toHaveLength(3);
 		for (const assignment of residentStoreAssignments) {
 			const offset = assignment.index!;
 			expect(

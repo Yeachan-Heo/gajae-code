@@ -344,7 +344,7 @@ jobs:
         with:
           shared-key: windows-dev-doctor-win32-x64
           cache-on-failure: true
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' || github.event_name == 'pull_request' }}
           cache-workspace-crates: true
       - name: Cache bun dependencies
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
@@ -696,7 +696,7 @@ jobs:
         with:
           shared-key: dev-affected-native-linux-x64
           cache-on-failure: true
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' || github.event_name == 'pull_request' }}
           cache-workspace-crates: true
       - name: Cache bun dependencies
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
@@ -765,7 +765,7 @@ jobs:
         with:
           shared-key: dev-affected-darwin-arm64-tab-worker
           cache-on-failure: true
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' || github.event_name == 'pull_request' }}
           cache-workspace-crates: true
       - name: Cache bun dependencies
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
@@ -869,7 +869,7 @@ jobs:
         with:
           shared-key: dev-affected-rust-linux-x64
           cache-on-failure: true
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' || github.event_name == 'pull_request' }}
           cache-workspace-crates: true
       - name: Cache bun dependencies
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
@@ -1135,7 +1135,7 @@ jobs:
         with:
           shared-key: dev-state-gates-native-linux-x64
           cache-on-failure: true
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' || github.event_name == 'pull_request' }}
           cache-workspace-crates: true
       - name: Restore bun dependency cache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4

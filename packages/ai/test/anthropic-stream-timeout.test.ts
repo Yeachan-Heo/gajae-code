@@ -237,6 +237,7 @@ describe("anthropic first-event timeouts", () => {
 		expect(attempt).toBe(2);
 		expect(result.stopReason).toBe("error");
 		expect(result.transportFailure?.providerCode).toBe("stream_first_event_timeout");
+		expect(result.transportFailure?.providerCode).not.toBe("empty_response");
 		expect(result.transportFailure?.retryMaxAttempts).toBe(1);
 	});
 
