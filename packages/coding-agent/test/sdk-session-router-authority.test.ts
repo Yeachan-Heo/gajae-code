@@ -1281,6 +1281,129 @@ describe("SessionRouter dispatch authority", () => {
 		}
 	});
 
+	for (const preparation of ["proof", "retirement"] as const) {
+		for (const completion of ["resolution", "rejection", "teardown"] as const) {
+			test(`bounds initializing publication ${preparation} by the absolute deadline and never dispatches after late ${completion}`, async () => {
+				const entered = Promise.withResolvers<void>();
+				const release = Promise.withResolvers<void>();
+				const settled = Promise.withResolvers<unknown>();
+				const deadlines = manualTimeouts();
+				let now = Date.now();
+				const deadline = now + 100;
+				let preparing = false;
+				let fixture: RouterFixture;
+				let timerSpy: { mockRestore(): void } | undefined;
+				let clearTimerSpy: { mockRestore(): void } | undefined;
+				const clock = spyOn(Date, "now").mockImplementation(() => now);
+				fixture = await routerFixture({
+					start: false,
+					onIndexRefresh: async () => {
+						if (!preparing) return;
+						if (preparation === "retirement" && fixture.authority.indexed) {
+							fixture.authority.indexed = false;
+							return;
+						}
+						entered.resolve();
+						await release.promise;
+					},
+					onAttachmentReady: async attachment => {
+						preparing = true;
+						timerSpy = spyOn(globalThis, "setTimeout").mockImplementation(deadlines.setTimeout);
+						clearTimerSpy = spyOn(globalThis, "clearTimeout").mockImplementation(deadlines.clearTimeout);
+						try {
+							const response = await fixture.router.request(
+								attachment.sessionId,
+								{ type: "register_provider", capability: "ui" },
+								attachment.generation,
+								attachment,
+								{ deadline },
+							);
+							settled.resolve(response);
+						} catch (error) {
+							settled.resolve(error);
+						} finally {
+							preparing = false;
+							timerSpy?.mockRestore();
+							clearTimerSpy?.mockRestore();
+						}
+					},
+				});
+				const starting = fixture.router.start();
+				try {
+					await entered.promise;
+					expect(fixture.clients[0]?.requests).toEqual([]);
+					now = deadline;
+					if (deadlines.pending() > 0) deadlines.fire();
+					const outcome = await Promise.race([settled.promise, Bun.sleep(100).then(() => "still pending")]);
+					expect(outcome).toBeInstanceOf(SessionRouterError);
+					expect(outcome).toMatchObject({ phase: "pre_send" });
+					expect(deadlines.pending()).toBe(0);
+					const stopping = completion === "teardown" ? fixture.router.stop() : undefined;
+					if (completion === "rejection") release.reject(new Error("late preparation rejection"));
+					else release.resolve();
+					await starting;
+					await stopping;
+					expect(fixture.clients[0]?.requests.filter(frame => frame.type === "register_provider")).toEqual([]);
+				} finally {
+					release.resolve();
+					await starting;
+					timerSpy?.mockRestore();
+					clearTimerSpy?.mockRestore();
+					clock.mockRestore();
+					await fixture.router.stop();
+				}
+			});
+		}
+
+		test(`initializing publication ${preparation} throws without dispatch or deadline leakage`, async () => {
+			const failure = new Error("publication preparation failed");
+			const deadlines = manualTimeouts();
+			let preparing = false;
+			let outcome: unknown;
+			let fixture: RouterFixture;
+			fixture = await routerFixture({
+				start: false,
+				onIndexRefresh: async () => {
+					if (!preparing) return;
+					if (preparation === "retirement" && fixture.authority.indexed) {
+						fixture.authority.indexed = false;
+						return;
+					}
+					throw failure;
+				},
+				onAttachmentReady: async attachment => {
+					preparing = true;
+					const timer = spyOn(globalThis, "setTimeout").mockImplementation(deadlines.setTimeout);
+					const clearTimer = spyOn(globalThis, "clearTimeout").mockImplementation(deadlines.clearTimeout);
+					try {
+						await fixture.router.request(
+							attachment.sessionId,
+							{ type: "register_provider", capability: "ui" },
+							attachment.generation,
+							attachment,
+							{ deadline: Date.now() + 1_000 },
+						);
+					} catch (error) {
+						outcome = error;
+					} finally {
+						preparing = false;
+						timer.mockRestore();
+						clearTimer.mockRestore();
+					}
+				},
+			});
+			try {
+				await fixture.router.start();
+				if (preparation === "proof") expect(outcome).toBe(failure);
+				else expect(outcome).toMatchObject({ phase: "pre_send" });
+				expect(deadlines.pending()).toBe(0);
+				expect(fixture.clients[0]?.requests.filter(frame => frame.type === "register_provider")).toEqual([]);
+			} finally {
+				await fixture.router.stop();
+			}
+		});
+	}
+
 	test("rejects an exact publication-time request after endpoint replacement", async () => {
 		let router: SessionRouter | undefined;
 		let endpointFile = "";
@@ -3230,11 +3353,13 @@ describe("SessionRouter dispatch authority", () => {
 	});
 	test("expires during connect before dispatch without closing the shared transport", async () => {
 		let connectCalls = 0;
+		let connectDeadline: number | undefined;
 		const entered = Promise.withResolvers<void>();
 		const reconnect = Promise.withResolvers<void>();
-		const connect = async (): Promise<void> => {
+		const connect = async (options?: { deadline?: number }): Promise<void> => {
 			connectCalls++;
 			if (connectCalls > 1) {
+				connectDeadline = options?.deadline;
 				entered.resolve();
 				await reconnect.promise;
 			}
@@ -3247,6 +3372,7 @@ describe("SessionRouter dispatch authority", () => {
 				deadline: now + 100,
 			});
 			await entered.promise;
+			expect(connectDeadline).toBe(now + 100);
 			now += 100;
 			reconnect.resolve();
 			await expect(request).rejects.toMatchObject({ phase: "pre_send" });
@@ -3284,7 +3410,7 @@ describe("SessionRouter dispatch authority", () => {
 			await fixture.router.stop();
 		}
 	});
-	test("classifies a response that arrives after dispatch deadline as ambiguous", async () => {
+	test("classifies a response that arrives after dispatch deadline as uncertain after send", async () => {
 		const entered = Promise.withResolvers<void>();
 		const acknowledgement = Promise.withResolvers<void>();
 		const fixture = await routerFixture({
@@ -3309,9 +3435,16 @@ describe("SessionRouter dispatch authority", () => {
 				},
 			);
 			await entered.promise;
+			const client = fixture.clients[0]!;
+			const requestIndex = client.requests.findIndex(operation => operation.type === "deadline-late-response");
+			expect(client.requestOptions[requestIndex]).toMatchObject({
+				deadline: now + 100,
+				timeoutMs: 100,
+				connectedOnly: true,
+			});
 			now += 100;
 			acknowledgement.resolve();
-			await expect(request).rejects.toMatchObject({ phase: "ambiguous" });
+			await expect(request).rejects.toMatchObject({ code: "uncertain_after_send" });
 			expect(
 				fixture.clients[0]?.requests.filter(operation => operation.type === "deadline-late-response"),
 			).toHaveLength(1);
@@ -3360,3 +3493,73 @@ describe("SessionRouter dispatch authority", () => {
 		});
 	}
 });
+
+for (const outcome of ["success", "throw", "cancel", "teardown"] as const) {
+	test(`Router absolute deadline handles late ${outcome}`, async () => {
+		let now = Date.now();
+		const deadline = now + 100;
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		let fixture: RouterFixture | undefined;
+		try {
+			fixture = await routerFixture({
+				onRequest: async frame => {
+					if (frame.type !== "register_provider") return { events: [] };
+					now = deadline;
+					if (outcome === "throw") throw new Error("late transport error");
+					if (outcome === "cancel") throw new DOMException("late cancellation", "AbortError");
+					if (outcome === "teardown") await fixture?.router.stop();
+					return { ok: true, result: { leaseId: "late-lease" } };
+				},
+			});
+			const request = fixture.router.request(
+				fixture.sessionId,
+				{
+					type: "register_provider",
+					id: "deadline-registration",
+					capability: "permission",
+					idempotencyKey: "registration-key",
+				},
+				1,
+				undefined,
+				{ deadline },
+			);
+			if (outcome === "throw") await expect(request).rejects.toThrow("late transport error");
+			else if (outcome === "cancel") await expect(request).rejects.toBeInstanceOf(DOMException);
+			else
+				await expect(request).rejects.toMatchObject({
+					code: "uncertain_after_send",
+					details: { id: "deadline-registration", idempotencyKey: "registration-key" },
+				});
+			expect(fixture.clients[0]?.requests.filter(frame => frame.type === "register_provider")).toHaveLength(1);
+		} finally {
+			clock.mockRestore();
+			await fixture?.router.stop();
+		}
+	});
+}
+
+for (const outcome of ["timeout", "throw", "cancel"] as const) {
+	test(`Router transport preparation ${outcome} never dispatches registration`, async () => {
+		const fixture = await routerFixture();
+		let now = Date.now();
+		const deadline = now + 100;
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		const failure =
+			outcome === "cancel" ? new DOMException("connect cancelled", "AbortError") : new Error("connect failed");
+		fixture.clients[0]!.client.connect = async () => {
+			if (outcome === "timeout") now = deadline;
+			else throw failure;
+		};
+		try {
+			const request = fixture.router.request(fixture.sessionId, { type: "register_provider" }, 1, undefined, {
+				deadline,
+			});
+			if (outcome === "timeout") await expect(request).rejects.toMatchObject({ phase: "pre_send" });
+			else await expect(request).rejects.toBe(failure);
+			expect(fixture.clients[0]?.requests.filter(frame => frame.type === "register_provider")).toHaveLength(0);
+		} finally {
+			clock.mockRestore();
+			await fixture.router.stop();
+		}
+	});
+}

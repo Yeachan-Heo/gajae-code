@@ -1,7 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { logger } from "@gajae-code/utils";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
-import { DEFAULT_SDK_REQUEST_TIMEOUT_MS, type SdkClient, SdkClientError } from "../client";
+import {
+	DEFAULT_SDK_REQUEST_TIMEOUT_MS,
+	type SdkClient,
+	SdkClientError,
+	type SdkDispatchContext,
+	type SdkSentRecord,
+} from "../client";
 import type { AbortScope } from "../host/control/operations";
 import { assertReverseResponseFrame, ReverseLeaseError } from "../host/reverse-leases";
 import {
@@ -43,8 +49,9 @@ export const PROVIDER_ACTIVATION_MAX_ATTEMPTS = 8;
  * with this error — which names the contended capability — with room to spare before the
  * ACP prompt watchdog reports the same stall as undifferentiated silence.
  *
- * One absolute deadline covers Router preparation, reconnect, and every registration;
- * late acknowledgements cannot publish provider readiness.
+ * One absolute deadline covers Router preparation, reconnect, and every registration.
+ * Expiry before dispatch refuses the request; expiry after dispatch preserves uncertainty
+ * because the deadline cannot undo a registration the host may already have committed.
  */
 export const PROVIDER_ACTIVATION_BUDGET_MS = Math.floor(ACP_PROMPT_INACTIVITY_TIMEOUT_MS / 3);
 
@@ -142,6 +149,7 @@ const ACP_MCP_PRESERVED_LAUNCH_CODES = new Set([
 	"readiness_timeout",
 	"spawn_failed",
 	"worktree_in_use",
+	"uncertain_after_send",
 ]);
 
 /**
@@ -159,7 +167,7 @@ export function acpMcpLaunchFailure(error: unknown, mcpServers: SessionLifecycle
 	if (
 		mcpServers.length === 0 ||
 		(code !== undefined && ACP_MCP_PRESERVED_LAUNCH_CODES.has(code)) ||
-		(error instanceof SdkClientError && (error.transport || error.code === "uncertain_after_send"))
+		(error instanceof SdkClientError && error.transport)
 	)
 		return error;
 	const names = mcpServers
@@ -598,27 +606,67 @@ export class AcpSdkAdapter {
 		// request that named no readiness budget is queued for the default one, so it
 		// needs the same extension rather than the client's generic request deadline.
 		const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
-		const deadline = Date.now() + (timeoutMs ?? DEFAULT_SDK_REQUEST_TIMEOUT_MS);
-		let lastError: unknown;
-		for (let attempt = 0; attempt < 3; attempt++) {
-			const remainingMs = deadline - Date.now();
-			const attemptTimeoutMs = attempt === 0 ? timeoutMs : remainingMs;
-			if (lastError !== undefined && (remainingMs <= 0 || this.#closed)) throw lastError;
+		const budgetMs = timeoutMs ?? DEFAULT_SDK_REQUEST_TIMEOUT_MS;
+		const deadline = Date.now() + budgetMs;
+		let sent = false;
+		let sentRecord: SdkSentRecord | undefined;
+		let uncertainty: SdkClientError | undefined;
+		const deadlineFailure = () =>
+			uncertainty ??
+			(sent
+				? new SdkClientError(
+						"uncertain_after_send",
+						"ACP lifecycle deadline elapsed after dispatch.",
+						sentRecord ?? {
+							operation,
+							idempotencyKey,
+						},
+					)
+				: new SdkClientError("timeout", "ACP lifecycle deadline elapsed before dispatch.", undefined, undefined, {
+						transport: true,
+					}));
+		const options = {
+			idempotencyKey,
+			deadline,
+			// SdkClient reads this after connecting, so reconnect and replay spend the same allowance.
+			get timeoutMs() {
+				return timeoutMs === undefined ? undefined : Math.max(0, deadline - Date.now());
+			},
+			beforeDispatch: () => {
+				if (Date.now() >= deadline) throw deadlineFailure();
+			},
+			onDispatch: (context: SdkDispatchContext) => {
+				sent = true;
+				if (typeof context.frame.id === "string") sentRecord = client.getSentRecord(context.frame.id);
+			},
+		};
+		const expired = Promise.withResolvers<never>();
+		const timer = setTimeout(() => expired.reject(deadlineFailure()), budgetMs);
+		const recover = async () => {
 			try {
-				return await client.global(operation, input, {
-					idempotencyKey,
-					deadline,
-					...(attemptTimeoutMs === undefined ? {} : { timeoutMs: attemptTimeoutMs }),
-				});
-			} catch (error) {
-				// A replay that never reaches the wire cannot resolve the original committed
-				// operation. Keep its sent record for the session owner's reconciliation.
-				if (lastError !== undefined && error instanceof SdkClientError && error.transport) throw lastError;
-				lastError = error;
-				if (!(error instanceof SdkClientError) || error.code !== "uncertain_after_send") throw error;
+				const result = await client.global(operation, input, options);
+				if (Date.now() >= deadline) throw deadlineFailure();
+				return result;
+			} catch (firstError) {
+				if (!(firstError instanceof SdkClientError) || firstError.code !== "uncertain_after_send") throw firstError;
+				uncertainty = firstError;
+				// Same-key replay joins the original durable claim, within the original deadline.
+				// Failure to recover does not prove that the committed operation failed.
+				if (Date.now() >= deadline || this.#closed) throw firstError;
+				try {
+					const result = await client.global(operation, input, options);
+					if (Date.now() >= deadline) throw firstError;
+					return result;
+				} catch {
+					throw firstError;
+				}
 			}
+		};
+		try {
+			return await Promise.race([recover(), expired.promise]);
+		} finally {
+			clearTimeout(timer);
 		}
-		throw lastError;
 	}
 
 	async sdkControl(params: { operation: string; input?: JsonObject }): Promise<unknown> {
@@ -657,7 +705,7 @@ export class AcpSdkAdapter {
 		throw new AcpSdkAdapterError("method_not_found", `Unsupported ACP SDK method: ${method}`);
 	}
 
-	async registerProvider(provider: AcpProviderRegistration, deadline?: number): Promise<void> {
+	async registerProvider(provider: AcpProviderRegistration, timeoutMs?: number, deadline?: number): Promise<void> {
 		if (this.#closed) throw new AcpSdkAdapterError("connection_closed");
 		if (!this.#router)
 			throw new AcpSdkAdapterError(
@@ -677,7 +725,7 @@ export class AcpSdkAdapter {
 				...(previousLeaseId ? { expectedLeaseId: previousLeaseId } : {}),
 			},
 			true,
-			deadline === undefined ? undefined : { deadline, timeoutMs: Math.max(0, deadline - Date.now()) },
+			timeoutMs === undefined ? undefined : { timeoutMs, ...(deadline === undefined ? {} : { deadline }) },
 		);
 		if (this.#closed) throw new AcpSdkAdapterError("connection_closed");
 		if (deadline !== undefined && Date.now() >= deadline)
@@ -715,8 +763,9 @@ export class AcpSdkAdapter {
 						const remainingMs = deadline - Date.now();
 						if (remainingMs <= 0) throw this.#providerActivationExhausted(attempt - 1, startedAt);
 						try {
-							await this.registerProvider(provider, deadline);
+							await this.registerProvider(provider, remainingMs, deadline);
 						} catch (error) {
+							if (providerErrorCode(error) === "uncertain_after_send") throw error;
 							if (providerErrorCode(error) === "provider_lease_conflict") {
 								this.#leases.delete(provider.capability);
 								this.#abortReverseForCapability(provider.capability);
@@ -746,6 +795,7 @@ export class AcpSdkAdapter {
 					this.#providersActivated = true;
 					return;
 				} catch (error) {
+					if (providerErrorCode(error) === "uncertain_after_send") throw error;
 					if (Date.now() >= deadline) throw this.#providerActivationExhausted(attempt, startedAt, error);
 					if (this.#router && attachment !== this.#attachment && !this.#closed) {
 						this.#providersActivated = false;

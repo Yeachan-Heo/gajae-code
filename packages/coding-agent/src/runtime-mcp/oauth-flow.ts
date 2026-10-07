@@ -285,6 +285,7 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 			expires_in?: number;
 			token_type?: string;
 		};
+		this.ctrl.signal?.throwIfAborted();
 
 		// Calculate expiry timestamp
 		const expiresIn = data.expires_in ?? 3600; // Default to 1 hour
@@ -368,6 +369,7 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 				client_id?: string;
 				client_secret?: string;
 			};
+			signal?.throwIfAborted();
 
 			if (data.client_id && data.client_id.trim() !== "") {
 				this.#resolvedClientId = data.client_id;
