@@ -1529,9 +1529,15 @@ async function removeVerifiedOwnedLockDirWithoutNative(
 		if (isTransientReleaseError(error)) throw error;
 		return "cleanup_failed";
 	}
-	const current = await captureFileLockDirIdentity(lockDir);
+	let nativeCapturePath = lockDir;
+	try {
+		nativeCapturePath = await canonicalLockPathPreservingFinal(lockDir);
+	} catch (error) {
+		if (!isEnoent(error) && !isTransientReleaseError(error)) throw error;
+	}
+	const current = await captureFileLockDirIdentity(nativeCapturePath);
 	if (!current || !sameStableFileLockIdentity(current, expected)) return "owner_changed";
-	const captured = nativeFileLockBindings().snapshotDirectoryTree(lockDir);
+	const captured = nativeFileLockBindings().snapshotDirectoryTree(nativeCapturePath);
 	if (!captured.ok || !captured.snapshot) return "owner_changed";
 	const infoEntry = captured.snapshot.entries.find(entry => entry.relativePath === "info");
 	if (
@@ -1545,7 +1551,7 @@ async function removeVerifiedOwnedLockDirWithoutNative(
 		!nativeFileLockInfoMatchesContentEvidence(infoEntry, expected)
 	)
 		return "owner_changed";
-	return await removeVerifiedLockDirWithoutNative(lockDir, captured.snapshot, owner);
+	return await removeVerifiedLockDirWithoutNative(nativeCapturePath, captured.snapshot, owner);
 }
 
 function nativeFileLockInfoMatchesStableIdentity(
