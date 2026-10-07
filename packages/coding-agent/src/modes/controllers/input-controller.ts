@@ -1174,6 +1174,7 @@ export class InputController {
 				return;
 			}
 			this.ctx.queueCompactionMessage(text, "steer", composer);
+			this.#titleQueuedCompactionText(text);
 			return;
 		}
 
@@ -1626,10 +1627,13 @@ export class InputController {
 	 * session was replaced (New Session, switch, resume) is discarded.
 	 */
 	maybeGenerateSessionTitle(text: string): void {
+		if (this.ctx.sessionManager.getSessionName()) return;
 		const sessionId = this.ctx.sessionManager.getSessionId();
-		if (this.#autoTitleInFlightSessionId === sessionId || this.ctx.sessionManager.getSessionName()) return;
+		if (this.#autoTitleInFlightSessionId === sessionId) return;
 		if ($pickenv("GJC_NO_TITLE", "PI_NO_TITLE")) return;
 		if (this.ctx.session.messages.some((m: AgentMessage) => m.role === "user")) return;
+		// Keep locally intercepted command arguments away from the title model.
+		if (this.ctx.session.isLocallyHandledSlashCommand(text)) return;
 		this.#autoTitleInFlightSessionId = sessionId;
 		generateSessionTitle(
 			text,
@@ -1651,6 +1655,12 @@ export class InputController {
 			.finally(() => {
 				if (this.#autoTitleInFlightSessionId === sessionId) this.#autoTitleInFlightSessionId = undefined;
 			});
+	}
+
+	/** Title text accepted into the compaction queue; skill commands replay through the skill path and are not titled. */
+	#titleQueuedCompactionText(text: string): void {
+		if (parseSkillInvocations(text, this.ctx.skillCommands ?? new Map()).length > 0) return;
+		this.maybeGenerateSessionTitle(text);
 	}
 
 	/**
@@ -1761,6 +1771,7 @@ export class InputController {
 				return;
 			}
 			this.ctx.queueCompactionMessage(text, "followUp");
+			this.#titleQueuedCompactionText(text);
 			return;
 		}
 
@@ -1775,6 +1786,7 @@ export class InputController {
 					followUpQueuePolicy: "sequential",
 				}),
 			);
+			this.maybeGenerateSessionTitle(text);
 			this.ctx.updatePendingMessagesDisplay();
 			this.ctx.ui.requestRender();
 			return;

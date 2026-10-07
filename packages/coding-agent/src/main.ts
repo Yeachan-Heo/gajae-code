@@ -996,7 +996,7 @@ export async function runInteractiveMode(
 	// drop the prompt.
 	const maybeGenerateStartupTitle = (text: string, images?: readonly unknown[]): void => {
 		try {
-			if (session.resolvePromptSkillInvocation(text, images)) return;
+			if (session.resolvePromptSkillInvocation(text, images) || session.isLocallyHandledSlashCommand(text)) return;
 			mode.maybeGenerateSessionTitle(text);
 		} catch (error: unknown) {
 			logger.warn("Startup session title generation failed", { error: String(error) });
