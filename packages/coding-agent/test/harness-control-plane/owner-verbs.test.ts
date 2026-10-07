@@ -6,7 +6,12 @@ import { callEndpoint } from "../../src/harness-control-plane/control-endpoint";
 import { type FinalizeChecks, ValidationObservationUncertainError } from "../../src/harness-control-plane/finalize";
 import { RuntimeOwner } from "../../src/harness-control-plane/owner";
 import type { HarnessSessionTransport, SessionStateSnapshot } from "../../src/harness-control-plane/session-transport";
-import { readEvents, readReceiptIndex, writeSessionState } from "../../src/harness-control-plane/storage";
+import {
+	readEvents,
+	readReceiptIndex,
+	readSessionState,
+	writeSessionState,
+} from "../../src/harness-control-plane/storage";
 import { SESSION_SCHEMA_VERSION, type SessionHandle, type SessionState } from "../../src/harness-control-plane/types";
 
 class FakeTransport implements HarnessSessionTransport {
@@ -128,7 +133,7 @@ describe("owner-dispatched recover / validate / operate", () => {
 		expect(decision.classification).toBe("continue"); // owner live, normal
 	});
 
-	it("operate is owner-dispatched and runs the bounded lifecycle loop", async () => {
+	it("operate is owner-dispatched and keeps an exhausted observation window resumable", async () => {
 		owner = new RuntimeOwner({
 			root,
 			sessionId: SID,
@@ -142,15 +147,25 @@ describe("owner-dispatched recover / validate / operate", () => {
 			input: { goal: "do the thing", maxIterations: 2 },
 		})) as Record<string, unknown>;
 		const operate = (res.evidence as Record<string, unknown>).operate as Record<string, unknown>;
-		expect(operate).toBeTruthy();
+		// This invocation's observation bound does not block a healthy owner or authorize completion.
+		expect(operate).toMatchObject({ completed: false, lifecycle: "observing", iterations: 2, blockers: [] });
 		expect(Array.isArray(operate.classifications)).toBe(true);
-		// git observer never reports completion here; exhausting the observation budget keeps the active owner observing (nonterminal) instead of finalizing.
+		// Git observation exhaustion keeps the active owner observing rather than finalizing.
 		expect(operate.lifecycle).toBe("observing");
-		// The owner persists the loop's resulting lifecycle (not stale).
-		expect((res.state as Record<string, unknown>).lifecycle).toBe("observing");
+		expect(res.state).toMatchObject({ lifecycle: "observing", blockers: [] });
+		expect(await readSessionState(root, SID)).toMatchObject({ lifecycle: "observing", blockers: [] });
+		expect(await readReceiptIndex(root, SID, "completion")).toHaveLength(0);
 		// Every emitted event carries the owner's lease identity (no hardcoded "operate" writer).
 		const events = await readEvents(root, SID, 0);
-		expect(events.length).toBeGreaterThan(0);
+		const kinds = events.map(event => event.kind);
+		expect(kinds).toContain("operate_observation_window_ended");
+		expect(kinds).not.toContain("operate_blocked");
+		expect(kinds).not.toContain("operate_finalized");
+		expect(events.find(event => event.kind === "operate_observation_window_ended")).toMatchObject({
+			state: { lifecycle: "observing", blockers: [] },
+			evidence: { completionObserved: false, resumeWith: "observe" },
+		});
 		expect(events.every(e => e.writer.ownerId === info.ownerId)).toBe(true);
+		expect(events.every(e => e.writer.leaseEpoch === info.leaseEpoch)).toBe(true);
 	});
 });
