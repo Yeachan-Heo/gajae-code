@@ -5,6 +5,7 @@ import type { Model } from "@gajae-code/ai";
 import { hookFetch, TempDir } from "@gajae-code/utils";
 import {
 	activateModelProfile,
+	applyModelProfileRuntimeBindings,
 	applyPreparedModelProfileActivation,
 	formatModelProfileCredentialError,
 	ModelProfileCredentialError,
@@ -238,6 +239,52 @@ describe("model profile activation", () => {
 			executor: "provider-b/executor",
 			architect: "provider-a/architect",
 		});
+	});
+
+	test("skips profile preparation when the recovery fence is already stale", async () => {
+		const session = fakeSession();
+		const registry = fakeRegistry();
+		const getProfiles = vi.spyOn(registry, "getModelProfiles");
+		const clearCanonicalVariant = vi.fn();
+		Object.assign(registry, { clearCanonicalVariant });
+
+		await activateModelProfile(
+			{ session, modelRegistry: registry as never, settings: Settings.isolated(), profileName: "profile-a" },
+			{ isCurrent: () => false },
+		);
+
+		expect(getProfiles).not.toHaveBeenCalled();
+		expect(clearCanonicalVariant).not.toHaveBeenCalled();
+		expect(session.setModelTemporaryCalls).toEqual([]);
+	});
+
+	test("cancels recovered runtime bindings when selection changes during preparation", async () => {
+		const session = fakeSession();
+		const registry = fakeRegistry();
+		const apiKey = Promise.withResolvers<string | undefined>();
+		const apiProbeStarted = Promise.withResolvers<void>();
+		vi.spyOn(registry, "getApiKeyForProvider").mockImplementation(async provider => {
+			if (provider === "provider-a") {
+				apiProbeStarted.resolve();
+				return apiKey.promise;
+			}
+			return `key-${provider}`;
+		});
+		const settings = Settings.isolated({ modelRoles: { default: "provider-c/original" } });
+		let selectionIsCurrent = true;
+		const activation = applyModelProfileRuntimeBindings(
+			{ session, modelRegistry: registry as never, settings, profileName: "profile-a" },
+			() => selectionIsCurrent,
+		);
+
+		await apiProbeStarted.promise;
+		selectionIsCurrent = false;
+		apiKey.resolve("key-provider-a");
+		await activation;
+
+		expect(session.getActiveModelProfile()).toBeUndefined();
+		expect(settings.getOverride("modelRoles")).toBeUndefined();
+		expect(settings.getOverride("task.agentModelOverrides")).toBeUndefined();
 	});
 
 	test("built-in claude-opus falls back to Opus 4.6 when Opus 5.5 is absent", async () => {
@@ -2542,6 +2589,56 @@ describe("model profile activation", () => {
 		expect(settings.get("modelProfile.default")).toBe("profile-a");
 		expect(flushCount).toBe(1);
 		expect(session.getActiveModelProfile()).toBe("profile-a");
+	});
+
+	test("rolls back stale persisted activation without overwriting the newer model selection", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated({
+			modelRoles: { default: "provider-a/previous", architect: "provider-c/previous-architect" },
+			"task.agentModelOverrides": { critic: "provider-c/previous-critic" },
+			"modelProfile.default": "old-profile",
+			defaultThinkingLevel: ThinkingLevel.Low,
+		});
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: fakeRegistry(),
+			settings,
+			profileName: "profile-a",
+		});
+		const selectedModel = model("provider-c", "selected");
+		let selectionRevision = 0;
+		let flushCount = 0;
+		settings.flushOrThrow = async () => {
+			flushCount += 1;
+			if (flushCount !== 1) return;
+			selectionRevision += 1;
+			session.model = selectedModel;
+			session.thinkingLevel = ThinkingLevel.Medium;
+			settings.setModelRole("default", "provider-c/selected");
+			settings.clearOverride("modelRoles");
+			settings.clearOverride("task.agentModelOverrides");
+			settings.unset("modelProfile.default");
+			session.setConfiguredModelChain("default", ["provider-c/selected"], "model_selection");
+		};
+
+		await applyPreparedModelProfileActivation(prepared, {
+			persistDefault: true,
+			isCurrent: () => selectionRevision === 0,
+		});
+
+		expect(session.model).toBe(selectedModel);
+		expect(session.getConfiguredModelChainState("default")?.origin).toBe("model_selection");
+		expect(settings.getModelRole("default")).toBe("provider-c/selected");
+		expect(settings.getGlobal("modelRoles")).toEqual({
+			default: "provider-c/selected",
+			architect: "provider-c/previous-architect",
+		});
+		expect(settings.get("modelProfile.default")).toBeUndefined();
+		expect(settings.get("task.agentModelOverrides")).toEqual({ critic: "provider-c/previous-critic" });
+		expect(settings.getOverride("modelRoles")).toBeUndefined();
+		expect(settings.getOverride("task.agentModelOverrides")).toBeUndefined();
+		expect(settings.get("defaultThinkingLevel")).toBe(ThinkingLevel.Low);
+		expect(flushCount).toBe(2);
 	});
 
 	test("missing credentials hard-block before mutation", async () => {

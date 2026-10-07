@@ -506,24 +506,29 @@ async function applyStartupModelProfilesWithPolicy(
 			userSelectionRevision?: number;
 		} = {},
 	): Promise<boolean> => {
+		const isCurrent =
+			options.userSelectionRevision === undefined
+				? undefined
+				: () => args.session.getUserModelSelectionRevision() === options.userSelectionRevision;
+		if (isCurrent && !isCurrent()) return false;
 		try {
 			if (options.runtimeBindingsOnly) {
-				await applyModelProfileRuntimeBindings({
-					session: args.session,
-					modelRegistry: args.modelRegistry,
-					settings: args.settings,
-					profileName,
-				});
+				await applyModelProfileRuntimeBindings(
+					{
+						session: args.session,
+						modelRegistry: args.modelRegistry,
+						settings: args.settings,
+						profileName,
+					},
+					isCurrent,
+				);
 			} else {
 				await activateModelProfile(
 					{ session: args.session, modelRegistry: args.modelRegistry, settings: args.settings, profileName },
 					{
 						persistDefault,
 						thinkingLevelOverride: options.thinkingLevelOverride,
-						isCurrent:
-							options.userSelectionRevision === undefined
-								? undefined
-								: () => args.session.getUserModelSelectionRevision() === options.userSelectionRevision,
+						isCurrent,
 					},
 				);
 			}
