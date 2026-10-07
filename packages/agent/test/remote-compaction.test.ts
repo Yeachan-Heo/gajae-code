@@ -5,7 +5,9 @@ import {
 	getPreservedOpenAiRemoteCompactionData,
 	requestOpenAiRemoteCompaction,
 	requestRemoteCompaction,
+	resolveOpenAiCompactEndpointForTest,
 } from "@gajae-code/agent-core/compaction/openai";
+import { resolveOpenAIProviderBaseUrlForTest } from "@gajae-code/ai/providers/openai-responses";
 import type { AssistantMessage, Model, ToolResultMessage } from "@gajae-code/ai/types";
 import { captureEndpointConfiguration, type EndpointConfiguration, hookFetch } from "@gajae-code/utils";
 
@@ -233,6 +235,22 @@ describe("remote compaction input trimming", () => {
 });
 
 describe("remote compaction endpoint", () => {
+	test("uses the captured proxy consistently for provider and compaction with a custom port", () => {
+		const restore = setEnvForTest("OPENAI_BASE_URL", "https://captured-proxy.example.com/v1");
+		try {
+			const endpointConfiguration = captureEndpointConfiguration();
+			Bun.env.OPENAI_BASE_URL = "https://live-proxy.example.com/v1";
+			const model = makeOpenAiModel({ baseUrl: "https://api.openai.com:8443/v1" });
+			const providerBaseUrl = resolveOpenAIProviderBaseUrlForTest(model.baseUrl, "api_key", endpointConfiguration);
+			const compactionEndpoint = resolveOpenAiCompactEndpointForTest(model, "api_key", endpointConfiguration);
+
+			expect(providerBaseUrl).toBe("https://captured-proxy.example.com/v1");
+			expect(compactionEndpoint).toBe(`${providerBaseUrl}/responses/compact`);
+		} finally {
+			restore();
+		}
+	});
+
 	test("uses captured routing through the maintenance caller and returns preserve data", async () => {
 		const previousBaseUrl = Bun.env.OPENAI_BASE_URL;
 		const requestCapture: { url?: string; authorization?: string | null } = {};
