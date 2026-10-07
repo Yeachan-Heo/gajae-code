@@ -15,6 +15,7 @@ import type { SubmittedUserInput } from "../types";
 import type { ModeGate } from "./mode-gate";
 
 type GoalSubcommand = "set" | "show" | "pause" | "resume" | "drop";
+const GOAL_TIMEOUT_OBSERVATION_MS = 30_000;
 
 const GOAL_SUBCOMMANDS = new Set<GoalSubcommand>(["set", "show", "pause", "resume", "drop"]);
 
@@ -55,6 +56,7 @@ export class GoalModeController {
 	#paused = false;
 	#previousTools: string[] | undefined;
 	#continuationTimer: NodeJS.Timeout | undefined;
+	#timeoutObservationTimer: NodeJS.Timeout | undefined;
 	#turnHadToolCalls = false;
 	#continuationTurnInFlight = false;
 	#suppressNextContinuation = false;
@@ -65,6 +67,7 @@ export class GoalModeController {
 	#goalHeldSnapshotKey: string | undefined;
 	#goalTimeoutFingerprint: string | undefined;
 	#goalIdenticalTimeoutStreak = 0;
+	#goalTimeoutAutoRetryKey: string | undefined;
 
 	constructor(private readonly ctx: GoalModeControllerContext) {}
 
@@ -120,6 +123,8 @@ export class GoalModeController {
 	cancelContinuation(): void {
 		if (this.#continuationTimer) clearTimeout(this.#continuationTimer);
 		this.#continuationTimer = undefined;
+		if (this.#timeoutObservationTimer) clearTimeout(this.#timeoutObservationTimer);
+		this.#timeoutObservationTimer = undefined;
 	}
 
 	onPendingSubmissionFinished(customType?: string): void {
@@ -212,9 +217,19 @@ export class GoalModeController {
 			}
 			if (decision.hold) {
 				this.#suppressNextContinuation = true;
-				this.ctx.showStatus(
-					`Goal paused for attention: repeated identical timeout from ${this.#goalTurnOutcomes[0]?.toolName ?? "tool"}. Send a message to continue.`,
-				);
+				const toolName = this.#goalTurnOutcomes[0]?.toolName ?? "tool";
+				const retryKey = `${decision.next.heldSnapshotKey ?? ""}\u0000${decision.next.fingerprint ?? ""}`;
+				if (this.#goalTimeoutAutoRetryKey !== retryKey) {
+					this.#goalTimeoutAutoRetryKey = retryKey;
+					this.ctx.showStatus(
+						`Goal is observing repeated identical timeout from ${toolName}; checking delegated work before one automatic retry.`,
+					);
+					this.#scheduleTimeoutObservation(retryKey);
+				} else {
+					this.ctx.showStatus(
+						`Goal paused for attention: the same ${toolName} timeout persisted after one monitored retry. Send a message to continue.`,
+					);
+				}
 			}
 			this.#continuationTurnInFlight = false;
 		} else {
@@ -224,7 +239,7 @@ export class GoalModeController {
 			await this.exit({ reason: "completed", silent: true });
 			return;
 		}
-		this.scheduleContinuation();
+		if (!this.#suppressNextContinuation) this.scheduleContinuation();
 	}
 
 	/**
@@ -394,6 +409,35 @@ export class GoalModeController {
 		this.#goalHeldSnapshotKey = undefined;
 		this.#goalTimeoutFingerprint = undefined;
 		this.#goalIdenticalTimeoutStreak = 0;
+		this.#goalTimeoutAutoRetryKey = undefined;
+	}
+
+	#scheduleTimeoutObservation(retryKey: string): void {
+		if (this.#timeoutObservationTimer) clearTimeout(this.#timeoutObservationTimer);
+		this.#timeoutObservationTimer = setTimeout(() => {
+			this.#timeoutObservationTimer = undefined;
+			const state = this.ctx.session.getGoalModeState();
+			if (!this.#enabled || this.#paused || !state?.enabled || state.goal.status !== "active") return;
+			const currentKey = `${this.#goalHeldSnapshotKey ?? ""}\u0000${this.#goalTimeoutFingerprint ?? ""}`;
+			if (currentKey !== retryKey) return;
+			const runningDelegates =
+				this.ctx.session
+					.getAsyncJobSnapshot?.()
+					?.running.filter(job => job.type === "task" && job.status === "running") ?? [];
+			if (runningDelegates.length > 0) {
+				this.ctx.showStatus(
+					`Goal is still observing ${runningDelegates.length} running delegated task(s); no duplicate continuation will start.`,
+				);
+				this.#scheduleTimeoutObservation(retryKey);
+				return;
+			}
+			this.#suppressNextContinuation = false;
+			this.ctx.showStatus(
+				"No delegated task is still running; the goal continuation will retry once after the timeout observation window.",
+			);
+			this.scheduleContinuation();
+		}, GOAL_TIMEOUT_OBSERVATION_MS);
+		this.#timeoutObservationTimer.unref?.();
 	}
 
 	#resetContinuationSuppression(): void {

@@ -95,6 +95,8 @@ export interface WorkflowRecoveryZeroProgressMemory {
 	lastFingerprint?: string;
 	/** Consecutive compaction observations with an unchanged fingerprint. */
 	unchangedObservations: number;
+	/** Session event revision; activity is progress evidence even before a durable checkpoint lands. */
+	lastActivityRevision?: number;
 }
 
 /** #4560: bound repeated zero-progress continuation cycles (#4560). */
@@ -103,11 +105,21 @@ export const ZERO_PROGRESS_STALL_THRESHOLD = 2;
 export function trackWorkflowRecoveryZeroProgress(
 	memory: WorkflowRecoveryZeroProgressMemory | undefined,
 	projection: WorkflowRecoveryProjection,
+	activityRevision?: number,
 ): WorkflowRecoveryZeroProgressMemory {
 	const fingerprint = hashWorkflowRecoveryProjection(projection);
-	if (!memory) return { lastFingerprint: fingerprint, unchangedObservations: 0 };
-	const unchanged = memory.lastFingerprint === fingerprint ? memory.unchangedObservations + 1 : 0;
-	return { lastFingerprint: fingerprint, unchangedObservations: unchanged };
+	if (!memory)
+		return { lastFingerprint: fingerprint, unchangedObservations: 0, lastActivityRevision: activityRevision };
+	const activityAdvanced =
+		activityRevision !== undefined &&
+		memory.lastActivityRevision !== undefined &&
+		activityRevision !== memory.lastActivityRevision;
+	const unchanged = !activityAdvanced && memory.lastFingerprint === fingerprint ? memory.unchangedObservations + 1 : 0;
+	return {
+		lastFingerprint: fingerprint,
+		unchangedObservations: unchanged,
+		lastActivityRevision: activityRevision ?? memory.lastActivityRevision,
+	};
 }
 
 export function isWorkflowRecoveryStalled(memory: WorkflowRecoveryZeroProgressMemory | undefined): boolean {
@@ -132,13 +144,48 @@ function boundText(value: unknown, maxChars: number): string | undefined {
  * the same bytes. Reading for projection and reopening for hashing lets a
  * concurrent replacement produce a digest over benign bytes while different
  * bytes reach the continuation prompt, so the two must never be split.
- * The handle is opened with `O_NOFOLLOW` and its identity is verified to be a
- * regular file before any bytes are trusted.
+ * POSIX uses `O_NOFOLLOW`. Windows verifies the lstat, opened-handle, and final
+ * path identities and confirms the canonical path remains under its run root.
  */
-async function readArtifactWithDigest(filePath: string): Promise<{ text: string; sha256: string } | undefined> {
-	if (process.platform === "win32") return undefined;
+async function readArtifactWithDigest(
+	filePath: string,
+	allowedRoot: string,
+): Promise<{ text: string; sha256: string } | undefined> {
 	let handle: fs.FileHandle | undefined;
 	try {
+		if (process.platform === "win32") {
+			const rootReal = await fs.realpath(allowedRoot);
+			const candidateReal = await fs.realpath(filePath);
+			const relative = path.relative(rootReal, candidateReal);
+			if (relative.startsWith("..") || path.isAbsolute(relative)) return undefined;
+			const before = await fs.lstat(filePath);
+			if (!before.isFile() || before.isSymbolicLink() || before.ino === 0) return undefined;
+			handle = await fs.open(filePath, nodeFsConstants.O_RDONLY);
+			const opened = await handle.stat();
+			if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) return undefined;
+			const buffer = await handle.readFile();
+			const [afterPath, afterReal, afterHandle] = await Promise.all([
+				fs.lstat(filePath),
+				fs.realpath(filePath),
+				handle.stat(),
+			]);
+			const afterRelative = path.relative(rootReal, afterReal);
+			if (
+				!afterPath.isFile() ||
+				afterPath.isSymbolicLink() ||
+				afterPath.dev !== before.dev ||
+				afterPath.ino !== before.ino ||
+				afterHandle.dev !== before.dev ||
+				afterHandle.ino !== before.ino ||
+				afterRelative.startsWith("..") ||
+				path.isAbsolute(afterRelative)
+			)
+				return undefined;
+			return {
+				text: buffer.toString("utf8"),
+				sha256: `sha256:${crypto.createHash("sha256").update(buffer).digest("hex")}`,
+			};
+		}
 		handle = await fs.open(filePath, nodeFsConstants.O_RDONLY | nodeFsConstants.O_NOFOLLOW);
 		const stat = await handle.stat();
 		if (!stat.isFile()) return undefined;
@@ -343,7 +390,7 @@ async function projectRalplanRunInternal(
 		return undefined;
 	const artifactPath = await resolveRalplanArtifactPath(runDir, artifactRow.path, plansRoot);
 	if (!artifactPath) return undefined;
-	const artifact = await readArtifactWithDigest(artifactPath);
+	const artifact = await readArtifactWithDigest(artifactPath, plansRoot);
 	if (!artifact) return undefined;
 	const markdown = artifact.text;
 	const objective = objectiveFromMarkdown(markdown);

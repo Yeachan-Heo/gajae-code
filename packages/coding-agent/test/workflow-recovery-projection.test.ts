@@ -108,7 +108,11 @@ describe("workflow recovery projection (#4560)", () => {
 			path.join(outsideRunDir, "index.jsonl"),
 			`${JSON.stringify({ stage: "final", stage_n: 1, path: "stage-01-final.md", sha256: digest })}\n`,
 		);
-		await fs.symlink(outsideRunDir, ralplanRunDir(tempDir.path(), "symlinked-run"));
+		await fs.symlink(
+			outsideRunDir,
+			ralplanRunDir(tempDir.path(), "symlinked-run"),
+			process.platform === "win32" ? "junction" : "dir",
+		);
 
 		await expect(
 			projectRalplanFinalRun({ cwd: tempDir.path(), sessionId: SESSION_ID, runId: "symlinked-run" }),
@@ -272,7 +276,11 @@ describe("workflow recovery projection (#4560)", () => {
 		const plansRoot = path.join(tempDir.path(), ".gjc", `_session-${SESSION_ID}`, "plans");
 		await fs.mkdir(plansRoot, { recursive: true });
 		// The `ralplan` ancestor component itself is a symlink out of the tree.
-		await fs.symlink(path.join(tempDir.path(), "outside"), path.join(plansRoot, "ralplan"));
+		await fs.symlink(
+			path.join(tempDir.path(), "outside"),
+			path.join(plansRoot, "ralplan"),
+			process.platform === "win32" ? "junction" : "dir",
+		);
 		await Bun.write(
 			path.join(tempDir.path(), ".gjc", `_session-${SESSION_ID}`, "state", "ralplan-state.json"),
 			JSON.stringify({ run_id: "evil-run" }),
@@ -455,6 +463,14 @@ describe("workflow recovery projection (#4560)", () => {
 		const recovered = trackWorkflowRecoveryZeroProgress(stalledMemory, { ...a, ...progressed } as typeof a);
 		expect(recovered.unchangedObservations).toBe(0);
 		expect(isWorkflowRecoveryStalled(recovered)).toBe(false);
+		const activeBefore = trackWorkflowRecoveryZeroProgress(undefined, a, 1);
+		const activeAfter = trackWorkflowRecoveryZeroProgress(activeBefore, a, 2);
+		expect(activeAfter.unchangedObservations).toBe(0);
+		expect(isWorkflowRecoveryStalled(activeAfter)).toBe(false);
+		const idleOnce = trackWorkflowRecoveryZeroProgress(activeAfter, a, 2);
+		const idleTwice = trackWorkflowRecoveryZeroProgress(idleOnce, a, 2);
+		expect(idleTwice.unchangedObservations).toBe(ZERO_PROGRESS_STALL_THRESHOLD);
+		expect(isWorkflowRecoveryStalled(idleTwice)).toBe(true);
 	});
 });
 

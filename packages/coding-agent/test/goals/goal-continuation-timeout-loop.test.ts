@@ -1,11 +1,13 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
-import * as path from "node:path";
+import * as fs from "node:fs/promises";
 import { Agent } from "@gajae-code/agent-core";
+import { closeModelCache } from "@gajae-code/ai";
+import { SqliteAuthCredentialStore } from "@gajae-code/ai/core";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { InteractiveMode } from "@gajae-code/coding-agent/modes/interactive-mode";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
-import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import { AgentSession, SessionDisposalIncompleteError } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { createTools, type Tool, type ToolSession } from "@gajae-code/coding-agent/tools";
@@ -14,6 +16,7 @@ import { TempDir } from "@gajae-code/utils";
 type Harness = {
 	tempDir: TempDir;
 	authStorage: AuthStorage;
+	modelRegistries: ModelRegistry[];
 	session: AgentSession;
 	mode: InteractiveMode;
 	cleanup: () => Promise<void>;
@@ -22,6 +25,7 @@ type Harness = {
 type ContinuationTimer = {
 	cancelled: boolean;
 	callback: () => void;
+	delay: number;
 };
 
 let continuationTimers: ContinuationTimer[] = [];
@@ -30,8 +34,8 @@ function installContinuationTimerControl(): void {
 	const realSetTimeout = globalThis.setTimeout;
 	const realClearTimeout = globalThis.clearTimeout;
 	const controlledSetTimeout = (callback: () => void, delay?: number): ReturnType<typeof setTimeout> => {
-		if (delay !== 800) return realSetTimeout(callback, delay);
-		const timer: ContinuationTimer = { cancelled: false, callback };
+		if (delay !== 800 && delay !== 30_000) return realSetTimeout(callback, delay);
+		const timer: ContinuationTimer = { cancelled: false, callback, delay };
 		continuationTimers.push(timer);
 		return timer as unknown as ReturnType<typeof setTimeout>;
 	};
@@ -47,12 +51,25 @@ function installContinuationTimerControl(): void {
 }
 
 async function advanceGoalContinuation(): Promise<void> {
-	for (let i = 0; i < 100 && continuationTimers.length === 0; i++) {
+	for (let i = 0; i < 100 && !continuationTimers.some(timer => timer.delay === 800); i++) {
 		await Bun.sleep(0);
 	}
-	const timer = continuationTimers.shift();
+	const index = continuationTimers.findIndex(timer => timer.delay === 800);
+	const timer = index >= 0 ? continuationTimers.splice(index, 1)[0] : undefined;
 	expect(timer).toBeDefined();
 	if (!timer || timer.cancelled) throw new Error("Expected an active goal continuation timer");
+	timer.callback();
+	await flush();
+}
+
+async function advanceTimeoutObservation(): Promise<void> {
+	for (let i = 0; i < 100 && !continuationTimers.some(timer => timer.delay === 30_000); i++) {
+		await Bun.sleep(0);
+	}
+	const index = continuationTimers.findIndex(timer => timer.delay === 30_000);
+	const timer = index >= 0 ? continuationTimers.splice(index, 1)[0] : undefined;
+	expect(timer).toBeDefined();
+	if (!timer || timer.cancelled) throw new Error("Expected an active timeout observation timer");
 	timer.callback();
 	await flush();
 }
@@ -61,9 +78,11 @@ async function createHarness(): Promise<Harness> {
 	resetSettingsForTest();
 	const tempDir = TempDir.createSync("@goal-timeout-loop-");
 	await Settings.init({ inMemory: true, cwd: tempDir.path() });
-	const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
-	const model = new ModelRegistry(authStorage).find("anthropic", "claude-sonnet-4-5");
+	const authStorage = new AuthStorage(await SqliteAuthCredentialStore.open(":memory:"));
+	const selectorRegistry = new ModelRegistry(authStorage);
+	const model = selectorRegistry.find("anthropic", "claude-sonnet-4-5");
 	if (!model) throw new Error("Expected test model");
+	const runtimeRegistry = new ModelRegistry(authStorage);
 	const settings = Settings.isolated({
 		"compaction.enabled": false,
 		"goal.enabled": true,
@@ -84,7 +103,7 @@ async function createHarness(): Promise<Harness> {
 		agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools, messages: [] } }),
 		sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
 		settings,
-		modelRegistry: new ModelRegistry(authStorage),
+		modelRegistry: runtimeRegistry,
 		toolRegistry: new Map<string, Tool>(tools.map(tool => [tool.name, tool] as const)),
 		rebuildSystemPrompt: async () => ({ systemPrompt: ["Test"] }),
 	});
@@ -92,17 +111,28 @@ async function createHarness(): Promise<Harness> {
 	await mode.init();
 	mode.ui.stop();
 	await mode.goalModeController.handleCommand("Prevent timeout loop");
+	const modelRegistries = [selectorRegistry, runtimeRegistry];
 	return {
 		tempDir,
 		authStorage,
+		modelRegistries: [selectorRegistry, runtimeRegistry],
 		session,
 		mode,
 		cleanup: async () => {
 			mode.stop();
-			await session.dispose();
-			authStorage.close();
-			tempDir.removeSync();
-			resetSettingsForTest();
+			try {
+				await session.dispose();
+			} catch (error) {
+				if (!(error instanceof SessionDisposalIncompleteError)) throw error;
+				await session.awaitDisposeCompletion();
+			} finally {
+				await session.sessionManager.close();
+				await Promise.all(modelRegistries.map(registry => registry.dispose()));
+				authStorage.close();
+				closeModelCache();
+				await fs.rm(tempDir.path(), { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+				resetSettingsForTest();
+			}
 		},
 	};
 }
@@ -188,21 +218,51 @@ describe("goal continuation repeated timeout guard", () => {
 	afterEach(async () => {
 		await harness.cleanup();
 		vi.restoreAllMocks();
-	});
+	}, 30_000);
 
-	it("holds after repeated turns with multiple identical timeout calls and surfaces attention status", async () => {
+	it("observes after repeated timeout, retries once, then asks for attention if the same failure persists", async () => {
 		const status = vi.spyOn(harness.mode, "showStatus");
 		await runContinuation(harness, [timeout(), timeout()]);
+		await runContinuation(harness, [timeout(), timeout()]);
+		expect(status).toHaveBeenCalledWith(
+			"Goal is observing repeated identical timeout from bash; checking delegated work before one automatic retry.",
+		);
+		await advanceTimeoutObservation();
 		await runContinuation(harness, [timeout(), timeout()]);
 		const blocked = harness.mode.getUserInput();
 		await flush();
 		expect(harness.mode.onInputCallback).toBeDefined();
 		expect(status).toHaveBeenCalledWith(
-			"Goal paused for attention: repeated identical timeout from bash. Send a message to continue.",
+			"Goal paused for attention: the same bash timeout persisted after one monitored retry. Send a message to continue.",
 		);
 		harness.mode.onInputCallback?.(harness.mode.startPendingSubmission({ text: "attention" }));
 		await blocked;
-	});
+	}, 30_000);
+
+	it("waits for a running delegated job before retrying a timeout", async () => {
+		const status = vi.spyOn(harness.mode, "showStatus");
+		let delegateRunning = true;
+		vi.spyOn(harness.session, "getAsyncJobSnapshot").mockImplementation(
+			() =>
+				({
+					running: delegateRunning ? [{ id: "task-1", type: "task", status: "running" }] : [],
+					recent: [],
+					delivery: { queued: 0, delivering: false, pendingJobIds: [], deadLettered: 0 },
+				}) as never,
+		);
+		await runContinuation(harness, [timeout()]);
+		await runContinuation(harness, [timeout()]);
+		await advanceTimeoutObservation();
+		expect(continuationTimers.some(timer => timer.delay === 800)).toBe(false);
+		expect(status).toHaveBeenCalledWith(
+			"Goal is still observing 1 running delegated task(s); no duplicate continuation will start.",
+		);
+		delegateRunning = false;
+		await advanceTimeoutObservation();
+		const retry = harness.mode.getUserInput();
+		await advanceGoalContinuation();
+		await expect(retry).resolves.toMatchObject({ customType: "goal-continuation" });
+	}, 30_000);
 
 	it("permits one timeout continuation", async () => {
 		await runContinuation(harness, [timeout()]);
