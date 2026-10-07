@@ -1138,6 +1138,27 @@ describe("Settings", () => {
 		}
 	});
 
+	it("applies versioned legacy migrations while staging a global config reload", async () => {
+		await writeSettings({ queueMode: "all" });
+		const settings = await Settings.loadReadonly({ cwd: projectDir, agentDir });
+		try {
+			expect(settings.get("steeringMode")).toBe("all");
+
+			const externalConfig = "queueMode: all\ndisplay:\n  tabWidth: 7\n";
+			await Bun.write(getConfigPath(), externalConfig);
+			const candidate = await stageConfigReload(settings);
+
+			expect(candidate.get("steeringMode")).toBe("all");
+			expect(candidate.getGlobal("steeringMode")).toBe("all");
+			settings.publishGlobalConfigReload(candidate).finalize();
+
+			expect(settings.get("steeringMode")).toBe("all");
+			expect(await Bun.file(getConfigPath()).text()).toBe(externalConfig);
+		} finally {
+			await settings.close();
+		}
+	});
+
 	it("preserves pending patches and project/runtime overrides without writing config.yml", async () => {
 		await writeSettings({
 			configSchemaVersion: 2,

@@ -884,7 +884,11 @@ export class Settings implements NotificationSettingsReader {
 				}
 			}
 
-			const reconciled = reconcileSettingsSchema(rawConfig);
+			const configSchemaVersion = normalizeConfigSchemaVersion(rawConfig.configSchemaVersion);
+			const futureSchemaVersion =
+				typeof configSchemaVersion === "number" && configSchemaVersion > CONFIG_SCHEMA_VERSION;
+			const migratedRawConfig = this.#migrateRawSettings(structuredClone(rawConfig));
+			const reconciled = reconcileSettingsSchema(migratedRawConfig);
 			const diagnostics = reconciled.report;
 			for (const [settingPath, pathSegments] of [
 				["modelRoles", ["modelRoles"]],
@@ -902,9 +906,6 @@ export class Settings implements NotificationSettingsReader {
 					diagnostics.valid = false;
 				}
 			}
-			const configSchemaVersion = normalizeConfigSchemaVersion(rawConfig.configSchemaVersion);
-			const futureSchemaVersion =
-				typeof configSchemaVersion === "number" && configSchemaVersion > CONFIG_SCHEMA_VERSION;
 			if (futureSchemaVersion) {
 				diagnostics.issues.push({
 					path: "configSchemaVersion",
