@@ -5792,7 +5792,6 @@ await writeSessionLifecycleFailure(
 	{ phase: "startup", reason: "failed", message: "owned synthetic startup failure" },
 	{ endpointGeneration: null, fenced: true, runtimeRemoved: true, hostStopped: true, brokerRegistrationReleased: true },
 );
-await Bun.sleep(60_000);
 `,
 		);
 		process.env.GJC_SDK_SESSION_COMMAND = `${process.execPath} ${fixture}`;
