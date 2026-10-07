@@ -44,7 +44,7 @@ type NormalizedAutoroutingCuratedTierMap = {
 export const TIER_MAP_VERSION = 1;
 
 export const CURATED_TIER_LABELS = {
-	"anthropic/claude-haiku-4-5": [{ tier: "fast", rank: 1 }],
+	"anthropic/claude-haiku-5-5": [{ tier: "fast", rank: 1 }],
 	"anthropic/claude-sonnet-5-5": [{ tier: "balanced", rank: 1 }],
 	"anthropic/claude-sonnet-5": [{ tier: "balanced", rank: 2 }],
 	"anthropic/claude-sonnet-4-6": [{ tier: "balanced", rank: 3 }],
