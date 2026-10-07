@@ -26,6 +26,7 @@ import {
 	sessionPlansDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
+import { writeWorkflowEnvelopeAtomic } from "@gajae-code/coding-agent/gjc-runtime/state-writer";
 import { readVisibleSkillActiveState } from "@gajae-code/coding-agent/skill-state/active-state";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { YAML } from "bun";
@@ -262,6 +263,102 @@ describe("native gjc ralplan runtime — consensus handoff", () => {
 		const afterTerminalPayload = JSON.parse(afterTerminal.stdout ?? "{}") as { run_id: string };
 		expect(afterTerminalPayload.run_id).not.toBe(freshPayload.run_id);
 	});
+
+	it("rejects a stale final without replacing the newer active run or its admission", async () => {
+		const root = await tempDir();
+		const oldRunId = await startNewRalplanRun(root, "old planning task");
+		const newRunId = await startNewRalplanRun(root, "new planning task");
+		const statePath = ralplanStatePath(root);
+		const fresh = JSON.parse(await fs.readFile(statePath, "utf-8"));
+		await writeWorkflowEnvelopeAtomic(
+			statePath,
+			{
+				...fresh,
+				handoff_from: "deep-interview",
+				handoff_at: "2026-10-07T00:00:00.000Z",
+				auto_handoff: { configuredTarget: "ultragoal", effectiveTarget: "off" },
+			},
+			{ cwd: root },
+		);
+		const stateBefore = await fs.readFile(statePath, "utf-8");
+
+		const result = await writeRalplanArtifact(root, oldRunId, "final", 1, "# stale final");
+
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("no longer the active session owner");
+		expect(await fs.readFile(statePath, "utf-8")).toBe(stateBefore);
+		expect(JSON.parse(stateBefore).run_id).toBe(newRunId);
+		expect(existsSync(ralplanPlanPath(root, oldRunId, "stage-01-final.md"))).toBe(false);
+	}, 60_000);
+
+	it("fences fresh role metadata and verdicts when a new run starts during artifact publication", async () => {
+		const root = await tempDir();
+		const oldRunId = await startNewRalplanRun(root, "old planning task");
+		expect((await writeRalplanArtifact(root, oldRunId, "planner", 1, "# old plan")).status).toBe(0);
+		const oldArtifactPath = ralplanPlanPath(root, oldRunId, "stage-02-critic.md");
+		const publicationReached = Promise.withResolvers<void>();
+		const releasePublication = Promise.withResolvers<void>();
+		const originalRename = fs.rename;
+		const renameSpy = spyOn(fs, "rename").mockImplementation(async (oldPath, newPath) => {
+			if (path.resolve(String(newPath)) === oldArtifactPath) {
+				publicationReached.resolve();
+				await releasePublication.promise;
+			}
+			return await originalRename(oldPath, newPath);
+		});
+		const write = runNativeRalplanCommand(
+			[
+				"--write",
+				"--run-id",
+				oldRunId,
+				"--stage",
+				"critic",
+				"--stage_n",
+				"2",
+				"--artifact",
+				"# old critique",
+				"--critic-id",
+				"0-OldCritic",
+				"--critic-resumable",
+				"true",
+				"--lane-verdict",
+				"OKAY",
+				"--json",
+			],
+			root,
+		);
+		try {
+			await publicationReached.promise;
+			const newRunId = await startNewRalplanRun(root, "new planning task");
+			const statePath = ralplanStatePath(root);
+			const fresh = JSON.parse(await fs.readFile(statePath, "utf-8"));
+			await writeWorkflowEnvelopeAtomic(
+				statePath,
+				{
+					...fresh,
+					critic_id: "0-NewCritic",
+					last_review_verdict: "WATCH",
+					last_review_verdict_lane: "architect",
+					last_review_verdict_stage_n: 1,
+				},
+				{ cwd: root },
+			);
+			const stateBefore = await fs.readFile(statePath, "utf-8");
+			releasePublication.resolve();
+			const result = await write;
+
+			expect(result.status).toBe(0);
+			expect(JSON.parse(stateBefore).run_id).toBe(newRunId);
+			expect(await fs.readFile(statePath, "utf-8")).toBe(stateBefore);
+			expect(JSON.parse(result.stdout ?? "{}").critic_state).toBeUndefined();
+			expect(JSON.parse(result.stdout ?? "{}").lane_verdict).toBeUndefined();
+			expect(await fs.readFile(oldArtifactPath, "utf-8")).toBe("# old critique\n");
+		} finally {
+			releasePublication.resolve();
+			await write;
+			renameSpy.mockRestore();
+		}
+	}, 60_000);
 
 	it("--architect openai-code seeds the kind into state", async () => {
 		const root = await tempDir();

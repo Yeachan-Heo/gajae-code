@@ -1883,8 +1883,19 @@ async function markRalplanFinalPublicationPending(
 					if (row.stage === "final") lastFinalSha = row.sha256;
 				}
 				if (lastFinalSha !== publication.sha256) return false;
-			} else if (existing.run_id === runId && phaseLocked) {
-				throw new RalplanCommandError(2, "cannot publish a new final after the Ralplan run reached a locked phase");
+			} else {
+				if (existing.run_id !== runId && existing.active === true) {
+					throw new RalplanCommandError(
+						2,
+						`ralplan run ${runId} is no longer the active session owner; current run ${String(existing.run_id)} remains active. Resume or retire that run before writing.`,
+					);
+				}
+				if (existing.run_id === runId && phaseLocked) {
+					throw new RalplanCommandError(
+						2,
+						"cannot publish a new final after the Ralplan run reached a locked phase",
+					);
+				}
 			}
 			if (existing.run_id !== runId) {
 				delete existing.planning_stuck;
@@ -2874,11 +2885,16 @@ async function handleArtifactWrite(
 	await persistActiveRunId(persistCwd, resolved.sessionId, resolved.runId, resolved.stage);
 	const persisted = await persistArtifact(resolved, persistCwd, content, sha256, autoHandoff);
 	await recordRalplanAdmissionRecoveryForOpener(persistCwd, resolved);
-	if (persistedRoleState) {
-		await applyPersistedRoleStateUpdate(persistCwd, resolved.sessionId, persistedRoleState);
+	let appliedPersistedRoleState: PersistedRoleStateUpdate | undefined;
+	if (
+		persistedRoleState &&
+		(await applyPersistedRoleStateUpdate(persistCwd, resolved.sessionId, persistedRoleState, resolved.runId))
+	) {
+		appliedPersistedRoleState = persistedRoleState;
 	}
-	if (laneVerdict) {
-		await applyLaneVerdictUpdate(persistCwd, resolved.sessionId, laneVerdict);
+	let appliedLaneVerdict: LaneVerdictUpdate | undefined;
+	if (laneVerdict && (await applyLaneVerdictUpdate(persistCwd, resolved.sessionId, laneVerdict, resolved.runId))) {
+		appliedLaneVerdict = laneVerdict;
 	}
 	if (autoHandoff) {
 		await persistRalplanFinalAdmission(
@@ -2923,9 +2939,12 @@ async function handleArtifactWrite(
 		created_at: persisted.createdAt,
 	};
 	if (persisted.pendingApprovalPath) payload.pending_approval_path = persisted.pendingApprovalPath;
-	if (persistedRoleState) payload[`${persistedRoleState.role}_state`] = persistedRoleStatePayload(persistedRoleState);
+	if (appliedPersistedRoleState) {
+		payload[`${appliedPersistedRoleState.role}_state`] = persistedRoleStatePayload(appliedPersistedRoleState);
+	}
 	if (reviewBudgetWarning) payload.review_budget_warning = reviewBudgetWarning;
-	if (laneVerdict) payload.lane_verdict = { lane: laneVerdict.lane, verdict: laneVerdict.verdict };
+	if (appliedLaneVerdict)
+		payload.lane_verdict = { lane: appliedLaneVerdict.lane, verdict: appliedLaneVerdict.verdict };
 	if (autoHandoff) payload.auto_handoff = autoHandoff;
 
 	const stdout = resolved.json
