@@ -1589,191 +1589,195 @@ function b() {
 			}
 		});
 
-		it("keeps real Bash and Monitor publishers bound across preparation and session commits", async () => {
-			type PublicationMode = "native-foreground" | "managed-foreground" | "async-background" | "monitor";
-			const modes: PublicationMode[] = ["native-foreground", "managed-foreground", "async-background", "monitor"];
+		it(
+			"keeps real Bash and Monitor publishers bound across preparation and session commits",
+			async () => {
+				type PublicationMode = "native-foreground" | "managed-foreground" | "async-background" | "monitor";
+				const modes: PublicationMode[] = ["native-foreground", "managed-foreground", "async-background", "monitor"];
 
-			for (const mode of modes) {
-				AsyncJobManager.resetForTests();
-				const modeDir = path.join(testDir, mode);
-				const heldCwd = path.join(modeDir, "held-cwd");
-				fs.mkdirSync(heldCwd, { recursive: true });
-				const manager = SessionManager.create(modeDir, SessionManager.explicitDestination(modeDir));
-				await manager.ensureOnDisk();
-				const sessionFile = manager.getSessionFile();
-				if (!sessionFile) throw new Error(`expected persisted session for ${mode}`);
-
-				const deliveries: Array<{ jobId: string; text: string }> = [];
-				const asyncManager =
-					mode === "native-foreground"
-						? undefined
-						: new AsyncJobManager({
-								onJobComplete: async (jobId, text) => {
-									deliveries.push({ jobId, text });
-								},
-							});
-				if (asyncManager) AsyncJobManager.setInstance(asyncManager);
-				const settings = Settings.isolated({
-					"async.enabled": mode === "async-background" || mode === "monitor",
-					"bash.autoBackground.enabled": false,
-					"tools.artifactHeadBytes": 8,
-					"tools.artifactTailBytes": 8,
-				});
-				const captureSpy = vi.spyOn(manager, "captureArtifactPublication");
-				const expectedOutput = (label: string): string => `${label}\n${"界".repeat(6_000)}\nEND\n`;
-				const commandFor = (label: string): string =>
-					`printf '${label}\\n'; i=0; while [ "$i" -lt 6000 ]; do printf '界'; i=$((i + 1)); done; printf '\\nEND\\n'`;
-				const runInvocation = async (
-					label: string,
-					cwd?: string,
-				): Promise<{ text: string; artifactIds: string[] }> => {
-					const session = createTestToolSession(modeDir, settings, {}, manager);
-					const tool = new BashTool(session);
-					const wrappedTool = wrapToolWithMetaNotice(tool);
-					const command = commandFor(label);
-					const callId = `publisher-${mode}-${label}`;
-					let managedForegroundCompletion: Promise<void> | undefined;
-					let unsubscribeManagedForeground: (() => void) | undefined;
-					if (mode === "managed-foreground") {
-						if (!asyncManager) throw new Error("Managed foreground fixture requires an async job manager");
-						const existingJobIds = new Set(asyncManager.getJobsSnapshot().jobs.map(job => job.id));
-						const captureRegisteredJob = (): void => {
-							for (const entry of asyncManager.getJobsSnapshot().jobs) {
-								if (entry.kind !== "bash" || existingJobIds.has(entry.id)) continue;
-								existingJobIds.add(entry.id);
-								const job = asyncManager.getJob(entry.id);
-								if (!job) continue;
-								managedForegroundCompletion = job.promise;
-								unsubscribeManagedForeground?.();
-								return;
-							}
-						};
-						unsubscribeManagedForeground = asyncManager.onChange(captureRegisteredJob);
-					}
-					if (mode === "monitor") {
-						if (!asyncManager) throw new Error("Monitor fixture requires an async job manager");
-						const rawLines: string[] = [];
-						const started = await tool.startMonitorJob(
-							{ command, cwd },
-							{ onRawLine: line => rawLines.push(line) },
-						);
-						const job = asyncManager.getJob(started.jobId);
-						if (!job) throw new Error("expected the Monitor job in its actual manager");
-						await job.promise;
-						await asyncManager.drainDeliveries({ timeoutMs: 1 });
-						expect(rawLines.join("\n")).toContain(label);
-						const delivery = deliveries.find(item => item.jobId === started.jobId);
-						if (!delivery) throw new Error("expected Monitor's actual job completion delivery");
-						return { text: delivery.text, artifactIds: artifactIdsInText(delivery.text) };
-					}
-
-					if (mode === "async-background") {
-						if (!asyncManager) throw new Error("Async Bash fixture requires an async job manager");
-						const result = await wrappedTool.execute(callId, { command, cwd, async: true });
-						const jobId = result.details?.async?.jobId;
-						if (!jobId) throw new Error("expected the actual async Bash job id");
-						const job = asyncManager.getJob(jobId);
-						if (!job) throw new Error("expected the async Bash job in its actual manager");
-						await job.promise;
-						await asyncManager.drainDeliveries({ timeoutMs: 1 });
-						const delivery = deliveries.find(item => item.jobId === jobId);
-						if (!delivery) throw new Error("expected async Bash's actual job completion delivery");
-						return { text: delivery.text, artifactIds: artifactIdsInText(delivery.text) };
-					}
-
-					try {
-						const result = await wrappedTool.execute(callId, { command, cwd });
-						const text = getTextOutput(result);
-						if (mode === "managed-foreground") {
-							if (!managedForegroundCompletion)
-								throw new Error("expected the actual managed foreground job completion promise");
-							await managedForegroundCompletion;
-						}
-						return { text, artifactIds: artifactIdsInText(text) };
-					} finally {
-						unsubscribeManagedForeground?.();
-					}
-				};
-
-				let prepared: PreparedNewSession | undefined;
-				let heldStat: HeldFilesystemStat | undefined;
-				try {
-					const original = await runInvocation("SOURCE-A");
-					expect(captureSpy).toHaveBeenCalledTimes(1);
-					expect(original.text).toContain("END");
-					const sourceArtifact = await findExactPublishedArtifact(
-						manager,
-						original.text,
-						expectedOutput("SOURCE-A"),
-					);
-					expect(sourceArtifact).toBeDefined();
-					if (!sourceArtifact) throw new Error(`expected real SOURCE-A artifact for ${mode}`);
-					const sourceArtifactsDir = sessionFile.slice(0, -6);
-					const sourceInventory = await readDirectoryBytes(sourceArtifactsDir);
-					const artifactMarkerNames = [...sourceInventory.keys()].filter(name => name.includes(".artifact-id"));
-					expect(artifactMarkerNames.length).toBeGreaterThan(0);
-
-					prepared = await manager.prepareFork();
-					if (!prepared?.sessionFile) throw new Error(`expected a fork candidate for ${mode}`);
-					const successorSessionId = prepared.sessionId;
-					const successorSessionFile = prepared.sessionFile;
-					const successorArtifactsDir = successorSessionFile.slice(0, -6);
-					const successorInventory = await readDirectoryBytes(successorArtifactsDir);
-					expect(successorInventory).toEqual(sourceInventory);
-					for (const markerName of artifactMarkerNames) {
-						expect(successorInventory.get(markerName)).toEqual(sourceInventory.get(markerName));
-					}
-					const inheritedArtifactBytes = successorInventory.get(path.basename(sourceArtifact.path));
-					expect(inheritedArtifactBytes).toEqual(await Bun.file(sourceArtifact.path).bytes());
-
-					heldStat = holdFilesystemStatAfterResult(heldCwd);
-					const retainedInvocation = runInvocation("RETAINED-A", heldCwd);
-					await heldStat.started;
-					expect(captureSpy).toHaveBeenCalledTimes(2);
-					manager.commitPreparedNewSession(prepared);
-					prepared = undefined;
-					expect(manager.getSessionId()).toBe(successorSessionId);
-					heldStat.release();
-
-					const retained = await retainedInvocation;
-					expect(retained.text).toContain("END");
-					expect(retained.text).toContain("Bash output artifact writer failed");
-					expect(retained.text).toContain("Session artifact continuation is no longer authorized.");
-					expect(retained.artifactIds).toEqual([]);
-					const successorAfterRetained = await readDirectoryBytes(successorArtifactsDir);
-					expect(successorAfterRetained).toEqual(successorInventory);
-					for (const [name, bytes] of successorInventory) {
-						expect(await Bun.file(path.join(successorArtifactsDir, name)).bytes()).toEqual(bytes);
-					}
-
-					const successor = await runInvocation("SUCCESSOR-B");
-					expect(captureSpy).toHaveBeenCalledTimes(3);
-					expect(successor.text).toContain("END");
-					expect(successor.artifactIds.length).toBeGreaterThan(0);
-					const successorArtifact = await findExactPublishedArtifact(
-						manager,
-						successor.text,
-						expectedOutput("SUCCESSOR-B"),
-					);
-					expect(successorArtifact).toBeDefined();
-					if (!successorArtifact) throw new Error(`expected real SUCCESSOR-B artifact for ${mode}`);
-					expect(successorArtifact.id).not.toBe(sourceArtifact.id);
-					expect(successorArtifact.path.startsWith(`${successorArtifactsDir}${path.sep}`)).toBe(true);
-					const inheritedAPath = await manager.getArtifactPath(sourceArtifact.id);
-					expect(inheritedAPath).not.toBeNull();
-					if (!inheritedAPath) throw new Error(`expected inherited SOURCE-A artifact after ${mode} commit`);
-					expect(await Bun.file(inheritedAPath).bytes()).toEqual(await Bun.file(sourceArtifact.path).bytes());
-				} finally {
-					heldStat?.release();
-					heldStat?.restore();
-					if (prepared) await manager.discardPreparedNewSession(prepared);
-					if (asyncManager) await asyncManager.dispose();
+				for (const mode of modes) {
 					AsyncJobManager.resetForTests();
-					captureSpy.mockRestore();
-					await manager.close();
+					const modeDir = path.join(testDir, mode);
+					const heldCwd = path.join(modeDir, "held-cwd");
+					fs.mkdirSync(heldCwd, { recursive: true });
+					const manager = SessionManager.create(modeDir, SessionManager.explicitDestination(modeDir));
+					await manager.ensureOnDisk();
+					const sessionFile = manager.getSessionFile();
+					if (!sessionFile) throw new Error(`expected persisted session for ${mode}`);
+
+					const deliveries: Array<{ jobId: string; text: string }> = [];
+					const asyncManager =
+						mode === "native-foreground"
+							? undefined
+							: new AsyncJobManager({
+									onJobComplete: async (jobId, text) => {
+										deliveries.push({ jobId, text });
+									},
+								});
+					if (asyncManager) AsyncJobManager.setInstance(asyncManager);
+					const settings = Settings.isolated({
+						"async.enabled": mode === "async-background" || mode === "monitor",
+						"bash.autoBackground.enabled": false,
+						"tools.artifactHeadBytes": 8,
+						"tools.artifactTailBytes": 8,
+					});
+					const captureSpy = vi.spyOn(manager, "captureArtifactPublication");
+					const expectedOutput = (label: string): string => `${label}\n${"界".repeat(400)}\nEND\n`;
+					const commandFor = (label: string): string =>
+						`printf '${label}\\n'; i=0; while [ "$i" -lt 400 ]; do printf '界'; i=$((i + 1)); done; printf '\\nEND\\n'`;
+					const runInvocation = async (
+						label: string,
+						cwd?: string,
+					): Promise<{ text: string; artifactIds: string[] }> => {
+						const session = createTestToolSession(modeDir, settings, {}, manager);
+						const tool = new BashTool(session);
+						const wrappedTool = wrapToolWithMetaNotice(tool);
+						const command = commandFor(label);
+						const callId = `publisher-${mode}-${label}`;
+						let managedForegroundCompletion: Promise<void> | undefined;
+						let unsubscribeManagedForeground: (() => void) | undefined;
+						if (mode === "managed-foreground") {
+							if (!asyncManager) throw new Error("Managed foreground fixture requires an async job manager");
+							const existingJobIds = new Set(asyncManager.getJobsSnapshot().jobs.map(job => job.id));
+							const captureRegisteredJob = (): void => {
+								for (const entry of asyncManager.getJobsSnapshot().jobs) {
+									if (entry.kind !== "bash" || existingJobIds.has(entry.id)) continue;
+									existingJobIds.add(entry.id);
+									const job = asyncManager.getJob(entry.id);
+									if (!job) continue;
+									managedForegroundCompletion = job.promise;
+									unsubscribeManagedForeground?.();
+									return;
+								}
+							};
+							unsubscribeManagedForeground = asyncManager.onChange(captureRegisteredJob);
+						}
+						if (mode === "monitor") {
+							if (!asyncManager) throw new Error("Monitor fixture requires an async job manager");
+							const rawLines: string[] = [];
+							const started = await tool.startMonitorJob(
+								{ command, cwd },
+								{ onRawLine: line => rawLines.push(line) },
+							);
+							const job = asyncManager.getJob(started.jobId);
+							if (!job) throw new Error("expected the Monitor job in its actual manager");
+							await job.promise;
+							await asyncManager.drainDeliveries({ timeoutMs: 1 });
+							expect(rawLines.join("\n")).toContain(label);
+							const delivery = deliveries.find(item => item.jobId === started.jobId);
+							if (!delivery) throw new Error("expected Monitor's actual job completion delivery");
+							return { text: delivery.text, artifactIds: artifactIdsInText(delivery.text) };
+						}
+
+						if (mode === "async-background") {
+							if (!asyncManager) throw new Error("Async Bash fixture requires an async job manager");
+							const result = await wrappedTool.execute(callId, { command, cwd, async: true });
+							const jobId = result.details?.async?.jobId;
+							if (!jobId) throw new Error("expected the actual async Bash job id");
+							const job = asyncManager.getJob(jobId);
+							if (!job) throw new Error("expected the async Bash job in its actual manager");
+							await job.promise;
+							await asyncManager.drainDeliveries({ timeoutMs: 1 });
+							const delivery = deliveries.find(item => item.jobId === jobId);
+							if (!delivery) throw new Error("expected async Bash's actual job completion delivery");
+							return { text: delivery.text, artifactIds: artifactIdsInText(delivery.text) };
+						}
+
+						try {
+							const result = await wrappedTool.execute(callId, { command, cwd });
+							const text = getTextOutput(result);
+							if (mode === "managed-foreground") {
+								if (!managedForegroundCompletion)
+									throw new Error("expected the actual managed foreground job completion promise");
+								await managedForegroundCompletion;
+							}
+							return { text, artifactIds: artifactIdsInText(text) };
+						} finally {
+							unsubscribeManagedForeground?.();
+						}
+					};
+
+					let prepared: PreparedNewSession | undefined;
+					let heldStat: HeldFilesystemStat | undefined;
+					try {
+						const original = await runInvocation("SOURCE-A");
+						expect(captureSpy).toHaveBeenCalledTimes(1);
+						expect(original.text).toContain("END");
+						const sourceArtifact = await findExactPublishedArtifact(
+							manager,
+							original.text,
+							expectedOutput("SOURCE-A"),
+						);
+						expect(sourceArtifact).toBeDefined();
+						if (!sourceArtifact) throw new Error(`expected real SOURCE-A artifact for ${mode}`);
+						const sourceArtifactsDir = sessionFile.slice(0, -6);
+						const sourceInventory = await readDirectoryBytes(sourceArtifactsDir);
+						const artifactMarkerNames = [...sourceInventory.keys()].filter(name => name.includes(".artifact-id"));
+						expect(artifactMarkerNames.length).toBeGreaterThan(0);
+
+						prepared = await manager.prepareFork();
+						if (!prepared?.sessionFile) throw new Error(`expected a fork candidate for ${mode}`);
+						const successorSessionId = prepared.sessionId;
+						const successorSessionFile = prepared.sessionFile;
+						const successorArtifactsDir = successorSessionFile.slice(0, -6);
+						const successorInventory = await readDirectoryBytes(successorArtifactsDir);
+						expect(successorInventory).toEqual(sourceInventory);
+						for (const markerName of artifactMarkerNames) {
+							expect(successorInventory.get(markerName)).toEqual(sourceInventory.get(markerName));
+						}
+						const inheritedArtifactBytes = successorInventory.get(path.basename(sourceArtifact.path));
+						expect(inheritedArtifactBytes).toEqual(await Bun.file(sourceArtifact.path).bytes());
+
+						heldStat = holdFilesystemStatAfterResult(heldCwd);
+						const retainedInvocation = runInvocation("RETAINED-A", heldCwd);
+						await heldStat.started;
+						expect(captureSpy).toHaveBeenCalledTimes(2);
+						manager.commitPreparedNewSession(prepared);
+						prepared = undefined;
+						expect(manager.getSessionId()).toBe(successorSessionId);
+						heldStat.release();
+
+						const retained = await retainedInvocation;
+						expect(retained.text).toContain("END");
+						expect(retained.text).toContain("Bash output artifact writer failed");
+						expect(retained.text).toContain("Session artifact continuation is no longer authorized.");
+						expect(retained.artifactIds).toEqual([]);
+						const successorAfterRetained = await readDirectoryBytes(successorArtifactsDir);
+						expect(successorAfterRetained).toEqual(successorInventory);
+						for (const [name, bytes] of successorInventory) {
+							expect(await Bun.file(path.join(successorArtifactsDir, name)).bytes()).toEqual(bytes);
+						}
+
+						const successor = await runInvocation("SUCCESSOR-B");
+						expect(captureSpy).toHaveBeenCalledTimes(3);
+						expect(successor.text).toContain("END");
+						expect(successor.artifactIds.length).toBeGreaterThan(0);
+						const successorArtifact = await findExactPublishedArtifact(
+							manager,
+							successor.text,
+							expectedOutput("SUCCESSOR-B"),
+						);
+						expect(successorArtifact).toBeDefined();
+						if (!successorArtifact) throw new Error(`expected real SUCCESSOR-B artifact for ${mode}`);
+						expect(successorArtifact.id).not.toBe(sourceArtifact.id);
+						expect(successorArtifact.path.startsWith(`${successorArtifactsDir}${path.sep}`)).toBe(true);
+						const inheritedAPath = await manager.getArtifactPath(sourceArtifact.id);
+						expect(inheritedAPath).not.toBeNull();
+						if (!inheritedAPath) throw new Error(`expected inherited SOURCE-A artifact after ${mode} commit`);
+						expect(await Bun.file(inheritedAPath).bytes()).toEqual(await Bun.file(sourceArtifact.path).bytes());
+					} finally {
+						heldStat?.release();
+						heldStat?.restore();
+						if (prepared) await manager.discardPreparedNewSession(prepared);
+						if (asyncManager) await asyncManager.dispose();
+						AsyncJobManager.resetForTests();
+						captureSpy.mockRestore();
+						await manager.close();
+					}
 				}
-			}
-		});
+			},
+			{ timeout: 45000 },
+		);
 
 		it("surfaces artifact writer diagnostics on successful Bash results", async () => {
 			const baselineSession = createTestToolSession(testDir);
