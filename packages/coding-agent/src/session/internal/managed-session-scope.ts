@@ -53,6 +53,7 @@ import {
 	acquireManagedLock,
 	assertManagedDirectoryRoot,
 	captureManagedFileNoFollow,
+	captureManagedFileNoFollowBounded,
 	captureManagedFilePrefixNoFollow,
 	copyManagedFileNoReplace,
 	ensureManagedDirectory,
@@ -60,6 +61,7 @@ import {
 	inspectManagedFileNoFollow,
 	isManagedLockQuarantineName,
 	MANAGED_ARTIFACT_COPY_BATCH_SIZE,
+	MANAGED_ARTIFACT_MAX_FILE_BYTES,
 	MANAGED_ARTIFACT_MAX_FILES,
 	MANAGED_ARTIFACT_MAX_TOTAL_BYTES,
 	MANAGED_SESSION_READ_RANGE_MAX_BYTES,
@@ -293,6 +295,7 @@ export type ManagedScopeErrorCode =
 	| "binding_conflict"
 	| "binding_invalid"
 	| "migration_busy"
+	| "managed_gc_journal_capacity_exceeded"
 	| "atomic_unavailable"
 	| "invalid_request"
 	| "durability_failed"
@@ -341,8 +344,13 @@ const managedScopeFailureCodes = new Set<ManagedScopeErrorCode>([
 	"durability_failed",
 	"durability_not_provable",
 	"migration_busy",
+	"managed_gc_journal_capacity_exceeded",
 	"capacity_exceeded",
 ]);
+
+function isManagedGcJournalCapacityError(error: unknown): boolean {
+	return error instanceof Error && error.message === "managed_gc_journal_capacity_exceeded";
+}
 
 /**
  * A scope whose directory outgrew a scan budget. The binding is untouched and
@@ -429,6 +437,7 @@ export type ManagedOpenFailure =
 	| "source_changed"
 	| "unsafe_artifacts"
 	| "artifact_capacity_exceeded"
+	| "managed_gc_journal_capacity_exceeded"
 	| "durability_failed"
 	| "atomic_unavailable"
 	| "invalid_request"
@@ -2025,6 +2034,7 @@ function expectedFailure(error: unknown): ManagedOpenFailure {
 		message === "source_changed" ||
 		message === "unsafe_artifacts" ||
 		message === "artifact_capacity_exceeded" ||
+		message === "managed_gc_journal_capacity_exceeded" ||
 		message === "durability_failed" ||
 		message === "atomic_unavailable" ||
 		message === "invalid_request" ||
@@ -3375,7 +3385,17 @@ function managedGcProtocolFileSnapshot(
 		"file",
 	);
 	if (!security.ok) throw new Error("managed_gc_protocol_file_invalid");
-	const snapshot = store.readExpected(relativePath);
+	let snapshot: ManagedFileSnapshot | null;
+	if (isManagedGcCleanupReceiptPath(relativePath)) {
+		try {
+			snapshot = store.readExpectedBounded(relativePath, CLEANUP_RECEIPT_REPLAY_MAX_BYTES);
+		} catch (error) {
+			if (error instanceof Error && error.message === "artifact_capacity_exceeded") cleanupReceiptReplayCapacity();
+			throw error;
+		}
+	} else {
+		snapshot = store.readExpected(relativePath);
+	}
 	if (!snapshot) throw new Error("managed_gc_protocol_file_missing");
 	const after = fs.lstatSync(pathname, { bigint: true });
 	if (
@@ -3411,6 +3431,28 @@ function managedGcProtocolFileSnapshot(
 			sha256: snapshot.identity.sha256,
 		},
 	};
+}
+
+function isManagedGcPendingCleanupReceiptPath(relativePath: string): boolean {
+	const prefix = `${MANAGED_INTERNAL_DIRECTORY}/${MANAGED_TOMBSTONES_DIRECTORY}/`;
+	if (!relativePath.startsWith(prefix)) return false;
+	return /\.cleanup-pending-[1-9][0-9]*\.json$/u.test(relativePath.slice(prefix.length));
+}
+
+function isManagedGcCleanupReceiptPath(relativePath: string): boolean {
+	const prefix = `${MANAGED_INTERNAL_DIRECTORY}/${MANAGED_TOMBSTONES_DIRECTORY}/`;
+	if (!relativePath.startsWith(prefix)) return false;
+	const match =
+		/^[a-f0-9]{64}\.[a-f0-9]{64}\.cleanup-(pending|artifacts_removed|completed)-([1-9][0-9]*)\.json$/u.exec(
+			relativePath.slice(prefix.length),
+		);
+	if (!match) return false;
+	const attempt = Number(match[2]);
+	return Number.isSafeInteger(attempt) && String(attempt) === match[2] && (match[1] !== "completed" || attempt === 1);
+}
+
+function isManagedGcCleanupLikeName(name: string): boolean {
+	return name.includes(".cleanup-") && name.endsWith(".json");
 }
 
 function managedGcProtocolRecord(
@@ -3631,8 +3673,21 @@ export function managedGcProtocolScopeInspectorForScope(scope: ManagedScope): Ma
 						if (!name || path.basename(name) !== name || name.includes(".jsonl"))
 							throw new Error(`managed_gc_protocol_entry_invalid:${role}/${name}`);
 						const relative = `${MANAGED_INTERNAL_DIRECTORY}/${role}/${name}`;
+						const cleanupLike = role === MANAGED_TOMBSTONES_DIRECTORY && isManagedGcCleanupLikeName(name);
+						if (cleanupLike && !isManagedGcCleanupReceiptPath(relative))
+							throw new Error("managed_gc_protocol_tombstone_role_invalid");
+						const pendingCleanup =
+							role === MANAGED_TOMBSTONES_DIRECTORY && isManagedGcPendingCleanupReceiptPath(relative);
 						let captured: ReturnType<typeof managedGcProtocolFileSnapshot>;
 						try {
+							if (pendingCleanup)
+								validateManagedGcProtocolTombstoneFile(
+									candidateScope,
+									path.join(directory.path, name),
+									name,
+									new Uint8Array(),
+									journals,
+								);
 							captured = managedGcProtocolFileSnapshot(candidateScope, store, relative);
 							if (role === MANAGED_LOCKS_DIRECTORY) {
 								if (isManagedLockQuarantineName(name)) {
@@ -3675,15 +3730,17 @@ export function managedGcProtocolScopeInspectorForScope(scope: ManagedScope): Ma
 									);
 								}
 							} else {
-								validateManagedGcProtocolTombstoneFile(
-									candidateScope,
-									path.join(directory.path, name),
-									name,
-									captured.snapshot.bytes,
-									journals,
-								);
+								if (!pendingCleanup)
+									validateManagedGcProtocolTombstoneFile(
+										candidateScope,
+										path.join(directory.path, name),
+										name,
+										captured.snapshot.bytes,
+										journals,
+									);
 							}
 						} catch (error) {
+							if (isManagedGcJournalCapacityError(error)) throw error;
 							const detail = error instanceof Error ? error.message : "unknown";
 							throw new Error(`${detail} [${role}/${name}]`);
 						}
@@ -4811,33 +4868,112 @@ function artifactTreeSnapshot(value: unknown): NativeDirectoryTreeSnapshot | und
 	return snapshot as unknown as NativeDirectoryTreeSnapshot;
 }
 
+const CLEANUP_RECEIPT_REPLAY_MAX_BYTES = Math.min(
+	MANAGED_ARTIFACT_MAX_FILE_BYTES,
+	MANAGED_SESSION_READ_RANGE_MAX_BYTES,
+);
+const CLEANUP_RECEIPT_REPLAY_MAX_WORK = MANAGED_ARTIFACT_MAX_FILES * 2;
+const CLEANUP_RECEIPT_REPLAY_CHUNK_BYTES = 64 * 1024;
+
+interface CleanupReceiptReplayBudget {
+	workUnits: number;
+	directoryEntries: number;
+	receiptReads: number;
+	readBytes: number;
+}
+
+function cleanupReceiptReplayCapacity(): never {
+	throw new Error("managed_gc_journal_capacity_exceeded");
+}
+
+function chargeCleanupReceiptReplayWork(budget: CleanupReceiptReplayBudget, amount = 1): void {
+	if (!Number.isSafeInteger(amount) || amount < 0 || budget.workUnits > CLEANUP_RECEIPT_REPLAY_MAX_WORK - amount)
+		cleanupReceiptReplayCapacity();
+	budget.workUnits += amount;
+}
+
+function admitCleanupReceiptReplayEntry(budget: CleanupReceiptReplayBudget): void {
+	if (budget.directoryEntries >= MANAGED_ARTIFACT_MAX_FILES) cleanupReceiptReplayCapacity();
+	chargeCleanupReceiptReplayWork(budget);
+	budget.directoryEntries++;
+}
+
+function admitCleanupReceiptReplayRead(budget: CleanupReceiptReplayBudget, size: number): void {
+	if (
+		!Number.isSafeInteger(size) ||
+		size < 0 ||
+		size > CLEANUP_RECEIPT_REPLAY_MAX_BYTES ||
+		budget.receiptReads >= MANAGED_ARTIFACT_MAX_FILES ||
+		budget.readBytes > MANAGED_ARTIFACT_MAX_TOTAL_BYTES - size
+	)
+		cleanupReceiptReplayCapacity();
+	chargeCleanupReceiptReplayWork(budget, Math.max(1, Math.ceil(size / CLEANUP_RECEIPT_REPLAY_CHUNK_BYTES)));
+	budget.receiptReads++;
+	budget.readBytes += size;
+}
+
 function pendingCleanupReceipt(
 	scope: ManagedScope,
 	tombstone: string,
 	target: RetiredTarget,
 ): CleanupReceipt | undefined {
+	const budget: CleanupReceiptReplayBudget = { workUnits: 0, directoryEntries: 0, receiptReads: 0, readBytes: 0 };
 	try {
 		const prefix = `${path.basename(tombstone, ".json")}.${stableOperationName(target)}.cleanup-pending-`;
-		const records = fs
-			.readdirSync(path.dirname(tombstone))
-			.filter(name => name.startsWith(prefix) && name.endsWith(".json"))
-			.map(
-				name =>
-					JSON.parse(
-						captureManagedFileNoFollow(path.join(path.dirname(tombstone), name)).bytes.toString("utf8"),
-					) as unknown,
-			)
-			.filter(
-				(value): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value),
-			)
-			.sort((left, right) => Number(left.attempt) - Number(right.attempt));
+		const directory = fs.opendirSync(path.dirname(tombstone));
+		const records: Array<{ readonly name: string; readonly attempt: number }> = [];
+		try {
+			for (;;) {
+				const entry = directory.readSync();
+				if (!entry) break;
+				admitCleanupReceiptReplayEntry(budget);
+				if (!entry.name.startsWith(prefix) || !entry.name.endsWith(".json")) continue;
+				const suffix = entry.name.slice(prefix.length, -".json".length);
+				if (!/^[1-9][0-9]*$/u.test(suffix)) throw new Error("durability_failed");
+				const attempt = Number(suffix);
+				if (!Number.isSafeInteger(attempt) || String(attempt) !== suffix) throw new Error("durability_failed");
+				if (records.length >= MANAGED_ARTIFACT_MAX_FILES) cleanupReceiptReplayCapacity();
+				records.push({ name: entry.name, attempt });
+			}
+		} finally {
+			directory.closeSync();
+		}
+		records.sort((left, right) => left.attempt - right.attempt);
 		let latest: CleanupReceipt | undefined;
 		const plannedPaths = new Set<string>();
-		for (const record of records)
-			latest = parseCleanupReceiptRecord(scope, tombstone, target, record, latest, plannedPaths);
+		for (const { name, attempt } of records) {
+			let snapshot: ManagedFileSnapshot;
+			try {
+				snapshot = captureManagedFileNoFollowBounded(
+					path.join(path.dirname(tombstone), name),
+					CLEANUP_RECEIPT_REPLAY_MAX_BYTES,
+					size => admitCleanupReceiptReplayRead(budget, size),
+				);
+			} catch (error) {
+				if (error instanceof Error && error.message === "artifact_capacity_exceeded")
+					cleanupReceiptReplayCapacity();
+				throw error;
+			}
+			const value: unknown = JSON.parse(snapshot.bytes.toString("utf8"));
+			if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("durability_failed");
+			latest = parseCleanupReceiptRecord(
+				scope,
+				tombstone,
+				target,
+				value as Record<string, unknown>,
+				attempt,
+				latest,
+				plannedPaths,
+			);
+		}
 		return latest;
 	} catch (error) {
-		if ((error as Error).message === "durability_failed" || isOwnerBoundaryFailure(error)) throw error;
+		if (
+			(error as Error).message === "durability_failed" ||
+			(error as Error).message === "managed_gc_journal_capacity_exceeded" ||
+			isOwnerBoundaryFailure(error)
+		)
+			throw error;
 		return undefined;
 	}
 }
@@ -4847,6 +4983,7 @@ function parseCleanupReceiptRecord(
 	tombstone: string,
 	target: RetiredTarget,
 	record: Record<string, unknown>,
+	filenameAttempt: number,
 	latest: CleanupReceipt | undefined,
 	plannedPaths: Set<string>,
 ): CleanupReceipt {
@@ -4866,6 +5003,7 @@ function parseCleanupReceiptRecord(
 		record.tombstone !== tombstone ||
 		typeof attempt !== "number" ||
 		!Number.isSafeInteger(attempt) ||
+		attempt !== filenameAttempt ||
 		attempt !== (latest?.attempt ?? 0) + 1 ||
 		recorded?.path !== target.path ||
 		recorded.sessionId !== target.sessionId ||
@@ -5184,7 +5322,7 @@ async function cleanupCompleted(scope: ManagedScope, tombstone: string, target: 
 		);
 		return cleanupCompletedRecordMatches(scope, tombstone, target, ownerReceipt, value);
 	} catch (error) {
-		if (isOwnerBoundaryFailure(error)) throw error;
+		if (isOwnerBoundaryFailure(error) || isManagedGcJournalCapacityError(error)) throw error;
 		return false;
 	}
 }
@@ -6394,6 +6532,7 @@ export async function reconcileManagedTombstones(
 					fsyncManagedParent(target.path);
 					await publishCleanupCompleted(scope, tombstone, target, lock);
 				} catch (error) {
+					if (isManagedGcJournalCapacityError(error)) throw error;
 					if (!expectedCandidate || target.sessionId === expectedCandidate.sessionId) throw error;
 					logger.warn("Tombstone reconciliation failed for one target; will retry on a future scope open", {
 						tombstone,

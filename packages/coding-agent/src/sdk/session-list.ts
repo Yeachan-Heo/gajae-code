@@ -17,6 +17,7 @@ export const SESSION_LIST_SAVED_SESSION_OMISSION_DETAIL_CODES = [
 	"binding_conflict",
 	"binding_invalid",
 	"migration_busy",
+	"managed_gc_journal_capacity_exceeded",
 	"atomic_unavailable",
 	"invalid_request",
 	"durability_failed",
