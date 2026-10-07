@@ -33,35 +33,38 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 	const lock = `${file}.lock`;
 	const parked = `${lock}.removing`;
 	await fs.mkdir(lock);
-	await Bun.write(path.join(lock, "info"), JSON.stringify({ pid: DEAD_PID, timestamp: 1000 }));
+	const infoPath = path.join(lock, "info");
+	await Bun.write(infoPath, JSON.stringify({ pid: DEAD_PID, timestamp: 1000 }));
 	let nativeIdentityChanged = false;
 	const realLstat = fs.lstat;
-	const normalizePath = (p: string): string => path.normalize(p).toLowerCase();
-	const transformStat = (target: string, stat: BigIntStats): BigIntStats => {
-		const normalized = normalizePath(target);
+	// Identify fixture objects independently of path aliases returned by Windows realpath.
+	const lockIdentity = (await realLstat(lock, { bigint: true })) as BigIntStats;
+	const infoIdentity = (await realLstat(infoPath, { bigint: true })) as BigIntStats;
+	const parentIdentity = detach ? ((await realLstat(root, { bigint: true })) as BigIntStats) : undefined;
+	const sameFileIdentity = (left: BigIntStats, right: BigIntStats): boolean =>
+		BigInt.asUintN(64, left.dev) === BigInt.asUintN(64, right.dev) &&
+		BigInt.asUintN(64, left.ino) === BigInt.asUintN(64, right.ino);
+	const transformStat = (stat: BigIntStats): BigIntStats => {
 		const isRoot =
-			normalized === normalizePath(lock) ||
-			normalized === normalizePath(parked) ||
-			(detach && normalized === normalizePath(root));
-		const isInfo =
-			normalized === normalizePath(path.join(lock, "info")) ||
-			normalized === normalizePath(path.join(parked, "info"));
+			sameFileIdentity(stat, lockIdentity) ||
+			(parentIdentity !== undefined && sameFileIdentity(stat, parentIdentity));
+		const isInfo = sameFileIdentity(stat, infoIdentity);
 		const id = isRoot && component !== "info" ? ROOT_ID : isInfo && component !== "root" ? INFO_ID : null;
 		if (id === null) return stat;
 		return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { ino: BigInt.asIntN(64, id) });
 	};
 	vi.spyOn(fs, "lstat").mockImplementation((async (target, options) => {
 		const stat = await realLstat(target, options);
-		return typeof stat.ino === "bigint" ? transformStat(String(target), stat as BigIntStats) : stat;
+		return typeof stat.ino === "bigint" ? transformStat(stat as BigIntStats) : stat;
 	}) as typeof fs.lstat);
 	const realOpen = fs.open;
 	vi.spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
 		const handle = await realOpen(target, flags, mode);
-		if (normalizePath(String(target)) === normalizePath(path.join(lock, "info"))) {
+		if (sameFileIdentity((await handle.stat({ bigint: true })) as BigIntStats, infoIdentity)) {
 			const realStat = handle.stat.bind(handle);
 			vi.spyOn(handle, "stat").mockImplementation((async options => {
 				const stat = await realStat(options);
-				return typeof stat.ino === "bigint" ? transformStat(String(target), stat as BigIntStats) : stat;
+				return typeof stat.ino === "bigint" ? transformStat(stat as BigIntStats) : stat;
 			}) as typeof handle.stat);
 		}
 		return handle;
