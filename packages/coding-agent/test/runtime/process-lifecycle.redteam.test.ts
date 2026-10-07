@@ -106,7 +106,7 @@ describe("process-lifecycle adversarial owned-process invariants", () => {
 		await waitFor(() => liveOwnedProcessCount() === before, 2_000, "live count baseline after immediate dispose");
 	});
 
-	test("dispose of an already-exited process is a no-op and does not throw", async () => {
+	test.skipIf(!isPosix)("dispose of an already-exited process is a no-op and does not throw", async () => {
 		const before = liveOwnedProcessCount();
 		const owner = spawnOwnedProcess(exitCodeCommand(7), { name: "redteam-already-exited" });
 		const exit = await owner.awaitExit({ timeoutMs: 2_000 });

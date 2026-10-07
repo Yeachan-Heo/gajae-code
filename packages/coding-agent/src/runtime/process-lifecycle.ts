@@ -20,6 +20,12 @@
  * owner registered until the group is actually gone, so the descendant tree is
  * still reaped by `dispose()`/postmortem.
  *
+ * Windows currently pins the root handle and verifies observable ancestry;
+ * it does not atomically contain the tree. A root that exits before the first
+ * observation retains an incomplete owner even when it appears clean. An
+ * intermediate lost before a live root's first observation can also escape;
+ * full containment requires a separate owned Job Object spawn implementation.
+ *
  * This module intentionally owns only these primitives. It does not migrate
  * existing call sites; subsystem PRs adopt it incrementally.
  *
@@ -162,7 +168,7 @@ export interface OwnedProcessTeardownResult {
 	status: OwnedProcessTeardownStatus;
 }
 
-/** A spawned child process owned by the runtime with guaranteed teardown. */
+/** A spawned child registered for bounded, identity-aware runtime teardown. */
 export interface OwnedProcess {
 	readonly child: ptree.ChildProcess;
 	readonly pid: number | undefined;

@@ -1,0 +1,2 @@
+### Fixed
+- Windows owned-process cleanup now retains incomplete ownership when the root exited before descendant ancestry was observed, instead of reporting success while an escaped grandchild may still run. Verified descendants keep pinned handles across teardown waves; unverifiable parent links fail closed. Complete Windows containment still requires an atomic owned-spawn Job Object implementation.

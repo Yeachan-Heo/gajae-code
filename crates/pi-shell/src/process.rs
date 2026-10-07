@@ -1323,7 +1323,7 @@ mod platform {
 			let Some(tree) = build_process_tree() else {
 				return Vec::new();
 			};
-			Self::children_from_tree(self.pid, &tree)
+			Self::children_from_tree(self, &tree)
 		}
 
 		/// Walk the entire descendant tree using a single Toolhelp snapshot.
@@ -1332,26 +1332,41 @@ mod platform {
 		/// table for every visited descendant, making tree termination
 		/// `O(N · D)` snapshots. One snapshot per termination wave is enough.
 		pub fn descendants(&self) -> Vec<Self> {
-			self.descendants_observed().unwrap_or_default()
+			self
+				.descendants_observed()
+				.unwrap_or_default()
+				.into_iter()
+				.filter(|process| process.status() == ProcessStatus::Running)
+				.collect()
 		}
 
 		/// `None` when the Toolhelp snapshot could not be taken at all. Callers
 		/// that terminate descendants MUST NOT treat that as an empty
 		/// descendant set.
 		pub fn descendants_observed(&self) -> Option<Vec<Self>> {
+			self.descendants_observed_from_roots(&[])
+		}
+
+		/// Include previously pinned descendants as traversal roots. Their
+		/// handles preserve the original parent incarnation after an
+		/// intermediate exits.
+		pub fn descendants_observed_from_roots(&self, retained: &[Self]) -> Option<Vec<Self>> {
 			let tree = build_process_tree()?;
-			let Ok(root) = u32::try_from(self.pid) else {
-				return Some(Vec::new());
-			};
 			let mut visited: HashSet<u32> = HashSet::new();
-			visited.insert(root);
 			let mut out = Vec::new();
-			Self::collect_descendants_from_tree(root, &tree, &mut visited, &mut out);
+			for root in std::iter::once(self).chain(retained) {
+				let current = Self::from_pid(root.pid)?;
+				if current.creation_time != root.creation_time {
+					return None;
+				}
+				visited.insert(u32::try_from(root.pid).ok()?);
+				Self::collect_descendants_from_tree(root, &tree, &mut visited, &mut out)?;
+			}
 			Some(out)
 		}
 
-		fn children_from_tree(pid: i32, tree: &HashMap<u32, SmallVec<[u32; 4]>>) -> Vec<Self> {
-			let Ok(pid_u32) = u32::try_from(pid) else {
+		fn children_from_tree(parent: &Self, tree: &HashMap<u32, SmallVec<[u32; 4]>>) -> Vec<Self> {
+			let Ok(pid_u32) = u32::try_from(parent.pid) else {
 				return Vec::new();
 			};
 			tree
@@ -1360,38 +1375,44 @@ mod platform {
 				.flatten()
 				.filter_map(|&child_pid| {
 					let child = Self::from_pid(i32::try_from(child_pid).ok()?)?;
-					(child.status() == ProcessStatus::Running).then_some(child)
+					(child.belongs_to(parent) && child.status() == ProcessStatus::Running)
+						.then_some(child)
 				})
 				.collect()
 		}
 
+		fn belongs_to(&self, parent: &Self) -> bool {
+			self.parent_pid() == Some(parent.pid) && self.creation_time >= parent.creation_time
+		}
+
 		fn collect_descendants_from_tree(
-			parent: u32,
+			parent: &Self,
 			tree: &HashMap<u32, SmallVec<[u32; 4]>>,
 			visited: &mut HashSet<u32>,
 			out: &mut Vec<Self>,
-		) {
-			let Some(children) = tree.get(&parent) else {
-				return;
+		) -> Option<()> {
+			let parent_pid = u32::try_from(parent.pid).ok()?;
+			let Some(children) = tree.get(&parent_pid) else {
+				return Some(());
 			};
 			for &child_pid in children {
 				if !visited.insert(child_pid) {
 					continue;
 				}
-				let Ok(child_pid_i) = i32::try_from(child_pid) else {
-					continue;
-				};
-				let Some(child) = Self::from_pid(child_pid_i) else {
-					continue;
-				};
-				if child.status() != ProcessStatus::Running {
-					continue;
+				let child = Self::from_pid(i32::try_from(child_pid).ok()?)?;
+				// Toolhelp stores numeric parent links. Revalidate both the child's
+				// actual parent and its creation time against the pinned parent before
+				// accepting authority; a stale snapshot must never select a reused PID.
+				if !child.belongs_to(parent) {
+					return None;
 				}
 				// Post-order: collect grandchildren first so leaves are signalled before
 				// their parents during tree termination.
-				Self::collect_descendants_from_tree(child_pid, tree, visited, out);
+				// An exited intermediate can still lead to running grandchildren.
+				Self::collect_descendants_from_tree(&child, tree, visited, out)?;
 				out.push(child);
 			}
+			Some(())
 		}
 
 		pub fn kill(&self, _signal: i32) -> bool {
@@ -1422,6 +1443,117 @@ mod platform {
 			} else {
 				ProcessStatus::Running
 			}
+		}
+	}
+
+	#[cfg(test)]
+	mod windows_tree_tests {
+		use std::process::{Command, Stdio};
+
+		use super::*;
+		use crate::process::KILL_SIGNAL;
+
+		struct FixtureProcess(Process);
+
+		impl Drop for FixtureProcess {
+			fn drop(&mut self) {
+				if self.0.status() == ProcessStatus::Running {
+					let _ = self.0.kill(KILL_SIGNAL);
+					for _ in 0..200 {
+						if self.0.status() == ProcessStatus::Exited {
+							break;
+						}
+						std::thread::sleep(std::time::Duration::from_millis(10));
+					}
+				}
+			}
+		}
+
+		#[test]
+		fn rejects_unverified_parent_links_and_newer_parent_incarnations() {
+			let mut command = Command::new("powershell.exe")
+				.args(["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30"])
+				.stdout(Stdio::null())
+				.stderr(Stdio::null())
+				.spawn()
+				.expect("spawn owned fixture");
+			let fixture = FixtureProcess(
+				Process::from_pid(i32::try_from(command.id()).expect("fixture PID"))
+					.expect("pin fixture"),
+			);
+			let parent = Process::from_pid(i32::try_from(std::process::id()).expect("test PID"))
+				.expect("pin actual parent");
+			assert!(fixture.0.belongs_to(&parent));
+			let mut newer_parent = parent.clone();
+			newer_parent.creation_time = fixture.0.creation_time + 1;
+			assert!(
+				!fixture.0.belongs_to(&newer_parent),
+				"a reused parent PID must not acquire an older child"
+			);
+			let mut forged_parent = parent.clone();
+			forged_parent.pid = fixture.0.pid;
+			let tree = HashMap::from([(
+				u32::try_from(forged_parent.pid).expect("parent PID"),
+				SmallVec::from_slice(&[u32::try_from(fixture.0.pid).expect("child PID")]),
+			)]);
+			let mut observed = Vec::new();
+			assert!(
+				Process::collect_descendants_from_tree(
+					&forged_parent,
+					&tree,
+					&mut HashSet::new(),
+					&mut observed
+				)
+				.is_none()
+			);
+			assert!(observed.is_empty(), "an unverified numeric edge grants no signal authority");
+			assert_eq!(
+				fixture.0.status(),
+				ProcessStatus::Running,
+				"verification must never signal the unrelated candidate"
+			);
+			let _ = fixture.0.kill(KILL_SIGNAL);
+			let _ = command.wait();
+		}
+
+		#[test]
+		fn retained_intermediate_handle_recovers_descendants_after_parent_exit() {
+			let script = "$child = Start-Process -FilePath powershell.exe -WindowStyle Hidden \
+			              -ArgumentList '-NoProfile -NonInteractive -Command Start-Sleep -Seconds \
+			              30' -PassThru; [Console]::Out.WriteLine($child.Id); $child.Dispose(); \
+			              Start-Sleep -Milliseconds 100";
+			let command = Command::new("powershell.exe")
+				.args(["-NoProfile", "-NonInteractive", "-Command", script])
+				.stdout(Stdio::piped())
+				.spawn()
+				.expect("spawn intermediate fixture");
+			let intermediate = FixtureProcess(
+				Process::from_pid(i32::try_from(command.id()).expect("intermediate PID"))
+					.expect("pin intermediate before exit"),
+			);
+			let output = command.wait_with_output().expect("wait for intermediate");
+			let leaf_pid = String::from_utf8_lossy(&output.stdout)
+				.trim()
+				.parse()
+				.expect("fixture leaf PID");
+			let leaf = FixtureProcess(Process::from_pid(leaf_pid).expect("pin leaf"));
+			assert_eq!(intermediate.0.status(), ProcessStatus::Exited);
+			assert!(leaf.0.belongs_to(&intermediate.0));
+			let root = Process::from_pid(i32::try_from(std::process::id()).expect("test PID"))
+				.expect("pin root");
+			let without_retained = root.descendants_observed().expect("observe root tree");
+			assert!(
+				!without_retained
+					.iter()
+					.any(|process| process.pid == leaf_pid),
+				"exited intermediate must actually be absent from the live parent walk"
+			);
+			let recovered = root
+				.descendants_observed_from_roots(&[intermediate.0.clone()])
+				.expect("retained ancestry must remain queryable");
+			assert!(recovered.iter().any(
+				|process| process.pid == leaf_pid && process.creation_time == leaf.0.creation_time
+			));
 		}
 	}
 
@@ -1978,6 +2110,30 @@ impl Process {
 		)
 	}
 
+	/// Preserve every verified Windows process handle across signal waves, even
+	/// after its parent exits and the next Toolhelp snapshot loses that edge.
+	#[cfg(target_os = "windows")]
+	fn extend_windows_descendants(&self, retained: &mut Vec<Self>) -> Result<()> {
+		let roots: Vec<_> = retained
+			.iter()
+			.map(|process| process.inner.clone())
+			.collect();
+		let observed = require_observed_descendants(
+			self.inner.descendants_observed_from_roots(&roots),
+			"could not verify the pinned Windows descendant tree",
+		)?;
+		for child in observed {
+			if let Some(known) = retained.iter().find(|known| known.pid() == child.pid()) {
+				if known.incarnation() != child.incarnation() {
+					return Err(anyhow!("pinned Windows descendant incarnation changed"));
+				}
+			} else {
+				retained.push(Self::from_inner(child));
+			}
+		}
+		Ok(())
+	}
+
 	fn signal_tree(&self, signal: i32) -> Result<u32> {
 		let descendants = require_observed_descendants(
 			self.live_descendants_observed(),
@@ -2030,11 +2186,12 @@ impl Process {
 	) -> Result<bool> {
 		if self.status() != ProcessStatus::Running {
 			// A process can exit after spawning background descendants. On Windows
-			// the stable process handle keeps the original PID incarnation pinned,
-			// so we can still enumerate and terminate its children safely. Other
-			// platforms need their process-group owner to reconcile this case.
+			// drain what can still be verified, but an empty snapshot cannot prove
+			// that an already-exited intermediate left no hidden grandchildren.
 			#[cfg(target_os = "windows")]
-			return self.terminate_exited_root_tree(timeout_ms, ct).await;
+			return self
+				.terminate_exited_root_tree(timeout_ms, ct, &mut Vec::new(), false)
+				.await;
 			#[cfg(not(target_os = "windows"))]
 			return Ok(true);
 		}
@@ -2066,7 +2223,9 @@ impl Process {
 			.await?;
 			if exited {
 				#[cfg(target_os = "windows")]
-				return self.terminate_exited_root_tree(timeout_ms, ct).await;
+				return self
+					.terminate_exited_root_tree(timeout_ms, ct, &mut descendants, true)
+					.await;
 				#[cfg(not(target_os = "windows"))]
 				return Ok(true);
 			}
@@ -2077,10 +2236,15 @@ impl Process {
 		if let Some(pgid) = process_group {
 			let _ = kill_process_group(pgid, KILL_SIGNAL);
 		}
-		descendants = require_observed_descendants(
-			self.live_descendants_observed(),
-			"could not observe the owned process tree before hard termination",
-		)?;
+		#[cfg(target_os = "windows")]
+		self.extend_windows_descendants(&mut descendants)?;
+		#[cfg(not(target_os = "windows"))]
+		{
+			descendants = require_observed_descendants(
+				self.live_descendants_observed(),
+				"could not observe the owned process tree before hard termination",
+			)?;
+		}
 		for child in &descendants {
 			let _ = child.inner.kill(KILL_SIGNAL);
 		}
@@ -2097,7 +2261,9 @@ impl Process {
 			return Ok(false);
 		}
 		#[cfg(target_os = "windows")]
-		return self.terminate_exited_root_tree(timeout_ms, ct).await;
+		return self
+			.terminate_exited_root_tree(timeout_ms, ct, &mut descendants, true)
+			.await;
 		#[cfg(not(target_os = "windows"))]
 		Ok(true)
 	}
@@ -2105,20 +2271,36 @@ impl Process {
 	/// Drain descendants after the root has exited. Re-snapshot after every
 	/// termination wave because a descendant may have spawned another process
 	/// while the previous snapshot was being signalled. A missing/inconclusive
-	/// snapshot is an error, never proof that the tree is empty.
+	/// snapshot is an error, never proof that the tree is empty. Without atomic
+	/// Job Object containment, a root already exited before our first
+	/// observation cannot establish complete ancestry. Even a live root's first
+	/// snapshot can miss a previously exited intermediate; this path does not
+	/// claim containment of descendants that were never observed or pinned.
 	#[cfg(target_os = "windows")]
-	async fn terminate_exited_root_tree(&self, timeout_ms: u32, ct: CancelToken) -> Result<bool> {
+	async fn terminate_exited_root_tree(
+		&self,
+		timeout_ms: u32,
+		ct: CancelToken,
+		descendants: &mut Vec<Self>,
+		observed_while_running: bool,
+	) -> Result<bool> {
 		let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
 		loop {
 			ct.heartbeat()?;
-			let descendants = require_observed_descendants(
-				self.live_descendants_observed(),
-				"could not verify the exited root's descendant tree",
-			)?;
-			if descendants.is_empty() {
+			self.extend_windows_descendants(descendants)?;
+			if descendants
+				.iter()
+				.all(|process| process.status() != ProcessStatus::Running)
+			{
+				if !observed_while_running {
+					return Err(anyhow!(
+						"Windows root exited before descendant ownership was observed; ancestry is \
+						 unknown without atomic containment; refusing to report tree teardown complete"
+					));
+				}
 				return Ok(true);
 			}
-			for child in &descendants {
+			for child in descendants.iter() {
 				let _ = child.inner.kill(KILL_SIGNAL);
 			}
 			let remaining = deadline.saturating_duration_since(Instant::now());
@@ -2126,7 +2308,7 @@ impl Process {
 				return Ok(false);
 			}
 			let wait = remaining.min(Duration::from_millis(25));
-			let _ = wait_for_exit(self, &descendants, Some(wait), ct.clone()).await?;
+			let _ = wait_for_exit(self, descendants, Some(wait), ct.clone()).await?;
 		}
 	}
 }
@@ -2731,8 +2913,8 @@ mod tests {
 	}
 
 	/// A root that exits after launching a background child still owns that
-	/// descendant. Reconciliation must use the pinned root incarnation, observe
-	/// the child tree, and terminate the child before reporting success.
+	/// descendant. Reconciliation kills the verified child, but without ancestry
+	/// observed before root exit it must retain an incomplete result.
 	#[cfg(target_os = "windows")]
 	#[test]
 	fn terminate_tree_reaps_descendants_after_root_exit() {
@@ -2766,6 +2948,7 @@ mod tests {
 			.build()
 			.expect("build test runtime");
 		let result = runtime.block_on(root.terminate_tree(false, -1, 2_000, CancelToken::new(None)));
+		let descendant_status_after_teardown = descendant.status();
 		// Keep fixture cleanup explicit even when the regression assertion fails.
 		if descendant.status() == ProcessStatus::Running {
 			let _ = descendant.inner.kill(KILL_SIGNAL);
@@ -2776,7 +2959,13 @@ mod tests {
 				thread::sleep(StdDuration::from_millis(10));
 			}
 		}
-		assert!(result.expect("tree teardown should reconcile successfully"));
+		let error = result.expect_err("unobserved ancestry must never claim complete tree teardown");
+		assert!(
+			error
+				.to_string()
+				.contains("root exited before descendant ownership was observed")
+		);
+		assert_eq!(descendant_status_after_teardown, ProcessStatus::Exited);
 		assert_eq!(descendant.status(), ProcessStatus::Exited);
 	}
 

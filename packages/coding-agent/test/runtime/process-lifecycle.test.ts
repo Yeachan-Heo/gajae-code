@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { fileURLToPath } from "node:url";
 import {
 	disposeAllOwnedProcesses,
 	disposeAllResourceOwners,
@@ -7,11 +8,42 @@ import {
 	resourceOwnerCount,
 	spawnOwnedProcess,
 } from "@gajae-code/coding-agent/runtime/process-lifecycle";
-import type { Process } from "@gajae-code/natives";
-import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 
 const isPosix = process.platform !== "win32";
 const isWindows = process.platform === "win32";
+
+interface WindowsProbeReport {
+	result: { status: string };
+	rootStatus: string;
+	rootIdentity: string;
+	leafStatus: string;
+	leafIdentity: string;
+	launcherStatus?: string;
+	controlStatus: string;
+	retainedOwners: number;
+	ownerDisposed: boolean;
+	diagnostic: string;
+}
+
+async function runWindowsProbe(mode: string): Promise<WindowsProbeReport> {
+	// Incomplete owners are intentionally retained. Isolate that registry state
+	// in a child runtime while its fixture finally cleans every pinned process.
+	const child = Bun.spawn(
+		[
+			process.execPath,
+			fileURLToPath(new URL("../fixtures/process-lifecycle-windows-probe.ts", import.meta.url)),
+			mode,
+		],
+		{ stdout: "pipe", stderr: "pipe" },
+	);
+	const [code, stdout, stderr] = await Promise.all([
+		child.exited,
+		new Response(child.stdout).text(),
+		new Response(child.stderr).text(),
+	]);
+	if (code !== 0) throw new Error(`Windows ${mode} fixture failed (${code}): ${stderr}\n${stdout}`);
+	return JSON.parse(stdout.trim()) as WindowsProbeReport;
+}
 
 async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
@@ -214,37 +246,52 @@ describe("ownership regression: group liveness drives teardown (F1a)", () => {
 		await waitFor(() => liveOwnedProcessCount() === before);
 	});
 
-	test.skipIf(!isWindows)("reconciles a Windows descendant after its root exits", async () => {
-		const before = liveOwnedProcessCount();
-		const script =
-			"$child = Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile -NonInteractive -Command Start-Sleep -Seconds 30' -PassThru; [Console]::Out.WriteLine($child.Id); Start-Sleep -Milliseconds 100";
-		const owner = spawnOwnedProcess(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], {
-			name: "windows-root-exits-first",
-		});
-		let descendant: Process | null = null;
-		try {
-			const [rootExit, stdout] = await Promise.all([
-				owner.awaitExit({ timeoutMs: 5_000 }),
-				new Response(owner.child.stdout).text(),
-			]);
-			expect(rootExit.exited).toBe(true);
-			const descendantPid = Number(stdout.trim());
-			expect(Number.isInteger(descendantPid)).toBe(true);
-			descendant = nativeProcessBindings().Process.fromPid(descendantPid);
-			expect(descendant).not.toBeNull();
-			if (!descendant) throw new Error("could not pin the fixture descendant");
-			const pinnedDescendant = descendant;
-			const processBindings = nativeProcessBindings();
-			expect(pinnedDescendant.status()).toBe(processBindings.ProcessStatus.Running);
-			await waitFor(() => pinnedDescendant.status() === processBindings.ProcessStatus.Exited, 5_000);
-			await waitFor(() => liveOwnedProcessCount() === before, 5_000);
-		} finally {
-			await owner.dispose();
-			if (descendant && descendant.status() === nativeProcessBindings().ProcessStatus.Running) {
-				await descendant.terminate({ gracefulMs: -1, timeoutMs: 1_000 }).catch(() => false);
-			}
-		}
-	});
+	test.skipIf(!isWindows)(
+		"retains Windows ownership when an exited intermediary hides a live grandchild",
+		async () => {
+			const report = await runWindowsProbe("exited-intermediate");
+			expect(report.result).toEqual({ status: "identity_unverified" });
+			expect(report.rootStatus).toBe("exited");
+			expect(report.launcherStatus).toBe("exited");
+			expect(report.leafStatus).toBe("running");
+			expect(report.controlStatus).toBe("running");
+			expect(report.retainedOwners).toBe(2);
+			expect(report.ownerDisposed).toBe(false);
+			expect(report.diagnostic).toContain("root exited before descendant ownership was observed");
+			expect(report.rootIdentity).toMatch(/^windows:\d+$/);
+			expect(BigInt(report.leafIdentity.slice(8))).toBeGreaterThan(BigInt(report.rootIdentity.slice(8)));
+		},
+		30_000,
+	);
+
+	test.skipIf(!isWindows)(
+		"drains a verified Windows child after root exit without claiming complete ancestry",
+		async () => {
+			const report = await runWindowsProbe("exited-direct");
+			expect(report.result).toEqual({ status: "identity_unverified" });
+			expect(report.rootStatus).toBe("exited");
+			expect(report.leafStatus).toBe("exited");
+			expect(report.controlStatus).toBe("running");
+			expect(report.retainedOwners).toBe(2);
+			expect(report.ownerDisposed).toBe(false);
+			expect(report.diagnostic).toContain("refusing to report tree teardown complete");
+		},
+		30_000,
+	);
+
+	test.skipIf(!isWindows)(
+		"terminates an observed live Windows root and child while unrelated control survives",
+		async () => {
+			const report = await runWindowsProbe("live-direct");
+			expect(report.result).toEqual({ status: "terminated" });
+			expect(report.rootStatus).toBe("exited");
+			expect(report.leafStatus).toBe("exited");
+			expect(report.controlStatus).toBe("running");
+			expect(report.retainedOwners).toBe(1);
+			expect(report.ownerDisposed).toBe(true);
+		},
+		30_000,
+	);
 
 	test.skipIf(!isPosix)("disposeAllOwnedProcesses escalates SIGKILL for a SIGTERM-ignoring child", async () => {
 		const before = liveOwnedProcessCount();
