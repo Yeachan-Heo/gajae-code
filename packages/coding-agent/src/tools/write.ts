@@ -462,6 +462,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		context: AgentToolContext | undefined,
 	): Promise<AgentToolResult<WriteToolDetails>> {
 		const absolutePath = entry.absolutePath;
+		enforcePlanModeWrite(this.session, absolutePath, { op: "update" });
 		if (!(await fs.exists(absolutePath))) {
 			throw new ToolError(`Conflict #${entry.id} target '${entry.displayPath}' no longer exists.`);
 		}

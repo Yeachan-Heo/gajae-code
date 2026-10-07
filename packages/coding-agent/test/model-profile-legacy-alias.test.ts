@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
 import { activateModelProfile, prepareModelProfileActivation } from "../src/config/model-profile-activation";
+import { validateModelProfileName } from "../src/config/model-profile-contract";
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { BUILTIN_MODEL_PROFILES } from "../src/config/model-profiles";
 import { Settings } from "../src/config/settings";
@@ -26,8 +27,8 @@ const codexModel = {
 
 const codexSolModel = {
 	...codexModel,
-	id: "gpt-5.6-sol",
-	name: "gpt-5.6-sol",
+	id: "gpt-6.1-sol",
+	name: "gpt-6.1-sol",
 	contextWindow: 373_000,
 } satisfies Model<"openai-codex-responses">;
 
@@ -68,6 +69,7 @@ function fakeRegistry(extraProfiles: ModelProfileDefinition[] = []) {
 		resolveCanonicalModel: () => undefined,
 		getCanonicalVariants: () => [],
 		getCanonicalId: () => undefined,
+		isSelectorCircuitOpen: () => false,
 	};
 }
 
@@ -162,5 +164,73 @@ describe("legacy model profile aliases", () => {
 		// The retired-name alias must NOT shadow an explicitly defined profile.
 		expect(prepared.profileName).toBe("codex-standard");
 		expect(prepared.defaultThinkingLevel).toBe(ThinkingLevel.XHigh);
+	});
+
+	test("maps retired codex-sol61 default to codex-pro during activation", async () => {
+		const settings = Settings.isolated({ "modelProfile.default": "codex-sol61" });
+		const session = fakeSession();
+
+		await activateModelProfile({
+			session,
+			modelRegistry: fakeRegistry(),
+			settings,
+			profileName: settings.get("modelProfile.default") ?? "",
+		});
+
+		expect(session.getActiveModelProfile()).toBe("codex-pro");
+		expect(session.setModelTemporaryCalls).toEqual([{ model: codexSolModel, thinkingLevel: ThinkingLevel.Medium }]);
+		expect(settings.get("modelProfile.default")).toBe("codex-sol61");
+	});
+
+	test("--default persists the canonical replacement name for codex-sol61", async () => {
+		const settings = Settings.isolated();
+		const session = fakeSession();
+
+		await activateModelProfile(
+			{ session, modelRegistry: fakeRegistry(), settings, profileName: "codex-sol61" },
+			{ persistDefault: true },
+		);
+
+		expect(session.getActiveModelProfile()).toBe("codex-pro");
+		expect(settings.get("modelProfile.default")).toBe("codex-pro");
+		expect(settings.get("defaultThinkingLevel")).toBe(ThinkingLevel.Medium);
+	});
+
+	test("preparation exposes the canonical replacement profile name for codex-sol61", async () => {
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: fakeRegistry(),
+			settings: Settings.isolated(),
+			profileName: "codex-sol61",
+		});
+
+		expect(prepared.profileName).toBe("codex-pro");
+		expect(prepared.defaultThinkingLevel).toBe(ThinkingLevel.Medium);
+	});
+
+	test("does not remap codex-sol61 when a user-defined profile shadows it", async () => {
+		const customCodexSol61: ModelProfileDefinition = {
+			name: "codex-sol61",
+			requiredProviders: ["openai-codex"],
+			modelMapping: { default: "openai-codex/gpt-5.5:xhigh" },
+			source: "user",
+		};
+
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: fakeRegistry([customCodexSol61]),
+			settings: Settings.isolated(),
+			profileName: "codex-sol61",
+		});
+
+		// The retired-name alias must NOT shadow an explicitly defined profile.
+		expect(prepared.profileName).toBe("codex-sol61");
+		expect(prepared.defaultThinkingLevel).toBe(ThinkingLevel.XHigh);
+	});
+
+	test("validates codex-sol61 to codex-pro against the builtin profile map", () => {
+		const builtinProfiles = new Map(BUILTIN_MODEL_PROFILES.map(profile => [profile.name, profile]));
+
+		expect(validateModelProfileName("codex-sol61", builtinProfiles)).toBe("codex-pro");
 	});
 });

@@ -563,7 +563,7 @@ test("isolated directories remain available after this test file", () => {
 				[report.logDir, "gjc-test-logs-"],
 			] as const) {
 				expect(path.dirname(path.resolve(dir))).toBe(path.resolve(os.tmpdir()));
-				expect(path.basename(dir)).toMatch(new RegExp("^" + prefix));
+				expect(path.basename(dir)).toMatch(new RegExp(`^${prefix}`));
 				expect(fs.existsSync(path.join(dir, "debug-marker"))).toBe(true);
 			}
 		} finally {

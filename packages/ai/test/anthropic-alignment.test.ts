@@ -10,7 +10,6 @@ import {
 	buildAnthropicHeaders,
 	buildAnthropicSystemBlocks,
 	claudeCodeEntrypoint,
-	claudeCodeVersion,
 	generateClaudeCloakingUserId,
 	isClaudeCloakingUserId,
 	mapStainlessArch,
@@ -18,6 +17,7 @@ import {
 	streamAnthropic,
 	stripClaudeToolPrefix,
 } from "@gajae-code/ai/providers/anthropic";
+import { getClaudeCodeVersion } from "@gajae-code/ai/providers/claude-code-version";
 import { getEnvApiKey } from "@gajae-code/ai/stream";
 import type { Context, Model, TJsonSchema, Tool } from "@gajae-code/ai/types";
 import * as z from "zod/v4";
@@ -120,7 +120,7 @@ describe("Anthropic request fingerprint alignment", () => {
 		const billingHeader = blocks?.[0]?.text;
 		expect(billingHeader).toMatch(
 			new RegExp(
-				`^x-anthropic-billing-header: cc_version=${claudeCodeVersion}\\.[0-9a-f]{3}; cc_entrypoint=${claudeCodeEntrypoint}; cch=[0-9a-f]{5};$`,
+				`^x-anthropic-billing-header: cc_version=${getClaudeCodeVersion()}\\.[0-9a-f]{3}; cc_entrypoint=${claudeCodeEntrypoint}; cch=[0-9a-f]{5};$`,
 			),
 		);
 
@@ -203,7 +203,7 @@ describe("Anthropic request fingerprint alignment", () => {
 			stream: true,
 			modelHeaders: { "User-Agent": "curl/8.7.1" },
 		});
-		expect(normalizedHeaders["User-Agent"]).toBe(`claude-cli/${claudeCodeVersion} (external, cli)`);
+		expect(normalizedHeaders["User-Agent"]).toBe(`claude-cli/${getClaudeCodeVersion()} (external, cli)`);
 
 		const embeddedClaudeCliHeaders = buildAnthropicHeaders({
 			apiKey: "sk-ant-oat-test",
@@ -211,7 +211,7 @@ describe("Anthropic request fingerprint alignment", () => {
 			stream: true,
 			modelHeaders: { "User-Agent": "my-client claude-cli/2.1.63" },
 		});
-		expect(embeddedClaudeCliHeaders["User-Agent"]).toBe(`claude-cli/${claudeCodeVersion} (external, cli)`);
+		expect(embeddedClaudeCliHeaders["User-Agent"]).toBe(`claude-cli/${getClaudeCodeVersion()} (external, cli)`);
 	});
 
 	it("skips Claude Code instruction injection for claude-3-5-haiku models", async () => {

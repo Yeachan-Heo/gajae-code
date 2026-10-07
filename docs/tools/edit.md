@@ -80,7 +80,7 @@ Warnings:
    - turns `≔A..B` with no payload into one `delete` edit per line in the range; a blank-in-place edit requires one explicit empty payload line
 6. `applyHashlineEdits()` in `packages/coding-agent/src/hashline/apply.ts` validates every referenced anchor before mutating anything. Each anchor hash is recomputed from current file content with `computeLineHash()`.
 7. If any anchor hash differs, `applyHashlineEdits()` throws `HashlineMismatchError`. `execute.ts` catches only that class and calls `tryRecoverHashlineWithCache()`.
-8. Recovery replays the edits against each retained snapshot generation for that path, newest first (`packages/coding-agent/src/edit/file-read-cache.ts`), then 3-way merges the result onto current disk content using `Diff.applyPatch(..., { fuzzFactor: 0 })` in `packages/coding-agent/src/hashline/recovery.ts`. Older generations cover a follow-up edit that reuses anchors from the original read after this session's own edit shifted lines. A generation is used only if every anchored line is in it with a matching hash, every replayed hunk's context comes from lines that snapshot actually observed, and each hunk's old side occurs exactly once in the live file. On success the edit proceeds with a warning; on failure the original mismatch error is re-thrown.
+8. Recovery replays the edits against each retained snapshot generation for that path, newest first (`packages/coding-agent/src/edit/file-read-cache.ts`), then 3-way merges the result onto current disk content using `Diff.applyPatch(..., { fuzzFactor: 0 })` in `packages/coding-agent/src/hashline/recovery.ts`. Older generations cover a follow-up edit that reuses anchors from the original read after this session's own edit shifted lines. A generation is used only if every anchored line is in it with a matching hash (multi-line range interiors carry no hash, so they only need to be present), every replayed hunk's context comes from lines that snapshot actually observed, and each hunk's old side occurs exactly once in the live file. On success the edit proceeds with a warning; on failure the original mismatch error is re-thrown.
 9. Before splicing lines, `absorbReplacementBoundaryDuplicates()` normalizes some malformed-but-recoverable ranges:
    - duplicate prefix/suffix lines adjacent to a replacement can be absorbed by widening the delete range
    - pure inserts can auto-drop duplicated leading/trailing payload lines when `edit.hashlineAutoDropPureInsertDuplicates` is enabled
@@ -177,7 +177,7 @@ export const done = true;
 - The visible mismatch report shows 2 lines of context on each side (`MISMATCH_CONTEXT`) in `packages/coding-agent/src/hashline/constants.ts`.
 - Stale-anchor recovery uses `fuzzFactor: 0` (`HASHLINE_RECOVERY_FUZZ_FACTOR`) in `packages/coding-agent/src/hashline/recovery.ts`.
 - The mismatch report searches 20 lines either side of a stale anchor for where its content moved (`MISMATCH_RELOCATE_WINDOW`).
-- The per-session read cache keeps at most 30 paths (`MAX_PATHS_PER_SESSION`) and 4 snapshot generations per path (`MAX_GENERATIONS_PER_PATH`) in `packages/coding-agent/src/edit/file-read-cache.ts`.
+- The per-session read cache keeps at most 30 paths (`MAX_PATHS_PER_SESSION`) and 8 snapshot generations per path (`MAX_GENERATIONS_PER_PATH`) in `packages/coding-agent/src/edit/file-read-cache.ts`.
 - Hashline streaming chunk defaults are 200 lines or 64 KiB per chunk (`packages/coding-agent/src/hashline/types.ts`, consumed by `packages/coding-agent/src/hashline/stream.ts`).
 - `HL_OP_INSERT_BEFORE` is `«`, `HL_OP_INSERT_AFTER` is `»`, `HL_OP_REPLACE` is `≔`, `HL_OP_CHARS` is `«»≔`, `HL_FILE_PREFIX` is `§`, and `HL_BODY_SEP` is `|` (`packages/coding-agent/src/hashline/hash.ts`).
 
@@ -196,7 +196,7 @@ export const done = true;
   - `line N: range A..B ends before it starts.`
   - `line N: range A..B uses two different hashes for the same line.`
 - Missing payload for `»` / `«`:
-  - `line N: » and « operations require at least one verbatim payload line.`
+  - `line N: » and « operations require at least one verbatim payload line.` followed by a hint: how to insert a single blank line (one empty line after the op), or, when the op line's `|TEXT` only repeated the anchored line's content, that the text was read as an anchor echo and the new lines belong after the op.
 - Stray payload line:
   - `line N: payload line has no preceding », «, or ≔ operation.`
 - Unknown op:

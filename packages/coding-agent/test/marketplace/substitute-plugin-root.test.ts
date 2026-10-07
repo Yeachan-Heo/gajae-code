@@ -56,4 +56,14 @@ describe("substitutePluginRoot", () => {
 	it("returns string unchanged when no variables present", () => {
 		expect(substitutePluginRoot("no-vars-here", ROOT)).toBe("no-vars-here");
 	});
+	it("inserts an install path containing replacement-pattern characters verbatim", () => {
+		// A string replacement would expand `$&`, `$$`, `` $` `` and `$'` inside the
+		// path: `a$&b` became `a${CLAUDE_PLUGIN_ROOT}b`, `x$`y` lost `$`y`, and `q$'z`
+		// spliced the remainder of the template into the middle of the path.
+		for (const root of ["/plugins/a$&b", "/plugins/x$$y", "/plugins/x$`y", "/plugins/q$'z", "/plugins/$1"]) {
+			expect(substitutePluginRoot(`${CLAUDE_VAR}/bin/server`, root)).toBe(`${root}/bin/server`);
+			expect(substitutePluginRoot(`${GJC_VAR}/bin/server`, root)).toBe(`${root}/bin/server`);
+			expect(substitutePluginRoot([`--config=${CLAUDE_VAR}/c.json`], root)).toEqual([`--config=${root}/c.json`]);
+		}
+	});
 });

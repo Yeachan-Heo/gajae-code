@@ -1,5 +1,6 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import { type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
+import { type CompactionSettings, resolveThresholdTokens } from "@gajae-code/agent-core/compaction";
 import type { CachedUsageReport, CredentialInventoryRecord, Usage } from "@gajae-code/ai";
 import { Settings } from "../src/config/settings";
 import { createMemoryBackendService } from "../src/memory-backend";
@@ -82,6 +83,7 @@ interface FakeAcpBuiltinSession {
 	getToolByName(name: string): unknown;
 	compact(args?: string): Promise<void>;
 	getContextUsage(): { tokens?: number; contextWindow: number } | undefined;
+	getAutoCompactionThresholdTokens(contextTokens?: number): number;
 	getAvailableModels(): Array<{ provider: string; id: string; contextWindow?: number }>;
 	getAvailableThinkingLevels(): ThinkingLevel[];
 	setModel(model: unknown): Promise<void>;
@@ -191,6 +193,19 @@ function createRuntime() {
 		getToolByName: (_name: string) => undefined,
 		async compact(_args?: string) {},
 		getContextUsage: () => undefined,
+		getAutoCompactionThresholdTokens(
+			this: { model?: { contextWindow?: number }; settings: Settings },
+			contextTokens?: number,
+		) {
+			const contextWindow = this.model?.contextWindow ?? 0;
+			if (contextWindow <= 0) return 0;
+			return resolveThresholdTokens(
+				contextWindow,
+				this.settings.getGroup("compaction") as CompactionSettings,
+				0,
+				contextTokens,
+			);
+		},
 		getAvailableModels: () => [] as Array<{ provider: string; id: string; contextWindow?: number }>,
 		getAvailableThinkingLevels: () => [ThinkingLevel.Low, ThinkingLevel.Medium, ThinkingLevel.High],
 		async setModel(_model: unknown) {},
@@ -700,11 +715,14 @@ describe("ACP builtin slash commands", () => {
 		runtime.notifyConfigChanged = () => {
 			configNotified++;
 		};
-		const setModelSpy = spyOn(session, "setModel").mockResolvedValue(undefined);
+		const setModelSpy = spyOn(session, "setModel").mockImplementation(async model => {
+			session.model = model as typeof session.model;
+		});
 
 		const result = await executeAcpBuiltinSlashCommand("/model claude-3-5-sonnet", runtime);
 
 		expect(result).toEqual({ consumed: true });
+		expect(session.model).toBe(available[0]);
 		expect(setModelSpy).toHaveBeenCalledWith(available[0], "default", {
 			cause: "user-selection",
 			selector: "anthropic/claude-3-5-sonnet",
@@ -716,7 +734,7 @@ describe("ACP builtin slash commands", () => {
 	});
 
 	it("model: applies explicit thinking level to the live default session", async () => {
-		const { runtime, session } = createRuntime();
+		const { output, runtime, session } = createRuntime();
 		const available = [{ provider: "anthropic", id: "claude-3-5-sonnet", contextWindow: 200_000 }];
 		session.getAvailableModels = () => available;
 		const setModelSpy = spyOn(session, "setModel").mockResolvedValue(undefined);
@@ -731,6 +749,9 @@ describe("ACP builtin slash commands", () => {
 			thinkingLevel: "low",
 		});
 		expect(setThinkingLevelSpy).toHaveBeenCalledWith("low");
+		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
+		expect(session.thinkingLevelCalls).toEqual([{ thinkingLevel: ThinkingLevel.Low, persist: undefined }]);
+		expect(output[0]).toContain("Default model set to anthropic/claude-3-5-sonnet:low");
 	});
 
 	it("model: applies explicit thinking level from a bare model id", async () => {
@@ -749,6 +770,8 @@ describe("ACP builtin slash commands", () => {
 			thinkingLevel: "low",
 		});
 		expect(setThinkingLevelSpy).toHaveBeenCalledWith("low");
+		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
+		expect(session.thinkingLevelCalls).toEqual([{ thinkingLevel: ThinkingLevel.Low, persist: undefined }]);
 		expect(output[0]).toContain("Default model set to anthropic/claude-3-5-sonnet:low");
 	});
 
@@ -762,12 +785,14 @@ describe("ACP builtin slash commands", () => {
 			maxTokens: 64_000,
 		};
 		session.getAvailableModels = () => [grok];
+		const modelBefore = session.model;
 		const setModelSpy = spyOn(session, "setModel").mockResolvedValue(undefined);
 
 		const result = await executeAcpBuiltinSlashCommand("/model xai/grok-4.6", runtime);
 
 		expect(result).toEqual({ consumed: true });
 		expect(setModelSpy).not.toHaveBeenCalled();
+		expect(session.model).toBe(modelBefore);
 		expect(output[0]).toContain("requires an explicit effort suffix");
 		expect(output[0]).toContain("/model <target> <model[:effort]>");
 	});
@@ -782,17 +807,19 @@ describe("ACP builtin slash commands", () => {
 			maxTokens: 64_000,
 		};
 		session.getAvailableModels = () => [reasoningModel];
+		const modelBefore = session.model;
 		const setModelSpy = spyOn(session, "setModel").mockResolvedValue(undefined);
 
 		const result = await executeAcpBuiltinSlashCommand("/model anthropic/claude-fable-5", runtime);
 
 		expect(result).toEqual({ consumed: true });
 		expect(setModelSpy).not.toHaveBeenCalled();
+		expect(session.model).toBe(modelBefore);
 		expect(output[0]).toContain("requires an explicit effort suffix");
 	});
 
 	it("model: accepts explicit effort for argument-based reasoning defaults from other providers", async () => {
-		const { runtime, session } = createRuntime();
+		const { output, runtime, session } = createRuntime();
 		const reasoningModel = {
 			provider: "anthropic",
 			id: "claude-fable-5",
@@ -801,7 +828,9 @@ describe("ACP builtin slash commands", () => {
 			maxTokens: 64_000,
 		};
 		session.getAvailableModels = () => [reasoningModel];
-		const setModelSpy = spyOn(session, "setModel").mockResolvedValue(undefined);
+		const setModelSpy = spyOn(session, "setModel").mockImplementation(async model => {
+			session.model = model as typeof session.model;
+		});
 
 		const result = await executeAcpBuiltinSlashCommand("/model anthropic/claude-fable-5:xhigh", runtime);
 
@@ -811,6 +840,8 @@ describe("ACP builtin slash commands", () => {
 			selector: "anthropic/claude-fable-5",
 			thinkingLevel: "xhigh",
 		});
+		expect(session.model).toBe(reasoningModel);
+		expect(output[0]).toContain("Default model set to anthropic/claude-fable-5:xhigh");
 		expect(runtime.settings.getModelRole("default")).toBe("anthropic/claude-fable-5:xhigh");
 	});
 
@@ -834,7 +865,7 @@ describe("ACP builtin slash commands", () => {
 	});
 
 	it("model: accepts explicit Grok effort for argument-based assignment", async () => {
-		const { runtime, session } = createRuntime();
+		const { output, runtime, session } = createRuntime();
 		const grok = {
 			provider: "xai",
 			id: "grok-4.6",
@@ -843,7 +874,9 @@ describe("ACP builtin slash commands", () => {
 			maxTokens: 64_000,
 		};
 		session.getAvailableModels = () => [grok];
-		const setModelSpy = spyOn(session, "setModel").mockResolvedValue(undefined);
+		const setModelSpy = spyOn(session, "setModel").mockImplementation(async model => {
+			session.model = model as typeof session.model;
+		});
 
 		const result = await executeAcpBuiltinSlashCommand("/model xai/grok-4.6:xhigh", runtime);
 
@@ -853,11 +886,14 @@ describe("ACP builtin slash commands", () => {
 			selector: "xai/grok-4.6",
 			thinkingLevel: "xhigh",
 		});
+		expect(session.model).toBe(grok);
+		expect(output[0]).toContain("Default model set to xai/grok-4.6:xhigh");
 	});
 
 	it("model: assigns a known model to a GJC role-agent target without switching active model", async () => {
 		const { output, runtime, session } = createRuntime();
 		session.getAvailableModels = () => [{ provider: "anthropic", id: "claude-3-5-sonnet", contextWindow: 200_000 }];
+		const modelBefore = session.model;
 		const setModelSpy = spyOn(session, "setModel").mockResolvedValue(undefined);
 		let titleNotified = 0;
 		let configNotified = 0;
@@ -872,6 +908,7 @@ describe("ACP builtin slash commands", () => {
 
 		expect(result).toEqual({ consumed: true });
 		expect(setModelSpy).not.toHaveBeenCalled();
+		expect(session.model).toBe(modelBefore);
 		expect(runtime.settings.get("task.agentModelOverrides")).toEqual({
 			executor: "anthropic/claude-3-5-sonnet:low",
 		});

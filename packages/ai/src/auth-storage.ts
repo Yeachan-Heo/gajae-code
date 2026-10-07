@@ -26,7 +26,13 @@ import type {
 	UsageReport,
 } from "./usage";
 
-import { getOAuthApiKey, getOAuthProvider, refreshOAuthToken, resolveOAuthStorageProvider } from "./utils/oauth";
+import {
+	getOAuthApiKey,
+	getOAuthProvider,
+	refreshOAuthToken,
+	resolveOAuthStorageProvider,
+	UnknownOAuthProviderError,
+} from "./utils/oauth";
 import { loginDeepInfra } from "./utils/oauth/deepinfra";
 import { loginDeepSeek } from "./utils/oauth/deepseek";
 import { loginOpenAICodexDevice } from "./utils/oauth/openai-codex";
@@ -531,7 +537,8 @@ export interface AuthCredentialStore {
 	 * Atomically adopts a fresh row or claims the current refresh token for one
 	 * local provider dial. SQLite-backed stores use this to prevent another
 	 * process from replaying a rotating refresh token between a pre-read and
-	 * the provider request.
+	 * the provider request. The supplied clock is advanced by any time spent
+	 * waiting for the immediate write reservation.
 	 */
 	claimOAuthRefreshLease?(
 		credentialId: number,
@@ -1409,6 +1416,12 @@ type IndexedStoredCredential<T extends AuthCredential = AuthCredential> = {
 };
 type OAuthCredentialSelection = IndexedStoredCredential<OAuthCredential>;
 type ConfigApiKeyRegistration = { apiKey: string; envSourced: boolean; order: number };
+type ConfigApiKeyOwnerFork = {
+	registrations: Map<string, ConfigApiKeyRegistration>;
+	providerGenerations: Map<string, number>;
+	fallbackGeneration: number;
+	nextRegistrationOrder: number;
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AuthStorage Class
@@ -1428,6 +1441,8 @@ export class AuthStorage {
 	#configOverrides: Map<string, string> = new Map();
 	/** Effective config override registrations, including owner-scoped model registries. */
 	#configOverrideRegistrations: Map<string, Map<object, ConfigApiKeyRegistration>> = new Map();
+	#configOwnerForks: Map<object, ConfigApiKeyOwnerFork> = new Map();
+	#disposedConfigOwnerForks = new WeakSet<object>();
 	#unownedConfigOverrides: Map<string, ConfigApiKeyRegistration> = new Map();
 	#configOverrideOrder = 0;
 	/**
@@ -1468,6 +1483,12 @@ export class AuthStorage {
 	#usageLogger?: UsageLogger;
 	#fallbackResolver?: (provider: string) => string | undefined;
 	#ownedFallbackResolvers: Map<object, (provider: string) => string | undefined> = new Map();
+	#ownerProviderGenerations = new WeakMap<object, Map<string, number>>();
+	#ownerFallbackGenerations = new WeakMap<object, number>();
+	#observedConfigOwners = new WeakSet<object>();
+	#sharedProviderGenerations = new Map<string, number>();
+	#sharedProviderConfigurationGenerations = new Map<string, number>();
+	#fallbackGeneration = 0;
 	#store: AuthCredentialStore;
 	#configValueResolver: (config: string, cacheScope?: string) => Promise<string | undefined>;
 	#resolvedStoredApiKeyValues: Map<string, Map<string, { fingerprint: string; usable: boolean }>> = new Map();
@@ -1495,6 +1516,7 @@ export class AuthStorage {
 	#generationListeners: Set<(generation: number) => void> = new Set();
 	#oauthRefreshInFlight: Map<number, Promise<AuthCredentialSnapshotEntry>> = new Map();
 	#oauthCredentialRefreshInFlight: Map<number, Promise<RefreshedOAuthCredentials>> = new Map();
+	#oauthRefreshLeaseHolders = new Map<string, number>();
 	/**
 	 * Locally failed refresh attempts keyed by `${credentialId}:${refreshToken}`.
 	 * See {@link OAUTH_REFRESH_FAILURE_REPLAY_GUARD_MS}.
@@ -1586,8 +1608,15 @@ export class AuthStorage {
 	allocateMonotonicSequence(key: string, expiresAtSec: number): number {
 		return this.#store.allocateMonotonicSequence(key, expiresAtSec);
 	}
-	getProviderConfigurationGeneration(provider: string): number {
-		return this.#getProviderConfigurationGeneration(provider);
+	getProviderConfigurationGeneration(provider: string, owner?: object): number {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		if (!owner) return this.#getProviderConfigurationGeneration(storageProvider) + this.#fallbackGeneration;
+		this.#observedConfigOwners.add(owner);
+		return (
+			this.#getSharedProviderConfigurationGeneration(storageProvider) +
+			this.#getOwnerProviderGeneration(owner, storageProvider) +
+			this.#getOwnerFallbackGeneration(owner)
+		);
 	}
 	getProviderOAuthRefreshGeneration(provider: string): number {
 		return this.#providerOAuthRefreshGenerations.get(resolveOAuthStorageProvider(provider)) ?? 0;
@@ -1598,9 +1627,43 @@ export class AuthStorage {
 	#getProviderConfigurationGeneration(provider: string): number {
 		return this.#providerConfigurationGenerations.get(resolveOAuthStorageProvider(provider)) ?? 1;
 	}
+	#getSharedProviderGeneration(provider: string): number {
+		return this.#sharedProviderGenerations.get(resolveOAuthStorageProvider(provider)) ?? 1;
+	}
+	#getSharedProviderConfigurationGeneration(provider: string): number {
+		return this.#sharedProviderConfigurationGenerations.get(resolveOAuthStorageProvider(provider)) ?? 1;
+	}
+	#getOwnerProviderGeneration(owner: object, provider: string): number {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		return (
+			this.#configOwnerForks.get(owner)?.providerGenerations.get(storageProvider) ??
+			this.#ownerProviderGenerations.get(owner)?.get(storageProvider) ??
+			0
+		);
+	}
+	#getOwnerFallbackGeneration(owner: object): number {
+		return this.#configOwnerForks.get(owner)?.fallbackGeneration ?? this.#ownerFallbackGenerations.get(owner) ?? 0;
+	}
+	#bumpOwnerProviderGeneration(owner: object, provider: string): void {
+		const key = resolveOAuthStorageProvider(provider);
+		const fork = this.#configOwnerForks.get(owner);
+		const generations = fork?.providerGenerations ?? this.#ownerProviderGenerations.get(owner) ?? new Map();
+		generations.set(key, (generations.get(key) ?? 0) + 1);
+		this.#observedConfigOwners.add(owner);
+		if (!fork) this.#ownerProviderGenerations.set(owner, generations);
+	}
+	#bumpOwnerFallbackGeneration(owner: object): void {
+		const fork = this.#configOwnerForks.get(owner);
+		if (fork) fork.fallbackGeneration += 1;
+		else this.#ownerFallbackGenerations.set(owner, this.#getOwnerFallbackGeneration(owner) + 1);
+	}
 	#configOverrideRegistration(provider: string, owner?: object): ConfigApiKeyRegistration | undefined {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		if (owner) {
+			this.#observedConfigOwners.add(owner);
+			const fork = this.#configOwnerForks.get(owner);
+			if (fork) return fork.registrations.get(storageProvider);
+			if (this.#disposedConfigOwnerForks.has(owner)) return undefined;
 			return (
 				this.#configOverrideRegistrations.get(storageProvider)?.get(owner) ??
 				this.#unownedConfigOverrides.get(storageProvider)
@@ -1618,6 +1681,13 @@ export class AuthStorage {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		provider = storageProvider;
 		const configOverride = this.#configOverrideRegistration(storageProvider, owner);
+		const ownerGeneration = owner ? this.#getOwnerProviderGeneration(owner, storageProvider) : 0;
+		const ownerFallbackGeneration = owner ? this.#getOwnerFallbackGeneration(owner) : this.#fallbackGeneration;
+		const generation = owner
+			? this.#getSharedProviderGeneration(storageProvider) + ownerGeneration + ownerFallbackGeneration
+			: this.#getProviderGeneration(storageProvider) + this.#fallbackGeneration;
+		const forkGenerationFingerprint =
+			ownerGeneration || ownerFallbackGeneration ? `\u0000${ownerGeneration}\u0000${ownerFallbackGeneration}` : "";
 		const runtimeOverride = this.#runtimeOverrides.get(storageProvider);
 		const environmentOverride = runtimeOverride || configOverride?.apiKey ? undefined : getEnvApiKey(storageProvider);
 		// Discovery callers may fingerprint the provider before resolving its
@@ -1639,7 +1709,9 @@ export class AuthStorage {
 		if (storedLiteral) {
 			return crypto
 				.createHash("sha256")
-				.update(`stored-literal\u0000${storageProvider}\u0000${storedLiteral.key}`)
+				.update(
+					`${generation}\u0000stored-literal\u0000${storageProvider}\u0000${storedLiteral.key}${forkGenerationFingerprint}`,
+				)
 				.digest("hex");
 		}
 		let selectedCredential: ({ index: number } & StoredCredential) | undefined;
@@ -1648,7 +1720,7 @@ export class AuthStorage {
 		} catch {
 			return crypto
 				.createHash("sha256")
-				.update(`${this.#getProviderGeneration(storageProvider)}\u0000unavailable-selector`)
+				.update(`${generation}${forkGenerationFingerprint}\u0000unavailable-selector`)
 				.digest("hex");
 		}
 		const storedEntries: StoredCredential[] = selectedCredential
@@ -1728,7 +1800,7 @@ export class AuthStorage {
 		return crypto
 			.createHash("sha256")
 			.update(
-				`${this.#getProviderGeneration(storageProvider)}\u0000${effectiveEnvKey ?? ""}\u0000${storedApiKeyFingerprint}\u0000${storedOAuthFingerprint}\u0000${evidenceKeyFingerprint}`,
+				`${generation}${forkGenerationFingerprint}\u0000${effectiveEnvKey ?? ""}\u0000${storedApiKeyFingerprint}\u0000${storedOAuthFingerprint}\u0000${evidenceKeyFingerprint}`,
 			)
 			.digest("hex");
 	}
@@ -1743,16 +1815,21 @@ export class AuthStorage {
 		this.#generationListeners.delete(listener);
 	}
 
-	#bumpGeneration(reason: string, provider?: string): void {
+	#bumpGeneration(reason: string, provider?: string, owner?: object): void {
 		this.#generation += 1;
 		if (provider) {
-			const storageProvider = resolveOAuthStorageProvider(provider);
-			this.#providerGenerations.set(storageProvider, this.#getProviderGeneration(storageProvider) + 1);
+			const key = resolveOAuthStorageProvider(provider);
+			this.#providerGenerations.set(key, this.#getProviderGeneration(key) + 1);
+			if (owner) this.#bumpOwnerProviderGeneration(owner, key);
+			else this.#sharedProviderGenerations.set(key, this.#getSharedProviderGeneration(key) + 1);
 			if (reason !== "stored-api-key-usability") {
-				this.#providerConfigurationGenerations.set(
-					storageProvider,
-					this.#getProviderConfigurationGeneration(storageProvider) + 1,
-				);
+				this.#providerConfigurationGenerations.set(key, this.#getProviderConfigurationGeneration(key) + 1);
+				if (!owner) {
+					this.#sharedProviderConfigurationGenerations.set(
+						key,
+						this.#getSharedProviderConfigurationGeneration(key) + 1,
+					);
+				}
 			}
 		}
 		for (const listener of [...this.#generationListeners]) {
@@ -2182,6 +2259,16 @@ export class AuthStorage {
 	}
 
 	/**
+	 * Whether a provider's config override is a literal `apiKey`, not an `apiKeyEnv`
+	 * indirection. Startup pin policy treats only a literal key as explicit, because
+	 * an env-sourced override yields to a stored api_key account (see {@link getApiKey}).
+	 */
+	hasLiteralConfigApiKey(provider: string, owner?: object): boolean {
+		const registration = this.#configOverrideRegistration(provider, owner);
+		return Boolean(registration?.apiKey) && !registration?.envSourced;
+	}
+
+	/**
 	 * Whether credential selection for a provider is pinned to one stored row by
 	 * a runtime selector (`--credential`).
 	 *
@@ -2301,6 +2388,43 @@ export class AuthStorage {
 	}
 
 	/**
+	 * Capture one owner's config API keys and fallback resolver in an isolated
+	 * scope. Credentials, selectors, runtime overrides, and OAuth remain shared.
+	 */
+	forkConfigOwner(sourceOwner: object): object {
+		if (this.#disposedConfigOwnerForks.has(sourceOwner)) {
+			throw new Error("Cannot fork a released config owner");
+		}
+		const registrations = new Map<string, ConfigApiKeyRegistration>();
+		const providers = new Set([
+			...this.#unownedConfigOverrides.keys(),
+			...this.#configOverrideRegistrations.keys(),
+			...(this.#configOwnerForks.get(sourceOwner)?.registrations.keys() ?? []),
+		]);
+		let nextRegistrationOrder = 0;
+		for (const provider of providers) {
+			const registration = this.#configOverrideRegistration(provider, sourceOwner);
+			if (!registration) continue;
+			registrations.set(provider, { ...registration });
+			nextRegistrationOrder = Math.max(nextRegistrationOrder, registration.order);
+		}
+		this.#observedConfigOwners.add(sourceOwner);
+		const owner = {};
+		const sourceFork = this.#configOwnerForks.get(sourceOwner);
+		this.#configOwnerForks.set(owner, {
+			registrations,
+			providerGenerations: new Map(
+				sourceFork?.providerGenerations ?? this.#ownerProviderGenerations.get(sourceOwner),
+			),
+			fallbackGeneration: this.#getOwnerFallbackGeneration(sourceOwner),
+			nextRegistrationOrder,
+		});
+		const resolver = this.#ownedFallbackResolvers.get(sourceOwner);
+		if (resolver) this.#ownedFallbackResolvers.set(owner, resolver);
+		return owner;
+	}
+
+	/**
 	 * Register a per-provider API key sourced from user configuration
 	 * (e.g. `models.yml` `providers.<name>.apiKey`). Higher priority than
 	 * stored credentials and OAuth tokens — when the user pins a key in
@@ -2322,6 +2446,22 @@ export class AuthStorage {
 	 */
 	setConfigApiKey(provider: string, apiKey: string, options: { envSourced?: boolean; owner?: object } = {}): void {
 		const storageProvider = resolveOAuthStorageProvider(provider);
+		if (options.owner) {
+			const fork = this.#configOwnerForks.get(options.owner);
+			if (fork) {
+				fork.registrations.set(storageProvider, {
+					apiKey,
+					envSourced: options.envSourced === true,
+					order: ++fork.nextRegistrationOrder,
+				});
+				fork.providerGenerations.set(storageProvider, (fork.providerGenerations.get(storageProvider) ?? 0) + 1);
+				this.#observedConfigOwners.add(options.owner);
+				return;
+			}
+			if (this.#disposedConfigOwnerForks.has(options.owner)) {
+				throw new Error("Cannot update a released config owner");
+			}
+		}
 		const registration = {
 			apiKey,
 			envSourced: options.envSourced === true,
@@ -2334,7 +2474,7 @@ export class AuthStorage {
 		} else {
 			this.#unownedConfigOverrides.set(storageProvider, registration);
 		}
-		this.#reconcileConfigApiKey(storageProvider, "set-config-api-key", true);
+		this.#reconcileConfigApiKey(storageProvider, "set-config-api-key", true, options.owner);
 	}
 
 	/**
@@ -2343,22 +2483,41 @@ export class AuthStorage {
 	removeConfigApiKey(provider: string, owner?: object): void {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		if (owner) {
+			const fork = this.#configOwnerForks.get(owner);
+			if (fork) {
+				if (!fork.registrations.delete(storageProvider)) return;
+				fork.providerGenerations.set(storageProvider, (fork.providerGenerations.get(storageProvider) ?? 0) + 1);
+				this.#observedConfigOwners.add(owner);
+				return;
+			}
+			if (this.#disposedConfigOwnerForks.has(owner)) return;
 			const registrations = this.#configOverrideRegistrations.get(storageProvider);
 			if (!registrations?.delete(owner)) return;
 			if (registrations.size === 0) this.#configOverrideRegistrations.delete(storageProvider);
 		} else {
 			if (!this.#unownedConfigOverrides.delete(storageProvider)) return;
 		}
-		this.#reconcileConfigApiKey(storageProvider, "remove-config-api-key", true);
+		this.#reconcileConfigApiKey(storageProvider, "remove-config-api-key", true, owner);
 	}
 
 	/**
 	 * Drop config-sourced API keys. An owner removes only its own registrations;
 	 * the unscoped form remains an explicit global reset for callers that own the
-	 * entire AuthStorage instance.
+	 * entire AuthStorage instance. Clearing a fork retains its isolated writable
+	 * scope; call releaseConfigOwner when that owner is permanently disposed.
 	 */
 	clearConfigApiKeys(owner?: object): void {
 		if (owner) {
+			const fork = this.#configOwnerForks.get(owner);
+			if (fork) {
+				for (const provider of fork.registrations.keys()) {
+					fork.providerGenerations.set(provider, (fork.providerGenerations.get(provider) ?? 0) + 1);
+				}
+				this.#observedConfigOwners.add(owner);
+				fork.registrations.clear();
+				return;
+			}
+			if (this.#disposedConfigOwnerForks.has(owner)) return;
 			const providers = [...this.#configOverrideRegistrations.entries()]
 				.filter(([, registrations]) => registrations.has(owner))
 				.map(([provider]) => provider);
@@ -2375,7 +2534,20 @@ export class AuthStorage {
 		for (const provider of providers) this.#reconcileConfigApiKey(provider, "clear-config-api-keys", true);
 	}
 
-	#reconcileConfigApiKey(provider: string, reason: string, forceGeneration = false): void {
+	/** Permanently release an owner returned by forkConfigOwner. Idempotent for forks. */
+	releaseConfigOwner(owner: object): void {
+		if (this.#disposedConfigOwnerForks.has(owner)) return;
+		const fork = this.#configOwnerForks.get(owner);
+		if (!fork) throw new Error("Cannot release an owner that was not created by forkConfigOwner");
+		for (const provider of fork.registrations.keys()) this.#bumpOwnerProviderGeneration(owner, provider);
+		if (this.#ownedFallbackResolvers.delete(owner)) this.#bumpOwnerFallbackGeneration(owner);
+		this.#ownerProviderGenerations.set(owner, new Map(fork.providerGenerations));
+		this.#ownerFallbackGenerations.set(owner, fork.fallbackGeneration);
+		this.#configOwnerForks.delete(owner);
+		this.#disposedConfigOwnerForks.add(owner);
+	}
+
+	#reconcileConfigApiKey(provider: string, reason: string, forceGeneration = false, owner?: object): void {
 		const previous = this.#configOverrides.get(provider);
 		const previousEnvSourced = this.#configOverrideEnvSourced.has(provider);
 		let winner: { apiKey: string; envSourced: boolean; order: number } | undefined =
@@ -2394,7 +2566,7 @@ export class AuthStorage {
 		const current = this.#configOverrides.get(provider);
 		const currentEnvSourced = this.#configOverrideEnvSourced.has(provider);
 		if (forceGeneration || previous !== current || previousEnvSourced !== currentEnvSourced) {
-			this.#bumpGeneration(reason, provider);
+			this.#bumpGeneration(reason, provider, owner);
 		}
 	}
 
@@ -2404,21 +2576,36 @@ export class AuthStorage {
 	 */
 	setFallbackResolver(resolver: (provider: string) => string | undefined, owner?: object): () => void {
 		if (owner) {
+			if (this.#disposedConfigOwnerForks.has(owner)) throw new Error("Cannot update a released config owner");
+			const previous = this.#ownedFallbackResolvers.get(owner);
 			this.#ownedFallbackResolvers.set(owner, resolver);
+			if (previous || this.#observedConfigOwners.has(owner)) {
+				this.#bumpOwnerFallbackGeneration(owner);
+				this.#bumpGeneration(previous ? "replace-fallback-resolver" : "set-fallback-resolver");
+			}
+			this.#observedConfigOwners.add(owner);
 			return () => {
 				if (this.#ownedFallbackResolvers.get(owner) !== resolver) return;
 				this.#ownedFallbackResolvers.delete(owner);
+				this.#bumpOwnerFallbackGeneration(owner);
+				this.#bumpGeneration("remove-fallback-resolver");
 			};
 		}
 		this.#fallbackResolver = resolver;
+		this.#fallbackGeneration += 1;
+		this.#bumpGeneration("set-fallback-resolver");
 		return () => {
-			if (this.#fallbackResolver === resolver) this.#fallbackResolver = undefined;
+			if (this.#fallbackResolver !== resolver) return;
+			this.#fallbackResolver = undefined;
+			this.#fallbackGeneration += 1;
+			this.#bumpGeneration("remove-fallback-resolver");
 		};
 	}
 
 	#resolveFallback(provider: string, owner?: object): string | undefined {
 		if (owner) {
-			return this.#ownedFallbackResolvers.get(owner)?.(provider) ?? this.#fallbackResolver?.(provider);
+			this.#observedConfigOwners.add(owner);
+			return this.#ownedFallbackResolvers.get(owner)?.(provider);
 		}
 		for (const resolver of [...this.#ownedFallbackResolvers.values()].reverse()) {
 			const value = resolver(provider);
@@ -3676,10 +3863,11 @@ export class AuthStorage {
 				break;
 			}
 			case "glm-zcode": {
-				const { loginGlmZcode } = await import("./utils/oauth/glm-zcode");
+				const { loginGlmZcode, GLM_ZCODE_MANUAL_INPUT_PROMPT } = await import("./utils/oauth/glm-zcode");
 				credentials = await loginGlmZcode({
 					...ctrl,
-					onManualCodeInput: ctrl.onManualCodeInput ?? manualCodeInput,
+					onManualCodeInput:
+						ctrl.onManualCodeInput ?? (() => ctrl.onPrompt({ message: GLM_ZCODE_MANUAL_INPUT_PROMPT })),
 				});
 				break;
 			}
@@ -3872,7 +4060,7 @@ export class AuthStorage {
 			default: {
 				const customProvider = getOAuthProvider(provider);
 				if (!customProvider) {
-					throw new Error(`Unknown OAuth provider: ${provider}`);
+					throw new UnknownOAuthProviderError(provider);
 				}
 				const customLoginResult = await customProvider.login({
 					onAuth: info => ctrl.onAuth(info),
@@ -5538,6 +5726,34 @@ export class AuthStorage {
 		let refreshPromise: Promise<OAuthCredentials>;
 		let localDial = false;
 		let refreshLease: OAuthRefreshLease | undefined;
+		let refreshLeaseCompleted = false;
+		const decrementRefreshLeaseHolder = (): void => {
+			if (!refreshLease) return;
+			const key = String(refreshLease.credentialId);
+			const holders = this.#oauthRefreshLeaseHolders.get(key);
+			if (holders === undefined || holders <= 1) {
+				this.#oauthRefreshLeaseHolders.delete(key);
+			} else {
+				this.#oauthRefreshLeaseHolders.set(key, holders - 1);
+			}
+		};
+		const releaseRefreshLease = (): void => {
+			if (!refreshLease || refreshLeaseCompleted) return;
+			refreshLeaseCompleted = true;
+			const holders = this.#oauthRefreshLeaseHolders.get(String(refreshLease.credentialId)) ?? 1;
+			decrementRefreshLeaseHolder();
+			if (holders > 1) return;
+			try {
+				const releaseLease = this.#store.releaseOAuthRefreshLease?.bind(this.#store);
+				releaseLease?.(refreshLease);
+			} catch (error) {
+				logger.warn("OAuth refresh lease release failed", {
+					provider,
+					credentialId: refreshLease.credentialId,
+					error: scrubHealthReason(error, [credential.access, credential.refresh]),
+				});
+			}
+		};
 
 		// Caller override > store-level hook > local per-provider refresh.
 		// `RemoteAuthCredentialStore` exposes the hook so a broker-backed gateway
@@ -5571,19 +5787,27 @@ export class AuthStorage {
 					const deadline = Date.now() + OAUTH_REFRESH_LEASE_MS;
 					for (;;) {
 						if (signal?.aborted) throw new Error("OAuth token refresh aborted by caller");
-						const claim = claimLease(
-							credentialId,
-							credential.refresh,
-							force,
-							owner,
-							Date.now(),
-							OAUTH_REFRESH_LEASE_MS,
-						);
+						let claim: OAuthRefreshLeaseClaim;
+						try {
+							claim = claimLease(
+								credentialId,
+								credential.refresh,
+								force,
+								owner,
+								Date.now(),
+								OAUTH_REFRESH_LEASE_MS,
+							);
+						} catch (error) {
+							releaseRefreshLease();
+							throw error;
+						}
 						if (claim.kind === "missing") throw new Error("OAuth refresh credential disappeared");
 
 						if (claim.kind === "claimed") {
 							credential = claim.credential;
 							refreshLease = claim.lease;
+							const key = String(claim.lease.credentialId);
+							this.#oauthRefreshLeaseHolders.set(key, (this.#oauthRefreshLeaseHolders.get(key) ?? 0) + 1);
 							break;
 						}
 						if (claim.kind === "adopted") {
@@ -5628,6 +5852,7 @@ export class AuthStorage {
 				const memoKey = `${credentialId}:${credential.refresh}`;
 				const memo = this.#recentOAuthRefreshFailures.get(memoKey);
 				if (memo && memo.expiresAt > Date.now()) {
+					releaseRefreshLease();
 					throw memo.error;
 				}
 			}
@@ -5637,16 +5862,32 @@ export class AuthStorage {
 			// and its refresh token must only ever be sent to the bound token
 			// endpoint.
 			if (credential.mcpBinding) {
-				refreshPromise = refreshBoundMCPOAuthCredential(credential, mcpClient, signal);
+				try {
+					refreshPromise = refreshBoundMCPOAuthCredential(credential, mcpClient, signal);
+				} catch (error) {
+					releaseRefreshLease();
+					throw error;
+				}
 			} else {
 				const customProvider = getOAuthProvider(provider);
 				if (customProvider) {
 					if (!customProvider.refreshToken) {
+						releaseRefreshLease();
 						throw new Error(`OAuth provider "${provider}" does not support token refresh`);
 					}
-					refreshPromise = customProvider.refreshToken(credential);
+					try {
+						refreshPromise = customProvider.refreshToken(credential);
+					} catch (error) {
+						releaseRefreshLease();
+						throw error;
+					}
 				} else {
-					refreshPromise = refreshOAuthToken(provider as OAuthProvider, credential);
+					try {
+						refreshPromise = refreshOAuthToken(provider as OAuthProvider, credential);
+					} catch (error) {
+						releaseRefreshLease();
+						throw error;
+					}
 				}
 			}
 		}
@@ -5701,6 +5942,8 @@ export class AuthStorage {
 				if (!completeLease?.(refreshLease, persisted)) {
 					throw new Error("OAuth token refresh ownership was lost before persistence");
 				}
+				refreshLeaseCompleted = true;
+				decrementRefreshLeaseHolder();
 				authority.persistedByLease = true;
 			}
 			return authority;
@@ -5716,17 +5959,20 @@ export class AuthStorage {
 			// pair is immediately eligible for a second refresh, replaying the token
 			// and tripping provider reuse detection. Skip the guard update only for a
 			// caller-owned abort, never for an internal timeout.
-			if (signal?.aborted && !isTimeoutAbort(signal)) throw error;
-			if (localDial && credentialId !== undefined) {
+			const callerAbort = signal?.aborted && !isTimeoutAbort(signal);
+			const unknownProvider = error instanceof UnknownOAuthProviderError;
+			const taggedError = callerAbort || unknownProvider ? error : tagRefreshAttempt(error, credential.refresh);
+			if (!callerAbort && !unknownProvider && localDial && credentialId !== undefined) {
 				for (const [key, entry] of this.#recentOAuthRefreshFailures) {
 					if (entry.expiresAt <= Date.now()) this.#recentOAuthRefreshFailures.delete(key);
 				}
 				this.#recentOAuthRefreshFailures.set(`${credentialId}:${credential.refresh}`, {
 					expiresAt: Date.now() + OAUTH_REFRESH_FAILURE_REPLAY_GUARD_MS,
-					error,
+					error: taggedError,
 				});
 			}
-			throw tagRefreshAttempt(error, credential.refresh);
+			releaseRefreshLease();
+			throw taggedError;
 		} finally {
 			if (timeout) clearTimeout(timeout);
 			if (signal && onAbort) signal.removeEventListener("abort", onAbort);
@@ -6083,7 +6329,7 @@ export class AuthStorage {
 
 	async #resolveStoredApiKey(provider: string, key: string): Promise<string | undefined> {
 		const storageProvider = resolveOAuthStorageProvider(provider);
-		const configurationGeneration = this.#getProviderConfigurationGeneration(storageProvider);
+		const configurationGeneration = this.#getSharedProviderConfigurationGeneration(storageProvider);
 		const resolutions =
 			this.#storedApiKeyResolutionInFlight.get(storageProvider) ?? new Map<string, Promise<string | undefined>>();
 		this.#storedApiKeyResolutionInFlight.set(storageProvider, resolutions);
@@ -6092,13 +6338,13 @@ export class AuthStorage {
 
 		const { promise, resolve, reject } = Promise.withResolvers<string | undefined>();
 		resolutions.set(key, promise);
-		const publish = (value: string | undefined) => {
+		const publish = (value: string | undefined): boolean => {
 			if (
-				configurationGeneration !== this.#getProviderConfigurationGeneration(storageProvider) ||
+				configurationGeneration !== this.#getSharedProviderConfigurationGeneration(storageProvider) ||
 				this.#storedApiKeyResolutionInFlight.get(storageProvider) !== resolutions ||
 				resolutions.get(key) !== promise
 			) {
-				return;
+				return false;
 			}
 			const values =
 				this.#resolvedStoredApiKeyValues.get(storageProvider) ??
@@ -6113,15 +6359,15 @@ export class AuthStorage {
 			if (key.startsWith("!") && wasUsable !== isUsable) {
 				this.#bumpGeneration("stored-api-key-usability", storageProvider);
 			}
+			return true;
 		};
 		void (async () => {
 			try {
 				const value = await this.#configValueResolver(key, String(configurationGeneration));
-				publish(value);
-				resolve(value);
+				resolve(publish(value) ? value : undefined);
 			} catch (error) {
-				publish(undefined);
-				reject(error);
+				if (publish(undefined)) reject(error);
+				else resolve(undefined);
 			} finally {
 				if (
 					this.#storedApiKeyResolutionInFlight.get(storageProvider) === resolutions &&
@@ -6404,12 +6650,9 @@ export class AuthStorage {
 
 	async #credentialMatchesApiKey(provider: string, credential: AuthCredential, apiKey: string): Promise<boolean> {
 		if (credential.type === "api_key") {
-			return (
-				(await this.#configValueResolver(
-					credential.key,
-					String(this.#getProviderConfigurationGeneration(provider)),
-				)) === apiKey
-			);
+			const generation = this.#getSharedProviderConfigurationGeneration(provider);
+			const resolved = await this.#configValueResolver(credential.key, String(generation));
+			return generation === this.#getSharedProviderConfigurationGeneration(provider) && resolved === apiKey;
 		}
 		if (credential.access === apiKey) return true;
 		return this.#extractStructuredApiKeyToken(apiKey) === credential.access;
@@ -7188,7 +7431,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			`);
 			this.#db.run("DROP TABLE auth_credentials_v0");
 		});
-		migrate();
+		migrate.immediate();
 	}
 
 	#migrateAuthSchemaV1OrV2ToV3(): void {
@@ -7210,7 +7453,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			`);
 			this.#db.run("DROP TABLE auth_credentials_legacy");
 		});
-		migrate();
+		migrate.immediate();
 	}
 
 	#migrateAuthSchemaV3ToV4(): void {
@@ -7232,7 +7475,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			`);
 			this.#db.run("DROP TABLE auth_credentials_v3");
 		});
-		migrate();
+		migrate.immediate();
 	}
 	#migrateAuthSchemaV4ToV5(): void {
 		const columns = this.#db.prepare("PRAGMA table_info(auth_credentials)").all() as Array<{ name?: string }>;
@@ -7335,7 +7578,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				.run(`usage_cache:report:${provider}:`.length, `usage_cache:report:${provider}:`);
 			return { kind: "removed", ids: unique.map(target => target.id) };
 		});
-		return remove();
+		return remove.immediate();
 	}
 	claimOAuthRefreshLease(
 		credentialId: number,
@@ -7345,7 +7588,9 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		nowMs: number,
 		leaseMs: number,
 	): OAuthRefreshLeaseClaim {
+		const enteredAtMs = Date.now();
 		const claim = this.#db.transaction((): OAuthRefreshLeaseClaim => {
+			const effectiveNowMs = nowMs + Math.max(0, Date.now() - enteredAtMs);
 			const row = this.#db
 				.prepare(
 					"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials WHERE id = ? AND disabled_cause IS NULL",
@@ -7353,17 +7598,21 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				.get(credentialId) as AuthRow | undefined;
 			const credential = row ? deserializeCredential(row) : null;
 			if (credential?.type !== "oauth") return { kind: "missing" };
-			if (!force && credential.refresh !== expectedRefresh && nowMs + OAUTH_REFRESH_SKEW_MS < credential.expires) {
+			if (
+				!force &&
+				credential.refresh !== expectedRefresh &&
+				effectiveNowMs + OAUTH_REFRESH_SKEW_MS < credential.expires
+			) {
 				return { kind: "adopted", credential };
 			}
 			const active = this.#db
 				.prepare("SELECT owner, expires_at FROM oauth_refresh_leases WHERE credential_id = ?")
 				.get(credentialId) as { owner?: string; expires_at?: number } | undefined;
-			if (typeof active?.expires_at === "number" && active.expires_at > nowMs) {
+			if (typeof active?.expires_at === "number" && active.expires_at > effectiveNowMs) {
 				if (active.owner === owner) {
 					this.#db
 						.prepare("UPDATE oauth_refresh_leases SET expires_at = ? WHERE credential_id = ? AND owner = ?")
-						.run(nowMs + leaseMs, credentialId, owner);
+						.run(effectiveNowMs + leaseMs, credentialId, owner);
 					return {
 						kind: "claimed",
 						credential,
@@ -7383,10 +7632,10 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				.prepare(
 					"INSERT INTO oauth_refresh_leases (credential_id, owner, token_fingerprint, expires_at) VALUES (?, ?, ?, ?)",
 				)
-				.run(credentialId, owner, tokenFingerprint, nowMs + leaseMs);
+				.run(credentialId, owner, tokenFingerprint, effectiveNowMs + leaseMs);
 			return { kind: "claimed", credential, lease: { credentialId, owner, tokenFingerprint } };
 		});
-		return claim();
+		return claim.immediate();
 	}
 
 	completeOAuthRefreshLease(lease: OAuthRefreshLease, credential: OAuthCredential): boolean {
@@ -7421,7 +7670,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				.run(lease.credentialId, lease.owner);
 			return true;
 		});
-		return complete();
+		return complete.immediate();
 	}
 
 	releaseOAuthRefreshLease(lease: OAuthRefreshLease): void {
@@ -7483,7 +7732,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			return result;
 		});
 
-		const result = replace(provider, credentials);
+		const result = replace.immediate(provider, credentials);
 		this.#purgeSupersededDisabledRows(provider, result);
 		return result;
 	}
@@ -7530,7 +7779,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			return result;
 		});
 
-		const result = upsert(provider, credential);
+		const result = upsert.immediate(provider, credential);
 		this.#purgeSupersededDisabledRows(provider, result);
 		return result;
 	}
@@ -7727,12 +7976,22 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 
 	tryAcquireUsageFetchLease(key: string, owner: string, nowMs: number, leaseMs: number): boolean | undefined {
 		try {
-			const nowSec = Math.floor(nowMs / 1000);
-			const expiresAtSec = Math.ceil((nowMs + leaseMs) / 1000);
-			const result = this.#claimUsageFetchLeaseStmt.run(`usage_fetch_lease:${key}`, owner, expiresAtSec, nowSec) as {
-				changes: number;
-			};
-			return result.changes === 1;
+			const enteredAtMs = Date.now();
+			const claim = this.#db.transaction(() => {
+				const effectiveNowMs = nowMs + Math.max(0, Date.now() - enteredAtMs);
+				const nowSec = Math.floor(effectiveNowMs / 1000);
+				const expiresAtSec = Math.ceil((effectiveNowMs + leaseMs) / 1000);
+				const result = this.#claimUsageFetchLeaseStmt.run(
+					`usage_fetch_lease:${key}`,
+					owner,
+					expiresAtSec,
+					nowSec,
+				) as {
+					changes: number;
+				};
+				return result.changes === 1;
+			});
+			return claim.immediate();
 		} catch {
 			return undefined;
 		}
@@ -7754,7 +8013,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			this.#upsertCacheStmt.run(key, String(next), expiresAtSec);
 			return next;
 		});
-		return allocate();
+		return allocate.immediate();
 	}
 
 	deleteCachePrefix(prefix: string): void {

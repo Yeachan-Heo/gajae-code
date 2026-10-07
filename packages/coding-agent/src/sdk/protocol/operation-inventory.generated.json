@@ -1674,6 +1674,24 @@
 		]
 	},
 	{
+		"sourceId": "registry:Q32",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "session.progress",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
 		"sourceId": "registry:R01",
 		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
 		"sourceKind": "registry",
@@ -2045,6 +2063,24 @@
 			"telegram": "generic_safe",
 			"discord": "generic_safe",
 			"slack": "generic_safe",
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "slash_command:progress",
+		"sourceFile": "packages/coding-agent/src/slash-commands/builtin-registry.ts",
+		"sourceKind": "slash_command",
+		"decision": "include",
+		"sdkId": "session.progress",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
 			"mcp": "generic_safe",
 			"acp": "generic_safe",
 			"daemonCli": "generic_safe"
@@ -2843,6 +2879,17 @@
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
 		]
+	},
+	{
+		"sourceId": "agent_session:getSubagentLifecycleStatuses",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal read-only subagent status projection consumed through session.progress (Q32), not a separate SDK seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:emitNotice",
@@ -3812,6 +3859,28 @@
 		]
 	},
 	{
+		"sourceId": "agent_session:resolvePromptSkillInvocation",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal prompt-dispatch classifier shared with interactive title seeding, not a user-facing control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
+		"sourceId": "agent_session:isLocallyHandledSlashCommand",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal slash-command classifier that keeps command text out of title seeding, not a user-facing control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "agent_session:promptCustomMessage",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
@@ -4239,6 +4308,28 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal terminal-abort bus seam (epoch only), threaded via terminalAbortSeams; not a user-facing SDK control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
+		"sourceId": "agent_session:getTerminalRunOwnerForEvent",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal Agent-claimed event ownership proof, read only through the terminalAbortSeams bus capability; not a public SDK operation",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
+		"sourceId": "agent_session:getRunOwnerDomain",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal run-resource ledger domain lookup for exact consuming-run ownership; not a public SDK operation",
 		"exclusionMetadata": {
 			"adapterMappings": "not_applicable",
 			"testIds": "not_applicable"
@@ -5472,6 +5563,17 @@
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
 		]
+	},
+	{
+		"sourceId": "agent_session:getAutoCompactionThresholdTokens",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal compaction-threshold accessor feeding the /context breakdown; exposed through context.get, not an independent SDK operation",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:getContextUsage",

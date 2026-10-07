@@ -53,6 +53,7 @@ async function replay(renderScope?: "layout"): Promise<Capture[]> {
 		getCanonicalModelSelections: () => [],
 		getDiscoverableProviders: () => [],
 		hasConfiguredProviderAuth: () => false,
+		isSelectorCircuitOpen: (_selector: string) => false,
 		onCatalogChanged: (callback: () => void) => {
 			catalogChanged = callback;
 			return () => {
@@ -173,6 +174,7 @@ async function replayPresetLanding(renderScope?: "layout"): Promise<Capture[]> {
 		resolveCanonicalModel: () => undefined,
 		getDiscoverableProviders: () => [],
 		hasConfiguredProviderAuth: () => false,
+		isSelectorCircuitOpen: (_selector: string) => false,
 		getApiKeyForProvider: () => auth.promise,
 		onCatalogChanged: (callback: () => void) => {
 			catalogChanged = callback;

@@ -87,6 +87,7 @@ function createRegistry(profiles: Iterable<[string, ModelProfileDefinition]> = [
 		getModelProfiles: () => new Map(profileMap),
 		getModelProfile: (name: string) => profileMap.get(name),
 		getApiKeyForProvider: async (providerId: string) => options.apiKeyForProvider?.(providerId) ?? "key",
+		isSelectorCircuitOpen: (_selector: string) => false,
 	} as unknown as ModelRegistry;
 }
 

@@ -11,6 +11,9 @@ export const MAX_PREPARATION_TIMEOUT_MS = 120_000;
 /** Bounded workspace install window; independent of child semantic readiness. */
 export const DEFAULT_DEPENDENCY_PREPARATION_TIMEOUT_MS = 30_000;
 
+/** Non-worktree broker pre-spawn cap, also limited by the admission window remaining since receipt. */
+export const DEFAULT_BROKER_PRESPAWN_PREPARATION_TIMEOUT_MS = 30_000;
+
 export function isValidReadinessTimeoutMs(value: unknown): value is number {
 	return (
 		typeof value === "number" &&
@@ -98,7 +101,9 @@ export function lifecycleStartupBudgetMs(requestedReadinessTimeoutMs: number): n
  *
  * Worktree launches add independent preparation budgets so git add / install cannot
  * cut the caller while the broker still owns the request. One-arg
- * {@link lifecycleStartupBudgetMs} stays queue+readiness for no-worktree callers.
+ * {@link lifecycleStartupBudgetMs} stays queue+readiness for no-worktree callers:
+ * broker-derived pre-spawn work uses only the unspent admission window from receipt,
+ * and the fresh readiness window ends within that unchanged caller budget.
  */
 export function lifecycleRequestTimeoutMs(operation: string, input: Record<string, unknown>): number | undefined {
 	const deadlineFields = [

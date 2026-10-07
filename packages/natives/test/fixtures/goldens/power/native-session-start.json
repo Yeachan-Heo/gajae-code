@@ -1,0 +1,11 @@
+{
+	"options": {
+		"reason": "Gajae Code agent session",
+		"idle": true,
+		"system": false,
+		"user": false,
+		"display": false
+	},
+	"baselineExport": "MacOSPowerAssertion",
+	"baselineResult": "start-stop-idempotent"
+}

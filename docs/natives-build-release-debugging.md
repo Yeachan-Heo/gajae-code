@@ -4,8 +4,8 @@ This runbook describes how `@gajae-code/natives` produces `.node` addons, genera
 
 It follows the architecture terms from `docs/natives-architecture.md`:
 
-- **build-time artifact production** (`scripts/build-native.ts`)
-- **embedded addon manifest generation** (`scripts/embed-native.ts`)
+- **build-time artifact production** (`packages/natives/scripts/build-native.ts`)
+- **embedded addon manifest generation** (`packages/natives/scripts/embed-native.ts`)
 - **runtime addon loading** (`native/index.js`, `native/loader-state.js`)
 
 ## Implementation files

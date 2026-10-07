@@ -88,6 +88,15 @@ describe("shared state argv classification", () => {
 });
 
 describe("checkBashAllowedPrefixes", () => {
+	it("blocks git diff options that write or read outside the repository", () => {
+		for (const command of ["git diff --output=/tmp/pwn", "git diff --no-index a b"]) {
+			const result = checkBashAllowedPrefixes(command, ["git diff"]);
+			expect(result.allowed).toBe(false);
+			expect(result.reason).toContain("git --output or --no-index");
+		}
+		expect(checkBashAllowedPrefixes("git diff --stat", ["git diff"])).toEqual({ allowed: true });
+	});
+
 	it("allows ralplan artifact writes for role agents", () => {
 		expect(
 			checkBashAllowedPrefixes(

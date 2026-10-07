@@ -25,7 +25,11 @@ import {
 	readSdkSessionEndpoint,
 	type SdkSessionEndpoint,
 } from "../client/discovery";
-import { SESSION_HOST_OBSERVER_CAPABILITY, TURN_STREAM_CAPABILITY } from "../host/host";
+import {
+	POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY,
+	SESSION_HOST_OBSERVER_CAPABILITY,
+	TURN_STREAM_CAPABILITY,
+} from "../host/host";
 import {
 	type ActivatedPreparedSession,
 	type PreparedSessionActivationClient,
@@ -199,6 +203,7 @@ export interface SessionRouterClient {
 		frame: Record<string, unknown>,
 		options?: {
 			timeoutMs?: number;
+			deadline?: number;
 			connectedOnly?: boolean;
 			/** Synchronous pre-send observer; a throw aborts the dispatch before the wire. */
 			beforeDispatch?: (context: SdkDispatchContext) => void;
@@ -287,8 +292,17 @@ export interface SessionRouterOptions {
 	agentDir: string;
 	/** Limits attachment to exact ids selected by a Broker-scoped operation. */
 	sessionIds?: readonly string[];
+	/** Dynamically limits attachment to sessions currently owned by the caller. */
+	attachFilter?: (sessionId: string) => boolean;
 	/** Marks default SDK clients as notification-only observers; demanding by default. */
 	observer?: boolean;
+	/**
+	 * Negotiates positioned-only notification effects on default SDK clients, so the
+	 * host stops sending them the raw native copy of frames whose positioned
+	 * envelope already reached them. Only notification-effect publishers opt in;
+	 * ordinary SDK observers keep both public surfaces.
+	 */
+	positionedNotificationEffects?: boolean;
 	deps?: SessionRouterDeps;
 	/** Runtime-specific identity validation; Router supplies a conservative fallback. */
 	correlateFrame?: SessionRouterFrameCorrelator;
@@ -615,7 +629,9 @@ type AdoptedSession = {
 export class SessionRouter {
 	readonly #agentDir: string;
 	readonly #sessionIds: ReadonlySet<string> | undefined;
+	readonly #attachFilter: ((sessionId: string) => boolean) | undefined;
 	readonly #observer: boolean;
+	readonly #positionedNotificationEffects: boolean;
 	readonly #deps: SessionRouterDeps;
 	readonly #correlateFrame: SessionRouterFrameCorrelator;
 	readonly #index: SessionIndex;
@@ -657,7 +673,9 @@ export class SessionRouter {
 	constructor(options: SessionRouterOptions) {
 		this.#agentDir = options.agentDir;
 		this.#sessionIds = options.sessionIds === undefined ? undefined : new Set(options.sessionIds);
+		this.#attachFilter = options.attachFilter;
 		this.#observer = options.observer === true;
+		this.#positionedNotificationEffects = options.positionedNotificationEffects === true;
 		this.#deps = options.deps ?? {};
 		this.#correlateFrame = options.correlateFrame ?? fallbackCorrelation;
 		this.#index = this.#deps.createIndex?.(options.agentDir) ?? new DefaultSessionIndex(options.agentDir);
@@ -797,6 +815,7 @@ export class SessionRouter {
 		if (
 			sessionId !== fallback.sessionId ||
 			(this.#sessionIds !== undefined && !this.#sessionIds.has(sessionId ?? "")) ||
+			(this.#attachFilter !== undefined && !this.#attachFilter(sessionId ?? "")) ||
 			endpointGeneration === undefined ||
 			pid === undefined ||
 			endpointMtimeMs === undefined ||
@@ -936,18 +955,47 @@ export class SessionRouter {
 		expectedAttachment?: SessionAttachment,
 		options?: {
 			timeoutMs?: number;
+			deadline?: number;
 			beforeDispatch?: (context: SdkDispatchContext) => void;
 			onDispatch?: SdkDispatchHandler;
 			dispatchFence?: (dispatch: () => Promise<Record<string, unknown>>) => Promise<Record<string, unknown>>;
 		},
 	): Promise<Record<string, unknown>> {
+		const { deadline, beforeDispatch, onDispatch, dispatchFence, ...requestOptions } = options ?? {};
+		const remainingDeadlineMs = (): number =>
+			deadline === undefined ? Number.POSITIVE_INFINITY : Math.max(0, deadline - Date.now());
+		const reconcileWithinDeadline = async (): Promise<void> => {
+			if (deadline === undefined) {
+				await this.#serialReconcile(this.#runEpoch, true, true);
+				return;
+			}
+			const remaining = remainingDeadlineMs();
+			if (remaining <= 0)
+				throw new SessionRouterError("pre_send", "SDK session request deadline elapsed during router preparation.");
+			const reconciliation = this.#serialReconcile(this.#runEpoch, true, true);
+			const expired = Promise.withResolvers<never>();
+			const timer = setTimeout(
+				() =>
+					expired.reject(
+						new SessionRouterError("pre_send", "SDK session request deadline elapsed during router preparation."),
+					),
+				remaining,
+			);
+			try {
+				await Promise.race([reconciliation, expired.promise]);
+			} finally {
+				clearTimeout(timer);
+			}
+		};
 		const matchesExpectedAuthority = (attachment: SessionAttachment): boolean =>
 			expectedAttachment === undefined ||
 			attachment === expectedAttachment ||
 			(expectedAttachment.authorityId !== undefined && attachment.authorityId === expectedAttachment.authorityId);
 		const publishing = this.#sessions.get(sessionId);
 		if (!publishing || !matchesExpectedAuthority(publishing.capability) || !publishing.initializingPublication)
-			await this.#serialReconcile(this.#runEpoch, true, true);
+			await reconcileWithinDeadline();
+		if (remainingDeadlineMs() <= 0)
+			throw new SessionRouterError("pre_send", "SDK session request deadline elapsed during router preparation.");
 		const attached = this.#sessions.get(sessionId);
 		if (!attached || !this.#attachmentPublished(attached))
 			throw new SessionRouterError("pre_send", "SDK session attachment is unavailable: session not published.");
@@ -976,20 +1024,44 @@ export class SessionRouter {
 		// token: the wire frame alone carries credentials, and the observer
 		// context is a deep-frozen, token-redacted copy (#4640 review).
 		const wireFrame = this.#prepareFrame(attached, frame);
-		const { beforeDispatch, onDispatch, dispatchFence, ...requestOptions } = options ?? {};
+		if (remainingDeadlineMs() <= 0) throw new SessionRouterError("pre_send", "SDK session request deadline elapsed.");
 		try {
-			await attached.client.connect?.();
+			const connecting = attached.client.connect?.();
+			if (connecting) {
+				if (deadline === undefined) await connecting;
+				else {
+					const expired = Promise.withResolvers<never>();
+					const timer = setTimeout(
+						() =>
+							expired.reject(
+								new SessionRouterError(
+									"pre_send",
+									"SDK session request deadline elapsed during transport preparation.",
+								),
+							),
+						remainingDeadlineMs(),
+					);
+					try {
+						await Promise.race([connecting, expired.promise]);
+					} finally {
+						clearTimeout(timer);
+					}
+				}
+			}
 		} catch (error) {
 			if (error instanceof SdkClientError) throw new SdkPreparedDispatchError(error);
 			throw error;
 		}
 		if (!this.#attachmentPublished(attached))
 			throw new SessionRouterError("pre_send", "SDK session attachment changed during transport preparation.");
-		const dispatch = () =>
-			attached.client.request(wireFrame, {
+		const dispatch = () => {
+			const dispatchRemaining = remainingDeadlineMs();
+			if (dispatchRemaining <= 0)
+				throw new SessionRouterError("pre_send", "SDK session request deadline elapsed before dispatch.");
+			return attached.client.request(wireFrame, {
 				...requestOptions,
 				connectedOnly: true,
-				timeoutMs: requestOptions.timeoutMs ?? SESSION_REQUEST_TIMEOUT_MS,
+				timeoutMs: Math.min(requestOptions.timeoutMs ?? SESSION_REQUEST_TIMEOUT_MS, dispatchRemaining),
 				...(beforeDispatch
 					? {
 							beforeDispatch: (context: SdkDispatchContext) =>
@@ -1003,7 +1075,16 @@ export class SessionRouter {
 						}
 					: {}),
 			});
+		};
 		const response = await (dispatchFence ? dispatchFence(dispatch) : dispatch());
+		// A late acknowledgement cannot activate a provider after the caller's budget.
+		// Keep the sent identity for reconciliation: expiry does not undo registration.
+		if (remainingDeadlineMs() <= 0)
+			throw new SdkClientError("uncertain_after_send", "SDK session request deadline elapsed after dispatch.", {
+				id: wireFrame.id,
+				operation: wireFrame.operation ?? wireFrame.type,
+				idempotencyKey: wireFrame.idempotencyKey,
+			});
 		const settled = this.#sessions.get(sessionId);
 		if (
 			!settled ||
@@ -1294,7 +1375,8 @@ export class SessionRouter {
 				session.live &&
 				isSessionAuthorityEligible(session) &&
 				!session.terminalUncertain &&
-				(this.#sessionIds === undefined || this.#sessionIds.has(session.sessionId)),
+				(this.#sessionIds === undefined || this.#sessionIds.has(session.sessionId)) &&
+				(this.#attachFilter === undefined || this.#attachFilter(session.sessionId)),
 		);
 		const liveIds = new Set(live.map(session => session.sessionId));
 		const attachedIds = new Set<string>();
@@ -1524,9 +1606,13 @@ export class SessionRouter {
 				endpointMtimeMs,
 			});
 		} else {
+			const capabilities = [
+				...(this.#observer ? [SESSION_HOST_OBSERVER_CAPABILITY, TURN_STREAM_CAPABILITY] : []),
+				...(this.#positionedNotificationEffects ? [POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY] : []),
+			];
 			const defaultClient = new SdkClient(endpoint.url, endpoint.token, {
 				...ACP_SESSION_RECONNECT,
-				...(this.#observer ? { capabilities: [SESSION_HOST_OBSERVER_CAPABILITY, TURN_STREAM_CAPABILITY] } : {}),
+				...(capabilities.length > 0 ? { capabilities } : {}),
 			});
 			transport = defaultClient;
 			connection = defaultClient.connect().then(() => defaultClient);

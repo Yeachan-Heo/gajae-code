@@ -91,7 +91,7 @@ Retain outside SDK session lifecycle:
 Primary files:
 
 - `packages/coding-agent/src/sdk/bus/telegram-daemon.ts`
-- `packages/coding-agent/src/sdk/bus/lifecycle-orchestrator.ts`
+- `packages/coding-agent/src/sdk/bus/lifecycle-orchestrator.ts` (planned name, never created; the daemon-side grammar landed as `packages/coding-agent/src/sdk/bus/lifecycle-commands.ts`)
 
 Remove:
 
@@ -363,7 +363,7 @@ Expected existing files:
 - `packages/coding-agent/src/sdk/broker/lifecycle.ts`
 - `packages/coding-agent/src/sdk/host/session-runtime.ts`
 - `packages/coding-agent/src/sdk/bus/telegram-daemon.ts`
-- `packages/coding-agent/src/sdk/bus/lifecycle-orchestrator.ts`
+- `packages/coding-agent/src/sdk/bus/lifecycle-orchestrator.ts` (planned name, never created; landed as `packages/coding-agent/src/sdk/bus/lifecycle-commands.ts` plus `packages/coding-agent/src/sdk/lifecycle/`)
 - shared chat-daemon/session-control modules under `packages/coding-agent/src/sdk/bus/`
 - Coordinator and ACP adapters where they consume the same core contracts
 

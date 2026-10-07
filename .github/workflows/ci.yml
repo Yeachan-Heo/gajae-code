@@ -200,6 +200,12 @@ jobs:
            run: |
               test -f packages/natives/native/pi_natives.linux-x64-baseline.node
               test -f packages/natives/native/pi_natives.linux-x64-modern.node
+         - name: Verify producer provenance sidecars
+           shell: bash
+           run: |
+              set -euo pipefail
+              test -f packages/natives/native/pi_natives.linux-x64-baseline.node.provenance.json
+              test -f packages/natives/native/pi_natives.linux-x64-modern.node.provenance.json
          - name: Upload native addon(s)
            uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
            with:
@@ -207,6 +213,8 @@ jobs:
               path: |
                  packages/natives/native/pi_natives.linux-x64-baseline.node
                  packages/natives/native/pi_natives.linux-x64-modern.node
+                 packages/natives/native/pi_natives.linux-x64-baseline.node.provenance.json
+                 packages/natives/native/pi_natives.linux-x64-modern.node.provenance.json
               if-no-files-found: error
               retention-days: 1
               overwrite: true
@@ -277,6 +285,13 @@ jobs:
               # native shard on an expired artifact (#5715).
               echo "::notice::main-native-${{ github.run_id }} is no longer retained; rebuilding the native addon from source for this re-run."
               bun run ci:build:native
+         - name: Rebuild and verify transferred native provenance
+           if: ${{ matrix.native }}
+           shell: bash
+           run: |
+              set -euo pipefail
+              bun scripts/verify-diagnostic-artifact-provenance.ts --rebuild-from-sidecars packages/natives/native
+              bun scripts/verify-diagnostic-artifact-provenance.ts --verify packages/natives/native
          - name: Run task shard
            env:
               GITHUB_ACTIONS: ""
@@ -319,6 +334,12 @@ jobs:
               # re-run is not a code failure (#5715).
               echo "::notice::main-native-${{ github.run_id }} is no longer retained; rebuilding the native addon from source for this re-run."
               bun run ci:build:native
+         - name: Rebuild and verify transferred native provenance
+           shell: bash
+           run: |
+              set -euo pipefail
+              bun scripts/verify-diagnostic-artifact-provenance.ts --rebuild-from-sidecars packages/natives/native
+              bun scripts/verify-diagnostic-artifact-provenance.ts --verify packages/natives/native
          - name: Run ACP conformance
            run: |
               # Real (non-symlinked) seeded scratch workspace, matching the promoted baseline:
@@ -376,45 +397,6 @@ jobs:
    # platform, then standalone binaries. Rehearsals stop after binary verification;
    # nightly publication waits for `nightly_gate` before touching npm or GitHub.
    # ---------------------------------------------------------------------------
-   mupdf_source:
-      if: ${{ needs.release_metadata.result == 'success' && (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'tag-build-verify') || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'nightly-release')) }}
-      needs: [release_metadata]
-      runs-on: ubuntu-22.04
-      timeout-minutes: 90
-      steps:
-         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
-           with:
-              node-version: "24"
-         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
-           with:
-              bun-version: "1.4.0"
-         - run: bun install --frozen-lockfile
-         - name: Install pinned Emscripten SDK
-           shell: bash
-           run: |
-              git clone --depth 1 --branch 4.0.8 https://github.com/emscripten-core/emsdk.git "$RUNNER_TEMP/emsdk"
-              actual_commit="$(git -C "$RUNNER_TEMP/emsdk" rev-parse HEAD)"
-              test "$actual_commit" = "419021fa040428bc69ef1559b325addb8e10211f" || {
-                 echo "Unexpected emsdk commit: $actual_commit" >&2
-                 exit 1
-              }
-              "$RUNNER_TEMP/emsdk/emsdk" install 4.0.8
-              "$RUNNER_TEMP/emsdk/emsdk" activate 4.0.8
-              echo "EMSDK=$RUNNER_TEMP/emsdk" >> "$GITHUB_ENV"
-         - name: Build MuPDF release materials
-           shell: bash
-           run: |
-              source "$EMSDK/emsdk_env.sh"
-              bun scripts/prepare-mupdf-release-materials.ts --output-dir "$RUNNER_TEMP/mupdf-release-materials"
-         - name: Upload version-qualified MuPDF source materials
-           uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
-           with:
-              name: mupdf-release-materials-${{ needs.release_metadata.outputs.version || format('rehearsal-{0}', github.run_id) }}
-              path: ${{ runner.temp }}/mupdf-release-materials
-              if-no-files-found: error
-              retention-days: 30
-              overwrite: true
 
    native:
       if: ${{ always() && needs.release_metadata.result == 'success' && (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'tag-build-verify') || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'nightly-release')) }}
@@ -445,8 +427,8 @@ jobs:
               nightly_version: ${{ needs.release_metadata.outputs.nightly_version }}
 
    binaries:
-      if: ${{ always() && needs.release_metadata.result == 'success' && needs.native.result == 'success' && needs.mupdf_source.result == 'success' && (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'tag-build-verify') || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'nightly-release')) }}
-      needs: [native, release_metadata, mupdf_source]
+      if: ${{ always() && needs.release_metadata.result == 'success' && needs.native.result == 'success' && (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'tag-build-verify') || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'nightly-release')) }}
+      needs: [native, release_metadata]
       timeout-minutes: 60
       runs-on: ${{ matrix.os }}
       strategy:
@@ -475,25 +457,44 @@ jobs:
          - name: Stage nightly release version
            if: ${{ needs.release_metadata.outputs.nightly_version != '' }}
            run: bun scripts/nightly-release.ts stage --version "${{ needs.release_metadata.outputs.nightly_version }}" --source-sha "${{ github.sha }}"
-         - name: Download MuPDF release materials
-           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
-           with:
-              name: mupdf-release-materials-${{ needs.release_metadata.outputs.version || format('rehearsal-{0}', github.run_id) }}
-              path: ${{ runner.temp }}/mupdf-release-materials
          - name: Download native addon(s)
            uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
            with:
               pattern: pi-natives-${{ matrix.platform }}-${{ matrix.arch }}*
               path: packages/natives/native
               merge-multiple: true
+         - name: Rebuild the diagnostic artifact provenance record
+           # The binaries matrix includes a Windows runner, whose default shell is
+           # PowerShell; this body is Bash.
+           shell: bash
+           run: |
+              set -euo pipefail
+              bun scripts/verify-diagnostic-artifact-provenance.ts --rebuild-from-sidecars packages/natives/native
+              bun scripts/verify-diagnostic-artifact-provenance.ts --verify packages/natives/native
          - name: Verify memory-guard native loader export
            run: bun test packages/natives/test/memory-guard-native.test.ts
 
          - name: Build release binary
            env:
               RELEASE_TARGETS: ${{ matrix.target_id }}
-              GJC_MUPDF_RELEASE_MATERIALS_DIR: ${{ runner.temp }}/mupdf-release-materials
            run: bun run ci:release:build-binaries
+         - name: Verify removed PDF references
+           run: bun scripts/verify-agpl-removal.ts --active-refs
+         - name: Verify packaged PDF payloads
+           shell: bash
+           run: |
+              set -euo pipefail
+              package_dir="$RUNNER_TEMP/coding-agent-package"
+              mkdir -p "$package_dir"
+              (cd packages/coding-agent && bun pm pack --destination "$package_dir")
+              # `bun pm pack` on Windows records non-POSIX member modes, which the
+              # strict release tar reader rejects. The published tarball is packed on
+              # Linux; for this scan-only copy, repack the identical member bytes with
+              # uniform POSIX modes via Bun.Archive (no shell tar, no drive-letter paths).
+              if [ "$RUNNER_OS" = "Windows" ]; then
+                 bun -e 'const [p] = await Array.fromAsync(new Bun.Glob("*.tgz").scan({ cwd: process.argv[1], absolute: true })); const files = await new Bun.Archive(await Bun.file(p).bytes()).files(); await Bun.write(p, await new Bun.Archive(Object.fromEntries(files), { compress: "gzip" }).bytes());' "$package_dir"
+              fi
+              bun scripts/verify-agpl-removal.ts --payload --tarball "$package_dir"/*.tgz --binary "${{ matrix.binary_path }}" --addon packages/natives/native/*.node --prose-root .
          - name: Smoke memory-guard native route (Windows)
            if: runner.os == 'Windows'
            shell: pwsh
@@ -659,6 +660,11 @@ jobs:
               pattern: pi-natives-*
               path: packages/natives/native
               merge-multiple: true
+         - name: Rebuild the diagnostic artifact provenance record
+           run: |
+              set -euo pipefail
+              bun scripts/verify-diagnostic-artifact-provenance.ts --rebuild-from-sidecars packages/natives/native
+              bun scripts/verify-diagnostic-artifact-provenance.ts --verify packages/natives/native
          - name: Prepare immutable package evidence
            env:
               RELEASE_CHANNEL: ${{ needs.release_metadata.outputs.channel }}
@@ -974,10 +980,15 @@ jobs:
                     # npm is read-after-write eventually consistent: re-observe
                     # until the sealed integrity is visible. 0.15.4 proved 60s is
                     # not enough (agent-core became visible only after the window
-                    # elapsed, failing an otherwise clean publish); allow up to 10
-                    # minutes of wall time, transfer time included, so a stalled
-                    # registry cannot stretch the window.
-                    deadline=$((SECONDS + 600))
+                    # elapsed, failing an otherwise clean publish), and v0.18.3
+                    # proved 600s is not enough either: the 110MB win32-x64
+                    # native was published at 09:47:26 but only became visible at
+                    # 09:59:40, blowing the window by 2m11s AFTER five sibling
+                    # packages had already gone immutable, which stranded the
+                    # release. Size this for the slowest plausible replica (large
+                    # Windows natives) rather than the median package, and keep
+                    # the window bounded so a truly stalled registry still fails.
+                    deadline=$((SECONDS + 1800))
                     while :; do
                        observed="$(registry_integrity "$name" "$version")"
                        [ "$observed" = "$expected_sri" ] && break
@@ -1050,8 +1061,8 @@ jobs:
       # GitHub Release, and verifies it. Repository code may execute here
       # because no npm credential capability exists in this job.
       # always(): see release_approval. Only a successful publish finalizes.
-      if: ${{ always() && needs.publish.result == 'success' && needs.mupdf_source.result == 'success' }}
-      needs: [publish, release_metadata, mupdf_source]
+      if: ${{ always() && needs.publish.result == 'success' }}
+      needs: [publish, release_metadata]
       timeout-minutes: 45
       runs-on: ubuntu-22.04
       permissions:
@@ -1078,11 +1089,6 @@ jobs:
            with:
               name: release-notes-${{ needs.release_metadata.outputs.version }}
               path: ${{ runner.temp }}/release-notes
-         - name: Download verified MuPDF corresponding source
-           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
-           with:
-              name: mupdf-release-materials-${{ needs.release_metadata.outputs.version }}
-              path: ${{ runner.temp }}/mupdf-release-materials
          - name: Verify release notes integrity
            shell: bash
            run: |
@@ -1131,11 +1137,6 @@ jobs:
                  ${{ runner.temp }}/release-evidence/gajae-release-packages-expected-v1.json
                  ${{ runner.temp }}/release-evidence/gajae-release-packages-v1.json
                  ${{ runner.temp }}/release-evidence/gajae-release-channel-v1.json
-                 ${{ runner.temp }}/mupdf-release-materials/mupdf-source.tar.gz
-                 ${{ runner.temp }}/mupdf-release-materials/mupdf-build-recipe.txt
-                 ${{ runner.temp }}/mupdf-release-materials/mupdf-notices.txt
-                 ${{ runner.temp }}/mupdf-release-materials/mupdf-provenance.json
-                 ${{ runner.temp }}/mupdf-release-materials/mupdf-built.wasm
          - name: Verify immutable GitHub Release
            env:
               GH_TOKEN: ${{ github.token }}
@@ -1160,8 +1161,6 @@ jobs:
                     "gjc-linux-x64", "gjc-linux-arm64", "gjc-darwin-arm64", "gjc-darwin-x64", "gjc-windows-x64.exe",
                     "gajae-release-binaries-v1.json", "gajae-release-binaries.sha256",
                     "gajae-release-packages-expected-v1.json", "gajae-release-packages-v1.json", "gajae-release-channel-v1.json",
-                    "mupdf-source.tar.gz", "mupdf-build-recipe.txt", "mupdf-notices.txt", "mupdf-provenance.json",
-                    "mupdf-built.wasm",
                  ];
                  const assets = new Set(release.assets.map(asset => asset.name));
                  const missing = expectedAssets.filter(name => !assets.has(name));

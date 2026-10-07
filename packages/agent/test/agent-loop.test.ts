@@ -16,7 +16,7 @@ import type {
 	AgentToolContext,
 	ToolCallContext,
 } from "@gajae-code/agent-core/types";
-import type { AssistantMessage, Context, Message, ToolResultMessage } from "@gajae-code/ai";
+import type { AssistantMessage, Context, Message, Model, ToolResultMessage } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import * as z from "zod/v4";
@@ -214,6 +214,7 @@ describe("agentLoop with AgentMessage", () => {
 		if (finalMessage.role !== "assistant") throw new Error("Expected assistant message");
 		expect(finalMessage.stopReason).toBe("aborted");
 		expect(finalMessage.errorMessage).toBe("Request was aborted");
+		expect(finalMessage.transportFailure?.providerCode).not.toBe("empty_response");
 		expect(events.map(event => event.type)).toContain("agent_end");
 		expect(publicationOrder).toEqual(["checkpoint", "agent_end"]);
 	});
@@ -2209,6 +2210,87 @@ describe("agentLoop - empty response overflow detection", () => {
 		expect(messageEnd?.message).toMatchObject({
 			stopReason: "error",
 			errorMessage: "Provider returned an empty response with zero token usage",
+		});
+	});
+
+	it("promotes an untyped zero-token empty stop so idle runs cannot look successful", async () => {
+		const context: AgentContext = { systemPrompt: ["You are helpful."], messages: [], tools: [] };
+		const mock = createMockModel({
+			responses: [{ content: [], stopReason: "stop", usage: { input: 0, output: 0 } }],
+		});
+		const stream = agentLoop(
+			[createUserMessage("Make a change")],
+			context,
+			{
+				model: mock.model,
+				convertToLlm: identityConverter,
+			},
+			undefined,
+			mock.stream,
+		);
+		for await (const _ of stream) {
+			// drain
+		}
+
+		const messages = await stream.result();
+		const assistantMessage = messages.find(m => m.role === "assistant") as AssistantMessage | undefined;
+		expect(assistantMessage).toMatchObject({
+			stopReason: "error",
+			errorMessage: "Provider returned an empty response with zero token usage",
+			errorKind: "local_empty_response",
+		});
+	});
+
+	it("promotes an empty stop when the provider tears down after its start event", async () => {
+		const context: AgentContext = { systemPrompt: ["You are helpful."], messages: [], tools: [] };
+		const mock = createMockModel({
+			responses: [{ content: [], stopReason: "stop", usage: { input: 0, output: 0 } }],
+		});
+		const streamFn = (model: Model, _context: Context, _options?: unknown): AssistantMessageEventStream => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const partial: AssistantMessage = {
+					role: "assistant",
+					content: [],
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: Date.now(),
+				};
+				stream.push({
+					type: "start",
+					partial,
+				});
+				stream.end(partial);
+			});
+			return stream;
+		};
+		const stream = agentLoop(
+			[createUserMessage("Make a change")],
+			context,
+			{ model: mock.model, convertToLlm: identityConverter },
+			undefined,
+			streamFn,
+		);
+		for await (const _ of stream) {
+			// drain
+		}
+
+		const messages = await stream.result();
+		const assistantMessage = messages.find(m => m.role === "assistant") as AssistantMessage | undefined;
+		expect(assistantMessage).toMatchObject({
+			stopReason: "error",
+			errorMessage: "Provider returned an empty response with zero token usage",
+			errorKind: "local_empty_response",
 		});
 	});
 

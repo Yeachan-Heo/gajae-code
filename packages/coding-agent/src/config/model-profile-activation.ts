@@ -17,6 +17,7 @@ import {
 export { resolveModelProfileName } from "./model-profile-contract";
 
 import {
+	createRegistrySelectorIndex,
 	GJC_MODEL_ASSIGNMENT_TARGETS,
 	type GjcModelAssignmentTargetId,
 	isAuthenticated,
@@ -96,6 +97,7 @@ export interface PrepareModelProfileActivationOptions {
 		| "resolveCanonicalModel"
 		| "getCanonicalVariants"
 		| "getCanonicalId"
+		| "isSelectorCircuitOpen"
 	> &
 		Partial<
 			Pick<
@@ -113,6 +115,7 @@ export interface PrepareModelProfileActivationOptions {
 			>
 		> & {
 			getError?: ModelRegistry["getError"];
+			authStorage?: ModelRegistry["authStorage"];
 		};
 	settings: Pick<Settings, "get" | "getGlobal" | "getOverride">;
 	profileName: string;
@@ -473,6 +476,53 @@ export class ModelProfileCredentialError extends Error {
 	}
 }
 
+interface SessionPinRegistry {
+	authStorage?: {
+		hasRuntimeApiKey(provider: string): boolean;
+		hasLiteralConfigApiKey(provider: string, owner?: object): boolean;
+		hasSessionCredentialUnavailable(provider: string, scopeId?: string): boolean;
+	};
+	getAuthStorageOwner?(): object;
+}
+
+/**
+ * Whether an unavailable session credential pin blocks `provider`.
+ *
+ * Mirrors `AuthStorage.getApiKey` precedence: a runtime `--api-key` override or a literal
+ * `models.yml` `apiKey` registered for this registry's owner is resolved before the
+ * unavailable-pin marker, so either one keeps the provider usable. An `apiKeyEnv` key does
+ * not: `getApiKey` prefers another stored api_key account over it, which would silently
+ * retarget the unavailable pin.
+ */
+export function isSessionCredentialPinBlocking(
+	registry: SessionPinRegistry,
+	provider: string,
+	sessionId: string | undefined,
+): boolean {
+	const authStorage = registry.authStorage;
+	if (!authStorage) return false;
+	if (authStorage.hasRuntimeApiKey(provider)) return false;
+	if (authStorage.hasLiteralConfigApiKey(provider, registry.getAuthStorageOwner?.())) return false;
+	return authStorage.hasSessionCredentialUnavailable(provider, sessionId);
+}
+
+async function getProfileProviderApiKey(
+	registry: PrepareModelProfileActivationOptions["modelRegistry"],
+	provider: string,
+	sessionId: string,
+	profileLabel: string,
+): Promise<string | undefined> {
+	const pinBlocking = () => isSessionCredentialPinBlocking(registry, provider, sessionId);
+	if (pinBlocking()) throw new ModelProfileCredentialError(profileLabel, [provider]);
+	try {
+		return await registry.getApiKeyForProvider(provider, sessionId);
+	} catch (error) {
+		// OAuth selection can invalidate a pin while the credential probe is running.
+		if (pinBlocking()) throw new ModelProfileCredentialError(profileLabel, [provider]);
+		throw error;
+	}
+}
+
 export function formatModelProfileCredentialError(profileLabel: string, providers: readonly string[]): string {
 	return `Model profile "${profileLabel}" requires credentials for: ${providers.join(", ")}. Run /login and configure the missing provider(s), then retry.`;
 }
@@ -674,6 +724,7 @@ export async function resolveMissingSessionModelRecovery(options: {
 		options.skips.every(skip => skip.reason === "unknown_model");
 	if (!allSelectorsUnknown) return undefined;
 	const fullCatalog = options.modelRegistry.getAll();
+	const catalogIndex = createRegistrySelectorIndex(fullCatalog);
 	const savedSelectorsMissingFromCatalog = resolveConfiguredModelPatterns(
 		options.defaultEntries,
 		options.settings,
@@ -687,7 +738,7 @@ export async function resolveMissingSessionModelRecovery(options: {
 			}).model
 		)
 			return false;
-		return !registrySelectorResolvesToModel(selector, fullCatalog);
+		return !registrySelectorResolvesToModel(selector, catalogIndex);
 	});
 	const savedConcreteDefault = options.savedDefault ? parseModelString(options.savedDefault) : undefined;
 	const savedConcreteDefaultMissingFromCatalog =
@@ -759,7 +810,12 @@ export async function resolveModelProfileDefaultChain(options: {
 	])) {
 		let apiKey: string | undefined;
 		try {
-			apiKey = await options.modelRegistry.getApiKeyForProvider(provider, options.credentialSessionId);
+			apiKey = await getProfileProviderApiKey(
+				options.modelRegistry,
+				provider,
+				options.credentialSessionId,
+				profileLabel,
+			);
 		} catch (error) {
 			if (requiredProviderSet.has(provider) && !alternativeSet.has(provider)) throw error;
 			continue;
@@ -784,7 +840,12 @@ export async function resolveModelProfileDefaultChain(options: {
 	const proxyApiKey =
 		proxyProvider === undefined
 			? undefined
-			: await options.modelRegistry.getApiKeyForProvider(proxyProvider, options.credentialSessionId);
+			: await getProfileProviderApiKey(
+					options.modelRegistry,
+					proxyProvider,
+					options.credentialSessionId,
+					profileLabel,
+				);
 	if (
 		proxyProvider !== undefined &&
 		!isModelProfileProxyConfigured(proxyProvider, configuredProviderIds, proxyApiKey === kNoAuth)
@@ -874,7 +935,8 @@ export async function resolveModelProfileDefaultChain(options: {
 			resolveModelByLookupAlias: options.modelRegistry.resolveModelByLookupAlias?.bind(options.modelRegistry),
 			lookupAliasExists: options.modelRegistry.lookupAliasExists?.bind(options.modelRegistry),
 			clearCanonicalVariant: options.modelRegistry.clearCanonicalVariant?.bind(options.modelRegistry),
-		} as ModelRegistry,
+			isSelectorCircuitOpen: options.modelRegistry.isSelectorCircuitOpen?.bind(options.modelRegistry),
+		},
 		options.settings as Settings,
 		options.credentialSessionId,
 		{
@@ -882,6 +944,8 @@ export async function resolveModelProfileDefaultChain(options: {
 			aliasIntent: "preset-equivalent",
 			canonicalSessionId: null,
 			credentialSessionId: options.credentialSessionId,
+			isCredentialUnavailable: provider =>
+				isSessionCredentialPinBlocking(options.modelRegistry, provider, options.credentialSessionId),
 		},
 	);
 	return { profileName, entries: defaultChain, ...resolution };
@@ -1066,10 +1130,11 @@ async function resolveAndClampSelectorValue(
 							options.credentialSessionId,
 							model.baseUrl,
 						),
-					resolveCanonicalModel: options.modelRegistry.resolveCanonicalModel.bind(options.modelRegistry),
+					resolveCanonicalModel: options.modelRegistry.resolveCanonicalModel?.bind(options.modelRegistry),
 					resolveModelByLookupAlias: options.modelRegistry.resolveModelByLookupAlias?.bind(options.modelRegistry),
 					lookupAliasExists: options.modelRegistry.lookupAliasExists?.bind(options.modelRegistry),
 					clearCanonicalVariant: options.modelRegistry.clearCanonicalVariant?.bind(options.modelRegistry),
+					isSelectorCircuitOpen: options.modelRegistry.isSelectorCircuitOpen?.bind(options.modelRegistry),
 				},
 				options.settings,
 				options.credentialSessionId,
@@ -1078,6 +1143,8 @@ async function resolveAndClampSelectorValue(
 					aliasIntent: options.aliasIntent,
 					canonicalSessionId: options.sessionId,
 					credentialSessionId: options.credentialSessionId,
+					isCredentialUnavailable: provider =>
+						isSessionCredentialPinBlocking(options.modelRegistry, provider, options.credentialSessionId),
 				},
 			);
 			resolved = {
@@ -1193,12 +1260,13 @@ async function concretizeProfileSelectorValue(
 							getAvailable: () => candidates,
 							getApiKey: model =>
 								prepared.modelRegistry.getApiKeyForProvider(model.provider, credentialSessionId, model.baseUrl),
-							resolveCanonicalModel: prepared.modelRegistry.resolveCanonicalModel.bind(prepared.modelRegistry),
+							resolveCanonicalModel: prepared.modelRegistry.resolveCanonicalModel?.bind(prepared.modelRegistry),
 							resolveModelByLookupAlias: prepared.modelRegistry.resolveModelByLookupAlias?.bind(
 								prepared.modelRegistry,
 							),
 							lookupAliasExists: prepared.modelRegistry.lookupAliasExists?.bind(prepared.modelRegistry),
 							clearCanonicalVariant: prepared.modelRegistry.clearCanonicalVariant?.bind(prepared.modelRegistry),
+							isSelectorCircuitOpen: prepared.modelRegistry.isSelectorCircuitOpen?.bind(prepared.modelRegistry),
 						},
 						prepared.settings as Settings,
 						credentialSessionId,
@@ -1207,6 +1275,8 @@ async function concretizeProfileSelectorValue(
 							aliasIntent: "preset-equivalent",
 							canonicalSessionId: prepared.session.sessionId,
 							credentialSessionId,
+							isCredentialUnavailable: provider =>
+								isSessionCredentialPinBlocking(prepared.modelRegistry, provider, credentialSessionId),
 						},
 					)
 				: resolveModelRoleValue(selector, candidates, {
@@ -1316,7 +1386,7 @@ export async function prepareModelProfileActivation(
 		for (const provider of authenticationProbeProviders) {
 			let apiKey: string | undefined;
 			try {
-				apiKey = await options.modelRegistry.getApiKeyForProvider(provider, credentialSessionId);
+				apiKey = await getProfileProviderApiKey(options.modelRegistry, provider, credentialSessionId, profileLabel);
 			} catch (error) {
 				if (requiredProviderSet.has(provider) && !alternativeSet.has(provider)) throw error;
 				continue;
@@ -1351,7 +1421,7 @@ export async function prepareModelProfileActivation(
 		const proxyApiKey =
 			proxyProvider === undefined
 				? undefined
-				: await options.modelRegistry.getApiKeyForProvider(proxyProvider, credentialSessionId);
+				: await getProfileProviderApiKey(options.modelRegistry, proxyProvider, credentialSessionId, profileLabel);
 		if (proxyProvider !== undefined) {
 			const configuredProxyProviders = options.modelRegistry.getConfiguredProviderIds?.();
 			if (!isModelProfileProxyConfigured(proxyProvider, configuredProxyProviders, proxyApiKey === kNoAuth)) {
@@ -1447,7 +1517,8 @@ export async function prepareModelProfileActivation(
 				resolveModelByLookupAlias: options.modelRegistry.resolveModelByLookupAlias?.bind(options.modelRegistry),
 				lookupAliasExists: options.modelRegistry.lookupAliasExists?.bind(options.modelRegistry),
 				clearCanonicalVariant: options.modelRegistry.clearCanonicalVariant?.bind(options.modelRegistry),
-			} as ModelRegistry,
+				isSelectorCircuitOpen: options.modelRegistry.isSelectorCircuitOpen?.bind(options.modelRegistry),
+			},
 			options.settings as Settings,
 			credentialSessionId,
 			{
@@ -1455,6 +1526,8 @@ export async function prepareModelProfileActivation(
 				aliasIntent: "preset-equivalent",
 				canonicalSessionId: options.session.sessionId,
 				credentialSessionId,
+				isCredentialUnavailable: provider =>
+					isSessionCredentialPinBlocking(options.modelRegistry, provider, credentialSessionId),
 			},
 		);
 		const defaultModel = defaultResolution.model;

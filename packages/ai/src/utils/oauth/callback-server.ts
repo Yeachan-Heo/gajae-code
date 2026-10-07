@@ -245,6 +245,11 @@ export abstract class OAuthCallbackFlow {
 		if (issuerFailure) {
 			resultState = { ok: false, error: issuerFailure };
 		} else if (error) {
+			// An error callback that does not carry this login's state must not
+			// settle the in-flight login or surface the caller's error text.
+			if (expectedState && state !== expectedState) {
+				return new Response("State mismatch", { status: 400 });
+			}
 			resultState = { ok: false, error: `Authorization failed: ${errorDescription}` };
 		} else if (!code) {
 			resultState = { ok: false, error: "Missing authorization code" };

@@ -241,6 +241,77 @@ describe("read tool URL handling", () => {
 		expect(textBlock?.type).toBe("text");
 		expect(textBlock?.text).toContain("displayed at 1000x500");
 	});
+	it("rasterizes fetched SVG responses to PNG before image resizing", async () => {
+		const svgBytes = fs.readFileSync(path.join(import.meta.dir, "../../../natives/test/fixtures/svg/geometry.svg"));
+		const session = createSession();
+		const tool = new ReadTool(session);
+		let resizeInput: { mimeType: string; bytes: Buffer } | undefined;
+		const resizeSpy = vi.spyOn(imageResize, "resizeImage").mockImplementation(async image => {
+			resizeInput = { mimeType: image.mimeType, bytes: Buffer.from(image.data, "base64") };
+			return {
+				buffer: new Uint8Array([1, 2, 3]),
+				mimeType: "image/png",
+				originalWidth: 17,
+				originalHeight: 11,
+				width: 17,
+				height: 11,
+				wasResized: false,
+				get data() {
+					return "aW1hZ2U=";
+				},
+			};
+		});
+		vi.spyOn(scrapers, "loadPage").mockResolvedValue({
+			ok: true,
+			status: 200,
+			contentType: "image/svg+xml",
+			finalUrl: "https://example.com/geometry.svg",
+			content: "",
+		});
+		vi.spyOn(scraperUtils, "fetchBinary").mockResolvedValue({ ok: true, buffer: svgBytes });
+		const markitSpy = vi.spyOn(scraperUtils, "convertWithMarkit").mockResolvedValue({
+			ok: false,
+			content: "",
+			error: "markit unavailable",
+		});
+
+		const result = await tool.execute("fetch-svg", { path: "https://example.com/geometry.svg" });
+		const imageBlock = result.content.find(
+			(content): content is { type: "image"; data: string; mimeType: string } => content.type === "image",
+		);
+
+		expect(resizeSpy).toHaveBeenCalledTimes(1);
+		expect(markitSpy).not.toHaveBeenCalled();
+		expect(resizeInput?.mimeType).toBe("image/png");
+		expect(resizeInput?.bytes.subarray(0, 8)).toEqual(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+		expect(result.details?.method).toBe("image");
+		expect(imageBlock?.mimeType).toBe("image/png");
+	});
+
+	it("returns invalid-image metadata when a fetched SVG cannot be rasterized", async () => {
+		const session = createSession();
+		const tool = new ReadTool(session);
+		const resizeSpy = vi.spyOn(imageResize, "resizeImage");
+		vi.spyOn(scrapers, "loadPage").mockResolvedValue({
+			ok: true,
+			status: 200,
+			contentType: "image/svg+xml",
+			finalUrl: "https://example.com/broken.svg",
+			content: "",
+		});
+		vi.spyOn(scraperUtils, "fetchBinary").mockResolvedValue({
+			ok: true,
+			buffer: Buffer.from("<svg not really xml"),
+		});
+		vi.spyOn(scraperUtils, "convertWithMarkit").mockResolvedValue({ ok: false, content: "", error: "unused" });
+
+		const result = await tool.execute("fetch-broken-svg", { path: "https://example.com/broken.svg" });
+
+		expect(resizeSpy).not.toHaveBeenCalled();
+		expect(result.details?.method).toBe("image-invalid");
+		expect(result.details?.notes?.some(note => note.startsWith("SVG rasterization failed:"))).toBe(true);
+		expect(result.content.some(content => content.type === "image")).toBe(false);
+	});
 
 	it("keeps markit extracted text for image responses", async () => {
 		const session = createSession();
@@ -293,12 +364,12 @@ describe("read tool URL handling", () => {
 		vi.spyOn(scrapers, "loadPage").mockResolvedValue({
 			ok: true,
 			status: 200,
-			contentType: "image/svg+xml",
-			finalUrl: "https://example.com/image.svg",
-			content: "<svg></svg>",
+			contentType: "image/bmp",
+			finalUrl: "https://example.com/image.bmp",
+			content: "unsupported bitmap response",
 		});
 
-		const result = await tool.execute("fetch-image-unsupported", { path: "https://example.com/image.svg" });
+		const result = await tool.execute("fetch-image-unsupported", { path: "https://example.com/image.bmp" });
 		const imageBlock = result.content.find(content => content.type === "image");
 		const textBlock = result.content.find(content => content.type === "text");
 
@@ -306,7 +377,7 @@ describe("read tool URL handling", () => {
 		expect(fetchBinarySpy).not.toHaveBeenCalled();
 		expect(imageBlock).toBeUndefined();
 		expect(textBlock?.type).toBe("text");
-		expect(textBlock?.text).toContain("<svg></svg>");
+		expect(textBlock?.text).toContain("unsupported bitmap response");
 	});
 
 	it("uses binary conversion fallback for unsupported image MIME when extension is convertible", async () => {

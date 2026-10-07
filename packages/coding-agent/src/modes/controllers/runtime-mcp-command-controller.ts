@@ -44,7 +44,8 @@ import { parseCommandArgs } from "../shared";
 import { buildOAuthLoginAnchor, createOAuthUrlCopyLease } from "../shared/oauth-url-copy";
 import { theme } from "../theme/theme";
 import type { InteractiveModeContext } from "../types";
-import { matchesAppInterrupt } from "../utils/keybinding-matchers";
+import { focusedUiOwnsInterrupt } from "../utils/interrupt-ownership";
+import { matchesAppClear, matchesAppInterrupt } from "../utils/keybinding-matchers";
 import { groupBySource, parseRemoveArgs, readScopeFlag, showCommandMessage } from "./command-controller-shared";
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
@@ -645,7 +646,9 @@ export class MCPCommandController {
 		const cancellationUnsubscribe =
 			signal === undefined && typeof this.ctx.ui.addInputListener === "function"
 				? this.ctx.ui.addInputListener(data => {
-						if (data !== "\x03" && !matchesAppInterrupt(data)) return;
+						const isClearKey = data === "\x03" || matchesAppClear(data);
+						if (!isClearKey && !matchesAppInterrupt(data)) return;
+						if (!isClearKey && focusedUiOwnsInterrupt(this.ctx)) return;
 						userController.abort(new Error("OAuth flow cancelled"));
 						return { consume: true };
 					})
@@ -1839,7 +1842,9 @@ export class MCPCommandController {
 		const oauthUrlCopyLease = createOAuthUrlCopyLease(this.ctx);
 		const abortController = new AbortController();
 		const interruptUnsubscribe = this.ctx.ui.addInputListener?.(data => {
-			if (data !== "\x03" && !matchesAppInterrupt(data)) return;
+			const isClearKey = data === "\x03" || matchesAppClear(data);
+			if (!isClearKey && !matchesAppInterrupt(data)) return;
+			if (!isClearKey && focusedUiOwnsInterrupt(this.ctx)) return;
 			abortController.abort(new Error("Smithery authorization cancelled."));
 			return { consume: true };
 		});

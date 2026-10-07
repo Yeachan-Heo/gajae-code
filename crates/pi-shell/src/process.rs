@@ -604,17 +604,23 @@ mod platform {
 		}
 
 		pub fn unique_id(&self) -> Option<u64> {
-			self.live_bsdinfo()?;
 			let mut info = std::mem::MaybeUninit::<ProcUniqueIdentifierInfo>::zeroed();
 			let size = i32::try_from(std::mem::size_of::<ProcUniqueIdentifierInfo>()).ok()?;
 			// SAFETY: `info` is a writable buffer of the exact flavor-17 structure
 			// size and libproc initializes it completely on a full-size result.
 			let read = unsafe { proc_pidinfo(self.pid, 17, 0, info.as_mut_ptr().cast(), size) };
 			if read != size {
+				// Entitled/setuid children may deny this optional identity query.
+				// Callers must corroborate process death separately.
 				return None;
 			}
 			// SAFETY: the full structure size was reported initialized above.
 			let unique_id = unsafe { info.assume_init() }.unique_id;
+			// Re-check liveness after reading to protect against pid reuse between the read
+			// and this verification: if the start time has changed, the pid was
+			// recycled. For entitled children that deny bsdinfo access (EPERM),
+			// returning None is appropriate since the caller must corroborate liveness
+			// separately (e.g., via incarnation records with empty unique_id).
 			self.live_bsdinfo()?;
 			Some(unique_id)
 		}

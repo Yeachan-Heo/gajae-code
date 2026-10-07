@@ -1,6 +1,7 @@
 import { describe, expect, spyOn, test, vi } from "bun:test";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import { type Model, THINKING_EFFORTS } from "@gajae-code/ai";
+import { logger } from "@gajae-code/utils";
 import { CliParseError } from "@gajae-code/utils/cli";
 import { parseArgs } from "../src/cli/args";
 import { ROOT_THINKING_LEVELS } from "../src/cli/root-flags";
@@ -71,6 +72,7 @@ function fakeSession(initial: Model | null = model("initial-provider", "initial"
 	const session = {
 		model: initial ?? undefined,
 		thinkingLevel: undefined as ThinkingLevel | undefined,
+		unavailableModelProfile: undefined as string | undefined,
 		sessionId: "session-1",
 		credentialSessionId: "credential-session-1",
 		setModelTemporaryCalls: [] as Array<{
@@ -94,6 +96,10 @@ function fakeSession(initial: Model | null = model("initial-provider", "initial"
 		},
 		getConfiguredModelChain: () => undefined,
 		hasRecoveredDefaultFallbackChain: () => false,
+		setUnavailableModelProfile(name: string | undefined) {
+			session.unavailableModelProfile = name;
+		},
+		getUnavailableModelProfile: () => session.unavailableModelProfile,
 		setConfiguredModelChain(role: string, entries: readonly string[]) {
 			session.configuredModelChains.push({ role, entries });
 		},
@@ -813,6 +819,301 @@ describe("startup model-profile credential recovery eligibility", () => {
 			}),
 		).toBe(expected);
 	});
+});
+
+test("interactive resume keeps a session open when its default profile requires an unavailable pin", async () => {
+	const profile: ModelProfileDefinition = {
+		name: "pinned-default",
+		requiredProviders: ["profile-provider"],
+		modelMapping: { default: "profile-provider/default" },
+		source: "user",
+	};
+	const session = fakeSession(null);
+	const settings = Settings.isolated({ "modelProfile.default": profile.name });
+	const getApiKeyForProvider = vi.fn(async () => "another-account-key");
+	const registry = {
+		...fakeRegistry([profile]),
+		getApiKeyForProvider,
+		authStorage: {
+			hasRuntimeApiKey: () => false,
+			hasLiteralConfigApiKey: () => false,
+			hasSessionCredentialUnavailable: (provider: string, scope: string) =>
+				provider === "profile-provider" && scope === session.credentialSessionId,
+		},
+	};
+	const result = await applyStartupModelProfilesForRoot({
+		session,
+		settings,
+		modelRegistry: registry as never,
+		parsedArgs: { resume: "saved-session" },
+		isInteractive: true,
+		hasInteractiveTerminal: true,
+		initialMessage: undefined,
+		initialMessages: [],
+		resumeAction: undefined,
+	});
+	expect(result.recoverableErrors).toHaveLength(1);
+	expect(result.recoverableErrors[0]).toContain("profile-provider");
+	expect(getApiKeyForProvider).not.toHaveBeenCalled();
+	expect(session.model).toBeUndefined();
+	expect(settings.get("modelProfile.default")).toBe(profile.name);
+});
+
+test("interactive startup logs a default profile skipped for missing credentials", async () => {
+	const profile: ModelProfileDefinition = {
+		name: "logged-pinned-default",
+		requiredProviders: ["profile-provider"],
+		modelMapping: { default: "profile-provider/default" },
+		source: "user",
+	};
+	const session = fakeSession(null);
+	const settings = Settings.isolated({ "modelProfile.default": profile.name });
+	const registry = {
+		...fakeRegistry([profile]),
+		getApiKeyForProvider: vi.fn(async () => "another-account-key"),
+		authStorage: {
+			hasRuntimeApiKey: () => false,
+			hasLiteralConfigApiKey: () => false,
+			hasSessionCredentialUnavailable: (provider: string, scope: string) =>
+				provider === "profile-provider" && scope === session.credentialSessionId,
+		},
+	};
+	const warnSpy = spyOn(logger, "warn").mockImplementation(() => {});
+	try {
+		const result = await applyStartupModelProfilesForRoot({
+			session,
+			settings,
+			modelRegistry: registry as never,
+			parsedArgs: { resume: "saved-session" },
+			isInteractive: true,
+			hasInteractiveTerminal: true,
+			initialMessage: undefined,
+			initialMessages: [],
+			resumeAction: undefined,
+		});
+		expect(result.recoverableErrors).toHaveLength(1);
+		expect(warnSpy).toHaveBeenCalledWith(
+			"Startup model profile not applied: missing provider credentials",
+			expect.objectContaining({
+				profile: profile.name,
+				errorClass: "ModelProfileCredentialError",
+				providers: ["profile-provider"],
+			}),
+		);
+	} finally {
+		warnSpy.mockRestore();
+	}
+});
+
+test("input-free interactive startup logs a stale persisted default", async () => {
+	const warnSpy = spyOn(logger, "warn").mockImplementation(() => {});
+	const session = fakeSession(null);
+	try {
+		const result = await applyStartupModelProfilesForRoot({
+			session,
+			settings: Settings.isolated({ "modelProfile.default": "deleted-profile" }),
+			modelRegistry: fakeRegistry([]) as never,
+			parsedArgs: {},
+			isInteractive: true,
+			hasInteractiveTerminal: true,
+			initialMessage: undefined,
+			initialMessages: [],
+			resumeAction: undefined,
+		});
+		expect(result.recoverableErrors).toHaveLength(1);
+		expect(warnSpy).toHaveBeenCalledWith(
+			"Startup model profile not applied: unknown profile",
+			expect.objectContaining({ profile: "deleted-profile", errorClass: "UnknownModelProfileError" }),
+		);
+		expect(session.getUnavailableModelProfile()).toBe("deleted-profile");
+	} finally {
+		warnSpy.mockRestore();
+	}
+});
+
+test("interactive startup reloads auth and retries a credential-blocked default profile once", async () => {
+	const profile: ModelProfileDefinition = {
+		name: "late-auth-profile",
+		requiredProviders: ["profile-provider"],
+		modelMapping: { default: "profile-provider/default" },
+		source: "user",
+	};
+	const provisionalModel = model("fallback-provider", "provisional");
+	const session = fakeSession(provisionalModel);
+	const events: string[] = [];
+	let credentialAvailable = false;
+	const base = fakeRegistry([profile]);
+	const authStorage = {
+		reload: vi.fn(async () => {
+			events.push("auth");
+			credentialAvailable = true;
+		}),
+		hasRuntimeApiKey: () => credentialAvailable,
+		hasLiteralConfigApiKey: () => false,
+		hasSessionCredentialUnavailable: () => false,
+	};
+	const registry = {
+		...base,
+		authStorage,
+		getApiKeyForProvider: async () => (credentialAvailable ? "fresh-key" : undefined),
+		async refresh(strategy?: string, credentialSessionId?: string) {
+			events.push("models");
+			await base.refresh(strategy, credentialSessionId);
+		},
+		async refreshModelPresetProfilesFromRegistry() {
+			events.push("profiles");
+			await base.refreshModelPresetProfilesFromRegistry();
+		},
+	};
+
+	const result = await applyStartupModelProfilesForRoot({
+		session,
+		settings: Settings.isolated({ "modelProfile.default": profile.name }),
+		modelRegistry: registry as never,
+		parsedArgs: {},
+		isInteractive: true,
+		hasInteractiveTerminal: true,
+		initialMessage: undefined,
+		initialMessages: [],
+		resumeAction: undefined,
+	});
+
+	expect(events).toEqual(["auth", "profiles", "models"]);
+	expect(authStorage.reload).toHaveBeenCalledTimes(1);
+	expect(result.recoverableErrors).toEqual([]);
+	expect(session.model).toMatchObject({ provider: "profile-provider", id: "default" });
+	expect(session.getUnavailableModelProfile()).toBeUndefined();
+	expect(base.refreshInBackgroundCalls).toEqual([]);
+});
+
+test("interactive startup keeps the provisional model and marks a default profile unavailable after one failed retry", async () => {
+	const profile: ModelProfileDefinition = {
+		name: "unavailable-default",
+		requiredProviders: ["profile-provider"],
+		modelMapping: { default: "profile-provider/default" },
+		source: "user",
+	};
+	const provisionalModel = model("fallback-provider", "provisional");
+	const session = fakeSession(provisionalModel);
+	const base = fakeRegistry([profile]);
+	const authStorage = {
+		reload: vi.fn(async () => {}),
+		hasRuntimeApiKey: () => false,
+		hasLiteralConfigApiKey: () => false,
+		hasSessionCredentialUnavailable: () => false,
+	};
+	const registry = {
+		...base,
+		authStorage,
+		getApiKeyForProvider: async () => undefined,
+	};
+
+	const result = await applyStartupModelProfilesForRoot({
+		session,
+		settings: Settings.isolated({ "modelProfile.default": profile.name }),
+		modelRegistry: registry as never,
+		parsedArgs: {},
+		isInteractive: true,
+		hasInteractiveTerminal: true,
+		initialMessage: undefined,
+		initialMessages: [],
+		resumeAction: undefined,
+	});
+
+	expect(authStorage.reload).toHaveBeenCalledTimes(1);
+	expect(base.profileCatalogRefreshCalls).toEqual(["refreshModelPresetProfilesFromRegistry"]);
+	expect(base.refreshCalls).toEqual(["online-if-uncached"]);
+	expect(result.recoverableErrors).toHaveLength(1);
+	expect(result.recoverableErrors[0]).toContain("profile-provider");
+	expect(session.model).toBe(provisionalModel);
+	expect(session.getUnavailableModelProfile()).toBe(profile.name);
+	expect(base.refreshInBackgroundCalls).toEqual([]);
+});
+
+test("interactive startup refreshes and applies an unknown default profile when it appears in the catalog", async () => {
+	const profile: ModelProfileDefinition = {
+		name: "newly-cataloged-profile",
+		requiredProviders: ["profile-provider"],
+		modelMapping: { default: "profile-provider/default" },
+		source: "user",
+	};
+	const session = fakeSession(model("fallback-provider", "provisional"));
+	const events: string[] = [];
+	const base = fakeRegistry([], { profilesAfterCatalogRefresh: [profile] });
+	const authStorage = {
+		reload: vi.fn(async () => {
+			events.push("auth");
+		}),
+		hasRuntimeApiKey: () => false,
+		hasLiteralConfigApiKey: () => false,
+		hasSessionCredentialUnavailable: () => false,
+	};
+	const registry = {
+		...base,
+		authStorage,
+		async refresh(strategy?: string, credentialSessionId?: string) {
+			events.push("models");
+			await base.refresh(strategy, credentialSessionId);
+		},
+		async refreshModelPresetProfilesFromRegistry() {
+			events.push("profiles");
+			await base.refreshModelPresetProfilesFromRegistry();
+		},
+	};
+
+	const result = await applyStartupModelProfilesForRoot({
+		session,
+		settings: Settings.isolated({ "modelProfile.default": profile.name }),
+		modelRegistry: registry as never,
+		parsedArgs: {},
+		isInteractive: true,
+		hasInteractiveTerminal: true,
+		initialMessage: undefined,
+		initialMessages: [],
+		resumeAction: undefined,
+	});
+
+	expect(events).toEqual(["auth", "profiles", "models"]);
+	expect(result.recoverableErrors).toEqual([]);
+	expect(session.model).toMatchObject({ provider: "profile-provider", id: "default" });
+	expect(session.getUnavailableModelProfile()).toBeUndefined();
+	expect(base.refreshInBackgroundCalls).toEqual([]);
+});
+
+test("interactive resume honors a runtime API key over an unavailable pin for the default profile", async () => {
+	const profile: ModelProfileDefinition = {
+		name: "pinned-default-runtime-key",
+		requiredProviders: ["profile-provider"],
+		modelMapping: { default: "profile-provider/default" },
+		source: "user",
+	};
+	const session = fakeSession(null);
+	const settings = Settings.isolated({ "modelProfile.default": profile.name });
+	const getApiKeyForProvider = vi.fn(async () => "runtime-key");
+	const registry = {
+		...fakeRegistry([profile]),
+		getApiKeyForProvider,
+		authStorage: {
+			hasRuntimeApiKey: (provider: string) => provider === "profile-provider",
+			hasLiteralConfigApiKey: () => false,
+			hasSessionCredentialUnavailable: (provider: string, scope: string) =>
+				provider === "profile-provider" && scope === session.credentialSessionId,
+		},
+	};
+	const result = await applyStartupModelProfilesForRoot({
+		session,
+		settings,
+		modelRegistry: registry as never,
+		parsedArgs: { resume: "saved-session" },
+		isInteractive: true,
+		hasInteractiveTerminal: true,
+		initialMessage: undefined,
+		initialMessages: [],
+		resumeAction: undefined,
+	});
+	expect(result.recoverableErrors).toEqual([]);
+	expect(getApiKeyForProvider).toHaveBeenCalled();
+	expect(session.model?.provider).toBe("profile-provider");
 });
 
 test("input-free interactive startup reports a stale persisted default without changing it", async () => {

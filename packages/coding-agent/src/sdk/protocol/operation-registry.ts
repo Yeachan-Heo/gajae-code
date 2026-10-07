@@ -174,6 +174,10 @@ const queries = [
 	["providers.list/active", "List active providers."],
 	["session.checkpoint", "Resolve a durable transcript checkpoint into a connection-owned replay cursor."],
 	["turn.steer_status", "Read the durable acknowledgement status of a correlated steer by clientRef."],
+	[
+		"session.progress",
+		"Read the read-only project progress snapshot (gjc.project_progress.v1) derived from durable session state.",
+	],
 ] as const;
 
 // Q28 was folded into Q26; preserve the independent Q29/Q30 query identities.
@@ -208,6 +212,7 @@ const queryIds = [
 	"Q29",
 	"Q30",
 	"Q31",
+	"Q32",
 ] as const;
 
 function queryId(index: number): string {
@@ -267,7 +272,7 @@ function controlErrors(id: string): string[] {
 		// refuses a session with no selected model before admission. The code is
 		// appended: ACP machine-only mapping reads errorCodes[0].
 		C01: ["client_ref_conflict", "reconciliation_capacity", "reconciliation_persist_failed", "model_not_selected"],
-		C02: ["client_ref_conflict", "reconciliation_capacity", "reconciliation_persist_failed"],
+		C02: ["turn_not_active", "client_ref_conflict", "reconciliation_capacity", "reconciliation_persist_failed"],
 		C09: ["client_ref_conflict", "reconciliation_capacity", "reconciliation_persist_failed"],
 		C06: ["action_claimed"],
 		C07: ["action_claimed", "terminal_uncertain"],
@@ -311,7 +316,7 @@ function queryContinuityClass(id: string): QueryContinuityClass {
 }
 
 function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
-	if (["Q23", "Q24", "Q25", "Q26", "Q27", "Q29", "Q30", "Q31"].includes(id))
+	if (["Q23", "Q24", "Q25", "Q26", "Q27", "Q29", "Q30", "Q31", "Q32"].includes(id))
 		return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" });
 	return dispositions();
 }
@@ -398,7 +403,9 @@ export const OPERATIONS: readonly Operation[] = [
 					? ["invalid_request", "resource_gone", "internal"]
 					: id === "Q27"
 						? ["invalid_request", "resource_gone", "model_profile_registry_error"]
-						: ["invalid_request", "resource_gone"],
+						: id === "Q32"
+							? ["invalid_request", "resource_gone", "unavailable"]
+							: ["invalid_request", "resource_gone"],
 			continuityClass: queryContinuityClass(id),
 			...(queryAliases[id] === undefined ? {} : { aliases: queryAliases[id] }),
 			adapterDispositions: queryDisposition(id),

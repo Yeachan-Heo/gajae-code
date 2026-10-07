@@ -1,11 +1,14 @@
+// Vendored from oh-my-pi (MIT) crates/pi-iso/src/diff.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: retain secure
+// plain-tree traversal and symlink-safe patch generation.
 //! Backend-agnostic change capture.
 //!
 //! Two code paths, both producing a [`Diff`] = list of [`FileChange`]:
 //!
 //! - **Git mode.** When `merged/.git` exists we shell `git diff --no-color
-//!   HEAD` plus `git ls-files --others --exclude-standard` (for untracked),
-//!   split the output on `diff --git` headers, and emit one [`FileChange`] per
-//!   file. Binary entries surface as `diff: None`.
+//!   --no-ext-diff HEAD` plus `git ls-files --others --exclude-standard` (for
+//!   untracked), split the output on `diff --git` headers, and emit one
+//!   [`FileChange`] per file. Binary entries surface as `diff: None`.
 //! - **Plain mode.** No `.git`; we walk both trees in parallel, short-circuit
 //!   on `(size, mtime-truncated-to-seconds)` equality, and emit a unified diff
 //!   for each surviving pair via `similar`. Directory-relative no-follow opens
@@ -24,7 +27,7 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 use crate::{
-	IsoError, IsoResult,
+	IsoError, IsoResult, command_failed,
 	plain_tree::{PlainEntry, PlainTree, index_tree},
 };
 
@@ -101,7 +104,8 @@ async fn git_diff(merged: &Path) -> IsoResult<Diff> {
 	// No `--binary`: we *want* git's `Binary files … differ` placeholder
 	// so we can map it to `diff: None`.
 	let tracked =
-		git_run(merged, &["-c", "core.quotepath=off", "diff", "--no-color", "HEAD"]).await?;
+		git_run(merged, &["-c", "core.quotepath=off", "diff", "--no-color", "--no-ext-diff", "HEAD"])
+			.await?;
 
 	let untracked_list = git_run(merged, &[
 		"-c",
@@ -129,6 +133,7 @@ async fn git_diff(merged: &Path) -> IsoResult<Diff> {
 			"core.quotepath=off",
 			"diff",
 			"--no-color",
+			"--no-ext-diff",
 			"--no-index",
 			git_null_path(),
 			path_str,
@@ -151,18 +156,22 @@ const fn git_null_path() -> &'static str {
 	"/dev/null"
 }
 
+/// Format a failed `git` invocation, rendering a signal death as `exit ?`.
+fn git_failure(args: &[&str], output: &std::process::Output) -> IsoError {
+	command_failed(
+		format_args!("git {}", args.join(" ")),
+		output
+			.status
+			.code()
+			.map_or_else(|| "?".into(), |code| code.to_string()),
+		&output.stderr,
+	)
+}
+
 async fn git_run(cwd: &Path, args: &[&str]) -> IsoResult<Vec<u8>> {
 	let output = git_spawn(cwd, args).await?;
 	if !output.status.success() {
-		let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-		return Err(IsoError::other(format!(
-			"git {} (exit {}): {stderr}",
-			args.join(" "),
-			output
-				.status
-				.code()
-				.map_or_else(|| "?".into(), |c| c.to_string())
-		)));
+		return Err(git_failure(args, &output));
 	}
 	Ok(output.stdout)
 }
@@ -174,15 +183,7 @@ async fn git_run_allow_exit1(cwd: &Path, args: &[&str]) -> IsoResult<Vec<u8>> {
 	if output.status.success() || output.status.code() == Some(1) {
 		return Ok(output.stdout);
 	}
-	let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-	Err(IsoError::other(format!(
-		"git {} (exit {}): {stderr}",
-		args.join(" "),
-		output
-			.status
-			.code()
-			.map_or_else(|| "?".into(), |c| c.to_string())
-	)))
+	Err(git_failure(args, &output))
 }
 
 async fn git_spawn(cwd: &Path, args: &[&str]) -> IsoResult<std::process::Output> {
@@ -400,4 +401,59 @@ const fn plain_mode(is_symlink: bool) -> &'static str {
 
 fn looks_binary(bytes: &[u8]) -> bool {
 	bytes.iter().take(8192).any(|&b| b == 0)
+}
+
+#[cfg(test)]
+mod tests {
+	use std::{
+		fs,
+		path::{Path, PathBuf},
+		process::Command,
+	};
+
+	fn git(cwd: &Path, args: &[&str]) {
+		let status = Command::new("git")
+			.current_dir(cwd)
+			.args(args)
+			.status()
+			.expect("git");
+		assert!(status.success(), "git {args:?} failed");
+	}
+
+	#[tokio::test]
+	async fn git_diff_does_not_run_an_external_diff_driver() {
+		let dir = PathBuf::from(std::env::temp_dir())
+			.join(format!("pi-iso-ext-diff-{}", std::process::id()));
+		let _ = fs::remove_dir_all(&dir);
+		fs::create_dir_all(&dir).unwrap();
+		git(&dir, &["init"]);
+		git(&dir, &["config", "user.email", "test@example.com"]);
+		git(&dir, &["config", "user.name", "test"]);
+		fs::write(dir.join("note.txt"), "before\n").unwrap();
+		git(&dir, &["add", "note.txt"]);
+		git(&dir, &["commit", "-m", "init"]);
+		fs::write(dir.join("note.txt"), "after\n").unwrap();
+
+		let marker = dir.join("driver-ran");
+		let driver = dir.join("driver.sh");
+		fs::write(&driver, format!("#!/bin/sh\ntouch {}\nexit 0\n", marker.display())).unwrap();
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			let mut perms = fs::metadata(&driver).unwrap().permissions();
+			perms.set_mode(0o755);
+			fs::set_permissions(&driver, perms).unwrap();
+		}
+		git(&dir, &["config", "diff.external", &driver.to_string_lossy()]);
+
+		let diff = super::git_diff(&dir).await.expect("diff");
+		assert!(!marker.exists(), "external diff driver ran");
+		assert!(
+			diff
+				.files
+				.iter()
+				.any(|file| file.path == Path::new("note.txt"))
+		);
+		let _ = fs::remove_dir_all(&dir);
+	}
 }

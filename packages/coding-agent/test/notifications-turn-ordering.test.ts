@@ -3,7 +3,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
-import { POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY, TOOL_ACTIVITY_CAPABILITY } from "../src/sdk/bus/telegram-daemon";
+import { TOOL_ACTIVITY_CAPABILITY } from "../src/sdk/bus/telegram-daemon";
+import { POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY } from "../src/sdk/host/host";
 import {
 	cleanupFixtureRoots,
 	createNotificationFixtureRoot,
@@ -98,6 +99,7 @@ async function setup(
 	const sid = `order-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	const ctx = {
 		cwd,
+		getActivePromptHandle: () => undefined,
 		sessionManager: {
 			getSessionId: () => sid,
 			getSessionName: () => "Ordering Test",

@@ -217,6 +217,10 @@
             "headers": {
               "$ref": "#/$defs/stringMap",
               "description": "HTTP headers sent with MCP requests. Public CLI output redacts values."
+            },
+            "publicNetwork": {
+              "type": "boolean",
+              "description": "When true, MCP HTTP requests and redirects must stay on public addresses."
             }
           },
           "not": {

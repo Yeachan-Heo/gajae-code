@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import { renameSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { processIncarnation } from "./process-incarnation";
@@ -121,25 +123,42 @@ function boundedMarker(
 }
 
 /**
- * Best-effort durable marker write; never throws (diagnostics must not mask the
- * exit itself). `pid` must be the writing broker process's own pid
- * (`process.pid`) so a later reader can bind the marker to the exact spawned
- * child it is attributing the failure to.
+ * Best-effort durable marker write; returns false on failure so callers can
+ * report missing evidence without masking the exit itself. `pid` must be the
+ * writing broker process's own pid (`process.pid`) so a later reader can bind
+ * the marker to the exact spawned child it is attributing the failure to.
  */
 export async function writeBrokerStartupFailureMarker(
 	agentDir: string,
 	failure: { reason: string; exitCode: number | null; signal: string | null; pid: number; incarnation?: string },
-): Promise<void> {
+	signal?: AbortSignal,
+): Promise<boolean> {
+	let tempPath: string | undefined;
 	try {
+		if (signal?.aborted) return false;
 		const incarnation = failure.incarnation ?? processIncarnation(failure.pid);
-		if (!incarnation) return;
-		await fs.mkdir(path.dirname(brokerStartupFailurePath(agentDir)), { recursive: true, mode: 0o700 });
+		if (!incarnation) return false;
+		const markerPath = brokerStartupFailurePath(agentDir);
+		const markerDirectory = path.dirname(markerPath);
+		await fs.mkdir(markerDirectory, { recursive: true, mode: 0o700 });
+		if (signal?.aborted) return false;
+
+		tempPath = path.join(markerDirectory, `.${path.basename(markerPath)}.${process.pid}.${randomUUID()}.tmp`);
 		await Bun.write(
-			brokerStartupFailurePath(agentDir),
+			tempPath,
 			JSON.stringify(boundedMarker(failure.reason, failure.exitCode, failure.signal, failure.pid, incarnation)),
 		);
+		if (signal?.aborted) return false;
+
+		// There must be no async gap between the cancellation check and publication:
+		// a timed-out caller cannot be followed by a late marker rename.
+		renameSync(tempPath, markerPath);
+		tempPath = undefined;
+		return true;
 	} catch {
-		// Best-effort only.
+		return false;
+	} finally {
+		if (tempPath) await fs.rm(tempPath, { force: true }).catch(() => undefined);
 	}
 }
 

@@ -187,7 +187,16 @@ export function formatSearchResults(data: ExaSearchResponse): string {
  * Format a non-search MCP response as human-readable text.
  * Handles objects, arrays, primitives, and common MCP response shapes.
  */
-export function formatGenericResponse(data: unknown): string {
+// Nesting depth is bounded. Each object level re-indents the entire formatted
+// subtree, so cost grows super-linearly with depth: 500/1000/2000/4000/8000
+// levels cost 60ms/227ms/730ms/5.9s/94s. A tool-call payload is whatever the
+// remote MCP server returned, and `MCP_MAX_CONTENT_BYTES` does not bound depth
+// — 8000 levels of `{"a":` is under 47 KB. The limit matches the one the
+// session-import walker already applies (`sanitizeImportedValue`, depth > 64).
+const MAX_GENERIC_RESPONSE_DEPTH = 64;
+
+export function formatGenericResponse(data: unknown, depth = 0): string {
+	if (depth > MAX_GENERIC_RESPONSE_DEPTH) return "[depth-limit]";
 	if (data === null || data === undefined) return "No result.";
 	if (typeof data === "string") return data;
 	if (typeof data === "number" || typeof data === "boolean") return String(data);
@@ -199,14 +208,22 @@ export function formatGenericResponse(data: unknown): string {
 			const item = data[i];
 			if (typeof item === "object" && item !== null) {
 				const record = item as Record<string, unknown>;
-				const title = (record.title ?? record.name ?? record.id ?? `Item ${i + 1}`) as string;
+				const rawTitle = record.title ?? record.name ?? record.id;
+				// A remote title is unvalidated JSON: stringify non-strings through the
+				// depth-bounded path instead of template coercion, which recurses unbounded.
+				const title =
+					rawTitle === undefined || rawTitle === null
+						? `Item ${i + 1}`
+						: typeof rawTitle === "string"
+							? rawTitle
+							: formatValue(rawTitle, depth + 2);
 				parts.push(`\n### ${title}`);
 				for (const [k, v] of Object.entries(record)) {
 					if (["title", "name", "id"].includes(k)) continue;
-					parts.push(`- **${k}:** ${formatValue(v)}`);
+					parts.push(`- **${k}:** ${formatValue(v, depth + 2)}`);
 				}
 			} else {
-				parts.push(`- ${formatValue(item)}`);
+				parts.push(`- ${formatValue(item, depth + 1)}`);
 			}
 		}
 		return parts.join("\n");
@@ -231,10 +248,10 @@ export function formatGenericResponse(data: unknown): string {
 			if (k === "content") continue; // handled above
 			if (v === null || v === undefined) continue;
 			if (typeof v === "object") {
-				const formatted = formatGenericResponse(v);
+				const formatted = formatGenericResponse(v, depth + 1);
 				if (formatted) lines.push(`- **${k}:**\n${indent(formatted, 2)}`);
 			} else {
-				lines.push(`- **${k}:** ${formatValue(v)}`);
+				lines.push(`- **${k}:** ${formatValue(v, depth + 1)}`);
 			}
 		}
 		return lines.join("\n") || "(empty)";
@@ -243,10 +260,26 @@ export function formatGenericResponse(data: unknown): string {
 	return String(data);
 }
 
-function formatValue(v: unknown): string {
+function formatValue(v: unknown, depth: number): string {
 	if (v === null || v === undefined) return "—";
-	if (typeof v === "object") return JSON.stringify(v);
+	if (typeof v === "object") return JSON.stringify(truncateDepth(v, depth));
 	return String(v);
+}
+
+/**
+ * Copies a value, replacing anything nested past MAX_GENERIC_RESPONSE_DEPTH with
+ * "[depth-limit]", so JSON.stringify never recurses through a remote payload's
+ * unbounded structure.
+ */
+function truncateDepth(value: unknown, depth: number): unknown {
+	if (value === null || typeof value !== "object") return value;
+	if (depth > MAX_GENERIC_RESPONSE_DEPTH) return "[depth-limit]";
+	if (Array.isArray(value)) return value.map(item => truncateDepth(item, depth + 1));
+	// Null prototype: an own "__proto__" key from a parsed payload must stay an
+	// own data property instead of hitting the Object.prototype setter.
+	const copy: Record<string, unknown> = Object.create(null);
+	for (const [key, child] of Object.entries(value)) copy[key] = truncateDepth(child, depth + 1);
+	return copy;
 }
 
 function indent(text: string, spaces: number): string {

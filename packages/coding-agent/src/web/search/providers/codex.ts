@@ -8,6 +8,7 @@
  */
 import * as os from "node:os";
 import { type AuthStorage, getBundledModels } from "@gajae-code/ai/core";
+import { OPENAI_HEADER_VALUES } from "@gajae-code/ai/providers/openai-codex/constants";
 import { decodeJwt } from "@gajae-code/ai/utils/oauth/openai-codex";
 import { $env, readSseJson, sanitizeHeaderComponent } from "@gajae-code/utils";
 import packageJson from "../../../../package.json" with { type: "json" };
@@ -157,8 +158,8 @@ function buildCodexHeaders(accessToken: string, accountId: string): Record<strin
 		Authorization: `Bearer ${accessToken}`,
 		"chatgpt-account-id": accountId,
 		"OpenAI-Beta": "responses=experimental",
-		originator: "pi",
-		"User-Agent": `pi/${packageJson.version} (${sanitizeHeaderComponent(os.platform())} ${sanitizeHeaderComponent(os.release())}; ${sanitizeHeaderComponent(os.arch())})`,
+		originator: OPENAI_HEADER_VALUES.ORIGINATOR_CODEX,
+		"User-Agent": `${OPENAI_HEADER_VALUES.ORIGINATOR_CODEX}/${packageJson.version} (${sanitizeHeaderComponent(os.platform())} ${sanitizeHeaderComponent(os.release())}; ${sanitizeHeaderComponent(os.arch())})`,
 		Accept: "text/event-stream",
 		"Content-Type": "application/json",
 	};

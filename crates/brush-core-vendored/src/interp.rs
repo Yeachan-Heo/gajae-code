@@ -7,7 +7,6 @@ use std::{
 
 use brush_parser::ast::{self, CommandPrefixOrSuffixItem};
 use itertools::Itertools;
-
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -30,7 +29,7 @@ struct PipelineExecutionContext<'a, SE: extensions::ShellExtensions> {
 	/// Process group ID for spawned processes.
 	process_group_id: Option<i32>,
 	/// Whether this command is part of a multi-command pipeline.
-	in_pipeline:       bool,
+	in_pipeline:      bool,
 }
 
 /// Information about an expanded external command launch.
@@ -288,7 +287,6 @@ fn ensure_not_cancelled(params: &ExecutionParameters) -> Result<(), error::Error
 	Ok(())
 }
 
-
 #[derive(Clone, Copy, Debug, Default)]
 /// Policy for how to manage spawned external processes.
 pub enum ProcessGroupPolicy {
@@ -308,7 +306,11 @@ impl ProcessGroupPolicy {
 	/// Preserve an embedding worker's containment boundary across nested shell
 	/// execution while retaining the caller's ordinary fallback policy.
 	pub const fn preserving_containment(self, fallback: Self) -> Self {
-		if matches!(self, Self::ContainedProcessGroup) { self } else { fallback }
+		if matches!(self, Self::ContainedProcessGroup) {
+			self
+		} else {
+			fallback
+		}
 	}
 }
 
@@ -679,7 +681,7 @@ async fn spawn_pipeline_processes(
 	let pipeline_len = pipeline.seq.len();
 	let mut pipe_readers = vec![];
 	let mut pipe_writers = vec![];
-	let mut spawn_results = VecDeque::new();
+	let mut spawn_results: VecDeque<ExecutionSpawnResult> = VecDeque::new();
 	let mut process_group_id: Option<i32> = None;
 
 	// Create pipes to use between commands, but only bother doing so if there's
@@ -718,7 +720,6 @@ async fn spawn_pipeline_processes(
 			cmd_params.disable_command_output_marking();
 		}
 
-
 		// Install pipes.
 		if let Some(Some(reader)) = pipe_readers.pop() {
 			cmd_params.open_files.set_fd(OpenFiles::STDIN_FD, reader);
@@ -751,9 +752,22 @@ async fn spawn_pipeline_processes(
 			}
 		};
 
-		let spawn_result = command
+		let spawn_result = match command
 			.execute_in_pipeline(pipeline_context, cmd_params)
-			.await?;
+			.await
+		{
+			Ok(spawn_result) => spawn_result,
+			Err(error) => {
+				// Close pipe ends for stages that were not launched, then join every
+				// stage already started before returning the launch error.
+				drop(pipe_readers);
+				drop(pipe_writers);
+				while let Some(spawn_result) = spawn_results.pop_front() {
+					let _ = spawn_result.wait_with_cancel(params.cancel_token()).await;
+				}
+				return Err(error);
+			},
+		};
 
 		// Update the process group ID if something was spawned.
 		if let ExecutionSpawnResult::StartedProcess(child) = &spawn_result {
@@ -778,16 +792,28 @@ async fn wait_for_pipeline_processes_and_update_status(
 	let mut result = ExecutionResult::success();
 	let mut stopped_children = vec![];
 	let mut last_failure_exit_code: Option<ExecutionExitCode> = None;
+	let mut first_error: Option<error::Error> = None;
 
 	// Clear our the pipeline status so we can start filling it out.
 	shell.last_pipeline_statuses_mut().clear();
 
 	while let Some(child) = process_spawn_results.pop_front() {
 		ensure_not_cancelled(params)?;
-		let wait_result = if !stopped_children.is_empty() {
-			child.poll().await?
+		let wait_result = if first_error.is_some() {
+			child.wait_with_cancel(params.cancel_token()).await
+		} else if !stopped_children.is_empty() {
+			child.poll().await
 		} else {
-			child.wait_with_cancel(params.cancel_token()).await?
+			child.wait_with_cancel(params.cancel_token()).await
+		};
+		let wait_result = match wait_result {
+			Ok(wait_result) => wait_result,
+			Err(error) => {
+				if first_error.is_none() {
+					first_error = Some(error);
+				}
+				continue;
+			},
 		};
 
 		match wait_result {
@@ -813,6 +839,10 @@ async fn wait_for_pipeline_processes_and_update_status(
 				stopped_children.push(jobs::JobTask::External(child));
 			},
 		}
+	}
+
+	if let Some(error) = first_error {
+		return Err(error);
 	}
 
 	// Apply pipefail semantics if enabled
@@ -870,10 +900,32 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::Command {
 					}
 				}
 
-				Ok(compound
-					.execute(&mut pipeline_context.shell, &params)
-					.await?
-					.into())
+				match pipeline_context.shell {
+					commands::ShellForCommand::OwnedShell { target, .. } => {
+						let compound = compound.clone();
+						let mut shell = *target;
+						let handle = tokio::runtime::Handle::current();
+						let (sender, receiver) = tokio::sync::oneshot::channel();
+
+						// Compound stages may perform blocking reads. A dedicated thread
+						// keeps them off Tokio's bounded workers and ends with the stage.
+						std::thread::Builder::new()
+							.name("brush-pipeline-stage".into())
+							.spawn(move || {
+								let result = handle.block_on(compound.execute(&mut shell, &params));
+								let _ = sender.send(result);
+							})?;
+
+						Ok(ExecutionSpawnResult::StartedTask(tokio::spawn(async move {
+							receiver
+								.await
+								.map_err(|_| std::io::Error::other("pipeline stage thread terminated"))?
+						})))
+					},
+					commands::ShellForCommand::ParentShell(shell) => {
+						Ok(compound.execute(shell, &params).await?.into())
+					},
+				}
 			},
 			Self::Function(func) => {
 				params.disable_command_output_marking();
@@ -1010,7 +1062,7 @@ impl Execute for ast::CoprocessCommand {
 			let pipeline_context = PipelineExecutionContext {
 				shell:            commands::ShellForCommand::ParentShell(&mut child_shell),
 				process_group_id: None,
-				in_pipeline:       false,
+				in_pipeline:      false,
 			};
 			let spawn_result = body
 				.execute_in_pipeline(pipeline_context, child_params)
@@ -1534,12 +1586,11 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
 				commands::ShellForCommand::ParentShell(parent_shell)
 			};
 
-			let context =
-				PipelineExecutionContext {
-					shell,
-					process_group_id: context.process_group_id,
-					in_pipeline: context.in_pipeline,
-				};
+			let context = PipelineExecutionContext {
+				shell,
+				process_group_id: context.process_group_id,
+				in_pipeline: context.in_pipeline,
+			};
 
 			match execute_command(context, params, cmd_name, assignments, args).await {
 				Ok(result) => Ok(result),

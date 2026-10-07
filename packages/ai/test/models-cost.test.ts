@@ -73,6 +73,37 @@ describe("calculateCost", () => {
 		expect(usage.cost.total).toBeCloseTo(2.18, 8);
 	});
 
+	it("bundles and calculates Cursor Composer pricing", () => {
+		const expectedPricing = [
+			{
+				id: "composer-2.5",
+				cost: { input: 0.5, output: 2.5, cacheRead: 0, cacheWrite: 0 },
+				total: 0.00175,
+			},
+			{
+				id: "composer-2.5-fast",
+				cost: { input: 3, output: 15, cacheRead: 0, cacheWrite: 0 },
+				total: 0.0105,
+			},
+		] as const;
+
+		for (const expected of expectedPricing) {
+			const model = getBundledModel("cursor", expected.id);
+			const usage: Usage = {
+				input: 1_000,
+				output: 500,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 1_500,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			};
+
+			expect(model.cost).toEqual(expected.cost);
+			calculateCost(model, usage);
+			expect(usage.cost.total).toBeCloseTo(expected.total, 8);
+		}
+	});
+
 	it("ignores non-canonical long-context pricing", () => {
 		const model = {
 			...getBundledModel("openai", "gpt-4o-mini"),
@@ -176,12 +207,19 @@ describe("calculateCost", () => {
 		});
 	});
 
-	it("bundles GPT-6 Sol and Luna standard and long-context pricing", () => {
+	it("bundles GPT-6 Sol family standard and long-context pricing", () => {
 		const sol = getBundledModel("openai-codex", "gpt-6-sol");
 		expect(sol.cost).toEqual({ input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 });
 		expect(sol.longContextPricing).toEqual({
 			threshold: 272_000,
 			cost: { input: 4, output: 15, cacheRead: 0.4, cacheWrite: 5 },
+		});
+
+		const sol61 = getBundledModel("openai-codex", "gpt-6.1-sol");
+		expect(sol61.cost).toEqual({ input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 });
+		expect(sol61.longContextPricing).toEqual({
+			threshold: 272_000,
+			cost: { input: 4, output: 15, cacheRead: 0.2, cacheWrite: 5 },
 		});
 
 		const luna = getBundledModel("openai-codex", "gpt-6-luna");

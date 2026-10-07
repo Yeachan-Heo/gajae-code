@@ -2,6 +2,144 @@
 
 ## [Unreleased]
 
+## [0.18.7] - 2026-10-04
+
+### Fixed
+
+- Explicitly emit `strict: false` for non-strict OpenAI Responses and Codex Responses function tools.
+
+- Salvage finalized Codex tool calls when an empty assistant message item opens before a transient stream close, while still failing closed on non-empty text.
+
+- Preserve finalized Codex tool calls when the stream ends without a terminal event, including an empty trailing message; unfinished calls and visible text still fail closed.
+
+- Add Codex request-timeout salvage refusal diagnostics and replay coverage for complete `todo_write` calls.
+
+- Salvage complete Codex function calls when the SSE or WebSocket idle watchdog ends a stalled stream.
+
+- **Kiro OAuth CodeWhisperer wire protocol**: Corrected critical wire protocol issues in the streaming transport:
+  - Fixed typo in request header `amzn-X-amz-target` → `x-amz-target`
+  - Changed streaming service target from `AmazonCodeWhispererService.GenerateAssistantResponse` to `AmazonCodeWhispererStreamingService.GenerateAssistantResponse`
+  - Fixed content-type from `application/json` to `application/x-amz-json-1.0`
+  - Moved `profileArn` from header to request body `conversationState`
+  - Flattened `userInputMessageContext.tools` from nested `{tools: [...]}` to direct array
+  - Fixed event payload handling for flat `{content}` structure (not nested `{assistantResponseEvent: {content}}`)
+  - Implemented accumulation of streaming tool input fragments per `toolUseId` until `stop` signal
+  - Cross-verified against kiro-api-key.ts headers implementation
+  - Reported by: nomo via wire protocol validation failures
+
+## [0.18.6] - 2026-10-03
+
+### Added
+
+- `AuthStorage.hasLiteralConfigApiKey(provider, owner?)` reports whether a provider's config override is a literal `apiKey` rather than an `apiKeyEnv` indirection.
+
+- Bundled GPT-6.1 Sol for the Codex provider: `openai-codex/gpt-6.1-sol` (272K context, 128K output, reasoning effort low..max) with $2/$10 per MTok and $0.10 cached-input pricing (#6147).
+
+### Changed
+
+- GLM Coding Plan (`glm-zcode`) GLM-5.3 and GLM-5.3-Flash now expose the `max` thinking level on top of the existing `minimal`–`xhigh` budget ladder. These models ride the Anthropic Messages-compatible endpoint where thinking is a token budget, and the generic anthropic-messages fallback capped non-Anthropic models at `xhigh` (32768 tokens). The endpoint accepts budgets up to 65536 and reasoning volume scales with the budget, so the previous ceiling silently limited the GLM-5.3 generation.
+
+- The `glm-zcode` OAuth login guidance now names the exact `zcode://oauth/callback?code=…&state=…` redirect shape and tells users to copy it from the browser DevTools Network tab, because a custom-protocol redirect never appears in the address bar; the manual-code prompt is now `glm-zcode`-specific instead of the generic authorization-code wording, which previously led users to paste the address-bar URL and stall the login.
+
+### Fixed
+
+- Anthropic-adaptive models with high/xhigh/max reasoning now receive sufficient `max_tokens` to accommodate both thinking output and message completion. Previously, adaptive requests used the default 32,000-token budget, consuming all tokens for thinking and leaving no output. When reasoning is enabled with adaptive thinking, the budget is now raised to `model.maxTokens` to allow room for both thinking and output. Explicit or configured `maxTokens` values remain authoritative and are not overridden. The fix also treats `maxTokens: 0` (documented as unspecified) the same as `undefined`, matching the behavior of `resolveDefaultRequestMaxTokens` (#6156).
+
+- A Kiro CodeWhisperer HTTP 200 response whose body is not an AWS event stream (for example a JSON or HTML error) now reports its status, content type, and the first 1000 characters of the body. Previously the body was parsed as event-stream frames and surfaced only as `eventstream: truncated message at end of stream`. The event-stream media type is matched case-insensitively, and the truncation error now reports how many trailing bytes were left (#6158). The error carries the `provider_protocol_mismatch` code, so session retry and managed fallback surface it instead of replaying the request.
+
+- Kiro (OAuth CodeWhisperer transport) now sets `userInputMessage.origin: AI_EDITOR`. Without it the service ignored `modelId` and answered every request with `auto`, so selecting a specific Kiro model had no effect.
+- Kiro (OAuth CodeWhisperer transport) now sends every trailing result of a parallel tool batch in `currentMessage`. The earlier results were left as a separate history entry, so the turn after two or more parallel tool calls failed with HTTP 400 `TOOL_USE_RESULT_MISMATCH`.
+
+- Salvage Codex function calls when complete JSON arguments arrive but the stream closes before `response.output_item.done`, including empty-object no-argument calls and idle SSE stalls.
+- Fail closed on mismatched argument events, explicit non-transient errors, and unauthoritative whitespace-only deltas; close open reasoning blocks before salvage.
+
+- Codex SSE progress classification reads each event's `delta` once, so the idle-watchdog classifier added in #6226 can no longer observe a different value than the stream handler assembles.
+
+- End a silent Codex WebSocket stream at its idle bound after a completed `todo_write` tool-call start with zero usage.
+- Preserve Codex transport errors and eligible SSE recovery when provisional tool arguments parse to null or another non-record value.
+
+- Recover expired Codex websocket continuation anchors with one anchor-free full-context replay on the same model when fallback is managed, while still honoring disabled provider retries.
+
+- Preserve bounded session retries for content-free Codex `server_is_overloaded` stream errors with generic or absent prose.
+
+- Codex websocket streams with an idle or first-event timeout above `2147483647` ms (about 24.9 days), such as `PI_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS=99999999999` meant as "effectively never", no longer time out right after the request. `setTimeout` treats longer delays as 1 ms; the wait is now capped at the timer maximum.
+
+- Treat trailing whitespace after complete Codex function-call arguments as idle SSE events without changing WebSocket progress or replay semantics.
+
+- Prevent Cursor inline MCP, todo, and native tool announcements from being replayed locally after a completed or aborted turn. Keep one canonical provider-owned MCP call for its inline execution.
+
+- Release the cross-process OAuth refresh lease when a token refresh fails, and keep credentials active when their OAuth provider has not registered yet.
+
+- Start SQLite auth-storage read-then-write transactions immediately to prevent concurrent OAuth refresh processes from failing with `database is locked`.
+- Advance the OAuth lease clock by time spent waiting for the immediate write reservation so busy-timeout waits do not shorten leases.
+
+- Stream idle and first-event watchdogs with a timeout above `2147483647` ms (about 24.9 days), such as `PI_STREAM_IDLE_TIMEOUT_MS=99999999999` meant as "effectively never", no longer abort the stream right away. `setTimeout` treats longer delays as 1 ms; the watchdog delay is now capped at the timer maximum. `0` still disables the watchdog.
+
+## [0.18.5] - 2026-09-30
+
+## [0.18.4] - 2026-09-30
+
+## [0.18.3] - 2026-09-30
+
+## [0.18.2] - 2026-09-30
+
+### Added
+
+- Bundled Claude Sonnet 5.5: `anthropic/claude-sonnet-5-5` and Amazon Bedrock `anthropic.claude-sonnet-5-5` (plus `au.`/`eu.`/`global.`/`jp.`/`us.` inference profiles), with 1M context, 128K output, and $2/$10 per MTok pricing (#6111).
+
+- Bundled GPT-6.1 Sol for the Codex provider: `openai-codex/gpt-6.1-sol` (272K context, 128K output, reasoning effort low..max) with $2/$10 per MTok and $0.10 cached-input pricing (#6147). Presets and model-profile defaults are unchanged.
+
+### Removed
+
+- Removed `installH2Fetch`. Bun's HTTP/2 client can wedge a pooled connection while uploading a large request body (~300 KB, a typical long agent context): every later request on that connection waits indefinitely for response headers. All `fetch()` traffic now uses HTTP/1.1.
+
+### Fixed
+
+- A large (≥1 MB) request to a custom Anthropic-compatible endpoint is now retried when its connection drops before any response (ECONNRESET, socket closed, `Connection error`). Previously the one-upload ceiling meant for first-event stalls also covered these failures, so a single network blip ended the turn. Server responses (e.g. 529) and first-event timeouts still respect the ceiling (#6072).
+
+- Kiro (OAuth CodeWhisperer transport) now replays earlier tool calls as structured `toolUses` and sends each tool result as `{ toolUseId, status, content: [{ text }] }`, linked to the call it answers, instead of serializing calls into assistant text and nesting results. Parallel tool results share one history entry, and image results are marked `[image omitted]` rather than sent empty (#6079).
+
+- OpenAI-compatible completions requests now log OpenAI SDK connection timeouts and retries to the gjc log. Previously a request stalled before response headers retried silently for up to several minutes.
+
+## [0.18.1] - 2026-09-29
+
+### Changed
+
+- Bump the bundled Claude Code fingerprint floor from 2.1.281 to 2.1.284.
+- Anthropic OAuth requests now sign `claude-cli/<version>` and the billing `cc_version` with the latest published Claude Code release instead of a build-time constant. The version is resolved in the background from Anthropic's `latest` release channel and the npm dist-tag (higher wins), refreshed at most every 6 hours, cached in `~/.gjc/cache/claude-code-version.json`, and never blocks a request or drops below the bundled floor. Set `GJC_CLAUDE_CODE_VERSION=X.Y.Z` to pin it. A stale fingerprint is answered with HTTP 400 `claude_code_version_too_old` on newer models, so this no longer waits for a gjc release to recover.
+
+### Fixed
+
+- OpenGateway models discovered from `/v1/models` now take their capabilities from the bundled catalog entry for the same upstream model, and `-ultrafast` deployments resolve to their upstream model, so `opengateway/deepseek/deepseek-v4.1-flash-ultrafast` and the GLM/Kimi ultrafast models are registered with reasoning support and accept thinking levels (#6070).
+
+- Bound Codex turns that stall after an empty reasoning item and streamed tool-call start to the shared stream idle timeout.
+
+- Apply the shared stream idle timeout to Codex WebSocket responses when no WebSocket-specific timeout is configured, so a stalled preferred transport surfaces an error within the expected idle window.
+
+## [0.18.0] - 2026-09-27
+
+### Added
+
+- `AuthStorage.setUsageProbeMode("cache-only")` limits credential ranking and quota checks to usage reports already cached in the shared store, so callers that never display usage can select credentials without calling provider usage endpoints.
+
+- `AssistantMessage.promptPrefix` (`PromptPrefixTelemetry`) carries the prompt-prefix fingerprint of the request that produced the message, so prompt-cache misses can be attributed to client prefix mutation or provider eviction (#5946).
+
+- Added bundled GPT-6 Sol and GPT-6 Luna model metadata and pricing for the OpenAI Codex transport.
+
+- Anthropic failures now carry an optional bounded `providerDiagnostic` (`category`, `httpStatus`, `code`, `evidence`) on the terminal assistant message, minted only from structured SDK error metadata or an explicit SSE `event: error` envelope. It distinguishes auth rejections, rate limits and upstream outages without exposing provider text, and contradictory or unreadable metadata produces no diagnostic; unsupported codes are discarded, while an independently valid status may still classify. The legacy `errorStatus`, error messages, retry admission and fallback behaviour are unchanged.
+
+### Changed
+
+- `AuthStorage.markUsageLimitReached` now reports the marked row identity and remaining unblocked same-kind credential IDs, distinguishing a vanished row from an exhausted pool.
+
+### Fixed
+
+- Share per-credential provider usage probes across processes through `agent.db`: a cross-process lease single-flights each credential's `/usage` request, a failed probe with no last-good report is now cooled down for about a minute instead of being retried on every credential selection, and loading credentials into a new process no longer purges the reports its peers already cached. Concurrent and back-to-back `gjc` processes no longer each hit the provider's usage endpoint and trip its 429 rate limit ([#5939](https://github.com/Yeachan-Heo/gajae-code/issues/5939)).
+
+- Kiro CodeWhisperer OAuth endpoint now correctly resolves to `codewhisperer.${region}.amazonaws.com` instead of the non-existent `amazoncodewhispererstreamingservice.${region}.amazonaws.com`. OAuth bearer token authentication requests targeting `AmazonCodeWhispererService.GenerateAssistantResponse` now route to a resolvable endpoint that matches the working endpoint used by API-key authentication. (#6002)
+
+- Direct `xai/grok-4.7` now advertises `reasoning_effort=xhigh`. xAI documents `xhigh` for grok-4.6 and later, but the thinking policy treated only grok-4.6 as xhigh-capable and clamped grok-4.7 to high, so the model picker could not select it.
+
 ## [0.17.7] - 2026-09-25
 
 ### Changed

@@ -239,6 +239,49 @@ describe("getLastAssistantUsage", () => {
 	});
 });
 
+describe("default compaction threshold ceiling", () => {
+	it("caps only the non-adaptive default sentinel", () => {
+		const settings = { ...DEFAULT_COMPACTION_SETTINGS };
+
+		expect(resolveThresholdTokens(1_000_000, settings)).toBe(300_000);
+		expect(resolveThresholdTokens(400_000, settings)).toBe(300_000);
+		expect(resolveThresholdTokens(200_000, settings)).toBe(170_000);
+		expect(resolveThresholdTokens(1_000_000, { ...settings, thresholdTokens: 800_000 })).toBe(800_000);
+		expect(resolveThresholdTokens(1_000_000, { ...settings, thresholdPercent: 90 })).toBe(900_000);
+	});
+
+	it("bounds the 1M-window keep window below the capped threshold", () => {
+		const settings = { ...DEFAULT_COMPACTION_SETTINGS, remoteEnabled: false };
+		const entries: SessionEntry[] = Array.from({ length: 80 }, (_, index) =>
+			createMessageEntry(createUserMessage(`turn ${index} ${"recent context ".repeat(1_000)}`)),
+		);
+		const preparation = prepareCompaction(entries, settings, { contextWindow: 1_000_000 });
+		if (!preparation) throw new Error("Expected compaction preparation for a large history");
+
+		const keepRecentTokens = preparation.tokenCorrection.keepRecentTokensCorrected;
+		expect(keepRecentTokens).toBeGreaterThanOrEqual(settings.keepRecentTokens);
+		expect(keepRecentTokens).toBeLessThanOrEqual(resolveThresholdTokens(1_000_000, settings));
+	});
+
+	it("does not apply the reserve cap to explicit 300K token or percent thresholds", () => {
+		const entries: SessionEntry[] = Array.from({ length: 80 }, (_, index) =>
+			createMessageEntry(createUserMessage(`turn ${index} ${"recent context ".repeat(1_000)}`)),
+		);
+		const thresholdOverrides: Array<Partial<Pick<CompactionSettings, "thresholdTokens" | "thresholdPercent">>> = [
+			{ thresholdTokens: 300_000 },
+			{ thresholdPercent: 30 },
+		];
+
+		for (const thresholdOverride of thresholdOverrides) {
+			const settings = { ...DEFAULT_COMPACTION_SETTINGS, remoteEnabled: false, ...thresholdOverride };
+			const preparation = prepareCompaction(entries, settings, { contextWindow: 1_000_000 });
+			if (!preparation) throw new Error("Expected compaction preparation for a large history");
+
+			expect(preparation.tokenCorrection.keepRecentTokensCorrected).toBe(150_000);
+		}
+	});
+});
+
 describe("shouldCompact", () => {
 	it("should return true when context exceeds threshold", () => {
 		const settings: CompactionSettings = {

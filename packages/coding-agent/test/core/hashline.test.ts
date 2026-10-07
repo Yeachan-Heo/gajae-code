@@ -10,10 +10,12 @@ import {
 	type ExecuteHashlineSingleOptions,
 	executeHashlineSingle,
 	FileReadCache,
+	formatFullAnchorRequirement,
 	generateDiffString,
 	getFileReadCache,
 	HashlineMismatchError,
 	HashlineMissingHashError,
+	HashlineMissingLineError,
 	HL_BODY_SEP,
 	HL_BODY_SEP_RE_RAW,
 	hashlineEditParamsSchema,
@@ -69,6 +71,18 @@ async function withTempDir(fn: (tempDir: string) => Promise<void>): Promise<void
 	} finally {
 		await fs.rm(tempDir, { recursive: true, force: true });
 	}
+}
+async function expectFileBytesUnchanged(filePath: string, original: string): Promise<void> {
+	expect(await Bun.file(filePath).bytes()).toEqual(new TextEncoder().encode(original));
+}
+
+async function rejectionMessage(promise: Promise<unknown>): Promise<string> {
+	try {
+		await promise;
+	} catch (error) {
+		return error instanceof Error ? error.message : String(error);
+	}
+	throw new Error("Expected promise to reject");
 }
 
 function makeHashlineSession(tempDir: string, settings = Settings.isolated()): ToolSession {
@@ -351,6 +365,18 @@ describe("hashline parser — block op syntax", () => {
 		expect(() => parseHashline(pl("orphan"))).toThrow(/payload line has no preceding/);
 	});
 
+	it("explains how to insert a blank line when an insert op has no payload", () => {
+		const op = `»${tag(1, "aaa")}`;
+		expect(() => parseHashline(`${op}\n`)).toThrow(`To insert a single blank line, put one empty line after "${op}"`);
+	});
+
+	it("explains an insert op whose inline text only echoes the anchored line", () => {
+		const op = `»${tag(1, "aaa")}`;
+		expect(() => parseHashline(`${op}|aaa\n`)).toThrow(
+			`matches the supplied anchor hash, so it was read as an anchor echo, not as new content. Put the lines to insert on the lines after "${op}".`,
+		);
+	});
+
 	it("leniently treats a bare blank line after « / » as an empty payload", () => {
 		const hash = computeLineHash(5, "aaa");
 		const anchor = { line: 5, hash };
@@ -449,9 +475,131 @@ describe("hashline — hash-less line references", () => {
 		}
 	});
 
-	it("still reports other malformed anchors as plain parse errors", () => {
-		expect(() => parseHashline(`≔sr\n${pl("x")}`)).toThrow(/expected a full anchor/);
-		expect(() => parseHashline(`≔sr\n${pl("x")}`)).not.toThrow(HashlineMissingHashError);
+	it("keeps non-hash-shaped malformed refs on the existing parse error path", async () => {
+		await withTempDir(async tempDir => {
+			const filePath = path.join(tempDir, "a.ts");
+			const original = "first\nsecond";
+			await Bun.write(filePath, original);
+
+			const message = await rejectionMessage(
+				executeHashlineSingle(hashlineExecuteOptions(tempDir, `§a.ts\n≔s\n${pl("x")}`)),
+			);
+			expect(message).toBe('line 1: expected a full anchor such as "119sr", "119ab", "119th"; got "s".');
+			await expectFileBytesUnchanged(filePath, original);
+		});
+	});
+
+	it("suggests the exact current anchor for a bare single-line reference", async () => {
+		await withTempDir(async tempDir => {
+			const filePath = path.join(tempDir, "a.ts");
+			const lines = Array.from({ length: 50 }, (_, index) => `line ${index + 1}`);
+			const original = lines.join("\n");
+			await Bun.write(filePath, original);
+
+			const message = await rejectionMessage(
+				executeHashlineSingle(hashlineExecuteOptions(tempDir, `§a.ts\n≔47\n${pl("X")}`)),
+			);
+			expect(message).toContain(`Use ≔${tag(47, "line 47")}`);
+			await expectFileBytesUnchanged(filePath, original);
+		});
+	});
+
+	it("suggests copy-ready endpoint anchors for bare ranges", async () => {
+		await withTempDir(async tempDir => {
+			const filePath = path.join(tempDir, "a.ts");
+			const lines = Array.from({ length: 30 }, (_, index) => `line ${index + 1}`);
+			const original = lines.join("\n");
+			await Bun.write(filePath, original);
+
+			const dottedMessage = await rejectionMessage(
+				executeHashlineSingle(hashlineExecuteOptions(tempDir, `§a.ts\n≔22..23\n${pl("X")}`)),
+			);
+			expect(dottedMessage).toContain(`Use ≔${tag(22, "line 22")}..${tag(23, "line 23")}`);
+			await expectFileBytesUnchanged(filePath, original);
+
+			const hyphenMessage = await rejectionMessage(
+				executeHashlineSingle(hashlineExecuteOptions(tempDir, `§a.ts\n≔24-27\n${pl("X")}`)),
+			);
+			expect(hyphenMessage).toContain(`Use ≔${tag(24, "line 24")}..${tag(27, "line 27")}`);
+			await expectFileBytesUnchanged(filePath, original);
+		});
+	});
+
+	it("preserves the insert op sigil when suggesting a bare anchor retry", async () => {
+		await withTempDir(async tempDir => {
+			const filePath = path.join(tempDir, "a.ts");
+			const original = "one\ntwo\nthree";
+			await Bun.write(filePath, original);
+
+			const beforeMessage = await rejectionMessage(
+				executeHashlineSingle(hashlineExecuteOptions(tempDir, `§a.ts\n«2\n${pl("before")}`)),
+			);
+			expect(beforeMessage).toContain(`Use «${tag(2, "two")}`);
+			await expectFileBytesUnchanged(filePath, original);
+
+			const afterMessage = await rejectionMessage(
+				executeHashlineSingle(hashlineExecuteOptions(tempDir, `§a.ts\n»2\n${pl("after")}`)),
+			);
+			expect(afterMessage).toContain(`Use »${tag(2, "two")}`);
+			await expectFileBytesUnchanged(filePath, original);
+		});
+	});
+
+	it("suggests the unique current line for a hash-only ref", async () => {
+		await withTempDir(async tempDir => {
+			const filePath = path.join(tempDir, "a.ts");
+			const original = "line-1\nline 2\nline 3";
+			await Bun.write(filePath, original);
+
+			let parseError: unknown;
+			try {
+				parseHashline(`≔qn\n${pl("X")}`);
+			} catch (error) {
+				parseError = error;
+			}
+			expect(parseError).toBeInstanceOf(HashlineMissingLineError);
+			const typedError = parseError as HashlineMissingLineError;
+			expect(typedError.hash).toBe("qn");
+			expect(typedError.lineNum).toBeUndefined();
+			expect(typedError.opSigil).toBe("≔");
+
+			const message = await rejectionMessage(
+				executeHashlineSingle(hashlineExecuteOptions(tempDir, `§a.ts\n≔qn\n${pl("X")}`)),
+			);
+			expect(message).toContain('Anchor "qn" lacks its line number. Did you mean ≔1qn?');
+			await expectFileBytesUnchanged(filePath, original);
+		});
+	});
+
+	it("does not guess a line for a hash-only ref with duplicate matches", async () => {
+		await withTempDir(async tempDir => {
+			const filePath = path.join(tempDir, "a.ts");
+			const original = "line-1\nline-1";
+			await Bun.write(filePath, original);
+
+			const message = await rejectionMessage(
+				executeHashlineSingle(hashlineExecuteOptions(tempDir, `§a.ts\n≔qn\n${pl("X")}`)),
+			);
+			expect(message).toContain(formatFullAnchorRequirement("qn"));
+			expect(message).toContain("hash matches 2 lines; re-read the target");
+			expect(message).not.toContain("Did you mean");
+			await expectFileBytesUnchanged(filePath, original);
+		});
+	});
+
+	it("shows the full-anchor hint when a hash-only ref has no matches", async () => {
+		await withTempDir(async tempDir => {
+			const filePath = path.join(tempDir, "a.ts");
+			const original = "alpha\nbeta";
+			await Bun.write(filePath, original);
+
+			const message = await rejectionMessage(
+				executeHashlineSingle(hashlineExecuteOptions(tempDir, `§a.ts\n≔zz\n${pl("X")}`)),
+			);
+			expect(message).toContain(formatFullAnchorRequirement("zz"));
+			expect(message).toContain("hash matches 0 lines; re-read the target");
+			await expectFileBytesUnchanged(filePath, original);
+		});
 	});
 
 	it("answers with the current anchors for the referenced lines and leaves the file untouched", async () => {
@@ -498,6 +646,143 @@ describe("hashline — hash-less line references", () => {
 			await Bun.write(path.join(tempDir, "a.ts"), "one\ntwo\n");
 			const run = executeHashlineSingle(hashlineExecuteOptions(tempDir, `§a.ts\n≔40\n${pl("X")}\n`));
 			await expect(run).rejects.toThrow("The edit was NOT applied. Line 40 does not exist (a.ts has 3 lines).");
+		});
+	});
+
+	it("accepts a copied-text suffix on a bare line number", async () => {
+		await withTempDir(async tempDir => {
+			const filePath = path.join(tempDir, "a.ts");
+			const lines = Array.from({ length: 50 }, (_, index) => `line ${index + 1}`);
+			const original = lines.join("\n");
+			await Bun.write(filePath, original);
+
+			const message = await rejectionMessage(
+				executeHashlineSingle(hashlineExecuteOptions(tempDir, `§a.ts\n≔47|old text\n${pl("X")}`)),
+			);
+			expect(message).toContain(`Use ≔${tag(47, "line 47")}`);
+			await expectFileBytesUnchanged(filePath, original);
+		});
+	});
+
+	it.each([
+		"a..b",
+		"a..b..c",
+		"../relative/path",
+	])("preserves the one-line retry hint when copied text contains dots (%s)", async copiedText => {
+		await withTempDir(async tempDir => {
+			const filePath = path.join(tempDir, "a.ts");
+			const original = Array.from({ length: 25 }, (_, index) => `line ${index + 1}`).join("\n");
+			await Bun.write(filePath, original);
+			const message = await rejectionMessage(
+				executeHashlineSingle(hashlineExecuteOptions(tempDir, `§a.ts\n≔22|${copiedText}\n${pl("X")}`)),
+			);
+			expect(message).toContain(`Use ≔${tag(22, "line 22")}`);
+			expect(message).not.toContain("Re-read the target");
+			await expectFileBytesUnchanged(filePath, original);
+		});
+	});
+
+	it("accepts a copied-text suffix on a hash-only anchor", async () => {
+		await withTempDir(async tempDir => {
+			const filePath = path.join(tempDir, "a.ts");
+			const original = "line-1\nsecond";
+			await Bun.write(filePath, original);
+
+			const message = await rejectionMessage(
+				executeHashlineSingle(hashlineExecuteOptions(tempDir, `§a.ts\n≔qn|old text\n${pl("X")}`)),
+			);
+			expect(message).toContain('Anchor "qn" lacks its line number. Did you mean ≔1qn?');
+			await expectFileBytesUnchanged(filePath, original);
+		});
+	});
+	it("rejects mixed range with hash on first endpoint only (≔22..23cd)", async () => {
+		await withTempDir(async tempDir => {
+			const filePath = path.join(tempDir, "a.ts");
+			const original = "line 1\nline 2\nline 3\n";
+			await Bun.write(filePath, original);
+
+			const message = await rejectionMessage(
+				executeHashlineSingle(hashlineExecuteOptions(tempDir, `§a.ts\n≔22..23cd\n${pl("X")}\n`)),
+			);
+			// Should contain the full range in the error message, not just the bare endpoint
+			expect(message).toContain("22..23cd");
+			expect(message).toContain("missing");
+			// Should NOT have a copy-ready "Use" suggestion since one endpoint lacks a hash
+			expect(message).not.toMatch(/Use ≔\d+/);
+			// Should indicate the full range is missing anchors
+			expect(message).toContain("Re-read the target");
+			await expectFileBytesUnchanged(filePath, original);
+		});
+	});
+
+	it.each([
+		"22|foo..23|bar",
+		"22|foo..23cd",
+	])("keeps the full span when a copied suffix precedes the range separator (≔%s)", async anchor => {
+		await withTempDir(async tempDir => {
+			const filePath = path.join(tempDir, "a.ts");
+			const original = "line 1\nline 2\nline 3\n";
+			await Bun.write(filePath, original);
+
+			const message = await rejectionMessage(
+				executeHashlineSingle(hashlineExecuteOptions(tempDir, `§a.ts\n≔${anchor}\n${pl("X")}\n`)),
+			);
+			// A one-line `Use ≔22xx` suggestion would make a resent range payload replace line 22 only.
+			expect(message).not.toMatch(/Use ≔\d+/);
+			expect(message).toContain("Re-read the target");
+			await expectFileBytesUnchanged(filePath, original);
+		});
+	});
+
+	it("rejects mixed range with hash on second endpoint only (≔ab..10cd)", async () => {
+		await withTempDir(async tempDir => {
+			const filePath = path.join(tempDir, "a.ts");
+			const original = "alpha\nbeta\n";
+			await Bun.write(filePath, original);
+
+			const message = await rejectionMessage(
+				executeHashlineSingle(hashlineExecuteOptions(tempDir, `§a.ts\n≔ab..10cd\n${pl("X")}\n`)),
+			);
+			// Should contain the full range and a message about missing line numbers
+			expect(message).toContain("ab..10cd");
+			expect(message).toContain("lacks its line number");
+			// Should NOT have a copy-ready suggestion
+			expect(message).not.toMatch(/Did you mean ≔\d+ab/);
+			// Should indicate to re-read the target
+			expect(message).toContain("Re-read the target");
+			await expectFileBytesUnchanged(filePath, original);
+		});
+	});
+
+	it("rejects reversed mixed range (≔10cd..ab)", async () => {
+		await withTempDir(async tempDir => {
+			const filePath = path.join(tempDir, "a.ts");
+			const original = "first\nsecond\n";
+			await Bun.write(filePath, original);
+
+			const message = await rejectionMessage(
+				executeHashlineSingle(hashlineExecuteOptions(tempDir, `§a.ts\n≔10cd..ab\n${pl("X")}\n`)),
+			);
+			expect(message).toContain("10cd..ab");
+			expect(message).toContain("lacks its line number");
+			expect(message).toContain("Re-read the target");
+			await expectFileBytesUnchanged(filePath, original);
+		});
+	});
+
+	it("rejects all-hash range (≔ab..cd)", async () => {
+		await withTempDir(async tempDir => {
+			const filePath = path.join(tempDir, "a.ts");
+			const original = "foo\nbar\n";
+			await Bun.write(filePath, original);
+
+			const message = await rejectionMessage(
+				executeHashlineSingle(hashlineExecuteOptions(tempDir, `§a.ts\n≔ab..cd\n${pl("X")}\n`)),
+			);
+			expect(message).toContain("ab..cd");
+			expect(message).toContain("lacks its line number");
+			expect(message).toContain("Re-read the target");
+			await expectFileBytesUnchanged(filePath, original);
 		});
 	});
 });
@@ -933,9 +1218,60 @@ describe("hashline — anchor-stale recovery via read snapshot cache", () => {
 	it("keeps a bounded number of generations per path", () => {
 		const cache = new FileReadCache();
 		const fakePath = "/tmp/__hashline-cache-generations__.ts";
-		for (let version = 0; version < 6; version++) cache.recordFull(fakePath, [`v${version}`]);
+		for (let version = 0; version < 10; version++) cache.recordFull(fakePath, [`v${version}`]);
 		const generations = cache.generations(fakePath);
-		expect(generations.map(snapshot => snapshot.lines.get(1))).toEqual(["v5", "v4", "v3", "v2"]);
+		expect(generations.map(snapshot => snapshot.lines.get(1))).toEqual([
+			"v9",
+			"v8",
+			"v7",
+			"v6",
+			"v5",
+			"v4",
+			"v3",
+			"v2",
+		]);
+	});
+
+	it("lands an edit authored against the original read after five of this session's own edits", async () => {
+		await withTempDir(async tempDir => {
+			const filePath = path.join(tempDir, "a.ts");
+			const v0Lines = ["// top", "", "const a = 1;", "const b = 2;", "", "function b() {", "  return 2;", "}"];
+			await Bun.write(filePath, `${v0Lines.join("\n")}\n`);
+			const session = makeHashlineSession(tempDir);
+			getFileReadCache(session).recordContiguous(filePath, 1, [...v0Lines, ""]);
+
+			// Five own edits, each inserting a line after line 1 (`// top`, which never moves).
+			// Each write records a new generation, pushing the original read back to the sixth.
+			for (let n = 0; n < 5; n++) {
+				const insert = `§a.ts\n»${tag(1, "// top")}\n// note ${n}\n`;
+				await executeHashlineSingle(hashlineExecuteOptions(tempDir, insert, undefined, session));
+			}
+			expect(getFileReadCache(session).generations(filePath)).toHaveLength(6);
+
+			// Anchor from the original read: line 7 was `  return 2;` there.
+			const stale = `§a.ts\n≔${sameLineRange(tag(7, "  return 2;"))}\n  return 3;\n`;
+			const result = await executeHashlineSingle(hashlineExecuteOptions(tempDir, stale, undefined, session));
+
+			expect(await Bun.file(filePath).text()).toBe(
+				[
+					"// top",
+					"// note 4",
+					"// note 3",
+					"// note 2",
+					"// note 1",
+					"// note 0",
+					"",
+					"const a = 1;",
+					"const b = 2;",
+					"",
+					"function b() {",
+					"  return 3;",
+					"}",
+					"",
+				].join("\n"),
+			);
+			expect(toolText(result)).toMatch(/Recovered from stale anchors using a previous read snapshot/);
+		});
 	});
 
 	it("lands a follow-up edit authored against the original read after this session's own edit shifted lines", async () => {
@@ -972,6 +1308,85 @@ describe("hashline — anchor-stale recovery via read snapshot cache", () => {
 			);
 			expect(toolText(result)).toMatch(/Recovered from stale anchors using a previous read snapshot/);
 		});
+	});
+
+	it("lands a multi-line range authored against the original read after this session's own edit shifted lines", async () => {
+		await withTempDir(async tempDir => {
+			const filePath = path.join(tempDir, "a.ts");
+			const v0Lines = ["function a() {", "  return 1;", "}", "", "function b() {", "  return 2;", "}"];
+			await Bun.write(filePath, `${v0Lines.join("\n")}\n`);
+			const session = makeHashlineSession(tempDir);
+			getFileReadCache(session).recordContiguous(filePath, 1, [...v0Lines, ""]);
+
+			const first = `§a.ts\n»${tag(1, "function a() {")}\n  if (x) {\n    return 0;\n  }\n`;
+			await executeHashlineSingle(hashlineExecuteOptions(tempDir, first, undefined, session));
+
+			// Lines 5..7 of the original read; line 6 is a range interior with no
+			// model-supplied hash, so only the endpoints vouch for the snapshot.
+			const second = `§a.ts\n≔${tag(5, "function b() {")}..${tag(7, "}")}\nfunction b() {\n  return 3;\n}\n`;
+			const result = await executeHashlineSingle(hashlineExecuteOptions(tempDir, second, undefined, session));
+
+			expect(await Bun.file(filePath).text()).toBe(
+				[
+					"function a() {",
+					"  if (x) {",
+					"    return 0;",
+					"  }",
+					"  return 1;",
+					"}",
+					"",
+					"function b() {",
+					"  return 3;",
+					"}",
+					"",
+				].join("\n"),
+			);
+			expect(toolText(result)).toMatch(/Recovered from stale anchors using a previous read snapshot/);
+		});
+	});
+
+	it("refuses multi-line range recovery when a range interior line changed in the live file", () => {
+		const cache = new FileReadCache();
+		const fakePath = "/tmp/__hashline-recovery-interior-changed__.ts";
+		cache.recordFull(fakePath, ["function b() {", "  return 2;", "}", ""]);
+		// Shifted by one line AND the interior line was rewritten out-of-band.
+		const currentText = ["// header", "function b() {", "  return 99;", "}", ""].join("\n");
+		const edits = parseHashline(`≔${tag(1, "function b() {")}..${tag(3, "}")}\nfunction b() {\n  return 3;\n}`);
+
+		expect(
+			tryRecoverHashlineWithCache({ cache, absolutePath: fakePath, currentText, edits, options: {} }),
+		).toBeNull();
+	});
+
+	it("refuses multi-line range recovery when the snapshot never held a range interior line", () => {
+		const cache = new FileReadCache();
+		const fakePath = "/tmp/__hashline-recovery-interior-missing__.ts";
+		cache.recordSparse(fakePath, [
+			[1, "function b() {"],
+			[3, "}"],
+		]);
+		const currentText = ["// header", "function b() {", "  return 2;", "}", ""].join("\n");
+		const edits = parseHashline(`≔${tag(1, "function b() {")}..${tag(3, "}")}\nfunction b() {\n  return 3;\n}`);
+
+		expect(
+			tryRecoverHashlineWithCache({ cache, absolutePath: fakePath, currentText, edits, options: {} }),
+		).toBeNull();
+	});
+
+	it("refuses range recovery that would relocate onto an identical copy after the anchored copy changed", () => {
+		const cache = new FileReadCache();
+		const fakePath = "/tmp/__hashline-recovery-relocate__.ts";
+		const pad = ["x", "x", "x"];
+		const block = ["function b() {", "  return 2;", "}"];
+		cache.recordFull(fakePath, [...pad, ...block, ...pad, ...block, ...pad]);
+		// Out-of-band edit changed the anchored copy's start line; the second,
+		// identical copy (with identical context) is untouched.
+		const currentText = [...pad, "function b(y) {", "  return 2;", "}", ...pad, ...block, ...pad].join("\n");
+		const edits = parseHashline(`≔${tag(4, "function b() {")}..${tag(6, "}")}\nfunction b() {\n  return 3;\n}`);
+
+		expect(
+			tryRecoverHashlineWithCache({ cache, absolutePath: fakePath, currentText, edits, options: {} }),
+		).toBeNull();
 	});
 
 	it("refuses recovery when the replayed hunk would match more than one live location", () => {

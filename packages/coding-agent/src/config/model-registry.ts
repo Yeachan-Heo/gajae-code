@@ -13,6 +13,7 @@ import {
 	type Context,
 	codexContextOverrideKey,
 	createModelManager,
+	createTrustedStrippedModelClone,
 	Effort,
 	enrichModelThinking,
 	getBundledModels,
@@ -49,6 +50,8 @@ import {
 	readBoundedModelsJson,
 	resolveLoopbackOpenAIBaseUrl,
 } from "@gajae-code/ai/utils/discovery/openai-compatible";
+// Internal-only: registerFinalizedModelClone is not part of the public @gajae-code/ai surface
+import { registerFinalizedModelClone } from "@gajae-code/ai/utils/trusted-model-clone";
 
 // Sentinels for local-only OAuth tokens — declared inline to avoid loading provider
 // modules at startup. Must match the provider OAuth modules.
@@ -782,26 +785,53 @@ function registryModelMetadataWithoutApiSpecificFields(model: Model<Api>): Parti
 	return metadata;
 }
 
-export function registrySelectorResolvesToModel(selector: string, models: readonly Model<Api>[]): boolean {
+/**
+ * Lowercased lookup keys for a model catalog, so selector resolution is a set
+ * lookup instead of a scan that re-lowercases every model id per selector.
+ */
+export interface RegistrySelectorIndex {
+	/** `id` and `provider/id`. */
+	exact: ReadonlySet<string>;
+	/** `id` alone. */
+	ids: ReadonlySet<string>;
+	/** Model ids per provider, for parsed `provider/id` selectors (nested, so no delimiter can collide). */
+	providerIds: ReadonlyMap<string, ReadonlySet<string>>;
+	/** Every `/`-delimited suffix of each id (`a/b/c` → `b/c`, `c`). */
+	idSuffixes: ReadonlySet<string>;
+}
+
+export function createRegistrySelectorIndex(models: readonly Model<Api>[]): RegistrySelectorIndex {
+	const exact = new Set<string>();
+	const ids = new Set<string>();
+	const providerIds = new Map<string, Set<string>>();
+	const idSuffixes = new Set<string>();
+	for (const model of models) {
+		const id = model.id.toLowerCase();
+		const provider = model.provider.toLowerCase();
+		ids.add(id);
+		exact.add(id);
+		exact.add(`${provider}/${id}`);
+		let providerModelIds = providerIds.get(provider);
+		if (!providerModelIds) {
+			providerModelIds = new Set<string>();
+			providerIds.set(provider, providerModelIds);
+		}
+		providerModelIds.add(id);
+		for (let slash = id.indexOf("/"); slash !== -1; slash = id.indexOf("/", slash + 1)) {
+			idSuffixes.add(id.slice(slash + 1));
+		}
+	}
+	return { exact, ids, providerIds, idSuffixes };
+}
+
+export function registrySelectorResolvesToModel(selector: string, index: RegistrySelectorIndex): boolean {
 	const normalizedSelector = selector.trim().toLowerCase();
-	if (
-		models.some(
-			model =>
-				model.id.toLowerCase() === normalizedSelector ||
-				`${model.provider}/${model.id}`.toLowerCase() === normalizedSelector,
-		)
-	)
-		return true;
+	if (index.exact.has(normalizedSelector)) return true;
 	const suffix = splitSelectorThinkingSuffix(normalizedSelector);
 	const baseSelector = suffix.thinkingLevel === undefined ? normalizedSelector : suffix.selector;
 	const parsed = parseModelString(baseSelector);
-	if (parsed)
-		return models.some(
-			model => model.provider.toLowerCase() === parsed.provider && model.id.toLowerCase() === parsed.id,
-		);
-	return models.some(
-		model => model.id.toLowerCase() === baseSelector || model.id.toLowerCase().endsWith(`/${baseSelector}`),
-	);
+	if (parsed) return index.providerIds.get(parsed.provider)?.has(parsed.id) ?? false;
+	return index.ids.has(baseSelector) || index.idSuffixes.has(baseSelector);
 }
 
 function filterMaterializedRegistryProfiles(
@@ -810,6 +840,7 @@ function filterMaterializedRegistryProfiles(
 	dynamicProviders: ReadonlySet<string>,
 ): Map<string, ModelProfileDefinition> {
 	const filtered = new Map<string, ModelProfileDefinition>();
+	const index = createRegistrySelectorIndex(models);
 	for (const [name, profile] of profiles) {
 		if (
 			profile.source === "registry" &&
@@ -818,7 +849,7 @@ function filterMaterializedRegistryProfiles(
 				return (
 					selectors.length > 0 &&
 					!selectors.some(selector => {
-						if (registrySelectorResolvesToModel(selector, models)) return true;
+						if (registrySelectorResolvesToModel(selector, index)) return true;
 						const suffix = splitSelectorThinkingSuffix(selector);
 						const parsed = parseModelString(suffix.thinkingLevel ? suffix.selector : selector);
 						return parsed !== undefined && dynamicProviders.has(parsed.provider);
@@ -1288,7 +1319,13 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 		}
 	}
 	result.compat = mergeCompat(model.compat, override.compat);
-	return enrichModelThinking(result);
+	// Preserve endpoint-provided reasoning effort maps; skip enrichModelThinking inference
+	const hasEndpointReasoningMap =
+		isRecord(result.compat) &&
+		"reasoningEffortMap" in result.compat &&
+		result.compat.reasoningEffortMap &&
+		Object.keys(result.compat.reasoningEffortMap as Record<string, unknown>).length > 0;
+	return hasEndpointReasoningMap ? result : enrichModelThinking(result);
 }
 /**
  * Normalizes `modelOverrides` keys to lowercase so override matching is
@@ -1640,6 +1677,14 @@ function finalizeCustomModel(model: CustomModelOverlay, options: CustomModelBuil
 	} as Model<Api>);
 }
 
+interface SelectorCircuit {
+	openUntil: number;
+	consecutiveOpens: number;
+	cooldownMs: number;
+	/** Half-open probe lease: only `owner` may route to the selector until `leaseUntil`. */
+	probe: { owner: string; leaseUntil: number } | undefined;
+}
+
 function normalizeSuppressedSelector(selector: string): string {
 	const trimmed = selector.trim();
 	if (!trimmed) return trimmed;
@@ -1769,6 +1814,7 @@ export class ModelRegistry {
 	#registeredProviderSources: Set<string> = new Set();
 	#cacheDbPath?: string;
 	#suppressedSelectors: Map<string, number> = new Map();
+	#selectorCircuits: Map<string, SelectorCircuit> = new Map();
 	#backgroundRefresh?: Promise<void>;
 	#catalogMutationTail: Promise<void> = Promise.resolve();
 	#pendingCatalogMutations = 0;
@@ -1908,6 +1954,7 @@ export class ModelRegistry {
 			try {
 				this.#reloadStaticModels();
 				this.#suppressedSelectors.clear();
+				this.#selectorCircuits.clear();
 				this.#modelBindingsApplier.apply();
 			} finally {
 				this.#resumeRebuild();
@@ -1941,6 +1988,7 @@ export class ModelRegistry {
 			try {
 				this.#reloadStaticModels();
 				this.#suppressedSelectors.clear();
+				this.#selectorCircuits.clear();
 				await this.#refreshRuntimeDiscoveries(
 					strategy,
 					undefined,
@@ -1991,6 +2039,11 @@ export class ModelRegistry {
 				for (const selector of this.#suppressedSelectors.keys()) {
 					if (selector.startsWith(`${providerId}/`)) {
 						this.#suppressedSelectors.delete(selector);
+					}
+				}
+				for (const selector of this.#selectorCircuits.keys()) {
+					if (selector.startsWith(`${providerId}/`)) {
+						this.#selectorCircuits.delete(selector);
 					}
 				}
 				await this.#refreshRuntimeDiscoveries(
@@ -2696,20 +2749,7 @@ export class ModelRegistry {
 		}));
 	}
 	#stripModelBaseUrlQueries(models: readonly Model<Api>[]): Model<Api>[] {
-		return models.map(model => {
-			if (!model.baseUrl) return model;
-			try {
-				const parsed = new URL(model.baseUrl);
-				parsed.username = "";
-				parsed.password = "";
-				parsed.search = "";
-				parsed.hash = "";
-				return { ...model, baseUrl: parsed.toString().replace(/\/$/, "") };
-			} catch {
-				const { baseUrl: _baseUrl, ...withoutBaseUrl } = model;
-				return withoutBaseUrl as Model<Api>;
-			}
-		});
+		return models.map(model => createTrustedStrippedModelClone(model));
 	}
 	#stripUrlUserinfo(url: string | undefined): string | undefined {
 		if (!url) return url;
@@ -3238,6 +3278,11 @@ export class ModelRegistry {
 									result.provider,
 									this.#providerEvidenceApiKeys.get(result.provider),
 								) &&
+							result.configurationGeneration ===
+								this.authStorage.getProviderConfigurationGeneration(
+									result.provider,
+									this.#authStorageConfigOwner,
+								) &&
 							result.endpoint ===
 								this.#normalizeDiscoveryEvidenceEndpoint(
 									this.#effectiveDiscoveryProviderConfig(providerConfig).baseUrl ?? "",
@@ -3259,7 +3304,10 @@ export class ModelRegistry {
 									this.#providerEvidenceApiKeys.get(result.provider),
 								) ||
 							result.configurationGeneration !==
-								this.authStorage.getProviderConfigurationGeneration(result.provider) ||
+								this.authStorage.getProviderConfigurationGeneration(
+									result.provider,
+									this.#authStorageConfigOwner,
+								) ||
 							result.endpoint !==
 								this.#normalizeDiscoveryEvidenceEndpoint(
 									this.#effectiveDiscoveryProviderConfig(providerConfig).baseUrl ?? "",
@@ -3490,7 +3538,10 @@ export class ModelRegistry {
 			? this.authStorage.has(provider) ||
 				this.authStorage.hasAuth(provider, undefined, { owner: this.#authStorageConfigOwner })
 			: !this.#isCredentiallessProvider(provider);
-		let preflightAuthConfigurationGeneration = this.authStorage.getProviderConfigurationGeneration(provider);
+		let preflightAuthConfigurationGeneration = this.authStorage.getProviderConfigurationGeneration(
+			provider,
+			this.#authStorageConfigOwner,
+		);
 		let preflightOAuthRefreshGeneration = this.authStorage.getProviderOAuthRefreshGeneration(provider);
 		if (shouldPreflightAuth) {
 			if (optionalAuth && isCurrentPreflight()) this.#credentiallessAuthFallbackProviders.delete(provider);
@@ -3505,7 +3556,10 @@ export class ModelRegistry {
 						credentialSessionId,
 					}),
 				);
-				const currentAuthConfigurationGeneration = this.authStorage.getProviderConfigurationGeneration(provider);
+				const currentAuthConfigurationGeneration = this.authStorage.getProviderConfigurationGeneration(
+					provider,
+					this.#authStorageConfigOwner,
+				);
 				if (preflightAuthConfigurationGeneration !== currentAuthConfigurationGeneration) {
 					const currentOAuthRefreshGeneration = this.authStorage.getProviderOAuthRefreshGeneration(provider);
 					if (
@@ -3583,6 +3637,9 @@ export class ModelRegistry {
 		const isCurrentEndpoint = () =>
 			endpoint ===
 			this.#normalizeDiscoveryEvidenceEndpoint(this.#effectiveDiscoveryProviderConfig(providerConfig).baseUrl ?? "");
+		const isCurrentAuthConfiguration = () =>
+			preflightAuthConfigurationGeneration ===
+			this.authStorage.getProviderConfigurationGeneration(provider, this.#authStorageConfigOwner);
 		const isCurrentProviderRefresh = () =>
 			providerRefresh === undefined ||
 			("providerId" in providerRefresh
@@ -3654,7 +3711,7 @@ export class ModelRegistry {
 			},
 			getEvidenceGeneration: provider => this.#getProviderEvidenceGeneration(provider.provider, preflightApiKey),
 			cacheDynamicModelProvenance: cacheLookupProvenance,
-			canPublishCache: () => isCurrentEndpoint() && isCurrentProviderRefresh(),
+			canPublishCache: () => isCurrentAuthConfiguration() && isCurrentEndpoint() && isCurrentProviderRefresh(),
 		});
 		const authGeneration =
 			mergeInput.authGeneration ??
@@ -3662,6 +3719,7 @@ export class ModelRegistry {
 		const current =
 			mergeInput.current &&
 			authGeneration === this.#getProviderEvidenceGeneration(effectiveProviderConfig.provider, preflightApiKey) &&
+			isCurrentAuthConfiguration() &&
 			isCurrentEndpoint();
 		if (!current) {
 			return {
@@ -3849,9 +3907,15 @@ export class ModelRegistry {
 		// The token is only needed if the dynamic fetch fires (cache miss),
 		// and failures there are handled gracefully.
 		const peekKey = async (descriptor: { providerId: string }) => {
-			const configurationGeneration = this.authStorage.getProviderConfigurationGeneration(descriptor.providerId);
+			const configurationGeneration = this.authStorage.getProviderConfigurationGeneration(
+				descriptor.providerId,
+				this.#authStorageConfigOwner,
+			);
 			const apiKey = await this.#peekApiKeyForProvider(descriptor.providerId, { credentialSessionId });
-			if (configurationGeneration !== this.authStorage.getProviderConfigurationGeneration(descriptor.providerId)) {
+			if (
+				configurationGeneration !==
+				this.authStorage.getProviderConfigurationGeneration(descriptor.providerId, this.#authStorageConfigOwner)
+			) {
 				return { apiKey: undefined, authGeneration: undefined };
 			}
 			return {
@@ -4346,6 +4410,134 @@ export class ModelRegistry {
 		return this.#applyProviderModelOverrides(providerConfig.provider, discovered);
 	}
 
+	/**
+	 * Extract thinking configuration from endpoint-advertised reasoning effort.
+	 * Parses the `reasoning_efforts` field when `supportsReasoningEffort` is enabled.
+	 * Maps endpoint effort values to internal Effort enum values while preserving aliases.
+	 */
+	#extractEndpointReasoningEffort(item: unknown, supportsReasoningEffort: boolean | undefined) {
+		if (!supportsReasoningEffort || !isRecord(item)) return undefined;
+
+		const reasoningEfforts = (item as { reasoning_efforts?: unknown }).reasoning_efforts;
+		if (!Array.isArray(reasoningEfforts) || reasoningEfforts.length === 0) return undefined;
+
+		const efforts: Array<{ value: string; default?: boolean }> = [];
+		let defaultEffort: string | undefined;
+
+		for (const effort of reasoningEfforts) {
+			if (!isRecord(effort)) continue;
+			const value = typeof effort.value === "string" ? effort.value.toLowerCase() : undefined;
+			if (!value) continue;
+			efforts.push({ value, default: effort.default === true });
+			if (effort.default === true) {
+				defaultEffort = value;
+			}
+		}
+
+		if (efforts.length === 0) return undefined;
+
+		// Map endpoint values to internal Effort enum values while preserving original aliases
+		const effortOrder = [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max];
+		const reasoningEffortMap: Record<string, string> = {};
+		const mappedEfforts: Array<{ mapped: Effort; original: string; default?: boolean }> = [];
+
+		for (const e of efforts) {
+			let mapped: Effort | undefined;
+			// Map common endpoint values to internal Effort
+			switch (e.value) {
+				case "minimal":
+				case "minimal-think":
+					mapped = Effort.Minimal;
+					break;
+				case "low":
+				case "low-think":
+					mapped = Effort.Low;
+					break;
+				case "medium":
+				case "medium-think":
+					mapped = Effort.Medium;
+					break;
+				case "high":
+				case "high-think":
+					mapped = Effort.High;
+					break;
+				case "xhigh":
+				case "xhigh-think":
+					mapped = Effort.XHigh;
+					break;
+				case "max":
+				case "max-think":
+					mapped = Effort.Max;
+					break;
+				default:
+					// Check if the value matches any known Effort value
+					if (
+						e.value === "minimal" ||
+						e.value === "low" ||
+						e.value === "medium" ||
+						e.value === "high" ||
+						e.value === "xhigh" ||
+						e.value === "max"
+					) {
+						mapped = e.value as Effort;
+					}
+			}
+
+			if (!mapped) continue;
+
+			// Preserve the original endpoint string for this effort level
+			if (!reasoningEffortMap[mapped]) {
+				reasoningEffortMap[mapped] = e.value;
+			}
+			mappedEfforts.push({ mapped, original: e.value, default: e.default });
+		}
+
+		if (mappedEfforts.length === 0) return undefined;
+
+		// Sort mapped efforts by their position in effortOrder and deduplicate
+		const supportedEfforts = Array.from(
+			new Map(
+				mappedEfforts
+					.map(e => [e.mapped, e] as const)
+					.sort((a, b) => effortOrder.indexOf(a[0]) - effortOrder.indexOf(b[0])),
+			).values(),
+		).map(e => e.mapped);
+
+		const minLevel: Effort = supportedEfforts[0] as Effort;
+		const maxLevel: Effort = supportedEfforts[supportedEfforts.length - 1] as Effort;
+
+		// Resolve the default effort
+		let resolvedDefaultEffort: Effort | undefined;
+		if (defaultEffort) {
+			const defaultEntry = mappedEfforts.find(e => e.original === defaultEffort);
+			if (defaultEntry && supportedEfforts.includes(defaultEntry.mapped)) {
+				resolvedDefaultEffort = defaultEntry.mapped;
+			}
+		}
+		// If no explicit default or it wasn't found, use medium if available, else middle of range
+		if (!resolvedDefaultEffort) {
+			if (supportedEfforts.includes(Effort.Medium)) {
+				resolvedDefaultEffort = Effort.Medium;
+			} else {
+				const midIndex = Math.floor(supportedEfforts.length / 2);
+				resolvedDefaultEffort = supportedEfforts[midIndex];
+			}
+		}
+
+		return {
+			thinking: {
+				mode: "effort" as const,
+				minLevel,
+				maxLevel,
+				defaultLevel: resolvedDefaultEffort,
+				levels: supportedEfforts,
+			} as ThinkingConfig,
+			compat: {
+				reasoningEffortMap,
+			},
+		};
+	}
+
 	async #discoverOpenAIModelsList(
 		providerConfig: DiscoveryProviderConfig,
 		discoveryApiKey?: string,
@@ -4428,31 +4620,44 @@ export class ModelRegistry {
 				item.max_output_tokens,
 			);
 			const api = this.#resolveDiscoveredModelApi(providerConfig, id, item);
-			discovered.push(
-				enrichModelThinking({
-					id,
-					name,
-					api,
-					provider: providerConfig.provider,
-					baseUrl: requestBaseUrl,
-					reasoning: providerConfig.provider === "omlx" ? true : (referenceModel?.reasoning ?? false),
-					thinking: referenceModel?.thinking,
-					input: referenceModel?.input ?? ["text"],
-					output: referenceModel?.output,
-					cost: referenceModel?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-					contextWindow:
-						firstPositiveDiscoveryNumber(
-							item.max_model_len,
-							item.context_length,
-							item.context_window,
-							item.max_context_length,
-							referenceModel?.contextWindow,
-							UNK_CONTEXT_WINDOW,
-						) ?? UNK_CONTEXT_WINDOW,
-					maxTokens: discoveredMaxTokens ?? referenceModel?.maxTokens ?? UNK_MAX_TOKENS,
-					maxTokensSource: discoveredMaxTokens === undefined ? referenceModel?.maxTokensSource : "discovered",
-					headers: providerConfig.headers,
-					compat: mergeCompat(
+			// Try to extract reasoning effort from endpoint-advertised metadata
+			const endpointReasoningConfig = this.#extractEndpointReasoningEffort(
+				item,
+				(providerConfig.compat as { supportsReasoningEffort?: boolean } | undefined)?.supportsReasoningEffort,
+			);
+			const hasEndpointReasoning = endpointReasoningConfig?.thinking !== undefined;
+			const modelBase: Parameters<typeof enrichModelThinking>[0] = {
+				id,
+				name,
+				api,
+				provider: providerConfig.provider,
+				baseUrl: requestBaseUrl,
+				reasoning:
+					providerConfig.provider === "omlx"
+						? true
+						: hasEndpointReasoning
+							? true
+							: (referenceModel?.reasoning ?? false),
+				thinking: hasEndpointReasoning
+					? (endpointReasoningConfig!.thinking as ThinkingConfig)
+					: referenceModel?.thinking,
+				input: referenceModel?.input ?? ["text"],
+				output: referenceModel?.output,
+				cost: referenceModel?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow:
+					firstPositiveDiscoveryNumber(
+						item.max_model_len,
+						item.context_length,
+						item.context_window,
+						item.max_context_length,
+						referenceModel?.contextWindow,
+						UNK_CONTEXT_WINDOW,
+					) ?? UNK_CONTEXT_WINDOW,
+				maxTokens: discoveredMaxTokens ?? referenceModel?.maxTokens ?? UNK_MAX_TOKENS,
+				maxTokensSource: discoveredMaxTokens === undefined ? referenceModel?.maxTokensSource : "discovered",
+				headers: providerConfig.headers,
+				compat: mergeCompat(
+					mergeProviderCompat(
 						{
 							supportsStore: false,
 							supportsDeveloperRole: false,
@@ -4466,19 +4671,26 @@ export class ModelRegistry {
 						},
 						mergeProviderCompat(providerConfig.compat, referenceModel?.compat),
 					),
-					...(providerConfig.provider === "omlx"
-						? {
-								reasoning: true,
-								thinking: {
-									mode: "effort" as const,
-									minLevel: Effort.Low,
-									maxLevel: Effort.High,
-									defaultLevel: Effort.Medium,
-								},
-							}
-						: {}),
-				}),
-			);
+					// Include endpoint-advertised reasoning effort map
+					hasEndpointReasoning ? endpointReasoningConfig.compat : undefined,
+				),
+				...(providerConfig.provider === "omlx"
+					? {
+							reasoning: true,
+							thinking: {
+								mode: "effort" as const,
+								minLevel: Effort.Low,
+								maxLevel: Effort.High,
+								defaultLevel: Effort.Medium,
+							},
+						}
+					: {}),
+			};
+			// Skip enrichModelThinking for models with explicit endpoint reasoning to preserve
+			// endpoint-advertised effort levels. enrichModelThinking would infer wider ranges
+			// based on the provider/API defaults rather than the endpoint's advertised values.
+			const finalModel = hasEndpointReasoning ? modelBase : enrichModelThinking(modelBase);
+			discovered.push(finalModel);
 		}
 		return this.#applyProviderModelOverrides(providerConfig.provider, discovered);
 	}
@@ -4741,7 +4953,52 @@ export class ModelRegistry {
 		});
 	}
 	#finalizeModels(models: Model<Api>[]): Model<Api>[] {
-		const finalized = models.map(model => enrichModelThinking({ ...this.#restoreDeclaredThinking(model) }));
+		const finalized = models.map(model => {
+			const restored = { ...this.#restoreDeclaredThinking(model) };
+			// Preserve models with endpoint-provided reasoning effort maps to avoid overriding
+			// with inferred defaults. enrichModelThinking would infer wider ranges based on
+			// provider/API defaults rather than the endpoint's advertised values.
+			const hasEndpointReasoningMap =
+				isRecord(restored.compat) &&
+				"reasoningEffortMap" in restored.compat &&
+				restored.compat.reasoningEffortMap &&
+				Object.keys(restored.compat.reasoningEffortMap as Record<string, unknown>).length > 0;
+			if (!hasEndpointReasoningMap) {
+				return enrichModelThinking(restored);
+			}
+			// For models with endpoint reasoning efforts, if thinking is not set,
+			// reconstruct it from the endpoint-provided reasoning effort map.
+			if (restored.thinking === undefined && restored.reasoning) {
+				// `hasEndpointReasoningMap` narrows at runtime only; `compat` is still the
+				// provider-compat union here, and only OpenAICompat declares the map.
+				const reasoningEffortMap = (restored.compat as { reasoningEffortMap?: Record<string, string> } | undefined)
+					?.reasoningEffortMap;
+				if (reasoningEffortMap) {
+					const effortOrder = [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max];
+					const supportedEfforts = Object.keys(reasoningEffortMap)
+						.filter(effort => effort !== "undefined" && effort !== "null")
+						.sort((a, b) => effortOrder.indexOf(a as Effort) - effortOrder.indexOf(b as Effort));
+					if (supportedEfforts.length > 0) {
+						const minLevel = supportedEfforts[0] as Effort;
+						const maxLevel = supportedEfforts[supportedEfforts.length - 1] as Effort;
+						const defaultLevel = supportedEfforts.includes(Effort.Medium)
+							? Effort.Medium
+							: (supportedEfforts[Math.floor(supportedEfforts.length / 2)] as Effort);
+						return {
+							...restored,
+							thinking: {
+								mode: "effort" as const,
+								minLevel,
+								maxLevel,
+								defaultLevel,
+								levels: supportedEfforts as Effort[],
+							},
+						};
+					}
+				}
+			}
+			return restored;
+		});
 		const result = applyFinalCodexGpt56ContextCap(finalized, undefined, this.#codexContextWindowOverrides);
 		for (let index = 0; index < result.length; index++) {
 			if (
@@ -4762,6 +5019,14 @@ export class ModelRegistry {
 			}
 			const generated = this.#generatedAuthHeaders.get(models[index]!);
 			if (generated) this.#generatedAuthHeaders.set(result[index]!, generated);
+			// Register finalized clone as trusted if the original is trusted
+			// registerFinalizedModelClone builds a fresh trusted object from the original's snapshot
+			if (result[index]) {
+				const registeredClone = registerFinalizedModelClone(models[index]!, result[index]);
+				if (registeredClone) {
+					result[index] = registeredClone;
+				}
+			}
 		}
 		return result;
 	}
@@ -6361,6 +6626,57 @@ export class ModelRegistry {
 			return false;
 		}
 		return true;
+	}
+
+	/**
+	 * Open the fallback-chain circuit for a selector after it failed out of a
+	 * managed chain. Consecutive opens without an intervening success double the
+	 * cooldown up to `maxCooldownMs`. A provider Retry-After instant (`retryAt`)
+	 * is authoritative and replaces the local cooldown window. Returns the instant
+	 * the circuit half-opens.
+	 */
+	openSelectorCircuit(selector: string, baseCooldownMs: number, maxCooldownMs: number, retryAt?: number): number {
+		const key = normalizeSuppressedSelector(selector);
+		const consecutiveOpens = (this.#selectorCircuits.get(key)?.consecutiveOpens ?? 0) + 1;
+		const cooldownMs = Math.min(
+			baseCooldownMs * 2 ** (consecutiveOpens - 1),
+			Math.max(baseCooldownMs, maxCooldownMs),
+		);
+		const openUntil = retryAt ?? Date.now() + cooldownMs;
+		this.#selectorCircuits.set(key, { openUntil, consecutiveOpens, cooldownMs, probe: undefined });
+		return openUntil;
+	}
+
+	/**
+	 * Whether chain resolution must skip a selector. It is skipped while its
+	 * circuit cools down, and while half-open once another owner holds the probe
+	 * lease. Passing `probeOwner` atomically claims the half-open probe for that
+	 * owner (re-admitting the same owner), so exactly one session probes a
+	 * recovered entry at a time; omit it for read-only availability checks.
+	 */
+	isSelectorCircuitOpen(selector: string, probeOwner?: string): boolean {
+		const circuit = this.#selectorCircuits.get(normalizeSuppressedSelector(selector));
+		if (!circuit) return false;
+		const now = Date.now();
+		if (circuit.openUntil > now) return true;
+		const probe = circuit.probe;
+		if (probe && probe.leaseUntil > now && probe.owner !== probeOwner) return true;
+		if (probeOwner !== undefined) {
+			circuit.probe = { owner: probeOwner, leaseUntil: now + Math.max(circuit.cooldownMs, 1) };
+		}
+		return false;
+	}
+
+	/** Whether a selector's cooldown elapsed with no live probe lease (half-open, probe available). */
+	isSelectorCircuitHalfOpen(selector: string): boolean {
+		const circuit = this.#selectorCircuits.get(normalizeSuppressedSelector(selector));
+		const now = Date.now();
+		return circuit !== undefined && circuit.openUntil <= now && !(circuit.probe && circuit.probe.leaseUntil > now);
+	}
+
+	/** Close a selector's circuit after an accepted response, resetting its escalation. */
+	closeSelectorCircuit(selector: string): void {
+		this.#selectorCircuits.delete(normalizeSuppressedSelector(selector));
 	}
 
 	/** Return whether a selector has an active, expired, or no rate-limit suppression. */

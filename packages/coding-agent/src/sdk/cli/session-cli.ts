@@ -167,6 +167,8 @@ export function sdkPublicFailure(code: string, details?: unknown, proof?: Public
 	const kinds: Record<string, PublicFailureKind> = {
 		usage: "usage",
 		invalid_input: "usage",
+		unknown_operation: "usage",
+		not_a_repository: "usage",
 		invalid_json: "invalid_json",
 		broker_unavailable: "broker_unavailable",
 		session_unavailable: "endpoint_stale",
@@ -177,6 +179,7 @@ export function sdkPublicFailure(code: string, details?: unknown, proof?: Public
 		tail_timeout: "timeout",
 		wait_timeout: "wait_timeout",
 		uncertain_after_send: "uncertain_after_send",
+		busy: "busy",
 		authorization_denied: "authorization_denied",
 		unauthorized: "authorization_denied",
 		forbidden: "authorization_denied",
@@ -203,8 +206,15 @@ export function sdkPublicFailure(code: string, details?: unknown, proof?: Public
 		references,
 		// A typed `resource_gone` keeps its public classification; the fixed
 		// diagnostic only separates absent resource state from an empty result.
-		// It asserts no cause and echoes no host-supplied text.
-		...(code === "resource_gone" ? { diagnostics: ["sdk_resource_gone" as const] } : {}),
+		// It asserts no cause and echoes no host-supplied text. The usage-mapped
+		// codes likewise attach fixed guidance instead of the original message.
+		...(code === "resource_gone"
+			? { diagnostics: ["sdk_resource_gone" as const] }
+			: code === "unknown_operation"
+				? { diagnostics: ["sdk_unknown_operation" as const] }
+				: code === "not_a_repository"
+					? { diagnostics: ["sdk_scope_requires_repository" as const] }
+					: {}),
 	});
 }
 
@@ -1248,7 +1258,11 @@ async function runSend(agentDir: string, sessionId: string, args: SdkSessionCliA
 								? ("wait_timeout" as const)
 								: failure.input.kind,
 					}
-				: {}),
+				: failure.input.kind === "busy"
+					? // turn.prompt is refused while a turn runs and its admission is released
+						// before any execution, so the prompt definitively did not apply.
+						{ proof: "pre-effect" as const }
+					: {}),
 			references: failure.input.references,
 		});
 	}

@@ -2,18 +2,12 @@ Launches subagents to parallelize workflows.
 
 - Results are delivered automatically when complete.
 - The tool result lists the assigned task ids (e.g. `0-AuthLoader`) — those are the live agent ids.
-{{#if ircEnabled}}
-- Coordinate with running tasks via `irc` using those ids. `subagent` cancel terminates a task and **cannot carry a message**.
-{{else}}
+- Coordinate with running tasks via `irc` when available, using those ids. `subagent` cancel terminates a task and **cannot carry a message**.
 - Use `subagent` action `inspect` or `list` to snapshot manager state.
-{{/if}}
 - To wait or cancel, use the `subagent` tool; its await/cancel doctrine is authoritative.
 
-{{#if ircEnabled}}
-Subagents have no conversation history, but they can reach you and their siblings live via the `irc` tool. Front-load every fact, file path, and direction they need in {{#if contextEnabled}}`context` or `assignment`{{else}}each `assignment`{{/if}}.
-{{else}}
 Subagents have no conversation history. Every fact, file path, and direction they need MUST be explicit in {{#if contextEnabled}}`context` or `assignment`{{else}}each `assignment`{{/if}}.
-{{/if}}
+Use `irc` for live coordination when it is available.
 
 <parameters>
 - `agent`: agent type for all tasks
@@ -36,27 +30,16 @@ Subagents have no conversation history. Every fact, file path, and direction the
 - HARD runtime gate: calls with more than 4 tasks are rejected before any child launches unless `spawnPlan` is complete.
 - NEVER assign tasks to run project-wide build/test/lint. Caller verifies after the batch.
 - **Subagents do not verify, lint, or format.** Every assignment MUST instruct the subagent to skip all gates and formatters. You run them once at the end across the union of changed files — avoids redundant runs and racing formatter passes.
-{{#if ircEnabled}}
-- Each task: ≤3–5 explicit files. Overlapping file sets are tolerable when peers can coordinate via `irc`, but still fan out to a cluster when the scopes are cleanly separable.
-- No globs, no "update all", no package-wide scope.
-{{else}}
-- Each task: ≤3–5 explicit files. No globs, no "update all", no package-wide scope. Fan out to a cluster instead.
-{{/if}}
+- Each task: ≤3–5 explicit files. No globs, no "update all", no package-wide scope. Use `irc` to coordinate overlapping work when it is available; otherwise keep file sets independent.
 - Pass large payloads via `local://<path>` URIs, not inline.
 {{#if contextEnabled}}- Put shared constraints in `context` once; do not duplicate across assignments.{{/if}}
 - Prefer agents that investigate **and** edit in one pass; only spin a read-only discovery step when affected files are genuinely unknown.
 </rules>
 
 <parallelization>
-{{#if ircEnabled}}
-Test: can task B run correctly without seeing A's output? If no, sequence A → B — **unless** B can reasonably ask A for the missing piece over `irc`. Live coordination beats a serial waterfall when the contract is small and easy to describe in a DM.
-Still sequence when one task produces a large, evolving contract (generated types, schema migration, core module API) the other consumes wholesale — IRC round-trips do not replace a finished artifact.
-Parallel when tasks touch disjoint files, are independent refactors/tests, or only need occasional clarification that can be resolved peer-to-peer.
-{{else}}
-Test: can task B run correctly without seeing A's output? If no, sequence A → B.
-Sequential when one task produces a contract (types, API, schema, core module) the other consumes.
-Parallel when tasks touch disjoint files or are independent refactors/tests.
-{{/if}}
+Test: can task B run correctly without seeing A's output? If no, sequence A → B, unless `irc` is available and A can answer a small clarification.
+Still sequence when one task produces a large, evolving contract (generated types, schema migration, core module API); live coordination is not a substitute for a finished contract.
+Parallel when tasks touch disjoint files, are independent refactors/tests, or need only occasional peer clarification.
 </parallelization>
 
 {{#if contextEnabled}}
@@ -77,10 +60,8 @@ Parallel when tasks touch disjoint files or are independent refactors/tests.
 {{#if spawningDisabled}}
 Agent spawning is disabled for this context.
 {{else}}
-{{#list agents join="\n"}}
-# {{name}}
-{{description}}
-{{/list}}
+Bundled role names: {{#list agents join=", "}}{{name}}{{/list}}. A configured agent may override a bundled role name and takes precedence.
+Other configured agents (project, user, plugin) may also be available; calling with an unknown `agent` lists the agents callable in this session.
 {{/if}}
 </agents>
 

@@ -21,6 +21,11 @@ import {
 	readSseEvents,
 } from "@gajae-code/utils";
 import {
+	anthropicProviderDiagnosticFromError,
+	anthropicProviderDiagnosticFromSseErrorData,
+	attachProviderDiagnostic,
+} from "../adapter-internals/provider-diagnostic";
+import {
 	isProviderSafetyStopAdapterInvocation,
 	mintProviderSafetyStop,
 	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
@@ -32,6 +37,7 @@ import {
 	supportsAnthropicAdaptiveThinkingDisplay as supportsAdaptiveThinkingDisplay,
 } from "../model-thinking";
 import { calculateCost } from "../models";
+import { readProviderDiagnostic } from "../provider-diagnostic";
 import { isUsageLimitError } from "../rate-limit-utils";
 import { getEnvApiKey, OUTPUT_FALLBACK_BUFFER } from "../stream";
 import type {
@@ -107,6 +113,7 @@ import {
 	type ResolveToolChoiceResult,
 	resolveToolChoice,
 } from "../utils/tool-choice-capability";
+import { getClaudeCodeVersion } from "./claude-code-version";
 import {
 	buildCopilotDynamicHeaders,
 	hasCopilotVisionInput,
@@ -288,7 +295,7 @@ export function buildAnthropicHeaders(options: AnthropicHeaderOptions): Record<s
 		const incomingUserAgent = getHeaderCaseInsensitive(options.modelHeaders, "User-Agent");
 		const userAgent = isClaudeCodeClientUserAgent(incomingUserAgent)
 			? incomingUserAgent
-			: `claude-cli/${claudeCodeVersion} (external, cli)`;
+			: `claude-cli/${getClaudeCodeVersion()} (external, cli)`;
 		return {
 			...modelHeaders,
 			...claudeCodeHeaders,
@@ -845,7 +852,6 @@ function getCacheControl(
 }
 
 // Stealth mode: Mimic Anthropic Code headers and tool prefixing.
-export const claudeCodeVersion = "2.1.281";
 export const claudeCodeEntrypoint = "sdk-cli";
 export const claudeToolPrefix: string = "proxy_";
 export const claudeCodeSystemInstruction = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
@@ -922,7 +928,7 @@ function createClaudeBillingHeader(payload: unknown): string {
 	const buildHash = Array.from(randomBytes, byte => byte.toString(16).padStart(2, "0"))
 		.join("")
 		.slice(0, 3);
-	return `${CLAUDE_BILLING_HEADER_PREFIX} cc_version=${claudeCodeVersion}.${buildHash}; cc_entrypoint=${claudeCodeEntrypoint}; cch=${cch};`;
+	return `${CLAUDE_BILLING_HEADER_PREFIX} cc_version=${getClaudeCodeVersion()}.${buildHash}; cc_entrypoint=${claudeCodeEntrypoint}; cch=${cch};`;
 }
 
 const CLAUDE_CLOAKING_USER_ID_REGEX =
@@ -1444,7 +1450,11 @@ async function* iterateAnthropicEvents(
 	for await (const sse of readSseEvents(response.body, signal)) {
 		notifyRawSseEvent(onSseEvent, sse);
 		if (sse.event === "error") {
-			throw new Error(sse.data);
+			// Classify the explicit protocol envelope BEFORE it collapses into an
+			// Error message: the structured `error.type` is the only trustworthy
+			// evidence here, and recovering it later from message text would be
+			// provenance laundering. The thrown error itself is unchanged.
+			throw attachProviderDiagnostic(new Error(sse.data), anthropicProviderDiagnosticFromSseErrorData(sse.data));
 		}
 
 		if (!ANTHROPIC_MESSAGE_EVENTS.has(sse.event ?? "")) {
@@ -1490,6 +1500,28 @@ type AnthropicStreamWithResponseRequest = {
 
 function hasAnthropicStreamWithResponseRequest(request: unknown): request is AnthropicStreamWithResponseRequest {
 	return isRecord(request) && typeof request.withResponse === "function";
+}
+
+/**
+ * The ONLY seam allowed to mint an HTTP-sourced diagnostic.
+ *
+ * Provenance is where the error came from, not what shape it has: the public
+ * SDK constructor and `APIError.generate` are callable by anyone, and a forged
+ * `APIError.prototype` object passes `instanceof` just as well, so an adapter
+ * callback (onPayload/onStreamCreated) or a compat layer could otherwise inject
+ * a fully trusted classification for a request that never reached the wire.
+ * Only a rejection raised while awaiting the SDK's own request/response is
+ * classified here; everything else reaches the outer catch with no carrier and
+ * stays undiagnosed.
+ */
+async function awaitAnthropicTransportResponse<T>(request: () => Promise<T>): Promise<T> {
+	try {
+		return await request();
+	} catch (error) {
+		if (typeof error === "object" && error !== null)
+			attachProviderDiagnostic(error, anthropicProviderDiagnosticFromError(error));
+		throw error;
+	}
 }
 
 async function getAnthropicStreamResponse(
@@ -1729,6 +1761,23 @@ function isTransientStreamEnvelopeError(error: unknown): boolean {
 	return (
 		error.message.includes(ANTHROPIC_STREAM_ENVELOPE_ERROR_PREFIX) ||
 		/stream event order|before message_start|before terminal stop signal/i.test(error.message)
+	);
+}
+
+/**
+ * A request whose connection failed before the server returned any response:
+ * the SDK's connection error, or a reset/closed/refused socket with no HTTP status.
+ */
+function isPreResponseConnectionFailure(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	if (extractHttpStatusFromError(error) !== undefined) return false;
+	if (error instanceof Anthropic.APIConnectionTimeoutError) return false;
+	if (error instanceof Anthropic.APIConnectionError) return true;
+	const code = (error as { code?: unknown }).code;
+	if (typeof code === "string" && /^(?:ECONNRESET|ECONNREFUSED|EPIPE|ENOTFOUND|EAI_AGAIN)$/.test(code)) return true;
+	return (
+		isUnexpectedSocketCloseMessage(error.message) ||
+		/\b(?:ECONNRESET|ECONNREFUSED|EPIPE)\b|^connection error\.?$|other side closed/i.test(error.message)
 	);
 }
 
@@ -2137,6 +2186,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				output.responseId = undefined;
 				output.errorKind = undefined;
 				output.errorStatus = undefined;
+				output.providerDiagnostic = undefined;
 				output.errorMessage = strictFallbackErrorMessage;
 				output.providerPayload = undefined;
 				output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
@@ -2199,10 +2249,12 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						events: anthropicStream,
 						response,
 						requestId,
-					} = await getAnthropicStreamResponse(
-						anthropicRequest,
-						requestSignal,
-						options?.client ? event => options?.onSseEvent?.(event, model, options?.attemptScope) : undefined,
+					} = await awaitAnthropicTransportResponse(() =>
+						getAnthropicStreamResponse(
+							anthropicRequest,
+							requestSignal,
+							options?.client ? event => options?.onSseEvent?.(event, model, options?.attemptScope) : undefined,
+						),
 					);
 					await notifyProviderResponse(options, response, model, requestId);
 					firstEventWaitStartedAt = Date.now();
@@ -2637,7 +2689,14 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					// Otherwise the multi-megabyte body is re-uploaded up to the default
 					// streamMaxRetries budget despite the ceiling. Once iteration has
 					// begun, only the grace-clock path above decides.
-					if (requestUploadCeilingBound && firstEventWaitStartedAt === undefined) {
+					// A connection that dropped before any response (reset, socket closed,
+					// connect failure) is exempt: the server never answered, so a retry is
+					// not a re-upload after a stall, and a network blip must not end the turn.
+					if (
+						requestUploadCeilingBound &&
+						firstEventWaitStartedAt === undefined &&
+						!isPreResponseConnectionFailure(streamFailure)
+					) {
 						Object.assign(streamFailure as Error, {
 							requestBytes,
 							endpointClass,
@@ -3047,6 +3106,17 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			const localAbortReason = activeAbortTracker.getLocalAbortReason();
 			output.stopReason = activeAbortTracker.wasCallerAbort() ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(localAbortReason ?? error);
+			// Additive provider classification. A caller abort or a local managed
+			// failure keeps its existing precedence and is never relabelled with
+			// provider evidence; the SSE carrier wins over a fresh read because it
+			// saw the protocol envelope before it became a message.
+			if (localAbortReason === undefined && !activeAbortTracker.wasCallerAbort()) {
+				// Carrier only. This catch also sees callback, compat and local
+				// failures, so re-reading the error's shape here would credit them
+				// with HTTP provenance they never had.
+				const diagnostic = readProviderDiagnostic(error);
+				if (diagnostic !== undefined) output.providerDiagnostic = diagnostic;
+			}
 			output.transportFailure = transportFailureFacts(localAbortReason ?? error) ?? output.transportFailure;
 			if (output.errorKind !== "provider_safety_stop" || !output.errorMessage) {
 				output.errorMessage =

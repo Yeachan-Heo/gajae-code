@@ -21,10 +21,13 @@
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
 | `id` | `string` | Yes | Stable identifier used in multi-question results. |
-| `question` | `string` | Yes | Prompt text shown to the user. |
+| `question` | `string` | Yes | Non-empty prompt text shown to the user; whitespace-only bodies are rejected before any selector or gate opens. |
 | `options` | `{ label: string }[]` | Yes | Explicit options. The UI always appends `Other (type your own)`; callers must not include it. |
 | `multi` | `boolean` | No | Enables multi-select mode. Default: `false`. |
 | `recommended` | `number` | No | Zero-based recommended option index. In single-select mode the label gets ` (Recommended)` appended in the UI. |
+| `deepInterview` | `object` | In an active interview | Structured round metadata. Round 0 requires `round: 0`, `component: "review-topology"`, `dimension: "topology"`, `ambiguity`, and `intent_contract` containing the displayed intent items and affirmative labels. Subsequent rounds require a positive round, component, dimension, and ambiguity. |
+
+While deep-interview state is in `current_phase: "interviewing"`, calls contain exactly one question. After native final-spec persistence moves the workflow to `handoff`, next-workflow and approval choices use ordinary asks without round metadata. Metadata belongs on that question, not in an additional `metadata` or `ignore` question. Question prose and `workflowGate` do not substitute for `deepInterview`: only the structured metadata lets the recorder persist the answer and lock confirmed intent. Ordinary asks still support multiple questions and free-text-only questions with `options: []`.
 
 ## Outputs
 - Single-shot result.
@@ -79,7 +82,7 @@
 - Abort signal during input: converted to `ToolAbortError("Ask input was cancelled")`.
 - Remote answer source closes the ask: throws `ToolAbortError("Ask was cancelled by the remote client")`.
 - `GJC_ASK_ANSWER_DEADLINE_MS` expires with no answer: throws `ToolAbortError("Ask was aborted: no answer was received within Ns of the headless ask answer deadline")`.
-- Empty `questions` at runtime returns a text error payload instead of throwing: `Error: questions must not be empty`.
+- Invalid inputs throw before opening a selector, registering an answer source, or emitting a gate, including direct execution calls. Empty question arrays, blank question bodies, missing active-interview metadata, and multiple active-interview questions are rejected with actionable validation errors.
 
 ## Notes
 - `recommended` is only a UI hint; invalid indexes are ignored.

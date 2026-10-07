@@ -79,3 +79,48 @@ export function assertAuthenticatedOrLoopback(bind: ParsedBind, bearerTokenCount
 		`${serverName} refuses to bind ${bind.hostname}:${bind.port} without bearer tokens; unauthenticated mode is loopback-only.`,
 	);
 }
+
+function parseHostPort(raw: string): number | null {
+	if (!/^\d+$/.test(raw)) return null;
+	const port = Number.parseInt(raw, 10);
+	if (port < 0 || port > 65535) return null;
+	return port;
+}
+
+/** Split an HTTP Host header into a hostname and an explicit port. */
+function parseHostHeader(value: string): { hostname: string; port: number } | null {
+	if (value.startsWith("[")) {
+		const end = value.indexOf("]");
+		if (end <= 1) return null;
+		const rest = value.slice(end + 1);
+		if (!rest.startsWith(":")) return null;
+		const port = parseHostPort(rest.slice(1));
+		if (port === null) return null;
+		return { hostname: value.slice(1, end), port };
+	}
+	const colon = value.lastIndexOf(":");
+	if (colon <= 0 || value.indexOf(":") !== colon) return null;
+	const port = parseHostPort(value.slice(colon + 1));
+	if (port === null) return null;
+	const hostname = value.slice(0, colon);
+	if (hostname.length === 0) return null;
+	return { hostname, port };
+}
+
+/**
+ * Tokenless loopback brokers accept a request only when its Host header is the
+ * bound hostname and port. A DNS-rebound same-origin GET sends the attacker's
+ * name and no Origin header.
+ */
+export function hostHeaderMatchesBind(hostHeader: string | null, bind: ParsedBind): boolean {
+	if (hostHeader === null) return false;
+	const trimmed = hostHeader.trim();
+	if (trimmed.length === 0 || /[\s@]/.test(trimmed)) return false;
+	const parsed = parseHostHeader(trimmed);
+	if (!parsed) return false;
+	const bindHost = bind.hostname
+		.trim()
+		.toLowerCase()
+		.replace(/^\[|\]$/g, "");
+	return parsed.hostname.toLowerCase() === bindHost && parsed.port === bind.port;
+}

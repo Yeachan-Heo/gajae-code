@@ -62,11 +62,17 @@ function envBool(value: string | undefined): boolean | undefined {
 	return ["true", "1", "yes"].includes(value.toLowerCase());
 }
 
-/** Coerce an env var value into an int, returning undefined for non-numeric input. */
+/**
+ * Coerce an env var value into a non-negative int, returning undefined (so the
+ * settings value applies) for anything that is not plain digits. `parseInt`
+ * alone would read "5turns" as 5, "1e3" as 1 and "-3" as -3.
+ */
 function envInt(value: string | undefined): number | undefined {
 	if (value === undefined) return undefined;
-	const n = Number.parseInt(value, 10);
-	return Number.isFinite(n) ? n : undefined;
+	const trimmed = value.trim();
+	if (!/^\d+$/.test(trimmed)) return undefined;
+	const n = Number(trimmed);
+	return Number.isSafeInteger(n) ? n : undefined;
 }
 
 function envString(value: string | undefined): string | undefined {

@@ -1175,15 +1175,52 @@ export interface OpenGatewayModelManagerConfig {
 	baseUrl?: string;
 }
 
+const OPENGATEWAY_BASE_URL = "https://apis.opengateway.ai/v1";
+/** OpenGateway serves accelerated deployments of an upstream model as `<upstream id>-ultrafast`. */
+const OPENGATEWAY_ULTRAFAST_SUFFIX = "-ultrafast";
+
 /**
  * OpenGateway by Sionic AI — an OpenAI-compatible gateway that fronts OpenAI,
- * Anthropic, and Google models behind one API key. Models are discovered from
- * the OpenAI-compatible `/v1/models` endpoint.
+ * Anthropic, Google, DeepSeek, Z.ai, Moonshot and Qwen models behind one API key.
+ * Models are discovered from the OpenAI-compatible `/v1/models` endpoint, which
+ * reports no capability metadata, so capabilities come from the bundled catalog:
+ * the OpenGateway entry first, then the same upstream id from any bundled
+ * provider, with `-ultrafast` deployments resolved to their upstream model.
  */
 export function opengatewayModelManagerOptions(
 	config?: OpenGatewayModelManagerConfig,
 ): ModelManagerOptions<"openai-completions"> {
-	return createSimpleOpenAICompletionsOptions("opengateway", "https://apis.opengateway.ai/v1", config);
+	const apiKey = config?.apiKey;
+	const baseUrl = config?.baseUrl ?? OPENGATEWAY_BASE_URL;
+	const resolveReference = createReferenceResolver(createBundledReferenceMap<"openai-completions">("opengateway"));
+	return {
+		providerId: "opengateway",
+		...(apiKey && {
+			fetchDynamicModels: () =>
+				fetchOpenAICompatibleModels({
+					api: "openai-completions",
+					provider: "opengateway",
+					baseUrl,
+					apiKey,
+					mapModel: (entry, defaults) => {
+						const reference =
+							resolveReference(defaults.id) ??
+							(defaults.id.endsWith(OPENGATEWAY_ULTRAFAST_SUFFIX)
+								? resolveReference(defaults.id.slice(0, -OPENGATEWAY_ULTRAFAST_SUFFIX.length))
+								: undefined);
+						const mapped = mapWithBundledReference(entry, defaults, reference);
+						return {
+							...mapped,
+							contextWindow: toPositiveNumber(entry.context_window, mapped.contextWindow),
+							maxTokens: toPositiveNumber(entry.max_output_tokens, mapped.maxTokens),
+							api: "openai-completions",
+							provider: "opengateway",
+							baseUrl,
+						};
+					},
+				}),
+		}),
+	};
 }
 
 // ---------------------------------------------------------------------------

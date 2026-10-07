@@ -4,7 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "../src/extensibility/extensions";
 import { Broker } from "../src/sdk/broker/broker";
-import { ensureBroker } from "../src/sdk/broker/ensure";
+import { type BrokerDiscovery, readBrokerDiscovery } from "../src/sdk/broker/discovery";
+import type { EnsureBrokerSettings } from "../src/sdk/broker/ensure";
 import { SessionIndex, type SessionIndexEvent } from "../src/sdk/broker/session-index";
 import { createSdkSessionRuntimeExtension } from "../src/sdk/host/session-runtime";
 import {
@@ -15,6 +16,13 @@ import {
 } from "../src/sdk/lifecycle/service";
 
 const actor = { id: "42", namespace: "telegram:account-fingerprint" } as const;
+
+// These fixtures own in-process brokers; discovery must not create detached daemons.
+async function discoverFixtureBroker({ agentDir }: EnsureBrokerSettings): Promise<BrokerDiscovery> {
+	const discovery = await readBrokerDiscovery(agentDir);
+	if (!discovery) throw new Error("Fixture broker is unavailable.");
+	return discovery;
+}
 
 function sdkContext(sessionId: string, cwd: string): ExtensionContext {
 	return {
@@ -125,7 +133,8 @@ test("four live SDK hosts recover broker index heartbeats without recreating ses
 	let ensureInFlight = 0;
 	let failEnsures = false;
 	let releaseFailure: PromiseWithResolvers<void> | undefined;
-	const ensureForTest: typeof ensureBroker = async input => {
+	const timersArmed = Promise.withResolvers<void>();
+	const ensureForTest = async (input: EnsureBrokerSettings): Promise<BrokerDiscovery> => {
 		ensureCalls++;
 		ensureInFlight++;
 		try {
@@ -134,7 +143,7 @@ test("four live SDK hosts recover broker index heartbeats without recreating ses
 				await releaseFailure?.promise;
 				throw new Error("injected broker recovery failure");
 			}
-			return await ensureBroker(input);
+			return await discoverFixtureBroker(input);
 		} finally {
 			ensureInFlight--;
 		}
@@ -171,6 +180,7 @@ test("four live SDK hosts recover broker index heartbeats without recreating ses
 						},
 					};
 					timerRecords.push(timer);
+					if (timerRecords.length === 4) timersArmed.resolve();
 					return timer as unknown as NodeJS.Timeout;
 				}) as typeof setInterval,
 				clearIntervalImpl: ((timer: NodeJS.Timeout) => {
@@ -207,6 +217,8 @@ test("four live SDK hosts recover broker index heartbeats without recreating ses
 			hosts.push({ handlers, context, stats });
 			await hosts[index]!.handlers.get("session_start")?.({}, context);
 		}
+		// Optional hosts arm recovery once their startup registration settles.
+		await timersArmed.promise;
 		expect(transportStats.map(stats => stats.starts)).toEqual([1, 1, 1, 1]);
 		expect(timerRecords).toHaveLength(4);
 		expect(timerRecords.every(timer => timer.unrefCalls === 1)).toBe(true);
@@ -218,7 +230,12 @@ test("four live SDK hosts recover broker index heartbeats without recreating ses
 		const firstTimer = timerRecords[0]!;
 		firstTimer.callback();
 		firstTimer.callback();
-		await Bun.sleep(0);
+		// Recovery awaits the (bounded) runtime-image replacement probe, a real
+		// fs.stat, before ensuring the broker, so the first ensure can land after
+		// more than one tick under load. Wait for it, then give a duplicate the
+		// same window to show up before asserting the single-flight guard held.
+		for (let attempt = 0; attempt < 200 && failingEnsureCalls === 0; attempt++) await Bun.sleep(5);
+		for (let attempt = 0; attempt < 10; attempt++) await Bun.sleep(5);
 		expect(failingEnsureCalls).toBe(1);
 		releaseFailure?.resolve();
 		for (let attempt = 0; attempt < 100 && ensureInFlight > 0; attempt++) await Bun.sleep(1);
@@ -272,6 +289,16 @@ for (const replacement of [false, true]) {
 		const releasePublication = Promise.withResolvers<void>();
 		const published = Promise.withResolvers<SessionIndexEvent>();
 		const releaseResult = Promise.withResolvers<void>();
+		const retired = Promise.withResolvers<void>();
+		const unregister = SessionIndex.prototype.unregisterIfCurrent;
+		const unregisterSpy = spyOn(SessionIndex.prototype, "unregisterIfCurrent").mockImplementation(async function (
+			this: SessionIndex,
+			...args
+		) {
+			const result = await unregister.apply(this, args);
+			retired.resolve();
+			return result;
+		});
 		const append = SessionIndex.prototype.append;
 		const appendSpy = spyOn(SessionIndex.prototype, "append").mockImplementation(async function (
 			this: SessionIndex,
@@ -293,6 +320,7 @@ for (const replacement of [false, true]) {
 			await broker.start();
 			createSdkSessionRuntimeExtension(api, {
 				agentDir,
+				ensureBrokerImpl: discoverFixtureBroker,
 				createTransport: async ({ sessionId: transportSessionId, stateRoot, token }) => ({
 					sessionId: transportSessionId,
 					stateRoot,
@@ -345,6 +373,7 @@ for (const replacement of [false, true]) {
 			}
 			releaseResult.resolve();
 			await starting;
+			await retired.promise;
 			await index.refresh();
 			const current = index.listSessions().sessions.find(session => session.sessionId === sessionId);
 			if (replacement) {
@@ -361,6 +390,7 @@ for (const replacement of [false, true]) {
 			appendSpy.mockRestore();
 			await handlers.get("session_shutdown")?.({}, context);
 			await broker?.stop();
+			unregisterSpy.mockRestore();
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
@@ -379,6 +409,7 @@ test("stopping a host while broker ensure is pending cannot register it after di
 	} as unknown as ExtensionAPI;
 	const ensureEntered = Promise.withResolvers<void>();
 	const ensureRelease = Promise.withResolvers<void>();
+	const ensureCompleted = Promise.withResolvers<void>();
 	let timerCount = 0;
 	let transportStops = 0;
 	let broker: Broker | undefined;
@@ -390,7 +421,9 @@ test("stopping a host while broker ensure is pending cannot register it after di
 			ensureBrokerImpl: async input => {
 				ensureEntered.resolve();
 				await ensureRelease.promise;
-				return await ensureBroker(input);
+				const discovery = await discoverFixtureBroker(input);
+				ensureCompleted.resolve();
+				return discovery;
 			},
 			setIntervalImpl: ((callback: () => void) => {
 				timerCount++;
@@ -431,6 +464,8 @@ test("stopping a host while broker ensure is pending cannot register it after di
 		await stop({}, context);
 		ensureRelease.resolve();
 		await starting;
+		await ensureCompleted.promise;
+		await Bun.sleep(0);
 		await broker.index.refresh();
 		expect(broker.index.listSessions().sessions.some(session => session.sessionId === sessionId)).toBe(false);
 		expect(timerCount).toBe(0);

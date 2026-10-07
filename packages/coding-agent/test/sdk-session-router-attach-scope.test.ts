@@ -19,8 +19,13 @@ const SESSION_IDS = ["scoped-session", "unrelated-session"] as const;
  * Router actually opened a transport for: attaching is what registers this
  * process as a live client on that host, so it is the behaviour under test.
  */
-async function scopedRouterFixture(sessionIds?: readonly string[]): Promise<{
+async function scopedRouterFixture(
+	sessionIds?: readonly string[],
+	attachFilter?: (sessionId: string) => boolean,
+): Promise<{
 	attached: string[];
+	closed: string[];
+	router: SessionRouter;
 	stop: () => Promise<void>;
 }> {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-router-attach-scope-"));
@@ -62,9 +67,11 @@ async function scopedRouterFixture(sessionIds?: readonly string[]): Promise<{
 	} as unknown as SessionIndex;
 
 	const attached: string[] = [];
+	const closed: string[] = [];
 	const router = new SessionRouter({
 		agentDir,
 		...(sessionIds === undefined ? {} : { sessionIds }),
+		...(attachFilter === undefined ? {} : { attachFilter }),
 		deps: {
 			createIndex: () => index,
 			createClient: async authority => {
@@ -73,7 +80,9 @@ async function scopedRouterFixture(sessionIds?: readonly string[]): Promise<{
 					onFrame: () => () => {},
 					onReconnect: () => () => {},
 					request: async () => ({ ok: true, generation: 1, lastSeq: 0, events: [] }),
-					close: async () => {},
+					close: async () => {
+						closed.push(authority.sessionId);
+					},
 					send: () => {},
 				};
 				return client;
@@ -81,7 +90,7 @@ async function scopedRouterFixture(sessionIds?: readonly string[]): Promise<{
 		},
 	});
 	await router.start();
-	return { attached, stop: async () => await router.stop() };
+	return { attached, closed, router, stop: async () => await router.stop() };
 }
 
 test("an unscoped Router attaches to every live indexed session", async () => {
@@ -114,6 +123,25 @@ test("a Router scoped to one session never attaches to an unrelated live session
 	const { attached, stop } = await scopedRouterFixture(["scoped-session"]);
 	try {
 		expect(attached).toEqual(["scoped-session"]);
+	} finally {
+		await stop();
+	}
+});
+
+test("a Router dynamic scope attaches additions and detaches removals", async () => {
+	const scope = new Set(["scoped-session"]);
+	const { attached, closed, router, stop } = await scopedRouterFixture(undefined, sessionId => scope.has(sessionId));
+	try {
+		expect([...attached].sort()).toEqual(["scoped-session"]);
+
+		scope.add("unrelated-session");
+		await router.reconcile();
+		expect([...attached].sort()).toEqual(["scoped-session", "unrelated-session"]);
+
+		scope.delete("scoped-session");
+		await router.reconcile();
+		expect(router.attachment("scoped-session")).toBeNull();
+		expect(closed).toContain("scoped-session");
 	} finally {
 		await stop();
 	}

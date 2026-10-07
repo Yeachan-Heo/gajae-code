@@ -134,7 +134,9 @@ export class SSHCommandController {
 					this.ctx.showError("Missing value for --port.");
 					return;
 				}
-				const parsed = Number.parseInt(value, 10);
+				// Same rule as the ACP `/ssh add` parser: `Number.parseInt` accepts
+				// trailing garbage ("22oops" -> 22), which would save a typo as a port.
+				const parsed = /^\d+$/.test(value) ? Number.parseInt(value, 10) : Number.NaN;
 				if (Number.isNaN(parsed) || parsed < 1 || parsed > 65535) {
 					this.ctx.showError("Invalid --port value. Must be an integer between 1 and 65535.");
 					return;

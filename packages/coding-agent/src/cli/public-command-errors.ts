@@ -20,6 +20,7 @@ export type PublicFailureKind =
 	| "timeout"
 	| "wait_timeout"
 	| "uncertain_after_send"
+	| "busy"
 	| "daemon_unhealthy"
 	| "daemon_stale"
 	| "daemon_mixed"
@@ -100,6 +101,10 @@ export const PUBLIC_COMMAND_DIAGNOSTICS = {
 		"The macOS open-file limit is below the recommended minimum; increase it before starting additional concurrent work.",
 	sdk_resource_gone:
 		"The requested resource is not available from this session endpoint; this reports absent resource state, not an empty result.",
+	sdk_unknown_operation:
+		"The --op value is not a known SDK operation id for this command. Per-session control ids include turn.prompt, turn.steer, turn.follow_up, turn.abort and turn.abort_and_prompt.",
+	sdk_scope_requires_repository:
+		"The selected session-list scope requires a Git repository. Run inside a checkout, pass --repo <path>, or use --scope cwd or --scope all.",
 	router_cleanup_failed: "SDK session Router cleanup failed.",
 	broker_cleanup_failed: "SDK broker client cleanup failed.",
 	// The broker reports this code from several distinct causes, so the text names none
@@ -162,6 +167,7 @@ const messages: Record<PublicFailureKind, string> = {
 	timeout: "The operation timed out; its outcome requires reconciliation.",
 	wait_timeout: "Waiting timed out after the operation was accepted. Do not replay it.",
 	uncertain_after_send: "The request was sent but its outcome is uncertain. Reconcile before any replay.",
+	busy: "The session is running a turn and refused the request.",
 	daemon_unhealthy: "The selected daemon is unhealthy.",
 	daemon_stale: "The selected daemon has stale runtime state.",
 	daemon_mixed: "Some daemon targets failed. Do not repeat mutations that already succeeded.",
@@ -282,6 +288,9 @@ export function classifyPublicCommandFailure(
 	else if (kind === "uncertain_after_send") {
 		category = "uncertain";
 		outcomeCertainty = "unknown";
+	} else if (kind === "busy") {
+		category = "unavailable";
+		if (outcomeCertainty === "not-applied") retryability = "yes";
 	} else if (
 		[
 			"unavailable",
@@ -325,7 +334,18 @@ export function classifyPublicCommandFailure(
 			nextSteps.push(step("Wait for the existing restart to finish, then inspect status; do not restart again."));
 		const session = references.find(ref => ref.kind === "sessionId");
 		const operation = references.find(ref => ref.kind === "operationRef");
-		if (
+		if (kind === "busy" && canonical[0] === "sdk" && outcomeCertainty === "not-applied") {
+			// A refused-before-execution request has no operation record to reconcile:
+			// point at the busy turn instead of a status lookup that can only say unknown.
+			nextSteps.push(
+				step(
+					"Steer the active turn with `sdk session raw control <sessionId> --op turn.steer`, or wait until the session is idle before sending again.",
+					session && executableValue(session.value)
+						? ["sdk", "session", "inspect", session.value]
+						: ["sdk", "session", "list"],
+				),
+			);
+		} else if (
 			canonical[0] === "sdk" &&
 			session &&
 			operation &&

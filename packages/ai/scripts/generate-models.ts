@@ -84,6 +84,16 @@ function isRetiredBundledModel(model: Pick<Model, "provider" | "id">): boolean {
  * Only Astra carries `priority: 1`; Sol and Luna stay in default catalog order
  * so the flagship remains the first Codex suggestion.
  */
+const CODEX_GPT6_MODELS: readonly { id: string; name: string; priority?: number }[] = [
+	{ id: "gpt-6-astra", name: "GPT-6 Astra", priority: 1 },
+	{ id: "gpt-6-sol", name: "GPT-6 Sol" },
+	{ id: "gpt-6.1-sol", name: "GPT-6.1 Sol" },
+	{ id: "gpt-6-luna", name: "GPT-6 Luna" },
+];
+
+/** Codex GPT-6 ids that are re-injected with unknown limits; seed rows for them are reset. */
+export const CODEX_GPT6_IDS: ReadonlySet<string> = new Set(CODEX_GPT6_MODELS.map(model => model.id));
+
 export function injectCodexGpt6Models(models: Model[]): void {
 	const gpt6 = (id: string, name: string, priority?: number): Model<"openai-codex-responses"> => ({
 		id,
@@ -94,17 +104,13 @@ export function injectCodexGpt6Models(models: Model[]): void {
 		reasoning: true,
 		input: ["text", "image"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 272_000,
-		maxTokens: 128_000,
+		contextWindow: UNK_CONTEXT_WINDOW,
+		maxTokens: UNK_MAX_TOKENS,
 		preferWebsockets: true,
 		...(priority === undefined ? {} : { priority }),
 	});
-	const bundled: Model<"openai-codex-responses">[] = [
-		gpt6("gpt-6-astra", "GPT-6-Astra", 1),
-		gpt6("gpt-6-sol", "GPT-6-Sol"),
-		gpt6("gpt-6-luna", "GPT-6-Luna"),
-	];
-	for (const model of bundled) {
+	for (const { id, name, priority } of CODEX_GPT6_MODELS) {
+		const model = gpt6(id, name, priority);
 		const exists = models.some(existing => existing.provider === model.provider && existing.id === model.id);
 		if (!exists) models.push(model);
 	}
@@ -523,6 +529,59 @@ function inheritModelsDevLimit(value: number, referenceValue: number, unspecifie
 	return value === unspecifiedValue ? referenceValue : value;
 }
 
+export interface SeedLimitPreservation {
+	contextWindow: number | undefined;
+	maxTokens: number | undefined;
+}
+
+/**
+ * Preserve known limits from seed models that will be excluded during regeneration.
+ * This ensures that if discovery fails, we can restore known values instead of
+ * persisting UNK markers that cause premature compaction and capacity understatement.
+ */
+function preserveSeedLimits(
+	prevModelsJson: Record<string, Record<string, Model>>,
+	codexGpt6Ids: ReadonlySet<string>,
+): Map<string, SeedLimitPreservation> {
+	const preserved = new Map<string, SeedLimitPreservation>();
+	for (const models of Object.values(prevModelsJson)) {
+		for (const model of Object.values(models)) {
+			if (model.provider === "openai-codex" && codexGpt6Ids.has(model.id)) {
+				const key = `${model.provider}/${model.id}`;
+				preserved.set(key, {
+					contextWindow: model.contextWindow,
+					maxTokens: model.maxTokens,
+				});
+			}
+		}
+	}
+	return preserved;
+}
+
+/**
+ * Restore known seed limits for models that still have UNK markers after discovery.
+ * This protects against transient external failures (unavailable models.dev, network issues)
+ * that would otherwise overwrite resolved limits with unknown markers.
+ */
+export function restoreSeedLimits(models: Model[], seedLimits: Map<string, SeedLimitPreservation>): Model[] {
+	return models.map(model => {
+		const preserved = seedLimits.get(`${model.provider}/${model.id}`);
+		if (!preserved) {
+			return model;
+		}
+		// Each limit is restored independently: discovery can leave either or both unknown.
+		const contextWindow =
+			model.contextWindow === UNK_CONTEXT_WINDOW
+				? (preserved.contextWindow ?? model.contextWindow)
+				: model.contextWindow;
+		const maxTokens = model.maxTokens === UNK_MAX_TOKENS ? (preserved.maxTokens ?? model.maxTokens) : model.maxTokens;
+		if (contextWindow === model.contextWindow && maxTokens === model.maxTokens) {
+			return model;
+		}
+		return { ...model, contextWindow, maxTokens };
+	});
+}
+
 function applyGlobalModelsDevFallback(models: readonly Model[], modelsDevModels: readonly Model[]): Model[] {
 	const providerScopedKeys = new Set(modelsDevModels.map(model => `${model.provider}/${model.id}`));
 	const globalReferences = createGlobalModelsDevReferenceMap(modelsDevModels);
@@ -534,13 +593,23 @@ function applyGlobalModelsDevFallback(models: readonly Model[], modelsDevModels:
 		if (!reference) {
 			return model;
 		}
+		// For Codex models, inherit all metadata from models.dev to ensure consistency.
+		// For provider-specific models (kiro, junie, etc.), only inherit limits to preserve
+		// their own capability definitions and naming.
+		if (model.provider === "openai-codex") {
+			return {
+				...model,
+				name: reference.name,
+				reasoning: reference.reasoning,
+				input: reference.input,
+				// Fill unknown endpoint limits from same-id models.dev references.
+				contextWindow: inheritModelsDevLimit(model.contextWindow, reference.contextWindow, UNK_CONTEXT_WINDOW),
+				maxTokens: inheritModelsDevLimit(model.maxTokens, reference.maxTokens, UNK_MAX_TOKENS),
+			};
+		}
+		// For other providers, only fill unknown limits, preserving provider-specific metadata.
 		return {
 			...model,
-			name: reference.name,
-			reasoning: reference.reasoning,
-			input: reference.input,
-			// Fill unknown endpoint limits from same-id models.dev references, but keep
-			// provider-specific values when discovery returned them explicitly.
 			contextWindow: inheritModelsDevLimit(model.contextWindow, reference.contextWindow, UNK_CONTEXT_WINDOW),
 			maxTokens: inheritModelsDevLimit(model.maxTokens, reference.maxTokens, UNK_MAX_TOKENS),
 		};
@@ -789,15 +858,21 @@ async function generateModels() {
 	// credentials are unavailable, and ad-hoc model additions all persist
 	// through the existing models.json seed.
 	// Discovery-only providers (local inference servers) — never bundle static models.
+	// Skip Codex gpt-6 models: they will be re-injected with UNK limits to inherit from models.dev.
 	const discoveryOnlyProviders = new Set(["ollama", "sglang", "vllm"]);
+	const codexGpt6Ids = CODEX_GPT6_IDS;
 	const fetchedKeys = new Set(allModels.map(model => `${model.provider}/${model.id}`));
+
+	// Preserve known limits from seed models that will be excluded, in case discovery fails
+	const seedLimits = preserveSeedLimits(prevModelsJson as Record<string, Record<string, Model>>, codexGpt6Ids);
 
 	for (const models of Object.values(prevModelsJson as Record<string, Record<string, Model>>)) {
 		for (const model of Object.values(models)) {
 			if (
 				!fetchedKeys.has(`${model.provider}/${model.id}`) &&
 				!discoveryOnlyProviders.has(model.provider) &&
-				!isRetiredBundledModel(model)
+				!isRetiredBundledModel(model) &&
+				!(model.provider === "openai-codex" && codexGpt6Ids.has(model.id))
 			) {
 				allModels.push(model.provider === "openai" ? { ...model, baseUrl: "" } : model);
 			}
@@ -813,6 +888,13 @@ async function generateModels() {
 	injectAlibabaTokenPlanModels(allModels);
 	injectJetBrainsJunieModels(allModels);
 	injectKiroModels(allModels);
+	// Re-apply models.dev fallback after injections to inherit context/token limits
+	// from models.dev for injected models that use UNK_CONTEXT_WINDOW and UNK_MAX_TOKENS.
+	allModels = applyGlobalModelsDevFallback(allModels, modelsDevModels);
+	// Restore known seed limits for Codex models that still have UNK markers after discovery.
+	// This protects against transient failures (unavailable models.dev, network issues) that
+	// would otherwise overwrite known limits with unknown markers.
+	allModels = restoreSeedLimits(allModels, seedLimits);
 	applyGeneratedModelPolicies(allModels);
 	// This provider-specific correction must run after generic policy inference,
 	// which otherwise caps unknown OpenAI-compatible models at `high`.

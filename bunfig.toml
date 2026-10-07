@@ -18,6 +18,12 @@ pathIgnorePatterns = [
   "**/node_modules/**",
   ".wt/**",
   ".worktrees/**",
+  # Untracked test working space (AGENTS.md, issue #4420). Debugging and
+  # red-team runs leave full repository checkouts here, and `bun test <path>`
+  # resolves through the whole tree: without this, a targeted run silently
+  # collects every nested copy and reports foreign failures under
+  # `artifacts/<name>/scripts/...`.
+  "artifacts/**",
 ]
 
 [run]

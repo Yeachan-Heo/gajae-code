@@ -9,8 +9,8 @@ import {
 
 const CI_WORKFLOW = ".github/workflows/ci.yml";
 const DEV_CI_WORKFLOW = ".github/workflows/dev-ci.yml";
-const PR_VALIDATION_WORKFLOW = ".github/workflows/pr-validation.yml";
 const SPOOFED_VERSION_WORKFLOW = ".github/workflows/spoofed-version-sync.yml";
+
 const repoRoot = `${import.meta.dir}/..`;
 
 async function parsedWorkflow(file: string): Promise<Record<string, unknown>> {
@@ -39,7 +39,7 @@ describe("workflow permission policy", () => {
 		expect(workflows.map(workflow => workflow.file)).toEqual([
 			".github/workflows/ci.yml",
 			".github/workflows/dev-ci.yml",
-			".github/workflows/pr-validation.yml",
+			".github/workflows/native-bench-ab.yml",
 			".github/workflows/public-site-sync.yml",
 			".github/workflows/spoofed-version-sync.yml",
 		]);
@@ -61,7 +61,6 @@ describe("workflow permission policy", () => {
 		expect(JOB_WRITE_ALLOWLIST).toEqual([
 			{ workflow: CI_WORKFLOW, job: "release_finalize", scope: "contents" },
 			{ workflow: CI_WORKFLOW, job: "publish", scope: "id-token" },
-			{ workflow: PR_VALIDATION_WORKFLOW, job: "validate", scope: "checks" },
 		]);
 		expect(jobWriteScopes(document)).toEqual(["publish.id-token", "release_finalize.contents"]);
 	});
@@ -77,21 +76,6 @@ describe("workflow permission policy", () => {
 		expect(jobWriteScopes(document)).toEqual([]);
 	});
 
-	test("pr-validation.yml has an exact read-scoped workflow default and only the allowlisted checks write job", async () => {
-		const workflows = await readWorkflowDocuments();
-		const prValidation = workflows.find(workflow => workflow.file === PR_VALIDATION_WORKFLOW);
-		expect(prValidation).toBeDefined();
-		const document = documentRecord(prValidation!.document);
-
-		expect(REQUIRED_READ_DEFAULT).toContain(PR_VALIDATION_WORKFLOW);
-		expect(document.permissions).toEqual({ contents: "read", "pull-requests": "read" });
-		// The validate job publishes a head-bound check run under the required
-		// context name for issue_comment runs (issue #4703); it is the only
-		// allowlisted write scope in this workflow.
-		expect(jobWriteScopes(document)).toEqual(["validate.checks"]);
-		expect(JOB_WRITE_ALLOWLIST).toContainEqual({ workflow: PR_VALIDATION_WORKFLOW, job: "validate", scope: "checks" });
-	});
-
 	test("spoofed-version-sync.yml detects drift with no write scope anywhere", async () => {
 		const workflows = await readWorkflowDocuments();
 		const spoofedVersion = workflows.find(workflow => workflow.file === SPOOFED_VERSION_WORKFLOW);
@@ -99,12 +83,22 @@ describe("workflow permission policy", () => {
 		const document = documentRecord(spoofedVersion!.document);
 
 		// The scheduled drift check reports; it never pushes a branch or opens a
-		// pull request. dev requires the signed exact-head PR contract, so write
+		// pull request. dev requires an approving maintainer review, so write
 		// scopes here could not remove the human step they would be bought for.
 		expect(REQUIRED_READ_DEFAULT).toContain(SPOOFED_VERSION_WORKFLOW);
 		expect(document.permissions).toEqual({ contents: "read" });
 		expect(jobWriteScopes(document)).toEqual([]);
 		expect(JOB_WRITE_ALLOWLIST.some(entry => entry.workflow === SPOOFED_VERSION_WORKFLOW)).toBe(false);
+	});
+
+	test("native-bench-ab.yml has an exact read-scoped workflow default and no write job scope", async () => {
+		const workflows = await readWorkflowDocuments();
+		const nativeBench = workflows.find(workflow => workflow.file === ".github/workflows/native-bench-ab.yml");
+		expect(nativeBench).toBeDefined();
+		const document = documentRecord(nativeBench!.document);
+
+		expect(document.permissions).toEqual({ contents: "read" });
+		expect(jobWriteScopes(document)).toEqual([]);
 	});
 
 	test("detects a ci.yml workflow contents write mutation", async () => {

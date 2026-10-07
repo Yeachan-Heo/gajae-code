@@ -174,11 +174,17 @@ const WorkflowGateMeta = z.object({
 	kind: z.enum(["question", "approval", "execution"]).describe("workflow gate kind"),
 });
 
+const QuestionText = z
+	.string()
+	.min(1)
+	.refine(value => value.trim().length > 0, "ask question body must contain non-whitespace text")
+	.describe("non-empty question text");
+
 function createQuestionItemSchema(deepInterviewSchema: z.ZodType<DeepInterviewMeta>) {
 	return z
 		.object({
 			id: z.string().describe("question id"),
-			question: z.string().describe("question text"),
+			question: QuestionText,
 			options: z.array(OptionItem).describe("available options"),
 			multi: z.boolean().describe("allow multiple selections").optional(),
 			recommended: z.number().describe("recommended option index").optional(),
@@ -265,12 +271,20 @@ function createQuestionItemSchema(deepInterviewSchema: z.ZodType<DeepInterviewMe
 }
 
 const QuestionItem = createQuestionItemSchema(DeepInterviewMeta);
-const TopologyQuestionItem = createQuestionItemSchema(DeepInterviewTopologyMeta);
-const PostTopologyQuestionItem = createQuestionItemSchema(z.union([DeepInterviewRoundMeta, DeepInterviewReviewMeta]));
+const TopologyQuestionItem = createQuestionItemSchema(DeepInterviewTopologyMeta).safeExtend({
+	deepInterview: DeepInterviewTopologyMeta.describe("required Round 0 topology and locked-intent metadata"),
+});
+const PostTopologyQuestionItem = createQuestionItemSchema(
+	z.union([DeepInterviewRoundMeta, DeepInterviewReviewMeta]),
+).safeExtend({
+	deepInterview: z
+		.union([DeepInterviewRoundMeta, DeepInterviewReviewMeta])
+		.describe("required positive-round interview metadata"),
+});
 
 const OrdinaryQuestionItem = z.object({
 	id: z.string().describe("question id"),
-	question: z.string().describe("question text"),
+	question: QuestionText,
 	options: z.array(OptionItem).describe("available options"),
 	multi: z.boolean().describe("allow multiple selections").optional(),
 	recommended: z.number().describe("recommended option index").optional(),
@@ -282,11 +296,11 @@ export const askSchema = z.object({
 });
 
 export const topologyAskSchema = z.object({
-	questions: z.array(TopologyQuestionItem).min(1).describe("questions to ask"),
+	questions: z.array(TopologyQuestionItem).length(1).describe("exactly one Round 0 topology question"),
 });
 
 export const postTopologyAskSchema = z.object({
-	questions: z.array(PostTopologyQuestionItem).min(1).describe("questions to ask"),
+	questions: z.array(PostTopologyQuestionItem).length(1).describe("exactly one positive-round interview question"),
 });
 
 export const ordinaryAskSchema = z.object({
@@ -542,6 +556,41 @@ function deepInterviewPlaceholderRejection(
 	return undefined;
 }
 
+function askIntegrityRejection(
+	arguments_: Record<string, unknown>,
+	stage: DeepInterviewAskStage,
+): RawArgumentValidationResult | undefined {
+	const root = parseEncodedContainer(arguments_);
+	if (!isPlainRecord(root)) return undefined;
+	const questions = parseEncodedContainer(root.questions);
+	if (!Array.isArray(questions)) return undefined;
+	for (const [index, rawQuestion] of questions.entries()) {
+		const question = parseEncodedContainer(rawQuestion);
+		if (isPlainRecord(question) && typeof question.question === "string" && question.question.trim().length === 0)
+			return {
+				outcome: "reject",
+				code: "ask-question-body-required",
+				detail: { rejectedKeys: [`questions[${index}].question`] },
+			};
+	}
+	if (stage === undefined) return undefined;
+	if (questions.length !== 1) return { outcome: "reject", code: "ask-deep-interview-single-question-required" };
+	const question = parseEncodedContainer(questions[0]);
+	if (isPlainRecord(question) && parseEncodedContainer(question.deepInterview) == null)
+		return {
+			outcome: "reject",
+			code: "ask-deep-interview-metadata-required",
+			detail: {
+				rejectedKeys: ["questions[0].deepInterview"],
+				hint:
+					stage === "topology"
+						? 'Use round: 0, component: "review-topology", dimension: "topology", ambiguity, and intent_contract with displayed items and affirmative labels.'
+						: "Use a positive round, component, dimension, and ambiguity; include intent_review only for a locked-intent reduction review.",
+			},
+		};
+	return undefined;
+}
+
 export function recoverRoundZeroIntentContract(
 	arguments_: Record<string, unknown>,
 	stage?: "topology" | "post-topology",
@@ -549,6 +598,8 @@ export function recoverRoundZeroIntentContract(
 	const normalizedInput = normalizeRoundZeroOptionalNulls(arguments_);
 	const placeholderRejection = deepInterviewPlaceholderRejection(normalizedInput);
 	if (placeholderRejection) return placeholderRejection;
+	const integrityRejection = askIntegrityRejection(normalizedInput, stage);
+	if (integrityRejection) return integrityRejection;
 	// #4649: an incomplete Round-0 topology object (deepInterview present,
 	// required fields omitted) is NOT a retired-pair recovery candidate, so it
 	// would passthrough into generic Zod validation whose error names no contract

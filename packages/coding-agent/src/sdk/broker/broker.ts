@@ -6,9 +6,14 @@ import path from "node:path";
 import type { NativeBrokerRestartIntent, NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
 import packageJson from "../../../package.json" with { type: "json" };
+import { FileLockAcquireError } from "../../config/file-lock";
 import type { ModelProfileErrorDetails } from "../../config/model-profile-contract";
 import { planLaunchWorktree } from "../../gjc-runtime/launch-worktree";
 import { readExistingStateForMutation, withWorkflowStateLock } from "../../gjc-runtime/state-writer";
+import type {
+	TaskArtifactOwnerDeletionEvidence,
+	TaskArtifactOwnerRetirementContinuation,
+} from "../../session/task-artifact-owner-codec";
 import { SdkClient, SdkClientError } from "../client";
 import {
 	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
@@ -27,6 +32,14 @@ import {
 	type SessionListSavedSessionOmissionDetailCode,
 } from "../session-list";
 import {
+	type BrokerExitMode,
+	type BrokerExitReason,
+	type BrokerExitRecord,
+	type BrokerFenceReason,
+	type BrokerStopRequest,
+	writeBrokerExitRecord,
+} from "./broker-exit";
+import {
 	BROKER_HEARTBEAT_TTL_MS,
 	type BrokerDiscovery,
 	type BrokerPublicationObservation,
@@ -41,6 +54,7 @@ import {
 	readBrokerDiscovery,
 	readBrokerRestartIntent,
 	redactBrokerDiscovery,
+	rollbackBrokerDiscoveryIfCurrent,
 } from "./discovery";
 import { endpointIncarnation, matchesIndexedEndpointFile, readEndpointFile } from "./endpoint-authority";
 import {
@@ -118,6 +132,7 @@ import {
 	type SpawnSubstrateProvider,
 } from "./spawn-authority";
 import { createSpawnSubstrateProvider } from "./spawn-substrate";
+import type { BrokerTaskArtifactOwnerRetirementDisposition } from "./task-artifact-owner-validation";
 import { BrokerTransport } from "./transport";
 
 export interface BrokerSettings {
@@ -147,6 +162,18 @@ export interface BrokerSettings {
 	 * value its launcher decided, with no cast/assumed tag in between.
 	 */
 	restartRequestId?: string;
+	/** Cancel bootstrap before retained publication when the owning CLI receives a signal. */
+	startupAbortSignal?: AbortSignal;
+	/** Called synchronously when retained publication establishes broker readiness. */
+	onStartupReady?: () => void;
+	/** Test-only delay after session checkpoint to verify unpublished discovery ownership. */
+	startupPrePublicationDelayMs?: number;
+	/** Test-only notification at the cached-discovery, pre-publication boundary. */
+	startupPrePublicationTestHook?: () => Promise<void>;
+	/** Test-only delay hook after discovery rename and before retained publication authority. */
+	startupAfterDiscoveryWriteTestHook?: () => Promise<void>;
+	/** Test-only delay after publication to exercise signal handoff ordering. */
+	startupPostPublicationDelayMs?: number;
 }
 
 type ResolvedBrokerSettings = {
@@ -272,6 +299,19 @@ export type BrokerCleanupEvidence = {
 	retainedTranscriptSuccessorPath?: string;
 	retainedTranscriptPlaceholderPath?: string;
 	retainedTranscriptUnknownPath?: string;
+	/** Immutable task-artifact owner authority captured before the first deletion effect. */
+	taskArtifactOwnerDeletionEvidence?: TaskArtifactOwnerDeletionEvidence;
+	/** Latest exact native remnant; it never replaces the original deletion evidence. */
+	taskArtifactOwnerRetirementContinuation?: TaskArtifactOwnerRetirementContinuation;
+	/** Strict owner-only wire disposition, decoded only with its separately stored evidence. */
+	taskArtifactOwnerRetirementOutcome?: BrokerTaskArtifactOwnerRetirementDisposition;
+	taskArtifactOwnerPayloadRetired?: true;
+	taskArtifactOwnerNamespaceRetained?: true;
+	taskArtifactOwnerRetired?: true;
+	/** Durable fact that transcript retirement completed while the owner namespace remains. */
+	taskArtifactOwnerTranscriptDeleted?: true;
+	/** Stable artifacts-phase owner refusal diagnostic. */
+	taskArtifactOwnerCleanupError?: string;
 	/** Durable proof that artifact cleanup completed before transcript mutation. */
 	artifactsRemoved?: boolean;
 	artifactsAbsentAtAuthorization?: true;
@@ -735,6 +775,17 @@ function normalizeAliasedString(
 	return { value: values[0] };
 }
 
+const BROKER_TASK_ARTIFACT_OWNER_CLEANUP_FIELDS = [
+	"taskArtifactOwnerDeletionEvidence",
+	"taskArtifactOwnerRetirementContinuation",
+	"taskArtifactOwnerRetirementOutcome",
+	"taskArtifactOwnerPayloadRetired",
+	"taskArtifactOwnerNamespaceRetained",
+	"taskArtifactOwnerRetired",
+	"taskArtifactOwnerTranscriptDeleted",
+	"taskArtifactOwnerCleanupError",
+] as const;
+
 export function normalizeBrokerInput(operation: string, input: Record<string, unknown>): InputNormalization {
 	const normalized: Record<string, unknown> = { ...input };
 	const session = normalizeAliasedString(input, "sessionId", ["id"]);
@@ -813,6 +864,18 @@ export function normalizeBrokerInput(operation: string, input: Record<string, un
 	if (cwd.value !== undefined) normalized.stateRoot = path.join(cwd.value, ".gjc", "state");
 	else if (stateRoot.value !== undefined) return error("invalid_input", "stateRoot requires cwd.");
 
+	if (operation === "session.delete") {
+		const hasOwnerField = (value: unknown): boolean =>
+			typeof value === "object" &&
+			value !== null &&
+			!Array.isArray(value) &&
+			BROKER_TASK_ARTIFACT_OWNER_CLEANUP_FIELDS.some(key => Object.hasOwn(value, key));
+		if (hasOwnerField(input) || hasOwnerField(target) || hasOwnerField(input.cleanup))
+			return error(
+				"invalid_input",
+				"Task-artifact owner cleanup state is broker-managed and cannot be supplied by clients.",
+			);
+	}
 	if (target) {
 		const normalizedTarget = { ...target };
 		delete normalizedTarget.path;
@@ -1292,6 +1355,8 @@ const BROKER_LIVENESS_GRACE_MS = 60_000;
 // still fresh to every reader.
 const BROKER_LIVENESS_TTL_MULTIPLIER = 4;
 const BROKER_SETTLEMENT_MS = 2_000;
+const BROKER_EXIT_RECORD_WRITE_TIMEOUT_MS = 1_000;
+const BROKER_SIGNAL_EXIT_RECORD_WRITE_TIMEOUT_MS = 2_000;
 
 export interface StartupAdmissionTiming {
 	now(): number;
@@ -1456,7 +1521,6 @@ type BrokerPublicationState =
 	| "observation-ambiguous"
 	| "heartbeat-ambiguous"
 	| "stopping";
-type BrokerStopMode = "owned-root" | "lost-root";
 
 const terminalPersistenceHooksForTest = new WeakMap<Broker, () => void>();
 const ambiguityGraceOverridesForTest = new WeakMap<Broker, number>();
@@ -1473,6 +1537,16 @@ export class Broker {
 	discovery: BrokerDiscovery | null = null;
 	#lock: string;
 	#owner = randomBytes(12).toString("hex");
+	/** Public publication-incarnation id, fixed at startup; never the endpoint generation. */
+	#diagnosticGeneration = randomBytes(16).toString("hex");
+	/** Trusted build snapshot captured at startup; unknown buildId stays null. */
+	#startupBuild: { packageVersion: string; buildId: string | null } = {
+		packageVersion: packageJson.version,
+		buildId:
+			typeof process.env.GJC_BUILD_ID === "string" && process.env.GJC_BUILD_ID.length > 0
+				? process.env.GJC_BUILD_ID
+				: null,
+	};
 	#sessionListCursors = new Map<string, SessionListCursor>();
 	#chains = new Map<string, Promise<void>>();
 	#spawnInFlight = new Map<string, SpawnInFlight>();
@@ -1487,13 +1561,22 @@ export class Broker {
 	#startupAdmissions = new StartupAdmissionQueue(sdkHostStartupConcurrency());
 	#publication: RetainedBrokerDiscovery | null = null;
 	#publicationState: BrokerPublicationState = "healthy-owned";
+	#fenceReason: BrokerFenceReason | null = null;
 	#lossAt: bigint | null = null;
 	#ambiguousAt: bigint | null = null;
 	#publishedAt: bigint | null = null;
+	#startedAt: bigint | null = null;
 	#watchInFlight = false;
+	#checkpointInFlight = false;
 	#stopping = false;
 	#transport: BrokerTransport | null = null;
 	#heartbeatTimer: NodeJS.Timeout | null = null;
+	#startupAbortSignal: AbortSignal | undefined;
+	#onStartupReady: (() => void) | undefined;
+	#startupPrePublicationDelayMs: number;
+	#startupPrePublicationTestHook: (() => Promise<void>) | undefined;
+	#startupAfterDiscoveryWriteTestHook: (() => Promise<void>) | undefined;
+	#startupPostPublicationDelayMs: number;
 	#completionTask: Promise<void> | null = null;
 	#completion!: Promise<void>;
 	#resolveCompletion!: () => void;
@@ -1527,6 +1610,22 @@ export class Broker {
 		this.ledger = new LifecycleLedger(settings.agentDir);
 		this.#ownsResolveModelPin = settings.resolveModelPin === undefined;
 		this.#resolveModelPin = settings.resolveModelPin ?? createDefaultSdkHostModelResolver(this.settings.agentDir);
+		this.#startupAbortSignal = settings.startupAbortSignal;
+		this.#onStartupReady = settings.onStartupReady;
+		this.#startupPrePublicationDelayMs =
+			Number.isSafeInteger(settings.startupPrePublicationDelayMs) &&
+			(settings.startupPrePublicationDelayMs ?? 0) > 0 &&
+			(settings.startupPrePublicationDelayMs ?? 0) <= 10_000
+				? (settings.startupPrePublicationDelayMs as number)
+				: 0;
+		this.#startupPrePublicationTestHook = settings.startupPrePublicationTestHook;
+		this.#startupAfterDiscoveryWriteTestHook = settings.startupAfterDiscoveryWriteTestHook;
+		this.#startupPostPublicationDelayMs =
+			Number.isSafeInteger(settings.startupPostPublicationDelayMs) &&
+			(settings.startupPostPublicationDelayMs ?? 0) > 0 &&
+			(settings.startupPostPublicationDelayMs ?? 0) <= 10_000
+				? (settings.startupPostPublicationDelayMs as number)
+				: 0;
 		if (!this.settings.masterCapabilityVerifier)
 			this.settings.masterCapabilityVerifier = createMasterCapabilityVerifier(this.index);
 		this.#spawnPromptLayer = settings.spawnPromptLayer ?? {
@@ -3703,6 +3802,10 @@ export class Broker {
 			logger.warn(`sdk broker: stale lock artifact reap failed: ${String(error)}`);
 		}
 	}
+	#throwIfStartupAborted(): void {
+		if (this.#startupAbortSignal?.aborted)
+			throw new Error("SDK broker startup was interrupted before retained publication.");
+	}
 
 	async start(): Promise<BrokerDiscovery> {
 		if (this.#completionTask) {
@@ -3720,12 +3823,18 @@ export class Broker {
 		}
 		this.#stopping = false;
 		this.#publicationState = "healthy-owned";
+		this.#fenceReason = null;
 		this.#lossAt = null;
 		this.#ambiguousAt = null;
 		this.#publishedAt = null;
+		this.#startedAt = process.hrtime.bigint();
 		this.#watchInFlight = false;
+		this.#checkpointInFlight = false;
+		this.#throwIfStartupAborted();
 		await Promise.all([this.ledger.assertSupportedStateVersions(), readBrokerDiscovery(this.settings.agentDir)]);
+		this.#throwIfStartupAborted();
 		await fs.mkdir(path.dirname(this.#lock), { recursive: true, mode: 0o700 });
+		this.#throwIfStartupAborted();
 		for (;;) {
 			try {
 				await this.#createLock();
@@ -3740,6 +3849,7 @@ export class Broker {
 				// clean exit, so name the reason here (#3963).
 				logger.info(
 					`sdk broker: lock contention, yielding to the live broker owner (ownerId=${live.ownerId}, pid=${live.pid}); this process exits without owning discovery`,
+					{ reason: "startup-race-lost", ownerId: live.ownerId, pid: live.pid, exitCode: 0 },
 				);
 				this.discovery = live;
 				return live;
@@ -3751,6 +3861,7 @@ export class Broker {
 				if (starting) {
 					logger.info(
 						`sdk broker: lock contention, yielding to the broker that just started (ownerId=${starting.ownerId}, pid=${starting.pid}); this process exits without owning discovery`,
+						{ reason: "startup-race-lost", ownerId: starting.ownerId, pid: starting.pid, exitCode: 0 },
 					);
 					this.discovery = starting;
 					return starting;
@@ -3766,9 +3877,11 @@ export class Broker {
 			}
 			await this.#reclaimStaleLock(snapshot);
 		}
+		this.#throwIfStartupAborted();
 		// Only the lock holder reaps, so concurrent brokers cannot race the removal.
 		await this.#reapLockArtifacts();
 		try {
+			this.#throwIfStartupAborted();
 			await this.index.open();
 			await this.ledger.open();
 			const brokerIdentityKey = await getBrokerIdentityKey(this.settings.agentDir);
@@ -3800,6 +3913,7 @@ export class Broker {
 			const token = newBrokerToken();
 			this.#transport = new BrokerTransport(this, token, this.settings.port);
 			const port = await this.#transport.start();
+			this.#throwIfStartupAborted();
 			this.discovery = {
 				version: 1,
 				protocolVersion: 3,
@@ -3808,6 +3922,10 @@ export class Broker {
 				ownerId: this.#owner,
 				pid: process.pid,
 				incarnation,
+				// Observation capability: the startup-fixed generation and the protocol the
+				// broker answers. An old broker simply omits both.
+				diagnosticGeneration: this.#diagnosticGeneration,
+				diagnosticProtocol: 1,
 				host: "127.0.0.1",
 				port,
 				url: `ws://127.0.0.1:${port}`,
@@ -3823,9 +3941,21 @@ export class Broker {
 			// interval; publishing first allowed it to kill an endpoint already handed
 			// to callers when a legitimate index-lock wait outlived the fence.
 			await this.#checkpointSessionHeartbeats();
-			this.#publication = await publishBrokerDiscovery(this.settings.agentDir, this.discovery);
+			this.#throwIfStartupAborted();
+			await this.#startupPrePublicationTestHook?.();
+			if (this.#startupPrePublicationDelayMs > 0) await Bun.sleep(this.#startupPrePublicationDelayMs);
+			this.#throwIfStartupAborted();
+			this.#publication = await publishBrokerDiscovery(
+				this.settings.agentDir,
+				this.discovery,
+				process.platform,
+				this.#startupAbortSignal,
+				this.#startupAfterDiscoveryWriteTestHook,
+			);
+			this.#throwIfStartupAborted();
 			this.#publicationState = "healthy-owned";
 			this.#publishedAt = process.hrtime.bigint();
+			this.#onStartupReady?.();
 			const cadenceMs = Math.max(
 				10,
 				Math.min(BROKER_PUBLICATION_CADENCE_MS, Math.floor(this.settings.heartbeatTtlMs / 3)),
@@ -3834,6 +3964,7 @@ export class Broker {
 				void this.#watchPublication();
 				void this.#reapSpawnOrphans();
 			}, cadenceMs);
+			if (this.#startupPostPublicationDelayMs > 0) await Bun.sleep(this.#startupPostPublicationDelayMs);
 			// This process is now the independently verified successor: its own
 			// discovery just published under its own retained authority. Release the
 			// predecessor's reservation only now, keyed to the exact request this
@@ -3853,6 +3984,17 @@ export class Broker {
 			}
 			return this.discovery;
 		} catch (error) {
+			if (this.#startupAbortSignal?.aborted && this.discovery) {
+				try {
+					await rollbackBrokerDiscoveryIfCurrent(this.settings.agentDir, this.discovery);
+				} catch (rollbackError) {
+					logger.error("sdk broker: cancelled startup publication rollback failed", {
+						reason: "startup-publication-rollback-failed",
+						pid: process.pid,
+						error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
+					});
+				}
+			}
 			await this.#transport?.stop();
 			this.#transport = null;
 			this.#publication?.close();
@@ -3863,7 +4005,12 @@ export class Broker {
 		}
 	}
 	get ownsDiscovery(): boolean {
-		return this.discovery?.ownerId === this.#owner;
+		// A cached discovery record is not ownership proof until its retained publication is healthy.
+		return (
+			this.#publication !== null &&
+			this.#publicationState === "healthy-owned" &&
+			this.discovery?.ownerId === this.#owner
+		);
 	}
 	get completion(): Promise<void> {
 		return this.#completion;
@@ -3970,7 +4117,7 @@ export class Broker {
 		// this process has actually exited -- would let a racing ordinary
 		// `ensureBroker` treat the still-live old owner as idle and spawn early.
 		setTimeout(() => {
-			void this.#complete("owned-root").finally(() => {
+			void this.#complete("owned-root", "restart-committed").finally(() => {
 				if (this.#restart === current) this.#restart = undefined;
 			});
 		}, 0);
@@ -3995,9 +4142,10 @@ export class Broker {
 	status(): RedactedBrokerDiscovery | null {
 		return this.discovery ? redactBrokerDiscovery(this.discovery) : null;
 	}
-	#fence(kind: "suspect-unpublished" | "observation-ambiguous" | "heartbeat-ambiguous"): void {
+	#fence(kind: BrokerFenceReason): void {
 		if (this.#publicationState === "stopping") return;
 		this.#publicationState = kind;
+		this.#fenceReason = kind;
 		this.#startupAdmissions.close();
 		if (kind === "suspect-unpublished") {
 			this.#lossAt ??= process.hrtime.bigint();
@@ -4047,10 +4195,7 @@ export class Broker {
 		// The lock is deliberately left behind: this process is about to exit, and the
 		// dead-owner reclaim (#3963) is what hands it to the successor.
 		if (this.#unprovenBeyondLivenessDeadline()) {
-			logger.error(
-				`sdk broker: no publication has succeeded in ${this.#livenessGraceMs()}ms; terminating so peers can reclaim the lock (#4704)`,
-			);
-			void this.#complete("lost-root");
+			void this.#complete("lost-root", "publication-liveness-timeout");
 			return;
 		}
 		// Ticks must not stack behind a stalled one: each would add another pending
@@ -4072,7 +4217,7 @@ export class Broker {
 		} catch {
 			if (this.#stopping || this.#publication !== publication) return;
 			this.#fence("observation-ambiguous");
-			if (this.#fencedBeyondDeadline()) void this.#complete("lost-root");
+			if (this.#fencedBeyondDeadline()) void this.#complete("lost-root", "ownership-fence-expired");
 			return;
 		}
 		if (this.#stopping || this.#publication !== publication) return;
@@ -4082,6 +4227,7 @@ export class Broker {
 			// authority. A replacement can win between this observation and that write;
 			// reopening here would admit lifecycle work under stale authority.
 			this.#publicationState = "healthy-owned";
+			this.#fenceReason = null;
 			this.#lossAt = null;
 			this.#ambiguousAt = null;
 			if (writeHeartbeat) {
@@ -4090,11 +4236,11 @@ export class Broker {
 					return;
 			}
 			this.#startupAdmissions.reopen();
-			if (this.#publicationState === "healthy-owned") await this.#checkpointSessionHeartbeats();
+			if (this.#publicationState === "healthy-owned") void this.#checkpointSessionHeartbeats();
 			return;
 		}
 		this.#fence(observation === "ambiguous" ? "observation-ambiguous" : "suspect-unpublished");
-		if (this.#fencedBeyondDeadline()) void this.#complete("lost-root");
+		if (this.#fencedBeyondDeadline()) void this.#complete("lost-root", "ownership-fence-expired");
 	}
 	async #writeHeartbeat(publication: RetainedBrokerDiscovery): Promise<void> {
 		if (!this.discovery || this.#publication !== publication || this.#publicationState === "stopping") return;
@@ -4131,15 +4277,59 @@ export class Broker {
 		return await this.index.checkpointLiveHeartbeats(now);
 	}
 	async #checkpointSessionHeartbeats(): Promise<void> {
+		if (this.#checkpointInFlight || this.#stopping) return;
+		this.#checkpointInFlight = true;
 		try {
 			await this.heartbeatSessions();
 		} catch (error) {
+			if (
+				error instanceof FileLockAcquireError &&
+				error.orphanPath &&
+				this.#publication !== null &&
+				this.#publicationState === "healthy-owned" &&
+				this.#fenceReason === null &&
+				this.#completionTask === null &&
+				this.#provenOwnedRoot()
+			) {
+				await this.#complete("owned-root", "heartbeat-renewal-blocked", null, error.orphanPath);
+				return;
+			}
 			logger.warn(`sdk broker: session heartbeat checkpoint failed: ${String(error)}`);
+		} finally {
+			this.#checkpointInFlight = false;
 		}
 	}
-	async #complete(mode: BrokerStopMode): Promise<void> {
+	async #complete(
+		mode: BrokerExitMode,
+		reason: BrokerExitReason,
+		signal: BrokerExitRecord["signal"] = null,
+		blockingLockPath?: string,
+	): Promise<void> {
 		if (this.#completionTask) return this.#completionTask;
+		const now = process.hrtime.bigint();
+		const fenceStartedAt = this.#lossAt ?? this.#ambiguousAt;
+		const exitRecord: BrokerExitRecord & Record<string, unknown> = {
+			version: 1,
+			mode,
+			reason,
+			fenceReason: this.#fenceReason,
+			fencedForMs: fenceStartedAt === null ? 0 : Math.max(0, Number((now - fenceStartedAt) / 1_000_000n)),
+			uptimeMs: this.#startedAt === null ? 0 : Math.max(0, Number((now - this.#startedAt) / 1_000_000n)),
+			...(blockingLockPath === undefined ? {} : { blockingLockPath }),
+			pid: process.pid,
+			signal,
+			writtenAt: Date.now(),
+		};
+		const message =
+			reason === "heartbeat-renewal-blocked" && blockingLockPath
+				? `blocked by retained removal transition ${blockingLockPath}`
+				: undefined;
+		(mode === "lost-root" || message !== undefined ? logger.warn : logger.info)("sdk broker: exiting", {
+			...exitRecord,
+			...(message === undefined ? {} : { message }),
+		});
 		this.#stopping = true;
+		this.#checkpointInFlight = false;
 		this.#publicationState = "stopping";
 		// A lost-root broker has been fenced: it no longer owns the published root, and
 		// its settlement is bounded, so any startup still queued behind it would be
@@ -4151,6 +4341,27 @@ export class Broker {
 		if (this.#heartbeatTimer) clearInterval(this.#heartbeatTimer);
 		this.#heartbeatTimer = null;
 		this.#completionTask = (async () => {
+			const recordWrite = Promise.withResolvers<boolean>();
+			const recordWriteController = new AbortController();
+			const recordWriteTimeoutMs =
+				reason === "signal" ? BROKER_SIGNAL_EXIT_RECORD_WRITE_TIMEOUT_MS : BROKER_EXIT_RECORD_WRITE_TIMEOUT_MS;
+			const recordWriteTimer = setTimeout(() => {
+				recordWriteController.abort();
+				recordWrite.resolve(false);
+			}, recordWriteTimeoutMs);
+			void writeBrokerExitRecord(this.settings.agentDir, exitRecord, recordWriteController.signal).then(
+				() => recordWrite.resolve(true),
+				() => recordWrite.resolve(false),
+			);
+			const recordPersisted = await recordWrite.promise;
+			clearTimeout(recordWriteTimer);
+			if (!recordPersisted) {
+				logger.error("sdk broker: failed to persist exit reason", {
+					reason: "exit-record-write-failed-or-timed-out",
+					mode,
+					pid: process.pid,
+				});
+			}
 			try {
 				await this.#transport?.stop();
 				this.#transport = null;
@@ -4213,12 +4424,12 @@ export class Broker {
 			observation = publicationObservationOverridesForTest.get(this) ?? this.#publication.observe();
 		} catch {
 			this.#fence("observation-ambiguous");
-			if (this.#fencedBeyondDeadline()) void this.#complete("lost-root");
+			if (this.#fencedBeyondDeadline()) void this.#complete("lost-root", "ownership-fence-expired");
 			return { authorized: false };
 		}
 		if (observation !== "owned") {
 			this.#fence(observation === "ambiguous" ? "observation-ambiguous" : "suspect-unpublished");
-			if (this.#fencedBeyondDeadline()) void this.#complete("lost-root");
+			if (this.#fencedBeyondDeadline()) void this.#complete("lost-root", "ownership-fence-expired");
 			return { authorized: false };
 		}
 		return { authorized: true, value: effect() };
@@ -4229,8 +4440,12 @@ export class Broker {
 	 * queued behind this broker is granted a slot that frees after completion and
 	 * spawns a child the broker has no authority over.
 	 */
-	async stop(): Promise<void> {
-		await this.#complete(this.#provenOwnedRoot() ? "owned-root" : "lost-root");
+	async stop(request: BrokerStopRequest = { kind: "shutdown-request" }): Promise<void> {
+		await this.#complete(
+			this.#provenOwnedRoot() ? "owned-root" : "lost-root",
+			request.kind,
+			request.kind === "signal" ? request.signal : null,
+		);
 	}
 	async #endpoint(input: Record<string, unknown>): Promise<BrokerResponse> {
 		const sessionId = input.sessionId;
@@ -4597,6 +4812,33 @@ export class Broker {
 			? entry.response
 			: error("terminal_uncertain", "lifecycle outcome has no recorded response");
 	}
+	/**
+	 * Published diagnostics for observation clients (SPEC "Result contract").
+	 *
+	 * Everything here is captured once at startup and never recomputed, so a later source
+	 * or package change cannot alter what a running broker reports. No token, socket
+	 * coordinate, argv or environment value is included; the identity fields are the
+	 * internal owner/process/root binding the observer already knows from discovery.
+	 */
+	#publishedDiagnostics(): Promise<BrokerResponse> {
+		// Observation is answered ONLY from an already-owned healthy retained publication.
+		// A broker that owns no publication refuses here and recovers nothing: it does not
+		// publish, ensure, restart or touch the authority to answer.
+		if (this.#publication === null || this.#publicationState !== "healthy-owned") {
+			return Promise.resolve(error("unavailable", "broker publication authority is not owned"));
+		}
+		return Promise.resolve({
+			ok: true,
+			result: {
+				diagnosticProtocol: 1,
+				generation: this.#diagnosticGeneration,
+				build: this.#startupBuild,
+				identity: { ownerId: this.#owner, pid: process.pid, agentRoot: this.settings.agentDir },
+			},
+		});
+	}
+
+	// Wire requests are readiness-gated by BrokerTransport before reaching this dispatcher.
 	handleRequest(operation: string, input: Record<string, unknown>, idempotencyKey?: string): Promise<BrokerResponse> {
 		if (operation === "broker.status") return Promise.resolve({ ok: true, result: this.status() });
 		if (operation === "broker.prepare_restart")
@@ -4636,6 +4878,7 @@ export class Broker {
 			const spawnClose = await this.#maybeCloseSpawnChild(input);
 			if (spawnClose) return spawnClose;
 		}
+		if (operation === "broker.diagnostics") return this.#publishedDiagnostics();
 		if (operation === "session.control") return this.#sessionControl(input, idempotencyKey);
 		if (operation === "session.lookup") {
 			const lookup = publicLifecycleLookupInput(input);
@@ -4804,6 +5047,11 @@ export class Broker {
 			fingerprint,
 			...(operation === "session.close" && typeof input.sessionId === "string"
 				? { intendedSessionId: input.sessionId }
+				: {}),
+			...(operation === "session.close" &&
+			typeof input.endpointGeneration === "number" &&
+			typeof input.endpointIncarnation === "string"
+				? { closeAuthorityBound: true }
 				: {}),
 		};
 		if (!this.ledger.get(identity)) {

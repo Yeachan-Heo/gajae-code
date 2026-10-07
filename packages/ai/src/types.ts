@@ -1,4 +1,6 @@
 import type { ZodType, z } from "zod/v4";
+import type { CustomApiRegistry } from "./api-registry";
+import type { ProviderDiagnostic } from "./provider-diagnostic";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import type { AnthropicOptions } from "./providers/anthropic";
 import type { AzureOpenAIResponsesOptions } from "./providers/azure-openai-responses";
@@ -391,6 +393,8 @@ export interface StreamOptions {
 	 */
 	frequencyPenalty?: number;
 	maxTokens?: number;
+	/** Explicit custom API handler scope for this execution; never inferred from model metadata. */
+	customApiRegistry?: CustomApiRegistry;
 	signal?: AbortSignal;
 	apiKey?: string;
 	/** Disables all transport-level replay; the fallback controller owns retries. */
@@ -757,7 +761,11 @@ export interface Usage {
 }
 
 export type StopReason = "stop" | "length" | "toolUse" | "error" | "aborted";
-export type AssistantErrorKind = "provider_safety_stop" | "local_snapshot_failure" | "local_buffer_overflow";
+export type AssistantErrorKind =
+	| "provider_safety_stop"
+	| "local_empty_response"
+	| "local_snapshot_failure"
+	| "local_buffer_overflow";
 /**
  * Structured, shape-only staging-buffer overflow diagnostic carried on the
  * terminal `AssistantMessage`. Attached only by the agent runtime from its own
@@ -871,6 +879,17 @@ export interface AssistantMessage {
 	bufferOverflow?: AssistantBufferOverflowDiagnostic;
 	/** HTTP status surfaced by the provider when the request failed. Populated by every provider's catch block alongside `errorMessage` so consumers (auth retry, telemetry, UI) can branch without regex-scraping the message. */
 	errorStatus?: number;
+	/**
+	 * Bounded, redaction-safe provider failure family, minted ONLY by a provider
+	 * adapter from structured provider metadata (SDK error fields or an explicit
+	 * SSE protocol error envelope). It is additive diagnostics: it never changes
+	 * the terminal outcome, the fixed error message, retry admission, or the
+	 * legacy heuristic `errorStatus`, and it is absent whenever the provider
+	 * supplied no trustworthy structured evidence.
+	 */
+	providerDiagnostic?: ProviderDiagnostic;
+	/** Redacted first-event transport timing and chunk-shape diagnostics for Google Gemini CLI. */
+	googleGeminiCliDiagnostics?: GoogleGeminiCliDiagnostics;
 	/** Typed upstream failure facts retained for retry classification without parsing errorMessage. */
 	transportFailure?: TransportFailureFacts;
 	/**
@@ -888,6 +907,20 @@ export interface AssistantMessage {
 	ttft?: number; // Time to first token in milliseconds
 	/** Prompt-prefix fingerprint of the request that produced this message. */
 	promptPrefix?: PromptPrefixTelemetry;
+}
+
+export interface GoogleGeminiCliDiagnostics {
+	responseAtMs?: number;
+	firstRawSseAtMs?: number;
+	chunkCounts: {
+		content: number;
+		thinking: number;
+		functionCall: number;
+		usageOnly: number;
+		other: number;
+	};
+	firstEventTimeoutMs?: number;
+	firstEventTimeoutSource?: "stream-option" | "env" | "idle-timeout" | "provider-fallback" | "default";
 }
 
 export interface ToolResultMessage<TDetails = any> {
@@ -1009,6 +1042,9 @@ export type TSchema = ZodType | TJsonSchema;
 export type Static<S> = S extends ZodType ? z.infer<S> : S extends { static: infer T } ? T : unknown;
 
 export type RawArgumentRejectionCode =
+	| "ask-question-body-required"
+	| "ask-deep-interview-metadata-required"
+	| "ask-deep-interview-single-question-required"
 	| "ask-deep-interview-question-body-required"
 	| "ask-intent-review-requires-positive-round"
 	| "ask-intent-contract-requires-non-empty-authority"

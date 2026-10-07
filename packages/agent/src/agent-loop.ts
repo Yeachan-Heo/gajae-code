@@ -10,11 +10,11 @@ import {
 	type Context,
 	classifyContextOverflow,
 	classifyFallbackTrigger,
-	EMPTY_RESPONSE_PROVIDER_CODE,
 	EventStream,
 	isProviderSafetyStopAuthenticated,
 	isZodSchema,
 	SERVER_OVERLOADED_PROVIDER_CODE,
+	sanitizeProviderDiagnostic,
 	streamSimple,
 	type ToolChoice,
 	type ToolResultMessage,
@@ -43,6 +43,7 @@ import {
 	verifyUnicodeEscapeEvidence,
 } from "@gajae-code/ai/utils/json-parse";
 import { $credentialEnv, sanitizeText } from "@gajae-code/utils";
+import { markDesignedError } from "@gajae-code/utils/error-classification";
 import * as logger from "@gajae-code/utils/logger";
 import { revokeProviderSafetyStop } from "../../ai/src/adapter-internals/provider-safety-stop";
 import type { AttemptScope } from "./attempt-scope";
@@ -768,12 +769,41 @@ function managedTransportFailure(failure: unknown) {
 	return facts && typeof facts === "object" ? transportFailureFacts(facts) : undefined;
 }
 
+function managedAssistantMessageHasContent(failure: unknown): boolean {
+	const content = managedProperty(failure, "content");
+	if (content === undefined) return false;
+	try {
+		if (!Array.isArray(content)) return true;
+		return content.some(block => {
+			if (!block || typeof block !== "object") return true;
+			const type = managedProperty(block, "type");
+			if (type === "text") {
+				const text = managedProperty(block, "text");
+				return typeof text !== "string" || text.length > 0;
+			}
+			if (type === "thinking") {
+				const thinking = managedProperty(block, "thinking");
+				const signature = managedProperty(block, "thinkingSignature");
+				return (
+					typeof thinking !== "string" ||
+					(thinking.length === 0 && signature !== undefined && typeof signature !== "string") ||
+					thinking.length > 0 ||
+					(typeof signature === "string" && signature.length > 0)
+				);
+			}
+			return true;
+		});
+	} catch {
+		return true;
+	}
+}
 // AI owns provider-originated authority. The agent loop owns authority for
 // the rebuilt message objects it creates; this second WeakSet is deliberately
 // module-private so a public AI consumer cannot transfer authority to an
 // arbitrary destination. A destination is marked only while this managed
 // runtime is rebuilding a source that AI authenticated.
 const managedProviderSafetyStops = new WeakSet<object>();
+const managedLocalEmptyResponses = new WeakSet<object>();
 
 function isManagedProviderSafetyStopAuthenticated(value: unknown): boolean {
 	return (
@@ -782,21 +812,28 @@ function isManagedProviderSafetyStopAuthenticated(value: unknown): boolean {
 	);
 }
 
-function managedRetryableFailure(failure: unknown): boolean {
+function managedRetryableFailure(failure: unknown, transaction?: ManagedAttemptTransaction): boolean {
+	const hasObservableOutput =
+		transaction?.hasObservableAssistantOutput(failure) ?? managedAssistantMessageHasContent(failure);
+	if (
+		managedProperty(failure, "stopReason") === "error" &&
+		managedProperty(failure, "errorKind") === "local_empty_response"
+	) {
+		return !hasObservableOutput;
+	}
 	const facts = managedTransportFailure(failure);
 	if (!facts) return false;
-	// OpenAI's typed statusless capacity-overload code (issue #5018) never
-	// becomes managed transaction authority. Before the code survived as
-	// transport facts this failure produced none, so the staged attempt was
-	// always committed; the shared Responses parser and Codex events now carry
-	// it, and this check preserves that committed-failure behavior instead of
-	// discarding the transaction. It reads only typed facts, never error text.
+	// Statusless typed capacity overloads are retryable only when the managed
+	// transaction and its terminal failure contain no observable assistant
+	// output. Empty provider-start text placeholders do not block retry, while
+	// terminal-only content remains committed. Admission reads typed facts, not
+	// provider error prose.
 	if (
 		facts.status === undefined &&
 		facts.providerCode === SERVER_OVERLOADED_PROVIDER_CODE &&
 		(facts.openaiErrorCode === undefined || facts.openaiErrorCode === SERVER_OVERLOADED_PROVIDER_CODE)
 	) {
-		return false;
+		return !hasObservableOutput;
 	}
 	// A typed provider safety stop is terminal evidence ahead of any transport
 	// class, but only with adapter-minted provenance: unauthenticated labels
@@ -823,21 +860,42 @@ function managedRetryableFailure(failure: unknown): boolean {
 	);
 }
 
-function promoteTypedEmptyResponseStop(message: AssistantMessage): void {
+function promoteEmptyResponseStop(
+	message: AssistantMessage,
+	providerMessage: unknown,
+	transaction?: ManagedAttemptTransaction,
+): void {
+	const providerContent = managedProperty(providerMessage, "content");
+	const providerErrorMessage = managedProperty(providerMessage, "errorMessage");
+	let providerContentIsEmpty = false;
+	try {
+		providerContentIsEmpty = Array.isArray(providerContent) && providerContent.length === 0;
+	} catch {
+		return;
+	}
 	if (
+		managedProperty(providerMessage, "stopReason") !== "stop" ||
+		!providerContentIsEmpty ||
+		(typeof providerErrorMessage === "string" && providerErrorMessage !== "") ||
+		managedProperty(providerMessage, "errorKind") !== undefined ||
+		managedProperty(providerMessage, "errorStatus") !== undefined ||
+		transaction?.hasObservableAssistantOutput(providerMessage) ||
 		message.stopReason !== "stop" ||
 		message.content.length !== 0 ||
 		message.usage.input !== 0 ||
 		message.usage.output !== 0 ||
 		message.usage.cacheRead !== 0 ||
 		message.usage.cacheWrite !== 0 ||
-		message.usage.totalTokens !== 0 ||
-		managedTransportFailure(message)?.providerCode?.toLowerCase() !== EMPTY_RESPONSE_PROVIDER_CODE
+		message.usage.totalTokens !== 0
 	) {
 		return;
 	}
 	message.stopReason = "error";
 	message.errorMessage = "Provider returned an empty response with zero token usage";
+	// Preserve the runtime-owned retry classification for untyped provider
+	// payloads without inventing provider transport facts.
+	message.errorKind = "local_empty_response";
+	managedLocalEmptyResponses.add(message);
 }
 /**
  * Terminal safety-stop authority is provenance-bound, not data-bound: a
@@ -865,6 +923,7 @@ function sanitizeProviderSafetyStopProvenance(
 	const errorKindRead = managedPropertyRead(message, "errorKind");
 	if (
 		errorKindRead.ok &&
+		errorKindRead.value !== "local_empty_response" &&
 		(errorKindRead.value !== "provider_safety_stop" || isManagedProviderSafetyStopAuthenticated(message))
 	) {
 		return message;
@@ -2030,6 +2089,8 @@ function losslessDetachedClone<T>(value: T): T {
 						"kind",
 						"status",
 						"code",
+						"http2RstCode",
+						"nativeErrorCode",
 						"providerCode",
 						"openaiErrorCode",
 						"anthropicErrorType",
@@ -2134,7 +2195,11 @@ function managedAssistantShell(
 	const errorKind =
 		stopReason === "error" && managedProperty(source, "errorKind") === "provider_safety_stop"
 			? ("provider_safety_stop" as const)
-			: undefined;
+			: stopReason === "error" &&
+					((typeof value === "object" && value !== null && managedLocalEmptyResponses.has(value)) ||
+						(typeof source === "object" && source !== null && managedLocalEmptyResponses.has(source)))
+				? ("local_empty_response" as const)
+				: undefined;
 	const safeMetadata: Record<string, unknown> = {};
 	if (isManagedPlainRecord(detailed.snapshot)) {
 		for (const key of Object.keys(detailed.snapshot)) {
@@ -2151,6 +2216,11 @@ function managedAssistantShell(
 	// runtime failure in the executor's parent-facing summary (#4618).
 	delete safeMetadata.errorKind;
 	delete safeMetadata.bufferOverflow;
+	// The provider diagnostic crosses the snapshot only through the closed
+	// validator: the raw snapshot value is dropped so a provider/stream payload
+	// cannot smuggle arbitrary shape or text through this metadata copy.
+	delete safeMetadata.providerDiagnostic;
+	const providerDiagnostic = sanitizeProviderDiagnostic(managedProperty(source, "providerDiagnostic"));
 	const rebuilt: AssistantMessage = {
 		...safeMetadata,
 		role: "assistant",
@@ -2165,6 +2235,7 @@ function managedAssistantShell(
 		...(typeof errorMessage === "string" ? { errorMessage } : {}),
 		...(errorKind ? { errorKind } : {}),
 		...(typeof errorStatus === "number" && Number.isFinite(errorStatus) ? { errorStatus } : {}),
+		...(providerDiagnostic === undefined ? {} : { providerDiagnostic }),
 	};
 	// The closed-literal copy above is fed by the stream-exit provenance
 	// sanitize, so an unauthenticated label never reaches here. Mark the
@@ -2175,6 +2246,7 @@ function managedAssistantShell(
 		revokeProviderSafetyStop(value);
 		if (typeof value === "object" && value !== null) managedProviderSafetyStops.delete(value);
 	}
+	if (errorKind === "local_empty_response") managedLocalEmptyResponses.add(rebuilt);
 	return rebuilt;
 }
 
@@ -2364,7 +2436,9 @@ function managedAssistantContent(value: unknown): AssistantMessage["content"][nu
 	}
 	if (type === "thinking") {
 		const thinking = managedProperty(value, "thinking");
-		return typeof thinking === "string" ? { type, thinking } : undefined;
+		const thinkingSignature = managedProperty(value, "thinkingSignature");
+		if (typeof thinking !== "string") return undefined;
+		return { type, thinking, ...(typeof thinkingSignature === "string" ? { thinkingSignature } : {}) };
 	}
 	if (type === "redactedThinking") {
 		const data = managedProperty(value, "data");
@@ -2663,6 +2737,7 @@ function isSupersededStreamingDelta(item: ManagedAttemptBatchItem): boolean {
 
 class ManagedAttemptTransaction {
 	#batch: ManagedAttemptBatchItem[] = [];
+	#hasObservableAssistantOutput = false;
 	#stagedEventCount = 0;
 	#stagedBytes = 0;
 	/** Caps for this transaction, read once from the operator env knobs. */
@@ -2688,7 +2763,7 @@ class ManagedAttemptTransaction {
 	push(event: AgentEvent): void {
 		if (this.#committed) {
 			if (event.type === "message_end" || event.type === "turn_end") {
-				this.#batch.push({ type: "event", event });
+				this.#retain({ type: "event", event });
 				return;
 			}
 			this.stream.push(event);
@@ -2791,7 +2866,7 @@ class ManagedAttemptTransaction {
 		}
 		// Each frame's exact accounted size is retained so compaction can debit
 		// exactly what it reclaims instead of re-measuring the whole batch.
-		this.#batch.push({
+		this.#retain({
 			type: "assistant_event",
 			message: partial,
 			event: snapshotEvent,
@@ -2801,6 +2876,54 @@ class ManagedAttemptTransaction {
 		this.#stagedBytes += retainedBytes;
 	}
 
+	hasObservableAssistantOutput(terminalMessage?: unknown): boolean {
+		return this.#hasObservableAssistantOutput || managedAssistantMessageHasContent(terminalMessage);
+	}
+
+	#retain(item: ManagedAttemptBatchItem): void {
+		this.#hasObservableAssistantOutput ||= this.#itemHasObservableAssistantOutput(item);
+		this.#batch.push(item);
+	}
+
+	#itemHasObservableAssistantOutput(item: ManagedAttemptBatchItem): boolean {
+		if (item.type === "assistant_event") {
+			if (managedAssistantMessageHasContent(item.message)) return true;
+			const event = item.event;
+			if (
+				event.type === "text_delta" ||
+				event.type === "thinking_delta" ||
+				event.type === "reasoning_summary_delta" ||
+				event.type === "text_end" ||
+				event.type === "thinking_end" ||
+				event.type === "reasoning_summary_end"
+			) {
+				if (event.type === "text_end" || event.type === "thinking_end" || event.type === "reasoning_summary_end")
+					return event.content.length > 0;
+				return event.delta.length > 0;
+			}
+			return event.type === "toolcall_start" || event.type === "toolcall_delta" || event.type === "toolcall_end";
+		}
+		const event = item.event;
+		if ("message" in event && managedAssistantMessageHasContent(event.message)) return true;
+		if ("error" in event && managedAssistantMessageHasContent(event.error)) return true;
+		if (event.type === "message_update") {
+			const update = event.assistantMessageEvent;
+			if (
+				update.type === "text_delta" ||
+				update.type === "thinking_delta" ||
+				update.type === "reasoning_summary_delta"
+			)
+				return update.delta.length > 0;
+			if (update.type === "text_end" || update.type === "thinking_end" || update.type === "reasoning_summary_end")
+				return update.content.length > 0;
+			return update.type === "toolcall_start" || update.type === "toolcall_delta" || update.type === "toolcall_end";
+		}
+		return (
+			event.type === "tool_execution_start" ||
+			event.type === "tool_execution_update" ||
+			event.type === "tool_execution_end"
+		);
+	}
 	flush(): void {
 		if (this.#discarded) return;
 		for (const item of this.#batch) {
@@ -3087,7 +3210,7 @@ class ManagedAttemptTransaction {
 				this.push(detached);
 				return;
 			}
-			this.#batch.push({ type: "event", event: detached, bytes: detachedBytes });
+			this.#retain({ type: "event", event: detached, bytes: detachedBytes });
 			this.#stagedEventCount++;
 			this.#stagedBytes += detachedBytes;
 			return;
@@ -3181,7 +3304,7 @@ class ManagedAttemptTransaction {
 		}
 		// Retain each frame's accounted size so compaction can debit exactly what
 		// it reclaims instead of re-measuring the whole batch.
-		this.#batch.push({ type: "event", event: snapshot, bytes });
+		this.#retain({ type: "event", event: snapshot, bytes });
 		this.#stagedEventCount += 1;
 
 		this.#stagedBytes += bytes;
@@ -3903,6 +4026,7 @@ async function runLoopBody(
 					recoveryAttempt && !wasEscapedNonAsciiRecoveryAttempt
 						? undefined
 						: { value: getLogicalTurnToolChoice() },
+					attemptTransaction,
 				);
 				const detection = detectHarmonyLeakInAssistantMessage(message);
 				if (detection && shouldMitigateHarmonyLeak(config.model, detection)) {
@@ -3926,7 +4050,7 @@ async function runLoopBody(
 						stream.end(newMessages);
 						return;
 					}
-					if (config.fallbackManaged && transaction && managedRetryableFailure(err)) {
+					if (config.fallbackManaged && transaction && managedRetryableFailure(err, transaction)) {
 						transaction.discard();
 						currentContext.messages.splice(contextMessageCount);
 						newMessages.splice(newMessageCount);
@@ -4198,7 +4322,11 @@ async function runLoopBody(
 					: "Provider returned an empty response with anomalously low token usage (possible context overflow via proxy)";
 			}
 
-			if (config.fallbackManaged && message.stopReason === "error" && managedRetryableFailure(message)) {
+			if (
+				config.fallbackManaged &&
+				message.stopReason === "error" &&
+				managedRetryableFailure(message, transaction)
+			) {
 				transaction?.discard();
 				currentContext.messages.splice(contextMessageCount);
 				newMessages.splice(newMessageCount);
@@ -4267,13 +4395,7 @@ async function runLoopBody(
 				);
 				const toolResults: ToolResultMessage[] = [];
 				for (const toolCall of toolCalls) {
-					const result = createAbortedToolResult(
-						toolCall,
-						stream,
-						message.stopReason,
-						message.errorMessage,
-						attemptScope,
-					);
+					const result = createAbortedToolResult(toolCall, stream, message.stopReason, message.errorMessage);
 					currentContext.messages.push(result);
 					newMessages.push(result);
 					toolResults.push(result);
@@ -4289,7 +4411,6 @@ async function runLoopBody(
 					});
 				}
 				stream.push({ type: "turn_end", message, toolResults, scope: attemptScope });
-				await config.afterTurnEndPublished?.();
 				publishAgentEnd(
 					stream,
 					config,
@@ -4318,7 +4439,6 @@ async function runLoopBody(
 							stream,
 							"error",
 							"Tool calls are disabled during repeated malformed tool-call recovery.",
-							attemptScope,
 						);
 						currentContext.messages.push(result);
 						newMessages.push(result);
@@ -4371,42 +4491,7 @@ async function runLoopBody(
 				pendingRecovery = undefined;
 			}
 
-			const composerRecoveryExhausted = sawComposerBashPolicyBlock && composerBashPolicyRecoveryAttempted;
-			const malformedRecoveryAvailable = repeatedMalformedToolCall && !malformedToolRecoveryAttempted;
-			const malformedRecoveryExhausted =
-				consecutiveMalformedTurns >= MAX_CONSECUTIVE_MALFORMED_TURNS && !malformedRecoveryAvailable;
-			const policyTerminalCommitted =
-				!loopSignal.aborted && (composerRecoveryExhausted || malformedRecoveryExhausted);
-			if (policyTerminalCommitted && composerRecoveryExhausted) {
-				message.stopReason = "error";
-				const recoveryLimitMessage =
-					"Composer bash policy blocked repository file I/O again after its one automatic recovery turn. Continue with dedicated repository tools.";
-				message.errorMessage = message.errorMessage
-					? `${message.errorMessage} | ${recoveryLimitMessage}`
-					: recoveryLimitMessage;
-			} else if (policyTerminalCommitted && malformedRecoveryExhausted) {
-				message.stopReason = "error";
-				const breakerMessage = `Stopping after ${consecutiveMalformedTurns} consecutive turns of malformed tool calls; the model did not produce a usable tool call or answer.`;
-				message.errorMessage = message.errorMessage
-					? `${message.errorMessage} | ${breakerMessage}`
-					: breakerMessage;
-			}
-
 			stream.push({ type: "turn_end", message, toolResults, scope: attemptScope });
-			await config.afterTurnEndPublished?.();
-			if (policyTerminalCommitted) {
-				if (steeringMessagesFromExecution && steeringMessagesFromExecution.length > 0) {
-					config.requeueSteeringMessages?.(steeringMessagesFromExecution);
-				}
-				publishAgentEnd(
-					stream,
-					config,
-					buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "completed", attemptScope),
-					attemptScope,
-				);
-				stream.end(newMessages);
-				return;
-			}
 
 			if (steeringMessagesFromExecution && steeringMessagesFromExecution.length > 0) {
 				// Same aborted-run guard as the drain below: the steer interrupt unwound
@@ -4451,9 +4536,44 @@ async function runLoopBody(
 			if (sawComposerBashPolicyBlock && !composerBashPolicyRecoveryAttempted) {
 				pendingRecovery = { kind: "composer-bash-policy", inserted: false };
 				composerBashPolicyRecoveryAttempted = true;
+			} else if (sawComposerBashPolicyBlock) {
+				message.stopReason = "error";
+				const recoveryLimitMessage =
+					"Composer bash policy blocked repository file I/O again after its one automatic recovery turn. Continue with dedicated repository tools.";
+				message.errorMessage = message.errorMessage
+					? `${message.errorMessage} | ${recoveryLimitMessage}`
+					: recoveryLimitMessage;
+				publishAgentEnd(
+					stream,
+					config,
+					buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "completed", attemptScope),
+					attemptScope,
+				);
+				stream.end(newMessages);
+				return;
 			} else if (repeatedMalformedToolCall && !malformedToolRecoveryAttempted) {
 				pendingRecovery = { kind: "malformed-tool-call", inserted: false };
 				malformedToolRecoveryAttempted = true;
+			} else if (consecutiveMalformedTurns >= MAX_CONSECUTIVE_MALFORMED_TURNS) {
+				// Deterministic terminal circuit breaker. The one-shot recovery turn
+				// above already had its chance; if the model is still emitting only
+				// malformed tool calls after it, the run cannot make progress and must
+				// stop rather than burn the provider budget. Terminates on consecutive
+				// count, not argument signatures, so rotating invalid shapes are bounded
+				// too.
+				message.stopReason = "error";
+				const breakerMessage = `Stopping after ${consecutiveMalformedTurns} consecutive turns of malformed tool calls; the model did not produce a usable tool call or answer.`;
+				message.errorMessage = message.errorMessage
+					? `${message.errorMessage} | ${breakerMessage}`
+					: breakerMessage;
+				publishAgentEnd(
+					stream,
+					config,
+					buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "completed", attemptScope),
+					attemptScope,
+				);
+				stream.end(newMessages);
+				return;
 			}
 		}
 
@@ -4539,6 +4659,7 @@ async function streamAssistantResponse(
 	},
 	provisionalToolTransaction?: ManagedAttemptTransaction,
 	toolChoiceOverride?: { value: ToolChoice | undefined },
+	managedAttemptTransaction?: ManagedAttemptTransaction,
 ): Promise<AssistantMessage> {
 	const managedDegradedFieldDiagnostics = new Set<string>();
 	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
@@ -4710,6 +4831,12 @@ async function streamAssistantResponse(
 				await finishChat(aborted);
 				return aborted;
 			}
+			// Fingerprint the exact provider-visible request only once it is really sent.
+			const promptPrefix = config.promptPrefixTracker?.observe(config.model, llmContext, {
+				toolChoice: effectiveToolChoice,
+				reasoning: effectiveReasoning,
+				serviceTier: config.serviceTier,
+			});
 			let responsePromise: Promise<Awaited<ReturnType<StreamFn>>>;
 			try {
 				responsePromise = Promise.resolve(
@@ -4816,10 +4943,9 @@ async function streamAssistantResponse(
 				return getResponseResult();
 			};
 
-			// Set up a single abort race: register the abort listener once for the whole
-			// stream and reuse the same race promise for every iterator.next() instead of
-			// allocating Promise.withResolvers and add/removeEventListener per event.
-			let abortRacePromise: Promise<typeof ABORTED> | undefined;
+			// Keep one listener, but race a fresh promise per read so pending abort
+			// reactions do not retain every event until the request ends.
+			let settleReadAbort: (() => void) | undefined;
 			let detachAbortListener: (() => void) | undefined;
 			if (requestSignal) {
 				if (requestSignal.aborted) {
@@ -4835,18 +4961,32 @@ async function streamAssistantResponse(
 					await finishChat(aborted);
 					return aborted;
 				}
-				const { promise, resolve } = Promise.withResolvers<typeof ABORTED>();
-				const onAbort = () => resolve(ABORTED);
+				const onAbort = () => settleReadAbort?.();
 				requestSignal.addEventListener("abort", onAbort, { once: true });
-				abortRacePromise = promise;
 				detachAbortListener = () => requestSignal.removeEventListener("abort", onAbort);
 			}
 
 			try {
 				while (true) {
 					let next: IteratorResult<AssistantMessageEvent>;
-					if (abortRacePromise) {
-						const result = await Promise.race([responseIterator.next(), abortRacePromise]);
+					if (requestSignal) {
+						const { promise, resolve } = Promise.withResolvers<typeof ABORTED>();
+						let settled = false;
+						const settleAbort = (): void => {
+							if (settled) return;
+							settled = true;
+							resolve(ABORTED);
+							config.onAbortRaceReactionChange?.(-1);
+						};
+						config.onAbortRaceReactionChange?.(1);
+						settleReadAbort = settleAbort;
+						let result: IteratorResult<AssistantMessageEvent> | typeof ABORTED;
+						try {
+							result = requestSignal.aborted ? ABORTED : await Promise.race([responseIterator.next(), promise]);
+						} finally {
+							settleAbort();
+							settleReadAbort = undefined;
+						}
 						if (result === ABORTED) {
 							closeIterator();
 							const aborted = emitAbortedAssistantMessage(
@@ -4962,7 +5102,8 @@ async function streamAssistantResponse(
 							const finalMessage = config.fallbackManaged
 								? managedAssistantShell(finished, config.model, managedDegradedFieldDiagnostics, true)
 								: finished;
-							promoteTypedEmptyResponseStop(finalMessage);
+							promoteEmptyResponseStop(finalMessage, finished, managedAttemptTransaction);
+							if (promptPrefix) finalMessage.promptPrefix = promptPrefix;
 							if (addedPartial) {
 								context.messages[context.messages.length - 1] = finalMessage;
 							} else {
@@ -4975,6 +5116,13 @@ async function streamAssistantResponse(
 							await finishChat(finalMessage);
 							return finalMessage;
 						}
+						default: {
+							const unexpectedEventType = (event as unknown as { type?: unknown }).type;
+							if (config.fallbackManaged && typeof unexpectedEventType !== "string") {
+								throw new ManagedAttemptSnapshotError("event.unknownType");
+							}
+							break;
+						}
 					}
 				}
 			} finally {
@@ -4986,16 +5134,8 @@ async function streamAssistantResponse(
 			const trailing = config.fallbackManaged
 				? managedAssistantShell(finished, config.model, managedDegradedFieldDiagnostics, true)
 				: finished;
-			promoteTypedEmptyResponseStop(trailing);
-			if (!config.fallbackManaged || (trailing.stopReason !== "error" && trailing.stopReason !== "aborted")) {
-				if (addedPartial) {
-					context.messages[context.messages.length - 1] = trailing;
-				} else {
-					context.messages.push(trailing);
-					stream.push({ type: "message_start", message: { ...trailing }, scope });
-				}
-				stream.push({ type: "message_end", message: trailing, scope });
-			}
+			promoteEmptyResponseStop(trailing, finished, managedAttemptTransaction);
+			if (promptPrefix) trailing.promptPrefix = promptPrefix;
 			await finishChat(trailing);
 			return trailing;
 		});
@@ -5137,7 +5277,6 @@ async function executeToolCalls(
 
 	const records = toolCalls.map(toolCall => {
 		const metadata = acceptedToolCallMetadata.get(toolCall) ?? escapedToolCallMetadata(toolCall);
-		const cleanupSettled = Promise.withResolvers<void>();
 		return {
 			toolCall: stripToolCallEvidence(toolCall),
 			metadata,
@@ -5151,9 +5290,6 @@ async function executeToolCalls(
 			toolResultMessage: undefined as ToolResultMessage | undefined,
 			resultEmitted: false,
 			argumentValidationFailed: false,
-			preDispatchEntered: false,
-			cleanupClaimed: false,
-			cleanupSettled,
 		};
 	});
 	const checkSteering = async (): Promise<void> => {
@@ -5312,85 +5448,14 @@ async function executeToolCalls(
 		record.started = true;
 	};
 
-	const settleDispatchedCancellationCleanup = async (record: (typeof records)[number]): Promise<void> => {
-		if (record.cleanupClaimed) {
-			await Promise.race([record.cleanupSettled.promise, Bun.sleep(1_000)]);
-			return;
-		}
-		record.cleanupClaimed = true;
-		try {
-			if (afterToolCall) {
-				await Promise.race([
-					afterToolCall(
-						{
-							assistantMessage,
-							toolCall: record.toolCall,
-							args: record.args,
-							result: {
-								content: [{ type: "text", text: "Tool call cancelled after dispatch." }],
-								isError: true,
-								details: { cancellation: "after_dispatch" },
-							},
-							isError: true,
-							context: currentContext,
-						},
-						toolSignal,
-					),
-					Bun.sleep(1_000),
-				]);
-			}
-		} catch {
-			// Cancellation is authoritative; the hook is best-effort cleanup only.
-		} finally {
-			record.cleanupSettled.resolve();
-		}
-	};
-
-	const settlePreDispatchCancellationCleanup = async (record: (typeof records)[number]): Promise<void> => {
-		if (record.cleanupClaimed) {
-			await Promise.race([record.cleanupSettled.promise, Bun.sleep(1_000)]);
-			return;
-		}
-		record.cleanupClaimed = true;
-		try {
-			if (afterToolCall) {
-				await Promise.race([
-					afterToolCall(
-						{
-							assistantMessage,
-							toolCall: record.toolCall,
-							args: record.args,
-							result: {
-								content: [{ type: "text", text: "Tool call cancelled before dispatch." }],
-								isError: true,
-								details: { cancellation: "before_dispatch" },
-							},
-							isError: true,
-							context: currentContext,
-						},
-						toolSignal,
-					),
-					Bun.sleep(1_000),
-				]);
-			}
-		} catch {
-			// Cancellation is authoritative; the hook is best-effort cleanup only.
-		} finally {
-			record.cleanupSettled.resolve();
-		}
-	};
-
 	const runTool = async (record: (typeof records)[number], index: number): Promise<void> => {
-		if (record.skipped || interruptState.triggered || signal?.aborted) {
+		if (record.skipped || interruptState.triggered) {
 			// Skip both span emission and the collector orphan record here. The
 			// scheduler-task finalizer emits the skipped result and collector record;
 			// the tail sweep below remains a defensive fallback for unexpected throws.
 			record.skipped = true;
-			record.cleanupClaimed = true;
-			record.cleanupSettled.resolve();
 			return;
 		}
-		record.preDispatchEntered = true;
 
 		record.toolCall = stripToolCallEvidence(record.toolCall);
 		const { toolCall, tool } = record;
@@ -5427,7 +5492,6 @@ async function executeToolCalls(
 		let result: AgentToolResult<any> = { content: [], details: {} };
 		let isError = false;
 		let caughtError: unknown;
-		let preDispatchCancellationResult: AgentToolResult<any> | undefined;
 
 		await runInActiveSpan(toolSpan, async () => {
 			try {
@@ -5450,7 +5514,7 @@ async function executeToolCalls(
 								: reason === "ambiguous"
 									? `The identity of tool call "${toolCall.name}" was ambiguous on the wire (duplicate call id or id/call_id collision), so its arguments cannot be safely attributed. Re-issue the call.`
 									: `Tool call "${toolCall.name}" was cut off before its arguments finished streaming (the response hit its output token limit). The partial arguments cannot be executed. Re-issue the call with complete arguments, splitting the work into smaller steps if needed.`;
-					throw new Error(detail);
+					throw markDesignedError(new Error(detail));
 				}
 				const displaySafeEscapedArguments =
 					escapedArgumentsGuarded &&
@@ -5478,10 +5542,12 @@ async function executeToolCalls(
 						toolRegistered: tool !== undefined,
 						displaySafeFieldsDeclared: isDisplaySafeEscapedTool(tool),
 					});
-					throw new Error(
-						`Tool call "${toolCall.name}" spelled printable text as \\uXXXX escapes instead of literal UTF-8 characters. ` +
-							`Escaped text cannot be verified — a single wrong hex digit silently becomes a different character — ` +
-							`so the call was not executed. Re-issue it writing every printable character literally.`,
+					throw markDesignedError(
+						new Error(
+							`Tool call "${toolCall.name}" spelled printable text as \\uXXXX escapes instead of literal UTF-8 characters. ` +
+								`Escaped text cannot be verified — a single wrong hex digit silently becomes a different character — ` +
+								`so the call was not executed. Re-issue it writing every printable character literally.`,
+						),
 					);
 				}
 				if (!tool) {
@@ -5500,10 +5566,12 @@ async function executeToolCalls(
 					// naming that guess hits a tool the model never asked for, which is
 					// worse than the dead end it would replace.
 					const base = `Tool ${toolCall.name} not found`;
-					throw new Error(
-						isToolDiscoveryCallable(tools)
-							? `${base}. If you are unsure whether this tool exists or how to use it, call \`${TOOL_DISCOVERY_NAME}\` to discover and activate the matching tool, then retry.`
-							: base,
+					throw markDesignedError(
+						new Error(
+							isToolDiscoveryCallable(tools)
+								? `${base}. If you are unsure whether this tool exists or how to use it, call \`${TOOL_DISCOVERY_NAME}\` to discover and activate the matching tool, then retry.`
+								: base,
+						),
 					);
 				}
 
@@ -5562,23 +5630,14 @@ async function executeToolCalls(
 					effectiveArgs,
 					toolContext,
 				);
-				if (toolSignal.aborted) {
-					record.skipped = true;
-					preDispatchCancellationResult = {
-						content: [{ type: "text", text: "Tool call cancelled before dispatch." }],
-						isError: true,
-						details: { cancellation: "before_dispatch" },
-					};
-				} else {
-					// Preparation is complete. A successful publication is the only transition
-					// that marks this record dispatched; intrinsic invocation then consumes locals.
-					publishToolDispatch(record, startEvent);
-					const execution = intrinsicReflectApply(execute, tool, invocationArguments);
-					const rawResult = await execution;
-					const coerced = coerceToolResult(rawResult);
-					result = coerced.result;
-					if (coerced.malformed || result.isError) isError = true;
-				}
+				// Preparation is complete. A successful publication is the only transition
+				// that marks this record dispatched; intrinsic invocation then consumes locals.
+				publishToolDispatch(record, startEvent);
+				const execution = intrinsicReflectApply(execute, tool, invocationArguments);
+				const rawResult = await execution;
+				const coerced = coerceToolResult(rawResult);
+				result = coerced.result;
+				if (coerced.malformed || result.isError) isError = true;
 			} catch (e) {
 				caughtError = e;
 				result = {
@@ -5587,18 +5646,8 @@ async function executeToolCalls(
 				};
 				isError = true;
 			}
-			// A pre-dispatch cleanup hook is only part of the cancellation contract.
-			// Validation failures and beforeToolCall blocks still have a real result
-			// that must flow through the normal tool-result path without invoking the
-			// post-execution hook before execution ever started.
-			if (afterToolCall && preDispatchCancellationResult && !record.started && !record.cleanupClaimed) {
-				await settlePreDispatchCancellationCleanup(record);
-			}
 
-			if (afterToolCall && record.started && (signal?.aborted || toolSignal.aborted)) {
-				await settleDispatchedCancellationCleanup(record);
-			} else if (afterToolCall && record.started && !signal?.aborted && !toolSignal.aborted) {
-				record.cleanupClaimed = true;
+			if (afterToolCall) {
 				try {
 					const after = await afterToolCall(
 						{
@@ -5626,17 +5675,11 @@ async function executeToolCalls(
 						details: {},
 					};
 					isError = true;
-				} finally {
-					record.cleanupSettled.resolve();
 				}
-			}
-			if (!record.cleanupClaimed) {
-				record.cleanupClaimed = true;
-				record.cleanupSettled.resolve();
 			}
 		});
 
-		const interrupted = interruptState.triggered || record.skipped;
+		const interrupted = interruptState.triggered;
 		if (interrupted) {
 			record.skipped = true;
 			emitToolResult(record, createSkippedToolResult(), true);
@@ -5738,17 +5781,6 @@ async function executeToolCalls(
 					record.skipped = true;
 					emitToolResult(record, createAbortedToolExecutionResult(), true);
 				}
-				for (const record of records) {
-					if (record.started || record.cleanupClaimed) continue;
-					void settlePreDispatchCancellationCleanup(record);
-				}
-				await Promise.all(
-					records.map(record =>
-						record.started
-							? settleDispatchedCancellationCleanup(record)
-							: settlePreDispatchCancellationCleanup(record),
-					),
-				);
 			}
 		} finally {
 			signal.removeEventListener("abort", onAbort);
@@ -5784,7 +5816,6 @@ function createAbortedToolResult(
 	stream: EventStream<AgentEvent, AgentMessage[]>,
 	reason: "aborted" | "error",
 	errorMessage?: string,
-	scope?: AttemptScope,
 ): ToolResultMessage {
 	toolCall = stripToolCallEvidence(toolCall);
 	const message = reason === "aborted" ? "Tool execution was aborted" : "Tool execution failed due to an error";
@@ -5805,7 +5836,6 @@ function createAbortedToolResult(
 		toolName: toolCall.name,
 		args: toolCall.arguments,
 		intent: toolCall.intent,
-		scope,
 	};
 	markNonDispatchedToolEvent(startEvent);
 	stream.push(startEvent);
@@ -5815,7 +5845,6 @@ function createAbortedToolResult(
 		toolName: toolCall.name,
 		result,
 		isError: true,
-		scope,
 	};
 	markNonDispatchedToolEvent(endEvent);
 	stream.push(endEvent);
@@ -5830,8 +5859,8 @@ function createAbortedToolResult(
 		timestamp: Date.now(),
 	};
 
-	stream.push({ type: "message_start", message: toolResultMessage, scope });
-	stream.push({ type: "message_end", message: toolResultMessage, scope });
+	stream.push({ type: "message_start", message: toolResultMessage });
+	stream.push({ type: "message_end", message: toolResultMessage });
 
 	return toolResultMessage;
 }

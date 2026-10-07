@@ -56,13 +56,22 @@ console.log(stats.byAgent.find(agent => agent.agent === "executor")?.totalCost);
 
 ## API Endpoints
 
+Endpoints marked *range* accept `?range=1h|24h|7d|30d|90d|all` (default `24h`; an unknown value falls back to `24h`). Time series use hourly buckets for `1h` and `24h` and daily buckets for longer ranges.
+
 | Endpoint | Description |
 |----------|-------------|
-| `GET /api/stats` | Overall stats with all breakdowns |
-| `GET /api/stats/models` | Per-model statistics |
-| `GET /api/stats/folders` | Per-folder/project statistics |
-| `GET /api/stats/timeseries` | Hourly time series data |
-| `POST /api/sync` | Trigger sync and return counts |
+| `GET /api/stats` | The full `DashboardStats` object: overall, failures, per-model/folder/agent breakdowns, the time, model, model-performance, and cost series, and the cache-miss attribution (*range*) |
+| `GET /api/stats/overview` | `overall` and `timeSeries` only (*range*) |
+| `GET /api/stats/models` | Per-model statistics, ordered by request count (*range*) |
+| `GET /api/stats/model-dashboard` | `byModel`, `modelSeries`, and `modelPerformanceSeries` (*range*) |
+| `GET /api/stats/folders` | Per-folder/project statistics (*range*) |
+| `GET /api/stats/timeseries` | Requests, errors, tokens, and cost per time bucket (*range*) |
+| `GET /api/stats/costs` | Daily cost per model and provider, split into input/output/cache (*range*) |
+| `GET /api/stats/behavior` | User-message behavior signals (yelling, profanity, repetition, and others): overall, per model, and over time (*range*) |
+| `GET /api/stats/recent` | Most recent requests, newest first (`?limit=`, default 100) |
+| `GET /api/stats/errors` | Most recent requests that stopped with an error (`?limit=`, default 100) |
+| `GET /api/request/:id` | One request with its stored messages and output; `404` if unknown |
+| `POST /api/sync` | Sync session files and return `{ processed, files, totalMessages }`; `409` while a sync is already running |
 
 ## Local server security
 
@@ -84,6 +93,69 @@ The web dashboard provides:
 - Per-model breakdown table
 - Per-folder breakdown table
 - Auto-refresh every 30 seconds
+
+## Tips & Common Patterns
+
+### Sync and print a summary
+
+Every `gjc stats` invocation syncs session files before it does anything else, so there is no separate sync flag.
+
+```bash
+gjc stats --summary
+```
+
+### JSON output for scripting
+
+With `--json`, stdout carries only the JSON document; the sync progress and the `Synced N new entries ...` summary go to stderr.
+
+```bash
+gjc stats --json | jq '.overall.totalCost'
+```
+
+### Dashboard on a custom port
+
+```bash
+gjc stats --port 3000
+```
+
+`--summary` and `--json` print and exit without starting the server, so `--port` has no effect when combined with them.
+
+### Programmatic: highest-cost folder
+
+```typescript
+import { getDashboardStats, syncAllSessions } from "@gajae-code/stats";
+
+await syncAllSessions();
+const stats = await getDashboardStats();
+
+const [first, ...rest] = stats.byFolder;
+if (first) {
+  const topFolder = rest.reduce((a, b) => (b.totalCost > a.totalCost ? b : a), first);
+  console.log(`Highest cost folder: ${topFolder.folder} ($${topFolder.totalCost.toFixed(2)})`);
+} else {
+  console.log("No folder data available");
+}
+```
+
+### Programmatic: most-requested model
+
+```typescript
+import { getDashboardStats, syncAllSessions } from "@gajae-code/stats";
+
+await syncAllSessions();
+const stats = await getDashboardStats();
+
+// byModel is ordered by request count, highest first.
+const topModel = stats.byModel[0];
+if (topModel) {
+  console.log(`Most requested model: ${topModel.model} (${topModel.totalRequests} requests)`);
+}
+```
+
+### Troubleshooting
+
+- **No data shown?** Check that session logs exist under `~/.gjc/agent/sessions/` (`~/<GJC_CONFIG_DIR>/agent/sessions/` if that variable is set). With a custom `GJC_CODING_AGENT_DIR`, sessions are in `$GJC_CODING_AGENT_DIR/sessions/`. Otherwise, on Linux and macOS, if `XDG_DATA_HOME` is set and `$XDG_DATA_HOME/gjc` exists (created by `gjc config init-xdg`), sessions are in `$XDG_DATA_HOME/gjc/sessions/`. These variables must come from your shell environment. A project `.env` cannot set them, and if the `.env` entry uses `$` expansion it blocks the shell value as well; in both cases the default path applies.
+- **Dashboard not starting?** Check that port 3847 (or the port passed to `--port`) is free.
 
 ## License
 

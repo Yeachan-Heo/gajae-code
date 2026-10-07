@@ -22,7 +22,7 @@ type Role = "default" | "executor" | "planner" | "critic" | "architect";
 
 const roles: Role[] = ["default", "executor", "planner", "critic", "architect"];
 const astraProfileNames = ["astra-lite", "astra-default", "astra-heavy", "astra-fable", "astra-fable-opus"] as const;
-const astraProfileNameSet = new Set<string>(astraProfileNames);
+const additiveProfileNames = new Set<string>(astraProfileNames);
 
 const expectedProfiles: Array<{
 	name: string;
@@ -33,44 +33,44 @@ const expectedProfiles: Array<{
 		name: "codex-eco",
 		requiredProviders: ["openai-codex"],
 		mapping: {
-			default: "openai-codex/gpt-5.6-terra:low",
-			executor: "openai-codex/gpt-5.6-luna:low",
-			planner: "openai-codex/gpt-5.6-luna:high",
-			critic: "openai-codex/gpt-5.6-terra:xhigh",
-			architect: "openai-codex/gpt-5.6-terra:high",
+			default: "openai-codex/gpt-6-luna:low",
+			executor: "openai-codex/gpt-6-luna:low",
+			planner: "openai-codex/gpt-6-luna:high",
+			critic: "openai-codex/gpt-6-luna:xhigh",
+			architect: "openai-codex/gpt-6-luna:high",
 		},
 	},
 	{
 		name: "codex-medium",
 		requiredProviders: ["openai-codex"],
 		mapping: {
-			default: "openai-codex/gpt-5.6-sol:low",
-			executor: "openai-codex/gpt-5.6-terra:low",
-			planner: "openai-codex/gpt-5.6-terra:high",
-			critic: "openai-codex/gpt-5.6-sol:xhigh",
-			architect: "openai-codex/gpt-5.6-sol:high",
+			default: "openai-codex/gpt-6.1-sol:low",
+			executor: "openai-codex/gpt-6.1-sol:low",
+			planner: "openai-codex/gpt-6.1-sol:high",
+			critic: "openai-codex/gpt-6.1-sol:xhigh",
+			architect: "openai-codex/gpt-6.1-sol:high",
 		},
 	},
 	{
 		name: "codex-pro",
 		requiredProviders: ["openai-codex"],
 		mapping: {
-			default: "openai-codex/gpt-5.6-sol:medium",
-			executor: "openai-codex/gpt-5.6-terra:medium",
-			planner: "openai-codex/gpt-5.6-sol:high",
-			critic: "openai-codex/gpt-5.6-sol:max",
-			architect: "openai-codex/gpt-5.6-sol:xhigh",
+			default: "openai-codex/gpt-6.1-sol:medium",
+			executor: "openai-codex/gpt-6.1-sol:medium",
+			planner: "openai-codex/gpt-6.1-sol:high",
+			critic: "openai-codex/gpt-6.1-sol:max",
+			architect: "openai-codex/gpt-6.1-sol:xhigh",
 		},
 	},
 	{
 		name: "lunamaxxing",
 		requiredProviders: ["openai-codex"],
 		mapping: {
-			default: "openai-codex/gpt-5.6-luna:medium",
-			executor: "openai-codex/gpt-5.6-luna:xhigh",
-			planner: "openai-codex/gpt-5.6-luna:max",
-			critic: "openai-codex/gpt-5.6-luna:max",
-			architect: "openai-codex/gpt-5.6-luna:max",
+			default: "openai-codex/gpt-6-luna:medium",
+			executor: "openai-codex/gpt-6-luna:xhigh",
+			planner: "openai-codex/gpt-6-luna:max",
+			critic: "openai-codex/gpt-6-luna:max",
+			architect: "openai-codex/gpt-6-luna:max",
 		},
 	},
 	{
@@ -78,10 +78,10 @@ const expectedProfiles: Array<{
 		requiredProviders: ["openai-codex"],
 		mapping: {
 			default: "openai-codex/gpt-6-astra:medium",
-			executor: "openai-codex/gpt-5.6-luna:xhigh",
+			executor: "openai-codex/gpt-6-luna:xhigh",
 			planner: "openai-codex/gpt-6-astra:xhigh",
-			critic: "openai-codex/gpt-5.6-sol:high",
-			architect: "openai-codex/gpt-5.6-terra:xhigh",
+			critic: "openai-codex/gpt-6.1-sol:high",
+			architect: "openai-codex/gpt-6.1-sol:xhigh",
 		},
 	},
 	{
@@ -89,10 +89,10 @@ const expectedProfiles: Array<{
 		requiredProviders: ["openai-codex"],
 		mapping: {
 			default: "openai-codex/gpt-6-astra:medium",
-			executor: "openai-codex/gpt-5.6-luna:max",
+			executor: "openai-codex/gpt-6-luna:max",
 			planner: "openai-codex/gpt-6-astra:xhigh",
-			critic: "openai-codex/gpt-5.6-sol:xhigh",
-			architect: "openai-codex/gpt-5.6-terra:xhigh",
+			critic: "openai-codex/gpt-6.1-sol:xhigh",
+			architect: "openai-codex/gpt-6.1-sol:xhigh",
 		},
 	},
 	{
@@ -100,8 +100,8 @@ const expectedProfiles: Array<{
 		requiredProviders: ["openai-codex"],
 		mapping: {
 			default: "openai-codex/gpt-6-astra:medium",
-			executor: "openai-codex/gpt-5.6-sol:max",
-			planner: "openai-codex/gpt-5.6-sol:max",
+			executor: "openai-codex/gpt-6.1-sol:max",
+			planner: "openai-codex/gpt-6.1-sol:max",
 			critic: "openai-codex/gpt-6-astra:max",
 			architect: "openai-codex/gpt-6-astra:max",
 		},
@@ -319,11 +319,11 @@ const expectedProfiles: Array<{
 		name: "claude-opus",
 		requiredProviders: ["anthropic"],
 		mapping: {
-			default: ["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:xhigh"],
-			executor: "anthropic/claude-sonnet-5",
-			planner: ["anthropic/claude-opus-5:low", "anthropic/claude-opus-4-6:low"],
-			critic: ["anthropic/claude-opus-5:high", "anthropic/claude-opus-4-6:high"],
-			architect: ["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:xhigh"],
+			default: ["anthropic/claude-opus-5-5:medium", "anthropic/claude-opus-4-6:xhigh"],
+			executor: "anthropic/claude-sonnet-5-5",
+			planner: ["anthropic/claude-opus-5-5:medium", "anthropic/claude-opus-4-6:low"],
+			critic: ["anthropic/claude-opus-5-5:high", "anthropic/claude-opus-4-6:high"],
+			architect: ["anthropic/claude-opus-5-5:high", "anthropic/claude-opus-4-6:xhigh"],
 		},
 	},
 	{
@@ -331,7 +331,7 @@ const expectedProfiles: Array<{
 		requiredProviders: ["anthropic"],
 		mapping: {
 			default: "anthropic/claude-fable-5-1:xhigh",
-			executor: "anthropic/claude-sonnet-5",
+			executor: "anthropic/claude-sonnet-5-5",
 			planner: "anthropic/claude-fable-5-1:low",
 			critic: "anthropic/claude-fable-5-1:high",
 			architect: "anthropic/claude-fable-5-1:xhigh",
@@ -671,22 +671,22 @@ const expectedProfiles: Array<{
 		name: "opus-codex",
 		requiredProviders: ["anthropic", "openai-codex"],
 		mapping: {
-			default: "anthropic/claude-opus-5:xhigh",
-			executor: "openai-codex/gpt-5.6-terra:low",
-			planner: "anthropic/claude-sonnet-5",
-			critic: "openai-codex/gpt-5.6-sol:xhigh",
-			architect: "openai-codex/gpt-5.6-sol:high",
+			default: "anthropic/claude-opus-5-5:medium",
+			executor: "openai-codex/gpt-6.1-sol:low",
+			planner: "anthropic/claude-sonnet-5-5",
+			critic: "openai-codex/gpt-6.1-sol:xhigh",
+			architect: "openai-codex/gpt-6.1-sol:high",
 		},
 	},
 	{
 		name: "codex-opencodego",
 		requiredProviders: ["openai-codex", "opencode-go"],
 		mapping: {
-			default: "openai-codex/gpt-5.6-sol:low",
+			default: "openai-codex/gpt-6.1-sol:low",
 			executor: "opencode-go/deepseek-v4-pro",
 			planner: "opencode-go/kimi-k3",
 			critic: "opencode-go/mimo-v2.5-pro",
-			architect: "openai-codex/gpt-5.6-sol:high",
+			architect: "openai-codex/gpt-6.1-sol:high",
 		},
 	},
 	{
@@ -694,10 +694,10 @@ const expectedProfiles: Array<{
 		requiredProviders: ["anthropic", "openai-codex"],
 		mapping: {
 			default: "anthropic/claude-fable-5-1:high",
-			executor: "openai-codex/gpt-5.6-terra:medium",
-			planner: "anthropic/claude-opus-5:medium",
-			critic: "anthropic/claude-opus-5:high",
-			architect: "openai-codex/gpt-5.6-sol:xhigh",
+			executor: "openai-codex/gpt-6.1-sol:medium",
+			planner: "anthropic/claude-opus-5-5:medium",
+			critic: "anthropic/claude-opus-5-5:high",
+			architect: "openai-codex/gpt-6.1-sol:xhigh",
 		},
 	},
 	{
@@ -705,7 +705,7 @@ const expectedProfiles: Array<{
 		requiredProviders: ["openai-codex", "anthropic"],
 		mapping: {
 			default: "openai-codex/gpt-6-astra:medium",
-			executor: "openai-codex/gpt-5.6-luna:max",
+			executor: "openai-codex/gpt-6-luna:max",
 			planner: "openai-codex/gpt-6-astra:xhigh",
 			critic: "anthropic/claude-fable-5-1:xhigh",
 			architect: "anthropic/claude-fable-5-1:xhigh",
@@ -716,8 +716,8 @@ const expectedProfiles: Array<{
 		requiredProviders: ["openai-codex", "anthropic"],
 		mapping: {
 			default: "openai-codex/gpt-6-astra:medium",
-			executor: "openai-codex/gpt-5.6-luna:max",
-			planner: "anthropic/claude-opus-5:medium",
+			executor: "openai-codex/gpt-6-luna:max",
+			planner: "anthropic/claude-opus-5-5:medium",
 			critic: "anthropic/claude-fable-5-1:xhigh",
 			architect: "anthropic/claude-fable-5-1:xhigh",
 		},
@@ -778,16 +778,16 @@ function builtinMapping(name: string): Record<Role, string> {
 	return profile.modelMapping as Record<Role, string>;
 }
 
-function substituteCodexFamily(selector: string, source: "sol" | "terra", target: "terra" | "luna"): string {
-	const match = /^openai-codex\/gpt-5\.6-(sol|terra|luna):(.+)$/.exec(selector);
-	if (!match) throw new Error(`Expected GPT-5.6 Codex selector, got: ${selector}`);
-	return match[1] === source ? `openai-codex/gpt-5.6-${target}:${match[2]}` : selector;
+function lowerSolToLuna(selector: string): string {
+	const match = /^openai-codex\/(gpt-6\.1-sol|gpt-6-luna):(.+)$/.exec(selector);
+	if (!match) throw new Error(`Expected Codex Sol or Luna selector, got: ${selector}`);
+	return `openai-codex/gpt-6-luna:${match[2]}`;
 }
 
 const fixedNonCodexComboMappings: Record<string, Partial<Record<Role, string>>> = {
 	"opus-codex": {
-		default: "anthropic/claude-opus-5:xhigh",
-		planner: "anthropic/claude-sonnet-5",
+		default: "anthropic/claude-opus-5-5:medium",
+		planner: "anthropic/claude-sonnet-5-5",
 	},
 	"codex-opencodego": {
 		executor: "opencode-go/deepseek-v4-pro",
@@ -796,15 +796,15 @@ const fixedNonCodexComboMappings: Record<string, Partial<Record<Role, string>>> 
 	},
 	"fable-opus-codex": {
 		default: "anthropic/claude-fable-5-1:high",
-		planner: "anthropic/claude-opus-5:medium",
-		critic: "anthropic/claude-opus-5:high",
+		planner: "anthropic/claude-opus-5-5:medium",
+		critic: "anthropic/claude-opus-5-5:high",
 	},
 	"astra-fable": {
 		critic: "anthropic/claude-fable-5-1:xhigh",
 		architect: "anthropic/claude-fable-5-1:xhigh",
 	},
 	"astra-fable-opus": {
-		planner: "anthropic/claude-opus-5:medium",
+		planner: "anthropic/claude-opus-5-5:medium",
 		critic: "anthropic/claude-fable-5-1:xhigh",
 		architect: "anthropic/claude-fable-5-1:xhigh",
 	},
@@ -816,10 +816,10 @@ describe("built-in model profile catalog", () => {
 		expect(BUILTIN_MODEL_PROFILES.map(profile => profile.name)).toEqual(
 			expectedProfiles.map(profile => profile.name),
 		);
-		const priorExpectedProfiles = expectedProfiles.filter(profile => !astraProfileNameSet.has(profile.name));
+		const priorExpectedProfiles = expectedProfiles.filter(profile => !additiveProfileNames.has(profile.name));
 		expect(priorExpectedProfiles).toHaveLength(58);
 		expect(
-			BUILTIN_MODEL_PROFILES.filter(profile => !astraProfileNameSet.has(profile.name)).map(profile => ({
+			BUILTIN_MODEL_PROFILES.filter(profile => !additiveProfileNames.has(profile.name)).map(profile => ({
 				name: profile.name,
 				requiredProviders: profile.requiredProviders,
 				mapping: profile.modelMapping,
@@ -965,18 +965,16 @@ describe("built-in model profile catalog", () => {
 		}
 	});
 
-	test("codex Eco is Medium with Terra lowered to Luna and Sol lowered to Terra", () => {
+	test("codex Eco is Medium with Sol lowered to Luna at the same effort", () => {
 		const eco = builtinMapping("codex-eco");
 		const medium = builtinMapping("codex-medium");
-		const loweredMedium = Object.fromEntries(
-			roles.map(role => [
-				role,
-				substituteCodexFamily(substituteCodexFamily(medium[role], "terra", "luna"), "sol", "terra"),
-			]),
-		) as Record<Role, string>;
+		const loweredMedium = Object.fromEntries(roles.map(role => [role, lowerSolToLuna(medium[role])])) as Record<
+			Role,
+			string
+		>;
 
 		expect(eco).toEqual(loweredMedium);
-		expect(Object.values(eco).some(selector => selector.includes("gpt-5.6-sol"))).toBe(false);
+		expect(Object.values(eco).some(selector => /gpt-6(\.1)?-sol/.test(selector))).toBe(false);
 	});
 
 	test("combo Codex roles project their source preset at the same role", () => {

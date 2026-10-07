@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import type { AssistantMessage } from "@gajae-code/ai";
+import { type CompactionSettings, resolveThresholdTokens } from "@gajae-code/agent-core/compaction";
+import type { AssistantMessage, Model } from "@gajae-code/ai";
+import { getBundledModel } from "@gajae-code/ai/models";
+
 import { AsyncJobManager } from "../../src/async";
 import type { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
@@ -9,6 +12,8 @@ import type { PlanModeState } from "../../src/plan-mode/state";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "../../src/sdk";
 import * as sdkModule from "../../src/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "../../src/session/agent-session";
+import type { AuthStorage } from "../../src/session/auth-storage";
+
 import { TaskTool } from "../../src/task";
 import * as discoveryModule from "../../src/task/discovery";
 import type { AgentDefinition, TaskParams } from "../../src/task/types";
@@ -94,13 +99,15 @@ function createSession(
 		parentEnableLsp?: boolean;
 		planMode?: PlanModeState;
 		taskEnableLsp?: boolean;
+		model?: Model;
 	} = {},
 ): ToolSession {
+	const authStorage = options.model ? ({} as unknown as AuthStorage) : undefined;
 	const modelRegistry = {
-		authStorage: undefined,
+		authStorage,
 		refresh: async () => {},
-		getAvailable: () => [],
-		getApiKey: async () => null,
+		getAvailable: () => (options.model ? [options.model] : []),
+		getApiKey: async () => (options.model ? "test-key" : null),
 	} as unknown as ModelRegistry;
 
 	return {
@@ -287,5 +294,32 @@ describe("subagent LSP availability", () => {
 
 		expect(getOptions()?.enableLsp).toBe(true);
 		expect(getOptions()?.toolNames).toEqual(["read", "search", "find", "lsp", "web_search"]);
+	});
+
+	it("uses the default 300K compaction threshold in a task-spawned 1M child", async () => {
+		const bundledModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!bundledModel) throw new Error("Expected bundled Anthropic model");
+		const model: Model = { ...bundledModel, contextWindow: 1_000_000 };
+		mockAgents({
+			name: "task",
+			description: "Task agent",
+			systemPrompt: "Use normal tools.",
+			source: "bundled",
+			model: [`${model.provider}/${model.id}`],
+		});
+		const { getOptions } = mockCreateAgentSession();
+
+		const tool = await TaskTool.create(createSession({ model }));
+		await executeDetached(tool, TEST_TASK);
+
+		const childOptions = getOptions();
+		if (!childOptions?.model || !childOptions.settings) throw new Error("Expected task child session options");
+		expect(childOptions.model.contextWindow).toBe(1_000_000);
+		expect(
+			resolveThresholdTokens(
+				childOptions.model.contextWindow,
+				childOptions.settings.getGroup("compaction") as CompactionSettings,
+			),
+		).toBe(300_000);
 	});
 });

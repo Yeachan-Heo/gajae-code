@@ -9,7 +9,7 @@
   - `packages/coding-agent/src/registry/agent-registry.ts` — process-global live agent directory.
   - `packages/coding-agent/src/session/agent-session.ts` — side-channel reply generation and history injection.
   - `packages/coding-agent/src/prompts/system/irc-incoming.md` — no-tools auto-reply prompt.
-  - `packages/coding-agent/src/tools/index.ts` — tool availability gating.
+  - `packages/coding-agent/src/tools/descriptors.ts` — tool availability gating.
   - `packages/coding-agent/src/config/settings-schema.ts` — `irc.enabled` default.
   - `packages/coding-agent/src/modes/controllers/event-controller.ts` — renders IRC events into chat UI.
   - `packages/coding-agent/src/modes/utils/ui-helpers.ts` — formats `[IRC]` transcript lines.
@@ -44,7 +44,7 @@
 
 ## Flow
 1. `IrcTool.createIf` only constructs the tool when `irc.enabled` is on and the session has both an `AgentRegistry` and `getAgentId` (`packages/coding-agent/src/tools/irc.ts`).
-2. Tool discovery adds another gate in `packages/coding-agent/src/tools/index.ts`: if the caller is `0-Main` and `async.enabled` is off, `irc` is hidden because the main agent cannot talk to concurrent peers in sync mode.
+2. Tool discovery adds another gate in `packages/coding-agent/src/tools/descriptors.ts`: `irc` is available only when `irc.enabled` is on and the session exposes both an agent registry and an agent id.
 3. `execute` resolves the process-global registry and sender id. Missing either returns a text error result instead of throwing.
 4. `op: "list"` calls `registry.listVisibleTo(senderId)`, which exposes every other agent in flat namespace whose status is `running` or `idle` (`packages/coding-agent/src/registry/agent-registry.ts`).
 5. `list` formats human-readable lines and returns `channels` as `['all', ...peerIds]`. These are logical targets only; there is no channel join state.
@@ -90,7 +90,7 @@
 ## Limits & Caps
 - Availability gates:
   - `irc.enabled` defaults to `true` in `packages/coding-agent/src/config/settings-schema.ts`.
-  - Main agent tool discovery suppresses `irc` when `async.enabled` is off (`packages/coding-agent/src/tools/index.ts`).
+  - `irc` is available only when the session exposes an agent registry and an agent id, in addition to `irc.enabled` (`packages/coding-agent/src/tools/descriptors.ts`).
 - Visibility scope: only peers in status `running` or `idle` are addressable via `listVisibleTo`.
 - Reply execution:
   - No tools are available in auto-reply turns (`toolChoice: "none"` in `runEphemeralTurn`).

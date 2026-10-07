@@ -7,6 +7,7 @@ import * as https from "node:https";
 import * as os from "node:os";
 import { Readable } from "node:stream";
 import type { Model } from "@gajae-code/ai";
+import { OPENAI_HEADER_VALUES } from "@gajae-code/ai/providers/openai-codex/constants";
 import type { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import type { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { CustomToolContext } from "@gajae-code/coding-agent/extensibility/custom-tools";
@@ -241,7 +242,10 @@ describe("imageGenTool", () => {
 		const result = await imageGenTool.execute("call-1", { subject: "a cat" }, undefined, ctx);
 		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
 
-		expect(userAgent).toMatch(/^pi\/[^\s]+ \(linux 4\.4\.302-Minimal-EAS-QTI_Haptic-R26; arm64\)$/);
+		const originatorRegex = new RegExp(
+			`^${OPENAI_HEADER_VALUES.ORIGINATOR_CODEX}/[^\\s]+ \\(linux 4\\.4\\.302-Minimal-EAS-QTI_Haptic-R26; arm64\\)$`,
+		);
+		expect(userAgent).toMatch(originatorRegex);
 		expect(userAgent).toMatch(/^[\x20-\x7e]+$/);
 		platformSpy.mockRestore();
 		releaseSpy.mockRestore();

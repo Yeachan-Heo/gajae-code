@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -7,10 +7,15 @@ import { YAML } from "bun";
 import { inspectConfigFile, runConfigCommand } from "../src/cli/config-cli";
 import { FileLockTestHooks } from "../src/config/file-lock";
 import { resetSettingsForTest, settings } from "../src/config/settings";
+import { getType, SETTINGS_SCHEMA, type SettingPath } from "../src/config/settings-schema";
+import { initTheme } from "../src/modes/theme/theme";
 
 let testAgentDir = "";
 const originalAgentDir = process.env.GJC_CODING_AGENT_DIR;
 const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
+
+// `config set` text confirmations render through the theme's status glyphs.
+beforeAll(() => initTheme());
 
 beforeEach(async () => {
 	resetSettingsForTest();
@@ -331,6 +336,68 @@ describe("config CLI schema coverage", () => {
 			expect(listOutput).not.toContain(secret);
 		});
 
+		it("redacts camelCase secret-suffixed keys such as notifications.slack.appToken on every output path", async () => {
+			const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+			const secret = "xapp-dummy-app-token-secret-321";
+			const key = "notifications.slack.appToken";
+			const drain = (): string => {
+				const text = logSpy.mock.calls.map(call => Bun.stripANSI(String(call[0] ?? ""))).join("\n");
+				logSpy.mockClear();
+				return text;
+			};
+
+			await runConfigCommand({ action: "set", key, value: secret, flags: {} });
+			const setText = drain();
+			await runConfigCommand({ action: "get", key, flags: {} });
+			const getText = drain();
+			await runConfigCommand({ action: "get", key, flags: { json: true } });
+			const getJson = drain();
+			await runConfigCommand({ action: "list", flags: {} });
+			const listText = drain();
+			await runConfigCommand({ action: "list", flags: { json: true } });
+			const listJson = drain();
+
+			expect(setText).toContain(`Set ${key} = <redacted>`);
+			expect(getText).toBe("<redacted>");
+			expect((JSON.parse(getJson) as { value: unknown }).value).toBe("<redacted>");
+			expect(listText).toContain(`${key} = <redacted>`);
+			expect((JSON.parse(listJson) as Record<string, { value: unknown }>)[key]?.value).toBe("<redacted>");
+			for (const rendered of [setText, getText, getJson, listText, listJson]) {
+				expect(rendered).not.toContain(secret);
+			}
+		});
+
+		it("redacts every secret-suffixed string setting and keeps token budgets visible", async () => {
+			const secretSuffix = /(token|secret|password|passwd|pwd|credentials?)$/i;
+			const allKeys = Object.keys(SETTINGS_SCHEMA) as SettingPath[];
+			const secretKeys = allKeys.filter(
+				key => getType(key) === "string" && secretSuffix.test(key.split(".").at(-1) ?? ""),
+			);
+			expect(secretKeys).toContain("notifications.slack.appToken");
+			const budgetKeys: SettingPath[] = [
+				"display.showTokenUsage",
+				"compaction.thresholdTokens",
+				"compaction.reserveTokens",
+				"memories.phase1InputTokenLimit",
+				"task.forkContext.maxTokens",
+				"hindsight.recallMaxTokens",
+			];
+			for (const key of budgetKeys) expect(["number", "boolean"]).toContain(getType(key));
+
+			const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+			// Any config command initializes the settings singleton before direct writes.
+			await runConfigCommand({ action: "get", key: "colorBlindMode", flags: { json: true } });
+			for (const key of secretKeys) settings.set(key as never, `dummy-value-for-${key}` as never);
+			await runConfigCommand({ action: "list", flags: { json: true } });
+			const listJson = JSON.parse(String(logSpy.mock.calls.at(-1)?.[0])) as Record<string, { value: unknown }>;
+
+			expect(secretKeys.filter(key => listJson[key]?.value !== "<redacted>")).toEqual([]);
+			for (const key of budgetKeys) {
+				expect(listJson[key]?.value).not.toBe("<redacted>");
+				expect(listJson[key]?.value).toEqual(settings.get(key));
+			}
+		});
+
 		it("shows secret-like values only with the explicit unsafe opt-in", async () => {
 			const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 			const secret = "broker-token-secret-789";
@@ -386,7 +453,7 @@ describe("config doctor vendor-separated delegation advisory", () => {
 			await doctorAdvisories([
 				"configSchemaVersion: 2",
 				"modelRoles:",
-				"  default: openai-codex/gpt-5.6-sol:low",
+				"  default: openai-codex/gpt-6.1-sol:low",
 				"task:",
 				"  eager: false",
 				"  agentModelOverrides:",

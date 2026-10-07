@@ -32,7 +32,6 @@ import { kProviderResolvedToolCall } from "../utils/block-symbols";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { transportFailureFacts } from "../utils/fallback-transport";
 import { FirstEventTimeoutError, getStreamFirstEventTimeoutMs, getStreamIdleTimeoutMs } from "../utils/idle-iterator";
-import { captureUnicodeEscapeEvidence, parseStreamingJson } from "../utils/json-parse";
 import { connectProxiedSocket, getProxyForUrl } from "../utils/proxy";
 import { formatErrorMessageWithRetryAfter } from "../utils/retry-after";
 import { flattenToolRootCombinators, toolWireSchema } from "../utils/schema";
@@ -2288,10 +2287,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			}
 			if (state.currentToolCall) {
 				const idx = output.content.indexOf(state.currentToolCall);
-				state.currentToolCall.arguments = parseStreamingJson(state.currentToolCall.partialJson);
-				captureUnicodeEscapeEvidence(state.currentToolCall, state.currentToolCall.partialJson ?? "");
-				delete (state.currentToolCall as any).partialJson;
-				delete (state.currentToolCall as any).index;
+				delete (state.currentToolCall as Partial<ToolCallState>).index;
+				delete (state.currentToolCall as Partial<ToolCallState>).kind;
 				stream.push({
 					type: "toolcall_end",
 					contentIndex: idx,
@@ -2428,9 +2425,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 
 type ToolCallState = ToolCall & {
 	index: number;
-	partialJson?: string;
-	kind: "mcp" | "todo_write" | "native" | "cursor-exec";
-	[kProviderResolvedToolCall]?: true;
+	kind: "todo_write" | "native" | "cursor-exec";
+	[kProviderResolvedToolCall]: true;
 };
 
 interface BlockState {
@@ -2491,6 +2487,57 @@ async function handleServerMessage(
 	} else if (msgCase === "conversationCheckpointUpdate") {
 		handleConversationCheckpointUpdate(msg.message.value, output, usageState, onConversationCheckpoint);
 	}
+}
+
+/** Offline test seam for the same server-message boundary used by streamCursor. */
+export function createCursorServerMessageHandlerForTest(
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+	write: (frame: Uint8Array, done: () => void) => boolean,
+	options: CursorOptions = {},
+): (message: AgentServerMessage) => Promise<void> {
+	const state: BlockState = {
+		currentTextBlock: null,
+		currentThinkingBlock: null,
+		currentToolCall: null,
+		firstTokenTime: undefined,
+		setTextBlock(block) {
+			this.currentTextBlock = block;
+		},
+		setThinkingBlock(block) {
+			this.currentThinkingBlock = block;
+		},
+		setToolCall(block) {
+			this.currentToolCall = block;
+		},
+		setFirstTokenTime() {
+			this.firstTokenTime ??= Date.now();
+		},
+	};
+	const usageState: UsageState = {
+		sawTokenDelta: false,
+		conversationUsedTokens: 0,
+		checkpointOutputTokens: 0,
+		hasConversationCheckpoint: false,
+	};
+	const writer = { write, isActive: () => true } as unknown as CursorRequestWriter;
+	const blobs = new Map<string, Uint8Array>();
+	return message =>
+		handleServerMessage(
+			message,
+			output,
+			stream,
+			state,
+			blobs,
+			writer,
+			options.execHandlers,
+			options.onToolResult,
+			usageState,
+			[],
+			undefined,
+			[],
+			options.signal,
+		);
 }
 
 function handleKvServerMessage(
@@ -3164,6 +3211,7 @@ async function handleExecServerMessage(
 		case "mcpArgs": {
 			const args = execMsg.message.value;
 			const mcpCall = decodeMcpCall(args);
+			synthesizeCursorExecToolCall(output, stream, mcpCall.toolCallId, mcpCall.toolName, mcpCall.args);
 			const { execResult } = await resolveExecHandler(
 				mcpCall,
 				execHandlers?.mcp?.bind(execHandlers),
@@ -4063,17 +4111,6 @@ function decodeMcpArgValue(value: Uint8Array): unknown {
 	return parseToolArgsJson(text);
 }
 
-function decodeMcpArgsMap(args?: Record<string, Uint8Array>): Record<string, unknown> | undefined {
-	if (!args) {
-		return undefined;
-	}
-	const decoded: Record<string, unknown> = {};
-	for (const [key, value] of Object.entries(args)) {
-		decoded[key] = decodeMcpArgValue(value);
-	}
-	return decoded;
-}
-
 function decodeMcpCall(args: {
 	name: string;
 	args: Record<string, Uint8Array>;
@@ -4089,7 +4126,7 @@ function decodeMcpCall(args: {
 		name: args.name,
 		providerIdentifier: args.providerIdentifier,
 		toolName: args.toolName || args.name,
-		toolCallId: args.toolCallId,
+		toolCallId: args.toolCallId || crypto.randomUUID(),
 		args: decodedArgs,
 		rawArgs: args.args ?? {},
 	};
@@ -4336,7 +4373,7 @@ const CURSOR_EXEC_OWNED_TOOL_CASES = new Set([
 ]);
 
 function isExecOwnedToolCall(toolCall: any): boolean {
-	return CURSOR_EXEC_OWNED_TOOL_CASES.has(toolCall?.tool?.case);
+	return !!selectMcpToolCall(toolCall) || CURSOR_EXEC_OWNED_TOOL_CASES.has(toolCall?.tool?.case);
 }
 
 export function buildNativeToolCallBlock(
@@ -4358,6 +4395,7 @@ export function buildNativeToolCallBlock(
 					: { raw: convertedArgs },
 			index,
 			kind: "native",
+			[kProviderResolvedToolCall]: true,
 		};
 	}
 	for (const [key, payload] of Object.entries(toolCall)) {
@@ -4380,6 +4418,7 @@ export function buildNativeToolCallBlock(
 			arguments: safeArguments,
 			index,
 			kind: "native",
+			[kProviderResolvedToolCall]: true,
 		};
 	}
 	return null;
@@ -4445,6 +4484,7 @@ function synthesizeCursorExecToolCall(
 	name: string,
 	args: Record<string, unknown>,
 ): void {
+	if (output.content.some(block => block.type === "toolCall" && block.id === toolCallId)) return;
 	const block: ToolCallState = {
 		type: "toolCall",
 		id: toolCallId,
@@ -4518,33 +4558,19 @@ function processInteractionUpdate(
 			state.setThinkingBlock(null);
 		}
 	} else if (updateCase === "toolCallStarted" && isExecOwnedToolCall(update.message.value.toolCall)) {
-		// Pi stream call IDs and exec IDs are distinct namespaces; without a shared
-		// correlation field, suppress the streamed variant and synthesize from exec.
+		// Exec owns MCP and Pi tools. Suppress interaction announcements and
+		// synthesize canonical, provider-resolved blocks before executing them.
 		log("exec", "streamedToolCallOwnedByExec", { case: update.message.value.toolCall?.tool?.case });
 	} else if (updateCase === "toolCallStarted") {
 		const toolCall = update.message.value.toolCall;
 		if (toolCall) {
-			const mcpCall = selectMcpToolCall(toolCall);
-			if (mcpCall) {
-				const args = mcpCall.args || {};
-				const block: ToolCallState = {
-					type: "toolCall",
-					id: args.toolCallId || crypto.randomUUID(),
-					name: args.name || args.toolName || "",
-					arguments: {},
-					index: output.content.length,
-					partialJson: "",
-					kind: "mcp",
-				};
-				output.content.push(block);
-				state.setToolCall(block);
-				stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
-				return;
-			}
+			const callId = update.message.value.callId || crypto.randomUUID();
+			// Repeated announcements describe the same provider-owned execution.
+			if (output.content.some(block => block.type === "toolCall" && block.id === callId)) return;
 
 			const todoArgs = buildTodoWriteArgs(toolCall);
 			if (todoArgs) {
-				const callId = update.message.value.callId || crypto.randomUUID();
+				// Cursor owns its todo state; this snapshot is for display, not local { ops } dispatch.
 				const block: ToolCallState = {
 					type: "toolCall",
 					id: callId,
@@ -4552,6 +4578,7 @@ function processInteractionUpdate(
 					arguments: todoArgs,
 					index: output.content.length,
 					kind: "todo_write",
+					[kProviderResolvedToolCall]: true,
 				};
 				output.content.push(block);
 				state.setToolCall(block);
@@ -4562,44 +4589,26 @@ function processInteractionUpdate(
 			// Fallback: cursor-native tool variants (shell/glob/grep/…) we don't model
 			// explicitly. Render them so the call and its result are visible instead of
 			// vanishing.
-			const nativeBlock = buildNativeToolCallBlock(
-				toolCall,
-				update.message.value.callId || crypto.randomUUID(),
-				output.content.length,
-			);
+			const nativeBlock = buildNativeToolCallBlock(toolCall, callId, output.content.length);
 			if (nativeBlock) {
 				output.content.push(nativeBlock);
 				state.setToolCall(nativeBlock);
 				stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
 			}
 		}
-	} else if (updateCase === "toolCallDelta" || updateCase === "partialToolCall") {
-		if (state.currentToolCall?.kind === "mcp") {
-			const delta = update.message.value.argsTextDelta || "";
-			state.currentToolCall.partialJson = `${state.currentToolCall.partialJson ?? ""}${delta}`;
-			state.currentToolCall.arguments = parseStreamingJson(state.currentToolCall.partialJson ?? "");
-			const idx = output.content.indexOf(state.currentToolCall);
-			stream.push({ type: "toolcall_delta", contentIndex: idx, delta, partial: output });
-		}
 	} else if (updateCase === "toolCallCompleted") {
+		if (isExecOwnedToolCall(update.message.value.toolCall)) return;
 		if (state.currentToolCall) {
 			const toolCall = update.message.value.toolCall;
-			if (state.currentToolCall.kind === "mcp") {
-				captureUnicodeEscapeEvidence(state.currentToolCall, state.currentToolCall.partialJson ?? "");
-				const decodedArgs = decodeMcpArgsMap(selectMcpToolCall(toolCall)?.args?.args);
-				if (decodedArgs) {
-					state.currentToolCall.arguments = decodedArgs;
-				}
-			} else if (state.currentToolCall.kind === "todo_write" && toolCall) {
+			if (state.currentToolCall.kind === "todo_write" && toolCall) {
 				const todoArgs = buildTodoWriteArgs(toolCall);
 				if (todoArgs) {
 					state.currentToolCall.arguments = todoArgs;
 				}
 			}
 			const idx = output.content.indexOf(state.currentToolCall);
-			delete (state.currentToolCall as any).partialJson;
-			delete (state.currentToolCall as any).index;
-			delete (state.currentToolCall as any).kind;
+			delete (state.currentToolCall as Partial<ToolCallState>).index;
+			delete (state.currentToolCall as Partial<ToolCallState>).kind;
 			stream.push({ type: "toolcall_end", contentIndex: idx, toolCall: state.currentToolCall, partial: output });
 			state.setToolCall(null);
 		}
@@ -4609,7 +4618,8 @@ function processInteractionUpdate(
 		const tokenDelta = update.message.value;
 		usageState.sawTokenDelta = true;
 		output.usage.output += tokenDelta.tokens || 0;
-		output.usage.totalTokens = output.usage.input + output.usage.output;
+		output.usage.totalTokens =
+			output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
 	}
 }
 
@@ -4636,7 +4646,8 @@ export function finalizeCursorUsage(output: AssistantMessage, usageState: UsageS
 	if (!usageState.hasConversationCheckpoint && used <= 0) return;
 	const outputIncludedInSnapshot = usageState.hasConversationCheckpoint ? usageState.checkpointOutputTokens : 0;
 	output.usage.input = Math.max(0, used - outputIncludedInSnapshot);
-	output.usage.totalTokens = output.usage.input + output.usage.output;
+	output.usage.totalTokens =
+		output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
 }
 
 export function finalizeCursorUsageForTest(

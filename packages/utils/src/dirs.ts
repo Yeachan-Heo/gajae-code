@@ -5,20 +5,26 @@
  * config root and GJC_CODING_AGENT_DIR (legacy alias PI_CODING_AGENT_DIR) to
  * override the agent directory.
  *
- * On Linux, if XDG_DATA_HOME / XDG_STATE_HOME / XDG_CACHE_HOME environment
- * variables are set, paths are redirected to XDG-compliant locations under
- * $XDG_*_HOME/gjc/. This requires running `gjc config migrate` first to
- * move data to the new locations. No filesystem existence checks are performed
- * — if the env var is set, gjc trusts that the migration has been done.
+ * On Linux and macOS, a category (data, state, cache) is redirected to
+ * $XDG_*_HOME/gjc/ only when the trusted XDG_*_HOME variable is set, the
+ * $XDG_*_HOME/gjc directory already exists (`gjc config init-xdg` creates it),
+ * and the agent directory is the default. Otherwise paths stay under the config
+ * root. `init-xdg` only creates the directories; existing data is not moved.
  */
 
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { engines, version } from "../package.json" with { type: "json" };
 import { resolveCanonicalLogsDir } from "./canonical-log-dir";
+import { APP_NAME } from "./cli-metadata";
 import { canonicalEnvKey, type ProjectEnvSnapshot, projectEnvSnapshot } from "./env-file";
 
+/**
+ * Entry metadata lives in the pure `cli-metadata` leaf so the actual CLI entry can
+ * import it without loading this module's load-time directory resolution. These
+ * re-exports keep the existing `@gajae-code/utils/dirs` surface unchanged.
+ */
+export { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "./cli-metadata";
 // The provenance snapshot and its key fold live in the leaf `env-file` module so
 // `scripts/test-preload.ts` can share this exact logic without importing this
 // module (whose load-time resolver construction would freeze state before the
@@ -27,69 +33,8 @@ import { canonicalEnvKey, type ProjectEnvSnapshot, projectEnvSnapshot } from "./
 // module's public surface.
 export { canonicalEnvKey };
 
-/** App name (e.g. "gjc") */
-export const APP_NAME: string = "gjc";
-
 /** Config directory name (e.g. ".gjc") */
 export const CONFIG_DIR_NAME: string = ".gjc";
-
-/** Version (e.g. "1.0.0") */
-export const VERSION: string = version;
-
-/** Minimum Bun version */
-export const MIN_BUN_VERSION: string = engines.bun.replace(/[^0-9.]/g, "");
-
-/**
- * Build the diagnostic shown when the Bun runtime executing `gjc` is older
- * than {@link MIN_BUN_VERSION}. This is the most common Windows native-install
- * failure (issue #525): `bun install -g gajae-code` probes a recent Bun while
- * the `gjc` launcher resolves an older Bun still on PATH. The message names the
- * exact detected runtime path and gives a platform-specific upgrade + PATH fix
- * instead of a bare `bun upgrade`.
- *
- * Pure and platform-parameterized so it can be unit-tested cross-platform.
- */
-export function formatBunRuntimeError(opts: {
-	currentVersion: string;
-	minVersion: string;
-	execPath?: string;
-	platform?: NodeJS.Platform;
-}): string {
-	const platform = opts.platform ?? process.platform;
-	const lines = [
-		`error: ${APP_NAME} requires Bun >= ${opts.minVersion}, but the running Bun is v${opts.currentVersion}.`,
-	];
-	if (opts.execPath) {
-		lines.push(`  detected Bun runtime: ${opts.execPath}`);
-	}
-	if (platform === "win32") {
-		lines.push(
-			"",
-			"The 'gjc' launcher is using an older Bun than the one used to install it.",
-			"Upgrade Bun, then restart your terminal so PATH and the runtime refresh:",
-			"",
-			'  powershell -c "irm bun.sh/install.ps1|iex"',
-			"",
-			"After restarting the terminal, verify both versions match:",
-			"  bun --version",
-			"  gjc --version",
-			"",
-			"If 'gjc' still loads the old runtime, make sure %USERPROFILE%\\.bun\\bin is",
-			"first on PATH and remove any stale Bun installs shadowing it.",
-		);
-	} else {
-		lines.push(
-			"",
-			"Upgrade Bun, then restart your terminal:",
-			"  bun upgrade",
-			"",
-			"Then verify:",
-			"  bun --version",
-			"  gjc --version",
-		);
-	}
-	return `${lines.join("\n")}\n`;
-}
 
 // =============================================================================
 // Project directory
@@ -883,6 +828,11 @@ export function getGithubCacheDbPath(): string {
 /** Get the durable tool-choice capability cache path. */
 export function getToolChoiceCapabilityCachePath(): string {
 	return dirs.rootSubdir(path.join("cache", "tool-choice-capabilities.db"), "cache");
+}
+
+/** Get the resolved Claude Code client-version cache path (~/.gjc/cache/claude-code-version.json). */
+export function getClaudeCodeVersionCachePath(): string {
+	return dirs.rootSubdir(path.join("cache", "claude-code-version.json"), "cache");
 }
 
 /** Get the natives directory (~/.gjc/natives). */

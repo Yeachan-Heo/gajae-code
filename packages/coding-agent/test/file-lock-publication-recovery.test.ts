@@ -71,6 +71,21 @@ async function makeFixture(parent = os.tmpdir()): Promise<Fixture> {
 	return { root, file, lock: `${file}.lock` };
 }
 
+async function deadPid(): Promise<number> {
+	const child = Bun.spawn(["sh", "-c", "exit 0"], { stdout: "ignore", stderr: "ignore" });
+	await child.exited;
+	return child.pid;
+}
+
+function removalInfo(pid: number, ownerHostId?: string): string {
+	return JSON.stringify({
+		pid,
+		timestamp: Date.now(),
+		owner_token: crypto.randomUUID(),
+		...(ownerHostId === undefined ? {} : { owner_host_id: ownerHostId }),
+	});
+}
+
 function treeSnapshot(directory: string): NativeDirectoryTreeSnapshot {
 	const captured = snapshotDirectoryTree(directory);
 	expect(captured.ok).toBe(true);
@@ -791,6 +806,123 @@ describe.skipIf(process.platform !== "linux")("file lock committed publication r
 		expect(treeSnapshot(`${lock}.removing`)).toEqual(recordedSnapshot(retained));
 		expect(await Bun.file(path.join(`${lock}.removing`, "info")).text()).toBe("foreign predecessor");
 		expect(await fs.readdir(root)).toEqual([path.basename(`${lock}.removing`)]);
+	});
+});
+
+describe.skipIf(process.platform === "win32")("file lock abandoned removal recovery", () => {
+	test("adopts an abandoned parseable removal transition and acquires", async () => {
+		const { file, lock } = await makeFixture();
+		const transition = `${lock}.removing`;
+		await fs.mkdir(transition);
+		await Bun.write(path.join(transition, "info"), removalInfo(await deadPid(), "host-a"));
+
+		const release = await acquireFileLock(file, { ...quickAcquire, ownerHostId: "host-a" });
+		try {
+			await expect(fs.lstat(transition)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			await release();
+		}
+		await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	test("hostless dead transition removed in a single acquire, info not left truncated", async () => {
+		const { file, lock } = await makeFixture();
+		const transition = `${lock}.removing`;
+		const infoPath = path.join(transition, "info");
+		await fs.mkdir(transition);
+		await Bun.write(infoPath, removalInfo(await deadPid()));
+
+		let release: (() => Promise<void>) | undefined;
+		try {
+			release = await acquireFileLock(file, { ...quickAcquire, ownerHostId: "host-a" });
+		} catch (error) {
+			if (await fs.exists(infoPath)) expect(await Bun.file(infoPath).size).not.toBe(0);
+			throw error;
+		}
+		try {
+			await expect(fs.lstat(transition)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			await release();
+		}
+	});
+
+	test("preserves a hostless live transition for a host-qualified acquirer", async () => {
+		const { file, lock } = await makeFixture();
+		const transition = `${lock}.removing`;
+		await fs.mkdir(transition);
+		await Bun.write(path.join(transition, "info"), removalInfo(process.pid));
+		const retained = treeSnapshot(transition);
+
+		await expect(acquireFileLock(file, { ...quickAcquire, ownerHostId: "host-a" })).rejects.toMatchObject({
+			code: "acquire_timeout",
+		});
+		expect(treeSnapshot(transition)).toEqual(retained);
+	});
+
+	test("preserves a removal transition held by a live owner", async () => {
+		const { file, lock } = await makeFixture();
+		const transition = `${lock}.removing`;
+		await fs.mkdir(transition);
+		await Bun.write(path.join(transition, "info"), removalInfo(process.pid, "host-a"));
+		const retained = treeSnapshot(transition);
+
+		await expect(acquireFileLock(file, { ...quickAcquire, ownerHostId: "host-a" })).rejects.toMatchObject({
+			code: "acquire_timeout",
+		});
+		expect(treeSnapshot(transition)).toEqual(retained);
+	});
+
+	test("preserves a removal transition owned by a foreign host", async () => {
+		const { file, lock } = await makeFixture();
+		const transition = `${lock}.removing`;
+		await fs.mkdir(transition);
+		await Bun.write(path.join(transition, "info"), removalInfo(await deadPid(), "foreign-host"));
+		const retained = treeSnapshot(transition);
+
+		await expect(acquireFileLock(file, { ...quickAcquire, ownerHostId: "host-a" })).rejects.toMatchObject({
+			code: "acquire_timeout",
+		});
+		expect(treeSnapshot(transition)).toEqual(retained);
+	});
+
+	test("preserves an abandoned transition containing an unproven payload", async () => {
+		const { file, lock } = await makeFixture();
+		const transition = `${lock}.removing`;
+		await fs.mkdir(transition);
+		await Bun.write(path.join(transition, "info"), removalInfo(await deadPid(), "host-a"));
+		await Bun.write(path.join(transition, "payload"), "must survive");
+		const retained = treeSnapshot(transition);
+
+		await expect(acquireFileLock(file, { ...quickAcquire, ownerHostId: "host-a" })).rejects.toMatchObject({
+			code: "acquire_timeout",
+		});
+		expect(treeSnapshot(transition)).toEqual(retained);
+		expect(await Bun.file(path.join(transition, "payload")).text()).toBe("must survive");
+	});
+
+	test("adopts a host-less abandoned transition and acquires", async () => {
+		const { file, lock } = await makeFixture();
+		const transition = `${lock}.removing`;
+		await fs.mkdir(transition);
+		await Bun.write(path.join(transition, "info"), removalInfo(await deadPid()));
+
+		const release = await acquireFileLock(file, quickAcquire);
+		try {
+			await expect(fs.lstat(transition)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			await release();
+		}
+	});
+
+	test("preserves a host-qualified abandoned transition for a host-less acquirer", async () => {
+		const { file, lock } = await makeFixture();
+		const transition = `${lock}.removing`;
+		await fs.mkdir(transition);
+		await Bun.write(path.join(transition, "info"), removalInfo(await deadPid(), "host-a"));
+		const retained = treeSnapshot(transition);
+
+		await expect(acquireFileLock(file, quickAcquire)).rejects.toMatchObject({ code: "acquire_timeout" });
+		expect(treeSnapshot(transition)).toEqual(retained);
 	});
 });
 

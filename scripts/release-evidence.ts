@@ -539,6 +539,26 @@ function createCanonicalTarball(entries: readonly TarEntry[]): Buffer {
 	return gzip;
 }
 
+/** One validated regular-file member of a package tarball. */
+export interface PackageTarballMember {
+	readonly path: string;
+	readonly mode: number;
+	readonly data: Buffer;
+}
+
+/**
+ * Bounded, validated regular-file members in archive order. Directory entries
+ * are omitted; any parser violation rejects the whole result.
+ */
+export function readPackageTarballMembers(
+	tarball: Uint8Array,
+	limits: TarballLimits = RELEASE_TARBALL_LIMITS,
+): PackageTarballMember[] {
+	return parseTarEntries(tarball, limits)
+		.filter(entry => entry.type === "file")
+		.map(({ path, mode, data }) => ({ path, mode, data }));
+}
+
 /** Normalizes a package tarball to the release's reproducible ustar/gzip form. */
 export function canonicalizePackageTarball(tarball: Uint8Array, limits: TarballLimits = RELEASE_TARBALL_LIMITS): Buffer {
 	return createCanonicalTarball(parseTarEntries(tarball, limits));

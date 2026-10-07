@@ -61,17 +61,32 @@ function instanceDirectories(root: string): string[] {
 		.filter(directory => fs.lstatSync(directory).isDirectory() && !fs.lstatSync(directory).isSymbolicLink());
 }
 
-/** Mirrors the production probe: UTC-pinned render, explicitly absolute parse. */
-function currentProcessStartTimeMs(): number | null {
+/** Mirrors the production probe: Linux `/proc` ticks + boot id, else a UTC-pinned `ps` render. */
+function currentProcessStart(): { startTimeMs: number | null; basis: string } {
+	if (process.platform === "linux") {
+		const bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+		const stat = fs.readFileSync(`/proc/${process.pid}/stat`, "utf8");
+		const ticks = Number(
+			stat
+				.slice(stat.lastIndexOf(")") + 1)
+				.trim()
+				.split(/\s+/)[19],
+		);
+		return { startTimeMs: Number.isSafeInteger(ticks) ? ticks : null, basis: `linux-proc-ticks:${bootId}` };
+	}
 	const result = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(process.pid)], {
 		stdout: "pipe",
 		stderr: "ignore",
 		env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" },
 	});
-	if (result.exitCode !== 0) return null;
+	if (result.exitCode !== 0) return { startTimeMs: null, basis: "utc" };
 	const rendered = new TextDecoder().decode(result.stdout).trim();
 	const startTimeMs = rendered ? Date.parse(`${rendered} GMT`) : Number.NaN;
-	return Number.isFinite(startTimeMs) ? startTimeMs : null;
+	return { startTimeMs: Number.isFinite(startTimeMs) ? startTimeMs : null, basis: "utc" };
+}
+
+function currentProcessStartTimeMs(): number | null {
+	return currentProcessStart().startTimeMs;
 }
 
 describe.skipIf(process.platform === "win32")("resident-cache lease-aware GC", () => {
@@ -150,7 +165,7 @@ describe.skipIf(process.platform === "win32")("resident-cache lease-aware GC", (
 		const live = createInstance(cacheRoot, "i-live-owner", {
 			pid: process.pid,
 			startTimeMs: currentProcessStartTimeMs(),
-			startTimeBasis: "utc",
+			startTimeBasis: currentProcessStart().basis,
 			nonce: "live-owner",
 		});
 
@@ -167,7 +182,7 @@ describe.skipIf(process.platform === "win32")("resident-cache lease-aware GC", (
 		const stale = createInstance(cacheRoot, "i-reused-pid", {
 			pid: process.pid,
 			startTimeMs: startTimeMs + 60_000,
-			startTimeBasis: "utc",
+			startTimeBasis: currentProcessStart().basis,
 			nonce: "reused-pid",
 		});
 
@@ -197,13 +212,51 @@ describe.skipIf(process.platform === "win32")("resident-cache lease-aware GC", (
 		expect(fs.existsSync(live)).toBe(true);
 	});
 
+	// On Linux `ps -o lstart` is `btime + ticks`, and `btime` is re-derived from the
+	// slewed wall clock, so a live owner's rendered start drifts (observed on WSL2:
+	// 15 minutes over 11 hours). A lease written on that drifting basis must never
+	// be read as PID reuse; only a same-basis tick mismatch proves reuse.
+	it.skipIf(process.platform !== "linux")(
+		"keeps a live owner whose lease carries a drifted wall-clock start time",
+		async () => {
+			const startTimeMs = Date.now() - 15 * 60 * 1000;
+			const cacheRoot = path.join(makeTempDir(), "resident-cache");
+			makeVerifiedRoot(cacheRoot);
+			const live = createInstance(cacheRoot, "i-drifted-wall-clock", {
+				pid: process.pid,
+				startTimeMs,
+				startTimeBasis: "utc",
+				nonce: "drifted-wall-clock",
+			});
+
+			await sweepResidentCacheRoot(cacheRoot);
+
+			expect(fs.existsSync(live)).toBe(true);
+		},
+	);
+
+	it.skipIf(process.platform !== "linux")("keeps a live owner whose lease is from another boot", async () => {
+		const cacheRoot = path.join(makeTempDir(), "resident-cache");
+		makeVerifiedRoot(cacheRoot);
+		const live = createInstance(cacheRoot, "i-other-boot", {
+			pid: process.pid,
+			startTimeMs: 1,
+			startTimeBasis: "linux-proc-ticks:00000000-0000-0000-0000-000000000000",
+			nonce: "other-boot",
+		});
+
+		await sweepResidentCacheRoot(cacheRoot);
+
+		expect(fs.existsSync(live)).toBe(true);
+	});
+
 	it("labels a freshly written owner lease as an absolute start time", () => {
 		const cacheRoot = path.join(makeTempDir(), "resident-cache");
 		const instanceDir = openVerifiedResidentCacheInstanceDir(cacheRoot);
 		try {
 			const owner = JSON.parse(fs.readFileSync(path.join(instanceDir, "owner.json"), "utf8")) as ResidentCacheOwner;
 
-			expect(owner.startTimeBasis).toBe("utc");
+			expect(owner.startTimeBasis).toBe(currentProcessStart().basis);
 			expect(owner.startTimeMs).toBe(currentProcessStartTimeMs());
 		} finally {
 			disposeVerifiedResidentCacheInstanceDir(instanceDir);

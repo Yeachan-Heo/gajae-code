@@ -608,7 +608,17 @@ Project executor override body.
 		const ralplan = await Bun.file(
 			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "ralplan", "SKILL.md"),
 		).text();
-		expect(ralplan).toContain("counts as opting into execution for that skill");
+		expect(ralplan).toContain("it does not replace structured approval for the current final artifact");
+		expect(ralplan).toContain("Never invent a direct approval record or infer execution consent from the skill name");
+		expect(ralplan).toContain("even if the user already named an execution skill");
+		expect(ralplan).toContain("A revised final artifact requires a fresh structured approval");
+		expect(ralplan).toContain(
+			'"plan this, then use `/skill:ultragoal`" still requires the tagged final approval `ask`',
+		);
+		expect(ralplan).toContain(
+			"Free text, refinement, cancellation, timeout, and **Stop here** do not authorize execution",
+		);
+		expect(ralplan).not.toContain("skip the re-ask");
 		expect(ralplan).toContain("gjc.ralplan.autoHandoff");
 		expect(ralplan).toContain("`off` (default), `ultragoal`, or `autoresearch`");
 		expect(ralplan).not.toContain("team_unavailable");
@@ -683,6 +693,33 @@ Project executor override body.
 		]) {
 			expect(content).not.toContain(forbidden);
 		}
+	});
+
+	it("documents full initial Crystal coverage and an explicit Phase 5 execution approval gate", () => {
+		const content =
+			getDefaultGjcDefinitions().find(
+				definition => definition.kind === "skill" && definition.name === "deep-interview",
+			)?.content ?? "";
+		expect(content).toContain("`snapshot.start` MUST be 0");
+		expect(content).toContain("exactly 200 is valid");
+		expect(content).toContain("canonical stored prior Crystal preserving the prefix");
+		expect(content).toContain("continue the ordinary interview flow");
+		const phase5 = content.split("## Phase 5: Execution Bridge")[1]?.split("### Phase 5b:")[0] ?? "";
+		const example = phase5.match(/```json\n([\s\S]*?)\n```/);
+		expect(example).not.toBeNull();
+		const input = JSON.parse(example![1]!);
+		expect(input.questions).toHaveLength(1);
+		expect(input.questions[0].workflowGate).toEqual({ stage: "deep-interview", kind: "execution" });
+		expect(input.questions[0].multi).toBe(false);
+		expect(input.questions[0].options).toContainEqual({
+			label: "Execute with ultragoal (only when spec is already implementation-ready and really simple)",
+		});
+		expect(phase5).toContain("separate `gjc deep-interview approve-execution --json` action");
+		expect(phase5).toContain("require that action to succeed before invoking `/skill:ultragoal`");
+		expect(phase5).toContain("does not itself authorize or automatically start implementation");
+		expect(phase5).toContain(
+			"Research/refinement choices, custom responses, cancellation, timeout, and untagged asks do not grant execution approval",
+		);
 	});
 
 	it("renders deep-interview arguments once through the loader-owned User field", async () => {

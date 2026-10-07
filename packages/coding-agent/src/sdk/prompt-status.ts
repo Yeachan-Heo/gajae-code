@@ -48,10 +48,14 @@ export interface TurnPromptInput {
 }
 
 /**
- * Terminal outcome is preserved exactly; active records never age into terminal. A
- * prompt that is active at process restart is finalized from its durable pending
+ * Terminal outcome is preserved exactly; active records never age into terminal. An
+ * ordinary prompt active at process restart is finalized from its durable pending
  * outcome (or `prompt_failed` when it has none), so it never reports as unknown.
+ * A `deadlineRecoveryPending` prompt is the safety exception: its status remains
+ * accepted/in-flight and its pending outcome stays private until exact execution
+ * settlement is proven.
  */
+import type { ProviderDiagnostic } from "@gajae-code/ai/core";
 import type { ReceiptState } from "./receipt-state";
 
 export type PromptReconciliationStatus = "accepted" | "in_flight" | "terminal_ok" | "failed";
@@ -96,6 +100,14 @@ export type SdkPromptTerminalOutcome =
 			category: SdkPromptFailureCategory;
 			/** Bounded safe provider/transport classifier when the provider supplied one. */
 			providerCode?: string;
+			/**
+			 * Bounded provider failure family, present only when the provider adapter
+			 * classified the failure from its own structured metadata. Purely
+			 * additive: `code`, `message`, `phase`, `category` and `providerCode`
+			 * are identical with or without it, and a malformed value is dropped
+			 * rather than invalidating the outcome.
+			 */
+			providerDiagnostic?: ProviderDiagnostic;
 	  };
 
 /** Exactly one selector per lookup. */

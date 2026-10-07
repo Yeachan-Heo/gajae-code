@@ -17,7 +17,7 @@
   - `packages/coding-agent/src/web/search/providers/brave.ts` — Brave Search API adapter.
   - `packages/coding-agent/src/web/search/providers/duckduckgo.ts` — keyless DuckDuckGo html/lite scrape adapter (permissionless default/fallback).
   - `packages/coding-agent/src/web/search/providers/insane.ts` — keyless safe public-route adapter inspired by upstream `fivetaku/insane-search`.
-  - `packages/coding-agent/src/web/search/providers/openai-code.ts` — OpenAI code provider SSE adapter.
+  - `packages/coding-agent/src/web/search/providers/codex.ts` — OpenAI code provider SSE adapter.
   - `packages/coding-agent/src/web/search/providers/exa.ts` — Exa API adapter.
   - `packages/coding-agent/src/web/search/providers/gemini.ts` — Gemini grounding SSE adapter.
   - `packages/coding-agent/src/web/search/providers/jina.ts` — Jina Reader search adapter.
@@ -31,7 +31,7 @@
   - `packages/coding-agent/src/web/search/providers/zai.ts` — Z.AI remote search adapter.
   - `packages/coding-agent/src/web/parallel.ts` — Parallel search/extract HTTP client.
   - `packages/coding-agent/src/web/kagi.ts` — Kagi HTTP client.
-  - `packages/coding-agent/src/tools/index.ts` — built-in tool registration and enable flag.
+  - `packages/coding-agent/src/tools/descriptors.ts` — built-in tool registration and enable flag.
 
 ## Inputs
 
@@ -43,6 +43,16 @@
 | `max_tokens` | `number` | No | Passed through as `maxOutputTokens` / `max_tokens` only by Anthropic, Gemini, and Perplexity API-key mode. Ignored by the other providers. |
 | `temperature` | `number` | No | Passed through only by Anthropic, Gemini, and Perplexity API-key mode. Ignored by the other providers. |
 | `num_search_results` | `number` | No | Requested upstream search breadth. For most providers this is the same count used for returned sources. Perplexity is the only adapter that keeps it distinct from `limit`. |
+| `xai_search_mode` | `"web" \| "x" \| "web_and_x"` | No | xAI only. Selects xAI's `web_search`, `x_search`, or both. When omitted, `prepareXaiTools()` infers it from the options below: web-only options → `web`, X-only options → `x`, both → `web_and_x`, neither → `web`. An explicit mode that conflicts with the supplied options fails with a 400 `SearchProviderError`. |
+| `allowed_domains` / `excluded_domains` | `string[]` (max 5) | No | xAI `web_search` only. Domain allow/deny filters; the two are mutually exclusive. |
+| `allowed_x_handles` / `excluded_x_handles` | `string[]` (max 20) | No | xAI `x_search` only. X handle allow/deny filters; the two are mutually exclusive. |
+| `from_date` / `to_date` | `string` (ISO 8601) | No | xAI `x_search` only. Date range for X posts, combined with `recency` by `xDateRange()`. |
+| `enable_image_understanding` | `boolean` | No | xAI only. Passed to whichever of `web_search` / `x_search` is active. |
+| `enable_image_search` | `boolean` | No | xAI `web_search` only. Search for and embed image results. |
+| `enable_video_understanding` | `boolean` | No | xAI `x_search` only. Analyze videos in X posts. |
+| `no_inline_citations` | `boolean` | No | xAI only. Sends `include: ["no_inline_citations"]` to disable inline citation markdown in the answer. |
+
+The xAI-specific fields are passed to every provider in the chain by `executeSearchUnscoped()` (`web/search/index.ts`), but only `providers/xai.ts` reads them; other providers ignore them.
 
 ## Outputs
 The tool returns a single text content block plus structured `details`.
@@ -153,7 +163,7 @@ Streaming: none. `WebSearchTool.execute()` does not forward its `_signal` argume
     - Accepts JSON responses and consumes SSE responses incrementally. Responses results use the completed response snapshot, or completed output-item events when that snapshot omits its output; Chat results accumulate text and citation annotations. Failed, incomplete, malformed, or prematurely ended streams are rejected rather than returned as partial search results.
     - Only `url_citation` annotations count as grounding. Inline links are recovered only when `web_search_call` or positive `tool_usage.web_search.num_requests` proves that a search ran; ordinary model answers with ungrounded URLs fail closed (`424`).
     - Caller cancellation and the LLM search timeout cover response-body consumption as well as the HTTP request.
-  - **OpenAI code** — `packages/coding-agent/src/web/search/providers/openai-code.ts`
+  - **OpenAI code** — `packages/coding-agent/src/web/search/providers/codex.ts`
     - Availability: non-expired OAuth credential for `openai-code` in `agent.db`.
     - Querying: SSE POST to `https://chatgpt.com/backend-api/openai-code/responses` with `tool_choice: { type: "web_search" }` and `search_context_size: "high"` by default.
     - Ignores `recency`, `max_tokens`, and `temperature` in this tool path.
@@ -205,7 +215,7 @@ Streaming: none. `WebSearchTool.execute()` does not forward its `_signal` argume
   - Uses a module-global provider-instance cache in `packages/coding-agent/src/web/search/provider.ts`.
   - Uses a WeakMap-keyed resolved-chain cache (per AuthStorage, 60s TTL) in the same file; `WebSearchTool`'s constructor prewarms it via `prewarmSearchProviders()`.
   - Uses a module-global preferred-provider setting in the same file.
-  - `packages/coding-agent/src/tools/index.ts` gates tool availability behind `session.settings.get("web_search.enabled")`.
+  - `packages/coding-agent/src/tools/descriptors.ts` gates tool availability behind `session.settings.get("web_search.enabled")`.
 - Background work / cancellation
   - Many provider adapters accept `AbortSignal`, but `WebSearchTool.execute()` does not pass its `_signal` into `executeSearch()`. Internal callers can still use cancellation by calling `runSearchQuery()` / `executeSearch()` with `signal` embedded in params.
 

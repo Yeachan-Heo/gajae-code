@@ -5,6 +5,7 @@
  * prints the resulting content blocks exactly as the model would receive them
  * (including truncation/limit notices appended by the meta-notice wrapper).
  */
+import type { AgentToolContext } from "@gajae-code/agent-core";
 import { getProjectDir } from "@gajae-code/utils";
 import chalk from "chalk";
 import { Settings } from "../config/settings";
@@ -38,7 +39,15 @@ export async function runReadCommand(cmd: ReadCommandArgs): Promise<void> {
 	const tool = wrapToolWithMetaNotice(new ReadTool(session));
 
 	try {
-		const result = await tool.execute("gjc-read", { path: cmd.path, truncation: cmd.truncation });
+		// Pass the loaded settings so the wrapper's output caps honor user config.
+		const context = { settings } as AgentToolContext;
+		const result = await tool.execute(
+			"gjc-read",
+			{ path: cmd.path, truncation: cmd.truncation },
+			undefined,
+			undefined,
+			context,
+		);
 
 		for (const block of result.content) {
 			if (block.type === "text") {

@@ -732,6 +732,22 @@ describe("Coding Agent Tools", () => {
 			expect((imageBlock?.data ?? "").length).toBeGreaterThan(0);
 		});
 
+		it("should rasterize local SVG files into PNG image content", async () => {
+			const fixture = fs.readFileSync(path.join(import.meta.dir, "../../natives/test/fixtures/svg/geometry.svg"));
+			const testFile = path.join(testDir, "geometry.svg");
+			fs.writeFileSync(testFile, fixture);
+
+			const result = await new ReadTool(createTestToolSession(testDir)).execute("test-call-svg", { path: testFile });
+			const imageBlock = result.content.find(
+				(content): content is { type: "image"; mimeType: string; data: string } => content.type === "image",
+			);
+
+			expect(getTextOutput(result)).toContain("Read image file [image/png]");
+			expect(imageBlock?.mimeType).toBe("image/png");
+			expect(Buffer.from(imageBlock?.data ?? "", "base64").subarray(0, 8)).toEqual(
+				Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+			);
+		});
 		it("should treat files with image extension but non-image content as text", async () => {
 			const testFile = path.join(testDir, "not-an-image.png");
 			fs.writeFileSync(testFile, "definitely not a png");

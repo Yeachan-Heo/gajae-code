@@ -40,7 +40,6 @@ import {
 	deriveLegacyTargetIdentity,
 	getBrokerIdentityKey,
 } from "../src/sdk/broker/identity";
-import { completeBrokerProcess } from "../src/sdk/broker/internal";
 import {
 	deriveLifecycleDeadlines,
 	readSessionLifecycleLaunchRequest,
@@ -50,6 +49,7 @@ import {
 	waitForChildSpawn,
 } from "../src/sdk/broker/lifecycle";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
+import { observeProcessIncarnation } from "../src/sdk/broker/process-incarnation";
 import { resolveSdkInternalSpawnCommand, resolveSdkInternalSpawnCommandForTest } from "../src/sdk/broker/runtime";
 import { readBrokerStartupFailureMarker, writeBrokerStartupFailureMarker } from "../src/sdk/broker/startup-failure";
 import { BROKER_RUNTIME_ABORT_CAPABILITY_FIELD } from "../src/sdk/host/control/runtime-gate";
@@ -750,27 +750,6 @@ async function waitForDiscovery(agentDir: string, children?: Bun.Subprocess[]) {
 	}
 	throw new Error("Timed out waiting for broker discovery.");
 }
-describe("broker process completion", () => {
-	it("exits zero only after successful broker completion", async () => {
-		const exit = vi.fn((code: number): never => {
-			throw new Error(`exit:${code}`);
-		});
-		await expect(completeBrokerProcess({ completion: Promise.resolve() } as Broker, exit)).rejects.toThrow("exit:0");
-		expect(exit).toHaveBeenCalledWith(0);
-	});
-
-	it("propagates broker completion failure without invoking success exit", async () => {
-		const failure = new Error("broker teardown failed");
-		const exit = vi.fn((_code: number): never => {
-			throw new Error("unexpected exit");
-		});
-		await expect(completeBrokerProcess({ completion: Promise.reject(failure) } as Broker, exit)).rejects.toBe(
-			failure,
-		);
-		expect(exit).not.toHaveBeenCalled();
-	});
-});
-
 it("keeps unresolved session cleanup authority through lifecycle ledger compaction", async () => {
 	const dir = await temp();
 	const ledger = await new LifecycleLedger(dir, { maxRows: 2 }).open();
@@ -2009,9 +1988,13 @@ describe("SDK broker identity and discovery", () => {
 				"Timed out waiting for detached SDK broker discovery.",
 			);
 			const brokerPid = await gotPid;
-			// The spawned detached broker must have been terminated + reaped, not orphaned.
+			// The spawned detached broker must have been terminated, not orphaned. The
+			// trampoline reparents it away from this process, so once killed it may stay
+			// an unreaped zombie of whichever subreaper adopted it; `kill(pid, 0)` still
+			// reports such a zombie as present. Process-identity observation classifies
+			// it as absent, which is the same authority the production reap path uses.
 			expect(typeof brokerPid).toBe("number");
-			expect(brokerDiscovery.isPidAlive(brokerPid!)).toBe(false);
+			expect(observeProcessIncarnation(brokerPid!).status).toBe("absent");
 			// No owner handle leaked for the failed agent dir.
 			expect(brokerOwnerForTest(dir)).toBeUndefined();
 		} finally {
@@ -3403,7 +3386,8 @@ describe("SDK broker identity and discovery", () => {
 		await broker.start();
 		const transitionSpy = vi.spyOn(broker.ledger, "transition").mockImplementation(async (...args) => {
 			const result = await transition(...args);
-			if (!canonicalInjected && JSON.stringify(args[2]?.response).includes("artifacts were removed")) {
+			// #6339 reworded the durable artifact-completion response to "artifacts are removed".
+			if (!canonicalInjected && JSON.stringify(args[2]?.response).includes("artifacts are removed")) {
 				canonicalInjected = true;
 				await fs.mkdir(artifactsDir);
 				await fs.writeFile(path.join(artifactsDir, ".reappeared"), "reappeared");
@@ -3997,7 +3981,8 @@ describe("SDK broker identity and discovery", () => {
 			const transcriptParent = path.dirname(sessionPath);
 			const renamedTranscriptParent = `${transcriptParent}.renamed`;
 			await fs.rename(transcriptParent, renamedTranscriptParent);
-			await fs.mkdir(transcriptParent);
+			// The replacement must still pass managed-scope security (#6339) so replay reaches receipt validation.
+			await fs.mkdir(transcriptParent, { mode: 0o700 });
 			const replacedParentReplay = await broker.handleRequest(
 				"session.delete",
 				{ sessionId, sessionPath, cwd },

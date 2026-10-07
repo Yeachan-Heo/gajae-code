@@ -40,6 +40,7 @@ import { CommandPalette, type CommandPaletteAction, type CommandPaletteEntry } f
 import type { PasteTextContext } from "../components/custom-editor";
 import { QueuePaneComponent } from "../components/queue-pane";
 import { type QueuedMessageMoveDirection, QueuedMessageSelectorComponent } from "../components/queued-message-selector";
+import { focusedUiOwnsInterrupt } from "../utils/interrupt-ownership";
 import { matchesAppInterrupt } from "../utils/keybinding-matchers";
 
 const QUEUE_SELECTOR_NAVIGATION_ACTIONS = [
@@ -95,6 +96,8 @@ function isExpandable(obj: unknown): obj is Expandable {
 export class InputController {
 	readonly actionRegistry: ActionRegistry<void>;
 	readonly #loadPastedImageBatch: typeof loadPastedImageBatch;
+	/** Session id with an automatic-title request pending, if any. */
+	#autoTitleInFlightSessionId: string | undefined;
 	#deferredSubmission?: {
 		text: string;
 		images?: InteractiveModeContext["pendingImages"];
@@ -546,15 +549,23 @@ export class InputController {
 			if (!isInterruptKey && !isClearKey) {
 				return undefined;
 			}
-			if (isClearKey && !isInterruptKey && this.ctx.hasActiveBtw() && this.ctx.handleBtwEscape()) {
-				this.#resetEscapeGestures();
-				return { consume: true };
-			}
-			if (isClearKey && !isInterruptKey && this.ctx.hookSelector?.hasActiveInlineInput?.() === true) {
+			// Listeners run before focused handleInput. Yield interrupt/back to the
+			// focused UI before touching BTW, maintenance, retries or workflow state.
+			// Clear (Ctrl+C by default) remains a global abort, even if the same
+			// key is also configured as interrupt.
+			if (isInterruptKey && !isClearKey && focusedUiOwnsInterrupt(this.ctx)) {
 				this.#resetEscapeGestures();
 				return undefined;
 			}
-			if (isClearKey && !isInterruptKey) {
+			if (isClearKey && this.ctx.hasActiveBtw() && this.ctx.handleBtwEscape()) {
+				this.#resetEscapeGestures();
+				return { consume: true };
+			}
+			if (isClearKey && this.ctx.hookSelector?.hasActiveInlineInput?.() === true) {
+				this.#resetEscapeGestures();
+				return undefined;
+			}
+			if (isClearKey) {
 				if (this.#handlePendingSteerInterrupt()) return { consume: true };
 				if (
 					this.#handleCancellableWorkEscape({
@@ -975,7 +986,17 @@ export class InputController {
 	}
 
 	setupEditorSubmitHandler(): void {
-		this.ctx.editor.onSubmit = text => this.submitText(text, { ownsComposer: true, editor: this.ctx.editor });
+		// The editor drops the returned promise, so a rejected submission (for example
+		// a session whose transcript was taken over by another process) must be
+		// reported here instead of escaping as a process-fatal unhandled rejection.
+		this.ctx.editor.onSubmit = text =>
+			this.submitText(text, { ownsComposer: true, editor: this.ctx.editor }).catch(error => {
+				this.#reportSubmissionError(error);
+			});
+	}
+
+	#reportSubmissionError(error: unknown): void {
+		this.ctx.showError(error instanceof Error ? error.message : String(error));
 	}
 
 	async submitText(text: string, composer: ComposerSubmissionOptions): Promise<void> {
@@ -1153,6 +1174,7 @@ export class InputController {
 				return;
 			}
 			this.ctx.queueCompactionMessage(text, "steer", composer);
+			this.#titleQueuedCompactionText(text);
 			return;
 		}
 
@@ -1162,6 +1184,9 @@ export class InputController {
 		// This handles extension commands (execute immediately), prompt template expansion, and queueing
 		if (this.ctx.session.isStreaming) {
 			invalidateSessionTitleGeneration(this.ctx.sessionManager);
+			// A turn started by a skill command has no user message yet, so the
+			// first typed message can arrive here instead of the idle path.
+			this.maybeGenerateSessionTitle(text);
 			if (this.#canModifyComposer(composer)) {
 				this.ctx.editor.addToHistory(text);
 				this.ctx.editor.setText("");
@@ -1190,32 +1215,7 @@ export class InputController {
 		// First, move any pending bash components to chat
 		this.ctx.flushPendingBashComponents();
 
-		// Generate session title on first message
-		const hasUserMessages = this.ctx.session.messages.some((m: AgentMessage) => m.role === "user");
-		if (!hasUserMessages && !this.ctx.sessionManager.getSessionName() && !$pickenv("GJC_NO_TITLE", "PI_NO_TITLE")) {
-			const registry = this.ctx.session.modelRegistry;
-			generateSessionTitle(
-				text,
-				registry,
-				this.ctx.settings,
-				this.ctx.session.credentialSessionId,
-				this.ctx.session.model,
-				provider => this.ctx.session.agent.metadataForProvider(provider),
-			)
-				.then(async title => {
-					if (title) {
-						const applied = await this.ctx.sessionManager.setSessionName(title, "auto");
-						if (applied) {
-							setSessionTerminalTitle(
-								this.ctx.sessionManager.getSessionName()!,
-								this.ctx.sessionManager.getCwd(),
-							);
-							this.ctx.updateEditorBorderColor();
-						}
-					}
-				})
-				.catch(() => {});
-		}
+		this.maybeGenerateSessionTitle(text);
 
 		if (this.ctx.onInputCallback) {
 			// Include any pending images from clipboard paste
@@ -1619,6 +1619,51 @@ export class InputController {
 	}
 
 	/**
+	 * Generate the automatic session title from the first user message. Called
+	 * from the editor submit and queue-shortcut paths (idle and streaming) and
+	 * from interactive startup messages; it is a no-op once the session has a
+	 * user message, a name, or a title request already in flight. The result is
+	 * bound to the session that requested it: a completion that lands after the
+	 * session was replaced (New Session, switch, resume) is discarded.
+	 */
+	maybeGenerateSessionTitle(text: string): void {
+		if (this.ctx.sessionManager.getSessionName()) return;
+		const sessionId = this.ctx.sessionManager.getSessionId();
+		if (this.#autoTitleInFlightSessionId === sessionId) return;
+		if ($pickenv("GJC_NO_TITLE", "PI_NO_TITLE")) return;
+		if (this.ctx.session.messages.some((m: AgentMessage) => m.role === "user")) return;
+		// Keep locally intercepted command arguments away from the title model.
+		if (this.ctx.session.isLocallyHandledSlashCommand(text)) return;
+		this.#autoTitleInFlightSessionId = sessionId;
+		generateSessionTitle(
+			text,
+			this.ctx.session.modelRegistry,
+			this.ctx.settings,
+			this.ctx.session.credentialSessionId,
+			this.ctx.session.model,
+			provider => this.ctx.session.agent.metadataForProvider(provider),
+		)
+			.then(async title => {
+				if (!title || this.ctx.sessionManager.getSessionId() !== sessionId) return;
+				const applied = await this.ctx.sessionManager.setSessionName(title, "auto");
+				if (applied) {
+					setSessionTerminalTitle(this.ctx.sessionManager.getSessionName()!, this.ctx.sessionManager.getCwd());
+					this.ctx.updateEditorBorderColor();
+				}
+			})
+			.catch(() => {})
+			.finally(() => {
+				if (this.#autoTitleInFlightSessionId === sessionId) this.#autoTitleInFlightSessionId = undefined;
+			});
+	}
+
+	/** Title text accepted into the compaction queue; skill commands replay through the skill path and are not titled. */
+	#titleQueuedCompactionText(text: string): void {
+		if (parseSkillInvocations(text, this.ctx.skillCommands ?? new Map()).length > 0) return;
+		this.maybeGenerateSessionTitle(text);
+	}
+
+	/**
 	 * Dispatch skill slash invocation(s) (`/skill:<name>`) through custom messages
 	 * using the supplied `streamingBehavior`. Returns true if the text contains a
 	 * recognised canonical skill command or command chain and was dispatched. A
@@ -1726,6 +1771,7 @@ export class InputController {
 				return;
 			}
 			this.ctx.queueCompactionMessage(text, "followUp");
+			this.#titleQueuedCompactionText(text);
 			return;
 		}
 
@@ -1740,6 +1786,7 @@ export class InputController {
 					followUpQueuePolicy: "sequential",
 				}),
 			);
+			this.maybeGenerateSessionTitle(text);
 			this.ctx.updatePendingMessagesDisplay();
 			this.ctx.ui.requestRender();
 			return;
@@ -1751,6 +1798,7 @@ export class InputController {
 			return;
 		}
 
+		this.maybeGenerateSessionTitle(text);
 		if (this.ctx.session.isStreaming) {
 			this.ctx.editor.addToHistory(text);
 			this.ctx.editor.setText("");

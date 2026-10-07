@@ -36,7 +36,8 @@ test("the production SDK host suites run sequentially and stop after a failure",
 		active -= 1;
 		return suite.file === sdkProductionHostIsolatedSuites[0].file ? 0 : 17;
 	});
-	expect(started).toEqual(sdkProductionHostIsolatedSuites.map(suite => suite.file));
+	expect(sdkProductionHostIsolatedSuites.length).toBeGreaterThan(2);
+	expect(started).toEqual(sdkProductionHostIsolatedSuites.slice(0, 2).map(suite => suite.file));
 	expect(maxActive).toBe(1);
 	expect(exitCode).toBe(17);
 });
@@ -144,12 +145,12 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		}
 	});
 
-	test("skips code-validation roots for metadata edits while retaining the contract", async () => {
+	test("skips code-validation roots for metadata-only edits", async () => {
 		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
-		// `edited` must stay in the trigger list: the verdict line lives in the PR
-		// body, so `pr-contract-bootstrap` has to re-check it on every body change.
+		// `edited` stays in the trigger list because retargeting a PR to another base
+		// is an `edited` event that must re-validate; body/title-only edits are skipped below.
 		expect(workflow).toContain("types: [opened, edited, synchronize, reopened, ready_for_review]");
-		expect(workflow).toContain("  pr-contract-bootstrap:\n    name: PR contract bootstrap\n    if: ${{ github.event_name == 'pull_request' }}");
+		expect(workflow).not.toContain("pr-contract-bootstrap:");
 
 		// Every job that validates code must opt out of a metadata-only edit.
 		// Metadata changes no tree, so running them re-queues an identical matrix and
@@ -256,9 +257,12 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/session/managed-lock-lease.windows.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/sdk-session-index-fsync.windows.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/sdk-session-index-lock-contention.test.ts");
+		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/file-lock-signed-identity.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/session-state-lock.test.ts");
+		expect(windowsJob).toContain("bun test ./packages/natives/test/windows-runtime-install.windows.test.ts");
 		// The required predicate must textually match the job gate so the aggregate
 		// invariant (windowsDoctor === required ? success : skipped) never fails closed.
+		expect(windowsJob).toContain("bun test ./packages/natives/test/walker-pool-unavailable.windows.test.ts");
 		const requiredLines = workflow.split("\n").filter(line => line.includes("CI_DEV_WINDOWS_DOCTOR_REQUIRED:"));
 		expect(requiredLines.length).toBe(2);
 		for (const line of requiredLines) expect(line).toContain("|| needs.affected-plan.outputs.has_windows_session_path == 'true'");
@@ -898,7 +902,7 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		const vendored = await runScript(["--matrix-json"], "crates/brush-core-vendored/src/lib.rs");
 		expect(vendored.exitCode).toBe(0);
 		const vendoredKeys = (JSON.parse(vendored.stdout.trim()) as Array<{ key: string }>).map(entry => entry.key);
-		expect(vendoredKeys.filter(key => key.startsWith("cargo-build:"))).toHaveLength(5);
+		expect(vendoredKeys.filter(key => key.startsWith("cargo-build:"))).toHaveLength(9);
 		expect(vendoredKeys.some(key => key.includes("brush"))).toBe(false);
 	});
 
@@ -927,7 +931,7 @@ describe("--matrix-json and --task CLI fan-out", () => {
 			expect(exitCode).toBe(0);
 			const entries = JSON.parse(stdout.trim()) as Array<{ key: string }>;
 			expect(entries.filter(entry => entry.key.startsWith("ts-build:")).map(entry => entry.key)).toHaveLength(2);
-			expect(entries.filter(entry => entry.key.startsWith("cargo-build:")).map(entry => entry.key)).toHaveLength(5);
+			expect(entries.filter(entry => entry.key.startsWith("cargo-build:")).map(entry => entry.key)).toHaveLength(9);
 			expect(entries.filter(entry => entry.key === "native-linux-x64")).toHaveLength(1);
 		}
 	});
@@ -953,6 +957,8 @@ describe("--matrix-json and --task CLI fan-out", () => {
 			...Array.from({ length: 8 }, (_, index) => `test:@gajae-code/coding-agent:shard-${index + 1}-of-8`),
 			"test:@gajae-code/coding-agent:sdk-production-host-isolated",
 			"check:@gajae-code/natives", "test:@gajae-code/natives",
+			"test:packages/natives/test/task-panic-to-rejection.test.ts",
+			"check:@gajae-code/orchestration-token-benchmark", "test:@gajae-code/orchestration-token-benchmark",
 			"check:@gajae-code/stats", "test:@gajae-code/stats",
 			"check:@gajae-code/tui", "test:@gajae-code/tui",
 			"check:@gajae-code/typescript-edit-benchmark", "test:@gajae-code/typescript-edit-benchmark",
@@ -1141,6 +1147,7 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		"packages/coding-agent/test/other/index.test.ts",
 		"packages/coding-agent/test/sdk-client.test.ts",
 		"packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts",
+		"packages/coding-agent/test/session/session-memory-integration.test.ts",
 	];
 
 	function targeted(paths: readonly string[]) {
@@ -1196,6 +1203,14 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		);
 		expect(directTask?.rust).toBe(true);
 		expect(unrelatedTask?.rust).toBe(false);
+	});
+
+	test("the native task-panic regression's direct PR task requires Rust", () => {
+		const testFile = "packages/natives/test/task-panic-to-rejection.test.ts";
+		const [directTask] = describeTasks([
+			{ key: `test:${testFile}`, description: testFile, command: ["bun", "packages/natives/scripts/run-task-panic-test.ts"], capabilities: { rust: true, nextest: false, nativeConsumer: false, nativeProducer: false } },
+		]);
+		expect(directTask?.rust).toBe(true);
 	});
 
 	test("SDK host and coordinator prompt-control changes include shard 1 and the isolated production host", () => {
@@ -1313,6 +1328,7 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"packages/coding-agent/test/sdk-session-directory.windows.test.ts",
 			"packages/coding-agent/test/sdk-session-index-fsync.windows.test.ts",
 			"packages/coding-agent/test/sdk-session-index-lock-contention.test.ts",
+			"packages/coding-agent/test/file-lock-signed-identity.test.ts",
 			"packages/coding-agent/src/sdk/broker/process-incarnation.ts",
 			"packages/coding-agent/src/config/file-lock.ts",
 			// Session-state lock / empty-delete receipt GC bind the native identity
@@ -1347,7 +1363,18 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"Cargo.lock",
 			"crates/brush-core-vendored/Cargo.toml",
 			"crates/pi-shell/Cargo.toml",
+			// 2.3: native walker pool failure requires the Windows Job Object live test.
+			"crates/pi-vfs/Cargo.toml",
+			"crates/pi-vfs/src/native/windows.rs",
+			"crates/pi-walker/Cargo.toml",
+			"crates/pi-walker/src/cache.rs",
+			"crates/pi-natives/src/iofs.rs",
+			"crates/pi-natives/src/glob.rs",
+			"packages/natives/test/walker-pool-unavailable.test.ts",
+			"packages/natives/test/walker-pool-unavailable.windows.test.ts",
 			"packages/natives/test/windows-hidden-shell.windows.test.ts",
+			"packages/natives/test/windows-shell-path.windows.test.ts",
+			"packages/natives/test/windows-runtime-install.windows.test.ts",
 		]) {
 			expect(isWindowsSessionPathRegressionPath(changedPath)).toBe(true);
 			expect(needsWindowsSessionPathRegression([changedPath])).toBe(true);
@@ -1457,6 +1484,32 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		);
 		expect(keys).toContain("test:packages/coding-agent/test/managed-scope-self-heal-budget.test.ts");
 	});
+	test("session-manager changes select session-memory integration exactly once without broad shards", () => {
+		const testKey = "test:packages/coding-agent/test/session/session-memory-integration.test.ts";
+		const tasks = targeted(["packages/coding-agent/src/session/session-manager.ts"]);
+		const keys = tasks.map(task => task.key);
+		expect(keys.filter(key => key === testKey)).toHaveLength(1);
+		expect(tasks.find(task => task.key === testKey)?.command).toEqual([
+			"bun",
+			"test",
+			"packages/coding-agent/test/session/session-memory-integration.test.ts",
+		]);
+		expect(keys).not.toContain("test:@gajae-code/coding-agent");
+		expect(keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-"))).toEqual([]);
+	});
+	test("unrelated session sources do not select the session-memory integration test", () => {
+		const keys = targeted(["packages/coding-agent/src/session/session-storage.ts"]).map(task => task.key);
+		expect(keys).not.toContain("test:packages/coding-agent/test/session/session-memory-integration.test.ts");
+	});
+	test("duplicate session-manager changes still select the integration test once", () => {
+		const keys = targeted([
+			"packages/coding-agent/src/session/session-manager.ts",
+			"packages/coding-agent/src/session/session-manager.ts",
+		]).map(task => task.key);
+		expect(
+			keys.filter(key => key === "test:packages/coding-agent/test/session/session-memory-integration.test.ts"),
+		).toHaveLength(1);
+	});
 	const extensibilityOwnerTests = [
 		"packages/coding-agent/test/function-hooks.test.ts",
 		"packages/coding-agent/test/extensions-discovery.test.ts",
@@ -1515,9 +1568,37 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		const tasks = targeted(["crates/pi-natives/src/path_identity.rs"]);
 		expect(tasks.map(task => task.key)).toContain("test:packages/natives/test/path-identity-posix.test.ts");
 	});
+	test("pi-edit matcher changes select the differential and edit behavior suites", () => {
+		const keys = targeted([
+			"crates/pi-edit/src/fuzzy.rs",
+			"crates/pi-natives/src/edit.rs",
+			"packages/coding-agent/src/edit/modes/replace.ts",
+			"packages/coding-agent/src/edit/modes/patch.ts",
+		]).map(task => task.key);
+		expect(keys).toContain("test:packages/natives/test/differential/edit-fuzzy.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/edit-diff.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/core/apply-patch.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/core/edit-hotspots-golden.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/tools.test.ts");
+	});
+	test("fd, iofs, and workspace walker changes select their behavioral suites", () => {
+		const fd = targeted(["crates/pi-natives/src/fd.rs"]).map(task => task.key);
+		expect(fd).toContain("test:packages/natives/test/fd-workspace-golden.test.ts");
+
+		const iofs = targeted(["crates/pi-natives/src/iofs.rs"]).map(task => task.key);
+		expect(iofs).toContain("test:packages/natives/test/native.test.ts");
+
+		const workspace = targeted(["crates/pi-natives/src/workspace.rs"]).map(task => task.key);
+		expect(workspace).toContain("test:packages/natives/test/fd-workspace-golden.test.ts");
+		expect(workspace).toContain("test:packages/coding-agent/test/workspace-tree.test.ts");
+	});
 	test("prompt-deadline-lease changes select the production deadline manager suite", () => {
 		const tasks = targeted(["packages/coding-agent/src/sdk/prompt-deadline-lease.ts"]);
 		expect(tasks.map(task => task.key)).toContain("test:packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts");
+	});
+	test("broker lifecycle changes select the lifecycle e2e suite", () => {
+		const tasks = targeted(["packages/coding-agent/src/sdk/broker/lifecycle.ts"]);
+		expect(tasks.map(task => task.key)).toContain("test:packages/coding-agent/test/sdk-broker-lifecycle-e2e.test.ts");
 	});
 	test("agent-session source changes select the promotion and concurrency suites", () => {
 		const tasks = targeted(["packages/coding-agent/src/session/agent-session.ts"]);
@@ -1861,6 +1942,29 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 		const generalShards = entries.filter(entry => entry.key.startsWith("test:@gajae-code/coding-agent:shard-"));
 		expect(generalShards).toHaveLength(8);
 		expect(generalShards.every(entry => !entry.rust)).toBe(true);
+	});
+
+	test("push mode runs the native task-panic regression only as its own Rust task", () => {
+		const natives: WorkspacePackage = {
+			name: "@gajae-code/natives",
+			dir: "packages/natives",
+			manifest: { name: "@gajae-code/natives", scripts: { check: "biome check .", test: "bun test" } },
+		};
+		const testFile = "packages/natives/test/task-panic-to-rejection.test.ts";
+		const entries = describeTasks(planTasks(["packages/natives/src/index.ts"], [natives]));
+		const packageTask = entries.find(entry => entry.key === "test:@gajae-code/natives");
+		expect(packageTask).toMatchObject({
+			command: ["bun", "test", "--path-ignore-patterns=test/task-panic-to-rejection.test.ts"],
+			rust: false,
+		});
+		expect(entries.find(entry => entry.key === `test:${testFile}`)).toMatchObject({
+			command: ["bun", "packages/natives/scripts/run-task-panic-test.ts"],
+			rust: true,
+			// It compiles its own addon, but it is a test shard, not the shared native
+			// producer: producer tasks are filtered out of the shard matrix.
+			nativeBuild: false,
+		});
+		expect(entries.filter(entry => entry.nativeBuild).map(entry => entry.key)).not.toContain(`test:${testFile}`);
 	});
 
 	test("push mode runs the AI suite with the same fresh-process boundary", () => {

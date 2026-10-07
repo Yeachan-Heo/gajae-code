@@ -110,6 +110,7 @@ function createContext(
 		getApiKeyForProvider: vi.fn(async () => "key"),
 		getApiKey: vi.fn(async () => "key"),
 		hasConfiguredProviderAuth: () => false,
+		isSelectorCircuitOpen: (_selector: string) => false,
 	};
 	const session = {
 		model: catalog[0],

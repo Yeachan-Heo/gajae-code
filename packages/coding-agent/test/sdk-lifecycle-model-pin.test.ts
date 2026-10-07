@@ -10,6 +10,7 @@ import { SessionManager } from "@gajae-code/coding-agent/session/session-manager
 import { applyStartupModelProfiles } from "../src/main";
 import { type CreateLifecycleAgentSessionResult, createLifecycleAgentSession } from "../src/sdk/lifecycle-session";
 import { SdkStartupCapability, SdkStartupRollbackTracker } from "../src/sdk/startup-capability";
+import { AgentSession, SessionDisposalIncompleteError } from "../src/session/agent-session";
 
 /**
  * The coordinator model pin (#4707) validates a selector against its own
@@ -91,8 +92,149 @@ describe("lifecycle session explicit model pin", () => {
 		capability.cancel(failure);
 
 		const created = await createLifecycleAgentSession({}, { capability, rollback });
-		expect(created).toEqual({ capability, rollback, failure });
+		expect(created).toEqual({ capability, rollback, failure, cleanupComplete: true });
 	});
+
+	test("reports incomplete owner cancellation when late session disposal fails", async () => {
+		const cwd = tempCwd();
+		const settingsReady = Promise.withResolvers<void>();
+		const settingsRelease = Promise.withResolvers<Settings>();
+		const originalLoadSettings = Settings.loadForScope.bind(Settings);
+		const loadSettings = vi.spyOn(Settings, "loadForScope").mockImplementation(async options => {
+			if (options.cwd === cwd && options.agentDir === cwd) {
+				settingsReady.resolve();
+				return await settingsRelease.promise;
+			}
+			return await originalLoadSettings(options);
+		});
+		const rollback = new SdkStartupRollbackTracker();
+		const capability = new SdkStartupCapability(rollback, "immediate", "late-disposal-failure");
+		const cancellation = capability.normalizeFailure("startup", "pending");
+		const sessionManager = SessionManager.inMemory(cwd);
+		let partiallyDisposed: AgentSession | undefined;
+		const dispose = vi.spyOn(AgentSession.prototype, "dispose").mockImplementation(async function (
+			this: AgentSession,
+		) {
+			partiallyDisposed = this;
+			throw new SessionDisposalIncompleteError("controlled session disposal failure");
+		});
+		const awaitDisposeCompletion = vi
+			.spyOn(AgentSession.prototype, "awaitDisposeCompletion")
+			.mockRejectedValue(new Error("controlled cleanup join failure"));
+		let created: CreateLifecycleAgentSessionResult | undefined;
+		try {
+			const constructing = createLifecycleAgentSession(
+				{
+					cwd,
+					agentDir: cwd,
+					authStorage,
+					sessionManager,
+					disableExtensionDiscovery: true,
+					skills: [],
+					contextFiles: [],
+					promptTemplates: [],
+					slashCommands: [],
+					enableLsp: false,
+					toolNames: [],
+				},
+				{ capability, rollback },
+			);
+			await settingsReady.promise;
+			capability.cancel(cancellation);
+			settingsRelease.resolve(Settings.isolated());
+			created = await constructing;
+			if (!("failure" in created)) throw new Error("Cancelled lifecycle construction returned a live session.");
+			expect(created.failure).toEqual(cancellation);
+			expect(created.cleanupComplete).toBe(false);
+			expect(created.capability).toBe(capability);
+			expect(created.rollback).toBe(rollback);
+		} finally {
+			awaitDisposeCompletion.mockRestore();
+			dispose.mockRestore();
+			loadSettings.mockRestore();
+			if (partiallyDisposed) await partiallyDisposed.dispose();
+			await sessionManager.close();
+		}
+	}, 30_000);
+
+	test("preserves incomplete cleanup when owned registry disposal fails", async () => {
+		const cwd = tempCwd();
+		const ownedStorage = await AuthStorage.create(":memory:");
+		const storageClose = vi.spyOn(ownedStorage, "close");
+		const createStorage = vi.spyOn(AuthStorage, "create").mockResolvedValue(ownedStorage);
+		const configureRegistry = vi
+			.spyOn(ModelRegistry.prototype, "applyConfiguredModelBindings")
+			.mockImplementation(() => {
+				throw new Error("controlled registry setup failure");
+			});
+		let ownedRegistry: ModelRegistry | undefined;
+		const disposeRegistry = vi.spyOn(ModelRegistry.prototype, "dispose").mockImplementation(async function (
+			this: ModelRegistry,
+		) {
+			ownedRegistry = this;
+			throw new Error("controlled registry disposal failure");
+		});
+		try {
+			const created = await createLifecycleAgentSession({
+				cwd,
+				agentDir: cwd,
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableLsp: false,
+				toolNames: [],
+			});
+			if (!("failure" in created)) throw new Error("Expected registry setup failure.");
+			expect(created.cleanupComplete).toBe(false);
+			expect(storageClose).toHaveBeenCalledTimes(1);
+		} finally {
+			disposeRegistry.mockRestore();
+			configureRegistry.mockRestore();
+			createStorage.mockRestore();
+			storageClose.mockRestore();
+			await ownedRegistry?.dispose().catch(() => {});
+			await ownedStorage.close();
+		}
+	}, 30_000);
+
+	test("marks startup configuration rejection incomplete when credential unsubscribe fails", async () => {
+		const cwd = tempCwd();
+		const originalSubscribe = authStorage.onCredentialDisabled.bind(authStorage);
+		let removeUnderlyingListener: (() => void) | undefined;
+		const subscribe = vi.spyOn(authStorage, "onCredentialDisabled").mockImplementation(listener => {
+			removeUnderlyingListener = originalSubscribe(listener);
+			return () => {
+				throw new Error("controlled credential listener cleanup failure");
+			};
+		});
+		const close = vi.spyOn(authStorage, "close");
+		const rollback = new SdkStartupRollbackTracker();
+		const capability = new SdkStartupCapability(rollback, "immediate", "startup-auth-rejection");
+		const rejectedStartupConfig = Promise.reject(new Error("controlled startup auth config failure")) as never;
+		try {
+			const created = await createLifecycleAgentSession(
+				{
+					cwd,
+					agentDir: cwd,
+					authStorage,
+					settings: Settings.isolated(),
+					startupAuthConfig: rejectedStartupConfig,
+					modelRegistryStartupMutation: { owner: "cli-root", onAttempt: () => {} },
+				},
+				{ capability, rollback },
+			);
+			if (!("failure" in created)) throw new Error("Expected startup auth configuration failure.");
+			expect(created.cleanupComplete).toBe(false);
+			expect(created.failure.message).toContain("controlled startup auth config failure");
+			expect(close).not.toHaveBeenCalled();
+		} finally {
+			subscribe.mockRestore();
+			close.mockRestore();
+			removeUnderlyingListener?.();
+		}
+	}, 30_000);
 
 	test("keeps the pin as the effective model after default-profile and mpreset processing", async () => {
 		const cwd = tempCwd();

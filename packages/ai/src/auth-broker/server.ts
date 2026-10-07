@@ -14,7 +14,7 @@ import { logger } from "@gajae-code/utils";
 import { isNoAuthBrowserOriginRequest, timingSafeEqual } from "../auth-gateway/http";
 import type { AuthStorage } from "../auth-storage";
 import type { Provider } from "../types";
-import { assertAuthenticatedOrLoopback, parseBind } from "../utils/parse-bind";
+import { assertAuthenticatedOrLoopback, hostHeaderMatchesBind, parseBind } from "../utils/parse-bind";
 import { AUTH_BROKER_EPOCH_HEADER } from "./client";
 import { cleanReason } from "./redact";
 import { AuthBrokerRefresher, type AuthBrokerRefresherSchedule } from "./refresher";
@@ -580,6 +580,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 	refresher?.start();
 	const generationGate = new GenerationGate(opts.storage);
 
+	let listenPort = bind.port;
 	const server = Bun.serve({
 		hostname: bind.hostname,
 		port: bind.port,
@@ -602,6 +603,17 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 						originPresent: true,
 					});
 					return json(403, { error: "no-auth rejects requests carrying Origin" });
+				}
+				if (tokens.size === 0) {
+					if (!hostHeaderMatchesBind(req.headers.get("host"), { hostname: bind.hostname, port: listenPort })) {
+						logger.info("auth-broker no-auth host rejected", {
+							method: req.method,
+							path: pathname,
+							peer,
+							hostPresent: req.headers.has("host"),
+						});
+						return json(403, { error: "no-auth rejects a host that is not the loopback bind" });
+					}
 				}
 				if (!isAuthorized(req, tokens)) {
 					logger.info("auth-broker request unauthorized", { method: req.method, path: pathname, peer });
@@ -757,6 +769,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 			}
 		},
 	});
+	listenPort = server.port ?? listenPort;
 
 	const boundHost = server.hostname ?? bind.hostname;
 	const boundPort = server.port ?? bind.port;

@@ -1,4 +1,5 @@
 import { createHash, timingSafeEqual } from "node:crypto";
+import { logger } from "@gajae-code/utils";
 import type { ServerWebSocket } from "bun";
 import type { Broker } from "./broker";
 
@@ -7,6 +8,8 @@ const PROTOCOL_VERSION = 3;
 const MAX_BROKER_JSON_FRAME_BYTES = 4 * 1024 * 1024;
 
 const BROKER_OPERATIONS = new Set([
+	// Observation-only published diagnostics; it starts, ensures and recovers nothing.
+	"broker.diagnostics",
 	"session.list",
 	"session.get_endpoint",
 	"session.create",
@@ -144,6 +147,10 @@ export class BrokerTransport {
 			sendError(socket, frame.id, "invalid_input", "idempotencyKey must be a string");
 			return;
 		}
+		if (!this.#broker.ownsDiscovery) {
+			sendError(socket, frame.id, "unavailable", "broker publication is unavailable");
+			return;
+		}
 		if (frame.operation === "broker.shutdown") {
 			const action = brokerShutdownSendAction(
 				send(socket, { type: "broker_response", id: frame.id, ok: true, result: { accepted: true } }),
@@ -156,11 +163,12 @@ export class BrokerTransport {
 		try {
 			const result = await this.#broker.handleRequest(frame.operation, frame.input, frame.idempotencyKey);
 			send(socket, { type: "broker_response", id: frame.id, ...result });
-		} catch {
+		} catch (error) {
+			logger.warn(`sdk broker request failed: ${error instanceof Error ? error.message : String(error)}`);
 			sendError(socket, frame.id, "unavailable", "broker request failed");
 		}
 	}
 	#scheduleStopAfterShutdownResponse(): void {
-		setTimeout(() => void this.#broker.stop(), 25);
+		setTimeout(() => void this.#broker.stop({ kind: "shutdown-request" }), 25);
 	}
 }

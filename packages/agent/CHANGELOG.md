@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+## [0.18.7] - 2026-10-04
+
+## [0.18.6] - 2026-10-03
+
+### Fixed
+
+- A run that fails with the generic `Agent run failed.` now logs its underlying cause (error name, message, `cause` chain, and a short stack) as a `warn` entry in the local gjc log, with credentials redacted. The transcript and SDK clients still receive only the generic message; previously the cause was discarded entirely, so these failures could not be diagnosed.
+
+## [0.18.5] - 2026-09-30
+
+## [0.18.4] - 2026-09-30
+
+## [0.18.3] - 2026-09-30
+
+## [0.18.2] - 2026-09-30
+
+## [0.18.1] - 2026-09-29
+
+### Changed
+
+- Cap the default non-adaptive auto-compaction threshold at 300,000 tokens; explicit thresholds and adaptive compaction remain unchanged. Opt-in context promotion retains the promoted model's reserve-based headroom.
+- Keep recent context strictly below the default ceiling even when the configured keep floor or token correction would otherwise reach it.
+
+## [0.18.0] - 2026-09-27
+
+### Added
+
+- `agent_failed` and the terminal assistant message now carry the optional bounded `providerDiagnostic` when the provider adapter classified the failure from its own structured metadata. Thrown errors are read only through the adapter's private carrier; terminal assistant messages carry the validated DTO. A foreign thrown error that self-declares a `providerDiagnostic` property gets none. The sanitized failure code and fixed message are unchanged.
+
 ## [0.17.7] - 2026-09-25
 
 ## [0.17.6] - 2026-09-24

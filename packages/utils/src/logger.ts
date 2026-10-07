@@ -87,7 +87,7 @@ function makeLogFormat(winston: WinstonModule): winston.Logform.Format {
  * is what let the transport write somewhere the readers never looked.
  */
 function makeFileTransport(DailyRotateFile: DailyRotateFileCtor, dir?: string): Transport {
-	return new DailyRotateFile({
+	const transport = new DailyRotateFile({
 		dirname: ensureDir(dir ?? getEffectiveLogsDir()),
 		filename: "gjc.%DATE%.log",
 		datePattern: "YYYY-MM-DD",
@@ -95,7 +95,16 @@ function makeFileTransport(DailyRotateFile: DailyRotateFileCtor, dir?: string): 
 		maxFiles: 5,
 		zippedArchive: true,
 	});
+	// winston-daily-rotate-file never listens on its file-stream-rotator stream,
+	// so a failed open or write of the log file (EACCES, EISDIR, EMFILE, the log
+	// directory removed under a live process) is emitted with no listener and
+	// becomes an uncaught exception from a single `logger.warn()`.
+	(transport.logStream as unknown as NodeJS.EventEmitter).on("error", ignoreSinkError);
+	return transport;
 }
+
+/** Logging failures must never take the process down; the record is dropped. */
+function ignoreSinkError(): void {}
 
 function makeConsoleTransport(winston: WinstonModule): Transport {
 	return new winston.transports.Console({ format: makeLogFormat(winston) });
@@ -130,6 +139,9 @@ async function getWinstonLogger(): Promise<Logger> {
 			// Don't exit on error - logging failures shouldn't crash the app
 			exitOnError: false,
 		});
+		// winston re-emits every transport `error` on the logger itself; with no
+		// listener that re-emit throws.
+		logger.on("error", ignoreSinkError);
 		applyTransports(logger, modules);
 		winstonLogger = logger;
 		flushBufferedLogs();

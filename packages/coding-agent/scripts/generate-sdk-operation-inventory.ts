@@ -15,6 +15,10 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal marketplace lifecycle refresh for the session skill catalog; not an independent SDK ingress operation",
 	"agent_session:getTerminalTurnEpoch":
 		"internal terminal-abort bus seam (epoch only), threaded via terminalAbortSeams; not a user-facing SDK control seam",
+	"agent_session:getTerminalRunOwnerForEvent":
+		"internal Agent-claimed event ownership proof, read only through the terminalAbortSeams bus capability; not a public SDK operation",
+	"agent_session:getRunOwnerDomain":
+		"internal run-resource ledger domain lookup for exact consuming-run ownership; not a public SDK operation",
 	"agent_session:cancelPendingPreflightForTerminalAbort":
 		"internal terminal-abort bus seam, threaded via terminalAbortSeams; not a user-facing SDK control seam",
 	"agent_session:abortPromptAndWaitWithTerminal":
@@ -62,6 +66,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"local transcript-discovery metadata command; no SDK operation counterpart or runtime/retention authority",
 	"slash_command:unstar":
 		"local transcript-discovery metadata command; no SDK operation counterpart or runtime/retention authority",
+	"agent_session:getSubagentLifecycleStatuses":
+		"internal read-only subagent status projection consumed through session.progress (Q32), not a separate SDK seam",
 	"agent_session:constructor": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getSessionAgentDir":
 		"internal session-scoped agent-directory accessor, not a user-facing SDK control seam",
@@ -203,6 +209,12 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:queueDeferredMessage": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:queueDeferredMessageForTests": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getContextUsageObservabilityForTests": "test-only observability, not a user-facing control seam",
+	"agent_session:getAutoCompactionThresholdTokens":
+		"internal compaction-threshold accessor feeding the /context breakdown; exposed through context.get, not an independent SDK operation",
+	"agent_session:resolvePromptSkillInvocation":
+		"internal prompt-dispatch classifier shared with interactive title seeding, not a user-facing control seam",
+	"agent_session:isLocallyHandledSlashCommand":
+		"internal slash-command classifier that keeps command text out of title seeding, not a user-facing control seam",
 	"agent_session:purgeQueuedCustomMessages": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:clearQueue": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:popLastQueuedMessage": "internal accessor/plumbing, not a user-facing control seam",
@@ -383,6 +395,7 @@ const SEAM_TO_SDK: Readonly<Record<string, string>> = {
 	"slash_command:session": "session.list",
 	"slash_command:jobs": "runtime.jobs.list",
 	"slash_command:context": "context.get",
+	"slash_command:progress": "session.progress",
 	"slash_command:usage": "usage.get",
 	"slash_command:tools": "tools.list",
 	"slash_command:login": "auth.login",

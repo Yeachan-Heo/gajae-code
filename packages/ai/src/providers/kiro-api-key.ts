@@ -7,6 +7,14 @@
  */
 import { $env } from "@gajae-code/utils";
 import { assertAwsRegionLabel } from "../adapter-internals/aws-region";
+import {
+	getProviderSafetyStopModelIdentity,
+	getProviderSafetyStopWireModelId,
+	isProviderSafetyStopAdapterInvocation,
+	mintProviderSafetyStop,
+	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+	registerProviderSafetyStopModel,
+} from "../adapter-internals/provider-safety-stop";
 import { Effort } from "../model-thinking";
 import type {
 	Api,
@@ -23,6 +31,16 @@ import type {
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { withHttpStatus } from "../utils/http-inspector";
 import type { KiroCodeWhispererOptions } from "./kiro-codewhisperer";
+
+/**
+ * Trust assumption: globalThis.fetch is treated as a trusted source for authenticated
+ * provider safety stops. The Kiro API-key transport does not support caller-provided
+ * fetch overrides (test injection via options.fetch is not supported). Tests that need
+ * to mock Kiro responses should use the provider test harness or mock at a higher level.
+ *
+ * This trust assumption is safe in runtime contexts where globalThis.fetch is the
+ * system-provided implementation and cannot be replaced after module load.
+ */
 
 const DEFAULT_REGION = "us-east-1";
 const KIRO_ORIGIN = "AI_EDITOR";
@@ -118,7 +136,7 @@ function kiroApiHeaders(apiKey: string, target: string): Record<string, string> 
 	};
 }
 
-function sanitizeKiroError(value: unknown, secret?: string): string {
+export function sanitizeKiroError(value: unknown, secret?: string): string {
 	let message = value instanceof Error ? value.message : String(value);
 	if (secret) message = message.split(secret).join("[redacted]");
 	message = message.replace(/bearer\s+[^\s,;]+/gi, "Bearer [redacted]");
@@ -296,9 +314,19 @@ export function kiroApiStaticModels(): Model<"kiro-codewhisperer-stream">[] {
 			},
 			baseUrl,
 		);
+		// Register as trusted identity if baseUrl is an official region-derived endpoint
+		if (isRegionDerivedKiroApiBaseUrl(baseUrl)) {
+			registerProviderSafetyStopModel(model);
+		}
 		models.push(model);
 		const dashed = toGjcModelId(item.modelId);
-		if (dashed !== item.modelId) models.push({ ...model, id: dashed });
+		if (dashed !== item.modelId) {
+			const dashedModel = { ...model, id: dashed };
+			if (isRegionDerivedKiroApiBaseUrl(baseUrl)) {
+				registerProviderSafetyStopModel(dashedModel);
+			}
+			models.push(dashedModel);
+		}
 	}
 	return models;
 }
@@ -310,7 +338,7 @@ export async function fetchKiroApiModels(
 ): Promise<Model<"kiro-codewhisperer-stream">[]> {
 	const resolvedRegion = region ?? kiroApiRegion();
 	const baseUrl = kiroApiBaseUrl(resolvedRegion);
-	const response = await fetch(baseUrl, {
+	const response = await globalThis.fetch(baseUrl, {
 		method: "POST",
 		headers: kiroApiHeaders(apiKey, LIST_TARGET),
 		body: JSON.stringify({ origin: KIRO_ORIGIN }),
@@ -329,9 +357,17 @@ export async function fetchKiroApiModels(
 		if (!item.modelId) continue;
 		const model = toModel(item, baseUrl);
 		models.push(model);
+		// Register as trusted identity if baseUrl is an official region-derived endpoint
+		if (isRegionDerivedKiroApiBaseUrl(baseUrl)) {
+			registerProviderSafetyStopModel(model);
+		}
 		const dashed = toGjcModelId(item.modelId);
 		if (dashed !== item.modelId) {
-			models.push({ ...model, id: dashed });
+			const dashedModel = { ...model, id: dashed };
+			if (isRegionDerivedKiroApiBaseUrl(baseUrl)) {
+				registerProviderSafetyStopModel(dashedModel);
+			}
+			models.push(dashedModel);
 		}
 	}
 	return models;
@@ -345,19 +381,15 @@ type KiroStreamEvent =
 	| { type: "toolUseInput"; data: { input: string } }
 	| { type: "toolUseStop"; data: { stop: boolean } }
 	| { type: "usage"; data: { inputTokens?: number; outputTokens?: number } }
+	| {
+			type: "refusal";
+			data: { stopReason?: string; stopDetails?: { refusal?: { category?: string; explanation?: string } } };
+	  }
 	| { type: "error"; data: { error: string; message?: string } };
 
-const EVENT_PATTERNS = [
-	'{"content":',
-	'{"name":',
-	'{"input":',
-	'{"stop":',
-	'{"contextUsagePercentage":',
-	'{"usage":',
-	'{"toolUseId":',
-	'{"error":',
-	'{"Error":',
-];
+// Removed EVENT_PATTERNS: now scans for any '{' and parses complete JSON objects,
+// independent of property order (fixes #6150 where refusal was missed when
+// stopReason/stopDetails was not the first property)
 
 function findJsonEnd(text: string, start: number): number {
 	let brace = 0;
@@ -390,17 +422,57 @@ function findJsonEnd(text: string, start: number): number {
 export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[]; remaining: string } {
 	const events: KiroStreamEvent[] = [];
 	let pos = 0;
+	// Bounded retention: if we find stray/invalid JSON, rescan up to this distance ahead
+	// looking for a valid JSON object. If we don't find one, return what we have.
+	const MAX_RESCAN_DISTANCE = 64 * 1024; // 64KB
+
 	while (pos < buffer.length) {
-		let start = -1;
-		for (const pattern of EVENT_PATTERNS) {
-			const idx = buffer.indexOf(pattern, pos);
-			if (idx >= 0 && (start < 0 || idx < start)) start = idx;
-		}
+		// Find next '{' character (property-order independent scan)
+		const start = buffer.indexOf("{", pos);
 		if (start < 0) break;
+
 		const end = findJsonEnd(buffer, start);
-		if (end < 0) return { events, remaining: buffer.slice(start) };
+		if (end < 0) {
+			// Unclosed brace at 'start'. Could be incomplete JSON waiting for more data, or junk/corruption.
+			// Resync by looking for valid JSON objects within MAX_RESCAN_DISTANCE that parse successfully.
+			const strayBraceEnd = Math.min(start + MAX_RESCAN_DISTANCE, buffer.length);
+			let resyncPos = start + 1;
+			let found = false;
+			while (resyncPos < strayBraceEnd) {
+				const nextStart = buffer.indexOf("{", resyncPos);
+				if (nextStart < 0) break;
+
+				// Try to find the end of this candidate
+				const nextEnd = findJsonEnd(buffer, nextStart);
+				if (nextEnd >= 0) {
+					// Found a candidate that closes. Try to parse it as valid JSON.
+					try {
+						const candidate = buffer.slice(nextStart, nextEnd + 1);
+						JSON.parse(candidate);
+						// Valid JSON found. Resync to this position and continue processing.
+						pos = nextStart;
+						found = true;
+						break;
+					} catch {
+						// Not valid JSON, keep looking
+					}
+				}
+				resyncPos = nextStart + 1;
+			}
+			if (!found) {
+				// No valid JSON found within MAX_RESCAN_DISTANCE. Retain the stray brace and data up to the cap
+				// for the next parse call. Enforce the MAX_RESCAN_DISTANCE cap to prevent unbounded buffering.
+				return { events, remaining: buffer.slice(start, start + MAX_RESCAN_DISTANCE) };
+			}
+			// Loop will continue with the resynced pos
+			continue;
+		}
+
+		let parsed: Record<string, unknown> | undefined;
 		try {
-			const parsed = JSON.parse(buffer.slice(start, end + 1)) as Record<string, unknown>;
+			parsed = JSON.parse(buffer.slice(start, end + 1)) as Record<string, unknown>;
+
+			// Classify event based on fields present (order-independent)
 			if (typeof parsed.content === "string") {
 				events.push({ type: "content", data: parsed.content });
 			} else if (parsed.name && parsed.toolUseId) {
@@ -422,9 +494,30 @@ export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[];
 				});
 			} else if ("stop" in parsed && parsed.contextUsagePercentage === undefined) {
 				events.push({ type: "toolUseStop", data: { stop: Boolean(parsed.stop) } });
-			} else if (parsed.usage && typeof parsed.usage === "object") {
+			}
+
+			// Check for usage first (before refusal) to ensure it gets processed even if refusal terminates the stream
+			if (parsed.usage && typeof parsed.usage === "object") {
 				const u = parsed.usage as { inputTokens?: number; outputTokens?: number };
 				events.push({ type: "usage", data: u });
+			}
+
+			// Check for refusal after usage so that usage is processed first and recorded before refusal terminates
+			// This check is now order-independent: stopDetails can appear at any position in the JSON object
+			if (
+				typeof parsed.stopDetails === "object" &&
+				parsed.stopDetails !== null &&
+				(parsed.stopDetails as Record<string, unknown>).refusal
+			) {
+				// Emit refusal event if stopDetails contains actual refusal data
+				events.push({
+					type: "refusal",
+					data: {
+						stopReason: parsed.stopReason as string | undefined,
+						stopDetails: parsed.stopDetails as { refusal?: { category?: string; explanation?: string } },
+					},
+				});
+				// Normal terminal metadata (stopReason: "COMPLETED", etc.) without refusal data is ignored
 			} else if (parsed.error || parsed.Error) {
 				events.push({
 					type: "error",
@@ -435,8 +528,39 @@ export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[];
 				});
 			}
 		} catch {
-			// skip malformed frame
+			// JSON parsing failed for a balanced frame: could be a junk wrapper like '{junk{...}}'
+			// Rescan for valid JSON objects inside the failed frame
+			const strayBraceEnd = Math.min(start + MAX_RESCAN_DISTANCE, buffer.length);
+			let resyncPos = start + 1;
+			let found = false;
+			while (resyncPos < strayBraceEnd) {
+				const nextStart = buffer.indexOf("{", resyncPos);
+				if (nextStart < 0 || nextStart > end) break; // Don't go past the found end
+
+				// Try to find the end of this candidate
+				const nextEnd = findJsonEnd(buffer, nextStart);
+				if (nextEnd >= 0) {
+					// Found a candidate that closes. Try to parse it as valid JSON.
+					try {
+						const candidate = buffer.slice(nextStart, nextEnd + 1);
+						JSON.parse(candidate);
+						// Valid JSON found. Resync to this position and continue processing.
+						pos = nextStart;
+						found = true;
+						break;
+					} catch {
+						// Not valid JSON, keep looking
+					}
+				}
+				resyncPos = nextStart + 1;
+			}
+			if (found) {
+				// Found valid JSON inside the junk wrapper, continue processing from there
+				continue;
+			}
+			// No valid JSON found; just skip this malformed frame
 		}
+
 		pos = end + 1;
 	}
 	return { events, remaining: "" };
@@ -591,12 +715,17 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 	const stream = new AssistantMessageEventStream();
 	(async () => {
 		const apiKey = options.apiKey?.trim() ?? "";
+		const startTime = Date.now();
+		let firstTokenEmitted = false;
+		let firstTokenTime: number | undefined;
+
+		// Initialize output with default values; will be updated inside try block with snapshotted model identity
 		const output: AssistantMessage = {
 			role: "assistant",
 			content: [],
 			api: "kiro-codewhisperer-stream" as Api,
-			provider: model.provider,
-			model: model.id,
+			provider: "",
+			model: "",
 			usage: {
 				input: 0,
 				output: 0,
@@ -609,22 +738,63 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			timestamp: Date.now(),
 		};
 		const blocks = output.content as Block[];
+
+		// Variables for streaming tool calls (initialized before try block so they're accessible in catch)
+		let currentTool: { id: string; name: string; input: string } | undefined;
+		let toolComplete = false; // Track whether the current tool has been completed (has stop flag)
+		let toolcallIndex: number | undefined;
+		const pendingToolCalls: Array<{ input: string; toolCall: ToolCall; index: number }> = [];
+
 		try {
+			// Use validated identity snapshot from trust check if available (no second read of getters),
+			// otherwise snapshot model properties now to prevent TOCTOU attacks.
+			let modelSnapshot = getProviderSafetyStopModelIdentity(options);
+			let wireModelIdFromSnapshot = getProviderSafetyStopWireModelId(options);
+			if (!modelSnapshot) {
+				// Trust check didn't provide snapshot; snapshot properties now
+				modelSnapshot = Object.freeze({
+					provider: model.provider,
+					id: model.id,
+					baseUrl: model.baseUrl,
+					api: "kiro-codewhisperer-stream" as Api,
+				});
+				wireModelIdFromSnapshot = model.wireModelId;
+			}
+
+			// Update output with snapshotted model identity
+			output.api = (modelSnapshot.api as Api) || ("kiro-codewhisperer-stream" as Api);
+			output.provider = modelSnapshot.provider || "";
+			output.model = modelSnapshot.id || "";
+
 			if (!isKiroApiKey(apiKey)) {
 				throw new Error(
 					"Kiro API key missing. Set KIRO_API_KEY to a ksk_ key from https://app.kiro.dev/settings/api-keys.",
 				);
 			}
-			const configuredBaseUrl = model.baseUrl;
+
+			const configuredBaseUrl = modelSnapshot.baseUrl || "";
 			const usesExplicitBaseUrl = Boolean(configuredBaseUrl) && !isRegionDerivedKiroApiBaseUrl(configuredBaseUrl);
 			const endpoint = configuredBaseUrl || kiroApiBaseUrl(kiroApiRegion(options));
-			let request = buildApiKeyRequest(model, context, options);
-			const replacementPayload = await options?.onPayload?.(request, model, options?.attemptScope, options?.signal);
+			// Create a snapshotted model view for downstream functions to use
+			const snapshotModel: Model<"kiro-codewhisperer-stream"> = {
+				...model,
+				provider: (modelSnapshot.provider || model.provider) as string,
+				id: (modelSnapshot.id || model.id) as string,
+				baseUrl: (modelSnapshot.baseUrl ?? model.baseUrl) as string,
+				wireModelId: wireModelIdFromSnapshot ?? model.wireModelId,
+			};
+			let request = buildApiKeyRequest(snapshotModel, context, options);
+			const replacementPayload = await options?.onPayload?.(
+				request,
+				snapshotModel,
+				options?.attemptScope,
+				options?.signal,
+			);
 			if (replacementPayload !== undefined) {
 				request = replacementPayload;
 			}
 
-			const response = await fetch(endpoint, {
+			const response = await (options.fetch ?? globalThis.fetch)(endpoint, {
 				method: "POST",
 				headers: { ...kiroApiHeaders(apiKey, CHAT_TARGET), ...(options.headers ?? {}) },
 				body: JSON.stringify(request),
@@ -645,11 +815,11 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			const decoder = new TextDecoder();
 			let buffer = "";
 			let lastContent = "";
-			let currentTool: { id: string; name: string; input: string } | undefined;
 			let thinkingIndex: number | undefined;
 			let textIndex: number | undefined;
 
-			const flushTool = () => {
+			// Add tool to blocks without emitting events (deferred until stream end)
+			const addToolToBlocks = () => {
 				if (!currentTool) return;
 				const args = currentTool.input.trim() ? currentTool.input : "{}";
 				let parsed: unknown = {};
@@ -666,47 +836,110 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				};
 				const index = blocks.length;
 				blocks.push({ ...toolCall, index });
-				stream.push({ type: "toolcall_start", contentIndex: index, partial: output });
-				stream.push({ type: "toolcall_delta", contentIndex: index, delta: args, partial: output });
-				stream.push({ type: "toolcall_end", contentIndex: index, toolCall, partial: output });
+				if (toolcallIndex === undefined) {
+					toolcallIndex = index;
+				}
+				const toolArgs =
+					typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+						? (parsed as Record<string, unknown>)
+						: {};
+				const normalizedArgs = JSON.stringify(toolArgs);
+				pendingToolCalls.push({ input: normalizedArgs, toolCall, index });
 				currentTool = undefined;
 			};
 
-			const emitText = (delta: string) => {
-				if (thinkingIndex !== undefined) {
+			// Emit accumulated tool call events (only called at stream end if no refusal)
+			const emitPendingToolCalls = () => {
+				for (const { input, toolCall, index } of pendingToolCalls) {
+					stream.push({ type: "toolcall_start", contentIndex: index, partial: output });
 					stream.push({
-						type: "thinking_end",
-						contentIndex: thinkingIndex,
-						content: "",
+						type: "toolcall_delta",
+						contentIndex: index,
+						delta: input,
 						partial: output,
 					});
+					stream.push({
+						type: "toolcall_end",
+						contentIndex: index,
+						toolCall,
+						partial: output,
+					});
+				}
+				pendingToolCalls.length = 0;
+			};
+
+			// Clear pending tool calls without emitting events (on refusal)
+			const clearPendingToolCalls = () => {
+				pendingToolCalls.length = 0;
+				currentTool = undefined;
+				toolComplete = false; // Reset tool completion flag
+			};
+
+			let textStartDeferred = false; // Track if text_start has been deferred pending thinking
+
+			const appendText = (delta: string) => {
+				// Set firstTokenTime on first real (non-thinking) text delta
+				if (!firstTokenEmitted) {
+					firstTokenEmitted = true;
+					firstTokenTime = Date.now();
+				}
+				if (thinkingIndex !== undefined) {
 					thinkingIndex = undefined;
 				}
 				if (textIndex === undefined) {
 					textIndex = blocks.length;
 					blocks.push({ type: "text", text: "", index: textIndex });
-					stream.push({ type: "text_start", contentIndex: textIndex, partial: output });
+					// Defer text_start emission if thinking might come before text.
+					// thinkingAccumulated is non-empty means we've seen thinking in this or prior content events.
+					// We don't know yet if more thinking will come, so defer text_start until stream end.
+					if (thinkingAccumulated.length === 0) {
+						// No thinking yet; safe to emit text_start now
+						stream.push({ type: "text_start", contentIndex: textIndex, partial: output });
+					} else {
+						// Thinking exists; defer text_start until we know thinking position
+						textStartDeferred = true;
+					}
 				}
 				const block = blocks[textIndex] as TextContent;
 				block.text += delta;
-				stream.push({ type: "text_delta", contentIndex: textIndex, delta, partial: output });
+				// Only emit text_delta if text_start was already emitted
+				if (!textStartDeferred) {
+					stream.push({ type: "text_delta", contentIndex: textIndex, delta, partial: output });
+				}
 			};
 
-			const emitThinking = (delta: string) => {
-				if (thinkingIndex === undefined) {
-					thinkingIndex = blocks.length;
-					blocks.push({ type: "thinking", thinking: "", index: thinkingIndex } as ThinkingContent & {
-						index: number;
-					});
-					stream.push({ type: "thinking_start", contentIndex: thinkingIndex, partial: output });
+			// Emit deferred text events if text_start was not yet sent
+			const emitDeferredTextEvents = () => {
+				if (textStartDeferred && textIndex !== undefined && textIndex < blocks.length) {
+					const block = blocks[textIndex];
+					if (block && block.type === "text") {
+						stream.push({ type: "text_start", contentIndex: textIndex, partial: output });
+						if (block.text.length > 0) {
+							stream.push({
+								type: "text_delta",
+								contentIndex: textIndex,
+								delta: block.text,
+								partial: output,
+							});
+						}
+						textStartDeferred = false;
+					}
 				}
-				const block = blocks[thinkingIndex] as ThinkingContent;
-				block.thinking += delta;
-				stream.push({ type: "thinking_delta", contentIndex: thinkingIndex, delta, partial: output });
+			};
+
+			// Emit text_end if text block was opened
+			const closeTextBlock = () => {
+				if (textIndex !== undefined) {
+					const block = blocks[textIndex] as TextContent;
+					stream.push({ type: "text_end", contentIndex: textIndex, content: block.text, partial: output });
+					textIndex = undefined;
+				}
 			};
 
 			let inThink = false;
 			let thinkBuf = "";
+			let thinkingAccumulated = ""; // Buffer thinking until end or refusal
+
 			const consumeContent = (raw: string) => {
 				thinkBuf += raw;
 				while (true) {
@@ -714,81 +947,210 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						const start = thinkBuf.indexOf("<thinking>");
 						if (start < 0) {
 							if (thinkBuf) {
-								emitText(thinkBuf);
+								appendText(thinkBuf);
 								thinkBuf = "";
 							}
 							return;
 						}
-						if (start > 0) emitText(thinkBuf.slice(0, start));
+						if (start > 0) appendText(thinkBuf.slice(0, start));
 						thinkBuf = thinkBuf.slice(start + "<thinking>".length);
 						inThink = true;
 					} else {
 						const end = thinkBuf.indexOf("</thinking>");
 						if (end < 0) {
 							if (thinkBuf) {
-								emitThinking(thinkBuf);
+								thinkingAccumulated += thinkBuf;
 								thinkBuf = "";
 							}
 							return;
 						}
-						if (end > 0) emitThinking(thinkBuf.slice(0, end));
+						if (end > 0) thinkingAccumulated += thinkBuf.slice(0, end);
 						thinkBuf = thinkBuf.slice(end + "</thinking>".length);
 						inThink = false;
-						if (thinkingIndex !== undefined) {
-							stream.push({
-								type: "thinking_end",
-								contentIndex: thinkingIndex,
-								content: "",
-								partial: output,
-							});
-							thinkingIndex = undefined;
-						}
 					}
 				}
 			};
 
+			// Emit accumulated thinking (from buffer)
+			const emitThinking = () => {
+				if (!thinkingAccumulated) return;
+				if (thinkingIndex === undefined) {
+					if (textIndex !== undefined && !textStartDeferred) {
+						// Text_start has already been emitted (not deferred) with contentIndex.
+						// Do NOT insert thinking before text (would change text's index).
+						// Append thinking after all emitted blocks.
+						thinkingIndex = blocks.length;
+						blocks.push({
+							type: "thinking",
+							thinking: thinkingAccumulated,
+							index: thinkingIndex,
+						} as ThinkingContent & { index: number });
+					} else {
+						// Text has not started streaming yet, or text_start was deferred.
+						// Thinking can take index 0 to preserve provider order.
+						thinkingIndex = 0;
+						blocks.unshift({
+							type: "thinking",
+							thinking: thinkingAccumulated,
+							index: 0,
+						} as ThinkingContent & { index: number });
+						// Update indices of blocks that were shifted
+						for (let i = 1; i < blocks.length; i++) {
+							(blocks[i] as Block).index = i;
+						}
+						// Update state tracking variables for shifted blocks
+						if (textIndex !== undefined) textIndex += 1;
+						if (toolcallIndex !== undefined) toolcallIndex += 1;
+						// Update indices in pending tool calls since all blocks shifted by 1
+						for (const pending of pendingToolCalls) {
+							pending.index += 1;
+						}
+					}
+					stream.push({ type: "thinking_start", contentIndex: thinkingIndex, partial: output });
+					stream.push({
+						type: "thinking_delta",
+						contentIndex: thinkingIndex,
+						delta: thinkingAccumulated,
+						partial: output,
+					});
+					stream.push({
+						type: "thinking_end",
+						contentIndex: thinkingIndex,
+						content: thinkingAccumulated,
+						partial: output,
+					});
+				}
+			};
+
+			// Process events incrementally as they arrive (streaming, no full-response buffering)
 			while (true) {
 				const { done, value } = await reader.read();
 				if (done) break;
 				buffer += decoder.decode(value, { stream: true });
 				const { events, remaining } = parseKiroApiEvents(buffer);
 				buffer = remaining;
+
+				// Check if any refusal events are present in this batch.
+				// Refusals suppress all content/tool events, but ordinary errors allow prior events to stream.
+				const hasTerminalEvent = events.some(e => e.type === "refusal");
+
 				for (const event of events) {
 					if (event.type === "content") {
-						if (event.data === lastContent) continue;
-						lastContent = event.data;
-						consumeContent(event.data);
-					} else if (event.type === "toolUse") {
-						if (currentTool && currentTool.id !== event.data.toolUseId) flushTool();
-						if (!currentTool) {
-							currentTool = { id: event.data.toolUseId, name: event.data.name, input: event.data.input };
-						} else {
-							currentTool.input += event.data.input;
+						if (!hasTerminalEvent) {
+							if (event.data === lastContent) continue;
+							lastContent = event.data;
+							consumeContent(event.data);
 						}
-						if (event.data.stop) flushTool();
-					} else if (event.type === "toolUseInput" && currentTool) {
+					} else if (event.type === "toolUse") {
+						if (!hasTerminalEvent) {
+							if (!firstTokenEmitted) {
+								firstTokenEmitted = true;
+								firstTokenTime = Date.now();
+							}
+							if (currentTool && currentTool.id !== event.data.toolUseId) addToolToBlocks();
+							if (!currentTool) {
+								currentTool = { id: event.data.toolUseId, name: event.data.name, input: event.data.input };
+								toolComplete = false; // New tool starts as incomplete
+							} else {
+								currentTool.input += event.data.input;
+							}
+							if (event.data.stop) {
+								toolComplete = true; // Mark tool as complete when stop flag is set
+								addToolToBlocks();
+							}
+						}
+					} else if (event.type === "toolUseInput" && currentTool && !hasTerminalEvent) {
+						if (!firstTokenEmitted) {
+							firstTokenEmitted = true;
+							firstTokenTime = Date.now();
+						}
 						currentTool.input += event.data.input;
 					} else if (event.type === "toolUseStop" && event.data.stop) {
-						flushTool();
+						toolComplete = true; // Mark tool as complete when toolUseStop is received
+						addToolToBlocks();
 					} else if (event.type === "usage") {
 						if (event.data.inputTokens !== undefined) output.usage.input = event.data.inputTokens;
 						if (event.data.outputTokens !== undefined) output.usage.output = event.data.outputTokens;
 						output.usage.totalTokens = output.usage.input + output.usage.output;
+					} else if (event.type === "refusal") {
+						const refusalData = event.data as {
+							stopReason?: string;
+							stopDetails?: { refusal?: { category?: string; explanation?: string } };
+						};
+						if (refusalData.stopDetails?.refusal) {
+							// Handle refusal: clear blocks and emit error (don't emit any text/tool that came before)
+							consumeContent(""); // Flush any pending thinking
+							clearPendingToolCalls(); // DROP any pending tool call without emitting events
+
+							const refusal = refusalData.stopDetails.refusal;
+							const category = refusal.category;
+							const explanation = refusal.explanation?.trim();
+							const label = category ? `Kiro refused the request (${category})` : "Kiro refused the request";
+
+							output.stopReason = "error";
+							output.errorMessage = sanitizeKiroError(explanation ? `${label}: ${explanation}` : label, apiKey);
+							output.content = [];
+
+							// Mint provider safety stop
+							// Do not pass options.fetch as callerTransport: the refusal came from the
+							// provider's response, not from a caller-controlled fabrication.
+							const adapterInvocation = isProviderSafetyStopAdapterInvocation(options);
+
+							const authenticated = mintProviderSafetyStop(
+								output,
+								"refusal",
+								PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+								undefined,
+								adapterInvocation,
+							);
+
+							if (!authenticated) {
+								output.transportFailure = {
+									kind: "transport",
+									status: 500,
+									providerCode: "untrusted_safety_stop",
+								};
+							}
+
+							output.duration = Date.now() - startTime;
+							if (firstTokenTime) output.ttft = firstTokenTime - startTime;
+							stream.push({ type: "error", reason: "error", error: output });
+							stream.end();
+							return;
+						}
 					} else if (event.type === "error") {
-						throw new Error(sanitizeKiroError(`${event.data.error}: ${event.data.message ?? ""}`, apiKey));
+						// On ordinary errors, flush pending COMPLETED tool events before the error terminal
+						// (refusals drop them, incomplete tools must not be emitted)
+						// Only emit the tool if it was explicitly completed (has stop flag)
+						if (toolComplete) addToolToBlocks();
+						emitPendingToolCalls();
+
+						// Preserve any already-accumulated text in the error context
+						const accumulatedText = blocks
+							.filter((b): b is TextContent => b.type === "text")
+							.map(b => b.text)
+							.join("");
+						const errorMsg = sanitizeKiroError(`${event.data.error}: ${event.data.message ?? ""}`, apiKey);
+						const fullErrorMsg = accumulatedText ? `${errorMsg}\n\nPartial output: ${accumulatedText}` : errorMsg;
+						throw new Error(fullErrorMsg);
 					}
 				}
 			}
-			flushTool();
-			if (textIndex !== undefined) {
-				const block = blocks[textIndex] as TextContent;
-				stream.push({ type: "text_end", contentIndex: textIndex, content: block.text, partial: output });
-			}
+
+			// Stream is done - add any pending tool, emit accumulated thinking, then deferred text, then close text block
+			addToolToBlocks();
+			emitThinking();
+			emitDeferredTextEvents();
+			// Now emit all tool call events in order (safe since no refusal occurred)
+			emitPendingToolCalls();
+			closeTextBlock();
 			const hasText = blocks.some(b => b.type === "text" && b.text.length > 0);
 			const hasTools = blocks.some(b => b.type === "toolCall");
 			if (!hasText && !hasTools) {
 				output.stopReason = "error";
 				output.errorMessage = "Kiro API key stream returned no tokens";
+				output.duration = Date.now() - startTime;
+				if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 				stream.push({ type: "error", reason: "error", error: output });
 				stream.end();
 				return;
@@ -802,11 +1164,43 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				output.usage.output = Math.max(1, Math.floor(text.length / 4));
 				output.usage.totalTokens = output.usage.input + output.usage.output;
 			}
+			// Rebuild output.content with blocks (thinking first if inserted at index 0, otherwise append order)
+			output.content = blocks.filter(
+				(b): b is TextContent | ThinkingContent | ToolCall =>
+					b.type === "text" || b.type === "thinking" || b.type === "toolCall",
+			);
+			output.duration = Date.now() - startTime;
+			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({ type: "done", reason: output.stopReason as "stop" | "toolUse", message: output });
 			stream.end();
 		} catch (error) {
+			// On ordinary errors (including reader.read() throws), emit only COMPLETED tool events
+			// before the error terminal (same semantics as the ordinary-error flush in the event loop).
+			// Incomplete currentTool is NOT finalized/emitted (only completed tools in pendingToolCalls flush).
+			// Refusals drop them via clearPendingToolCalls, but ordinary errors preserve content consistency.
+
+			// Emit all pending tool call events (inline of emitPendingToolCalls logic)
+			for (const { input, toolCall, index } of pendingToolCalls) {
+				stream.push({ type: "toolcall_start", contentIndex: index, partial: output });
+				stream.push({
+					type: "toolcall_delta",
+					contentIndex: index,
+					delta: input,
+					partial: output,
+				});
+				stream.push({
+					type: "toolcall_end",
+					contentIndex: index,
+					toolCall,
+					partial: output,
+				});
+			}
+			pendingToolCalls.length = 0;
+
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = sanitizeKiroError(error, apiKey);
+			output.duration = Date.now() - startTime;
+			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}

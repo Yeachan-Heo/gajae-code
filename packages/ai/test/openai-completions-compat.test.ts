@@ -241,6 +241,7 @@ describe("openai-completions compatibility", () => {
 		expect(xaiCompat("x-ai/grok-4.6", "openai", "https://api.openai.com/v1")).toBe(false);
 		expect((await captureXaiPayload("grok-4.5", "low")).reasoning_effort).toBe("low");
 		expect((await captureXaiPayload("grok-4.6", "xhigh")).reasoning_effort).toBe("xhigh");
+		expect((await captureXaiPayload("grok-4.7", "xhigh")).reasoning_effort).toBe("xhigh");
 		expect((await captureXaiPayload("grok-4.7", "low")).reasoning_effort).toBe("low");
 		expect((await captureXaiPayload("grok-4.20-0309-reasoning", "low")).reasoning_effort).toBe("low");
 		expect((await captureXaiPayload("grok-4.6", "xhigh", "https://proxy.example.com/v1")).reasoning_effort).toBe(

@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentMessage } from "@gajae-code/agent-core";
 import { completeSimple, Effort, type Model } from "@gajae-code/ai/core";
+import { clampThinkingLevelForModel } from "@gajae-code/ai/model-thinking";
 import { getAgentDbPath, getMemoriesDir, logger, parseJsonlLenient, prompt } from "@gajae-code/utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { resolveModelRoleValue } from "../config/model-resolver";
@@ -615,7 +616,7 @@ async function runStage1Job(options: {
 				apiKey,
 				metadata: options.metadata,
 				maxTokens: Math.max(1024, Math.min(4096, Math.floor(modelMaxTokens * 0.2))),
-				reasoning: Effort.Low,
+				reasoning: clampThinkingLevelForModel(model, Effort.Low),
 			},
 		);
 
@@ -747,7 +748,12 @@ async function runConsolidationModel(options: {
 		{
 			messages: [{ role: "user", content: [{ type: "text", text: input }], timestamp: Date.now() }],
 		},
-		{ apiKey, metadata: options.metadata, maxTokens: 8192, reasoning: Effort.Medium },
+		{
+			apiKey,
+			metadata: options.metadata,
+			maxTokens: 8192,
+			reasoning: clampThinkingLevelForModel(model, Effort.Medium),
+		},
 	);
 	if (response.stopReason === "error") {
 		throw new Error(response.errorMessage || "phase2 model error");

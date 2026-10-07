@@ -15,7 +15,7 @@
   - `packages/coding-agent/src/task/output-manager.ts` — session-scoped `agent://` id allocation.
   - `packages/coding-agent/src/task/simple-mode.ts` — `default` / `schema-free` / `independent` field gating.
   - `packages/coding-agent/src/internal-urls/agent-protocol.ts` — resolve `agent://<id>` to saved subagent output.
-  - `packages/coding-agent/src/tools/index.ts` — tool registration and recursion-depth gating.
+  - `packages/coding-agent/src/tools/descriptors.ts` — tool registration and recursion-depth gating.
   - `packages/coding-agent/src/sdk/session.ts` — child-session router/tool wiring and per-subagent `AgentOutputManager`.
   - `docs/handoff-generation-pipeline.md` — session artifact/handoff persistence patterns used by the wider session layer.
 
@@ -30,6 +30,7 @@
 | `context` | `string` | No | Shared background prepended to every subagent system prompt. Trimmed before use. |
 | `schema` | `string` | No | JSON-encoded JTD schema. Overrides agent/session output schema when this mode allows task-level schemas. |
 | `isolated` | `boolean` | No | Only present when the tool is created with isolation enabled. Requests isolated execution for the whole batch. |
+| `spawnPlan` | `{ whyParallel: string; whyNotLocal: string; independence: string; expectedReceiptShape: string; maxInlineTokens: number }` | No | Required when a batch has more than 4 tasks (`DEFAULT_SPAWN_THRESHOLD` in `task/spawn-gate.ts`). The four strings must be non-empty and `maxInlineTokens` a positive finite number; otherwise the batch is rejected with `Task spawn gate rejected this batch: ...` naming the missing fields. |
 
 `tasks[].description` is UI-only. `tasks[].assignment` is the actual per-task instruction.
 
@@ -74,6 +75,7 @@ Same as default, except `schema` is rejected by `validateTaskModeParams(...)` in
 | `agent` | `string` | Yes | Exact agent name. |
 | `tasks` | `Array<{ id: string; description: string; assignment: string }>` | Yes | Same item shape, but each `assignment` must carry all required background because shared `context` is disabled. |
 | `isolated` | `boolean` | No | Same conditional field as above. |
+| `spawnPlan` | `object` | No | Same spawn gate as above: required for batches of more than 4 tasks. |
 
 In this mode both `context` and `schema` are rejected.
 
@@ -229,7 +231,7 @@ With autorouting disabled, model resolution is byte-for-byte unchanged.
 - Async/full sync parallelism both use `task.maxConcurrency` from settings:
   - sync path: `mapWithConcurrencyLimit(...)`
   - async path: `Semaphore(...)` around job bodies
-- Recursion depth gate: `task.maxRecursionDepth` from settings; `packages/coding-agent/src/tools/index.ts` hides the `task` tool at or beyond the limit, and `runSubprocess(...)` also strips child `task` access at max depth.
+- Recursion depth gate: `task.maxRecursionDepth` from settings; `packages/coding-agent/src/tools/descriptors.ts` hides the `task` tool at or beyond the limit, and `runSubprocess(...)` also strips child `task` access at max depth.
 - Final inline summary preview per task uses `fullOutputThreshold = 5000` chars in `packages/coding-agent/src/task/index.ts`; longer outputs are summarized while `agent://<id>` points to the full artifact.
 
 ## Errors

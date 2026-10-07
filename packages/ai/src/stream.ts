@@ -8,6 +8,7 @@ import {
 	getTrustedHomeDir,
 } from "@gajae-code/utils";
 import {
+	attachProviderSafetyStopModelIdentity,
 	copyProviderSafetyStopAdapterInvocation,
 	isProviderSafetyStopModelTrusted,
 	withProviderSafetyStopAdapterInvocation,
@@ -24,7 +25,7 @@ function markManagedAttemptValidated<T extends object>(options: T): T {
 	return Object.assign(options, { [managedAttemptValidated]: true });
 }
 
-import { getCustomApi } from "./api-registry";
+import { CustomApiRegistry, resolveCustomApi } from "./api-registry";
 import type { Effort } from "./model-thinking";
 import {
 	getMiniMaxThinkingMode,
@@ -83,6 +84,31 @@ import { AssistantMessageEventStream } from "./utils/event-stream";
 import { isFoundryEnabled } from "./utils/foundry";
 
 let cachedVertexAdcCredentialsExists: boolean | null = null;
+
+function assertCustomApiRegistryActive(registry: CustomApiRegistry | undefined): void {
+	if (registry !== undefined) CustomApiRegistry.assertActive(registry);
+}
+
+function isBuiltInApi(api: Api): boolean {
+	switch (api) {
+		case "openai-completions":
+		case "openai-responses":
+		case "openai-codex-responses":
+		case "azure-openai-responses":
+		case "anthropic-messages":
+		case "bedrock-converse-stream":
+		case "google-generative-ai":
+		case "google-gemini-cli":
+		case "google-vertex":
+		case "ollama-chat":
+		case "cursor-agent":
+		case "devin-acp":
+		case "kiro-codewhisperer-stream":
+			return true;
+		default:
+			return false;
+	}
+}
 
 function hasVertexAdcCredentials(): boolean {
 	if (cachedVertexAdcCredentialsExists === null) {
@@ -339,6 +365,7 @@ export function stream<TApi extends Api>(
 	options?: OptionsForApi<TApi>,
 	onStreamCreated?: () => void,
 ): AssistantMessageEventStream {
+	assertCustomApiRegistryActive(options?.customApiRegistry);
 	if (!hasValidatedManagedAttempt(options)) assertManagedAttempt(options);
 	if (options?.fallbackManaged) {
 		options = { ...options, requestMaxRetries: 0, streamMaxRetries: 0 } as OptionsForApi<TApi>;
@@ -352,9 +379,12 @@ export function stream<TApi extends Api>(
 		options = { ...options, maxTokens: undefined } as OptionsForApi<TApi>;
 	}
 	// Check custom API registry first (extension-provided APIs like "vertex-Anthropic model-api")
-	const customApiProvider = getCustomApi(model.api);
+	const customApiProvider = resolveCustomApi(model.api, options?.customApiRegistry);
 	if (customApiProvider) {
 		return customApiProvider.stream(model, context, options as StreamOptions);
+	}
+	if (options?.customApiRegistry !== undefined && !isBuiltInApi(model.api)) {
+		throw new Error(`Unhandled API: ${model.api}`);
 	}
 
 	if (model.provider === "gitlab-duo") {
@@ -395,10 +425,18 @@ export function stream<TApi extends Api>(
 			onStreamCreated,
 		);
 	} else if (model.api === "kiro-codewhisperer-stream") {
+		const kiroOptions = (options || {}) as KiroCodeWhispererOptions;
+		const identitySnapshot = isProviderSafetyStopModelTrusted(model);
+		let adapterKiroOptions = identitySnapshot ? withProviderSafetyStopAdapterInvocation(kiroOptions) : kiroOptions;
+		// Attach validated model identity snapshot to prevent TOCTOU attacks on getters
+		if (identitySnapshot) {
+			const wireModelId = (model as { wireModelId?: string }).wireModelId;
+			adapterKiroOptions = attachProviderSafetyStopModelIdentity(adapterKiroOptions, identitySnapshot, wireModelId);
+		}
 		return streamKiroCodeWhisperer(
 			model as Model<"kiro-codewhisperer-stream">,
 			context,
-			(options || {}) as KiroCodeWhispererOptions,
+			adapterKiroOptions,
 			onStreamCreated,
 		);
 	} else if (model.api === "devin-acp") {
@@ -584,6 +622,7 @@ export function streamSimple<TApi extends Api>(
 	context: Context,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
+	assertCustomApiRegistryActive(options?.customApiRegistry);
 	assertManagedAttempt(options);
 	if (options?.fallbackManaged) {
 		options = {
@@ -719,7 +758,7 @@ export function streamSimple<TApi extends Api>(
 	}
 
 	// Check custom API registry (extension-provided APIs)
-	const customApiProvider = getCustomApi(model.api);
+	const customApiProvider = resolveCustomApi(model.api, options?.customApiRegistry);
 	if (customApiProvider) {
 		const events = customApiProvider.streamSimple(model, context, {
 			...options,
@@ -729,6 +768,9 @@ export function streamSimple<TApi extends Api>(
 		const forwarded = new AssistantMessageEventStream();
 		pipeAssistantStream(forwarded, events, options.signal, options.onStreamCreated);
 		return forwarded;
+	}
+	if (options?.customApiRegistry !== undefined && !isBuiltInApi(model.api)) {
+		throw new Error(`Unhandled API: ${model.api}`);
 	}
 
 	// Vertex AI uses Application Default Credentials, not API keys
@@ -955,6 +997,7 @@ function mapOptionsForApi<TApi extends Api>(
 		presencePenalty: options?.presencePenalty,
 		repetitionPenalty: options?.repetitionPenalty,
 		maxTokens: resolveDefaultRequestMaxTokens(model, options?.maxTokens),
+		customApiRegistry: options?.customApiRegistry,
 		signal: options?.signal,
 		streamFirstEventTimeoutMs: options?.streamFirstEventTimeoutMs,
 		streamIdleTimeoutMs: options?.streamIdleTimeoutMs,
@@ -1022,8 +1065,28 @@ function mapOptionsForApi<TApi extends Api>(
 			// For older models: use budget-based thinking
 			if (model.thinking?.mode === "anthropic-adaptive") {
 				const effort = mapEffortToAnthropicAdaptiveEffort(model, reasoning);
+
+				// Adaptive mode sends effort directly (no explicit budget_tokens).
+				// However, the thinking consumes tokens from the overall max_tokens budget.
+				// If max_tokens is capped at DEFAULT_REQUEST_MAX_TOKENS (32k),
+				// high/xhigh/max reasoning consumes all 32k, leaving no output tokens.
+				// Solution: when caller did not explicitly set maxTokens,
+				// increase the cap to model.maxTokens to allow room for output.
+				let adaptiveMaxTokens = base.maxTokens ?? model.maxTokens;
+				const hasExplicitMaxTokens = Number.isSafeInteger(options?.maxTokens) && (options?.maxTokens as number) > 0;
+				if (
+					!hasExplicitMaxTokens &&
+					adaptiveMaxTokens === DEFAULT_REQUEST_MAX_TOKENS &&
+					Number.isSafeInteger(model.maxTokens) &&
+					model.maxTokens > DEFAULT_REQUEST_MAX_TOKENS
+				) {
+					// Increase to model.maxTokens to leave room for both thinking and output
+					adaptiveMaxTokens = model.maxTokens;
+				}
+
 				return castApi<"anthropic-messages">({
 					...base,
+					maxTokens: adaptiveMaxTokens,
 					thinkingEnabled: true,
 					effort,
 					toolChoice: mapAnthropicToolChoice(options?.toolChoice),

@@ -3,6 +3,157 @@ import { AsyncJobManager } from "@gajae-code/coding-agent/async/job-manager";
 import { lookupOwnedRegistration, registerOwnedRegistration } from "../src/session/terminal-abort";
 
 describe("AsyncJobManager", () => {
+	test("reentrant cancellation disposal waits for the published runner completion", async () => {
+		const runner = Promise.withResolvers<string>();
+		const endpointId = "lifecycle-reentrant-disposal";
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		let disposing: Promise<boolean> | undefined;
+		let drained = false;
+		let runnerFinished = false;
+		try {
+			expect(AsyncJobManager.registerForEndpoint(endpointId, manager)).toBe(true);
+			manager.register(
+				"bash",
+				"synchronously cancelled held runner",
+				({ jobId }) => {
+					expect(manager.cancel(jobId)).toBe(true);
+					return runner.promise;
+				},
+				{
+					lifecycle: {
+						onCancel: job => {
+							void job.promise.then(() => {
+								runnerFinished = true;
+							});
+							disposing = manager.dispose({ timeoutMs: 2_000 }).then(result => {
+								drained = result;
+								return result;
+							});
+						},
+					},
+				},
+			);
+			if (!disposing) throw new Error("Cancellation did not start disposal");
+			await Bun.sleep(5);
+			expect(runnerFinished).toBe(false);
+			expect(drained).toBe(false);
+			expect(AsyncJobManager.forEndpoint(endpointId)).toBe(manager);
+			runner.resolve("runner unwound");
+			expect(await disposing).toBe(true);
+			expect(runnerFinished).toBe(true);
+			expect(AsyncJobManager.forEndpoint(endpointId)).toBeUndefined();
+		} finally {
+			runner.resolve("runner unwound");
+			await manager.dispose({ timeoutMs: 100 });
+		}
+	});
+
+	test("evicts a synchronously failing runner through its original lifecycle", async () => {
+		const terminalRows: string[] = [];
+		const evictedGenerations: string[] = [];
+		const manager = new AsyncJobManager({ onJobComplete: async () => {}, retentionMs: 10 });
+		try {
+			const id = manager.register(
+				"bash",
+				"synchronous setup failure",
+				() => {
+					throw new Error("setup failed synchronously");
+				},
+				{
+					lifecycle: {
+						onTerminal: job => terminalRows.push(manager.getJob(job.id)?.generation ?? "missing"),
+						onEvict: job => evictedGenerations.push(job.generation),
+					},
+				},
+			);
+			const job = manager.getJob(id);
+			if (!job) throw new Error("Failed job was not published before retention expired");
+			expect(job.status).toBe("failed");
+			expect(job.errorText).toBe("setup failed synchronously");
+			expect(terminalRows).toEqual([job.generation]);
+			await job.promise;
+			const deadline = Date.now() + 2_000;
+			while (manager.getJob(id) && Date.now() < deadline) await Bun.sleep(1);
+			expect(manager.getJob(id)).toBeUndefined();
+			expect(evictedGenerations).toEqual([job.generation]);
+		} finally {
+			await manager.dispose({ timeoutMs: 100 });
+		}
+	});
+
+	test("waitForAll and dispose retain an evicted cancelled runner until physical unwind", async () => {
+		const gate = Promise.withResolvers<string>();
+		let evictions = 0;
+		let waitForAllSettled = false;
+		const manager = new AsyncJobManager({ onJobComplete: async () => {}, retentionMs: 0 });
+		const jobId = manager.register("task", "evicted held runner", () => gate.promise, {
+			lifecycle: {
+				onEvict: () => {
+					evictions += 1;
+				},
+			},
+		});
+		const job = manager.getJob(jobId);
+		if (!job) throw new Error("Job was not registered");
+		manager.cancelAll();
+		expect(manager.getJob(jobId)).toBeUndefined();
+		expect(evictions).toBe(0);
+
+		const waiting = manager.waitForAll().then(() => {
+			waitForAllSettled = true;
+		});
+		await Bun.sleep(10);
+		expect(waitForAllSettled).toBe(false);
+		expect(await manager.dispose({ timeoutMs: 10 })).toBe(false);
+		expect(manager.getLastDisposeDiagnostics()).toMatchObject({ stuckJobIds: [jobId], deliveriesDrained: false });
+		expect(evictions).toBe(0);
+
+		gate.resolve("late result");
+		await Promise.all([job.promise, waiting, manager.awaitRetainedDisposalCompletion()]);
+		expect(waitForAllSettled).toBe(true);
+		expect(evictions).toBe(1);
+	});
+
+	test("physical eviction cleanup runs exactly once for success, rejection, cancellation, and failNow", async () => {
+		for (const mode of ["success", "rejection", "cancellation", "failNow"] as const) {
+			const gate = Promise.withResolvers<void>();
+			let evictions = 0;
+			const manager = new AsyncJobManager({ onJobComplete: async () => {}, retentionMs: 0 });
+			const jobId = manager.register(
+				"task",
+				`${mode} held runner`,
+				async () => {
+					await gate.promise;
+					if (mode === "rejection") throw new Error("runner rejected");
+					return "runner completed";
+				},
+				{
+					lifecycle: {
+						onEvict: () => {
+							evictions += 1;
+						},
+					},
+				},
+			);
+			const job = manager.getJob(jobId);
+			if (!job) throw new Error(`${mode} job was not registered`);
+			if (mode === "cancellation") manager.cancelAll();
+			if (mode === "failNow") {
+				if (!manager.failNow(jobId, job.generation, "forced failure")) {
+					throw new Error("failNow did not settle the running job");
+				}
+			}
+			if (mode === "cancellation" || mode === "failNow") expect(manager.getJob(jobId)).toBeUndefined();
+			expect(evictions).toBe(0);
+
+			gate.resolve();
+			await job.promise;
+			expect(evictions).toBe(1);
+			await manager.dispose({ timeoutMs: 100 });
+			expect(evictions).toBe(1);
+		}
+	});
+
 	test("forwards progress updates and delivers completion", async () => {
 		const progressEvents: Array<{ text: string; details?: Record<string, unknown> }> = [];
 		const completions: Array<{ jobId: string; text: string }> = [];
@@ -423,6 +574,231 @@ describe("AsyncJobManager", () => {
 
 		manager.cancelAll();
 	});
+
+	test("late cancelled settlement cannot run lifecycle callbacks on a same-id successor", async () => {
+		const runA = Promise.withResolvers<string>();
+		const runB = Promise.withResolvers<string>();
+		const manager = new AsyncJobManager({ retentionMs: 0, onJobComplete: async () => {} });
+		let replacementInstalled = false;
+		let terminalA: unknown;
+		let terminalB: unknown;
+		const unsubscribe = manager.onChange(() => {
+			if (replacementInstalled || manager.getJob("lifecycle-reuse")) return;
+			replacementInstalled = true;
+			manager.register("task", "successor B", () => runB.promise, {
+				id: "lifecycle-reuse",
+				lifecycle: { onTerminal: job => (terminalB = job) },
+			});
+		});
+
+		try {
+			const jobId = manager.register("task", "cancelled A", () => runA.promise, {
+				id: "lifecycle-reuse",
+				lifecycle: { onTerminal: job => (terminalA = job) },
+			});
+			const jobA = manager.getJob(jobId);
+			manager.cancelAll();
+
+			const jobB = manager.getJob(jobId);
+			expect(replacementInstalled).toBe(true);
+			expect(jobB?.label).toBe("successor B");
+			runA.resolve("late A result");
+			await Bun.sleep(0);
+
+			expect(terminalA).toBe(jobA);
+			expect(terminalB).toBeUndefined();
+			expect(manager.getJob(jobId)).toBe(jobB);
+		} finally {
+			unsubscribe();
+			runA.resolve("late A result");
+			runB.resolve("B result");
+			await manager.dispose({ timeoutMs: 100 });
+		}
+	});
+
+	test("a delayed cancelled-run callback cannot schedule eviction for its replacement", async () => {
+		const retentionMs = 30;
+		const runA = Promise.withResolvers<string>();
+		const runB = Promise.withResolvers<string>();
+		const manager = new AsyncJobManager({ retentionMs, onJobComplete: async () => {} });
+		let replacementInstalled = false;
+		let terminalB = 0;
+		const unsubscribe = manager.onChange(() => {
+			if (replacementInstalled || manager.getJob("timer-reuse")) return;
+			replacementInstalled = true;
+			manager.register("task", "successor B", () => runB.promise, {
+				id: "timer-reuse",
+				lifecycle: { onTerminal: () => terminalB++ },
+			});
+		});
+
+		try {
+			manager.register("task", "cancelled A", () => runA.promise, { id: "timer-reuse" });
+			manager.cancelAll();
+			const deadline = Date.now() + 2_000;
+			while (!replacementInstalled) {
+				if (Date.now() >= deadline) throw new Error("Timed out waiting for A eviction and B registration");
+				await Bun.sleep(5);
+			}
+			const jobB = manager.getJob("timer-reuse");
+			expect(jobB?.label).toBe("successor B");
+
+			runA.resolve("late A result");
+			await Bun.sleep(retentionMs * 3);
+
+			expect(terminalB).toBe(0);
+			expect(manager.getJob("timer-reuse")).toBe(jobB);
+			expect(jobB?.status).toBe("running");
+		} finally {
+			unsubscribe();
+			runA.resolve("late A result");
+			runB.resolve("B result");
+			await manager.dispose({ timeoutMs: 100 });
+		}
+	});
+
+	test("late settlement marks only its own cancelled job settled for owner shutdown", async () => {
+		const runA = Promise.withResolvers<string>();
+		const runB = Promise.withResolvers<string>();
+		const manager = new AsyncJobManager({ retentionMs: 20, onJobComplete: async () => {} });
+		let replacementInstalled = false;
+		const unsubscribe = manager.onChange(() => {
+			if (replacementInstalled || manager.getJob("settled-reuse")) return;
+			replacementInstalled = true;
+			manager.register("task", "successor B", () => runB.promise, {
+				id: "settled-reuse",
+				ownerId: "0-Test",
+				metadata: { subagent: { id: "successor-subagent", agent: "test", agentSource: "project" } },
+			});
+		});
+
+		try {
+			manager.register("task", "cancelled A", () => runA.promise, {
+				id: "settled-reuse",
+				ownerId: "0-Test",
+				metadata: { subagent: { id: "original-subagent", agent: "test", agentSource: "project" } },
+			});
+			manager.cancelAll();
+			const deadline = Date.now() + 2_000;
+			while (!replacementInstalled) {
+				if (Date.now() >= deadline) throw new Error("Timed out waiting for A eviction and B registration");
+				await Bun.sleep(5);
+			}
+
+			runA.resolve("late A result");
+			await Bun.sleep(0);
+			expect(manager.cancel("settled-reuse")).toBe(true);
+			const lease = manager.beginOwnerSubagentShutdown("0-Test");
+			expect(lease?.targets).toContainEqual({
+				subagentId: "successor-subagent",
+				jobId: "settled-reuse",
+				source: "metadata_job",
+			});
+		} finally {
+			unsubscribe();
+			runA.resolve("late A result");
+			runB.resolve("B result");
+			await manager.dispose({ timeoutMs: 100 });
+		}
+	});
+
+	test("reentrant lifecycle inspection sees the issuing job across same-id replacement", async () => {
+		const runA = Promise.withResolvers<string>();
+		const runB = Promise.withResolvers<string>();
+		const manager = new AsyncJobManager({ retentionMs: 0, onJobComplete: async () => {} });
+		let replacementInstalled = false;
+		let terminalJobA: unknown;
+		let currentDuringA: unknown;
+		let terminalJobB: unknown;
+		const unsubscribe = manager.onChange(() => {
+			if (replacementInstalled || manager.getJob("reentrant-reuse")) return;
+			replacementInstalled = true;
+			manager.register("task", "successor B", () => runB.promise, {
+				id: "reentrant-reuse",
+				lifecycle: { onTerminal: job => (terminalJobB = job) },
+			});
+		});
+
+		try {
+			const jobId = manager.register("task", "cancelled A", () => runA.promise, {
+				id: "reentrant-reuse",
+				lifecycle: {
+					onTerminal: job => {
+						terminalJobA = job;
+						currentDuringA = manager.getJob(job.id);
+					},
+				},
+			});
+			const jobA = manager.getJob(jobId);
+			manager.cancelAll();
+			const jobB = manager.getJob(jobId);
+			runA.resolve("late A result");
+			await Bun.sleep(0);
+
+			expect(terminalJobA).toBe(jobA);
+			expect(currentDuringA).toBe(jobB);
+			expect(terminalJobB).toBeUndefined();
+			expect(manager.getJob(jobId)).toBe(jobB);
+		} finally {
+			unsubscribe();
+			runA.resolve("late A result");
+			runB.resolve("B result");
+			await manager.dispose({ timeoutMs: 100 });
+		}
+	});
+
+	test("monitor tombstone retains the evicted job lifecycle after same-id replacement", async () => {
+		const runA = Promise.withResolvers<string>();
+		const runB = Promise.withResolvers<string>();
+		const manager = new AsyncJobManager({ retentionMs: 0, onJobComplete: async () => {} });
+		let replacementInstalled = false;
+		let purgedA: unknown;
+		let purgedB: unknown;
+		const unsubscribe = manager.onChange(() => {
+			if (replacementInstalled || manager.getJob("monitor-reuse")) return;
+			replacementInstalled = true;
+			manager.register("bash", "successor monitor B", () => runB.promise, {
+				id: "monitor-reuse",
+				ownerId: "owner-B",
+				metadata: { monitor: true },
+				lifecycle: { onTombstonePurge: job => (purgedB = job) },
+			});
+		});
+
+		try {
+			const jobId = manager.register("bash", "original monitor A", () => runA.promise, {
+				id: "monitor-reuse",
+				ownerId: "owner-A",
+				metadata: { monitor: true },
+				lifecycle: { onTombstonePurge: job => (purgedA = job) },
+			});
+			const jobA = manager.getJob(jobId);
+			manager.cancelAll();
+			const jobB = manager.getJob(jobId);
+			runA.resolve("late A result");
+			await Bun.sleep(0);
+
+			expect(jobB?.label).toBe("successor monitor B");
+			expect(manager.getMonitorTombstone(jobId, { ownerId: "owner-A" })).toMatchObject({
+				jobId,
+				ownerId: "owner-A",
+				status: "cancelled",
+			});
+			expect(manager.purgeMonitorTombstone(jobId, { ownerId: "owner-A" })).toEqual({
+				found: true,
+				status: "cancelled",
+			});
+			expect(purgedA).toBe(jobA);
+			expect(purgedB).toBeUndefined();
+			expect(manager.getJob(jobId)).toBe(jobB);
+		} finally {
+			unsubscribe();
+			runA.resolve("late A result");
+			runB.resolve("B result");
+			await manager.dispose({ timeoutMs: 100 });
+		}
+	});
+
 	test("retention-zero eviction runs onEvict and records a monitor tombstone", async () => {
 		let evictCount = 0;
 		const manager = new AsyncJobManager({ retentionMs: 0, onJobComplete: async () => {} });
@@ -468,7 +844,7 @@ describe("AsyncJobManager", () => {
 		}
 	});
 
-	test("purgeMonitorTombstone after eviction returns found and runs purge once", async () => {
+	test("purgeMonitorTombstone after eviction does not rerun eviction cleanup", async () => {
 		let evictCount = 0;
 		const manager = new AsyncJobManager({ retentionMs: 0, onJobComplete: async () => {} });
 		const jobId = manager.register("bash", "monitor", async () => "done", {
@@ -484,9 +860,9 @@ describe("AsyncJobManager", () => {
 		await manager.waitForAll();
 		expect(evictCount).toBe(1);
 		expect(manager.purgeMonitorTombstone(jobId, { ownerId: "0-Test" })).toEqual({ found: true, status: "completed" });
-		expect(evictCount).toBe(2);
+		expect(evictCount).toBe(1);
 		expect(manager.purgeMonitorTombstone(jobId, { ownerId: "0-Test" })).toEqual({ found: false });
-		expect(evictCount).toBe(2);
+		expect(evictCount).toBe(1);
 	});
 
 	test("tombstone purge uses the dedicated onTombstonePurge hook, not the evict phase", async () => {
@@ -542,7 +918,47 @@ describe("AsyncJobManager", () => {
 
 		expect(phases.filter(p => p === "cancel")).toHaveLength(1);
 		expect(phases.filter(p => p === "terminal")).toHaveLength(1);
-		expect(phases.filter(p => p === "evict")).toHaveLength(2);
+		expect(phases.filter(p => p === "evict")).toHaveLength(1);
+	});
+
+	test("held monitor eviction defers onEvict across tombstone purge and disposal", async () => {
+		for (const mode of ["public-purge", "dispose"] as const) {
+			const gate = Promise.withResolvers<string>();
+			let evictCount = 0;
+			let tombstonePurgeCount = 0;
+			const manager = new AsyncJobManager({ retentionMs: 0, onJobComplete: async () => {} });
+			const jobId = manager.register("bash", `held monitor ${mode}`, () => gate.promise, {
+				metadata: { monitor: true },
+				lifecycle: {
+					onEvict: () => {
+						evictCount += 1;
+					},
+					onTombstonePurge: () => {
+						tombstonePurgeCount += 1;
+					},
+				},
+			});
+			manager.cancelAll();
+			expect(manager.getJob(jobId)).toBeUndefined();
+			expect(evictCount).toBe(0);
+
+			if (mode === "public-purge") {
+				expect(manager.purgeMonitorTombstone(jobId)).toMatchObject({ found: true, status: "cancelled" });
+				expect(tombstonePurgeCount).toBe(1);
+				expect(evictCount).toBe(0);
+			} else {
+				expect(await manager.dispose({ timeoutMs: 10 })).toBe(false);
+				expect(tombstonePurgeCount).toBe(1);
+				expect(evictCount).toBe(0);
+			}
+
+			gate.resolve("late monitor result");
+			await manager.waitForAll();
+			if (mode === "dispose") await manager.awaitRetainedDisposalCompletion();
+			expect(evictCount).toBe(1);
+			expect(tombstonePurgeCount).toBe(1);
+			if (mode === "public-purge") await manager.dispose({ timeoutMs: 100 });
+		}
 	});
 
 	test("cancelling a job retires its owned registration", async () => {

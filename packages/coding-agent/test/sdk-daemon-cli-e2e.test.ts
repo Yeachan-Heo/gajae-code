@@ -653,10 +653,13 @@ describe("SDK session CLI", () => {
 			"{}",
 			"--confirm",
 		]);
-		expect(control.exitCode).toBe(1);
+		expect(control.exitCode).toBe(2);
 		expect(receivedControl).toBeUndefined();
 		expect(endpointConnections).toBe(connectionsAfterList);
-		expect(JSON.parse(control.stdout)).toMatchObject({ error: { code: "operation_failed" } });
+		expect(JSON.parse(control.stdout)).toMatchObject({
+			error: { code: "usage", outcomeCertainty: "not-applied" },
+			diagnostics: [{ code: "sdk_unknown_operation" }],
+		});
 		expect(control.stderr).not.toContain("session-token");
 
 		const query = await runCli(root, agentDir, [

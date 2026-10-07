@@ -166,7 +166,7 @@ describe("convertTools: freeform emission", () => {
 		}>;
 
 		const items = out.parameters.properties.operations.items;
-		expect(out.strict).toBeUndefined();
+		expect(out.strict).toBe(false);
 		expect(items.oneOf).toBeUndefined();
 		expect(items.anyOf).toEqual(unionBranches);
 	});

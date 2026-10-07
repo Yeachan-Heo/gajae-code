@@ -13,6 +13,7 @@ import type {
 	WorkspaceEdit,
 } from "./types";
 import { uriToFile } from "./utils";
+import { assertInsideWorkspace } from "./workspace-path";
 
 // =============================================================================
 // Text Edit Application
@@ -133,6 +134,7 @@ export async function applyWorkspaceEdit(edit: WorkspaceEdit, cwd: string): Prom
 	const textEditsByUri = flattenWorkspaceTextEdits(edit);
 	for (const [uri, textEdits] of textEditsByUri) {
 		const filePath = uriToFile(uri);
+		await assertInsideWorkspace(cwd, filePath);
 		await applyTextEdits(filePath, textEdits);
 		applied.push(`Applied ${textEdits.length} edit(s) to ${formatPathRelativeToCwd(filePath, cwd)}`);
 	}
@@ -144,18 +146,22 @@ export async function applyWorkspaceEdit(edit: WorkspaceEdit, cwd: string): Prom
 			if (change.kind === "create") {
 				const createOp = change as CreateFile;
 				const filePath = uriToFile(createOp.uri);
+				await assertInsideWorkspace(cwd, filePath);
 				await Bun.write(filePath, "");
 				applied.push(`Created ${formatPathRelativeToCwd(filePath, cwd)}`);
 			} else if (change.kind === "rename") {
 				const renameOp = change as RenameFile;
 				const oldPath = uriToFile(renameOp.oldUri);
 				const newPath = uriToFile(renameOp.newUri);
+				await assertInsideWorkspace(cwd, oldPath);
+				await assertInsideWorkspace(cwd, newPath);
 				await fs.mkdir(path.dirname(newPath), { recursive: true });
 				await fs.rename(oldPath, newPath);
 				applied.push(`Renamed ${formatPathRelativeToCwd(oldPath, cwd)} → ${formatPathRelativeToCwd(newPath, cwd)}`);
 			} else if (change.kind === "delete") {
 				const deleteOp = change as DeleteFile;
 				const filePath = uriToFile(deleteOp.uri);
+				await assertInsideWorkspace(cwd, filePath);
 				await fs.rm(filePath, { recursive: true });
 				applied.push(`Deleted ${formatPathRelativeToCwd(filePath, cwd)}`);
 			}

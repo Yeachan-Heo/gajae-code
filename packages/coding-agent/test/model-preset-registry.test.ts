@@ -261,6 +261,26 @@ describe("signed model preset registry", () => {
 			'{"negativeZero":0,"𐀀":2,"":1}',
 		);
 		expect(() => canonicalModelPresetRegistryJson("\ud800")).toThrow(/lone high surrogate/i);
+		expect(() => canonicalModelPresetRegistryJson({ key: "a\udc00" })).toThrow(/lone low surrogate/i);
+	});
+
+	test("quotes strings and keys exactly as JSON.stringify", () => {
+		const strings = [
+			"plain-id",
+			'quote"in',
+			"back\\slash",
+			"tab\tnew\nline",
+			"nul\u0000ctl\u001f",
+			"del\u007f",
+			"é🙂",
+			"\u2028sep",
+		];
+		for (const value of strings) {
+			expect(canonicalModelPresetRegistryJson(value)).toBe(JSON.stringify(value));
+			expect(canonicalModelPresetRegistryJson({ [value]: value })).toBe(
+				`{${JSON.stringify(value)}:${JSON.stringify(value)}}`,
+			);
+		}
 	});
 
 	test("accepts the exact producer revision-1 manifest signature and snapshot binding", async () => {

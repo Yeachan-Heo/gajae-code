@@ -52,7 +52,7 @@ The file holds one or more `### <Section>` blocks (`### Added`, `### Changed`, `
 - The thing that was broken now works (#1234).
 ```
 
-This pattern exists because of what it replaces. Contributors used to append their entry under `## [Unreleased]` in `packages/<pkg>/CHANGELOG.md`, which put every pull request on the same lines of the same file. Git cannot auto-merge two insertions at the same position, so each merge dirtied every other open PR — and the exact-head approval contract re-binds approval to the head (`scripts/verify-pr-verdict.ts` requires `review.commit?.oid === headSha`), so clearing that dirt with a rebase threw the approval away and cost a fresh reviewer round-trip. Issue #5491 measured a six-line change paying three rebases and two approval rounds, with `CHANGELOG.md` the only conflicted path every time. Distinct fragment file names cannot conflict, so the shared insertion point stops existing.
+This pattern exists because of what it replaces. Contributors used to append their entry under `## [Unreleased]` in `packages/<pkg>/CHANGELOG.md`, which put every pull request on the same lines of the same file. Git cannot auto-merge two insertions at the same position, so each merge dirtied every other open PR. Distinct fragment file names cannot conflict, so the shared insertion point stops existing.
 
 `scripts/release.ts` folds every pending fragment into its package's `## [Unreleased]` section and deletes the consumed files as part of the release commit. Run `bun scripts/changelog-fragments.ts check` to validate fragments locally, and Dev CI rejects a pull request that edits a guarded `## [Unreleased]` section directly or deletes a fragment.
 
@@ -83,63 +83,8 @@ The `CI` workflow publishes a scheduled nightly prerelease from `main` at 04:23 
 - Relevant focused tests or checks are listed in the PR description.
 - User-facing changes include a changelog fragment under `packages/<pkg>/changelog.d/` when appropriate.
 
-## Exact-head PR verdict gate
+## Approval requirement
 
-Every pull request to `dev` must keep exactly one `gajae.pr-review-verdict.v1` line from the pull request template. The `PR contract / Validate exact-head PR contract` status is produced by a narrowly scoped `pull_request_target` workflow loaded from the trusted default branch. It has read-only permissions, receives no secrets, consumes no caches or artifacts, and executes only the base-owned validator while inspecting the event's immutable base and exact head. The validator recomputes the binary diff digest, requires the head to contain the base, runs the fast GJC state-writer scan against the PR-head bytes, and rejects `merge-approved` verdicts whose reviewer-id matches the PR author — no exception. The repository owner's solo path is the separately named `merge-self-approved` verdict (below). `needs-human` and `merge-blocked` are valid review states but intentionally keep the status red until an independent reviewer records `merge-approved` for the current head.
-
-### Risk-classified review policy (issue #4703, post-review semantics)
-
-The review requirement is classified by the change's real risk; the PR body must check **exactly one** risk class (zero or multiple checked boxes fail closed — a missing classification never waives the stricter tiers).
-
-- **Low-risk fix / ordinary maintenance** — the repository owner may merge through the explicitly named `merge-self-approved` verdict with a `gajae.pr-self-review.v1` risk-record comment bound to the exact base/head/digest. This is a deliberate solo force path: the verdict name itself, the bootstrap log line (`SELF-AUTHORIZED: merge-self-approved, no independent human review`), and the check output all record that no independent human reviewed the change. It exists to keep routine maintainer fixes unblocked, and it is named honestly instead of being dressed up as review.
-- **Fix with material regression risk** — requires one assigned independent domain reviewer selected from recent merged PR/commit ownership and demonstrated expertise in the touched files/contracts, whose authenticated exact-head `APPROVED` GitHub review the validator verifies (`extra:independent:<login>`; the token alone never satisfies the gate). The `extra:gpt-heavy` token was removed: an author-supplied claim with no authenticated run artifact behind it cannot substitute for review evidence.
-- **Large refactors, features, and materially high-risk changes** (security, auth, install, remove, public API, destructive lifecycle, architecture) — exactly one assigned independent domain reviewer, selected the same way and verified the same way (authenticated exact-head `APPROVED` review with write+ permission).
-
-For every risk class, `merge-approved` requires an authenticated exact-head `APPROVED` review from an identity distinct from the PR author — the original universal invariant is intact and no comment of the author's own can reach it. External contributor PRs unchanged: ordinary authenticated `APPROVED` review from a repository maintainer.
-
-### Risk-record comment format
-
-For the owner's low-risk solo path (and to carry the risk classification for higher tiers), post the record as a **PR comment** (never in the PR body — body text cannot authorize anything):
-
-```text
-gajae.pr-self-review.v1 verdict:merge-self-approved base:<40-hex event base> head:<40-hex exact head> sha256:<64-hex base...head diff digest> reviewer-id:<PR author login> risk:<low-risk|regression-risk|high-risk> extra:<none|independent:<login>> evidence:<review evidence>
-self-review-signature: sha256:<digest over the record above>
-Signed-off-by: gaebal-gajae (clawdbot) 🦞
-```
-
-The `self-review-signature` is an **integrity digest, not authentication**: `sha256("gajae.pr-self-review.v1.signature-domain" + canonical record lines)`, generated with `bun scripts/verify-pr-verdict.ts --self-review-sign <verdict> <base> <head> <digest> <reviewer-id> <risk> <extra> <evidence>`. It proves the comment text matches what was posted for the bound head — tamper evidence, exactly like the diff digest. Authorization never rests on it: the same identity authors the PR and posts the record, so it could never prove independent review, and the contract does not pretend otherwise. The validator accepts the record only when all of the following hold; otherwise it fails closed:
-
-- the record is fetched through the trusted workflow token from the GitHub issue-comments API (comment bytes are data; head-controlled code is never executed); only records from the PR author are eligible, every page is scanned and the **newest** record wins, and any API failure fails closed;
-- the record author is exactly the **repository owner account** (`author_association: OWNER`, the delegated maintainer identity gaebal-gajae operates) and matches `reviewer-id`, which must equal the PR author; members and collaborators cannot use the solo path;
-- base, head, and digest match the immutable event base, the exact PR head, and the recomputed `base...head` diff digest (stale values never authorize a newer head);
-- the integrity digest matches the record, so any post-hoc edit of verdict, head, digest, risk, extra, or evidence is detected;
-- the risk classification matches the PR body's exactly-one checked risk classification;
-- `merge-self-approved` additionally requires `risk:low-risk` and `extra:none`; higher risk classes must use independent review (`merge-approved`);
-- `extra:independent:<login>` (used to carry the risk classification for higher tiers) is only honored when that login is a distinct maintainer (not the PR author) with admin/maintain/write permission **and** an authenticated exact-head `APPROVED` GitHub review.
-
-Comment events (`issue_comment: [created, edited, deleted]`) re-run the trusted-base validator, so posting, editing, or deleting the record re-evaluates the contract server-side; deleting the record revokes the authorization on the exact head.
-
-Comment-triggered validation publishes to the **same required authority**: `issue_comment` runs associate with the default-branch SHA, so the workflow creates/updates a check run named `Validate exact-head PR contract` on the resolved exact PR head. Authorization and revocation therefore update the one head-bound required context that `pull_request_target` runs also report; a parallel status context could never revoke a green required check. Branch-protection rollout contract: once this lands, enable branch protection on `dev` requiring `PR contract / Validate exact-head PR contract` (strict); until protection is enabled, the Dev CI `PR contract bootstrap` job plus the verdict discipline remain the enforced path. Because `issue_comment` workflows only trigger from the repository default branch (`main`), the comment path activates when this workflow definition reaches `main` — until then the Dev CI `PR contract bootstrap` job (a `pull_request` event, natively head-bound) remains the authoritative gate, which is how the introducing PR itself is validated.
-
-The first PR that introduces this workflow uses a trusted two-phase bootstrap. Phase 1 landed `Dev CI / PR contract bootstrap` directly on `dev`, so its inline validation exists in the immutable event base before the implementation PR is evaluated. Phase 2 enables the isolated `PR contract` consumer in this implementation PR. Review events run only that cheap, read-only contract workflow; they never launch or cancel the affected Dev CI pipeline. The validator still executes exclusively from the immutable event-base checkout and treats PR-head bytes as data. The same bootstrap ordering applies to the solo path: a PR whose immutable base predates the `merge-self-approved`-aware validator cannot use it on that base; the introducing PR relies on the Dev CI bootstrap job and merges before the comment path becomes active for later PRs.
-
-After the final commit and rebase, compute the digest with:
-
-```sh
-git fetch origin dev
-git merge-base --is-ancestor origin/dev HEAD
-git diff --binary --full-index --no-ext-diff origin/dev...HEAD | sha256sum
-bun scripts/verify-gjc-state-writers.ts --fail
-```
-
-The verdict line must use the resulting lowercase digest and name the GitHub reviewer whose effective `APPROVED` review targets the exact PR head — never the PR author. The owner's low-risk solo alternative is the explicitly named `merge-self-approved`:
-
-```text
-gajae.pr-review-verdict.v1 merge-approved sha256:<64-hex-digest> reviewer:<architect|critic|human> reviewer-id:<identity> evidence:<review-or-CI-reference>
-```
-
-GJC users can opt into fast feedback before `gh pr create` by copying `docs/examples/gjc-hooks/pre/bash.ts` to this checkout's `.gjc/hooks/pre/bash.ts`. Keep the hook project-local: installing it under `~/.gjc/agent` would incorrectly impose this repository's policy on unrelated repositories. The local hook is advisory and bypassable; the server-side status check is authoritative and covers humans and other runtimes.
-
-`bun run dev:hooks` enables the repository's Git pre-push hook (also included in `install:dev`). It validates the commit being pushed and the remote destination branch, including `HEAD:<branch>` refspecs. Repository lookup uses Git's actual push destination, not a remote's potentially different fetch URL, and refuses unresolved or malformed fork metadata instead of assuming that no upstream PR exists. An explicit no-open-PR result is allowed; API failure is not that result. Local preflight accepts valid `needs-human`/`merge-blocked` records so review work can be pushed; those records remain blocked by the server merge gate. `GJC_SKIP_PR_PREFLIGHT=1` or `--no-verify` bypasses only this local feedback, never server approval.
+Merges to `dev` require one approving GitHub review from a write-access maintainer on the exact current head. This is enforced by the repository's native GitHub ruleset.
 
 Metadata-only PR edits must not manufacture successful required checks by skipping the aggregate jobs. Dev CI validates those events through real code-validation jobs; separate metadata concurrency preserves an already-running code-validation run. Pending, failed, cancelled, or missing dependency evidence cannot satisfy the aggregate. State-gate relevance is decided before native provisioning, with runtime prompt Markdown in dependency workspaces treated as executable input rather than documentation.

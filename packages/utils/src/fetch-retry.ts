@@ -92,7 +92,7 @@ export interface FetchWithRetryOptions extends RequestInit {
 	 * ceiling. Values that remain negative or non-finite after capping retry
 	 * immediately.
 	 */
-	defaultDelayMs?: number | readonly number[] | ((attempt: number) => number);
+	defaultDelayMs?: number | readonly number[] | ((attempt: number, error?: unknown) => number);
 	/**
 	 * Optional per-attempt overlay merged into the base `RequestInit` each try.
 	 * Headers from the overlay shallow-merge over the base. Useful for auth
@@ -148,7 +148,7 @@ export async function fetchWithRetry(
 			if (signal?.aborted) throw new Error("Request was aborted");
 			const wrapped = wrapNetworkError(error);
 			if (attempt + 1 >= maxAttempts) throw wrapped;
-			const delayMs = normalizeRetryDelay(resolveDefaultDelay(defaultDelayMs, attempt), maxDelayMs);
+			const delayMs = normalizeRetryDelay(resolveDefaultDelay(defaultDelayMs, attempt, error), maxDelayMs);
 			await scheduler.wait(delayMs, { signal });
 			continue;
 		}
@@ -191,10 +191,14 @@ function wrapNetworkError(error: unknown): Error {
 	return new Error(String(error));
 }
 
-function resolveDefaultDelay(option: FetchWithRetryOptions["defaultDelayMs"], attempt: number): number {
+function resolveDefaultDelay(
+	option: FetchWithRetryOptions["defaultDelayMs"],
+	attempt: number,
+	error?: unknown,
+): number {
 	if (option === undefined) return 500 * 2 ** attempt;
 	if (typeof option === "number") return option;
-	if (typeof option === "function") return option(attempt);
+	if (typeof option === "function") return option(attempt, error);
 	return option[Math.min(attempt, option.length - 1)] ?? 0;
 }
 

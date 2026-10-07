@@ -1,6 +1,6 @@
 {
 	"name": "@gajae-code/natives",
-	"version": "0.17.7",
+	"version": "0.18.7",
 	"description": "Native Rust bindings for grep, clipboard, image processing, syntax highlighting, PTY, and shell operations via N-API",
 	"type": "module",
 	"homepage": "https://gajae-code.com",
@@ -43,7 +43,8 @@
 	"devDependencies": {
 		"@napi-rs/cli": "catalog:",
 		"@types/bun": "catalog:",
-		"@types/ws": "catalog:"
+		"@types/ws": "catalog:",
+		"diff": "catalog:"
 	},
 	"engines": {
 		"bun": ">=1.4.0"
@@ -57,6 +58,9 @@
 		"native/index.d.ts",
 		"native/loader-state.js",
 		"native/loader-state.d.ts",
+		"native/diagnostic-loader.d.ts",
+		"native/diagnostic-loader.js",
+		"native/diagnostic-artifact.json",
 		"native/embedded-addon.js",
 		"README.md"
 	],
@@ -72,6 +76,11 @@
 			"types": "./native/index.d.ts",
 			"import": "./native/index.js",
 			"default": "./native/index.js"
+		},
+		"./diagnostic-loader": {
+			"types": "./native/diagnostic-loader.d.ts",
+			"import": "./native/diagnostic-loader.js",
+			"default": "./native/diagnostic-loader.js"
 		}
 	}
 }

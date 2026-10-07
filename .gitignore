@@ -12,6 +12,7 @@ target/
 *.tsbuildinfo
 *.node
 *.node.build.json
+*.node.provenance.json
 *.b64.js
 # `bun build --compile` leaves these next to the entrypoint when it is interrupted.
 *.bun-build
@@ -62,6 +63,7 @@ packages/ai/test/.temp-images/
 .gjc/_session-*/
 .gjc/backlog-*/
 .gjc/rss-checkpoints/
+.gjc/profiles/
 .gjc/metrics.json
 **/.gjc/settings.json.fallback-invalid
 **/.gjc/settings.json.config-root.fallback-invalid

@@ -32,6 +32,59 @@ async function waitForCapturedCursorHandlers(
 }
 
 describe("Agent.forceAbort", () => {
+	it("classifies a post-abort rejection as cancelled without agent_failed", async () => {
+		const model = createMockModel();
+		const lookupStarted = Promise.withResolvers<void>();
+		const rejectionGate = Promise.withResolvers<void>();
+		const agent = new Agent({
+			initialState: { model: model.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			getApiKey: async () => {
+				lookupStarted.resolve();
+				await rejectionGate.promise;
+				throw new Error("request setup rejected after abort");
+			},
+		});
+		const events: AgentEvent[] = [];
+		agent.subscribe(event => events.push(event));
+
+		// Stream rejection is short-circuited by agentLoop's abort race, so gate request setup to reach Agent's catch.
+		const prompt = agent.prompt("abort the request");
+		await lookupStarted.promise;
+		agent.abort();
+		rejectionGate.resolve();
+		await prompt;
+
+		const terminals = events.filter(event => event.type === "agent_end");
+		expect(terminals).toHaveLength(1);
+		expect(terminals[0]).toMatchObject({
+			stopReason: "cancelled",
+			messages: [expect.objectContaining({ stopReason: "aborted" })],
+		});
+		expect(events.some(event => event.type === "agent_failed")).toBe(false);
+	});
+
+	it("reports a rejected stream as a failure when the run was not cancelled", async () => {
+		const model = createMockModel();
+		const streamFn: StreamFn = async () => {
+			throw new Error("stream rejected");
+		};
+		const agent = new Agent({
+			initialState: { model: model.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn,
+		});
+		const events: AgentEvent[] = [];
+		agent.subscribe(event => events.push(event));
+
+		await agent.prompt("fail the stream");
+
+		const failures = events.filter(event => event.type === "agent_failed");
+		expect(failures).toHaveLength(1);
+		expect(failures[0]).toMatchObject({ type: "agent_failed", error: { code: "agent_failed" } });
+		const terminals = events.filter(event => event.type === "agent_end");
+		expect(terminals).toHaveLength(1);
+		expect(terminals[0]).toMatchObject({ messages: [expect.objectContaining({ stopReason: "error" })] });
+	});
+
 	it("recovers busy state when stream creation never resolves", async () => {
 		const model = createMockModel({ responses: [{ content: ["after hung create"] }] });
 		let callCount = 0;

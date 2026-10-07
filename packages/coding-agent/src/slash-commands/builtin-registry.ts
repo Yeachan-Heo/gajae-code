@@ -31,6 +31,8 @@ import {
 	type InteractiveModeContext,
 } from "../modes/types";
 import { parseUiLanguage, resolveUiLanguage, UI_LANGUAGE_LABELS, UI_LANGUAGES, uiString } from "../modes/ui-language";
+import { buildSessionProjectProgress } from "../progress/collect-project-progress";
+import { PROGRESS_COMMAND_ACP_DESCRIPTION } from "../progress/render-progress";
 // W1b/W5b: notification-service and daemon controllers stay off the static
 // import graph; the /notify handlers import them lazily at first use.
 import type { NotificationProvider } from "../sdk/bus/config";
@@ -63,6 +65,7 @@ import { switchSessionCredentialCommand } from "./helpers/credential-switch";
 import { buildFastStatusReport } from "./helpers/fast-status-report";
 import { formatDuration } from "./helpers/format";
 import { commandConsumed, errorMessage, parseSlashCommand, parseSubcommand, usage } from "./helpers/parse";
+import { renderProgressReportLines, renderProgressReportText } from "./helpers/progress-report";
 import { handleSshAcp } from "./helpers/ssh";
 import { buildUsageReportText, collectCachedUsageReports } from "./helpers/usage-report";
 import type {
@@ -1585,6 +1588,30 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "progress",
+		description:
+			"Show a read-only project progress overview from durable goal, todo, workflow, agent, and verification state",
+		// Production ACP advertises and dispatches `/progress` itself over the
+		// `session.progress` SDK query (modes/acp/acp-agent.ts) with the same copy.
+		acpDescription: PROGRESS_COMMAND_ACP_DESCRIPTION,
+		allowArgs: false,
+		handle: async (_command, runtime) => {
+			const report = await buildSessionProjectProgress(runtime.session, runtime.sessionManager);
+			await runtime.output(renderProgressReportText(report));
+			return commandConsumed();
+		},
+		handleTui: async (_command, runtime) => {
+			const ctx = runtime.ctx;
+			const report = await buildSessionProjectProgress(ctx.session, ctx.sessionManager);
+			ctx.chatContainer.addChild(new Spacer(1));
+			ctx.chatContainer.addChild(new DynamicBorder());
+			ctx.chatContainer.addChild(new Text(renderProgressReportLines(report, theme).join("\n"), 1, 0));
+			ctx.chatContainer.addChild(new DynamicBorder());
+			ctx.ui.requestRender();
+			ctx.editor.setText("");
+		},
+	},
+	{
 		name: "usage",
 		description: "Show provider usage and limits",
 		acpDescription: "Show token usage",
@@ -2211,19 +2238,22 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	{
 		name: "contribute-pr",
 		aliases: ["contribution-prep"],
-		description: "Dump redacted session context and spawn a fresh contribute-pr worker",
+		description: "Dump redacted session context and write a worker prompt for a separate terminal",
 		inlineHint: "[focus instructions]",
 		allowArgs: true,
 		handle: async (command, runtime) => {
-			const result = await runtime.session.prepareContributionPrep({
+			const prepared = await runtime.session.prepareContributionPrep({
 				customInstructions: command.args || undefined,
-				spawnWorker: true,
+				// The interactive session owns the terminal; don't detach a second GJC
+				// process that can later be adopted by zsh when this session exits.
+				spawnWorker: false,
 			});
 			await runtime.output(
 				[
 					"Contribution prep artifacts written.",
-					`Manifest: ${result.manifestPath}`,
-					`Worker prompt: ${result.workerPromptPath}`,
+					`Manifest: ${prepared.manifestPath}`,
+					`Worker prompt: ${prepared.workerPromptPath}`,
+					"Run the worker prompt from a separate terminal when ready.",
 				].join("\n"),
 			);
 			return commandConsumed();

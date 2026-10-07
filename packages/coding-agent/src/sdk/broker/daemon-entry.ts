@@ -1,7 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { type BrokerDiscovery, readBrokerDiscovery, readBrokerRestartIntent } from "./discovery";
 import { withBrokerStartupLock } from "./ensure";
-import { observeProcessIncarnation } from "./process-incarnation";
+import { isProcessIncarnation, observeProcessIncarnation } from "./process-incarnation";
 import { resolveSdkInternalSpawnCommand } from "./runtime";
 
 export interface AuthorizedBrokerSuccessorOptions {
@@ -61,12 +61,15 @@ export async function launchAuthorizedBrokerSuccessor(
 			existing.restartRequestId === options.requestId
 		)
 			return { kind: "adopted" as const, discovery: existing };
-		const command = resolveSdkInternalSpawnCommand("broker-internal");
+		const command = resolveSdkInternalSpawnCommand(
+			process.platform === "win32" ? "broker-internal" : "broker-trampoline-internal",
+		);
 		let child: ChildProcess;
+		const isTrampoline = process.platform !== "win32";
 		try {
 			child = spawn(command.file, [...command.args, "--agent-dir", options.agentDir], {
 				detached: true,
-				stdio: "ignore",
+				stdio: isTrampoline ? ["ignore", "pipe", "ignore"] : "ignore",
 				env: { ...command.env, GJC_BROKER_RESTART_REQUEST: options.requestId },
 				...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
 			});
@@ -78,14 +81,44 @@ export async function launchAuthorizedBrokerSuccessor(
 			};
 		}
 		let spawnError: Error | undefined;
+		let trampolineOutput = "";
+		let trampolineOutputEnded = !isTrampoline;
+		if (child.stdout)
+			child.stdout
+				.setEncoding("utf8")
+				.on("data", chunk => (trampolineOutput += chunk))
+				.once("end", () => (trampolineOutputEnded = true));
 		child.once("error", childError => {
 			spawnError = childError;
 		});
 		child.unref();
-		return { kind: "spawned" as const, child, spawnError: () => spawnError };
+		return {
+			kind: "spawned" as const,
+			child,
+			isTrampoline,
+			trampolineOutput: () => trampolineOutput,
+			trampolineOutputEnded: () => trampolineOutputEnded,
+			spawnError: () => spawnError,
+		};
 	});
 	if (spawnOutcome.kind !== "spawned") return spawnOutcome;
 	const { child } = spawnOutcome;
+	let successorPid: number | undefined;
+	let successorIncarnation: string | undefined;
+	let trampolineExited = !spawnOutcome.isTrampoline;
+	let trampolineExitCode: number | null = null;
+	let trampolineSignal: NodeJS.Signals | null = null;
+	if (spawnOutcome.isTrampoline)
+		child.once("exit", (code, signal) => {
+			trampolineExitCode = code;
+			trampolineSignal = signal;
+			trampolineExited = true;
+		});
+	if (spawnOutcome.isTrampoline && (child.exitCode !== null || child.signalCode !== null)) {
+		trampolineExitCode = child.exitCode;
+		trampolineSignal = child.signalCode;
+		trampolineExited = true;
+	}
 	const until = Math.min(Date.now() + Math.max(1, options.deadlineAt - Date.now()), options.deadlineAt);
 	for (;;) {
 		if (spawnOutcome.spawnError())
@@ -94,7 +127,34 @@ export async function launchAuthorizedBrokerSuccessor(
 				reason: "spawn_failed",
 				detail: spawnOutcome.spawnError()?.message,
 			};
-		if (child.exitCode !== null || child.signalCode !== null)
+		if (!spawnOutcome.isTrampoline && (child.exitCode !== null || child.signalCode !== null))
+			return { kind: "refused", reason: "spawn_exited_before_publication" };
+		if (spawnOutcome.isTrampoline && !successorPid) {
+			const report = spawnOutcome.trampolineOutput().trim();
+			const match = /^(\d+)\t([^\r\n]+)$/.exec(report);
+			if (match) {
+				const pid = Number(match[1]);
+				const incarnation = match[2];
+				if (Number.isSafeInteger(pid) && pid > 0 && isProcessIncarnation(incarnation)) {
+					const observed = observeProcessIncarnation(pid);
+					if (observed.status === "present" && observed.incarnation === incarnation) {
+						successorPid = pid;
+						successorIncarnation = incarnation;
+					}
+				}
+			}
+		}
+		if (successorPid) {
+			const observed = observeProcessIncarnation(successorPid);
+			if (
+				observed.status === "absent" ||
+				(observed.status === "present" && observed.incarnation !== successorIncarnation)
+			)
+				return { kind: "refused", reason: "spawn_exited_before_publication" };
+		}
+		if (spawnOutcome.isTrampoline && trampolineExited && spawnOutcome.trampolineOutputEnded() && !successorPid)
+			return { kind: "refused", reason: "spawn_exited_before_publication" };
+		if (spawnOutcome.isTrampoline && trampolineExited && (trampolineSignal !== null || trampolineExitCode !== 0))
 			return { kind: "refused", reason: "spawn_exited_before_publication" };
 		const discovered = await readBrokerDiscovery(options.agentDir);
 		if (
@@ -102,7 +162,8 @@ export async function launchAuthorizedBrokerSuccessor(
 			discovered.packageGeneration === options.packageGeneration &&
 			discovered.restartRequestId === options.requestId
 		)
-			return { kind: "spawned", discovery: discovered };
+			if (!spawnOutcome.isTrampoline || (trampolineExited && spawnOutcome.trampolineOutputEnded()))
+				return { kind: "spawned", discovery: discovered };
 		if (Date.now() >= until) return { kind: "refused", reason: "publication_timeout" };
 		await Bun.sleep(SUCCESSOR_SPAWN_POLL_MS);
 	}

@@ -39,7 +39,7 @@ export interface AsyncJob {
 	endTime?: number;
 	label: string;
 	abortController: AbortController;
-	promise: Promise<void>;
+	readonly promise: Promise<void>;
 	resultText?: string;
 	errorText?: string;
 	/** Safe, bounded cause when session setup failed before the LLM began work. */
@@ -151,7 +151,8 @@ export interface OwnerSubagentShutdownProof {
 
 interface OwnerSubagentShutdownLeaseState {
 	lease: OwnerSubagentShutdownLease;
-	backingJobIds: ReadonlyMap<string, readonly string[]>;
+	backingExecutions: ReadonlyMap<string, readonly AsyncJobExecution[]>;
+	records: ReadonlyMap<string, OwnerSubagentShutdownRecordCapture>;
 	phase: "active" | "proving" | "proved";
 	proof?: OwnerSubagentShutdownProof;
 }
@@ -211,6 +212,21 @@ export interface SubagentRecord {
 	terminalGeneration?: string;
 	/** Generation of currentJobId, preventing stale ID reuse from mutating this record. */
 	currentJobGeneration?: string;
+}
+
+/** Retains one exact job object until its runner and deferred eviction cleanup settle. */
+interface AsyncJobExecution {
+	readonly job: AsyncJob;
+	readonly physicalCompletion: Promise<void>;
+	physicallySettled: boolean;
+	/** An evicted row's lifecycle cleanup must not race its still-running runner. */
+	pendingEvictionCleanup: boolean;
+}
+
+interface OwnerSubagentShutdownRecordCapture {
+	readonly record: SubagentRecord;
+	readonly currentJobId: string | null;
+	readonly currentJobGeneration?: string;
 }
 
 /** Lightweight, manager-owned resume payload. The async layer treats `data` as opaque. */
@@ -676,8 +692,10 @@ export class AsyncJobManager {
 	readonly #evictionTimers = new Map<string, NodeJS.Timeout>();
 	readonly #outputState = new Map<string, AsyncJobOutputState>();
 	readonly #ownerCleanups = new Map<string, Set<() => void>>();
-	readonly #lifecycles = new Map<string, AsyncJobLifecycleCleanup>();
-	readonly #lifecyclePhases = new Map<string, Set<"cancel" | "terminal" | "evict">>();
+	readonly #lifecycles = new WeakMap<AsyncJob, AsyncJobLifecycleCleanup>();
+	readonly #lifecyclePhases = new WeakMap<AsyncJob, Set<"cancel" | "terminal" | "evict">>();
+	readonly #executionsByJob = new WeakMap<AsyncJob, AsyncJobExecution>();
+	readonly #activeExecutions = new Set<AsyncJobExecution>();
 	readonly #monitorTombstones = new Map<string, MonitorTombstone>();
 	readonly #outputRetentionBytes = DEFAULT_JOB_OUTPUT_RETENTION_BYTES;
 	readonly #onJobComplete: AsyncJobManagerOptions["onJobComplete"];
@@ -697,7 +715,7 @@ export class AsyncJobManager {
 	readonly #terminalWaits = new Map<string, TerminalWaitState>();
 	#waitSeq = 0;
 	readonly #publishedTerminalGenerations = new Set<string>();
-	readonly #settledJobIds = new Set<string>();
+	readonly #settledJobs = new Set<AsyncJob>();
 	#jobGenerationSeq = 0;
 	readonly #liveHandles = new Map<string, SubagentLiveHandle>();
 	readonly #subagentProgress = new Map<string, AgentProgress>();
@@ -1074,9 +1092,9 @@ export class AsyncJobManager {
 
 		this.#expireMonitorTombstones();
 		const id = this.#resolveJobId(options?.id);
-		this.#settledJobIds.delete(id);
 		const abortController = new AbortController();
 		const startTime = Date.now();
+		const completion = Promise.withResolvers<void>();
 
 		const job: AsyncJob = {
 			id,
@@ -1086,11 +1104,20 @@ export class AsyncJobManager {
 			startTime,
 			label,
 			abortController,
-			promise: Promise.resolve(),
+			promise: completion.promise,
 			ownerId: options?.ownerId,
 			metadata: options?.metadata,
 		};
-		if (options?.lifecycle) this.#lifecycles.set(id, options.lifecycle);
+		Object.defineProperty(job, "promise", { writable: false, configurable: false });
+		if (options?.lifecycle) this.#lifecycles.set(job, options.lifecycle);
+		const execution: AsyncJobExecution = {
+			job,
+			physicalCompletion: completion.promise,
+			physicallySettled: false,
+			pendingEvictionCleanup: false,
+		};
+		this.#executionsByJob.set(job, execution);
+		this.#activeExecutions.add(execution);
 
 		const reportProgress = async (text: string, details?: Record<string, unknown>): Promise<void> => {
 			if (!options?.onProgress) return;
@@ -1103,7 +1130,8 @@ export class AsyncJobManager {
 				});
 			}
 		};
-		job.promise = (async () => {
+		this.#jobs.set(id, job);
+		void (async () => {
 			try {
 				const result = await run({ jobId: id, signal: abortController.signal, reportProgress });
 				const outcome: SubagentRunOutcome =
@@ -1120,8 +1148,8 @@ export class AsyncJobManager {
 					job.resultText = outcome.kind === "paused" ? outcome.note : outcome.text;
 					this.#markRecordTerminal(id, "cancelled", job.generation);
 					this.#publishTerminal(job);
-					this.#runLifecycle(id, "terminal", job);
-					this.#scheduleEviction(id);
+					this.#runLifecycle(job, "terminal");
+					this.#scheduleEviction(job);
 					this.#drainResumeQueue();
 					// The run has now actually unwound: retire the owned tuple so a
 					// later scope:"owned" abort of the same turn does not report
@@ -1151,8 +1179,8 @@ export class AsyncJobManager {
 					this.#markRecordTerminal(id, "failed", job.generation);
 					this.#publishTerminal(job);
 					this.#enqueueDelivery(id, outcome.text);
-					this.#runLifecycle(id, "terminal", job);
-					this.#scheduleEviction(id);
+					this.#runLifecycle(job, "terminal");
+					this.#scheduleEviction(job);
 					this.#drainResumeQueue();
 					return;
 				}
@@ -1163,8 +1191,8 @@ export class AsyncJobManager {
 				this.#markRecordTerminal(id, "completed", job.generation);
 				this.#publishTerminal(job);
 				this.#enqueueDelivery(id, outcome.text);
-				this.#runLifecycle(id, "terminal", job);
-				this.#scheduleEviction(id);
+				this.#runLifecycle(job, "terminal");
+				this.#scheduleEviction(job);
 				this.#drainResumeQueue();
 			} catch (error) {
 				if (this.#externallySettled.has(job.generation)) {
@@ -1175,8 +1203,8 @@ export class AsyncJobManager {
 					job.errorText = error instanceof Error ? error.message : String(error);
 					this.#markRecordTerminal(id, "cancelled", job.generation);
 					this.#publishTerminal(job);
-					this.#runLifecycle(id, "terminal", job);
-					this.#scheduleEviction(id);
+					this.#runLifecycle(job, "terminal");
+					this.#scheduleEviction(job);
 					this.#drainResumeQueue();
 					this.#retireCancelledJobOwned(id, job.generation);
 					return;
@@ -1188,18 +1216,41 @@ export class AsyncJobManager {
 				this.#markRecordTerminal(id, "failed", job.generation);
 				this.#publishTerminal(job);
 				this.#enqueueDelivery(id, errorText);
-				this.#runLifecycle(id, "terminal", job);
-				this.#scheduleEviction(id);
+				this.#runLifecycle(job, "terminal");
+				this.#scheduleEviction(job);
 				this.#drainResumeQueue();
 			}
-		})().finally(() => {
-			this.#externallySettled.delete(job.generation);
-			this.#settledJobIds.add(id);
-		});
+		})()
+			.finally(() => {
+				this.#externallySettled.delete(job.generation);
+				if (this.#jobs.get(id) === job) this.#settledJobs.add(job);
+				this.#settleExecution(execution);
+			})
+			.then(completion.resolve, completion.reject);
 
-		this.#jobs.set(id, job);
 		this.#notifyChange();
 		return id;
+	}
+
+	#settleExecution(execution: AsyncJobExecution): void {
+		if (execution.physicallySettled) return;
+		try {
+			if (execution.pendingEvictionCleanup) this.#finishEvictionCleanup(execution.job);
+		} finally {
+			execution.physicallySettled = true;
+			this.#activeExecutions.delete(execution);
+		}
+	}
+
+	#finishEvictionCleanup(job: AsyncJob): void {
+		this.#runLifecycle(job, "evict");
+		this.#purgeTerminalSubagentStateForJob(job.id, job.generation);
+	}
+
+	#cancelExactExecution(execution: AsyncJobExecution): boolean {
+		const job = execution.job;
+		if (this.#jobs.get(job.id) !== job) return false;
+		return this.cancel(job.id, job.ownerId ? { ownerId: job.ownerId } : undefined);
 	}
 
 	/**
@@ -1229,8 +1280,8 @@ export class AsyncJobManager {
 			this.#markRecordTerminal(id, "cancelled", job.generation);
 			this.#freezeEndTime(job);
 			this.#publishTerminal(job);
-			this.#runLifecycle(id, "cancel");
-			this.#scheduleEviction(id);
+			this.#runLifecycle(job, "cancel");
+			this.#scheduleEviction(job);
 			this.#drainResumeQueue();
 			// A PAUSED job's run has already unwound (it returned "paused"), so
 			// its owned tuple is retired here; a RUNNING job's tuple is retired
@@ -1243,7 +1294,7 @@ export class AsyncJobManager {
 		this.#freezeEndTime(job);
 		this.#markRecordTerminal(id, "cancelled", job.generation);
 		this.#publishTerminal(job);
-		this.#runLifecycle(id, "cancel");
+		this.#runLifecycle(job, "cancel");
 		job.abortController.abort();
 		this.#notifyChange();
 		return true;
@@ -1260,14 +1311,14 @@ export class AsyncJobManager {
 		job.endTime ??= Date.now();
 	}
 
-	#runLifecycle(jobId: string, phase: "cancel" | "terminal" | "evict", jobOverride?: AsyncJob): void {
-		const lifecycle = this.#lifecycles.get(jobId);
-		const job = jobOverride ?? this.#jobs.get(jobId);
-		if (!lifecycle || !job) return;
-		const fired = this.#lifecyclePhases.get(jobId) ?? new Set<"cancel" | "terminal" | "evict">();
+	#runLifecycle(job: AsyncJob, phase: "cancel" | "terminal" | "evict"): void {
+		const lifecycle = this.#lifecycles.get(job);
+		if (!lifecycle) return;
+		const jobId = job.id;
+		const fired = this.#lifecyclePhases.get(job) ?? new Set<"cancel" | "terminal" | "evict">();
 		if (fired.has(phase)) return;
 		fired.add(phase);
-		this.#lifecyclePhases.set(jobId, fired);
+		this.#lifecyclePhases.set(job, fired);
 		try {
 			if (phase === "cancel") lifecycle.onCancel?.(job);
 			else if (phase === "terminal") lifecycle.onTerminal?.(job);
@@ -1288,16 +1339,16 @@ export class AsyncJobManager {
 		}
 	}
 
-	#recordMonitorTombstone(jobId: string): void {
-		const job = this.#jobs.get(jobId);
-		if (!job?.metadata?.monitor) return;
-		const lifecycle = this.#lifecycles.get(jobId);
+	#recordMonitorTombstone(job: AsyncJob): void {
+		const jobId = job.id;
+		if (!job.metadata?.monitor) return;
+		const lifecycle = this.#lifecycles.get(job);
 		this.#monitorTombstones.set(jobId, {
 			jobId,
 			ownerId: job.ownerId,
 			status: job.status,
 			expiresAt: Date.now() + MONITOR_TOMBSTONE_TTL_MS,
-			purge: () => (lifecycle?.onTombstonePurge ?? lifecycle?.onEvict)?.(job),
+			purge: () => lifecycle?.onTombstonePurge?.(job),
 		});
 	}
 
@@ -1484,37 +1535,63 @@ export class AsyncJobManager {
 	beginOwnerSubagentShutdown(ownerId: string): OwnerSubagentShutdownLease | undefined {
 		if (!ownerId || this.#ownerSubagentShutdownLeases.has(ownerId)) return undefined;
 		const targets = new Map<string, OwnerSubagentShutdownTarget>();
-		const backingJobIds = new Map<string, Set<string>>();
-		const addBackingJob = (subagentId: string, jobId: string | null): void => {
-			if (!jobId) return;
-			const ids = backingJobIds.get(subagentId) ?? new Set<string>();
-			ids.add(jobId);
-			backingJobIds.set(subagentId, ids);
+		const backingExecutions = new Map<string, Set<AsyncJobExecution>>();
+		const records = new Map<string, OwnerSubagentShutdownRecordCapture>();
+		const findExecution = (jobId: string, generation?: string): AsyncJobExecution | undefined => {
+			if (generation === undefined) return undefined;
+			const job = this.#jobs.get(jobId);
+			if (job?.generation === generation) {
+				return this.#executionsByJob.get(job);
+			}
+			for (const execution of this.#activeExecutions) {
+				if (execution.job.id === jobId && execution.job.generation === generation) return execution;
+			}
+			return undefined;
+		};
+		const addBackingExecution = (subagentId: string, execution: AsyncJobExecution | undefined): void => {
+			if (!execution || execution.job.ownerId !== ownerId) return;
+			const executions = backingExecutions.get(subagentId) ?? new Set<AsyncJobExecution>();
+			executions.add(execution);
+			backingExecutions.set(subagentId, executions);
 		};
 		for (const record of this.#subagentRecords.values()) {
-			if (record.ownerId !== ownerId || this.#isTerminalSubagentStatus(record.status)) continue;
+			if (record.ownerId !== ownerId) continue;
+			const backingExecution =
+				record.currentJobId && record.currentJobGeneration
+					? findExecution(record.currentJobId, record.currentJobGeneration)
+					: undefined;
+			records.set(record.subagentId, {
+				record,
+				currentJobId: record.currentJobId,
+				currentJobGeneration: record.currentJobGeneration,
+			});
+			if (this.#isTerminalSubagentStatus(record.status) && backingExecution?.physicallySettled !== false) continue;
 			targets.set(record.subagentId, {
 				subagentId: record.subagentId,
 				jobId: record.status === "queued" ? null : record.currentJobId,
 				source: "record",
 			});
-			if (record.status !== "queued") addBackingJob(record.subagentId, record.currentJobId);
+			addBackingExecution(record.subagentId, backingExecution);
 		}
-		for (const job of this.#jobs.values()) {
+		const candidateJobs = new Set<AsyncJob>(this.#jobs.values());
+		for (const execution of this.#activeExecutions) candidateJobs.add(execution.job);
+		for (const job of candidateJobs) {
 			const subagentId = job.metadata?.subagent?.id;
+			const execution = this.#executionsByJob.get(job);
+			const physicallyActive = execution !== undefined && !execution.physicallySettled;
 			if (
 				job.ownerId !== ownerId ||
 				!subagentId ||
-				(job.status !== "running" && job.status !== "paused" && job.status !== "cancelled")
+				(!physicallyActive && job.status !== "running" && job.status !== "paused" && job.status !== "cancelled")
 			) {
 				continue;
 			}
-			if (job.status === "cancelled" && this.#settledJobIds.has(job.id) && !this.#subagentRecords.has(subagentId))
+			if (job.status === "cancelled" && execution?.physicallySettled && !this.#subagentRecords.has(subagentId))
 				continue;
 			if (!targets.has(subagentId)) {
 				targets.set(subagentId, { subagentId, jobId: job.id, source: "metadata_job" });
 			}
-			addBackingJob(subagentId, job.id);
+			addBackingExecution(subagentId, execution);
 		}
 		const lease: OwnerSubagentShutdownLease = {
 			ownerId,
@@ -1523,12 +1600,13 @@ export class AsyncJobManager {
 		};
 		this.#ownerSubagentShutdownLeases.set(ownerId, {
 			lease,
-			backingJobIds: new Map<string, readonly string[]>(
-				Array.from(backingJobIds, ([subagentId, jobIds]): [string, readonly string[]] => [
+			backingExecutions: new Map<string, readonly AsyncJobExecution[]>(
+				Array.from(backingExecutions, ([subagentId, executions]): [string, readonly AsyncJobExecution[]] => [
 					subagentId,
-					Array.from(jobIds),
+					Array.from(executions),
 				]),
 			),
+			records,
 			phase: "active",
 		});
 		return lease;
@@ -1593,33 +1671,38 @@ export class AsyncJobManager {
 		}
 		if (state.phase === "proved" && state.proof?.confirmed) return state.proof;
 		state.phase = "proving";
-		const settled = new Set<string>();
-		const promises: Promise<void>[] = [];
+		const promises = new Set<Promise<void>>();
 		for (const target of lease.targets) {
-			const backingJobs = (state.backingJobIds.get(target.subagentId) ?? []).map(jobId => ({
-				jobId,
-				job: this.#jobs.get(jobId),
-			}));
-			if (target.source === "record") this.cancelSubagent(target.subagentId, { ownerId: lease.ownerId });
-			for (const { jobId, job } of backingJobs) {
-				this.cancel(jobId, { ownerId: lease.ownerId });
-				if (!job || job.ownerId !== lease.ownerId) continue;
-				promises.push(
-					job.promise.then(
-						() => {
-							settled.add(jobId);
-						},
-						() => {
-							settled.add(jobId);
-						},
-					),
-				);
+			const executions = state.backingExecutions.get(target.subagentId) ?? [];
+			const capture = state.records.get(target.subagentId);
+			if (
+				target.source === "record" &&
+				capture &&
+				this.#subagentRecords.get(target.subagentId) === capture.record &&
+				capture.record.status === "queued"
+			) {
+				this.cancelSubagent(target.subagentId, { ownerId: lease.ownerId });
+			}
+			for (const execution of executions) {
+				this.#cancelExactExecution(execution);
+				promises.add(execution.physicalCompletion);
+			}
+			if (target.source !== "record" || executions.length > 0) continue;
+			const record = capture?.record;
+			if (!capture || !record || this.#subagentRecords.get(target.subagentId) !== record) continue;
+			if (record.status === "paused") {
+				const row = record.currentJobId ? this.#jobs.get(record.currentJobId) : undefined;
+				if (row && row.generation === capture.currentJobGeneration) continue;
+				record.status = "cancelled";
+				this.#liveHandles.delete(record.subagentId);
+				this.#subagentProgress.delete(record.subagentId);
+				this.#notifyChange();
 			}
 		}
 		const timeoutMs = Math.max(0, options?.timeoutMs ?? OWNER_SUBAGENT_SHUTDOWN_TIMEOUT_MS);
 		let deadlineExceeded = false;
 		await Promise.race([
-			Promise.allSettled(promises),
+			Promise.allSettled([...promises]),
 			Bun.sleep(timeoutMs).then(() => {
 				deadlineExceeded = true;
 			}),
@@ -1633,7 +1716,7 @@ export class AsyncJobManager {
 			);
 		}
 		const unresolvedIds = lease.targets
-			.filter(target => !this.#hasTerminalShutdownEvidence(target, lease.ownerId, current.backingJobIds, settled))
+			.filter(target => !this.#hasTerminalShutdownEvidence(target, lease.ownerId, current))
 			.map(target => target.subagentId);
 		const reason =
 			unresolvedIds.length === 0
@@ -1650,16 +1733,23 @@ export class AsyncJobManager {
 	#hasTerminalShutdownEvidence(
 		target: OwnerSubagentShutdownTarget,
 		ownerId: string,
-		backingJobIds: ReadonlyMap<string, readonly string[]>,
-		settled: ReadonlySet<string>,
+		state: OwnerSubagentShutdownLeaseState,
 	): boolean {
-		const record = this.#subagentRecords.get(target.subagentId);
-		if (!record || record.ownerId !== ownerId || !this.#isTerminalSubagentStatus(record.status)) return false;
-		return (backingJobIds.get(target.subagentId) ?? []).every(jobId => {
-			if (!settled.has(jobId)) return false;
-			const job = this.#jobs.get(jobId);
-			return job === undefined || job.ownerId === ownerId;
-		});
+		const capture = state.records.get(target.subagentId);
+		const record = capture?.record;
+		if (
+			!record ||
+			this.#subagentRecords.get(target.subagentId) !== record ||
+			record.ownerId !== ownerId ||
+			record.currentJobId !== capture.currentJobId ||
+			record.currentJobGeneration !== capture.currentJobGeneration ||
+			!this.#isTerminalSubagentStatus(record.status)
+		) {
+			return false;
+		}
+		return (state.backingExecutions.get(target.subagentId) ?? []).every(
+			execution => execution.job.ownerId === ownerId && execution.physicallySettled,
+		);
 	}
 
 	#ownerSubagentShutdownProof(
@@ -1962,7 +2052,7 @@ export class AsyncJobManager {
 			rec.status = "cancelled";
 			this.#liveHandles.delete(rec.subagentId);
 			this.#subagentProgress.delete(rec.subagentId);
-			if (shouldScheduleEviction && currentJobId) this.#scheduleEviction(currentJobId);
+			if (shouldScheduleEviction && job) this.#scheduleEviction(job);
 			else this.#notifyChange();
 			this.#drainResumeQueue();
 			// A paused run has already unwound (it returned "paused") and this
@@ -2597,8 +2687,8 @@ export class AsyncJobManager {
 		this.#markRecordTerminal(jobId, "failed", generation);
 		this.#publishTerminal(job);
 		this.#enqueueDelivery(jobId, errorText);
-		this.#runLifecycle(jobId, "terminal", job);
-		this.#scheduleEviction(jobId);
+		this.#runLifecycle(job, "terminal");
+		this.#scheduleEviction(job);
 		this.#drainResumeQueue();
 		this.#notifyChange();
 		return true;
@@ -2606,7 +2696,7 @@ export class AsyncJobManager {
 
 	cancelAll(filter?: AsyncJobFilter): void {
 		for (const job of this.getRunningJobs(filter)) {
-			if (this.cancel(job.id, filter)) this.#scheduleEviction(job.id);
+			if (this.cancel(job.id, filter)) this.#scheduleEviction(job);
 		}
 	}
 
@@ -2628,11 +2718,23 @@ export class AsyncJobManager {
 	}
 	async cancelAndSettleOwnerJobs(ownerId: string, options?: { timeoutMs?: number }): Promise<boolean> {
 		const jobs = this.getAllJobs({ ownerId });
-		for (const job of jobs) this.cancel(job.id, { ownerId });
+		const executions = new Set<AsyncJobExecution>();
+		for (const job of jobs) {
+			const execution = this.#executionsByJob.get(job);
+			if (execution) {
+				executions.add(execution);
+				this.#cancelExactExecution(execution);
+			}
+		}
+		for (const execution of this.#activeExecutions) {
+			if (execution.job.ownerId !== ownerId) continue;
+			executions.add(execution);
+			this.#cancelExactExecution(execution);
+		}
 		const timeoutMs = Math.max(0, options?.timeoutMs ?? OWNER_SUBAGENT_SHUTDOWN_TIMEOUT_MS);
 		let timedOut = false;
 		await Promise.race([
-			Promise.allSettled(jobs.map(job => job.promise)),
+			Promise.allSettled([...executions].map(execution => execution.physicalCompletion)),
 			Bun.sleep(timeoutMs).then(() => {
 				timedOut = true;
 			}),
@@ -2657,11 +2759,11 @@ export class AsyncJobManager {
 	}
 
 	async #waitForAllWithDeadline(timeoutMs: number): Promise<{ completed: boolean; stuckJobIds: string[] }> {
-		const jobs = Array.from(this.#jobs.values());
-		if (jobs.length === 0) return { completed: true, stuckJobIds: [] };
+		const executions = [...this.#activeExecutions];
+		if (executions.length === 0) return { completed: true, stuckJobIds: [] };
 		let timedOut = false;
 		await Promise.race([
-			Promise.allSettled(jobs.map(job => job.promise)),
+			Promise.allSettled(executions.map(execution => execution.physicalCompletion)),
 			Bun.sleep(Math.max(0, timeoutMs)).then(() => {
 				timedOut = true;
 			}),
@@ -2669,9 +2771,7 @@ export class AsyncJobManager {
 		if (!timedOut) return { completed: true, stuckJobIds: [] };
 		return {
 			completed: false,
-			stuckJobIds: Array.from(this.#jobs.values())
-				.filter(job => job.status === "running" || job.status === "cancelled")
-				.map(job => job.id),
+			stuckJobIds: executions.filter(execution => !execution.physicallySettled).map(execution => execution.job.id),
 		};
 	}
 
@@ -2757,7 +2857,7 @@ export class AsyncJobManager {
 	}
 
 	async waitForAll(): Promise<void> {
-		await Promise.all(Array.from(this.#jobs.values()).map(job => job.promise));
+		await Promise.all([...this.#activeExecutions].map(execution => execution.physicalCompletion));
 	}
 
 	async drainDeliveries(options?: { timeoutMs?: number; filter?: AsyncJobFilter }): Promise<boolean> {
@@ -2824,15 +2924,15 @@ export class AsyncJobManager {
 		// registration keeps the original protection (cleanups cannot register fresh
 		// work) without disabling delivery. Errors in cleanups are logged, never
 		// escalated.
-		const unsettledJobPromises = new Set<Promise<void>>();
+		const unsettledExecutionPromises = new Set<Promise<void>>();
 		const jobIdsByPromise = new Map<Promise<void>, string>();
-		for (const job of this.#jobs.values()) {
-			const promise = job.promise;
-			unsettledJobPromises.add(promise);
-			jobIdsByPromise.set(promise, job.id);
+		for (const execution of this.#activeExecutions) {
+			const promise = execution.physicalCompletion;
+			unsettledExecutionPromises.add(promise);
+			jobIdsByPromise.set(promise, execution.job.id);
 			void promise.then(
-				() => unsettledJobPromises.delete(promise),
-				() => unsettledJobPromises.delete(promise),
+				() => unsettledExecutionPromises.delete(promise),
+				() => unsettledExecutionPromises.delete(promise),
 			);
 		}
 		this.#registrationClosed = true;
@@ -2861,12 +2961,12 @@ export class AsyncJobManager {
 		const remainingDeliveryMs = Math.max(0, disposalDeadline - Date.now());
 		const drained = await this.drainDeliveries({ timeoutMs: remainingDeliveryMs });
 		if (!drained) this.#projectUndeliveredDisposalFailures();
-		const retainedAuthority = new Set<Promise<void>>(unsettledJobPromises);
+		const retainedAuthority = new Set<Promise<void>>(unsettledExecutionPromises);
 		for (const delivery of this.#inFlightDeliveries) {
 			if (delivery.promise) retainedAuthority.add(delivery.promise);
 		}
 		this.#retainedDisposalCompletion = Promise.allSettled(retainedAuthority).then(() => {});
-		const physicalStuckJobIds = [...unsettledJobPromises]
+		const physicalStuckJobIds = [...unsettledExecutionPromises]
 			.map(promise => jobIdsByPromise.get(promise))
 			.filter((id): id is string => id !== undefined);
 		const stuckJobIds = [...new Set([...waitResult.stuckJobIds, ...physicalStuckJobIds])];
@@ -2881,6 +2981,7 @@ export class AsyncJobManager {
 		this.#clearEvictionTimers();
 		this.#disposed = true;
 		this.#jobs.clear();
+		this.#settledJobs.clear();
 		this.#deliveries.length = 0;
 		this.#inFlightDeliveries.length = 0;
 		this.#deadLetteredDeliveries.clear();
@@ -2968,11 +3069,13 @@ export class AsyncJobManager {
 		return true;
 	}
 
-	#scheduleEviction(jobId: string): void {
-		if (this.#disposed) return;
+	#scheduleEviction(job: AsyncJob): void {
+		const jobId = job.id;
+		if (this.#disposed || this.#jobs.get(jobId) !== job) return;
 		this.#notifyChange();
+		if (this.#disposed || this.#jobs.get(jobId) !== job) return;
 		if (this.#retentionMs <= 0) {
-			this.#evictJob(jobId);
+			this.#evictJob(job);
 			// The terminal notification above precedes eviction so consumers can see
 			// the terminal transition; publish once more after the record disappears
 			// so observers can project any delivery that still owns the generation.
@@ -2984,28 +3087,32 @@ export class AsyncJobManager {
 			clearTimeout(existing);
 		}
 		const timer = setTimeout(() => {
+			if (this.#evictionTimers.get(jobId) !== timer) return;
 			this.#evictionTimers.delete(jobId);
-			this.#evictJob(jobId);
+			this.#evictJob(job);
 			this.#notifyChange();
 		}, this.#retentionMs);
 		timer.unref();
 		this.#evictionTimers.set(jobId, timer);
 	}
 
-	#evictJob(jobId: string): void {
+	#evictJob(job: AsyncJob): void {
+		const jobId = job.id;
+		if (this.#jobs.get(jobId) !== job) return;
 		this.#expireMonitorTombstones();
-		this.#recordMonitorTombstone(jobId);
-		this.#runLifecycle(jobId, "evict");
-		this.#purgeTerminalSubagentStateForJob(jobId);
-		const job = this.#jobs.get(jobId);
+		this.#recordMonitorTombstone(job);
+		const execution = this.#executionsByJob.get(job);
+		if (execution && !execution.physicallySettled) execution.pendingEvictionCleanup = true;
+		else this.#finishEvictionCleanup(job);
+		if (this.#jobs.get(jobId) !== job) return;
 		const deadLetter = this.#deadLetteredDeliveries.get(jobId);
 		const failure =
-			job?.deliveryFailure && (!deadLetter || deadLetter.generation === job.generation)
+			job.deliveryFailure && (!deadLetter || deadLetter.generation === job.generation)
 				? job.deliveryFailure
-				: deadLetter && job?.generation === deadLetter.generation
+				: deadLetter && job.generation === deadLetter.generation
 					? deadLetter
 					: undefined;
-		if (job && failure) {
+		if (failure) {
 			this.#evictedDeadLetters.set(job.generation, {
 				jobId: job.id,
 				generation: job.generation,
@@ -3023,13 +3130,12 @@ export class AsyncJobManager {
 				this.#evictedDeadLetters.delete(oldestGeneration);
 			}
 		}
+		if (this.#jobs.get(jobId) !== job) return;
 		this.#jobs.delete(jobId);
-		this.#settledJobIds.delete(jobId);
-		this.#lifecycles.delete(jobId);
-		this.#lifecyclePhases.delete(jobId);
+		this.#settledJobs.delete(job);
 		this.#deadLetteredDeliveries.delete(jobId);
 		this.#deadLetteredDeliveryOwners.delete(jobId);
-		if (job) this.#publishedTerminalGenerations.delete(job.generation);
+		this.#publishedTerminalGenerations.delete(job.generation);
 		this.#outputState.delete(jobId);
 	}
 

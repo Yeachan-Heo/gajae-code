@@ -34,6 +34,7 @@ function fakeRegistry(options?: {
 		resolveCanonicalModel: () => undefined,
 		getCanonicalVariants: () => [],
 		getCanonicalId: () => undefined,
+		isSelectorCircuitOpen: () => false,
 	};
 }
 

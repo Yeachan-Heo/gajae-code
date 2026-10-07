@@ -86,6 +86,9 @@ function createControllerContext(
 				login: vi.fn(async () => {}),
 				listCredentialInventory: vi.fn(() => []),
 				listCredentialRemovalTargets: vi.fn(() => []),
+				hasRuntimeApiKey: vi.fn(() => false),
+				hasLiteralConfigApiKey: vi.fn(() => false),
+				hasSessionCredentialUnavailable: vi.fn(() => false),
 			},
 			getModelProfiles: () => new Map(profiles),
 			getModelProfile: (name: string) => profiles.get(name),
@@ -95,6 +98,7 @@ function createControllerContext(
 			resolveCanonicalModel: () => undefined,
 			getCanonicalVariants: () => [],
 			getCanonicalId: () => undefined,
+			isSelectorCircuitOpen: (_selector: string) => false,
 		},
 	};
 	const ctx = {

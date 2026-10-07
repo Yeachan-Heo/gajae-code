@@ -1,7 +1,13 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { isEnoent } from "@gajae-code/utils";
 import type { Skill } from "../extensibility/skills";
-import { initializeLocalRoot, type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
+import {
+	initializeLocalRoot,
+	type LocalProtocolOptions,
+	resolveLocalRoot,
+	resolveLocalUrlToPath,
+} from "../internal-urls/local-protocol";
 import { validateRelativePath } from "../internal-urls/skill-protocol";
 import type { InternalResource } from "../internal-urls/types";
 import { normalizeLocalScheme } from "./path-utils";
@@ -125,6 +131,52 @@ function matchSkillName(
 	return { skill: undefined, suffix: undefined };
 }
 
+function localPathEscapes(realRoot: string, candidate: string): boolean {
+	return candidate !== realRoot && !candidate.startsWith(`${realRoot}${path.sep}`);
+}
+
+async function canonicalLocalPath(localRoot: string, lexicalPath: string): Promise<string> {
+	const realRoot = await fs.realpath(localRoot);
+	try {
+		const realTarget = await fs.realpath(lexicalPath);
+		if (localPathEscapes(realRoot, realTarget)) {
+			throw new ToolError("local:// path escapes the session local root");
+		}
+		return realTarget;
+	} catch (error) {
+		if (error instanceof ToolError || !isEnoent(error)) throw error;
+	}
+
+	const missing: string[] = [];
+	let cursor = lexicalPath;
+	for (;;) {
+		let stat: Awaited<ReturnType<typeof fs.lstat>> | undefined;
+		try {
+			stat = await fs.lstat(cursor);
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		}
+		if (stat) {
+			let realAncestor: string;
+			try {
+				realAncestor = await fs.realpath(cursor);
+			} catch (error) {
+				if (isEnoent(error)) throw new ToolError("local:// path escapes the session local root");
+				throw error;
+			}
+			const canonical = path.join(realAncestor, ...missing);
+			if (localPathEscapes(realRoot, canonical)) {
+				throw new ToolError("local:// path escapes the session local root");
+			}
+			return canonical;
+		}
+		const parent = path.dirname(cursor);
+		if (parent === cursor) throw new ToolError("local:// path escapes the session local root");
+		missing.unshift(path.basename(cursor));
+		cursor = parent;
+	}
+}
+
 function extractScheme(url: string): SupportedInternalScheme | undefined {
 	const match = /^([a-z][a-z0-9+.-]*):\/\//i.exec(url);
 	if (!match) return undefined;
@@ -180,10 +232,11 @@ async function resolveInternalUrlToPath(
 		}
 		await initializeLocalRoot(localOptions);
 		const resolvedLocalPath = resolveLocalUrlToPath(url, localOptions);
+		const realTarget = await canonicalLocalPath(resolveLocalRoot(localOptions), resolvedLocalPath);
 		if (ensureLocalParentDirs) {
-			await fs.mkdir(path.dirname(resolvedLocalPath), { recursive: true });
+			await fs.mkdir(path.dirname(realTarget), { recursive: true });
 		}
-		return resolvedLocalPath;
+		return realTarget;
 	}
 
 	if (!internalRouter?.canHandle(url)) {

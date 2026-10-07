@@ -169,6 +169,63 @@ async function disposeFixture(fixture: CredentialFixture, session?: AgentSession
 	fixture.authStorage.close();
 }
 
+/** Persist a session whose default model and durable pin target `provider`, then retire the pinned row. */
+async function persistStalePinnedSession(
+	fixture: CredentialFixture,
+	savedModel: string,
+	provider = fixture.provider,
+	pinnedRowId = fixture.paidRowId,
+): Promise<{ sessionFile: string; credentialScope: string }> {
+	const savedManager = SessionManager.create(fixture.root, path.join(fixture.root, "sessions"));
+	const credentialScope = savedManager.getSessionId();
+	savedManager.appendModelChange(savedModel, "default");
+	savedManager.appendCustomEntry("auth-credential-pin", {
+		v: 1,
+		scopeId: credentialScope,
+		provider,
+		pin: { kind: "id", value: String(pinnedRowId) },
+		credentialStoreIdentity: "fixture-store",
+	});
+	await savedManager.ensureOnDisk();
+	await savedManager.flush();
+	const sessionFile = savedManager.getSessionFile();
+	if (!sessionFile) throw new Error("Expected persisted session file");
+	await savedManager.close();
+	expect(fixture.authStorage.disableCredentialById(pinnedRowId, "removed by test")).toBe(true);
+	return { sessionFile, credentialScope };
+}
+
+/**
+ * Isolated settings with a configured default. A configured default disables the
+ * unconfigured first-available sweep, so a resume can only land on the saved chain
+ * or this default rather than on credentials outside the fixture.
+ */
+function settingsWithDefault(selector: string): Settings {
+	const settings = Settings.isolated({ "marketplace.autoUpdate": "off" });
+	settings.setModelRole("default", selector);
+	return settings;
+}
+
+/** Resume `sessionFile` with provider network access forbidden. */
+async function resumeStalePinnedSession(
+	fixture: CredentialFixture,
+	resumed: { sessionFile: string; credentialScope: string },
+	overrides: Partial<CreateAgentSessionOptions> = {},
+): Promise<CreateAgentSessionResult> {
+	using _blockedFetch = hookFetch(() => {
+		throw new Error("Resume must not call a provider");
+	});
+	return await createAgentSession({
+		...sessionOptions(fixture),
+		modelPattern: undefined,
+		credentialSessionId: resumed.credentialScope,
+		sessionManager: await SessionManager.open(resumed.sessionFile, fixture.root),
+		startupAuthConfig: snapshot(fixture.provider, `id:${fixture.wrongRowId}`),
+		modelRegistryStartupMutation: { owner: "cli-root", onAttempt: () => {} },
+		...overrides,
+	});
+}
+
 describe("startup credential pin handoff", () => {
 	test("hands the exact startup auth snapshot from root discovery to the CLI session", async () => {
 		using tempDir = TempDir.createSync("@gjc-startup-pin-root-");
@@ -404,6 +461,58 @@ describe("startup credential pin handoff", () => {
 		}
 	});
 
+	test("resumes a saved model with a removed pin without selecting the settings default on that provider", async () => {
+		using tempDir = TempDir.createSync("@gjc-startup-pin-saved-resume-");
+		const fixture = await createCredentialFixture(tempDir.path());
+		const savedManager = SessionManager.create(fixture.root, path.join(fixture.root, "sessions"));
+		const credentialScope = savedManager.getSessionId();
+		savedManager.appendModelChange(`${fixture.provider}/entitled-model`, "default");
+		savedManager.appendCustomEntry("auth-credential-pin", {
+			v: 1,
+			scopeId: credentialScope,
+			provider: fixture.provider,
+			pin: { kind: "id", value: String(fixture.paidRowId) },
+			credentialStoreIdentity: "fixture-store",
+		});
+		await savedManager.ensureOnDisk();
+		await savedManager.flush();
+		const sessionFile = savedManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected persisted session file");
+		await savedManager.close();
+		expect(fixture.authStorage.disableCredentialById(fixture.paidRowId, "removed by test")).toBe(true);
+
+		const settings = Settings.isolated({ "marketplace.autoUpdate": "off" });
+		settings.setModelRole("default", `${fixture.provider}/entitled-model`);
+		let session: AgentSession | undefined;
+		using _blockedFetch = hookFetch(() => {
+			throw new Error("Resume must not call a provider with another credential");
+		});
+		try {
+			const resumedManager = await SessionManager.open(sessionFile, fixture.root);
+			const result = await createAgentSession({
+				...sessionOptions(fixture),
+				modelPattern: undefined,
+				credentialSessionId: credentialScope,
+				settings,
+				sessionManager: resumedManager,
+				startupAuthConfig: snapshot(fixture.provider, `id:${fixture.wrongRowId}`),
+				modelRegistryStartupMutation: { owner: "cli-root", onAttempt: () => {} },
+			});
+			session = result.session;
+			expect(session.model).toBeUndefined();
+			expect(result.modelFallbackMessage).toContain("Re-pin a credential or select AUTO explicitly");
+			expect(fixture.authStorage.hasSessionCredentialUnavailable(fixture.provider, credentialScope)).toBe(true);
+			expect(
+				await fixture.authStorage.peekApiKey(fixture.provider, {
+					sessionId: credentialScope,
+					owner: fixture.modelRegistry.getAuthStorageOwner(),
+				}),
+			).toBeUndefined();
+		} finally {
+			await disposeFixture(fixture, session);
+		}
+	});
+
 	test("an explicit credential selector overrides the global paid pin", async () => {
 		using tempDir = TempDir.createSync("@gjc-startup-pin-explicit-");
 		const fixture = await createCredentialFixture(tempDir.path());
@@ -432,6 +541,186 @@ describe("startup credential pin handoff", () => {
 			).toBe(fixture.wrongKey);
 		} finally {
 			await disposeFixture(fixture, session);
+		}
+	});
+
+	describe("explicit provider keys outrank an unavailable resumed pin", () => {
+		const runtimeKey = "fixture-runtime-key";
+		const configKey = "fixture-config-key";
+
+		for (const source of ["runtime", "registry config"] as const) {
+			test(`restores the saved model with a ${source} key instead of reporting the pin unavailable`, async () => {
+				using tempDir = TempDir.createSync("@gjc-startup-pin-explicit-restore-");
+				const fixture = await createCredentialFixture(tempDir.path());
+				const resumed = await persistStalePinnedSession(fixture, `${fixture.provider}/entitled-model`);
+				const explicitKey = source === "runtime" ? runtimeKey : configKey;
+				if (source === "runtime") fixture.authStorage.setRuntimeApiKey(fixture.provider, runtimeKey);
+				else
+					fixture.authStorage.setConfigApiKey(fixture.provider, configKey, {
+						owner: fixture.modelRegistry.getAuthStorageOwner(),
+					});
+				let session: AgentSession | undefined;
+				try {
+					const result = await resumeStalePinnedSession(fixture, resumed, {
+						settings: settingsWithDefault(`${fixture.provider}/missing-model`),
+					});
+					session = result.session;
+					expect(`${session.model?.provider}/${session.model?.id}`).toBe(`${fixture.provider}/entitled-model`);
+					// Only the unresolvable settings default may be reported. This proves the
+					// pre-extension restore selected the model: the post-extension retry would
+					// also restore it but clears this message, so keep the exact match.
+					expect(result.modelFallbackMessage).toBe(`Model ${fixture.provider}/missing-model not found`);
+					expect(
+						fixture.authStorage.hasSessionCredentialUnavailable(fixture.provider, resumed.credentialScope),
+					).toBe(true);
+					expect(await fixture.modelRegistry.getApiKeyForProvider(fixture.provider, resumed.credentialScope)).toBe(
+						explicitKey,
+					);
+				} finally {
+					await disposeFixture(fixture, session);
+				}
+			});
+		}
+
+		test("a config key registered by another registry does not unblock the unavailable pin", async () => {
+			using tempDir = TempDir.createSync("@gjc-startup-pin-foreign-config-");
+			const fixture = await createCredentialFixture(tempDir.path());
+			const resumed = await persistStalePinnedSession(fixture, `${fixture.provider}/entitled-model`);
+			fixture.authStorage.setConfigApiKey(fixture.provider, configKey, { owner: {} });
+			let session: AgentSession | undefined;
+			try {
+				const result = await resumeStalePinnedSession(fixture, resumed, {
+					settings: settingsWithDefault(`${fixture.provider}/missing-model`),
+				});
+				session = result.session;
+				expect(session.model).toBeUndefined();
+				expect(result.modelFallbackMessage).toContain("Re-pin a credential or select AUTO explicitly");
+				expect(
+					await fixture.authStorage.peekApiKey(fixture.provider, {
+						sessionId: resumed.credentialScope,
+						owner: fixture.modelRegistry.getAuthStorageOwner(),
+					}),
+				).toBeUndefined();
+			} finally {
+				await disposeFixture(fixture, session);
+			}
+		});
+
+		test("an apiKeyEnv config key does not unblock the pin onto another stored api_key account", async () => {
+			using tempDir = TempDir.createSync("@gjc-startup-pin-env-config-");
+			const fixture = await createCredentialFixture(tempDir.path());
+			const alternateKey = "fixture-alternate-api-key";
+			fixture.authStorage.upsertCredential(fixture.provider, { type: "api_key", key: alternateKey });
+			const resumed = await persistStalePinnedSession(fixture, `${fixture.provider}/entitled-model`);
+			fixture.authStorage.setConfigApiKey(fixture.provider, "fixture-env-config-key", {
+				envSourced: true,
+				owner: fixture.modelRegistry.getAuthStorageOwner(),
+			});
+			// getApiKey prefers the stored api_key account over an apiKeyEnv override,
+			// so treating this override as explicit would retarget the unavailable pin.
+			expect(await fixture.modelRegistry.getApiKeyForProvider(fixture.provider, resumed.credentialScope)).toBe(
+				alternateKey,
+			);
+			let session: AgentSession | undefined;
+			try {
+				const result = await resumeStalePinnedSession(fixture, resumed, {
+					settings: settingsWithDefault(`${fixture.provider}/entitled-model`),
+				});
+				session = result.session;
+				expect(session.model).toBeUndefined();
+				expect(result.modelFallbackMessage).toContain("Re-pin a credential or select AUTO explicitly");
+			} finally {
+				await disposeFixture(fixture, session);
+			}
+		});
+
+		test("falls back to the settings default on the pinned provider when a runtime key exists", async () => {
+			using tempDir = TempDir.createSync("@gjc-startup-pin-explicit-settings-");
+			const fixture = await createCredentialFixture(tempDir.path());
+			const resumed = await persistStalePinnedSession(fixture, `${fixture.provider}/retired-model`);
+			fixture.authStorage.setRuntimeApiKey(fixture.provider, runtimeKey);
+			let session: AgentSession | undefined;
+			try {
+				const result = await resumeStalePinnedSession(fixture, resumed, {
+					settings: settingsWithDefault(`${fixture.provider}/entitled-model`),
+				});
+				session = result.session;
+				expect(`${session.model?.provider}/${session.model?.id}`).toBe(`${fixture.provider}/entitled-model`);
+			} finally {
+				await disposeFixture(fixture, session);
+			}
+		});
+
+		for (const withRuntimeKey of [true, false]) {
+			test(`post-extension retry ${withRuntimeKey ? "restores" : "keeps blocked"} an extension-registered saved model ${withRuntimeKey ? "with" : "without"} a runtime key`, async () => {
+				using tempDir = TempDir.createSync("@gjc-startup-pin-explicit-late-");
+				const fixture = await createCredentialFixture(tempDir.path());
+				const lateProvider = "late-pin-provider";
+				await fixture.authStorage.set(lateProvider, [
+					{ type: "oauth", access: "late-wrong", refresh: "late-wrong-r", expires: Date.now() + 3_600_000 },
+					{ type: "oauth", access: "late-paid", refresh: "late-paid-r", expires: Date.now() + 3_600_000 },
+				]);
+				const latePaidRow = fixture.authStorage.listCredentialInventory(lateProvider)[1];
+				if (!latePaidRow) throw new Error("Expected late provider credential rows");
+				const resumed = await persistStalePinnedSession(
+					fixture,
+					`${lateProvider}/late-model`,
+					lateProvider,
+					latePaidRow.id,
+				);
+				if (withRuntimeKey) fixture.authStorage.setRuntimeApiKey(lateProvider, runtimeKey);
+				let session: AgentSession | undefined;
+				try {
+					// The unresolvable default leaves the post-extension retry as the only restore path.
+					const result = await resumeStalePinnedSession(fixture, resumed, {
+						settings: settingsWithDefault(`${fixture.provider}/missing-model`),
+						extensions: [
+							pi => {
+								pi.registerProvider(lateProvider, {
+									baseUrl: "https://late-pin.example.test/v1",
+									api: "openai-completions",
+									oauth: {
+										name: "Late Pin Fixture",
+										login: async () => ({
+											access: "late-login",
+											refresh: "late-login-r",
+											expires: Date.now() + 3_600_000,
+										}),
+										getApiKey: credentials => credentials.access,
+									},
+									models: [
+										{
+											id: "late-model",
+											name: "Late Model",
+											reasoning: false,
+											input: ["text"],
+											cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+											contextWindow: 128_000,
+											maxTokens: 8_192,
+										},
+									],
+								});
+							},
+						],
+					});
+					session = result.session;
+					if (withRuntimeKey) {
+						expect(`${session.model?.provider}/${session.model?.id}`).toBe(`${lateProvider}/late-model`);
+						expect(result.modelFallbackMessage).toBeUndefined();
+					} else {
+						expect(session.model).toBeUndefined();
+						expect(result.modelFallbackMessage).toContain(`Could not restore model ${lateProvider}/late-model`);
+						expect(
+							await fixture.authStorage.peekApiKey(lateProvider, {
+								sessionId: resumed.credentialScope,
+								owner: fixture.modelRegistry.getAuthStorageOwner(),
+							}),
+						).toBeUndefined();
+					}
+				} finally {
+					await disposeFixture(fixture, session);
+				}
+			});
 		}
 	});
 });

@@ -213,6 +213,12 @@ async function childMain(): Promise<void> {
 				);
 			}
 			if (scenario === "kiro-stream") return new Response('{"content":"ok"}', { status: 200 });
+			if (scenario === "codewhisperer") {
+				return new Response(new Uint8Array(), {
+					status: 200,
+					headers: { "content-type": "application/vnd.amazon.eventstream" },
+				});
+			}
 			return new Response(new Uint8Array(), { status: 200 });
 		},
 		{ preconnect: globalThis.fetch.preconnect },
@@ -613,9 +619,9 @@ if (process.argv[2] === CHILD_FLAG) {
 			[
 				"codewhisperer",
 				"us-iso-east-1",
-				"https://amazoncodewhispererstreamingservice.us-iso-east-1.amazonaws.com/",
+				"https://codewhisperer.us-iso-east-1.amazonaws.com/",
 				"bearer",
-				"AmazonCodeWhispererService.GenerateAssistantResponse",
+				"AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
 			],
 			[
 				"kiro-discovery",

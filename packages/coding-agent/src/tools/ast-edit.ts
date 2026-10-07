@@ -17,6 +17,7 @@ import { createFileRecorder, formatResultPath } from "./file-recorder";
 import { formatGroupedFiles } from "./grouped-file-output";
 import type { OutputMeta } from "./output-meta";
 import { resolveToolSearchScope } from "./path-utils";
+import { enforcePlanModeWrite } from "./plan-mode-guard";
 import {
 	appendParseErrorsBulletList,
 	capParseErrors,
@@ -337,6 +338,9 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 					label: `AST Edit: ${result.totalReplacements} replacement${previewReplacementPlural} in ${result.filesTouched} file${previewFilePlural}`,
 					sourceToolName: this.name,
 					apply: async (_reason: string) => {
+						for (const filePath of previewedFiles) {
+							enforcePlanModeWrite(this.session, filePath, { op: "update" });
+						}
 						await assertWorkflowMutationRawPathsAllowed({
 							cwd: this.session.cwd,
 							sessionId: this.session.getSessionId?.() ?? undefined,

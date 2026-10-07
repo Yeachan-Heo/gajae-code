@@ -4,6 +4,7 @@ import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { exactUnlink } from "@gajae-code/natives";
 import { isEnoent, logger, postmortem } from "@gajae-code/utils";
+import { readLinuxProcStartTimeSync } from "../gjc-runtime/linux-proc";
 
 const BLOB_PREFIX = "blob:sha256:";
 const CANONICAL_BLOB_NAME = /^[0-9a-f]{64}$/;
@@ -46,10 +47,21 @@ const RESIDENT_CACHE_SWEEP_EXPECTED_IO_CODES = new Set([
 ]);
 const ownedResidentCacheInstanceDirs = new Set<string>();
 const activeResidentCacheRootSweeps = new Set<string>();
-let ownResidentCacheProcessStartTimeMs: number | null | undefined;
+let ownResidentCacheProcessStart: ResidentCacheProcessStart | undefined;
 
-/** Marks `startTimeMs` as an absolute instant parsed from a UTC-pinned `ps` render. */
-const RESIDENT_CACHE_START_TIME_BASIS = "utc";
+/** Marks `startTimeMs` as an absolute instant parsed from a UTC-pinned `ps` render (non-Linux). */
+const RESIDENT_CACHE_UTC_START_TIME_BASIS = "utc";
+/**
+ * Prefix for a Linux start identity: `startTimeMs` holds `/proc/<pid>/stat` field 22
+ * (clock ticks since boot) and the suffix is the kernel `boot_id`. Ticks are immune
+ * to wall-clock adjustment; the boot id scopes them to one kernel boot.
+ */
+const RESIDENT_CACHE_LINUX_START_TIME_BASIS_PREFIX = "linux-proc-ticks:";
+
+interface ResidentCacheProcessStart {
+	readonly startTimeMs: number | null;
+	readonly basis: string;
+}
 
 interface ResidentCacheOwnerToken {
 	readonly pid: number;
@@ -240,19 +252,47 @@ function assertResidentCacheDirectoryPathMatchesDescriptor(pathname: string, des
 	assertResidentCacheDirectoryDescriptor(pathname, current, descriptor, uid);
 }
 
-function residentCacheProcessStartTimeMs(pid: number): number | null {
-	if (pid === process.pid && ownResidentCacheProcessStartTimeMs !== undefined) {
-		return ownResidentCacheProcessStartTimeMs;
-	}
+let residentCacheLinuxBootId: string | null | undefined;
 
-	// Mirror file-lock's `ps`-based process incarnation probe, but pin the locale
-	// AND the zone. `lstart` is a zoneless local wall clock rendered by `ps` from
-	// /etc/localtime, while `Date.parse` of a zoneless string binds it to the JS
-	// runtime's own zone. Those are two independent resolutions, so a reader whose
-	// runtime resolves UTC while `ps` renders UTC+9 derives an epoch nine hours off
-	// for the very same live process — and this value's only job is to detect PID
-	// reuse, so a disagreeing reader reports every live owner as reused and the GC
-	// reaps a running session's cache. Pinning TZ on the child fixes the rendering
+function readResidentCacheLinuxBootId(): string | null {
+	if (residentCacheLinuxBootId !== undefined) return residentCacheLinuxBootId;
+	let bootId: string | null = null;
+	try {
+		const text = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+		if (/^[0-9a-f-]{36}$/.test(text)) bootId = text;
+	} catch {
+		// Without a boot id, tick counts cannot be scoped to one boot.
+	}
+	residentCacheLinuxBootId = bootId;
+	return bootId;
+}
+
+function residentCacheProcessStart(pid: number): ResidentCacheProcessStart {
+	if (pid === process.pid && ownResidentCacheProcessStart !== undefined) return ownResidentCacheProcessStart;
+	const start = process.platform === "linux" ? residentCacheLinuxProcessStart(pid) : residentCacheUtcProcessStart(pid);
+	if (pid === process.pid) ownResidentCacheProcessStart = start;
+	return start;
+}
+
+// `ps -o lstart` is NOT a stable identity on Linux: procps renders it as
+// `btime + starttime_ticks`, and `btime` is re-derived from the current wall clock
+// minus uptime. On hosts whose clock is continuously slewed (WSL2 is the common
+// case) `btime` drifts, so the very same live process reports a start time that
+// moves by seconds to minutes over a session. Any drift reads as PID reuse and the
+// GC reaps a running session's cache. The raw tick count never moves.
+function residentCacheLinuxProcessStart(pid: number): ResidentCacheProcessStart {
+	const bootId = readResidentCacheLinuxBootId();
+	if (bootId === null) return { startTimeMs: null, basis: RESIDENT_CACHE_LINUX_START_TIME_BASIS_PREFIX };
+	const basis = `${RESIDENT_CACHE_LINUX_START_TIME_BASIS_PREFIX}${bootId}`;
+	const ticks = readLinuxProcStartTimeSync(pid);
+	const startTimeMs = ticks === null ? Number.NaN : Number(ticks);
+	return { startTimeMs: Number.isSafeInteger(startTimeMs) ? startTimeMs : null, basis };
+}
+
+function residentCacheUtcProcessStart(pid: number): ResidentCacheProcessStart {
+	// Pin the locale AND the zone. `lstart` is a zoneless local wall clock rendered
+	// by `ps` from /etc/localtime, while `Date.parse` of a zoneless string binds it
+	// to the JS runtime's own zone. Pinning TZ on the child fixes the rendering
 	// side; the explicit GMT suffix fixes the parsing side.
 	let startTimeMs: number | null = null;
 	try {
@@ -269,8 +309,7 @@ function residentCacheProcessStartTimeMs(pid: number): number | null {
 	} catch {
 		// An unavailable process-start source cannot prove PID reuse.
 	}
-	if (pid === process.pid) ownResidentCacheProcessStartTimeMs = startTimeMs;
-	return startTimeMs;
+	return { startTimeMs, basis: RESIDENT_CACHE_UTC_START_TIME_BASIS };
 }
 
 type ResidentCacheOwnerLiveness = "alive" | "dead" | "unknown";
@@ -376,10 +415,11 @@ function readResidentCacheOwnerSnapshot(instanceDir: string, uid: number): Resid
 function writeResidentCacheOwnerToken(instanceDir: string, uid: number): void {
 	const nonce = path.basename(instanceDir).slice("i-".length);
 	if (!nonce) throw new ResidentCacheTrustError("instance_nonce_missing", instanceDir);
+	const ownStart = residentCacheProcessStart(process.pid);
 	const owner: ResidentCacheOwnerToken = {
 		pid: process.pid,
-		startTimeMs: residentCacheProcessStartTimeMs(process.pid),
-		startTimeBasis: RESIDENT_CACHE_START_TIME_BASIS,
+		startTimeMs: ownStart.startTimeMs,
+		startTimeBasis: ownStart.basis,
 		nonce,
 		createdAt: Date.now(),
 	};
@@ -579,26 +619,31 @@ function residentCacheSweepLimit(value: number | undefined, ceiling: number): nu
 	return Math.max(0, Math.min(Math.floor(value), ceiling));
 }
 
-function cachedResidentCacheProcessStartTimeMs(pid: number, cache: Map<number, number | null>): number | null {
-	if (cache.has(pid)) return cache.get(pid) ?? null;
-	const startTimeMs = residentCacheProcessStartTimeMs(pid);
-	cache.set(pid, startTimeMs);
-	return startTimeMs;
+function cachedResidentCacheProcessStart(
+	pid: number,
+	cache: Map<number, ResidentCacheProcessStart>,
+): ResidentCacheProcessStart {
+	const cached = cache.get(pid);
+	if (cached !== undefined) return cached;
+	const start = residentCacheProcessStart(pid);
+	cache.set(pid, start);
+	return start;
 }
 
 function residentCacheOwnerIsStale(
 	owner: ResidentCacheOwnerToken,
-	startTimeCache: Map<number, number | null>,
+	startTimeCache: Map<number, ResidentCacheProcessStart>,
 ): boolean {
 	const liveness = residentCacheOwnerLiveness(owner.pid);
 	if (liveness === "dead") return true;
 	if (liveness !== "alive" || owner.startTimeMs === null) return false;
-	// A token from before the UTC pin carries a zone-dependent wall clock. Comparing
-	// it against an absolute instant would read an ordinary timezone offset as PID
-	// reuse and reap a live owner, so an unlabelled basis leaves reuse unproven.
-	if (owner.startTimeBasis !== RESIDENT_CACHE_START_TIME_BASIS) return false;
-	const currentStartTimeMs = cachedResidentCacheProcessStartTimeMs(owner.pid, startTimeCache);
-	return currentStartTimeMs !== null && currentStartTimeMs !== owner.startTimeMs;
+	const current = cachedResidentCacheProcessStart(owner.pid, startTimeCache);
+	// Start times are comparable only on the same basis (and, on Linux, the same
+	// boot). A token from an older writer (unlabelled zone-dependent wall clock, or
+	// the drifting `ps` render) or another basis leaves reuse unproven, so a live
+	// owner is never reaped on a basis mismatch.
+	if (owner.startTimeBasis !== current.basis) return false;
+	return current.startTimeMs !== null && current.startTimeMs !== owner.startTimeMs;
 }
 
 function reapResidentCacheInstanceDir(
@@ -681,7 +726,7 @@ export async function sweepResidentCacheRoot(root: string, options: ResidentCach
 			// cache state behind.
 			rootDescriptor = openVerifiedResidentCacheDirectory(root, uid);
 			assertResidentCacheDirectoryPathMatchesDescriptor(root, rootDescriptor, uid);
-			const startTimeCache = new Map<number, number | null>();
+			const startTimeCache = new Map<number, ResidentCacheProcessStart>();
 			const entries = fs.opendirSync(root);
 			try {
 				let examined = 0;
@@ -746,7 +791,7 @@ function openVerifiedCacheInstanceDir(root: string, instanceName?: string): stri
 					const staleInstance = readResidentCacheOwnerSnapshot(candidate, uid);
 					if (
 						staleInstance === null ||
-						!residentCacheOwnerIsStale(staleInstance.owner, new Map<number, number | null>()) ||
+						!residentCacheOwnerIsStale(staleInstance.owner, new Map<number, ResidentCacheProcessStart>()) ||
 						!reapResidentCacheInstanceDir(root, rootDescriptor, candidate, staleInstance, uid)
 					) {
 						throw error;

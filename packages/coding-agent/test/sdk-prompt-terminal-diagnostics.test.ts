@@ -421,3 +421,304 @@ isolatedSdkHostTest(
 	},
 	75_000,
 );
+
+isolatedSdkHostTest(
+	"SDK host treats a cooperative pause as a normal prompt terminal",
+	async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-terminal-paused-"));
+		dirs.push(cwd);
+		const sessionId = `sdk-prompt-terminal-paused-${Date.now()}`;
+		const sessionContext = context(cwd, sessionId);
+		const handlers = await start(sessionContext);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		const diagnostics: unknown[] = [];
+		const errorSpy = spyOn(logger, "error").mockImplementation((...args: unknown[]) => {
+			if (args[0] === "sdk_prompt_terminal_failed") diagnostics.push(args[1]);
+		});
+
+		const submit = async (requestId: string): Promise<void> => {
+			socket.send(
+				JSON.stringify({
+					type: "control_request",
+					id: requestId,
+					operation: "turn.prompt",
+					input: { text: "pause this turn", clientRef: requestId },
+				}),
+			);
+			await waitFor(
+				() => frames.some(frame => frame.type === "control_response" && frame.id === requestId),
+				`prompt acknowledgement ${requestId}`,
+			);
+		};
+		const waitForActive = async (clientRef: string): Promise<void> => {
+			let lastResponse = "none";
+			for (let attempt = 0; attempt < 120; attempt += 1) {
+				const id = `${clientRef}-active-${attempt}`;
+				socket.send(
+					JSON.stringify({
+						type: "query_request",
+						id,
+						query: "turn.result",
+						input: { kind: "prompt", clientRef },
+					}),
+				);
+				await waitFor(() => frames.some(frame => frame.id === id), `active prompt query ${clientRef}`);
+				const response = frames.find(frame => frame.id === id) as
+					| { result?: { status?: string; [key: string]: unknown } }
+					| undefined;
+				if (response !== undefined) lastResponse = JSON.stringify(response);
+				if (response?.result?.status === "accepted" || response?.result?.status === "in_flight") return;
+			}
+			throw new Error(`prompt ${clientRef} never became in_flight; lastResponse=${lastResponse}`);
+		};
+		const result = async (clientRef: string): Promise<Record<string, unknown>> => {
+			let lastResponse = "none";
+			let responseSeen = false;
+			for (let attempt = 0; attempt < 120; attempt += 1) {
+				const id = `${clientRef}-result-${attempt}`;
+				socket.send(
+					JSON.stringify({
+						type: "query_request",
+						id,
+						query: "turn.result",
+						input: { kind: "prompt", clientRef },
+					}),
+				);
+				await waitFor(() => frames.some(frame => frame.id === id), `terminal prompt query ${clientRef}`);
+				const response = frames.find(frame => frame.id === id) as
+					| { result?: { status?: string; [key: string]: unknown } }
+					| undefined;
+				if (response !== undefined) {
+					responseSeen = true;
+					lastResponse = JSON.stringify(response);
+				}
+				if (response?.result?.status === "failed" || response?.result?.status === "terminal_ok")
+					return response.result;
+				await Bun.sleep(25);
+			}
+			throw new Error(
+				`turn.result never reported a terminal status for ${clientRef}; responseSeen=${responseSeen}; lastResponse=${lastResponse}`,
+			);
+		};
+
+		try {
+			await submit("paused-prompt");
+			await waitForActive("paused-prompt");
+			await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+			await handlers.get("agent_end")?.({ type: "agent_end", stopReason: "paused", messages: [] }, sessionContext);
+			const paused = await result("paused-prompt");
+			expect(paused.status).toBe("terminal_ok");
+			expect(paused.outcome).toEqual({ kind: "stopped", reason: "end_turn", provenance: "agent" });
+			expect(diagnostics).toHaveLength(0);
+
+			await submit("paused-error-prompt");
+			await waitForActive("paused-error-prompt");
+			await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+			await handlers.get("agent_end")?.(
+				{
+					type: "agent_end",
+					stopReason: "paused",
+					messages: [{ role: "assistant", stopReason: "error", errorMessage: "provider failed" }],
+				},
+				sessionContext,
+			);
+			const failed = await result("paused-error-prompt");
+			expect(failed.status).toBe("failed");
+			expect(failed.outcome).toMatchObject({ kind: "failed", code: "prompt_failed", provenance: "agent_failed" });
+			expect(diagnostics).toHaveLength(1);
+			expect(diagnostics[0]).toMatchObject({
+				loopStopReason: "paused",
+				assistantStopReason: "error",
+				reason: "provider failed",
+			});
+		} finally {
+			errorSpy.mockRestore();
+		}
+
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	},
+	75_000,
+);
+
+const F2_DIAGNOSTIC = {
+	category: "auth",
+	httpStatus: 401,
+	code: "authentication_error",
+	evidence: "structured_code",
+} as const;
+
+isolatedSdkHostTest(
+	"F2 the native agent_failed producer publishes the adapter diagnostic on the real wire frame",
+	async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-f2-thrown-"));
+		dirs.push(cwd);
+		const sessionId = `sdk-f2-thrown-${Date.now()}`;
+		const sessionContext = context(cwd, sessionId);
+		const handlers = await start(sessionContext, () => undefined);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "f2-thrown",
+				operation: "turn.prompt",
+				input: { text: "provider refuses this turn", clientRef: "f2-thrown-ref" },
+			}),
+		);
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === "f2-thrown"),
+			"prompt acknowledgement",
+		);
+
+		// The real native handlers, with the payload the Agent emits: a thrown
+		// provider failure whose validated diagnostic travels on the error.
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		await handlers.get("agent_failed")?.(
+			{
+				type: "agent_failed",
+				error: Object.assign(new Error("provider rejected sk-ant-secret-F2 https://api.example/v1"), {
+					code: "provider_rejected",
+					providerDiagnostic: { ...F2_DIAGNOSTIC },
+				}),
+			},
+			sessionContext,
+		);
+		await waitFor(() => frames.some(frame => frame.type === "agent_failed"), "native agent_failed frame");
+
+		const failure = frames.find(frame => frame.type === "agent_failed") as Record<string, unknown>;
+		expect(failure).toMatchObject({
+			error: { code: "provider_rejected", message: "Prompt submission failed.", providerDiagnostic: F2_DIAGNOSTIC },
+		});
+		// The published frame stays bounded: no raw body, key or URL rides along.
+		expect(JSON.stringify(failure)).not.toContain("sk-ant-secret-F2");
+		expect(JSON.stringify(failure)).not.toContain("api.example");
+
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	},
+	75_000,
+);
+
+isolatedSdkHostTest(
+	"F2 the native terminal stream-error producer carries the diagnostic to the supported turn.result query",
+	async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-f2-stream-"));
+		dirs.push(cwd);
+		const sessionId = `sdk-f2-stream-${Date.now()}`;
+		const sessionContext = context(cwd, sessionId);
+		const handlers = await start(sessionContext, () => undefined);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "f2-stream",
+				operation: "turn.prompt",
+				input: { text: "provider fails inside the stream", clientRef: "f2-stream-ref" },
+			}),
+		);
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === "f2-stream"),
+			"prompt acknowledgement",
+		);
+
+		// No agent_failed frame: the failure exists only as a terminal error assistant,
+		// so the diagnostic can come from nowhere but the stream-error producer itself.
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		await handlers.get("agent_end")?.(
+			{
+				type: "agent_end",
+				stopReason: "completed",
+				messages: [
+					{
+						role: "assistant",
+						stopReason: "error",
+						errorKind: "provider_error",
+						errorCode: "provider_unavailable",
+						errorMessage: "overloaded sk-ant-secret-F2-STREAM https://api.example/v1",
+						providerDiagnostic: {
+							category: "provider_unavailable",
+							httpStatus: 503,
+							code: "overloaded_error",
+							evidence: "structured_code",
+						},
+					},
+				],
+			},
+			sessionContext,
+		);
+
+		// Q26 `turn.result` is a QUERY, not a control operation: it is read through
+		// `query_request`, which is the supported public readback for a durable turn.
+		let settled: { status?: string; error?: { code?: string }; outcome?: Record<string, unknown> } | undefined;
+		let lastResponse = "none";
+		for (let attempt = 0; attempt < 120 && settled === undefined; attempt += 1) {
+			socket.send(
+				JSON.stringify({
+					type: "query_request",
+					id: `f2-stream-result-${attempt}`,
+					query: "turn.result",
+					input: { kind: "prompt", clientRef: "f2-stream-ref" },
+				}),
+			);
+			await Bun.sleep(25);
+			const response = frames.find(frame => frame.id === `f2-stream-result-${attempt}`) as
+				| { result?: { status?: string; error?: { code?: string }; outcome?: Record<string, unknown> } }
+				| undefined;
+			if (response !== undefined) lastResponse = JSON.stringify(response);
+			if (response?.result?.status === "failed" || response?.result?.status === "terminal_ok")
+				settled = response.result;
+		}
+		if (settled === undefined) throw new Error(`turn.result never reported a terminal status; last=${lastResponse}`);
+
+		expect(settled.status).toBe("failed");
+		expect(settled.outcome).toMatchObject({
+			kind: "failed",
+			code: "prompt_failed",
+			provenance: "agent_failed",
+			providerCode: "provider_unavailable",
+			providerDiagnostic: {
+				category: "provider_unavailable",
+				httpStatus: 503,
+				code: "overloaded_error",
+				evidence: "structured_code",
+			},
+		});
+		expect(JSON.stringify(settled)).not.toContain("sk-ant-secret-F2-STREAM");
+		expect(JSON.stringify(settled)).not.toContain("api.example");
+
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	},
+	75_000,
+);

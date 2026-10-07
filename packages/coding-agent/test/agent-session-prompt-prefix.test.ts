@@ -64,14 +64,13 @@ describe("AgentSession prompt-prefix telemetry", () => {
 		expect(first).toMatchObject({ change: "initial", messages: 2, previousMessages: 0 });
 		expect(second?.hash).toMatch(/^[0-9a-f]{16}$/);
 		expect(second?.hash).not.toBe(first?.hash);
-		// The previous request's volatile context is stripped before the next prompt, so
-		// the already-sent prefix is rewritten at its position: a client-caused miss.
+		// The previous request's volatile context is kept in agent.state, so the prefix is properly reused.
+		// The second request appends a new volatile context and new prompt, extending the cache prefix.
 		expect(second).toMatchObject({
-			change: "messages",
-			messages: 4,
+			change: "append",
+			messages: 5,
 			previousMessages: 2,
-			reusedMessages: 0,
-			divergedRole: "user",
+			reusedMessages: 2,
 		});
 	});
 });

@@ -27,7 +27,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
-import { isNonDispatchedToolEvent, type RunSettlementProof, ThinkingLevel } from "@gajae-code/agent-core";
+import {
+	type AgentTerminalOwnerContext,
+	isNonDispatchedToolEvent,
+	type RunCancellationDomain,
+	type RunSettlementProof,
+	ThinkingLevel,
+} from "@gajae-code/agent-core";
 import type { ImageContent, TextContent, Tool } from "@gajae-code/ai/core";
 import type { NotificationServer as NativeNotificationServer } from "@gajae-code/natives";
 
@@ -105,6 +111,7 @@ import {
 	canDeliverSdkEvent,
 	createSdkSurfaceFactory,
 	masterAttestationForEffectiveHost,
+	POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY,
 	reattestMasterSessionIdentity,
 	SESSION_HOST_OBSERVER_CAPABILITY,
 	type SessionSdkHost,
@@ -116,6 +123,7 @@ import { type AbortScope, type ControlSurface, dispatchControl, TypedControlErro
 import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
 import { isAutoroutingInactive, markAutoroutingInactive } from "../host/internal-autorouting-state";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
+import { RESPONSE_CEILING_BYTES } from "../host/query/handlers";
 import type { SdkFrame } from "../host/types";
 import {
 	parseSyntheticModelId,
@@ -137,7 +145,10 @@ import {
 	assistantFailureCode,
 	failedPromptOutcome,
 	formatPromptFailureForLocalLog,
+	isSafePromptFailureCode,
 	PROMPT_FAILURE_MESSAGE_DEADLINE,
+	providerDiagnosticField,
+	publishedPromptFailure,
 	sanitizePromptFailure,
 } from "../prompt-failure";
 import { PROMPT_CLIENT_REF_MAX_LENGTH, type SdkPromptTerminalOutcome } from "../prompt-status";
@@ -200,7 +211,6 @@ import {
 	ASK_SELECTED_ACK_CAPABILITY,
 	type EnsureDaemonResult,
 	ensureTelegramDaemonRunningDetailed,
-	POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY,
 } from "./telegram-daemon";
 
 export type {
@@ -1225,6 +1235,9 @@ export class PresentationArbiter {
 interface SessionRuntime {
 	server: NotificationServer;
 	host: SessionSdkHost;
+	getJoinedPromptCorrelations: (owner: AgentTerminalOwnerContext) => Array<{ commandId: string; turnId: string }>;
+	isPromptRunOwner: (correlation: { commandId: string; turnId: string }, owner: AgentTerminalOwnerContext) => boolean;
+	retireJoinedPromptOwners: () => void;
 	/** Delivers one ring-positioned event envelope to every attached subscriber
 	 *  connection, applying the same capability gate as event replay. */
 	broadcastEventFrame: (event: SdkFrame) => string[];
@@ -2614,6 +2627,12 @@ function sdkControlSurface(
 		error: unknown,
 	) => void | Promise<void> = () => {},
 	onPromptAcceptFailed: (correlation: { commandId: string; turnId: string }) => void = () => {},
+	onPromptDiverted: (correlation: { commandId: string; turnId: string }) => void,
+	onPromptPromoted: (
+		correlation: { commandId: string; turnId: string },
+		promotion: { startsOwnRun?: boolean; removed?: boolean },
+		handle: string | undefined,
+	) => void,
 	acceptGateResolution: () => boolean,
 	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T>,
 	admitPrompt: (clientRef?: string) => void,
@@ -3015,6 +3034,7 @@ function sdkControlSurface(
 			admission.accepted();
 			accepting = false;
 			accepted = true;
+			if (effectiveDeliverAs !== undefined) onPromptDiverted(correlation);
 			// #4743: an accepted run owns a durable terminal publication when it
 			// settles; teardown joins it via this latch (never-accepted preflights
 			// produce no durable write and stay unjoined by design).
@@ -3040,7 +3060,14 @@ function sdkControlSurface(
 					...(effectiveDeliverAs ? { deliverAs: effectiveDeliverAs } : {}),
 					onPreflightAcceptCommit,
 					onPreflightAccepted,
-					...admission.hooks,
+					onQueuedPromoted: promotion => {
+						admission.hooks.onQueuedPromoted(promotion);
+						onPromptPromoted(correlation, promotion, ctx.getActivePromptHandle());
+					},
+					onDispatchDisposition: disposition => {
+						admission.hooks.onDispatchDisposition(disposition);
+						if (!disposition.startsOwnRun) onPromptDiverted(correlation);
+					},
 					preflightSignal: preflightController.signal,
 					...(sdkRunToken ? { sdkRunToken } : {}),
 				}),
@@ -3718,8 +3745,8 @@ function sdkControlSurface(
 				return unavailable("model.cycle", "no session model-cycle seam is installed")();
 			return { changed: (await ctx.cycleModel()) !== undefined };
 		},
-		setThinking: level => {
-			api.setThinkingLevel(level as ThinkingLevel);
+		setThinking: async level => {
+			await api.setThinkingLevelForControl(level as ThinkingLevel, false);
 			return { changed: true };
 		},
 		cycleThinking: () => {
@@ -4244,6 +4271,16 @@ export function shouldAwaitNotificationStartup(event: {
 	return event.type !== "session_switch" || event.transition?.origin !== INTERACTIVE_SELECTOR_RESUME_ORIGIN;
 }
 
+export function boundedCorrelatedAgentEndFrame(frame: Record<string, unknown>): Record<string, unknown> {
+	const finalText = typeof frame.finalText === "string" ? frame.finalText : "";
+	if (finalText.length <= RESPONSE_CEILING_BYTES / 8) return frame;
+	return {
+		...frame,
+		finalText: `${finalText.slice(0, RESPONSE_CEILING_BYTES / 8)}[truncated]`,
+		finalTextTruncated: true,
+	};
+}
+
 export function createNotificationsExtension(
 	api: ExtensionAPI,
 	options: {
@@ -4276,6 +4313,8 @@ export function createNotificationsExtension(
 		 * preflight outside the durable admission path (review thread P2).
 		 */
 		terminalAbortSeams?: {
+			getTerminalRunOwnerForEvent?: (event: object) => AgentTerminalOwnerContext | undefined;
+			getRunOwnerDomain?: (handle: string) => RunCancellationDomain | undefined;
 			getTerminalTurnEpoch: () => number | undefined;
 			cancelPendingPreflightForTerminalAbort: () => void;
 			captureTerminalAbortSteeringSnapshot?: () => void;
@@ -4563,6 +4602,7 @@ export function createNotificationsExtension(
 		if (reason === "session" && requestedRuntime) {
 			requestedRuntime.inboundFenced = true;
 			requestedRuntime.stopping = true;
+			requestedRuntime.retireJoinedPromptOwners();
 			requestedRuntime.abortEphemeralTurns();
 		}
 		if (reason === "session" && requestedRuntime) requestedRuntime.stopSessionNameObserver();
@@ -4831,6 +4871,19 @@ export function createNotificationsExtension(
 			return failLifecycleStartup("failed", "Lifecycle SDK startup requires an agent directory.");
 
 		const pendingInteractive = new Map<string, PendingInteractiveAsk>();
+		const queuedRemovalTerminals = new Map<string, Promise<boolean>>();
+		const joinedPromptOwners = new Map<
+			string,
+			{ correlation: { commandId: string; turnId: string }; owner: AgentTerminalOwnerContext }
+		>();
+		const getJoinedPromptCorrelations = (terminalOwner: AgentTerminalOwnerContext) =>
+			[...joinedPromptOwners.values()]
+				.filter(
+					({ owner }) =>
+						owner.resourceRunId === terminalOwner.resourceRunId && owner.domain === terminalOwner.domain,
+				)
+				.map(({ correlation }) => correlation);
+		const retireJoinedPromptOwners = (): void => joinedPromptOwners.clear();
 		const pendingPromptCorrelations: Array<{ commandId: string; turnId: string }> = [];
 		const pendingPromptCorrelationsBySdkRunToken = new Map<string, { commandId: string; turnId: string }>();
 		const workLease = ctx.getSessionWorkLease?.() ?? createSessionWorkLease();
@@ -5078,6 +5131,8 @@ export function createNotificationsExtension(
 			acknowledged: boolean;
 			connectionId: string;
 			abandoned: boolean;
+			terminalRetry?: Promise<void>;
+			backlogDropLogged?: boolean;
 			failed: boolean;
 			terminal: boolean;
 			retainCorrelation: boolean;
@@ -5090,6 +5145,8 @@ export function createNotificationsExtension(
 			 * up to a hard maximum runtime anchored to acceptance.
 			 */
 			deadlineLease: PromptDeadlineLease;
+			deadlineSuspended?: true;
+			sdkRunToken?: string;
 			deadlineTimer?: Parameters<typeof clearTimeout>[0];
 			/**
 			 * Identity of the in-flight deadline expiry attempt (set synchronously
@@ -5298,10 +5355,12 @@ export function createNotificationsExtension(
 				submission.workLease = undefined;
 			}
 			promptSubmissions.delete(key);
-			// A fatal closure is transport-level, not a committed semantic terminal: the
-			// durable record stays authoritative, so it must never leave a tombstone.
-			if (submission.fatal) return;
 			const [commandId, turnId] = key.split(":", 2);
+			// A fatal closure is transport-level, not a committed semantic terminal: the
+			// durable record stays authoritative, so it must never leave a tombstone
+			// or release images still retained by an unsettled run. Runtime teardown
+			// releases those reservations even if this delivery record expires.
+			if (submission.fatal) return;
 			if (!commandId || !turnId) return;
 			removePendingPromptCorrelation({ commandId, turnId });
 			addTerminalTombstone(key, submission.connectionId);
@@ -5329,6 +5388,289 @@ export function createNotificationsExtension(
 			submission.abandoned = true;
 			submission.bufferedFrames.length = 0;
 		};
+		const isCorrelatedDeltaFrame = (frame: Record<string, unknown>): boolean => {
+			if (frame.type !== "event" || frame.kind !== "message_update") return false;
+			const payload = frame.payload as {
+				event?: { assistantMessageEvent?: { type?: string } };
+			};
+			const type = payload.event?.assistantMessageEvent?.type;
+			return type === "text_delta" || type === "thinking_delta";
+		};
+		const boundedCorrelatedFrames = (frame: Record<string, unknown>): Record<string, unknown>[] | undefined => {
+			if (frame.type === "event" && frame.kind === "message_update") {
+				const payload = frame.payload as {
+					event?: {
+						message?: { role?: string };
+						assistantMessageEvent?: { type?: string; delta?: string };
+					};
+				};
+				const update = payload.event?.assistantMessageEvent;
+				if (update?.type !== "text_delta" && update?.type !== "thinking_delta") return undefined;
+				// ACP consumes deltas, so retain the delta while discarding the replaceable
+				// accumulated message snapshot. Split giant deltas without changing content.
+				const delta = update.delta ?? "";
+				const makeFrame = (chunk: string): Record<string, unknown> => ({
+					...frame,
+					payload: {
+						event_type: "message_update",
+						event: {
+							type: "message_update",
+							message: { role: payload.event?.message?.role ?? "assistant", content: [] },
+							assistantMessageEvent: { type: update.type, delta: chunk },
+						},
+					},
+				});
+				const frames: Record<string, unknown>[] = [];
+				let offset = 0;
+				while (offset < delta.length || (offset === 0 && delta.length === 0)) {
+					let low = 1;
+					let high = delta.length - offset + 1;
+					let bestEnd = 0;
+					while (low < high) {
+						const candidateLength = Math.floor((low + high) / 2);
+						let candidateEnd = offset + candidateLength;
+						if (
+							candidateEnd < delta.length &&
+							delta.charCodeAt(candidateEnd) >= 0xdc00 &&
+							delta.charCodeAt(candidateEnd) <= 0xdfff
+						)
+							candidateEnd += 1;
+						const candidate = JSON.stringify(makeFrame(delta.slice(offset, candidateEnd)));
+						if (Buffer.byteLength(candidate) <= RESPONSE_CEILING_BYTES) {
+							bestEnd = candidateEnd;
+							low = candidateLength + 1;
+						} else {
+							high = candidateLength;
+						}
+					}
+					if (bestEnd === 0) return undefined;
+					frames.push(makeFrame(delta.slice(offset, bestEnd)));
+					offset = bestEnd;
+					if (delta.length === 0) break;
+				}
+				return frames;
+			}
+			if (frame.type === "event" && frame.kind === "message_end") {
+				const payload = frame.payload as {
+					event?: { message?: { role?: string; content?: Array<{ type?: string; text?: string }> } };
+				};
+				const message = payload.event?.message;
+				const textBlocks =
+					message?.content
+						?.filter(
+							(block): block is { type: "text"; text: string } =>
+								block.type === "text" && typeof block.text === "string",
+						)
+						.map(block => block.text) ?? [];
+				const makeMessageEndFrame = (
+					content: Array<{ type: "text"; text: string }>,
+					textTruncated?: true,
+					omittedTextBlocks?: number,
+				): Record<string, unknown> => ({
+					...frame,
+					payload: {
+						event_type: "message_end",
+						event: {
+							type: "message_end",
+							message: {
+								role: message?.role ?? "assistant",
+								content,
+								...(textTruncated ? { textTruncated } : {}),
+								...(omittedTextBlocks ? { omittedTextBlocks } : {}),
+							},
+						},
+					},
+				});
+				const fits = (candidate: Record<string, unknown>): boolean =>
+					Buffer.byteLength(JSON.stringify(candidate)) <= RESPONSE_CEILING_BYTES;
+				const content: Array<{ type: "text"; text: string }> = [];
+				let textTruncated = false;
+				let omittedTextBlocks = 0;
+				for (const [index, textBlock] of textBlocks.entries()) {
+					const wholeBlock = [...content, { type: "text" as const, text: textBlock }];
+					if (fits(makeMessageEndFrame(wholeBlock))) {
+						content.push({ type: "text", text: textBlock });
+						continue;
+					}
+					textTruncated = true;
+					const remainingTextBlocks = textBlocks.length - index;
+					let low = 1;
+					let high = textBlock.length + 1;
+					let bestEnd = 0;
+					while (low < high) {
+						const candidateLength = Math.floor((low + high) / 2);
+						let candidateEnd = candidateLength;
+						if (
+							candidateEnd < textBlock.length &&
+							textBlock.charCodeAt(candidateEnd) >= 0xdc00 &&
+							textBlock.charCodeAt(candidateEnd) <= 0xdfff
+						)
+							candidateEnd += 1;
+						const candidateContent = [
+							...content,
+							...(candidateEnd > 0 ? [{ type: "text" as const, text: textBlock.slice(0, candidateEnd) }] : []),
+						];
+						const candidateOmittedTextBlocks = remainingTextBlocks - (candidateEnd > 0 ? 1 : 0);
+						if (
+							fits(
+								makeMessageEndFrame(
+									candidateContent,
+									true,
+									candidateOmittedTextBlocks > 0 ? candidateOmittedTextBlocks : undefined,
+								),
+							)
+						) {
+							bestEnd = candidateEnd;
+							low = candidateLength + 1;
+						} else high = candidateLength;
+					}
+					if (bestEnd > 0) content.push({ type: "text", text: textBlock.slice(0, bestEnd) });
+					omittedTextBlocks = remainingTextBlocks - (bestEnd > 0 ? 1 : 0);
+					break;
+				}
+				return [
+					makeMessageEndFrame(
+						content,
+						textTruncated ? true : undefined,
+						omittedTextBlocks > 0 ? omittedTextBlocks : undefined,
+					),
+				];
+			}
+			if (frame.type === "agent_end") {
+				return [boundedCorrelatedAgentEndFrame(frame)];
+			}
+			if (frame.type === "agent_failed") {
+				const outcome = frame.outcome as Extract<SdkPromptTerminalOutcome, { kind: "failed" }> | undefined;
+				return [
+					{
+						...frame,
+						error: { code: outcome?.code ?? "prompt_failed", message: "Prompt failure details were truncated." },
+						...(outcome ? { outcome: { ...outcome, message: "Prompt failure details were truncated." } } : {}),
+					},
+				];
+			}
+			return undefined;
+		};
+		const deliverCorrelatedFrame = (submission: PromptSubmission, frame: Record<string, unknown>) => {
+			if (submission.abandoned) return;
+			const activeRuntime = runtime;
+			if (!activeRuntime) return;
+			const fail = (cause: string, frameBytes: number, failedJson = JSON.stringify(frame)) => {
+				// A non-terminal frame only reports progress from a still-running
+				// prompt. Abandon its delivery on failure instead of publishing a
+				// synthetic terminal that could race the real run and make ACP
+				// settle the prompt while provider/tool execution continues.
+				if (frame.type !== "agent_end" && frame.type !== "agent_failed") {
+					if (cause === "writer_backlog_full") {
+						if (!submission.backlogDropLogged) {
+							submission.backlogDropLogged = true;
+							logger.warn(
+								`sdk: correlated non-terminal delivery dropped: cause=${cause} frameBytes=${frameBytes}`,
+							);
+						}
+						return;
+					}
+					logger.warn(`sdk: correlated non-terminal delivery abandoned: cause=${cause} frameBytes=${frameBytes}`);
+					abandonPrompt(submission);
+					return;
+				}
+				if (cause === "writer_backlog_full") {
+					const correlation = { commandId: String(frame.commandId), turnId: String(frame.turnId) };
+					const key = promptSubmissionKey(correlation);
+					submission.terminalRetry = (async () => {
+						const deadline = Date.now() + 3_000;
+						while (Date.now() < deadline) {
+							await Bun.sleep(50);
+							try {
+								activeRuntime.server.sendTo(submission.connectionId, failedJson);
+								return;
+							} catch (retryError) {
+								if (!String(retryError).includes("cause=writer_backlog_full")) break;
+							}
+						}
+						terminalDeliveryFailure(cause, frameBytes);
+					})().finally(() => {
+						submission.terminalRetry = undefined;
+						if (submission.terminal && promptSubmissions.get(key) === submission) {
+							if (!submission.abandoned) submission.phase = "delivered";
+							finalizePrompt(key, correlation);
+						}
+					});
+					return;
+				}
+				terminalDeliveryFailure(cause, frameBytes);
+			};
+			const terminalDeliveryFailure = (cause: string, frameBytes: number) => {
+				const safeCause = isSafePromptFailureCode(cause) ? cause : "unknown";
+				const correlation = { commandId: String(frame.commandId), turnId: String(frame.turnId) };
+				const outcome = failedPromptOutcome({
+					code: "prompt_failed",
+					provenance: "agent_failed",
+					providerCode: safeCause,
+					evidence: {},
+				});
+				try {
+					activeRuntime.server.sendTo(
+						submission.connectionId,
+						JSON.stringify({
+							type: "agent_failed",
+							sessionId: activeRuntime.id,
+							...correlation,
+							error: {
+								code: "delivery_failed",
+								message: "Prompt frame delivery failed.",
+								cause: safeCause,
+								frameBytes,
+							},
+							outcome,
+						}),
+					);
+				} catch (error) {
+					logger.warn(`sdk: correlated delivery failure terminal failed: ${String(error)}`);
+				}
+				abandonPrompt(submission);
+			};
+			const original = JSON.stringify(frame);
+			const originalBytes = Buffer.byteLength(original);
+			let framesToSend = [frame];
+			if (originalBytes > RESPONSE_CEILING_BYTES) {
+				const bounded = boundedCorrelatedFrames(frame);
+				if (!bounded) {
+					if (frame.type === "event" && frame.kind === "message_update" && !isCorrelatedDeltaFrame(frame)) return;
+					fail("oversized_frame", originalBytes);
+					return;
+				}
+				framesToSend = bounded;
+			}
+			for (const frameToSend of framesToSend) {
+				const json = JSON.stringify(frameToSend);
+				if (Buffer.byteLength(json) > RESPONSE_CEILING_BYTES) {
+					fail("oversized_frame", originalBytes);
+					return;
+				}
+				try {
+					activeRuntime.server.sendTo(submission.connectionId, json);
+				} catch (error) {
+					const detail = String(error);
+					if (detail.includes("cause=oversized_frame") && json === original) {
+						const bounded = boundedCorrelatedFrames(frame);
+						if (bounded) {
+							try {
+								for (const retryFrame of bounded)
+									activeRuntime.server.sendTo(submission.connectionId, JSON.stringify(retryFrame));
+								return;
+							} catch (retryError) {
+								logger.warn(`sdk: bounded correlated delivery failed: ${String(retryError)}`);
+							}
+						}
+					}
+					logger.warn(`sdk: correlated delivery failed: ${detail}`);
+					const cause = /cause=([a-z_]+)/.exec(detail)?.[1] ?? "unknown";
+					fail(cause, originalBytes, json);
+					return;
+				}
+			}
+		};
 		const emitPromptLifecycle = (
 			correlation: { commandId: string; turnId: string } | undefined,
 			frame: PromptLifecycleFrame,
@@ -5351,13 +5693,9 @@ export function createNotificationsExtension(
 				submission.bufferedFrames.push(frame);
 				return;
 			}
-			try {
-				runtime.server.sendTo(submission.connectionId, JSON.stringify(frame));
-			} catch (error) {
-				logger.warn(`sdk: correlated lifecycle delivery failed: ${String(error)}`);
-				abandonPrompt(submission);
-			}
+			deliverCorrelatedFrame(submission, frame);
 			if (submission.terminal) {
+				if (submission.terminalRetry) return;
 				submission.phase = "delivered";
 				finalizePrompt(key, correlation);
 			}
@@ -5369,7 +5707,7 @@ export function createNotificationsExtension(
 		 */
 		const armPromptDeadline = (key: string, correlation: { commandId: string; turnId: string }) => {
 			const submission = promptSubmissions.get(key);
-			if (!submission) return;
+			if (!submission || submission.deadlineSuspended) return;
 			const lease = submission.deadlineLease;
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			submission.deadlineTimer = setTimeout(
@@ -5477,29 +5815,36 @@ export function createNotificationsExtension(
 			);
 		};
 		const emitPromptEvent = (event: AgentSessionEvent) => {
-			if (!runtime?.activePromptCorrelation) return;
+			if (!runtime) return;
 			cleanupPromptRecords();
-			const correlation = runtime.activePromptCorrelation;
-			// Renewal is attributed exactly like the correlated delivery below.
-			renewPromptDeadline(correlation, event);
-			noteToolDispatchBoundary(correlation, event);
-			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
-			if (!submission || submission.abandoned) return;
-			const frame = {
-				type: "event",
-				kind: event.type,
-				payload: toAgentWireEventPayload(event),
-				...correlation,
-			};
-			if (!submission.acknowledged) {
-				submission.bufferedFrames.push(frame);
-				return;
-			}
-			try {
-				runtime.server.sendTo(submission.connectionId, JSON.stringify(frame));
-			} catch (error) {
-				logger.warn(`sdk: correlated agent event delivery failed: ${String(error)}`);
-				abandonPrompt(submission);
+			const handle = ctx.getActivePromptHandle();
+			const domain = handle ? terminalAbortSeams?.getRunOwnerDomain?.(handle) : undefined;
+			const correlations = handle && domain ? getJoinedPromptCorrelations({ resourceRunId: handle, domain }) : [];
+			const root = runtime.activePromptCorrelation;
+			if (
+				root &&
+				!correlations.some(
+					correlation => correlation.commandId === root.commandId && correlation.turnId === root.turnId,
+				)
+			)
+				correlations.unshift(root);
+			for (const correlation of correlations) {
+				// Renewal is attributed exactly like the correlated delivery below.
+				renewPromptDeadline(correlation, event);
+				noteToolDispatchBoundary(correlation, event);
+				const submission = promptSubmissions.get(promptSubmissionKey(correlation));
+				if (!submission || submission.abandoned) continue;
+				const frame = {
+					type: "event",
+					kind: event.type,
+					payload: toAgentWireEventPayload(event),
+					...correlation,
+				};
+				if (!submission.acknowledged) {
+					submission.bufferedFrames.push(frame);
+					continue;
+				}
+				deliverCorrelatedFrame(submission, frame);
 			}
 		};
 		/**
@@ -5519,7 +5864,10 @@ export function createNotificationsExtension(
 			submission: PromptSubmission,
 			attempt: { lease: PromptDeadlineLease; generation: number; selfAbortStarted?: true },
 		): DeadlineAttemptStatus => {
-			if (promptSubmissions.get(key) !== submission || submission.deadlineLease !== attempt.lease) return "stale";
+			if (promptSubmissions.get(key) !== submission) return "stale";
+			if (!attempt.selfAbortStarted && (submission.deadlineSuspended || submission.deadlineLease !== attempt.lease))
+				return "superseded";
+			if (submission.deadlineLease !== attempt.lease) return "stale";
 			const lease = submission.deadlineLease;
 			// A deadline expiry attempt must not be superseded by progress that its
 			// OWN abort caused. Terminal fencing aborts the running tool, and the
@@ -5664,15 +6012,13 @@ export function createNotificationsExtension(
 		};
 		const flushPromptLifecycle = (key: string, submission: PromptSubmission) => {
 			for (const frame of submission.bufferedFrames.splice(0)) {
-				try {
-					server.sendTo(submission.connectionId, JSON.stringify(frame));
-				} catch (error) {
-					logger.warn(`sdk: buffered correlated lifecycle delivery failed: ${String(error)}`);
-					abandonPrompt(submission);
-					break;
-				}
+				deliverCorrelatedFrame(submission, frame);
+				if (submission.abandoned) break;
 			}
 			if (submission.terminal) {
+				if (submission.terminalRetry) {
+					return;
+				}
 				submission.phase = "delivered";
 				const [commandId, turnId] = key.split(":", 2);
 				if (commandId && turnId) finalizePrompt(key, { commandId, turnId });
@@ -5730,6 +6076,7 @@ export function createNotificationsExtension(
 					maxMs: resolveSdkPromptMaxRuntimeMs(settings?.get("sdk.promptMaxRuntimeMs")),
 				}),
 				phase: "active",
+				...(sdkRunToken ? { sdkRunToken } : {}),
 				...(workLeaseHandle ? { workLease: workLeaseHandle } : {}),
 				// Bound to the Agent run at `agent_start`; acceptance precedes execution.
 				executionHandle: undefined,
@@ -5835,10 +6182,73 @@ export function createNotificationsExtension(
 			correlation: { commandId: string; turnId: string },
 			handle: string | undefined,
 		) => {
-			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
+			const key = promptSubmissionKey(correlation);
+			const submission = promptSubmissions.get(key);
 			if (submission) {
+				if (submission.deadlineSuspended) {
+					submission.deadlineSuspended = undefined;
+					submission.deadlineLease = createPromptDeadlineLease({
+						now: Date.now(),
+						leaseMs: submission.deadlineLease.leaseMs,
+						maxMs: submission.deadlineLease.maxMs,
+					});
+					armPromptDeadline(key, correlation);
+				}
 				submission.executionHandle = handle;
 				submission.preflightAbort = undefined;
+			}
+		};
+		const onPromptDiverted = (correlation: { commandId: string; turnId: string }) => {
+			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
+			// A follow-up's private token can only be adopted by its exact future run.
+			// Implicit steering has no such future-run authority and must leave pending.
+			if (!submission?.sdkRunToken) removePendingPromptCorrelation(correlation);
+			if (!submission || submission.terminal) return;
+			submission.deadlineSuspended = true;
+			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
+			submission.deadlineTimer = undefined;
+		};
+		const onPromptPromoted = (
+			correlation: { commandId: string; turnId: string },
+			promotion: { startsOwnRun?: boolean; removed?: boolean },
+			handle: string | undefined,
+		) => {
+			const key = promptSubmissionKey(correlation);
+			removePendingPromptCorrelation(correlation);
+			if (promotion.removed) {
+				const completion: { terminalized?: boolean } = {};
+				const removal = terminalizePrompt(
+					correlation,
+					{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+					{},
+					undefined,
+					completion,
+				).then(() => completion.terminalized === true);
+				queuedRemovalTerminals.set(key, removal);
+				trackReconciliationProducer(
+					removal.finally(() => {
+						if (queuedRemovalTerminals.get(key) === removal) queuedRemovalTerminals.delete(key);
+					}),
+				);
+				return;
+			}
+			const submission = promptSubmissions.get(key);
+			if (!submission || submission.terminal) return;
+			submission.deadlineSuspended = undefined;
+			submission.deadlineLease = createPromptDeadlineLease({
+				now: Date.now(),
+				leaseMs: submission.deadlineLease.leaseMs,
+				maxMs: submission.deadlineLease.maxMs,
+			});
+			armPromptDeadline(key, correlation);
+			if (promotion.startsOwnRun === true) {
+				if (submission.sdkRunToken) pendingPromptCorrelationsBySdkRunToken.set(submission.sdkRunToken, correlation);
+				else pendingPromptCorrelations.push(correlation);
+			} else {
+				bindPromptExecutionHandle(correlation, handle);
+				const domain = handle ? terminalAbortSeams?.getRunOwnerDomain?.(handle) : undefined;
+				if (handle && domain)
+					joinedPromptOwners.set(key, { correlation, owner: { resourceRunId: handle, domain } });
 			}
 		};
 		const terminalizePrompt = async (
@@ -5868,6 +6278,7 @@ export function createNotificationsExtension(
 			// the seam must refuse to fence the successor's lineage (review
 			// thread P1).
 			const terminalExpectedEpoch = options.terminal ? terminalAbortSeams?.getTerminalTurnEpoch?.() : undefined;
+			const deadlineAttempt = submission.deadlineAttempt;
 			let winner: SdkPromptTerminalOutcome;
 			try {
 				winner = await kindReconciliation.claimPendingOutcome(
@@ -5891,7 +6302,6 @@ export function createNotificationsExtension(
 			// attempt must then back off — reset to active and reschedule —
 			// instead of fencing and publishing a deadline terminal for a live
 			// prompt. A re-accepted or evicted submission is never touched.
-			const deadlineAttempt = submission.deadlineAttempt;
 			if (deadlineAttempt) {
 				const key = promptSubmissionKey(correlation);
 				const status = deadlineAttemptStatus(key, submission, deadlineAttempt);
@@ -6078,6 +6488,7 @@ export function createNotificationsExtension(
 			}
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			if (!recordPromptTerminal(correlation)) return;
+			joinedPromptOwners.delete(promptSubmissionKey(correlation));
 			if (!runtime) {
 				// The runtime (and with it the positioned ring) is gone, so the
 				// terminal can never be published from this process; expire the
@@ -6259,6 +6670,8 @@ export function createNotificationsExtension(
 			recordPromptAccepted,
 			recordPromptFailure,
 			discardPromptAcceptance,
+			onPromptDiverted,
+			onPromptPromoted,
 			() => runtime?.stopping !== true,
 			trackGateResolution,
 			admitPromptSubmission,
@@ -6311,9 +6724,15 @@ export function createNotificationsExtension(
 							return { aborted: true, disposition: "cancelled" as const };
 						}
 					}
-					await terminalizePrompt({ commandId, turnId }, cancellationOutcome, {
-						fence: hasExecutionHandle || !submission.preflightAbort,
-					});
+					const removal = queuedRemovalTerminals.get(key);
+					if (removal) {
+						if (!(await removal))
+							throw new TypedControlError("busy", "Queued prompt cancellation could not be durably confirmed.");
+					} else {
+						await terminalizePrompt({ commandId, turnId }, cancellationOutcome, {
+							fence: hasExecutionHandle || !submission.preflightAbort,
+						});
+					}
 				}
 				return { aborted: true, disposition: "cancelled" as const };
 			},
@@ -6819,6 +7238,20 @@ export function createNotificationsExtension(
 							);
 							return already_terminalResult;
 						}
+						if (currentSubmission.preflightAbort) {
+							try {
+								await currentSubmission.preflightAbort();
+							} catch (error) {
+								logger.warn(`sdk: accepted queued cancellation failed: ${String(error)}`);
+								failPromptClosed(
+									{ commandId, turnId },
+									currentSubmission,
+									"terminal_uncertain",
+									"Accepted queued prompt could not be settled before cancellation.",
+								);
+								return { ok: false as const, reason: "worker_unsettled" as const };
+							}
+						}
 						if (preflightCancel?.hasPending()) {
 							preflightCancel.cancel();
 							// The seam cancels the SESSION-WIDE preflight controller:
@@ -6827,11 +7260,30 @@ export function createNotificationsExtension(
 							if (noOtherConnectionPreflights?.() !== false)
 								terminalAbortSeams?.cancelPendingPreflightForTerminalAbort?.();
 						}
-						await terminalizePrompt(
-							{ commandId, turnId },
-							{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
-							{},
-						);
+						const removal = queuedRemovalTerminals.get(promptSubmissionKey({ commandId, turnId }));
+						const completion: { terminalized?: boolean } = {};
+						if (removal) completion.terminalized = await removal;
+						else
+							await terminalizePrompt(
+								{ commandId, turnId },
+								{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+								{ fence: Boolean(currentSubmission.executionHandle) },
+								undefined,
+								completion,
+							);
+						const durable = kindReconciliation.lookupResult(currentSubmission.reconciliationKind, {
+							commandId,
+							turnId,
+						});
+						if (
+							completion.terminalized !== true &&
+							(durable.terminalAt === undefined ||
+								(durable.status !== "terminal_ok" && durable.status !== "failed"))
+						) {
+							// The reserved marker remains uncertain; never commit deterministic no-effect
+							// authority while the accepted submission still lacks a durable terminal.
+							return { ok: false as const, reason: "worker_unsettled" as const };
+						}
 						// No prompt won the race: finalize the reserved row so a later
 						// same-key retry replays this deterministic no_active_turn result
 						// instead of reservation uncertainty (review thread P2).
@@ -7705,6 +8157,12 @@ export function createNotificationsExtension(
 		runtime = {
 			server,
 			host,
+			getJoinedPromptCorrelations,
+			isPromptRunOwner: (correlation, owner) => {
+				const handle = promptSubmissions.get(promptSubmissionKey(correlation))?.executionHandle;
+				return handle === owner.resourceRunId && terminalAbortSeams?.getRunOwnerDomain?.(handle) === owner.domain;
+			},
+			retireJoinedPromptOwners,
 			broadcastEventFrame,
 			broadcastEventFrameWithReceipts,
 			revisions,
@@ -9588,7 +10046,10 @@ export function createNotificationsExtension(
 		if (!rt) return;
 		const correlation = rt.activePromptCorrelation;
 		if (!correlation) return;
-		const error = sanitizePromptFailure(event.error);
+		// The publication projection: the same bounded code/message plus the
+		// validated optional diagnostic the adapter attached. The frame is what a
+		// client observes, so a diagnostic dropped here is a diagnostic nobody sees.
+		const error = publishedPromptFailure(event.error);
 		rt.emitPromptLifecycle(correlation, {
 			type: "agent_failed",
 			sessionId: id,
@@ -9605,13 +10066,25 @@ export function createNotificationsExtension(
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (!rt) return;
-		void rt.host
-			.reportActivity("idle")
-			.catch(error => logger.warn(`notifications: idle activity checkpoint failed: ${String(error)}`));
-		// Clear the streaming flag for SDK consumers even when notifications are off.
-		rt.busy = false;
-		const correlation = rt.activePromptCorrelation;
-		if (correlation) {
+		// The Agent's terminal owner is independent of delivery correlation. Never
+		// borrow a successor's run handle to settle a predecessor's SDK prompts.
+		const terminalOwner = terminalAbortSeams?.getTerminalRunOwnerForEvent?.(event);
+		const rootCorrelation = rt.activePromptCorrelation;
+		const correlations = terminalOwner ? rt.getJoinedPromptCorrelations(terminalOwner) : [];
+		if (
+			rootCorrelation &&
+			(!terminalOwner || rt.isPromptRunOwner(rootCorrelation, terminalOwner)) &&
+			!correlations.some(
+				correlation =>
+					correlation.commandId === rootCorrelation.commandId && correlation.turnId === rootCorrelation.turnId,
+			)
+		)
+			correlations.unshift(rootCorrelation);
+		for (const correlation of correlations) {
+			// This attributed agent_end is an execution boundary even when the
+			// subsequent durable terminal claim fails. A fatal transport closure
+			// clears attribution, so an unrelated later agent_end cannot settle a
+			// predecessor's prompt correlation.
 			const assistants = (Array.isArray(event.messages) ? [...event.messages].reverse() : []).filter(
 				message => message && typeof message === "object" && (message as { role?: unknown }).role === "assistant",
 			) as Array<{ stopReason?: unknown; errorKind?: unknown; errorCode?: unknown }>;
@@ -9631,10 +10104,10 @@ export function createNotificationsExtension(
 			else if (finalAssistant?.errorKind === "provider_safety_stop")
 				outcome = { kind: "stopped", reason: "refusal", provenance: "agent" };
 			// A missing/normal final assistant with a non-failing loop stop reason is a
-			// normal turn end; only explicit error/aborted assistants or non-completed
-			// loop stop reasons are failures. Text is never parsed.
+			// normal turn end; only explicit error/aborted assistants or other
+			// non-completed loop stop reasons are failures. Text is never parsed.
 			else if (
-				(event.stopReason === undefined || event.stopReason === "completed") &&
+				(event.stopReason === undefined || event.stopReason === "completed" || event.stopReason === "paused") &&
 				finalAssistant?.stopReason !== "error" &&
 				finalAssistant?.stopReason !== "aborted"
 			)
@@ -9649,6 +10122,13 @@ export function createNotificationsExtension(
 					provenance: "agent_failed",
 					...(providerCode !== undefined ? { providerCode } : {}),
 					evidence: {},
+					// The terminal assistant carries the adapter's already validated DTO
+					// alongside its bounded classifier; revalidation in failedPromptOutcome
+					// drops anything that is absent, malformed or forged. Message text is
+					// still never parsed.
+					...providerDiagnosticField(
+						(terminalAssistant as { providerDiagnostic?: unknown } | undefined)?.providerDiagnostic,
+					),
 				});
 			}
 			const successAssistant = assistants.find(
@@ -9692,11 +10172,24 @@ export function createNotificationsExtension(
 						}
 					: {}),
 			});
-		} else {
-			rt.emitPromptLifecycle(undefined, { type: "agent_end", sessionId: id });
 		}
+		if (correlations.length === 0) rt.emitPromptLifecycle(undefined, { type: "agent_end", sessionId: id });
+		if (
+			rootCorrelation &&
+			terminalOwner &&
+			!rt.isPromptRunOwner(rootCorrelation, terminalOwner) &&
+			!correlations.some(
+				correlation =>
+					correlation.commandId === rootCorrelation.commandId && correlation.turnId === rootCorrelation.turnId,
+			)
+		)
+			return;
+		rt.busy = false;
+		void rt.host
+			.reportActivity("idle")
+			.catch(error => logger.warn(`notifications: idle activity checkpoint failed: ${String(error)}`));
 		finishAgentWork(rt, event.stopReason === "paused");
-		rt.activePromptCorrelation = undefined;
+		if (rt.activePromptCorrelation === rootCorrelation) rt.activePromptCorrelation = undefined;
 		terminalizeInFlightTools(rt, id, event.stopReason === "cancelled" ? "cancelled" : "failed");
 		try {
 			pushSessionFrame(rt, { type: "activity", sessionId: id, state: "idle" });

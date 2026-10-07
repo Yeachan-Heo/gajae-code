@@ -149,6 +149,11 @@ operation reference used for later reconciliation.
   terminal state or the wait window (`--timeout-ms`, default 30s) elapses.
   `send --wait` never cancels a running turn; a window that elapses before a
   terminal state is reported as `wait_timeout` with the last observed status.
+- `send` only starts a new turn. While the session is running a turn the host
+  refuses `turn.prompt` before admission, and the CLI reports error code `busy`
+  with `outcomeCertainty: "not-applied"`. To correct the running turn use
+  `raw control <sessionId> --op turn.steer --json-input '{"text":"..."}'`;
+  otherwise wait for the session to become idle and send again.
 
 - `--text` and the JSON input sources (`--json-input`,
   `--json-input-file` — which must be a `0600` regular file —
@@ -261,6 +266,10 @@ operation and returns the broker/host response:
 
 - `raw control <sessionId> --op <operation>` — one control operation with
   `--json-input*`; `--confirm` confirms destructive control operations.
+  Turn control ids are `turn.prompt`, `turn.steer` (`{"text":...}`),
+  `turn.follow_up`, `turn.abort` and `turn.abort_and_prompt`. An unknown id is
+  a usage error (exit `2`, diagnostic `sdk_unknown_operation`) and is never
+  dispatched.
 - `raw query <sessionId> --query <operation>` — one query; `--cursor` passes a
   continuation cursor.
 - `raw global --op <operation>` — one broker global. Lifecycle globals
@@ -376,6 +385,10 @@ and stacks are not public error evidence. Do not infer non-execution from a
 nonzero exit or timeout: `wait_timeout` after acceptance means applied work,
 whereas `uncertain_after_send` means the outcome is unknown. Preserve session,
 operation, idempotency, claim, command and turn references when supplied.
+A `busy` refusal from `send` is definite: the prompt was never admitted, so
+there is no operation record to reconcile. A `session list` whose scope needs a
+Git repository but runs outside one is a usage error with diagnostic
+`sdk_scope_requires_repository`.
 
 Error guidance performs no additional probes, status calls, retries, restarts or
 kills. Execute an appropriate explicit observation only when the task warrants
@@ -460,6 +473,60 @@ continuation that supplies a different scope or anchor fails with
 
 Rows are probed only after scope filtering, through broker/router-owned
 credential-free attachments, yielding `reachable`, `unreachable`, or `stale`.
+
+## Read-only broker observation (`gjc sdk diagnostics broker`)
+
+`gjc sdk diagnostics broker [--agent-dir <dir>] [--expected-generation <id>] [--timeout-ms <ms>] [--json]`
+observes an already running broker publication. Unlike every other broker
+command on this page it never calls `ensureBroker`: it cannot start, ensure,
+retire, restart or recover a broker, cannot spawn a host, and writes no error
+evidence — not even for malformed input. It answers only from an already-owned
+healthy retained publication; a broker that owns no publication reports typed
+unavailability instead of acquiring the authority to reply.
+
+Selection is exact. Without `--agent-dir` no alternative root is scanned, and a
+replacement publication observed mid-request fails closed rather than
+reconnecting. A second observation is a new explicit invocation, never an
+automatic retry.
+
+`--timeout-ms` (1..10000, default 2000) is one absolute budget for the whole
+observation — the native lease, connect, authentication and the final identity
+recheck all draw from it, and expiry outranks a later refusal. It is a **work
+budget, not a guaranteed wall-clock return**: the unchanged SDK client close
+grace can extend settlement past the budget, and a synchronous kernel read
+already in flight is not forcibly cancelled. Expect the observation to stop
+doing new work at the deadline, not to return at exactly that instant.
+
+The result is `schema: gjc.broker-observation`, `version: 1`, an `observedAt`
+client timestamp, and exactly one of:
+
+- `broker`: `generation` (the broker's publication-incarnation id, fixed at its
+  startup — not the endpoint generation and not the package version),
+  `build.packageVersion`, `build.buildId` (startup-captured trusted metadata, or
+  `null`), and `diagnosticProtocol: 1`.
+- `unavailable`: `reason` plus a fixed message keyed by that reason. The reasons
+  are exactly `absent`, `stale`, `incompatible`, `authentication_failed`,
+  `unsupported`, `generation_mismatch`, `transport_unavailable`, `timeout`,
+  `invalid_response` and `unsafe_discovery`. Messages are literals, never
+  exception text.
+
+Malformed input is **not** an unavailable reason. Bad argv is a usage error: the
+CLI prints the fixed usage block and exits `2` without observing anything, and
+the SDK facade rejects the same inputs by throwing a typed options error to the
+caller before any observation begins. `invalid_arguments` is that caller-error
+surface, not a value the result DTO can carry.
+
+Exit codes are `0` for an observed broker, `1` for typed unavailability, and `2`
+for malformed argv. All output stays within 8192 UTF-8 bytes and identifying
+fields are never truncated into misleading values. A broker too old to publish a
+generation and diagnostic protocol is `unsupported`; compatibility is never
+synthesized. The document carries no pid, path, URL, port, token, argv or
+environment value.
+
+Observation qualifies on darwin arm64 with Bun 1.4.0 on a local
+ownership-enforcing APFS volume, and activates only the fixed package or cached
+native artifact — a missing or mismatched artifact is `unsupported`, never
+extracted or repaired. It is observation, not signed supply-chain attestation.
 
 ## Local-only spawn (`gjc sdk spawn`)
 

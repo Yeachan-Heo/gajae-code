@@ -69,6 +69,7 @@ const QUERY_BINDINGS: Readonly<Record<string, string | undefined>> = {
 	"config.list/get": "getConfigItems",
 	"session.branch_candidates": "getBranchCandidates",
 	"extensions.list": "getExtensions",
+	"session.progress": "getProjectProgress",
 };
 
 export interface SdkSurfacePolicy {

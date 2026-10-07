@@ -11,7 +11,9 @@ import {
 	type ImageContent,
 	type Message,
 	type Model,
+	type ProviderDiagnostic,
 	type ProviderSessionState,
+	readProviderDiagnostic,
 	type ServiceTier,
 	type SimpleStreamOptions,
 	streamSimple,
@@ -25,7 +27,7 @@ import {
 	CURSOR_COMPOSER_BASH_POLICY_RECOVERY_PROMPT,
 	isCurrentComposerBashPolicyBlockedError,
 } from "@gajae-code/ai/providers/composer-discipline";
-import { extractHttpStatusFromError } from "@gajae-code/utils";
+import { extractHttpStatusFromError, logger, redactCrashSecrets } from "@gajae-code/utils";
 import { agentLoop, agentLoopContinue, managedLocalErrorDiagnostic } from "./agent-loop";
 import type { AppendOnlyContextManager } from "./append-only-context";
 import type { AttemptRunHandle, AttemptScope } from "./attempt-scope";
@@ -94,7 +96,10 @@ const PROVIDER_ACCEPTABLE_FAILURE_CODES = new Set([
 	"execution",
 ]);
 
-function sanitizeAgentFailure(error: unknown, runtimeClassifiedCode?: string): { code: string; message: string } {
+function sanitizeAgentFailure(
+	error: unknown,
+	runtimeClassifiedCode?: string,
+): { code: string; message: string; providerDiagnostic?: ProviderDiagnostic } {
 	let code = "agent_failed";
 	try {
 		if (runtimeClassifiedCode !== undefined) {
@@ -114,7 +119,14 @@ function sanitizeAgentFailure(error: unknown, runtimeClassifiedCode?: string): {
 	} catch {
 		// Untrusted provider errors may expose throwing accessors.
 	}
-	return { code, message: "Agent run failed." };
+	// Provenance is the adapter's private carrier, never a property the error
+	// declares about itself: a foreign error cannot label its own failure family.
+	const providerDiagnostic = readProviderDiagnostic(error);
+	return {
+		code,
+		message: "Agent run failed.",
+		...(providerDiagnostic === undefined ? {} : { providerDiagnostic }),
+	};
 }
 
 /** Only runtime-authenticated built-in constructors may contribute a name. */
@@ -150,6 +162,30 @@ function safeErrorStatus(error: unknown): number | undefined {
 		);
 	} catch {
 		return undefined;
+	}
+}
+
+/**
+ * The user-facing failure is deliberately generic, so the underlying cause is
+ * otherwise lost. Record it in the local debug log with credentials redacted
+ * and the text bounded; this never reaches the transcript or SDK clients.
+ */
+function describeRunFailureForLog(error: unknown): { cause: string; stack?: string } {
+	try {
+		const raw = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+		const chain: string[] = [raw];
+		let cause = error instanceof Error ? error.cause : undefined;
+		for (let depth = 0; cause !== undefined && depth < 3; depth++) {
+			chain.push(`caused by ${cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause)}`);
+			cause = cause instanceof Error ? cause.cause : undefined;
+		}
+		const stack = error instanceof Error ? error.stack?.split("\n").slice(1, 9).join("\n") : undefined;
+		return {
+			cause: redactCrashSecrets(chain.join(" | ")).slice(0, 2000),
+			...(stack ? { stack: redactCrashSecrets(stack) } : {}),
+		};
+	} catch {
+		return { cause: "<unreadable error>" };
 	}
 }
 
@@ -2330,6 +2366,15 @@ export class Agent {
 				: (managedLocalErrorDiagnostic(err)?.errorKind ?? providerCode);
 			const sanitized = sanitizeAgentFailure(err, runtimeFailureCode);
 			const errorName = safeErrorName(err);
+			if (!abortController.signal.aborted) {
+				logger.warn("Agent run failed", {
+					provider: model.provider,
+					model: model.id,
+					code: sanitized.code,
+					status: safeErrorStatus(err),
+					...describeRunFailureForLog(err),
+				});
+			}
 
 			const errorMsg: AgentMessage = {
 				role: "assistant",
@@ -2350,6 +2395,7 @@ export class Agent {
 				errorCode: sanitized.code,
 				...(errorName ? { errorName } : {}),
 				errorStatus: safeErrorStatus(err),
+				...(sanitized.providerDiagnostic === undefined ? {} : { providerDiagnostic: sanitized.providerDiagnostic }),
 				// Local-diagnostic authority (`errorKind` + structured
 				// `bufferOverflow`) comes from ONE identity check: a foreign error
 				// that self-declares a local kind gets neither field, so the parent
@@ -2362,15 +2408,15 @@ export class Agent {
 			// Store the sanitized message only: the raw provider error may carry request
 			// bodies, credentials, or tokens (exact-head review P1).
 			this.#state.error = sanitizeAgentFailure(err).message;
-			this.#emit({
-				type: "agent_failed",
-				// Runtime-authenticated classifiers only: abort comes from the
-				// signal, and a local staging failure comes from the identity-
-				// checked managedLocalErrorDiagnostic — a foreign error that
-				// self-declares a local kind still maps to agent_failed.
-				error: sanitizeAgentFailure(err, runtimeFailureCode),
-				scope: handle.scope,
-			});
+			if (!abortController.signal.aborted) {
+				this.#emit({
+					type: "agent_failed",
+					// Only the identity-checked local staging diagnostic may assert a
+					// local failure kind; a foreign self-declaration stays agent_failed.
+					error: sanitizeAgentFailure(err, runtimeFailureCode),
+					scope: handle.scope,
+				});
+			}
 			this.requestRunTerminal(managedLogicalRunOwner ?? runId, {
 				stopReason: abortController.signal.aborted ? "cancelled" : "error",
 				messages: [errorMsg],

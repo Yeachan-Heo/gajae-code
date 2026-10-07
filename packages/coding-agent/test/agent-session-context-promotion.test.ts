@@ -203,6 +203,65 @@ describe("AgentSession context promotion", () => {
 		expect(closeSpy).toHaveBeenCalledTimes(1);
 	});
 
+	it("preserves larger-model headroom after promotion past the default 300K threshold", async () => {
+		const sparkModel = modelRegistry.find("openai-codex", "gpt-5.3-codex-spark");
+		const codexModel = modelRegistry.find("openai-codex", "gpt-5.5");
+		if (!sparkModel || !codexModel) throw new Error("Expected codex spark and codex models to exist");
+		const sourceModel: Model = {
+			...sparkModel,
+			contextWindow: 1_000_000,
+			contextPromotionTarget: `${codexModel.provider}/${codexModel.id}`,
+		};
+		const targetModel: Model = { ...codexModel, contextWindow: 1_050_000 };
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([sourceModel, targetModel]);
+		vi.spyOn(modelRegistry, "getApiKey").mockResolvedValue("test-key");
+
+		const agent = new Agent({
+			initialState: { model: sourceModel, systemPrompt: ["Test"], tools: [], messages: [] },
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "contextPromotion.enabled": true }),
+			modelRegistry,
+		});
+		vi.spyOn(agent, "continue").mockResolvedValue();
+		const compactionStarts: AgentSessionEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_start") compactionStarts.push(event);
+		});
+
+		const contextTokens = 350_001;
+		const promotedMessage: AssistantMessage = {
+			...createAssistantMessage(sourceModel),
+			usage: {
+				input: contextTokens,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: contextTokens,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+		};
+		session.agent.emitExternalEvent({ type: "message_end", message: promotedMessage });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [promotedMessage] });
+		await waitFor(() => session.model?.id === targetModel.id);
+		await session.waitForIdle();
+
+		expect(session.model?.id).toBe(targetModel.id);
+		expect(session.getAutoCompactionThresholdTokens(contextTokens)).toBe(892_500);
+
+		const retryMessage: AssistantMessage = {
+			...createAssistantMessage(targetModel),
+			usage: promotedMessage.usage,
+		};
+		session.agent.emitExternalEvent({ type: "message_end", message: retryMessage });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [retryMessage] });
+		await session.waitForIdle();
+
+		expect(compactionStarts).toHaveLength(0);
+	});
+
 	it("keeps an untyped zero-token proxy empty stop on the promotion path", async () => {
 		const sparkModel = modelRegistry.find("openai-codex", "gpt-5.3-codex-spark");
 		const codexModel = modelRegistry.find("openai-codex", "gpt-5.5");

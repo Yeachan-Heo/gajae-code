@@ -199,7 +199,9 @@ describe("writeConversationDump", () => {
 		await sourceSession.ensureOnDisk();
 		const artifactId = await sourceSession.saveArtifact("artifact contents", "read");
 		await sourceSession.flush();
-		await sourceSession.close();
+		// Artifact access is fenced once the manager starts closing, so capture the
+		// dump inputs first and close the source session afterwards — the runner
+		// disposes its client only after snapshotting the same fields.
 
 		const sourceSessionFile = sourceSession.getSessionFile();
 		if (!sourceSessionFile || !artifactId) {
@@ -209,6 +211,7 @@ describe("writeConversationDump", () => {
 		if (!sourceArtifactPath) {
 			throw new Error("Test fixture failed to resolve source artifact path");
 		}
+		await sourceSession.close();
 
 		const dumpPath = await writeConversationDump({
 			dumpDir: dumpRoot.absolute(),

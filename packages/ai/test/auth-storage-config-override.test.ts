@@ -19,6 +19,7 @@ describe("AuthStorage config-override apiKey", () => {
 		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-ai-auth-config-override-"));
 		store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
 		authStorage = new AuthStorage(store);
+		authStorage.setUsageProbeMode("cache-only");
 	});
 
 	afterEach(async () => {
@@ -177,6 +178,19 @@ describe("AuthStorage config-override apiKey", () => {
 		});
 	});
 
+	test("hasLiteralConfigApiKey distinguishes a literal key from an env-sourced one per owner", () => {
+		if (!authStorage) throw new Error("test setup failed");
+		const owner = {};
+		const otherOwner = {};
+		authStorage.setConfigApiKey("anthropic", "env-key", { envSourced: true, owner });
+		expect(authStorage.hasConfigApiKey("anthropic", owner)).toBe(true);
+		expect(authStorage.hasLiteralConfigApiKey("anthropic", owner)).toBe(false);
+
+		authStorage.setConfigApiKey("anthropic", "literal-key", { owner });
+		expect(authStorage.hasLiteralConfigApiKey("anthropic", owner)).toBe(true);
+		expect(authStorage.hasLiteralConfigApiKey("anthropic", otherOwner)).toBe(false);
+	});
+
 	test("describeCredentialSource reports the stored credential that shadows an env-sourced override", async () => {
 		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
 			if (!authStorage) throw new Error("test setup failed");
@@ -218,6 +232,183 @@ describe("AuthStorage config-override apiKey", () => {
 
 			// Unowned callers continue to observe the latest process-wide registration.
 			expect(await authStorage.getApiKey("anthropic")).toBe("second-key");
+		});
+	});
+
+	test("owned fallback lookup is strict, copied by forks, and protected from stale disposers", async () => {
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			if (!authStorage) throw new Error("test setup failed");
+			const ownerA = {};
+			const ownerB = {};
+			const ownerWithoutFallback = {};
+			const removeGlobal = authStorage.setFallbackResolver(() => "global-fallback");
+			const removeA1 = authStorage.setFallbackResolver(() => "owner-a-v1", ownerA);
+			const forkA = authStorage.forkConfigOwner(ownerA);
+			const removeA2 = authStorage.setFallbackResolver(() => "owner-a-v2", ownerA);
+			removeA1();
+			const removeB1 = authStorage.setFallbackResolver(() => "owner-b-v1", ownerB);
+			const removeB2 = authStorage.setFallbackResolver(() => "owner-b-v2", ownerB);
+			removeB1();
+
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: ownerA })).toBe("owner-a-v2");
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: forkA })).toBe("owner-a-v1");
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: ownerB })).toBe("owner-b-v2");
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: ownerWithoutFallback })).toBeUndefined();
+
+			removeA2();
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: ownerA })).toBeUndefined();
+			removeGlobal();
+			removeB2();
+			authStorage.releaseConfigOwner(forkA);
+		});
+	});
+
+	test("forkConfigOwner captures config provenance while shared credential authorities remain live", async () => {
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			if (!authStorage) throw new Error("test setup failed");
+			const sourceOwner = {};
+			const siblingOwner = {};
+			authStorage.setConfigApiKey("anthropic", "source-env-key", { owner: sourceOwner, envSourced: true });
+			const forkOwner = authStorage.forkConfigOwner(sourceOwner);
+
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: forkOwner })).toBe("source-env-key");
+			expect(authStorage.hasConfigApiKey("anthropic", forkOwner)).toBe(true);
+			expect(authStorage.hasLiteralConfigApiKey("anthropic", forkOwner)).toBe(false);
+
+			authStorage.setConfigApiKey("anthropic", "sibling-key", { owner: siblingOwner });
+			authStorage.setConfigApiKey("anthropic", "source-updated-key", { owner: sourceOwner });
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: forkOwner })).toBe("source-env-key");
+			authStorage.clearConfigApiKeys(sourceOwner);
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: forkOwner })).toBe("source-env-key");
+
+			await authStorage.set("anthropic", [{ type: "api_key", key: "stored-login-key-v1" }]);
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: forkOwner })).toBe("stored-login-key-v1");
+			await authStorage.set("anthropic", [{ type: "api_key", key: "stored-login-key-v2" }]);
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: forkOwner })).toBe("stored-login-key-v2");
+
+			authStorage.setRuntimeApiKey("anthropic", "runtime-key");
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: forkOwner })).toBe("runtime-key");
+			authStorage.removeRuntimeApiKey("anthropic");
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: forkOwner })).toBe("stored-login-key-v2");
+		});
+	});
+
+	test("forkConfigOwner capture and release preserve parent generations and unowned selection", async () => {
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			if (!authStorage) throw new Error("test setup failed");
+			const capturedStorage = authStorage;
+			await seedOAuth("anthropic", "shared-oauth");
+			authStorage.setConfigApiKey("anthropic", "unowned-key");
+			const sourceOwner = {};
+			authStorage.setConfigApiKey("anthropic", "source-key", { owner: sourceOwner });
+			const globalKey = await authStorage.getApiKey("anthropic");
+			const globalGeneration = authStorage.getGeneration();
+			const providerGeneration = authStorage.getProviderConfigurationGeneration("anthropic");
+			const sourceEvidence = authStorage.getProviderEvidenceGeneration("anthropic", undefined, sourceOwner);
+
+			const forkOwner = authStorage.forkConfigOwner(sourceOwner);
+			const unownedFallbackFork = authStorage.forkConfigOwner({});
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: unownedFallbackFork })).toBe(
+				"unowned-key",
+			);
+			expect(await authStorage.getApiKey("anthropic")).toBe(globalKey);
+			expect(authStorage.getGeneration()).toBe(globalGeneration);
+			expect(authStorage.getProviderConfigurationGeneration("anthropic")).toBe(providerGeneration);
+			expect(authStorage.getProviderEvidenceGeneration("anthropic", undefined, sourceOwner)).toBe(sourceEvidence);
+
+			authStorage.clearConfigApiKeys(forkOwner);
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: forkOwner })).toBe("shared-oauth");
+			const localGeneration = authStorage.getProviderEvidenceGeneration("anthropic", undefined, forkOwner);
+			authStorage.setConfigApiKey("anthropic", "rebuilt-source-key", { owner: forkOwner });
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: forkOwner })).toBe("rebuilt-source-key");
+			const evidenceAfterWrite = authStorage.getProviderEvidenceGeneration("anthropic", undefined, forkOwner);
+			expect(evidenceAfterWrite).not.toBe(localGeneration);
+			authStorage.clearConfigApiKeys(forkOwner);
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: forkOwner })).toBe("shared-oauth");
+			expect(authStorage.getProviderEvidenceGeneration("anthropic", undefined, forkOwner)).not.toBe(
+				evidenceAfterWrite,
+			);
+			authStorage.setConfigApiKey("anthropic", "rebuilt-again-key", { owner: forkOwner });
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: forkOwner })).toBe("rebuilt-again-key");
+			expect(await authStorage.getApiKey("anthropic")).toBe(globalKey);
+			authStorage.releaseConfigOwner(unownedFallbackFork);
+			expect(await authStorage.getApiKey("anthropic")).toBe(globalKey);
+			expect(authStorage.getGeneration()).toBe(globalGeneration);
+			expect(authStorage.getProviderConfigurationGeneration("anthropic")).toBe(providerGeneration);
+			expect(authStorage.getProviderEvidenceGeneration("anthropic", undefined, sourceOwner)).toBe(sourceEvidence);
+
+			const siblingOwner = {};
+			authStorage.setConfigApiKey("anthropic", "sibling-b-key", { owner: siblingOwner });
+			const generationBeforeRelease = authStorage.getGeneration();
+			const providerGenerationBeforeRelease = authStorage.getProviderConfigurationGeneration("anthropic");
+			authStorage.releaseConfigOwner(forkOwner);
+			authStorage.releaseConfigOwner(forkOwner);
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: forkOwner })).toBe("shared-oauth");
+			expect(authStorage.hasConfigApiKey("anthropic", forkOwner)).toBe(false);
+			expect(() => capturedStorage.setConfigApiKey("anthropic", "released-write", { owner: forkOwner })).toThrow(
+				"released config owner",
+			);
+			expect(authStorage.getGeneration()).toBe(generationBeforeRelease);
+			expect(authStorage.getProviderConfigurationGeneration("anthropic")).toBe(providerGenerationBeforeRelease);
+			expect(() => capturedStorage.releaseConfigOwner(siblingOwner)).toThrow("not created by forkConfigOwner");
+		});
+	});
+
+	test("forkConfigOwner isolates absent baselines and writes while shared selector masks remain active", async () => {
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			if (!authStorage) throw new Error("test setup failed");
+			await authStorage.set("anthropic", [
+				{
+					type: "oauth",
+					accountId: "account-first",
+					email: "first@example.com",
+					access: "first-access",
+					refresh: "first-refresh",
+					expires: Date.now() + 60 * 60_000,
+				},
+				{
+					type: "oauth",
+					accountId: "account-second",
+					email: "second@example.com",
+					access: "second-access",
+					refresh: "second-refresh",
+					expires: Date.now() + 60 * 60_000,
+				},
+			]);
+			const forkOwner = authStorage.forkConfigOwner({});
+			const storedRows = authStorage.listCredentialInventory("anthropic");
+			const secondRow = storedRows[1];
+			if (!secondRow) throw new Error("Expected two stored OAuth rows");
+			authStorage.acquireCredentialScope("fork-auto");
+			const autoAccess = await authStorage.getApiKey("anthropic", "fork-auto", { owner: forkOwner });
+			const autoCredential = authStorage.getOAuthCredential("anthropic", "fork-auto", { owner: forkOwner })?.access;
+			const pinnedEmail = autoCredential === "first-access" ? "second@example.com" : "first@example.com";
+			authStorage.setRuntimeCredentialSelector("anthropic", { kind: "email", value: pinnedEmail });
+			expect(authStorage.getOAuthCredential("anthropic")?.access).not.toBe(autoCredential);
+			authStorage.setSessionCredentialAuto("anthropic", "fork-auto");
+			expect(authStorage.resolveEffectiveCredentialSelector("anthropic", "fork-auto")).toBeUndefined();
+			const globalGeneration = authStorage.getGeneration();
+			const providerGeneration = authStorage.getProviderConfigurationGeneration("anthropic");
+			authStorage.setConfigApiKey("anthropic", "sibling-key", { owner: {} });
+			expect(await authStorage.getApiKey("anthropic", "fork-auto", { owner: forkOwner })).toBe(autoAccess);
+
+			const forkEvidence = authStorage.getProviderEvidenceGeneration("anthropic", undefined, forkOwner);
+			authStorage.setConfigApiKey("anthropic", "fork-key", { owner: forkOwner });
+			expect(await authStorage.getApiKey("anthropic", "fork-auto", { owner: forkOwner })).toBe("fork-key");
+			await expect(authStorage.getApiKey("anthropic")).rejects.toThrow("config API key override is active");
+			expect(authStorage.getGeneration()).toBe(globalGeneration + 1);
+			expect(authStorage.getProviderConfigurationGeneration("anthropic")).toBe(providerGeneration + 1);
+			expect(authStorage.getProviderEvidenceGeneration("anthropic", undefined, forkOwner)).not.toBe(forkEvidence);
+
+			authStorage.removeConfigApiKey("anthropic", forkOwner);
+			expect(await authStorage.getApiKey("anthropic", "fork-auto", { owner: forkOwner })).toBe(autoAccess);
+			const generationAfterForkWrite = authStorage.getGeneration();
+			authStorage.clearConfigApiKeys(forkOwner);
+			expect(await authStorage.getApiKey("anthropic", "fork-auto", { owner: forkOwner })).toBe(autoAccess);
+			expect(authStorage.getOAuthCredential("anthropic", "fork-auto", { owner: forkOwner })?.access).toBe(
+				autoCredential,
+			);
+			expect(authStorage.getGeneration()).toBe(generationAfterForkWrite);
 		});
 	});
 

@@ -34,6 +34,20 @@ export class ModelBindingsApplier {
 		};
 	}
 
+	/** Fork configured bindings and their applied lifecycle onto independent settings. */
+	snapshotForSettings(targetSettings: Settings): ModelBindingsApplier {
+		const snapshot = new ModelBindingsApplier();
+		snapshot.#targetSettings = targetSettings;
+		snapshot.#bindings = this.getBindings();
+		snapshot.#appliedRoles = new Set(this.#appliedRoles);
+		snapshot.#appliedAgentOverrides = new Set(this.#appliedAgentOverrides);
+		snapshot.#roleBaselines = this.#cloneSelectorMap(this.#roleBaselines);
+		snapshot.#agentBaselines = this.#cloneSelectorMap(this.#agentBaselines);
+		snapshot.#lastAppliedRoles = this.#cloneSelectorMap(this.#lastAppliedRoles);
+		snapshot.#lastAppliedAgentOverrides = this.#cloneSelectorMap(this.#lastAppliedAgentOverrides);
+		return snapshot;
+	}
+
 	applyTo(targetSettings: Settings): void {
 		if (this.#targetSettings && this.#targetSettings !== targetSettings) {
 			this.#restoreTarget(this.#targetSettings);
@@ -181,6 +195,12 @@ export class ModelBindingsApplier {
 		if (!bindings) return undefined;
 		const copy: Record<string, ModelSelectorValue> = {};
 		for (const [key, value] of Object.entries(bindings)) copy[key] = this.#clone(value)!;
+		return copy;
+	}
+
+	#cloneSelectorMap<T extends ModelSelectorValue | undefined>(source: Map<string, T>): Map<string, T> {
+		const copy = new Map<string, T>();
+		for (const [key, value] of source) copy.set(key, this.#clone(value) as T);
 		return copy;
 	}
 

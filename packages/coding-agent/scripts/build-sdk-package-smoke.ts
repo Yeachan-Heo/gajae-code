@@ -12,6 +12,7 @@ const tuiPackageDir = path.resolve(packageDir, "../tui");
 const nativesPackageDir = path.resolve(packageDir, "../natives");
 const linuxX64PackageDir = path.resolve(packageDir, "../natives-linux-x64");
 const utilsPackageDir = path.resolve(packageDir, "../utils");
+const statsPackageDir = path.resolve(packageDir, "../stats");
 const manifestsDir = path.join(packageDir, "test/manifests");
 // v2 intentionally removes eager concrete-tool exports to preserve the SDK cold boundary.
 const baselineVersion = 2;
@@ -51,6 +52,7 @@ async function runSmoke(): Promise<Surface> {
 		const nativesTarball = run(["bun", "pm", "pack", "--destination", tempDir, "--quiet"], nativesPackageDir);
 		const linuxX64Tarball = run(["bun", "pm", "pack", "--destination", tempDir, "--quiet"], stagedLinuxX64Dir);
 		const utilsTarball = run(["bun", "pm", "pack", "--destination", tempDir, "--quiet"], utilsPackageDir);
+		const statsTarball = run(["bun", "pm", "pack", "--destination", tempDir, "--quiet"], statsPackageDir);
 		const codingAgentTarball = run(["bun", "pm", "pack", "--destination", tempDir, "--quiet"], packageDir);
 		const agentTarballPath = path.isAbsolute(agentTarball) ? agentTarball : path.join(agentPackageDir, agentTarball);
 		const aiTarballPath = path.isAbsolute(aiTarball) ? aiTarball : path.join(aiPackageDir, aiTarball);
@@ -62,6 +64,7 @@ async function runSmoke(): Promise<Surface> {
 			? linuxX64Tarball
 			: path.join(stagedLinuxX64Dir, linuxX64Tarball);
 		const utilsTarballPath = path.isAbsolute(utilsTarball) ? utilsTarball : path.join(utilsPackageDir, utilsTarball);
+		const statsTarballPath = path.isAbsolute(statsTarball) ? statsTarball : path.join(statsPackageDir, statsTarball);
 		const codingAgentTarballPath = path.isAbsolute(codingAgentTarball)
 			? codingAgentTarball
 			: path.join(packageDir, codingAgentTarball);
@@ -79,6 +82,7 @@ async function runSmoke(): Promise<Surface> {
 						"@gajae-code/natives": `file:${nativesTarballPath}`,
 						"@gajae-code/natives-linux-x64": `file:${linuxX64TarballPath}`,
 						"@gajae-code/utils": `file:${utilsTarballPath}`,
+						"@gajae-code/stats": `file:${statsTarballPath}`,
 					},
 					overrides: {
 						"@gajae-code/agent-core": `file:${agentTarballPath}`,
@@ -87,6 +91,7 @@ async function runSmoke(): Promise<Surface> {
 						"@gajae-code/natives": `file:${nativesTarballPath}`,
 						"@gajae-code/natives-linux-x64": `file:${linuxX64TarballPath}`,
 						"@gajae-code/utils": `file:${utilsTarballPath}`,
+						"@gajae-code/stats": `file:${statsTarballPath}`,
 					},
 				},
 				null,

@@ -346,36 +346,112 @@ function usableAccountHome(home: string | undefined): string | undefined {
 	return resolved === path.parse(resolved).root ? undefined : resolved;
 }
 
+/**
+ * The real account home, resolved WITHOUT trusting `$HOME`.
+ *
+ * `os.userInfo()` is NOT usable here: on darwin it reports `$HOME`, so a test
+ * that pins a fake `HOME` inside the temp root would be mistaken for the real
+ * home and its own fixture would be refused as `real-home`.
+ *
+ * The passwd probes below read the account database instead, which is what
+ * makes the captured alias authoritative.
+ *
+ * The probe cannot capture output with `stdout: "pipe"` in every context it
+ * runs in. Bun 1.4.0 rejects the piped shape with `EBADF: bad file descriptor,
+ * posix_spawn` when the preload is active — which is exactly the posture of a
+ * `bun test` run against this repository. A `Bun.file` destination works in
+ * both postures, so the probe always captures through a temp file. When
+ * resolution collapses, no standard temp roots are authorized, every
+ * `mkdtemp(os.tmpdir())` fixture becomes undeletable, and every test run aborts
+ * at exit 70 (issue #4794 regression).
+ */
 function accountHomeIndependentOfEnvironment(): string | undefined {
-	try {
+	if (process.platform === "win32") return windowsAccountHome();
+	const command = (() => {
 		if (process.platform === "linux") {
 			const uid = process.geteuid?.();
-			if (uid === undefined) return undefined;
-			const result = Bun.spawnSync({
-				cmd: ["getent", "passwd", String(uid)],
-				env: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin", LC_ALL: "C" },
-				stdout: "pipe",
-				stderr: "ignore",
-			});
-			if (result.exitCode !== 0) return undefined;
-			return usableAccountHome(new TextDecoder().decode(result.stdout).split("\n")[0]?.split(":")[5]);
+			return uid === undefined ? undefined : ["getent", "passwd", String(uid)];
 		}
 		if (process.platform === "darwin") {
-			const username = os.userInfo().username;
+			return ["dscl", ".", "-read", `/Users/${os.userInfo().username}`, "NFSHomeDirectory"];
+		}
+		return undefined;
+	})();
+	if (!command) return undefined;
+	const output = runAccountProbe(command);
+	if (output === undefined) return undefined;
+	if (process.platform === "linux") {
+		return usableAccountHome(output.split("\n")[0]?.split(":")[5]);
+	}
+	const line = output.split("\n").find(entry => entry.startsWith("NFSHomeDirectory:"));
+	return usableAccountHome(line?.slice("NFSHomeDirectory:".length).trim());
+}
+
+/**
+ * The account home on Windows, resolved without trusting the process
+ * environment that cleanup code is free to rewrite.
+ *
+ * Windows has no passwd/dscl database, so the only OS-provided root is the
+ * per-user profile directory. `os.homedir()` derives it from `USERPROFILE`
+ * (`SHGetKnownFolderPath` is not exposed to Bun), which means a caller that
+ * rewrites `%USERPROFILE%` before this module loads could spoof it. The
+ * captured value is therefore only trusted when it agrees with the profile
+ * root implied by the SYSTEMDRIVE/USERNAME pair, and it is still confined to
+ * an absolute path that is not a drive root.
+ *
+ * Without this resolver `trustedHome` stays empty on Windows, `deletionRootsFor`
+ * is skipped, `%TEMP%` never becomes an allowed root, and every
+ * `mkdtemp(os.tmpdir())` cleanup refuses itself. That is what failed the
+ * Windows `binaries` job on the v0.18.2 release run: `prepack` ->
+ * `generate-tool-catalog.ts` creates its isolated root under `os.tmpdir()` and
+ * then `safeRm`s it.
+ */
+function windowsAccountHome(): string | undefined {
+	const profile = usableAccountHome(Bun.env.USERPROFILE);
+	if (profile === undefined) return undefined;
+	const drive = Bun.env.SYSTEMDRIVE;
+	const username = Bun.env.USERNAME;
+	if (drive === undefined || username === undefined) return profile;
+	const expected = path.win32.join(drive, "Users", username);
+	// Accept either the direct profile root or a relocated/mapped variant that
+	// still shares the drive, and never widen past a single absolute path.
+	const normalized = path.win32.normalize(profile).toLowerCase();
+	const expectedRoot = path.win32.normalize(expected).toLowerCase();
+	if (normalized === expectedRoot) return profile;
+	const driveRoot = path.win32.parse(path.win32.normalize(profile)).root.toLowerCase();
+	if (driveRoot !== path.win32.parse(expectedRoot).root.toLowerCase()) return undefined;
+	return profile;
+}
+
+const accountProbeEnv = { PATH: "/usr/bin:/bin:/usr/sbin:/sbin", LC_ALL: "C" };
+
+/**
+ * Runs an account-database probe and returns its stdout, or `undefined` when
+ * the probe cannot be run.
+ *
+ * Output is captured through a temp file rather than `stdout: "pipe"`: inside a
+ * preloaded `bun test` process Bun 1.4.0 throws `EBADF` for the piped shape
+ * (see the note on {@link accountHomeIndependentOfEnvironment}). A `Bun.file`
+ * destination is the only capture shape that works there, and `fs.readFileSync`
+ * reads the result back without a second spawn.
+ */
+function runAccountProbe(command: string[]): string | undefined {
+	return tryRun(() => {
+		const handle = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "gjc-account-probe-"));
+		try {
+			const outputPath = path.join(handle, "stdout");
 			const result = Bun.spawnSync({
-				cmd: ["dscl", ".", "-read", `/Users/${username}`, "NFSHomeDirectory"],
-				env: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin", LC_ALL: "C" },
-				stdout: "pipe",
+				cmd: command,
+				env: accountProbeEnv,
+				stdout: Bun.file(outputPath),
 				stderr: "ignore",
 			});
 			if (result.exitCode !== 0) return undefined;
-			const line = new TextDecoder().decode(result.stdout).split("\n").find(entry => entry.startsWith("NFSHomeDirectory:"));
-			return usableAccountHome(line?.slice("NFSHomeDirectory:".length).trim());
+			return fs.readFileSync(outputPath, "utf8");
+		} finally {
+			fs.rmSync(handle, { recursive: true, force: true });
 		}
-		return usableAccountHome(os.userInfo().homedir);
-	} catch {
-		return undefined;
-	}
+	});
 }
 
 /**

@@ -636,9 +636,10 @@ test("shared-agent equal saved IDs select one owner without cross-workspace effe
 		expect(effectRecords.some(row => row.effectIntent?.stateRoot === loser.stateRoot)).toBe(false);
 		await closeSharedOwner(life, winner, A.source.id);
 		await expect(fs.access(path.join(winner.stateRoot, "sdk", `${A.source.id}.lifecycle.json`))).resolves.toBeNull();
+		// Closing the owner retires its ready marker (#6261); the lifecycle marker is retained.
 		await expect(
 			fs.access(path.join(winner.stateRoot, "sdk", `${A.source.id}.lifecycle.ready.json`)),
-		).resolves.toBeNull();
+		).rejects.toThrow();
 		await assertEndpointAndMarkerAbsent(loser, A.source.id);
 		const deleteCall = winner === A ? a : b;
 		const deletion = await (deleteCall === "mcp" ? mcpGlobal : daemonGlobal)(

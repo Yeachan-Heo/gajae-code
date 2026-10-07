@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+## [0.18.7] - 2026-10-04
+
+## [0.18.6] - 2026-10-03
+
+### Fixed
+
+- A `GJC_CLEANUP_DEADLINE_MS` above `2147483647` (about 24.9 days) no longer makes the exit-bound cleanup deadline expire at once. The deadline was passed straight to `setTimeout`, which treats longer delays as 1 ms, so shutdown skipped the cleanup it was meant to wait for; it is now capped at the timer maximum.
+
+## [0.18.5] - 2026-09-30
+
+## [0.18.4] - 2026-09-30
+
+## [0.18.3] - 2026-09-30
+
+## [0.18.2] - 2026-09-30
+
+## [0.18.1] - 2026-09-29
+
+### Fixed
+
+- A log file that cannot be opened or written (permission denied, the path taken by a directory, too many open files, or the log directory removed while gjc runs) no longer crashes the process from the next `logger` call. `winston-daily-rotate-file` never listened for errors on its underlying file stream, so the failure surfaced as an uncaught exception; the logger now drops the record instead, as it already intended for logging failures.
+
+## [0.18.0] - 2026-09-27
+
+### Changed
+
+- Mermaid ASCII helpers now call the lazily loaded native renderer instead of a TypeScript rendering dependency.
+
 ## [0.17.7] - 2026-09-25
 
 ## [0.17.6] - 2026-09-24

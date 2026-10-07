@@ -1,6 +1,8 @@
 /**
  * OpenAI code provider (ChatGPT OAuth) flow — browser and device-code flows.
  */
+
+import { OPENAI_HEADER_VALUES } from "../../providers/openai-codex/constants";
 import { OAuthCallbackFlow, type OAuthCallbackFlowOptions } from "./callback-server";
 import { generatePKCE } from "./pkce";
 import type { OAuthController, OAuthCredentials } from "./types";
@@ -153,13 +155,13 @@ async function exchangeCodeForToken(code: string, verifier: string, redirectUri:
  * Login with OpenAI code provider OAuth
  */
 export type OpenAICodexLoginOptions = OAuthController & {
-	/** Optional originator value for OpenAI code provider OAuth. Default: "opencode". */
+	/** Optional originator value for OpenAI code provider OAuth. Default: codex_cli_rs. */
 	originator?: string;
 };
 
 export async function loginOpenAICodex(options: OpenAICodexLoginOptions): Promise<OAuthCredentials> {
 	const pkce = await generatePKCE();
-	const originator = options.originator?.trim() || "opencode";
+	const originator = options.originator?.trim() || OPENAI_HEADER_VALUES.ORIGINATOR_CODEX;
 	const flow = new OpenAICodexOAuthFlow(options, pkce, originator);
 
 	return flow.login();

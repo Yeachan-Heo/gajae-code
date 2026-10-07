@@ -27,7 +27,7 @@ import type { ToolSession } from "../tools";
 
 const MAX_PATHS_PER_SESSION = 30;
 /** Snapshot generations retained per path (newest first). */
-const MAX_GENERATIONS_PER_PATH = 4;
+const MAX_GENERATIONS_PER_PATH = 8;
 
 export interface FileReadSnapshot {
 	/** 1-indexed line number → exact line content as observed by `read`/`search`. */

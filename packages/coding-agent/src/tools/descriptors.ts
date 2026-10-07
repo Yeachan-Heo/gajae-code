@@ -11,6 +11,12 @@ import {
 	validateDeferredAskArguments,
 	validateDeferredTodoArguments,
 } from "./descriptor-validation";
+import {
+	evalToolDescriptionForSession,
+	renderTaskDescription,
+	searchToolDescriptionForSession,
+	taskParametersForSession,
+} from "./session-descriptions";
 import { TOOL_CATALOG, type ToolCatalogEntry } from "./tool-catalog.generated";
 import { ToolError } from "./tool-errors";
 
@@ -33,6 +39,11 @@ export interface ToolDescriptorMetadata {
 	readonly intent?: AgentTool<any, any, any>["intent"];
 	readonly parametersForSession?: (session?: ToolSession) => TSchema;
 	readonly parameters?: TSchema;
+	/**
+	 * Renders the description the loaded tool will report for this session. Tools whose prompt text
+	 * depends on session settings need it, or the advertised text changes on first load (#5992).
+	 */
+	readonly descriptionForSession?: (session: ToolSession) => string;
 	readonly description?: string;
 	readonly label?: string;
 	readonly customWireName?: string;
@@ -121,8 +132,10 @@ export class LazyAgentTool implements AgentTool<any, any, any> {
 		return this.#tool?.name ?? this.descriptor.metadata.name;
 	}
 	get description(): string {
+		const session = this.#session;
 		return (
 			this.#tool?.description ??
+			(session ? this.descriptor.metadata.descriptionForSession?.(session) : undefined) ??
 			this.descriptor.metadata.description ??
 			this.descriptor.presentation.summary ??
 			this.descriptor.metadata.summary ??
@@ -393,6 +406,7 @@ function descriptor(spec: DescriptorSpec): ToolDescriptor {
 		inline: catalog?.inline ?? spec.inline,
 		rawArgumentValidation: spec.rawArgumentValidation,
 		parametersForSession: spec.parametersForSession,
+		descriptionForSession: spec.descriptionForSession,
 		intent: catalog?.intent ?? spec.intent,
 		description: catalog?.description ?? spec.description,
 		parameters: spec.parameters ?? (catalog?.parameters as TSchema | undefined),
@@ -465,6 +479,15 @@ const names: Array<[name: string, label: string, summary: string | undefined, lo
 		["move_session", "Move Session", undefined, "essential"],
 	];
 
+const sessionDescriptions: Readonly<Record<string, ToolDescriptorMetadata["descriptionForSession"]>> = {
+	eval: evalToolDescriptionForSession,
+	search: searchToolDescriptionForSession,
+	task: renderTaskDescription,
+};
+
+const sessionParameters: Readonly<Record<string, ToolDescriptorMetadata["parametersForSession"]>> = {
+	task: taskParametersForSession,
+};
 const descriptorRawArgumentValidations: Readonly<Record<string, ToolDescriptorMetadata["rawArgumentValidation"]>> = {
 	ask: validateDeferredAskArguments,
 	todo_write: validateDeferredTodoArguments,
@@ -487,7 +510,10 @@ const builtins = names
 					: undefined,
 			parameters: name === "ask" ? deferredAskParameters : undefined,
 			parametersForSession:
-				name === "ask" ? session => selectAskParameters(session?.getDeepInterviewAskStage?.()) : undefined,
+				name === "ask"
+					? session => selectAskParameters(session?.getDeepInterviewAskStage?.())
+					: sessionParameters[name],
+			descriptionForSession: sessionDescriptions[name],
 			rawArgumentValidation: descriptorRawArgumentValidations[name],
 			intent: deferredIntentPolicies[name],
 			loader: loaders[name],

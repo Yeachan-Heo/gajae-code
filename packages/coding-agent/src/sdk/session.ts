@@ -59,8 +59,13 @@ import { loadCapability, reset as resetCapabilities } from "../capability";
 import { type Rule, ruleCapability, setActiveRules } from "../capability/rule";
 import type { SourceMeta } from "../capability/types";
 import { AUTOROUTING_INACTIVE_WARNING } from "../config/autorouting-contract";
-import { ModelProfileCredentialError, resolveMissingSessionModelRecovery } from "../config/model-profile-activation";
+import {
+	isSessionCredentialPinBlocking,
+	ModelProfileCredentialError,
+	resolveMissingSessionModelRecovery,
+} from "../config/model-profile-activation";
 import { resolveModelProfileName } from "../config/model-profile-contract";
+import type { ModelProfileOwnershipMarker } from "../config/model-profile-ownership";
 import { resolveProfileBindings } from "../config/model-profiles";
 import { kNoAuth, ModelRegistry } from "../config/model-registry";
 import {
@@ -157,6 +162,7 @@ import {
 	type MCPToolCache,
 	resolveMCPToolCache,
 } from "../runtime-mcp";
+import { createMCPFormInputHandler } from "../runtime-mcp/elicitation";
 import type { MCPLoadResult } from "../runtime-mcp/manager";
 import { MCP_STARTUP_WAIT_GRACE_MS } from "../runtime-mcp/startup-policy";
 import type { MCPServerConfig } from "../runtime-mcp/types";
@@ -502,6 +508,8 @@ export interface CreateAgentSessionOptions {
 	modelPattern?: string;
 	/** Active profile inherited by a nested SDK/subagent session. */
 	activeModelProfile?: string;
+	/** Model profile ownership marker for propagating parent profile ownership to subagent sessions. */
+	modelProfileOwnershipMarker?: ModelProfileOwnershipMarker;
 	/** Thinking selector. Default: from settings, else unset */
 	thinkingLevel?: ThinkingLevel;
 	/** Runtime substitution metadata for the initial model_change session event. */
@@ -594,6 +602,18 @@ export interface CreateAgentSessionOptions {
 	 * @internal CLI-only ordering guard; SDK callers retain immediate startup by default.
 	 */
 	deferMemoryBackendStartup?: boolean;
+	/**
+	 * Skip optional model-catalog discovery during lifecycle startup. ACP hosts must
+	 * publish their endpoint before unrelated provider credential refreshes begin.
+	 * @internal lifecycle-only startup guard.
+	 */
+	deferOptionalModelRefresh?: boolean;
+
+	/**
+	 * Defer model profile activation until explicit model pin validation occurs.
+	 * @internal Lifecycle-only: prevents default profile activation before pin resolution.
+	 */
+	deferModelProfileActivation?: boolean;
 
 	/** Enable LSP integration (tool, formatting, diagnostics, warmup). Default: true */
 	enableLsp?: boolean;
@@ -710,6 +730,22 @@ export interface CreateAgentSessionResult {
 	 * this session published. Undefined when no GJC bundles participated.
 	 */
 	gjcRuntimeSnapshot?: GjcRuntimeSnapshotProvider;
+}
+
+/**
+ * Start optional provider/model discovery only when it is safe to add work to
+ * the caller's startup graph. Lifecycle hosts deliberately skip this during
+ * construction: discovery preflights every configured provider and may refresh
+ * an unrelated OAuth credential while several hosts are opening the same DB.
+ */
+export function startOptionalModelRefresh(
+	modelRegistry: Pick<ModelRegistry, "refreshInBackground">,
+	credentialSessionId: string | undefined,
+	deferred: boolean,
+): boolean {
+	if (deferred) return false;
+	modelRegistry.refreshInBackground("online-if-uncached", credentialSessionId);
+	return true;
 }
 
 export interface DeferredMcpConfigStartupResult {
@@ -1690,8 +1726,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		throw primary;
 	};
 	// Subscribe before owned-registry construction as its first catalog pass may
-	// probe credentials. Preserve the listener cleanup contract if scoped settings
-	// loading fails after the storage has been acquired.
+	// probe credentials. Embedder handlers disable AuthStorage's no-listener
+	// buffer, so the SDK listener must already be present before any startup probe.
 	try {
 		unsubscribeCredentialDisabled = authStorage.onCredentialDisabled(event => {
 			if (credentialDisabledTarget) {
@@ -1987,10 +2023,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				options.preferredCredentialSelector.selector,
 			);
 		}
+		// A runtime key or this registry's literal models.yml apiKey outranks an
+		// unavailable pin; without one the provider stays blocked (never retargeted).
+		const isCredentialPinBlocking = (provider: string): boolean =>
+			isSessionCredentialPinBlocking(modelRegistry, provider, credentialSessionId);
 		const modelApiKeyAvailability = new Map<string, boolean>();
 		const getModelAvailabilityKey = (candidate: Model): string =>
 			`${candidate.provider}\u0000${candidate.baseUrl ?? ""}`;
 		const hasModelApiKey = async (candidate: Model): Promise<boolean> => {
+			if (isCredentialPinBlocking(candidate.provider)) return false;
 			const availabilityKey = getModelAvailabilityKey(candidate);
 			const cached = modelApiKeyAvailability.get(availabilityKey);
 			if (cached !== undefined) {
@@ -2016,6 +2057,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const key = await modelRegistry
 				.getApiKey(candidate, credentialSessionId, { credentialSelector })
 				.catch(error => {
+					if (isCredentialPinBlocking(candidate.provider)) return undefined;
 					if (credentialSelector) {
 						logger.debug("Credential selector did not match model availability candidate", {
 							provider: candidate.provider,
@@ -2059,6 +2101,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const hasExistingSession = existingBranch.length > 0;
 		const hasThinkingEntry = existingBranch.some(entry => entry.type === "thinking_level_change");
 		const hasServiceTierEntry = existingBranch.some(entry => entry.type === "service_tier_change");
+
+		// Apply inherited model profile ownership marker to subagent sessions when a parent provides one.
+		// This must occur after computing hasExistingSession to avoid marking a fresh session as resumed.
+		if (options.modelProfileOwnershipMarker !== undefined) {
+			sessionManager.appendModelProfileOwnershipMarker(options.modelProfileOwnershipMarker);
+		}
 
 		for (const entry of existingBranch) {
 			if (entry.type !== "custom" || entry.customType !== "auth-credential-pin") continue;
@@ -2164,7 +2212,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				settings,
 			);
 			await refreshMissingQualifiedModelProviders(startupModelSelectors, modelRegistry, credentialSessionId);
-			modelRegistry.refreshInBackground("online-if-uncached", credentialSessionId);
+			startOptionalModelRefresh(modelRegistry, credentialSessionId, options.deferOptionalModelRefresh === true);
 		}
 
 		const hasExplicitModel = options.model !== undefined || options.modelPattern !== undefined;
@@ -2257,10 +2305,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					{
 						managedFallback: defaultModelEntries.length > 1,
 						canonicalSessionId: providerSessionId,
+						isCredentialUnavailable: isCredentialPinBlocking,
 						...(persistedProfileOwnsDefault ? { aliasIntent: "preset-equivalent" as const } : {}),
 					},
 				);
 				model = restoredDefaultResolution.model;
+				if (restoredDefaultResolution.skips.some(skip => skip.reason === "credential_unavailable")) {
+					modelFallbackMessage =
+						"Saved session credential is unavailable. Re-pin a credential or select AUTO explicitly.";
+				}
 				// A restored session model from a different provider than an active
 				// `--prefer-credential` preference is discarded rather than kept: the
 				// preference names one provider's account, and silently resuming on
@@ -2295,7 +2348,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						deferredMissingSessionRecovery = true;
 					}
 				}
-				if (!model) modelFallbackMessage = `Could not restore model ${defaultModelEntries.join(" -> ")}`;
+				if (!model && !restoredDefaultResolution.skips.some(skip => skip.reason === "credential_unavailable")) {
+					modelFallbackMessage = `Could not restore model ${defaultModelEntries.join(" -> ")}`;
+				}
 			});
 		}
 
@@ -2305,6 +2360,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			!hasExplicitModel &&
 			!model &&
 			defaultRoleSpec.model &&
+			!isCredentialPinBlocking(defaultRoleSpec.model.provider) &&
 			(!preferredCredentialProvider || defaultRoleSpec.model.provider === preferredCredentialProvider)
 		) {
 			const settingsDefaultModel = defaultRoleSpec.model;
@@ -2630,7 +2686,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let ownedMcpManagerTools: readonly CustomTool[] = [];
 		let publishOwnedMcpTools = false;
 		const notificationDebounceTimers = new Map<string, Timer>();
+		const installMcpInputHandler = (manager: MCPManager): void => {
+			manager.setInputRequestHandler(
+				createMCPFormInputHandler({
+					getUi: () => {
+						const context = toolContextStore.getContext();
+						return { ui: context.ui, hasUI: context.hasUI === true };
+					},
+					getAskAnswerSource: () => session.getAskAnswerSource(),
+				}),
+			);
+		};
 		const wireMcpManagerCallbacks = (manager: MCPManager): void => {
+			installMcpInputHandler(manager);
 			manager.setOnPromptsChanged(serverName => {
 				const promptCommands = buildMCPPromptCommands(manager);
 				session.setMCPPromptCommands(promptCommands);
@@ -3242,13 +3310,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			peekQueueInvoker: () => session.peekQueueInvoker(),
 			peekStandingResolveHandler: () => session.peekStandingResolveHandler(),
 			setStandingResolveHandler: handler => session.setStandingResolveHandler(handler),
-			allocateOutputArtifact: async toolType => {
-				try {
-					return await sessionManager.allocateArtifactPath(toolType);
-				} catch {
-					return {};
-				}
-			},
+			allocateOutputArtifact: toolType => sessionManager.allocateArtifactPath(toolType),
 			getArtifactManager: () => sessionManager.getArtifactManager(),
 			isArtifactManagerAuthorized: manager => sessionManager.isArtifactManagerAuthorized(manager),
 			adoptArtifactManager: manager => sessionManager.adoptArtifactManager(manager),
@@ -3662,6 +3724,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					: {}),
 			});
 			owned.setAuthStorage(authStorage);
+			installMcpInputHandler(owned);
 			mcpManager = owned;
 			ownsMcpManager = true;
 			registerOwnedMcpManagerCleanup(owned);
@@ -3991,6 +4054,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							// INTERNAL terminal-abort seams, threaded directly from the
 							// owning session (NOT on the public extension context).
 							terminalAbortSeams: {
+								getTerminalRunOwnerForEvent: event => {
+									if (!session) throw new Error("Terminal owner session is not initialized.");
+									return session.getTerminalRunOwnerForEvent(event);
+								},
+								getRunOwnerDomain: handle => {
+									if (!session) throw new Error("Terminal owner session is not initialized.");
+									return session.getRunOwnerDomain(handle);
+								},
 								getTerminalTurnEpoch: () => {
 									if (!session) throw new Error("Terminal abort session is not initialized.");
 									return session.getTerminalTurnEpoch();
@@ -4243,6 +4314,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				{
 					managedFallback: defaultModelEntries.length > 1,
 					canonicalSessionId: providerSessionId,
+					isCredentialUnavailable: isCredentialPinBlocking,
 					...(persistedProfileOwnsDefault ? { aliasIntent: "preset-equivalent" as const } : {}),
 				},
 			);
@@ -5414,7 +5486,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			forkContextSeed: options.forkContextSeed,
 			providerSessionState: options.providerSessionState,
 		});
-		session.setActiveModelProfile(startupActiveModelProfile);
+		// Defer profile activation until explicit model pin validation occurs (#5919).
+		if (!options.deferModelProfileActivation) {
+			session.setActiveModelProfile(startupActiveModelProfile);
+		}
 		if (retainedRecoveryBindingsAfterLateRestore) session.markStartupRecoveryBindingsRequired();
 		if (recoveredSessionDefault)
 			session.installRecoveredDefaultFallbackChain(

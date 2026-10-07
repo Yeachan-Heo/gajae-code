@@ -4,7 +4,10 @@ export const MODEL_PROFILE_DISCOVERY_QUERY = "models.profiles.list";
 export const MODEL_PROFILE_ERROR_DETAIL_MAX_BYTES = 2048;
 const REQUESTED_PROFILE_MAX_BYTES = 256;
 
-const LEGACY_MODEL_PROFILE_ALIASES: ReadonlyMap<string, string> = new Map([["codex-standard", "codex-medium"]]);
+const LEGACY_MODEL_PROFILE_ALIASES: ReadonlyMap<string, string> = new Map([
+	["codex-standard", "codex-medium"],
+	["codex-sol61", "codex-pro"],
+]);
 
 export interface ModelProfileCatalogItem {
 	id: string;

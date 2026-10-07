@@ -74,6 +74,8 @@ export interface LifecycleDurableEffectsReceipt {
 export interface LifecycleLedgerEntry {
 	operationKey?: string;
 	fingerprint?: string;
+	/** True only when a session.close request supplied immutable generation authority. */
+	closeAuthorityBound?: boolean;
 	version: typeof SDK_STATE_VERSION;
 	identity: string;
 	requestHash: string;
@@ -211,6 +213,20 @@ function pendingCleanupSessionId(response: unknown): string | undefined {
 	if (!response || typeof response !== "object") return undefined;
 	const cleanup = (response as { error?: { cleanup?: { sessionId?: unknown } } }).error?.cleanup;
 	return canonicalCleanupSessionId(cleanup?.sessionId) ? cleanup.sessionId : undefined;
+}
+
+function retirementCreateIdentity(response: unknown): string | undefined {
+	if (!response || typeof response !== "object") return undefined;
+	const error = (response as { error?: unknown }).error;
+	if (!error || typeof error !== "object") return undefined;
+	const cleanup = (error as { cleanup?: unknown }).cleanup;
+	if (!cleanup || typeof cleanup !== "object") return undefined;
+	const receipt = (cleanup as { uncertainRetirement?: unknown }).uncertainRetirement;
+	if (!receipt || typeof receipt !== "object") return undefined;
+	const identity = (receipt as { identity?: unknown }).identity;
+	if (!identity || typeof identity !== "object") return undefined;
+	const createIdentity = (identity as { createIdentity?: unknown }).createIdentity;
+	return typeof createIdentity === "string" && createIdentity.length > 0 ? createIdentity : undefined;
 }
 
 function hasValidTerminalDigests(entry: LifecycleLedgerEntry): boolean {
@@ -646,23 +662,91 @@ export class LifecycleLedger {
 			await directory.close();
 		}
 	}
-	async #compact(replacement?: LifecycleLedgerEntry): Promise<boolean> {
+	async #compact(
+		replacement?: LifecycleLedgerEntry,
+		incoming?: { readonly bytes: number; readonly rows: number },
+	): Promise<boolean> {
 		const anchors = new Map<string, LifecycleLedgerEntry>();
 		for (const entry of this.#entries) {
 			const latest = replacement?.identity === entry.identity ? replacement : this.#byIdentity.get(entry.identity);
 			if (entry.state === "accepted" && !anchors.has(entry.identity) && entry.requestHash === latest?.requestHash)
 				anchors.set(entry.identity, entry);
 		}
-		const snapshot: LifecycleLedgerEntry[] = [];
 		const compacted = new Map(this.#byIdentity);
 		if (replacement) compacted.set(replacement.identity, replacement);
-		for (const [identity, latest] of compacted) {
-			const anchor = anchors.get(identity);
-			if (!anchor) throw new Error("Lifecycle ledger compaction requires an accepted identity anchor.");
-			snapshot.push(replacement?.identity === identity && latest.state === "accepted" ? latest : anchor);
-			if (latest.state !== "accepted") snapshot.push(latest);
+		const buildSnapshot = (): LifecycleLedgerEntry[] => {
+			const next: LifecycleLedgerEntry[] = [];
+			for (const [identity, latest] of compacted) {
+				const anchor = anchors.get(identity);
+				if (!anchor) throw new Error("Lifecycle ledger compaction requires an accepted identity anchor.");
+				next.push(replacement?.identity === identity && latest.state === "accepted" ? latest : anchor);
+				if (latest.state !== "accepted") next.push(latest);
+			}
+			return next;
+		};
+		let snapshot = buildSnapshot();
+		let contents = Buffer.from(snapshot.map(entry => `${JSON.stringify(entry)}\n`).join(""));
+		const needsEviction = incoming
+			? snapshot.length + incoming.rows > this.#limits.maxRows ||
+				contents.length + incoming.bytes > this.#limits.maxBytes
+			: replacement === undefined
+				? snapshot.length >= this.#limits.maxRows || contents.length >= this.#limits.maxBytes
+				: snapshot.length > this.#limits.maxRows || contents.length > this.#limits.maxBytes;
+		if (needsEviction) {
+			const protectedCreateIdentities = new Set<string>();
+			for (const entry of compacted.values()) {
+				const createIdentity =
+					retirementCreateIdentity(entry.response) ?? retirementCreateIdentity(entry.unresolvedCleanupResponse);
+				if (createIdentity !== undefined) protectedCreateIdentities.add(createIdentity);
+			}
+			const evictable = [...compacted.values()]
+				.filter(
+					latest =>
+						latest.identity !== replacement?.identity &&
+						terminal(latest.state) &&
+						latest.operationKey !== undefined &&
+						latest.fingerprint !== undefined &&
+						(!latest.operationKey.startsWith("session.close\u0000") || latest.closeAuthorityBound === true) &&
+						!protectedCreateIdentities.has(latest.identity) &&
+						pendingCleanupSessionId(latest.response) === undefined &&
+						pendingCleanupSessionId(latest.unresolvedCleanupResponse) === undefined,
+				)
+				.sort((left, right) => left.ts - right.ts);
+			const rowsByIdentity = new Map<string, number>();
+			const bytesByIdentity = new Map<string, number>();
+			for (const entry of snapshot) {
+				rowsByIdentity.set(entry.identity, (rowsByIdentity.get(entry.identity) ?? 0) + 1);
+				bytesByIdentity.set(
+					entry.identity,
+					(bytesByIdentity.get(entry.identity) ?? 0) + Buffer.byteLength(`${JSON.stringify(entry)}\n`),
+				);
+			}
+			let remainingRows = snapshot.length;
+			let remainingBytes = contents.length;
+			const evicted = new Set<string>();
+			for (const latest of evictable) {
+				if (
+					remainingRows <= this.#limits.maxRows / 2 &&
+					remainingBytes <= this.#limits.maxBytes / 2 &&
+					remainingRows + (incoming?.rows ?? 0) <= this.#limits.maxRows &&
+					remainingBytes + (incoming?.bytes ?? 0) <= this.#limits.maxBytes
+				)
+					break;
+				evicted.add(latest.identity);
+				remainingRows -= rowsByIdentity.get(latest.identity) ?? 0;
+				remainingBytes -= bytesByIdentity.get(latest.identity) ?? 0;
+			}
+			for (const identity of evicted) compacted.delete(identity);
+			snapshot = buildSnapshot();
+			contents = Buffer.from(snapshot.map(entry => `${JSON.stringify(entry)}\n`).join(""));
+			// Replay is guaranteed only for identities retained in the compacted ledger.
 		}
-		const contents = Buffer.from(snapshot.map(entry => `${JSON.stringify(entry)}\n`).join(""));
+		if (
+			incoming &&
+			(snapshot.length + incoming.rows > this.#limits.maxRows ||
+				contents.length + incoming.bytes > this.#limits.maxBytes)
+		)
+			throw new Error("Lifecycle ledger append exceeds configured bounds.");
 		if (
 			snapshot.length > this.#limits.maxRows ||
 			contents.length > this.#limits.maxBytes ||
@@ -735,7 +819,7 @@ export class LifecycleLedger {
 	async migrateIdentity(
 		from: string,
 		to: string,
-		metadata: { operationKey: string; fingerprint: string },
+		metadata: { operationKey: string; fingerprint: string; closeAuthorityBound?: boolean },
 	): Promise<LifecycleLedgerEntry | undefined> {
 		return this.#mutate(async () => {
 			const existing = this.#byIdentity.get(to);
@@ -776,9 +860,12 @@ export class LifecycleLedger {
 		);
 		if (line.length - 1 > this.#limits.maxLineBytes)
 			throw new Error("Lifecycle ledger row exceeds the maximum byte length.");
+		if (line.length > this.#limits.maxBytes) throw new Error("Lifecycle ledger append exceeds configured bounds.");
 		let replacementCompacted = false;
 		if (this.#rowCount + 1 > this.#limits.maxRows || this.#byteCount + line.length > this.#limits.maxBytes)
-			replacementCompacted = await this.#compact(this.#byIdentity.has(entry.identity) ? entry : undefined);
+			replacementCompacted = this.#byIdentity.has(entry.identity)
+				? await this.#compact(entry)
+				: await this.#compact(undefined, { bytes: line.length, rows: 1 });
 		if (replacementCompacted) return entry;
 		if (this.#rowCount + 1 > this.#limits.maxRows || this.#byteCount + line.length > this.#limits.maxBytes)
 			throw new Error("Lifecycle ledger append exceeds configured bounds.");
@@ -798,7 +885,12 @@ export class LifecycleLedger {
 	async begin(
 		identity: string,
 		requestHash: string,
-		metadata: { operationKey?: string; fingerprint?: string; intendedSessionId?: string } = {},
+		metadata: {
+			operationKey?: string;
+			fingerprint?: string;
+			intendedSessionId?: string;
+			closeAuthorityBound?: boolean;
+		} = {},
 	): Promise<BeginResult> {
 		return this.#mutate(async () => this.#begin(identity, requestHash, metadata));
 	}
@@ -806,7 +898,12 @@ export class LifecycleLedger {
 	async #begin(
 		identity: string,
 		requestHash: string,
-		metadata: { operationKey?: string; fingerprint?: string; intendedSessionId?: string },
+		metadata: {
+			operationKey?: string;
+			fingerprint?: string;
+			intendedSessionId?: string;
+			closeAuthorityBound?: boolean;
+		},
 	): Promise<BeginResult> {
 		const prior = this.#byIdentity.get(identity);
 		if (!prior)
@@ -819,6 +916,7 @@ export class LifecycleLedger {
 					operationKey: metadata.operationKey,
 					fingerprint: metadata.fingerprint,
 					intendedSessionId: metadata.intendedSessionId,
+					closeAuthorityBound: metadata.closeAuthorityBound,
 					state: "accepted",
 					ts: Date.now(),
 				}),

@@ -6,6 +6,7 @@ import type {
 	ImageContent,
 	Message,
 	Model,
+	ProviderDiagnostic,
 	SimpleStreamOptions,
 	Static,
 	streamSimple,
@@ -811,6 +812,13 @@ export interface AgentContext {
 export interface AgentFailureDiagnostic {
 	code: string;
 	message: string;
+	/**
+	 * Bounded provider failure family, present only when the provider adapter
+	 * itself classified the failure from structured metadata (its private
+	 * carrier). Additive diagnostics: the `code` and the fixed `message` above
+	 * are unchanged by its presence or absence.
+	 */
+	providerDiagnostic?: ProviderDiagnostic;
 }
 
 /**

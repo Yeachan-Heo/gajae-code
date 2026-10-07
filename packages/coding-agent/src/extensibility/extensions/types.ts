@@ -49,6 +49,7 @@ import type { ExecOptions, ExecResult } from "../../exec/exec";
 import type { CustomEditor } from "../../modes/components/custom-editor";
 import type { WorkflowGateEmitter } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import type { Theme } from "../../modes/theme/theme";
+import type { ProjectProgressSnapshot } from "../../progress/progress-contract";
 import type { AgentSessionEventListener } from "../../session/agent-session";
 import type {
 	ClientBridge,
@@ -538,6 +539,8 @@ export interface ExtensionContext {
 		| Promise<{ bytes: Uint8Array; totalBytes: number } | undefined>;
 
 	getJobs(): unknown;
+	/** Read-only project progress snapshot (`session.progress`), derived from durable session state. */
+	getProjectProgress?(): Promise<ProjectProgressSnapshot>;
 	/** Subscribe to foreground-wait folds (`bash_folded`). Returns an unsubscribe function. */
 	onJobFold?(listener: (event: JobFoldEvent) => void): () => void;
 	/** Observe session events synchronously in producer order. Returns an unsubscribe function. */
@@ -764,6 +767,8 @@ export interface AgentStartEvent extends SharedAgentStartEvent {
 	sdkRunToken?: string;
 	/** Complete set of SDK queue owners consumed together by this run. */
 	sdkRunTokens?: string[];
+	/** Internal public lifecycle boundary; accepted retries with a suppressed predecessor end retain it. */
+	lifecycleScope?: AttemptScope;
 }
 
 /** Fired when an agent run fails before emitting agent_end. The error is the
@@ -1723,6 +1728,8 @@ export interface ExtensionContextActions {
 		| undefined
 		| Promise<{ bytes: Uint8Array; totalBytes: number } | undefined>;
 	getJobs?: () => unknown;
+	/** Read-only project progress snapshot backing the `session.progress` SDK query. */
+	getProjectProgress?: () => Promise<ProjectProgressSnapshot>;
 	/** Subscribe to foreground-wait folds so the SDK host can publish `bash_folded`. Returns an unsubscribe. */
 	onJobFold?: (listener: (event: JobFoldEvent) => void) => () => void;
 	/** Ordered, synchronous AgentSession subscription, independent of async extension hooks. */

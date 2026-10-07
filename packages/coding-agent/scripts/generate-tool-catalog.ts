@@ -91,6 +91,10 @@ function makeSettings() {
 		"edit.fuzzyThreshold": 0.8,
 		"lsp.diagnosticsOnEdit": false,
 		"lsp.formatOnWrite": false,
+		// Rendered into the read tool description; mirror the settings-schema defaults so
+		// the catalog does not ship "about undefined lines or undefined KiB".
+		"read.receiptBudgetLines": 50,
+		"read.receiptBudgetBytes": 10,
 	};
 	return {
 		get: (key: string) => values[key],

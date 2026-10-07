@@ -103,6 +103,7 @@ function convertToLegacyConfig(server: MCPServer): MCPServerConfig {
 			url: server.url ?? "",
 		};
 		if (server.headers) config.headers = server.headers;
+		if (server.publicNetwork === true) config.publicNetwork = true;
 		canonicalizeMCPEndpoint(config.url);
 		return config;
 	}

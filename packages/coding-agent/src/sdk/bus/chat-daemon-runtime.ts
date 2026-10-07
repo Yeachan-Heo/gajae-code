@@ -318,6 +318,9 @@ export class ChatDaemonRuntime {
 		this.#router = new SessionRouter({
 			agentDir: input.agentDir,
 			observer: true,
+			// A lean final answer carries no messageRef, so the raw native copy of a
+			// positioned frame has no identity to collapse onto and would post twice.
+			positionedNotificationEffects: true,
 			correlateFrame,
 			deps: {
 				...deps.routerDeps,

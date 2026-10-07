@@ -12,7 +12,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { failedPromptOutcome } from "../prompt-failure";
+import type { ProviderDiagnostic } from "@gajae-code/ai/core";
+import { failedPromptOutcome, providerDiagnosticField } from "../prompt-failure";
 import type { PromptReconciliationStatus, SdkPromptTerminalOutcome } from "../prompt-status";
 import type { ReceiptState } from "../receipt-state";
 import { reportableTurnResultContent, TURN_RESULT_CONTENT_MAX_BYTES, type TurnResultContent } from "../turn-result";
@@ -66,6 +67,12 @@ export interface DurableExecutionReconciliationRecord extends PromptCorrelation 
 	/** Skill-only safe token; never skill args bodies. */
 	skillName?: string;
 	content?: TurnResultContent;
+	/**
+	 * Bounded provider failure family recorded by `agent_failed` before the
+	 * terminal boundary, so the terminal outcome can still carry it. Revalidated
+	 * on every read; a malformed value is stripped, never fatal to the record.
+	 */
+	providerDiagnostic?: ProviderDiagnostic;
 }
 
 /**
@@ -562,13 +569,14 @@ export function settleProcessRestart(
 		outcome?.kind === "failed" && outcome.provenance === "deadline";
 	const providerFailureOutcome = (
 		error: { code: string; message: string },
-		record: { startedAt?: number },
+		record: { startedAt?: number; providerDiagnostic?: ProviderDiagnostic },
 	): SdkPromptTerminalOutcome =>
 		failedPromptOutcome({
 			code: "prompt_failed",
 			provenance: "agent_failed",
 			...(error.code !== "prompt_failed" ? { providerCode: error.code } : {}),
 			evidence: record.startedAt !== undefined ? { startedAt: record.startedAt } : {},
+			...providerDiagnosticField(record.providerDiagnostic),
 		});
 	return records.map(record => {
 		if (record.kind === "steer") {

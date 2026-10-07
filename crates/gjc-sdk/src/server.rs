@@ -4316,6 +4316,63 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn exact_request_frame_ceiling_is_accepted_and_one_byte_over_closes_only_its_socket() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut bounded = connect(&handle, "secret").await;
+		next_server_hello(&mut bounded).await;
+		let mut healthy = connect(&handle, "secret").await;
+		next_server_hello(&mut healthy).await;
+		wait_for_clients(&handle, 2).await;
+
+		let envelope_bytes =
+			serde_json::to_string(&ClientMessage::Ping(Ping { nonce: String::new() }))
+				.unwrap()
+				.len();
+		let nonce = "x".repeat(REQUEST_FRAME_BYTES - envelope_bytes);
+		let exact =
+			serde_json::to_string(&ClientMessage::Ping(Ping { nonce: nonce.clone() })).unwrap();
+		assert_eq!(exact.len(), 256 * 1024);
+		bounded
+			.send(Message::Text(exact))
+			.await
+			.expect("send exact private request ceiling");
+		match timeout(Duration::from_secs(2), next_server_msg(&mut bounded))
+			.await
+			.expect("exact private request must receive its real pong")
+		{
+			ServerMessage::Pong(pong) => assert_eq!(pong.nonce, nonce),
+			other => panic!("expected exact-frame pong, got {other:?}"),
+		}
+
+		let over =
+			serde_json::to_string(&ClientMessage::Ping(Ping { nonce: format!("{nonce}x") })).unwrap();
+		assert_eq!(over.len(), 256 * 1024 + 1);
+		bounded
+			.send(Message::Text(over))
+			.await
+			.expect("send one-byte-over private request");
+		match timeout(Duration::from_secs(2), bounded.next())
+			.await
+			.expect("one-byte-over private request must close its socket")
+		{
+			Some(Ok(Message::Close(Some(frame)))) => assert_eq!(frame.code, CloseCode::Size),
+			Some(Err(_)) | None => {},
+			Some(Ok(message)) => panic!("one-byte-over private request was not rejected: {message:?}"),
+		}
+		wait_for_clients(&handle, 1).await;
+		healthy
+			.send(Message::Text(
+				serde_json::to_string(&ClientMessage::Ping(Ping { nonce: "healthy".into() })).unwrap(),
+			))
+			.await
+			.expect("unrelated authenticated socket remains writable");
+		assert!(
+			matches!(next_server_msg(&mut healthy).await, ServerMessage::Pong(Pong { nonce }) if nonce == "healthy")
+		);
+		handle.stop_and_wait().await;
+	}
+
+	#[tokio::test]
 	async fn ping_gets_pong() {
 		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
 		let mut sender = connect(&handle, "secret").await;
@@ -5165,10 +5222,22 @@ mod tests {
 		next_server_hello(&mut healthy).await;
 		wait_for_clients(&handle, 2).await;
 
-		oversized
+		// The server rejects the frame from its length header and closes while
+		// the client may still be writing the payload, so the send itself can
+		// observe the close as a reset or broken pipe. Either way the offending
+		// client is disconnected, which is what this test asserts.
+		match oversized
 			.send(Message::Text("x".repeat(REQUEST_FRAME_BYTES + 1)))
 			.await
-			.expect("send oversized text frame");
+		{
+			Ok(()) => {},
+			Err(tokio_tungstenite::tungstenite::Error::Io(error))
+				if matches!(
+					error.kind(),
+					std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+				) => {},
+			Err(error) => panic!("send oversized text frame: {error:?}"),
+		}
 		match tokio::time::timeout(std::time::Duration::from_secs(2), oversized.next())
 			.await
 			.expect("oversized client was not closed")

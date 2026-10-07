@@ -1,3 +1,4 @@
+// Vendored from can1357/oh-my-pi@a85bd5228d9f0f619deade1db78fa49420a721e1:crates/pi-builtins/src/umask.rs — MIT (c) 2025 Mario Zechner, 2025-2026 Can Bölük, 2026 Stencil Labs, Inc. Modified for gajae-code: yes, retains the synchronous local process umask API.
 use std::io::Write;
 
 use brush_core::{ErrorKind, ExecutionResult, builtins};
@@ -33,7 +34,9 @@ impl builtins::Command for UmaskCommand {
 				let parsed = brush_core::int_utils::parse(mode.as_str(), 8)?;
 				set_umask(parsed)?;
 			} else {
-				return brush_core::error::unimp("umask setting mode from symbolic value");
+				let current_umask = get_umask()?;
+				let parsed = parse_symbolic_umask(mode, current_umask)?;
+				set_umask(parsed)?;
 			}
 		} else {
 			let umask = get_umask()?;
@@ -74,6 +77,81 @@ cfg_if! {
 	 }
 }
 
+fn parse_symbolic_umask(mode: &str, current_umask: u32) -> Result<nix::sys::stat::mode_t, brush_core::Error> {
+	let mut umask = current_umask & 0o777;
+	let mut chars = mode.chars().peekable();
+	let mut saw_clause = false;
+
+	while chars.peek().is_some() {
+		saw_clause = true;
+
+		let mut who_bits = 0;
+		while let Some(&ch) = chars.peek() {
+			let bits = match ch {
+				'u' => 0o700,
+				'g' => 0o070,
+				'o' => 0o007,
+				'a' => 0o777,
+				_ => break,
+			};
+			who_bits |= bits;
+			chars.next();
+		}
+		if who_bits == 0 {
+			who_bits = 0o777;
+		}
+
+		loop {
+			let op = chars.next().ok_or(ErrorKind::InvalidUmask)?;
+			if !matches!(op, '+' | '-' | '=') {
+				return Err(ErrorKind::InvalidUmask.into());
+			}
+
+			let mut perm_bits = 0;
+			while let Some(&ch) = chars.peek() {
+				let bits = match ch {
+					'r' => 0o444,
+					'w' => 0o222,
+					'x' => 0o111,
+					'+' | '-' | '=' | ',' => break,
+					_ => return Err(ErrorKind::InvalidUmask.into()),
+				};
+				perm_bits |= bits & who_bits;
+				chars.next();
+			}
+
+			match op {
+				'+' => umask &= !perm_bits,
+				'-' => umask |= perm_bits,
+				'=' => {
+					umask |= who_bits;
+					umask &= !perm_bits;
+				},
+				_ => unreachable!(),
+			}
+
+			match chars.peek() {
+				Some(',') => {
+					chars.next();
+					if chars.peek().is_none() {
+						return Err(ErrorKind::InvalidUmask.into());
+					}
+					break;
+				},
+				Some('+' | '-' | '=') => continue,
+				Some(_) => return Err(ErrorKind::InvalidUmask.into()),
+				None => break,
+			}
+		}
+	}
+
+	if saw_clause {
+		Ok(umask as nix::sys::stat::mode_t)
+	} else {
+		Err(ErrorKind::InvalidUmask.into())
+	}
+}
+
 fn set_umask(value: nix::sys::stat::mode_t) -> Result<(), brush_core::Error> {
 	// value of mode_t can be platform dependent
 	let mode = nix::sys::stat::Mode::from_bits(value).ok_or_else(|| ErrorKind::InvalidUmask)?;
@@ -95,4 +173,40 @@ fn symbolic_mask_from_bits(bits: u32) -> String {
 	}
 
 	result
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn parse(mode: &str, current_umask: u32) -> u32 {
+		u32::from(parse_symbolic_umask(mode, current_umask).unwrap())
+	}
+
+	#[test]
+	fn parses_symbolic_umask_assignments() {
+		assert_eq!(parse("u=rwx,g=rx,o=", 0o022), 0o027);
+		assert_eq!(parse("=r", 0o022), 0o333);
+		assert_eq!(parse("a=", 0o022), 0o777);
+		assert_eq!(parse("u=", 0o022), 0o722);
+	}
+
+	#[test]
+	fn parses_symbolic_umask_incremental_ops() {
+		assert_eq!(parse("u+rw", 0o777), 0o177);
+		assert_eq!(parse("g-w", 0o022), 0o022);
+		assert_eq!(parse("+x", 0o022), 0o022);
+		assert_eq!(parse("u+r-w", 0o777), 0o377);
+		assert_eq!(parse("a+r,u-w", 0o777), 0o333);
+	}
+
+	#[test]
+	fn rejects_invalid_symbolic_umasks() {
+		assert!(parse_symbolic_umask("", 0o022).is_err());
+		assert!(parse_symbolic_umask("u", 0o022).is_err());
+		assert!(parse_symbolic_umask("u+z", 0o022).is_err());
+		assert!(parse_symbolic_umask("z+r", 0o022).is_err());
+		assert!(parse_symbolic_umask("u=,", 0o022).is_err());
+		assert!(parse_symbolic_umask("u,,g=r", 0o022).is_err());
+	}
 }

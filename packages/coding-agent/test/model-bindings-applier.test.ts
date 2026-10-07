@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { ModelBindingsApplier } from "../src/config/model-bindings-applier";
-import type { Settings } from "../src/config/settings";
+import { Settings } from "../src/config/settings";
 
 function createSettings(initial: {
 	modelRoles: Record<string, string | string[]>;
@@ -78,6 +78,93 @@ describe("ModelBindingsApplier", () => {
 			modelRoles: { default: "config/default" },
 			"task.agentModelOverrides": { executor: "config/executor" },
 		});
+	});
+
+	test("snapshots applied bindings and lifecycle onto independent Settings", () => {
+		const sourceSettings = Settings.isolated({
+			modelRoles: { default: "baseline/default" },
+			"task.agentModelOverrides": { executor: "baseline/executor" },
+		});
+		const sourceApplier = new ModelBindingsApplier();
+		sourceApplier.setBindings({
+			modelRoles: { default: ["configured/default", "configured/fallback"] },
+			agentModelOverrides: { executor: ["configured/executor", "configured/executor-fallback"] },
+		});
+		sourceApplier.applyTo(sourceSettings);
+
+		sourceSettings.override("modelRoles", {
+			...sourceSettings.get("modelRoles"),
+			default: "profile/default",
+		});
+		sourceSettings.override("task.agentModelOverrides", {
+			...sourceSettings.get("task.agentModelOverrides"),
+			executor: "profile/executor",
+		});
+
+		const capturedSettings = sourceSettings.snapshot();
+		const fork = sourceApplier.snapshotForSettings(capturedSettings);
+		expect(fork.getBindings()).toEqual(sourceApplier.getBindings());
+		expect(capturedSettings.get("modelRoles").default).toBe("profile/default");
+		expect(capturedSettings.get("task.agentModelOverrides").executor).toBe("profile/executor");
+
+		// The fork already targets the captured Settings; this must not restore or retarget the source.
+		fork.applyTo(capturedSettings);
+		expect(sourceSettings.get("modelRoles").default).toBe("profile/default");
+		expect(sourceSettings.get("task.agentModelOverrides").executor).toBe("profile/executor");
+
+		const callerChain = ["fork/default", "fork/fallback"];
+		fork.setBindings({
+			modelRoles: { default: callerChain },
+			agentModelOverrides: { executor: "fork/executor" },
+		});
+		callerChain[0] = "caller/mutated";
+		fork.forceApplyTo(capturedSettings);
+		fork.applyTo(capturedSettings);
+		expect(capturedSettings.get("modelRoles").default).toEqual(["fork/default", "fork/fallback"]);
+		expect(capturedSettings.get("task.agentModelOverrides").executor).toBe("fork/executor");
+		expect(sourceApplier.getBindings()).toEqual({
+			modelRoles: { default: ["configured/default", "configured/fallback"] },
+			agentModelOverrides: { executor: ["configured/executor", "configured/executor-fallback"] },
+		});
+		expect(sourceSettings.get("modelRoles").default).toBe("profile/default");
+		expect(sourceSettings.get("task.agentModelOverrides").executor).toBe("profile/executor");
+
+		fork.setBindings(undefined);
+		fork.apply();
+		expect(capturedSettings.get("modelRoles").default).toBe("baseline/default");
+		expect(capturedSettings.get("task.agentModelOverrides").executor).toBe("baseline/executor");
+
+		sourceApplier.setBindings({
+			modelRoles: { default: "source/default" },
+			agentModelOverrides: { executor: "source/executor" },
+		});
+		sourceApplier.forceApplyTo(sourceSettings);
+		fork.setBindings({
+			modelRoles: { default: "fork/independent" },
+			agentModelOverrides: { executor: "fork/independent" },
+		});
+		fork.forceApplyTo(capturedSettings);
+		expect(sourceSettings.get("modelRoles").default).toBe("source/default");
+		expect(sourceSettings.get("task.agentModelOverrides").executor).toBe("source/executor");
+		expect(capturedSettings.get("modelRoles").default).toBe("fork/independent");
+		expect(capturedSettings.get("task.agentModelOverrides").executor).toBe("fork/independent");
+		expect(sourceApplier.getBindings()).toEqual({
+			modelRoles: { default: "source/default" },
+			agentModelOverrides: { executor: "source/executor" },
+		});
+		expect(fork.getBindings()).toEqual({
+			modelRoles: { default: "fork/independent" },
+			agentModelOverrides: { executor: "fork/independent" },
+		});
+
+		sourceApplier.setBindings(undefined);
+		sourceApplier.apply();
+		fork.setBindings(undefined);
+		fork.apply();
+		expect(sourceSettings.get("modelRoles").default).toBe("baseline/default");
+		expect(sourceSettings.get("task.agentModelOverrides").executor).toBe("baseline/executor");
+		expect(capturedSettings.get("modelRoles").default).toBe("baseline/default");
+		expect(capturedSettings.get("task.agentModelOverrides").executor).toBe("baseline/executor");
 	});
 
 	test("snapshots configured selector arrays before applying them", () => {

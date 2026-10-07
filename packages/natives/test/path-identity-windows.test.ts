@@ -9,6 +9,7 @@ import {
 	canonicalExistingDirectoryIdentity,
 	exactRemoveDirectoryTree,
 	exactReplacePath,
+	exactReplaceRetained,
 	exactRestore,
 	exactUnlink,
 	exactUnlinkDirect,
@@ -153,6 +154,52 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		expect(exactReplacePath(source, destination, sourceIdentity, destinationIdentity)).toEqual({ ok: true });
 		expect(await fs.readFile(destination, "utf8")).toBe("new-state");
 		await expect(fs.access(source)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("publishes a retained self-replacement for owner-only executables (#6096)", async () => {
+		// exactReplaceRetained reads each retained handle's owner and DACL to enforce
+		// the no-shared-write invariant. Without READ_CONTROL on those handles,
+		// GetSecurityInfo fails and every real Windows `gjc update` stopped at
+		// acl_unavailable before promotion.
+		const root = await temporaryDirectory();
+		const source = path.join(root, "staged.exe");
+		const destination = path.join(root, "gjc.exe");
+		const user = process.env.USERNAME;
+		if (!user) throw new Error("Missing Windows username");
+		await fs.writeFile(source, "new-binary");
+		await fs.writeFile(destination, "old-binary");
+		// Exact replacement validates ownership as well as the DACL; pin the
+		// fixture owner instead of relying on the runner's temp-file default.
+		await runIcacls(source, "/setowner", user);
+		await runIcacls(destination, "/setowner", user);
+		expect(applyOwnerOnlyPathSecurity(source, "file")).toEqual({ ok: true });
+		expect(applyOwnerOnlyPathSecurity(destination, "file")).toEqual({ ok: true });
+		const parent = await parentIdentity(source);
+		const identity = async (pathname: string, contents: string) => {
+			const stat = await fs.stat(pathname, { bigint: true });
+			return {
+				...parent,
+				dev: stat.dev,
+				ino: stat.ino,
+				nlink: stat.nlink,
+				size: stat.size,
+				mtimeNs: stat.mtimeNs,
+				sha256: sha256(contents),
+			};
+		};
+
+		const result = exactReplaceRetained(
+			source,
+			destination,
+			"gjc.exe.backup",
+			await identity(source, "new-binary"),
+			await identity(destination, "old-binary"),
+		);
+
+		expect(result.code).toBeUndefined();
+		expect(result.ok).toBe(true);
+		expect(await fs.readFile(destination, "utf8")).toBe("new-binary");
+		expect(await fs.readFile(path.join(root, "gjc.exe.backup"), "utf8")).toBe("old-binary");
 	});
 
 	it("retries a transient destination sharing violation and succeeds after the holder releases", async () => {
@@ -563,6 +610,39 @@ setTimeout(() => { try { fs.closeSync(fd); } catch {} process.exit(0); }, Number
 		expect(verifyOwnerOnlyPathSecurity(directory, "directory")).toEqual({ ok: true });
 		expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: true });
 		expect(await fs.readFile(file, "utf8")).toBe(contents);
+	});
+	it("accepts a BUILTIN Administrators-owned managed directory with the current user's safe DACL", async () => {
+		const root = await temporaryDirectory();
+		const directory = path.join(root, "managed-admin-owned");
+		const user = process.env.USERNAME;
+		if (!user) throw new Error("Missing Windows username");
+		await fs.mkdir(directory);
+		expect(applyOwnerOnlyPathSecurity(directory, "directory")).toEqual({ ok: true });
+
+		try {
+			await runIcacls(directory, "/setowner", "*S-1-5-32-544");
+			expect(verifyOwnerOnlyPathSecurity(directory, "directory")).toEqual({ ok: true });
+		} finally {
+			await runIcacls(directory, "/setowner", user);
+		}
+	});
+	it("continues rejecting managed directories owned by SYSTEM", async () => {
+		const root = await temporaryDirectory();
+		const directory = path.join(root, "managed-system-owned");
+		const user = process.env.USERNAME;
+		if (!user) throw new Error("Missing Windows username");
+		await fs.mkdir(directory);
+		expect(applyOwnerOnlyPathSecurity(directory, "directory")).toEqual({ ok: true });
+
+		try {
+			await runIcacls(directory, "/setowner", "*S-1-5-18");
+			expect(verifyOwnerOnlyPathSecurity(directory, "directory")).toEqual({
+				ok: false,
+				code: "owner_mismatch",
+			});
+		} finally {
+			await runIcacls(directory, "/setowner", user);
+		}
 	});
 	it("repairs a legacy inherited ACL only for the captured directory and file identities", async () => {
 		const root = await temporaryDirectory();

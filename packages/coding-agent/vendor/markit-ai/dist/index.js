@@ -8,7 +8,6 @@ export { ImageConverter } from "./converters/image.js";
 export { IpynbConverter } from "./converters/ipynb.js";
 export { IWorkConverter } from "./converters/iwork.js";
 export { JsonConverter } from "./converters/json.js";
-export { PdfConverter } from "./converters/pdf/index.js";
 export { PlainTextConverter } from "./converters/plain-text.js";
 export { PptxConverter } from "./converters/pptx.js";
 export { RssConverter } from "./converters/rss.js";

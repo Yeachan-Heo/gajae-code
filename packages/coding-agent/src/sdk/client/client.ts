@@ -14,6 +14,8 @@ export type SdkErrorCode =
 export class SdkClientError extends Error {
 	readonly code: SdkErrorCode;
 	readonly details: unknown;
+	/** True only when the SDK client itself reported a transport failure, never for a server error frame. */
+	readonly transport: boolean;
 	/**
 	 * Reconnect-cycle diagnostics, separate from `details` because `details` is an
 	 * established contract: callers read the terminating transport error straight off
@@ -22,19 +24,35 @@ export class SdkClientError extends Error {
 	 * break every such reader, so the new attribution rides alongside it instead.
 	 */
 	readonly reconnect?: SdkReconnectExhaustedDetails;
-	constructor(code: SdkErrorCode, message: string, details?: unknown, reconnect?: SdkReconnectExhaustedDetails) {
+	constructor(
+		code: SdkErrorCode,
+		message: string,
+		details?: unknown,
+		reconnect?: SdkReconnectExhaustedDetails,
+		options: { transport?: boolean } = {},
+	) {
 		super(message);
 		this.name = "SdkClientError";
 		this.code = code;
 		this.details = details;
+		this.transport = options.transport === true;
 		if (reconnect) this.reconnect = reconnect;
 	}
+}
+
+function transportError(
+	code: SdkErrorCode,
+	message: string,
+	details?: unknown,
+	reconnect?: SdkReconnectExhaustedDetails,
+): SdkClientError {
+	return new SdkClientError(code, message, details, reconnect, { transport: true });
 }
 
 /** A prepared transport operation failed before any wire handoff. */
 export class SdkPreparedDispatchError extends SdkClientError {
 	constructor(error: SdkClientError) {
-		super(error.code, error.message, error.details, error.reconnect);
+		super(error.code, error.message, error.details, error.reconnect, { transport: error.transport });
 		this.name = "SdkPreparedDispatchError";
 	}
 }
@@ -82,6 +100,8 @@ export interface SdkClientOptions {
 
 export interface SdkRequestOptions {
 	timeoutMs?: number;
+	/** Absolute wall-clock deadline for this request, including connection setup. */
+	deadline?: number;
 	idempotencyKey?: string;
 	confirm?: boolean;
 	/**
@@ -350,18 +370,18 @@ export class SdkClient {
 	}
 
 	send(frame: SdkFrame): void {
-		if (this.#closed) throw new SdkClientError("connection_closed", "SDK client closed");
+		if (this.#closed) throw transportError("connection_closed", "SDK client closed");
 		this.#throwIfDeadlineElapsed();
 		const current = this.#currentSocketRecord ?? this.#opening?.candidate;
 		const authoritative =
 			this.#isActive(current ?? null) ||
 			(!!current && current.phase === "hello" && this.#isCandidate(current.cycle, current));
 		if (!current || !authoritative || current.socket.readyState !== WebSocket.OPEN)
-			throw new SdkClientError("connection_closed", "SDK WebSocket is not connected");
+			throw transportError("connection_closed", "SDK WebSocket is not connected");
 		try {
 			current.socket.send(JSON.stringify(frame));
 		} catch (error) {
-			throw new SdkClientError("unavailable", "SDK WebSocket send failed", error);
+			throw transportError("unavailable", "SDK WebSocket send failed", error);
 		}
 	}
 
@@ -383,19 +403,19 @@ export class SdkClient {
 			if (cycle.backoffTimer) clearTimeout(cycle.backoffTimer);
 			if (cycle.candidate) {
 				transports.add(cycle.candidate);
-				this.#retire(cycle.candidate, new SdkClientError("connection_closed", "SDK client closed"), false);
+				this.#retire(cycle.candidate, transportError("connection_closed", "SDK client closed"), false);
 			}
-			cycle.rejectBackoff?.(new SdkClientError("connection_closed", "SDK client closed"));
+			cycle.rejectBackoff?.(transportError("connection_closed", "SDK client closed"));
 			cycle.rejectBackoff = undefined;
 			if (this.#opening === cycle) this.#opening = null;
 		}
 		const current = this.#currentSocketRecord;
 		if (current) {
 			transports.add(current);
-			this.#retire(current, new SdkClientError("connection_closed", "SDK client closed"), false, true);
+			this.#retire(current, transportError("connection_closed", "SDK client closed"), false, true);
 		}
 		for (const [id, pending] of this.#pending)
-			this.#settlePending(id, pending, new SdkClientError("connection_closed", "SDK client closed"), true);
+			this.#settlePending(id, pending, transportError("connection_closed", "SDK client closed"), true);
 		try {
 			await Promise.all([...transports].map(incarnation => this.#closeTransport(incarnation)));
 		} finally {
@@ -469,7 +489,7 @@ export class SdkClient {
 
 	async #request(frame: Frame, options: SdkRequestOptions, onResponse?: () => void): Promise<unknown> {
 		if (this.#closed) {
-			const error = new SdkClientError("connection_closed", "SDK client closed");
+			const error = transportError("connection_closed", "SDK client closed");
 			throw options.connectedOnly ? new SdkPreparedDispatchError(error) : error;
 		}
 		try {
@@ -477,6 +497,14 @@ export class SdkClient {
 		} catch (error) {
 			if (options.connectedOnly && error instanceof SdkClientError) throw new SdkPreparedDispatchError(error);
 			throw error;
+		}
+		const requestDeadline =
+			typeof options.deadline === "number" && Number.isFinite(options.deadline)
+				? Math.min(options.deadline, this.#deadline ?? Number.POSITIVE_INFINITY)
+				: this.#deadline;
+		if (requestDeadline !== undefined && Date.now() >= requestDeadline) {
+			const error = this.#deadlineError();
+			throw options.connectedOnly ? new SdkPreparedDispatchError(error) : error;
 		}
 		let incarnation: Incarnation;
 		if (options.connectedOnly) {
@@ -486,8 +514,8 @@ export class SdkClient {
 				if (error instanceof SdkClientError) throw new SdkPreparedDispatchError(error);
 				throw error;
 			}
-		} else incarnation = await this.#connect();
-		const timeoutMs = this.#remainingTimeout(options.timeoutMs ?? this.#timeoutMs);
+		} else incarnation = await this.#connect(requestDeadline);
+		const timeoutMs = this.#remainingTimeout(options.timeoutMs ?? this.#timeoutMs, requestDeadline);
 		if (timeoutMs <= 0) {
 			const error = this.#deadlineError();
 			throw options.connectedOnly ? new SdkPreparedDispatchError(error) : error;
@@ -526,7 +554,7 @@ export class SdkClient {
 					this.#settlePending(
 						id,
 						pending,
-						new SdkClientError("timeout", `SDK request timed out after ${timeoutMs}ms`, {
+						transportError("timeout", `SDK request timed out after ${timeoutMs}ms`, {
 							requestId: id,
 							requestSent: pending.sent,
 						} satisfies SdkRequestTimeoutDetails),
@@ -537,7 +565,7 @@ export class SdkClient {
 		};
 		this.#pending.set(id, pending);
 		if (!this.#isActive(incarnation) || incarnation.socket.readyState !== WebSocket.OPEN) {
-			const error = new SdkClientError("unavailable", "SDK WebSocket is not connected");
+			const error = transportError("unavailable", "SDK WebSocket is not connected");
 			this.#settlePending(id, pending, options.connectedOnly ? new SdkPreparedDispatchError(error) : error);
 			return await deferred.promise;
 		}
@@ -591,19 +619,19 @@ export class SdkClient {
 					pending,
 					options.connectedOnly
 						? new SdkPreparedDispatchError(
-								new SdkClientError("connection_closed", "SDK client closed during dispatch"),
+								transportError("connection_closed", "SDK client closed during dispatch"),
 							)
-						: new SdkClientError("connection_closed", "SDK client closed during dispatch"),
+						: transportError("connection_closed", "SDK client closed during dispatch"),
 				);
 			return await deferred.promise;
 		}
-		if (this.#deadline !== undefined && Date.now() >= this.#deadline) {
+		if (requestDeadline !== undefined && Date.now() >= requestDeadline) {
 			const error = this.#deadlineError();
 			this.#settlePending(id, pending, options.connectedOnly ? new SdkPreparedDispatchError(error) : error);
 			return await deferred.promise;
 		}
 		if (incarnation.socket.readyState !== WebSocket.OPEN) {
-			const error = new SdkClientError("unavailable", "SDK WebSocket is not connected");
+			const error = transportError("unavailable", "SDK WebSocket is not connected");
 			this.#settlePending(id, pending, options.connectedOnly ? new SdkPreparedDispatchError(error) : error);
 			return await deferred.promise;
 		}
@@ -638,7 +666,7 @@ export class SdkClient {
 				const sendError =
 					error instanceof SdkClientError
 						? error
-						: new SdkClientError("unavailable", "SDK WebSocket send failed", error);
+						: transportError("unavailable", "SDK WebSocket send failed", error);
 				this.#settlePending(
 					id,
 					pending,
@@ -665,24 +693,25 @@ export class SdkClient {
 	}
 
 	#deadlineError(reconnect?: SdkReconnectExhaustedDetails): SdkClientError {
-		return new SdkClientError("timeout", "SDK client deadline elapsed.", undefined, reconnect);
+		return transportError("timeout", "SDK client deadline elapsed.", undefined, reconnect);
 	}
 
-	#remainingTimeout(limit = this.#timeoutMs): number {
-		if (this.#deadline === undefined) return limit;
-		return Math.min(limit, Math.max(0, this.#deadline - Date.now()));
+	#remainingTimeout(limit = this.#timeoutMs, deadline = this.#deadline): number {
+		if (deadline === undefined) return limit;
+		return Math.min(limit, Math.max(0, deadline - Date.now()));
 	}
 
 	#throwIfDeadlineElapsed(): void {
 		if (this.#deadline !== undefined && Date.now() >= this.#deadline) throw this.#deadlineError();
 	}
 
-	async #connect(): Promise<Incarnation> {
+	async #connect(requestDeadline?: number): Promise<Incarnation> {
 		this.#throwIfDeadlineElapsed();
+		if (requestDeadline !== undefined && Date.now() >= requestDeadline) throw this.#deadlineError();
 		const current = this.#currentSocketRecord;
 		if (current && this.#isActive(current) && current.socket.readyState === WebSocket.OPEN) return current;
 		if (current)
-			this.#retire(current, new SdkClientError("connection_closed", "SDK WebSocket connection closed"), true, true);
+			this.#retire(current, transportError("connection_closed", "SDK WebSocket connection closed"), true, true);
 
 		let cycle = this.#opening;
 		if (!cycle) {
@@ -690,13 +719,22 @@ export class SdkClient {
 			this.#opening = cycle;
 			cycle.promise = this.#openWithRetry(cycle);
 		}
-		return await cycle.promise!;
+		if (requestDeadline === undefined) return await cycle.promise!;
+		const remaining = requestDeadline - Date.now();
+		if (remaining <= 0) throw this.#deadlineError();
+		const expired = Promise.withResolvers<never>();
+		const timer = setTimeout(() => expired.reject(this.#deadlineError()), remaining);
+		try {
+			return await Promise.race([cycle.promise!, expired.promise]);
+		} finally {
+			clearTimeout(timer);
+		}
 	}
 
 	#requireConnectedIncarnation(): Incarnation {
 		const current = this.#currentSocketRecord;
 		if (!current || !this.#isActive(current) || current.socket.readyState !== WebSocket.OPEN)
-			throw new SdkClientError("connection_closed", "SDK WebSocket disconnected before prepared dispatch.");
+			throw transportError("connection_closed", "SDK WebSocket disconnected before prepared dispatch.");
 		return current;
 	}
 
@@ -711,7 +749,7 @@ export class SdkClient {
 			reason,
 		});
 		const cancelled = (): SdkClientError =>
-			new SdkClientError("connection_closed", "SDK client closed", lastError, diagnostics("cancelled"));
+			transportError("connection_closed", "SDK client closed", lastError, diagnostics("cancelled"));
 		/**
 		 * A deadline and retry budget measure different failure axes. One-shot clients
 		 * need the deadline to fast-fail their operation, while long-lived ACP sessions
@@ -730,10 +768,10 @@ export class SdkClient {
 			try {
 				const incarnation = await this.#open(cycle);
 				if (!this.#isActive(incarnation) && (!this.#isOpening(cycle) || cycle.candidate !== incarnation))
-					throw new SdkClientError("connection_closed", "SDK WebSocket is not connected");
+					throw transportError("connection_closed", "SDK WebSocket is not connected");
 				await this.#waitForHello(incarnation);
 				if (this.#isActive(incarnation)) return incarnation;
-				throw new SdkClientError("connection_closed", "SDK WebSocket is not connected");
+				throw transportError("connection_closed", "SDK WebSocket is not connected");
 			} catch (error) {
 				lastError = error;
 				if (!this.#isOpening(cycle)) throw cancelled();
@@ -743,7 +781,7 @@ export class SdkClient {
 						candidate,
 						error instanceof SdkClientError
 							? error
-							: new SdkClientError("unavailable", "SDK WebSocket connection failed", error),
+							: transportError("unavailable", "SDK WebSocket connection failed", error),
 						true,
 					);
 				if (attempt < this.#reconnectAttempts) {
@@ -780,7 +818,7 @@ export class SdkClient {
 		}
 		cycle.phase = "complete";
 		if (this.#opening === cycle) this.#opening = null;
-		const error = new SdkClientError(
+		const error = transportError(
 			"reconnect_exhausted",
 			"SDK WebSocket reconnect attempts exhausted",
 			lastError,
@@ -891,7 +929,7 @@ export class SdkClient {
 		if (incarnation.failure) return Promise.reject(incarnation.failure);
 		if (this.#isActive(incarnation)) return Promise.resolve();
 		if (!this.#isCandidate(incarnation.cycle, incarnation) || incarnation.phase !== "hello")
-			return Promise.reject(new SdkClientError("connection_closed", "SDK WebSocket is not connected"));
+			return Promise.reject(transportError("connection_closed", "SDK WebSocket is not connected"));
 		const deferred = Promise.withResolvers<void>();
 		incarnation.resolveHello = deferred.resolve;
 		incarnation.rejectHello = deferred.reject;
@@ -903,7 +941,7 @@ export class SdkClient {
 		const error =
 			this.#deadline !== undefined && Date.now() >= this.#deadline
 				? this.#deadlineError()
-				: new SdkClientError("timeout", `SDK WebSocket connection timed out after ${timeoutMs}ms`);
+				: transportError("timeout", `SDK WebSocket connection timed out after ${timeoutMs}ms`);
 		incarnation.rejectOpen?.(error);
 		this.#retire(incarnation, error, true);
 	}
@@ -911,20 +949,20 @@ export class SdkClient {
 	#onSocketFailure(incarnation: Incarnation, event?: Event): void {
 		if (!this.#isCandidate(incarnation.cycle, incarnation) && !this.#isActive(incarnation)) return;
 		const detail = event as (Event & { error?: unknown; message?: unknown }) | undefined;
+		let failureMessage = "SDK WebSocket connection closed";
+		if (detail?.error instanceof Error) failureMessage = detail.error.message;
+		else if (typeof detail?.message === "string") failureMessage = detail.message;
 		const error =
-			detail?.error instanceof Error
+			detail?.error instanceof SdkClientError && detail.error.transport
 				? detail.error
-				: new SdkClientError(
-						"connection_closed",
-						typeof detail?.message === "string" ? detail.message : "SDK WebSocket connection closed",
-					);
+				: transportError("connection_closed", failureMessage);
 		if (incarnation.phase === "opening") incarnation.rejectOpen?.(error);
 		if (incarnation.phase === "hello") incarnation.rejectHello?.(error);
 		this.#retire(
 			incarnation,
 			error instanceof SdkClientError
 				? error
-				: new SdkClientError("unavailable", "SDK WebSocket connection failed", error),
+				: transportError("unavailable", "SDK WebSocket connection failed", error),
 			true,
 			true,
 		);
@@ -1115,7 +1153,7 @@ export class SdkClient {
 		const onClose = (): void => resolve();
 		socket.addEventListener("close", onClose, { once: true });
 		const timer = setTimeout(
-			() => reject(new SdkClientError("timeout", `SDK WebSocket close timed out after ${timeoutMs}ms`)),
+			() => reject(transportError("timeout", `SDK WebSocket close timed out after ${timeoutMs}ms`)),
 			timeoutMs,
 		);
 		timer.unref?.();
@@ -1124,9 +1162,9 @@ export class SdkClient {
 			if (Number(socket.readyState) === WebSocket.CLOSED) resolve();
 			await promise;
 		} catch (error) {
-			if (error instanceof SdkClientError) throw error;
+			if (error instanceof SdkClientError && error.transport) throw error;
 			if (Number(socket.readyState) !== WebSocket.CLOSED)
-				throw new SdkClientError("connection_closed", "SDK WebSocket close failed", error);
+				throw transportError("connection_closed", "SDK WebSocket close failed", error);
 		} finally {
 			clearTimeout(timer);
 			socket.removeEventListener("close", onClose);

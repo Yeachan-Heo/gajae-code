@@ -1,3 +1,5 @@
+# Vendored from oh-my-pi (MIT) crates/pi-ast/Cargo.toml @ a85bd5228d9f0f619deade1db78fa49420a721e1
+# Local modifications: workspace manifest subset with optional full-langs grammar dependencies and Perl support.
 [package]
 name = "pi-ast"
 version.workspace = true
@@ -28,8 +30,10 @@ tree-sitter-dart = { workspace = true, optional = true }
 tree-sitter-css.workspace = true
 tree-sitter-diff = { workspace = true, optional = true }
 tree-sitter-dockerfile = { workspace = true, optional = true }
+tree-sitter-elisp = { workspace = true, optional = true }
 tree-sitter-elixir = { workspace = true, optional = true }
 tree-sitter-erlang = { workspace = true, optional = true }
+tree-sitter-fortran = { workspace = true, optional = true }
 tree-sitter-go.workspace = true
 tree-sitter-graphql = { workspace = true, optional = true }
 tree-sitter-haskell = { workspace = true, optional = true }
@@ -72,6 +76,7 @@ tree-sitter-vue = { workspace = true, optional = true }
 tree-sitter-xml = { workspace = true, optional = true }
 tree-sitter-yaml.workspace = true
 tree-sitter-zig = { workspace = true, optional = true }
+xxhash-rust.workspace = true
 [features]
 default = []
 full-langs = [
@@ -81,8 +86,10 @@ full-langs = [
 	"dep:tree-sitter-dart",
 	"dep:tree-sitter-diff",
 	"dep:tree-sitter-dockerfile",
+	"dep:tree-sitter-elisp",
 	"dep:tree-sitter-elixir",
 	"dep:tree-sitter-erlang",
+	"dep:tree-sitter-fortran",
 	"dep:tree-sitter-graphql",
 	"dep:tree-sitter-haskell",
 	"dep:tree-sitter-hcl",

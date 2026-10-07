@@ -161,30 +161,64 @@ describe("runtime deletion guard: real preload wiring (subprocess)", () => {
 	const repoRoot = path.join(import.meta.dir, "..");
 	const fixturesDir = path.join(repoRoot, "scripts", "test-fixtures");
 
-	function runFixture(name: string, env: Record<string, string>): { exitCode: number; stderr: string } {
-		const proc = Bun.spawnSync({
-			cmd: [process.execPath, "test", path.join(fixturesDir, name)],
-			cwd: repoRoot,
-			env: { ...process.env, ...env },
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		return {
-			exitCode: proc.exitCode,
-			stderr: new TextDecoder().decode(proc.stderr),
-		};
+	/**
+	 * Spawns a child with its output captured through temp files.
+	 *
+	 * `stdout: "pipe"` is unavailable here: Bun 1.4.0 throws `EBADF: bad file
+	 * descriptor, posix_spawn` for the piped shape whenever the test preload is
+	 * active (see {@link runFixture}). A `Bun.file` destination works in both
+	 * postures.
+	 */
+	function spawnCaptured(cmd: string[], env: NodeJS.ProcessEnv): { exitCode: number; stderr: string } {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-guard-spawn-"));
+		try {
+			const stdoutPath = path.join(dir, "stdout");
+			const stderrPath = path.join(dir, "stderr");
+			const proc = Bun.spawnSync({
+				cmd,
+				cwd: repoRoot,
+				env,
+				stdout: Bun.file(stdoutPath),
+				stderr: Bun.file(stderrPath),
+			});
+			return {
+				exitCode: proc.exitCode,
+				stderr: fs.readFileSync(stderrPath, "utf8"),
+			};
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	}
+
+	/**
+	 * Runs a fixture through `bun test` with the real preload wiring.
+	 *
+	 * The path is passed ABSOLUTE on purpose. Bun 1.4.0 selects its module
+	 * loader from the shape of the test path: an absolute path loads
+	 * `bunfig.toml` and runs the preload normally, while a BARE relative path
+	 * (`scripts/x.ts`) silently skips the preload entirely, which would make
+	 * these assertions study an unguarded child.
+	 */
+	function runFixture(name: string, env: Record<string, string>): { exitCode: number; stderr: string } {
+		return spawnCaptured([process.execPath, "test", path.join(fixturesDir, name)], {
+			...process.env,
+			...env,
+		});
+	}
+
 
 	/** Removal outside any guarded surface: a plain `bun -e` process has no preload. */
 	function unguardedRm(target: string): void {
-		const proc = Bun.spawnSync({
-			cmd: [process.execPath, "-e", "require('node:fs').rmSync(process.argv[1], { recursive: true, force: true })", target],
-			cwd: repoRoot,
-			env: process.env,
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		if (proc.exitCode !== 0) throw new Error(`unguarded cleanup failed for ${target}`);
+		const result = spawnCaptured(
+			[
+				process.execPath,
+				"-e",
+				"require('node:fs').rmSync(process.argv[1], { recursive: true, force: true })",
+				target,
+			],
+			process.env,
+		);
+		if (result.exitCode !== 0) throw new Error(`unguarded cleanup failed for ${target}`);
 	}
 
 	test.skipIf(process.platform !== "linux" || !isWritable("/dev/shm"))(
@@ -247,6 +281,32 @@ describe("runtime deletion guard: real preload wiring (subprocess)", () => {
 			}
 		},
 	);
+
+	/**
+	 * The account-home probe must resolve the REAL home from inside this
+	 * repository's preloaded `bun test` posture. If the probe silently fails,
+	 * `homeAliases` is empty, the world collapses to repo-root-only, and every
+	 * `mkdtemp(os.tmpdir())` fixture becomes undeletable — reported as unrelated
+	 * cleanup failures long after the real cause (issue #4794).
+	 *
+	 * This runs the fixture as a CHILD on purpose. The world is built once at
+	 * module load, so an in-process assertion would observe whatever the preload
+	 * already resolved and could never catch a broken probe.
+	 */
+	test("a preloaded child resolves the real account home and authorizes the temp root", () => {
+		// BARE relative path on purpose. Bun 1.4.0 only arms the piped-spawn
+		// `EBADF` defect for this path shape: with `./` or an absolute path the
+		// child silently keeps a working pipe and would mask a regression. A
+		// bare relative argument is a filename FILTER (not a path), so the
+		// fixture is discovered by the ordinary scan of this repository.
+		const result = spawnCaptured(
+			[process.execPath, "test", "guard-home-resolution"],
+			process.env,
+		);
+		expect(result.exitCode).toBe(0);
+		expect(result.stderr).toContain("homeAliases>0");
+		expect(result.stderr).toContain("tempRootAuthorized");
+	});
 });
 
 function isWritable(dir: string): boolean {

@@ -788,7 +788,6 @@ describe("AgentSession concurrent prompt guard", () => {
 		await hiddenTurn;
 		await firstPrompt;
 		await session.waitForIdle();
-
 		expect(callMessages).toHaveLength(2);
 		expect(
 			callMessages[1]?.some(message => {

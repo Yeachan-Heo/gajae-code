@@ -1,6 +1,6 @@
 # Context Compaction
 
-GJC compacts conversation context when the current context token count crosses the configured compaction threshold. By default, adaptive compaction is off and the legacy threshold behavior is preserved.
+GJC compacts conversation context when the current context token count crosses the configured compaction threshold. By default, adaptive compaction is off and the reserve-based auto-compaction threshold is capped at 300,000 tokens; an active opt-in context promotion uses the promoted model's uncapped reserve-based threshold.
 
 ## Static Threshold Tuning
 
@@ -17,7 +17,7 @@ compaction:
   thresholdPercent: 70
 ```
 
-`compaction.thresholdTokens` takes priority over percentage settings when it is greater than zero. With adaptive mode disabled, the default percentage sentinel `-1` uses the legacy reserve-based threshold: roughly `contextWindow - reserve`, commonly near 85% of the model context window. With adaptive mode enabled, `compaction.adaptive.baseThresholdPercent` is the adaptive base, including when `thresholdPercent` remains at its `-1` sentinel; the adaptive base is then lowered only when its context and call-rate conditions are met.
+`compaction.thresholdTokens` takes priority over percentage settings when it is greater than zero. With adaptive mode disabled, the default percentage sentinel `-1` uses a reserve-based auto-compaction threshold capped at 300,000 tokens: `min(contextWindow - max(15% of contextWindow, compaction.reserveTokens), 300,000)`. Automatic compaction does not reserve a separate model max-output budget. While opt-in context promotion is active, the promoted model instead uses its uncapped reserve-based threshold to benefit from the larger context window. Explicit token and percentage thresholds are not capped. With adaptive mode enabled, `compaction.adaptive.baseThresholdPercent` is the adaptive base, including when `thresholdPercent` remains at its `-1` sentinel; the adaptive base is then lowered only when its context and call-rate conditions are met and is not capped at 300,000 tokens.
 
 ## Adaptive Compaction
 

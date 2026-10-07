@@ -1402,6 +1402,42 @@ describe("replacement cleanup receipt reconcile TOCTOU resilience", () => {
 		expect(fs.existsSync(path.join(root, "concurrent-reconcile"))).toBe(true);
 	});
 
+	it("accepts a real native lost-source result only for the exact peer-promoted orphan receipt", () => {
+		const { pending, receipt } = pendingReceipt();
+		const originalBytes = fs.readFileSync(pending);
+		const originalInode = fs.statSync(pending).ino;
+		const realRename = native.renameNoReplacePath;
+		vi.spyOn(native, "renameNoReplacePath").mockImplementation((source, destination) => {
+			if (source !== pending) return realRename(source, destination);
+			expect(realRename(source, destination).ok).toBe(true);
+			return realRename(source, destination);
+		});
+
+		replay("native-concurrent-reconcile");
+
+		expect(fs.existsSync(pending)).toBe(false);
+		expect(fs.statSync(receipt).ino).toBe(originalInode);
+		expect(fs.readFileSync(receipt).equals(originalBytes)).toBe(true);
+		expect(fs.existsSync(path.join(root, "native-concurrent-reconcile"))).toBe(true);
+	});
+
+	it("refuses a real native lost-source result when the promoted receipt was replaced", () => {
+		const { pending, receipt } = pendingReceipt();
+		const realRename = native.renameNoReplacePath;
+		vi.spyOn(native, "renameNoReplacePath").mockImplementation((source, destination) => {
+			if (source !== pending) return realRename(source, destination);
+			expect(realRename(source, destination).ok).toBe(true);
+			const replacement = `${destination}.replacement`;
+			fs.copyFileSync(destination, replacement);
+			fs.renameSync(replacement, destination);
+			return realRename(source, destination);
+		});
+
+		expect(() => replay("unproven-native-reconcile")).toThrow("managed_replace_cleanup_receipt_invalid");
+		expect(fs.existsSync(receipt)).toBe(true);
+		expect(fs.existsSync(path.join(root, "unproven-native-reconcile"))).toBe(false);
+	});
+
 	it("canonicalizes signed file ids from an interrupted pending Windows receipt", () => {
 		const destination = path.join(root, "session.jsonl");
 		const staging = path.join(root, ".session.replacement");
@@ -1763,6 +1799,92 @@ describe("replacement cleanup receipt reconcile TOCTOU resilience", () => {
 		expect(fs.existsSync(path.join(root, "cleanup-identity-mismatch"))).toBe(false);
 	});
 
+	it("defers a canonical receipt whose retirement slot a peer has already claimed", () => {
+		const predecessorPath = path.join(root, "predecessor");
+		fs.writeFileSync(predecessorPath, "predecessor\n");
+		const predecessor = snapshot(predecessorPath);
+		const contents = JSON.stringify({ arbitrary: "receipt contents are advisory" });
+		const { receipt, receiptIdentity } = publishCanonicalReceipt(predecessor, contents);
+		// A peer's native exact-unlink claims the slot with an empty exchange
+		// placeholder before it swaps the receipt out of its canonical name.
+		const slot = receiptQuarantine(receiptIdentity, predecessor);
+		fs.writeFileSync(slot, "");
+		const peerClaim = snapshot(slot);
+		const retainedReceipt = snapshot(receipt);
+		const exactUnlink = vi.spyOn(native, "exactUnlink");
+
+		replay("peer-claimed-slot");
+
+		expect(exactUnlink.mock.results.find(result => result.type === "return")?.value).toMatchObject({
+			ok: false,
+			code: "quarantine_collision",
+		});
+		expect(snapshot(receipt)).toEqual(retainedReceipt);
+		expect(snapshot(slot)).toEqual(peerClaim);
+		expect(fs.existsSync(path.join(root, "peer-claimed-slot"))).toBe(true);
+
+		// Once the claim is released without retiring the receipt, the retained
+		// receipt is reconciled by the next mutation.
+		fs.unlinkSync(slot);
+		replay("peer-released-slot");
+
+		expect(fs.existsSync(receipt)).toBe(false);
+		expect(fs.readFileSync(slot, "utf8")).toBe(contents);
+		expect(fs.existsSync(path.join(root, "peer-released-slot"))).toBe(true);
+	});
+
+	it("defers a detached receipt placeholder whose retirement slot a peer has already claimed", () => {
+		const predecessorPath = path.join(root, "predecessor");
+		fs.writeFileSync(predecessorPath, "predecessor\n");
+		const predecessor = snapshot(predecessorPath);
+		const { receipt, receiptIdentity } = publishCanonicalReceipt(
+			predecessor,
+			JSON.stringify({ arbitrary: "receipt contents are advisory" }),
+		);
+		// A peer detached the receipt and left its empty exchange placeholder at the
+		// canonical name; a second peer already claimed the placeholder's slot.
+		const detachedReceipt = receiptQuarantine(receiptIdentity, predecessor);
+		fs.renameSync(receipt, detachedReceipt);
+		fs.writeFileSync(receipt, "");
+		const placeholder = snapshot(receipt);
+		const hex = (value: string) => BigInt(value).toString(16);
+		const placeholderSlot = path.join(
+			root,
+			`.gjc-receipt-placeholder-remove-${hex(placeholder.dev)}-${hex(placeholder.ino)}-${hex(predecessor.dev)}-${hex(predecessor.ino)}-${hex(receiptIdentity.dev)}-${hex(receiptIdentity.ino)}`,
+		);
+		fs.writeFileSync(placeholderSlot, "");
+		const peerClaim = snapshot(placeholderSlot);
+
+		replay("peer-claimed-placeholder-slot");
+
+		expect(snapshot(receipt)).toEqual(placeholder);
+		expect(snapshot(placeholderSlot)).toEqual(peerClaim);
+		expect(snapshot(detachedReceipt)).toMatchObject({ ino: receiptIdentity.ino, sha256: receiptIdentity.sha256 });
+		expect(fs.existsSync(path.join(root, "peer-claimed-placeholder-slot"))).toBe(true);
+	});
+
+	it("keeps a receipt slot collision that retained receipt state fail-closed", () => {
+		const predecessorPath = path.join(root, "predecessor");
+		fs.writeFileSync(predecessorPath, "predecessor\n");
+		const predecessor = snapshot(predecessorPath);
+		const { receipt } = publishCanonicalReceipt(
+			predecessor,
+			JSON.stringify({ arbitrary: "receipt contents are advisory" }),
+		);
+
+		vi.spyOn(native, "exactUnlink").mockImplementation(pathname => {
+			if (pathname === receipt)
+				return { ok: false, code: "quarantine_collision", retainedUnknownPath: path.join(root, ".unknown") };
+			throw new Error(`Unexpected exact unlink: ${pathname}`);
+		});
+
+		expect(() => replay("collision-retained-state")).toThrow(
+			"managed_replace_receipt_cleanup_pending:quarantine_collision",
+		);
+		expect(fs.existsSync(receipt)).toBe(true);
+		expect(fs.existsSync(path.join(root, "collision-retained-state"))).toBe(false);
+	});
+
 	it.skipIf(process.platform !== "darwin")(
 		"keeps an exact replacement I/O failure fail-closed because replacement state is unknown",
 		() => {
@@ -1979,7 +2101,188 @@ describe.skipIf(process.platform !== "linux")("managed native security result va
 	});
 });
 
+describe("path-backed managed descendant binding", () => {
+	it("rejects a base-directory symlink to the same inode for reads and tree capture", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-path-binding-"));
+		const artifacts = path.join(root, "artifacts");
+		const detached = path.join(root, "detached-artifacts");
+		fs.mkdirSync(artifacts, { mode: 0o700 });
+		fs.writeFileSync(path.join(artifacts, "payload.bin"), "unchanged payload", { mode: 0o600 });
+		const expected = managedDirectoryRoot(artifacts);
+		const store = new ManagedSessionDescendantStore(
+			managedDirectoryRoot(root),
+			artifacts,
+			undefined,
+			"default",
+			root,
+			expected,
+			"read-only",
+		);
+		try {
+			expect(store.readExpected("payload.bin")?.bytes).toEqual(Buffer.from("unchanged payload"));
+			expect(store.captureTree("").rootIno).toBe(expected.ino.toString());
+
+			fs.renameSync(artifacts, detached);
+			fs.symlinkSync(detached, artifacts, "dir");
+			const followed = fs.statSync(artifacts, { bigint: true });
+			expect(followed.dev).toBe(expected.dev);
+			expect(followed.ino).toBe(expected.ino);
+			expect(fs.lstatSync(artifacts).isSymbolicLink()).toBe(true);
+
+			expect(() => store.assertBound()).toThrow("root binding changed");
+			expect(() => store.readExpected("payload.bin")).toThrow("root binding changed");
+			expect(() => store.captureDirectoryIdentity("")).toThrow("root binding changed");
+			expect(() => store.captureTree("")).toThrow("root binding changed");
+			expect(fs.readFileSync(path.join(detached, "payload.bin"), "utf8")).toBe("unchanged payload");
+		} finally {
+			store.close();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
+describe.skipIf(process.platform !== "darwin")("path-backed managed descendant publication binding", () => {
+	it("refuses publication through a base symlink and preserves its unchanged target", async () => {
+		const root = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-managed-path-publish-binding-"));
+		const artifacts = path.join(root, "artifacts");
+		const detached = path.join(root, "detached-artifacts");
+		await fsp.mkdir(artifacts, { mode: 0o700 });
+		await fsp.writeFile(path.join(artifacts, "payload.bin"), "unchanged payload", { mode: 0o600 });
+		const expected = managedDirectoryRoot(artifacts);
+		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), artifacts);
+		try {
+			expect(store.readExpected("payload.bin")?.bytes).toEqual(Buffer.from("unchanged payload"));
+			await store.publishNoReplace("control.bin", Buffer.from("authorized control"));
+			expect(store.captureTree("").rootIno).toBe(expected.ino.toString());
+
+			await fsp.rename(artifacts, detached);
+			await fsp.symlink(detached, artifacts, "dir");
+			const followed = await fsp.stat(artifacts, { bigint: true });
+			expect(followed.dev).toBe(expected.dev);
+			expect(followed.ino).toBe(expected.ino);
+			expect(() => store.assertBound()).toThrow("root binding changed");
+			expect(() => store.readExpected("payload.bin")).toThrow("root binding changed");
+			expect(() => store.captureTree("")).toThrow("root binding changed");
+			await expect(store.publishNoReplace("must-not-publish.bin", Buffer.from("unauthorized"))).rejects.toThrow(
+				"root binding changed",
+			);
+			expect(await fsp.readdir(detached)).toEqual(expect.arrayContaining(["control.bin", "payload.bin"]));
+			expect(await fsp.readdir(detached)).toHaveLength(2);
+			expect(await fsp.readFile(path.join(detached, "control.bin"), "utf8")).toBe("authorized control");
+			expect(await fsp.readFile(path.join(detached, "payload.bin"), "utf8")).toBe("unchanged payload");
+		} finally {
+			store.close();
+			await fsp.rm(root, { recursive: true, force: true });
+		}
+	});
+});
+
 describe.skipIf(process.platform !== "linux")("managed descendant retained binding", () => {
+	it("owns only a newly derived authority and closes it once", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-derived-owner-"));
+		const rootIdentity = managedDirectoryRoot(root);
+		const parent = new ManagedSessionDescendantStore(rootIdentity, root);
+		const borrowedAuthority = parent.retainAuthority();
+		if (!borrowedAuthority) throw new Error("Expected a retained native authority");
+		const borrowedStore = new ManagedSessionDescendantStore(rootIdentity, root, {
+			authority: borrowedAuthority,
+			authorityBaseDir: root,
+		});
+		const realRetain = native.RecoveryFsRoot.prototype.retainManagedDirectory;
+		const realClose = native.RecoveryFsRoot.prototype.close;
+		const retainedChildren: native.RecoveryFsRoot[] = [];
+		const closedAuthorities: native.RecoveryFsRoot[] = [];
+		const retainSpy = vi
+			.spyOn(native.RecoveryFsRoot.prototype, "retainManagedDirectory")
+			.mockImplementation(function (this: native.RecoveryFsRoot, relativePath, expectedDev, expectedIno) {
+				const retained = realRetain.call(this, relativePath, expectedDev, expectedIno);
+				retainedChildren.push(retained);
+				return retained;
+			});
+		const closeSpy = vi.spyOn(native.RecoveryFsRoot.prototype, "close").mockImplementation(function (
+			this: native.RecoveryFsRoot,
+		) {
+			closedAuthorities.push(this);
+			return realClose.call(this);
+		});
+		let derived: ManagedSessionDescendantStore | undefined;
+		try {
+			borrowedStore.close();
+			expect(borrowedAuthority.identity()).toMatchObject({ ok: true });
+
+			derived = parent.deriveSubtree("derived");
+			expect(retainedChildren).toHaveLength(1);
+			const childAuthority = retainedChildren[0];
+			if (!childAuthority) throw new Error("Expected the real retained child authority");
+			derived.close();
+			derived.close();
+			expect(closedAuthorities.filter(authority => authority === childAuthority)).toHaveLength(1);
+			expect(childAuthority.identity()).toMatchObject({ ok: false, code: "closed" });
+			expect(borrowedAuthority.identity()).toMatchObject({ ok: true });
+
+			parent.assertBound();
+			parent.publishNoReplaceSync("parent-after-child-close.bin", Buffer.from("parent remains open"));
+			expect(borrowedAuthority.readManaged("parent-after-child-close.bin")).toMatchObject({ ok: true });
+		} finally {
+			closeSpy.mockRestore();
+			retainSpy.mockRestore();
+			derived?.close();
+			borrowedStore.close();
+			borrowedAuthority.close();
+			parent.close();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("closes a newly retained child when constructor binding fails", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-derived-constructor-failure-"));
+		const rootIdentity = managedDirectoryRoot(root);
+		const parent = new ManagedSessionDescendantStore(rootIdentity, root);
+		const childPath = path.join(root, "derived");
+		const displacedPath = path.join(root, "displaced-derived");
+		const realRetain = native.RecoveryFsRoot.prototype.retainManagedDirectory;
+		const realClose = native.RecoveryFsRoot.prototype.close;
+		let retainedChild: native.RecoveryFsRoot | undefined;
+		const closeCalls: native.RecoveryFsRoot[] = [];
+		const retainSpy = vi
+			.spyOn(native.RecoveryFsRoot.prototype, "retainManagedDirectory")
+			.mockImplementation(function (this: native.RecoveryFsRoot, relativePath, expectedDev, expectedIno) {
+				const retained = realRetain.call(this, relativePath, expectedDev, expectedIno);
+				if (relativePath === "derived") {
+					retainedChild = retained;
+					fs.renameSync(childPath, displacedPath);
+					fs.symlinkSync(displacedPath, childPath, "dir");
+				}
+				return retained;
+			});
+		const closeSpy = vi.spyOn(native.RecoveryFsRoot.prototype, "close").mockImplementation(function (
+			this: native.RecoveryFsRoot,
+		) {
+			closeCalls.push(this);
+			return realClose.call(this);
+		});
+		try {
+			expect(() => parent.deriveSubtree("derived")).toThrow("Managed descendant root binding changed");
+			if (!retainedChild) throw new Error("Expected the real retained child authority");
+			expect(closeCalls.filter(authority => authority === retainedChild)).toHaveLength(1);
+			expect(retainedChild.identity()).toMatchObject({ ok: false, code: "closed" });
+			parent.assertBound();
+			parent.publishNoReplaceSync("parent-after-constructor-failure.bin", Buffer.from("parent remains open"));
+			expect(fs.readFileSync(path.join(root, "parent-after-constructor-failure.bin"), "utf8")).toBe(
+				"parent remains open",
+			);
+		} finally {
+			closeSpy.mockRestore();
+			retainSpy.mockRestore();
+			if (fs.lstatSync(childPath).isSymbolicLink()) {
+				fs.unlinkSync(childPath);
+				fs.renameSync(displacedPath, childPath);
+			}
+			parent.close();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("rejects publication after the retained subtree pathname is replaced", async () => {
 		const root = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-managed-store-binding-"));
 		try {
@@ -3297,6 +3600,17 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 describe("MemorySessionStorage.deleteSessionVerified parity", () => {
 	let storage: MemorySessionStorage;
 	const sessionsRoot = "/sessions";
+	const ownerTargetFields = [
+		"taskArtifactOwnerStorageContext",
+		"taskArtifactOwnerDeletionEvidence",
+		"taskArtifactOwnerRetirementOutcome",
+		"taskArtifactOwnerTranscriptDeleted",
+		"deferTaskArtifactOwnerRetirement",
+		"taskArtifactOwnerRetired",
+		"taskArtifactOwnerRetirementContinuation",
+		"taskArtifactOwnerPayloadRetired",
+		"taskArtifactOwnerNamespaceRetained",
+	] as const satisfies readonly (keyof VerifiedSessionDeleteTarget)[];
 
 	beforeEach(() => {
 		storage = new MemorySessionStorage();
@@ -3324,6 +3638,7 @@ describe("MemorySessionStorage.deleteSessionVerified parity", () => {
 	it("deletes a verified matching transcript", async () => {
 		const transcriptPath = path.join(sessionsRoot, "s.jsonl");
 		seedTranscript(transcriptPath);
+		storage.writeTextSync(`${transcriptPath}.spill.idx`, "index\n");
 		const result = await storage.deleteSessionVerified({
 			sessionsRoot,
 			transcriptPath,
@@ -3333,6 +3648,161 @@ describe("MemorySessionStorage.deleteSessionVerified parity", () => {
 		});
 		expect(result).toEqual({ kind: "deleted" });
 		expect(storage.existsSync(transcriptPath)).toBe(false);
+		expect(storage.existsSync(`${transcriptPath}.spill.idx`)).toBe(false);
+	});
+
+	it("refuses a task-artifact owner in the header without mutating the transcript or spill keys", async () => {
+		const transcriptPath = path.join(sessionsRoot, "owned-header.jsonl");
+		const ownerLocator = {
+			schemaVersion: 1,
+			ownerId: "a".repeat(64),
+			directoryDev: "1",
+			directoryIno: "2",
+		};
+		seedTranscript(transcriptPath, {
+			type: "session",
+			id: "session-id",
+			cwd: "/cwd",
+			taskArtifactOwner: ownerLocator,
+		});
+		storage.writeTextSync(`${transcriptPath}.spill.idx`, "index\n");
+		storage.writeTextSync(`${transcriptPath}.spill.commit`, "commit\n");
+		const transcriptBefore = storage.readTextSync(transcriptPath);
+
+		const err = await storage
+			.deleteSessionVerified({
+				sessionsRoot,
+				transcriptPath,
+				sessionId: "session-id",
+				cwd: "/cwd",
+				transcriptIdentity: verifiedIdentity(transcriptPath),
+			})
+			.catch(error => error);
+
+		expect(err).toBeInstanceOf(SessionDeleteVerificationError);
+		expect((err as SessionDeleteVerificationError).kind).toBe("artifacts");
+		expect(storage.readTextSync(transcriptPath)).toBe(transcriptBefore);
+		expect(storage.readTextSync(`${transcriptPath}.spill.idx`)).toBe("index\n");
+		expect(storage.readTextSync(`${transcriptPath}.spill.commit`)).toBe("commit\n");
+	});
+
+	it("refuses a replayed task-artifact owner header patch without mutating transcript or spill keys", async () => {
+		const transcriptPath = path.join(sessionsRoot, "owned-patch.jsonl");
+		const ownerLocator = {
+			schemaVersion: 1,
+			ownerId: "b".repeat(64),
+			directoryDev: "3",
+			directoryIno: "4",
+		};
+		storage.writeTextSync(
+			transcriptPath,
+			`${JSON.stringify({ type: "session", id: "session-id", cwd: "/cwd", version: 4 })}\n${JSON.stringify({
+				type: "header_patch",
+				patch: { taskArtifactOwner: ownerLocator },
+			})}\n`,
+		);
+		storage.writeTextSync(`${transcriptPath}.spill.idx`, "index\n");
+		storage.writeTextSync(`${transcriptPath}.spill.commit`, "commit\n");
+		const transcriptBefore = storage.readTextSync(transcriptPath);
+
+		const err = await storage
+			.deleteSessionVerified({
+				sessionsRoot,
+				transcriptPath,
+				sessionId: "session-id",
+				cwd: "/cwd",
+				transcriptIdentity: verifiedIdentity(transcriptPath),
+			})
+			.catch(error => error);
+
+		expect(err).toBeInstanceOf(SessionDeleteVerificationError);
+		expect((err as SessionDeleteVerificationError).kind).toBe("artifacts");
+		expect(storage.readTextSync(transcriptPath)).toBe(transcriptBefore);
+		expect(storage.readTextSync(`${transcriptPath}.spill.idx`)).toBe("index\n");
+		expect(storage.readTextSync(`${transcriptPath}.spill.commit`)).toBe("commit\n");
+	});
+
+	it("rejects an absent-transcript retry carrying durable owner retirement proof", async () => {
+		const transcriptPath = path.join(sessionsRoot, "owner-retired.jsonl");
+		seedTranscript(transcriptPath);
+		const transcriptIdentity = verifiedIdentity(transcriptPath);
+		storage.unlinkSync(transcriptPath);
+		storage.writeTextSync(`${transcriptPath}.spill.idx`, "index\n");
+		storage.writeTextSync(`${transcriptPath}.spill.commit`, "commit\n");
+
+		const err = await storage
+			.deleteSessionVerified({
+				sessionsRoot,
+				transcriptPath,
+				sessionId: "session-id",
+				cwd: "/cwd",
+				transcriptIdentity,
+				taskArtifactOwnerRetired: true,
+				taskArtifactOwnerTranscriptDeleted: true,
+			})
+			.catch(error => error);
+
+		expect(err).toBeInstanceOf(SessionDeleteVerificationError);
+		expect((err as SessionDeleteVerificationError).kind).toBe("artifacts");
+		expect(storage.existsSync(transcriptPath)).toBe(false);
+		expect(storage.readTextSync(`${transcriptPath}.spill.idx`)).toBe("index\n");
+		expect(storage.readTextSync(`${transcriptPath}.spill.commit`)).toBe("commit\n");
+	});
+
+	it.each([
+		true,
+		false,
+	])("refuses every defined owner field before mutation (transcript present=%s)", async present => {
+		for (const field of ownerTargetFields) {
+			for (const [valueIndex, value] of [false, null, {}].entries()) {
+				const transcriptPath = path.join(sessionsRoot, `${field}-${valueIndex}.jsonl`);
+				seedTranscript(transcriptPath);
+				const transcriptBefore = storage.readTextSync(transcriptPath);
+				const target: VerifiedSessionDeleteTarget = {
+					sessionsRoot,
+					transcriptPath,
+					sessionId: "session-id",
+					cwd: "/cwd",
+					transcriptIdentity: verifiedIdentity(transcriptPath),
+				};
+				if (!present) storage.unlinkSync(transcriptPath);
+				storage.writeTextSync(`${transcriptPath}.spill.idx`, "index\n");
+				storage.writeTextSync(`${transcriptPath}.spill.commit`, "commit\n");
+				Object.defineProperty(target, field, { value, enumerable: true });
+				const failure: unknown = await storage.deleteSessionVerified(target).catch((error: unknown) => error);
+				if (!(failure instanceof SessionDeleteVerificationError)) throw new Error(`Missing refusal for ${field}`);
+				expect(failure.kind).toBe("artifacts");
+				expect(failure.message).toBe("task_artifact_owner_memory_backend_unsupported");
+				expect(storage.existsSync(transcriptPath)).toBe(present);
+				if (present) expect(storage.readTextSync(transcriptPath)).toBe(transcriptBefore);
+				expect(storage.readTextSync(`${transcriptPath}.spill.idx`)).toBe("index\n");
+				expect(storage.readTextSync(`${transcriptPath}.spill.commit`)).toBe("commit\n");
+			}
+		}
+	});
+
+	it.each([
+		true,
+		false,
+	])("treats explicitly undefined owner fields as omitted (transcript present=%s)", async present => {
+		const transcriptPath = path.join(sessionsRoot, "undefined-owner-fields.jsonl");
+		seedTranscript(transcriptPath);
+		const target: VerifiedSessionDeleteTarget = {
+			sessionsRoot,
+			transcriptPath,
+			sessionId: "session-id",
+			cwd: "/cwd",
+			transcriptIdentity: verifiedIdentity(transcriptPath),
+		};
+		if (!present) storage.unlinkSync(transcriptPath);
+		storage.writeTextSync(`${transcriptPath}.spill.idx`, "index\n");
+		storage.writeTextSync(`${transcriptPath}.spill.commit`, "commit\n");
+		for (const field of ownerTargetFields)
+			Object.defineProperty(target, field, { value: undefined, enumerable: true });
+		expect(await storage.deleteSessionVerified(target)).toEqual({ kind: "deleted" });
+		expect(storage.existsSync(transcriptPath)).toBe(false);
+		expect(storage.existsSync(`${transcriptPath}.spill.idx`)).toBe(!present);
+		expect(storage.existsSync(`${transcriptPath}.spill.commit`)).toBe(!present);
 	});
 
 	it("rejects a transcript outside the sessions root (containment parity)", async () => {

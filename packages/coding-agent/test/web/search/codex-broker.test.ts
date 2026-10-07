@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "bun:test";
 import * as os from "node:os";
 import type { AuthStorage } from "@gajae-code/ai";
+import { OPENAI_HEADER_VALUES } from "@gajae-code/ai/providers/openai-codex/constants";
 import { hookFetch } from "@gajae-code/utils";
 import { AgentStorage } from "../../../src/session/agent-storage";
 import type { SearchParams } from "../../../src/web/search/providers/base";
@@ -86,7 +87,11 @@ describe("Codex web search broker auth", () => {
 		});
 
 		expect(result.provider).toBe("codex");
-		expect(userAgent).toMatch(/^pi\/[^\s]+ \(linux 4\.4\.302-Minimal-EAS-QTI_Haptic-R26; arm64\)$/);
+		expect(userAgent).toMatch(
+			new RegExp(
+				`^${OPENAI_HEADER_VALUES.ORIGINATOR_CODEX}/[^\\s]+ \\(linux 4\\.4\\.302-Minimal-EAS-QTI_Haptic-R26; arm64\\)$`,
+			),
+		);
 		expect(userAgent).toMatch(/^[\x20-\x7e]+$/);
 		platformSpy.mockRestore();
 		releaseSpy.mockRestore();

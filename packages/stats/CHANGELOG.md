@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+## [0.18.7] - 2026-10-04
+
+## [0.18.6] - 2026-10-03
+
+## [0.18.5] - 2026-09-30
+
+## [0.18.4] - 2026-09-30
+
+## [0.18.3] - 2026-09-30
+
+## [0.18.2] - 2026-09-30
+
+### Fixed
+
+- The stats dashboard API answers `400 Bad Request` for a malformed `?limit=` on `/api/stats/recent` and `/api/stats/errors`, and for a malformed `/api/request/:id`. Before, `limit=abc` failed with a 500 SQLite `datatype mismatch`, a negative limit returned every stored request because SQLite treats a negative `LIMIT` as unlimited, and an id such as `1abc` was read as `1`.
+
+## [0.18.1] - 2026-09-29
+
+## [0.18.0] - 2026-09-27
+
+### Added
+
+- Dashboard stats now include a `failures` report: the error+abort share of requests, time spent in failed requests, and the prompt tokens re-paid by requests that missed the cache entirely right after a failure in the same session. `gjc stats --summary` and `gjc-stats --sync` print it under "Provider Failures", so provider-failure cost can be compared across time windows (#5948).
+
 ## [0.17.7] - 2026-09-25
 
 ## [0.17.6] - 2026-09-24

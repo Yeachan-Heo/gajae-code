@@ -60,6 +60,7 @@ async function runCallback(
 ): Promise<{ response: Response; html: string; outcome: OAuthCredentials | Error }> {
 	const flow = new TestCallbackFlow(await availablePort(), options);
 	const login = flow.login().catch((error: unknown) => (error instanceof Error ? error : new Error(String(error))));
+	if (!params.has("state")) params.set("state", EXPECTED_STATE);
 	const callbackUrl = new URL(await flow.authUrl);
 	callbackUrl.search = params.toString();
 	const response = await fetch(callbackUrl);
@@ -198,5 +199,40 @@ describe("OAuthCallbackFlow callback script data", () => {
 		expect(html).not.toContain(code);
 		expect(readServerState(html)).toEqual({ ok: true, code, state: EXPECTED_STATE });
 		expect(outcome).toEqual({ access: `access-${code}`, refresh: "refresh-token", expires: 1 });
+	});
+
+	it("does not cancel an in-flight login when an error callback has the wrong state", async () => {
+		const flow = new TestCallbackFlow(await availablePort());
+		let settled = false;
+		const login = flow.login().then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+		const callbackUrl = new URL(await flow.authUrl);
+		callbackUrl.search = new URLSearchParams({
+			error: "access_denied",
+			error_description: "attacker-controlled detail",
+			state: "wrong-state",
+		}).toString();
+		const response = await fetch(callbackUrl);
+		await new Promise(resolve => setTimeout(resolve, 30));
+		expect(response.status).toBe(400);
+		expect(await response.text()).toBe("State mismatch");
+		expect(settled).toBe(false);
+
+		const correlated = new URL(callbackUrl);
+		correlated.search = new URLSearchParams({
+			error: "access_denied",
+			error_description: "the user denied access",
+			state: EXPECTED_STATE,
+		}).toString();
+		const correlatedResponse = await fetch(correlated);
+		expect(correlatedResponse.status).toBe(500);
+		await login;
+		expect(settled).toBe(true);
 	});
 });
