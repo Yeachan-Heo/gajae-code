@@ -1101,6 +1101,12 @@ export interface DiffStreamResult {
  */
 export declare function diffWords(oldText: string, newText: string): Array<DiffChange>
 
+/**
+ * Returns whether the directory's child names are case-sensitive when the
+ * platform can query that property.
+ */
+export declare function directoryCaseSensitive(path: string): boolean | null
+
 export interface DoctorJournalCreateResult {
   authority?: DoctorJournalAuthority
   sideEffectStarted: boolean
