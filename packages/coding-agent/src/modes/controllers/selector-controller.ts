@@ -1612,7 +1612,7 @@ export class SelectorController {
 	}
 
 	async #handleCredentialImport(): Promise<void> {
-		this.ctx.showStatus("Scanning for existing Claude Code / Codex CLI credentials…");
+		this.ctx.showStatus("Scanning for existing Claude Code / Codex CLI / Kiro CLI credentials…");
 		const preview = await runExternalCredentialAutoImport({
 			authStorage: {
 				importCredentialIfAbsent: async () => ({
