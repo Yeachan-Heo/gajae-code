@@ -2697,6 +2697,7 @@ export interface PreparedProfileModelSelection {
 	readonly sessionId: string;
 	readonly model: Model;
 	readonly thinkingLevel: ThinkingLevel | undefined;
+	readonly committedThinkingLevel: ThinkingLevel | undefined;
 	readonly previousModel: Model | undefined;
 	readonly previousThinkingLevel: ThinkingLevel | undefined;
 	readonly previousEditMode: EditMode;
@@ -18741,6 +18742,8 @@ export class AgentSession {
 					let modelCommitStarted = false;
 					let activationPublicationStarted = false;
 					let liveModelSelectionCommitted = false;
+					let liveModelSelectionCommitFinished = false;
+					let committedThinkingLevelLiveMutationRevision: number | undefined;
 					try {
 						publication = this.settings.publishGlobalConfigReload(stagedSettings, () => {
 							modelCommitStarted = true;
@@ -18755,7 +18758,13 @@ export class AgentSession {
 							if (preparedLiveModelSelection) {
 								this.#assertPreparedProfileModelSelectionCurrent(preparedLiveModelSelection);
 								liveModelSelectionCommitted = true;
-								this.commitPreparedProfileModelSelection(preparedLiveModelSelection);
+								this.commitPreparedProfileModelSelection(
+									preparedLiveModelSelection,
+									mutationRevision => {
+										committedThinkingLevelLiveMutationRevision = mutationRevision;
+									},
+								);
+								liveModelSelectionCommitFinished = true;
 							}
 						});
 						stagedModels.finalize();
@@ -18763,6 +18772,9 @@ export class AgentSession {
 						modelCommitSucceeded = true;
 					} catch (error) {
 						const rollbackErrors: unknown[] = [];
+						if (liveModelSelectionCommitted && committedThinkingLevelLiveMutationRevision === undefined) {
+							committedThinkingLevelLiveMutationRevision = this.#thinkingLevelLiveMutationRevision;
+						}
 						try {
 							publication?.rollback();
 						} catch (rollbackError) {
@@ -18779,15 +18791,24 @@ export class AgentSession {
 								rollbackErrors.push(rollbackError);
 							}
 						}
+						const thinkingLevelMutationSuperseded =
+							committedThinkingLevelLiveMutationRevision !== undefined &&
+							this.#thinkingLevelLiveMutationRevision !== committedThinkingLevelLiveMutationRevision;
 						if (
 							liveModelSelectionCommitted &&
 							preparedLiveModelSelection &&
-							this.getUserModelSelectionRevision() === preparedLiveModelSelectionRevision
+							this.getUserModelSelectionRevision() === preparedLiveModelSelectionRevision &&
+							this.model === preparedLiveModelSelection.model &&
+							(!liveModelSelectionCommitFinished ||
+								thinkingLevelMutationSuperseded ||
+								this.thinkingLevel === preparedLiveModelSelection.committedThinkingLevel)
 						) {
 							try {
 								await this.restoreModelSelectionForRollback(
 									preparedLiveModelSelection.previousModel,
-									preparedLiveModelSelection.previousThinkingLevel,
+									thinkingLevelMutationSuperseded
+										? this.thinkingLevel
+										: preparedLiveModelSelection.previousThinkingLevel,
 								);
 							} catch (rollbackError) {
 								rollbackErrors.push(rollbackError);
@@ -19575,11 +19596,16 @@ export class AgentSession {
 		const previousModel = this.model;
 		const previousThinkingLevel = this.thinkingLevel;
 		const previousEditMode = this.#resolveActiveEditMode();
+		const committedThinkingLevel = resolveThinkingLevelForModel(
+			model,
+			thinkingLevel ?? model.thinking?.defaultLevel ?? previousThinkingLevel,
+		);
 		if (this.sessionId !== sessionId) throw new Error("Session changed while preparing profile model selection");
 		return {
 			sessionId,
 			model,
 			thinkingLevel,
+			committedThinkingLevel,
 			previousModel,
 			previousThinkingLevel,
 			previousEditMode,
@@ -19587,13 +19613,16 @@ export class AgentSession {
 		};
 	}
 
-	commitPreparedProfileModelSelection(prepared: PreparedProfileModelSelection): void {
+	commitPreparedProfileModelSelection(
+		prepared: PreparedProfileModelSelection,
+		onThinkingLevelApplied?: (mutationRevision: number) => void,
+	): void {
 		this.#assertPreparedProfileModelSelectionCurrent(prepared);
 		this.#setModelAuthoritatively(prepared.model, "profile-activation");
 		this.#syncAppendOnlyContext(prepared.model);
 		this.sessionManager.appendModelChange(`${prepared.model.provider}/${prepared.model.id}`, "temporary");
 		this.settings.getStorage()?.recordModelUsage(`${prepared.model.provider}/${prepared.model.id}`);
-		this.setThinkingLevel(prepared.thinkingLevel ?? prepared.model.thinking?.defaultLevel ?? this.thinkingLevel);
+		this.#applyThinkingLevel(prepared.committedThinkingLevel, false, false, onThinkingLevelApplied);
 	}
 
 	#assertPreparedProfileModelSelectionCurrent(prepared: PreparedProfileModelSelection): void {
@@ -20163,7 +20192,12 @@ export class AgentSession {
 	 * effort (issue #4695): only control surfaces may pass true, so model-default
 	 * appends never mint `session` scope in {@link getThinkingScopeForControl}.
 	 */
-	#applyThinkingLevel(level: ThinkingLevel | undefined, persist: boolean, operatorIntent: boolean): void {
+	#applyThinkingLevel(
+		level: ThinkingLevel | undefined,
+		persist: boolean,
+		operatorIntent: boolean,
+		onApplied?: (mutationRevision: number) => void,
+	): void {
 		if (persist) this.#assertDurableSettingsWritable();
 		this.#thinkingLevelMutationRevision++;
 		this.#thinkingLevelLiveMutationRevision++;
@@ -20173,6 +20207,7 @@ export class AgentSession {
 		const isChanging = effectiveLevel !== this.#thinkingLevel;
 
 		this.#thinkingLevel = effectiveLevel;
+		onApplied?.(this.#thinkingLevelLiveMutationRevision);
 		this.agent.setThinkingLevel(toReasoningEffort(effectiveLevel));
 		if (isChanging) this.#defaultModelSelectionMutationRevision++;
 

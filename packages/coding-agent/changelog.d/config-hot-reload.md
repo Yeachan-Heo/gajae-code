@@ -5,3 +5,4 @@
 ### Fixed
 
 - Preserve successive manual model selections, completed provider discovery, and unchanged credential discovery restrictions during configuration reload. Validate reload credentials without rejecting refreshable OAuth accounts or registering API keys that conflict with a credential pin in any live session.
+- Preserve live model and thinking-level choices across asynchronous reload preparation and rollback after publication failures.

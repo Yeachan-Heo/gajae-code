@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { Agent } from "@gajae-code/agent-core";
+import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
 import { type ConfigHotReloadCandidate, ConfigHotReloadWatcher } from "../src/config/config-hot-reload";
+import * as modelProfileActivation from "../src/config/model-profile-activation";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { AgentSession } from "../src/session/agent-session";
@@ -11,6 +12,7 @@ import { SessionManager } from "../src/session/session-manager";
 
 const provider = "reload-test";
 const modelId = "active-model";
+type TestModelThinking = { minLevel: string; maxLevel: string; defaultLevel?: string };
 
 async function waitFor(predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
@@ -72,6 +74,7 @@ describe("AgentSession configuration reload", () => {
 		withProfile?: boolean;
 		requiresProvider?: boolean;
 		apiKeyEnv?: string;
+		thinking?: TestModelThinking;
 	}): string {
 		const providerId = options.providerId ?? provider;
 		const modelIdValue = options.modelId ?? modelId;
@@ -92,6 +95,20 @@ describe("AgentSession configuration reload", () => {
 			`        name: ${options.name}`,
 			"        contextWindow: 32768",
 			"        maxTokens: 4096",
+			...(options.thinking
+				? [
+						"        reasoning: true",
+						"        compat:",
+						"          supportsReasoningEffort: true",
+						"        thinking:",
+						"          mode: effort",
+						`          minLevel: ${options.thinking.minLevel}`,
+						`          maxLevel: ${options.thinking.maxLevel}`,
+						...(options.thinking.defaultLevel
+							? [`          defaultLevel: ${options.thinking.defaultLevel}`]
+							: []),
+					]
+				: []),
 			...(options.additionalModelId
 				? [
 						`      - id: ${options.additionalModelId}`,
@@ -121,6 +138,7 @@ describe("AgentSession configuration reload", () => {
 		withProfile?: boolean;
 		requiresProvider?: boolean;
 		apiKeyEnv?: string;
+		thinking?: TestModelThinking;
 		credentialSessionId?: string;
 		persistentSession?: boolean;
 	}) {
@@ -142,6 +160,7 @@ describe("AgentSession configuration reload", () => {
 				withProfile: options?.withProfile,
 				requiresProvider: options?.requiresProvider,
 				apiKeyEnv: options?.apiKeyEnv,
+				thinking: options?.thinking,
 			}),
 		);
 		const settings = await Settings.loadForScope({ cwd: tempDir, agentDir: tempDir });
@@ -746,6 +765,383 @@ describe("AgentSession configuration reload", () => {
 			restorePublicationFence?.();
 			restoreModelRegistryApiKey?.();
 			restorePrepareModelSelection?.();
+		}
+	});
+
+	it("does not roll back a committed reload model over a completed cycle choice", async () => {
+		const releasePublicationFence = Promise.withResolvers<void>();
+		const releaseProfileRollback = Promise.withResolvers<void>();
+		const cycleApiKey = Promise.withResolvers<string>();
+		let publicationFenceEntered = false;
+		let profileRollbackStarted = false;
+		let cycleApiKeyRequested = false;
+		let restorePublicationFence: (() => void) | undefined;
+		let restoreModelRegistryApiKey: (() => void) | undefined;
+		let restoreStageModelsReload: (() => void) | undefined;
+		let restoreStagedFinalize: (() => void) | undefined;
+		let restoreModelRollback: (() => void) | undefined;
+		let restoreProfileRollback: (() => void) | undefined;
+		let reload: Promise<unknown> | undefined;
+		let cycle: Promise<unknown> | undefined;
+		try {
+			const { configPath, modelsPath } = await createSession({
+				modelId: "default-model",
+				additionalModelId: "manual-model",
+				withProfile: true,
+			});
+			session!.settings.set("modelRoles", { planner: `${provider}/manual-model` });
+			await session!.settings.flushOrThrow();
+			await session!.activateModelProfileForControl("active-profile");
+			const originalProfileRollback = modelProfileActivation.rollbackPreparedModelProfileActivation;
+			const profileRollbackSpy = vi
+				.spyOn(modelProfileActivation, "rollbackPreparedModelProfileActivation")
+				.mockImplementation(async (...args) => {
+					profileRollbackStarted = true;
+					await releaseProfileRollback.promise;
+					return await originalProfileRollback(...args);
+				});
+			restoreProfileRollback = () => profileRollbackSpy.mockRestore();
+
+			const originalAcquirePublicationFence = modelRegistry!.acquirePublicationFence.bind(modelRegistry!);
+			const publicationFenceSpy = vi
+				.spyOn(modelRegistry!, "acquirePublicationFence")
+				.mockImplementation(async signal => {
+					publicationFenceEntered = true;
+					await releasePublicationFence.promise;
+					return await originalAcquirePublicationFence(signal);
+				});
+			restorePublicationFence = () => publicationFenceSpy.mockRestore();
+
+			const originalStageModelsReload = modelRegistry!.stageModelsConfigReload.bind(modelRegistry!);
+			const stageModelsReloadSpy = vi
+				.spyOn(modelRegistry!, "stageModelsConfigReload")
+				.mockImplementation(async (...args) => {
+					const stagedModels = await originalStageModelsReload(...args);
+					const finalizeSpy = vi.spyOn(stagedModels, "finalize").mockImplementation(() => {
+						throw new Error("Injected failure after publication");
+					});
+					restoreStagedFinalize = () => finalizeSpy.mockRestore();
+					return stagedModels;
+				});
+			restoreStageModelsReload = () => stageModelsReloadSpy.mockRestore();
+
+			const originalRestoreModelSelection = session!.restoreModelSelectionForRollback.bind(session!);
+			const restoreModelSpy = vi
+				.spyOn(session!, "restoreModelSelectionForRollback")
+				.mockImplementation(
+					async (model, thinkingLevel) => await originalRestoreModelSelection(model, thinkingLevel),
+				);
+			restoreModelRollback = () => restoreModelSpy.mockRestore();
+
+			const staged = candidate(
+				23,
+				configPath,
+				modelsPath,
+				settingsText({ todoEnabled: false, compactionEnabled: false }),
+				modelsText({
+					modelId: "manual-model",
+					additionalModelId: "default-model",
+					name: "After",
+					baseUrl: "https://after.example/v1",
+					withProfile: true,
+				}),
+			);
+			reload = session!.reloadConfiguration(staged, new AbortController().signal);
+			await waitFor(() => publicationFenceEntered);
+
+			const apiKeySpy = vi.spyOn(modelRegistry!, "getApiKey").mockImplementation(async () => {
+				cycleApiKeyRequested = true;
+				return await cycleApiKey.promise;
+			});
+			restoreModelRegistryApiKey = () => apiKeySpy.mockRestore();
+			cycle = session!.cycleRoleModels(["default", "planner"], { temporary: true });
+			await waitFor(() => cycleApiKeyRequested);
+			releasePublicationFence.resolve();
+			await waitFor(() => profileRollbackStarted);
+			cycleApiKey.resolve("temporary-cycle-key");
+			await expect(cycle).resolves.toMatchObject({ model: { id: "manual-model" } });
+			releaseProfileRollback.resolve();
+			await expect(reload).rejects.toMatchObject({ code: "PUBLICATION_FAILED" });
+
+			expect(restoreModelSpy).not.toHaveBeenCalled();
+			expect(session!.model).toMatchObject({ id: "manual-model", baseUrl: "https://before.example/v1" });
+			expect(modelRegistry!.find(provider, "default-model")?.baseUrl).toBe("https://before.example/v1");
+			expect(session!.getConfiguredModelChainState("default")).toMatchObject({
+				entries: [`${provider}/default-model`],
+				identity: "active-profile",
+			});
+		} finally {
+			releasePublicationFence.resolve();
+			releaseProfileRollback.resolve();
+			cycleApiKey.resolve("cleanup-cycle-key");
+			await Promise.allSettled(
+				[reload, cycle].filter((operation): operation is Promise<unknown> => operation !== undefined),
+			);
+			restorePublicationFence?.();
+			restoreModelRegistryApiKey?.();
+			restoreStagedFinalize?.();
+			restoreStageModelsReload?.();
+			restoreModelRollback?.();
+			restoreProfileRollback?.();
+		}
+	});
+
+	it.each([
+		{
+			name: "restores the captured level",
+			thinkingControlLevel: undefined,
+			expectedLevel: ThinkingLevel.High,
+		},
+		{
+			name: "preserves a same-effective explicit level",
+			thinkingControlLevel: ThinkingLevel.Low,
+			expectedLevel: ThinkingLevel.Low,
+		},
+	])("$name after a clamped reload rollback", async ({ thinkingControlLevel, expectedLevel }) => {
+		const releasePublicationFence = Promise.withResolvers<void>();
+		const releaseLivePreparation = Promise.withResolvers<void>();
+		const releaseProfileRollback = Promise.withResolvers<void>();
+		const cycleApiKey = Promise.withResolvers<string | undefined>();
+		let publicationFenceEntered = false;
+		let livePreparationEntered = false;
+		let profileRollbackStarted = false;
+		let cycleApiKeyRequested = false;
+		let restorePublicationFence: (() => void) | undefined;
+		let restoreLivePreparation: (() => void) | undefined;
+		let restoreModelRegistryApiKey: (() => void) | undefined;
+		let restoreStageModelsReload: (() => void) | undefined;
+		let restoreStagedFinalize: (() => void) | undefined;
+		let restoreModelRollback: (() => void) | undefined;
+		let restoreProfileRollback: (() => void) | undefined;
+		let reload: Promise<unknown> | undefined;
+		let cycle: Promise<unknown> | undefined;
+		try {
+			const { configPath, modelsPath } = await createSession({
+				modelId: "default-model",
+				additionalModelId: "manual-model",
+				withProfile: true,
+				thinking: { minLevel: "low", maxLevel: "high", defaultLevel: "high" },
+			});
+			session!.setThinkingLevel(ThinkingLevel.High);
+			session!.settings.set("modelRoles", { planner: `${provider}/manual-model` });
+			await session!.settings.flushOrThrow();
+			await session!.activateModelProfileForControl("active-profile");
+			const originalProfileRollback = modelProfileActivation.rollbackPreparedModelProfileActivation;
+			const profileRollbackSpy = vi
+				.spyOn(modelProfileActivation, "rollbackPreparedModelProfileActivation")
+				.mockImplementation(async (...args) => {
+					profileRollbackStarted = true;
+					await releaseProfileRollback.promise;
+					return await originalProfileRollback(...args);
+				});
+			restoreProfileRollback = () => profileRollbackSpy.mockRestore();
+
+			const originalAcquirePublicationFence = modelRegistry!.acquirePublicationFence.bind(modelRegistry!);
+			const publicationFenceSpy = vi
+				.spyOn(modelRegistry!, "acquirePublicationFence")
+				.mockImplementation(async signal => {
+					publicationFenceEntered = true;
+					await releasePublicationFence.promise;
+					return await originalAcquirePublicationFence(signal);
+				});
+			restorePublicationFence = () => publicationFenceSpy.mockRestore();
+
+			const originalStageModelsReload = modelRegistry!.stageModelsConfigReload.bind(modelRegistry!);
+			const stageModelsReloadSpy = vi
+				.spyOn(modelRegistry!, "stageModelsConfigReload")
+				.mockImplementation(async (...args) => {
+					const stagedModels = await originalStageModelsReload(...args);
+					const finalizeSpy = vi.spyOn(stagedModels, "finalize").mockImplementation(() => {
+						throw new Error("Injected failure after publication");
+					});
+					restoreStagedFinalize = () => finalizeSpy.mockRestore();
+					return stagedModels;
+				});
+			restoreStageModelsReload = () => stageModelsReloadSpy.mockRestore();
+
+			const originalRestoreModelSelection = session!.restoreModelSelectionForRollback.bind(session!);
+			const restoreModelSpy = vi
+				.spyOn(session!, "restoreModelSelectionForRollback")
+				.mockImplementation(
+					async (model, thinkingLevel) => await originalRestoreModelSelection(model, thinkingLevel),
+				);
+			restoreModelRollback = () => restoreModelSpy.mockRestore();
+
+			const staged = candidate(
+				24,
+				configPath,
+				modelsPath,
+				settingsText({ todoEnabled: false, compactionEnabled: false }),
+				modelsText({
+					modelId: "default-model",
+					additionalModelId: "manual-model",
+					name: "After",
+					baseUrl: "https://after.example/v1",
+					withProfile: true,
+					thinking: { minLevel: "low", maxLevel: "low", defaultLevel: "low" },
+				}),
+			);
+			reload = session!.reloadConfiguration(staged, new AbortController().signal);
+			await waitFor(() => publicationFenceEntered);
+
+			const apiKeySpy = vi.spyOn(modelRegistry!, "getApiKey").mockImplementation(async () => {
+				cycleApiKeyRequested = true;
+				return await cycleApiKey.promise;
+			});
+			restoreModelRegistryApiKey = () => apiKeySpy.mockRestore();
+			const originalPrepareModelSelection = session!.prepareModelSelectionForProfileActivation.bind(session!);
+			const prepareModelSelectionSpy = vi
+				.spyOn(session!, "prepareModelSelectionForProfileActivation")
+				.mockImplementation(async (model, thinkingLevel, signal) => {
+					const prepared = await originalPrepareModelSelection(model, thinkingLevel, signal);
+					if (model.id === "default-model") {
+						livePreparationEntered = true;
+						await releaseLivePreparation.promise;
+					}
+					return prepared;
+				});
+			restoreLivePreparation = () => prepareModelSelectionSpy.mockRestore();
+			const cycleOperation = session!.cycleRoleModels(["default", "planner"], { temporary: true });
+			cycle = cycleOperation;
+			const cycleOutcome = cycleOperation.then(
+				() => ({ status: "resolved" as const }),
+				error => ({ status: "rejected" as const, error }),
+			);
+			expect(cycleApiKeyRequested).toBe(true);
+			releasePublicationFence.resolve();
+			await waitFor(() => livePreparationEntered);
+			cycleApiKey.resolve(undefined);
+			const outcome = await cycleOutcome;
+			if (outcome.status === "resolved") throw new Error("Expected role cycle to reject without an API key");
+			expect(outcome.error).toMatchObject({ message: "No API key for reload-test/manual-model" });
+			releaseLivePreparation.resolve();
+			await waitFor(() => profileRollbackStarted);
+			expect(session!.thinkingLevel).toBe(ThinkingLevel.Low);
+			if (thinkingControlLevel !== undefined) {
+				await session!.setThinkingLevelForControl(thinkingControlLevel, false);
+			}
+			releaseProfileRollback.resolve();
+			await expect(reload).rejects.toMatchObject({ code: "PUBLICATION_FAILED" });
+
+			expect(restoreModelSpy).toHaveBeenCalledTimes(1);
+			expect(session!.model).toMatchObject({ id: "default-model", baseUrl: "https://before.example/v1" });
+			expect(session!.thinkingLevel).toBe(expectedLevel);
+			expect(modelRegistry!.find(provider, "default-model")?.baseUrl).toBe("https://before.example/v1");
+		} finally {
+			releasePublicationFence.resolve();
+			releaseLivePreparation.resolve();
+			releaseProfileRollback.resolve();
+			cycleApiKey.resolve(undefined);
+			await Promise.allSettled(
+				[reload, cycle].filter((operation): operation is Promise<unknown> => operation !== undefined),
+			);
+			restorePublicationFence?.();
+			restoreLivePreparation?.();
+			restoreModelRegistryApiKey?.();
+			restoreStagedFinalize?.();
+			restoreStageModelsReload?.();
+			restoreModelRollback?.();
+			restoreProfileRollback?.();
+		}
+	});
+
+	it("restores the current model when prepared selection commit fails before thinking update", async () => {
+		const { configPath, modelsPath, sessionManager } = await createSession({
+			modelId: "default-model",
+			thinking: { minLevel: "low", maxLevel: "high", defaultLevel: "high" },
+		});
+		session!.setThinkingLevel(ThinkingLevel.High);
+
+		const originalAppendModelChange = sessionManager.appendModelChange.bind(sessionManager);
+		let failTemporaryAppend = true;
+		const appendModelChangeSpy = vi.spyOn(sessionManager, "appendModelChange").mockImplementation((model, role) => {
+			if (failTemporaryAppend && role === "temporary") {
+				failTemporaryAppend = false;
+				throw new Error("Injected session append failure");
+			}
+			return originalAppendModelChange(model, role);
+		});
+		try {
+			const staged = candidate(
+				25,
+				configPath,
+				modelsPath,
+				settingsText({ todoEnabled: false, compactionEnabled: false }),
+				modelsText({
+					modelId: "default-model",
+					name: "After",
+					baseUrl: "https://after.example/v1",
+					thinking: { minLevel: "low", maxLevel: "low", defaultLevel: "low" },
+				}),
+			);
+			await expect(session!.reloadConfiguration(staged, new AbortController().signal)).rejects.toMatchObject({
+				code: "PUBLICATION_FAILED",
+			});
+
+			expect(failTemporaryAppend).toBe(false);
+			expect(session!.model).toMatchObject({ id: "default-model", baseUrl: "https://before.example/v1" });
+			expect(session!.thinkingLevel).toBe(ThinkingLevel.High);
+			expect(modelRegistry!.find(provider, "default-model")?.baseUrl).toBe("https://before.example/v1");
+		} finally {
+			appendModelChangeSpy.mockRestore();
+		}
+	});
+
+	it("preserves a reentrant same-effective thinking control during reload rollback", async () => {
+		const { configPath, modelsPath } = await createSession({
+			modelId: "default-model",
+			thinking: { minLevel: "low", maxLevel: "high", defaultLevel: "high" },
+		});
+		session!.setThinkingLevel(ThinkingLevel.High);
+
+		const originalStageModelsReload = modelRegistry!.stageModelsConfigReload.bind(modelRegistry!);
+		let restoreStagedFinalize: (() => void) | undefined;
+		const stageModelsReloadSpy = vi
+			.spyOn(modelRegistry!, "stageModelsConfigReload")
+			.mockImplementation(async (...args) => {
+				const stagedModels = await originalStageModelsReload(...args);
+				const finalizeSpy = vi.spyOn(stagedModels, "finalize").mockImplementation(() => {
+					throw new Error("Injected failure after publication");
+				});
+				restoreStagedFinalize = () => finalizeSpy.mockRestore();
+				return stagedModels;
+			});
+		let explicitControlApplied = false;
+		const unsubscribe = session!.subscribe(event => {
+			if (
+				!explicitControlApplied &&
+				event.type === "thinking_level_changed" &&
+				event.thinkingLevel === ThinkingLevel.Low
+			) {
+				explicitControlApplied = true;
+				void session!.setThinkingLevelForControl(ThinkingLevel.Low, false);
+			}
+		});
+		try {
+			const staged = candidate(
+				26,
+				configPath,
+				modelsPath,
+				settingsText({ todoEnabled: false, compactionEnabled: false }),
+				modelsText({
+					modelId: "default-model",
+					name: "After",
+					baseUrl: "https://after.example/v1",
+					thinking: { minLevel: "low", maxLevel: "low", defaultLevel: "low" },
+				}),
+			);
+			await expect(session!.reloadConfiguration(staged, new AbortController().signal)).rejects.toMatchObject({
+				code: "PUBLICATION_FAILED",
+			});
+
+			expect(explicitControlApplied).toBe(true);
+			expect(session!.model).toMatchObject({ id: "default-model", baseUrl: "https://before.example/v1" });
+			expect(session!.thinkingLevel).toBe(ThinkingLevel.Low);
+			expect(modelRegistry!.find(provider, "default-model")?.baseUrl).toBe("https://before.example/v1");
+		} finally {
+			unsubscribe();
+			restoreStagedFinalize?.();
+			stageModelsReloadSpy.mockRestore();
 		}
 	});
 
