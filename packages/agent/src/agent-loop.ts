@@ -771,24 +771,31 @@ function managedTransportFailure(failure: unknown) {
 
 function managedAssistantMessageHasContent(failure: unknown): boolean {
 	const content = managedProperty(failure, "content");
-	if (!Array.isArray(content)) return false;
-	return content.some(block => {
-		if (!block || typeof block !== "object") return false;
-		const type = managedProperty(block, "type");
-		if (type === "text") {
-			const text = managedProperty(block, "text");
-			return typeof text === "string" && text.length > 0;
-		}
-		if (type === "thinking") {
-			const thinking = managedProperty(block, "thinking");
-			const signature = managedProperty(block, "thinkingSignature");
-			return (
-				(typeof thinking === "string" && thinking.length > 0) ||
-				(typeof signature === "string" && signature.length > 0)
-			);
-		}
-		return type === "redactedThinking" || type === "toolCall";
-	});
+	if (content === undefined) return false;
+	try {
+		if (!Array.isArray(content)) return true;
+		return content.some(block => {
+			if (!block || typeof block !== "object") return true;
+			const type = managedProperty(block, "type");
+			if (type === "text") {
+				const text = managedProperty(block, "text");
+				return typeof text !== "string" || text.length > 0;
+			}
+			if (type === "thinking") {
+				const thinking = managedProperty(block, "thinking");
+				const signature = managedProperty(block, "thinkingSignature");
+				return (
+					typeof thinking !== "string" ||
+					(thinking.length === 0 && signature !== undefined && typeof signature !== "string") ||
+					thinking.length > 0 ||
+					(typeof signature === "string" && signature.length > 0)
+				);
+			}
+			return true;
+		});
+	} catch {
+		return true;
+	}
 }
 // AI owns provider-originated authority. The agent loop owns authority for
 // the rebuilt message objects it creates; this second WeakSet is deliberately
@@ -806,24 +813,27 @@ function isManagedProviderSafetyStopAuthenticated(value: unknown): boolean {
 }
 
 function managedRetryableFailure(failure: unknown, transaction?: ManagedAttemptTransaction): boolean {
+	const hasObservableOutput =
+		transaction?.hasObservableAssistantOutput(failure) ?? managedAssistantMessageHasContent(failure);
 	if (
 		managedProperty(failure, "stopReason") === "error" &&
 		managedProperty(failure, "errorKind") === "local_empty_response"
 	) {
-		return true;
+		return !hasObservableOutput;
 	}
 	const facts = managedTransportFailure(failure);
 	if (!facts) return false;
-	// OpenAI's typed statusless capacity-overload code (issue #5018) is
-	// discardable only while the current managed attempt has no observable
-	// output. The session owns the retry decision; this check only protects
-	// the transaction boundary and reads typed facts, never error text.
+	// Statusless typed capacity overloads are retryable only when the managed
+	// transaction and its terminal failure contain no observable assistant
+	// output. Empty provider-start text placeholders do not block retry, while
+	// terminal-only content remains committed. Admission reads typed facts, not
+	// provider error prose.
 	if (
 		facts.status === undefined &&
 		facts.providerCode === SERVER_OVERLOADED_PROVIDER_CODE &&
 		(facts.openaiErrorCode === undefined || facts.openaiErrorCode === SERVER_OVERLOADED_PROVIDER_CODE)
 	) {
-		return !(transaction?.hasObservableAssistantOutput() ?? managedAssistantMessageHasContent(failure));
+		return !hasObservableOutput;
 	}
 	// A typed provider safety stop is terminal evidence ahead of any transport
 	// class, but only with adapter-minted provenance: unauthenticated labels
@@ -850,8 +860,26 @@ function managedRetryableFailure(failure: unknown, transaction?: ManagedAttemptT
 	);
 }
 
-function promoteEmptyResponseStop(message: AssistantMessage): void {
+function promoteEmptyResponseStop(
+	message: AssistantMessage,
+	providerMessage: unknown,
+	transaction?: ManagedAttemptTransaction,
+): void {
+	const providerContent = managedProperty(providerMessage, "content");
+	const providerErrorMessage = managedProperty(providerMessage, "errorMessage");
+	let providerContentIsEmpty = false;
+	try {
+		providerContentIsEmpty = Array.isArray(providerContent) && providerContent.length === 0;
+	} catch {
+		return;
+	}
 	if (
+		managedProperty(providerMessage, "stopReason") !== "stop" ||
+		!providerContentIsEmpty ||
+		(typeof providerErrorMessage === "string" && providerErrorMessage !== "") ||
+		managedProperty(providerMessage, "errorKind") !== undefined ||
+		managedProperty(providerMessage, "errorStatus") !== undefined ||
+		transaction?.hasObservableAssistantOutput(providerMessage) ||
 		message.stopReason !== "stop" ||
 		message.content.length !== 0 ||
 		message.usage.input !== 0 ||
@@ -2847,7 +2875,8 @@ class ManagedAttemptTransaction {
 		this.#stagedBytes += retainedBytes;
 	}
 
-	hasObservableAssistantOutput(): boolean {
+	hasObservableAssistantOutput(terminalMessage?: unknown): boolean {
+		if (managedAssistantMessageHasContent(terminalMessage)) return true;
 		return this.#batch.some(item => {
 			if (item.type === "assistant_event") {
 				if (managedAssistantMessageHasContent(item.message)) return true;
@@ -4013,6 +4042,7 @@ async function runLoopBody(
 					recoveryAttempt && !wasEscapedNonAsciiRecoveryAttempt
 						? undefined
 						: { value: getLogicalTurnToolChoice() },
+					attemptTransaction,
 				);
 				const detection = detectHarmonyLeakInAssistantMessage(message);
 				if (detection && shouldMitigateHarmonyLeak(config.model, detection)) {
@@ -4036,7 +4066,7 @@ async function runLoopBody(
 						stream.end(newMessages);
 						return;
 					}
-					if (config.fallbackManaged && transaction && managedRetryableFailure(err)) {
+					if (config.fallbackManaged && transaction && managedRetryableFailure(err, transaction)) {
 						transaction.discard();
 						currentContext.messages.splice(contextMessageCount);
 						newMessages.splice(newMessageCount);
@@ -4308,7 +4338,11 @@ async function runLoopBody(
 					: "Provider returned an empty response with anomalously low token usage (possible context overflow via proxy)";
 			}
 
-			if (config.fallbackManaged && message.stopReason === "error" && managedRetryableFailure(message)) {
+			if (
+				config.fallbackManaged &&
+				message.stopReason === "error" &&
+				managedRetryableFailure(message, transaction)
+			) {
 				transaction?.discard();
 				currentContext.messages.splice(contextMessageCount);
 				newMessages.splice(newMessageCount);
@@ -4641,6 +4675,7 @@ async function streamAssistantResponse(
 	},
 	provisionalToolTransaction?: ManagedAttemptTransaction,
 	toolChoiceOverride?: { value: ToolChoice | undefined },
+	managedAttemptTransaction?: ManagedAttemptTransaction,
 ): Promise<AssistantMessage> {
 	const managedDegradedFieldDiagnostics = new Set<string>();
 	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
@@ -5083,7 +5118,7 @@ async function streamAssistantResponse(
 							const finalMessage = config.fallbackManaged
 								? managedAssistantShell(finished, config.model, managedDegradedFieldDiagnostics, true)
 								: finished;
-							promoteEmptyResponseStop(finalMessage);
+							promoteEmptyResponseStop(finalMessage, finished, managedAttemptTransaction);
 							if (promptPrefix) finalMessage.promptPrefix = promptPrefix;
 							if (addedPartial) {
 								context.messages[context.messages.length - 1] = finalMessage;
@@ -5097,6 +5132,13 @@ async function streamAssistantResponse(
 							await finishChat(finalMessage);
 							return finalMessage;
 						}
+						default: {
+							const unexpectedEventType = (event as unknown as { type?: unknown }).type;
+							if (config.fallbackManaged && typeof unexpectedEventType !== "string") {
+								throw new ManagedAttemptSnapshotError("event.unknownType");
+							}
+							break;
+						}
 					}
 				}
 			} finally {
@@ -5108,7 +5150,7 @@ async function streamAssistantResponse(
 			const trailing = config.fallbackManaged
 				? managedAssistantShell(finished, config.model, managedDegradedFieldDiagnostics, true)
 				: finished;
-			promoteEmptyResponseStop(trailing);
+			promoteEmptyResponseStop(trailing, finished, managedAttemptTransaction);
 			if (promptPrefix) trailing.promptPrefix = promptPrefix;
 			await finishChat(trailing);
 			return trailing;
