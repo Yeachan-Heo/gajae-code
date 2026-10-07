@@ -846,6 +846,14 @@ export type AgentEvent =
 			/** Present iff `AgentTelemetryConfig` was supplied on this run. */
 			telemetry?: AgentRunSummary;
 			coverage?: AgentRunCoverage;
+			/** True if the run ended with a silent abort (not shown to user). */
+			silentAbort?: boolean;
+			/** True if the run ended with a TTSR-triggered abort. */
+			ttsrAbort?: boolean;
+			/** True if terminal persistence failed for this run. */
+			terminalPersistenceFailed?: boolean;
+			/** True if the terminal projection was matched after this run. */
+			terminalProjectionMatched?: boolean;
 			scope?: AttemptScope;
 	  }
 	// Turn lifecycle - a turn is one assistant response + any tool calls/results
@@ -860,7 +868,14 @@ export type AgentEvent =
 			assistantMessageEvent: AssistantMessageEvent;
 			scope?: AttemptScope;
 	  }
-	| { type: "message_end"; message: AgentMessage; scope?: AttemptScope }
+	| {
+			type: "message_end";
+			message: AgentMessage;
+			scope?: AttemptScope;
+			terminalPersistenceFailed?: boolean;
+			ttsrAbort?: boolean;
+			silentAbort?: boolean;
+	  }
 	// Tool execution lifecycle
 	| {
 			type: "tool_execution_start";
