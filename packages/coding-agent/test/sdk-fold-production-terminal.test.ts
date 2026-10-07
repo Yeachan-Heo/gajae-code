@@ -187,6 +187,143 @@ async function cancelFoldedTerminal(folded: FoldedTerminal): Promise<void> {
 	await folded.promptRun;
 }
 
+function registerOrdinarySdkJob(output: string, label: string) {
+	if (!created || !tempDir) throw new Error("SDK session fixture unavailable");
+	const manager = AsyncJobManager.forEndpoint(created.session.sessionId);
+	if (!manager) throw new Error("expected the SDK session's production async job manager");
+	const cwd = tempDir.path();
+	const jobId = manager.register("bash", label, async () => {
+		const child = Bun.spawn([process.execPath, "-e", `process.stdout.write(${JSON.stringify(output)})`], {
+			cwd,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+			child.exited,
+		]);
+		if (exitCode !== 0) throw new Error(`Bun async job exited with ${exitCode}: ${stderr}`);
+		return stdout;
+	});
+	const job = manager.getJob(jobId);
+	if (!job) throw new Error("expected the ordinary SDK job in its production async manager");
+	if (job.ownerId !== undefined) throw new Error("expected an unowned ordinary SDK async job");
+	return { jobId, manager };
+}
+
+type OrdinaryPublicationRefusal = "symlink" | "replacement" | "contended" | "unavailable";
+
+async function assertOrdinaryPublicationRefusal(scenario: OrdinaryPublicationRefusal): Promise<void> {
+	const mock = await createProductionSession(false, scenario !== "unavailable");
+	if (!sessionManager || !created || !tempDir) throw new Error("SDK session fixture unavailable");
+	const warning = spyOnWarnings();
+	const originalSaveArtifact = SessionManager.prototype.saveArtifact;
+	const saveArtifact = trackSpy(spyOn(SessionManager.prototype, "saveArtifact"));
+	const allocateArtifactPath = trackSpy(spyOn(SessionManager.prototype, "allocateArtifactPath"));
+	let saveCompleted = false;
+	let savedArtifactId: string | undefined;
+	let destinationPath: string | undefined;
+	let publicationError: unknown;
+	const externalTarget = path.join(tempDir.path(), "ordinary-symlink-target.txt");
+	if (scenario === "symlink") await Bun.write(externalTarget, "protected external bytes");
+
+	if (scenario === "unavailable") {
+		saveArtifact.mockImplementation(function (this: SessionManager, content: string, toolType: string) {
+			const saving = originalSaveArtifact.call(this, content, toolType);
+			this.retireEphemeralArtifactsAfterTransition();
+			return saving.then(artifactId => {
+				saveCompleted = true;
+				savedArtifactId = artifactId;
+				return artifactId;
+			});
+		});
+	} else {
+		const originalAllocatePath = ArtifactManager.prototype.allocatePath;
+		trackSpy(spyOn(ArtifactManager.prototype, "allocatePath")).mockImplementation(async function (
+			this: ArtifactManager,
+			toolType: string,
+		) {
+			const allocation = await originalAllocatePath.call(this, toolType);
+			if (toolType === "async" && allocation.id) {
+				destinationPath = path.join(this.dir, `${allocation.id}.async.log`);
+				if (scenario === "symlink") fs.symlinkSync(externalTarget, destinationPath);
+				if (scenario === "replacement") await Bun.write(destinationPath, "replacement bytes");
+			}
+			return allocation;
+		});
+		const originalPublish = ManagedSessionDescendantStore.prototype.publishNoReplaceSync;
+		trackSpy(spyOn(ManagedSessionDescendantStore.prototype, "publishNoReplaceSync")).mockImplementation(function (
+			this: ManagedSessionDescendantStore,
+			relativePath: string,
+			bytes: Uint8Array,
+		) {
+			if (!relativePath.endsWith(".async.log")) return originalPublish.call(this, relativePath, bytes);
+			destinationPath = path.join(this.dir, relativePath);
+			if (scenario === "contended")
+				originalPublish.call(this, relativePath, Buffer.from("contending publisher bytes"));
+			try {
+				return originalPublish.call(this, relativePath, bytes);
+			} catch (error) {
+				publicationError = error;
+				throw error;
+			}
+		});
+	}
+
+	const queue = created.session.yieldQueue;
+	const originalEnqueue = queue.enqueue;
+	const queuedResults: string[] = [];
+	trackSpy(spyOn(queue, "enqueue")).mockImplementation(function <P>(this: typeof queue, kind: string, entry: P) {
+		if (kind === "async-result" && typeof entry === "object" && entry !== null && "result" in entry) {
+			const result = entry.result;
+			if (typeof result === "string") queuedResults.push(result);
+		}
+		return originalEnqueue.call(this, kind, entry);
+	});
+
+	const output = `${`${scenario} ordinary refused output `.repeat(1_000)}${scenario.toUpperCase()}-ORDINARY-MARKER`;
+	const warningsBeforeCompletion = warning.mock.calls.length;
+	const callsBeforeCompletion = mock.calls.length;
+	const { jobId, manager } = registerOrdinarySdkJob(output, `ordinary ${scenario} refusal`);
+	if (manager.getJob(jobId)?.ownerId !== undefined) throw new Error("ordinary refusal job unexpectedly has an owner");
+	await waitFor(() =>
+		warning.mock.calls
+			.slice(warningsBeforeCompletion)
+			.some(([message]) => message === "Async job completion delivery failed"),
+	);
+
+	expect(saveArtifact).toHaveBeenCalledWith(
+		expect.stringContaining(`${scenario.toUpperCase()}-ORDINARY-MARKER`),
+		"async",
+	);
+	expect(allocateArtifactPath).not.toHaveBeenCalled();
+	expect(queuedResults).toEqual([]);
+	expect(queue.has("async-result")).toBe(false);
+	const failureWarning = warning.mock.calls
+		.slice(warningsBeforeCompletion)
+		.find(([message]) => message === "Async job completion delivery failed");
+	if (!failureWarning) throw new Error("expected ordinary async callback publication refusal warning");
+	if (scenario === "unavailable") {
+		expect(saveCompleted).toBe(true);
+		expect(savedArtifactId).toBeUndefined();
+		expect(sessionManager.getArtifactManager()).toBeNull();
+		expect(JSON.stringify(failureWarning)).toContain("Artifact storage unavailable for async follow-up output.");
+	} else {
+		if (!(publicationError instanceof Error)) throw new Error("expected secure artifact publication refusal");
+		expect(JSON.stringify(failureWarning)).toContain(publicationError.message);
+		if (!destinationPath) throw new Error("expected refused ordinary artifact destination");
+		if (scenario === "symlink") {
+			expect(await Bun.file(externalTarget).text()).toBe("protected external bytes");
+			expect(fs.lstatSync(destinationPath).isSymbolicLink()).toBe(true);
+		}
+		if (scenario === "replacement") expect(await Bun.file(destinationPath).text()).toBe("replacement bytes");
+		if (scenario === "contended") expect(await Bun.file(destinationPath).text()).toBe("contending publisher bytes");
+	}
+	await queue.flush("idle");
+	expect(mock.calls.length).toBe(callsBeforeCompletion);
+}
+
 async function disposeProductionSession(): Promise<void> {
 	const failures: unknown[] = [];
 	let teardownSettled = created === undefined;
@@ -224,7 +361,7 @@ async function disposeProductionSession(): Promise<void> {
 	if (failures.length > 1) throw new AggregateError(failures, "SDK fixture bounded disposal failed.");
 }
 
-describe("SDK production ACP fold path", () => {
+describe("SDK production async completion paths", () => {
 	afterEach(async () => {
 		await disposeProductionSession();
 	});
@@ -308,6 +445,44 @@ describe("SDK production ACP fold path", () => {
 		expect(wakeMessages).toContain("folded output");
 		expect(wakeMessages).toContain("folded client-terminal wait");
 	});
+
+	test("publishes long output from an ordinary SDK-managed Bun job through SessionManager", async () => {
+		const mock = await createProductionSession(false);
+		if (!sessionManager || !created) throw new Error("SDK session fixture unavailable");
+		const fullOutput = `${"ordinary SDK Bun output\n".repeat(800)}ORDINARY-OUTPUT-MARKER`;
+		expect(fullOutput.length).toBeGreaterThan(12_000);
+		const saveArtifact = trackSpy(spyOn(SessionManager.prototype, "saveArtifact"));
+		const allocateArtifactPath = trackSpy(spyOn(SessionManager.prototype, "allocateArtifactPath"));
+		const callsBeforeWake = mock.calls.length;
+		registerOrdinarySdkJob(fullOutput, "ordinary SDK artifact publication");
+		await waitFor(() => created!.session.yieldQueue.has("async-result"));
+		await created.session.yieldQueue.flush("idle");
+		expect(mock.calls.length).toBe(callsBeforeWake + 1);
+		const wakeMessages = mock.calls[mock.calls.length - 1]?.context.messages
+			.filter(message => message.role === "user")
+			.flatMap(message =>
+				typeof message.content === "string"
+					? [message.content]
+					: message.content.flatMap(content => (content.type === "text" ? [content.text] : [])),
+			)
+			.join("\n");
+		if (wakeMessages === undefined) throw new Error("expected ordinary async-job model wake");
+		expect(wakeMessages).toContain(fullOutput.slice(0, 4_000));
+		expect(saveArtifact).toHaveBeenCalledWith(fullOutput, "async");
+		expect(allocateArtifactPath).not.toHaveBeenCalled();
+		const uri = wakeMessages.match(/artifact:\/\/(\d+)/u)?.[0];
+		if (!uri) throw new Error("expected ordinary async-job artifact URI in model wake");
+		expect(wakeMessages).toContain(`Full output: ${uri}`);
+		const artifactPath = await sessionManager.getArtifactPath(uri.slice("artifact://".length));
+		if (!artifactPath) throw new Error("expected resolvable ordinary async-job artifact");
+		expect(await Bun.file(artifactPath).text()).toBe(fullOutput);
+	});
+
+	for (const scenario of ["symlink", "replacement", "contended", "unavailable"] as const) {
+		test(`refuses ordinary SDK async publication after ${scenario} failure without queuing success`, async () => {
+			await assertOrdinaryPublicationRefusal(scenario);
+		});
+	}
 
 	test("publishes parked long output through SessionManager and wakes with its resolvable artifact URI", async () => {
 		const mock = await createProductionSession(true);
@@ -600,8 +775,7 @@ describe("SDK production ACP fold path", () => {
 			warning.mock.calls.some(
 				([message, details]) =>
 					message === "Parked folded delivery formatting failed" &&
-					JSON.stringify(details)?.includes("Artifact storage unavailable for parked async follow-up output.") ===
-						true,
+					JSON.stringify(details)?.includes("Artifact storage unavailable for async follow-up output.") === true,
 			),
 		).toBe(true);
 		await created.session.yieldQueue.flush("idle");

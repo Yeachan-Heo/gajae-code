@@ -54,6 +54,7 @@ import {
 	isBackgroundJobSupportEnabled,
 	jobElapsedMs,
 } from "../async";
+import { formatAsyncResultForFollowUp } from "../async/result-formatting";
 import { resolveBrowserBackend } from "../browser-backend";
 import { loadCapability, reset as resetCapabilities } from "../capability";
 import { type Rule, ruleCapability, setActiveRules } from "../capability/rule";
@@ -2520,33 +2521,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		const backgroundJobsEnabled = isBackgroundJobSupportEnabled(settings);
 		const asyncMaxJobs = Math.min(100, Math.max(1, settings.get("async.maxJobs") ?? 100));
-		const ASYNC_INLINE_RESULT_MAX_CHARS = 12_000;
-		const ASYNC_PREVIEW_MAX_CHARS = 4_000;
-		const formatAsyncResultForFollowUp = async (result: string, allowArtifact = true): Promise<string> => {
-			if (result.length <= ASYNC_INLINE_RESULT_MAX_CHARS) {
-				return result;
-			}
-
-			const preview = `${result.slice(0, ASYNC_PREVIEW_MAX_CHARS)}\n\n[Output truncated. Showing first ${ASYNC_PREVIEW_MAX_CHARS.toLocaleString()} characters.]`;
-			// A delivery already denied by a scope:"owned" gate never reaches the
-			// model: allocating an artifact for it would leave the stopped job's
-			// output in an unreferenced artifact after the flush drops it (review
-			// thread P2). Only the inline preview is produced.
-			if (!allowArtifact) return preview;
-			try {
-				const { path: artifactPath, id: artifactId } = await sessionManager.allocateArtifactPath("async");
-				if (artifactPath && artifactId) {
-					await Bun.write(artifactPath, result);
-					return `${preview}\nFull output: artifact://${artifactId}`;
-				}
-			} catch (error) {
-				logger.warn("Failed to persist async follow-up artifact", {
-					error: error instanceof Error ? error.message : String(error),
-				});
-			}
-
-			return preview;
-		};
 		// Only top-level sessions own an AsyncJobManager. Subagents reach the
 		// parent's manager via `AsyncJobManager.instance()` (set below), so creating
 		// a second instance here just to leave it orphaned wastes a constructor and
@@ -2604,7 +2578,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								if (job) asyncJobManager?.retainParkedDelivery(job, result);
 								return;
 							}
-							const formattedResult = await formatAsyncResultForFollowUp(result, !deniedOwnedDelivery);
+							// A delivery already denied by a scope:"owned" gate never reaches the
+							// model: allocating an artifact for it would leave the stopped job's
+							// output in an unreferenced artifact after the flush drops it (review
+							// thread P2). Only the inline preview is produced.
+							const formattedResult = await formatAsyncResultForFollowUp(
+								sessionManager,
+								result,
+								!deniedOwnedDelivery,
+							);
 							if (
 								foldDisposition.kind === "receipt" &&
 								job &&
