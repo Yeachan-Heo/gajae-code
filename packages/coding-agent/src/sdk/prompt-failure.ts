@@ -366,9 +366,23 @@ export function lifecycleFailureCauseDiagnostic(failureCause: unknown): string |
  * first line of message, and exit code/signal if available. Bounded to 200 chars,
  * sanitized for outbound publication (strips paths, URLs, ANSI, credentials, identifiers).
  * Used for #408 to provide real cause in terminal_failure logs.
+ *
+ * When error comes from agent_failed event, uses the pre-extracted cause field if available.
  */
 export function failureCauseDiagnostic(error: unknown): string | undefined {
 	if (error === null || error === undefined) return undefined;
+
+	// If this error came from agent_failed event, it may have a pre-extracted cause
+	const errorAsObj = error as { cause?: unknown } | undefined;
+	if (typeof errorAsObj?.cause === "string" && errorAsObj.cause.length > 0) {
+		// Cause from agent_failed is already sanitized and bounded, just validate and revalidate
+		const verdict = sanitizeExternalCrashV1(errorAsObj.cause, FAILURE_CAUSE_DIAGNOSTIC_MAX);
+		if (verdict.ok && verdict.value === errorAsObj.cause) return verdict.value;
+		// If sanitization changed it, it's not trusted (already sanitized)
+		if (!verdict.ok) return undefined;
+		return verdict.value;
+	}
+
 	try {
 		let className = "Error";
 		let message = "";
@@ -380,26 +394,26 @@ export function failureCauseDiagnostic(error: unknown): string | undefined {
 			const firstLine = (error.message || "").split("\n")[0] || "";
 			message = firstLine.slice(0, 100);
 			// Check for exitCode, signal, or code properties on Error instances
-			const errorAsObj = error as { signal?: unknown; exitCode?: unknown; code?: unknown };
+			const errorObj = error as { signal?: unknown; exitCode?: unknown; code?: unknown };
 			if (
-				typeof errorAsObj.signal === "string" &&
-				["SIGTERM", "SIGKILL", "SIGABRT", "SIGSEGV", "SIGINT"].includes(errorAsObj.signal)
+				typeof errorObj.signal === "string" &&
+				["SIGTERM", "SIGKILL", "SIGABRT", "SIGSEGV", "SIGINT"].includes(errorObj.signal)
 			) {
-				exitSignal = `signal=${errorAsObj.signal}`;
+				exitSignal = `signal=${errorObj.signal}`;
 			} else if (
-				typeof errorAsObj.exitCode === "number" &&
-				Number.isInteger(errorAsObj.exitCode) &&
-				errorAsObj.exitCode >= 0 &&
-				errorAsObj.exitCode <= 255
+				typeof errorObj.exitCode === "number" &&
+				Number.isInteger(errorObj.exitCode) &&
+				errorObj.exitCode >= 0 &&
+				errorObj.exitCode <= 255
 			) {
-				exitSignal = `exit=${errorAsObj.exitCode}`;
+				exitSignal = `exit=${errorObj.exitCode}`;
 			} else if (
-				typeof errorAsObj.code === "number" &&
-				Number.isInteger(errorAsObj.code) &&
-				errorAsObj.code >= 0 &&
-				errorAsObj.code <= 255
+				typeof errorObj.code === "number" &&
+				Number.isInteger(errorObj.code) &&
+				errorObj.code >= 0 &&
+				errorObj.code <= 255
 			) {
-				exitSignal = `code=${errorAsObj.code}`;
+				exitSignal = `code=${errorObj.code}`;
 			}
 		} else if (typeof error === "string") {
 			message = error.split("\n")[0]?.slice(0, 100) || "";
