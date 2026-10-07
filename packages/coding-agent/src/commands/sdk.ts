@@ -15,6 +15,7 @@ import { CliParseError, Command } from "@gajae-code/utils/cli";
 import type { Args as ParsedArgs } from "../cli/args";
 import { isSafeSdkInternalAgentDir, scanPublicCommand } from "../cli/public-command-entry";
 import { PublicCommandFailure } from "../cli/public-command-errors";
+import { FileLockAcquireError } from "../config/file-lock";
 import { parseModelString } from "../config/model-resolver";
 import { Settings } from "../config/settings";
 import { usePostmortemSignalExitAuthority } from "../lsp/client";
@@ -31,6 +32,7 @@ import {
 import { readBrokerDiscovery } from "../sdk/broker/discovery";
 import { type EndpointFileRead, readEndpointFile } from "../sdk/broker/endpoint-authority";
 import {
+	BROKER_DISCOVERY_BUDGET,
 	emitBrokerStartupTestSignal,
 	reconcileBrokerGenerationForStartup,
 	withBrokerStartupLock,
@@ -1760,7 +1762,7 @@ export default class Sdk extends Command {
 		let runningBroker: Broker | undefined;
 		let stopSweep: (() => void) | undefined;
 		let startupExitRequested = false;
-		let startupExitReason: "startup-deadline" | "startup-signal" | undefined;
+		let startupExitReason: BrokerStartupExitRecord["reason"] | undefined;
 		let startupExitLogged = false;
 		let pendingShutdownSignal: "SIGTERM" | "SIGINT" | undefined;
 		let startupExitTask: Promise<boolean> | undefined;
@@ -1781,10 +1783,11 @@ export default class Sdk extends Command {
 		};
 		const startupSignalExitCode = (signal: "SIGTERM" | "SIGINT"): 130 | 143 => (signal === "SIGINT" ? 130 : 143);
 		const makeStartupExitRecord = (
-			reason: "startup-deadline" | "startup-signal",
+			reason: BrokerStartupExitRecord["reason"],
 			exitCode: 1 | 130 | 143,
 			signal: "SIGTERM" | "SIGINT" | null,
 			timeoutMs?: number,
+			blockingLockPath?: string,
 		): BrokerStartupExitRecord & Record<string, unknown> => ({
 			version: 1,
 			reason,
@@ -1797,6 +1800,7 @@ export default class Sdk extends Command {
 			exitCode,
 			timeoutMs: timeoutMs ?? null,
 			writtenAt: Date.now(),
+			...(blockingLockPath === undefined ? {} : { blockingLockPath }),
 		});
 		const beginStartupExitRecordWrite = (record: BrokerStartupExitRecord): Promise<BrokerStartupExitWriteStatus> => {
 			const testDelayMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_EXIT_RECORD_DELAY_MS ?? 0);
@@ -1831,21 +1835,24 @@ export default class Sdk extends Command {
 			process.stderr.write(`${JSON.stringify({ level, message, ...record })}\n`);
 		};
 		const exitDuringStartup = (
-			reason: "startup-deadline" | "startup-signal",
+			reason: BrokerStartupExitRecord["reason"],
 			exitCode: 1 | 130 | 143,
 			signal: "SIGTERM" | "SIGINT" | null,
 			timeoutMs?: number,
+			blockingLockPath?: string,
 		): Promise<boolean> => {
 			// The first startup exit cause owns both the persisted reason and the process exit code.
 			if (startupExitTask) return startupExitReason === reason ? startupExitTask : Promise.resolve(false);
 			if (startupExitRequested) return Promise.resolve(false);
 			startupExitRequested = true;
 			startupExitReason = reason;
-			const exitRecord = makeStartupExitRecord(reason, exitCode, signal, timeoutMs);
+			const exitRecord = makeStartupExitRecord(reason, exitCode, signal, timeoutMs, blockingLockPath);
 			const message =
-				reason === "startup-deadline"
-					? `SDK broker startup exceeded its ${timeoutMs}ms fence deadline.`
-					: `SDK broker startup interrupted by ${signal} before readiness.`;
+				reason === "startup-lock-blocked" && blockingLockPath
+					? `SDK broker startup blocked by retained removal transition ${blockingLockPath}.`
+					: reason === "startup-deadline"
+						? `SDK broker startup exceeded its ${timeoutMs}ms fence deadline.`
+						: `SDK broker startup interrupted by ${signal} before readiness.`;
 			writeStartupExitLog(exitRecord, message);
 			startupExitTask = (async () => {
 				const exitRecordWrite = await beginStartupExitRecordWrite(exitRecord);
@@ -1874,7 +1881,7 @@ export default class Sdk extends Command {
 						: pendingShutdownSignal;
 			if (!signal) return;
 			pendingShutdownSignal = signal;
-			if (startupExitTask && startupExitReason === "startup-deadline") {
+			if (startupExitTask && startupExitReason !== "startup-signal") {
 				await startupExitTask;
 				await waitForStartupAbortCleanup();
 				process.exit(1);
@@ -2046,6 +2053,17 @@ export default class Sdk extends Command {
 			if (pendingShutdownSignal) {
 				await finishPendingStartupSignal();
 				return;
+			}
+			// A retained removal transition is an explicit acquire failure, not only
+			// an exhausted ordinary contention timeout.
+			if (error instanceof FileLockAcquireError && error.orphanPath) {
+				await exitDuringStartup(
+					"startup-lock-blocked",
+					1,
+					null,
+					BROKER_DISCOVERY_BUDGET.startupLockWaitMs,
+					error.orphanPath,
+				);
 			}
 			if (broker) {
 				try {
