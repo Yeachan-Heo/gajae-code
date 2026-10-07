@@ -1,7 +1,7 @@
 import { afterAll, afterEach, describe, expect, test, vi } from "bun:test";
 import { crc32 } from "../src/providers/aws-eventstream";
 import { streamKiroCodeWhisperer } from "../src/providers/kiro-codewhisperer";
-import type { AssistantMessageEvent, Context, Model } from "../src/types";
+import type { AssistantMessageEvent, Context, FetchImpl, Model } from "../src/types";
 
 // Frame encoder (copied from aws-eventstream.test.ts for use in fixtures)
 function encodeStringHeader(name: string, value: string): Uint8Array {
@@ -51,7 +51,7 @@ function encodeFrame(headers: Record<string, string>, payload: Uint8Array): Uint
 let capturedRequest: { headers: Record<string, string>; body: string } | null = null;
 
 function createMockFetch() {
-	return async (_url: string, init?: RequestInit) => {
+	return async (_url: string | URL | Request, init?: RequestInit) => {
 		// Capture request
 		const headers: Record<string, string> = {};
 		const headerObj = init?.headers;
@@ -93,7 +93,7 @@ function createMockFetch() {
 	};
 }
 
-const mockFetch = vi.spyOn(globalThis, "fetch" as any).mockImplementation(createMockFetch());
+const mockFetch = vi.spyOn<{ fetch: FetchImpl }, "fetch">(globalThis, "fetch").mockImplementation(createMockFetch());
 
 afterEach(() => {
 	mockFetch.mockClear();

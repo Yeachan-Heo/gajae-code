@@ -10,7 +10,7 @@ import {
 } from "../src/adapter-internals/provider-safety-stop";
 import { getBundledModel } from "../src/models";
 import { streamKiroApiKey } from "../src/providers/kiro-api-key";
-import type { Context, Model } from "../src/types";
+import type { AssistantMessageEvent, Context, Model } from "../src/types";
 import { registerFinalizedModelClone } from "../src/utils/trusted-model-clone";
 
 const originalFetch = globalThis.fetch;
@@ -272,7 +272,7 @@ describe("P3: Thinking block streamed without text buffering", () => {
 			});
 		}) as unknown as typeof fetch;
 
-		const events: unknown[] = [];
+		const events: AssistantMessageEvent[] = [];
 		const stream = streamKiroApiKey(model, context, {
 			apiKey,
 			requestMaxRetries: 0,
@@ -284,10 +284,10 @@ describe("P3: Thinking block streamed without text buffering", () => {
 		}
 
 		// Find indices of different event types
-		const thinkingStartIdx = events.findIndex(e => (e as any).type === "thinking_start");
-		const thinkingEndIdx = events.findIndex(e => (e as any).type === "thinking_end");
-		const textStartIdx = events.findIndex(e => (e as any).type === "text_start");
-		const textDeltaEvents = events.filter(e => (e as any).type === "text_delta");
+		const thinkingStartIdx = events.findIndex(e => e.type === "thinking_start");
+		const thinkingEndIdx = events.findIndex(e => e.type === "thinking_end");
+		const textStartIdx = events.findIndex(e => e.type === "text_start");
+		const textDeltaEvents = events.filter(e => e.type === "text_delta");
 
 		// Verify thinking was emitted
 		expect(thinkingStartIdx).toBeGreaterThanOrEqual(0);
@@ -300,9 +300,9 @@ describe("P3: Thinking block streamed without text buffering", () => {
 		expect(textDeltaEvents.length).toBeGreaterThan(0);
 
 		// Verify the answer text contains the full answer
-		const doneEvent = events.find(e => (e as any).type === "done") as any;
+		const doneEvent = events.find(e => e.type === "done");
 		if (doneEvent?.message?.content) {
-			const textBlock = doneEvent.message.content.find((c: any) => c.type === "text");
+			const textBlock = doneEvent.message.content.find(c => c.type === "text");
 			expect(textBlock?.text).toContain("this is the answer");
 		}
 	});
@@ -340,7 +340,7 @@ describe("P3: Thinking block streamed without text buffering", () => {
 			});
 		}) as unknown as typeof fetch;
 
-		const events: unknown[] = [];
+		const events: AssistantMessageEvent[] = [];
 		const stream = streamKiroApiKey(model, context, {
 			apiKey,
 			requestMaxRetries: 0,
@@ -351,8 +351,8 @@ describe("P3: Thinking block streamed without text buffering", () => {
 			events.push(event);
 		}
 
-		const toolcallDeltaEvent = events.find(e => (e as any).type === "toolcall_delta") as any;
-		const toolcallEndEvent = events.find(e => (e as any).type === "toolcall_end") as any;
+		const toolcallDeltaEvent = events.find(e => e.type === "toolcall_delta");
+		const toolcallEndEvent = events.find(e => e.type === "toolcall_end");
 
 		// Delta should have normalized args (empty string for no args, not raw input)
 		expect(toolcallDeltaEvent?.delta).toBe("{}");
