@@ -75,15 +75,16 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 		// Canonicalize IDs the same way production code does when comparing identities
 		const canonicalRootId = canonicalLockFileId(BigInt.asIntN(64, ROOT_ID));
 		const canonicalInfoId = canonicalLockFileId(BigInt.asIntN(64, INFO_ID));
-		// On Windows, canonicalize DEVICE_ID; on other platforms, preserve the snapshot's dev
-		const canonicalRootDev = process.platform === "win32" ? canonicalLockDeviceId(DEVICE_ID).toString() : snapshot.rootDev;
+		// On Windows, canonicalize the observed device; otherwise preserve it.
+		const canonicalRootDev =
+			process.platform === "win32" ? canonicalLockDeviceId(BigInt(snapshot.rootDev)).toString() : snapshot.rootDev;
 		return {
 			...snapshot,
 			rootDev: canonicalRootDev,
 			rootIno: component === "info" ? snapshot.rootIno : canonicalRootId.toString(),
 			entries: snapshot.entries.map(entry => ({
 				...entry,
-				dev: process.platform === "win32" ? canonicalLockDeviceId(DEVICE_ID).toString() : entry.dev,
+				dev: process.platform === "win32" ? canonicalLockDeviceId(BigInt(entry.dev)).toString() : entry.dev,
 				ino:
 					entry.relativePath === "" && component !== "info"
 						? canonicalRootId.toString()
