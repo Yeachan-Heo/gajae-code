@@ -8494,7 +8494,28 @@ export class SessionManager {
 		if (issued) return issued;
 		// Preserve explicit identity from cross-manager adoptions where the target
 		// manager has no #stateSnapshots entry but the snapshot itself carries the identity.
-		const explicit = (snapshot as any).explicitPersistIdentity as ExplicitPersistIdentity | undefined;
+		// When the snapshot is copied through documented caller-adjusted paths (spread,
+		// JSON round-trip, structuredClone, etc.), the non-enumerable property is lost.
+		// Reconstruct it from the sessionFile to ensure stale file checks are not bypassed.
+		let explicit = (snapshot as any).explicitPersistIdentity as ExplicitPersistIdentity | undefined;
+		if (!explicit && snapshot.sessionFile && !snapshot.managedPersistExpectedIdentity) {
+			// Only attempt reconstruction for explicit-storage sessions (no managed identity).
+			// When a snapshot is copied through documented caller-adjusted paths (spread,
+			// JSON round-trip, structuredClone, etc.), the non-enumerable property is lost.
+			// Reconstruct it from the sessionFile to enable stale file checks in validation.
+			try {
+				explicit = this.#captureExplicitPersistIdentity(snapshot.sessionFile);
+				// Verify the reconstructed identity matches the snapshot's sessionId
+				if (explicit.sessionId !== snapshot.sessionId) {
+					// Session ID mismatch indicates the snapshot is for a different session
+					explicit = undefined;
+				}
+			} catch {
+				// If reconstruction fails (e.g., storage doesn't support readRangeSync),
+				// continue without it; validation will handle missing identity
+				explicit = undefined;
+			}
+		}
 		if (explicit) {
 			return Object.freeze({
 				...snapshot,

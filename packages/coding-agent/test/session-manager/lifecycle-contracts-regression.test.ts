@@ -83,6 +83,102 @@ describe("lifecycle contracts regression (PR #6428)", () => {
 		}
 	});
 
+	it("preserves explicit persist identity when snapshot is copied via spread operator", async () => {
+		using root = TempDir.createSync("@pi-cross-manager-explicit-identity-spread-");
+		const storage = new FileSessionStorage();
+
+		const managerA = SessionManager.create(root.path(), root.path(), storage);
+		try {
+			managerA.appendMessage({ role: "user", content: "message in A", timestamp: 1 });
+			await managerA.ensureOnDisk();
+			const snapshotA = managerA.captureState();
+			const sessionFileA = managerA.getSessionFile();
+
+			if (!sessionFileA) throw new Error("Expected explicit session file");
+
+			// Copy the snapshot via spread operator (documented caller-adjusted path)
+			// The explicit identity should survive this copy. When the snapshot is copied,
+			// the non-enumerable property is lost, but the identity should still be available.
+			const copiedSnapshot = { ...snapshotA };
+
+			// Verify the non-enumerable property is not present in the copy
+			expect((copiedSnapshot as any).explicitPersistIdentity).toBeUndefined();
+
+			// Create a second manager that will adopt the copied snapshot
+			const managerB = SessionManager.create(root.path(), root.path(), storage);
+			try {
+				// Adopt the copied snapshot from manager A
+				managerB.restoreState(copiedSnapshot);
+
+				// Verify the state was restored with proper identity
+				expect(managerB.getSessionId()).toBe(snapshotA.sessionId);
+				expect(managerB.getSessionFile()).toBe(snapshotA.sessionFile);
+
+				// Add a message and ensure the explicit identity is preserved
+				managerB.appendMessage({ role: "user", content: "response", timestamp: 2 });
+				await managerB.ensureOnDisk();
+				const sessionFileB = managerB.getSessionFile();
+
+				if (!sessionFileB) throw new Error("Expected session file");
+
+				// The snapshot adoption should preserve the explicit identity,
+				// which prevents stale file checks from being skipped
+				expect(sessionFileB).toBe(sessionFileA);
+			} finally {
+				await managerB.close();
+			}
+		} finally {
+			await managerA.close();
+		}
+	});
+
+	it("adopts snapshot with implicit explicit identity reconstruction for copied state", async () => {
+		using root = TempDir.createSync("@pi-cross-manager-explicit-identity-adopt-");
+		const storage = new FileSessionStorage();
+
+		const managerA = SessionManager.create(root.path(), root.path(), storage);
+		try {
+			managerA.appendMessage({ role: "user", content: "message in A", timestamp: 1 });
+			await managerA.ensureOnDisk();
+			const snapshotA = managerA.captureState();
+			const sessionFileA = managerA.getSessionFile();
+
+			if (!sessionFileA) throw new Error("Expected explicit session file");
+
+			// Copy the snapshot via spread operator (documented caller-adjusted path)
+			// This simulates a caller making a clean copy of the snapshot
+			const copiedSnapshot = { ...snapshotA };
+
+			// Verify the non-enumerable property is not present in the copy
+			expect((copiedSnapshot as any).explicitPersistIdentity).toBeUndefined();
+
+			// Create a second manager that will adopt the copied snapshot
+			const managerB = SessionManager.create(root.path(), root.path(), storage);
+			try {
+				// Adopt the copied snapshot - the explicit identity should be implicitly reconstructed
+				// from the sessionFile even though it was lost during the spread copy
+				managerB.restoreState(copiedSnapshot);
+
+				// Verify the state was restored with proper identity
+				expect(managerB.getSessionId()).toBe(snapshotA.sessionId);
+				expect(managerB.getSessionFile()).toBe(snapshotA.sessionFile);
+
+				// Add a message to ensure the restoration is complete
+				managerB.appendMessage({ role: "user", content: "response", timestamp: 2 });
+				await managerB.ensureOnDisk();
+
+				// Verify both managers point to the same session file
+				const sessionFileB = managerB.getSessionFile();
+				if (!sessionFileB) throw new Error("Expected session file");
+				expect(sessionFileB).toBe(sessionFileA);
+			} finally {
+				await managerB.close();
+			}
+		} finally {
+			await managerA.close();
+		}
+	});
+
 	it("throws during getArtifactPath after teardown starts", async () => {
 		const session = SessionManager.inMemory();
 
