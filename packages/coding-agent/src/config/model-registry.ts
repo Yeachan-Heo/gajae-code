@@ -3042,7 +3042,7 @@ export class ModelRegistry {
 			const resolved = this.#runtimeProviderApiKeyEnvNames.has(provider)
 				? $rotatingCredentialEnv(this.#runtimeProviderApiKeyEnvNames.get(provider)!)
 				: resolveApiKeyConfig(apiKeyConfig);
-			if (!resolved) {
+			if (!resolved || this.authStorage.hasAnyCredentialPin(provider)) {
 				this.#runtimeProviderCredentialInstalled.delete(provider);
 				const authHeader = this.#runtimeProviderAuthHeaders.get(provider);
 				if (authHeader === true) {
@@ -3098,7 +3098,7 @@ export class ModelRegistry {
 			const resolved = this.#runtimeProviderApiKeyEnvNames.has(provider)
 				? $rotatingCredentialEnv(this.#runtimeProviderApiKeyEnvNames.get(provider)!)
 				: resolveApiKeyConfig(apiKeyConfig);
-			if (!resolved) continue;
+			if (!resolved || this.authStorage.hasAnyCredentialPin(provider)) continue;
 			this.#customProviderApiKeys.set(provider, resolved);
 			this.#runtimeProviderResolvedApiKeys.set(provider, resolved);
 			this.#runtimeProviderCredentialInstalled.add(provider);

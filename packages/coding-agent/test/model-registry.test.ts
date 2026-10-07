@@ -6626,7 +6626,86 @@ describe("ModelRegistry", () => {
 		}
 	});
 
-	test("materializes a resolved runtime apiKey in auth headers", async () => {
+	test("does not reapply runtime provider keys over a session pin during static reload", async () => {
+		const envName = "GJC_TEST_RUNTIME_PROVIDER_PINNED_RELOAD_KEY";
+		const restoreKey = setEnvForTest(envName, "initial-runtime-provider-key");
+		const sessionId = "runtime-provider-pinned-reload-session";
+		let registry: ModelRegistry | undefined;
+		try {
+			await authStorage.set("runtime-proxy", [
+				{
+					type: "oauth",
+					access: "runtime-proxy-pinned-oauth-access",
+					refresh: "runtime-proxy-pinned-oauth-refresh",
+					expires: Date.now() + 60_000,
+					email: "runtime-proxy@example.com",
+				},
+			]);
+			writeRawModelsJson({
+				"runtime-proxy": {
+					...providerConfig(
+						"https://static-proxy-before.example/v1",
+						[{ id: "static-before" }],
+						"openai-completions",
+					),
+				},
+			});
+			registry = new ModelRegistry(authStorage, modelsJsonPath);
+			registry.registerProvider("runtime-proxy", {
+				baseUrl: "https://runtime-proxy.example/v1",
+				apiKey: envName,
+				api: "openai-completions",
+				authHeader: true,
+				models: [
+					{
+						id: "runtime-model",
+						name: "Runtime Model",
+						reasoning: false,
+						input: ["text"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						contextWindow: 100_000,
+						maxTokens: 8_000,
+					},
+				],
+			});
+			expect(await registry.getApiKeyForProvider("runtime-proxy")).toBe("initial-runtime-provider-key");
+
+			// Static reload drops owner keys before reapplying runtime registrations.
+			authStorage.clearConfigApiKeys(registry.getAuthStorageOwner());
+			authStorage.acquireCredentialScope(sessionId);
+			authStorage.setSessionCredentialSelector(sessionId, "runtime-proxy", {
+				kind: "email",
+				value: "runtime-proxy@example.com",
+			});
+			Bun.env[envName] = "rotated-runtime-provider-key";
+			writeRawModelsJson({
+				"runtime-proxy": {
+					...providerConfig(
+						"https://static-proxy-after.example/v1",
+						[{ id: "static-after" }],
+						"openai-completions",
+					),
+				},
+			});
+			await registry.refresh("offline");
+
+			expect(authStorage.hasConfigApiKey("runtime-proxy", registry.getAuthStorageOwner())).toBe(false);
+			await expect(
+				authStorage.peekApiKey("runtime-proxy", {
+					sessionId,
+					owner: registry.getAuthStorageOwner(),
+				}),
+			).resolves.toBe("runtime-proxy-pinned-oauth-access");
+			expect(registry.find("runtime-proxy", "runtime-model")?.headers?.Authorization).toBeUndefined();
+			expect(registry.getEffectiveProviderAuth("runtime-proxy", sessionId)).toBe("oauth");
+		} finally {
+			registry?.dispose();
+			authStorage.releaseCredentialScope(sessionId);
+			restoreKey();
+		}
+	});
+
+	test("materializes a resolved runtime provider apiKey in auth headers", async () => {
 		const envName = "GJC_TEST_RUNTIME_AUTH_HEADER_KEY";
 		const restoreKey = setEnvForTest(envName, "resolved-runtime-auth-key");
 		try {
