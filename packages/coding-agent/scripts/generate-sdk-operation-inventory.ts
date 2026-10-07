@@ -227,10 +227,6 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal owner-recovery staged restore builder after durable claims/fencing, never a user-facing SDK operation",
 	"agent_session:setActiveModelProfile": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getActiveModelProfile": "internal accessor/plumbing, not a user-facing control seam",
-	"agent_session:setUnavailableModelProfile":
-		"internal session-scoped profile lifecycle state behind the reviewed model.set seam, not an independent public SDK operation",
-	"agent_session:getUnavailableModelProfile":
-		"internal session-scoped profile lifecycle accessor behind the reviewed model.set seam, not an independent public SDK operation",
 	"agent_session:getUserModelSelectionRevision":
 		"internal session-scoped model selection revision tracking behind the reviewed model.set seam, not an independent public SDK operation",
 	"agent_session:getUserCanonicalVariantSelection":
