@@ -228,9 +228,9 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:setActiveModelProfile": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getActiveModelProfile": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setUnavailableModelProfile":
-		"internal session-scoped profile lifecycle state behind the reviewed model.set seam, not an independent public SDK operation",
+		"internal session-scoped unavailable profile tracking, mutated on model-load failure through the reviewed model.set lifecycle; not an independent public SDK operation",
 	"agent_session:getUnavailableModelProfile":
-		"internal session-scoped profile lifecycle accessor behind the reviewed model.set seam, not an independent public SDK operation",
+		"internal session-scoped unavailable profile query for UI status rendering behind the reviewed model.set lifecycle; not an independent public SDK operation",
 	"agent_session:getUserModelSelectionRevision":
 		"internal session-scoped model selection revision tracking behind the reviewed model.set seam, not an independent public SDK operation",
 	"agent_session:getUserCanonicalVariantSelection":
@@ -331,10 +331,6 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal profile-derived eager delegation synchronization, not a user-facing SDK control seam",
 	"agent_session:submitUserMessage":
 		"public in-process embedder lifecycle API; direct handle surface, not an SDK transport operation",
-	"agent_session:setUnavailableModelProfile":
-		"internal session-scoped unavailable profile tracking; mutated by the session lifecycle on model-load failure, not a public SDK control seam",
-	"agent_session:getUnavailableModelProfile":
-		"internal session-scoped unavailable profile query for UI status rendering; not a public SDK operation",
 };
 /** Maps reviewed source seams to registry SDK operation IDs. */
 const SEAM_TO_SDK: Readonly<Record<string, string>> = {
