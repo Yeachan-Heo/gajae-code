@@ -6229,6 +6229,12 @@ export async function reconcileManagedTombstones(
 	expectedCandidate?: ManagedCandidate,
 ): Promise<void> {
 	const directory = path.join(managedInternalDirectory(scope), MANAGED_TOMBSTONES_DIRECTORY);
+	// Ensure scope authority is prepared before any operations that might access the GC protocol
+	const prepared = await ensureManagedScope(
+		scope,
+		scope.platform === "win32" ? "windows-existing-verify-first" : "default",
+	);
+	if (prepared.kind === "error") throw new Error(prepared.message);
 	for (const name of fs.readdirSync(directory)) {
 		const tombstone = path.join(directory, name);
 		const discoveredTargets = retiredTargets(scope, tombstone);
@@ -6242,11 +6248,6 @@ export async function reconcileManagedTombstones(
 			continue;
 		let lock: ManagedStorageLock | undefined;
 		try {
-			const prepared = await ensureManagedScope(
-				scope,
-				scope.platform === "win32" ? "windows-existing-verify-first" : "default",
-			);
-			if (prepared.kind === "error") throw new Error(prepared.message);
 			lock = await acquireManagedLock(
 				path.join(managedInternalDirectory(scope), MANAGED_LOCKS_DIRECTORY),
 				path.basename(tombstone, ".json"),
