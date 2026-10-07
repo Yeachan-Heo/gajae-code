@@ -606,6 +606,10 @@ export class PromptDeadlineManager {
 		lease: PromptDeadlineLease,
 		generation: number,
 	): void {
+		if (process.env.GJC_DEBUG_DEADLINE === "1")
+			process.stderr.write(
+				`[deadline-manager-debug] recover ${JSON.stringify({ key, attempts: this.#uncertaintyRetries.get(key) ?? 0, pending: this.#uncertaintyRecoveryPending.has(key), due: this.#now() >= promptDeadlineAt(lease) })}\n`,
+			);
 		const current = this.#leases.get(key);
 		if (
 			!correlation ||
@@ -633,6 +637,8 @@ export class PromptDeadlineManager {
 				lease.acceptedAt + lease.maxMs,
 			)
 			.then(() => {
+				if (process.env.GJC_DEBUG_DEADLINE === "1")
+					process.stderr.write(`[deadline-manager-debug] markUncertain resolved ${key}\n`);
 				const current = this.#leases.get(key);
 				if (current === lease && this.#now() >= lease.acceptedAt + lease.maxMs) {
 					// The acceptance-anchored hard maximum has expired. Keep the durable
@@ -667,6 +673,8 @@ export class PromptDeadlineManager {
 				}
 			})
 			.catch(() => {
+				if (process.env.GJC_DEBUG_DEADLINE === "1")
+					process.stderr.write(`[deadline-manager-debug] markUncertain rejected ${key}\n`);
 				const current = this.#leases.get(key);
 				if (current !== lease || this.#now() < promptDeadlineAt(current)) {
 					// Validate authority before applying the exhaustion branch too. A stale
