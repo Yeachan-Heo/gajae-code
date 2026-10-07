@@ -1946,7 +1946,6 @@ describe("agentLoop - empty response overflow detection", () => {
 		});
 	});
 
-
 	it("does not promote a zero-token stop that contains a content block", async () => {
 		const context: AgentContext = {
 			systemPrompt: ["You are helpful."],
