@@ -65,7 +65,7 @@ test("SDK observer tags do not exempt context handlers from replay invalidation"
 	);
 	const runner = new ExtensionRunner([extension], runtime, process.cwd(), SessionManager.inMemory(), {} as never);
 	runner.setAttemptRecordStore(records);
-	await runner.emit({ type: "context", messages: [] }, undefined, scope);
+	await runner.emitContext([], scope);
 	expect(delivered).toBe(1);
 	expect(records.isClean(scope)).toBe(false);
 });
