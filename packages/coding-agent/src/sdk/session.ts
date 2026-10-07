@@ -185,7 +185,7 @@ import { AgentSession, type ForkContextSeed, isSessionDisposalIncompleteError } 
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../session/auth-storage";
 import { type CustomMessage, convertToLlm } from "../session/messages";
 import { primaryControlSurfaceFor } from "../session/primary-control-surface";
-import { createReadonlySessionManager, SessionManager } from "../session/session-manager";
+import { createReadonlySessionManager, SessionManager, sessionArtifactCapability } from "../session/session-manager";
 import {
 	parsePersistedCredentialSelector,
 	resolveStartupAuthConfig,
@@ -3299,6 +3299,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			peekStandingResolveHandler: () => session.peekStandingResolveHandler(),
 			setStandingResolveHandler: handler => session.setStandingResolveHandler(handler),
 			allocateOutputArtifact: toolType => sessionManager.allocateArtifactPath(toolType),
+			captureArtifactPublication: () => {
+				const capability = sessionArtifactCapability(sessionManager);
+				if (!capability) throw new Error("Session artifact publication authority is unavailable.");
+				return capability.captureArtifactPublication();
+			},
 			getArtifactManager: () => sessionManager.getArtifactManager(),
 			isArtifactManagerAuthorized: manager => sessionManager.isArtifactManagerAuthorized(manager),
 			adoptArtifactManager: manager => sessionManager.adoptArtifactManager(manager),
