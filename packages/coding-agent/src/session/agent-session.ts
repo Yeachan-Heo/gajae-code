@@ -15636,6 +15636,7 @@ export class AgentSession {
 					forceOneAtATime: sequential !== undefined,
 					createDisplayEntry: false,
 					trackExternalFollowUp: false,
+					sdkRunToken: this.#activeSdkRunToken,
 				});
 				if (this.#abortUnwind && !sequential) this.#abortUnwindSteerFallbacks.push(appMessage);
 				// The chip now describes follow-up work: keep its mode and identity

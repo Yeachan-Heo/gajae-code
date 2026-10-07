@@ -129,4 +129,18 @@ describe("cursor conversation usage", () => {
 		expect(secondTurn.input).toBe(225);
 		expect(secondTurn.totalTokens).toBe(250);
 	});
+
+	it("includes cache tokens in totalTokens calculation", () => {
+		// Note: Cursor provider currently always reports cache tokens as 0
+		// (the server does not provide cache info), but the calculation should
+		// still include them for correctness in case the provider changes.
+		const usage = finalizeCursorUsageForTest(100, 20);
+
+		expect(usage.input).toBe(80);
+		expect(usage.output).toBe(20);
+		expect(usage.cacheRead).toBe(0);
+		expect(usage.cacheWrite).toBe(0);
+		// totalTokens should include all components: input + output + cacheRead + cacheWrite
+		expect(usage.totalTokens).toBe(usage.input + usage.output + usage.cacheRead + usage.cacheWrite);
+	});
 });

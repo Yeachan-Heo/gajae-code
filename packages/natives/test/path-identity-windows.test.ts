@@ -164,8 +164,14 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		const root = await temporaryDirectory();
 		const source = path.join(root, "staged.exe");
 		const destination = path.join(root, "gjc.exe");
+		const user = process.env.USERNAME;
+		if (!user) throw new Error("Missing Windows username");
 		await fs.writeFile(source, "new-binary");
 		await fs.writeFile(destination, "old-binary");
+		// Exact replacement validates ownership as well as the DACL; pin the
+		// fixture owner instead of relying on the runner's temp-file default.
+		await runIcacls(source, "/setowner", user);
+		await runIcacls(destination, "/setowner", user);
 		expect(applyOwnerOnlyPathSecurity(source, "file")).toEqual({ ok: true });
 		expect(applyOwnerOnlyPathSecurity(destination, "file")).toEqual({ ok: true });
 		const parent = await parentIdentity(source);
@@ -604,6 +610,39 @@ setTimeout(() => { try { fs.closeSync(fd); } catch {} process.exit(0); }, Number
 		expect(verifyOwnerOnlyPathSecurity(directory, "directory")).toEqual({ ok: true });
 		expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: true });
 		expect(await fs.readFile(file, "utf8")).toBe(contents);
+	});
+	it("accepts a BUILTIN Administrators-owned managed directory with the current user's safe DACL", async () => {
+		const root = await temporaryDirectory();
+		const directory = path.join(root, "managed-admin-owned");
+		const user = process.env.USERNAME;
+		if (!user) throw new Error("Missing Windows username");
+		await fs.mkdir(directory);
+		expect(applyOwnerOnlyPathSecurity(directory, "directory")).toEqual({ ok: true });
+
+		try {
+			await runIcacls(directory, "/setowner", "*S-1-5-32-544");
+			expect(verifyOwnerOnlyPathSecurity(directory, "directory")).toEqual({ ok: true });
+		} finally {
+			await runIcacls(directory, "/setowner", user);
+		}
+	});
+	it("continues rejecting managed directories owned by SYSTEM", async () => {
+		const root = await temporaryDirectory();
+		const directory = path.join(root, "managed-system-owned");
+		const user = process.env.USERNAME;
+		if (!user) throw new Error("Missing Windows username");
+		await fs.mkdir(directory);
+		expect(applyOwnerOnlyPathSecurity(directory, "directory")).toEqual({ ok: true });
+
+		try {
+			await runIcacls(directory, "/setowner", "*S-1-5-18");
+			expect(verifyOwnerOnlyPathSecurity(directory, "directory")).toEqual({
+				ok: false,
+				code: "owner_mismatch",
+			});
+		} finally {
+			await runIcacls(directory, "/setowner", user);
+		}
 	});
 	it("repairs a legacy inherited ACL only for the captured directory and file identities", async () => {
 		const root = await temporaryDirectory();

@@ -4618,7 +4618,8 @@ function processInteractionUpdate(
 		const tokenDelta = update.message.value;
 		usageState.sawTokenDelta = true;
 		output.usage.output += tokenDelta.tokens || 0;
-		output.usage.totalTokens = output.usage.input + output.usage.output;
+		output.usage.totalTokens =
+			output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
 	}
 }
 
@@ -4645,7 +4646,8 @@ export function finalizeCursorUsage(output: AssistantMessage, usageState: UsageS
 	if (!usageState.hasConversationCheckpoint && used <= 0) return;
 	const outputIncludedInSnapshot = usageState.hasConversationCheckpoint ? usageState.checkpointOutputTokens : 0;
 	output.usage.input = Math.max(0, used - outputIncludedInSnapshot);
-	output.usage.totalTokens = output.usage.input + output.usage.output;
+	output.usage.totalTokens =
+		output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
 }
 
 export function finalizeCursorUsageForTest(

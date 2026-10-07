@@ -9,7 +9,7 @@ import { streamAnthropic } from "@gajae-code/ai";
 import { createKindAwareReconciliation } from "../src/sdk/bus/kind-aware-reconciliation";
 import { createReconciliationStore } from "../src/sdk/bus/reconciliation-store";
 import { createInvocationReconciliation, providerFailureFromAgentEnd } from "../src/sdk/host/session-runtime";
-import { failedPromptOutcome } from "../src/sdk/prompt-failure";
+import { failedPromptOutcome, promptFailureRetryability } from "../src/sdk/prompt-failure";
 
 /**
  * The diagnostic is only worth publishing if it is the SAME validated value at
@@ -152,6 +152,90 @@ describe("provider diagnostic across SDK reconciliation boundaries", () => {
 			],
 		}) as { providerDiagnostic?: unknown } | undefined;
 		expect(forged?.providerDiagnostic).toBeUndefined();
+	});
+
+	test("projects a local empty response like the typed empty-response class without provider facts", () => {
+		const local = providerFailureFromAgentEnd({
+			messages: [{ role: "assistant", stopReason: "error", errorKind: "local_empty_response" }],
+		}) as { code: string; message: string; providerCode?: unknown; providerDiagnostic?: unknown } | undefined;
+		const typed = providerFailureFromAgentEnd({
+			messages: [
+				{
+					role: "assistant",
+					stopReason: "error",
+					errorMessage: "Provider returned an empty response with zero token usage",
+					transportFailure: { kind: "transport", providerCode: "empty_response" },
+				},
+			],
+		}) as { code: string; providerCode?: string } | undefined;
+
+		expect(local).toEqual({ code: "empty_response", message: "Prompt submission failed." });
+		expect(local).not.toHaveProperty("providerCode");
+		expect(local).not.toHaveProperty("providerDiagnostic");
+		expect(typed?.providerCode).toBe("empty_response");
+
+		const localOutcome = failedPromptOutcome({
+			code: "prompt_failed",
+			provenance: "agent_failed",
+			providerCode: local?.code,
+			evidence: {},
+		});
+		const typedOutcome = failedPromptOutcome({
+			code: "prompt_failed",
+			provenance: "agent_failed",
+			providerCode: typed?.providerCode,
+			evidence: {},
+		});
+		expect(localOutcome.category).toBe("provider_transport");
+		expect(localOutcome.message).toBe("Prompt submission failed.");
+		expect(localOutcome.providerDiagnostic).toBeUndefined();
+		expect(promptFailureRetryability(localOutcome.category)).toBe("transient");
+		expect(promptFailureRetryability(localOutcome.category)).toBe(promptFailureRetryability(typedOutcome.category));
+	});
+
+	test("does not project aborted, snapshot-failure, or buffer-overflow results as provider failures", () => {
+		const aborted = failedPromptOutcome({
+			code: "prompt_failed",
+			provenance: "agent_failed",
+			providerCode: "aborted",
+			evidence: {},
+		});
+		expect(aborted.category).toBe("agent_runtime");
+		expect(promptFailureRetryability(aborted.category)).toBe("terminal");
+
+		for (const message of [
+			{ role: "assistant", stopReason: "cancelled" },
+			{ role: "assistant", stopReason: "aborted", errorKind: "local_empty_response" },
+			{ role: "assistant", stopReason: "error", errorKind: "local_snapshot_failure" },
+			{ role: "assistant", stopReason: "error", errorKind: "local_buffer_overflow" },
+		]) {
+			expect(providerFailureFromAgentEnd({ messages: [message] })).toBeUndefined();
+		}
+	});
+
+	test("fails closed when provider failure metadata getters throw", () => {
+		const stopReasonThrows = {
+			role: "assistant",
+			get stopReason(): never {
+				throw new Error("hostile stopReason");
+			},
+		};
+		const errorKindThrows = {
+			role: "assistant",
+			stopReason: "error",
+			get errorKind(): never {
+				throw new Error("hostile errorKind");
+			},
+		};
+		const messagesThrows = {
+			get messages(): never {
+				throw new Error("hostile messages");
+			},
+		};
+
+		expect(providerFailureFromAgentEnd({ messages: [stopReasonThrows] })).toBeUndefined();
+		expect(providerFailureFromAgentEnd({ messages: [errorKindThrows] })).toBeUndefined();
+		expect(providerFailureFromAgentEnd(messagesThrows)).toBeUndefined();
 	});
 
 	test("carries the diagnostic through the host reconciler onto the public status", async () => {
