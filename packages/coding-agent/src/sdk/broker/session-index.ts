@@ -1208,8 +1208,9 @@ export class SessionIndex {
 	 * Admission that requires serialized authority must use refresh() instead.
 	 * An append committed before the stat always changes
 	 * the stamp; a change landing after the stat is seen on the next poll, the
-	 * same TOCTOU envelope a locked read has. A corrupt suffix never takes the fast path: re-scanning
-	 * preserves the existing re-diagnosis behavior. Returns true when state was
+	 * same TOCTOU envelope a locked read has. A corrupt suffix never takes the
+	 * fast path: re-scanning preserves the existing re-diagnosis behavior.
+	 * Returns true when state was
 	 * reloaded. Authority revalidation that needs the strongest available
 	 * snapshot inside an already-locked write (append, unregister) keeps using
 	 * the exact locked paths.
