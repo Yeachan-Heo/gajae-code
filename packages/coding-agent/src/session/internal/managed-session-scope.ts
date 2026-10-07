@@ -2303,6 +2303,10 @@ type RetiredTarget = ManagedCandidate & {
 const MANAGED_GC_RETIREMENT_PREFIX = "gc-retirement-";
 const MANAGED_GC_RETIREMENT_RECEIPTS = `${MANAGED_INTERNAL_DIRECTORY}/${MANAGED_RECEIPTS_DIRECTORY}`;
 const MANAGED_GC_RETIREMENT_LOCKS = `${MANAGED_INTERNAL_DIRECTORY}/${MANAGED_LOCKS_DIRECTORY}`;
+// History capacity is shared by every transcript in one scope, so publishers must share one lease.
+const MANAGED_GC_RETIREMENT_SCOPE_LOCK_NAME = `${MANAGED_GC_RETIREMENT_PREFIX}${createHash("sha256")
+	.update("managed-gc-retirement-scope-lock-v1", "utf8")
+	.digest("hex")}`;
 interface ManagedGcTrustedScope {
 	readonly root: ManagedDirectoryRoot;
 	readonly retainedAuthority: RecoveryFsRoot | undefined;
@@ -3367,7 +3371,7 @@ async function withManagedGcRetirementJournal<T>(
 		store.ensureDirectory(MANAGED_GC_RETIREMENT_LOCKS);
 		lock = await acquireManagedLock(
 			path.join(scope.directoryPath, MANAGED_GC_RETIREMENT_LOCKS),
-			`${MANAGED_GC_RETIREMENT_PREFIX}${managedGcRetirementTranscriptKey(transcriptPath)}`,
+			MANAGED_GC_RETIREMENT_SCOPE_LOCK_NAME,
 			trusted.root,
 			trusted.policy,
 		);
