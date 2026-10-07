@@ -772,7 +772,24 @@ function managedTransportFailure(failure: unknown) {
 
 function managedAssistantMessageHasContent(failure: unknown): boolean {
 	const content = managedProperty(failure, "content");
-	return Array.isArray(content) && content.length > 0;
+	if (!Array.isArray(content)) return false;
+	return content.some(block => {
+		if (!block || typeof block !== "object") return false;
+		const type = managedProperty(block, "type");
+		if (type === "text") {
+			const text = managedProperty(block, "text");
+			return typeof text === "string" && text.length > 0;
+		}
+		if (type === "thinking") {
+			const thinking = managedProperty(block, "thinking");
+			const signature = managedProperty(block, "thinkingSignature");
+			return (
+				(typeof thinking === "string" && thinking.length > 0) ||
+				(typeof signature === "string" && signature.length > 0)
+			);
+		}
+		return type === "redactedThinking" || type === "toolCall";
+	});
 }
 
 // AI owns provider-originated authority. The agent loop owns authority for
