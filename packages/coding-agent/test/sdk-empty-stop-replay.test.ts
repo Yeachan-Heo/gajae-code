@@ -12,17 +12,22 @@ import { SessionManager } from "../src/session/session-manager";
 import { EMPTY_STOP_SCENARIOS, handleProviderRequest } from "./helpers/managed-empty-stop-harness";
 
 describe("SDK empty-stop replay (local HTTP adapter only)", () => {
-	it.each(EMPTY_STOP_SCENARIOS)("settles %s with accepted-only lifecycle", async scenario => {
+	it.each([...EMPTY_STOP_SCENARIOS])("settles %s with accepted-only lifecycle", async scenario => {
 		const fallbackDisabled = scenario === "fallback-disabled" || scenario === "untyped-disabled";
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-empty-stop-"));
 		const auth = await AuthStorage.create(path.join(cwd, "auth.db"));
 		const models: string[] = [];
 		const runtimeErrors: string[] = [];
-		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
-			const request = input instanceof Request ? input : new Request(input, init);
-			expect(new URL(request.url).host).toBe("empty-stop.test");
-			return handleProviderRequest(request, scenario, models);
-		});
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(
+				async (input: string | URL | Request, init?: RequestInit) => {
+					const request = input instanceof Request ? input : new Request(input.toString(), init);
+					expect(new URL(request.url).host).toBe("empty-stop.test");
+					return handleProviderRequest(request, scenario, models);
+				},
+				{ preconnect: globalThis.fetch.preconnect },
+			),
+		);
 		try {
 			const settings = Settings.isolated({
 				"compaction.enabled": false,

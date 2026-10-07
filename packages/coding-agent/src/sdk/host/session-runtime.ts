@@ -34,9 +34,14 @@ import {
 	type Settings,
 	validateSettingPatch,
 } from "../../config/settings";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
+import type {
+	AgentStartEvent,
+	ExtensionAPI,
+	ExtensionCommandContext,
+	ExtensionContext,
+} from "../../extensibility/extensions";
 import { tagHostObserverHandler } from "../../extensibility/extensions/function-hooks-internal";
-import type { AgentEndEvent, AgentStartEvent, TurnEndEvent, TurnStartEvent } from "../../extensibility/shared-events";
+import type { AgentEndEvent, TurnEndEvent, TurnStartEvent } from "../../extensibility/shared-events";
 import { normalizeGoal } from "../../goals/state";
 import { toAgentWireEventPayload } from "../../modes/shared/agent-wire/event-envelope";
 import type { AgentSessionEvent } from "../../session/agent-session";
