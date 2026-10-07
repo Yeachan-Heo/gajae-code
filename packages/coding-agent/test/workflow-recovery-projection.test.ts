@@ -207,7 +207,10 @@ describe("workflow recovery projection (#4560)", () => {
 		});
 	});
 
-	it("recognizes legacy lane-overflow markers as recoverable instead of terminal", async () => {
+	it.each([
+		"",
+		" (ledger under-count: parsed architect rows=0, on-disk architect artifacts=1)",
+	])("recognizes legacy lane-overflow markers as recoverable instead of terminal: %s", async ledgerNote => {
 		const runId = "legacy-lane-overflow-recovery";
 		const runDir = ralplanRunDir(tempDir.path(), runId);
 		const digest = crypto.createHash("sha256").update(FINAL_PLAN).digest("hex");
@@ -218,7 +221,7 @@ describe("workflow recovery projection (#4560)", () => {
 				{
 					event: "planning_stuck",
 					planning_stuck: true,
-					reason: "ralplan review lane budget exceeded: architect pass 2 of max 1 in consensus iteration 1",
+					reason: `ralplan review lane budget exceeded: architect pass 2 of max 1 in consensus iteration 1${ledgerNote}`,
 				},
 			)}\n`,
 		);
@@ -231,6 +234,29 @@ describe("workflow recovery projection (#4560)", () => {
 			actionClass: "recover-plan-admission",
 			detail: "review-lane-admission-unresolved",
 		});
+	});
+
+	it.each([
+		"ralplan review lane budget exceeded: incomplete marker",
+		"ralplan review lane budget exceeded: architect pass 2 of max 1 in consensus iteration 0",
+		"ralplan review lane budget exceeded: architect pass invalid of max 1 in consensus iteration 1",
+	])("keeps malformed legacy admission terminal during recovery: %s", async reason => {
+		const runId = "malformed-legacy-admission";
+		const runDir = ralplanRunDir(tempDir.path(), runId);
+		await Bun.write(path.join(runDir, "stage-01-final.md"), FINAL_PLAN);
+		await Bun.write(
+			path.join(runDir, "index.jsonl"),
+			`${JSON.stringify({
+				stage: "final",
+				stage_n: 1,
+				path: "stage-01-final.md",
+				sha256: crypto.createHash("sha256").update(FINAL_PLAN).digest("hex"),
+			})}\n` + `${JSON.stringify({ event: "planning_stuck", planning_stuck: true, reason })}\n`,
+		);
+
+		const projection = await projectRalplanFinalRun({ cwd: tempDir.path(), sessionId: SESSION_ID, runId });
+
+		expect(projection?.nextAction).toEqual({ actionClass: "awaiting-approval", detail: "planning-stuck" });
 	});
 
 	it("resumes a planner-only run at intent reconciliation, not at consensus review", async () => {

@@ -3138,6 +3138,131 @@ describe("ralplan review lane budget config.yml", () => {
 });
 
 describe("ralplan review lane budget replays", () => {
+	it("records terminal opener exhaustion after a recovered legacy lane marker", async () => {
+		const root = await tempDir();
+		const runId = "legacy-lane-then-terminal-cap";
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal", maxIterations: 2 } } }, null, 2),
+			"utf-8",
+		);
+		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# plan")).status).toBe(0);
+		await fs.appendFile(
+			ralplanPlanPath(root, runId, "index.jsonl"),
+			`${JSON.stringify({
+				event: "planning_stuck",
+				planning_stuck: true,
+				reason: "ralplan review lane budget exceeded: architect pass 2 of max 1 in consensus iteration 1",
+			})}\n`,
+			"utf-8",
+		);
+		expect((await writeRalplanArtifact(root, runId, "revision", 2, "# recovered plan")).status).toBe(0);
+		expect((await writeRalplanArtifact(root, runId, "revision", 3, "# exhausted plan")).status).toBe(3);
+
+		const final = await writeRalplanArtifact(root, runId, "final", 4, "# best effort");
+
+		expect(final.status).toBe(0);
+		expect(JSON.parse(final.stdout ?? "{}").auto_handoff).toMatchObject({
+			effectiveTarget: "off",
+			degradationReason: "planning_stuck",
+		});
+	}, 60_000);
+
+	it.each([
+		"unresolved",
+		"legacy-recovered",
+	] as const)("preserves %s admission state through bounded ledger compaction", async admissionState => {
+		const root = await tempDir();
+		const runId = `compacted-admission-${admissionState}`;
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal", maxIterations: 5 } } }, null, 2),
+			"utf-8",
+		);
+		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# initial plan")).status).toBe(0);
+		expect((await writeRalplanArtifact(root, runId, "architect", 1, "# architecture")).status).toBe(0);
+		expect((await writeRalplanArtifact(root, runId, "architect", 2, "# extra architecture")).status).toBe(3);
+		const indexPath = ralplanPlanPath(root, runId, "index.jsonl");
+		if (admissionState === "legacy-recovered") {
+			const rows = (await fs.readFile(indexPath, "utf-8"))
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line) as Record<string, unknown>);
+			await fs.writeFile(
+				indexPath,
+				`${rows
+					.map(row =>
+						JSON.stringify(
+							row.event === "planning_admission_rejected"
+								? {
+										event: "planning_stuck",
+										planning_stuck: true,
+										reason:
+											"ralplan review lane budget exceeded: architect pass 2 of max 1 in consensus iteration 1",
+									}
+								: row,
+						),
+					)
+					.join("\n")}\n`,
+				"utf-8",
+			);
+			expect((await writeRalplanArtifact(root, runId, "revision", 2, "# recovered plan")).status).toBe(0);
+		}
+		// Imported historical observations exercise the compactor without thousands
+		// of unrelated native writes or adding opener/lane admissions.
+		await fs.appendFile(
+			indexPath,
+			Array.from(
+				{ length: 1500 },
+				(_, index) =>
+					`${JSON.stringify({ event: "historical_observation", sequence: index, detail: "x".repeat(1024) })}\n`,
+			).join(""),
+			"utf-8",
+		);
+		expect((await fs.stat(indexPath)).size).toBeGreaterThan(1024 * 1024);
+		expect((await writeRalplanArtifact(root, runId, "adr", 3, "# decision")).status).toBe(0);
+		expect((await fs.stat(indexPath)).size).toBeLessThanOrEqual(1024 * 1024);
+
+		const final = await writeRalplanArtifact(root, runId, "final", 4, "# final plan");
+		expect(final.status).toBe(0);
+		expect(JSON.parse(final.stdout ?? "{}").auto_handoff).toMatchObject(
+			admissionState === "unresolved"
+				? { effectiveTarget: "off", degradationReason: "planning_admission_pending" }
+				: { effectiveTarget: "ultragoal", degradationReason: null },
+		);
+	}, 60_000);
+
+	it.each([
+		"ralplan review lane budget exceeded: incomplete marker",
+		"ralplan review lane budget exceeded: architect pass 2 of max 1 in consensus iteration 0",
+		"ralplan review lane budget exceeded: architect pass invalid of max 1 in consensus iteration 1",
+	])("keeps malformed legacy admission fail-closed: %s", async reason => {
+		const root = await tempDir();
+		const runId = "malformed-legacy-admission";
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal" } } }, null, 2),
+			"utf-8",
+		);
+		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# plan")).status).toBe(0);
+		await fs.appendFile(
+			ralplanPlanPath(root, runId, "index.jsonl"),
+			`${JSON.stringify({ event: "planning_stuck", planning_stuck: true, reason })}\n`,
+			"utf-8",
+		);
+
+		const final = await writeRalplanArtifact(root, runId, "final", 2, "# final");
+
+		expect(final.status).toBe(0);
+		expect(JSON.parse(final.stdout ?? "{}").auto_handoff).toMatchObject({
+			effectiveTarget: "off",
+			degradationReason: "planning_stuck",
+		});
+	}, 60_000);
+
 	it("keeps lane admission recoverable and preserves handoff after a new opener generation", async () => {
 		const root = await tempDir();
 		const runId = "recoverable-lane-admission";
@@ -3192,7 +3317,10 @@ describe("ralplan review lane budget replays", () => {
 		});
 	});
 
-	it("keeps legacy lane-overflow stuck rows nonterminal but pending until a valid recovery event", async () => {
+	it.each([
+		"",
+		" (ledger under-count: parsed architect rows=0, on-disk architect artifacts=1)",
+	])("keeps legacy lane-overflow stuck rows nonterminal but pending until a valid recovery event: %s", async ledgerNote => {
 		const root = await tempDir();
 		const runId = "legacy-lane-overflow";
 		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
@@ -3208,7 +3336,7 @@ describe("ralplan review lane budget replays", () => {
 			`${JSON.stringify({
 				event: "planning_stuck",
 				planning_stuck: true,
-				reason: "ralplan review lane budget exceeded: architect pass 2 of max 1 in consensus iteration 1",
+				reason: `ralplan review lane budget exceeded: architect pass 2 of max 1 in consensus iteration 1${ledgerNote}`,
 			})}\n`,
 		);
 
@@ -3218,7 +3346,7 @@ describe("ralplan review lane budget replays", () => {
 			effectiveTarget: "off",
 			degradationReason: "planning_admission_pending",
 		});
-	});
+	}, 60_000);
 
 	it("refuses only the pathological same-iteration lane retries and preserves final escalation", async () => {
 		const root = await tempDir();

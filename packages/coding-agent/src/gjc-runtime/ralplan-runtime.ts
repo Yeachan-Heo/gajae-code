@@ -1475,7 +1475,9 @@ async function applyLaneVerdictUpdate(
 function ralplanPlanningStuckIndexKey(entry: unknown): string | undefined {
 	if (!entry || typeof entry !== "object" || Array.isArray(entry)) return undefined;
 	const record = entry as Record<string, unknown>;
-	return record.planning_stuck === true ? "planning_stuck" : undefined;
+	if (record.planning_stuck !== true) return undefined;
+	const admission = parseLaneAdmissionGeneration(record);
+	return admission ? `legacy_lane_admission\u0000${admission.generation}\u0000${admission.lane}` : "planning_stuck";
 }
 
 function ralplanAdmissionEventIndexKey(entry: unknown): string | undefined {
@@ -1536,7 +1538,8 @@ function parseLaneAdmissionGeneration(
 	if (
 		row.event === "planning_admission_rejected" &&
 		typeof row.generation === "number" &&
-		Number.isInteger(row.generation) &&
+		Number.isSafeInteger(row.generation) &&
+		row.generation >= 1 &&
 		(row.lane === "architect" || row.lane === "critic")
 	) {
 		return { generation: row.generation, lane: row.lane };
@@ -1545,10 +1548,12 @@ function parseLaneAdmissionGeneration(
 	// encoded the lane and generation in its reason string.
 	if (row.event === "planning_stuck" && typeof row.reason === "string") {
 		const legacy =
-			/^ralplan review lane budget exceeded: (architect|critic) pass .* in consensus iteration (\d+)/.exec(
+			/^ralplan review lane budget exceeded: (architect|critic) pass [1-9]\d* of max [1-9]\d* in consensus iteration ([1-9]\d*)(?: \(ledger under-count: [^\r\n]*\))?$/.exec(
 				row.reason,
 			);
-		if (legacy) return { lane: legacy[1] as RalplanReviewLane, generation: Number(legacy[2]) };
+		if (legacy && Number.isSafeInteger(Number(legacy[2]))) {
+			return { lane: legacy[1] as RalplanReviewLane, generation: Number(legacy[2]) };
+		}
 	}
 	return undefined;
 }
@@ -1710,8 +1715,7 @@ async function readRalplanPlanningStuck(cwd: string, sessionId: string, runId: s
 		try {
 			const row = JSON.parse(line) as Record<string, unknown>;
 			if (row.event === "planning_stuck" && row.planning_stuck === true) {
-				const legacyLaneOverflow =
-					typeof row.reason === "string" && row.reason.startsWith("ralplan review lane budget exceeded:");
+				const legacyLaneOverflow = parseLaneAdmissionGeneration(row) !== undefined;
 				if (!legacyLaneOverflow) return true;
 			}
 		} catch {
@@ -2083,23 +2087,48 @@ function serializeRalplanIndexEntries(entries: readonly unknown[]): string {
 
 /**
  * Compact the append-only ralplan ledger without dropping the current final receipt.
- * The newest row and newest planning-stuck marker are also retained so a write can
- * never report success while silently losing the receipt it just persisted.
+ * Retain the current terminal marker and latest admission/recovery row for each
+ * generation/lane. Repeated attempts remain removable without changing whether
+ * consensus is blocked, recovered, or terminal. The 1 MiB bound still fails closed
+ * if the live receipt set itself cannot fit.
  */
 function compactRalplanIndexEntries(entries: readonly unknown[]): unknown[] {
 	let latestFinal = -1;
 	let latestPlanningStuck = -1;
+	const latestAdmissions = new Map<string, number>();
 	for (const [index, entry] of entries.entries()) {
 		if (entry && typeof entry === "object" && !Array.isArray(entry)) {
 			const record = entry as Record<string, unknown>;
 			if (record.stage === "final") latestFinal = index;
-			if (record.planning_stuck === true) latestPlanningStuck = index;
+			const rejected = parseLaneAdmissionGeneration(record);
+			if (rejected) {
+				latestAdmissions.set(`rejected\u0000${rejected.generation}\u0000${rejected.lane}`, index);
+			} else if (record.planning_stuck === true) {
+				latestPlanningStuck = index;
+			}
+			if (
+				record.event === "planning_admission_recovered" &&
+				typeof record.generation === "number" &&
+				Number.isSafeInteger(record.generation) &&
+				record.generation >= 1 &&
+				typeof record.recovered_by_generation === "number" &&
+				Number.isSafeInteger(record.recovered_by_generation) &&
+				record.recovered_by_generation > record.generation &&
+				(record.lane === "architect" || record.lane === "critic")
+			) {
+				latestAdmissions.set(`recovered\u0000${record.generation}\u0000${record.lane}`, index);
+			}
 		}
 	}
+	const protectedAdmissions = new Set(latestAdmissions.values());
 	const retained = entries.map((entry, index) => ({
 		entry,
 		bytes: Buffer.byteLength(`${JSON.stringify(entry)}\n`, "utf8"),
-		protected: index === entries.length - 1 || index === latestFinal || index === latestPlanningStuck,
+		protected:
+			index === entries.length - 1 ||
+			index === latestFinal ||
+			index === latestPlanningStuck ||
+			protectedAdmissions.has(index),
 	}));
 	let totalBytes = retained.reduce((total, item) => total + item.bytes, 0);
 	while (totalBytes > RALPLAN_MAX_INDEX_BYTES) {

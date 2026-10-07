@@ -333,27 +333,24 @@ function ralplanLaneAdmissionIdentity(row: RalplanProjectionRow): string | undef
 	if (
 		row.event === "planning_admission_rejected" &&
 		typeof row.generation === "number" &&
-		Number.isInteger(row.generation) &&
+		Number.isSafeInteger(row.generation) &&
+		row.generation >= 1 &&
 		(row.lane === "architect" || row.lane === "critic")
 	) {
 		return `${row.generation}\u0000${row.lane}`;
 	}
 	if (row.event === "planning_stuck" && typeof row.reason === "string") {
 		const legacy =
-			/^ralplan review lane budget exceeded: (architect|critic) pass .* in consensus iteration (\d+)/.exec(
+			/^ralplan review lane budget exceeded: (architect|critic) pass [1-9]\d* of max [1-9]\d* in consensus iteration ([1-9]\d*)(?: \(ledger under-count: [^\r\n]*\))?$/.exec(
 				row.reason,
 			);
-		if (legacy) return `${Number(legacy[2])}\u0000${legacy[1]}`;
+		if (legacy && Number.isSafeInteger(Number(legacy[2]))) return `${Number(legacy[2])}\u0000${legacy[1]}`;
 	}
 	return undefined;
 }
 
 function isLegacyRalplanLaneOverflow(row: RalplanProjectionRow): boolean {
-	return (
-		row.event === "planning_stuck" &&
-		typeof row.reason === "string" &&
-		row.reason.startsWith("ralplan review lane budget exceeded:")
-	);
+	return row.event === "planning_stuck" && ralplanLaneAdmissionIdentity(row) !== undefined;
 }
 
 /**
