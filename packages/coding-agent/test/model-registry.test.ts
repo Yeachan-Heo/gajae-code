@@ -10026,6 +10026,14 @@ describe("ModelRegistry config reload", () => {
 			capturedCandidate.commit();
 			capturedCandidate.finalize();
 			expect(authStorage.hasEffectiveCredentialSelector(authProvider, pinnedSessionId)).toBe(true);
+			pinnedRegistry.setActiveCredentialSessionId(pinnedSessionId);
+			await pinnedRegistry.refreshStatic();
+
+			expect(authStorage.hasEffectiveCredentialSelector(authProvider, pinnedSessionId)).toBe(true);
+			expect(authStorage.hasConfigApiKey(authProvider, pinnedRegistry.getAuthStorageOwner())).toBe(false);
+			await expect(authStorage.peekApiKey(authProvider, { sessionId: pinnedSessionId })).resolves.toBe(
+				"pinned-oauth-access",
+			);
 			await pinnedRegistry.refresh("offline", pinnedSessionId);
 
 			expect(authStorage.hasEffectiveCredentialSelector(authProvider, pinnedSessionId)).toBe(true);

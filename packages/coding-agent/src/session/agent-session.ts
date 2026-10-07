@@ -10412,6 +10412,7 @@ export class AgentSession {
 		this.#resetAdaptiveCompactionState();
 		this.#reasoningControlContextGeneration++;
 		const sid = this.#providerSessionId ?? sessionId ?? this.sessionManager.getSessionId();
+		this.#modelRegistry.setActiveCredentialSessionId(this.credentialSessionId);
 		this.agent.sessionId = sid;
 		this.agent.providerSessionId = this.#providerCacheSessionId ?? sid;
 		this.agent.setMetadataResolver(context =>

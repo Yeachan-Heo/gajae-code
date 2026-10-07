@@ -2084,6 +2084,7 @@ export class ModelRegistry {
 	#optionalAuthPreflightGenerations = new Map<string, number>();
 	#optionalAuthPreflightEpoch = 0;
 	#stagedReloadCandidate = false;
+	#activeCredentialSessionId: string | undefined;
 	#leaseWaiters: RegistryLeaseWaiter[] = [];
 	#activeConsumerLeases = 0;
 	#publicationFenceHeld = false;
@@ -2164,6 +2165,7 @@ export class ModelRegistry {
 		this.#runtimeProviderResolvedApiKeys = new Map(source.#runtimeProviderResolvedApiKeys);
 		this.#runtimeProviderCredentialInstalled = new Set(source.#runtimeProviderCredentialInstalled);
 		this.#runtimeProviderApiKeyEnvNames = new Map(source.#runtimeProviderApiKeyEnvNames);
+		this.#activeCredentialSessionId = source.#activeCredentialSessionId;
 		this.#runtimeProviderOverrides = new Map(source.#runtimeProviderOverrides);
 		this.#runtimeProviderAuthHeaders = new Map(source.#runtimeProviderAuthHeaders);
 		this.#generatedAuthHeaderProviders = new Set(source.#generatedAuthHeaderProviders);
@@ -2764,6 +2766,11 @@ export class ModelRegistry {
 		};
 	}
 
+	/** @internal Scope unscoped static reloads to the active interactive session. */
+	setActiveCredentialSessionId(credentialSessionId: string): void {
+		this.#activeCredentialSessionId = credentialSessionId;
+	}
+
 	/** Replace the read-only settings snapshot used by profile-scoped resolution. */
 	setScopedSettings(settingsReader: Pick<Settings, "get" | "getGlobal">): void {
 		this.#catalogRefreshGeneration++;
@@ -2809,6 +2816,8 @@ export class ModelRegistry {
 	 */
 	async refresh(strategy: ModelRefreshStrategy = "online-if-uncached", credentialSessionId?: string): Promise<void> {
 		if (this.#disposed) return;
+		if (credentialSessionId !== undefined) this.#activeCredentialSessionId = credentialSessionId;
+		const effectiveCredentialSessionId = credentialSessionId ?? this.#activeCredentialSessionId;
 		await this.#enqueueCatalogMutation(async () => {
 			if (this.#disposed) return;
 			const refreshGeneration = ++this.#catalogRefreshGeneration;
@@ -2817,7 +2826,7 @@ export class ModelRegistry {
 			};
 			this.#suspendRebuild();
 			try {
-				this.#reloadStaticModels(credentialSessionId);
+				this.#reloadStaticModels(effectiveCredentialSessionId);
 				this.#suppressedSelectors.clear();
 				this.#selectorCircuits.clear();
 				await this.#refreshRuntimeDiscoveries(
@@ -2825,7 +2834,7 @@ export class ModelRegistry {
 					undefined,
 					refreshGeneration,
 					providerRefreshFence,
-					credentialSessionId,
+					effectiveCredentialSessionId,
 				);
 				if (refreshGeneration === this.#catalogRefreshGeneration) this.#modelBindingsApplier.apply();
 			} finally {
@@ -2965,7 +2974,9 @@ export class ModelRegistry {
 		return resolveProviderModelReference(providerId, modelId, staticModels);
 	}
 
-	#getStaticLoadEnvironmentFingerprint(credentialSessionId?: string): string {
+	#getStaticLoadEnvironmentFingerprint(
+		credentialSessionId: string | undefined = this.#activeCredentialSessionId,
+	): string {
 		const providerBaseUrlEnvKeys = new Set(
 			[
 				...getBundledProviders(),
@@ -2992,7 +3003,7 @@ export class ModelRegistry {
 		});
 	}
 
-	#reloadStaticModels(credentialSessionId?: string): void {
+	#reloadStaticModels(credentialSessionId: string | undefined = this.#activeCredentialSessionId): void {
 		const currentMtime = this.#modelsConfigFile.getMtimeMs();
 		const disabledProviderKey = [...getDisabledProviderIdsFromSettings(this.#settings)].sort().join("\u0000");
 		const environmentFingerprint = this.#getStaticLoadEnvironmentFingerprint(credentialSessionId);
@@ -3116,7 +3127,7 @@ export class ModelRegistry {
 		return this.#configError;
 	}
 
-	#loadModels(credentialSessionId?: string) {
+	#loadModels(credentialSessionId: string | undefined = this.#activeCredentialSessionId) {
 		// Load custom models from models.json first (to know which providers to override)
 		const {
 			models: customModels = [],
@@ -3664,7 +3675,7 @@ export class ModelRegistry {
 		}
 	}
 
-	#loadCustomModels(credentialSessionId?: string): CustomModelsResult {
+	#loadCustomModels(credentialSessionId: string | undefined = this.#activeCredentialSessionId): CustomModelsResult {
 		this.#configuredApiKeyEnvNames.clear();
 		const loaded = this.#modelsConfigSource ?? this.#modelsConfigFile.tryLoad();
 		const { value, error, status } = loaded;
@@ -5986,7 +5997,10 @@ export class ModelRegistry {
 		}
 	}
 
-	#parseModels(config: ModelsConfig, credentialSessionId?: string): CustomModelOverlay[] {
+	#parseModels(
+		config: ModelsConfig,
+		credentialSessionId: string | undefined = this.#activeCredentialSessionId,
+	): CustomModelOverlay[] {
 		const models: CustomModelOverlay[] = [];
 
 		for (const [providerName, providerConfig] of Object.entries(config.providers ?? {})) {
