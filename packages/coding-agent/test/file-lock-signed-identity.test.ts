@@ -19,6 +19,14 @@ const ROOT_ID = 15_821_989_915_882_833_371n;
 const INFO_ID = 11_529_215_046_068_470_561n;
 const DEAD_PID = 2_147_483_647;
 
+function normalizedPath(value: string): string {
+	return path
+		.resolve(value)
+		.replace(/\\/g, "/")
+		.replace(/^\/\/\?\//, "")
+		.toLowerCase();
+}
+
 afterEach(async () => {
 	vi.restoreAllMocks();
 	FileLockTestHooks.nativeQuarantineBindings = undefined;
@@ -35,10 +43,13 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 	await fs.mkdir(lock);
 	await Bun.write(path.join(lock, "info"), JSON.stringify({ pid: DEAD_PID, timestamp: 1000 }));
 	let nativeIdentityChanged = false;
+	const rootPaths = new Set([lock, parked, ...(detach ? [root] : [])].map(normalizedPath));
+	const infoPaths = new Set([path.join(lock, "info"), path.join(parked, "info")].map(normalizedPath));
 	const realLstat = fs.lstat;
 	const transformStat = (target: string, stat: BigIntStats): BigIntStats => {
-		const isRoot = target === lock || target === parked || (detach && target === root);
-		const isInfo = target === path.join(lock, "info") || target === path.join(parked, "info");
+		const normalizedTarget = normalizedPath(target);
+		const isRoot = rootPaths.has(normalizedTarget);
+		const isInfo = infoPaths.has(normalizedTarget);
 		const id = isRoot && component !== "info" ? ROOT_ID : isInfo && component !== "root" ? INFO_ID : null;
 		if (id === null) return stat;
 		return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { ino: BigInt.asIntN(64, id) });
