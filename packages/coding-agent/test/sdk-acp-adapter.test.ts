@@ -628,7 +628,15 @@ for (const replayFailure of [
 				original,
 			);
 			expect(sdk.frames).toHaveLength(2);
-			expect(sdk.frames[1]).toEqual(sdk.frames[0]);
+			const firstRequest = sdk.frames[0];
+			const replayRequest = sdk.frames[1];
+			if (!firstRequest || !replayRequest) throw new Error("expected both lifecycle request attempts");
+			const { timeoutMs: firstTimeoutMs, ...firstEnvelope } = firstRequest;
+			const { timeoutMs: replayTimeoutMs, ...replayEnvelope } = replayRequest;
+			expect(replayEnvelope).toEqual(firstEnvelope);
+			if (typeof firstTimeoutMs !== "number" || typeof replayTimeoutMs !== "number")
+				throw new Error("expected remaining lifecycle timeout budgets");
+			expect(replayTimeoutMs).toBeLessThanOrEqual(firstTimeoutMs);
 		} finally {
 			await adapter.close();
 		}
