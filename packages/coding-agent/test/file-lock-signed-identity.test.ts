@@ -90,12 +90,12 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 		})),
 	});
 	const originals = new Map<string, NativeDirectoryTreeSnapshot>();
-	const remove = vi.fn((target: string, snapshot: NativeDirectoryTreeSnapshot, parent?: { ino: bigint }) => {
+	const remove = vi.fn((target: string, snapshot: NativeDirectoryTreeSnapshot, parentIdentity?: { dev: bigint; ino: bigint }, detachOnly?: boolean) => {
 		const original = originals.get(target);
 		if (!original) throw new Error("Removal without captured authority");
 		expect(snapshot).toEqual(nativeSnapshot(original));
 		if (detach) {
-			expect(parent?.ino).toBe(ROOT_ID);
+			expect(parentIdentity?.ino).toBe(ROOT_ID);
 			renameSync(target, parked);
 			return { ok: true, detachedPath: parked };
 		}
