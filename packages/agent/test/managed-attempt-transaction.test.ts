@@ -4059,25 +4059,48 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 	});
 	it("discards a provisional placeholder on cancellation without terminal duplication", async () => {
 		const mock = createMockModel();
-		const pending = new AssistantMessageEventStream();
+		const placeholderStaged = Promise.withResolvers<void>();
 		const agent = new Agent({
 			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
-			streamFn: () => pending,
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				const started: AssistantMessage = {
+					...assistantMessage(mock.model),
+					api: "openai-responses",
+					content: [{ type: "text", text: "" }],
+				};
+				queueMicrotask(async () => {
+					stream.push({ type: "start", partial: started });
+					await stream.waitForConsumerDrain(new AbortController().signal);
+					placeholderStaged.resolve();
+				});
+				return stream;
+			},
 		});
 		const events: AgentEvent[] = [];
 		agent.subscribe(event => events.push(event));
 		const run = agent.prompt("run", { fallbackManaged: true });
-		for (let index = 0; index < 20 && !agent.state.isStreaming; index += 1) await Bun.sleep(1);
+		await placeholderStaged.promise;
 		agent.abort();
 		await run;
 
 		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+		const assistantMessageEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "message_end" }> =>
+				event.type === "message_end" && event.message.role === "assistant",
+		);
+		expect(assistantMessageEnds).toHaveLength(0);
 		expect(events.filter(event => event.type === "message_end")).toHaveLength(1);
+		expect(events.filter(event => event.type === "message_end" && event.message.role !== "assistant")).toHaveLength(
+			1,
+		);
+		expect(events.filter(event => event.type === "message_update")).toHaveLength(0);
 		expect(agent.state.messages.filter(message => message.role === "assistant")).toHaveLength(0);
 	});
 	it("tears down an aborted provider iterator exactly once", async () => {
 		const mock = createMockModel();
 		const factoryStarted = Promise.withResolvers<void>();
+		const iteratorReadStarted = Promise.withResolvers<void>();
 		let returnCalls = 0;
 		const agent = new Agent({
 			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
@@ -4085,6 +4108,7 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 				factoryStarted.resolve();
 				return {
 					async next() {
+						iteratorReadStarted.resolve();
 						return await new Promise<IteratorResult<never>>(() => {});
 					},
 					async return() {
@@ -4097,12 +4121,21 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 				} as unknown as AssistantMessageEventStream;
 			},
 		});
+		const events: AgentEvent[] = [];
+		agent.subscribe(event => events.push(event));
 		const run = agent.prompt("run", { fallbackManaged: true });
 		await factoryStarted.promise;
+		await iteratorReadStarted.promise;
 		agent.abort();
 		await run;
 
 		expect(returnCalls).toBe(1);
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+		expect(events.filter(event => event.type === "message_update")).toHaveLength(0);
+		expect(events.filter(event => event.type === "message_end" && event.message.role === "assistant")).toHaveLength(
+			0,
+		);
+		expect(agent.state.messages.filter(message => message.role === "assistant")).toHaveLength(0);
 	});
 	it("closes a late provider factory response after cancellation", async () => {
 		const mock = createMockModel();
@@ -4128,6 +4161,8 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 				return factory.promise;
 			},
 		});
+		const events: AgentEvent[] = [];
+		agent.subscribe(event => events.push(event));
 		const run = agent.prompt("run", { fallbackManaged: true });
 		await factoryStarted.promise;
 		agent.abort();
@@ -4136,5 +4171,11 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 		for (let index = 0; index < 20 && returnCalls === 0; index += 1) await Bun.sleep(1);
 
 		expect(returnCalls).toBe(1);
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+		expect(events.filter(event => event.type === "message_update")).toHaveLength(0);
+		expect(events.filter(event => event.type === "message_end" && event.message.role === "assistant")).toHaveLength(
+			0,
+		);
+		expect(agent.state.messages.filter(message => message.role === "assistant")).toHaveLength(0);
 	});
 });

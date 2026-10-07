@@ -5,6 +5,7 @@ import { Agent, type AgentOptions, type AgentTool } from "@gajae-code/agent-core
 import * as compactionModule from "@gajae-code/agent-core/compaction";
 import { type AssistantMessage, getBundledModel, type Model, type ToolCall } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { streamOpenAIResponses } from "@gajae-code/ai/providers/openai-responses";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -376,10 +377,12 @@ describe("AgentSession managed fallback attempt transaction", () => {
 			onHandler?: () => void;
 			settings?: Record<string, unknown>;
 			singleModelChain?: boolean;
+			primaryModel?: Model;
+			fallbackModel?: Model;
 		} = {},
 	): { agent: Agent; primary: Model; fallback: Model } {
-		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
-		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		const primary = options.primaryModel ?? getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallback = options.fallbackModel ?? getBundledModel("openai", "gpt-4o-mini");
 		if (!primary || !fallback) throw new Error("Expected bundled test models");
 		const sessionManager = SessionManager.inMemory();
 		const modelRegistry = new ModelRegistry(authStorage);
@@ -796,6 +799,63 @@ describe("AgentSession managed fallback attempt transaction", () => {
 			stopReason: "stop",
 			content: [{ type: "text", text: "overload recovered" }],
 		});
+	});
+	it("reaches the managed guard through a real Responses first-event timeout", async () => {
+		const primary = getBundledModel("openai", "gpt-5-mini");
+		const fallback = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!primary || !fallback || primary.api !== "openai-responses") {
+			throw new Error("Expected bundled OpenAI Responses and Anthropic test models");
+		}
+		let timeoutResult: AssistantMessage | undefined;
+		let calls = 0;
+		createSession(
+			(model, context, options) => {
+				calls++;
+				if (selector(model) === selector(primary)) {
+					const stream = streamOpenAIResponses(model as Model<"openai-responses">, context, {
+						...options,
+						apiKey: "local-test-key",
+						fetch: async () =>
+							new Response(new ReadableStream<Uint8Array>({ start() {} }), {
+								status: 200,
+								headers: { "content-type": "text/event-stream" },
+							}),
+						streamFirstEventTimeoutMs: 5,
+						streamIdleTimeoutMs: 20,
+						requestMaxRetries: 0,
+					});
+					void stream.result().then(result => {
+						timeoutResult = result;
+					});
+					return stream;
+				}
+				return createMockModel({ responses: [{ content: ["real timeout recovered"] }] }).stream(
+					model,
+					context,
+					options,
+				);
+			},
+			1,
+			{ primaryModel: primary, fallbackModel: fallback },
+		);
+
+		await session!.prompt("exercise real local Responses timeout");
+		await session!.waitForIdle();
+
+		expect(calls).toBe(2);
+		expect(timeoutResult).toMatchObject({
+			role: "assistant",
+			content: [],
+			stopReason: "error",
+			usage: { input: 0, output: 0, totalTokens: 0 },
+			transportFailure: { kind: "transport", providerCode: "stream_first_event_timeout" },
+		});
+		expect(session!.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "stop",
+			content: [{ type: "text", text: "real timeout recovered" }],
+		});
+		expect(session!.messages.filter(message => message.role === "assistant")).toHaveLength(1);
 	});
 
 	it("rejects a context-handler execution in a managed timeout successor without publishing duplicate content", async () => {
