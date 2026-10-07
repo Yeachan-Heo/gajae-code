@@ -4,12 +4,7 @@ import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import {
-	exactRemoveDirectoryTree,
-	exactUnlinkDirect,
-	type NativeDirectoryTreeSnapshot,
-	snapshotDirectoryTree,
-} from "@gajae-code/natives";
+import type { NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
 import { logger, postmortem } from "@gajae-code/utils";
 import { CliParseError, Command } from "@gajae-code/utils/cli";
 import type { Args as ParsedArgs } from "../cli/args";
@@ -17,62 +12,28 @@ import { isSafeSdkInternalAgentDir, scanPublicCommand } from "../cli/public-comm
 import { PublicCommandFailure } from "../cli/public-command-errors";
 import { parseModelString } from "../config/model-resolver";
 import { Settings } from "../config/settings";
-import { usePostmortemSignalExitAuthority } from "../lsp/client";
-import { applyStartupModelProfiles, createSessionManager } from "../main";
-import { initializeExtensions } from "../modes/runtime-init";
-import { initTheme } from "../modes/theme/theme";
-import { ACP_MCP_REQUEST_TIMEOUT_MS, ACP_MCP_STARTUP_HEADROOM_MS } from "../sdk/acp/mcp";
-import { Broker } from "../sdk/broker/broker";
-import {
-	type BrokerStartupExitRecord,
-	type BrokerStartupExitWriteStatus,
-	writeBrokerStartupExitRecordBounded,
-} from "../sdk/broker/broker-exit";
-import { readBrokerDiscovery } from "../sdk/broker/discovery";
-import { type EndpointFileRead, readEndpointFile } from "../sdk/broker/endpoint-authority";
-import {
-	emitBrokerStartupTestSignal,
-	reconcileBrokerGenerationForStartup,
-	withBrokerStartupLock,
-} from "../sdk/broker/ensure";
-import {
-	LifecycleFailurePublicationCleanupError,
-	LifecycleReadinessCleanupError,
-	type LifecycleTranscriptEvidence,
-	readSessionLifecycleLaunchRequest,
-	type SessionLifecycleLaunchRequest,
-	type SessionLifecycleTranscriptIdentity,
-	sessionHostAttachedClients,
-	sessionHostWorkLeaseActive,
-	startBrokerDeadRegistrationSweep,
-	writeSessionLifecycleFailure,
-	writeSessionLifecycleReady,
+import type { Broker } from "../sdk/broker/broker";
+import type { BrokerStartupExitRecord, BrokerStartupExitWriteStatus } from "../sdk/broker/broker-exit";
+import type { EndpointFileRead } from "../sdk/broker/endpoint-authority";
+import type {
+	LifecycleTranscriptEvidence,
+	SessionLifecycleLaunchRequest,
+	SessionLifecycleTranscriptIdentity,
 } from "../sdk/broker/lifecycle";
-import { processIncarnation } from "../sdk/broker/process-incarnation";
-import { resolveSdkInternalSpawnCommand } from "../sdk/broker/runtime";
-import { writeBrokerStartupFailureMarker } from "../sdk/broker/startup-failure";
-import { runSdkStderrDrainer } from "../sdk/broker/stderr-drainer";
-import { renderSdkSearchTable, runSdkSearch, runSdkSessionCli } from "../sdk/cli";
-import { renderSpawnTable, runSdkSpawn } from "../sdk/cli/master-cli";
-import { runSdkGuidesCli } from "../sdk/guides/cli";
-import {
-	type CreateLifecycleAgentSessionResult,
-	createLifecycleAgentSession,
-	type SdkLifecycleStartupOwner,
+import type {
+	CreateLifecycleAgentSessionResult,
+	SdkLifecycleStartupOwner,
 } from "../sdk/lifecycle-session";
 import { listManagedSessionCandidates, resolveManagedSessionScope } from "../sdk/session-directory";
 import {
-	SdkStartupCapability,
 	type SdkStartupFailure,
 	type SdkStartupResult,
 	type SdkStartupRollbackResult,
-	SdkStartupRollbackTracker,
 } from "../sdk/startup-capability";
-import { runSdkServe, SdkServeError } from "../sdk/transport/serve-cli";
-import { type AgentSession, isSessionDisposalIncompleteError } from "../session/agent-session";
-import {
-	type CapturedSessionTranscriptSnapshot,
-	type ResumeSessionIdentity,
+import type { AgentSession } from "../session/agent-session";
+import type {
+	CapturedSessionTranscriptSnapshot,
+	ResumeSessionIdentity,
 	SessionManager,
 } from "../session/session-manager";
 
@@ -83,8 +44,9 @@ export async function lifecycleArgs(
 ): Promise<ParsedArgs> {
 	const targetScope = await resolveManagedSessionScope({ cwd, agentDir });
 	if (targetScope.kind !== "resolved") throw new Error(`Lifecycle session scope is invalid: ${targetScope.message}`);
-	const forkSessionDir =
-		request.operation === "session.fork" ? SessionManager.getDefaultSessionDir(cwd, agentDir) : undefined;
+	const forkSessionDir = request.operation === "session.fork"
+		? (await import("../session/session-manager")).SessionManager.getDefaultSessionDir(cwd, agentDir)
+		: undefined;
 	return {
 		messages: [],
 		fileArgs: [],

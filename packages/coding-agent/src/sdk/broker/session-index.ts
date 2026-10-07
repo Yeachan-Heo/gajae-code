@@ -200,6 +200,15 @@ export interface SessionList {
 	warnings: string[];
 }
 
+export type SessionIndexSessionRead =
+	| {
+			status: "ok";
+			indexSeq: number;
+			session: IndexedSession | undefined;
+			warnings: string[];
+	  }
+	| { status: "incomplete"; indexSeq?: number };
+
 export type SessionGenerationIndexStatus =
 	| {
 			status: "current";
@@ -279,6 +288,14 @@ const dirFor = (agentDir: string) => path.join(agentDir, "sdk", "sessions");
 const logFor = (agentDir: string) => path.join(dirFor(agentDir), "index.jsonl");
 const snapshotFor = (agentDir: string) => path.join(dirFor(agentDir), "index.snapshot.json");
 const auditFor = (agentDir: string) => path.join(dirFor(agentDir), "index-audit.jsonl");
+const SESSION_PROJECTION_VERSION = 1;
+const sessionProjectionsDirFor = (agentDir: string) => path.join(dirFor(agentDir), "index-projections");
+const sessionProjectionManifestFor = (agentDir: string) => path.join(sessionProjectionsDirFor(agentDir), "manifest.json");
+const sessionProjectionFor = (agentDir: string, sessionId: string) =>
+	path.join(
+		sessionProjectionsDirFor(agentDir),
+		`${createHash("sha256").update(sessionId).digest("hex")}.json`,
+	);
 /**
  * Idle-poll change stamp over the two index files (#4689). A polling reader
  * that has already replayed the index must be able to prove "nothing changed"
@@ -313,6 +330,30 @@ interface SessionIndexChangeStamp {
 	readonly log: SessionIndexFileStamp;
 	readonly snapshot: SessionIndexFileStamp;
 }
+interface SerializedSessionIndexFileStamp {
+	readonly exists: boolean;
+	readonly size: number;
+	readonly ino: string;
+	readonly mtimeMs: number;
+	readonly ctimeMs: number;
+}
+interface SessionProjectionManifest {
+	readonly version: number;
+	readonly indexSeq: number;
+	readonly complete: boolean;
+	readonly stamp: {
+		readonly log: SerializedSessionIndexFileStamp;
+		readonly snapshot: SerializedSessionIndexFileStamp;
+	};
+	readonly checksum: string;
+}
+interface SessionProjection {
+	readonly version: number;
+	readonly sessionId: string;
+	readonly publishedIndexSeq: number;
+	readonly events: SessionIndexEvent[];
+	readonly checksum: string;
+}
 async function statIndexFile(file: string): Promise<SessionIndexFileStamp> {
 	try {
 		const stat = await fs.stat(file, { bigint: true });
@@ -346,6 +387,68 @@ function sameIndexChangeStamp(a: SessionIndexChangeStamp, b: SessionIndexChangeS
 		a.snapshot.mtimeMs === b.snapshot.mtimeMs &&
 		a.snapshot.ctimeMs === b.snapshot.ctimeMs
 	);
+}
+function serializedIndexChangeStamp(stamp: SessionIndexChangeStamp): SessionProjectionManifest["stamp"] {
+	const serialize = (file: SessionIndexFileStamp): SerializedSessionIndexFileStamp => ({
+		exists: file.exists,
+		size: file.size,
+		ino: file.ino.toString(),
+		mtimeMs: file.mtimeMs,
+		ctimeMs: file.ctimeMs,
+	});
+	return { log: serialize(stamp.log), snapshot: serialize(stamp.snapshot) };
+}
+function sameSerializedIndexChangeStamp(
+	a: SessionProjectionManifest["stamp"],
+	b: SessionIndexChangeStamp,
+): boolean {
+	const fileMatches = (serialized: SerializedSessionIndexFileStamp, current: SessionIndexFileStamp) =>
+		serialized.exists === current.exists &&
+		serialized.size === current.size &&
+		serialized.ino === current.ino.toString() &&
+		serialized.mtimeMs === current.mtimeMs &&
+		serialized.ctimeMs === current.ctimeMs;
+	return fileMatches(a.log, b.log) && fileMatches(a.snapshot, b.snapshot);
+}
+function projectionChecksum(value: unknown): string {
+	return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+function isSerializedSessionIndexFileStamp(value: unknown): value is SerializedSessionIndexFileStamp {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+	const stamp = value as Record<string, unknown>;
+	return (
+		typeof stamp.exists === "boolean" &&
+		typeof stamp.size === "number" &&
+		Number.isSafeInteger(stamp.size) &&
+		stamp.size >= 0 &&
+		typeof stamp.ino === "string" &&
+		/^\d+$/.test(stamp.ino) &&
+		typeof stamp.mtimeMs === "number" &&
+		Number.isFinite(stamp.mtimeMs) &&
+		typeof stamp.ctimeMs === "number" &&
+		Number.isFinite(stamp.ctimeMs)
+	);
+}
+function parseSessionProjectionManifest(value: unknown): SessionProjectionManifest | undefined {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const manifest = value as Record<string, unknown>;
+	if (
+		manifest.version !== SESSION_PROJECTION_VERSION ||
+		typeof manifest.indexSeq !== "number" ||
+		!Number.isSafeInteger(manifest.indexSeq) ||
+		manifest.indexSeq < 0 ||
+		typeof manifest.complete !== "boolean" ||
+		manifest.stamp === null ||
+		typeof manifest.stamp !== "object" ||
+		Array.isArray(manifest.stamp) ||
+		typeof manifest.checksum !== "string"
+	)
+		return undefined;
+	const stamp = manifest.stamp as Record<string, unknown>;
+	if (!isSerializedSessionIndexFileStamp(stamp.log) || !isSerializedSessionIndexFileStamp(stamp.snapshot)) return undefined;
+	const { checksum, ...unsigned } = manifest;
+	if (checksum !== projectionChecksum(unsigned)) return undefined;
+	return manifest as unknown as SessionProjectionManifest;
 }
 const ROTATE_BYTES = 4 * 1024 * 1024;
 /** Coalesced heartbeat checkpoint rate cap (C2): at most one per session per minute. */
@@ -1184,6 +1287,155 @@ export class SessionIndex {
 			if (SessionIndex.#openGroups.get(indexPath) === group) SessionIndex.#openGroups.delete(indexPath);
 		}
 	}
+	#projectionComplete(): boolean {
+		return !this.#corruptSuffix && !this.#warnings.includes("Invalid session index snapshot");
+	}
+	async #readProjectionManifestUnderLock(): Promise<SessionProjectionManifest | undefined> {
+		try {
+			return parseSessionProjectionManifest(
+				JSON.parse(await fs.readFile(sessionProjectionManifestFor(this.#agentDir), "utf8")),
+			);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			if (error instanceof SyntaxError) return undefined;
+			throw error;
+		}
+	}
+	async #publishProjectionManifestUnderLock(complete = this.#projectionComplete()): Promise<void> {
+		const directory = sessionProjectionsDirFor(this.#agentDir);
+		await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+		await fs.chmod(directory, 0o700);
+		const unsigned = {
+			version: SESSION_PROJECTION_VERSION,
+			indexSeq: this.indexSeq,
+			complete,
+			stamp: serializedIndexChangeStamp(await readIndexChangeStamp(this.#agentDir)),
+		};
+		await replaceAtomically(
+			sessionProjectionManifestFor(this.#agentDir),
+			JSON.stringify({ ...unsigned, checksum: projectionChecksum(unsigned) }),
+		);
+	}
+	async #publishSessionProjectionUnderLock(sessionId: string): Promise<void> {
+		const events = this.#events.filter(event => event.sessionId === sessionId);
+		const file = sessionProjectionFor(this.#agentDir, sessionId);
+		if (events.length === 0) {
+			await fs.rm(file, { force: true });
+			return;
+		}
+		const unsigned = {
+			version: SESSION_PROJECTION_VERSION,
+			sessionId,
+			publishedIndexSeq: this.indexSeq,
+			events,
+		};
+		await replaceAtomically(file, JSON.stringify({ ...unsigned, checksum: projectionChecksum(unsigned) }));
+	}
+	async #rebuildSessionProjectionsUnderLock(): Promise<void> {
+		const directory = sessionProjectionsDirFor(this.#agentDir);
+		await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+		await fs.chmod(directory, 0o700);
+		const sessionIds = new Set(this.#events.map(event => event.sessionId));
+		for (const sessionId of sessionIds) await this.#publishSessionProjectionUnderLock(sessionId);
+		const projectionKeys = new Set(
+			[...sessionIds].map(sessionId => createHash("sha256").update(sessionId).digest("hex")),
+		);
+		for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+			if (!entry.isFile() || entry.name === "manifest.json" || !entry.name.endsWith(".json")) continue;
+			const key = entry.name.slice(0, -".json".length);
+			if (!projectionKeys.has(key)) await fs.rm(path.join(directory, entry.name), { force: true });
+		}
+		await this.#publishProjectionManifestUnderLock();
+	}
+	async #ensureSessionProjectionsUnderLock(): Promise<void> {
+		const [manifest, stamp] = await Promise.all([
+			this.#readProjectionManifestUnderLock(),
+			readIndexChangeStamp(this.#agentDir),
+		]);
+		if (
+			manifest &&
+			manifest.indexSeq === this.indexSeq &&
+			manifest.complete === this.#projectionComplete() &&
+			sameSerializedIndexChangeStamp(manifest.stamp, stamp)
+		)
+			return;
+		if (!this.#projectionComplete()) {
+			await this.#publishProjectionManifestUnderLock(false);
+			return;
+		}
+		await this.#rebuildSessionProjectionsUnderLock();
+	}
+	async #readSessionProjectionUnderLock(
+		sessionId: string,
+	): Promise<
+		| { status: "ok"; indexSeq: number; events: SessionIndexEvent[]; warnings: string[] }
+		| { status: "incomplete"; indexSeq?: number }
+	> {
+		const manifest = await this.#readProjectionManifestUnderLock();
+		if (!manifest) {
+			const stamp = await readIndexChangeStamp(this.#agentDir);
+			return !stamp.log.exists && !stamp.snapshot.exists
+				? { status: "ok", indexSeq: 0, events: [], warnings: [] }
+				: { status: "incomplete" };
+		}
+		if (!manifest.complete) return { status: "incomplete", indexSeq: manifest.indexSeq };
+		const before = await readIndexChangeStamp(this.#agentDir);
+		if (!sameSerializedIndexChangeStamp(manifest.stamp, before))
+			return { status: "incomplete", indexSeq: manifest.indexSeq };
+		let value: unknown;
+		try {
+			value = JSON.parse(await fs.readFile(sessionProjectionFor(this.#agentDir, sessionId), "utf8"));
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT")
+				return { status: "ok", indexSeq: manifest.indexSeq, events: [], warnings: [] };
+			if (error instanceof SyntaxError) return { status: "incomplete", indexSeq: manifest.indexSeq };
+			throw error;
+		}
+		if (value === null || typeof value !== "object" || Array.isArray(value))
+			return { status: "incomplete", indexSeq: manifest.indexSeq };
+		const record = value as Record<string, unknown>;
+		if (
+			record.version !== SESSION_PROJECTION_VERSION ||
+			record.sessionId !== sessionId ||
+			typeof record.publishedIndexSeq !== "number" ||
+			!Number.isSafeInteger(record.publishedIndexSeq) ||
+			record.publishedIndexSeq < 0 ||
+			record.publishedIndexSeq > manifest.indexSeq ||
+			!Array.isArray(record.events) ||
+			typeof record.checksum !== "string"
+		)
+			return { status: "incomplete", indexSeq: manifest.indexSeq };
+		const { checksum, ...unsigned } = record;
+		if (checksum !== projectionChecksum(unsigned)) return { status: "incomplete", indexSeq: manifest.indexSeq };
+		const events = record.events as SessionIndexEvent[];
+		const warnings: string[] = [];
+		let previousSeq = 0;
+		for (const event of events) {
+			if (
+				!event ||
+				typeof event !== "object" ||
+				Array.isArray(event) ||
+				event.sessionId !== sessionId ||
+				!Number.isSafeInteger(event.indexSeq) ||
+				event.indexSeq <= previousSeq ||
+				event.indexSeq > record.publishedIndexSeq
+			)
+				return { status: "incomplete", indexSeq: manifest.indexSeq };
+			try {
+				assertSupportedSessionIndexEventVersion(sessionProjectionFor(this.#agentDir, sessionId), event);
+			} catch {
+				return { status: "incomplete", indexSeq: manifest.indexSeq };
+			}
+			const { checksum: eventChecksum, ...eventUnsigned } = event;
+			if (eventChecksum !== sessionIndexChecksum(eventUnsigned))
+				return { status: "incomplete", indexSeq: manifest.indexSeq };
+			if (!sessionLocatorV2(event.locator)) warnings.push(legacyLocatorDiagnostic(event));
+			previousSeq = event.indexSeq;
+		}
+		const after = await readIndexChangeStamp(this.#agentDir);
+		if (!sameIndexChangeStamp(before, after)) return { status: "incomplete", indexSeq: manifest.indexSeq };
+		return { status: "ok", indexSeq: manifest.indexSeq, events, warnings };
+	}
 	async replay(): Promise<void> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		await SessionIndex.#enqueue(indexPath, () =>
@@ -1257,6 +1509,7 @@ export class SessionIndex {
 		)
 			await this.#tailUnderLock();
 		else await this.#replayUnderLock();
+		await this.#ensureSessionProjectionsUnderLock();
 		// #replayUnderLock recaptures the stamp itself; the tail path needs it
 		// captured here (refresh() does this via #refreshUnderLock).
 		this.#changeStamp = await readIndexChangeStamp(this.#agentDir);
@@ -1311,6 +1564,7 @@ export class SessionIndex {
 		const scan = await this.#scan();
 		this.#adoptScan(scan);
 		await this.#writeAuditUnderLock();
+		await this.#ensureSessionProjectionsUnderLock();
 		this.#changeStamp = await readIndexChangeStamp(this.#agentDir);
 	}
 	#adoptScan(scan: SessionIndexScan): void {
@@ -1623,6 +1877,7 @@ export class SessionIndex {
 		if (this.#events.length === 0 && this.#logOffset === 0) await this.#replayUnderLock();
 		else await this.#tailUnderLock();
 		await this.#writeAuditUnderLock();
+		await this.#ensureSessionProjectionsUnderLock();
 		// #tailUnderLock may delegate to #replayUnderLock (which re-captures);
 		// capturing here covers the tail-only and missing-log paths.
 		this.#changeStamp = await readIndexChangeStamp(this.#agentDir);
@@ -1653,6 +1908,7 @@ export class SessionIndex {
 			const preparedScan = await this.#scan();
 			return await withSessionIndexLock("append", this.#agentDir, async () => {
 				await this.#replayPreparedAppendUnderLock(preparedScan, preparedStamp);
+				await this.#ensureSessionProjectionsUnderLock();
 				if (this.#corruptSuffix) {
 					// A corrupt suffix used to hard-fail every append until a human ran
 					// `gjc gc --repair-session-index` — but the writers that corrupt the
@@ -1694,6 +1950,10 @@ export class SessionIndex {
 				if (!hasSessionLocatorV2(event)) this.#warn(legacyLocatorDiagnostic(event));
 				await this.#writeAuditUnderLock();
 				if (this.#logOffset >= ROTATE_BYTES) await this.#rotate();
+				else {
+					await this.#publishSessionProjectionUnderLock(event.sessionId);
+					await this.#publishProjectionManifestUnderLock();
+				}
 				this.#changeStamp = await readIndexChangeStamp(this.#agentDir);
 				return event;
 			});

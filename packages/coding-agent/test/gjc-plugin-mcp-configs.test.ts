@@ -100,6 +100,43 @@ afterEach(async () => {
 });
 
 describe("plugin MCP runtime config conversion", () => {
+	test("import and empty discovery do not open PATH Node executables for hashing", async () => {
+		const cwd = await trackedTempDir("gjc-mcp-lazy-import-");
+		const modulePath = path.join(import.meta.dir, "../src/extensibility/gjc-plugins/runtime-adapters.ts");
+		const utilsPath = path.join(import.meta.dir, "../../utils/src/index.ts");
+		const child = Bun.spawn(
+			[
+				process.execPath,
+				"--eval",
+				`
+import { vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { setAgentDir } from ${JSON.stringify(utilsPath)};
+setAgentDir(${JSON.stringify(cwd)});
+const open = fs.open;
+const executableReads = [];
+vi.spyOn(fs, "open").mockImplementation((file, ...args) => {
+  if (["node", "node.exe"].includes(path.basename(String(file)))) executableReads.push(String(file));
+  return open(file, ...args);
+});
+const { buildPluginMcpConfigs } = await import(${JSON.stringify(modulePath)});
+const result = await buildPluginMcpConfigs({ cwd: ${JSON.stringify(cwd)} });
+await Bun.sleep(100);
+process.stdout.write(JSON.stringify({ executableReads, configs: Object.keys(result.configs) }));
+`,
+			],
+			{ cwd: path.join(import.meta.dir, "../../.."), stdout: "pipe", stderr: "pipe" },
+		);
+		const [stdout, stderr, code] = await Promise.all([
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+			child.exited,
+		]);
+		expect({ code, stderr }).toEqual({ code: 0, stderr: "" });
+		expect(JSON.parse(stdout)).toEqual({ executableReads: [], configs: [] });
+	});
+
 	test("bounds and redacts plugin MCP diagnostics", () => {
 		const secret = "plugin-startup-secret-value";
 		const diagnostic = safePluginMcpDiagnostic(`api_key=${secret}\u001b[31m ${"x".repeat(1_200)}`);
