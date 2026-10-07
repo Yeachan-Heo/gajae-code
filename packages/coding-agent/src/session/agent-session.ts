@@ -2768,6 +2768,7 @@ export class AgentSession {
 	#scopedModels: ScopedModelSelection[];
 	#thinkingLevel: ThinkingLevel | undefined;
 	#activeModelProfile: string | undefined;
+	#unavailableModelProfile: string | undefined;
 	#activeProfileInstalledRoles = new Map<string, ModelSelectorValue | undefined>();
 	#activeProfileInstalledAgentOverrides = new Map<string, ModelSelectorValue | undefined>();
 	#preProfileModel: Model | undefined;
@@ -18207,6 +18208,7 @@ export class AgentSession {
 
 		options?.onMutationStarted?.();
 		this.#setModelAuthoritatively(model, options?.cause ?? "user-selection");
+		if (options?.cause === "user-selection") this.#unavailableModelProfile = undefined;
 		this.#seedSessionCanonicalVariant(model);
 		this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, role);
 		this.settings.setModelRole(
@@ -18252,10 +18254,21 @@ export class AgentSession {
 
 	setActiveModelProfile(name: string | undefined): void {
 		this.#activeModelProfile = name;
+		if (name !== undefined) {
+			this.#unavailableModelProfile = undefined;
+		}
 	}
 
 	getActiveModelProfile(): string | undefined {
 		return this.#activeModelProfile;
+	}
+
+	setUnavailableModelProfile(name: string | undefined): void {
+		this.#unavailableModelProfile = name;
+	}
+
+	getUnavailableModelProfile(): string | undefined {
+		return this.#unavailableModelProfile;
 	}
 
 	/**
@@ -18780,6 +18793,9 @@ export class AgentSession {
 				this.#syncAppendOnlyContext(model);
 			} else {
 				this.#setModelAuthoritatively(model, options?.cause ?? "temporary-operation");
+			}
+			if (options?.cause === "user-selection") {
+				this.#unavailableModelProfile = undefined;
 			}
 			this.sessionManager.appendModelChange(
 				`${model.provider}/${model.id}`,
