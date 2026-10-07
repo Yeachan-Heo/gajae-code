@@ -36,8 +36,10 @@ afterEach(async () => {
 	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 });
 
-async function signedIdentityFixture(component: "root" | "info" | "both", detach = false) {
-	const root = await fs.mkdtemp(path.join(os.tmpdir(), "file-lock-signed-id-"));
+async function signedIdentityFixture(component: "root" | "info" | "both", detach = false, tempRoot = os.tmpdir()) {
+	// Exact removal resolves parent aliases before re-reading stat identity.
+	// Keep the fixture's path-matched stat spies on that same canonical path.
+	const root = await fs.realpath(await fs.mkdtemp(path.join(tempRoot, "file-lock-signed-id-")));
 	roots.push(root);
 	const file = path.join(root, "index.jsonl");
 	const lock = `${file}.lock`;
@@ -142,6 +144,24 @@ test("acquires and releases after reclaiming a signed-ID dead-owner lock", async
 	);
 	expect(await fs.exists(fixture.lock)).toBe(false);
 });
+
+test.skipIf(process.platform !== "win32")(
+	"reclaims signed IDs through a temporary-root drive-letter alias",
+	async () => {
+		const canonicalTempRoot = await fs.realpath(os.tmpdir());
+		const driveLetter = canonicalTempRoot[0];
+		const alternateCase =
+			driveLetter === driveLetter.toUpperCase() ? driveLetter.toLowerCase() : driveLetter.toUpperCase();
+		const aliasedTempRoot = alternateCase + canonicalTempRoot.slice(1);
+		expect(aliasedTempRoot).not.toBe(canonicalTempRoot);
+		const fixture = await signedIdentityFixture("both", false, aliasedTempRoot);
+		const observed = await readFileLockObservationForGc(fixture.lock);
+		if (!observed) throw new Error("Expected a lock observation");
+		expect(await removeFileLockDirForGc(fixture.lock, observed.info, observed.identity)).toBe("removed");
+		expect(fixture.remove).toHaveBeenCalledTimes(1);
+		expect(await fs.exists(fixture.lock)).toBe(false);
+	},
+);
 
 test("canonicalizes the parent and detached root in fallback cleanup", async () => {
 	const fixture = await signedIdentityFixture("both", true);
