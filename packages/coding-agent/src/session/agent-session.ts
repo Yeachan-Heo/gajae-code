@@ -18207,8 +18207,9 @@ export class AgentSession {
 		}
 
 		options?.onMutationStarted?.();
-		this.#setModelAuthoritatively(model, options?.cause ?? "user-selection");
-		if (options?.cause === "user-selection") this.#unavailableModelProfile = undefined;
+		const cause = options?.cause ?? "user-selection";
+		this.#setModelAuthoritatively(model, cause);
+		if (cause === "user-selection") this.#unavailableModelProfile = undefined;
 		this.#seedSessionCanonicalVariant(model);
 		this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, role);
 		this.settings.setModelRole(
@@ -18217,7 +18218,7 @@ export class AgentSession {
 		);
 		// Only an explicit user selection starts a new fallback epoch. Internal
 		// fallback switches must preserve the exhausted-model set while advancing.
-		if (role === "default" && (options?.cause ?? "user-selection") === "user-selection") {
+		if (role === "default" && cause === "user-selection") {
 			this.#fallbackTransitionGeneration++;
 			this.#defaultFallbackController = undefined;
 			this.#defaultFallbackExhaustedLastTurn = false;
@@ -18269,6 +18270,11 @@ export class AgentSession {
 
 	getUnavailableModelProfile(): string | undefined {
 		return this.#unavailableModelProfile;
+	}
+
+	/** Revision fence for deferred startup profile recovery. */
+	getDefaultModelSelectionMutationRevision(): number {
+		return this.#defaultModelSelectionMutationRevision;
 	}
 
 	/**

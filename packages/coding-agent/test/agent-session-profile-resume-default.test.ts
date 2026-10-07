@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
-import { Agent } from "@gajae-code/agent-core";
+import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
 import {
 	applyPreparedModelProfileActivation,
@@ -96,8 +96,31 @@ describe("AgentSession profile resume defaults", () => {
 		expect(session.getUnavailableModelProfile()).toBeUndefined();
 
 		session.setUnavailableModelProfile("stale-profile");
+		const revision = session.getDefaultModelSelectionMutationRevision();
 		await session.setModel(base);
 		expect(session.getUnavailableModelProfile()).toBeUndefined();
+		expect(session.getDefaultModelSelectionMutationRevision()).toBeGreaterThan(revision);
+	});
+
+	it("preserves an unavailable-profile marker when the active profile is reset", () => {
+		const { base } = resolveModels();
+		session = makeSession(base);
+
+		session.setActiveModelProfile("unavailable-profile");
+		session.setUnavailableModelProfile("unavailable-profile");
+		session.setActiveModelProfile(undefined);
+
+		expect(session.getUnavailableModelProfile()).toBe("unavailable-profile");
+	});
+
+	it("preserves the unavailable-profile marker when startup only overrides thinking", async () => {
+		const { base } = resolveModels();
+		session = makeSession(base);
+		session.setUnavailableModelProfile("unavailable-profile");
+
+		await session.setModelTemporary(base, ThinkingLevel.High, { cause: "startup-override" });
+
+		expect(session.getUnavailableModelProfile()).toBe("unavailable-profile");
 	});
 
 	it("keeps a transient switch as role=temporary so resume does not adopt it", async () => {
