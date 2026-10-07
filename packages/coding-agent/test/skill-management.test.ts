@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { removeSkill } from "../src/customization/mutations";
 import {
 	isNativeSkillEnabled,
 	listConventionSkillImportSources,
@@ -159,9 +160,20 @@ describe("skill-management", () => {
 					policy: { trustUserSkills: true },
 					allowExternalUserSkillSymlinks: true,
 				});
-				expect(trusted).toContainEqual(
-					expect.objectContaining({ name: "external-helper", scope: "user", enabled: true }),
+				const record = trusted.find(skill => skill.name === "external-helper");
+				expect(record).toEqual(
+					expect.objectContaining({
+						name: "external-helper",
+						scope: "user",
+						enabled: true,
+						path: path.join(userSkills, "external-helper", "SKILL.md"),
+					}),
 				);
+				if (!record) throw new Error("Expected trusted external skill record");
+
+				const removal = await removeSkill(record);
+				expect(removal).toMatchObject({ ok: false });
+				await fs.stat(path.join(sharedSkills, "external-helper", "SKILL.md"));
 			});
 		});
 	});
