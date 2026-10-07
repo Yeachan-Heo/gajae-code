@@ -9064,12 +9064,14 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			});
 			const recoveryDeadline = Date.now() + 5_000;
 			while (
-				!store.snapshot().some(
-					record =>
-						record.commandId === correlation.commandId &&
-						(record as SdkOnlyInvocationRecord & { deadlineRecoveryPending?: boolean }).deadlineRecoveryPending ===
-							true,
-				)
+				!store
+					.snapshot()
+					.some(
+						record =>
+							record.commandId === correlation.commandId &&
+							(record as SdkOnlyInvocationRecord & { deadlineRecoveryPending?: boolean })
+								.deadlineRecoveryPending === true,
+					)
 			) {
 				if (Date.now() >= recoveryDeadline) throw new Error("Prompt deadline recovery was not durably marked.");
 				await Bun.sleep(10);
