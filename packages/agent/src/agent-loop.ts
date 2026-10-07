@@ -2737,6 +2737,8 @@ function isSupersededStreamingDelta(item: ManagedAttemptBatchItem): boolean {
 
 class ManagedAttemptTransaction {
 	#batch: ManagedAttemptBatchItem[] = [];
+	// Compaction and flushes must never erase evidence used by retry admission.
+	#hasObservableAssistantOutput = false;
 	#stagedEventCount = 0;
 	#stagedBytes = 0;
 	/** Caps for this transaction, read once from the operator env knobs. */
@@ -2762,7 +2764,7 @@ class ManagedAttemptTransaction {
 	push(event: AgentEvent): void {
 		if (this.#committed) {
 			if (event.type === "message_end" || event.type === "turn_end") {
-				this.#batch.push({ type: "event", event });
+				this.#retain({ type: "event", event });
 				return;
 			}
 			this.stream.push(event);
@@ -2865,7 +2867,7 @@ class ManagedAttemptTransaction {
 		}
 		// Each frame's exact accounted size is retained so compaction can debit
 		// exactly what it reclaims instead of re-measuring the whole batch.
-		this.#batch.push({
+		this.#retain({
 			type: "assistant_event",
 			message: partial,
 			event: snapshotEvent,
@@ -2876,48 +2878,52 @@ class ManagedAttemptTransaction {
 	}
 
 	hasObservableAssistantOutput(terminalMessage?: unknown): boolean {
-		if (managedAssistantMessageHasContent(terminalMessage)) return true;
-		return this.#batch.some(item => {
-			if (item.type === "assistant_event") {
-				if (managedAssistantMessageHasContent(item.message)) return true;
-				const event = item.event;
-				if (
-					event.type === "text_delta" ||
-					event.type === "thinking_delta" ||
-					event.type === "reasoning_summary_delta" ||
-					event.type === "text_end" ||
-					event.type === "thinking_end" ||
-					event.type === "reasoning_summary_end"
-				) {
-					if (event.type === "text_end" || event.type === "thinking_end" || event.type === "reasoning_summary_end")
-						return event.content.length > 0;
-					return event.delta.length > 0;
-				}
-				return event.type === "toolcall_start" || event.type === "toolcall_delta" || event.type === "toolcall_end";
-			}
+		return this.#hasObservableAssistantOutput || managedAssistantMessageHasContent(terminalMessage);
+	}
+
+	#retain(item: ManagedAttemptBatchItem): void {
+		this.#hasObservableAssistantOutput ||= this.#itemHasObservableAssistantOutput(item);
+		this.#batch.push(item);
+	}
+
+	#itemHasObservableAssistantOutput(item: ManagedAttemptBatchItem): boolean {
+		if (item.type === "assistant_event") {
+			if (managedAssistantMessageHasContent(item.message)) return true;
 			const event = item.event;
-			if ("message" in event && managedAssistantMessageHasContent(event.message)) return true;
-			if ("error" in event && managedAssistantMessageHasContent(event.error)) return true;
-			if (event.type === "message_update") {
-				const update = event.assistantMessageEvent;
-				if (
-					update.type === "text_delta" ||
-					update.type === "thinking_delta" ||
-					update.type === "reasoning_summary_delta"
-				)
-					return update.delta.length > 0;
-				if (update.type === "text_end" || update.type === "thinking_end" || update.type === "reasoning_summary_end")
-					return update.content.length > 0;
-				return (
-					update.type === "toolcall_start" || update.type === "toolcall_delta" || update.type === "toolcall_end"
-				);
+			if (
+				event.type === "text_delta" ||
+				event.type === "thinking_delta" ||
+				event.type === "reasoning_summary_delta" ||
+				event.type === "text_end" ||
+				event.type === "thinking_end" ||
+				event.type === "reasoning_summary_end"
+			) {
+				if (event.type === "text_end" || event.type === "thinking_end" || event.type === "reasoning_summary_end")
+					return event.content.length > 0;
+				return event.delta.length > 0;
 			}
-			return (
-				event.type === "tool_execution_start" ||
-				event.type === "tool_execution_update" ||
-				event.type === "tool_execution_end"
-			);
-		});
+			return event.type === "toolcall_start" || event.type === "toolcall_delta" || event.type === "toolcall_end";
+		}
+		const event = item.event;
+		if ("message" in event && managedAssistantMessageHasContent(event.message)) return true;
+		if ("error" in event && managedAssistantMessageHasContent(event.error)) return true;
+		if (event.type === "message_update") {
+			const update = event.assistantMessageEvent;
+			if (
+				update.type === "text_delta" ||
+				update.type === "thinking_delta" ||
+				update.type === "reasoning_summary_delta"
+			)
+				return update.delta.length > 0;
+			if (update.type === "text_end" || update.type === "thinking_end" || update.type === "reasoning_summary_end")
+				return update.content.length > 0;
+			return update.type === "toolcall_start" || update.type === "toolcall_delta" || update.type === "toolcall_end";
+		}
+		return (
+			event.type === "tool_execution_start" ||
+			event.type === "tool_execution_update" ||
+			event.type === "tool_execution_end"
+		);
 	}
 	flush(): void {
 		if (this.#discarded) return;
@@ -3226,7 +3232,7 @@ class ManagedAttemptTransaction {
 				this.push(detached);
 				return;
 			}
-			this.#batch.push({ type: "event", event: detached, bytes: detachedBytes });
+			this.#retain({ type: "event", event: detached, bytes: detachedBytes });
 			this.#stagedEventCount++;
 			this.#stagedBytes += detachedBytes;
 			return;
@@ -3320,7 +3326,7 @@ class ManagedAttemptTransaction {
 		}
 		// Retain each frame's accounted size so compaction can debit exactly what
 		// it reclaims instead of re-measuring the whole batch.
-		this.#batch.push({ type: "event", event: snapshot, bytes });
+		this.#retain({ type: "event", event: snapshot, bytes });
 		this.#stagedEventCount += 1;
 
 		this.#stagedBytes += bytes;
