@@ -1126,8 +1126,6 @@ export class Settings implements NotificationSettingsReader {
 		return cloned;
 	}
 
-
-
 	/** Resolve a retained execution's project layer without persistence or global hooks. */
 	async snapshotForCwd(cwd: string): Promise<Settings> {
 		const cloned = this.snapshot();

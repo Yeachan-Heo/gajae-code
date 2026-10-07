@@ -13,7 +13,9 @@ import { InternalUrlRouter } from "../src/internal-urls/router";
 import { createAgentSession } from "../src/sdk";
 import { ArtifactManager } from "../src/session/artifacts";
 import { SessionManager } from "../src/session/session-manager";
+import { FileSessionStorage } from "../src/session/session-storage";
 import { AgentOutputManager, TaskTool } from "../src/task";
+import * as discoveryModule from "../src/task/discovery";
 import type { ExecutorOptions } from "../src/task/executor";
 import type { TaskScopeAuthority } from "../src/task/scope";
 import type { SingleResult, TaskItem, TaskToolSchemaInstance } from "../src/task/types";
@@ -37,7 +39,7 @@ async function git(cwd: string, args: string[]): Promise<void> {
 	if (code !== 0) throw new Error(`git ${args.join(" ")}: ${stdout}${stderr}`);
 }
 
-async function harness(isolated = false) {
+async function harness(isolated = false, persistent = false) {
 	const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-scope-")));
 	roots.push(root);
 	const a = path.join(root, "workspace");
@@ -83,7 +85,13 @@ async function harness(isolated = false) {
 		settings.override("task.enableLsp", false);
 		settings.override("irc.enabled", false);
 	}
-	const sessionManager = SessionManager.inMemory(a);
+	const sessionManager = persistent
+		? SessionManager.create(
+				a,
+				SessionManager.explicitDestination(path.join(root, "sessions")),
+				new FileSessionStorage(),
+			)
+		: SessionManager.inMemory(a);
 	const jobs = new AsyncJobManager({ onJobComplete: async () => {} });
 	managers.push(jobs);
 	const artifacts = new ArtifactManager(path.join(root, "outputs"));
@@ -389,6 +397,7 @@ describe("task admission after trusted committed moves", () => {
 	it("rejects arbitrary cwd drift and foreign payloads before ID or job allocation", async () => {
 		const h = await harness();
 		const tool = await TaskTool.create(h.session, { runSubprocess: complete });
+		const discover = vi.spyOn(discoveryModule, "discoverAgents");
 		const allocate = vi.spyOn(h.allocator, "allocateBatch");
 		const register = vi.spyOn(h.jobs, "register");
 		h.setDrift(h.b);
@@ -399,6 +408,7 @@ describe("task admission after trusted committed moves", () => {
 		expect(text(await start(tool, [task("Foreign", { repositoryBinding: bindingA })]))).toContain(
 			"repository binding",
 		);
+		expect(discover).not.toHaveBeenCalled();
 		expect(allocate).not.toHaveBeenCalled();
 		expect(register).not.toHaveBeenCalled();
 		await start(tool, [task("Valid")]);
@@ -594,4 +604,127 @@ describe("task admission after trusted committed moves", () => {
 			}
 		}, 30_000);
 	}
+
+	it("continues refreshing moved resources when target settings reload fails and preserves caller context", async () => {
+		const h = await harness();
+		const callerPath = path.join(h.a, "caller.md");
+		await Bun.write(callerPath, "Caller-authored instructions");
+		const callerContextFiles = [{ path: callerPath, content: "Caller-authored instructions" }];
+		const snapshotForCwd = vi.spyOn(h.sourceSettings, "snapshotForCwd").mockImplementationOnce(async () => {
+			throw new Error("injected target settings read failure");
+		});
+		const seen: ExecutorOptions[] = [];
+		const create = TaskTool.create;
+		vi.spyOn(TaskTool, "create").mockImplementation((session, options) =>
+			create(session, {
+				...options,
+				runSubprocess: async worker => {
+					seen.push(worker);
+					return complete(worker);
+				},
+			}),
+		);
+		const { session } = await createAgentSession({
+			cwd: h.a,
+			agentDir: h.home,
+			sessionManager: h.sessionManager,
+			settings: h.sourceSettings,
+			contextFiles: callerContextFiles,
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			slashCommands: [],
+			enableMCP: false,
+			enableMcpAutoload: false,
+			enableLsp: false,
+			toolNames: ["task"],
+		});
+		try {
+			const taskTool = session.getToolByName("task")!;
+			await h.sessionManager.moveTo(h.b);
+			expect(snapshotForCwd).toHaveBeenCalled();
+			const started = await start(taskTool, [task("RetrySettings")]);
+			expect(text(started)).toContain("background task");
+			const jobs = AsyncJobManager.instance();
+			if (!jobs) throw new Error("Expected the SDK-owned async manager");
+			await jobs.waitForAll();
+			expect(seen).toHaveLength(1);
+			expect(seen[0]?.contextFiles).toEqual(expect.arrayContaining(callerContextFiles));
+			expect(seen[0]?.contextFiles?.some(file => file.content.includes("Original B instructions"))).toBe(false);
+			expect(seen[0]?.promptTemplates?.find(template => template.name === "scope-template")?.content).toContain(
+				"Template B",
+			);
+			expect(seen[0]?.skills?.find(skill => skill.name === "scope-skill")?.filePath).toContain(h.b);
+			expect(seen[0]?.settings?.getCwd()).toBe(h.b);
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
+
+	it("keeps queued output readable after a persistent explicit-destination session moves", async () => {
+		const h = await harness(false, true);
+		expect(h.sessionManager.isManagedDestination()).toBe(false);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const seen: ExecutorOptions[] = [];
+		const create = TaskTool.create;
+		vi.spyOn(TaskTool, "create").mockImplementation((session, options) => {
+			return create(session, {
+				...options,
+				runSubprocess: async worker => {
+					seen.push(worker);
+					const result = await complete(worker);
+					if (worker.id === "0-Running") {
+						if (worker.artifactsDir) {
+							await fs.chmod(path.join(worker.artifactsDir, `${worker.id}.md`), 0o600);
+							await fs.chmod(path.join(worker.artifactsDir, `${worker.id}.md.meta.json`), 0o600);
+						}
+						entered.resolve();
+						await release.promise;
+					}
+					return result;
+				},
+			});
+		});
+		const { session } = await createAgentSession({
+			cwd: h.a,
+			agentDir: h.home,
+			sessionManager: h.sessionManager,
+			settings: h.sourceSettings,
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			toolNames: ["task", "read"],
+		});
+		try {
+			const taskTool = session.getToolByName("task");
+			const readTool = session.getToolByName("read");
+			if (!taskTool || !readTool) throw new Error("Expected task and read tools");
+			const sourceArtifactsDir = h.sessionManager.getArtifactsDir();
+			expect(sourceArtifactsDir).not.toBeNull();
+			const started = await start(taskTool, [task("Running"), task("Queued")]);
+			expect(text(started)).toContain("background task");
+			await entered.promise;
+			await h.sessionManager.moveTo(h.b);
+			release.resolve();
+			const jobs = AsyncJobManager.instance();
+			if (!jobs) throw new Error("Expected the SDK-owned async manager");
+			await jobs.waitForAll();
+			expect(jobs.getJob("0-Running")?.status).toBe("completed");
+			expect(jobs.getJob("1-Queued")?.status).toBe("completed");
+			expect(seen.map(worker => worker.cwd)).toEqual([h.a, h.a]);
+			expect(seen[1]?.artifactsDir).not.toBe(sourceArtifactsDir);
+			const queuedOutput = await readTool.execute("read-queued-output", { path: "agent://1-Queued" });
+			expect(text(queuedOutput)).toContain("A");
+		} finally {
+			release.resolve();
+			const jobs = AsyncJobManager.instance();
+			if (jobs) await jobs.waitForAll();
+			await session.dispose();
+		}
+	}, 30_000);
 });

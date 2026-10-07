@@ -131,6 +131,7 @@ interface TaskResumeDescriptor {
 	params: TaskParams;
 	task: TaskItem & { id: string };
 	sessionFile: string | null;
+	externalTaskSessionsDir?: string;
 	durableOutputAllowed?: boolean;
 	forkContextSeed?: ForkContextSeed;
 	agentSource: AgentDefinition["source"];
@@ -146,6 +147,17 @@ function isTaskResumeDescriptor(value: unknown): value is TaskResumeDescriptor {
 }
 function renderTaskAssignment(assignment: string, simpleMode: TaskSimpleMode): string {
 	return renderSubagentUserPrompt(assignment, simpleMode === "independent");
+}
+
+function taskSessionFileForArtifacts(
+	artifacts: TaskArtifacts,
+	taskId: string,
+	externalTaskSessionsDir: string | undefined,
+	fallbackSessionFile: string | null,
+): string | null {
+	if (artifacts.parentArtifactManager?.getManagedStore()) return null;
+	const artifactsDir = artifacts.effectiveArtifactsDir ?? externalTaskSessionsDir;
+	return artifactsDir ? path.join(artifactsDir, `${taskId}.jsonl`) : fallbackSessionFile;
 }
 
 export function subagentRunOutcomeFromSingleResult(
@@ -598,6 +610,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	#scopeIdentity: TaskScopeIdentity | undefined;
 	#artifactOwner: TaskTool | undefined;
 	#executionArtifacts: TaskArtifacts | undefined;
+	#executionArtifactsSessionId: string | null | undefined;
+	#executionArtifactsGeneration: number | undefined;
 	#testRunSubprocess: typeof runSubprocess | undefined;
 
 	private constructor(
@@ -809,37 +823,58 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	 * artifacts path, then to the session-lifetime durable temp root.
 	 */
 	async #resolveEffectiveArtifactsDir(): Promise<TaskArtifacts> {
-		if (this.#executionArtifacts) return this.#executionArtifacts;
 		if (this.#artifactOwner) {
-			this.#executionArtifacts = await this.#artifactOwner.#resolveEffectiveArtifactsDir();
-			return this.#executionArtifacts;
+			return this.#artifactOwner.#resolveEffectiveArtifactsDir();
 		}
+		const sessionId = this.session.getSessionId?.() ?? null;
+		const generation = this.session.getTaskScopeIdentity?.().generation;
+		if (
+			this.#executionArtifacts &&
+			this.#executionArtifactsSessionId === sessionId &&
+			this.#executionArtifactsGeneration === generation
+		)
+			return this.#executionArtifacts;
+		if (this.session.isManagedSessionDestination?.() === true && this.session.getSessionFile())
+			await this.session.ensureArtifactManager?.();
 		const shared = this.#sharedArtifactStore();
 		if (shared) {
-			return {
+			this.#executionArtifacts = {
 				sessionArtifactsDir: shared.dir,
 				durableArtifactsDir: null,
 				effectiveArtifactsDir: shared.dir,
 				parentArtifactManager: shared.manager,
 			};
+		} else {
+			const sessionFile = this.session.getSessionFile();
+			const sessionArtifactsDir = sessionFile ? sessionFile.slice(0, -6) : null;
+			if (sessionArtifactsDir) {
+				this.#executionArtifacts = {
+					sessionArtifactsDir,
+					durableArtifactsDir: null,
+					effectiveArtifactsDir: sessionArtifactsDir,
+					parentArtifactManager: undefined,
+				};
+			} else {
+				const durable = await this.#ensureSessionLifetimeArtifacts();
+				this.#executionArtifacts = {
+					sessionArtifactsDir: null,
+					durableArtifactsDir: durable?.dir ?? null,
+					effectiveArtifactsDir: durable?.dir,
+					parentArtifactManager: durable?.manager,
+				};
+			}
 		}
-		const sessionFile = this.session.getSessionFile();
-		const sessionArtifactsDir = sessionFile ? sessionFile.slice(0, -6) : null;
-		if (sessionArtifactsDir) {
-			return {
-				sessionArtifactsDir,
-				durableArtifactsDir: null,
-				effectiveArtifactsDir: sessionArtifactsDir,
-				parentArtifactManager: undefined,
-			};
-		}
-		const durable = await this.#ensureSessionLifetimeArtifacts();
-		return {
-			sessionArtifactsDir: null,
-			durableArtifactsDir: durable?.dir ?? null,
-			effectiveArtifactsDir: durable?.dir,
-			parentArtifactManager: durable?.manager,
-		};
+		this.#executionArtifactsSessionId = sessionId;
+		this.#executionArtifactsGeneration = generation;
+		return this.#executionArtifacts;
+	}
+
+	async #resolveCurrentArtifactOwnerArtifacts(): Promise<TaskArtifacts> {
+		const artifactOwner = this.#artifactOwner ?? this;
+		const resolve = () => artifactOwner.#resolveEffectiveArtifactsDir();
+		return artifactOwner.session.runWithTaskAdmission
+			? artifactOwner.session.runWithTaskAdmission(resolve)
+			: resolve();
 	}
 
 	/**
@@ -932,29 +967,36 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					`Session repository binding rejected before task discovery: ${error instanceof Error ? error.message : String(error)}`,
 				);
 			}
+			const normalizedParams = normalizeTaskAdmissionParams(params as TaskParams);
+			const simpleMode = this.#getTaskSimpleMode();
+			const validationError = validateTaskModeParams(simpleMode, normalizedParams);
+			if (validationError) return createTaskModeError(validationError);
+			const taskIdValidationError = validateTaskIdsForScheduling(normalizedParams.tasks ?? []);
+			if (taskIdValidationError) return createTaskModeError(taskIdValidationError);
+			const bindingResolution = await resolveTaskItemsWithRepositoryBindings(
+				this.session.cwd,
+				normalizedParams.tasks ?? [],
+			);
+			if (bindingResolution.error) return createTaskModeError(bindingResolution.error);
+			const admittedParams: TaskParams = { ...normalizedParams, tasks: bindingResolution.tasks };
 			const snapshot = snapshotTaskSession(this.session, this.#resolveOwnedJobManager());
 			const { agents, projectAgentsDir } = await discoverAgents(snapshot.cwd, snapshot.home, snapshot.settings);
 			signal?.throwIfAborted();
 			const execution = new TaskTool(snapshot, agents, this.#sessionRepositoryBinding, projectAgentsDir);
 			execution.#artifactOwner = this;
 			execution.#testRunSubprocess = this.#testRunSubprocess;
-			return execution.#executeAdmitted(toolCallId, params, signal, onUpdate);
+			return execution.#executeAdmitted(toolCallId, admittedParams, signal, onUpdate);
 		};
 		return this.session.runWithTaskAdmission ? this.session.runWithTaskAdmission(admit) : admit();
 	}
 
 	async #executeAdmitted(
 		_toolCallId: string,
-		rawParams: unknown,
+		params: TaskParams,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
 	): Promise<AgentToolResult<TaskToolDetails>> {
-		const params = normalizeTaskAdmissionParams(rawParams as TaskParams);
 		const simpleMode = this.#getTaskSimpleMode();
-		const validationError = validateTaskModeParams(simpleMode, params);
-		if (validationError) {
-			return createTaskModeError(validationError);
-		}
 
 		// Re-verify session authority before using any discovered agents or scheduling work.
 		try {
@@ -969,17 +1011,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			return createTaskModeError(`Session repository binding rejected before task discovery: ${message}`);
 		}
 
-		const rawTaskItems = params.tasks ?? [];
-		const taskIdValidationError = validateTaskIdsForScheduling(rawTaskItems);
-		if (taskIdValidationError) {
-			return createTaskModeError(taskIdValidationError);
-		}
-		const bindingResolution = await resolveTaskItemsWithRepositoryBindings(this.session.cwd, rawTaskItems);
-		if (bindingResolution.error) {
-			return createTaskModeError(bindingResolution.error);
-		}
-		const taskItems = bindingResolution.tasks;
-		const paramsWithBindings: TaskParams = { ...params, tasks: taskItems };
+		const taskItems = params.tasks ?? [];
+		const paramsWithBindings = params;
 		if (taskItems.length === 0) {
 			return this.#executeSync(_toolCallId, paramsWithBindings, signal, onUpdate);
 		}
@@ -1070,11 +1103,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 
 		const artifactOwner = this.#artifactOwner?.session ?? this.session;
-		const authorizedArtifactsDirs = [...(artifactOwner.getAuthorizedArtifactsDirs?.() ?? [])];
-		this.session.getArtifactsDir = () => batchArtifactsDir ?? null;
-		this.session.getAuthorizedArtifactsDirs = () => authorizedArtifactsDirs;
-		this.session.getArtifactManager = () => asyncParentArtifactManager ?? null;
-		this.session.isArtifactManagerAuthorized = candidate => candidate === asyncParentArtifactManager;
+		this.session.getArtifactsDir = artifactOwner.getArtifactsDir ?? (() => null);
+		this.session.getAuthorizedArtifactsDirs = artifactOwner.getAuthorizedArtifactsDirs ?? (() => []);
+		this.session.getArtifactManager = artifactOwner.getArtifactManager ?? (() => null);
+		this.session.isArtifactManagerAuthorized = candidate =>
+			artifactOwner.isArtifactManagerAuthorized?.(candidate) === true;
 		artifactOwner.agentOutputManager ??= new AgentOutputManager(artifactOwner.getArtifactsDir ?? (() => null));
 		const outputManager = artifactOwner.agentOutputManager;
 		this.session.agentOutputManager = outputManager;
@@ -1234,6 +1267,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					"task",
 					descriptor.task.id,
 					async ({ signal: runSignal }) => {
+						const currentArtifacts = await descriptor.executionTool.#resolveCurrentArtifactOwnerArtifacts();
+						descriptor.sessionFile = taskSessionFileForArtifacts(
+							currentArtifacts,
+							descriptor.task.id,
+							descriptor.externalTaskSessionsDir,
+							descriptor.sessionFile,
+						);
+						descriptor.durableOutputAllowed = Boolean(currentArtifacts.effectiveArtifactsDir);
 						const result = await descriptor.executionTool.#executeSync(
 							descriptor.toolCallId,
 							{ ...descriptor.params, tasks: [resumedTask] },
@@ -1246,14 +1287,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								resumeMessage: message,
 								sessionFiles: new Map([[descriptor.task.id, descriptor.sessionFile]]),
 								suppressRoiReconciliation: true,
-								...(descriptor.durableOutputAllowed === true
-									? {}
-									: {
-											persistence: {
-												effectiveArtifactsDir: undefined,
-												parentArtifactManager: undefined,
-											},
-										}),
+								persistence: descriptor.durableOutputAllowed
+									? {
+											effectiveArtifactsDir: currentArtifacts.effectiveArtifactsDir,
+											parentArtifactManager: currentArtifacts.parentArtifactManager,
+										}
+									: { effectiveArtifactsDir: undefined, parentArtifactManager: undefined },
 							},
 						);
 						const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
@@ -1394,6 +1433,22 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					});
 					continue;
 				}
+				const resumeDescriptor: TaskResumeDescriptor = {
+					executionTool: this,
+					toolCallId: _toolCallId,
+					params,
+					task: { ...taskItem, id: uniqueId },
+					sessionFile: subtaskSessionFile,
+					externalTaskSessionsDir,
+					durableOutputAllowed: Boolean(batchArtifactsDir),
+					forkContextSeed: frozenForkSeed,
+					agentSource: fallbackAgentSource,
+					repositoryBinding: taskItem.repositoryBinding as RepositoryBinding,
+					duplicateIdentity: admission.identity,
+					duplicatePolicy: taskItem.duplicate_policy ?? "warn",
+					initialDisposition: admission.disposition,
+				};
+				let resolvedSubtaskSessionFile = subtaskSessionFile;
 				const jobId = manager.register(
 					"task",
 					label,
@@ -1416,6 +1471,21 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							buildAsyncDetails("running", startedJobs[0]?.jobId ?? label) as unknown as Record<string, unknown>,
 						);
 						try {
+							const currentArtifacts = await this.#resolveCurrentArtifactOwnerArtifacts();
+							resolvedSubtaskSessionFile = taskSessionFileForArtifacts(
+								currentArtifacts,
+								uniqueId,
+								externalTaskSessionsDir,
+								subtaskSessionFile,
+							);
+							resumeDescriptor.sessionFile = resolvedSubtaskSessionFile;
+							resumeDescriptor.durableOutputAllowed = Boolean(currentArtifacts.effectiveArtifactsDir);
+							const subagentRecord = manager
+								.getSubagentRecords?.({ ownerId: this.session.getAgentId?.() ?? undefined })
+								.find(record => record.subagentId === uniqueId);
+							if (subagentRecord && manager.registerSubagentRecord) {
+								manager.registerSubagentRecord({ ...subagentRecord, sessionFile: resolvedSubtaskSessionFile });
+							}
 							const result = await this.#executeSync(
 								_toolCallId,
 								singleParams,
@@ -1424,12 +1494,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								[uniqueId],
 								frozenForkSeeds,
 								{
-									sessionFiles: new Map([[uniqueId, subtaskSessionFile]]),
+									sessionFiles: new Map([[uniqueId, resolvedSubtaskSessionFile]]),
 									suppressRoiReconciliation: true,
-									persistence: {
-										effectiveArtifactsDir: batchArtifactsDir,
-										parentArtifactManager: asyncParentArtifactManager,
-									},
+									persistence: currentArtifacts.effectiveArtifactsDir
+										? {
+												effectiveArtifactsDir: currentArtifacts.effectiveArtifactsDir,
+												parentArtifactManager: currentArtifacts.parentArtifactManager,
+											}
+										: { effectiveArtifactsDir: undefined, parentArtifactManager: undefined },
 								},
 							);
 							const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
@@ -1549,18 +1621,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							subagentId: uniqueId,
 							ownerId: this.session.getAgentId?.() ?? undefined,
 							data: {
-								executionTool: this,
-								toolCallId: _toolCallId,
-								params,
-								task: { ...taskItem, id: uniqueId },
-								sessionFile: subtaskSessionFile,
-								durableOutputAllowed: Boolean(batchArtifactsDir),
-								forkContextSeed: frozenForkSeed,
-								agentSource: fallbackAgentSource,
-								repositoryBinding: taskItem.repositoryBinding as RepositoryBinding,
-								duplicateIdentity: admission.identity,
-								duplicatePolicy: taskItem.duplicate_policy ?? "warn",
-								initialDisposition: admission.disposition,
+								...resumeDescriptor,
 							} satisfies TaskResumeDescriptor,
 						},
 						resumeRunner,
@@ -1574,7 +1635,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						currentJobGeneration: manager.getJob(jobId)?.generation,
 						historicalJobIds: [],
 						status: manager.getJob(jobId)?.status ?? "running",
-						sessionFile: subtaskSessionFile,
+						sessionFile: resolvedSubtaskSessionFile,
 						resumable: true,
 						duplicateIdentity: duplicateIdentityKey(admission.identity),
 						duplicateDisposition: admission.disposition?.action,

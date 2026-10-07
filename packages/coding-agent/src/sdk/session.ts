@@ -2852,14 +2852,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		 * root's AGENTS.md and tree, and subagents inherit the same mismatch.
 		 */
 		const applyRescopedReadState = async (to: string): Promise<void> => {
-			contextFiles = [];
-			try {
-				const rediscovered = await loadContextFilesResultInternal({ cwd: to, agentDir, profileAuthority });
-				contextFiles = rediscovered.contextFiles;
-			} catch (error) {
-				logger.warn("Failed to re-discover context files after session rescope", {
-					error: safeErrorForLog(error),
-				});
+			if (options.contextFiles === undefined) {
+				contextFiles = [];
+				try {
+					const rediscovered = await loadContextFilesResultInternal({ cwd: to, agentDir, profileAuthority });
+					contextFiles = rediscovered.contextFiles;
+				} catch (error) {
+					logger.warn("Failed to re-discover context files after session rescope", {
+						error: safeErrorForLog(error),
+					});
+				}
 			}
 			if (options.skills === undefined) {
 				try {
@@ -2901,7 +2903,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					: await settings.snapshotForCwd(sessionManager.getCwd());
 		};
 		const refreshTaskScopeAfterMove = async (): Promise<void> => {
-			await refreshTaskScopeSettings();
+			let settingsRefreshFailure: { error: unknown } | undefined;
+			try {
+				await refreshTaskScopeSettings();
+			} catch (error) {
+				settingsRefreshFailure = { error };
+			}
 			await applyRescopedReadState(sessionManager.getCwd());
 			if (options.promptTemplates === undefined) {
 				toolSession.promptTemplates = [];
@@ -2913,6 +2920,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					});
 				}
 			}
+			if (settingsRefreshFailure) throw settingsRefreshFailure.error;
 		};
 
 		const toolSession: ToolSession & TaskScopeAuthority = {
