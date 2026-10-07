@@ -6489,7 +6489,8 @@ export class AuthStorage {
 		void (async () => {
 			try {
 				const value = await this.#configValueResolver(key, String(configurationGeneration));
-				resolve(publish(value) ? value : undefined);
+				publish(value);
+				resolve(value);
 			} catch (error) {
 				if (publish(undefined)) reject(error);
 				else resolve(undefined);
