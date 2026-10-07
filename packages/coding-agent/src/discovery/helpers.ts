@@ -500,6 +500,8 @@ export const SKILL_FRONTMATTER_SCAN_TOTAL_BYTES = 64 * 1024;
 
 export const SkillDiscoveryTestHooks: {
 	afterCandidateValidated?: (candidatePath: string) => void | Promise<void>;
+	afterSkillLinksCaptured?: (candidatePath: string) => void | Promise<void>;
+	afterSkillPathResolved?: (candidatePath: string) => void | Promise<void>;
 	afterAuthorityRootValidated?: (root: string) => void | Promise<void>;
 	afterAuthorityRootMissing?: (root: string) => void | Promise<void>;
 	afterContainedRootValidated?: (root: string) => void | Promise<void>;
@@ -746,7 +748,6 @@ export async function scanSkillsFromDir(
 		const relative = path.relative(realRoot, candidate);
 		return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 	};
-	const allowOutsideRoot = options.allowExternalUserSkillSymlinks === true && level === "user";
 	const skillPathAndLinksAreCurrent = async (
 		skillPath: string,
 		expectedFile: SkillFileIdentity | undefined,
@@ -885,7 +886,9 @@ export async function scanSkillsFromDir(
 					captureSkillLinkIdentity(candidatePath),
 				])
 			).filter((identity): identity is SkillLinkIdentity => identity !== null);
+			await SkillDiscoveryTestHooks.afterSkillLinksCaptured?.(candidatePath);
 			const skillPath = await fs.promises.realpath(candidatePath);
+			await SkillDiscoveryTestHooks.afterSkillPathResolved?.(candidatePath);
 			const allowOutsideRoot = options.allowExternalUserSkillSymlinks && level === "user";
 			if (!isWithinRoot(skillPath) && !allowOutsideRoot) {
 				const remedy =
@@ -903,6 +906,22 @@ export async function scanSkillsFromDir(
 				return;
 			}
 			const pinExternalTarget = !isWithinRoot(skillPath) && allowOutsideRoot;
+			const fileLink = linkIdentities.find(identity => identity.path === candidatePath);
+			const parentLink = linkIdentities.find(identity => identity.path === path.dirname(candidatePath));
+			const capturedLinkTargetPath =
+				fileLink?.target.kind === "file"
+					? fileLink.target.realPath
+					: parentLink?.target.kind === "directory"
+						? path.join(parentLink.target.realPath, path.basename(candidatePath))
+						: undefined;
+			if (
+				pinExternalTarget &&
+				(!capturedLinkTargetPath ||
+					normalizePathForComparison(skillPath) !== normalizePathForComparison(capturedLinkTargetPath))
+			) {
+				warnings.push(`Refusing skill path not bound to its captured external link target: ${candidatePath}`);
+				return;
+			}
 			const fileIdentity = pinExternalTarget ? { dev: stat.dev, ino: stat.ino, realPath: skillPath } : undefined;
 			const pinnedLinkIdentities = pinExternalTarget ? linkIdentities : [];
 			await SkillDiscoveryTestHooks.afterCandidateValidated?.(candidatePath);
