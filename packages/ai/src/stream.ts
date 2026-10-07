@@ -8,6 +8,7 @@ import {
 	getTrustedHomeDir,
 } from "@gajae-code/utils";
 import {
+	attachProviderSafetyStopModelIdentity,
 	copyProviderSafetyStopAdapterInvocation,
 	isProviderSafetyStopModelTrusted,
 	withProviderSafetyStopAdapterInvocation,
@@ -424,10 +425,18 @@ export function stream<TApi extends Api>(
 			onStreamCreated,
 		);
 	} else if (model.api === "kiro-codewhisperer-stream") {
+		const kiroOptions = (options || {}) as KiroCodeWhispererOptions;
+		const identitySnapshot = isProviderSafetyStopModelTrusted(model);
+		let adapterKiroOptions = identitySnapshot ? withProviderSafetyStopAdapterInvocation(kiroOptions) : kiroOptions;
+		// Attach validated model identity snapshot to prevent TOCTOU attacks on getters
+		if (identitySnapshot) {
+			const wireModelId = (model as { wireModelId?: string }).wireModelId;
+			adapterKiroOptions = attachProviderSafetyStopModelIdentity(adapterKiroOptions, identitySnapshot, wireModelId);
+		}
 		return streamKiroCodeWhisperer(
 			model as Model<"kiro-codewhisperer-stream">,
 			context,
-			(options || {}) as KiroCodeWhispererOptions,
+			adapterKiroOptions,
 			onStreamCreated,
 		);
 	} else if (model.api === "devin-acp") {
