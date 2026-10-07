@@ -35,6 +35,7 @@ import {
 	validateSettingPatch,
 } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
+import { tagSdkLifecycleObserver } from "../../extensibility/extensions/function-hooks-internal";
 import type { AgentEndEvent } from "../../extensibility/shared-events";
 import { normalizeGoal } from "../../goals/state";
 import { toAgentWireEventPayload } from "../../modes/shared/agent-wire/event-envelope";
@@ -6051,40 +6052,44 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			resolveTerminalPublicationWaiters(observed, terminalPublicationByCorrelation);
 		}
 	};
-	api.on("agent_start", (event, ctx) => {
-		const owner = lifecycleStateForEvent(ctx, "agent_start", event.sdkRunToken);
-		// The activity checkpoint is already fire-and-forget and does not depend on
-		// the handler awaiting trackLifecycle, so it composes with #5683 unchanged.
-		void (owner?.runtime ?? lifecycleStateForContext(ctx, "agent_start")?.runtime)
-			?.reportActivity("active")
-			.catch(error => logger.warn(`sdk: active activity checkpoint failed: ${String(error)}`));
-		// Interactive/skill turns must not wait on durable start persist. Keep
-		// trackLifecycle so drain, persist-then-publish, content-hold release, and
-		// shutdown still run; do not return that promise to the extension runner
-		// (EXTENSION_HANDLER_TIMEOUT_MS would otherwise stall the prompt).
-		void trackLifecycle(
-			async () =>
-				emitLifecycle(
-					"agent_start",
-					ctx,
-					undefined,
-					undefined,
-					owner ? { state: owner, sessionId: owner.sessionId } : undefined,
-					undefined,
-					false,
-					undefined,
-					undefined,
-					typeof event.sdkRunToken === "string" ? event.sdkRunToken : undefined,
-					event.sdkRunTokens,
-					event.lifecycleScope,
-				),
-			owner,
-		).catch(error => {
-			logger.error("SDK agent_start lifecycle task failed", {
-				error: sanitizePromptFailure(error),
+	api.on(
+		"agent_start",
+		tagSdkLifecycleObserver((event, ctx) => {
+			const owner = lifecycleStateForEvent(ctx, "agent_start", event.sdkRunToken);
+			// The activity checkpoint is already fire-and-forget and does not depend on
+			// the handler awaiting trackLifecycle, so it composes with #5683 unchanged.
+			void (owner?.runtime ?? lifecycleStateForContext(ctx, "agent_start")?.runtime)
+				?.reportActivity("active")
+				.catch(error => logger.warn(`sdk: active activity checkpoint failed: ${String(error)}`));
+			// Interactive/skill turns must not wait on durable start persist. Keep
+			// trackLifecycle so drain, persist-then-publish, content-hold release, and
+			// shutdown still run; do not return that promise to the extension runner
+			// (EXTENSION_HANDLER_TIMEOUT_MS would otherwise stall the prompt).
+			void trackLifecycle(
+				async () =>
+					emitLifecycle(
+						"agent_start",
+						ctx,
+						undefined,
+						undefined,
+						owner ? { state: owner, sessionId: owner.sessionId } : undefined,
+						undefined,
+						false,
+						undefined,
+						undefined,
+						typeof event.sdkRunToken === "string" ? event.sdkRunToken : undefined,
+						event.sdkRunTokens,
+						event.lifecycleScope,
+					),
+				owner,
+			).catch(error => {
+				logger.error("SDK agent_start lifecycle task failed", {
+					error: sanitizePromptFailure(error),
+				});
 			});
-		});
-	});
+		}),
+	);
+
 	api.on("agent_end", (event, ctx) => {
 		const tokenBinding =
 			typeof event.sdkRunToken === "string" ? lifecycleRunOwners.get(event.sdkRunToken) : undefined;
