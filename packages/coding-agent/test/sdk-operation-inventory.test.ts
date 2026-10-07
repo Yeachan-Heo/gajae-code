@@ -150,15 +150,15 @@ describe("SDK operation inventory", () => {
 			],
 			[
 				"agent_session:getUserModelSelectionRevision",
-				"internal revision fence for deferred model-profile recovery after a concrete user selection; not a public SDK operation",
+				"internal session-scoped model selection revision tracking behind the reviewed model.set seam, not an independent public SDK operation",
 			],
 			[
 				"agent_session:getUserCanonicalVariantSelection",
-				"internal revision and sticky canonical-variant state used by deferred profile recovery; not a public SDK operation",
+				"internal session-scoped model variant selection state behind the reviewed model.set seam, not an independent public SDK operation",
 			],
 			[
 				"agent_session:markUserModelSelection",
-				"internal mutation that invalidates deferred model-profile recovery after a concrete user selection; not a public SDK operation",
+				"internal session-scoped model selection revision marker behind the reviewed model.set seam, not an independent public SDK operation",
 			],
 		]);
 		for (const [sourceId, rationale] of expected) {
