@@ -20983,7 +20983,16 @@ export class AgentSession {
 		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
 		const errorIsFromBeforeCompaction =
 			compactionEntry !== null && assistantMessage.timestamp < new Date(compactionEntry.timestamp).getTime();
+		// A successful empty stop is not provider overflow evidence. The legacy
+		// near-zero usage heuristic must not replay a billed, successful request.
+		const successfulEmptyStop =
+			assistantMessage.stopReason === "stop" &&
+			assistantMessage.content.length === 0 &&
+			assistantMessage.usage.totalTokens > 0 &&
+			assistantMessage.usage.input + assistantMessage.usage.cacheRead + assistantMessage.usage.cacheWrite <=
+				contextWindow;
 		if (
+			!successfulEmptyStop &&
 			sameModel &&
 			!errorIsFromBeforeCompaction &&
 			classifyContextOverflow(assistantMessage, assistantMessage.transportFailure, contextWindow)
@@ -23677,6 +23686,7 @@ export class AgentSession {
 
 	#managedFallbackPromptOptions(): {
 		fallbackManaged?: boolean;
+		contextOverflowManaged?: boolean;
 		nextFallbackAttempt?: (model: Model) => FallbackAttemptToken;
 		onManagedAttemptAccepted?: () => void;
 		onManagedAttemptOutcome?: (
@@ -23684,9 +23694,10 @@ export class AgentSession {
 		) => ManagedAttemptDecision | Promise<ManagedAttemptDecision>;
 	} {
 		const controller = this.#defaultFallbackChain();
-		if (controller.chain.entries.length < 2) return {};
+		if (controller.chain.entries.length < 2) return { contextOverflowManaged: true };
 		return {
 			fallbackManaged: true,
+			contextOverflowManaged: true,
 			nextFallbackAttempt: model => {
 				controller.onAttemptStarted();
 				this.#managedFallbackProviderAttemptCount++;
