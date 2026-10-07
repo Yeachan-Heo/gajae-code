@@ -4273,14 +4273,14 @@ export class Broker {
 		if (publication) await this.#writeHeartbeat(publication);
 	}
 	/** Re-observes provably live session hosts and checkpoints their liveness. */
-	async heartbeatSessions(now = Date.now()): Promise<number> {
-		return await this.index.checkpointLiveHeartbeats(now);
+	async heartbeatSessions(now = Date.now(), abortSignal?: AbortSignal): Promise<number> {
+		return await this.index.checkpointLiveHeartbeats(now, abortSignal);
 	}
 	async #checkpointSessionHeartbeats(): Promise<void> {
 		if (this.#checkpointInFlight || this.#stopping) return;
 		this.#checkpointInFlight = true;
 		try {
-			await this.heartbeatSessions();
+			await this.heartbeatSessions(Date.now(), this.#startupAbortSignal);
 		} catch (error) {
 			if (
 				error instanceof FileLockAcquireError &&
