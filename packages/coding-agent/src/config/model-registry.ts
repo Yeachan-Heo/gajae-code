@@ -3723,10 +3723,9 @@ export class ModelRegistry {
 					? resolveApiKeyConfig(providerConfig.apiKey)
 					: resolveApiKeyEnvConfig(providerConfig.apiKeyEnv);
 			const localOpenAICompat = providerConfig.openaiCompat;
-			const rotatingApiKeyEnv =
-				credentialPinActive || providerConfig.apiKey
-					? undefined
-					: (providerConfig.apiKeyEnv ?? (localOpenAICompat?.apiKey ? undefined : localOpenAICompat?.apiKeyEnv));
+			const rotatingApiKeyEnv = providerConfig.apiKey
+				? undefined
+				: (providerConfig.apiKeyEnv ?? (localOpenAICompat?.apiKey ? undefined : localOpenAICompat?.apiKeyEnv));
 			if (rotatingApiKeyEnv) this.#customProviderApiKeyEnvNames.set(providerName, rotatingApiKeyEnv);
 			if (providerConfig.authHeader !== undefined)
 				this.#customProviderAuthHeaders.set(providerName, providerConfig.authHeader);

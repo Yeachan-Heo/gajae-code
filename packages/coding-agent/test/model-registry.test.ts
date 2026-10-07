@@ -10186,6 +10186,18 @@ describe("ModelRegistry config reload", () => {
 			expect(candidate.valid).toBe(true);
 			candidate.commit();
 			candidate.finalize();
+			await Bun.write(
+				modelsPathForTest,
+				JSON.stringify({
+					providers: {
+						[provider]: {
+							...initialConfig.providers[provider],
+							apiKeyEnv,
+						},
+					},
+				}),
+			);
+			await pinnedRegistry.refreshStatic();
 			expect(authStorage.hasConfigApiKey(provider, pinnedRegistry.getAuthStorageOwner())).toBe(false);
 			Bun.env[apiKeyEnv] = "late-conflicting-config-key";
 			const controller = new AbortController();
@@ -10197,6 +10209,9 @@ describe("ModelRegistry config reload", () => {
 			await expect(
 				authStorage.peekApiKey(provider, { sessionId, owner: pinnedRegistry.getAuthStorageOwner() }),
 			).resolves.toBe("unresolved-pin-oauth-access");
+			authStorage.releaseCredentialScope(sessionId);
+			await expect(pinnedRegistry.getApiKeyForProvider(provider)).resolves.toBe("late-conflicting-config-key");
+			expect(authStorage.hasConfigApiKey(provider, pinnedRegistry.getAuthStorageOwner())).toBe(true);
 		} finally {
 			candidate?.rollback();
 			authStorage.releaseCredentialScope(sessionId);
