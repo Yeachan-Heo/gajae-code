@@ -157,6 +157,43 @@ describe("empty lock directory (issue #6008, claim-based ownership)", () => {
 		expect(await fs.readdir(lockDir)).toEqual(["unrelated"]);
 	});
 
+	test("removes a partial owner record after a claim write fails", async () => {
+		const filePath = path.join(await makeTemp(), "index.jsonl");
+		const lockDir = `${filePath}.lock`;
+		const infoPath = path.join(lockDir, "info");
+		await fs.mkdir(lockDir);
+		const pastTime = new Date(Date.now() - 15_000);
+		await fs.utimes(lockDir, pastTime, pastTime);
+
+		const realOpen = fs.open;
+		let injected = false;
+		vi.spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
+			const handle = await realOpen(target, flags, mode);
+			if (String(target) !== infoPath || flags !== "wx") return handle;
+			vi.spyOn(handle, "writeFile").mockImplementation(async () => {
+				injected = true;
+				await handle.write("{");
+				throw Object.assign(new Error("simulated partial owner write"), { code: "EIO" });
+			});
+			return handle;
+		});
+
+		let callbackEntered = false;
+		await expect(
+			withFileLock(
+				filePath,
+				async () => {
+					callbackEntered = true;
+				},
+				{ retries: 2, retryDelayMs: 1, staleMs: 10_000 },
+			),
+		).rejects.toMatchObject({ code: "acquire_timeout" });
+
+		expect(injected).toBe(true);
+		expect(callbackEntered).toBe(false);
+		expect(await fs.readdir(lockDir)).toEqual([]);
+	});
+
 	test("a claim on the final attempt is adopted, not leaked as a live-pid lock", async () => {
 		const filePath = path.join(await makeTemp(), "index.jsonl");
 		const lockDir = `${filePath}.lock`;
