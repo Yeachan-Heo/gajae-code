@@ -1712,6 +1712,9 @@ export async function applyPreparedModelProfileActivation(
 	let activatedAgentModelOverridesOverride: unknown;
 
 	try {
+		// Set the fallback chain before yielding to setModelTemporary, so a user
+		// selection during async mutation uses the fallback chain as-is rather than
+		// having the profile's chain written over a concurrent user choice.
 		const ownedDefaultChain =
 			prepared.defaultChain.length > 0
 				? prepared.defaultChain
@@ -1748,7 +1751,16 @@ export async function applyPreparedModelProfileActivation(
 					},
 				},
 			);
-			if (options.isCurrent && !modelMutationStarted) return;
+			if (options.isCurrent && !modelMutationStarted) {
+				// Restore canonical variant before returning due to canceled prepare
+				restoreCanonicalVariantAfterPreparation(
+					prepared.modelRegistry,
+					prepared.session,
+					prepared.previousCanonicalVariant,
+					prepared.previousUserCanonicalVariantSelection,
+				);
+				return;
+			}
 			if (options.isCurrent && !options.isCurrent()) throw new ModelProfileActivationSupersededError();
 		}
 		// Always reinstall the model role layer from the durable base plus the
