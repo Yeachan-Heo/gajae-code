@@ -1712,22 +1712,6 @@ export async function applyPreparedModelProfileActivation(
 	let activatedAgentModelOverridesOverride: unknown;
 
 	try {
-		if (prepared.defaultModel) {
-			activationStage = "model selection";
-			await prepared.session.setModelTemporary(
-				prepared.defaultModel,
-				options.thinkingLevelOverride ?? prepared.defaultThinkingLevel,
-				{
-					cause: "profile-activation",
-					shouldMutate: options.isCurrent,
-					onMutationStarted: () => {
-						modelMutationStarted = true;
-					},
-				},
-			);
-			if (options.isCurrent && !modelMutationStarted) return;
-			if (options.isCurrent && !options.isCurrent()) throw new ModelProfileActivationSupersededError();
-		}
 		const ownedDefaultChain =
 			prepared.defaultChain.length > 0
 				? prepared.defaultChain
@@ -1750,6 +1734,22 @@ export async function applyPreparedModelProfileActivation(
 			}
 			activatedDefaultChainState = prepared.session.getConfiguredModelChainState?.("default");
 			activatedFallbackRuntimeState = prepared.session.getDefaultFallbackRuntimeState?.();
+		}
+		if (prepared.defaultModel) {
+			activationStage = "model selection";
+			await prepared.session.setModelTemporary(
+				prepared.defaultModel,
+				options.thinkingLevelOverride ?? prepared.defaultThinkingLevel,
+				{
+					cause: "profile-activation",
+					shouldMutate: options.isCurrent,
+					onMutationStarted: () => {
+						modelMutationStarted = true;
+					},
+				},
+			);
+			if (options.isCurrent && !modelMutationStarted) return;
+			if (options.isCurrent && !options.isCurrent()) throw new ModelProfileActivationSupersededError();
 		}
 		// Always reinstall the model role layer from the durable base plus the
 		// new profile's roles so omitted roles from the previous profile are dropped.

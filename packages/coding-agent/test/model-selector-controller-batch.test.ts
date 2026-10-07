@@ -529,7 +529,12 @@ describe("SelectorController model batch assignments", () => {
 		expect(setModelTemporary).toHaveBeenCalledTimes(2);
 	});
 	test("role assignment replaces active profile override immediately and persists the explicit selection", async () => {
-		const { ctx, settings } = createControllerContext();
+		const { ctx, settings, session } = createControllerContext();
+		let marksAtCredentialProbe = 0;
+		session.modelRegistry.getApiKey.mockImplementation(async () => {
+			marksAtCredentialProbe = session.markUserModelSelection.mock.calls.length;
+			return "key";
+		});
 		settings.override("task.agentModelOverrides", {
 			executor: "provider-a/profile-executor:medium",
 			architect: "provider-a/profile-architect:low",
@@ -543,6 +548,8 @@ describe("SelectorController model batch assignments", () => {
 			selector: "provider-a/selected:high",
 		});
 
+		expect(session.markUserModelSelection).toHaveBeenCalledTimes(1);
+		expect(marksAtCredentialProbe).toBe(1);
 		expect(settings.get("task.agentModelOverrides")).toEqual({
 			executor: "provider-a/profile-executor:medium",
 			architect: "provider-a/selected:high",

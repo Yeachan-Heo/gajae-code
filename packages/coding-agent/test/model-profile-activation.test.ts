@@ -258,6 +258,39 @@ describe("model profile activation", () => {
 		expect(session.setModelTemporaryCalls).toEqual([]);
 	});
 
+	test("preserves a newer fallback chain selected during profile model activation", async () => {
+		const session = fakeSession();
+		const registry = fakeRegistry();
+		const modelMutationStarted = Promise.withResolvers<void>();
+		const allowModelMutation = Promise.withResolvers<void>();
+		session.setModelTemporary = async (next, thinkingLevel, options) => {
+			modelMutationStarted.resolve();
+			await allowModelMutation.promise;
+			options?.onMutationStarted?.();
+			session.setModelTemporaryCalls.push({ model: next, thinkingLevel });
+			session.model = next;
+			session.thinkingLevel = thinkingLevel;
+		};
+		const activation = activateModelProfile({
+			session,
+			modelRegistry: registry as never,
+			settings: Settings.isolated(),
+			profileName: "profile-a",
+		});
+
+		await modelMutationStarted.promise;
+		session.setConfiguredModelChain("default", ["provider-c/default"], "model-selection", "user-selection", true);
+		allowModelMutation.resolve();
+		await activation;
+
+		expect(session.getConfiguredModelChain("default")).toEqual(["provider-c/default"]);
+		expect(session.getConfiguredModelChainState("default")).toMatchObject({
+			origin: "model-selection",
+			identity: "user-selection",
+			explicitHead: true,
+		});
+	});
+
 	test("cancels recovered runtime bindings when selection changes during preparation", async () => {
 		const session = fakeSession();
 		const registry = fakeRegistry();

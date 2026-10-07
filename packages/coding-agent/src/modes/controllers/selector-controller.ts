@@ -2777,6 +2777,12 @@ export class SelectorController {
 							return;
 						}
 						const { model, role, thinkingLevel, selector: selectedSelector } = selection;
+						if (
+							(role !== null && role !== "default") ||
+							selection.roles?.some(targetRole => targetRole !== "default")
+						) {
+							this.ctx.session.markUserModelSelection();
+						}
 						if (role === null) {
 							// Temporary: update agent state but don't persist to settings
 							this.ctx.session.markUserModelSelection();
