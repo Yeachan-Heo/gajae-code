@@ -57,7 +57,7 @@ function successfulReport(): ScenarioReport {
 }
 
 function request(model: string, route = "/v1/chat/completions"): Request {
-	return new Request(`http://127.0.0.1:30200${route}`, { method: "POST", body: JSON.stringify({ model }) });
+	return new Request(`http://127.0.0.1:52440${route}`, { method: "POST", body: JSON.stringify({ model }) });
 }
 
 async function chunks(response: Response): Promise<Array<Record<string, unknown>>> {
@@ -94,10 +94,10 @@ describe("managed empty-stop harness local contracts (no connected scenarios)", 
 		expect(stderr).toContain("Unknown scenario");
 	}, 15_000);
 
-	test.each(["0", "30200", "30219"])("accepts isolated port %s", value => {
+	test.each(["0", "52440", "52459"])("accepts isolated port %s", value => {
 		expect(parseHarnessPort(value)).toBe(Number(value));
 	});
-	test.each(["", " ", "30199", "30220", "8000", "30200.5", "invalid"])("rejects port %s", value => {
+	test.each(["", " ", "52439", "52460", "8000", "52440.5", "invalid"])("rejects port %s", value => {
 		expect(() => parseHarnessPort(value)).toThrow("PORT_BASE");
 	});
 
