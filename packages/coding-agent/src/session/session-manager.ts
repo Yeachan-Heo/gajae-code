@@ -12706,8 +12706,13 @@ export class SessionManager {
 			try {
 				await writer.close();
 			} catch (error) {
-				if (writer.getCloseState() === "close_failed_retryable" && !this.#closeRetryOriginError)
-					this.#closeRetryOriginError = writer.getCloseError() ?? toError(error);
+				if (writer.getCloseState() === "close_failed_retryable" && !this.#closeRetryOriginError) {
+					const closeError = writer.getCloseError() ?? toError(error);
+					this.#closeRetryOriginError = closeError;
+					// Record the error immediately so the identity check in close() will pass
+					// when the retry succeeds, even if toError() is called again later.
+					if (!this.#persistError) this.#persistError = closeError;
+				}
 				throw error;
 			}
 			this.#persistWriter = undefined;
