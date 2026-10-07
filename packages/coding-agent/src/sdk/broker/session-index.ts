@@ -2342,7 +2342,7 @@ export class SessionIndex {
 	 * while the broker was down keep their stale or missing heartbeat and read as
 	 * unknown/not-live (never fresh forever). Returns the number of checkpoints written.
 	 */
-	async checkpointLiveHeartbeats(now = Date.now()): Promise<number> {
+	async checkpointLiveHeartbeats(now = Date.now(), abortSignal?: AbortSignal): Promise<number> {
 		// A stale observation batch fails closed (no heartbeat), but on a busy
 		// machine a single contended lock acquisition is enough to discard the
 		// whole cycle. With the broker's 5s cadence repeatedly losing that race,
@@ -2351,7 +2351,10 @@ export class SessionIndex {
 		// Re-probe from scratch a bounded number of times inside this pass: each
 		// attempt keeps the exact fail-closed contract (fresh probes, freshness
 		// bounds re-checked under the lock); only the starvation is removed.
+		// Startup caller must not exceed its deadline across all retries; once
+		// the startup fence is exhausted, stop retrying and fail closed.
 		for (let attempt = 0; ; attempt++) {
+			if (abortSignal?.aborted) return 0;
 			const result = await this.#checkpointLiveHeartbeatsOnce(now);
 			if (result !== STALE_OBSERVATION || attempt + 1 >= SESSION_HEARTBEAT_CHECKPOINT_ATTEMPTS)
 				return result === STALE_OBSERVATION ? 0 : result;
