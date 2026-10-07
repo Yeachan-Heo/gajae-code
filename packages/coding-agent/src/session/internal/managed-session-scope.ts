@@ -3628,14 +3628,35 @@ export function managedGcProtocolScopeInspectorForScope(scope: ManagedScope): Ma
 				agentDir: scope.agentDir,
 				sessionsRoot: scope.sessionsRoot,
 			});
-			if (resolved.kind !== "resolved" || resolved.scope.directoryPath !== input.scopePath)
+			let candidateScope: ManagedScope;
+			let candidateTrusted: ManagedGcTrustedScope | undefined;
+			if (resolved.kind === "error" && resolved.code === "cwd_missing") {
+				candidateScope = {
+					apiVersion: 1,
+					layoutVersion: MANAGED_SESSION_LAYOUT_VERSION,
+					identityVersion: MANAGED_SESSION_IDENTITY_VERSION,
+					agentDir: scope.agentDir,
+					sessionsRoot: scope.sessionsRoot,
+					canonicalCwd: bindingValue.canonicalPath,
+					legacyLexicalCwd: bindingValue.canonicalPath,
+					directoryName: path.basename(input.scopePath),
+					directoryPath: input.scopePath,
+					platform: bindingValue.platform,
+				};
+				if (hasManagedGcRetirementJournalWithoutWorkspace(candidateScope))
+					throw new Error("managed_gc_protocol_scope_unrecognized");
+			} else if (resolved.kind === "resolved" && resolved.scope.directoryPath === input.scopePath) {
+				candidateScope = resolved.scope;
+				candidateTrusted = managedGcTrustedScope(candidateScope);
+			} else {
 				throw new Error("managed_gc_protocol_scope_unrecognized");
-			const candidateScope = resolved.scope;
-			const candidateTrusted = managedGcTrustedScope(candidateScope);
+			}
 			if (
-				candidateTrusted.root.canonicalPath !== trusted.root.canonicalPath ||
-				candidateTrusted.root.dev !== trusted.root.dev ||
-				candidateTrusted.root.ino !== trusted.root.ino ||
+				configuredRootPath(candidateScope) !== trusted.root.canonicalPath ||
+				(candidateTrusted &&
+					(candidateTrusted.root.canonicalPath !== trusted.root.canonicalPath ||
+						candidateTrusted.root.dev !== trusted.root.dev ||
+						candidateTrusted.root.ino !== trusted.root.ino)) ||
 				candidateScope.agentDir !== scope.agentDir ||
 				candidateScope.sessionsRoot !== scope.sessionsRoot
 			)
@@ -3643,7 +3664,21 @@ export function managedGcProtocolScopeInspectorForScope(scope: ManagedScope): Ma
 			const scopeIdentity = managedGcProtocolPathIdentity(candidateScope.directoryPath);
 			if (scopeIdentity.dev !== input.scopeIdentity.dev || scopeIdentity.ino !== input.scopeIdentity.ino)
 				throw new Error("managed_gc_protocol_scope_identity_mismatch");
-			const store = managedGcScopeReader(candidateScope, candidateTrusted);
+			const store = candidateTrusted
+				? managedGcScopeReader(candidateScope, candidateTrusted)
+				: new ManagedSessionDescendantStore(
+						trusted.root,
+						candidateScope.directoryPath,
+						undefined,
+						trusted.policy,
+						candidateScope.agentDir,
+						{
+							canonicalPath: candidateScope.directoryPath,
+							dev: BigInt(scopeIdentity.dev),
+							ino: BigInt(scopeIdentity.ino),
+						},
+						"read-only",
+					);
 			try {
 				store.verifyRootSecurity();
 				const checkedBinding = managedGcProtocolFileSnapshot(candidateScope, store, MANAGED_SESSION_BINDING_FILE);

@@ -5778,23 +5778,60 @@ test("broker preserves a code-less lifecycle startup failure message", async () 
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-startup-message-"));
 	const agentDir = path.join(root, "agent");
 	const fixture = path.join(root, "startup-failure.ts");
-	const previousCommand = process.env.GJC_SDK_SESSION_COMMAND;
+	const requestPath = path.join(root, "child-request.json");
+	const pidPath = path.join(root, "child.pid");
+	const exitPath = path.join(root, "child-exit");
+	const deadlines = deriveLifecycleDeadlines(1_000, 4_000);
+	let nowMs = deadlines.receivedAt;
+	let publishedAt: number | undefined;
 	const broker = new Broker({ agentDir });
 	try {
 		await fs.writeFile(
 			fixture,
-			`import { writeSessionLifecycleFailure } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/sdk/broker/lifecycle.ts"))};
-const request = JSON.parse(process.env.GJC_SDK_LIFECYCLE_REQUEST!);
-await writeSessionLifecycleFailure(
-	request.stateRoot,
-	request.sessionId,
-	request.effectMarker,
-	{ phase: "startup", reason: "failed", message: "owned synthetic startup failure" },
-	{ endpointGeneration: null, fenced: true, runtimeRemoved: true, hostStopped: true, brokerRegistrationReleased: true },
-);
+			`await Bun.write(${JSON.stringify(requestPath)}, process.env.GJC_SDK_LIFECYCLE_REQUEST!);
+await Bun.write(${JSON.stringify(pidPath)}, String(process.pid));
+const deadline = Date.now() + 15_000;
+while (!(await Bun.file(${JSON.stringify(exitPath)}).exists()) && Date.now() < deadline) await Bun.sleep(1);
 `,
 		);
-		process.env.GJC_SDK_SESSION_COMMAND = `${process.execPath} ${fixture}`;
+		setLifecycleCommandResolverForTest(broker, () => ({ file: process.execPath, args: ["run", fixture] }));
+		setLifecycleTimingForTest(broker, {
+			now: () => nowMs,
+			sleep: async ms => {
+				if (!(await Bun.file(pidPath).exists())) {
+					await Bun.sleep(1);
+					return;
+				}
+				nowMs += ms;
+				if (publishedAt === undefined) {
+					const request = (await Bun.file(requestPath).json()) as SessionLifecycleLaunchRequest;
+					if (!request.stateRoot || !request.sessionId || !request.effectMarker)
+						throw new Error("Expected the real startup fixture locator and effect marker.");
+					const pid = Number(await Bun.file(pidPath).text());
+					const incarnation = processIncarnation(pid);
+					if (!incarnation) throw new Error("Expected the real startup fixture child incarnation.");
+					await writeSessionLifecycleFailure(
+						request.stateRoot,
+						request.sessionId,
+						request.effectMarker,
+						{ phase: "startup", reason: "failed", message: "owned synthetic startup failure" },
+						{
+							endpointGeneration: null,
+							fenced: true,
+							runtimeRemoved: true,
+							hostStopped: true,
+							brokerRegistrationReleased: true,
+						},
+						undefined,
+						incarnation,
+						pid,
+					);
+					publishedAt = nowMs;
+					await Bun.write(exitPath, "exit\n");
+				}
+				await Bun.sleep(1);
+			},
+		});
 		await broker.start();
 		const response = await broker.handleRequest(
 			"session.create",
@@ -5804,10 +5841,17 @@ await writeSessionLifecycleFailure(
 		expect(response).toMatchObject({
 			ok: false,
 			error: { code: "spawn_failed", message: "owned synthetic startup failure" },
+			startupFailure: {
+				message: "owned synthetic startup failure",
+				cleanupProof: { processExited: true, endpointRemoved: true, hostUnregistered: { state: "not_registered" } },
+			},
 		});
+		expect(publishedAt).toBeDefined();
+		expect(publishedAt!).toBeLessThan(deadlines.semanticReadyDeadlineAt);
+		expect(nowMs).toBeLessThan(deadlines.lifecycleCleanupDeadlineAt);
 	} finally {
-		if (previousCommand === undefined) delete process.env.GJC_SDK_SESSION_COMMAND;
-		else process.env.GJC_SDK_SESSION_COMMAND = previousCommand;
+		setLifecycleTimingForTest(broker, undefined);
+		setLifecycleCommandResolverForTest(broker, undefined);
 		await broker.stop();
 		await fs.rm(root, { recursive: true, force: true });
 	}
