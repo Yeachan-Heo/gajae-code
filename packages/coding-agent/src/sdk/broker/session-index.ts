@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
-import { withFileLock } from "../../config/file-lock";
+import { type FileLockOptions, withFileLock } from "../../config/file-lock";
 import { repo } from "../../utils/git";
 import { endpointIncarnation } from "./endpoint-authority";
 import { processIncarnation } from "./process-incarnation";
@@ -804,6 +804,9 @@ const SESSION_INDEX_REPLAY_FRESHNESS_MS = 2_000;
  * heartbeat for long enough that live hosts project as dead.
  */
 const SESSION_HEARTBEAT_CHECKPOINT_ATTEMPTS = 4;
+// Leave publication headroom inside the CLI's 20s bootstrap fence. All retries,
+// including local queueing, share this monotonic budget rather than four minutes.
+const SESSION_HEARTBEAT_CHECKPOINT_BUDGET_MS = 15_000;
 const STALE_OBSERVATION: unique symbol = Symbol("stale-heartbeat-observation");
 /** Maximum distinct live identity probes admitted by one public status query. */
 const SESSION_GENERATION_PROBE_LIMIT = 32;
@@ -815,7 +818,12 @@ const SESSION_GENERATION_PROBE_LIMIT = 32;
  * observation window and (b) the lock budget cannot silently drift per call
  * site.
  */
-function withSessionIndexLock<T>(operation: string, agentDir: string, callback: () => Promise<T>): Promise<T> {
+function withSessionIndexLock<T>(
+	operation: string,
+	agentDir: string,
+	callback: () => Promise<T>,
+	options: FileLockOptions = SESSION_INDEX_LOCK_OPTIONS,
+): Promise<T> {
 	return withFileLock(
 		logFor(agentDir),
 		async () => {
@@ -834,7 +842,7 @@ function withSessionIndexLock<T>(operation: string, agentDir: string, callback: 
 				clearTimeout(note);
 			}
 		},
-		SESSION_INDEX_LOCK_OPTIONS,
+		options,
 	);
 }
 function isValidSnapshot(snapshot: unknown): snapshot is { indexSeq: number; events: SessionIndexEvent[] } {
@@ -2342,7 +2350,11 @@ export class SessionIndex {
 	 * while the broker was down keep their stale or missing heartbeat and read as
 	 * unknown/not-live (never fresh forever). Returns the number of checkpoints written.
 	 */
-	async checkpointLiveHeartbeats(now = Date.now(), abortSignal?: AbortSignal): Promise<number> {
+	async checkpointLiveHeartbeats(
+		now = Date.now(),
+		abortSignal?: AbortSignal,
+		deadline = performance.now() + SESSION_HEARTBEAT_CHECKPOINT_BUDGET_MS,
+	): Promise<number> {
 		// A stale observation batch fails closed (no heartbeat), but on a busy
 		// machine a single contended lock acquisition is enough to discard the
 		// whole cycle. With the broker's 5s cadence repeatedly losing that race,
@@ -2351,20 +2363,45 @@ export class SessionIndex {
 		// Re-probe from scratch a bounded number of times inside this pass: each
 		// attempt keeps the exact fail-closed contract (fresh probes, freshness
 		// bounds re-checked under the lock); only the starvation is removed.
-		// Startup caller must not exceed its deadline across all retries; once
-		// the startup fence is exhausted, stop retrying and fail closed.
-		for (let attempt = 0; ; attempt++) {
-			if (abortSignal?.aborted) return 0;
-			const result = await this.#checkpointLiveHeartbeatsOnce(now);
-			if (result !== STALE_OBSERVATION || attempt + 1 >= SESSION_HEARTBEAT_CHECKPOINT_ATTEMPTS)
-				return result === STALE_OBSERVATION ? 0 : result;
-			now = Date.now();
+		deadline = Math.min(deadline, performance.now() + SESSION_HEARTBEAT_CHECKPOINT_BUDGET_MS);
+		if (abortSignal?.aborted || performance.now() >= deadline) return 0;
+		const budget = new AbortController();
+		const signal = abortSignal ? AbortSignal.any([abortSignal, budget.signal]) : budget.signal;
+		const cancelled = Promise.withResolvers<0>();
+		const onAbort = (): void => cancelled.resolve(0);
+		signal.addEventListener("abort", onAbort, { once: true });
+		const timer = setTimeout(() => budget.abort(), deadline - performance.now());
+		timer.unref();
+		try {
+			for (let attempt = 0; ; attempt++) {
+				if (signal.aborted || performance.now() >= deadline) return 0;
+				// Preserve queue ordering even if this caller cancels first. The
+				// queued operation checks the same signal before touching the index.
+				const result = await Promise.race([
+					this.#checkpointLiveHeartbeatsOnce(now, signal, deadline),
+					cancelled.promise,
+				]);
+				if (result !== STALE_OBSERVATION || attempt + 1 >= SESSION_HEARTBEAT_CHECKPOINT_ATTEMPTS)
+					return result === STALE_OBSERVATION ? 0 : result;
+				now = Date.now();
+			}
+		} catch (error) {
+			if (signal.aborted && error === signal.reason) return 0;
+			throw error;
+		} finally {
+			clearTimeout(timer);
+			signal.removeEventListener("abort", onAbort);
 		}
 	}
 
-	async #checkpointLiveHeartbeatsOnce(now: number): Promise<number | typeof STALE_OBSERVATION> {
+	async #checkpointLiveHeartbeatsOnce(
+		now: number,
+		signal: AbortSignal,
+		deadline: number,
+	): Promise<number | typeof STALE_OBSERVATION> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		return await SessionIndex.#enqueue(indexPath, async () => {
+			if (signal.aborted || performance.now() >= deadline) return 0;
 			// An absent index holds no registration to checkpoint, so this pass must read
 			// it as "nothing to do" instead of creating one. Recreating the directory
 			// resurrects a state root its owner already retired: the broker's 5s
@@ -2399,62 +2436,75 @@ export class SessionIndex {
 				probed.set(`${row.sessionId}\u0000${row.endpointGeneration}\u0000${row.pid}`, processIncarnation(row.pid));
 			}
 			const probedAt = performance.now();
-			return await withSessionIndexLock("heartbeat checkpoint", this.#agentDir, async () => {
-				// Contended or delayed acquisition invalidates the observation set:
-				// never trust identity evidence gathered meaningfully before the
-				// lock was held. The checkpoint is skipped this cycle (fail-closed);
-				// the OS is never probed while the machine-global lock is held. The
-				// bound tolerates scheduler jitter on an uncontended acquisition —
-				// which is the only path where the evidence is trustworthy.
-				if (performance.now() - probedAt > SESSION_INDEX_PROBE_FRESHNESS_MS) return STALE_OBSERVATION;
-				await this.#replayUnderLock();
-				// Recheck AFTER the awaited replay too (#4544 review round 4): the
-				// replay re-reads the whole log (up to the 4 MiB rotation bound) and
-				// fsyncs pending audit rows, so the probe→write interval can stretch
-				// well past the acquisition bound above while the lock is held. The
-				// same pid-reuse window exists across that awaited replay; consuming
-				// the cached observation then would checkpoint the replacement
-				// process as the dead row. The replay bound covers the full locked
-				// replay cost envelope of a healthy machine; anything slower fails
-				// closed (no heartbeat this cycle) and the next pass re-probes.
-				if (performance.now() - probedAt > SESSION_INDEX_REPLAY_FRESHNESS_MS) return STALE_OBSERVATION;
-				if (this.#corruptSuffix) return 0;
-				const events: SessionIndexEvent[] = [];
-				const rows = reduceEvents(this.#events, now, this.#agentDir, probed).sessions;
-				for (const row of rows) {
-					if (!isSessionAuthorityEligible(row) || row.terminal || row.terminalUncertain) continue;
-					if (row.lastHeartbeatAt !== undefined && now - row.lastHeartbeatAt < SESSION_HEARTBEAT_INTERVAL_MS)
-						continue;
-					if (!alive(row.pid)) continue;
-					const recordedIncarnation = row.hostIncarnation ?? row.processIncarnation;
-					if (recordedIncarnation === undefined) continue;
-					const current = probed.get(`${row.sessionId}\u0000${row.endpointGeneration}\u0000${row.pid}`);
-					if (current === undefined || current !== recordedIncarnation) continue;
-					const unsigned: Omit<SessionIndexEvent, "checksum"> = {
-						version: SESSION_INDEX_EVENT_VERSION,
-						indexSeq: this.indexSeq + events.length + 1,
-						type: "host_heartbeat",
-						sessionId: row.sessionId,
-						locator: row.locator,
-						endpointGeneration: row.endpointGeneration,
-						pid: row.pid,
-						...(row.processIncarnation === undefined ? {} : { processIncarnation: row.processIncarnation }),
-						...(row.hostIncarnation === undefined ? {} : { hostIncarnation: row.hostIncarnation }),
-						...(row.masterRole === undefined ? {} : { masterRole: row.masterRole }),
-						// Preserve the host's last observed activity state while this
-						// broker-owned heartbeat only renews liveness. A live idle host
-						// must not be rewritten as active merely because its pid is alive.
-						activity: row.activity ?? { state: "active", at: now },
-						ts: now,
-					};
-					events.push({ ...unsigned, checksum: sessionIndexChecksum(unsigned) });
-				}
-				if (events.length === 0) return 0;
-				for (const event of events) await appendSync(logFor(this.#agentDir), JSON.stringify(event));
-				await this.#refreshUnderLock();
-				if ((await fs.stat(logFor(this.#agentDir))).size >= ROTATE_BYTES) await this.#rotate();
-				return events.length;
-			});
+			const remainingMs = deadline - performance.now();
+			if (signal.aborted || remainingMs <= 0) return 0;
+			return await withSessionIndexLock(
+				"heartbeat checkpoint",
+				this.#agentDir,
+				async () => {
+					if (signal.aborted || performance.now() >= deadline) return 0;
+					// Contended or delayed acquisition invalidates the observation set:
+					// never trust identity evidence gathered meaningfully before the
+					// lock was held. The checkpoint is skipped this cycle (fail-closed);
+					// the OS is never probed while the machine-global lock is held. The
+					// bound tolerates scheduler jitter on an uncontended acquisition —
+					// which is the only path where the evidence is trustworthy.
+					if (performance.now() - probedAt > SESSION_INDEX_PROBE_FRESHNESS_MS) return STALE_OBSERVATION;
+					await this.#replayUnderLock();
+					if (signal.aborted || performance.now() >= deadline) return 0;
+					// Recheck AFTER the awaited replay too (#4544 review round 4): the
+					// replay re-reads the whole log (up to the 4 MiB rotation bound) and
+					// fsyncs pending audit rows, so the probe→write interval can stretch
+					// well past the acquisition bound above while the lock is held. The
+					// same pid-reuse window exists across that awaited replay; consuming
+					// the cached observation then would checkpoint the replacement
+					// process as the dead row. The replay bound covers the full locked
+					// replay cost envelope of a healthy machine; anything slower fails
+					// closed (no heartbeat this cycle) and the next pass re-probes.
+					if (performance.now() - probedAt > SESSION_INDEX_REPLAY_FRESHNESS_MS) return STALE_OBSERVATION;
+					if (this.#corruptSuffix) return 0;
+					const events: SessionIndexEvent[] = [];
+					const rows = reduceEvents(this.#events, now, this.#agentDir, probed).sessions;
+					for (const row of rows) {
+						if (!isSessionAuthorityEligible(row) || row.terminal || row.terminalUncertain) continue;
+						if (row.lastHeartbeatAt !== undefined && now - row.lastHeartbeatAt < SESSION_HEARTBEAT_INTERVAL_MS)
+							continue;
+						if (!alive(row.pid)) continue;
+						const recordedIncarnation = row.hostIncarnation ?? row.processIncarnation;
+						if (recordedIncarnation === undefined) continue;
+						const current = probed.get(`${row.sessionId}\u0000${row.endpointGeneration}\u0000${row.pid}`);
+						if (current === undefined || current !== recordedIncarnation) continue;
+						const unsigned: Omit<SessionIndexEvent, "checksum"> = {
+							version: SESSION_INDEX_EVENT_VERSION,
+							indexSeq: this.indexSeq + events.length + 1,
+							type: "host_heartbeat",
+							sessionId: row.sessionId,
+							locator: row.locator,
+							endpointGeneration: row.endpointGeneration,
+							pid: row.pid,
+							...(row.processIncarnation === undefined ? {} : { processIncarnation: row.processIncarnation }),
+							...(row.hostIncarnation === undefined ? {} : { hostIncarnation: row.hostIncarnation }),
+							...(row.masterRole === undefined ? {} : { masterRole: row.masterRole }),
+							// Preserve the host's last observed activity state while this
+							// broker-owned heartbeat only renews liveness. A live idle host
+							// must not be rewritten as active merely because its pid is alive.
+							activity: row.activity ?? { state: "active", at: now },
+							ts: now,
+						};
+						events.push({ ...unsigned, checksum: sessionIndexChecksum(unsigned) });
+					}
+					if (events.length === 0) return 0;
+					for (const event of events) await appendSync(logFor(this.#agentDir), JSON.stringify(event));
+					await this.#refreshUnderLock();
+					if ((await fs.stat(logFor(this.#agentDir))).size >= ROTATE_BYTES) await this.#rotate();
+					return events.length;
+				},
+				{
+					...SESSION_INDEX_LOCK_OPTIONS,
+					retries: Math.max(1, Math.ceil(remainingMs / SESSION_INDEX_LOCK_OPTIONS.retryDelayMs)),
+					signal,
+				},
+			);
 		});
 	}
 

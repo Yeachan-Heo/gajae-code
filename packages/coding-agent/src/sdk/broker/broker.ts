@@ -164,6 +164,8 @@ export interface BrokerSettings {
 	restartRequestId?: string;
 	/** Cancel bootstrap before retained publication when the owning CLI receives a signal. */
 	startupAbortSignal?: AbortSignal;
+	/** Monotonic checkpoint deadline, leaving time for retained publication. */
+	startupCheckpointDeadline?: number;
 	/** Called synchronously when retained publication establishes broker readiness. */
 	onStartupReady?: () => void;
 	/** Test-only delay after session checkpoint to verify unpublished discovery ownership. */
@@ -1572,6 +1574,7 @@ export class Broker {
 	#transport: BrokerTransport | null = null;
 	#heartbeatTimer: NodeJS.Timeout | null = null;
 	#startupAbortSignal: AbortSignal | undefined;
+	#startupCheckpointDeadline: number | undefined;
 	#onStartupReady: (() => void) | undefined;
 	#startupPrePublicationDelayMs: number;
 	#startupPrePublicationTestHook: (() => Promise<void>) | undefined;
@@ -1611,6 +1614,7 @@ export class Broker {
 		this.#ownsResolveModelPin = settings.resolveModelPin === undefined;
 		this.#resolveModelPin = settings.resolveModelPin ?? createDefaultSdkHostModelResolver(this.settings.agentDir);
 		this.#startupAbortSignal = settings.startupAbortSignal;
+		this.#startupCheckpointDeadline = settings.startupCheckpointDeadline;
 		this.#onStartupReady = settings.onStartupReady;
 		this.#startupPrePublicationDelayMs =
 			Number.isSafeInteger(settings.startupPrePublicationDelayMs) &&
@@ -4273,14 +4277,18 @@ export class Broker {
 		if (publication) await this.#writeHeartbeat(publication);
 	}
 	/** Re-observes provably live session hosts and checkpoints their liveness. */
-	async heartbeatSessions(now = Date.now(), abortSignal?: AbortSignal): Promise<number> {
-		return await this.index.checkpointLiveHeartbeats(now, abortSignal);
+	async heartbeatSessions(now = Date.now(), abortSignal?: AbortSignal, deadline?: number): Promise<number> {
+		return await this.index.checkpointLiveHeartbeats(now, abortSignal, deadline);
 	}
 	async #checkpointSessionHeartbeats(): Promise<void> {
 		if (this.#checkpointInFlight || this.#stopping) return;
 		this.#checkpointInFlight = true;
 		try {
-			await this.heartbeatSessions(Date.now(), this.#startupAbortSignal);
+			await this.heartbeatSessions(
+				Date.now(),
+				this.#startupAbortSignal,
+				this.#publication === null ? this.#startupCheckpointDeadline : undefined,
+			);
 		} catch (error) {
 			if (
 				error instanceof FileLockAcquireError &&
