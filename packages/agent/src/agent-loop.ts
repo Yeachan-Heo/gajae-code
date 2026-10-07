@@ -2868,6 +2868,7 @@ class ManagedAttemptTransaction {
 			}
 			const event = item.event;
 			if ("message" in event && managedAssistantMessageHasContent(event.message)) return true;
+			if ("error" in event && managedAssistantMessageHasContent(event.error)) return true;
 			if (event.type === "message_update") {
 				const update = event.assistantMessageEvent;
 				if (
