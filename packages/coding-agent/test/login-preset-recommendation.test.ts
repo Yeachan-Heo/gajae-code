@@ -66,6 +66,7 @@ function createControllerContext(
 		thinkingLevel: undefined as ThinkingLevel | undefined,
 		sessionId: "session-1",
 		scopedModels: [],
+		markUserModelSelection: vi.fn(),
 		setModelTemporaryCalls: [] as Array<{ model: Model; thinkingLevel?: ThinkingLevel }>,
 		async setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel) {
 			this.setModelTemporaryCalls.push({ model: next, thinkingLevel });
@@ -136,6 +137,7 @@ describe("login preset recommendation", () => {
 
 		expect(ctx.showError).not.toHaveBeenCalled();
 		expect(ctx.showHookConfirm).toHaveBeenCalledWith("Apply codex-medium now?", "");
+		expect(session.markUserModelSelection).toHaveBeenCalledTimes(1);
 		expect(session.setModelTemporaryCalls).toEqual([{ model: codexModel, thinkingLevel: ThinkingLevel.Medium }]);
 		expect(session.setActiveModelProfile).toHaveBeenCalledWith("codex-medium");
 		expect(settings.get("modelProfile.default")).toBeUndefined();
@@ -148,6 +150,7 @@ describe("login preset recommendation", () => {
 		await login(ctx, "openai-codex");
 
 		expect(ctx.showHookConfirm).toHaveBeenCalledWith("Apply codex-medium now?", "");
+		expect(session.markUserModelSelection).not.toHaveBeenCalled();
 		expect(session.setModelTemporaryCalls).toEqual([]);
 		expect(session.setActiveModelProfile).not.toHaveBeenCalled();
 		expect(settings.get("task.agentModelOverrides")).toEqual({ executor: "openai-codex/original-executor" });

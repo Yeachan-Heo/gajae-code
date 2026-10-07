@@ -102,6 +102,16 @@ describe("AgentSession profile resume defaults", () => {
 		expect(session.getUserModelSelectionRevision()).toBeGreaterThan(revision);
 	});
 
+	it("advances the recovery fence for explicit control-surface selections", () => {
+		const { base } = resolveModels();
+		session = makeSession(base);
+		const revision = session.getUserModelSelectionRevision();
+
+		session.markUserModelSelection();
+
+		expect(session.getUserModelSelectionRevision()).toBe(revision + 1);
+	});
+
 	it("preserves an unavailable-profile marker when the active profile is reset", () => {
 		const { base } = resolveModels();
 		session = makeSession(base);
