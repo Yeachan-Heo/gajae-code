@@ -414,6 +414,7 @@ describe("startup update contract", () => {
 		let startupRequests = 0;
 		let postCreateRefreshes = 0;
 		const admissions: boolean[] = [];
+		const validations: boolean[] = [];
 
 		try {
 			await Bun.write(
@@ -470,6 +471,14 @@ describe("startup update contract", () => {
 				startupRequests += 1;
 				return Promise.reject(new Error("print startup provider request"));
 			});
+			const originalValidation = ModelRegistry.prototype.validateModelForStoredLiteralCredential;
+			using _validationSpy = vi
+				.spyOn(ModelRegistry.prototype, "validateModelForStoredLiteralCredential")
+				.mockImplementation(function (this: ModelRegistry, providerId, selectedModelId, selector) {
+					const validated = originalValidation.call(this, providerId, selectedModelId, selector);
+					validations.push(validated);
+					return validated;
+				});
 
 			await runRootCommand(
 				rootArgs({
@@ -511,6 +520,7 @@ describe("startup update contract", () => {
 
 			expect(admissions).toEqual([true]);
 			expect(observedModel).toMatchObject({ provider, id: modelId });
+			expect(validations).toEqual([true]);
 			expect(observedFallback).toBeUndefined();
 			expect(printedModel).toMatchObject({ provider, id: modelId });
 			expect(startupRequests).toBe(0);
