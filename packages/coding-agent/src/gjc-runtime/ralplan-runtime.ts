@@ -3183,7 +3183,12 @@ async function seedRalplanState(
 				};
 			}
 
-			if (existing?.active === true && !resolved.newRun) {
+			if (
+				existing?.active === true &&
+				typeof existing.run_id === "string" &&
+				existing.run_id.trim() !== "" &&
+				!resolved.newRun
+			) {
 				throw new RalplanCommandError(
 					2,
 					"an active ralplan run already owns this session; use --resume to continue it or --new-run to deliberately start another run.",
@@ -3194,6 +3199,15 @@ async function seedRalplanState(
 			const repositoryBinding = publicRepositoryBinding(await captureRepositoryBinding(cwd, { displayPath: cwd }));
 			const mode: "short" | "deliberate" = resolved.deliberate ? "deliberate" : "short";
 			const payload: Record<string, unknown> = {
+				...(existing && existing.run_id === undefined
+					? {
+							...(typeof existing.handoff_from === "string" ? { handoff_from: existing.handoff_from } : {}),
+							...(typeof existing.handoff_at === "string" ? { handoff_at: existing.handoff_at } : {}),
+							...(typeof existing.upstream_handoff_at === "string"
+								? { upstream_handoff_at: existing.upstream_handoff_at }
+								: {}),
+						}
+					: {}),
 				active: true,
 				current_phase: "planner",
 				skill: "ralplan",

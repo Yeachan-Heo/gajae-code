@@ -1202,7 +1202,7 @@ describe("native gjc ralplan runtime — duplicate --write guard", () => {
 			.filter(Boolean)
 			.map(line => JSON.parse(line) as { stage?: string })
 			.filter(row => row.stage === "architect");
-		 expect(architectRows).toHaveLength(1);
+		expect(architectRows).toHaveLength(1);
 	});
 	it("compacts oversized ralplan ledgers while retaining the current final receipt", async () => {
 		const root = await tempDir();

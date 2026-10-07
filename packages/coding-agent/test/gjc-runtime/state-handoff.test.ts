@@ -421,6 +421,7 @@ async function askAndPersistExecutionApproval(
 	});
 	const context = { hasUI: true, ui: { select: async () => label }, abort: () => {} } as unknown as AgentToolContext;
 	const result = await tool.execute(toolCallId, args, undefined, undefined, context);
+	if (result.isError) throw new Error(`approval Ask failed: ${JSON.stringify(result.content)}`);
 	manager.appendMessage({
 		role: "toolResult",
 		toolCallId,
