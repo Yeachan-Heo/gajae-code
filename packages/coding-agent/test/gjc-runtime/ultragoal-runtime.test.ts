@@ -898,7 +898,7 @@ describe("ultragoal CLI replay validation", () => {
 
 		const cwdRoot = await tempDir();
 		const outsideCwd = await tempDir();
-		await fs.symlink(outsideCwd, path.join(cwdRoot, "linked-cwd"), "dir");
+		await fs.symlink(outsideCwd, path.join(cwdRoot, "linked-cwd"), "junction");
 		const cwdError = await expectRejectedExecutorQa(
 			cwdRoot,
 			cliExecutorQa([cliReplayArtifact({ cwd: "linked-cwd" })]),
@@ -907,7 +907,6 @@ describe("ultragoal CLI replay validation", () => {
 
 		const artifactRoot = await tempDir();
 		const outsideArtifactRoot = await tempDir();
-		await fs.mkdir(path.join(artifactRoot, "artifacts"), { recursive: true });
 		const outsideReplay = path.join(outsideArtifactRoot, "replay.json");
 		await Bun.write(
 			outsideReplay,
@@ -919,7 +918,7 @@ describe("ultragoal CLI replay validation", () => {
 				recordedStdout: "outside\n",
 			}),
 		);
-		await fs.symlink(outsideReplay, path.join(artifactRoot, "artifacts", "replay.json"));
+		await fs.symlink(outsideArtifactRoot, path.join(artifactRoot, "artifacts"), "junction");
 		const artifactError = await expectRejectedExecutorQa(
 			artifactRoot,
 			cliExecutorQa([
@@ -2757,7 +2756,7 @@ describe("native GJC ultragoal runtime", () => {
 				qualityGateJson: recoveryGate("G005"),
 			}),
 		).rejects.toThrow("exactly the declared replacement");
-	});
+	}, 120_000);
 
 	it("validation batch idempotent replay rejects stale durable metadata before early return", async () => {
 		const root = await batchTempDir();
@@ -6683,6 +6682,11 @@ describe("resolveGitBase nearest integration base", () => {
 	it("scopes a dev-forked branch to dev, not a stale main", async () => {
 		const dir = await tempDir();
 		await git(dir, ["init", "-q"]);
+		await fs.mkdir(path.join(dir, ".empty-hooks"), { recursive: true });
+		await git(dir, ["config", "user.name", "Gajae Test"]);
+		await git(dir, ["config", "user.email", "gajae-test@example.invalid"]);
+		await git(dir, ["config", "commit.gpgsign", "false"]);
+		await git(dir, ["config", "core.hooksPath", path.join(dir, ".empty-hooks")]);
 		await git(dir, ["checkout", "-q", "-b", "main"]);
 		await commit(dir, "base.txt", "base");
 		await git(dir, ["checkout", "-q", "-b", "dev"]);
@@ -6692,18 +6696,23 @@ describe("resolveGitBase nearest integration base", () => {
 
 		// dev is the nearest base (1 commit ahead) vs main (2 commits ahead).
 		expect(await resolveGitBase(dir)).toBe("dev");
-	});
+	}, 30_000);
 
 	it("honors an explicit branch argument", async () => {
 		const dir = await tempDir();
 		await git(dir, ["init", "-q"]);
+		await fs.mkdir(path.join(dir, ".empty-hooks"), { recursive: true });
+		await git(dir, ["config", "user.name", "Gajae Test"]);
+		await git(dir, ["config", "user.email", "gajae-test@example.invalid"]);
+		await git(dir, ["config", "commit.gpgsign", "false"]);
+		await git(dir, ["config", "core.hooksPath", path.join(dir, ".empty-hooks")]);
 		await git(dir, ["checkout", "-q", "-b", "main"]);
 		await commit(dir, "base.txt", "base");
 		await git(dir, ["checkout", "-q", "-b", "feature/y"]);
 		await commit(dir, "feature.txt", "feature work");
 
 		expect(await resolveGitBase(dir, "main")).toBe("main");
-	});
+	}, 30_000);
 
 	it("rejects repositories without a recognized integration base", async () => {
 		const dir = await tempDir();

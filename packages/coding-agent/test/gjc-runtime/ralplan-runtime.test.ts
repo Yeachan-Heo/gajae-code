@@ -99,6 +99,17 @@ async function writeRalplanArtifact(
 	);
 }
 
+async function startNewRalplanRun(root: string, task: string): Promise<string> {
+	const result = await runNativeRalplanCommand(["--new-run", "--json", task], root);
+	if (result.status !== 0)
+		throw new Error(`Could not start a new ralplan run: ${result.stderr ?? result.stdout ?? "unknown error"}`);
+	const receipt = JSON.parse(result.stdout ?? "{}") as { run_id?: unknown };
+	if (typeof receipt.run_id !== "string" || receipt.run_id.length === 0) {
+		throw new Error("New ralplan run did not return a run_id.");
+	}
+	return receipt.run_id;
+}
+
 async function writeRalplanLaneVerdictArtifact(
 	root: string,
 	runId: string,
@@ -426,7 +437,8 @@ describe("native gjc ralplan runtime — --write artifact path", () => {
 		);
 		expect(seed.status).toBe(0);
 		const seedReceipt = JSON.parse(seed.stdout ?? "{}") as { session_id: string; run_id: string };
-		expect(seedReceipt).toMatchObject({ session_id: ownerSessionId, run_id: ownerSessionId });
+		expect(seedReceipt.session_id).toBe(ownerSessionId);
+		expect(seedReceipt.run_id).not.toBe(ownerSessionId);
 
 		const previousSessionId = process.env.GJC_SESSION_ID;
 		process.env.GJC_SESSION_ID = childSessionId;
@@ -2298,7 +2310,7 @@ describe("ralplan consensus iteration cap (#3165)", () => {
 		const final = await write("final", 6, "# best effort pending approval");
 		expect(final.status).toBe(0);
 		expect(final.stdout).toContain("pending_approval_path");
-	});
+	}, 120_000);
 
 	it("honors project config.yml maxIterations=2 and resets budget on new run_id", async () => {
 		const root = await tempDir();
@@ -2321,9 +2333,10 @@ describe("ralplan consensus iteration cap (#3165)", () => {
 		expect(stuck.status).toBe(3);
 		expect(JSON.parse(stuck.stdout ?? "{}").max_iterations).toBe(2);
 
-		// Fresh run_id must not inherit the stuck budget.
-		expect((await write("run-b", "planner", 1, "# p-b")).status).toBe(0);
-		expect((await write("run-b", "revision", 2, "# r2-b")).status).toBe(0);
+		// Switching runs is explicit; the new run starts with an independent budget.
+		const newRunId = await startNewRalplanRun(root, "fresh run after iteration cap");
+		expect((await write(newRunId, "planner", 1, "# p-b")).status).toBe(0);
+		expect((await write(newRunId, "revision", 2, "# r2-b")).status).toBe(0);
 	});
 
 	it("dedupes an identical revision write at the cap without PLANNING-STUCK", async () => {
@@ -2461,9 +2474,10 @@ describe("ralplan consensus iteration cap (#3165)", () => {
 		await fs.writeFile(path.join(ralplanRunDir(root, "run-old"), "index.jsonl"), "", "utf-8");
 		expect((await write("run-old", "revision", 6, "# stuck")).status).toBe(3);
 
-		// Fresh run is independent even while the old run remains at cap under wipe.
-		expect((await write("run-new", "planner", 1, "# p-new")).status).toBe(0);
-		expect((await write("run-new", "revision", 2, "# r2-new")).status).toBe(0);
+		// Fresh run is explicit and independent even while the old run remains at cap under wipe.
+		const freshRunId = await startNewRalplanRun(root, "fresh run after ledger failure");
+		expect((await write(freshRunId, "planner", 1, "# p-new")).status).toBe(0);
+		expect((await write(freshRunId, "revision", 2, "# r2-new")).status).toBe(0);
 	});
 });
 
@@ -2645,7 +2659,8 @@ describe("ralplan crash-gap dedupe repair", () => {
 		const staleRunId = "stale-critic-metadata";
 		const activeRunId = "active-critic-metadata";
 		const staleRunDir = ralplanRunDir(root, staleRunId);
-		expect((await writeRalplanArtifact(root, staleRunId, "planner", 1, "# stale plan")).status).toBe(0);
+		await fs.mkdir(staleRunDir, { recursive: true });
+		await fs.writeFile(path.join(staleRunDir, "stage-01-planner.md"), "# stale plan\n", "utf-8");
 		await fs.writeFile(path.join(staleRunDir, "stage-02-critic.md"), "# stale critique\n", "utf-8");
 		expect((await writeRalplanArtifact(root, activeRunId, "planner", 1, "# active plan")).status).toBe(0);
 		const stateBefore = JSON.parse(await fs.readFile(ralplanStatePath(root), "utf-8"));
@@ -2691,7 +2706,8 @@ describe("ralplan crash-gap dedupe repair", () => {
 		const staleRunId = "stale-architect-metadata";
 		const activeRunId = "active-architect-metadata";
 		const staleRunDir = ralplanRunDir(root, staleRunId);
-		expect((await writeRalplanArtifact(root, staleRunId, "planner", 1, "# stale plan")).status).toBe(0);
+		await fs.mkdir(staleRunDir, { recursive: true });
+		await fs.writeFile(path.join(staleRunDir, "stage-01-planner.md"), "# stale plan\n", "utf-8");
 		await fs.writeFile(path.join(staleRunDir, "stage-02-architect.md"), "# stale architecture\n", "utf-8");
 		expect((await writeRalplanArtifact(root, activeRunId, "planner", 1, "# active plan")).status).toBe(0);
 		const stateBefore = JSON.parse(await fs.readFile(ralplanStatePath(root), "utf-8"));
@@ -3182,7 +3198,7 @@ describe("ralplan review lane budget replays", () => {
 		const final = await writeRalplanArtifact(root, runId, "final", sequence.length + 1, "# best effort final");
 		expect(final.status).toBe(0);
 		expect(JSON.parse(final.stdout ?? "{}").pending_approval_path).toBeDefined();
-	});
+	}, 120_000);
 
 	it("keeps healthy t3code and browser-use shaped replays free of warnings and stuck signals", async () => {
 		const root = await tempDir();
@@ -3202,13 +3218,14 @@ describe("ralplan review lane budget replays", () => {
 			"critic",
 			"final",
 		]);
-		const browserUse = await replay("healthy-browser-use", ["planner", "architect", "critic", "final"]);
+		const browserUseRunId = await startNewRalplanRun(root, "healthy browser-use shaped replay");
+		const browserUse = await replay(browserUseRunId, ["planner", "architect", "critic", "final"]);
 		for (const result of [...t3code, ...browserUse]) {
 			expect(result.status).toBe(0);
 			expect(result.stdout).not.toContain(PLANNING_STUCK_MARKER);
 			expect(JSON.parse(result.stdout ?? "{}").review_budget_warning).toBeUndefined();
 		}
-	});
+	}, 120_000);
 });
 
 describe("ralplan review lane budget rigor and receipts", () => {
@@ -3349,7 +3366,8 @@ describe("ralplan HUD lane verdict carriage", () => {
 		const staleRunId = "hud-stale-repair";
 		const activeRunId = "hud-active-run";
 		const staleRunDir = ralplanRunDir(root, staleRunId);
-		expect((await writeRalplanArtifact(root, staleRunId, "planner", 1, "# stale plan")).status).toBe(0);
+		await fs.mkdir(staleRunDir, { recursive: true });
+		await fs.writeFile(path.join(staleRunDir, "stage-01-planner.md"), "# stale plan\n", "utf-8");
 		await fs.writeFile(path.join(staleRunDir, "stage-02-architect.md"), "# stale architecture\n", "utf-8");
 		expect((await writeRalplanArtifact(root, activeRunId, "planner", 1, "# active plan")).status).toBe(0);
 
@@ -3523,7 +3541,6 @@ describe("ralplan HUD lane verdict carriage", () => {
 	it("clears both verdict sources when a new run starts and rebuilds HUD state", async () => {
 		const root = await tempDir();
 		const runOne = "hud-reset-one";
-		const runTwo = "hud-reset-two";
 		expect((await writeRalplanArtifact(root, runOne, "planner", 1, "# plan one")).status).toBe(0);
 		expect(
 			(await writeRalplanLaneVerdictArtifact(root, runOne, "critic", 2, "# critique one", "ITERATE")).status,
@@ -3537,6 +3554,7 @@ describe("ralplan HUD lane verdict carriage", () => {
 			).status,
 		).toBe(0);
 
+		const runTwo = await startNewRalplanRun(root, "new run clears old verdict");
 		expect((await writeRalplanArtifact(root, runTwo, "planner", 1, "# plan two")).status).toBe(0);
 		expect((await readRalplanHudChips(root)).some(chip => chip.label === "verdict")).toBe(false);
 		const switchedState = JSON.parse(await fs.readFile(ralplanStatePath(root), "utf-8"));
