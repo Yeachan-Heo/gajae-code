@@ -1,4 +1,6 @@
 import { expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import type { AssistantMessage } from "@gajae-code/ai";
 import { classifyFallbackTrigger } from "@gajae-code/ai/utils/fallback-transport";
@@ -6,6 +8,7 @@ import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { ExtensionRuntime, loadExtensionFromFactory } from "../src/extensibility/extensions/loader";
 import { ExtensionRunner } from "../src/extensibility/extensions/runner";
+import { createAgentSession } from "../src/sdk";
 import { createSdkSessionRuntimeExtension } from "../src/sdk/host/session-runtime";
 import { AgentSession, type AgentSessionEvent } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
@@ -15,19 +18,21 @@ import { type EmptyStopScenario, handleProviderRequest } from "./helpers/managed
 
 // Local session integration: real provider HTTP/SSE, without launching the SDK
 // broker or running the connected verification scenarios owned by the tester.
-test.each([
-	"fallback-enabled",
-	"untyped-fallback",
-	"fallback-disabled",
-	"untyped-disabled",
-	"nonzero-usage",
-] as const)("local session preserves empty-stop request boundary: %s", async (scenario: EmptyStopScenario) => {
+test.each(
+	["fallback-enabled", "untyped-fallback", "fallback-disabled", "untyped-disabled", "nonzero-usage"].flatMap(
+		scenario => [
+			{ scenario: scenario as EmptyStopScenario, initialization: "direct" as const },
+			{ scenario: scenario as EmptyStopScenario, initialization: "sdk" as const },
+		],
+	),
+)("local session preserves empty-stop request boundary: %j", async ({ scenario, initialization }) => {
 	const models: string[] = [];
 	const server = Bun.serve({
 		hostname: "127.0.0.1",
 		port: 0,
 		fetch: request => handleProviderRequest(request, scenario, models),
 	});
+	const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-empty-stop-local-"));
 	const auth = await AuthStorage.create(":memory:");
 	let session: AgentSession | undefined;
 	try {
@@ -78,17 +83,41 @@ test.each([
 		);
 		const runner = new ExtensionRunner([extension], runtime, process.cwd(), manager, registry, undefined, settings);
 		expect(runner.hasHandlers("agent_start")).toBe(true);
-		const agent = new Agent({
-			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
-			getApiKey: provider => registry.getApiKeyForProvider(provider),
-		});
-		session = new AgentSession({
-			agent,
-			settings,
-			sessionManager: manager,
-			modelRegistry: registry,
-			extensionRunner: runner,
-		});
+		if (initialization === "direct") {
+			const agent = new Agent({
+				initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+				getApiKey: async () => registry.getApiKeyForProvider("empty-stop-fixture"),
+			});
+			session = new AgentSession({
+				agent,
+				settings,
+				sessionManager: manager,
+				modelRegistry: registry,
+				extensionRunner: runner,
+			});
+		} else {
+			({ session } = await createAgentSession({
+				cwd: root,
+				agentDir: root,
+				model: primary,
+				authStorage: auth,
+				settings,
+				sessionManager: manager,
+				modelRegistry: registry,
+				disableExtensionDiscovery: true,
+				enableMCP: false,
+				enableMcpAutoload: false,
+				enableLsp: false,
+				skipPythonPreflight: true,
+				deferOptionalModelRefresh: true,
+				toolNames: [],
+				skills: [],
+				rules: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+			}));
+		}
 		session.setConfiguredModelChain(
 			"default",
 			scenario === "nonzero-usage" || scenario.endsWith("disabled")
@@ -149,6 +178,7 @@ test.each([
 		} finally {
 			auth.close();
 			server.stop(true);
+			await fs.rm(root, { recursive: true, force: true });
 		}
 	}
 }, 15_000);
