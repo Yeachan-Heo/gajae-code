@@ -18032,8 +18032,18 @@ export class SessionManager {
 				throw new Error("task_artifact_owner_locator_persistence_failed");
 			owner.manager.assertManagedBinding();
 			this.#managedTaskArtifactOwner = { sessionId, owner };
+			const supersededManager = this.#artifactManager;
 			this.#artifactManager = null;
 			this.#artifactManagerSessionFile = null;
+			if (supersededManager) {
+				try {
+					supersededManager.getManagedStore()?.close();
+				} catch (closeError) {
+					throw new Error(
+						`Failed to close superseded artifact manager store: ${closeError instanceof Error ? closeError.message : String(closeError)}`,
+					);
+				}
+			}
 			return owner.manager;
 		} catch (error) {
 			if (!locator && this.#fileEntries.includes(header) && header.id === sessionId) delete header.taskArtifactOwner;

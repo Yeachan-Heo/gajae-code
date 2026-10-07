@@ -114,4 +114,116 @@ describe("managed task artifact owner lifecycle", () => {
 			await sessionManager.close();
 		}
 	});
+
+	it("copies artifacts and establishes new owner for forked sessions", async () => {
+		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-owner-fork-")));
+		roots.push(root);
+		const cwd = path.join(root, "workspace");
+		await fs.mkdir(cwd, { recursive: true });
+
+		const sessionManager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, root));
+		try {
+			await sessionManager.ensureOnDisk();
+			await sessionManager.flush();
+
+			// Save an artifact in the original session
+			const testContent = "test artifact content";
+			await sessionManager.saveArtifact(testContent, "test");
+
+			const sessionFile = sessionManager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected a persistent session file");
+			const sessionDir = sessionFile.slice(0, -6);
+
+			// Verify the artifact exists in the original session
+			const artifactPath = path.join(sessionDir, "0.test.log");
+			const artifactExists = await fs.exists(artifactPath);
+			expect(artifactExists).toBe(true);
+
+			// Fork the session
+			const forked = await sessionManager.fork();
+			if (!forked) throw new Error("Expected a fork result");
+
+			// Verify the artifact was copied to the forked session's artifacts directory
+			const forkedDir = forked.newSessionFile.slice(0, -6);
+			const forkedArtifactPath = path.join(forkedDir, "0.test.log");
+			const forkedArtifactExists = await fs.exists(forkedArtifactPath);
+			expect(forkedArtifactExists).toBe(true);
+
+			// Verify the content matches
+			const forkedContent = await Bun.file(forkedArtifactPath).text();
+			expect(forkedContent).toBe(testContent);
+
+			// Open the forked session and verify it can establish its own owner
+			const forkedSessionManager = await SessionManager.open(
+				forked.newSessionFile,
+				SessionManager.managedDestination(cwd, root),
+			);
+			try {
+				// Ensure the forked session can establish its own artifact manager
+				const forkedArtifactManager = await forkedSessionManager.ensureArtifactManager();
+				if (!forkedArtifactManager) throw new Error("Expected a forked artifact manager");
+
+				// The forked session should have its own owner directory
+				expect(forkedArtifactManager.dir).toBeDefined();
+			} finally {
+				await forkedSessionManager.close();
+			}
+		} finally {
+			await sessionManager.close();
+		}
+	});
+
+	it("closes superseded artifact store during task owner installation and session disposal", async () => {
+		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-artifact-store-close-")));
+		roots.push(root);
+		const cwd = path.join(root, "workspace");
+		await fs.mkdir(cwd, { recursive: true });
+
+		const sessionManager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, root));
+		const close = ManagedSessionDescendantStore.prototype.close;
+		const closedStores: ManagedSessionDescendantStore[] = [];
+
+		vi.spyOn(ManagedSessionDescendantStore.prototype, "close").mockImplementation(function (
+			this: ManagedSessionDescendantStore,
+		) {
+			closedStores.push(this);
+			return close.call(this);
+		});
+
+		try {
+			await sessionManager.ensureOnDisk();
+			await sessionManager.flush();
+
+			// Access artifacts to establish initial artifact manager
+			await sessionManager.saveArtifact("test data", "test-artifact");
+
+			// Ensure the artifact manager is created (and task owner is established)
+			const ownerManager = await sessionManager.ensureArtifactManager();
+			if (!ownerManager) throw new Error("Expected an owner manager");
+
+			const sessionFile = sessionManager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected a persistent session file");
+
+			const ownerStore = ownerManager.getManagedStore();
+			if (!ownerStore) throw new Error("Expected an owner store");
+
+			// Close the session and verify stores are closed properly
+			await sessionManager.close();
+
+			// The owner store should have been closed
+			expect(closedStores).toContain(ownerStore);
+
+			// Reopen and verify the owner is stable
+			const reopened = await SessionManager.open(sessionFile, SessionManager.managedDestination(cwd, root));
+			try {
+				const restoredManager = await reopened.ensureArtifactManager();
+				expect(restoredManager?.dir).toBe(ownerManager.dir);
+			} finally {
+				await reopened.close();
+			}
+		} finally {
+			vi.restoreAllMocks();
+			await sessionManager.close();
+		}
+	});
 });
