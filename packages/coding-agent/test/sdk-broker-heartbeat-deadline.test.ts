@@ -46,7 +46,7 @@ describe("broker startup heartbeat budget", () => {
 		const broker = new Broker({
 			agentDir: dir,
 			port: 0,
-			startupDeadline,
+			startupCheckpointDeadline: startupDeadline - 1_000,
 			onStartupReady: () => {
 				ready = true;
 			},
