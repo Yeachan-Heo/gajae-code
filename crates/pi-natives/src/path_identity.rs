@@ -15913,6 +15913,253 @@ mod exact_replace_path_tests {
 		assert_eq!(fs::read(&destination).expect("read committed successor"), b"successor");
 	}
 }
+
+#[cfg(all(test, unix))]
+mod sdk_readiness_lifecycle_tests {
+	use std::{
+		fs,
+		os::unix::fs::{MetadataExt, symlink},
+		path::{Path, PathBuf},
+		sync::atomic::{AtomicU64, Ordering},
+	};
+
+	use super::{ExactFileIdentity, PATH_IDENTITY_HOOK_TEST_LOCK, platform, sha256};
+
+	static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+	struct TempDir(PathBuf);
+
+	impl TempDir {
+		fn new(base: &Path) -> Self {
+			loop {
+				let path = base.join(format!(
+					"gjc-sdk-readiness-{}-{}",
+					std::process::id(),
+					NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+				));
+				match fs::create_dir(&path) {
+					Ok(()) => return Self(path),
+					Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
+					Err(error) => panic!("create readiness temp directory: {error}"),
+				}
+			}
+		}
+	}
+
+	impl Drop for TempDir {
+		fn drop(&mut self) {
+			let _ = fs::remove_dir_all(&self.0);
+		}
+	}
+
+	fn identity(path: &Path) -> ExactFileIdentity {
+		let metadata = fs::metadata(path).expect("stat readiness file");
+		let parent =
+			fs::metadata(path.parent().expect("readiness parent")).expect("stat readiness parent");
+		ExactFileIdentity {
+			dev:               metadata.dev(),
+			ino:               metadata.ino(),
+			nlink:             Some(metadata.nlink()),
+			parent_dev:        Some(parent.dev()),
+			parent_ino:        Some(parent.ino()),
+			size:              metadata.size(),
+			mtime_ns:          metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
+			directory:         false,
+			detach_only:       false,
+			quarantine_name:   Some(".readiness-cleanup".to_owned()),
+			sha256:            Some(sha256(&fs::read(path).expect("read readiness identity bytes"))),
+			allow_hard_link:   false,
+			require_hard_link: false,
+		}
+	}
+
+	fn seed(root: &Path) -> (PathBuf, PathBuf) {
+		let sdk = root.join("agent").join("sdk");
+		fs::create_dir_all(&sdk).expect("create nested SDK directory");
+		let staged = sdk.join("ready.staged");
+		let ready = sdk.join("ready.json");
+		fs::write(&staged, b"new readiness").expect("seed staged readiness");
+		fs::write(&ready, b"old readiness").expect("seed existing readiness");
+		(staged, ready)
+	}
+
+	fn assert_entries(parent: &Path, expected: &[&str]) {
+		let mut actual = fs::read_dir(parent)
+			.expect("list readiness namespace")
+			.map(|entry| entry.expect("read readiness entry").file_name())
+			.collect::<Vec<_>>();
+		actual.sort();
+		let mut expected = expected
+			.iter()
+			.map(|name| std::ffi::OsString::from(*name))
+			.collect::<Vec<_>>();
+		expected.sort();
+		assert_eq!(actual, expected, "unexpected readiness namespace debris");
+	}
+
+	fn replace_and_cleanup(real_root: &Path, operation_root: &Path) {
+		let (real_staged, real_ready) = seed(real_root);
+		let staged = operation_root.join("agent/sdk/ready.staged");
+		let ready = operation_root.join("agent/sdk/ready.json");
+		let expected_source = identity(&real_staged);
+		let expected_destination = identity(&real_ready);
+		let result =
+			platform::exact_replace_path(&staged, &ready, &expected_source, &expected_destination);
+		assert!(result.ok, "replace readiness: {:?}", result.code);
+		assert_eq!(fs::read(&real_ready).expect("read published readiness"), b"new readiness");
+		assert!(!real_staged.exists(), "staged readiness must disappear");
+		let parent = real_ready.parent().expect("SDK directory");
+		// Exact replacement deliberately retains the descriptor-scrubbed predecessor.
+		let scrubbed_name = format!(
+			".gjc-exact-replace-destination-{:x}-{:x}",
+			expected_destination.ino,
+			std::process::id()
+		);
+		assert_entries(parent, &["ready.json", &scrubbed_name]);
+		let scrubbed = parent.join(&scrubbed_name);
+		assert!(
+			fs::symlink_metadata(&scrubbed)
+				.expect("stat scrubbed predecessor")
+				.is_file()
+		);
+		assert_eq!(fs::read(&scrubbed).expect("read scrubbed predecessor"), b"");
+
+		let published = identity(&real_ready);
+		assert_eq!((published.dev, published.ino), (expected_source.dev, expected_source.ino));
+		let result = platform::exact_unlink_direct(&ready, &published);
+		assert!(result.ok, "clean readiness: {:?}", result.code);
+		assert!(!real_ready.exists(), "published readiness must disappear");
+		assert_entries(parent, &[&scrubbed_name]);
+		assert_eq!(fs::read(scrubbed).expect("read retained scrubbed predecessor"), b"");
+	}
+
+	#[test]
+	fn readiness_replace_then_direct_cleanup_under_temp_dir() {
+		let _guard = PATH_IDENTITY_HOOK_TEST_LOCK
+			.lock()
+			.unwrap_or_else(|error| error.into_inner());
+		let temporary = TempDir::new(&std::env::temp_dir());
+		// Keep the lexical temp path: macOS alias translation must run in the native
+		// walk.
+		replace_and_cleanup(&temporary.0, &temporary.0);
+	}
+
+	#[test]
+	fn readiness_replace_and_direct_cleanup_refuse_symlinks() {
+		let _guard = PATH_IDENTITY_HOOK_TEST_LOCK
+			.lock()
+			.unwrap_or_else(|error| error.into_inner());
+		for case in ["ancestor", "source_leaf", "destination_leaf"] {
+			let temporary = TempDir::new(&std::env::temp_dir());
+			let (staged, ready) = seed(&temporary.0);
+			let expected_source = identity(&staged);
+			let expected_destination = identity(&ready);
+			let parent = ready.parent().expect("SDK directory");
+			let alias = if case == "ancestor" {
+				temporary.0.join("alias")
+			} else {
+				parent.join("alias")
+			};
+			let (operation_staged, operation_ready, cleanup_path, cleanup_identity) = match case {
+				"ancestor" => {
+					symlink(temporary.0.join("agent"), &alias).expect("create symlink ancestor");
+					(
+						alias.join("sdk/ready.staged"),
+						alias.join("sdk/ready.json"),
+						alias.join("sdk/ready.json"),
+						&expected_destination,
+					)
+				},
+				"source_leaf" => {
+					symlink(&staged, &alias).expect("create source symlink leaf");
+					(alias.clone(), ready.clone(), alias.clone(), &expected_source)
+				},
+				_ => {
+					symlink(&ready, &alias).expect("create destination symlink leaf");
+					(staged.clone(), alias.clone(), alias.clone(), &expected_destination)
+				},
+			};
+			let replaced = platform::exact_replace_path(
+				&operation_staged,
+				&operation_ready,
+				&expected_source,
+				&expected_destination,
+			);
+			assert!(!replaced.ok, "replace must refuse {case}");
+			assert_eq!(
+				replaced.code.as_deref(),
+				Some(if case == "ancestor" {
+					"reparse_point"
+				} else {
+					"identity_mismatch"
+				})
+			);
+			let cleaned = platform::exact_unlink_direct(&cleanup_path, cleanup_identity);
+			assert!(!cleaned.ok, "cleanup must refuse {case}");
+			assert_eq!(cleaned.code.as_deref(), Some("reparse_point"));
+			assert_eq!(fs::read(&staged).expect("read untouched staged readiness"), b"new readiness");
+			assert_eq!(fs::read(&ready).expect("read untouched old readiness"), b"old readiness");
+			assert!(
+				fs::symlink_metadata(alias)
+					.expect("stat refused symlink")
+					.file_type()
+					.is_symlink()
+			);
+			let mut expected_entries = vec!["ready.staged", "ready.json"];
+			if case != "ancestor" {
+				expected_entries.push("alias");
+			}
+			assert_entries(parent, &expected_entries);
+		}
+	}
+
+	#[test]
+	fn readiness_replace_and_direct_cleanup_refuse_wrong_parent_or_identity() {
+		let _guard = PATH_IDENTITY_HOOK_TEST_LOCK
+			.lock()
+			.unwrap_or_else(|error| error.into_inner());
+		for wrong_parent in [true, false] {
+			let temporary = TempDir::new(&std::env::temp_dir());
+			let (staged, ready) = seed(&temporary.0);
+			let mut expected_source = identity(&staged);
+			let mut expected_destination = identity(&ready);
+			let expected_code = if wrong_parent {
+				let other_parent = fs::metadata(&temporary.0).expect("stat unrelated parent");
+				for identity in [&mut expected_source, &mut expected_destination] {
+					identity.parent_dev = Some(other_parent.dev());
+					identity.parent_ino = Some(other_parent.ino());
+				}
+				"parent_mismatch"
+			} else {
+				expected_destination.ino = expected_destination.ino.wrapping_add(1);
+				"identity_mismatch"
+			};
+			let replaced =
+				platform::exact_replace_path(&staged, &ready, &expected_source, &expected_destination);
+			assert!(!replaced.ok);
+			assert_eq!(replaced.code.as_deref(), Some(expected_code));
+			let cleaned = platform::exact_unlink_direct(&ready, &expected_destination);
+			assert!(!cleaned.ok);
+			assert_eq!(cleaned.code.as_deref(), Some(expected_code));
+			assert_eq!(fs::read(&staged).expect("read untouched staged readiness"), b"new readiness");
+			assert_eq!(fs::read(&ready).expect("read untouched old readiness"), b"old readiness");
+			assert_entries(ready.parent().expect("SDK directory"), &["ready.staged", "ready.json"]);
+		}
+	}
+
+	#[cfg(target_os = "macos")]
+	#[test]
+	fn readiness_replace_then_direct_cleanup_through_tmp_lexical_alias() {
+		let _guard = PATH_IDENTITY_HOOK_TEST_LOCK
+			.lock()
+			.unwrap_or_else(|error| error.into_inner());
+		let temporary = TempDir::new(Path::new("/private/tmp"));
+		let lexical = Path::new("/tmp").join(temporary.0.file_name().expect("temp directory name"));
+		// Identities come from /private/tmp; only native operations receive /tmp.
+		replace_and_cleanup(&temporary.0, &lexical);
+	}
+}
+
 #[cfg(test)]
 mod sha256_tests {
 	use std::io::{self, Read};
