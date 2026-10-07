@@ -1062,6 +1062,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 							const profileLabel = formatModelProfileDisplayLabel(
 								runtime.session.modelRegistry.getModelProfile(presetName) ?? { name: presetName },
 							);
+							runtime.session.markUserModelSelection();
 							await activateModelProfile(
 								{
 									session: runtime.session,

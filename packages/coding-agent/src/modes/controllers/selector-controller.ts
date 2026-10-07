@@ -2494,6 +2494,7 @@ export class SelectorController {
 	 * default) then refresh the status surfaces. Rethrows so callers surface errors.
 	 */
 	async #applyModelProfile(profileName: string, persistDefault: boolean): Promise<void> {
+		this.ctx.session.markUserModelSelection();
 		const profileLabel = formatModelProfileDisplayLabel(
 			this.ctx.session.modelRegistry.getModelProfile(profileName) ?? { name: profileName },
 		);
@@ -2776,6 +2777,7 @@ export class SelectorController {
 						const { model, role, thinkingLevel, selector: selectedSelector } = selection;
 						if (role === null) {
 							// Temporary: update agent state but don't persist to settings
+							this.ctx.session.markUserModelSelection();
 							await this.ctx.session.setModelTemporary(model, thinkingLevel, {
 								cause: "temporary-operation",
 								reason: "other",
@@ -3677,6 +3679,7 @@ export class SelectorController {
 			return;
 		}
 
+		this.ctx.session.markUserModelSelection();
 		await activateModelProfile({
 			session: this.ctx.session,
 			modelRegistry: this.ctx.session.modelRegistry,
