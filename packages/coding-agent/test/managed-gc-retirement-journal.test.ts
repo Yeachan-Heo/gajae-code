@@ -35,6 +35,7 @@ import {
 	acquireManagedLock,
 	captureManagedFileNoFollow,
 	captureManagedFileNoFollowBounded,
+	MANAGED_ARTIFACT_MAX_FILES,
 	MANAGED_SESSION_READ_RANGE_MAX_BYTES,
 	ManagedSessionDescendantStore,
 } from "../src/session/internal/managed-session-storage";
@@ -76,6 +77,10 @@ interface Fixture {
 }
 
 const temporaryRoots: string[] = [];
+const MANAGED_GC_SCOPE_LOCK_NAME = `gc-retirement-${crypto
+	.createHash("sha256")
+	.update("managed-gc-retirement-scope-lock-v1", "utf8")
+	.digest("hex")}`;
 
 afterEach(() => {
 	vi.restoreAllMocks();
@@ -119,7 +124,7 @@ describe("owner-aware data cannot bypass live consumer authority", () => {
 		const journalLock = path.join(
 			fixture.scope.directoryPath,
 			".gjc-managed-session-internal/locks",
-			`gc-retirement-${crypto.createHash("sha256").update(fixture.transcriptPath).digest("hex")}.lock`,
+			`${MANAGED_GC_SCOPE_LOCK_NAME}.lock`,
 		);
 		for (const [pathname, identity] of unlink.mock.calls) {
 			expect(pathname).toBe(journalLock);
@@ -236,7 +241,7 @@ describe("owner-aware data cannot bypass live consumer authority", () => {
 		const journalLock = path.join(
 			fixture.scope.directoryPath,
 			".gjc-managed-session-internal/locks",
-			`gc-retirement-${crypto.createHash("sha256").update(fixture.transcriptPath).digest("hex")}.lock`,
+			`${MANAGED_GC_SCOPE_LOCK_NAME}.lock`,
 		);
 		for (const [pathname, identity] of unlink.mock.calls) {
 			expect(pathname).toBe(journalLock);
@@ -2153,6 +2158,96 @@ describe("managed GC retirement journal", () => {
 			expect(pressuredAllocations.every(entry => entry.size > 0 && entry.size < 64 * 1024 * 1024)).toBe(true);
 			expect([managedReceiptInventory(target.scope), managedReceiptInventory(unaffected.scope)]).toEqual(before);
 		}
+	});
+
+	it("serializes distinct-target appends at the shared receipt-directory capacity", async () => {
+		const fixture = makeFixture();
+		const secondTranscriptName = "second-fixture.jsonl";
+		const secondTranscriptPath = path.join(fixture.scope.directoryPath, secondTranscriptName);
+		const transcriptStore = openScopeStore(fixture.scope);
+		try {
+			transcriptStore.publishNoReplaceSync(
+				secondTranscriptName,
+				Buffer.from(
+					`${JSON.stringify({
+						type: "session",
+						id: fixture.target.sessionId,
+						cwd: fixture.cwd,
+						version: 3,
+						taskArtifactOwner: fixture.evidence.locator,
+					})}\n`,
+					"utf8",
+				),
+			);
+		} finally {
+			transcriptStore.close();
+		}
+		const secondTarget = bindManagedGcSessionRetirementTarget(fixture.scope, secondTranscriptPath);
+		const secondReceipt: ManagedGcSessionRetirementReceipt = {
+			...secondTarget,
+			state: "prepared",
+			taskArtifactOwnerDeletionEvidence: fixture.evidence,
+		};
+		const targetKeys = new Set(
+			[fixture.transcriptPath, secondTranscriptPath].map(transcriptPath =>
+				crypto.createHash("sha256").update(path.resolve(transcriptPath), "utf8").digest("hex"),
+			),
+		);
+		const syntheticNames: string[] = [];
+		for (let index = 0; syntheticNames.length < MANAGED_ARTIFACT_MAX_FILES - 1; index++) {
+			const key = index.toString(16).padStart(64, "0");
+			if (!targetKeys.has(key)) syntheticNames.push(`gc-retirement-${key}-prepared.json`);
+		}
+		const receiptDirectory = path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal", "receipts");
+		const lockDirectory = path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal", "locks");
+		const openedLockPaths = new Set<string>();
+		const originalOpendir = fs.opendirSync.bind(fs);
+		const originalOpen = fs.openSync.bind(fs);
+		const entry = (name: string): fs.Dirent =>
+			({
+				name,
+				isBlockDevice: () => false,
+				isCharacterDevice: () => false,
+				isDirectory: () => false,
+				isFIFO: () => false,
+				isFile: () => true,
+				isSocket: () => false,
+				isSymbolicLink: () => false,
+			}) as fs.Dirent;
+		const inventory = spyOn(fs, "opendirSync").mockImplementation(pathname => {
+			if (path.resolve(String(pathname)) !== receiptDirectory) return originalOpendir(pathname);
+			const directory = originalOpendir(pathname);
+			let index = 0;
+			return {
+				readSync: () => (index < syntheticNames.length ? entry(syntheticNames[index++]!) : directory.readSync()),
+				closeSync: () => directory.closeSync(),
+			} as fs.Dir;
+		});
+		const open = spyOn(fs, "openSync").mockImplementation(((
+			pathname: fs.PathLike,
+			flags: string | number,
+			mode?: number,
+		) => {
+			if (typeof pathname === "string" && path.dirname(path.resolve(pathname)) === lockDirectory)
+				openedLockPaths.add(path.resolve(pathname));
+			return originalOpen(pathname, flags, mode);
+		}) as typeof fs.openSync);
+		let results: PromiseSettledResult<ManagedGcSessionRetirementReceipt>[] = [];
+		try {
+			results = await Promise.allSettled([
+				publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture)),
+				publishManagedGcSessionRetirementReceipt(fixture.scope, secondReceipt),
+			]);
+		} finally {
+			open.mockRestore();
+			inventory.mockRestore();
+		}
+		expect(results.filter(result => result.status === "fulfilled")).toHaveLength(1);
+		const rejected = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+		expect(rejected?.reason).toMatchObject({ message: "managed_gc_journal_capacity_exceeded" });
+		expect(openedLockPaths.size).toBe(1);
+		expect([...openedLockPaths][0]).toBe(path.join(lockDirectory, `${MANAGED_GC_SCOPE_LOCK_NAME}.lock`));
+		expect(managedReceiptInventory(fixture.scope)).toHaveLength(1);
 	});
 
 	it("admits aggregate history bytes before candidate encoding and rejects over-budget read allocation", async () => {
