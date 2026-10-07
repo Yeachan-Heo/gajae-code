@@ -861,6 +861,7 @@ export async function assertExplicitTargetGjcNotSymlinked(root: string): Promise
 }
 
 async function readConfinedArtifactFile(candidate: string, confineRoot: string): Promise<string> {
+	const isWindows = process.platform === "win32";
 	let realRoot: string;
 	try {
 		realRoot = await fs.realpath(confineRoot);
@@ -869,23 +870,61 @@ async function readConfinedArtifactFile(candidate: string, confineRoot: string):
 		throw new RalplanCommandError(2, `failed to read --artifact ${candidate}: ${err.message}`);
 	}
 	let handle: fs.FileHandle;
+	if (isWindows) {
+		try {
+			const entry = await fs.lstat(candidate);
+			if (entry.isSymbolicLink()) {
+				throw new RalplanCommandError(2, `failed to read --artifact ${candidate}: symbolic links are not allowed`);
+			}
+		} catch (error) {
+			if (error instanceof RalplanCommandError) throw error;
+			const err = error as NodeJS.ErrnoException;
+			throw new RalplanCommandError(2, `failed to read --artifact ${candidate}: ${err.message}`);
+		}
+	}
 	try {
-		handle = await fs.open(candidate, fssync.constants.O_RDONLY | fssync.constants.O_NOFOLLOW);
+		const noFollow = isWindows ? 0 : fssync.constants.O_NOFOLLOW;
+		handle = await fs.open(candidate, fssync.constants.O_RDONLY | noFollow);
 	} catch (error) {
 		const err = error as NodeJS.ErrnoException;
 		throw new RalplanCommandError(2, `failed to read --artifact ${candidate}: ${err.message}`);
 	}
 	try {
-		const opened = await handle.stat();
+		const opened = await handle.stat({ bigint: true });
 		if (!opened.isFile()) {
 			throw new RalplanCommandError(2, `ralplan --artifact is not a regular file: ${candidate}`);
 		}
-		const fdPath = `/proc/self/fd/${handle.fd}`;
 		let openedIdentity: string;
-		try {
-			openedIdentity = await fs.realpath(fdPath);
-		} catch {
-			throw new RalplanCommandError(2, `ralplan --artifact identity could not be established: ${candidate}`);
+		if (isWindows) {
+			try {
+				openedIdentity = await fs.realpath(candidate);
+				const pathIdentity = await fs.stat(openedIdentity, { bigint: true });
+				const currentEntry = await fs.lstat(candidate, { bigint: true });
+				const identityMatches =
+					opened.dev !== 0n &&
+					opened.ino !== 0n &&
+					opened.dev === pathIdentity.dev &&
+					opened.ino === pathIdentity.ino;
+				if (currentEntry.isSymbolicLink()) {
+					throw new RalplanCommandError(
+						2,
+						`failed to read --artifact ${candidate}: symbolic links are not allowed`,
+					);
+				}
+				if (!identityMatches) {
+					throw new RalplanCommandError(2, `ralplan --artifact identity could not be established: ${candidate}`);
+				}
+			} catch (error) {
+				if (error instanceof RalplanCommandError) throw error;
+				throw new RalplanCommandError(2, `ralplan --artifact identity could not be established: ${candidate}`);
+			}
+		} else {
+			const fdPath = `/proc/self/fd/${handle.fd}`;
+			try {
+				openedIdentity = await fs.realpath(fdPath);
+			} catch {
+				throw new RalplanCommandError(2, `ralplan --artifact identity could not be established: ${candidate}`);
+			}
 		}
 		const relative = path.relative(realRoot, openedIdentity);
 		if (relative.startsWith("..") || path.isAbsolute(relative)) {
