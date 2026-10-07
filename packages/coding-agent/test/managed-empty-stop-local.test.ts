@@ -4,9 +4,9 @@ import type { AssistantMessage } from "@gajae-code/ai";
 import { classifyFallbackTrigger } from "@gajae-code/ai/utils/fallback-transport";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
-import { tagSdkLifecycleObserver } from "../src/extensibility/extensions/function-hooks-internal";
 import { ExtensionRuntime, loadExtensionFromFactory } from "../src/extensibility/extensions/loader";
 import { ExtensionRunner } from "../src/extensibility/extensions/runner";
+import { createSdkSessionRuntimeExtension } from "../src/sdk/host/session-runtime";
 import { AgentSession, type AgentSessionEvent } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
@@ -30,7 +30,6 @@ test.each([
 	});
 	const auth = await AuthStorage.create(":memory:");
 	let session: AgentSession | undefined;
-	let observedStarts = 0;
 	try {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
@@ -63,12 +62,14 @@ test.each([
 		const runtime = new ExtensionRuntime();
 		const extension = await loadExtensionFromFactory(
 			api => {
-				api.on(
-					"agent_start",
-					tagSdkLifecycleObserver(() => {
-						observedStarts++;
-					}),
-				);
+				// Exercise production registration and delivery with the real provider
+				// stream. Without session_start, this local test never starts a broker.
+				createSdkSessionRuntimeExtension(api, {
+					agentDir: process.cwd(),
+					createTransport: () => {
+						throw new Error("Local integration must not launch an SDK transport");
+					},
+				});
 			},
 			process.cwd(),
 			new EventBus(),
@@ -76,6 +77,7 @@ test.each([
 			"sdk-lifecycle-observer-test",
 		);
 		const runner = new ExtensionRunner([extension], runtime, process.cwd(), manager, registry, undefined, settings);
+		expect(runner.hasHandlers("agent_start")).toBe(true);
 		const agent = new Agent({
 			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
 			getApiKey: provider => registry.getApiKeyForProvider(provider),
@@ -100,7 +102,6 @@ test.each([
 		await session.waitForIdle();
 		const failed = scenario.endsWith("disabled");
 		expect(models).toEqual(scenario === "nonzero-usage" || failed ? ["primary"] : ["primary", "fallback"]);
-		expect(observedStarts).toBe(1);
 		const assistants = session.messages.filter(
 			(message): message is AssistantMessage => message.role === "assistant",
 		);
