@@ -18210,7 +18210,7 @@ export class AgentSession {
 
 		options?.onMutationStarted?.();
 		const cause = options?.cause ?? "user-selection";
-		if (role === "default" && cause === "user-selection") this.markUserModelSelection();
+		if (cause === "user-selection") this.markUserModelSelection();
 		this.#setModelAuthoritatively(model, cause);
 		if (cause === "user-selection") this.#unavailableModelProfile = undefined;
 		this.#seedSessionCanonicalVariant(model);
