@@ -1135,7 +1135,7 @@ type OAuthResolutionResult = { apiKey: string; credential: OAuthCredential };
  * Refreshed OAuth access plus identity metadata returned by
  * {@link AuthStorage.getOAuthAccess}. Callers that authenticate via a bearer
  * AND need the credential's identity (OpenAI code backend `chatgpt-account-id`, Google
- * `projectId`, GitHub `enterpriseUrl`, Kiro `profileArn`) consume this shape directly; the
+ * `projectId`, GitHub `enterpriseUrl`) consume this shape directly; the
  * refresh slot is deliberately omitted because rotating refresh tokens never
  * leave {@link AuthStorage}.
  */
@@ -1145,7 +1145,6 @@ export interface OAuthAccess {
 	email?: string;
 	projectId?: string;
 	enterpriseUrl?: string;
-	profileArn?: string;
 }
 export interface InvalidateCredentialMatchingOptions {
 	signal?: AbortSignal;
@@ -1288,7 +1287,6 @@ function oauthNonTokenFieldsEqual(left: OAuthCredential, right: OAuthCredential)
 		left.email === right.email &&
 		left.projectId === right.projectId &&
 		left.enterpriseUrl === right.enterpriseUrl &&
-		left.profileArn === right.profileArn &&
 		left.mcpBinding?.resourceOrigin === right.mcpBinding?.resourceOrigin &&
 		left.mcpBinding?.tokenEndpoint === right.mcpBinding?.tokenEndpoint
 	);
@@ -1308,18 +1306,12 @@ function authCredentialEquals(left: AuthCredential, right: AuthCredential): bool
 	);
 }
 
-function parseStructuredOAuthKey(
-	apiKey: string,
-): { token: string; projectId?: string; profileArn?: string } | undefined {
+function parseStructuredOAuthKey(apiKey: string): { token: string; projectId?: string } | undefined {
 	if (!apiKey.startsWith("{")) return undefined;
 	try {
-		const parsed = JSON.parse(apiKey) as { token?: unknown; projectId?: unknown; profileArn?: unknown };
+		const parsed = JSON.parse(apiKey) as { token?: unknown; projectId?: unknown };
 		if (typeof parsed.token !== "string") return undefined;
-		return {
-			token: parsed.token,
-			projectId: typeof parsed.projectId === "string" ? parsed.projectId : undefined,
-			profileArn: typeof parsed.profileArn === "string" ? parsed.profileArn : undefined,
-		};
+		return { token: parsed.token, projectId: typeof parsed.projectId === "string" ? parsed.projectId : undefined };
 	} catch {
 		return undefined;
 	}
@@ -1337,7 +1329,6 @@ function resolveMemoizedOAuthIdentityKey(provider: string, credential: OAuthCred
 		credential.email ?? "",
 		credential.projectId ?? "",
 		credential.enterpriseUrl ?? "",
-		credential.profileArn ?? "",
 		credential.access,
 		credential.refresh,
 	].join("\u0000");
@@ -1776,7 +1767,6 @@ export class AuthStorage {
 					usability,
 					credential.projectId ?? "",
 					credential.enterpriseUrl ?? "",
-					credential.profileArn ?? "",
 					credential.mcpBinding?.resourceOrigin ?? "",
 					credential.mcpBinding?.tokenEndpoint ?? "",
 				].join("\u0000");
@@ -1795,10 +1785,7 @@ export class AuthStorage {
 			const matchesRow = (entry: StoredCredential, tokens: readonly string[] | undefined): boolean => {
 				const credential = entry.credential;
 				if (credential.type !== "oauth" || keyToken.length === 0 || !tokens?.includes(keyToken)) return false;
-				return (
-					(structuredKey?.projectId === undefined || structuredKey.projectId === credential.projectId) &&
-					(structuredKey?.profileArn === undefined || structuredKey.profileArn === credential.profileArn)
-				);
+				return structuredKey?.projectId === undefined || structuredKey.projectId === credential.projectId;
 			};
 			// Current tokens win over rotated ones so a row's old token can never shadow another row's live token.
 			oauthKeyEntry =
@@ -4123,7 +4110,6 @@ export class AuthStorage {
 			projectId: credential.projectId,
 			email: credential.email,
 			enterpriseUrl: credential.enterpriseUrl,
-			profileArn: credential.profileArn,
 			mcpBinding: credential.mcpBinding,
 		};
 	}
@@ -4138,12 +4124,10 @@ export class AuthStorage {
 		if (projectId) parts.push(`project:${projectId}`);
 		const enterpriseUrl = credential.enterpriseUrl?.trim().toLowerCase();
 		if (enterpriseUrl) parts.push(`enterprise:${enterpriseUrl}`);
-		const profileArn = credential.profileArn?.trim();
-		if (profileArn) parts.push(`profile:${profileArn}`);
-		// Only fall back to a secret-derived key when stable credential identity is unavailable.
-		// Including the token hash when accountId/email/profileArn are present causes cache misses on
+		// Only fall back to a secret-derived key when a stable account identifier is unavailable.
+		// Including the token hash when accountId/email are present causes cache misses on
 		// every OAuth refresh — usage data is per-account, not per-token.
-		const hasStableIdentifier = Boolean(accountId || email || profileArn);
+		const hasStableIdentifier = Boolean(accountId || email);
 		if (!hasStableIdentifier) {
 			const secret = credential.apiKey?.trim() || credential.refreshToken?.trim() || credential.accessToken?.trim();
 			if (secret) {
@@ -4201,7 +4185,6 @@ export class AuthStorage {
 			projectId: credential.projectId,
 			email: credential.email,
 			enterpriseUrl: credential.enterpriseUrl,
-			profileArn: credential.profileArn,
 			mcpBinding: credential.mcpBinding,
 		};
 	}
@@ -4216,7 +4199,6 @@ export class AuthStorage {
 			projectId: refreshed.projectId ?? credential.projectId,
 			email: refreshed.email ?? credential.email,
 			enterpriseUrl: refreshed.enterpriseUrl ?? credential.enterpriseUrl,
-			profileArn: refreshed.profileArn ?? credential.profileArn,
 			mcpBinding: credential.mcpBinding,
 		};
 	}
@@ -4235,8 +4217,7 @@ export class AuthStorage {
 			return (
 				entry.credential.accountId === previous.accountId &&
 				entry.credential.email === previous.email &&
-				entry.credential.projectId === previous.projectId &&
-				entry.credential.profileArn === previous.profileArn
+				entry.credential.projectId === previous.projectId
 			);
 		});
 		return match?.id;
@@ -4251,8 +4232,7 @@ export class AuthStorage {
 			return (
 				entry.credential.accountId === previous.accountId &&
 				entry.credential.email === previous.email &&
-				entry.credential.projectId === previous.projectId &&
-				entry.credential.profileArn === previous.profileArn
+				entry.credential.projectId === previous.projectId
 			);
 		});
 		if (index === -1) return;
@@ -4267,7 +4247,6 @@ export class AuthStorage {
 			projectId: next.projectId,
 			email: next.email,
 			enterpriseUrl: next.enterpriseUrl,
-			profileArn: next.profileArn ?? existing.profileArn,
 			mcpBinding: next.mcpBinding ?? existing.mcpBinding,
 		});
 	}
@@ -5840,7 +5819,6 @@ export class AuthStorage {
 								email: claim.credential.email,
 								projectId: claim.credential.projectId,
 								enterpriseUrl: claim.credential.enterpriseUrl,
-								profileArn: claim.credential.profileArn,
 								mcpBinding: claim.credential.mcpBinding,
 								persistedByLease: true,
 							};
@@ -5955,7 +5933,6 @@ export class AuthStorage {
 				email: effectiveRefreshed.email ?? credential.email,
 				projectId: effectiveRefreshed.projectId ?? credential.projectId,
 				enterpriseUrl: effectiveRefreshed.enterpriseUrl ?? credential.enterpriseUrl,
-				profileArn: effectiveRefreshed.profileArn ?? credential.profileArn,
 				mcpBinding: (effectiveRefreshed as RefreshedOAuthCredentials).mcpBinding ?? credential.mcpBinding,
 			};
 			if (refreshLease) {
@@ -6143,7 +6120,6 @@ export class AuthStorage {
 				email: result.newCredentials.email ?? selection.credential.email,
 				projectId: result.newCredentials.projectId ?? selection.credential.projectId,
 				enterpriseUrl: result.newCredentials.enterpriseUrl ?? selection.credential.enterpriseUrl,
-				profileArn: result.newCredentials.profileArn ?? selection.credential.profileArn,
 				mcpBinding: refreshedAuthority.mcpBinding,
 			};
 			this.#replaceCredentialAt(
@@ -6452,12 +6428,6 @@ export class AuthStorage {
 		if (selectedCredential?.credential.type === "oauth") {
 			const expiresAt = selectedCredential.credential.expires;
 			if (Number.isFinite(expiresAt) && expiresAt > Date.now()) {
-				if (provider === "kiro") {
-					return JSON.stringify({
-						token: selectedCredential.credential.access,
-						profileArn: selectedCredential.credential.profileArn,
-					});
-				}
 				if (provider === "github-copilot") {
 					return JSON.stringify({
 						token: selectedCredential.credential.access,
@@ -6486,12 +6456,6 @@ export class AuthStorage {
 		if (oauthSelection) {
 			const expiresAt = oauthSelection.credential.expires;
 			if (Number.isFinite(expiresAt) && expiresAt > Date.now()) {
-				if (provider === "kiro") {
-					return JSON.stringify({
-						token: oauthSelection.credential.access,
-						profileArn: oauthSelection.credential.profileArn,
-					});
-				}
 				if (provider === "github-copilot") {
 					return JSON.stringify({
 						token: oauthSelection.credential.access,
@@ -6677,7 +6641,6 @@ export class AuthStorage {
 			email: credential.email,
 			projectId: credential.projectId,
 			enterpriseUrl: credential.enterpriseUrl,
-			profileArn: credential.profileArn,
 		};
 	}
 
@@ -6905,7 +6868,6 @@ export class AuthStorage {
 				email: refreshed.email ?? target.credential.email,
 				projectId: refreshed.projectId ?? target.credential.projectId,
 				enterpriseUrl: refreshed.enterpriseUrl ?? target.credential.enterpriseUrl,
-				profileArn: refreshed.profileArn ?? target.credential.profileArn,
 				mcpBinding: refreshed.mcpBinding,
 			};
 			this.#replaceCredentialAt(provider, index, updated, !refreshed.persistedByLease, id);
@@ -7160,8 +7122,6 @@ function extractOAuthCredentialIdentifiers(credential: OAuthCredential): string[
 	if (accountId) identifiers.add(`account:${accountId}`);
 	const email = normalizeStoredEmail(credential.email);
 	if (email) identifiers.add(`email:${email}`);
-	const profileArn = credential.profileArn?.trim();
-	if (profileArn) identifiers.add(`profile:${profileArn}`);
 	const accessIdentifiers = extractOAuthTokenIdentifiers(credential.access) ?? [];
 	for (const identifier of accessIdentifiers) {
 		identifiers.add(identifier);

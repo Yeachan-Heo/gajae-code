@@ -147,7 +147,6 @@ export interface UsageCredential {
 	projectId?: string;
 	email?: string;
 	enterpriseUrl?: string;
-	profileArn?: string;
 	mcpBinding?: UsageMCPOAuthBinding;
 	metadata?: Record<string, unknown>;
 }

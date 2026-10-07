@@ -135,16 +135,14 @@ When more than one OAuth credential is stored for the same provider (e.g. severa
 
 ### External CLI credential import roots
 
-`gjc setup credentials`, the TUI "import existing credentials" action, and the startup auto-import discover Claude Code, Codex CLI, and Kiro CLI social-login credentials on disk. Claude Code and Codex CLI relocate their own config root through the environment, so gjc follows the same variables instead of assuming the home-directory default. Kiro CLI stores social tokens in its local `data.sqlite3`; GJC reads only the `auth_kv` entry and never modifies that database.
+`gjc setup credentials`, the TUI "import existing credentials" action, and the startup auto-import discover Claude Code and Codex CLI credentials on disk. Both CLIs relocate their own config root through the environment, so gjc follows the same variables instead of assuming the home-directory default. This is what makes an account selected by an external account switcher (which launches the shell with these variables set) the account gjc imports.
 
 | Variable             | Used for                                                              | Required when                                        | Notes / precedence                                                                                                                                     |
 | -------------------- | --------------------------------------------------------------------- | ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `CLAUDE_CONFIG_DIR`  | Directory holding Claude Code's `.credentials.json`                   | Claude Code's config root is not `~/.claude`         | Read through `$credentialEnv` (project `.env` cannot redirect it). Must be absolute; relative or blank values fall back to `~/.claude`.                 |
 | `CODEX_HOME`         | Directory holding Codex CLI's `auth.json`                             | Codex CLI's home is not `~/.codex`                   | Read through `$credentialEnv` (project `.env` cannot redirect it). Must be absolute; relative or blank values fall back to `~/.codex`.                  |
-| `XDG_DATA_HOME`      | Kiro CLI data directory on Linux                                       | Kiro CLI data root is not `~/.local/share`            | Read through `$credentialEnv`; relative or blank values fall back to `~/.local/share`. GJC reads `kiro-cli/data.sqlite3` from this directory.                 |
-| `LOCALAPPDATA`       | Kiro CLI data directory on Windows                                     | Kiro CLI data root is not `%LOCALAPPDATA%`            | Read through `$credentialEnv`; relative or blank values fall back to `~/AppData/Local`. GJC reads `kiro-cli/data.sqlite3` from this directory.                  |
 
-Redacted summaries name environment redirects, never resolved paths. Kiro CLI's default database path is `~/Library/Application Support/kiro-cli/data.sqlite3` on macOS, `~/.local/share/kiro-cli/data.sqlite3` on Linux, and `%LOCALAPPDATA%/kiro-cli/data.sqlite3` on Windows. macOS Keychain discovery is unaffected: it is still only consulted when no Claude Code credential file is found.
+Redacted summaries name the variable (`Claude Code ($CLAUDE_CONFIG_DIR/.credentials.json)`), never the resolved path. macOS Keychain discovery is unaffected: it is still only consulted when no credential file is found.
 
 ---
 

@@ -22,7 +22,6 @@ import {
 } from "@gajae-code/utils";
 
 import type { Settings } from "../config/settings";
-import { resolveGlobalUserSkillLinkTrust } from "../config/skill-settings-defaults";
 import { clearCache as clearFsCache, findRepoRoot, cacheStats as fsCacheStats, invalidate as invalidateFs } from "./fs";
 import type {
 	Capability,
@@ -414,8 +413,6 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 	const ordinaryOptions: LoadOptions = options.isolatedHome ? { ...options, isolatedHome: false } : options;
 	const cwd = ordinaryOptions.cwd ?? getProjectDir();
 	const home = getTrustedHomeDir();
-	const activeSettings = ordinaryOptions.settings ?? settingsByCwd.get(path.normalize(cwd));
-	const globalSettings = typeof activeSettings?.getGlobal === "function" ? activeSettings : undefined;
 	const userAgentDir = ordinaryOptions.agentDir ? path.resolve(ordinaryOptions.agentDir) : getAgentDir();
 	const profileAuthority =
 		ordinaryOptions.profileAuthority ??
@@ -432,10 +429,6 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 		repoRoot,
 		isolatedHome: false,
 		settings: ordinaryOptions.settings,
-		allowExternalUserSkillSymlinks: resolveGlobalUserSkillLinkTrust({
-			trustUserSkills: globalSettings?.getGlobal("skills.trustUserSkills"),
-			enablePiUser: globalSettings?.getGlobal("skills.enablePiUser"),
-		}),
 		bypassCache: ordinaryOptions.bypassCache,
 	};
 	const providers = filterProviders(capability, ordinaryOptions);
@@ -528,16 +521,6 @@ export async function loadCapabilityForHome<T>(
 		isolatedHome,
 		homeIdentity,
 		settings: isolatedOptions.settings,
-		allowExternalUserSkillSymlinks: resolveGlobalUserSkillLinkTrust({
-			trustUserSkills:
-				typeof isolatedOptions.settings?.getGlobal === "function"
-					? isolatedOptions.settings.getGlobal("skills.trustUserSkills")
-					: undefined,
-			enablePiUser:
-				typeof isolatedOptions.settings?.getGlobal === "function"
-					? isolatedOptions.settings.getGlobal("skills.enablePiUser")
-					: undefined,
-		}),
 	};
 
 	return await loadImpl(capability, providers, ctx, isolatedOptions);

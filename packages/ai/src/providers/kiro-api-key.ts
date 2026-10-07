@@ -81,44 +81,15 @@ export function kiroApiRegion(options?: { region?: string }): string {
 	);
 }
 
-function kiroOAuthRegion(region?: string): string {
-	return region ?? $env.KIRO_REGION ?? $env.AWS_REGION ?? $env.AWS_DEFAULT_REGION ?? DEFAULT_REGION;
-}
-
 export function kiroApiBaseUrl(region: string): string {
 	assertAwsRegionLabel(region);
 	return `https://q.${region}.amazonaws.com/`;
-}
-
-function kiroOAuthBaseUrl(region: string): string {
-	assertAwsRegionLabel(region);
-	return `https://codewhisperer.${region}.amazonaws.com/`;
 }
 
 function isRegionDerivedKiroApiBaseUrl(baseUrl: string): boolean {
 	try {
 		const url = new URL(baseUrl);
 		const match = /^q\.([a-z0-9-]+)\.amazonaws\.com$/.exec(url.hostname);
-		if (!match) return false;
-		assertAwsRegionLabel(match[1]);
-		return (
-			url.protocol === "https:" &&
-			url.username === "" &&
-			url.password === "" &&
-			url.port === "" &&
-			url.pathname === "/" &&
-			url.search === "" &&
-			url.hash === ""
-		);
-	} catch {
-		return false;
-	}
-}
-
-function isRegionDerivedKiroOAuthBaseUrl(baseUrl: string): boolean {
-	try {
-		const url = new URL(baseUrl);
-		const match = /^codewhisperer\.([a-z0-9-]+)\.amazonaws\.com$/.exec(url.hostname);
 		if (!match) return false;
 		assertAwsRegionLabel(match[1]);
 		return (
@@ -360,7 +331,7 @@ export function kiroApiStaticModels(): Model<"kiro-codewhisperer-stream">[] {
 	return models;
 }
 
-/** Discover models available to a Kiro API key. */
+/** Discover models this API key can use. Returns null when the key is missing. */
 export async function fetchKiroApiModels(
 	apiKey: string,
 	region?: string,
@@ -381,55 +352,21 @@ export async function fetchKiroApiModels(
 		);
 	}
 	const payload = (await response.json()) as { models?: ApiModel[] };
-	return mapKiroDiscoveredModels(payload.models, baseUrl);
-}
-
-/** Discover models available to a Kiro social-login bearer token. */
-export async function fetchKiroOAuthModels(
-	accessToken: string,
-	profileArn?: string,
-	region?: string,
-): Promise<Model<"kiro-codewhisperer-stream">[]> {
-	const resolvedRegion = kiroOAuthRegion(region);
-	const baseUrl = kiroOAuthBaseUrl(resolvedRegion);
-	const response = await globalThis.fetch(baseUrl, {
-		method: "POST",
-		headers: {
-			"Content-Type": "application/x-amz-json-1.0",
-			Accept: "application/json",
-			Authorization: `Bearer ${accessToken}`,
-			"X-Amz-Target": LIST_TARGET,
-		},
-		body: JSON.stringify({ origin: KIRO_ORIGIN, ...(profileArn ? { profileArn } : {}) }),
-		redirect: "error",
-		signal: AbortSignal.timeout(15_000),
-	});
-	if (!response.ok) {
-		const body = await response.text().catch(() => "");
-		throw new Error(
-			sanitizeKiroError(`Kiro ListAvailableModels HTTP ${response.status}: ${body.slice(0, 500)}`, accessToken),
-		);
-	}
-	const payload = (await response.json()) as { models?: ApiModel[] };
-	return mapKiroDiscoveredModels(payload.models, baseUrl);
-}
-
-function mapKiroDiscoveredModels(
-	apiModels: ApiModel[] | undefined,
-	baseUrl: string,
-): Model<"kiro-codewhisperer-stream">[] {
 	const models: Model<"kiro-codewhisperer-stream">[] = [];
-	const trustedEndpoint = isRegionDerivedKiroApiBaseUrl(baseUrl) || isRegionDerivedKiroOAuthBaseUrl(baseUrl);
-	for (const item of apiModels ?? []) {
+	for (const item of payload.models ?? []) {
 		if (!item.modelId) continue;
 		const model = toModel(item, baseUrl);
 		models.push(model);
 		// Register as trusted identity if baseUrl is an official region-derived endpoint
-		if (trustedEndpoint) registerProviderSafetyStopModel(model);
+		if (isRegionDerivedKiroApiBaseUrl(baseUrl)) {
+			registerProviderSafetyStopModel(model);
+		}
 		const dashed = toGjcModelId(item.modelId);
 		if (dashed !== item.modelId) {
 			const dashedModel = { ...model, id: dashed };
-			if (trustedEndpoint) registerProviderSafetyStopModel(dashedModel);
+			if (isRegionDerivedKiroApiBaseUrl(baseUrl)) {
+				registerProviderSafetyStopModel(dashedModel);
+			}
 			models.push(dashedModel);
 		}
 	}
@@ -651,7 +588,7 @@ function convertTools(tools: Tool[]) {
 	}));
 }
 
-export function buildKiroThinkingPrefix(reasoning: string | boolean | undefined): string {
+function thinkingPrefix(reasoning: string | boolean | undefined): string {
 	if (!reasoning || reasoning === true) return "";
 	const budget = EFFORT_BUDGET[String(reasoning)] ?? 20_000;
 	return `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>`;
@@ -663,7 +600,7 @@ function buildApiKeyRequest(
 	options: KiroCodeWhispererOptions,
 ): unknown {
 	const modelId = toKiroModelId(model.wireModelId || model.id);
-	const prefix = buildKiroThinkingPrefix(options.reasoning);
+	const prefix = thinkingPrefix(options.reasoning);
 	let systemPrompt = context.systemPrompt?.join("\n") ?? "";
 	if (prefix) systemPrompt = systemPrompt ? `${prefix}\n${systemPrompt}` : prefix;
 

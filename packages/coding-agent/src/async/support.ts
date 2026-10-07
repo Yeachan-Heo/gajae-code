@@ -1,6 +1,4 @@
-import * as path from "node:path";
-import { directoryCaseSensitive } from "@gajae-code/natives";
-import { resolveEquivalentPath, stablePathKey } from "@gajae-code/utils";
+import { stablePathKey } from "@gajae-code/utils";
 import type { Settings } from "../config/settings";
 
 export function isBackgroundJobSupportEnabled(settings: Pick<Settings, "get">): boolean {
@@ -28,15 +26,7 @@ export function asyncJobEndpointId(
 	sessionId: string,
 	sessionFile: string | undefined,
 ): string {
-	if (providerSessionId === undefined || sessionFile === undefined) return sessionId;
-	const resolvedSessionFile = resolveEquivalentPath(sessionFile);
-	const caseSensitiveDirectory =
-		process.platform === "win32"
-			? (directoryCaseSensitive(path.dirname(resolvedSessionFile)) ?? undefined)
-			: undefined;
-	return JSON.stringify([
-		"async-job-endpoint",
-		providerSessionId,
-		stablePathKey(resolvedSessionFile, caseSensitiveDirectory),
-	]);
+	return providerSessionId !== undefined && sessionFile !== undefined
+		? JSON.stringify(["async-job-endpoint", providerSessionId, stablePathKey(sessionFile)])
+		: sessionId;
 }
