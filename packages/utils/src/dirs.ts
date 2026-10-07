@@ -96,9 +96,11 @@ export function stablePathKey(inputPath: string): string {
 	let entryPath = resolvedPath;
 	let entryExists = false;
 	try {
-		const entryStats = fs.lstatSync(entryPath);
+		fs.lstatSync(entryPath);
 		entryExists = true;
-		if (entryStats.isSymbolicLink()) entryPath = fs.realpathSync(entryPath);
+		// Resolve existing entries before using their name so 8.3 aliases and
+		// symlinks share the canonical entry name without depending on its inode.
+		entryPath = fs.realpathSync(entryPath);
 	} catch {}
 
 	const parentPath = path.dirname(entryPath);
