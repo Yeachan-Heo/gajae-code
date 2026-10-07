@@ -30,13 +30,18 @@ not independently auto-loaded. The link must resolve to a directory inside the s
 repository. Discovery, management listing, and skill invocation share this policy.
 The repository, link, and resolved target identities are checked during scanning and
 again when loading the body; replacing a captured link or target invalidates that
-discovery result. Dangling links, external targets, hardlinked skill files, and
-non-regular files are not admitted.
+discovery result. External project targets, hardlinked skill files, and non-regular
+files are not admitted.
 
-This exception does not apply to user/profile roots, custom directories, or repositories
-without a verified Git root. Native skill creation/import writes still refuse symlinked
-destination roots; manage the shared source files directly rather than replacing the
-project link with a copy.
+In user scope, an individual skill symlink inside `~/.gjc/agent/skills` or a configured
+custom directory may resolve outside its scan root when `skills.trustUserSkills` is
+enabled in user/global settings (on by default); project settings cannot grant this
+permission. The skill link, target, and file identities are checked again when loading
+body. Symlinked user/profile authority roots remain refused. Native skill
+creation/import writes still refuse symlinked destination roots. Management preserves
+the lexical link path and refuses to remove symlinked skills, so deleting a listed
+entry cannot recursively delete its shared target; remove the link from the scan
+directory directly when it is no longer needed.
 
 User scope (installed once, available in every project):
 

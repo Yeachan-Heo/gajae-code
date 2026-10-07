@@ -35,6 +35,8 @@ export interface LoadCustomizationInventoryOptions {
 	home?: string;
 	/** Skill management policy snapshot (trust, include/ignore, disabledExtensions). */
 	policy?: SkillManagementPolicy;
+	/** User-owned permission to follow external user skill symlinks. */
+	allowExternalUserSkillSymlinks?: boolean;
 	/** Disabled extension ids (`skill:<name>` / `mcp:<name>`) from settings. */
 	disabledExtensions?: string[];
 }
@@ -94,6 +96,7 @@ async function loadSkillRows(options: LoadCustomizationInventoryOptions, _warnin
 		cwd: options.cwd,
 		home: options.home,
 		policy: options.policy,
+		allowExternalUserSkillSymlinks: options.allowExternalUserSkillSymlinks,
 	});
 	const managedPaths = new Set<string>();
 	for (const record of records) {

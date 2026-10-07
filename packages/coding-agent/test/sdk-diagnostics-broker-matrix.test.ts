@@ -909,7 +909,6 @@ describe("budget reaches the native stage and identity is rechecked before the s
 					.catch(() => false)),
 		});
 		const facadeModule = path.join(import.meta.dir, "..", "src", "sdk", "diagnostics", "observe-broker.ts");
-		const loaderModule = path.join(import.meta.dir, "..", "..", "natives", "native", "diagnostic-loader.js");
 		const harness = path.join(workspace, "native-boundary.ts");
 		await Bun.write(
 			harness,

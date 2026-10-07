@@ -2494,17 +2494,20 @@ export class SelectorController {
 	 * default) then refresh the status surfaces. Rethrows so callers surface errors.
 	 */
 	async #applyModelProfile(profileName: string, persistDefault: boolean): Promise<void> {
+		this.ctx.session.markUserModelSelection();
 		const profileLabel = formatModelProfileDisplayLabel(
 			this.ctx.session.modelRegistry.getModelProfile(profileName) ?? { name: profileName },
 		);
-		await activateModelProfile(
-			{
-				session: this.ctx.session,
-				modelRegistry: this.ctx.session.modelRegistry,
-				settings: this.ctx.settings,
-				profileName,
-			},
-			{ persistDefault },
+		await this.ctx.session.withSdkControlMutation(() =>
+			activateModelProfile(
+				{
+					session: this.ctx.session,
+					modelRegistry: this.ctx.session.modelRegistry,
+					settings: this.ctx.settings,
+					profileName,
+				},
+				{ persistDefault },
+			),
 		);
 		this.ctx.statusLine.invalidate();
 		this.ctx.updateEditorBorderColor();
@@ -2774,8 +2777,15 @@ export class SelectorController {
 							return;
 						}
 						const { model, role, thinkingLevel, selector: selectedSelector } = selection;
+						if (
+							(role !== null && role !== "default") ||
+							selection.roles?.some(targetRole => targetRole !== "default")
+						) {
+							this.ctx.session.markUserModelSelection();
+						}
 						if (role === null) {
 							// Temporary: update agent state but don't persist to settings
+							this.ctx.session.markUserModelSelection();
 							await this.ctx.session.setModelTemporary(model, thinkingLevel, {
 								cause: "temporary-operation",
 								reason: "other",
@@ -3677,12 +3687,15 @@ export class SelectorController {
 			return;
 		}
 
-		await activateModelProfile({
-			session: this.ctx.session,
-			modelRegistry: this.ctx.session.modelRegistry,
-			settings: this.ctx.settings,
-			profileName: recommendedProfile.name,
-		});
+		this.ctx.session.markUserModelSelection();
+		await this.ctx.session.withSdkControlMutation(() =>
+			activateModelProfile({
+				session: this.ctx.session,
+				modelRegistry: this.ctx.session.modelRegistry,
+				settings: this.ctx.settings,
+				profileName: recommendedProfile.name,
+			}),
+		);
 	}
 
 	async #handleOAuthLogin(providerId: string, options?: OAuthSelectorOptions): Promise<void> {
