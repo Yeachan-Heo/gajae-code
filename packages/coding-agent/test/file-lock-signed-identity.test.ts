@@ -12,6 +12,18 @@ import {
 	withFileLock,
 } from "../src/config/file-lock";
 
+/** Canonicalize file IDs the same way production code does. */
+function canonicalLockFileId(value: bigint): bigint {
+	if (value < -(1n << 63n) || value > (1n << 64n) - 1n) throw new Error("file_lock_identity_out_of_range");
+	return BigInt.asUintN(64, value);
+}
+
+function canonicalLockDeviceId(value: bigint): bigint {
+	if (process.platform !== "win32") return canonicalLockFileId(value);
+	if (value < -(1n << 31n) || value > (1n << 32n) - 1n) throw new Error("file_lock_identity_out_of_range");
+	return BigInt.asUintN(32, value);
+}
+
 const roots: string[] = [];
 // A real NTFS lock directory exhibited this signed/unsigned pair under Bun and
 // the native snapshot API. The fixture makes it deterministic on every OS.
@@ -59,19 +71,28 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 		}
 		return handle;
 	});
-	const nativeSnapshot = (snapshot: NativeDirectoryTreeSnapshot): NativeDirectoryTreeSnapshot => ({
-		...snapshot,
-		rootIno: component === "info" ? snapshot.rootIno : ROOT_ID.toString(),
-		entries: snapshot.entries.map(entry => ({
-			...entry,
-			ino:
-				entry.relativePath === "" && component !== "info"
-					? ROOT_ID.toString()
-					: entry.relativePath === "info" && component !== "root"
-						? (INFO_ID + (nativeIdentityChanged ? 1n : 0n)).toString()
-						: entry.ino,
-		})),
-	});
+	const nativeSnapshot = (snapshot: NativeDirectoryTreeSnapshot): NativeDirectoryTreeSnapshot => {
+		// Canonicalize IDs the same way production code does when comparing identities
+		const canonicalRootId = canonicalLockFileId(BigInt.asIntN(64, ROOT_ID));
+		const canonicalInfoId = canonicalLockFileId(BigInt.asIntN(64, INFO_ID));
+		// On Windows, canonicalize DEVICE_ID; on other platforms, preserve the snapshot's dev
+		const canonicalRootDev = process.platform === "win32" ? canonicalLockDeviceId(DEVICE_ID).toString() : snapshot.rootDev;
+		return {
+			...snapshot,
+			rootDev: canonicalRootDev,
+			rootIno: component === "info" ? snapshot.rootIno : canonicalRootId.toString(),
+			entries: snapshot.entries.map(entry => ({
+				...entry,
+				dev: process.platform === "win32" ? canonicalLockDeviceId(DEVICE_ID).toString() : entry.dev,
+				ino:
+					entry.relativePath === "" && component !== "info"
+						? canonicalRootId.toString()
+						: entry.relativePath === "info" && component !== "root"
+							? (canonicalInfoId + (nativeIdentityChanged ? 1n : 0n)).toString()
+							: entry.ino,
+			})),
+		};
+	};
 	const originals = new Map<string, NativeDirectoryTreeSnapshot>();
 	const remove = vi.fn((target: string, snapshot: NativeDirectoryTreeSnapshot, parent?: { ino: bigint }) => {
 		const original = originals.get(target);
