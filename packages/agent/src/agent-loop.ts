@@ -2088,6 +2088,8 @@ function losslessDetachedClone<T>(value: T): T {
 						"kind",
 						"status",
 						"code",
+						"http2RstCode",
+						"nativeErrorCode",
 						"providerCode",
 						"openaiErrorCode",
 						"anthropicErrorType",
