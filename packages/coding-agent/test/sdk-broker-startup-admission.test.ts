@@ -2,6 +2,7 @@ import { expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { AcpSdkAdapter } from "../src/sdk/acp";
+import { DEFAULT_SDK_REQUEST_TIMEOUT_MS } from "../src/sdk/client/client";
 import {
 	Broker,
 	StartupAdmissionQueue,
@@ -833,14 +834,15 @@ test("the ACP caller deadline follows a supplied lifecycle deadline tuple, not t
 test("the ACP caller leaves an unbudgetable lifecycle request on the generic client deadline", async () => {
 	// A partial tuple conflicts with the broker's all-or-nothing deadline contract, and an
 	// out-of-range readiness value is out of contract on its own. Both are refused as invalid
-	// input before anything is queued, so neither may claim a startup-sized caller deadline.
+	// input before anything is queued, so neither may claim a startup-sized caller deadline. They stay
+	// bounded by the default client request deadline instead of going unbounded.
 	const partial = new TimeoutCapturingSdkClient();
 	await new AcpSdkAdapter({ client: partial as never }).global(
 		"session.create",
 		{ cwd: "/workspace", receivedAt: 1_000_000, requestedReadinessTimeoutMs: 30_000 },
 		"partial-deadline-tuple",
 	);
-	expect(partial.timeoutMs).toBeUndefined();
+	expect(partial.timeoutMs).toBe(DEFAULT_SDK_REQUEST_TIMEOUT_MS);
 
 	const outOfRange = new TimeoutCapturingSdkClient();
 	await new AcpSdkAdapter({ client: outOfRange as never }).global(
@@ -848,5 +850,5 @@ test("the ACP caller leaves an unbudgetable lifecycle request on the generic cli
 		{ cwd: "/workspace", readinessTimeoutMs: 600_000 },
 		"out-of-range-readiness",
 	);
-	expect(outOfRange.timeoutMs).toBeUndefined();
+	expect(outOfRange.timeoutMs).toBe(DEFAULT_SDK_REQUEST_TIMEOUT_MS);
 });
