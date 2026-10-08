@@ -148,6 +148,7 @@ describe("issue #6446 Windows path casing", () => {
 				stablePathKey(path.join(directory, "Session.jsonl.")),
 			);
 		} finally {
+			vi.restoreAllMocks();
 			await fsPromises.rm(directory, { recursive: true, force: true });
 		}
 	});
