@@ -59,8 +59,6 @@ describe("SessionLease", () => {
 		);
 		await writeFile(filePath, JSON.stringify({ ownerId: "owner-a" }), "utf8");
 
-
-
 		await releaseLease(root, SID, "owner-a");
 
 		expect(

@@ -6177,6 +6177,7 @@ describe("post-acceptance invocation terminalization", () => {
 		let harness: InvocationHarness | undefined;
 		let session: AgentSession | undefined;
 		let authStorage: AuthStorage | undefined;
+		let restoreEmission: (() => void) | undefined;
 		let providerCalls = 0;
 		try {
 			const real = await createTerminalizationSession(
@@ -6187,6 +6188,7 @@ describe("post-acceptance invocation terminalization", () => {
 					return createMockModel({ responses: [{ content: ["started"] }] }).stream(model, context, options);
 				},
 				{ "todo.enabled": true, "todo.reminders": true, "todo.reminders.max": 1, "retry.enabled": false },
+				true,
 			);
 			session = real.session;
 			session.setConfiguredModelChain("default", [selector(real.model)], "terminal-throw-test");
@@ -6198,9 +6200,16 @@ describe("post-acceptance invocation terminalization", () => {
 				isIdle: () => !session?.isStreaming,
 				sendUserMessage: realSendUserMessage(session),
 			});
-			session.subscribe(async event => {
-				await harness?.emit(event.type, event);
+			const runner = session.extensionRunner;
+			if (!runner) throw new Error("Expected the real awaited terminal extension bridge.");
+			const emit = runner.emit.bind(runner);
+			const emission = spyOn(runner, "emit").mockImplementation(async event => {
+				const result = await emit(event);
+				if (event.type === "agent_start" || event.type === "agent_failed" || event.type === "agent_end")
+					await harness?.emit(event.type, event);
+				return result;
 			});
+			restoreEmission = () => emission.mockRestore();
 			const accepted = await harness.control("turn.prompt", { text: "finish the outstanding work" });
 			expect(accepted.ok).toBe(true);
 			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
@@ -6227,6 +6236,7 @@ describe("post-acceptance invocation terminalization", () => {
 				outcome: { kind: "failed" },
 			});
 		} finally {
+			restoreEmission?.();
 			await session?.dispose();
 			authStorage?.close();
 			await harness?.stop();
