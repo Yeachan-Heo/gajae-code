@@ -4962,7 +4962,9 @@ async function streamAssistantResponse(
 				const onFactoryAbort = () => resolveFactoryAbort(ABORTED);
 				requestSignal.addEventListener("abort", onFactoryAbort, { once: true });
 				try {
-					const responseOrAbort = await Promise.race([responsePromise, factoryAbort]);
+					const responseOrAbort = requestSignal.aborted
+						? ABORTED
+						: await Promise.race([responsePromise, factoryAbort]);
 					if (responseOrAbort === ABORTED) {
 						const aborted = emitAbortedAssistantMessage(null, false, context, config, stream, scope);
 						await finishChat(aborted);
