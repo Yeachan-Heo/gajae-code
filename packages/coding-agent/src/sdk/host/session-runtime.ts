@@ -484,10 +484,24 @@ export interface SdkOnlyTerminalAbortSeams {
 
 export interface SdkOnlyDeadlineRecoveryCheckpoint {
 	at: number;
-	stage: "terminalization-start" | "terminalization-result" | "publication-start" | "publication-result";
+	stage:
+		| "terminalization-start"
+		| "terminalization-result"
+		| "publication-start"
+		| "publication-result"
+		| "note-transition-start"
+		| "note-transition-awaiting-finalization"
+		| "note-transition-finalization-ready"
+		| "note-transition-before-persist"
+		| "note-transition-persisted"
+		| "note-transition-persist-failed";
 	correlation: InvocationCorrelation;
 	result?: "settled" | "uncertain" | "published" | "not-published" | "rejected";
 	reason?: string;
+	recordStatus?: string;
+	recordRevision?: number;
+	recordTerminalAt?: number;
+	pendingFinalization?: boolean;
 	eventCaptured?: boolean;
 	eventPrepared?: boolean;
 	terminalCommitted?: boolean;
@@ -1040,7 +1054,12 @@ function canonicalizeHydratedDiagnostics(record: InvocationRecord): InvocationRe
 }
 
 export function createInvocationReconciliation(
-	options: { stateRoot?: string; sessionId?: string; store?: SdkOnlyReconciliationStore } = {},
+	options: {
+		stateRoot?: string;
+		sessionId?: string;
+		store?: SdkOnlyReconciliationStore;
+		onDeadlineRecoveryCheckpointForTests?: (checkpoint: SdkOnlyDeadlineRecoveryCheckpoint) => void;
+	} = {},
 ): InvocationReconciliation {
 	const ACTIVE_CAPACITY = 256;
 	const TERMINAL_CAPACITY = 512;
@@ -1078,6 +1097,17 @@ export function createInvocationReconciliation(
 		}
 	>();
 	const pendingTerminalVisibility = new Map<string, { visibleRecord: InvocationRecord; writes: number }>();
+	const recordDeadlineRecoveryCheckpoint = (
+		stage: SdkOnlyDeadlineRecoveryCheckpoint["stage"],
+		correlation: InvocationCorrelation,
+		details: Omit<SdkOnlyDeadlineRecoveryCheckpoint, "at" | "correlation" | "stage"> = {},
+	): void => {
+		try {
+			options.onDeadlineRecoveryCheckpointForTests?.({ at: Date.now(), stage, correlation, ...details });
+		} catch {
+			// A test observer must never participate in durable reconciliation.
+		}
+	};
 	const retainPendingTerminalVisibility = (recordKey: string, visibleRecord: InvocationRecord): (() => void) => {
 		const existing = pendingTerminalVisibility.get(recordKey);
 		if (existing) existing.writes += 1;
@@ -1272,7 +1302,22 @@ export function createInvocationReconciliation(
 			let record = records.get(recordKey);
 			if (!record) return;
 			const pending = pendingFinalizations.get(recordKey);
+			const isPromptEnd = kind === "prompt" && frame.type === "agent_end";
+			if (isPromptEnd)
+				recordDeadlineRecoveryCheckpoint("note-transition-start", correlation, {
+					recordStatus: record.status,
+					recordRevision: record.revision,
+					recordTerminalAt: record.terminalAt,
+					pendingFinalization: pending?.finalizedRecord === record,
+				});
 			if (pending?.finalizedRecord === record) {
+				if (isPromptEnd)
+					recordDeadlineRecoveryCheckpoint("note-transition-awaiting-finalization", correlation, {
+						recordStatus: record.status,
+						recordRevision: record.revision,
+						recordTerminalAt: record.terminalAt,
+						pendingFinalization: true,
+					});
 				const upgrade = Promise.withResolvers<void>();
 				pending.upgrades.add(upgrade);
 				let upgradeError: unknown;
@@ -1284,6 +1329,13 @@ export function createInvocationReconciliation(
 						// so a real lifecycle event is never swallowed.
 					}
 					const current = records.get(recordKey);
+					if (isPromptEnd)
+						recordDeadlineRecoveryCheckpoint("note-transition-finalization-ready", correlation, {
+							recordStatus: current?.status,
+							recordRevision: current?.revision,
+							recordTerminalAt: current?.terminalAt,
+							pendingFinalization: pendingFinalizations.get(recordKey) === pending,
+						});
 					const incomingOutcome = frame.type === "agent_end" ? canonicalTerminalOutcome(frame.outcome) : undefined;
 					const providerFailure =
 						current?.error !== undefined && current.error.code !== "prompt_deadline_exceeded";
@@ -1665,10 +1717,31 @@ export function createInvocationReconciliation(
 				record.terminalAt === undefined && next.terminalAt !== undefined
 					? retainPendingTerminalVisibility(recordKey, record)
 					: undefined;
+			if (isPromptEnd)
+				recordDeadlineRecoveryCheckpoint("note-transition-before-persist", correlation, {
+					recordStatus: next.status,
+					recordRevision: next.revision,
+					recordTerminalAt: next.terminalAt,
+					pendingFinalization: pendingFinalizations.has(recordKey),
+				});
 			records.set(recordKey, next);
 			try {
 				await persist();
+				if (isPromptEnd)
+					recordDeadlineRecoveryCheckpoint("note-transition-persisted", correlation, {
+						recordStatus: next.status,
+						recordRevision: next.revision,
+						recordTerminalAt: next.terminalAt,
+						pendingFinalization: pendingFinalizations.has(recordKey),
+					});
 			} catch (error) {
+				if (isPromptEnd)
+					recordDeadlineRecoveryCheckpoint("note-transition-persist-failed", correlation, {
+						recordStatus: next.status,
+						recordRevision: next.revision,
+						recordTerminalAt: next.terminalAt,
+						pendingFinalization: pendingFinalizations.has(recordKey),
+					});
 				if (records.get(recordKey) === next) records.set(recordKey, record);
 				throw error;
 			} finally {
@@ -6437,7 +6510,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const reconciliationStore =
 			options.terminalAbortSeams?.getReconciliationStore?.() ??
 			createReconciliationStore({ sessionFile, sessionId });
-		const reconciliation = createInvocationReconciliation({ store: reconciliationStore });
+		const reconciliation = createInvocationReconciliation({
+			store: reconciliationStore,
+			onDeadlineRecoveryCheckpointForTests: options.terminalAbortSeams?.onDeadlineRecoveryCheckpointForTests,
+		});
 		await reconciliation.hydrate();
 		const steerReconciliation = createKindAwareReconciliation({
 			store: reconciliationStore as never,
