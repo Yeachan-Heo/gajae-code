@@ -19,6 +19,7 @@ import {
 	parseBrokerHopReply,
 	reapDetachedBrokerPidForTest,
 	reapSpawnedBrokerForTest,
+	signalDetachedBrokerProcessForTest,
 	signalPinnedBrokerProcessForTest,
 } from "../src/sdk/broker/ensure";
 import { writeBrokerHopReplyForTest } from "../src/sdk/broker/hop";
@@ -335,6 +336,16 @@ describe("SDK broker hop protocol", () => {
 		expect(signals).toEqual([]);
 		expect(signalPinnedBrokerProcessForTest(reference, "windows:11", "SIGTERM")).toBe(true);
 		expect(signals).toEqual([os.constants.signals.SIGTERM]);
+	});
+
+	test("detached broker signaling fails closed on Darwin without a pinned signal primitive", () => {
+		const kill = spyOn(process, "kill").mockImplementation(() => true);
+		try {
+			expect(signalDetachedBrokerProcessForTest(12345, "darwin:123", "SIGTERM", "darwin")).toBe(false);
+			expect(kill).not.toHaveBeenCalled();
+		} finally {
+			kill.mockRestore();
+		}
 	});
 
 	test("failed successor handoff retries cleanup for its captured broker identity", async () => {

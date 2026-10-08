@@ -841,7 +841,8 @@ async function reapSpawnedBroker(
 /**
  * Reap a broker launched by a short-lived hop or trampoline. The launcher has
  * already exited, so its ChildProcess carries no signal to await: the real broker
- * is targeted by the reported pid, and every poll/signal is fenced by incarnation.
+ * is targeted by the reported pid, and every poll is fenced by incarnation.
+ * Signals use a pinned OS process handle; unsupported platforms fail closed.
  */
 interface PinnedBrokerProcess {
 	readonly incarnation: string;
@@ -858,19 +859,17 @@ function signalPinnedBrokerProcess(
 	return signalNumber !== undefined && reference.signalRoot(signalNumber);
 }
 
-function signalDetachedBrokerProcess(pid: number, brokerIncarnation: string, signal: NodeJS.Signals): boolean {
-	if (process.platform !== "darwin") {
-		const reference = nativeProcessBindings().Process.fromPid(pid);
-		return signalPinnedBrokerProcess(reference, brokerIncarnation, signal);
-	}
-	// Darwin's signalRoot intentionally fails closed; keep the existing
-	// incarnation-checked process.kill path where the native API cannot bind a signal.
-	try {
-		process.kill(pid, signal);
-		return true;
-	} catch {
-		return false;
-	}
+function signalDetachedBrokerProcess(
+	pid: number,
+	brokerIncarnation: string,
+	signal: NodeJS.Signals,
+	platform: NodeJS.Platform = process.platform,
+): boolean {
+	// Darwin has no atomic identity-bound signal primitive. A separate
+	// incarnation check cannot close the PID-reuse window before process.kill.
+	if (platform === "darwin") return false;
+	const reference = nativeProcessBindings().Process.fromPid(pid);
+	return signalPinnedBrokerProcess(reference, brokerIncarnation, signal);
 }
 
 async function reapDetachedBrokerPid(
@@ -1551,6 +1550,15 @@ export function signalPinnedBrokerProcessForTest(
 	signal: NodeJS.Signals,
 ): boolean {
 	return signalPinnedBrokerProcess(reference, expectedIncarnation, signal);
+}
+/** Test hook: verifies platforms without identity-bound signaling fail closed. */
+export function signalDetachedBrokerProcessForTest(
+	pid: number,
+	brokerIncarnation: string,
+	signal: NodeJS.Signals,
+	platform: NodeJS.Platform,
+): boolean {
+	return signalDetachedBrokerProcess(pid, brokerIncarnation, signal, platform);
 }
 /** Test hook: resolves the complete broker environment without spawning. */
 export function brokerSpawnEnvironmentForTest(
