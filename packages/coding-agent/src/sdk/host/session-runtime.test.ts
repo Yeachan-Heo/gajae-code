@@ -8530,8 +8530,15 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		try {
 			harness = await invocationHarness(sessionId, cwd, {
 				settings: {
+					// This test covers deferred terminal recovery, not deadline-triggered worktree persistence.
 					get: (key: string) =>
-						key === "sdk.promptDeadlineMs" ? 150 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
+						key === "sdk.promptDeadlineMs"
+							? 150
+							: key === "sdk.promptMaxRuntimeMs"
+								? 60_000
+								: key === "sdk.flushWorktreeOnDeadline"
+									? false
+									: undefined,
 				} as unknown as Settings,
 				sendUserMessage: async (_content, options) => {
 					await options?.onPreflightAcceptCommit?.();
