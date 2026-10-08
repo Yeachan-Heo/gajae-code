@@ -46,6 +46,7 @@ import {
 	createSdkSessionRuntimeExtension,
 	createSdkSurfaceFactory,
 	RetainedTerminalBoundaryRegistry,
+	type SdkOnlyDeadlineRecoveryCheckpoint,
 	type SdkOnlyInvocationRecord,
 	type SdkOnlyReconciliationStore,
 	type SdkOnlyTerminalAbortSeams,
@@ -8524,22 +8525,16 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		const store = createReconciliationStore({ sessionFile, sessionId });
 		const activeTools = new Set(["unfenced-tool"]);
 		const toolDrainObserved = Promise.withResolvers<void>();
+		const recoveryCheckpoints: SdkOnlyDeadlineRecoveryCheckpoint[] = [];
 		let boundaryWaitStarted = false;
 		let abortCalls = 0;
 		let harness: InvocationHarness | undefined;
 		try {
 			harness = await invocationHarness(sessionId, cwd, {
-				// Keep the independently bounded worktree flush out of this recovery-status wait.
 				settings: {
 					// This test covers deferred terminal recovery, not deadline-triggered worktree persistence.
 					get: (key: string) =>
-						key === "sdk.promptDeadlineMs"
-							? 150
-							: key === "sdk.promptMaxRuntimeMs"
-								? 60_000
-								: key === "sdk.flushWorktreeOnDeadline"
-									? false
-									: undefined,
+						key === "sdk.promptDeadlineMs" ? 150 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
 				} as unknown as Settings,
 				sendUserMessage: async (_content, options) => {
 					await options?.onPreflightAcceptCommit?.();
@@ -8549,6 +8544,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 					getReconciliationStore: () => store,
 					getTerminalTurnEpoch: () => 109,
 					getActivePromptHandle: () => "deadline-captured-uncertain-run",
+					onDeadlineRecoveryCheckpointForTests: checkpoint => recoveryCheckpoints.push(checkpoint),
 					pendingToolExecutions: () => {
 						if (activeTools.size > 0) boundaryWaitStarted = true;
 						const pending = [...activeTools];
@@ -8605,7 +8601,29 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			// tool-set drain; clearing the test seam alone does not wake its bounded
 			// retry timer.
 			await toolDrainObserved.promise;
-			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
+			let terminalStatus: NonNullable<ResponseFrame["result"]>;
+			try {
+				terminalStatus = await settledStatus(harness, "turn.prompt_status", correlation);
+			} catch (error) {
+				const finalRecord = store.snapshot().find(record => record.commandId === correlation.commandId) as
+					| (SdkOnlyInvocationRecord & {
+							pendingOutcome?: unknown;
+							deadlineRecoveryPending?: boolean;
+							terminalAt?: number;
+					  })
+					| undefined;
+				throw new Error(
+					`${error instanceof Error ? error.message : String(error)}; deadline checkpoints=${JSON.stringify(recoveryCheckpoints)}; durable=${JSON.stringify(
+						{
+							status: finalRecord?.status,
+							terminalAt: finalRecord?.terminalAt,
+							deadlineRecoveryPending: finalRecord?.deadlineRecoveryPending,
+							pendingOutcome: finalRecord?.pendingOutcome,
+						},
+					)}`,
+				);
+			}
+			expect(terminalStatus).toMatchObject({
 				status: "terminal_ok",
 				outcome: { kind: "stopped", reason: "cancelled" },
 			});

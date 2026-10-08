@@ -445,6 +445,7 @@ export interface SdkOnlyTerminalAbortSeams {
 	getReconciliationStore?: () => SdkOnlyReconciliationStore | undefined;
 	getTerminalTurnEpoch: () => number | undefined;
 	getActivePromptHandle: () => string | undefined;
+	onDeadlineRecoveryCheckpointForTests?: (checkpoint: SdkOnlyDeadlineRecoveryCheckpoint) => void;
 	/** Re-read the active prompt's owning SDK connection for the owner-mismatch
 	 *  recheck; falls back to the runtime-tracked owner when absent (review
 	 *  thread P1). */
@@ -479,6 +480,20 @@ export interface SdkOnlyTerminalAbortSeams {
 	pendingToolExecutions?: (handle: string) => readonly string[];
 	/** Test override for the maximum durable terminal reservation rows. */
 	maxDurableTerminalReservationsForTests?: number;
+}
+
+export interface SdkOnlyDeadlineRecoveryCheckpoint {
+	at: number;
+	stage: "terminalization-start" | "terminalization-result" | "publication-start" | "publication-result";
+	correlation: InvocationCorrelation;
+	result?: "settled" | "uncertain" | "published" | "not-published" | "rejected";
+	reason?: string;
+	eventCaptured?: boolean;
+	eventPrepared?: boolean;
+	terminalCommitted?: boolean;
+	leaseCurrent?: boolean;
+	pendingToolCount?: number;
+	errorCode?: string;
 }
 
 /**
@@ -6429,6 +6444,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			ownedKinds: ["steer"],
 		});
 		await steerReconciliation.hydrateFromStore();
+		const recordDeadlineRecoveryCheckpoint = (checkpoint: Omit<SdkOnlyDeadlineRecoveryCheckpoint, "at">): void => {
+			try {
+				options.terminalAbortSeams?.onDeadlineRecoveryCheckpointForTests?.({ ...checkpoint, at: Date.now() });
+			} catch {
+				// A test observer must never participate in deadline correctness.
+			}
+		};
 		const deadlineManager = new PromptDeadlineManager({
 			reconciliation,
 			getLeaseMs: () => resolveSdkPromptDeadlineMs(options.settings?.get("sdk.promptDeadlineMs" as never)),
@@ -6498,8 +6520,34 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				const observation = deadlineTerminalizationObservations.get(target);
 				const seams = options.terminalAbortSeams;
 				const pendingToolExecutions = seams?.pendingToolExecutions;
-				if (!observation || !seams || !pendingToolExecutions) return "uncertain";
-				const pendingTools = () => pendingToolExecutions(observation.handle);
+				recordDeadlineRecoveryCheckpoint({
+					stage: "terminalization-start",
+					correlation,
+					eventCaptured: observation?.eventCaptured,
+					eventPrepared: observation?.eventPrepared,
+					terminalCommitted: observation?.terminalCommitted,
+				});
+				let pendingToolCount: number | undefined;
+				const finish = (result: PromptDeadlineTerminalization, reason: string): PromptDeadlineTerminalization => {
+					recordDeadlineRecoveryCheckpoint({
+						stage: "terminalization-result",
+						correlation,
+						result,
+						reason,
+						eventCaptured: observation?.eventCaptured,
+						eventPrepared: observation?.eventPrepared,
+						terminalCommitted: observation?.terminalCommitted,
+						pendingToolCount,
+					});
+					return result;
+				};
+				if (!observation || !seams || !pendingToolExecutions)
+					return finish("uncertain", "missing-observation-or-tool-observer");
+				const pendingTools = () => {
+					const pending = pendingToolExecutions(observation.handle);
+					pendingToolCount = pending.length;
+					return pending;
+				};
 				const awaitEventPreparation = async (): Promise<boolean> => {
 					if (observation.eventPrepared) return true;
 					const captured = await Promise.race([
@@ -6510,7 +6558,15 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				};
 				if (observation.eventCaptured) {
 					const prepared = await awaitEventPreparation();
-					return prepared && pendingTools().length === 0 ? "settled" : "uncertain";
+					pendingToolCount = pendingTools().length;
+					return finish(
+						prepared && pendingToolCount === 0 ? "settled" : "uncertain",
+						!prepared
+							? "captured-event-not-prepared"
+							: pendingToolCount > 0
+								? "tools-still-pending"
+								: "captured-event-and-tools-settled",
+					);
 				}
 
 				if (!observation.eventCaptured) {
@@ -6524,13 +6580,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 							entry => lifecycleCorrelationKey(entry.correlation) === target,
 						)
 					)
-						return "uncertain";
+						return finish("uncertain", "lifecycle-batch-no-longer-owns-correlation");
 					if (
 						!isCurrent() ||
 						seams.getActivePromptHandle() !== observation.handle ||
 						seams.getTerminalTurnEpoch() !== observation.epoch
 					)
-						return "uncertain";
+						return finish("uncertain", "lease-or-active-run-mismatch");
 				}
 				await waitForToolCallBoundary({
 					pending: pendingTools,
@@ -6539,14 +6595,22 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				});
 				if (observation.eventCaptured) {
 					const prepared = await awaitEventPreparation();
-					return prepared && pendingTools().length === 0 ? "settled" : "uncertain";
+					pendingToolCount = pendingTools().length;
+					return finish(
+						prepared && pendingToolCount === 0 ? "settled" : "uncertain",
+						!prepared
+							? "captured-event-not-prepared"
+							: pendingToolCount > 0
+								? "tools-still-pending"
+								: "captured-event-and-tools-settled",
+					);
 				}
 				if (
 					!isCurrent() ||
 					seams.getActivePromptHandle() !== observation.handle ||
 					seams.getTerminalTurnEpoch() !== observation.epoch
 				)
-					return "uncertain";
+					return finish("uncertain", "lease-or-active-run-mismatch-after-tool-boundary");
 
 				let steeringSnapshotToken: number | undefined;
 				let proof: { status: string; terminalScope?: unknown } | undefined;
@@ -6563,7 +6627,15 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					});
 					if (proof.status !== "settled") {
 						const prepared = await awaitEventPreparation();
-						return prepared && pendingTools().length === 0 ? "settled" : "uncertain";
+						pendingToolCount = pendingTools().length;
+						return finish(
+							prepared && pendingToolCount === 0 ? "settled" : "uncertain",
+							!prepared
+								? "abort-proof-not-settled-and-event-not-prepared"
+								: pendingToolCount > 0
+									? "tools-still-pending"
+									: "captured-event-and-tools-settled",
+						);
 					}
 					const terminalScope = proof.terminalScope as
 						| { abortedAttemptEpoch?: unknown; lineageIdHash?: unknown }
@@ -6573,17 +6645,26 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						typeof terminalScope.lineageIdHash !== "string" ||
 						isOwnedAttemptRegistrationIncomplete(terminalScope.lineageIdHash, observation.epoch)
 					)
-						return "uncertain";
+						return finish("uncertain", "terminal-scope-mismatch");
 					const exactJobs = findOwnedRegistrationsForTurn(terminalScope.lineageIdHash, observation.epoch);
 					if (exactJobs.length > 0) {
 						const endpointId = exactJobs[0]?.endpointId;
 						const manager = AsyncJobManager.forEndpoint(endpointId) ?? AsyncJobManager.instance();
-						if (!manager || (await settleOwnedWork(manager, exactJobs, 500)) !== "stopped") return "uncertain";
+						if (!manager || (await settleOwnedWork(manager, exactJobs, 500)) !== "stopped")
+							return finish("uncertain", "owned-work-not-stopped");
 					}
 					const prepared = await awaitEventPreparation();
-					return prepared && pendingTools().length === 0 ? "settled" : "uncertain";
+					pendingToolCount = pendingTools().length;
+					return finish(
+						prepared && pendingToolCount === 0 ? "settled" : "uncertain",
+						!prepared
+							? "captured-event-not-prepared"
+							: pendingToolCount > 0
+								? "tools-still-pending"
+								: "captured-event-and-tools-settled",
+					);
 				} catch {
-					return "uncertain";
+					return finish("uncertain", "terminal-abort-error");
 				} finally {
 					if (steeringSnapshotToken !== undefined && proof?.status !== "settled")
 						seams.discardTerminalAbortSteeringSnapshot?.(steeringSnapshotToken);
@@ -6595,21 +6676,57 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				const terminalOutcome = observation
 					? deadlineOutcomeAfterAbort(correlation, observation.terminalOutcome, observation.terminalHasActivity)
 					: undefined;
-				if (!observation?.eventCaptured || !observation.eventPrepared || terminalOutcome === undefined)
+				let terminalIsCurrent: boolean | undefined;
+				let pendingToolCount = -1;
+				const recordPublicationResult = (
+					result: SdkOnlyDeadlineRecoveryCheckpoint["result"],
+					reason: string,
+					errorCodeValue?: string,
+				): void => {
+					recordDeadlineRecoveryCheckpoint({
+						stage: "publication-result",
+						correlation,
+						result,
+						reason,
+						eventCaptured: observation?.eventCaptured,
+						eventPrepared: observation?.eventPrepared,
+						terminalCommitted: observation?.terminalCommitted,
+						leaseCurrent: terminalIsCurrent,
+						pendingToolCount,
+						errorCode: errorCodeValue,
+					});
+				};
+				recordDeadlineRecoveryCheckpoint({
+					stage: "publication-start",
+					correlation,
+					eventCaptured: observation?.eventCaptured,
+					eventPrepared: observation?.eventPrepared,
+					terminalCommitted: observation?.terminalCommitted,
+				});
+				if (!observation?.eventCaptured || !observation.eventPrepared || terminalOutcome === undefined) {
+					recordPublicationResult("rejected", "missing-captured-terminal-outcome");
 					return false;
+				}
 				if (!observation.terminalCommitted) {
 					const pendingTools = options.terminalAbortSeams?.pendingToolExecutions;
-					let terminalIsCurrent = false;
-					let pendingToolCount = -1;
 					try {
 						terminalIsCurrent = isCurrent();
 						if (pendingTools) pendingToolCount = pendingTools(observation.handle).length;
-					} catch {
+					} catch (error) {
+						recordPublicationResult("rejected", "publication-precheck-threw", errorCode(error));
 						return false;
 					}
-					if (!terminalIsCurrent || !pendingTools || pendingToolCount > 0) return false;
+					if (!terminalIsCurrent || !pendingTools || pendingToolCount > 0) {
+						recordPublicationResult("rejected", "publication-precheck-rejected");
+						return false;
+					}
 					try {
-						if (!isCurrent() || pendingTools(observation.handle).length > 0) return false;
+						terminalIsCurrent = isCurrent();
+						pendingToolCount = pendingTools(observation.handle).length;
+						if (!terminalIsCurrent || pendingToolCount > 0) {
+							recordPublicationResult("rejected", "publication-recheck-rejected");
+							return false;
+						}
 						// Commit the authoritative Q26 result before exposing its terminal
 						// boundary; a crash between publication and this write would strand
 						// restart recovery with only a hidden pending claim.
@@ -6622,11 +6739,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						observation.terminalOutcome = terminalOutcome;
 						observation.terminalCommitted = true;
 						observation.clearUnrecordedFailure?.();
-					} catch {
+					} catch (error) {
+						recordPublicationResult("rejected", "terminal-transition-persist-failed", errorCode(error));
 						return false;
 					}
 				}
 				const published = publishDeadlineTerminalBoundary(observation, correlation, terminalOutcome);
+				recordPublicationResult(published ? "published" : "not-published", "terminal-boundary-result");
 				return { outcome: terminalOutcome, published } satisfies PromptDeadlinePublicationResult;
 			},
 			// Persist the agent's uncommitted work before the retirement below tears
