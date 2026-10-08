@@ -5994,7 +5994,18 @@ export class AgentSession {
 								this.#settleDeliveredOwnedRegistrations(survivors);
 								return "dropped" as const;
 							}
-							if (this.#turnEndPersistenceFailure) await this.#reconcileTurnEndPersistenceFailure();
+							if (this.#turnEndPersistenceFailure) {
+								await this.#reconcileTurnEndPersistenceFailure();
+								if (!identityIsCurrent()) {
+									this.#settleDeliveredOwnedRegistrations(survivors);
+									return "dropped" as const;
+								}
+							}
+							this.#assertNoSessionTransition();
+							if (!identityIsCurrent()) {
+								this.#settleDeliveredOwnedRegistrations(survivors);
+								return "dropped" as const;
+							}
 							if (survivors.some(message => ownedCompletionResumeAction(message) === "fresh"))
 								this.#resumeFromOwnedCompletion();
 							if (survivors.length === 1) {
@@ -6045,11 +6056,11 @@ export class AgentSession {
 					return "dropped" as const;
 				}
 			},
-			scheduleIdleFlush: (run, onSkip) => {
+			scheduleIdleFlush: (run, onSkip, requestedDelayMs) => {
 				// The startup barrier already gates injectIdle, so begin waiting on a
 				// pending barrier immediately. Once readiness has settled, ordinary
 				// idle wakes retain the fixed merge window.
-				const delayMs = this.#startupTurnBarrierPending ? 0 : FOLD_WAKE_MERGE_WINDOW_MS;
+				const delayMs = requestedDelayMs ?? (this.#startupTurnBarrierPending ? 0 : FOLD_WAKE_MERGE_WINDOW_MS);
 				this.#schedulePostPromptTask(
 					async signal => {
 						await run(signal);

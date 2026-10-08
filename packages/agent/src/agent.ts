@@ -570,6 +570,8 @@ export class Agent {
 	#resolveRunningPrompt?: () => void;
 	#runSequence = 0;
 	#activeRunId?: number;
+	#pendingTurnEndPublication?: { runId: number; completion: Promise<void> };
+	#forcedAbortPublicationRunId?: number;
 	#activeResourceRunId?: string;
 	#activeResourceCancellationDomain?: RunCancellationDomain;
 	#continuationGeneration = 0;
@@ -1622,6 +1624,10 @@ export class Agent {
 		const targetLogicalRunId = logicalRunId ?? this.#managedLogicalRunOwner ?? this.#activeRunId;
 		const handle = targetLogicalRunId !== undefined ? this.#runHandles.get(targetLogicalRunId) : undefined;
 		const runId = this.#activeRunId;
+		const pendingTurnEndPublication =
+			runId !== undefined && this.#pendingTurnEndPublication?.runId === runId
+				? this.#pendingTurnEndPublication
+				: undefined;
 		const managedLogicalRunId = this.#managedLogicalRunOwner;
 		const activeLogicalRunId = managedLogicalRunId ?? runId;
 		if (
@@ -1633,38 +1639,53 @@ export class Agent {
 		}
 		const activeResourceDomain = this.#activeResourceCancellationDomain;
 		const activeResourceRunId = this.#activeResourceRunId;
+		const resolve = this.#resolveRunningPrompt;
 		const hadActiveRun = runId !== undefined && (this.#runningPrompt !== undefined || this.#state.isStreaming);
 		if (!hadActiveRun) return false;
 
 		this.#abortController?.abort(reason);
 		this.#continuationGeneration++;
 		this.#attemptAuthority.advanceMain();
-		this.#state.isStreaming = false;
-		this.#state.streamMessage = null;
-		this.#state.pendingToolCalls = new Set<string>();
 		this.#abortController = undefined;
 		this.#cursorToolResultBuffer = [];
 		this.#managedLogicalRunOwner = undefined;
 
-		const resolve = this.#resolveRunningPrompt;
-		this.#runningPrompt = undefined;
-		this.#resolveRunningPrompt = undefined;
 		this.#activeRunId = undefined;
 		this.#activeResourceRunId = undefined;
 		this.#activeResourceCancellationDomain = undefined;
-		resolve?.();
-		this.#finalizeRun(
-			activeLogicalRunId ?? runId!,
-			{
-				type: "agent_end",
-				messages: [],
-				stopReason: "cancelled",
-				scope: handle?.scope,
-			},
-			undefined,
-			activeResourceDomain,
-		);
-		if (activeResourceRunId) this.resourceLedger.quarantine(activeResourceRunId);
+		const finalizeForcedAbort = () => {
+			this.#state.isStreaming = false;
+			this.#state.streamMessage = null;
+			this.#state.pendingToolCalls = new Set<string>();
+			this.#runningPrompt = undefined;
+			this.#resolveRunningPrompt = undefined;
+			resolve?.();
+			this.#finalizeRun(
+				activeLogicalRunId ?? runId!,
+				{
+					type: "agent_end",
+					messages: [],
+					stopReason: "cancelled",
+					scope: handle?.scope,
+				},
+				undefined,
+				activeResourceDomain,
+			);
+			if (activeResourceRunId) this.resourceLedger.quarantine(activeResourceRunId);
+		};
+
+		if (pendingTurnEndPublication) {
+			// A turn_end has already entered the publication barrier. Keep the Agent
+			// busy until its durable consumer finishes, then publish the forced
+			// terminal event so it cannot overtake the checkpoint.
+			this.#forcedAbortPublicationRunId = runId;
+			void pendingTurnEndPublication.completion.then(() => {
+				if (this.#forcedAbortPublicationRunId === runId) this.#forcedAbortPublicationRunId = undefined;
+				finalizeForcedAbort();
+			});
+		} else {
+			finalizeForcedAbort();
+		}
 		return true;
 	}
 
@@ -2146,10 +2167,17 @@ export class Agent {
 			afterTurnEndPublished: async () => {
 				if (this.#activeRunId !== runId) return;
 				const publication = Promise.withResolvers<void>();
+				const completion = Promise.withResolvers<void>();
+				const pendingPublication = { runId, completion: completion.promise };
+				this.#pendingTurnEndPublication = pendingPublication;
 				pendingTurnEndPublications.push(publication);
-				await publication.promise;
-				if (this.#activeRunId !== runId) return;
-				await this.afterTurnEndPublished?.();
+				try {
+					await publication.promise;
+					await this.afterTurnEndPublished?.();
+				} finally {
+					if (this.#pendingTurnEndPublication === pendingPublication) this.#pendingTurnEndPublication = undefined;
+					completion.resolve();
+				}
 			},
 			getSteeringMessages: async () => {
 				if (this.#activeRunId !== runId) {
@@ -2247,7 +2275,10 @@ export class Agent {
 				: agentLoopContinue(context, config, abortController.signal, this.streamFn, !continuesLogicalRun, scope);
 
 			for await (const event of stream) {
-				if (this.#activeRunId !== runId) {
+				if (
+					this.#activeRunId !== runId &&
+					!(event.type === "turn_end" && this.#forcedAbortPublicationRunId === runId)
+				) {
 					break;
 				}
 

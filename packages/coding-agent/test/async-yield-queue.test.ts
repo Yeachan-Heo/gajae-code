@@ -389,6 +389,29 @@ test("build failure requeues the failed and unbuilt groups in FIFO order", async
 	expect(buildCalls).toEqual(["a", "b", "b", "c"]);
 });
 
+test("dispatcher build failures schedule a delayed idle retry", async () => {
+	const scheduled: Array<{ run: (signal?: AbortSignal) => Promise<void>; delayMs: number | undefined }> = [];
+	const queue = new YieldQueue({
+		isStreaming: () => false,
+		injectStreaming: () => {},
+		injectIdle: async () => "delivered",
+		scheduleIdleFlush: (run, _onSkip, delayMs) => scheduled.push({ run, delayMs }),
+	});
+	queue.register<string>("persistent-build-failure", {
+		build: () => {
+			throw new Error("persistent build failure");
+		},
+	});
+	queue.enqueue("persistent-build-failure", "entry");
+
+	expect(scheduled).toHaveLength(1);
+	await scheduled[0]!.run();
+
+	expect(scheduled).toHaveLength(2);
+	expect(scheduled[1]!.delayMs).toBe(1_000);
+	expect(queue.has("persistent-build-failure")).toBe(true);
+});
+
 test("idle injection rechecks queued identity after a transition clears the kind", async () => {
 	const injectionStarted = Promise.withResolvers<void>();
 	const releaseInjection = Promise.withResolvers<void>();

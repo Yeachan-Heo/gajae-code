@@ -30,7 +30,7 @@ export interface YieldQueueOptions {
 		signal?: AbortSignal,
 		identityIsCurrent?: () => boolean,
 	): Promise<YieldDeliveryResult | undefined>;
-	scheduleIdleFlush(run: (signal?: AbortSignal) => Promise<void>, onSkip: () => void): void;
+	scheduleIdleFlush(run: (signal?: AbortSignal) => Promise<void>, onSkip: () => void, delayMs?: number): void;
 	getIdleFlushSignal?(): AbortSignal | undefined;
 	captureIdentity?(): unknown;
 	isIdentityCurrent?(identity: unknown): boolean;
@@ -67,6 +67,8 @@ interface FlushBatch {
 function formatError(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
+
+const DISPATCH_FAILURE_RETRY_DELAY_MS = 1_000;
 
 export class YieldQueue {
 	readonly #options: YieldQueueOptions;
@@ -230,17 +232,17 @@ export class YieldQueue {
 	 * a transition (e.g. handoff) releases a delivery fence so entries queued while
 	 * fenced are not stranded until an unrelated enqueue or agent yield.
 	 */
-	rearmIdle(): void {
+	rearmIdle(delayMs?: number): void {
 		if (this.#options.isStreaming()) return;
 		for (const entries of this.#entries.values()) {
 			if (entries.length > 0) {
-				this.#scheduleIdleFlush();
+				this.#scheduleIdleFlush(delayMs);
 				return;
 			}
 		}
 	}
 
-	#scheduleIdleFlush(): void {
+	#scheduleIdleFlush(delayMs?: number): void {
 		if (this.#idleFlushPending) return;
 		this.#idleFlushPending = true;
 		const owner = Symbol("idle-flush");
@@ -251,11 +253,15 @@ export class YieldQueue {
 			this.#idleFlushPending = false;
 		};
 		try {
-			this.#options.scheduleIdleFlush(async signal => {
-				releaseOwner();
-				if (this.#options.isStreaming()) return;
-				await this.flush("idle", signal);
-			}, releaseOwner);
+			this.#options.scheduleIdleFlush(
+				async signal => {
+					releaseOwner();
+					if (this.#options.isStreaming()) return;
+					await this.flush("idle", signal);
+				},
+				releaseOwner,
+				delayMs,
+			);
 		} catch (error) {
 			releaseOwner();
 			logger.warn("Yield queue idle flush scheduling failed", { error: formatError(error) });
@@ -288,7 +294,7 @@ export class YieldQueue {
 				} catch (error) {
 					logger.warn("Yield queue stale check failed", { kind, error: formatError(error) });
 					this.#requeue(kind, [entry]);
-					this.rearmIdle();
+					this.rearmIdle(DISPATCH_FAILURE_RETRY_DELAY_MS);
 					continue;
 				}
 				if (stale) continue;
@@ -330,7 +336,7 @@ export class YieldQueue {
 				for (let pendingIndex = groups.length - 1; pendingIndex >= groupIndex; pendingIndex--) {
 					this.#requeue(kind, groups[pendingIndex]!);
 				}
-				this.rearmIdle();
+				this.rearmIdle(DISPATCH_FAILURE_RETRY_DELAY_MS);
 				break;
 			}
 		}

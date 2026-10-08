@@ -21,8 +21,16 @@ import { submitInteractiveInput } from "@gajae-code/coding-agent/main";
 import type { SubmittedUserInput } from "@gajae-code/coding-agent/modes/types";
 import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
-import { convertToLlm, SILENT_ABORT_MARKER } from "@gajae-code/coding-agent/session/messages";
+import { type CustomMessage, convertToLlm, SILENT_ABORT_MARKER } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import {
+	type OwnedCompletionEnvelope,
+	registerOwnedRegistration,
+	registerTerminalTurnScope,
+	type TurnRegistrationKey,
+	unregisterOwnedRegistration,
+	unregisterTerminalScope,
+} from "@gajae-code/coding-agent/session/terminal-abort";
 import { Snowflake } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
@@ -2119,6 +2127,123 @@ describe("AgentSession TTSR resume gate", () => {
 
 		expect(order.slice(0, 4)).toEqual(["provider-1", "persist-failed", "persisted", "provider-2"]);
 		expect(ttsrManager.getMessageCount()).toBe(2);
+	});
+
+	it("does not promote an owned idle completion after a transition starts during reconciliation", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let streamCallCount = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"] },
+			streamFn: () => {
+				streamCallCount++;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const done = makeMsg("done");
+					stream.push({ type: "start", partial: done });
+					stream.push({ type: "done", reason: "stop", message: done });
+				});
+				return stream;
+			},
+		});
+		const sessionManager = SessionManager.inMemory(tempDir);
+		const appendTtsrInjection = sessionManager.appendTtsrInjection.bind(sessionManager);
+		let rejectInitialCheckpoint = true;
+		let startTransitionDuringReconciliation = false;
+		const transitionStarted = Promise.withResolvers<void>();
+		const releaseTransitionAbort = Promise.withResolvers<void>();
+		let transition: Promise<boolean> | undefined;
+		let transitionStartError: unknown;
+		vi.spyOn(sessionManager, "appendTtsrInjection").mockImplementation((ruleNames, records, messageCount) => {
+			if (ruleNames.length === 0 && rejectInitialCheckpoint) {
+				rejectInitialCheckpoint = false;
+				throw new Error("injected turn-end persistence failure");
+			}
+			if (ruleNames.length === 0 && startTransitionDuringReconciliation) {
+				startTransitionDuringReconciliation = false;
+				queueMicrotask(() => {
+					try {
+						transition = session.newSession();
+					} catch (error) {
+						transitionStartError = error;
+						transitionStarted.resolve();
+					}
+				});
+			}
+			return appendTtsrInjection(ruleNames, records, messageCount);
+		});
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-idle-reconcile-race.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const ttsrManager = new TtsrManager({ enabled: true });
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, ttsrManager });
+		await expect(session.prompt("first turn")).rejects.toThrow("injected turn-end persistence failure");
+		const originalEpoch = session.getTerminalTurnEpoch();
+		if (originalEpoch === undefined) throw new Error("Expected a prompt lineage before idle delivery");
+
+		const registration: TurnRegistrationKey = {
+			endpointId: `idle-reconcile-${Snowflake.next()}`,
+			endpointGeneration: 0,
+			lineageIdHash: `idle-reconcile-lineage-${Snowflake.next()}`,
+			promptAttemptEpoch: 17,
+			jobId: `idle-reconcile-job-${Snowflake.next()}`,
+			jobGeneration: "job:1",
+		};
+		const terminalScope = registerTerminalTurnScope({
+			lineageIdHash: registration.lineageIdHash,
+			promptAttemptEpoch: registration.promptAttemptEpoch,
+			ownedCompletionPolicy: "enabled",
+		});
+		if (!terminalScope) throw new Error("Expected terminal scope registration to succeed");
+		registerOwnedRegistration(registration, { isJobTerminal: () => true });
+		const ownedEnvelope: OwnedCompletionEnvelope = {
+			lineageIdHash: registration.lineageIdHash,
+			promptAttemptEpoch: registration.promptAttemptEpoch,
+			registration,
+		};
+		const ownedMessage: CustomMessage<{ ownedCompletions: OwnedCompletionEnvelope[] }> = {
+			role: "custom",
+			customType: "async-result",
+			content: "owned completion",
+			display: true,
+			attribution: "agent",
+			details: { ownedCompletions: [ownedEnvelope] },
+			timestamp: Date.now(),
+		};
+		const unregisterDispatcher = session.yieldQueue.register<string>("idle-reconcile-race", {
+			build: () => ownedMessage,
+		});
+		const abortSpy = vi.spyOn(session, "abort").mockImplementation(async () => {
+			transitionStarted.resolve();
+			await releaseTransitionAbort.promise;
+		});
+
+		try {
+			startTransitionDuringReconciliation = true;
+			session.yieldQueue.enqueue("idle-reconcile-race", "completion");
+			await session.yieldQueue.flush("idle");
+			await transitionStarted.promise;
+			if (transitionStartError !== undefined) throw transitionStartError;
+			if (!transition) throw new Error("Expected the new-session transition to start");
+
+			expect(session.getTerminalTurnEpoch()).toBe(originalEpoch);
+			expect(session.yieldQueue.has("idle-reconcile-race")).toBe(true);
+			expect(streamCallCount).toBe(1);
+
+			releaseTransitionAbort.resolve();
+			await transition;
+			await session.yieldQueue.flush("idle");
+			expect(session.yieldQueue.has("idle-reconcile-race")).toBe(false);
+		} finally {
+			releaseTransitionAbort.resolve();
+			await transition?.catch(() => {});
+			abortSpy.mockRestore();
+			unregisterDispatcher();
+			unregisterOwnedRegistration(registration);
+			unregisterTerminalScope(terminalScope.scopeId);
+		}
 	});
 
 	it("interruptMode never deduplicates the reminder across sibling tool calls in one batch", async () => {
