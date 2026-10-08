@@ -20,6 +20,7 @@ import {
 	assertManagedTranscript,
 	type EmptyStopScenario,
 	handleProviderRequest,
+	parseHarnessPort,
 } from "./helpers/managed-empty-stop-harness";
 
 // Local session integration: real provider HTTP/SSE, without launching the SDK
@@ -35,7 +36,7 @@ test.each(
 	const models: string[] = [];
 	const server = Bun.serve({
 		hostname: "127.0.0.1",
-		port: 0,
+		port: parseHarnessPort(process.env.PORT_BASE ?? "0"),
 		fetch: request => handleProviderRequest(request, scenario, models),
 	});
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-empty-stop-local-"));
