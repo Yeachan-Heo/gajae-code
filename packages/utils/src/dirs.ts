@@ -15,10 +15,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type {
-	directoryCaseSensitive as nativeDirectoryCaseSensitive,
-	windowsOrdinalCaseFold as nativeWindowsOrdinalCaseFold,
-} from "@gajae-code/natives";
+import * as nativeBindings from "@gajae-code/natives";
 import { resolveCanonicalLogsDir } from "./canonical-log-dir";
 import { APP_NAME } from "./cli-metadata";
 import { canonicalEnvKey, type ProjectEnvSnapshot, projectEnvSnapshot } from "./env-file";
@@ -87,17 +84,9 @@ export function pathIdentityKey(inputPath: string): string {
 	return resolvedPath;
 }
 
-type NativeWindowsPathBindings = {
-	directoryCaseSensitive: typeof nativeDirectoryCaseSensitive;
-	windowsOrdinalCaseFold: typeof nativeWindowsOrdinalCaseFold;
-};
-
-let nativeWindowsPathBindings: NativeWindowsPathBindings | undefined;
-
 function windowsDirectoryCaseSensitivity(directoryPath: string): boolean | undefined {
 	try {
-		nativeWindowsPathBindings ??= require("@gajae-code/natives") as NativeWindowsPathBindings;
-		return nativeWindowsPathBindings.directoryCaseSensitive(directoryPath) ?? undefined;
+		return nativeBindings.directoryCaseSensitive(directoryPath) ?? undefined;
 	} catch {
 		return undefined;
 	}
@@ -121,8 +110,7 @@ function isWellFormedUtf16(value: string): boolean {
 function windowsOrdinalCaseFold(value: string): string | undefined {
 	if (!isWellFormedUtf16(value)) return undefined;
 	try {
-		nativeWindowsPathBindings ??= require("@gajae-code/natives") as NativeWindowsPathBindings;
-		return nativeWindowsPathBindings.windowsOrdinalCaseFold(value);
+		return nativeBindings.windowsOrdinalCaseFold(value);
 	} catch {
 		return undefined;
 	}
