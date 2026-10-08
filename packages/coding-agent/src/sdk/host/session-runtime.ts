@@ -2042,6 +2042,7 @@ export interface SdkSurfaceFactoryOptions {
 	steerStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 	hostTools?: boolean | (() => boolean);
 	getRuntimeHost?: () => SessionSdkHost | undefined;
+	finalizeDeadlineRecovery?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => Promise<void>;
 }
 
 /** Shared policy, capability, and query-surface factory for every SDK transport. */
@@ -2072,6 +2073,11 @@ function createQuerySurface(
 		steerStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 		hostTools?: boolean | (() => boolean);
 		getRuntimeHost?: () => SessionSdkHost | undefined;
+		finalizeDeadlineRecovery?: (selector: {
+			commandId?: string;
+			turnId?: string;
+			clientRef?: string;
+		}) => Promise<void>;
 		primaryControlSurface?: "cli" | "sdk";
 	} = {},
 ): SessionSurface {
@@ -2472,8 +2478,10 @@ function createQuerySurface(
 		...(typeof (ctx as Partial<ExtensionContext>).getProjectProgress === "function"
 			? { getProjectProgress: () => ctx.getProjectProgress!() }
 			: {}),
-		getPromptStatus: (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
-			reconciliation.lookup("prompt", selector),
+		getPromptStatus: async (selector: { commandId?: string; turnId?: string; clientRef?: string }) => {
+			await options.finalizeDeadlineRecovery?.(selector);
+			return reconciliation.lookup("prompt", selector);
+		},
 		getSkillInvokeStatus: (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
 			reconciliation.lookup("skill", selector),
 		getTurnResult: (selector: {
@@ -2555,6 +2563,7 @@ export function createSdkSurfaceFactory(
 		hostTools: options.hostTools,
 		getRuntimeHost: options.getRuntimeHost,
 		primaryControlSurface: options.primaryControlSurface,
+		finalizeDeadlineRecovery: options.finalizeDeadlineRecovery,
 	});
 	return {
 		policy,
@@ -6619,7 +6628,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 							type: "agent_end",
 							...(observation.terminalContent === undefined ? {} : { content: observation.terminalContent }),
 							...(observation.terminalHasActivity ? { hasActivity: true } : {}),
-							outcome: terminalOutcome,
+							outcome: terminalOutcome as InvocationOutcome | undefined,
 						});
 						observation.terminalOutcome = terminalOutcome;
 						observation.terminalCommitted = true;
@@ -6707,6 +6716,41 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			await Promise.race([settled, timeout]);
 		};
 		let runtime: SessionSdkSessionRuntime;
+		const finalizeDealineRecoveryWhenQueried = async (selector: {
+			commandId?: string;
+			turnId?: string;
+			clientRef?: string;
+		}) => {
+			try {
+				const record = reconciliation.lookup("prompt", selector) as Record<string, unknown> | undefined;
+				if (
+					!record ||
+					(record as unknown as { deadlineRecoveryPending?: boolean }).deadlineRecoveryPending !== true ||
+					record.terminalAt !== undefined
+				)
+					return;
+				const key = selector.commandId && selector.turnId ? `${selector.commandId}:${selector.turnId}` : undefined;
+				if (!key) return;
+				const observation = deadlineTerminalizationObservations.get(key);
+				if (!observation || observation.terminalCommitted) return;
+				const pendingTools = options.terminalAbortSeams?.pendingToolExecutions;
+				if (!pendingTools || pendingTools(observation.handle).length > 0) return;
+				const pendingOutcomeRaw = (record as unknown as { pendingOutcome?: unknown }).pendingOutcome;
+				const terminalOutcome: unknown = pendingOutcomeRaw ?? observation.terminalOutcome;
+				if (!terminalOutcome) return;
+				const correlation = {
+					commandId: selector.commandId,
+					turnId: selector.turnId,
+				} as unknown as InvocationCorrelation;
+				await reconciliation.noteTransition("prompt", correlation, {
+					type: "agent_end",
+					...(observation.terminalContent === undefined ? {} : { content: observation.terminalContent }),
+					...(observation.terminalHasActivity ? { hasActivity: true } : {}),
+					outcome: terminalOutcome as InvocationOutcome | undefined,
+				});
+				observation.terminalCommitted = true;
+			} catch {}
+		};
 		const surfaceFactory = createSdkSurfaceFactory({
 			ctx,
 			id: sessionId,
@@ -6720,6 +6764,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			// Origin is explicit at the session bootstrap boundary. The low-level
 			// runtime defaults to SDK for existing embedders; CLI roots pass cli.
 			primaryControlSurface: options.primaryControlSurface ?? "sdk",
+			finalizeDeadlineRecovery: finalizeDealineRecoveryWhenQueried,
 		});
 		const queryHandlers = new QueryHandlers(surfaceFactory.query, sessionId, revisions, cursors);
 		const inputGate = { quiescing: false };
