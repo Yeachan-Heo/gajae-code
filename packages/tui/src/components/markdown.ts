@@ -311,7 +311,8 @@ export interface MarkdownTheme {
 	/**
 	 * Resolve an SVG figure component by fenced block source text. Components
 	 * are retained by fence order for the lifetime of this Markdown instance.
-	 * Return null or undefined to fall back to fenced code rendering.
+	 * Return null for a stable fenced-code fallback; return undefined when a
+	 * declined fence should be retried on the next render.
 	 */
 	resolveSvgFigure?: (source: string, context: SvgFigureResolveContext) => Component | null | undefined;
 	symbols: SymbolTheme;
@@ -393,7 +394,10 @@ export class Markdown implements Component {
 	#lastFullParseAt = 0;
 	#onStaleThrottle?: () => void;
 	#staleThrottleTimer?: ReturnType<typeof setTimeout>;
-	#hasDynamicSvgFigures: boolean;
+	#mayHaveDynamicSvgFigures: boolean;
+	#hasActiveDynamicSvgFigures = false;
+	#hasRetryableSvgFigureFallback = false;
+	#cachedImageProtocol: typeof TERMINAL.imageProtocol | undefined;
 	#dynamicFigures = new Map<number, Component>();
 	#nextDynamicFigureIndex = 0;
 	#disposed = false;
@@ -407,7 +411,7 @@ export class Markdown implements Component {
 		codeBlockIndent: number = 2,
 	) {
 		this.#text = text;
-		this.#hasDynamicSvgFigures = theme.resolveSvgFigure !== undefined && hasSvgFence(text);
+		this.#mayHaveDynamicSvgFigures = theme.resolveSvgFigure !== undefined && hasSvgFence(text);
 		this.#paddingX = paddingX;
 		this.#paddingY = paddingY;
 		this.#theme = theme;
@@ -425,7 +429,7 @@ export class Markdown implements Component {
 		}
 		if (this.#text !== text) this.#rejectedParseKey = undefined;
 		this.#text = text;
-		this.#hasDynamicSvgFigures = this.#theme.resolveSvgFigure !== undefined && hasSvgFence(text);
+		this.#mayHaveDynamicSvgFigures = this.#theme.resolveSvgFigure !== undefined && hasSvgFence(text);
 		if (this.#streaming) {
 			return;
 		}
@@ -502,8 +506,10 @@ export class Markdown implements Component {
 		if (component) {
 			if (previous && previous !== component) previous.dispose?.();
 			this.#dynamicFigures.set(index, component);
+			this.#hasActiveDynamicSvgFigures = true;
 			return component;
 		}
+		if (component === undefined) this.#hasRetryableSvgFigureFallback = true;
 		// Retain a failed resolver component so its owner can retry it when the
 		// source at this fence position changes instead of rasterizing the same
 		// final failure on every redraw.
@@ -564,15 +570,17 @@ export class Markdown implements Component {
 	}
 
 	#render(width: number, includeAnchors: boolean): { lines: string[]; spans?: Array<ViewportAnchorSpan | null> } {
-		if (!this.#hasDynamicSvgFigures) this.#disposeDynamicFiguresFrom(0);
+		if (!this.#mayHaveDynamicSvgFigures) this.#disposeDynamicFiguresFrom(0);
 
 		// L1: per-instance cache — fastest path for repeated renders of the same
 		// instance at the same width (e.g. resize debounce, repeated redraws).
 		if (
-			!this.#hasDynamicSvgFigures &&
+			!this.#hasActiveDynamicSvgFigures &&
+			!this.#hasRetryableSvgFigureFallback &&
 			this.#cachedLines &&
 			this.#cachedText === this.#text &&
 			this.#cachedWidth === width &&
+			this.#cachedImageProtocol === TERMINAL.imageProtocol &&
 			(!includeAnchors || this.#cachedAnchorSpans !== undefined)
 		) {
 			return { lines: this.#cachedLines, spans: this.#cachedAnchorSpans };
@@ -582,10 +590,12 @@ export class Markdown implements Component {
 		const contentWidth = Math.max(1, width - this.#paddingX * 2);
 
 		if (
-			!this.#hasDynamicSvgFigures &&
+			!this.#hasActiveDynamicSvgFigures &&
+			!this.#hasRetryableSvgFigureFallback &&
 			this.#streaming &&
 			this.#cachedLines &&
 			this.#cachedWidth === width &&
+			this.#cachedImageProtocol === TERMINAL.imageProtocol &&
 			this.#lastFullParseAt > 0 &&
 			(!includeAnchors || this.#cachedAnchorSpans !== undefined)
 		) {
@@ -596,6 +606,9 @@ export class Markdown implements Component {
 			}
 		}
 
+		this.#hasActiveDynamicSvgFigures = false;
+		this.#hasRetryableSvgFigureFallback = false;
+
 		// Don't render anything if there's no actual text
 		if (!this.#text || this.#text.trim() === "") {
 			this.#currentParse = undefined;
@@ -605,6 +618,7 @@ export class Markdown implements Component {
 			this.#cachedWidth = width;
 			this.#cachedLines = result;
 			this.#cachedAnchorSpans = includeAnchors ? [] : undefined;
+			this.#cachedImageProtocol = TERMINAL.imageProtocol;
 			return { lines: result, spans: this.#cachedAnchorSpans };
 		}
 
@@ -624,7 +638,7 @@ export class Markdown implements Component {
 		const cacheKey = `${contentKey}\x00${width}\x00${this.#paddingX}\x00${this.#paddingY}\x00${this.#codeBlockIndent}\x00${objectId(this.#theme)}\x00${this.#defaultTextStyle ? objectId(this.#defaultTextStyle) : -1}\x00${TERMINAL.imageProtocol ?? ""}\x00${TERMINAL.hyperlinks ? 1 : 0}\x00${bgColorProbe}\x00${headingProbe}`;
 		const cached = renderCache.get(cacheKey);
 		if (
-			!this.#hasDynamicSvgFigures &&
+			!this.#mayHaveDynamicSvgFigures &&
 			cached !== undefined &&
 			cached.source === normalizedText &&
 			(!includeAnchors || cached.anchorSpans !== undefined)
@@ -634,6 +648,7 @@ export class Markdown implements Component {
 			this.#cachedWidth = width;
 			this.#cachedLines = cached.lines;
 			this.#cachedAnchorSpans = cached.anchorSpans;
+			this.#cachedImageProtocol = TERMINAL.imageProtocol;
 			if (!this.#streaming || this.#currentParse?.source !== normalizedText) this.#currentParse = undefined;
 			return { lines: cached.lines, spans: cached.anchorSpans };
 		}
@@ -818,24 +833,27 @@ export class Markdown implements Component {
 		}
 		if (!this.#streaming || this.#text !== renderedText) this.#currentParse = undefined;
 
-		// Async SVG figures must be rendered again after their raster changes; do
-		// not retain their pending or terminal-image output in the text-only L1/L2.
-		if (this.#hasDynamicSvgFigures) {
+		// Active figures and retryable fallbacks must render again. A stable
+		// fenced-code fallback is safe in this instance's L1 cache, but possible
+		// SVG fences stay out of shared L2 because resolver state can vary by instance.
+		if (this.#hasActiveDynamicSvgFigures || this.#hasRetryableSvgFigureFallback) {
 			this.#cachedText = undefined;
 			this.#cachedWidth = undefined;
 			this.#cachedLines = undefined;
 			this.#cachedAnchorSpans = undefined;
+			this.#cachedImageProtocol = undefined;
 		} else {
 			this.#cachedText = renderedText;
 			this.#cachedWidth = width;
 			this.#cachedLines = result;
 			this.#cachedAnchorSpans = anchorSpans;
+			this.#cachedImageProtocol = TERMINAL.imageProtocol;
 			this.#lastFullParseAt = markdownNow();
 		}
 
 		// Update L2 module-level LRU so future instances with the same key skip
 		// the marked.lexer + highlightCode (Rust FFI) work entirely.
-		if (!this.#streaming && !this.#hasDynamicSvgFigures) {
+		if (!this.#streaming && !this.#mayHaveDynamicSvgFigures) {
 			renderCache.set(cacheKey, { source: normalizedText, lines: result, ...(anchorSpans ? { anchorSpans } : {}) });
 		}
 

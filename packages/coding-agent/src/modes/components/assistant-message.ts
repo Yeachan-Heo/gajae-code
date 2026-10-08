@@ -44,7 +44,8 @@ function getAssistantMarkdownTheme(): MarkdownTheme {
 			const graphicsSuppressed =
 				isTerminalGraphicsFallbackActive() &&
 				!(TERMINAL.imageProtocol === ImageProtocol.Kitty && isCursorNeutralImagePermittedInFallback());
-			if (!TERMINAL.imageProtocol || graphicsSuppressed) return null;
+			if (!TERMINAL.imageProtocol) return null; // Stable environment: cache the code fallback.
+			if (graphicsSuppressed) return undefined; // The suppression scope can end; retry on repaint.
 			const palette = theme.getSvgPalette();
 			const previous = context.previous instanceof SvgFigure ? context.previous : undefined;
 			const figure =
