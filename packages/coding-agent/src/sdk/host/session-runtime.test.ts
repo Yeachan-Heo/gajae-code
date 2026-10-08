@@ -8529,6 +8529,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		let harness: InvocationHarness | undefined;
 		try {
 			harness = await invocationHarness(sessionId, cwd, {
+				// Keep the independently bounded worktree flush out of this recovery-status wait.
 				settings: {
 					// This test covers deferred terminal recovery, not deadline-triggered worktree persistence.
 					get: (key: string) =>
