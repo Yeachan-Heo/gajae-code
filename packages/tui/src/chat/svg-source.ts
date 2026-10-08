@@ -251,9 +251,10 @@ function resolveSvgCssVariables(source: string, palette: Readonly<Record<string,
 		const end = constructEnd(source, start);
 		if (end < 0) return output + source.slice(start);
 		const tag = source.slice(start, end);
-		if (/^<(?:[\w.-]+:)?style(?=[\s/>])/i.test(tag) && !isSelfClosingSvgTag(tag)) {
+		const styleTagName = /^<((?:[\w.-]+:)?style)(?=[\s/>])/i.exec(tag)?.[1];
+		if (styleTagName && !isSelfClosingSvgTag(tag)) {
 			output += resolveCssAttributes(tag, palette, fg);
-			const closingTag = findStyleClosingTag(source, end);
+			const closingTag = findStyleClosingTag(source, end, styleTagName);
 			if (closingTag < 0) return output + resolveCssValue(source.slice(end), palette, fg);
 			output += resolveCssValue(source.slice(end, closingTag), palette, fg);
 			cursor = closingTag;
@@ -270,14 +271,15 @@ function isSelfClosingSvgTag(tag: string): boolean {
 	return /\/\s*>$/.test(tag);
 }
 
-/** Find the closing style tag; `<` cannot appear literally in XML style text. */
-function findStyleClosingTag(source: string, start: number): number {
+/** Find the matching closing style tag; `<` cannot appear literally in XML style text. */
+function findStyleClosingTag(source: string, start: number, qualifiedName: string): number {
 	const lowered = source.toLowerCase();
-	let index = lowered.indexOf("</style", start);
+	const closingTag = `</${qualifiedName}`.toLowerCase();
+	let index = lowered.indexOf(closingTag, start);
 	while (index >= 0) {
-		const next = source[index + 7];
+		const next = source[index + closingTag.length];
 		if (next === ">" || (next !== undefined && /\s/.test(next))) return index;
-		index = lowered.indexOf("</style", index + 7);
+		index = lowered.indexOf(closingTag, index + closingTag.length);
 	}
 	return -1;
 }

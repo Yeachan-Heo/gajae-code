@@ -134,4 +134,16 @@ describe("prepareSvg", () => {
 		expect(prepared).toContain("<text>Use var(--gjc-accent)</text>");
 		expect(prepared).toContain('<rect fill="#ff8800"/>');
 	});
+
+	it("matches the closing tag for namespace-qualified stylesheets", () => {
+		const prepared = prepareSvg(
+			'<svg><x:style xmlns:x="http://www.w3.org/2000/svg">.a{fill:var(--gjc-accent)}</x:style>' +
+				'<text>Use var(--gjc-accent)</text><rect fill="var(--gjc-accent)"/></svg>',
+			palette,
+		);
+
+		expect(prepared).toContain(".a{fill:#ff8800}");
+		expect(prepared).toContain("<text>Use var(--gjc-accent)</text>");
+		expect(prepared).toContain('<rect fill="#ff8800"/>');
+	});
 });
