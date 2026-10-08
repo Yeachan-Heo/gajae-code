@@ -1543,13 +1543,45 @@ mod platform {
 			assert!(leaf.0.belongs_to(&intermediate.0));
 			let root = Process::from_pid(i32::try_from(std::process::id()).expect("test PID"))
 				.expect("pin root");
-			let without_retained = root.descendants_observed().expect("observe root tree");
 			assert!(
-				!without_retained
+				!root
+					.children()
 					.iter()
-					.any(|process| process.pid == leaf_pid),
-				"exited intermediate must actually be absent from the live parent walk"
+					.any(|process| process.pid == intermediate.0.pid),
+				"exited intermediate must not remain a live direct child"
 			);
+
+			// Toolhelp may still enumerate an exited process while its handle is
+			// pinned. Simulate a later snapshot that has dropped the intermediate
+			// edge: the root walk cannot reach the leaf, but a retained intermediate
+			// root still can.
+			let intermediate_pid =
+				u32::try_from(intermediate.0.pid).expect("intermediate PID fits in u32");
+			let leaf_pid_u32 = u32::try_from(leaf_pid).expect("leaf PID fits in u32");
+			let incomplete_tree =
+				HashMap::from([(intermediate_pid, SmallVec::from_slice(&[leaf_pid_u32]))]);
+			let root_pid = u32::try_from(root.pid).expect("root PID fits in u32");
+			let mut visited = HashSet::new();
+			visited.insert(root_pid);
+			let mut observed = Vec::new();
+			Process::collect_descendants_from_tree(
+				&root,
+				&incomplete_tree,
+				&mut visited,
+				&mut observed,
+			)
+			.expect("an incomplete but valid root snapshot remains traversable");
+			assert!(observed.is_empty(), "missing parent edge cannot invent descendants");
+			visited.insert(intermediate_pid);
+			Process::collect_descendants_from_tree(
+				&intermediate.0,
+				&incomplete_tree,
+				&mut visited,
+				&mut observed,
+			)
+			.expect("retained intermediate remains a valid traversal root");
+			assert!(observed.iter().any(|process| process.pid == leaf_pid));
+
 			let recovered = root
 				.descendants_observed_from_roots(&[intermediate.0.clone()])
 				.expect("retained ancestry must remain queryable");
@@ -3073,14 +3105,14 @@ mod tests {
 		#[cfg(target_os = "windows")]
 		{
 			std::process::Command::new("powershell.exe")
-				.args(["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 10"])
+				.args(["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30"])
 				.spawn()
 				.expect("spawn PowerShell sleep fixture")
 		}
 		#[cfg(not(target_os = "windows"))]
 		{
 			std::process::Command::new("sleep")
-				.arg("10")
+				.arg("30")
 				.spawn()
 				.expect("spawn sleep fixture")
 		}
@@ -3272,13 +3304,13 @@ mod tests {
 
 	/// Regression test for the macOS `proc_listchildpids` brokenness: on
 	/// darwin 25.4+ the kernel returns no entries when a process queries its
-	/// own children via that API, so `Process::descendants` produced an empty
-	/// list and termination cleanup silently became a no-op. The replacement
+	/// own children via that API, so `Process::children` produced no entries
+	/// and termination cleanup silently became a no-op. The replacement
 	/// path scans `proc_listallpids` and groups by `pbi_ppid`, which actually
 	/// works. Linux has always worked via `/proc`.
 	#[cfg(unix)]
 	#[test]
-	fn descendants_includes_freshly_spawned_child() {
+	fn children_includes_freshly_spawned_child() {
 		use std::{process::Command, thread, time::Duration};
 
 		let mut child = Command::new("sleep")
@@ -3296,7 +3328,7 @@ mod tests {
 		let mut found = false;
 		for _ in 0..200 {
 			if harness
-				.live_descendants()
+				.children()
 				.iter()
 				.any(|descendant| descendant.pid() == child_pid)
 			{
@@ -3311,9 +3343,9 @@ mod tests {
 
 		assert!(
 			found,
-			"freshly spawned child pid {child_pid} must appear in `live_descendants` so the \
-			 cancellation cleanup can reach it; this regressed on macOS when the walk relied on the \
-			 broken `proc_listchildpids`",
+			"freshly spawned child pid {child_pid} must appear in `children` so the descendant \
+			 cleanup can reach it; this regressed on macOS when the walk relied on the broken \
+			 `proc_listchildpids`",
 		);
 	}
 
@@ -3395,23 +3427,23 @@ mod tests {
 		let mut child = spawn_long_lived_process();
 		let pid = i32::try_from(child.id()).expect("child pid fits in i32");
 
-		// Wait briefly for the spawned process to become observable before killing
+		// Wait for the spawned process to become observable before killing
 		// it, so the absence assertion below proves a real live-to-dead transition
-		// without racing process-table publication under parallel test load.
+		// without racing process-table publication or pidfd pressure under parallel
+		// test load.
 		let mut observation = Process::observe(pid);
-		for _ in 0..100 {
+		for _ in 0..500 {
 			if matches!(&observation, ProcessObservation::Present { .. }) {
 				break;
 			}
 			thread::sleep(StdDuration::from_millis(20));
 			observation = Process::observe(pid);
 		}
-		assert!(
-			matches!(&observation, ProcessObservation::Present { .. }),
-			"owned child must observe as present before it is killed",
-		);
-
-		child.kill().expect("kill owned child");
+		let observed_present = matches!(&observation, ProcessObservation::Present { .. });
+		let child_status_before_cleanup = child.try_wait().expect("check owned child status");
+		if child_status_before_cleanup.is_none() {
+			child.kill().expect("kill owned child");
+		}
 		child.wait().expect("reap owned child");
 		// Release the child handle before asserting absence. `wait` reaps the
 		// child but `std::process::Child` closes the underlying handle only on
@@ -3419,11 +3451,16 @@ mod tests {
 		// identity, so `OpenProcess` and `from_pid` both still succeed — alive
 		// for as long as any handle to it is open. Holding `child` past the
 		// reap therefore pins the very incarnation this test waits to see
-		// disappear (observed in CI: `Present { incarnation:
+		// disappearance (observed in CI: `Present { incarnation:
 		// "windows:134341044275280593" }` for the whole 2s poll budget). The
 		// assertion below still demands a positive `Absent`, so dropping the
 		// handle removes a fixture artifact rather than weakening the contract.
 		drop(child);
+		assert!(
+			observed_present,
+			"owned child must observe as present before teardown; got {observation:?}, child status \
+			 before cleanup: {child_status_before_cleanup:?}",
+		);
 
 		// Process-table absence is not guaranteed to be visible to the very next
 		// observation on every platform; poll briefly for the confirmed-dead
