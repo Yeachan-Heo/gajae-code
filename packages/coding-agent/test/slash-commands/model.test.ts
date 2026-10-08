@@ -37,7 +37,6 @@ function createRuntime() {
 		setActiveModelProfile(name: string | undefined) {
 			activeModelProfile = name;
 		},
-		markUserModelSelection() {},
 	};
 	const sessionManager = {
 		getSessionId: () => "session-1",
