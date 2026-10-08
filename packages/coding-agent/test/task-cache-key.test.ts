@@ -197,6 +197,25 @@ describe("task fork-context provider identity", () => {
 				: [relativePath];
 		});
 	}
+	function removeTempTree(dir: string): void {
+		for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+			const entryPath = path.join(dir, entry.name);
+			if (entry.isDirectory() && !entry.isSymbolicLink()) {
+				removeTempTree(entryPath);
+			} else {
+				try {
+					fs.rmSync(entryPath, { force: true });
+				} catch (error) {
+					throw new Error(`Failed to remove entry ${entryPath}`, { cause: error });
+				}
+			}
+		}
+		try {
+			fs.rmdirSync(dir);
+		} catch (error) {
+			throw new Error(`Failed to remove directory ${dir}`, { cause: error });
+		}
+	}
 
 	afterEach(async () => {
 		while (sessions.length > 0) await sessions.pop()?.dispose();
@@ -208,7 +227,7 @@ describe("task fork-context provider identity", () => {
 			const modelCacheClosed = closeModelCache(path.join(tempDir, "models.db"));
 			if (!fs.existsSync(tempDir)) continue;
 			try {
-				fs.rmSync(tempDir, { recursive: true, force: true });
+				removeTempTree(tempDir);
 			} catch (error) {
 				let remaining: string[];
 				try {
@@ -216,8 +235,9 @@ describe("task fork-context provider identity", () => {
 				} catch {
 					remaining = ["<unreadable>"];
 				}
+				const failure = error instanceof Error ? error.message : String(error);
 				throw new Error(
-					`Failed to remove ${tempDir}; cwd=${process.cwd()}; modelCacheClosed=${modelCacheClosed}; remaining=${JSON.stringify(remaining)}`,
+					`Failed to remove ${tempDir}; failure=${failure}; cwd=${process.cwd()}; modelCacheClosed=${modelCacheClosed}; remaining=${JSON.stringify(remaining)}`,
 					{ cause: error },
 				);
 			}
