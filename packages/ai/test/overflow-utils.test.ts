@@ -114,6 +114,18 @@ describe("isContextOverflow - empty response with low usage (proxy-level overflo
 		expect(isContextOverflow(message)).toBe(true);
 	});
 
+	it("disables only the empty-response heuristic while preserving typed and measured overflow", () => {
+		const message = createEmptyStopMessage(1, 1);
+		const options = { allowEmptyResponseHeuristic: false };
+		expect(classifyContextOverflow(message, undefined, 32768)).toBe(true);
+		expect(classifyContextOverflow(message, undefined, 32768, options)).toBe(false);
+		for (const providerCode of ["context_length_exceeded", "request_too_large"]) {
+			expect(classifyContextOverflow(message, { kind: "transport", providerCode }, 32768, options)).toBe(true);
+		}
+		expect(classifyContextOverflow(message, { kind: "transport", status: 429 }, 32768, options)).toBe(false);
+		expect(classifyContextOverflow(createEmptyStopMessage(32769, 0), undefined, 32768, options)).toBe(true);
+	});
+
 	it("detects empty content at threshold boundary (total = 5)", () => {
 		const message = createEmptyStopMessage(3, 2);
 		expect(isContextOverflow(message)).toBe(true);

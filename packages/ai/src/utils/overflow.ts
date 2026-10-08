@@ -221,6 +221,7 @@ export function classifyContextOverflow(
 	message: AssistantMessage,
 	transportFailure?: TransportFailureFacts,
 	contextWindow?: number,
+	options: { allowEmptyResponseHeuristic?: boolean } = {},
 ): boolean {
 	if (transportFailure?.status === 429) return false;
 	const typedCodes = transportCodes(transportFailure);
@@ -251,6 +252,7 @@ export function classifyContextOverflow(
 	}
 
 	return (
+		options.allowEmptyResponseHeuristic !== false &&
 		message.stopReason === "stop" &&
 		message.content.length === 0 &&
 		message.usage.input + message.usage.output <= EMPTY_RESPONSE_USAGE_THRESHOLD

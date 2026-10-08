@@ -81,7 +81,6 @@ describe("AgentSession.disposeChildSubprocesses (#698 signal teardown)", () => {
 			await disposeOwnedPythonKernels(ownerId);
 			kernelCleanupCompleted.resolve();
 		});
-
 		const execution = session!.executePython(
 			"import time; print('signal-ready', flush=True); time.sleep(60)",
 			chunk => {
@@ -118,7 +117,6 @@ describe("AgentSession.disposeChildSubprocesses (#698 signal teardown)", () => {
 			releaseCompletion.resolve();
 			await Promise.allSettled([teardown, execution]);
 		}
-
 	}, 15000);
 
 	it("is idempotent across repeated calls", async () => {

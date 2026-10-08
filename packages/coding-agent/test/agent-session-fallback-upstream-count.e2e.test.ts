@@ -807,6 +807,48 @@ describe("AgentSession fallback upstream request counts", () => {
 		).toHaveLength(1);
 	});
 
+	it.each([
+		"context_length_exceeded",
+		"request_too_large",
+	])("handles typed %s on a low-usage successful empty stop before fallback", async providerCode => {
+		const calls: string[] = [];
+		const events: AgentSessionEvent[] = [];
+		const { primary } = createSession(1, model => {
+			calls.push(selector(model));
+			if (calls.length > 1) return successfulStream(model);
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const message: AssistantMessage = {
+					role: "assistant",
+					content: [],
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					usage: {
+						input: 1,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 1,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: Date.now(),
+					transportFailure: { kind: "transport", status: 400, providerCode },
+				};
+				stream.push({ type: "start", partial: message });
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		});
+		session!.subscribe(event => events.push(event));
+		await session!.prompt("Recover custom-provider typed overflow");
+		await session!.waitForIdle();
+		expect(calls).toEqual([selector(primary), selector(primary)]);
+		expect(events.filter(event => event.type === "model_fallback_switched")).toEqual([]);
+		expect(session!.messages.at(-1)).toMatchObject({ content: [{ type: "text", text: "Recovered" }] });
+	});
+
 	it("preserves successful overflow compaction and retry on the same model", async () => {
 		const calls: string[] = [];
 		const events: AgentSessionEvent[] = [];
