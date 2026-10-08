@@ -828,8 +828,30 @@ export function resolveManagedScopeForWrite(input: ManagedScopeInput): ManagedSc
 export function resolveManagedGcScopeForRead(input: ManagedScopeInput): ManagedScopeResolution {
 	const resolved = resolveManagedScope(input);
 	if (resolved.kind === "error") return resolved;
-	const scope = resolved.scope;
+	return establishExistingManagedGcScopeAuthority(resolved.scope);
+}
+
+function assertManagedScopeConfiguration(scope: ManagedScope): void {
+	const configuration = managedScopeConfigurations.get(scope);
+	if (
+		!configuration ||
+		scope.agentDir !== configuration.agentDir ||
+		scope.sessionsRoot !== configuration.sessionsRoot ||
+		scope.canonicalCwd !== configuration.canonicalCwd ||
+		scope.directoryName !== configuration.directoryName ||
+		scope.directoryPath !== configuration.directoryPath ||
+		scope.platform !== configuration.platform ||
+		scope.apiVersion !== 1 ||
+		scope.layoutVersion !== MANAGED_SESSION_LAYOUT_VERSION ||
+		scope.identityVersion !== MANAGED_SESSION_IDENTITY_VERSION
+	)
+		throw new Error("managed_gc_scope_authority_mismatch");
+}
+
+function establishExistingManagedGcScopeAuthority(scope: ManagedScope): ManagedScopeResolution {
 	try {
+		assertManagedScopeConfiguration(scope);
+		assertRetainedManagedDirectoryIdentity(scope);
 		const rootPath = configuredRootPath(scope);
 		if (
 			path.resolve(scope.agentDir) !== scope.agentDir ||
@@ -878,7 +900,7 @@ export function resolveManagedGcScopeForRead(input: ManagedScopeInput): ManagedS
 		managedDirectoryIdentities.set(scope, { dev: scopeDirectory.dev, ino: scopeDirectory.ino });
 		managedDirectoryAuthorities.set(scope, undefined);
 		readManagedGcScopeIdentities.set(scope, { configuredRoot, profile, sessions });
-		return resolved;
+		return { kind: "resolved", scope };
 	} catch (error) {
 		return {
 			kind: "error",
@@ -2324,18 +2346,7 @@ function managedGcTrustedScope(scope: ManagedScope): ManagedGcTrustedScope {
 	const configuration = managedScopeConfigurations.get(scope);
 	if (!root || !identity || !configuration || !managedDirectoryAuthorities.has(scope))
 		throw new Error("managed_gc_scope_authority_unavailable");
-	if (
-		scope.agentDir !== configuration.agentDir ||
-		scope.sessionsRoot !== configuration.sessionsRoot ||
-		scope.canonicalCwd !== configuration.canonicalCwd ||
-		scope.directoryName !== configuration.directoryName ||
-		scope.directoryPath !== configuration.directoryPath ||
-		scope.platform !== configuration.platform ||
-		scope.apiVersion !== 1 ||
-		scope.layoutVersion !== MANAGED_SESSION_LAYOUT_VERSION ||
-		scope.identityVersion !== MANAGED_SESSION_IDENTITY_VERSION
-	)
-		throw new Error("managed_gc_scope_authority_mismatch");
+	assertManagedScopeConfiguration(scope);
 	const policy: ManagedSessionSecurityPolicy =
 		scope.platform === "win32" ? "windows-existing-verify-first" : "default";
 	assertManagedDirectoryRoot(root);
@@ -5919,29 +5930,63 @@ async function publishCleanupCompleted(
 			!pendingCleanupReceipt(scope, tombstone, target)?.taskArtifactOwnerTranscriptDeleted)
 	)
 		throw new Error("durability_failed");
+	const completedPath = cleanupReceiptPath(tombstone, target, "completed", 1);
+	const record = {
+		schemaVersion: 1,
+		state: "cleanup_completed",
+		scope: scopeDigest(scope.platform, scope.canonicalCwd),
+		tombstone,
+		attempt: 1,
+		target: { path: target.path, sessionId: target.sessionId, cwd: target.cwd, identity: target.identity },
+		...(ownerReceipt && ownerOutcome
+			? {
+					taskArtifactOwnerDeletionEvidence: ownerReceipt.taskArtifactOwnerDeletionEvidence,
+					taskArtifactOwnerRetirementOutcome: ownerOutcome,
+					taskArtifactOwnerRetired: true,
+					taskArtifactOwnerTranscriptDeleted: true,
+				}
+			: {}),
+	};
+	const serialized = `${JSON.stringify(record, (_key, value: unknown) => (typeof value === "bigint" ? value.toString() : value))}\n`;
 	try {
-		await publishManagedTombstone(
-			cleanupReceiptPath(tombstone, target, "completed", 1),
-			{
-				schemaVersion: 1,
-				state: "cleanup_completed",
-				scope: scopeDigest(scope.platform, scope.canonicalCwd),
-				tombstone,
-				attempt: 1,
-				target: { path: target.path, sessionId: target.sessionId, cwd: target.cwd, identity: target.identity },
-				...(ownerReceipt && ownerOutcome
-					? {
-							taskArtifactOwnerDeletionEvidence: ownerReceipt.taskArtifactOwnerDeletionEvidence,
-							taskArtifactOwnerRetirementOutcome: ownerOutcome,
-							taskArtifactOwnerRetired: true,
-							taskArtifactOwnerTranscriptDeleted: true,
-						}
-					: {}),
-			},
-			lock.assertOwned,
-		);
+		await publishManagedTombstone(completedPath, record, lock.assertOwned);
 	} catch (error) {
 		if ((error as Error).message !== "destination_conflict") throw error;
+		lock.assertOwned();
+		if (await cleanupCompleted(scope, tombstone, target)) return;
+		const trusted = managedGcTrustedScope(scope);
+		const stale = captureManagedFileNoFollow(completedPath);
+		const value: unknown = JSON.parse(stale.bytes.toString("utf8"));
+		if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("durability_failed");
+		const prior = value as Record<string, unknown>;
+		const priorTarget = prior.target;
+		if (!priorTarget || typeof priorTarget !== "object" || Array.isArray(priorTarget))
+			throw new Error("durability_failed");
+		const targetRecord = priorTarget as Record<string, unknown>;
+		const priorIdentity = targetRecord.identity;
+		if (!priorIdentity || typeof priorIdentity !== "object" || Array.isArray(priorIdentity))
+			throw new Error("durability_failed");
+		const identityRecord = priorIdentity as Record<string, unknown>;
+		if (typeof identityRecord.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(identityRecord.sha256))
+			throw new Error("durability_failed");
+		const recertified = {
+			...prior,
+			target: { ...targetRecord, identity: { ...identityRecord, sha256: target.identity.sha256 } },
+		};
+		if (!deepSame(recertified, JSON.parse(serialized))) throw new Error("durability_failed");
+		const store = managedGcScopeStore(scope, trusted);
+		try {
+			lock.assertOwned();
+			store.replaceExpected(
+				path.relative(scope.directoryPath, completedPath),
+				new TextEncoder().encode(serialized),
+				stale,
+			);
+			lock.assertOwned();
+			assertRetainedManagedDirectoryIdentity(scope);
+		} finally {
+			store.close();
+		}
 	}
 	if (!(await cleanupCompleted(scope, tombstone, target))) throw new Error("durability_failed");
 }
@@ -6696,6 +6741,10 @@ export async function reconcileManagedTombstones(
 	scope: ManagedScope,
 	expectedCandidate?: ManagedCandidate,
 ): Promise<void> {
+	if (!managedDirectoryAuthorities.has(scope)) {
+		const established = establishExistingManagedGcScopeAuthority(scope);
+		if (established.kind === "error") throw new Error(established.message);
+	}
 	const directory = path.join(managedInternalDirectory(scope), MANAGED_TOMBSTONES_DIRECTORY);
 	// Ensure scope authority is prepared before any operations that might access the GC protocol
 	const prepared = await ensureManagedScope(

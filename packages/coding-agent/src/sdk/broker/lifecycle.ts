@@ -994,7 +994,7 @@ type CleanupEvidence = BrokerCleanupEvidence;
 function brokerTaskArtifactOwnerCleanupFields(cleanup: CleanupEvidence): Record<string, unknown> {
 	const fields: Record<string, unknown> = {};
 	for (const [key, value] of Object.entries(cleanup)) {
-		if (key.startsWith("taskArtifactOwner")) fields[key] = value;
+		if (key.startsWith("taskArtifactOwner") && value !== undefined) fields[key] = value;
 	}
 	return fields;
 }

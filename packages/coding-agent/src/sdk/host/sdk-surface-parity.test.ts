@@ -48,6 +48,7 @@ function memoryTransport(): SessionSdkTransport & {
 		stop: async () => {
 			started = false;
 		},
+		isConnectionOpen: () => started,
 		broadcastFrame(frame) {
 			broadcasts.push(frame);
 		},

@@ -639,6 +639,158 @@ describe("queued promotion run identity (#4668)", () => {
 		expect(session.pendingMessageCounts.followUp).toBe(0);
 	});
 
+	for (const disposition of ["resume", "remove"] as const) {
+		it(`parks previously scheduled ordinary queue work released from startup during SDK publication (${disposition})`, async () => {
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+			const mock = createMockModel({ responses: [{ content: ["SDK answer"] }, { content: ["ordinary answer"] }] });
+			const agent = new Agent({
+				getApiKey: provider => `${provider}-test-key`,
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: mock.stream,
+			});
+			const startupFence = Promise.withResolvers<void>();
+			const publisherHeld = Promise.withResolvers<void>();
+			const releasePublisher = Promise.withResolvers<void>();
+			const rawEndObserved = Promise.withResolvers<void>();
+			const ordinaryStarted = Promise.withResolvers<void>();
+			let queueAdmission: Promise<void> | undefined;
+			let rawObservation:
+				| {
+						rawStreaming: boolean;
+						sessionStreaming: boolean;
+						generation?: number;
+						initialQueueSize: number;
+						admittedQueueSize: number;
+				  }
+				| undefined;
+			let publisherGeneration: number | undefined;
+			let publisherFinished = false;
+			const ordinaryText = "ordinary scheduled before SDK terminal barrier";
+			const observations: {
+				kind: "terminal" | "ordinary";
+				generation?: number;
+				publisherFinished?: boolean;
+				queued?: number;
+			}[] = [];
+			// Register before AgentSession, exactly as the existing genuine unwind fixture.
+			const unsubscribeRaw = agent.subscribe(event => {
+				if (event.type === "agent_end" && queueAdmission === undefined) {
+					const current = session!;
+					const initialQueueSize = agent.snapshotFollowUp().length;
+					const rawStreaming = agent.state.isStreaming;
+					const sessionStreaming = current.isStreaming;
+					current.extendStartupTurnBarrier(startupFence.promise);
+					queueAdmission = current.followUp(ordinaryText);
+					rawObservation = {
+						rawStreaming,
+						sessionStreaming,
+						generation: event.scope?.generation,
+						initialQueueSize,
+						admittedQueueSize: agent.snapshotFollowUp().length,
+					};
+					rawEndObserved.resolve();
+				}
+				if (event.type !== "message_start" || event.message.role !== "user") return;
+				const content =
+					typeof event.message.content === "string"
+						? event.message.content
+						: event.message.content.map(part => (part.type === "text" ? part.text : "")).join("");
+				if (content === ordinaryText) {
+					observations.push({ kind: "ordinary", publisherFinished });
+					ordinaryStarted.resolve();
+				}
+			});
+			const extensionRunner = {
+				hasHandlers: vi.fn((eventType: string) => eventType === "agent_end"),
+				hasToolResultMediation: vi.fn().mockReturnValue(false),
+				emitBeforeAgentStart: vi.fn().mockResolvedValue({ messages: [] }),
+				emit: vi.fn(async (event: unknown, _continueWhile: unknown, deliveryScope?: { generation: number }) => {
+					const typedEvent = event as { type?: string; sdkRunToken?: string };
+					if (typedEvent.type === "agent_end" && typedEvent.sdkRunToken !== undefined) {
+						publisherGeneration = deliveryScope?.generation;
+						publisherHeld.resolve();
+						await releasePublisher.promise;
+						publisherFinished = true;
+					}
+				}),
+			};
+			const settings = Settings.isolated({ "compaction.enabled": false });
+			settings.setModelRole("default", `${model.provider}/${model.id}`);
+			session = new AgentSession({
+				agent,
+				sessionManager: SessionManager.inMemory(),
+				settings,
+				modelRegistry,
+				extensionRunner: extensionRunner as never,
+			});
+			const unsubscribeTerminal = session.subscribe(event => {
+				if (event.type === "agent_end")
+					observations.push({
+						kind: "terminal",
+						generation: event.scope?.generation,
+						queued: agent.snapshotFollowUp().length,
+					});
+			});
+			const sdkPrompt = session.sendUserMessage("actual SDK root", {
+				sdkRunCapability: createSdkRunCapability("scheduled-startup-fence-owner"),
+			});
+			try {
+				await withTimeout(rawEndObserved.promise, 5_000, "actual SDK raw end before session listener");
+				expect(rawObservation).toMatchObject({
+					rawStreaming: false,
+					sessionStreaming: true,
+					initialQueueSize: 0,
+					admittedQueueSize: 1,
+				});
+				expect(rawObservation?.generation).toBeDefined();
+				if (!queueAdmission) throw new Error("Expected actual pre-barrier ordinary queue admission");
+				await withTimeout(queueAdmission, 5_000, "pre-barrier ordinary admission");
+				await withTimeout(publisherHeld.promise, 5_000, "actual SDK publisher owns active boundary");
+				expect(publisherGeneration).toBe(rawObservation?.generation);
+				expect(mock.calls).toHaveLength(1);
+				expect(agent.snapshotFollowUp()).toHaveLength(1);
+				startupFence.resolve();
+				expect(
+					await Promise.race([ordinaryStarted.promise.then(() => "started"), Bun.sleep(20).then(() => "pending")]),
+				).toBe("pending");
+				expect(mock.calls).toHaveLength(1);
+				expect(agent.snapshotFollowUp()).toHaveLength(1);
+				if (disposition === "remove") {
+					const queued = session.getQueuedMessageEntries().find(entry => entry.text === ordinaryText);
+					if (!queued) throw new Error("Expected original parked ordinary queue identity");
+					expect(session.removeQueuedMessageForEditing(queued.id)).toBe(ordinaryText);
+					expect(agent.snapshotFollowUp()).toHaveLength(0);
+				}
+				releasePublisher.resolve();
+				await expect(withTimeout(sdkPrompt, 5_000, "real SDK void submission settlement")).resolves.toBeUndefined();
+				if (disposition === "resume")
+					await withTimeout(ordinaryStarted.promise, 5_000, "actual publication resumes preexisting queued task");
+				await withTimeout(session.waitForIdle(), 5_000, "fenced queued task complete settlement");
+				expect(mock.calls).toHaveLength(disposition === "resume" ? 2 : 1);
+				expect(agent.snapshotFollowUp()).toHaveLength(0);
+				expect(
+					observations.filter(
+						event => event.kind === "ordinary" || event.generation === rawObservation?.generation,
+					),
+				).toEqual([
+					{ kind: "terminal", generation: rawObservation?.generation, queued: 1 },
+					...(disposition === "resume" ? [{ kind: "ordinary" as const, publisherFinished: true }] : []),
+				]);
+			} finally {
+				startupFence.resolve();
+				releasePublisher.resolve();
+				unsubscribeRaw();
+				unsubscribeTerminal();
+				await withTimeout(
+					sdkPrompt.catch(() => {}),
+					5_000,
+					"fenced fixture submission disposal",
+				);
+			}
+		});
+	}
+
 	it("returns a stable handle for same-run steering and its terminal scope", async () => {
 		const gate = Promise.withResolvers<void>();
 		const toolStarted = Promise.withResolvers<void>();
@@ -1090,12 +1242,17 @@ describe("queued promotion run identity (#4668)", () => {
 		const fixture = buildAbortableTrackedTransitionFixture(sessionManager, undefined, true);
 		session = fixture.session;
 		const customStarted = Promise.withResolvers<void>();
+		const boundaryOrder: { kind: "terminal" | "ordinary"; generation?: number }[] = [];
+		const unsubscribeTerminal = session.subscribe(event => {
+			if (event.type === "agent_end") boundaryOrder.push({ kind: "terminal", generation: event.scope?.generation });
+		});
 		const unsubscribe = session.agent.subscribe(event => {
 			if (
 				event.type === "message_start" &&
 				event.message.role === "custom" &&
 				event.message.customType === "custom-fifo"
 			) {
+				boundaryOrder.push({ kind: "ordinary" });
 				customStarted.resolve();
 			}
 		});
@@ -1116,24 +1273,202 @@ describe("queued promotion run identity (#4668)", () => {
 		expect(
 			await Promise.race([customStarted.promise.then(() => "started"), Bun.sleep(20).then(() => "pending")]),
 		).toBe("pending");
+		const execution = await deferred.execution;
+		if (execution.disposition === "removed") throw new Error("Expected authentic deferred SDK execution");
 		fixture.secondGate.resolve();
 		await withTimeout(deferred.terminal, 5_000, "custom FIFO deferred terminal");
 		await withTimeout(customStarted.promise, 5_000, "custom FIFO ordinary follow-up start");
 		unsubscribe();
 		await session.waitForIdle();
+		unsubscribeTerminal();
+		expect(
+			boundaryOrder
+				.filter(entry => entry.kind === "ordinary" || entry.generation === execution.attemptScope.generation)
+				.map(entry => entry.kind),
+		).toEqual(["terminal", "ordinary"]);
+	});
+
+	it("does not starve a promoted SDK terminal on a different-scope message extension", async () => {
+		const policyTailHeld = Promise.withResolvers<void>();
+		const releasePolicyTail = Promise.withResolvers<void>();
+		let armPolicyTail = false;
+		let heldGeneration: number | undefined;
+		let extensionFinished = false;
+		const extensionRunner = {
+			hasHandlers: vi.fn((eventType: string) => eventType === "message_end"),
+			hasToolResultMediation: vi.fn().mockReturnValue(false),
+			emitBeforeAgentStart: vi.fn().mockResolvedValue({ messages: [] }),
+			emit: vi.fn(async (event: unknown, _continueWhile: unknown, deliveryScope?: { generation: number }) => {
+				const typedEvent = event as { type?: string; message?: AgentMessage };
+				if (
+					armPolicyTail &&
+					typedEvent.type === "message_end" &&
+					typedEvent.message?.role === "assistant" &&
+					typedEvent.message.stopReason === "stop"
+				) {
+					armPolicyTail = false;
+					heldGeneration = deliveryScope?.generation;
+					policyTailHeld.resolve();
+					await releasePolicyTail.promise;
+					extensionFinished = true;
+				}
+			}),
+		};
+		const fixture = buildAbortableTrackedTransitionFixture(SessionManager.inMemory(), extensionRunner, true);
+		session = fixture.session;
+		const boundaryOrder: { kind: "terminal" | "ordinary"; generation?: number }[] = [];
+		const unsubscribeTerminal = session.subscribe(event => {
+			if (event.type === "agent_end") boundaryOrder.push({ kind: "terminal", generation: event.scope?.generation });
+		});
+		try {
+			const promptDone = session.prompt("first task").catch(() => {});
+			await withTimeout(fixture.firstToolStarted.promise, 5_000, "policy-tail first actual tool");
+			const deferred = await session.submitUserMessage("deferred SDK", {
+				deliverAs: "followUp",
+				trackSubmission: true,
+				sdkRunCapability: createSdkRunCapability("new-input-owned-policy-tail"),
+			} as never);
+			await session.abort({ cause: "user_interrupt" });
+			await withTimeout(promptDone, 5_000, "policy-tail initial prompt settlement");
+			await withTimeout(fixture.secondToolStarted.promise, 5_000, "owned SDK successor start");
+			const execution = await withTimeout(deferred.execution, 5_000, "policy-tail SDK execution acceptance");
+			if (execution.disposition === "removed") throw new Error("Expected authentic SDK execution");
+			armPolicyTail = true;
+			fixture.secondGate.resolve();
+			await withTimeout(policyTailHeld.promise, 5_000, "actual SDK message policy tail");
+			await withTimeout(session.agent.waitForIdle(), 5_000, "raw SDK producer end");
+			await expect(
+				withTimeout(deferred.terminal, 5_000, "actual owned SDK terminal with other extension held"),
+			).resolves.toMatchObject({
+				submissionId: deferred.submissionId,
+				disposition: "completed",
+			});
+			expect(heldGeneration).toBeDefined();
+			expect(heldGeneration).not.toBe(execution.attemptScope.generation);
+			expect(extensionFinished).toBe(false);
+			expect(boundaryOrder.filter(entry => entry.generation === execution.attemptScope.generation)).toEqual([
+				{ kind: "terminal", generation: execution.attemptScope.generation },
+			]);
+			releasePolicyTail.resolve();
+			await withTimeout(session.waitForIdle(), 5_000, "other extension settlement");
+			expect(extensionFinished).toBe(true);
+		} finally {
+			releasePolicyTail.resolve();
+			fixture.firstGate.resolve();
+			fixture.secondGate.resolve();
+			unsubscribeTerminal();
+		}
+	});
+
+	it("parks a newly queued ordinary follow-up while its SDK predecessor publisher is active", async () => {
+		const publisherHeld = Promise.withResolvers<void>();
+		const releasePublisher = Promise.withResolvers<void>();
+		let armPublisher = false;
+		let publisherGeneration: number | undefined;
+		let publisherFinished = false;
+		const extensionRunner = {
+			hasHandlers: vi.fn((eventType: string) => eventType === "agent_end"),
+			hasToolResultMediation: vi.fn().mockReturnValue(false),
+			emitBeforeAgentStart: vi.fn().mockResolvedValue({ messages: [] }),
+			emit: vi.fn(async (event: unknown, _continueWhile: unknown, deliveryScope?: { generation: number }) => {
+				const typedEvent = event as { type?: string; sdkRunToken?: string };
+				if (armPublisher && typedEvent.type === "agent_end" && typedEvent.sdkRunToken !== undefined) {
+					armPublisher = false;
+					publisherGeneration = deliveryScope?.generation;
+					publisherHeld.resolve();
+					await releasePublisher.promise;
+					publisherFinished = true;
+				}
+			}),
+		};
+		const fixture = buildAbortableTrackedTransitionFixture(SessionManager.inMemory(), extensionRunner, true);
+		session = fixture.session;
+		const ordinaryStarted = Promise.withResolvers<void>();
+		const observedBoundary: { kind: "terminal" | "ordinary"; generation?: number; publisherFinished?: boolean }[] =
+			[];
+		const unsubscribeTerminal = session.subscribe(event => {
+			if (event.type === "agent_end")
+				observedBoundary.push({ kind: "terminal", generation: event.scope?.generation });
+		});
+		const unsubscribeInput = session.agent.subscribe(event => {
+			if (event.type !== "message_start" || event.message.role !== "user") return;
+			const content =
+				typeof event.message.content === "string"
+					? event.message.content
+					: event.message.content.map(part => (part.type === "text" ? part.text : "")).join("");
+			if (content === "new ordinary while SDK publisher is held") {
+				observedBoundary.push({ kind: "ordinary", publisherFinished });
+				ordinaryStarted.resolve();
+			}
+		});
+		try {
+			const promptDone = session.prompt("first task").catch(() => {});
+			await withTimeout(fixture.firstToolStarted.promise, 5_000, "publisher fixture first tool");
+			const deferred = await session.submitUserMessage("deferred SDK", {
+				deliverAs: "followUp",
+				trackSubmission: true,
+				sdkRunCapability: createSdkRunCapability("new-input-owned-publisher"),
+			} as never);
+			await session.abort({ cause: "user_interrupt" });
+			await withTimeout(promptDone, 5_000, "publisher fixture initial settlement");
+			await withTimeout(fixture.secondToolStarted.promise, 5_000, "publisher fixture actual SDK tool");
+			const execution = await withTimeout(deferred.execution, 5_000, "publisher fixture SDK execution");
+			if (execution.disposition === "removed") throw new Error("Expected authentic SDK execution");
+			armPublisher = true;
+			fixture.secondGate.resolve();
+			await withTimeout(publisherHeld.promise, 5_000, "genuine SDK publisher extension");
+			expect(publisherGeneration).toBe(execution.attemptScope.generation);
+			await expect(withTimeout(deferred.terminal, 5_000, "actual SDK local terminal")).resolves.toMatchObject({
+				submissionId: deferred.submissionId,
+				disposition: "completed",
+			});
+			await withTimeout(
+				session.followUp("new ordinary while SDK publisher is held"),
+				5_000,
+				"explicit ordinary queue admission",
+			);
+			expect(
+				await Promise.race([ordinaryStarted.promise.then(() => "started"), Bun.sleep(20).then(() => "pending")]),
+			).toBe("pending");
+			expect(session.agent.snapshotFollowUp()).toHaveLength(1);
+			releasePublisher.resolve();
+			await withTimeout(ordinaryStarted.promise, 5_000, "genuine publication resumes queued input");
+			await withTimeout(session.waitForIdle(), 5_000, "publisher fixture complete settlement");
+			expect(
+				observedBoundary.filter(
+					entry => entry.kind === "ordinary" || entry.generation === execution.attemptScope.generation,
+				),
+			).toEqual([
+				{ kind: "terminal", generation: execution.attemptScope.generation },
+				{ kind: "ordinary", publisherFinished: true },
+			]);
+		} finally {
+			releasePublisher.resolve();
+			fixture.firstGate.resolve();
+			fixture.secondGate.resolve();
+			unsubscribeTerminal();
+			unsubscribeInput();
+		}
 	});
 
 	it("keeps rearmed steering behind an older deferred SDK follow-up", async () => {
 		const fixture = buildAbortableTrackedTransitionFixture(SessionManager.inMemory(), undefined, true);
 		session = fixture.session;
 		const rearmedStarted = Promise.withResolvers<void>();
+		const boundaryOrder: { kind: "terminal" | "ordinary"; generation?: number }[] = [];
+		const unsubscribeTerminal = session.subscribe(event => {
+			if (event.type === "agent_end") boundaryOrder.push({ kind: "terminal", generation: event.scope?.generation });
+		});
 		const unsubscribe = session.agent.subscribe(event => {
 			if (event.type !== "message_start" || event.message.role !== "user") return;
 			const content =
 				typeof event.message.content === "string"
 					? event.message.content
 					: event.message.content.map(part => (part.type === "text" ? part.text : "")).join("");
-			if (content === "rearmed steer") rearmedStarted.resolve();
+			if (content === "rearmed steer") {
+				boundaryOrder.push({ kind: "ordinary" });
+				rearmedStarted.resolve();
+			}
 		});
 		const promptDone = session.prompt("first task").catch(() => {});
 		await fixture.firstToolStarted.promise;
@@ -1149,11 +1484,19 @@ describe("queued promotion run identity (#4668)", () => {
 		expect(
 			await Promise.race([rearmedStarted.promise.then(() => "started"), Bun.sleep(20).then(() => "pending")]),
 		).toBe("pending");
+		const execution = await deferred.execution;
+		if (execution.disposition === "removed") throw new Error("Expected authentic deferred SDK execution");
 		fixture.secondGate.resolve();
 		await withTimeout(deferred.terminal, 5_000, "rearmed deferred terminal");
 		await withTimeout(rearmedStarted.promise, 5_000, "rearmed steer successor start");
 		unsubscribe();
 		await session.waitForIdle();
+		unsubscribeTerminal();
+		expect(
+			boundaryOrder
+				.filter(entry => entry.kind === "ordinary" || entry.generation === execution.attemptScope.generation)
+				.map(entry => entry.kind),
+		).toEqual(["terminal", "ordinary"]);
 	});
 
 	it("holds public follow-up admission behind a tracked acceptance reservation", async () => {

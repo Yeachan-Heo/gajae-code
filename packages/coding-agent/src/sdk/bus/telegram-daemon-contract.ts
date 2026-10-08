@@ -297,10 +297,9 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * Generation 193 gates streamed content on negotiated observer capabilities,
  * so existing owners are replaced before exposing the new observer path.
  * Generation 201 binds queued cancellation and terminal deadlines to the exact
- * consuming run, so pre-fix owners cannot serve the new generic lifecycle path.
- * Generation 202 joins queued-removal terminal publication before ordinary
- * abort acknowledgement, replacing owners that still acknowledge cancellation
- * before its terminal record is durable.
+ * consuming run, so pre-fix owners cannot serve the generic lifecycle path.
+ * Generation 202 adds complete image staging and exact accepted-capacity release
+ * when queued submissions are removed, replacing generation-201 image-free owners.
  */
 export const DAEMON_GENERATION = 202;
 

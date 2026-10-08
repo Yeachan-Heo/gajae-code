@@ -1328,6 +1328,35 @@ describe("managed session write protocol", () => {
 		await expect(fs.access(source)).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
+	it.each([
+		"missing-binding",
+		"noncanonical-binding",
+		"unregistered-scope",
+	] as const)("rejects cold reconciliation with %s without repairing storage", async boundary => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		expect((await prepareManagedSessionScopeForWrite(scope)).kind).toBe("resolved");
+		const source = path.join(legacyDirectory(sessionsRoot, cwd), "cold-authority.jsonl");
+		const bytes = transcript("cold-authority", cwd);
+		await fs.mkdir(path.dirname(source), { recursive: true });
+		await fs.writeFile(source, bytes);
+		const cold = resolveManagedScope({ cwd, agentDir: path.dirname(sessionsRoot), sessionsRoot });
+		if (cold.kind !== "resolved") throw new Error(cold.message);
+		const binding = path.join(scope.directoryPath, MANAGED_SESSION_BINDING_FILE);
+		const original = await fs.readFile(binding, "utf8");
+		if (boundary === "missing-binding") await fs.unlink(binding);
+		if (boundary === "noncanonical-binding") await fs.writeFile(binding, `${original}\n`);
+		const input = boundary === "unregistered-scope" ? { ...cold.scope } : cold.scope;
+		await expect(reconcileManagedTombstones(input)).rejects.toThrow(
+			"The existing managed GC read authority could not be verified.",
+		);
+		expect(await fs.readFile(source, "utf8")).toBe(bytes);
+		if (boundary === "missing-binding") await expect(fs.access(binding)).rejects.toMatchObject({ code: "ENOENT" });
+		else
+			expect(await fs.readFile(binding, "utf8")).toBe(
+				boundary === "noncanonical-binding" ? `${original}\n` : original,
+			);
+	});
+
 	it("completes after a crash following transcript unlink with a durable retained artifact root", async () => {
 		const { cwd, sessionsRoot, scope } = await fixture();
 		const source = path.join(legacyDirectory(sessionsRoot, cwd), "post-transcript-crash.jsonl");
@@ -2165,6 +2194,73 @@ describe("managed session write protocol", () => {
 			lock.mockRestore();
 		}
 	});
+	it.each([
+		"success",
+		"replacement-failure",
+		"destination-swap",
+	] as const)("closes exact recertification stores on %s without replaying transcript deletion", async boundary => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const source = path.join(legacyDirectory(sessionsRoot, cwd), "recertification-boundary.jsonl");
+		await fs.mkdir(path.dirname(source), { recursive: true });
+		await fs.writeFile(source, transcript("recertification-boundary", cwd));
+		const listed = listManagedCandidates(scope);
+		if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing candidate");
+		expect(await deleteManagedSessionCandidate(scope, listed.owned[0])).toMatchObject({ kind: "deleted" });
+		const tombstones = path.join(scope.directoryPath, ".gjc-managed-session-internal", "tombstones");
+		const names = (await fs.readdir(tombstones)).filter(name => name.includes(".cleanup-completed-"));
+		expect(names).toHaveLength(1);
+		const receipt = path.join(tombstones, names[0]!);
+		const stale = JSON.parse(await fs.readFile(receipt, "utf8")) as { target: { identity: { sha256: string } } };
+		stale.target.identity.sha256 = "0".repeat(64);
+		const staleBytes = `${JSON.stringify(stale)}\n`;
+		await fs.writeFile(receipt, staleBytes);
+		const original = managedSessionStorage.ManagedSessionDescendantStore.prototype.replaceExpected;
+		const originalClose = managedSessionStorage.ManagedSessionDescendantStore.prototype.close;
+		const closed: managedSessionStorage.ManagedSessionDescendantStore[] = [];
+		let attemptedStore: managedSessionStorage.ManagedSessionDescendantStore | undefined;
+		const close = vi.spyOn(managedSessionStorage.ManagedSessionDescendantStore.prototype, "close");
+		close.mockImplementation(function (this: managedSessionStorage.ManagedSessionDescendantStore) {
+			closed.push(this);
+			originalClose.call(this);
+		});
+		let attempts = 0;
+		const replace = vi.spyOn(managedSessionStorage.ManagedSessionDescendantStore.prototype, "replaceExpected");
+		replace.mockImplementation(function (
+			this: managedSessionStorage.ManagedSessionDescendantStore,
+			relative,
+			bytes,
+			expected,
+		) {
+			attempts += 1;
+			attemptedStore = this;
+			if (boundary === "replacement-failure") throw new Error("test_exact_replacement_failed");
+			if (boundary === "destination-swap") {
+				syncFs.renameSync(receipt, `${receipt}.retained`);
+				syncFs.copyFileSync(`${receipt}.retained`, receipt);
+			}
+			return original.call(this, relative, bytes, expected);
+		});
+		try {
+			const cold = resolveManagedScope({ cwd, agentDir: path.dirname(sessionsRoot), sessionsRoot });
+			if (cold.kind !== "resolved") throw new Error(cold.message);
+			expect((await prepareManagedSessionScopeForWrite(cold.scope)).kind).toBe(
+				boundary === "success" ? "resolved" : "error",
+			);
+			expect(attempts).toBe(1);
+			expect(closed.filter(store => store === attemptedStore)).toHaveLength(1);
+			const observed = await fs.readFile(receipt, "utf8");
+			if (boundary === "success") {
+				const record = JSON.parse(observed) as { target: { identity: { sha256: string } } };
+				expect(record.target.identity.sha256).toBe(listed.owned[0].identity.sha256);
+			} else expect(observed).toBe(staleBytes);
+			await expect(fs.access(source)).rejects.toMatchObject({ code: "ENOENT" });
+			if (boundary === "destination-swap") expect(await fs.readFile(`${receipt}.retained`, "utf8")).toBe(staleBytes);
+		} finally {
+			replace.mockRestore();
+			close.mockRestore();
+		}
+	});
+
 	it("still acquires the lock when a completed cleanup receipt no longer binds its target identity", async () => {
 		const { cwd, sessionsRoot, scope } = await fixture();
 		const legacy = legacyDirectory(sessionsRoot, cwd);
