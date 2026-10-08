@@ -11,15 +11,17 @@ import {
 	sessionUltragoalDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { reconcileWorkflowSkillState } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
+import { __setRepositoryStateWitnessTestHookForTests } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-change-set";
 import {
 	validateCompletionReceipt,
 	verifyUltragoalDurableCompletionState,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-guard";
-
 import {
 	addUltragoalSubgoal,
 	buildUltragoalHudSummary,
 	checkpointUltragoalGoal,
+	computeCheckpointChangeSet,
+	computeUltragoalReviewSourceHash,
 	createUltragoalPlan,
 	getUltragoalStatus,
 	hashStructuredValue,
@@ -68,6 +70,41 @@ async function tempDir(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-runtime-"));
 	tempRoots.push(dir);
 	return dir;
+}
+
+async function runTestGit(cwd: string, args: string[]): Promise<void> {
+	const proc = Bun.spawn(["git", ...args], {
+		cwd,
+		env: {
+			...process.env,
+			GIT_AUTHOR_NAME: "Gajae Test",
+			GIT_AUTHOR_EMAIL: "gajae-test@example.invalid",
+			GIT_COMMITTER_NAME: "Gajae Test",
+			GIT_COMMITTER_EMAIL: "gajae-test@example.invalid",
+		},
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	await proc.exited;
+	if (proc.exitCode !== 0) {
+		throw new Error(`git ${args.join(" ")} failed: ${await new Response(proc.stderr).text()}`);
+	}
+}
+
+async function initializeCheckpointGitRepository(root: string): Promise<void> {
+	await runTestGit(root, ["init", "-q"]);
+	await runTestGit(root, ["config", "user.name", "Gajae Test"]);
+	await runTestGit(root, ["config", "user.email", "gajae-test@example.invalid"]);
+	await fs.writeFile(path.join(root, ".gitignore"), ".gjc/\nartifacts/\n");
+	await fs.writeFile(path.join(root, "source.txt"), "baseline source\n");
+	await runTestGit(root, ["checkout", "-q", "-b", "main"]);
+	await runTestGit(root, ["add", ".gitignore", "source.txt"]);
+	await runTestGit(root, ["commit", "-m", "baseline"]);
+	await runTestGit(root, ["checkout", "-q", "-b", "feature"]);
+	await fs.writeFile(path.join(root, "feature.txt"), "reviewed change\n");
+	await runTestGit(root, ["add", "feature.txt"]);
+	await runTestGit(root, ["commit", "-m", "feature change"]);
+	delete process.env.CI_DEV_CHANGED_PATHS;
 }
 
 /**
@@ -469,6 +506,58 @@ function webExecutorQa(overrides: Record<string, unknown> = {}): Record<string, 
 async function passingLiveQualityGate(root: string): Promise<string> {
 	await writeStructuralArtifacts(root);
 	return passingQualityGate();
+}
+
+async function passingCheckpointQualityGate(root: string): Promise<string> {
+	const gate = JSON.parse(await passingLiveQualityGate(root)) as Record<string, any>;
+	const changeSet = await computeCheckpointChangeSet(root);
+	const sourceHash = computeUltragoalReviewSourceHash(changeSet);
+	if (!sourceHash) throw new Error("test setup could not capture a complete authoritative repository source hash");
+	gate.iteration.reviewCohort.sourceHash = sourceHash;
+	for (const lane of Object.values(gate.iteration.reviewCohort.lanes) as Array<Record<string, unknown>>) {
+		lane.sourceHash = sourceHash;
+	}
+	return JSON.stringify(gate);
+}
+
+async function createInterruptedCompleteCheckpoint(root: string): Promise<{
+	qualityGateJson: string;
+	checkpointEventId: string;
+	goalsPath: string;
+}> {
+	await initializeCheckpointGitRepository(root);
+	const qualityGateJson = await passingCheckpointQualityGate(root);
+	await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+	await startNextUltragoalGoal({ cwd: root });
+	const goalsPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json");
+	const ledgerPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "ledger.jsonl");
+	const originalAppendFile = fs.appendFile;
+	let failLedgerAppend = true;
+	const appendSpy = spyOn(fs, "appendFile").mockImplementation(async (...args: any[]) => {
+		const target = typeof args[0] === "string" ? args[0] : String(args[0]);
+		if (path.resolve(target) === path.resolve(ledgerPath) && failLedgerAppend) {
+			failLedgerAppend = false;
+			throw new Error("injected checkpoint ledger append failure");
+		}
+		return await (originalAppendFile as (...writeArgs: any[]) => Promise<any>)(...args);
+	});
+	try {
+		await expect(
+			checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G001",
+				status: "complete",
+				evidence: "tests passed",
+				qualityGateJson,
+			}),
+		).rejects.toThrow("injected checkpoint ledger append failure");
+	} finally {
+		appendSpy.mockRestore();
+	}
+	const interruptedPlan = await readUltragoalPlan(root);
+	const checkpointEventId = interruptedPlan?.goals[0]?.completionVerification?.checkpointLedgerEventId;
+	if (!checkpointEventId) throw new Error("test setup did not persist the interrupted checkpoint receipt");
+	return { qualityGateJson, checkpointEventId, goalsPath };
 }
 
 function batchChangeSetPaths(): Array<{ path: string; status: string }> {
@@ -3692,20 +3781,36 @@ describe("native GJC ultragoal runtime", () => {
 
 	it("repairs an interrupted complete checkpoint when the ledger append failed", async () => {
 		const root = await tempDir();
-		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
-		await startNextUltragoalGoal({ cwd: root });
-		const qualityGateJson = await passingLiveQualityGate(root);
-		const goalsPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json");
-		const ledgerPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "ledger.jsonl");
-		const originalAppendFile = fs.appendFile;
-		let failLedgerAppend = true;
-		const appendSpy = spyOn(fs, "appendFile").mockImplementation(async (...args: any[]) => {
-			const target = typeof args[0] === "string" ? args[0] : String(args[0]);
-			if (path.resolve(target) === path.resolve(ledgerPath) && failLedgerAppend) {
-				failLedgerAppend = false;
-				throw new Error("injected checkpoint ledger append failure");
-			}
-			return await (originalAppendFile as (...writeArgs: any[]) => Promise<any>)(...args);
+		const { qualityGateJson, checkpointEventId, goalsPath } = await createInterruptedCompleteCheckpoint(root);
+		expect((await readUltragoalLedger(root)).some(event => event.eventId === checkpointEventId)).toBe(false);
+
+		const repairedPlan = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "tests passed",
+			qualityGateJson,
+		});
+		const repairedReceipt = repairedPlan.goals[0]?.completionVerification;
+		const repairedEvents = (await readUltragoalLedger(root)).filter(event => event.eventId === checkpointEventId);
+		expect(repairedReceipt?.checkpointLedgerEventId).toBe(checkpointEventId);
+		expect(repairedEvents).toHaveLength(1);
+		expect(repairedEvents[0]).toMatchObject({
+			event: "goal_checkpointed",
+			goalId: "G001",
+			status: "complete",
+			evidence: "tests passed",
+		});
+		expect(JSON.parse(await fs.readFile(goalsPath, "utf-8")).goals[0].status).toBe("complete");
+	});
+
+	it("does not repair an interrupted checkpoint when authoritative source hash drifted", async () => {
+		const root = await tempDir();
+		const { qualityGateJson, checkpointEventId } = await createInterruptedCompleteCheckpoint(root);
+		let captures = 0;
+		__setRepositoryStateWitnessTestHookForTests(async () => {
+			captures += 1;
+			if (captures === 2) await runTestGit(root, ["update-ref", "refs/heads/main", "HEAD"]);
 		});
 		try {
 			await expect(
@@ -3716,39 +3821,37 @@ describe("native GJC ultragoal runtime", () => {
 					evidence: "tests passed",
 					qualityGateJson,
 				}),
-			).rejects.toThrow("injected checkpoint ledger append failure");
+			).rejects.toThrow("authoritative source hash changed since its persisted receipt");
 		} finally {
-			appendSpy.mockRestore();
+			__setRepositoryStateWitnessTestHookForTests(undefined);
 		}
+		expect(captures).toBe(2);
+		expect((await readUltragoalLedger(root)).some(event => event.eventId === checkpointEventId)).toBe(false);
+	});
 
-		const interruptedPlan = await readUltragoalPlan(root);
-		const interruptedReceipt = interruptedPlan?.goals[0]?.completionVerification;
-		expect(interruptedPlan?.goals[0]?.status).toBe("complete");
-		expect(interruptedReceipt?.checkpointLedgerEventId).toBeTruthy();
-		expect(
-			(await readUltragoalLedger(root)).some(event => event.eventId === interruptedReceipt?.checkpointLedgerEventId),
-		).toBe(false);
-
-		const repairedPlan = await checkpointUltragoalGoal({
-			cwd: root,
-			goalId: "G001",
-			status: "complete",
-			evidence: "tests passed",
-			qualityGateJson,
+	it("does not repair an interrupted checkpoint when the final repository capture is incomplete", async () => {
+		const root = await tempDir();
+		const { qualityGateJson, checkpointEventId } = await createInterruptedCompleteCheckpoint(root);
+		let captures = 0;
+		__setRepositoryStateWitnessTestHookForTests(async (_phase, cwd) => {
+			captures += 1;
+			if (captures === 2) await fs.writeFile(path.join(cwd, "source.txt"), "changed during repair capture\n");
 		});
-		const repairedReceipt = repairedPlan.goals[0]?.completionVerification;
-		const repairedEvents = (await readUltragoalLedger(root)).filter(
-			event => event.eventId === interruptedReceipt?.checkpointLedgerEventId,
-		);
-		expect(repairedReceipt?.checkpointLedgerEventId).toBe(interruptedReceipt?.checkpointLedgerEventId);
-		expect(repairedEvents).toHaveLength(1);
-		expect(repairedEvents[0]).toMatchObject({
-			event: "goal_checkpointed",
-			goalId: "G001",
-			status: "complete",
-			evidence: "tests passed",
-		});
-		expect(JSON.parse(await fs.readFile(goalsPath, "utf-8")).goals[0].status).toBe("complete");
+		try {
+			await expect(
+				checkpointUltragoalGoal({
+					cwd: root,
+					goalId: "G001",
+					status: "complete",
+					evidence: "tests passed",
+					qualityGateJson,
+				}),
+			).rejects.toThrow("authoritative repository evidence is incomplete or untrusted");
+		} finally {
+			__setRepositoryStateWitnessTestHookForTests(undefined);
+		}
+		expect(captures).toBe(2);
+		expect((await readUltragoalLedger(root)).some(event => event.eventId === checkpointEventId)).toBe(false);
 	});
 
 	it("dedups duplicate checkpoint ledger entries for an unchanged status and evidence (#645)", async () => {

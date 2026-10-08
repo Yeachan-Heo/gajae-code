@@ -3898,6 +3898,22 @@ async function checkpointUltragoalGoalForSession(
 					`Cannot repair interrupted checkpoint for ${goal.id}: durable receipt no longer matches its recovery intent.`,
 				);
 			}
+			const qualityGate = qualityGateObject(qualityGateJson);
+			const iteration = qualityGateObject(qualityGate?.iteration);
+			const reviewCohort = qualityGateObject(iteration?.reviewCohort);
+			const persistedSourceHash = nonEmptyString(reviewCohort?.sourceHash);
+			const repairChangeSet = await computeCheckpointChangeSet(input.cwd);
+			if (repairChangeSet?.trusted !== true || repairChangeSet.captureIncomplete === true) {
+				throw new Error(
+					`Cannot repair interrupted checkpoint for ${goal.id}: authoritative repository evidence is incomplete or untrusted.`,
+				);
+			}
+			const repairSourceHash = computeUltragoalReviewSourceHash(repairChangeSet);
+			if (!persistedSourceHash || !repairSourceHash || repairSourceHash !== persistedSourceHash) {
+				throw new Error(
+					`Cannot repair interrupted checkpoint for ${goal.id}: authoritative source hash changed since its persisted receipt.`,
+				);
+			}
 			await appendCheckpointLedgerEventOnce(input.cwd, sessionId, checkpointEvent);
 		});
 		return (await readUltragoalPlan(input.cwd, sessionId)) ?? plan;
