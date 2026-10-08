@@ -1,4 +1,4 @@
-import type { ChildProcess } from "node:child_process";
+import type * as childProcess from "node:child_process";
 import {
 	type BrokerDiscovery,
 	brokerProcessIncarnation,
@@ -106,7 +106,7 @@ export async function launchAuthorizedBrokerSuccessor(
 					reason: "spawn_failed" as const,
 					detail: "Broker launcher returned no verified process identity.",
 				};
-			const child: ChildProcess = launched.process;
+			const child: childProcess.ChildProcess = launched.process;
 			child.unref();
 			return {
 				kind: "spawned" as const,

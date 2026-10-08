@@ -229,19 +229,53 @@ export async function launchBrokerViaHop(
 	});
 	const wait = await awaitLauncherCloseBeforeDeadline(hop, timeoutMs, () => hop.stdout?.destroy());
 	if (wait.kind === "timeout") {
-		const detail = wait.terminated ? "hop exited after handoff cleanup" : "hop did not exit after termination";
-		return {
-			process: hop,
-			realBrokerPid: undefined,
-			error: new BrokerHopError({
-				exitCode: hop.exitCode,
-				stdout,
-				stderr,
-				reason: `hop exceeded its ${timeoutMs}ms startup deadline; ${detail}`,
-			}),
-		};
+		return await brokerHopTimeoutResult(hop, stdout, stderr, timeoutMs, wait.terminated);
 	}
 	return { process: hop, ...parseBrokerHopReply(wait.outcome.code, stdout, wait.outcome.spawnError, stderr) };
+}
+
+async function brokerHopTimeoutResult(
+	hop: ChildProcess,
+	stdout: string,
+	stderr: string,
+	timeoutMs: number,
+	launcherTerminated: boolean,
+): Promise<BrokerLaunchResult> {
+	// A complete reply can arrive before the hop's close event. Preserve its
+	// incarnation and reap that exact broker instead of leaving it detached after
+	// reporting a timeout to the caller.
+	const handoff = parseBrokerHopReply(0, stdout, undefined, stderr);
+	let cleanupFailure: string | undefined;
+	if (handoff.realBrokerPid !== undefined && handoff.realBrokerIncarnation !== undefined) {
+		try {
+			await reapDetachedBrokerPid(handoff.realBrokerPid, handoff.realBrokerIncarnation, {
+				gracefulMs: HOP_HANDOFF_CLEANUP_TIMEOUT_MS,
+				killVerifyMs: HOP_HANDOFF_CLEANUP_TIMEOUT_MS,
+			});
+		} catch (error) {
+			cleanupFailure = error instanceof Error ? error.message : String(error);
+		}
+	}
+	const launcherDetail = launcherTerminated
+		? "hop exited after handoff cleanup"
+		: "hop did not exit after termination";
+	const brokerDetail =
+		handoff.realBrokerPid === undefined
+			? ""
+			: cleanupFailure
+				? `; exact broker cleanup failed: ${cleanupFailure}`
+				: "; captured broker handoff was reaped";
+	return {
+		process: hop,
+		realBrokerPid: handoff.realBrokerPid,
+		...(handoff.realBrokerIncarnation !== undefined ? { realBrokerIncarnation: handoff.realBrokerIncarnation } : {}),
+		error: new BrokerHopError({
+			exitCode: hop.exitCode,
+			stdout,
+			stderr,
+			reason: `hop exceeded its ${timeoutMs}ms startup deadline; ${launcherDetail}${brokerDetail}`,
+		}),
+	};
 }
 
 /** Parses the hop's single-line pid/incarnation reply into broker identity or a typed error. */
@@ -348,6 +382,19 @@ function brokerStartupExitReason(record: BrokerStartupExitRecord | undefined): s
 	if (record.reason === "startup-deadline")
 		return `SDK broker startup exceeded its ${record.timeoutMs}ms fence deadline.`;
 	return `SDK broker startup interrupted by ${record.signal} before readiness.`;
+}
+
+function brokerStartupExitStatus(
+	childExitCode: number | null,
+	childSignal: NodeJS.Signals | null,
+	startupExitRecord: Pick<BrokerStartupExitRecord, "exitCode" | "signal"> | undefined,
+	startupFailureMarker: Pick<BrokerStartupFailureMarker, "exitCode" | "signal"> | undefined,
+): { exitCode: number | null; signal: string | null } {
+	const brokerExitEvidence = startupExitRecord ?? startupFailureMarker;
+	return {
+		exitCode: brokerExitEvidence ? brokerExitEvidence.exitCode : childExitCode,
+		signal: brokerExitEvidence ? brokerExitEvidence.signal : childSignal,
+	};
 }
 
 export function isBrokerGenerationCompatible(discovery: BrokerDiscovery | null): boolean {
@@ -1132,10 +1179,44 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		await spawnLog?.handle.close().catch(() => undefined);
 		let discoveryError: unknown;
 		let brokerExitedBeforeDiscovery = false;
+		const observeDiscovery = async (): Promise<EnsureOutcome | undefined> => {
+			try {
+				const discovered = await readBrokerDiscoveryBeforeDeadline(
+					settings.agentDir,
+					settings.heartbeatTtlMs,
+					deadline,
+				);
+				if (!discovered || !(await isBrokerReusable(discovered))) return undefined;
+				if (
+					childIncarnation === undefined &&
+					realBrokerPid !== undefined &&
+					realBrokerPid === child.pid &&
+					discovered.pid === realBrokerPid
+				) {
+					const verifiedIncarnation = brokerProcessIncarnation(realBrokerPid);
+					if (verifiedIncarnation === discovered.incarnation) {
+						childIncarnation = verifiedIncarnation;
+						owner = registerBrokerOwner(settings.agentDir, child, realBrokerPid, childIncarnation);
+					}
+				}
+				if (owner.markReady(discovered)) {
+					return initiator === "fixture-lease"
+						? { kind: "local-started-fixture", discovery: discovered, owner, child }
+						: { kind: "local-started-discovery", discovery: discovered };
+				}
+				await owner.stop();
+				return { kind: "external-discovery", discovery: discovered };
+			} catch (error) {
+				discoveryError = error;
+				return undefined;
+			}
+		};
 		while (ensureBrokerTiming.now() < deadline) {
 			const failedSpawn =
 				spawnError || child.signalCode !== null || (child.exitCode !== null && child.exitCode !== 0);
 			if (failedSpawn) {
+				const discovered = await observeDiscovery();
+				if (discovered) return discovered;
 				brokerExitedBeforeDiscovery = true;
 				break;
 			}
@@ -1143,6 +1224,8 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 			if (realBrokerPid !== undefined) {
 				brokerObservation = observeProcessIncarnation(realBrokerPid);
 				if (brokerObservation.status === "absent") {
+					const discovered = await observeDiscovery();
+					if (discovered) return discovered;
 					brokerExitedBeforeDiscovery = true;
 					break;
 				}
@@ -1151,6 +1234,8 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 					childIncarnation !== undefined &&
 					brokerObservation.incarnation !== childIncarnation
 				) {
+					const discovered = await observeDiscovery();
+					if (discovered) return discovered;
 					brokerExitedBeforeDiscovery = true;
 					break;
 				}
@@ -1164,6 +1249,8 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 				}
 				const startupExitRecord = await readBrokerStartupExitRecord(settings.agentDir);
 				if (startupExitRecord?.pid === realBrokerPid && startupExitRecord.writtenAt >= childSpawnedAt) {
+					const discovered = await observeDiscovery();
+					if (discovered) return discovered;
 					brokerExitedBeforeDiscovery = true;
 					break;
 				}
@@ -1171,48 +1258,18 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 					const marker = await readBrokerStartupFailureMarker(settings.agentDir);
 					if (
 						marker?.pid === realBrokerPid &&
-						marker.incarnation === childIncarnation &&
+						marker?.incarnation === childIncarnation &&
 						marker.writtenAt >= childSpawnedAt
 					) {
+						const discovered = await observeDiscovery();
+						if (discovered) return discovered;
 						brokerExitedBeforeDiscovery = true;
 						break;
 					}
 				}
 			}
-			try {
-				const discovered = await readBrokerDiscoveryBeforeDeadline(
-					settings.agentDir,
-					settings.heartbeatTtlMs,
-					deadline,
-				);
-				if (discovered) {
-					if (!(await isBrokerReusable(discovered))) {
-						await ensureBrokerTiming.sleep(50);
-						continue;
-					}
-					if (
-						childIncarnation === undefined &&
-						realBrokerPid !== undefined &&
-						realBrokerPid === child.pid &&
-						discovered.pid === realBrokerPid
-					) {
-						const verifiedIncarnation = brokerProcessIncarnation(realBrokerPid);
-						if (verifiedIncarnation === discovered.incarnation) {
-							childIncarnation = verifiedIncarnation;
-							owner = registerBrokerOwner(settings.agentDir, child, realBrokerPid, childIncarnation);
-						}
-					}
-					if (owner.markReady(discovered)) {
-						return initiator === "fixture-lease"
-							? { kind: "local-started-fixture", discovery: discovered, owner, child }
-							: { kind: "local-started-discovery", discovery: discovered };
-					}
-					await owner.stop();
-					return { kind: "external-discovery", discovery: discovered };
-				}
-			} catch (error) {
-				discoveryError = error;
-			}
+			const discovered = await observeDiscovery();
+			if (discovered) return discovered;
 			await ensureBrokerTiming.sleep(50);
 		}
 		const exitedBeforeDiscovery = brokerExitedBeforeDiscovery;
@@ -1286,8 +1343,7 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 			? brokerSpawnFailureError(spawnError)
 			: exitedBeforeDiscovery
 				? new BrokerStartupError({
-						exitCode: child.exitCode ?? trustedStartupExitRecord?.exitCode ?? null,
-						signal: child.signalCode ?? trustedStartupExitRecord?.signal ?? null,
+						...brokerStartupExitStatus(child.exitCode, child.signalCode, trustedStartupExitRecord, trustedMarker),
 						reason:
 							brokerStartupExitReason(trustedStartupExitRecord) ?? brokerStartupFailureReason(trustedMarker),
 						stderrExcerpt: spawnLogTail.length > 0 ? spawnLogTail : undefined,
@@ -1446,4 +1502,23 @@ export function brokerStartupFailureReasonForTest(marker: BrokerStartupFailureMa
 /** Test hook: verifies typed hop errors survive ensureBroker's spawn-failure mapping. */
 export function brokerSpawnFailureErrorForTest(spawnError: Error): Error {
 	return brokerSpawnFailureError(spawnError);
+}
+/** Test hook: preserves and reaps a verified broker reply captured at the hop deadline. */
+export function brokerHopTimeoutResultForTest(
+	hop: ChildProcess,
+	stdout: string,
+	stderr: string,
+	timeoutMs: number,
+	launcherTerminated: boolean,
+): Promise<BrokerLaunchResult> {
+	return brokerHopTimeoutResult(hop, stdout, stderr, timeoutMs, launcherTerminated);
+}
+/** Test hook: verifies broker exit evidence takes precedence over the launcher's status. */
+export function brokerStartupExitStatusForTest(
+	childExitCode: number | null,
+	childSignal: NodeJS.Signals | null,
+	startupExitRecord: Pick<BrokerStartupExitRecord, "exitCode" | "signal"> | undefined,
+	startupFailureMarker: Pick<BrokerStartupFailureMarker, "exitCode" | "signal"> | undefined,
+): { exitCode: number | null; signal: string | null } {
+	return brokerStartupExitStatus(childExitCode, childSignal, startupExitRecord, startupFailureMarker);
 }

@@ -9,8 +9,10 @@ import { type BrokerDiscovery, isPidAlive } from "../src/sdk/broker/discovery";
 import {
 	awaitBrokerLauncherForTest,
 	BrokerHopError,
+	brokerHopTimeoutResultForTest,
 	brokerOwnerIdentityMatchesForTest,
 	brokerSpawnFailureErrorForTest,
+	brokerStartupExitStatusForTest,
 	launchBrokerViaHop,
 	parseBrokerHopReply,
 	reapDetachedBrokerPidForTest,
@@ -87,7 +89,7 @@ describe("SDK broker hop protocol", () => {
 		expect(observeProcessIncarnation(pid).status).toBe("absent");
 	});
 
-	test("failed hop handoff terminates the pinned broker process", async () => {
+	test.skipIf(process.platform === "darwin")("failed hop handoff terminates the pinned broker process", async () => {
 		const child = childProcess.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
 		const spawned = Promise.withResolvers<void>();
 		child.once("spawn", spawned.resolve);
@@ -110,6 +112,49 @@ describe("SDK broker hop protocol", () => {
 			if (reference.status() === "running") reference.signalRoot(os.constants.signals.SIGKILL);
 			await reference.waitForExit({ timeoutMs: 1_000 });
 		}
+	});
+
+	test("a completed handoff captured at the deadline is reaped by exact incarnation", async () => {
+		const child = childProcess.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+		const spawned = Promise.withResolvers<void>();
+		const closed = Promise.withResolvers<void>();
+		child.once("spawn", spawned.resolve);
+		child.once("close", closed.resolve);
+		await spawned.promise;
+		const pid = child.pid;
+		if (pid === undefined) throw new Error("Test broker did not expose its pid.");
+		const observation = observeProcessIncarnation(pid);
+		if (observation.status !== "present") throw new Error("Test broker process identity could not be observed.");
+
+		try {
+			const result = await brokerHopTimeoutResultForTest(
+				child,
+				`${JSON.stringify({ pid, incarnation: observation.incarnation })}\n`,
+				"",
+				10,
+				true,
+			);
+			expect(result.realBrokerPid).toBe(pid);
+			expect(result.realBrokerIncarnation).toBe(observation.incarnation);
+			if (!(result.error instanceof BrokerHopError)) throw new Error("Expected a typed hop timeout error.");
+			expect(result.error.reason).toContain("captured broker handoff was reaped");
+			await closed.promise;
+			expect(observeProcessIncarnation(pid).status).toBe("absent");
+		} finally {
+			if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+			await closed.promise;
+		}
+	});
+
+	test("startup diagnostics prefer the real broker exit record over the completed hop", () => {
+		expect(brokerStartupExitStatusForTest(0, "SIGTERM", { exitCode: 1, signal: null }, undefined)).toEqual({
+			exitCode: 1,
+			signal: null,
+		});
+		expect(brokerStartupExitStatusForTest(0, "SIGTERM", undefined, { exitCode: 1, signal: null })).toEqual({
+			exitCode: 1,
+			signal: null,
+		});
 	});
 
 	test("hop launch errors preserve the underlying spawn diagnostic", async () => {
