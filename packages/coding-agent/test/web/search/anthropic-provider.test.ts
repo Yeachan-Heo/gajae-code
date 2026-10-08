@@ -42,6 +42,7 @@ describe("Anthropic web search provider", () => {
 		await searchAnthropic({ query: "latest release", temperature: 0 });
 
 		expect(requestBody?.model).toBe("claude-haiku-5-5");
+		expect(requestBody?.thinking).toEqual({ type: "disabled" });
 		expect(requestBody).not.toHaveProperty("temperature");
 	});
 

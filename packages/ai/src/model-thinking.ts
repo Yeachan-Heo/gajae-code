@@ -533,22 +533,36 @@ export function hasAnthropicSamplingParameterRestrictions(modelId: string): bool
 }
 
 /**
- * Adaptive thinking `display` is supported starting with Anthropic Opus 4.7.
- * Older adaptive-thinking models (Opus 4.6, Sonnet 4.6+) reject the field.
+ * Adaptive thinking `display` is supported by Anthropic Opus 4.7+, Haiku 5.5,
+ * and Fable 5+. Older adaptive-thinking models (Opus 4.6, Sonnet 4.6+) reject the field.
  * Fable (5+) postdates Opus 4.7, accepts `display`, and defaults it to
  * "omitted" — thinking tokens are billed but no content streams back — so it
  * must opt in like Opus 4.7+ (issue #2791).
  *
- * Shares `hasOpus47ApiRestrictions` version parsing on purpose: the two
- * predicates describe the same API generation, and a private `claude-opus-(\d+)-(\d+)`
- * regex silently disagreed with it for single-component aliases (`claude-opus-5`
- * matched nothing while `claude-opus-5-20260101` matched), so the same model sent
- * a different thinking shape and beta set depending on which id string was used.
- * Bedrock region/inference-profile prefixes are handled by the canonical parser.
+ * The Opus capability shares `hasOpus47ApiRestrictions` version parsing on purpose:
+ * a private `claude-opus-(\d+)-(\d+)` regex silently disagreed with it for
+ * single-component aliases (`claude-opus-5` matched nothing while
+ * `claude-opus-5-20260101` matched), so the same model sent a different thinking
+ * shape and beta set depending on which id string was used. Haiku 5.5 is matched
+ * by parsed family/version. Bedrock profile prefixes are handled canonically.
  */
 export function supportsAnthropicAdaptiveThinkingDisplay(modelId: string): boolean {
 	if (/claude-fable-\d/.test(modelId)) return true;
-	return hasOpus47ApiRestrictions(modelId);
+	return hasOpus47ApiRestrictions(modelId) || isAnthropicHaiku55Model(modelId);
+}
+
+/**
+ * Returns whether an adaptive-thinking model accepts an explicit disabled
+ * thinking mode. Haiku 5.5 and Opus 4.7+ support this field; Fable's adaptive
+ * thinking cannot be disabled.
+ */
+export function supportsAnthropicAdaptiveThinkingDisable(modelId: string): boolean {
+	return hasOpus47ApiRestrictions(modelId) || isAnthropicHaiku55Model(modelId);
+}
+
+function isAnthropicHaiku55Model(modelId: string): boolean {
+	const parsed = parseAnthropicModel(getCanonicalModelId(modelId));
+	return parsed?.kind === "haiku" && semverEqual(parsed.version, "5.5");
 }
 
 function anthropicModelHasRealXHighEffort<TApi extends Api>(model: ApiModel<TApi>): boolean {

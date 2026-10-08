@@ -12,6 +12,8 @@ import {
 	mapEffortToGoogleThinkingLevel,
 	modelSupportsReasoningControl,
 	requireSupportedEffort,
+	supportsAnthropicAdaptiveThinkingDisable,
+	supportsAnthropicAdaptiveThinkingDisplay,
 } from "@gajae-code/ai/model-thinking";
 import type { Api, Model, Provider, ThinkingControlMode } from "@gajae-code/ai/types";
 
@@ -84,6 +86,16 @@ describe("model thinking metadata", () => {
 		expect(hasAnthropicSamplingParameterRestrictions("claude-haiku-5-5")).toBe(true);
 		expect(hasAnthropicSamplingParameterRestrictions("anthropic.claude-haiku-5-5")).toBe(true);
 		expect(hasAnthropicSamplingParameterRestrictions("claude-haiku-4-5")).toBe(false);
+	});
+
+	it("recognizes Haiku 5.5 adaptive display and disable support across Bedrock profiles", () => {
+		expect(supportsAnthropicAdaptiveThinkingDisplay("claude-haiku-5-5")).toBe(true);
+		expect(supportsAnthropicAdaptiveThinkingDisplay("us.anthropic.claude-haiku-5-5")).toBe(true);
+		expect(supportsAnthropicAdaptiveThinkingDisplay("claude-haiku-4-5")).toBe(false);
+		expect(supportsAnthropicAdaptiveThinkingDisable("claude-haiku-5-5")).toBe(true);
+		expect(supportsAnthropicAdaptiveThinkingDisable("global.anthropic.claude-haiku-5-5")).toBe(true);
+		expect(supportsAnthropicAdaptiveThinkingDisable("claude-opus-4-7")).toBe(true);
+		expect(supportsAnthropicAdaptiveThinkingDisable("claude-fable-5")).toBe(false);
 	});
 
 	it("keeps Haiku 4.5 on budget thinking after generated policy refresh", () => {

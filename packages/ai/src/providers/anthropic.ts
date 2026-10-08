@@ -35,6 +35,7 @@ import {
 	hasAnthropicSamplingParameterRestrictions,
 	mapEffortToAnthropicAdaptiveEffort,
 	supportsAnthropicAdaptiveThinkingDisplay as supportsAdaptiveThinkingDisplay,
+	supportsAnthropicAdaptiveThinkingDisable,
 } from "../model-thinking";
 import { calculateCost } from "../models";
 import { readProviderDiagnostic } from "../provider-diagnostic";
@@ -3399,15 +3400,27 @@ function createClient(
 }
 
 /**
- * Anthropic rejects extended thinking combined with a forced tool choice, so such a
- * request drops `thinking`/`output_config`. Reports whether the forced-choice branch
- * applied so the caller can keep the replayed history consistent with it.
+ * Anthropic rejects extended thinking combined with a forced tool choice. Adaptive
+ * generations that support explicit disable retain that switch; other generations
+ * omit the thinking fields. Reports whether the branch applied so replayed history
+ * can be kept consistent with the request.
  */
-function disableThinkingIfToolChoiceForced(params: MessageCreateParamsStreaming): boolean {
+function disableThinkingIfToolChoiceForced(
+	params: MessageCreateParamsStreaming,
+	model: Model<"anthropic-messages">,
+): boolean {
 	const toolChoice = params.tool_choice;
 	if (!toolChoice) return false;
 	if (toolChoice.type !== "any" && toolChoice.type !== "tool") return false;
-	delete params.thinking;
+	if (
+		model.thinking?.mode === "anthropic-adaptive" &&
+		!getAnthropicCompat(model).disableAdaptiveThinking &&
+		supportsAnthropicAdaptiveThinkingDisable(model.id)
+	) {
+		params.thinking = { type: "disabled" };
+	} else {
+		delete params.thinking;
+	}
 	delete params.output_config;
 	return true;
 }
@@ -3764,18 +3777,25 @@ function buildParams(
 			params.thinking = { type: options.thinkingEnabled ? "adaptive" : "disabled" };
 		}
 	} else if (model.reasoning && miniMaxMode !== "always-on") {
-		if (options?.thinkingEnabled) {
-			const mode = model.thinking?.mode;
+		const mode = model.thinking?.mode;
+		const compat = getAnthropicCompat(model);
+		if (
+			options?.thinkingEnabled === false &&
+			mode === "anthropic-adaptive" &&
+			!compat.disableAdaptiveThinking &&
+			supportsAnthropicAdaptiveThinkingDisable(model.id)
+		) {
+			params.thinking = { type: "disabled" };
+		} else if (options?.thinkingEnabled) {
 			const requestedEffort = options.reasoning;
 			const effort =
 				options.effort ??
 				(requestedEffort ? mapEffortToAnthropicAdaptiveEffort(model, requestedEffort) : undefined);
 
-			const compat = getAnthropicCompat(model);
 			if (mode === "anthropic-adaptive" && !compat.disableAdaptiveThinking) {
-				// Starting with Anthropic model Opus 4.7, adaptive thinking content is omitted from the
-				// response by default. Opt into summarized reasoning so thinking deltas keep
-				// streaming with human-readable content for callers that rely on it.
+				// Some adaptive generations (including Opus 4.7+, Fable 5, and Haiku 5.5)
+				// omit thinking content by default. Opt into summarized reasoning so
+				// thinking deltas keep streaming with readable content for callers that rely on it.
 				const adaptive: { type: "adaptive"; display?: AnthropicThinkingDisplay } = { type: "adaptive" };
 				if (supportsAdaptiveThinkingDisplay(model.id)) {
 					adaptive.display = options.thinkingDisplay ?? "summarized";
@@ -3827,12 +3847,12 @@ function buildParams(
 		}
 	}
 
-	// A forced tool choice strips `thinking` from the request. Signed thinking blocks
-	// replayed from history belong to a thinking-enabled request, and Anthropic rejects
-	// that pair with `thinking`/`redacted_thinking` blocks "cannot be modified", so the
-	// replay has to degrade in the same rebuild. Runs before the billing/system payload
-	// snapshot so the attribution hash covers the messages actually sent.
-	if (disableThinkingIfToolChoiceForced(params) && hasNativeThinkingBlocks(params.messages)) {
+	// A forced tool choice disables extended thinking. Signed thinking blocks replayed
+	// from history belong to a thinking-enabled request, and Anthropic rejects that pair
+	// with `thinking`/`redacted_thinking` blocks "cannot be modified", so the replay has
+	// to degrade in the same rebuild. Runs before the billing/system payload snapshot so
+	// the attribution hash covers the messages actually sent.
+	if (disableThinkingIfToolChoiceForced(params, model) && hasNativeThinkingBlocks(params.messages)) {
 		params.messages = convertAnthropicMessages(context.messages, model, isOAuthToken, {
 			...thinkingRepair,
 			repairAllAssistantThinking: true,

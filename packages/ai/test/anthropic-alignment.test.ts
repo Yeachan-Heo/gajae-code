@@ -18,7 +18,7 @@ import {
 	stripClaudeToolPrefix,
 } from "@gajae-code/ai/providers/anthropic";
 import { getClaudeCodeVersion } from "@gajae-code/ai/providers/claude-code-version";
-import { getEnvApiKey } from "@gajae-code/ai/stream";
+import { getEnvApiKey, streamSimple } from "@gajae-code/ai/stream";
 import type { Context, Model, TJsonSchema, Tool } from "@gajae-code/ai/types";
 import * as z from "zod/v4";
 import { getBundledModel } from "../src/models";
@@ -79,6 +79,21 @@ function captureAnthropicPayload(
 		topP: options?.topP,
 		topK: options?.topK,
 		toolChoice: options?.toolChoice,
+		onPayload: payload => resolve(payload),
+	});
+	return promise;
+}
+
+function captureSimpleAnthropicPayload(
+	model: Model<"anthropic-messages">,
+	context: Context,
+	options?: { reasoning?: Effort; disableReasoning?: boolean },
+): Promise<unknown> {
+	const { promise, resolve } = Promise.withResolvers<unknown>();
+	void streamSimple(model, context, {
+		apiKey: "sk-ant-oat-test",
+		signal: createAbortedSignal(),
+		...options,
 		onPayload: payload => resolve(payload),
 	});
 	return promise;
@@ -381,6 +396,45 @@ describe("Anthropic request fingerprint alignment", () => {
 		)) as { tool_choice?: unknown };
 
 		expect(payload.tool_choice).toEqual({ type: "tool", name: "proxy_resolve" });
+	});
+
+	it("explicitly disables adaptive thinking for forced Haiku 5.5 tool calls", async () => {
+		const bundledModel = getBundledModel<"anthropic-messages">("anthropic", "claude-haiku-5-5");
+		const model = {
+			...bundledModel,
+			compat: { ...bundledModel.compat, supportsForcedToolChoice: true },
+		};
+		const payload = (await captureAnthropicPayload(
+			model,
+			{
+				systemPrompt: ["Stay concise."],
+				messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+				tools: [
+					{
+						name: "resolve",
+						description: "resolve a pending action",
+						parameters: {
+							type: "object",
+							properties: { action: { type: "string" } },
+							required: ["action"],
+						} as TJsonSchema,
+					},
+				],
+			},
+			{
+				thinkingEnabled: true,
+				reasoning: Effort.High,
+				toolChoice: { type: "tool", name: "resolve" },
+			},
+		)) as {
+			thinking?: { type?: string };
+			output_config?: { effort?: string };
+			tool_choice?: { type?: string; name?: string };
+		};
+
+		expect(payload.tool_choice).toEqual({ type: "tool", name: "proxy_resolve" });
+		expect(payload.thinking).toEqual({ type: "disabled" });
+		expect(payload.output_config).toBeUndefined();
 	});
 	it("adds additionalProperties false to Anthropic tool object schemas", async () => {
 		const originalNestedSchema = {
@@ -1155,15 +1209,33 @@ describe("Anthropic request fingerprint alignment", () => {
 			temperature?: number;
 			top_p?: number;
 			top_k?: number;
-			thinking?: { type?: string; budget_tokens?: number };
+			thinking?: { type?: string; display?: string; budget_tokens?: number };
 			output_config?: { effort?: string };
 		};
 
 		expect(payload.temperature).toBeUndefined();
 		expect(payload.top_p).toBeUndefined();
 		expect(payload.top_k).toBeUndefined();
-		expect(payload.thinking).toEqual({ type: "adaptive" });
+		expect(payload.thinking).toEqual({ type: "adaptive", display: "summarized" });
 		expect(payload.output_config).toEqual({ effort: "medium" });
+	});
+
+	it("lets explicit reasoning-off override a requested adaptive effort", async () => {
+		const model = getBundledModel<"anthropic-messages">("anthropic", "claude-haiku-5-5");
+		const payload = (await captureSimpleAnthropicPayload(
+			model,
+			{
+				systemPrompt: ["Stay concise."],
+				messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+			},
+			{ reasoning: Effort.Max, disableReasoning: true },
+		)) as {
+			thinking?: { type?: string };
+			output_config?: { effort?: string };
+		};
+
+		expect(payload.thinking).toEqual({ type: "disabled" });
+		expect(payload.output_config).toBeUndefined();
 	});
 
 	it("drops sampling params and requests summarized adaptive thinking for Opus 4.7", async () => {

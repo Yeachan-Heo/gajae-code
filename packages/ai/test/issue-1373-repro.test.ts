@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { Effort } from "../src/model-thinking";
 import { getBundledModel } from "../src/models";
 import { streamBedrock } from "../src/providers/amazon-bedrock";
-import type { Context, Model } from "../src/types";
+import type { Context, Model, Tool } from "../src/types";
 
 const originalSkipAuth = process.env.AWS_BEDROCK_SKIP_AUTH;
 
@@ -52,6 +52,12 @@ const baseContext: Context = {
 	messages: [{ role: "user", content: "ping", timestamp: Date.now() }],
 };
 
+const testTool: Tool = {
+	name: "lookup",
+	description: "Look up a value.",
+	parameters: { type: "object", properties: {}, additionalProperties: false },
+};
+
 function abortedSignal(): AbortSignal {
 	const controller = new AbortController();
 	controller.abort();
@@ -64,14 +70,16 @@ interface ThinkingPayload {
 		output_config?: { effort?: string };
 	};
 	inferenceConfig?: { maxTokens?: number; temperature?: number; topP?: number };
+	toolConfig?: { toolChoice?: Record<string, unknown> };
 }
 
 function captureBedrockPayload(
 	model: Model<"bedrock-converse-stream">,
 	options: Parameters<typeof streamBedrock>[2] = {},
+	context: Context = baseContext,
 ): Promise<ThinkingPayload> {
 	const { promise, resolve } = Promise.withResolvers<ThinkingPayload>();
-	void streamBedrock(model, baseContext, {
+	void streamBedrock(model, context, {
 		signal: abortedSignal(),
 		...options,
 		onPayload: payload => {
@@ -90,7 +98,7 @@ describe("issue #1373: Bedrock Claude thinkingDisplay", () => {
 			temperature: 0.2,
 			topP: 0.3,
 		});
-		expect(payload.additionalModelRequestFields?.thinking).toEqual({ type: "adaptive" });
+		expect(payload.additionalModelRequestFields?.thinking).toEqual({ type: "adaptive", display: "summarized" });
 		expect(payload.additionalModelRequestFields?.output_config).toEqual({ effort: "xhigh" });
 		expect(payload.inferenceConfig?.temperature).toBeUndefined();
 		expect(payload.inferenceConfig?.topP).toBeUndefined();
@@ -157,5 +165,35 @@ describe("issue #1373: Bedrock Claude thinkingDisplay", () => {
 			display: "summarized",
 		});
 		expect(typeof payload.additionalModelRequestFields?.thinking?.budget_tokens).toBe("number");
+	});
+
+	it("explicitly disables adaptive thinking when requested for Haiku 5.5", async () => {
+		const model = getBundledModel<"bedrock-converse-stream">("amazon-bedrock", "us.anthropic.claude-haiku-5-5");
+		const payload = await captureBedrockPayload(model, {
+			reasoning: Effort.Max,
+			disableReasoning: true,
+		});
+
+		expect(payload.additionalModelRequestFields?.thinking).toEqual({ type: "disabled" });
+		expect(payload.additionalModelRequestFields?.output_config).toBeUndefined();
+	});
+
+	it("disables Haiku 5.5 adaptive thinking for forced tool choice", async () => {
+		const bundledModel = getBundledModel<"bedrock-converse-stream">(
+			"amazon-bedrock",
+			"us.anthropic.claude-haiku-5-5",
+		);
+		const model = {
+			...bundledModel,
+			compat: { ...bundledModel.compat, supportsForcedToolChoice: true },
+		};
+		const payload = await captureBedrockPayload(
+			model,
+			{ toolChoice: "required" },
+			{ ...baseContext, tools: [testTool] },
+		);
+
+		expect(payload.toolConfig?.toolChoice).toEqual({ any: {} });
+		expect(payload.additionalModelRequestFields?.thinking).toEqual({ type: "disabled" });
 	});
 });

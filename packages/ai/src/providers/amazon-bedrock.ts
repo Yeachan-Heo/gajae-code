@@ -16,6 +16,7 @@ import {
 	mapEffortToAnthropicAdaptiveEffort,
 	requireSupportedEffort,
 	supportsAnthropicAdaptiveThinkingDisplay as supportsAdaptiveThinkingDisplay,
+	supportsAnthropicAdaptiveThinkingDisable,
 } from "../model-thinking";
 import { calculateCost } from "../models";
 import type {
@@ -62,6 +63,8 @@ export interface BedrockOptions extends StreamOptions {
 	toolChoice?: ToolChoice;
 	/* See https://docs.aws.amazon.com/bedrock/latest/userguide/inference-reasoning.html for supported models. */
 	reasoning?: Effort;
+	/** Force-disable adaptive reasoning for generations that support it. */
+	disableReasoning?: boolean;
 	/* Custom token budgets per thinking level. Overrides default budgets. */
 	thinkingBudgets?: ThinkingBudgets;
 	/* Only supported by Anthropic model 4.x models, see https://docs.aws.amazon.com/bedrock/latest/userguide/Anthropic model-messages-extended-thinking.html#Anthropic model-messages-extended-thinking-tool-use-interleaved */
@@ -215,10 +218,20 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 			let additionalModelRequestFields = buildAdditionalModelRequestFields(model, options);
 
 			// Bedrock rejects thinking + forced tool_choice ("any" or specific tool).
-			// When the resolved tool_choice forces tool use, disable thinking to avoid API errors.
-			if (toolConfig?.toolChoice && additionalModelRequestFields) {
+			// Haiku 5.5 and Opus 4.7+ default to adaptive thinking, so explicitly
+			// disable it instead of merely omitting additional fields.
+			if (toolConfig?.toolChoice) {
 				const tc = toolConfig.toolChoice;
-				if (tc.any || tc.tool) additionalModelRequestFields = undefined;
+				if (tc.any || tc.tool) {
+					if (
+						model.thinking?.mode === "anthropic-adaptive" &&
+						supportsAnthropicAdaptiveThinkingDisable(model.id)
+					) {
+						additionalModelRequestFields = { thinking: { type: "disabled" } };
+					} else if (additionalModelRequestFields) {
+						additionalModelRequestFields = undefined;
+					}
+				}
 			}
 			const allowsSamplingParameters = !hasAnthropicSamplingParameterRestrictions(model.id);
 
@@ -880,16 +893,24 @@ function buildAdditionalModelRequestFields(
 	model: Model<"bedrock-converse-stream">,
 	options: BedrockOptions,
 ): Record<string, unknown> | undefined {
+	if (
+		model.reasoning &&
+		options.disableReasoning &&
+		model.thinking?.mode === "anthropic-adaptive" &&
+		supportsAnthropicAdaptiveThinkingDisable(model.id)
+	) {
+		return { thinking: { type: "disabled" } };
+	}
+
 	const reasoning = options.reasoning;
 	if (!reasoning || !model.reasoning) return undefined;
 
 	const mode = model.thinking?.mode;
 	if (mode === "anthropic-adaptive") {
 		const effort = mapEffortToAnthropicAdaptiveEffort(model, reasoning);
-		// Starting with Anthropic model Opus 4.7, Anthropic switched the adaptive-thinking
-		// default to "omitted", which silently suppresses streamed reasoning and
-		// can read as a stalled stream during long reasoning runs (issue #1373).
-		// Opt back into "summarized" by default on models that accept the field.
+		// Some adaptive generations (including Opus 4.7+, Fable 5, and Haiku 5.5)
+		// default to "omitted", which can read as a stalled stream during long
+		// reasoning runs (issue #1373). Opt into "summarized" where accepted.
 		const adaptive: { type: "adaptive"; display?: BedrockThinkingDisplay } = { type: "adaptive" };
 		if (supportsAdaptiveThinkingDisplay(model.id)) {
 			adaptive.display = options.thinkingDisplay ?? "summarized";
