@@ -579,6 +579,20 @@ export function supportsAnthropicAdaptiveThinkingDisable(modelId: string): boole
 	return parsed.kind === "sonnet" && semverEqual(parsed.version, "5.0");
 }
 
+/**
+ * Anthropic adaptive thinking supports forced tool use except on Opus 5.5,
+ * Sonnet 5.5, Fable 5.1, and Mythos 5.1. Unknown model IDs fail closed.
+ * https://platform.claude.com/docs/en/build-with-claude/thinking#thinking-with-tool-use
+ */
+export function supportsAnthropicAdaptiveThinkingWithForcedToolChoice(modelId: string): boolean {
+	const parsed = parseAnthropicModel(getCanonicalModelId(modelId));
+	if (!parsed) return false;
+	if ((parsed.kind === "opus" || parsed.kind === "sonnet") && semverEqual(parsed.version, "5.5")) {
+		return false;
+	}
+	return !(parsed.kind === "fable" && semverEqual(parsed.version, "5.1"));
+}
+
 function isAnthropicHaiku55Model(modelId: string): boolean {
 	const parsed = parseAnthropicModel(getCanonicalModelId(modelId));
 	return parsed?.kind === "haiku" && semverEqual(parsed.version, "5.5");

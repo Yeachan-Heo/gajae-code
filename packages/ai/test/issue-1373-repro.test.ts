@@ -205,7 +205,7 @@ describe("issue #1373: Bedrock Claude thinkingDisplay", () => {
 		expect(payload.additionalModelRequestFields).toBeUndefined();
 	});
 
-	it("disables Haiku 5.5 adaptive thinking for forced tool choice", async () => {
+	it("preserves requested Haiku 5.5 adaptive thinking for forced tool choice", async () => {
 		const bundledModel = getBundledModel<"bedrock-converse-stream">(
 			"amazon-bedrock",
 			"us.anthropic.claude-haiku-5-5",
@@ -216,11 +216,12 @@ describe("issue #1373: Bedrock Claude thinkingDisplay", () => {
 		};
 		const payload = await captureBedrockPayload(
 			model,
-			{ toolChoice: "required" },
+			{ toolChoice: "required", reasoning: Effort.High },
 			{ ...baseContext, tools: [testTool] },
 		);
 
 		expect(payload.toolConfig?.toolChoice).toEqual({ any: {} });
-		expect(payload.additionalModelRequestFields?.thinking).toEqual({ type: "disabled" });
+		expect(payload.additionalModelRequestFields?.thinking).toEqual({ type: "adaptive", display: "summarized" });
+		expect(payload.additionalModelRequestFields?.output_config).toEqual({ effort: "high" });
 	});
 });

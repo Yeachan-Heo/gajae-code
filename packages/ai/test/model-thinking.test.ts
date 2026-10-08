@@ -15,6 +15,7 @@ import {
 	requireSupportedEffort,
 	supportsAnthropicAdaptiveThinkingDisable,
 	supportsAnthropicAdaptiveThinkingDisplay,
+	supportsAnthropicAdaptiveThinkingWithForcedToolChoice,
 } from "@gajae-code/ai/model-thinking";
 import type { Api, Model, Provider, ThinkingControlMode } from "@gajae-code/ai/types";
 
@@ -105,6 +106,18 @@ describe("model thinking metadata", () => {
 		expect(supportsAnthropicAdaptiveThinkingDisable("claude-opus-5-5")).toBe(false);
 		expect(supportsAnthropicAdaptiveThinkingDisable("claude-sonnet-5-5")).toBe(false);
 		expect(supportsAnthropicAdaptiveThinkingDisable("claude-fable-5")).toBe(false);
+	});
+
+	it("recognizes adaptive thinking generations compatible with forced tool choice", () => {
+		expect(supportsAnthropicAdaptiveThinkingWithForcedToolChoice("claude-haiku-5-5")).toBe(true);
+		expect(supportsAnthropicAdaptiveThinkingWithForcedToolChoice("us.anthropic.claude-haiku-5-5")).toBe(true);
+		expect(supportsAnthropicAdaptiveThinkingWithForcedToolChoice("claude-opus-4-7")).toBe(true);
+		expect(supportsAnthropicAdaptiveThinkingWithForcedToolChoice("claude-sonnet-5")).toBe(true);
+		expect(supportsAnthropicAdaptiveThinkingWithForcedToolChoice("claude-opus-5-5")).toBe(false);
+		expect(supportsAnthropicAdaptiveThinkingWithForcedToolChoice("claude-sonnet-5-5")).toBe(false);
+		expect(supportsAnthropicAdaptiveThinkingWithForcedToolChoice("claude-fable-5-1")).toBe(false);
+		expect(supportsAnthropicAdaptiveThinkingWithForcedToolChoice("claude-mythos-5-1")).toBe(false);
+		expect(supportsAnthropicAdaptiveThinkingWithForcedToolChoice("claude-unknown-5-5")).toBe(false);
 	});
 
 	it("keeps Haiku 4.5 on budget thinking after generated policy refresh", () => {

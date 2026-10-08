@@ -398,7 +398,7 @@ describe("Anthropic request fingerprint alignment", () => {
 		expect(payload.tool_choice).toEqual({ type: "tool", name: "proxy_resolve" });
 	});
 
-	it("explicitly disables adaptive thinking for forced Haiku 5.5 tool calls", async () => {
+	it("preserves requested adaptive thinking for forced Haiku 5.5 tool calls", async () => {
 		const bundledModel = getBundledModel<"anthropic-messages">("anthropic", "claude-haiku-5-5");
 		const model = {
 			...bundledModel,
@@ -427,14 +427,14 @@ describe("Anthropic request fingerprint alignment", () => {
 				toolChoice: { type: "tool", name: "resolve" },
 			},
 		)) as {
-			thinking?: { type?: string };
+			thinking?: { type?: string; display?: string };
 			output_config?: { effort?: string };
 			tool_choice?: { type?: string; name?: string };
 		};
 
 		expect(payload.tool_choice).toEqual({ type: "tool", name: "proxy_resolve" });
-		expect(payload.thinking).toEqual({ type: "disabled" });
-		expect(payload.output_config).toBeUndefined();
+		expect(payload.thinking).toEqual({ type: "adaptive", display: "summarized" });
+		expect(payload.output_config).toEqual({ effort: "high" });
 	});
 	it("adds additionalProperties false to Anthropic tool object schemas", async () => {
 		const originalNestedSchema = {

@@ -17,6 +17,7 @@ import {
 	requireSupportedEffort,
 	supportsAnthropicAdaptiveThinkingDisplay as supportsAdaptiveThinkingDisplay,
 	supportsAnthropicAdaptiveThinkingDisable,
+	supportsAnthropicAdaptiveThinkingWithForcedToolChoice,
 } from "../model-thinking";
 import { calculateCost } from "../models";
 import type {
@@ -217,13 +218,22 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 			const resolvedToolChoice = resolveToolChoice(model, options.toolChoice);
 			const toolConfig = convertToolConfig(context.tools, resolvedToolChoice.resolvedChoice);
 			let additionalModelRequestFields = buildAdditionalModelRequestFields(model, options);
+			const thinkingRequest = additionalModelRequestFields?.thinking;
+			const adaptiveThinkingRequested =
+				typeof thinkingRequest === "object" &&
+				thinkingRequest !== null &&
+				"type" in thinkingRequest &&
+				thinkingRequest.type === "adaptive";
 
-			// Bedrock rejects thinking + forced tool_choice ("any" or specific tool).
-			// Haiku 5.5 and Opus 4.7+ default to adaptive thinking, so explicitly
-			// disable it instead of merely omitting additional fields.
+			// Preserve explicitly requested adaptive thinking on generations that
+			// support forced tool use; manual thinking and restricted generations
+			// retain the conservative disable/omit behavior.
 			if (toolConfig?.toolChoice) {
 				const tc = toolConfig.toolChoice;
-				if (tc.any || tc.tool) {
+				if (
+					(tc.any || tc.tool) &&
+					!(adaptiveThinkingRequested && supportsAnthropicAdaptiveThinkingWithForcedToolChoice(model.id))
+				) {
 					if (
 						model.thinking?.mode === "anthropic-adaptive" &&
 						supportsAnthropicAdaptiveThinkingDisable(model.id)

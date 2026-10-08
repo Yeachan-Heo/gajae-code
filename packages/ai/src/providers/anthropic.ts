@@ -37,6 +37,7 @@ import {
 	mapEffortToAnthropicAdaptiveEffort,
 	supportsAnthropicAdaptiveThinkingDisplay as supportsAdaptiveThinkingDisplay,
 	supportsAnthropicAdaptiveThinkingDisable,
+	supportsAnthropicAdaptiveThinkingWithForcedToolChoice,
 } from "../model-thinking";
 import { calculateCost } from "../models";
 import { readProviderDiagnostic } from "../provider-diagnostic";
@@ -3408,10 +3409,9 @@ function createClient(
 }
 
 /**
- * Anthropic rejects extended thinking combined with a forced tool choice. Adaptive
- * generations that support explicit disable retain that switch; other generations
- * omit the thinking fields. Reports whether the branch applied so replayed history
- * can be kept consistent with the request.
+ * Manual thinking and specific adaptive generations reject forced tool choice.
+ * Preserve adaptive configurations for compatible generations; for the remaining
+ * requests, report whether thinking was removed so replayed history stays consistent.
  */
 function disableThinkingIfToolChoiceForced(
 	params: MessageCreateParamsStreaming,
@@ -3420,6 +3420,13 @@ function disableThinkingIfToolChoiceForced(
 	const toolChoice = params.tool_choice;
 	if (!toolChoice) return false;
 	if (toolChoice.type !== "any" && toolChoice.type !== "tool") return false;
+	if (
+		params.thinking?.type === "adaptive" &&
+		!getAnthropicCompat(model).disableAdaptiveThinking &&
+		supportsAnthropicAdaptiveThinkingWithForcedToolChoice(model.id)
+	) {
+		return false;
+	}
 	if (
 		model.thinking?.mode === "anthropic-adaptive" &&
 		!getAnthropicCompat(model).disableAdaptiveThinking &&
