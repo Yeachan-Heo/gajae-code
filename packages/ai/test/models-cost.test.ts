@@ -230,10 +230,9 @@ describe("calculateCost", () => {
 		});
 	});
 
-	it("generates Haiku 5.5 long-context prices for Anthropic and every Bedrock selector", () => {
+	it("generates Haiku 5.5 long-context prices for Anthropic and supported Bedrock selectors", () => {
 		const selectors = [
 			{ provider: "anthropic", id: "claude-haiku-5-5" },
-			{ provider: "amazon-bedrock", id: "anthropic.claude-haiku-5-5" },
 			{ provider: "amazon-bedrock", id: "au.anthropic.claude-haiku-5-5" },
 			{ provider: "amazon-bedrock", id: "eu.anthropic.claude-haiku-5-5" },
 			{ provider: "amazon-bedrock", id: "global.anthropic.claude-haiku-5-5" },
@@ -241,6 +240,8 @@ describe("calculateCost", () => {
 			{ provider: "amazon-bedrock", id: "us.anthropic.claude-haiku-5-5" },
 		] as const;
 		const rawCatalog = modelsJson as Record<string, Record<string, Model>>;
+		expect(rawCatalog["amazon-bedrock"]?.["anthropic.claude-haiku-5-5"]).toBeUndefined();
+		expect(getBundledModel("amazon-bedrock", "anthropic.claude-haiku-5-5")).toBeUndefined();
 
 		for (const { provider, id } of selectors) {
 			const rawModel = rawCatalog[provider]?.[id];

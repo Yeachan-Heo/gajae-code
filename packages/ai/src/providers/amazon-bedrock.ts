@@ -12,6 +12,7 @@ import { assertAwsRegionLabel } from "../adapter-internals/aws-region";
 import { parseBedrockClaudeGeneration, supportsBedrockClaudePromptCaching } from "../bedrock-claude-cache-policy";
 import type { Effort } from "../model-thinking";
 import {
+	hasAnthropicSamplingParameterRestrictions,
 	mapEffortToAnthropicAdaptiveEffort,
 	requireSupportedEffort,
 	supportsAnthropicAdaptiveThinkingDisplay as supportsAdaptiveThinkingDisplay,
@@ -219,14 +220,15 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 				const tc = toolConfig.toolChoice;
 				if (tc.any || tc.tool) additionalModelRequestFields = undefined;
 			}
+			const allowsSamplingParameters = !hasAnthropicSamplingParameterRestrictions(model.id);
 
 			let commandInput: ConverseStreamRequest = {
 				messages: convertMessages(context, model, cacheRetention),
 				system: buildSystemPrompt(context.systemPrompt, model, cacheRetention),
 				inferenceConfig: {
 					maxTokens: options.maxTokens,
-					temperature: options.temperature,
-					topP: options.topP,
+					temperature: allowsSamplingParameters ? options.temperature : undefined,
+					topP: allowsSamplingParameters ? options.topP : undefined,
 				},
 				toolConfig,
 				additionalModelRequestFields,

@@ -3,6 +3,19 @@ export type BedrockClaudeGeneration = {
 	kind: string;
 };
 
+/**
+ * Haiku 5.5's bare model ID is documented for Bedrock Mantle Messages, not
+ * Bedrock Runtime Converse. Converse supports its geo/global profile IDs.
+ * https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-haiku-5-5.html
+ */
+export function isUnsupportedBedrockConverseModel(model: { provider: string; api: string; id: string }): boolean {
+	return (
+		model.provider === "amazon-bedrock" &&
+		model.api === "bedrock-converse-stream" &&
+		model.id === "anthropic.claude-haiku-5-5"
+	);
+}
+
 function extractBedrockModelId(id: string): string | undefined {
 	if (id !== id.toLowerCase()) return undefined;
 	if (id.startsWith("arn:")) {

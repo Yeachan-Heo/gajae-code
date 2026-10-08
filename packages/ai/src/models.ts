@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { registerProviderSafetyStopModel } from "./adapter-internals/provider-safety-stop";
+import { isUnsupportedBedrockConverseModel } from "./bedrock-claude-cache-policy";
 import { getAnthropicModelCost, getOpenAIModelCost } from "./model-pricing";
 import { isRetiredModelKey } from "./model-retirements";
 import { applyGeneratedModelPolicies, enrichModelThinking } from "./model-thinking";
@@ -48,7 +49,7 @@ function getProviderModels(provider: GeneratedProvider): Map<string, Model<Api>>
 	if (!models) return undefined;
 	const providerModels = new Map<string, Model<Api>>();
 	for (const [id, model] of Object.entries(models)) {
-		if (isRetiredModelKey(provider, id)) {
+		if (isRetiredModelKey(provider, id) || isUnsupportedBedrockConverseModel(model as Model<Api>)) {
 			continue;
 		}
 		const bundledModel = applyBundledCompatDefaults(enrichModelThinking(model as Model<Api>));

@@ -989,41 +989,6 @@
         "maxLevel": "high"
       }
     },
-    "anthropic.claude-haiku-5-5": {
-      "api": "bedrock-converse-stream",
-      "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
-      "contextWindow": 1000000,
-      "cost": {
-        "cacheRead": 0.01,
-        "cacheWrite": 0.125,
-        "input": 0.1,
-        "output": 0.5
-      },
-      "id": "anthropic.claude-haiku-5-5",
-      "input": [
-        "text",
-        "image"
-      ],
-      "maxTokens": 128000,
-      "name": "Anthropic Haiku 5.5",
-      "provider": "amazon-bedrock",
-      "reasoning": true,
-      "thinking": {
-        "mode": "anthropic-budget-effort",
-        "minLevel": "minimal",
-        "maxLevel": "high",
-        "defaultLevel": "medium"
-      },
-      "longContextPricing": {
-        "threshold": 100000,
-        "cost": {
-          "input": 0.5,
-          "output": 2.5,
-          "cacheRead": 0.05,
-          "cacheWrite": 0.625
-        }
-      }
-    },
     "apac.amazon.nova-lite-v1:0": {
       "api": "bedrock-converse-stream",
       "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
@@ -1413,9 +1378,9 @@
       "provider": "amazon-bedrock",
       "reasoning": true,
       "thinking": {
-        "mode": "anthropic-budget-effort",
-        "minLevel": "minimal",
-        "maxLevel": "high",
+        "mode": "anthropic-adaptive",
+        "minLevel": "low",
+        "maxLevel": "max",
         "defaultLevel": "medium"
       },
       "longContextPricing": {
@@ -2237,9 +2202,9 @@
       "provider": "amazon-bedrock",
       "reasoning": true,
       "thinking": {
-        "mode": "anthropic-budget-effort",
-        "minLevel": "minimal",
-        "maxLevel": "high",
+        "mode": "anthropic-adaptive",
+        "minLevel": "low",
+        "maxLevel": "max",
         "defaultLevel": "medium"
       },
       "longContextPricing": {
@@ -2702,9 +2667,9 @@
       "provider": "amazon-bedrock",
       "reasoning": true,
       "thinking": {
-        "mode": "anthropic-budget-effort",
-        "minLevel": "minimal",
-        "maxLevel": "high",
+        "mode": "anthropic-adaptive",
+        "minLevel": "low",
+        "maxLevel": "max",
         "defaultLevel": "medium"
       },
       "longContextPricing": {
@@ -3430,9 +3395,9 @@
       "provider": "amazon-bedrock",
       "reasoning": true,
       "thinking": {
-        "mode": "anthropic-budget-effort",
-        "minLevel": "minimal",
-        "maxLevel": "high",
+        "mode": "anthropic-adaptive",
+        "minLevel": "low",
+        "maxLevel": "max",
         "defaultLevel": "medium"
       },
       "longContextPricing": {
@@ -5046,9 +5011,9 @@
       "provider": "amazon-bedrock",
       "reasoning": true,
       "thinking": {
-        "mode": "anthropic-budget-effort",
-        "minLevel": "minimal",
-        "maxLevel": "high",
+        "mode": "anthropic-adaptive",
+        "minLevel": "low",
+        "maxLevel": "max",
         "defaultLevel": "medium"
       },
       "longContextPricing": {

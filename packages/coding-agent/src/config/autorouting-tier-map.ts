@@ -1117,9 +1117,7 @@ export const TIER_MAP_SKIP_LIST = {
 		rationale: "pre-feature baseline; not yet curated",
 	},
 	"amazon-bedrock/anthropic.claude-fable-5": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
-	"amazon-bedrock/anthropic.claude-haiku-5-5": {
-		rationale: "PR #6483 Haiku 5.5 Bedrock selector; not separately tier-curated",
-	},
+
 	"amazon-bedrock/anthropic.claude-opus-4-6-v1": {
 		baseline: true,
 		rationale: "pre-feature baseline; not yet curated",

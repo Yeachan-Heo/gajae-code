@@ -59,7 +59,7 @@ describe("thinking control modes", () => {
 describe("model thinking metadata", () => {
 	it("resolves Haiku 5.5 defaults with separate Anthropic and Bedrock thinking modes", () => {
 		const anthropic = getBundledModel("anthropic", "claude-haiku-5-5");
-		const bedrock = getBundledModel("amazon-bedrock", "anthropic.claude-haiku-5-5");
+		const bedrock = getBundledModel("amazon-bedrock", "us.anthropic.claude-haiku-5-5");
 
 		expect(anthropic.thinking).toEqual({
 			mode: "anthropic-adaptive",
@@ -75,11 +75,12 @@ describe("model thinking metadata", () => {
 			Effort.Max,
 		]);
 		expect(bedrock.thinking).toEqual({
-			mode: "anthropic-budget-effort",
-			minLevel: Effort.Minimal,
-			maxLevel: Effort.High,
+			mode: "anthropic-adaptive",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
 			defaultLevel: Effort.Medium,
 		});
+		expect(getSupportedEfforts(bedrock)).toEqual([Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max]);
 		expect(hasAnthropicSamplingParameterRestrictions("claude-haiku-5-5")).toBe(true);
 		expect(hasAnthropicSamplingParameterRestrictions("anthropic.claude-haiku-5-5")).toBe(true);
 		expect(hasAnthropicSamplingParameterRestrictions("claude-haiku-4-5")).toBe(false);

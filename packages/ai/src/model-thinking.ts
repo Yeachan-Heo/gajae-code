@@ -57,7 +57,9 @@ const DEFAULT_REASONING_EFFORTS_WITH_XHIGH_AND_MAX: readonly Effort[] = [
 	Effort.Max,
 ];
 // Anthropic documents low..max for Haiku 5.5; unlike the shared range, it excludes minimal.
+// Anthropic Messages and Bedrock Converse support the same Haiku 5.5 effort levels.
 // https://platform.claude.com/docs/en/build-with-claude/thinking-steering-and-cost#effort-levels
+// https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-haiku-5-5.html
 const CLAUDE_HAIKU_5_5_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max];
 const GEMINI_3_PRO_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High];
 const GEMINI_3_FLASH_EFFORTS: readonly Effort[] = [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High];
@@ -1018,7 +1020,7 @@ function inferAnthropicSupportedEfforts<TApi extends Api>(
 		semverGte(parsedModel.version, "4.6")
 	) {
 		if (parsedModel.kind === "haiku" && semverEqual(parsedModel.version, "5.5")) {
-			return model.api === "anthropic-messages" ? CLAUDE_HAIKU_5_5_EFFORTS : DEFAULT_REASONING_EFFORTS;
+			return CLAUDE_HAIKU_5_5_EFFORTS;
 		}
 		if (parsedModel.kind === "fable") {
 			// Fable exposes Anthropic's Messages-only xhigh preset; Bedrock
@@ -1104,6 +1106,9 @@ function inferThinkingControlMode<TApi extends Api>(
 					semverGte(parsedModel.version, "4.6") &&
 					(parsedModel.kind === "opus" || parsedModel.kind === "fable")
 				) {
+					return "anthropic-adaptive";
+				}
+				if (parsedModel.kind === "haiku" && semverEqual(parsedModel.version, "5.5")) {
 					return "anthropic-adaptive";
 				}
 				if (semverGte(parsedModel.version, "4.5")) {

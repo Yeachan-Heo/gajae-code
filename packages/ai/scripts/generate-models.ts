@@ -12,6 +12,7 @@ const COPILOT_PREMIUM_MULTIPLIERS: Record<string, number> = {
 import * as path from "node:path";
 import { $env } from "@gajae-code/utils";
 import { AuthStorage, type OAuthAccess, SqliteAuthCredentialStore } from "../src/auth-storage";
+import { isUnsupportedBedrockConverseModel } from "../src/bedrock-claude-cache-policy";
 import { createModelManager } from "../src/model-manager";
 import { RETIRED_MODEL_KEYS } from "../src/model-retirements";
 import {
@@ -878,7 +879,7 @@ async function generateModels() {
 			}
 		}
 	}
-	allModels = allModels.filter(model => !isRetiredBundledModel(model));
+	allModels = allModels.filter(model => !isRetiredBundledModel(model) && !isUnsupportedBedrockConverseModel(model));
 
 	allModels = applyGlobalModelsDevFallback(allModels, modelsDevModels);
 	allModels = applyPremiumMultiplierOverrides(allModels);

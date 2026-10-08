@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { Effort } from "../src/model-thinking";
+import { getBundledModel } from "../src/models";
 import { streamBedrock } from "../src/providers/amazon-bedrock";
 import type { Context, Model } from "../src/types";
 
@@ -60,7 +61,9 @@ function abortedSignal(): AbortSignal {
 interface ThinkingPayload {
 	additionalModelRequestFields?: {
 		thinking?: { type?: string; display?: string; budget_tokens?: number };
+		output_config?: { effort?: string };
 	};
+	inferenceConfig?: { maxTokens?: number; temperature?: number; topP?: number };
 }
 
 function captureBedrockPayload(
@@ -80,6 +83,19 @@ function captureBedrockPayload(
 }
 
 describe("issue #1373: Bedrock Claude thinkingDisplay", () => {
+	it("uses adaptive Haiku 5.5 effort and omits unsupported sampling fields", async () => {
+		const model = getBundledModel<"bedrock-converse-stream">("amazon-bedrock", "us.anthropic.claude-haiku-5-5");
+		const payload = await captureBedrockPayload(model, {
+			reasoning: Effort.XHigh,
+			temperature: 0.2,
+			topP: 0.3,
+		});
+		expect(payload.additionalModelRequestFields?.thinking).toEqual({ type: "adaptive" });
+		expect(payload.additionalModelRequestFields?.output_config).toEqual({ effort: "xhigh" });
+		expect(payload.inferenceConfig?.temperature).toBeUndefined();
+		expect(payload.inferenceConfig?.topP).toBeUndefined();
+	});
+
 	it("defaults adaptive thinking to display=summarized on Opus 4.7+", async () => {
 		const payload = await captureBedrockPayload(adaptiveModel("anthropic.claude-opus-4-7"), {
 			reasoning: Effort.High,

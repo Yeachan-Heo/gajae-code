@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { isUnsupportedBedrockConverseModel } from "../src/bedrock-claude-cache-policy";
 import { applyGeneratedModelPolicies } from "../src/model-thinking";
 import { calculateCost, getBundledModels } from "../src/models";
 import { parseBedrockClaudeGeneration, supportsPromptCaching } from "../src/providers/amazon-bedrock";
@@ -20,6 +21,29 @@ function bedrockModel(id: string, cachePriced = false): Model<"bedrock-converse-
 		maxTokens: 8_192,
 	};
 }
+
+describe("Bedrock Haiku 5.5 Converse availability", () => {
+	it("excludes the Mantle-only bare ID but keeps Runtime inference profiles", () => {
+		const base = { provider: "amazon-bedrock", api: "bedrock-converse-stream" };
+		expect(isUnsupportedBedrockConverseModel({ ...base, id: "anthropic.claude-haiku-5-5" })).toBe(true);
+		for (const id of [
+			"us.anthropic.claude-haiku-5-5",
+			"eu.anthropic.claude-haiku-5-5",
+			"au.anthropic.claude-haiku-5-5",
+			"jp.anthropic.claude-haiku-5-5",
+			"global.anthropic.claude-haiku-5-5",
+		]) {
+			expect(isUnsupportedBedrockConverseModel({ ...base, id })).toBe(false);
+		}
+		expect(
+			isUnsupportedBedrockConverseModel({
+				provider: "amazon-bedrock",
+				api: "anthropic-messages",
+				id: "anthropic.claude-haiku-5-5",
+			}),
+		).toBe(false);
+	});
+});
 
 describe("Bedrock prompt caching support", () => {
 	it("uses one generation table for request caching and cache-pricing metadata", () => {
