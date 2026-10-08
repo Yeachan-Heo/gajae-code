@@ -4,7 +4,7 @@ import type { AgentMessage } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai";
 import { type AsyncJob, AsyncJobManager } from "@gajae-code/coding-agent/async";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { createAgentSession } from "@gajae-code/coding-agent/sdk";
+import { type CreateAgentSessionResult, createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import type { CustomMessage } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
@@ -188,7 +188,7 @@ describe("async result yield queue delivery", () => {
 	test("acknowledgement during formatting settles only the stale owned registration", async () => {
 		const tempDir = TempDir.createSync("@gjc-async-yield-race-");
 		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-		let created: Awaited<ReturnType<typeof createAgentSession>> | undefined;
+		let created: CreateAgentSessionResult | undefined;
 		let staleRegistration: TurnRegistrationKey | undefined;
 		let liveRegistration: TurnRegistrationKey | undefined;
 		const formattingStarted = Promise.withResolvers<void>();
@@ -346,6 +346,95 @@ test("flush preserves the queued FIFO chronology across contiguous origin runs",
 	const grouped = followUps as CustomMessage<{ jobs: string[] }>[];
 	expect(grouped.map(m => m.content)).toEqual(["a1", "b1", "a2"]);
 	expect(grouped.map(m => m.details?.jobs)).toEqual([["j-1"], ["j-2"], ["j-3"]]);
+});
+
+test("build failure requeues the failed and unbuilt groups in FIFO order", async () => {
+	const { queue, followUps } = createHarness(false);
+	const buildCalls: string[] = [];
+	let failB = true;
+	queue.register<string>("test-build-failure", {
+		groupKey: value => value,
+		build: values => {
+			const [value] = values;
+			if (value === undefined) return null;
+			buildCalls.push(value);
+			if (value === "b" && failB) {
+				failB = false;
+				throw new Error("temporary build failure");
+			}
+			return {
+				role: "custom",
+				customType: "async-result",
+				content: value,
+				display: true,
+				attribution: "agent",
+				details: {},
+				timestamp: 1,
+			};
+		},
+	});
+	queue.enqueue("test-build-failure", "a");
+	queue.enqueue("test-build-failure", "b");
+	queue.enqueue("test-build-failure", "c");
+
+	await queue.flush("streaming");
+
+	expect(followUps.map(message => (message as CustomMessage).content)).toEqual(["a"]);
+	expect(buildCalls).toEqual(["a", "b"]);
+	expect(queue.has("test-build-failure")).toBe(true);
+
+	await queue.flush("streaming");
+
+	expect(followUps.map(message => (message as CustomMessage).content)).toEqual(["a", "b", "c"]);
+	expect(buildCalls).toEqual(["a", "b", "b", "c"]);
+});
+
+test("idle injection rechecks queued identity after a transition clears the kind", async () => {
+	const injectionStarted = Promise.withResolvers<void>();
+	const releaseInjection = Promise.withResolvers<void>();
+	let currentIdentity = "predecessor";
+	let identityCurrentAtRelease: boolean | undefined;
+	const delivered: string[] = [];
+	const dropped: string[] = [];
+	const queue = new YieldQueue({
+		isStreaming: () => false,
+		captureIdentity: () => currentIdentity,
+		isIdentityCurrent: identity => identity === currentIdentity,
+		injectStreaming: () => {},
+		injectIdle: async (_messages, _signal, identityIsCurrent) => {
+			injectionStarted.resolve();
+			await releaseInjection.promise;
+			identityCurrentAtRelease = identityIsCurrent?.() ?? false;
+			return identityCurrentAtRelease ? "delivered" : "dropped";
+		},
+		scheduleIdleFlush: () => {},
+	});
+	queue.register<string>("identity-fence", {
+		build: values => ({
+			role: "custom",
+			customType: "async-result",
+			content: values.join("+"),
+			display: true,
+			attribution: "agent",
+			details: {},
+			timestamp: 1,
+		}),
+		onDelivered: value => delivered.push(value),
+		onDrop: value => dropped.push(value),
+	});
+	queue.enqueue("identity-fence", "predecessor result");
+
+	const flush = queue.flush("idle");
+	await injectionStarted.promise;
+	currentIdentity = "successor";
+	queue.clearKind("identity-fence");
+	releaseInjection.resolve();
+	await flush;
+
+	expect(identityCurrentAtRelease).toBe(false);
+	expect(delivered).toEqual([]);
+	expect(dropped).toEqual(["predecessor result"]);
+	expect(queue.has("identity-fence")).toBe(false);
 });
 
 test("flush without a groupKey keeps the single-batch behavior", async () => {

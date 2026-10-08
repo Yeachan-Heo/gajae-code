@@ -316,15 +316,22 @@ export class YieldQueue {
 			}
 		}
 		const messages: BuiltMessage[] = [];
-		for (const group of groups.values()) {
+		for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+			const group = groups[groupIndex]!;
 			try {
 				const message = dispatcher.build(group.map(entry => entry.value));
 				if (message) messages.push({ message, entries: group });
 				else this.#notifyDropped(dispatcher, group);
 			} catch (error) {
 				logger.warn("Yield queue build failed", { kind, error: formatError(error) });
-				this.#requeue(kind, group);
+				// Preserve FIFO by retaining the failed group and every group that
+				// has not been built yet. Requeueing each group in reverse order
+				// works with #requeue's prepend semantics without combining origins.
+				for (let pendingIndex = groups.length - 1; pendingIndex >= groupIndex; pendingIndex--) {
+					this.#requeue(kind, groups[pendingIndex]!);
+				}
 				this.rearmIdle();
+				break;
 			}
 		}
 		return messages.length > 0 ? messages : null;
