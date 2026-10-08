@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { MarkdownTheme, SvgFigureResolveContext } from "../src/components/markdown";
-import { Markdown } from "../src/components/markdown";
+import { clearRenderCache, Markdown } from "../src/components/markdown";
 import type { Component } from "../src/tui";
 import { defaultMarkdownTheme } from "./test-themes";
 
@@ -103,5 +103,33 @@ describe("Markdown asynchronous SVG figures", () => {
 		expect(rendered).toContain("```svg");
 		expect(rendered).toContain("<svg/>");
 		markdown.dispose();
+	});
+
+	it("keeps render caching enabled for SVG examples nested inside another fence", () => {
+		clearRenderCache();
+		const figures: DeferredFigure[] = [];
+		let resolverCalls = 0;
+		let codeBlockCalls = 0;
+		const baseTheme = figureTheme(figures, () => resolverCalls++);
+		const theme = {
+			...baseTheme,
+			codeBlock: (text: string) => {
+				codeBlockCalls++;
+				return defaultMarkdownTheme.codeBlock(text);
+			},
+		};
+		const source = "````markdown\n```svg\n<svg/>\n```\n````";
+		const first = new Markdown(source, 0, 0, theme);
+		first.render(80);
+		const renderedCodeBlockCalls = codeBlockCalls;
+
+		const second = new Markdown(source, 0, 0, theme);
+		second.render(80);
+
+		expect(resolverCalls).toBe(0);
+		expect(renderedCodeBlockCalls).toBeGreaterThan(0);
+		expect(codeBlockCalls).toBe(renderedCodeBlockCalls);
+		first.dispose();
+		second.dispose();
 	});
 });

@@ -10,6 +10,8 @@ import {
 } from "../src/terminal-capabilities";
 
 const SVG = '<svg width="12" height="7" viewBox="0 0 12 7"><rect width="12" height="7" fill="#f00"/></svg>';
+const WIDE_SVG =
+	'<svg width="800" height="400" viewBox="0 0 800 400"><rect width="800" height="400" fill="#f00"/></svg>';
 
 describe("SvgFigure", () => {
 	let theme: ImageTheme;
@@ -51,6 +53,38 @@ describe("SvgFigure", () => {
 			figure.dispose();
 			setCellDimensions(previousCellDimensions);
 			setTerminalImageProtocol(previousProtocol);
+		}
+	});
+
+	it("rerasterizes when the viewport height changes at the same terminal width", async () => {
+		const previousRows = Object.getOwnPropertyDescriptor(process.stdout, "rows");
+		const previousCellDimensions = getCellDimensions();
+		Object.defineProperty(process.stdout, "rows", { configurable: true, value: 24 });
+		setCellDimensions({ widthPx: 9, heightPx: 18 });
+		let changed = Promise.withResolvers<void>();
+		const figure = new SvgFigure({ theme, palette, onChange: () => changed.resolve() });
+		try {
+			figure.update(WIDE_SVG, true);
+			figure.render(80);
+			await changed.promise;
+			expect(figure.debugState().raster).toBe("684x342");
+
+			changed = Promise.withResolvers<void>();
+			Object.defineProperty(process.stdout, "rows", { configurable: true, value: 6 });
+			figure.render(80);
+			await changed.promise;
+			expect(figure.debugState().raster).toBe("144x72");
+
+			changed = Promise.withResolvers<void>();
+			setCellDimensions({ widthPx: 9, heightPx: 36 });
+			figure.render(80);
+			await changed.promise;
+			expect(figure.debugState().raster).toBe("288x144");
+		} finally {
+			figure.dispose();
+			setCellDimensions(previousCellDimensions);
+			if (previousRows) Object.defineProperty(process.stdout, "rows", previousRows);
+			else Reflect.deleteProperty(process.stdout, "rows");
 		}
 	});
 

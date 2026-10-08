@@ -14,13 +14,32 @@ export type FigureSegment =
 	/** `closed` once the fence's closing line arrived. */
 	| { readonly kind: "svg"; readonly source: string; readonly closed: boolean };
 
-/** A top-level (≤3-space indent) ```svg / ~~~svg fence opener, info string compared ASCII-case-insensitively. */
-const SVG_FENCE = /^ {0,3}(?:`{3,}|~{3,})[ \t]*svg(?:[ \t]|$)/im;
+/** A top-level (≤3-space indent) fenced-code opener. */
 const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 
 /** Whether `markdown` holds a ```svg fence {@link splitSvgFences} would lift. */
 export function hasSvgFence(markdown: string): boolean {
-	return markdown.includes("svg") && SVG_FENCE.test(markdown);
+	if (!markdown.includes("svg")) return false;
+	let fence: string | undefined;
+	let lineStart = 0;
+	while (lineStart <= markdown.length) {
+		const newline = markdown.indexOf("\n", lineStart);
+		const lineEnd = newline < 0 ? markdown.length : newline;
+		const next = newline < 0 ? markdown.length + 1 : newline + 1;
+		const line = markdown.slice(lineStart, lineEnd);
+		if (fence) {
+			if (closesFence(line, fence)) fence = undefined;
+		} else {
+			const open = FENCE_OPEN.exec(line);
+			// A backtick fence's info string cannot hold backticks (CommonMark).
+			if (open && !(open[1]![0] === "`" && open[2]!.includes("`"))) {
+				if (open[2]!.trim().split(/[ \t]/, 1)[0]!.toLowerCase() === "svg") return true;
+				fence = open[1]!;
+			}
+		}
+		lineStart = next;
+	}
+	return false;
 }
 
 /**

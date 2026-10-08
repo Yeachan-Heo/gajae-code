@@ -63,6 +63,12 @@ interface Attempt {
 	final: boolean;
 }
 
+interface Layout {
+	width: number;
+	cell: CellDimensions;
+	limits: Limits;
+}
+
 /** Cells a figure rendered at `width` may fill: the image's width, a share of the viewport, and the raster edge cap. */
 function limitsFor(width: number, cell: CellDimensions): Limits {
 	const viewportRows = Math.floor((process.stdout.rows || 24) * MAX_VIEWPORT_SHARE);
@@ -101,7 +107,8 @@ export class SvgFigure implements Component {
 	#disposed = false;
 	/** Last render width; rasters wait for the first render to know their room. */
 	#width: number | undefined;
-	#image: { raster: Raster; component: Image } | undefined;
+	#layout: Layout | undefined;
+	#image: { raster: Raster; cell: CellDimensions; columns: number; rows: number; component: Image } | undefined;
 
 	constructor(options: SvgFigureOptions) {
 		this.#options = options;
@@ -131,16 +138,28 @@ export class SvgFigure implements Component {
 	}
 
 	render(width: number): string[] {
-		const width1 = width;
-		if (width1 !== this.#width) {
-			this.#width = width1;
+		const cell = getCellDimensions();
+		const limits = limitsFor(width, cell);
+		const previousLayout = this.#layout;
+		const cellChanged =
+			previousLayout?.cell.widthPx !== cell.widthPx || previousLayout.cell.heightPx !== cell.heightPx;
+		const layoutChanged =
+			previousLayout === undefined ||
+			previousLayout.width !== width ||
+			cellChanged ||
+			previousLayout.limits.columns !== limits.columns ||
+			previousLayout.limits.rows !== limits.rows;
+		if (layoutChanged) {
+			this.#width = width;
+			this.#layout = { width, cell, limits };
+			if (cellChanged) this.#image?.component.invalidate();
 			this.#schedule();
 		}
 		if (!this.#raster && !this.#failed) return [];
 		if (this.failed) return [];
 		if (this.#raster) {
-			const image = this.#imageFor(this.#raster);
-			return image.render(width1);
+			const image = this.#imageFor(this.#raster, limits, cell);
+			return image.render(width);
 		}
 		return [];
 	}
@@ -306,18 +325,26 @@ export class SvgFigure implements Component {
 	 * cell size and room it was drawn for that box is its pixels exactly; a
 	 * raster outdated by a resize is scaled by {@link Image} until its redraw lands.
 	 */
-	#imageFor(raster: Raster): Image {
+	#imageFor(raster: Raster, limits: Limits, cell: CellDimensions): Image {
 		const current = this.#image;
-		if (current?.raster === raster) return current.component;
-		const columns = raster.widthPx / raster.cell.widthPx;
-		const rows = raster.heightPx / raster.cell.heightPx;
+		const columns = Math.min(limits.columns, Math.ceil(raster.widthPx / cell.widthPx));
+		const rows = Math.min(limits.rows, Math.ceil(raster.heightPx / cell.heightPx));
+		if (
+			current?.raster === raster &&
+			current.cell.widthPx === cell.widthPx &&
+			current.cell.heightPx === cell.heightPx &&
+			current.columns === columns &&
+			current.rows === rows
+		) {
+			return current.component;
+		}
 		const component = new Image(raster.data, "image/png", this.#options.theme, {
 			maxWidthCells: columns,
 			maxHeightCells: rows,
 			filename: "svg",
 			refetch: () => raster.data,
 		});
-		this.#image = { raster, component };
+		this.#image = { raster, cell, columns, rows, component };
 		return component;
 	}
 

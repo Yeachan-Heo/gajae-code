@@ -17,6 +17,7 @@ describe("splitSvgFences", () => {
 		const nested = "````markdown\n```svg\n<svg/>\n```\n````";
 		const indented = "    ```svg\n    <svg/>\n    ```";
 		expect(splitSvgFences(nested)).toEqual([{ kind: "markdown", text: nested }]);
+		expect(hasSvgFence(nested)).toBe(false);
 		expect(splitSvgFences(indented)).toEqual([{ kind: "markdown", text: indented }]);
 		expect(hasSvgFence(indented)).toBe(false);
 		expect(hasSvgFence("```svgx\n```")).toBe(false);
