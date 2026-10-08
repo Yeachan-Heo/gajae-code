@@ -185,12 +185,31 @@ describe("task fork-context provider identity", () => {
 	const authStorages: AuthStorage[] = [];
 	const tempDirs: string[] = [];
 
+	async function removeTempDirWithWindowsRetry(tempDir: string): Promise<void> {
+		if (process.platform === "win32") {
+			Bun.gc(true);
+			await Bun.sleep(50);
+		}
+		for (let attempt = 0; ; attempt++) {
+			try {
+				fs.rmSync(tempDir, { recursive: true, force: true });
+				return;
+			} catch (error) {
+				const code =
+					error && typeof error === "object" && "code" in error ? (error as { code?: unknown }).code : undefined;
+				if (process.platform !== "win32" || (code !== "EBUSY" && code !== "EPERM") || attempt >= 100) throw error;
+				Bun.gc(true);
+				await Bun.sleep(100);
+			}
+		}
+	}
+
 	afterEach(async () => {
 		while (sessions.length > 0) await sessions.pop()?.dispose();
 		while (authStorages.length > 0) authStorages.pop()?.close();
 		while (tempDirs.length > 0) {
 			const tempDir = tempDirs.pop();
-			if (tempDir && fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+			if (tempDir && fs.existsSync(tempDir)) await removeTempDirWithWindowsRetry(tempDir);
 		}
 	});
 
