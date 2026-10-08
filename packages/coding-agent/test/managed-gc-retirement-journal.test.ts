@@ -37,7 +37,9 @@ import {
 	captureManagedFileNoFollow,
 	captureManagedFileNoFollowBounded,
 	MANAGED_ARTIFACT_MAX_FILES,
+	MANAGED_ARTIFACT_MAX_TOTAL_BYTES,
 	MANAGED_SESSION_READ_RANGE_MAX_BYTES,
+	type ManagedFileIdentity,
 	ManagedSessionDescendantStore,
 } from "../src/session/internal/managed-session-storage";
 import {
@@ -949,6 +951,50 @@ function readReceiptSuffix(fixture: Fixture, suffix: string): unknown {
 	}
 }
 
+function managedGcReceiptPath(fixture: Fixture, suffix: string): string {
+	const key = crypto.createHash("sha256").update(path.resolve(fixture.transcriptPath), "utf8").digest("hex");
+	return path.join(
+		fixture.scope.directoryPath,
+		".gjc-managed-session-internal",
+		"receipts",
+		`gc-retirement-${key}-${suffix}.json`,
+	);
+}
+
+function extendManagedGcReceiptWithWhitespace(pathname: string, targetSize: number): void {
+	const descriptor = fs.openSync(pathname, "r+");
+	try {
+		const initialSize = fs.fstatSync(descriptor).size;
+		if (!Number.isSafeInteger(targetSize) || initialSize > targetSize)
+			throw new Error("managed_gc_receipt_padding_size_invalid");
+		const spaces = Buffer.alloc(1024 * 1024, 0x20);
+		for (let position = initialSize; position < targetSize; ) {
+			const length = Math.min(spaces.byteLength, targetSize - position);
+			const written = fs.writeSync(descriptor, spaces, 0, length, position);
+			if (written !== length) throw new Error("managed_gc_receipt_padding_short_write");
+			position += written;
+		}
+	} finally {
+		fs.closeSync(descriptor);
+	}
+}
+
+function padManagedGcReceiptHistoryTo512MiB(fixture: Fixture): string[] {
+	const paths = [
+		managedGcReceiptPath(fixture, "prepared"),
+		managedGcReceiptPath(fixture, "artifacts_removed"),
+		...Array.from({ length: 6 }, (_, index) =>
+			managedGcReceiptPath(fixture, `owner_pending-${String(index + 1).padStart(8, "0")}`),
+		),
+	];
+	if (paths.length * MANAGED_SESSION_READ_RANGE_MAX_BYTES !== MANAGED_ARTIFACT_MAX_TOTAL_BYTES)
+		throw new Error("fixture_gc_receipt_history_limit_mismatch");
+	for (const pathname of paths) extendManagedGcReceiptWithWhitespace(pathname, MANAGED_SESSION_READ_RANGE_MAX_BYTES);
+	const storedBytes = paths.reduce((total, pathname) => total + fs.statSync(pathname).size, 0);
+	if (storedBytes !== MANAGED_ARTIFACT_MAX_TOTAL_BYTES) throw new Error("fixture_gc_receipt_history_not_at_limit");
+	return paths;
+}
+
 async function cleanupRetryCandidate(fixture: Fixture) {
 	await Bun.write(
 		fixture.transcriptPath,
@@ -1185,7 +1231,7 @@ describe("bounded cleanup receipt replay", () => {
 		expect(allocate.mock.calls.some(([size]) => size === 64 * 1024 * 1024 + 1)).toBe(false);
 	});
 
-	it("refuses simulated aggregate descriptor bytes before allocating the ninth receipt", async () => {
+	it("refuses the ninth actual cleanup receipt after eight real 64 MiB admissions", async () => {
 		const { fixture, tombstonePath } = await injectedCleanupHistory(9);
 		const directory = path.dirname(tombstonePath);
 		const names = fs
@@ -1195,29 +1241,32 @@ describe("bounded cleanup receipt replay", () => {
 				(left, right) => Number(/-([0-9]+)\.json$/u.exec(left)?.[1]) - Number(/-([0-9]+)\.json$/u.exec(right)?.[1]),
 			);
 		const receiptPaths = new Set(names.map(name => path.join(directory, name)));
-		const actualSizes = new Map([...receiptPaths].map(pathname => [pathname, fs.statSync(pathname).size]));
-		const admitted = new Set<string>();
-		let allocatingPath: string | undefined;
+		for (const name of names.slice(0, 8))
+			extendManagedGcReceiptWithWhitespace(path.join(directory, name), MANAGED_SESSION_READ_RANGE_MAX_BYTES);
+		const actualSizes = new Map(
+			[...receiptPaths].map(pathname => {
+				const stat = fs.statSync(pathname, { bigint: true });
+				return [
+					pathname,
+					{ dev: stat.dev, ino: stat.ino, size: stat.size, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs },
+				] as const;
+			}),
+		);
+		const before = [...actualSizes.entries()];
 		const readers: Array<{ matchingEntries: number; allocations: number; inventoryClosed: boolean }> = [];
 		let activeReader: (typeof readers)[number] | undefined;
-		const receiptSize = 64 * 1024 * 1024;
-		const originalFstat = fs.fstatSync.bind(fs);
-		const originalLstat = fs.lstatSync.bind(fs);
+		const receiptSize = MANAGED_SESSION_READ_RANGE_MAX_BYTES;
 		const originalOpendir = fs.opendirSync.bind(fs);
 		const originalOpen = fs.openSync.bind(fs);
 		const originalClose = fs.closeSync.bind(fs);
+		const originalRead = fs.readSync.bind(fs);
 		const originalAlloc = Buffer.alloc.bind(Buffer);
 		const descriptorPaths = new Map<number, string>();
-		const withReceiptSize = <T extends fs.Stats | fs.BigIntStats>(stat: T): T =>
-			new Proxy(stat, {
-				get: (value, property) =>
-					property === "size"
-						? typeof value.size === "bigint"
-							? BigInt(receiptSize)
-							: receiptSize
-						: Reflect.get(value, property, value),
-			}) as T;
-		vi.spyOn(fs, "opendirSync").mockImplementation(pathname => {
+		const allocated = new Map<string, number>();
+		const bytesRequested = new Map<string, number>();
+		const bytesRead = new Map<string, number>();
+		const closes = new Map<string, number>();
+		const opendir = vi.spyOn(fs, "opendirSync").mockImplementation(pathname => {
 			const handle = originalOpendir(pathname);
 			if (pathname !== directory) return handle;
 			const reader = { matchingEntries: 0, allocations: 0, inventoryClosed: false };
@@ -1235,51 +1284,100 @@ describe("bounded cleanup receipt replay", () => {
 				},
 			} as fs.Dir;
 		});
-		vi.spyOn(fs, "openSync").mockImplementation(((pathname: fs.PathLike, flags: string | number, mode?: number) => {
+		const open = vi.spyOn(fs, "openSync").mockImplementation(((
+			pathname: fs.PathLike,
+			flags: string | number,
+			mode?: number,
+		) => {
 			const fd = originalOpen(pathname, flags, mode);
-			if (typeof pathname === "string") descriptorPaths.set(fd, path.resolve(pathname));
+			if (typeof pathname === "string" && receiptPaths.has(path.resolve(pathname)))
+				descriptorPaths.set(fd, path.resolve(pathname));
 			return fd;
 		}) as typeof fs.openSync);
-		vi.spyOn(fs, "closeSync").mockImplementation(fd => {
+		const close = vi.spyOn(fs, "closeSync").mockImplementation(fd => {
+			const pathname = descriptorPaths.get(fd);
 			try {
 				originalClose(fd);
 			} finally {
 				descriptorPaths.delete(fd);
+				if (pathname) closes.set(pathname, (closes.get(pathname) ?? 0) + 1);
 			}
 		});
-		vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, options?: { bigint?: boolean }) => {
+		const read = vi.spyOn(fs, "readSync").mockImplementation(((
+			fd: number,
+			buffer: NodeJS.ArrayBufferView,
+			offset: number,
+			length: number,
+			position: number | null,
+		) => {
 			const pathname = descriptorPaths.get(fd);
-			const stat = originalFstat(fd, options as never);
-			if (!pathname || !receiptPaths.has(pathname)) return stat;
-			allocatingPath = pathname;
-			return withReceiptSize(stat);
-		}) as typeof fs.fstatSync);
-		vi.spyOn(fs, "lstatSync").mockImplementation(((pathname: fs.PathLike, options?: { bigint?: boolean }) => {
-			const stat = originalLstat(pathname, options as never);
-			return typeof pathname === "string" && receiptPaths.has(pathname) ? withReceiptSize(stat) : stat;
-		}) as typeof fs.lstatSync);
-		vi.spyOn(Buffer, "alloc").mockImplementation(((
+			if (pathname) bytesRequested.set(pathname, (bytesRequested.get(pathname) ?? 0) + length);
+			const count = originalRead(fd, buffer, offset, length, position);
+			if (pathname) bytesRead.set(pathname, (bytesRead.get(pathname) ?? 0) + count);
+			return count;
+		}) as typeof fs.readSync);
+		const allocate = vi.spyOn(Buffer, "alloc").mockImplementation(((
 			size: number,
 			fill?: string | Uint8Array | number,
 			encoding?: BufferEncoding,
 		) => {
 			if (size !== receiptSize) return originalAlloc(size, fill as number, encoding);
-			if (!allocatingPath) throw new Error("cleanup_receipt_allocation_path_missing");
-			const pathname = allocatingPath;
-			allocatingPath = undefined;
-			admitted.add(pathname);
+			const pathname = [...descriptorPaths.values()].find(candidate => receiptPaths.has(candidate));
+			if (!pathname) throw new Error("cleanup_receipt_allocation_descriptor_missing");
+			allocated.set(pathname, (allocated.get(pathname) ?? 0) + 1);
 			if (activeReader?.inventoryClosed) activeReader.allocations++;
-			return originalAlloc(actualSizes.get(pathname) ?? size);
+			return originalAlloc(size, fill as number, encoding);
 		}) as typeof Buffer.alloc);
 		const inspect = managedGcProtocolScopeInspectorForScope(fixture.scope);
-		await expect(inspect([protocolInputFor(fixture.scope)])).rejects.toThrow("managed_gc_journal_capacity_exceeded");
+		try {
+			await expect(inspect([protocolInputFor(fixture.scope)])).rejects.toThrow(
+				"managed_gc_journal_capacity_exceeded",
+			);
+		} finally {
+			allocate.mockRestore();
+			read.mockRestore();
+			close.mockRestore();
+			open.mockRestore();
+			opendir.mockRestore();
+		}
 		expect(names.length).toBeGreaterThan(8);
 		expect(readers).toEqual([
-			{ matchingEntries: names.length, inventoryClosed: true, allocations: 0 },
-			{ matchingEntries: names.length, inventoryClosed: true, allocations: 0 },
-			{ matchingEntries: names.length, inventoryClosed: true, allocations: 8 },
+			{ matchingEntries: names.length, allocations: 0, inventoryClosed: true },
+			{ matchingEntries: names.length, allocations: 0, inventoryClosed: true },
+			{ matchingEntries: names.length, allocations: 8, inventoryClosed: true },
 		]);
-		expect(admitted.size).toBe(8);
+		expect([...allocated.values()].reduce((total, count) => total + count, 0)).toBe(8);
+		const openedReceiptPaths = new Set(names.slice(0, 9).map(name => path.join(directory, name)));
+		for (const pathname of receiptPaths) {
+			const initialSize = actualSizes.get(pathname)?.size;
+			if (!openedReceiptPaths.has(pathname)) {
+				expect(closes.has(pathname)).toBe(false);
+				expect(allocated.has(pathname)).toBe(false);
+				expect(bytesRequested.has(pathname)).toBe(false);
+				expect(bytesRead.has(pathname)).toBe(false);
+			} else {
+				expect(closes.get(pathname)).toBe(1);
+				if (initialSize === BigInt(receiptSize)) {
+					expect(allocated.get(pathname)).toBe(1);
+					expect(bytesRequested.get(pathname)).toBe(receiptSize);
+					expect(bytesRead.get(pathname)).toBe(receiptSize);
+				} else {
+					expect(initialSize).toBeLessThan(BigInt(receiptSize));
+					expect(allocated.has(pathname)).toBe(false);
+					expect(bytesRequested.has(pathname)).toBe(false);
+					expect(bytesRead.has(pathname)).toBe(false);
+				}
+			}
+		}
+		expect(
+			[...receiptPaths].map(pathname => {
+				const stat = fs.statSync(pathname, { bigint: true });
+				return [
+					pathname,
+					{ dev: stat.dev, ino: stat.ino, size: stat.size, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs },
+				] as const;
+			}),
+		).toEqual(before);
 	}, 60_000);
 
 	it("rejects noncanonical suffixes, filename-record mismatches, and gaps", async () => {
@@ -1304,6 +1402,188 @@ describe("bounded cleanup receipt replay", () => {
 			}
 			const result = await deleteManagedSessionCandidate(fixture.scope, candidate);
 			expect(result).toMatchObject({ kind: "error", code: "durability_failed" });
+		}
+	});
+});
+
+describe("managed GC receipt descriptor admission", () => {
+	it("rejects an actual oversized receipt from descriptor size before allocating its contents", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		const receiptPath = managedGcReceiptPath(fixture, "prepared");
+		const receiptBytes = fs.readFileSync(receiptPath);
+		const descriptor = fs.openSync(receiptPath, "r+");
+		try {
+			fs.ftruncateSync(descriptor, MANAGED_SESSION_READ_RANGE_MAX_BYTES + 1);
+		} finally {
+			fs.closeSync(descriptor);
+		}
+		const before = fs.statSync(receiptPath, { bigint: true });
+		const allocations = spyOn(Buffer, "alloc");
+		await expect(
+			readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath),
+		).rejects.toThrow("managed_gc_journal_capacity_exceeded");
+		const after = fs.statSync(receiptPath, { bigint: true });
+		expect(after.size).toBe(BigInt(MANAGED_SESSION_READ_RANGE_MAX_BYTES + 1));
+		expect(after.dev).toBe(before.dev);
+		expect(after.ino).toBe(before.ino);
+		expect(after.nlink).toBe(1n);
+		expect(allocations.mock.calls.some(([size]) => size >= MANAGED_SESSION_READ_RANGE_MAX_BYTES)).toBe(false);
+		const current = Buffer.alloc(receiptBytes.byteLength);
+		const readDescriptor = fs.openSync(receiptPath, "r");
+		try {
+			expect(fs.readSync(readDescriptor, current, 0, current.byteLength, 0)).toBe(current.byteLength);
+		} finally {
+			fs.closeSync(readDescriptor);
+		}
+		expect(current).toEqual(receiptBytes);
+	});
+
+	it("rejects a linked actual receipt before allocation under the producer's real scope lock", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		const receiptPath = managedGcReceiptPath(fixture, "prepared");
+		const linkedPath = path.join(fixture.temporaryRoot, "linked-prepared-receipt.json");
+		const lockPath = path.join(
+			fixture.scope.directoryPath,
+			".gjc-managed-session-internal",
+			"locks",
+			`${MANAGED_GC_SCOPE_LOCK_NAME}.lock`,
+		);
+		const before = fs.readFileSync(receiptPath);
+		const beforeStat = fs.statSync(receiptPath, { bigint: true });
+		fs.linkSync(receiptPath, linkedPath);
+		let openedScopeLock = false;
+		let receiptOpenCount = 0;
+		const originalOpen = fs.openSync.bind(fs);
+		const open = vi.spyOn(fs, "openSync").mockImplementation(((
+			pathname: fs.PathLike,
+			flags: string | number,
+			mode?: number,
+		) => {
+			const descriptor = originalOpen(pathname, flags, mode);
+			if (typeof pathname === "string" && path.resolve(pathname) === receiptPath) receiptOpenCount++;
+			if (typeof pathname === "string" && path.resolve(pathname) === lockPath) openedScopeLock = true;
+			return descriptor;
+		}) as typeof fs.openSync);
+		const allocations = spyOn(Buffer, "alloc");
+		try {
+			const next: ManagedGcSessionRetirementReceipt = {
+				...preparedReceipt(fixture),
+				state: "artifacts_removed",
+				artifactsRemoved: true,
+			};
+			await expect(publishManagedGcSessionRetirementReceipt(fixture.scope, next)).rejects.toThrow("hard_link");
+			expect(openedScopeLock).toBe(true);
+			expect(receiptOpenCount).toBe(0);
+			expect(allocations.mock.calls.some(([size]) => size === Number(beforeStat.size))).toBe(false);
+			expect(fs.readFileSync(receiptPath)).toEqual(before);
+			expect(fs.readFileSync(linkedPath)).toEqual(before);
+			const afterStat = fs.statSync(receiptPath, { bigint: true });
+			expect(afterStat.dev).toBe(beforeStat.dev);
+			expect(afterStat.ino).toBe(beforeStat.ino);
+			expect(afterStat.size).toBe(beforeStat.size);
+			expect(afterStat.nlink).toBe(2n);
+		} finally {
+			allocations.mockRestore();
+			open.mockRestore();
+		}
+	});
+
+	it("closes a real receipt inventory after refusing its 50,001st physical entry", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		const receiptDirectory = path.dirname(managedGcReceiptPath(fixture, "prepared"));
+		for (let index = 0; index < MANAGED_ARTIFACT_MAX_FILES; index++) {
+			const name = `gc-retirement-untrusted-${String(index).padStart(8, "0")}.entry`;
+			fs.writeFileSync(path.join(receiptDirectory, name), "", { flag: "wx", mode: 0o600 });
+		}
+		expect(fs.readdirSync(receiptDirectory)).toHaveLength(MANAGED_ARTIFACT_MAX_FILES + 1);
+		const originalOpendir = fs.opendirSync.bind(fs);
+		let entriesRead = 0;
+		let inventoryCloseCount = 0;
+		const opendir = vi.spyOn(fs, "opendirSync").mockImplementation(pathname => {
+			const directory = originalOpendir(pathname);
+			if (path.resolve(String(pathname)) !== receiptDirectory) return directory;
+			return {
+				readSync: () => {
+					const entry = directory.readSync();
+					if (entry) entriesRead++;
+					return entry;
+				},
+				closeSync: () => {
+					directory.closeSync();
+					inventoryCloseCount++;
+				},
+			} as fs.Dir;
+		});
+		const allocations = spyOn(Buffer, "alloc");
+		try {
+			await expect(
+				readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath),
+			).rejects.toThrow("managed_gc_journal_capacity_exceeded");
+			expect(entriesRead).toBe(MANAGED_ARTIFACT_MAX_FILES + 1);
+			expect(inventoryCloseCount).toBe(1);
+			expect(allocations.mock.calls.some(([size]) => size >= MANAGED_SESSION_READ_RANGE_MAX_BYTES)).toBe(false);
+		} finally {
+			allocations.mockRestore();
+			opendir.mockRestore();
+		}
+	});
+
+	it("admits actual receipt descriptors through 512 MiB and refuses the overflowing read before allocation", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, {
+			...preparedReceipt(fixture),
+			state: "artifacts_removed",
+			artifactsRemoved: true,
+		});
+		for (let attempt = 1; attempt <= 8; attempt++) {
+			await publishManagedGcSessionRetirementReceipt(
+				fixture.scope,
+				pendingReceipt(fixture, `actual-byte-budget-${attempt}`),
+			);
+			expect(readReceiptSuffix(fixture, `owner_pending-${String(attempt).padStart(8, "0")}`)).toMatchObject({
+				state: "owner_pending",
+				ownerRetirementAttempt: attempt,
+			});
+		}
+		const pendingPaths = Array.from({ length: 8 }, (_, index) =>
+			managedGcReceiptPath(fixture, `owner_pending-${String(index + 1).padStart(8, "0")}`),
+		);
+		for (const receiptPath of pendingPaths.slice(0, 7))
+			extendManagedGcReceiptWithWhitespace(receiptPath, MANAGED_SESSION_READ_RANGE_MAX_BYTES);
+		const finalDescriptor = fs.openSync(pendingPaths[7]!, "r+");
+		try {
+			fs.ftruncateSync(finalDescriptor, MANAGED_SESSION_READ_RANGE_MAX_BYTES);
+		} finally {
+			fs.closeSync(finalDescriptor);
+		}
+		const preparedBytes = fs.statSync(managedGcReceiptPath(fixture, "prepared")).size;
+		const artifactsBytes = fs.statSync(managedGcReceiptPath(fixture, "artifacts_removed")).size;
+		expect(7 * MANAGED_SESSION_READ_RANGE_MAX_BYTES + preparedBytes + artifactsBytes).toBeLessThanOrEqual(
+			MANAGED_ARTIFACT_MAX_TOTAL_BYTES,
+		);
+		expect(8 * MANAGED_SESSION_READ_RANGE_MAX_BYTES + preparedBytes + artifactsBytes).toBeGreaterThan(
+			MANAGED_ARTIFACT_MAX_TOTAL_BYTES,
+		);
+		for (const receiptPath of pendingPaths) {
+			const stat = fs.statSync(receiptPath, { bigint: true });
+			expect(stat.size).toBe(BigInt(MANAGED_SESSION_READ_RANGE_MAX_BYTES));
+			expect(stat.nlink).toBe(1n);
+		}
+		const allocations = spyOn(Buffer, "alloc");
+		try {
+			await expect(
+				readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath),
+			).rejects.toThrow("managed_gc_journal_capacity_exceeded");
+			const fullReceiptAllocations = allocations.mock.calls
+				.filter(([size]) => size === MANAGED_SESSION_READ_RANGE_MAX_BYTES)
+				.map(([size]) => size);
+			expect(fullReceiptAllocations).toEqual(Array(7).fill(MANAGED_SESSION_READ_RANGE_MAX_BYTES));
+		} finally {
+			allocations.mockRestore();
 		}
 	});
 });
@@ -1993,7 +2273,7 @@ describe("managed GC retirement journal", () => {
 		}
 	});
 
-	it("budgets discovery and inspector GC receipt rereads per target across genuine sibling scopes", async () => {
+	it("admits actual 512 MiB receipt histories for sibling discovery", async () => {
 		const fixture = makeFixture();
 		const sibling = makeSiblingFixture(fixture, "managed-gc-budget-sibling");
 		for (const current of [fixture, sibling]) {
@@ -2006,29 +2286,42 @@ describe("managed GC retirement journal", () => {
 			for (let attempt = 1; attempt <= 6; attempt++)
 				await publishManagedGcSessionRetirementReceipt(
 					current.scope,
-					pendingReceipt(current, `sibling-pressure-${attempt}`),
+					pendingReceipt(current, `sibling-actual-boundary-${attempt}`),
 				);
+		}
+		const paddedPaths = [
+			...padManagedGcReceiptHistoryTo512MiB(fixture),
+			...padManagedGcReceiptHistoryTo512MiB(sibling),
+		];
+		for (const pathname of paddedPaths) {
+			const stat = fs.statSync(pathname, { bigint: true });
+			expect(stat.size).toBe(BigInt(MANAGED_SESSION_READ_RANGE_MAX_BYTES));
+			expect(stat.nlink).toBe(1n);
 		}
 		const targetKeys = [fixture, sibling].map(current =>
 			crypto.createHash("sha256").update(path.resolve(current.transcriptPath), "utf8").digest("hex"),
 		);
-		const projectedReads = new Map<string, number>();
+		const actualReads = new Map<string, number>();
+		const actualBytesByTarget = new Map<string, number>();
 		const originalReadExpectedBounded = ManagedSessionDescendantStore.prototype.readExpectedBounded;
-		const pressure = spyOn(ManagedSessionDescendantStore.prototype, "readExpectedBounded").mockImplementation(
+		const boundedRead = spyOn(ManagedSessionDescendantStore.prototype, "readExpectedBounded").mockImplementation(
 			function (
 				this: ManagedSessionDescendantStore,
 				relativePath: string,
 				maxBytes: number,
-				admitSize?: (size: number) => void,
+				admitSize?: (size: number, descriptor: ManagedFileIdentity) => void,
 			) {
-				return originalReadExpectedBounded.call(this, relativePath, maxBytes, size => {
+				return originalReadExpectedBounded.call(this, relativePath, maxBytes, (size, descriptor) => {
 					const key = /^\.gjc-managed-session-internal\/receipts\/gc-retirement-([a-f0-9]{64})-/u.exec(
 						relativePath,
 					)?.[1];
 					if (key && targetKeys.includes(key)) {
-						projectedReads.set(key, (projectedReads.get(key) ?? 0) + 1);
-						admitSize?.(64 * 1024 * 1024);
-					} else admitSize?.(size);
+						actualReads.set(key, (actualReads.get(key) ?? 0) + 1);
+						expect(descriptor.size).toBe(size);
+						expect(size).toBe(MANAGED_SESSION_READ_RANGE_MAX_BYTES);
+						actualBytesByTarget.set(key, (actualBytesByTarget.get(key) ?? 0) + size);
+					}
+					admitSize?.(size, descriptor);
 				});
 			},
 		);
@@ -2039,26 +2332,21 @@ describe("managed GC retirement journal", () => {
 				sessionsRoot: fixture.sessionsRoot,
 			});
 			expect(discovered).toHaveLength(2);
-			expect([...projectedReads.values()].sort((left, right) => left - right)).toEqual([8, 8]);
-			expect([...projectedReads.values()].reduce((sum, count) => sum + count, 0) * 64 * 1024 * 1024).toBe(
-				1024 * 1024 * 1024,
-			);
-			expect(discoveryAllocations.mock.calls.some(([size]) => size >= 64 * 1024 * 1024)).toBe(false);
-
-			projectedReads.clear();
-			const inspect = managedGcProtocolScopeInspectorForScope(fixture.scope);
-			const inspected = await inspect([protocolInputFor(fixture.scope), protocolInputFor(sibling.scope)]);
-			expect(inspected).toHaveLength(2);
-			expect([...projectedReads.values()].length).toBe(2);
-			expect([...projectedReads.values()].every(count => count === 32)).toBe(true);
-			expect(discoveryAllocations.mock.calls.some(([size]) => size >= 64 * 1024 * 1024)).toBe(false);
+			expect([...actualReads.values()].sort((left, right) => left - right)).toEqual([8, 8]);
+			expect([...actualBytesByTarget.values()].sort((left, right) => left - right)).toEqual([
+				MANAGED_ARTIFACT_MAX_TOTAL_BYTES,
+				MANAGED_ARTIFACT_MAX_TOTAL_BYTES,
+			]);
+			expect(
+				discoveryAllocations.mock.calls.filter(([size]) => size === MANAGED_SESSION_READ_RANGE_MAX_BYTES),
+			).toHaveLength(16);
 		} finally {
-			pressure.mockRestore();
+			boundedRead.mockRestore();
 			discoveryAllocations.mockRestore();
 		}
-	});
+	}, 60_000);
 
-	it("rejects the ninth individually admissible state per target before discovery or inspector allocation", async () => {
+	it("admits eight actual 64 MiB sibling states and rejects the ninth actual state before allocation", async () => {
 		const fixture = makeFixture();
 		const sibling = makeSiblingFixture(fixture, "managed-gc-ninth-sibling");
 		for (const current of [fixture, sibling]) {
@@ -2076,32 +2364,72 @@ describe("managed GC retirement journal", () => {
 		}
 		const target = fixture.scope.directoryName.localeCompare(sibling.scope.directoryName) > 0 ? fixture : sibling;
 		const unaffected = target === fixture ? sibling : fixture;
+		const targetKey = crypto.createHash("sha256").update(path.resolve(target.transcriptPath), "utf8").digest("hex");
+		const unaffectedKey = crypto
+			.createHash("sha256")
+			.update(path.resolve(unaffected.transcriptPath), "utf8")
+			.digest("hex");
 		await publishManagedGcSessionRetirementReceipt(target.scope, pendingReceipt(target, "target_ninth_state"));
+		const paddedHistoryPaths = [
+			...padManagedGcReceiptHistoryTo512MiB(target),
+			...padManagedGcReceiptHistoryTo512MiB(unaffected),
+		];
+		for (const pathname of paddedHistoryPaths)
+			expect(fs.statSync(pathname, { bigint: true }).size).toBe(BigInt(MANAGED_SESSION_READ_RANGE_MAX_BYTES));
 		const before = [managedReceiptInventory(fixture.scope), managedReceiptInventory(sibling.scope)];
 		const keys = [target, unaffected].map(current =>
 			crypto.createHash("sha256").update(path.resolve(current.transcriptPath), "utf8").digest("hex"),
 		);
 		const attempts = new Map<string, number>();
+		const actualAdmissions = new Map<string, { count: number; bytes: number }>();
+		const allocatedReceipts = new Map<string, number>();
+		let activeReceiptPath: string | undefined;
 		const originalReadExpectedBounded = ManagedSessionDescendantStore.prototype.readExpectedBounded;
+		const originalAlloc = Buffer.alloc.bind(Buffer);
 		const boundedRead = spyOn(ManagedSessionDescendantStore.prototype, "readExpectedBounded").mockImplementation(
 			function (
 				this: ManagedSessionDescendantStore,
 				relativePath: string,
 				maxBytes: number,
-				admitSize?: (size: number) => void,
+				admitSize?: (size: number, descriptor: ManagedFileIdentity) => void,
 			) {
-				return originalReadExpectedBounded.call(this, relativePath, maxBytes, size => {
-					const key = /^\.gjc-managed-session-internal\/receipts\/gc-retirement-([a-f0-9]{64})-/u.exec(
-						relativePath,
-					)?.[1];
-					if (key && keys.includes(key)) {
-						attempts.set(key, (attempts.get(key) ?? 0) + 1);
-						admitSize?.(64 * 1024 * 1024);
-					} else admitSize?.(size);
-				});
+				activeReceiptPath = relativePath;
+				try {
+					return originalReadExpectedBounded.call(this, relativePath, maxBytes, (size, descriptor) => {
+						const key = /^\.gjc-managed-session-internal\/receipts\/gc-retirement-([a-f0-9]{64})-/u.exec(
+							relativePath,
+						)?.[1];
+						if (key && keys.includes(key)) {
+							attempts.set(key, (attempts.get(key) ?? 0) + 1);
+							expect(descriptor.size).toBe(size);
+							expect(descriptor.nlink).toBe(1n);
+							const entryKey = `${key}:${relativePath}`;
+							const entry = actualAdmissions.get(entryKey) ?? { count: 0, bytes: 0 };
+							entry.count++;
+							entry.bytes += size;
+							actualAdmissions.set(entryKey, entry);
+						}
+						admitSize?.(size, descriptor);
+					});
+				} finally {
+					activeReceiptPath = undefined;
+				}
 			},
 		);
-		const allocations = spyOn(Buffer, "alloc");
+		const allocations = spyOn(Buffer, "alloc").mockImplementation(((
+			size: number,
+			fill?: string | Uint8Array | number,
+			encoding?: BufferEncoding,
+		) => {
+			if (activeReceiptPath && size === MANAGED_SESSION_READ_RANGE_MAX_BYTES) {
+				const key = /^\.gjc-managed-session-internal\/receipts\/gc-retirement-([a-f0-9]{64})-/u.exec(
+					activeReceiptPath,
+				)?.[1];
+				const allocationKey = `${key}:${activeReceiptPath}`;
+				allocatedReceipts.set(allocationKey, (allocatedReceipts.get(allocationKey) ?? 0) + 1);
+			}
+			return originalAlloc(size, fill, encoding);
+		}) as typeof Buffer.alloc);
 		try {
 			await expect(
 				discoverManagedGcSessionRetirementReceipts({
@@ -2110,60 +2438,32 @@ describe("managed GC retirement journal", () => {
 				}),
 			).rejects.toThrow("managed_gc_journal_capacity_exceeded");
 			expect([...attempts.values()].sort((left, right) => left - right)).toEqual([8, 9]);
-			expect(allocations.mock.calls.some(([size]) => size >= 64 * 1024 * 1024)).toBe(false);
+			expect([...actualAdmissions.entries()].filter(([entry]) => entry.startsWith(`${targetKey}:`))).toHaveLength(9);
+			expect(
+				[...actualAdmissions.entries()].filter(([entry]) => entry.startsWith(`${unaffectedKey}:`)),
+			).toHaveLength(8);
+			for (const [entryKey, admission] of actualAdmissions) {
+				const refused = entryKey.endsWith("owner_pending-00000007.json");
+				expect(admission.count).toBe(1);
+				if (refused) expect(admission.bytes).toBeLessThan(MANAGED_SESSION_READ_RANGE_MAX_BYTES);
+				else expect(admission.bytes).toBe(MANAGED_SESSION_READ_RANGE_MAX_BYTES);
+			}
+			expect([...allocatedReceipts.values()].reduce((total, count) => total + count, 0)).toBe(16);
+			expect(
+				[...allocatedReceipts.keys()].some(
+					entryKey =>
+						entryKey ===
+						`${targetKey}:.gjc-managed-session-internal/receipts/gc-retirement-${targetKey}-owner_pending-00000007.json`,
+				),
+			).toBe(false);
 			expect([managedReceiptInventory(fixture.scope), managedReceiptInventory(sibling.scope)]).toEqual(before);
 		} finally {
 			boundedRead.mockRestore();
 			allocations.mockRestore();
 		}
+	}, 60_000);
 
-		attempts.clear();
-		const protocolPath = path.join(target.scope.directoryPath, ".gjc-managed-session-internal");
-		const originalOpendirSync = fs.opendirSync.bind(fs);
-		let inspectorStarted = false;
-		const opendir = vi.spyOn(fs, "opendirSync").mockImplementation(pathname => {
-			if (path.resolve(String(pathname)) === protocolPath) inspectorStarted = true;
-			return originalOpendirSync(pathname);
-		});
-		const inspectorRead = spyOn(ManagedSessionDescendantStore.prototype, "readExpectedBounded").mockImplementation(
-			function (
-				this: ManagedSessionDescendantStore,
-				relativePath: string,
-				maxBytes: number,
-				admitSize?: (size: number) => void,
-			) {
-				return originalReadExpectedBounded.call(this, relativePath, maxBytes, size => {
-					const key = /^\.gjc-managed-session-internal\/receipts\/gc-retirement-([a-f0-9]{64})-/u.exec(
-						relativePath,
-					)?.[1];
-					if (inspectorStarted && key && keys.includes(key)) {
-						attempts.set(key, (attempts.get(key) ?? 0) + 1);
-						admitSize?.(64 * 1024 * 1024);
-					} else admitSize?.(size);
-				});
-			},
-		);
-		const inspectorAllocations = spyOn(Buffer, "alloc");
-		try {
-			await expect(
-				managedGcProtocolScopeInspectorForScope(fixture.scope)([
-					protocolInputFor(target.scope),
-					protocolInputFor(unaffected.scope),
-				]),
-			).rejects.toThrow("managed_gc_journal_capacity_exceeded");
-		} finally {
-			opendir.mockRestore();
-			inspectorRead.mockRestore();
-			inspectorAllocations.mockRestore();
-		}
-		expect(inspectorStarted).toBe(true);
-		expect(attempts.get(keys[0]!)).toBe(9);
-		expect(attempts.get(keys[1]!)).toBeUndefined();
-		expect(inspectorAllocations.mock.calls.some(([size]) => size >= 64 * 1024 * 1024)).toBe(false);
-		expect([managedReceiptInventory(fixture.scope), managedReceiptInventory(sibling.scope)]).toEqual(before);
-	});
-
-	it("refuses inspector history overflow independently in initial comparison and final phases before real receipt allocation", async () => {
+	it("keeps genuine receipt rereads healthy under the default descriptor-size cap", async () => {
 		const fixture = makeFixture();
 		const sibling = makeSiblingFixture(fixture, "managed-gc-independent-phase-sibling");
 		const target = fixture.scope.directoryName.localeCompare(sibling.scope.directoryName) > 0 ? fixture : sibling;
@@ -2175,81 +2475,301 @@ describe("managed GC retirement journal", () => {
 				state: "artifacts_removed",
 				artifactsRemoved: true,
 			});
-			for (let attempt = 1; attempt <= (current === target ? 7 : 6); attempt++)
+			for (let attempt = 1; attempt <= 6; attempt++)
 				await publishManagedGcSessionRetirementReceipt(
 					current.scope,
 					pendingReceipt(current, `phase-seed-${attempt}`),
 				);
 		}
 		const targetKey = crypto.createHash("sha256").update(path.resolve(target.transcriptPath), "utf8").digest("hex");
-		const targetPrefix = `.gjc-managed-session-internal/receipts/gc-retirement-${targetKey}-`;
+		const unaffectedKey = crypto
+			.createHash("sha256")
+			.update(path.resolve(unaffected.transcriptPath), "utf8")
+			.digest("hex");
 		const before = [managedReceiptInventory(target.scope), managedReceiptInventory(unaffected.scope)];
+		const expectedPaths = new Map<string, Set<string>>([
+			[targetKey, new Set(before[0]!.map(entry => `.gjc-managed-session-internal/receipts/${entry.name}`))],
+			[unaffectedKey, new Set(before[1]!.map(entry => `.gjc-managed-session-internal/receipts/${entry.name}`))],
+		]);
+		const readsByTarget = new Map<string, string[]>();
+		const capsByTarget = new Map<string, number[]>();
 		const originalRead = ManagedSessionDescendantStore.prototype.readExpectedBounded;
-		const originalAllocate = Buffer.alloc;
+		const read = spyOn(ManagedSessionDescendantStore.prototype, "readExpectedBounded").mockImplementation(function (
+			this: ManagedSessionDescendantStore,
+			relativePath: string,
+			maxBytes: number,
+			admitSize?: (size: number, descriptor: ManagedFileIdentity) => void,
+		) {
+			const key = /^\.gjc-managed-session-internal\/receipts\/gc-retirement-([a-f0-9]{64})-/u.exec(
+				relativePath,
+			)?.[1];
+			if (key === targetKey || key === unaffectedKey) {
+				const caps = capsByTarget.get(key) ?? [];
+				caps.push(maxBytes);
+				capsByTarget.set(key, caps);
+			}
+			return originalRead.call(this, relativePath, maxBytes, (size, descriptor) => {
+				if (key === targetKey || key === unaffectedKey) {
+					const scope = key === targetKey ? target.scope : unaffected.scope;
+					const actualSize = Number(
+						fs.statSync(path.join(scope.directoryPath, relativePath), { bigint: true }).size,
+					);
+					expect(size).toBe(actualSize);
+					expect(descriptor.size).toBe(size);
+					expect(descriptor.nlink).toBe(1n);
+					expect(expectedPaths.get(key)?.has(relativePath)).toBe(true);
+					const reads = readsByTarget.get(key) ?? [];
+					reads.push(relativePath);
+					readsByTarget.set(key, reads);
+				}
+				admitSize?.(size, descriptor);
+			});
+		});
+		try {
+			const snapshots = await managedGcProtocolScopeInspectorForScope(fixture.scope)([
+				protocolInputFor(target.scope),
+				protocolInputFor(unaffected.scope),
+			]);
+			expect(snapshots).toHaveLength(2);
+		} finally {
+			read.mockRestore();
+		}
+		for (const [key, paths] of expectedPaths) {
+			const reads = readsByTarget.get(key) ?? [];
+			const caps = capsByTarget.get(key) ?? [];
+			const passSize = paths.size;
+			expect(reads).toHaveLength(passSize * 4);
+			expect(caps).toEqual(Array(passSize * 4).fill(MANAGED_SESSION_READ_RANGE_MAX_BYTES));
+			for (let pass = 0; pass < 4; pass++) {
+				expect(new Set(reads.slice(pass * passSize, (pass + 1) * passSize))).toEqual(paths);
+			}
+		}
+		expect([managedReceiptInventory(target.scope), managedReceiptInventory(unaffected.scope)]).toEqual(before);
+	});
+
+	it("rejects each inspector-phase receipt under a smaller real read cap before allocation", async () => {
 		for (const phase of [
-			{ name: "initial", earlierReads: 9 },
-			{ name: "comparison", earlierReads: 18 },
-			{ name: "final", earlierReads: 27 },
-		]) {
-			let reads = 0;
-			const admissions: Array<{ relativePath: string; actualSize: number; pressured: boolean }> = [];
-			const allocated: Array<{ relativePath: string; actualSize: number; pressured: boolean; size: number }> = [];
-			let activeRead: { relativePath: string; actualSize: number; pressured: boolean } | undefined;
-			// Negative budget pressure only: the original reader opens genuine files and allocates their actual size.
+			{ name: "initial", earlierReads: 9, samePathRead: 2 },
+			{ name: "comparison", earlierReads: 18, samePathRead: 3 },
+			{ name: "final", earlierReads: 27, samePathRead: 4 },
+		] as const) {
+			const fixture = makeFixture(`managed-gc-phase-${phase.name}`);
+			const sibling = makeSiblingFixture(fixture, `managed-gc-phase-sibling-${phase.name}`);
+			for (const current of [fixture, sibling]) {
+				await publishManagedGcSessionRetirementReceipt(current.scope, preparedReceipt(current));
+				await publishManagedGcSessionRetirementReceipt(current.scope, {
+					...preparedReceipt(current),
+					state: "artifacts_removed",
+					artifactsRemoved: true,
+				});
+				const pendingCount = current === fixture ? 7 : 6;
+				for (let attempt = 1; attempt <= pendingCount; attempt++)
+					await publishManagedGcSessionRetirementReceipt(
+						current.scope,
+						pendingReceipt(current, `phase-${phase.name}-${attempt}`),
+					);
+			}
+
+			const targetKey = crypto
+				.createHash("sha256")
+				.update(path.resolve(fixture.transcriptPath), "utf8")
+				.digest("hex");
+			const targetPrefix = `.gjc-managed-session-internal/receipts/gc-retirement-${targetKey}-`;
+			const beforeTree = snapshotTree(fixture.sessionsRoot);
+			const beforeReceipts = managedReceiptInventory(fixture.scope);
+			const beforeSiblingReceipts = managedReceiptInventory(sibling.scope);
+			const reads = new Map<string, number>();
+			const descriptorPaths = new Map<number, string>();
+			const triggerFstatIdentities: Array<{
+				dev: bigint;
+				ino: bigint;
+				nlink: bigint;
+				size: bigint;
+				mtimeNs: bigint;
+				ctimeNs: bigint;
+				isFile: boolean;
+			}> = [];
+			const targetCloseCounts = new Map<string, number>();
+			const targetReadBytes = new Map<string, number>();
+			const targetReadRequests = new Map<string, number>();
+			const targetAllocationCounts = new Map<string, number>();
+			let triggerPath: string | undefined;
+			let triggerRelativePath: string | undefined;
+			let triggerDescriptor: number | undefined;
+			let triggerOpenCount = 0;
+			let triggerStat: fs.BigIntStats | undefined;
+			let triggerRequestCap: number | undefined;
+			let allocationWhileTargetOpen = 0;
+			const originalRead = ManagedSessionDescendantStore.prototype.readExpectedBounded;
+			const originalOpen = fs.openSync.bind(fs);
+			const originalClose = fs.closeSync.bind(fs);
+			const originalReadSync = fs.readSync.bind(fs);
+			const originalFstat = fs.fstatSync.bind(fs);
+			const originalAlloc = Buffer.alloc.bind(Buffer);
 			const read = spyOn(ManagedSessionDescendantStore.prototype, "readExpectedBounded").mockImplementation(
 				function (
 					this: ManagedSessionDescendantStore,
 					relativePath: string,
 					maxBytes: number,
-					admitSize?: (size: number) => void,
+					admitSize?: (size: number, descriptor: ManagedFileIdentity) => void,
 				) {
 					if (!relativePath.startsWith(targetPrefix))
 						return originalRead.call(this, relativePath, maxBytes, admitSize);
-					reads++;
-					const actualSize = Number(
-						fs.statSync(path.join(target.scope.directoryPath, relativePath), { bigint: true }).size,
-					);
-					const current = { relativePath, actualSize, pressured: reads > phase.earlierReads };
-					const previous = activeRead;
-					activeRead = current;
-					try {
-						return originalRead.call(this, relativePath, maxBytes, size => {
-							expect(size).toBe(actualSize);
-							admissions.push(current);
-							if (!admitSize) throw new Error(`fixture_${phase.name}_admission_callback_missing`);
-							admitSize(current.pressured ? 64 * 1024 * 1024 : size);
-						});
-					} finally {
-						activeRead = previous;
+					const count = (reads.get(relativePath) ?? 0) + 1;
+					reads.set(relativePath, count);
+					const totalReads = [...reads.values()].reduce((sum, current) => sum + current, 0);
+					if (totalReads === phase.earlierReads + 1) {
+						triggerRelativePath = relativePath;
+						triggerPath = path.join(fixture.scope.directoryPath, relativePath);
+						triggerStat = fs.lstatSync(triggerPath, { bigint: true });
+						triggerRequestCap = maxBytes;
+						if (!triggerStat.isFile() || triggerStat.nlink !== 1n || triggerStat.size <= 0n)
+							throw new Error(`fixture_${phase.name}_receipt_descriptor_unavailable`);
+						if (typeof admitSize !== "function")
+							throw new Error(`fixture_${phase.name}_admission_callback_missing`);
+						if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0)
+							throw new Error(`fixture_${phase.name}_default_read_cap_invalid`);
+						return originalRead.call(this, relativePath, 0, admitSize);
 					}
+					return originalRead.call(this, relativePath, maxBytes, admitSize);
 				},
 			);
-			const allocations = spyOn(Buffer, "alloc").mockImplementation((size, fill, encoding) => {
-				if (activeRead) allocated.push({ ...activeRead, size });
-				return originalAllocate(size, fill, encoding);
+			const open = spyOn(fs, "openSync").mockImplementation(((
+				pathname: fs.PathLike,
+				flags: string | number,
+				mode?: number,
+			) => {
+				const fd = originalOpen(pathname, flags, mode);
+				if (typeof pathname === "string" && triggerPath && path.resolve(pathname) === triggerPath) {
+					descriptorPaths.set(fd, triggerPath);
+					triggerDescriptor = fd;
+					triggerOpenCount++;
+				}
+				return fd;
+			}) as typeof fs.openSync);
+			const close = spyOn(fs, "closeSync").mockImplementation(fd => {
+				const pathname = descriptorPaths.get(fd);
+				try {
+					originalClose(fd);
+				} finally {
+					if (pathname) {
+						descriptorPaths.delete(fd);
+						targetCloseCounts.set(pathname, (targetCloseCounts.get(pathname) ?? 0) + 1);
+					}
+				}
 			});
+			const readSync = spyOn(fs, "readSync").mockImplementation(((
+				fd: number,
+				buffer: NodeJS.ArrayBufferView,
+				offset: number,
+				length: number,
+				position: number | null,
+			) => {
+				const pathname = descriptorPaths.get(fd);
+				if (pathname) targetReadRequests.set(pathname, (targetReadRequests.get(pathname) ?? 0) + length);
+				const bytes = originalReadSync(fd, buffer, offset, length, position);
+				if (pathname) targetReadBytes.set(pathname, (targetReadBytes.get(pathname) ?? 0) + bytes);
+				return bytes;
+			}) as typeof fs.readSync);
+			const fstat = spyOn(fs, "fstatSync").mockImplementation(((fd: number, options?: { bigint?: boolean }) => {
+				if (options?.bigint) {
+					const stat = originalFstat(fd, { ...options, bigint: true });
+					const pathname = descriptorPaths.get(fd);
+					if (pathname) {
+						if (typeof stat.mtimeNs !== "bigint" || typeof stat.ctimeNs !== "bigint")
+							throw new Error(`fixture_${phase.name}_opened_descriptor_stat_invalid`);
+						triggerFstatIdentities.push({
+							dev: stat.dev,
+							ino: stat.ino,
+							nlink: stat.nlink,
+							size: stat.size,
+							mtimeNs: stat.mtimeNs,
+							ctimeNs: stat.ctimeNs,
+							isFile: stat.isFile(),
+						});
+					}
+					return stat;
+				}
+				return originalFstat(fd, options ? { ...options, bigint: false } : undefined);
+			}) as typeof fs.fstatSync);
+			const allocate = spyOn(Buffer, "alloc").mockImplementation(((
+				size: number,
+				fill?: string | Uint8Array | number,
+				encoding?: BufferEncoding,
+			) => {
+				const pathname = [...descriptorPaths.values()].find(value => value === triggerPath);
+				if (pathname) {
+					targetAllocationCounts.set(pathname, (targetAllocationCounts.get(pathname) ?? 0) + 1);
+					allocationWhileTargetOpen++;
+				}
+				return originalAlloc(size, fill, encoding);
+			}) as typeof Buffer.alloc);
+			let caught: unknown;
 			try {
-				await expect(
-					managedGcProtocolScopeInspectorForScope(fixture.scope)([
-						protocolInputFor(target.scope),
-						protocolInputFor(unaffected.scope),
-					]),
-				).rejects.toThrow("managed_gc_journal_capacity_exceeded");
+				await managedGcProtocolScopeInspectorForScope(fixture.scope)([
+					protocolInputFor(fixture.scope),
+					protocolInputFor(sibling.scope),
+				]);
+			} catch (error) {
+				caught = error;
 			} finally {
+				allocate.mockRestore();
+				fstat.mockRestore();
+				readSync.mockRestore();
+				close.mockRestore();
+				open.mockRestore();
 				read.mockRestore();
-				allocations.mockRestore();
 			}
-			const pressured = admissions.filter(entry => entry.pressured);
-			const pressuredAllocations = allocated.filter(entry => entry.pressured && entry.size === entry.actualSize);
-			expect(reads).toBe(phase.earlierReads + 9);
-			expect(admissions.filter(entry => !entry.pressured)).toHaveLength(phase.earlierReads);
-			expect(pressured).toHaveLength(9);
-			expect(pressuredAllocations).toHaveLength(8);
-			const refused = pressured[8];
-			if (!refused) throw new Error(`fixture_${phase.name}_refused_descriptor_missing`);
-			expect(allocated.some(entry => entry.pressured && entry.relativePath === refused.relativePath)).toBe(false);
-			expect(pressuredAllocations.every(entry => entry.size > 0 && entry.size < 64 * 1024 * 1024)).toBe(true);
-			expect([managedReceiptInventory(target.scope), managedReceiptInventory(unaffected.scope)]).toEqual(before);
+
+			expect(caught).toMatchObject({ message: "managed_gc_journal_capacity_exceeded" });
+			expect(triggerPath).toBeTypeOf("string");
+			expect(triggerStat).toBeDefined();
+			expect(triggerRequestCap).toBe(MANAGED_SESSION_READ_RANGE_MAX_BYTES);
+			expect(triggerStat!.size).toBeGreaterThan(0n);
+			expect([...reads.values()].reduce((sum, count) => sum + count, 0)).toBe(phase.earlierReads + 1);
+			expect(triggerRelativePath).toBeTypeOf("string");
+			expect(reads.get(triggerRelativePath!)).toBe(phase.samePathRead);
+			expect(triggerOpenCount).toBe(1);
+			expect(targetCloseCounts.get(triggerPath!)).toBe(1);
+			if (triggerDescriptor === undefined) throw new Error(`fixture_${phase.name}_descriptor_not_opened`);
+			expect(triggerFstatIdentities).toEqual([
+				{
+					dev: triggerStat!.dev,
+					ino: triggerStat!.ino,
+					nlink: triggerStat!.nlink,
+					size: triggerStat!.size,
+					mtimeNs: triggerStat!.mtimeNs,
+					ctimeNs: triggerStat!.ctimeNs,
+					isFile: true,
+				},
+			]);
+			expect(() => originalFstat(triggerDescriptor!, { bigint: true })).toThrow();
+			expect(targetReadRequests.has(triggerPath!)).toBe(false);
+			expect(targetReadBytes.has(triggerPath!)).toBe(false);
+			expect(targetAllocationCounts.has(triggerPath!)).toBe(false);
+			expect(allocationWhileTargetOpen).toBe(0);
+			if (!triggerStat) throw new Error(`fixture_${phase.name}_trigger_stat_missing`);
+			const afterStat = fs.lstatSync(triggerPath!, { bigint: true });
+			expect({
+				dev: afterStat.dev,
+				ino: afterStat.ino,
+				nlink: afterStat.nlink,
+				size: afterStat.size,
+				mtimeNs: afterStat.mtimeNs,
+				ctimeNs: afterStat.ctimeNs,
+			}).toEqual({
+				dev: triggerStat.dev,
+				ino: triggerStat.ino,
+				nlink: triggerStat.nlink,
+				size: triggerStat.size,
+				mtimeNs: triggerStat.mtimeNs,
+				ctimeNs: triggerStat.ctimeNs,
+			});
+			expect([managedReceiptInventory(fixture.scope), managedReceiptInventory(sibling.scope)]).toEqual([
+				beforeReceipts,
+				beforeSiblingReceipts,
+			]);
+			expect(snapshotTree(fixture.sessionsRoot)).toEqual(beforeTree);
 		}
 	});
 
@@ -2343,7 +2863,7 @@ describe("managed GC retirement journal", () => {
 		expect(managedReceiptInventory(fixture.scope)).toHaveLength(1);
 	});
 
-	it("admits aggregate history bytes before candidate encoding and rejects over-budget read allocation", async () => {
+	it("rejects a candidate after actual 512 MiB history admission before candidate encoding", async () => {
 		const fixture = makeFixture();
 		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
 		await publishManagedGcSessionRetirementReceipt(fixture.scope, {
@@ -2353,7 +2873,19 @@ describe("managed GC retirement journal", () => {
 		});
 		for (let attempt = 1; attempt <= 6; attempt++)
 			await publishManagedGcSessionRetirementReceipt(fixture.scope, pendingReceipt(fixture, `seed-${attempt}`));
-		const candidateReason = "projected_history_capacity_candidate";
+		const paddedPaths = padManagedGcReceiptHistoryTo512MiB(fixture);
+		for (const pathname of paddedPaths) {
+			const stat = fs.statSync(pathname, { bigint: true });
+			expect(stat.size).toBe(BigInt(MANAGED_SESSION_READ_RANGE_MAX_BYTES));
+			expect(stat.nlink).toBe(1n);
+		}
+		expect(paddedPaths.reduce((total, pathname) => total + fs.statSync(pathname).size, 0)).toBe(
+			MANAGED_ARTIFACT_MAX_TOTAL_BYTES,
+		);
+		expect((await readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath))?.state).toBe(
+			"owner_pending",
+		);
+		const candidateReason = "actual_history_capacity_candidate";
 		const candidate = pendingReceipt(fixture, candidateReason);
 		const candidateOutcome = candidate.taskArtifactOwnerRetirementOutcome;
 		if (candidateOutcome?.kind !== "uncertain") throw new Error("fixture_candidate_outcome_missing");
@@ -2365,21 +2897,20 @@ describe("managed GC retirement journal", () => {
 		};
 		const before = managedReceiptInventory(fixture.scope);
 		const originalReadExpectedBounded = ManagedSessionDescendantStore.prototype.readExpectedBounded;
-		const simulatedAdmissions: number[] = [];
-		// Resource-pressure simulation only: the real bounded reader returns genuine file bytes and identities;
-		// only the admission callback receives a projected size before its allocation.
+		const actualAdmissions: Array<{ relativePath: string; size: number; descriptor: ManagedFileIdentity }> = [];
 		const boundedRead = spyOn(ManagedSessionDescendantStore.prototype, "readExpectedBounded").mockImplementation(
 			function (
 				this: ManagedSessionDescendantStore,
 				relativePath: string,
 				maxBytes: number,
-				admitSize?: (size: number) => void,
+				admitSize?: (size: number, descriptor: ManagedFileIdentity) => void,
 			) {
-				return originalReadExpectedBounded.call(this, relativePath, maxBytes, size => {
+				return originalReadExpectedBounded.call(this, relativePath, maxBytes, (size, descriptor) => {
 					if (relativePath.startsWith(".gjc-managed-session-internal/receipts/gc-retirement-")) {
-						simulatedAdmissions.push(64 * 1024 * 1024);
-						admitSize?.(64 * 1024 * 1024);
-					} else admitSize?.(size);
+						expect(descriptor.size).toBe(size);
+						actualAdmissions.push({ relativePath, size, descriptor });
+					}
+					admitSize?.(size, descriptor);
 				});
 			},
 		);
@@ -2390,28 +2921,12 @@ describe("managed GC retirement journal", () => {
 		let encodedCandidate = false;
 		let candidateBuffer = false;
 		let publishedCandidate = false;
+		let receiptAllocationCount = 0;
+		const candidateRelativePath = path
+			.relative(fixture.scope.directoryPath, managedGcReceiptPath(fixture, "owner_pending-00000007"))
+			.split(path.sep)
+			.join("/");
 		try {
-			expect(
-				(await readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath))?.state,
-			).toBe("owner_pending");
-			expect(
-				(await readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath))?.state,
-			).toBe("owner_pending");
-			expect((await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture))).state).toBe(
-				"owner_pending",
-			);
-			expect(
-				(
-					await publishManagedGcSessionRetirementReceipt(fixture.scope, {
-						...preparedReceipt(fixture),
-						state: "artifacts_removed",
-						artifactsRemoved: true,
-					})
-				).state,
-			).toBe("owner_pending");
-			expect(simulatedAdmissions).toHaveLength(32);
-			expect(managedReceiptInventory(fixture.scope)).toEqual(before);
-			simulatedAdmissions.length = 0;
 			await expect(publishManagedGcSessionRetirementReceipt(fixture.scope, invalidCandidate)).rejects.toThrow(
 				"managed_gc_journal_capacity_exceeded",
 			);
@@ -2424,9 +2939,12 @@ describe("managed GC retirement journal", () => {
 			candidateBuffer = from.mock.calls.some(
 				([value]) => typeof value === "string" && value.includes(candidateReason),
 			);
-			publishedCandidate = publishes.mock.calls.some(([relativePath]) =>
-				String(relativePath).startsWith(".gjc-managed-session-internal/receipts/gc-retirement-"),
+			publishedCandidate = publishes.mock.calls.some(
+				([relativePath]) => String(relativePath) === candidateRelativePath,
 			);
+			receiptAllocationCount = allocations.mock.calls.filter(
+				([size]) => size === MANAGED_SESSION_READ_RANGE_MAX_BYTES,
+			).length;
 		} finally {
 			boundedRead.mockRestore();
 			allocations.mockRestore();
@@ -2434,48 +2952,48 @@ describe("managed GC retirement journal", () => {
 			from.mockRestore();
 			publishes.mockRestore();
 		}
-		expect(simulatedAdmissions).toHaveLength(8);
+		expect(actualAdmissions).toHaveLength(8);
+		expect(actualAdmissions.every(entry => entry.size === MANAGED_SESSION_READ_RANGE_MAX_BYTES)).toBe(true);
+		expect(actualAdmissions.every(entry => entry.descriptor.nlink === 1n)).toBe(true);
+		expect(receiptAllocationCount).toBe(8);
 		expect(encodedCandidate).toBe(false);
 		expect(candidateBuffer).toBe(false);
 		expect(publishedCandidate).toBe(false);
 		expect(managedReceiptInventory(fixture.scope)).toEqual(before);
-		await expect(publishManagedGcSessionRetirementReceipt(fixture.scope, invalidCandidate)).rejects.toThrow(
-			"task_artifact_owner_retirement_outcome_invalid",
-		);
-		expect(managedReceiptInventory(fixture.scope)).toEqual(before);
-		await publishManagedGcSessionRetirementReceipt(fixture.scope, candidate);
 
-		const afterAppend = managedReceiptInventory(fixture.scope);
-		const overflowRead = spyOn(ManagedSessionDescendantStore.prototype, "readExpectedBounded").mockImplementation(
-			function (
-				this: ManagedSessionDescendantStore,
-				relativePath: string,
-				maxBytes: number,
-				admitSize?: (size: number) => void,
-			) {
-				return originalReadExpectedBounded.call(this, relativePath, maxBytes, size => {
-					admitSize?.(
-						relativePath.startsWith(".gjc-managed-session-internal/receipts/gc-retirement-")
-							? 64 * 1024 * 1024
-							: size,
-					);
-				});
-			},
+		const controlFixture = makeFixture("managed-gc-append-candidate-control");
+		await publishManagedGcSessionRetirementReceipt(controlFixture.scope, preparedReceipt(controlFixture));
+		await publishManagedGcSessionRetirementReceipt(controlFixture.scope, {
+			...preparedReceipt(controlFixture),
+			state: "artifacts_removed",
+			artifactsRemoved: true,
+		});
+		for (let attempt = 1; attempt <= 6; attempt++)
+			await publishManagedGcSessionRetirementReceipt(
+				controlFixture.scope,
+				pendingReceipt(controlFixture, `control-seed-${attempt}`),
+			);
+		const controlBefore = managedReceiptInventory(controlFixture.scope);
+		const controlCandidate = pendingReceipt(controlFixture, "valid-history-control");
+		const controlOutcome = controlCandidate.taskArtifactOwnerRetirementOutcome;
+		if (controlOutcome?.kind !== "uncertain") throw new Error("fixture_control_candidate_outcome_missing");
+		const invalidControlCandidate: ManagedGcSessionRetirementReceipt = {
+			...controlCandidate,
+			taskArtifactOwnerRetirementOutcome: Object.assign({}, controlOutcome, {
+				unexpectedBigint: 18_446_744_073_709_551_616n,
+			}) as typeof controlOutcome,
+		};
+		await expect(
+			publishManagedGcSessionRetirementReceipt(controlFixture.scope, invalidControlCandidate),
+		).rejects.toThrow("task_artifact_owner_retirement_outcome_invalid");
+		expect(managedReceiptInventory(controlFixture.scope)).toEqual(controlBefore);
+		const validControlReceipt = await publishManagedGcSessionRetirementReceipt(
+			controlFixture.scope,
+			controlCandidate,
 		);
-		const readAllocations = spyOn(Buffer, "alloc");
-		let readAllocatedOverLimit = false;
-		try {
-			await expect(
-				readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath),
-			).rejects.toThrow("managed_gc_journal_capacity_exceeded");
-			readAllocatedOverLimit = readAllocations.mock.calls.some(([size]) => size >= 64 * 1024 * 1024);
-		} finally {
-			overflowRead.mockRestore();
-			readAllocations.mockRestore();
-		}
-		expect(readAllocatedOverLimit).toBe(false);
-		expect(managedReceiptInventory(fixture.scope)).toEqual(afterAppend);
-	});
+		expect(validControlReceipt).toMatchObject({ state: "owner_pending", ownerRetirementAttempt: 7 });
+		expect(managedReceiptInventory(controlFixture.scope)).toHaveLength(controlBefore.length + 1);
+	}, 60_000);
 
 	it("uses bounded GC rereads when a receipt grows between discovery and inspector verification", async () => {
 		const fixture = makeFixture();

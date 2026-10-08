@@ -40,6 +40,10 @@ The REPL runs in the session cwd and retains variables, imports, and loaded data
 
 The kernel owner id is `python:<session-id>`, deliberately distinct from the `eval` owner so the two never alias and cleanup remains scoped to the owning session.
 
+An invocation captures its cwd, session file, session id, and settings before preflight and remains tracked through its transcript append. Clearing detaches the captured generation and joins its pending operations and kernel shutdown. Its session cleanup callback remains registered until cleanup succeeds, so session teardown also joins an older generation still clearing while a successor is active.
+
+Owner ids remain string labels, not private identity authority. A later cleanup using the same label can still select a successor kernel; this lifecycle improvement does not fix that legacy ABA boundary. Captured invocation metadata grants no transcript or audit filesystem append authority.
+
 The session's kernel is disposed on:
 
 - the `clear` action,
