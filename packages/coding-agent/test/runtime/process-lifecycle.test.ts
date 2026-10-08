@@ -280,15 +280,15 @@ describe("ownership regression: group liveness drives teardown (F1a)", () => {
 	);
 
 	test.skipIf(!isWindows)(
-		"terminates an observed live Windows root and child while unrelated control survives",
+		"signals an observed live Windows root and child but retains ownership without a Job Object",
 		async () => {
 			const report = await runWindowsProbe("live-direct");
-			expect(report.result).toEqual({ status: "terminated" });
+			expect(report.result).toEqual({ status: "identity_unverified" });
 			expect(report.rootStatus).toBe("exited");
 			expect(report.leafStatus).toBe("exited");
 			expect(report.controlStatus).toBe("running");
-			expect(report.retainedOwners).toBe(1);
-			expect(report.ownerDisposed).toBe(true);
+			expect(report.retainedOwners).toBe(2);
+			expect(report.ownerDisposed).toBe(false);
 		},
 		30_000,
 	);

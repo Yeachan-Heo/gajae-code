@@ -4,7 +4,9 @@
 use std::time::Instant;
 use std::{collections::HashSet, time::Duration};
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
+#[cfg(any(target_os = "windows", test))]
+use anyhow::anyhow;
 
 use crate::cancel::CancelToken;
 
@@ -1577,6 +1579,7 @@ mod platform {
 			let launcher_script = directory.join("launcher.ps1");
 			let leaf_marker = directory.join("leaf.pid");
 			let launcher_marker = directory.join("launcher.pid");
+			let visible_marker = directory.join("visible.pid");
 			let ready_marker = directory.join("ready");
 			let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "''"));
 			let launcher_source =
@@ -1590,10 +1593,14 @@ mod platform {
 				leaf_marker.display()
 			);
 			let root_source = format!(
-				"$launcher = Start-Process -FilePath powershell.exe -WindowStyle Hidden -ArgumentList \
-				 {} -PassThru; [IO.File]::WriteAllText({}, [string]$launcher.Id); \
+				"$visible = Start-Process -FilePath powershell.exe -WindowStyle Hidden -ArgumentList \
+				 '-NoProfile -NonInteractive -Command Start-Sleep -Seconds 30' -PassThru; \
+				 [IO.File]::WriteAllText({}, [string]$visible.Id); $visible.Dispose(); $launcher = \
+				 Start-Process -FilePath powershell.exe -WindowStyle Hidden -ArgumentList {} \
+				 -PassThru; [IO.File]::WriteAllText({}, [string]$launcher.Id); \
 				 $launcher.WaitForExit(); $launcher.Dispose(); [IO.File]::WriteAllText({}, 'ready'); \
 				 Start-Sleep -Seconds 30",
+				quote(&visible_marker),
 				format!("'{}'", launcher_arguments.replace('\'', "''")),
 				quote(&launcher_marker),
 				quote(&ready_marker),
@@ -1628,16 +1635,30 @@ mod platform {
 				.parse()
 				.expect("leaf PID must be numeric");
 			let leaf = FixtureProcess(Process::from_pid(leaf_pid).expect("pin live leaf"));
+			let visible_pid: i32 = fs::read_to_string(&visible_marker)
+				.expect("root must publish visible child PID")
+				.trim()
+				.parse()
+				.expect("visible child PID must be numeric");
+			let visible = FixtureProcess(Process::from_pid(visible_pid).expect("pin visible child"));
 			let launcher_pid: i32 = fs::read_to_string(&launcher_marker)
 				.expect("root must publish intermediate PID")
 				.trim()
 				.parse()
 				.expect("intermediate PID must be numeric");
 			assert_eq!(root_handle.0.status(), ProcessStatus::Running);
+			assert_eq!(visible.0.status(), ProcessStatus::Running);
 			assert_eq!(leaf.0.status(), ProcessStatus::Running);
+			let visible_children = root.children();
 			assert!(
-				root.children().is_empty(),
-				"the live root no longer has the exited intermediate in its observable ancestry"
+				visible_children
+					.iter()
+					.any(|process| process.pid() == visible_pid)
+			);
+			assert!(
+				!visible_children
+					.iter()
+					.any(|process| process.pid() == launcher_pid)
 			);
 			assert_ne!(root_pid, launcher_pid);
 
@@ -1649,13 +1670,14 @@ mod platform {
 				runtime.block_on(root.terminate_tree(false, -1, 2_000, CancelToken::new(None)));
 			let _error = result
 				.err()
-				.expect("an empty descendant walk cannot prove Windows tree teardown");
+				.expect("a non-empty descendant walk cannot prove complete Windows tree teardown");
 			assert_eq!(root.status(), ProcessStatus::Exited, "the pinned root is still signaled");
 			assert_eq!(leaf.0.status(), ProcessStatus::Running, "unverified leaf is not signaled");
+			assert_eq!(visible.0.status(), ProcessStatus::Exited, "pinned visible child is signaled");
 			assert_eq!(control.0.status(), ProcessStatus::Running, "unrelated control survives");
 
 			let _ = root_child.wait();
-			drop((root_handle, leaf, control));
+			drop((root_handle, leaf, visible, control));
 			let _ = control_child.wait();
 			let _ = fs::remove_dir_all(directory);
 		}
@@ -2161,9 +2183,17 @@ impl Process {
 	}
 
 	/// Strict variant of [`Self::kill_tree`] for callers that must distinguish
-	/// an observed empty tree from a process-table snapshot failure.
+	/// an observed empty tree from a process-table snapshot failure on Windows.
 	pub fn try_kill_tree(&self, signal: Option<i32>) -> Result<u32> {
-		self.signal_tree(signal.unwrap_or(KILL_SIGNAL))
+		let signal = signal.unwrap_or(KILL_SIGNAL);
+		#[cfg(target_os = "windows")]
+		{
+			self.signal_tree(signal)
+		}
+		#[cfg(not(target_os = "windows"))]
+		{
+			Ok(self.signal_tree(signal))
+		}
 	}
 
 	/// Process group id for this process, when supported by the platform.
@@ -2192,10 +2222,10 @@ impl Process {
 	/// and the root, then optionally waits up to `graceful_ms` for the tree to
 	/// exit before escalating to `KILL_SIGNAL`. Pass `graceful_ms < 0` to skip
 	/// the wait entirely (the polite signal is still emitted). Returns `true`
-	/// when the tree has exited by the end of the hard wave's wait window and
-	/// Windows descendant ancestry was established. Windows reports an error
-	/// rather than complete teardown when no descendant ancestry was observed,
-	/// because a transient intermediate may have exited before the first walk.
+	/// when the platform can prove the tree has exited. Windows currently drains
+	/// pinned processes but reports incomplete containment because, without an
+	/// atomic Job Object, a snapshot cannot prove a transient intermediate did
+	/// not hide a still-running child.
 	pub async fn terminate_tree(
 		&self,
 		group: bool,
@@ -2310,18 +2340,13 @@ impl Process {
 		Ok(())
 	}
 
+	#[cfg(target_os = "windows")]
 	fn signal_tree(&self, signal: i32) -> Result<u32> {
-		#[cfg(target_os = "windows")]
 		let descendants = self.observed_descendants_or_signal_known(
 			self.live_descendants_observed(),
 			&[],
 			signal,
 			true,
-			"could not observe the owned process tree before signalling",
-		)?;
-		#[cfg(not(target_os = "windows"))]
-		let descendants = require_observed_descendants(
-			self.live_descendants_observed(),
 			"could not observe the owned process tree before signalling",
 		)?;
 		// If self leads its own process group, also signal the group — this catches
@@ -2335,10 +2360,21 @@ impl Process {
 		Ok(self.signal_known_targets(&descendants, signal, true))
 	}
 
+	#[cfg(not(target_os = "windows"))]
+	fn signal_tree(&self, signal: i32) -> u32 {
+		let descendants = self.live_descendants();
+		if let Some(pgid) = self.inner.group_id()
+			&& pgid == self.inner.pid()
+		{
+			let _ = kill_process_group(pgid, signal);
+		}
+		self.signal_known_targets(&descendants, signal, true)
+	}
+
+	#[cfg(target_os = "windows")]
 	fn signal_tree_without_group(&self, signal: i32) -> Result<u32> {
 		let current_pid = i32::try_from(std::process::id()).unwrap_or(-1);
 		let include_root = self.pid() != current_pid;
-		#[cfg(target_os = "windows")]
 		let descendants = self.observed_descendants_or_signal_known(
 			self.live_descendants_observed(),
 			&[],
@@ -2346,16 +2382,23 @@ impl Process {
 			include_root,
 			"could not observe the owned process tree before signalling",
 		)?;
-		#[cfg(not(target_os = "windows"))]
-		let descendants = require_observed_descendants(
-			self.live_descendants_observed(),
-			"could not observe the owned process tree before signalling",
-		)?;
 		let eligible: Vec<_> = descendants
 			.into_iter()
 			.filter(|child| child.pid() != current_pid)
 			.collect();
 		Ok(self.signal_known_targets(&eligible, signal, include_root))
+	}
+
+	#[cfg(not(target_os = "windows"))]
+	fn signal_tree_without_group(&self, signal: i32) -> u32 {
+		let current_pid = i32::try_from(std::process::id()).unwrap_or(-1);
+		let include_root = self.pid() != current_pid;
+		let eligible: Vec<_> = self
+			.live_descendants()
+			.into_iter()
+			.filter(|child| child.pid() != current_pid)
+			.collect();
+		self.signal_known_targets(&eligible, signal, include_root)
 	}
 
 	async fn terminate_tree_impl(
@@ -2367,11 +2410,11 @@ impl Process {
 	) -> Result<bool> {
 		if self.status() != ProcessStatus::Running {
 			// A process can exit after spawning background descendants. On Windows
-			// drain what can still be verified, but an empty snapshot cannot prove
-			// that an already-exited intermediate left no hidden grandchildren.
+			// drain what can still be verified, but no snapshot can prove that an
+			// already-exited intermediate left no hidden grandchildren.
 			#[cfg(target_os = "windows")]
 			return self
-				.terminate_exited_root_tree(timeout_ms, ct, &mut Vec::new(), false)
+				.terminate_exited_root_tree(timeout_ms, ct, &mut Vec::new())
 				.await;
 			#[cfg(not(target_os = "windows"))]
 			return Ok(true);
@@ -2392,12 +2435,7 @@ impl Process {
 			"could not observe the owned process tree before graceful termination",
 		)?;
 		#[cfg(not(target_os = "windows"))]
-		let mut descendants = require_observed_descendants(
-			self.live_descendants_observed(),
-			"could not observe the owned process tree before graceful termination",
-		)?;
-		#[cfg(target_os = "windows")]
-		let mut observed_while_running = !descendants.is_empty();
+		let mut descendants = self.live_descendants();
 		self.signal_known_targets(&descendants, TERM_SIGNAL, true);
 
 		// Optional grace wait. A negative `graceful_ms` skips the wait entirely
@@ -2413,7 +2451,7 @@ impl Process {
 			if exited {
 				#[cfg(target_os = "windows")]
 				return self
-					.terminate_exited_root_tree(timeout_ms, ct, &mut descendants, observed_while_running)
+					.terminate_exited_root_tree(timeout_ms, ct, &mut descendants)
 					.await;
 				#[cfg(not(target_os = "windows"))]
 				return Ok(true);
@@ -2430,17 +2468,9 @@ impl Process {
 			self.signal_known_targets(&descendants, KILL_SIGNAL, true);
 			return Err(error);
 		}
-		#[cfg(target_os = "windows")]
-		{
-			observed_while_running |=
-				self.status() == ProcessStatus::Running && !descendants.is_empty();
-		}
 		#[cfg(not(target_os = "windows"))]
 		{
-			descendants = require_observed_descendants(
-				self.live_descendants_observed(),
-				"could not observe the owned process tree before hard termination",
-			)?;
+			descendants = self.live_descendants();
 		}
 		self.signal_known_targets(&descendants, KILL_SIGNAL, true);
 
@@ -2456,7 +2486,7 @@ impl Process {
 		}
 		#[cfg(target_os = "windows")]
 		return self
-			.terminate_exited_root_tree(timeout_ms, ct, &mut descendants, observed_while_running)
+			.terminate_exited_root_tree(timeout_ms, ct, &mut descendants)
 			.await;
 		#[cfg(not(target_os = "windows"))]
 		Ok(true)
@@ -2468,7 +2498,7 @@ impl Process {
 	/// snapshot is an error, never proof that the tree is empty. Without atomic
 	/// Job Object containment, a root already exited before our first
 	/// observation cannot establish complete ancestry. Even a live root's first
-	/// snapshot can miss a previously exited intermediate; an empty walk
+	/// snapshot can miss a previously exited intermediate; even a non-empty walk
 	/// therefore does not establish complete ownership. This path does not claim
 	/// containment of descendants that were never observed or pinned.
 	#[cfg(target_os = "windows")]
@@ -2477,7 +2507,6 @@ impl Process {
 		timeout_ms: u32,
 		ct: CancelToken,
 		descendants: &mut Vec<Self>,
-		observed_while_running: bool,
 	) -> Result<bool> {
 		let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
 		loop {
@@ -2490,13 +2519,10 @@ impl Process {
 				.iter()
 				.all(|process| process.status() != ProcessStatus::Running)
 			{
-				if !observed_while_running {
-					return Err(anyhow!(
-						"Windows root exited before descendant ownership was observed; ancestry is \
-						 unknown without atomic containment; refusing to report tree teardown complete"
-					));
-				}
-				return Ok(true);
+				return Err(anyhow!(
+					"Windows process-tree containment is unverified without an atomic Job Object; \
+					 pinned descendants were drained, but unobserved descendants may remain"
+				));
 			}
 			for child in descendants.iter() {
 				let _ = child.inner.kill(KILL_SIGNAL);
@@ -2511,6 +2537,7 @@ impl Process {
 	}
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn require_observed_descendants<T>(observed: Option<T>, context: &str) -> Result<T> {
 	observed.ok_or_else(|| anyhow!("{context}; refusing to treat an unknown tree as empty"))
 }
@@ -3158,11 +3185,7 @@ mod tests {
 			}
 		}
 		let error = result.expect_err("unobserved ancestry must never claim complete tree teardown");
-		assert!(
-			error
-				.to_string()
-				.contains("root exited before descendant ownership was observed")
-		);
+		assert!(error.to_string().contains("atomic Job Object"));
 		assert_eq!(descendant_status_after_teardown, ProcessStatus::Exited);
 		assert_eq!(descendant.status(), ProcessStatus::Exited);
 	}

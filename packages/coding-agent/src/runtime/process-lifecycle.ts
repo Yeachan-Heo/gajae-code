@@ -22,11 +22,11 @@
  *
  * Windows currently pins the root handle and verifies observable ancestry;
  * it does not atomically contain the tree. A root that exits before the first
- * observation retains an incomplete owner even when it appears clean. An
- * empty descendant walk while the root is live is also incomplete: a transient
- * intermediate may already have exited and hidden a live grandchild. The
- * native cleanup signals pinned targets but reports `identity_unverified` and
- * keeps the owner registered; full containment requires an owned Job Object.
+ * observation retains an incomplete owner even when it appears clean. A
+ * process-table walk, even a non-empty one, cannot prove that a transient
+ * intermediate did not exit and hide a still-running grandchild. Native
+ * cleanup signals pinned targets but reports `identity_unverified` and keeps
+ * the owner registered; complete containment requires an owned Job Object.
  *
  * This module intentionally owns only these primitives. It does not migrate
  * existing call sites; subsystem PRs adopt it incrementally.

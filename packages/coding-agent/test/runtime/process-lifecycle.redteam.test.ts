@@ -94,7 +94,7 @@ function processState(pid: number): string | undefined {
 
 describe("process-lifecycle adversarial owned-process invariants", () => {
 	test.skipIf(process.platform !== "win32")(
-		"signals a pinned Windows root but reports an empty live-tree walk as incomplete",
+		"signals a pinned Windows root but reports containment incomplete without a Job Object",
 		async () => {
 			const child = Bun.spawn(longRunnerCommand(), { stdout: "ignore", stderr: "ignore" });
 			const bindings = nativeProcessBindings();
@@ -113,7 +113,7 @@ describe("process-lifecycle adversarial owned-process invariants", () => {
 		},
 	);
 
-	test("dispose immediately after spawn wins the startup race and returns to baseline", async () => {
+	test.skipIf(!isPosix)("dispose immediately after spawn wins the startup race and returns to baseline", async () => {
 		const before = liveOwnedProcessCount();
 		const owner = spawnOwnedProcess(longRunnerCommand(), {
 			name: "redteam-immediate-dispose",
@@ -326,25 +326,32 @@ time.sleep(100)
 		},
 	);
 
-	test("awaitExit with timeoutMs 0 reports a live long-runner without killing it, then dispose cleans it", async () => {
-		const before = liveOwnedProcessCount();
-		const owner = spawnOwnedProcess(longRunnerCommand(), {
-			name: "redteam-zero-timeout",
-			gracefulMs: 10,
-		});
-		try {
-			const probe = await owner.awaitExit({ timeoutMs: 0 });
-			expect(probe.exited).toBe(false);
-			expect(owner.pid === undefined ? false : processAlive(owner.pid)).toBe(true);
-		} finally {
-			await owner.dispose();
-		}
-		const exit = await owner.awaitExit({ timeoutMs: 2_000 });
-		expect(exit.exited).toBe(true);
-		await waitFor(() => liveOwnedProcessCount() === before, 2_000, "live count baseline after zero-timeout dispose");
-	});
+	test.skipIf(!isPosix)(
+		"awaitExit with timeoutMs 0 reports a live long-runner without killing it, then dispose cleans it",
+		async () => {
+			const before = liveOwnedProcessCount();
+			const owner = spawnOwnedProcess(longRunnerCommand(), {
+				name: "redteam-zero-timeout",
+				gracefulMs: 10,
+			});
+			try {
+				const probe = await owner.awaitExit({ timeoutMs: 0 });
+				expect(probe.exited).toBe(false);
+				expect(owner.pid === undefined ? false : processAlive(owner.pid)).toBe(true);
+			} finally {
+				await owner.dispose();
+			}
+			const exit = await owner.awaitExit({ timeoutMs: 2_000 });
+			expect(exit.exited).toBe(true);
+			await waitFor(
+				() => liveOwnedProcessCount() === before,
+				2_000,
+				"live count baseline after zero-timeout dispose",
+			);
+		},
+	);
 
-	test("liveOwnedProcessCount returns to baseline after a batch of spawn and dispose", async () => {
+	test.skipIf(!isPosix)("liveOwnedProcessCount returns to baseline after a batch of spawn and dispose", async () => {
 		const before = liveOwnedProcessCount();
 		const owners = Array.from({ length: 8 }, (_, index) =>
 			spawnOwnedProcess(longRunnerCommand(), {
