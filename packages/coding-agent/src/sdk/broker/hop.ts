@@ -6,6 +6,8 @@ import type { Process } from "@gajae-code/natives";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import type { BrokerHopMessage } from "./ensure";
 
+export const BROKER_HOP_ACKNOWLEDGEMENT = "GJC_BROKER_HOP_ACK\n";
+
 /**
  * Windows broker hop: spawns the real broker with detached:true and reports its pid.
  *
@@ -18,8 +20,9 @@ import type { BrokerHopMessage } from "./ensure";
  * Invoked by gjc internals only. Usage:
  *   gjc internal broker-hop <json-encoded-args>
  *
- * Exits with code 0 after writing the broker pid and incarnation to stdout as JSON.
- * Exits with code 1 on spawn failure (error logged to stderr).
+ * Exits with code 0 after writing the broker pid/incarnation to stdout and
+ * receiving the parent's acknowledgement. If stdin closes first, it terminates
+ * the pinned broker and exits with code 1.
  */
 
 export async function runBrokerHopFromArgv(argv: string[]): Promise<void> {
@@ -55,7 +58,13 @@ export async function runBrokerHopFromArgv(argv: string[]): Promise<void> {
 			const cleanup = await terminateUnverifiableWindowsChild(child);
 			fail(`broker process identity could not be bound to the spawned child; ${cleanup}`);
 		}
-		const handoff = await writeBrokerHopReply(child, childReference, pid, writeBrokerHopStdout);
+		const handoff = await writeBrokerHopReply(
+			child,
+			childReference,
+			pid,
+			writeBrokerHopStdout,
+			waitForBrokerHopAcknowledgement,
+		);
 		if (handoff.kind === "failed") fail(handoff.reason);
 		process.exit(0);
 	} catch (error) {
@@ -65,14 +74,17 @@ export async function runBrokerHopFromArgv(argv: string[]): Promise<void> {
 
 type BrokerHopWriteCallback = (error?: Error | null) => void;
 type BrokerHopWriter = (chunk: string, callback: BrokerHopWriteCallback) => void;
+type BrokerHopAcknowledger = () => Promise<boolean>;
 
 async function writeBrokerHopReply(
 	child: childProcess.ChildProcess,
 	reference: Process,
 	pid: number,
 	write: BrokerHopWriter,
+	waitForAcknowledgement: BrokerHopAcknowledger,
 ): Promise<{ kind: "written" } | { kind: "failed"; reason: string }> {
 	const completion = Promise.withResolvers<void>();
+	const acknowledgementPromise = waitForAcknowledgement();
 	let settled = false;
 	const settle = (error?: Error | null): void => {
 		if (settled) return;
@@ -87,8 +99,6 @@ async function writeBrokerHopReply(
 	}
 	try {
 		await completion.promise;
-		child.unref();
-		return { kind: "written" };
 	} catch (error) {
 		const writeError = error instanceof Error ? error : new Error(String(error));
 		const cleanup = await terminateBrokerAfterFailedHandoff(reference);
@@ -97,6 +107,22 @@ async function writeBrokerHopReply(
 			reason: `broker hop handoff failed for pid ${pid}: ${cleanup}; ${writeError.message}`,
 		};
 	}
+	let acknowledged = false;
+	let acknowledgementError: string | undefined;
+	try {
+		acknowledged = await acknowledgementPromise;
+	} catch (error) {
+		acknowledgementError = error instanceof Error ? error.message : String(error);
+	}
+	if (!acknowledged) {
+		const cleanup = await terminateBrokerAfterFailedHandoff(reference);
+		return {
+			kind: "failed",
+			reason: `broker hop handoff was not acknowledged for pid ${pid}: ${cleanup}${acknowledgementError ? `; ${acknowledgementError}` : ""}`,
+		};
+	}
+	child.unref();
+	return { kind: "written" };
 }
 
 export function writeBrokerHopReplyForTest(
@@ -104,8 +130,39 @@ export function writeBrokerHopReplyForTest(
 	reference: Process,
 	pid: number,
 	write: BrokerHopWriter,
+	waitForAcknowledgement: BrokerHopAcknowledger = async () => true,
 ): Promise<{ kind: "written" } | { kind: "failed"; reason: string }> {
-	return writeBrokerHopReply(child, reference, pid, write);
+	return writeBrokerHopReply(child, reference, pid, write, waitForAcknowledgement);
+}
+
+function waitForBrokerHopAcknowledgement(): Promise<boolean> {
+	const acknowledgment = Promise.withResolvers<boolean>();
+	let received = "";
+	let settled = false;
+	const finish = (accepted: boolean): void => {
+		if (settled) return;
+		settled = true;
+		process.stdin.removeListener("data", onData);
+		process.stdin.removeListener("end", onEnd);
+		process.stdin.removeListener("close", onEnd);
+		process.stdin.removeListener("error", onEnd);
+		acknowledgment.resolve(accepted);
+	};
+	const onData = (chunk: Buffer | string): void => {
+		received += chunk.toString();
+		if (received.length > BROKER_HOP_ACKNOWLEDGEMENT.length) {
+			finish(false);
+			return;
+		}
+		if (received.includes("\n")) finish(received === BROKER_HOP_ACKNOWLEDGEMENT);
+	};
+	const onEnd = (): void => finish(false);
+	process.stdin.on("data", onData);
+	process.stdin.once("end", onEnd);
+	process.stdin.once("close", onEnd);
+	process.stdin.once("error", onEnd);
+	process.stdin.resume();
+	return acknowledgment.promise;
 }
 
 const writeBrokerHopStdout: BrokerHopWriter = (chunk, callback): void => {

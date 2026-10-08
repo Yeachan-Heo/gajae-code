@@ -16,6 +16,7 @@ import {
 	readBrokerDiscovery,
 	readBrokerRestartIntent,
 } from "./discovery";
+import { BROKER_HOP_ACKNOWLEDGEMENT } from "./hop";
 import {
 	isProcessIncarnation,
 	observeProcessIncarnation,
@@ -201,11 +202,11 @@ export async function awaitBrokerLauncherForTest(
  * Windows only: launch the broker through the internal hop and await its reply.
  *
  * `taskkill /T /F` walks ParentProcessId, so a broker spawned directly by the client
- * dies with it even when detached. The hop spawns the broker and exits at once,
- * leaving the broker without a live parent in the client's tree. The broker
- * environment reaches the hop as its own process environment (the broker inherits
- * it), never on the command line, and stderr is passed as a path because a parent
- * fd number does not exist inside the hop.
+ * dies with it even when detached. The hop spawns the broker and exits after
+ * the parent acknowledges the complete reply, leaving the broker without a
+ * live parent in the client's tree. The broker inherits the environment set on
+ * the hop, never passed on the command line; stderr is passed as a path because
+ * a parent fd number does not exist inside the hop.
  */
 export async function launchBrokerViaHop(
 	message: BrokerHopMessage,
@@ -217,19 +218,43 @@ export async function launchBrokerViaHop(
 	const hop = spawn(hopCmd.file, hopCmd.args, {
 		detached: false,
 		windowsHide: true,
-		stdio: ["ignore", "pipe", "pipe"],
+		stdio: ["pipe", "pipe", "pipe"],
 		env: options.env,
 		...(options.cwd ? { cwd: options.cwd } : {}),
 	});
 	let stdout = "";
 	let stderr = "";
+	let acknowledgementSent = false;
+	const endHopInput = (chunk?: string): void => {
+		if (!hop.stdin || hop.stdin.destroyed || hop.stdin.writableEnded) return;
+		try {
+			hop.stdin.end(chunk);
+		} catch {
+			// The hop will treat a closed acknowledgement pipe as a failed handoff.
+		}
+	};
 	hop.stdout?.on("data", chunk => {
 		stdout = appendBoundedOutput(stdout, chunk);
+		if (acknowledgementSent) return;
+		// A successful hop write callback does not prove this parent received the
+		// record. Keep the hop's pinned broker until this complete identity parses.
+		const newlineIndex = stdout.indexOf("\n");
+		if (newlineIndex < 0) return;
+		acknowledgementSent = true;
+		const replyText = stdout.slice(0, newlineIndex + 1);
+		const trailingOutput = stdout.slice(newlineIndex + 1);
+		const parsed = parseBrokerHopReply(0, replyText);
+		if (parsed.error === undefined && trailingOutput.length === 0) endHopInput(BROKER_HOP_ACKNOWLEDGEMENT);
+		else endHopInput();
 	});
 	hop.stderr?.on("data", chunk => {
 		stderr = appendBoundedOutput(stderr, chunk);
 	});
-	const wait = await awaitLauncherCloseBeforeDeadline(hop, timeoutMs, () => hop.stdout?.destroy());
+	hop.stdin?.on("error", () => {});
+	const wait = await awaitLauncherCloseBeforeDeadline(hop, timeoutMs, () => {
+		hop.stdout?.destroy();
+		endHopInput();
+	});
 	if (wait.kind === "timeout") {
 		return await brokerHopTimeoutResult(hop, stdout, stderr, timeoutMs, wait.terminated);
 	}

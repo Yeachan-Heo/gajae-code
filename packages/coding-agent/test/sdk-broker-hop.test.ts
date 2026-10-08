@@ -122,6 +122,37 @@ describe("SDK broker hop protocol", () => {
 	});
 
 	test.skipIf(process.platform === "darwin")(
+		"hop terminates the broker when the parent does not acknowledge",
+		async () => {
+			const child = childProcess.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+			const spawned = Promise.withResolvers<void>();
+			child.once("spawn", spawned.resolve);
+			await spawned.promise;
+			const pid = child.pid;
+			if (pid === undefined) throw new Error("Test broker did not expose its pid.");
+			const reference = nativeProcessBindings().Process.fromPid(pid);
+			if (!reference) throw new Error("Test broker process could not be pinned.");
+
+			try {
+				const result = await writeBrokerHopReplyForTest(
+					child,
+					reference,
+					pid,
+					(_chunk, callback) => callback(),
+					async () => false,
+				);
+				expect(result.kind).toBe("failed");
+				if (result.kind !== "failed") throw new Error("Expected an unacknowledged handoff to fail.");
+				expect(result.reason).toContain("not acknowledged");
+				expect(reference.status()).not.toBe("running");
+			} finally {
+				if (reference.status() === "running") reference.signalRoot(os.constants.signals.SIGKILL);
+				await reference.waitForExit({ timeoutMs: 1_000 });
+			}
+		},
+	);
+
+	test.skipIf(process.platform === "darwin")(
 		"a completed handoff captured at the deadline is reaped by exact incarnation",
 		async () => {
 			const child = childProcess.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
