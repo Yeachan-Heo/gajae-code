@@ -64,6 +64,7 @@ type ModelProfileActivationSession = Pick<
 			modelRoles: Readonly<Record<string, ModelSelectorValue>>;
 			agentModelOverrides: Readonly<Record<string, ModelSelectorValue>>;
 		},
+		manual?: { modelRoles: readonly string[]; agentModelOverrides: readonly string[] },
 	) => void;
 	/** Drop the recorded profile-installed override keys (e.g. after materialization). */
 	clearProfileInstalledOverrides?: () => void;
@@ -75,6 +76,8 @@ type ModelProfileActivationSession = Pick<
 		agentModelOverrides: ReadonlyMap<string, ModelSelectorValue | undefined>;
 		installedModelRoles: ReadonlyMap<string, ModelSelectorValue>;
 		installedAgentModelOverrides: ReadonlyMap<string, ModelSelectorValue>;
+		manualModelRoles: ReadonlySet<string>;
+		manualAgentModelOverrides: ReadonlySet<string>;
 		preProfileModel: Model<Api> | undefined;
 	};
 	restoreProfileInstalledOverrideState?: (state: ProfileInstalledOverrideState) => void;
@@ -83,6 +86,7 @@ type ModelProfileActivationSession = Pick<
 	getSessionDefaultModelSelector?: () => string | undefined;
 	recordResumeDefaultModel?: (selector: string | undefined) => void;
 	getUserCanonicalVariantSelection?: () => UserCanonicalVariantSelection;
+	getUserModelSelectionRevision?: () => number;
 	seedDefaultFallbackResolution?: (activeIndex: number, skips: Array<{ selector: string; reason: string }>) => void;
 	getDefaultFallbackRuntimeState?: () => DefaultFallbackRuntimeState;
 	restoreDefaultFallbackRuntimeState?: (state: DefaultFallbackRuntimeState) => void;
@@ -117,6 +121,8 @@ type ProfileInstalledOverrideState = {
 	agentModelOverrides: ReadonlyMap<string, ModelSelectorValue | undefined>;
 	installedModelRoles: ReadonlyMap<string, ModelSelectorValue>;
 	installedAgentModelOverrides: ReadonlyMap<string, ModelSelectorValue>;
+	manualModelRoles: ReadonlySet<string>;
+	manualAgentModelOverrides: ReadonlySet<string>;
 	preProfileModel: Model<Api> | undefined;
 };
 
@@ -231,6 +237,8 @@ export interface PreparedModelProfileActivation {
 	defaultResolutionSkips: Array<{ selector: string; reason: string }>;
 	modelRoles: Record<string, ModelSelectorValue>;
 	agentModelOverrides: Record<string, ModelSelectorValue>;
+	manualModelRoleOverrides: ReadonlySet<string>;
+	manualAgentModelOverrides: ReadonlySet<string>;
 	previousActiveModelProfile: string | undefined;
 	/**
 	 * The session resume default ("provider/id") captured BEFORE activation —
@@ -1682,9 +1690,14 @@ export async function prepareModelProfileActivation(
 		const installedState = options.session.getProfileInstalledOverrideState?.();
 		const baseModelRoles = { ...(options.settings.getOverride("modelRoles") ?? {}) };
 		const baseAgentModelOverrides = { ...(options.settings.getOverride("task.agentModelOverrides") ?? {}) };
-		const manualModelRoleOverrides = new Set<string>();
-		const manualAgentModelOverrides = new Set<string>();
+		const manualModelRoleOverrides = new Set(
+			options.preserveManualOverrides ? (installedState?.manualModelRoles ?? []) : [],
+		);
+		const manualAgentModelOverrides = new Set(
+			options.preserveManualOverrides ? (installedState?.manualAgentModelOverrides ?? []) : [],
+		);
 		for (const role of installedKeys?.modelRoles ?? []) {
+			if (options.preserveManualOverrides && manualModelRoleOverrides.has(role)) continue;
 			const installed = installedState?.installedModelRoles.get(role);
 			if (
 				options.preserveManualOverrides &&
@@ -1697,6 +1710,7 @@ export async function prepareModelProfileActivation(
 			delete baseModelRoles[role];
 		}
 		for (const role of installedKeys?.agentModelOverrides ?? []) {
+			if (options.preserveManualOverrides && manualAgentModelOverrides.has(role)) continue;
 			const installed = installedState?.installedAgentModelOverrides.get(role);
 			if (
 				options.preserveManualOverrides &&
@@ -1773,6 +1787,8 @@ export async function prepareModelProfileActivation(
 			defaultChain,
 			modelRoles: nextModelRoles,
 			agentModelOverrides: nextAgentModelOverrides,
+			manualModelRoleOverrides,
+			manualAgentModelOverrides,
 			previousActiveModelProfile: options.session.getActiveModelProfile?.(),
 			previousSessionDefaultModel: options.session.getSessionDefaultModelSelector?.(),
 			previousDefaultFallbackRuntimeState: options.session.getDefaultFallbackRuntimeState?.(),
@@ -1948,6 +1964,10 @@ export function publishPreparedModelProfileActivation(
 		prepared.previousModel,
 		{ modelRoles: prepared.baseModelRoles, agentModelOverrides: prepared.baseAgentModelOverrides },
 		{ modelRoles: prepared.modelRoles, agentModelOverrides: prepared.agentModelOverrides },
+		{
+			modelRoles: [...prepared.manualModelRoleOverrides],
+			agentModelOverrides: [...prepared.manualAgentModelOverrides],
+		},
 	);
 	prepared.publishedState = capturePublishedModelProfileActivationState(prepared);
 }
@@ -2082,6 +2102,10 @@ export async function applyPreparedModelProfileActivation(
 				prepared.previousModel,
 				{ modelRoles: prepared.baseModelRoles, agentModelOverrides: prepared.baseAgentModelOverrides },
 				{ modelRoles: prepared.modelRoles, agentModelOverrides: prepared.agentModelOverrides },
+				{
+					modelRoles: [...prepared.manualModelRoleOverrides],
+					agentModelOverrides: [...prepared.manualAgentModelOverrides],
+				},
 			);
 			activatedProfileInstalledOverrideState = prepared.session.getProfileInstalledOverrideState?.();
 		}
@@ -2106,6 +2130,8 @@ export async function applyPreparedModelProfileActivation(
 			prepared.previousDefaultFallbackRuntimeState !== undefined &&
 			(selectionIsCurrent() ||
 				sameSerializedValue(prepared.session.getDefaultFallbackRuntimeState?.(), activatedFallbackRuntimeState));
+		let modelRollbackSelectionRevision: number | undefined;
+		let modelRollbackSelectionWasCurrent = false;
 		const rollbackErrors: Array<{ stage: string; error: unknown }> = [];
 		const restore = (stage: string, action: () => void): void => {
 			try {
@@ -2191,6 +2217,8 @@ export async function applyPreparedModelProfileActivation(
 			);
 		}
 		if (modelMutationStarted && selectionIsCurrent()) {
+			modelRollbackSelectionWasCurrent = selectionIsCurrent();
+			modelRollbackSelectionRevision = prepared.session.getUserModelSelectionRevision?.();
 			try {
 				if (prepared.session.restoreModelSelectionForRollback) {
 					await prepared.session.restoreModelSelectionForRollback(
@@ -2236,7 +2264,11 @@ export async function applyPreparedModelProfileActivation(
 				),
 			);
 		}
-		if (shouldRestoreFallbackRuntimeState) {
+		const userSelectionChangedDuringModelRollback =
+			modelRollbackSelectionRevision !== undefined
+				? prepared.session.getUserModelSelectionRevision?.() !== modelRollbackSelectionRevision
+				: modelRollbackSelectionWasCurrent && !selectionIsCurrent();
+		if (shouldRestoreFallbackRuntimeState && !userSelectionChangedDuringModelRollback) {
 			restore("restore fallback runtime", () =>
 				prepared.session.restoreDefaultFallbackRuntimeState?.(prepared.previousDefaultFallbackRuntimeState!),
 			);
@@ -2807,6 +2839,7 @@ export async function applyModelProfileRuntimeBindings(
 	const previousModelRolesOverride = prepared.settings.getOverride("modelRoles");
 	const previousAgentModelOverridesOverride = prepared.settings.getOverride("task.agentModelOverrides");
 	const previousActiveModelProfile = prepared.session.getActiveModelProfile?.();
+	const previousProfileInstalledOverrideState = prepared.session.getProfileInstalledOverrideState?.();
 	let activatedModelRolesOverride: Readonly<Record<string, ModelSelectorValue>> | undefined;
 	let activatedAgentModelOverridesOverride: Readonly<Record<string, ModelSelectorValue>> | undefined;
 	try {
@@ -2849,6 +2882,9 @@ export async function applyModelProfileRuntimeBindings(
 			if (prepared.session.getActiveModelProfile?.() === prepared.profileName) {
 				prepared.session.setActiveModelProfile?.(previousActiveModelProfile);
 			}
+			if (previousProfileInstalledOverrideState) {
+				prepared.session.restoreProfileInstalledOverrideState?.(previousProfileInstalledOverrideState);
+			}
 			try {
 				await prepared.session.syncEagerDelegation?.();
 			} catch (error) {
@@ -2865,6 +2901,10 @@ export async function applyModelProfileRuntimeBindings(
 			prepared.previousModel,
 			{ modelRoles: prepared.baseModelRoles, agentModelOverrides: prepared.baseAgentModelOverrides },
 			{ modelRoles: prepared.modelRoles, agentModelOverrides: prepared.agentModelOverrides },
+			{
+				modelRoles: [...prepared.manualModelRoleOverrides],
+				agentModelOverrides: [...prepared.manualAgentModelOverrides],
+			},
 		);
 	} finally {
 		if (isCurrent && !isCurrent()) {

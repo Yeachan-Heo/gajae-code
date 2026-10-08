@@ -59,6 +59,8 @@ function fakeSession(initial = model("provider-a", "initial")) {
 	const profileInstalledAgentOverrides = new Map<string, ModelSelectorValue | undefined>();
 	const installedModelRoles = new Map<string, ModelSelectorValue>();
 	const installedAgentModelOverrides = new Map<string, ModelSelectorValue>();
+	const manualModelRoles = new Set<string>();
+	const manualAgentModelOverrides = new Set<string>();
 	return {
 		model: initial as Model | undefined,
 		thinkingLevel: ThinkingLevel.Low as ThinkingLevel | undefined,
@@ -97,6 +99,8 @@ function fakeSession(initial = model("provider-a", "initial")) {
 				agentModelOverrides: new Map(profileInstalledAgentOverrides),
 				installedModelRoles: new Map(installedModelRoles),
 				installedAgentModelOverrides: new Map(installedAgentModelOverrides),
+				manualModelRoles: new Set(manualModelRoles),
+				manualAgentModelOverrides: new Set(manualAgentModelOverrides),
 				preProfileModel,
 			};
 		},
@@ -105,6 +109,8 @@ function fakeSession(initial = model("provider-a", "initial")) {
 			agentModelOverrides: ReadonlyMap<string, ModelSelectorValue | undefined>;
 			installedModelRoles: ReadonlyMap<string, ModelSelectorValue>;
 			installedAgentModelOverrides: ReadonlyMap<string, ModelSelectorValue>;
+			manualModelRoles: ReadonlySet<string>;
+			manualAgentModelOverrides: ReadonlySet<string>;
 			preProfileModel: Model | undefined;
 		}) {
 			profileInstalledRoles.clear();
@@ -115,6 +121,10 @@ function fakeSession(initial = model("provider-a", "initial")) {
 			for (const [role, value] of state.installedModelRoles) installedModelRoles.set(role, value);
 			installedAgentModelOverrides.clear();
 			for (const [role, value] of state.installedAgentModelOverrides) installedAgentModelOverrides.set(role, value);
+			manualModelRoles.clear();
+			for (const role of state.manualModelRoles) manualModelRoles.add(role);
+			manualAgentModelOverrides.clear();
+			for (const role of state.manualAgentModelOverrides) manualAgentModelOverrides.add(role);
 			preProfileModel = state.preProfileModel;
 		},
 		noteProfileInstalledOverrides(
@@ -129,6 +139,7 @@ function fakeSession(initial = model("provider-a", "initial")) {
 				modelRoles: Readonly<Record<string, ModelSelectorValue>>;
 				agentModelOverrides: Readonly<Record<string, ModelSelectorValue>>;
 			},
+			manual?: { modelRoles: readonly string[]; agentModelOverrides: readonly string[] },
 		) {
 			preProfileModel ??= previousModel;
 			for (const role of [...profileInstalledRoles.keys()]) {
@@ -158,6 +169,10 @@ function fakeSession(initial = model("provider-a", "initial")) {
 				const value = installed?.agentModelOverrides[role];
 				if (value !== undefined) installedAgentModelOverrides.set(role, value);
 			}
+			manualModelRoles.clear();
+			for (const role of manual?.modelRoles ?? []) manualModelRoles.add(role);
+			manualAgentModelOverrides.clear();
+			for (const role of manual?.agentModelOverrides ?? []) manualAgentModelOverrides.add(role);
 		},
 		getDefaultFallbackRuntimeState() {
 			return this.defaultFallbackRuntimeState;

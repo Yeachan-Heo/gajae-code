@@ -2892,6 +2892,7 @@ export class SelectorController {
 								if (!materializedProfile) {
 									for (const targetRole of targetRoles) {
 										const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetRole];
+										this.ctx.session.markProfileRoleOverrideManual?.(target.settingsPath, targetRole);
 										if (target.settingsPath === "modelRoles") {
 											this.ctx.settings.setModelRole(targetRole, value);
 										} else {
@@ -2995,6 +2996,7 @@ export class SelectorController {
 							});
 							if (!materializedProfile) {
 								const target = GJC_MODEL_ASSIGNMENT_TARGETS[role];
+								this.ctx.session.markProfileRoleOverrideManual?.(target.settingsPath, role);
 								if (target.settingsPath === "modelRoles") {
 									this.ctx.settings.setModelRole(role, value);
 								} else {

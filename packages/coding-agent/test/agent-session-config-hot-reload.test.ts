@@ -73,6 +73,7 @@ describe("AgentSession configuration reload", () => {
 		apiKey?: string;
 		withProfile?: boolean;
 		profileRoleMapping?: boolean;
+		profilePlannerModelId?: string;
 		requiresProvider?: boolean;
 		apiKeyEnv?: string;
 		thinking?: TestModelThinking;
@@ -125,7 +126,9 @@ describe("AgentSession configuration reload", () => {
 						`    required_providers: ${options.requiresProvider ? `[${providerId}]` : "[]"}`,
 						"    model_mapping:",
 						`      default: ${providerId}/${modelIdValue}`,
-						...(options.profileRoleMapping ? [`      planner: ${providerId}/${modelIdValue}`] : []),
+						...(options.profileRoleMapping
+							? [`      planner: ${providerId}/${options.profilePlannerModelId ?? modelIdValue}`]
+							: []),
 					]
 				: []),
 			"",
@@ -139,6 +142,7 @@ describe("AgentSession configuration reload", () => {
 		api?: string;
 		withProfile?: boolean;
 		profileRoleMapping?: boolean;
+		profilePlannerModelId?: string;
 		requiresProvider?: boolean;
 		apiKeyEnv?: string;
 		thinking?: TestModelThinking;
@@ -162,6 +166,7 @@ describe("AgentSession configuration reload", () => {
 				baseUrl: "https://before.example/v1",
 				withProfile: options?.withProfile,
 				profileRoleMapping: options?.profileRoleMapping,
+				profilePlannerModelId: options?.profilePlannerModelId,
 				requiresProvider: options?.requiresProvider,
 				apiKeyEnv: options?.apiKeyEnv,
 				thinking: options?.thinking,
@@ -314,6 +319,40 @@ describe("AgentSession configuration reload", () => {
 		await session!.reloadConfiguration(staged, new AbortController().signal);
 		expect(session!.settings.get("modelRoles").planner).toBe(`${provider}/new-durable`);
 		expect(session!.settings.getOverride("modelRoles")?.planner).toBeUndefined();
+	});
+
+	it("preserves an explicit same-value role override during profile refresh", async () => {
+		const { configPath, modelsPath } = await createSession({
+			withProfile: true,
+			profileRoleMapping: true,
+			additionalModelId: "refreshed-planner",
+		});
+		await session!.activateModelProfileForControl("active-profile");
+		const explicitValue = `${provider}/${modelId}`;
+		expect(session!.settings.getOverride("task.agentModelOverrides")?.planner).toBe(explicitValue);
+
+		// Selecting the already-installed value is still an explicit ownership choice.
+		session!.settings.setAgentModelOverride("planner", explicitValue);
+		session!.markProfileRoleOverrideManual("task.agentModelOverrides", "planner");
+
+		const staged = candidate(
+			11,
+			configPath,
+			modelsPath,
+			await Bun.file(configPath).text(),
+			modelsText({
+				name: "Before",
+				baseUrl: "https://before.example/v1",
+				additionalModelId: "refreshed-planner",
+				withProfile: true,
+				profileRoleMapping: true,
+				profilePlannerModelId: "refreshed-planner",
+			}),
+		);
+		await session!.reloadConfiguration(staged, new AbortController().signal);
+
+		expect(session!.settings.getOverride("task.agentModelOverrides")?.planner).toBe(explicitValue);
+		expect(session!.getProfileInstalledOverrideState().manualAgentModelOverrides).toEqual(new Set(["planner"]));
 	});
 
 	it("cancels a queued reload without publishing or blocking the next admission", async () => {

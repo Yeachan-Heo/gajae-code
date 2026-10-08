@@ -2850,6 +2850,8 @@ export class AgentSession {
 	#activeProfileInstalledAgentOverrides = new Map<string, ModelSelectorValue | undefined>();
 	#activeProfileInstalledRoleValues = new Map<string, ModelSelectorValue>();
 	#activeProfileInstalledAgentOverrideValues = new Map<string, ModelSelectorValue>();
+	#activeProfileManualModelRoles = new Set<string>();
+	#activeProfileManualAgentModelOverrides = new Set<string>();
 	#preProfileModel: Model | undefined;
 	#sessionAdmissionQueue: SessionAdmissionEntry[] = [];
 	#activeSessionAdmission: SessionAdmissionEntry | undefined;
@@ -18035,7 +18037,7 @@ export class AgentSession {
 		if (this.#activeModelProfile && this.#activeModelProfile !== configuredDefaultProfileIdentity) {
 			this.settings.clearOverride("modelRoles");
 			this.settings.clearOverride("task.agentModelOverrides");
-			this.#activeModelProfile = undefined;
+			this.setActiveModelProfile(undefined);
 		}
 		const inheritedThinkingLevel = resolveThinkingLevelForModel(this.model, this.#getInheritedThinkingLevel());
 		this.#thinkingLevelMutationRevision++;
@@ -18331,6 +18333,7 @@ export class AgentSession {
 			role,
 			this.#formatRoleModelValue(role, model, options?.selector, options?.thinkingLevel),
 		);
+		if (cause === "user-selection") this.markProfileRoleOverrideManual("modelRoles", role);
 		// Only an explicit user selection starts a new fallback epoch. Internal
 		// fallback switches must preserve the exhausted-model set while advancing.
 		if (role === "default" && cause === "user-selection") {
@@ -18369,10 +18372,20 @@ export class AgentSession {
 	}
 
 	setActiveModelProfile(name: string | undefined): void {
+		if (name !== this.#activeModelProfile) {
+			this.#activeProfileManualModelRoles.clear();
+			this.#activeProfileManualAgentModelOverrides.clear();
+		}
 		this.#activeModelProfile = name;
 		if (name !== undefined) {
 			this.#unavailableModelProfile = undefined;
 		}
+	}
+
+	markProfileRoleOverrideManual(path: "modelRoles" | "task.agentModelOverrides", role: string): void {
+		if (this.#activeModelProfile === undefined) return;
+		if (path === "modelRoles") this.#activeProfileManualModelRoles.add(role);
+		else this.#activeProfileManualAgentModelOverrides.add(role);
 	}
 
 	getActiveModelProfile(): string | undefined {
@@ -19139,6 +19152,7 @@ export class AgentSession {
 			modelRoles: Readonly<Record<string, ModelSelectorValue>>;
 			agentModelOverrides: Readonly<Record<string, ModelSelectorValue>>;
 		},
+		manual?: { modelRoles: readonly string[]; agentModelOverrides: readonly string[] },
 	): void {
 		const bindings = this.#modelRegistry.getConfiguredModelBindings?.();
 		if (this.#preProfileModel === undefined) this.#preProfileModel = preProfileModel;
@@ -19187,6 +19201,8 @@ export class AgentSession {
 				installed?.agentModelOverrides[role] ?? this.settings.get("task.agentModelOverrides")[role];
 			if (installedValue !== undefined) this.#activeProfileInstalledAgentOverrideValues.set(role, installedValue);
 		}
+		this.#activeProfileManualModelRoles = new Set(manual?.modelRoles ?? []);
+		this.#activeProfileManualAgentModelOverrides = new Set(manual?.agentModelOverrides ?? []);
 	}
 
 	getProfileInstalledOverrideState(): {
@@ -19194,6 +19210,8 @@ export class AgentSession {
 		agentModelOverrides: ReadonlyMap<string, ModelSelectorValue | undefined>;
 		installedModelRoles: ReadonlyMap<string, ModelSelectorValue>;
 		installedAgentModelOverrides: ReadonlyMap<string, ModelSelectorValue>;
+		manualModelRoles: ReadonlySet<string>;
+		manualAgentModelOverrides: ReadonlySet<string>;
 		preProfileModel: Model | undefined;
 	} {
 		return {
@@ -19201,6 +19219,8 @@ export class AgentSession {
 			agentModelOverrides: new Map(this.#activeProfileInstalledAgentOverrides),
 			installedModelRoles: new Map(this.#activeProfileInstalledRoleValues),
 			installedAgentModelOverrides: new Map(this.#activeProfileInstalledAgentOverrideValues),
+			manualModelRoles: new Set(this.#activeProfileManualModelRoles),
+			manualAgentModelOverrides: new Set(this.#activeProfileManualAgentModelOverrides),
 			preProfileModel: this.#preProfileModel,
 		};
 	}
@@ -19210,12 +19230,16 @@ export class AgentSession {
 		agentModelOverrides: ReadonlyMap<string, ModelSelectorValue | undefined>;
 		installedModelRoles: ReadonlyMap<string, ModelSelectorValue>;
 		installedAgentModelOverrides: ReadonlyMap<string, ModelSelectorValue>;
+		manualModelRoles: ReadonlySet<string>;
+		manualAgentModelOverrides: ReadonlySet<string>;
 		preProfileModel: Model | undefined;
 	}): void {
 		this.#activeProfileInstalledRoles = new Map(state.modelRoles);
 		this.#activeProfileInstalledAgentOverrides = new Map(state.agentModelOverrides);
 		this.#activeProfileInstalledRoleValues = new Map(state.installedModelRoles);
 		this.#activeProfileInstalledAgentOverrideValues = new Map(state.installedAgentModelOverrides);
+		this.#activeProfileManualModelRoles = new Set(state.manualModelRoles);
+		this.#activeProfileManualAgentModelOverrides = new Set(state.manualAgentModelOverrides);
 		this.#preProfileModel = state.preProfileModel;
 	}
 
@@ -19225,6 +19249,8 @@ export class AgentSession {
 		this.#activeProfileInstalledAgentOverrides.clear();
 		this.#activeProfileInstalledRoleValues.clear();
 		this.#activeProfileInstalledAgentOverrideValues.clear();
+		this.#activeProfileManualModelRoles.clear();
+		this.#activeProfileManualAgentModelOverrides.clear();
 	}
 
 	/** Current profile-installed override keys, for deriving the activation base. */
@@ -27588,6 +27614,8 @@ export class AgentSession {
 			const previousActiveProfileInstalledAgentOverrideValues = new Map(
 				this.#activeProfileInstalledAgentOverrideValues,
 			);
+			const previousActiveProfileManualModelRoles = new Set(this.#activeProfileManualModelRoles);
+			const previousActiveProfileManualAgentModelOverrides = new Set(this.#activeProfileManualAgentModelOverrides);
 			const previousPreProfileModel = this.#preProfileModel;
 			const previousServiceTier = this.agent.serviceTier;
 			const previousSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
@@ -27719,7 +27747,7 @@ export class AgentSession {
 						? settingsDefaultEntries
 						: (configuredDefaultChain?.entries ??
 							(sessionContext.models.default ? [sessionContext.models.default] : []));
-				this.#activeModelProfile = targetActiveModelProfile;
+				this.setActiveModelProfile(targetActiveModelProfile);
 				this.#defaultFallbackController = undefined;
 				if (defaultEntries.length > 0) {
 					const resolution = await resolveModelChainWithAuth(
@@ -27815,7 +27843,7 @@ export class AgentSession {
 				// a cross-file transition must not advertise that profile after its
 				// runtime role layer was removed. Otherwise delegation prompt state and
 				// actual role routing diverge.
-				if (!targetProfileRuntimeInstalled) this.#activeModelProfile = undefined;
+				if (!targetProfileRuntimeInstalled) this.setActiveModelProfile(undefined);
 
 				const hasThinkingEntry = this.sessionManager
 					.getBranch()
@@ -28022,6 +28050,8 @@ export class AgentSession {
 				this.#activeProfileInstalledAgentOverrideValues = new Map(
 					previousActiveProfileInstalledAgentOverrideValues,
 				);
+				this.#activeProfileManualModelRoles = new Set(previousActiveProfileManualModelRoles);
+				this.#activeProfileManualAgentModelOverrides = new Set(previousActiveProfileManualAgentModelOverrides);
 				this.#preProfileModel = previousPreProfileModel;
 				this.#activeModelProfile = previousActiveModelProfile;
 				this.#restoreWorkflowGateEmitter(suspendedWorkflowGateEmitter);

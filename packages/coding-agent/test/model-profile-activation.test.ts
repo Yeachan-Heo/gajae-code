@@ -265,6 +265,81 @@ describe("model profile activation", () => {
 		expect(session.model).toBe(newerSelection);
 	});
 
+	test("does not restore fallback state after a newer selection during model rollback", async () => {
+		const restoreStarted = Promise.withResolvers<void>();
+		const allowRestore = Promise.withResolvers<void>();
+		let selectionRevision = 0;
+		let fallbackState = {
+			chain: {
+				role: "default",
+				entries: ["provider-c/default"],
+				origin: "model_selection",
+				explicitHead: true,
+			},
+			controller: {
+				activeIndex: 0,
+				attemptsUsed: 0,
+				totalAttemptsUsed: 0,
+				attemptStarted: false,
+				restoredEntryIndices: [],
+				tried: [],
+				skips: [],
+				exhaustedForTurn: false,
+			},
+			exhaustedLastTurn: false,
+		} satisfies DefaultFallbackRuntimeState;
+		const newerFallbackState = {
+			...fallbackState,
+			chain: { ...fallbackState.chain, entries: ["provider-b/executor"] },
+			controller: { ...fallbackState.controller, activeIndex: 1 },
+		};
+		const restoreFallback = vi.fn();
+		const session = Object.assign(fakeSession(), {
+			getUserModelSelectionRevision: () => selectionRevision,
+			getDefaultFallbackRuntimeState: () => fallbackState,
+			restoreDefaultFallbackRuntimeState: restoreFallback,
+			setModelTemporary: async (
+				_next: Model,
+				_thinkingLevel: ThinkingLevel | undefined,
+				options?: { shouldMutate?: () => boolean; onMutationStarted?: () => void },
+			) => {
+				if (options?.shouldMutate && !options.shouldMutate()) return;
+				options?.onMutationStarted?.();
+				throw new Error("profile model selection failed");
+			},
+			restoreModelSelectionForRollback: async (
+				_previousModel: Model | undefined,
+				_previousThinkingLevel: ThinkingLevel | undefined,
+			) => {
+				restoreStarted.resolve();
+				await allowRestore.promise;
+			},
+		});
+		const activation = await prepareModelProfileActivation({
+			session,
+			modelRegistry: fakeRegistry(),
+			settings: Settings.isolated(),
+			profileName: "profile-a",
+		});
+		let applying: Promise<void> | undefined;
+		try {
+			applying = applyPreparedModelProfileActivation(activation, {
+				isCurrent: () => selectionRevision === 0,
+			});
+			await restoreStarted.promise;
+			selectionRevision++;
+			fallbackState = newerFallbackState;
+			allowRestore.resolve();
+			await expect(applying).rejects.toThrow("profile model selection failed");
+
+			expect(restoreFallback).not.toHaveBeenCalled();
+			expect(fallbackState).toEqual(newerFallbackState);
+		} finally {
+			allowRestore.resolve();
+			if (applying) await Promise.allSettled([applying]);
+		}
+	});
+
 	test("keeps a same-model resume choice made during rollback model restoration", async () => {
 		const baseSession = fakeSession();
 		const restoreStarted = Promise.withResolvers<void>();
@@ -476,6 +551,7 @@ describe("model profile activation", () => {
 					architect: "provider-a/architect",
 				},
 			},
+			{ modelRoles: [], agentModelOverrides: [] },
 		);
 	});
 
