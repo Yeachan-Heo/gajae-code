@@ -1,3 +1,3 @@
 ### Fixed
 
-- Fence late Ralplan final publication against a newer active run before changing its state, and prevent in-flight role metadata or verdict updates from leaking into a replacement run.
+- Reject late Ralplan artifacts and state/HUD updates whenever the persisted run owner differs, even after the newer run becomes terminal; explicit new-run seeding is the only owner replacement.

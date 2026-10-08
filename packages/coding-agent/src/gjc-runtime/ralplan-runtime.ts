@@ -639,8 +639,8 @@ function buildLaneAdmissionRejectedResult(input: {
 		`${PLANNING_ADMISSION_REJECTED_MARKER}: ${input.decision.reason} ` +
 		`(run_id=${input.runId}, stage=${input.stage}, stage_n=${input.stageN}, source=${input.source}). ` +
 		`The ${input.decision.lane} lane is rejected for this generation only. Do not retry with an incremented stage_n; ` +
-		"continue with another eligible lane, or route a justified blocker through a Planner revision opener. " +
-		"This admission rejection does not poison the run; terminal opener exhaustion remains PLANNING-STUCK.";
+		"another eligible lane may still contribute to this generation, but pending admission clears only after an accepted " +
+		"revision opener creates a newer generation. Terminal opener exhaustion remains PLANNING-STUCK.";
 	if (input.json) {
 		return {
 			status: 3,
@@ -1005,6 +1005,14 @@ async function readActiveRunId(cwd: string, sessionId: string): Promise<string |
 	return candidate;
 }
 
+function assertRalplanSessionOwner(runId: string, currentRunId: string | undefined): void {
+	if (currentRunId === undefined || currentRunId === runId) return;
+	throw new RalplanCommandError(
+		2,
+		`ralplan run ${runId} is no longer the active session owner; current run ${currentRunId} retains session ownership. Resume it or explicitly start a new run before writing.`,
+	);
+}
+
 /**
  * Read the authoritative repository binding from ralplan run state and fail closed
  * when the active cwd no longer matches (handoff / QA / stage write) (#2901).
@@ -1103,12 +1111,8 @@ async function persistActiveRunId(cwd: string, sessionId: string, runId: string,
 				);
 			}
 			let existing: Record<string, unknown> = existingRead.kind === "valid" ? existingRead.value : {};
-			if (existing.run_id !== runId && existing.active === true) {
-				throw new RalplanCommandError(
-					2,
-					`ralplan run ${runId} is no longer the active session owner; current run ${String(existing.run_id)} remains active. Resume or retire that run before writing.`,
-				);
-			}
+			const currentRunId = typeof existing.run_id === "string" ? existing.run_id.trim() : "";
+			assertRalplanSessionOwner(runId, currentRunId || undefined);
 			if (
 				existing.run_id === runId &&
 				existing.active !== true &&
@@ -1626,11 +1630,11 @@ async function recordRalplanAdmissionRecoveries(
 	}
 }
 
-async function recordRalplanAdmissionRecoveryForOpener(
+async function recordRalplanAdmissionRecoveryForRevision(
 	cwd: string,
 	resolved: Pick<ResolvedArtifactArgs, "sessionId" | "runId" | "stage">,
 ): Promise<void> {
-	if (resolved.stage !== "planner" && resolved.stage !== "revision") return;
+	if (resolved.stage !== "revision") return;
 	const generation = await countRalplanOnDiskOpeners(cwd, resolved.sessionId, resolved.runId);
 	await recordRalplanAdmissionRecoveries(cwd, resolved.sessionId, resolved.runId, generation);
 }
@@ -2499,20 +2503,29 @@ async function syncRalplanHud(options: {
 	stage: string;
 	pendingApproval: boolean;
 	iteration?: number;
-	runId?: string;
+	runId: string;
 	reviewPassBudget?: number;
 	latestSummary?: string;
 }): Promise<void> {
 	try {
-		await syncSkillActiveState({
-			cwd: options.cwd,
-			skill: "ralplan",
-			active: !options.pendingApproval || options.stage === "final",
-			phase: options.stage,
-			sessionId: options.sessionId,
-			source: "gjc-ralplan-native",
-			hud: await buildRalplanHud(options),
-		});
+		const statePath = ralplanStatePath(options.cwd, options.sessionId);
+		await withWorkflowStateLock(
+			statePath,
+			async () => {
+				const state = await readExistingStateForMutation(statePath);
+				if (state.kind !== "valid" || state.value.run_id !== options.runId) return;
+				await syncSkillActiveState({
+					cwd: options.cwd,
+					skill: "ralplan",
+					active: !options.pendingApproval || options.stage === "final",
+					phase: options.stage,
+					sessionId: options.sessionId,
+					source: "gjc-ralplan-native",
+					hud: await buildRalplanHud(options),
+				});
+			},
+			{ cwd: options.cwd },
+		);
 	} catch {
 		// HUD sync is best-effort and must not change command semantics.
 	}
@@ -2663,6 +2676,7 @@ async function handleArtifactWrite(
 			{ cwd: persistCwd },
 		);
 	}
+	assertRalplanSessionOwner(resolved.runId, await readActiveRunId(persistCwd, resolved.sessionId));
 	const persistedRoleState = parsePersistedRoleStateArgs(args, resolved.stage);
 	const laneVerdict = parseLaneVerdictArgs(args, resolved.stage, resolved.stageN);
 	// Fail closed before stage persistence / path writes when cwd drifted to a sibling repo.
@@ -2766,7 +2780,7 @@ async function handleArtifactWrite(
 				}
 			}
 		}
-		await recordRalplanAdmissionRecoveryForOpener(persistCwd, resolved);
+		await recordRalplanAdmissionRecoveryForRevision(persistCwd, resolved);
 		return await buildDeduplicatedResult(resolved, existingArtifact, sha256, persistCwd, repositoryBinding);
 	}
 
@@ -2819,7 +2833,7 @@ async function handleArtifactWrite(
 		if (laneVerdict && (await applyLaneVerdictUpdate(persistCwd, resolved.sessionId, laneVerdict, resolved.runId))) {
 			appliedLaneVerdict = laneVerdict;
 		}
-		await recordRalplanAdmissionRecoveryForOpener(persistCwd, resolved);
+		await recordRalplanAdmissionRecoveryForRevision(persistCwd, resolved);
 		return await buildDeduplicatedResult(
 			resolved,
 			repairedArtifact,
@@ -2913,7 +2927,7 @@ async function handleArtifactWrite(
 	// Keep run-state `current_phase` coherent with the stage being persisted.
 	await persistActiveRunId(persistCwd, resolved.sessionId, resolved.runId, resolved.stage);
 	const persisted = await persistArtifact(resolved, persistCwd, content, sha256, autoHandoff);
-	await recordRalplanAdmissionRecoveryForOpener(persistCwd, resolved);
+	await recordRalplanAdmissionRecoveryForRevision(persistCwd, resolved);
 	let appliedPersistedRoleState: PersistedRoleStateUpdate | undefined;
 	if (
 		persistedRoleState &&
