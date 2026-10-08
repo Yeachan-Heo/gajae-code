@@ -254,10 +254,9 @@ describe("task fork-context provider identity", () => {
 		const seedB = await parent.buildForkContextSeed({ maxMessages: 50, maxTokens: 10_000 });
 		expect(seedA.metadata.includedMessages).toBeGreaterThan(0);
 
-		const artifactsDir = path.join(tempDir, "artifacts");
-		const artifacts = new ArtifactManager(
-			new ManagedSessionDescendantStore(managedDirectoryRoot(tempDir), artifactsDir),
-		);
+		const root = managedDirectoryRoot(tempDir);
+		const artifactsDir = path.join(root.canonicalPath, "artifacts");
+		const artifacts = new ArtifactManager(new ManagedSessionDescendantStore(root, artifactsDir));
 		const childAProviderSessionId = JSON.stringify(["subagent-canonical", parent.sessionId, "0-child-a"]);
 		const childBProviderSessionId = JSON.stringify(["subagent-canonical", parent.sessionId, "1-child-b"]);
 		const childAPersistence = createManagedTaskPersistence(artifacts, "0-child-a");
@@ -297,10 +296,9 @@ describe("task fork-context provider identity", () => {
 		authStorages.push(parentAuth);
 		parent.agent.appendMessage({ role: "user", content: "parent context", timestamp: Date.now() });
 		const seed = await parent.buildForkContextSeed({ maxMessages: 50, maxTokens: 10_000 });
-		const artifactsDir = path.join(tempDir, "artifacts");
-		const artifacts = new ArtifactManager(
-			new ManagedSessionDescendantStore(managedDirectoryRoot(tempDir), artifactsDir),
-		);
+		const root = managedDirectoryRoot(tempDir);
+		const artifactsDir = path.join(root.canonicalPath, "artifacts");
+		const artifacts = new ArtifactManager(new ManagedSessionDescendantStore(root, artifactsDir));
 		const persistence = createManagedTaskPersistence(artifacts, "0-resumable-child");
 		const childProviderSessionId = JSON.stringify(["subagent-canonical", parent.sessionId, "0-resumable-child"]);
 		const { session: child, authStorage: childAuth } = await createSession(tempDir, {
