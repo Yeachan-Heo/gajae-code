@@ -5,6 +5,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
+import { refuseFailedBrokerLaunchForTest } from "../src/sdk/broker/daemon-entry";
 import { type BrokerDiscovery, isPidAlive } from "../src/sdk/broker/discovery";
 import {
 	awaitBrokerLauncherForTest,
@@ -334,6 +335,36 @@ describe("SDK broker hop protocol", () => {
 		expect(signals).toEqual([]);
 		expect(signalPinnedBrokerProcessForTest(reference, "windows:11", "SIGTERM")).toBe(true);
 		expect(signals).toEqual([os.constants.signals.SIGTERM]);
+	});
+
+	test("failed successor handoff retries cleanup for its captured broker identity", async () => {
+		const child = childProcess.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+		const spawned = Promise.withResolvers<void>();
+		const closed = Promise.withResolvers<void>();
+		child.once("spawn", spawned.resolve);
+		child.once("close", closed.resolve);
+		await spawned.promise;
+		const pid = child.pid;
+		if (pid === undefined) throw new Error("Test broker did not expose its pid.");
+		const observation = observeProcessIncarnation(pid);
+		if (observation.status !== "present") throw new Error("Test broker process identity could not be observed.");
+
+		try {
+			const result = await refuseFailedBrokerLaunchForTest({
+				process: child,
+				realBrokerPid: pid,
+				realBrokerIncarnation: observation.incarnation,
+				error: new Error("trampoline timeout cleanup failed"),
+			});
+			expect(result).toMatchObject({ kind: "refused", reason: "spawn_failed" });
+			if (result.kind !== "refused") throw new Error("Expected a failed successor refusal.");
+			expect(result.detail).toContain("trampoline timeout cleanup failed");
+			await closed.promise;
+			expect(observeProcessIncarnation(pid).status).toBe("absent");
+		} finally {
+			if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+			await closed.promise;
+		}
 	});
 
 	test("detached reaping does not signal a PID that was already reused", async () => {

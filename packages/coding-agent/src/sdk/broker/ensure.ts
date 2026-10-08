@@ -926,6 +926,14 @@ async function reapDetachedBrokerPid(
 	throw new Error(`Detached SDK broker (pid ${pid}) did not exit after SIGKILL during reap.`);
 }
 
+/** Reap a failed hop/trampoline launch again when a higher-level successor path owns the refusal. */
+export async function reapFailedBrokerLaunch(
+	launch: Pick<BrokerLaunchResult, "realBrokerPid" | "realBrokerIncarnation">,
+): Promise<void> {
+	if (launch.realBrokerPid === undefined) return;
+	await reapDetachedBrokerPid(launch.realBrokerPid, launch.realBrokerIncarnation);
+}
+
 function registerBrokerOwner(
 	agentDir: string,
 	child: ChildProcess,

@@ -6,8 +6,10 @@ import {
 	readBrokerRestartIntent,
 } from "./discovery";
 import {
+	type BrokerLaunchResult,
 	launchBrokerViaHop,
 	launchBrokerViaPosixTrampoline,
+	reapFailedBrokerLaunch,
 	resolveBrokerLaunchMode,
 	withBrokerStartupLock,
 } from "./ensure";
@@ -37,6 +39,21 @@ export type AuthorizedBrokerSuccessorResult =
 	  };
 
 const SUCCESSOR_SPAWN_POLL_MS = 25;
+
+async function refuseFailedBrokerLaunch(
+	launched: BrokerLaunchResult,
+): Promise<Extract<AuthorizedBrokerSuccessorResult, { kind: "refused" }>> {
+	const child: childProcess.ChildProcess = launched.process;
+	child.unref();
+	let detail = launched.error?.message ?? "Broker launch failed.";
+	try {
+		await reapFailedBrokerLaunch(launched);
+	} catch (error) {
+		const cleanupDetail = error instanceof Error ? error.message : String(error);
+		detail = `${detail}; retry cleanup failed: ${cleanupDetail}`;
+	}
+	return { kind: "refused", reason: "spawn_failed", detail };
+}
 
 /**
  * Launches (or adopts) exactly one authorized successor for `requestId`.
@@ -98,8 +115,7 @@ export async function launchAuthorizedBrokerSuccessor(
 							...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
 							timeoutMs,
 						});
-			if (launched.error)
-				return { kind: "refused" as const, reason: "spawn_failed" as const, detail: launched.error.message };
+			if (launched.error) return await refuseFailedBrokerLaunch(launched);
 			if (launched.realBrokerPid === undefined || launched.realBrokerIncarnation === undefined)
 				return {
 					kind: "refused" as const,
@@ -163,6 +179,13 @@ export async function launchAuthorizedBrokerSuccessor(
 		if (Date.now() >= until) return { kind: "refused", reason: "publication_timeout" };
 		await Bun.sleep(SUCCESSOR_SPAWN_POLL_MS);
 	}
+}
+
+/** Test hook: retries exact cleanup before mapping a launch error to refusal. */
+export function refuseFailedBrokerLaunchForTest(
+	launched: BrokerLaunchResult,
+): Promise<Extract<AuthorizedBrokerSuccessorResult, { kind: "refused" }>> {
+	return refuseFailedBrokerLaunch(launched);
 }
 
 /**
