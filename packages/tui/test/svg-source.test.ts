@@ -103,4 +103,15 @@ describe("prepareSvg", () => {
 		expect(prepared).toContain("<!-- var(--accent) -->");
 		expect(prepared).toContain('fill="#ff8800" style="stroke:#ff8800" data-label="var(--accent)"');
 	});
+
+	it("preserves locally declared CSS variables while resolving theme tokens", () => {
+		const svg =
+			"<svg><style>:root{--shape:#f00}.a{fill:var(--shape);stroke:var(--accent)}</style>" +
+			'<rect class="a" style="--inline:#0f0;fill:var(--inline)"/></svg>';
+		const prepared = prepareSvg(svg, palette);
+
+		expect(prepared).toContain("--shape:#f00");
+		expect(prepared).toContain("fill:var(--shape);stroke:#ff8800");
+		expect(prepared).toContain('style="--inline:#0f0;fill:var(--inline)"');
+	});
 });

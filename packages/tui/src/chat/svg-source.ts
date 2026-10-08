@@ -211,10 +211,11 @@ const CSS_VALUE_ATTRIBUTES = new Set([
  * Make a figure's source what an SVG rasterizer draws as written, in the
  * reader's theme. Rasterizers resolve neither CSS custom properties nor an
  * inherited text color, and reject a root without the SVG namespace, so:
- * - CSS variable references in `<style>` contents, `style` declarations, and
- *   presentation attributes become `palette[name]` (an unknown name takes
- *   its fallback, else `palette.fg`); SVG text and unrelated attributes stay
- *   literal;
+ * - locally declared CSS custom properties remain intact for the SVG cascade;
+ *   other variable references in `<style>` contents, `style` declarations,
+ *   and presentation attributes become `palette[name]` (an unknown name
+ *   takes its fallback, else `palette.fg`); SVG text and unrelated attributes
+ *   stay literal;
  * - a root `<svg>` lacking them gets `color` = `palette.fg` (so
  *   `currentColor` follows the theme), a sans-serif `font-family` (instead
  *   of the rasterizer's Times), `xmlns`, and `xmlns:xlink` when the source
@@ -222,7 +223,8 @@ const CSS_VALUE_ATTRIBUTES = new Set([
  */
 export function prepareSvg(svg: string, palette: Readonly<Record<string, string>>): string {
 	const fg = palette.fg ?? "currentColor";
-	const resolved = resolveSvgCssVariables(svg, palette, fg);
+	const localVariables = collectSvgCssVariables(svg);
+	const resolved = resolveSvgCssVariables(svg, palette, fg, localVariables);
 	const usesXlink = resolved.includes("xlink:");
 	const root = findRootSvgTag(resolved);
 	if (!root) return resolved;
@@ -239,7 +241,12 @@ export function prepareSvg(svg: string, palette: Readonly<Record<string, string>
 }
 
 /** Resolve CSS variables only in stylesheet text and CSS-bearing XML attributes. */
-function resolveSvgCssVariables(source: string, palette: Readonly<Record<string, string>>, fg: string): string {
+function resolveSvgCssVariables(
+	source: string,
+	palette: Readonly<Record<string, string>>,
+	fg: string,
+	localVariables: ReadonlySet<string>,
+): string {
 	let output = "";
 	let cursor = 0;
 	while (cursor < source.length) {
@@ -250,17 +257,81 @@ function resolveSvgCssVariables(source: string, palette: Readonly<Record<string,
 		if (end < 0) return output + source.slice(start);
 		const tag = source.slice(start, end);
 		if (/^<(?:[\w.-]+:)?style(?=[\s/>])/i.test(tag)) {
-			output += resolveCssAttributes(tag, palette, fg);
+			output += resolveCssAttributes(tag, palette, fg, localVariables);
 			const closingTag = findStyleClosingTag(source, end);
-			if (closingTag < 0) return output + resolveCssValue(source.slice(end), palette, fg);
-			output += resolveCssValue(source.slice(end, closingTag), palette, fg);
+			if (closingTag < 0) return output + resolveCssValue(source.slice(end), palette, fg, localVariables);
+			output += resolveCssValue(source.slice(end, closingTag), palette, fg, localVariables);
 			cursor = closingTag;
 			continue;
 		}
-		output += resolveCssAttributes(tag, palette, fg);
+		output += resolveCssAttributes(tag, palette, fg, localVariables);
 		cursor = end;
 	}
 	return output;
+}
+
+/** Collect custom-property declarations from stylesheet text and inline styles. */
+function collectSvgCssVariables(source: string): Set<string> {
+	const variables = new Set<string>();
+	let cursor = 0;
+	while (cursor < source.length) {
+		const start = source.indexOf("<", cursor);
+		if (start < 0) break;
+		const end = constructEnd(source, start);
+		if (end < 0) break;
+		const tag = source.slice(start, end);
+		forEachSvgAttribute(tag, (name, value) => {
+			if (name === "style") collectCssVariableDeclarations(value, variables);
+		});
+		if (/^<(?:[\w.-]+:)?style(?=[\s/>])/i.test(tag)) {
+			const closingTag = findStyleClosingTag(source, end);
+			if (closingTag < 0) {
+				collectCssVariableDeclarations(source.slice(end), variables);
+				break;
+			}
+			collectCssVariableDeclarations(source.slice(end, closingTag), variables);
+			cursor = closingTag;
+			continue;
+		}
+		cursor = end;
+	}
+	return variables;
+}
+
+/** Collect custom-property declarations while ignoring CSS comments and strings. */
+function collectCssVariableDeclarations(css: string, variables: Set<string>): void {
+	let index = 0;
+	let lastSignificant: string | undefined;
+	while (index < css.length) {
+		if (css.startsWith("/*", index)) {
+			const end = css.indexOf("*/", index + 2);
+			index = end < 0 ? css.length : end + 2;
+			continue;
+		}
+		const char = css[index];
+		if (char === '"' || char === "'") {
+			const quote = char;
+			index++;
+			while (index < css.length) {
+				if (css[index] === "\\") index += 2;
+				else if (css[index++] === quote) break;
+			}
+			lastSignificant = quote;
+			continue;
+		}
+		if (
+			css.startsWith("--", index) &&
+			(lastSignificant === undefined || lastSignificant === "{" || lastSignificant === ";")
+		) {
+			let nameEnd = index + 2;
+			while (/[\w-]/.test(css[nameEnd] ?? "")) nameEnd++;
+			let colon = nameEnd;
+			while (/\s/.test(css[colon] ?? "")) colon++;
+			if (nameEnd > index + 2 && css[colon] === ":") variables.add(css.slice(index + 2, nameEnd));
+		}
+		if (!/\s/.test(char ?? "")) lastSignificant = char;
+		index++;
+	}
 }
 
 /** Find the closing style tag; `<` cannot appear literally in XML style text. */
@@ -276,15 +347,38 @@ function findStyleClosingTag(source: string, start: number): number {
 }
 
 /** Resolve CSS-bearing attribute values without rewriting other XML content. */
-function resolveCssAttributes(tag: string, palette: Readonly<Record<string, string>>, fg: string): string {
-	if (!/^<[A-Za-z_]/.test(tag)) return tag;
+function resolveCssAttributes(
+	tag: string,
+	palette: Readonly<Record<string, string>>,
+	fg: string,
+	localVariables: ReadonlySet<string>,
+): string {
+	const replacements: Array<{ start: number; end: number; value: string }> = [];
+	forEachSvgAttribute(tag, (name, value, start, end) => {
+		if (name !== "style" && !CSS_VALUE_ATTRIBUTES.has(name)) return;
+		const resolved = resolveCssValue(value, palette, fg, localVariables);
+		if (resolved !== value) replacements.push({ start, end, value: resolved });
+	});
+	if (replacements.length === 0) return tag;
+	let output = "";
+	let cursor = 0;
+	for (const replacement of replacements) {
+		output += tag.slice(cursor, replacement.start) + replacement.value;
+		cursor = replacement.end;
+	}
+	return output + tag.slice(cursor);
+}
+
+type SvgAttributeVisitor = (name: string, value: string, valueStart: number, valueEnd: number) => void;
+
+/** Visit quoted attributes in a complete XML start tag with source offsets. */
+function forEachSvgAttribute(tag: string, visit: SvgAttributeVisitor): void {
+	if (!/^<[A-Za-z_]/.test(tag)) return;
 	let index = 1;
 	while (index < tag.length && !/[\s/>]/.test(tag[index] ?? "")) index++;
-	let cursor = 0;
-	let output = "";
 	while (index < tag.length) {
 		while (/\s/.test(tag[index] ?? "")) index++;
-		if (tag[index] === "/" || tag[index] === ">") break;
+		if (tag[index] === "/" || tag[index] === ">") return;
 		const nameStart = index;
 		while (index < tag.length && !/[\s=/>]/.test(tag[index] ?? "")) index++;
 		const name = tag.slice(nameStart, index).toLowerCase();
@@ -297,24 +391,21 @@ function resolveCssAttributes(tag: string, palette: Readonly<Record<string, stri
 			const valueStart = ++index;
 			while (index < tag.length && tag[index] !== quote) index++;
 			const valueEnd = index;
-			const cssValue = name === "style" || CSS_VALUE_ATTRIBUTES.has(name);
-			if (cssValue) {
-				const resolved = resolveCssValue(tag.slice(valueStart, valueEnd), palette, fg);
-				if (resolved !== tag.slice(valueStart, valueEnd)) {
-					output += tag.slice(cursor, valueStart) + resolved;
-					cursor = valueEnd;
-				}
-			}
+			visit(name, tag.slice(valueStart, valueEnd), valueStart, valueEnd);
 			index++;
 		} else {
 			while (index < tag.length && !/[\s>]/.test(tag[index] ?? "")) index++;
 		}
 	}
-	return output ? output + tag.slice(cursor) : tag;
 }
 
 /** Resolve variable functions outside CSS comments and quoted string literals. */
-function resolveCssValue(source: string, palette: Readonly<Record<string, string>>, fg: string): string {
+function resolveCssValue(
+	source: string,
+	palette: Readonly<Record<string, string>>,
+	fg: string,
+	localVariables: ReadonlySet<string>,
+): string {
 	let output = "";
 	let cursor = 0;
 	let index = 0;
@@ -338,12 +429,15 @@ function resolveCssValue(source: string, palette: Readonly<Record<string, string
 			VAR_REFERENCE.lastIndex = index;
 			const match = VAR_REFERENCE.exec(source);
 			if (match?.index === index) {
-				output += source.slice(cursor, index);
 				const name = match[1]!;
 				const fallback = match[2];
-				output += palette[name] ?? (fallback?.trim() || fg);
-				index = VAR_REFERENCE.lastIndex;
-				cursor = index;
+				const end = VAR_REFERENCE.lastIndex;
+				if (!localVariables.has(name)) {
+					output += source.slice(cursor, index);
+					output += palette[name] ?? (fallback?.trim() || fg);
+					cursor = end;
+				}
+				index = end;
 				continue;
 			}
 		}
