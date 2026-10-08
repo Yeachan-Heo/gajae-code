@@ -1683,7 +1683,7 @@ mod platform {
 		}
 
 		#[test]
-		fn incomplete_descendant_discovery_still_signals_pinned_root() {
+		fn incomplete_initial_descendant_discovery_still_signals_pinned_root() {
 			use std::process::{Command, Stdio};
 
 			let mut child = Command::new("powershell.exe")
@@ -1711,14 +1711,84 @@ mod platform {
 					.contains("incomplete descendant discovery")
 			);
 			for _ in 0..200 {
-				if root.status() == crate::process::ProcessStatus::Exited {
+				if root.status() == ProcessStatus::Exited {
+					break;
+				}
+				std::thread::sleep(std::time::Duration::from_millis(10));
+			}
+			assert_eq!(root.status(), ProcessStatus::Exited);
+			let _ = child.wait();
+			drop(fixture);
+		}
+
+		#[test]
+		fn incomplete_descendant_rediscovery_signals_already_pinned_targets() {
+			use std::{
+				io::{BufRead, BufReader},
+				process::{Command, Stdio},
+			};
+
+			let script = "$child = Start-Process -FilePath powershell.exe -WindowStyle Hidden \
+			              -ArgumentList '-NoProfile -NonInteractive -Command Start-Sleep -Seconds \
+			              30' -PassThru; [Console]::Out.WriteLine($child.Id); \
+			              [Console]::Out.Flush(); $child.Dispose(); Start-Sleep -Seconds 30";
+			let mut child = Command::new("powershell.exe")
+				.args(["-NoProfile", "-NonInteractive", "-Command", script])
+				.stdout(Stdio::piped())
+				.stderr(Stdio::null())
+				.spawn()
+				.expect("spawn owned root fixture");
+			let pid = i32::try_from(child.id()).expect("fixture PID fits i32");
+			let fixture = FixtureProcess(Process::from_pid(pid).expect("pin fixture root"));
+			let root = crate::process::Process::from_pid(pid).expect("pin owned root");
+			let mut output = BufReader::new(child.stdout.take().expect("root stdout is piped"));
+			let mut child_pid = String::new();
+			output
+				.read_line(&mut child_pid)
+				.expect("read descendant PID");
+			let child_pid: i32 = child_pid
+				.trim()
+				.parse()
+				.expect("descendant PID must be numeric");
+			let descendant =
+				FixtureProcess(Process::from_pid(child_pid).expect("pin direct descendant"));
+			let mut known_descendants = None;
+			for _ in 0..200 {
+				if let Some(observed) = root.live_descendants_observed()
+					&& observed.iter().any(|process| process.pid() == child_pid)
+				{
+					known_descendants = Some(observed);
+					break;
+				}
+				std::thread::sleep(std::time::Duration::from_millis(10));
+			}
+			let mut known_descendants = known_descendants
+				.expect("initial walk pins the direct descendant before injected rewalk failure");
+			let pinned = known_descendants
+				.iter_mut()
+				.find(|process| process.pid() == child_pid)
+				.expect("initial walk pinned the direct descendant");
+			pinned.inner.creation_time = pinned.inner.creation_time.saturating_add(1);
+			let error = root
+				.extend_windows_descendants_or_signal_known(&mut known_descendants, KILL_SIGNAL, true)
+				.expect_err("failed re-discovery must remain observable after signaling known targets");
+			assert!(
+				error
+					.to_string()
+					.contains("could not verify the pinned Windows descendant tree")
+			);
+			for _ in 0..200 {
+				if root.status() == crate::process::ProcessStatus::Exited
+					&& descendant.0.status() == ProcessStatus::Exited
+				{
 					break;
 				}
 				std::thread::sleep(std::time::Duration::from_millis(10));
 			}
 			assert_eq!(root.status(), crate::process::ProcessStatus::Exited);
+			assert_eq!(descendant.0.status(), ProcessStatus::Exited);
 			let _ = child.wait();
-			drop(fixture);
+			drop((fixture, descendant));
 		}
 	}
 
@@ -2341,6 +2411,22 @@ impl Process {
 	}
 
 	#[cfg(target_os = "windows")]
+	fn extend_windows_descendants_or_signal_known(
+		&self,
+		retained: &mut Vec<Self>,
+		signal: i32,
+		include_root: bool,
+	) -> Result<()> {
+		match self.extend_windows_descendants(retained) {
+			Ok(()) => Ok(()),
+			Err(error) => {
+				self.signal_known_targets(retained, signal, include_root);
+				Err(error)
+			},
+		}
+	}
+
+	#[cfg(target_os = "windows")]
 	fn signal_tree(&self, signal: i32) -> Result<u32> {
 		let descendants = self.observed_descendants_or_signal_known(
 			self.live_descendants_observed(),
@@ -2464,10 +2550,7 @@ impl Process {
 			let _ = kill_process_group(pgid, KILL_SIGNAL);
 		}
 		#[cfg(target_os = "windows")]
-		if let Err(error) = self.extend_windows_descendants(&mut descendants) {
-			self.signal_known_targets(&descendants, KILL_SIGNAL, true);
-			return Err(error);
-		}
+		self.extend_windows_descendants_or_signal_known(&mut descendants, KILL_SIGNAL, true)?;
 		#[cfg(not(target_os = "windows"))]
 		{
 			descendants = self.live_descendants();
@@ -2511,10 +2594,7 @@ impl Process {
 		let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
 		loop {
 			ct.heartbeat()?;
-			if let Err(error) = self.extend_windows_descendants(descendants) {
-				self.signal_known_targets(descendants, KILL_SIGNAL, false);
-				return Err(error);
-			}
+			self.extend_windows_descendants_or_signal_known(descendants, KILL_SIGNAL, false)?;
 			if descendants
 				.iter()
 				.all(|process| process.status() != ProcessStatus::Running)

@@ -176,7 +176,7 @@ export interface OwnedProcess {
 	readonly pid: number | undefined;
 	/** Resolves/rejects when the root child exits (mirrors ptree's `exited`). */
 	readonly exited: Promise<number>;
-	/** `true` once `dispose()` has started. */
+	/** `true` while explicit disposal is in flight or after it confirms teardown; unresolved owners remain retryable. */
 	readonly disposed: boolean;
 	/**
 	 * Wait for the root child to exit, optionally bounded by `timeoutMs`. With no
