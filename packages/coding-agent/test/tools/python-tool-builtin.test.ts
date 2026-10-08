@@ -316,9 +316,12 @@ describe("builtin session Python tool", () => {
 		let clearFromTrackerSettled = false;
 		let foreignExecutionSettled = false;
 		let foreignClearSettled = false;
+		let originalExecutionSettled = false;
+		let trackingWrapperSettled = false;
 		let cleanupFromTracker: Promise<void> | undefined;
 		let clearFromTracker: Promise<AgentToolResult> | undefined;
 		let foreignClear: Promise<AgentToolResult> | undefined;
+		const releaseTrackingWrapper = Promise.withResolvers<void>();
 
 		const assertExecutionAllowed = (): void => {
 			if (!sessionFixture) throw new Error("Python execution was admitted before SDK session construction");
@@ -326,7 +329,8 @@ describe("builtin session Python tool", () => {
 		};
 		const trackExecution: NonNullable<ToolSession["trackEvalExecution"]> = (execution, abortController) => {
 			if (!sessionFixture) throw new Error("Python execution was tracked before SDK session construction");
-			if (reenterCleanupFromTracker) {
+			const holdTrackingWrapper = reenterCleanupFromTracker;
+			if (holdTrackingWrapper) {
 				reenterCleanupFromTracker = false;
 				const cleanup = registeredCleanup;
 				if (!cleanup) throw new Error("Expected the Python generation cleanup to be registered before tracking");
@@ -340,7 +344,13 @@ describe("builtin session Python tool", () => {
 					cleanupFromTrackerSettled = true;
 				});
 			}
-			return sessionFixture.session.trackEvalExecution(execution, abortController);
+			const trackedExecution = sessionFixture.session.trackEvalExecution(execution, abortController);
+			if (!holdTrackingWrapper) return trackedExecution;
+			return trackedExecution.then(async result => {
+				await releaseTrackingWrapper.promise;
+				trackingWrapperSettled = true;
+				return result;
+			});
 		};
 		const registerCleanup = (cleanup: () => Promise<void> | void): (() => void) => {
 			if (!sessionFixture) throw new Error("Python cleanup was registered before SDK session construction");
@@ -393,9 +403,14 @@ describe("builtin session Python tool", () => {
 			await appendStarted[foreignSessionId].promise;
 
 			reenterCleanupFromTracker = true;
-			const originalExecution = tool.execute("python-reentrant-execution", {
-				code: "print('invocation retired by its tracker')",
-			});
+			const originalExecution = tool
+				.execute("python-reentrant-execution", {
+					code: "print('invocation retired by its tracker')",
+				})
+				.then(result => {
+					originalExecutionSettled = true;
+					return result;
+				});
 			await appendStarted[TEST_SESSION_ID].promise;
 			expect(cleanupFromTrackerSettled).toBe(false);
 			expect(clearFromTrackerSettled).toBe(false);
@@ -409,13 +424,17 @@ describe("builtin session Python tool", () => {
 			);
 
 			releaseAppend[TEST_SESSION_ID].resolve();
-			const originalResult = await originalExecution;
 			await cleanupFromTracker;
 			const clearResult = await clearFromTracker;
+			expect(originalExecutionSettled).toBe(false);
+			expect(trackingWrapperSettled).toBe(false);
+			releaseTrackingWrapper.resolve();
+			const originalResult = await originalExecution;
 			expect(originalResult.content.length).toBeGreaterThan(0);
 			expect(clearResult?.isError).toBeUndefined();
 			expect(cleanupFromTrackerSettled).toBe(true);
 			expect(clearFromTrackerSettled).toBe(true);
+			expect(trackingWrapperSettled).toBe(true);
 			expect(foreignExecutionSettled).toBe(false);
 
 			foreignClear = foreignTool.execute("python-foreign-clear", { action: "clear" }).then(result => {
@@ -437,10 +456,38 @@ describe("builtin session Python tool", () => {
 			expect(textOf(successor)).toContain("healthy successor");
 		} finally {
 			// Only release test gates here so an execution/assertion error is not replaced by cleanup.
+			releaseTrackingWrapper.resolve();
 			releaseAppend[TEST_SESSION_ID].resolve();
 			releaseAppend[foreignSessionId].resolve();
 		}
 	}, 30_000);
+
+	it("retires an invocation when the tracking callback re-enters cleanup and throws", async () => {
+		const cwd = tempDir();
+		let registeredCleanup: (() => Promise<void> | void) | undefined;
+		let cleanupFromTracker: Promise<void> | undefined;
+		const executeSpy = vi.spyOn(pyExecutor, "executePython");
+		const disposeSpy = vi.spyOn(pyExecutor, "disposeKernelSessionsByOwner").mockResolvedValue(undefined);
+		const tool = await loadPythonTool({
+			cwd,
+			registerSessionCleanup: cleanup => {
+				registeredCleanup = cleanup;
+			},
+			trackEvalExecution: () => {
+				if (!registeredCleanup) throw new Error("Expected the Python generation cleanup to be registered");
+				cleanupFromTracker = Promise.resolve(registeredCleanup());
+				throw new Error("tracking callback failed");
+			},
+		});
+
+		await expect(executeTool(tool, { code: "print('must not execute')" })).rejects.toThrow(
+			"tracking callback failed",
+		);
+		if (!cleanupFromTracker) throw new Error("Expected tracker cleanup to start");
+		await cleanupFromTracker;
+		expect(executeSpy).not.toHaveBeenCalled();
+		expect(disposeSpy).toHaveBeenCalledWith(pythonKernelOwnerId(TEST_SESSION_ID));
+	});
 
 	it("captures live cwd and session metadata before preflight and tracks through transcript append", async () => {
 		const cwdA = tempDir();
