@@ -3290,11 +3290,11 @@ mod tests {
 		let self_pid = i32::try_from(std::process::id()).expect("self pid fits in i32");
 		let harness = Process::from_pid(self_pid).expect("harness Process ref");
 
-		// Allow a few polling iterations so the kernel's process-table query
-		// settles on a loaded host. proc_listallpids reflects newly forked pids
-		// within milliseconds in practice; 1s is a comfortable upper bound.
+		// Allow the kernel's process-table query to settle under parallel test
+		// load. Normally the child appears immediately; the bounded window keeps
+		// this regression deterministic without waiting for the child to exit.
 		let mut found = false;
-		for _ in 0..40 {
+		for _ in 0..200 {
 			if harness
 				.live_descendants()
 				.iter()
@@ -3395,10 +3395,19 @@ mod tests {
 		let mut child = spawn_long_lived_process();
 		let pid = i32::try_from(child.id()).expect("child pid fits in i32");
 
-		// Confirm the fixture is genuinely alive before killing it, so the
-		// absence assertion below proves a real live-to-dead transition.
+		// Wait briefly for the spawned process to become observable before killing
+		// it, so the absence assertion below proves a real live-to-dead transition
+		// without racing process-table publication under parallel test load.
+		let mut observation = Process::observe(pid);
+		for _ in 0..100 {
+			if matches!(&observation, ProcessObservation::Present { .. }) {
+				break;
+			}
+			thread::sleep(StdDuration::from_millis(20));
+			observation = Process::observe(pid);
+		}
 		assert!(
-			matches!(Process::observe(pid), ProcessObservation::Present { .. }),
+			matches!(&observation, ProcessObservation::Present { .. }),
 			"owned child must observe as present before it is killed",
 		);
 
