@@ -16,10 +16,11 @@ export type FigureSegment =
 
 /** A top-level (≤3-space indent) fenced-code opener. */
 const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+const SVG_TEXT = /svg/i;
 
 /** Whether `markdown` holds a ```svg fence {@link splitSvgFences} would lift. */
 export function hasSvgFence(markdown: string): boolean {
-	if (!markdown.includes("svg")) return false;
+	if (!SVG_TEXT.test(markdown)) return false;
 	let fence: string | undefined;
 	let lineStart = 0;
 	while (lineStart <= markdown.length) {
@@ -256,7 +257,7 @@ function resolveSvgCssVariables(
 		const end = constructEnd(source, start);
 		if (end < 0) return output + source.slice(start);
 		const tag = source.slice(start, end);
-		if (/^<(?:[\w.-]+:)?style(?=[\s/>])/i.test(tag)) {
+		if (/^<(?:[\w.-]+:)?style(?=[\s/>])/i.test(tag) && !isSelfClosingSvgTag(tag)) {
 			output += resolveCssAttributes(tag, palette, fg, localVariables);
 			const closingTag = findStyleClosingTag(source, end);
 			if (closingTag < 0) return output + resolveCssValue(source.slice(end), palette, fg, localVariables);
@@ -283,7 +284,7 @@ function collectSvgCssVariables(source: string): Set<string> {
 		forEachSvgAttribute(tag, (name, value) => {
 			if (name === "style") collectCssVariableDeclarations(value, variables);
 		});
-		if (/^<(?:[\w.-]+:)?style(?=[\s/>])/i.test(tag)) {
+		if (/^<(?:[\w.-]+:)?style(?=[\s/>])/i.test(tag) && !isSelfClosingSvgTag(tag)) {
 			const closingTag = findStyleClosingTag(source, end);
 			if (closingTag < 0) {
 				collectCssVariableDeclarations(source.slice(end), variables);
@@ -296,6 +297,11 @@ function collectSvgCssVariables(source: string): Set<string> {
 		cursor = end;
 	}
 	return variables;
+}
+
+/** Whether a complete XML start tag is self-closing. */
+function isSelfClosingSvgTag(tag: string): boolean {
+	return /\/\s*>$/.test(tag);
 }
 
 /** Collect custom-property declarations while ignoring CSS comments and strings. */

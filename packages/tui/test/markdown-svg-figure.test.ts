@@ -54,7 +54,7 @@ function figureTheme(figures: DeferredFigure[], onResolve?: (context: SvgFigureR
 
 describe("Markdown asynchronous SVG figures", () => {
 	it("rerenders pending figures after completion and keeps them out of both render caches", () => {
-		const source = "Intro\n\n~~~ SVG title\n<svg/>\n~~~\n\nOutro";
+		const source = "Intro\n\n~~~ SVG title\n<SVG/>\n~~~\n\nOutro";
 		const figures: DeferredFigure[] = [];
 		let resolverCalls = 0;
 		const theme = figureTheme(figures, () => resolverCalls++);

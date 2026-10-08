@@ -16,10 +16,13 @@ describe("splitSvgFences", () => {
 	it("leaves svg fences nested in another fence or indented as code as prose", () => {
 		const nested = "````markdown\n```svg\n<svg/>\n```\n````";
 		const indented = "    ```svg\n    <svg/>\n    ```";
+		const uppercase = "```SVG\n<SVG/>\n```";
 		expect(splitSvgFences(nested)).toEqual([{ kind: "markdown", text: nested }]);
 		expect(hasSvgFence(nested)).toBe(false);
 		expect(splitSvgFences(indented)).toEqual([{ kind: "markdown", text: indented }]);
 		expect(hasSvgFence(indented)).toBe(false);
+		expect(hasSvgFence(uppercase)).toBe(true);
+		expect(splitSvgFences(uppercase)).toEqual([{ kind: "svg", source: "<SVG/>\n", closed: true }]);
 		expect(hasSvgFence("```svgx\n```")).toBe(false);
 	});
 
@@ -113,5 +116,15 @@ describe("prepareSvg", () => {
 		expect(prepared).toContain("--shape:#f00");
 		expect(prepared).toContain("fill:var(--shape);stroke:#ff8800");
 		expect(prepared).toContain('style="--inline:#0f0;fill:var(--inline)"');
+	});
+
+	it("does not treat a self-closing style element as the start of a stylesheet", () => {
+		const prepared = prepareSvg(
+			'<svg><style/><text>Use var(--accent)</text><rect fill="var(--accent)"/></svg>',
+			palette,
+		);
+
+		expect(prepared).toContain("<text>Use var(--accent)</text>");
+		expect(prepared).toContain('<rect fill="#ff8800"/>');
 	});
 });
