@@ -15,7 +15,7 @@
 import { rasterizeSvg } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
 import { Image, type ImageTheme } from "../components/image";
-import { type CellDimensions, getCellDimensions, getImageDimensions } from "../terminal-capabilities";
+import { type CellDimensions, getCellDimensions, getImageDimensions, TERMINAL } from "../terminal-capabilities";
 import type { Component } from "../tui";
 import { closePartialSvg, prepareSvg } from "./svg-source";
 
@@ -99,6 +99,7 @@ export class SvgFigure implements Component {
 	#width: number | undefined;
 	#layout: Layout | undefined;
 	#image: { raster: Raster; cell: CellDimensions; columns: number; rows: number; component: Image } | undefined;
+	#graphicsUnavailableNotified = false;
 
 	constructor(options: SvgFigureOptions) {
 		this.#options = options;
@@ -128,6 +129,16 @@ export class SvgFigure implements Component {
 	}
 
 	render(width: number): string[] {
+		if (!TERMINAL.imageProtocol) {
+			clearTimeout(this.#timer);
+			this.#timer = undefined;
+			if (!this.#graphicsUnavailableNotified) {
+				this.#graphicsUnavailableNotified = true;
+				this.#options.onChange();
+			}
+			return [];
+		}
+		this.#graphicsUnavailableNotified = false;
 		const cell = getCellDimensions();
 		const limits = limitsFor(width, cell);
 		const previousLayout = this.#layout;
@@ -210,7 +221,7 @@ export class SvgFigure implements Component {
 	/** Start a raster when one is due: single-flight, throttled while streaming, immediate once final. */
 	#schedule(): void {
 		const width = this.#width;
-		if (this.#disposed || this.#rasterizing || width === undefined) return;
+		if (this.#disposed || !TERMINAL.imageProtocol || this.#rasterizing || width === undefined) return;
 		if (this.#final && this.#timer) {
 			clearTimeout(this.#timer);
 			this.#timer = undefined;

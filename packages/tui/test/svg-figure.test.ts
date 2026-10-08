@@ -56,9 +56,42 @@ describe("SvgFigure", () => {
 		}
 	});
 
+	it("suppresses terminal-image placeholders and notifies the parent when graphics disappear", async () => {
+		const previousProtocol = TERMINAL.imageProtocol;
+		const rasterized = Promise.withResolvers<void>();
+		let changes = 0;
+		const figure = new SvgFigure({
+			theme,
+			palette,
+			onChange: () => {
+				changes++;
+				rasterized.resolve();
+			},
+		});
+		setTerminalImageProtocol(ImageProtocol.Kitty);
+		try {
+			figure.update(SVG, true);
+			figure.render(80);
+			await rasterized.promise;
+			expect(figure.render(80).join("")).toContain("\x1b_G");
+
+			const changesBeforeFallback = changes;
+			setTerminalImageProtocol(null);
+			expect(figure.render(80)).toEqual([]);
+			expect(changes).toBe(changesBeforeFallback + 1);
+			expect(figure.render(80)).toEqual([]);
+			expect(changes).toBe(changesBeforeFallback + 1);
+		} finally {
+			figure.dispose();
+			setTerminalImageProtocol(previousProtocol);
+		}
+	});
+
 	it("rerasterizes when the viewport height changes at the same terminal width", async () => {
+		const previousProtocol = TERMINAL.imageProtocol;
 		const previousRows = Object.getOwnPropertyDescriptor(process.stdout, "rows");
 		const previousCellDimensions = getCellDimensions();
+		setTerminalImageProtocol(ImageProtocol.Kitty);
 		Object.defineProperty(process.stdout, "rows", { configurable: true, value: 24 });
 		setCellDimensions({ widthPx: 9, heightPx: 18 });
 		let changed = Promise.withResolvers<void>();
@@ -83,12 +116,15 @@ describe("SvgFigure", () => {
 		} finally {
 			figure.dispose();
 			setCellDimensions(previousCellDimensions);
+			setTerminalImageProtocol(previousProtocol);
 			if (previousRows) Object.defineProperty(process.stdout, "rows", previousRows);
 			else Reflect.deleteProperty(process.stdout, "rows");
 		}
 	});
 
 	it("recovers after a failed final source is replaced by valid SVG", async () => {
+		const previousProtocol = TERMINAL.imageProtocol;
+		setTerminalImageProtocol(ImageProtocol.Kitty);
 		let changed = Promise.withResolvers<void>();
 		const figure = new SvgFigure({ theme, palette, onChange: () => changed.resolve() });
 		try {
@@ -105,6 +141,7 @@ describe("SvgFigure", () => {
 			expect(figure.debugState()).toMatchObject({ current: true, failed: false });
 		} finally {
 			figure.dispose();
+			setTerminalImageProtocol(previousProtocol);
 		}
 	});
 });
