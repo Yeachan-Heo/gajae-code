@@ -1850,9 +1850,11 @@ export default class Sdk extends Command {
 			const message =
 				reason === "startup-lock-blocked" && blockingLockPath
 					? `SDK broker startup blocked by retained removal transition ${blockingLockPath}.`
-					: reason === "startup-deadline"
-						? `SDK broker startup exceeded its ${timeoutMs}ms fence deadline.`
-						: `SDK broker startup interrupted by ${signal} before readiness.`;
+					: reason === "startup-lock-unavailable" && blockingLockPath
+						? `SDK broker startup could not acquire required lock ${blockingLockPath}.`
+						: reason === "startup-deadline"
+							? `SDK broker startup exceeded its ${timeoutMs}ms fence deadline.`
+							: `SDK broker startup interrupted by ${signal} before readiness.`;
 			writeStartupExitLog(exitRecord, message);
 			startupExitTask = (async () => {
 				const exitRecordWrite = await beginStartupExitRecordWrite(exitRecord);
@@ -2066,6 +2068,8 @@ export default class Sdk extends Command {
 					BROKER_DISCOVERY_BUDGET.startupLockWaitMs,
 					error.orphanPath,
 				);
+			} else if (error instanceof FileLockAcquireError) {
+				await exitDuringStartup("startup-lock-unavailable", 1, null, undefined, error.lockPath);
 			}
 			if (broker) {
 				try {

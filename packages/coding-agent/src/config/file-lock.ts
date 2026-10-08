@@ -2535,16 +2535,20 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			ownerToken,
 			opts.onAcquired,
 		);
-		if (isFileLockOrphanTransition(result))
-			throw new FileLockAcquireError(
-				filePath,
-				lockPath,
-				attempt + 1,
-				`orphan transition retained at ${result.path}`,
-				"orphan_transition",
-				result.path,
-			);
-		if (result) {
+		if (isFileLockOrphanTransition(result)) {
+			// Adoption is identity-bound and can be refused by a transient cleanup race.
+			// Keep using the caller's bounded contention budget; the same generation is
+			// revalidated before every later adoption attempt.
+			if (attempt + 1 === opts.retries)
+				throw new FileLockAcquireError(
+					filePath,
+					lockPath,
+					opts.retries,
+					`orphan transition retained at ${result.path}`,
+					"orphan_transition",
+					result.path,
+				);
+		} else if (result) {
 			localLockStates.set(localKey, { owner: result, status: "held" });
 			return () => releaseLock(lockPath, result, localKey);
 		}
@@ -2593,20 +2597,26 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			opts.signal.removeEventListener("abort", onAbort);
 		}
 	}
+	const holder = await lockHolderDescription(
+		lockPath,
+		orphanTransitionAgeMs,
+		opts.ownerHostId,
+		opts.previousOwnerHostIds ?? [],
+	);
+	const transitionState = await classifyFileLockRemovalTransition(
+		lockPath,
+		orphanTransitionAgeMs,
+		opts.ownerHostId,
+		opts.previousOwnerHostIds ?? [],
+	);
+	const orphanPath = transitionState === "orphan_transition" ? fileLockRemovalTransitionPath(lockPath) : undefined;
 	throw new FileLockAcquireError(
 		filePath,
 		lockPath,
 		opts.retries,
-		await lockHolderDescription(lockPath, orphanTransitionAgeMs, opts.ownerHostId, opts.previousOwnerHostIds ?? []),
-		"acquire_timeout",
-		(await classifyFileLockRemovalTransition(
-			lockPath,
-			orphanTransitionAgeMs,
-			opts.ownerHostId,
-			opts.previousOwnerHostIds ?? [],
-		))
-			? fileLockRemovalTransitionPath(lockPath)
-			: undefined,
+		holder,
+		orphanPath ? "orphan_transition" : "acquire_timeout",
+		orphanPath,
 		await staleRemovalFailureForCurrentGeneration(lockPath, staleRemovalFailure),
 	);
 }

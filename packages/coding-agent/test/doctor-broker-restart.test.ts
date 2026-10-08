@@ -1,6 +1,8 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import path from "node:path";
+import { type NativeExactUnlinkResult, snapshotDirectoryTree } from "@gajae-code/natives";
+import { FileLockTestHooks } from "../src/config/file-lock";
 import { Broker } from "../src/sdk/broker/broker";
 import { readBrokerExitRecord } from "../src/sdk/broker/broker-exit";
 import { launchAuthorizedBrokerSuccessor } from "../src/sdk/broker/daemon-entry";
@@ -310,6 +312,35 @@ describe("doctor broker restart protocol", () => {
 		});
 		expect(result.kind).toBe("refused");
 		if (result.kind === "refused") expect(result.reason).toBe("intent_not_committed");
+	});
+
+	it("launchAuthorizedBrokerSuccessor maps a retained orphan transition to a startup-lock refusal", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-doctor-orphan-lock-"));
+		const transitionPath = path.join(dir, "sdk", "broker.startup.lock.removing");
+		await fs.mkdir(transitionPath, { recursive: true });
+		await fs.writeFile(
+			path.join(transitionPath, "info"),
+			JSON.stringify({ pid: 525_252, timestamp: Date.now() - 120_000, owner_token: "dead-owner" }),
+		);
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: () => ({ ok: false, code: "identity_mismatch" }) as NativeExactUnlinkResult,
+		});
+		const sleep = spyOn(Bun, "sleep").mockImplementation(async () => undefined);
+		try {
+			const result = await launchAuthorizedBrokerSuccessor({
+				agentDir: dir,
+				requestId: "retained-orphan-lock",
+				deadlineAt: Date.now() + 30_000,
+				packageGeneration: "test-generation",
+			});
+			expect(result).toMatchObject({ kind: "refused", reason: "startup_lock_unavailable" });
+			if (result.kind === "refused") expect(result.detail).toContain("blocked by retained removal transition");
+		} finally {
+			sleep.mockRestore();
+			FileLockTestHooks.nativeQuarantineBindings = undefined;
+			await fs.rm(dir, { recursive: true, force: true });
+		}
 	});
 
 	it("retry/successor race: adopting an already-prepared request replays the same lease instead of double-preparing", async () => {

@@ -1,5 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { isFileLockAcquireTimeout } from "../../config/file-lock";
+import { FileLockAcquireError } from "../../config/file-lock";
 import { type BrokerDiscovery, readBrokerDiscovery, readBrokerRestartIntent } from "./discovery";
 import { withBrokerStartupLock } from "./ensure";
 import { isProcessIncarnation, observeProcessIncarnation } from "./process-incarnation";
@@ -30,6 +30,17 @@ export type AuthorizedBrokerSuccessorResult =
 
 const SUCCESSOR_SPAWN_POLL_MS = 25;
 
+type SpawnedBrokerChild = {
+	kind: "spawned";
+	child: ChildProcess;
+	isTrampoline: boolean;
+	trampolineOutput: () => string;
+	trampolineOutputEnded: () => boolean;
+	spawnError: () => Error | undefined;
+};
+
+type BrokerSuccessorSpawnOutcome = Exclude<AuthorizedBrokerSuccessorResult, { kind: "spawned" }> | SpawnedBrokerChild;
+
 /**
  * Launches (or adopts) exactly one authorized successor for `requestId`.
  *
@@ -45,7 +56,7 @@ const SUCCESSOR_SPAWN_POLL_MS = 25;
 export async function launchAuthorizedBrokerSuccessor(
 	options: AuthorizedBrokerSuccessorOptions,
 ): Promise<AuthorizedBrokerSuccessorResult> {
-	let spawnOutcome: any;
+	let spawnOutcome: BrokerSuccessorSpawnOutcome;
 	try {
 		spawnOutcome = await withBrokerStartupLock(options.agentDir, async deadline => {
 			if (Date.now() >= Math.min(deadline, options.deadlineAt))
@@ -106,11 +117,11 @@ export async function launchAuthorizedBrokerSuccessor(
 			};
 		});
 	} catch (error) {
-		if (isFileLockAcquireTimeout(error)) {
+		if (error instanceof FileLockAcquireError) {
 			return {
 				kind: "refused" as const,
 				reason: "startup_lock_unavailable" as const,
-				detail: (error as Error).message,
+				detail: error.message,
 			};
 		}
 		throw error;

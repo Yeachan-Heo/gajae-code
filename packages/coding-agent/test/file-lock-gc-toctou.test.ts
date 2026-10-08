@@ -1221,7 +1221,7 @@ describe("file lock cleanup failure handling (#2478)", () => {
 				code: "orphan_transition",
 				reason: "orphan_transition",
 				orphanPath: detachedPath,
-				attempts: 1,
+				attempts: 2,
 			});
 			expect(entered).toBe(false);
 			expect(await fs.exists(detachedPath)).toBe(true);
@@ -1284,6 +1284,40 @@ describe("file lock cleanup failure handling (#2478)", () => {
 			await expect(
 				withFileLock(lockedFile, async () => undefined, { retries: 2, retryDelayMs: 1 }),
 			).resolves.toBeUndefined();
+			expect(await fs.exists(detachedPath)).toBe(false);
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"retries a refused orphan adoption and acquires after the cleanup race clears",
+		async () => {
+			const lockedFile = path.join(await makeTemp(), "orphan-adoption-retry.json");
+			const detachedPath = `${lockedFile}.lock.removing`;
+			await fs.mkdir(detachedPath);
+			const old = new Date(Date.now() - 120_000);
+			await fs.utimes(detachedPath, old, old);
+			let removalAttempts = 0;
+			FileLockTestHooks.nativeQuarantineBindings = () => ({
+				snapshotDirectoryTree,
+				exactRemoveDirectoryTree: (target, snapshot) => {
+					if (target === detachedPath) {
+						removalAttempts++;
+						if (removalAttempts === 1) return { ok: false, code: "identity_mismatch" } as NativeExactUnlinkResult;
+					}
+					return exactRemoveDirectoryTree(target, snapshot);
+				},
+			});
+
+			let entered = false;
+			await withFileLock(
+				lockedFile,
+				async () => {
+					entered = true;
+				},
+				{ retries: 3, retryDelayMs: 1 },
+			);
+			expect(entered).toBe(true);
+			expect(removalAttempts).toBe(2);
 			expect(await fs.exists(detachedPath)).toBe(false);
 		},
 	);
