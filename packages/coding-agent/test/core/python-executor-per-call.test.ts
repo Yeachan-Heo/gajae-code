@@ -1,13 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { executePython } from "@gajae-code/coding-agent/eval/py/executor";
-import type { KernelExecuteOptions, KernelExecuteResult } from "@gajae-code/coding-agent/eval/py/kernel";
+import { executePython, type PythonResult } from "@gajae-code/coding-agent/eval/py/executor";
 import { PythonKernel } from "@gajae-code/coding-agent/eval/py/kernel";
 import { TempDir } from "@gajae-code/utils";
-
-interface KernelStub {
-	execute: (code: string, options?: KernelExecuteOptions) => Promise<KernelExecuteResult>;
-	shutdown: () => Promise<void>;
-}
 
 type KernelStartOptions = Parameters<typeof PythonKernel.start>[0];
 
@@ -46,6 +40,33 @@ function rejectOnStartupCancellation(options: KernelStartOptions): Promise<never
 	}
 
 	return promise;
+}
+
+async function waitForFile(filePath: string, timeoutMs = 5_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (await Bun.file(filePath).exists()) return;
+		await Bun.sleep(10);
+	}
+	throw new Error(`Timed out waiting for Python marker file: ${filePath}`);
+}
+
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function waitForProcessGone(pid: number, timeoutMs = 5_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (!isProcessAlive(pid)) return;
+		await Bun.sleep(25);
+	}
+	expect(isProcessAlive(pid)).toBe(false);
 }
 
 describe("executePython (per-call)", () => {
@@ -120,31 +141,40 @@ describe("executePython (per-call)", () => {
 	it("shuts down kernel on timed-out cancellation", async () => {
 		Bun.env.PI_PYTHON_SKIP_CHECK = "1";
 		using tempDir = TempDir.createSync("@gjc-python-executor-per-call-");
-
-		let shutdownCalls = 0;
-		const kernel: KernelStub = {
-			execute: async () => ({
-				status: "ok",
-				cancelled: true,
-				timedOut: true,
-				stdinRequested: false,
-			}),
-			shutdown: async () => {
-				shutdownCalls += 1;
-			},
+		const pidFile = `${tempDir.path()}/per-call-kernel.pid`;
+		const readyFile = `${tempDir.path()}/per-call-kernel.ready`;
+		const kernels: PythonKernel[] = [];
+		let execution: Promise<PythonResult> | undefined;
+		PythonKernel.start = async options => {
+			const kernel = await originalStart(options);
+			kernels.push(kernel);
+			return kernel;
 		};
 
-		PythonKernel.start = async () => kernel as unknown as PythonKernel;
+		let pid: number | undefined;
+		try {
+			execution = executePython(
+				`from pathlib import Path\nimport os, time\nPath(${JSON.stringify(pidFile)}).write_text(str(os.getpid()))\nPath(${JSON.stringify(readyFile)}).touch()\ntime.sleep(60)`,
+				{
+					kernelMode: "per-call",
+					timeoutMs: 5000,
+					cwd: tempDir.path(),
+				},
+			);
+			await waitForFile(readyFile);
+			pid = Number((await Bun.file(pidFile).text()).trim());
+			expect(Number.isSafeInteger(pid) && pid > 0).toBe(true);
+			expect(isProcessAlive(pid)).toBe(true);
+			const result = await execution;
 
-		const result = await executePython("sleep(10)", {
-			kernelMode: "per-call",
-			timeoutMs: 2000,
-			cwd: tempDir.path(),
-		});
-
-		expect(result.cancelled).toBe(true);
-		expect(result.exitCode).toBeUndefined();
-		expect(result.output).toContain("eval cell timed out after 2s");
-		expect(shutdownCalls).toBe(1);
-	});
+			expect(result.cancelled).toBe(true);
+			expect(result.exitCode).toBeUndefined();
+			expect(result.output).toContain("Command timed out after 5 seconds");
+			expect(kernels).toHaveLength(1);
+			await waitForProcessGone(pid);
+			expect(kernels[0].isAlive()).toBe(false);
+		} finally {
+			await execution?.catch(() => undefined);
+		}
+	}, 30_000);
 });

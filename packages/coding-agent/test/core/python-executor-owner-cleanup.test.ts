@@ -80,6 +80,20 @@ async function flushMicrotasks(turns = 6): Promise<void> {
 	for (let turn = 0; turn < turns; turn += 1) await Promise.resolve();
 }
 
+async function waitForRequest<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+	let timer: NodeJS.Timeout | undefined;
+	try {
+		return await Promise.race([
+			promise,
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+			}),
+		]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
 afterEach(async () => {
 	await disposeAllKernelSessions();
 	PythonKernel.start = originalStart;
@@ -889,6 +903,7 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 	it("joins a held genuine initializer and shuts down its unpublished real kernel", async () => {
 		using tempDir = TempDir.createSync("@gjc-python-owner-initializer-");
 		const cwd = tempDir.path();
+		const pidFile = `${cwd}/held-initializer.pid`;
 		const initialized = Promise.withResolvers<PythonKernel>();
 		const release = Promise.withResolvers<void>();
 		const kernels: PythonKernel[] = [];
@@ -896,6 +911,10 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			const kernel = await originalStart(options);
 			kernels.push(kernel);
 			if (options.cwd === cwd) {
+				const marked = await kernel.execute(
+					`from pathlib import Path\nimport os\nPath(${JSON.stringify(pidFile)}).write_text(str(os.getpid()))`,
+				);
+				if (marked.status !== "ok") throw new Error("Could not mark the held initializer process");
 				initialized.resolve(kernel);
 				await release.promise;
 			}
@@ -903,6 +922,7 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 		});
 		let execution: Promise<PythonResult> | undefined;
 		let cleanup: Promise<void> | undefined;
+		let pid: number | undefined;
 		try {
 			execution = executePython("print('must not execute')", {
 				cwd,
@@ -911,6 +931,7 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 				kernelOwnerId: "owner-a",
 			});
 			const kernel = await initialized.promise;
+			pid = await waitForProcessFile(pidFile);
 			expect(kernel.isAlive()).toBe(true);
 
 			cleanup = disposeKernelSessionsByOwner("owner-a");
@@ -920,7 +941,8 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			});
 			await flushMicrotasks();
 			expect(cleanupSettled).toBe(false);
-			expect(kernel.isAlive()).toBe(true);
+			await waitForProcessGone(pid);
+			expect(kernel.isAlive()).toBe(false);
 
 			release.resolve();
 			const result = await execution;
@@ -936,16 +958,113 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 		}
 	}, 30_000);
 
+	it("keeps a shared initializer created by A alive when owner B survives A retirement", async () => {
+		using tempDir = TempDir.createSync("@gjc-python-owner-creator-a-shared-");
+		const cwd = tempDir.path();
+		const pidFile = `${cwd}/creator-a.pid`;
+		const readyFile = `${cwd}/creator-b.ready`;
+		const initialized = Promise.withResolvers<PythonKernel>();
+		const waiterAvailability = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const kernels: PythonKernel[] = [];
+		let initializationReached = false;
+		let executionA: Promise<PythonResult> | undefined;
+		let executionB: Promise<PythonResult> | undefined;
+		let ownerCleanup: Promise<void> | undefined;
+		vi.spyOn(pythonKernel, "checkPythonKernelAvailability").mockImplementation(async (...args) => {
+			if (initializationReached && args[0] === cwd) waiterAvailability.resolve();
+			return await originalAvailability(...args);
+		});
+		vi.spyOn(PythonKernel, "start").mockImplementation(async options => {
+			const kernel = await originalStart(options);
+			kernels.push(kernel);
+			if (options.cwd === cwd) {
+				const marked = await kernel.execute(
+					`from pathlib import Path\nimport os\nPath(${JSON.stringify(pidFile)}).write_text(str(os.getpid()))`,
+				);
+				if (marked.status !== "ok") throw new Error("Could not mark owner A's shared initializer");
+				initializationReached = true;
+				initialized.resolve(kernel);
+				await release.promise;
+			}
+			return kernel;
+		});
+		try {
+			executionA = executePython("print('A initializer request')", {
+				cwd,
+				sessionId: "creator-a-shared-initializer",
+				kernelMode: "session",
+				kernelOwnerId: "owner-a",
+			});
+			const failIfSettled = (execution: Promise<PythonResult>, owner: string): Promise<never> =>
+				execution.then(result => {
+					throw new Error(`${owner} request settled before its initializer gate: ${result.output}`);
+				});
+			const kernel = await Promise.race([initialized.promise, failIfSettled(executionA, "A")]);
+			const pid = await waitForProcessFile(pidFile);
+			executionB = executePython(`from pathlib import Path\nPath(${JSON.stringify(readyFile)}).touch()`, {
+				cwd,
+				sessionId: "creator-a-shared-initializer",
+				kernelMode: "session",
+				kernelOwnerId: "owner-b",
+			});
+			await Promise.race([waiterAvailability.promise, failIfSettled(executionB, "B")]);
+			await flushMicrotasks(12);
+
+			ownerCleanup = disposeKernelSessionsByOwner("owner-a");
+			const resultA = await waitForRequest(
+				executionA,
+				5_000,
+				"Cancelled creator A remained joined to the surviving B initializer",
+			);
+			expect(resultA.cancelled).toBe(true);
+			let cleanupSettled = false;
+			void ownerCleanup.then(() => {
+				cleanupSettled = true;
+			});
+			await flushMicrotasks();
+			expect(cleanupSettled).toBe(false);
+			expect(kernels).toHaveLength(1);
+			expect(kernel.isAlive()).toBe(true);
+			expect(isProcessAlive(pid)).toBe(true);
+
+			release.resolve();
+			const resultB = await executionB;
+			await ownerCleanup;
+			expect(resultB.exitCode).toBe(0);
+			expect(await Bun.file(readyFile).exists()).toBe(true);
+			expect(kernels).toHaveLength(1);
+			expect(kernel.isAlive()).toBe(true);
+			expect(isProcessAlive(pid)).toBe(true);
+
+			await disposeKernelSessionsByOwner("owner-b");
+			await waitForProcessGone(pid);
+			expect(kernel.isAlive()).toBe(false);
+		} finally {
+			release.resolve();
+			await Promise.allSettled([
+				...(ownerCleanup ? [ownerCleanup] : []),
+				...(executionA ? [executionA] : []),
+				...(executionB ? [executionB] : []),
+				disposeKernelSessionsByOwner("owner-b"),
+				disposeAllKernelSessions(),
+			]);
+		}
+	}, 30_000);
+
 	it("keeps an A waiter joined through synchronous cleanup reentry while B's shared initializer survives", async () => {
 		using tempDir = TempDir.createSync("@gjc-python-owner-shared-initializer-");
 		const cwd = tempDir.path();
+		const startEntered = Promise.withResolvers<void>();
+		const allowCreation = Promise.withResolvers<void>();
 		const initialized = Promise.withResolvers<PythonKernel>();
 		const release = Promise.withResolvers<void>();
 		const waiterAvailability = Promise.withResolvers<void>();
 		const readyPath = `${cwd}/initializer-b.ready`;
 		const pidPath = `${cwd}/initializer-b.pid`;
 		const kernels: PythonKernel[] = [];
-		let initializationReached = false;
+		let initializerStartEntered = false;
+		let creationCallbackEntered = false;
 		let executionA: Promise<PythonResult> | undefined;
 		let executionB: Promise<PythonResult> | undefined;
 		let ownerCleanup: Promise<void> | undefined;
@@ -968,21 +1087,32 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			{ once: true },
 		);
 		vi.spyOn(pythonKernel, "checkPythonKernelAvailability").mockImplementation(async (...args) => {
-			if (initializationReached && args[0] === cwd) waiterAvailability.resolve();
+			if (initializerStartEntered && args[0] === cwd) waiterAvailability.resolve();
 			return await originalAvailability(...args);
 		});
 		vi.spyOn(PythonKernel, "start").mockImplementation(async startOptions => {
-			const kernel = await originalStart(startOptions);
-			kernels.push(kernel);
-			if (startOptions.cwd === cwd) {
-				const marked = await kernel.execute(
-					`from pathlib import Path\nimport os\nPath(${JSON.stringify(pidPath)}).write_text(str(os.getpid()))`,
-				);
-				if (marked.status !== "ok") throw new Error("Could not mark the real shared initializer process");
-				initializationReached = true;
-				initialized.resolve(kernel);
-				await release.promise;
-			}
+			if (startOptions.cwd !== cwd) return await originalStart(startOptions);
+			initializerStartEntered = true;
+			startEntered.resolve();
+			await allowCreation.promise;
+			const registerKernel = startOptions.onKernelCreated;
+			const kernel = await originalStart({
+				...startOptions,
+				onKernelCreated: created => {
+					registerKernel?.(created);
+					kernels.push(created);
+					if (creationCallbackEntered) return;
+					creationCallbackEntered = true;
+					ownerCleanup = disposeKernelSessionsByOwner("owner-a");
+					controller.abort(new DOMException("reenter owner cleanup", "AbortError"));
+				},
+			});
+			const marked = await kernel.execute(
+				`from pathlib import Path\nimport os\nPath(${JSON.stringify(pidPath)}).write_text(str(os.getpid()))`,
+			);
+			if (marked.status !== "ok") throw new Error("Could not mark the real shared initializer process");
+			initialized.resolve(kernel);
+			await release.promise;
 			return kernel;
 		});
 		try {
@@ -990,20 +1120,30 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 				...options,
 				kernelOwnerId: "owner-b",
 			});
-			const kernel = await initialized.promise;
-			const pid = await waitForProcessFile(pidPath);
-			expect(kernel.isAlive()).toBe(true);
+			const failIfSettled = (execution: Promise<PythonResult>, owner: string): Promise<never> =>
+				execution.then(result => {
+					throw new Error(`${owner} request settled before its setup gate: ${result.output}`);
+				});
+			await Promise.race([startEntered.promise, failIfSettled(executionB, "B")]);
 
 			executionA = executePython("print('A waits on B initializer')", {
 				...options,
 				kernelOwnerId: "owner-a",
 				signal: controller.signal,
 			});
-			await waiterAvailability.promise;
+			await Promise.race([
+				waiterAvailability.promise,
+				failIfSettled(executionA, "A"),
+				failIfSettled(executionB, "B"),
+			]);
 			await flushMicrotasks(12);
+			allowCreation.resolve();
 
-			ownerCleanup = disposeKernelSessionsByOwner("owner-a");
-			controller.abort(new DOMException("reenter owner cleanup", "AbortError"));
+			const kernel = await Promise.race([initialized.promise, failIfSettled(executionB, "B")]);
+			const pid = await waitForProcessFile(pidPath);
+			expect(kernel.isAlive()).toBe(true);
+
+			if (!ownerCleanup || !reentrantCleanup) throw new Error("Creation callback did not trigger cleanup reentry");
 			let ownerCleanupSettled = false;
 			let reentrantCleanupSettled = false;
 			void ownerCleanup.then(() => {
@@ -1013,7 +1153,7 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 				reentrantCleanupSettled = true;
 			});
 			expect(reentrantCleanup).toBeDefined();
-			const resultA = await executionA;
+			const resultA = await waitForRequest(executionA, 5_000, "Cancelled A remained joined to B's held initializer");
 			expect(resultA.cancelled).toBe(true);
 			await flushMicrotasks();
 			expect(ownerCleanupSettled).toBe(false);
@@ -1039,6 +1179,7 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			bodyFailed = true;
 			bodyError = error;
 		} finally {
+			allowCreation.resolve();
 			release.resolve();
 			controller.abort();
 			const settled = await Promise.allSettled([
@@ -1059,6 +1200,95 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 		if (cleanupFailed) throw cleanupError;
 	}, 30_000);
 
+	it("retains a real partial-start kernel when its first shutdown rejects, then retries explicitly", async () => {
+		Bun.env.PI_PYTHON_SKIP_CHECK = "1";
+		using tempDir = TempDir.createSync("@gjc-python-partial-start-retention-");
+		const cwd = tempDir.path();
+		const ownerId = "partial-start-owner";
+		const startupError = new Error("injected actual creation-callback failure");
+		const shutdownError = new Error("first partial-start shutdown rejected");
+		const spawn = Bun.spawn.bind(Bun);
+		let pid: number | undefined;
+		let kernel: PythonKernel | undefined;
+		let creationCallbacks = 0;
+		let startupFailureCallbacks = 0;
+		let shutdownCalls = 0;
+		let cleanup: Promise<void> | undefined;
+		function spawnObserver<
+			const In extends Bun.SpawnOptions.Writable = "ignore",
+			const Out extends Bun.SpawnOptions.Readable = "pipe",
+			const Err extends Bun.SpawnOptions.Readable = "inherit",
+		>(options: Bun.SpawnOptions.SpawnOptions<In, Out, Err> & { cmd: string[] }): Bun.Subprocess<In, Out, Err>;
+		function spawnObserver<
+			const In extends Bun.SpawnOptions.Writable = "ignore",
+			const Out extends Bun.SpawnOptions.Readable = "pipe",
+			const Err extends Bun.SpawnOptions.Readable = "inherit",
+		>(commands: string[], options?: Bun.SpawnOptions.SpawnOptions<In, Out, Err>): Bun.Subprocess<In, Out, Err>;
+		function spawnObserver<
+			const In extends Bun.SpawnOptions.Writable = "ignore",
+			const Out extends Bun.SpawnOptions.Readable = "pipe",
+			const Err extends Bun.SpawnOptions.Readable = "inherit",
+		>(
+			command: string[] | (Bun.SpawnOptions.SpawnOptions<In, Out, Err> & { cmd: string[] }),
+			options?: Bun.SpawnOptions.SpawnOptions<In, Out, Err>,
+		): Bun.Subprocess<In, Out, Err> {
+			const proc = Array.isArray(command) ? spawn(command, options) : spawn(command);
+			const spawnOptions = Array.isArray(command) ? options : command;
+			if (spawnOptions && spawnOptions.cwd === cwd && spawnOptions.detached === true) pid = proc.pid;
+			return proc;
+		}
+		vi.spyOn(Bun, "spawn").mockImplementation(spawnObserver);
+		vi.spyOn(PythonKernel, "start").mockImplementation(async options => {
+			const registerKernel = options.onKernelCreated;
+			const handleStartupFailure = options.onStartupFailure;
+			return await originalStart({
+				...options,
+				onKernelCreated: created => {
+					registerKernel?.(created);
+					kernel = created;
+					creationCallbacks += 1;
+					const shutdown = created.shutdown.bind(created);
+					created.shutdown = async shutdownOptions => {
+						shutdownCalls += 1;
+						if (shutdownCalls === 1) throw shutdownError;
+						return await shutdown(shutdownOptions);
+					};
+					throw startupError;
+				},
+				onStartupFailure: async failed => {
+					startupFailureCallbacks += 1;
+					await handleStartupFailure?.(failed);
+				},
+			});
+		});
+		try {
+			const execution = executePython("print('partial startup must not execute')", {
+				cwd,
+				sessionId: "partial-start-session",
+				kernelMode: "session",
+				kernelOwnerId: ownerId,
+			});
+			await expect(execution).rejects.toBe(startupError);
+			expect(creationCallbacks).toBe(1);
+			expect(startupFailureCallbacks).toBe(1);
+			expect(shutdownCalls).toBe(1);
+			if (!kernel || pid === undefined) throw new Error("Actual runner process was not captured at creation");
+			expect(isProcessAlive(pid)).toBe(true);
+			expect(kernel.isAlive()).toBe(true);
+
+			cleanup = disposeKernelSessionsByOwner(ownerId);
+			await cleanup;
+			expect(shutdownCalls).toBe(2);
+			await waitForProcessGone(pid);
+			expect(kernel.isAlive()).toBe(false);
+		} finally {
+			await Promise.allSettled([
+				...(cleanup ? [cleanup] : [disposeKernelSessionsByOwner(ownerId)]),
+				disposeAllKernelSessions(),
+			]);
+		}
+	}, 30_000);
+
 	it("propagates and retries failed shutdown of a captured late initializer by its original label", async () => {
 		using tempDir = TempDir.createSync("@gjc-python-owner-late-shutdown-retry-");
 		const cwd = tempDir.path();
@@ -1067,6 +1297,7 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 		const pidFile = `${cwd}/late-kernel.pid`;
 		const kernels: PythonKernel[] = [];
 		const originalError = new Error("late kernel shutdown failed");
+		const shutdownStarted = Promise.withResolvers<void>();
 		let shutdownCalls = 0;
 		vi.spyOn(PythonKernel, "start").mockImplementation(async options => {
 			const kernel = await originalStart(options);
@@ -1075,7 +1306,10 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 				const shutdown = kernel.shutdown.bind(kernel);
 				kernel.shutdown = async shutdownOptions => {
 					shutdownCalls += 1;
-					if (shutdownCalls === 1) throw originalError;
+					if (shutdownCalls === 1) {
+						shutdownStarted.resolve();
+						throw originalError;
+					}
 					return await shutdown(shutdownOptions);
 				};
 				const marked = await kernel.execute(
@@ -1100,6 +1334,11 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			const kernel = await initialized.promise;
 			pid = await waitForProcessFile(pidFile);
 			cleanup = disposeKernelSessionsByOwner("late-retry-owner");
+			await shutdownStarted.promise;
+			await flushMicrotasks();
+			expect(shutdownCalls).toBe(1);
+			expect(isProcessAlive(pid)).toBe(true);
+			expect(kernel.isAlive()).toBe(true);
 			release.resolve();
 			await expect(cleanup).rejects.toBe(originalError);
 			const result = await execution;
@@ -1118,12 +1357,26 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 		}
 	}, 30_000);
 
-	it("global cleanup joins preflight but leaves a same-name process created after its captured scope", async () => {
+	it("global cleanup cancels a captured pre-spawn request without retiring the later same-name kernel", async () => {
 		using tempDir = TempDir.createSync("@gjc-python-global-preflight-");
 		const cwd = tempDir.path();
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
-		const kernels = trackStartedKernels();
+		const pidFile = `${cwd}/global-successor.pid`;
+		const kernels: PythonKernel[] = [];
+		const physicallyCreated: PythonKernel[] = [];
+		vi.spyOn(PythonKernel, "start").mockImplementation(async options => {
+			const onKernelCreated = options.onKernelCreated;
+			const kernel = await originalStart({
+				...options,
+				onKernelCreated: created => {
+					physicallyCreated.push(created);
+					onKernelCreated?.(created);
+				},
+			});
+			kernels.push(kernel);
+			return kernel;
+		});
 		let executionA: Promise<PythonResult> | undefined;
 		let globalCleanup: Promise<void> | undefined;
 		holdAvailability(cwd, release.promise, entered.resolve);
@@ -1135,20 +1388,27 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 				kernelOwnerId: "owner-a",
 			});
 			await entered.promise;
+			expect(physicallyCreated).toHaveLength(0);
 			globalCleanup = disposeAllKernelSessions();
 			let cleanupSettled = false;
 			void globalCleanup.then(() => {
 				cleanupSettled = true;
 			});
 
-			const firstB = await executePython("print('B survives')", {
-				cwd,
-				sessionId: "global-captured-session",
-				kernelMode: "session",
-				kernelOwnerId: "owner-b",
-			});
+			const firstB = await executePython(
+				`from pathlib import Path\nimport os\nPath(${JSON.stringify(pidFile)}).write_text(str(os.getpid()))`,
+				{
+					cwd,
+					sessionId: "global-captured-session",
+					kernelMode: "session",
+					kernelOwnerId: "owner-b",
+				},
+			);
 			expect(firstB.exitCode).toBe(0);
+			const successorPid = await waitForProcessFile(pidFile);
+			expect(isProcessAlive(successorPid)).toBe(true);
 			expect(kernels).toHaveLength(1);
+			expect(physicallyCreated).toHaveLength(1);
 			expect(kernels[0].isAlive()).toBe(true);
 			expect(cleanupSettled).toBe(false);
 
@@ -1157,14 +1417,20 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			await globalCleanup;
 			expect(resultA.cancelled).toBe(true);
 
-			const secondB = await executePython("print('B still survives')", {
-				cwd,
-				sessionId: "global-captured-session",
-				kernelMode: "session",
-				kernelOwnerId: "owner-b",
-			});
+			const secondB = await executePython(
+				`from pathlib import Path\nimport os\nPath(${JSON.stringify(pidFile)}).write_text(str(os.getpid()))`,
+				{
+					cwd,
+					sessionId: "global-captured-session",
+					kernelMode: "session",
+					kernelOwnerId: "owner-b",
+				},
+			);
 			expect(secondB.exitCode).toBe(0);
+			expect(Number((await Bun.file(pidFile).text()).trim())).toBe(successorPid);
+			expect(isProcessAlive(successorPid)).toBe(true);
 			expect(kernels).toHaveLength(1);
+			expect(physicallyCreated).toHaveLength(1);
 			expect(kernels[0].isAlive()).toBe(true);
 		} finally {
 			release.resolve();

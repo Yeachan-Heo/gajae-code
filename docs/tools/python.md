@@ -44,6 +44,10 @@ An invocation captures its cwd, session file, session id, and settings before pr
 
 The original invocation is enrolled in that generation before the external execution-tracking callback runs. Reentrant clear or registered cleanup therefore joins the invocation's transcript and result finalization, rather than observing an empty pending set. This enrollment does not depend on a replacement promise returned by the tracking callback.
 
+A spawned kernel is registered before startup callbacks run. If startup fails and shutdown rejects or cannot confirm exit, the actual kernel remains available for a later explicit cleanup or acquisition retry; the same failed startup does not silently make a second shutdown attempt or overwrite that resource. Per-call and replacement kernels follow the same retention rule.
+
+An initializing kernel has an independent startup cancellation controller. A cancelled request can detach while another owner still needs that initializer, but owner and global cleanup continue joining the captured initialization. Failed or cancelled preflight removes provisional membership rather than leaving an owner that never acquired the kernel. Confirmed shutdown covers the spawned runner process, not its descendants.
+
 Owner ids remain string labels, not private identity authority. A later cleanup using the same label can still select a successor kernel; this lifecycle improvement does not fix that legacy ABA boundary. Captured invocation metadata grants no transcript or audit filesystem append authority.
 
 The session's kernel is disposed on:
