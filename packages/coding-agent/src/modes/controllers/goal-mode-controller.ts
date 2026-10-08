@@ -94,7 +94,7 @@ export class GoalModeController {
 	}
 
 	scheduleContinuation(): void {
-		this.cancelContinuation();
+		this.#cancelContinuationTimer();
 		if (!this.ctx.inputCallback) return;
 		if (!this.ctx.session.settings.get("goal.continuationModes").includes("interactive")) return;
 		if (this.ctx.planModeActive || !this.#enabled || this.#paused || this.#suppressNextContinuation) return;
@@ -121,10 +121,14 @@ export class GoalModeController {
 	}
 
 	cancelContinuation(): void {
-		if (this.#continuationTimer) clearTimeout(this.#continuationTimer);
-		this.#continuationTimer = undefined;
+		this.#cancelContinuationTimer();
 		if (this.#timeoutObservationTimer) clearTimeout(this.#timeoutObservationTimer);
 		this.#timeoutObservationTimer = undefined;
+	}
+
+	#cancelContinuationTimer(): void {
+		if (this.#continuationTimer) clearTimeout(this.#continuationTimer);
+		this.#continuationTimer = undefined;
 	}
 
 	onPendingSubmissionFinished(customType?: string): void {

@@ -146,10 +146,10 @@ async function runContinuation(
 	harness: Harness,
 	outcomes: Array<{ toolName: string; args: unknown; isError: boolean; result: unknown }>,
 	unpaired: "none" | "start" | "end" = "none",
+	input = harness.mode.getUserInput(),
 ): Promise<void> {
 	expect(harness.mode.goalModeController.enabled).toBe(true);
 	expect(harness.session.settings.get("goal.continuationModes")).toContain("interactive");
-	const input = harness.mode.getUserInput();
 	await advanceGoalContinuation();
 	const submission = await input;
 	expect(submission).toMatchObject({ customType: "goal-continuation" });
@@ -227,8 +227,19 @@ describe("goal continuation repeated timeout guard", () => {
 		expect(status).toHaveBeenCalledWith(
 			"Goal is observing repeated identical timeout from bash; checking delegated work before one automatic retry.",
 		);
+		const retry = harness.mode.getUserInput();
+		await flush();
+		expect(harness.mode.onInputCallback).toBeDefined();
+		expect(continuationTimers.some(timer => timer.delay === 30_000 && !timer.cancelled)).toBe(true);
 		await advanceTimeoutObservation();
-		await runContinuation(harness, [timeout(), timeout()]);
+		expect(status).toHaveBeenCalledWith(
+			"No delegated task is still running; the goal continuation will retry once after the timeout observation window.",
+		);
+		await runContinuation(harness, [timeout(), timeout()], "none", retry);
+		expect(
+			continuationTimers.some(timer => !timer.cancelled && (timer.delay === 800 || timer.delay === 30_000)),
+		).toBe(false);
+		expect(harness.session.getGoalModeState()).toMatchObject({ enabled: true, goal: { status: "active" } });
 		const blocked = harness.mode.getUserInput();
 		await flush();
 		expect(harness.mode.onInputCallback).toBeDefined();
