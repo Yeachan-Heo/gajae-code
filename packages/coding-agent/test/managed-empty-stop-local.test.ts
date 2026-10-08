@@ -24,14 +24,18 @@ import {
 
 // Local session integration: real provider HTTP/SSE, without launching the SDK
 // broker or running the connected verification scenarios owned by the tester.
-test.each(
-	["fallback-enabled", "untyped-fallback", "fallback-disabled", "untyped-disabled", "nonzero-usage"].flatMap(
+test.each([
+	...["fallback-enabled", "untyped-fallback", "fallback-disabled", "untyped-disabled", "nonzero-usage"].flatMap(
 		scenario => [
-			{ scenario: scenario as EmptyStopScenario, initialization: "direct" as const },
-			{ scenario: scenario as EmptyStopScenario, initialization: "sdk" as const },
+			{ scenario: scenario as EmptyStopScenario, initialization: "direct" as const, nonzeroFallback: false },
+			{ scenario: scenario as EmptyStopScenario, initialization: "sdk" as const, nonzeroFallback: false },
 		],
 	),
-)("local session preserves empty-stop request boundary: %j", async ({ scenario, initialization }) => {
+	// A single-model boundary cannot detect accidental fallback admission.
+	// Keep the same one-request/no-switch expectations with a usable tail.
+	{ scenario: "nonzero-usage" as const, initialization: "direct" as const, nonzeroFallback: true },
+	{ scenario: "nonzero-usage" as const, initialization: "sdk" as const, nonzeroFallback: true },
+])("local session preserves empty-stop request boundary: %j", async ({ scenario, initialization, nonzeroFallback }) => {
 	const models: string[] = [];
 	const server = Bun.serve({
 		hostname: "127.0.0.1",
@@ -132,7 +136,7 @@ test.each(
 		expect(session.extensionRunner?.hasHandlers("agent_start")).toBe(true);
 		session.setConfiguredModelChain(
 			"default",
-			scenario === "nonzero-usage" || scenario.endsWith("disabled")
+			(scenario === "nonzero-usage" && !nonzeroFallback) || scenario.endsWith("disabled")
 				? ["empty-stop-fixture/primary"]
 				: ["empty-stop-fixture/primary", "empty-stop-fixture/fallback"],
 			"test",
