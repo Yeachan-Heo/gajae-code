@@ -13,6 +13,7 @@ type NativeManagedScope = Pick<
 	| "exactRestore"
 	| "exactUnlink"
 	| "snapshotDirectoryTree"
+	| "snapshotEmptyDirectory"
 	| "verifyOwnerOnlyPathSecurity"
 	| "verifyOwnerOnlyPathSecurityExpected"
 >;
@@ -6266,7 +6267,7 @@ export function cleanupAuthorityMatches(
 			parentStat.ino !== cleanup.identity.parentIno
 		)
 			return false;
-		const snapshot = nativeScope().snapshotDirectoryTree(cleanup.retainedPath);
+		const snapshot = nativeScope().snapshotEmptyDirectory(cleanup.retainedPath);
 		const observedRoot = snapshot.snapshot?.entries.find(
 			entry => entry.relativePath === "" && entry.kind === "directory",
 		);
@@ -6330,7 +6331,7 @@ export function detachArtifactRootForMigration(
 	const stat = fs.lstatSync(placeholder, { bigint: true });
 	if (!stat.isDirectory() || stat.isSymbolicLink() || path.dirname(placeholder) !== path.dirname(plan.originalPath))
 		throw new Error("durability_failed");
-	const snapshot = nativeScope().snapshotDirectoryTree(placeholder);
+	const snapshot = nativeScope().snapshotEmptyDirectory(placeholder);
 	if (!snapshot.ok || !snapshot.snapshot) throw new Error("durability_failed");
 	// Windows directory size/mtime authority is the native tree root, never Bun's
 	// zero-valued directory lstat. Capturing Bun values here would guarantee a

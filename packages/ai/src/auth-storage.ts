@@ -1972,7 +1972,9 @@ export class AuthStorage {
 		selectors.set(storageProvider, selector);
 		this.#sessionCredentialSelectors.set(scope, selectors);
 		this.#sessionCredentialAutoMasks.get(scope)?.delete(storageProvider);
-		this.#bumpGeneration("set-session-credential-selector", storageProvider);
+		// Scope-local selection invalidates availability, not the provenance of
+		// an unchanged provider credential used by discovery outside this scope.
+		this.#bumpGeneration("set-session-credential-selector");
 	}
 
 	/** Explicitly mask persistent/process-global selection and return the provider to AUTO for one scope. */
@@ -1985,7 +1987,7 @@ export class AuthStorage {
 		const masks = this.#sessionCredentialAutoMasks.get(scope) ?? new Set<string>();
 		masks.add(storageProvider);
 		this.#sessionCredentialAutoMasks.set(scope, masks);
-		this.#bumpGeneration("set-session-credential-auto", storageProvider);
+		this.#bumpGeneration("set-session-credential-auto");
 	}
 
 	/** Clear a scope's explicit selector and AUTO mask, restoring normal precedence. */
@@ -1998,7 +2000,7 @@ export class AuthStorage {
 		const changed = Boolean(selectors?.delete(storageProvider) || masks?.delete(storageProvider));
 		if (selectors?.size === 0) this.#sessionCredentialSelectors.delete(scope);
 		if (masks?.size === 0) this.#sessionCredentialAutoMasks.delete(scope);
-		if (changed) this.#bumpGeneration("clear-session-credential-selector", storageProvider);
+		if (changed) this.#bumpGeneration("clear-session-credential-selector");
 	}
 
 	/** Preserve a failed hard pin as unavailable instead of allowing AUTO fallback. */
@@ -2011,7 +2013,7 @@ export class AuthStorage {
 		this.#sessionCredentialUnavailable.set(scope, unavailable);
 		this.#sessionCredentialSelectors.get(scope)?.delete(storageProvider);
 		this.#sessionCredentialAutoMasks.get(scope)?.delete(storageProvider);
-		this.#bumpGeneration("mark-session-credential-unavailable", storageProvider);
+		this.#bumpGeneration("mark-session-credential-unavailable");
 	}
 
 	/** Return a failed hard pin retained for this scope, if any. */

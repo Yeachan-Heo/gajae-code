@@ -112,6 +112,7 @@ export const search = nativeBindings.search;
 export const setHangulCompatJamoWidthOverride = nativeBindings.setHangulCompatJamoWidthOverride;
 export const sliceWithWidth = nativeBindings.sliceWithWidth;
 export const snapshotDirectoryTree = nativeBindings.snapshotDirectoryTree;
+export const snapshotEmptyDirectory = nativeBindings.snapshotEmptyDirectory;
 export const structuredPatchHunks = nativeBindings.structuredPatchHunks;
 export const summarizeCode = nativeBindings.summarizeCode;
 export const supportsLanguage = nativeBindings.supportsLanguage;

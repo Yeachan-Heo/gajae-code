@@ -2912,6 +2912,12 @@ export declare function sliceWithWidth(line: string, startCol: number, length: n
 export declare function snapshotDirectoryTree(path: string): NativeDirectoryTreeResult
 
 /**
+ * Capture native root metadata only after proving a directory has no entries.
+ * Enumeration stops at the first non-dot child; no child is opened or read.
+ */
+export declare function snapshotEmptyDirectory(path: string): NativeDirectoryTreeResult
+
+/**
  * Unified-diff hunks with jsdiff
  * `structuredPatch(_, _, oldText, newText, _, _, { context }).hunks`
  * semantics. `context` defaults to 4 like jsdiff.
