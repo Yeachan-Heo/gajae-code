@@ -227,6 +227,7 @@ interface OwnerSubagentShutdownRecordCapture {
 	readonly record: SubagentRecord;
 	readonly currentJobId: string | null;
 	readonly currentJobGeneration?: string;
+	readonly queuedSeq?: number;
 }
 
 /** Lightweight, manager-owned resume payload. The async layer treats `data` as opaque. */
@@ -1564,6 +1565,7 @@ export class AsyncJobManager {
 				record,
 				currentJobId: record.currentJobId,
 				currentJobGeneration: record.currentJobGeneration,
+				queuedSeq: record.status === "queued" ? record.queued?.seq : undefined,
 			});
 			if (this.#isTerminalSubagentStatus(record.status) && backingExecution?.physicallySettled !== false) continue;
 			targets.set(record.subagentId, {
@@ -1679,7 +1681,8 @@ export class AsyncJobManager {
 				target.source === "record" &&
 				capture &&
 				this.#subagentRecords.get(target.subagentId) === capture.record &&
-				capture.record.status === "queued"
+				capture.record.status === "queued" &&
+				(capture.queuedSeq === undefined || capture.record.queued?.seq === capture.queuedSeq)
 			) {
 				this.cancelSubagent(target.subagentId, { ownerId: lease.ownerId });
 			}
@@ -1741,9 +1744,22 @@ export class AsyncJobManager {
 			!record ||
 			this.#subagentRecords.get(target.subagentId) !== record ||
 			record.ownerId !== ownerId ||
-			record.currentJobId !== capture.currentJobId ||
-			record.currentJobGeneration !== capture.currentJobGeneration ||
 			!this.#isTerminalSubagentStatus(record.status)
+		) {
+			return false;
+		}
+		if (capture.queuedSeq !== undefined) {
+			const queuedGeneration = `queued:${target.subagentId}:${capture.queuedSeq}`;
+			if (
+				record.status !== "cancelled" ||
+				record.terminalQueuedSeq !== capture.queuedSeq ||
+				record.terminalGeneration !== queuedGeneration
+			) {
+				return false;
+			}
+		} else if (
+			record.currentJobId !== capture.currentJobId ||
+			record.currentJobGeneration !== capture.currentJobGeneration
 		) {
 			return false;
 		}
@@ -1851,7 +1867,10 @@ export class AsyncJobManager {
 		if (rec.status === "queued") {
 			if (message !== undefined && rec.queued) {
 				rec.queued.message = message;
-				const queued = this.#resumeQueue.find(entry => entry.subagentId === rec.subagentId);
+				const queued = this.#resumeQueue.find(
+					entry =>
+						entry.subagentId === rec.subagentId && entry.ownerId === rec.ownerId && entry.seq === rec.queued?.seq,
+				);
 				if (queued) queued.message = message;
 				return { ok: true, queued: true, status: "queued" };
 			}
@@ -1864,6 +1883,7 @@ export class AsyncJobManager {
 		if (!this.#resolveResumeRunner(rec, descriptor)) return { ok: false, reason: "no_runner" };
 		if (this.getRunningJobs().length >= this.#maxRunningJobs) {
 			const seq = ++this.#resumeSeq;
+			rec.terminalQueuedSeq = undefined;
 			rec.status = "queued";
 			rec.queued = {
 				ownerId: rec.ownerId,
@@ -1996,7 +2016,12 @@ export class AsyncJobManager {
 		while (index < this.#resumeQueue.length && this.getRunningJobs().length < this.#maxRunningJobs) {
 			const entry = this.#resumeQueue[index];
 			const rec = this.#subagentRecords.get(entry.subagentId);
-			if (rec?.status !== "queued") {
+			if (
+				rec?.status !== "queued" ||
+				rec.ownerId !== entry.ownerId ||
+				rec.queued?.ownerId !== entry.ownerId ||
+				rec.queued?.seq !== entry.seq
+			) {
 				this.#resumeQueue.splice(index, 1);
 				continue;
 			}
@@ -2065,8 +2090,10 @@ export class AsyncJobManager {
 			return true;
 		}
 		if (rec.status === "queued") {
-			const idx = this.#resumeQueue.findIndex(e => e.subagentId === rec.subagentId);
 			const queuedSeq = rec.queued?.seq;
+			const idx = this.#resumeQueue.findIndex(
+				e => e.subagentId === rec.subagentId && e.ownerId === rec.ownerId && e.seq === queuedSeq,
+			);
 			if (idx !== -1) this.#resumeQueue.splice(idx, 1);
 			rec.status = "cancelled";
 			if (queuedSeq !== undefined) {

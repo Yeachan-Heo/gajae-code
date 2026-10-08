@@ -6448,6 +6448,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				const seams = options.terminalAbortSeams;
 				const handle = seams?.getActivePromptHandle();
 				const epoch = seams?.getTerminalTurnEpoch();
+				// Capture lifecycle ownership independently of settlement proof. Without
+				// a tool-set observer the later terminalization hook still fails closed,
+				// but a matching real end must remain private and recoverable meanwhile.
 				if (!seams || !handle || epoch === undefined) return;
 				const existing = deadlineTerminalizationObservations.get(key);
 				if (existing) return () => cleanupDeadlineTerminalizationObservation(key, existing);

@@ -8523,6 +8523,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		await Bun.write(sessionFile, "");
 		const store = createReconciliationStore({ sessionFile, sessionId });
 		const activeTools = new Set(["unfenced-tool"]);
+		const toolDrainObserved = Promise.withResolvers<void>();
 		let boundaryWaitStarted = false;
 		let abortCalls = 0;
 		let harness: InvocationHarness | undefined;
@@ -8549,7 +8550,9 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 					getActivePromptHandle: () => "deadline-captured-uncertain-run",
 					pendingToolExecutions: () => {
 						if (activeTools.size > 0) boundaryWaitStarted = true;
-						return [...activeTools];
+						const pending = [...activeTools];
+						if (pending.length === 0) toolDrainObserved.resolve();
+						return pending;
 					},
 					abortPromptAndWaitWithTerminal: async () => {
 						abortCalls += 1;
@@ -8597,8 +8600,11 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			});
 
 			activeTools.clear();
-			// Keep this inside the 60s hard-runtime budget while tolerating a slow CI retry tick.
-			expect(await settledStatus(harness, "turn.prompt_status", correlation, 30_000)).toMatchObject({
+			// Wait until the deadline recovery loop has actually observed the exact
+			// tool-set drain; clearing the test seam alone does not wake its bounded
+			// retry timer.
+			await toolDrainObserved.promise;
+			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
 				status: "terminal_ok",
 				outcome: { kind: "stopped", reason: "cancelled" },
 			});
@@ -8618,6 +8624,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		const sessionFile = path.join(cwd, "session.json");
 		await Bun.write(sessionFile, "");
 		const store = createReconciliationStore({ sessionFile, sessionId });
+		const deadlineStarted = Promise.withResolvers<void>();
 		let abortCalls = 0;
 		let harness: InvocationHarness | undefined;
 		try {
@@ -8633,7 +8640,10 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				terminalAbortSeams: {
 					getReconciliationStore: () => store,
 					getTerminalTurnEpoch: () => 17,
-					getActivePromptHandle: () => "unobservable-tool-run",
+					getActivePromptHandle: () => {
+						deadlineStarted.resolve();
+						return "unobservable-tool-run";
+					},
 					abortPromptAndWaitWithTerminal: async () => {
 						abortCalls += 1;
 						return { status: "settled" };
@@ -8647,7 +8657,10 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			await harness.emit("agent_failed", {
 				error: Object.assign(new Error("provider unavailable"), { code: "provider_unavailable" }),
 			});
-			await Bun.sleep(150);
+			// Expiry must install its recoverable observation before the real end
+			// arrives; otherwise an end racing the durable uncertainty write can
+			// terminalize from the diagnostic alone.
+			await deadlineStarted.promise;
 			expect(abortCalls).toBe(0);
 			expect(await harness.query("turn.prompt_status", correlation)).toMatchObject({
 				result: { status: "in_flight" },
@@ -8655,7 +8668,6 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toHaveLength(1);
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toEqual([]);
 			await harness.emit("agent_end", { stopReason: "cancelled" });
-			await Bun.sleep(100);
 			expect(await harness.query("turn.prompt_status", correlation)).toMatchObject({
 				result: { status: "in_flight" },
 			});

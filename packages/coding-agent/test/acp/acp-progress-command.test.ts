@@ -143,6 +143,12 @@ describe("ACP /progress builtin", () => {
 		);
 		try {
 			const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+			// `session/new` schedules client-visible bootstrap updates asynchronously. Match the
+			// advertised-command production path before testing prompt admission.
+			await waitFor(
+				() => updates.some(update => update.update.sessionUpdate === "available_commands_update"),
+				"ACP available commands",
+			);
 
 			// Hold each session.progress query on a gate the test settles; other queries pass through.
 			let gate = Promise.withResolvers<void>();

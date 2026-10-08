@@ -451,7 +451,39 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 		expect(completions.map(completion => completion.text)).toContain("resumed:C");
 		const proof = await manager.cancelAndProveOwnerSubagents(lease, { timeoutMs: 50 });
 		expect(proof).toMatchObject({ confirmed: true, terminalIds: ["A"], unresolvedIds: [] });
+		expect(manager.getSubagentRecord("A")?.status).toBe("cancelled");
 		manager.finishOwnerSubagentShutdown(lease, "release");
+		await manager.dispose({ timeoutMs: 500 });
+	});
+
+	test("a stale queued generation cannot resume a replacement owner's entry", async () => {
+		const { manager, completions } = makeManager({ maxRunningJobs: 1 });
+		installResumeRunner(manager);
+		const a = spawnControllable(manager, "A", "owner-a");
+		expect(manager.pauseSubagent("A").ok).toBe(true);
+		a.release();
+		await manager.waitForAll();
+
+		const blocker = spawnControllable(manager, "BLOCK", "owner-blocker");
+		expect(manager.resumeSubagent("A", { ownerId: "owner-a" }, "stale").queued).toBe(true);
+		manager.registerSubagentRecord({
+			subagentId: "A",
+			ownerId: "owner-b",
+			currentJobId: null,
+			historicalJobIds: ["A"],
+			status: "paused",
+			sessionFile: "/tmp/A-owner-b.jsonl",
+			resumable: true,
+		});
+		expect(manager.resumeSubagent("A", { ownerId: "owner-b" }, "current").queued).toBe(true);
+
+		blocker.release();
+		await manager.waitForAll();
+		await manager.drainDeliveries({ timeoutMs: 500 });
+
+		expect(completions.map(completion => completion.text)).toContain("resumed:current");
+		expect(completions.map(completion => completion.text)).not.toContain("resumed:stale");
+		expect(manager.getSubagentRecord("A", { ownerId: "owner-b" })?.status).toBe("completed");
 		await manager.dispose({ timeoutMs: 500 });
 	});
 
