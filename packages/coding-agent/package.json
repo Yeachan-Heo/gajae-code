@@ -32,7 +32,7 @@
 		"build": "bun run verify:markit-vendor && bun scripts/build-binary.ts",
 		"check": "bun run verify:markit-vendor && biome check . && bun run check:types",
 		"check:runtime": "bun run generate-hotkeys-docs --check && bun run verify:sdk-canonicalization",
-		"check:types": "bun run generate-docs-index && tsc -p tsconfig.json --noEmit",
+		"check:types": "tsc -p tsconfig.json --noEmit",
 		"check:autorouting-map": "bun scripts/check-autorouting-tier-map.ts",
 		"lint": "biome lint .",
 		"test": "bun test",

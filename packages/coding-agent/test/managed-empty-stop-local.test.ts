@@ -23,7 +23,7 @@ import {
 } from "./helpers/managed-empty-stop-harness";
 
 // Local session integration: real provider HTTP/SSE, without launching the SDK
-// broker or running the connected verification scenarios owned by the tester.
+// broker or running the connected WebSocket verification scenarios.
 test.each([
 	...["fallback-enabled", "untyped-fallback", "fallback-disabled", "untyped-disabled", "nonzero-usage"].flatMap(
 		scenario => [

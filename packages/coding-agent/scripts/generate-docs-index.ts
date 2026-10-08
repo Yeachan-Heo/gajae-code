@@ -68,13 +68,5 @@ const output = [
 	"",
 ].join("\n");
 
-// Workspace typechecks can generate concurrently. Publish a complete file so
-// another workspace's compiler never observes a truncated or partial module.
-const temporaryPath = `${outputPath}.${process.pid}.tmp`;
-try {
-	await Bun.write(temporaryPath, output);
-	await fs.rename(temporaryPath, outputPath);
-} finally {
-	await fs.rm(temporaryPath, { force: true });
-}
+await Bun.write(outputPath, output);
 process.stderr.write(`Generated ${path.relative(process.cwd(), outputPath)} (${entries.length} docs)\n`);
