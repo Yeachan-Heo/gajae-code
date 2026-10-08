@@ -7084,7 +7084,29 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			() => acceptingGateResolutions,
 			trackGateResolution,
 			options.onInvocationCompletionReconciledForTests,
-			frame => runtime.emitEvent(frame),
+			frame => {
+				// Completion can win the durable transaction while a lifecycle end is
+				// still waiting on it. Both publishers must share the same claim.
+				if (typeof frame.commandId !== "string" || typeof frame.turnId !== "string")
+					throw new Error("SDK invocation publication requires a correlation.");
+				const correlation = { commandId: frame.commandId, turnId: frame.turnId };
+				if (frame.type !== "agent_end") {
+					if (!hasClaimedTerminalBoundary(correlation)) runtime.emitEvent(frame);
+					return;
+				}
+				if (!claimTerminalBoundary(correlation)) return;
+				const key = lifecycleCorrelationKey(correlation);
+				const sequenceBefore = runtime.host.events.sequence;
+				try {
+					runtime.emitEvent(frame);
+					terminalBoundaryClaims.setPublicationResult(key, true);
+				} catch (error) {
+					if (runtime.host.events.sequence > sequenceBefore)
+						terminalBoundaryClaims.setPublicationResult(key, true);
+					else terminalBoundaryClaims.releaseClaim(key);
+					throw error;
+				}
+			},
 			acceptedQueueCancellations,
 		);
 		const installProviderDefinitions = (capability: string, definitions: unknown): void => {
