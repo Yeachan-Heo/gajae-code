@@ -4,6 +4,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as stream from "node:stream";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { refuseFailedBrokerLaunchForTest } from "../src/sdk/broker/daemon-entry";
 import { type BrokerDiscovery, isPidAlive } from "../src/sdk/broker/discovery";
@@ -22,7 +23,11 @@ import {
 	signalDetachedBrokerProcessForTest,
 	signalPinnedBrokerProcessForTest,
 } from "../src/sdk/broker/ensure";
-import { writeBrokerHopReplyForTest } from "../src/sdk/broker/hop";
+import {
+	BROKER_HANDOFF_ACKNOWLEDGEMENT,
+	waitForBrokerHandoffAcknowledgement,
+	writeBrokerHopReplyForTest,
+} from "../src/sdk/broker/hop";
 import { observeProcessIncarnation } from "../src/sdk/broker/process-incarnation";
 
 describe("SDK broker hop protocol", () => {
@@ -386,6 +391,18 @@ describe("SDK broker hop protocol", () => {
 		} finally {
 			kill.mockRestore();
 		}
+	});
+
+	test("broker handoff acknowledgement requires the complete protocol token", async () => {
+		const acceptedInput = new stream.PassThrough();
+		const accepted = waitForBrokerHandoffAcknowledgement(acceptedInput);
+		acceptedInput.end(BROKER_HANDOFF_ACKNOWLEDGEMENT);
+		expect(await accepted).toBe(true);
+
+		const incompleteInput = new stream.PassThrough();
+		const incomplete = waitForBrokerHandoffAcknowledgement(incompleteInput);
+		incompleteInput.end(BROKER_HANDOFF_ACKNOWLEDGEMENT.slice(0, -1));
+		expect(await incomplete).toBe(false);
 	});
 
 	test.skipIf(process.platform === "darwin")(

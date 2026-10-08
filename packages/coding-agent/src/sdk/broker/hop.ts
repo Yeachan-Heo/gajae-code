@@ -2,11 +2,12 @@ import * as childProcess from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as process from "node:process";
+import type * as stream from "node:stream";
 import type { Process } from "@gajae-code/natives";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import type { BrokerHopMessage } from "./ensure";
 
-export const BROKER_HOP_ACKNOWLEDGEMENT = "GJC_BROKER_HOP_ACK\n";
+export const BROKER_HANDOFF_ACKNOWLEDGEMENT = "GJC_BROKER_HANDOFF_ACK\n";
 
 /**
  * Windows broker hop: spawns the real broker with detached:true and reports its pid.
@@ -58,12 +59,8 @@ export async function runBrokerHopFromArgv(argv: string[]): Promise<void> {
 			const cleanup = await terminateUnverifiableWindowsChild(child);
 			fail(`broker process identity could not be bound to the spawned child; ${cleanup}`);
 		}
-		const handoff = await writeBrokerHopReply(
-			child,
-			childReference,
-			pid,
-			writeBrokerHopStdout,
-			waitForBrokerHopAcknowledgement,
+		const handoff = await writeBrokerHopReply(child, childReference, pid, writeBrokerHopStdout, () =>
+			waitForBrokerHandoffAcknowledgement(process.stdin),
 		);
 		if (handoff.kind === "failed") fail(handoff.reason);
 		process.exit(0);
@@ -135,33 +132,33 @@ export function writeBrokerHopReplyForTest(
 	return writeBrokerHopReply(child, reference, pid, write, waitForAcknowledgement);
 }
 
-function waitForBrokerHopAcknowledgement(): Promise<boolean> {
+export function waitForBrokerHandoffAcknowledgement(input: stream.Readable): Promise<boolean> {
 	const acknowledgment = Promise.withResolvers<boolean>();
 	let received = "";
 	let settled = false;
 	const finish = (accepted: boolean): void => {
 		if (settled) return;
 		settled = true;
-		process.stdin.removeListener("data", onData);
-		process.stdin.removeListener("end", onEnd);
-		process.stdin.removeListener("close", onEnd);
-		process.stdin.removeListener("error", onEnd);
+		input.removeListener("data", onData);
+		input.removeListener("end", onEnd);
+		input.removeListener("close", onEnd);
+		input.removeListener("error", onEnd);
 		acknowledgment.resolve(accepted);
 	};
 	const onData = (chunk: Buffer | string): void => {
 		received += chunk.toString();
-		if (received.length > BROKER_HOP_ACKNOWLEDGEMENT.length) {
+		if (received.length > BROKER_HANDOFF_ACKNOWLEDGEMENT.length) {
 			finish(false);
 			return;
 		}
-		if (received.includes("\n")) finish(received === BROKER_HOP_ACKNOWLEDGEMENT);
+		if (received.includes("\n")) finish(received === BROKER_HANDOFF_ACKNOWLEDGEMENT);
 	};
 	const onEnd = (): void => finish(false);
-	process.stdin.on("data", onData);
-	process.stdin.once("end", onEnd);
-	process.stdin.once("close", onEnd);
-	process.stdin.once("error", onEnd);
-	process.stdin.resume();
+	input.on("data", onData);
+	input.once("end", onEnd);
+	input.once("close", onEnd);
+	input.once("error", onEnd);
+	input.resume();
 	return acknowledgment.promise;
 }
 

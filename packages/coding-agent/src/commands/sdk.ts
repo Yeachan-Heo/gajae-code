@@ -37,6 +37,7 @@ import {
 	reconcileBrokerGenerationForStartup,
 	withBrokerStartupLock,
 } from "../sdk/broker/ensure";
+import { waitForBrokerHandoffAcknowledgement } from "../sdk/broker/hop";
 import {
 	LifecycleFailurePublicationCleanupError,
 	LifecycleReadinessCleanupError,
@@ -1743,6 +1744,16 @@ export default class Sdk extends Command {
 					// The child may already have exited; reporting failure remains authoritative.
 				}
 				throw error;
+			}
+			if (!(await waitForBrokerHandoffAcknowledgement(process.stdin))) {
+				try {
+					child.kill("SIGKILL");
+				} catch {
+					// The direct child may already have exited; do not detach it without acknowledgement.
+				}
+				throw new Error(
+					"Broker trampoline handoff was not acknowledged; termination of the direct child was requested.",
+				);
 			}
 			child.unref();
 			return;

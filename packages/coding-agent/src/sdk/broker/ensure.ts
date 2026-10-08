@@ -16,7 +16,7 @@ import {
 	readBrokerDiscovery,
 	readBrokerRestartIntent,
 } from "./discovery";
-import { BROKER_HOP_ACKNOWLEDGEMENT } from "./hop";
+import { BROKER_HANDOFF_ACKNOWLEDGEMENT } from "./hop";
 import {
 	isProcessIncarnation,
 	observeProcessIncarnation,
@@ -138,6 +138,16 @@ function appendBoundedOutput(current: string, chunk: Buffer | string): string {
 	return next.length <= MAX_LAUNCHER_OUTPUT_CHARS ? next : next.slice(-MAX_LAUNCHER_OUTPUT_CHARS);
 }
 
+function endBrokerLauncherInput(child: ChildProcess, chunk?: string): void {
+	const input = child.stdin;
+	if (!input || input.destroyed || input.writableEnded) return;
+	try {
+		input.end(chunk);
+	} catch {
+		// The launcher treats an ended acknowledgement pipe as a failed handoff.
+	}
+}
+
 function awaitLauncherClose(child: ChildProcess): Promise<{ code: number | null; spawnError?: Error }> {
 	const { promise, resolve } = Promise.withResolvers<{ code: number | null; spawnError?: Error }>();
 	let spawnError: Error | undefined;
@@ -225,14 +235,6 @@ export async function launchBrokerViaHop(
 	let stdout = "";
 	let stderr = "";
 	let acknowledgementSent = false;
-	const endHopInput = (chunk?: string): void => {
-		if (!hop.stdin || hop.stdin.destroyed || hop.stdin.writableEnded) return;
-		try {
-			hop.stdin.end(chunk);
-		} catch {
-			// The hop will treat a closed acknowledgement pipe as a failed handoff.
-		}
-	};
 	hop.stdout?.on("data", chunk => {
 		stdout = appendBoundedOutput(stdout, chunk);
 		if (acknowledgementSent) return;
@@ -244,8 +246,9 @@ export async function launchBrokerViaHop(
 		const replyText = stdout.slice(0, newlineIndex + 1);
 		const trailingOutput = stdout.slice(newlineIndex + 1);
 		const parsed = parseBrokerHopReply(0, replyText);
-		if (parsed.error === undefined && trailingOutput.length === 0) endHopInput(BROKER_HOP_ACKNOWLEDGEMENT);
-		else endHopInput();
+		if (parsed.error === undefined && trailingOutput.length === 0)
+			endBrokerLauncherInput(hop, BROKER_HANDOFF_ACKNOWLEDGEMENT);
+		else endBrokerLauncherInput(hop);
 	});
 	hop.stderr?.on("data", chunk => {
 		stderr = appendBoundedOutput(stderr, chunk);
@@ -253,7 +256,7 @@ export async function launchBrokerViaHop(
 	hop.stdin?.on("error", () => {});
 	const wait = await awaitLauncherCloseBeforeDeadline(hop, timeoutMs, () => {
 		hop.stdout?.destroy();
-		endHopInput();
+		endBrokerLauncherInput(hop);
 	});
 	if (wait.kind === "timeout") {
 		return await brokerHopTimeoutResult(hop, stdout, stderr, timeoutMs, wait.terminated);
@@ -345,16 +348,31 @@ export async function launchBrokerViaPosixTrampoline(
 		throw new Error("POSIX broker trampoline startup deadline elapsed.");
 	const command = resolveSdkInternalSpawnCommand("broker-trampoline-internal");
 	const child = spawn(command.file, [...command.args, "--agent-dir", agentDir], {
-		detached: false,
-		stdio: ["ignore", "pipe", options.stderrFd ?? "ignore"],
+		detached: true,
+		stdio: ["pipe", "pipe", options.stderrFd ?? "ignore"],
 		env: options.env,
 		...(options.cwd ? { cwd: options.cwd } : {}),
 	});
 	let stdout = "";
+	let acknowledgementSent = false;
 	child.stdout?.on("data", chunk => {
 		stdout = appendBoundedOutput(stdout, chunk);
+		if (acknowledgementSent) return;
+		const newlineIndex = stdout.indexOf("\n");
+		if (newlineIndex < 0) return;
+		acknowledgementSent = true;
+		const replyText = stdout.slice(0, newlineIndex + 1);
+		const trailingOutput = stdout.slice(newlineIndex + 1);
+		const parsed = parseBrokerTrampolineReply(0, replyText);
+		if (parsed.error === undefined && trailingOutput.length === 0)
+			endBrokerLauncherInput(child, BROKER_HANDOFF_ACKNOWLEDGEMENT);
+		else endBrokerLauncherInput(child);
 	});
-	const wait = await awaitLauncherCloseBeforeDeadline(child, timeoutMs, () => child.stdout?.destroy());
+	child.stdin?.on("error", () => {});
+	const wait = await awaitLauncherCloseBeforeDeadline(child, timeoutMs, () => {
+		child.stdout?.destroy();
+		endBrokerLauncherInput(child);
+	});
 	if (wait.kind === "timeout") {
 		return await brokerTrampolineTimeoutResult(child, stdout, timeoutMs, wait.terminated);
 	}
