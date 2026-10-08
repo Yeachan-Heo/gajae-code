@@ -86,6 +86,14 @@ describe("model thinking metadata", () => {
 		expect(hasAnthropicSamplingParameterRestrictions("claude-haiku-4-5")).toBe(false);
 	});
 
+	it("keeps Haiku 4.5 on budget thinking after generated policy refresh", () => {
+		const anthropic = getBundledModel("anthropic", "claude-haiku-4-5");
+		const bedrock = getBundledModel("amazon-bedrock", "us.anthropic.claude-haiku-4-5-20251001-v1:0");
+
+		expect(anthropic.thinking?.mode).toBe("budget");
+		expect(bedrock.thinking?.mode).toBe("budget");
+	});
+
 	it("fails closed when a reasoning model lacks thinking metadata", () => {
 		const model = createModel({
 			id: "claude-sonnet-4-5",

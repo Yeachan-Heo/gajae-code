@@ -1094,7 +1094,7 @@ function inferThinkingControlMode<TApi extends Api>(
 				if (semverGte(parsedModel.version, "4.6")) {
 					return "anthropic-adaptive";
 				}
-				if (semverGte(parsedModel.version, "4.5")) {
+				if (semverGte(parsedModel.version, "4.5") && parsedModel.kind !== "haiku") {
 					return "anthropic-budget-effort";
 				}
 			}
@@ -1111,7 +1111,7 @@ function inferThinkingControlMode<TApi extends Api>(
 				if (parsedModel.kind === "haiku" && semverEqual(parsedModel.version, "5.5")) {
 					return "anthropic-adaptive";
 				}
-				if (semverGte(parsedModel.version, "4.5")) {
+				if (semverGte(parsedModel.version, "4.5") && parsedModel.kind !== "haiku") {
 					return "anthropic-budget-effort";
 				}
 			}
