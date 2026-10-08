@@ -449,7 +449,13 @@ describe("interactive background activity indicator", () => {
 			await controller.handleEvent(
 				recovery === "compaction"
 					? { type: "auto_compaction_start", reason: "threshold", action: "context-full" }
-					: { type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 1000, errorMessage: "rate limited" },
+					: {
+							type: "auto_retry_start",
+							attempt: 1,
+							maxAttempts: 3,
+							delayMs: 1000,
+							errorMessage: "rate limited",
+						},
 			);
 			await controller.handleEvent({ type: "agent_end", messages: [], stopReason: "cancelled" });
 			await controller.handleEvent(

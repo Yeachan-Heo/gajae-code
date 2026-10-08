@@ -155,7 +155,7 @@ describe("Anthropic prompt caching", () => {
 		// proxies add their own controls or do not understand the root field.
 		expect(proxiedClaude.cache_control).toBeUndefined();
 		expect(
-			(proxiedClaude.messages.at(-1)?.content as Array<{ cache_control?: CacheControl }>)[0]?.cache_control,
+			(proxiedClaude.messages.at(-1)!.content as Array<{ cache_control?: CacheControl }>)[0]?.cache_control,
 		).toEqual({
 			type: "ephemeral",
 		});
@@ -453,7 +453,7 @@ describe("Anthropic prompt caching", () => {
 			]),
 		);
 		expect(
-			(payload.messages.at(-1)?.content as Array<{ cache_control?: CacheControl }>).at(-1)?.cache_control,
+			(payload.messages.at(-1)!.content as Array<{ cache_control?: CacheControl }>).at(-1)?.cache_control,
 		).toEqual({
 			type: "ephemeral",
 		});

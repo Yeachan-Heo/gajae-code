@@ -3490,7 +3490,9 @@ describe("ModelRegistry", () => {
 				return Response.json({ data: [{ id: "union-alpha" }] });
 			});
 			const registrySettings = Settings.isolated();
-			const registry = new ModelRegistry(authStorage, modelsJsonPath, registrySettings, { automaticRefresh: false });
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, registrySettings, {
+				automaticRefresh: false,
+			});
 			const expected = {
 				id: "union-alpha",
 				provider,
@@ -3512,7 +3514,9 @@ describe("ModelRegistry", () => {
 			} finally {
 				registry.dispose();
 			}
-			const reloaded = new ModelRegistry(authStorage, modelsJsonPath, registrySettings, { automaticRefresh: false });
+			const reloaded = new ModelRegistry(authStorage, modelsJsonPath, registrySettings, {
+				automaticRefresh: false,
+			});
 			try {
 				await reloaded.refreshProvider(provider, "offline");
 				expect(reloaded.find(provider, "union-alpha")).toMatchObject(expected);

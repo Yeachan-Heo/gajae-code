@@ -4909,7 +4909,10 @@ test.each([
 		if (phase === "accepted") expect(await prompt).toMatchObject({ ok: true, result: { accepted: true } });
 		expect(ownedSignal?.aborted).toBe(false);
 		expect(modelCalls).toBe(0);
-		expect(await harness.controlAs("owner", "turn.abort", {})).toMatchObject({ ok: true, result: { aborted: true } });
+		expect(await harness.controlAs("owner", "turn.abort", {})).toMatchObject({
+			ok: true,
+			result: { aborted: true },
+		});
 		expect(ownedSignal?.aborted).toBe(true);
 		expect(rootAbortCalls).toBe(0);
 		release.resolve();
@@ -6387,7 +6390,10 @@ describe("post-acceptance invocation terminalization", () => {
 					if (prompts === 1) await neverSettlingPromise();
 				},
 			});
-			const failed = await harness.control("turn.prompt", { text: "provider rejects", clientRef: `http-${status}` });
+			const failed = await harness.control("turn.prompt", {
+				text: "provider rejects",
+				clientRef: `http-${status}`,
+			});
 			expect(failed.ok).toBe(true);
 			const failedIds = { commandId: failed.result?.commandId, turnId: failed.result?.turnId };
 			await harness.emit("agent_start");
@@ -11697,7 +11703,11 @@ test.each([
 		await handlers.get("session_start")?.({}, ctx);
 		expect(creations).toBe(2);
 		expect(
-			await request({ type: "query_request", query: "turn.result", input: { kind: "prompt", commandId, turnId } }),
+			await request({
+				type: "query_request",
+				query: "turn.result",
+				input: { kind: "prompt", commandId, turnId },
+			}),
 		).toMatchObject({
 			ok: true,
 			result: { status: "failed", error: { code: "cancelled" } },

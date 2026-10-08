@@ -1601,7 +1601,10 @@ describe.serial("AgentSession resilient retry", () => {
 		let requests = 0;
 		const failure = `data: ${JSON.stringify({ type: "error", code, message: "persistent upstream failure" })}\n\n`;
 		const success = [
-			{ type: "response.output_item.added", item: { type: "message", id: "msg_1", role: "assistant", content: [] } },
+			{
+				type: "response.output_item.added",
+				item: { type: "message", id: "msg_1", role: "assistant", content: [] },
+			},
 			{ type: "response.output_text.delta", delta: "recovered" },
 			{
 				type: "response.output_item.done",
@@ -1618,7 +1621,9 @@ describe.serial("AgentSession resilient retry", () => {
 			.join("");
 		mockCodexFetch(async () => {
 			requests++;
-			return new Response(requests <= 3 ? failure : success, { headers: { "content-type": "text/event-stream" } });
+			return new Response(requests <= 3 ? failure : success, {
+				headers: { "content-type": "text/event-stream" },
+			});
 		});
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 		const { retryStartEvents, retryEndEvents } = track(session);
