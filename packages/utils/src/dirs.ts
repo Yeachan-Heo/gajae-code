@@ -15,7 +15,10 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { directoryCaseSensitive as nativeDirectoryCaseSensitive } from "@gajae-code/natives";
+import type {
+	directoryCaseSensitive as nativeDirectoryCaseSensitive,
+	windowsOrdinalCaseFold as nativeWindowsOrdinalCaseFold,
+} from "@gajae-code/natives";
 import { resolveCanonicalLogsDir } from "./canonical-log-dir";
 import { APP_NAME } from "./cli-metadata";
 import { canonicalEnvKey, type ProjectEnvSnapshot, projectEnvSnapshot } from "./env-file";
@@ -84,17 +87,42 @@ export function pathIdentityKey(inputPath: string): string {
 	return resolvedPath;
 }
 
-type NativeDirectoryCaseSensitivityBindings = {
+type NativeWindowsPathBindings = {
 	directoryCaseSensitive: typeof nativeDirectoryCaseSensitive;
+	windowsOrdinalCaseFold: typeof nativeWindowsOrdinalCaseFold;
 };
 
-let nativeDirectoryCaseSensitivityBindings: NativeDirectoryCaseSensitivityBindings | undefined;
+let nativeWindowsPathBindings: NativeWindowsPathBindings | undefined;
 
 function windowsDirectoryCaseSensitivity(directoryPath: string): boolean | undefined {
 	try {
-		nativeDirectoryCaseSensitivityBindings ??=
-			require("@gajae-code/natives") as NativeDirectoryCaseSensitivityBindings;
-		return nativeDirectoryCaseSensitivityBindings.directoryCaseSensitive(directoryPath) ?? undefined;
+		nativeWindowsPathBindings ??= require("@gajae-code/natives") as NativeWindowsPathBindings;
+		return nativeWindowsPathBindings.directoryCaseSensitive(directoryPath) ?? undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function isWellFormedUtf16(value: string): boolean {
+	for (let index = 0; index < value.length; index++) {
+		const codeUnit = value.charCodeAt(index);
+		if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+			if (index + 1 >= value.length) return false;
+			const nextCodeUnit = value.charCodeAt(index + 1);
+			if (nextCodeUnit < 0xdc00 || nextCodeUnit > 0xdfff) return false;
+			index++;
+		} else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+			return false;
+		}
+	}
+	return true;
+}
+
+function windowsOrdinalCaseFold(value: string): string | undefined {
+	if (!isWellFormedUtf16(value)) return undefined;
+	try {
+		nativeWindowsPathBindings ??= require("@gajae-code/natives") as NativeWindowsPathBindings;
+		return nativeWindowsPathBindings.windowsOrdinalCaseFold(value);
 	} catch {
 		return undefined;
 	}
@@ -158,7 +186,7 @@ export function stablePathKey(inputPath: string): string {
 	}
 
 	let entryName = path.basename(entryPath);
-	if (caseSensitiveDirectory === false) entryName = entryName.toLowerCase();
+	if (caseSensitiveDirectory === false) entryName = windowsOrdinalCaseFold(entryName) ?? entryName;
 	if (parentIdentity && parentIdentity.ino !== 0n)
 		return JSON.stringify([
 			"win32-path-entry",
@@ -166,7 +194,7 @@ export function stablePathKey(inputPath: string): string {
 			parentIdentity.ino.toString(),
 			entryName,
 		]);
-	return caseSensitiveDirectory === false ? resolvedPath.toLowerCase() : resolvedPath;
+	return caseSensitiveDirectory === false ? (windowsOrdinalCaseFold(resolvedPath) ?? resolvedPath) : resolvedPath;
 }
 
 export function normalizePathForComparison(inputPath: string, platform: NodeJS.Platform = process.platform): string {

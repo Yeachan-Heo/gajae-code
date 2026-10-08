@@ -3027,6 +3027,9 @@ export interface WindowsJobMemoryProbeResult {
   code?: string
 }
 
+/** Fold UTF-16 code units with Windows' ordinal case mapping, without Unicode expansions. */
+export declare function windowsOrdinalCaseFold(value: string): string
+
 /** Profiling results returned to JavaScript. */
 export interface WorkProfile {
   /** Folded stack format for flamegraph tools. */

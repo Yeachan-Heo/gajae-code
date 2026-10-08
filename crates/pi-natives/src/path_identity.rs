@@ -1401,6 +1401,21 @@ pub fn directory_case_sensitive(path: String) -> Option<bool> {
 	}
 }
 
+/// Fold UTF-16 code units with Windows' ordinal case mapping, without Unicode
+/// expansions.
+#[allow(clippy::missing_const_for_fn, reason = "the Windows implementation calls an OS API")]
+#[napi]
+pub fn windows_ordinal_case_fold(value: String) -> String {
+	#[cfg(windows)]
+	{
+		platform::windows_ordinal_case_fold(&value)
+	}
+	#[cfg(not(windows))]
+	{
+		value
+	}
+}
+
 #[cfg(unix)]
 pub(crate) fn verify_descriptor_acl_absent(
 	file: &std::fs::File,
@@ -10990,6 +11005,14 @@ mod platform {
 		if closed { result } else { None }
 	}
 
+	pub(super) fn windows_ordinal_case_fold(value: &str) -> String {
+		let folded: Vec<u16> = value
+			.encode_utf16()
+			.map(|unit| unsafe { rtl_upcase_unicode_char(unit) })
+			.collect();
+		String::from_utf16(&folded).unwrap_or_else(|_| value.to_owned())
+	}
+
 	#[repr(C)]
 	struct UnicodeString {
 		length:         u16,
@@ -11015,6 +11038,9 @@ mod platform {
 
 	#[link(name = "ntdll")]
 	unsafe extern "system" {
+		#[link_name = "RtlUpcaseUnicodeChar"]
+		fn rtl_upcase_unicode_char(source_character: u16) -> u16;
+
 		fn NtCreateFile(
 			file_handle: *mut HANDLE,
 			desired_access: u32,

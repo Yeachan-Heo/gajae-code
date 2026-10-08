@@ -90,6 +90,41 @@ describe("issue #6446 Windows path casing", () => {
 		}
 	});
 
+	it("uses ordinal folding without collapsing expanded Unicode casing", () => {
+		if (process.platform !== "win32") return;
+
+		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-session-key-unicode-"));
+		try {
+			expect(directoryCaseSensitive(directory)).toBe(false);
+			const dottedCapitalIPath = path.join(directory, "İ.jsonl");
+			const dottedLowercaseIPath = path.join(directory, "i̇.jsonl");
+			expect(stablePathKey(dottedCapitalIPath)).not.toBe(stablePathKey(dottedLowercaseIPath));
+			expect(stablePathKey(path.join(directory, "Session.jsonl"))).toBe(
+				stablePathKey(path.join(directory, "session.jsonl")),
+			);
+		} finally {
+			fs.rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
+	it("uses ordinal folding for fallback keys without a usable parent identity", () => {
+		if (process.platform !== "win32") return;
+
+		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-session-key-fallback-"));
+		try {
+			expect(directoryCaseSensitive(directory)).toBe(false);
+			vi.spyOn(fs, "statSync").mockImplementation((() => ({ dev: 0n, ino: 0n })) as unknown as typeof fs.statSync);
+			const dottedCapitalIPath = path.join(directory, "İ.jsonl");
+			const dottedLowercaseIPath = path.join(directory, "i̇.jsonl");
+			expect(stablePathKey(dottedCapitalIPath)).not.toBe(stablePathKey(dottedLowercaseIPath));
+			expect(stablePathKey(path.join(directory, "Session.jsonl"))).toBe(
+				stablePathKey(path.join(directory, "session.jsonl")),
+			);
+		} finally {
+			fs.rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
 	it.skipIf(!process.env.GJC_TEST_CASE_SENSITIVE_DIRECTORY)(
 		"keeps existing case-distinct transcript files separate in a case-sensitive directory",
 		() => {
