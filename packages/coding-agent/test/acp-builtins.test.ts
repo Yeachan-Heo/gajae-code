@@ -866,8 +866,20 @@ describe("ACP builtin slash commands", () => {
 		const result = await executeAcpBuiltinSlashCommand("/model executor xai/grok-4.5", runtime);
 
 		expect(result).toEqual({ consumed: true });
+		expect(session.userModelSelectionMarks).toBe(0);
 		expect(runtime.settings.get("task.agentModelOverrides")).toEqual({});
 		expect(output[0]).toContain("requires an explicit effort suffix");
+	});
+
+	it("model: does not fence a rejected role selector", async () => {
+		const { output, runtime, session } = createRuntime();
+
+		const result = await executeAcpBuiltinSlashCommand("/model executor unknown-selector", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(session.userModelSelectionMarks).toBe(0);
+		expect(runtime.settings.get("task.agentModelOverrides")).toEqual({});
+		expect(output[0]).toContain("Unknown model: unknown-selector");
 	});
 
 	it("model: accepts explicit Grok effort for argument-based assignment", async () => {
@@ -919,7 +931,7 @@ describe("ACP builtin slash commands", () => {
 
 		expect(result).toEqual({ consumed: true });
 		expect(session.userModelSelectionMarks).toBe(1);
-		expect(marksAtCredentialProbe).toBe(1);
+		expect(marksAtCredentialProbe).toBe(0);
 		expect(setModelSpy).not.toHaveBeenCalled();
 		expect(session.model).toBe(modelBefore);
 		expect(runtime.settings.get("task.agentModelOverrides")).toEqual({
