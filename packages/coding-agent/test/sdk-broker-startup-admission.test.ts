@@ -60,16 +60,6 @@ class TimeoutCapturingSdkClient {
 	}
 }
 
-/**
- * The adapter grants `deadline - Date.now()` when the client reads its timeout, so a
- * millisecond tick between computing and reading the deadline shortens it by one.
- * Pinning the clock makes the granted budget exactly comparable.
- */
-function freezeClock(): Disposable {
-	const now = spyOn(Date, "now").mockReturnValue(Date.now());
-	return { [Symbol.dispose]: () => now.mockRestore() };
-}
-
 test("SDK host startup concurrency scales sublinearly with observable CPU parallelism", () => {
 	expect(sdkHostStartupConcurrency(1)).toBe(1);
 	expect(sdkHostStartupConcurrency(4)).toBe(2);
