@@ -61,10 +61,13 @@ describe("AuthStorage config-override apiKey", () => {
 		expect(authStorage.getGeneration()).toBeGreaterThan(generation);
 		expect(authStorage.getStoredLiteralApiKeyEvidenceGeneration(provider, selector)).toBe(evidence);
 		authStorage.setSessionCredentialAuto(provider, "literal-cache-session");
+		expect(authStorage.getGeneration()).toBeGreaterThan(generation + 1);
 		expect(authStorage.getStoredLiteralApiKeyEvidenceGeneration(provider, selector)).toBe(evidence);
 		authStorage.clearSessionCredentialSelector(provider, "literal-cache-session");
+		expect(authStorage.getGeneration()).toBeGreaterThan(generation + 2);
 		expect(authStorage.getStoredLiteralApiKeyEvidenceGeneration(provider, selector)).toBe(evidence);
 		authStorage.markSessionCredentialUnavailable("literal-cache-session", provider, selector);
+		expect(authStorage.getGeneration()).toBeGreaterThan(generation + 3);
 		expect(authStorage.getStoredLiteralApiKeyEvidenceGeneration(provider, selector)).toBe(evidence);
 		authStorage.setRuntimeApiKey(provider, ["fixture", "override"].join("-"));
 		expect(authStorage.getStoredLiteralApiKeyEvidenceGeneration(provider, selector)).toBeUndefined();
