@@ -1,3 +1,3 @@
 ### Fixed
 
-- Finalize usage-fetch lease statements when closing SQLite auth storage so Windows releases the database file handle.
+- Finalize all outstanding SQLite auth statements on close, including usage-fetch leases, so Windows releases database file handles immediately.

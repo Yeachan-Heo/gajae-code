@@ -8285,6 +8285,6 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		this.#releaseUsageFetchLeaseStmt.finalize();
 		this.#deleteCachePrefixStmt.finalize();
 		this.#deleteExpiredCacheStmt.finalize();
-		this.#db.close();
+		this.#db.close(true);
 	}
 }
