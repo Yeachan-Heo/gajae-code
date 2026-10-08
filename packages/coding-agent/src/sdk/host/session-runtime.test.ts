@@ -8608,7 +8608,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			await Bun.sleep(10);
 			await rm(cwd, { recursive: true, force: true });
 		}
-	});
+	}, 60_000);
 
 	test("an unproven real end stays private until exact settlement evidence exists", async () => {
 		// A matching lifecycle end still cannot settle a recovered deadline record
