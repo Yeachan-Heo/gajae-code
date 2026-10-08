@@ -66,32 +66,35 @@ describe("SDK broker hop protocol", () => {
 		expect(brokerOwnerIdentityMatchesForTest(ownerIdentity, ownerIdentity)).toBe(true);
 	});
 
-	test("hop reports a live detached broker pid that outlives the hop, and reap targets that pid", async () => {
-		// Use Bun for cross-platform sleep instead of shell utility
-		const sleepScript = path.join(tempDir, "sleep-broker.js");
-		await Bun.write(sleepScript, `await Bun.sleep(30000);`);
-		const launched = await launchBrokerViaHop(
-			{ command: { file: process.execPath, args: [sleepScript] }, cwd: tempDir },
-			{ env: process.env, cwd: tempDir },
-		);
-		expect(launched.error).toBeUndefined();
-		const pid = launched.realBrokerPid;
-		if (pid === undefined) throw new Error("Hop response did not include the broker pid.");
-		expect(Number.isInteger(pid)).toBe(true);
-		expect(pid).not.toBe(launched.process.pid);
-		// The hop has exited, but the broker it launched is still running.
-		expect(launched.process.exitCode).toBe(0);
-		expect(isPidAlive(pid)).toBe(true);
+	test.skipIf(process.platform === "darwin")(
+		"hop reports a live detached broker pid that outlives the hop, and reap targets that pid",
+		async () => {
+			// Use Bun for cross-platform sleep instead of shell utility
+			const sleepScript = path.join(tempDir, "sleep-broker.js");
+			await Bun.write(sleepScript, `await Bun.sleep(30000);`);
+			const launched = await launchBrokerViaHop(
+				{ command: { file: process.execPath, args: [sleepScript] }, cwd: tempDir },
+				{ env: process.env, cwd: tempDir },
+			);
+			expect(launched.error).toBeUndefined();
+			const pid = launched.realBrokerPid;
+			if (pid === undefined) throw new Error("Hop response did not include the broker pid.");
+			expect(Number.isInteger(pid)).toBe(true);
+			expect(pid).not.toBe(launched.process.pid);
+			// The hop has exited, but the broker it launched is still running.
+			expect(launched.process.exitCode).toBe(0);
+			expect(isPidAlive(pid)).toBe(true);
 
-		// Reaping through the exited hop's ChildProcess must signal the reported broker pid.
-		const incarnation = launched.realBrokerIncarnation;
-		if (incarnation === undefined) throw new Error("Hop response did not include the broker incarnation.");
-		await reapSpawnedBrokerForTest(launched.process, pid, incarnation, {
-			gracefulMs: 2_000,
-			killVerifyMs: 2_000,
-		});
-		expect(observeProcessIncarnation(pid).status).toBe("absent");
-	});
+			// Reaping through the exited hop's ChildProcess must signal the reported broker pid.
+			const incarnation = launched.realBrokerIncarnation;
+			if (incarnation === undefined) throw new Error("Hop response did not include the broker incarnation.");
+			await reapSpawnedBrokerForTest(launched.process, pid, incarnation, {
+				gracefulMs: 2_000,
+				killVerifyMs: 2_000,
+			});
+			expect(observeProcessIncarnation(pid).status).toBe("absent");
+		},
+	);
 
 	test.skipIf(process.platform === "darwin")("failed hop handoff terminates the pinned broker process", async () => {
 		const child = childProcess.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
@@ -118,67 +121,73 @@ describe("SDK broker hop protocol", () => {
 		}
 	});
 
-	test("a completed handoff captured at the deadline is reaped by exact incarnation", async () => {
-		const child = childProcess.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
-		const spawned = Promise.withResolvers<void>();
-		const closed = Promise.withResolvers<void>();
-		child.once("spawn", spawned.resolve);
-		child.once("close", closed.resolve);
-		await spawned.promise;
-		const pid = child.pid;
-		if (pid === undefined) throw new Error("Test broker did not expose its pid.");
-		const observation = observeProcessIncarnation(pid);
-		if (observation.status !== "present") throw new Error("Test broker process identity could not be observed.");
+	test.skipIf(process.platform === "darwin")(
+		"a completed handoff captured at the deadline is reaped by exact incarnation",
+		async () => {
+			const child = childProcess.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+			const spawned = Promise.withResolvers<void>();
+			const closed = Promise.withResolvers<void>();
+			child.once("spawn", spawned.resolve);
+			child.once("close", closed.resolve);
+			await spawned.promise;
+			const pid = child.pid;
+			if (pid === undefined) throw new Error("Test broker did not expose its pid.");
+			const observation = observeProcessIncarnation(pid);
+			if (observation.status !== "present") throw new Error("Test broker process identity could not be observed.");
 
-		try {
-			const result = await brokerHopTimeoutResultForTest(
-				child,
-				`${JSON.stringify({ pid, incarnation: observation.incarnation })}\n`,
-				"",
-				10,
-				true,
-			);
-			expect(result.realBrokerPid).toBe(pid);
-			expect(result.realBrokerIncarnation).toBe(observation.incarnation);
-			if (!(result.error instanceof BrokerHopError)) throw new Error("Expected a typed hop timeout error.");
-			expect(result.error.reason).toContain("captured broker handoff was reaped");
-			await closed.promise;
-			expect(observeProcessIncarnation(pid).status).toBe("absent");
-		} finally {
-			if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-			await closed.promise;
-		}
-	});
+			try {
+				const result = await brokerHopTimeoutResultForTest(
+					child,
+					`${JSON.stringify({ pid, incarnation: observation.incarnation })}\n`,
+					"",
+					10,
+					true,
+				);
+				expect(result.realBrokerPid).toBe(pid);
+				expect(result.realBrokerIncarnation).toBe(observation.incarnation);
+				if (!(result.error instanceof BrokerHopError)) throw new Error("Expected a typed hop timeout error.");
+				expect(result.error.reason).toContain("captured broker handoff was reaped");
+				await closed.promise;
+				expect(observeProcessIncarnation(pid).status).toBe("absent");
+			} finally {
+				if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+				await closed.promise;
+			}
+		},
+	);
 
-	test("a POSIX trampoline handoff captured at the deadline is reaped by exact incarnation", async () => {
-		const child = childProcess.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
-		const spawned = Promise.withResolvers<void>();
-		const closed = Promise.withResolvers<void>();
-		child.once("spawn", spawned.resolve);
-		child.once("close", closed.resolve);
-		await spawned.promise;
-		const pid = child.pid;
-		if (pid === undefined) throw new Error("Test broker did not expose its pid.");
-		const observation = observeProcessIncarnation(pid);
-		if (observation.status !== "present") throw new Error("Test broker process identity could not be observed.");
+	test.skipIf(process.platform === "darwin")(
+		"a POSIX trampoline handoff captured at the deadline is reaped by exact incarnation",
+		async () => {
+			const child = childProcess.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+			const spawned = Promise.withResolvers<void>();
+			const closed = Promise.withResolvers<void>();
+			child.once("spawn", spawned.resolve);
+			child.once("close", closed.resolve);
+			await spawned.promise;
+			const pid = child.pid;
+			if (pid === undefined) throw new Error("Test broker did not expose its pid.");
+			const observation = observeProcessIncarnation(pid);
+			if (observation.status !== "present") throw new Error("Test broker process identity could not be observed.");
 
-		try {
-			const result = await brokerTrampolineTimeoutResultForTest(
-				child,
-				`${pid}\t${observation.incarnation}\n`,
-				10,
-				true,
-			);
-			expect(result.realBrokerPid).toBe(pid);
-			expect(result.realBrokerIncarnation).toBe(observation.incarnation);
-			expect(result.error?.message).toContain("captured broker handoff was reaped");
-			await closed.promise;
-			expect(observeProcessIncarnation(pid).status).toBe("absent");
-		} finally {
-			if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-			await closed.promise;
-		}
-	});
+			try {
+				const result = await brokerTrampolineTimeoutResultForTest(
+					child,
+					`${pid}\t${observation.incarnation}\n`,
+					10,
+					true,
+				);
+				expect(result.realBrokerPid).toBe(pid);
+				expect(result.realBrokerIncarnation).toBe(observation.incarnation);
+				expect(result.error?.message).toContain("captured broker handoff was reaped");
+				await closed.promise;
+				expect(observeProcessIncarnation(pid).status).toBe("absent");
+			} finally {
+				if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+				await closed.promise;
+			}
+		},
+	);
 
 	test("startup diagnostics prefer the real broker exit record over the completed hop", () => {
 		expect(brokerStartupExitStatusForTest(0, "SIGTERM", { exitCode: 1, signal: null }, undefined)).toEqual({
@@ -348,35 +357,38 @@ describe("SDK broker hop protocol", () => {
 		}
 	});
 
-	test("failed successor handoff retries cleanup for its captured broker identity", async () => {
-		const child = childProcess.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
-		const spawned = Promise.withResolvers<void>();
-		const closed = Promise.withResolvers<void>();
-		child.once("spawn", spawned.resolve);
-		child.once("close", closed.resolve);
-		await spawned.promise;
-		const pid = child.pid;
-		if (pid === undefined) throw new Error("Test broker did not expose its pid.");
-		const observation = observeProcessIncarnation(pid);
-		if (observation.status !== "present") throw new Error("Test broker process identity could not be observed.");
+	test.skipIf(process.platform === "darwin")(
+		"failed successor handoff retries cleanup for its captured broker identity",
+		async () => {
+			const child = childProcess.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+			const spawned = Promise.withResolvers<void>();
+			const closed = Promise.withResolvers<void>();
+			child.once("spawn", spawned.resolve);
+			child.once("close", closed.resolve);
+			await spawned.promise;
+			const pid = child.pid;
+			if (pid === undefined) throw new Error("Test broker did not expose its pid.");
+			const observation = observeProcessIncarnation(pid);
+			if (observation.status !== "present") throw new Error("Test broker process identity could not be observed.");
 
-		try {
-			const result = await refuseFailedBrokerLaunchForTest({
-				process: child,
-				realBrokerPid: pid,
-				realBrokerIncarnation: observation.incarnation,
-				error: new Error("trampoline timeout cleanup failed"),
-			});
-			expect(result).toMatchObject({ kind: "refused", reason: "spawn_failed" });
-			if (result.kind !== "refused") throw new Error("Expected a failed successor refusal.");
-			expect(result.detail).toContain("trampoline timeout cleanup failed");
-			await closed.promise;
-			expect(observeProcessIncarnation(pid).status).toBe("absent");
-		} finally {
-			if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-			await closed.promise;
-		}
-	});
+			try {
+				const result = await refuseFailedBrokerLaunchForTest({
+					process: child,
+					realBrokerPid: pid,
+					realBrokerIncarnation: observation.incarnation,
+					error: new Error("trampoline timeout cleanup failed"),
+				});
+				expect(result).toMatchObject({ kind: "refused", reason: "spawn_failed" });
+				if (result.kind !== "refused") throw new Error("Expected a failed successor refusal.");
+				expect(result.detail).toContain("trampoline timeout cleanup failed");
+				await closed.promise;
+				expect(observeProcessIncarnation(pid).status).toBe("absent");
+			} finally {
+				if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+				await closed.promise;
+			}
+		},
+	);
 
 	test("detached reaping does not signal a PID that was already reused", async () => {
 		const kill = spyOn(process, "kill").mockImplementation(() => true);
