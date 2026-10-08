@@ -66,6 +66,8 @@ async function createSession(
 		slashCommands: [],
 		enableMCP: false,
 		enableLsp: false,
+		deferOptionalModelRefresh: true,
+		sdkHostModeSupported: false,
 		forkContextSeed: options.forkContextSeed,
 		providerSessionId: options.providerSessionId,
 		providerSessionState: options.providerSessionState,
