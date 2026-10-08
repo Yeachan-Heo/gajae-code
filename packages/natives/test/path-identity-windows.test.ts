@@ -7,6 +7,7 @@ import * as path from "node:path";
 import {
 	applyOwnerOnlyPathSecurity,
 	canonicalExistingDirectoryIdentity,
+	directoryCaseSensitive,
 	exactRemoveDirectoryTree,
 	exactReplacePath,
 	exactReplaceRetained,
@@ -70,7 +71,29 @@ afterEach(async () => {
 	);
 });
 
+describe("directory case sensitivity API", () => {
+	it.skipIf(process.platform === "win32")("returns unknown off Windows", () => {
+		expect(directoryCaseSensitive(os.tmpdir())).toBeNull();
+	});
+});
+
 describe.skipIf(process.platform !== "win32")("Windows native path identity", () => {
+	it("reports the case-sensitivity flag for an ordinary directory", async () => {
+		expect(directoryCaseSensitive(await temporaryDirectory())).toBe(false);
+	});
+
+	it.skipIf(!process.env.GJC_TEST_CASE_SENSITIVE_DIRECTORY)(
+		"reports case-sensitive child names for a configured directory",
+		() => {
+			expect(directoryCaseSensitive(process.env.GJC_TEST_CASE_SENSITIVE_DIRECTORY!)).toBe(true);
+		},
+	);
+
+	it("returns unknown for UNC paths without probing a share", () => {
+		expect(directoryCaseSensitive(String.raw`\\server\share\workspace`)).toBeNull();
+		expect(directoryCaseSensitive(String.raw`\\?\UNC\server\share\workspace`)).toBeNull();
+	});
+
 	it("keeps retained publication refusal structured on Windows", async () => {
 		const root = await temporaryDirectory();
 		let refusal: unknown;

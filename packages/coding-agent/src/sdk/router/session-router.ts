@@ -854,7 +854,7 @@ export class SessionRouter {
 		const capability = current?.capability;
 		if (!attached || !current || !capability)
 			throw new SessionRouterError("pre_send", "Broker session endpoint could not be attached.");
-		const listing = this.#index.listSessions();
+		const listing = this.#index.listSessions(undefined, new Set([sessionId]));
 		const indexedCurrent = listing.warnings.some(warning => warningAffectsSession(warning, sessionId))
 			? undefined
 			: listing.sessions.find(item => item.sessionId === sessionId);
@@ -1103,7 +1103,7 @@ export class SessionRouter {
 		let indexed: IndexedSession | undefined;
 		try {
 			await this.#index.refresh();
-			const listing = this.#index.listSessions();
+			const listing = this.#index.listSessions(undefined, new Set([sessionId]));
 			if (listing.warnings.some(warning => warningAffectsSession(warning, sessionId))) return undefined;
 			indexed = listing.sessions.find(candidate => candidate.sessionId === sessionId);
 		} catch {
@@ -1177,7 +1177,7 @@ export class SessionRouter {
 		try {
 			await this.#index.open();
 			await this.#index.refresh();
-			const listing = this.#index.listSessions();
+			const listing = this.#index.listSessions(undefined, new Set([sessionId]));
 			if (listing.warnings.some(warning => warningAffectsSession(warning, sessionId)))
 				throw new SessionActivationError(
 					"session_not_live",
@@ -1368,7 +1368,7 @@ export class SessionRouter {
 			for (const attached of this.#sessions.values()) this.#reviveTransport(attached);
 			return;
 		}
-		const indexed = this.#index.listSessions();
+		const indexed = this.#index.listSessions(undefined, this.#sessionIds);
 		const live = indexed.sessions.filter(
 			session =>
 				!indexed.warnings.some(warning => warningAffectsSession(warning, session.sessionId)) &&
@@ -1577,7 +1577,7 @@ export class SessionRouter {
 		)
 			return null;
 		await this.#index.refresh();
-		const listing = this.#index.listSessions();
+		const listing = this.#index.listSessions(undefined, new Set([indexed.sessionId]));
 		if (listing.warnings.some(warning => warningAffectsSession(warning, indexed.sessionId))) return null;
 		const current = listing.sessions.find(session => session.sessionId === indexed.sessionId);
 		if (!current || !sameIndexedAuthority(indexed, current)) return null;
@@ -2268,7 +2268,7 @@ export class SessionRouter {
 				try {
 					await this.#index.refresh();
 					const current = this.#index
-						.listSessions()
+						.listSessions(undefined, new Set([attached.sessionId]))
 						.sessions.find(session => session.sessionId === attached.sessionId);
 					if (
 						current?.live &&

@@ -15,6 +15,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { directoryCaseSensitive as nativeDirectoryCaseSensitive } from "@gajae-code/natives";
 import { resolveCanonicalLogsDir } from "./canonical-log-dir";
 import { APP_NAME } from "./cli-metadata";
 import { canonicalEnvKey, type ProjectEnvSnapshot, projectEnvSnapshot } from "./env-file";
@@ -83,21 +84,49 @@ export function pathIdentityKey(inputPath: string): string {
 	return resolvedPath;
 }
 
+type NativeDirectoryCaseSensitivityBindings = {
+	directoryCaseSensitive: typeof nativeDirectoryCaseSensitive;
+};
+
+let nativeDirectoryCaseSensitivityBindings: NativeDirectoryCaseSensitivityBindings | undefined;
+
+function isWindowsNetworkPath(inputPath: string): boolean {
+	const normalizedPath = path.win32.normalize(inputPath);
+	const lowerPath = normalizedPath.toLowerCase();
+	if (lowerPath.startsWith("\\\\?\\unc\\") || lowerPath.startsWith("\\\\.\\unc\\")) return true;
+	return (
+		normalizedPath.startsWith("\\\\") &&
+		!normalizedPath.startsWith("\\\\?\\") &&
+		!normalizedPath.startsWith("\\\\.\\")
+	);
+}
+
+function windowsDirectoryCaseSensitivity(directoryPath: string): boolean | undefined {
+	// The native query deliberately rejects UNC paths. Windows UNC paths use
+	// case-insensitive names by default, so fold them without probing the share.
+	if (isWindowsNetworkPath(directoryPath)) return false;
+	try {
+		nativeDirectoryCaseSensitivityBindings ??=
+			require("@gajae-code/natives") as NativeDirectoryCaseSensitivityBindings;
+		return nativeDirectoryCaseSensitivityBindings.directoryCaseSensitive(directoryPath) ?? undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 /**
  * Return a key for a path whose final file can be created or replaced after
  * registration. On Windows, use the parent directory's stable identity and the
- * final entry name rather than the file's inode. Existing case-insensitive
- * aliases share the directory's recorded entry spelling; case-sensitive
- * entries retain distinct names.
+ * final entry name rather than the file's inode. Case-insensitive directories
+ * fold the name even before the entry exists; case-sensitive and unknown
+ * directories preserve it so distinct paths cannot alias.
  */
 export function stablePathKey(inputPath: string): string {
 	const resolvedPath = path.resolve(inputPath);
 
 	let entryPath = resolvedPath;
-	let entryExists = false;
 	try {
 		fs.lstatSync(entryPath);
-		entryExists = true;
 		// Resolve existing entries before using their name so 8.3 aliases and
 		// symlinks share the canonical entry name without depending on its inode.
 		entryPath = fs.realpathSync(entryPath);
@@ -112,19 +141,14 @@ export function stablePathKey(inputPath: string): string {
 			return resolvedPath;
 		}
 	}
+	const caseSensitiveDirectory = windowsDirectoryCaseSensitivity(parentPath);
+	if (caseSensitiveDirectory === false) entryName = entryName.toLowerCase();
 	try {
 		const parentStats = fs.statSync(parentPath, { bigint: true });
-		if (parentStats.ino === 0n) return resolvedPath;
-		const entries = fs.readdirSync(parentPath);
-		const exactEntry = entries.find(name => name === entryName);
-		if (exactEntry !== undefined) entryName = exactEntry;
-		else if (entryExists) {
-			const caseAliases = entries.filter(name => name.toLowerCase() === entryName.toLowerCase());
-			if (caseAliases.length === 1) entryName = caseAliases[0] ?? entryName;
-		}
-		return JSON.stringify(["win32-path-entry", parentStats.dev.toString(), parentStats.ino.toString(), entryName]);
+		if (parentStats.ino !== 0n)
+			return JSON.stringify(["win32-path-entry", parentStats.dev.toString(), parentStats.ino.toString(), entryName]);
 	} catch {}
-	return resolvedPath;
+	return caseSensitiveDirectory === false ? resolvedPath.toLowerCase() : resolvedPath;
 }
 
 export function normalizePathForComparison(inputPath: string, platform: NodeJS.Platform = process.platform): string {

@@ -19,6 +19,7 @@ import {
 import {
 	BOUNDED_FIRST_OPEN_MAX_LINE_BYTES,
 	BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES,
+	type PreparedNewSession,
 	SessionManager,
 	SessionManagerTestHooks,
 } from "../../src/session/session-manager";
@@ -3666,19 +3667,14 @@ describe("whole-session persistence freshness", () => {
 			`${JSON.stringify({ type: "session", version: 5, id: "rewrite-destination", timestamp: "0", cwd: "/cwd" })}\n`,
 		);
 		const manager = await SessionManager.open(
-			sourceFile,
+			destinationFile,
 			SessionManager.explicitDestination("/sessions"),
 			storage,
 			"copy-retain",
 			"off",
 		);
+		const destinationSnapshot = manager.captureState();
 		try {
-			// Snapshots are authenticated by their issuing manager. Build the
-			// destination snapshot on this manager, then return to the source so the
-			// lifecycle race exercises the real restore path rather than failing at
-			// the fixture boundary.
-			await manager.setSessionFile(destinationFile);
-			const destinationSnapshot = manager.captureState();
 			await manager.setSessionFile(sourceFile);
 			const sourceEntryId = manager.appendCustomEntry("before-lifecycle-switch", { value: 1 });
 			await manager.flush();
@@ -6242,5 +6238,151 @@ describe("descriptor-bound capture and staged fork publication", () => {
 		);
 		const truncated = SessionManager.captureTranscriptStrict("/sessions/truncated.jsonl", storage);
 		expect(truncated).toMatchObject({ kind: "error", reason: "malformed" });
+	});
+
+	it("binds captured artifact publication to the actual session across readiness, commit, and close", async () => {
+		const tempDir = TempDir.createSync("@pi-artifact-publication-lifecycle-");
+		const sessionFile = path.join(tempDir.path(), "source.jsonl");
+		await Bun.write(
+			sessionFile,
+			`${JSON.stringify({ type: "session", version: 5, id: "artifact-source", timestamp: "0", cwd: tempDir.path() })}\n`,
+		);
+		let manager: SessionManager | undefined;
+		let prepared: PreparedNewSession | undefined;
+		let restoreAllocationSpy: (() => void) | undefined;
+		const allocationStarted = Promise.withResolvers<void>();
+		const releaseAllocation = Promise.withResolvers<void>();
+		try {
+			manager = await SessionManager.open(
+				sessionFile,
+				SessionManager.explicitDestination(tempDir.path()),
+				new FileSessionStorage(),
+			);
+			const retainedPublication = manager.captureArtifactPublication();
+			const sourceSessionId = manager.getSessionId();
+			const sourceSessionFile = manager.getSessionFile();
+			expect(sourceSessionFile).toBe(sessionFile);
+
+			prepared = await manager.prepareFork();
+			if (!prepared?.sessionFile) throw new Error("Expected an uncommitted successor session");
+			expect(manager.getSessionId()).toBe(sourceSessionId);
+			expect(manager.getSessionFile()).toBe(sourceSessionFile);
+
+			const readyContent = "source remains writable while successor is ready: 雪🧪\n";
+			const readyId = await retainedPublication(readyContent, "bash-original");
+			expect(readyId).toBeDefined();
+			if (!readyId) throw new Error("Expected source-session artifact publication");
+			const readyPath = path.join(sourceSessionFile!.slice(0, -6), `${readyId}.bash-original.log`);
+			expect(await manager.getArtifactPath(readyId)).toBe(readyPath);
+			expect(await Bun.file(readyPath).bytes()).toEqual(Buffer.from(readyContent, "utf8"));
+			expect(await Bun.file(readyPath).text()).toBe(readyContent);
+
+			await manager.discardPreparedNewSession(prepared);
+			prepared = undefined;
+			const releasedContent = "source remains writable after candidate release\n";
+			const releasedId = await retainedPublication(releasedContent, "bash-original");
+			expect(releasedId).toBeDefined();
+			if (!releasedId) throw new Error("Expected publication after candidate release");
+			expect(
+				await Bun.file(path.join(sourceSessionFile!.slice(0, -6), `${releasedId}.bash-original.log`)).text(),
+			).toBe(releasedContent);
+
+			prepared = await manager.prepareFork();
+			if (!prepared?.sessionFile) throw new Error("Expected a successor session for commit");
+			const successorSessionFile = prepared.sessionFile;
+			const successorArtifactsDir = successorSessionFile.slice(0, -6);
+			const readCandidateInventory = async (): Promise<Map<string, Uint8Array>> => {
+				const names = fs.existsSync(successorArtifactsDir) ? fs.readdirSync(successorArtifactsDir).sort() : [];
+				const inventory = new Map<string, Uint8Array>();
+				for (const name of names) {
+					inventory.set(name, await Bun.file(path.join(successorArtifactsDir, name)).bytes());
+				}
+				return inventory;
+			};
+			const candidateInventoryBefore = await readCandidateInventory();
+			expect([...candidateInventoryBefore.keys()].sort()).toEqual(
+				[
+					`.artifact-id-${readyId}`,
+					`.artifact-id-${releasedId}`,
+					`${readyId}.bash-original.log`,
+					`${releasedId}.bash-original.log`,
+				].sort(),
+			);
+			expect(candidateInventoryBefore.get(`${readyId}.bash-original.log`)).toEqual(
+				Buffer.from(readyContent, "utf8"),
+			);
+			expect(candidateInventoryBefore.get(`${releasedId}.bash-original.log`)).toEqual(
+				Buffer.from(releasedContent, "utf8"),
+			);
+			const sourceArtifacts = manager.getArtifactManager();
+			if (!sourceArtifacts) throw new Error("Expected the actual source artifact manager");
+			const allocatePath = sourceArtifacts.allocatePath.bind(sourceArtifacts);
+			let heldAllocation = true;
+			const allocationSpy = vi.spyOn(sourceArtifacts, "allocatePath").mockImplementation(async toolType => {
+				const allocation = await allocatePath(toolType);
+				if (heldAllocation && toolType === "bash-original") {
+					heldAllocation = false;
+					allocationStarted.resolve();
+					await releaseAllocation.promise;
+				}
+				return allocation;
+			});
+			restoreAllocationSpy = () => allocationSpy.mockRestore();
+			const pendingPublication = retainedPublication("must not cross the commit boundary", "bash-original");
+			await allocationStarted.promise;
+
+			manager.commitPreparedNewSession(prepared);
+			prepared = undefined;
+			expect(manager.getSessionFile()).toBe(successorSessionFile);
+			expect(manager.getSessionId()).not.toBe(sourceSessionId);
+			releaseAllocation.resolve();
+			await expect(pendingPublication).rejects.toThrow(/no longer authorized|changed before/);
+			restoreAllocationSpy();
+			restoreAllocationSpy = undefined;
+
+			const candidateInventoryAfterRejectedPublication = await readCandidateInventory();
+			expect(candidateInventoryAfterRejectedPublication).toEqual(candidateInventoryBefore);
+			for (const name of candidateInventoryBefore.keys()) {
+				expect(await Bun.file(path.join(successorArtifactsDir, name)).text()).not.toContain(
+					"must not cross the commit boundary",
+				);
+			}
+			await expect(retainedPublication("stale retained publisher", "bash-original")).rejects.toThrow(
+				/no longer authorized|changed before/,
+			);
+			expect(await readCandidateInventory()).toEqual(candidateInventoryBefore);
+
+			const successorPublication = manager.captureArtifactPublication();
+			const successorContent = "successor control: 你好🧪\n";
+			const successorId = await successorPublication(successorContent, "bash");
+			expect(successorId).toBeDefined();
+			if (!successorId) throw new Error("Expected successor-session control publication");
+			const successorArtifactPath = path.join(successorArtifactsDir, `${successorId}.bash.log`);
+			expect(await manager.getArtifactPath(successorId)).toBe(successorArtifactPath);
+			expect(await Bun.file(successorArtifactPath).bytes()).toEqual(Buffer.from(successorContent, "utf8"));
+			expect(await Bun.file(successorArtifactPath).text()).toBe(successorContent);
+			const candidateInventoryAfterControl = await readCandidateInventory();
+			expect([...candidateInventoryAfterControl.keys()].sort()).toEqual(
+				[
+					...new Set([
+						...candidateInventoryBefore.keys(),
+						`.artifact-id-${successorId}`,
+						`${successorId}.bash.log`,
+					]),
+				].sort(),
+			);
+
+			const closePublisher = manager.captureArtifactPublication();
+			await manager.close();
+			manager = undefined;
+			await expect(closePublisher("publication after close", "bash")).rejects.toThrow(/closing/);
+			expect(await readCandidateInventory()).toEqual(candidateInventoryAfterControl);
+		} finally {
+			releaseAllocation.resolve();
+			restoreAllocationSpy?.();
+			if (manager && prepared) await manager.discardPreparedNewSession(prepared);
+			await manager?.close();
+			tempDir.removeSync();
+		}
 	});
 });

@@ -1383,6 +1383,24 @@ pub fn canonical_existing_directory_identity(
 	platform::canonical_existing_directory_identity(&path)
 }
 
+/// Returns whether the directory's child names are case-sensitive when the
+/// platform can query that property.
+#[napi]
+pub fn directory_case_sensitive(path: String) -> Option<bool> {
+	if path.contains('\0') {
+		return None;
+	}
+	#[cfg(windows)]
+	{
+		platform::directory_case_sensitive(Path::new(&path))
+	}
+	#[cfg(not(windows))]
+	{
+		let _ = path;
+		None
+	}
+}
+
 #[cfg(unix)]
 pub(crate) fn verify_descriptor_acl_absent(
 	file: &std::fs::File,
@@ -1854,6 +1872,16 @@ pub fn snapshot_directory_tree(path: String) -> NativeDirectoryTreeResult {
 		return NativeDirectoryTreeResult::failure("io_error");
 	}
 	platform::snapshot_directory_tree(Path::new(&path))
+}
+
+/// Capture native root metadata only after proving a directory has no entries.
+/// Enumeration stops at the first non-dot child; no child is opened or read.
+#[napi]
+pub fn snapshot_empty_directory(path: String) -> NativeDirectoryTreeResult {
+	if path.contains('\0') {
+		return NativeDirectoryTreeResult::failure("io_error");
+	}
+	platform::snapshot_empty_directory(Path::new(&path))
 }
 
 /// Remove a directory tree only when a fresh descriptor-relative snapshot
@@ -6859,6 +6887,187 @@ pub(crate) mod platform {
 		}
 	}
 
+	#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+	fn directory_is_empty(fd: libc::c_int) -> Result<bool, &'static str> {
+		let current = c".";
+		// SAFETY: `fd` is live and `.` resolves the same directory with an independent
+		// stream offset for this bounded observation.
+		let duplicate = unsafe {
+			libc::openat(
+				fd,
+				current.as_ptr(),
+				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+			)
+		};
+		if duplicate < 0 {
+			return Err(security_code(&std::io::Error::last_os_error()));
+		}
+		// SAFETY: ownership of the live duplicate transfers to DIR on success.
+		let directory = unsafe { libc::fdopendir(duplicate) };
+		if directory.is_null() {
+			let error = std::io::Error::last_os_error();
+			// SAFETY: fdopendir failed, so this branch still owns the descriptor.
+			unsafe { libc::close(duplicate) };
+			return Err(security_code(&error));
+		}
+		loop {
+			clear_errno();
+			// SAFETY: the DIR pointer is live until its matching closedir call.
+			let entry = unsafe { libc::readdir(directory) };
+			if entry.is_null() {
+				let errno = current_errno();
+				// SAFETY: this branch owns the live descriptor and closes it exactly once.
+				unsafe { libc::closedir(directory) };
+				return if errno == 0 {
+					Ok(true)
+				} else {
+					Err(security_code(&std::io::Error::from_raw_os_error(errno)))
+				};
+			}
+			// SAFETY: readdir returned a live dirent with a NUL-terminated name.
+			let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+			if name != b"." && name != b".." {
+				// Stop immediately: do not retain, stat, open, or descend into this child.
+				// SAFETY: this branch owns the live descriptor and closes it exactly once.
+				unsafe { libc::closedir(directory) };
+				return Ok(false);
+			}
+		}
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+	fn directory_entry_from_fd(fd: libc::c_int) -> Result<NativeDirectoryTreeEntry, &'static str> {
+		// SAFETY: zero initializes this output-only C stat structure before fstat fills
+		// it.
+		let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: the descriptor is live and the initialized output struct is writable.
+		if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+			return Err(security_code(&std::io::Error::last_os_error()));
+		}
+		if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+			return Err("not_directory");
+		}
+		Ok(entry_from_stat(String::new(), &stat, "directory", None))
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+	fn directory_entry_at(
+		parent_fd: libc::c_int,
+		name: &CString,
+	) -> Result<NativeDirectoryTreeEntry, &'static str> {
+		// SAFETY: zero initializes this output-only C stat structure before fstatat
+		// fills it.
+		let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: the parent descriptor and name are live, and the output struct is
+		// writable.
+		if unsafe { libc::fstatat(parent_fd, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) }
+			!= 0
+		{
+			return Err(security_code(&std::io::Error::last_os_error()));
+		}
+		match stat.st_mode & libc::S_IFMT {
+			libc::S_IFLNK => return Err("reparse_point"),
+			libc::S_IFDIR => {},
+			_ => return Err("not_directory"),
+		}
+		Ok(entry_from_stat(String::new(), &stat, "directory", None))
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+	pub(super) fn snapshot_empty_directory(path: &Path) -> NativeDirectoryTreeResult {
+		let (parent_fd, name) = match open_parent_no_follow(path) {
+			Ok(value) => value,
+			Err(result) => {
+				return NativeDirectoryTreeResult::failure(
+					result.code.as_deref().unwrap_or("io_error"),
+				);
+			},
+		};
+		// SAFETY: ownership of the live descriptor transfers to File exactly once.
+		let parent = unsafe { File::from_raw_fd(parent_fd) };
+		let parent_entry = match directory_entry_from_fd(parent.as_raw_fd()) {
+			Ok(entry) => entry,
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		};
+		// SAFETY: the live descriptor, where used, and NUL-terminated path remain
+		// valid.
+		let root_fd = unsafe {
+			libc::openat(
+				parent.as_raw_fd(),
+				name.as_ptr(),
+				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+			)
+		};
+		if root_fd < 0 {
+			return NativeDirectoryTreeResult::failure(
+				security_code(&std::io::Error::last_os_error()),
+			);
+		}
+		// SAFETY: ownership of the live descriptor transfers to File exactly once.
+		let root = unsafe { File::from_raw_fd(root_fd) };
+		let root_entry = match directory_entry_from_fd(root.as_raw_fd()) {
+			Ok(entry) => entry,
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		};
+		match directory_is_empty(root.as_raw_fd()) {
+			Ok(true) => {},
+			Ok(false) => return NativeDirectoryTreeResult::failure("directory_not_empty"),
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		}
+
+		let (final_parent_fd, final_name) = match open_parent_no_follow(path) {
+			Ok(value) => value,
+			Err(result) => {
+				return NativeDirectoryTreeResult::failure(
+					result.code.as_deref().unwrap_or("io_error"),
+				);
+			},
+		};
+		// SAFETY: ownership of the live descriptor transfers to File exactly once.
+		let final_parent = unsafe { File::from_raw_fd(final_parent_fd) };
+		let final_parent_entry = match directory_entry_from_fd(final_parent.as_raw_fd()) {
+			Ok(entry) => entry,
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		};
+		if final_name != name
+			|| final_parent_entry.dev != parent_entry.dev
+			|| final_parent_entry.ino != parent_entry.ino
+		{
+			return NativeDirectoryTreeResult::failure("identity_mismatch");
+		}
+		match directory_is_empty(root.as_raw_fd()) {
+			Ok(true) => {},
+			Ok(false) => return NativeDirectoryTreeResult::failure("directory_not_empty"),
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		}
+		let current_root = match directory_entry_from_fd(root.as_raw_fd()) {
+			Ok(entry) => entry,
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		};
+		let named_root = match directory_entry_at(final_parent.as_raw_fd(), &final_name) {
+			Ok(entry) => entry,
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		};
+		if current_root != root_entry || named_root != root_entry {
+			return NativeDirectoryTreeResult::failure("identity_mismatch");
+		}
+		NativeDirectoryTreeResult::success(NativeDirectoryTreeSnapshot {
+			root_dev: root_entry.dev.clone(),
+			root_ino: root_entry.ino.clone(),
+			entries:  vec![root_entry],
+		})
+	}
+
+	#[cfg(not(any(
+		target_os = "linux",
+		target_os = "android",
+		target_os = "macos",
+		target_os = "ios"
+	)))]
+	pub(super) fn snapshot_empty_directory(_: &Path) -> NativeDirectoryTreeResult {
+		NativeDirectoryTreeResult::failure("tree_authority_unavailable")
+	}
+
 	fn snapshot_fd(
 		fd: libc::c_int,
 		relative: &str,
@@ -10555,6 +10764,12 @@ mod platform {
 	unsafe extern "system" {
 		fn GetModuleHandleW(module_name: *const u16) -> *mut c_void;
 		fn GetProcAddress(module: *mut c_void, procedure_name: *const u8) -> *mut c_void;
+		fn GetFileInformationByHandleEx(
+			file: HANDLE,
+			file_information_class: i32,
+			file_information: *mut c_void,
+			buffer_size: u32,
+		) -> i32;
 	}
 
 	// Test-only fault injection for the exact-replace destination open retry:
@@ -10597,6 +10812,13 @@ mod platform {
 		DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
 
 	const FILE_RENAME_INFORMATION_CLASS: i32 = 10;
+	const FILE_CASE_SENSITIVE_INFO_CLASS: i32 = 23;
+	const FILE_CS_FLAG_CASE_SENSITIVE_DIR: u32 = 0x1;
+
+	#[repr(C)]
+	struct FileCaseSensitiveInfo {
+		flags: u32,
+	}
 
 	#[repr(C)]
 	struct HandleRenameInformation {
@@ -10726,6 +10948,32 @@ mod platform {
 			CloseHandle(handle);
 		}
 		result
+	}
+
+	pub(super) fn directory_case_sensitive(path: &Path) -> Option<bool> {
+		let handle = open_path(path, false, FILE_READ_ATTRIBUTES).ok()?;
+		let result = (|| {
+			let attributes = handle_attributes(handle).ok()?;
+			if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+				return None;
+			}
+
+			let mut information = FileCaseSensitiveInfo { flags: 0 };
+			let succeeded = unsafe {
+				GetFileInformationByHandleEx(
+					handle,
+					FILE_CASE_SENSITIVE_INFO_CLASS,
+					(&mut information as *mut FileCaseSensitiveInfo).cast(),
+					size_of::<FileCaseSensitiveInfo>() as u32,
+				)
+			};
+			if succeeded == 0 {
+				return None;
+			}
+			Some(information.flags & FILE_CS_FLAG_CASE_SENSITIVE_DIR != 0)
+		})();
+		let closed = unsafe { CloseHandle(handle) } != 0;
+		if closed { result } else { None }
 	}
 
 	#[repr(C)]
@@ -13164,6 +13412,70 @@ mod platform {
 		Ok(())
 	}
 
+	fn directory_handle_is_empty(handle: HANDLE) -> Result<bool, &'static str> {
+		let mut restart_scan = 1u8;
+		loop {
+			let mut buffer = vec![0u8; 1024];
+			// SAFETY: zero is a valid initial NT I/O status block and the kernel writes it
+			// only through this exclusive, properly aligned mutable reference.
+			let mut status: IoStatusBlock = unsafe { std::mem::zeroed() };
+			// SAFETY: `handle` remains open, `buffer` is writable for its checked u32
+			// length, and `status` outlives the synchronous NT call. Requesting a single
+			// record bounds enumeration without accumulating directory names.
+			let result = unsafe {
+				NtQueryDirectoryFile(
+					handle,
+					null_mut(),
+					null_mut(),
+					null_mut(),
+					&mut status,
+					buffer.as_mut_ptr().cast(),
+					buffer.len() as u32,
+					FILE_ID_BOTH_DIRECTORY_INFORMATION,
+					1,
+					null_mut(),
+					restart_scan,
+				)
+			};
+			restart_scan = 0;
+			if result == STATUS_NO_MORE_FILES {
+				return Ok(true);
+			}
+			if result < 0 || status.information > buffer.len() {
+				return Err("io_error");
+			}
+			let used = status.information;
+			if used == 0 {
+				return Err("io_error");
+			}
+			let minimum = std::mem::offset_of!(FileIdBothDirectoryInformation, file_name);
+			let name_length_offset =
+				std::mem::offset_of!(FileIdBothDirectoryInformation, file_name_length);
+			if used < minimum {
+				return Err("io_error");
+			}
+			let length_end = name_length_offset
+				.checked_add(size_of::<u32>())
+				.ok_or("io_error")?;
+			let name_length = u32::from_le_bytes(
+				buffer
+					.get(name_length_offset..length_end)
+					.ok_or("io_error")?
+					.try_into()
+					.map_err(|_| "io_error")?,
+			) as usize;
+			if name_length % size_of::<u16>() != 0 || name_length > used - minimum {
+				return Err("io_error");
+			}
+			let name_end = minimum.checked_add(name_length).ok_or("io_error")?;
+			let name = buffer.get(minimum..name_end).ok_or("io_error")?;
+			if name == [b'.', 0] || name == [b'.', 0, b'.', 0] {
+				continue;
+			}
+			return Ok(false);
+		}
+	}
+
 	fn tree_entry_matches(
 		handle: HANDLE,
 		expected: &NativeDirectoryTreeEntry,
@@ -13380,6 +13692,69 @@ mod platform {
 			result?;
 		}
 		Ok(())
+	}
+
+	pub(super) fn snapshot_empty_directory(path: &Path) -> NativeDirectoryTreeResult {
+		let root = match open_exact(path, "directory", FILE_READ_ATTRIBUTES | FILE_READ_DATA) {
+			Ok(root) => root,
+			Err(result) => {
+				return NativeDirectoryTreeResult::failure(
+					result.code.as_deref().unwrap_or("io_error"),
+				);
+			},
+		};
+		let initial_entry = match tree_entry(root.target, String::new(), "directory") {
+			Ok(entry) => entry,
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		};
+		match directory_handle_is_empty(root.target) {
+			Ok(true) => {},
+			Ok(false) => return NativeDirectoryTreeResult::failure("directory_not_empty"),
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		}
+
+		let reopened = match open_exact(path, "directory", FILE_READ_ATTRIBUTES | FILE_READ_DATA) {
+			Ok(reopened) => reopened,
+			Err(result) => {
+				return NativeDirectoryTreeResult::failure(
+					result.code.as_deref().unwrap_or("io_error"),
+				);
+			},
+		};
+		let (Some(parent), Some(reopened_parent)) = (root.parent(), reopened.parent()) else {
+			return NativeDirectoryTreeResult::failure("identity_mismatch");
+		};
+		match handles_same_object_checked(parent, reopened_parent) {
+			Ok(true) => {},
+			Ok(false) => return NativeDirectoryTreeResult::failure("identity_mismatch"),
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		}
+		match handles_same_object_checked(root.target, reopened.target) {
+			Ok(true) => {},
+			Ok(false) => return NativeDirectoryTreeResult::failure("identity_mismatch"),
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		}
+		match directory_handle_is_empty(root.target) {
+			Ok(true) => {},
+			Ok(false) => return NativeDirectoryTreeResult::failure("directory_not_empty"),
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		}
+		let current_entry = match tree_entry(root.target, String::new(), "directory") {
+			Ok(entry) => entry,
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		};
+		let named_entry = match tree_entry(reopened.target, String::new(), "directory") {
+			Ok(entry) => entry,
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		};
+		if current_entry != initial_entry || named_entry != initial_entry {
+			return NativeDirectoryTreeResult::failure("identity_mismatch");
+		}
+		NativeDirectoryTreeResult::success(NativeDirectoryTreeSnapshot {
+			root_dev: initial_entry.dev.clone(),
+			root_ino: initial_entry.ino.clone(),
+			entries:  vec![initial_entry],
+		})
 	}
 
 	pub(super) fn snapshot_directory_tree(path: &Path) -> NativeDirectoryTreeResult {
@@ -13603,6 +13978,9 @@ mod platform {
 		NativeExactUnlinkResult::failure("identity_unavailable")
 	}
 	pub(super) fn snapshot_directory_tree(_: &Path) -> NativeDirectoryTreeResult {
+		NativeDirectoryTreeResult::failure("tree_authority_unavailable")
+	}
+	pub(super) fn snapshot_empty_directory(_: &Path) -> NativeDirectoryTreeResult {
 		NativeDirectoryTreeResult::failure("tree_authority_unavailable")
 	}
 	pub(super) fn exact_remove_directory_tree_with_mode(

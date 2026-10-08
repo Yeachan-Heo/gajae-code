@@ -79,8 +79,7 @@ type ModelProfileActivationSession = Pick<
 		| "resolveModelByLookupAlias"
 		| "authStorage"
 		| "isCredentiallessProvider"
-	> &
-		Partial<Pick<ModelRegistry, "getAvailableForProfileActivation">>;
+	>;
 	getConfiguredModelChainState?: (role: string) => ConfiguredModelChainState | undefined;
 };
 
@@ -109,7 +108,6 @@ export interface PrepareModelProfileActivationOptions {
 			Pick<
 				ModelRegistry,
 				| "getAvailable"
-				| "getAvailableForProfileActivation"
 				| "resolveModelByLookupAlias"
 				| "lookupAliasExists"
 				| "clearCanonicalVariant"
@@ -267,10 +265,8 @@ function concretizeMaterializedAssignmentValues(
 	if (!modelRegistry || !sessionId) return assignments;
 	// Materialized assignments are persisted into `modelRoles` and
 	// `task.agentModelOverrides` and later consumed by profile execution, so they
-	// must resolve against the descriptor-backed profile-activation catalog, not
-	// the broadened general one: otherwise a bare assignment can persist a
-	// bundled model that fresh live profile evidence excludes.
-	const availableModels = modelRegistry.getAvailableForProfileActivation?.() ?? modelRegistry.getAvailable();
+	// resolve against the same catalog profile activation uses.
+	const availableModels = modelRegistry.getAvailable();
 	const authenticatedModels = availableModels.filter(model => {
 		const isCredentiallessProvider = modelRegistry.isCredentiallessProvider?.bind(modelRegistry);
 		const hasUsableAuth = modelRegistry.authStorage?.hasUsableAuth?.bind(modelRegistry.authStorage);
@@ -888,10 +884,7 @@ export async function resolveModelProfileDefaultChain(options: {
 			allRoutable && proxyProvider !== undefined ? [proxyProvider] : [...group],
 		);
 	}
-	const availableModels =
-		options.modelRegistry.getAvailableForProfileActivation?.() ??
-		options.modelRegistry.getAvailable?.() ??
-		options.modelRegistry.getAll();
+	const availableModels = options.modelRegistry.getAvailable?.() ?? options.modelRegistry.getAll();
 	let bindings = resolveProfileBindings(profile);
 	if (alternativeGroups.length > 0)
 		bindings = rewriteBindingsProviders(bindings, authenticatedProviders, alternativeGroups);
@@ -1493,10 +1486,7 @@ export async function prepareModelProfileActivation(
 			);
 		}
 
-		const availableModels =
-			options.modelRegistry.getAvailableForProfileActivation?.() ??
-			options.modelRegistry.getAvailable?.() ??
-			options.modelRegistry.getAll();
+		const availableModels = options.modelRegistry.getAvailable?.() ?? options.modelRegistry.getAll();
 		const roleCatalogModels = options.modelRegistry.getAll();
 		let bindings = resolveProfileBindings(profile);
 		if (alternativeGroups.length > 0) {

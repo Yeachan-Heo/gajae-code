@@ -686,7 +686,7 @@ export declare function __piNativesPublishOutcomeV1(): void
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV0_18_7(): void
+export declare function __piNativesV0_18_8(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.
@@ -1100,6 +1100,12 @@ export interface DiffStreamResult {
  * post-pass dedupes whitespace across change boundaries.
  */
 export declare function diffWords(oldText: string, newText: string): Array<DiffChange>
+
+/**
+ * Returns whether the directory's child names are case-sensitive when the
+ * platform can query that property.
+ */
+export declare function directoryCaseSensitive(path: string): boolean | null
 
 export interface DoctorJournalCreateResult {
   authority?: DoctorJournalAuthority
@@ -2910,6 +2916,12 @@ export declare function sliceWithWidth(line: string, startCol: number, length: n
  * changes are rejected rather than followed.
  */
 export declare function snapshotDirectoryTree(path: string): NativeDirectoryTreeResult
+
+/**
+ * Capture native root metadata only after proving a directory has no entries.
+ * Enumeration stops at the first non-dot child; no child is opened or read.
+ */
+export declare function snapshotEmptyDirectory(path: string): NativeDirectoryTreeResult
 
 /**
  * Unified-diff hunks with jsdiff
