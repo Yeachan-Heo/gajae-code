@@ -39,7 +39,9 @@ export const PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE = "provider_protocol_mismatch
  * the existence gate below. It is always compared case-sensitively.
  */
 export const SERVER_OVERLOADED_PROVIDER_CODE = "server_is_overloaded";
+const MAX_TRANSPORT_CODE_LENGTH = 256;
 const MAX_NATIVE_HTTP2_ERROR_CODE_LENGTH = 64;
+const MAX_RETAINED_TRANSPORT_HEADER_VALUE_LENGTH = 1024;
 
 export type TransportHeaders = Headers | Record<string, string | undefined>;
 
@@ -157,8 +159,8 @@ function finitePositiveInteger(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
 }
 
-function stringValue(value: unknown): string | undefined {
-	return typeof value === "string" ? value : undefined;
+function stringValue(value: unknown, maxLength = MAX_TRANSPORT_CODE_LENGTH): string | undefined {
+	return typeof value === "string" && value.length <= maxLength ? value : undefined;
 }
 
 /** Retry-signal headers retained on transport facts; everything else is dropped. */
@@ -183,7 +185,7 @@ function retainedHeaderRecord(headers: TransportHeaders | undefined): Record<str
 		if (headers instanceof Headers) {
 			for (const name of RETAINED_TRANSPORT_HEADERS) {
 				const value = headers.get(name);
-				if (typeof value !== "string") continue;
+				if (typeof value !== "string" || value.length > MAX_RETAINED_TRANSPORT_HEADER_VALUE_LENGTH) continue;
 				record ??= {};
 				record[name] = value;
 			}
@@ -191,7 +193,13 @@ function retainedHeaderRecord(headers: TransportHeaders | undefined): Record<str
 		}
 		for (const key of Object.keys(headers)) {
 			const descriptor = Object.getOwnPropertyDescriptor(headers, key);
-			if (!descriptor || !("value" in descriptor) || typeof descriptor.value !== "string") continue;
+			if (
+				!descriptor ||
+				!("value" in descriptor) ||
+				typeof descriptor.value !== "string" ||
+				descriptor.value.length > MAX_RETAINED_TRANSPORT_HEADER_VALUE_LENGTH
+			)
+				continue;
 			const name = key.toLowerCase();
 			if (!RETAINED_TRANSPORT_HEADER_SET.has(name)) continue;
 			record ??= {};
@@ -247,7 +255,9 @@ export function transportFailureFacts(
 	const headers = retainedHeaderRecord(rawHeaders);
 	const normalizedCode = providerCode?.toLowerCase();
 	const http2RstCode = finiteNonNegativeInteger(propertyOf(value, "http2RstCode"));
-	const nativeCode = stringValue(propertyOf(value, "nativeErrorCode")) ?? stringValue(propertyOf(value, "code"));
+	const nativeCode =
+		stringValue(propertyOf(value, "nativeErrorCode"), MAX_NATIVE_HTTP2_ERROR_CODE_LENGTH) ??
+		stringValue(propertyOf(value, "code"));
 	const nativeErrorCode =
 		nativeCode && nativeCode.length <= MAX_NATIVE_HTTP2_ERROR_CODE_LENGTH && /^ERR_HTTP2_[A-Z_]+$/.test(nativeCode)
 			? nativeCode

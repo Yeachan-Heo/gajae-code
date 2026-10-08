@@ -2100,21 +2100,60 @@ function losslessDetachedClone<T>(value: T): T {
 						const transportDescriptor = Object.getOwnPropertyDescriptor(descriptor.value, transportKey);
 						if (!transportDescriptor || !("value" in transportDescriptor)) continue;
 						const transportValue = transportDescriptor.value;
-						if (
-							transportKey === "http2RstCode" &&
-							(typeof transportValue !== "number" || !Number.isInteger(transportValue) || transportValue < 0)
-						)
+						if (transportKey === "kind") {
+							if (transportValue === "transport") transport.kind = transportValue;
 							continue;
-						if (
-							transportKey === "nativeErrorCode" &&
-							transportFailureFacts({ nativeErrorCode: transportValue })?.nativeErrorCode !== transportValue
-						)
-							continue;
-						try {
-							transport[transportKey] = structuredClone(transportValue);
-						} catch {
-							// Strip only this non-cloneable transport fact.
 						}
+						if (transportKey === "status") {
+							const status = transportFailureFacts({ status: transportValue })?.status;
+							if (status === transportValue) transport.status = status;
+							continue;
+						}
+						if (transportKey === "http2RstCode") {
+							const code = transportFailureFacts({ http2RstCode: transportValue })?.http2RstCode;
+							if (code === transportValue) transport.http2RstCode = code;
+							continue;
+						}
+						if (transportKey === "nativeErrorCode") {
+							const code = transportFailureFacts({ nativeErrorCode: transportValue })?.nativeErrorCode;
+							if (code === transportValue) transport.nativeErrorCode = code;
+							continue;
+						}
+						if (transportKey === "code") {
+							const code = transportFailureFacts({ code: transportValue })?.providerCode;
+							if (code === transportValue) transport.code = code;
+							continue;
+						}
+						if (transportKey === "providerCode") {
+							const code = transportFailureFacts({ providerCode: transportValue })?.providerCode;
+							if (code === transportValue) transport.providerCode = code;
+							continue;
+						}
+						if (transportKey === "openaiErrorCode") {
+							const code = transportFailureFacts({ openaiErrorCode: transportValue })?.openaiErrorCode;
+							if (code === transportValue) transport.openaiErrorCode = code;
+							continue;
+						}
+						if (transportKey === "anthropicErrorType") {
+							const code = transportFailureFacts({ anthropicErrorType: transportValue })?.anthropicErrorType;
+							if (code === transportValue) transport.anthropicErrorType = code;
+							continue;
+						}
+						if (transportKey === "credentialModelUnavailable") {
+							const credentialModelUnavailable = transportFailureFacts({
+								credentialModelUnavailable: transportValue,
+							})?.credentialModelUnavailable;
+							if (credentialModelUnavailable === true) transport.credentialModelUnavailable = true;
+							continue;
+						}
+						if (transportKey === "retryAfterMs") {
+							if (typeof transportValue === "number" && Number.isFinite(transportValue) && transportValue >= 0) {
+								transport.retryAfterMs = transportValue;
+							}
+							continue;
+						}
+						const headers = transportFailureFacts({ headers: transportValue })?.headers;
+						if (headers) transport.headers = headers;
 					}
 					output[key] = transport;
 				}

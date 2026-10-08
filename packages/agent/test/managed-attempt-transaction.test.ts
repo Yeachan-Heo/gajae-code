@@ -1351,10 +1351,12 @@ describe("managed attempt transaction", () => {
 	});
 
 	it.each([
-		"http2RstCode",
-		"nativeErrorCode",
-		"oversizedNativeErrorCode",
-	] as const)("drops an invalid %s value after a non-cloneable sibling", async damaged => {
+		{ key: "http2RstCode", invalidKind: "map" },
+		{ key: "nativeErrorCode", invalidKind: "map" },
+		{ key: "nativeErrorCode", invalidKind: "string" },
+		{ key: "code", invalidKind: "string" },
+		{ key: "providerCode", invalidKind: "string" },
+	] as const)("drops invalid $key ($invalidKind) after a non-cloneable sibling", async ({ key, invalidKind }) => {
 		const mock = createMockModel();
 		const transportFailure = {
 			kind: "transport" as const,
@@ -1363,14 +1365,14 @@ describe("managed attempt transaction", () => {
 			nativeErrorCode: "ERR_HTTP2_STREAM_ERROR",
 		};
 		let invalidValue: unknown;
-		if (damaged === "oversizedNativeErrorCode") {
+		if (invalidKind === "string") {
 			invalidValue = `ERR_HTTP2_${"A".repeat(64 * 1024)}`;
 		} else {
 			const oversizedMap = new Map<string, string>();
 			for (let index = 0; index < 512; index++) oversizedMap.set(`diagnostic-${index}`, "x".repeat(256));
 			invalidValue = oversizedMap;
 		}
-		Object.defineProperty(transportFailure, damaged === "http2RstCode" ? damaged : "nativeErrorCode", {
+		Object.defineProperty(transportFailure, key, {
 			value: invalidValue,
 			enumerable: true,
 			writable: true,
@@ -1404,8 +1406,8 @@ describe("managed attempt transaction", () => {
 		const retained = message?.role === "assistant" ? message.transportFailure : undefined;
 		const expected = {
 			kind: "transport" as const,
-			...(damaged === "http2RstCode" ? {} : { http2RstCode: 8 }),
-			...(damaged === "http2RstCode" ? { nativeErrorCode: "ERR_HTTP2_STREAM_ERROR" } : {}),
+			...(key === "http2RstCode" ? {} : { http2RstCode: 8 }),
+			...(key === "nativeErrorCode" ? {} : { nativeErrorCode: "ERR_HTTP2_STREAM_ERROR" }),
 		};
 		expect(retained).toEqual(expected);
 		expect(transportFailureFacts(retained)).toEqual(expected);
