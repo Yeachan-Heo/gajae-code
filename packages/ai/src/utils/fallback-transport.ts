@@ -39,6 +39,7 @@ export const PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE = "provider_protocol_mismatch
  * the existence gate below. It is always compared case-sensitively.
  */
 export const SERVER_OVERLOADED_PROVIDER_CODE = "server_is_overloaded";
+const MAX_NATIVE_HTTP2_ERROR_CODE_LENGTH = 64;
 
 export type TransportHeaders = Headers | Record<string, string | undefined>;
 
@@ -247,7 +248,10 @@ export function transportFailureFacts(
 	const normalizedCode = providerCode?.toLowerCase();
 	const http2RstCode = finiteNonNegativeInteger(propertyOf(value, "http2RstCode"));
 	const nativeCode = stringValue(propertyOf(value, "nativeErrorCode")) ?? stringValue(propertyOf(value, "code"));
-	const nativeErrorCode = nativeCode && /^ERR_HTTP2_[A-Z_]+$/.test(nativeCode) ? nativeCode : undefined;
+	const nativeErrorCode =
+		nativeCode && nativeCode.length <= MAX_NATIVE_HTTP2_ERROR_CODE_LENGTH && /^ERR_HTTP2_[A-Z_]+$/.test(nativeCode)
+			? nativeCode
+			: undefined;
 	const requestBytes = finiteNonNegativeInteger(propertyOf(value, "requestBytes"));
 	const firstEventElapsedMs = finiteNonNegativeInteger(propertyOf(value, "firstEventElapsedMs"));
 	const firstEventTimeoutMs = finiteNonNegativeInteger(propertyOf(value, "firstEventTimeoutMs"));

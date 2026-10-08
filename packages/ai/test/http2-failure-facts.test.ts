@@ -12,6 +12,12 @@ describe("HTTP/2 diagnostic facts", () => {
 		expect(JSON.stringify(facts)).not.toContain("private native message");
 	});
 
+	it("drops oversized native codes from diagnostic facts", () => {
+		const facts = transportFailureFacts({ nativeErrorCode: `ERR_HTTP2_${"A".repeat(64 * 1024)}` });
+		expect(facts).toBeUndefined();
+		expect(classifyFallbackTrigger(facts)).toEqual({ class: "other" });
+	});
+
 	it("round-trips reset diagnostics without interpreting them as HTTP status", () => {
 		const facts = transportFailureFacts({ http2RstCode: 8 });
 		expect(facts).toMatchObject({ kind: "transport", http2RstCode: 8 });

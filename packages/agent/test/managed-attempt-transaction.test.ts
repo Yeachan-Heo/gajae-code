@@ -1350,6 +1350,68 @@ describe("managed attempt transaction", () => {
 		expect(fallbackCalls).toBe(0);
 	});
 
+	it.each([
+		"http2RstCode",
+		"nativeErrorCode",
+		"oversizedNativeErrorCode",
+	] as const)("drops an invalid %s value after a non-cloneable sibling", async damaged => {
+		const mock = createMockModel();
+		const transportFailure = {
+			kind: "transport" as const,
+			nonCloneable: () => {},
+			http2RstCode: 8,
+			nativeErrorCode: "ERR_HTTP2_STREAM_ERROR",
+		};
+		let invalidValue: unknown;
+		if (damaged === "oversizedNativeErrorCode") {
+			invalidValue = `ERR_HTTP2_${"A".repeat(64 * 1024)}`;
+		} else {
+			const oversizedMap = new Map<string, string>();
+			for (let index = 0; index < 512; index++) oversizedMap.set(`diagnostic-${index}`, "x".repeat(256));
+			invalidValue = oversizedMap;
+		}
+		Object.defineProperty(transportFailure, damaged === "http2RstCode" ? damaged : "nativeErrorCode", {
+			value: invalidValue,
+			enumerable: true,
+			writable: true,
+			configurable: true,
+		});
+		expect(() => structuredClone(transportFailure)).toThrow();
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				stream.push({
+					type: "error",
+					reason: "error",
+					error: {
+						...assistantMessage(mock.model),
+						stopReason: "error",
+						errorMessage: "Cursor HTTP/2 request aborted before turnEnded",
+						transportFailure,
+					},
+				});
+			});
+			return stream;
+		};
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+		});
+
+		await agent.prompt("run");
+		await agent.waitForIdle();
+		const message = agent.state.messages.findLast(message => message.role === "assistant");
+		const retained = message?.role === "assistant" ? message.transportFailure : undefined;
+		const expected = {
+			kind: "transport" as const,
+			...(damaged === "http2RstCode" ? {} : { http2RstCode: 8 }),
+			...(damaged === "http2RstCode" ? { nativeErrorCode: "ERR_HTTP2_STREAM_ERROR" } : {}),
+		};
+		expect(retained).toEqual(expected);
+		expect(transportFailureFacts(retained)).toEqual(expected);
+		expect(classifyFallbackTrigger(transportFailureFacts(retained))).toEqual({ class: "other" });
+	});
+
 	it("stages a non-cloneable provider failure without masking it as a DataCloneError", async () => {
 		// Regression: a provider error message whose payload is not
 		// structured-cloneable (e.g. a live `Headers` in `transportFailure`)

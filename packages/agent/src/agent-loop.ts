@@ -2099,8 +2099,19 @@ function losslessDetachedClone<T>(value: T): T {
 					] as const) {
 						const transportDescriptor = Object.getOwnPropertyDescriptor(descriptor.value, transportKey);
 						if (!transportDescriptor || !("value" in transportDescriptor)) continue;
+						const transportValue = transportDescriptor.value;
+						if (
+							transportKey === "http2RstCode" &&
+							(typeof transportValue !== "number" || !Number.isInteger(transportValue) || transportValue < 0)
+						)
+							continue;
+						if (
+							transportKey === "nativeErrorCode" &&
+							transportFailureFacts({ nativeErrorCode: transportValue })?.nativeErrorCode !== transportValue
+						)
+							continue;
 						try {
-							transport[transportKey] = structuredClone(transportDescriptor.value);
+							transport[transportKey] = structuredClone(transportValue);
 						} catch {
 							// Strip only this non-cloneable transport fact.
 						}
