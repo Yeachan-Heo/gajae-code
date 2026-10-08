@@ -1,7 +1,7 @@
 ---
 name: ralplan
 description: Consensus planning entrypoint that auto-gates vague ultragoal requests before execution
-argument-hint: "[--interactive] [--deliberate] [--architect openai-code] [--critic openai-code] <task description>"
+argument-hint: "[--interactive] [--deliberate] [--resume|--new-run] [--architect openai-code] [--critic openai-code] <task description>"
 level: 4
 
 source: "forked from upstream ralplan skill and rebranded for GJC"
@@ -19,8 +19,10 @@ Ralplan is the consensus planning workflow. It triggers iterative planning with 
 
 ## Flags
 
-- `--interactive`: Adds draft-review prompts and one-at-a-time reconciliation. When the final receipt resolves `auto_handoff.effectiveTarget` to `off` without `degradationReason: "planning_stuck"`, final approval uses an `ask` workflow gate; a configured automatic admission is handled by step 8.
+- `--interactive`: Adds draft-review prompts and one-at-a-time reconciliation. When the final receipt resolves `auto_handoff.effectiveTarget` to `off` and its `degradationReason` is neither `planning_stuck` nor `planning_admission_pending`, final approval uses an `ask` workflow gate; a configured automatic admission is handled by step 8. Step 8 excludes both degradation reasons from the approval `ask` path.
 - `--deliberate`: Forces high-risk deliberation: pre-mortem plus expanded test planning. It may also auto-enable for explicit auth/security, migration, destructive, incident, compliance/PII, or public-API-breakage risk.
+- `--resume`: Explicitly resumes the active Ralplan run in this session. It retains the run ID, current phase, role-agent identities, review verdicts, and admission history; a supplied task must match the persisted task. If the task is already stored, the flag may be used without positional task text.
+- `--new-run`: Explicitly replaces the active Ralplan state pointer with a fresh run ID. Join or cancel prior role workers before using it; the new run fences their state updates but does not terminate their processes or delete their old artifacts.
 - `--architect openai-code` / `--critic openai-code`: Use OpenAI code for that review pass when available; otherwise note the fallback and use default GJC review.
 - `gjc.ralplan.autoHandoff`: Selects final-plan admission: `off` (default), `ultragoal`, or `autoresearch`. An `autoresearch` target admits `/skill:autoresearch` to continue research from the approved plan rather than implement it; it needs no availability probe. `PLANNING-STUCK` also resolves every target to `off`. Invalid settings reject the final write before any final artifact is persisted. The final receipt's ledger-backed runtime-owned `auto_handoff.effectiveTarget` is authoritative across state loss and run switching.
 - `--write --stage <type> --stage_n <N> --artifact <markdown file path or markdown string>`: Native writer for Planner/Architect/Critic/revision/ADR/final pending-approval markdown under `.gjc/_session-{sessionid}/plans/ralplan/<run-id>/`; do not edit `.gjc/` directly.
@@ -29,6 +31,10 @@ Ralplan is the consensus planning workflow. It triggers iterative planning with 
 
 For corrupt, tampered, unreadable, or stale current-session ralplan state, run `gjc state clear --force --mode ralplan` scoped by `--session-id`, command payload, or `GJC_SESSION_ID`; it clears only ralplan state for that session.
 
+An active run cannot be reseeded implicitly. Use `gjc ralplan --resume` to continue the same task, or `gjc ralplan --new-run "<different task>"` to deliberately create a new run while preserving the previous run's artifacts and ledger. A terminal/inactive run is never silently reused as the next run.
+
+A live, active handoff-created Ralplan state without `run_id` is only an unseeded envelope, not an active run. The first Ralplan invocation may seed it normally and must preserve its incoming handoff lineage. Terminal or inactive state is a fresh-task boundary and does not carry old handoff lineage forward. Use `--new-run` to replace an actual run that already has a `run_id`.
+
 ## Behavior
 
 ## Planning/Execution Boundary
@@ -36,6 +42,7 @@ For corrupt, tampered, unreadable, or stale current-session ralplan state, run `
 Ralplan is planning only. It may inspect context and draft plan/spec/proposal artifacts, but those remain `pending approval` until tagged structured-UI execution approval for the current final artifact, or a valid non-off final receipt's runtime-owned `auto_handoff.effectiveTarget` admits the existing handoff chain. Before either admission, do not mutate product source, run mutation-oriented shell, commit, push, open PRs, invoke execution skills, or delegate implementation.
 
 Explicitly naming `ultragoal` (including `/skill:` and `gjc` forms) selects the desired execution target; it does not replace structured approval for the current final artifact when `auto_handoff.effectiveTarget` is `off`. Never invent a direct approval record or infer execution consent from the skill name.
+If the final receipt has unresolved `planning_admission_pending`, explicitly naming `ultragoal` does not bypass the consensus admission; recover only through an accepted revision opener that creates a newer generation before asking for approval.
 
 Persist planning artifacts and handoffs through the ralplan CLI writer, never direct `.gjc/` edits:
 Direct `write`, `edit`, or `ast_edit` calls against `.gjc/_session-{sessionid}/specs`, `.gjc/_session-{sessionid}/plans`, `.gjc/_session-{sessionid}/state`, or any other `.gjc/` path are forbidden unless an explicit force override is active.
@@ -107,7 +114,7 @@ The consensus workflow:
       - For every confirmed open item, embed the resolved outcome into the final plan under an **## Intent Reconciliation** section so the `pending approval` artifact records each decision; record any item the user explicitly defers as an open confirmation under that same section.
    d. Persist the reconciliation with `gjc ralplan --write --worktree-root <repository_binding.worktreeRoot> --stage post-interview --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT --json`, then return the receipt/path plus a compact status (reconciled-clean / reconciled-with-revision / open-confirmations-pending) instead of pasting the full body.
 7. On reconciliation completion, re-check the review join gate (Critic `OKAY` plus Architect `CLEAR`/`APPROVE` for the same Planner artifact/pass), mark the plan `pending approval` unless execution is already authorized by the resolved handoff admission, then persist the ADR/final plan via `gjc ralplan --write --worktree-root <repository_binding.worktreeRoot> --stage final --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT --json`. Read the successful receipt's `auto_handoff` object; its ledger-backed `effectiveTarget` is runtime-owned and is the only automatic-routing decision; do not directly edit `.gjc/_session-{sessionid}/plans`. Final plan must include ADR (Decision, Drivers, Alternatives considered, Why chosen, Consequences, Follow-ups) and, when present, the **## Intent Reconciliation** section.
-8. **Final admission and approval gate:** Reconciliation must first reach the successful final receipt from step 7. If that receipt has `auto_handoff.degradationReason: "planning_stuck"`, it is terminal: retain the `pending approval` artifact and **never dispatch**, including for an explicitly named execution skill; do not issue an approval `ask`. Otherwise, if its runtime-owned `auto_handoff.effectiveTarget` is `ultragoal`, that valid non-off receipt is explicit operator admission for same-turn execution through that target; proceed to step 9 without an `ask`. If it is `off`, including ordinary `off`, require an accepted tagged structured approval for the current final artifact even if the user already named an execution skill. Unless that current final artifact already has that approval, present the finalized plan via the `ask` tool (regardless of `--interactive`) with `workflowGate: { stage: "ralplan", kind: "approval" }` on the final question so RPC/headless clients receive a `ralplan`/`approval` workflow gate, not a deep-interview question gate. Identify the current final receipt/path in the question. A revised final artifact requires a fresh structured approval; approval of a previous final artifact does not carry over. Use these options:
+8. **Final admission and approval gate:** Reconciliation must first reach the successful final receipt from step 7. If that receipt has `auto_handoff.degradationReason: "planning_stuck"`, it is terminal: retain the `pending approval` artifact and **never dispatch**, including for an explicitly named execution skill; do not issue an approval `ask`. If the receipt has `planning_admission_pending`, do not ask for execution approval or dispatch: return to consensus and recover only through an accepted revision opener that creates a newer generation; terminal opener-cap exhaustion remains `planning_stuck`. Otherwise, if its runtime-owned `auto_handoff.effectiveTarget` is `ultragoal`, that valid non-off receipt is explicit operator admission for same-turn execution through that target; proceed to step 9 without an `ask`. If it is `off`, including ordinary `off`, require an accepted tagged structured approval for the current final artifact even if the user already named an execution skill. Unless that current final artifact already has that approval, present the finalized plan via the `ask` tool (regardless of `--interactive`) with `workflowGate: { stage: "ralplan", kind: "approval" }` on the final question so RPC/headless clients receive a `ralplan`/`approval` workflow gate, not a deep-interview question gate. Identify the current final receipt/path in the question. A revised final artifact requires a fresh structured approval; approval of a previous final artifact does not carry over. Use these options:
    - **Refine further** — re-run the consensus loop / request changes, then return here
    - **Approve execution via ultragoal (Recommended)** — goal-tracked autonomous execution
    - **Stop here** — keep the plan as `pending approval` and make no further changes
@@ -166,11 +173,14 @@ gjc:
 
 - Default: **1** Architect pass and **1** Critic pass per opener iteration.
 - Override via `gjc.ralplan.maxReviewPassesPerLane` (integer **1..10**, registered in the public settings schema) using the workflow-settings precedence above; project overrides user.
-- On overflow: exit code **3** with the **`PLANNING-STUCK`** marker and lane-specific JSON/stderr detail.
+- On lane overflow: exit code **3** with **`RALPLAN-ADMISSION-REJECTED`** and lane/generation-specific JSON/stderr detail. This rejects only that lane admission for the current generation; it does not mark the run terminal or disable auto-handoff. Do not retry the same lane by incrementing `stage_n`. Another eligible lane may still contribute to the current generation, but only an accepted Planner `revision` opener can recover pending admission.
+- Until an accepted revision opener creates a newer generation and emits `planning_admission_recovered`, final receipts are nonterminal but `auto_handoff.effectiveTarget` is `off` with `degradationReason: "planning_admission_pending"`; do not ask the user to bypass the unresolved consensus admission. Terminal `planning_stuck` still takes precedence.
 - `post-interview`, `adr`, and `final` are always allowed.
 - Identical re-writes dedupe without stuck-signaling — including after a crash between artifact write and ledger append: the identical retry repairs the missing ledger row and returns the dedupe receipt.
 - A new `--run-id` starts a fresh budget.
 - A rule-2-justified blocker routes through a Planner `revision` opener (new iteration, fresh lane budget), never a second same-iteration review pass.
+- The ledger records `planning_admission_rejected` and, only after an accepted revision opener creates a newer generation, `planning_admission_recovered` with both generation identities. These are audit events, not terminal stuck markers. Older lane-overflow `planning_stuck` rows are interpreted as recoverable; terminal iteration-cap events and malformed ledgers remain fail-closed.
+- A duplicate artifact write is idempotent only when both `(stage, stage_n)` and content match. Retry uncertain/crash-gap writes with the same identity and bytes; surface a different-content conflict to the orchestrator rather than incrementing `stage_n` blindly.
 - Override example (project `.gjc/config.yml`):
 
 ```yaml

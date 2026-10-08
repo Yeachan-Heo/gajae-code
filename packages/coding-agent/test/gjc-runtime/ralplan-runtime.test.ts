@@ -1,11 +1,12 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, type Mode, type PathLike } from "node:fs";
+import { existsSync, type Mode, type PathLike, type StatOptions } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
 	evaluateRalplanIterationCap,
 	evaluateRalplanReviewLaneBudget,
+	PLANNING_ADMISSION_REJECTED_MARKER,
 	PLANNING_STUCK_MARKER,
 	RALPLAN_DEFAULT_MAX_ITERATIONS,
 	RALPLAN_DEFAULT_MAX_REVIEW_PASSES_PER_LANE,
@@ -25,6 +26,7 @@ import {
 	sessionPlansDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
+import { writeWorkflowEnvelopeAtomic } from "@gajae-code/coding-agent/gjc-runtime/state-writer";
 import { readVisibleSkillActiveState } from "@gajae-code/coding-agent/skill-state/active-state";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { YAML } from "bun";
@@ -96,6 +98,17 @@ async function writeRalplanArtifact(
 		],
 		root,
 	);
+}
+
+async function startNewRalplanRun(root: string, task: string): Promise<string> {
+	const result = await runNativeRalplanCommand(["--new-run", "--json", task], root);
+	if (result.status !== 0)
+		throw new Error(`Could not start a new ralplan run: ${result.stderr ?? result.stdout ?? "unknown error"}`);
+	const receipt = JSON.parse(result.stdout ?? "{}") as { run_id?: unknown };
+	if (typeof receipt.run_id !== "string" || receipt.run_id.length === 0) {
+		throw new Error("New ralplan run did not return a run_id.");
+	}
+	return receipt.run_id;
 }
 
 async function writeRalplanLaneVerdictArtifact(
@@ -176,25 +189,335 @@ describe("native gjc ralplan runtime — consensus handoff", () => {
 		expect(await fs.readFile(statePath, "utf-8")).toBe("{broken json");
 	});
 
-	it("reuses a valid active run id during consensus handoff seeding", async () => {
+	it("requires explicit resume or new-run when a run is active and resume preserves continuity", async () => {
 		const root = await tempDir();
+		const seeded = await runNativeRalplanCommand(["--json", "continue existing"], root);
+		expect(seeded.status).toBe(0);
 		const statePath = ralplanStatePath(root);
-		await fs.mkdir(path.dirname(statePath), { recursive: true });
+		const before = JSON.parse(await fs.readFile(statePath, "utf-8")) as Record<string, unknown>;
+		const runId = before.run_id as string;
 		await fs.writeFile(
 			statePath,
-			JSON.stringify({ skill: "ralplan", active: true, current_phase: "planner", run_id: "existing-run" }),
+			JSON.stringify({
+				...before,
+				current_phase: "revision",
+				planner_subagent_id: "planner-resume-1",
+				planner_resumable: true,
+				architect_id: "architect-resume-1",
+				critic_id: "critic-resume-1",
+				last_review_verdict: "OKAY",
+				auto_handoff: { configuredTarget: "ultragoal", effectiveTarget: "ultragoal" },
+				planning_stuck: { marker: "PLANNING-STUCK", reason: "preserved historical diagnostic" },
+			}),
 			"utf-8",
 		);
 
-		const result = await runNativeRalplanCommand(["--json", "continue existing"], root);
+		const defaultSeed = await runNativeRalplanCommand(["--json", "different task"], root);
+		expect(defaultSeed.status).toBe(2);
+		expect(defaultSeed.stderr).toContain("use --resume to continue it or --new-run");
+
+		const result = await runNativeRalplanCommand(["--resume", "--json"], root);
 
 		expect(result.status).toBe(0);
-		const payload = JSON.parse(result.stdout ?? "{}") as { run_id: string };
-		expect(payload.run_id).toBe("existing-run");
-		const state = JSON.parse(await fs.readFile(statePath, "utf-8")) as { run_id: string; task: string };
-		expect(state.run_id).toBe("existing-run");
+		const payload = JSON.parse(result.stdout ?? "{}") as { run_id: string; mode: string };
+		expect(payload.run_id).toBe(runId);
+		const state = JSON.parse(await fs.readFile(statePath, "utf-8")) as Record<string, unknown>;
+		expect(state.run_id).toBe(runId);
 		expect(state.task).toBe("continue existing");
+		expect(state.current_phase).toBe("revision");
+		expect(state.planner_subagent_id).toBe("planner-resume-1");
+		expect(state.architect_id).toBe("architect-resume-1");
+		expect(state.critic_id).toBe("critic-resume-1");
+		expect(state.last_review_verdict).toBe("OKAY");
+		expect(state.auto_handoff).toEqual({ configuredTarget: "ultragoal", effectiveTarget: "ultragoal" });
+		expect(state.planning_stuck).toEqual({ marker: "PLANNING-STUCK", reason: "preserved historical diagnostic" });
+		expect(payload.mode).toBe("short");
+
+		const mismatch = await runNativeRalplanCommand(["--resume", "different task"], root);
+		expect(mismatch.status).toBe(2);
+		expect(mismatch.stderr).toContain("--resume task does not match");
+		const originalArtifact = await writeRalplanArtifact(root, runId, "revision", 2, "# stale terminal-owner write");
+		expect(originalArtifact.status).toBe(0);
+
+		const fresh = await runNativeRalplanCommand(["--new-run", "--json", "different task"], root);
+		expect(fresh.status).toBe(0);
+		const freshPayload = JSON.parse(fresh.stdout ?? "{}") as { run_id: string };
+		expect(freshPayload.run_id).not.toBe(runId);
+		const freshState = JSON.parse(await fs.readFile(statePath, "utf-8")) as Record<string, unknown>;
+		expect(freshState.current_phase).toBe("planner");
+		expect(freshState.planner_subagent_id).toBeUndefined();
+		expect(freshState.architect_id).toBeUndefined();
+		expect(freshState.critic_id).toBeUndefined();
+		expect(freshState.last_review_verdict).toBeUndefined();
+		expect(freshState.auto_handoff).toBeUndefined();
+		expect(freshState.planning_stuck).toBeUndefined();
+		const staleWrite = await writeRalplanArtifact(root, runId, "revision", 3, "# stale prior run write");
+		expect(staleWrite.status).toBe(2);
+		expect(staleWrite.stderr).toContain("no longer the active session owner");
+
+		await fs.writeFile(
+			statePath,
+			JSON.stringify({ ...freshState, active: false, current_phase: "complete" }),
+			"utf-8",
+		);
+		const terminalStateBeforeStaleWrite = await fs.readFile(statePath, "utf-8");
+		const staleAfterTerminal = await writeRalplanArtifact(root, runId, "revision", 2, "# stale terminal-owner write");
+		expect(staleAfterTerminal.status).toBe(2);
+		expect(staleAfterTerminal.stderr).toContain("no longer the active session owner");
+		expect(await fs.readFile(statePath, "utf-8")).toBe(terminalStateBeforeStaleWrite);
+		expect(await fs.readFile(ralplanPlanPath(root, runId, "stage-02-revision.md"), "utf-8")).toBe(
+			"# stale terminal-owner write\n",
+		);
+
+		const afterTerminal = await runNativeRalplanCommand(["--json", "after terminal"], root);
+		expect(afterTerminal.status).toBe(0);
+		const afterTerminalPayload = JSON.parse(afterTerminal.stdout ?? "{}") as { run_id: string };
+		expect(afterTerminalPayload.run_id).not.toBe(freshPayload.run_id);
 	});
+
+	it("resumes an active final phase without changing its run identity or phase", async () => {
+		const root = await tempDir();
+		const runId = await startNewRalplanRun(root, "resume final publication");
+		const statePath = ralplanStatePath(root);
+		const seeded = JSON.parse(await fs.readFile(statePath, "utf-8")) as Record<string, unknown>;
+		await writeWorkflowEnvelopeAtomic(statePath, { ...seeded, current_phase: "final" }, { cwd: root });
+
+		const result = await runNativeRalplanCommand(["--resume", "--json"], root);
+
+		expect(result.status).toBe(0);
+		expect(JSON.parse(result.stdout ?? "{}")).toMatchObject({ run_id: runId });
+		expect(JSON.parse(await fs.readFile(statePath, "utf-8"))).toMatchObject({
+			run_id: runId,
+			active: true,
+			current_phase: "final",
+		});
+	});
+
+	it("rejects resuming an inactive terminal final phase", async () => {
+		const root = await tempDir();
+		const runId = await startNewRalplanRun(root, "terminal final cannot resume");
+		const statePath = ralplanStatePath(root);
+		const seeded = JSON.parse(await fs.readFile(statePath, "utf-8")) as Record<string, unknown>;
+		await writeWorkflowEnvelopeAtomic(statePath, { ...seeded, active: false, current_phase: "final" }, { cwd: root });
+
+		const result = await runNativeRalplanCommand(["--resume", "--json"], root);
+
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("--resume requires an active ralplan run");
+		expect(JSON.parse(await fs.readFile(statePath, "utf-8"))).toMatchObject({
+			run_id: runId,
+			active: false,
+			current_phase: "final",
+		});
+	});
+
+	it("rejects a stale final without replacing the newer active run or its admission", async () => {
+		const root = await tempDir();
+		const oldRunId = await startNewRalplanRun(root, "old planning task");
+		const newRunId = await startNewRalplanRun(root, "new planning task");
+		const statePath = ralplanStatePath(root);
+		const fresh = JSON.parse(await fs.readFile(statePath, "utf-8"));
+		await writeWorkflowEnvelopeAtomic(
+			statePath,
+			{
+				...fresh,
+				handoff_from: "deep-interview",
+				handoff_at: "2026-10-07T00:00:00.000Z",
+				auto_handoff: { configuredTarget: "ultragoal", effectiveTarget: "off" },
+			},
+			{ cwd: root },
+		);
+		const stateBefore = await fs.readFile(statePath, "utf-8");
+
+		const result = await writeRalplanArtifact(root, oldRunId, "final", 1, "# stale final");
+
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("no longer the active session owner");
+		expect(await fs.readFile(statePath, "utf-8")).toBe(stateBefore);
+		expect(JSON.parse(stateBefore).run_id).toBe(newRunId);
+		expect(existsSync(ralplanPlanPath(root, oldRunId, "stage-01-final.md"))).toBe(false);
+	}, 60_000);
+
+	it("rejects a stale final paused after owner validation when a newer run becomes terminal", async () => {
+		const root = await tempDir();
+		const oldRunId = await startNewRalplanRun(root, "old planning task");
+		const statePath = ralplanStatePath(root);
+		const oldIndexPath = ralplanPlanPath(root, oldRunId, "index.jsonl");
+		const ownerCheckReached = Promise.withResolvers<void>();
+		const resumeOldWriter = Promise.withResolvers<void>();
+		let paused = false;
+		const originalLstat = fs.lstat.bind(fs);
+		const lstatImplementation = (async (target: PathLike, options?: StatOptions) => {
+			if (!paused && path.resolve(String(target)) === path.resolve(oldIndexPath)) {
+				paused = true;
+				ownerCheckReached.resolve();
+				await resumeOldWriter.promise;
+			}
+			return await originalLstat(target, options);
+		}) as typeof fs.lstat;
+		const lstatSpy = spyOn(fs, "lstat").mockImplementation(lstatImplementation);
+		const write = writeRalplanArtifact(root, oldRunId, "final", 1, "# stale final");
+		try {
+			// The per-run writer has passed its early owner check but has not reached the
+			// final-publication state mutation yet.
+			await ownerCheckReached.promise;
+			const newRunId = await startNewRalplanRun(root, "new planning task");
+			const newerState = JSON.parse(await fs.readFile(statePath, "utf-8")) as Record<string, unknown>;
+			const newerAdmission = {
+				configuredTarget: "ultragoal",
+				effectiveTarget: "off",
+				degradationReason: "planning_admission_pending",
+			};
+			await writeWorkflowEnvelopeAtomic(
+				statePath,
+				{ ...newerState, active: false, current_phase: "complete", auto_handoff: newerAdmission },
+				{ cwd: root },
+			);
+			const terminalOwnerState = await fs.readFile(statePath, "utf-8");
+
+			resumeOldWriter.resolve();
+			const result = await write;
+
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("no longer the active session owner");
+			expect(await fs.readFile(statePath, "utf-8")).toBe(terminalOwnerState);
+			expect(JSON.parse(terminalOwnerState)).toMatchObject({
+				run_id: newRunId,
+				active: false,
+				current_phase: "complete",
+				auto_handoff: newerAdmission,
+			});
+			expect(existsSync(ralplanPlanPath(root, oldRunId, "stage-01-final.md"))).toBe(false);
+			expect(existsSync(ralplanPlanPath(root, oldRunId, "pending-approval.md"))).toBe(false);
+			expect(existsSync(oldIndexPath)).toBe(false);
+		} finally {
+			resumeOldWriter.resolve();
+			await write;
+			lstatSpy.mockRestore();
+		}
+	}, 60_000);
+
+	it("allows a first final publication when an incoming planning handoff has no Ralplan owner yet", async () => {
+		const root = await tempDir();
+		const statePath = ralplanStatePath(root);
+		const seeded = await runNativeRalplanCommand(["--json", "incoming handoff task"], root);
+		expect(seeded.status).toBe(0);
+		const incoming = JSON.parse(await fs.readFile(statePath, "utf-8")) as Record<string, unknown>;
+		delete incoming.run_id;
+		const handoffAt = "2026-10-07T00:00:00.000Z";
+		await writeWorkflowEnvelopeAtomic(
+			statePath,
+			{
+				...incoming,
+				active: false,
+				current_phase: "handoff",
+				handoff_from: "deep-interview",
+				handoff_at: handoffAt,
+				upstream_handoff_at: handoffAt,
+			},
+			{ cwd: root },
+		);
+
+		const runId = "handoff-final-run";
+		const result = await writeRalplanArtifact(root, runId, "final", 1, "# first final after handoff");
+
+		expect(result.status).toBe(0);
+		expect(JSON.parse(await fs.readFile(statePath, "utf-8"))).toMatchObject({
+			run_id: runId,
+			active: true,
+			current_phase: "final",
+			handoff_from: "deep-interview",
+			handoff_at: handoffAt,
+			upstream_handoff_at: handoffAt,
+		});
+		expect(await fs.readFile(ralplanPlanPath(root, runId, "stage-01-final.md"), "utf-8")).toBe(
+			"# first final after handoff\n",
+		);
+	}, 60_000);
+
+	it("fences fresh role metadata and verdicts when a new run starts during artifact publication", async () => {
+		const root = await tempDir();
+		const oldRunId = await startNewRalplanRun(root, "old planning task");
+		expect((await writeRalplanArtifact(root, oldRunId, "planner", 1, "# old plan")).status).toBe(0);
+		const oldArtifactPath = ralplanPlanPath(root, oldRunId, "stage-02-critic.md");
+		const publicationReached = Promise.withResolvers<void>();
+		const releasePublication = Promise.withResolvers<void>();
+		const originalRename = fs.rename;
+		const renameSpy = spyOn(fs, "rename").mockImplementation(async (oldPath, newPath) => {
+			if (path.resolve(String(newPath)) === oldArtifactPath) {
+				publicationReached.resolve();
+				await releasePublication.promise;
+			}
+			return await originalRename(oldPath, newPath);
+		});
+		const write = runNativeRalplanCommand(
+			[
+				"--write",
+				"--run-id",
+				oldRunId,
+				"--stage",
+				"critic",
+				"--stage_n",
+				"2",
+				"--artifact",
+				"# old critique",
+				"--critic-id",
+				"0-OldCritic",
+				"--critic-resumable",
+				"true",
+				"--lane-verdict",
+				"OKAY",
+				"--json",
+			],
+			root,
+		);
+		try {
+			await publicationReached.promise;
+			const newRunId = await startNewRalplanRun(root, "new planning task");
+			const statePath = ralplanStatePath(root);
+			const fresh = JSON.parse(await fs.readFile(statePath, "utf-8"));
+			await writeWorkflowEnvelopeAtomic(
+				statePath,
+				{
+					...fresh,
+					critic_id: "0-NewCritic",
+					last_review_verdict: "WATCH",
+					last_review_verdict_lane: "architect",
+					last_review_verdict_stage_n: 1,
+				},
+				{ cwd: root },
+			);
+			const readRalplanHudEntry = async () => {
+				const snapshot = JSON.parse(await fs.readFile(activeSnapshotPath(root, TEST_SESSION_ID), "utf-8")) as {
+					active_skills?: Array<{
+						skill: string;
+						phase?: string;
+						hud?: { chips?: Array<{ label: string; value?: string }> };
+					}>;
+				};
+				return snapshot.active_skills?.find(entry => entry.skill === "ralplan");
+			};
+			const newRunHud = await readRalplanHudEntry();
+			expect(newRunHud?.phase).toBe("planner");
+			const stateBefore = await fs.readFile(statePath, "utf-8");
+			releasePublication.resolve();
+			const result = await write;
+
+			expect(result.status).toBe(0);
+			expect(JSON.parse(stateBefore).run_id).toBe(newRunId);
+			expect(await fs.readFile(statePath, "utf-8")).toBe(stateBefore);
+			expect(JSON.parse(result.stdout ?? "{}").critic_state).toBeUndefined();
+			expect(JSON.parse(result.stdout ?? "{}").lane_verdict).toBeUndefined();
+			expect(await fs.readFile(oldArtifactPath, "utf-8")).toBe("# old critique\n");
+			const hudAfterStalePublication = await readRalplanHudEntry();
+			expect(hudAfterStalePublication).toEqual(newRunHud);
+			expect(hudAfterStalePublication?.phase).toBe("planner");
+		} finally {
+			releasePublication.resolve();
+			await write;
+			renameSpy.mockRestore();
+		}
+	}, 60_000);
 
 	it("--architect openai-code seeds the kind into state", async () => {
 		const root = await tempDir();
@@ -370,7 +693,8 @@ describe("native gjc ralplan runtime — --write artifact path", () => {
 		);
 		expect(seed.status).toBe(0);
 		const seedReceipt = JSON.parse(seed.stdout ?? "{}") as { session_id: string; run_id: string };
-		expect(seedReceipt).toMatchObject({ session_id: ownerSessionId, run_id: ownerSessionId });
+		expect(seedReceipt.session_id).toBe(ownerSessionId);
+		expect(seedReceipt.run_id).not.toBe(ownerSessionId);
 
 		const previousSessionId = process.env.GJC_SESSION_ID;
 		process.env.GJC_SESSION_ID = childSessionId;
@@ -1072,14 +1396,12 @@ describe("native gjc ralplan runtime — duplicate --write guard", () => {
 		expect(indexLines.length).toBe(2);
 	});
 
-	it("collapses concurrent identical writes to a single index.jsonl row (#660 TOCTOU)", async () => {
+	it("collapses concurrent identical writes to a single index.jsonl row (#660)", async () => {
 		const root = await tempDir();
 		const args = ["--write", "--stage", "planner", "--stage_n", "1", "--artifact", "# Plan", "--run-id", "race-run"];
 
-		// The command-level dedup (findExistingStageArtifact) and the ledger append
-		// are not under one lock, so racing identical writes can both observe an
-		// empty index and both append. The ledger writer serializes the append, so
-		// exactly one row survives regardless of the race.
+		// A per-run admission lock serializes the dedupe snapshot through publication;
+		// appendJsonlIdempotent remains the ledger's own idempotency boundary.
 		const results = await Promise.all(Array.from({ length: 6 }, () => runNativeRalplanCommand([...args], root)));
 		for (const result of results) {
 			expect(result.status).toBe(0);
@@ -1092,7 +1414,7 @@ describe("native gjc ralplan runtime — duplicate --write guard", () => {
 		expect(indexLines.length).toBe(1);
 		expect(JSON.parse(indexLines[0]).stage).toBe("planner");
 	});
-	it("uses one pre-persist ledger snapshot without claiming cross-process exclusivity", async () => {
+	it("uses one ledger snapshot inside the run admission critical section", async () => {
 		const root = await tempDir();
 		const runId = "sequential-snapshot";
 		const indexPath = path.join(ralplanRunDir(root, runId), "index.jsonl");
@@ -1106,14 +1428,37 @@ describe("native gjc ralplan runtime — duplicate --write guard", () => {
 		}) as typeof fs.lstat;
 		const readSpy = spyOn(fs, "lstat").mockImplementation(lstatImplementation);
 		try {
-			// One invocation only: the documented sequence is intentionally not a
-			// cross-process admission claim, lock, or CAS test.
+			// One invocation still uses a single immutable snapshot while its run lock is held.
 			const result = await writeRalplanArtifact(root, runId, "planner", 1, "# plan");
 			expect(result.status).toBe(0);
 		} finally {
 			readSpy.mockRestore();
 		}
 		expect(prePersistLedgerReads).toBe(1);
+	});
+
+	it("serializes distinct review-lane passes against the configured budget", async () => {
+		const root = await tempDir();
+		const runId = "concurrent-review-budget";
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { maxIterations: 5, maxReviewPassesPerLane: 1 } } }, null, 2),
+			"utf-8",
+		);
+		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# plan")).status).toBe(0);
+		const results = await Promise.all([
+			writeRalplanArtifact(root, runId, "architect", 2, "# architect pass 2"),
+			writeRalplanArtifact(root, runId, "architect", 3, "# architect pass 3"),
+		]);
+		expect(results.map(result => result.status).sort()).toEqual([0, 3]);
+		const indexText = await fs.readFile(path.join(ralplanRunDir(root, runId), "index.jsonl"), "utf-8");
+		const architectRows = indexText
+			.split(/\r?\n/)
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as { stage?: string })
+			.filter(row => row.stage === "architect");
+		expect(architectRows).toHaveLength(1);
 	});
 	it("compacts oversized ralplan ledgers while retaining the current final receipt", async () => {
 		const root = await tempDir();
@@ -1707,7 +2052,7 @@ describe("native gjc ralplan runtime — post-clear re-activation (#644)", () =>
 		return JSON.parse(raw);
 	};
 
-	it("re-asserts active:true and resets phase out of terminal lock when a new run_id is written after a clear", async () => {
+	it("requires an explicit new-run seed before writing after a clear", async () => {
 		const root = await tempDir();
 		await runNativeRalplanCommand(["--deliberate", "task"], root);
 		const statePath = ralplanStatePath(root);
@@ -1727,15 +2072,24 @@ describe("native gjc ralplan runtime — post-clear re-activation (#644)", () =>
 			"utf-8",
 		);
 
-		// A subsequent --write with a NEW run_id starts a fresh run and must re-arm the skill.
-		const result = await runNativeRalplanCommand(
+		// A delayed artifact writer cannot replace the terminal owner by inventing a new run ID.
+		const staleWrite = await runNativeRalplanCommand(
 			["--write", "--stage", "planner", "--stage_n", "1", "--artifact", "# Plan", "--run-id", "new-run-after-clear"],
+			root,
+		);
+		expect(staleWrite.status).toBe(2);
+		expect(staleWrite.stderr).toContain("retains session ownership");
+
+		// An explicit seed establishes the new owner before its artifact writer runs.
+		const runId = await startNewRalplanRun(root, "fresh task after clear");
+		const result = await runNativeRalplanCommand(
+			["--write", "--stage", "planner", "--stage_n", "1", "--artifact", "# Plan", "--run-id", runId],
 			root,
 		);
 		expect(result.status).toBe(0);
 
 		const after = await readState(root);
-		expect(after.run_id).toBe("new-run-after-clear");
+		expect(after.run_id).toBe(runId);
 		expect(after.active).toBe(true);
 		expect(after.current_phase).toBe("planner");
 		expect(after.handoff_from).toBeUndefined();
@@ -1789,16 +2143,18 @@ describe("native gjc ralplan runtime — post-clear re-activation (#644)", () =>
 
 		await fs.writeFile(statePath, JSON.stringify({ ...seeded, active: false, current_phase: "complete" }), "utf-8");
 
-		// A stray --write reusing the SAME (cleared) run_id must not silently re-arm a finished run.
+		// A stray --write reusing the SAME (cleared) terminal run must be rejected before artifact publication.
 		const result = await runNativeRalplanCommand(
 			["--write", "--stage", "planner", "--stage_n", "1", "--artifact", "# Plan", "--run-id", seededRunId],
 			root,
 		);
-		expect(result.status).toBe(0);
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("is terminal (complete)");
 
 		const after = await readState(root);
 		expect(after.active).toBe(false);
 		expect(after.current_phase).toBe("complete");
+		expect(existsSync(path.join(ralplanRunDir(root, seededRunId), "stage-01-planner.md"))).toBe(false);
 	});
 });
 describe("ralplan automatic handoff admission (#3398)", () => {
@@ -2020,11 +2376,9 @@ describe("ralplan automatic handoff admission (#3398)", () => {
 			YAML.stringify({ gjc: { ralplan: { autoHandoff: "off" } } }, null, 2),
 			"utf-8",
 		);
-		const retry = JSON.parse((await writeRalplanArtifact(root, runId, "final", 1, "# final")).stdout ?? "{}");
-		expect(retry).toMatchObject({
-			deduplicated: true,
-			auto_handoff: { configuredTarget: "ultragoal", effectiveTarget: "ultragoal" },
-		});
+		const retry = await writeRalplanArtifact(root, runId, "final", 1, "# final");
+		expect(retry.status).toBe(2);
+		expect(retry.stderr).toContain("current run another-run retains session ownership");
 		expect(await fs.readFile(ralplanStatePath(root), "utf-8")).toBe(currentState);
 	});
 	it("returns a cleared run's final receipt without reactivating its projection", async () => {
@@ -2219,7 +2573,7 @@ describe("ralplan consensus iteration cap (#3165)", () => {
 		const final = await write("final", 6, "# best effort pending approval");
 		expect(final.status).toBe(0);
 		expect(final.stdout).toContain("pending_approval_path");
-	});
+	}, 120_000);
 
 	it("honors project config.yml maxIterations=2 and resets budget on new run_id", async () => {
 		const root = await tempDir();
@@ -2242,9 +2596,10 @@ describe("ralplan consensus iteration cap (#3165)", () => {
 		expect(stuck.status).toBe(3);
 		expect(JSON.parse(stuck.stdout ?? "{}").max_iterations).toBe(2);
 
-		// Fresh run_id must not inherit the stuck budget.
-		expect((await write("run-b", "planner", 1, "# p-b")).status).toBe(0);
-		expect((await write("run-b", "revision", 2, "# r2-b")).status).toBe(0);
+		// Switching runs is explicit; the new run starts with an independent budget.
+		const newRunId = await startNewRalplanRun(root, "fresh run after iteration cap");
+		expect((await write(newRunId, "planner", 1, "# p-b")).status).toBe(0);
+		expect((await write(newRunId, "revision", 2, "# r2-b")).status).toBe(0);
 	});
 
 	it("dedupes an identical revision write at the cap without PLANNING-STUCK", async () => {
@@ -2382,9 +2737,10 @@ describe("ralplan consensus iteration cap (#3165)", () => {
 		await fs.writeFile(path.join(ralplanRunDir(root, "run-old"), "index.jsonl"), "", "utf-8");
 		expect((await write("run-old", "revision", 6, "# stuck")).status).toBe(3);
 
-		// Fresh run is independent even while the old run remains at cap under wipe.
-		expect((await write("run-new", "planner", 1, "# p-new")).status).toBe(0);
-		expect((await write("run-new", "revision", 2, "# r2-new")).status).toBe(0);
+		// Fresh run is explicit and independent even while the old run remains at cap under wipe.
+		const freshRunId = await startNewRalplanRun(root, "fresh run after ledger failure");
+		expect((await write(freshRunId, "planner", 1, "# p-new")).status).toBe(0);
+		expect((await write(freshRunId, "revision", 2, "# r2-new")).status).toBe(0);
 	});
 });
 
@@ -2566,7 +2922,8 @@ describe("ralplan crash-gap dedupe repair", () => {
 		const staleRunId = "stale-critic-metadata";
 		const activeRunId = "active-critic-metadata";
 		const staleRunDir = ralplanRunDir(root, staleRunId);
-		expect((await writeRalplanArtifact(root, staleRunId, "planner", 1, "# stale plan")).status).toBe(0);
+		await fs.mkdir(staleRunDir, { recursive: true });
+		await fs.writeFile(path.join(staleRunDir, "stage-01-planner.md"), "# stale plan\n", "utf-8");
 		await fs.writeFile(path.join(staleRunDir, "stage-02-critic.md"), "# stale critique\n", "utf-8");
 		expect((await writeRalplanArtifact(root, activeRunId, "planner", 1, "# active plan")).status).toBe(0);
 		const stateBefore = JSON.parse(await fs.readFile(ralplanStatePath(root), "utf-8"));
@@ -2600,10 +2957,8 @@ describe("ralplan crash-gap dedupe repair", () => {
 			root,
 		);
 
-		expect(repaired.status).toBe(0);
-		const payload = JSON.parse(repaired.stdout ?? "{}");
-		expect(payload.deduplicated).toBe(true);
-		expect(payload.critic_state).toBeUndefined();
+		expect(repaired.status).toBe(2);
+		expect(repaired.stderr).toContain("current run active-critic-metadata retains session ownership");
 		expect(JSON.parse(await fs.readFile(ralplanStatePath(root), "utf-8"))).toEqual(stateBefore);
 	});
 
@@ -2612,7 +2967,8 @@ describe("ralplan crash-gap dedupe repair", () => {
 		const staleRunId = "stale-architect-metadata";
 		const activeRunId = "active-architect-metadata";
 		const staleRunDir = ralplanRunDir(root, staleRunId);
-		expect((await writeRalplanArtifact(root, staleRunId, "planner", 1, "# stale plan")).status).toBe(0);
+		await fs.mkdir(staleRunDir, { recursive: true });
+		await fs.writeFile(path.join(staleRunDir, "stage-01-planner.md"), "# stale plan\n", "utf-8");
 		await fs.writeFile(path.join(staleRunDir, "stage-02-architect.md"), "# stale architecture\n", "utf-8");
 		expect((await writeRalplanArtifact(root, activeRunId, "planner", 1, "# active plan")).status).toBe(0);
 		const stateBefore = JSON.parse(await fs.readFile(ralplanStatePath(root), "utf-8"));
@@ -2638,10 +2994,8 @@ describe("ralplan crash-gap dedupe repair", () => {
 			root,
 		);
 
-		expect(repaired.status).toBe(0);
-		const payload = JSON.parse(repaired.stdout ?? "{}");
-		expect(payload.deduplicated).toBe(true);
-		expect(payload.architect_state).toBeUndefined();
+		expect(repaired.status).toBe(2);
+		expect(repaired.stderr).toContain("current run active-architect-metadata retains session ownership");
 		expect(JSON.parse(await fs.readFile(ralplanStatePath(root), "utf-8"))).toEqual(stateBefore);
 	});
 
@@ -2946,6 +3300,253 @@ describe("ralplan review lane budget config.yml", () => {
 });
 
 describe("ralplan review lane budget replays", () => {
+	it("records terminal opener exhaustion after a recovered legacy lane marker", async () => {
+		const root = await tempDir();
+		const runId = "legacy-lane-then-terminal-cap";
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal", maxIterations: 2 } } }, null, 2),
+			"utf-8",
+		);
+		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# plan")).status).toBe(0);
+		await fs.appendFile(
+			ralplanPlanPath(root, runId, "index.jsonl"),
+			`${JSON.stringify({
+				event: "planning_stuck",
+				planning_stuck: true,
+				reason: "ralplan review lane budget exceeded: architect pass 2 of max 1 in consensus iteration 1",
+			})}\n`,
+			"utf-8",
+		);
+		expect((await writeRalplanArtifact(root, runId, "revision", 2, "# recovered plan")).status).toBe(0);
+		expect((await writeRalplanArtifact(root, runId, "revision", 3, "# exhausted plan")).status).toBe(3);
+
+		const final = await writeRalplanArtifact(root, runId, "final", 4, "# best effort");
+
+		expect(final.status).toBe(0);
+		expect(JSON.parse(final.stdout ?? "{}").auto_handoff).toMatchObject({
+			effectiveTarget: "off",
+			degradationReason: "planning_stuck",
+		});
+	}, 60_000);
+
+	it.each([
+		"unresolved",
+		"legacy-recovered",
+	] as const)("preserves %s admission state through bounded ledger compaction", async admissionState => {
+		const root = await tempDir();
+		const runId = `compacted-admission-${admissionState}`;
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal", maxIterations: 5 } } }, null, 2),
+			"utf-8",
+		);
+		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# initial plan")).status).toBe(0);
+		expect((await writeRalplanArtifact(root, runId, "architect", 1, "# architecture")).status).toBe(0);
+		expect((await writeRalplanArtifact(root, runId, "architect", 2, "# extra architecture")).status).toBe(3);
+		const indexPath = ralplanPlanPath(root, runId, "index.jsonl");
+		if (admissionState === "legacy-recovered") {
+			const rows = (await fs.readFile(indexPath, "utf-8"))
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line) as Record<string, unknown>);
+			await fs.writeFile(
+				indexPath,
+				`${rows
+					.map(row =>
+						JSON.stringify(
+							row.event === "planning_admission_rejected"
+								? {
+										event: "planning_stuck",
+										planning_stuck: true,
+										reason:
+											"ralplan review lane budget exceeded: architect pass 2 of max 1 in consensus iteration 1",
+									}
+								: row,
+						),
+					)
+					.join("\n")}\n`,
+				"utf-8",
+			);
+			expect((await writeRalplanArtifact(root, runId, "revision", 2, "# recovered plan")).status).toBe(0);
+		}
+		// Imported historical observations exercise the compactor without thousands
+		// of unrelated native writes or adding opener/lane admissions.
+		await fs.appendFile(
+			indexPath,
+			Array.from(
+				{ length: 1500 },
+				(_, index) =>
+					`${JSON.stringify({ event: "historical_observation", sequence: index, detail: "x".repeat(1024) })}\n`,
+			).join(""),
+			"utf-8",
+		);
+		expect((await fs.stat(indexPath)).size).toBeGreaterThan(1024 * 1024);
+		expect((await writeRalplanArtifact(root, runId, "adr", 3, "# decision")).status).toBe(0);
+		expect((await fs.stat(indexPath)).size).toBeLessThanOrEqual(1024 * 1024);
+
+		const final = await writeRalplanArtifact(root, runId, "final", 4, "# final plan");
+		expect(final.status).toBe(0);
+		expect(JSON.parse(final.stdout ?? "{}").auto_handoff).toMatchObject(
+			admissionState === "unresolved"
+				? { effectiveTarget: "off", degradationReason: "planning_admission_pending" }
+				: { effectiveTarget: "ultragoal", degradationReason: null },
+		);
+	}, 60_000);
+
+	it.each([
+		"ralplan review lane budget exceeded: incomplete marker",
+		"ralplan review lane budget exceeded: architect pass 2 of max 1 in consensus iteration 0",
+		"ralplan review lane budget exceeded: architect pass invalid of max 1 in consensus iteration 1",
+	])("keeps malformed legacy admission fail-closed: %s", async reason => {
+		const root = await tempDir();
+		const runId = "malformed-legacy-admission";
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal" } } }, null, 2),
+			"utf-8",
+		);
+		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# plan")).status).toBe(0);
+		await fs.appendFile(
+			ralplanPlanPath(root, runId, "index.jsonl"),
+			`${JSON.stringify({ event: "planning_stuck", planning_stuck: true, reason })}\n`,
+			"utf-8",
+		);
+
+		const final = await writeRalplanArtifact(root, runId, "final", 2, "# final");
+
+		expect(final.status).toBe(0);
+		expect(JSON.parse(final.stdout ?? "{}").auto_handoff).toMatchObject({
+			effectiveTarget: "off",
+			degradationReason: "planning_stuck",
+		});
+	}, 60_000);
+
+	it("recovers lane admission only after an accepted revision opener", async () => {
+		const root = await tempDir();
+		const runId = "recoverable-lane-admission";
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal", maxIterations: 5 } } }, null, 2),
+			"utf-8",
+		);
+		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# initial plan")).status).toBe(0);
+		expect((await writeRalplanArtifact(root, runId, "architect", 1, "# architect pass 1")).status).toBe(0);
+		const rejected = await writeRalplanArtifact(root, runId, "architect", 2, "# architect pass 2");
+		expect(rejected.status).toBe(3);
+		expect(JSON.parse(rejected.stdout ?? "{}")).toMatchObject({
+			admission_rejected: true,
+			recoverable: true,
+			marker: PLANNING_ADMISSION_REJECTED_MARKER,
+		});
+		expect((await writeRalplanArtifact(root, runId, "planner", 2, "# accepted planner opener")).status).toBe(0);
+		expect((await writeRalplanArtifact(root, runId, "critic", 3, "# eligible peer lane")).status).toBe(0);
+		const pendingFinal = JSON.parse(
+			(await writeRalplanArtifact(root, runId, "final", 4, "# pending plan")).stdout ?? "{}",
+		);
+		expect(pendingFinal.auto_handoff).toMatchObject({
+			configuredTarget: "ultragoal",
+			effectiveTarget: "off",
+			degradationReason: "planning_admission_pending",
+		});
+		expect((await writeRalplanArtifact(root, runId, "revision", 4, "# justified revision")).status).toBe(0);
+
+		const indexText = await fs.readFile(path.join(ralplanRunDir(root, runId), "index.jsonl"), "utf-8");
+		const rows = indexText
+			.split(/\r?\n/)
+			.filter(Boolean)
+			.map(line => JSON.parse(line));
+		expect(rows).toContainEqual(
+			expect.objectContaining({ event: "planning_admission_rejected", generation: 1, lane: "architect" }),
+		);
+		expect(rows).toContainEqual(
+			expect.objectContaining({
+				event: "planning_admission_recovered",
+				generation: 1,
+				recovered_by_generation: 3,
+				lane: "architect",
+			}),
+		);
+		expect(JSON.parse(await fs.readFile(ralplanStatePath(root), "utf-8")).planning_stuck).toBeUndefined();
+
+		const final = JSON.parse((await writeRalplanArtifact(root, runId, "final", 5, "# approved plan")).stdout ?? "{}");
+		expect(final.auto_handoff).toMatchObject({
+			configuredTarget: "ultragoal",
+			effectiveTarget: "ultragoal",
+			degradationReason: null,
+		});
+	});
+
+	it("keeps rejected revision recovery pending while terminal stuck takes precedence", async () => {
+		const root = await tempDir();
+		const runId = "rejected-revision-admission-recovery";
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify(
+				{ gjc: { ralplan: { autoHandoff: "ultragoal", maxIterations: 1, maxReviewPassesPerLane: 1 } } },
+				null,
+			),
+			"utf-8",
+		);
+		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# initial plan")).status).toBe(0);
+		expect((await writeRalplanArtifact(root, runId, "architect", 1, "# architect pass 1")).status).toBe(0);
+		expect((await writeRalplanArtifact(root, runId, "critic", 2, "# eligible peer lane")).status).toBe(0);
+		expect((await writeRalplanArtifact(root, runId, "architect", 3, "# rejected architect pass")).status).toBe(3);
+
+		const rejectedRevision = await writeRalplanArtifact(root, runId, "revision", 4, "# capped revision");
+		expect(rejectedRevision.status).toBe(3);
+		expect(JSON.parse(rejectedRevision.stdout ?? "{}")).toMatchObject({ planning_stuck: true, max_iterations: 1 });
+
+		const final = await writeRalplanArtifact(root, runId, "final", 5, "# terminal best plan");
+		expect(final.status).toBe(0);
+		expect(JSON.parse(final.stdout ?? "{}").auto_handoff).toMatchObject({
+			configuredTarget: "ultragoal",
+			effectiveTarget: "off",
+			degradationReason: "planning_stuck",
+		});
+		const rows = (await fs.readFile(ralplanPlanPath(root, runId, "index.jsonl"), "utf-8"))
+			.split(/\r?\n/)
+			.filter(Boolean)
+			.map(line => JSON.parse(line));
+		expect(rows.some((row: { event?: string }) => row.event === "planning_admission_recovered")).toBe(false);
+	});
+
+	it.each([
+		"",
+		" (ledger under-count: parsed architect rows=0, on-disk architect artifacts=1)",
+	])("keeps legacy lane-overflow stuck rows nonterminal but pending until a valid recovery event: %s", async ledgerNote => {
+		const root = await tempDir();
+		const runId = "legacy-lane-overflow";
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal" } } }, null, 2),
+			"utf-8",
+		);
+		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# plan")).status).toBe(0);
+		expect((await writeRalplanArtifact(root, runId, "final", 2, "# final")).status).toBe(0);
+		await fs.appendFile(
+			path.join(ralplanRunDir(root, runId), "index.jsonl"),
+			`${JSON.stringify({
+				event: "planning_stuck",
+				planning_stuck: true,
+				reason: `ralplan review lane budget exceeded: architect pass 2 of max 1 in consensus iteration 1${ledgerNote}`,
+			})}\n`,
+		);
+
+		const final = JSON.parse((await writeRalplanArtifact(root, runId, "final", 2, "# final")).stdout ?? "{}");
+		expect(final.auto_handoff).toMatchObject({
+			configuredTarget: "ultragoal",
+			effectiveTarget: "off",
+			degradationReason: "planning_admission_pending",
+		});
+	}, 60_000);
+
 	it("refuses only the pathological same-iteration lane retries and preserves final escalation", async () => {
 		const root = await tempDir();
 		await seedProjectRalplanMaxIterations(root);
@@ -2983,18 +3584,45 @@ describe("ralplan review lane budget replays", () => {
 		}
 		for (const label of ["a2", "a6", "c6", "a8"]) {
 			const payload = JSON.parse(results.get(label)?.stdout ?? "{}");
-			expect(payload).toMatchObject({ planning_stuck: true, marker: PLANNING_STUCK_MARKER });
+			expect(payload).toMatchObject({
+				admission_rejected: true,
+				recoverable: true,
+				marker: PLANNING_ADMISSION_REJECTED_MARKER,
+			});
+			expect(payload.planning_stuck).toBeUndefined();
 			expect(["architect", "critic"]).toContain(payload.lane);
 			expect(typeof payload.passes).toBe("number");
 			expect(typeof payload.max_review_passes_per_lane).toBe("number");
 		}
 		const openerPayload = JSON.parse(results.get("rev6")?.stdout ?? "{}");
 		expect(openerPayload).toMatchObject({ planning_stuck: true, max_iterations: 5, projected_iteration: 6 });
+		const indexText = await fs.readFile(path.join(ralplanRunDir(root, runId), "index.jsonl"), "utf-8");
+		const indexRows = indexText
+			.split(/\r?\n/)
+			.filter(Boolean)
+			.map(line => JSON.parse(line));
+		expect(indexRows).toContainEqual(
+			expect.objectContaining({
+				event: "planning_admission_rejected",
+				generation: 1,
+				lane: "architect",
+				recoverable: true,
+			}),
+		);
+		expect(indexRows).toContainEqual(
+			expect.objectContaining({
+				event: "planning_admission_recovered",
+				generation: 1,
+				recovered_by_generation: 2,
+				lane: "architect",
+			}),
+		);
+		expect(indexRows.filter(row => row.event === "planning_stuck")).toHaveLength(1);
 
 		const final = await writeRalplanArtifact(root, runId, "final", sequence.length + 1, "# best effort final");
 		expect(final.status).toBe(0);
 		expect(JSON.parse(final.stdout ?? "{}").pending_approval_path).toBeDefined();
-	});
+	}, 120_000);
 
 	it("keeps healthy t3code and browser-use shaped replays free of warnings and stuck signals", async () => {
 		const root = await tempDir();
@@ -3014,13 +3642,14 @@ describe("ralplan review lane budget replays", () => {
 			"critic",
 			"final",
 		]);
-		const browserUse = await replay("healthy-browser-use", ["planner", "architect", "critic", "final"]);
+		const browserUseRunId = await startNewRalplanRun(root, "healthy browser-use shaped replay");
+		const browserUse = await replay(browserUseRunId, ["planner", "architect", "critic", "final"]);
 		for (const result of [...t3code, ...browserUse]) {
 			expect(result.status).toBe(0);
 			expect(result.stdout).not.toContain(PLANNING_STUCK_MARKER);
 			expect(JSON.parse(result.stdout ?? "{}").review_budget_warning).toBeUndefined();
 		}
-	});
+	}, 120_000);
 });
 
 describe("ralplan review lane budget rigor and receipts", () => {
@@ -3067,13 +3696,15 @@ describe("ralplan review lane budget rigor and receipts", () => {
 		const stuckPayload = JSON.parse(third.stdout ?? "{}");
 		expect(stuckPayload).toMatchObject({
 			ok: false,
-			planning_stuck: true,
-			marker: PLANNING_STUCK_MARKER,
+			admission_rejected: true,
+			recoverable: true,
+			marker: PLANNING_ADMISSION_REJECTED_MARKER,
 			lane: "architect",
 			passes: 2,
 			projected_passes: 3,
 			max_review_passes_per_lane: 2,
 		});
+		expect(stuckPayload.planning_stuck).toBeUndefined();
 		expect(stuckPayload.iteration).toBeUndefined();
 		expect(stuckPayload.max_iterations).toBeUndefined();
 
@@ -3092,8 +3723,8 @@ describe("ralplan review lane budget rigor and receipts", () => {
 		expect(textSecond.stdout).toContain("Warning: ralplan architect review budget final slot used (2/2).");
 		const textThird = await writeRalplanArtifact(textRoot, textRunId, "architect", 4, "# architect three", false);
 		expect(textThird.status).toBe(3);
-		expect(textThird.stdout).toBe(`${PLANNING_STUCK_MARKER}\n`);
-		expect(textThird.stderr).toContain("Stop re-invoking the architect review lane");
+		expect(textThird.stdout).toBe(`${PLANNING_ADMISSION_REJECTED_MARKER}\n`);
+		expect(textThird.stderr).toContain("lane is rejected for this generation only");
 
 		const defaultRoot = await tempDir();
 		const defaultResult = await writeRalplanArtifact(
@@ -3159,7 +3790,8 @@ describe("ralplan HUD lane verdict carriage", () => {
 		const staleRunId = "hud-stale-repair";
 		const activeRunId = "hud-active-run";
 		const staleRunDir = ralplanRunDir(root, staleRunId);
-		expect((await writeRalplanArtifact(root, staleRunId, "planner", 1, "# stale plan")).status).toBe(0);
+		await fs.mkdir(staleRunDir, { recursive: true });
+		await fs.writeFile(path.join(staleRunDir, "stage-01-planner.md"), "# stale plan\n", "utf-8");
 		await fs.writeFile(path.join(staleRunDir, "stage-02-architect.md"), "# stale architecture\n", "utf-8");
 		expect((await writeRalplanArtifact(root, activeRunId, "planner", 1, "# active plan")).status).toBe(0);
 
@@ -3171,8 +3803,8 @@ describe("ralplan HUD lane verdict carriage", () => {
 			"# stale architecture",
 			"BLOCK",
 		);
-		expect(repaired.status).toBe(0);
-		expect(JSON.parse(repaired.stdout ?? "{}").lane_verdict).toBeUndefined();
+		expect(repaired.status).toBe(2);
+		expect(repaired.stderr).toContain("current run hud-active-run retains session ownership");
 		const state = JSON.parse(await fs.readFile(ralplanStatePath(root), "utf-8"));
 		expect(state.run_id).toBe(activeRunId);
 		for (const key of ["last_review_verdict", "last_review_verdict_lane", "last_review_verdict_stage_n"]) {
@@ -3333,7 +3965,6 @@ describe("ralplan HUD lane verdict carriage", () => {
 	it("clears both verdict sources when a new run starts and rebuilds HUD state", async () => {
 		const root = await tempDir();
 		const runOne = "hud-reset-one";
-		const runTwo = "hud-reset-two";
 		expect((await writeRalplanArtifact(root, runOne, "planner", 1, "# plan one")).status).toBe(0);
 		expect(
 			(await writeRalplanLaneVerdictArtifact(root, runOne, "critic", 2, "# critique one", "ITERATE")).status,
@@ -3347,6 +3978,7 @@ describe("ralplan HUD lane verdict carriage", () => {
 			).status,
 		).toBe(0);
 
+		const runTwo = await startNewRalplanRun(root, "new run clears old verdict");
 		expect((await writeRalplanArtifact(root, runTwo, "planner", 1, "# plan two")).status).toBe(0);
 		expect((await readRalplanHudChips(root)).some(chip => chip.label === "verdict")).toBe(false);
 		const switchedState = JSON.parse(await fs.readFile(ralplanStatePath(root), "utf-8"));

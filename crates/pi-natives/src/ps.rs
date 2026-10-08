@@ -197,8 +197,11 @@ impl Process {
 	/// tree is hard-killed via `TerminateProcess`. Defaults to the POSIX
 	/// hard-kill signal.
 	#[napi]
-	pub fn kill_tree(&self, signal: Option<i32>) -> u32 {
-		self.inner.kill_tree(signal)
+	pub fn kill_tree(&self, signal: Option<i32>) -> Result<u32> {
+		self
+			.inner
+			.try_kill_tree(signal)
+			.map_err(|error| napi::Error::from_reason(error.to_string()))
 	}
 
 	/// Gracefully terminate this process and its descendants.

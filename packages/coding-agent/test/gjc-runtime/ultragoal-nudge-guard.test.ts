@@ -120,15 +120,12 @@ describe("ultragoal nudge guard", () => {
 		expect(ledger.some(event => event.event === "nudge" && event.surface === "ask")).toBe(false);
 	});
 
-	// F6: a human_blocked classification is still nudged while budget remains; only
-	// after exhaustion does the old human_blocked allowance let the pause through.
-	it("AC1/F6: human_blocked pause is nudged while budget remains, then allowed after exhaustion", async () => {
+	// F04: once a durable human-only blocker exists, retries cannot resolve it.
+	it("F04: a verified human-only pause preserves its nudge budget", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await setProjectBudget(cwd, 1);
 		await createUltragoalPlan({ cwd, brief: SINGLE_BRIEF });
-		// Budget 1: the first pause attempt is nudged before the human-only blocker is classified.
-		await expect(assertUltragoalPauseAllowed(cwd)).rejects.toThrow(/try-harder nudge \(1\/1\)/);
 		const classification = await recordUltragoalBlockerClassification({
 			cwd,
 			classification: "human_blocked",
@@ -141,8 +138,24 @@ describe("ultragoal nudge guard", () => {
 			evidence: "critic confirms the remaining blocker requires human action",
 			classificationEventId: classification.eventId,
 		});
-		// The exhausted budget now falls back to the bound clean human-blocked allowance.
 		await expect(assertUltragoalPauseAllowed(cwd)).resolves.toBeUndefined();
+		const ledger = await readUltragoalLedger(cwd, TEST_SESSION_ID);
+		expect(ledger.filter(event => event.event === "nudge")).toHaveLength(0);
+	});
+
+	it("F04: a human-only blocker awaiting its clean critic verdict is not nudged", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await setProjectBudget(cwd, 1);
+		await createUltragoalPlan({ cwd, brief: SINGLE_BRIEF });
+		await recordUltragoalBlockerClassification({
+			cwd,
+			classification: "human_blocked",
+			evidence: "User must provide production API credentials",
+		});
+		await expect(assertUltragoalPauseAllowed(cwd)).rejects.toThrow(/later fresh clean pause terminal critic OKAY/);
+		const ledger = await readUltragoalLedger(cwd, TEST_SESSION_ID);
+		expect(ledger.filter(event => event.event === "nudge")).toHaveLength(0);
 	});
 
 	// AC2: after the budget is spent, pause falls back to today's gate (blocked, no infinite loop).

@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as crypto from "node:crypto";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import * as compactionModule from "@gajae-code/agent-core/compaction";
 import type { AssistantMessage } from "@gajae-code/ai";
+import { closeModelCache } from "@gajae-code/ai/core";
 import { getBundledModel } from "@gajae-code/ai/models";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -40,14 +42,15 @@ describe("AgentSession workflow recovery continuation (#4560)", () => {
 	let session: AgentSession;
 	let sessionManager: SessionManager;
 	let authStorage: AuthStorage;
+	let modelRegistry: ModelRegistry;
 
 	beforeEach(async () => {
 		tempDir = TempDir.createSync("@pi-4560-continuation-");
 		const extensionPath = path.join(getProjectAgentDir(tempDir.path()), "extensions", "compact.ts");
 		await Bun.write(extensionPath, "export default function(pi) {}");
-		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
+		authStorage = await AuthStorage.create(":memory:");
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		const modelRegistry = new ModelRegistry(authStorage);
+		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
 		const extensionsResult = await loadExtensions([extensionPath], tempDir.path());
 		const extensionRunner = new ExtensionRunner(
@@ -89,10 +92,23 @@ describe("AgentSession workflow recovery continuation (#4560)", () => {
 	});
 
 	afterEach(async () => {
-		await session.dispose();
-		authStorage.close();
-		tempDir.removeSync();
-		vi.restoreAllMocks();
+		try {
+			await session.dispose();
+		} finally {
+			try {
+				await sessionManager.close();
+			} finally {
+				try {
+					await modelRegistry.dispose();
+				} finally {
+					authStorage.close();
+					const tempCachePath = path.join(tempDir.path(), "models.db");
+					closeModelCache(tempCachePath);
+					await fs.rm(tempDir.path(), { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+					vi.restoreAllMocks();
+				}
+			}
+		}
 	});
 
 	async function compact(stopReason: "stop" | "length" = "stop"): Promise<void> {

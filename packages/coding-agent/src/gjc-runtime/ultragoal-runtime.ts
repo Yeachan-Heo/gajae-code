@@ -57,6 +57,7 @@ import { renderUltragoalStatusMarkdown } from "./state-renderer";
 import { reconcileWorkflowSkillState } from "./state-runtime";
 import {
 	appendJsonl,
+	appendJsonlIdempotent,
 	persistedStateRevision,
 	withWorkflowStateLock,
 	writeArtifact,
@@ -85,6 +86,7 @@ import {
 	runUltragoalSuccessionCommand,
 } from "./ultragoal-succession";
 import {
+	isLowRiskTerminalCriticOmissionSelection,
 	resolveUltragoalValidationApplicability,
 	type UltragoalValidationApplicability,
 	type UltragoalValidationLane,
@@ -408,6 +410,41 @@ export async function appendLedger(
 	});
 	await writeSessionActivityMarker(cwd, resolvedSessionId, { writer: "ultragoal-runtime", path: paths.ledgerPath });
 	return entry;
+}
+
+function checkpointEventKey(entry: unknown): string | undefined {
+	if (!entry || typeof entry !== "object" || Array.isArray(entry)) return undefined;
+	const eventId = (entry as Record<string, unknown>).eventId;
+	return typeof eventId === "string" && eventId.trim() ? `checkpoint\u0000${eventId}` : undefined;
+}
+
+function sameCheckpointLedgerEvent(existing: unknown, candidate: Record<string, unknown>): boolean {
+	if (!existing || typeof existing !== "object" || Array.isArray(existing)) return false;
+	const row = existing as Record<string, unknown>;
+	return ["eventId", "event", "goalId", "status", "evidence", "qualityGateJson", "completionVerification"].every(
+		key =>
+			row[key] === undefined || candidate[key] === undefined
+				? row[key] === candidate[key]
+				: hashStructuredValue(row[key]) === hashStructuredValue(candidate[key]),
+	);
+}
+
+async function appendCheckpointLedgerEventOnce(
+	cwd: string,
+	sessionId: string,
+	event: Record<string, unknown>,
+): Promise<void> {
+	const paths = getUltragoalPaths(cwd, sessionId);
+	const candidate = { ...event, timestamp: new Date().toISOString() };
+	const result = await appendJsonlIdempotent(paths.ledgerPath, candidate, {
+		cwd,
+		audit: { category: "ledger", verb: "append", owner: "gjc-runtime", sessionId },
+		key: checkpointEventKey,
+	});
+	if (result.duplicate !== undefined && !sameCheckpointLedgerEvent(result.duplicate, candidate)) {
+		throw new Error(`checkpoint ledger event ${String(event.eventId)} already exists with conflicting contents`);
+	}
+	await writeSessionActivityMarker(cwd, sessionId, { writer: "ultragoal-runtime", path: paths.ledgerPath });
 }
 
 export async function readUltragoalLedger(cwd: string, sessionId?: string | null): Promise<UltragoalLedgerEvent[]> {
@@ -2877,8 +2914,9 @@ async function validateCompletionQualityGate(
 	if (isFinalAggregate) {
 		if (
 			options.ledger &&
-			terminalCriticCeilingReached(options.ledger) &&
-			!terminalCriticGateOverridden(options.ledger)
+			options.plan &&
+			terminalCriticCeilingReached(options.ledger, computeCriticVerdictPlanGeneration(options.plan)) &&
+			!terminalCriticGateOverridden(options.ledger, computeCriticVerdictPlanGeneration(options.plan))
 		) {
 			found.add(
 				"criticReview",
@@ -2894,7 +2932,10 @@ async function validateCompletionQualityGate(
 		// of duplicating the already-joined review with another read pass.
 		const criticReview = qualityGateObject(gate.criticReview);
 		const criticProportionallySatisfied =
-			lowRiskReduced && applicability.basisUnchanged && !applicability.hasOpenReviewBlockers;
+			lowRiskReduced &&
+			applicability.basisUnchanged &&
+			!applicability.hasOpenReviewBlockers &&
+			isLowRiskTerminalCriticOmissionSelection(laneSelection);
 		if (criticReview?.verdict !== "OKAY" && !criticProportionallySatisfied) {
 			found.add(
 				"criticReview.verdict",
@@ -3567,6 +3608,64 @@ function validateCompleteCheckpointTargetGoal(goal: UltragoalGoal): void {
 	);
 }
 
+function findInterruptedCompleteCheckpointReceipt(input: {
+	plan: UltragoalPlan;
+	ledger: readonly UltragoalLedgerEvent[];
+	goal: UltragoalGoal;
+	evidence: string;
+}): UltragoalCompletionVerification | undefined {
+	const receipt = input.goal.completionVerification;
+	if (
+		input.goal.status !== "complete" ||
+		input.goal.evidence !== input.evidence ||
+		!receipt ||
+		receipt.schemaVersion !== 1 ||
+		receipt.goalId !== input.goal.id ||
+		!COMPLETE_CHECKPOINT_ALLOWED_PRE_STATUSES.has(receipt.goalStatusBeforeCheckpoint) ||
+		typeof receipt.checkpointLedgerEventId !== "string" ||
+		!receipt.checkpointLedgerEventId.trim() ||
+		typeof receipt.qualityGateHash !== "string" ||
+		input.goal.updatedAt !== receipt.verifiedAt ||
+		input.goal.completedAt !== receipt.verifiedAt
+	) {
+		return undefined;
+	}
+	const existingEvent = input.ledger.find(event => event.eventId === receipt.checkpointLedgerEventId);
+	if (existingEvent) {
+		const consistent =
+			existingEvent.event === "goal_checkpointed" &&
+			existingEvent.goalId === input.goal.id &&
+			existingEvent.status === "complete" &&
+			existingEvent.evidence === input.evidence &&
+			hashStructuredValue(existingEvent.completionVerification) === hashStructuredValue(receipt) &&
+			hashStructuredValue(existingEvent.qualityGateJson) === receipt.qualityGateHash;
+		if (!consistent) {
+			throw new Error(`Goal ${input.goal.id} checkpoint receipt event id conflicts with its ledger row`);
+		}
+		return undefined;
+	}
+	try {
+		const generation = computeUltragoalPlanGeneration({
+			plan: input.plan,
+			ledger: input.ledger,
+			goal: input.goal,
+			receiptKind: receipt.receiptKind,
+			beforeStatus: receipt.goalStatusBeforeCheckpoint,
+			targetGoalUpdatedAt: receipt.basis.goalUpdatedAtBeforeCheckpoint,
+			excludeEventId: receipt.checkpointLedgerEventId,
+		});
+		if (
+			generation.planGeneration !== receipt.planGeneration ||
+			hashStructuredValue(generation.basis) !== hashStructuredValue(receipt.basis)
+		) {
+			return undefined;
+		}
+	} catch {
+		return undefined;
+	}
+	return receipt;
+}
+
 export interface UltragoalCheckpointInput {
 	cwd: string;
 	goalId: string;
@@ -3604,7 +3703,11 @@ async function checkpointUltragoalGoalForSession(
 	await assertUltragoalGoalNotFenced(input.cwd, sessionId, goal.id);
 	const evidence = input.evidence.trim();
 	if (!evidence) throw new Error("checkpoint evidence is required");
-	const ledgerBefore = await readUltragoalLedger(input.cwd);
+	const ledgerBefore = await readUltragoalLedger(input.cwd, sessionId);
+	const interruptedCheckpointReceipt =
+		input.status === "complete"
+			? findInterruptedCompleteCheckpointReceipt({ plan, ledger: ledgerBefore, goal, evidence })
+			: undefined;
 	const matchingIdempotentEvents = ledgerBefore.filter(
 		event =>
 			event.event === "goal_checkpointed" &&
@@ -3651,20 +3754,21 @@ async function checkpointUltragoalGoalForSession(
 	// records OKAY. A mutated goal row keeps the fail-loud tamper handling in
 	// the idempotent branch below.
 	const staleCompleteReceiptReplay =
-		input.status === "complete" &&
-		goal.status === "complete" &&
-		goal.evidence === evidence &&
-		Boolean(matchingIdempotentEvent) &&
-		(!goal.completionVerification ||
-			(goal.completionVerification.verifiedAt === goal.updatedAt &&
-				(validateReceiptFreshBase({
-					plan,
-					ledger: ledgerBefore,
-					goal,
-					receipt: goal.completionVerification,
-					receiptKind: goal.completionVerification.receiptKind,
-				}) !== null ||
-					finalAggregateReceiptMissingCriticOkay(ledgerBefore, goal.completionVerification))));
+		Boolean(interruptedCheckpointReceipt) ||
+		(input.status === "complete" &&
+			goal.status === "complete" &&
+			goal.evidence === evidence &&
+			Boolean(matchingIdempotentEvent) &&
+			(!goal.completionVerification ||
+				(goal.completionVerification.verifiedAt === goal.updatedAt &&
+					(validateReceiptFreshBase({
+						plan,
+						ledger: ledgerBefore,
+						goal,
+						receipt: goal.completionVerification,
+						receiptKind: goal.completionVerification.receiptKind,
+					}) !== null ||
+						finalAggregateReceiptMissingCriticOkay(ledgerBefore, goal.completionVerification)))));
 	if (
 		goal.status === input.status &&
 		goal.evidence === evidence &&
@@ -3744,6 +3848,75 @@ async function checkpointUltragoalGoalForSession(
 				"completion source changed or could not be captured consistently during validation; retry the checkpoint against a stable repository state",
 			);
 		}
+	}
+	if (interruptedCheckpointReceipt && qualityGateJson && !Array.isArray(qualityGateJson)) {
+		if (hashStructuredValue(qualityGateJson) !== interruptedCheckpointReceipt.qualityGateHash) {
+			throw new Error(
+				`Cannot repair interrupted checkpoint for ${goal.id} with different quality-gate evidence; resubmit the identical validated gate or investigate the durable receipt.`,
+			);
+		}
+		const checkpointEvent = {
+			eventId: interruptedCheckpointReceipt.checkpointLedgerEventId,
+			event: "goal_checkpointed",
+			goalId: goal.id,
+			status: "complete",
+			evidence,
+			qualityGateJson,
+			completionVerification: interruptedCheckpointReceipt,
+		};
+		await withUltragoalPlanOwnership(input.cwd, sessionId, async () => {
+			await assertUltragoalAdoptionPublished(input.cwd, sessionId);
+			await assertUltragoalGoalNotFenced(input.cwd, sessionId, goal.id);
+			const latestPlan = await readUltragoalPlan(input.cwd, sessionId);
+			const latestGoal = latestPlan?.goals.find(item => item.id === goal.id);
+			if (!latestPlan || !latestGoal || hashStructuredValue(latestPlan) !== hashStructuredValue(plan)) {
+				throw new Error(
+					`Cannot repair interrupted checkpoint for ${goal.id}: durable Ultragoal state changed during revalidation.`,
+				);
+			}
+			const latestLedger = await readUltragoalLedger(input.cwd, sessionId);
+			const latestReceipt = findInterruptedCompleteCheckpointReceipt({
+				plan: latestPlan,
+				ledger: latestLedger,
+				goal: latestGoal,
+				evidence,
+			});
+			const existingEvent = latestLedger.find(event => event.eventId === checkpointEvent.eventId);
+			if (existingEvent) {
+				if (!sameCheckpointLedgerEvent(existingEvent, checkpointEvent)) {
+					throw new Error(
+						`Cannot repair interrupted checkpoint for ${goal.id}: checkpoint event id is already used.`,
+					);
+				}
+				return;
+			}
+			if (
+				!latestReceipt ||
+				hashStructuredValue(latestReceipt) !== hashStructuredValue(interruptedCheckpointReceipt)
+			) {
+				throw new Error(
+					`Cannot repair interrupted checkpoint for ${goal.id}: durable receipt no longer matches its recovery intent.`,
+				);
+			}
+			const qualityGate = qualityGateObject(qualityGateJson);
+			const iteration = qualityGateObject(qualityGate?.iteration);
+			const reviewCohort = qualityGateObject(iteration?.reviewCohort);
+			const persistedSourceHash = nonEmptyString(reviewCohort?.sourceHash);
+			const repairChangeSet = await computeCheckpointChangeSet(input.cwd);
+			if (repairChangeSet?.trusted !== true || repairChangeSet.captureIncomplete === true) {
+				throw new Error(
+					`Cannot repair interrupted checkpoint for ${goal.id}: authoritative repository evidence is incomplete or untrusted.`,
+				);
+			}
+			const repairSourceHash = computeUltragoalReviewSourceHash(repairChangeSet);
+			if (!persistedSourceHash || !repairSourceHash || repairSourceHash !== persistedSourceHash) {
+				throw new Error(
+					`Cannot repair interrupted checkpoint for ${goal.id}: authoritative source hash changed since its persisted receipt.`,
+				);
+			}
+			await appendCheckpointLedgerEventOnce(input.cwd, sessionId, checkpointEvent);
+		});
+		return (await readUltragoalPlan(input.cwd, sessionId)) ?? plan;
 	}
 	const now = new Date().toISOString();
 	const beforeStatus = goal.status;
@@ -4394,8 +4567,8 @@ export async function recordUltragoalCriticVerdict(input: {
 				resolvedSessionId,
 			);
 			const updatedLedger = [...ledger, criticVerdict];
-			const count = countNonOkayTerminalCriticVerdicts(updatedLedger);
-			if (count >= TERMINAL_CRITIC_CEILING && !terminalCriticHardStopReached(updatedLedger)) {
+			const count = countNonOkayTerminalCriticVerdicts(updatedLedger, planGeneration);
+			if (count >= TERMINAL_CRITIC_CEILING && !terminalCriticHardStopReached(updatedLedger, planGeneration)) {
 				await appendLedger(
 					input.cwd,
 					{
@@ -4427,10 +4600,17 @@ export async function recordUltragoalCriticGateOverride(input: {
 		paths.ledgerPath,
 		async () => {
 			const ledger = await readUltragoalLedger(input.cwd, resolvedSessionId);
-			if (!terminalCriticHardStopReached(ledger)) {
+			const plan = await readUltragoalPlan(input.cwd, resolvedSessionId);
+			if (!plan) throw new Error("record-critic-gate-override requires an active ultragoal plan");
+			const planGeneration = computeCriticVerdictPlanGeneration(plan);
+			if (!terminalCriticHardStopReached(ledger, planGeneration)) {
 				throw new Error("record-critic-gate-override requires a durably recorded terminal critic hard stop");
 			}
-			return appendLedger(input.cwd, { event: CRITIC_GATE_OVERRIDE_EVENT, evidence }, resolvedSessionId);
+			return appendLedger(
+				input.cwd,
+				{ event: CRITIC_GATE_OVERRIDE_EVENT, evidence, planGeneration },
+				resolvedSessionId,
+			);
 		},
 		{ cwd: input.cwd },
 	);

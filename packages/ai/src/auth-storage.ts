@@ -1503,6 +1503,7 @@ export class AuthStorage {
 	#ownerFallbackGenerations = new WeakMap<object, number>();
 	#observedConfigOwners = new WeakSet<object>();
 	#sharedProviderGenerations = new Map<string, number>();
+	#sharedStoredLiteralGenerations = new Map<string, number>();
 	#sharedProviderConfigurationGenerations = new Map<string, number>();
 	#fallbackGeneration = 0;
 	#store: AuthCredentialStore;
@@ -1525,6 +1526,7 @@ export class AuthStorage {
 	#pendingDisabledEvents: CredentialDisabledEvent[] = [];
 	#generation = 1;
 	#providerGenerations = new Map<string, number>();
+	#storedLiteralGenerations = new Map<string, number>();
 	#providerConfigurationGenerations = new Map<string, number>();
 	#providerOAuthRefreshGenerations = new Map<string, number>();
 	/** Recent access tokens replaced by same-account rotation, keyed by storage provider and row id. */
@@ -1723,10 +1725,17 @@ export class AuthStorage {
 							process.env[credential.key] === undefined,
 					);
 		if (storedLiteral) {
+			// Exact literal cache evidence follows credential material, while session
+			// selection changes still advance the broad provider/configuration fences.
+			const literalGeneration = owner
+				? (this.#sharedStoredLiteralGenerations.get(storageProvider) ?? 1) +
+					ownerGeneration +
+					ownerFallbackGeneration
+				: (this.#storedLiteralGenerations.get(storageProvider) ?? 1) + this.#fallbackGeneration;
 			return crypto
 				.createHash("sha256")
 				.update(
-					`${generation}\u0000stored-literal\u0000${storageProvider}\u0000${storedLiteral.key}${forkGenerationFingerprint}`,
+					`${literalGeneration}\u0000stored-literal\u0000${storageProvider}\u0000${storedLiteral.key}${forkGenerationFingerprint}`,
 				)
 				.digest("hex");
 		}
@@ -1839,6 +1848,17 @@ export class AuthStorage {
 		this.#generation += 1;
 		if (provider) {
 			const key = resolveOAuthStorageProvider(provider);
+			const changesStoredLiteralProvenance =
+				reason !== "set-session-credential-selector" &&
+				reason !== "set-session-credential-auto" &&
+				reason !== "clear-session-credential-selector" &&
+				reason !== "mark-session-credential-unavailable";
+			if (changesStoredLiteralProvenance) {
+				this.#storedLiteralGenerations.set(key, (this.#storedLiteralGenerations.get(key) ?? 1) + 1);
+				if (!owner) {
+					this.#sharedStoredLiteralGenerations.set(key, (this.#sharedStoredLiteralGenerations.get(key) ?? 1) + 1);
+				}
+			}
 			this.#providerGenerations.set(key, this.#getProviderGeneration(key) + 1);
 			if (owner) this.#bumpOwnerProviderGeneration(owner, key);
 			else this.#sharedProviderGenerations.set(key, this.#getSharedProviderGeneration(key) + 1);
@@ -1974,7 +1994,7 @@ export class AuthStorage {
 		this.#sessionCredentialAutoMasks.get(scope)?.delete(storageProvider);
 		// Scope-local selection invalidates availability, not the provenance of
 		// an unchanged provider credential used by discovery outside this scope.
-		this.#bumpGeneration("set-session-credential-selector");
+		this.#bumpGeneration("set-session-credential-selector", storageProvider);
 	}
 
 	/** Explicitly mask persistent/process-global selection and return the provider to AUTO for one scope. */
@@ -1987,7 +2007,7 @@ export class AuthStorage {
 		const masks = this.#sessionCredentialAutoMasks.get(scope) ?? new Set<string>();
 		masks.add(storageProvider);
 		this.#sessionCredentialAutoMasks.set(scope, masks);
-		this.#bumpGeneration("set-session-credential-auto");
+		this.#bumpGeneration("set-session-credential-auto", storageProvider);
 	}
 
 	/** Clear a scope's explicit selector and AUTO mask, restoring normal precedence. */
@@ -2000,7 +2020,7 @@ export class AuthStorage {
 		const changed = Boolean(selectors?.delete(storageProvider) || masks?.delete(storageProvider));
 		if (selectors?.size === 0) this.#sessionCredentialSelectors.delete(scope);
 		if (masks?.size === 0) this.#sessionCredentialAutoMasks.delete(scope);
-		if (changed) this.#bumpGeneration("clear-session-credential-selector");
+		if (changed) this.#bumpGeneration("clear-session-credential-selector", storageProvider);
 	}
 
 	/** Preserve a failed hard pin as unavailable instead of allowing AUTO fallback. */
@@ -2013,7 +2033,7 @@ export class AuthStorage {
 		this.#sessionCredentialUnavailable.set(scope, unavailable);
 		this.#sessionCredentialSelectors.get(scope)?.delete(storageProvider);
 		this.#sessionCredentialAutoMasks.get(scope)?.delete(storageProvider);
-		this.#bumpGeneration("mark-session-credential-unavailable");
+		this.#bumpGeneration("mark-session-credential-unavailable", storageProvider);
 	}
 
 	/** Return a failed hard pin retained for this scope, if any. */
@@ -8266,23 +8286,8 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	close(): void {
 		if (this.#closed) return;
 		this.#closed = true;
-		this.#listActiveStmt.finalize();
-		this.#listActiveByProviderStmt.finalize();
-		this.#listAllStmt.finalize();
-		this.#listAllByProviderStmt.finalize();
-		this.#listDisabledByProviderStmt.finalize();
-		this.#insertStmt.finalize();
-		this.#updateStmt.finalize();
-		this.#deleteStmt.finalize();
-		this.#deleteIfMatchesStmt.finalize();
-		this.#deleteIfRevisionStmt.finalize();
-		this.#deleteByProviderStmt.finalize();
-		this.#hardDeleteStmt.finalize();
-		this.#getCacheStmt.finalize();
-		this.#getCacheIncludingExpiredStmt.finalize();
-		this.#upsertCacheStmt.finalize();
-		this.#deleteCachePrefixStmt.finalize();
-		this.#deleteExpiredCacheStmt.finalize();
-		this.#db.close();
+		// Uncached prepare() statements keep SQLite handles alive after close(false).
+		// Finalize every statement owned by this connection before releasing it.
+		this.#db.close(true);
 	}
 }

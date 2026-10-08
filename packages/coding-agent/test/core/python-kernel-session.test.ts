@@ -48,10 +48,11 @@ describe("executePython kernel reuse", () => {
 		Bun.env.PI_PYTHON_SKIP_CHECK = "1";
 		startCalls = 0;
 		kernels = [];
-		PythonKernel.start = (async () => {
+		PythonKernel.start = (async options => {
 			startCalls += 1;
 			const kernel = new FakeKernel(`kernel-${startCalls}`);
 			kernels.push(kernel);
+			options.onKernelCreated?.(kernel as unknown as PythonKernel);
 			return kernel as unknown as PythonKernel;
 		}) as typeof PythonKernel.start;
 	});

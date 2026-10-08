@@ -49,6 +49,7 @@ export interface TaskResultReceipt {
 	localErrorSummary?: SingleResult["localErrorSummary"];
 	errorSummary?: string;
 	duplicateDisposition?: SingleResult["duplicateDisposition"];
+	cleanup?: SingleResult["cleanup"];
 	abortSummary?: string;
 	preview: string;
 	previewTruncated: boolean;
@@ -323,15 +324,20 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 			? { attempt: raw.retryFailure.attempt, errorSummary: "Retry failure recorded." }
 			: undefined,
 		duplicateDisposition: raw.duplicateDisposition,
+		cleanup: raw.cleanup ? { ...raw.cleanup } : undefined,
 		localErrorSummary: raw.localErrorSummary,
 		errorSummary:
 			raw.setupFailure?.summary ??
 			raw.localErrorSummary?.summary ??
-			(raw.error
-				? "Error recorded."
-				: raw.persistence?.outcome === "recovery_available"
-					? "Changes were not persisted to the owner worktree."
-					: undefined),
+			(raw.cleanup?.status === "failed"
+				? "Agent session cleanup failed."
+				: raw.cleanup?.status === "pending"
+					? "Agent session cleanup is still pending."
+					: raw.error
+						? "Error recorded."
+						: raw.persistence?.outcome === "recovery_available"
+							? "Changes were not persisted to the owner worktree."
+							: undefined),
 		setupFailure: raw.setupFailure ? { summary: raw.setupFailure.summary } : undefined,
 		abortSummary: raw.abortReason ? "Abort reason recorded." : undefined,
 		preview,

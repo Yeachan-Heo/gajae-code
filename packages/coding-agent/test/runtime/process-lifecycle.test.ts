@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { fileURLToPath } from "node:url";
 import {
 	disposeAllOwnedProcesses,
 	disposeAllResourceOwners,
@@ -9,6 +10,40 @@ import {
 } from "@gajae-code/coding-agent/runtime/process-lifecycle";
 
 const isPosix = process.platform !== "win32";
+const isWindows = process.platform === "win32";
+
+interface WindowsProbeReport {
+	result: { status: string };
+	rootStatus: string;
+	rootIdentity: string;
+	leafStatus: string;
+	leafIdentity: string;
+	launcherStatus?: string;
+	controlStatus: string;
+	retainedOwners: number;
+	ownerDisposed: boolean;
+	diagnostic: string;
+}
+
+async function runWindowsProbe(mode: string): Promise<WindowsProbeReport> {
+	// Incomplete owners are intentionally retained. Isolate that registry state
+	// in a child runtime while its fixture finally cleans every pinned process.
+	const child = Bun.spawn(
+		[
+			process.execPath,
+			fileURLToPath(new URL("../fixtures/process-lifecycle-windows-probe.ts", import.meta.url)),
+			mode,
+		],
+		{ stdout: "pipe", stderr: "pipe" },
+	);
+	const [code, stdout, stderr] = await Promise.all([
+		child.exited,
+		new Response(child.stdout).text(),
+		new Response(child.stderr).text(),
+	]);
+	if (code !== 0) throw new Error(`Windows ${mode} fixture failed (${code}): ${stderr}\n${stdout}`);
+	return JSON.parse(stdout.trim()) as WindowsProbeReport;
+}
 
 async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
@@ -29,7 +64,7 @@ function alive(pid: number): boolean {
 }
 
 describe("spawnOwnedProcess (F1a)", () => {
-	test("awaits clean exit and deregisters from the live set", async () => {
+	test.skipIf(!isPosix)("awaits clean exit and deregisters from the live set", async () => {
 		const before = liveOwnedProcessCount();
 		const owner = spawnOwnedProcess(["sh", "-c", "exit 0"], { name: "clean-exit" });
 		const result = await owner.awaitExit();
@@ -38,7 +73,7 @@ describe("spawnOwnedProcess (F1a)", () => {
 		await waitFor(() => liveOwnedProcessCount() === before);
 	});
 
-	test("awaitExit honors a bounded timeout for a long runner", async () => {
+	test.skipIf(!isPosix)("awaitExit honors a bounded timeout for a long runner", async () => {
 		const owner = spawnOwnedProcess(["sh", "-c", "sleep 30"], { name: "timeout-probe" });
 		try {
 			const result = await owner.awaitExit({ timeoutMs: 100 });
@@ -48,7 +83,7 @@ describe("spawnOwnedProcess (F1a)", () => {
 		}
 	});
 
-	test("dispose terminates a long runner and is idempotent", async () => {
+	test.skipIf(!isPosix)("dispose terminates a long runner and is idempotent", async () => {
 		const before = liveOwnedProcessCount();
 		const owner = spawnOwnedProcess(["sh", "-c", "sleep 30"], { name: "dispose-probe" });
 		await Bun.sleep(50);
@@ -59,7 +94,7 @@ describe("spawnOwnedProcess (F1a)", () => {
 		await waitFor(() => liveOwnedProcessCount() === before);
 	});
 
-	test("an already-aborted signal disposes the process immediately", async () => {
+	test.skipIf(!isPosix)("an already-aborted signal disposes the process immediately", async () => {
 		const before = liveOwnedProcessCount();
 		const owner = spawnOwnedProcess(["sh", "-c", "sleep 30"], {
 			name: "pre-aborted",
@@ -70,7 +105,7 @@ describe("spawnOwnedProcess (F1a)", () => {
 		await waitFor(() => liveOwnedProcessCount() === before);
 	});
 
-	test("aborting mid-run disposes and removes the abort listener", async () => {
+	test.skipIf(!isPosix)("aborting mid-run disposes and removes the abort listener", async () => {
 		const before = liveOwnedProcessCount();
 		const controller = new AbortController();
 		const owner = spawnOwnedProcess(["sh", "-c", "sleep 30"], {
@@ -199,7 +234,7 @@ describe("ownership regression: group liveness drives teardown (F1a)", () => {
 		}
 	});
 
-	test("owner stays tracked until dispose teardown completes", async () => {
+	test.skipIf(!isPosix)("owner stays tracked until dispose teardown completes", async () => {
 		const before = liveOwnedProcessCount();
 		const owner = spawnOwnedProcess(["sh", "-c", "sleep 30"], { name: "tracked-until-done", gracefulMs: 300 });
 		await Bun.sleep(50);
@@ -210,6 +245,53 @@ describe("ownership regression: group liveness drives teardown (F1a)", () => {
 		await disposing;
 		await waitFor(() => liveOwnedProcessCount() === before);
 	});
+
+	test.skipIf(!isWindows)(
+		"retains Windows ownership when an exited intermediary hides a live grandchild",
+		async () => {
+			const report = await runWindowsProbe("exited-intermediate");
+			expect(report.result).toEqual({ status: "identity_unverified" });
+			expect(report.rootStatus).toBe("exited");
+			expect(report.launcherStatus).toBe("exited");
+			expect(report.leafStatus).toBe("running");
+			expect(report.controlStatus).toBe("running");
+			expect(report.retainedOwners).toBe(2);
+			expect(report.ownerDisposed).toBe(false);
+			expect(report.diagnostic).toContain("root exited before descendant ownership was observed");
+			expect(report.rootIdentity).toMatch(/^windows:\d+$/);
+			expect(BigInt(report.leafIdentity.slice(8))).toBeGreaterThan(BigInt(report.rootIdentity.slice(8)));
+		},
+		30_000,
+	);
+
+	test.skipIf(!isWindows)(
+		"drains a verified Windows child after root exit without claiming complete ancestry",
+		async () => {
+			const report = await runWindowsProbe("exited-direct");
+			expect(report.result).toEqual({ status: "identity_unverified" });
+			expect(report.rootStatus).toBe("exited");
+			expect(report.leafStatus).toBe("exited");
+			expect(report.controlStatus).toBe("running");
+			expect(report.retainedOwners).toBe(2);
+			expect(report.ownerDisposed).toBe(false);
+			expect(report.diagnostic).toContain("refusing to report tree teardown complete");
+		},
+		30_000,
+	);
+
+	test.skipIf(!isWindows)(
+		"signals an observed live Windows root and child but retains ownership without a Job Object",
+		async () => {
+			const report = await runWindowsProbe("live-direct");
+			expect(report.result).toEqual({ status: "identity_unverified" });
+			expect(report.rootStatus).toBe("exited");
+			expect(report.leafStatus).toBe("exited");
+			expect(report.controlStatus).toBe("running");
+			expect(report.retainedOwners).toBe(2);
+			expect(report.ownerDisposed).toBe(false);
+		},
+		30_000,
+	);
 
 	test.skipIf(!isPosix)("disposeAllOwnedProcesses escalates SIGKILL for a SIGTERM-ignoring child", async () => {
 		const before = liveOwnedProcessCount();

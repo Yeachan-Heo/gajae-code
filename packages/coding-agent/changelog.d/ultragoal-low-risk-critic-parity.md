@@ -1,0 +1,3 @@
+### Fixed
+
+- Low-risk final-aggregate checkpoints accepted by the runtime validator can now pass the completion guard when their fresh, runtime-validated lane-selection proof omits the terminal critic. The same proof is used by identical-evidence checkpoint replay, preventing a valid reduced gate from being misclassified as permanently repairable.

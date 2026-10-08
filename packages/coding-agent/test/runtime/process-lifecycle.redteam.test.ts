@@ -9,8 +9,21 @@ import {
 	resourceOwnerCount,
 	spawnOwnedProcess,
 } from "@gajae-code/coding-agent/runtime/process-lifecycle";
+import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 
 const isPosix = process.platform !== "win32";
+
+function longRunnerCommand(): string[] {
+	return process.platform === "win32"
+		? ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30"]
+		: ["sh", "-c", "sleep 30"];
+}
+
+function exitCodeCommand(code: number): string[] {
+	return process.platform === "win32"
+		? ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", `exit ${code}`]
+		: ["sh", "-c", `exit ${code}`];
+}
 
 async function waitFor(predicate: () => boolean, timeoutMs = 5_000, label = "condition"): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
@@ -80,9 +93,29 @@ function processState(pid: number): string | undefined {
 }
 
 describe("process-lifecycle adversarial owned-process invariants", () => {
-	test("dispose immediately after spawn wins the startup race and returns to baseline", async () => {
+	test.skipIf(process.platform !== "win32")(
+		"signals a pinned Windows root but reports containment incomplete without a Job Object",
+		async () => {
+			const child = Bun.spawn(longRunnerCommand(), { stdout: "ignore", stderr: "ignore" });
+			const bindings = nativeProcessBindings();
+			const root = bindings.Process.fromPid(child.pid);
+			if (!root) {
+				child.kill();
+				throw new Error("could not pin Windows fixture root");
+			}
+			try {
+				await expect(root.terminate({ gracefulMs: -1, timeoutMs: 1_000 })).rejects.toThrow();
+				expect(root.status()).toBe(bindings.ProcessStatus.Exited);
+			} finally {
+				if (root.status() === bindings.ProcessStatus.Running) root.signalRoot(9);
+				await child.exited;
+			}
+		},
+	);
+
+	test.skipIf(!isPosix)("dispose immediately after spawn wins the startup race and returns to baseline", async () => {
 		const before = liveOwnedProcessCount();
-		const owner = spawnOwnedProcess(["sh", "-c", "printf ready; sleep 30"], {
+		const owner = spawnOwnedProcess(longRunnerCommand(), {
 			name: "redteam-immediate-dispose",
 			gracefulMs: 10,
 		});
@@ -94,9 +127,9 @@ describe("process-lifecycle adversarial owned-process invariants", () => {
 		await waitFor(() => liveOwnedProcessCount() === before, 2_000, "live count baseline after immediate dispose");
 	});
 
-	test("dispose of an already-exited process is a no-op and does not throw", async () => {
+	test.skipIf(!isPosix)("dispose of an already-exited process is a no-op and does not throw", async () => {
 		const before = liveOwnedProcessCount();
-		const owner = spawnOwnedProcess(["sh", "-c", "exit 7"], { name: "redteam-already-exited" });
+		const owner = spawnOwnedProcess(exitCodeCommand(7), { name: "redteam-already-exited" });
 		const exit = await owner.awaitExit({ timeoutMs: 2_000 });
 		expect(exit).toEqual({ exited: true, code: 7 });
 
@@ -244,70 +277,84 @@ time.sleep(100)
 		},
 	);
 
-	test("double and concurrent dispose share one settled result and issue one terminating signal", async () => {
-		const before = liveOwnedProcessCount();
-		const tmp = `/tmp/gjc-process-lifecycle-${process.pid}-${Date.now()}`;
-		const owner = spawnOwnedProcess(
-			// `sh` runs a TERM trap only after the current foreground command returns, so the
-			// polling interval must stay well under `gracefulMs` or SIGKILL beats the handler.
-			["sh", "-c", `trap 'echo term >> ${tmp}; exit 0' TERM; echo up > ${tmp}; while :; do sleep 0.05; done`],
-			{ name: "redteam-concurrent-dispose", gracefulMs: 2_000 },
-		);
-		try {
-			await waitForAsync(() => fileContains(tmp, "up"), 2_000, "child readiness marker");
-			const first = owner.dispose();
-			const second = owner.dispose();
-			expect(second).toBe(first);
-			await expect(Promise.all([first, second, owner.dispose()])).resolves.toEqual([
-				{ status: "terminated" },
-				{ status: "terminated" },
-				{ status: "terminated" },
-			]);
+	test.skipIf(!isPosix)(
+		"double and concurrent dispose share one settled result and issue one terminating signal",
+		async () => {
+			const before = liveOwnedProcessCount();
+			const tmp = `/tmp/gjc-process-lifecycle-${process.pid}-${Date.now()}`;
+			const owner = spawnOwnedProcess(
+				// `sh` runs a TERM trap only after the current foreground command returns, so the
+				// polling interval must stay well under `gracefulMs` or SIGKILL beats the handler.
+				["sh", "-c", `trap 'echo term >> ${tmp}; exit 0' TERM; echo up > ${tmp}; while :; do sleep 0.05; done`],
+				{ name: "redteam-concurrent-dispose", gracefulMs: 2_000 },
+			);
+			try {
+				await waitForAsync(() => fileContains(tmp, "up"), 2_000, "child readiness marker");
+				const first = owner.dispose();
+				const second = owner.dispose();
+				expect(second).toBe(first);
+				await expect(Promise.all([first, second, owner.dispose()])).resolves.toEqual([
+					{ status: "terminated" },
+					{ status: "terminated" },
+					{ status: "terminated" },
+				]);
+				const exit = await owner.awaitExit({ timeoutMs: 2_000 });
+				expect(exit.exited).toBe(true);
+				await waitFor(
+					() => liveOwnedProcessCount() === before,
+					2_000,
+					"live count baseline after concurrent dispose",
+				);
+				// The child's TERM trap appends the marker asynchronously, so awaitExit can
+				// return before that write lands under shard load. Poll for the single
+				// terminating signal instead of sampling the file once.
+				await waitForAsync(
+					async () => (await Bun.file(tmp).text()).split("\n").filter(line => line === "term").length === 1,
+					2_000,
+					"single term marker after concurrent dispose",
+				);
+				const marker = await Bun.file(tmp).text();
+				expect(marker.split("\n").filter(line => line === "term")).toHaveLength(1);
+			} finally {
+				try {
+					await owner.dispose();
+				} catch {
+					/* already disposed */
+				}
+				await Bun.$`rm -f ${tmp}`.quiet();
+			}
+		},
+	);
+
+	test.skipIf(!isPosix)(
+		"awaitExit with timeoutMs 0 reports a live long-runner without killing it, then dispose cleans it",
+		async () => {
+			const before = liveOwnedProcessCount();
+			const owner = spawnOwnedProcess(longRunnerCommand(), {
+				name: "redteam-zero-timeout",
+				gracefulMs: 10,
+			});
+			try {
+				const probe = await owner.awaitExit({ timeoutMs: 0 });
+				expect(probe.exited).toBe(false);
+				expect(owner.pid === undefined ? false : processAlive(owner.pid)).toBe(true);
+			} finally {
+				await owner.dispose();
+			}
 			const exit = await owner.awaitExit({ timeoutMs: 2_000 });
 			expect(exit.exited).toBe(true);
-			await waitFor(() => liveOwnedProcessCount() === before, 2_000, "live count baseline after concurrent dispose");
-			// The child's TERM trap appends the marker asynchronously, so awaitExit can
-			// return before that write lands under shard load. Poll for the single
-			// terminating signal instead of sampling the file once.
-			await waitForAsync(
-				async () => (await Bun.file(tmp).text()).split("\n").filter(line => line === "term").length === 1,
+			await waitFor(
+				() => liveOwnedProcessCount() === before,
 				2_000,
-				"single term marker after concurrent dispose",
+				"live count baseline after zero-timeout dispose",
 			);
-			const marker = await Bun.file(tmp).text();
-			expect(marker.split("\n").filter(line => line === "term")).toHaveLength(1);
-		} finally {
-			try {
-				await owner.dispose();
-			} catch {
-				/* already disposed */
-			}
-			await Bun.$`rm -f ${tmp}`.quiet();
-		}
-	});
+		},
+	);
 
-	test("awaitExit with timeoutMs 0 reports a live long-runner without killing it, then dispose cleans it", async () => {
-		const before = liveOwnedProcessCount();
-		const owner = spawnOwnedProcess(["sh", "-c", "sleep 30"], {
-			name: "redteam-zero-timeout",
-			gracefulMs: 10,
-		});
-		try {
-			const probe = await owner.awaitExit({ timeoutMs: 0 });
-			expect(probe.exited).toBe(false);
-			expect(owner.pid === undefined ? false : processAlive(owner.pid)).toBe(true);
-		} finally {
-			await owner.dispose();
-		}
-		const exit = await owner.awaitExit({ timeoutMs: 2_000 });
-		expect(exit.exited).toBe(true);
-		await waitFor(() => liveOwnedProcessCount() === before, 2_000, "live count baseline after zero-timeout dispose");
-	});
-
-	test("liveOwnedProcessCount returns to baseline after a batch of spawn and dispose", async () => {
+	test.skipIf(!isPosix)("liveOwnedProcessCount returns to baseline after a batch of spawn and dispose", async () => {
 		const before = liveOwnedProcessCount();
 		const owners = Array.from({ length: 8 }, (_, index) =>
-			spawnOwnedProcess(["sh", "-c", "sleep 30"], {
+			spawnOwnedProcess(longRunnerCommand(), {
 				name: `redteam-batch-${index}`,
 				gracefulMs: 10,
 			}),

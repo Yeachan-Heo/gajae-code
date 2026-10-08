@@ -1,0 +1,2 @@
+### Fixed
+- Without an atomic owned-spawn Job Object, Windows owned-process cleanup now reports `identity_unverified` and retains ownership even after draining every pinned descendant: a non-empty snapshot cannot prove that an exited intermediate hid no worker. Known pinned targets are still signaled when ancestry is incomplete, while unobserved descendants remain unresolved. Complete Windows containment requires atomic Job Object membership at spawn time.

@@ -7,6 +7,7 @@ import type {
 	UltragoalPlan,
 	UltragoalReceiptKind,
 } from "./ultragoal-runtime";
+import { isLowRiskTerminalCriticOmissionSelection } from "./ultragoal-validation-policy";
 
 export const CRITIC_VERDICT_EVENT = "critic_verdict";
 export const CRITIC_GATE_HARD_STOP_EVENT = "critic_gate_hard_stop";
@@ -115,37 +116,63 @@ export function countTerminalCriticVerdicts(ledger: readonly UltragoalLedgerEven
 	return ledger.filter(event => event.event === CRITIC_VERDICT_EVENT && event.planGeneration === planGeneration)
 		.length;
 }
-/** Pure: count every non-OKAY terminal critic verdict recorded for this run. */
+/** Pure: count non-OKAY terminal critic verdicts for one acceptance/change generation. */
 export function countNonOkayTerminalCriticVerdicts(
 	ledger: readonly UltragoalLedgerEvent[],
-	_legacyPlanGeneration?: string,
+	planGeneration?: string,
 ): number {
-	return ledger.filter(event => event.event === CRITIC_VERDICT_EVENT && event.verdict !== "OKAY").length;
+	return ledger.filter(
+		event =>
+			event.event === CRITIC_VERDICT_EVENT &&
+			event.verdict !== "OKAY" &&
+			(planGeneration === undefined || event.planGeneration === planGeneration),
+	).length;
 }
 
 export function terminalCriticHardStopReached(
 	ledger: readonly UltragoalLedgerEvent[],
-	_legacyPlanGeneration?: string,
+	planGeneration?: string,
 ): boolean {
-	return ledger.some(event => event.event === CRITIC_GATE_HARD_STOP_EVENT);
+	return ledger.some(
+		event =>
+			event.event === CRITIC_GATE_HARD_STOP_EVENT &&
+			(planGeneration === undefined || event.planGeneration === planGeneration),
+	);
 }
 
-export function terminalCriticGateOverridden(ledger: readonly UltragoalLedgerEvent[]): boolean {
-	let overrideAfterLatestHardStop = false;
+export function terminalCriticGateOverridden(
+	ledger: readonly UltragoalLedgerEvent[],
+	planGeneration?: string,
+): boolean {
+	let hardStopIndex = -1;
 	for (let index = ledger.length - 1; index >= 0; index--) {
 		const event = ledger[index];
-		if (event.event === CRITIC_GATE_OVERRIDE_EVENT) overrideAfterLatestHardStop = true;
-		if (event.event === CRITIC_GATE_HARD_STOP_EVENT) return overrideAfterLatestHardStop;
+		if (
+			event.event === CRITIC_GATE_HARD_STOP_EVENT &&
+			(planGeneration === undefined || event.planGeneration === planGeneration)
+		) {
+			hardStopIndex = index;
+			break;
+		}
 	}
-	return false;
+	if (hardStopIndex < 0) return false;
+	const hardStopGeneration = ledger[hardStopIndex]?.planGeneration;
+	return ledger
+		.slice(hardStopIndex + 1)
+		.some(
+			event =>
+				event.event === CRITIC_GATE_OVERRIDE_EVENT &&
+				(typeof event.planGeneration !== "string" || event.planGeneration === hardStopGeneration),
+		);
 }
 
 export function terminalCriticCeilingReached(
 	ledger: readonly UltragoalLedgerEvent[],
-	_legacyPlanGeneration?: string,
+	planGeneration?: string,
 ): boolean {
 	return (
-		countNonOkayTerminalCriticVerdicts(ledger) >= TERMINAL_CRITIC_CEILING || terminalCriticHardStopReached(ledger)
+		countNonOkayTerminalCriticVerdicts(ledger, planGeneration) >= TERMINAL_CRITIC_CEILING ||
+		terminalCriticHardStopReached(ledger, planGeneration)
 	);
 }
 
@@ -306,11 +333,10 @@ export function findLedgerReceiptEvent(
 	);
 }
 /**
- * A final-aggregate receipt whose recorded ledger checkpoint quality gate is
- * missing a clean `criticReview` OKAY can never satisfy the completion guard,
- * yet is not "stale" under {@link validateReceiptFreshBase}. Detect it so an
- * identical-evidence complete replay can re-verify and re-mint with a
- * corrected gate instead of no-opping into a permanently blocked run.
+ * A final-aggregate receipt whose recorded checkpoint has neither a clean
+ * critic verdict nor the runtime-validated low-risk omission proof can never
+ * satisfy the completion guard. Detect it so identical-evidence replay can
+ * re-verify it instead of no-opping into a permanently blocked run.
  */
 export function finalAggregateReceiptMissingCriticOkay(
 	ledger: readonly UltragoalLedgerEvent[],
@@ -321,9 +347,14 @@ export function finalAggregateReceiptMissingCriticOkay(
 	if (!event) return false;
 	const gate = event.qualityGateJson;
 	if (typeof gate !== "object" || gate === null || Array.isArray(gate)) return true;
-	const criticReview = (gate as Record<string, unknown>).criticReview;
-	if (typeof criticReview !== "object" || criticReview === null || Array.isArray(criticReview)) return true;
-	return (criticReview as Record<string, unknown>).verdict !== "OKAY";
+	const gateObject = gate as Record<string, unknown>;
+	const criticReview = gateObject.criticReview;
+	const hasOkayCritic =
+		typeof criticReview === "object" &&
+		criticReview !== null &&
+		!Array.isArray(criticReview) &&
+		(criticReview as Record<string, unknown>).verdict === "OKAY";
+	return !hasOkayCritic && !isLowRiskTerminalCriticOmissionSelection(gateObject.validationLaneSelection);
 }
 
 export function validateReceiptFreshBase(input: {

@@ -75,6 +75,7 @@ export interface WorkflowRecoveryProjection {
 			| "run-plan-review"
 			| "revise-plan"
 			| "reconcile-intent"
+			| "recover-plan-admission"
 			| "final-aggregate-checkpoint"
 			| "awaiting-approval"
 			| "unknown";
@@ -105,8 +106,10 @@ export function trackWorkflowRecoveryZeroProgress(
 ): WorkflowRecoveryZeroProgressMemory {
 	const fingerprint = hashWorkflowRecoveryProjection(projection);
 	if (!memory) return { lastFingerprint: fingerprint, unchangedObservations: 0 };
-	const unchanged = memory.lastFingerprint === fingerprint ? memory.unchangedObservations + 1 : 0;
-	return { lastFingerprint: fingerprint, unchangedObservations: unchanged };
+	return {
+		lastFingerprint: fingerprint,
+		unchangedObservations: memory.lastFingerprint === fingerprint ? memory.unchangedObservations + 1 : 0,
+	};
 }
 
 export function isWorkflowRecoveryStalled(memory: WorkflowRecoveryZeroProgressMemory | undefined): boolean {
@@ -131,13 +134,48 @@ function boundText(value: unknown, maxChars: number): string | undefined {
  * the same bytes. Reading for projection and reopening for hashing lets a
  * concurrent replacement produce a digest over benign bytes while different
  * bytes reach the continuation prompt, so the two must never be split.
- * The handle is opened with `O_NOFOLLOW` and its identity is verified to be a
- * regular file before any bytes are trusted.
+ * POSIX uses `O_NOFOLLOW`. Windows verifies the lstat, opened-handle, and final
+ * path identities and confirms the canonical path remains under its run root.
  */
-async function readArtifactWithDigest(filePath: string): Promise<{ text: string; sha256: string } | undefined> {
-	if (process.platform === "win32") return undefined;
+async function readArtifactWithDigest(
+	filePath: string,
+	allowedRoot: string,
+): Promise<{ text: string; sha256: string } | undefined> {
 	let handle: fs.FileHandle | undefined;
 	try {
+		if (process.platform === "win32") {
+			const rootReal = await fs.realpath(allowedRoot);
+			const candidateReal = await fs.realpath(filePath);
+			const relative = path.relative(rootReal, candidateReal);
+			if (relative.startsWith("..") || path.isAbsolute(relative)) return undefined;
+			const before = await fs.lstat(filePath);
+			if (!before.isFile() || before.isSymbolicLink() || before.ino === 0) return undefined;
+			handle = await fs.open(filePath, nodeFsConstants.O_RDONLY);
+			const opened = await handle.stat();
+			if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) return undefined;
+			const buffer = await handle.readFile();
+			const [afterPath, afterReal, afterHandle] = await Promise.all([
+				fs.lstat(filePath),
+				fs.realpath(filePath),
+				handle.stat(),
+			]);
+			const afterRelative = path.relative(rootReal, afterReal);
+			if (
+				!afterPath.isFile() ||
+				afterPath.isSymbolicLink() ||
+				afterPath.dev !== before.dev ||
+				afterPath.ino !== before.ino ||
+				afterHandle.dev !== before.dev ||
+				afterHandle.ino !== before.ino ||
+				afterRelative.startsWith("..") ||
+				path.isAbsolute(afterRelative)
+			)
+				return undefined;
+			return {
+				text: buffer.toString("utf8"),
+				sha256: `sha256:${crypto.createHash("sha256").update(buffer).digest("hex")}`,
+			};
+		}
 		handle = await fs.open(filePath, nodeFsConstants.O_RDONLY | nodeFsConstants.O_NOFOLLOW);
 		const stat = await handle.stat();
 		if (!stat.isFile()) return undefined;
@@ -275,12 +313,41 @@ interface RalplanProjectionRow {
 	sha256?: unknown;
 	event?: unknown;
 	planning_stuck?: unknown;
+	generation?: unknown;
+	recovered_by_generation?: unknown;
+	lane?: unknown;
+	reason?: unknown;
+}
+
+function ralplanLaneAdmissionIdentity(row: RalplanProjectionRow): string | undefined {
+	if (
+		row.event === "planning_admission_rejected" &&
+		typeof row.generation === "number" &&
+		Number.isSafeInteger(row.generation) &&
+		row.generation >= 1 &&
+		(row.lane === "architect" || row.lane === "critic")
+	) {
+		return `${row.generation}\u0000${row.lane}`;
+	}
+	if (row.event === "planning_stuck" && typeof row.reason === "string") {
+		const legacy =
+			/^ralplan review lane budget exceeded: (architect|critic) pass [1-9]\d* of max [1-9]\d* in consensus iteration ([1-9]\d*)(?: \(ledger under-count: [^\r\n]*\))?$/.exec(
+				row.reason,
+			);
+		if (legacy && Number.isSafeInteger(Number(legacy[2]))) return `${Number(legacy[2])}\u0000${legacy[1]}`;
+	}
+	return undefined;
+}
+
+function isLegacyRalplanLaneOverflow(row: RalplanProjectionRow): boolean {
+	return row.event === "planning_stuck" && ralplanLaneAdmissionIdentity(row) !== undefined;
 }
 
 /**
- * Build a recovery projection from the newest complete Ralplan `final` stage
- * row of a run. Returns undefined when no parseable final artifact exists —
- * compaction then degrades to the thin projection instead of guessing.
+ * Build a recovery projection from the latest usable Ralplan artifact. For an
+ * active run, a planner/revision opener recorded after the newest final takes
+ * precedence until a replacement final is recorded. `finalOnly` ignores such
+ * openers. Returns undefined when the selected artifact cannot be verified.
  */
 async function projectRalplanRunInternal(
 	input: RalplanProjectionInput,
@@ -302,7 +369,10 @@ async function projectRalplanRunInternal(
 	}
 	const finalRow = [...rows].reverse().find(row => row.stage === "final");
 	const planRow = [...rows].reverse().find(row => row.stage === "revision" || row.stage === "planner");
-	const artifactRow = finalOnly ? finalRow : (finalRow ?? planRow);
+	const finalRowIndex = finalRow ? rows.lastIndexOf(finalRow) : -1;
+	const planRowIndex = planRow ? rows.lastIndexOf(planRow) : -1;
+	const postFinalOpener = !finalOnly && finalRowIndex >= 0 && planRowIndex > finalRowIndex;
+	const artifactRow = finalOnly ? finalRow : postFinalOpener ? planRow : (finalRow ?? planRow);
 	if (
 		typeof artifactRow?.path !== "string" ||
 		artifactRow.path.trim().length === 0 ||
@@ -311,7 +381,7 @@ async function projectRalplanRunInternal(
 		return undefined;
 	const artifactPath = await resolveRalplanArtifactPath(runDir, artifactRow.path, plansRoot);
 	if (!artifactPath) return undefined;
-	const artifact = await readArtifactWithDigest(artifactPath);
+	const artifact = await readArtifactWithDigest(artifactPath, plansRoot);
 	if (!artifact) return undefined;
 	const markdown = artifact.text;
 	const objective = objectiveFromMarkdown(markdown);
@@ -343,10 +413,38 @@ async function projectRalplanRunInternal(
 	if (!/^sha256:[0-9a-f]{64}$/.test(recorded) || recorded !== sha256) return undefined;
 	const stage = typeof artifactRow.stage === "string" ? artifactRow.stage : "unknown";
 	const latestStage = typeof rows.at(-1)?.stage === "string" ? rows.at(-1)?.stage : undefined;
-	const planningStuck = rows.some(row => row.event === "planning_stuck" && row.planning_stuck === true);
+	const planningStuck = rows.some(
+		row => row.event === "planning_stuck" && row.planning_stuck === true && !isLegacyRalplanLaneOverflow(row),
+	);
+	const rejectedAdmissions = new Set<string>();
+	const recoveredAdmissions = new Set<string>();
+	for (const row of rows) {
+		const identity = ralplanLaneAdmissionIdentity(row);
+		if (identity) rejectedAdmissions.add(identity);
+		if (
+			row.event === "planning_admission_recovered" &&
+			typeof row.generation === "number" &&
+			Number.isInteger(row.generation) &&
+			typeof row.recovered_by_generation === "number" &&
+			Number.isInteger(row.recovered_by_generation) &&
+			row.recovered_by_generation > row.generation &&
+			(row.lane === "architect" || row.lane === "critic")
+		) {
+			recoveredAdmissions.add(`${row.generation}\u0000${row.lane}`);
+		}
+	}
+	const planningAdmissionPending = [...rejectedAdmissions].some(identity => !recoveredAdmissions.has(identity));
+	const recoveryAfterFinal =
+		finalRowIndex >= 0 && rows.slice(finalRowIndex + 1).some(row => row.event === "planning_admission_recovered");
 	let nextAction: WorkflowRecoveryProjection["nextAction"];
 	if (planningStuck) {
 		nextAction = { actionClass: "awaiting-approval", detail: "planning-stuck" };
+	} else if (planningAdmissionPending) {
+		nextAction = { actionClass: "recover-plan-admission", detail: "review-lane-admission-unresolved" };
+	} else if (postFinalOpener) {
+		nextAction = { actionClass: "run-plan-review" };
+	} else if (recoveryAfterFinal) {
+		nextAction = { actionClass: "run-plan-review", detail: "refresh-final-after-admission-recovery" };
 	} else if (stage === "final") {
 		nextAction = { actionClass: "awaiting-approval" };
 	} else if (latestStage === "critic") {

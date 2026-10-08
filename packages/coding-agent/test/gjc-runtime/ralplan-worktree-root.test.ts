@@ -2,12 +2,38 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
+import { runNativeRalplanCommand as runNativeRalplanCommandImpl } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
 import { runRalplanCliCommand } from "../../src/commands/ralplan";
 import ralplanPersistenceTemplate from "../../src/prompts/agent-fragments/ralplan-persistence.md" with { type: "text" };
 
 const tempRoots: string[] = [];
 const recursiveForce = { recursive: true, force: true } as const;
+const activeRunIds = new Map<string, string>();
+
+async function runNativeRalplanCommand(args: string[], cwd = process.cwd(), options: { agentDir?: string } = {}) {
+	const sessionIndex = args.indexOf("--session-id");
+	const runIdIndex = args.indexOf("--run-id");
+	const sessionId = sessionIndex >= 0 ? args[sessionIndex + 1] : undefined;
+	const adjustedArgs = [...args];
+	if (args.includes("--write") && sessionId && runIdIndex >= 0 && args[runIdIndex + 1] === sessionId) {
+		const activeRunId = activeRunIds.get(sessionId);
+		if (activeRunId) adjustedArgs[runIdIndex + 1] = activeRunId;
+	}
+	const result = await runNativeRalplanCommandImpl(adjustedArgs, cwd, options);
+	if (!args.includes("--write") && result.status === 0 && sessionId) {
+		const jsonRunId = (() => {
+			try {
+				return (JSON.parse(result.stdout ?? "{}") as { run_id?: unknown }).run_id;
+			} catch {
+				return undefined;
+			}
+		})();
+		const textRunId = result.stdout?.match(/\brun_id=([A-Za-z0-9_-]+)/u)?.[1];
+		const runId = typeof jsonRunId === "string" ? jsonRunId : textRunId;
+		if (runId) activeRunIds.set(sessionId, runId);
+	}
+	return result;
+}
 
 let priorSessionId: string | undefined;
 beforeAll(() => {
@@ -78,7 +104,7 @@ function statePath(root: string, sessionId: string): string {
 }
 
 function runDir(root: string, sessionId: string, runId: string): string {
-	return path.join(root, ".gjc", `_session-${sessionId}`, "plans", "ralplan", runId);
+	return path.join(root, ".gjc", `_session-${sessionId}`, "plans", "ralplan", activeRunIds.get(sessionId) ?? runId);
 }
 
 function hudPath(root: string, sessionId: string): string {
@@ -92,8 +118,12 @@ function activeEntryPath(root: string, sessionId: string): string {
 async function symlinkDir(target: string, prefix: string): Promise<string> {
 	const parent = await tempDir(prefix);
 	const link = path.join(parent, "link");
-	await fs.symlink(target, link);
+	await fs.symlink(target, link, process.platform === "win32" ? "junction" : "dir");
 	return link;
+}
+
+async function symlinkDirectory(target: string, link: string): Promise<void> {
+	await fs.symlink(target, link, process.platform === "win32" ? "junction" : "dir");
 }
 
 function explicitWriteArgs(input: {
@@ -294,7 +324,7 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		);
 		expect(first.status).toBe(0);
 		const second = await runNativeRalplanCommand(
-			["--worktree-root", target, "--session-id", session, "--json", "resume task"],
+			["--worktree-root", target, "--session-id", session, "--resume", "--json", "resume task"],
 			dispatcher,
 		);
 		expect(second.status).toBe(0);
@@ -487,7 +517,7 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
 	});
 
-	it("keeps duplicate-write and owner-session conflict behavior in explicit-target mode", async () => {
+	it("keeps duplicate-write behavior and rejects foreign sessions in explicit-target mode", async () => {
 		const session = "wt-dedupe";
 		const target = await initRepo("gjc-ralplan-target-");
 		const dispatcher = await initRepo("gjc-ralplan-dispatcher-");
@@ -547,7 +577,7 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 			dispatcher,
 		);
 		expect(foreign.status).toBe(2);
-		expect(foreign.stderr ?? "").toMatch(/is owned by session/);
+		expect(foreign.stderr ?? "").toMatch(/holds no seeded ralplan run state/);
 	});
 	it("canonicalizes absolute, nested-relative, and symlink --worktree-root onto one realpath", async () => {
 		const session = "wt-path-shapes";
@@ -568,12 +598,12 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		);
 		expect(viaAbsolute.status).toBe(0);
 		const viaRelative = await runNativeRalplanCommand(
-			["--worktree-root", relativeViaDotDot, "--session-id", session, "--json", "relative task"],
+			["--worktree-root", relativeViaDotDot, "--session-id", session, "--resume", "--json", "absolute task"],
 			nestedCwd,
 		);
 		expect(viaRelative.status).toBe(0);
 		const viaSymlink = await runNativeRalplanCommand(
-			["--worktree-root", targetLink, "--session-id", session, "--json", "symlink task"],
+			["--worktree-root", targetLink, "--session-id", session, "--resume", "--json", "absolute task"],
 			dispatcher,
 		);
 		expect(viaSymlink.status).toBe(0);
@@ -638,7 +668,7 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		expect(firstWrite.status).toBe(0);
 
 		const restart = await runNativeRalplanCommand(
-			["--worktree-root", target, "--session-id", session, "--json", "restart task"],
+			["--worktree-root", target, "--session-id", session, "--resume", "--json", "restart task"],
 			laterDispatcher,
 		);
 		expect(restart.status).toBe(0);
@@ -757,11 +787,12 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 			dispatcher,
 		);
 		expect(stuck.status).toBe(3);
-		expect(stuck.stderr ?? "").toMatch(/PLANNING-STUCK/);
+		expect(stuck.stderr ?? "").toMatch(/RALPLAN-ADMISSION-REJECTED/);
 		const index = await fs.readFile(path.join(runDir(target, session, session), "index.jsonl"), "utf-8");
-		expect(index).toMatch(/planning_stuck/);
+		expect(index).toMatch(/planning_admission_rejected/);
+		expect(index).not.toMatch(/"event":"planning_stuck"/);
 		const state = await readState(target, session);
-		expect(state.planning_stuck).toEqual(expect.objectContaining({ marker: "PLANNING-STUCK" }));
+		expect(state.planning_stuck).toBeUndefined();
 		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
 	});
 	it("rejects a fake .git directory that is not a valid worktree before mutation", async () => {
@@ -974,7 +1005,7 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		const target = await initRepo("gjc-ralplan-target-");
 		const dispatcher = await initRepo("gjc-ralplan-dispatcher-");
 		const outside = await tempDir("gjc-ralplan-gjc-outside-");
-		await fs.symlink(outside, path.join(target, ".gjc"));
+		await symlinkDirectory(outside, path.join(target, ".gjc"));
 		const seed = await runNativeRalplanCommand(
 			["--worktree-root", target, "--session-id", session, "--json", "symlink gjc"],
 			dispatcher,
@@ -985,41 +1016,44 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
 	});
 
-	it("rejects an in-cwd artifact symlink so a swapped path cannot be followed", async () => {
-		const session = "wt-artifact-nofollow";
-		const target = await initRepo("gjc-ralplan-target-");
-		const dispatcher = await initRepo("gjc-ralplan-dispatcher-");
-		const outsider = await tempDir("gjc-ralplan-outside-swap-");
-		await fs.writeFile(path.join(outsider, "secret.md"), "external bytes\n");
-		await fs.symlink(path.join(outsider, "secret.md"), path.join(dispatcher, "plan.md"));
-		expect(
-			(
-				await runNativeRalplanCommand(
-					["--worktree-root", target, "--session-id", session, "nofollow task"],
-					dispatcher,
-				)
-			).status,
-		).toBe(0);
-		const write = await runNativeRalplanCommand(
-			explicitWriteArgs({
-				worktreeRoot: target,
-				stage: "planner",
-				stageN: 1,
-				session,
-				artifact: "plan.md",
-			}),
-			dispatcher,
-		);
-		expect(write.status).toBe(2);
-		expect(write.stderr ?? "").toMatch(/escapes the invoking cwd|failed to read --artifact/);
-		expect(await pathExists(path.join(runDir(target, session, session), "stage-01-planner.md"))).toBe(false);
-	});
+	it.skipIf(process.platform === "win32")(
+		"rejects an in-cwd artifact symlink so a swapped path cannot be followed",
+		async () => {
+			const session = "wt-artifact-nofollow";
+			const target = await initRepo("gjc-ralplan-target-");
+			const dispatcher = await initRepo("gjc-ralplan-dispatcher-");
+			const outsider = await tempDir("gjc-ralplan-outside-swap-");
+			await fs.writeFile(path.join(outsider, "secret.md"), "external bytes\n");
+			await fs.symlink(path.join(outsider, "secret.md"), path.join(dispatcher, "plan.md"));
+			expect(
+				(
+					await runNativeRalplanCommand(
+						["--worktree-root", target, "--session-id", session, "nofollow task"],
+						dispatcher,
+					)
+				).status,
+			).toBe(0);
+			const write = await runNativeRalplanCommand(
+				explicitWriteArgs({
+					worktreeRoot: target,
+					stage: "planner",
+					stageN: 1,
+					session,
+					artifact: "plan.md",
+				}),
+				dispatcher,
+			);
+			expect(write.status).toBe(2);
+			expect(write.stderr ?? "").toMatch(/escapes the invoking cwd|failed to read --artifact/);
+			expect(await pathExists(path.join(runDir(target, session, session), "stage-01-planner.md"))).toBe(false);
+		},
+	);
 	it("public CLI refuses a symlinked target .gjc before settings migration", async () => {
 		const target = await initRepo("gjc-ralplan-target-");
 		const dispatcher = await initRepo("gjc-ralplan-dispatcher-");
 		const outside = await tempDir("gjc-ralplan-gjc-outside-cli-");
 		await fs.writeFile(path.join(outside, "settings.json"), JSON.stringify({ "gjc.ralplan.maxIterations": 7 }));
-		await fs.symlink(outside, path.join(target, ".gjc"));
+		await symlinkDirectory(outside, path.join(target, ".gjc"));
 		const probe = path.join(import.meta.dir, "../fixtures/ralplan-cli-worktree-root-probe.ts");
 		const proc = Bun.spawn(
 			[process.execPath, probe, "--worktree-root", target, "--session-id", "cli-gjc-symlink", "--json", "task"],

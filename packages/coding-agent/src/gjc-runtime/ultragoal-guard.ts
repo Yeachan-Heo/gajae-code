@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import { DEFAULT_ULTRAGOAL_OBJECTIVE } from "./goal-mode-request";
 import { resolveGjcSessionForRead, SessionResolutionError } from "./session-resolution";
 import {
+	computeCriticVerdictPlanGeneration,
 	findCleanPauseCriticVerdict,
 	findLedgerReceiptEvent,
 	terminalCriticCeilingReached,
@@ -25,6 +26,7 @@ import {
 	type UltragoalPlan,
 	type UltragoalReceiptKind,
 } from "./ultragoal-runtime";
+import { isLowRiskTerminalCriticOmissionSelection } from "./ultragoal-validation-policy";
 
 export type UltragoalGuardState =
 	| "inactive"
@@ -261,31 +263,6 @@ export function validateCompletionReceipt(input: {
 			goalId: input.goal.id,
 		};
 	}
-	if (input.receiptKind === "final-aggregate") {
-		const checkpointEvent = findLedgerReceiptEvent(input.ledger, receipt);
-		if (checkpointEvent) {
-			const qualityGate =
-				typeof checkpointEvent.qualityGateJson === "object" &&
-				checkpointEvent.qualityGateJson !== null &&
-				!Array.isArray(checkpointEvent.qualityGateJson)
-					? (checkpointEvent.qualityGateJson as Record<string, unknown>)
-					: undefined;
-			const criticReview =
-				qualityGate &&
-				typeof qualityGate.criticReview === "object" &&
-				qualityGate.criticReview !== null &&
-				!Array.isArray(qualityGate.criticReview)
-					? (qualityGate.criticReview as Record<string, unknown>)
-					: undefined;
-			if (criticReview?.verdict !== "OKAY") {
-				return {
-					state: "active_missing_critic_verdict",
-					message: `Ultragoal ${input.goal.id} final aggregate receipt checkpoint requires criticReview with verdict OKAY.`,
-					goalId: input.goal.id,
-				};
-			}
-		}
-	}
 	if (receipt.validationBatch?.role === "deferred-member") {
 		return validateDeferredMemberReceiptFresh({
 			plan: input.plan,
@@ -305,7 +282,37 @@ export function validateCompletionReceipt(input: {
 	});
 	if (baseDiagnostic) return baseDiagnostic;
 	if (input.receiptKind === "final-aggregate") {
-		if (terminalCriticCeilingReached(input.ledger) && !terminalCriticGateOverridden(input.ledger)) {
+		const checkpointEvent = findLedgerReceiptEvent(input.ledger, receipt);
+		const qualityGate =
+			typeof checkpointEvent?.qualityGateJson === "object" &&
+			checkpointEvent.qualityGateJson !== null &&
+			!Array.isArray(checkpointEvent.qualityGateJson)
+				? (checkpointEvent.qualityGateJson as Record<string, unknown>)
+				: undefined;
+		const criticReview =
+			qualityGate &&
+			typeof qualityGate.criticReview === "object" &&
+			qualityGate.criticReview !== null &&
+			!Array.isArray(qualityGate.criticReview)
+				? (qualityGate.criticReview as Record<string, unknown>)
+				: undefined;
+		if (
+			criticReview?.verdict !== "OKAY" &&
+			!isLowRiskTerminalCriticOmissionSelection(qualityGate?.validationLaneSelection)
+		) {
+			return {
+				state: "active_missing_critic_verdict",
+				message: `Ultragoal ${input.goal.id} final aggregate receipt checkpoint requires criticReview with verdict OKAY unless its fresh, runtime-validated lane selection proves the low-risk unchanged-basis omission.`,
+				goalId: input.goal.id,
+			};
+		}
+	}
+	if (input.receiptKind === "final-aggregate") {
+		const planGeneration = computeCriticVerdictPlanGeneration(input.plan);
+		if (
+			terminalCriticCeilingReached(input.ledger, planGeneration) &&
+			!terminalCriticGateOverridden(input.ledger, planGeneration)
+		) {
 			return {
 				state: "active_stale_receipt",
 				message: `Ultragoal ${input.goal.id} final aggregate receipt is stale because the terminal-critic ceiling is currently reached.`,
@@ -896,6 +903,8 @@ export function isUltragoalBypassPrompt(prompt: string): boolean {
 export interface UltragoalPauseBlockDiagnostic {
 	blocked: boolean;
 	reason: string;
+	/** A fresh durable human-only classification makes autonomous nudges ineffective. */
+	humanBlocked?: boolean;
 }
 
 /**
@@ -924,18 +933,35 @@ export async function isUltragoalPauseBlocked(cwd: string): Promise<UltragoalPau
 			reason: `Unable to read durable Ultragoal ledger: ${error instanceof Error ? error.message : String(error)}`,
 		};
 	}
-	if (terminalCriticCeilingReached(ledger) && !terminalCriticGateOverridden(ledger)) {
+	const classification = [...ledger].reverse().find(event => event.event === "blocker_classified");
+	const humanBlocked = classification?.classification === "human_blocked";
+	let plan: UltragoalPlan | null;
+	try {
+		plan = await readUltragoalPlan(cwd);
+	} catch (error) {
 		return {
 			blocked: true,
+			humanBlocked,
+			reason: `Unable to read durable Ultragoal plan for pause critic verdict: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	}
+	if (!plan) {
+		return { blocked: true, humanBlocked, reason: "Unable to read durable Ultragoal plan for pause critic verdict." };
+	}
+	const planGeneration = computeCriticVerdictPlanGeneration(plan);
+	if (terminalCriticCeilingReached(ledger, planGeneration) && !terminalCriticGateOverridden(ledger, planGeneration)) {
+		return {
+			blocked: true,
+			humanBlocked,
 			reason:
 				"The Ultragoal run hit the terminal-critic ceiling; requires human/leader `gjc ultragoal record-critic-gate-override` before further terminal attempts.",
 		};
 	}
 
-	const classification = [...ledger].reverse().find(event => event.event === "blocker_classified");
 	if (classification?.classification !== "human_blocked") {
 		return {
 			blocked: true,
+			humanBlocked: false,
 			reason:
 				"An Ultragoal run is active. Pausing requires the latest blocker_classified event to be human_blocked, followed by a bound clean pause terminal critic verdict.",
 		};
@@ -943,44 +969,35 @@ export async function isUltragoalPauseBlocked(cwd: string): Promise<UltragoalPau
 	if (typeof classification.eventId !== "string" || !classification.eventId.trim()) {
 		return {
 			blocked: true,
+			humanBlocked: true,
 			reason:
 				"Pausing requires a later fresh clean pause terminal critic OKAY verdict bound to the latest human_blocked blocker_classified event; a REJECT/ITERATE/stale/missing verdict blocks the pause and the run must keep executing.",
 		};
-	}
-	let plan: UltragoalPlan | null;
-	try {
-		plan = await readUltragoalPlan(cwd);
-	} catch (error) {
-		return {
-			blocked: true,
-			reason: `Unable to read durable Ultragoal plan for pause critic verdict: ${error instanceof Error ? error.message : String(error)}`,
-		};
-	}
-	if (!plan) {
-		return { blocked: true, reason: "Unable to read durable Ultragoal plan for pause critic verdict." };
 	}
 	const criticVerdict = findCleanPauseCriticVerdict(plan, ledger, classification.eventId);
 	if (!criticVerdict) {
 		return {
 			blocked: true,
+			humanBlocked: true,
 			reason:
 				"Pausing requires a later fresh clean pause terminal critic OKAY verdict bound to the latest human_blocked blocker_classified event; a REJECT/ITERATE/stale/missing verdict blocks the pause and the run must keep executing.",
 		};
 	}
 	return {
 		blocked: false,
+		humanBlocked: true,
 		reason:
 			"Latest blocker_classified event is human_blocked with a later fresh clean bound pause terminal critic verdict.",
 	};
 }
 
 export async function assertUltragoalPauseAllowed(cwd: string, agentDir?: string): Promise<void> {
-	if (cwd) {
+	const diagnostic = await isUltragoalPauseBlocked(cwd);
+	if (!diagnostic.blocked) return;
+	if (cwd && !diagnostic.humanBlocked) {
 		const nudge = await consumeUltragoalNudge({ cwd, surface: "pause", agentDir });
 		if (nudge.nudged) throw new Error(nudge.message);
 	}
-	const diagnostic = await isUltragoalPauseBlocked(cwd);
-	if (!diagnostic.blocked) return;
 	throw new Error(
 		[
 			diagnostic.reason,

@@ -108,7 +108,11 @@ describe("workflow recovery projection (#4560)", () => {
 			path.join(outsideRunDir, "index.jsonl"),
 			`${JSON.stringify({ stage: "final", stage_n: 1, path: "stage-01-final.md", sha256: digest })}\n`,
 		);
-		await fs.symlink(outsideRunDir, ralplanRunDir(tempDir.path(), "symlinked-run"));
+		await fs.symlink(
+			outsideRunDir,
+			ralplanRunDir(tempDir.path(), "symlinked-run"),
+			process.platform === "win32" ? "junction" : "dir",
+		);
 
 		await expect(
 			projectRalplanFinalRun({ cwd: tempDir.path(), sessionId: SESSION_ID, runId: "symlinked-run" }),
@@ -159,6 +163,102 @@ describe("workflow recovery projection (#4560)", () => {
 		expect(projection?.nextAction).toEqual({ actionClass: "awaiting-approval", detail: "planning-stuck" });
 	});
 
+	it("resumes unresolved lane admission at recovery and refreshes a final written before recovery", async () => {
+		const runId = "recoverable-lane-admission";
+		const runDir = ralplanRunDir(tempDir.path(), runId);
+		const digest = crypto.createHash("sha256").update(FINAL_PLAN).digest("hex");
+		await Bun.write(path.join(runDir, "stage-01-final.md"), FINAL_PLAN);
+		await Bun.write(
+			path.join(runDir, "index.jsonl"),
+			`${JSON.stringify({ stage: "final", stage_n: 1, path: "stage-01-final.md", sha256: digest })}\n${JSON.stringify(
+				{
+					event: "planning_admission_rejected",
+					admission_rejected: true,
+					recoverable: true,
+					generation: 1,
+					stage_n: 2,
+					lane: "architect",
+				},
+			)}\n`,
+		);
+		await Bun.write(
+			path.join(tempDir.path(), ".gjc", `_session-${SESSION_ID}`, "state", "ralplan-state.json"),
+			JSON.stringify({ run_id: runId }),
+		);
+		let projection = await projectLatestRalplanRun({ cwd: tempDir.path(), sessionId: SESSION_ID });
+		expect(projection?.nextAction).toEqual({
+			actionClass: "recover-plan-admission",
+			detail: "review-lane-admission-unresolved",
+		});
+
+		await fs.appendFile(
+			path.join(runDir, "index.jsonl"),
+			`${JSON.stringify({
+				event: "planning_admission_recovered",
+				generation: 1,
+				recovered_by_generation: 2,
+				lane: "architect",
+			})}\n`,
+		);
+		projection = await projectLatestRalplanRun({ cwd: tempDir.path(), sessionId: SESSION_ID });
+		expect(projection?.nextAction).toEqual({
+			actionClass: "run-plan-review",
+			detail: "refresh-final-after-admission-recovery",
+		});
+	});
+
+	it.each([
+		"",
+		" (ledger under-count: parsed architect rows=0, on-disk architect artifacts=1)",
+	])("recognizes legacy lane-overflow markers as recoverable instead of terminal: %s", async ledgerNote => {
+		const runId = "legacy-lane-overflow-recovery";
+		const runDir = ralplanRunDir(tempDir.path(), runId);
+		const digest = crypto.createHash("sha256").update(FINAL_PLAN).digest("hex");
+		await Bun.write(path.join(runDir, "stage-01-final.md"), FINAL_PLAN);
+		await Bun.write(
+			path.join(runDir, "index.jsonl"),
+			`${JSON.stringify({ stage: "final", stage_n: 1, path: "stage-01-final.md", sha256: digest })}\n${JSON.stringify(
+				{
+					event: "planning_stuck",
+					planning_stuck: true,
+					reason: `ralplan review lane budget exceeded: architect pass 2 of max 1 in consensus iteration 1${ledgerNote}`,
+				},
+			)}\n`,
+		);
+		await Bun.write(
+			path.join(tempDir.path(), ".gjc", `_session-${SESSION_ID}`, "state", "ralplan-state.json"),
+			JSON.stringify({ run_id: runId }),
+		);
+		const projection = await projectLatestRalplanRun({ cwd: tempDir.path(), sessionId: SESSION_ID });
+		expect(projection?.nextAction).toEqual({
+			actionClass: "recover-plan-admission",
+			detail: "review-lane-admission-unresolved",
+		});
+	});
+
+	it.each([
+		"ralplan review lane budget exceeded: incomplete marker",
+		"ralplan review lane budget exceeded: architect pass 2 of max 1 in consensus iteration 0",
+		"ralplan review lane budget exceeded: architect pass invalid of max 1 in consensus iteration 1",
+	])("keeps malformed legacy admission terminal during recovery: %s", async reason => {
+		const runId = "malformed-legacy-admission";
+		const runDir = ralplanRunDir(tempDir.path(), runId);
+		await Bun.write(path.join(runDir, "stage-01-final.md"), FINAL_PLAN);
+		await Bun.write(
+			path.join(runDir, "index.jsonl"),
+			`${JSON.stringify({
+				stage: "final",
+				stage_n: 1,
+				path: "stage-01-final.md",
+				sha256: crypto.createHash("sha256").update(FINAL_PLAN).digest("hex"),
+			})}\n` + `${JSON.stringify({ event: "planning_stuck", planning_stuck: true, reason })}\n`,
+		);
+
+		const projection = await projectRalplanFinalRun({ cwd: tempDir.path(), sessionId: SESSION_ID, runId });
+
+		expect(projection?.nextAction).toEqual({ actionClass: "awaiting-approval", detail: "planning-stuck" });
+	});
+
 	it("resumes a planner-only run at intent reconciliation, not at consensus review", async () => {
 		// Regression for #4560 review P1-1: the manifest requires planner -> intent
 		// before Architect/Critic consensus. A compaction in that window previously
@@ -184,6 +284,47 @@ describe("workflow recovery projection (#4560)", () => {
 		expect(projection?.nextAction.detail).toBe("planner-without-intent-receipt");
 	});
 
+	it.each(["planner", "revision"] as const)("projects a post-final %s opener for plan review", async openerStage => {
+		const runId = `post-final-${openerStage}-opener`;
+		const runDir = ralplanRunDir(tempDir.path(), runId);
+		const openerPlan = `Repair the new widget parser regression.\n\n## Accepted Scope\n- parser/new-lookahead.ts\n\n## Non-Goals\n- Replacing the tokenizer\n`;
+		const finalDigest = crypto.createHash("sha256").update(FINAL_PLAN).digest("hex");
+		const openerDigest = crypto.createHash("sha256").update(openerPlan).digest("hex");
+		const openerPath = `stage-02-${openerStage}.md`;
+		await Bun.write(path.join(runDir, "stage-01-final.md"), FINAL_PLAN);
+		await Bun.write(path.join(runDir, openerPath), openerPlan);
+		await Bun.write(
+			path.join(runDir, "index.jsonl"),
+			`${JSON.stringify({ stage: "final", stage_n: 1, path: "stage-01-final.md", sha256: finalDigest })}\n${JSON.stringify(
+				{
+					stage: openerStage,
+					stage_n: 2,
+					path: openerPath,
+					sha256: openerDigest,
+				},
+			)}\n`,
+		);
+		await Bun.write(
+			path.join(tempDir.path(), ".gjc", `_session-${SESSION_ID}`, "state", "ralplan-state.json"),
+			JSON.stringify({ run_id: runId }),
+		);
+
+		const projection = await projectLatestRalplanRun({ cwd: tempDir.path(), sessionId: SESSION_ID });
+
+		expect(projection?.source).toBe("ralplan-run");
+		expect(projection?.provenance).toMatchObject({
+			runId,
+			stage: openerStage,
+			planPath: path.join(runDir, openerPath),
+			sha256: `sha256:${openerDigest}`,
+		});
+		expect(projection?.scope).toEqual([
+			{ kind: "accepted", text: "parser/new-lookahead.ts" },
+			{ kind: "non_goal", text: "Replacing the tokenizer" },
+		]);
+		expect(projection?.nextAction).toEqual({ actionClass: "run-plan-review" });
+	});
+
 	it("rejects a ralplan run reached through a symlinked ancestor directory", async () => {
 		// Regression for #4560 review P1-6: checking only the leaf run directory
 		// let a symlinked ancestor relocate the effective recovery root.
@@ -202,7 +343,11 @@ describe("workflow recovery projection (#4560)", () => {
 		const plansRoot = path.join(tempDir.path(), ".gjc", `_session-${SESSION_ID}`, "plans");
 		await fs.mkdir(plansRoot, { recursive: true });
 		// The `ralplan` ancestor component itself is a symlink out of the tree.
-		await fs.symlink(path.join(tempDir.path(), "outside"), path.join(plansRoot, "ralplan"));
+		await fs.symlink(
+			path.join(tempDir.path(), "outside"),
+			path.join(plansRoot, "ralplan"),
+			process.platform === "win32" ? "junction" : "dir",
+		);
 		await Bun.write(
 			path.join(tempDir.path(), ".gjc", `_session-${SESSION_ID}`, "state", "ralplan-state.json"),
 			JSON.stringify({ run_id: "evil-run" }),
@@ -385,6 +530,11 @@ describe("workflow recovery projection (#4560)", () => {
 		const recovered = trackWorkflowRecoveryZeroProgress(stalledMemory, { ...a, ...progressed } as typeof a);
 		expect(recovered.unchangedObservations).toBe(0);
 		expect(isWorkflowRecoveryStalled(recovered)).toBe(false);
+		// Tool starts, updates, and ends do not change this durable projection and
+		// therefore cannot reset the zero-progress observation count.
+		const sameProjectionAfterToolActivity = trackWorkflowRecoveryZeroProgress(stalledMemory, a);
+		expect(sameProjectionAfterToolActivity.unchangedObservations).toBe(ZERO_PROGRESS_STALL_THRESHOLD + 1);
+		expect(isWorkflowRecoveryStalled(sameProjectionAfterToolActivity)).toBe(true);
 	});
 });
 

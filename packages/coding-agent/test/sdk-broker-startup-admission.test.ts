@@ -26,7 +26,7 @@ import {
 	preparationBudgetMs,
 	startupQueueWaitMs,
 } from "../src/sdk/broker/startup-budget";
-import { DEFAULT_SDK_REQUEST_TIMEOUT_MS } from "../src/sdk/client/client";
+import { DEFAULT_SDK_REQUEST_TIMEOUT_MS } from "../src/sdk/client";
 import { normalizeSdkStartupFailure } from "../src/sdk/startup-capability";
 
 function controlledTiming(now: () => number): {
@@ -58,16 +58,6 @@ class TimeoutCapturingSdkClient {
 		this.timeoutMs = options?.timeoutMs;
 		return { ok: true };
 	}
-}
-
-/**
- * The adapter grants `deadline - Date.now()` when the client reads its timeout, so a
- * millisecond tick between computing and reading the deadline shortens it by one.
- * Pinning the clock makes the granted budget exactly comparable.
- */
-function freezeClock(): Disposable {
-	const now = spyOn(Date, "now").mockReturnValue(Date.now());
-	return { [Symbol.dispose]: () => now.mockRestore() };
 }
 
 test("SDK host startup concurrency scales sublinearly with observable CPU parallelism", () => {
@@ -601,31 +591,36 @@ test("a stop that cannot prove it still owns the root drains the queued startups
 }, 15_000);
 
 test("the ACP caller deadline covers the admission wait even when readiness is defaulted", async () => {
-	using _clock = freezeClock();
-	const defaulted = new TimeoutCapturingSdkClient();
-	await new AcpSdkAdapter({ client: defaulted as never }).global(
-		"session.create",
-		{ cwd: "/workspace" },
-		"defaulted-readiness",
-	);
-	expect(defaulted.timeoutMs).toBe(lifecycleStartupBudgetMs(DEFAULT_READINESS_TIMEOUT_MS) + 1_000);
+	// Capture the initial allowance without elapsed transport preparation time.
+	const clock = spyOn(Date, "now").mockReturnValue(1_000_000);
+	try {
+		const defaulted = new TimeoutCapturingSdkClient();
+		await new AcpSdkAdapter({ client: defaulted as never }).global(
+			"session.create",
+			{ cwd: "/workspace" },
+			"defaulted-readiness",
+		);
+		expect(defaulted.timeoutMs).toBe(lifecycleStartupBudgetMs(DEFAULT_READINESS_TIMEOUT_MS) + 1_000);
 
-	const requested = new TimeoutCapturingSdkClient();
-	await new AcpSdkAdapter({ client: requested as never }).global(
-		"session.create",
-		{ cwd: "/workspace", readinessTimeoutMs: 4_000 },
-		"requested-readiness",
-	);
-	expect(requested.timeoutMs).toBe(lifecycleStartupBudgetMs(4_000) + 1_000);
+		const requested = new TimeoutCapturingSdkClient();
+		await new AcpSdkAdapter({ client: requested as never }).global(
+			"session.create",
+			{ cwd: "/workspace", readinessTimeoutMs: 4_000 },
+			"requested-readiness",
+		);
+		expect(requested.timeoutMs).toBe(lifecycleStartupBudgetMs(4_000) + 1_000);
 
-	// An operation that never queues for a startup slot keeps its own readiness sizing.
-	const closing = new TimeoutCapturingSdkClient();
-	await new AcpSdkAdapter({ client: closing as never }).global(
-		"session.close",
-		{ sessionId: "s", readinessTimeoutMs: 4_000 },
-		"closing",
-	);
-	expect(closing.timeoutMs).toBe(5_000);
+		// An operation that never queues for a startup slot keeps its own readiness sizing.
+		const closing = new TimeoutCapturingSdkClient();
+		await new AcpSdkAdapter({ client: closing as never }).global(
+			"session.close",
+			{ sessionId: "s", readinessTimeoutMs: 4_000 },
+			"closing",
+		);
+		expect(closing.timeoutMs).toBe(5_000);
+	} finally {
+		clock.mockRestore();
+	}
 });
 test("caller timeout adds independent prep budgets for both worktree input shapes", () => {
 	expect(lifecycleStartupBudgetMs(DEFAULT_READINESS_TIMEOUT_MS)).toBe(20_000);
@@ -818,44 +813,48 @@ test("the production queue-wait sleep ends with its cutoff instead of its durati
 });
 
 test("the ACP caller deadline follows a supplied lifecycle deadline tuple, not the field it overrides", async () => {
-	using _clock = freezeClock();
-	const receivedAt = 1_000_000;
-	const tuple = deriveLifecycleDeadlines(receivedAt, 30_000);
+	const clock = spyOn(Date, "now").mockReturnValue(1_000_000);
+	try {
+		const receivedAt = 1_000_000;
+		const tuple = deriveLifecycleDeadlines(receivedAt, 30_000);
 
-	// The broker sizes both the admission wait and the readiness window from the tuple and
-	// ignores `readinessTimeoutMs` entirely, so budgeting the overridden field would cut the
-	// caller off long before the broker reaches its own terminal.
-	const supplied = new TimeoutCapturingSdkClient();
-	await new AcpSdkAdapter({ client: supplied as never }).global(
-		"session.create",
-		{ cwd: "/workspace", readinessTimeoutMs: 4_000, ...tuple },
-		"supplied-deadline-tuple",
-	);
-	expect(supplied.timeoutMs).toBe(lifecycleStartupBudgetMs(30_000) + 1_000);
+		// The broker sizes both the admission wait and the readiness window from the tuple and
+		// ignores `readinessTimeoutMs` entirely, so budgeting the overridden field would cut the
+		// caller off long before the broker reaches its own terminal.
+		const supplied = new TimeoutCapturingSdkClient();
+		await new AcpSdkAdapter({ client: supplied as never }).global(
+			"session.create",
+			{ cwd: "/workspace", readinessTimeoutMs: 4_000, ...tuple },
+			"supplied-deadline-tuple",
+		);
+		expect(supplied.timeoutMs).toBe(lifecycleStartupBudgetMs(30_000) + 1_000);
 
-	// A close carries no admission wait, so it is budgeted on the tuple's readiness alone.
-	const closing = new TimeoutCapturingSdkClient();
-	await new AcpSdkAdapter({ client: closing as never }).global(
-		"session.close",
-		{ sessionId: "s", ...tuple },
-		"closing-deadline-tuple",
-	);
-	expect(closing.timeoutMs).toBe(31_000);
+		// A close carries no admission wait, so it is budgeted on the tuple's readiness alone.
+		const closing = new TimeoutCapturingSdkClient();
+		await new AcpSdkAdapter({ client: closing as never }).global(
+			"session.close",
+			{ sessionId: "s", ...tuple },
+			"closing-deadline-tuple",
+		);
+		expect(closing.timeoutMs).toBe(31_000);
+	} finally {
+		clock.mockRestore();
+	}
 });
 
-test("the ACP caller leaves an unbudgetable lifecycle request on the generic client deadline", async () => {
-	using _clock = freezeClock();
+test("the ACP caller bounds an unbudgetable lifecycle request by the generic client deadline", async () => {
 	// A partial tuple conflicts with the broker's all-or-nothing deadline contract, and an
 	// out-of-range readiness value is out of contract on its own. Both are refused as invalid
-	// input before anything is queued, so neither may claim a startup-sized caller deadline. They stay
-	// bounded by the default client request deadline instead of going unbounded.
+	// input before anything is queued. The adapter explicitly supplies the remaining
+	// generic budget so transport preparation and replay cannot restart that deadline.
 	const partial = new TimeoutCapturingSdkClient();
 	await new AcpSdkAdapter({ client: partial as never }).global(
 		"session.create",
 		{ cwd: "/workspace", receivedAt: 1_000_000, requestedReadinessTimeoutMs: 30_000 },
 		"partial-deadline-tuple",
 	);
-	expect(partial.timeoutMs).toBe(DEFAULT_SDK_REQUEST_TIMEOUT_MS);
+	expect(partial.timeoutMs).toBeGreaterThan(0);
+	expect(partial.timeoutMs).toBeLessThanOrEqual(DEFAULT_SDK_REQUEST_TIMEOUT_MS);
 
 	const outOfRange = new TimeoutCapturingSdkClient();
 	await new AcpSdkAdapter({ client: outOfRange as never }).global(
@@ -863,5 +862,6 @@ test("the ACP caller leaves an unbudgetable lifecycle request on the generic cli
 		{ cwd: "/workspace", readinessTimeoutMs: 600_000 },
 		"out-of-range-readiness",
 	);
-	expect(outOfRange.timeoutMs).toBe(DEFAULT_SDK_REQUEST_TIMEOUT_MS);
+	expect(outOfRange.timeoutMs).toBeGreaterThan(0);
+	expect(outOfRange.timeoutMs).toBeLessThanOrEqual(DEFAULT_SDK_REQUEST_TIMEOUT_MS);
 });

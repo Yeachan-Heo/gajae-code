@@ -96,12 +96,14 @@ describe("/model batch assignments", () => {
 	});
 
 	test("assign all-role-agents writes only role-agent overrides with no active profile", async () => {
-		const { output, runtime, settings } = createRuntime();
+		const { output, runtime, session, settings } = createRuntime();
+		using selectionSpy = spyOn(session, "markUserModelSelection");
 		settings.setModelRole("default", "anthropic/default-model:medium");
 
 		await expect(
 			executeAcpBuiltinSlashCommand("/model assign all-role-agents claude-3-5-sonnet:low", runtime),
 		).resolves.toEqual({ consumed: true });
+		expect(selectionSpy).toHaveBeenCalledTimes(1);
 
 		expect(settings.getModelRole("default")).toBe("anthropic/default-model:medium");
 		expect(settings.get("task.agentModelOverrides")).toEqual({

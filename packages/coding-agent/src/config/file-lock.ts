@@ -239,8 +239,9 @@ function writeLockInfo(lockPath: string, info: LockInfo): Promise<LockInfo> {
 	// Owner metadata must stay readable by its own process under a restrictive
 	// umask: release re-reads this record to authorize removal, and an info file
 	// born mode 000 under umask 0777 would wedge the lock at first release.
-	return Bun.write(`${lockPath}/info`, JSON.stringify(info), { mode: 0o600 })
-		.then(() => fs.chmod(`${lockPath}/info`, 0o600))
+	return fs
+		.writeFile(path.join(lockPath, "info"), JSON.stringify(info), { mode: 0o600 })
+		.then(() => fs.chmod(path.join(lockPath, "info"), 0o600))
 		.then(() => info);
 }
 

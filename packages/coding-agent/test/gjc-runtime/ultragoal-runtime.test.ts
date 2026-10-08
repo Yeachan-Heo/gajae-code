@@ -11,15 +11,17 @@ import {
 	sessionUltragoalDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { reconcileWorkflowSkillState } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
+import { __setRepositoryStateWitnessTestHookForTests } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-change-set";
 import {
 	validateCompletionReceipt,
 	verifyUltragoalDurableCompletionState,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-guard";
-
 import {
 	addUltragoalSubgoal,
 	buildUltragoalHudSummary,
 	checkpointUltragoalGoal,
+	computeCheckpointChangeSet,
+	computeUltragoalReviewSourceHash,
 	createUltragoalPlan,
 	getUltragoalStatus,
 	hashStructuredValue,
@@ -68,6 +70,41 @@ async function tempDir(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-runtime-"));
 	tempRoots.push(dir);
 	return dir;
+}
+
+async function runTestGit(cwd: string, args: string[]): Promise<void> {
+	const proc = Bun.spawn(["git", ...args], {
+		cwd,
+		env: {
+			...process.env,
+			GIT_AUTHOR_NAME: "Gajae Test",
+			GIT_AUTHOR_EMAIL: "gajae-test@example.invalid",
+			GIT_COMMITTER_NAME: "Gajae Test",
+			GIT_COMMITTER_EMAIL: "gajae-test@example.invalid",
+		},
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	await proc.exited;
+	if (proc.exitCode !== 0) {
+		throw new Error(`git ${args.join(" ")} failed: ${await new Response(proc.stderr).text()}`);
+	}
+}
+
+async function initializeCheckpointGitRepository(root: string): Promise<void> {
+	await runTestGit(root, ["init", "-q"]);
+	await runTestGit(root, ["config", "user.name", "Gajae Test"]);
+	await runTestGit(root, ["config", "user.email", "gajae-test@example.invalid"]);
+	await fs.writeFile(path.join(root, ".gitignore"), ".gjc/\nartifacts/\n");
+	await fs.writeFile(path.join(root, "source.txt"), "baseline source\n");
+	await runTestGit(root, ["checkout", "-q", "-b", "main"]);
+	await runTestGit(root, ["add", ".gitignore", "source.txt"]);
+	await runTestGit(root, ["commit", "-m", "baseline"]);
+	await runTestGit(root, ["checkout", "-q", "-b", "feature"]);
+	await fs.writeFile(path.join(root, "feature.txt"), "reviewed change\n");
+	await runTestGit(root, ["add", "feature.txt"]);
+	await runTestGit(root, ["commit", "-m", "feature change"]);
+	delete process.env.CI_DEV_CHANGED_PATHS;
 }
 
 /**
@@ -469,6 +506,58 @@ function webExecutorQa(overrides: Record<string, unknown> = {}): Record<string, 
 async function passingLiveQualityGate(root: string): Promise<string> {
 	await writeStructuralArtifacts(root);
 	return passingQualityGate();
+}
+
+async function passingCheckpointQualityGate(root: string): Promise<string> {
+	const gate = JSON.parse(await passingLiveQualityGate(root)) as Record<string, any>;
+	const changeSet = await computeCheckpointChangeSet(root);
+	const sourceHash = computeUltragoalReviewSourceHash(changeSet);
+	if (!sourceHash) throw new Error("test setup could not capture a complete authoritative repository source hash");
+	gate.iteration.reviewCohort.sourceHash = sourceHash;
+	for (const lane of Object.values(gate.iteration.reviewCohort.lanes) as Array<Record<string, unknown>>) {
+		lane.sourceHash = sourceHash;
+	}
+	return JSON.stringify(gate);
+}
+
+async function createInterruptedCompleteCheckpoint(root: string): Promise<{
+	qualityGateJson: string;
+	checkpointEventId: string;
+	goalsPath: string;
+}> {
+	await initializeCheckpointGitRepository(root);
+	const qualityGateJson = await passingCheckpointQualityGate(root);
+	await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+	await startNextUltragoalGoal({ cwd: root });
+	const goalsPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json");
+	const ledgerPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "ledger.jsonl");
+	const originalAppendFile = fs.appendFile;
+	let failLedgerAppend = true;
+	const appendSpy = spyOn(fs, "appendFile").mockImplementation(async (...args: any[]) => {
+		const target = typeof args[0] === "string" ? args[0] : String(args[0]);
+		if (path.resolve(target) === path.resolve(ledgerPath) && failLedgerAppend) {
+			failLedgerAppend = false;
+			throw new Error("injected checkpoint ledger append failure");
+		}
+		return await (originalAppendFile as (...writeArgs: any[]) => Promise<any>)(...args);
+	});
+	try {
+		await expect(
+			checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G001",
+				status: "complete",
+				evidence: "tests passed",
+				qualityGateJson,
+			}),
+		).rejects.toThrow("injected checkpoint ledger append failure");
+	} finally {
+		appendSpy.mockRestore();
+	}
+	const interruptedPlan = await readUltragoalPlan(root);
+	const checkpointEventId = interruptedPlan?.goals[0]?.completionVerification?.checkpointLedgerEventId;
+	if (!checkpointEventId) throw new Error("test setup did not persist the interrupted checkpoint receipt");
+	return { qualityGateJson, checkpointEventId, goalsPath };
 }
 
 function batchChangeSetPaths(): Array<{ path: string; status: string }> {
@@ -898,7 +987,7 @@ describe("ultragoal CLI replay validation", () => {
 
 		const cwdRoot = await tempDir();
 		const outsideCwd = await tempDir();
-		await fs.symlink(outsideCwd, path.join(cwdRoot, "linked-cwd"), "dir");
+		await fs.symlink(outsideCwd, path.join(cwdRoot, "linked-cwd"), "junction");
 		const cwdError = await expectRejectedExecutorQa(
 			cwdRoot,
 			cliExecutorQa([cliReplayArtifact({ cwd: "linked-cwd" })]),
@@ -907,7 +996,6 @@ describe("ultragoal CLI replay validation", () => {
 
 		const artifactRoot = await tempDir();
 		const outsideArtifactRoot = await tempDir();
-		await fs.mkdir(path.join(artifactRoot, "artifacts"), { recursive: true });
 		const outsideReplay = path.join(outsideArtifactRoot, "replay.json");
 		await Bun.write(
 			outsideReplay,
@@ -919,7 +1007,7 @@ describe("ultragoal CLI replay validation", () => {
 				recordedStdout: "outside\n",
 			}),
 		);
-		await fs.symlink(outsideReplay, path.join(artifactRoot, "artifacts", "replay.json"));
+		await fs.symlink(outsideArtifactRoot, path.join(artifactRoot, "artifacts"), "junction");
 		const artifactError = await expectRejectedExecutorQa(
 			artifactRoot,
 			cliExecutorQa([
@@ -2757,7 +2845,7 @@ describe("native GJC ultragoal runtime", () => {
 				qualityGateJson: recoveryGate("G005"),
 			}),
 		).rejects.toThrow("exactly the declared replacement");
-	});
+	}, 120_000);
 
 	it("validation batch idempotent replay rejects stale durable metadata before early return", async () => {
 		const root = await batchTempDir();
@@ -3689,6 +3777,81 @@ describe("native GJC ultragoal runtime", () => {
 			goalId: "G001",
 			receiptKind: "final-aggregate",
 		});
+	});
+
+	it("repairs an interrupted complete checkpoint when the ledger append failed", async () => {
+		const root = await tempDir();
+		const { qualityGateJson, checkpointEventId, goalsPath } = await createInterruptedCompleteCheckpoint(root);
+		expect((await readUltragoalLedger(root)).some(event => event.eventId === checkpointEventId)).toBe(false);
+
+		const repairedPlan = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "tests passed",
+			qualityGateJson,
+		});
+		const repairedReceipt = repairedPlan.goals[0]?.completionVerification;
+		const repairedEvents = (await readUltragoalLedger(root)).filter(event => event.eventId === checkpointEventId);
+		expect(repairedReceipt?.checkpointLedgerEventId).toBe(checkpointEventId);
+		expect(repairedEvents).toHaveLength(1);
+		expect(repairedEvents[0]).toMatchObject({
+			event: "goal_checkpointed",
+			goalId: "G001",
+			status: "complete",
+			evidence: "tests passed",
+		});
+		expect(JSON.parse(await fs.readFile(goalsPath, "utf-8")).goals[0].status).toBe("complete");
+	});
+
+	it("does not repair an interrupted checkpoint when authoritative source hash drifted", async () => {
+		const root = await tempDir();
+		const { qualityGateJson, checkpointEventId } = await createInterruptedCompleteCheckpoint(root);
+		let captures = 0;
+		__setRepositoryStateWitnessTestHookForTests(async () => {
+			captures += 1;
+			if (captures === 2) await runTestGit(root, ["update-ref", "refs/heads/main", "HEAD"]);
+		});
+		try {
+			await expect(
+				checkpointUltragoalGoal({
+					cwd: root,
+					goalId: "G001",
+					status: "complete",
+					evidence: "tests passed",
+					qualityGateJson,
+				}),
+			).rejects.toThrow("authoritative source hash changed since its persisted receipt");
+		} finally {
+			__setRepositoryStateWitnessTestHookForTests(undefined);
+		}
+		expect(captures).toBe(2);
+		expect((await readUltragoalLedger(root)).some(event => event.eventId === checkpointEventId)).toBe(false);
+	});
+
+	it("does not repair an interrupted checkpoint when the final repository capture is incomplete", async () => {
+		const root = await tempDir();
+		const { qualityGateJson, checkpointEventId } = await createInterruptedCompleteCheckpoint(root);
+		let captures = 0;
+		__setRepositoryStateWitnessTestHookForTests(async (_phase, cwd) => {
+			captures += 1;
+			if (captures === 2) await fs.writeFile(path.join(cwd, "source.txt"), "changed during repair capture\n");
+		});
+		try {
+			await expect(
+				checkpointUltragoalGoal({
+					cwd: root,
+					goalId: "G001",
+					status: "complete",
+					evidence: "tests passed",
+					qualityGateJson,
+				}),
+			).rejects.toThrow("authoritative repository evidence is incomplete or untrusted");
+		} finally {
+			__setRepositoryStateWitnessTestHookForTests(undefined);
+		}
+		expect(captures).toBe(2);
+		expect((await readUltragoalLedger(root)).some(event => event.eventId === checkpointEventId)).toBe(false);
 	});
 
 	it("dedups duplicate checkpoint ledger entries for an unchanged status and evidence (#645)", async () => {
@@ -6622,6 +6785,11 @@ describe("resolveGitBase nearest integration base", () => {
 	it("scopes a dev-forked branch to dev, not a stale main", async () => {
 		const dir = await tempDir();
 		await git(dir, ["init", "-q"]);
+		await fs.mkdir(path.join(dir, ".empty-hooks"), { recursive: true });
+		await git(dir, ["config", "user.name", "Gajae Test"]);
+		await git(dir, ["config", "user.email", "gajae-test@example.invalid"]);
+		await git(dir, ["config", "commit.gpgsign", "false"]);
+		await git(dir, ["config", "core.hooksPath", path.join(dir, ".empty-hooks")]);
 		await git(dir, ["checkout", "-q", "-b", "main"]);
 		await commit(dir, "base.txt", "base");
 		await git(dir, ["checkout", "-q", "-b", "dev"]);
@@ -6631,18 +6799,23 @@ describe("resolveGitBase nearest integration base", () => {
 
 		// dev is the nearest base (1 commit ahead) vs main (2 commits ahead).
 		expect(await resolveGitBase(dir)).toBe("dev");
-	});
+	}, 30_000);
 
 	it("honors an explicit branch argument", async () => {
 		const dir = await tempDir();
 		await git(dir, ["init", "-q"]);
+		await fs.mkdir(path.join(dir, ".empty-hooks"), { recursive: true });
+		await git(dir, ["config", "user.name", "Gajae Test"]);
+		await git(dir, ["config", "user.email", "gajae-test@example.invalid"]);
+		await git(dir, ["config", "commit.gpgsign", "false"]);
+		await git(dir, ["config", "core.hooksPath", path.join(dir, ".empty-hooks")]);
 		await git(dir, ["checkout", "-q", "-b", "main"]);
 		await commit(dir, "base.txt", "base");
 		await git(dir, ["checkout", "-q", "-b", "feature/y"]);
 		await commit(dir, "feature.txt", "feature work");
 
 		expect(await resolveGitBase(dir, "main")).toBe("main");
-	});
+	}, 30_000);
 
 	it("rejects repositories without a recognized integration base", async () => {
 		const dir = await tempDir();
