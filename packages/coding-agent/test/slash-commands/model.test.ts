@@ -25,7 +25,6 @@ function createRuntime() {
 		},
 		getAvailableModels: () => [availableModel],
 		setConfiguredModelChain: () => {},
-		markUserModelSelection() {},
 		async setModel(model: { provider: string; id: string }, _role: "default", _options?: unknown) {
 			this.model = model;
 		},
@@ -38,6 +37,7 @@ function createRuntime() {
 		setActiveModelProfile(name: string | undefined) {
 			activeModelProfile = name;
 		},
+		markUserModelSelection() {},
 	};
 	const sessionManager = {
 		getSessionId: () => "session-1",

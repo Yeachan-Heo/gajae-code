@@ -2,16 +2,20 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { AgentToolResult } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { pythonBackend } from "@gajae-code/coding-agent/eval";
-import * as pythonExecutor from "@gajae-code/coding-agent/eval/py/executor";
-import type { PythonKernel as PythonKernelInstance } from "@gajae-code/coding-agent/eval/py/kernel";
-import * as pythonKernel from "@gajae-code/coding-agent/eval/py/kernel";
 import { AgentRegistry } from "@gajae-code/coding-agent/registry/agent-registry";
 import { createAgentSession, type ExtensionFactory, type WorkspaceTree } from "@gajae-code/coding-agent/sdk";
+import { isSessionDisposalIncompleteError } from "@gajae-code/coding-agent/session/agent-session";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Snowflake } from "@gajae-code/utils";
+import * as pythonExecutor from "../src/eval/py/executor";
+import type { PythonKernel as PythonKernelInstance } from "../src/eval/py/kernel";
+import * as pythonKernel from "../src/eval/py/kernel";
+import { sessionIpykernelsDir } from "../src/gjc-runtime/session-layout";
+import { PYTHON_TOOL_NAME } from "../src/tools/python";
 
 const OK_EXECUTION = { status: "ok", cancelled: false, timedOut: false, stdinRequested: false } as const;
 
@@ -99,7 +103,7 @@ const mockLongPythonDisposeSleepsImmediate = () => {
 const createSession = async (
 	tempDir: string,
 	cwd: string,
-	options: { extensions?: ExtensionFactory[]; sessionManager?: SessionManager } = {},
+	options: { extensions?: ExtensionFactory[]; sessionManager?: SessionManager; toolNames?: string[] } = {},
 ) =>
 	(
 		await createAgentSession({
@@ -117,7 +121,7 @@ const createSession = async (
 			slashCommands: [],
 			enableMCP: false,
 			enableLsp: false,
-			toolNames: ["eval"],
+			toolNames: options.toolNames ?? ["eval"],
 		})
 	).session;
 
@@ -136,6 +140,72 @@ const createMockKernel = () => {
 		}),
 	};
 };
+
+function toolText(result: AgentToolResult): string {
+	return result.content.map(block => (block.type === "text" ? block.text : "")).join("\n");
+}
+
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function waitForProcessFile(filePath: string, timeoutMs = 10_000): Promise<number> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		const file = Bun.file(filePath);
+		if (await file.exists()) {
+			const pid = Number((await file.text()).trim());
+			if (Number.isSafeInteger(pid) && pid > 0 && isProcessAlive(pid)) return pid;
+		}
+		await Bun.sleep(10);
+	}
+	throw new Error(`Timed out waiting for a live Python process in ${filePath}`);
+}
+
+async function waitForProcessGone(pid: number, timeoutMs = 10_000): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (!isProcessAlive(pid)) return true;
+		await Bun.sleep(25);
+	}
+	return !isProcessAlive(pid);
+}
+
+async function transcriptDirectories(cwd: string, sessionId: string): Promise<string[]> {
+	const root = sessionIpykernelsDir(cwd, sessionId);
+	const directories = new Set<string>();
+	try {
+		for await (const file of new Bun.Glob("*/transcript.jsonl").scan({ cwd: root })) {
+			directories.add(path.dirname(file));
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+	return [...directories].sort();
+}
+
+async function transcriptRecords(
+	cwd: string,
+	sessionId: string,
+	directory: string,
+): Promise<Array<Record<string, unknown>>> {
+	const raw = await Bun.file(path.join(sessionIpykernelsDir(cwd, sessionId), directory, "transcript.jsonl")).text();
+	return raw
+		.split(/\r?\n/)
+		.filter(Boolean)
+		.map(line => JSON.parse(line) as Record<string, unknown>);
+}
+
+async function transcriptBytes(cwd: string, sessionId: string, directory: string): Promise<Uint8Array> {
+	return new Uint8Array(
+		await Bun.file(path.join(sessionIpykernelsDir(cwd, sessionId), directory, "transcript.jsonl")).arrayBuffer(),
+	);
+}
 
 describe("AgentSession python cleanup", () => {
 	const tempDirs: string[] = [];
@@ -225,6 +295,166 @@ describe("AgentSession python cleanup", () => {
 		expect(startSpy).toHaveBeenCalledTimes(2);
 		expect(unrelatedKernel.execute).toHaveBeenCalledTimes(2);
 	});
+
+	it("joins held generation A cleanup and generation B process shutdown during SDK disposal", async () => {
+		const { tempDir, cwd } = createTempProject();
+		tempDirs.push(tempDir);
+		const session = await createSession(tempDir, cwd, { toolNames: [PYTHON_TOOL_NAME] });
+		const pythonTool = session.getToolByName(PYTHON_TOOL_NAME);
+		expect(pythonTool).toBeDefined();
+		if (!pythonTool) throw new Error("Expected the SDK Python tool");
+
+		const sessionId = session.sessionManager.getSessionId();
+		const pidFileA = path.join(tempDir, "python-generation-a.pid");
+		const pidFileB = path.join(tempDir, "python-generation-b.pid");
+		const codeA = `import os, time\nwith open(${JSON.stringify(pidFileA)}, "w") as pid_file:\n    pid_file.write(str(os.getpid()))\nprint("generation-a-held", flush=True)\ntime.sleep(30)`;
+		const codeB = `import os\nwith open(${JSON.stringify(pidFileB)}, "w") as pid_file:\n    pid_file.write(str(os.getpid()))\nprint("generation-b-ready", flush=True)`;
+		const realAvailability = pythonKernel.checkPythonKernelAvailability.bind(pythonKernel);
+		vi.spyOn(pythonKernel, "checkPythonKernelAvailability").mockImplementation((...args) =>
+			realAvailability(...args),
+		);
+		const realExecutePython = pythonExecutor.executePython.bind(pythonExecutor);
+		let executorCalls = 0;
+		vi.spyOn(pythonExecutor, "executePython").mockImplementation((...args) => {
+			executorCalls += 1;
+			return realExecutePython(...args);
+		});
+		const realStart = pythonKernel.PythonKernel.start.bind(pythonKernel.PythonKernel);
+		const shutdownAStarted = Promise.withResolvers<void>();
+		const shutdownBStarted = Promise.withResolvers<void>();
+		const releaseShutdownA = Promise.withResolvers<void>();
+		let firstKernel: pythonKernel.PythonKernel | undefined;
+		let kernelStarts = 0;
+		vi.spyOn(pythonKernel.PythonKernel, "start").mockImplementation(async options => {
+			const kernel = await realStart(options);
+			kernelStarts += 1;
+			if (kernelStarts === 1) {
+				firstKernel = kernel;
+				const originalShutdown = kernel.shutdown.bind(kernel);
+				kernel.shutdown = async shutdownOptions => {
+					shutdownAStarted.resolve();
+					await releaseShutdownA.promise;
+					return await originalShutdown(shutdownOptions);
+				};
+			} else {
+				const originalShutdown = kernel.shutdown.bind(kernel);
+				kernel.shutdown = async shutdownOptions => {
+					shutdownBStarted.resolve();
+					return await originalShutdown(shutdownOptions);
+				};
+			}
+			return kernel;
+		});
+		const executionA = pythonTool.execute("python-generation-a", { code: codeA });
+		let executionB: Promise<AgentToolResult> | undefined;
+		let clearSettled = false;
+		let clearA: Promise<AgentToolResult> | undefined;
+		let disposeSettled = false;
+		let disposePromise: Promise<void> | undefined;
+		let pidA: number | undefined;
+		let pidB: number | undefined;
+		let cleanupResults: PromiseSettledResult<unknown>[] = [];
+		try {
+			pidA = await waitForProcessFile(pidFileA);
+			expect(isProcessAlive(pidA)).toBe(true);
+			clearA = pythonTool.execute("python-clear-generation-a", { action: "clear" }).then(result => {
+				clearSettled = true;
+				return result;
+			});
+			await shutdownAStarted.promise;
+			expect(firstKernel).toBeDefined();
+			expect(isProcessAlive(pidA)).toBe(true);
+			await Bun.sleep(0);
+			expect(clearSettled).toBe(false);
+
+			executionB = pythonTool.execute("python-generation-b", { code: codeB });
+			const executionBStarted = executionB;
+			const resultA = await executionA;
+			expect(resultA.isError).toBeUndefined();
+			const resultB = await executionBStarted;
+			expect(resultB.isError).toBeUndefined();
+			pidB = await waitForProcessFile(pidFileB);
+			expect(isProcessAlive(pidB)).toBe(true);
+			expect(session.sessionManager.getSessionId()).toBe(sessionId);
+			const directories = await transcriptDirectories(cwd, sessionId);
+			expect(directories).toHaveLength(2);
+			const transcriptSnapshots = await Promise.all(
+				directories.map(async directory => ({
+					directory,
+					bytes: await transcriptBytes(cwd, sessionId, directory),
+					records: await transcriptRecords(cwd, sessionId, directory),
+				})),
+			);
+			expect(transcriptSnapshots.flatMap(transcript => transcript.records)).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({ code: codeA, cancelled: true }),
+					expect.objectContaining({ code: codeB, cancelled: false }),
+				]),
+			);
+
+			disposePromise = session.dispose().then(() => {
+				disposeSettled = true;
+			});
+			await shutdownBStarted.promise;
+			expect(isProcessAlive(pidA)).toBe(true);
+			expect(disposeSettled).toBe(false);
+			expect(clearSettled).toBe(false);
+			expect(kernelStarts).toBe(2);
+			expect(executorCalls).toBe(2);
+
+			releaseShutdownA.resolve();
+			await disposePromise;
+			expect(disposeSettled).toBe(true);
+			expect(clearSettled).toBe(true);
+			expect(await waitForProcessGone(pidA)).toBe(true);
+			expect(await waitForProcessGone(pidB)).toBe(true);
+			expect(toolText(resultA)).toContain("generation-a-held");
+			expect(toolText(resultB)).toContain("generation-b-ready");
+			await session.awaitDisposeCompletion();
+			for (const transcript of transcriptSnapshots) {
+				expect(await transcriptBytes(cwd, sessionId, transcript.directory)).toEqual(transcript.bytes);
+			}
+			await clearA;
+		} finally {
+			releaseShutdownA.resolve();
+			if (!disposePromise) disposePromise = session.dispose().then(() => undefined);
+			const disposeCleanup = (async (): Promise<void> => {
+				let callerFailure: unknown;
+				try {
+					await disposePromise;
+				} catch (error) {
+					if (!isSessionDisposalIncompleteError(error)) callerFailure = error;
+				}
+				let completionFailure: unknown;
+				try {
+					await session.awaitDisposeCompletion();
+				} catch (error) {
+					completionFailure = error;
+				}
+				if (callerFailure !== undefined && completionFailure !== undefined) {
+					throw new AggregateError([callerFailure, completionFailure], "SDK Python disposal failed.");
+				}
+				if (callerFailure !== undefined) throw callerFailure;
+				if (completionFailure !== undefined) throw completionFailure;
+			})();
+			const processWaits = [
+				...(pidA !== undefined ? [waitForProcessGone(pidA)] : []),
+				...(pidB !== undefined ? [waitForProcessGone(pidB)] : []),
+			];
+			cleanupResults = await Promise.allSettled([
+				disposeCleanup,
+				executionA,
+				...(executionB ? [executionB] : []),
+				...(clearA ? [clearA] : []),
+				...processWaits,
+			]);
+		}
+		const cleanupFailures = cleanupResults.flatMap(result => (result.status === "rejected" ? [result.reason] : []));
+		if (cleanupFailures.length === 1) throw cleanupFailures[0];
+		if (cleanupFailures.length > 1) throw new AggregateError(cleanupFailures, "SDK Python test cleanup failed.");
+		const processResults = cleanupResults.slice(4);
+		expect(processResults.every(result => result.status === "fulfilled" && result.value === true)).toBe(true);
+	}, 30_000);
 
 	it("does not dispose unrelated Python owners when createAgentSession fails after session construction", async () => {
 		const { tempDir, cwd } = createTempProject();
@@ -430,7 +660,7 @@ describe("AgentSession python cleanup", () => {
 		);
 	});
 
-	it("detaches retained kernel ownership even when dispose times out waiting for Python work", async () => {
+	it("retains kernel ownership cleanup until blocked Python work settles", async () => {
 		const { tempDir, cwd } = createTempProject();
 		tempDirs.push(tempDir);
 		const kernel = new FakeKernel();
@@ -444,50 +674,83 @@ describe("AgentSession python cleanup", () => {
 		vi.spyOn(pythonKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
 		const sleepSpy = mockLongPythonDisposeSleepsImmediate();
 
-		const startSpy = vi
-			.spyOn(pythonKernel.PythonKernel, "start")
-			.mockResolvedValue(kernel as unknown as PythonKernelInstance);
+		let kernelStarts = 0;
+		vi.spyOn(pythonKernel.PythonKernel, "start").mockImplementation(async () => {
+			kernelStarts += 1;
+			return kernel as unknown as PythonKernelInstance;
+		});
 
 		const firstSession = await createSession(tempDir, cwd);
 		const secondSession = await createSession(tempDir, cwd);
 
-		await secondSession.executePython("print('owner-b warmup')");
-		const firstExecution = firstSession.executePython("print('blocked')");
-		await blockedExecutionStarted.promise;
-		let firstExecutionSettled = false;
-		void firstExecution.finally(() => {
-			firstExecutionSettled = true;
-		});
+		let firstExecution: Promise<pythonExecutor.PythonResult> | undefined;
+		let firstDisposeCaller: Promise<void> | undefined;
+		let firstDisposeCompletion: Promise<void> | undefined;
+		let secondDisposeCaller: Promise<void> | undefined;
+		let secondDisposeCompletion: Promise<void> | undefined;
+		let cleanupFailures: unknown[] = [];
+		try {
+			await secondSession.executePython("print('owner-b warmup')");
+			firstExecution = firstSession.executePython("print('blocked')");
+			await blockedExecutionStarted.promise;
+			let firstExecutionSettled = false;
+			void firstExecution.then(
+				() => {
+					firstExecutionSettled = true;
+				},
+				() => {
+					firstExecutionSettled = true;
+				},
+			);
 
-		let firstDisposed = false;
-		const disposeFirst = firstSession.dispose().then(() => {
-			firstDisposed = true;
-		});
-		await disposeFirst;
-		expect(sleepSpy.mock.calls.some(([duration]) => isPythonDisposeWaitDuration(duration))).toBe(true);
+			let disposeRejectedAsIncomplete = false;
+			firstDisposeCaller = firstSession.dispose().catch(error => {
+				if (!isSessionDisposalIncompleteError(error)) throw error;
+				disposeRejectedAsIncomplete = true;
+			});
+			await firstDisposeCaller;
+			expect(sleepSpy.mock.calls.some(([duration]) => isPythonDisposeWaitDuration(duration))).toBe(true);
+			expect(disposeRejectedAsIncomplete).toBe(true);
+			expect(firstExecutionSettled).toBe(false);
+			expect(kernel.shutdownCalls).toBe(0);
+			expect(kernelStarts).toBe(1);
 
-		expect(firstDisposed).toBe(true);
-		expect(firstExecutionSettled).toBe(false);
-		expect(kernel.shutdownCalls).toBe(0);
-		expect(startSpy).toHaveBeenCalledTimes(1);
-
-		blockedExecution.resolve(OK_EXECUTION);
-		await expect(firstExecution).resolves.toMatchObject({
-			cancelled: false,
-			exitCode: 0,
-			stdinRequested: false,
-		});
-		await secondSession.executePython("print('owner-b after detach')");
-		expect(startSpy).toHaveBeenCalledTimes(1);
-		expect(kernel.executeCalls).toEqual([
-			"print('owner-b warmup')",
-			"print('blocked')",
-			"print('owner-b after detach')",
-		]);
-		await secondSession.dispose();
-
-		expect(kernel.shutdownCalls).toBe(1);
-	}, 10000);
+			blockedExecution.resolve(OK_EXECUTION);
+			await expect(firstExecution).resolves.toMatchObject({
+				cancelled: true,
+				stdinRequested: false,
+			});
+			firstDisposeCompletion = firstSession.awaitDisposeCompletion();
+			await firstDisposeCompletion;
+			expect(firstExecutionSettled).toBe(true);
+			expect(kernel.shutdownCalls).toBe(0);
+			expect(kernelStarts).toBe(1);
+			await secondSession.executePython("print('owner-b after detach')");
+			expect(kernelStarts).toBe(1);
+			expect(kernel.executeCalls).toEqual([
+				"print('owner-b warmup')",
+				"print('blocked')",
+				"print('owner-b after detach')",
+			]);
+			secondDisposeCaller = secondSession.dispose();
+			secondDisposeCompletion = secondSession.awaitDisposeCompletion();
+			await Promise.all([firstDisposeCompletion, secondDisposeCaller, secondDisposeCompletion]);
+			expect(kernel.shutdownCalls).toBe(1);
+		} finally {
+			blockedExecution.resolve(OK_EXECUTION);
+			const completions = [
+				...(firstExecution ? [firstExecution] : []),
+				...(firstDisposeCaller ? [firstDisposeCaller] : []),
+				...(secondDisposeCaller ? [secondDisposeCaller] : []),
+				firstSession.awaitDisposeCompletion(),
+				secondSession.awaitDisposeCompletion(),
+			];
+			const results = await Promise.allSettled(completions);
+			cleanupFailures = results.flatMap(result => (result.status === "rejected" ? [result.reason] : []));
+		}
+		if (cleanupFailures.length === 1) throw cleanupFailures[0];
+		if (cleanupFailures.length > 1) throw new AggregateError(cleanupFailures, "Python owner cleanup test failed.");
+	}, 30_000);
 
 	it("rejects direct session Python starts once dispose begins", async () => {
 		const { tempDir, cwd } = createTempProject();

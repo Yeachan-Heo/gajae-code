@@ -653,6 +653,7 @@ function reduceEvents(
 	now: number,
 	agentDir: string,
 	probedIncarnations?: ReadonlyMap<string, string | undefined>,
+	sessionIds?: ReadonlySet<string>,
 ): SessionIndexProjection {
 	// Resolved once: the fence-row check runs per root, and only this side of the
 	// comparison is ours to normalize.
@@ -669,7 +670,12 @@ function reduceEvents(
 		}
 		return identity;
 	};
-	const { admitted } = admitEvents(events);
+	// Admission and projection are keyed by sessionId (tuple, tombstone, identity),
+	// so a scoped read reduces only the requested sessions' events and skips the
+	// other sessions' pid/incarnation probes without changing their rows.
+	const { admitted } = admitEvents(
+		sessionIds === undefined ? events : events.filter(event => sessionIds.has(event.sessionId)),
+	);
 	const latestByIdentity = new Map<string, SessionIndexEvent>();
 	const latestHeartbeatByIdentity = new Map<string, SessionIndexEvent>();
 	for (const event of admitted) {
@@ -1350,6 +1356,10 @@ export class SessionIndex {
 	}
 	/** Seed the audit dedupe set once, then append records for newly-rejected events. */
 	async #writeAuditUnderLock(): Promise<void> {
+		const candidates = auditRecords(this.#events, this.#policy.clock());
+		// The audit log only dedupes rejections, so a reader with none never pays
+		// for loading it.
+		if (candidates.length === 0) return;
 		if (this.#auditedSeq === null) {
 			this.#auditedSeq = new Set();
 			try {
@@ -1367,9 +1377,7 @@ export class SessionIndex {
 				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 			}
 		}
-		const pending = auditRecords(this.#events, this.#policy.clock()).filter(
-			record => !this.#auditedSeq!.has(record.indexSeq),
-		);
+		const pending = candidates.filter(record => !this.#auditedSeq!.has(record.indexSeq));
 		if (pending.length === 0) return;
 		await appendSync(auditFor(this.#agentDir), pending.map(record => JSON.stringify(record)).join("\n"));
 		for (const record of pending) this.#auditedSeq.add(record.indexSeq);
@@ -1979,10 +1987,18 @@ export class SessionIndex {
 		this.#changeStamp = await readIndexChangeStamp(this.#agentDir);
 	}
 
-	listSessions(probedIncarnations?: ReadonlyMap<string, string | undefined>): SessionList {
+	/**
+	 * Public session rows. `sessionIds` scopes the projection to those sessions:
+	 * rows for them are identical to the unscoped read, other sessions are absent.
+	 */
+	listSessions(
+		probedIncarnations?: ReadonlyMap<string, string | undefined>,
+		sessionIds?: ReadonlySet<string>,
+	): SessionList {
 		return {
 			indexSeq: this.indexSeq,
-			sessions: reduceEvents(this.#events, this.#policy.clock(), this.#agentDir, probedIncarnations).sessions,
+			sessions: reduceEvents(this.#events, this.#policy.clock(), this.#agentDir, probedIncarnations, sessionIds)
+				.sessions,
 			warnings: this.#warnings,
 		};
 	}

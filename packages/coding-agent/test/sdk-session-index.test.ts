@@ -1806,6 +1806,78 @@ describe("SDK session index", () => {
 			expect.objectContaining({ sessionId: "deleted", endpointGeneration: registration.endpointGeneration + 1 }),
 		]);
 	});
+	it("projects a scoped session list with the same rows as the full projection", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-scoped-"));
+		const index = await new SessionIndex(dir).open();
+		const deleted = await index.append(event("scoped-deleted"));
+		await index.append({
+			type: "session_deleted",
+			sessionId: deleted.sessionId,
+			locator: deleted.locator,
+			endpointGeneration: deleted.endpointGeneration,
+			pid: deleted.pid,
+			...(deleted.processIncarnation === undefined ? {} : { processIncarnation: deleted.processIncarnation }),
+			...(deleted.hostIncarnation === undefined ? {} : { hostIncarnation: deleted.hostIncarnation }),
+		});
+		await index.append(event("scoped-a"));
+		await index.append({ ...event("scoped-a"), endpointGeneration: 2 });
+		await index.append({ ...event("scoped-b"), locator: { cwd: "r2", worktreeRoot: null, stateRoot: "q2" } });
+		await index.append(event("scoped-b"));
+
+		const full = index.listSessions();
+		expect(full.sessions.map(row => row.sessionId).sort()).toEqual(["scoped-a", "scoped-b"]);
+		for (const sessionId of ["scoped-a", "scoped-b", "scoped-deleted", "absent"]) {
+			const scoped = index.listSessions(undefined, new Set([sessionId]));
+			expect(scoped.sessions).toEqual(full.sessions.filter(row => row.sessionId === sessionId));
+			expect(scoped.indexSeq).toBe(full.indexSeq);
+			expect(scoped.warnings).toEqual(full.warnings);
+		}
+		expect(index.listSessions(undefined, new Set(["scoped-a", "scoped-b"])).sessions).toEqual(full.sessions);
+	});
+	it("dedupes rejection audit rows across cold readers", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-audit-dedupe-"));
+		const legacy = {
+			version: SDK_STATE_VERSION,
+			indexSeq: 1,
+			type: "host_registered" as const,
+			sessionId: "legacy-audit",
+			locator: { repo: dir, stateRoot: path.join(dir, ".gjc", "state") },
+			endpointGeneration: 1,
+			pid: process.pid,
+			ts: Date.now(),
+		};
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		await fs.mkdir(sessionsDir, { recursive: true });
+		await fs.writeFile(
+			path.join(sessionsDir, "index.jsonl"),
+			`${JSON.stringify({ ...legacy, checksum: sessionIndexChecksum(legacy as unknown as Omit<SessionIndexEvent, "checksum">) })}\n`,
+		);
+		const auditPath = path.join(sessionsDir, "index-audit.jsonl");
+		await (await new SessionIndex(dir).open()).refresh();
+		const first = await fs.readFile(auditPath, "utf8");
+		expect(first.trim().split("\n")).toHaveLength(1);
+		// A torn trailing row does not disturb dedupe of the valid rows.
+		await fs.writeFile(auditPath, `${first}{"indexSeq":2`);
+		await (await new SessionIndex(dir).open()).refresh();
+		await (await new SessionIndex(dir).open()).refresh();
+		const rows = (await fs.readFile(auditPath, "utf8")).split("\n").filter(line => line.includes('"indexSeq":1,'));
+		expect(rows).toHaveLength(1);
+		// A closed but invalid JSON row naming seq 1 is not a dedupe record either:
+		// the valid rejection record must still be written.
+		await fs.writeFile(auditPath, '{"indexSeq":1,broken}\n');
+		await (await new SessionIndex(dir).open()).refresh();
+		const valid = (await fs.readFile(auditPath, "utf8"))
+			.split("\n")
+			.flatMap(line => {
+				try {
+					return [JSON.parse(line) as { indexSeq?: number }];
+				} catch {
+					return [];
+				}
+			})
+			.filter(record => record.indexSeq === 1);
+		expect(valid).toHaveLength(1);
+	});
 	it("preserves closure before deletion but rejects delayed closure evidence", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-retirement-evidence-"));
 		const index = await new SessionIndex(dir).open();

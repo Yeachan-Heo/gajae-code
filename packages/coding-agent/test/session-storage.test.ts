@@ -8,9 +8,11 @@ import * as native from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
 import {
 	captureManagedFileNoFollow,
+	captureManagedFileNoFollowBounded,
 	ensureManagedDirectory,
 	MANAGED_ARTIFACT_MAX_FILE_BYTES,
 	ManagedCommittedMutationError,
+	type ManagedFileIdentity,
 	ManagedReplaceError,
 	ManagedSessionDescendantStore,
 	managedDirectoryRoot,
@@ -845,6 +847,189 @@ describe("managed descriptor reads", () => {
 			expect(observedFlags & fs.constants.O_NONBLOCK).toBe(fs.constants.O_NONBLOCK);
 			spy.mockRestore();
 		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("admits the opened descriptor before allocation, closes it, and preserves the admission failure", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-admission-")));
+		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+		const transcript = path.join(root, "session.jsonl");
+		const bytes = Buffer.from("admitted descriptor bytes\n");
+		store.publishNoReplaceSync("session.jsonl", bytes);
+		const expectedStat = fs.statSync(transcript, { bigint: true });
+		const originalOpenReadLease = store.openReadLease.bind(store);
+		let actualLease: ReturnType<typeof store.openReadLease> | undefined;
+		let admissionObserved = false;
+		let forwardedClose = false;
+		let closeInjectionCount = 0;
+		const injectedCloseFailure = new Error("injected terminal close failure");
+		let observedAdmission: { size: number; descriptor: ManagedFileIdentity } | undefined;
+		const primaryFailure = new Error("admission rejected before allocation");
+		const openLease = vi.spyOn(store, "openReadLease").mockImplementation((relativePath, expectedDescriptor) => {
+			const lease = originalOpenReadLease(relativePath, expectedDescriptor);
+			actualLease = lease;
+			return {
+				readRange: (start, length) => lease.readRange(start, length),
+				close: () => {
+					lease.close();
+					if (admissionObserved) {
+						forwardedClose = true;
+						closeInjectionCount++;
+						throw injectedCloseFailure;
+					}
+				},
+			};
+		});
+		const read = vi.spyOn(fs, "readSync");
+		const allocate = vi.spyOn(Buffer, "alloc");
+		let caught: unknown;
+		try {
+			try {
+				store.readExpectedBounded("session.jsonl", bytes.byteLength, (size, descriptor) => {
+					admissionObserved = true;
+					observedAdmission = { size, descriptor };
+					throw primaryFailure;
+				});
+			} catch (error) {
+				caught = error;
+			}
+			expect(caught).toBe(primaryFailure);
+			expect(observedAdmission?.size).toBe(bytes.byteLength);
+			expect(observedAdmission?.descriptor).toMatchObject({
+				dev: expectedStat.dev,
+				ino: expectedStat.ino,
+				nlink: 1n,
+				size: bytes.byteLength,
+				mtimeNs: expectedStat.mtimeNs,
+				ctimeNs: expectedStat.ctimeNs,
+			});
+			if (!actualLease) throw new Error("managed capture read lease was not opened");
+			expect(forwardedClose).toBe(true);
+			expect(admissionObserved).toBe(true);
+			expect(closeInjectionCount).toBe(1);
+			expect(() => actualLease!.readRange(0, 0)).toThrow("closed");
+			expect(read).not.toHaveBeenCalled();
+			expect(allocate.mock.calls.some(([size]) => size === bytes.byteLength)).toBe(false);
+		} finally {
+			allocate.mockRestore();
+			read.mockRestore();
+			openLease.mockRestore();
+			store.close();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects growth during bounded capture without reading beyond the admitted size", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-growth-")));
+		const pathname = path.join(root, "session.jsonl");
+		const initial = Buffer.from("initial-sized transcript\n");
+		fs.writeFileSync(pathname, initial, { mode: 0o600 });
+		const originalRead = fs.readSync.bind(fs);
+		let bytesRead = 0;
+		let bytesRequested = 0;
+		let grew = false;
+		const read = vi.spyOn(fs, "readSync").mockImplementation(((
+			fd: number,
+			buffer: NodeJS.ArrayBufferView,
+			offset: number,
+			length: number,
+			position: number | null,
+		) => {
+			bytesRequested += length;
+			const count = originalRead(fd, buffer, offset, length, position);
+			bytesRead += count;
+			if (!grew) {
+				grew = true;
+				fs.truncateSync(pathname, initial.byteLength + 9);
+			}
+			return count;
+		}) as typeof fs.readSync);
+		const allocate = vi.spyOn(Buffer, "alloc");
+		try {
+			expect(() => captureManagedFileNoFollowBounded(pathname, initial.byteLength)).toThrow("source_changed");
+			expect(bytesRead).toBe(initial.byteLength);
+			expect(bytesRequested).toBe(initial.byteLength);
+			expect(allocate.mock.calls.some(([size]) => size === initial.byteLength)).toBe(true);
+			expect(fs.statSync(pathname).size).toBe(initial.byteLength + 9);
+		} finally {
+			allocate.mockRestore();
+			read.mockRestore();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects pathname replacement during bounded capture after reading only the original generation", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-replacement-")));
+		const pathname = path.join(root, "session.jsonl");
+		const detached = `${pathname}.detached`;
+		const initial = Buffer.from("original generation bytes\n");
+		const replacement = Buffer.from("replacement generation must not be read\n");
+		fs.writeFileSync(pathname, initial, { mode: 0o600 });
+		const originalRead = fs.readSync.bind(fs);
+		let bytesRead = 0;
+		let bytesRequested = 0;
+		let replaced = false;
+		const read = vi.spyOn(fs, "readSync").mockImplementation(((
+			fd: number,
+			buffer: NodeJS.ArrayBufferView,
+			offset: number,
+			length: number,
+			position: number | null,
+		) => {
+			bytesRequested += length;
+			const count = originalRead(fd, buffer, offset, length, position);
+			bytesRead += count;
+			if (!replaced) {
+				replaced = true;
+				fs.renameSync(pathname, detached);
+				fs.writeFileSync(pathname, replacement, { mode: 0o600 });
+			}
+			return count;
+		}) as typeof fs.readSync);
+		const allocate = vi.spyOn(Buffer, "alloc");
+		try {
+			expect(() => captureManagedFileNoFollowBounded(pathname, initial.byteLength)).toThrow("source_changed");
+			expect(bytesRead).toBe(initial.byteLength);
+			expect(bytesRequested).toBe(initial.byteLength);
+			expect(allocate.mock.calls.some(([size]) => size === initial.byteLength)).toBe(true);
+			expect(fs.readFileSync(detached)).toEqual(initial);
+			expect(fs.readFileSync(pathname)).toEqual(replacement);
+		} finally {
+			allocate.mockRestore();
+			read.mockRestore();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("fences lease ranges to their initial size and returns fresh exact bytes and digest", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-lease-fence-")));
+		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+		try {
+			const firstBytes = Buffer.from("first descriptor generation\n");
+			store.publishNoReplaceSync("session.jsonl", firstBytes);
+			const firstDescriptor = store.descriptorExpected("session.jsonl");
+			if (!firstDescriptor) throw new Error("first managed descriptor missing");
+			const firstLease = store.openReadLease("session.jsonl", firstDescriptor);
+			expect(() => firstLease.readRange(firstBytes.byteLength - 1, 2)).toThrow("range_not_present");
+			expect(Buffer.from(firstLease.readRange(0, firstBytes.byteLength))).toEqual(firstBytes);
+			firstLease.close();
+
+			const freshBytes = Buffer.from("fresh positive exact transcript bytes\n");
+			store.replaceSync("session.jsonl", freshBytes);
+			const freshDescriptor = store.descriptorExpected("session.jsonl");
+			if (!freshDescriptor) throw new Error("fresh managed descriptor missing");
+			const freshLease = store.openReadLease("session.jsonl", freshDescriptor);
+			const exactBytes = Buffer.from(freshLease.readRange(0, freshBytes.byteLength));
+			freshLease.close();
+			const snapshot = store.readExpectedBounded("session.jsonl", freshBytes.byteLength);
+			if (!snapshot) throw new Error("fresh bounded snapshot missing");
+			expect(exactBytes).toEqual(freshBytes);
+			expect(snapshot.bytes).toEqual(freshBytes);
+			expect(snapshot.identity.sha256).toBe(createHash("sha256").update(freshBytes).digest("hex"));
+			expect(snapshot.identity.size).toBe(freshBytes.byteLength);
+		} finally {
+			store.close();
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
