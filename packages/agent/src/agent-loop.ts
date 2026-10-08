@@ -5000,10 +5000,9 @@ async function streamAssistantResponse(
 				return getResponseResult();
 			};
 
-			// Set up a single abort race: register the abort listener once for the whole
-			// stream and reuse the same race promise for every iterator.next() instead of
-			// allocating Promise.withResolvers and add/removeEventListener per event.
-			let abortRacePromise: Promise<typeof ABORTED> | undefined;
+			// Keep one abort listener for the stream, but give each read its own race
+			// promise so completed reads do not accumulate reactions on a pending promise.
+			let resolveCurrentAbortRace: ((value: typeof ABORTED) => void) | undefined;
 			let detachAbortListener: (() => void) | undefined;
 			if (requestSignal) {
 				if (requestSignal.aborted) {
@@ -5019,18 +5018,39 @@ async function streamAssistantResponse(
 					await finishChat(aborted);
 					return aborted;
 				}
-				const { promise, resolve } = Promise.withResolvers<typeof ABORTED>();
-				const onAbort = () => resolve(ABORTED);
+				const onAbort = () => resolveCurrentAbortRace?.(ABORTED);
 				requestSignal.addEventListener("abort", onAbort, { once: true });
-				abortRacePromise = promise;
 				detachAbortListener = () => requestSignal.removeEventListener("abort", onAbort);
 			}
 
 			try {
 				while (true) {
+					if (requestSignal?.aborted) {
+						closeIterator();
+						const aborted = emitAbortedAssistantMessage(
+							partialMessage,
+							addedPartial,
+							context,
+							config,
+							stream,
+							scope,
+						);
+						await finishChat(aborted);
+						return aborted;
+					}
 					let next: IteratorResult<AssistantMessageEvent>;
-					if (abortRacePromise) {
-						const result = await Promise.race([responseIterator.next(), abortRacePromise]);
+					if (requestSignal) {
+						const { promise, resolve } = Promise.withResolvers<typeof ABORTED>();
+						resolveCurrentAbortRace = resolve;
+						config.onAbortRaceReactionChange?.(1);
+						let result: IteratorResult<AssistantMessageEvent> | typeof ABORTED;
+						try {
+							result = await Promise.race([responseIterator.next(), promise]);
+						} finally {
+							if (resolveCurrentAbortRace === resolve) resolveCurrentAbortRace = undefined;
+							resolve(ABORTED);
+							config.onAbortRaceReactionChange?.(-1);
+						}
 						if (result === ABORTED) {
 							closeIterator();
 							const aborted = emitAbortedAssistantMessage(
