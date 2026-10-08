@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { closeModelCache } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
 import type { Message, ProviderSessionState } from "@gajae-code/ai/types";
 import { Snowflake, stablePathKey } from "@gajae-code/utils";
@@ -185,31 +186,14 @@ describe("task fork-context provider identity", () => {
 	const authStorages: AuthStorage[] = [];
 	const tempDirs: string[] = [];
 
-	async function removeTempDirWithWindowsRetry(tempDir: string): Promise<void> {
-		if (process.platform === "win32") {
-			Bun.gc(true);
-			await Bun.sleep(50);
-		}
-		for (let attempt = 0; ; attempt++) {
-			try {
-				fs.rmSync(tempDir, { recursive: true, force: true });
-				return;
-			} catch (error) {
-				const code =
-					error && typeof error === "object" && "code" in error ? (error as { code?: unknown }).code : undefined;
-				if (process.platform !== "win32" || (code !== "EBUSY" && code !== "EPERM") || attempt >= 100) throw error;
-				Bun.gc(true);
-				await Bun.sleep(100);
-			}
-		}
-	}
-
 	afterEach(async () => {
 		while (sessions.length > 0) await sessions.pop()?.dispose();
 		while (authStorages.length > 0) authStorages.pop()?.close();
 		while (tempDirs.length > 0) {
 			const tempDir = tempDirs.pop();
-			if (tempDir && fs.existsSync(tempDir)) await removeTempDirWithWindowsRetry(tempDir);
+			if (!tempDir) continue;
+			closeModelCache(path.join(tempDir, "models.db"));
+			if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
 		}
 	}, 15_000);
 
@@ -383,7 +367,7 @@ describe("task fork-context provider identity", () => {
 		expect(first.agent.providerSessionId).toBe("shared-provider-affinity");
 		expect(second.agent.providerSessionId).toBe("shared-provider-affinity");
 		expect(first.sessionManager.getSessionId()).not.toBe(second.sessionManager.getSessionId());
-	});
+	}, 15_000);
 
 	it("rekeys explicit provider ownership to the successor transcript and frees the predecessor", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-task-provider-transition-${Snowflake.next()}-`));
