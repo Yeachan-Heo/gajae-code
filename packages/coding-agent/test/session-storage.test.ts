@@ -8,8 +8,11 @@ import * as native from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
 import {
 	captureManagedFileNoFollow,
+	captureManagedFileNoFollowBounded,
+	ensureManagedDirectory,
 	MANAGED_ARTIFACT_MAX_FILE_BYTES,
 	ManagedCommittedMutationError,
+	type ManagedFileIdentity,
 	ManagedReplaceError,
 	ManagedSessionDescendantStore,
 	managedDirectoryRoot,
@@ -556,6 +559,177 @@ describe("FileSessionStorageWriter certainty-aware close", () => {
 	});
 });
 
+describe("MemorySessionStorageWriter owned append publication", () => {
+	let storage: MemorySessionStorage;
+
+	beforeEach(() => {
+		storage = new MemorySessionStorage();
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("publishes unbuffered appends immediately and keeps read snapshots isolated", () => {
+		const sessionPath = "/sessions/immediate.jsonl";
+		const writer = storage.openWriter(sessionPath, { flags: "w" });
+		writer.writeLineSync("first\n");
+
+		const firstStat = storage.statSync(sessionPath);
+		const snapshot = storage.readSnapshotSync(sessionPath);
+		const range = storage.readRangeSync(sessionPath, 0, firstStat.size);
+		expect(Buffer.from(snapshot.bytes).toString("utf8")).toBe("first\n");
+		expect(Buffer.from(range.bytes).toString("utf8")).toBe("first\n");
+		expect(firstStat.size).toBe(6);
+
+		writer.writeLineSync("second\n");
+		expect(storage.readTextSync(sessionPath)).toBe("first\nsecond\n");
+		expect(storage.statSync(sessionPath).size).toBe(13);
+		expect(storage.statSync(sessionPath).ino).toBe(firstStat.ino);
+		expect(Buffer.from(snapshot.bytes).toString("utf8")).toBe("first\n");
+		expect(Buffer.from(range.bytes).toString("utf8")).toBe("first\n");
+
+		snapshot.bytes[0] = 0;
+		range.bytes[0] = 0;
+		expect(storage.readTextSync(sessionPath)).toBe("first\nsecond\n");
+		writer.closeSync();
+		expect(writer.getCloseState()).toBe("closed");
+	});
+
+	it("keeps appended input isolated and publishes buffered bytes only on flush", () => {
+		const sessionPath = "/sessions/buffered.jsonl";
+		const writer = storage.openBufferedWriter(sessionPath, { flags: "w" });
+		const input = Buffer.from("first");
+		writer.writeBytesSync(input);
+		input.fill(0);
+
+		expect(storage.statSync(sessionPath).size).toBe(0);
+		expect(storage.readTextSync(sessionPath)).toBe("");
+		writer.flushSync();
+		expect(storage.readTextSync(sessionPath)).toBe("first");
+		const inode = storage.statSync(sessionPath).ino;
+
+		const nextInput = Buffer.from("+second");
+		writer.writeBytesSync(nextInput);
+		nextInput.fill(0);
+		expect(storage.readTextSync(sessionPath)).toBe("first");
+		writer.flushSync();
+		expect(storage.readTextSync(sessionPath)).toBe("first+second");
+		expect(storage.statSync(sessionPath).size).toBe(12);
+		expect(storage.statSync(sessionPath).ino).toBe(inode);
+		writer.closeSync();
+		expect(writer.getCloseState()).toBe("closed");
+	});
+
+	it("grows at the visible-length boundary without changing the prior prefix", () => {
+		const sessionPath = "/sessions/growth.jsonl";
+		const writer = storage.openWriter(sessionPath, { flags: "w" });
+		const prefix = `${"a".repeat(4095)}\n`;
+		writer.writeLineSync(prefix);
+		const snapshot = storage.readSnapshotSync(sessionPath);
+		const range = storage.readRangeSync(sessionPath, 0, prefix.length);
+
+		writer.writeLineSync("b\n");
+		expect(storage.statSync(sessionPath).size).toBe(prefix.length + 2);
+		expect(storage.readTextSync(sessionPath)).toBe(`${prefix}b\n`);
+		expect(Buffer.from(snapshot.bytes).toString("utf8")).toBe(prefix);
+		expect(Buffer.from(range.bytes).toString("utf8")).toBe(prefix);
+		writer.closeSync();
+	});
+
+	it("retains a renamed published prefix while the writer continues at its old path", () => {
+		const sessionPath = "/sessions/renamed.jsonl";
+		const retainedPath = "/sessions/retained.jsonl";
+		const writer = storage.openWriter(sessionPath, { flags: "w" });
+		writer.writeLineSync("prefix\n");
+		const retainedInode = storage.statSync(sessionPath).ino;
+
+		storage.renameSync(sessionPath, retainedPath);
+		writer.writeLineSync("continued\n");
+		expect(storage.readTextSync(retainedPath)).toBe("prefix\n");
+		expect(storage.readTextSync(sessionPath)).toBe("prefix\ncontinued\n");
+		expect(storage.statSync(retainedPath).ino).toBe(retainedInode);
+		expect(storage.statSync(sessionPath).ino).not.toBe(retainedInode);
+		writer.closeSync();
+	});
+
+	it("retains an exactly replaced prefix while its source writer continues", () => {
+		const sessionPath = "/sessions/replacement-source.jsonl";
+		const retainedPath = "/sessions/replacement-destination.jsonl";
+		const writer = storage.openWriter(sessionPath, { flags: "w" });
+		try {
+			writer.writeLineSync("prefix\n");
+			const retainedInode = storage.statSync(sessionPath).ino;
+			storage.writeTextSync(retainedPath, "original destination\n");
+			const destination = storage.readSnapshotSync(retainedPath);
+			expect(
+				storage.replaceExactSync(sessionPath, retainedPath, {
+					stat: destination.stat,
+					sha256: createHash("sha256").update(destination.bytes).digest("hex"),
+				}),
+			).toBe(true);
+			writer.writeLineSync("continued\n");
+			expect(storage.readTextSync(retainedPath)).toBe("prefix\n");
+			expect(storage.readTextSync(sessionPath)).toBe("prefix\ncontinued\n");
+			expect(storage.statSync(retainedPath).ino).toBe(retainedInode);
+			expect(storage.statSync(sessionPath).ino).not.toBe(retainedInode);
+		} finally {
+			writer.closeSync();
+		}
+	});
+
+	it("reuses geometric backing allocations across many complete publications", () => {
+		const sessionPath = "/sessions/allocations.jsonl";
+		const seed = "s".repeat(32 * 1024);
+		storage.writeTextSync(sessionPath, seed);
+		const writer = storage.openWriter(sessionPath);
+		const realWriteBytesOwnedSync = storage.writeBytesOwnedSync.bind(storage);
+		const publishedBackings = new Set<ArrayBufferLike>();
+		const publishSpy = vi.spyOn(storage, "writeBytesOwnedSync").mockImplementation((path, content) => {
+			publishedBackings.add(content.buffer);
+			realWriteBytesOwnedSync(path, content);
+		});
+		const chunk = `${"x".repeat(8192)}\n`;
+		const appendCount = 20;
+
+		for (let index = 0; index < appendCount; index++) writer.writeLineSync(chunk);
+
+		const expected = seed + chunk.repeat(appendCount);
+		expect(storage.readTextSync(sessionPath)).toBe(expected);
+		expect(storage.statSync(sessionPath).size).toBe(Buffer.byteLength(expected));
+		// The writer grows geometrically (four backing buffers here); copying each
+		// whole visible prefix would instead allocate one distinct 8 KiB+ buffer per append.
+		expect(publishedBackings.size).toBeLessThanOrEqual(5);
+		publishSpy.mockRestore();
+		writer.closeSync();
+	});
+
+	it("keeps close errors stable and rejects writes after an uncertain close", () => {
+		const sessionPath = "/sessions/close-error.jsonl";
+		let closeCalls = 0;
+		const writer = storage.openWriter(sessionPath, {
+			flags: "w",
+			closeAdapter: {
+				close() {
+					closeCalls++;
+					throw new Error("memory close outcome unknown");
+				},
+			},
+		});
+		writer.writeLineSync("published\n");
+
+		expect(() => writer.closeSync()).toThrow("memory close outcome unknown");
+		const closeError = writer.getCloseError();
+		expect(closeError?.message).toBe("memory close outcome unknown");
+		expect(writer.getCloseState()).toBe("close_unknown");
+		expect(() => writer.closeSync()).toThrow("memory close outcome unknown");
+		expect(writer.getCloseError()).toBe(closeError);
+		expect(closeCalls).toBe(1);
+		expect(() => writer.writeLineSync("rejected\n")).toThrow("memory close outcome unknown");
+		expect(storage.readTextSync(sessionPath)).toBe("published\n");
+	});
+});
+
 describe("managed descriptor reads", () => {
 	it("returns transcript identity without exposing file bytes", () => {
 		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-descriptor-")));
@@ -673,6 +847,189 @@ describe("managed descriptor reads", () => {
 			expect(observedFlags & fs.constants.O_NONBLOCK).toBe(fs.constants.O_NONBLOCK);
 			spy.mockRestore();
 		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("admits the opened descriptor before allocation, closes it, and preserves the admission failure", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-admission-")));
+		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+		const transcript = path.join(root, "session.jsonl");
+		const bytes = Buffer.from("admitted descriptor bytes\n");
+		store.publishNoReplaceSync("session.jsonl", bytes);
+		const expectedStat = fs.statSync(transcript, { bigint: true });
+		const originalOpenReadLease = store.openReadLease.bind(store);
+		let actualLease: ReturnType<typeof store.openReadLease> | undefined;
+		let admissionObserved = false;
+		let forwardedClose = false;
+		let closeInjectionCount = 0;
+		const injectedCloseFailure = new Error("injected terminal close failure");
+		let observedAdmission: { size: number; descriptor: ManagedFileIdentity } | undefined;
+		const primaryFailure = new Error("admission rejected before allocation");
+		const openLease = vi.spyOn(store, "openReadLease").mockImplementation((relativePath, expectedDescriptor) => {
+			const lease = originalOpenReadLease(relativePath, expectedDescriptor);
+			actualLease = lease;
+			return {
+				readRange: (start, length) => lease.readRange(start, length),
+				close: () => {
+					lease.close();
+					if (admissionObserved) {
+						forwardedClose = true;
+						closeInjectionCount++;
+						throw injectedCloseFailure;
+					}
+				},
+			};
+		});
+		const read = vi.spyOn(fs, "readSync");
+		const allocate = vi.spyOn(Buffer, "alloc");
+		let caught: unknown;
+		try {
+			try {
+				store.readExpectedBounded("session.jsonl", bytes.byteLength, (size, descriptor) => {
+					admissionObserved = true;
+					observedAdmission = { size, descriptor };
+					throw primaryFailure;
+				});
+			} catch (error) {
+				caught = error;
+			}
+			expect(caught).toBe(primaryFailure);
+			expect(observedAdmission?.size).toBe(bytes.byteLength);
+			expect(observedAdmission?.descriptor).toMatchObject({
+				dev: expectedStat.dev,
+				ino: expectedStat.ino,
+				nlink: 1n,
+				size: bytes.byteLength,
+				mtimeNs: expectedStat.mtimeNs,
+				ctimeNs: expectedStat.ctimeNs,
+			});
+			if (!actualLease) throw new Error("managed capture read lease was not opened");
+			expect(forwardedClose).toBe(true);
+			expect(admissionObserved).toBe(true);
+			expect(closeInjectionCount).toBe(1);
+			expect(() => actualLease!.readRange(0, 0)).toThrow("closed");
+			expect(read).not.toHaveBeenCalled();
+			expect(allocate.mock.calls.some(([size]) => size === bytes.byteLength)).toBe(false);
+		} finally {
+			allocate.mockRestore();
+			read.mockRestore();
+			openLease.mockRestore();
+			store.close();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects growth during bounded capture without reading beyond the admitted size", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-growth-")));
+		const pathname = path.join(root, "session.jsonl");
+		const initial = Buffer.from("initial-sized transcript\n");
+		fs.writeFileSync(pathname, initial, { mode: 0o600 });
+		const originalRead = fs.readSync.bind(fs);
+		let bytesRead = 0;
+		let bytesRequested = 0;
+		let grew = false;
+		const read = vi.spyOn(fs, "readSync").mockImplementation(((
+			fd: number,
+			buffer: NodeJS.ArrayBufferView,
+			offset: number,
+			length: number,
+			position: number | null,
+		) => {
+			bytesRequested += length;
+			const count = originalRead(fd, buffer, offset, length, position);
+			bytesRead += count;
+			if (!grew) {
+				grew = true;
+				fs.truncateSync(pathname, initial.byteLength + 9);
+			}
+			return count;
+		}) as typeof fs.readSync);
+		const allocate = vi.spyOn(Buffer, "alloc");
+		try {
+			expect(() => captureManagedFileNoFollowBounded(pathname, initial.byteLength)).toThrow("source_changed");
+			expect(bytesRead).toBe(initial.byteLength);
+			expect(bytesRequested).toBe(initial.byteLength);
+			expect(allocate.mock.calls.some(([size]) => size === initial.byteLength)).toBe(true);
+			expect(fs.statSync(pathname).size).toBe(initial.byteLength + 9);
+		} finally {
+			allocate.mockRestore();
+			read.mockRestore();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects pathname replacement during bounded capture after reading only the original generation", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-replacement-")));
+		const pathname = path.join(root, "session.jsonl");
+		const detached = `${pathname}.detached`;
+		const initial = Buffer.from("original generation bytes\n");
+		const replacement = Buffer.from("replacement generation must not be read\n");
+		fs.writeFileSync(pathname, initial, { mode: 0o600 });
+		const originalRead = fs.readSync.bind(fs);
+		let bytesRead = 0;
+		let bytesRequested = 0;
+		let replaced = false;
+		const read = vi.spyOn(fs, "readSync").mockImplementation(((
+			fd: number,
+			buffer: NodeJS.ArrayBufferView,
+			offset: number,
+			length: number,
+			position: number | null,
+		) => {
+			bytesRequested += length;
+			const count = originalRead(fd, buffer, offset, length, position);
+			bytesRead += count;
+			if (!replaced) {
+				replaced = true;
+				fs.renameSync(pathname, detached);
+				fs.writeFileSync(pathname, replacement, { mode: 0o600 });
+			}
+			return count;
+		}) as typeof fs.readSync);
+		const allocate = vi.spyOn(Buffer, "alloc");
+		try {
+			expect(() => captureManagedFileNoFollowBounded(pathname, initial.byteLength)).toThrow("source_changed");
+			expect(bytesRead).toBe(initial.byteLength);
+			expect(bytesRequested).toBe(initial.byteLength);
+			expect(allocate.mock.calls.some(([size]) => size === initial.byteLength)).toBe(true);
+			expect(fs.readFileSync(detached)).toEqual(initial);
+			expect(fs.readFileSync(pathname)).toEqual(replacement);
+		} finally {
+			allocate.mockRestore();
+			read.mockRestore();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("fences lease ranges to their initial size and returns fresh exact bytes and digest", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-lease-fence-")));
+		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+		try {
+			const firstBytes = Buffer.from("first descriptor generation\n");
+			store.publishNoReplaceSync("session.jsonl", firstBytes);
+			const firstDescriptor = store.descriptorExpected("session.jsonl");
+			if (!firstDescriptor) throw new Error("first managed descriptor missing");
+			const firstLease = store.openReadLease("session.jsonl", firstDescriptor);
+			expect(() => firstLease.readRange(firstBytes.byteLength - 1, 2)).toThrow("range_not_present");
+			expect(Buffer.from(firstLease.readRange(0, firstBytes.byteLength))).toEqual(firstBytes);
+			firstLease.close();
+
+			const freshBytes = Buffer.from("fresh positive exact transcript bytes\n");
+			store.replaceSync("session.jsonl", freshBytes);
+			const freshDescriptor = store.descriptorExpected("session.jsonl");
+			if (!freshDescriptor) throw new Error("fresh managed descriptor missing");
+			const freshLease = store.openReadLease("session.jsonl", freshDescriptor);
+			const exactBytes = Buffer.from(freshLease.readRange(0, freshBytes.byteLength));
+			freshLease.close();
+			const snapshot = store.readExpectedBounded("session.jsonl", freshBytes.byteLength);
+			if (!snapshot) throw new Error("fresh bounded snapshot missing");
+			expect(exactBytes).toEqual(freshBytes);
+			expect(snapshot.bytes).toEqual(freshBytes);
+			expect(snapshot.identity.sha256).toBe(createHash("sha256").update(freshBytes).digest("hex"));
+			expect(snapshot.identity.size).toBe(freshBytes.byteLength);
+		} finally {
+			store.close();
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
@@ -3989,5 +4346,118 @@ describe("SessionManager.inventorySessionsStrict root inspection failures", () =
 		expect(result.failures).toHaveLength(1);
 		expect(result.failures[0].kind).toBe("scan");
 		expect(result.failures[0].message).not.toContain("EIO");
+	});
+});
+
+describe.skipIf(process.platform !== "win32")("managed session security: owner_mismatch repair", () => {
+	let tempRoot: string;
+	let tempDir: string;
+
+	beforeEach(() => {
+		tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-owner-mismatch-"));
+		tempDir = path.join(tempRoot, "sessiondir");
+		fs.mkdirSync(tempDir, { mode: 0o700 });
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+		fs.rmSync(tempRoot, { recursive: true, force: true });
+	});
+
+	it("owner_mismatch -> repair succeeds -> directory accepted", () => {
+		const stat = fs.lstatSync(tempDir, { bigint: true });
+		const root = managedDirectoryRoot(tempRoot);
+
+		const verifyMock = vi.spyOn(native, "verifyOwnerOnlyPathSecurityExpected").mockReturnValue({
+			ok: false,
+			code: "owner_mismatch",
+		} as const);
+
+		const repairMock = vi.spyOn(native, "repairOwnerOnlyPathSecurityExpected").mockReturnValue({ ok: true });
+
+		expect(() => ensureManagedDirectory(tempDir, root, "windows-existing-verify-first")).not.toThrow();
+
+		expect(verifyMock).toHaveBeenCalledWith(tempDir, "directory", stat.dev, stat.ino);
+		expect(repairMock).toHaveBeenCalledWith(tempDir, "directory", stat.dev, stat.ino);
+	});
+
+	it("owner_mismatch -> repair fails with io_error -> security error with actionable message", () => {
+		const root = managedDirectoryRoot(tempRoot);
+
+		const verifyMock = vi.spyOn(native, "verifyOwnerOnlyPathSecurityExpected").mockReturnValue({
+			ok: false,
+			code: "owner_mismatch",
+		} as const);
+
+		const repairMock = vi.spyOn(native, "repairOwnerOnlyPathSecurityExpected").mockReturnValue({
+			ok: false,
+			code: "io_error",
+		} as const);
+
+		expect(() => ensureManagedDirectory(tempDir, root, "windows-existing-verify-first")).toThrow(
+			/directory owner mismatch: unable to take ownership.*administrator privileges/,
+		);
+
+		expect(verifyMock).toHaveBeenCalled();
+		expect(repairMock).toHaveBeenCalled();
+	});
+
+	it("other verify codes throw immediately without calling repair", () => {
+		const root = managedDirectoryRoot(tempRoot);
+
+		const verifyMock = vi.spyOn(native, "verifyOwnerOnlyPathSecurityExpected").mockReturnValue({
+			ok: false,
+			code: "identity_mismatch",
+		} as const);
+
+		const repairMock = vi.spyOn(native, "repairOwnerOnlyPathSecurityExpected");
+
+		expect(() => ensureManagedDirectory(tempDir, root, "windows-existing-verify-first")).toThrow();
+
+		expect(repairMock).not.toHaveBeenCalled();
+		expect(verifyMock).toHaveBeenCalled();
+	});
+
+	it("acl_verify_failed also triggers repair attempt", () => {
+		const root = managedDirectoryRoot(tempRoot);
+
+		const verifyMock = vi.spyOn(native, "verifyOwnerOnlyPathSecurityExpected").mockReturnValue({
+			ok: false,
+			code: "acl_verify_failed",
+		} as const);
+
+		const repairMock = vi.spyOn(native, "repairOwnerOnlyPathSecurityExpected").mockReturnValue({ ok: true });
+
+		expect(() => ensureManagedDirectory(tempDir, root, "windows-existing-verify-first")).not.toThrow();
+
+		expect(verifyMock).toHaveBeenCalled();
+		expect(repairMock).toHaveBeenCalled();
+	});
+
+	it("verify ok immediately returns without calling repair", () => {
+		const root = managedDirectoryRoot(tempRoot);
+
+		const verifyMock = vi.spyOn(native, "verifyOwnerOnlyPathSecurityExpected").mockReturnValue({ ok: true });
+
+		const repairMock = vi.spyOn(native, "repairOwnerOnlyPathSecurityExpected");
+
+		expect(() => ensureManagedDirectory(tempDir, root, "windows-existing-verify-first")).not.toThrow();
+
+		expect(repairMock).not.toHaveBeenCalled();
+		expect(verifyMock).toHaveBeenCalled();
+	});
+
+	it("default policy applies security without repair attempt", () => {
+		const root = managedDirectoryRoot(tempRoot);
+
+		vi.spyOn(native, "applyOwnerOnlyPathSecurity").mockReturnValue({ ok: true });
+
+		vi.spyOn(native, "verifyOwnerOnlyPathSecurity").mockReturnValue({ ok: true });
+
+		const repairMock = vi.spyOn(native, "repairOwnerOnlyPathSecurityExpected");
+
+		expect(() => ensureManagedDirectory(tempDir, root, "default")).not.toThrow();
+
+		expect(repairMock).not.toHaveBeenCalled();
 	});
 });

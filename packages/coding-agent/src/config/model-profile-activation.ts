@@ -37,6 +37,11 @@ import {
 import { type ModelSelectorValue, normalizeModelSelectorValue } from "./model-selector-value";
 import type { Settings } from "./settings";
 
+type UserCanonicalVariantSelection = {
+	revision: number;
+	canonicalVariant: string | undefined;
+};
+
 type ModelProfileActivationSession = Pick<
 	AgentSession,
 	"model" | "thinkingLevel" | "sessionId" | "getConfiguredModelChain" | "setConfiguredModelChain"
@@ -59,6 +64,7 @@ type ModelProfileActivationSession = Pick<
 	syncEagerDelegation?: () => Promise<void>;
 	getSessionDefaultModelSelector?: () => string | undefined;
 	recordResumeDefaultModel?: (selector: string | undefined) => void;
+	getUserCanonicalVariantSelection?: () => UserCanonicalVariantSelection;
 	seedDefaultFallbackResolution?: (activeIndex: number, skips: Array<{ selector: string; reason: string }>) => void;
 	getDefaultFallbackRuntimeState?: () => DefaultFallbackRuntimeState;
 	restoreDefaultFallbackRuntimeState?: (state: DefaultFallbackRuntimeState) => void;
@@ -73,8 +79,7 @@ type ModelProfileActivationSession = Pick<
 		| "resolveModelByLookupAlias"
 		| "authStorage"
 		| "isCredentiallessProvider"
-	> &
-		Partial<Pick<ModelRegistry, "getAvailableForProfileActivation">>;
+	>;
 	getConfiguredModelChainState?: (role: string) => ConfiguredModelChainState | undefined;
 };
 
@@ -103,7 +108,6 @@ export interface PrepareModelProfileActivationOptions {
 			Pick<
 				ModelRegistry,
 				| "getAvailable"
-				| "getAvailableForProfileActivation"
 				| "resolveModelByLookupAlias"
 				| "lookupAliasExists"
 				| "clearCanonicalVariant"
@@ -123,6 +127,8 @@ export interface PrepareModelProfileActivationOptions {
 export interface ApplyModelProfileActivationOptions {
 	persistDefault?: boolean;
 	thinkingLevelOverride?: ThinkingLevel;
+	/** Cancels deferred activation if a newer user model selection exists. */
+	isCurrent?: () => boolean;
 }
 export interface PreparedModelProfileActivation {
 	profileName: string;
@@ -176,6 +182,7 @@ export interface PreparedModelProfileActivation {
 	 * so a stale provider cannot silently resurrect.
 	 */
 	previousCanonicalVariant: string | undefined;
+	previousUserCanonicalVariantSelection: UserCanonicalVariantSelection | undefined;
 	/** Registry used to resolve and restore the session sticky canonical variant. */
 	modelRegistry: PrepareModelProfileActivationOptions["modelRegistry"];
 }
@@ -258,10 +265,8 @@ function concretizeMaterializedAssignmentValues(
 	if (!modelRegistry || !sessionId) return assignments;
 	// Materialized assignments are persisted into `modelRoles` and
 	// `task.agentModelOverrides` and later consumed by profile execution, so they
-	// must resolve against the descriptor-backed profile-activation catalog, not
-	// the broadened general one: otherwise a bare assignment can persist a
-	// bundled model that fresh live profile evidence excludes.
-	const availableModels = modelRegistry.getAvailableForProfileActivation?.() ?? modelRegistry.getAvailable();
+	// resolve against the same catalog profile activation uses.
+	const availableModels = modelRegistry.getAvailable();
 	const authenticatedModels = availableModels.filter(model => {
 		const isCredentiallessProvider = modelRegistry.isCredentiallessProvider?.bind(modelRegistry);
 		const hasUsableAuth = modelRegistry.authStorage?.hasUsableAuth?.bind(modelRegistry.authStorage);
@@ -879,10 +884,7 @@ export async function resolveModelProfileDefaultChain(options: {
 			allRoutable && proxyProvider !== undefined ? [proxyProvider] : [...group],
 		);
 	}
-	const availableModels =
-		options.modelRegistry.getAvailableForProfileActivation?.() ??
-		options.modelRegistry.getAvailable?.() ??
-		options.modelRegistry.getAll();
+	const availableModels = options.modelRegistry.getAvailable?.() ?? options.modelRegistry.getAll();
 	let bindings = resolveProfileBindings(profile);
 	if (alternativeGroups.length > 0)
 		bindings = rewriteBindingsProviders(bindings, authenticatedProviders, alternativeGroups);
@@ -1323,6 +1325,25 @@ function restoreCanonicalVariant(
 		modelRegistry.clearCanonicalVariant?.(sessionId);
 	}
 }
+
+function restoreCanonicalVariantAfterPreparation(
+	modelRegistry: PrepareModelProfileActivationOptions["modelRegistry"],
+	session: ModelProfileActivationSession,
+	previousCanonicalVariant: string | undefined,
+	previousUserSelection: UserCanonicalVariantSelection | undefined,
+): void {
+	const currentUserSelection = session.getUserCanonicalVariantSelection?.();
+	const userSelectionChanged =
+		previousUserSelection !== undefined &&
+		currentUserSelection !== undefined &&
+		currentUserSelection.revision !== previousUserSelection.revision;
+	restoreCanonicalVariant(
+		modelRegistry,
+		session.sessionId,
+		userSelectionChanged ? currentUserSelection.canonicalVariant : previousCanonicalVariant,
+	);
+}
+
 export async function prepareModelProfileActivation(
 	options: PrepareModelProfileActivationOptions,
 ): Promise<PreparedModelProfileActivation> {
@@ -1337,6 +1358,7 @@ export async function prepareModelProfileActivation(
 	// genuinely-sticky provider even when the live model is a transient switch.
 	const credentialSessionId = options.session.credentialSessionId ?? options.session.sessionId;
 	const previousCanonicalVariant = options.modelRegistry.getSessionCanonicalVariant?.(options.session.sessionId);
+	const previousUserCanonicalVariantSelection = options.session.getUserCanonicalVariantSelection?.();
 
 	// Explicit profile activation/reselection invalidates the session's sticky
 	// canonical variant BEFORE the new profile's aliases resolve, so the old
@@ -1464,10 +1486,7 @@ export async function prepareModelProfileActivation(
 			);
 		}
 
-		const availableModels =
-			options.modelRegistry.getAvailableForProfileActivation?.() ??
-			options.modelRegistry.getAvailable?.() ??
-			options.modelRegistry.getAll();
+		const availableModels = options.modelRegistry.getAvailable?.() ?? options.modelRegistry.getAll();
 		const roleCatalogModels = options.modelRegistry.getAll();
 		let bindings = resolveProfileBindings(profile);
 		if (alternativeGroups.length > 0) {
@@ -1562,6 +1581,7 @@ export async function prepareModelProfileActivation(
 			modelRegistry: options.modelRegistry,
 			previousModel,
 			previousCanonicalVariant,
+			previousUserCanonicalVariantSelection,
 			previousThinkingLevel: options.session.thinkingLevel,
 			previousAgentModelOverrides: { ...options.settings.get("task.agentModelOverrides") },
 			previousModelRoles: { ...options.settings.get("modelRoles") },
@@ -1602,7 +1622,12 @@ export async function prepareModelProfileActivation(
 		};
 	} catch (error) {
 		try {
-			restoreCanonicalVariant(options.modelRegistry, options.session.sessionId, previousCanonicalVariant);
+			restoreCanonicalVariantAfterPreparation(
+				options.modelRegistry,
+				options.session,
+				previousCanonicalVariant,
+				previousUserCanonicalVariantSelection,
+			);
 		} catch (rollbackError) {
 			throw incompleteModelProfileRollbackError("preparation", "profile preflight", error, [
 				{ stage: "restore canonical model variant", error: rollbackError },
@@ -1648,10 +1673,45 @@ function incompleteModelProfileRollbackError(
 	);
 }
 
+class ModelProfileActivationSupersededError extends Error {
+	constructor() {
+		super("Model profile activation superseded by a newer user model selection");
+		this.name = "ModelProfileActivationSupersededError";
+	}
+}
+
+function sameSerializedValue(left: unknown, right: unknown): boolean {
+	return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function restoreConcurrentProfileOverrides(
+	previous: Readonly<Record<string, ModelSelectorValue>> | undefined,
+	activated: Readonly<Record<string, ModelSelectorValue>> | undefined,
+	current: Readonly<Record<string, ModelSelectorValue>> | undefined,
+): Readonly<Record<string, ModelSelectorValue>> | undefined {
+	if (sameSerializedValue(current, activated)) return previous;
+	const restored = { ...(previous ?? {}) };
+	const keys = new Set([
+		...Object.keys(previous ?? {}),
+		...Object.keys(activated ?? {}),
+		...Object.keys(current ?? {}),
+	]);
+	for (const key of keys) {
+		const wasActivated = activated !== undefined && Object.hasOwn(activated, key);
+		const isCurrent = current !== undefined && Object.hasOwn(current, key);
+		if (wasActivated === isCurrent && sameSerializedValue(activated?.[key], current?.[key])) continue;
+		const currentValue = current?.[key];
+		if (isCurrent && currentValue !== undefined) restored[key] = currentValue;
+		else delete restored[key];
+	}
+	return Object.keys(restored).length > 0 || previous !== undefined ? restored : undefined;
+}
+
 export async function applyPreparedModelProfileActivation(
 	prepared: PreparedModelProfileActivation,
 	options: ApplyModelProfileActivationOptions = {},
 ): Promise<void> {
+	if (options.isCurrent && !options.isCurrent()) return;
 	let activationStage = "default chain";
 	let modelMutationStarted = false;
 	let overridesChanged = false;
@@ -1659,8 +1719,15 @@ export async function applyPreparedModelProfileActivation(
 	let persistentMutationStarted = false;
 	let defaultChainChanged = false;
 	let resumeDefaultChanged = false;
+	let activatedDefaultChainState: ConfiguredModelChainState | undefined;
+	let activatedFallbackRuntimeState: DefaultFallbackRuntimeState | undefined;
+	let activatedModelRolesOverride: unknown;
+	let activatedAgentModelOverridesOverride: unknown;
 
 	try {
+		// Set the fallback chain before yielding to setModelTemporary, so a user
+		// selection during async mutation uses the fallback chain as-is rather than
+		// having the profile's chain written over a concurrent user choice.
 		const ownedDefaultChain =
 			prepared.defaultChain.length > 0
 				? prepared.defaultChain
@@ -1681,6 +1748,8 @@ export async function applyPreparedModelProfileActivation(
 					prepared.defaultResolutionSkips,
 				);
 			}
+			activatedDefaultChainState = prepared.session.getConfiguredModelChainState?.("default");
+			activatedFallbackRuntimeState = prepared.session.getDefaultFallbackRuntimeState?.();
 		}
 		if (prepared.defaultModel) {
 			activationStage = "model selection";
@@ -1689,11 +1758,14 @@ export async function applyPreparedModelProfileActivation(
 				options.thinkingLevelOverride ?? prepared.defaultThinkingLevel,
 				{
 					cause: "profile-activation",
+					shouldMutate: options.isCurrent,
 					onMutationStarted: () => {
 						modelMutationStarted = true;
 					},
 				},
 			);
+			if (options.isCurrent && !modelMutationStarted) throw new ModelProfileActivationSupersededError();
+			if (options.isCurrent && !options.isCurrent()) throw new ModelProfileActivationSupersededError();
 		}
 		// Always reinstall the model role layer from the durable base plus the
 		// new profile's roles so omitted roles from the previous profile are dropped.
@@ -1702,6 +1774,7 @@ export async function applyPreparedModelProfileActivation(
 			...prepared.baseModelRoles,
 			...prepared.modelRoles,
 		});
+		activatedModelRolesOverride = prepared.settings.getOverride("modelRoles");
 		modelRolesChanged = true;
 		// Always reinstall the agent role layer from the durable base plus the
 		// new profile's roles: a default-only or role-free successor must drop
@@ -1711,6 +1784,7 @@ export async function applyPreparedModelProfileActivation(
 			...prepared.baseAgentModelOverrides,
 			...prepared.agentModelOverrides,
 		});
+		activatedAgentModelOverridesOverride = prepared.settings.getOverride("task.agentModelOverrides");
 		overridesChanged = true;
 		if (options.persistDefault) {
 			persistentMutationStarted = true;
@@ -1727,6 +1801,7 @@ export async function applyPreparedModelProfileActivation(
 			activationStage = "forward settings flush";
 			await prepared.settings.flushOrThrow();
 		}
+		if (options.isCurrent && !options.isCurrent()) throw new ModelProfileActivationSupersededError();
 		activationStage = "active profile marker";
 		prepared.session.setActiveModelProfile?.(prepared.profileName);
 		if (prepared.defaultModel) {
@@ -1743,6 +1818,8 @@ export async function applyPreparedModelProfileActivation(
 			prepared.previousModel,
 		);
 	} catch (error) {
+		const activationWasCancelled = error instanceof ModelProfileActivationSupersededError;
+		const selectionSuperseded = options.isCurrent?.() === false;
 		const rollbackErrors: Array<{ stage: string; error: unknown }> = [];
 		const restore = (stage: string, action: () => void): void => {
 			try {
@@ -1752,42 +1829,82 @@ export async function applyPreparedModelProfileActivation(
 			}
 		};
 		if (persistentMutationStarted) {
-			restore("restore default profile setting", () =>
-				prepared.previousPersistedDefaultProfile === undefined
-					? prepared.settings.unset("modelProfile.default")
-					: prepared.settings.set("modelProfile.default", prepared.previousPersistedDefaultProfile),
-			);
+			if (
+				!selectionSuperseded ||
+				sameSerializedValue(prepared.settings.getGlobal("modelProfile.default"), prepared.profileName)
+			) {
+				restore("restore default profile setting", () =>
+					prepared.previousPersistedDefaultProfile === undefined
+						? prepared.settings.unset("modelProfile.default")
+						: prepared.settings.set("modelProfile.default", prepared.previousPersistedDefaultProfile),
+				);
+			}
+			const currentPersistedModelRoles = prepared.settings.getGlobal("modelRoles");
+			const restoredModelRoles =
+				selectionSuperseded && currentPersistedModelRoles && !sameSerializedValue(currentPersistedModelRoles, {})
+					? { ...(prepared.previousPersistedModelRoles ?? {}), ...currentPersistedModelRoles }
+					: prepared.previousPersistedModelRoles;
 			restore("restore model role setting", () =>
-				prepared.previousPersistedModelRoles === undefined
+				restoredModelRoles === undefined
 					? prepared.settings.unset("modelRoles")
-					: prepared.settings.set("modelRoles", prepared.previousPersistedModelRoles),
+					: prepared.settings.set("modelRoles", restoredModelRoles),
 			);
+			const currentPersistedAgentModelOverrides = prepared.settings.getGlobal("task.agentModelOverrides");
+			const restoredPersistedAgentModelOverrides =
+				selectionSuperseded &&
+				currentPersistedAgentModelOverrides &&
+				!sameSerializedValue(currentPersistedAgentModelOverrides, {})
+					? {
+							...(prepared.previousPersistedAgentModelOverrides ?? {}),
+							...currentPersistedAgentModelOverrides,
+						}
+					: prepared.previousPersistedAgentModelOverrides;
 			restore("restore agent role setting", () =>
-				prepared.previousPersistedAgentModelOverrides === undefined
+				restoredPersistedAgentModelOverrides === undefined
 					? prepared.settings.unset("task.agentModelOverrides")
-					: prepared.settings.set("task.agentModelOverrides", prepared.previousPersistedAgentModelOverrides),
+					: prepared.settings.set("task.agentModelOverrides", restoredPersistedAgentModelOverrides),
 			);
-			restore("restore thinking level setting", () =>
-				prepared.previousPersistedDefaultThinkingLevel === undefined
-					? prepared.settings.unset("defaultThinkingLevel")
-					: prepared.settings.set("defaultThinkingLevel", prepared.previousPersistedDefaultThinkingLevel),
-			);
+			const activatedThinkingLevel =
+				prepared.defaultThinkingLevel !== undefined && prepared.defaultThinkingLevel !== ThinkingLevel.Inherit
+					? prepared.defaultThinkingLevel
+					: prepared.previousPersistedDefaultThinkingLevel;
+			if (
+				!selectionSuperseded ||
+				sameSerializedValue(prepared.settings.getGlobal("defaultThinkingLevel"), activatedThinkingLevel)
+			) {
+				restore("restore thinking level setting", () =>
+					prepared.previousPersistedDefaultThinkingLevel === undefined
+						? prepared.settings.unset("defaultThinkingLevel")
+						: prepared.settings.set("defaultThinkingLevel", prepared.previousPersistedDefaultThinkingLevel),
+				);
+			}
 		}
-		if (modelRolesChanged) {
+		if (
+			modelRolesChanged &&
+			(!selectionSuperseded ||
+				sameSerializedValue(prepared.settings.getOverride("modelRoles"), activatedModelRolesOverride))
+		) {
 			restore("restore model role overrides", () =>
 				prepared.previousModelRolesOverride === undefined
 					? prepared.settings.clearOverride("modelRoles")
 					: prepared.settings.override("modelRoles", prepared.previousModelRolesOverride),
 			);
 		}
-		if (overridesChanged) {
+		if (
+			overridesChanged &&
+			(!selectionSuperseded ||
+				sameSerializedValue(
+					prepared.settings.getOverride("task.agentModelOverrides"),
+					activatedAgentModelOverridesOverride,
+				))
+		) {
 			restore("restore agent role overrides", () =>
 				prepared.previousAgentModelOverridesOverride === undefined
 					? prepared.settings.clearOverride("task.agentModelOverrides")
 					: prepared.settings.override("task.agentModelOverrides", prepared.previousAgentModelOverridesOverride),
 			);
 		}
-		if (modelMutationStarted) {
+		if (modelMutationStarted && !selectionSuperseded) {
 			try {
 				if (prepared.session.restoreModelSelectionForRollback) {
 					await prepared.session.restoreModelSelectionForRollback(
@@ -1810,7 +1927,11 @@ export async function applyPreparedModelProfileActivation(
 				prepared.session.recordResumeDefaultModel?.(prepared.previousSessionDefaultModel),
 			);
 		}
-		if (defaultChainChanged) {
+		if (
+			defaultChainChanged &&
+			(!selectionSuperseded ||
+				sameSerializedValue(prepared.session.getConfiguredModelChainState?.("default"), activatedDefaultChainState))
+		) {
 			const previousChain = prepared.previousDefaultChainState;
 			restore("restore default chain", () =>
 				prepared.session.setConfiguredModelChain(
@@ -1824,16 +1945,27 @@ export async function applyPreparedModelProfileActivation(
 				),
 			);
 		}
-		if (prepared.previousDefaultFallbackRuntimeState) {
+		if (
+			prepared.previousDefaultFallbackRuntimeState &&
+			(!selectionSuperseded ||
+				sameSerializedValue(prepared.session.getDefaultFallbackRuntimeState?.(), activatedFallbackRuntimeState))
+		) {
 			restore("restore fallback runtime", () =>
 				prepared.session.restoreDefaultFallbackRuntimeState?.(prepared.previousDefaultFallbackRuntimeState!),
 			);
 		}
-		restore("restore active profile", () =>
-			prepared.session.setActiveModelProfile?.(prepared.previousActiveModelProfile),
-		);
+		if (!selectionSuperseded) {
+			restore("restore active profile", () =>
+				prepared.session.setActiveModelProfile?.(prepared.previousActiveModelProfile),
+			);
+		}
 		restore("restore canonical model variant", () =>
-			restoreCanonicalVariant(prepared.modelRegistry, prepared.session.sessionId, prepared.previousCanonicalVariant),
+			restoreCanonicalVariantAfterPreparation(
+				prepared.modelRegistry,
+				prepared.session,
+				prepared.previousCanonicalVariant,
+				prepared.previousUserCanonicalVariantSelection,
+			),
 		);
 		if (persistentMutationStarted) {
 			try {
@@ -1845,6 +1977,7 @@ export async function applyPreparedModelProfileActivation(
 		if (rollbackErrors.length > 0) {
 			throw incompleteModelProfileRollbackError("activation", activationStage, error, rollbackErrors);
 		}
+		if (activationWasCancelled) return;
 		throw error;
 	}
 	// The installed role layer decides whether this profile is vendor-separated,
@@ -2112,28 +2245,46 @@ export async function activateModelProfile(
 	options: PrepareModelProfileActivationOptions,
 	applyOptions: ApplyModelProfileActivationOptions = {},
 ): Promise<void> {
+	if (applyOptions.isCurrent && !applyOptions.isCurrent()) return;
 	const prepared = await prepareModelProfileActivation(options);
+	if (applyOptions.isCurrent && !applyOptions.isCurrent()) {
+		restoreCanonicalVariantAfterPreparation(
+			prepared.modelRegistry,
+			prepared.session,
+			prepared.previousCanonicalVariant,
+			prepared.previousUserCanonicalVariantSelection,
+		);
+		return;
+	}
 	await applyPreparedModelProfileActivation(prepared, applyOptions);
 }
 
 /** Install only a profile's runtime role layer, preserving session model and configured-chain intent. */
-export async function applyModelProfileRuntimeBindings(options: PrepareModelProfileActivationOptions): Promise<void> {
+
+export async function applyModelProfileRuntimeBindings(
+	options: PrepareModelProfileActivationOptions,
+	isCurrent?: () => boolean,
+): Promise<void> {
+	if (isCurrent && !isCurrent()) return;
 	const prepared = await prepareModelProfileActivation(options);
+	const previousModelRolesOverride = prepared.settings.getOverride("modelRoles");
+	const previousAgentModelOverridesOverride = prepared.settings.getOverride("task.agentModelOverrides");
+	const previousActiveModelProfile = prepared.session.getActiveModelProfile?.();
+	let activatedModelRolesOverride: Readonly<Record<string, ModelSelectorValue>> | undefined;
+	let activatedAgentModelOverridesOverride: Readonly<Record<string, ModelSelectorValue>> | undefined;
 	try {
+		if (isCurrent && !isCurrent()) return;
 		prepared.settings.override("modelRoles", {
 			...prepared.baseModelRoles,
 			...prepared.modelRoles,
 		});
+		activatedModelRolesOverride = prepared.settings.getOverride("modelRoles");
 		prepared.settings.override("task.agentModelOverrides", {
 			...prepared.baseAgentModelOverrides,
 			...prepared.agentModelOverrides,
 		});
+		activatedAgentModelOverridesOverride = prepared.settings.getOverride("task.agentModelOverrides");
 		prepared.session.setActiveModelProfile?.(prepared.profileName);
-		prepared.session.noteProfileInstalledOverrides?.(
-			Object.keys(prepared.modelRoles),
-			Object.keys(prepared.agentModelOverrides),
-			prepared.previousModel,
-		);
 		try {
 			await prepared.session.syncEagerDelegation?.();
 		} catch (error) {
@@ -2142,7 +2293,50 @@ export async function applyModelProfileRuntimeBindings(options: PrepareModelProf
 				error: error instanceof Error ? error.message : String(error),
 			});
 		}
+		if (isCurrent && !isCurrent()) {
+			const restoredModelRolesOverride = restoreConcurrentProfileOverrides(
+				previousModelRolesOverride,
+				activatedModelRolesOverride,
+				prepared.settings.getOverride("modelRoles"),
+			);
+			if (restoredModelRolesOverride === undefined) prepared.settings.clearOverride("modelRoles");
+			else prepared.settings.override("modelRoles", restoredModelRolesOverride);
+			const restoredAgentModelOverridesOverride = restoreConcurrentProfileOverrides(
+				previousAgentModelOverridesOverride,
+				activatedAgentModelOverridesOverride,
+				prepared.settings.getOverride("task.agentModelOverrides"),
+			);
+			if (restoredAgentModelOverridesOverride === undefined)
+				prepared.settings.clearOverride("task.agentModelOverrides");
+			else prepared.settings.override("task.agentModelOverrides", restoredAgentModelOverridesOverride);
+			if (prepared.session.getActiveModelProfile?.() === prepared.profileName) {
+				prepared.session.setActiveModelProfile?.(previousActiveModelProfile);
+			}
+			try {
+				await prepared.session.syncEagerDelegation?.();
+			} catch (error) {
+				logger.warn("Failed to sync eager delegation after canceled recovered profile runtime bindings", {
+					profile: prepared.profileName,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+			return;
+		}
+		prepared.session.noteProfileInstalledOverrides?.(
+			Object.keys(prepared.modelRoles),
+			Object.keys(prepared.agentModelOverrides),
+			prepared.previousModel,
+		);
 	} finally {
-		restoreCanonicalVariant(prepared.modelRegistry, prepared.session.sessionId, prepared.previousCanonicalVariant);
+		if (isCurrent && !isCurrent()) {
+			restoreCanonicalVariantAfterPreparation(
+				prepared.modelRegistry,
+				prepared.session,
+				prepared.previousCanonicalVariant,
+				prepared.previousUserCanonicalVariantSelection,
+			);
+		} else {
+			restoreCanonicalVariant(prepared.modelRegistry, prepared.session.sessionId, prepared.previousCanonicalVariant);
+		}
 	}
 }

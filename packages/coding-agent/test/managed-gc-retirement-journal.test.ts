@@ -11,6 +11,7 @@ import {
 } from "../src/session/internal/managed-gc-retirement-codec";
 import {
 	bindManagedGcSessionRetirementTarget,
+	cleanupAuthorityMatches,
 	computeManagedScopeDigest,
 	deleteManagedSessionCandidate,
 	discoverManagedGcSessionRetirementReceipts,
@@ -35,7 +36,10 @@ import {
 	acquireManagedLock,
 	captureManagedFileNoFollow,
 	captureManagedFileNoFollowBounded,
+	MANAGED_ARTIFACT_MAX_FILES,
+	MANAGED_ARTIFACT_MAX_TOTAL_BYTES,
 	MANAGED_SESSION_READ_RANGE_MAX_BYTES,
+	type ManagedFileIdentity,
 	ManagedSessionDescendantStore,
 } from "../src/session/internal/managed-session-storage";
 import {
@@ -76,11 +80,107 @@ interface Fixture {
 }
 
 const temporaryRoots: string[] = [];
+const MANAGED_GC_SCOPE_LOCK_NAME = `gc-retirement-${crypto
+	.createHash("sha256")
+	.update("managed-gc-retirement-scope-lock-v1", "utf8")
+	.digest("hex")}`;
 
 afterEach(() => {
 	vi.restoreAllMocks();
 	ManagedSessionScopeTestHooks.beforeVerifiedDelete = undefined;
 	for (const root of temporaryRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+describe("bounded exchange-placeholder cleanup authority", () => {
+	it("rejects a foreign child without changing its bytes or inode", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "managed-gc-empty-placeholder-"));
+		temporaryRoots.push(root);
+		const parent = path.join(root, "parent");
+		const retainedPath = path.join(parent, ".gjc-exact-unlink-placeholder-test");
+		fs.mkdirSync(parent);
+		fs.mkdirSync(retainedPath);
+		const issued = native.snapshotEmptyDirectory(retainedPath);
+		if (!issued.ok || !issued.snapshot || issued.snapshot.entries.length !== 1)
+			throw new Error("native_empty_placeholder_snapshot_missing");
+		const nativeRoot = issued.snapshot.entries[0];
+		if (!nativeRoot) throw new Error("native_empty_placeholder_root_missing");
+		const parentStat = fs.lstatSync(parent, { bigint: true });
+		const cleanup = {
+			state: "cleanup_pending" as const,
+			role: "exchange_placeholder" as const,
+			retainedPath,
+			identity: {
+				dev: BigInt(nativeRoot.dev),
+				ino: BigInt(nativeRoot.ino),
+				size: BigInt(nativeRoot.size),
+				mtimeNs: BigInt(nativeRoot.mtimeNs),
+				parentDev: parentStat.dev,
+				parentIno: parentStat.ino,
+			},
+			tree: issued.snapshot,
+		};
+		expect(cleanupAuthorityMatches(cleanup, parent)).toBe(true);
+
+		const foreignPath = path.join(retainedPath, "foreign-payload");
+		const foreignBytes = Buffer.alloc(256 * 1024, 0xa7);
+		fs.writeFileSync(foreignPath, foreignBytes);
+		const before = fs.lstatSync(foreignPath, { bigint: true });
+		expect(cleanupAuthorityMatches(cleanup, parent)).toBe(false);
+		expect(fs.readFileSync(foreignPath)).toEqual(foreignBytes);
+		const after = fs.lstatSync(foreignPath, { bigint: true });
+		expect(after.dev).toBe(before.dev);
+		expect(after.ino).toBe(before.ino);
+		expect(after.size).toBe(before.size);
+		expect(after.mtimeNs).toBe(before.mtimeNs);
+	});
+
+	it("rejects a replaced empty path against the original native root identity", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "managed-gc-empty-placeholder-"));
+		temporaryRoots.push(root);
+		const parent = path.join(root, "parent");
+		const retainedPath = path.join(parent, ".gjc-exact-unlink-placeholder-test");
+		const displacedPath = path.join(parent, ".displaced-placeholder");
+		fs.mkdirSync(parent);
+		fs.mkdirSync(retainedPath);
+		const issued = native.snapshotEmptyDirectory(retainedPath);
+		if (!issued.ok || !issued.snapshot || issued.snapshot.entries.length !== 1)
+			throw new Error("native_empty_placeholder_snapshot_missing");
+		const nativeRoot = issued.snapshot.entries[0];
+		if (!nativeRoot) throw new Error("native_empty_placeholder_root_missing");
+		const parentStat = fs.lstatSync(parent, { bigint: true });
+		const cleanup = {
+			state: "cleanup_pending" as const,
+			role: "exchange_placeholder" as const,
+			retainedPath,
+			identity: {
+				dev: BigInt(nativeRoot.dev),
+				ino: BigInt(nativeRoot.ino),
+				size: BigInt(nativeRoot.size),
+				mtimeNs: BigInt(nativeRoot.mtimeNs),
+				parentDev: parentStat.dev,
+				parentIno: parentStat.ino,
+			},
+			tree: issued.snapshot,
+		};
+		const originalBefore = fs.lstatSync(retainedPath, { bigint: true });
+		fs.renameSync(retainedPath, displacedPath);
+		fs.mkdirSync(retainedPath);
+		const replacementBefore = fs.lstatSync(retainedPath, { bigint: true });
+
+		expect(cleanupAuthorityMatches(cleanup, parent)).toBe(false);
+		const replacementAfter = fs.lstatSync(retainedPath, { bigint: true });
+		expect(replacementAfter.dev).toBe(replacementBefore.dev);
+		expect(replacementAfter.ino).toBe(replacementBefore.ino);
+		expect(fs.readdirSync(retainedPath)).toEqual([]);
+		const displaced = fs.lstatSync(displacedPath, { bigint: true });
+		expect([displaced.dev, displaced.ino, displaced.size, displaced.mtimeNs]).toEqual([
+			originalBefore.dev,
+			originalBefore.ino,
+			originalBefore.size,
+			originalBefore.mtimeNs,
+		]);
+		expect(fs.readdirSync(displacedPath)).toEqual([]);
+	});
 });
 
 describe("owner-aware data cannot bypass live consumer authority", () => {
@@ -119,7 +219,7 @@ describe("owner-aware data cannot bypass live consumer authority", () => {
 		const journalLock = path.join(
 			fixture.scope.directoryPath,
 			".gjc-managed-session-internal/locks",
-			`gc-retirement-${crypto.createHash("sha256").update(fixture.transcriptPath).digest("hex")}.lock`,
+			`${MANAGED_GC_SCOPE_LOCK_NAME}.lock`,
 		);
 		for (const [pathname, identity] of unlink.mock.calls) {
 			expect(pathname).toBe(journalLock);
@@ -236,7 +336,7 @@ describe("owner-aware data cannot bypass live consumer authority", () => {
 		const journalLock = path.join(
 			fixture.scope.directoryPath,
 			".gjc-managed-session-internal/locks",
-			`gc-retirement-${crypto.createHash("sha256").update(fixture.transcriptPath).digest("hex")}.lock`,
+			`${MANAGED_GC_SCOPE_LOCK_NAME}.lock`,
 		);
 		for (const [pathname, identity] of unlink.mock.calls) {
 			expect(pathname).toBe(journalLock);
@@ -279,6 +379,73 @@ function protocolInputFor(scope: ManagedScope): ManagedGcProtocolScopeInput {
 			mtimeNs: protocolStat.mtimeNs.toString(),
 			ctimeNs: protocolStat.ctimeNs.toString(),
 			mode: Number(protocolStat.mode & 0o777n),
+		},
+	};
+}
+
+interface ObservedDirectoryStream {
+	readonly pathname: string;
+	readonly bufferSize: number | undefined;
+	readAttempts: number;
+	entriesRead: number;
+	closed: boolean;
+}
+
+function observeRealDirectoryStreams(
+	shouldObserve: (pathname: string) => boolean,
+	beforeRead?: (pathname: string, directory: fs.Dir) => void,
+	onReadError?: (error: unknown) => void,
+): {
+	readonly streams: ObservedDirectoryStream[];
+	restoreIfCurrent: () => void;
+} {
+	const streams: ObservedDirectoryStream[] = [];
+	const originalOpendirSync = fs.opendirSync.bind(fs);
+	const opendir = vi.spyOn(fs, "opendirSync").mockImplementation((pathname, options) => {
+		const directory = originalOpendirSync(pathname, options);
+		const absolutePath = path.resolve(String(pathname));
+		if (!shouldObserve(absolutePath)) return directory;
+		const observation: ObservedDirectoryStream = {
+			pathname: absolutePath,
+			bufferSize: options?.bufferSize,
+			readAttempts: 0,
+			entriesRead: 0,
+			closed: false,
+		};
+		streams.push(observation);
+		return new Proxy(directory, {
+			get(target, property) {
+				if (property === "readSync")
+					return () => {
+						observation.readAttempts++;
+						beforeRead?.(absolutePath, target);
+						try {
+							const entry = target.readSync();
+							if (entry) observation.entriesRead++;
+							return entry;
+						} catch (error) {
+							onReadError?.(error);
+							throw error;
+						}
+					};
+				if (property === "closeSync")
+					return () => {
+						try {
+							return target.closeSync();
+						} finally {
+							observation.closed = true;
+						}
+					};
+				const value = Reflect.get(target, property, target);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		}) as fs.Dir;
+	});
+	const installedOpendirSync = fs.opendirSync;
+	return {
+		streams,
+		restoreIfCurrent: () => {
+			if (fs.opendirSync === installedOpendirSync) opendir.mockRestore();
 		},
 	};
 }
@@ -438,6 +605,262 @@ describe("independent authenticated protocol inventories", () => {
 	});
 });
 
+describe("shared finite managed GC inventory admission", () => {
+	it("charges readonly receipt count and collect rereads while a genuine leased reader stays healthy", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		const receiptPath = managedGcReceiptPath(fixture, "prepared");
+		const receiptDirectory = path.dirname(receiptPath);
+		const unrelatedCount = 13_000;
+		const unrelatedNames = Array.from(
+			{ length: unrelatedCount },
+			(_, index) => `inventory-consumer-unrelated-${String(index).padStart(5, "0")}`,
+		);
+		const unrelatedIdentities: Array<{ name: string; dev: bigint; ino: bigint }> = [];
+		for (const name of unrelatedNames) {
+			const pathname = path.join(receiptDirectory, name);
+			fs.mkdirSync(pathname, { mode: 0o700 });
+			const stat = fs.lstatSync(pathname, { bigint: true });
+			unrelatedIdentities.push({ name, dev: stat.dev, ino: stat.ino });
+		}
+		const physicalEntries = unrelatedCount + 1;
+		const receiptBytesBefore = await Bun.file(receiptPath).bytes();
+		const receiptIdentityBefore = fs.lstatSync(receiptPath, { bigint: true });
+		const observed = observeRealDirectoryStreams(pathname => pathname === receiptDirectory);
+		try {
+			await expect(
+				readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath),
+			).rejects.toThrow("managed_gc_journal_capacity_exceeded");
+			const refusedStreams = observed.streams.filter(stream => stream.pathname === receiptDirectory);
+			expect(refusedStreams.length).toBeGreaterThanOrEqual(3);
+			expect(refusedStreams.slice(0, 2).map(stream => stream.entriesRead)).toEqual([
+				physicalEntries,
+				physicalEntries,
+			]);
+			expect(refusedStreams.slice(0, 2).map(stream => stream.readAttempts)).toEqual([
+				physicalEntries + 1,
+				physicalEntries + 1,
+			]);
+			expect(refusedStreams.every(stream => stream.bufferSize === 1 && stream.closed)).toBe(true);
+
+			const leased = await readManagedGcSessionRetirementReceipt(fixture.scope, fixture.transcriptPath);
+			expect(leased?.state).toBe("prepared");
+			expect(observed.streams.every(stream => stream.closed)).toBe(true);
+			expect(observed.streams.every(stream => stream.bufferSize === 1)).toBe(true);
+		} finally {
+			observed.restoreIfCurrent();
+		}
+		const receiptIdentityAfter = fs.lstatSync(receiptPath, { bigint: true });
+		expect(await Bun.file(receiptPath).bytes()).toEqual(receiptBytesBefore);
+		expect(receiptIdentityAfter.dev).toBe(receiptIdentityBefore.dev);
+		expect(receiptIdentityAfter.ino).toBe(receiptIdentityBefore.ino);
+		expect(receiptIdentityAfter.size).toBe(receiptIdentityBefore.size);
+		expect(receiptIdentityAfter.mtimeNs).toBe(receiptIdentityBefore.mtimeNs);
+		expect(receiptIdentityAfter.ctimeNs).toBe(receiptIdentityBefore.ctimeNs);
+		expect(
+			unrelatedNames.map(name => {
+				const stat = fs.lstatSync(path.join(receiptDirectory, name), { bigint: true });
+				return { name, dev: stat.dev, ino: stat.ino };
+			}),
+		).toEqual(unrelatedIdentities);
+		for (const name of unrelatedNames) fs.rmdirSync(path.join(receiptDirectory, name));
+		const independent = await readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath);
+		expect(independent?.state).toBe("prepared");
+	}, 60_000);
+
+	it("shares discovery admission between the real sessions root and a scope receipt directory", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		const originalRootEntryCount = fs.readdirSync(fixture.sessionsRoot).length;
+		const rootNoiseCount = 8_000;
+		const receiptNoiseCount = 3_000;
+		const rootNoiseNames = Array.from(
+			{ length: rootNoiseCount },
+			(_, index) => `inventory-root-unrelated-${String(index).padStart(5, "0")}`,
+		);
+		const receiptNoiseNames = Array.from(
+			{ length: receiptNoiseCount },
+			(_, index) => `inventory-scope-unrelated-${String(index).padStart(5, "0")}`,
+		);
+		const receiptDirectory = path.dirname(managedGcReceiptPath(fixture, "prepared"));
+		for (const name of rootNoiseNames) fs.mkdirSync(path.join(fixture.sessionsRoot, name), { mode: 0o700 });
+		for (const name of receiptNoiseNames) fs.mkdirSync(path.join(receiptDirectory, name), { mode: 0o700 });
+		const observed = observeRealDirectoryStreams(
+			pathname => pathname === fixture.sessionsRoot || pathname === receiptDirectory,
+		);
+		try {
+			await expect(
+				discoverManagedGcSessionRetirementReceipts({
+					agentDir: fixture.agentDir,
+					sessionsRoot: fixture.sessionsRoot,
+				}),
+			).rejects.toThrow("managed_gc_journal_capacity_exceeded");
+			const rootStreams = observed.streams.filter(stream => stream.pathname === fixture.sessionsRoot);
+			const receiptStreams = observed.streams.filter(stream => stream.pathname === receiptDirectory);
+			expect(rootStreams.length).toBeGreaterThanOrEqual(4);
+			expect(rootStreams.slice(0, 2).map(stream => stream.entriesRead)).toEqual([
+				rootNoiseCount + originalRootEntryCount,
+				rootNoiseCount + originalRootEntryCount,
+			]);
+			expect(receiptStreams.length).toBeGreaterThanOrEqual(2);
+			expect(observed.streams.every(stream => stream.bufferSize === 1 && stream.closed)).toBe(true);
+		} finally {
+			observed.restoreIfCurrent();
+		}
+		for (const name of receiptNoiseNames) fs.rmdirSync(path.join(receiptDirectory, name));
+		for (const name of rootNoiseNames) fs.rmdirSync(path.join(fixture.sessionsRoot, name));
+		const independent = await discoverManagedGcSessionRetirementReceipts({
+			agentDir: fixture.agentDir,
+			sessionsRoot: fixture.sessionsRoot,
+		});
+		expect(independent).toHaveLength(1);
+		expect(independent[0]?.receipt.state).toBe("prepared");
+	}, 60_000);
+
+	it("shares initial, comparison, and final inspector rereads with both internal discoveries", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		const rootNoiseCount = 3_000;
+		const lockCount = 2_300;
+		const rootNoiseNames = Array.from(
+			{ length: rootNoiseCount },
+			(_, index) => `inventory-inspector-root-${String(index).padStart(5, "0")}`,
+		);
+		for (const name of rootNoiseNames) fs.mkdirSync(path.join(fixture.sessionsRoot, name), { mode: 0o700 });
+		const lockDirectory = path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal", "locks");
+		const context = taskArtifactOwnerStorageContextForScope(fixture.scope);
+		const generatedLockNames: string[] = [];
+		for (let index = 0; index < lockCount; index++) {
+			const name = crypto.createHash("sha256").update(`managed-gc-inspector-inventory-${index}`).digest("hex");
+			const lock = await acquireManagedLock(lockDirectory, name, context.rootAuthority, context.securityPolicy);
+			try {
+				generatedLockNames.push(`${name}.lock`);
+			} finally {
+				await lock.release();
+			}
+		}
+		const inspect = managedGcProtocolScopeInspectorForScope(fixture.scope);
+		const input = protocolInputFor(fixture.scope);
+		const protocolDirectory = path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal");
+		const observed = observeRealDirectoryStreams(
+			pathname =>
+				pathname === fixture.sessionsRoot ||
+				pathname === protocolDirectory ||
+				pathname.startsWith(`${protocolDirectory}${path.sep}`),
+		);
+		try {
+			await expect(inspect([input])).rejects.toThrow("managed_gc_journal_capacity_exceeded");
+			const rootStreams = observed.streams.filter(stream => stream.pathname === fixture.sessionsRoot);
+			const lockStreams = observed.streams.filter(stream => stream.pathname === lockDirectory);
+			expect(rootStreams.length).toBeGreaterThanOrEqual(7);
+			expect(lockStreams.map(stream => stream.entriesRead)).toEqual(Array.from({ length: 6 }, () => lockCount + 1));
+			expect(observed.streams.every(stream => stream.bufferSize === 1 && stream.closed)).toBe(true);
+		} finally {
+			observed.restoreIfCurrent();
+		}
+		for (const name of generatedLockNames) fs.unlinkSync(path.join(lockDirectory, name));
+		for (const name of rootNoiseNames) fs.rmdirSync(path.join(fixture.sessionsRoot, name));
+		const independent = await inspect([input]);
+		expect(independent).toHaveLength(1);
+		expect(independent[0]?.directories.find(directory => directory.role === "receipts")?.files).toContainEqual(
+			expect.objectContaining({ name: path.basename(managedGcReceiptPath(fixture, "prepared")) }),
+		);
+	}, 60_000);
+
+	it("preserves an original directory open error without adopting a replacement and retries independently", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		const receiptPath = managedGcReceiptPath(fixture, "prepared");
+		const receiptDirectory = path.dirname(receiptPath);
+		const displacedDirectory = `${receiptDirectory}-open-failure`;
+		const originalIdentity = fs.lstatSync(receiptDirectory, { bigint: true });
+		const receiptBytes = await Bun.file(receiptPath).bytes();
+		const originalOpen = fs.opendirSync.bind(fs);
+		let firstOpen = true;
+		let originalError: unknown;
+		let restorationError: unknown;
+		const open = vi.spyOn(fs, "opendirSync").mockImplementation((pathname, options) => {
+			if (!firstOpen || path.resolve(String(pathname)) !== receiptDirectory) return originalOpen(pathname, options);
+			firstOpen = false;
+			fs.renameSync(receiptDirectory, displacedDirectory);
+			try {
+				return originalOpen(pathname, options);
+			} catch (error) {
+				originalError = error;
+				throw error;
+			} finally {
+				try {
+					fs.renameSync(displacedDirectory, receiptDirectory);
+				} catch (error) {
+					restorationError = error;
+				}
+			}
+		});
+		const installedOpen = fs.opendirSync;
+		try {
+			let rejection: unknown;
+			try {
+				await readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath);
+			} catch (error) {
+				rejection = error;
+			}
+			expect(originalError).toMatchObject({ code: "ENOENT" });
+			expect(rejection).toBe(originalError);
+			expect(restorationError).toBeUndefined();
+			const currentIdentity = fs.lstatSync(receiptDirectory, { bigint: true });
+			expect(currentIdentity.dev).toBe(originalIdentity.dev);
+			expect(currentIdentity.ino).toBe(originalIdentity.ino);
+			expect(await Bun.file(receiptPath).bytes()).toEqual(receiptBytes);
+			const retried = await readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath);
+			expect(retried?.state).toBe("prepared");
+		} finally {
+			if (fs.opendirSync === installedOpen) open.mockRestore();
+		}
+	});
+
+	it("preserves an original receipt-directory read error, closes its stream, and retries independently", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		const receiptDirectory = path.dirname(managedGcReceiptPath(fixture, "prepared"));
+		let readError: unknown;
+		let failFirstRead = true;
+		const observed = observeRealDirectoryStreams(
+			pathname => pathname === receiptDirectory,
+			(_pathname, directory) => {
+				if (!failFirstRead) return;
+				failFirstRead = false;
+				directory.closeSync();
+			},
+			error => {
+				readError = error;
+			},
+		);
+		try {
+			let rejection: unknown;
+			try {
+				await readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath);
+			} catch (error) {
+				rejection = error;
+			}
+			expect(readError).toMatchObject({ code: "ERR_DIR_CLOSED" });
+			expect(rejection).toBe(readError);
+			const failedStream = observed.streams[0];
+			expect(failedStream).toBeDefined();
+			expect(failedStream?.readAttempts).toBe(1);
+			expect(failedStream?.entriesRead).toBe(0);
+			expect(failedStream?.closed).toBe(true);
+			expect(failedStream?.bufferSize).toBe(1);
+
+			const retried = await readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath);
+			expect(retried?.state).toBe("prepared");
+			expect(observed.streams.length).toBeGreaterThanOrEqual(3);
+			expect(observed.streams.every(stream => stream.closed && stream.bufferSize === 1)).toBe(true);
+		} finally {
+			observed.restoreIfCurrent();
+		}
+	});
+});
+
 function makeScope(agentDir: string, sessionsRoot: string, cwd: string): ManagedScope {
 	const result = resolveManagedScopeForWrite({ agentDir, sessionsRoot, cwd });
 	if (result.kind !== "resolved") throw new Error(`fixture_scope_resolution_failed:${result.code}`);
@@ -562,6 +985,140 @@ function makeFixture(
 		target,
 		evidence,
 		...(largeOwnerTreeMarker ? { largeOwnerTreeMarker } : {}),
+	};
+}
+
+function makeSiblingFixture(parent: Fixture, sessionId: string): Fixture {
+	const cwd = path.join(parent.temporaryRoot, `${sessionId}-cwd`);
+	fs.mkdirSync(cwd, { mode: 0o700 });
+	const scope = makeScope(parent.agentDir, parent.sessionsRoot, cwd);
+	const ownerContext = taskArtifactOwnerStorageContextForScope(scope);
+	const ownerId = ownerIdForSession(sessionId);
+	const rootStore = newSessionRootStore(ownerContext);
+	let locator: TaskArtifactOwnerLocator | undefined;
+	try {
+		rootStore.ensureDirectory(OWNER_DIRECTORY);
+		const directory = rootStore.ensureDirectory(ownerRelativePath(ownerId));
+		locator = parseTaskArtifactOwnerLocator({
+			schemaVersion: OWNER_SCHEMA_VERSION,
+			ownerId,
+			directoryDev: directory.dev.toString(),
+			directoryIno: directory.ino.toString(),
+		});
+		if (!locator) throw new Error("fixture_sibling_owner_locator_missing");
+		const ownerStore = rootStore.deriveSubtree(ownerRelativePath(ownerId));
+		try {
+			ownerStore.publishNoReplaceSync(
+				OWNER_MANIFEST,
+				Buffer.from(
+					JSON.stringify({
+						schemaVersion: OWNER_SCHEMA_VERSION,
+						ownerId,
+						directoryDev: locator.directoryDev,
+						directoryIno: locator.directoryIno,
+						sessionId,
+					}),
+					"utf8",
+				),
+			);
+			ownerStore.publishNoReplaceSync("payload.json", Buffer.from("sibling payload", "utf8"));
+		} finally {
+			ownerStore.close();
+		}
+	} finally {
+		rootStore.close();
+	}
+	if (!locator) throw new Error("fixture_sibling_owner_locator_missing");
+	const transcriptPath = path.join(scope.directoryPath, "sibling.jsonl");
+	const transcriptStore = openScopeStore(scope);
+	try {
+		transcriptStore.publishNoReplaceSync(
+			"sibling.jsonl",
+			Buffer.from(
+				`${JSON.stringify({ type: "session", id: sessionId, cwd, version: 3, taskArtifactOwner: locator })}\n`,
+			),
+		);
+	} finally {
+		transcriptStore.close();
+	}
+	const target = bindManagedGcSessionRetirementTarget(scope, transcriptPath);
+	const evidence = captureTaskArtifactOwnerDeletionEvidence(ownerContext, sessionId, locator);
+	if (!evidence) throw new Error("fixture_sibling_owner_evidence_missing");
+	return {
+		temporaryRoot: parent.temporaryRoot,
+		agentDir: parent.agentDir,
+		sessionsRoot: parent.sessionsRoot,
+		cwd,
+		scope,
+		transcriptPath,
+		target,
+		evidence,
+	};
+}
+
+function makeTargetFixtureInScope(parent: Fixture, scope: ManagedScope, sessionId: string, filename: string): Fixture {
+	const cwd = scope.canonicalCwd;
+	const ownerContext = taskArtifactOwnerStorageContextForScope(scope);
+	const ownerId = ownerIdForSession(sessionId);
+	const rootStore = newSessionRootStore(ownerContext);
+	let locator: TaskArtifactOwnerLocator | undefined;
+	try {
+		rootStore.ensureDirectory(OWNER_DIRECTORY);
+		const directory = rootStore.ensureDirectory(ownerRelativePath(ownerId));
+		locator = parseTaskArtifactOwnerLocator({
+			schemaVersion: OWNER_SCHEMA_VERSION,
+			ownerId,
+			directoryDev: directory.dev.toString(),
+			directoryIno: directory.ino.toString(),
+		});
+		if (!locator) throw new Error("fixture_late_owner_locator_missing");
+		const ownerStore = rootStore.deriveSubtree(ownerRelativePath(ownerId));
+		try {
+			ownerStore.publishNoReplaceSync(
+				OWNER_MANIFEST,
+				Buffer.from(
+					JSON.stringify({
+						schemaVersion: OWNER_SCHEMA_VERSION,
+						ownerId,
+						directoryDev: locator.directoryDev,
+						directoryIno: locator.directoryIno,
+						sessionId,
+					}),
+					"utf8",
+				),
+			);
+			ownerStore.publishNoReplaceSync("payload.json", Buffer.from("late owner payload", "utf8"));
+		} finally {
+			ownerStore.close();
+		}
+	} finally {
+		rootStore.close();
+	}
+	if (!locator) throw new Error("fixture_late_owner_locator_missing");
+	const transcriptPath = path.join(scope.directoryPath, filename);
+	const transcriptStore = openScopeStore(scope);
+	try {
+		transcriptStore.publishNoReplaceSync(
+			filename,
+			Buffer.from(
+				`${JSON.stringify({ type: "session", id: sessionId, cwd, version: 3, taskArtifactOwner: locator })}\n`,
+			),
+		);
+	} finally {
+		transcriptStore.close();
+	}
+	const target = bindManagedGcSessionRetirementTarget(scope, transcriptPath);
+	const evidence = captureTaskArtifactOwnerDeletionEvidence(ownerContext, sessionId, locator);
+	if (!evidence) throw new Error("fixture_late_owner_evidence_missing");
+	return {
+		temporaryRoot: parent.temporaryRoot,
+		agentDir: parent.agentDir,
+		sessionsRoot: parent.sessionsRoot,
+		cwd,
+		scope,
+		transcriptPath,
+		target,
+		evidence,
 	};
 }
 
@@ -715,6 +1272,50 @@ function readReceiptSuffix(fixture: Fixture, suffix: string): unknown {
 	} finally {
 		store.close();
 	}
+}
+
+function managedGcReceiptPath(fixture: Fixture, suffix: string): string {
+	const key = crypto.createHash("sha256").update(path.resolve(fixture.transcriptPath), "utf8").digest("hex");
+	return path.join(
+		fixture.scope.directoryPath,
+		".gjc-managed-session-internal",
+		"receipts",
+		`gc-retirement-${key}-${suffix}.json`,
+	);
+}
+
+function extendManagedGcReceiptWithWhitespace(pathname: string, targetSize: number): void {
+	const descriptor = fs.openSync(pathname, "r+");
+	try {
+		const initialSize = fs.fstatSync(descriptor).size;
+		if (!Number.isSafeInteger(targetSize) || initialSize > targetSize)
+			throw new Error("managed_gc_receipt_padding_size_invalid");
+		const spaces = Buffer.alloc(1024 * 1024, 0x20);
+		for (let position = initialSize; position < targetSize; ) {
+			const length = Math.min(spaces.byteLength, targetSize - position);
+			const written = fs.writeSync(descriptor, spaces, 0, length, position);
+			if (written !== length) throw new Error("managed_gc_receipt_padding_short_write");
+			position += written;
+		}
+	} finally {
+		fs.closeSync(descriptor);
+	}
+}
+
+function padManagedGcReceiptHistoryTo512MiB(fixture: Fixture): string[] {
+	const paths = [
+		managedGcReceiptPath(fixture, "prepared"),
+		managedGcReceiptPath(fixture, "artifacts_removed"),
+		...Array.from({ length: 6 }, (_, index) =>
+			managedGcReceiptPath(fixture, `owner_pending-${String(index + 1).padStart(8, "0")}`),
+		),
+	];
+	if (paths.length * MANAGED_SESSION_READ_RANGE_MAX_BYTES !== MANAGED_ARTIFACT_MAX_TOTAL_BYTES)
+		throw new Error("fixture_gc_receipt_history_limit_mismatch");
+	for (const pathname of paths) extendManagedGcReceiptWithWhitespace(pathname, MANAGED_SESSION_READ_RANGE_MAX_BYTES);
+	const storedBytes = paths.reduce((total, pathname) => total + fs.statSync(pathname).size, 0);
+	if (storedBytes !== MANAGED_ARTIFACT_MAX_TOTAL_BYTES) throw new Error("fixture_gc_receipt_history_not_at_limit");
+	return paths;
 }
 
 async function cleanupRetryCandidate(fixture: Fixture) {
@@ -904,7 +1505,7 @@ describe("bounded cleanup receipt replay", () => {
 		expect(allocate.mock.calls.some(([allocationSize]) => allocationSize === size)).toBe(false);
 	});
 
-	it("admits every inventory entry and refuses the 50,001st before replay reads or retains entries", async () => {
+	it("refuses shared inspection inventory before opening cleanup replay files (resource-pressure simulation)", async () => {
 		const { fixture, tombstonePath } = await injectedCleanupHistory(1);
 		const directory = path.dirname(tombstonePath);
 		const originalOpen = fs.opendirSync.bind(fs);
@@ -923,12 +1524,28 @@ describe("bounded cleanup receipt replay", () => {
 			} as fs.Dir;
 		});
 		const allocate = vi.spyOn(Buffer, "alloc");
+		const fileOpen = vi.spyOn(fs, "openSync");
 		const inspect = managedGcProtocolScopeInspectorForScope(fixture.scope);
-		await expect(inspect([protocolInputFor(fixture.scope)])).rejects.toThrow("managed_gc_journal_capacity_exceeded");
-		expect(entriesRead).toBe(50_001);
-		expect(closed).toBe(true);
-		expect(allocate.mock.calls.some(([size]) => typeof size === "number" && size >= 64 * 1024 * 1024)).toBe(false);
-		open.mockRestore();
+		try {
+			await expect(inspect([protocolInputFor(fixture.scope)])).rejects.toThrow(
+				"managed_gc_journal_capacity_exceeded",
+			);
+			// Each returned entry consumes a read attempt and observation before filtering.
+			expect(entriesRead).toBeGreaterThan(MANAGED_ARTIFACT_MAX_FILES / 2);
+			expect(entriesRead * 2).toBeLessThanOrEqual(MANAGED_ARTIFACT_MAX_FILES * 2);
+			expect(entriesRead).toBeLessThan(MANAGED_ARTIFACT_MAX_FILES + 1);
+			expect(closed).toBe(true);
+			expect(fileOpen.mock.calls.some(([pathname]) => String(pathname).includes(".cleanup-pending-"))).toBe(false);
+			expect(allocate.mock.calls.some(([size]) => typeof size === "number" && size >= 64 * 1024 * 1024)).toBe(false);
+		} finally {
+			fileOpen.mockRestore();
+			allocate.mockRestore();
+			open.mockRestore();
+		}
+		const fresh = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fresh.scope, preparedReceipt(fresh));
+		const freshInspect = managedGcProtocolScopeInspectorForScope(fresh.scope);
+		expect(await freshInspect([protocolInputFor(fresh.scope)])).toHaveLength(1);
 	});
 
 	it("refuses an oversized receipt from its descriptor size before Buffer allocation", async () => {
@@ -953,7 +1570,7 @@ describe("bounded cleanup receipt replay", () => {
 		expect(allocate.mock.calls.some(([size]) => size === 64 * 1024 * 1024 + 1)).toBe(false);
 	});
 
-	it("refuses simulated aggregate descriptor bytes before allocating the ninth receipt", async () => {
+	it("refuses the ninth actual cleanup receipt after eight real 64 MiB admissions", async () => {
 		const { fixture, tombstonePath } = await injectedCleanupHistory(9);
 		const directory = path.dirname(tombstonePath);
 		const names = fs
@@ -963,29 +1580,32 @@ describe("bounded cleanup receipt replay", () => {
 				(left, right) => Number(/-([0-9]+)\.json$/u.exec(left)?.[1]) - Number(/-([0-9]+)\.json$/u.exec(right)?.[1]),
 			);
 		const receiptPaths = new Set(names.map(name => path.join(directory, name)));
-		const actualSizes = new Map([...receiptPaths].map(pathname => [pathname, fs.statSync(pathname).size]));
-		const admitted = new Set<string>();
-		let allocatingPath: string | undefined;
+		for (const name of names.slice(0, 8))
+			extendManagedGcReceiptWithWhitespace(path.join(directory, name), MANAGED_SESSION_READ_RANGE_MAX_BYTES);
+		const actualSizes = new Map(
+			[...receiptPaths].map(pathname => {
+				const stat = fs.statSync(pathname, { bigint: true });
+				return [
+					pathname,
+					{ dev: stat.dev, ino: stat.ino, size: stat.size, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs },
+				] as const;
+			}),
+		);
+		const before = [...actualSizes.entries()];
 		const readers: Array<{ matchingEntries: number; allocations: number; inventoryClosed: boolean }> = [];
 		let activeReader: (typeof readers)[number] | undefined;
-		const receiptSize = 64 * 1024 * 1024;
-		const originalFstat = fs.fstatSync.bind(fs);
-		const originalLstat = fs.lstatSync.bind(fs);
+		const receiptSize = MANAGED_SESSION_READ_RANGE_MAX_BYTES;
 		const originalOpendir = fs.opendirSync.bind(fs);
 		const originalOpen = fs.openSync.bind(fs);
 		const originalClose = fs.closeSync.bind(fs);
+		const originalRead = fs.readSync.bind(fs);
 		const originalAlloc = Buffer.alloc.bind(Buffer);
 		const descriptorPaths = new Map<number, string>();
-		const withReceiptSize = <T extends fs.Stats | fs.BigIntStats>(stat: T): T =>
-			new Proxy(stat, {
-				get: (value, property) =>
-					property === "size"
-						? typeof value.size === "bigint"
-							? BigInt(receiptSize)
-							: receiptSize
-						: Reflect.get(value, property, value),
-			}) as T;
-		vi.spyOn(fs, "opendirSync").mockImplementation(pathname => {
+		const allocated = new Map<string, number>();
+		const bytesRequested = new Map<string, number>();
+		const bytesRead = new Map<string, number>();
+		const closes = new Map<string, number>();
+		const opendir = vi.spyOn(fs, "opendirSync").mockImplementation(pathname => {
 			const handle = originalOpendir(pathname);
 			if (pathname !== directory) return handle;
 			const reader = { matchingEntries: 0, allocations: 0, inventoryClosed: false };
@@ -1003,48 +1623,100 @@ describe("bounded cleanup receipt replay", () => {
 				},
 			} as fs.Dir;
 		});
-		vi.spyOn(fs, "openSync").mockImplementation(((pathname: fs.PathLike, flags: string | number, mode?: number) => {
+		const open = vi.spyOn(fs, "openSync").mockImplementation(((
+			pathname: fs.PathLike,
+			flags: string | number,
+			mode?: number,
+		) => {
 			const fd = originalOpen(pathname, flags, mode);
-			if (typeof pathname === "string") descriptorPaths.set(fd, path.resolve(pathname));
+			if (typeof pathname === "string" && receiptPaths.has(path.resolve(pathname)))
+				descriptorPaths.set(fd, path.resolve(pathname));
 			return fd;
 		}) as typeof fs.openSync);
-		vi.spyOn(fs, "closeSync").mockImplementation(fd => {
+		const close = vi.spyOn(fs, "closeSync").mockImplementation(fd => {
+			const pathname = descriptorPaths.get(fd);
 			try {
 				originalClose(fd);
 			} finally {
 				descriptorPaths.delete(fd);
+				if (pathname) closes.set(pathname, (closes.get(pathname) ?? 0) + 1);
 			}
 		});
-		vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, options?: { bigint?: boolean }) => {
+		const read = vi.spyOn(fs, "readSync").mockImplementation(((
+			fd: number,
+			buffer: NodeJS.ArrayBufferView,
+			offset: number,
+			length: number,
+			position: number | null,
+		) => {
 			const pathname = descriptorPaths.get(fd);
-			const stat = originalFstat(fd, options as never);
-			if (!pathname || !receiptPaths.has(pathname)) return stat;
-			allocatingPath = pathname;
-			return withReceiptSize(stat);
-		}) as typeof fs.fstatSync);
-		vi.spyOn(fs, "lstatSync").mockImplementation(((pathname: fs.PathLike, options?: { bigint?: boolean }) => {
-			const stat = originalLstat(pathname, options as never);
-			return typeof pathname === "string" && receiptPaths.has(pathname) ? withReceiptSize(stat) : stat;
-		}) as typeof fs.lstatSync);
-		vi.spyOn(Buffer, "alloc").mockImplementation(((
+			if (pathname) bytesRequested.set(pathname, (bytesRequested.get(pathname) ?? 0) + length);
+			const count = originalRead(fd, buffer, offset, length, position);
+			if (pathname) bytesRead.set(pathname, (bytesRead.get(pathname) ?? 0) + count);
+			return count;
+		}) as typeof fs.readSync);
+		const allocate = vi.spyOn(Buffer, "alloc").mockImplementation(((
 			size: number,
 			fill?: string | Uint8Array | number,
 			encoding?: BufferEncoding,
 		) => {
 			if (size !== receiptSize) return originalAlloc(size, fill as number, encoding);
-			if (!allocatingPath) throw new Error("cleanup_receipt_allocation_path_missing");
-			const pathname = allocatingPath;
-			allocatingPath = undefined;
-			admitted.add(pathname);
+			const pathname = [...descriptorPaths.values()].find(candidate => receiptPaths.has(candidate));
+			if (!pathname) throw new Error("cleanup_receipt_allocation_descriptor_missing");
+			allocated.set(pathname, (allocated.get(pathname) ?? 0) + 1);
 			if (activeReader?.inventoryClosed) activeReader.allocations++;
-			return originalAlloc(actualSizes.get(pathname) ?? size);
+			return originalAlloc(size, fill as number, encoding);
 		}) as typeof Buffer.alloc);
 		const inspect = managedGcProtocolScopeInspectorForScope(fixture.scope);
-		await expect(inspect([protocolInputFor(fixture.scope)])).rejects.toThrow("managed_gc_journal_capacity_exceeded");
-		expect(readers).toHaveLength(1);
-		expect(readers[0]).toMatchObject({ inventoryClosed: true, allocations: 8 });
-		expect(readers[0]!.matchingEntries).toBeGreaterThan(8);
-		expect(admitted.size).toBe(8);
+		try {
+			await expect(inspect([protocolInputFor(fixture.scope)])).rejects.toThrow(
+				"managed_gc_journal_capacity_exceeded",
+			);
+		} finally {
+			allocate.mockRestore();
+			read.mockRestore();
+			close.mockRestore();
+			open.mockRestore();
+			opendir.mockRestore();
+		}
+		expect(names.length).toBeGreaterThan(8);
+		expect(readers).toEqual([
+			{ matchingEntries: names.length, allocations: 0, inventoryClosed: true },
+			{ matchingEntries: names.length, allocations: 0, inventoryClosed: true },
+			{ matchingEntries: names.length, allocations: 8, inventoryClosed: true },
+		]);
+		expect([...allocated.values()].reduce((total, count) => total + count, 0)).toBe(8);
+		const openedReceiptPaths = new Set(names.slice(0, 9).map(name => path.join(directory, name)));
+		for (const pathname of receiptPaths) {
+			const initialSize = actualSizes.get(pathname)?.size;
+			if (!openedReceiptPaths.has(pathname)) {
+				expect(closes.has(pathname)).toBe(false);
+				expect(allocated.has(pathname)).toBe(false);
+				expect(bytesRequested.has(pathname)).toBe(false);
+				expect(bytesRead.has(pathname)).toBe(false);
+			} else {
+				expect(closes.get(pathname)).toBe(1);
+				if (initialSize === BigInt(receiptSize)) {
+					expect(allocated.get(pathname)).toBe(1);
+					expect(bytesRequested.get(pathname)).toBe(receiptSize);
+					expect(bytesRead.get(pathname)).toBe(receiptSize);
+				} else {
+					expect(initialSize).toBeLessThan(BigInt(receiptSize));
+					expect(allocated.has(pathname)).toBe(false);
+					expect(bytesRequested.has(pathname)).toBe(false);
+					expect(bytesRead.has(pathname)).toBe(false);
+				}
+			}
+		}
+		expect(
+			[...receiptPaths].map(pathname => {
+				const stat = fs.statSync(pathname, { bigint: true });
+				return [
+					pathname,
+					{ dev: stat.dev, ino: stat.ino, size: stat.size, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs },
+				] as const;
+			}),
+		).toEqual(before);
 	}, 60_000);
 
 	it("rejects noncanonical suffixes, filename-record mismatches, and gaps", async () => {
@@ -1069,6 +1741,188 @@ describe("bounded cleanup receipt replay", () => {
 			}
 			const result = await deleteManagedSessionCandidate(fixture.scope, candidate);
 			expect(result).toMatchObject({ kind: "error", code: "durability_failed" });
+		}
+	});
+});
+
+describe("managed GC receipt descriptor admission", () => {
+	it("rejects an actual oversized receipt from descriptor size before allocating its contents", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		const receiptPath = managedGcReceiptPath(fixture, "prepared");
+		const receiptBytes = fs.readFileSync(receiptPath);
+		const descriptor = fs.openSync(receiptPath, "r+");
+		try {
+			fs.ftruncateSync(descriptor, MANAGED_SESSION_READ_RANGE_MAX_BYTES + 1);
+		} finally {
+			fs.closeSync(descriptor);
+		}
+		const before = fs.statSync(receiptPath, { bigint: true });
+		const allocations = spyOn(Buffer, "alloc");
+		await expect(
+			readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath),
+		).rejects.toThrow("managed_gc_journal_capacity_exceeded");
+		const after = fs.statSync(receiptPath, { bigint: true });
+		expect(after.size).toBe(BigInt(MANAGED_SESSION_READ_RANGE_MAX_BYTES + 1));
+		expect(after.dev).toBe(before.dev);
+		expect(after.ino).toBe(before.ino);
+		expect(after.nlink).toBe(1n);
+		expect(allocations.mock.calls.some(([size]) => size >= MANAGED_SESSION_READ_RANGE_MAX_BYTES)).toBe(false);
+		const current = Buffer.alloc(receiptBytes.byteLength);
+		const readDescriptor = fs.openSync(receiptPath, "r");
+		try {
+			expect(fs.readSync(readDescriptor, current, 0, current.byteLength, 0)).toBe(current.byteLength);
+		} finally {
+			fs.closeSync(readDescriptor);
+		}
+		expect(current).toEqual(receiptBytes);
+	});
+
+	it("rejects a linked actual receipt before allocation under the producer's real scope lock", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		const receiptPath = managedGcReceiptPath(fixture, "prepared");
+		const linkedPath = path.join(fixture.temporaryRoot, "linked-prepared-receipt.json");
+		const lockPath = path.join(
+			fixture.scope.directoryPath,
+			".gjc-managed-session-internal",
+			"locks",
+			`${MANAGED_GC_SCOPE_LOCK_NAME}.lock`,
+		);
+		const before = fs.readFileSync(receiptPath);
+		const beforeStat = fs.statSync(receiptPath, { bigint: true });
+		fs.linkSync(receiptPath, linkedPath);
+		let openedScopeLock = false;
+		let receiptOpenCount = 0;
+		const originalOpen = fs.openSync.bind(fs);
+		const open = vi.spyOn(fs, "openSync").mockImplementation(((
+			pathname: fs.PathLike,
+			flags: string | number,
+			mode?: number,
+		) => {
+			const descriptor = originalOpen(pathname, flags, mode);
+			if (typeof pathname === "string" && path.resolve(pathname) === receiptPath) receiptOpenCount++;
+			if (typeof pathname === "string" && path.resolve(pathname) === lockPath) openedScopeLock = true;
+			return descriptor;
+		}) as typeof fs.openSync);
+		const allocations = spyOn(Buffer, "alloc");
+		try {
+			const next: ManagedGcSessionRetirementReceipt = {
+				...preparedReceipt(fixture),
+				state: "artifacts_removed",
+				artifactsRemoved: true,
+			};
+			await expect(publishManagedGcSessionRetirementReceipt(fixture.scope, next)).rejects.toThrow("hard_link");
+			expect(openedScopeLock).toBe(true);
+			expect(receiptOpenCount).toBe(0);
+			expect(allocations.mock.calls.some(([size]) => size === Number(beforeStat.size))).toBe(false);
+			expect(fs.readFileSync(receiptPath)).toEqual(before);
+			expect(fs.readFileSync(linkedPath)).toEqual(before);
+			const afterStat = fs.statSync(receiptPath, { bigint: true });
+			expect(afterStat.dev).toBe(beforeStat.dev);
+			expect(afterStat.ino).toBe(beforeStat.ino);
+			expect(afterStat.size).toBe(beforeStat.size);
+			expect(afterStat.nlink).toBe(2n);
+		} finally {
+			allocations.mockRestore();
+			open.mockRestore();
+		}
+	});
+
+	it("closes a genuine leased inventory at its 50,001st physical entry before allocation", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		const receiptDirectory = path.dirname(managedGcReceiptPath(fixture, "prepared"));
+		for (let index = 0; index < MANAGED_ARTIFACT_MAX_FILES; index++) {
+			const name = `gc-retirement-untrusted-${String(index).padStart(8, "0")}.entry`;
+			fs.writeFileSync(path.join(receiptDirectory, name), "", { flag: "wx", mode: 0o600 });
+		}
+		expect(fs.readdirSync(receiptDirectory)).toHaveLength(MANAGED_ARTIFACT_MAX_FILES + 1);
+		const originalOpendir = fs.opendirSync.bind(fs);
+		let entriesRead = 0;
+		let inventoryCloseCount = 0;
+		const opendir = vi.spyOn(fs, "opendirSync").mockImplementation((pathname, options) => {
+			const directory = originalOpendir(pathname, options);
+			if (path.resolve(String(pathname)) !== receiptDirectory) return directory;
+			return {
+				readSync: () => {
+					const entry = directory.readSync();
+					if (entry) entriesRead++;
+					return entry;
+				},
+				closeSync: () => {
+					directory.closeSync();
+					inventoryCloseCount++;
+				},
+			} as fs.Dir;
+		});
+		const allocations = spyOn(Buffer, "alloc");
+		try {
+			await expect(readManagedGcSessionRetirementReceipt(fixture.scope, fixture.transcriptPath)).rejects.toThrow(
+				"managed_gc_journal_capacity_exceeded",
+			);
+			expect(entriesRead).toBe(MANAGED_ARTIFACT_MAX_FILES + 1);
+			expect(inventoryCloseCount).toBe(1);
+			expect(allocations.mock.calls.some(([size]) => size >= MANAGED_SESSION_READ_RANGE_MAX_BYTES)).toBe(false);
+		} finally {
+			allocations.mockRestore();
+			opendir.mockRestore();
+		}
+	});
+
+	it("admits actual receipt descriptors through 512 MiB and refuses the overflowing read before allocation", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, {
+			...preparedReceipt(fixture),
+			state: "artifacts_removed",
+			artifactsRemoved: true,
+		});
+		for (let attempt = 1; attempt <= 8; attempt++) {
+			await publishManagedGcSessionRetirementReceipt(
+				fixture.scope,
+				pendingReceipt(fixture, `actual-byte-budget-${attempt}`),
+			);
+			expect(readReceiptSuffix(fixture, `owner_pending-${String(attempt).padStart(8, "0")}`)).toMatchObject({
+				state: "owner_pending",
+				ownerRetirementAttempt: attempt,
+			});
+		}
+		const pendingPaths = Array.from({ length: 8 }, (_, index) =>
+			managedGcReceiptPath(fixture, `owner_pending-${String(index + 1).padStart(8, "0")}`),
+		);
+		for (const receiptPath of pendingPaths.slice(0, 7))
+			extendManagedGcReceiptWithWhitespace(receiptPath, MANAGED_SESSION_READ_RANGE_MAX_BYTES);
+		const finalDescriptor = fs.openSync(pendingPaths[7]!, "r+");
+		try {
+			fs.ftruncateSync(finalDescriptor, MANAGED_SESSION_READ_RANGE_MAX_BYTES);
+		} finally {
+			fs.closeSync(finalDescriptor);
+		}
+		const preparedBytes = fs.statSync(managedGcReceiptPath(fixture, "prepared")).size;
+		const artifactsBytes = fs.statSync(managedGcReceiptPath(fixture, "artifacts_removed")).size;
+		expect(7 * MANAGED_SESSION_READ_RANGE_MAX_BYTES + preparedBytes + artifactsBytes).toBeLessThanOrEqual(
+			MANAGED_ARTIFACT_MAX_TOTAL_BYTES,
+		);
+		expect(8 * MANAGED_SESSION_READ_RANGE_MAX_BYTES + preparedBytes + artifactsBytes).toBeGreaterThan(
+			MANAGED_ARTIFACT_MAX_TOTAL_BYTES,
+		);
+		for (const receiptPath of pendingPaths) {
+			const stat = fs.statSync(receiptPath, { bigint: true });
+			expect(stat.size).toBe(BigInt(MANAGED_SESSION_READ_RANGE_MAX_BYTES));
+			expect(stat.nlink).toBe(1n);
+		}
+		const allocations = spyOn(Buffer, "alloc");
+		try {
+			await expect(
+				readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath),
+			).rejects.toThrow("managed_gc_journal_capacity_exceeded");
+			const fullReceiptAllocations = allocations.mock.calls
+				.filter(([size]) => size === MANAGED_SESSION_READ_RANGE_MAX_BYTES)
+				.map(([size]) => size);
+			expect(fullReceiptAllocations).toEqual(Array(7).fill(MANAGED_SESSION_READ_RANGE_MAX_BYTES));
+		} finally {
+			allocations.mockRestore();
 		}
 	});
 });
@@ -1269,6 +2123,1295 @@ describe("managed GC retirement journal", () => {
 			"artifacts_removed",
 		);
 	}, 60_000);
+
+	it("separates public inspection admission from leased publication capacity (resource-pressure simulation only)", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		const receiptDirectory = path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal", "receipts");
+		const before = managedReceiptInventory(fixture.scope);
+		const protocolInput = protocolInputFor(fixture.scope);
+		const inspect = managedGcProtocolScopeInspectorForScope(fixture.scope);
+		const originalOpendir = fs.opendirSync.bind(fs);
+		let scans = 0;
+		const scanEntries: number[] = [];
+		let inventoriesClosed = 0;
+		const inventory = vi.spyOn(fs, "opendirSync").mockImplementation((pathname, options) => {
+			if (path.resolve(String(pathname)) !== receiptDirectory) return originalOpendir(pathname, options);
+			// Synthetic dirents exercise only the pre-retention guard; no fake entry reaches parsing or authority checks.
+			const scan = scans;
+			scans++;
+			scanEntries.push(0);
+			let index = 0;
+			return {
+				readSync: () => {
+					if (index === 50_001) return null;
+					index++;
+					scanEntries[scan] = index;
+					return { name: `gc-retirement-simulated-${index}` } as fs.Dirent;
+				},
+				closeSync: () => {
+					inventoriesClosed++;
+				},
+			} as fs.Dir;
+		});
+		const allocations = spyOn(Buffer, "alloc");
+		const stringifies = spyOn(JSON, "stringify");
+		const publishes = spyOn(ManagedSessionDescendantStore.prototype, "publishNoReplaceSync");
+		let largeAllocation = false;
+		let encodedCandidate = false;
+		let publishedCandidate = false;
+		const candidate: ManagedGcSessionRetirementReceipt = {
+			...preparedReceipt(fixture),
+			state: "artifacts_removed",
+			artifactsRemoved: true,
+		};
+		try {
+			await expect(
+				readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath),
+			).rejects.toThrow("managed_gc_journal_capacity_exceeded");
+			await expect(publishManagedGcSessionRetirementReceipt(fixture.scope, candidate)).rejects.toThrow(
+				"managed_gc_journal_capacity_exceeded",
+			);
+			await expect(
+				discoverManagedGcSessionRetirementReceipts({
+					agentDir: fixture.agentDir,
+					sessionsRoot: fixture.sessionsRoot,
+				}),
+			).rejects.toThrow("managed_gc_journal_capacity_exceeded");
+			await expect(inspect([protocolInput])).rejects.toThrow("managed_gc_journal_capacity_exceeded");
+			largeAllocation = allocations.mock.calls.some(([size]) => size >= 64 * 1024 * 1024);
+			encodedCandidate = stringifies.mock.calls.some(([value]) => {
+				if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+				const record = value as Record<string, unknown>;
+				return record.state === "artifacts_removed" && record.transcriptPath === fixture.transcriptPath;
+			});
+			publishedCandidate = publishes.mock.calls.some(([relativePath]) =>
+				String(relativePath).startsWith(".gjc-managed-session-internal/receipts/gc-retirement-"),
+			);
+		} finally {
+			inventory.mockRestore();
+			allocations.mockRestore();
+			stringifies.mockRestore();
+			publishes.mockRestore();
+		}
+		expect(scans).toBe(4);
+		// Only the genuine leased publisher reaches the independent stored-entry ceiling.
+		expect(scanEntries[1]).toBe(MANAGED_ARTIFACT_MAX_FILES + 1);
+		for (const scan of [0, 2, 3]) {
+			const entries = scanEntries[scan];
+			expect(entries).toBeDefined();
+			expect(entries!).toBeGreaterThan(MANAGED_ARTIFACT_MAX_FILES / 2);
+			expect(entries! * 2).toBeLessThanOrEqual(MANAGED_ARTIFACT_MAX_FILES * 2);
+			expect(entries!).toBeLessThan(MANAGED_ARTIFACT_MAX_FILES + 1);
+		}
+		expect(inventoriesClosed).toBe(scans);
+		expect(largeAllocation).toBe(false);
+		expect(encodedCandidate).toBe(false);
+		expect(publishedCandidate).toBe(false);
+		expect(managedReceiptInventory(fixture.scope)).toEqual(before);
+		expect((await readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath))?.state).toBe(
+			"prepared",
+		);
+		expect(
+			await discoverManagedGcSessionRetirementReceipts({
+				agentDir: fixture.agentDir,
+				sessionsRoot: fixture.sessionsRoot,
+			}),
+		).toHaveLength(1);
+		expect(await inspect([protocolInputFor(fixture.scope)])).toHaveLength(1);
+	});
+
+	it("rejects an oversized persisted GC state in reader, publisher, and discovery before allocation", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		const key = crypto.createHash("sha256").update(path.resolve(fixture.transcriptPath), "utf8").digest("hex");
+		const receiptPath = path.join(
+			fixture.scope.directoryPath,
+			".gjc-managed-session-internal",
+			"receipts",
+			`gc-retirement-${key}-prepared.json`,
+		);
+		fs.truncateSync(receiptPath, 64 * 1024 * 1024 + 1);
+		const before = fs.statSync(receiptPath, { bigint: true });
+		const allocations = spyOn(Buffer, "alloc");
+		const publishes = spyOn(ManagedSessionDescendantStore.prototype, "publishNoReplaceSync");
+		let largeAllocation = false;
+		let gcPublication = false;
+		try {
+			await expect(
+				readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath),
+			).rejects.toThrow("managed_gc_journal_capacity_exceeded");
+			await expect(
+				publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture)),
+			).rejects.toThrow("managed_gc_journal_capacity_exceeded");
+			await expect(
+				discoverManagedGcSessionRetirementReceipts({
+					agentDir: fixture.agentDir,
+					sessionsRoot: fixture.sessionsRoot,
+				}),
+			).rejects.toThrow("managed_gc_journal_capacity_exceeded");
+			largeAllocation = allocations.mock.calls.some(([size]) => size === 64 * 1024 * 1024 + 1);
+			gcPublication = publishes.mock.calls.some(([relativePath]) =>
+				String(relativePath).startsWith(".gjc-managed-session-internal/receipts/gc-retirement-"),
+			);
+		} finally {
+			allocations.mockRestore();
+			publishes.mockRestore();
+		}
+		const after = fs.statSync(receiptPath, { bigint: true });
+		expect(largeAllocation).toBe(false);
+		expect(gcPublication).toBe(false);
+		expect(after.dev).toBe(before.dev);
+		expect(after.ino).toBe(before.ino);
+		expect(after.size).toBe(before.size);
+		expect(after.mtimeNs).toBe(before.mtimeNs);
+		expect(after.ctimeNs).toBe(before.ctimeNs);
+	});
+
+	it("rejects the projected scan-guard entry before candidate encoding (inventory-pressure simulation only)", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		const key = crypto.createHash("sha256").update(path.resolve(fixture.transcriptPath), "utf8").digest("hex");
+		const otherKey = key === "a".repeat(64) ? "b".repeat(64) : "a".repeat(64);
+		const simulatedEntries = Array.from({ length: 50_001 }, (_, index) => {
+			const name =
+				index === 0
+					? `gc-retirement-${key}-prepared.json`
+					: `gc-retirement-${otherKey}-owner_pending-${String(index).padStart(8, "0")}.json`;
+			return {
+				name,
+				isFile: () => true,
+				isSymbolicLink: () => false,
+			} as fs.Dirent;
+		});
+		const receiptDirectory = path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal", "receipts");
+		const originalOpendir = fs.opendirSync.bind(fs);
+		let scans = 0;
+		const inventory = vi.spyOn(fs, "opendirSync").mockImplementation(pathname => {
+			if (path.resolve(String(pathname)) !== receiptDirectory) return originalOpendir(pathname);
+			scans++;
+			let index = 0;
+			return {
+				readSync: () => simulatedEntries[index++] ?? null,
+				closeSync: () => undefined,
+			} as fs.Dir;
+		});
+		const stringifies = spyOn(JSON, "stringify");
+		const publishes = spyOn(ManagedSessionDescendantStore.prototype, "publishNoReplaceSync");
+		let encodedCandidate = false;
+		let publishedCandidate = false;
+		try {
+			await expect(
+				publishManagedGcSessionRetirementReceipt(fixture.scope, {
+					...preparedReceipt(fixture),
+					state: "artifacts_removed",
+					artifactsRemoved: true,
+				}),
+			).rejects.toThrow("managed_gc_journal_capacity_exceeded");
+			encodedCandidate = stringifies.mock.calls.some(([value]) => {
+				if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+				const record = value as Record<string, unknown>;
+				return record.state === "artifacts_removed" && record.transcriptPath === fixture.transcriptPath;
+			});
+			publishedCandidate = publishes.mock.calls.some(([relativePath]) =>
+				String(relativePath).startsWith(".gjc-managed-session-internal/receipts/gc-retirement-"),
+			);
+		} finally {
+			inventory.mockRestore();
+			stringifies.mockRestore();
+			publishes.mockRestore();
+		}
+		expect(scans).toBe(1);
+		expect(encodedCandidate).toBe(false);
+		expect(publishedCandidate).toBe(false);
+	});
+
+	it("refuses projected entry 50001 after admitting exactly 50000 existing entries before strict candidate encoding", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, {
+			...preparedReceipt(fixture),
+			state: "artifacts_removed",
+			artifactsRemoved: true,
+		});
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, pendingReceipt(fixture, "existing-entry-plan"));
+		const candidate = pendingReceipt(fixture, "projected-entry-50001");
+		const outcome = candidate.taskArtifactOwnerRetirementOutcome;
+		if (outcome?.kind !== "uncertain") throw new Error("fixture_projected_candidate_outcome_missing");
+		const invalidCandidate: ManagedGcSessionRetirementReceipt = {
+			...candidate,
+			taskArtifactOwnerRetirementOutcome: Object.assign({}, outcome, {
+				unexpectedBigint: 18_446_744_073_709_551_616n,
+			}),
+		};
+		const before = managedReceiptInventory(fixture.scope);
+		const receiptDirectory = path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal", "receipts");
+		const genuineEntries = fs.readdirSync(receiptDirectory, { withFileTypes: true });
+		const key = crypto.createHash("sha256").update(path.resolve(fixture.transcriptPath), "utf8").digest("hex");
+		const otherKey = key === "a".repeat(64) ? "b".repeat(64) : "a".repeat(64);
+		// Inventory pressure is a negative resource simulation, not authority for these other names.
+		const entries = [
+			...genuineEntries,
+			...Array.from(
+				{ length: 50_000 - genuineEntries.length },
+				(_, index) =>
+					({
+						name: `gc-retirement-${otherKey}-owner_pending-${index + 1}.json`,
+						isFile: () => true,
+						isDirectory: () => false,
+						isSymbolicLink: () => false,
+						isBlockDevice: () => false,
+						isCharacterDevice: () => false,
+						isFIFO: () => false,
+						isSocket: () => false,
+					}) as fs.Dirent,
+			),
+		];
+		expect(entries).toHaveLength(50_000);
+		const scanned: number[] = [];
+		const originalOpendir = fs.opendirSync.bind(fs);
+		const inventory = vi.spyOn(fs, "opendirSync").mockImplementation(pathname => {
+			if (path.resolve(String(pathname)) !== receiptDirectory) return originalOpendir(pathname);
+			const scan = scanned.length;
+			scanned.push(0);
+			let index = 0;
+			return {
+				readSync: () => {
+					const entry = entries[index++];
+					if (entry) scanned[scan] = (scanned[scan] ?? 0) + 1;
+					return entry ?? null;
+				},
+				closeSync: () => undefined,
+			} as fs.Dir;
+		});
+		const stringifies = spyOn(JSON, "stringify");
+		const from = spyOn(Buffer, "from");
+		const publishes = spyOn(ManagedSessionDescendantStore.prototype, "publishNoReplaceSync");
+		let encodedCandidate = false;
+		let allocatedCandidate = false;
+		let publishedCandidate = false;
+		try {
+			await expect(publishManagedGcSessionRetirementReceipt(fixture.scope, invalidCandidate)).rejects.toThrow(
+				"managed_gc_journal_capacity_exceeded",
+			);
+			encodedCandidate = stringifies.mock.calls.some(([value]) => {
+				if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+				const record = value as Record<string, unknown>;
+				const candidateOutcome = record.taskArtifactOwnerRetirementOutcome as { reason?: unknown } | undefined;
+				return (
+					record.transcriptPath === fixture.transcriptPath && candidateOutcome?.reason === "projected-entry-50001"
+				);
+			});
+			allocatedCandidate = from.mock.calls.some(
+				([value]) => typeof value === "string" && value.includes("projected-entry-50001"),
+			);
+			publishedCandidate = publishes.mock.calls.some(([relativePath]) =>
+				String(relativePath).startsWith(".gjc-managed-session-internal/receipts/gc-retirement-"),
+			);
+		} finally {
+			inventory.mockRestore();
+			stringifies.mockRestore();
+			from.mockRestore();
+			publishes.mockRestore();
+		}
+		expect(scanned.length).toBeGreaterThanOrEqual(2);
+		expect(scanned.every(count => count === 50_000)).toBe(true);
+		expect(encodedCandidate).toBe(false);
+		expect(allocatedCandidate).toBe(false);
+		expect(publishedCandidate).toBe(false);
+		expect(managedReceiptInventory(fixture.scope)).toEqual(before);
+		await expect(publishManagedGcSessionRetirementReceipt(fixture.scope, invalidCandidate)).rejects.toThrow(
+			"task_artifact_owner_retirement_outcome_invalid",
+		);
+		expect(managedReceiptInventory(fixture.scope)).toEqual(before);
+	}, 60_000);
+
+	it("rejects a genuine authenticated sibling scope inserted after discovery's initial root inventory", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		const sibling = makeSiblingFixture(fixture, "managed-gc-discovery-sibling");
+		await publishManagedGcSessionRetirementReceipt(sibling.scope, preparedReceipt(sibling));
+		const parentJournalBefore = managedReceiptInventory(fixture.scope);
+		const siblingJournalBefore = managedReceiptInventory(sibling.scope);
+		const originalRoot = snapshotTree(fixture.sessionsRoot);
+		const lateCwd = path.join(fixture.temporaryRoot, "late-scope-cwd");
+		fs.mkdirSync(lateCwd, { mode: 0o700 });
+		let inserted = false;
+		let postInsertionRoot: unknown[] | undefined;
+		const originalOpendirSync = fs.opendirSync.bind(fs);
+		const inventoryInterleave = vi.spyOn(fs, "opendirSync").mockImplementation(pathname => {
+			if (
+				!inserted &&
+				[fixture.scope.directoryPath, sibling.scope.directoryPath].some(
+					scopePath =>
+						path.resolve(String(pathname)) === path.join(scopePath, ".gjc-managed-session-internal", "receipts"),
+				)
+			) {
+				inserted = true;
+				const lateScope = makeScope(fixture.agentDir, fixture.sessionsRoot, lateCwd);
+				postInsertionRoot = snapshotTree(fixture.sessionsRoot);
+				if (
+					lateScope.directoryPath === fixture.scope.directoryPath ||
+					lateScope.directoryPath === sibling.scope.directoryPath
+				)
+					throw new Error("fixture_late_scope_collision");
+			}
+			return originalOpendirSync(pathname);
+		});
+		try {
+			await expect(
+				discoverManagedGcSessionRetirementReceipts({
+					agentDir: fixture.agentDir,
+					sessionsRoot: fixture.sessionsRoot,
+				}),
+			).rejects.toThrow("managed_gc_scope_authority_mismatch");
+		} finally {
+			inventoryInterleave.mockRestore();
+		}
+		expect(inserted).toBe(true);
+		if (!postInsertionRoot) throw new Error("fixture_scope_inventory_insertion_missing");
+		expect(snapshotTree(fixture.sessionsRoot)).toEqual(postInsertionRoot);
+		expect(managedReceiptInventory(fixture.scope)).toEqual(parentJournalBefore);
+		expect(managedReceiptInventory(sibling.scope)).toEqual(siblingJournalBefore);
+		expect(originalRoot).not.toEqual(postInsertionRoot);
+	});
+
+	it("rejects a late authenticated populated scope without adopting its prepared journal", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		const sibling = makeSiblingFixture(fixture, "managed-gc-populated-existing-sibling");
+		await publishManagedGcSessionRetirementReceipt(sibling.scope, preparedReceipt(sibling));
+		const late = makeSiblingFixture(fixture, "managed-gc-populated-late-sibling");
+		await publishManagedGcSessionRetirementReceipt(late.scope, preparedReceipt(late));
+		const lateKey = crypto.createHash("sha256").update(path.resolve(late.transcriptPath), "utf8").digest("hex");
+		const lateReceiptPath = path.join(
+			late.scope.directoryPath,
+			".gjc-managed-session-internal",
+			"receipts",
+			`gc-retirement-${lateKey}-prepared.json`,
+		);
+		const preparedHash = crypto
+			.createHash("sha256")
+			.update(await Bun.file(lateReceiptPath).bytes())
+			.digest("hex");
+		const preparedIdentity = fs.statSync(lateReceiptPath, { bigint: true });
+		const stagingPath = path.join(fixture.temporaryRoot, "staged-populated-scope");
+		fs.renameSync(late.scope.directoryPath, stagingPath);
+		const originalRoot = snapshotTree(fixture.sessionsRoot);
+		const parentJournalBefore = managedReceiptInventory(fixture.scope);
+		const siblingJournalBefore = managedReceiptInventory(sibling.scope);
+		let inserted = false;
+		let postInsertionRoot: unknown[] | undefined;
+		const originalOpendirSync = fs.opendirSync.bind(fs);
+		const interleave = vi.spyOn(fs, "opendirSync").mockImplementation(pathname => {
+			if (
+				!inserted &&
+				[fixture.scope.directoryPath, sibling.scope.directoryPath].some(
+					scopePath =>
+						path.resolve(String(pathname)) === path.join(scopePath, ".gjc-managed-session-internal", "receipts"),
+				)
+			) {
+				inserted = true;
+				fs.renameSync(stagingPath, late.scope.directoryPath);
+				postInsertionRoot = snapshotTree(fixture.sessionsRoot);
+			}
+			return originalOpendirSync(pathname);
+		});
+		try {
+			await expect(
+				discoverManagedGcSessionRetirementReceipts({
+					agentDir: fixture.agentDir,
+					sessionsRoot: fixture.sessionsRoot,
+				}),
+			).rejects.toThrow("managed_gc_scope_authority_mismatch");
+		} finally {
+			interleave.mockRestore();
+		}
+		expect(inserted).toBe(true);
+		if (!postInsertionRoot) throw new Error("fixture_populated_scope_insertion_missing");
+		expect(snapshotTree(fixture.sessionsRoot)).toEqual(postInsertionRoot);
+		expect(originalRoot).not.toEqual(postInsertionRoot);
+		expect(managedReceiptInventory(fixture.scope)).toEqual(parentJournalBefore);
+		expect(managedReceiptInventory(sibling.scope)).toEqual(siblingJournalBefore);
+		const preparedAfter = fs.statSync(lateReceiptPath, { bigint: true });
+		expect(preparedAfter.dev).toBe(preparedIdentity.dev);
+		expect(preparedAfter.ino).toBe(preparedIdentity.ino);
+		expect(
+			crypto
+				.createHash("sha256")
+				.update(await Bun.file(lateReceiptPath).bytes())
+				.digest("hex"),
+		).toBe(preparedHash);
+		const lateRecord = (await Bun.file(lateReceiptPath).json()) as Record<string, unknown>;
+		expect(lateRecord.state).toBe("prepared");
+		expect(lateRecord.transcriptPath).toBe(late.transcriptPath);
+		expect(lateRecord.taskArtifactOwnerDeletionEvidence).toEqual(late.evidence);
+	});
+
+	it("rejects a genuine prepared journal inserted into an already-inventoried scope, including prior absence", async () => {
+		for (const initialState of ["prepared", "absent"] as const) {
+			const fixture = makeFixture(`managed-gc-existing-scope-${initialState}`);
+			const sibling = makeSiblingFixture(fixture, `managed-gc-existing-scope-later-${initialState}`);
+			const [first, second] = [fixture, sibling].sort((left, right) =>
+				left.scope.directoryName.localeCompare(right.scope.directoryName),
+			);
+			if (initialState === "prepared")
+				await publishManagedGcSessionRetirementReceipt(first.scope, preparedReceipt(first));
+			await publishManagedGcSessionRetirementReceipt(second.scope, preparedReceipt(second));
+			const firstReceiptDir = path.join(first.scope.directoryPath, ".gjc-managed-session-internal", "receipts");
+			const expectedFirstInventory = managedReceiptInventory(first.scope);
+			const expectedSecondInventory = managedReceiptInventory(second.scope);
+			const postExistingSnapshot = snapshotTree(fixture.sessionsRoot);
+			let insertedTarget: Fixture | undefined;
+			let postInsertionSnapshot: unknown[] | undefined;
+			let intercepted = false;
+			const originalOpendirSync = fs.opendirSync.bind(fs);
+			const inventoryInterleave = vi.spyOn(fs, "opendirSync").mockImplementation(pathname => {
+				if (
+					!intercepted &&
+					path.resolve(String(pathname)) ===
+						path.join(second.scope.directoryPath, ".gjc-managed-session-internal", "receipts")
+				) {
+					intercepted = true;
+					insertedTarget = makeTargetFixtureInScope(
+						fixture,
+						first.scope,
+						`late-managed-gc-target-${initialState}`,
+						`late-${initialState}.jsonl`,
+					);
+					const lateKey = crypto
+						.createHash("sha256")
+						.update(path.resolve(insertedTarget.transcriptPath), "utf8")
+						.digest("hex");
+					const lateStore = openScopeStore(first.scope);
+					try {
+						lateStore.ensureDirectory(".gjc-managed-session-internal/receipts");
+						lateStore.publishNoReplaceSync(
+							`.gjc-managed-session-internal/receipts/gc-retirement-${lateKey}-prepared.json`,
+							Buffer.from(
+								`${JSON.stringify(
+									preparedReceiptRecordForMeasurement(insertedTarget),
+									(_key, value: unknown) => (typeof value === "bigint" ? value.toString() : value),
+								)}\n`,
+								"utf8",
+							),
+						);
+					} finally {
+						lateStore.close();
+					}
+					postInsertionSnapshot = snapshotTree(fixture.sessionsRoot);
+				}
+				return originalOpendirSync(pathname);
+			});
+			try {
+				await expect(
+					discoverManagedGcSessionRetirementReceipts({
+						agentDir: fixture.agentDir,
+						sessionsRoot: fixture.sessionsRoot,
+					}),
+				).rejects.toThrow("task_artifact_owner_continuation_authority_mismatch");
+			} finally {
+				inventoryInterleave.mockRestore();
+			}
+			expect(intercepted).toBe(true);
+			if (!insertedTarget || !postInsertionSnapshot)
+				throw new Error("fixture_existing_scope_journal_insertion_missing");
+			expect(snapshotTree(fixture.sessionsRoot)).toEqual(postInsertionSnapshot);
+			expect(managedReceiptInventory(first.scope)).toHaveLength(expectedFirstInventory.length + 1);
+			expect(managedReceiptInventory(second.scope)).toEqual(expectedSecondInventory);
+			const lateKey = crypto
+				.createHash("sha256")
+				.update(path.resolve(insertedTarget.transcriptPath), "utf8")
+				.digest("hex");
+			const lateReceiptPath = path.join(firstReceiptDir, `gc-retirement-${lateKey}-prepared.json`);
+			const lateRecord = JSON.parse(fs.readFileSync(lateReceiptPath, "utf8")) as Record<string, unknown>;
+			expect(lateRecord.state).toBe("prepared");
+			expect(lateRecord.transcriptPath).toBe(insertedTarget.transcriptPath);
+			expect(lateRecord.taskArtifactOwnerDeletionEvidence).toEqual(insertedTarget.evidence);
+			if (initialState === "absent") expect(postExistingSnapshot).not.toEqual(postInsertionSnapshot);
+		}
+	});
+
+	it("admits actual 512 MiB receipt histories for sibling discovery", async () => {
+		const fixture = makeFixture();
+		const sibling = makeSiblingFixture(fixture, "managed-gc-budget-sibling");
+		for (const current of [fixture, sibling]) {
+			await publishManagedGcSessionRetirementReceipt(current.scope, preparedReceipt(current));
+			await publishManagedGcSessionRetirementReceipt(current.scope, {
+				...preparedReceipt(current),
+				state: "artifacts_removed",
+				artifactsRemoved: true,
+			});
+			for (let attempt = 1; attempt <= 6; attempt++)
+				await publishManagedGcSessionRetirementReceipt(
+					current.scope,
+					pendingReceipt(current, `sibling-actual-boundary-${attempt}`),
+				);
+		}
+		const paddedPaths = [
+			...padManagedGcReceiptHistoryTo512MiB(fixture),
+			...padManagedGcReceiptHistoryTo512MiB(sibling),
+		];
+		for (const pathname of paddedPaths) {
+			const stat = fs.statSync(pathname, { bigint: true });
+			expect(stat.size).toBe(BigInt(MANAGED_SESSION_READ_RANGE_MAX_BYTES));
+			expect(stat.nlink).toBe(1n);
+		}
+		const targetKeys = [fixture, sibling].map(current =>
+			crypto.createHash("sha256").update(path.resolve(current.transcriptPath), "utf8").digest("hex"),
+		);
+		const actualReads = new Map<string, number>();
+		const actualBytesByTarget = new Map<string, number>();
+		const originalReadExpectedBounded = ManagedSessionDescendantStore.prototype.readExpectedBounded;
+		const boundedRead = spyOn(ManagedSessionDescendantStore.prototype, "readExpectedBounded").mockImplementation(
+			function (
+				this: ManagedSessionDescendantStore,
+				relativePath: string,
+				maxBytes: number,
+				admitSize?: (size: number, descriptor: ManagedFileIdentity) => void,
+			) {
+				return originalReadExpectedBounded.call(this, relativePath, maxBytes, (size, descriptor) => {
+					const key = /^\.gjc-managed-session-internal\/receipts\/gc-retirement-([a-f0-9]{64})-/u.exec(
+						relativePath,
+					)?.[1];
+					if (key && targetKeys.includes(key)) {
+						actualReads.set(key, (actualReads.get(key) ?? 0) + 1);
+						expect(descriptor.size).toBe(size);
+						expect(size).toBe(MANAGED_SESSION_READ_RANGE_MAX_BYTES);
+						actualBytesByTarget.set(key, (actualBytesByTarget.get(key) ?? 0) + size);
+					}
+					admitSize?.(size, descriptor);
+				});
+			},
+		);
+		const discoveryAllocations = spyOn(Buffer, "alloc");
+		try {
+			const discovered = await discoverManagedGcSessionRetirementReceipts({
+				agentDir: fixture.agentDir,
+				sessionsRoot: fixture.sessionsRoot,
+			});
+			expect(discovered).toHaveLength(2);
+			expect([...actualReads.values()].sort((left, right) => left - right)).toEqual([8, 8]);
+			expect([...actualBytesByTarget.values()].sort((left, right) => left - right)).toEqual([
+				MANAGED_ARTIFACT_MAX_TOTAL_BYTES,
+				MANAGED_ARTIFACT_MAX_TOTAL_BYTES,
+			]);
+			expect(
+				discoveryAllocations.mock.calls.filter(([size]) => size === MANAGED_SESSION_READ_RANGE_MAX_BYTES),
+			).toHaveLength(16);
+		} finally {
+			boundedRead.mockRestore();
+			discoveryAllocations.mockRestore();
+		}
+	}, 60_000);
+
+	it("admits eight actual 64 MiB sibling states and rejects the ninth actual state before allocation", async () => {
+		const fixture = makeFixture();
+		const sibling = makeSiblingFixture(fixture, "managed-gc-ninth-sibling");
+		for (const current of [fixture, sibling]) {
+			await publishManagedGcSessionRetirementReceipt(current.scope, preparedReceipt(current));
+			await publishManagedGcSessionRetirementReceipt(current.scope, {
+				...preparedReceipt(current),
+				state: "artifacts_removed",
+				artifactsRemoved: true,
+			});
+			for (let attempt = 1; attempt <= 6; attempt++)
+				await publishManagedGcSessionRetirementReceipt(
+					current.scope,
+					pendingReceipt(current, `sibling-ninth-${attempt}`),
+				);
+		}
+		const target = fixture.scope.directoryName.localeCompare(sibling.scope.directoryName) > 0 ? fixture : sibling;
+		const unaffected = target === fixture ? sibling : fixture;
+		const targetKey = crypto.createHash("sha256").update(path.resolve(target.transcriptPath), "utf8").digest("hex");
+		const unaffectedKey = crypto
+			.createHash("sha256")
+			.update(path.resolve(unaffected.transcriptPath), "utf8")
+			.digest("hex");
+		await publishManagedGcSessionRetirementReceipt(target.scope, pendingReceipt(target, "target_ninth_state"));
+		const paddedHistoryPaths = [
+			...padManagedGcReceiptHistoryTo512MiB(target),
+			...padManagedGcReceiptHistoryTo512MiB(unaffected),
+		];
+		for (const pathname of paddedHistoryPaths)
+			expect(fs.statSync(pathname, { bigint: true }).size).toBe(BigInt(MANAGED_SESSION_READ_RANGE_MAX_BYTES));
+		const before = [managedReceiptInventory(fixture.scope), managedReceiptInventory(sibling.scope)];
+		const keys = [target, unaffected].map(current =>
+			crypto.createHash("sha256").update(path.resolve(current.transcriptPath), "utf8").digest("hex"),
+		);
+		const attempts = new Map<string, number>();
+		const actualAdmissions = new Map<string, { count: number; bytes: number }>();
+		const allocatedReceipts = new Map<string, number>();
+		let activeReceiptPath: string | undefined;
+		const originalReadExpectedBounded = ManagedSessionDescendantStore.prototype.readExpectedBounded;
+		const originalAlloc = Buffer.alloc.bind(Buffer);
+		const boundedRead = spyOn(ManagedSessionDescendantStore.prototype, "readExpectedBounded").mockImplementation(
+			function (
+				this: ManagedSessionDescendantStore,
+				relativePath: string,
+				maxBytes: number,
+				admitSize?: (size: number, descriptor: ManagedFileIdentity) => void,
+			) {
+				activeReceiptPath = relativePath;
+				try {
+					return originalReadExpectedBounded.call(this, relativePath, maxBytes, (size, descriptor) => {
+						const key = /^\.gjc-managed-session-internal\/receipts\/gc-retirement-([a-f0-9]{64})-/u.exec(
+							relativePath,
+						)?.[1];
+						if (key && keys.includes(key)) {
+							attempts.set(key, (attempts.get(key) ?? 0) + 1);
+							expect(descriptor.size).toBe(size);
+							expect(descriptor.nlink).toBe(1n);
+							const entryKey = `${key}:${relativePath}`;
+							const entry = actualAdmissions.get(entryKey) ?? { count: 0, bytes: 0 };
+							entry.count++;
+							entry.bytes += size;
+							actualAdmissions.set(entryKey, entry);
+						}
+						admitSize?.(size, descriptor);
+					});
+				} finally {
+					activeReceiptPath = undefined;
+				}
+			},
+		);
+		const allocations = spyOn(Buffer, "alloc").mockImplementation(((
+			size: number,
+			fill?: string | Uint8Array | number,
+			encoding?: BufferEncoding,
+		) => {
+			if (activeReceiptPath && size === MANAGED_SESSION_READ_RANGE_MAX_BYTES) {
+				const key = /^\.gjc-managed-session-internal\/receipts\/gc-retirement-([a-f0-9]{64})-/u.exec(
+					activeReceiptPath,
+				)?.[1];
+				const allocationKey = `${key}:${activeReceiptPath}`;
+				allocatedReceipts.set(allocationKey, (allocatedReceipts.get(allocationKey) ?? 0) + 1);
+			}
+			return originalAlloc(size, fill, encoding);
+		}) as typeof Buffer.alloc);
+		try {
+			await expect(
+				discoverManagedGcSessionRetirementReceipts({
+					agentDir: fixture.agentDir,
+					sessionsRoot: fixture.sessionsRoot,
+				}),
+			).rejects.toThrow("managed_gc_journal_capacity_exceeded");
+			expect([...attempts.values()].sort((left, right) => left - right)).toEqual([8, 9]);
+			expect([...actualAdmissions.entries()].filter(([entry]) => entry.startsWith(`${targetKey}:`))).toHaveLength(9);
+			expect(
+				[...actualAdmissions.entries()].filter(([entry]) => entry.startsWith(`${unaffectedKey}:`)),
+			).toHaveLength(8);
+			for (const [entryKey, admission] of actualAdmissions) {
+				const refused = entryKey.endsWith("owner_pending-00000007.json");
+				expect(admission.count).toBe(1);
+				if (refused) expect(admission.bytes).toBeLessThan(MANAGED_SESSION_READ_RANGE_MAX_BYTES);
+				else expect(admission.bytes).toBe(MANAGED_SESSION_READ_RANGE_MAX_BYTES);
+			}
+			expect([...allocatedReceipts.values()].reduce((total, count) => total + count, 0)).toBe(16);
+			expect(
+				[...allocatedReceipts.keys()].some(
+					entryKey =>
+						entryKey ===
+						`${targetKey}:.gjc-managed-session-internal/receipts/gc-retirement-${targetKey}-owner_pending-00000007.json`,
+				),
+			).toBe(false);
+			expect([managedReceiptInventory(fixture.scope), managedReceiptInventory(sibling.scope)]).toEqual(before);
+		} finally {
+			boundedRead.mockRestore();
+			allocations.mockRestore();
+		}
+	}, 60_000);
+
+	it("keeps genuine receipt rereads healthy under the default descriptor-size cap", async () => {
+		const fixture = makeFixture();
+		const sibling = makeSiblingFixture(fixture, "managed-gc-independent-phase-sibling");
+		const target = fixture.scope.directoryName.localeCompare(sibling.scope.directoryName) > 0 ? fixture : sibling;
+		const unaffected = target === fixture ? sibling : fixture;
+		for (const current of [target, unaffected]) {
+			await publishManagedGcSessionRetirementReceipt(current.scope, preparedReceipt(current));
+			await publishManagedGcSessionRetirementReceipt(current.scope, {
+				...preparedReceipt(current),
+				state: "artifacts_removed",
+				artifactsRemoved: true,
+			});
+			for (let attempt = 1; attempt <= 6; attempt++)
+				await publishManagedGcSessionRetirementReceipt(
+					current.scope,
+					pendingReceipt(current, `phase-seed-${attempt}`),
+				);
+		}
+		const targetKey = crypto.createHash("sha256").update(path.resolve(target.transcriptPath), "utf8").digest("hex");
+		const unaffectedKey = crypto
+			.createHash("sha256")
+			.update(path.resolve(unaffected.transcriptPath), "utf8")
+			.digest("hex");
+		const before = [managedReceiptInventory(target.scope), managedReceiptInventory(unaffected.scope)];
+		const expectedPaths = new Map<string, Set<string>>([
+			[targetKey, new Set(before[0]!.map(entry => `.gjc-managed-session-internal/receipts/${entry.name}`))],
+			[unaffectedKey, new Set(before[1]!.map(entry => `.gjc-managed-session-internal/receipts/${entry.name}`))],
+		]);
+		const readsByTarget = new Map<string, string[]>();
+		const capsByTarget = new Map<string, number[]>();
+		const originalRead = ManagedSessionDescendantStore.prototype.readExpectedBounded;
+		const read = spyOn(ManagedSessionDescendantStore.prototype, "readExpectedBounded").mockImplementation(function (
+			this: ManagedSessionDescendantStore,
+			relativePath: string,
+			maxBytes: number,
+			admitSize?: (size: number, descriptor: ManagedFileIdentity) => void,
+		) {
+			const key = /^\.gjc-managed-session-internal\/receipts\/gc-retirement-([a-f0-9]{64})-/u.exec(
+				relativePath,
+			)?.[1];
+			if (key === targetKey || key === unaffectedKey) {
+				const caps = capsByTarget.get(key) ?? [];
+				caps.push(maxBytes);
+				capsByTarget.set(key, caps);
+			}
+			return originalRead.call(this, relativePath, maxBytes, (size, descriptor) => {
+				if (key === targetKey || key === unaffectedKey) {
+					const scope = key === targetKey ? target.scope : unaffected.scope;
+					const actualSize = Number(
+						fs.statSync(path.join(scope.directoryPath, relativePath), { bigint: true }).size,
+					);
+					expect(size).toBe(actualSize);
+					expect(descriptor.size).toBe(size);
+					expect(descriptor.nlink).toBe(1n);
+					expect(expectedPaths.get(key)?.has(relativePath)).toBe(true);
+					const reads = readsByTarget.get(key) ?? [];
+					reads.push(relativePath);
+					readsByTarget.set(key, reads);
+				}
+				admitSize?.(size, descriptor);
+			});
+		});
+		try {
+			const snapshots = await managedGcProtocolScopeInspectorForScope(fixture.scope)([
+				protocolInputFor(target.scope),
+				protocolInputFor(unaffected.scope),
+			]);
+			expect(snapshots).toHaveLength(2);
+		} finally {
+			read.mockRestore();
+		}
+		for (const [key, paths] of expectedPaths) {
+			const reads = readsByTarget.get(key) ?? [];
+			const caps = capsByTarget.get(key) ?? [];
+			const passSize = paths.size;
+			expect(reads).toHaveLength(passSize * 4);
+			expect(caps).toEqual(Array(passSize * 4).fill(MANAGED_SESSION_READ_RANGE_MAX_BYTES));
+			for (let pass = 0; pass < 4; pass++) {
+				expect(new Set(reads.slice(pass * passSize, (pass + 1) * passSize))).toEqual(paths);
+			}
+		}
+		expect([managedReceiptInventory(target.scope), managedReceiptInventory(unaffected.scope)]).toEqual(before);
+	});
+
+	it("rejects each inspector-phase receipt under a smaller real read cap before allocation", async () => {
+		for (const phase of [
+			{ name: "initial", earlierReads: 9, samePathRead: 2 },
+			{ name: "comparison", earlierReads: 18, samePathRead: 3 },
+			{ name: "final", earlierReads: 27, samePathRead: 4 },
+		] as const) {
+			const fixture = makeFixture(`managed-gc-phase-${phase.name}`);
+			const sibling = makeSiblingFixture(fixture, `managed-gc-phase-sibling-${phase.name}`);
+			for (const current of [fixture, sibling]) {
+				await publishManagedGcSessionRetirementReceipt(current.scope, preparedReceipt(current));
+				await publishManagedGcSessionRetirementReceipt(current.scope, {
+					...preparedReceipt(current),
+					state: "artifacts_removed",
+					artifactsRemoved: true,
+				});
+				const pendingCount = current === fixture ? 7 : 6;
+				for (let attempt = 1; attempt <= pendingCount; attempt++)
+					await publishManagedGcSessionRetirementReceipt(
+						current.scope,
+						pendingReceipt(current, `phase-${phase.name}-${attempt}`),
+					);
+			}
+
+			const targetKey = crypto
+				.createHash("sha256")
+				.update(path.resolve(fixture.transcriptPath), "utf8")
+				.digest("hex");
+			const targetPrefix = `.gjc-managed-session-internal/receipts/gc-retirement-${targetKey}-`;
+			const beforeTree = snapshotTree(fixture.sessionsRoot);
+			const beforeReceipts = managedReceiptInventory(fixture.scope);
+			const beforeSiblingReceipts = managedReceiptInventory(sibling.scope);
+			const reads = new Map<string, number>();
+			const descriptorPaths = new Map<number, string>();
+			const triggerFstatIdentities: Array<{
+				dev: bigint;
+				ino: bigint;
+				nlink: bigint;
+				size: bigint;
+				mtimeNs: bigint;
+				ctimeNs: bigint;
+				isFile: boolean;
+			}> = [];
+			const targetCloseCounts = new Map<string, number>();
+			const targetReadBytes = new Map<string, number>();
+			const targetReadRequests = new Map<string, number>();
+			const targetAllocationCounts = new Map<string, number>();
+			let triggerPath: string | undefined;
+			let triggerRelativePath: string | undefined;
+			let triggerDescriptor: number | undefined;
+			let triggerOpenCount = 0;
+			let triggerStat: fs.BigIntStats | undefined;
+			let triggerRequestCap: number | undefined;
+			let allocationWhileTargetOpen = 0;
+			const originalRead = ManagedSessionDescendantStore.prototype.readExpectedBounded;
+			const originalOpen = fs.openSync.bind(fs);
+			const originalClose = fs.closeSync.bind(fs);
+			const originalReadSync = fs.readSync.bind(fs);
+			const originalFstat = fs.fstatSync.bind(fs);
+			const originalAlloc = Buffer.alloc.bind(Buffer);
+			const read = spyOn(ManagedSessionDescendantStore.prototype, "readExpectedBounded").mockImplementation(
+				function (
+					this: ManagedSessionDescendantStore,
+					relativePath: string,
+					maxBytes: number,
+					admitSize?: (size: number, descriptor: ManagedFileIdentity) => void,
+				) {
+					if (!relativePath.startsWith(targetPrefix))
+						return originalRead.call(this, relativePath, maxBytes, admitSize);
+					const count = (reads.get(relativePath) ?? 0) + 1;
+					reads.set(relativePath, count);
+					const totalReads = [...reads.values()].reduce((sum, current) => sum + current, 0);
+					if (totalReads === phase.earlierReads + 1) {
+						triggerRelativePath = relativePath;
+						triggerPath = path.join(fixture.scope.directoryPath, relativePath);
+						triggerStat = fs.lstatSync(triggerPath, { bigint: true });
+						triggerRequestCap = maxBytes;
+						if (!triggerStat.isFile() || triggerStat.nlink !== 1n || triggerStat.size <= 0n)
+							throw new Error(`fixture_${phase.name}_receipt_descriptor_unavailable`);
+						if (typeof admitSize !== "function")
+							throw new Error(`fixture_${phase.name}_admission_callback_missing`);
+						if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0)
+							throw new Error(`fixture_${phase.name}_default_read_cap_invalid`);
+						return originalRead.call(this, relativePath, 0, admitSize);
+					}
+					return originalRead.call(this, relativePath, maxBytes, admitSize);
+				},
+			);
+			const open = spyOn(fs, "openSync").mockImplementation(((
+				pathname: fs.PathLike,
+				flags: string | number,
+				mode?: number,
+			) => {
+				const fd = originalOpen(pathname, flags, mode);
+				if (typeof pathname === "string" && triggerPath && path.resolve(pathname) === triggerPath) {
+					descriptorPaths.set(fd, triggerPath);
+					triggerDescriptor = fd;
+					triggerOpenCount++;
+				}
+				return fd;
+			}) as typeof fs.openSync);
+			const close = spyOn(fs, "closeSync").mockImplementation(fd => {
+				const pathname = descriptorPaths.get(fd);
+				try {
+					originalClose(fd);
+				} finally {
+					if (pathname) {
+						descriptorPaths.delete(fd);
+						targetCloseCounts.set(pathname, (targetCloseCounts.get(pathname) ?? 0) + 1);
+					}
+				}
+			});
+			const readSync = spyOn(fs, "readSync").mockImplementation(((
+				fd: number,
+				buffer: NodeJS.ArrayBufferView,
+				offset: number,
+				length: number,
+				position: number | null,
+			) => {
+				const pathname = descriptorPaths.get(fd);
+				if (pathname) targetReadRequests.set(pathname, (targetReadRequests.get(pathname) ?? 0) + length);
+				const bytes = originalReadSync(fd, buffer, offset, length, position);
+				if (pathname) targetReadBytes.set(pathname, (targetReadBytes.get(pathname) ?? 0) + bytes);
+				return bytes;
+			}) as typeof fs.readSync);
+			const fstat = spyOn(fs, "fstatSync").mockImplementation(((fd: number, options?: { bigint?: boolean }) => {
+				if (options?.bigint) {
+					const stat = originalFstat(fd, { ...options, bigint: true });
+					const pathname = descriptorPaths.get(fd);
+					if (pathname) {
+						if (typeof stat.mtimeNs !== "bigint" || typeof stat.ctimeNs !== "bigint")
+							throw new Error(`fixture_${phase.name}_opened_descriptor_stat_invalid`);
+						triggerFstatIdentities.push({
+							dev: stat.dev,
+							ino: stat.ino,
+							nlink: stat.nlink,
+							size: stat.size,
+							mtimeNs: stat.mtimeNs,
+							ctimeNs: stat.ctimeNs,
+							isFile: stat.isFile(),
+						});
+					}
+					return stat;
+				}
+				return originalFstat(fd, options ? { ...options, bigint: false } : undefined);
+			}) as typeof fs.fstatSync);
+			const allocate = spyOn(Buffer, "alloc").mockImplementation(((
+				size: number,
+				fill?: string | Uint8Array | number,
+				encoding?: BufferEncoding,
+			) => {
+				const pathname = [...descriptorPaths.values()].find(value => value === triggerPath);
+				if (pathname) {
+					targetAllocationCounts.set(pathname, (targetAllocationCounts.get(pathname) ?? 0) + 1);
+					allocationWhileTargetOpen++;
+				}
+				return originalAlloc(size, fill, encoding);
+			}) as typeof Buffer.alloc);
+			let caught: unknown;
+			try {
+				await managedGcProtocolScopeInspectorForScope(fixture.scope)([
+					protocolInputFor(fixture.scope),
+					protocolInputFor(sibling.scope),
+				]);
+			} catch (error) {
+				caught = error;
+			} finally {
+				allocate.mockRestore();
+				fstat.mockRestore();
+				readSync.mockRestore();
+				close.mockRestore();
+				open.mockRestore();
+				read.mockRestore();
+			}
+
+			expect(caught).toMatchObject({ message: "managed_gc_journal_capacity_exceeded" });
+			expect(triggerPath).toBeTypeOf("string");
+			expect(triggerStat).toBeDefined();
+			expect(triggerRequestCap).toBe(MANAGED_SESSION_READ_RANGE_MAX_BYTES);
+			expect(triggerStat!.size).toBeGreaterThan(0n);
+			expect([...reads.values()].reduce((sum, count) => sum + count, 0)).toBe(phase.earlierReads + 1);
+			expect(triggerRelativePath).toBeTypeOf("string");
+			expect(reads.get(triggerRelativePath!)).toBe(phase.samePathRead);
+			expect(triggerOpenCount).toBe(1);
+			expect(targetCloseCounts.get(triggerPath!)).toBe(1);
+			if (triggerDescriptor === undefined) throw new Error(`fixture_${phase.name}_descriptor_not_opened`);
+			expect(triggerFstatIdentities).toEqual([
+				{
+					dev: triggerStat!.dev,
+					ino: triggerStat!.ino,
+					nlink: triggerStat!.nlink,
+					size: triggerStat!.size,
+					mtimeNs: triggerStat!.mtimeNs,
+					ctimeNs: triggerStat!.ctimeNs,
+					isFile: true,
+				},
+			]);
+			expect(() => originalFstat(triggerDescriptor!, { bigint: true })).toThrow();
+			expect(targetReadRequests.has(triggerPath!)).toBe(false);
+			expect(targetReadBytes.has(triggerPath!)).toBe(false);
+			expect(targetAllocationCounts.has(triggerPath!)).toBe(false);
+			expect(allocationWhileTargetOpen).toBe(0);
+			if (!triggerStat) throw new Error(`fixture_${phase.name}_trigger_stat_missing`);
+			const afterStat = fs.lstatSync(triggerPath!, { bigint: true });
+			expect({
+				dev: afterStat.dev,
+				ino: afterStat.ino,
+				nlink: afterStat.nlink,
+				size: afterStat.size,
+				mtimeNs: afterStat.mtimeNs,
+				ctimeNs: afterStat.ctimeNs,
+			}).toEqual({
+				dev: triggerStat.dev,
+				ino: triggerStat.ino,
+				nlink: triggerStat.nlink,
+				size: triggerStat.size,
+				mtimeNs: triggerStat.mtimeNs,
+				ctimeNs: triggerStat.ctimeNs,
+			});
+			expect([managedReceiptInventory(fixture.scope), managedReceiptInventory(sibling.scope)]).toEqual([
+				beforeReceipts,
+				beforeSiblingReceipts,
+			]);
+			expect(snapshotTree(fixture.sessionsRoot)).toEqual(beforeTree);
+		}
+	});
+
+	it("serializes distinct-target appends at the shared receipt-directory capacity", async () => {
+		const fixture = makeFixture();
+		const secondTranscriptName = "second-fixture.jsonl";
+		const secondTranscriptPath = path.join(fixture.scope.directoryPath, secondTranscriptName);
+		const transcriptStore = openScopeStore(fixture.scope);
+		try {
+			transcriptStore.publishNoReplaceSync(
+				secondTranscriptName,
+				Buffer.from(
+					`${JSON.stringify({
+						type: "session",
+						id: fixture.target.sessionId,
+						cwd: fixture.cwd,
+						version: 3,
+						taskArtifactOwner: fixture.evidence.locator,
+					})}\n`,
+					"utf8",
+				),
+			);
+		} finally {
+			transcriptStore.close();
+		}
+		const secondTarget = bindManagedGcSessionRetirementTarget(fixture.scope, secondTranscriptPath);
+		const secondReceipt: ManagedGcSessionRetirementReceipt = {
+			...secondTarget,
+			state: "prepared",
+			taskArtifactOwnerDeletionEvidence: fixture.evidence,
+		};
+		const targetKeys = new Set(
+			[fixture.transcriptPath, secondTranscriptPath].map(transcriptPath =>
+				crypto.createHash("sha256").update(path.resolve(transcriptPath), "utf8").digest("hex"),
+			),
+		);
+		const syntheticNames: string[] = [];
+		for (let index = 0; syntheticNames.length < MANAGED_ARTIFACT_MAX_FILES - 1; index++) {
+			const key = index.toString(16).padStart(64, "0");
+			if (!targetKeys.has(key)) syntheticNames.push(`gc-retirement-${key}-prepared.json`);
+		}
+		const receiptDirectory = path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal", "receipts");
+		const lockDirectory = path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal", "locks");
+		const openedLockPaths = new Set<string>();
+		const originalOpendir = fs.opendirSync.bind(fs);
+		const originalOpen = fs.openSync.bind(fs);
+		const entry = (name: string): fs.Dirent =>
+			({
+				name,
+				isBlockDevice: () => false,
+				isCharacterDevice: () => false,
+				isDirectory: () => false,
+				isFIFO: () => false,
+				isFile: () => true,
+				isSocket: () => false,
+				isSymbolicLink: () => false,
+			}) as fs.Dirent;
+		const inventory = spyOn(fs, "opendirSync").mockImplementation(pathname => {
+			if (path.resolve(String(pathname)) !== receiptDirectory) return originalOpendir(pathname);
+			const directory = originalOpendir(pathname);
+			let index = 0;
+			return {
+				readSync: () => (index < syntheticNames.length ? entry(syntheticNames[index++]!) : directory.readSync()),
+				closeSync: () => directory.closeSync(),
+			} as fs.Dir;
+		});
+		const open = spyOn(fs, "openSync").mockImplementation(((
+			pathname: fs.PathLike,
+			flags: string | number,
+			mode?: number,
+		) => {
+			if (typeof pathname === "string" && path.dirname(path.resolve(pathname)) === lockDirectory)
+				openedLockPaths.add(path.resolve(pathname));
+			return originalOpen(pathname, flags, mode);
+		}) as typeof fs.openSync);
+		let results: PromiseSettledResult<ManagedGcSessionRetirementReceipt>[] = [];
+		let capacityRefusal: unknown;
+		try {
+			results = await Promise.allSettled([
+				publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture)),
+				publishManagedGcSessionRetirementReceipt(fixture.scope, secondReceipt),
+			]);
+			expect(results.filter(result => result.status === "fulfilled")).toHaveLength(1);
+			const rejectedIndex = results.findIndex(result => result.status === "rejected");
+			const rejected = results[rejectedIndex];
+			if (rejected?.status !== "rejected") throw new Error("capacity_fixture_missing_rejection");
+			capacityRefusal = rejected.reason;
+			if (rejected.reason instanceof Error && rejected.reason.message === "migration_busy") {
+				// Join both original calls before retrying the same losing target under the unchanged pressure.
+				const retryReceipt = rejectedIndex === 0 ? preparedReceipt(fixture) : secondReceipt;
+				try {
+					await publishManagedGcSessionRetirementReceipt(fixture.scope, retryReceipt);
+					capacityRefusal = undefined;
+				} catch (error) {
+					capacityRefusal = error;
+				}
+			}
+		} finally {
+			open.mockRestore();
+			inventory.mockRestore();
+		}
+		expect(capacityRefusal).toMatchObject({ message: "managed_gc_journal_capacity_exceeded" });
+		expect(openedLockPaths.size).toBe(1);
+		expect([...openedLockPaths][0]).toBe(path.join(lockDirectory, `${MANAGED_GC_SCOPE_LOCK_NAME}.lock`));
+		expect(managedReceiptInventory(fixture.scope)).toHaveLength(1);
+	}, 60_000);
+
+	it("rejects a candidate after actual 512 MiB history admission before candidate encoding", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, {
+			...preparedReceipt(fixture),
+			state: "artifacts_removed",
+			artifactsRemoved: true,
+		});
+		for (let attempt = 1; attempt <= 6; attempt++)
+			await publishManagedGcSessionRetirementReceipt(fixture.scope, pendingReceipt(fixture, `seed-${attempt}`));
+		const paddedPaths = padManagedGcReceiptHistoryTo512MiB(fixture);
+		for (const pathname of paddedPaths) {
+			const stat = fs.statSync(pathname, { bigint: true });
+			expect(stat.size).toBe(BigInt(MANAGED_SESSION_READ_RANGE_MAX_BYTES));
+			expect(stat.nlink).toBe(1n);
+		}
+		expect(paddedPaths.reduce((total, pathname) => total + fs.statSync(pathname).size, 0)).toBe(
+			MANAGED_ARTIFACT_MAX_TOTAL_BYTES,
+		);
+		expect((await readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath))?.state).toBe(
+			"owner_pending",
+		);
+		const candidateReason = "actual_history_capacity_candidate";
+		const candidate = pendingReceipt(fixture, candidateReason);
+		const candidateOutcome = candidate.taskArtifactOwnerRetirementOutcome;
+		if (candidateOutcome?.kind !== "uncertain") throw new Error("fixture_candidate_outcome_missing");
+		const invalidCandidate: ManagedGcSessionRetirementReceipt = {
+			...candidate,
+			taskArtifactOwnerRetirementOutcome: Object.assign({}, candidateOutcome, {
+				unexpectedBigint: 18_446_744_073_709_551_616n,
+			}) as typeof candidateOutcome,
+		};
+		const before = managedReceiptInventory(fixture.scope);
+		const originalReadExpectedBounded = ManagedSessionDescendantStore.prototype.readExpectedBounded;
+		const actualAdmissions: Array<{ relativePath: string; size: number; descriptor: ManagedFileIdentity }> = [];
+		const boundedRead = spyOn(ManagedSessionDescendantStore.prototype, "readExpectedBounded").mockImplementation(
+			function (
+				this: ManagedSessionDescendantStore,
+				relativePath: string,
+				maxBytes: number,
+				admitSize?: (size: number, descriptor: ManagedFileIdentity) => void,
+			) {
+				return originalReadExpectedBounded.call(this, relativePath, maxBytes, (size, descriptor) => {
+					if (relativePath.startsWith(".gjc-managed-session-internal/receipts/gc-retirement-")) {
+						expect(descriptor.size).toBe(size);
+						actualAdmissions.push({ relativePath, size, descriptor });
+					}
+					admitSize?.(size, descriptor);
+				});
+			},
+		);
+		const allocations = spyOn(Buffer, "alloc");
+		const stringifies = spyOn(JSON, "stringify");
+		const from = spyOn(Buffer, "from");
+		const publishes = spyOn(ManagedSessionDescendantStore.prototype, "publishNoReplaceSync");
+		let encodedCandidate = false;
+		let candidateBuffer = false;
+		let publishedCandidate = false;
+		let receiptAllocationCount = 0;
+		const candidateRelativePath = path
+			.relative(fixture.scope.directoryPath, managedGcReceiptPath(fixture, "owner_pending-00000007"))
+			.split(path.sep)
+			.join("/");
+		try {
+			await expect(publishManagedGcSessionRetirementReceipt(fixture.scope, invalidCandidate)).rejects.toThrow(
+				"managed_gc_journal_capacity_exceeded",
+			);
+			encodedCandidate = stringifies.mock.calls.some(([value]) => {
+				if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+				const record = value as Record<string, unknown>;
+				const outcome = record.taskArtifactOwnerRetirementOutcome as { reason?: unknown } | undefined;
+				return record.transcriptPath === fixture.transcriptPath && outcome?.reason === candidateReason;
+			});
+			candidateBuffer = from.mock.calls.some(
+				([value]) => typeof value === "string" && value.includes(candidateReason),
+			);
+			publishedCandidate = publishes.mock.calls.some(
+				([relativePath]) => String(relativePath) === candidateRelativePath,
+			);
+			receiptAllocationCount = allocations.mock.calls.filter(
+				([size]) => size === MANAGED_SESSION_READ_RANGE_MAX_BYTES,
+			).length;
+		} finally {
+			boundedRead.mockRestore();
+			allocations.mockRestore();
+			stringifies.mockRestore();
+			from.mockRestore();
+			publishes.mockRestore();
+		}
+		expect(actualAdmissions).toHaveLength(8);
+		expect(actualAdmissions.every(entry => entry.size === MANAGED_SESSION_READ_RANGE_MAX_BYTES)).toBe(true);
+		expect(actualAdmissions.every(entry => entry.descriptor.nlink === 1n)).toBe(true);
+		expect(receiptAllocationCount).toBe(8);
+		expect(encodedCandidate).toBe(false);
+		expect(candidateBuffer).toBe(false);
+		expect(publishedCandidate).toBe(false);
+		expect(managedReceiptInventory(fixture.scope)).toEqual(before);
+
+		const controlFixture = makeFixture("managed-gc-append-candidate-control");
+		await publishManagedGcSessionRetirementReceipt(controlFixture.scope, preparedReceipt(controlFixture));
+		await publishManagedGcSessionRetirementReceipt(controlFixture.scope, {
+			...preparedReceipt(controlFixture),
+			state: "artifacts_removed",
+			artifactsRemoved: true,
+		});
+		for (let attempt = 1; attempt <= 6; attempt++)
+			await publishManagedGcSessionRetirementReceipt(
+				controlFixture.scope,
+				pendingReceipt(controlFixture, `control-seed-${attempt}`),
+			);
+		const controlBefore = managedReceiptInventory(controlFixture.scope);
+		const controlCandidate = pendingReceipt(controlFixture, "valid-history-control");
+		const controlOutcome = controlCandidate.taskArtifactOwnerRetirementOutcome;
+		if (controlOutcome?.kind !== "uncertain") throw new Error("fixture_control_candidate_outcome_missing");
+		const invalidControlCandidate: ManagedGcSessionRetirementReceipt = {
+			...controlCandidate,
+			taskArtifactOwnerRetirementOutcome: Object.assign({}, controlOutcome, {
+				unexpectedBigint: 18_446_744_073_709_551_616n,
+			}) as typeof controlOutcome,
+		};
+		await expect(
+			publishManagedGcSessionRetirementReceipt(controlFixture.scope, invalidControlCandidate),
+		).rejects.toThrow("task_artifact_owner_retirement_outcome_invalid");
+		expect(managedReceiptInventory(controlFixture.scope)).toEqual(controlBefore);
+		const validControlReceipt = await publishManagedGcSessionRetirementReceipt(
+			controlFixture.scope,
+			controlCandidate,
+		);
+		expect(validControlReceipt).toMatchObject({ state: "owner_pending", ownerRetirementAttempt: 7 });
+		expect(managedReceiptInventory(controlFixture.scope)).toHaveLength(controlBefore.length + 1);
+	}, 60_000);
+
+	it("uses bounded GC rereads when a receipt grows between discovery and inspector verification", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		const protocolInput = protocolInputFor(fixture.scope);
+		const inspect = managedGcProtocolScopeInspectorForScope(fixture.scope);
+		const receiptDirectory = path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal", "receipts");
+		const protocolDirectory = path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal");
+		const key = crypto.createHash("sha256").update(path.resolve(fixture.transcriptPath), "utf8").digest("hex");
+		const preparedPath = path.join(receiptDirectory, `gc-retirement-${key}-prepared.json`);
+		const originalOpendirSync = fs.opendirSync.bind(fs);
+		const originalLstatSync = fs.lstatSync.bind(fs);
+		let inspectorStarted = false;
+		let receiptDirectoryStats = 0;
+		let grewReceipt = false;
+		const opendir = vi.spyOn(fs, "opendirSync").mockImplementation(pathname => {
+			if (path.resolve(String(pathname)) === protocolDirectory) inspectorStarted = true;
+			return originalOpendirSync(pathname);
+		});
+		const lstat = vi.spyOn(fs, "lstatSync").mockImplementation(((...args: Parameters<typeof fs.lstatSync>) => {
+			const stat = originalLstatSync(...args);
+			if (inspectorStarted && path.resolve(String(args[0])) === receiptDirectory) {
+				receiptDirectoryStats++;
+				if (receiptDirectoryStats === 5) {
+					fs.truncateSync(preparedPath, 64 * 1024 * 1024 + 1);
+					grewReceipt = true;
+				}
+			}
+			return stat;
+		}) as typeof fs.lstatSync);
+		const allocations = spyOn(Buffer, "alloc");
+		let overLimitAllocation = false;
+		try {
+			await expect(inspect([protocolInput])).rejects.toThrow("managed_gc_journal_capacity_exceeded");
+			overLimitAllocation = allocations.mock.calls.some(([size]) => size === 64 * 1024 * 1024 + 1);
+		} finally {
+			opendir.mockRestore();
+			lstat.mockRestore();
+			allocations.mockRestore();
+		}
+		expect(receiptDirectoryStats).toBeGreaterThanOrEqual(5);
+		expect(grewReceipt).toBe(true);
+		expect(fs.statSync(preparedPath).size).toBe(64 * 1024 * 1024 + 1);
+		expect(overLimitAllocation).toBe(false);
+	});
 
 	it("persists actual native disposition and replays pending namespaces after transcript absence", async () => {
 		const fixture = makeFixture();
@@ -1621,6 +3764,207 @@ describe("managed GC retirement journal", () => {
 				"utf8",
 			),
 		).toBe("fixture payload");
+	});
+
+	it("accepts canonical attempt ten and rejects malformed and filename-mismatched attempts", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, {
+			...preparedReceipt(fixture),
+			state: "artifacts_removed",
+			artifactsRemoved: true,
+		});
+		for (let attempt = 1; attempt <= 10; attempt++)
+			await publishManagedGcSessionRetirementReceipt(fixture.scope, pendingReceipt(fixture, `attempt-${attempt}`));
+		expect(
+			(await readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath))
+				?.ownerRetirementAttempt,
+		).toBe(10);
+
+		const key = crypto.createHash("sha256").update(path.resolve(fixture.transcriptPath), "utf8").digest("hex");
+		const relativePath = `.gjc-managed-session-internal/receipts/gc-retirement-${key}-owner_pending-00000010.json`;
+		const record = readReceiptSuffix(fixture, "owner_pending-00000010") as Record<string, unknown>;
+		const store = openScopeStore(fixture.scope);
+		try {
+			store.publishNoReplaceSync(
+				`.gjc-managed-session-internal/receipts/gc-retirement-${key}-owner_pending-000000010.json`,
+				Buffer.from(`${JSON.stringify(record)}\n`, "utf8"),
+			);
+		} finally {
+			store.close();
+		}
+		await expect(
+			readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath),
+		).rejects.toThrow("task_artifact_owner_continuation_corrupt");
+
+		const replacementStore = openScopeStore(fixture.scope);
+		try {
+			replacementStore.removeIfExistsDescriptor(
+				`.gjc-managed-session-internal/receipts/gc-retirement-${key}-owner_pending-000000010.json`,
+			);
+			const existing = replacementStore.readExpected(relativePath);
+			if (!existing) throw new Error("fixture_attempt_ten_missing");
+			replacementStore.replaceExpected(
+				relativePath,
+				Buffer.from(`${JSON.stringify({ ...record, ownerRetirementAttempt: 11 })}\n`, "utf8"),
+				existing,
+			);
+		} finally {
+			replacementStore.close();
+		}
+		await expect(
+			readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath),
+		).rejects.toThrow("task_artifact_owner_continuation_state_missing");
+	});
+
+	it("rejects a genuine payload shrink followed by reintroduction in persisted pending history", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, {
+			...preparedReceipt(fixture),
+			state: "artifacts_removed",
+			artifactsRemoved: true,
+		});
+		const context = taskArtifactOwnerStorageContextForScope(fixture.scope);
+		const ownerPath = ownerAbsolutePath(context, fixture.target.taskArtifactOwnerLocator.ownerId);
+		const payloadPath = path.join(ownerPath, "payload.json");
+		const originalPayload = fs.readFileSync(payloadPath);
+		const rootStore = newSessionRootStore(context);
+		const captureTree = () =>
+			rootStore.captureTree(ownerRelativePath(fixture.target.taskArtifactOwnerLocator.ownerId));
+		const replacePayloadInPlace = (bytes: Buffer): void => {
+			const before = fs.lstatSync(payloadPath, { bigint: true });
+			if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n)
+				throw new Error("fixture_payload_identity_invalid");
+			const descriptor = fs.openSync(payloadPath, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW);
+			try {
+				const opened = fs.fstatSync(descriptor, { bigint: true });
+				if (opened.dev !== before.dev || opened.ino !== before.ino) throw new Error("fixture_payload_replaced");
+				fs.ftruncateSync(descriptor, 0);
+				if (bytes.byteLength > 0) fs.writeSync(descriptor, bytes, 0, bytes.byteLength, 0);
+				fs.fsyncSync(descriptor);
+			} finally {
+				fs.closeSync(descriptor);
+			}
+			const after = fs.lstatSync(payloadPath, { bigint: true });
+			if (after.dev !== before.dev || after.ino !== before.ino || after.nlink !== 1n)
+				throw new Error("fixture_payload_identity_changed");
+		};
+		try {
+			const initialContinuation = uncertainContinuation(fixture);
+			expect(captureTree()).toEqual(fixture.evidence.treeSnapshot);
+			const first: ManagedGcSessionRetirementReceipt = {
+				...fixture.target,
+				state: "owner_pending",
+				taskArtifactOwnerDeletionEvidence: fixture.evidence,
+				taskArtifactOwnerRetirementOutcome: {
+					kind: "uncertain",
+					evidence: fixture.evidence,
+					continuation: initialContinuation,
+					reason: "genuine_initial_tree",
+				},
+				taskArtifactOwnerRetirementContinuation: initialContinuation,
+			};
+			await publishManagedGcSessionRetirementReceipt(fixture.scope, first);
+
+			const expansionStore = rootStore.deriveSubtree(
+				ownerRelativePath(fixture.target.taskArtifactOwnerLocator.ownerId),
+			);
+			let expandedContinuation: TaskArtifactOwnerRetirementContinuation | undefined;
+			try {
+				expansionStore.publishNoReplaceSync("temporary-expansion.txt", Buffer.from("new retained path", "utf8"));
+				expandedContinuation = {
+					...initialContinuation,
+					retainedTreeSnapshot: captureTree(),
+				};
+			} finally {
+				expansionStore.removeIfExistsDescriptor("temporary-expansion.txt");
+				expansionStore.close();
+			}
+			if (!expandedContinuation) throw new Error("fixture_expanded_continuation_missing");
+			const expanded: ManagedGcSessionRetirementReceipt = {
+				...first,
+				taskArtifactOwnerRetirementOutcome: {
+					kind: "uncertain",
+					evidence: fixture.evidence,
+					continuation: expandedContinuation,
+					reason: "genuine_tree_expansion",
+				},
+				taskArtifactOwnerRetirementContinuation: expandedContinuation,
+			};
+			await expect(publishManagedGcSessionRetirementReceipt(fixture.scope, expanded)).rejects.toThrow(
+				"task_artifact_owner_continuation_authority_mismatch",
+			);
+
+			replacePayloadInPlace(Buffer.alloc(0));
+			const shrunkContinuation: TaskArtifactOwnerRetirementContinuation = {
+				...initialContinuation,
+				retainedTreeSnapshot: captureTree(),
+			};
+			const shrunk: ManagedGcSessionRetirementReceipt = {
+				...first,
+				taskArtifactOwnerRetirementOutcome: {
+					kind: "uncertain",
+					evidence: fixture.evidence,
+					continuation: shrunkContinuation,
+					reason: "genuine_payload_shrink",
+				},
+				taskArtifactOwnerRetirementContinuation: shrunkContinuation,
+			};
+			await publishManagedGcSessionRetirementReceipt(fixture.scope, shrunk);
+
+			replacePayloadInPlace(originalPayload);
+			const reintroducedContinuation: TaskArtifactOwnerRetirementContinuation = {
+				...initialContinuation,
+				retainedTreeSnapshot: captureTree(),
+			};
+			const reintroducedOutcome = {
+				kind: "uncertain" as const,
+				evidence: fixture.evidence,
+				continuation: reintroducedContinuation,
+				reason: "genuine_payload_reintroduction",
+			};
+			const reintroduced: ManagedGcSessionRetirementReceipt = {
+				...first,
+				taskArtifactOwnerRetirementOutcome: reintroducedOutcome,
+				taskArtifactOwnerRetirementContinuation: reintroducedContinuation,
+			};
+			const beforeRejectedAppend = managedReceiptInventory(fixture.scope);
+			await expect(publishManagedGcSessionRetirementReceipt(fixture.scope, reintroduced)).rejects.toThrow(
+				"task_artifact_owner_continuation_authority_mismatch",
+			);
+			expect(managedReceiptInventory(fixture.scope)).toEqual(beforeRejectedAppend);
+
+			const key = crypto.createHash("sha256").update(path.resolve(fixture.transcriptPath), "utf8").digest("hex");
+			const forgedRecord = {
+				schemaVersion: 1,
+				state: "owner_pending",
+				scope: computeManagedScopeDigest(fixture.scope.platform, fixture.scope.canonicalCwd),
+				transcriptPath: fixture.transcriptPath,
+				sessionId: fixture.target.sessionId,
+				cwd: fixture.target.cwd,
+				transcriptIdentity: managedGcRetirementIdentityRecord(fixture.target.transcriptIdentity),
+				taskArtifactOwnerDeletionEvidence: fixture.evidence,
+				ownerRetirementAttempt: 3,
+				artifactsRemoved: true,
+				taskArtifactOwnerRetirementOutcome: reintroducedOutcome,
+				taskArtifactOwnerRetirementContinuation: reintroducedContinuation,
+			};
+			const journalStore = openScopeStore(fixture.scope);
+			try {
+				journalStore.publishNoReplaceSync(
+					`.gjc-managed-session-internal/receipts/gc-retirement-${key}-owner_pending-00000003.json`,
+					Buffer.from(`${JSON.stringify(forgedRecord)}\n`, "utf8"),
+				);
+			} finally {
+				journalStore.close();
+			}
+			await expect(
+				readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath),
+			).rejects.toThrow("task_artifact_owner_continuation_authority_mismatch");
+		} finally {
+			rootStore.close();
+		}
 	});
 
 	it("rejects a numbered-attempt gap and later states without prepared authority", async () => {

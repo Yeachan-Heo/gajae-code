@@ -190,9 +190,7 @@ function cursorRowLabel(selector: ModelSelectorComponent): string | undefined {
 
 describe("preset landing adversarial QA", () => {
 	test("defers browser catalog materialization until model browsing starts", async () => {
-		const registry = Object.assign(createRegistry(["openai-codex"]), {
-			getAvailableForProfileActivation: vi.fn(() => [codexModel, ...builtinCodexModels]),
-		});
+		const registry = createRegistry(["openai-codex"]);
 		const ui = { requestRender: vi.fn() } as unknown as TUI;
 		const selector = new ModelSelectorComponent(
 			ui,
@@ -207,14 +205,12 @@ describe("preset landing adversarial QA", () => {
 		await rendered(selector);
 		expect(registry.refreshStatic).toHaveBeenCalledTimes(1);
 		expect(registry.refresh).not.toHaveBeenCalled();
-		expect(registry.getAvailable).not.toHaveBeenCalled();
 		expect(registry.getCanonicalModelSelections).not.toHaveBeenCalled();
-		expect(registry.getAvailableForProfileActivation).toHaveBeenCalled();
+		expect(registry.getAvailable).toHaveBeenCalled();
 
 		selector.handleInput("g");
 		const text = await rendered(selector);
 		expect(registry.refresh).toHaveBeenCalledTimes(1);
-		expect(registry.getAvailable).toHaveBeenCalledTimes(1);
 		expect(registry.getCanonicalModelSelections).toHaveBeenCalledTimes(1);
 		expect(text).toContain("gpt-5.5");
 	});

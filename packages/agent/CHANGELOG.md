@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [0.18.8] - 2026-10-08
+
+### Fixed
+
+- Promote zero-token empty provider responses to explicit errors, including responses without typed transport metadata.
+- Preserve clean-attempt fallback for typed capacity overloads after earlier committed tool work, while blocking replay of observable output.
+
+- Preserve managed fallback retries when a provider stages an empty assistant text placeholder before reporting a statusless overload, while retaining non-empty terminal error content.
+
 ## [0.18.7] - 2026-10-04
 
 ## [0.18.6] - 2026-10-03

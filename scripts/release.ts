@@ -11,6 +11,9 @@
 
 import { $, Glob } from "bun";
 import { consumeFragments, foldFragmentsIntoChangelog, readPackageFragments } from "./changelog-fragments";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 
 const changelogGlob = new Glob("packages/*/CHANGELOG.md");
 const packageJsonGlob = new Glob("packages/*/package.json");
@@ -907,6 +910,24 @@ async function cmdRelease(version: string): Promise<void> {
 	console.log("Pushing to remote...");
 	await pushReleaseRefsAtomically(version);
 	console.log();
+	// 8b. Backmerge the release commit into dev so the next release merge stays a
+	// fast-forward. The refs are published at this point, so a backmerge that cannot
+	// land is reported with a manual recovery path and never fails the release.
+	console.log("Backmerging main into dev…");
+	const backmerge = await backmergeReleaseIntoDev(version);
+	if (backmerge.action === "blocked") {
+		console.error(`  Backmerge blocked: ${backmerge.detail}`);
+		console.error(`  v${version} is already published; sync dev by hand:`);
+		console.error(
+			"    git fetch origin +refs/heads/main:refs/remotes/origin/main +refs/heads/dev:refs/remotes/origin/dev && git worktree add /tmp/gjc-backmerge origin/dev",
+		);
+		console.error("    git -C /tmp/gjc-backmerge merge origin/main   # keep main's version and dev's artifacts map");
+		console.error(`    git -C /tmp/gjc-backmerge push origin HEAD:refs/heads/backmerge/${version}`);
+		console.error(`    gh pr create --head backmerge/${version} --base dev --title "chore(release): backmerge v${version} into dev"`);
+	} else {
+		console.log(`  ${backmerge.action}: ${backmerge.detail}`);
+	}
+	console.log();
 
 	// 9. Watch CI. The refs are published from here on, so an observer that cannot
 	// reach GitHub is reported as an observation gap — never as a CI verdict, and
@@ -935,6 +956,176 @@ async function cmdRelease(version: string): Promise<void> {
 		console.error("  bun scripts/release.ts <newer-version>");
 		process.exit(1);
 
+	}
+}
+
+// =============================================================================
+// Backmerge (main -> dev)
+// =============================================================================
+
+/**
+ * The one path a main->dev backmerge may conflict on. It records the digest of a
+ * locally built addon, so every maintainer native build rewrites it while both
+ * branches carry a different build of the same file.
+ */
+export const BACKMERGE_CONFLICT_PATH = "packages/natives/native/diagnostic-artifact.json";
+
+/** Attempts allowed before giving up on a `dev` that keeps moving under the merge. */
+const BACKMERGE_PUSH_ATTEMPTS = 3;
+
+/**
+ * Resolve the known diagnostic-artifact backmerge conflict: adopt the released
+ * `version` from main and keep the artifacts map from dev. Fails closed when either
+ * side lacks the field the resolution depends on.
+ */
+export function resolveDiagnosticArtifactBackmerge(ours: string, theirs: string): string {
+	const oursManifest = JSON.parse(ours) as Record<string, unknown>;
+	const theirsManifest = JSON.parse(theirs) as { version?: unknown };
+	if (typeof theirsManifest.version !== "string") {
+		throw new Error(`${BACKMERGE_CONFLICT_PATH} has no string version on main`);
+	}
+	if (typeof oursManifest.schema !== "string") {
+		throw new Error(`${BACKMERGE_CONFLICT_PATH} has no string schema on dev`);
+	}
+	const artifacts = oursManifest.artifacts;
+	if (artifacts === null || typeof artifacts !== "object" || Array.isArray(artifacts)) {
+		throw new Error(`${BACKMERGE_CONFLICT_PATH} has no artifacts map on dev`);
+	}
+	// Start from dev's manifest so any top-level field the schema gains later survives the
+	// resolution instead of being dropped by a hand-built three-key object.
+	const resolved = { ...oursManifest, version: theirsManifest.version };
+	return `${JSON.stringify(resolved, null, 2)}\n`;
+}
+
+export type BackmergeOutcome =
+	| { action: "skipped"; detail: string }
+	| { action: "opened"; detail: string }
+	| { action: "blocked"; detail: string };
+
+export interface BackmergePullRequest {
+	/** Repository checkout the opener runs in. */
+	cwd: string;
+	/** Pushed branch name, without `refs/heads/`. */
+	head: string;
+	base: "dev";
+	title: string;
+	body: string;
+}
+
+/** Opens the backmerge pull request; resolves to a failure detail or `undefined` on success. */
+export type BackmergePullRequestOpener = (request: BackmergePullRequest) => Promise<string | undefined>;
+
+async function openBackmergePullRequestWithGh(request: BackmergePullRequest): Promise<string | undefined> {
+	const created = await $`gh pr create --head ${request.head} --base ${request.base} --title ${request.title} --body ${request.body}`
+		.cwd(request.cwd)
+		.quiet()
+		.nothrow();
+	if (created.exitCode === 0) return undefined;
+	const error = created.stderr.toString().trim();
+	return /already exists/iu.test(error) ? undefined : firstLine(error);
+}
+
+/** First non-empty line of command output, for a bounded user-facing detail. */
+function firstLine(text: string): string {
+	return text
+		.split("\n")
+		.map(line => line.trim())
+		.find(line => line.length > 0) ?? "unknown";
+}
+
+/**
+ * Classify a rejected `git push` of the backmerge commit. Only a `dev` that moved under
+ * the merge is retryable; a permission or branch-protection refusal is terminal, so it is
+ * reported instead of burning the remaining attempts against an unchanged rejection.
+ */
+export function classifyBackmergePushFailure(stderr: string): "retry" | "blocked" {
+	return /non-fast-forward|fetch first/iu.test(stderr) ? "retry" : "blocked";
+}
+function gitAt(dir: string, args: readonly string[]) {
+	return $`git -C ${dir} -c core.fsmonitor=false -c core.untrackedCache=false ${args}`;
+}
+
+/**
+ * Sync the just-pushed release commit into `dev` so the next release merge stays a
+ * fast-forward. Runs in throwaway worktrees so the release checkout is untouched, and
+ * returns a blocked outcome instead of throwing: the release is already published, so
+ * a failed backmerge must never fail the release.
+ *
+ * Every merge to `dev` needs an approving review of its exact head, so the merge is
+ * pushed to `backmerge/<version>` and opened as a pull request rather than pushed to
+ * `dev`. An existing `backmerge/<version>` branch is left untouched: it may already
+ * carry review fixes, and its pull request is the place to finish the sync.
+ */
+export async function backmergeReleaseIntoDev(
+	version: string,
+	options: { repoDir?: string; openPullRequest?: BackmergePullRequestOpener } = {},
+): Promise<BackmergeOutcome> {
+	const repoDir = options.repoDir ?? process.cwd();
+	const openPullRequest = options.openPullRequest ?? openBackmergePullRequestWithGh;
+	const worktrees: string[] = [];
+	try {
+		// Explicit destinations: in a `--single-branch main` checkout, or any checkout whose
+		// `remote.origin.fetch` does not map `dev`, a source-only refspec fetches the objects
+		// without updating `origin/dev`, leaving it absent or stale for every command below.
+		await gitAt(repoDir, ["fetch", "origin", "+refs/heads/main:refs/remotes/origin/main", "+refs/heads/dev:refs/remotes/origin/dev"]).quiet();
+		const contained = await gitAt(repoDir, ["merge-base", "--is-ancestor", "origin/main", "origin/dev"]).quiet().nothrow();
+		if (contained.exitCode === 0) return { action: "skipped", detail: "dev already contains origin/main" };
+		const existing = await gitAt(repoDir, ["ls-remote", "--exit-code", "--heads", "origin", `backmerge/${version}`]).quiet().nothrow();
+		if (existing.exitCode === 0) return { action: "skipped", detail: `backmerge/${version} already exists; finish the sync through its pull request` };
+
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-backmerge-"));
+		worktrees.push(dir);
+		await gitAt(repoDir, ["worktree", "add", "--detach", dir, "origin/dev"]).quiet();
+
+		const merge = await gitAt(dir, ["merge", "--no-commit", "--no-ff", "origin/main"]).quiet().nothrow();
+		if (merge.exitCode !== 0) {
+			const conflicted = (await gitAt(dir, ["diff", "--name-only", "--diff-filter=U"]).text())
+				.split("\n")
+				.map(line => line.trim())
+				.filter(Boolean);
+			if (conflicted.length !== 1 || conflicted[0] !== BACKMERGE_CONFLICT_PATH) {
+				return { action: "blocked", detail: `unexpected conflict: ${conflicted.join(", ") || "unknown"}` };
+			}
+			const ours = await gitAt(dir, ["show", `:2:${BACKMERGE_CONFLICT_PATH}`]).text();
+			const theirs = await gitAt(dir, ["show", `:3:${BACKMERGE_CONFLICT_PATH}`]).text();
+			await Bun.write(path.join(dir, BACKMERGE_CONFLICT_PATH), resolveDiagnosticArtifactBackmerge(ours, theirs));
+			await gitAt(dir, ["add", BACKMERGE_CONFLICT_PATH]).quiet();
+		}
+		await gitAt(dir, [
+			"commit",
+			"-m",
+			`chore(release): sync the v${version} release into dev`,
+			"-m",
+			"dev must contain every released main commit, or the next release merge stops being a fast-forward and the changelog fragments that release consumed reappear as pending work.",
+		]).quiet();
+
+		const branch = `backmerge/${version}`;
+		const pushed = await gitAt(dir, ["push", "origin", `HEAD:refs/heads/${branch}`]).quiet().nothrow();
+		if (pushed.exitCode !== 0) {
+			return { action: "blocked", detail: `failed to push ${branch}: ${firstLine(pushed.stderr.toString().trim())}` };
+		}
+
+		const failure = await openPullRequest({
+			cwd: dir,
+			head: branch,
+			base: "dev",
+			title: `chore(release): backmerge v${version} into dev`,
+			body: `Sync the v${version} release from main into dev so the next release merge stays a fast-forward.
+
+The release consumed its changelog fragments; the history guard admits those deletions because the \`v${version}\` tag records them. The \`${BACKMERGE_CONFLICT_PATH}\` conflict is resolved by taking main's released version and dev's artifact digests.
+
+Merging to dev requires maintainer approval of this exact head.`,
+		});
+		if (failure !== undefined) return { action: "blocked", detail: `pushed ${branch} but could not open its pull request: ${failure}` };
+		return { action: "opened", detail: `opened ${branch} -> dev; merge it after maintainer approval` };
+	} catch (error) {
+		const detail = error instanceof Error ? error.message : String(error);
+		return { action: "blocked", detail: `unexpected error: ${detail}` };
+	} finally {
+		for (const dir of worktrees) {
+			await gitAt(repoDir, ["worktree", "remove", "--force", dir]).quiet().nothrow();
+		}
+		await gitAt(repoDir, ["worktree", "prune"]).quiet().nothrow();
 	}
 }
 

@@ -1,4 +1,4 @@
-import { afterAll, afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, spyOn, test, vi } from "bun:test";
 import * as modelProfileActivation from "../../src/config/model-profile-activation";
 import { Settings } from "../../src/config/settings";
 import type { AgentSession } from "../../src/session/agent-session";
@@ -79,6 +79,10 @@ function createRuntime() {
 		sessionId: "session-1",
 		model: undefined as { provider: string; id: string; contextWindow?: number } | undefined,
 		thinkingLevel: undefined as string | undefined,
+		markUserModelSelection: vi.fn(),
+		async withSdkControlMutation<T>(body: () => Promise<T>): Promise<T> {
+			return body();
+		},
 		modelRegistry: {
 			async getApiKey(_model: { provider: string; id: string }, _sessionId?: string) {
 				return "test-api-key";
@@ -163,6 +167,7 @@ describe("/model <preset> activation", () => {
 
 		expect(result).toEqual({ consumed: true });
 		expect(activateSpy).toHaveBeenCalledTimes(1);
+		expect(runtime.session.markUserModelSelection).toHaveBeenCalledTimes(1);
 		const [options, applyOptions] = activateSpy.mock.calls[0]!;
 		expect(options.profileName).toBe("codex-medium");
 		expect(applyOptions).toEqual({ persistDefault: false });

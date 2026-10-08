@@ -809,7 +809,11 @@ export class RuntimeOwner {
 			evidence: Record<string, unknown>,
 		): Promise<void> => {
 			if (signal.aborted) return;
-			if (kind === "operate_blocked" || kind === "operate_finalized") {
+			if (kind === "operate_observation_window_ended") {
+				const lifecycle = evidence.lifecycle === "submitted" ? "submitted" : "observing";
+				const persisted = await this.#persistValidationLifecycle(signal, lifecycle, []);
+				if (!persisted.persisted) return;
+			} else if (kind === "operate_blocked" || kind === "operate_finalized") {
 				const lifecycle = kind === "operate_finalized" && evidence.completed === true ? "completed" : "blocked";
 				const blockers = Array.isArray(evidence.blockers)
 					? evidence.blockers.filter((blocker): blocker is string => typeof blocker === "string")

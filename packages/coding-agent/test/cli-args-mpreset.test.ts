@@ -5,6 +5,7 @@ import { logger } from "@gajae-code/utils";
 import { CliParseError } from "@gajae-code/utils/cli";
 import { parseArgs } from "../src/cli/args";
 import { ROOT_THINKING_LEVELS } from "../src/cli/root-flags";
+import { activateModelProfile } from "../src/config/model-profile-activation";
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { Settings } from "../src/config/settings";
 import {
@@ -45,7 +46,7 @@ function fakeRegistry(
 		getError: () => undefined,
 		getApiKeyForProvider: async () => "key",
 		getAll: () => activeModels,
-		getAvailableForProfileActivation: () =>
+		getAvailable: () =>
 			options.excludeModelsFromProfileActivationUntilRefresh && !modelsRefreshed ? [] : activeModels,
 		async refresh(strategy = "online-if-uncached", credentialSessionId?: string) {
 			registry.refreshCalls.push(strategy);
@@ -69,10 +70,12 @@ function fakeRegistry(
 }
 
 function fakeSession(initial: Model | null = model("initial-provider", "initial")) {
+	let mutationTail = Promise.resolve();
 	const session = {
 		model: initial ?? undefined,
 		thinkingLevel: undefined as ThinkingLevel | undefined,
 		unavailableModelProfile: undefined as string | undefined,
+		userModelSelectionRevision: 0,
 		sessionId: "session-1",
 		credentialSessionId: "credential-session-1",
 		setModelTemporaryCalls: [] as Array<{
@@ -88,11 +91,34 @@ function fakeSession(initial: Model | null = model("initial-provider", "initial"
 		async setModelTemporary(
 			next: Model,
 			thinkingLevel?: ThinkingLevel,
-			options?: { persistAsSessionDefault?: boolean; cause?: string },
+			options?: {
+				persistAsSessionDefault?: boolean;
+				cause?: string;
+				shouldMutate?: () => boolean;
+				onMutationStarted?: () => void;
+			},
 		) {
+			if (options?.shouldMutate && !options.shouldMutate()) return;
+			options?.onMutationStarted?.();
+			if (options?.cause === "user-selection") session.userModelSelectionRevision++;
 			session.setModelTemporaryCalls.push({ model: next, thinkingLevel, options });
 			session.model = next;
 			session.thinkingLevel = thinkingLevel;
+		},
+		getUserModelSelectionRevision: () => session.userModelSelectionRevision,
+		markUserModelSelection() {
+			session.userModelSelectionRevision++;
+		},
+		async withSdkControlMutation<T>(body: () => Promise<T>): Promise<T> {
+			const previous = mutationTail;
+			const next = Promise.withResolvers<void>();
+			mutationTail = next.promise;
+			await previous;
+			try {
+				return await body();
+			} finally {
+				next.resolve();
+			}
 		},
 		getConfiguredModelChain: () => undefined,
 		hasRecoveredDefaultFallbackChain: () => false,
@@ -112,6 +138,8 @@ function fakeSession(initial: Model | null = model("initial-provider", "initial"
 		setModelTemporaryCalls: typeof session.setModelTemporaryCalls;
 		configuredModelChains: typeof session.configuredModelChains;
 		seedDefaultFallbackResolutionCalls: typeof session.seedDefaultFallbackResolutionCalls;
+		markUserModelSelection: typeof session.markUserModelSelection;
+		withSdkControlMutation: typeof session.withSdkControlMutation;
 	};
 }
 describe("CLI model profile args", () => {
@@ -1030,6 +1058,306 @@ test("interactive startup keeps the provisional model and marks a default profil
 	expect(base.refreshInBackgroundCalls).toEqual([]);
 });
 
+test("interactive startup does not retry a profile after a user selects a model during recovery", async () => {
+	const profile: ModelProfileDefinition = {
+		name: "deferred-profile",
+		requiredProviders: ["profile-provider"],
+		modelMapping: { default: "profile-provider/default" },
+		source: "user",
+	};
+	const session = fakeSession(model("fallback-provider", "provisional"));
+	const selectedModel = model("user-provider", "selected");
+	const base = fakeRegistry([profile]);
+	let credentialAvailable = false;
+	const authStorage = {
+		reload: vi.fn(async () => {
+			credentialAvailable = true;
+			await session.setModelTemporary(selectedModel, undefined, { cause: "user-selection" });
+		}),
+		hasRuntimeApiKey: () => credentialAvailable,
+		hasLiteralConfigApiKey: () => false,
+		hasSessionCredentialUnavailable: () => false,
+	};
+	const registry = {
+		...base,
+		authStorage,
+		getApiKeyForProvider: async () => (credentialAvailable ? "fresh-key" : undefined),
+	};
+
+	const result = await applyStartupModelProfilesForRoot({
+		session,
+		settings: Settings.isolated(),
+		modelRegistry: registry as never,
+		parsedArgs: { mpreset: profile.name },
+		isInteractive: true,
+		hasInteractiveTerminal: true,
+		initialMessage: undefined,
+		initialMessages: [],
+		resumeAction: undefined,
+	});
+
+	expect(authStorage.reload).toHaveBeenCalledTimes(1);
+	expect(result.recoverableErrors).toHaveLength(1);
+	expect(session.model).toBe(selectedModel);
+	expect(session.setModelTemporaryCalls.map(call => call.model)).toEqual([selectedModel]);
+});
+
+test("interactive startup cancels profile activation when selection changes during profile preparation", async () => {
+	const profile: ModelProfileDefinition = {
+		name: "prepared-profile",
+		requiredProviders: ["profile-provider"],
+		modelMapping: { default: "profile-provider/default" },
+		source: "user",
+	};
+	const session = fakeSession(model("fallback-provider", "provisional"));
+	const selectedModel = model("user-provider", "selected");
+	const base = fakeRegistry([profile]);
+	let credentialAvailable = false;
+	let selectedDuringPreparation = false;
+	const authStorage = {
+		reload: vi.fn(async () => {
+			credentialAvailable = true;
+		}),
+		hasRuntimeApiKey: () => credentialAvailable,
+		hasLiteralConfigApiKey: () => false,
+		hasSessionCredentialUnavailable: () => false,
+	};
+	const registry = {
+		...base,
+		authStorage,
+		getApiKeyForProvider: async () => {
+			if (!credentialAvailable) return undefined;
+			if (!selectedDuringPreparation) {
+				selectedDuringPreparation = true;
+				await session.setModelTemporary(selectedModel, undefined, { cause: "user-selection" });
+			}
+			return "fresh-key";
+		},
+	};
+
+	const result = await applyStartupModelProfilesForRoot({
+		session,
+		settings: Settings.isolated(),
+		modelRegistry: registry as never,
+		parsedArgs: { mpreset: profile.name },
+		isInteractive: true,
+		hasInteractiveTerminal: true,
+		initialMessage: undefined,
+		initialMessages: [],
+		resumeAction: undefined,
+	});
+
+	expect(authStorage.reload).toHaveBeenCalledTimes(1);
+	expect(selectedDuringPreparation).toBe(true);
+	expect(result.recoverableErrors).toEqual([]);
+	expect(session.model).toBe(selectedModel);
+	expect(session.setModelTemporaryCalls.map(call => call.model)).toEqual([selectedModel]);
+});
+
+test("interactive startup cancels recovered runtime bindings after a newer selection", async () => {
+	const profile: ModelProfileDefinition = {
+		name: "recovered-runtime-profile",
+		requiredProviders: ["profile-provider"],
+		modelMapping: { default: "profile-provider/default" },
+		source: "user",
+	};
+	const session = fakeSession(model("fallback-provider", "provisional"));
+	Object.assign(session, { hasRecoveredDefaultFallbackChain: () => true });
+	const selectedModel = model("user-provider", "selected");
+	const base = fakeRegistry([profile]);
+	let credentialAvailable = false;
+	let retryProbeStarted = false;
+	const preparationStarted = Promise.withResolvers<void>();
+	const retryCredential = Promise.withResolvers<string | undefined>();
+	const authStorage = {
+		reload: vi.fn(async () => {
+			credentialAvailable = true;
+		}),
+		hasRuntimeApiKey: () => credentialAvailable,
+		hasLiteralConfigApiKey: () => false,
+		hasSessionCredentialUnavailable: () => false,
+	};
+	const registry = {
+		...base,
+		authStorage,
+		getApiKeyForProvider: async () => {
+			if (!credentialAvailable) return undefined;
+			if (!retryProbeStarted) {
+				retryProbeStarted = true;
+				preparationStarted.resolve();
+				return retryCredential.promise;
+			}
+			return "fresh-key";
+		},
+	};
+	const settings = Settings.isolated({
+		"modelProfile.default": profile.name,
+		modelRoles: { executor: "provider-c/previous-executor" },
+	});
+	const startup = applyStartupModelProfilesForRoot({
+		session,
+		settings,
+		modelRegistry: registry as never,
+		parsedArgs: {},
+		isInteractive: true,
+		hasInteractiveTerminal: true,
+		initialMessage: undefined,
+		initialMessages: [],
+		resumeAction: undefined,
+	});
+
+	await preparationStarted.promise;
+	session.markUserModelSelection();
+	Object.assign(session, { model: selectedModel });
+	retryCredential.resolve("fresh-key");
+	await startup;
+
+	expect(authStorage.reload).toHaveBeenCalledTimes(1);
+	expect(session.model).toBe(selectedModel);
+	expect(settings.getOverride("modelRoles")).toBeUndefined();
+	expect(settings.getOverride("task.agentModelOverrides")).toBeUndefined();
+});
+
+test("interactive retry skips later profile preparation after a newer selection", async () => {
+	const defaultProfile: ModelProfileDefinition = {
+		name: "retry-default-profile",
+		requiredProviders: ["default-provider"],
+		modelMapping: { default: "default-provider/default" },
+		source: "user",
+	};
+	const explicitProfile: ModelProfileDefinition = {
+		name: "retry-explicit-profile",
+		requiredProviders: ["explicit-provider"],
+		modelMapping: { default: "explicit-provider/default" },
+		source: "user",
+	};
+	const session = fakeSession(model("fallback-provider", "provisional"));
+	const selectedModel = model("user-provider", "selected");
+	const models = [model("default-provider", "default"), model("explicit-provider", "default")];
+	const base = fakeRegistry([defaultProfile, explicitProfile]);
+	base.getAll = () => models;
+	base.getAvailable = () => models;
+	let credentialAvailable = false;
+	let retryProbeStarted = false;
+	let explicitProviderRequests = 0;
+	const preparationStarted = Promise.withResolvers<void>();
+	const retryCredential = Promise.withResolvers<string | undefined>();
+	const authStorage = {
+		reload: vi.fn(async () => {
+			credentialAvailable = true;
+		}),
+		hasRuntimeApiKey: () => credentialAvailable,
+		hasLiteralConfigApiKey: () => false,
+		hasSessionCredentialUnavailable: () => false,
+	};
+	const registry = {
+		...base,
+		authStorage,
+		getApiKeyForProvider: async (provider: string) => {
+			if (provider === "explicit-provider") explicitProviderRequests += 1;
+			if (!credentialAvailable) return undefined;
+			if (provider === "default-provider" && !retryProbeStarted) {
+				retryProbeStarted = true;
+				preparationStarted.resolve();
+				return retryCredential.promise;
+			}
+			return "fresh-key";
+		},
+	};
+	const startup = applyStartupModelProfilesForRoot({
+		session,
+		settings: Settings.isolated({ "modelProfile.default": defaultProfile.name }),
+		modelRegistry: registry as never,
+		parsedArgs: { mpreset: explicitProfile.name },
+		isInteractive: true,
+		hasInteractiveTerminal: true,
+		initialMessage: undefined,
+		initialMessages: [],
+		resumeAction: undefined,
+	});
+
+	await preparationStarted.promise;
+	session.markUserModelSelection();
+	Object.assign(session, { model: selectedModel });
+	retryCredential.resolve("fresh-key");
+	await startup;
+
+	expect(authStorage.reload).toHaveBeenCalledTimes(1);
+	expect(explicitProviderRequests).toBe(1);
+	expect(session.model).toBe(selectedModel);
+});
+
+test("serializes replacement profile preparation after stale recovery rollback", async () => {
+	const startupProfile: ModelProfileDefinition = {
+		name: "stale-startup-profile",
+		requiredProviders: ["startup-provider"],
+		modelMapping: { default: "startup-provider/default", executor: "startup-provider/executor" },
+		source: "user",
+	};
+	const replacementProfile: ModelProfileDefinition = {
+		name: "replacement-profile",
+		requiredProviders: ["replacement-provider"],
+		modelMapping: { default: "replacement-provider/default" },
+		source: "user",
+	};
+	const session = fakeSession(model("fallback-provider", "provisional"));
+	const models = [
+		model("startup-provider", "default"),
+		model("startup-provider", "executor"),
+		model("replacement-provider", "default"),
+	];
+	const registry = fakeRegistry([startupProfile, replacementProfile]);
+	registry.getAll = () => models;
+	registry.getAvailable = () => models;
+	const settings = Settings.isolated();
+	const flushStarted = Promise.withResolvers<void>();
+	const allowFlush = Promise.withResolvers<void>();
+	let flushCount = 0;
+	settings.flushOrThrow = async () => {
+		flushCount += 1;
+		if (flushCount === 1) {
+			flushStarted.resolve();
+			await allowFlush.promise;
+		}
+	};
+	const startup = applyStartupModelProfilesForRoot({
+		session,
+		settings,
+		modelRegistry: registry as never,
+		parsedArgs: { mpreset: startupProfile.name, default: true },
+		isInteractive: true,
+		hasInteractiveTerminal: true,
+		initialMessage: undefined,
+		initialMessages: [],
+		resumeAction: undefined,
+	});
+
+	await flushStarted.promise;
+	session.markUserModelSelection();
+	let replacementStarted = false;
+	const replacement = session.withSdkControlMutation(async () => {
+		replacementStarted = true;
+		await activateModelProfile({
+			session,
+			modelRegistry: registry as never,
+			settings,
+			profileName: replacementProfile.name,
+		});
+	});
+	await Promise.resolve();
+	expect(replacementStarted).toBe(false);
+
+	allowFlush.resolve();
+	await startup;
+	await replacement;
+
+	expect(replacementStarted).toBe(true);
+	expect(session.model).toMatchObject({ provider: "replacement-provider", id: "default" });
+	expect(settings.get("modelProfile.default")).toBeUndefined();
+	expect(settings.getOverride("modelRoles")?.executor).toBeUndefined();
+	expect(flushCount).toBe(2);
+});
+
 test("interactive startup refreshes and applies an unknown default profile when it appears in the catalog", async () => {
 	const profile: ModelProfileDefinition = {
 		name: "newly-cataloged-profile",
@@ -1576,6 +1904,64 @@ test("recoverable blocked --mpreset still reapplies explicit CLI override after 
 	expect(
 		session.setModelTemporaryCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
 	).toEqual(["profile-provider/default:medium", "cli-provider/explicit:xhigh"]);
+});
+
+test("retrying a recovered default preserves explicit --mpreset precedence", async () => {
+	const settings = Settings.isolated({ "modelProfile.default": "blocked-default" });
+	const session = fakeSession();
+	let defaultCredentialAvailable = false;
+	const base = fakeRegistry(
+		[
+			{
+				name: "blocked-default",
+				requiredProviders: ["blocked-provider"],
+				modelMapping: { default: "blocked-provider/default" },
+				source: "user",
+			},
+			{
+				name: "healthy-session",
+				requiredProviders: ["cli-provider"],
+				modelMapping: { default: "cli-provider/explicit" },
+				source: "user",
+			},
+		],
+		{ modelsAfterRefresh: [model("blocked-provider", "default"), model("cli-provider", "explicit")] },
+	);
+	const authStorage = {
+		reload: vi.fn(async () => {
+			defaultCredentialAvailable = true;
+		}),
+		hasRuntimeApiKey: (provider: string) => provider === "blocked-provider" && defaultCredentialAvailable,
+		hasLiteralConfigApiKey: () => false,
+		hasSessionCredentialUnavailable: () => false,
+	};
+	const registry = {
+		...base,
+		authStorage,
+		getApiKeyForProvider: async (provider: string) =>
+			provider === "blocked-provider" ? (defaultCredentialAvailable ? "fresh-key" : undefined) : "key",
+	};
+
+	const result = await applyStartupModelProfilesForRoot({
+		session,
+		settings,
+		modelRegistry: registry as never,
+		parsedArgs: { mpreset: "healthy-session" },
+		isInteractive: true,
+		hasInteractiveTerminal: true,
+		initialMessage: undefined,
+		initialMessages: [],
+		resumeAction: undefined,
+	});
+
+	expect(authStorage.reload).toHaveBeenCalledTimes(1);
+	expect(result.recoverableErrors).toEqual([]);
+	expect(session.setModelTemporaryCalls.map(call => `${call.model.provider}/${call.model.id}`)).toEqual([
+		"cli-provider/explicit",
+		"blocked-provider/default",
+		"cli-provider/explicit",
+	]);
+	expect(session.model).toMatchObject({ provider: "cli-provider", id: "explicit" });
 });
 
 test("thinking-only startup uses authoritative override semantics", async () => {

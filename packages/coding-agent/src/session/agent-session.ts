@@ -535,6 +535,7 @@ import type {
 	SessionEntry,
 	SessionManagerCloseOutcome,
 	SessionMemoryStats,
+	SessionArtifactPublication,
 } from "./session-manager";
 import {
 	createReadonlySessionManager,
@@ -1802,20 +1803,14 @@ function summarizeAgentBashArtifactSave(
 	};
 }
 
-export interface AgentBashArtifactStore {
-	saveArtifact(content: string, toolType: string): Promise<string | undefined>;
-	getArtifactPath(id: string): Promise<string | null>;
-}
-
 export async function saveAgentBashOriginalArtifact(
-	store: AgentBashArtifactStore,
+	publication: SessionArtifactPublication,
 	originalText: string,
 ): Promise<BashArtifactSaveResult> {
 	try {
-		const artifactId = await store.saveArtifact(originalText, "bash-original");
-		if (!artifactId) return { status: "failed", diagnostic: "storage returned no artifact id" };
-		const artifactPath = await store.getArtifactPath(artifactId);
-		return artifactPath ? summarizeAgentBashArtifactSave(artifactId, originalText) : { status: "unavailable" };
+		const artifactId = await publication(originalText, "bash-original");
+		if (!artifactId) return { status: "unavailable" };
+		return summarizeAgentBashArtifactSave(artifactId, originalText);
 	} catch (error) {
 		return { status: "failed", diagnostic: boundAgentBashArtifactSaveDiagnostic(error) };
 	}
@@ -2794,6 +2789,9 @@ export class AgentSession {
 	#followUpReservationTransitionWaiters = new Set<() => void>();
 	#selectionFenceGeneration = 0;
 	#defaultModelSelectionMutationRevision = 0;
+	#userModelSelectionRevision = 0;
+	#userCanonicalVariantSelectionRevision = 0;
+	#userCanonicalVariantSelection: string | undefined;
 	#thinkingLevelMutationRevision = 0;
 	#thinkingVisibilityMutationRevision = 0;
 	#thinkingLevelLiveMutationRevision = 0;
@@ -10811,6 +10809,11 @@ export class AgentSession {
 	 * at `timeoutMs` so a wedged subprocess can't stall process exit.
 	 */
 	async disposeChildSubprocesses(timeoutMs = SIGNAL_TEARDOWN_TIMEOUT_MS): Promise<void> {
+		this.#evalExecutionDisposing = true;
+		this.abortEval();
+		const evalExecutionsSettled = this.#waitForEvalExecutionsToSettle(timeoutMs).then(settled => {
+			if (!settled) logger.warn("signal teardown: active eval executions remain unsettled");
+		});
 		const sessionId = this.sessionManager.getSessionId();
 		const kernelOwnerId = this.#evalKernelOwnerId;
 		this.#unregisterResourceGc?.();
@@ -10820,6 +10823,7 @@ export class AgentSession {
 		this.#unregisterDelegationHintSettings?.();
 		this.#unregisterDelegationHintSettings = undefined;
 		const work = Promise.allSettled([
+			evalExecutionsSettled,
 			// kill:true so a forced exit also reaps spawned-app Chrome we own (headless
 			// always closes; connected/attached browsers only disconnect — never killed).
 			releaseTabsForOwner(sessionId, { kill: true }).catch((error: unknown) =>
@@ -10848,7 +10852,8 @@ export class AgentSession {
 				logger.warn("signal teardown: tool session transition cleanups failed", { error }),
 			),
 		]);
-		await Promise.race([work, Bun.sleep(timeoutMs)]);
+		const completed = await Promise.race([work.then(() => true), Bun.sleep(timeoutMs).then(() => false)]);
+		if (!completed) logger.warn("signal teardown: cleanup exceeded its bounded caller deadline");
 	}
 
 	#rebindProviderSessionState(providerSessionState: Map<string, ProviderSessionState>): void {
@@ -18208,9 +18213,12 @@ export class AgentSession {
 		}
 
 		options?.onMutationStarted?.();
-		this.#setModelAuthoritatively(model, options?.cause ?? "user-selection");
-		if (options?.cause === "user-selection") this.#unavailableModelProfile = undefined;
+		const cause = options?.cause ?? "user-selection";
+		if (cause === "user-selection") this.markUserModelSelection();
+		this.#setModelAuthoritatively(model, cause);
+		if (cause === "user-selection") this.#unavailableModelProfile = undefined;
 		this.#seedSessionCanonicalVariant(model);
+		if (cause === "user-selection") this.#recordUserCanonicalVariantSelection();
 		this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, role);
 		this.settings.setModelRole(
 			role,
@@ -18218,7 +18226,7 @@ export class AgentSession {
 		);
 		// Only an explicit user selection starts a new fallback epoch. Internal
 		// fallback switches must preserve the exhausted-model set while advancing.
-		if (role === "default" && (options?.cause ?? "user-selection") === "user-selection") {
+		if (role === "default" && cause === "user-selection") {
 			this.#fallbackTransitionGeneration++;
 			this.#defaultFallbackController = undefined;
 			this.#defaultFallbackExhaustedLastTurn = false;
@@ -18270,6 +18278,24 @@ export class AgentSession {
 
 	getUnavailableModelProfile(): string | undefined {
 		return this.#unavailableModelProfile;
+	}
+
+	/** Revision fence for deferred activation after a user model selection. */
+	getUserModelSelectionRevision(): number {
+		return this.#userModelSelectionRevision;
+	}
+
+	/** Latest concrete user choice that seeded or cleared the session's sticky canonical variant. */
+	getUserCanonicalVariantSelection(): { revision: number; canonicalVariant: string | undefined } {
+		return {
+			revision: this.#userCanonicalVariantSelectionRevision,
+			canonicalVariant: this.#userCanonicalVariantSelection,
+		};
+	}
+
+	/** Fence deferred startup profile recovery before an explicit control-surface selection. */
+	markUserModelSelection(): void {
+		this.#userModelSelectionRevision++;
 	}
 
 	/**
@@ -18433,12 +18459,15 @@ export class AgentSession {
 	 * Session-scoped only: does not persist `modelProfile.default`.
 	 */
 	async activateModelProfileForControl(profileName: string): Promise<boolean> {
-		await activateModelProfile({
-			session: this,
-			modelRegistry: this.#modelRegistry,
-			settings: this.settings,
-			profileName,
-		});
+		this.markUserModelSelection();
+		await this.withSdkControlMutation(() =>
+			activateModelProfile({
+				session: this,
+				modelRegistry: this.#modelRegistry,
+				settings: this.settings,
+				profileName,
+			}),
+		);
 		return this.getActiveModelProfile() === profileName;
 	}
 
@@ -18473,6 +18502,7 @@ export class AgentSession {
 			onAfterActivation?: () => void;
 		},
 	): Promise<{ changed: boolean; id: string }> {
+		this.markUserModelSelection();
 		// Do not hold selection admission while waiting for a scheduled continuation:
 		// the continuation may need prompt admission to settle the current turn.
 		await this.waitForIdle();
@@ -18751,6 +18781,7 @@ export class AgentSession {
 			reason?: TemporaryModelReason;
 			providerSessionScope?: TemporaryProviderSessionScope;
 			signal?: AbortSignal;
+			shouldMutate?: () => boolean;
 			onMutationStarted?: () => void;
 		},
 		// biome-ignore lint/suspicious/noConfusingVoidType: Existing session adapters return Promise<void>; a scope is optional.
@@ -18769,6 +18800,8 @@ export class AgentSession {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
 		if (suppliedScope && this.#temporaryProviderSessionScopes.at(-1)?.token !== suppliedScope) return;
+		if (options?.shouldMutate && !options.shouldMutate()) return;
+		if (options?.cause === "user-selection") this.markUserModelSelection();
 		options?.onMutationStarted?.();
 
 		const isTemporaryOperation = options?.cause === undefined || options.cause === "temporary-operation";
@@ -18805,6 +18838,7 @@ export class AgentSession {
 			this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
 			if (options?.persistAsSessionDefault) {
 				this.#seedSessionCanonicalVariant(model);
+				if (options.cause === "user-selection") this.#recordUserCanonicalVariantSelection();
 			}
 
 			// Apply explicit thinking level if given; otherwise prefer the model's
@@ -18929,8 +18963,10 @@ export class AgentSession {
 		// session-scoped updates occur during the promotion phase after ownership
 		// is committed. Session ownership is captured in the promotion logic above.
 		this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: true });
+		this.markUserModelSelection();
 		this.#setModelWithProviderSessionReset(model);
 		this.#seedSessionCanonicalVariant(model);
+		this.#recordUserCanonicalVariantSelection();
 		const thinkingLevelChanged = this.#thinkingLevel !== thinkingLevel;
 		this.#thinkingLevelMutationRevision++;
 		this.#thinkingLevelLiveMutationRevision++;
@@ -19270,6 +19306,7 @@ export class AgentSession {
 		const next = roleModels[nextIndex];
 
 		if (options?.temporary) {
+			this.markUserModelSelection();
 			await this.setModelTemporary(next.model, next.explicitThinkingLevel ? next.thinkingLevel : undefined, {
 				cause: "temporary-operation",
 				reason: "temporary-cycle",
@@ -21924,6 +21961,11 @@ export class AgentSession {
 		} else {
 			this.#modelRegistry.clearCanonicalVariant?.(this.sessionId);
 		}
+	}
+
+	#recordUserCanonicalVariantSelection(): void {
+		this.#userCanonicalVariantSelectionRevision++;
+		this.#userCanonicalVariantSelection = this.#modelRegistry.getSessionCanonicalVariant?.(this.sessionId);
 	}
 
 	#closeCodexProviderSessionsForHistoryRewrite(): void {
@@ -25557,10 +25599,6 @@ export class AgentSession {
 	// Bash Execution
 	// =========================================================================
 
-	async #saveBashOriginalArtifact(originalText: string): Promise<BashArtifactSaveResult> {
-		return saveAgentBashOriginalArtifact(this.sessionManager, originalText);
-	}
-
 	/**
 	 * Execute a bash command.
 	 * Adds result to agent context and session.
@@ -25575,6 +25613,7 @@ export class AgentSession {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; onPersisted?: () => void },
 	): Promise<BashResult> {
+		const publishArtifact = this.sessionManager.captureArtifactPublication();
 		const excludeFromContext = options?.excludeFromContext === true;
 		this.#markRetryReplayUnsafe();
 
@@ -25612,7 +25651,7 @@ export class AgentSession {
 					sessionId: this.sessionId,
 					cwd,
 				}),
-				onMinimizedSave: originalText => this.#saveBashOriginalArtifact(originalText),
+				onMinimizedSave: originalText => saveAgentBashOriginalArtifact(publishArtifact, originalText),
 			});
 
 			this.recordBashResult(command, result, options);
@@ -25716,9 +25755,18 @@ export class AgentSession {
 		this.#markRetryReplayUnsafe();
 		const cwd = this.sessionManager.getCwd();
 		this.assertEvalExecutionAllowed();
+		const sessionFile = this.sessionManager.getSessionFile();
+		const sessionId = sessionFile ? `session:${sessionFile}:cwd:${cwd}` : `cwd:${cwd}`;
+		const kernelOwnerId = this.#evalKernelOwnerId;
+		const kernelMode = this.settings.get("python.kernelMode");
+		const settings = this.settings;
 
 		const abortController = new AbortController();
-		const execution = (async (): Promise<PythonResult> => {
+		const execution = Promise.resolve().then(async (): Promise<PythonResult> => {
+			if (abortController.signal.aborted) {
+				throw abortController.signal.reason ?? new DOMException("Aborted", "AbortError");
+			}
+			this.assertEvalExecutionAllowed();
 			if (this.#extensionRunner?.hasHandlers("user_python")) {
 				const hookResult = await this.#extensionRunner.emitUserPython({
 					type: "user_python",
@@ -25726,6 +25774,9 @@ export class AgentSession {
 					excludeFromContext,
 					cwd,
 				});
+				if (abortController.signal.aborted) {
+					throw abortController.signal.reason ?? new DOMException("Aborted", "AbortError");
+				}
 				this.assertEvalExecutionAllowed();
 				if (hookResult?.result) {
 					this.recordPythonResult(code, hookResult.result, options);
@@ -25733,15 +25784,12 @@ export class AgentSession {
 				}
 			}
 
-			// Use the same session ID as eval's Python backend for kernel sharing
-			const sessionFile = this.sessionManager.getSessionFile();
-			const sessionId = sessionFile ? `session:${sessionFile}:cwd:${cwd}` : `cwd:${cwd}`;
 			const result = await executePythonCommand(code, {
 				cwd,
 				sessionId,
-				kernelOwnerId: this.#evalKernelOwnerId,
-				kernelMode: this.settings.get("python.kernelMode"),
-				settings: this.settings,
+				kernelOwnerId,
+				kernelMode,
+				settings,
 				onChunk,
 				signal: abortController.signal,
 			});
@@ -25750,7 +25798,7 @@ export class AgentSession {
 			// must not reopen a closing session to append history.
 			if (!this.#evalExecutionDisposing) this.recordPythonResult(code, result, options);
 			return result;
-		})();
+		});
 		return await this.trackEvalExecution(execution, abortController);
 	}
 

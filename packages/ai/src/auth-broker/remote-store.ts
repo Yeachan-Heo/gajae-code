@@ -38,12 +38,14 @@ import {
 	AuthBrokerStreamUnsupportedError,
 } from "./client";
 import { cleanReason } from "./redact";
-import type {
-	CredentialMetadataRecord,
-	RefresherSchedule,
-	SnapshotEntry,
-	SnapshotResponse,
-	SnapshotStreamEvent,
+
+import {
+	type CredentialMetadataRecord,
+	DEFAULT_REFRESH_SKEW_MS,
+	type RefresherSchedule,
+	type SnapshotEntry,
+	type SnapshotResponse,
+	type SnapshotStreamEvent,
 } from "./types";
 
 export type CredentialInventoryMetadataCapability = "pending" | "supported" | "unsupported" | "mismatch" | "failed";
@@ -1092,11 +1094,30 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	async refreshOAuthCredential(
 		_provider: Provider,
 		credentialId: number,
-		_credential: OAuthCredential,
+		credential: OAuthCredential,
 		signal?: AbortSignal,
+		expectedRevision?: number,
 	): Promise<OAuthCredentials> {
+		const toOAuthCredentials = (current: OAuthCredential): OAuthCredentials => ({
+			access: current.access,
+			refresh: REMOTE_REFRESH_SENTINEL,
+			expires: current.expires,
+			accountId: current.accountId,
+			email: current.email,
+			projectId: current.projectId,
+			enterpriseUrl: current.enterpriseUrl,
+		});
+		const observed = this.#snapshot.credentials.find(candidate => candidate.id === credentialId);
+		if (
+			observed?.credential.type === "oauth" &&
+			observed.credential.access !== credential.access &&
+			Date.now() + DEFAULT_REFRESH_SKEW_MS < observed.credential.expires
+		) {
+			return toOAuthCredentials(observed.credential);
+		}
+
 		try {
-			await this.#client.refreshCredential(credentialId, signal);
+			await this.#client.refreshCredential(credentialId, signal, expectedRevision ?? observed?.revision);
 		} catch (error) {
 			if (isErrorStatus(error, 404) && !this.#streamingActive) {
 				await this.refreshSnapshot().catch(refreshError => {
@@ -1112,16 +1133,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		if (accepted?.credential.type !== "oauth") {
 			throw new Error(`Broker snapshot no longer contains OAuth credential id=${credentialId}`);
 		}
-		const refreshed = accepted.credential;
-		return {
-			access: refreshed.access,
-			refresh: REMOTE_REFRESH_SENTINEL,
-			expires: refreshed.expires,
-			accountId: refreshed.accountId,
-			email: refreshed.email,
-			projectId: refreshed.projectId,
-			enterpriseUrl: refreshed.enterpriseUrl,
-		};
+		return toOAuthCredentials(accepted.credential);
 	}
 
 	async refreshMCPOAuthCredential(

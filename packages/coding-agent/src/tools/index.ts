@@ -19,6 +19,7 @@ import type { ArtifactManager } from "../session/artifacts";
 import type { ClientBridge } from "../session/client-bridge";
 import type { FoldAdapter } from "../session/fold-coordinator";
 import type { CustomMessage } from "../session/messages";
+import type { SessionArtifactPublication } from "../session/session-manager";
 import type { ToolChoiceQueue } from "../session/tool-choice-queue";
 import type { SkillActiveEntry } from "../skill-state/active-state";
 import type { AgentOutputManager } from "../task/output-manager";
@@ -308,6 +309,8 @@ export interface ToolSession {
 	registerSessionCleanup?: (cleanup: () => Promise<void> | void) => () => void;
 	/** Allocate a new artifact path and ID for session-scoped truncated output. */
 	allocateOutputArtifact?: (toolType: string) => Promise<{ id?: string; path?: string }>;
+	/** Capture owner-bound artifact publication authority for one session lifecycle. */
+	captureArtifactPublication?: () => SessionArtifactPublication;
 	/** Get session spawns */
 	getSessionSpawns: () => string | null;
 	/** Get resolved model string if explicitly set for this session */

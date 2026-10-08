@@ -3454,9 +3454,11 @@ class MemorySessionStorageWriter implements SessionStorageBufferedWriter {
 		this.#length = nextLength;
 	}
 
+	// Memory storage retains this view, so expose only visible bytes, never capacity.
+	// Appends write after each published prefix; growth switches backing buffers.
 	#writeCurrent(bytesWritten: number): void {
 		this.#writeCalls++;
-		this.#storage.writeBytesOwnedSync(this.#path, Buffer.from(this.#bytes.subarray(0, this.#length)));
+		this.#storage.writeBytesOwnedSync(this.#path, this.#bytes.subarray(0, this.#length));
 		this.#bytesWritten += bytesWritten;
 	}
 
@@ -3472,7 +3474,7 @@ class MemorySessionStorageWriter implements SessionStorageBufferedWriter {
 		}
 		this.#buffer.copy(this.#bytes, this.#length, 0, pendingBytes);
 		this.#writeCalls++;
-		this.#storage.writeBytesOwnedSync(this.#path, Buffer.from(this.#bytes.subarray(0, nextLength)));
+		this.#storage.writeBytesOwnedSync(this.#path, this.#bytes.subarray(0, nextLength));
 		this.#length = nextLength;
 		this.#bufferedBytes = 0;
 		this.#bytesWritten += pendingBytes;
