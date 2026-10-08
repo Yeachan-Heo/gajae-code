@@ -55,7 +55,7 @@ function getAssistantMarkdownTheme(): MarkdownTheme {
 					palette,
 					onChange: context.onChange,
 				});
-			figure.update(source, !context.streaming, palette);
+			figure.update(source, context.closed || !context.streaming, palette);
 			return figure.failed ? null : figure;
 		},
 	};

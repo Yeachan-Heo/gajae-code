@@ -95,6 +95,25 @@ describe("Markdown asynchronous SVG figures", () => {
 		markdown.dispose();
 	});
 
+	it("marks a closed fence final while its containing message is still streaming", () => {
+		const figures: DeferredFigure[] = [];
+		const contexts: SvgFigureResolveContext[] = [];
+		const markdown = new Markdown(
+			"```svg\n<svg/>\n```\n\nMore prose",
+			0,
+			0,
+			figureTheme(figures, context => contexts.push(context)),
+		);
+		markdown.setStreaming(true);
+		markdown.render(80);
+		expect(contexts[0]).toMatchObject({ streaming: true, closed: true });
+
+		markdown.setText("```svg\n<svg/>", { streaming: true });
+		markdown.render(80);
+		expect(contexts[1]).toMatchObject({ streaming: true, closed: false });
+		markdown.dispose();
+	});
+
 	it("rerenders pending figures after completion and keeps them out of both render caches", () => {
 		const source = "Intro\n\n~~~ SVG title\n<SVG/>\n~~~\n\nOutro";
 		const figures: DeferredFigure[] = [];

@@ -73,6 +73,11 @@ export function splitSvgFences(markdown: string): FigureSegment[] {
 	return segments;
 }
 
+/** Whether a Marked SVG code token's raw source contains its closing fence. */
+export function isClosedSvgFence(raw: string): boolean {
+	return splitFenceBody(raw).closed;
+}
+
 function isSvgFenceInfo(info: string | undefined): boolean {
 	return info?.trim().split(/[ \t]/, 1)[0]?.toLowerCase() === "svg";
 }
@@ -278,11 +283,15 @@ function isSelfClosingSvgTag(tag: string): boolean {
 function findStyleClosingTag(source: string, start: number, qualifiedName: string): number {
 	const lowered = source.toLowerCase();
 	const closingTag = `</${qualifiedName}`.toLowerCase();
-	let index = lowered.indexOf(closingTag, start);
+	let index = source.indexOf("<", start);
 	while (index >= 0) {
-		const next = source[index + closingTag.length];
-		if (next === ">" || (next !== undefined && /\s/.test(next))) return index;
-		index = lowered.indexOf(closingTag, index + closingTag.length);
+		if (lowered.startsWith(closingTag, index)) {
+			const next = source[index + closingTag.length];
+			if (next === ">" || (next !== undefined && /\s/.test(next))) return index;
+		}
+		const end = constructEnd(source, index);
+		if (end < 0) return -1;
+		index = source.indexOf("<", end);
 	}
 	return -1;
 }

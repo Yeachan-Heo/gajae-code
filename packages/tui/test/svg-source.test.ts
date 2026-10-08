@@ -154,4 +154,15 @@ describe("prepareSvg", () => {
 		expect(prepared).toContain("<text>Use var(--gjc-accent)</text>");
 		expect(prepared).toContain('<rect fill="#ff8800"/>');
 	});
+
+	it("skips closing-tag text inside a style CDATA section", () => {
+		const prepared = prepareSvg(
+			"<svg><style><![CDATA[/* </style> */ .a{fill:var(--gjc-accent)}]]></style>" +
+				'<rect fill="var(--gjc-accent)"/></svg>',
+			palette,
+		);
+
+		expect(prepared).toContain(".a{fill:#ff8800}");
+		expect(prepared).toContain('<rect fill="#ff8800"/>');
+	});
 });

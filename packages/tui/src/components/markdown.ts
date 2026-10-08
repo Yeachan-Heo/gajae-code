@@ -1,6 +1,6 @@
 import { LRUCache } from "lru-cache/raw";
 import { Marked, marked, type Token, Tokenizer, type Tokens } from "marked";
-import { hasSvgFence } from "../chat/svg-source";
+import { hasSvgFence, isClosedSvgFence } from "../chat/svg-source";
 import type { SymbolTheme } from "../symbols";
 import { TERMINAL } from "../terminal-capabilities";
 import type { Component } from "../tui";
@@ -319,8 +319,10 @@ export interface MarkdownTheme {
 }
 
 export interface SvgFigureResolveContext {
-	/** The message is still streaming; the resolver should treat this fence as non-final. */
+	/** Whether the containing message is still streaming. */
 	streaming: boolean;
+	/** The individual code fence has received its closing marker. */
+	closed: boolean;
 	/** Request a repaint after the figure's asynchronous output changes. */
 	onChange: () => void;
 	/** The component previously resolved for this fence position, if any. */
@@ -491,11 +493,12 @@ export class Markdown implements Component {
 		}
 	}
 
-	#resolveDynamicFigure(source: string): Component | undefined {
+	#resolveDynamicFigure(source: string, closed: boolean): Component | undefined {
 		const index = this.#nextDynamicFigureIndex++;
 		const previous = this.#dynamicFigures.get(index);
 		const component = this.#theme.resolveSvgFigure?.(source, {
 			streaming: this.#streaming,
+			closed,
 			onChange: () => {
 				if (this.#disposed) return;
 				this.invalidate();
@@ -1018,7 +1021,7 @@ export class Markdown implements Component {
 				// string in token.lang, so match its normalized language token.
 				const language = token.lang?.trim().split(/[ \t]/, 1)[0]?.toLowerCase();
 				if (allowSvgFigure && language === "svg" && this.#theme.resolveSvgFigure) {
-					const figure = this.#resolveDynamicFigure(token.text);
+					const figure = this.#resolveDynamicFigure(token.text, isClosedSvgFence(token.raw));
 					if (figure) {
 						// SVG figures are components that render directly
 						const figureLines = figure.render(width);
