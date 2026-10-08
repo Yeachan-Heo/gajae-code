@@ -153,7 +153,7 @@ import {
 	utf8ByteLength,
 } from "./btw-contract";
 import { createSessionWorkLease, type SessionWorkLease, type SessionWorkLeaseHandle } from "./session-work-lease";
-import { DEFAULT_ARTIFACT_MAX_BYTES, truncateHeadBytes } from "./streaming-output";
+import { truncateHeadBytes } from "./streaming-output";
 
 export interface ForkContextSeedMetadata {
 	sourceSessionId: string;
@@ -221,6 +221,7 @@ import {
 	type OwnerSubagentShutdownLease,
 	type SubagentLifecycle,
 } from "../async";
+import { formatAsyncResultForFollowUp, summarizeAgentBashArtifactSave } from "../async/result-formatting";
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
 import type { CasReceipt } from "../config/atomic-yaml-patch";
@@ -567,31 +568,6 @@ import {
 import { ToolChoiceQueue } from "./tool-choice-queue";
 import { pruneSupersededMaintenanceReminders, pruneSupersededVolatileProjectContext } from "./volatile-context-pruning";
 import { YieldQueue } from "./yield-queue";
-
-const ASYNC_INLINE_RESULT_MAX_CHARS = 12_000;
-const ASYNC_PREVIEW_MAX_CHARS = 4_000;
-
-async function formatParkedAsyncResult(
-	sessionManager: SessionManager,
-	result: string,
-	allowArtifact = true,
-): Promise<string> {
-	if (result.length <= ASYNC_INLINE_RESULT_MAX_CHARS) return result;
-	const preview = `${result.slice(0, ASYNC_PREVIEW_MAX_CHARS)}\n\n[Output truncated. Showing first ${ASYNC_PREVIEW_MAX_CHARS.toLocaleString()} characters.]`;
-	try {
-		if (!allowArtifact) return preview;
-		const { path: artifactPath, id: artifactId } = await sessionManager.allocateArtifactPath("async");
-		if (artifactPath && artifactId) {
-			await Bun.write(artifactPath, result);
-			return `${preview}\nFull output: artifact://${artifactId}`;
-		}
-	} catch (error) {
-		logger.warn("Failed to persist parked async follow-up artifact", {
-			error: error instanceof Error ? error.message : String(error),
-		});
-	}
-	return preview;
-}
 
 /**
  * #4560: structured workflow recovery projection from canonical durable
@@ -1806,23 +1782,6 @@ function boundAgentBashArtifactSaveDiagnostic(error: unknown): string {
 	const message = (error instanceof Error ? error.message : String(error)).replace(/\s+/gu, " ").trim();
 	const normalized = message || "unknown storage error";
 	return truncateHeadBytes(normalized, AGENT_BASH_ARTIFACT_SAVE_DIAGNOSTIC_MAX_BYTES).text;
-}
-
-function summarizeAgentBashArtifactSave(
-	artifactId: string,
-	originalText: string,
-): Extract<BashArtifactSaveResult, { status: "saved" }> {
-	const originalBytes = utf8ByteLength(originalText);
-	if (originalBytes <= DEFAULT_ARTIFACT_MAX_BYTES) {
-		return { status: "saved", artifactId, complete: true };
-	}
-	const retainedBytes = truncateHeadBytes(originalText, DEFAULT_ARTIFACT_MAX_BYTES).bytes;
-	return {
-		status: "saved",
-		artifactId,
-		complete: false,
-		omittedBytes: originalBytes - retainedBytes,
-	};
 }
 
 export async function saveAgentBashOriginalArtifact(
@@ -3717,7 +3676,7 @@ export class AgentSession {
 					}
 				: undefined;
 			const allowArtifact = ownedCompletion === undefined || isOwnedCompletionEnvelopeAllowed(ownedCompletion);
-			void formatParkedAsyncResult(this.sessionManager, disposition.text, allowArtifact)
+			void formatAsyncResultForFollowUp(this.sessionManager, disposition.text, allowArtifact)
 				.then(formattedResult => {
 					const manager = this.#ownedAsyncJobManager;
 					if (manager?.isDeliverySuppressed(job.id, job.generation)) {

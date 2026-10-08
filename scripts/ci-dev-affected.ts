@@ -1207,11 +1207,20 @@ export function planTargetedTasks(
 			addCodingAgentSdkProductionHostTask(tasks);
 		}
 
+		const owner = owningPackage(changedPath, packages);
 		if (mappedTests.length > 0) {
+			// Direct regression tests do not replace the coding-agent package's
+			// lint/type check when production source changes.
+			if (
+				owner?.name === "@gajae-code/coding-agent" &&
+				changedPath.startsWith(`${owner.dir}/src/`) &&
+				owner.manifest.scripts?.check
+			) {
+				add(tasks, `check:${owner.name}`, `Check ${owner.name}`, packageScriptCommand("check"), resolvePackageCwd(owner.dir));
+			}
 			continue;
 		}
 
-		const owner = owningPackage(changedPath, packages);
 		if (owner) {
 			if (owner.manifest.scripts?.check) {
 				add(tasks, `check:${owner.name}`, `Check ${owner.name}`, packageScriptCommand("check"), resolvePackageCwd(owner.dir));
