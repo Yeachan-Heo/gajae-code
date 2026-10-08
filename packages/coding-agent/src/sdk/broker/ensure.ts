@@ -245,26 +245,10 @@ async function brokerHopTimeoutResult(
 	// incarnation and reap that exact broker instead of leaving it detached after
 	// reporting a timeout to the caller.
 	const handoff = parseBrokerHopReply(0, stdout, undefined, stderr);
-	let cleanupFailure: string | undefined;
-	if (handoff.realBrokerPid !== undefined && handoff.realBrokerIncarnation !== undefined) {
-		try {
-			await reapDetachedBrokerPid(handoff.realBrokerPid, handoff.realBrokerIncarnation, {
-				gracefulMs: HOP_HANDOFF_CLEANUP_TIMEOUT_MS,
-				killVerifyMs: HOP_HANDOFF_CLEANUP_TIMEOUT_MS,
-			});
-		} catch (error) {
-			cleanupFailure = error instanceof Error ? error.message : String(error);
-		}
-	}
+	const brokerDetail = await reapTimedOutBrokerHandoff(handoff.realBrokerPid, handoff.realBrokerIncarnation);
 	const launcherDetail = launcherTerminated
 		? "hop exited after handoff cleanup"
 		: "hop did not exit after termination";
-	const brokerDetail =
-		handoff.realBrokerPid === undefined
-			? ""
-			: cleanupFailure
-				? `; exact broker cleanup failed: ${cleanupFailure}`
-				: "; captured broker handoff was reaped";
 	return {
 		process: hop,
 		realBrokerPid: handoff.realBrokerPid,
@@ -276,6 +260,23 @@ async function brokerHopTimeoutResult(
 			reason: `hop exceeded its ${timeoutMs}ms startup deadline; ${launcherDetail}${brokerDetail}`,
 		}),
 	};
+}
+
+async function reapTimedOutBrokerHandoff(
+	realBrokerPid: number | undefined,
+	realBrokerIncarnation: string | undefined,
+): Promise<string> {
+	if (realBrokerPid === undefined || realBrokerIncarnation === undefined) return "";
+	try {
+		await reapDetachedBrokerPid(realBrokerPid, realBrokerIncarnation, {
+			gracefulMs: HOP_HANDOFF_CLEANUP_TIMEOUT_MS,
+			killVerifyMs: HOP_HANDOFF_CLEANUP_TIMEOUT_MS,
+		});
+		return "; captured broker handoff was reaped";
+	} catch (error) {
+		const detail = error instanceof Error ? error.message : String(error);
+		return `; exact broker cleanup failed: ${detail}`;
+	}
 }
 
 /** Parses the hop's single-line pid/incarnation reply into broker identity or a typed error. */
@@ -328,15 +329,32 @@ export async function launchBrokerViaPosixTrampoline(
 	});
 	const wait = await awaitLauncherCloseBeforeDeadline(child, timeoutMs);
 	if (wait.kind === "timeout") {
-		const detail = wait.terminated ? "trampoline was terminated" : "trampoline did not exit after termination";
-		return {
-			process: child,
-			realBrokerPid: undefined,
-			error: new Error(`POSIX broker trampoline exceeded its ${timeoutMs}ms startup deadline; ${detail}`),
-		};
+		return await brokerTrampolineTimeoutResult(child, stdout, timeoutMs, wait.terminated);
 	}
 	const parsed = parseBrokerTrampolineReply(wait.outcome.code, stdout, wait.outcome.spawnError);
 	return { process: child, ...parsed };
+}
+
+async function brokerTrampolineTimeoutResult(
+	trampoline: ChildProcess,
+	stdout: string,
+	timeoutMs: number,
+	trampolineTerminated: boolean,
+): Promise<BrokerLaunchResult> {
+	const handoff = parseBrokerTrampolineReply(0, stdout);
+	const brokerDetail = await reapTimedOutBrokerHandoff(handoff.realBrokerPid, handoff.realBrokerIncarnation);
+	const trampolineDetail = trampolineTerminated
+		? "trampoline was terminated"
+		: "trampoline did not exit after termination";
+	const handoffFailure = handoff.realBrokerPid === undefined && handoff.error ? `; ${handoff.error.message}` : "";
+	return {
+		process: trampoline,
+		realBrokerPid: handoff.realBrokerPid,
+		...(handoff.realBrokerIncarnation !== undefined ? { realBrokerIncarnation: handoff.realBrokerIncarnation } : {}),
+		error: new Error(
+			`POSIX broker trampoline exceeded its ${timeoutMs}ms startup deadline; ${trampolineDetail}${brokerDetail}${handoffFailure}`,
+		),
+	};
 }
 
 export function parseBrokerTrampolineReply(
@@ -1512,6 +1530,15 @@ export function brokerHopTimeoutResultForTest(
 	launcherTerminated: boolean,
 ): Promise<BrokerLaunchResult> {
 	return brokerHopTimeoutResult(hop, stdout, stderr, timeoutMs, launcherTerminated);
+}
+/** Test hook: preserves and reaps a verified POSIX trampoline reply at its deadline. */
+export function brokerTrampolineTimeoutResultForTest(
+	trampoline: ChildProcess,
+	stdout: string,
+	timeoutMs: number,
+	trampolineTerminated: boolean,
+): Promise<BrokerLaunchResult> {
+	return brokerTrampolineTimeoutResult(trampoline, stdout, timeoutMs, trampolineTerminated);
 }
 /** Test hook: verifies broker exit evidence takes precedence over the launcher's status. */
 export function brokerStartupExitStatusForTest(

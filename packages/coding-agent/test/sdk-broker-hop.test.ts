@@ -13,6 +13,7 @@ import {
 	brokerOwnerIdentityMatchesForTest,
 	brokerSpawnFailureErrorForTest,
 	brokerStartupExitStatusForTest,
+	brokerTrampolineTimeoutResultForTest,
 	launchBrokerViaHop,
 	parseBrokerHopReply,
 	reapDetachedBrokerPidForTest,
@@ -138,6 +139,36 @@ describe("SDK broker hop protocol", () => {
 			expect(result.realBrokerIncarnation).toBe(observation.incarnation);
 			if (!(result.error instanceof BrokerHopError)) throw new Error("Expected a typed hop timeout error.");
 			expect(result.error.reason).toContain("captured broker handoff was reaped");
+			await closed.promise;
+			expect(observeProcessIncarnation(pid).status).toBe("absent");
+		} finally {
+			if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+			await closed.promise;
+		}
+	});
+
+	test("a POSIX trampoline handoff captured at the deadline is reaped by exact incarnation", async () => {
+		const child = childProcess.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+		const spawned = Promise.withResolvers<void>();
+		const closed = Promise.withResolvers<void>();
+		child.once("spawn", spawned.resolve);
+		child.once("close", closed.resolve);
+		await spawned.promise;
+		const pid = child.pid;
+		if (pid === undefined) throw new Error("Test broker did not expose its pid.");
+		const observation = observeProcessIncarnation(pid);
+		if (observation.status !== "present") throw new Error("Test broker process identity could not be observed.");
+
+		try {
+			const result = await brokerTrampolineTimeoutResultForTest(
+				child,
+				`${pid}\t${observation.incarnation}\n`,
+				10,
+				true,
+			);
+			expect(result.realBrokerPid).toBe(pid);
+			expect(result.realBrokerIncarnation).toBe(observation.incarnation);
+			expect(result.error?.message).toContain("captured broker handoff was reaped");
 			await closed.promise;
 			expect(observeProcessIncarnation(pid).status).toBe("absent");
 		} finally {
