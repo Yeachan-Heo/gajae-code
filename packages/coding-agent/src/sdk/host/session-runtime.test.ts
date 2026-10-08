@@ -5842,6 +5842,48 @@ test("SDK turn.steer preserves its expected run token and propagates a stale-run
 });
 
 describe("post-acceptance invocation terminalization", () => {
+	test("completion fallback and a held lifecycle end publish one terminal boundary", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-completion-lifecycle-race-"));
+		const completion = Promise.withResolvers<string>();
+		const terminalEntered = Promise.withResolvers<void>();
+		const releaseTerminal = Promise.withResolvers<void>();
+		const completionReconciled = Promise.withResolvers<void>();
+		let harness: InvocationHarness | undefined;
+		try {
+			harness = await invocationHarness("completion-lifecycle-race", cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					return completion.promise;
+				},
+				persistInterceptor: () => {},
+				agentFailedWriteFailures: 0,
+				persistHold: { type: "agent_end", onEntered: terminalEntered.resolve, release: releaseTerminal.promise },
+				onInvocationCompletionReconciled: () => completionReconciled.resolve(),
+			});
+			const accepted = await harness.control("turn.prompt", { text: "complete once" });
+			expect(accepted.ok).toBe(true);
+			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			await harness.emit("agent_start");
+			completion.resolve("completed");
+			await terminalEntered.promise;
+			const end = harness.emit("agent_end", {
+				messages: [{ role: "assistant", stopReason: "stop", content: "completed" }],
+			});
+			await Bun.sleep(0);
+			releaseTerminal.resolve();
+			await Promise.all([end, completionReconciled.promise]);
+			expect(await settledStatus(harness, "turn.result", { kind: "prompt", ...correlation })).toMatchObject({
+				status: "terminal_ok",
+				content: { text: "completed" },
+			});
+			expect(harness.broadcasts.filter(frame => frame.kind === "agent_end")).toHaveLength(1);
+		} finally {
+			completion.resolve("completed");
+			releaseTerminal.resolve();
+			await harness?.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
 	test.each([
 		false,
 		true,
