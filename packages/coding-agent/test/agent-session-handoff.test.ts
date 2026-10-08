@@ -526,49 +526,32 @@ describe("AgentSession handoff", () => {
 		expect(JSON.stringify(promptSpy.mock.calls)).toContain("STALLED:");
 	});
 
-	it("uses handoff strategy for threshold-triggered auto maintenance", async () => {
+	it("uses handoff strategy for idle auto maintenance", async () => {
 		session.settings.set("compaction.strategy", "handoff");
-		session.settings.set("compaction.thresholdPercent", 1);
 		session.settings.set("contextPromotion.enabled", false);
-
-		const model = session.model;
-		if (!model) {
-			throw new Error("Expected model to be set");
-		}
-
-		const assistantMessage: AssistantMessage = {
-			role: "assistant",
-			content: [{ type: "text", text: "maintenance trigger" }],
-			api: model.api,
-			provider: model.provider,
-			model: model.id,
-			stopReason: "stop",
-			usage: {
-				input: 10_000,
-				output: 1_000,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 11_000,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-			timestamp: Date.now(),
-		};
 
 		const handoffSpy = vi.spyOn(session, "handoff").mockResolvedValue({ document: "handoff document" });
 
-		session.agent.emitExternalEvent({ type: "message_end", message: assistantMessage });
-		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
-		await Bun.sleep(20);
+		await session.runIdleCompaction();
 
 		expect(handoffSpy).toHaveBeenCalledTimes(1);
-		expect(handoffSpy).toHaveBeenCalledWith(expect.stringContaining("Threshold-triggered maintenance"), {
+		expect(handoffSpy).toHaveBeenCalledWith(expect.any(String), {
 			autoTriggered: true,
 			signal: expect.anything(),
 		});
 		expect(events.filter(event => event.type === "auto_compaction_start")).toHaveLength(1);
+		expect(events.find(event => event.type === "auto_compaction_start")).toMatchObject({
+			reason: "idle",
+			action: "handoff",
+		});
 		const endEvents = events.filter(event => event.type === "auto_compaction_end");
 		expect(endEvents).toHaveLength(1);
-		expect(endEvents[0]).toMatchObject({ type: "auto_compaction_end", aborted: false, willRetry: false });
+		expect(endEvents[0]).toMatchObject({
+			type: "auto_compaction_end",
+			action: "handoff",
+			aborted: false,
+			willRetry: false,
+		});
 	});
 
 	it("completes threshold-triggered auto-handoff while the original prompt is still unwinding", async () => {
@@ -648,12 +631,18 @@ describe("AgentSession handoff", () => {
 			events.push(event);
 		});
 
+		const handoffSpy = vi.spyOn(session, "handoff");
 		const generateHandoffSpy = vi
 			.spyOn(compactionModule, "generateHandoff")
 			.mockResolvedValue("## Goal\nContinue from here");
 		await session.prompt("Trigger threshold handoff");
 
 		expect(mock.calls).toHaveLength(1);
+		expect(handoffSpy).toHaveBeenCalledTimes(1);
+		expect(handoffSpy).toHaveBeenCalledWith(expect.stringContaining("Threshold-triggered maintenance"), {
+			autoTriggered: true,
+			signal: expect.anything(),
+		});
 		expect(generateHandoffSpy).toHaveBeenCalledTimes(1);
 		const endEvents = events.filter(event => event.type === "auto_compaction_end");
 		expect(endEvents).toHaveLength(1);
@@ -1092,11 +1081,9 @@ describe("AgentSession handoff", () => {
 		await Bun.sleep(5);
 
 		// The bypass turn-start paths (steer/follow-up/sendUserMessage) are fenced too.
-		await expect(session.steer("steer during handoff")).rejects.toThrow(/handoff is in progress/i);
-		await expect(session.followUp("follow-up during handoff")).rejects.toThrow(/handoff is in progress/i);
-		await expect(session.sendUserMessage("msg", { deliverAs: "followUp" })).rejects.toThrow(
-			/handoff is in progress/i,
-		);
+		await expect(session.steer("steer during handoff")).rejects.toMatchObject({ code: "busy" });
+		await expect(session.followUp("follow-up during handoff")).rejects.toMatchObject({ code: "busy" });
+		await expect(session.sendUserMessage("msg", { deliverAs: "followUp" })).rejects.toMatchObject({ code: "busy" });
 
 		gate.resolve();
 		await handoffPromise;
