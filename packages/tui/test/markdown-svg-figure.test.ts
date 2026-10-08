@@ -174,4 +174,31 @@ describe("Markdown asynchronous SVG figures", () => {
 		first.dispose();
 		second.dispose();
 	});
+
+	it("keeps list-contained SVG examples on the ordinary cached code path", () => {
+		clearRenderCache();
+		const figures: DeferredFigure[] = [];
+		let resolverCalls = 0;
+		let codeBlockCalls = 0;
+		const baseTheme = figureTheme(figures, () => resolverCalls++);
+		const theme = {
+			...baseTheme,
+			codeBlock: (text: string) => {
+				codeBlockCalls++;
+				return defaultMarkdownTheme.codeBlock(text);
+			},
+		};
+		const source = "- example\n  ```svg\n  <svg/>\n  ```";
+		const first = new Markdown(source, 0, 0, theme);
+		first.render(80);
+		expect(resolverCalls).toBe(0);
+		expect(codeBlockCalls).toBe(1);
+
+		const second = new Markdown(source, 0, 0, theme);
+		second.render(80);
+		expect(resolverCalls).toBe(0);
+		expect(codeBlockCalls).toBe(1);
+		first.dispose();
+		second.dispose();
+	});
 });

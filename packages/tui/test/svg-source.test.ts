@@ -16,11 +16,14 @@ describe("splitSvgFences", () => {
 	it("leaves svg fences nested in another fence or indented as code as prose", () => {
 		const nested = "````markdown\n```svg\n<svg/>\n```\n````";
 		const indented = "    ```svg\n    <svg/>\n    ```";
+		const list = "- example\n  ```svg\n  <svg/>\n  ```";
 		const uppercase = "```SVG\n<SVG/>\n```";
 		expect(splitSvgFences(nested)).toEqual([{ kind: "markdown", text: nested }]);
 		expect(hasSvgFence(nested)).toBe(false);
 		expect(splitSvgFences(indented)).toEqual([{ kind: "markdown", text: indented }]);
 		expect(hasSvgFence(indented)).toBe(false);
+		expect(splitSvgFences(list)).toEqual([{ kind: "markdown", text: list }]);
+		expect(hasSvgFence(list)).toBe(false);
 		expect(hasSvgFence(uppercase)).toBe(true);
 		expect(splitSvgFences(uppercase)).toEqual([{ kind: "svg", source: "<SVG/>\n", closed: true }]);
 		expect(hasSvgFence("```svgx\n```")).toBe(false);
@@ -73,10 +76,15 @@ describe("prepareSvg", () => {
 		);
 	});
 
-	it("resolves theme tokens nested in custom-property fallbacks", () => {
-		const prepared = prepareSvg('<svg><rect fill="var(--missing, var(--gjc-accent))"/></svg>', palette);
+	it("resolves theme tokens through nested custom-property fallback chains", () => {
+		const prepared = prepareSvg(
+			'<svg><rect fill="var(--missing, var(--gjc-accent))"/>' +
+				'<rect stroke="var(--gjc-missing, var(--gjc-also-missing, var(--gjc-primary, red)))"/></svg>',
+			{ ...palette, primary: "#f00" },
+		);
 
 		expect(prepared).toContain('fill="var(--missing, #ff8800)"');
+		expect(prepared).toContain('stroke="#f00"');
 	});
 
 	it("gives a bare root the theme text color, a sans-serif font, and the namespaces the source needs", () => {

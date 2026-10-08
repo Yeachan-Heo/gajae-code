@@ -7,6 +7,7 @@
  *
  * Source: oh-my-pi (https://github.com/can1357/oh-my-pi)
  */
+import { Marked } from "marked";
 
 /** One run of an assistant text block: prose, or the body of a ```svg fence. */
 export type FigureSegment =
@@ -17,6 +18,7 @@ export type FigureSegment =
 /** A top-level (≤3-space indent) fenced-code opener. */
 const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 const SVG_TEXT = /svg/i;
+const svgMarkdownParser = new Marked();
 
 /** Whether `markdown` holds a ```svg fence {@link splitSvgFences} would lift. */
 export function hasSvgFence(markdown: string): boolean {
@@ -34,7 +36,11 @@ export function hasSvgFence(markdown: string): boolean {
 			const open = FENCE_OPEN.exec(line);
 			// A backtick fence's info string cannot hold backticks (CommonMark).
 			if (open && !(open[1]![0] === "`" && open[2]!.includes("`"))) {
-				if (open[2]!.trim().split(/[ \t]/, 1)[0]!.toLowerCase() === "svg") return true;
+				if (isSvgFenceInfo(open[2]!)) {
+					return svgMarkdownParser
+						.lexer(markdown)
+						.some(token => token.type === "code" && isSvgFenceInfo(token.lang));
+				}
 				fence = open[1]!;
 			}
 		}
@@ -51,45 +57,43 @@ export function hasSvgFence(markdown: string): boolean {
  */
 export function splitSvgFences(markdown: string): FigureSegment[] {
 	const segments: FigureSegment[] = [];
-	/** Open fence: its marker run, and where an svg fence's body starts (-1 for other fences). */
-	let fence: { marker: string; body: number } | undefined;
 	let proseStart = 0;
-	let lineStart = 0;
-	while (lineStart <= markdown.length) {
-		const newline = markdown.indexOf("\n", lineStart);
-		const lineEnd = newline < 0 ? markdown.length : newline;
-		const next = newline < 0 ? markdown.length + 1 : newline + 1;
-		const line = markdown.slice(lineStart, lineEnd);
-		if (fence) {
-			if (closesFence(line, fence.marker)) {
-				if (fence.body >= 0) {
-					segments.push({ kind: "svg", source: markdown.slice(fence.body, lineStart), closed: true });
-					proseStart = Math.min(next, markdown.length);
-				}
-				fence = undefined;
-			}
-		} else {
-			const open = FENCE_OPEN.exec(line);
-			// A backtick fence's info string cannot hold backticks (CommonMark).
-			if (open && !(open[1]![0] === "`" && open[2]!.includes("`"))) {
-				const isSvg = open[2]!.trim().split(/[ \t]/, 1)[0]!.toLowerCase() === "svg";
-				if (isSvg) {
-					const prose = markdown.slice(proseStart, lineStart);
-					if (prose.trim()) segments.push({ kind: "markdown", text: prose });
-					fence = { marker: open[1]!, body: Math.min(next, markdown.length) };
-				} else {
-					fence = { marker: open[1]!, body: -1 };
-				}
-			}
-		}
-		lineStart = next;
+	for (const token of svgMarkdownParser.lexer(markdown)) {
+		if (token.type !== "code" || !isSvgFenceInfo(token.lang)) continue;
+		const start = markdown.indexOf(token.raw, proseStart);
+		if (start < 0) continue;
+		const end = start + token.raw.length;
+		const prose = markdown.slice(proseStart, start);
+		if (prose.trim()) segments.push({ kind: "markdown", text: prose });
+		segments.push({ kind: "svg", ...splitFenceBody(token.raw) });
+		proseStart = end;
 	}
-	if (fence && fence.body >= 0) {
-		segments.push({ kind: "svg", source: markdown.slice(fence.body), closed: false });
-	} else if (markdown.slice(proseStart).trim()) {
-		segments.push({ kind: "markdown", text: markdown.slice(proseStart) });
-	}
+	const trailingProse = markdown.slice(proseStart);
+	if (trailingProse.trim()) segments.push({ kind: "markdown", text: trailingProse });
 	return segments;
+}
+
+function isSvgFenceInfo(info: string | undefined): boolean {
+	return info?.trim().split(/[ \t]/, 1)[0]?.toLowerCase() === "svg";
+}
+
+function splitFenceBody(raw: string): { source: string; closed: boolean } {
+	const openerEnd = raw.indexOf("\n");
+	const opener = raw.slice(0, openerEnd < 0 ? raw.length : openerEnd);
+	const marker = FENCE_OPEN.exec(opener)?.[1];
+	const bodyStart = openerEnd < 0 ? raw.length : openerEnd + 1;
+	if (!marker) return { source: raw.slice(bodyStart), closed: false };
+	let lineStart = bodyStart;
+	while (lineStart <= raw.length) {
+		const newline = raw.indexOf("\n", lineStart);
+		const lineEnd = newline < 0 ? raw.length : newline;
+		if (closesFence(raw.slice(lineStart, lineEnd), marker)) {
+			return { source: raw.slice(bodyStart, lineStart), closed: true };
+		}
+		if (newline < 0) break;
+		lineStart = newline + 1;
+	}
+	return { source: raw.slice(bodyStart), closed: false };
 }
 
 /** Whether `line` closes a fence opened by `marker`: same character, at least as long, nothing after. */
@@ -145,8 +149,7 @@ export function closePartialSvg(source: string): string | null {
 	return document;
 }
 
-/** `var(--name)` / `var(--name, fallback)`; the fallback may contain one nested function. */
-const VAR_REFERENCE = /var\(\s*--([\w-]+)\s*(?:,\s*((?:[^()]|\([^()]*\))*))?\)/gi;
+/** CSS `var()` references are parsed with balanced parentheses below. */
 const CSS_VALUE_ATTRIBUTES = new Set([
 	"alignment-baseline",
 	"baseline-shift",
@@ -355,37 +358,106 @@ function resolveCssValue(source: string, palette: Readonly<Record<string, string
 			continue;
 		}
 		if (source.slice(index, index + 4).toLowerCase() === "var(") {
-			VAR_REFERENCE.lastIndex = index;
-			const match = VAR_REFERENCE.exec(source);
-			if (match?.index === index) {
-				const name = match[1]!;
-				const fallback = match[2];
-				const end = VAR_REFERENCE.lastIndex;
-				if (name.startsWith("gjc-")) {
+			const reference = readCssVariableReference(source, index);
+			if (reference) {
+				if (reference.name.startsWith("gjc-")) {
 					output += source.slice(cursor, index);
-					output +=
-						palette[name.slice("gjc-".length)] ??
-						(fallback === undefined ? fg : resolveCssValue(fallback, palette, fg, depth + 1));
-					cursor = end;
-				} else if (fallback !== undefined) {
-					const resolvedFallback = resolveCssValue(fallback, palette, fg, depth + 1);
-					if (resolvedFallback !== fallback) {
+					const themeColor = palette[reference.name.slice("gjc-".length)];
+					const fallback = reference.fallback?.trim();
+					output += themeColor ?? (fallback ? resolveCssValue(fallback, palette, fg, depth + 1) : fg);
+					cursor = reference.end;
+				} else if (reference.fallback !== undefined) {
+					const resolvedFallback = resolveCssValue(reference.fallback, palette, fg, depth + 1);
+					if (resolvedFallback !== reference.fallback) {
 						output += source.slice(cursor, index);
-						const fallbackStart = match[0].lastIndexOf(fallback);
 						output +=
-							match[0].slice(0, fallbackStart) +
+							source.slice(index, reference.fallbackStart) +
 							resolvedFallback +
-							match[0].slice(fallbackStart + fallback.length);
-						cursor = end;
+							source.slice(reference.fallbackEnd, reference.end);
+						cursor = reference.end;
 					}
 				}
-				index = end;
+				index = reference.end;
 				continue;
 			}
 		}
 		index++;
 	}
 	return output ? output + source.slice(cursor) : source;
+}
+
+interface CssVariableReference {
+	name: string;
+	end: number;
+	fallback: string | undefined;
+	fallbackStart: number;
+	fallbackEnd: number;
+}
+
+/** Parse a CSS `var()` reference with balanced nested functions. */
+function readCssVariableReference(source: string, start: number): CssVariableReference | undefined {
+	let depth = 1;
+	let quote: string | undefined;
+	let close = -1;
+	for (let index = start + 4; index < source.length; index++) {
+		if (source.startsWith("/*", index)) {
+			const commentEnd = source.indexOf("*/", index + 2);
+			if (commentEnd < 0) return undefined;
+			index = commentEnd + 1;
+			continue;
+		}
+		const char = source[index];
+		if (quote !== undefined) {
+			if (char === "\\") index++;
+			else if (char === quote) quote = undefined;
+		} else if (char === '"' || char === "'") {
+			quote = char;
+		} else if (char === "(") {
+			depth++;
+		} else if (char === ")" && --depth === 0) {
+			close = index;
+			break;
+		}
+	}
+	if (close < 0) return undefined;
+
+	const bodyStart = start + 4;
+	let nestedDepth = 0;
+	quote = undefined;
+	let comma = -1;
+	for (let index = bodyStart; index < close; index++) {
+		if (source.startsWith("/*", index)) {
+			const commentEnd = source.indexOf("*/", index + 2);
+			if (commentEnd < 0 || commentEnd >= close) return undefined;
+			index = commentEnd + 1;
+			continue;
+		}
+		const char = source[index];
+		if (quote !== undefined) {
+			if (char === "\\") index++;
+			else if (char === quote) quote = undefined;
+		} else if (char === '"' || char === "'") {
+			quote = char;
+		} else if (char === "(") {
+			nestedDepth++;
+		} else if (char === ")") {
+			nestedDepth--;
+		} else if (char === "," && nestedDepth === 0) {
+			comma = index;
+			break;
+		}
+	}
+	const nameEnd = comma < 0 ? close : comma;
+	const name = source.slice(bodyStart, nameEnd).trim();
+	if (!/^--[\w-]+$/.test(name)) return undefined;
+	const fallbackStart = comma < 0 ? close : comma + 1;
+	return {
+		name: name.slice(2),
+		end: close + 1,
+		fallback: comma < 0 ? undefined : source.slice(fallbackStart, close),
+		fallbackStart,
+		fallbackEnd: close,
+	};
 }
 
 /** The first quote-aware `<svg …>` start tag (namespace prefix allowed). */
