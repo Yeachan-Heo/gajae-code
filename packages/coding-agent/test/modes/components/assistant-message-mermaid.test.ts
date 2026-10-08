@@ -86,6 +86,22 @@ describe("AssistantMessageComponent mermaid markdown", () => {
 });
 
 describe("AssistantMessageComponent SVG markdown", () => {
+	it("keeps the fenced SVG source when the terminal has no graphics protocol", () => {
+		setTerminalImageProtocol(null);
+		const component = new AssistantMessageComponent(
+			createAssistantMessage('```svg\n<svg width="10" height="10"><rect/></svg>\n```'),
+		);
+		try {
+			const rendered = Bun.stripANSI(component.render(100).join("\n"));
+			expect(TERMINAL.imageProtocol).toBeNull();
+			expect(rendered).toContain("```svg");
+			expect(rendered).toContain("<svg");
+			expect(rendered).not.toContain("[Image: svg");
+		} finally {
+			component.dispose();
+		}
+	});
+
 	it("renders SVG fences as terminal images and repaints after rasterization", async () => {
 		const originalProtocol = TERMINAL.imageProtocol;
 		setTerminalImageProtocol(ImageProtocol.Kitty);
@@ -112,6 +128,8 @@ describe("AssistantMessageComponent SVG markdown", () => {
 	});
 
 	it("falls back to the original fenced code after a final rasterization failure", async () => {
+		const originalProtocol = TERMINAL.imageProtocol;
+		setTerminalImageProtocol(ImageProtocol.Kitty);
 		const failed = Promise.withResolvers<void>();
 		const component = new AssistantMessageComponent(createAssistantMessage("```svg\n<svg"), false, () =>
 			failed.resolve(),
@@ -125,6 +143,7 @@ describe("AssistantMessageComponent SVG markdown", () => {
 			expect(rendered).not.toContain("[Image: ");
 		} finally {
 			component.dispose();
+			setTerminalImageProtocol(originalProtocol);
 		}
 	});
 });
