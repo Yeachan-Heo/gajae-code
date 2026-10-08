@@ -85,6 +85,8 @@ import { Settings, type SkillsSettings } from "../config/settings";
 import { resolveEagerTaskDelegation } from "../config/task-delegation";
 import { CursorExecHandlers } from "../cursor";
 import { EditTool } from "../edit";
+import { disposeVmContextsByOwner } from "../eval/js/context-manager";
+import { disposeKernelSessionsByOwner } from "../eval/py/executor";
 import type { MasterModeContext } from "../master-mode/context";
 import { describeFoldReceipt } from "../session/fold-coordinator";
 import type { BashRestrictionProfile } from "../tools/bash-allowed-prefixes";
@@ -3213,9 +3215,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getSessionFile: () => sessionManager.getSessionFile() ?? null,
 			getSessionAgentDir: () => session?.getSessionAgentDir() ?? options.agentDir ?? settings.getAgentDir(),
 			getEvalKernelOwnerId: () => evalKernelOwnerId,
-			assertEvalExecutionAllowed: () => session?.assertEvalExecutionAllowed(),
-			trackEvalExecution: (execution, abortController) =>
-				session ? session.trackEvalExecution(execution, abortController) : execution,
+			assertEvalExecutionAllowed: () => {
+				if (!session) throw new Error("Eval execution is unavailable until session initialization completes");
+				session.assertEvalExecutionAllowed();
+			},
+			trackEvalExecution: (execution, abortController) => {
+				if (!session) {
+					abortController.abort(new Error("Eval execution is unavailable until session initialization completes"));
+					void execution.catch(() => {});
+					throw new Error("Eval execution is unavailable until session initialization completes");
+				}
+				return session.trackEvalExecution(execution, abortController);
+			},
 			getAsyncJobManager: () => asyncJobManager,
 			waitForUserSteering: signal => {
 				if (agent) return agent.waitForSteeringArrival(signal);
@@ -3309,7 +3320,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			adoptArtifactManager: manager => sessionManager.adoptArtifactManager(manager),
 			releaseArtifactManager: manager => sessionManager.releaseArtifactManager(manager),
 			ensureArtifactManager: () => sessionManager.ensureArtifactManager(),
-			registerSessionCleanup: cleanup => session?.registerToolSessionTransitionCleanup(cleanup) ?? (() => {}),
+			registerSessionCleanup: cleanup => {
+				if (!session) throw new Error("Cannot register session cleanup before session initialization completes");
+				return session.registerToolSessionTransitionCleanup(cleanup);
+			},
 			mcpConfigPath: explicitMcpConfigPath,
 			settings,
 			authStorage,
@@ -6055,6 +6069,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			gjcRuntimeSnapshot: gjcRuntimeStore,
 		};
 	} catch (error) {
+		// Capture pending owner work before asynchronous startup teardown can yield.
+		const startupPythonCleanup = disposeKernelSessionsByOwner(evalKernelOwnerId);
+		void startupPythonCleanup.catch(() => {});
 		let cleanupDiagnostic: unknown;
 		let ownedMcpCleanupFailed = false;
 		let ownedMcpCleanupError: unknown;
@@ -6092,6 +6109,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					await session.awaitDisposeCompletion();
 				}
 			});
+			await attemptCleanup(() => startupPythonCleanup);
 		} else {
 			if (hasRegistered)
 				await attemptCleanup(() => {
@@ -6116,18 +6134,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					ownedMcpCleanupFailed = true;
 					ownedMcpCleanupError = cleanupError;
 				});
-			const evalCleanup = Promise.all([import("../eval/py/executor"), import("../eval/js/context-manager")]);
-			let evalCleanupModules: Awaited<typeof evalCleanup> | undefined;
-			try {
-				evalCleanupModules = await evalCleanup;
-			} catch (cleanupError) {
-				recordCleanupFailure(cleanupError);
-			}
-			if (evalCleanupModules) {
-				const [kernelExecutor, contextManager] = evalCleanupModules;
-				await attemptCleanup(() => kernelExecutor.disposeKernelSessionsByOwner(evalKernelOwnerId));
-				await attemptCleanup(() => contextManager.disposeVmContextsByOwner(evalKernelOwnerId));
-			}
+			await attemptCleanup(() => startupPythonCleanup);
+			await attemptCleanup(() => disposeVmContextsByOwner(evalKernelOwnerId));
 			await attemptCleanup(closeOwnedSettings);
 		}
 		if (processCwdClaimed)
