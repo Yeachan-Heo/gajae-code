@@ -14,3 +14,4 @@
 - Preserve requested adaptive thinking and effort for forced tool calls on compatible Claude generations
 - Price Bedrock Claude cache writes by the response's TTL breakdown, including Haiku 5.5's 1-hour write rate
 - Price Anthropic 5-minute and 1-hour cache writes from reported TTL usage, including Haiku 5.5's 5x long-context rates
+- Keep model-ineligible Haiku fast-mode requests from disabling the priority tier and preserve Bedrock Claude safety-stop details

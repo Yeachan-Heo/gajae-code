@@ -317,6 +317,9 @@ const STRUCTURED_REFUSAL_SIGNALS: ReadonlySet<string> = new Set([
 	"sensitive",
 	// openai-completions: finish_reason / error.code
 	"content_filter",
+	// amazon-bedrock: MessageStopEvent.stopReason
+	"content_filtered",
+	"guardrail_intervened",
 	// google-generative-ai: candidate finishReason
 	"SAFETY",
 	"IMAGE_SAFETY",

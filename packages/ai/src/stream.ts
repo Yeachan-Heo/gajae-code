@@ -418,12 +418,11 @@ export function stream<TApi extends Api>(
 		);
 	} else if (model.api === "bedrock-converse-stream") {
 		// Bedrock doesn't have any API keys instead it sources credentials from standard AWS env variables or from given AWS profile.
-		return streamBedrock(
-			model as Model<"bedrock-converse-stream">,
-			context,
-			(options || {}) as BedrockOptions,
-			onStreamCreated,
-		);
+		const bedrockOptions = (options || {}) as BedrockOptions;
+		const adapterOptions = isProviderSafetyStopModelTrusted(model)
+			? withProviderSafetyStopAdapterInvocation(bedrockOptions)
+			: bedrockOptions;
+		return streamBedrock(model as Model<"bedrock-converse-stream">, context, adapterOptions, onStreamCreated);
 	} else if (model.api === "kiro-codewhisperer-stream") {
 		const kiroOptions = (options || {}) as KiroCodeWhispererOptions;
 		const identitySnapshot = isProviderSafetyStopModelTrusted(model);

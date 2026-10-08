@@ -4,7 +4,7 @@ import {
 	isAnthropicFastModeUnsupportedError,
 	streamAnthropic,
 } from "@gajae-code/ai/providers/anthropic";
-import type { Context, Model, ProviderSessionState, ServiceTier } from "@gajae-code/ai/types";
+import type { AssistantMessage, Context, Model, ProviderSessionState, ServiceTier } from "@gajae-code/ai/types";
 import { hookFetch } from "@gajae-code/utils";
 
 function makeAnthropicModel(id: string): Model<"anthropic-messages"> {
@@ -54,7 +54,7 @@ function capturePayload(model: Model<"anthropic-messages">, opts: CaptureOptions
 async function capturePayloadAndHeaders(
 	model: Model<"anthropic-messages">,
 	opts: CaptureOptions,
-): Promise<{ payload: unknown; headers: Headers | undefined }> {
+): Promise<{ payload: unknown; headers: Headers | undefined; message: AssistantMessage }> {
 	let payload: unknown;
 	let headers: Headers | undefined;
 	using _hook = hookFetch(async (_input, init) => {
@@ -86,7 +86,7 @@ async function capturePayloadAndHeaders(
 		const body = events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
 		return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
 	});
-	await streamAnthropic(model, CONTEXT, {
+	const message = await streamAnthropic(model, CONTEXT, {
 		apiKey: "sk-ant-oat-test",
 		isOAuth: true,
 		serviceTier: opts.serviceTier,
@@ -95,7 +95,7 @@ async function capturePayloadAndHeaders(
 			payload = requestPayload;
 		},
 	}).result();
-	return { payload, headers };
+	return { payload, headers, message };
 }
 
 describe("Anthropic priority service tier → speed='fast'", () => {
@@ -115,11 +115,12 @@ describe("Anthropic priority service tier → speed='fast'", () => {
 
 	it("omits fast mode for Haiku 5.5 before provider retries are needed", async () => {
 		for (const serviceTier of ["priority", "claude-only"] as const) {
-			const { payload, headers } = await capturePayloadAndHeaders(makeAnthropicModel("claude-haiku-5-5"), {
+			const { payload, headers, message } = await capturePayloadAndHeaders(makeAnthropicModel("claude-haiku-5-5"), {
 				serviceTier,
 			});
 			expect((payload as { speed?: string }).speed).toBeUndefined();
 			expect(headers?.get("anthropic-beta") ?? "").not.toContain("fast-mode-2026-02-01");
+			expect(message.disabledFeatures).toBeUndefined();
 		}
 	});
 

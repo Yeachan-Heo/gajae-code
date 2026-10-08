@@ -5,7 +5,9 @@ import { applyGeneratedModelPolicies } from "../src/model-thinking";
 import { calculateCost, getBundledModel, getBundledModels } from "../src/models";
 import { parseBedrockClaudeGeneration, streamBedrock, supportsPromptCaching } from "../src/providers/amazon-bedrock";
 import { crc32 } from "../src/providers/aws-eventstream";
-import type { Context, Model, Usage } from "../src/types";
+import { streamSimple } from "../src/stream";
+import type { AssistantMessage, Context, Model, Usage } from "../src/types";
+import { isProviderSafetyStopAuthenticated } from "../src/utils/provider-safety-stop";
 
 function encodeStringHeader(name: string, value: string): Uint8Array {
 	const nameBytes = new TextEncoder().encode(name);
@@ -277,5 +279,76 @@ describe("bundled Bedrock catalog id-shape tripwire", () => {
 		expect(
 			claudeIds.filter(model => parseBedrockClaudeGeneration(model.id.toLowerCase()) !== undefined).length,
 		).toBeGreaterThan(0);
+	});
+});
+
+async function runBedrockSafetyStop(
+	stopReason: "content_filtered" | "guardrail_intervened",
+	throughDispatcher: boolean,
+): Promise<AssistantMessage> {
+	const model = getBundledModel<"bedrock-converse-stream">("amazon-bedrock", "us.anthropic.claude-haiku-5-5");
+	const context: Context = {
+		systemPrompt: [],
+		messages: [{ role: "user", content: "Please answer safely.", timestamp: Date.now() }],
+	};
+	const originalSkipAuth = process.env.AWS_BEDROCK_SKIP_AUTH;
+	const originalBearerToken = process.env.AWS_BEARER_TOKEN_BEDROCK;
+	process.env.AWS_BEDROCK_SKIP_AUTH = "1";
+	delete process.env.AWS_BEARER_TOKEN_BEDROCK;
+
+	try {
+		using _fetchHook = hookFetch(async () =>
+			bedrockEventStreamResponse([
+				{ type: "messageStart", payload: { role: "assistant" } },
+				{
+					type: "messageStop",
+					payload: {
+						stopReason,
+						additionalModelResponseFields: { guardrailAction: "BLOCKED", category: "safety" },
+					},
+				},
+			]),
+		);
+		return throughDispatcher
+			? await streamSimple(model, context, {}).result()
+			: await streamBedrock(model, context, {}).result();
+	} finally {
+		if (originalSkipAuth === undefined) delete process.env.AWS_BEDROCK_SKIP_AUTH;
+		else process.env.AWS_BEDROCK_SKIP_AUTH = originalSkipAuth;
+		if (originalBearerToken === undefined) delete process.env.AWS_BEARER_TOKEN_BEDROCK;
+		else process.env.AWS_BEARER_TOKEN_BEDROCK = originalBearerToken;
+	}
+}
+
+describe("Bedrock provider safety stops", () => {
+	it("preserves and authenticates content_filtered refusals through trusted dispatch", async () => {
+		const result = await runBedrockSafetyStop("content_filtered", true);
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("stopReason: content_filtered");
+		expect(result.errorMessage).toContain('"guardrailAction":"BLOCKED"');
+		expect(result.errorKind).toBe("provider_safety_stop");
+		expect(result.transportFailure).toBeUndefined();
+		expect(isProviderSafetyStopAuthenticated(result)).toBe(true);
+	});
+
+	it("recognizes guardrail_intervened as a provider safety stop", async () => {
+		const result = await runBedrockSafetyStop("guardrail_intervened", true);
+
+		expect(result.errorMessage).toContain("stopReason: guardrail_intervened");
+		expect(result.errorKind).toBe("provider_safety_stop");
+		expect(isProviderSafetyStopAuthenticated(result)).toBe(true);
+	});
+
+	it("does not authenticate a safety stop from direct provider calls", async () => {
+		const result = await runBedrockSafetyStop("content_filtered", false);
+
+		expect(result.errorKind).toBeUndefined();
+		expect(isProviderSafetyStopAuthenticated(result)).toBe(false);
+		expect(result.transportFailure).toMatchObject({
+			kind: "transport",
+			status: 500,
+			providerCode: "untrusted_safety_stop",
+		});
 	});
 });

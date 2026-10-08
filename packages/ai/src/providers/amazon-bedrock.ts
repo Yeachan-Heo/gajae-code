@@ -9,6 +9,11 @@
 
 import { $credentialEnv, $env, $flag, extractHttpStatusFromError, fetchWithRetry } from "@gajae-code/utils";
 import { assertAwsRegionLabel } from "../adapter-internals/aws-region";
+import {
+	isProviderSafetyStopAdapterInvocation,
+	mintProviderSafetyStop,
+	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+} from "../adapter-internals/provider-safety-stop";
 import { parseBedrockClaudeGeneration, supportsBedrockClaudePromptCaching } from "../bedrock-claude-cache-policy";
 import type { Effort } from "../model-thinking";
 import {
@@ -165,6 +170,7 @@ interface ContentBlockStopEvent {
 }
 interface MessageStopEvent {
 	stopReason?: string;
+	additionalModelResponseFields?: unknown;
 }
 interface MetadataEvent {
 	usage?: {
@@ -451,6 +457,25 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 						case "messageStop": {
 							const ev = payload as MessageStopEvent;
 							output.stopReason = mapStopReason(ev.stopReason);
+							if (output.stopReason === "error") {
+								output.errorMessage = formatBedrockStopErrorMessage(ev);
+							}
+							if (isBedrockSafetyStop(ev.stopReason)) {
+								const authenticated = mintProviderSafetyStop(
+									output,
+									ev.stopReason,
+									PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+									options.fetch,
+									isProviderSafetyStopAdapterInvocation(options),
+								);
+								if (!authenticated) {
+									output.transportFailure = {
+										kind: "transport",
+										status: 500,
+										providerCode: "untrusted_safety_stop",
+									};
+								}
+							}
 							break;
 						}
 						case "metadata": {
@@ -482,7 +507,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 			}
 			output.stopReason = options.signal?.aborted ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(error);
-			output.transportFailure = transportFailureFacts(error);
+			output.transportFailure = transportFailureFacts(error) ?? output.transportFailure;
 			const baseMessage = error instanceof Error ? error.message : JSON.stringify(error);
 			// Enrich error with thinking block diagnostics for signature-related failures
 			let diagnostics = "";
@@ -504,7 +529,13 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 					diagnostics = `\n[thinking-diag] ${JSON.stringify(thinkingBlocks)}`;
 				}
 			}
-			output.errorMessage = await appendRawHttpRequestDumpFor400(baseMessage + diagnostics, error, rawRequestDump);
+			if (output.errorKind !== "provider_safety_stop" || !output.errorMessage) {
+				output.errorMessage = await appendRawHttpRequestDumpFor400(
+					baseMessage + diagnostics,
+					error,
+					rawRequestDump,
+				);
+			}
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({ type: "error", reason: output.stopReason, error: output });
@@ -898,6 +929,23 @@ export function convertToolConfig(
 	}
 
 	return bedrockToolChoice ? { tools: bedrockTools, toolChoice: bedrockToolChoice } : { tools: bedrockTools };
+}
+
+function isBedrockSafetyStop(reason: string | undefined): reason is "content_filtered" | "guardrail_intervened" {
+	return reason === "content_filtered" || reason === "guardrail_intervened";
+}
+
+function formatBedrockStopErrorMessage(event: MessageStopEvent): string {
+	const reason = event.stopReason ?? "unknown";
+	if (event.additionalModelResponseFields === undefined) {
+		return `Bedrock stream ended with stopReason: ${reason}`;
+	}
+	const serializedDetails = JSON.stringify(event.additionalModelResponseFields);
+	if (serializedDetails === undefined) {
+		return `Bedrock stream ended with stopReason: ${reason}`;
+	}
+	const details = serializedDetails.length > 1000 ? `${serializedDetails.slice(0, 1000)}...` : serializedDetails;
+	return `Bedrock stream ended with stopReason: ${reason}; additionalModelResponseFields: ${details}`;
 }
 
 function mapStopReason(reason: string | undefined): StopReason {

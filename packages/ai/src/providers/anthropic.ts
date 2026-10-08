@@ -2071,10 +2071,8 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			let disableStrictTools =
 				(providerSessionState?.strictToolsDisabled ?? false) || (model.compat?.disableStrictTools ?? false);
 			let strictFallbackErrorMessage: string | undefined;
-			let dropFastMode =
-				(providerSessionState?.fastModeDisabled ?? false) ||
-				(resolveServiceTier(options?.serviceTier, model.provider) === "priority" &&
-					hasAnthropicFastModeRestrictions(model.id));
+			const fastModeUnavailableForModel = hasAnthropicFastModeRestrictions(model.id);
+			let dropFastMode = providerSessionState?.fastModeDisabled ?? false;
 			let droppedForcedToolChoice = false;
 			// Exactly one corrective retry per request for the CPA alias-restore
 			// signature (issue #4338); recurrence terminalizes instead of resending.
@@ -2127,7 +2125,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				if (disableStrictTools) {
 					dropAnthropicStrictTools(nextParams);
 				}
-				if (dropFastMode) {
+				if (dropFastMode || fastModeUnavailableForModel) {
 					dropAnthropicFastMode(nextParams);
 				}
 				const replacementPayload = await options?.onPayload?.(
@@ -2968,6 +2966,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						!options?.fallbackManaged &&
 						!options?.disableProviderRetries &&
 						!dropFastMode &&
+						!fastModeUnavailableForModel &&
 						resolveServiceTier(options?.serviceTier, model.provider) === "priority" &&
 						firstTokenTime === undefined &&
 						isAnthropicFastModeUnsupportedError(streamFailure)
