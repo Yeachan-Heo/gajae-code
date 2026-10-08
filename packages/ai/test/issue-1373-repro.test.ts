@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { Effort } from "../src/model-thinking";
 import { getBundledModel } from "../src/models";
 import { streamBedrock } from "../src/providers/amazon-bedrock";
+import { streamSimple } from "../src/stream";
 import type { Context, Model, Tool } from "../src/types";
 
 const originalSkipAuth = process.env.AWS_BEDROCK_SKIP_AUTH;
@@ -82,6 +83,18 @@ function captureBedrockPayload(
 	void streamBedrock(model, context, {
 		signal: abortedSignal(),
 		...options,
+		onPayload: payload => {
+			resolve(payload as ThinkingPayload);
+			return undefined;
+		},
+	});
+	return promise;
+}
+
+function captureSimpleBedrockPayload(model: Model<"bedrock-converse-stream">): Promise<ThinkingPayload> {
+	const { promise, resolve } = Promise.withResolvers<ThinkingPayload>();
+	void streamSimple(model, baseContext, {
+		signal: abortedSignal(),
 		onPayload: payload => {
 			resolve(payload as ThinkingPayload);
 			return undefined;
@@ -173,6 +186,14 @@ describe("issue #1373: Bedrock Claude thinkingDisplay", () => {
 			reasoning: Effort.Max,
 			disableReasoning: true,
 		});
+
+		expect(payload.additionalModelRequestFields?.thinking).toEqual({ type: "disabled" });
+		expect(payload.additionalModelRequestFields?.output_config).toBeUndefined();
+	});
+
+	it("disables default-on Haiku thinking when no reasoning effort is requested", async () => {
+		const model = getBundledModel<"bedrock-converse-stream">("amazon-bedrock", "us.anthropic.claude-haiku-5-5");
+		const payload = await captureSimpleBedrockPayload(model);
 
 		expect(payload.additionalModelRequestFields?.thinking).toEqual({ type: "disabled" });
 		expect(payload.additionalModelRequestFields?.output_config).toBeUndefined();

@@ -1145,7 +1145,9 @@ function mapOptionsForApi<TApi extends Api>(
 			const bedrockBase: BedrockOptions = {
 				...base,
 				reasoning: options?.reasoning,
-				disableReasoning: options?.disableReasoning,
+				disableReasoning:
+					options?.disableReasoning === true ||
+					(model.thinking?.mode === "anthropic-adaptive" && options?.reasoning === undefined),
 				thinkingBudgets: options?.thinkingBudgets,
 				toolChoice: mapAnthropicToolChoice(options?.toolChoice),
 				thinkingDisplay: options?.hideThinkingSummary ? "omitted" : undefined,
