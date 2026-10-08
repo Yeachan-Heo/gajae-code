@@ -1280,7 +1280,7 @@ export function retainManagedDirectoryAuthority(
 	expected?: { dev: bigint; ino: bigint },
 ): RecoveryFsRoot | undefined {
 	assertManagedDirectoryRoot(root);
-	const resolved = canonicalizeManagedPath(directory);
+	const resolved = canonicalizeManagedPathWithinRoot(root.canonicalPath, directory);
 	const relative = managedRelativePath(root, resolved).join("/");
 	if (process.platform !== "linux") return undefined;
 	const named = fs.lstatSync(resolved, { bigint: true });
@@ -1365,30 +1365,61 @@ function ensureManagedRoot(root: ManagedDirectoryRoot): void {
 	assertManagedDirectoryRoot(root);
 }
 
-function canonicalizeManagedPath(pathname: string): string {
+/** Resolve aliases above a managed root without following descendant symlinks. */
+function canonicalizeManagedPathWithinRoot(rootPath: string, pathname: string): string {
+	const canonicalRootPath = path.resolve(rootPath);
+	const namedRoot = fs.lstatSync(canonicalRootPath);
+	if (!namedRoot.isDirectory() || namedRoot.isSymbolicLink())
+		throw new Error(`Managed root authority changed: ${canonicalRootPath}`);
 	const resolvedPath = path.resolve(pathname);
-	const missingSegments: string[] = [];
-	let currentPath = resolvedPath;
-	for (;;) {
-		try {
-			let canonicalPath = fs.realpathSync.native(currentPath);
-			for (let index = missingSegments.length - 1; index >= 0; index--) {
-				canonicalPath = path.join(canonicalPath, missingSegments[index]!);
+	const filesystemRoot = path.parse(resolvedPath).root;
+	const components = path.relative(filesystemRoot, resolvedPath).split(path.sep).filter(Boolean);
+	let currentPath = filesystemRoot;
+	let reachedManagedRoot = currentPath === canonicalRootPath;
+	if (reachedManagedRoot) currentPath = canonicalRootPath;
+
+	for (let index = 0; index < components.length; index++) {
+		const component = components[index]!;
+		const nextPath = path.join(currentPath, component);
+		if (!reachedManagedRoot) {
+			let canonicalPrefix: string;
+			try {
+				canonicalPrefix = fs.realpathSync.native(nextPath);
+			} catch (error) {
+				const code = (error as NodeJS.ErrnoException).code;
+				if (code === "ENOENT" || code === "ENOTDIR")
+					throw new Error(`Managed path escapes configured root: ${pathname}`, { cause: error });
+				throw error;
 			}
-			return canonicalPath;
+			if (canonicalPrefix === canonicalRootPath) {
+				reachedManagedRoot = true;
+				currentPath = canonicalRootPath;
+				continue;
+			}
+			currentPath = nextPath;
+			continue;
+		}
+
+		let named: fs.Stats;
+		try {
+			named = fs.lstatSync(nextPath);
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
-			if (code !== "ENOENT" && code !== "ENOTDIR") return resolvedPath;
-			const parentPath = path.dirname(currentPath);
-			if (parentPath === currentPath) return resolvedPath;
-			missingSegments.push(path.basename(currentPath));
-			currentPath = parentPath;
+			if (code === "ENOENT") return path.join(currentPath, ...components.slice(index));
+			throw error;
 		}
+		if (named.isSymbolicLink()) throw new Error(`Managed path contains symlink: ${nextPath}`);
+		if (index < components.length - 1 && !named.isDirectory())
+			throw new Error(`Managed path component is not a directory: ${nextPath}`);
+		currentPath = nextPath;
 	}
+
+	if (!reachedManagedRoot) throw new Error(`Managed path escapes configured root: ${pathname}`);
+	return currentPath;
 }
 
 function relativeWithinManagedRoot(rootPath: string, pathname: string): readonly string[] {
-	const canonicalPath = canonicalizeManagedPath(pathname);
+	const canonicalPath = canonicalizeManagedPathWithinRoot(rootPath, pathname);
 	const relative = path.relative(rootPath, canonicalPath);
 	if (process.platform === "win32") {
 		const canonicalRoot = path.win32.normalize(rootPath);
@@ -1571,9 +1602,10 @@ export class ManagedSessionDescendantStore {
 		if (access === "read-only" && retained) throw new Error("managed_read_store_cannot_borrow_authority");
 		if (access === "read-only" && !expectedSubtreeRoot)
 			throw new Error("managed_read_store_requires_existing_identity");
-		const canonicalBaseDir = canonicalizeManagedPath(baseDir);
+		assertManagedDirectoryRoot(root);
+		const canonicalBaseDir = canonicalizeManagedPathWithinRoot(root.canonicalPath, baseDir);
 		const canonicalAuthorityBaseDir = retained
-			? canonicalizeManagedPath(retained.authorityBaseDir)
+			? canonicalizeManagedPathWithinRoot(root.canonicalPath, retained.authorityBaseDir)
 			: canonicalBaseDir;
 		managedRelativePath(root, canonicalBaseDir);
 

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { closeModelCache } from "@gajae-code/ai/core";
@@ -105,28 +106,28 @@ describe("async job endpoint id derivation", () => {
 		expect(asyncJobEndpointId("provider", "logical-id", undefined)).toBe("logical-id");
 	});
 
-	it("keeps endpoint keys stable as a transcript is created and replaced", () => {
+	it("keeps endpoint keys stable as a transcript is created and replaced", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-endpoint-persist-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const sessionFile = path.join(tempDir, "session.jsonl");
 		const beforeCreate = asyncJobEndpointId("provider", "logical-id", sessionFile);
 
-		fs.writeFileSync(sessionFile, "first");
+		await Bun.write(sessionFile, "first");
 		expect(asyncJobEndpointId("provider", "logical-id", sessionFile)).toBe(beforeCreate);
 
 		fs.rmSync(sessionFile);
-		fs.writeFileSync(sessionFile, "replacement");
+		await Bun.write(sessionFile, "replacement");
 		expect(asyncJobEndpointId("provider", "logical-id", sessionFile)).toBe(beforeCreate);
 	});
 
-	it("collapses symlink and dot-segment transcript aliases onto one endpoint key", () => {
+	it("collapses symlink and dot-segment transcript aliases onto one endpoint key", async () => {
 		if (process.platform === "win32") return;
 		const tempDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), `pi-endpoint-alias-${Snowflake.next()}-`)));
 		tempDirs.push(tempDir);
 		const realDir = path.join(tempDir, "real");
 		fs.mkdirSync(realDir);
 		const realFile = path.join(realDir, "session.jsonl");
-		fs.writeFileSync(realFile, "");
+		await Bun.write(realFile, "");
 		fs.symlinkSync(realDir, path.join(tempDir, "alias-dir"), "dir");
 		fs.symlinkSync(realFile, path.join(tempDir, "alias-file.jsonl"));
 
@@ -158,23 +159,18 @@ describe("async job endpoint id derivation", () => {
 		);
 	});
 
-	it("keys Windows path aliases stably without merging case-sensitive files", () => {
+	it("keys Windows path aliases stably without merging case-sensitive files", async () => {
 		if (process.platform !== "win32") return;
 
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-endpoint-case-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const sessionFile1 = path.join(tempDir, "Session.jsonl");
 		const sessionFile2 = path.join(tempDir, "session.jsonl");
-		fs.writeFileSync(sessionFile1, "");
+		await Bun.write(sessionFile1, "first");
 		const endpoint1 = asyncJobEndpointId("provider", "logical-id", sessionFile1);
 
-		let distinctCaseSensitiveFiles = false;
-		try {
-			fs.writeFileSync(sessionFile2, "", { flag: "wx" });
-			distinctCaseSensitiveFiles = true;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-		}
+		await Bun.write(sessionFile2, "second");
+		const distinctCaseSensitiveFiles = (await Bun.file(sessionFile1).text()) === "first";
 
 		const endpoint2 = asyncJobEndpointId("provider", "logical-id", sessionFile2);
 
@@ -189,29 +185,34 @@ describe("task fork-context provider identity", () => {
 	const authStorages: AuthStorage[] = [];
 	const artifactStores: ManagedSessionDescendantStore[] = [];
 	const tempDirs: string[] = [];
-	function listTempTree(dir: string, prefix = ""): string[] {
-		return fs.readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
+	async function listTempTree(dir: string, prefix = ""): Promise<string[]> {
+		const entries = await fsPromises.readdir(dir, { withFileTypes: true });
+		const paths: string[] = [];
+		for (const entry of entries) {
 			const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
-			return entry.isDirectory() && !entry.isSymbolicLink()
-				? [`${relativePath}/`, ...listTempTree(path.join(dir, entry.name), relativePath)]
-				: [relativePath];
-		});
+			if (entry.isDirectory() && !entry.isSymbolicLink()) {
+				paths.push(`${relativePath}/`, ...(await listTempTree(path.join(dir, entry.name), relativePath)));
+			} else {
+				paths.push(relativePath);
+			}
+		}
+		return paths;
 	}
-	function removeTempTree(dir: string): void {
-		for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+	async function removeTempTree(dir: string): Promise<void> {
+		for (const entry of await fsPromises.readdir(dir, { withFileTypes: true })) {
 			const entryPath = path.join(dir, entry.name);
 			if (entry.isDirectory() && !entry.isSymbolicLink()) {
-				removeTempTree(entryPath);
+				await removeTempTree(entryPath);
 			} else {
 				try {
-					fs.rmSync(entryPath, { force: true });
+					await fsPromises.rm(entryPath, { force: true });
 				} catch (error) {
 					throw new Error(`Failed to remove entry ${entryPath}`, { cause: error });
 				}
 			}
 		}
 		try {
-			fs.rmdirSync(dir);
+			await fsPromises.rmdir(dir);
 		} catch (error) {
 			throw new Error(`Failed to remove directory ${dir}`, { cause: error });
 		}
@@ -227,11 +228,11 @@ describe("task fork-context provider identity", () => {
 			const modelCacheClosed = closeModelCache(path.join(tempDir, "models.db"));
 			if (!fs.existsSync(tempDir)) continue;
 			try {
-				removeTempTree(tempDir);
+				await removeTempTree(tempDir);
 			} catch (error) {
 				let remaining: string[];
 				try {
-					remaining = listTempTree(tempDir);
+					remaining = await listTempTree(tempDir);
 				} catch {
 					remaining = ["<unreadable>"];
 				}
@@ -259,6 +260,20 @@ describe("task fork-context provider identity", () => {
 		} finally {
 			store.close();
 		}
+	});
+
+	it("rejects a managed child replaced with a sibling-scope symlink", async () => {
+		const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), `pi-managed-child-symlink-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const root = managedDirectoryRoot(tempDir);
+		const siblingPath = path.join(root.canonicalPath, "sibling-scope");
+		const preparedPath = path.join(root.canonicalPath, "prepared-scope");
+		await fsPromises.mkdir(siblingPath, { mode: 0o700 });
+		await fsPromises.mkdir(preparedPath, { mode: 0o700 });
+		await fsPromises.rmdir(preparedPath);
+		await fsPromises.symlink(siblingPath, preparedPath, process.platform === "win32" ? "junction" : "dir");
+
+		expect(() => new ManagedSessionDescendantStore(root, preparedPath)).toThrow(/symlink/i);
 	});
 
 	it("canonicalizes a retained authority base before deriving a descendant path", () => {
