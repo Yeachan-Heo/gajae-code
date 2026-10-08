@@ -58,6 +58,7 @@ function makeToolSession(tempDir: string, settings: Settings): ToolSession {
 		getArtifactsDir: () => artifacts.dir,
 		getArtifactManager: () => artifacts,
 		allocateOutputArtifact: (toolType: string) => artifacts.allocatePath(toolType),
+		captureArtifactPublication: () => (content: string, toolType: string) => artifacts.save(content, toolType),
 	} as unknown as ToolSession;
 }
 

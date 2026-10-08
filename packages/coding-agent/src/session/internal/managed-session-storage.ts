@@ -2805,7 +2805,10 @@ export class ManagedSessionDescendantStore {
 				named.isSymbolicLink() ||
 				named.dev !== before.dev ||
 				named.ino !== before.ino ||
-				named.nlink !== before.nlink
+				named.nlink !== before.nlink ||
+				named.size !== before.size ||
+				named.mtimeNs !== before.mtimeNs ||
+				named.ctimeNs !== before.ctimeNs
 			)
 				throw new Error("source_changed");
 			const rootAfter = fs.lstatSync(this.#baseDir, { bigint: true });
@@ -2851,6 +2854,7 @@ export class ManagedSessionDescendantStore {
 			return {
 				readRange: (start, length) => {
 					if (closed) throw new Error("closed");
+					if (start + length > expectedDescriptor.size) throw new Error("range_not_present");
 					return this.readRangeExpectedSync(relativePath, start, length, expectedDescriptor).bytes;
 				},
 				close: () => {
@@ -2992,7 +2996,7 @@ export class ManagedSessionDescendantStore {
 	readExpectedBounded(
 		relativePath: string,
 		maxBytes: number,
-		admitSize?: (size: number) => void,
+		admitSize?: (size: number, descriptor: ManagedFileIdentity) => void,
 	): ManagedFileSnapshot | null {
 		if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new Error("invalid_capture_limit");
 		this.#assertBound();
@@ -3019,17 +3023,37 @@ export class ManagedSessionDescendantStore {
 		if (stat.nlink !== 1n) throw new Error("source_changed");
 		if (!Number.isSafeInteger(stat.size) || stat.size < 0) throw new Error("source_changed");
 		if (stat.size > maxBytes) throw new Error("artifact_capacity_exceeded");
-		admitSize?.(stat.size);
-		const bytes = Buffer.alloc(stat.size);
 		const lease = this.openReadLease(this.#relative(resolved), stat);
 		let failed = false;
 		let failure: unknown;
+		let snapshot: ManagedFileSnapshot | undefined;
 		try {
+			admitSize?.(stat.size, {
+				dev: stat.dev,
+				ino: stat.ino,
+				nlink: stat.nlink,
+				size: stat.size,
+				mtimeNs: stat.mtimeNs,
+				ctimeNs: stat.ctimeNs,
+			});
+			const bytes = Buffer.alloc(stat.size);
 			for (let offset = 0; offset < bytes.byteLength; ) {
 				const length = Math.min(1024 * 1024, bytes.byteLength - offset);
 				bytes.set(lease.readRange(offset, length), offset);
 				offset += length;
 			}
+			snapshot = {
+				bytes,
+				identity: {
+					dev: stat.dev,
+					ino: stat.ino,
+					nlink: stat.nlink,
+					size: stat.size,
+					mtimeNs: stat.mtimeNs,
+					ctimeNs: stat.ctimeNs,
+					sha256: createHash("sha256").update(bytes).digest("hex"),
+				},
+			};
 		} catch (error) {
 			failed = true;
 			failure = error;
@@ -3043,18 +3067,8 @@ export class ManagedSessionDescendantStore {
 			}
 		}
 		if (failed) throw failure;
-		return {
-			bytes,
-			identity: {
-				dev: stat.dev,
-				ino: stat.ino,
-				nlink: stat.nlink,
-				size: stat.size,
-				mtimeNs: stat.mtimeNs,
-				ctimeNs: stat.ctimeNs,
-				sha256: createHash("sha256").update(bytes).digest("hex"),
-			},
-		};
+		if (!snapshot) throw new Error("Managed descendant snapshot is unavailable");
+		return snapshot;
 	}
 
 	/** Remove an exact captured file without reopening its pathname as authority. */
@@ -3706,7 +3720,7 @@ export function captureManagedFilePrefixNoFollow(pathname: string, maxBytes: num
 export function captureManagedFileNoFollowBounded(
 	pathname: string,
 	maxBytes: number,
-	admitSize?: (size: number) => void,
+	admitSize?: (size: number, descriptor: ManagedFileIdentity) => void,
 ): ManagedFileSnapshot {
 	if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new Error("invalid_capture_limit");
 	return captureManagedFileNoFollowLimit(pathname, maxBytes, true, admitSize);
@@ -3721,9 +3735,12 @@ function captureManagedFileNoFollowLimit(
 	pathname: string,
 	maxBytes?: number,
 	rejectOversized = false,
-	admitSize?: (size: number) => void,
+	admitSize?: (size: number, descriptor: ManagedFileIdentity) => void,
 ): ManagedFileSnapshot {
 	const fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0));
+	let failed = false;
+	let failure: unknown;
+	let snapshot: ManagedFileSnapshot | undefined;
 	try {
 		const before = fs.fstatSync(fd, { bigint: true });
 		if (!before.isFile() || (rejectOversized ? before.nlink !== 1n : before.nlink > 1n))
@@ -3732,7 +3749,7 @@ function captureManagedFileNoFollowLimit(
 		if (!Number.isSafeInteger(fileSize) || fileSize < 0) throw new Error("source_changed");
 		if (rejectOversized && maxBytes !== undefined && fileSize > maxBytes)
 			throw new Error("artifact_capacity_exceeded");
-		admitSize?.(fileSize);
+		admitSize?.(fileSize, identity(before));
 		const captureSize = maxBytes === undefined ? fileSize : Math.min(fileSize, maxBytes);
 		const bytes = Buffer.alloc(captureSize);
 		let offset = 0;
@@ -3746,10 +3763,22 @@ function captureManagedFileNoFollowLimit(
 		const named = fs.lstatSync(pathname, { bigint: true });
 		if (!named.isFile() || named.isSymbolicLink() || !sameIdentity(identity(before), identity(named)))
 			throw new Error("source_changed");
-		return { bytes, identity: identity(before, createHash("sha256").update(bytes).digest("hex")) };
-	} finally {
-		fs.closeSync(fd);
+		snapshot = { bytes, identity: identity(before, createHash("sha256").update(bytes).digest("hex")) };
+	} catch (error) {
+		failed = true;
+		failure = error;
 	}
+	try {
+		fs.closeSync(fd);
+	} catch (error) {
+		if (!failed) {
+			failed = true;
+			failure = error;
+		}
+	}
+	if (failed) throw failure;
+	if (!snapshot) throw new Error("Managed file capture is unavailable");
+	return snapshot;
 }
 
 /** Streams a managed file once while retaining only a bounded header prefix and the full descriptor-bound digest. */

@@ -2116,12 +2116,7 @@ function createQuerySurface(
 	};
 	const getProfileCredentialSessionId = () => ctx.credentialSessionId ?? id;
 	const profileSettings = (options.settings ?? ctx.settings) as Pick<Settings, "get"> | undefined;
-	const getProfileAvailableModels = (): Model<Api>[] => {
-		const getAvailableForProfileActivation = ctx.modelRegistry.getAvailableForProfileActivation;
-		return typeof getAvailableForProfileActivation === "function"
-			? getAvailableForProfileActivation.call(ctx.modelRegistry)
-			: ctx.modelRegistry.getAvailable();
-	};
+	const getProfileAvailableModels = (): Model<Api>[] => ctx.modelRegistry.getAvailable();
 	const resolveProfileAvailability = async (
 		profile: ModelProfileDefinition,
 		authenticatedProviders: ReadonlySet<string>,

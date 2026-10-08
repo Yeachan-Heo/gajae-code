@@ -1223,7 +1223,7 @@ describe("ModelRegistry", () => {
 			expect(registry.getAvailable()).not.toBe(initial);
 		});
 
-		test("uses successful LiteLLM discovery as authoritative for available models", async () => {
+		test("adds successful LiteLLM discovery to the available models without dropping bundled ids", async () => {
 			const liveIds = ["openai/gpt-5.4", "proxy-only-model"];
 			const bundledIds = getBundledModels("litellm").map(model => model.id);
 			expect(bundledIds).toContain("openai/gpt-5.4");
@@ -1246,7 +1246,7 @@ describe("ModelRegistry", () => {
 					.filter(model => model.provider === "litellm")
 					.map(model => model.id)
 					.sort();
-				expect(availableIds).toEqual([...liveIds].sort());
+				expect(availableIds).toEqual([...new Set([...bundledIds, ...liveIds])].sort());
 			} finally {
 				await registry.dispose();
 			}
@@ -7170,7 +7170,8 @@ describe("ModelRegistry", () => {
 			});
 			const hasAvailableOpenAiModel = () =>
 				registry.getAvailable().some(model => model.provider === provider && model.id === bundledModel.id);
-			expect(hasAvailableOpenAiModel()).toBe(false);
+			// Empty discovery no longer deletes bundled entries from the catalog.
+			expect(hasAvailableOpenAiModel()).toBe(true);
 
 			let modelsListRequests = 0;
 			using _hook = hookFetch(() => {
@@ -7186,7 +7187,7 @@ describe("ModelRegistry", () => {
 				models: [],
 				fetchedAt: expect.any(Number),
 			});
-			expect(hasAvailableOpenAiModel()).toBe(false);
+			expect(hasAvailableOpenAiModel()).toBe(true);
 			await registry.dispose();
 		});
 
