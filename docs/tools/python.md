@@ -42,6 +42,8 @@ The kernel owner id is `python:<session-id>`, deliberately distinct from the `ev
 
 An invocation captures its cwd, session file, session id, and settings before preflight and remains tracked through its transcript append. Clearing detaches the captured generation and joins its pending operations and kernel shutdown. Its session cleanup callback remains registered until cleanup succeeds, so session teardown also joins an older generation still clearing while a successor is active.
 
+The original invocation is enrolled in that generation before the external execution-tracking callback runs. Reentrant clear or registered cleanup therefore joins the invocation's transcript and result finalization, rather than observing an empty pending set. This enrollment does not depend on a replacement promise returned by the tracking callback.
+
 Owner ids remain string labels, not private identity authority. A later cleanup using the same label can still select a successor kernel; this lifecycle improvement does not fix that legacy ABA boundary. Captured invocation metadata grants no transcript or audit filesystem append authority.
 
 The session's kernel is disposed on:
