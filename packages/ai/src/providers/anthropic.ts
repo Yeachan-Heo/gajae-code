@@ -32,6 +32,7 @@ import {
 } from "../adapter-internals/provider-safety-stop";
 import {
 	getMiniMaxThinkingMode,
+	hasAnthropicFastModeRestrictions,
 	hasAnthropicSamplingParameterRestrictions,
 	mapEffortToAnthropicAdaptiveEffort,
 	supportsAnthropicAdaptiveThinkingDisplay as supportsAdaptiveThinkingDisplay,
@@ -2031,7 +2032,11 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 
 				const extraBetas = normalizeExtraBetas(options?.betas);
 				const wantsAnthropicPriority = resolveServiceTier(options?.serviceTier, model.provider) === "priority";
-				if (wantsAnthropicPriority && !extraBetas.includes(fastModeBeta)) {
+				if (
+					wantsAnthropicPriority &&
+					!hasAnthropicFastModeRestrictions(model.id) &&
+					!extraBetas.includes(fastModeBeta)
+				) {
 					extraBetas.push(fastModeBeta);
 				}
 
@@ -2065,7 +2070,10 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			let disableStrictTools =
 				(providerSessionState?.strictToolsDisabled ?? false) || (model.compat?.disableStrictTools ?? false);
 			let strictFallbackErrorMessage: string | undefined;
-			let dropFastMode = providerSessionState?.fastModeDisabled ?? false;
+			let dropFastMode =
+				(providerSessionState?.fastModeDisabled ?? false) ||
+				(resolveServiceTier(options?.serviceTier, model.provider) === "priority" &&
+					hasAnthropicFastModeRestrictions(model.id));
 			let droppedForcedToolChoice = false;
 			// Exactly one corrective retry per request for the CPA alias-restore
 			// signature (issue #4338); recurrence terminalizes instead of resending.

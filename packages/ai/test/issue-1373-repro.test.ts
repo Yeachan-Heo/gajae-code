@@ -199,6 +199,12 @@ describe("issue #1373: Bedrock Claude thinkingDisplay", () => {
 		expect(payload.additionalModelRequestFields?.output_config).toBeUndefined();
 	});
 
+	it("leaves always-on Opus 5.5 at the provider default when effort is omitted", async () => {
+		const payload = await captureSimpleBedrockPayload(adaptiveModel("us.anthropic.claude-opus-5-5"));
+
+		expect(payload.additionalModelRequestFields).toBeUndefined();
+	});
+
 	it("disables Haiku 5.5 adaptive thinking for forced tool choice", async () => {
 		const bundledModel = getBundledModel<"bedrock-converse-stream">(
 			"amazon-bedrock",

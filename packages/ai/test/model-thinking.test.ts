@@ -6,6 +6,7 @@ import {
 	Effort,
 	enrichModelThinking,
 	getSupportedEfforts,
+	hasAnthropicFastModeRestrictions,
 	hasAnthropicSamplingParameterRestrictions,
 	linkOpenAIPromotionTargets,
 	mapEffortToAnthropicAdaptiveEffort,
@@ -86,6 +87,9 @@ describe("model thinking metadata", () => {
 		expect(hasAnthropicSamplingParameterRestrictions("claude-haiku-5-5")).toBe(true);
 		expect(hasAnthropicSamplingParameterRestrictions("anthropic.claude-haiku-5-5")).toBe(true);
 		expect(hasAnthropicSamplingParameterRestrictions("claude-haiku-4-5")).toBe(false);
+		expect(hasAnthropicFastModeRestrictions("claude-haiku-5-5")).toBe(true);
+		expect(hasAnthropicFastModeRestrictions("us.anthropic.claude-haiku-5-5")).toBe(true);
+		expect(hasAnthropicFastModeRestrictions("claude-opus-5-5")).toBe(false);
 	});
 
 	it("recognizes Haiku 5.5 adaptive display and disable support across Bedrock profiles", () => {
@@ -95,6 +99,11 @@ describe("model thinking metadata", () => {
 		expect(supportsAnthropicAdaptiveThinkingDisable("claude-haiku-5-5")).toBe(true);
 		expect(supportsAnthropicAdaptiveThinkingDisable("global.anthropic.claude-haiku-5-5")).toBe(true);
 		expect(supportsAnthropicAdaptiveThinkingDisable("claude-opus-4-7")).toBe(true);
+		expect(supportsAnthropicAdaptiveThinkingDisable("claude-opus-4-8")).toBe(true);
+		expect(supportsAnthropicAdaptiveThinkingDisable("claude-opus-5")).toBe(true);
+		expect(supportsAnthropicAdaptiveThinkingDisable("claude-sonnet-5")).toBe(true);
+		expect(supportsAnthropicAdaptiveThinkingDisable("claude-opus-5-5")).toBe(false);
+		expect(supportsAnthropicAdaptiveThinkingDisable("claude-sonnet-5-5")).toBe(false);
 		expect(supportsAnthropicAdaptiveThinkingDisable("claude-fable-5")).toBe(false);
 	});
 

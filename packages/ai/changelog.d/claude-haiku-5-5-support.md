@@ -10,4 +10,5 @@
 
 - Update Claude Sonnet 5.5 cache read price from $0.20/MTok to $0.10/MTok across all providers (anthropic, amazon-bedrock, and regional variants) per Anthropic's price halving
 - Align Bedrock Converse with Haiku 5.5 adaptive effort support, omit rejected sampling parameters, and exclude its Mantle-only bare model ID
+- Omit Anthropic fast-mode fields for Haiku 5.5, which is not a supported fast-mode model
 - Price Anthropic 5-minute and 1-hour cache writes from reported TTL usage, including Haiku 5.5's 5x long-context rates

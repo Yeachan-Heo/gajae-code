@@ -5,6 +5,7 @@ import {
 	streamAnthropic,
 } from "@gajae-code/ai/providers/anthropic";
 import type { Context, Model, ProviderSessionState, ServiceTier } from "@gajae-code/ai/types";
+import { hookFetch } from "@gajae-code/utils";
 
 function makeAnthropicModel(id: string): Model<"anthropic-messages"> {
 	return {
@@ -50,6 +51,53 @@ function capturePayload(model: Model<"anthropic-messages">, opts: CaptureOptions
 	return promise;
 }
 
+async function capturePayloadAndHeaders(
+	model: Model<"anthropic-messages">,
+	opts: CaptureOptions,
+): Promise<{ payload: unknown; headers: Headers | undefined }> {
+	let payload: unknown;
+	let headers: Headers | undefined;
+	using _hook = hookFetch(async (_input, init) => {
+		headers = new Headers(init?.headers);
+		const events = [
+			{
+				type: "message_start",
+				message: {
+					id: "msg_fast_mode_test",
+					type: "message",
+					role: "assistant",
+					model: model.id,
+					content: [],
+					stop_reason: null,
+					stop_sequence: null,
+					usage: { input_tokens: 1, output_tokens: 0 },
+				},
+			},
+			{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+			{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } },
+			{ type: "content_block_stop", index: 0 },
+			{
+				type: "message_delta",
+				delta: { stop_reason: "end_turn", stop_sequence: null },
+				usage: { output_tokens: 1 },
+			},
+			{ type: "message_stop" },
+		];
+		const body = events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
+		return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+	});
+	await streamAnthropic(model, CONTEXT, {
+		apiKey: "sk-ant-oat-test",
+		isOAuth: true,
+		serviceTier: opts.serviceTier,
+		providerSessionState: opts.providerSessionState,
+		onPayload: requestPayload => {
+			payload = requestPayload;
+		},
+	}).result();
+	return { payload, headers };
+}
+
 describe("Anthropic priority service tier → speed='fast'", () => {
 	it("sets speed='fast' for Claude Opus 4.7 when serviceTier='priority'", async () => {
 		const payload = (await capturePayload(makeAnthropicModel("claude-opus-4-7"), {
@@ -65,10 +113,19 @@ describe("Anthropic priority service tier → speed='fast'", () => {
 		expect(payload.speed).toBe("fast");
 	});
 
-	it("forwards speed='fast' for any model — server decides what's supported", async () => {
-		// Not gated client-side so future model additions (Opus 4.8, Sonnet 4.x, etc.)
-		// don't need an SDK release. Server returns invalid_request_error naming the
-		// model when unsupported.
+	it("omits fast mode for Haiku 5.5 before provider retries are needed", async () => {
+		for (const serviceTier of ["priority", "claude-only"] as const) {
+			const { payload, headers } = await capturePayloadAndHeaders(makeAnthropicModel("claude-haiku-5-5"), {
+				serviceTier,
+			});
+			expect((payload as { speed?: string }).speed).toBeUndefined();
+			expect(headers?.get("anthropic-beta") ?? "").not.toContain("fast-mode-2026-02-01");
+		}
+	});
+
+	it("keeps server-side fast-mode fallback for unclassified models", async () => {
+		// Unknown model ids remain server-validated so future models do not need an
+		// SDK release merely to attempt fast mode.
 		const payload = (await capturePayload(makeAnthropicModel("claude-opus-4-5"), {
 			serviceTier: "priority",
 		})) as { speed?: string };

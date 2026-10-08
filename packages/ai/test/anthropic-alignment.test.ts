@@ -1238,6 +1238,28 @@ describe("Anthropic request fingerprint alignment", () => {
 		expect(payload.output_config).toBeUndefined();
 	});
 
+	it("does not disable always-on Opus 5.5 thinking", async () => {
+		const payload = (await captureAnthropicPayload(
+			{
+				...ANTHROPIC_MODEL,
+				id: "claude-opus-5-5",
+				name: "Claude Opus 5.5",
+				thinking: {
+					mode: "anthropic-adaptive",
+					minLevel: Effort.Low,
+					maxLevel: Effort.Max,
+				},
+			},
+			{
+				systemPrompt: ["Stay concise."],
+				messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+			},
+			{ thinkingEnabled: false },
+		)) as { thinking?: { type?: string } };
+
+		expect(payload.thinking).toBeUndefined();
+	});
+
 	it("drops sampling params and requests summarized adaptive thinking for Opus 4.7", async () => {
 		const payload = (await captureAnthropicPayload(
 			{

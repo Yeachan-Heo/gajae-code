@@ -533,6 +533,15 @@ export function hasAnthropicSamplingParameterRestrictions(modelId: string): bool
 }
 
 /**
+ * True for known Anthropic models that must not receive `speed: "fast"`.
+ * Unknown generations retain the provider's server-validation fallback.
+ * https://platform.claude.com/docs/en/build-with-claude/fast-mode#supported-models
+ */
+export function hasAnthropicFastModeRestrictions(modelId: string): boolean {
+	return isAnthropicHaiku55Model(modelId);
+}
+
+/**
  * Adaptive thinking `display` is supported by Anthropic Opus 4.7+, Haiku 5.5,
  * and Fable 5+. Older adaptive-thinking models (Opus 4.6, Sonnet 4.6+) reject the field.
  * Fable (5+) postdates Opus 4.7, accepts `display`, and defaults it to
@@ -552,12 +561,22 @@ export function supportsAnthropicAdaptiveThinkingDisplay(modelId: string): boole
 }
 
 /**
- * Returns whether an adaptive-thinking model accepts an explicit disabled
- * thinking mode. Haiku 5.5 and Opus 4.7+ support this field; Fable's adaptive
- * thinking cannot be disabled.
+ * Returns whether an adaptive-thinking generation accepts an explicit disabled
+ * mode. Keep this allowlist aligned with Anthropic's per-model matrix: Opus 4.7,
+ * Opus 4.8, Opus 5, Sonnet 5, and Haiku 5.5 accept it; always-on generations
+ * such as Fable and Opus 5.5 reject it. Sonnet 5.5 uses `between_tools` instead.
+ * https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting
  */
 export function supportsAnthropicAdaptiveThinkingDisable(modelId: string): boolean {
-	return hasOpus47ApiRestrictions(modelId) || isAnthropicHaiku55Model(modelId);
+	if (isAnthropicHaiku55Model(modelId)) return true;
+	const parsed = parseAnthropicModel(getCanonicalModelId(modelId));
+	if (!parsed) return false;
+	if (parsed.kind === "opus") {
+		return (
+			semverEqual(parsed.version, "4.7") || semverEqual(parsed.version, "4.8") || semverEqual(parsed.version, "5.0")
+		);
+	}
+	return parsed.kind === "sonnet" && semverEqual(parsed.version, "5.0");
 }
 
 function isAnthropicHaiku55Model(modelId: string): boolean {
