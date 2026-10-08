@@ -724,12 +724,31 @@ function isFileLockOrphanTransition(value: FileLockAcquisitionResult): value is 
 	return value !== null && "kind" in value && value.kind === "orphan_transition";
 }
 
-/** Without an owner, only an aged, completely empty directory is reclaimable. */
+/** Without an owner, an aged empty directory or scrubbed (info-only) removal is reclaimable. */
 function isEmptyRemovalTransition(snapshot: NativeDirectoryTreeSnapshot, graceMs: number): boolean {
 	const root = snapshot.entries[0];
 	if (snapshot.entries.length !== 1 || root?.relativePath !== "" || root.kind !== "directory") return false;
 	const ageMs = Date.now() - Number(root.mtimeNs) / 1_000_000;
 	return Number.isFinite(ageMs) && ageMs >= graceMs;
+}
+
+/** A scrubbed removal transition may retain only an aged info file. */
+function isScrubbedRemovalTransition(snapshot: NativeDirectoryTreeSnapshot, graceMs: number): boolean {
+	const root = snapshot.entries[0];
+	if (root?.relativePath !== "" || root?.kind !== "directory") return false;
+	if (snapshot.entries.length === 1) {
+		// Completely empty directory is OK.
+		const ageMs = Date.now() - Number(root.mtimeNs) / 1_000_000;
+		return Number.isFinite(ageMs) && ageMs >= graceMs;
+	}
+	if (snapshot.entries.length !== 2) return false;
+	// Only the "info" file is allowed alongside the root.
+	const info = snapshot.entries[1];
+	if (info?.relativePath !== "info" || info.kind !== "file") return false;
+	// The info file must be aged. After exactRemoveDirectoryTree detaches payload on POSIX,
+	// the directory mtime may be recent while the info metadata remains old.
+	const infoAgeMs = Date.now() - Number(info.mtimeNs) / 1_000_000;
+	return Number.isFinite(infoAgeMs) && infoAgeMs >= graceMs;
 }
 
 async function removeRemovalRecord(recordPath: string, expectedBytes: string): Promise<boolean> {
@@ -856,7 +875,7 @@ async function adoptOrphanedFileLockRemovalTransition(
 	const captured = snapshotDirectoryTree(transitionPath);
 	if (!captured.ok || !captured.snapshot) return false;
 	const snapshot = captured.snapshot;
-	if (!recordedOwner && !isEmptyRemovalTransition(snapshot, orphanAgeMs)) return false;
+	if (!recordedOwner && !isScrubbedRemovalTransition(snapshot, orphanAgeMs)) return false;
 	if (recordedOwner && (snapshot.rootDev !== recordedOwner.rootDev || snapshot.rootIno !== recordedOwner.rootIno))
 		return false;
 	// Claim an ownerless generation without replacing any live publisher's record.
