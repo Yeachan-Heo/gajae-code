@@ -63,14 +63,20 @@ describe("prepareSvg", () => {
 
 	it("resolves theme tokens, falling back to the given default and then to fg", () => {
 		const svg = prepareSvg(
-			'<svg xmlns="http://www.w3.org/2000/svg" color="red" font-family="serif"><style>.a{fill:var(--accent)}</style>' +
-				'<rect stroke="var( --accent , #000)" fill="var(--nope, rgb(1, 2, 3))"/><text fill="var(--missing)"/></svg>',
+			'<svg xmlns="http://www.w3.org/2000/svg" color="red" font-family="serif"><style>.a{fill:var(--gjc-accent)}</style>' +
+				'<rect stroke="var( --gjc-accent , #000)" fill="var(--gjc-nope, rgb(1, 2, 3))"/><text fill="var(--gjc-missing)"/></svg>',
 			palette,
 		);
 		expect(svg).toBe(
 			'<svg xmlns="http://www.w3.org/2000/svg" color="red" font-family="serif"><style>.a{fill:#ff8800}</style>' +
 				'<rect stroke="#ff8800" fill="rgb(1, 2, 3)"/><text fill="#eeeeee"/></svg>',
 		);
+	});
+
+	it("resolves theme tokens nested in custom-property fallbacks", () => {
+		const prepared = prepareSvg('<svg><rect fill="var(--missing, var(--gjc-accent))"/></svg>', palette);
+
+		expect(prepared).toContain('fill="var(--missing, #ff8800)"');
 	});
 
 	it("gives a bare root the theme text color, a sans-serif font, and the namespaces the source needs", () => {
@@ -96,35 +102,36 @@ describe("prepareSvg", () => {
 
 	it("resolves CSS variables without rewriting SVG text, comments, or unrelated attributes", () => {
 		const svg =
-			'<svg><style>.a{fill:var(--accent);content:"var(--accent)";/*var(--accent)*/}</style>' +
-			"<text>Use var(--accent) here</text><!-- var(--accent) -->" +
-			'<rect fill="var(--accent)" style="stroke:var(--accent)" data-label="var(--accent)"/></svg>';
+			'<svg><style>.a{fill:var(--gjc-accent);content:"var(--gjc-accent)";/*var(--gjc-accent)*/}</style>' +
+			"<text>Use var(--gjc-accent) here</text><!-- var(--gjc-accent) -->" +
+			'<rect fill="var(--gjc-accent)" style="stroke:var(--gjc-accent)" data-label="var(--gjc-accent)"/></svg>';
 		const prepared = prepareSvg(svg, palette);
 
-		expect(prepared).toContain('<style>.a{fill:#ff8800;content:"var(--accent)";/*var(--accent)*/}</style>');
-		expect(prepared).toContain("<text>Use var(--accent) here</text>");
-		expect(prepared).toContain("<!-- var(--accent) -->");
-		expect(prepared).toContain('fill="#ff8800" style="stroke:#ff8800" data-label="var(--accent)"');
+		expect(prepared).toContain('<style>.a{fill:#ff8800;content:"var(--gjc-accent)";/*var(--gjc-accent)*/}</style>');
+		expect(prepared).toContain("<text>Use var(--gjc-accent) here</text>");
+		expect(prepared).toContain("<!-- var(--gjc-accent) -->");
+		expect(prepared).toContain('fill="#ff8800" style="stroke:#ff8800" data-label="var(--gjc-accent)"');
 	});
 
-	it("preserves locally declared CSS variables while resolving theme tokens", () => {
+	it("preserves author-defined variables without colliding with reserved theme tokens", () => {
 		const svg =
-			"<svg><style>:root{--shape:#f00}.a{fill:var(--shape);stroke:var(--accent)}</style>" +
-			'<rect class="a" style="--inline:#0f0;fill:var(--inline)"/></svg>';
+			"<svg><style>:root{--shape:#f00}.special{--accent:#0f0;fill:var(--shape);stroke:var(--gjc-accent)}</style>" +
+			'<rect class="special" style="--inline:#0f0;fill:var(--inline)"/><rect fill="var(--gjc-accent)"/></svg>';
 		const prepared = prepareSvg(svg, palette);
 
 		expect(prepared).toContain("--shape:#f00");
 		expect(prepared).toContain("fill:var(--shape);stroke:#ff8800");
 		expect(prepared).toContain('style="--inline:#0f0;fill:var(--inline)"');
+		expect(prepared).toContain('<rect fill="#ff8800"/>');
 	});
 
 	it("does not treat a self-closing style element as the start of a stylesheet", () => {
 		const prepared = prepareSvg(
-			'<svg><style/><text>Use var(--accent)</text><rect fill="var(--accent)"/></svg>',
+			'<svg><style/><text>Use var(--gjc-accent)</text><rect fill="var(--gjc-accent)"/></svg>',
 			palette,
 		);
 
-		expect(prepared).toContain("<text>Use var(--accent)</text>");
+		expect(prepared).toContain("<text>Use var(--gjc-accent)</text>");
 		expect(prepared).toContain('<rect fill="#ff8800"/>');
 	});
 });
