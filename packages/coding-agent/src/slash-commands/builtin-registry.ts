@@ -1050,7 +1050,6 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 						runtime,
 					);
 				}
-				if (targetIds.some(targetId => targetId !== "default")) runtime.session.markUserModelSelection();
 				// Preset shortcut: when the selector names a known model profile
 				// (optionally `gajae-code/`-prefixed) and the target is implicit,
 				// activate the profile immediately instead of treating the preset name
@@ -1113,6 +1112,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 							throw new Error(`No API key for ${selection.model.provider}/${selection.model.id}`);
 						}
 					}
+					if (includesRoleAgent && !includesDefault) runtime.session.markUserModelSelection();
 
 					const overrides = runtime.settings.get("task.agentModelOverrides");
 					const assignments = new Map<GjcModelAssignmentTargetId, string>();
