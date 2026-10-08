@@ -94,6 +94,18 @@ describe("issue #1373: Bedrock Claude thinkingDisplay", () => {
 		expect(payload.additionalModelRequestFields?.output_config).toEqual({ effort: "xhigh" });
 		expect(payload.inferenceConfig?.temperature).toBeUndefined();
 		expect(payload.inferenceConfig?.topP).toBeUndefined();
+		const serializedPayload = JSON.stringify(payload);
+		expect(serializedPayload).not.toContain('"temperature"');
+		expect(serializedPayload).not.toContain('"topP"');
+	});
+
+	it("keeps sampling fields for Bedrock models without those restrictions", async () => {
+		const payload = await captureBedrockPayload(budgetModel("us.anthropic.claude-haiku-4-5-20251001-v1:0"), {
+			temperature: 0.2,
+			topP: 0.3,
+		});
+		expect(payload.inferenceConfig?.temperature).toBe(0.2);
+		expect(payload.inferenceConfig?.topP).toBe(0.3);
 	});
 
 	it("defaults adaptive thinking to display=summarized on Opus 4.7+", async () => {
