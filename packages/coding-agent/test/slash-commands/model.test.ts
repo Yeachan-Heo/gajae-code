@@ -11,7 +11,6 @@ function createRuntime() {
 	const availableModel = { provider: "anthropic", id: "claude-3-5-sonnet", contextWindow: 200_000 };
 	const session = {
 		sessionId: "session-1",
-		markUserModelSelection() {},
 		model: undefined as { provider: string; id: string; contextWindow?: number } | undefined,
 		thinkingLevel: undefined as string | undefined,
 		modelRegistry: {
