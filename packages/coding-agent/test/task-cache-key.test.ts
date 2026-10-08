@@ -189,7 +189,7 @@ describe("task fork-context provider identity", () => {
 		return fs.readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
 			const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
 			return entry.isDirectory() && !entry.isSymbolicLink()
-				? listTempTree(path.join(dir, entry.name), relativePath)
+				? [`${relativePath}/`, ...listTempTree(path.join(dir, entry.name), relativePath)]
 				: [relativePath];
 		});
 	}
@@ -212,7 +212,7 @@ describe("task fork-context provider identity", () => {
 					remaining = ["<unreadable>"];
 				}
 				throw new Error(
-					`Failed to remove ${tempDir}; modelCacheClosed=${modelCacheClosed}; remaining=${JSON.stringify(remaining)}`,
+					`Failed to remove ${tempDir}; cwd=${process.cwd()}; modelCacheClosed=${modelCacheClosed}; remaining=${JSON.stringify(remaining)}`,
 					{ cause: error },
 				);
 			}
