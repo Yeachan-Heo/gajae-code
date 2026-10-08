@@ -54,6 +54,7 @@ describe("closePartialSvg", () => {
 		expect(closePartialSvg('<svg><g><text x="1">Hel')).toBe('<svg><g><text x="1">Hel</text></g></svg>');
 		// A `>` inside a quoted attribute value does not end the tag.
 		expect(closePartialSvg('<svg><g><path d="M0 0" data-x="a>b')).toBe("<svg><g></g></svg>");
+		expect(closePartialSvg('<svg><rect width="1" />')).toBe('<svg><rect width="1" /></svg>');
 		expect(closePartialSvg("<svg><g></g><!-- note")).toBe("<svg><g></g></svg>");
 		expect(closePartialSvg("<svg><style><![CDATA[ rect { fill")).toBe("<svg><style></style></svg>");
 		expect(closePartialSvg("<svg><text>a &amp; b &am")).toBe("<svg><text>a &amp; b </text></svg>");
@@ -85,6 +86,10 @@ describe("prepareSvg", () => {
 
 		expect(prepared).toContain('fill="var(--missing, #ff8800)"');
 		expect(prepared).toContain('stroke="#f00"');
+
+		let deepFallback = "var(--gjc-accent)";
+		for (let index = 19; index >= 0; index--) deepFallback = `var(--gjc-missing-${index}, ${deepFallback})`;
+		expect(prepareSvg(`<svg><rect fill="${deepFallback}"/></svg>`, palette)).toContain('<rect fill="#ff8800"/>');
 	});
 
 	it("gives a bare root the theme text color, a sans-serif font, and the namespaces the source needs", () => {

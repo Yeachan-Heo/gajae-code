@@ -139,9 +139,10 @@ export function closePartialSvg(source: string): string | null {
 			const at = open.lastIndexOf(name);
 			if (at >= 0) open.length = at;
 		} else if (source[lt + 1] !== "!" && source[lt + 1] !== "?") {
-			const name = /^<([^\s/>]+)/.exec(source.slice(lt, close))?.[1];
+			const tag = source.slice(lt, close);
+			const name = /^<([^\s/>]+)/.exec(tag)?.[1];
 			if (name !== undefined) {
-				if (source[close - 2] !== "/") open.push(name);
+				if (!isSelfClosingSvgTag(tag)) open.push(name);
 				if (!rootSeen && (name === "svg" || name.endsWith(":svg"))) rootSeen = true;
 			}
 		}
@@ -345,54 +346,76 @@ function forEachSvgAttribute(tag: string, visit: SvgAttributeVisitor): void {
 }
 
 /** Resolve variable functions outside CSS comments and quoted string literals. */
-function resolveCssValue(source: string, palette: Readonly<Record<string, string>>, fg: string, depth = 0): string {
-	if (depth >= 16) return source;
-	let output = "";
-	let cursor = 0;
-	let index = 0;
-	while (index < source.length) {
-		if (source.startsWith("/*", index)) {
-			const end = source.indexOf("*/", index + 2);
-			index = end < 0 ? source.length : end + 2;
+function resolveCssValue(source: string, palette: Readonly<Record<string, string>>, fg: string): string {
+	const frames: CssResolutionFrame[] = [{ source, cursor: 0, index: 0, output: "", prefix: "", suffix: "" }];
+	while (frames.length > 0) {
+		const frame = frames[frames.length - 1]!;
+		if (frame.index >= frame.source.length) {
+			const resolved = frame.output + frame.source.slice(frame.cursor);
+			frames.pop();
+			if (frames.length === 0) return resolved;
+			const parent = frames[frames.length - 1]!;
+			parent.output += frame.prefix + resolved + frame.suffix;
 			continue;
 		}
-		const char = source[index];
+		if (frame.source.startsWith("/*", frame.index)) {
+			const end = frame.source.indexOf("*/", frame.index + 2);
+			frame.index = end < 0 ? frame.source.length : end + 2;
+			continue;
+		}
+		const char = frame.source[frame.index];
 		if (char === '"' || char === "'") {
 			const quote = char;
-			index++;
-			while (index < source.length) {
-				if (source[index] === "\\") index += 2;
-				else if (source[index++] === quote) break;
+			frame.index++;
+			while (frame.index < frame.source.length) {
+				if (frame.source[frame.index] === "\\") frame.index += 2;
+				else if (frame.source[frame.index++] === quote) break;
 			}
 			continue;
 		}
-		if (source.slice(index, index + 4).toLowerCase() === "var(") {
-			const reference = readCssVariableReference(source, index);
+		if (frame.source.slice(frame.index, frame.index + 4).toLowerCase() === "var(") {
+			const reference = readCssVariableReference(frame.source, frame.index);
 			if (reference) {
+				const fallback = reference.fallback;
 				if (reference.name.startsWith("gjc-")) {
-					output += source.slice(cursor, index);
+					frame.output += frame.source.slice(frame.cursor, frame.index);
 					const themeColor = palette[reference.name.slice("gjc-".length)];
-					const fallback = reference.fallback?.trim();
-					output += themeColor ?? (fallback ? resolveCssValue(fallback, palette, fg, depth + 1) : fg);
-					cursor = reference.end;
-				} else if (reference.fallback !== undefined) {
-					const resolvedFallback = resolveCssValue(reference.fallback, palette, fg, depth + 1);
-					if (resolvedFallback !== reference.fallback) {
-						output += source.slice(cursor, index);
-						output +=
-							source.slice(index, reference.fallbackStart) +
-							resolvedFallback +
-							source.slice(reference.fallbackEnd, reference.end);
-						cursor = reference.end;
+					if (themeColor !== undefined) {
+						frame.output += themeColor;
+					} else if (fallback?.trim()) {
+						frames.push({ source: fallback.trim(), cursor: 0, index: 0, output: "", prefix: "", suffix: "" });
+					} else {
+						frame.output += fg;
 					}
+					frame.cursor = reference.end;
+				} else if (fallback !== undefined) {
+					frame.output += frame.source.slice(frame.cursor, frame.index);
+					frames.push({
+						source: fallback,
+						cursor: 0,
+						index: 0,
+						output: "",
+						prefix: frame.source.slice(frame.index, reference.fallbackStart),
+						suffix: frame.source.slice(reference.fallbackEnd, reference.end),
+					});
+					frame.cursor = reference.end;
 				}
-				index = reference.end;
+				frame.index = reference.end;
 				continue;
 			}
 		}
-		index++;
+		frame.index++;
 	}
-	return output ? output + source.slice(cursor) : source;
+	return source;
+}
+
+interface CssResolutionFrame {
+	source: string;
+	cursor: number;
+	index: number;
+	output: string;
+	prefix: string;
+	suffix: string;
 }
 
 interface CssVariableReference {
