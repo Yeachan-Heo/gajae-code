@@ -13,6 +13,7 @@ import {
 	type KernelExecuteResult,
 	type KernelShutdownResult,
 	PythonKernel,
+	PythonKernelStartError,
 } from "./kernel";
 import type { PythonRuntimeOptions } from "./runtime";
 import { ensurePyToolBridge, registerPyToolBridge } from "./tool-bridge";
@@ -115,6 +116,8 @@ interface PythonSession {
 	kernelInstanceId: string;
 	bridgeCapability?: string;
 	ownerIds: Set<string>;
+	durableOwnerIds: Set<string>;
+	provisionalOwnerCounts: Map<string, number>;
 	hasFallbackOwner: boolean;
 	queue: Promise<void>;
 	cleanupPromise?: Promise<KernelShutdownResult>;
@@ -122,20 +125,32 @@ interface PythonSession {
 }
 
 interface InitializingPythonSession {
+	sessionId: string;
 	promise: Promise<PythonSession>;
+	startupController: AbortController;
+	requests: Set<ActivePythonRequest>;
 	ownerIds: Set<string>;
 	retirementOwnerIds: Set<string>;
 	hasFallbackOwner: boolean;
 	cancelled?: PythonExecutionCancelledError;
 	kernel?: PythonKernel;
+	cleanupAttempt?: Promise<KernelShutdownResult>;
 	cleanupError?: unknown;
 	cleanupFailed?: boolean;
 }
 
 interface ActivePythonRequest {
 	readonly ownerId?: string;
+	readonly sessionId?: string;
+	readonly fallbackOwner: boolean;
 	readonly controller: AbortController;
+	signal?: AbortSignal;
+	initializer?: InitializingPythonSession;
+	initializerAcquired?: boolean;
+	provisionalSession?: PythonSession;
 	readonly completion: Promise<void>;
+	readonly kernels: Set<PythonKernel>;
+	readonly cleanupAttempts: Map<PythonKernel, Promise<KernelShutdownResult>>;
 	readonly finish: () => void;
 }
 
@@ -196,19 +211,28 @@ function retainKernelForOwners(kernel: PythonKernel, ownerIds: Set<string>): voi
 	retiringKernelOwners.set(kernel, owners);
 }
 
-async function shutdownOrRetainKernel(kernel: PythonKernel, ownerIds: Set<string>): Promise<void> {
-	let result: KernelShutdownResult;
+function retainKernelForOwner(kernel: PythonKernel | undefined, ownerId: string): void {
+	if (!kernel) return;
+	retiringKernels.add(kernel);
+	const owners = retiringKernelOwners.get(kernel) ?? new Set<string>();
+	owners.add(ownerId);
+	retiringKernelOwners.set(kernel, owners);
+}
+
+function removeKernelOwner(kernel: PythonKernel | undefined, ownerId: string): void {
+	if (kernel) retiringKernelOwners.get(kernel)?.delete(ownerId);
+}
+
+async function shutdownOrRetainKernel(kernel: PythonKernel, ownerIds: Set<string>, timeoutMs?: number): Promise<void> {
+	retainKernelForOwners(kernel, ownerIds);
+	const [shutdown, start] = prepareRetiringKernelShutdown(kernel, timeoutMs);
+	start();
 	try {
-		result = await callKernelShutdown(kernel);
+		await shutdown;
 	} catch (error) {
-		retainKernelForOwners(kernel, ownerIds);
 		logger.warn("Python kernel shutdown not confirmed", { kernelId: kernel.id, reason: error });
 		throw error;
 	}
-	if (result.confirmed) return;
-	retainKernelForOwners(kernel, ownerIds);
-	logger.warn("Python kernel shutdown not confirmed", { kernelId: kernel.id });
-	throw unconfirmedShutdownError(kernel);
 }
 
 function prepareSessionShutdown(session: PythonSession): Promise<KernelShutdownResult> {
@@ -216,7 +240,12 @@ function prepareSessionShutdown(session: PythonSession): Promise<KernelShutdownR
 	const { promise: cleanup, resolve, reject } = Promise.withResolvers<KernelShutdownResult>();
 	retiringSessions.add(session);
 	session.cleanupPromise = cleanup;
-	session.cleanupStart = () => void confirmedKernelShutdown(session.kernel).then(resolve, reject);
+	retainKernelForOwners(session.kernel, session.ownerIds);
+	const [kernelCleanup, startKernelCleanup] = prepareRetiringKernelShutdown(session.kernel);
+	session.cleanupStart = () => {
+		startKernelCleanup();
+		void kernelCleanup.then(resolve, reject);
+	};
 	void cleanup.then(
 		result => {
 			if (result.confirmed) retiringSessions.delete(session);
@@ -243,22 +272,25 @@ function startSessionShutdown(session: PythonSession): void {
 	start();
 }
 
-function callKernelShutdown(kernel: PythonKernel): Promise<KernelShutdownResult> {
+function callKernelShutdown(kernel: PythonKernel, timeoutMs?: number): Promise<KernelShutdownResult> {
 	try {
-		return kernel.shutdown();
+		return kernel.shutdown(timeoutMs === undefined ? undefined : { timeoutMs });
 	} catch (error) {
 		return Promise.reject(error);
 	}
 }
 
-function confirmedKernelShutdown(kernel: PythonKernel): Promise<KernelShutdownResult> {
-	return callKernelShutdown(kernel).then(result => {
+function confirmedKernelShutdown(kernel: PythonKernel, timeoutMs?: number): Promise<KernelShutdownResult> {
+	return callKernelShutdown(kernel, timeoutMs).then(result => {
 		if (!result.confirmed) throw unconfirmedShutdownError(kernel);
 		return result;
 	});
 }
 
-function prepareRetiringKernelShutdown(kernel: PythonKernel): [Promise<KernelShutdownResult>, () => void] {
+function prepareRetiringKernelShutdown(
+	kernel: PythonKernel,
+	timeoutMs?: number,
+): [Promise<KernelShutdownResult>, () => void] {
 	const existing = retiringKernelShutdowns.get(kernel);
 	if (existing) return [existing, () => {}];
 	const { promise, resolve, reject } = Promise.withResolvers<KernelShutdownResult>();
@@ -281,7 +313,7 @@ function prepareRetiringKernelShutdown(kernel: PythonKernel): [Promise<KernelShu
 		() => {
 			if (started) return;
 			started = true;
-			void confirmedKernelShutdown(kernel).then(resolve, reject);
+			void confirmedKernelShutdown(kernel, timeoutMs).then(resolve, reject);
 		},
 	];
 }
@@ -306,6 +338,16 @@ class PythonExecutionCancelledError extends Error {
 	}
 }
 
+class PythonKernelCleanupError extends Error {
+	constructor(
+		kernel: PythonKernel,
+		readonly cleanupError: unknown,
+	) {
+		super(`Python kernel cleanup failed: ${kernel.id}`, { cause: cleanupError });
+		this.name = "PythonKernelCleanupError";
+	}
+}
+
 function getExecutionDeadlineMs(options?: Pick<PythonExecutorOptions, "deadlineMs" | "timeoutMs">): number | undefined {
 	if (options?.deadlineMs !== undefined) return options.deadlineMs;
 	if (options?.timeoutMs === undefined) return undefined;
@@ -323,24 +365,30 @@ function beginPythonRequest(
 	ensurePythonResourceCleanup();
 	const capturedOptions = { ...(options ?? {}) };
 	const cwd = useSessionFallback ? (capturedOptions.cwd ?? getProjectDir()) : undefined;
-	const ownerId =
-		capturedOptions.kernelOwnerId ??
-		(useSessionFallback && capturedOptions.kernelMode !== "per-call"
+	const sessionId =
+		useSessionFallback && capturedOptions.kernelMode !== "per-call"
 			? scopedSessionId(
 					capturedOptions.sessionId ?? `session:${cwd}`,
 					capturedOptions.settings,
 					capturedOptions.sessionId !== undefined,
 				)
-			: undefined);
+			: undefined;
+	const ownerId = capturedOptions.kernelOwnerId ?? sessionId;
 	const deadlineMs = getExecutionDeadlineMs(capturedOptions);
 	const controller = new AbortController();
 	const { promise: completion, resolve } = Promise.withResolvers<void>();
 	let deadlineTimer: NodeJS.Timeout | undefined;
 	const request: ActivePythonRequest = {
 		ownerId,
+		sessionId,
+		fallbackOwner: capturedOptions.kernelOwnerId === undefined,
 		controller,
 		completion,
+		kernels: new Set(),
+		cleanupAttempts: new Map(),
 		finish: () => {
+			detachInitializerRequest(request, false);
+			detachProvisionalSessionRequest(request);
 			activeRequests.delete(request);
 			if (deadlineTimer) clearTimeout(deadlineTimer);
 			resolve();
@@ -351,6 +399,11 @@ function beginPythonRequest(
 	const signals = [controller.signal];
 	if (capturedOptions.signal) signals.push(capturedOptions.signal);
 	const signal = AbortSignal.any(signals);
+	request.signal = signal;
+	if (sessionId !== undefined) {
+		const session = sessions.get(sessionId);
+		if (session && isInitializingSession(session)) enrollInitializerRequest(session, request);
+	}
 	const remainingMs = getRemainingTimeoutMs(deadlineMs);
 	deadlineTimer =
 		remainingMs !== undefined
@@ -502,7 +555,14 @@ function buildKernelEnv(options: {
 	return Object.keys(env).length > 0 ? env : undefined;
 }
 
-async function startKernel(cwd: string, options: PythonExecutorOptions): Promise<PythonKernel> {
+async function startKernel(
+	cwd: string,
+	options: PythonExecutorOptions,
+	registration?: {
+		onKernelCreated: (kernel: PythonKernel) => void;
+		onStartupFailure: (kernel: PythonKernel) => Promise<void>;
+	},
+): Promise<PythonKernel> {
 	throwIfExecutionCancelled(options);
 	return await PythonKernel.start({
 		cwd,
@@ -511,6 +571,8 @@ async function startKernel(cwd: string, options: PythonExecutorOptions): Promise
 		runtimeOptions: options.runtimeOptions,
 		signal: options.signal,
 		deadlineMs: options.deadlineMs,
+		onKernelCreated: registration?.onKernelCreated,
+		onStartupFailure: registration?.onStartupFailure,
 	});
 }
 
@@ -522,75 +584,246 @@ function attachOwner(
 	if (ownerId !== undefined) {
 		if (session.hasFallbackOwner) {
 			session.ownerIds.delete(sessionId);
+			if (!isInitializingSession(session)) session.durableOwnerIds.delete(sessionId);
+			removeKernelOwner(session.kernel, sessionId);
 			session.hasFallbackOwner = false;
 		}
 		session.ownerIds.add(ownerId);
+		if (!isInitializingSession(session)) session.durableOwnerIds.add(ownerId);
+		retainKernelForOwner(session.kernel, ownerId);
 		return;
 	}
 	if (session.hasFallbackOwner || session.ownerIds.size === 0) {
 		session.ownerIds.add(sessionId);
+		if (!isInitializingSession(session)) session.durableOwnerIds.add(sessionId);
 		session.hasFallbackOwner = true;
+		retainKernelForOwner(session.kernel, sessionId);
 	}
 }
 
-async function acquireSession(sessionId: string, cwd: string, options: PythonExecutorOptions): Promise<PythonSession> {
+function enrollInitializerRequest(initializing: InitializingPythonSession, request: ActivePythonRequest): boolean {
+	if (request.initializer === initializing) return true;
+	if (request.signal?.aborted || initializing.cancelled) return false;
+	if (request.sessionId !== initializing.sessionId) return false;
+	if (request.initializer) detachInitializerRequest(request, false);
+	request.initializer = initializing;
+	initializing.requests.add(request);
+	if (request.fallbackOwner || !initializing.hasFallbackOwner) {
+		attachOwner(initializing, initializing.sessionId, request.fallbackOwner ? undefined : request.ownerId);
+	} else if (request.ownerId !== undefined) {
+		initializing.ownerIds.add(request.ownerId);
+	}
+	return true;
+}
+
+function initializerRequestOwnerId(request: ActivePythonRequest): string | undefined {
+	return request.ownerId;
+}
+
+function detachInitializerRequest(request: ActivePythonRequest, timedOut: boolean): void {
+	const initializing = request.initializer;
+	if (!initializing) return;
+	request.initializer = undefined;
+	request.initializerAcquired = false;
+	initializing.requests.delete(request);
+	const ownerId = initializerRequestOwnerId(request);
+	if (ownerId !== undefined) {
+		let hasOwnerRequest = false;
+		for (const other of initializing.requests) {
+			if (other.ownerId === ownerId && !other.signal?.aborted) {
+				hasOwnerRequest = true;
+				break;
+			}
+		}
+		if (!hasOwnerRequest) {
+			initializing.ownerIds.delete(ownerId);
+			if (request.fallbackOwner || initializing.cleanupFailed) {
+				initializing.retirementOwnerIds.add(ownerId);
+			}
+			if (initializing.ownerIds.size > 0) removeKernelOwner(initializing.kernel, ownerId);
+		}
+	}
+	if (initializing.ownerIds.size !== 0 || initializing.cancelled) return;
+	initializing.cancelled = new PythonExecutionCancelledError(timedOut);
+	if (initializing.kernel && !initializing.cleanupAttempt && !initializing.cleanupFailed) {
+		const [cleanup, start] = prepareRetiringKernelShutdown(initializing.kernel);
+		initializing.cleanupAttempt = cleanup;
+		start();
+	}
+	initializing.startupController.abort(initializing.cancelled);
+}
+
+function promoteInitializerRequest(request: ActivePythonRequest): void {
+	const initializing = request.initializer;
+	if (!initializing) return;
+	initializing.requests.delete(request);
+	request.initializer = undefined;
+}
+
+function promoteProvisionalSessionRequest(request: ActivePythonRequest): void {
+	const session = request.provisionalSession;
+	if (!session) return;
+	request.provisionalSession = undefined;
+	const ownerId = request.ownerId;
+	if (ownerId === undefined) return;
+	session.durableOwnerIds.add(ownerId);
+	const count = session.provisionalOwnerCounts.get(ownerId) ?? 0;
+	if (count <= 1) session.provisionalOwnerCounts.delete(ownerId);
+	else session.provisionalOwnerCounts.set(ownerId, count - 1);
+}
+
+function detachProvisionalSessionRequest(request: ActivePythonRequest): void {
+	const session = request.provisionalSession;
+	if (!session) return;
+	request.provisionalSession = undefined;
+	const ownerId = request.ownerId;
+	if (ownerId === undefined) return;
+	const count = session.provisionalOwnerCounts.get(ownerId) ?? 0;
+	if (count <= 1) session.provisionalOwnerCounts.delete(ownerId);
+	else session.provisionalOwnerCounts.set(ownerId, count - 1);
+	if (count > 1 || session.durableOwnerIds.has(ownerId)) return;
+	if (session.ownerIds.size === 1 && session.ownerIds.has(ownerId)) {
+		retainKernelForOwner(session.kernel, ownerId);
+		if (sessions.get(session.sessionId) === session) sessions.delete(session.sessionId);
+		const cleanup = prepareSessionShutdown(session);
+		startSessionShutdown(session);
+		void cleanup.catch(error =>
+			logger.warn("Python kernel shutdown not confirmed", { kernelId: session.kernel.id, reason: error }),
+		);
+		return;
+	}
+	session.ownerIds.delete(ownerId);
+	removeKernelOwner(session.kernel, ownerId);
+}
+
+function initializingOwnerIds(initializing: InitializingPythonSession): Set<string> {
+	return new Set(initializing.ownerIds.size > 0 ? initializing.ownerIds : initializing.retirementOwnerIds);
+}
+
+async function shutdownInitializingKernel(
+	initializing: InitializingPythonSession,
+	kernel: PythonKernel,
+): Promise<void> {
+	try {
+		if (initializing.kernel === kernel && initializing.cleanupAttempt) {
+			await initializing.cleanupAttempt;
+		} else {
+			await shutdownOrRetainKernel(kernel, initializingOwnerIds(initializing));
+		}
+	} catch (error) {
+		initializing.cleanupError = error;
+		initializing.cleanupFailed = true;
+		throw error;
+	}
+}
+
+async function acquireSession(
+	sessionId: string,
+	cwd: string,
+	options: PythonExecutorOptions,
+	request: ActivePythonRequest,
+): Promise<PythonSession> {
+	throwIfExecutionCancelled(options);
 	const existing = sessions.get(sessionId);
+	if (request.provisionalSession && request.provisionalSession !== existing) {
+		detachProvisionalSessionRequest(request);
+	}
 	if (existing) {
-		attachOwner(existing, sessionId, options.kernelOwnerId);
+		if (isInitializingSession(existing)) {
+			if (enrollInitializerRequest(existing, request)) {
+				if (!request.fallbackOwner) attachOwner(existing, sessionId, options.kernelOwnerId);
+				request.initializerAcquired = true;
+			}
+		} else {
+			promoteProvisionalSessionRequest(request);
+			attachOwner(existing, sessionId, options.kernelOwnerId);
+		}
+		if (isInitializingSession(existing) && existing.cleanupFailed && existing.kernel) {
+			await shutdownOrRetainKernel(existing.kernel, initializingOwnerIds(existing));
+			promoteInitializerRequest(request);
+			existing.cleanupFailed = false;
+			existing.cleanupError = undefined;
+			existing.ownerIds.clear();
+			existing.retirementOwnerIds.clear();
+			existing.hasFallbackOwner = false;
+			if (sessions.get(sessionId) === existing) sessions.delete(sessionId);
+			throwIfExecutionCancelled(options);
+			return await acquireSession(sessionId, cwd, options, request);
+		}
 		let session: PythonSession;
 		if (isInitializingSession(existing)) {
 			try {
 				session = await waitForPromiseWithCancellation(existing.promise, options);
 			} catch (error) {
+				if (isCancellationError(error))
+					detachInitializerRequest(request, isTimedOutCancellation(error, options.signal));
 				const remainingMs = getRemainingTimeoutMs(options.deadlineMs);
-				if (
-					isCancellationError(error) &&
-					!options.signal?.aborted &&
-					(remainingMs === undefined || remainingMs > 0)
-				)
-					return await acquireSession(sessionId, cwd, options);
+				const mayRetry = !options.signal?.aborted && (remainingMs === undefined || remainingMs > 0);
+				if (isCancellationError(error) && mayRetry && !existing.cleanupFailed) {
+					if (existing.cancelled) await existing.promise.catch(() => undefined);
+					return await acquireSession(sessionId, cwd, options, request);
+				}
 				throw error;
 			}
 		} else {
 			session = existing;
 		}
+		if (isInitializingSession(existing)) promoteInitializerRequest(request);
 		return session;
 	}
 
+	const startupController = new AbortController();
 	const initializing: InitializingPythonSession = {
+		sessionId,
+		startupController,
+		requests: new Set(),
 		ownerIds: new Set(),
 		retirementOwnerIds: new Set(),
 		hasFallbackOwner: false,
 		promise: Promise.resolve().then(async () => {
-			throwIfExecutionCancelled(options);
-			const kernel = await startKernel(cwd, options);
-			initializing.kernel = kernel;
-			if (initializing.cancelled || options.signal?.aborted) {
+			if (initializing.cancelled) throw initializing.cancelled;
+			const startupOptions = { ...options, signal: startupController.signal, deadlineMs: undefined };
+			const kernel = await startKernel(cwd, startupOptions, {
+				onKernelCreated: created => {
+					initializing.kernel = created;
+					retainKernelForOwners(created, initializingOwnerIds(initializing));
+				},
+				onStartupFailure: async failed => {
+					try {
+						await shutdownInitializingKernel(initializing, failed);
+					} catch (error) {
+						logger.warn("Python kernel shutdown not confirmed", {
+							kernelId: failed.id,
+							reason: error,
+						});
+					}
+				},
+			});
+			for (const route of [...initializing.requests]) {
+				if (!route.initializerAcquired && route.signal?.aborted) {
+					detachInitializerRequest(route, isTimedOutCancellation(route.signal.reason, route.signal));
+				}
+			}
+			if (initializing.cancelled || startupController.signal.aborted) {
 				try {
-					await shutdownOrRetainKernel(kernel, initializing.ownerIds);
+					await shutdownInitializingKernel(initializing, kernel);
 				} catch (error) {
-					initializing.cleanupError = error;
-					initializing.cleanupFailed = true;
+					logger.warn("Python kernel shutdown not confirmed", { kernelId: kernel.id, reason: error });
 				}
 				throw (
 					initializing.cancelled ??
-					new PythonExecutionCancelledError(isTimedOutCancellation(options.signal?.reason, options.signal))
+					new PythonExecutionCancelledError(
+						isTimedOutCancellation(startupController.signal.reason, startupController.signal),
+					)
 				);
 			}
 			const current = sessions.get(sessionId);
 			if (current !== initializing) {
 				try {
-					await shutdownOrRetainKernel(kernel, initializing.ownerIds);
+					await shutdownInitializingKernel(initializing, kernel);
 				} catch (error) {
-					initializing.cleanupError = error;
-					initializing.cleanupFailed = true;
+					logger.warn("Python kernel shutdown not confirmed", { kernelId: kernel.id, reason: error });
 				}
-				const winner = current
-					? isInitializingSession(current)
-						? await waitForPromiseWithCancellation(current.promise, options)
-						: current
-					: undefined;
-				if (winner) return winner;
 				throw new PythonExecutionCancelledError(false);
 			}
 			const session: PythonSession = {
@@ -599,21 +832,35 @@ async function acquireSession(sessionId: string, cwd: string, options: PythonExe
 				kernelInstanceId: crypto.randomUUID(),
 				bridgeCapability: options.bridge?.capability,
 				ownerIds: new Set(initializing.ownerIds),
+				durableOwnerIds: new Set(),
+				provisionalOwnerCounts: new Map(),
 				hasFallbackOwner: initializing.hasFallbackOwner,
 				queue: Promise.resolve(),
 			};
+			for (const route of initializing.requests) {
+				const ownerId = route.ownerId;
+				const acquired = route.initializerAcquired === true;
+				route.initializer = undefined;
+				route.initializerAcquired = false;
+				if (ownerId === undefined || !session.ownerIds.has(ownerId)) continue;
+				if (acquired) {
+					session.durableOwnerIds.add(ownerId);
+				} else {
+					route.provisionalSession = session;
+					session.provisionalOwnerCounts.set(ownerId, (session.provisionalOwnerCounts.get(ownerId) ?? 0) + 1);
+				}
+			}
+			initializing.requests.clear();
 			sessions.set(sessionId, session);
 			return session;
 		}),
 	};
-	attachOwner(initializing, sessionId, options.kernelOwnerId);
+	if (enrollInitializerRequest(initializing, request)) request.initializerAcquired = true;
 	initializingSessions.add(initializing);
 	sessions.set(sessionId, initializing);
 	let cancellationTimer: NodeJS.Timeout | undefined;
 	const retireCancelledInitialization = (timedOut: boolean): void => {
-		if (initializing.cancelled) return;
-		initializing.cancelled = new PythonExecutionCancelledError(timedOut);
-		if (sessions.get(sessionId) === initializing) sessions.delete(sessionId);
+		detachInitializerRequest(request, timedOut);
 	};
 	const onAbort = (): void => {
 		options.signal?.removeEventListener("abort", onAbort);
@@ -636,18 +883,20 @@ async function acquireSession(sessionId: string, cwd: string, options: PythonExe
 	void initializing.promise
 		.finally(() => {
 			initializingSessions.delete(initializing);
+			if (!initializing.cleanupFailed && sessions.get(sessionId) === initializing) sessions.delete(sessionId);
 			options.signal?.removeEventListener("abort", onAbort);
 			if (cancellationTimer) clearTimeout(cancellationTimer);
 		})
 		.catch(() => undefined);
 	try {
 		const session = await waitForPromiseWithCancellation(initializing.promise, options);
+		promoteInitializerRequest(request);
 		return session;
 	} catch (err) {
 		if (isCancellationError(err)) {
 			retireCancelledInitialization(isTimedOutCancellation(err, options.signal));
-			await initializing.promise.catch(() => undefined);
-		} else if (sessions.get(sessionId) === initializing) {
+			if (initializing.cancelled) await initializing.promise.catch(() => undefined);
+		} else if (sessions.get(sessionId) === initializing && !initializing.cleanupFailed) {
 			sessions.delete(sessionId);
 		}
 		throw err;
@@ -662,9 +911,8 @@ async function replaceSessionKernel(
 	throwIfExecutionCancelled(options);
 	const old = session.kernel;
 	const remaining = getRemainingTimeoutMs(options.deadlineMs);
-	await old
-		.shutdown(remaining !== undefined ? { timeoutMs: Math.max(0, remaining) } : undefined)
-		.catch(() => undefined);
+	const ownerIds = new Set(session.ownerIds);
+	await shutdownOrRetainKernel(old, ownerIds, remaining === undefined ? undefined : Math.max(0, remaining));
 	throwIfExecutionCancelled(options);
 	if (sessions.get(session.sessionId) !== session) {
 		throw new PythonExecutionCancelledError(false);
@@ -675,9 +923,17 @@ async function replaceSessionKernel(
 	const nextCapability = bridge ? crypto.randomUUID() : undefined;
 	if (bridge && nextCapability) bridge.capability = nextCapability;
 	let next: PythonKernel | undefined;
+	let startSucceeded = false;
 	try {
 		throwIfExecutionCancelled(options);
-		next = await startKernel(cwd, options);
+		next = await startKernel(cwd, options, {
+			onKernelCreated: created => {
+				next = created;
+				retainKernelForOwners(created, ownerIds);
+			},
+			onStartupFailure: failed => shutdownOrRetainKernel(failed, ownerIds),
+		});
+		startSucceeded = true;
 		throwIfExecutionCancelled(options);
 		if (sessions.get(session.sessionId) !== session) {
 			throw new PythonExecutionCancelledError(false);
@@ -686,7 +942,7 @@ async function replaceSessionKernel(
 		session.kernelInstanceId = crypto.randomUUID();
 		session.bridgeCapability = nextCapability;
 	} catch (err) {
-		await next?.shutdown().catch(() => undefined);
+		if (startSucceeded && next) await shutdownOrRetainKernel(next, ownerIds).catch(() => undefined);
 		if (bridge && previousCapability && bridge.capability === nextCapability) {
 			bridge.capability = previousCapability;
 		}
@@ -697,14 +953,26 @@ async function replaceSessionKernel(
 async function resetSession(sessionId: string): Promise<void> {
 	const existing = sessions.get(sessionId);
 	if (!existing) return;
-	if (sessions.get(sessionId) === existing) sessions.delete(sessionId);
 	if (isInitializingSession(existing)) {
+		existing.cancelled ??= new PythonExecutionCancelledError(false);
+		let cleanup: Promise<KernelShutdownResult> | undefined;
+		if (existing.kernel) {
+			const prepared = prepareRetiringKernelShutdown(existing.kernel);
+			cleanup = prepared[0];
+			existing.cleanupAttempt = cleanup;
+			prepared[1]();
+		}
+		if (!existing.startupController.signal.aborted) existing.startupController.abort(existing.cancelled);
 		await existing.promise.catch(() => undefined);
+		if (existing.cleanupFailed) throw existing.cleanupError;
+		if (cleanup) await cleanup;
 		return;
 	}
+	const kernel = existing.kernel;
 	const shutdown = prepareSessionShutdown(existing);
 	startSessionShutdown(existing);
-	await shutdown.catch(() => undefined);
+	await shutdown;
+	if (sessions.get(sessionId) === existing && existing.kernel === kernel) sessions.delete(sessionId);
 }
 
 async function runQueued<T>(
@@ -743,12 +1011,27 @@ export function disposeAllKernelSessions(): Promise<void> {
 	]);
 	const shutdowns = [...targets].map(session => [session, prepareSessionShutdown(session)] as const);
 	const retiring = [...retiringKernels].map(kernel => [kernel, ...prepareRetiringKernelShutdown(kernel)] as const);
+	for (const request of requests) {
+		for (const kernel of request.kernels) {
+			const cleanup = retiring.find(([retiringKernel]) => retiringKernel === kernel)?.[1];
+			if (cleanup) request.cleanupAttempts.set(kernel, cleanup);
+		}
+	}
+	for (const entry of initializing) {
+		if (!entry.kernel) continue;
+		const cleanup = retiring.find(([kernel]) => kernel === entry.kernel)?.[1];
+		if (cleanup) entry.cleanupAttempt = cleanup;
+	}
 	for (const [id, entry] of entries) {
 		if (sessions.get(id) === entry) sessions.delete(id);
 	}
 	// Publish every exact physical cleanup future before abort listeners or shutdown callbacks can reenter disposal.
 	for (const request of requests) {
 		if (!request.controller.signal.aborted) request.controller.abort(new PythonExecutionCancelledError(false));
+	}
+	for (const entry of initializing) {
+		entry.cancelled ??= new PythonExecutionCancelledError(false);
+		if (!entry.startupController.signal.aborted) entry.startupController.abort(entry.cancelled);
 	}
 	for (const [session] of shutdowns) startSessionShutdown(session);
 	for (const [, , start] of retiring) start();
@@ -791,23 +1074,61 @@ export function disposeKernelSessionsByOwner(ownerId: string): Promise<void> {
 		),
 	]);
 	const toShutdown: PythonSession[] = [];
-	for (const entry of initializing) entry.retirementOwnerIds.add(ownerId);
-	for (const [id, entry] of entries)
-		if (isInitializingSession(entry) && entry.ownerIds.size === 1) sessions.delete(id);
-	for (const entry of initializing) entry.ownerIds.delete(ownerId);
+	const initializersToAbort: InitializingPythonSession[] = [];
+	for (const entry of initializing) {
+		entry.retirementOwnerIds.add(ownerId);
+		let hasOwnerRequest = false;
+		for (const request of entry.requests) {
+			if (request.ownerId === ownerId && !request.signal?.aborted) {
+				hasOwnerRequest = true;
+				break;
+			}
+		}
+		if (!hasOwnerRequest) {
+			entry.ownerIds.delete(ownerId);
+			if (entry.ownerIds.size > 0) removeKernelOwner(entry.kernel, ownerId);
+		}
+		if (![...entry.ownerIds].some(id => id !== ownerId)) {
+			entry.cancelled ??= new PythonExecutionCancelledError(false);
+			initializersToAbort.push(entry);
+		}
+	}
 	for (const session of sessionsToRetire) {
 		if (session.ownerIds.size === 1) {
 			toShutdown.push(session);
 			if (sessions.get(session.sessionId) === session) sessions.delete(session.sessionId);
 		} else {
 			session.ownerIds.delete(ownerId);
+			session.durableOwnerIds.delete(ownerId);
+			removeKernelOwner(session.kernel, ownerId);
 		}
 	}
 	const shutdowns = toShutdown.map(session => [session, prepareSessionShutdown(session)] as const);
-	const retiring = [...retiringKernels]
-		.filter(kernel => retiringKernelOwners.get(kernel)?.has(ownerId))
-		.map(kernel => [kernel, ...prepareRetiringKernelShutdown(kernel)] as const);
+	const retiring: Array<readonly [PythonKernel, Promise<KernelShutdownResult>, () => void]> = [];
+	for (const kernel of retiringKernels) {
+		const owners = retiringKernelOwners.get(kernel);
+		if (!owners?.has(ownerId)) continue;
+		if (owners.size > 1) {
+			owners.delete(ownerId);
+			continue;
+		}
+		retiring.push([kernel, ...prepareRetiringKernelShutdown(kernel)]);
+	}
+	for (const request of requests) {
+		for (const kernel of request.kernels) {
+			const cleanup = retiring.find(([retiringKernel]) => retiringKernel === kernel)?.[1];
+			if (cleanup) request.cleanupAttempts.set(kernel, cleanup);
+		}
+	}
+	for (const entry of initializing) {
+		if (!entry.kernel) continue;
+		const cleanup = retiring.find(([kernel]) => kernel === entry.kernel)?.[1];
+		if (cleanup) entry.cleanupAttempt = cleanup;
+	}
 	// All cleanup futures are visible before an abort listener can reenter this API.
+	for (const entry of initializersToAbort) {
+		if (!entry.startupController.signal.aborted) entry.startupController.abort(entry.cancelled);
+	}
 	for (const request of requests) {
 		if (!request.controller.signal.aborted) request.controller.abort(new PythonExecutionCancelledError(false));
 	}
@@ -830,6 +1151,7 @@ export function disposeKernelSessionsByOwner(ownerId: string): Promise<void> {
 			const result = results[index];
 			if (result.status === "fulfilled" && result.value.confirmed) {
 				session.ownerIds.delete(ownerId);
+				session.durableOwnerIds.delete(ownerId);
 				continue;
 			}
 			if (!sessions.has(session.sessionId)) sessions.set(session.sessionId, session);
@@ -842,6 +1164,19 @@ export function disposeKernelSessionsByOwner(ownerId: string): Promise<void> {
 			const result = retiringResults[index];
 			if (result.status === "fulfilled" && result.value.confirmed) continue;
 			failures.push(result.status === "rejected" ? result.reason : unconfirmedShutdownError(kernel));
+		}
+		for (const [id, entry] of sessions) {
+			if (
+				isInitializingSession(entry) &&
+				entry.retirementOwnerIds.has(ownerId) &&
+				entry.cleanupFailed &&
+				entry.kernel &&
+				!retiringKernels.has(entry.kernel)
+			) {
+				entry.cleanupFailed = false;
+				entry.cleanupError = undefined;
+				if (sessions.get(id) === entry) sessions.delete(id);
+			}
 		}
 		if (failures.length) throw failures[0];
 	})();
@@ -954,7 +1289,7 @@ async function executeWithKernel(
 			...(await sink.dump()),
 		};
 	} catch (err) {
-		if (isCancellationError(err) || options?.signal?.aborted) {
+		if (isCancellationError(err)) {
 			const timedOut = isTimedOutCancellation(err, options?.signal);
 			return {
 				exitCode: undefined,
@@ -1006,21 +1341,67 @@ async function ensureToolBridge(options: PythonExecutorOptions): Promise<void> {
 	}
 }
 
-async function executePerCall(code: string, cwd: string, options: PythonExecutorOptions): Promise<PythonResult> {
+async function executePerCall(
+	code: string,
+	cwd: string,
+	options: PythonExecutorOptions,
+	request: ActivePythonRequest,
+): Promise<PythonResult> {
 	throwIfExecutionCancelled(options);
 	if (options.bridge && !options.bridgeSessionId) {
 		options.bridgeSessionId = `py-bridge:${crypto.randomUUID()}`;
 	}
-	const kernel = await startKernel(cwd, options);
+	const ownerIds = new Set(options.kernelOwnerId === undefined ? [] : [options.kernelOwnerId]);
+	let physicalKernel: PythonKernel | undefined;
+	const kernel = await startKernel(cwd, options, {
+		onKernelCreated: created => {
+			physicalKernel = created;
+			request.kernels.add(created);
+			retainKernelForOwners(created, ownerIds);
+		},
+		onStartupFailure: async failed => {
+			const cleanup = request.cleanupAttempts.get(failed);
+			if (cleanup) await cleanup;
+			else await shutdownOrRetainKernel(failed, ownerIds);
+		},
+	});
+	const createdKernel = physicalKernel;
+	if (!createdKernel || createdKernel !== kernel) {
+		await shutdownOrRetainKernel(kernel, ownerIds);
+		throw new Error("Python kernel creation was not registered");
+	}
+	let execution:
+		| { readonly succeeded: true; readonly result: PythonResult }
+		| { readonly succeeded: false; readonly error: unknown };
 	try {
 		throwIfExecutionCancelled(options);
-		return await executeWithKernel(kernel, code, options);
-	} finally {
-		await kernel.shutdown().catch(() => undefined);
+		execution = { succeeded: true, result: await executeWithKernel(kernel, code, options) };
+	} catch (error) {
+		execution = { succeeded: false, error };
 	}
+
+	let cleanup: { readonly succeeded: true } | { readonly succeeded: false; readonly error: unknown };
+	try {
+		const cleanupAttempt = request.cleanupAttempts.get(createdKernel);
+		if (cleanupAttempt) await cleanupAttempt;
+		else await shutdownOrRetainKernel(createdKernel, ownerIds);
+		cleanup = { succeeded: true };
+	} catch (error) {
+		cleanup = { succeeded: false, error: new PythonKernelCleanupError(createdKernel, error) };
+	}
+
+	if (!execution.succeeded && !isCancellationError(execution.error)) throw execution.error;
+	if (!cleanup.succeeded) throw cleanup.error;
+	if (!execution.succeeded) throw execution.error;
+	return execution.result;
 }
 
-async function executeOnSession(code: string, cwd: string, options: PythonExecutorOptions): Promise<PythonResult> {
+async function executeOnSession(
+	code: string,
+	cwd: string,
+	options: PythonExecutorOptions,
+	request: ActivePythonRequest,
+): Promise<PythonResult> {
 	throwIfExecutionCancelled(options);
 	const sessionId = scopedSessionId(
 		options.sessionId ?? `session:${cwd}`,
@@ -1035,7 +1416,7 @@ async function executeOnSession(code: string, cwd: string, options: PythonExecut
 		await resetSession(sessionId);
 		throwIfExecutionCancelled(options);
 	}
-	const session = await acquireSession(sessionId, cwd, options);
+	const session = await acquireSession(sessionId, cwd, options, request);
 	throwIfExecutionCancelled(options);
 	if (options.bridge && session.bridgeCapability) {
 		options.bridge.capability = session.bridgeCapability;
@@ -1086,7 +1467,7 @@ export async function executePythonWithKernel(
 	try {
 		return await executeWithKernel(kernel, code, tracked.options);
 	} catch (err) {
-		if (isCancellationError(err) || tracked.options.signal?.aborted) {
+		if (isCancellationError(err)) {
 			return createCancelledPythonResult(
 				isTimedOutCancellation(err, tracked.options.signal),
 				tracked.options.timeoutMs,
@@ -1111,11 +1492,12 @@ export async function executePython(code: string, options?: PythonExecutorOption
 
 		const kernelMode = executionOptions.kernelMode ?? "session";
 		if (kernelMode === "per-call") {
-			return await executePerCall(code, cwd, executionOptions);
+			return await executePerCall(code, cwd, executionOptions, tracked.request);
 		}
-		return await executeOnSession(code, cwd, executionOptions);
+		return await executeOnSession(code, cwd, executionOptions, tracked.request);
 	} catch (err) {
-		if (isCancellationError(err) || executionOptions.signal?.aborted) {
+		if (err instanceof PythonKernelStartError || err instanceof PythonKernelCleanupError) throw err;
+		if (isCancellationError(err)) {
 			return createCancelledPythonResult(isTimedOutCancellation(err, executionOptions.signal));
 		}
 		throw err;
