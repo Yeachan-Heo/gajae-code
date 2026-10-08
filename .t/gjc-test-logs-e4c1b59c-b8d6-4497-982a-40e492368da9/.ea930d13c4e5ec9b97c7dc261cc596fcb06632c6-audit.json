@@ -1,0 +1,15 @@
+{
+    "keep": {
+        "days": false,
+        "amount": 5
+    },
+    "auditLog": "/home/probe/paseo-worktrees/09xhizs7/rf-6469-r8/.t/gjc-test-logs-e4c1b59c-b8d6-4497-982a-40e492368da9/.ea930d13c4e5ec9b97c7dc261cc596fcb06632c6-audit.json",
+    "files": [
+        {
+            "date": 1791421456103,
+            "name": "/home/probe/paseo-worktrees/09xhizs7/rf-6469-r8/.t/gjc-test-logs-e4c1b59c-b8d6-4497-982a-40e492368da9/gjc.2026-10-08.log",
+            "hash": "9535568f911ac84683d2964b96ea5a005e8ff4f8881e0618e72574629b06ce4b"
+        }
+    ],
+    "hashType": "sha256"
+}
