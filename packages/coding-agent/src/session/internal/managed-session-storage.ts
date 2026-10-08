@@ -1387,11 +1387,11 @@ function canonicalizeManagedPath(pathname: string): string {
 	}
 }
 
-function managedRelativePath(root: ManagedDirectoryRoot, pathname: string): readonly string[] {
+function relativeWithinManagedRoot(rootPath: string, pathname: string): readonly string[] {
 	const canonicalPath = canonicalizeManagedPath(pathname);
-	const relative = path.relative(root.canonicalPath, canonicalPath);
+	const relative = path.relative(rootPath, canonicalPath);
 	if (process.platform === "win32") {
-		const canonicalRoot = path.win32.normalize(root.canonicalPath);
+		const canonicalRoot = path.win32.normalize(rootPath);
 		const canonicalCandidate = path.win32.normalize(canonicalPath);
 		const rootPrefix = canonicalRoot.endsWith(path.win32.sep) ? canonicalRoot : `${canonicalRoot}${path.win32.sep}`;
 		if (canonicalCandidate !== canonicalRoot && !canonicalCandidate.startsWith(rootPrefix))
@@ -1401,6 +1401,10 @@ function managedRelativePath(root: ManagedDirectoryRoot, pathname: string): read
 	if (path.isAbsolute(relative) || relative.split(path.sep).includes(".."))
 		throw new Error(`Managed path escapes configured root: ${pathname}`);
 	return relative.split(path.sep);
+}
+
+function managedRelativePath(root: ManagedDirectoryRoot, pathname: string): readonly string[] {
+	return relativeWithinManagedRoot(root.canonicalPath, pathname);
 }
 
 const PROCESS_START_ID = randomUUID();
@@ -1568,6 +1572,9 @@ export class ManagedSessionDescendantStore {
 		if (access === "read-only" && !expectedSubtreeRoot)
 			throw new Error("managed_read_store_requires_existing_identity");
 		const canonicalBaseDir = canonicalizeManagedPath(baseDir);
+		const canonicalAuthorityBaseDir = retained
+			? canonicalizeManagedPath(retained.authorityBaseDir)
+			: canonicalBaseDir;
 		managedRelativePath(root, canonicalBaseDir);
 
 		this.#root = root;
@@ -1575,9 +1582,9 @@ export class ManagedSessionDescendantStore {
 		this.#policy = policy ?? "default";
 		this.#access = access;
 		this.#profileAgentDir = profileAgentDir ?? root.canonicalPath;
-		this.#authorityBaseDir = retained?.authorityBaseDir ?? this.#baseDir;
+		this.#authorityBaseDir = canonicalAuthorityBaseDir;
 		if (retained) {
-			const relative = path.relative(retained.authorityBaseDir, this.#baseDir).split(path.sep).join("/");
+			const relative = relativeWithinManagedRoot(canonicalAuthorityBaseDir, this.#baseDir).join("/");
 			// For the root case (authorityBaseDir === baseDir, relative === ""), the
 			// stable identity() result carries the exact root dev/inode without
 			// snapshotting the entire live session tree. snapshotManagedTree("")

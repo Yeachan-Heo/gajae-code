@@ -211,6 +211,38 @@ describe("task fork-context provider identity", () => {
 		}
 	});
 
+	it("canonicalizes a retained authority base before deriving a descendant path", () => {
+		if (process.platform !== "linux") return;
+
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-managed-retained-alias-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const configuredRoot = path.join(tempDir, "managed-root");
+		fs.mkdirSync(configuredRoot, { mode: 0o700 });
+		const root = managedDirectoryRoot(configuredRoot);
+		const rootAlias = path.join(tempDir, "managed-root-alias");
+		fs.symlinkSync(configuredRoot, rootAlias, "dir");
+		const artifactsDir = path.join(root.canonicalPath, "artifacts");
+		fs.mkdirSync(artifactsDir, { mode: 0o700 });
+
+		const parentStore = new ManagedSessionDescendantStore(root, root.canonicalPath);
+		const retainedAuthority = parentStore.retainAuthority();
+		if (!retainedAuthority) throw new Error("Expected the Linux managed store to retain its authority");
+		try {
+			const childStore = new ManagedSessionDescendantStore(root, path.join(rootAlias, "artifacts"), {
+				authority: retainedAuthority,
+				authorityBaseDir: rootAlias,
+			});
+			try {
+				expect(childStore.dir).toBe(artifactsDir);
+			} finally {
+				childStore.close();
+			}
+		} finally {
+			retainedAuthority.close();
+			parentStore.close();
+		}
+	});
+
 	it("gives nested managed children distinct provider identities without rewriting logical headers", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-task-cache-key-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
