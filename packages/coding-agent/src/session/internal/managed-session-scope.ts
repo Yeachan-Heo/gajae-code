@@ -2972,8 +2972,9 @@ function readManagedGcReceiptSnapshot(
 	history?: MutableManagedGcReceiptHistory,
 ): ManagedFileSnapshot | null {
 	try {
-		return store.readExpectedBounded(relativePath, MANAGED_GC_RECEIPT_MAX_BYTES, size => {
-			if (history) managedGcAdmitHistoryBytes(history, size, relativePath);
+		return store.readExpectedBounded(relativePath, MANAGED_GC_RECEIPT_MAX_BYTES, (size, descriptor) => {
+			if (descriptor.nlink !== 1n || descriptor.size !== size) throw new Error("source_changed");
+			if (history) managedGcAdmitHistoryBytes(history, descriptor.size, relativePath);
 		});
 	} catch (error) {
 		if (error instanceof Error && error.message === "artifact_capacity_exceeded") managedGcJournalCapacity();
