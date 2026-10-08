@@ -1432,10 +1432,11 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(entries.find(entry => entry.key === "native-linux-x64")?.nativeBuild).toBe(true);
 	});
 
-	test("a source file with a directly-named test maps exclusively to that test", () => {
+	test("a source file with a directly-named test also runs the coding-agent package check", () => {
 		const tasks = targeted(["packages/coding-agent/src/edit/foo.ts"]);
 		expect(tasks.map(task => task.key)).toEqual([
 			"test:packages/coding-agent/test/edit/foo.test.ts",
+			"check:@gajae-code/coding-agent",
 			"native-linux-x64",
 		]);
 	});
@@ -1567,6 +1568,7 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 	test("SDK session changes select MCP discovery cleanup without widening extension owners", () => {
 		const keys = targeted(["packages/coding-agent/src/sdk/session.ts"]).map(task => task.key);
 		expect(keys).toContain("test:packages/coding-agent/test/sdk-mcp-discovery.test.ts");
+		expect(keys).toContain("check:@gajae-code/coding-agent");
 		for (const ownerTest of extensibilityOwnerTests) expect(keys).toContain(`test:${ownerTest}`);
 		expect(keys).not.toContain("test:@gajae-code/coding-agent");
 		expect(keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-"))).toEqual([]);
@@ -1619,6 +1621,7 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(keys).toContain("test:packages/coding-agent/test/agent-session-before-agent-start-attribution.test.ts");
 		expect(keys).toContain("test:packages/coding-agent/test/agent-session-promotion-identity.test.ts");
 		expect(keys).toContain("test:packages/coding-agent/test/agent-session-terminal-abort-chain.test.ts");
+		expect(keys).toContain("check:@gajae-code/coding-agent");
 	});
 	test("agent lifecycle source changes select force-abort and managed-attempt regressions", () => {
 		const keys = targeted(["packages/agent/src/agent.ts"]).map(task => task.key);
