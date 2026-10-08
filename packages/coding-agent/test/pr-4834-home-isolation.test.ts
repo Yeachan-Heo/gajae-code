@@ -369,8 +369,8 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 		});
 
 		const skill = result.items.find(item => item.name === "linked-helper");
-		expect(skill?.path).toBe(path.join(linkedSkillDir, "SKILL.md"));
-		expect(skill?.discoveryPath).toBe(path.join(userSkillsDir, "linked-helper", "SKILL.md"));
+		expect(skill?.path).toBe(await fs.realpath(path.join(linkedSkillDir, "SKILL.md")));
+		expect(skill?.discoveryPath).toBe(path.join(await fs.realpath(userSkillsDir), "linked-helper", "SKILL.md"));
 		expect(result.warnings).toEqual([]);
 	});
 
