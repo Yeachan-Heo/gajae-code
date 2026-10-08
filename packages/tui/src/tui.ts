@@ -1989,7 +1989,8 @@ export class TUI extends Container {
 
 	acquireRasterLease(request: RasterLeaseRequest): Promise<RasterLeaseAcquireResult> {
 		return this.#enqueueRaster(isCurrentLifecycle => {
-			if (!isCurrentLifecycle()) return { status: "rejected", reason: "terminal-unavailable" } as const;
+			if (this.#preparationDisposed || !isCurrentLifecycle())
+				return { status: "rejected", reason: "terminal-unavailable" } as const;
 			if (
 				!request ||
 				typeof request.ownerId !== "string" ||
@@ -2037,7 +2038,7 @@ export class TUI extends Container {
 				typeof (rawOperation0 as { type?: unknown }).type === "string"
 					? (rawOperation0 as { type: string }).type
 					: "queued-output";
-			if (!isCurrentLifecycle())
+			if (!isCurrentLifecycle() || this.#preparationDisposed)
 				return { queueId: id, operation: operation0 as TerminalOutputOperation["type"], status: "failed" as const };
 			const rawOperation =
 				request && typeof request === "object" ? (request as { operation?: unknown }).operation : undefined;

@@ -71,6 +71,22 @@ describe("TUI raster lease public boundary", () => {
 		expect(terminal.getWriteLog()).toEqual([]);
 	});
 
+	it("rejects new raster and generic output after TUI disposal", async () => {
+		const { tui, terminal } = await setup();
+		tui.dispose();
+
+		const lease = await tui.acquireRasterLease(request("after-dispose"));
+		expect(lease).toEqual({ status: "rejected", reason: "terminal-unavailable" });
+
+		const rasterOutput = await tui.submitTerminalOutput({
+			operation: { type: "raster-probe", bytes: bytes("AFTER_DISPOSE_RASTER") },
+		});
+		const genericOutput = await tui.queueTerminalOutput("AFTER_DISPOSE_GENERIC");
+		expect(rasterOutput.status).toBe("failed");
+		expect(genericOutput.status).toBe("failed");
+		expect(terminal.getWriteLog()).toEqual([]);
+	});
+
 	it("writes multipart records as one terminal write", async () => {
 		const { tui, terminal } = await setup();
 		const lease = await tui.acquireRasterLease(request("multipart"));
