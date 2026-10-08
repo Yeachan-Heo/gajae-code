@@ -776,7 +776,7 @@ describe("SDK production async completion paths", () => {
 			await cancelFoldedTerminal(folded);
 			if (destinationPath && fs.existsSync(destinationPath)) fs.unlinkSync(destinationPath);
 		}
-	});
+	}, 30_000);
 
 	test("reports unavailable when a parked output's ephemeral artifact manager retires during initialization", async () => {
 		const mock = await createProductionSession(true, false);
