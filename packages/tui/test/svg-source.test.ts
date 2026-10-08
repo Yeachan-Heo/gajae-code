@@ -90,4 +90,17 @@ describe("prepareSvg", () => {
 			`<svg color="#eeeeee" font-family="sans-serif" data-label=' xmlns="urn:wrong" color="red" >' xmlns="http://www.w3.org/2000/svg"><rect/></svg>`,
 		);
 	});
+
+	it("resolves CSS variables without rewriting SVG text, comments, or unrelated attributes", () => {
+		const svg =
+			'<svg><style>.a{fill:var(--accent);content:"var(--accent)";/*var(--accent)*/}</style>' +
+			"<text>Use var(--accent) here</text><!-- var(--accent) -->" +
+			'<rect fill="var(--accent)" style="stroke:var(--accent)" data-label="var(--accent)"/></svg>';
+		const prepared = prepareSvg(svg, palette);
+
+		expect(prepared).toContain('<style>.a{fill:#ff8800;content:"var(--accent)";/*var(--accent)*/}</style>');
+		expect(prepared).toContain("<text>Use var(--accent) here</text>");
+		expect(prepared).toContain("<!-- var(--accent) -->");
+		expect(prepared).toContain('fill="#ff8800" style="stroke:#ff8800" data-label="var(--accent)"');
+	});
 });

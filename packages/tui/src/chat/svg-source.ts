@@ -146,13 +146,75 @@ export function closePartialSvg(source: string): string | null {
 
 /** `var(--name)` / `var(--name, fallback)`; the fallback may hold one level of parentheses (`rgb(…)`). */
 const VAR_REFERENCE = /var\(\s*--([\w-]+)\s*(?:,\s*((?:[^()]|\([^()]*\))*))?\)/g;
+const CSS_VALUE_ATTRIBUTES = new Set([
+	"alignment-baseline",
+	"baseline-shift",
+	"clip",
+	"clip-path",
+	"clip-rule",
+	"color",
+	"color-interpolation",
+	"color-interpolation-filters",
+	"color-rendering",
+	"cursor",
+	"direction",
+	"display",
+	"dominant-baseline",
+	"fill",
+	"fill-opacity",
+	"fill-rule",
+	"filter",
+	"flood-color",
+	"flood-opacity",
+	"font-family",
+	"font-size",
+	"font-size-adjust",
+	"font-stretch",
+	"font-style",
+	"font-variant",
+	"font-weight",
+	"glyph-orientation-horizontal",
+	"glyph-orientation-vertical",
+	"image-rendering",
+	"letter-spacing",
+	"lighting-color",
+	"marker-end",
+	"marker-mid",
+	"marker-start",
+	"mask",
+	"opacity",
+	"overflow",
+	"paint-order",
+	"pointer-events",
+	"shape-rendering",
+	"stop-color",
+	"stop-opacity",
+	"stroke",
+	"stroke-dasharray",
+	"stroke-dashoffset",
+	"stroke-linecap",
+	"stroke-linejoin",
+	"stroke-miterlimit",
+	"stroke-opacity",
+	"stroke-width",
+	"text-anchor",
+	"text-decoration",
+	"text-rendering",
+	"unicode-bidi",
+	"vector-effect",
+	"visibility",
+	"word-spacing",
+	"writing-mode",
+]);
 
 /**
  * Make a figure's source what an SVG rasterizer draws as written, in the
  * reader's theme. Rasterizers resolve neither CSS custom properties nor an
  * inherited text color, and reject a root without the SVG namespace, so:
- * - `var(--name)` / `var(--name, fallback)` become `palette[name]` (an
- *   unknown name takes its fallback, else `palette.fg`);
+ * - CSS variable references in `<style>` contents, `style` declarations, and
+ *   presentation attributes become `palette[name]` (an unknown name takes
+ *   its fallback, else `palette.fg`); SVG text and unrelated attributes stay
+ *   literal;
  * - a root `<svg>` lacking them gets `color` = `palette.fg` (so
  *   `currentColor` follows the theme), a sans-serif `font-family` (instead
  *   of the rasterizer's Times), `xmlns`, and `xmlns:xlink` when the source
@@ -160,10 +222,7 @@ const VAR_REFERENCE = /var\(\s*--([\w-]+)\s*(?:,\s*((?:[^()]|\([^()]*\))*))?\)/g
  */
 export function prepareSvg(svg: string, palette: Readonly<Record<string, string>>): string {
 	const fg = palette.fg ?? "currentColor";
-	const resolved = svg.replace(
-		VAR_REFERENCE,
-		(_match, name: string, fallback: string | undefined) => palette[name] ?? (fallback?.trim() || fg),
-	);
+	const resolved = resolveSvgCssVariables(svg, palette, fg);
 	const usesXlink = resolved.includes("xlink:");
 	const root = findRootSvgTag(resolved);
 	if (!root) return resolved;
@@ -177,6 +236,120 @@ export function prepareSvg(svg: string, palette: Readonly<Record<string, string>
 	if (!added) return resolved;
 	const tag = root.tag.replace(/^<[^\s/>]+/, `$&${added}`);
 	return `${resolved.slice(0, root.start)}${tag}${resolved.slice(root.end)}`;
+}
+
+/** Resolve CSS variables only in stylesheet text and CSS-bearing XML attributes. */
+function resolveSvgCssVariables(source: string, palette: Readonly<Record<string, string>>, fg: string): string {
+	let output = "";
+	let cursor = 0;
+	while (cursor < source.length) {
+		const start = source.indexOf("<", cursor);
+		if (start < 0) return output + source.slice(cursor);
+		output += source.slice(cursor, start);
+		const end = constructEnd(source, start);
+		if (end < 0) return output + source.slice(start);
+		const tag = source.slice(start, end);
+		if (/^<(?:[\w.-]+:)?style(?=[\s/>])/i.test(tag)) {
+			output += resolveCssAttributes(tag, palette, fg);
+			const closingTag = findStyleClosingTag(source, end);
+			if (closingTag < 0) return output + resolveCssValue(source.slice(end), palette, fg);
+			output += resolveCssValue(source.slice(end, closingTag), palette, fg);
+			cursor = closingTag;
+			continue;
+		}
+		output += resolveCssAttributes(tag, palette, fg);
+		cursor = end;
+	}
+	return output;
+}
+
+/** Find the closing style tag; `<` cannot appear literally in XML style text. */
+function findStyleClosingTag(source: string, start: number): number {
+	const lowered = source.toLowerCase();
+	let index = lowered.indexOf("</style", start);
+	while (index >= 0) {
+		const next = source[index + 7];
+		if (next === ">" || (next !== undefined && /\s/.test(next))) return index;
+		index = lowered.indexOf("</style", index + 7);
+	}
+	return -1;
+}
+
+/** Resolve CSS-bearing attribute values without rewriting other XML content. */
+function resolveCssAttributes(tag: string, palette: Readonly<Record<string, string>>, fg: string): string {
+	if (!/^<[A-Za-z_]/.test(tag)) return tag;
+	let index = 1;
+	while (index < tag.length && !/[\s/>]/.test(tag[index] ?? "")) index++;
+	let cursor = 0;
+	let output = "";
+	while (index < tag.length) {
+		while (/\s/.test(tag[index] ?? "")) index++;
+		if (tag[index] === "/" || tag[index] === ">") break;
+		const nameStart = index;
+		while (index < tag.length && !/[\s=/>]/.test(tag[index] ?? "")) index++;
+		const name = tag.slice(nameStart, index).toLowerCase();
+		while (/\s/.test(tag[index] ?? "")) index++;
+		if (tag[index] !== "=") continue;
+		index++;
+		while (/\s/.test(tag[index] ?? "")) index++;
+		const quote = tag[index];
+		if (quote === '"' || quote === "'") {
+			const valueStart = ++index;
+			while (index < tag.length && tag[index] !== quote) index++;
+			const valueEnd = index;
+			const cssValue = name === "style" || CSS_VALUE_ATTRIBUTES.has(name);
+			if (cssValue) {
+				const resolved = resolveCssValue(tag.slice(valueStart, valueEnd), palette, fg);
+				if (resolved !== tag.slice(valueStart, valueEnd)) {
+					output += tag.slice(cursor, valueStart) + resolved;
+					cursor = valueEnd;
+				}
+			}
+			index++;
+		} else {
+			while (index < tag.length && !/[\s>]/.test(tag[index] ?? "")) index++;
+		}
+	}
+	return output ? output + tag.slice(cursor) : tag;
+}
+
+/** Resolve variable functions outside CSS comments and quoted string literals. */
+function resolveCssValue(source: string, palette: Readonly<Record<string, string>>, fg: string): string {
+	let output = "";
+	let cursor = 0;
+	let index = 0;
+	while (index < source.length) {
+		if (source.startsWith("/*", index)) {
+			const end = source.indexOf("*/", index + 2);
+			index = end < 0 ? source.length : end + 2;
+			continue;
+		}
+		const char = source[index];
+		if (char === '"' || char === "'") {
+			const quote = char;
+			index++;
+			while (index < source.length) {
+				if (source[index] === "\\") index += 2;
+				else if (source[index++] === quote) break;
+			}
+			continue;
+		}
+		if (source.startsWith("var(", index)) {
+			VAR_REFERENCE.lastIndex = index;
+			const match = VAR_REFERENCE.exec(source);
+			if (match?.index === index) {
+				output += source.slice(cursor, index);
+				const name = match[1]!;
+				const fallback = match[2];
+				output += palette[name] ?? (fallback?.trim() || fg);
+				index = VAR_REFERENCE.lastIndex;
+				cursor = index;
+				continue;
+			}
+		}
+		index++;
+	}
+	return output ? output + source.slice(cursor) : source;
 }
 
 /** The first quote-aware `<svg …>` start tag (namespace prefix allowed). */

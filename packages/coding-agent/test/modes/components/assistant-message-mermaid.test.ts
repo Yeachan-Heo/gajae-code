@@ -5,7 +5,7 @@ import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/
 import { AssistantMessageComponent } from "@gajae-code/coding-agent/modes/components/assistant-message";
 import { clearMermaidCache } from "@gajae-code/coding-agent/modes/theme/mermaid-cache";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
-import { ImageProtocol, setTerminalImageProtocol, TERMINAL } from "@gajae-code/tui";
+import { ImageProtocol, setTerminalImageProtocol, TERMINAL, withTerminalGraphicsFallback } from "@gajae-code/tui";
 
 const originalImageProtocol = TERMINAL.imageProtocol;
 
@@ -94,6 +94,26 @@ describe("AssistantMessageComponent SVG markdown", () => {
 		try {
 			const rendered = Bun.stripANSI(component.render(100).join("\n"));
 			expect(TERMINAL.imageProtocol).toBeNull();
+			expect(rendered).toContain("```svg");
+			expect(rendered).toContain("<svg");
+			expect(rendered).not.toContain("[Image: svg");
+		} finally {
+			component.dispose();
+		}
+	});
+
+	it("keeps the fenced SVG source in graphics-suppressed render scopes", () => {
+		setTerminalImageProtocol(ImageProtocol.Iterm2);
+		const component = new AssistantMessageComponent(
+			createAssistantMessage('```svg\n<svg width="10" height="10"><rect/></svg>\n```'),
+		);
+		try {
+			const rendered = Bun.stripANSI(
+				withTerminalGraphicsFallback(() => component.render(100).join("\n"), {
+					allowCursorNeutralImages: true,
+				}),
+			);
+			expect(TERMINAL.imageProtocol).toBe(ImageProtocol.Iterm2);
 			expect(rendered).toContain("```svg");
 			expect(rendered).toContain("<svg");
 			expect(rendered).not.toContain("[Image: svg");

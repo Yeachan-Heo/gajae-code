@@ -4,6 +4,8 @@ import {
 	Container,
 	Image,
 	ImageProtocol,
+	isCursorNeutralImagePermittedInFallback,
+	isTerminalGraphicsFallbackActive,
 	isViewportAnchorSourceRenderer,
 	Markdown,
 	SvgFigure,
@@ -39,7 +41,10 @@ function getAssistantMarkdownTheme(): MarkdownTheme {
 	cachedAssistantMarkdownTheme = {
 		...base,
 		resolveSvgFigure: (source, context) => {
-			if (!TERMINAL.imageProtocol) return null;
+			const graphicsSuppressed =
+				isTerminalGraphicsFallbackActive() &&
+				!(TERMINAL.imageProtocol === ImageProtocol.Kitty && isCursorNeutralImagePermittedInFallback());
+			if (!TERMINAL.imageProtocol || graphicsSuppressed) return null;
 			const palette = theme.getSvgPalette();
 			const previous = context.previous instanceof SvgFigure ? context.previous : undefined;
 			const figure =

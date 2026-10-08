@@ -12,22 +12,12 @@
  *
  * Source: oh-my-pi (https://github.com/can1357/oh-my-pi)
  */
-import type { rasterizeSvg as NativeRasterizeSvg } from "@gajae-code/natives";
+import { rasterizeSvg } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
 import { Image, type ImageTheme } from "../components/image";
 import { type CellDimensions, getCellDimensions, getImageDimensions } from "../terminal-capabilities";
 import type { Component } from "../tui";
 import { closePartialSvg, prepareSvg } from "./svg-source";
-
-type RasterizeSvgFn = typeof NativeRasterizeSvg;
-let rasterizeSvg: RasterizeSvgFn | undefined;
-
-function getRasterizeSvg(): RasterizeSvgFn {
-	if (!rasterizeSvg) {
-		rasterizeSvg = (require("@gajae-code/natives") as { rasterizeSvg: RasterizeSvgFn }).rasterizeSvg;
-	}
-	return rasterizeSvg;
-}
 
 /** Least time between rasters of a fence that is still streaming. */
 const STREAM_INTERVAL_MS = 200;
@@ -255,8 +245,7 @@ export class SvgFigure implements Component {
 			this.#startedAt = performance.now();
 			try {
 				const prepared = prepareSvg(svg, attempt.palette);
-				const rasterize = getRasterizeSvg();
-				const sourcePng = await rasterize(
+				const sourcePng = await rasterizeSvg(
 					new TextEncoder().encode(prepared),
 					attempt.limits.columns * cell.widthPx,
 					attempt.limits.rows * cell.heightPx,
@@ -285,7 +274,7 @@ export class SvgFigure implements Component {
 						`viewBox="0 0 ${widthPx} ${heightPx}"><image ` +
 						`href="data:image/png;base64,${sourceData}" x="${x}" y="${y}" ` +
 						`width="${drawnWidth}" height="${drawnHeight}"/></svg>`;
-					png = await rasterize(new TextEncoder().encode(paddedSvg), widthPx, heightPx);
+					png = await rasterizeSvg(new TextEncoder().encode(paddedSvg), widthPx, heightPx);
 				}
 			} catch (error) {
 				// A streaming prefix that does not parse yet keeps the previous raster.
