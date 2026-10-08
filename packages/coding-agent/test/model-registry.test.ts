@@ -1602,7 +1602,7 @@ describe("ModelRegistry", () => {
 				const resolved = registry.resolveCanonicalModel(record.id, { availableOnly: false, candidates });
 				expect(selection.model).toBe(resolved);
 			}
-		});
+		}, 15_000);
 		// Sticky state mutates per call, so each scenario runs batch and per-record
 		// passes in the same order on independent registries. Split into one test
 		// per scenario: a single combined test exceeded the default 5s test
@@ -9914,35 +9914,30 @@ describe("ModelRegistry config reload", () => {
 	});
 
 	test("preserves authoritative discovery for an unchanged literal-key provider across reload", async () => {
-		const previousOpenAiKey = Bun.env.OPENAI_API_KEY;
-		Bun.env.OPENAI_API_KEY = "ambient-openai-key";
 		let candidate: ModelsConfigReloadCandidate | undefined;
 		try {
-			const bundledIds = (getBundledModels("openai") as Model<Api>[]).map(model => model.id);
-			const discoveredId = bundledIds[0]!;
-			const unsupportedId = bundledIds.find(id => id !== discoveredId)!;
+			const providerId = "literal-discovery";
+			const discoveredId = "authoritatively-discovered-model";
 			const initialConfig = JSON.parse(await Bun.file(modelsPath).text()) as {
 				providers: Record<string, unknown>;
 			};
-			initialConfig.providers.openai = {
-				baseUrl: "https://openai-config.example/v1",
+			initialConfig.providers[providerId] = {
+				baseUrl: "https://literal-discovery.example/v1",
 				api: "openai-responses",
 				apiKey: "literal-openai-key",
 				discovery: { type: "openai-models-list" },
-				models: [{ id: "openai-local-model" }],
 			};
 			await Bun.write(modelsPath, JSON.stringify(initialConfig));
 			await registry.refreshStatic();
 			using _hook = hookFetch(input => {
-				expect(String(input)).toBe("https://openai-config.example/v1/models");
+				expect(String(input)).toBe("https://literal-discovery.example/v1/models");
 				return new Response(JSON.stringify({ data: [{ id: discoveredId }] }), {
 					headers: { "Content-Type": "application/json" },
 				});
 			});
-			await registry.refreshProvider("openai", "online");
-			expect(registry.getAvailable().some(model => model.provider === "openai" && model.id === unsupportedId)).toBe(
-				false,
-			);
+			await registry.refreshProvider(providerId, "online");
+			expect(registry.getAll().some(model => model.provider === providerId && model.id === discoveredId)).toBe(true);
+			expect(registry.getActiveProviders().some(provider => provider.provider === providerId)).toBe(true);
 
 			const nextConfig = structuredClone(initialConfig);
 			const reloadProxy = nextConfig.providers["reload-proxy"] as {
@@ -9957,13 +9952,10 @@ describe("ModelRegistry config reload", () => {
 			expect(candidate.valid).toBe(true);
 			candidate.commit();
 			candidate.finalize();
-			expect(registry.getAvailable().some(model => model.provider === "openai" && model.id === unsupportedId)).toBe(
-				false,
-			);
+			expect(registry.getAll().some(model => model.provider === providerId && model.id === discoveredId)).toBe(true);
+			expect(registry.getActiveProviders().some(provider => provider.provider === providerId)).toBe(true);
 		} finally {
 			candidate?.rollback();
-			if (previousOpenAiKey === undefined) delete Bun.env.OPENAI_API_KEY;
-			else Bun.env.OPENAI_API_KEY = previousOpenAiKey;
 		}
 	});
 

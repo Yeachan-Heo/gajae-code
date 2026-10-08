@@ -80,9 +80,9 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:getConfiguredModelChainState":
 		"internal model-profile transaction snapshot, not a user-facing SDK control seam",
 	"agent_session:setUnavailableModelProfile":
-		"internal startup-profile recovery marker, not a user-facing SDK control seam",
+		"internal session-scoped startup-profile recovery marker, not a user-facing SDK control seam",
 	"agent_session:getUnavailableModelProfile":
-		"internal startup-profile recovery marker, not a user-facing SDK control seam",
+		"internal session-scoped startup-profile recovery status for UI rendering, not a public SDK operation",
 	"agent_session:getConfigurationPaths":
 		"internal config hot-reload path identity projection, not a user-facing SDK control seam",
 	"agent_session:validateConfiguration":
@@ -347,10 +347,6 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal profile-derived eager delegation synchronization, not a user-facing SDK control seam",
 	"agent_session:submitUserMessage":
 		"public in-process embedder lifecycle API; direct handle surface, not an SDK transport operation",
-	"agent_session:setUnavailableModelProfile":
-		"internal session-scoped unavailable profile tracking; mutated by the session lifecycle on model-load failure, not a public SDK control seam",
-	"agent_session:getUnavailableModelProfile":
-		"internal session-scoped unavailable profile query for UI status rendering; not a public SDK operation",
 };
 /** Maps reviewed source seams to registry SDK operation IDs. */
 const SEAM_TO_SDK: Readonly<Record<string, string>> = {

@@ -209,6 +209,102 @@ describe("configuration hot reload watcher", () => {
 		expect(errors).toHaveLength(1);
 	});
 
+	test("re-arms a transient directory-watch open failure before a config-only save", async () => {
+		const directory = await temporaryDirectory();
+		const configDirectory = path.join(directory, "config");
+		const paths = await configPaths(configDirectory);
+		const candidates: ConfigHotReloadCandidate[] = [];
+		const errors: ConfigHotReloadError[] = [];
+		const realWatch = nodeFs.watch;
+		let configWatchAttempts = 0;
+		let recovered = false;
+		const watchSpy = spyOn(nodeFs, "watch").mockImplementation(
+			new Proxy(realWatch, {
+				apply(target, receiver, args) {
+					const isConfigDirectory = String(args[0]) === configDirectory;
+					if (isConfigDirectory) {
+						configWatchAttempts++;
+						if (configWatchAttempts === 1) {
+							throw Object.assign(new Error("private watcher failure"), { code: "EACCES" });
+						}
+					}
+					const watcher = Reflect.apply(target, receiver, args);
+					if (isConfigDirectory && configWatchAttempts === 2) recovered = true;
+					return watcher;
+				},
+			}),
+		);
+		const watcher = createWatcher(
+			candidate => {
+				candidates.push(candidate);
+			},
+			error => {
+				errors.push(error);
+			},
+		);
+		try {
+			await watcher.start(paths);
+			await waitFor(() => (recovered ? true : undefined));
+		} finally {
+			watchSpy.mockRestore();
+		}
+
+		await atomicReplace(paths.configPath, "config: recovered after open failure\n");
+		const recoveredCandidate = await waitFor(() =>
+			candidates.find(candidate => candidate.config.text === "config: recovered after open failure\n"),
+		);
+		expect(recoveredCandidate.models.text).toBe("models: initial\n");
+		expect(errors).toHaveLength(1);
+	});
+
+	test("re-arms a directory watcher after a runtime error before a config-only save", async () => {
+		const directory = await temporaryDirectory();
+		const configDirectory = path.join(directory, "config");
+		const paths = await configPaths(configDirectory);
+		const candidates: ConfigHotReloadCandidate[] = [];
+		const errors: ConfigHotReloadError[] = [];
+		const realWatch = nodeFs.watch;
+		let configWatchAttempts = 0;
+		let configWatcher: nodeFs.FSWatcher | undefined;
+		let recovered = false;
+		const watchSpy = spyOn(nodeFs, "watch").mockImplementation(
+			new Proxy(realWatch, {
+				apply(target, receiver, args) {
+					const watcher = Reflect.apply(target, receiver, args);
+					if (String(args[0]) === configDirectory) {
+						configWatchAttempts++;
+						if (configWatchAttempts === 1) configWatcher = watcher;
+						if (configWatchAttempts === 2) recovered = true;
+					}
+					return watcher;
+				},
+			}),
+		);
+		const watcher = createWatcher(
+			candidate => {
+				candidates.push(candidate);
+			},
+			error => {
+				errors.push(error);
+			},
+		);
+		try {
+			await watcher.start(paths);
+			expect(configWatcher).toBeDefined();
+			configWatcher!.emit("error", Object.assign(new Error("private runtime watcher failure"), { code: "EIO" }));
+			await waitFor(() => (recovered ? true : undefined));
+		} finally {
+			watchSpy.mockRestore();
+		}
+
+		await atomicReplace(paths.configPath, "config: recovered after runtime failure\n");
+		const recoveredCandidate = await waitFor(() =>
+			candidates.find(candidate => candidate.config.text === "config: recovered after runtime failure\n"),
+		);
+		expect(recoveredCandidate.models.text).toBe("models: initial\n");
+		expect(errors).toHaveLength(1);
+	});
+
 	test("coalesces pending changes to the newest revision and aborts older application", async () => {
 		const directory = await temporaryDirectory();
 		const paths = await configPaths(path.join(directory, "config"));

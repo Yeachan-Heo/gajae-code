@@ -18648,87 +18648,135 @@ export class AgentSession {
 					let preparedLiveModelSelection: PreparedProfileModelSelection | undefined;
 					let preparedLiveModelSelectionRevision = userModelSelectionRevision;
 					let preserveDefaultModelSelection = true;
-					const activeProfile = this.getActiveModelProfile();
-					if (activeProfile) {
-						prepared = await this.#preflightActiveProfile(stagedSettings, stagedModels, {
-							prepareSessionModelSelection: true,
-							signal: reloadSignal,
-							settingsForApply: this.settings,
-						});
-						const previousChain = prepared!.previousDefaultChainState;
-						const profileOwnsDefaultChain =
-							previousChain?.origin === "profile-activation" && previousChain.identity === activeProfile;
-						const chainIsUnchanged =
-							prepared!.defaultChain.length === (previousChain?.entries.length ?? 0) &&
-							prepared!.defaultChain.every((selector, index) => selector === previousChain?.entries[index]);
-						preserveDefaultModelSelection =
-							prepared!.defaultChain.length === 0 || !profileOwnsDefaultChain || chainIsUnchanged;
-					}
-					if (preserveDefaultModelSelection && this.#currentModelConfigurationChanged(stagedModels.registry)) {
-						const updatedModel = this.#updatedCurrentModel(stagedModels.registry);
-						if (updatedModel) {
-							const previousModel = this.model;
-							const previousThinkingLevel = this.thinkingLevel;
-							const selectionRevision = this.getUserModelSelectionRevision();
-							const preparedSelection = await this.prepareModelSelectionForProfileActivation(
-								updatedModel,
-								previousThinkingLevel,
-								reloadSignal,
-							);
-							if (
-								this.getUserModelSelectionRevision() === selectionRevision &&
-								this.model === previousModel &&
-								this.thinkingLevel === previousThinkingLevel
-							) {
-								preparedLiveModelSelectionRevision = selectionRevision;
-								preparedLiveModelSelection = preparedSelection;
+					const prepareCandidateSelections = async (modelsCandidate: ModelsConfigReloadCandidate): Promise<void> => {
+						prepared = undefined;
+						preparedLiveModelSelection = undefined;
+						preparedLiveModelSelectionRevision = userModelSelectionRevision;
+						preserveDefaultModelSelection = true;
+						const activeProfile = this.getActiveModelProfile();
+						if (activeProfile) {
+							prepared = await this.#preflightActiveProfile(stagedSettings, modelsCandidate, {
+								prepareSessionModelSelection: true,
+								signal: reloadSignal,
+								settingsForApply: this.settings,
+							});
+							const previousChain = prepared!.previousDefaultChainState;
+							const profileOwnsDefaultChain =
+								previousChain?.origin === "profile-activation" && previousChain.identity === activeProfile;
+							const chainIsUnchanged =
+								prepared!.defaultChain.length === (previousChain?.entries.length ?? 0) &&
+								prepared!.defaultChain.every((selector, index) => selector === previousChain?.entries[index]);
+							preserveDefaultModelSelection =
+								prepared!.defaultChain.length === 0 || !profileOwnsDefaultChain || chainIsUnchanged;
+						}
+						if (
+							preserveDefaultModelSelection &&
+							this.#currentModelConfigurationChanged(modelsCandidate.registry)
+						) {
+							const updatedModel = this.#updatedCurrentModel(modelsCandidate.registry);
+							if (updatedModel) {
+								const previousModel = this.model;
+								const previousThinkingLevel = this.thinkingLevel;
+								const selectionRevision = this.getUserModelSelectionRevision();
+								const preparedSelection = await this.prepareModelSelectionForProfileActivation(
+									updatedModel,
+									previousThinkingLevel,
+									reloadSignal,
+								);
+								if (
+									this.getUserModelSelectionRevision() === selectionRevision &&
+									this.model === previousModel &&
+									this.thinkingLevel === previousThinkingLevel
+								) {
+									preparedLiveModelSelectionRevision = selectionRevision;
+									preparedLiveModelSelection = preparedSelection;
+								}
 							}
 						}
-					}
+					};
+					await prepareCandidateSelections(stagedModels);
 					reloadSignal.throwIfAborted();
 					publicationFenceRelease = await this.#modelRegistry.acquirePublicationFence(reloadSignal);
 					reloadSignal.throwIfAborted();
-					const preserveLiveModelSelection =
-						this.getUserModelSelectionRevision() !== userModelSelectionRevision ||
-						this.model !== userModelSelectionModel;
-					if (
-						preparedLiveModelSelection &&
-						(this.getUserModelSelectionRevision() !== preparedLiveModelSelectionRevision ||
-							this.model !== preparedLiveModelSelection.previousModel ||
-							this.thinkingLevel !== preparedLiveModelSelection.previousThinkingLevel)
-					) {
-						preparedLiveModelSelection = undefined;
-					}
-					if (preserveLiveModelSelection && this.model) {
-						const currentModel = this.model;
-						const currentThinkingLevel = this.thinkingLevel;
-						const updatedModel = this.#updatedCurrentModel(stagedModels.registry);
-						if (!updatedModel) {
-							throw new ConfigurationReloadError(
-								"MODEL_UNAVAILABLE",
-								new Error("The current model is unavailable in the staged registry"),
-							);
+					let preserveLiveModelSelection = false;
+					const prepareLiveModelSelection = async (modelsCandidate: ModelsConfigReloadCandidate): Promise<void> => {
+						preserveLiveModelSelection =
+							this.getUserModelSelectionRevision() !== userModelSelectionRevision ||
+							this.model !== userModelSelectionModel;
+						if (
+							preparedLiveModelSelection &&
+							(this.getUserModelSelectionRevision() !== preparedLiveModelSelectionRevision ||
+								this.model !== preparedLiveModelSelection.previousModel ||
+								this.thinkingLevel !== preparedLiveModelSelection.previousThinkingLevel)
+						) {
+							preparedLiveModelSelection = undefined;
 						}
-						if (!util.isDeepStrictEqual(currentModel, updatedModel)) {
-							const selectionRevision = this.getUserModelSelectionRevision();
-							preparedLiveModelSelection = await this.prepareModelSelectionForProfileActivation(
-								updatedModel,
-								currentThinkingLevel,
-								reloadSignal,
-							);
-							preparedLiveModelSelectionRevision = selectionRevision;
-							reloadSignal.throwIfAborted();
-							if (
-								this.getUserModelSelectionRevision() !== selectionRevision ||
-								this.model !== currentModel ||
-								this.thinkingLevel !== currentThinkingLevel
-							) {
+						if (preserveLiveModelSelection && this.model) {
+							const currentModel = this.model;
+							const currentThinkingLevel = this.thinkingLevel;
+							const updatedModel = this.#updatedCurrentModel(modelsCandidate.registry);
+							if (!updatedModel) {
 								throw new ConfigurationReloadError(
-									"PUBLICATION_FAILED",
-									new Error("The live model selection changed while preparing the reload model"),
+									"MODEL_UNAVAILABLE",
+									new Error("The current model is unavailable in the staged registry"),
 								);
 							}
+							if (!util.isDeepStrictEqual(currentModel, updatedModel)) {
+								const selectionRevision = this.getUserModelSelectionRevision();
+								preparedLiveModelSelection = await this.prepareModelSelectionForProfileActivation(
+									updatedModel,
+									currentThinkingLevel,
+									reloadSignal,
+								);
+								preparedLiveModelSelectionRevision = selectionRevision;
+								reloadSignal.throwIfAborted();
+								if (
+									this.getUserModelSelectionRevision() !== selectionRevision ||
+									this.model !== currentModel ||
+									this.thinkingLevel !== currentThinkingLevel
+								) {
+									throw new ConfigurationReloadError(
+										"PUBLICATION_FAILED",
+										new Error("The live model selection changed while preparing the reload model"),
+									);
+								}
+							}
 						}
+					};
+					let catalogRestages = 0;
+					for (;;) {
+						const modelsCandidate = stagedModels;
+						if (!modelsCandidate) throw new ConfigurationReloadError("MODELS_INVALID");
+						if (!modelsCandidate.isCurrent()) {
+							if (catalogRestages >= 2) {
+								throw new ConfigurationReloadError(
+									"PUBLICATION_FAILED",
+									new Error("The model catalog kept changing during configuration reload preflight"),
+								);
+							}
+							catalogRestages++;
+							modelsCandidate.rollback();
+							stagedModels = undefined;
+							let restagedModels: ModelsConfigReloadCandidate;
+							try {
+								restagedModels = await this.#modelRegistry.stageModelsConfigReload(
+									candidate.models,
+									stagedSettings,
+								);
+							} catch (error) {
+								throw new ConfigurationReloadError("MODELS_INVALID", error);
+							}
+							stagedModels = restagedModels;
+							if (!restagedModels.valid || !restagedModels.diagnostics.valid) {
+								throw new ConfigurationReloadError("MODELS_INVALID");
+							}
+							await prepareCandidateSelections(restagedModels);
+							reloadSignal.throwIfAborted();
+							continue;
+						}
+						await prepareLiveModelSelection(modelsCandidate);
+						reloadSignal.throwIfAborted();
+						if (modelsCandidate.isCurrent()) break;
 					}
 					const modelsChanged = stagedModels.changed;
 					const settingsChanged = changedSettings.length > 0;
@@ -18815,11 +18863,33 @@ export class AgentSession {
 							}
 						}
 						if (modelCommitStarted) {
+							const selectedModelBeforeRollback = this.model;
+							const selectedThinkingLevelBeforeRollback = this.thinkingLevel;
+							const selectionRevisionBeforeRollback = this.getUserModelSelectionRevision();
 							try {
 								stagedModels!.rollback();
+								modelRollbackAttempted = true;
+								if (
+									selectedModelBeforeRollback &&
+									this.model === selectedModelBeforeRollback &&
+									this.getUserModelSelectionRevision() === selectionRevisionBeforeRollback
+								) {
+									const restoredModel = this.#modelRegistry
+										.getAvailable()
+										.find(
+											model =>
+												model.provider === selectedModelBeforeRollback.provider &&
+												model.id === selectedModelBeforeRollback.id,
+										);
+									if (restoredModel && !util.isDeepStrictEqual(selectedModelBeforeRollback, restoredModel)) {
+										await this.restoreModelSelectionForRollback(
+											restoredModel,
+											selectedThinkingLevelBeforeRollback,
+										);
+									}
+								}
 							} catch (rollbackError) {
 								rollbackErrors.push(rollbackError);
-							} finally {
 								modelRollbackAttempted = true;
 							}
 						}
@@ -18834,9 +18904,10 @@ export class AgentSession {
 						publicationFenceRelease?.();
 						publicationFenceRelease = undefined;
 					}
-					if (prepared) {
+					const preparedActivation = prepared;
+					if (preparedActivation) {
 						await this.#modelRegistry.withConsumerLease(async () => {
-							await finishPreparedModelProfileActivation(prepared);
+							await finishPreparedModelProfileActivation(preparedActivation);
 						});
 					}
 					if (preparedLiveModelSelection) {

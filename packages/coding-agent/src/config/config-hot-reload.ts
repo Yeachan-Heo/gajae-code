@@ -5,6 +5,8 @@ import * as path from "node:path";
 
 const DEBOUNCE_QUIET_MS = 45;
 const DEBOUNCE_MAX_MS = 300;
+const WATCH_RECOVERY_INITIAL_MS = 100;
+const WATCH_RECOVERY_MAX_MS = 5_000;
 
 export interface ConfigHotReloadPaths {
 	readonly configPath: string;
@@ -60,6 +62,9 @@ interface Binding {
 	readonly paths: ConfigHotReloadPaths;
 	readonly watchers: Map<string, nodeFs.FSWatcher>;
 	readonly watcherIdentities: Map<string, string>;
+	watcherRecoveryTimer: NodeJS.Timeout | undefined;
+	watcherRecoveryDelayMs: number;
+	watcherDirectoryDiscoveryFailed: boolean;
 	initializing: boolean;
 	baselineIdentity: string | undefined;
 	initialReadFailed: boolean;
@@ -216,6 +221,9 @@ export class ConfigHotReloadWatcher {
 			paths,
 			watchers: new Map(),
 			watcherIdentities: new Map(),
+			watcherRecoveryTimer: undefined,
+			watcherRecoveryDelayMs: WATCH_RECOVERY_INITIAL_MS,
+			watcherDirectoryDiscoveryFailed: false,
 			initializing: true,
 			baselineIdentity: undefined,
 			initialReadFailed: false,
@@ -270,8 +278,11 @@ export class ConfigHotReloadWatcher {
 		if (!binding) return;
 		if (binding.debounceTimer) clearTimeout(binding.debounceTimer);
 		binding.debounceTimer = undefined;
+		if (binding.watcherRecoveryTimer) clearTimeout(binding.watcherRecoveryTimer);
+		binding.watcherRecoveryTimer = undefined;
 		for (const watcher of binding.watchers.values()) watcher.close();
 		binding.watchers.clear();
+		binding.watcherIdentities.clear();
 	}
 
 	async #readSources(binding: Binding): Promise<FileSources> {
@@ -316,15 +327,29 @@ export class ConfigHotReloadWatcher {
 			if (desired.has(directory)) continue;
 			watcher.close();
 			binding.watchers.delete(directory);
+			binding.watcherIdentities.delete(directory);
+		}
+		if (
+			binding.watcherDirectoryDiscoveryFailed ||
+			desired.size === 0 ||
+			[...desired.keys()].some(directory => !binding.watchers.has(directory))
+		) {
+			this.#scheduleWatcherRecovery(binding);
+		} else {
+			this.#clearWatcherRecovery(binding);
 		}
 	}
 
 	async #desiredWatchDirectories(binding: Binding): Promise<Map<string, Set<string>>> {
+		let lookupFailed = false;
 		const findDirectories = async (filePath: string): Promise<Set<string>> => {
 			try {
 				return await existingDirectoryAncestors(filePath);
 			} catch (error) {
-				if (this.#isCurrent(binding)) this.#report("watch", error, filePath);
+				if (this.#isCurrent(binding)) {
+					lookupFailed = true;
+					this.#report("watch", error, filePath);
+				}
 				return new Set();
 			}
 		};
@@ -332,6 +357,10 @@ export class ConfigHotReloadWatcher {
 			findDirectories(binding.paths.configPath),
 			findDirectories(binding.paths.modelsPath),
 		]);
+		if (this.#isCurrent(binding)) {
+			binding.watcherDirectoryDiscoveryFailed = lookupFailed;
+			if (lookupFailed) this.#scheduleWatcherRecovery(binding);
+		}
 		const desired = new Map<string, Set<string>>();
 		for (const [targetPath, directories] of [
 			[binding.paths.configPath, configDirectories],
@@ -366,6 +395,7 @@ export class ConfigHotReloadWatcher {
 				if (binding.watcherIdentities.get(directory) === identity) return;
 				binding.watchers.get(directory)!.close();
 				binding.watchers.delete(directory);
+				binding.watcherIdentities.delete(directory);
 			}
 			const watcher = nodeFs.watch(directory, (eventType, filename) => {
 				if (filename === null) {
@@ -375,6 +405,7 @@ export class ConfigHotReloadWatcher {
 				const name = filename.toString();
 				if (eventType === "rename" && name === path.basename(directory)) {
 					binding.watchers.delete(directory);
+					binding.watcherIdentities.delete(directory);
 					watcher.close();
 					this.#scheduleScan(binding);
 					return;
@@ -386,8 +417,10 @@ export class ConfigHotReloadWatcher {
 			watcher.on("error", error => {
 				if (!this.#isCurrent(binding)) return;
 				binding.watchers.delete(directory);
+				binding.watcherIdentities.delete(directory);
 				watcher.close();
 				this.#report("watch", error, directory);
+				this.#scheduleWatcherRecovery(binding);
 			});
 			binding.watchers.set(directory, watcher);
 			binding.watcherIdentities.set(directory, identity);
@@ -395,7 +428,25 @@ export class ConfigHotReloadWatcher {
 		} catch (error) {
 			attempted.add(directory);
 			this.#report("watch", error, directory);
+			this.#scheduleWatcherRecovery(binding);
 		}
+	}
+
+	#scheduleWatcherRecovery(binding: Binding): void {
+		if (!this.#isCurrent(binding) || binding.watcherRecoveryTimer) return;
+		const delay = binding.watcherRecoveryDelayMs;
+		binding.watcherRecoveryDelayMs = Math.min(delay * 2, WATCH_RECOVERY_MAX_MS);
+		binding.watcherRecoveryTimer = setTimeout(() => {
+			binding.watcherRecoveryTimer = undefined;
+			if (this.#isCurrent(binding)) void this.#scan(binding);
+		}, delay);
+		binding.watcherRecoveryTimer.unref?.();
+	}
+
+	#clearWatcherRecovery(binding: Binding): void {
+		if (binding.watcherRecoveryTimer) clearTimeout(binding.watcherRecoveryTimer);
+		binding.watcherRecoveryTimer = undefined;
+		binding.watcherRecoveryDelayMs = WATCH_RECOVERY_INITIAL_MS;
 	}
 
 	#matchesWatchedPath(binding: Binding, directory: string, filename: string): boolean {

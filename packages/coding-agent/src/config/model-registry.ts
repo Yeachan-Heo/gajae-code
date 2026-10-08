@@ -1962,6 +1962,7 @@ export interface ModelsConfigReloadCandidate {
 	readonly changed: boolean;
 	readonly diagnostics: { readonly valid: boolean; readonly errors: readonly unknown[] };
 	readonly registry: ModelRegistry;
+	isCurrent(): boolean;
 	commit(): void;
 	rollback(): void;
 	finalize(): void;
@@ -2560,11 +2561,12 @@ export class ModelRegistry {
 			registry.#rebuildCanonicalIndex();
 		};
 		const expectedGeneration = this.#catalogRefreshGeneration;
+		const isCurrent = () => !this.#disposed && this.#catalogRefreshGeneration === expectedGeneration;
 		const commit = () => {
 			if (finished) throw new Error("Models config reload candidate is no longer active");
 			if (!diagnostics.valid) throw new Error("Cannot commit an invalid models config reload candidate");
 			if (committed) return;
-			if (this.#disposed || this.#catalogRefreshGeneration !== expectedGeneration) {
+			if (!isCurrent()) {
 				throw new Error("Model catalog changed during configuration preflight");
 			}
 			for (const provider of registry.#ownedConfigApiKeys.keys()) {
@@ -2609,7 +2611,7 @@ export class ModelRegistry {
 			this.#notifyCatalogChanged();
 			void registry.dispose();
 		};
-		return { valid: diagnostics.valid, changed, diagnostics, registry, commit, rollback, finalize };
+		return { valid: diagnostics.valid, changed, diagnostics, registry, isCurrent, commit, rollback, finalize };
 	}
 
 	#acquireLease(kind: RegistryLeaseWaiter["kind"], signal?: AbortSignal): Promise<() => void> {

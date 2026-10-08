@@ -14,6 +14,7 @@ import {
 	materializeActiveModelProfileAssignments,
 	materializeModelProfileForDeletion,
 	prepareModelProfileActivation,
+	publishPreparedModelProfileActivation,
 	resolveModelProfileDefaultChain,
 	restoreMaterializedModelProfileForDeletion,
 	rewriteSelectorForProxy,
@@ -24,7 +25,11 @@ import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { BUILTIN_MODEL_PROFILES, mergeModelProfiles } from "../src/config/model-profiles";
 import { kNoAuth, ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
-import { AgentSession, type DefaultFallbackRuntimeState } from "../src/session/agent-session";
+import {
+	AgentSession,
+	type DefaultFallbackRuntimeState,
+	type PreparedProfileModelSelection,
+} from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
 
@@ -260,6 +265,75 @@ describe("model profile activation", () => {
 		expect(session.model).toBe(newerSelection);
 	});
 
+	test("keeps a same-model resume choice made during rollback model restoration", async () => {
+		const baseSession = fakeSession();
+		const restoreStarted = Promise.withResolvers<void>();
+		const allowRestore = Promise.withResolvers<void>();
+		const session = Object.assign(baseSession, {
+			prepareModelSelectionForProfileActivation: async (
+				nextModel: Model,
+				thinkingLevel: ThinkingLevel | undefined,
+				signal?: AbortSignal,
+			): Promise<PreparedProfileModelSelection> => ({
+				sessionId: baseSession.sessionId,
+				model: nextModel,
+				thinkingLevel,
+				committedThinkingLevel: thinkingLevel,
+				previousModel: baseSession.model,
+				previousThinkingLevel: baseSession.thinkingLevel,
+				previousEditMode: "default" as never,
+				signal,
+			}),
+			commitPreparedProfileModelSelection: (selection: PreparedProfileModelSelection) => {
+				baseSession.model = selection.model;
+				baseSession.thinkingLevel = selection.committedThinkingLevel;
+			},
+			restoreModelSelectionForRollback: async (
+				previousModel: Model | undefined,
+				previousThinkingLevel: ThinkingLevel | undefined,
+			) => {
+				baseSession.model = previousModel;
+				baseSession.thinkingLevel = previousThinkingLevel;
+				restoreStarted.resolve();
+				await allowRestore.promise;
+			},
+		});
+		baseSession.recordResumeDefaultModel("provider-c/previous-default");
+		const settings = Settings.isolated();
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: fakeRegistry(),
+			settings,
+			profileName: "profile-a",
+			prepareSessionModelSelection: true,
+		});
+		const profileDefault = prepared.defaultModel;
+		if (!profileDefault) throw new Error("Expected a prepared profile default model");
+		publishPreparedModelProfileActivation(prepared);
+		const publishedDefault = `${profileDefault.provider}/${profileDefault.id}`;
+		let selectionIsCurrent = true;
+		let rollback: Promise<void> | undefined;
+		try {
+			rollback = rollbackPreparedModelProfileActivation(prepared, {
+				isCurrent: () => selectionIsCurrent,
+			});
+			await restoreStarted.promise;
+			selectionIsCurrent = false;
+			baseSession.model = profileDefault;
+			baseSession.thinkingLevel = ThinkingLevel.Low;
+			baseSession.recordResumeDefaultModel(publishedDefault);
+			allowRestore.resolve();
+			await rollback;
+
+			expect(baseSession.model).toBe(profileDefault);
+			expect(baseSession.thinkingLevel).toBe(ThinkingLevel.Low);
+			expect(baseSession.getSessionDefaultModelSelector()).toBe(publishedDefault);
+		} finally {
+			allowRestore.resolve();
+			if (rollback) await Promise.allSettled([rollback]);
+		}
+	});
+
 	test("skips profile preparation when the recovery fence is already stale", async () => {
 		const session = fakeSession();
 		const registry = fakeRegistry();
@@ -371,6 +445,38 @@ describe("model profile activation", () => {
 		expect(session.getActiveModelProfile()).toBeUndefined();
 		expect(settings.getOverride("modelRoles")).toBeUndefined();
 		expect(settings.getOverride("task.agentModelOverrides")).toBeUndefined();
+	});
+
+	test("records recovered role ownership baselines for later profile reloads", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated();
+		const baselineModelRoles = { planner: "provider-c/manual-planner" };
+		const baselineAgentModelOverrides = { architect: "provider-c/manual-architect" };
+		settings.override("modelRoles", baselineModelRoles);
+		settings.override("task.agentModelOverrides", baselineAgentModelOverrides);
+		const noteProfileInstalledOverrides = vi.fn();
+		Object.assign(session, { noteProfileInstalledOverrides });
+
+		await applyModelProfileRuntimeBindings({
+			session,
+			modelRegistry: fakeRegistry() as never,
+			settings,
+			profileName: "profile-a",
+		});
+
+		expect(noteProfileInstalledOverrides).toHaveBeenCalledWith(
+			[],
+			["executor", "architect"],
+			session.model,
+			{ modelRoles: baselineModelRoles, agentModelOverrides: baselineAgentModelOverrides },
+			{
+				modelRoles: {},
+				agentModelOverrides: {
+					executor: "provider-b/executor",
+					architect: "provider-a/architect",
+				},
+			},
+		);
 	});
 
 	test("restores recovered runtime bindings when selection changes during delegation sync", async () => {

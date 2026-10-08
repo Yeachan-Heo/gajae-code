@@ -72,6 +72,7 @@ describe("AgentSession configuration reload", () => {
 		baseUrl: string;
 		apiKey?: string;
 		withProfile?: boolean;
+		profileRoleMapping?: boolean;
 		requiresProvider?: boolean;
 		apiKeyEnv?: string;
 		thinking?: TestModelThinking;
@@ -124,6 +125,7 @@ describe("AgentSession configuration reload", () => {
 						`    required_providers: ${options.requiresProvider ? `[${providerId}]` : "[]"}`,
 						"    model_mapping:",
 						`      default: ${providerId}/${modelIdValue}`,
+						...(options.profileRoleMapping ? [`      planner: ${providerId}/${modelIdValue}`] : []),
 					]
 				: []),
 			"",
@@ -136,6 +138,7 @@ describe("AgentSession configuration reload", () => {
 		additionalModelId?: string;
 		api?: string;
 		withProfile?: boolean;
+		profileRoleMapping?: boolean;
 		requiresProvider?: boolean;
 		apiKeyEnv?: string;
 		thinking?: TestModelThinking;
@@ -158,6 +161,7 @@ describe("AgentSession configuration reload", () => {
 				name: "Before",
 				baseUrl: "https://before.example/v1",
 				withProfile: options?.withProfile,
+				profileRoleMapping: options?.profileRoleMapping,
 				requiresProvider: options?.requiresProvider,
 				apiKeyEnv: options?.apiKeyEnv,
 				thinking: options?.thinking,
@@ -258,6 +262,34 @@ describe("AgentSession configuration reload", () => {
 			modelsChanged: false,
 			changedSettings: [],
 		});
+	});
+
+	it("re-stages the same snapshot after a safe offline catalog refresh", async () => {
+		const { configPath, modelsPath } = await createSession();
+		const staged = candidate(
+			3,
+			configPath,
+			modelsPath,
+			settingsText({ todoEnabled: true, compactionEnabled: false }),
+			modelsText({ name: "After refresh", baseUrl: "https://after-refresh.example/v1" }),
+		);
+		const originalStage = modelRegistry!.stageModelsConfigReload.bind(modelRegistry!);
+		let stageCount = 0;
+		const stageSpy = vi.spyOn(modelRegistry!, "stageModelsConfigReload").mockImplementation(async (...args) => {
+			const stagedModels = await originalStage(...args);
+			stageCount++;
+			if (stageCount === 1) await modelRegistry!.refresh("offline");
+			return stagedModels;
+		});
+
+		await expect(session!.reloadConfiguration(staged, new AbortController().signal)).resolves.toMatchObject({
+			applied: true,
+			settingsChanged: true,
+			modelsChanged: true,
+		});
+		expect(stageSpy).toHaveBeenCalledTimes(2);
+		expect(session!.settings.get("todo.enabled")).toBe(true);
+		expect(session!.model).toMatchObject({ name: "After refresh", baseUrl: "https://after-refresh.example/v1" });
 	});
 
 	it("rejects removing the current manually selected model before superseding pending work", async () => {
@@ -768,7 +800,7 @@ describe("AgentSession configuration reload", () => {
 		}
 	});
 
-	it("does not roll back a committed reload model over a completed cycle choice", async () => {
+	it("preserves a newer user selection and role state during profile reload rollback", async () => {
 		const releasePublicationFence = Promise.withResolvers<void>();
 		const releaseProfileRollback = Promise.withResolvers<void>();
 		const cycleApiKey = Promise.withResolvers<string>();
@@ -788,6 +820,7 @@ describe("AgentSession configuration reload", () => {
 				modelId: "default-model",
 				additionalModelId: "manual-model",
 				withProfile: true,
+				profileRoleMapping: true,
 			});
 			session!.settings.set("modelRoles", { planner: `${provider}/manual-model` });
 			await session!.settings.flushOrThrow();
@@ -844,6 +877,7 @@ describe("AgentSession configuration reload", () => {
 					name: "After",
 					baseUrl: "https://after.example/v1",
 					withProfile: true,
+					profileRoleMapping: true,
 				}),
 			);
 			reload = session!.reloadConfiguration(staged, new AbortController().signal);
@@ -859,17 +893,35 @@ describe("AgentSession configuration reload", () => {
 			releasePublicationFence.resolve();
 			await waitFor(() => profileRollbackStarted);
 			cycleApiKey.resolve("temporary-cycle-key");
-			await expect(cycle).resolves.toMatchObject({ model: { id: "manual-model" } });
+			await expect(cycle).resolves.toMatchObject({ model: { id: "manual-model" }, role: "planner" });
+			const manualModel = modelRegistry!.find(provider, "manual-model");
+			if (!manualModel) throw new Error("Expected the manual model to remain available during rollback");
+			await session!.setModelTemporary(manualModel, undefined, {
+				cause: "user-selection",
+				persistAsSessionDefault: true,
+			});
+			const selectedModel = session!.model;
+			const selectedChain = session!.getConfiguredModelChainState("default");
+			const selectedAgentOverrides = session!.settings.getOverride("task.agentModelOverrides");
+			const selectedProfile = session!.getActiveModelProfile();
+			const selectedInstalledOverrides = session!.getProfileInstalledOverrideState();
+			expect(selectedAgentOverrides?.planner).not.toBe(`${provider}/manual-model`);
+			expect(selectedProfile).toBeUndefined();
 			releaseProfileRollback.resolve();
 			await expect(reload).rejects.toMatchObject({ code: "PUBLICATION_FAILED" });
 
-			expect(restoreModelSpy).not.toHaveBeenCalled();
+			expect(restoreModelSpy).toHaveBeenCalledTimes(1);
+			expect(restoreModelSpy.mock.calls[0]?.[0]).toMatchObject({
+				id: "manual-model",
+				baseUrl: "https://before.example/v1",
+			});
 			expect(session!.model).toMatchObject({ id: "manual-model", baseUrl: "https://before.example/v1" });
 			expect(modelRegistry!.find(provider, "default-model")?.baseUrl).toBe("https://before.example/v1");
-			expect(session!.getConfiguredModelChainState("default")).toMatchObject({
-				entries: [`${provider}/default-model`],
-				identity: "active-profile",
-			});
+			expect(session!.model).not.toBe(selectedModel);
+			expect(session!.getConfiguredModelChainState("default")).toEqual(selectedChain);
+			expect(session!.settings.getOverride("task.agentModelOverrides")).toEqual(selectedAgentOverrides);
+			expect(session!.getActiveModelProfile()).toBe(selectedProfile);
+			expect(session!.getProfileInstalledOverrideState()).toEqual(selectedInstalledOverrides);
 		} finally {
 			releasePublicationFence.resolve();
 			releaseProfileRollback.resolve();
