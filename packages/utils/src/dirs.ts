@@ -15,7 +15,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import * as nativeBindings from "@gajae-code/natives";
+import * as nativeBindings from "@gajae-code/natives/path-identity";
 import { resolveCanonicalLogsDir } from "./canonical-log-dir";
 import { APP_NAME } from "./cli-metadata";
 import { canonicalEnvKey, type ProjectEnvSnapshot, projectEnvSnapshot } from "./env-file";
