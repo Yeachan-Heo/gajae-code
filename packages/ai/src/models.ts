@@ -104,13 +104,34 @@ export function getBundledModels(provider: GeneratedProvider): Model<Api>[] {
 	return models ? (Array.from(models.values()) as Model<Api>[]) : [];
 }
 
+function calculateAnthropicCacheWriteCost<TApi extends Api>(
+	model: Model<TApi>,
+	usage: Usage,
+	pricing: Model<TApi>["cost"],
+): number {
+	if (model.api !== "anthropic-messages" || usage.cttl === undefined) {
+		return (pricing.cacheWrite / 1_000_000) * usage.cacheWrite;
+	}
+
+	const fiveMinuteTokens = usage.cttl.ephemeral5m ?? 0;
+	const oneHourTokens = usage.cttl.ephemeral1h ?? 0;
+	if (fiveMinuteTokens + oneHourTokens !== usage.cacheWrite) {
+		return (pricing.cacheWrite / 1_000_000) * usage.cacheWrite;
+	}
+
+	// 5m writes use the catalog cacheWrite rate; 1h writes cost 2x base input.
+	// `pricing` already includes Haiku 5.5's 5x over-100K prompt multiplier.
+	// https://platform.claude.com/docs/en/about-claude/pricing#model-pricing
+	return (pricing.cacheWrite * fiveMinuteTokens + pricing.input * 2 * oneHourTokens) / 1_000_000;
+}
+
 export function calculateCost<TApi extends Api>(model: Model<TApi>, usage: Usage): Usage["cost"] {
 	const inputTokens = usage.input + usage.cacheRead + usage.cacheWrite;
 	const pricing = getOpenAIModelCost(model, inputTokens) ?? getAnthropicModelCost(model, inputTokens) ?? model.cost;
 	usage.cost.input = (pricing.input / 1000000) * usage.input;
 	usage.cost.output = (pricing.output / 1000000) * usage.output;
 	usage.cost.cacheRead = (pricing.cacheRead / 1000000) * usage.cacheRead;
-	usage.cost.cacheWrite = (pricing.cacheWrite / 1000000) * usage.cacheWrite;
+	usage.cost.cacheWrite = calculateAnthropicCacheWriteCost(model, usage, pricing);
 	usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite;
 	return usage.cost;
 }

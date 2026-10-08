@@ -287,6 +287,42 @@ describe("calculateCost", () => {
 		expect(aboveThreshold.cost.total).toBeCloseTo(0.049800625, 10);
 	});
 
+	it("prices Anthropic cache writes by TTL and Haiku's long-context tier", () => {
+		const cacheUsage = (cacheWrite: number, cttl: Usage["cttl"]): Usage => ({
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite,
+			totalTokens: cacheWrite,
+			cttl,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-5-5");
+		const sonnetOneHour = cacheUsage(1_000_000, { ephemeral1h: 1_000_000 });
+		calculateCost(sonnet, sonnetOneHour);
+		expect(sonnetOneHour.cost.cacheWrite).toBe(4);
+		const incompleteTtl = cacheUsage(1_000_000, { ephemeral1h: 500_000 });
+		calculateCost(sonnet, incompleteTtl);
+		expect(incompleteTtl.cost.cacheWrite).toBe(2.5);
+
+		const haiku = getBundledModel("anthropic", "claude-haiku-5-5");
+		const fiveMinuteAtThreshold = cacheUsage(100_000, { ephemeral5m: 100_000 });
+		const oneHourAtThreshold = cacheUsage(100_000, { ephemeral1h: 100_000 });
+		const oneHourAboveThreshold = cacheUsage(100_001, { ephemeral1h: 100_001 });
+		calculateCost(haiku, fiveMinuteAtThreshold);
+		calculateCost(haiku, oneHourAtThreshold);
+		calculateCost(haiku, oneHourAboveThreshold);
+
+		expect(fiveMinuteAtThreshold.cost.cacheWrite).toBeCloseTo(0.0125, 12);
+		expect(oneHourAtThreshold.cost.cacheWrite).toBeCloseTo(0.02, 12);
+		expect(oneHourAboveThreshold.cost.cacheWrite).toBeCloseTo(0.100001, 12);
+
+		const openAi = getBundledModel("openai", "gpt-4o-mini");
+		const openAiUsage = cacheUsage(1_000_000, { ephemeral1h: 1_000_000 });
+		calculateCost(openAi, openAiUsage);
+		expect(openAiUsage.cost.cacheWrite).toBe(openAi.cost.cacheWrite);
+	});
+
 	it("switches GPT-6 Sol pricing only above 272K input tokens", () => {
 		const model = getBundledModel("openai-codex", "gpt-6-sol");
 		const usage = (cacheWrite: number): Usage => ({
