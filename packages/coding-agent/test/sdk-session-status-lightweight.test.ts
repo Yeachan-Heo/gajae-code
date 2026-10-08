@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { SessionRouter, SessionRouterOptions } from "../src/sdk/router";
+import type { SessionRouterOptions } from "../src/sdk/router";
+import { SessionRouter } from "../src/sdk/router";
 
 describe("sdk session status lightweight mode", () => {
 	test("lightweight mode is accepted by SessionRouterOptions", () => {
