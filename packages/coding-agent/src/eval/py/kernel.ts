@@ -83,6 +83,22 @@ interface KernelStartOptions extends KernelLifecycleOptions {
 	onStartupFailure?: (kernel: PythonKernel) => Promise<void>;
 }
 
+export type PythonKernelStartupCleanupFailure =
+	| { kind: "unconfirmed"; result: KernelShutdownResult }
+	| { kind: "rejected"; error: unknown };
+
+/** Startup failed after a real runner was created and physical cleanup failed. */
+export class PythonKernelStartError extends Error {
+	constructor(
+		readonly kernel: PythonKernel,
+		readonly startupError: unknown,
+		readonly cleanupFailure: PythonKernelStartupCleanupFailure,
+	) {
+		super("Python kernel startup failed and runner cleanup was not confirmed", { cause: startupError });
+		this.name = "PythonKernelStartError";
+	}
+}
+
 interface KernelShutdownOptions {
 	signal?: AbortSignal;
 	timeoutMs?: number;
@@ -341,12 +357,18 @@ export class PythonKernel {
 			await kernel.#executeWithBudget(PYTHON_PRELUDE, startup.signal, startupBudget, "Python kernel prelude");
 			return kernel;
 		} catch (err) {
+			let cleanupFailure: PythonKernelStartupCleanupFailure | undefined;
 			try {
-				if (options.onStartupFailure) await options.onStartupFailure(kernel);
-				else await kernel.shutdown({ timeoutMs: SHUTDOWN_GRACE_MS });
-			} catch {
-				/* Preserve the original startup error over any cleanup failure. */
+				if (options.onStartupFailure) {
+					await options.onStartupFailure(kernel);
+				} else {
+					const result = await kernel.shutdown({ timeoutMs: SHUTDOWN_GRACE_MS });
+					if (!result.confirmed) cleanupFailure = { kind: "unconfirmed", result };
+				}
+			} catch (cleanupError) {
+				cleanupFailure = { kind: "rejected", error: cleanupError };
 			}
+			if (cleanupFailure) throw new PythonKernelStartError(kernel, err, cleanupFailure);
 			throw err;
 		}
 	}

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -9,11 +9,17 @@ import {
 	type PythonResult,
 } from "@gajae-code/coding-agent/eval/py/executor";
 import * as pythonKernel from "@gajae-code/coding-agent/eval/py/kernel";
-import { type KernelShutdownResult, PythonKernel } from "@gajae-code/coding-agent/eval/py/kernel";
+import {
+	type KernelShutdownResult,
+	PythonKernel,
+	PythonKernelStartError,
+} from "@gajae-code/coding-agent/eval/py/kernel";
 import { TempDir } from "@gajae-code/utils";
 
 const originalStart = PythonKernel.start;
 const originalAvailability = pythonKernel.checkPythonKernelAvailability;
+let skipPythonCheckBeforeEach: string | undefined;
+let cleanupFailures: unknown[] = [];
 
 function trackStartedKernels(): PythonKernel[] {
 	const kernels: PythonKernel[] = [];
@@ -76,6 +82,41 @@ async function waitForProcessGone(pid: number, timeoutMs = 5_000): Promise<void>
 	expect(isProcessAlive(pid)).toBe(false);
 }
 
+async function shutdownAndConfirm(kernel: PythonKernel): Promise<void> {
+	const result = await kernel.shutdown();
+	if (!result.confirmed) throw new Error(`Python kernel ${kernel.id} shutdown was not confirmed`);
+}
+
+function observeRunnerPid(cwd: string): () => number | undefined {
+	const spawn = Bun.spawn.bind(Bun);
+	let pid: number | undefined;
+	function spawnObserver<
+		const In extends Bun.SpawnOptions.Writable = "ignore",
+		const Out extends Bun.SpawnOptions.Readable = "pipe",
+		const Err extends Bun.SpawnOptions.Readable = "inherit",
+	>(options: Bun.SpawnOptions.SpawnOptions<In, Out, Err> & { cmd: string[] }): Bun.Subprocess<In, Out, Err>;
+	function spawnObserver<
+		const In extends Bun.SpawnOptions.Writable = "ignore",
+		const Out extends Bun.SpawnOptions.Readable = "pipe",
+		const Err extends Bun.SpawnOptions.Readable = "inherit",
+	>(commands: string[], options?: Bun.SpawnOptions.SpawnOptions<In, Out, Err>): Bun.Subprocess<In, Out, Err>;
+	function spawnObserver<
+		const In extends Bun.SpawnOptions.Writable = "ignore",
+		const Out extends Bun.SpawnOptions.Readable = "pipe",
+		const Err extends Bun.SpawnOptions.Readable = "inherit",
+	>(
+		command: string[] | (Bun.SpawnOptions.SpawnOptions<In, Out, Err> & { cmd: string[] }),
+		options?: Bun.SpawnOptions.SpawnOptions<In, Out, Err>,
+	): Bun.Subprocess<In, Out, Err> {
+		const proc = Array.isArray(command) ? spawn(command, options) : spawn(command);
+		const spawnOptions = Array.isArray(command) ? options : command;
+		if (spawnOptions?.cwd === cwd && spawnOptions.detached === true) pid = proc.pid;
+		return proc;
+	}
+	vi.spyOn(Bun, "spawn").mockImplementation(spawnObserver);
+	return () => pid;
+}
+
 async function flushMicrotasks(turns = 6): Promise<void> {
 	for (let turn = 0; turn < turns; turn += 1) await Promise.resolve();
 }
@@ -94,10 +135,40 @@ async function waitForRequest<T>(promise: Promise<T>, timeoutMs: number, message
 	}
 }
 
+function markSettled(promise: Promise<unknown>, onSettled: () => void): void {
+	void promise.then(onSettled, onSettled);
+}
+
+async function joinCleanupTasks(tasks: Promise<unknown>[]): Promise<void> {
+	const settled = await Promise.allSettled(tasks);
+	for (const result of settled) {
+		if (result.status === "rejected") cleanupFailures.push(result.reason);
+	}
+}
+
+function cleanupFailuresFrom(settled: PromiseSettledResult<unknown>[]): AggregateError | undefined {
+	const failures = settled.flatMap(result => (result.status === "rejected" ? [result.reason] : []));
+	return failures.length > 0 ? new AggregateError(failures, "Python cleanup tasks failed") : undefined;
+}
+
+beforeEach(() => {
+	skipPythonCheckBeforeEach = Bun.env.PI_PYTHON_SKIP_CHECK;
+	cleanupFailures = [];
+});
+
 afterEach(async () => {
-	await disposeAllKernelSessions();
-	PythonKernel.start = originalStart;
-	vi.restoreAllMocks();
+	const failures = [...cleanupFailures];
+	try {
+		await disposeAllKernelSessions();
+	} catch (error) {
+		failures.push(error);
+	} finally {
+		PythonKernel.start = originalStart;
+		vi.restoreAllMocks();
+		if (skipPythonCheckBeforeEach === undefined) delete Bun.env.PI_PYTHON_SKIP_CHECK;
+		else Bun.env.PI_PYTHON_SKIP_CHECK = skipPythonCheckBeforeEach;
+	}
+	if (failures.length > 0) throw new AggregateError(failures, "Python owner-cleanup fixture cleanup failed");
 });
 
 describe("python executor owner cleanup", () => {
@@ -149,13 +220,27 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 	resourceOwnersAfterCleanup,
 }));
 } finally {
-	await executor?.disposeAllKernelSessions();
-	await execution?.catch(() => undefined);
-	if (kernel.isAlive()) {
-		const shutdown = await kernel.shutdown();
-		if (!shutdown.confirmed) throw new Error("Borrowed Python kernel shutdown was not confirmed");
-	}
-	await lifecycle.disposeAllResourceOwners();
+	const shutdown = (async () => {
+		let firstFailure;
+		try {
+			const first = await kernel.shutdown();
+			if (first.confirmed) return;
+			firstFailure = new Error("Borrowed Python kernel shutdown was unconfirmed");
+		} catch (error) {
+			firstFailure = error;
+		}
+		const retry = await kernel.shutdown();
+		if (!retry.confirmed) throw new AggregateError([firstFailure], "Borrowed Python kernel retry was unconfirmed");
+		throw new Error("First borrowed Python kernel cleanup attempt failed", { cause: firstFailure });
+	})();
+	const cleanupResults = await Promise.allSettled([
+		executor.disposeAllKernelSessions(),
+		...(execution ? [execution] : []),
+		shutdown,
+		lifecycle.disposeAllResourceOwners(),
+	]);
+	const cleanupFailure = cleanupResults.find(result => result.status === "rejected");
+	if (cleanupFailure?.status === "rejected") throw cleanupFailure.reason;
 }
 }, 30_000);
 `;
@@ -216,7 +301,7 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			await disposeKernelSessionsByOwner("owner-b");
 			expect(kernels[0].isAlive()).toBe(false);
 		} finally {
-			await disposeAllKernelSessions();
+			await joinCleanupTasks([disposeAllKernelSessions()]);
 		}
 	}, 30_000);
 
@@ -259,7 +344,7 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			expect(stillUnrelated.exitCode).toBe(0);
 			expect(kernels).toHaveLength(3);
 		} finally {
-			await disposeAllKernelSessions();
+			await joinCleanupTasks([disposeAllKernelSessions()]);
 		}
 	}, 30_000);
 
@@ -278,7 +363,7 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			await disposeKernelSessionsByOwner("fallback-session");
 			expect(kernels[0].isAlive()).toBe(false);
 		} finally {
-			await disposeAllKernelSessions();
+			await joinCleanupTasks([disposeAllKernelSessions()]);
 		}
 	}, 30_000);
 
@@ -299,10 +384,12 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			expect(result.cancelled).toBe(true);
 			expect(kernel.isAlive()).toBe(true);
 		} finally {
-			await disposeKernelSessionsByOwner("borrowed-owner");
-			await execution?.catch(() => undefined);
-			await kernel.shutdown();
-			await disposeAllKernelSessions();
+			await joinCleanupTasks([
+				disposeKernelSessionsByOwner("borrowed-owner"),
+				...(execution ? [execution] : []),
+				shutdownAndConfirm(kernel),
+				disposeAllKernelSessions(),
+			]);
 		}
 	}, 30_000);
 
@@ -336,10 +423,10 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			repeatedCleanup = disposeKernelSessionsByOwner("owner-a");
 			let firstSettled = false;
 			let repeatedSettled = false;
-			void cleanup.then(() => {
+			markSettled(cleanup, () => {
 				firstSettled = true;
 			});
-			void repeatedCleanup.then(() => {
+			markSettled(repeatedCleanup, () => {
 				repeatedSettled = true;
 			});
 			await flushMicrotasks();
@@ -359,9 +446,11 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			expect(kernels[1].isAlive()).toBe(true);
 		} finally {
 			releaseShutdown.resolve();
-			await (cleanup ?? disposeKernelSessionsByOwner("owner-a"));
-			await repeatedCleanup;
-			await disposeAllKernelSessions();
+			await joinCleanupTasks([
+				cleanup ?? disposeKernelSessionsByOwner("owner-a"),
+				...(repeatedCleanup ? [repeatedCleanup] : []),
+				disposeAllKernelSessions(),
+			]);
 		}
 	}, 30_000);
 
@@ -423,10 +512,10 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			cleanupB = disposeKernelSessionsByOwner(options.kernelOwnerId);
 			let cleanupASettled = false;
 			let cleanupBSettled = false;
-			void cleanupA.then(() => {
+			markSettled(cleanupA, () => {
 				cleanupASettled = true;
 			});
-			void cleanupB.then(() => {
+			markSettled(cleanupB, () => {
 				cleanupBSettled = true;
 			});
 			await waitForProcessGone(pidB);
@@ -461,10 +550,10 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 				...(executionB ? [executionB] : []),
 				disposeAllKernelSessions(),
 			]);
-			const failed = settled.find(result => result.status === "rejected");
-			if (failed?.status === "rejected") {
+			const failure = cleanupFailuresFrom(settled);
+			if (failure) {
 				cleanupFailed = true;
-				cleanupError = failed.reason;
+				cleanupError = failure;
 			}
 		}
 		if (bodyFailed) throw bodyError;
@@ -505,7 +594,7 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 							"abort",
 							() => {
 								nestedCleanup = disposeKernelSessionsByOwner(ownerId);
-								void nestedCleanup.then(() => {
+								markSettled(nestedCleanup, () => {
 									nestedSettled = true;
 								});
 							},
@@ -596,10 +685,10 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 				...(execution ? [execution] : []),
 				disposeAllKernelSessions(),
 			]);
-			const failed = settled.find(result => result.status === "rejected");
-			if (failed?.status === "rejected") {
+			const failure = cleanupFailuresFrom(settled);
+			if (failure) {
 				cleanupFailed = true;
-				cleanupError = failed.reason;
+				cleanupError = failure;
 			}
 		}
 		if (bodyFailed) throw bodyError;
@@ -659,10 +748,10 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			cleanupB = disposeAllKernelSessions();
 			let cleanupASettled = false;
 			let cleanupBSettled = false;
-			void cleanupA.then(() => {
+			markSettled(cleanupA, () => {
 				cleanupASettled = true;
 			});
-			void cleanupB.then(() => {
+			markSettled(cleanupB, () => {
 				cleanupBSettled = true;
 			});
 			await waitForProcessGone(pidB);
@@ -697,10 +786,10 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 				...(executionB ? [executionB] : []),
 				disposeAllKernelSessions(),
 			]);
-			const failed = settled.find(result => result.status === "rejected");
-			if (failed?.status === "rejected") {
+			const failure = cleanupFailuresFrom(settled);
+			if (failure) {
 				cleanupFailed = true;
-				cleanupError = failed.reason;
+				cleanupError = failure;
 			}
 		}
 		if (bodyFailed) throw bodyError;
@@ -742,7 +831,7 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			expect(shutdownCalls).toBe(2);
 			expect(kernel.isAlive()).toBe(false);
 		} finally {
-			await disposeAllKernelSessions();
+			await joinCleanupTasks([disposeAllKernelSessions()]);
 		}
 	}, 30_000);
 
@@ -851,10 +940,10 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 				...(pid !== undefined ? [waitForProcessGone(pid)] : []),
 				disposeAllKernelSessions(),
 			]);
-			const failed = settled.find(result => result.status === "rejected");
-			if (failed?.status === "rejected") {
+			const failure = cleanupFailuresFrom(settled);
+			if (failure) {
 				cleanupFailed = true;
-				cleanupError = failed.reason;
+				cleanupError = failure;
 			}
 		}
 		if (bodyFailed) throw bodyError;
@@ -880,7 +969,7 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			await entered.promise;
 			cleanup = disposeKernelSessionsByOwner("owner-a");
 			let cleanupSettled = false;
-			void cleanup.then(() => {
+			markSettled(cleanup, () => {
 				cleanupSettled = true;
 			});
 			await flushMicrotasks();
@@ -894,9 +983,11 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			expect(kernels).toHaveLength(0);
 		} finally {
 			release.resolve();
-			await (cleanup ?? disposeKernelSessionsByOwner("owner-a"));
-			await execution?.catch(() => undefined);
-			await disposeAllKernelSessions();
+			await joinCleanupTasks([
+				cleanup ?? disposeKernelSessionsByOwner("owner-a"),
+				...(execution ? [execution] : []),
+				disposeAllKernelSessions(),
+			]);
 		}
 	}, 30_000);
 
@@ -936,7 +1027,7 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 
 			cleanup = disposeKernelSessionsByOwner("owner-a");
 			let cleanupSettled = false;
-			void cleanup.then(() => {
+			markSettled(cleanup, () => {
 				cleanupSettled = true;
 			});
 			await flushMicrotasks();
@@ -952,9 +1043,11 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			expect(kernel.isAlive()).toBe(false);
 		} finally {
 			release.resolve();
-			await (cleanup ?? disposeKernelSessionsByOwner("owner-a"));
-			await execution?.catch(() => undefined);
-			await disposeAllKernelSessions();
+			await joinCleanupTasks([
+				cleanup ?? disposeKernelSessionsByOwner("owner-a"),
+				...(execution ? [execution] : []),
+				disposeAllKernelSessions(),
+			]);
 		}
 	}, 30_000);
 
@@ -1019,7 +1112,7 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			);
 			expect(resultA.cancelled).toBe(true);
 			let cleanupSettled = false;
-			void ownerCleanup.then(() => {
+			markSettled(ownerCleanup, () => {
 				cleanupSettled = true;
 			});
 			await flushMicrotasks();
@@ -1042,7 +1135,7 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			expect(kernel.isAlive()).toBe(false);
 		} finally {
 			release.resolve();
-			await Promise.allSettled([
+			await joinCleanupTasks([
 				...(ownerCleanup ? [ownerCleanup] : []),
 				...(executionA ? [executionA] : []),
 				...(executionB ? [executionB] : []),
@@ -1146,10 +1239,10 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			if (!ownerCleanup || !reentrantCleanup) throw new Error("Creation callback did not trigger cleanup reentry");
 			let ownerCleanupSettled = false;
 			let reentrantCleanupSettled = false;
-			void ownerCleanup.then(() => {
+			markSettled(ownerCleanup, () => {
 				ownerCleanupSettled = true;
 			});
-			void reentrantCleanup?.then(() => {
+			markSettled(reentrantCleanup, () => {
 				reentrantCleanupSettled = true;
 			});
 			expect(reentrantCleanup).toBeDefined();
@@ -1190,10 +1283,10 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 				disposeKernelSessionsByOwner("owner-b"),
 				disposeAllKernelSessions(),
 			]);
-			const failed = settled.find(result => result.status === "rejected");
-			if (failed?.status === "rejected") {
+			const failure = cleanupFailuresFrom(settled);
+			if (failure) {
 				cleanupFailed = true;
-				cleanupError = failed.reason;
+				cleanupError = failure;
 			}
 		}
 		if (bodyFailed) throw bodyError;
@@ -1207,37 +1300,13 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 		const ownerId = "partial-start-owner";
 		const startupError = new Error("injected actual creation-callback failure");
 		const shutdownError = new Error("first partial-start shutdown rejected");
-		const spawn = Bun.spawn.bind(Bun);
+		const getRunnerPid = observeRunnerPid(cwd);
 		let pid: number | undefined;
 		let kernel: PythonKernel | undefined;
 		let creationCallbacks = 0;
 		let startupFailureCallbacks = 0;
 		let shutdownCalls = 0;
 		let cleanup: Promise<void> | undefined;
-		function spawnObserver<
-			const In extends Bun.SpawnOptions.Writable = "ignore",
-			const Out extends Bun.SpawnOptions.Readable = "pipe",
-			const Err extends Bun.SpawnOptions.Readable = "inherit",
-		>(options: Bun.SpawnOptions.SpawnOptions<In, Out, Err> & { cmd: string[] }): Bun.Subprocess<In, Out, Err>;
-		function spawnObserver<
-			const In extends Bun.SpawnOptions.Writable = "ignore",
-			const Out extends Bun.SpawnOptions.Readable = "pipe",
-			const Err extends Bun.SpawnOptions.Readable = "inherit",
-		>(commands: string[], options?: Bun.SpawnOptions.SpawnOptions<In, Out, Err>): Bun.Subprocess<In, Out, Err>;
-		function spawnObserver<
-			const In extends Bun.SpawnOptions.Writable = "ignore",
-			const Out extends Bun.SpawnOptions.Readable = "pipe",
-			const Err extends Bun.SpawnOptions.Readable = "inherit",
-		>(
-			command: string[] | (Bun.SpawnOptions.SpawnOptions<In, Out, Err> & { cmd: string[] }),
-			options?: Bun.SpawnOptions.SpawnOptions<In, Out, Err>,
-		): Bun.Subprocess<In, Out, Err> {
-			const proc = Array.isArray(command) ? spawn(command, options) : spawn(command);
-			const spawnOptions = Array.isArray(command) ? options : command;
-			if (spawnOptions && spawnOptions.cwd === cwd && spawnOptions.detached === true) pid = proc.pid;
-			return proc;
-		}
-		vi.spyOn(Bun, "spawn").mockImplementation(spawnObserver);
 		vi.spyOn(PythonKernel, "start").mockImplementation(async options => {
 			const registerKernel = options.onKernelCreated;
 			const handleStartupFailure = options.onStartupFailure;
@@ -1272,6 +1341,7 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			expect(creationCallbacks).toBe(1);
 			expect(startupFailureCallbacks).toBe(1);
 			expect(shutdownCalls).toBe(1);
+			pid = getRunnerPid();
 			if (!kernel || pid === undefined) throw new Error("Actual runner process was not captured at creation");
 			expect(isProcessAlive(pid)).toBe(true);
 			expect(kernel.isAlive()).toBe(true);
@@ -1282,9 +1352,307 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			await waitForProcessGone(pid);
 			expect(kernel.isAlive()).toBe(false);
 		} finally {
-			await Promise.allSettled([
+			await joinCleanupTasks([
 				...(cleanup ? [cleanup] : [disposeKernelSessionsByOwner(ownerId)]),
 				disposeAllKernelSessions(),
+				...(pid !== undefined ? [waitForProcessGone(pid)] : []),
+			]);
+		}
+	}, 30_000);
+
+	it("keeps a fallback owner through another request's failed preflight", async () => {
+		Bun.env.PI_PYTHON_SKIP_CHECK = "1";
+		using tempDir = TempDir.createSync("@gjc-python-fallback-preflight-");
+		const cwd = tempDir.path();
+		const pidFile = `${cwd}/fallback-owner.pid`;
+		const releaseStart = Promise.withResolvers<void>();
+		const started = Promise.withResolvers<PythonKernel>();
+		const preflightError = new Error("B preflight failed before acquisition");
+		let rejectBPreflight = false;
+		let startCalls = 0;
+		let executionA: Promise<PythonResult> | undefined;
+		let executionB: Promise<PythonResult> | undefined;
+		let executionASettled = false;
+		let executionBSettled = false;
+		let globalCleanup: Promise<void> | undefined;
+		let pid: number | undefined;
+		let bodyError: unknown;
+		vi.spyOn(pythonKernel, "checkPythonKernelAvailability").mockImplementation(async (...args) => {
+			if (args[0] === cwd && rejectBPreflight) {
+				rejectBPreflight = false;
+				throw preflightError;
+			}
+			return await originalAvailability(...args);
+		});
+		vi.spyOn(PythonKernel, "start").mockImplementation(async options => {
+			startCalls += 1;
+			const created = await originalStart(options);
+			if (options.cwd === cwd) {
+				const marked = await created.execute(
+					`from pathlib import Path\nimport os\nPath(${JSON.stringify(pidFile)}).write_text(str(os.getpid()))`,
+				);
+				if (marked.status !== "ok") throw new Error("Could not observe the fallback initializer PID");
+				started.resolve(created);
+				await releaseStart.promise;
+			}
+			return created;
+		});
+		try {
+			executionA = executePython("print('fallback A remains active')", {
+				cwd,
+				sessionId: "fallback-preflight-session",
+				kernelMode: "session",
+			});
+			markSettled(executionA, () => {
+				executionASettled = true;
+			});
+			const actualKernel = await started.promise;
+			pid = await waitForProcessFile(pidFile);
+			expect(actualKernel.isAlive()).toBe(true);
+			rejectBPreflight = true;
+			executionB = executePython("print('B must fail before acquisition')", {
+				cwd,
+				sessionId: "fallback-preflight-session",
+				kernelMode: "session",
+				kernelOwnerId: "explicit-owner-b",
+			});
+			markSettled(executionB, () => {
+				executionBSettled = true;
+			});
+			await expect(executionB).rejects.toBe(preflightError);
+			expect(actualKernel.isAlive()).toBe(true);
+			expect(isProcessAlive(pid)).toBe(true);
+			expect(startCalls).toBe(1);
+
+			releaseStart.resolve();
+			const resultA = await executionA;
+			expect(resultA.exitCode).toBe(0);
+			expect(actualKernel.isAlive()).toBe(true);
+			globalCleanup = disposeAllKernelSessions();
+			await globalCleanup;
+			await waitForProcessGone(pid);
+			expect(actualKernel.isAlive()).toBe(false);
+			expect(startCalls).toBe(1);
+		} catch (error) {
+			bodyError = error;
+		} finally {
+			releaseStart.resolve();
+			await joinCleanupTasks([
+				...(executionA && !executionASettled ? [executionA] : []),
+				...(executionB && !executionBSettled ? [executionB] : []),
+				...(globalCleanup ? [globalCleanup] : []),
+				disposeAllKernelSessions(),
+				...(pid !== undefined ? [waitForProcessGone(pid)] : []),
+			]);
+		}
+		if (bodyError !== undefined) throw bodyError;
+	}, 30_000);
+
+	it("direct PythonKernel.start exposes a real spawned kernel when standalone cleanup rejects", async () => {
+		Bun.env.PI_PYTHON_SKIP_CHECK = "1";
+		using tempDir = TempDir.createSync("@gjc-python-direct-start-retention-");
+		const cwd = tempDir.path();
+		const startupError = new Error("direct kernel creation callback failed");
+		const shutdownError = new Error("direct startup shutdown rejected");
+		const getRunnerPid = observeRunnerPid(cwd);
+		let kernel: PythonKernel | undefined;
+		let shutdownCalls = 0;
+		let startError: PythonKernelStartError | undefined;
+		try {
+			await PythonKernel.start({
+				cwd,
+				onKernelCreated: created => {
+					kernel = created;
+					const shutdown = created.shutdown.bind(created);
+					created.shutdown = async shutdownOptions => {
+						shutdownCalls += 1;
+						if (shutdownCalls === 1) throw shutdownError;
+						return await shutdown(shutdownOptions);
+					};
+					throw startupError;
+				},
+			});
+			throw new Error("Direct kernel start unexpectedly succeeded");
+		} catch (error) {
+			if (!(error instanceof PythonKernelStartError)) {
+				const pid = getRunnerPid();
+				await joinCleanupTasks([
+					...(kernel ? [shutdownAndConfirm(kernel)] : []),
+					...(pid !== undefined ? [waitForProcessGone(pid)] : []),
+				]);
+				throw error;
+			}
+			startError = error;
+		}
+		try {
+			const pid = getRunnerPid();
+			if (!startError) throw new Error("Standalone startup did not report cleanup failure");
+			if (!kernel) throw new Error("Actual standalone Python kernel was not captured before startup failure");
+			expect(startError.startupError).toBe(startupError);
+			expect(startError.cause).toBe(startupError);
+			expect(startError.cleanupFailure).toEqual({ kind: "rejected", error: shutdownError });
+			expect(startError.kernel).toBe(kernel);
+			expect(shutdownCalls).toBe(1);
+			if (pid === undefined) throw new Error("Actual standalone Python runner PID was not observed");
+			expect(isProcessAlive(pid)).toBe(true);
+			expect(startError.kernel.isAlive()).toBe(true);
+			const result = await startError.kernel.shutdown();
+			expect(result.confirmed).toBe(true);
+			expect(shutdownCalls).toBe(2);
+			await waitForProcessGone(pid);
+		} finally {
+			const pid = getRunnerPid();
+			await joinCleanupTasks([
+				...(kernel ? [shutdownAndConfirm(kernel)] : []),
+				...(pid !== undefined ? [waitForProcessGone(pid)] : []),
+			]);
+		}
+		expect(kernel?.isAlive()).toBe(false);
+	}, 30_000);
+
+	it("direct startup failure reports the real shutdown outcome without assuming PID state", async () => {
+		Bun.env.PI_PYTHON_SKIP_CHECK = "1";
+		using tempDir = TempDir.createSync("@gjc-python-direct-start-outcome-");
+		const cwd = tempDir.path();
+		const startupError = new Error("direct startup failed after spawn");
+		const getRunnerPid = observeRunnerPid(cwd);
+		let kernel: PythonKernel | undefined;
+		let shutdownCalls = 0;
+		try {
+			let startError: unknown;
+			try {
+				await PythonKernel.start({
+					cwd,
+					onKernelCreated: created => {
+						kernel = created;
+						const shutdown = created.shutdown.bind(created);
+						created.shutdown = async shutdownOptions => {
+							shutdownCalls += 1;
+							return await shutdown(
+								shutdownCalls === 1 ? { ...shutdownOptions, timeoutMs: 0 } : shutdownOptions,
+							);
+						};
+						throw startupError;
+					},
+				});
+				throw new Error("Direct startup unexpectedly succeeded");
+			} catch (error) {
+				startError = error;
+			}
+			if (startError instanceof PythonKernelStartError) {
+				expect(startError.startupError).toBe(startupError);
+				if (startError.cleanupFailure.kind === "unconfirmed") {
+					expect(startError.cleanupFailure.result.confirmed).toBe(false);
+				} else {
+					expect(startError.cleanupFailure.error).toBeDefined();
+				}
+				kernel = startError.kernel;
+				const retry = await kernel.shutdown();
+				expect(retry.confirmed).toBe(true);
+				expect(shutdownCalls).toBe(2);
+			} else {
+				expect(startError).toBe(startupError);
+			}
+			const pid = getRunnerPid();
+			if (pid === undefined) throw new Error("Actual direct-start runner PID was not observed");
+			await waitForProcessGone(pid);
+			expect(kernel).toBeDefined();
+		} finally {
+			const pid = getRunnerPid();
+			await joinCleanupTasks([
+				...(kernel ? [shutdownAndConfirm(kernel)] : []),
+				...(pid !== undefined ? [waitForProcessGone(pid)] : []),
+			]);
+		}
+	}, 30_000);
+
+	it("does not publish a replacement when cancellation arrives during failed-initializer retry", async () => {
+		using tempDir = TempDir.createSync("@gjc-python-cancel-retry-startup-");
+		const cwd = tempDir.path();
+		const getRunnerPid = observeRunnerPid(cwd);
+		const retryEntered = Promise.withResolvers<void>();
+		const releaseRetry = Promise.withResolvers<void>();
+		const startupError = new Error("retry startup callback failed");
+		const shutdownError = new Error("initial partial-start shutdown rejected");
+		let kernel: PythonKernel | undefined;
+		let startCalls = 0;
+		let shutdownCalls = 0;
+		let pid: number | undefined;
+		let initialExecution: Promise<PythonResult> | undefined;
+		let retryExecution: Promise<PythonResult> | undefined;
+		let cleanup: Promise<void> | undefined;
+		const retryController = new AbortController();
+		vi.spyOn(PythonKernel, "start").mockImplementation(async options => {
+			startCalls += 1;
+			const registerKernel = options.onKernelCreated;
+			const handleStartupFailure = options.onStartupFailure;
+			return await originalStart({
+				...options,
+				onKernelCreated: created => {
+					registerKernel?.(created);
+					if (options.cwd !== cwd) return;
+					kernel = created;
+					const shutdown = created.shutdown.bind(created);
+					created.shutdown = async shutdownOptions => {
+						shutdownCalls += 1;
+						if (shutdownCalls === 1) throw shutdownError;
+						if (shutdownCalls === 2) {
+							retryEntered.resolve();
+							await releaseRetry.promise;
+						}
+						return await shutdown(shutdownOptions);
+					};
+					throw startupError;
+				},
+				onStartupFailure: async failed => {
+					await handleStartupFailure?.(failed);
+				},
+			});
+		});
+		try {
+			initialExecution = executePython("print('initial start')", {
+				cwd,
+				sessionId: "cancel-during-initializer-retry",
+				kernelMode: "session",
+				kernelOwnerId: "retry-owner",
+			});
+			await expect(initialExecution).rejects.toBe(startupError);
+			expect(shutdownCalls).toBe(1);
+			if (!kernel) throw new Error("Partial-start callback did not retain its real kernel");
+			pid = getRunnerPid();
+			if (pid === undefined) throw new Error("Partial-start runner PID was not observed");
+			expect(kernel.isAlive()).toBe(true);
+			expect(isProcessAlive(pid)).toBe(true);
+
+			retryExecution = executePython("print('cancelled retry')", {
+				cwd,
+				sessionId: "cancel-during-initializer-retry",
+				kernelMode: "session",
+				kernelOwnerId: "retry-owner",
+				signal: retryController.signal,
+			});
+			await retryEntered.promise;
+			retryController.abort(new DOMException("cancel retry", "AbortError"));
+			releaseRetry.resolve();
+			const result = await retryExecution;
+			expect(result.cancelled).toBe(true);
+			expect(startCalls).toBe(1);
+			expect(shutdownCalls).toBe(2);
+			await waitForProcessGone(pid);
+			expect(kernel.isAlive()).toBe(false);
+			cleanup = disposeAllKernelSessions();
+			await cleanup;
+			expect(startCalls).toBe(1);
+		} finally {
+			releaseRetry.resolve();
+			retryController.abort();
+			await joinCleanupTasks([
+				...(retryExecution ? [retryExecution] : []),
+				...(cleanup ? [cleanup] : []),
+				disposeKernelSessionsByOwner("retry-owner"),
+				disposeAllKernelSessions(),
+				...(kernel ? [shutdownAndConfirm(kernel)] : []),
+				...(pid !== undefined ? [waitForProcessGone(pid)] : []),
 			]);
 		}
 	}, 30_000);
@@ -1352,8 +1720,7 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			expect(kernel.isAlive()).toBe(false);
 		} finally {
 			release.resolve();
-			await execution?.catch(() => undefined);
-			await disposeAllKernelSessions();
+			await joinCleanupTasks([...(execution ? [execution] : []), disposeAllKernelSessions()]);
 		}
 	}, 30_000);
 
@@ -1391,7 +1758,7 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			expect(physicallyCreated).toHaveLength(0);
 			globalCleanup = disposeAllKernelSessions();
 			let cleanupSettled = false;
-			void globalCleanup.then(() => {
+			markSettled(globalCleanup, () => {
 				cleanupSettled = true;
 			});
 
@@ -1434,9 +1801,11 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			expect(kernels[0].isAlive()).toBe(true);
 		} finally {
 			release.resolve();
-			await (globalCleanup ?? disposeAllKernelSessions());
-			await executionA?.catch(() => undefined);
-			await disposeAllKernelSessions();
+			await joinCleanupTasks([
+				globalCleanup ?? disposeAllKernelSessions(),
+				...(executionA ? [executionA] : []),
+				disposeAllKernelSessions(),
+			]);
 		}
 	}, 30_000);
 
@@ -1469,8 +1838,7 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			await disposeKernelSessionsByOwner("owner-a");
 		} finally {
 			controller.abort();
-			await execution?.catch(() => undefined);
-			await disposeAllKernelSessions();
+			await joinCleanupTasks([...(execution ? [execution] : []), disposeAllKernelSessions()]);
 		}
 	}, 30_000);
 
@@ -1505,9 +1873,7 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			expect(kernels).toHaveLength(1);
 			expect(kernels[0].isAlive()).toBe(false);
 		} finally {
-			await disposeAllKernelSessions();
-			await first?.catch(() => undefined);
-			await queued?.catch(() => undefined);
+			await joinCleanupTasks([disposeAllKernelSessions(), ...(first ? [first] : []), ...(queued ? [queued] : [])]);
 		}
 	}, 30_000);
 });
