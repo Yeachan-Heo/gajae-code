@@ -127,8 +127,6 @@ export function closePartialSvg(source: string): string | null {
 
 /** `var(--name)` / `var(--name, fallback)`; the fallback may hold one level of parentheses (`rgb(…)`). */
 const VAR_REFERENCE = /var\(\s*--([\w-]+)\s*(?:,\s*((?:[^()]|\([^()]*\))*))?\)/g;
-/** The first `<svg …>` start tag (namespace prefix allowed). */
-const ROOT_TAG = /<(?:[\w.-]+:)?svg(?=[\s/>])[^>]*>/;
 
 /**
  * Make a figure's source what an SVG rasterizer draws as written, in the
@@ -148,14 +146,59 @@ export function prepareSvg(svg: string, palette: Readonly<Record<string, string>
 		(_match, name: string, fallback: string | undefined) => palette[name] ?? (fallback?.trim() || fg),
 	);
 	const usesXlink = resolved.includes("xlink:");
-	return resolved.replace(ROOT_TAG, tag => {
-		let added = "";
-		if (!/\scolor\s*=/.test(tag)) added += ` color="${fg}"`;
-		if (!/\sfont-family\s*=/.test(tag)) added += ` font-family="sans-serif"`;
-		if (!/\sxmlns\s*=/.test(tag)) added += ` xmlns="http://www.w3.org/2000/svg"`;
-		if (usesXlink && !/\sxmlns:xlink\s*=/.test(tag)) added += ` xmlns:xlink="http://www.w3.org/1999/xlink"`;
-		return added ? tag.replace(/^<[^\s/>]+/, `$&${added}`) : tag;
-	});
+	const root = findRootSvgTag(resolved);
+	if (!root) return resolved;
+	let added = "";
+	if (!hasSvgAttribute(root.tag, "color")) added += ` color="${fg}"`;
+	if (!hasSvgAttribute(root.tag, "font-family")) added += ` font-family="sans-serif"`;
+	if (!hasSvgAttribute(root.tag, "xmlns")) added += ` xmlns="http://www.w3.org/2000/svg"`;
+	if (usesXlink && !hasSvgAttribute(root.tag, "xmlns:xlink")) {
+		added += ` xmlns:xlink="http://www.w3.org/1999/xlink"`;
+	}
+	if (!added) return resolved;
+	const tag = root.tag.replace(/^<[^\s/>]+/, `$&${added}`);
+	return `${resolved.slice(0, root.start)}${tag}${resolved.slice(root.end)}`;
+}
+
+/** The first quote-aware `<svg …>` start tag (namespace prefix allowed). */
+function findRootSvgTag(source: string): { start: number; end: number; tag: string } | undefined {
+	let start = source.indexOf("<");
+	while (start >= 0) {
+		const end = constructEnd(source, start);
+		if (end < 0) return undefined;
+		const tag = source.slice(start, end);
+		if (/^<(?:[\w.-]+:)?svg(?=[\s/>])/.test(tag)) return { start, end, tag };
+		start = source.indexOf("<", end);
+	}
+	return undefined;
+}
+
+/** Whether the quote-aware root tag declares `attribute` outside another value. */
+function hasSvgAttribute(tag: string, attribute: string): boolean {
+	const name = /^<(?:[\w.-]+:)?svg(?=[\s/>])/.exec(tag)?.[0];
+	if (!name) return false;
+	let index = name.length;
+	while (index < tag.length) {
+		while (/\s/.test(tag[index] ?? "")) index++;
+		if (tag[index] === "/" || tag[index] === ">") return false;
+		const start = index;
+		while (index < tag.length && !/[\s=/>]/.test(tag[index] ?? "")) index++;
+		const current = tag.slice(start, index);
+		while (/\s/.test(tag[index] ?? "")) index++;
+		if (tag[index] !== "=") return false;
+		index++;
+		while (/\s/.test(tag[index] ?? "")) index++;
+		const quote = tag[index];
+		if (quote === "'" || quote === '"') {
+			index++;
+			while (index < tag.length && tag[index] !== quote) index++;
+			index++;
+		} else {
+			while (index < tag.length && !/[\s>]/.test(tag[index] ?? "")) index++;
+		}
+		if (current === attribute) return true;
+	}
+	return false;
 }
 
 /** Index just past the markup construct starting at `<` (`lt`), or -1 when it is not complete yet. */

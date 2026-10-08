@@ -1,5 +1,6 @@
 import { LRUCache } from "lru-cache/raw";
 import { Marked, marked, type Token, Tokenizer, type Tokens } from "marked";
+import { hasSvgFence } from "../chat/svg-source";
 import type { SymbolTheme } from "../symbols";
 import { TERMINAL } from "../terminal-capabilities";
 import type { Component } from "../tui";
@@ -308,11 +309,21 @@ export interface MarkdownTheme {
 	 */
 	resolveMermaidAscii?: (source: string) => string | null;
 	/**
-	 * Resolve an SVG figure component by fenced block source text.
+	 * Resolve an SVG figure component by fenced block source text. Components
+	 * are retained by fence order for the lifetime of this Markdown instance.
 	 * Return null or undefined to fall back to fenced code rendering.
 	 */
-	resolveSvgFigure?: (source: string) => Component | null | undefined;
+	resolveSvgFigure?: (source: string, context: SvgFigureResolveContext) => Component | null | undefined;
 	symbols: SymbolTheme;
+}
+
+export interface SvgFigureResolveContext {
+	/** The message is still streaming; the resolver should treat this fence as non-final. */
+	streaming: boolean;
+	/** Request a repaint after the figure's asynchronous output changes. */
+	onChange: () => void;
+	/** The component previously resolved for this fence position, if any. */
+	previous?: Component;
 }
 
 interface InlineStyleContext {
@@ -382,6 +393,10 @@ export class Markdown implements Component {
 	#lastFullParseAt = 0;
 	#onStaleThrottle?: () => void;
 	#staleThrottleTimer?: ReturnType<typeof setTimeout>;
+	#hasDynamicSvgFigures: boolean;
+	#dynamicFigures = new Map<number, Component>();
+	#nextDynamicFigureIndex = 0;
+	#disposed = false;
 
 	constructor(
 		text: string,
@@ -392,6 +407,7 @@ export class Markdown implements Component {
 		codeBlockIndent: number = 2,
 	) {
 		this.#text = text;
+		this.#hasDynamicSvgFigures = theme.resolveSvgFigure !== undefined && hasSvgFence(text);
 		this.#paddingX = paddingX;
 		this.#paddingY = paddingY;
 		this.#theme = theme;
@@ -409,6 +425,7 @@ export class Markdown implements Component {
 		}
 		if (this.#text !== text) this.#rejectedParseKey = undefined;
 		this.#text = text;
+		this.#hasDynamicSvgFigures = this.#theme.resolveSvgFigure !== undefined && hasSvgFence(text);
 		if (this.#streaming) {
 			return;
 		}
@@ -446,9 +463,11 @@ export class Markdown implements Component {
 	}
 
 	dispose(): void {
+		this.#disposed = true;
 		this.#clearStaleThrottleTimer();
 		this.#currentParse = undefined;
 		this.#rejectedParseKey = undefined;
+		this.#disposeDynamicFiguresFrom(0);
 	}
 
 	invalidate(): void {
@@ -456,6 +475,40 @@ export class Markdown implements Component {
 		this.#cachedWidth = undefined;
 		this.#cachedLines = undefined;
 		this.#cachedAnchorSpans = undefined;
+		this.#lastFullParseAt = 0;
+		this.#clearStaleThrottleTimer();
+	}
+
+	#disposeDynamicFiguresFrom(startIndex: number): void {
+		for (const [index, component] of this.#dynamicFigures) {
+			if (index < startIndex) continue;
+			this.#dynamicFigures.delete(index);
+			component.dispose?.();
+		}
+	}
+
+	#resolveDynamicFigure(source: string): Component | undefined {
+		const index = this.#nextDynamicFigureIndex++;
+		const previous = this.#dynamicFigures.get(index);
+		const component = this.#theme.resolveSvgFigure?.(source, {
+			streaming: this.#streaming,
+			onChange: () => {
+				if (this.#disposed) return;
+				this.invalidate();
+				this.#onStaleThrottle?.();
+			},
+			previous,
+		});
+		if (component) {
+			if (previous && previous !== component) previous.dispose?.();
+			this.#dynamicFigures.set(index, component);
+			return component;
+		}
+		// Retain a failed resolver component so its owner can retry it when the
+		// source at this fence position changes instead of rasterizing the same
+		// final failure on every redraw.
+		if (previous) this.#dynamicFigures.set(index, previous);
+		return undefined;
 	}
 
 	#exceedsHighlightCap(code: string): boolean {
@@ -511,9 +564,12 @@ export class Markdown implements Component {
 	}
 
 	#render(width: number, includeAnchors: boolean): { lines: string[]; spans?: Array<ViewportAnchorSpan | null> } {
+		if (!this.#hasDynamicSvgFigures) this.#disposeDynamicFiguresFrom(0);
+
 		// L1: per-instance cache — fastest path for repeated renders of the same
 		// instance at the same width (e.g. resize debounce, repeated redraws).
 		if (
+			!this.#hasDynamicSvgFigures &&
 			this.#cachedLines &&
 			this.#cachedText === this.#text &&
 			this.#cachedWidth === width &&
@@ -526,6 +582,7 @@ export class Markdown implements Component {
 		const contentWidth = Math.max(1, width - this.#paddingX * 2);
 
 		if (
+			!this.#hasDynamicSvgFigures &&
 			this.#streaming &&
 			this.#cachedLines &&
 			this.#cachedWidth === width &&
@@ -567,6 +624,7 @@ export class Markdown implements Component {
 		const cacheKey = `${contentKey}\x00${width}\x00${this.#paddingX}\x00${this.#paddingY}\x00${this.#codeBlockIndent}\x00${objectId(this.#theme)}\x00${this.#defaultTextStyle ? objectId(this.#defaultTextStyle) : -1}\x00${TERMINAL.imageProtocol ?? ""}\x00${TERMINAL.hyperlinks ? 1 : 0}\x00${bgColorProbe}\x00${headingProbe}`;
 		const cached = renderCache.get(cacheKey);
 		if (
+			!this.#hasDynamicSvgFigures &&
 			cached !== undefined &&
 			cached.source === normalizedText &&
 			(!includeAnchors || cached.anchorSpans !== undefined)
@@ -606,6 +664,7 @@ export class Markdown implements Component {
 		const renderedLines: string[] = [];
 		const tokenBoundaries: Array<{ start: number; end: number; srcLo: number; srcHi: number; units: number[] }> = [];
 		let srcOffset = 0;
+		this.#nextDynamicFigureIndex = 0;
 
 		for (let i = 0; i < tokens.length; i++) {
 			const token = tokens[i];
@@ -631,6 +690,7 @@ export class Markdown implements Component {
 				});
 			}
 		}
+		this.#disposeDynamicFiguresFrom(this.#nextDynamicFigureIndex);
 
 		let wrappedLines: string[];
 		let wrappedSpans: Array<ViewportAnchorSpan | null> | undefined;
@@ -758,16 +818,24 @@ export class Markdown implements Component {
 		}
 		if (!this.#streaming || this.#text !== renderedText) this.#currentParse = undefined;
 
-		// Update L1 per-instance cache
-		this.#cachedText = renderedText;
-		this.#cachedWidth = width;
-		this.#cachedLines = result;
-		this.#cachedAnchorSpans = anchorSpans;
-		this.#lastFullParseAt = markdownNow();
+		// Async SVG figures must be rendered again after their raster changes; do
+		// not retain their pending or terminal-image output in the text-only L1/L2.
+		if (this.#hasDynamicSvgFigures) {
+			this.#cachedText = undefined;
+			this.#cachedWidth = undefined;
+			this.#cachedLines = undefined;
+			this.#cachedAnchorSpans = undefined;
+		} else {
+			this.#cachedText = renderedText;
+			this.#cachedWidth = width;
+			this.#cachedLines = result;
+			this.#cachedAnchorSpans = anchorSpans;
+			this.#lastFullParseAt = markdownNow();
+		}
 
 		// Update L2 module-level LRU so future instances with the same key skip
 		// the marked.lexer + highlightCode (Rust FFI) work entirely.
-		if (!this.#streaming) {
+		if (!this.#streaming && !this.#hasDynamicSvgFigures) {
 			renderCache.set(cacheKey, { source: normalizedText, lines: result, ...(anchorSpans ? { anchorSpans } : {}) });
 		}
 
@@ -878,6 +946,7 @@ export class Markdown implements Component {
 		nextTokenType?: string,
 		styleContext?: InlineStyleContext,
 		units?: number[],
+		allowSvgFigure = true,
 	): string[] {
 		const lines: string[] = [];
 
@@ -927,9 +996,11 @@ export class Markdown implements Component {
 					}
 				}
 
-				// Handle SVG figures when available
-				if (token.lang === "svg" && this.#theme.resolveSvgFigure) {
-					const figure = this.#theme.resolveSvgFigure(token.text);
+				// Handle SVG figures when available. Marked keeps the complete info
+				// string in token.lang, so match its normalized language token.
+				const language = token.lang?.trim().split(/[ \t]/, 1)[0]?.toLowerCase();
+				if (allowSvgFigure && language === "svg" && this.#theme.resolveSvgFigure) {
+					const figure = this.#resolveDynamicFigure(token.text);
 					if (figure) {
 						// SVG figures are components that render directly
 						const figureLines = figure.render(width);
@@ -997,6 +1068,8 @@ export class Markdown implements Component {
 						quoteContentWidth,
 						nextQuoteToken?.type,
 						quoteInlineStyleContext,
+						undefined,
+						false,
 					);
 					for (let c = 0; c < childLines.length; c++) quoteLineUnit.push(i);
 					renderedQuoteLines.push(...childLines);

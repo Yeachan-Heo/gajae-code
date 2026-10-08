@@ -19,6 +19,7 @@ export * from "./components/spacer";
 export * from "./components/tab-bar";
 export * from "./components/text";
 export * from "./components/truncated-text";
+export * from "./chat/svg-figure";
 // Editor component interface (for custom editors)
 export type * from "./editor-component";
 // Fuzzy matching

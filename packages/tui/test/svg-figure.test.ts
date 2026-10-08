@@ -1,68 +1,76 @@
-import { beforeEach, describe, expect, it, mock } from "bun:test";
+import { beforeEach, describe, expect, it } from "bun:test";
 import { SvgFigure } from "../src/chat/svg-figure";
 import type { ImageTheme } from "../src/components/image";
+import {
+	getCellDimensions,
+	ImageProtocol,
+	setCellDimensions,
+	setTerminalImageProtocol,
+	TERMINAL,
+} from "../src/terminal-capabilities";
+
+const SVG = '<svg width="12" height="7" viewBox="0 0 12 7"><rect width="12" height="7" fill="#f00"/></svg>';
 
 describe("SvgFigure", () => {
-	let onChange: ReturnType<typeof mock>;
 	let theme: ImageTheme;
+	const palette = { fg: "#ffffff" };
 
 	beforeEach(() => {
-		onChange = mock(() => {});
 		theme = {
 			fallbackColor: (str: string) => str,
 		};
 	});
 
 	it("initializes without source", () => {
-		const figure = new SvgFigure({ theme, onChange });
+		const figure = new SvgFigure({ theme, palette, onChange: () => {} });
 		const lines = figure.render(80);
 		expect(lines).toEqual([]);
 	});
 
-	it("returns empty lines while source is streaming", () => {
-		const figure = new SvgFigure({ theme, onChange });
-		figure.update('<svg><rect fill="red"/>', false);
-		const lines = figure.render(80);
-		// While streaming, we may not have a rendered image yet, so check that we don't crash
-		expect(Array.isArray(lines)).toBe(true);
+	it("rerenders retained raster bytes after invalidating its image cache", async () => {
+		const previousProtocol = TERMINAL.imageProtocol;
+		const previousCellDimensions = getCellDimensions();
+		setTerminalImageProtocol(ImageProtocol.Kitty);
+		setCellDimensions({ widthPx: 9, heightPx: 18 });
+		const rasterized = Promise.withResolvers<void>();
+		const figure = new SvgFigure({ theme, palette, onChange: () => rasterized.resolve() });
+		try {
+			figure.update(SVG, true);
+			expect(figure.render(80)).toEqual([]);
+			await rasterized.promise;
+			expect(figure.pending).toBe(false);
+
+			const first = figure.render(80).join("");
+			expect(first).toContain("\x1b_G");
+			expect(figure.debugState()).toMatchObject({ current: true, failed: false, raster: "18x18" });
+
+			figure.invalidate();
+			const afterInvalidate = figure.render(80).join("");
+			expect(afterInvalidate).toContain("\x1b_G");
+		} finally {
+			figure.dispose();
+			setCellDimensions(previousCellDimensions);
+			setTerminalImageProtocol(previousProtocol);
+		}
 	});
 
-	it("calls onChange when updated", async () => {
-		const figure = new SvgFigure({ theme, onChange });
-		figure.update("<svg><rect/></svg>", true);
-		// Wait for microtask to complete
-		await new Promise(resolve => setTimeout(resolve, 0));
-		// onChange may not be called if rasterization fails or hasn't completed
-		expect(typeof figure.pending).toBe("boolean");
-	});
+	it("recovers after a failed final source is replaced by valid SVG", async () => {
+		let changed = Promise.withResolvers<void>();
+		const figure = new SvgFigure({ theme, palette, onChange: () => changed.resolve() });
+		try {
+			figure.update("not an SVG document", true);
+			figure.render(80);
+			await changed.promise;
+			expect(figure.failed).toBe(true);
 
-	it("disposes cleanly", () => {
-		const figure = new SvgFigure({ theme, onChange });
-		figure.update("<svg/>", false);
-		expect(() => figure.dispose()).not.toThrow();
-	});
-
-	it("returns debug state", () => {
-		const figure = new SvgFigure({ theme, onChange });
-		figure.update("<svg/>", true);
-		const state = figure.debugState();
-		expect(state).toHaveProperty("final");
-		expect(state).toHaveProperty("raster");
-		expect(state).toHaveProperty("current");
-	});
-
-	it("invalidates cache", () => {
-		const figure = new SvgFigure({ theme, onChange });
-		figure.update("<svg/>", true);
-		expect(() => figure.invalidate()).not.toThrow();
-	});
-
-	it("reports pending state correctly", () => {
-		const figure = new SvgFigure({ theme, onChange });
-		figure.update("<svg/>", false);
-		expect(figure.pending).toEqual(true);
-		figure.update("<svg/>", true);
-		// After marking as final, pending state depends on whether rasterization has completed
-		expect(typeof figure.pending).toBe("boolean");
+			changed = Promise.withResolvers<void>();
+			figure.update(SVG, true);
+			figure.render(80);
+			await changed.promise;
+			expect(figure.failed).toBe(false);
+			expect(figure.debugState()).toMatchObject({ current: true, failed: false });
+		} finally {
+			figure.dispose();
+		}
 	});
 });

@@ -85,6 +85,50 @@ describe("AssistantMessageComponent mermaid markdown", () => {
 	});
 });
 
+describe("AssistantMessageComponent SVG markdown", () => {
+	it("renders SVG fences as terminal images and repaints after rasterization", async () => {
+		const originalProtocol = TERMINAL.imageProtocol;
+		setTerminalImageProtocol(ImageProtocol.Kitty);
+		const rasterized = Promise.withResolvers<void>();
+		const component = new AssistantMessageComponent(
+			createAssistantMessage(
+				'```svg\n<svg width="10" height="10" viewBox="0 0 10 10"><rect width="10" height="10" fill="#f00"/></svg>\n```',
+			),
+			false,
+			() => rasterized.resolve(),
+		);
+		try {
+			const pending = component.render(120).join("\n");
+			expect(pending).not.toContain("```svg");
+			await rasterized.promise;
+
+			const rendered = component.render(120).join("\n");
+			expect(rendered).toContain("\x1b_G");
+			expect(rendered).not.toContain("<svg");
+		} finally {
+			component.dispose();
+			setTerminalImageProtocol(originalProtocol);
+		}
+	});
+
+	it("falls back to the original fenced code after a final rasterization failure", async () => {
+		const failed = Promise.withResolvers<void>();
+		const component = new AssistantMessageComponent(createAssistantMessage("```svg\n<svg"), false, () =>
+			failed.resolve(),
+		);
+		try {
+			component.render(100);
+			await failed.promise;
+			const rendered = Bun.stripANSI(component.render(100).join("\n"));
+			expect(rendered).toContain("```svg");
+			expect(rendered).toContain("<svg");
+			expect(rendered).not.toContain("[Image: ");
+		} finally {
+			component.dispose();
+		}
+	});
+});
+
 describe("AssistantMessageComponent thinking rendering", () => {
 	it("elides pathological repeated-token thinking loops", () => {
 		const repeated = Array.from({ length: 40 }, () => "is").join(" ");

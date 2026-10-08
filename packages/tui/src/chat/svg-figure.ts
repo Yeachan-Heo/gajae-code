@@ -12,23 +12,22 @@
  *
  * Source: oh-my-pi (https://github.com/can1357/oh-my-pi)
  */
+import type { rasterizeSvg as NativeRasterizeSvg } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
-
-type RasterizeSvgFn = (input: Uint8Array, maxWidthPx: number, maxHeightPx: number) => Promise<Uint8Array>;
-let rasterizeSvg: RasterizeSvgFn | undefined;
-
-async function getRasterizeSvg(): Promise<RasterizeSvgFn> {
-	if (!rasterizeSvg) {
-		const natives = await import("@gajae-code/natives");
-		rasterizeSvg = natives.rasterizeSvg as RasterizeSvgFn;
-	}
-	return rasterizeSvg;
-}
-
 import { Image, type ImageTheme } from "../components/image";
 import { type CellDimensions, getCellDimensions, getImageDimensions } from "../terminal-capabilities";
 import type { Component } from "../tui";
 import { closePartialSvg, prepareSvg } from "./svg-source";
+
+type RasterizeSvgFn = typeof NativeRasterizeSvg;
+let rasterizeSvg: RasterizeSvgFn | undefined;
+
+function getRasterizeSvg(): RasterizeSvgFn {
+	if (!rasterizeSvg) {
+		rasterizeSvg = (require("@gajae-code/natives") as { rasterizeSvg: RasterizeSvgFn }).rasterizeSvg;
+	}
+	return rasterizeSvg;
+}
 
 /** Least time between rasters of a fence that is still streaming. */
 const STREAM_INTERVAL_MS = 200;
@@ -53,25 +52,22 @@ interface Raster {
 	data: string;
 	widthPx: number;
 	heightPx: number;
-	/** Budget key; one per revision so a new raster is a new terminal image. */
-	key: string;
 }
 
 /** Inputs of a raster attempt, successful or not. */
 interface Attempt {
 	source: string;
+	palette: Readonly<Record<string, string>>;
 	cell: CellDimensions;
 	limits: Limits;
 	final: boolean;
 }
 
-let nextFigureId = 0;
-
 /** Cells a figure rendered at `width` may fill: the image's width, a share of the viewport, and the raster edge cap. */
 function limitsFor(width: number, cell: CellDimensions): Limits {
 	const viewportRows = Math.floor((process.stdout.rows || 24) * MAX_VIEWPORT_SHARE);
 	return {
-		columns: Math.min(width - 2, Math.floor(MAX_EDGE_PX / cell.widthPx)),
+		columns: Math.max(1, Math.min(Math.max(1, width - 2), Math.floor(MAX_EDGE_PX / cell.widthPx))),
 		rows: Math.max(1, Math.min(viewportRows, Math.floor(MAX_EDGE_PX / cell.heightPx))),
 	};
 }
@@ -81,17 +77,18 @@ export interface SvgFigureOptions {
 	 * Theme for rendering the image fallback text.
 	 */
 	theme: ImageTheme;
+	/** CSS colors substituted for SVG theme variables and currentColor. */
+	palette: Readonly<Record<string, string>>;
 	/** The figure's rows changed outside a text update: a raster landed or rendering fell back to code. */
 	onChange: () => void;
 }
 
 export class SvgFigure implements Component {
 	readonly #options: SvgFigureOptions;
-	readonly #id = nextFigureId++;
+	#palette: Readonly<Record<string, string>>;
 	#source = "";
 	/** No more text arrives for this fence: no throttling, and a failed raster falls back to code. */
 	#final = false;
-	#revision = 0;
 	#raster: Raster | undefined;
 	#attempt: Attempt | undefined;
 	/** Final source that could not be drawn; rendered as plaintext. */
@@ -108,13 +105,18 @@ export class SvgFigure implements Component {
 
 	constructor(options: SvgFigureOptions) {
 		this.#options = options;
+		this.#palette = options.palette;
 	}
 
 	/** Feed the fence body; `final` once the fence closed or the message stopped streaming. */
-	update(source: string, final: boolean): void {
-		if (source === this.#source && final === this.#final) return;
+	update(source: string, final: boolean, palette = this.#palette): void {
+		const sourceChanged = source !== this.#source;
+		const paletteChanged = palette !== this.#palette;
+		if (!sourceChanged && !paletteChanged && final === this.#final) return;
+		if (sourceChanged || paletteChanged) this.#failed = undefined;
 		this.#source = source;
 		this.#final = final;
+		this.#palette = palette;
 		// Deferred: a block built mid-stream is marked streaming right after it
 		// is mounted, when render() was called already (e.g. by diffing); a
 		// schedule() queued before then is dropped, so the next render() starts
@@ -135,10 +137,7 @@ export class SvgFigure implements Component {
 			this.#schedule();
 		}
 		if (!this.#raster && !this.#failed) return [];
-		if (this.#failed) {
-			// Return failed source as plain text lines split by newlines
-			return this.#failed.split("\n").map(line => line || "");
-		}
+		if (this.failed) return [];
 		if (this.#raster) {
 			const image = this.#imageFor(this.#raster);
 			return image.render(width1);
@@ -147,8 +146,7 @@ export class SvgFigure implements Component {
 	}
 
 	invalidate(): void {
-		this.#raster = undefined;
-		this.#image = undefined;
+		this.#image?.component.invalidate();
 	}
 
 	dispose(): void {
@@ -175,6 +173,7 @@ export class SvgFigure implements Component {
 		return (
 			attempt === undefined ||
 			attempt.source !== this.#source ||
+			attempt.palette !== this.#palette ||
 			attempt.cell.widthPx !== cell.widthPx ||
 			attempt.cell.heightPx !== cell.heightPx ||
 			// A streaming attempt that failed is retried once as final.
@@ -224,6 +223,7 @@ export class SvgFigure implements Component {
 		const cell = getCellDimensions();
 		const attempt: Attempt = {
 			source: this.#source,
+			palette: this.#palette,
 			cell,
 			limits: limitsFor(width, cell),
 			final: this.#final,
@@ -235,13 +235,39 @@ export class SvgFigure implements Component {
 			this.#rasterizing = true;
 			this.#startedAt = performance.now();
 			try {
-				const prepared = prepareSvg(svg, { fg: "#ffffff" });
-				const rasterize = await getRasterizeSvg();
-				png = await rasterize(
+				const prepared = prepareSvg(svg, attempt.palette);
+				const rasterize = getRasterizeSvg();
+				const sourcePng = await rasterize(
 					new TextEncoder().encode(prepared),
 					attempt.limits.columns * cell.widthPx,
 					attempt.limits.rows * cell.heightPx,
 				);
+				const sourceData = Buffer.from(sourcePng).toString("base64");
+				const sourceSize = getImageDimensions(sourceData, "image/png");
+				if (!sourceSize) throw new Error("SVG rasterizer returned invalid PNG dimensions");
+
+				const columns = Math.min(attempt.limits.columns, Math.ceil(sourceSize.widthPx / cell.widthPx));
+				const rows = Math.min(attempt.limits.rows, Math.ceil(sourceSize.heightPx / cell.heightPx));
+				const widthPx = columns * cell.widthPx;
+				const heightPx = rows * cell.heightPx;
+				if (widthPx === sourceSize.widthPx && heightPx === sourceSize.heightPx) {
+					png = sourcePng;
+				} else {
+					// Terminal graphics occupy whole cells. Keep the original raster's
+					// aspect ratio by centering it on a transparent cell-sized canvas;
+					// the embedded data URL is resolved without reading host files.
+					const scale = Math.min(widthPx / sourceSize.widthPx, heightPx / sourceSize.heightPx, 1);
+					const drawnWidth = sourceSize.widthPx * scale;
+					const drawnHeight = sourceSize.heightPx * scale;
+					const x = (widthPx - drawnWidth) / 2;
+					const y = (heightPx - drawnHeight) / 2;
+					const paddedSvg =
+						`<svg xmlns="http://www.w3.org/2000/svg" width="${widthPx}" height="${heightPx}" ` +
+						`viewBox="0 0 ${widthPx} ${heightPx}"><image ` +
+						`href="data:image/png;base64,${sourceData}" x="${x}" y="${y}" ` +
+						`width="${drawnWidth}" height="${drawnHeight}"/></svg>`;
+					png = await rasterize(new TextEncoder().encode(paddedSvg), widthPx, heightPx);
+				}
 			} catch (error) {
 				// A streaming prefix that does not parse yet keeps the previous raster.
 				if (attempt.final) logger.debug("SVG figure did not render", { error: String(error) });
@@ -254,7 +280,7 @@ export class SvgFigure implements Component {
 		const size = data ? getImageDimensions(data, "image/png") : null;
 		if (data && size) {
 			this.#show(attempt, data, size.widthPx, size.heightPx);
-		} else if (attempt.final) {
+		} else if (attempt.final && attempt.source === this.#source && attempt.palette === this.#palette) {
 			this.#failed = attempt.source;
 			this.#options.onChange();
 		}
@@ -263,6 +289,7 @@ export class SvgFigure implements Component {
 	}
 
 	#show(attempt: Attempt, data: string, widthPx: number, heightPx: number): void {
+		if (this.#failed === attempt.source) this.#failed = undefined;
 		this.#raster = {
 			source: attempt.source,
 			cell: attempt.cell,
@@ -270,7 +297,6 @@ export class SvgFigure implements Component {
 			data,
 			widthPx,
 			heightPx,
-			key: `svg${this.#id}:${++this.#revision}`,
 		};
 		this.#options.onChange();
 	}
@@ -289,6 +315,7 @@ export class SvgFigure implements Component {
 			maxWidthCells: columns,
 			maxHeightCells: rows,
 			filename: "svg",
+			refetch: () => raster.data,
 		});
 		this.#image = { raster, component };
 		return component;
@@ -296,5 +323,9 @@ export class SvgFigure implements Component {
 
 	get pending(): boolean {
 		return this.#rasterizing || (this.#final === false && this.#raster === undefined && this.#failed === undefined);
+	}
+
+	get failed(): boolean {
+		return this.#failed === this.#source;
 	}
 }

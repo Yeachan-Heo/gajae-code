@@ -74,4 +74,19 @@ describe("prepareSvg", () => {
 			'<svg color="#eeeeee" font-family="sans-serif" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 1 1"><use xlink:href="#a"/></svg>',
 		);
 	});
+
+	it("scans the complete root tag when an attribute value contains a greater-than sign", () => {
+		const svg = '<svg data-label="1 > 0" xmlns="http://www.w3.org/2000/svg"><rect/></svg>';
+		const prepared = prepareSvg(svg, palette);
+
+		expect(prepared).toContain('data-label="1 > 0"');
+		expect(prepared.match(/\sxmlns=/g)).toHaveLength(1);
+	});
+
+	it("does not treat attribute-value text as root attributes", () => {
+		const svg = `<svg data-label=' xmlns="urn:wrong" color="red" >' xmlns="http://www.w3.org/2000/svg"><rect/></svg>`;
+		expect(prepareSvg(svg, palette)).toBe(
+			`<svg color="#eeeeee" font-family="sans-serif" data-label=' xmlns="urn:wrong" color="red" >' xmlns="http://www.w3.org/2000/svg"><rect/></svg>`,
+		);
+	});
 });
