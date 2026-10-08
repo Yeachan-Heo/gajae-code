@@ -327,7 +327,7 @@ export async function launchBrokerViaPosixTrampoline(
 	child.stdout?.on("data", chunk => {
 		stdout = appendBoundedOutput(stdout, chunk);
 	});
-	const wait = await awaitLauncherCloseBeforeDeadline(child, timeoutMs);
+	const wait = await awaitLauncherCloseBeforeDeadline(child, timeoutMs, () => child.stdout?.destroy());
 	if (wait.kind === "timeout") {
 		return await brokerTrampolineTimeoutResult(child, stdout, timeoutMs, wait.terminated);
 	}
