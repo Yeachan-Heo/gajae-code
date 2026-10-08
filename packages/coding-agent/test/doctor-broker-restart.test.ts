@@ -285,6 +285,38 @@ describe("doctor broker restart protocol", () => {
 		if (outcome.kind === "owner_unavailable") expect(outcome.reason).toBe("no_discovery");
 	});
 
+	it("authorized successors wait through a long session-index transaction within their startup deadline", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-doctor-index-lock-"));
+		const lockPath = path.join(dir, "sdk", "sessions", "index.jsonl.lock");
+		const requestId = "doctor-long-index-lock";
+		await fs.mkdir(lockPath, { recursive: true });
+		await fs.writeFile(
+			path.join(lockPath, "info"),
+			JSON.stringify({ pid: process.pid, timestamp: Date.now(), owner_token: "live-index-owner" }),
+		);
+		const successor = new Broker({
+			agentDir: dir,
+			restartRequestId: requestId,
+			startupCheckpointDeadline: performance.now() + 30_000,
+		});
+		const started = successor.start().then(
+			discovery => ({ kind: "started" as const, discovery }),
+			error => ({ kind: "failed" as const, error }),
+		);
+		try {
+			await Bun.sleep(12_000);
+			await fs.rm(lockPath, { recursive: true, force: true });
+			const outcome = await started;
+			expect(outcome.kind).toBe("started");
+			if (outcome.kind === "failed") throw outcome.error;
+			expect(outcome.discovery.restartRequestId).toBe(requestId);
+		} finally {
+			await fs.rm(lockPath, { recursive: true, force: true });
+			await successor.stop();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	}, 45_000);
+
 	it("restartBrokerForDoctor returns a busy owner's refusal as prepare_refused through the SDK client", async () => {
 		const { dir, broker } = await fixture();
 		await broker.index.append({

@@ -700,6 +700,44 @@ it("records a typed startup-lock refusal when the session-index lock times out",
 	}
 });
 
+it("records retained session-index transitions as retryable lock unavailability", async () => {
+	const dir = await temp();
+	const indexDir = path.join(dir, "sdk", "sessions");
+	const lockPath = path.join(indexDir, "index.jsonl.lock");
+	const transitionPath = path.join(indexDir, "index.jsonl.lock.removing");
+	const indexFilePath = path.join(indexDir, "index.jsonl");
+	const start = spyOn(Broker.prototype, "start").mockRejectedValue(
+		new FileLockAcquireError(
+			indexFilePath,
+			lockPath,
+			600,
+			`held by pid ${process.pid}`,
+			"orphan_transition",
+			transitionPath,
+		),
+	);
+	const stop = spyOn(Broker.prototype, "stop").mockImplementation(async () => undefined);
+	try {
+		const command = new Sdk(["broker-internal", "--agent-dir", dir], {} as never);
+		await expect(command.run()).rejects.toMatchObject({
+			code: "orphan_transition",
+			orphanPath: transitionPath,
+		});
+		expect(await readBrokerStartupExitRecord(dir)).toMatchObject({
+			mode: "startup",
+			reason: "startup-lock-unavailable",
+			blockingLockPath: transitionPath,
+			timeoutMs: null,
+			exitCode: 1,
+			signal: null,
+		});
+	} finally {
+		stop.mockRestore();
+		start.mockRestore();
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+});
+
 it("retries ordinary broker startup after its session-index lock becomes available", async () => {
 	const dir = await temp();
 	const indexDir = path.join(dir, "sdk", "sessions");

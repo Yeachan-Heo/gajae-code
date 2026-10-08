@@ -764,9 +764,16 @@ function reduceEvents(
 const SESSION_INDEX_LOCK_OPTIONS = { retries: 600, retryDelayMs: 100 } as const;
 const SESSION_INDEX_STARTUP_LOCK_WAIT_MS = 10_000;
 
-/** Keep broker bootstrap lock waits bounded while retaining the longer runtime transaction budget. */
-export function sessionIndexStartupLockOptions(deadline: number, signal?: AbortSignal): FileLockOptions {
-	const boundedDeadline = Math.min(deadline, performance.now() + SESSION_INDEX_STARTUP_LOCK_WAIT_MS);
+/** Bound ordinary bootstrap waits; authorized doctor successors may use the full prepared window. */
+export function sessionIndexStartupLockOptions(
+	deadline: number,
+	signal?: AbortSignal,
+	policy: "ordinary" | "authorized-successor" = "ordinary",
+): FileLockOptions {
+	const boundedDeadline =
+		policy === "authorized-successor"
+			? deadline
+			: Math.min(deadline, performance.now() + SESSION_INDEX_STARTUP_LOCK_WAIT_MS);
 	return {
 		...SESSION_INDEX_LOCK_OPTIONS,
 		retries: Math.min(

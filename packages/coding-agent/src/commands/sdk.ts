@@ -1908,8 +1908,10 @@ export default class Sdk extends Command {
 			await exitDuringStartup("startup-signal", startupSignalExitCode(signal), signal);
 			return true;
 		};
+		let startupFenceAcquired = false;
 		try {
 			const startupOperation = async (deadline: number): Promise<Broker | undefined> => {
+				startupFenceAcquired = true;
 				const remainingMs = Math.max(1, deadline - Date.now());
 				const testWatchdogMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_WATCHDOG_MS ?? 0);
 				const watchdogMs =
@@ -2058,9 +2060,14 @@ export default class Sdk extends Command {
 				await finishPendingStartupSignal();
 				return;
 			}
-			// A retained removal transition is an explicit acquire failure, not only
-			// an exhausted ordinary contention timeout.
-			if (error instanceof FileLockAcquireError && error.code === "orphan_transition" && error.orphanPath) {
+			// Only a retained transition on the outer startup fence gets its own
+			// blocked reason. Nested resource-lock failures are retryable unavailability.
+			if (
+				error instanceof FileLockAcquireError &&
+				!startupFenceAcquired &&
+				error.code === "orphan_transition" &&
+				error.orphanPath
+			) {
 				await exitDuringStartup(
 					"startup-lock-blocked",
 					1,
