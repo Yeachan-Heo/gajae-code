@@ -29,7 +29,7 @@ import {
 	type BrokerStartupExitWriteStatus,
 	writeBrokerStartupExitRecordBounded,
 } from "../sdk/broker/broker-exit";
-import { readBrokerDiscovery } from "../sdk/broker/discovery";
+import { readBrokerDiscovery, readBrokerRestartIntent } from "../sdk/broker/discovery";
 import { type EndpointFileRead, readEndpointFile } from "../sdk/broker/endpoint-authority";
 import {
 	BROKER_DISCOVERY_BUDGET,
@@ -1912,7 +1912,22 @@ export default class Sdk extends Command {
 		try {
 			const startupOperation = async (deadline: number): Promise<Broker | undefined> => {
 				startupFenceAcquired = true;
-				const remainingMs = Math.max(1, deadline - Date.now());
+				// Only a matching committed restart intent extends this child's startup
+				// fence beyond the ordinary operation window. The durable lease is the
+				// authority for a doctor successor's longer wait, not an environment value.
+				const restartRequestEnv = process.env.GJC_BROKER_RESTART_REQUEST;
+				const restartRequestId =
+					typeof restartRequestEnv === "string" && /^[A-Za-z0-9_-]{1,256}$/.test(restartRequestEnv)
+						? restartRequestEnv
+						: undefined;
+				const restartIntent = restartRequestId === undefined ? null : await readBrokerRestartIntent(agentDir);
+				const startupDeadlineAt =
+					restartIntent?.phase === "committed" &&
+					restartIntent.requestId === restartRequestId &&
+					restartIntent.expiresAt > Date.now()
+						? restartIntent.expiresAt
+						: deadline;
+				const remainingMs = Math.max(1, startupDeadlineAt - Date.now());
 				const testWatchdogMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_WATCHDOG_MS ?? 0);
 				const watchdogMs =
 					Number.isSafeInteger(testWatchdogMs) && testWatchdogMs > 0 && testWatchdogMs <= remainingMs
@@ -1932,7 +1947,7 @@ export default class Sdk extends Command {
 					});
 				}, watchdogMs);
 				try {
-					const existing = await reconcileBrokerGenerationForStartup({ agentDir }, deadline);
+					const existing = await reconcileBrokerGenerationForStartup({ agentDir }, startupDeadlineAt);
 					if (startupAbortController.signal.aborted) return undefined;
 					if (existing) {
 						logger.info("sdk broker: startup reused an existing owner", {
@@ -1965,15 +1980,6 @@ export default class Sdk extends Command {
 						await Bun.sleep(startupDelayMs);
 					}
 					if (startupAbortController.signal.aborted) return undefined;
-					// The real broker-internal entry point is the only place that reads this
-					// launcher-supplied environment variable; it is validated here and handed
-					// to Broker as a typed setting, never read a second time inside broker.ts
-					// from process.env directly.
-					const restartRequestEnv = process.env.GJC_BROKER_RESTART_REQUEST;
-					const restartRequestId =
-						typeof restartRequestEnv === "string" && /^[A-Za-z0-9_-]{1,256}$/.test(restartRequestEnv)
-							? restartRequestEnv
-							: undefined;
 					const testPostPublicationDelayMs = Number(
 						process.env.GJC_SDK_TEST_BROKER_POST_PUBLICATION_DELAY_MS ?? 0,
 					);
