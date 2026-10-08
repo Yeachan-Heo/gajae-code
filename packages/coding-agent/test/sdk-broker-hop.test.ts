@@ -18,6 +18,7 @@ import {
 	parseBrokerHopReply,
 	reapDetachedBrokerPidForTest,
 	reapSpawnedBrokerForTest,
+	signalPinnedBrokerProcessForTest,
 } from "../src/sdk/broker/ensure";
 import { writeBrokerHopReplyForTest } from "../src/sdk/broker/hop";
 import { observeProcessIncarnation } from "../src/sdk/broker/process-incarnation";
@@ -308,12 +309,31 @@ describe("SDK broker hop protocol", () => {
 				"linux:11",
 				{ gracefulMs: 5, killVerifyMs: 5 },
 				() => observations[index++] ?? { status: "unknown", reasonCode: "test_exhausted" },
+				(pid, _incarnation, signal) => {
+					process.kill(pid, signal);
+					return true;
+				},
 			);
 			expect(kill).toHaveBeenCalledTimes(1);
 			expect(kill).toHaveBeenCalledWith(12345, "SIGTERM");
 		} finally {
 			kill.mockRestore();
 		}
+	});
+
+	test("pinned broker signals require a matching process incarnation", () => {
+		const signals: number[] = [];
+		const reference = {
+			incarnation: "windows:11",
+			signalRoot: (signal: number): boolean => {
+				signals.push(signal);
+				return true;
+			},
+		};
+		expect(signalPinnedBrokerProcessForTest(reference, "windows:12", "SIGTERM")).toBe(false);
+		expect(signals).toEqual([]);
+		expect(signalPinnedBrokerProcessForTest(reference, "windows:11", "SIGTERM")).toBe(true);
+		expect(signals).toEqual([os.constants.signals.SIGTERM]);
 	});
 
 	test("detached reaping does not signal a PID that was already reused", async () => {

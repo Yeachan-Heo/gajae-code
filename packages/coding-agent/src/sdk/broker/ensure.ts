@@ -2,7 +2,9 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { FileHandle } from "node:fs/promises";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import path from "node:path";
+import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import packageJson from "../../../package.json" with { type: "json" };
 import { acquireFileLock, type FileLockOptions, withFileLock } from "../../config/file-lock";
 import { loadInstallationHostId, loadLegacyInstallationHostId } from "../../config/machine-identity";
@@ -758,6 +760,7 @@ interface ReapTiming {
 	gracefulMs: number;
 	killVerifyMs: number;
 }
+type DetachedBrokerSignal = (pid: number, brokerIncarnation: string, signal: NodeJS.Signals) => boolean;
 const DEFAULT_REAP_TIMING: ReapTiming = {
 	gracefulMs: REAP_GRACEFUL_MS,
 	killVerifyMs: REAP_SIGKILL_CAP_MS,
@@ -840,11 +843,42 @@ async function reapSpawnedBroker(
  * already exited, so its ChildProcess carries no signal to await: the real broker
  * is targeted by the reported pid, and every poll/signal is fenced by incarnation.
  */
+interface PinnedBrokerProcess {
+	readonly incarnation: string;
+	signalRoot(signal: number): boolean;
+}
+
+function signalPinnedBrokerProcess(
+	reference: PinnedBrokerProcess | null,
+	expectedIncarnation: string,
+	signal: NodeJS.Signals,
+): boolean {
+	if (!reference || reference.incarnation !== expectedIncarnation) return false;
+	const signalNumber = os.constants.signals[signal];
+	return signalNumber !== undefined && reference.signalRoot(signalNumber);
+}
+
+function signalDetachedBrokerProcess(pid: number, brokerIncarnation: string, signal: NodeJS.Signals): boolean {
+	if (process.platform !== "darwin") {
+		const reference = nativeProcessBindings().Process.fromPid(pid);
+		return signalPinnedBrokerProcess(reference, brokerIncarnation, signal);
+	}
+	// Darwin's signalRoot intentionally fails closed; keep the existing
+	// incarnation-checked process.kill path where the native API cannot bind a signal.
+	try {
+		process.kill(pid, signal);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 async function reapDetachedBrokerPid(
 	pid: number,
 	brokerIncarnation?: string,
 	timing: ReapTiming = DEFAULT_REAP_TIMING,
 	observe: (pid: number) => ProcessIncarnationObservation = observeProcessIncarnation,
+	signalProcess: DetachedBrokerSignal = signalDetachedBrokerProcess,
 ): Promise<void> {
 	const inspect = (): "owned" | "gone" | "unknown" => {
 		const observation = observe(pid);
@@ -867,11 +901,17 @@ async function reapDetachedBrokerPid(
 		if (state === "unknown") {
 			throw new Error(`Detached SDK broker (pid ${pid}) cannot be signaled without a verified process incarnation.`);
 		}
-		try {
-			process.kill(pid, sig);
-		} catch {
-			// The next incarnation observation distinguishes exit from a live process.
+		if (!brokerIncarnation) {
+			throw new Error(`Detached SDK broker (pid ${pid}) cannot be signaled without a verified process incarnation.`);
 		}
+		let delivered = false;
+		try {
+			delivered = signalProcess(pid, brokerIncarnation, sig);
+		} catch {
+			// Re-inspect below; only a confirmed gone/replaced process settles cleanup.
+		}
+		if (!delivered && inspect() !== "gone")
+			throw new Error(`Detached SDK broker (pid ${pid}) could not be signaled under its pinned incarnation.`);
 		return true;
 	};
 	const beforeTermination = inspect();
@@ -1492,8 +1532,17 @@ export function reapDetachedBrokerPidForTest(
 	brokerIncarnation: string | undefined,
 	timing: ReapTiming = DEFAULT_REAP_TIMING,
 	observe: (pid: number) => ProcessIncarnationObservation = observeProcessIncarnation,
+	signalProcess: DetachedBrokerSignal = signalDetachedBrokerProcess,
 ): Promise<void> {
-	return reapDetachedBrokerPid(pid, brokerIncarnation, timing, observe);
+	return reapDetachedBrokerPid(pid, brokerIncarnation, timing, observe, signalProcess);
+}
+/** Test hook: verifies a pinned process handle matches before sending a signal. */
+export function signalPinnedBrokerProcessForTest(
+	reference: PinnedBrokerProcess | null,
+	expectedIncarnation: string,
+	signal: NodeJS.Signals,
+): boolean {
+	return signalPinnedBrokerProcess(reference, expectedIncarnation, signal);
 }
 /** Test hook: resolves the complete broker environment without spawning. */
 export function brokerSpawnEnvironmentForTest(
