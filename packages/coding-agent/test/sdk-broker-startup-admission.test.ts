@@ -2,7 +2,6 @@ import { expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { AcpSdkAdapter } from "../src/sdk/acp";
-import { DEFAULT_SDK_REQUEST_TIMEOUT_MS } from "../src/sdk/client/client";
 import {
 	Broker,
 	StartupAdmissionQueue,
@@ -27,6 +26,7 @@ import {
 	preparationBudgetMs,
 	startupQueueWaitMs,
 } from "../src/sdk/broker/startup-budget";
+import { DEFAULT_SDK_REQUEST_TIMEOUT_MS } from "../src/sdk/client/client";
 import { normalizeSdkStartupFailure } from "../src/sdk/startup-capability";
 
 function controlledTiming(now: () => number): {
