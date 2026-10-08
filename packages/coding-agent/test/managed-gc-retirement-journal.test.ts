@@ -11,6 +11,7 @@ import {
 } from "../src/session/internal/managed-gc-retirement-codec";
 import {
 	bindManagedGcSessionRetirementTarget,
+	cleanupAuthorityMatches,
 	computeManagedScopeDigest,
 	deleteManagedSessionCandidate,
 	discoverManagedGcSessionRetirementReceipts,
@@ -86,6 +87,98 @@ afterEach(() => {
 	vi.restoreAllMocks();
 	ManagedSessionScopeTestHooks.beforeVerifiedDelete = undefined;
 	for (const root of temporaryRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+describe("bounded exchange-placeholder cleanup authority", () => {
+	it("rejects a foreign child without changing its bytes or inode", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "managed-gc-empty-placeholder-"));
+		temporaryRoots.push(root);
+		const parent = path.join(root, "parent");
+		const retainedPath = path.join(parent, ".gjc-exact-unlink-placeholder-test");
+		fs.mkdirSync(parent);
+		fs.mkdirSync(retainedPath);
+		const issued = native.snapshotEmptyDirectory(retainedPath);
+		if (!issued.ok || !issued.snapshot || issued.snapshot.entries.length !== 1)
+			throw new Error("native_empty_placeholder_snapshot_missing");
+		const nativeRoot = issued.snapshot.entries[0];
+		if (!nativeRoot) throw new Error("native_empty_placeholder_root_missing");
+		const parentStat = fs.lstatSync(parent, { bigint: true });
+		const cleanup = {
+			state: "cleanup_pending" as const,
+			role: "exchange_placeholder" as const,
+			retainedPath,
+			identity: {
+				dev: BigInt(nativeRoot.dev),
+				ino: BigInt(nativeRoot.ino),
+				size: BigInt(nativeRoot.size),
+				mtimeNs: BigInt(nativeRoot.mtimeNs),
+				parentDev: parentStat.dev,
+				parentIno: parentStat.ino,
+			},
+			tree: issued.snapshot,
+		};
+		expect(cleanupAuthorityMatches(cleanup, parent)).toBe(true);
+
+		const foreignPath = path.join(retainedPath, "foreign-payload");
+		const foreignBytes = Buffer.alloc(256 * 1024, 0xa7);
+		fs.writeFileSync(foreignPath, foreignBytes);
+		const before = fs.lstatSync(foreignPath, { bigint: true });
+		expect(cleanupAuthorityMatches(cleanup, parent)).toBe(false);
+		expect(fs.readFileSync(foreignPath)).toEqual(foreignBytes);
+		const after = fs.lstatSync(foreignPath, { bigint: true });
+		expect(after.dev).toBe(before.dev);
+		expect(after.ino).toBe(before.ino);
+		expect(after.size).toBe(before.size);
+		expect(after.mtimeNs).toBe(before.mtimeNs);
+	});
+
+	it("rejects a replaced empty path against the original native root identity", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "managed-gc-empty-placeholder-"));
+		temporaryRoots.push(root);
+		const parent = path.join(root, "parent");
+		const retainedPath = path.join(parent, ".gjc-exact-unlink-placeholder-test");
+		const displacedPath = path.join(parent, ".displaced-placeholder");
+		fs.mkdirSync(parent);
+		fs.mkdirSync(retainedPath);
+		const issued = native.snapshotEmptyDirectory(retainedPath);
+		if (!issued.ok || !issued.snapshot || issued.snapshot.entries.length !== 1)
+			throw new Error("native_empty_placeholder_snapshot_missing");
+		const nativeRoot = issued.snapshot.entries[0];
+		if (!nativeRoot) throw new Error("native_empty_placeholder_root_missing");
+		const parentStat = fs.lstatSync(parent, { bigint: true });
+		const cleanup = {
+			state: "cleanup_pending" as const,
+			role: "exchange_placeholder" as const,
+			retainedPath,
+			identity: {
+				dev: BigInt(nativeRoot.dev),
+				ino: BigInt(nativeRoot.ino),
+				size: BigInt(nativeRoot.size),
+				mtimeNs: BigInt(nativeRoot.mtimeNs),
+				parentDev: parentStat.dev,
+				parentIno: parentStat.ino,
+			},
+			tree: issued.snapshot,
+		};
+		const originalBefore = fs.lstatSync(retainedPath, { bigint: true });
+		fs.renameSync(retainedPath, displacedPath);
+		fs.mkdirSync(retainedPath);
+		const replacementBefore = fs.lstatSync(retainedPath, { bigint: true });
+
+		expect(cleanupAuthorityMatches(cleanup, parent)).toBe(false);
+		const replacementAfter = fs.lstatSync(retainedPath, { bigint: true });
+		expect(replacementAfter.dev).toBe(replacementBefore.dev);
+		expect(replacementAfter.ino).toBe(replacementBefore.ino);
+		expect(fs.readdirSync(retainedPath)).toEqual([]);
+		const displaced = fs.lstatSync(displacedPath, { bigint: true });
+		expect([displaced.dev, displaced.ino, displaced.size, displaced.mtimeNs]).toEqual([
+			originalBefore.dev,
+			originalBefore.ino,
+			originalBefore.size,
+			originalBefore.mtimeNs,
+		]);
+		expect(fs.readdirSync(displacedPath)).toEqual([]);
+	});
 });
 
 describe("owner-aware data cannot bypass live consumer authority", () => {
