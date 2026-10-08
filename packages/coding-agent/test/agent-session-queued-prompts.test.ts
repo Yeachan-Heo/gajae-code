@@ -259,7 +259,7 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		expect(userTexts(session)).toEqual(["p1", "steer me", "queue me"]);
 	});
 
-	it("cancels only an implicit diverted text before queue consumption", async () => {
+	it.each(["text", "image"] as const)("cancels only an implicit diverted %s before queue consumption", async mode => {
 		const gate = Promise.withResolvers<void>();
 		session = buildSession([
 			async () => {
@@ -273,15 +273,29 @@ describe("AgentSession queued prompts (issue #434)", () => {
 			await waitUntil(() => session!.agent.state.isStreaming);
 			await session.sendUserMessage("keep steer", { deliverAs: "steer" });
 			const cancelled = new AbortController();
+			const image =
+				mode === "image"
+					? Buffer.from(
+							await Bun.file(path.join(import.meta.dir, "fixtures/sdk-inline-image-large.png")).arrayBuffer(),
+						).toString("base64")
+					: undefined;
+			const text = mode === "image" ? "cancel only this image" : "cancel only this text";
+			const content =
+				image === undefined
+					? text
+					: [
+							{ type: "text" as const, text },
+							{ type: "image" as const, mimeType: "image/png", data: image },
+						];
 			const promotions: Array<{ startsOwnRun?: boolean; removed?: boolean }> = [];
 			const dispositions: Array<{ startsOwnRun: boolean }> = [];
-			await session.sendUserMessage("cancel only this text", {
+			await session.sendUserMessage(content, {
 				preflightSignal: cancelled.signal,
 				onDispatchDisposition: disposition => dispositions.push(disposition),
 				onQueuedPromoted: promotion => promotions.push(promotion),
 			});
 			expect(dispositions).toEqual([{ startsOwnRun: false }]);
-			expect(session.getQueuedMessages().steering).toEqual(["keep steer", "cancel only this text"]);
+			expect(session.getQueuedMessages().steering).toEqual(["keep steer", text]);
 			cancelled.abort();
 			expect(session.getQueuedMessages().steering).toEqual(["keep steer"]);
 			expect(promotions).toEqual([{ startsOwnRun: false, removed: true }]);
@@ -291,6 +305,15 @@ describe("AgentSession queued prompts (issue #434)", () => {
 			await session.waitForIdle();
 			expect(userTexts(session)).toEqual(["original", "keep steer"]);
 			expect(assistantCount(session)).toBe(2);
+			if (image !== undefined)
+				expect(
+					session.agent.state.messages.some(
+						message =>
+							message.role === "user" &&
+							Array.isArray(message.content) &&
+							message.content.some(block => block.type === "image" && block.data === image),
+					),
+				).toBe(false);
 		} finally {
 			gate.resolve();
 			await first;

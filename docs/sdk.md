@@ -449,6 +449,67 @@ progress in the same consuming run and cancellation domain. Session teardown
 retires joined attribution; late predecessor progress or terminal events cannot
 adopt or settle a successor. Transport or delivery failure alone does not prove
 execution settled and does not retire a live unsettled execution owner.
+### ACP inline images and internal staging
+
+ACP clients can submit standard inline `ContentBlock.image` data on both initial
+and follow-up prompts. GJC preserves the encoded image's original bytes and MIME
+type; clients do not need a custom upload API or a `resource_link`. The internal
+SDK frame cap remains 256 KiB. Large inline images cross it through SDK-core-owned
+`turn.image.begin`, `turn.image.append`, `turn.image.finish`, and
+`turn.image.discard` controls, not by increasing the cap or exposing endpoint
+credentials to the ACP client.
+
+Staging is scoped to the authenticated live connection and session. Each upload
+has a two-minute inactivity lease, a declared byte length, MIME type, and SHA-256 digest.
+`turn.image.begin` optionally accepts a nonempty `batchId` of at most 128 characters.
+Successful begin, append, and finish operations renew live uploads only for the same
+authenticated connection and explicit batch; omitted batch IDs renew that upload alone.
+ACP uses its request `clientRef` as the batch label so an early completed image stays
+available while later images are still transferring. Invalid or rejected operations,
+unrelated batches/connections, and cleanup do not renew these leases. Two minutes
+without successful staging progress still retires the batch, without changing quotas.
+Chunks are canonical base64 in sequence, with at most 96 KiB decoded per chunk.
+The host verifies exact length, digest, MIME/header agreement, dimensions, and
+image decoding before a reference is usable. A prompt accepts at most 16 images,
+each at most 20 MiB, with 64 MiB source limits for pending and accepted images and
+a shared 256 MiB process payload/copy budget. Appends coalesce into retained
+96 KiB slabs instead of retaining one Buffer per fragment; tiny uploads reserve
+at least 4 KiB. Session and process staging budgets charge the actual retained
+allocation before it is created, and successful finalization releases slab
+padding. Flexible fragment sizes remain supported without a chunk-count limit.
+Expiry, discard, and connection loss retire unconsumed upload capacity.
+
+Finished references are connection-owned and one-shot. `turn.prompt` consumes
+`stagedImages: [{ id }]`; callers cannot mix them with direct `images` or reuse
+references after redemption, including a subsequent admission rejection. ACP's
+bounded retry after a **confirmed** `busy` response restages the original bytes
+with fresh references. Capacity rejection may precede redemption, so old IDs
+must be discarded or confirmed already gone before fresh staging. Unconfirmed
+cleanup emits a bounded diagnostic and refuses the retry; it does not invent
+capacity release or replay an uncertain mutation. A lost or uncertain acknowledgement is reconciled through
+`turn.result`, never treated as permission to upload and execute the prompt again.
+The user's message is echoed once across a confirmed retry. Upload validation and
+final staged-envelope bounds pass before any text/image echo is published, so an
+upload rejection cannot leave an accepted-looking transcript entry. Validated replies
+for this request's active staging renew only its local ACP inactivity watchdog; they
+are not model/tool activity or execution authority. This pre-dispatch boundary does
+not suppress the user message for later prompt-admission or admitted model failures.
+
+Cancellation applies to the exact outstanding prompt, including successor
+admission while a cancelled image's user-message echo is still being published.
+Before consumption, a prompt diverted into steering retains its own queue-removal
+capability; cancelling it must not abort unrelated active work. After consumption,
+its image quota and durable completion belong to the exact consuming run and
+cancellation domain. A trusted natural terminal settles each joined accepted
+prompt with its own correlation; confirmed queue removal settles that submission
+without waiting for an unrelated run. A deterministic cancellation receipt waits
+for that submission's durable terminal; persistence uncertainty remains uncertain
+on same-key replay. Confirmed queue residence suspends the terminal lease. Actual
+consumption or own-run promotion starts a fresh bounded lease, renewed only by
+attributable progress in the same consuming run and cancellation domain.
+A transport diagnostic or delivery-record
+expiry does not prove execution ended and cannot release accepted-image quota.
+Exact run terminal or session teardown releases retained image quota.
 
 `turn.prompt` remains ordered and non-idempotent. Its envelope `idempotencyKey`
 does not replay a response or produce `idempotency_conflict`. A retained duplicate
@@ -471,8 +532,11 @@ accepted turn count — including a running tool's partial-result `tool_executio
 long-running tool that streams output (e.g. a multi-minute compile) keeps renewing the lease mid-run;
 heartbeats, streaming text/thinking deltas, retries, other turns/sessions, and
 unrelated session noise do not renew the lease, and out-of-order delivery never shortens it. The
-hard maximum is never unbounded: every renewal is capped at `acceptedAt + sdk.promptMaxRuntimeMs` so a
-wedged or continuously noisy prompt still reaches a deterministic terminal outcome. Terminalization then has a fixed `10_000` ms
+hard maximum is never unbounded: every renewal is capped at the lease's start time plus
+`sdk.promptMaxRuntimeMs`. The lease begins at acceptance for a directly executing prompt;
+for confirmed queued input it is suspended during queue residence and begins again at
+actual consumption or own-run promotion, without changing the durable `acceptedAt`.
+A wedged or continuously noisy executing prompt still reaches a deterministic terminal outcome. Terminalization then has a fixed `10_000` ms
 grace period, which is not configurable. A controlled terminal failure reaches ACP
 as JSON-RPC `-32603` with `data.code` of `prompt_failed` or
 `prompt_deadline_exceeded`.

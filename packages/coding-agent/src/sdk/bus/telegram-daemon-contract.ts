@@ -301,8 +301,10 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * Generation 202 joins queued-removal terminal publication before ordinary
  * abort acknowledgement, replacing owners that still acknowledge cancellation
  * before its terminal record is durable.
+ * Generation 203 releases staged image capacity when a queued SDK prompt is
+ * removed, so a pre-fix owner cannot retain that capacity until session close.
  */
-export const DAEMON_GENERATION = 202;
+export const DAEMON_GENERATION = 203;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

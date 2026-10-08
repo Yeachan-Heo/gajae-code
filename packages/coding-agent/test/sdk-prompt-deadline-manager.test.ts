@@ -245,6 +245,36 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		manager.clearAll();
 	});
 
+	test("defers a real terminal while deadline uncertainty is being persisted", async () => {
+		const { reconciliation, state } = fakeReconciliation();
+		const recoveryStarted = Promise.withResolvers<void>();
+		const recoveryRelease = Promise.withResolvers<void>();
+		state.uncertainStarted = () => recoveryStarted.resolve();
+		state.uncertainRelease = recoveryRelease.promise;
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+			onDeadlineTerminalization: async () => "uncertain" as const,
+		});
+		const correlation = { commandId: "cmd-uncertainty-write-fence", turnId: "turn-uncertainty-write-fence" };
+		manager.onAccepted(correlation);
+		await recoveryStarted.promise;
+
+		expect(manager.shouldDeferTerminalTransition(correlation)).toBe(true);
+		manager.noteTerminalTransition(
+			correlation,
+			undefined,
+			{ outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" } },
+			manager.shouldDeferTerminalTransition(correlation),
+		);
+		recoveryRelease.resolve();
+		await Bun.sleep(20);
+		expect(manager.shouldDeferTerminalTransition(correlation)).toBe(true);
+		expect(state.uncertainCalls).toBe(1);
+		manager.clearAll();
+	});
+
 	test("a recovered deadline prompt defers terminal frames without restored run evidence", () => {
 		const { reconciliation } = fakeReconciliation();
 		const manager = new PromptDeadlineManager({
@@ -650,6 +680,7 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		now = 1_000;
 		await claimStarted.promise; // expiry is suspended inside claimPendingOutcome
 		expect(manager.isExpiring(correlation)).toBe(true);
+		expect(manager.shouldDeferTerminalTransition(correlation)).toBe(true);
 		// Fresh attributable progress renews the lease while the claim is in flight.
 		now = 2_000;
 		manager.onAttributableEvent(correlation, "tool_execution_start", now);

@@ -4075,7 +4075,10 @@ export class AgentSession {
 	// A scheduled continuation owns this terminal boundary until it either starts
 	// the successor or proves it cannot. Holds prevent a false idle event while
 	// preserving the predecessor for cancellation and preflight failures.
-	#pendingAgentEndContinuationHolds = new Map<symbol, AgentSessionEvent>();
+	#pendingAgentEndContinuationHolds = new Map<
+		symbol,
+		{ event: AgentSessionEvent | undefined; resourceRunId?: string; predecessorScope?: AttemptScope }
+	>();
 	#deferredAgentEndLeases = new WeakMap<AgentSessionEvent, RunResourceProducerLease>();
 	#sessionSettlementPromise: Promise<void> | undefined;
 	#sessionSettlementResolve: (() => void) | undefined;
@@ -4752,7 +4755,22 @@ export class AgentSession {
 		}
 	}
 
-	#reserveDeferredAgentEndForContinuation(predecessorScope?: AttemptScope): symbol | undefined {
+	#bindDeferredAgentEndToUpcomingContinuations(event: AgentSessionEvent): void {
+		const scope = (event as AgentSessionEvent & { scope?: AttemptScope }).scope;
+		const resourceRunId =
+			this.#runResourceLeaseContext.getStore()?.resourceRunId ?? getAgentTerminalOwnerContext(event)?.resourceRunId;
+		for (const reservation of this.#pendingAgentEndContinuationHolds.values()) {
+			if (reservation.event !== undefined) continue;
+			if (reservation.predecessorScope !== undefined && reservation.predecessorScope !== scope) continue;
+			if (reservation.resourceRunId !== undefined && reservation.resourceRunId !== resourceRunId) continue;
+			reservation.event = event;
+		}
+	}
+
+	#reserveDeferredAgentEndForContinuation(
+		predecessorScope?: AttemptScope,
+		reserveUpcoming = false,
+	): symbol | undefined {
 		const resourceRunId = this.#runResourceLeaseContext.getStore()?.resourceRunId;
 		const pending = predecessorScope
 			? [...this.#pendingSdkAgentEnds].find(
@@ -4767,9 +4785,13 @@ export class AgentSession {
 					getAgentTerminalOwnerContext(this.#pendingAgentEndEmit)?.resourceRunId === resourceRunId
 						? this.#pendingAgentEndEmit
 						: undefined));
-		if (!pending) return undefined;
+		if (!pending && !reserveUpcoming) return undefined;
 		const hold = Symbol("deferred-agent-end-continuation");
-		this.#pendingAgentEndContinuationHolds.set(hold, pending);
+		this.#pendingAgentEndContinuationHolds.set(hold, {
+			event: pending,
+			...(resourceRunId === undefined ? {} : { resourceRunId }),
+			...(predecessorScope === undefined ? {} : { predecessorScope }),
+		});
 		this.#deferredAgentEndWorkLeases.set(hold, this.#sessionWorkLease.acquire());
 		return hold;
 	}
@@ -4783,22 +4805,22 @@ export class AgentSession {
 		const scope = (pending as AgentSessionEvent & { scope?: AttemptScope }).scope;
 		if (scope && this.#sdkRunTokensByAttemptScope.has(scope)) this.#pendingSdkAgentEnds.add(pending);
 		const hold = Symbol("deferred-agent-end-continuation");
-		this.#pendingAgentEndContinuationHolds.set(hold, pending);
+		this.#pendingAgentEndContinuationHolds.set(hold, { event: pending });
 		this.#deferredAgentEndWorkLeases.set(hold, this.#sessionWorkLease.acquire());
 		return hold;
 	}
 
 	#claimDeferredAgentEndForContinuation(hold: symbol | undefined): AgentSessionEvent | undefined {
 		if (!hold) return undefined;
-		const pending = this.#pendingAgentEndContinuationHolds.get(hold);
+		const pending = this.#pendingAgentEndContinuationHolds.get(hold)?.event;
 		this.#pendingAgentEndContinuationHolds.delete(hold);
 		if (pending) this.#pendingSdkAgentEnds.delete(pending);
 		this.#deferredAgentEndWorkLeases.get(hold)?.release();
 		this.#deferredAgentEndWorkLeases.delete(hold);
 		if (pending && this.#pendingAgentEndEmit === pending) {
 			this.#pendingAgentEndEmit = undefined;
-			for (const [candidate, candidatePending] of this.#pendingAgentEndContinuationHolds) {
-				if (candidatePending === pending) {
+			for (const [candidate, candidateReservation] of this.#pendingAgentEndContinuationHolds) {
+				if (candidateReservation.event === pending) {
 					this.#pendingAgentEndContinuationHolds.delete(candidate);
 					this.#deferredAgentEndWorkLeases.get(candidate)?.release();
 					this.#deferredAgentEndWorkLeases.delete(candidate);
@@ -4826,12 +4848,13 @@ export class AgentSession {
 		this.#pendingAgentEndEmit = pending;
 		const scope = (pending as AgentSessionEvent & { scope?: AttemptScope }).scope;
 		if (scope && this.#sdkRunTokensByAttemptScope.has(scope)) this.#pendingSdkAgentEnds.add(pending);
-		this.#pendingAgentEndContinuationHolds.set(hold, pending);
+		const reservation = this.#pendingAgentEndContinuationHolds.get(hold);
+		if (reservation) reservation.event = pending;
 	}
 
 	#releaseDeferredAgentEndContinuation(hold: symbol | undefined): void {
 		if (!hold) return;
-		const pending = this.#pendingAgentEndContinuationHolds.get(hold);
+		const pending = this.#pendingAgentEndContinuationHolds.get(hold)?.event;
 		this.#pendingAgentEndContinuationHolds.delete(hold);
 		this.#deferredAgentEndWorkLeases.get(hold)?.release();
 		this.#deferredAgentEndWorkLeases.delete(hold);
@@ -4841,8 +4864,10 @@ export class AgentSession {
 	#releaseDeferredAgentEndContinuations(): void {
 		let pending: AgentSessionEvent | undefined;
 		for (const candidate of this.#pendingAgentEndContinuationHolds.values()) {
-			pending = candidate;
-			break;
+			if (candidate.event !== undefined) {
+				pending = candidate.event;
+				break;
+			}
 		}
 		this.#pendingAgentEndContinuationHolds.clear();
 		for (const lease of this.#deferredAgentEndWorkLeases.values()) lease.release();
@@ -5178,7 +5203,8 @@ export class AgentSession {
 	#flushPendingAgentEnd(): void {
 		for (const sdkPending of this.#pendingSdkAgentEnds) {
 			if (!this.#agentEndContinuationDecisions.has(sdkPending)) continue;
-			if ([...this.#pendingAgentEndContinuationHolds.values()].includes(sdkPending)) continue;
+			if ([...this.#pendingAgentEndContinuationHolds.values()].some(reservation => reservation.event === sdkPending))
+				continue;
 			this.#pendingSdkAgentEnds.delete(sdkPending);
 			if (this.#pendingAgentEndEmit === sdkPending) this.#pendingAgentEndEmit = undefined;
 			const sdkLease = this.#deferredAgentEndLeases.get(sdkPending);
@@ -7425,6 +7451,7 @@ export class AgentSession {
 			isContinuingMidRunMaintenanceOutcome(event.maintenanceOutcome)
 		)
 			return;
+		if (event.type === "agent_end") this.#bindDeferredAgentEndToUpcomingContinuations(event);
 
 		// Hold agent_end until the prompt's finally and all earlier async event work
 		// have unwound. Subscribers treat this event as the ready signal; flushing it
@@ -8620,7 +8647,7 @@ export class AgentSession {
 			const deferredPredecessorAgentEnd =
 				options?.deferredPredecessorAgentEnd ??
 				(options?.suppressPredecessorAgentEnd
-					? this.#claimDeferredAgentEndForContinuation(this.#reserveDeferredAgentEndForContinuation())
+					? this.#claimDeferredAgentEndForContinuation(this.#reserveDeferredAgentEndForContinuation(undefined, true))
 					: undefined);
 			const precedingSelectionFence = this.#selectionFenceTail;
 			const deferredPromptGeneration = options?.generation ?? this.#promptGeneration;
@@ -8648,7 +8675,7 @@ export class AgentSession {
 			(options?.deferredPredecessorAgentEnd
 				? this.#restoreAndReserveDeferredAgentEndForContinuation(options.deferredPredecessorAgentEnd)
 				: options?.suppressPredecessorAgentEnd
-					? this.#reserveDeferredAgentEndForContinuation()
+					? this.#reserveDeferredAgentEndForContinuation(undefined, true)
 					: undefined);
 		let terminalized = false;
 		const skip = (
@@ -9044,7 +9071,7 @@ export class AgentSession {
 		if (this.#pendingSelectionFences > 0 && selectionFenceGeneration === this.#selectionFenceGeneration) {
 			const predecessorAgentEnd =
 				deferredPredecessorAgentEnd ??
-				this.#claimDeferredAgentEndForContinuation(this.#reserveDeferredAgentEndForContinuation());
+				this.#claimDeferredAgentEndForContinuation(this.#reserveDeferredAgentEndForContinuation(undefined, true));
 			const precedingSelectionFence = this.#selectionFenceTail;
 			const deferredScheduling = precedingSelectionFence.then(() => {
 				try {
