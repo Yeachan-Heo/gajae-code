@@ -137,7 +137,11 @@ describe("skill-management", () => {
 		it("requires user-owned trust to list an external user skill symlink", async () => {
 			await withTempDirs(async (cwd, home) => {
 				const sharedSkills = path.join(path.dirname(cwd), "shared-user-skills");
-				await makeSkill(sharedSkills, "external-helper", "Shared user helper");
+				const sharedSkillPath = await makeSkill(sharedSkills, "external-helper", "Shared user helper");
+				await fs.writeFile(
+					sharedSkillPath,
+					"---\nname: external-helper\ndescription: Shared user helper\nx-gjc-imported-from: claude-code\n---\n# Shared helper\n",
+				);
 				const userSkills = path.join(home, ".gjc", "agent", "skills");
 				await fs.mkdir(userSkills, { recursive: true });
 				await fs.symlink(
@@ -166,6 +170,7 @@ describe("skill-management", () => {
 						name: "external-helper",
 						scope: "user",
 						enabled: true,
+						importedFrom: "claude-code",
 						path: path.join(userSkills, "external-helper", "SKILL.md"),
 					}),
 				);
