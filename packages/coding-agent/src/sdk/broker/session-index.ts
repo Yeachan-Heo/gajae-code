@@ -762,6 +762,20 @@ function reduceEvents(
 // Global launch bursts may queue behind legitimate long index transactions. Keep
 // this bounded at one minute while the shared lock's exact dead-owner recovery runs.
 const SESSION_INDEX_LOCK_OPTIONS = { retries: 600, retryDelayMs: 100 } as const;
+const SESSION_INDEX_STARTUP_LOCK_WAIT_MS = 10_000;
+
+/** Keep broker bootstrap lock waits bounded while retaining the longer runtime transaction budget. */
+export function sessionIndexStartupLockOptions(deadline: number, signal?: AbortSignal): FileLockOptions {
+	const boundedDeadline = Math.min(deadline, performance.now() + SESSION_INDEX_STARTUP_LOCK_WAIT_MS);
+	return {
+		...SESSION_INDEX_LOCK_OPTIONS,
+		retries: Math.min(
+			SESSION_INDEX_LOCK_OPTIONS.retries,
+			Math.max(1, Math.ceil((boundedDeadline - performance.now()) / SESSION_INDEX_LOCK_OPTIONS.retryDelayMs)),
+		),
+		...(signal === undefined ? {} : { signal }),
+	};
+}
 
 /**
  * Observation window for one locked index transaction (#4544). This never times
@@ -1183,7 +1197,7 @@ export class SessionIndex {
 		});
 		return promise;
 	}
-	async open(): Promise<this> {
+	async open(options: FileLockOptions = SESSION_INDEX_LOCK_OPTIONS): Promise<this> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		let group = SessionIndex.#openGroups.get(indexPath);
 		if (!group || group.closed) {
@@ -1193,7 +1207,7 @@ export class SessionIndex {
 		}
 		await group.promise;
 		await SessionIndex.#enqueue(indexPath, () =>
-			withSessionIndexLock("replay", this.#agentDir, () => this.#replayUnderLock()),
+			withSessionIndexLock("replay", this.#agentDir, () => this.#replayUnderLock(), options),
 		);
 		return this;
 	}

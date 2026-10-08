@@ -2609,14 +2609,14 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 		opts.ownerHostId,
 		opts.previousOwnerHostIds ?? [],
 	);
-	const orphanPath = transitionState === "orphan_transition" ? fileLockRemovalTransitionPath(lockPath) : undefined;
+	const transitionPath = transitionState ? fileLockRemovalTransitionPath(lockPath) : undefined;
 	throw new FileLockAcquireError(
 		filePath,
 		lockPath,
 		opts.retries,
 		holder,
-		orphanPath ? "orphan_transition" : "acquire_timeout",
-		orphanPath,
+		transitionState === "orphan_transition" ? "orphan_transition" : "acquire_timeout",
+		transitionPath,
 		await staleRemovalFailureForCurrentGeneration(lockPath, staleRemovalFailure),
 	);
 }

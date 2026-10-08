@@ -700,6 +700,52 @@ it("records a typed startup-lock refusal when the session-index lock times out",
 	}
 });
 
+it("retries ordinary broker startup after its session-index lock becomes available", async () => {
+	const dir = await temp();
+	const indexDir = path.join(dir, "sdk", "sessions");
+	const blockingLockPath = path.join(indexDir, "index.jsonl.lock");
+	await fs.mkdir(blockingLockPath, { recursive: true });
+	await Bun.write(
+		path.join(blockingLockPath, "info"),
+		JSON.stringify({ pid: process.pid, timestamp: Date.now(), owner_token: "live-index-owner" }),
+	);
+	const lockUnavailable = Promise.withResolvers<void>();
+	void lockUnavailable.promise.catch(() => undefined);
+	let pollInFlight = false;
+	let lockUnavailableCount = 0;
+	let discoveryWhileBlocked: BrokerDiscovery | null | undefined;
+	const poll = setInterval(() => {
+		if (pollInFlight) return;
+		pollInFlight = true;
+		void readBrokerStartupExitRecord(dir)
+			.then(async record => {
+				if (record?.reason !== "startup-lock-unavailable") return;
+				lockUnavailableCount++;
+				discoveryWhileBlocked = await brokerDiscovery.readBrokerDiscovery(dir);
+				clearInterval(poll);
+				await fs.rm(blockingLockPath, { recursive: true, force: true });
+				lockUnavailable.resolve();
+			})
+			.catch(lockUnavailable.reject)
+			.finally(() => {
+				pollInFlight = false;
+			});
+	}, 25);
+	try {
+		const discovery = await ensureBroker({ agentDir: dir });
+		await lockUnavailable.promise;
+		expect(lockUnavailableCount).toBe(1);
+		expect(discoveryWhileBlocked).toBeNull();
+		expect(discovery.pid).toBeGreaterThan(0);
+		expect(await brokerDiscovery.readBrokerDiscovery(dir)).toMatchObject({ pid: discovery.pid });
+	} finally {
+		clearInterval(poll);
+		await fs.rm(blockingLockPath, { recursive: true, force: true });
+		await brokerOwnerForTest(dir)?.stop();
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}, 45_000);
+
 it("keeps the deadline reason when SIGTERM arrives during its async record fallback", async () => {
 	if (process.platform === "win32") return;
 	const dir = await temp();

@@ -2060,7 +2060,7 @@ export default class Sdk extends Command {
 			}
 			// A retained removal transition is an explicit acquire failure, not only
 			// an exhausted ordinary contention timeout.
-			if (error instanceof FileLockAcquireError && error.orphanPath) {
+			if (error instanceof FileLockAcquireError && error.code === "orphan_transition" && error.orphanPath) {
 				await exitDuringStartup(
 					"startup-lock-blocked",
 					1,
@@ -2069,7 +2069,7 @@ export default class Sdk extends Command {
 					error.orphanPath,
 				);
 			} else if (error instanceof FileLockAcquireError) {
-				await exitDuringStartup("startup-lock-unavailable", 1, null, undefined, error.lockPath);
+				await exitDuringStartup("startup-lock-unavailable", 1, null, undefined, error.orphanPath ?? error.lockPath);
 			}
 			if (broker) {
 				try {

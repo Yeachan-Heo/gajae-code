@@ -1,2 +1,2 @@
 ### Fixed
-- Retry file-lock acquisition after a refused orphan-transition adoption, and report broker startup lock timeouts as typed refusals instead of generic startup failures.
+- Retry file-lock acquisition after a refused orphan-transition adoption, retry broker startup once when the session-index lock becomes available, and report a typed refusal if the lock remains unavailable.
