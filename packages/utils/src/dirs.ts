@@ -128,12 +128,28 @@ function windowsOrdinalCaseFold(value: string): string | undefined {
 	}
 }
 
+function isExtendedWindowsPath(pathname: string): boolean {
+	return pathname.startsWith("\\\\?\\") || pathname.startsWith("\\\\.\\");
+}
+
+function normalizeWindowsEntryName(entryName: string, pathname: string): string {
+	return isExtendedWindowsPath(pathname) ? entryName : entryName.replace(/[ .]+$/, "");
+}
+
+function normalizeWindowsFinalEntryPath(pathname: string): string {
+	if (isExtendedWindowsPath(pathname)) return pathname;
+	const directory = path.win32.dirname(pathname);
+	const entryName = normalizeWindowsEntryName(path.win32.basename(pathname), pathname);
+	return path.win32.join(directory, entryName);
+}
+
 /**
  * Return a key for a path whose final file can be created or replaced after
  * registration. On Windows, use the parent directory's stable identity and the
  * final entry name rather than the file's inode. Case-insensitive directories
  * fold the name even before the entry exists; case-sensitive and unknown
- * directories preserve it so distinct paths cannot alias.
+ * directories preserve case. Ordinary Win32 paths also discard trailing dots
+ * and spaces from the final name, while extended-length paths preserve them.
  */
 export function stablePathKey(inputPath: string): string {
 	const resolvedPath = path.resolve(inputPath);
@@ -155,6 +171,7 @@ export function stablePathKey(inputPath: string): string {
 	}
 
 	let entryPath = resolvedPath;
+	const fallbackPath = normalizeWindowsFinalEntryPath(resolvedPath);
 	let parentPath = path.dirname(entryPath);
 	let parentIdentity: { dev: bigint; ino: bigint } | undefined;
 	try {
@@ -185,7 +202,7 @@ export function stablePathKey(inputPath: string): string {
 		}
 	}
 
-	let entryName = path.basename(entryPath);
+	let entryName = normalizeWindowsEntryName(path.basename(entryPath), resolvedPath);
 	if (caseSensitiveDirectory === false) entryName = windowsOrdinalCaseFold(entryName) ?? entryName;
 	if (parentIdentity && parentIdentity.ino !== 0n)
 		return JSON.stringify([
@@ -194,7 +211,7 @@ export function stablePathKey(inputPath: string): string {
 			parentIdentity.ino.toString(),
 			entryName,
 		]);
-	return caseSensitiveDirectory === false ? (windowsOrdinalCaseFold(resolvedPath) ?? resolvedPath) : resolvedPath;
+	return caseSensitiveDirectory === false ? (windowsOrdinalCaseFold(fallbackPath) ?? fallbackPath) : fallbackPath;
 }
 
 export function normalizePathForComparison(inputPath: string, platform: NodeJS.Platform = process.platform): string {

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { randomUUID } from "node:crypto";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -85,6 +85,17 @@ describe("issue #6446 Windows path casing", () => {
 			} else {
 				expect(stablePathKey(firstPath)).not.toBe(stablePathKey(secondPath));
 			}
+			expect(stablePathKey(firstPath)).toBe(stablePathKey(path.join(directory, "Session.jsonl.")));
+			expect(stablePathKey(firstPath)).toBe(stablePathKey(path.join(directory, "Session.jsonl ")));
+
+			const resolvedDirectory = path.win32.resolve(directory);
+			const extendedDirectory = resolvedDirectory.startsWith("\\\\?\\")
+				? resolvedDirectory
+				: resolvedDirectory.startsWith("\\\\")
+					? `\\\\?\\UNC\\${resolvedDirectory.slice(2)}`
+					: `\\\\?\\${resolvedDirectory}`;
+			const extendedPath = `${extendedDirectory}\\Session.jsonl`;
+			expect(stablePathKey(extendedPath)).not.toBe(stablePathKey(`${extendedPath}.`));
 		} finally {
 			fs.rmSync(directory, { recursive: true, force: true });
 		}
@@ -101,6 +112,9 @@ describe("issue #6446 Windows path casing", () => {
 			expect(stablePathKey(dottedCapitalIPath)).not.toBe(stablePathKey(dottedLowercaseIPath));
 			expect(stablePathKey(path.join(directory, "Session.jsonl"))).toBe(
 				stablePathKey(path.join(directory, "session.jsonl")),
+			);
+			expect(stablePathKey(path.join(directory, "Session.jsonl"))).toBe(
+				stablePathKey(path.join(directory, "Session.jsonl.")),
 			);
 		} finally {
 			fs.rmSync(directory, { recursive: true, force: true });
@@ -119,6 +133,9 @@ describe("issue #6446 Windows path casing", () => {
 			expect(stablePathKey(dottedCapitalIPath)).not.toBe(stablePathKey(dottedLowercaseIPath));
 			expect(stablePathKey(path.join(directory, "Session.jsonl"))).toBe(
 				stablePathKey(path.join(directory, "session.jsonl")),
+			);
+			expect(stablePathKey(path.join(directory, "Session.jsonl"))).toBe(
+				stablePathKey(path.join(directory, "Session.jsonl.")),
 			);
 		} finally {
 			fs.rmSync(directory, { recursive: true, force: true });
@@ -174,7 +191,7 @@ describe("issue #6446 Windows path casing", () => {
 			const directory = process.env.GJC_TEST_UNC_CASE_SENSITIVE_DIRECTORY!;
 			expect(path.win32.normalize(directory).startsWith("\\\\")).toBe(true);
 			expect(directoryCaseSensitive(directory)).toBe(true);
-			const stem = `gjc-unc-${randomUUID()}`;
+			const stem = `gjc-unc-${crypto.randomUUID()}`;
 			const firstPath = path.join(directory, `${stem}-Session.jsonl`);
 			const secondPath = path.join(directory, `${stem}-session.jsonl`);
 			try {
@@ -194,7 +211,7 @@ describe("issue #6446 Windows path casing", () => {
 			const directory = process.env.GJC_TEST_UNC_CASE_INSENSITIVE_DIRECTORY!;
 			expect(path.win32.normalize(directory).startsWith("\\\\")).toBe(true);
 			expect(directoryCaseSensitive(directory)).toBe(false);
-			const stem = `gjc-unc-${randomUUID()}`;
+			const stem = `gjc-unc-${crypto.randomUUID()}`;
 			const firstPath = path.join(directory, `${stem}-Session.jsonl`);
 			const aliasPath = path.join(directory, `${stem}-session.jsonl`);
 			try {
