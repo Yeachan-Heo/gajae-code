@@ -3478,7 +3478,6 @@ export class AsyncJobManager {
 				continue;
 
 			this.#deliveries.splice(index, 1);
-			this.#notifyChange();
 			await this.#deliverDelivery(delivery);
 		}
 	}

@@ -24,6 +24,13 @@ describe("AsyncJobManager delivery reliability", () => {
 		const healthyRun = Promise.withResolvers<string>();
 		const delivered: string[] = [];
 		let heldJobId = "";
+		let queuedObserved = false;
+		let callbackStarted = false;
+		const dequeueTransition: { reached: boolean; callbackAlreadyStarted: boolean; pending: boolean } = {
+			reached: false,
+			callbackAlreadyStarted: false,
+			pending: false,
+		};
 		const drains: {
 			unbounded?: Promise<boolean>;
 			unboundedOutcome: "pending" | "fulfilled" | "rejected";
@@ -33,6 +40,7 @@ describe("AsyncJobManager delivery reliability", () => {
 		const manager = new AsyncJobManager({
 			onJobComplete: async jobId => {
 				if (jobId === heldJobId) {
+					callbackStarted = true;
 					heldDeliveryStarted.resolve();
 					await releaseHeldDelivery.promise;
 				}
@@ -41,7 +49,15 @@ describe("AsyncJobManager delivery reliability", () => {
 		});
 		const unsubscribe = manager.onChange(() => {
 			const state = manager.getDeliveryState();
-			if (drains.unbounded || !state.delivering || !state.pendingJobIds.includes(heldJobId)) return;
+			const pending = state.pendingJobIds.includes(heldJobId);
+			if (pending && !state.delivering) {
+				queuedObserved = true;
+				return;
+			}
+			if (drains.unbounded || !queuedObserved) return;
+			dequeueTransition.reached = true;
+			dequeueTransition.callbackAlreadyStarted = callbackStarted;
+			dequeueTransition.pending = pending;
 			const unbounded = manager.drainDeliveries();
 			drains.unbounded = unbounded;
 			void unbounded.then(
@@ -80,6 +96,9 @@ describe("AsyncJobManager delivery reliability", () => {
 			healthyProducer = healthyJob.promise;
 
 			await heldDeliveryStarted.promise;
+			expect(dequeueTransition.reached).toBe(true);
+			expect(dequeueTransition.callbackAlreadyStarted).toBe(false);
+			expect(dequeueTransition.pending).toBe(true);
 			healthyRun.resolve("healthy");
 			await healthyProducer;
 			expect(healthyJob.status).toBe("completed");
@@ -148,11 +167,24 @@ describe("AsyncJobManager delivery reliability", () => {
 		});
 		let disposePromise: Promise<boolean> | undefined;
 		let producerCompletion: Promise<void> | undefined;
-		const retainedState: { outcome: "pending" | "fulfilled" | "rejected" } = { outcome: "pending" };
-		let retainedCompletion: Promise<void> | undefined;
+		const retainedState: { outcome: "pending" | "fulfilled" | "rejected"; error?: unknown } = { outcome: "pending" };
+		let retainedFuture: Promise<void> | undefined;
+		let retainedObserver: Promise<void> | undefined;
 		let primaryFailure: unknown;
 		let hasPrimaryFailure = false;
 		const cleanupFailures: unknown[] = [];
+		const observeRetainedFuture = (): void => {
+			retainedFuture = manager.awaitRetainedDisposalCompletion();
+			retainedObserver = retainedFuture.then(
+				() => {
+					retainedState.outcome = "fulfilled";
+				},
+				error => {
+					retainedState.outcome = "rejected";
+					retainedState.error = error;
+				},
+			);
+		};
 
 		try {
 			const jobId = manager.register("bash", "held disposal delivery", async () => "payload");
@@ -165,17 +197,18 @@ describe("AsyncJobManager delivery reliability", () => {
 			disposePromise = manager.dispose({ timeoutMs: 25 });
 			expect(await disposePromise).toBe(false);
 
-			retainedCompletion = manager.awaitRetainedDisposalCompletion().then(
-				() => {
-					retainedState.outcome = "fulfilled";
-				},
-				() => {
-					retainedState.outcome = "rejected";
-				},
-			);
+			observeRetainedFuture();
+			const observer = retainedObserver;
+			if (!observer) throw new Error("expected retained-future settlement observer");
+			const retainedWhileCallbackHeld = await Promise.race([
+				observer.then(() => retainedState.outcome),
+				Bun.sleep(25).then(() => "pending" as const),
+			]);
+			expect(retainedWhileCallbackHeld).toBe("pending");
 			expect(retainedState.outcome).toBe("pending");
 			releaseDelivery.resolve();
-			await retainedCompletion;
+			await retainedFuture;
+			await retainedObserver;
 			expect(retainedState.outcome).toBe("fulfilled");
 		} catch (error) {
 			hasPrimaryFailure = true;
@@ -192,23 +225,16 @@ describe("AsyncJobManager delivery reliability", () => {
 			if (producerCompletion) await join(producerCompletion);
 			await join(manager.waitForAll());
 			if (disposePromise) await join(disposePromise);
-			else
+			else {
 				await join(
 					manager.dispose({ timeoutMs: 25 }).then(disposed => {
 						if (!disposed) throw new Error("manager disposal did not settle during fixture cleanup");
 					}),
 				);
-			if (!retainedCompletion) {
-				retainedCompletion = manager.awaitRetainedDisposalCompletion().then(
-					() => {
-						retainedState.outcome = "fulfilled";
-					},
-					() => {
-						retainedState.outcome = "rejected";
-					},
-				);
 			}
-			await join(retainedCompletion);
+			if (!retainedFuture) observeRetainedFuture();
+			if (retainedFuture) await join(retainedFuture);
+			if (retainedObserver) await join(retainedObserver);
 		}
 		if (hasPrimaryFailure) throw primaryFailure;
 		if (cleanupFailures.length > 0)
