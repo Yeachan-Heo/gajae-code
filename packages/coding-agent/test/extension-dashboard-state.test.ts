@@ -119,4 +119,36 @@ describe("loadAllExtensions user skill trust", () => {
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
+
+	test("honors effective project-level denial for external user skill symlinks", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-extension-project-skill-denial-"));
+		const previousAgentDir = getAgentDir();
+		try {
+			const cwd = path.join(root, "project");
+			const agentDir = path.join(root, "agent");
+			const skillsDir = path.join(agentDir, "skills");
+			const externalSkillDir = path.join(root, "shared-skills", "external-helper");
+			await fs.mkdir(cwd, { recursive: true });
+			await fs.mkdir(externalSkillDir, { recursive: true });
+			await fs.mkdir(skillsDir, { recursive: true });
+			await fs.writeFile(
+				path.join(externalSkillDir, "SKILL.md"),
+				"---\nname: external-helper\ndescription: User-owned helper\n---\nExternal body",
+			);
+			await fs.symlink(externalSkillDir, path.join(skillsDir, "external-helper"), "dir");
+			setAgentDir(agentDir);
+
+			const settings = Settings.isolated({}, { overrides: { "skills.trustUserSkills": false } });
+			expect(settings.get("skills.trustUserSkills")).toBe(false);
+			expect(settings.getGlobal("skills.trustUserSkills")).toBeUndefined();
+
+			const extensions = await loadAllExtensions(cwd, [], settings);
+			expect(extensions.some(extension => extension.kind === "skill" && extension.name === "external-helper")).toBe(
+				false,
+			);
+		} finally {
+			setAgentDir(previousAgentDir);
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
 });
