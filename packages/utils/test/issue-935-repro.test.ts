@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { directoryCaseSensitive } from "@gajae-code/natives";
@@ -48,10 +49,10 @@ describe("issue #6446 Windows path casing", () => {
 		expect(resolveEquivalentPath(inputPath)).toBe(path.resolve(inputPath));
 	});
 
-	it("canonicalizes existing Windows short-name aliases", () => {
+	it("canonicalizes existing Windows short-name aliases", async () => {
 		if (process.platform !== "win32") return;
 
-		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-short-name-key-"));
+		const directory = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-short-name-key-"));
 		try {
 			const shortPath = path.join(directory, "SESSION~1.JSONL");
 			const canonicalPath = path.join(directory, "long-session-name.jsonl");
@@ -64,16 +65,16 @@ describe("issue #6446 Windows path casing", () => {
 				expect(stablePathKey(shortPath)).not.toBe(stablePathKey(canonicalPath));
 			}
 		} finally {
-			fs.rmSync(directory, { recursive: true, force: true });
+			await fsPromises.rm(directory, { recursive: true, force: true });
 		}
 	});
 
-	it("uses the parent directory's case rule for missing transcript names", () => {
+	it("uses the parent directory's case rule for missing transcript names", async () => {
 		if (process.platform !== "win32") return;
 
 		const configuredRoot = process.env.GJC_TEST_CASE_SENSITIVE_DIRECTORY;
 		if (configuredRoot) expect(directoryCaseSensitive(configuredRoot)).toBe(true);
-		const directory = fs.mkdtempSync(path.join(configuredRoot ?? os.tmpdir(), "gjc-session-key-"));
+		const directory = await fsPromises.mkdtemp(path.join(configuredRoot ?? os.tmpdir(), "gjc-session-key-"));
 		try {
 			const sensitivity = directoryCaseSensitive(directory);
 			const firstPath = path.join(directory, "Session.jsonl");
@@ -97,14 +98,14 @@ describe("issue #6446 Windows path casing", () => {
 			const extendedPath = `${extendedDirectory}\\Session.jsonl`;
 			expect(stablePathKey(extendedPath)).not.toBe(stablePathKey(`${extendedPath}.`));
 		} finally {
-			fs.rmSync(directory, { recursive: true, force: true });
+			await fsPromises.rm(directory, { recursive: true, force: true });
 		}
 	});
 
-	it("uses ordinal folding without collapsing expanded Unicode casing", () => {
+	it("uses ordinal folding without collapsing expanded Unicode casing", async () => {
 		if (process.platform !== "win32") return;
 
-		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-session-key-unicode-"));
+		const directory = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-session-key-unicode-"));
 		try {
 			expect(directoryCaseSensitive(directory)).toBe(false);
 			const dottedCapitalIPath = path.join(directory, "İ.jsonl");
@@ -117,14 +118,14 @@ describe("issue #6446 Windows path casing", () => {
 				stablePathKey(path.join(directory, "Session.jsonl.")),
 			);
 		} finally {
-			fs.rmSync(directory, { recursive: true, force: true });
+			await fsPromises.rm(directory, { recursive: true, force: true });
 		}
 	});
 
-	it("uses ordinal folding for fallback keys without a usable parent identity", () => {
+	it("uses ordinal folding for fallback keys without a usable parent identity", async () => {
 		if (process.platform !== "win32") return;
 
-		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-session-key-fallback-"));
+		const directory = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-session-key-fallback-"));
 		try {
 			expect(directoryCaseSensitive(directory)).toBe(false);
 			vi.spyOn(fs, "statSync").mockImplementation((() => ({ dev: 0n, ino: 0n })) as unknown as typeof fs.statSync);
@@ -138,26 +139,26 @@ describe("issue #6446 Windows path casing", () => {
 				stablePathKey(path.join(directory, "Session.jsonl.")),
 			);
 		} finally {
-			fs.rmSync(directory, { recursive: true, force: true });
+			await fsPromises.rm(directory, { recursive: true, force: true });
 		}
 	});
 
 	it.skipIf(!process.env.GJC_TEST_CASE_SENSITIVE_DIRECTORY)(
 		"keeps existing case-distinct transcript files separate in a case-sensitive directory",
-		() => {
+		async () => {
 			if (process.platform !== "win32") return;
-			const directory = fs.mkdtempSync(
+			const directory = await fsPromises.mkdtemp(
 				path.join(process.env.GJC_TEST_CASE_SENSITIVE_DIRECTORY!, "gjc-session-key-existing-"),
 			);
 			try {
 				expect(directoryCaseSensitive(directory)).toBe(true);
 				const firstPath = path.join(directory, "Session.jsonl");
 				const secondPath = path.join(directory, "session.jsonl");
-				fs.writeFileSync(firstPath, "first");
-				fs.writeFileSync(secondPath, "second", { flag: "wx" });
+				await Bun.write(firstPath, "first");
+				await Bun.write(secondPath, "second");
 				expect(stablePathKey(firstPath)).not.toBe(stablePathKey(secondPath));
 			} finally {
-				fs.rmSync(directory, { recursive: true, force: true });
+				await fsPromises.rm(directory, { recursive: true, force: true });
 			}
 		},
 	);
@@ -187,7 +188,7 @@ describe("issue #6446 Windows path casing", () => {
 
 	it.skipIf(process.platform !== "win32" || !process.env.GJC_TEST_UNC_CASE_SENSITIVE_DIRECTORY)(
 		"keeps distinct transcript entries on a case-sensitive UNC share",
-		() => {
+		async () => {
 			const directory = process.env.GJC_TEST_UNC_CASE_SENSITIVE_DIRECTORY!;
 			expect(path.win32.normalize(directory).startsWith("\\\\")).toBe(true);
 			expect(directoryCaseSensitive(directory)).toBe(true);
@@ -195,19 +196,19 @@ describe("issue #6446 Windows path casing", () => {
 			const firstPath = path.join(directory, `${stem}-Session.jsonl`);
 			const secondPath = path.join(directory, `${stem}-session.jsonl`);
 			try {
-				fs.writeFileSync(firstPath, "upper");
-				fs.writeFileSync(secondPath, "lower", { flag: "wx" });
+				await Bun.write(firstPath, "upper");
+				await Bun.write(secondPath, "lower");
 				expect(stablePathKey(firstPath)).not.toBe(stablePathKey(secondPath));
 			} finally {
-				fs.rmSync(firstPath, { force: true });
-				fs.rmSync(secondPath, { force: true });
+				await fsPromises.rm(firstPath, { force: true });
+				await fsPromises.rm(secondPath, { force: true });
 			}
 		},
 	);
 
 	it.skipIf(process.platform !== "win32" || !process.env.GJC_TEST_UNC_CASE_INSENSITIVE_DIRECTORY)(
 		"folds transcript aliases on a case-insensitive UNC share",
-		() => {
+		async () => {
 			const directory = process.env.GJC_TEST_UNC_CASE_INSENSITIVE_DIRECTORY!;
 			expect(path.win32.normalize(directory).startsWith("\\\\")).toBe(true);
 			expect(directoryCaseSensitive(directory)).toBe(false);
@@ -215,10 +216,10 @@ describe("issue #6446 Windows path casing", () => {
 			const firstPath = path.join(directory, `${stem}-Session.jsonl`);
 			const aliasPath = path.join(directory, `${stem}-session.jsonl`);
 			try {
-				fs.writeFileSync(firstPath, "session");
+				await Bun.write(firstPath, "session");
 				expect(stablePathKey(firstPath)).toBe(stablePathKey(aliasPath));
 			} finally {
-				fs.rmSync(firstPath, { force: true });
+				await fsPromises.rm(firstPath, { force: true });
 			}
 		},
 	);
