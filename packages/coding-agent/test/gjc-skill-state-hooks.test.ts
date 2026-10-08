@@ -486,7 +486,7 @@ describe("GJC native skill-state hooks", () => {
 		const sessionId = "test-cleared-authoritative-entries";
 		const stateDir = sessionStateDir(root, sessionId);
 		await fs.mkdir(activeStateDir(root, sessionId), { recursive: true });
-		await fs.writeFile(
+		await Bun.write(
 			path.join(stateDir, "skill-active-state.json"),
 			JSON.stringify({
 				version: 1,
