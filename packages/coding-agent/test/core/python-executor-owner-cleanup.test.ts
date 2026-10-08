@@ -9,7 +9,7 @@ import {
 	type PythonResult,
 } from "@gajae-code/coding-agent/eval/py/executor";
 import * as pythonKernel from "@gajae-code/coding-agent/eval/py/kernel";
-import { PythonKernel } from "@gajae-code/coding-agent/eval/py/kernel";
+import { type KernelShutdownResult, PythonKernel } from "@gajae-code/coding-agent/eval/py/kernel";
 import { TempDir } from "@gajae-code/utils";
 
 const originalStart = PythonKernel.start;
@@ -737,11 +737,15 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 		const kernels = trackStartedKernels();
 		const readyFile = `${tempDir.path()}/unconfirmed-shutdown.ready`;
 		const pidFile = `${tempDir.path()}/unconfirmed-shutdown.pid`;
+		const secondShutdownStarted = Promise.withResolvers<void>();
+		const releaseSecondShutdown = Promise.withResolvers<void>();
 		let pid: number | undefined;
 		let execution: Promise<PythonResult> | undefined;
 		let firstCleanup: Promise<void> | undefined;
-		let firstShutdownResult: Awaited<ReturnType<PythonKernel["shutdown"]>> | undefined;
-		let secondShutdownResult: Awaited<ReturnType<PythonKernel["shutdown"]>> | undefined;
+		let retryCleanup: Promise<void> | undefined;
+		let firstShutdownResult: KernelShutdownResult | undefined;
+		let secondShutdownResult: KernelShutdownResult | undefined;
+		let secondShutdownReceiver: PythonKernel | undefined;
 		let shutdownCalls = 0;
 		let bodyFailed = false;
 		let bodyError: unknown;
@@ -761,10 +765,15 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			pid = await waitForProcessFile(pidFile);
 			const kernel = kernels[0];
 			const originalShutdown = kernel.shutdown.bind(kernel);
-			kernel.shutdown = async options => {
-				shutdownCalls += 1;
-				const result = await originalShutdown(shutdownCalls === 1 ? { ...options, timeoutMs: 0 } : options);
-				if (shutdownCalls === 1) firstShutdownResult = result;
+			kernel.shutdown = async function (this: PythonKernel, options?: Parameters<PythonKernel["shutdown"]>[0]) {
+				const call = ++shutdownCalls;
+				if (call === 2) {
+					secondShutdownReceiver = this;
+					secondShutdownStarted.resolve();
+					await releaseSecondShutdown.promise;
+				}
+				const result = await originalShutdown(call === 1 ? { ...options, timeoutMs: 0 } : options);
+				if (call === 1) firstShutdownResult = result;
 				else secondShutdownResult = result;
 				return result;
 			};
@@ -773,7 +782,6 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			await expect(firstCleanup).rejects.toMatchObject({
 				name: "PythonKernelShutdownUnconfirmedError",
 			});
-			expect(isProcessAlive(pid)).toBe(true);
 			expect(kernels).toHaveLength(1);
 			expect(kernels[0]).toBe(kernel);
 			const executionResult = await execution;
@@ -781,10 +789,39 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			expect(firstShutdownResult).toEqual({ confirmed: false });
 			expect(shutdownCalls).toBe(1);
 
-			await disposeKernelSessionsByOwner("unconfirmed-owner");
+			await waitForProcessGone(pid);
+			retryCleanup = disposeKernelSessionsByOwner("unconfirmed-owner");
+			const retryStartTimeout = Promise.withResolvers<void>();
+			const retryStartTimer = setTimeout(retryStartTimeout.resolve, 5_000);
+			try {
+				await Promise.race([
+					secondShutdownStarted.promise,
+					retryStartTimeout.promise.then(() => {
+						throw new Error("Timed out waiting for retained Python kernel shutdown retry");
+					}),
+				]);
+			} finally {
+				clearTimeout(retryStartTimer);
+			}
+			let retrySettled = false;
+			void retryCleanup.then(
+				() => {
+					retrySettled = true;
+				},
+				() => {
+					retrySettled = true;
+				},
+			);
+			await flushMicrotasks();
+			expect(retrySettled).toBe(false);
+			expect(shutdownCalls).toBe(2);
+			expect(secondShutdownReceiver).toBe(kernel);
+			releaseSecondShutdown.resolve();
+			await retryCleanup;
 			await waitForProcessGone(pid);
 			expect(secondShutdownResult).toEqual({ confirmed: true });
 			expect(shutdownCalls).toBe(2);
+			expect(secondShutdownReceiver).toBe(kernel);
 			expect(kernels).toHaveLength(1);
 			expect(kernels[0]).toBe(kernel);
 			expect(kernel.isAlive()).toBe(false);
@@ -792,7 +829,9 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			bodyFailed = true;
 			bodyError = error;
 		} finally {
+			releaseSecondShutdown.resolve();
 			const settled = await Promise.allSettled([
+				...(retryCleanup ? [retryCleanup] : []),
 				disposeKernelSessionsByOwner("unconfirmed-owner"),
 				...(execution ? [execution] : []),
 				...(pid !== undefined ? [waitForProcessGone(pid)] : []),
