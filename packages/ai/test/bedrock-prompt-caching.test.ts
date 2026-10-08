@@ -1,9 +1,68 @@
 import { describe, expect, it } from "bun:test";
+import { hookFetch } from "@gajae-code/utils";
 import { isUnsupportedBedrockConverseModel } from "../src/bedrock-claude-cache-policy";
 import { applyGeneratedModelPolicies } from "../src/model-thinking";
-import { calculateCost, getBundledModels } from "../src/models";
-import { parseBedrockClaudeGeneration, supportsPromptCaching } from "../src/providers/amazon-bedrock";
-import type { Model, Usage } from "../src/types";
+import { calculateCost, getBundledModel, getBundledModels } from "../src/models";
+import { parseBedrockClaudeGeneration, streamBedrock, supportsPromptCaching } from "../src/providers/amazon-bedrock";
+import { crc32 } from "../src/providers/aws-eventstream";
+import type { Context, Model, Usage } from "../src/types";
+
+function encodeStringHeader(name: string, value: string): Uint8Array {
+	const nameBytes = new TextEncoder().encode(name);
+	const valueBytes = new TextEncoder().encode(value);
+	const result = new Uint8Array(1 + nameBytes.length + 1 + 2 + valueBytes.length);
+	const view = new DataView(result.buffer);
+	let offset = 0;
+	view.setUint8(offset++, nameBytes.length);
+	result.set(nameBytes, offset);
+	offset += nameBytes.length;
+	view.setUint8(offset++, 7);
+	view.setUint16(offset, valueBytes.length, false);
+	offset += 2;
+	result.set(valueBytes, offset);
+	return result;
+}
+
+function encodeBedrockEvent(eventType: string, payload: unknown): Uint8Array {
+	const headers = [
+		encodeStringHeader(":message-type", "event"),
+		encodeStringHeader(":event-type", eventType),
+		encodeStringHeader(":content-type", "application/json"),
+	];
+	const headerLength = headers.reduce((length, header) => length + header.length, 0);
+	const headerBytes = new Uint8Array(headerLength);
+	let headerOffset = 0;
+	for (const header of headers) {
+		headerBytes.set(header, headerOffset);
+		headerOffset += header.length;
+	}
+	const payloadBytes = new TextEncoder().encode(JSON.stringify(payload));
+	const totalLength = 12 + headerLength + payloadBytes.length + 4;
+	const frame = new Uint8Array(totalLength);
+	const view = new DataView(frame.buffer);
+	view.setUint32(0, totalLength, false);
+	view.setUint32(4, headerLength, false);
+	view.setUint32(8, crc32(frame.subarray(0, 8)), false);
+	frame.set(headerBytes, 12);
+	frame.set(payloadBytes, 12 + headerLength);
+	view.setUint32(totalLength - 4, crc32(frame.subarray(0, totalLength - 4)), false);
+	return frame;
+}
+
+function bedrockEventStreamResponse(events: Array<{ type: string; payload: unknown }>): Response {
+	const frames = events.map(event => encodeBedrockEvent(event.type, event.payload));
+	const bodyLength = frames.reduce((length, frame) => length + frame.length, 0);
+	const body = new Uint8Array(bodyLength);
+	let offset = 0;
+	for (const frame of frames) {
+		body.set(frame, offset);
+		offset += frame.length;
+	}
+	return new Response(body, {
+		status: 200,
+		headers: { "content-type": "application/vnd.amazon.eventstream" },
+	});
+}
 
 function bedrockModel(id: string, cachePriced = false): Model<"bedrock-converse-stream"> {
 	return {
@@ -87,6 +146,59 @@ describe("Bedrock prompt caching support", () => {
 				calculateCost(model, usage);
 				expect(usage.cost.cacheRead !== 0 || usage.cost.cacheWrite !== 0, id).toBe(expected);
 			}
+		}
+	});
+
+	it("prices Bedrock Claude cache writes from the reported TTL breakdown", async () => {
+		const model = getBundledModel<"bedrock-converse-stream">("amazon-bedrock", "us.anthropic.claude-haiku-5-5");
+		const context: Context = {
+			systemPrompt: ["Stable context."],
+			messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+		};
+		const cacheWriteTokens = 1_000_001;
+		const originalSkipAuth = process.env.AWS_BEDROCK_SKIP_AUTH;
+		const originalBearerToken = process.env.AWS_BEARER_TOKEN_BEDROCK;
+		process.env.AWS_BEDROCK_SKIP_AUTH = "1";
+		delete process.env.AWS_BEARER_TOKEN_BEDROCK;
+
+		try {
+			const readCacheUsage = async (ttl: "5m" | "1h") => {
+				using _fetchHook = hookFetch(async () =>
+					bedrockEventStreamResponse([
+						{ type: "messageStart", payload: { role: "assistant" } },
+						{
+							type: "metadata",
+							payload: {
+								usage: {
+									inputTokens: 0,
+									outputTokens: 0,
+									cacheWriteInputTokens: cacheWriteTokens,
+									totalTokens: cacheWriteTokens,
+									cacheDetails: [{ ttl, inputTokens: cacheWriteTokens }],
+								},
+							},
+						},
+						{ type: "messageStop", payload: { stopReason: "end_turn" } },
+					]),
+				);
+				return await streamBedrock(model, context, {
+					region: "us-east-1",
+					cacheRetention: ttl === "1h" ? "long" : "short",
+				}).result();
+			};
+
+			const oneHour = await readCacheUsage("1h");
+			expect(oneHour.usage.cttl).toEqual({ ephemeral1h: cacheWriteTokens });
+			expect(oneHour.usage.cost.cacheWrite).toBeCloseTo(1.1000011, 10);
+
+			const fiveMinute = await readCacheUsage("5m");
+			expect(fiveMinute.usage.cttl).toEqual({ ephemeral5m: cacheWriteTokens });
+			expect(fiveMinute.usage.cost.cacheWrite).toBeCloseTo(0.6875006875, 10);
+		} finally {
+			if (originalSkipAuth === undefined) delete process.env.AWS_BEDROCK_SKIP_AUTH;
+			else process.env.AWS_BEDROCK_SKIP_AUTH = originalSkipAuth;
+			if (originalBearerToken === undefined) delete process.env.AWS_BEARER_TOKEN_BEDROCK;
+			else process.env.AWS_BEARER_TOKEN_BEDROCK = originalBearerToken;
 		}
 	});
 

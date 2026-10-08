@@ -172,6 +172,7 @@ interface MetadataEvent {
 		cacheReadInputTokens?: number;
 		cacheWriteInputTokens?: number;
 		totalTokens?: number;
+		cacheDetails?: Array<{ inputTokens?: number; ttl?: "5m" | "1h" }>;
 	};
 }
 
@@ -601,6 +602,21 @@ function handleMetadata(event: MetadataEvent, model: Model<"bedrock-converse-str
 		output.usage.cacheRead = event.usage.cacheReadInputTokens || 0;
 		output.usage.cacheWrite = event.usage.cacheWriteInputTokens || 0;
 		output.usage.totalTokens = event.usage.totalTokens || output.usage.input + output.usage.output;
+		let fiveMinuteTokens = 0;
+		let oneHourTokens = 0;
+		for (const detail of event.usage.cacheDetails ?? []) {
+			const tokens = detail.inputTokens;
+			if (typeof tokens !== "number" || !Number.isSafeInteger(tokens) || tokens < 0) continue;
+			if (detail.ttl === "5m") fiveMinuteTokens += tokens;
+			else if (detail.ttl === "1h") oneHourTokens += tokens;
+		}
+		output.usage.cttl =
+			fiveMinuteTokens + oneHourTokens > 0
+				? {
+						...(fiveMinuteTokens > 0 ? { ephemeral5m: fiveMinuteTokens } : {}),
+						...(oneHourTokens > 0 ? { ephemeral1h: oneHourTokens } : {}),
+					}
+				: undefined;
 		calculateCost(model, output.usage);
 	}
 }

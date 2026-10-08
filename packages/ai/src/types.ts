@@ -736,8 +736,8 @@ export interface Usage {
 	 */
 	reasoningTokens?: number;
 	/**
-	 * Cache-write TTL breakdown (Anthropic only). When set, the components sum to
-	 * `cacheWrite`. Absent providers do not populate this.
+	 * Cache-write TTL breakdown for Anthropic Messages and Bedrock Claude. When
+	 * set, the components sum to `cacheWrite`. Absent providers do not populate this.
 	 */
 	cttl?: {
 		ephemeral5m?: number;

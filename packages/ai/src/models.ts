@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { registerProviderSafetyStopModel } from "./adapter-internals/provider-safety-stop";
-import { isUnsupportedBedrockConverseModel } from "./bedrock-claude-cache-policy";
+import { isUnsupportedBedrockConverseModel, parseBedrockClaudeGeneration } from "./bedrock-claude-cache-policy";
 import { getAnthropicModelCost, getOpenAIModelCost } from "./model-pricing";
 import { isRetiredModelKey } from "./model-retirements";
 import { applyGeneratedModelPolicies, enrichModelThinking } from "./model-thinking";
@@ -104,12 +104,17 @@ export function getBundledModels(provider: GeneratedProvider): Model<Api>[] {
 	return models ? (Array.from(models.values()) as Model<Api>[]) : [];
 }
 
-function calculateAnthropicCacheWriteCost<TApi extends Api>(
+function calculateClaudeCacheWriteCost<TApi extends Api>(
 	model: Model<TApi>,
 	usage: Usage,
 	pricing: Model<TApi>["cost"],
 ): number {
-	if (model.api !== "anthropic-messages" || usage.cttl === undefined) {
+	const supportsTtlPricing =
+		model.api === "anthropic-messages" ||
+		(model.api === "bedrock-converse-stream" &&
+			model.provider === "amazon-bedrock" &&
+			parseBedrockClaudeGeneration(model.id) !== undefined);
+	if (!supportsTtlPricing || usage.cttl === undefined) {
 		return (pricing.cacheWrite / 1_000_000) * usage.cacheWrite;
 	}
 
@@ -122,6 +127,8 @@ function calculateAnthropicCacheWriteCost<TApi extends Api>(
 	// 5m writes use the catalog cacheWrite rate; 1h writes cost 2x base input.
 	// `pricing` already includes Haiku 5.5's 5x over-100K prompt multiplier.
 	// https://platform.claude.com/docs/en/about-claude/pricing#model-pricing
+	// Bedrock reports cache writes by TTL in cacheDetails.
+	// https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_TokenUsage.html
 	return (pricing.cacheWrite * fiveMinuteTokens + pricing.input * 2 * oneHourTokens) / 1_000_000;
 }
 
@@ -131,7 +138,7 @@ export function calculateCost<TApi extends Api>(model: Model<TApi>, usage: Usage
 	usage.cost.input = (pricing.input / 1000000) * usage.input;
 	usage.cost.output = (pricing.output / 1000000) * usage.output;
 	usage.cost.cacheRead = (pricing.cacheRead / 1000000) * usage.cacheRead;
-	usage.cost.cacheWrite = calculateAnthropicCacheWriteCost(model, usage, pricing);
+	usage.cost.cacheWrite = calculateClaudeCacheWriteCost(model, usage, pricing);
 	usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite;
 	return usage.cost;
 }
