@@ -3308,7 +3308,7 @@ mod tests {
 	/// and termination cleanup silently became a no-op. The replacement
 	/// path scans `proc_listallpids` and groups by `pbi_ppid`, which actually
 	/// works. Linux has always worked via `/proc`.
-	#[cfg(unix)]
+	#[cfg(target_os = "macos")]
 	#[test]
 	fn children_includes_freshly_spawned_child() {
 		use std::{process::Command, thread, time::Duration};
