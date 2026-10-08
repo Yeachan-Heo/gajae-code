@@ -296,6 +296,7 @@ Set `mouse.enabled: true` to let GJC capture the wheel for virtual session scrol
 | Variable | Behavior |
 | --- | --- |
 | `GJC_LAUNCH_POLICY` | Launch policy for `--tmux` startup: `tmux` (default) or `direct` (skip the tmux session) |
+| `GJC_NO_TMUX` | `1` or `true` (exact spelling) has the same effect as `GJC_LAUNCH_POLICY=direct`. A `GJC_LAUNCH_POLICY` of `tmux` or `direct` wins over it. |
 | `GJC_TMUX_SESSION` | Explicit tmux session name override for `--tmux` startup. Use a unique value (for example `GJC_TMUX_SESSION=gjc-fresh-$(date +%s) gjc --tmux`) to force a fresh named session. |
 | `GJC_TMUX_COMMAND` | tmux binary/name override for every GJC tmux flow. This is not a shell command line; include only the executable path/name, not flags. |
 | `GJC_TMUX_PROFILE` | Set `0`/`false`/`off` to apply only the required ownership tags and skip the scroll/mouse/clipboard profile |
@@ -521,6 +522,8 @@ Extra conditional behavior:
 | `GJC_FORCE_IMAGE_PROTOCOL`    | Forces supported image protocol (`kitty`, `iterm2`/`iterm`, `sixel`, `none`) where used            |
 | `GJC_ALLOW_SIXEL_PASSTHROUGH` | Allows SIXEL passthrough when `GJC_FORCE_IMAGE_PROTOCOL=sixel`                                      |
 | `GJC_NO_PTY`                  | If `1`, disables interactive PTY path for bash tool                                                |
+| `GJC_SKIP_NOFILE_CHECK` | macOS only. `1` or `true` (exact spelling) skips the startup check that warns when `ulimit -n` is below `4096`. |
+| `GJC_CLEANUP_DEADLINE_MS` | How long a signal, fatal-error, broken-pipe, or `quit()` exit waits for in-flight shutdown cleanup before it exits anyway (default `5000`). Finite values `>= 0` are honored, and values above `2147483647` are lowered to it. Empty, negative, or non-numeric values fall back to the default. |
 | `GJC_SESSION_CONTEXT_BUDGET_BYTES` | Overrides the synchronous session-context materialization budget in bytes (default `536870912` = 512 MiB, ceiling `8589934592` = 8 GiB). Only a canonical positive-integer value is honored; anything invalid (empty, non-numeric, negative, zero, overflowing a safe integer, or above the ceiling) fail-closes to the 512 MiB default with a warning. Raise it above your measured session size to suppress the `SessionContextTooLargeError` preflight, or lower it to restore the old tight bound. |
 
 LSP project configuration may control declarative matching, activation, and capabilities, but it cannot define a command, arguments, executable, client factory, initialization options, or opaque server settings. Trusted user-wide configuration outside the project—including the recommended `~/.gjc/agent/lsp.*` files and supported legacy user locations—can override LSP launches and server options; automatic discovery uses trusted external executables and rejects project-owned lexical paths as well as symlink-resolved project binaries.
@@ -607,6 +610,7 @@ These are read as runtime signals; they are usually set by the terminal/OS rathe
 | `GJC_FORCE_IMAGE_PROTOCOL` | Forces terminal image protocol detection (`kitty`, `iterm2`/`iterm`, `sixel`, `none`) |
 | `GJC_TUI_KEYBOARD_PROTOCOL` | Enhanced keyboard input (Kitty keyboard protocol + xterm modifyOtherKeys). Enabled by default; set `0` / `false` to leave the keyboard in its default mode. GJC automatically skips the modifyOtherKeys fallback on Windows and Apple Terminal because it breaks CJK/Hangul IME composition there; use the full opt-out for other affected terminals such as Android Termius. |
 | `GJC_TUI_SYNCHRONIZED_OUTPUT` | Synchronized-output framing (`CSI ?2026h/l`) is enabled by default. Set `0` / `false` / `off` / `no` before starting or restarting GJC to remove that framing for terminal parsers that render it incorrectly. This is a process-wide compatibility and diagnostic switch, not tmux/Byobu client detection or per-client negotiation. Disabling it may expose visible tearing; return to the default after diagnosis unless the client requires the workaround. |
+| `GJC_TUI_WIDTH_SETTLE_MS` | Trailing debounce in ms before the full repaint that repairs the transcript after a terminal width change (default `1000`; `0` turns the settled repair off). Read once when the TUI starts. A negative or non-numeric value falls back to the default. `PI_TUI_WIDTH_SETTLE_MS` is the legacy alias. |
 
 ---
 
