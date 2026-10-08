@@ -67,6 +67,7 @@ async function createSession(
 		enableMCP: false,
 		enableLsp: false,
 		deferOptionalModelRefresh: true,
+		notificationHostModeSupported: false,
 		sdkHostModeSupported: false,
 		forkContextSeed: options.forkContextSeed,
 		providerSessionId: options.providerSessionId,
