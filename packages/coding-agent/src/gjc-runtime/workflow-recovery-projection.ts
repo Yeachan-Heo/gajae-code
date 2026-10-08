@@ -95,8 +95,6 @@ export interface WorkflowRecoveryZeroProgressMemory {
 	lastFingerprint?: string;
 	/** Consecutive compaction observations with an unchanged fingerprint. */
 	unchangedObservations: number;
-	/** Session event revision; activity is progress evidence even before a durable checkpoint lands. */
-	lastActivityRevision?: number;
 }
 
 /** #4560: bound repeated zero-progress continuation cycles (#4560). */
@@ -105,20 +103,12 @@ export const ZERO_PROGRESS_STALL_THRESHOLD = 2;
 export function trackWorkflowRecoveryZeroProgress(
 	memory: WorkflowRecoveryZeroProgressMemory | undefined,
 	projection: WorkflowRecoveryProjection,
-	activityRevision?: number,
 ): WorkflowRecoveryZeroProgressMemory {
 	const fingerprint = hashWorkflowRecoveryProjection(projection);
-	if (!memory)
-		return { lastFingerprint: fingerprint, unchangedObservations: 0, lastActivityRevision: activityRevision };
-	const activityAdvanced =
-		activityRevision !== undefined &&
-		memory.lastActivityRevision !== undefined &&
-		activityRevision !== memory.lastActivityRevision;
-	const unchanged = !activityAdvanced && memory.lastFingerprint === fingerprint ? memory.unchangedObservations + 1 : 0;
+	if (!memory) return { lastFingerprint: fingerprint, unchangedObservations: 0 };
 	return {
 		lastFingerprint: fingerprint,
-		unchangedObservations: unchanged,
-		lastActivityRevision: activityRevision ?? memory.lastActivityRevision,
+		unchangedObservations: memory.lastFingerprint === fingerprint ? memory.unchangedObservations + 1 : 0,
 	};
 }
 
@@ -354,9 +344,10 @@ function isLegacyRalplanLaneOverflow(row: RalplanProjectionRow): boolean {
 }
 
 /**
- * Build a recovery projection from the newest complete Ralplan `final` stage
- * row of a run. Returns undefined when no parseable final artifact exists —
- * compaction then degrades to the thin projection instead of guessing.
+ * Build a recovery projection from the latest usable Ralplan artifact. For an
+ * active run, a planner/revision opener recorded after the newest final takes
+ * precedence until a replacement final is recorded. `finalOnly` ignores such
+ * openers. Returns undefined when the selected artifact cannot be verified.
  */
 async function projectRalplanRunInternal(
 	input: RalplanProjectionInput,
@@ -378,7 +369,10 @@ async function projectRalplanRunInternal(
 	}
 	const finalRow = [...rows].reverse().find(row => row.stage === "final");
 	const planRow = [...rows].reverse().find(row => row.stage === "revision" || row.stage === "planner");
-	const artifactRow = finalOnly ? finalRow : (finalRow ?? planRow);
+	const finalRowIndex = finalRow ? rows.lastIndexOf(finalRow) : -1;
+	const planRowIndex = planRow ? rows.lastIndexOf(planRow) : -1;
+	const postFinalOpener = !finalOnly && finalRowIndex >= 0 && planRowIndex > finalRowIndex;
+	const artifactRow = finalOnly ? finalRow : postFinalOpener ? planRow : (finalRow ?? planRow);
 	if (
 		typeof artifactRow?.path !== "string" ||
 		artifactRow.path.trim().length === 0 ||
@@ -440,7 +434,6 @@ async function projectRalplanRunInternal(
 		}
 	}
 	const planningAdmissionPending = [...rejectedAdmissions].some(identity => !recoveredAdmissions.has(identity));
-	const finalRowIndex = finalRow ? rows.lastIndexOf(finalRow) : -1;
 	const recoveryAfterFinal =
 		finalRowIndex >= 0 && rows.slice(finalRowIndex + 1).some(row => row.event === "planning_admission_recovered");
 	let nextAction: WorkflowRecoveryProjection["nextAction"];
@@ -448,6 +441,8 @@ async function projectRalplanRunInternal(
 		nextAction = { actionClass: "awaiting-approval", detail: "planning-stuck" };
 	} else if (planningAdmissionPending) {
 		nextAction = { actionClass: "recover-plan-admission", detail: "review-lane-admission-unresolved" };
+	} else if (postFinalOpener) {
+		nextAction = { actionClass: "run-plan-review" };
 	} else if (recoveryAfterFinal) {
 		nextAction = { actionClass: "run-plan-review", detail: "refresh-final-after-admission-recovery" };
 	} else if (stage === "final") {

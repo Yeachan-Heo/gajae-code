@@ -7077,13 +7077,6 @@ export class AgentSession {
 	}
 
 	#trackAgentEvent = (event: AgentEvent): Promise<void> => {
-		if (
-			event.type === "tool_execution_start" ||
-			event.type === "tool_execution_update" ||
-			event.type === "tool_execution_end"
-		) {
-			this.#workflowActivityRevision++;
-		}
 		const eventScope = (event as AgentEvent & { scope?: AttemptScope }).scope;
 		if ((event.type === "agent_start" || event.type === "turn_start") && eventScope !== undefined) {
 			this.#bindAttemptScopeToActiveRun(eventScope);
@@ -16552,7 +16545,6 @@ export class AgentSession {
 				this.#workflowRecoveryMemory = trackWorkflowRecoveryZeroProgress(
 					this.#workflowRecoveryMemory,
 					snapshot.workflowRecovery,
-					this.#workflowActivityRevision,
 				);
 			}
 			if (snapshot.workflowRecovery && this.#workflowRecoveryMemory) {
@@ -16623,7 +16615,6 @@ export class AgentSession {
 	}
 	/** #4560: zero-progress memory across compaction observations. */
 	#workflowRecoveryMemory: WorkflowRecoveryZeroProgressMemory | undefined;
-	#workflowActivityRevision = 0;
 	/** #4560: active skills observed by the latest compaction snapshot. */
 	#lastCompactionActiveSkills: Array<{ skill: string; phase: string }> = [];
 

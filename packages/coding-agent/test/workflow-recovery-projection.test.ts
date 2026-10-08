@@ -284,6 +284,47 @@ describe("workflow recovery projection (#4560)", () => {
 		expect(projection?.nextAction.detail).toBe("planner-without-intent-receipt");
 	});
 
+	it.each(["planner", "revision"] as const)("projects a post-final %s opener for plan review", async openerStage => {
+		const runId = `post-final-${openerStage}-opener`;
+		const runDir = ralplanRunDir(tempDir.path(), runId);
+		const openerPlan = `Repair the new widget parser regression.\n\n## Accepted Scope\n- parser/new-lookahead.ts\n\n## Non-Goals\n- Replacing the tokenizer\n`;
+		const finalDigest = crypto.createHash("sha256").update(FINAL_PLAN).digest("hex");
+		const openerDigest = crypto.createHash("sha256").update(openerPlan).digest("hex");
+		const openerPath = `stage-02-${openerStage}.md`;
+		await Bun.write(path.join(runDir, "stage-01-final.md"), FINAL_PLAN);
+		await Bun.write(path.join(runDir, openerPath), openerPlan);
+		await Bun.write(
+			path.join(runDir, "index.jsonl"),
+			`${JSON.stringify({ stage: "final", stage_n: 1, path: "stage-01-final.md", sha256: finalDigest })}\n${JSON.stringify(
+				{
+					stage: openerStage,
+					stage_n: 2,
+					path: openerPath,
+					sha256: openerDigest,
+				},
+			)}\n`,
+		);
+		await Bun.write(
+			path.join(tempDir.path(), ".gjc", `_session-${SESSION_ID}`, "state", "ralplan-state.json"),
+			JSON.stringify({ run_id: runId }),
+		);
+
+		const projection = await projectLatestRalplanRun({ cwd: tempDir.path(), sessionId: SESSION_ID });
+
+		expect(projection?.source).toBe("ralplan-run");
+		expect(projection?.provenance).toMatchObject({
+			runId,
+			stage: openerStage,
+			planPath: path.join(runDir, openerPath),
+			sha256: `sha256:${openerDigest}`,
+		});
+		expect(projection?.scope).toEqual([
+			{ kind: "accepted", text: "parser/new-lookahead.ts" },
+			{ kind: "non_goal", text: "Replacing the tokenizer" },
+		]);
+		expect(projection?.nextAction).toEqual({ actionClass: "run-plan-review" });
+	});
+
 	it("rejects a ralplan run reached through a symlinked ancestor directory", async () => {
 		// Regression for #4560 review P1-6: checking only the leaf run directory
 		// let a symlinked ancestor relocate the effective recovery root.
@@ -489,14 +530,11 @@ describe("workflow recovery projection (#4560)", () => {
 		const recovered = trackWorkflowRecoveryZeroProgress(stalledMemory, { ...a, ...progressed } as typeof a);
 		expect(recovered.unchangedObservations).toBe(0);
 		expect(isWorkflowRecoveryStalled(recovered)).toBe(false);
-		const activeBefore = trackWorkflowRecoveryZeroProgress(undefined, a, 1);
-		const activeAfter = trackWorkflowRecoveryZeroProgress(activeBefore, a, 2);
-		expect(activeAfter.unchangedObservations).toBe(0);
-		expect(isWorkflowRecoveryStalled(activeAfter)).toBe(false);
-		const idleOnce = trackWorkflowRecoveryZeroProgress(activeAfter, a, 2);
-		const idleTwice = trackWorkflowRecoveryZeroProgress(idleOnce, a, 2);
-		expect(idleTwice.unchangedObservations).toBe(ZERO_PROGRESS_STALL_THRESHOLD);
-		expect(isWorkflowRecoveryStalled(idleTwice)).toBe(true);
+		// Tool starts, updates, and ends do not change this durable projection and
+		// therefore cannot reset the zero-progress observation count.
+		const sameProjectionAfterToolActivity = trackWorkflowRecoveryZeroProgress(stalledMemory, a);
+		expect(sameProjectionAfterToolActivity.unchangedObservations).toBe(ZERO_PROGRESS_STALL_THRESHOLD + 1);
+		expect(isWorkflowRecoveryStalled(sameProjectionAfterToolActivity)).toBe(true);
 	});
 });
 
