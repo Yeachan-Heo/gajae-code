@@ -5,3 +5,4 @@
 - Provider iterators that close with a trailing assistant but no explicit `done`/`error` event now publish the canonical `message_end` before `turn_end` and `agent_end`, preventing session persistence from missing the authoritative final response.
 - Provider stream cancellation keeps one signal listener, bounds per-read abort-race reactions, and observes synchronous aborts raised inside provider factories.
 - Lossless degraded snapshots preserve only validated, size-bounded transport codes, retry headers, and HTTP/2 diagnostics while dropping unreadable, oversized, or non-cloneable values.
+- Normal Agent requests now retain provider-visible prompt-prefix telemetry, and `Agent.reset()` starts a fresh cache lineage.
