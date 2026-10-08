@@ -1216,8 +1216,7 @@ export function planTargetedTasks(
 			if (owner.manifest.scripts?.check) {
 				add(tasks, `check:${owner.name}`, `Check ${owner.name}`, packageScriptCommand("check"), resolvePackageCwd(owner.dir));
 			}
-			const needsCliSmoke = isCodingAgentRuntimePath(changedPath) || (isTestFilePath(changedPath) && mappedTests.length === 0);
-			if (needsCliSmoke) {
+			if (isCodingAgentRuntimePath(changedPath)) {
 				add(tasks, "cli-smoke", "GJC CLI smoke test", ["bun", "run", "ci:test:smoke"]);
 			}
 			if (isUnscopedWrapperPath(changedPath)) {
