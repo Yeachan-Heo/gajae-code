@@ -355,6 +355,25 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 		}
 	});
 
+	test("loads a trusted user skill symlink whose target remains inside the explicit home", async () => {
+		const sharedSkills = path.join(home, "shared-skills");
+		const linkedSkillDir = path.join(sharedSkills, "linked-helper");
+		const userSkillsDir = path.join(home, ".gjc", "agent", "skills");
+		await makeSkill(sharedSkills, "linked-helper");
+		await fs.mkdir(userSkillsDir, { recursive: true });
+		await fs.symlink(linkedSkillDir, path.join(userSkillsDir, "linked-helper"), "dir");
+
+		const result = await loadCapabilityForHome<Skill>(skillCapability.id, home, {
+			cwd: project,
+			providers: ["native"],
+		});
+
+		const skill = result.items.find(item => item.name === "linked-helper");
+		expect(skill?.path).toBe(await fs.realpath(path.join(linkedSkillDir, "SKILL.md")));
+		expect(skill?.discoveryPath).toBe(path.join(await fs.realpath(userSkillsDir), "linked-helper", "SKILL.md"));
+		expect(result.warnings).toEqual([]);
+	});
+
 	test("current-profile explicit-home loads authorize the exact XDG plugin root", async () => {
 		if (process.platform === "win32") return;
 		const processHome = path.join(tempDir, "process-home");
