@@ -19,7 +19,7 @@ Ralplan is the consensus planning workflow. It triggers iterative planning with 
 
 ## Flags
 
-- `--interactive`: Adds draft-review prompts and one-at-a-time reconciliation. When the final receipt resolves `auto_handoff.effectiveTarget` to `off` without `degradationReason: "planning_stuck"`, final approval uses an `ask` workflow gate; a configured automatic admission is handled by step 8.
+- `--interactive`: Adds draft-review prompts and one-at-a-time reconciliation. When the final receipt resolves `auto_handoff.effectiveTarget` to `off` and its `degradationReason` is neither `planning_stuck` nor `planning_admission_pending`, final approval uses an `ask` workflow gate; a configured automatic admission is handled by step 8. Step 8 excludes both degradation reasons from the approval `ask` path.
 - `--deliberate`: Forces high-risk deliberation: pre-mortem plus expanded test planning. It may also auto-enable for explicit auth/security, migration, destructive, incident, compliance/PII, or public-API-breakage risk.
 - `--resume`: Explicitly resumes the active Ralplan run in this session. It retains the run ID, current phase, role-agent identities, review verdicts, and admission history; a supplied task must match the persisted task. If the task is already stored, the flag may be used without positional task text.
 - `--new-run`: Explicitly replaces the active Ralplan state pointer with a fresh run ID. Join or cancel prior role workers before using it; the new run fences their state updates but does not terminate their processes or delete their old artifacts.

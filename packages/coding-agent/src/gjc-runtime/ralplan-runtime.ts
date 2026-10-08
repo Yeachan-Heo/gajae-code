@@ -1866,6 +1866,7 @@ async function markRalplanFinalPublicationPending(
 			if (existingRead.kind === "corrupt")
 				throw new RalplanCommandError(2, `existing ralplan state is corrupt or tampered (${existingRead.error})`);
 			let existing: Record<string, unknown> = existingRead.kind === "valid" ? existingRead.value : {};
+			const currentRunId = typeof existing.run_id === "string" ? existing.run_id.trim() : "";
 			const phase = typeof existing.current_phase === "string" ? existing.current_phase.trim() : "";
 			// Active final is publication/approval, not a terminal lifecycle despite its stage phase lock.
 			const phaseLocked =
@@ -1892,12 +1893,10 @@ async function markRalplanFinalPublicationPending(
 				}
 				if (lastFinalSha !== publication.sha256) return false;
 			} else {
-				if (existing.run_id !== runId && existing.active === true) {
-					throw new RalplanCommandError(
-						2,
-						`ralplan run ${runId} is no longer the active session owner; current run ${String(existing.run_id)} remains active. Resume or retire that run before writing.`,
-					);
-				}
+				// A final can establish its first run ID after an incoming planning handoff,
+				// whose Ralplan state has no owner yet. Once any nonblank run ID owns the
+				// session, however, neither an active nor terminal newer run may be replaced.
+				if (currentRunId && currentRunId !== runId) assertRalplanSessionOwner(runId, currentRunId);
 				if (existing.run_id === runId && phaseLocked) {
 					throw new RalplanCommandError(
 						2,
@@ -1909,7 +1908,7 @@ async function markRalplanFinalPublicationPending(
 				delete existing.planning_stuck;
 				delete existing.auto_handoff;
 				// A first final may establish the run directly after a planning handoff.
-				if (existing.run_id !== undefined) {
+				if (currentRunId) {
 					delete existing.handoff_from;
 					delete existing.handoff_at;
 					delete existing.upstream_handoff_at;
@@ -3192,7 +3191,11 @@ async function seedRalplanState(
 				}
 				const runId = typeof existing.run_id === "string" ? existing.run_id.trim() : "";
 				const currentPhase = typeof existing.current_phase === "string" ? existing.current_phase.trim() : "";
-				if (!runId || !currentPhase || getSkillManifest("ralplan").phaseLock.includes(currentPhase)) {
+				if (
+					!runId ||
+					!currentPhase ||
+					(getSkillManifest("ralplan").phaseLock.includes(currentPhase) && currentPhase !== "final")
+				) {
 					throw new RalplanCommandError(
 						2,
 						"--resume requires an active, non-terminal ralplan run identity and phase.",

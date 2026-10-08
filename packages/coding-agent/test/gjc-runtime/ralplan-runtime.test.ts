@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, type Mode, type PathLike } from "node:fs";
+import { existsSync, type Mode, type PathLike, type StatOptions } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -275,6 +275,42 @@ describe("native gjc ralplan runtime — consensus handoff", () => {
 		expect(afterTerminalPayload.run_id).not.toBe(freshPayload.run_id);
 	});
 
+	it("resumes an active final phase without changing its run identity or phase", async () => {
+		const root = await tempDir();
+		const runId = await startNewRalplanRun(root, "resume final publication");
+		const statePath = ralplanStatePath(root);
+		const seeded = JSON.parse(await fs.readFile(statePath, "utf-8")) as Record<string, unknown>;
+		await writeWorkflowEnvelopeAtomic(statePath, { ...seeded, current_phase: "final" }, { cwd: root });
+
+		const result = await runNativeRalplanCommand(["--resume", "--json"], root);
+
+		expect(result.status).toBe(0);
+		expect(JSON.parse(result.stdout ?? "{}")).toMatchObject({ run_id: runId });
+		expect(JSON.parse(await fs.readFile(statePath, "utf-8"))).toMatchObject({
+			run_id: runId,
+			active: true,
+			current_phase: "final",
+		});
+	});
+
+	it("rejects resuming an inactive terminal final phase", async () => {
+		const root = await tempDir();
+		const runId = await startNewRalplanRun(root, "terminal final cannot resume");
+		const statePath = ralplanStatePath(root);
+		const seeded = JSON.parse(await fs.readFile(statePath, "utf-8")) as Record<string, unknown>;
+		await writeWorkflowEnvelopeAtomic(statePath, { ...seeded, active: false, current_phase: "final" }, { cwd: root });
+
+		const result = await runNativeRalplanCommand(["--resume", "--json"], root);
+
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("--resume requires an active ralplan run");
+		expect(JSON.parse(await fs.readFile(statePath, "utf-8"))).toMatchObject({
+			run_id: runId,
+			active: false,
+			current_phase: "final",
+		});
+	});
+
 	it("rejects a stale final without replacing the newer active run or its admission", async () => {
 		const root = await tempDir();
 		const oldRunId = await startNewRalplanRun(root, "old planning task");
@@ -300,6 +336,103 @@ describe("native gjc ralplan runtime — consensus handoff", () => {
 		expect(await fs.readFile(statePath, "utf-8")).toBe(stateBefore);
 		expect(JSON.parse(stateBefore).run_id).toBe(newRunId);
 		expect(existsSync(ralplanPlanPath(root, oldRunId, "stage-01-final.md"))).toBe(false);
+	}, 60_000);
+
+	it("rejects a stale final paused after owner validation when a newer run becomes terminal", async () => {
+		const root = await tempDir();
+		const oldRunId = await startNewRalplanRun(root, "old planning task");
+		const statePath = ralplanStatePath(root);
+		const oldIndexPath = ralplanPlanPath(root, oldRunId, "index.jsonl");
+		const ownerCheckReached = Promise.withResolvers<void>();
+		const resumeOldWriter = Promise.withResolvers<void>();
+		let paused = false;
+		const originalLstat = fs.lstat.bind(fs);
+		const lstatImplementation = (async (target: PathLike, options?: StatOptions) => {
+			if (!paused && path.resolve(String(target)) === path.resolve(oldIndexPath)) {
+				paused = true;
+				ownerCheckReached.resolve();
+				await resumeOldWriter.promise;
+			}
+			return await originalLstat(target, options);
+		}) as typeof fs.lstat;
+		const lstatSpy = spyOn(fs, "lstat").mockImplementation(lstatImplementation);
+		const write = writeRalplanArtifact(root, oldRunId, "final", 1, "# stale final");
+		try {
+			// The per-run writer has passed its early owner check but has not reached the
+			// final-publication state mutation yet.
+			await ownerCheckReached.promise;
+			const newRunId = await startNewRalplanRun(root, "new planning task");
+			const newerState = JSON.parse(await fs.readFile(statePath, "utf-8")) as Record<string, unknown>;
+			const newerAdmission = {
+				configuredTarget: "ultragoal",
+				effectiveTarget: "off",
+				degradationReason: "planning_admission_pending",
+			};
+			await writeWorkflowEnvelopeAtomic(
+				statePath,
+				{ ...newerState, active: false, current_phase: "complete", auto_handoff: newerAdmission },
+				{ cwd: root },
+			);
+			const terminalOwnerState = await fs.readFile(statePath, "utf-8");
+
+			resumeOldWriter.resolve();
+			const result = await write;
+
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("no longer the active session owner");
+			expect(await fs.readFile(statePath, "utf-8")).toBe(terminalOwnerState);
+			expect(JSON.parse(terminalOwnerState)).toMatchObject({
+				run_id: newRunId,
+				active: false,
+				current_phase: "complete",
+				auto_handoff: newerAdmission,
+			});
+			expect(existsSync(ralplanPlanPath(root, oldRunId, "stage-01-final.md"))).toBe(false);
+			expect(existsSync(ralplanPlanPath(root, oldRunId, "pending-approval.md"))).toBe(false);
+			expect(existsSync(oldIndexPath)).toBe(false);
+		} finally {
+			resumeOldWriter.resolve();
+			await write;
+			lstatSpy.mockRestore();
+		}
+	}, 60_000);
+
+	it("allows a first final publication when an incoming planning handoff has no Ralplan owner yet", async () => {
+		const root = await tempDir();
+		const statePath = ralplanStatePath(root);
+		const seeded = await runNativeRalplanCommand(["--json", "incoming handoff task"], root);
+		expect(seeded.status).toBe(0);
+		const incoming = JSON.parse(await fs.readFile(statePath, "utf-8")) as Record<string, unknown>;
+		delete incoming.run_id;
+		const handoffAt = "2026-10-07T00:00:00.000Z";
+		await writeWorkflowEnvelopeAtomic(
+			statePath,
+			{
+				...incoming,
+				active: false,
+				current_phase: "handoff",
+				handoff_from: "deep-interview",
+				handoff_at: handoffAt,
+				upstream_handoff_at: handoffAt,
+			},
+			{ cwd: root },
+		);
+
+		const runId = "handoff-final-run";
+		const result = await writeRalplanArtifact(root, runId, "final", 1, "# first final after handoff");
+
+		expect(result.status).toBe(0);
+		expect(JSON.parse(await fs.readFile(statePath, "utf-8"))).toMatchObject({
+			run_id: runId,
+			active: true,
+			current_phase: "final",
+			handoff_from: "deep-interview",
+			handoff_at: handoffAt,
+			upstream_handoff_at: handoffAt,
+		});
+		expect(await fs.readFile(ralplanPlanPath(root, runId, "stage-01-final.md"), "utf-8")).toBe(
+			"# first final after handoff\n",
+		);
 	}, 60_000);
 
 	it("fences fresh role metadata and verdicts when a new run starts during artifact publication", async () => {
