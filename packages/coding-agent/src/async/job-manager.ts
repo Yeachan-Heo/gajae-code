@@ -3443,16 +3443,22 @@ export class AsyncJobManager {
 			return;
 		}
 
-		this.#deliveryLoop = this.#runDeliveryLoop()
+		const completion = Promise.withResolvers<void>();
+		const promise = completion.promise;
+		this.#deliveryLoop = promise;
+		const operation = this.#runDeliveryLoop()
 			.catch(error => {
 				logger.error("Async job delivery loop crashed", { error: String(error) });
 			})
 			.finally(() => {
-				this.#deliveryLoop = undefined;
-				if (!this.#disposed && this.#hasDeliverable()) {
-					this.#ensureDeliveryLoop();
+				if (this.#deliveryLoop === promise) {
+					this.#deliveryLoop = undefined;
+					if (!this.#disposed && this.#hasDeliverable()) {
+						this.#ensureDeliveryLoop();
+					}
 				}
 			});
+		void operation.then(completion.resolve, completion.reject);
 	}
 
 	async #runDeliveryLoop(): Promise<void> {
@@ -3478,8 +3484,10 @@ export class AsyncJobManager {
 	}
 
 	#deliverDelivery(delivery: AsyncJobDelivery): Promise<void> {
-		const promise = (async () => {
-			this.#inFlightDeliveries.push(delivery);
+		const completion = Promise.withResolvers<void>();
+		delivery.promise = completion.promise;
+		this.#inFlightDeliveries.push(delivery);
+		const operation = (async () => {
 			this.#notifyChange();
 			try {
 				const currentJob = this.#jobs.get(delivery.jobId);
@@ -3532,12 +3540,14 @@ export class AsyncJobManager {
 				if (!this.#disposed && this.#hasDeliverable()) this.#ensureDeliveryLoop();
 			}
 		})();
-		delivery.promise = promise;
-		return promise;
+		void operation.then(completion.resolve, completion.reject);
+		return completion.promise;
 	}
 
 	async #waitForDeliveryPromise(promise: Promise<void> | undefined, deadline: number): Promise<boolean> {
-		if (!promise) return true;
+		// Missing an enrolled in-flight future is uncertainty, never evidence of
+		// successful settlement.
+		if (!promise) return false;
 		if (deadline === Number.POSITIVE_INFINITY) {
 			await promise;
 			return true;
