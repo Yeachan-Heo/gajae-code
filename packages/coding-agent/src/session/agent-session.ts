@@ -1784,11 +1784,6 @@ function boundAgentBashArtifactSaveDiagnostic(error: unknown): string {
 	return truncateHeadBytes(normalized, AGENT_BASH_ARTIFACT_SAVE_DIAGNOSTIC_MAX_BYTES).text;
 }
 
-export interface AgentBashArtifactStore {
-	saveArtifact(content: string, toolType: string): Promise<string | undefined>;
-	getArtifactPath(id: string): Promise<string | null>;
-}
-
 export async function saveAgentBashOriginalArtifact(
 	publication: SessionArtifactPublication,
 	originalText: string,
