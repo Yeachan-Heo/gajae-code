@@ -211,7 +211,7 @@ describe("task fork-context provider identity", () => {
 			const tempDir = tempDirs.pop();
 			if (tempDir && fs.existsSync(tempDir)) await removeTempDirWithWindowsRetry(tempDir);
 		}
-	});
+	}, 15_000);
 
 	it("canonicalizes an existing root alias before creating a missing managed descendant", () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-managed-root-alias-${Snowflake.next()}-`));
