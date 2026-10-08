@@ -122,19 +122,27 @@ describe("issue #6446 Windows path casing", () => {
 		}
 	});
 
-	it("uses ordinal folding for fallback keys without a usable parent identity", async () => {
+	it("preserves ancestor casing for zero-inode fallback keys", async () => {
 		if (process.platform !== "win32") return;
 
 		const directory = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-session-key-fallback-"));
 		try {
 			expect(directoryCaseSensitive(directory)).toBe(false);
 			vi.spyOn(fs, "statSync").mockImplementation((() => ({ dev: 0n, ino: 0n })) as unknown as typeof fs.statSync);
+			const realpathSpy = vi.spyOn(fs, "realpathSync").mockImplementation((() => {
+				throw new Error("canonical parent unavailable");
+			}) as unknown as typeof fs.realpathSync);
 			const dottedCapitalIPath = path.join(directory, "İ.jsonl");
 			const dottedLowercaseIPath = path.join(directory, "i̇.jsonl");
 			expect(stablePathKey(dottedCapitalIPath)).not.toBe(stablePathKey(dottedLowercaseIPath));
 			expect(stablePathKey(path.join(directory, "Session.jsonl"))).toBe(
 				stablePathKey(path.join(directory, "session.jsonl")),
 			);
+			const alternateParentSpelling = path.join(path.dirname(directory), path.basename(directory).toUpperCase());
+			expect(stablePathKey(path.join(directory, "Session.jsonl"))).not.toBe(
+				stablePathKey(path.join(alternateParentSpelling, "Session.jsonl")),
+			);
+			expect(realpathSpy).toHaveBeenCalled();
 			expect(stablePathKey(path.join(directory, "Session.jsonl"))).toBe(
 				stablePathKey(path.join(directory, "Session.jsonl.")),
 			);

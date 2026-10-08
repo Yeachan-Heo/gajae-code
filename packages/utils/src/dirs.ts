@@ -211,7 +211,15 @@ export function stablePathKey(inputPath: string): string {
 			parentIdentity.ino.toString(),
 			entryName,
 		]);
-	return caseSensitiveDirectory === false ? (windowsOrdinalCaseFold(fallbackPath) ?? fallbackPath) : fallbackPath;
+	if (caseSensitiveDirectory === false) {
+		// The case rule applies to this directory's entries, not to its ancestors.
+		// Preserve the canonical parent spelling and fold only the final name.
+		try {
+			parentPath = fs.realpathSync(parentPath);
+		} catch {}
+		return JSON.stringify(["win32-path-entry-fallback", parentPath, entryName]);
+	}
+	return fallbackPath;
 }
 
 export function normalizePathForComparison(inputPath: string, platform: NodeJS.Platform = process.platform): string {
