@@ -735,7 +735,80 @@ describe("managed descriptor reads", () => {
 	const realCjsReadSync = cjsFs.readSync;
 	const realCjsCloseSync = cjsFs.closeSync;
 	const realCjsFstatSync = cjsFs.fstatSync;
+	const realCjsLstatSync = cjsFs.lstatSync;
 	const realCjsOpenSync = cjsFs.openSync;
+
+	function forwardFstatSync(fd: number): fs.Stats;
+	function forwardFstatSync(fd: number, options?: fs.StatOptions & { bigint?: false | undefined }): fs.Stats;
+	function forwardFstatSync(fd: number, options: fs.StatOptions & { bigint: true }): fs.BigIntStats;
+	function forwardFstatSync(fd: number, options?: fs.StatOptions): fs.Stats | fs.BigIntStats;
+	function forwardFstatSync(fd: number, options?: fs.StatOptions): fs.Stats | fs.BigIntStats {
+		return options === undefined ? realCjsFstatSync(fd) : realCjsFstatSync(fd, options);
+	}
+
+	function forwardLstatSync(file: fs.PathLike): fs.Stats;
+	function forwardLstatSync(
+		file: fs.PathLike,
+		options?: fs.StatOptions & { bigint?: false | undefined; throwIfNoEntry?: true | undefined },
+	): fs.Stats;
+	function forwardLstatSync(
+		file: fs.PathLike,
+		options: fs.StatOptions & { bigint: true; throwIfNoEntry?: true | undefined },
+	): fs.BigIntStats;
+	function forwardLstatSync(
+		file: fs.PathLike,
+		options: fs.StatOptions & { bigint?: false | undefined; throwIfNoEntry: false },
+	): fs.Stats | undefined;
+	function forwardLstatSync(
+		file: fs.PathLike,
+		options: fs.StatOptions & { bigint: true; throwIfNoEntry: false },
+	): fs.BigIntStats | undefined;
+	function forwardLstatSync(
+		file: fs.PathLike,
+		options: fs.StatOptions & { throwIfNoEntry?: true | undefined },
+	): fs.Stats | fs.BigIntStats;
+	function forwardLstatSync(file: fs.PathLike, options?: fs.StatOptions): fs.Stats | fs.BigIntStats | undefined;
+	function forwardLstatSync(file: fs.PathLike, options?: fs.StatOptions): fs.Stats | fs.BigIntStats | undefined {
+		return options === undefined ? realCjsLstatSync(file) : realCjsLstatSync(file, options);
+	}
+
+	function capturePathLstatError(
+		pathname: string,
+		onPathnameError: (error: NodeJS.ErrnoException) => void,
+	): typeof fs.lstatSync {
+		function lstat(file: fs.PathLike): fs.Stats;
+		function lstat(
+			file: fs.PathLike,
+			options?: fs.StatOptions & { bigint?: false | undefined; throwIfNoEntry?: true | undefined },
+		): fs.Stats;
+		function lstat(
+			file: fs.PathLike,
+			options: fs.StatOptions & { bigint: true; throwIfNoEntry?: true | undefined },
+		): fs.BigIntStats;
+		function lstat(
+			file: fs.PathLike,
+			options: fs.StatOptions & { bigint?: false | undefined; throwIfNoEntry: false },
+		): fs.Stats | undefined;
+		function lstat(
+			file: fs.PathLike,
+			options: fs.StatOptions & { bigint: true; throwIfNoEntry: false },
+		): fs.BigIntStats | undefined;
+		function lstat(
+			file: fs.PathLike,
+			options: fs.StatOptions & { throwIfNoEntry?: true | undefined },
+		): fs.Stats | fs.BigIntStats;
+		function lstat(file: fs.PathLike, options?: fs.StatOptions): fs.Stats | fs.BigIntStats | undefined;
+		function lstat(file: fs.PathLike, options?: fs.StatOptions): fs.Stats | fs.BigIntStats | undefined {
+			try {
+				return forwardLstatSync(file, options);
+			} catch (error) {
+				if (path.resolve(String(file)) === pathname && (error as NodeJS.ErrnoException).code === "ENOENT")
+					onPathnameError(error as NodeJS.ErrnoException);
+				throw error;
+			}
+		}
+		return lstat;
+	}
 
 	function forwardReadSync(
 		fd: number,
@@ -796,7 +869,8 @@ describe("managed descriptor reads", () => {
 		});
 	}
 
-	function expectClosedDescriptors(descriptors: number[]): void {
+	function descriptorsAreClosed(descriptors: number[]): boolean {
+		let closed = true;
 		let failed = false;
 		let failure: unknown;
 		for (const fd of descriptors) {
@@ -806,11 +880,7 @@ describe("managed descriptor reads", () => {
 			} catch (caught) {
 				error = caught;
 			}
-			if ((error as NodeJS.ErrnoException | undefined)?.code !== "EBADF") {
-				try {
-					realCjsCloseSync(fd);
-				} catch {}
-			}
+			if ((error as NodeJS.ErrnoException | undefined)?.code !== "EBADF") closed = false;
 			try {
 				expect(error).toMatchObject({ code: "EBADF" });
 			} catch (caught) {
@@ -821,6 +891,7 @@ describe("managed descriptor reads", () => {
 			}
 		}
 		if (failed) throw failure;
+		return closed;
 	}
 
 	function cleanupReaderTest(
@@ -833,6 +904,7 @@ describe("managed descriptor reads", () => {
 	): void {
 		let cleanupFailed = false;
 		let cleanupError: unknown;
+		let resourcesDischarged = true;
 		const attempt = (cleanup: () => void): void => {
 			try {
 				cleanup();
@@ -846,14 +918,66 @@ describe("managed descriptor reads", () => {
 		for (const spy of spies) {
 			if (spy) attempt(() => spy.mockRestore());
 		}
-		if (store) attempt(() => store.close());
-		if (ownedDescriptor !== undefined) attempt(() => realCjsCloseSync(ownedDescriptor));
-		attempt(() =>
-			expectClosedDescriptors(
-				ownedDescriptor === undefined ? closedDescriptors : [...closedDescriptors, ownedDescriptor],
-			),
-		);
-		attempt(() => fs.rmSync(root, { recursive: true, force: true }));
+		if (store) {
+			try {
+				store.close();
+			} catch (error) {
+				resourcesDischarged = false;
+				if (!cleanupFailed) {
+					cleanupFailed = true;
+					cleanupError = error;
+				}
+			}
+		}
+		const ownedDescriptorIsClosed = (): boolean => {
+			if (ownedDescriptor === undefined) return true;
+			try {
+				realCjsFstatSync(ownedDescriptor);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "EBADF") return true;
+				if (!cleanupFailed) {
+					cleanupFailed = true;
+					cleanupError = error;
+				}
+				return false;
+			}
+			let closeFailure: unknown;
+			try {
+				realCjsCloseSync(ownedDescriptor);
+			} catch (error) {
+				closeFailure = error;
+				if (!cleanupFailed) {
+					cleanupFailed = true;
+					cleanupError = error;
+				}
+			}
+			try {
+				realCjsFstatSync(ownedDescriptor);
+				if (!cleanupFailed) {
+					cleanupFailed = true;
+					cleanupError = closeFailure ?? new Error("Owned descriptor remained open during test cleanup");
+				}
+				return false;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "EBADF") return true;
+				if (!cleanupFailed) {
+					cleanupFailed = true;
+					cleanupError = closeFailure ?? error;
+				}
+				return false;
+			}
+		};
+		if (!ownedDescriptorIsClosed()) resourcesDischarged = false;
+		try {
+			if (!descriptorsAreClosed(closedDescriptors)) resourcesDischarged = false;
+		} catch (error) {
+			resourcesDischarged = false;
+			if (!cleanupFailed) {
+				cleanupFailed = true;
+				cleanupError = error;
+			}
+		}
+		if (resourcesDischarged) attempt(() => fs.rmSync(root, { recursive: true, force: true }));
 		if (!bodyFailed && cleanupFailed) throw cleanupError;
 	}
 
@@ -966,8 +1090,8 @@ describe("managed descriptor reads", () => {
 		try {
 			const actualStore = await prepareReadOnlyStore(root, "session.jsonl", "descriptor payload\n");
 			store = actualStore;
-			fstatSpy = vi.spyOn(fs, "fstatSync").mockImplementation((fd: number, options: fs.StatOptions = {}) => {
-				realCjsFstatSync(fd, options);
+			fstatSpy = vi.spyOn(fs, "fstatSync").mockImplementation((fd: number, options?: fs.StatOptions) => {
+				forwardFstatSync(fd, options);
 				throw primaryFailure;
 			});
 			closeSpy = closeAfterForwarding(secondaryFailure, closedDescriptors);
@@ -985,6 +1109,61 @@ describe("managed descriptor reads", () => {
 			throw error;
 		} finally {
 			cleanupReaderTest(root, store, closedDescriptors, [fstatSpy, closeSpy], bodyFailed);
+		}
+	});
+
+	it("preserves the actual post-open pathname ENOENT over a secondary close error", async () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-descriptor-disappear-")));
+		const pathname = path.join(root, "session.jsonl");
+		const detached = path.join(root, "session.detached.jsonl");
+		const closedDescriptors: number[] = [];
+		const secondaryFailure = new Error("descriptor close failed after unlink");
+		let store: ManagedSessionDescendantStore | undefined;
+		let fstatSpy: Mock<typeof fs.fstatSync> | undefined;
+		let lstatSpy: Mock<typeof fs.lstatSync> | undefined;
+		let closeSpy: Mock<typeof fs.closeSync> | undefined;
+		let originalPathnameError: NodeJS.ErrnoException | undefined;
+		let fileDisplaced = false;
+		let bodyFailed = false;
+		try {
+			const actualStore = await prepareReadOnlyStore(root, "session.jsonl", "descriptor before unlink\n");
+			store = actualStore;
+			function fstatAfterOpen(fd: number, options?: fs.StatOptions & { bigint?: false | undefined }): fs.Stats;
+			function fstatAfterOpen(fd: number, options: fs.StatOptions & { bigint: true }): fs.BigIntStats;
+			function fstatAfterOpen(fd: number, options?: fs.StatOptions): fs.Stats | fs.BigIntStats;
+			function fstatAfterOpen(fd: number, options?: fs.StatOptions): fs.Stats | fs.BigIntStats {
+				const stats = forwardFstatSync(fd, options);
+				if (!fileDisplaced) {
+					fs.renameSync(pathname, detached);
+					fileDisplaced = true;
+				}
+				return stats;
+			}
+			fstatSpy = vi.spyOn(fs, "fstatSync").mockImplementation(fstatAfterOpen);
+			lstatSpy = vi.spyOn(fs, "lstatSync").mockImplementation(
+				capturePathLstatError(pathname, error => {
+					originalPathnameError = error;
+				}),
+			);
+			closeSpy = closeAfterForwarding(secondaryFailure, closedDescriptors);
+
+			let caught: unknown;
+			try {
+				actualStore.descriptorExpected("session.jsonl");
+			} catch (error) {
+				caught = error;
+			}
+			expect(fileDisplaced).toBe(true);
+			expect(originalPathnameError).toMatchObject({ code: "ENOENT" });
+			expect(caught).toBe(originalPathnameError);
+			expect((caught as NodeJS.ErrnoException).code).toBe("ENOENT");
+			expect(caught).not.toBe(secondaryFailure);
+			expect(closedDescriptors).toHaveLength(1);
+		} catch (error) {
+			bodyFailed = true;
+			throw error;
+		} finally {
+			cleanupReaderTest(root, store, closedDescriptors, [fstatSpy, lstatSpy, closeSpy], bodyFailed);
 		}
 	});
 
