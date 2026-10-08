@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test";
 import { resolveBrokerLaunchMode } from "../src/sdk/broker/ensure";
 
-test("production broker routing uses an exact Darwin child and platform launchers elsewhere", () => {
+test("production broker routing preserves Unix trampolines and the Windows hop", () => {
 	expect(resolveBrokerLaunchMode("linux", "discovery")).toBe("posix-trampoline");
-	expect(resolveBrokerLaunchMode("darwin", "discovery")).toBe("darwin-child");
+	expect(resolveBrokerLaunchMode("darwin", "discovery")).toBe("darwin-trampoline");
 	expect(resolveBrokerLaunchMode("win32", "discovery")).toBe("windows-hop");
 });
 

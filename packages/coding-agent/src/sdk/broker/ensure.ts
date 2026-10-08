@@ -16,7 +16,7 @@ import {
 	readBrokerDiscovery,
 	readBrokerRestartIntent,
 } from "./discovery";
-import { BROKER_HANDOFF_ACKNOWLEDGEMENT } from "./hop";
+import { BROKER_HANDOFF_ABORT, BROKER_HANDOFF_ACKNOWLEDGEMENT, BROKER_HANDOFF_COMMIT } from "./hop";
 import {
 	isProcessIncarnation,
 	observeProcessIncarnation,
@@ -43,6 +43,12 @@ export interface BrokerSpawnResult {
 	realBrokerPid: number | undefined;
 	/** Kernel identity returned by the POSIX trampoline when available. */
 	realBrokerIncarnation?: string;
+	handoff?: BrokerLaunchHandoff;
+}
+
+export interface BrokerLaunchHandoff {
+	release(): Promise<void>;
+	terminate(): Promise<void>;
 }
 
 /**
@@ -70,10 +76,10 @@ export class BrokerHopError extends Error {
 export function resolveBrokerLaunchMode(
 	platform: NodeJS.Platform,
 	initiator: "discovery" | "fixture-lease",
-): "windows-hop" | "posix-trampoline" | "darwin-child" | "direct" {
+): "windows-hop" | "posix-trampoline" | "darwin-trampoline" | "direct" {
 	if (initiator === "fixture-lease") return "direct";
 	if (platform === "win32") return "windows-hop";
-	return platform === "darwin" ? "darwin-child" : "posix-trampoline";
+	return platform === "darwin" ? "darwin-trampoline" : "posix-trampoline";
 }
 
 /**
@@ -126,6 +132,7 @@ export interface BrokerLaunchResult {
 	realBrokerPid: number | undefined;
 	realBrokerIncarnation?: string;
 	error: Error | undefined;
+	handoff?: BrokerLaunchHandoff;
 }
 
 const MAX_LAUNCHER_OUTPUT_CHARS = 4_096;
@@ -145,6 +152,19 @@ function endBrokerLauncherInput(child: ChildProcess, chunk?: string): void {
 	} catch {
 		// The launcher treats an ended acknowledgement pipe as a failed handoff.
 	}
+}
+
+function writeBrokerLauncherInput(child: ChildProcess, chunk: string): Promise<void> {
+	const input = child.stdin;
+	if (!input || input.destroyed || input.writableEnded)
+		return Promise.reject(new Error("Broker trampoline control pipe is closed."));
+	const { promise, resolve, reject } = Promise.withResolvers<void>();
+	try {
+		input.write(chunk, error => (error ? reject(error) : resolve()));
+	} catch (error) {
+		reject(error instanceof Error ? error : new Error(String(error)));
+	}
+	return promise;
 }
 
 function awaitLauncherClose(child: ChildProcess): Promise<{ code: number | null; spawnError?: Error }> {
@@ -337,82 +357,31 @@ export function parseBrokerHopReply(
 	return { realBrokerPid: pid, realBrokerIncarnation: incarnation, error: undefined };
 }
 
-function awaitBrokerChildSpawn(child: ChildProcess): Promise<Error | undefined> {
-	const { promise, resolve } = Promise.withResolvers<Error | undefined>();
-	child.once("spawn", () => resolve(undefined));
-	child.once("error", resolve);
-	return promise;
-}
-
-/** Darwin keeps the broker as a retained detached ChildProcess so cleanup never signals a reused PID. */
-export async function launchBrokerViaDetachedChild(
-	command: { file: string; args: readonly string[] },
-	options: { env: NodeJS.ProcessEnv; cwd?: string; stderrFd?: number; timeoutMs?: number },
-): Promise<BrokerLaunchResult> {
-	const timeoutMs = options.timeoutMs ?? DEFAULT_LAUNCHER_TIMEOUT_MS;
-	if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("Detached SDK broker startup deadline elapsed.");
-	const child = spawnBrokerDirect(command.file, command.args, {
-		stdioFd: options.stderrFd,
-		env: options.env,
-		...(options.cwd ? { cwd: options.cwd } : {}),
-		detached: true,
-	}).process;
-	const spawnOutcome = await Promise.race([
-		awaitBrokerChildSpawn(child).then(error => ({ kind: "spawned" as const, error })),
-		Bun.sleep(timeoutMs).then(() => ({ kind: "timeout" as const })),
-	]);
-	const realBrokerPid = child.pid;
-	const realBrokerIncarnation = realBrokerPid === undefined ? undefined : brokerProcessIncarnation(realBrokerPid);
-	if (spawnOutcome.kind === "timeout") {
-		const terminated = await terminateLauncher(child);
-		if (!terminated)
-			child.once("spawn", () => {
-				if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-			});
-		return {
-			process: child,
-			realBrokerPid,
-			...(realBrokerIncarnation !== undefined ? { realBrokerIncarnation } : {}),
-			error: new Error(
-				`Detached SDK broker spawn exceeded its ${timeoutMs}ms deadline; ${terminated ? "child terminated" : "termination was not confirmed"}.`,
-			),
-		};
-	}
-	if (spawnOutcome.error) {
-		return {
-			process: child,
-			realBrokerPid,
-			...(realBrokerIncarnation !== undefined ? { realBrokerIncarnation } : {}),
-			error: spawnOutcome.error,
-		};
-	}
-	if (realBrokerPid === undefined || realBrokerIncarnation === undefined) {
-		let detail = "Detached SDK broker did not expose a verified process identity.";
-		try {
-			await reapSpawnedBroker(child, realBrokerPid, realBrokerIncarnation);
-		} catch (error) {
-			detail = `${detail} ${error instanceof Error ? error.message : String(error)}`;
-		}
-		return { process: child, realBrokerPid, error: new Error(detail) };
-	}
-	return { process: child, realBrokerPid, realBrokerIncarnation, error: undefined };
-}
-
-/** POSIX only: a short-lived CLI trampoline detaches the broker from the client tree. */
+/** POSIX only: the trampoline holds its exact broker child until the publication decision. */
 export async function launchBrokerViaPosixTrampoline(
 	agentDir: string,
-	options: { env: NodeJS.ProcessEnv; cwd?: string; stderrFd?: number; timeoutMs?: number },
+	options: {
+		env: NodeJS.ProcessEnv;
+		cwd?: string;
+		stderrFd?: number;
+		timeoutMs?: number;
+		retainChildUntilPublication?: boolean;
+	},
 ): Promise<BrokerLaunchResult> {
 	const timeoutMs = options.timeoutMs ?? DEFAULT_LAUNCHER_TIMEOUT_MS;
 	if (!Number.isFinite(timeoutMs) || timeoutMs <= 0)
 		throw new Error("POSIX broker trampoline startup deadline elapsed.");
 	const command = resolveSdkInternalSpawnCommand("broker-trampoline-internal");
+	const trampolineEnvironment = { ...options.env };
+	if (options.retainChildUntilPublication) trampolineEnvironment.GJC_BROKER_TRAMPOLINE_RETAIN_UNTIL_PUBLICATION = "1";
+	else delete trampolineEnvironment.GJC_BROKER_TRAMPOLINE_RETAIN_UNTIL_PUBLICATION;
 	const child = spawn(command.file, [...command.args, "--agent-dir", agentDir], {
 		detached: true,
 		stdio: ["pipe", "pipe", options.stderrFd ?? "ignore"],
-		env: options.env,
+		env: trampolineEnvironment,
 		...(options.cwd ? { cwd: options.cwd } : {}),
 	});
+	if (options.retainChildUntilPublication) return await launchBrokerViaRetainedPosixTrampoline(child, timeoutMs);
 	let stdout = "";
 	let acknowledgementSent = false;
 	child.stdout?.on("data", chunk => {
@@ -438,6 +407,152 @@ export async function launchBrokerViaPosixTrampoline(
 	}
 	const parsed = parseBrokerTrampolineReply(wait.outcome.code, stdout, wait.outcome.spawnError);
 	return { process: child, ...parsed };
+}
+
+const RETAINED_TRAMPOLINE_CLEANUP_TIMEOUT_MS = 5_000;
+
+function createBrokerLaunchHandoff(
+	trampoline: ChildProcess,
+	brokerPid: number,
+	brokerIncarnation: string,
+): BrokerLaunchHandoff {
+	const closed = awaitLauncherClose(trampoline);
+	let disposition: "release" | "terminate" | undefined;
+	let completion: Promise<void> | undefined;
+	const finish = (requested: "release" | "terminate"): Promise<void> => {
+		if (completion) {
+			if (disposition !== requested)
+				return Promise.reject(new Error(`Broker trampoline already received ${disposition}.`));
+			return completion;
+		}
+		disposition = requested;
+		completion = (async () => {
+			const message = requested === "release" ? BROKER_HANDOFF_COMMIT : BROKER_HANDOFF_ABORT;
+			let inputError: unknown;
+			if (!trampoline.stdin?.destroyed && !trampoline.stdin?.writableEnded) {
+				try {
+					await writeBrokerLauncherInput(trampoline, message);
+				} catch (error) {
+					inputError = error;
+				} finally {
+					endBrokerLauncherInput(trampoline);
+				}
+			} else if (requested === "release") {
+				inputError = new Error("POSIX broker trampoline control pipe closed before publication commit.");
+			}
+			const outcome = await Promise.race([
+				closed,
+				Bun.sleep(RETAINED_TRAMPOLINE_CLEANUP_TIMEOUT_MS).then(() => undefined),
+			]);
+			if (!outcome) throw new Error("POSIX broker trampoline did not complete its publication decision.");
+			if (outcome.spawnError) throw outcome.spawnError;
+			if (requested === "release") {
+				if (inputError)
+					throw new Error("Could not commit the POSIX broker handoff after publication.", { cause: inputError });
+				if (outcome.code !== 0)
+					throw new Error(`POSIX broker trampoline exited with code ${outcome.code} before release completed.`);
+				return;
+			}
+			const observation = observeProcessIncarnation(brokerPid);
+			if (
+				observation.status !== "absent" &&
+				!(observation.status === "present" && observation.incarnation !== brokerIncarnation)
+			)
+				throw new Error(`POSIX broker trampoline did not verify cleanup of broker ${brokerPid}.`);
+		})();
+		return completion;
+	};
+	return { release: () => finish("release"), terminate: () => finish("terminate") };
+}
+
+async function launchBrokerViaRetainedPosixTrampoline(
+	trampoline: ChildProcess,
+	timeoutMs: number,
+): Promise<BrokerLaunchResult> {
+	let stdout = "";
+	let parsed: ReturnType<typeof parseBrokerTrampolineReply> | undefined;
+	let failure: Error | undefined;
+	let settled = false;
+	const reply = Promise.withResolvers<void>();
+	const finish = (error?: Error): void => {
+		if (settled) return;
+		settled = true;
+		failure = error;
+		reply.resolve();
+	};
+	const closed = awaitLauncherClose(trampoline);
+	void closed.then(outcome => {
+		if (settled) return;
+		const result = parseBrokerTrampolineReply(outcome.code, stdout, outcome.spawnError);
+		parsed = result;
+		finish(result.error ?? new Error("POSIX broker trampoline exited before publication was confirmed."));
+	});
+	trampoline.stdout?.on("data", chunk => {
+		stdout = appendBoundedOutput(stdout, chunk);
+		if (settled) return;
+		const newlineIndex = stdout.indexOf("\n");
+		if (newlineIndex < 0) return;
+		const replyText = stdout.slice(0, newlineIndex + 1);
+		const trailingOutput = stdout.slice(newlineIndex + 1);
+		const result = parseBrokerTrampolineReply(0, replyText);
+		if (result.error || trailingOutput.length > 0) {
+			parsed = result;
+			endBrokerLauncherInput(trampoline);
+			finish(result.error ?? new Error("POSIX broker trampoline wrote unexpected output."));
+			return;
+		}
+		parsed = result;
+		void writeBrokerLauncherInput(trampoline, BROKER_HANDOFF_ACKNOWLEDGEMENT).then(
+			() => finish(),
+			error => {
+				endBrokerLauncherInput(trampoline);
+				finish(error instanceof Error ? error : new Error(String(error)));
+			},
+		);
+	});
+	trampoline.stdin?.on("error", () => {});
+	const wait = await Promise.race([
+		reply.promise.then(() => ({ kind: "reply" as const })),
+		Bun.sleep(timeoutMs).then(() => ({ kind: "timeout" as const })),
+	]);
+	const identity = {
+		realBrokerPid: parsed?.realBrokerPid,
+		...(parsed?.realBrokerIncarnation === undefined ? {} : { realBrokerIncarnation: parsed.realBrokerIncarnation }),
+	};
+	if (wait.kind === "timeout") {
+		endBrokerLauncherInput(trampoline);
+		return {
+			process: trampoline,
+			...identity,
+			...(identity.realBrokerPid !== undefined && identity.realBrokerIncarnation !== undefined
+				? { handoff: createBrokerLaunchHandoff(trampoline, identity.realBrokerPid, identity.realBrokerIncarnation) }
+				: {}),
+			error: new Error(`POSIX broker trampoline did not report a verified identity within ${timeoutMs}ms.`),
+		};
+	}
+	if (failure) {
+		endBrokerLauncherInput(trampoline);
+		return {
+			process: trampoline,
+			...identity,
+			...(identity.realBrokerPid !== undefined && identity.realBrokerIncarnation !== undefined
+				? { handoff: createBrokerLaunchHandoff(trampoline, identity.realBrokerPid, identity.realBrokerIncarnation) }
+				: {}),
+			error: failure,
+		};
+	}
+	if (identity.realBrokerPid === undefined || identity.realBrokerIncarnation === undefined)
+		return {
+			process: trampoline,
+			...identity,
+			error: new Error("POSIX broker trampoline returned no verified process identity."),
+		};
+	return {
+		process: trampoline,
+		...identity,
+		error: undefined,
+		handoff: createBrokerLaunchHandoff(trampoline, identity.realBrokerPid, identity.realBrokerIncarnation),
+	};
 }
 
 async function brokerTrampolineTimeoutResult(
@@ -843,7 +958,7 @@ export interface StartedFixtureBroker {
 interface BrokerOwner {
 	stop(): Promise<void>;
 	canReuse(discovery: BrokerDiscovery | null): boolean;
-	markReady(discovery: BrokerDiscovery): boolean;
+	markReady(discovery: BrokerDiscovery): Promise<boolean>;
 }
 type EnsureInitiator = "discovery" | "fixture-lease";
 type EnsureOutcome =
@@ -886,8 +1001,8 @@ async function reapSpawnedBroker(
 	brokerIncarnation?: string,
 	timing: ReapTiming = DEFAULT_REAP_TIMING,
 ): Promise<void> {
-	// On Windows with hop, realBrokerPid is the actual broker process to reap.
-	// On POSIX or when realBrokerPid is undefined, child is the actual broker to reap.
+	// `child` is the actual broker only for direct fixture launches; hop and
+	// trampoline launches keep the broker identity separate from the launcher.
 	const pidToReap = realBrokerPid ?? child.pid;
 	// A spawn failure (e.g. ENOENT) never created a kernel process: pid is
 	// undefined and there is nothing to signal or await. The `error` event is the
@@ -895,6 +1010,7 @@ async function reapSpawnedBroker(
 	// run out the TERM/KILL windows or report a stuck child that never existed.
 	if (pidToReap === undefined) return;
 	if (pidToReap !== child.pid) {
+		// The retained ChildProcess is a hop/trampoline, not the broker itself.
 		await reapDetachedBrokerPid(pidToReap, brokerIncarnation, timing);
 		return;
 	}
@@ -1028,10 +1144,14 @@ async function reapDetachedBrokerPid(
 	throw new Error(`Detached SDK broker (pid ${pid}) did not exit after SIGKILL during reap.`);
 }
 
-/** Reap a failed broker launch using its retained child handle when it is the broker itself. */
+/** Reap a failed launch through its pending trampoline lease or retained broker handle. */
 export async function reapFailedBrokerLaunch(
-	launch: Pick<BrokerLaunchResult, "process" | "realBrokerPid" | "realBrokerIncarnation">,
+	launch: Pick<BrokerLaunchResult, "process" | "realBrokerPid" | "realBrokerIncarnation" | "handoff">,
 ): Promise<void> {
+	if (launch.handoff) {
+		await launch.handoff.terminate();
+		return;
+	}
 	if (launch.realBrokerPid === undefined) return;
 	if (launch.realBrokerPid === launch.process.pid) {
 		await reapSpawnedBroker(launch.process, launch.realBrokerPid, launch.realBrokerIncarnation);
@@ -1040,23 +1160,33 @@ export async function reapFailedBrokerLaunch(
 	await reapDetachedBrokerPid(launch.realBrokerPid, launch.realBrokerIncarnation);
 }
 
+/** Reap the direct broker child held by the startup trampoline before publication. */
+export async function reapBrokerTrampolineChild(
+	child: ChildProcess,
+	brokerPid: number | undefined,
+	brokerIncarnation?: string,
+): Promise<void> {
+	await reapSpawnedBroker(child, brokerPid, brokerIncarnation);
+}
+
 function registerBrokerOwner(
 	agentDir: string,
 	child: ChildProcess,
 	realBrokerPid: number | undefined,
 	brokerIncarnation: string | undefined,
 	timing: ReapTiming = DEFAULT_REAP_TIMING,
+	launchHandoff?: BrokerLaunchHandoff,
 ): BrokerOwner {
-	// On Windows, child is the hop process which exits immediately after spawning the real broker.
-	// The real broker publishes its own pid in the discovery (realBrokerPid from hop stdout).
-	// On other platforms, child is the actual broker, and its pid is the real broker pid.
+	// Windows retains the hop process handle; POSIX retains the trampoline until publication
+	// when requested. `realBrokerPid` and incarnation always identify the broker itself.
 	const expectedBrokerPid = realBrokerPid ?? child.pid;
 	const expectedBrokerIncarnation = brokerIncarnation;
+	let handoff = launchHandoff;
+	let publishedDiscovery: BrokerDiscovery | undefined;
 	let state: "starting" | "ready" | "cleanup-unverified" = "starting";
 	const matches = (discovery: BrokerDiscovery | null): boolean => {
 		if (!discovery) return false;
-		// On Windows, verify the discovery matches the real broker pid from the hop.
-		// On other platforms, verify the discovery comes from the child we spawned.
+		// Match discovery to the exact broker identity captured by the launch protocol.
 		return Boolean(
 			expectedBrokerPid !== undefined &&
 				expectedBrokerIncarnation &&
@@ -1064,21 +1194,53 @@ function registerBrokerOwner(
 				discovery.incarnation === expectedBrokerIncarnation,
 		);
 	};
-	const owner: BrokerOwner = {
-		async stop(): Promise<void> {
+	let stopTask: Promise<void> | undefined;
+	const stop = (): Promise<void> => {
+		if (stopTask) return stopTask;
+		const task = (async () => {
 			try {
-				await reapSpawnedBroker(child, expectedBrokerPid, expectedBrokerIncarnation, timing);
+				if (handoff) {
+					await handoff.terminate();
+					handoff = undefined;
+				} else if (publishedDiscovery) {
+					try {
+						await shutdownPublishedBrokerViaRpc(
+							agentDir,
+							publishedDiscovery,
+							Date.now() +
+								Math.max(BROKER_DISCOVERY_BUDGET.staleRetirementMs, timing.gracefulMs + timing.killVerifyMs),
+						);
+					} catch (error) {
+						if (process.platform === "darwin" && expectedBrokerPid !== child.pid) throw error;
+						await reapSpawnedBroker(child, expectedBrokerPid, expectedBrokerIncarnation, timing);
+					}
+				} else {
+					await reapSpawnedBroker(child, expectedBrokerPid, expectedBrokerIncarnation, timing);
+				}
 			} catch (error) {
 				state = "cleanup-unverified";
 				throw error;
 			}
 			if (owners.get(agentDir) === owner) owners.delete(agentDir);
-		},
+		})();
+		stopTask = task;
+		void task.catch(() => {
+			if (stopTask === task) stopTask = undefined;
+		});
+		return task;
+	};
+	const owner: BrokerOwner = {
+		stop,
 		canReuse(discovery): boolean {
 			return state === "ready" && matches(discovery);
 		},
-		markReady(discovery): boolean {
+		async markReady(discovery): Promise<boolean> {
 			if (!matches(discovery)) return false;
+			if (handoff) {
+				await handoff.release();
+				handoff = undefined;
+			}
+			publishedDiscovery = discovery;
 			state = "ready";
 			return true;
 		},
@@ -1138,39 +1300,96 @@ export async function closeBrokerClientBeforeDeadline(
 	await Promise.race([close, ensureBrokerTiming.sleep(remainingMs)]);
 }
 
+function brokerIdentityIsGone(discovery: BrokerDiscovery): boolean {
+	const observation = observeProcessIncarnation(discovery.pid);
+	return (
+		observation.status === "absent" ||
+		(observation.status === "present" && observation.incarnation !== discovery.incarnation)
+	);
+}
+
+async function waitForBrokerIdentityGone(discovery: BrokerDiscovery, deadline: number): Promise<void> {
+	for (;;) {
+		if (brokerIdentityIsGone(discovery)) return;
+		const remainingMs = deadline - ensureBrokerTiming.now();
+		if (remainingMs <= 0) throw new Error(`SDK broker ${discovery.pid} did not exit after authenticated shutdown.`);
+		await ensureBrokerTiming.sleep(Math.min(STALE_BROKER_POLL_MS, remainingMs));
+	}
+}
+
+async function waitForBrokerDiscoveryOwnerGone(
+	agentDir: string,
+	discovery: BrokerDiscovery,
+	deadline: number,
+): Promise<void> {
+	for (;;) {
+		const current = await readBrokerDiscovery(agentDir);
+		if (!current || !sameBrokerOwner(current, discovery)) return;
+		const remainingMs = deadline - ensureBrokerTiming.now();
+		if (remainingMs <= 0)
+			throw new Error(`SDK broker ${discovery.pid} retained discovery after authenticated shutdown.`);
+		await ensureBrokerTiming.sleep(Math.min(STALE_BROKER_POLL_MS, remainingMs));
+	}
+}
+
+async function shutdownPublishedBrokerViaRpc(
+	agentDir: string,
+	discovery: BrokerDiscovery,
+	deadline: number,
+): Promise<void> {
+	if (brokerIdentityIsGone(discovery)) return;
+	const current = await readBrokerDiscovery(agentDir);
+	if (!current || !sameBrokerOwner(current, discovery)) {
+		if (discovery.pid === process.pid) await waitForBrokerDiscoveryOwnerGone(agentDir, discovery, deadline);
+		else await waitForBrokerIdentityGone(discovery, deadline);
+		return;
+	}
+	const remainingMs = deadline - ensureBrokerTiming.now();
+	if (remainingMs <= 0) throw new Error("SDK broker shutdown deadline elapsed before RPC connection.");
+	const client = await SdkClient.connect(current.url, current.token, {
+		timeoutMs: Math.max(1, Math.min(2_000, remainingMs)),
+	});
+	try {
+		await client.global("broker.shutdown", {}, { timeoutMs: Math.max(1, deadline - ensureBrokerTiming.now()) });
+	} finally {
+		await closeBrokerClientBeforeDeadline(client, deadline).catch(() => undefined);
+	}
+	if (discovery.pid === process.pid) await waitForBrokerDiscoveryOwnerGone(agentDir, discovery, deadline);
+	else await waitForBrokerIdentityGone(discovery, deadline);
+}
+
 async function retireUnusableBroker(
 	stale: BrokerDiscovery,
 	settings: EnsureBrokerSettings,
 	outerDeadline = Number.POSITIVE_INFINITY,
 ): Promise<void> {
 	const deadline = Math.min(outerDeadline, ensureBrokerTiming.now() + BROKER_DISCOVERY_BUDGET.staleRetirementMs);
-	let shutdownSucceeded = false;
-	try {
-		const current = await readBrokerDiscoveryBeforeDeadline(settings.agentDir, settings.heartbeatTtlMs, deadline);
-		if (!current || !sameBrokerOwner(current, stale)) return;
-		const client = await SdkClient.connect(current.url, current.token, { timeoutMs: 2_000, deadline });
-		try {
-			await client.global("broker.shutdown", {});
-			shutdownSucceeded = true;
-		} finally {
-			await closeBrokerClientBeforeDeadline(client, deadline).catch(() => undefined);
+	const current = await readBrokerDiscoveryBeforeDeadline(settings.agentDir, settings.heartbeatTtlMs, deadline);
+	if (!current || !sameBrokerOwner(current, stale)) {
+		if (stale.pid === process.pid) {
+			await waitForBrokerDiscoveryOwnerGone(settings.agentDir, stale, deadline);
+			return;
 		}
-	} catch {}
-	if (!shutdownSucceeded) {
+		await reapDetachedBrokerPid(stale.pid, stale.incarnation);
+		await waitForBrokerIdentityGone(stale, deadline);
+		return;
+	}
+	try {
+		await shutdownPublishedBrokerViaRpc(settings.agentDir, current, deadline);
+		return;
+	} catch (rpcError) {
 		try {
-			if (brokerProcessIncarnation(stale.pid) === stale.incarnation) {
-				try {
-					process.kill(stale.pid, "SIGTERM");
-				} catch {}
-			}
-		} catch {}
+			if (stale.pid === process.pid)
+				throw new Error("Cannot reap an in-process stale broker through its shared process PID.");
+			await reapDetachedBrokerPid(stale.pid, stale.incarnation);
+		} catch (cleanupError) {
+			throw new AggregateError(
+				[rpcError, cleanupError],
+				`SDK broker ${stale.pid} shutdown and identity-bound cleanup both failed.`,
+			);
+		}
 	}
-	// Wait for the stale identity to disappear (owner-fenced: pid+incarnation).
-	while (ensureBrokerTiming.now() < deadline) {
-		const current = await readBrokerDiscoveryBeforeDeadline(settings.agentDir, settings.heartbeatTtlMs, deadline);
-		if (!sameBrokerOwner(current, stale)) break;
-		await ensureBrokerTiming.sleep(STALE_BROKER_POLL_MS);
-	}
+	await waitForBrokerIdentityGone(stale, deadline);
 }
 
 /** Reconcile an observed broker generation before entering a startup critical section. */
@@ -1314,33 +1533,19 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 				realBrokerIncarnation: launched.realBrokerIncarnation,
 			};
 			spawnError = launched.error;
-		} else if (launchMode === "posix-trampoline") {
+		} else if (launchMode === "posix-trampoline" || launchMode === "darwin-trampoline") {
 			const launched = await launchBrokerViaPosixTrampoline(settings.agentDir, {
 				env,
 				...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
 				...(spawnLog ? { stderrFd: spawnLog.handle.fd } : {}),
 				timeoutMs: Math.max(0, deadline - ensureBrokerTiming.now()),
+				retainChildUntilPublication: launchMode === "darwin-trampoline",
 			});
 			spawnResult = {
 				process: launched.process,
 				realBrokerPid: launched.realBrokerPid,
 				realBrokerIncarnation: launched.realBrokerIncarnation,
-			};
-			spawnError = launched.error;
-		} else if (launchMode === "darwin-child") {
-			const launched = await launchBrokerViaDetachedChild(
-				{ file: command.file, args: brokerArgs },
-				{
-					env,
-					...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
-					...(spawnLog ? { stderrFd: spawnLog.handle.fd } : {}),
-					timeoutMs: Math.max(0, deadline - ensureBrokerTiming.now()),
-				},
-			);
-			spawnResult = {
-				process: launched.process,
-				realBrokerPid: launched.realBrokerPid,
-				realBrokerIncarnation: launched.realBrokerIncarnation,
+				handoff: launched.handoff,
 			};
 			spawnError = launched.error;
 		} else {
@@ -1359,11 +1564,16 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		const realBrokerPid = spawnResult.realBrokerPid;
 		let childIncarnation =
 			spawnResult.realBrokerIncarnation ??
-			((launchMode === "direct" || launchMode === "darwin-child") && realBrokerPid !== undefined
-				? brokerProcessIncarnation(realBrokerPid)
-				: undefined);
-		let owner = registerBrokerOwner(settings.agentDir, child, realBrokerPid, childIncarnation);
-		child.unref();
+			(launchMode === "direct" && realBrokerPid !== undefined ? brokerProcessIncarnation(realBrokerPid) : undefined);
+		let owner = registerBrokerOwner(
+			settings.agentDir,
+			child,
+			realBrokerPid,
+			childIncarnation,
+			DEFAULT_REAP_TIMING,
+			spawnResult.handoff,
+		);
+		if (!spawnResult.handoff) child.unref();
 		// The child holds its own duplicate of the descriptor. Failure to close the
 		// parent's diagnostic handle must not discard exact ownership of a live child.
 		await spawnLog?.handle.close().catch(() => undefined);
@@ -1386,10 +1596,17 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 					const verifiedIncarnation = brokerProcessIncarnation(realBrokerPid);
 					if (verifiedIncarnation === discovered.incarnation) {
 						childIncarnation = verifiedIncarnation;
-						owner = registerBrokerOwner(settings.agentDir, child, realBrokerPid, childIncarnation);
+						owner = registerBrokerOwner(
+							settings.agentDir,
+							child,
+							realBrokerPid,
+							childIncarnation,
+							DEFAULT_REAP_TIMING,
+							spawnResult.handoff,
+						);
 					}
 				}
-				if (owner.markReady(discovered)) {
+				if (await owner.markReady(discovered)) {
 					return initiator === "fixture-lease"
 						? { kind: "local-started-fixture", discovery: discovered, owner, child }
 						: { kind: "local-started-discovery", discovery: discovered };
@@ -1465,8 +1682,8 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		const exitedBeforeDiscovery = brokerExitedBeforeDiscovery;
 		const marker = await readBrokerStartupFailureMarker(settings.agentDir);
 		const startupExitRecord = await readBrokerStartupExitRecord(settings.agentDir);
-		// Hops and trampolines exit after starting the broker. Failure records are
-		// always attributed to the real broker pid, never to the short-lived launcher.
+		// Hops and committed trampolines may exit before the parent finishes polling.
+		// Failure records are attributed to the real broker pid, not the launcher.
 		const trustedMarker =
 			marker &&
 			childIncarnation !== undefined &&

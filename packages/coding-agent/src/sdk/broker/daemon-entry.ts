@@ -7,7 +7,6 @@ import {
 } from "./discovery";
 import {
 	type BrokerLaunchResult,
-	launchBrokerViaDetachedChild,
 	launchBrokerViaHop,
 	launchBrokerViaPosixTrampoline,
 	reapFailedBrokerLaunch,
@@ -45,7 +44,7 @@ async function refuseFailedBrokerLaunch(
 	launched: BrokerLaunchResult,
 ): Promise<Extract<AuthorizedBrokerSuccessorResult, { kind: "refused" }>> {
 	const child: childProcess.ChildProcess = launched.process;
-	child.unref();
+	if (!launched.handoff) child.unref();
 	let detail = launched.error?.message ?? "Broker launch failed.";
 	try {
 		await reapFailedBrokerLaunch(launched);
@@ -54,6 +53,27 @@ async function refuseFailedBrokerLaunch(
 		detail = `${detail}; retry cleanup failed: ${cleanupDetail}`;
 	}
 	return { kind: "refused", reason: "spawn_failed", detail };
+}
+
+async function refuseUnpublishedBrokerSuccessor(
+	child: childProcess.ChildProcess,
+	realBrokerPid: number | undefined,
+	realBrokerIncarnation: string | undefined,
+	handoff: BrokerLaunchResult["handoff"],
+	reason: "spawn_exited_before_publication" | "publication_timeout",
+): Promise<Extract<AuthorizedBrokerSuccessorResult, { kind: "refused" }>> {
+	let detail: string | undefined;
+	try {
+		await reapFailedBrokerLaunch({
+			process: child,
+			realBrokerPid,
+			realBrokerIncarnation,
+			handoff,
+		});
+	} catch (error) {
+		detail = `Broker successor cleanup failed: ${error instanceof Error ? error.message : String(error)}`;
+	}
+	return { kind: "refused", reason, ...(detail === undefined ? {} : { detail }) };
 }
 
 /**
@@ -111,23 +131,12 @@ export async function launchAuthorizedBrokerSuccessor(
 								timeoutMs,
 							},
 						)
-					: launchMode === "darwin-child"
-						? await launchBrokerViaDetachedChild(
-								{
-									file: command.file,
-									args: [...command.args, "--agent-dir", options.agentDir],
-								},
-								{
-									env,
-									cwd: command.kind === "bun-source" ? command.cwd : undefined,
-									timeoutMs,
-								},
-							)
-						: await launchBrokerViaPosixTrampoline(options.agentDir, {
-								env,
-								...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
-								timeoutMs,
-							});
+					: await launchBrokerViaPosixTrampoline(options.agentDir, {
+							env,
+							...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
+							timeoutMs,
+							retainChildUntilPublication: launchMode === "darwin-trampoline",
+						});
 			if (launched.error) return await refuseFailedBrokerLaunch(launched);
 			if (launched.realBrokerPid === undefined || launched.realBrokerIncarnation === undefined)
 				return await refuseFailedBrokerLaunch({
@@ -135,12 +144,13 @@ export async function launchAuthorizedBrokerSuccessor(
 					error: new Error("Broker launcher returned no verified process identity."),
 				});
 			const child: childProcess.ChildProcess = launched.process;
-			child.unref();
+			if (!launched.handoff) child.unref();
 			return {
 				kind: "spawned" as const,
 				child,
 				realBrokerPid: launched.realBrokerPid,
 				realBrokerIncarnation: launched.realBrokerIncarnation,
+				handoff: launched.handoff,
 			};
 		} catch (spawnError) {
 			return {
@@ -160,10 +170,17 @@ export async function launchAuthorizedBrokerSuccessor(
 			: undefined);
 	const until = Math.min(Date.now() + Math.max(1, options.deadlineAt - Date.now()), options.deadlineAt);
 	for (;;) {
-		// The launcher exits successfully before the broker publishes; only a failed
-		// launcher or the broker's own identity observation can terminate this wait.
+		// On Darwin the trampoline remains alive until publication; elsewhere the
+		// launcher exits after handoff. The broker identity remains authoritative.
 		const failedSpawn = child.signalCode !== null || (child.exitCode !== null && child.exitCode !== 0);
-		if (failedSpawn) return { kind: "refused", reason: "spawn_exited_before_publication" };
+		if (failedSpawn)
+			return await refuseUnpublishedBrokerSuccessor(
+				child,
+				realBrokerPid,
+				expectedBrokerIncarnation,
+				spawnOutcome.handoff,
+				"spawn_exited_before_publication",
+			);
 		if (realBrokerPid !== undefined) {
 			const observation = observeProcessIncarnation(realBrokerPid);
 			if (
@@ -172,7 +189,13 @@ export async function launchAuthorizedBrokerSuccessor(
 					expectedBrokerIncarnation !== undefined &&
 					observation.incarnation !== expectedBrokerIncarnation)
 			)
-				return { kind: "refused", reason: "spawn_exited_before_publication" };
+				return await refuseUnpublishedBrokerSuccessor(
+					child,
+					realBrokerPid,
+					expectedBrokerIncarnation,
+					spawnOutcome.handoff,
+					"spawn_exited_before_publication",
+				);
 			if (
 				observation.status === "present" &&
 				expectedBrokerIncarnation === undefined &&
@@ -184,27 +207,38 @@ export async function launchAuthorizedBrokerSuccessor(
 		const discovered = await readBrokerDiscovery(options.agentDir);
 		if (
 			discovered &&
+			discovered.pid === realBrokerPid &&
+			discovered.incarnation === expectedBrokerIncarnation &&
 			discovered.packageGeneration === options.packageGeneration &&
 			discovered.restartRequestId === options.requestId
-		)
-			return { kind: "spawned", discovery: discovered };
-		if (Date.now() >= until) {
+		) {
 			try {
-				await reapFailedBrokerLaunch({
-					process: child,
-					realBrokerPid,
-					realBrokerIncarnation: expectedBrokerIncarnation,
-				});
+				await spawnOutcome.handoff?.release();
 			} catch (error) {
-				const detail = error instanceof Error ? error.message : String(error);
+				const refusal = await refuseUnpublishedBrokerSuccessor(
+					child,
+					realBrokerPid,
+					expectedBrokerIncarnation,
+					spawnOutcome.handoff,
+					"spawn_exited_before_publication",
+				);
 				return {
-					kind: "refused",
-					reason: "publication_timeout",
-					detail: `Broker successor cleanup failed: ${detail}`,
+					...refusal,
+					detail: `Broker successor release failed: ${error instanceof Error ? error.message : String(error)}${
+						refusal.detail ? `; ${refusal.detail}` : ""
+					}`,
 				};
 			}
-			return { kind: "refused", reason: "publication_timeout" };
+			return { kind: "spawned", discovery: discovered };
 		}
+		if (Date.now() >= until)
+			return await refuseUnpublishedBrokerSuccessor(
+				child,
+				realBrokerPid,
+				expectedBrokerIncarnation,
+				spawnOutcome.handoff,
+				"publication_timeout",
+			);
 		await Bun.sleep(SUCCESSOR_SPAWN_POLL_MS);
 	}
 }

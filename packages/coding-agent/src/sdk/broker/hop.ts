@@ -8,6 +8,8 @@ import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import type { BrokerHopMessage } from "./ensure";
 
 export const BROKER_HANDOFF_ACKNOWLEDGEMENT = "GJC_BROKER_HANDOFF_ACK\n";
+export const BROKER_HANDOFF_COMMIT = "GJC_BROKER_HANDOFF_COMMIT\n";
+export const BROKER_HANDOFF_ABORT = "GJC_BROKER_HANDOFF_ABORT\n";
 
 /**
  * Windows broker hop: spawns the real broker with detached:true and reports its pid.
@@ -160,6 +162,50 @@ export function waitForBrokerHandoffAcknowledgement(input: stream.Readable): Pro
 	input.once("error", onEnd);
 	input.resume();
 	return acknowledgment.promise;
+}
+
+/** Wait for a validated identity ACK followed by the parent's publication decision. */
+export function waitForBrokerHandoffDecision(input: stream.Readable, timeoutMs = 30_000): Promise<"commit" | "abort"> {
+	const decision = Promise.withResolvers<"commit" | "abort">();
+	let received = "";
+	let settled = false;
+	const finish = (value: "commit" | "abort"): void => {
+		if (settled) return;
+		settled = true;
+		clearTimeout(timer);
+		input.removeListener("data", onData);
+		input.removeListener("end", onEnd);
+		input.removeListener("close", onEnd);
+		input.removeListener("error", onEnd);
+		decision.resolve(value);
+	};
+	const onData = (chunk: Buffer | string): void => {
+		received += chunk.toString();
+		if (received.length > BROKER_HANDOFF_ACKNOWLEDGEMENT.length + BROKER_HANDOFF_COMMIT.length) {
+			finish("abort");
+			return;
+		}
+		if (received.length < BROKER_HANDOFF_ACKNOWLEDGEMENT.length) {
+			if (!BROKER_HANDOFF_ACKNOWLEDGEMENT.startsWith(received)) finish("abort");
+			return;
+		}
+		if (!received.startsWith(BROKER_HANDOFF_ACKNOWLEDGEMENT)) {
+			finish("abort");
+			return;
+		}
+		const action = received.slice(BROKER_HANDOFF_ACKNOWLEDGEMENT.length);
+		if (action === BROKER_HANDOFF_COMMIT) finish("commit");
+		else if (action === BROKER_HANDOFF_ABORT) finish("abort");
+		else if (!BROKER_HANDOFF_COMMIT.startsWith(action) && !BROKER_HANDOFF_ABORT.startsWith(action)) finish("abort");
+	};
+	const onEnd = (): void => finish("abort");
+	const timer = setTimeout(() => finish("abort"), timeoutMs);
+	input.on("data", onData);
+	input.once("end", onEnd);
+	input.once("close", onEnd);
+	input.once("error", onEnd);
+	input.resume();
+	return decision.promise;
 }
 
 const writeBrokerHopStdout: BrokerHopWriter = (chunk, callback): void => {

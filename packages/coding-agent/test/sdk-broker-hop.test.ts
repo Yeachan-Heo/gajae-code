@@ -16,8 +16,8 @@ import {
 	brokerSpawnFailureErrorForTest,
 	brokerStartupExitStatusForTest,
 	brokerTrampolineTimeoutResultForTest,
-	launchBrokerViaDetachedChild,
 	launchBrokerViaHop,
+	launchBrokerViaPosixTrampoline,
 	parseBrokerHopReply,
 	reapDetachedBrokerPidForTest,
 	reapFailedBrokerLaunch,
@@ -26,8 +26,11 @@ import {
 	signalPinnedBrokerProcessForTest,
 } from "../src/sdk/broker/ensure";
 import {
+	BROKER_HANDOFF_ABORT,
 	BROKER_HANDOFF_ACKNOWLEDGEMENT,
+	BROKER_HANDOFF_COMMIT,
 	waitForBrokerHandoffAcknowledgement,
+	waitForBrokerHandoffDecision,
 	writeBrokerHopReplyForTest,
 } from "../src/sdk/broker/hop";
 import { observeProcessIncarnation } from "../src/sdk/broker/process-incarnation";
@@ -407,6 +410,23 @@ describe("SDK broker hop protocol", () => {
 		expect(await incomplete).toBe(false);
 	});
 
+	test("retained broker handoff requires a final publication decision", async () => {
+		const committedInput = new stream.PassThrough();
+		const committed = waitForBrokerHandoffDecision(committedInput, 1_000);
+		committedInput.end(`${BROKER_HANDOFF_ACKNOWLEDGEMENT}${BROKER_HANDOFF_COMMIT}`);
+		expect(await committed).toBe("commit");
+
+		const abortedInput = new stream.PassThrough();
+		const aborted = waitForBrokerHandoffDecision(abortedInput, 1_000);
+		abortedInput.end(`${BROKER_HANDOFF_ACKNOWLEDGEMENT}${BROKER_HANDOFF_ABORT}`);
+		expect(await aborted).toBe("abort");
+
+		const incompleteInput = new stream.PassThrough();
+		const incomplete = waitForBrokerHandoffDecision(incompleteInput, 1_000);
+		incompleteInput.end(BROKER_HANDOFF_ACKNOWLEDGEMENT);
+		expect(await incomplete).toBe("abort");
+	});
+
 	test("failed successor handoff retries cleanup for its captured broker identity", async () => {
 		const child = childProcess.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
 		const spawned = Promise.withResolvers<void>();
@@ -437,28 +457,32 @@ describe("SDK broker hop protocol", () => {
 		}
 	});
 
-	test("detached discovery child cleanup uses the retained process handle", async () => {
-		const launched = await launchBrokerViaDetachedChild(
-			{ file: process.execPath, args: ["-e", "setInterval(() => {}, 1000)"] },
-			{ env: process.env },
-		);
-		if (launched.error) throw launched.error;
-		const pid = launched.realBrokerPid;
-		if (pid === undefined || pid !== launched.process.pid)
-			throw new Error("Detached broker did not retain its exact child process handle.");
-		const closed = Promise.withResolvers<void>();
-		launched.process.once("close", closed.resolve);
-		try {
-			await reapFailedBrokerLaunch(launched);
-			await closed.promise;
-			expect(observeProcessIncarnation(pid).status).toBe("absent");
-		} finally {
-			if (launched.process.exitCode === null && launched.process.signalCode === null) {
-				launched.process.kill("SIGKILL");
-				await closed.promise;
+	test.skipIf(process.platform === "win32")(
+		"retained POSIX startup handoff aborts and reaps its exact broker child",
+		async () => {
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-broker-trampoline-handoff-"));
+			const agentDir = path.join(root, "agent");
+			const launched = await launchBrokerViaPosixTrampoline(agentDir, {
+				env: { ...process.env, GJC_CODING_AGENT_DIR: agentDir },
+				retainChildUntilPublication: true,
+			});
+			try {
+				if (launched.error) throw launched.error;
+				if (!launched.handoff || launched.realBrokerPid === undefined || !launched.realBrokerIncarnation)
+					throw new Error("Retained trampoline did not return a verified broker handoff.");
+				await reapFailedBrokerLaunch(launched);
+				const after = observeProcessIncarnation(launched.realBrokerPid);
+				expect(
+					after.status === "absent" ||
+						(after.status === "present" && after.incarnation !== launched.realBrokerIncarnation),
+				).toBe(true);
+			} finally {
+				if (launched.handoff) await launched.handoff.terminate().catch(() => undefined);
+				await fs.rm(root, { recursive: true, force: true });
 			}
-		}
-	});
+		},
+		60_000,
+	);
 
 	test("detached reaping does not signal a PID that was already reused", async () => {
 		const kill = spyOn(process, "kill").mockImplementation(() => true);
