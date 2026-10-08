@@ -176,6 +176,7 @@ describe("InteractiveMode.setEditorComponent", () => {
 	});
 
 	it("rebuilds a committed orphan assistant from the session transcript", () => {
+		mode.renderInitialMessages();
 		const message: AssistantMessage = {
 			role: "assistant",
 			content: [{ type: "text", text: "orphan survives later reconcile" }],
@@ -205,6 +206,7 @@ describe("InteractiveMode.setEditorComponent", () => {
 	});
 
 	it("does not restore a live assistant after canonical orphan persistence", () => {
+		mode.renderInitialMessages();
 		const committed: AssistantMessage = {
 			role: "assistant",
 			content: [{ type: "text", text: "canonical orphan exactly once" }],

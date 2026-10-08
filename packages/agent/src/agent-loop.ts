@@ -4836,6 +4836,12 @@ async function streamAssistantResponse(
 				await finishChat(aborted);
 				return aborted;
 			}
+			// Fingerprint the exact provider-visible request only once it is really sent.
+			const promptPrefix = config.promptPrefixTracker?.observe(config.model, llmContext, {
+				toolChoice: effectiveToolChoice,
+				reasoning: effectiveReasoning,
+				serviceTier: config.serviceTier,
+			});
 			let responsePromise: Promise<Awaited<ReturnType<StreamFn>>>;
 			try {
 				responsePromise = Promise.resolve(

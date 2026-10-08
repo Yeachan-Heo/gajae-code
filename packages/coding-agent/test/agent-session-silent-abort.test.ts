@@ -14,7 +14,7 @@
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
-import { Agent, type AgentEvent, ThinkingLevel } from "@gajae-code/agent-core";
+import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
 import type { AssistantMessage, TextContent } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -179,7 +179,7 @@ describe("AgentSession silent-abort marker stamping", () => {
 		if (provisionalText?.type === "text") provisionalText.text = "mutated after captured update";
 		session.markPlanCompactAbortPending();
 		expect(session.isPlanCompactAbortPending).toBe(true);
-		const rawAgentEnd: Extract<AgentEvent, { type: "agent_end" }> = {
+		const rawAgentEnd: Extract<AgentSessionEvent, { type: "agent_end" }> = {
 			type: "agent_end",
 			messages: [],
 			stopReason: "cancelled",
@@ -226,7 +226,7 @@ describe("AgentSession silent-abort marker stamping", () => {
 		const beforeAbortGeneration = session.transcriptPromptGeneration;
 		await session.abort();
 		expect(session.transcriptPromptGeneration).toBeGreaterThan(beforeAbortGeneration);
-		const terminal: Extract<AgentEvent, { type: "agent_end" }> = {
+		const terminal: Extract<AgentSessionEvent, { type: "agent_end" }> = {
 			type: "agent_end",
 			messages: [],
 			stopReason: "cancelled",
@@ -249,7 +249,7 @@ describe("AgentSession silent-abort marker stamping", () => {
 		const presentationMessage = makeStoppedAssistantMessage("external partial");
 		const finalMessage = makeStoppedAssistantMessage("external final");
 		session.agent.emitExternalEvent({ type: "message_start", message: presentationMessage, scope });
-		const terminal: Extract<AgentEvent, { type: "agent_end" }> = {
+		const terminal: Extract<AgentSessionEvent, { type: "agent_end" }> = {
 			type: "agent_end",
 			messages: [finalMessage],
 			stopReason: "completed",
@@ -311,7 +311,7 @@ describe("AgentSession silent-abort marker stamping", () => {
 		expect(result.cancelled).toBe(false);
 		const clonedScope = { ...predecessorScope };
 		const lateFinal = makeStoppedAssistantMessage("late cloned-scope final");
-		const lateTerminal: Extract<AgentEvent, { type: "agent_end" }> = {
+		const lateTerminal: Extract<AgentSessionEvent, { type: "agent_end" }> = {
 			type: "agent_end",
 			messages: [lateFinal],
 			stopReason: "completed",
@@ -363,7 +363,7 @@ describe("AgentSession silent-abort marker stamping", () => {
 		vi.spyOn(session.sessionManager, "appendMessage").mockImplementationOnce(() => {
 			throw new Error("synthetic persistence failure");
 		});
-		const terminal: Extract<AgentEvent, { type: "agent_end" }> = {
+		const terminal: Extract<AgentSessionEvent, { type: "agent_end" }> = {
 			type: "agent_end",
 			messages: [],
 			stopReason: "cancelled",

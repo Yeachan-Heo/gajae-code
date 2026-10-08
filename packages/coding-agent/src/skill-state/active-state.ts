@@ -1060,9 +1060,9 @@ async function activeSubskillsForExistingEntry(
 	const resolvedSessionId = await resolveBoundarySessionId(cwd, sessionId);
 	const { sessionPath } = getSkillActiveStatePaths(cwd, resolvedSessionId);
 	const sessionState = await readRawActiveStateForHandoff(sessionPath, false);
-	const existing = (await mergeVisibleEntries(cwd, sessionState, resolvedSessionId, activeStateScopeLockHeld)).find(
-		entry => entry.skill === skill,
-	);
+	const existing = (
+		await mergeVisibleEntries(cwd, sessionState, resolvedSessionId, undefined, activeStateScopeLockHeld)
+	).find(entry => entry.skill === skill);
 	return existing?.active_subskills;
 }
 

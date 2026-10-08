@@ -971,7 +971,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(session.queuedMessageCount).toBe(1);
 	});
 
-	it("keeps session_switch hook-queued steering deliverable after clearing pre-switch queues", async () => {
+	it("rejects untracked session_switch steering and clears pre-switch queues", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const agent = new Agent({
 			getApiKey: () => "test-key",
@@ -991,11 +991,16 @@ describe("AgentSession concurrent prompt guard", () => {
 		authStorages.push(authStorage);
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models-switch-hook.yml"));
+		const switchHookErrors: unknown[] = [];
 		const extensionRunner = {
 			hasHandlers: vi.fn(() => false),
 			emit: vi.fn(async (event: { type: string }) => {
 				if (event.type === "session_switch") {
-					await session.sendUserMessage("queued by switch hook", { deliverAs: "steer" });
+					try {
+						await session.sendUserMessage("queued by switch hook", { deliverAs: "steer" });
+					} catch (error) {
+						switchHookErrors.push(error);
+					}
 				}
 			}),
 		} as unknown as ExtensionRunner;
@@ -1020,8 +1025,9 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(await session.switchSession(targetSessionFile)).toBe(true);
 		expect(appendOnly?.log.length).toBe(0);
 
-		expect(session.getQueuedMessages().followUp).toEqual(["queued by switch hook"]);
-		expect(agent.snapshotFollowUp()).toHaveLength(1);
+		expect(switchHookErrors).toEqual([expect.objectContaining({ code: "busy" })]);
+		expect(session.getQueuedMessages().followUp).toEqual([]);
+		expect(agent.snapshotFollowUp()).toHaveLength(0);
 	});
 
 	// Regression: a subscriber that fires the next prompt synchronously from the

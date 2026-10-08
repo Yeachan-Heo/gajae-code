@@ -125,6 +125,7 @@ import {
 	modelSupportsMaintenanceCalls,
 	modelSupportsServiceTier,
 	modelsAreEqual,
+	resolveOAuthStorageProvider,
 	streamSimple,
 } from "@gajae-code/ai/core";
 import { normalizeAnthropicBaseUrl } from "@gajae-code/ai/providers/anthropic";
@@ -428,6 +429,7 @@ import {
 import { assertWorkflowMutationAllowed } from "../skill-state/workflow-mutation-guard";
 import { invalidateHostMetadata } from "../ssh/connection-manager";
 import { buildVolatileProjectContext } from "../system-prompt";
+import { DelegationHintController } from "../task/delegation-hint";
 import { resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
 import {
 	buildDiscoverableToolSearchIndex,
@@ -826,16 +828,16 @@ export type AutoCompactionContinuationSkipReason = "auto_continue_disabled_non_r
 
 type AgentEndSessionEvent = Extract<AgentEvent, { type: "agent_end" }> & {
 	/** Immutable abort-display classification captured before asynchronous UI dispatch. */
-	readonly silentAbort?: true;
-	readonly ttsrAbort?: true;
-	readonly terminalPersistenceFailed?: true;
+	readonly silentAbort?: boolean;
+	readonly ttsrAbort?: boolean;
+	readonly terminalPersistenceFailed?: boolean;
 	readonly terminalProjectionMatched?: boolean;
 };
 
 type MessageEndSessionEvent = Extract<AgentEvent, { type: "message_end" }> & {
-	readonly silentAbort?: true;
-	readonly ttsrAbort?: true;
-	readonly terminalPersistenceFailed?: true;
+	readonly silentAbort?: boolean;
+	readonly ttsrAbort?: boolean;
+	readonly terminalPersistenceFailed?: boolean;
 };
 
 export type AgentSessionEvent =
@@ -3802,6 +3804,7 @@ export class AgentSession {
 	/** Idempotent unregister handle for this session's resource-GC registration. */
 	#unregisterResourceGc?: () => void;
 	#unregisterRuntimeStateFinalizer?: () => void;
+	#coordinatorRuntimeStateFileOverrideForTests: string | undefined = undefined;
 	#unregisterBeforeMoveListener?: () => void;
 	#unregisterMoveAbortListener?: () => void;
 	#unregisterMovePublicationListener?: () => void;
@@ -3827,6 +3830,7 @@ export class AgentSession {
 		);
 	}
 	#unregisterSessionMemorySettings?: () => void;
+	#unregisterDelegationHintSettings?: () => void;
 	/**
 	 * AsyncJobManager owned by this session (top-level only). Subagents leave
 	 * this undefined and **MUST NOT** dispose the global instance on teardown.
@@ -4009,6 +4013,7 @@ export class AgentSession {
 
 	// TTSR manager for time-traveling stream rules
 	#ttsrManager: TtsrManager | undefined = undefined;
+	#delegationHint: DelegationHintController;
 	#pendingTtsrInjections: Rule[] = [];
 	/** Per-tool TTSR rules whose `interruptMode` opted out of aborting the stream.
 	 *  These are folded into the matched tool call's `toolResult` content as an
@@ -4407,6 +4412,8 @@ export class AgentSession {
 
 	#appendCoordinatorPersist(run: () => Promise<void>): Promise<void> {
 		const queued = this.#coordinatorPersistQueue.then(run, run);
+		const testFailures = this.#coordinatorPersistFailuresForTests;
+		if (testFailures) void queued.catch(error => testFailures.push(error));
 		this.#coordinatorPersistQueue = queued.catch(() => {});
 		return queued;
 	}
@@ -6162,8 +6169,19 @@ export class AgentSession {
 		this.#credentialStoreIdentity = config.credentialStoreIdentity;
 		this.#providerCacheSessionId = config.providerCacheSessionId;
 		this.#asyncJobProviderSessionId = config.asyncJobProviderSessionId;
+		this.#delegationHint = new DelegationHintController({
+			getMode: () => this.settings.get("task.delegationHint.mode"),
+			getAutoroutingEnabled: () => this.settings.getEffectiveAutorouting().active,
+			getAutoroutingTiers: () => this.settings.get("task.autorouting.tiers"),
+			notify: message => this.emitNotice("info", message, "delegation-hint"),
+		});
+		this.#unregisterDelegationHintSettings = this.settings.onChanged(settingPath => {
+			if (settingPath === "task.delegationHint.mode") {
+				this.#delegationHint.setEnabled(this.settings.get("task.delegationHint.mode") === "hint");
+			}
+		});
 		// Per-tool TTSR reminders are folded into the matched tool's result via this hook.
-		this.agent.afterToolCall = ctx => {
+		this.agent.afterToolCall = (ctx, signal) => {
 			const ownership = this.#toolLifecycleOwnership.get(ctx.toolCall);
 			if (!ownership) {
 				this.#perToolTtsrInjections.delete(ctx.toolCall.id);
@@ -7569,6 +7587,7 @@ export class AgentSession {
 
 	/** Serializes sidecar writes in publication order, independent of write latency. */
 	#coordinatorPersistQueue: Promise<void> = Promise.resolve();
+	#coordinatorPersistFailuresForTests: unknown[] | undefined;
 
 	#recordPostPublicationOutcome(
 		context: CoordinatorRuntimeStatePersistContext,
@@ -7634,6 +7653,9 @@ export class AgentSession {
 	 */
 	#runtimeStateMarkerFile(input: { sessionId: string; cwd: string }): string | null {
 		if (!input.sessionId.trim()) return null;
+		if (this.#coordinatorRuntimeStateFileOverrideForTests) {
+			return this.#coordinatorRuntimeStateFileOverrideForTests;
+		}
 		const pinned = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
 		if (this.taskDepth > 0) return sessionRuntimeStatePath(input.cwd, input.sessionId);
 		return pinned || sessionRuntimeStatePath(input.cwd, input.sessionId);
@@ -7714,6 +7736,7 @@ export class AgentSession {
 					{ event: event.type, ...(attempt > 0 ? { retries: attempt } : {}) },
 				);
 				if (propagateFailure) throw error;
+				this.#coordinatorPersistFailuresForTests?.push(error);
 				return;
 			}
 		}
@@ -7739,10 +7762,17 @@ export class AgentSession {
 	async #emitSessionEvent(event: AgentSessionEvent, eventLease?: RunResourceProducerLease): Promise<void> {
 		const attemptScope = (event as AgentSessionEvent & { scope?: AttemptScope }).scope;
 		if (event.type === "turn_start") {
+			const delegationHintEnabled = this.settings.get("task.delegationHint.mode") === "hint";
+			this.#delegationHint.setEnabled(delegationHintEnabled);
+			if (delegationHintEnabled) this.#delegationHint.onTurnStart();
 			this.#extensionTurnGeneration++;
 			this.#closedExtensionTurnGeneration = undefined;
 		} else if (event.type === "turn_end") {
 			this.#closedExtensionTurnGeneration = this.#extensionTurnGeneration;
+		}
+		if (event.type === "message_end" && event.message.role === "user") {
+			this.#delegationHint.setEnabled(this.settings.get("task.delegationHint.mode") === "hint");
+			this.#delegationHint.onUserMessage();
 		}
 		if (event.type === "message_update") {
 			// Fast path: message_update maps to no sidecar state, so we must not
@@ -8010,10 +8040,6 @@ export class AgentSession {
 				this.agent.discardRejectedAssistantEvent(event.message);
 			}
 		};
-		if (attemptScope && this.#retiredSessionIdentityAttemptScopes.has(attemptScope)) {
-			discardRejectedAssistantEvent();
-			return;
-		}
 		if (attemptScopeKey && this.#retiredSessionIdentityAttemptScopeKeys.has(attemptScopeKey)) {
 			discardRejectedAssistantEvent();
 			return;
@@ -9939,7 +9965,12 @@ export class AgentSession {
 				this.#schedulePostPromptTask(
 					async signal => {
 						if (signal.aborted) return;
-						await this.#scheduleOverflowRetryContinuation(generation, resourceRunId, continuationIdentity);
+						await this.#scheduleOverflowRetryContinuation(
+							generation,
+							resourceRunId,
+							sdkOwnership,
+							continuationIdentity,
+						);
 					},
 					{
 						generation,
@@ -10019,6 +10050,7 @@ export class AgentSession {
 					deferredSelectionFenceGeneration,
 					deferredPredecessorAgentEnd,
 					sdkOwnership,
+					scheduledSessionIdentity,
 				);
 			return;
 		}
@@ -11787,6 +11819,8 @@ export class AgentSession {
 		this.#unregisterResourceGc = undefined;
 		this.#unregisterSessionMemorySettings?.();
 		this.#unregisterSessionMemorySettings = undefined;
+		this.#unregisterDelegationHintSettings?.();
+		this.#unregisterDelegationHintSettings = undefined;
 		if (ownerTerminalContextFromEnvironment() === null) this.#unregisterRuntimeStateFinalizer?.();
 		this.#unregisterRuntimeStateFinalizer = undefined;
 		this.#unregisterBeforeMoveListener?.();
@@ -11903,6 +11937,8 @@ export class AgentSession {
 		this.#unregisterResourceGc = undefined;
 		this.#unregisterSessionMemorySettings?.();
 		this.#unregisterSessionMemorySettings = undefined;
+		this.#unregisterDelegationHintSettings?.();
+		this.#unregisterDelegationHintSettings = undefined;
 		const work = Promise.allSettled([
 			evalExecutionsSettled,
 			// kill:true so a forced exit also reaps spawned-app Chrome we own (headless
@@ -12056,6 +12092,25 @@ export class AgentSession {
 		});
 	}
 
+	/** Bind coordinator runtime-state persistence to this session in tests. */
+	setCoordinatorRuntimeStateFileForTests(stateFile: string): void {
+		if (!path.isAbsolute(stateFile)) {
+			throw new Error("Coordinator runtime-state test path must be absolute.");
+		}
+		this.#coordinatorRuntimeStateFileOverrideForTests = path.resolve(stateFile);
+		this.#registerRuntimeStateFinalizer();
+	}
+
+	/** Read the test-only coordinator runtime-state path bound to this session. */
+	getCoordinatorRuntimeStateFileForTests(): string | undefined {
+		return this.#coordinatorRuntimeStateFileOverrideForTests;
+	}
+
+	/** Enable sidecar write failure reporting for retry-test teardown. */
+	trackCoordinatorRuntimeStatePersistenceFailuresForTests(): void {
+		this.#coordinatorPersistFailuresForTests = [];
+	}
+
 	/** Test seam: await all currently admitted coordinator sidecar writes. */
 	async awaitCoordinatorRuntimeStatePersistenceForTests(): Promise<void> {
 		// A terminal abort can schedule a preserved follow-up as a fresh turn after
@@ -12078,6 +12133,11 @@ export class AgentSession {
 		}
 		await this.#coordinatorPersistQueue;
 		await this.#drainUnbarrieredCoordinatorPersists();
+		const failures = this.#coordinatorPersistFailuresForTests;
+		if (failures && failures.length > 0) {
+			this.#coordinatorPersistFailuresForTests = [];
+			throw new AggregateError(failures, "Coordinator runtime-state persistence failed during test");
+		}
 	}
 	queueCoordinatorRuntimeStatePersistForTests(event: AgentSessionEvent, gate: Promise<void>): Promise<void> {
 		this.#agentEventAdmission.set(event, {
@@ -20149,7 +20209,6 @@ export class AgentSession {
 			shouldMutate?: () => boolean;
 			onMutationStarted?: () => void;
 			allowPromptContinuationReentry?: boolean;
-			onMutationStarted?: () => void;
 		},
 		// biome-ignore lint/suspicious/noConfusingVoidType: Existing session adapters return Promise<void>; a scope is optional.
 	): Promise<TemporaryProviderSessionScope | void> {
@@ -24747,15 +24806,12 @@ export class AgentSession {
 			const overflowContinuationScheduled =
 				willRetry && !continuationSkipReason
 					? await this.#scheduleOverflowRetryContinuation(
-							generation,
-							options?.resourceRunId,
-							generation,
-							options?.resourceRunId,
-							options?.sdkOwnership,
-							{ sessionId: compactionSessionId, sessionIdentityEpoch: compactionSessionIdentityEpoch },
-							ownsAutoCompactionTransition,
-						)
-						)
+						generation,
+						options?.resourceRunId,
+						options?.sdkOwnership,
+						{ sessionId: compactionSessionId, sessionIdentityEpoch: compactionSessionIdentityEpoch },
+						ownsAutoCompactionTransition,
+					)
 					: false;
 
 			await this.#emitSessionEvent({
@@ -25922,6 +25978,7 @@ export class AgentSession {
 				continue;
 			}
 			const resolvedModel = resolved.model;
+			const canonicalModelKey = this.#managedFallbackCanonicalModelKey(resolvedModel);
 			if (this.#escapedNonAsciiExhaustedModelKeys.has(`${resolved.model.provider}\u0000${resolved.model.id}`)) {
 				controller.onResolutionSkip("escaped_non_ascii_model_exhausted");
 				continue;
@@ -26224,16 +26281,19 @@ export class AgentSession {
 	 *    would hide an authorization defect and cycle through healthy rows.
 	 * 3. Auth failures retain their existing key-change proof. Quota, rate-limit
 	 *    and OAuth account-model rejections mark before resolving and require two known,
-	 *    different stored row IDs before reporting rotation. This is mark-time
-	 *    identity, not dispatch-bound attribution across shared sessions.
+	 *    different stored row IDs before reporting rotation. Managed same-turn fallback
+	 *    also retains the dispatched row identity when a concurrent insertion resets
+	 *    the session assignment.
 	 */
 	async #markFailedCredential(trigger: {
 		class: FallbackTriggerClass;
 		retryAfterMs?: number;
 		authDisposition?: AuthDisposition;
-	}): Promise<"rotated" | "exhausted" | "unchanged"> {
+		trackSameTurnRows?: boolean;
+	}): Promise<"rotated" | "alternate" | "exhausted" | "unchanged"> {
+		const model = this.model;
 		if (
-			!this.model ||
+			!model ||
 			(trigger.class !== "auth" &&
 				trigger.class !== "quota" &&
 				trigger.class !== "rate_limit" &&
@@ -26245,7 +26305,7 @@ export class AgentSession {
 		if (trigger.class === "auth" && trigger.authDisposition === "forbidden") return "unchanged";
 
 		const authStorage = this.#modelRegistry.authStorage;
-		const provider = this.model.provider;
+		const provider = model.provider;
 		// (1) Pin guard, before any mutation and for every branch.
 		if (
 			authStorage.hasRuntimeApiKey(provider) ||
@@ -26285,13 +26345,46 @@ export class AgentSession {
 				owner: this.#modelRegistry.getAuthStorageOwner(),
 				...(before === undefined ? {} : { rowId: before }),
 			});
-			if (!remaining) return "exhausted";
-			await this.#modelRegistry.getApiKey(this.model, credentialSessionId);
-			const after = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
-			if (before !== undefined && after !== undefined && before !== after) return "rotated";
-			return "unchanged";
+			const { state, failedRowId, credentialKind, remainingCredentialIds } = markResult;
+			const trackedCredentialKind = credentialKind ?? beforeKind;
+			const triedRows =
+				trigger.trackSameTurnRows && trackedCredentialKind !== undefined
+					? this.#managedFallbackTriedRows(model, trackedCredentialKind)
+					: undefined;
+			if (trigger.trackSameTurnRows && trackedCredentialKind !== undefined) {
+				this.#trackManagedFallbackCredential(model, trackedCredentialKind, failedRowId);
+			}
+			if (remainingCredentialIds.length === 0) return state === "marked" ? "exhausted" : "unchanged";
+			if (credentialKind === undefined) return "unchanged";
+			for (const peerId of remainingCredentialIds) {
+				if (triedRows?.has(peerId)) continue;
+				if (!authStorage.isCredentialAvailable(provider, peerId)) continue;
+				let peerApiKey: string | undefined;
+				try {
+					peerApiKey = await this.#modelRegistry.getApiKey(model, credentialSessionId, {
+						credentialSelector: { kind: "id", value: String(peerId) },
+					});
+				} catch (error) {
+					if (authStorage.isCredentialAvailable(provider, peerId)) throw error;
+					continue;
+				}
+				if (!isAuthenticated(peerApiKey)) continue;
+				const selectedRowId = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
+				const selectedKind = authStorage.getSessionCredentialType(provider, credentialSessionId);
+				if (
+					selectedRowId === peerId &&
+					selectedKind === credentialKind &&
+					authStorage.isCredentialAvailable(provider, peerId)
+				) {
+					triedRows?.add(selectedRowId);
+					return state === "marked" && before !== undefined && before === failedRowId && selectedRowId !== before
+						? "rotated"
+						: "alternate";
+				}
+			}
+			return triedRows ? (state === "marked" ? "exhausted" : "unchanged") : "exhausted";
 		}
-		const activeApiKey = await this.#modelRegistry.getApiKey(this.model, credentialSessionId);
+		const activeApiKey = await this.#modelRegistry.getApiKey(model, credentialSessionId);
 
 		if (!isAuthenticated(activeApiKey)) return "unchanged";
 		const remaining = await authStorage.invalidateCredentialMatching(provider, activeApiKey, {
@@ -26301,7 +26394,7 @@ export class AgentSession {
 		if (!remaining) return "unchanged";
 
 		// (3) Distinct-row proof.
-		if ((await this.#modelRegistry.getApiKey(this.model, credentialSessionId)) !== activeApiKey) {
+		if ((await this.#modelRegistry.getApiKey(model, credentialSessionId)) !== activeApiKey) {
 			return "rotated";
 		}
 		return remaining ? "unchanged" : "exhausted";
@@ -26491,10 +26584,11 @@ export class AgentSession {
 		// extension lifecycle participation. Mark the failed credential and
 		// retry with the next stored credential of the same provider.
 		let credentialRotated = false;
-		if (canRotateCodexCredential && trigger.class === "credential") {
+		let quotaCredentialMark: "rotated" | "alternate" | "exhausted" | "unchanged" | undefined;
+		if (canRotateCodexCredential && trigger.class === "credential" && !providerRetryCeilingReached) {
 			const mark = await this.#markFailedCredential(trigger);
 			this.#codexCredentialModelUnavailableRetried = true;
-			credentialRotated = mark === "rotated";
+			credentialRotated = mark === "rotated" || (managedFallback && mark === "alternate");
 			if (!credentialRotated && !managedFallback) {
 				return managedOutcome
 					? {
@@ -26505,14 +26599,16 @@ export class AgentSession {
 			}
 		}
 		if (
-			!managedFallback &&
-			!providerRetryCeilingReached &&
 			!assistantMessageHasVisibleOrToolContent(message) &&
 			(trigger.class === "quota" || trigger.class === "rate_limit")
 		) {
-			const mark = await this.#markFailedCredential(trigger);
-			credentialRotated = mark === "rotated";
-			if (mark === "exhausted") this.#stampQuotaRetryableAt(message);
+			quotaCredentialMark = await this.#markFailedCredential({
+				...trigger,
+				trackSameTurnRows: managedFallback && (trigger.class === "quota" || trigger.class === "rate_limit"),
+			});
+			credentialRotated =
+				quotaCredentialMark === "rotated" || (managedFallback && quotaCredentialMark === "alternate");
+			if (quotaCredentialMark === "exhausted") this.#stampQuotaRetryableAt(message);
 		}
 
 		// A content-free credential rotation is inherently replay-safe: no partial
@@ -27402,7 +27498,6 @@ export class AgentSession {
 		const excludeFromContext = options?.excludeFromContext === true;
 		this.#markRetryReplayUnsafe();
 		const cwd = this.sessionManager.getCwd();
-		const sessionFile = this.sessionManager.getSessionFile();
 		this.assertEvalExecutionAllowed();
 		const sessionFile = this.sessionManager.getSessionFile();
 		const sessionId = sessionFile ? `session:${sessionFile}:cwd:${cwd}` : `cwd:${cwd}`;
@@ -27433,7 +27528,6 @@ export class AgentSession {
 				}
 			}
 
-		const sessionId = sessionFile ? `session:${sessionFile}:cwd:${cwd}` : `cwd:${cwd}`;
 			const result = await executePythonCommand(code, {
 				cwd,
 				sessionId,
