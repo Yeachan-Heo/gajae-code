@@ -184,6 +184,7 @@ describe("async job endpoint id derivation", () => {
 describe("task fork-context provider identity", () => {
 	const sessions: AgentSession[] = [];
 	const authStorages: AuthStorage[] = [];
+	const artifactStores: ManagedSessionDescendantStore[] = [];
 	const tempDirs: string[] = [];
 	function listTempTree(dir: string, prefix = ""): string[] {
 		return fs.readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
@@ -197,6 +198,7 @@ describe("task fork-context provider identity", () => {
 	afterEach(async () => {
 		while (sessions.length > 0) await sessions.pop()?.dispose();
 		while (authStorages.length > 0) authStorages.pop()?.close();
+		while (artifactStores.length > 0) artifactStores.pop()?.close();
 		while (tempDirs.length > 0) {
 			const tempDir = tempDirs.pop();
 			if (!tempDir) continue;
@@ -281,7 +283,9 @@ describe("task fork-context provider identity", () => {
 
 		const root = managedDirectoryRoot(tempDir);
 		const artifactsDir = path.join(root.canonicalPath, "artifacts");
-		const artifacts = new ArtifactManager(new ManagedSessionDescendantStore(root, artifactsDir));
+		const artifactStore = new ManagedSessionDescendantStore(root, artifactsDir);
+		artifactStores.push(artifactStore);
+		const artifacts = new ArtifactManager(artifactStore);
 		const childAProviderSessionId = JSON.stringify(["subagent-canonical", parent.sessionId, "0-child-a"]);
 		const childBProviderSessionId = JSON.stringify(["subagent-canonical", parent.sessionId, "1-child-b"]);
 		const childAPersistence = createManagedTaskPersistence(artifacts, "0-child-a");
@@ -323,7 +327,9 @@ describe("task fork-context provider identity", () => {
 		const seed = await parent.buildForkContextSeed({ maxMessages: 50, maxTokens: 10_000 });
 		const root = managedDirectoryRoot(tempDir);
 		const artifactsDir = path.join(root.canonicalPath, "artifacts");
-		const artifacts = new ArtifactManager(new ManagedSessionDescendantStore(root, artifactsDir));
+		const artifactStore = new ManagedSessionDescendantStore(root, artifactsDir);
+		artifactStores.push(artifactStore);
+		const artifacts = new ArtifactManager(artifactStore);
 		const persistence = createManagedTaskPersistence(artifacts, "0-resumable-child");
 		const childProviderSessionId = JSON.stringify(["subagent-canonical", parent.sessionId, "0-resumable-child"]);
 		const { session: child, authStorage: childAuth } = await createSession(tempDir, {
