@@ -919,6 +919,28 @@ export interface QueuedInputSubmission {
 
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
+
+/**
+ * Deliver one event to one listener, containing both synchronous throws and
+ * async rejections. Listeners are `void`-typed but interactive mode subscribes
+ * with an `async` one whose handlers can persist (plan approval calls
+ * `session.prompt()`); a rejection there, e.g. the managed append fence after
+ * another process took over the transcript, must not escape as an unhandled
+ * rejection and terminate the process.
+ */
+function deliverSessionEvent(
+	listener: AgentSessionEventListener,
+	event: AgentSessionEvent,
+	onError: (error: unknown) => void,
+): void {
+	try {
+		const result: unknown = listener(event);
+		if (result instanceof Promise) result.catch(onError);
+	} catch (error) {
+		onError(error);
+	}
+}
+
 export type AsyncJobSnapshotItem = Pick<
 	AsyncJob,
 	"id" | "type" | "status" | "label" | "startTime" | "endTime" | "metadata"
@@ -6928,11 +6950,9 @@ export class AgentSession {
 	/** Emit an event to all listeners without letting one subscriber poison lifecycle settlement. */
 	#emit(event: AgentSessionEvent): void {
 		for (const listener of this.#eventListenerSnapshot) {
-			try {
-				listener(event);
-			} catch (error) {
+			deliverSessionEvent(listener, event, error => {
 				logger.warn("Agent session event subscriber failed", { event: event.type, error: String(error) });
-			}
+			});
 		}
 	}
 
@@ -18982,14 +19002,12 @@ export class AgentSession {
 		if (thinkingLevelChanged) {
 			const event: AgentSessionEvent = { type: "thinking_level_changed", thinkingLevel };
 			for (const listener of this.#eventListenerSnapshot) {
-				try {
-					listener(event);
-				} catch {
+				deliverSessionEvent(listener, event, () => {
 					logger.warn("Default model selection event listener failed", {
 						code: "default_model_selection_listener_failed",
 						disposition: "continue",
 					});
-				}
+				});
 			}
 		}
 		this.#applyPreparedDefaultModelSelectionPrompt(systemPrompt);

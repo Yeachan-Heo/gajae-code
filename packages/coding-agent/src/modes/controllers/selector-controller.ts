@@ -2777,18 +2777,12 @@ export class SelectorController {
 							return;
 						}
 						const { model, role, thinkingLevel, selector: selectedSelector } = selection;
-						if (
-							(role !== null && role !== "default") ||
-							selection.roles?.some(targetRole => targetRole !== "default")
-						) {
-							this.ctx.session.markUserModelSelection();
-						}
 						if (role === null) {
 							// Temporary: update agent state but don't persist to settings
-							this.ctx.session.markUserModelSelection();
 							await this.ctx.session.setModelTemporary(model, thinkingLevel, {
 								cause: "temporary-operation",
 								reason: "other",
+								onMutationStarted: () => this.ctx.session.markUserModelSelection(),
 							});
 							this.ctx.session.setDefaultFallbackRuntimeModel(
 								selectedSelector ?? formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel),
@@ -2826,6 +2820,7 @@ export class SelectorController {
 								selectedSelector && thinkingLevel && selectedSelector.endsWith(`:${thinkingLevel}`)
 									? selectedSelector.slice(0, -thinkingLevel.length - 1)
 									: selectedSelector;
+							if (includesRoleAgent && !includesDefault) this.ctx.session.markUserModelSelection();
 
 							const rollbackSnapshot = this.#captureDefaultAssignmentRollback();
 							let defaultMutationStarted = false;
@@ -2948,6 +2943,7 @@ export class SelectorController {
 							}
 							const value =
 								selectedSelector ?? formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel);
+							this.ctx.session.markUserModelSelection();
 							const assignments = new Map<GjcModelAssignmentTargetId, string>([[role, value]]);
 							const materializedProfile = materializeActiveModelProfileAssignments({
 								session: this.ctx.session,

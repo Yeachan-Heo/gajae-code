@@ -19,6 +19,16 @@ const TEST_SESSION_ID = "test-session";
 
 type ToolCallParams = { action?: "execute" | "clear"; code?: string };
 
+interface AgentSessionFixture {
+	session: AgentSession;
+	sessionManager: SessionManager;
+	cleanup: () => Promise<void>;
+}
+
+interface PythonToolSessionFixture extends AgentSessionFixture {
+	pythonTool: AgentTool;
+}
+
 function textOf(result: AgentToolResult): string {
 	return result.content.map(block => (block.type === "text" ? block.text : "")).join("\n");
 }
@@ -143,7 +153,7 @@ async function createAgentSessionFixture(options: {
 	toolRegistry: Map<string, AgentTool>;
 	sessionManager?: SessionManager;
 	settings?: Settings;
-}): Promise<{ session: AgentSession; sessionManager: SessionManager; cleanup: () => Promise<void> }> {
+}): Promise<AgentSessionFixture> {
 	const authStorage = await AuthStorage.create(path.join(options.cwd, "testauth.db"));
 	authStorage.setRuntimeApiKey("anthropic", "test-key");
 	const modelRegistry = new ModelRegistry(authStorage);
@@ -183,13 +193,8 @@ async function createPythonToolSessionFixture(options: {
 	getSessionId: () => string | null;
 	settings: Settings;
 	sessionManager?: SessionManager;
-}): Promise<{
-	session: AgentSession;
-	sessionManager: SessionManager;
-	pythonTool: AgentTool;
-	cleanup: () => Promise<void>;
-}> {
-	let fixture: Awaited<ReturnType<typeof createAgentSessionFixture>> | undefined;
+}): Promise<PythonToolSessionFixture> {
+	let fixture: AgentSessionFixture | undefined;
 	const toolSession = makeToolSession({
 		cwd: options.cwd,
 		getCwd: options.getCwd,
@@ -292,6 +297,198 @@ describe("builtin session Python tool", () => {
 		expect(secondOptions.artifactsDir).toBe(sessionIpykernelsArtifactsDir(cwd, TEST_SESSION_ID));
 	});
 
+	it("enrolls the original invocation before reentrant registered cleanup and clear", async () => {
+		const cwd = tempDir();
+		const foreignSessionId = "foreign-python-test-session";
+		const appendStarted = {
+			[TEST_SESSION_ID]: Promise.withResolvers<void>(),
+			[foreignSessionId]: Promise.withResolvers<void>(),
+		};
+		const releaseAppend = {
+			[TEST_SESSION_ID]: Promise.withResolvers<void>(),
+			[foreignSessionId]: Promise.withResolvers<void>(),
+		};
+		let sessionFixture: AgentSessionFixture | undefined;
+		let registeredCleanup: (() => Promise<void> | void) | undefined;
+		let pythonTool: AgentTool | undefined;
+		let reenterCleanupFromTracker = false;
+		let cleanupFromTrackerSettled = false;
+		let clearFromTrackerSettled = false;
+		let foreignExecutionSettled = false;
+		let foreignClearSettled = false;
+		let originalExecutionSettled = false;
+		let trackingWrapperSettled = false;
+		let cleanupFromTracker: Promise<void> | undefined;
+		let clearFromTracker: Promise<AgentToolResult> | undefined;
+		let foreignClear: Promise<AgentToolResult> | undefined;
+		const releaseTrackingWrapper = Promise.withResolvers<void>();
+
+		const assertExecutionAllowed = (): void => {
+			if (!sessionFixture) throw new Error("Python execution was admitted before SDK session construction");
+			sessionFixture.session.assertEvalExecutionAllowed();
+		};
+		const trackExecution: NonNullable<ToolSession["trackEvalExecution"]> = (execution, abortController) => {
+			if (!sessionFixture) throw new Error("Python execution was tracked before SDK session construction");
+			const holdTrackingWrapper = reenterCleanupFromTracker;
+			if (holdTrackingWrapper) {
+				reenterCleanupFromTracker = false;
+				const cleanup = registeredCleanup;
+				if (!cleanup) throw new Error("Expected the Python generation cleanup to be registered before tracking");
+				const activeTool = pythonTool;
+				if (!activeTool) throw new Error("Expected the built-in Python tool to be loaded before tracking");
+				clearFromTracker = activeTool.execute("python-reentrant-clear", { action: "clear" }).then(result => {
+					clearFromTrackerSettled = true;
+					return result;
+				});
+				cleanupFromTracker = Promise.resolve(cleanup()).then(() => {
+					cleanupFromTrackerSettled = true;
+				});
+			}
+			const trackedExecution = sessionFixture.session.trackEvalExecution(execution, abortController);
+			if (!holdTrackingWrapper) return trackedExecution;
+			return trackedExecution.then(async result => {
+				await releaseTrackingWrapper.promise;
+				trackingWrapperSettled = true;
+				return result;
+			});
+		};
+		const registerCleanup = (cleanup: () => Promise<void> | void): (() => void) => {
+			if (!sessionFixture) throw new Error("Python cleanup was registered before SDK session construction");
+			registeredCleanup = cleanup;
+			return sessionFixture.session.registerToolSessionTransitionCleanup(cleanup);
+		};
+
+		const tool = await loadPythonTool({
+			cwd,
+			getSessionId: () => TEST_SESSION_ID,
+			registerSessionCleanup: registerCleanup,
+			assertEvalExecutionAllowed: assertExecutionAllowed,
+			trackEvalExecution: trackExecution,
+		});
+		pythonTool = tool;
+		const foreignTool = await loadPythonTool({
+			cwd,
+			getSessionId: () => foreignSessionId,
+			registerSessionCleanup: cleanup => {
+				if (!sessionFixture) throw new Error("Python cleanup was registered before SDK session construction");
+				return sessionFixture.session.registerToolSessionTransitionCleanup(cleanup);
+			},
+			assertEvalExecutionAllowed: assertExecutionAllowed,
+			trackEvalExecution: trackExecution,
+		});
+		sessionFixture = await createAgentSessionFixture({ cwd, toolRegistry: new Map([[PYTHON_TOOL_NAME, tool]]) });
+		sessionCleanups.push(sessionFixture.cleanup);
+
+		const realAppendFile = fs.appendFile.bind(fs);
+		vi.spyOn(fs, "appendFile").mockImplementation(async (filePath, data, options) => {
+			const result = await realAppendFile(filePath, data, options);
+			const targetSessionId = ([TEST_SESSION_ID, foreignSessionId] as const).find(
+				sessionId =>
+					String(filePath).startsWith(sessionIpykernelsDir(cwd, sessionId)) &&
+					String(filePath).endsWith("transcript.jsonl"),
+			);
+			if (targetSessionId === undefined) return result;
+			appendStarted[targetSessionId].resolve();
+			await releaseAppend[targetSessionId].promise;
+			return result;
+		});
+
+		try {
+			const foreignExecution = foreignTool
+				.execute("python-foreign-invocation", { code: "print('foreign invocation')" })
+				.then(result => {
+					foreignExecutionSettled = true;
+					return result;
+				});
+			await appendStarted[foreignSessionId].promise;
+
+			reenterCleanupFromTracker = true;
+			const originalExecution = tool
+				.execute("python-reentrant-execution", {
+					code: "print('invocation retired by its tracker')",
+				})
+				.then(result => {
+					originalExecutionSettled = true;
+					return result;
+				});
+			await appendStarted[TEST_SESSION_ID].promise;
+			expect(cleanupFromTrackerSettled).toBe(false);
+			expect(clearFromTrackerSettled).toBe(false);
+			expect(foreignExecutionSettled).toBe(false);
+			expect(cleanupFromTracker).toBeDefined();
+			expect(clearFromTracker).toBeDefined();
+			expect(
+				await transcriptRecords(cwd, TEST_SESSION_ID, (await transcriptDirectories(cwd, TEST_SESSION_ID))[0]!),
+			).toEqual(
+				expect.arrayContaining([expect.objectContaining({ code: "print('invocation retired by its tracker')" })]),
+			);
+
+			releaseAppend[TEST_SESSION_ID].resolve();
+			await cleanupFromTracker;
+			const clearResult = await clearFromTracker;
+			expect(originalExecutionSettled).toBe(false);
+			expect(trackingWrapperSettled).toBe(false);
+			releaseTrackingWrapper.resolve();
+			const originalResult = await originalExecution;
+			expect(originalResult.content.length).toBeGreaterThan(0);
+			expect(clearResult?.isError).toBeUndefined();
+			expect(cleanupFromTrackerSettled).toBe(true);
+			expect(clearFromTrackerSettled).toBe(true);
+			expect(trackingWrapperSettled).toBe(true);
+			expect(foreignExecutionSettled).toBe(false);
+
+			foreignClear = foreignTool.execute("python-foreign-clear", { action: "clear" }).then(result => {
+				foreignClearSettled = true;
+				return result;
+			});
+			await Bun.sleep(0);
+			expect(foreignClearSettled).toBe(false);
+			releaseAppend[foreignSessionId].resolve();
+			const foreignResult = await foreignExecution;
+			const foreignClearResult = await foreignClear;
+			expect(textOf(foreignResult)).toContain("foreign invocation");
+			expect(foreignClearResult.isError).toBeUndefined();
+
+			const successor = await tool.execute("python-reentrant-successor", {
+				code: "print('healthy successor')",
+			});
+			expect(successor.isError).toBeUndefined();
+			expect(textOf(successor)).toContain("healthy successor");
+		} finally {
+			// Only release test gates here so an execution/assertion error is not replaced by cleanup.
+			releaseTrackingWrapper.resolve();
+			releaseAppend[TEST_SESSION_ID].resolve();
+			releaseAppend[foreignSessionId].resolve();
+		}
+	}, 30_000);
+
+	it("retires an invocation when the tracking callback re-enters cleanup and throws", async () => {
+		const cwd = tempDir();
+		let registeredCleanup: (() => Promise<void> | void) | undefined;
+		let cleanupFromTracker: Promise<void> | undefined;
+		const executeSpy = vi.spyOn(pyExecutor, "executePython");
+		const disposeSpy = vi.spyOn(pyExecutor, "disposeKernelSessionsByOwner").mockResolvedValue(undefined);
+		const tool = await loadPythonTool({
+			cwd,
+			registerSessionCleanup: cleanup => {
+				registeredCleanup = cleanup;
+			},
+			trackEvalExecution: () => {
+				if (!registeredCleanup) throw new Error("Expected the Python generation cleanup to be registered");
+				cleanupFromTracker = Promise.resolve(registeredCleanup());
+				throw new Error("tracking callback failed");
+			},
+		});
+
+		await expect(executeTool(tool, { code: "print('must not execute')" })).rejects.toThrow(
+			"tracking callback failed",
+		);
+		if (!cleanupFromTracker) throw new Error("Expected tracker cleanup to start");
+		await cleanupFromTracker;
+		expect(executeSpy).not.toHaveBeenCalled();
+		expect(disposeSpy).toHaveBeenCalledWith(pythonKernelOwnerId(TEST_SESSION_ID));
+	});
+
 	it("captures live cwd and session metadata before preflight and tracks through transcript append", async () => {
 		const cwdA = tempDir();
 		const cwdB = tempDir();
@@ -360,7 +557,7 @@ describe("builtin session Python tool", () => {
 			}
 			return result;
 		});
-		let sessionForCleanup: Awaited<ReturnType<typeof createPythonToolSessionFixture>> | undefined;
+		let sessionForCleanup: PythonToolSessionFixture | undefined;
 		let executionForCleanup: Promise<AgentToolResult> | undefined;
 		let clear: Promise<AgentToolResult> | undefined;
 		let transition: Promise<boolean> | undefined;
