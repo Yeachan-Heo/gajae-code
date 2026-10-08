@@ -9,3 +9,4 @@
 - Managed iTerm cursor refreshes now cancel with the raster/TUI lifecycle and have a bounded command deadline, so stalled tmux coordination cannot wedge teardown or block later terminal cleanup.
 - Managed task-enrollment reads now use cross-platform workflow locking instead of Linux-only private publication, keeping broker startup safe when no enrollment record exists.
 - Async yield queues preserve FIFO suffixes and retry deadlines across dispatcher failures, active turns, and stale scheduled wakes; idle owned-completion admission revalidates session identity and transition state after persistence reconciliation before minting a fresh turn lineage.
+- Existing multi-workflow snapshots are migrated before per-skill state becomes authoritative, preserving concurrent workflows and approval guards during later state updates.

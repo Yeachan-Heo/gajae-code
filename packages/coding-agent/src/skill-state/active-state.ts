@@ -636,6 +636,7 @@ const PLANNING_PIPELINE_RANK = new Map<string, number>([
 	["ralplan", 1],
 	["ultragoal", 2],
 ]);
+const ACTIVE_ENTRY_MIGRATION_MARKER = ".active-entry-migration.pending";
 
 function planningPipelineRank(skill: string): number | undefined {
 	return PLANNING_PIPELINE_RANK.get(skill);
@@ -696,13 +697,80 @@ async function mergeVisibleEntries(
 	return activeStateScopeLockHeld ? await read() : await withActiveStateScopeLock(cwd, { sessionId }, read);
 }
 
-async function hasAuthoritativeActiveEntryDirectory(cwd: string, sessionId: string): Promise<boolean> {
+function activeEntryMigrationMarkerPath(cwd: string, sessionId: string): string {
+	return path.join(path.dirname(activeStateDir(cwd, sessionId)), ACTIVE_ENTRY_MIGRATION_MARKER);
+}
+
+async function hasActiveEntryDirectory(cwd: string, sessionId: string): Promise<boolean> {
 	try {
 		return (await fs.stat(activeStateDir(cwd, sessionId))).isDirectory();
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		return false;
 	}
+}
+
+async function hasPendingActiveEntryMigration(cwd: string, sessionId: string): Promise<boolean> {
+	try {
+		await fs.stat(activeEntryMigrationMarkerPath(cwd, sessionId));
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		return false;
+	}
+}
+
+async function hasAuthoritativeActiveEntryDirectory(cwd: string, sessionId: string): Promise<boolean> {
+	return (await hasActiveEntryDirectory(cwd, sessionId)) && !(await hasPendingActiveEntryMigration(cwd, sessionId));
+}
+
+/**
+ * Migrate unrepresented legacy or indeterminate snapshot rows before treating the
+ * per-skill directory as complete. Keep a marker until all entries are durable so
+ * reads and retries continue to include the snapshot if migration is interrupted.
+ */
+async function migrateSnapshotEntriesToActiveDirectory(cwd: string, sessionId: string): Promise<void> {
+	const sessionScope = { sessionId };
+	const migrationMarkerPath = activeEntryMigrationMarkerPath(cwd, sessionId);
+	const migrationPending = await hasPendingActiveEntryMigration(cwd, sessionId);
+	const activeDirectoryExists = await hasActiveEntryDirectory(cwd, sessionId);
+
+	const { sessionPath } = getSkillActiveStatePaths(cwd, sessionId);
+	const snapshot = migrationPending
+		? await readSessionSnapshotStrict(sessionPath)
+		: await readRawActiveStateForHandoff(sessionPath, false);
+	const snapshotEntries = snapshot ? rawActiveEntries(snapshot) : [];
+	const existingEntries = await readActiveEntries(cwd, sessionScope);
+	let entriesToMigrate = snapshotEntries;
+	if (!migrationPending) {
+		if (snapshot && classifySnapshotAuthority(snapshot) === "derived") return;
+		if (activeDirectoryExists) {
+			const representedSkills = new Set(existingEntries.map(entry => entry.skill));
+			entriesToMigrate = snapshotEntries.filter(entry => !representedSkills.has(entry.skill));
+		}
+		if (entriesToMigrate.length === 0) return;
+	}
+
+	const entries = dedupeVisibleBySkill([...existingEntries, ...entriesToMigrate], sessionId);
+	if (entries.length === 0) {
+		throw new Error(
+			`Cannot complete skill active-entry migration for session ${sessionId}: no source entries remain`,
+		);
+	}
+	if (!migrationPending) await Bun.write(migrationMarkerPath, "pending\n");
+
+	for (const entry of entries) {
+		await writeActiveEntry(cwd, sessionScope, entry.skill, entry, {
+			cwd,
+			audit: activeStateWriterAudit("migrate-active-entry", sessionScope),
+			sourceRevision:
+				typeof entry.source_state_revision === "number" && Number.isFinite(entry.source_state_revision)
+					? entry.source_state_revision
+					: persistedStateRevision(entry),
+			activeStateScopeLockHeld: true,
+		});
+	}
+	await fs.rm(migrationMarkerPath, { force: true });
 }
 
 export type VisibleSkillActiveStateCacheTier = "security" | "hud";
@@ -722,6 +790,7 @@ interface ActiveStateSignature {
 	sessionPath: ActiveStateStatSignature | null;
 	activeDir: ActiveStateStatSignature | null;
 	activeEntries: ActiveStateStatSignature[];
+	migrationMarker: ActiveStateStatSignature | null;
 	ralplanModeState: ActiveStateStatSignature | null;
 }
 
@@ -755,6 +824,7 @@ function signaturesEqual(a: ActiveStateSignature, b: ActiveStateSignature): bool
 			left?.size === right?.size);
 	if (!statEqual(a.sessionPath, b.sessionPath)) return false;
 	if (!statEqual(a.activeDir, b.activeDir)) return false;
+	if (!statEqual(a.migrationMarker, b.migrationMarker)) return false;
 	if (!statEqual(a.ralplanModeState, b.ralplanModeState)) return false;
 	if (a.activeEntries.length !== b.activeEntries.length) return false;
 	return a.activeEntries.every((entry, index) => statEqual(entry, b.activeEntries[index] ?? null));
@@ -783,6 +853,7 @@ export async function computeActiveStateSignature(cwd: string, sessionId: string
 		sessionPath: await statSignature(sessionPath),
 		activeDir,
 		activeEntries,
+		migrationMarker: await statSignature(activeEntryMigrationMarkerPath(resolvedCwd, sessionId)),
 		ralplanModeState: await statSignature(modeStatePath(resolvedCwd, sessionId, "ralplan")),
 	};
 }
@@ -1090,6 +1161,7 @@ export async function syncSkillActiveState(
 	};
 	const sessionScope = { sessionId: options.sessionId };
 	return withActiveStateScopeLock(options.cwd, sessionScope, async () => {
+		await migrateSnapshotEntriesToActiveDirectory(options.cwd, sessionScope.sessionId);
 		const preservedActiveSubskills =
 			options.active_subskills === undefined
 				? await activeSubskillsForExistingEntry(options.cwd, options.sessionId, options.skill, true)
@@ -1164,6 +1236,9 @@ export async function applyHandoffToActiveState(options: ApplyHandoffOptions): P
 	};
 	const writeEntries = async (sessionScope: ActiveSessionScope, prior: SkillActiveState | null): Promise<void> => {
 		await withActiveStateScopeLock(options.cwd, sessionScope, async () => {
+			if (await hasPendingActiveEntryMigration(options.cwd, sessionId)) {
+				await migrateSnapshotEntriesToActiveDirectory(options.cwd, sessionId);
+			}
 			const authoritativeEntries = await hasAuthoritativeActiveEntryDirectory(options.cwd, sessionId);
 			const priorEntries = authoritativeEntries
 				? await readActiveEntries(options.cwd, sessionScope)

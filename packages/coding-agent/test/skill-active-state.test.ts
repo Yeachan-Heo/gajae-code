@@ -414,6 +414,161 @@ describe("GJC skill-active state", () => {
 		});
 	});
 
+	it("migrates every legacy snapshot workflow before making per-skill entries authoritative", async () => {
+		await withTempCwd(async cwd => {
+			const sessionId = "sess-legacy-migrate";
+			const { sessionPath } = getSkillActiveStatePaths(cwd, sessionId);
+			await fs.mkdir(path.dirname(sessionPath), { recursive: true });
+			await Bun.write(
+				sessionPath,
+				JSON.stringify({
+					version: 1,
+					active: true,
+					skill: "autoresearch",
+					active_skills: [
+						{
+							skill: "autoresearch",
+							phase: "research",
+							active: true,
+							session_id: sessionId,
+							updated_at: "2026-10-08T18:00:00.000Z",
+						},
+						{
+							skill: "ralplan",
+							phase: "pending-approval",
+							active: true,
+							session_id: sessionId,
+							updated_at: "2026-10-08T18:01:00.000Z",
+							source_state_revision: "invalid",
+						},
+					],
+				}),
+			);
+
+			await syncSkillActiveState({
+				cwd,
+				skill: "autoresearch",
+				phase: "running",
+				active: true,
+				sessionId,
+				nowIso: "2026-10-08T19:00:00.000Z",
+			});
+
+			const visible = await readVisibleSkillActiveState(cwd, sessionId);
+			expect(visible?.active_skills?.map(entry => entry.skill).sort()).toEqual(["autoresearch", "ralplan"]);
+			expect(visible?.active_skills?.find(entry => entry.skill === "ralplan")?.phase).toBe("pending-approval");
+			const migratedRalplan = JSON.parse(
+				await fs.readFile(path.join(activeStateDir(cwd, sessionId), "ralplan.json"), "utf8"),
+			);
+			expect(migratedRalplan.source_state_revision).toBe(0);
+		});
+	});
+
+	it("migrates unrepresented legacy rows from an existing active directory", async () => {
+		await withTempCwd(async cwd => {
+			const sessionId = "sess-legacy-partial";
+			const { sessionPath } = getSkillActiveStatePaths(cwd, sessionId);
+			await fs.mkdir(path.dirname(sessionPath), { recursive: true });
+			const snapshotEntries = [
+				{
+					skill: "autoresearch",
+					phase: "research",
+					active: true,
+					session_id: sessionId,
+					updated_at: "2026-10-08T18:00:00.000Z",
+				},
+				{
+					skill: "ralplan",
+					phase: "pending-approval",
+					active: true,
+					session_id: sessionId,
+					updated_at: "2026-10-08T18:01:00.000Z",
+				},
+			];
+			await Bun.write(
+				sessionPath,
+				JSON.stringify({ version: 1, active: true, skill: "autoresearch", active_skills: snapshotEntries }),
+			);
+
+			const activeDir = activeStateDir(cwd, sessionId);
+			await fs.mkdir(activeDir, { recursive: true });
+			await Bun.write(path.join(activeDir, "autoresearch.json"), JSON.stringify(snapshotEntries[0]));
+
+			await syncSkillActiveState({
+				cwd,
+				skill: "autoresearch",
+				phase: "running",
+				active: true,
+				sessionId,
+				nowIso: "2026-10-08T19:00:00.000Z",
+			});
+
+			const visible = await readVisibleSkillActiveState(cwd, sessionId);
+			expect(visible?.active_skills?.map(entry => entry.skill).sort()).toEqual(["autoresearch", "ralplan"]);
+			expect(visible?.active_skills?.find(entry => entry.skill === "ralplan")?.phase).toBe("pending-approval");
+		});
+	});
+
+	it("resumes an interrupted legacy-entry migration without dropping snapshot rows", async () => {
+		await withTempCwd(async cwd => {
+			const sessionId = "sess-legacy-retry";
+			const { sessionPath } = getSkillActiveStatePaths(cwd, sessionId);
+			await fs.mkdir(path.dirname(sessionPath), { recursive: true });
+			const snapshotEntries = [
+				{
+					skill: "autoresearch",
+					phase: "research",
+					active: true,
+					session_id: sessionId,
+					updated_at: "2026-10-08T18:00:00.000Z",
+				},
+				{
+					skill: "ralplan",
+					phase: "pending-approval",
+					active: true,
+					session_id: sessionId,
+					updated_at: "2026-10-08T18:01:00.000Z",
+				},
+			];
+			await Bun.write(
+				sessionPath,
+				JSON.stringify({ version: 1, active: true, skill: "autoresearch", active_skills: snapshotEntries }),
+			);
+
+			const activeDir = activeStateDir(cwd, sessionId);
+			await fs.mkdir(activeDir, { recursive: true });
+			await Bun.write(path.join(activeDir, "autoresearch.json"), JSON.stringify(snapshotEntries[0]));
+			const beforeMigration = await readVisibleSkillActiveState(cwd, sessionId);
+			expect(beforeMigration?.active_skills?.map(entry => entry.skill)).toEqual(["autoresearch"]);
+
+			const migrationMarker = path.join(path.dirname(activeDir), ".active-entry-migration.pending");
+			await Bun.write(migrationMarker, "pending\n");
+			const duringMigration = await readVisibleSkillActiveState(cwd, sessionId);
+			expect(duringMigration?.active_skills?.map(entry => entry.skill).sort()).toEqual(["autoresearch", "ralplan"]);
+
+			await syncSkillActiveState({
+				cwd,
+				skill: "autoresearch",
+				phase: "running",
+				active: true,
+				sessionId,
+				nowIso: "2026-10-08T19:00:00.000Z",
+			});
+
+			const visible = await readVisibleSkillActiveState(cwd, sessionId);
+			expect(visible?.active_skills?.map(entry => entry.skill).sort()).toEqual(["autoresearch", "ralplan"]);
+			expect(visible?.active_skills?.find(entry => entry.skill === "ralplan")?.phase).toBe("pending-approval");
+			const markerExists = await fs.stat(migrationMarker).then(
+				() => true,
+				error => {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+					throw error;
+				},
+			);
+			expect(markerExists).toBe(false);
+		});
+	});
+
 	it("chooses the most advanced active pipeline stage as snapshot primary regardless of file order", async () => {
 		await withTempCwd(async cwd => {
 			const activeDir = path.join(cwd, ".gjc", "_session-sess1", "state", "active");
