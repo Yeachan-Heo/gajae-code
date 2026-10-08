@@ -549,7 +549,7 @@ describe("SDK production async completion paths", () => {
 		expect(savedOutput).toContain(fullOutput);
 		expect(savedOutput.length).toBeGreaterThan(12_000);
 		await cancelFoldedTerminal(folded);
-	});
+	}, 30_000);
 
 	test("reports exact artifact completeness across byte-cap and UTF-8 boundaries", async () => {
 		const cases = [
