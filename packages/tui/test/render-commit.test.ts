@@ -444,7 +444,6 @@ describe("generation-scoped render commits", () => {
 		terminal.flush = async () => {
 			flushStarted.resolve();
 			await flushGate.promise;
-			return true;
 		};
 		const held = tui.submitTerminalOutput({
 			token: lease.token,
