@@ -25,6 +25,7 @@ export interface ImageBudget {
 }
 
 /** SVG user units per terminal row; a 1000-unit-wide drawing spans ~125 columns of 1:2 cells. */
+// biome-ignore lint/correctness/noUnusedVariables: documented design constant
 const UNITS_PER_ROW = 16;
 /** Least time between rasters of a fence that is still streaming. */
 const STREAM_INTERVAL_MS = 200;
