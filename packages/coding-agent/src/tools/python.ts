@@ -297,6 +297,13 @@ export function createSessionPythonTool(input: SessionPythonToolInput): AgentToo
 					signal?.removeEventListener("abort", abortFromCaller);
 					contextGeneration.abortControllers.delete(abortController);
 				});
+			const settled = execution.then(
+				() => {},
+				() => {},
+			);
+			contextGeneration.completions.add(settled);
+			void settled.then(() => contextGeneration.completions.delete(settled));
+
 			let completion: Promise<AgentToolResult>;
 			try {
 				completion = input.trackEvalExecution ? input.trackEvalExecution(execution, abortController) : execution;
@@ -308,12 +315,6 @@ export function createSessionPythonTool(input: SessionPythonToolInput): AgentToo
 				void execution.catch(() => {});
 				throw error;
 			}
-			const settled = completion.then(
-				() => {},
-				() => {},
-			);
-			contextGeneration.completions.add(settled);
-			void settled.then(() => contextGeneration.completions.delete(settled));
 			return await completion;
 		},
 	};
