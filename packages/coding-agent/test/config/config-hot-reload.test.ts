@@ -546,4 +546,53 @@ describe("configuration hot reload watcher", () => {
 		await Bun.sleep(140);
 		expect(calls).toHaveLength(1);
 	});
+
+	test("does not report watcher initialization failures from a retired binding", async () => {
+		const directory = await temporaryDirectory();
+		const firstDirectory = path.join(directory, "first");
+		const firstPaths = await configPaths(firstDirectory);
+		const nextPaths = await configPaths(path.join(directory, "next"));
+		const errors: ConfigHotReloadError[] = [];
+		const watcher = createWatcher(
+			() => {},
+			error => {
+				errors.push(error);
+			},
+		);
+		const realStat = fs.stat;
+		const delayedStat = Promise.withResolvers<nodeFs.Stats>();
+		let firstDirectoryStatCalls = 0;
+		let statBlocked = false;
+		let statSettled = false;
+		const statSpy = spyOn(fs, "stat").mockImplementation(
+			new Proxy(realStat, {
+				apply(target, receiver, args) {
+					if (String(args[0]) === firstDirectory) {
+						firstDirectoryStatCalls++;
+						if (firstDirectoryStatCalls === 3) {
+							statBlocked = true;
+							return delayedStat.promise;
+						}
+					}
+					return Reflect.apply(target, receiver, args);
+				},
+			}),
+		);
+		const starting = watcher.start(firstPaths);
+		try {
+			await waitFor(() => (statBlocked ? true : undefined));
+			await watcher.rebind(nextPaths);
+			statSettled = true;
+			delayedStat.reject(new Error("retired watcher initialization failure"));
+			await starting;
+			expect(errors).toEqual([]);
+		} finally {
+			if (!statSettled) {
+				statSettled = true;
+				delayedStat.reject(new Error("test cleanup"));
+			}
+			statSpy.mockRestore();
+			await starting.catch(() => {});
+		}
+	});
 });

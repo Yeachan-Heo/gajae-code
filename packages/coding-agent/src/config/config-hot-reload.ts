@@ -426,6 +426,7 @@ export class ConfigHotReloadWatcher {
 			binding.watcherIdentities.set(directory, identity);
 			this.#clearErrors("watch", directory);
 		} catch (error) {
+			if (!this.#isCurrent(binding)) return;
 			attempted.add(directory);
 			this.#report("watch", error, directory);
 			this.#scheduleWatcherRecovery(binding);
