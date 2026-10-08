@@ -5,7 +5,7 @@ import {
 	isCodexGpt56Tier,
 	isCodexProductTransport,
 } from "./context-cap-policy";
-import { applyOpenAIModelPricing } from "./model-pricing";
+import { applyAnthropicModelPricing, applyOpenAIModelPricing } from "./model-pricing";
 import {
 	isAuditedOpenAIReasoningTransport,
 	parseDirectXaiReasoningEffortGeneration,
@@ -56,6 +56,9 @@ const DEFAULT_REASONING_EFFORTS_WITH_XHIGH_AND_MAX: readonly Effort[] = [
 	Effort.XHigh,
 	Effort.Max,
 ];
+// Anthropic documents low..max for Haiku 5.5; unlike the shared range, it excludes minimal.
+// https://platform.claude.com/docs/en/build-with-claude/thinking-steering-and-cost#effort-levels
+const CLAUDE_HAIKU_5_5_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max];
 const GEMINI_3_PRO_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High];
 const GEMINI_3_FLASH_EFFORTS: readonly Effort[] = [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High];
 // Gemini 3.7 Flash dropped `minimal`; the official API returns an error for it.
@@ -96,7 +99,7 @@ type SemVer = {
 };
 
 type GeminiKind = "pro" | "flash";
-type AnthropicKind = "opus" | "sonnet" | "fable";
+type AnthropicKind = "opus" | "sonnet" | "fable" | "haiku";
 type OpenAIVariant =
 	| "astra"
 	| "base"
@@ -517,6 +520,16 @@ export function hasOpus47ApiRestrictions(modelId: string): boolean {
 	return semverGte(parsed.version, "4.7") && parsed.kind === "opus";
 }
 
+/** Returns true for Anthropic model generations that reject sampling parameters. */
+export function hasAnthropicSamplingParameterRestrictions(modelId: string): boolean {
+	const parsed = parseAnthropicModel(getCanonicalModelId(modelId));
+	if (!parsed) return false;
+	return (
+		(parsed.kind === "opus" && semverGte(parsed.version, "4.7")) ||
+		(parsed.kind === "haiku" && semverEqual(parsed.version, "5.5"))
+	);
+}
+
 /**
  * Adaptive thinking `display` is supported starting with Anthropic Opus 4.7.
  * Older adaptive-thinking models (Opus 4.6, Sonnet 4.6+) reject the field.
@@ -555,6 +568,7 @@ function anthropicModelHasRealXHighEffort<TApi extends Api>(model: ApiModel<TApi
 
 function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 	applyOpenAIModelPricing(model);
+	applyAnthropicModelPricing(model);
 	const copilotLimits = model.provider === "github-copilot" ? COPILOT_GENERATED_LIMITS[model.id] : undefined;
 	if (copilotLimits) {
 		model.contextWindow = copilotLimits.contextWindow;
@@ -837,6 +851,16 @@ function inferDefaultEffort<TApi extends Api>(model: ApiModel<TApi>, parsedModel
 	if (model.provider === "kimi-code" && model.id === "k3") {
 		return Effort.High;
 	}
+	// Anthropic documents medium as Haiku 5.5's default effort.
+	// https://platform.claude.com/docs/en/models/overview
+	if (
+		parsedModel.family === "anthropic" &&
+		parsedModel.kind === "haiku" &&
+		semverEqual(parsedModel.version, "5.5") &&
+		(model.api === "anthropic-messages" || model.api === "bedrock-converse-stream")
+	) {
+		return Effort.Medium;
+	}
 	if (
 		parsedModel.family === "openai" &&
 		model.provider === "openai-codex" &&
@@ -993,6 +1017,9 @@ function inferAnthropicSupportedEfforts<TApi extends Api>(
 		(model.api === "anthropic-messages" || model.api === "bedrock-converse-stream") &&
 		semverGte(parsedModel.version, "4.6")
 	) {
+		if (parsedModel.kind === "haiku" && semverEqual(parsedModel.version, "5.5")) {
+			return model.api === "anthropic-messages" ? CLAUDE_HAIKU_5_5_EFFORTS : DEFAULT_REASONING_EFFORTS;
+		}
 		if (parsedModel.kind === "fable") {
 			// Fable exposes Anthropic's Messages-only xhigh preset; Bedrock
 			// Converse lacks it (same split as Opus 4.7+ below).
@@ -1116,7 +1143,7 @@ function parseGeminiModel(modelId: string): GeminiModel | null {
 }
 
 function parseAnthropicModel(modelId: string): AnthropicModel | null {
-	const match = /claude-(opus|sonnet|fable)-(\d{1,2}(?:[.-]\d{1,2}){0,2})\b/.exec(modelId);
+	const match = /claude-(opus|sonnet|fable|haiku)-(\d{1,2}(?:[.-]\d{1,2}){0,2})\b/.exec(modelId);
 	if (!match) {
 		return null;
 	}

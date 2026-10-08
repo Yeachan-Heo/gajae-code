@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { registerProviderSafetyStopModel } from "./adapter-internals/provider-safety-stop";
-import { getOpenAIModelCost } from "./model-pricing";
+import { getAnthropicModelCost, getOpenAIModelCost } from "./model-pricing";
 import { isRetiredModelKey } from "./model-retirements";
 import { applyGeneratedModelPolicies, enrichModelThinking } from "./model-thinking";
 // `with { type: "file" }` is embedded by `bun build --compile` and resolves to
@@ -105,7 +105,7 @@ export function getBundledModels(provider: GeneratedProvider): Model<Api>[] {
 
 export function calculateCost<TApi extends Api>(model: Model<TApi>, usage: Usage): Usage["cost"] {
 	const inputTokens = usage.input + usage.cacheRead + usage.cacheWrite;
-	const pricing = getOpenAIModelCost(model, inputTokens) ?? model.cost;
+	const pricing = getOpenAIModelCost(model, inputTokens) ?? getAnthropicModelCost(model, inputTokens) ?? model.cost;
 	usage.cost.input = (pricing.input / 1000000) * usage.input;
 	usage.cost.output = (pricing.output / 1000000) * usage.output;
 	usage.cost.cacheRead = (pricing.cacheRead / 1000000) * usage.cacheRead;

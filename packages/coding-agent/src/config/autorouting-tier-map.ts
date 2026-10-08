@@ -1117,6 +1117,9 @@ export const TIER_MAP_SKIP_LIST = {
 		rationale: "pre-feature baseline; not yet curated",
 	},
 	"amazon-bedrock/anthropic.claude-fable-5": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
+	"amazon-bedrock/anthropic.claude-haiku-5-5": {
+		rationale: "PR #6483 Haiku 5.5 Bedrock selector; not separately tier-curated",
+	},
 	"amazon-bedrock/anthropic.claude-opus-4-6-v1": {
 		baseline: true,
 		rationale: "pre-feature baseline; not yet curated",
@@ -1128,6 +1131,9 @@ export const TIER_MAP_SKIP_LIST = {
 	"amazon-bedrock/au.anthropic.claude-haiku-4-5-20251001-v1:0": {
 		baseline: true,
 		rationale: "pre-feature baseline; not yet curated",
+	},
+	"amazon-bedrock/au.anthropic.claude-haiku-5-5": {
+		rationale: "PR #6483 Haiku 5.5 Bedrock selector; not separately tier-curated",
 	},
 	"amazon-bedrock/au.anthropic.claude-opus-4-6-v1": {
 		baseline: true,
@@ -1188,6 +1194,9 @@ export const TIER_MAP_SKIP_LIST = {
 		baseline: true,
 		rationale: "pre-feature baseline; not yet curated",
 	},
+	"amazon-bedrock/eu.anthropic.claude-haiku-5-5": {
+		rationale: "PR #6483 Haiku 5.5 Bedrock selector; not separately tier-curated",
+	},
 	"amazon-bedrock/eu.anthropic.claude-opus-4-1-20250805-v1:0": {
 		baseline: true,
 		rationale: "pre-feature baseline; not yet curated",
@@ -1241,6 +1250,9 @@ export const TIER_MAP_SKIP_LIST = {
 		baseline: true,
 		rationale: "pre-feature baseline; not yet curated",
 	},
+	"amazon-bedrock/global.anthropic.claude-haiku-5-5": {
+		rationale: "PR #6483 Haiku 5.5 Bedrock selector; not separately tier-curated",
+	},
 	"amazon-bedrock/global.anthropic.claude-opus-4-5-20251101-v1:0": {
 		baseline: true,
 		rationale: "pre-feature baseline; not yet curated",
@@ -1282,6 +1294,9 @@ export const TIER_MAP_SKIP_LIST = {
 	"amazon-bedrock/jp.anthropic.claude-haiku-4-5-20251001-v1:0": {
 		baseline: true,
 		rationale: "pre-feature baseline; not yet curated",
+	},
+	"amazon-bedrock/jp.anthropic.claude-haiku-5-5": {
+		rationale: "PR #6483 Haiku 5.5 Bedrock selector; not separately tier-curated",
 	},
 	"amazon-bedrock/jp.anthropic.claude-opus-4-7": {
 		baseline: true,
@@ -1411,6 +1426,9 @@ export const TIER_MAP_SKIP_LIST = {
 		baseline: true,
 		rationale: "pre-feature baseline; not yet curated",
 	},
+	"amazon-bedrock/us.anthropic.claude-haiku-5-5": {
+		rationale: "PR #6483 Haiku 5.5 Bedrock selector; not separately tier-curated",
+	},
 	"amazon-bedrock/us.anthropic.claude-opus-4-1-20250805-v1:0": {
 		baseline: true,
 		rationale: "pre-feature baseline; not yet curated",
@@ -1492,6 +1510,7 @@ export const TIER_MAP_SKIP_LIST = {
 	"anthropic/claude-3-haiku-20240307": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"anthropic/claude-fable-5": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"anthropic/claude-fable-5-1": { rationale: "post-feature catalog addition; not yet curated" },
+	"anthropic/claude-haiku-4-5": { rationale: "previous fast-tier model; not separately tier-curated" },
 	"anthropic/claude-haiku-4-5-20251001": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"anthropic/claude-opus-4-0": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"anthropic/claude-opus-4-1": { baseline: true, rationale: "pre-feature baseline; not yet curated" },

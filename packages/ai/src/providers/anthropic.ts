@@ -32,7 +32,7 @@ import {
 } from "../adapter-internals/provider-safety-stop";
 import {
 	getMiniMaxThinkingMode,
-	hasOpus47ApiRestrictions,
+	hasAnthropicSamplingParameterRestrictions,
 	mapEffortToAnthropicAdaptiveEffort,
 	supportsAnthropicAdaptiveThinkingDisplay as supportsAdaptiveThinkingDisplay,
 } from "../model-thinking";
@@ -3736,8 +3736,8 @@ function buildParams(
 			seqs.length > ANTHROPIC_STOP_SEQUENCES_MAX ? seqs.slice(0, ANTHROPIC_STOP_SEQUENCES_MAX) : seqs;
 	}
 
-	// Opus 4.7+ rejects non-default sampling parameters with 400 error.
-	if (hasOpus47ApiRestrictions(model.id)) {
+	// Opus 4.7+ and Haiku 5.5 reject non-default sampling parameters with 400 errors.
+	if (hasAnthropicSamplingParameterRestrictions(model.id)) {
 		delete params.top_p;
 		delete params.top_k;
 		delete params.temperature;

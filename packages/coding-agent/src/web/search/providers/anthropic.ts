@@ -5,6 +5,7 @@
  * Returns synthesized answers with citations and source metadata.
  */
 import type { AuthStorage } from "@gajae-code/ai/core";
+import { hasAnthropicSamplingParameterRestrictions } from "@gajae-code/ai/model-thinking";
 import {
 	type AnthropicSystemBlock,
 	buildAnthropicSystemBlocks,
@@ -132,7 +133,7 @@ async function callSearch(
 		],
 	};
 
-	if (temperature !== undefined) {
+	if (temperature !== undefined && !hasAnthropicSamplingParameterRestrictions(model)) {
 		body.temperature = temperature;
 	}
 

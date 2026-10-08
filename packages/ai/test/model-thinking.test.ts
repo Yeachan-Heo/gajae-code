@@ -6,6 +6,7 @@ import {
 	Effort,
 	enrichModelThinking,
 	getSupportedEfforts,
+	hasAnthropicSamplingParameterRestrictions,
 	linkOpenAIPromotionTargets,
 	mapEffortToAnthropicAdaptiveEffort,
 	mapEffortToGoogleThinkingLevel,
@@ -56,6 +57,34 @@ describe("thinking control modes", () => {
 });
 
 describe("model thinking metadata", () => {
+	it("resolves Haiku 5.5 defaults with separate Anthropic and Bedrock thinking modes", () => {
+		const anthropic = getBundledModel("anthropic", "claude-haiku-5-5");
+		const bedrock = getBundledModel("amazon-bedrock", "anthropic.claude-haiku-5-5");
+
+		expect(anthropic.thinking).toEqual({
+			mode: "anthropic-adaptive",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
+			defaultLevel: Effort.Medium,
+		});
+		expect(getSupportedEfforts(anthropic)).toEqual([
+			Effort.Low,
+			Effort.Medium,
+			Effort.High,
+			Effort.XHigh,
+			Effort.Max,
+		]);
+		expect(bedrock.thinking).toEqual({
+			mode: "anthropic-budget-effort",
+			minLevel: Effort.Minimal,
+			maxLevel: Effort.High,
+			defaultLevel: Effort.Medium,
+		});
+		expect(hasAnthropicSamplingParameterRestrictions("claude-haiku-5-5")).toBe(true);
+		expect(hasAnthropicSamplingParameterRestrictions("anthropic.claude-haiku-5-5")).toBe(true);
+		expect(hasAnthropicSamplingParameterRestrictions("claude-haiku-4-5")).toBe(false);
+	});
+
 	it("fails closed when a reasoning model lacks thinking metadata", () => {
 		const model = createModel({
 			id: "claude-sonnet-4-5",
@@ -396,6 +425,36 @@ describe("model thinking metadata", () => {
 });
 
 describe("generated model policies", () => {
+	it("keeps Sonnet 5.5 cache pricing and Haiku 5.5 long-context pricing on regeneration", () => {
+		const models: Model<Api>[] = [
+			{
+				...createModel({ id: "claude-sonnet-5-5", api: "anthropic-messages", provider: "anthropic" }),
+				cost: { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },
+			},
+			{
+				...createModel({
+					id: "au.anthropic.claude-sonnet-5-5",
+					api: "bedrock-converse-stream",
+					provider: "amazon-bedrock",
+				}),
+				cost: { input: 2.2, output: 11, cacheRead: 0.22, cacheWrite: 2.75 },
+			},
+			{
+				...createModel({ id: "claude-haiku-5-5", api: "anthropic-messages", provider: "anthropic" }),
+				cost: { input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125 },
+			},
+		];
+
+		applyGeneratedModelPolicies(models);
+
+		expect(models[0]?.cost.cacheRead).toBe(0.1);
+		expect(models[1]?.cost.cacheRead).toBeCloseTo(0.11, 12);
+		expect(models[2]?.longContextPricing).toEqual({
+			threshold: 100_000,
+			cost: { input: 0.5, output: 2.5, cacheRead: 0.05, cacheWrite: 0.625 },
+		});
+	});
+
 	it("corrects stale direct xAI Grok reasoning metadata before enrichment", () => {
 		const models = [
 			createModel({ id: "grok-4.5", api: "openai-completions", provider: "xai", reasoning: false }),

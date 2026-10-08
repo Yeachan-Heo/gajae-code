@@ -230,6 +230,62 @@ describe("calculateCost", () => {
 		});
 	});
 
+	it("generates Haiku 5.5 long-context prices for Anthropic and every Bedrock selector", () => {
+		const selectors = [
+			{ provider: "anthropic", id: "claude-haiku-5-5" },
+			{ provider: "amazon-bedrock", id: "anthropic.claude-haiku-5-5" },
+			{ provider: "amazon-bedrock", id: "au.anthropic.claude-haiku-5-5" },
+			{ provider: "amazon-bedrock", id: "eu.anthropic.claude-haiku-5-5" },
+			{ provider: "amazon-bedrock", id: "global.anthropic.claude-haiku-5-5" },
+			{ provider: "amazon-bedrock", id: "jp.anthropic.claude-haiku-5-5" },
+			{ provider: "amazon-bedrock", id: "us.anthropic.claude-haiku-5-5" },
+		] as const;
+		const rawCatalog = modelsJson as Record<string, Record<string, Model>>;
+
+		for (const { provider, id } of selectors) {
+			const rawModel = rawCatalog[provider]?.[id];
+			if (!rawModel) throw new Error(`Missing bundled model ${provider}/${id}`);
+			const expectedLongCost = {
+				input: rawModel.cost.input * 5,
+				output: rawModel.cost.output * 5,
+				cacheRead: rawModel.cost.cacheRead * 5,
+				cacheWrite: rawModel.cost.cacheWrite * 5,
+			};
+			expect(rawModel.longContextPricing).toEqual({ threshold: 100_000, cost: expectedLongCost });
+			expect(getBundledModel(provider, id).longContextPricing).toEqual({
+				threshold: 100_000,
+				cost: expectedLongCost,
+			});
+		}
+	});
+
+	it("switches Haiku 5.5 to 5x pricing only above 100K prompt tokens", () => {
+		const model = getBundledModel("anthropic", "claude-haiku-5-5");
+		const usage = (cacheWrite: number): Usage => ({
+			input: 99_000,
+			output: 100,
+			cacheRead: 1_000,
+			cacheWrite,
+			totalTokens: 100_100 + cacheWrite,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
+		const atThreshold = usage(0);
+		const aboveThreshold = usage(1);
+
+		calculateCost(model, atThreshold);
+		calculateCost(model, aboveThreshold);
+
+		expect(atThreshold.cost.input).toBeCloseTo(0.0099, 10);
+		expect(atThreshold.cost.output).toBeCloseTo(0.00005, 10);
+		expect(atThreshold.cost.cacheRead).toBeCloseTo(0.00001, 10);
+		expect(atThreshold.cost.total).toBeCloseTo(0.00996, 10);
+		expect(aboveThreshold.cost.input).toBeCloseTo(0.0495, 10);
+		expect(aboveThreshold.cost.output).toBeCloseTo(0.00025, 10);
+		expect(aboveThreshold.cost.cacheRead).toBeCloseTo(0.00005, 10);
+		expect(aboveThreshold.cost.cacheWrite).toBeCloseTo(0.000000625, 10);
+		expect(aboveThreshold.cost.total).toBeCloseTo(0.049800625, 10);
+	});
+
 	it("switches GPT-6 Sol pricing only above 272K input tokens", () => {
 		const model = getBundledModel("openai-codex", "gpt-6-sol");
 		const usage = (cacheWrite: number): Usage => ({

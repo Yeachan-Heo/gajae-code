@@ -84,6 +84,59 @@ const OPENAI_GPT_5_6_PRICING: ReadonlyMap<string, TieredPricing> = new Map([
 	],
 ]);
 
+const CLAUDE_HAIKU_5_5_LONG_CONTEXT_THRESHOLD = 100_000;
+
+function firstPartyClaudeModelId<TApi extends Api>(model: Model<TApi>): string | undefined {
+	if (model.provider === "anthropic" && model.api === "anthropic-messages") {
+		return model.id;
+	}
+	if (model.provider === "amazon-bedrock" && model.api === "bedrock-converse-stream") {
+		return model.id.replace(/^(?:au|eu|global|jp|us)\./, "").replace(/^anthropic\./, "");
+	}
+	return undefined;
+}
+
+function multiplyCost(cost: ModelCost, multiplier: number): ModelCost {
+	return {
+		input: cost.input * multiplier,
+		output: cost.output * multiplier,
+		cacheRead: cost.cacheRead * multiplier,
+		cacheWrite: cost.cacheWrite * multiplier,
+	};
+}
+
+/** Persist first-party Anthropic pricing corrections into the generated catalog. */
+export function applyAnthropicModelPricing<TApi extends Api>(model: Model<TApi>): void {
+	const modelId = firstPartyClaudeModelId(model);
+	if (modelId === "claude-sonnet-5-5") {
+		// Anthropic documents Sonnet 5.5 cache hits at 5% of base input, not 10%.
+		// https://platform.claude.com/docs/en/about-claude/pricing#model-pricing
+		model.cost.cacheRead = Number((model.cost.input / 20).toPrecision(12));
+	}
+	if (modelId === "claude-haiku-5-5") {
+		// Haiku 5.5 charges 5x each rate when the prompt exceeds 100,000 tokens.
+		// https://platform.claude.com/docs/en/about-claude/pricing#model-pricing
+		model.longContextPricing = {
+			threshold: CLAUDE_HAIKU_5_5_LONG_CONTEXT_THRESHOLD,
+			cost: multiplyCost(model.cost, 5),
+		};
+	}
+}
+
+/** Return the audited Haiku 5.5 over-100K rates for first-party Anthropic routes. */
+export function getAnthropicModelCost<TApi extends Api>(
+	model: Model<TApi>,
+	inputTokens: number,
+): ModelCost | undefined {
+	if (
+		firstPartyClaudeModelId(model) !== "claude-haiku-5-5" ||
+		inputTokens <= CLAUDE_HAIKU_5_5_LONG_CONTEXT_THRESHOLD
+	) {
+		return undefined;
+	}
+	return multiplyCost(model.cost, 5);
+}
+
 export function getOpenAIModelCost<TApi extends Api>(model: Model<TApi>, inputTokens: number): ModelCost | undefined {
 	if (model.provider !== "openai" && model.provider !== "openai-codex") {
 		return undefined;

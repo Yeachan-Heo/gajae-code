@@ -21,6 +21,7 @@ import { getClaudeCodeVersion } from "@gajae-code/ai/providers/claude-code-versi
 import { getEnvApiKey } from "@gajae-code/ai/stream";
 import type { Context, Model, TJsonSchema, Tool } from "@gajae-code/ai/types";
 import * as z from "zod/v4";
+import { getBundledModel } from "../src/models";
 import { withEnv } from "./helpers";
 
 const ANTHROPIC_MODEL: Model<"anthropic-messages"> = {
@@ -1133,6 +1134,36 @@ describe("Anthropic request fingerprint alignment", () => {
 		expect(payload.top_p).toBeUndefined();
 		expect(payload.top_k).toBeUndefined();
 		expect(payload.thinking).toBeUndefined();
+	});
+
+	it("sends bundled Haiku 5.5 adaptive effort without unsupported sampling parameters", async () => {
+		const model = getBundledModel<"anthropic-messages">("anthropic", "claude-haiku-5-5");
+		const payload = (await captureAnthropicPayload(
+			model,
+			{
+				systemPrompt: ["Stay concise."],
+				messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+			},
+			{
+				thinkingEnabled: true,
+				reasoning: Effort.Medium,
+				temperature: 0.2,
+				topP: 0.3,
+				topK: 4,
+			},
+		)) as {
+			temperature?: number;
+			top_p?: number;
+			top_k?: number;
+			thinking?: { type?: string; budget_tokens?: number };
+			output_config?: { effort?: string };
+		};
+
+		expect(payload.temperature).toBeUndefined();
+		expect(payload.top_p).toBeUndefined();
+		expect(payload.top_k).toBeUndefined();
+		expect(payload.thinking).toEqual({ type: "adaptive" });
+		expect(payload.output_config).toEqual({ effort: "medium" });
 	});
 
 	it("drops sampling params and requests summarized adaptive thinking for Opus 4.7", async () => {
