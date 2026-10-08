@@ -412,6 +412,259 @@ test("dispatcher build failures schedule a delayed idle retry", async () => {
 	expect(queue.has("persistent-build-failure")).toBe(true);
 });
 
+test("stale-check failures retain the failed FIFO suffix for a delayed retry", async () => {
+	const scheduled: Array<{ run: (signal?: AbortSignal) => Promise<void>; delayMs: number | undefined }> = [];
+	const delivered: string[][] = [];
+	const staleChecks: string[] = [];
+	let failFirstCheck = true;
+	const queue = new YieldQueue({
+		isStreaming: () => false,
+		injectStreaming: () => {},
+		injectIdle: async () => "delivered",
+		scheduleIdleFlush: (run, _onSkip, delayMs) => scheduled.push({ run, delayMs }),
+	});
+	queue.register<string>("stale-check-failure", {
+		isStale: entry => {
+			staleChecks.push(entry);
+			if (entry === "A" && failFirstCheck) throw new Error("temporary stale-check failure");
+			return false;
+		},
+		build: entries => {
+			delivered.push([...entries]);
+			return {
+				role: "custom",
+				customType: "async-result",
+				content: entries.join(","),
+				display: true,
+				attribution: "agent",
+				details: {},
+				timestamp: 1,
+			};
+		},
+	});
+	queue.enqueue("stale-check-failure", "A");
+	queue.enqueue("stale-check-failure", "B");
+
+	await queue.flush("idle");
+
+	expect(staleChecks).toEqual(["A"]);
+	expect(delivered).toEqual([]);
+	expect(scheduled[1]?.delayMs).toBe(1_000);
+	expect(queue.has("stale-check-failure")).toBe(true);
+	await scheduled[0]!.run();
+	expect(staleChecks).toEqual(["A"]);
+
+	failFirstCheck = false;
+	await scheduled[1]!.run();
+
+	expect(staleChecks).toEqual(["A", "A", "B"]);
+	expect(delivered).toEqual([["A", "B"]]);
+	expect(queue.has("stale-check-failure")).toBe(false);
+});
+
+test("stale-check retry delay survives a streaming turn and preserves prefix delivery", async () => {
+	const scheduled: Array<{ run: (signal?: AbortSignal) => Promise<void>; delayMs: number | undefined }> = [];
+	const staleChecks: string[] = [];
+	const deliveries: string[] = [];
+	let streaming = true;
+	let failA = true;
+	const queue = new YieldQueue({
+		isStreaming: () => streaming,
+		injectStreaming: message => {
+			if (message.role === "custom") deliveries.push(`stream:${message.content}`);
+		},
+		injectIdle: async messages => {
+			for (const message of messages) {
+				if (message.role === "custom") deliveries.push(`idle:${message.content}`);
+			}
+			return "delivered";
+		},
+		scheduleIdleFlush: (run, _onSkip, delayMs) => scheduled.push({ run, delayMs }),
+	});
+	queue.register<string>("streaming-stale-check-failure", {
+		isStale: entry => {
+			staleChecks.push(entry);
+			if (entry === "A" && failA) throw new Error("temporary stale-check failure");
+			return false;
+		},
+		build: entries => ({
+			role: "custom",
+			customType: "async-result",
+			content: entries.join(","),
+			display: true,
+			attribution: "agent",
+			details: {},
+			timestamp: 1,
+		}),
+	});
+	queue.enqueue("streaming-stale-check-failure", "prefix");
+	queue.enqueue("streaming-stale-check-failure", "A");
+	queue.enqueue("streaming-stale-check-failure", "B");
+
+	await queue.flush("streaming");
+
+	expect(staleChecks).toEqual(["prefix", "A"]);
+	expect(deliveries).toEqual(["stream:prefix"]);
+	expect(queue.has("streaming-stale-check-failure")).toBe(true);
+	expect(scheduled).toHaveLength(0);
+
+	streaming = false;
+	queue.rearmIdle();
+	expect(scheduled[0]?.delayMs).toBe(1_000);
+	failA = false;
+	await scheduled[0]!.run();
+
+	expect(staleChecks).toEqual(["prefix", "A", "A", "B"]);
+	expect(deliveries).toEqual(["stream:prefix", "idle:A,B"]);
+	expect(queue.has("streaming-stale-check-failure")).toBe(false);
+});
+
+test("retry delay survives a scheduled wake that arrives during streaming", async () => {
+	const scheduled: Array<{ run: (signal?: AbortSignal) => Promise<void>; delayMs: number | undefined }> = [];
+	const delivered: string[] = [];
+	let streaming = false;
+	let failBuild = true;
+	const queue = new YieldQueue({
+		isStreaming: () => streaming,
+		injectStreaming: () => {},
+		injectIdle: async messages => {
+			for (const message of messages) if (message.role === "custom") delivered.push(message.content as string);
+			return "delivered";
+		},
+		scheduleIdleFlush: (run, _onSkip, delayMs) => scheduled.push({ run, delayMs }),
+	});
+	queue.register<string>("scheduled-during-streaming", {
+		build: entries => {
+			if (failBuild) throw new Error("temporary build failure");
+			return {
+				role: "custom",
+				customType: "async-result",
+				content: entries.join(","),
+				display: true,
+				attribution: "agent",
+				details: {},
+				timestamp: 1,
+			};
+		},
+	});
+	queue.enqueue("scheduled-during-streaming", "retry me");
+	await queue.flush("idle");
+	expect(scheduled[1]!.delayMs).toBe(1_000);
+
+	streaming = true;
+	await scheduled[1]!.run();
+	expect(queue.has("scheduled-during-streaming")).toBe(true);
+
+	streaming = false;
+	queue.rearmIdle();
+	expect(scheduled[2]!.delayMs).toBe(1_000);
+	failBuild = false;
+	await queue.flush("idle");
+	await scheduled[2]!.run();
+	expect(delivered).toEqual(["retry me"]);
+
+	queue.enqueue("scheduled-during-streaming", "fresh entry");
+	expect(scheduled[3]!.delayMs).toBeUndefined();
+});
+
+test("successful direct retry does not delay new work enqueued during injection", async () => {
+	const scheduled: Array<{ run: (signal?: AbortSignal) => Promise<void>; delayMs: number | undefined }> = [];
+	const injectionStarted = Promise.withResolvers<void>();
+	const releaseInjection = Promise.withResolvers<void>();
+	const delivered: string[] = [];
+	let streaming = false;
+	let failBuild = true;
+	const queue = new YieldQueue({
+		isStreaming: () => streaming,
+		injectStreaming: () => {},
+		injectIdle: async messages => {
+			for (const message of messages) if (message.role === "custom") delivered.push(message.content as string);
+			injectionStarted.resolve();
+			await releaseInjection.promise;
+			return "delivered";
+		},
+		scheduleIdleFlush: (run, _onSkip, delayMs) => scheduled.push({ run, delayMs }),
+	});
+	queue.register<string>("direct-retry-success", {
+		build: entries => {
+			if (failBuild) throw new Error("temporary build failure");
+			return {
+				role: "custom",
+				customType: "async-result",
+				content: entries.join(","),
+				display: true,
+				attribution: "agent",
+				details: {},
+				timestamp: 1,
+			};
+		},
+	});
+	queue.enqueue("direct-retry-success", "retried entry");
+	await queue.flush("idle");
+	expect(scheduled[1]!.delayMs).toBe(1_000);
+
+	streaming = true;
+	await scheduled[1]!.run();
+	streaming = false;
+	failBuild = false;
+	const directFlush = queue.flush("idle");
+	await injectionStarted.promise;
+	queue.enqueue("direct-retry-success", "fresh entry");
+	expect(scheduled[2]!.delayMs).toBeUndefined();
+	releaseInjection.resolve();
+	await directFlush;
+	await scheduled[2]!.run();
+
+	expect(delivered).toEqual(["retried entry", "fresh entry"]);
+});
+
+test("an invalidated retry onSkip cannot delay a new queue owner", async () => {
+	const scheduled: Array<{
+		run: (signal?: AbortSignal) => Promise<void>;
+		onSkip: () => void;
+		delayMs: number | undefined;
+	}> = [];
+	const delivered: string[] = [];
+	let failBuild = true;
+	const queue = new YieldQueue({
+		isStreaming: () => false,
+		injectStreaming: () => {},
+		injectIdle: async messages => {
+			for (const message of messages) if (message.role === "custom") delivered.push(message.content as string);
+			return "delivered";
+		},
+		scheduleIdleFlush: (run, onSkip, delayMs) => scheduled.push({ run, onSkip, delayMs }),
+	});
+	queue.register<string>("retry-owner", {
+		build: entries => {
+			if (failBuild) throw new Error("temporary build failure");
+			return {
+				role: "custom",
+				customType: "async-result",
+				content: entries.join(","),
+				display: true,
+				attribution: "agent",
+				details: {},
+				timestamp: 1,
+			};
+		},
+	});
+	queue.enqueue("retry-owner", "old entry");
+	await queue.flush("idle");
+	expect(scheduled[1]!.delayMs).toBe(1_000);
+
+	queue.clearKind("retry-owner");
+	failBuild = false;
+	queue.enqueue("retry-owner", "fresh entry");
+	expect(scheduled[2]!.delayMs).toBeUndefined();
+	scheduled[1]!.onSkip();
+	await scheduled[2]!.run();
+	expect(delivered).toEqual(["fresh entry"]);
+
+	queue.enqueue("retry-owner", "next entry");
+	expect(scheduled[3]!.delayMs).toBeUndefined();
+});
+
 test("idle injection rechecks queued identity after a transition clears the kind", async () => {
 	const injectionStarted = Promise.withResolvers<void>();
 	const releaseInjection = Promise.withResolvers<void>();

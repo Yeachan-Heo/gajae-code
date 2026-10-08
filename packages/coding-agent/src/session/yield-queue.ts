@@ -78,6 +78,8 @@ export class YieldQueue {
 	#clearGeneration = 0;
 	#idleFlushPending = false;
 	#idleFlushPendingOwner: symbol | undefined;
+	#idleFlushPendingDelayMs = 0;
+	#idleFlushRetryDelayMs = 0;
 
 	constructor(options: YieldQueueOptions) {
 		this.#options = options;
@@ -97,6 +99,7 @@ export class YieldQueue {
 			if (this.#dispatchers.get(kind) !== stored) return;
 			this.#dispatchers.delete(kind);
 			this.#entries.delete(kind);
+			this.#clearIdleFlushIfEmpty();
 		};
 	}
 
@@ -128,6 +131,8 @@ export class YieldQueue {
 		if (mode === "idle") {
 			this.#idleFlushPending = false;
 			this.#idleFlushPendingOwner = undefined;
+			this.#idleFlushPendingDelayMs = 0;
+			this.#idleFlushRetryDelayMs = 0;
 		}
 		const idleMessages: AgentMessage[] = [];
 		const idleBatches: FlushBatch[] = [];
@@ -200,6 +205,7 @@ export class YieldQueue {
 				logger.warn("Yield queue preserved idle dispatch failed", { error: formatError(error) });
 			}
 		}
+		this.#clearIdleFlushIfEmpty();
 	}
 
 	clear(onDrop?: (kind: string, entries: readonly unknown[]) => void): void {
@@ -217,6 +223,8 @@ export class YieldQueue {
 		this.#entries.clear();
 		this.#idleFlushPending = false;
 		this.#idleFlushPendingOwner = undefined;
+		this.#idleFlushPendingDelayMs = 0;
+		this.#idleFlushRetryDelayMs = 0;
 	}
 
 	/** Drop only the queued entries of a single kind, releasing their claims. */
@@ -225,6 +233,15 @@ export class YieldQueue {
 		const entries = this.#entries.get(kind);
 		if (entries) this.#notifyDropped(this.#dispatchers.get(kind), entries);
 		this.#entries.delete(kind);
+		this.#clearIdleFlushIfEmpty();
+	}
+
+	#clearIdleFlushIfEmpty(): void {
+		if (this.has()) return;
+		this.#idleFlushPending = false;
+		this.#idleFlushPendingOwner = undefined;
+		this.#idleFlushPendingDelayMs = 0;
+		this.#idleFlushRetryDelayMs = 0;
 	}
 
 	/**
@@ -233,37 +250,62 @@ export class YieldQueue {
 	 * fenced are not stranded until an unrelated enqueue or agent yield.
 	 */
 	rearmIdle(delayMs?: number): void {
+		if (delayMs !== undefined) {
+			this.#idleFlushRetryDelayMs = Math.max(this.#idleFlushRetryDelayMs, delayMs);
+			if (this.#idleFlushPending && this.#idleFlushPendingDelayMs < this.#idleFlushRetryDelayMs) {
+				this.#idleFlushPendingOwner = undefined;
+				this.#idleFlushPending = false;
+				this.#idleFlushPendingDelayMs = 0;
+			}
+		}
 		if (this.#options.isStreaming()) return;
 		for (const entries of this.#entries.values()) {
 			if (entries.length > 0) {
-				this.#scheduleIdleFlush(delayMs);
+				this.#scheduleIdleFlush();
 				return;
 			}
 		}
+		this.#idleFlushRetryDelayMs = 0;
 	}
 
-	#scheduleIdleFlush(delayMs?: number): void {
+	#scheduleIdleFlush(): void {
 		if (this.#idleFlushPending) return;
 		this.#idleFlushPending = true;
+		const delayMs = this.#idleFlushRetryDelayMs;
+		this.#idleFlushRetryDelayMs = 0;
+		this.#idleFlushPendingDelayMs = delayMs;
 		const owner = Symbol("idle-flush");
 		this.#idleFlushPendingOwner = owner;
 		const releaseOwner = () => {
 			if (this.#idleFlushPendingOwner !== owner) return;
 			this.#idleFlushPendingOwner = undefined;
 			this.#idleFlushPending = false;
+			this.#idleFlushPendingDelayMs = 0;
 		};
 		try {
 			this.#options.scheduleIdleFlush(
 				async signal => {
+					if (this.#idleFlushPendingOwner !== owner) return;
 					releaseOwner();
-					if (this.#options.isStreaming()) return;
+					if (this.#options.isStreaming()) {
+						if (this.has()) this.#idleFlushRetryDelayMs = Math.max(this.#idleFlushRetryDelayMs, delayMs);
+						return;
+					}
 					await this.flush("idle", signal);
 				},
-				releaseOwner,
-				delayMs,
+				() => {
+					const ownsPendingFlush = this.#idleFlushPendingOwner === owner;
+					releaseOwner();
+					if (ownsPendingFlush && this.has())
+						this.#idleFlushRetryDelayMs = Math.max(this.#idleFlushRetryDelayMs, delayMs);
+				},
+				delayMs > 0 ? delayMs : undefined,
 			);
 		} catch (error) {
+			const ownsPendingFlush = this.#idleFlushPendingOwner === owner;
 			releaseOwner();
+			if (ownsPendingFlush && this.has())
+				this.#idleFlushRetryDelayMs = Math.max(this.#idleFlushRetryDelayMs, delayMs);
 			logger.warn("Yield queue idle flush scheduling failed", { error: formatError(error) });
 		}
 	}
@@ -286,16 +328,17 @@ export class YieldQueue {
 		// to ordinary manager state (e.g. isDeliverySuppressed) or explicit
 		// blocked-continuation/owned-cleanup entries.
 		const survivors: StoredEntry[] = [];
-		for (const entry of entries) {
+		for (let entryIndex = 0; entryIndex < entries.length; entryIndex++) {
+			const entry = entries[entryIndex]!;
 			if (dispatcher.isStale) {
 				let stale: boolean;
 				try {
 					stale = dispatcher.isStale(entry.value);
 				} catch (error) {
 					logger.warn("Yield queue stale check failed", { kind, error: formatError(error) });
-					this.#requeue(kind, [entry]);
+					this.#requeue(kind, entries.slice(entryIndex));
 					this.rearmIdle(DISPATCH_FAILURE_RETRY_DELAY_MS);
-					continue;
+					break;
 				}
 				if (stale) continue;
 			}
