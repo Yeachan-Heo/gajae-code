@@ -7081,32 +7081,37 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				if (settledRow.status === "terminal_ok" || settledRow.status === "failed")
 					deadlineManager.clear(correlation);
 			},
-			() => acceptingGateResolutions,
-			trackGateResolution,
-			options.onInvocationCompletionReconciledForTests,
-			frame => {
-				// Completion can win the durable transaction while a lifecycle end is
-				// still waiting on it. Both publishers must share the same claim.
-				if (typeof frame.commandId !== "string" || typeof frame.turnId !== "string")
-					throw new Error("SDK invocation publication requires a correlation.");
-				const correlation = { commandId: frame.commandId, turnId: frame.turnId };
-				if (frame.type !== "agent_end") {
-					if (!hasClaimedTerminalBoundary(correlation)) runtime.emitEvent(frame);
-					return;
-				}
-				if (!claimTerminalBoundary(correlation)) return;
-				const key = lifecycleCorrelationKey(correlation);
-				const sequenceBefore = runtime.host.events.sequence;
-				try {
-					runtime.emitEvent(frame);
-					terminalBoundaryClaims.setPublicationResult(key, true);
-				} catch (error) {
-					if (runtime.host.events.sequence > sequenceBefore)
+			(
+				trackGateResolution,
+				options.onInvocationCompletionReconciledForTests,
+				frame => {
+					// Completion can win the durable transaction while a lifecycle end is
+					// still waiting on it. Both publishers must share the same claim.
+					if (typeof frame.commandId !== "string" || typeof frame.turnId !== "string")
+						return;
+					const correlation = { commandId: frame.commandId, turnId: frame.turnId };
+					if (frame.type !== "agent_end") {
+						if (!hasClaimedTerminalBoundary(correlation)) runtime.emitEvent(frame);
+						return;
+					}
+					const key = lifecycleCorrelationKey(correlation);
+					if (!claimTerminalBoundary(correlation)) {
+						const previouslyPublished = terminalBoundaryClaims.publicationResult(key) === true;
+						if (previouslyPublished) return;
+						terminalBoundaryClaims.releaseClaim(key);
+						if (!claimTerminalBoundary(correlation)) return;
+					}
+					const sequenceBefore = runtime.host.events.sequence;
+					try {
+						runtime.emitEvent(frame);
 						terminalBoundaryClaims.setPublicationResult(key, true);
-					else terminalBoundaryClaims.releaseClaim(key);
-					throw error;
-				}
-			},
+					} catch (error) {
+						if (runtime.host.events.sequence > sequenceBefore)
+							terminalBoundaryClaims.setPublicationResult(key, true);
+						else terminalBoundaryClaims.releaseClaim(key);
+						throw error;
+					}
+				},
 			acceptedQueueCancellations,
 		);
 		const installProviderDefinitions = (capability: string, definitions: unknown): void => {
