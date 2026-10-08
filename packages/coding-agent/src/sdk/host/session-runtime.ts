@@ -1556,10 +1556,22 @@ export function createInvocationReconciliation(
 				});
 				const failure = sanitizePromptFailure(frame.error);
 				if (preserveDeadlineRecovery) {
-					// When deadline recovery is pending, store the failure in pendingOutcome
-					// rather than setting next.error, which would cause agent_end to terminate prematurely.
-					const failureOutcome = canonicalFailedOutcome(failure, "agent_failed", {}, undefined, diagnostic);
-					(next as unknown as { pendingOutcome?: unknown }).pendingOutcome = failureOutcome;
+					// Preserve an outcome already staged for deadline recovery; use this
+					// failure only when no real terminal has been staged. A synthetic
+					// deadline claim is superseded by the provider's concrete failure.
+					const pendingOutcome = canonicalTerminalOutcome(
+						(next as unknown as { pendingOutcome?: unknown }).pendingOutcome,
+						undefined,
+						failureEvidence(next),
+					);
+					const pendingIsDeadlineClaim =
+						pendingOutcome?.kind === "failed" &&
+						pendingOutcome.code === "prompt_deadline_exceeded" &&
+						pendingOutcome.provenance === "deadline";
+					if (pendingOutcome === undefined || pendingIsDeadlineClaim) {
+						const failureOutcome = canonicalFailedOutcome(failure, "agent_failed", {}, undefined, diagnostic);
+						(next as unknown as { pendingOutcome?: unknown }).pendingOutcome = failureOutcome;
+					}
 				} else if (
 					next.error === undefined ||
 					(next.error.code === "agent_failed" && failure.code !== "agent_failed")
@@ -1975,6 +1987,7 @@ export function createInvocationReconciliation(
 				upgrades: new Set<PromiseWithResolvers<void>>(),
 				errors: [] as unknown[],
 			};
+			const releaseTerminalVisibility = retainPendingTerminalVisibility(recordKey, record);
 			pendingFinalizations.set(recordKey, pending);
 			records.set(recordKey, finalizedRecord);
 			try {
@@ -1996,6 +2009,7 @@ export function createInvocationReconciliation(
 				throw error;
 			} finally {
 				if (pendingFinalizations.get(recordKey) === pending) pendingFinalizations.delete(recordKey);
+				releaseTerminalVisibility();
 			}
 		},
 		async markUncertain(kind, correlation, isCurrent, deadlineMaxAt) {
@@ -6635,15 +6649,24 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					if (!terminalIsCurrent || !pendingTools || pendingToolCount > 0) return false;
 					try {
 						if (!isCurrent() || pendingTools(observation.handle).length > 0) return false;
-						// Commit the authoritative Q26 result before exposing its terminal
+						// Finalize the authoritative Q26 result before exposing its terminal
 						// boundary; a crash between publication and this write would strand
 						// restart recovery with only a hidden pending claim.
-						await reconciliation.noteTransition("prompt", correlation, {
-							type: "agent_end",
-							...(observation.terminalContent === undefined ? {} : { content: observation.terminalContent }),
-							...(observation.terminalHasActivity ? { hasActivity: true } : {}),
-							outcome: terminalOutcome,
-						});
+						await reconciliation.finalizeOutcome(
+							"prompt",
+							correlation,
+							terminalOutcome,
+							isCurrent,
+							terminalOutcome.kind === "failed" && terminalOutcome.providerCode !== undefined
+								? { code: terminalOutcome.providerCode, message: terminalOutcome.message }
+								: undefined,
+							{
+								...(observation.terminalContent === undefined ? {} : { content: observation.terminalContent }),
+								...(observation.terminalHasActivity ? { hasActivity: true } : {}),
+								...(terminalOutcome.kind === "stopped" ? { outcomeKind: "stopped" } : {}),
+							},
+						);
+						if (!isCurrent()) return false;
 						observation.terminalOutcome = terminalOutcome;
 						observation.terminalCommitted = true;
 						observation.clearUnrecordedFailure?.();
