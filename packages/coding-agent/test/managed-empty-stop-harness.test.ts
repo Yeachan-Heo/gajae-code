@@ -139,7 +139,9 @@ describe("managed empty-stop harness local contracts (no connected scenarios)", 
 		expect(parseHarnessPort(value)).toBe(Number(value));
 	});
 	test.each(["", " ", "30199", "30220", "8000", "30200.5", "invalid"])("rejects port %s", value => {
-		expect(() => parseHarnessPort(value)).toThrow("PORT_BASE");
+		withPortBase(undefined, () => {
+			expect(() => parseHarnessPort(value)).toThrow("PORT_BASE");
+		});
 	});
 	test.each(["52440", "52459"])("accepts assigned isolated port %s", value => {
 		withPortBase("52440", () => {

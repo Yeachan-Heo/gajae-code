@@ -295,7 +295,9 @@ export async function runManagedEmptyStopScenario(
 			}));
 			session.setConfiguredModelChain(
 				"default",
-				usesFallback(scenario) ? [`${PROVIDER}/${PRIMARY}`, `${PROVIDER}/${FALLBACK}`] : [`${PROVIDER}/${PRIMARY}`],
+				usesFallback(scenario) || scenario === "nonzero-usage"
+					? [`${PROVIDER}/${PRIMARY}`, `${PROVIDER}/${FALLBACK}`]
+					: [`${PROVIDER}/${PRIMARY}`],
 				"connected-local",
 			);
 			const events: AgentSessionEvent[] = [];

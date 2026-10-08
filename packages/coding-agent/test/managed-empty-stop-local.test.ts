@@ -34,15 +34,21 @@ test.each(
 	),
 )("local session preserves empty-stop request boundary: %j", async ({ scenario, initialization }) => {
 	const models: string[] = [];
-	const server = Bun.serve({
-		hostname: "127.0.0.1",
-		port: parseHarnessPort(process.env.PORT_BASE ?? "0"),
-		fetch: request => handleProviderRequest(request, scenario, models),
-	});
-	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-empty-stop-local-"));
-	const auth = await AuthStorage.create(":memory:");
+	let server: Bun.Server<undefined> | undefined;
+	let root: string | undefined;
+	let auth: AuthStorage | undefined;
 	let session: AgentSession | undefined;
+	let failure: unknown;
+	const errors: unknown[] = [];
 	try {
+		server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: parseHarnessPort(process.env.PORT_BASE ?? "0"),
+			fetch: request => handleProviderRequest(request, scenario, models),
+		});
+		root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-empty-stop-local-"));
+		const workspace = root;
+		auth = await AuthStorage.create(":memory:");
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			"contextPromotion.enabled": false,
@@ -78,7 +84,7 @@ test.each(
 			// Register on the runner that actually drives each session. Without
 			// session_start, production lifecycle observation needs no transport.
 			createSdkSessionRuntimeExtension(api, {
-				agentDir: root,
+				agentDir: workspace,
 				createTransport: () => {
 					throw new Error("Local integration must not launch an SDK transport");
 				},
@@ -133,7 +139,7 @@ test.each(
 		expect(session.extensionRunner?.hasHandlers("agent_start")).toBe(true);
 		session.setConfiguredModelChain(
 			"default",
-			scenario === "nonzero-usage" || scenario.endsWith("disabled")
+			scenario.endsWith("disabled")
 				? ["empty-stop-fixture/primary"]
 				: ["empty-stop-fixture/primary", "empty-stop-fixture/fallback"],
 			"test",
@@ -188,13 +194,27 @@ test.each(
 		if (initialization === "sdk") {
 			await assertManagedTranscript(manager, assistants);
 		}
+	} catch (error) {
+		failure = error;
 	} finally {
-		try {
-			await session?.dispose();
-		} finally {
-			auth.close();
-			server.stop(true);
-			await fs.rm(root, { recursive: true, force: true });
-		}
+		const clean = async (operation: () => unknown | Promise<unknown>) => {
+			try {
+				await operation();
+			} catch (error) {
+				errors.push(error);
+			}
+		};
+		await clean(async () => await session?.dispose());
+		await clean(() => auth?.close());
+		await clean(() => server?.stop(true));
+		// Retain storage if an owner could not close; never abandon the listener.
+		const storage = root;
+		if (errors.length === 0 && storage) await clean(() => fs.rm(storage, { recursive: true, force: true }));
 	}
+	if (errors.length > 0)
+		throw new AggregateError(
+			failure === undefined ? errors : [failure, ...errors],
+			"Local empty-stop cleanup failed",
+		);
+	if (failure !== undefined) throw failure;
 }, 15_000);
