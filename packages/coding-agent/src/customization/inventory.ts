@@ -74,18 +74,6 @@ function redactServerForDisplay(server: Record<string, unknown>): Record<string,
 // Skills
 // ---------------------------------------------------------------------------
 
-async function readImportMarker(skillPath: string): Promise<string | null> {
-	try {
-		const content = await fs.readFile(skillPath, "utf-8");
-		const { frontmatter } = parseFrontmatter(content, { level: "off" });
-		// parseFrontmatter camelCases keys: x-gjc-imported-from → xGjcImportedFrom.
-		const marker = frontmatter[IMPORTED_FROM_FRONTMATTER_KEY] ?? frontmatter.xGjcImportedFrom;
-		return typeof marker === "string" ? marker : null;
-	} catch {
-		return null;
-	}
-}
-
 function importedProductLabel(marker: string): string {
 	return marker === "claude-code" ? "Claude Code" : marker === "codex" ? "Codex" : marker;
 }
@@ -102,7 +90,7 @@ async function loadSkillRows(options: LoadCustomizationInventoryOptions, _warnin
 	for (const record of records) {
 		managedPaths.add(path.resolve(record.path));
 		const scope: GjcScope = record.scope === "project" ? "project" : "global";
-		const marker = await readImportMarker(record.path);
+		const marker = record.importedFrom ?? null;
 		let status: InventoryStatus;
 		const diagnostics: string[] = [];
 		if (options.policy?.enabled === false) {
