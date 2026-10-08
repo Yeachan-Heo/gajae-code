@@ -215,12 +215,12 @@ import {
 	type AsyncJob,
 	type AsyncJobDeliveryState,
 	AsyncJobManager,
-	asyncJobEndpointId as deriveAsyncJobEndpointId,
 	type FoldReason,
 	type JobFoldEvent,
 	type OwnerSubagentShutdownLease,
 	type SubagentLifecycle,
 } from "../async";
+import { asyncJobEndpointId as deriveAsyncJobEndpointId } from "../async/endpoint-id";
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
 import type { CasReceipt } from "../config/atomic-yaml-patch";
