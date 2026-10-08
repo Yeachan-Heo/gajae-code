@@ -149,9 +149,7 @@ describe("async job endpoint id derivation", () => {
 	});
 
 	it("keeps distinct transcripts and distinct provider scopes on distinct keys", async () => {
-		const tempDir = await fsPromises.realpath(
-			await fsPromises.mkdtemp(path.join(os.tmpdir(), `pi-endpoint-distinct-${Snowflake.next()}-`)),
-		);
+		const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), `pi-endpoint-distinct-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const first = path.join(tempDir, "a.jsonl");
 		const second = path.join(tempDir, "b.jsonl");
