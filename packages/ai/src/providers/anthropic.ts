@@ -203,6 +203,12 @@ const sharedHeaders = {
 	"Content-Type": "application/json",
 	"Anthropic-Version": "2023-06-01",
 	"Anthropic-Dangerous-Direct-Browser-Access": "true",
+};
+
+// Claude Code client marker. Like the claude-code/oauth betas it is sent only with
+// OAuth credentials: Anthropic classifies API-key requests carrying it as Claude
+// Code usage, which excludes them from API credit grants.
+const claudeCodeAppHeaders = {
 	"X-App": "cli",
 };
 
@@ -298,6 +304,7 @@ export function buildAnthropicHeaders(options: AnthropicHeaderOptions): Record<s
 			Accept: acceptHeader,
 			Authorization: `Bearer ${options.apiKey}`,
 			...sharedHeaders,
+			...claudeCodeAppHeaders,
 			"Anthropic-Beta": betaHeader,
 			"User-Agent": userAgent,
 		};
