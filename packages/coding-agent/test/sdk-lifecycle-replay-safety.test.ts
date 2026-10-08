@@ -71,7 +71,10 @@ test("SDK observer tags do not exempt context handlers from replay invalidation"
 	expect(records.isClean(scope)).toBe(false);
 });
 
-test.each([false, true])("real SDK run-start registration preserves only host replay authority: %s", async userHandler => {
+test.each([
+	false,
+	true,
+])("real SDK run-start registration preserves only host replay authority: %s", async userHandler => {
 	const authority = createAttemptScopeAuthority();
 	const scope = authority.mintMain();
 	const records = new AttemptRecordStore(authority);

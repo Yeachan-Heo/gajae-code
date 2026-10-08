@@ -1555,95 +1555,123 @@ export function createInvocationReconciliation(
 					error: formatPromptFailureForLocalLog(frame.error),
 				});
 				const failure = sanitizePromptFailure(frame.error);
-				if (next.error === undefined || (next.error.code === "agent_failed" && failure.code !== "agent_failed"))
+				if (preserveDeadlineRecovery) {
+					// When deadline recovery is pending, store the failure in pendingOutcome
+					// rather than setting next.error, which would cause agent_end to terminate prematurely.
+					const failureOutcome = canonicalFailedOutcome(failure, "agent_failed", {}, undefined, diagnostic);
+					(next as unknown as { pendingOutcome?: unknown }).pendingOutcome = failureOutcome;
+				} else if (
+					next.error === undefined ||
+					(next.error.code === "agent_failed" && failure.code !== "agent_failed")
+				)
 					next.error = failure;
 			} else {
-				const pendingOutcome = (next as unknown as { pendingOutcome?: unknown }).pendingOutcome;
-				delete (next as unknown as { pendingOutcome?: unknown }).pendingOutcome;
-				delete (next as unknown as { pendingReceiptState?: unknown }).pendingReceiptState;
-				next.content = reduceTurnResultContent(next.content, frame.content);
-				const incomingOutcome =
-					canonicalTerminalOutcome(frame.outcome, undefined, failureEvidence(next, frame.hasActivity)) ??
-					canonicalTerminalOutcome(pendingOutcome, undefined, failureEvidence(next, frame.hasActivity));
-				if (
-					incomingOutcome?.kind === "stopped" &&
-					(next.error === undefined || next.error.code === "prompt_deadline_exceeded")
-				) {
-					next.outcome = incomingOutcome;
-					if (next.error?.code === "prompt_deadline_exceeded") delete next.error;
-					next.status = "terminal_ok";
-				} else if (incomingOutcome?.kind === "failed") {
-					// The provider diagnostic recorded before the boundary carries the
-					// bounded classifier; prefer it over a generic frame outcome that lost
-					// the provider code.
-					const recordErrorOutcome =
-						next.error !== undefined && next.error.code !== "prompt_deadline_exceeded"
-							? canonicalFailedOutcome(
-									next.error,
-									"agent_failed",
-									failureEvidence(next),
-									undefined,
-									next.providerDiagnostic,
-								)
-							: undefined;
-					const preferRecordError =
-						recordErrorOutcome?.kind === "failed" &&
-						recordErrorOutcome.providerCode !== undefined &&
-						incomingOutcome.providerCode === undefined;
-					// The frame outcome now carries the provider code on its own (the
-					// post-start failure evidence supplies it), so preferRecordError no
-					// longer fires for a provider refusal and the frame outcome wins. It
-					// is built from evidence and never carries the diagnostic, so fill the
-					// hole additively from the classification already recorded by
-					// agent_failed: the primary classifier, phase, category, providerCode
-					// and evidence of the chosen outcome stay exactly as upstream built
-					// them, and an outcome that already carries a diagnostic is untouched.
-					const selectedOutcome = preferRecordError ? recordErrorOutcome : incomingOutcome;
-					// Same-primary only: a collected diagnostic describes the failure the
-					// record classified, so it must not travel onto a terminal that reports a
-					// different provider primary.
-					next.outcome = (
-						diagnosticBelongsToOutcome(next, selectedOutcome)
-							? enrichOutcomeDiagnostic(selectedOutcome, next.providerDiagnostic)
-							: selectedOutcome
-					) as InvocationOutcome;
-					if (next.error === undefined)
-						next.error = { code: incomingOutcome.code, message: incomingOutcome.message };
-					else next.error = { code: next.error.code, message: incomingOutcome.message };
-					next.status = "failed";
-				} else if (next.error !== undefined) {
-					next.outcome = canonicalFailedOutcome(
-						next.error,
-						"agent_failed",
-						{},
-						undefined,
-						next.providerDiagnostic,
+				const deadlineRecoveryPending =
+					(record as unknown as { deadlineRecoveryPending?: boolean }).deadlineRecoveryPending === true;
+				if (deadlineRecoveryPending) {
+					// When deadline recovery is pending, agent_end should store the outcome
+					// in pendingOutcome rather than terminalize immediately.
+					next.content = reduceTurnResultContent(next.content, frame.content);
+					const incomingOutcome =
+						canonicalTerminalOutcome(frame.outcome, undefined, failureEvidence(next, frame.hasActivity)) ??
+						canonicalTerminalOutcome(
+							(next as unknown as { pendingOutcome?: unknown }).pendingOutcome,
+							undefined,
+							failureEvidence(next, frame.hasActivity),
+						);
+					if (incomingOutcome !== undefined) {
+						(next as unknown as { pendingOutcome?: unknown }).pendingOutcome = incomingOutcome;
+					}
+					// Keep status as in_flight, don't terminalize
+					// Note: the deadline recovery manager will eventually finalize when conditions are met
+				} else {
+					const pendingOutcome = (next as unknown as { pendingOutcome?: unknown }).pendingOutcome;
+					delete (next as unknown as { pendingOutcome?: unknown }).pendingOutcome;
+					delete (next as unknown as { pendingReceiptState?: unknown }).pendingReceiptState;
+					next.content = reduceTurnResultContent(next.content, frame.content);
+					const incomingOutcome =
+						canonicalTerminalOutcome(frame.outcome, undefined, failureEvidence(next, frame.hasActivity)) ??
+						canonicalTerminalOutcome(pendingOutcome, undefined, failureEvidence(next, frame.hasActivity));
+					if (
+						incomingOutcome?.kind === "stopped" &&
+						(next.error === undefined || next.error.code === "prompt_deadline_exceeded")
+					) {
+						next.outcome = incomingOutcome;
+						if (next.error?.code === "prompt_deadline_exceeded") delete next.error;
+						next.status = "terminal_ok";
+					} else if (incomingOutcome?.kind === "failed") {
+						// The provider diagnostic recorded before the boundary carries the
+						// bounded classifier; prefer it over a generic frame outcome that lost
+						// the provider code.
+						const recordErrorOutcome =
+							next.error !== undefined && next.error.code !== "prompt_deadline_exceeded"
+								? canonicalFailedOutcome(
+										next.error,
+										"agent_failed",
+										failureEvidence(next),
+										undefined,
+										next.providerDiagnostic,
+									)
+								: undefined;
+						const preferRecordError =
+							recordErrorOutcome?.kind === "failed" &&
+							recordErrorOutcome.providerCode !== undefined &&
+							incomingOutcome.providerCode === undefined;
+						// The frame outcome now carries the provider code on its own (the
+						// post-start failure evidence supplies it), so preferRecordError no
+						// longer fires for a provider refusal and the frame outcome wins. It
+						// is built from evidence and never carries the diagnostic, so fill the
+						// hole additively from the classification already recorded by
+						// agent_failed: the primary classifier, phase, category, providerCode
+						// and evidence of the chosen outcome stay exactly as upstream built
+						// them, and an outcome that already carries a diagnostic is untouched.
+						const selectedOutcome = preferRecordError ? recordErrorOutcome : incomingOutcome;
+						// Same-primary only: a collected diagnostic describes the failure the
+						// record classified, so it must not travel onto a terminal that reports a
+						// different provider primary.
+						next.outcome = (
+							diagnosticBelongsToOutcome(next, selectedOutcome)
+								? enrichOutcomeDiagnostic(selectedOutcome, next.providerDiagnostic)
+								: selectedOutcome
+						) as InvocationOutcome;
+						if (next.error === undefined)
+							next.error = { code: incomingOutcome.code, message: incomingOutcome.message };
+						else next.error = { code: next.error.code, message: incomingOutcome.message };
+						next.status = "failed";
+					} else if (next.error !== undefined) {
+						next.outcome = canonicalFailedOutcome(
+							next.error,
+							"agent_failed",
+							{},
+							undefined,
+							next.providerDiagnostic,
+						);
+						next.status = "failed";
+					} else if (
+						kind === "prompt" &&
+						frame.type === "agent_end" &&
+						!frame.content?.text.trim() &&
+						!frame.hasActivity
+					) {
+						next.status = "failed";
+						next.error = EMPTY_PROMPT_FAILURE;
+						next.outcome = canonicalFailedOutcome(EMPTY_PROMPT_FAILURE);
+					} else next.status = "terminal_ok";
+					if (next.outcome !== undefined)
+						next.outcome = rephaseFailedOutcome(
+							next.outcome as SdkPromptTerminalOutcome,
+							failureEvidence(next, frame.hasActivity),
+						);
+					if ((next.outcome as SdkPromptTerminalOutcome | undefined)?.kind === "failed") {
+						const failed = next.outcome as Extract<SdkPromptTerminalOutcome, { kind: "failed" }>;
+						next.error = { code: next.error?.code ?? failed.code, message: failed.message };
+					}
+					next.receiptState = reduceReceiptState(
+						next.receiptState,
+						reportableTurnResultContent(next.content) ? "present" : "missing",
 					);
-					next.status = "failed";
-				} else if (
-					kind === "prompt" &&
-					frame.type === "agent_end" &&
-					!frame.content?.text.trim() &&
-					!frame.hasActivity
-				) {
-					next.status = "failed";
-					next.error = EMPTY_PROMPT_FAILURE;
-					next.outcome = canonicalFailedOutcome(EMPTY_PROMPT_FAILURE);
-				} else next.status = "terminal_ok";
-				if (next.outcome !== undefined)
-					next.outcome = rephaseFailedOutcome(
-						next.outcome as SdkPromptTerminalOutcome,
-						failureEvidence(next, frame.hasActivity),
-					);
-				if ((next.outcome as SdkPromptTerminalOutcome | undefined)?.kind === "failed") {
-					const failed = next.outcome as Extract<SdkPromptTerminalOutcome, { kind: "failed" }>;
-					next.error = { code: next.error?.code ?? failed.code, message: failed.message };
+					next.terminalAt = Date.now();
 				}
-				next.receiptState = reduceReceiptState(
-					next.receiptState,
-					reportableTurnResultContent(next.content) ? "present" : "missing",
-				);
-				next.terminalAt = Date.now();
 			}
 
 			const releaseTerminalVisibility =
