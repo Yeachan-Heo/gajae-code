@@ -7,6 +7,7 @@ import packageJson from "../package.json" with { type: "json" };
 import { AcpAgent, acpRequestFailure } from "../src/modes/acp/acp-agent";
 import { AcpSdkAdapter, type AcpSdkAdapterError, acpMcpLaunchFailure } from "../src/sdk/acp";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
+import { lifecycleRequestTimeoutMs } from "../src/sdk/broker/startup-budget";
 import { SdkClientError, type SdkRequestOptions } from "../src/sdk/client";
 import { MAX_REVERSE_PAYLOAD_BYTES } from "../src/sdk/host";
 import type { SessionAttachment } from "../src/sdk/router";
@@ -42,6 +43,7 @@ class FakeSdkClient {
 			input,
 			...(options?.idempotencyKey === undefined ? {} : { idempotencyKey: options.idempotencyKey }),
 			...(options?.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+			...(options?.deadline === undefined ? {} : { deadline: options.deadline }),
 		});
 		return this.globalResponse;
 	}
@@ -384,6 +386,26 @@ test("ACP SDK adapter maps native and extension methods and keeps endpoint crede
 	await broker.close();
 });
 
+test("ACP lifecycle startup deadline is bounded by the broker startup budget", async () => {
+	const sdk = new FakeSdkClient();
+	const adapter = new AcpSdkAdapter({ client: sdk as never });
+	const startedAt = Date.now();
+	const clock = spyOn(Date, "now").mockReturnValue(startedAt);
+	try {
+		const input = { cwd: "/workspace", target: { path: "/workspace" } };
+		await adapter.global("session.create", input, "bounded-startup-key");
+		const frame = sdk.frames.at(-1);
+		const deadline = frame?.deadline;
+		const expected = lifecycleRequestTimeoutMs("session.create", input);
+		if (typeof deadline !== "number" || expected === undefined) throw new Error("startup deadline was not recorded");
+		expect(deadline - startedAt).toBeLessThanOrEqual(expected + 5);
+		expect(frame?.timeoutMs).toBe(expected);
+	} finally {
+		await adapter.close();
+		clock.mockRestore();
+	}
+});
+
 test("Broker client injection cannot service live session controls or queries", async () => {
 	const sdk = new FakeSdkClient();
 	const adapter = new AcpSdkAdapter({ client: sdk as never });
@@ -507,6 +529,7 @@ test("ACP SDK adapter exposes SDK event frames while rejecting raw lifecycle glo
 			input: { cwd: "/workspace" },
 			idempotencyKey: "lifecycle-key",
 			timeoutMs: 21_000,
+			deadline: expect.any(Number),
 		});
 		expect(received).toContainEqual({ type: "event", payload: { type: "turn_end" } });
 	} finally {
@@ -605,7 +628,15 @@ for (const replayFailure of [
 				original,
 			);
 			expect(sdk.frames).toHaveLength(2);
-			expect(sdk.frames[1]).toEqual(sdk.frames[0]);
+			const firstRequest = sdk.frames[0];
+			const replayRequest = sdk.frames[1];
+			if (!firstRequest || !replayRequest) throw new Error("expected both lifecycle request attempts");
+			const { timeoutMs: firstTimeoutMs, ...firstEnvelope } = firstRequest;
+			const { timeoutMs: replayTimeoutMs, ...replayEnvelope } = replayRequest;
+			expect(replayEnvelope).toEqual(firstEnvelope);
+			if (typeof firstTimeoutMs !== "number" || typeof replayTimeoutMs !== "number")
+				throw new Error("expected remaining lifecycle timeout budgets");
+			expect(replayTimeoutMs).toBeLessThanOrEqual(firstTimeoutMs);
 		} finally {
 			await adapter.close();
 		}
@@ -659,7 +690,9 @@ test("ACP lifecycle waits for a late replay acknowledgment without another creat
 		acknowledgment.resolve({ result: { sessionId: "late-committed" } });
 		await expect(recovery).resolves.toEqual({ result: { sessionId: "late-committed" } });
 		expect(sdk.frames).toHaveLength(2);
-		expect(sdk.frames[1]).toEqual(sdk.frames[0]);
+		expect(sdk.frames[1]).toEqual({ ...sdk.frames[0], timeoutMs: expect.any(Number) });
+		expect(sdk.frames[1]?.timeoutMs).toBeLessThanOrEqual(sdk.frames[0]?.timeoutMs as number);
+		expect(sdk.frames[1]?.timeoutMs).toBeGreaterThan(0);
 	} finally {
 		acknowledgment.resolve({ result: { sessionId: "late-committed" } });
 		await adapter.close();
@@ -889,23 +922,29 @@ test("ACP lifecycle aliases forward caller idempotency keys outside operation in
 		{ method: "closeSession", operation: "session.close", input: { sessionId: "close" } },
 	];
 
-	await adapter.start();
-	for (const alias of aliases)
-		await expect(adapter.handle(alias.method, alias.input)).rejects.toMatchObject({ code: "invalid_input" });
+	const clock = spyOn(Date, "now").mockReturnValue(Date.now());
+	try {
+		await adapter.start();
+		for (const alias of aliases)
+			await expect(adapter.handle(alias.method, alias.input)).rejects.toMatchObject({ code: "invalid_input" });
 
-	for (const [index, alias] of aliases.entries())
-		await adapter.handle(alias.method, { ...alias.input, idempotencyKey: `alias-${index}` });
+		for (const [index, alias] of aliases.entries())
+			await adapter.handle(alias.method, { ...alias.input, idempotencyKey: `alias-${index}` });
 
-	expect(sdk.frames).toEqual(
-		aliases.map((alias, index) => ({
-			type: "broker_request",
-			operation: alias.operation,
-			input: alias.input,
-			idempotencyKey: `alias-${index}`,
-			...(alias.operation === "session.close" ? {} : { timeoutMs: 21_000 }),
-		})),
-	);
-	await adapter.close();
+		expect(sdk.frames).toEqual(
+			aliases.map((alias, index) => ({
+				type: "broker_request",
+				operation: alias.operation,
+				input: alias.input,
+				idempotencyKey: `alias-${index}`,
+				...(alias.operation === "session.close" ? { timeoutMs: 10_000 } : { timeoutMs: 21_000 }),
+				deadline: expect.any(Number),
+			})),
+		);
+	} finally {
+		await adapter.close();
+		clock.mockRestore();
+	}
 });
 
 test("ACP reverse dispatch captures Router identity before reverse dispatch and rejects duplicates", async () => {

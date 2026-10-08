@@ -479,6 +479,8 @@ export interface ScanSkillsFromDirOptions {
 	linkContainmentRoot?: string;
 	/** Filesystem authority for explicit-home reads. */
 	scope?: ReadScope;
+	/** User-owned permission to follow symlinks outside a user-scope scan root. */
+	allowExternalUserSkillSymlinks?: boolean;
 }
 
 // Stable ordering used for skill lists in prompts: name (case-insensitive), then name, then path.
@@ -498,6 +500,8 @@ export const SKILL_FRONTMATTER_SCAN_TOTAL_BYTES = 64 * 1024;
 
 export const SkillDiscoveryTestHooks: {
 	afterCandidateValidated?: (candidatePath: string) => void | Promise<void>;
+	afterSkillLinksCaptured?: (candidatePath: string) => void | Promise<void>;
+	afterSkillPathResolved?: (candidatePath: string) => void | Promise<void>;
 	afterAuthorityRootValidated?: (root: string) => void | Promise<void>;
 	afterAuthorityRootMissing?: (root: string) => void | Promise<void>;
 	afterContainedRootValidated?: (root: string) => void | Promise<void>;
@@ -515,6 +519,25 @@ interface ScanRootLinkIdentity {
 	ino: bigint;
 	linkText: string;
 	target: DirectoryIdentity;
+}
+
+interface SkillFileIdentity {
+	dev: bigint;
+	ino: bigint;
+	realPath: string;
+}
+
+interface SkillLinkIdentity {
+	path: string;
+	dev: bigint;
+	ino: bigint;
+	linkText: string;
+	target: {
+		dev: bigint;
+		ino: bigint;
+		realPath: string;
+		kind: "directory" | "file";
+	};
 }
 
 async function captureScanRootLinkIdentity(root: string): Promise<ScanRootLinkIdentity | null> {
@@ -572,6 +595,38 @@ async function directoryIdentityIsCurrent(
 			current.ino === expected.ino &&
 			normalizePathForComparison(current.realPath) === normalizePathForComparison(expected.realPath)
 		);
+	} catch {
+		return false;
+	}
+}
+
+async function captureSkillLinkIdentity(linkPath: string): Promise<SkillLinkIdentity | null> {
+	const observed = await fs.promises.lstat(linkPath, { bigint: true });
+	if (!observed.isSymbolicLink()) return null;
+	const linkText = await fs.promises.readlink(linkPath);
+	const realPath = await fs.promises.realpath(linkPath);
+	const target = await fs.promises.stat(realPath, { bigint: true });
+	const kind = target.isDirectory() ? "directory" : target.isFile() ? "file" : undefined;
+	if (!kind) return null;
+	return {
+		path: linkPath,
+		dev: observed.dev,
+		ino: observed.ino,
+		linkText,
+		target: { dev: target.dev, ino: target.ino, realPath, kind },
+	};
+}
+
+async function skillLinkIdentityIsCurrent(expected: SkillLinkIdentity): Promise<boolean> {
+	try {
+		const observed = await fs.promises.lstat(expected.path, { bigint: true });
+		if (!observed.isSymbolicLink() || observed.dev !== expected.dev || observed.ino !== expected.ino) return false;
+		if ((await fs.promises.readlink(expected.path)) !== expected.linkText) return false;
+		const realPath = await fs.promises.realpath(expected.path);
+		if (normalizePathForComparison(realPath) !== normalizePathForComparison(expected.target.realPath)) return false;
+		const target = await fs.promises.stat(realPath, { bigint: true });
+		const kind = target.isDirectory() ? "directory" : target.isFile() ? "file" : undefined;
+		return kind === expected.target.kind && target.dev === expected.target.dev && target.ino === expected.target.ino;
 	} catch {
 		return false;
 	}
@@ -693,7 +748,36 @@ export async function scanSkillsFromDir(
 		const relative = path.relative(realRoot, candidate);
 		return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 	};
-	const openSkillFileSafely = async (skillPath: string): Promise<FileHandle> => {
+	const skillPathAndLinksAreCurrent = async (
+		skillPath: string,
+		expectedFile: SkillFileIdentity | undefined,
+		linkIdentities: readonly SkillLinkIdentity[],
+	): Promise<boolean> => {
+		try {
+			const [realPath, currentFile, currentLinks] = await Promise.all([
+				fs.promises.realpath(skillPath),
+				expectedFile ? fs.promises.stat(expectedFile.realPath, { bigint: true }) : Promise.resolve(undefined),
+				Promise.all(linkIdentities.map(skillLinkIdentityIsCurrent)),
+			]);
+			if (!expectedFile) return isWithinRoot(realPath) && currentLinks.every(Boolean);
+			if (!currentFile) return false;
+			return (
+				normalizePathForComparison(realPath) === normalizePathForComparison(expectedFile.realPath) &&
+				currentFile.isFile() &&
+				currentFile.nlink === 1n &&
+				currentFile.dev === expectedFile.dev &&
+				currentFile.ino === expectedFile.ino &&
+				currentLinks.every(Boolean)
+			);
+		} catch {
+			return false;
+		}
+	};
+	const openSkillFileSafely = async (
+		skillPath: string,
+		expectedFile: SkillFileIdentity | undefined,
+		linkIdentities: readonly SkillLinkIdentity[],
+	): Promise<FileHandle> => {
 		if (
 			!(await scanRootIsCurrent()) ||
 			(options.authorityRoot &&
@@ -707,14 +791,14 @@ export async function scanSkillsFromDir(
 			(process.platform === "win32" ? 0 : (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
 		const handle = await fs.promises.open(skillPath, flags);
 		try {
-			const [opened, observed, currentPath, currentScanRoot, currentAuthorityRoot] = await Promise.all([
+			const [opened, observed, currentScanRoot, currentAuthorityRoot, currentSkillPath] = await Promise.all([
 				handle.stat({ bigint: true }),
 				fs.promises.lstat(skillPath, { bigint: true }),
-				fs.promises.realpath(skillPath),
 				scanRootIsCurrent(),
 				options.authorityRoot && authorityIdentity
 					? directoryIdentityIsCurrent(options.authorityRoot, authorityIdentity)
 					: true,
+				skillPathAndLinksAreCurrent(skillPath, expectedFile, linkIdentities),
 			]);
 			if (
 				!opened.isFile() ||
@@ -723,9 +807,10 @@ export async function scanSkillsFromDir(
 				!observed.isFile() ||
 				opened.dev !== observed.dev ||
 				opened.ino !== observed.ino ||
-				!isWithinRoot(currentPath) ||
+				(expectedFile !== undefined && (opened.dev !== expectedFile.dev || opened.ino !== expectedFile.ino)) ||
 				!currentScanRoot ||
-				!currentAuthorityRoot
+				!currentAuthorityRoot ||
+				!currentSkillPath
 			) {
 				throw new Error(`Unsafe skill file: ${skillPath}`);
 			}
@@ -735,15 +820,20 @@ export async function scanSkillsFromDir(
 			throw error;
 		}
 	};
-	const readSkillContentSafely = async (skillPath: string): Promise<string> => {
-		const handle = await openSkillFileSafely(skillPath);
+	const readSkillContentSafely = async (
+		skillPath: string,
+		expectedFile: SkillFileIdentity | undefined,
+		linkIdentities: readonly SkillLinkIdentity[],
+	): Promise<string> => {
+		const handle = await openSkillFileSafely(skillPath, expectedFile, linkIdentities);
 		try {
 			const content = await handle.readFile({ encoding: "utf8" });
 			if (
 				!(await scanRootIsCurrent()) ||
 				(options.authorityRoot &&
 					authorityIdentity &&
-					!(await directoryIdentityIsCurrent(options.authorityRoot, authorityIdentity)))
+					!(await directoryIdentityIsCurrent(options.authorityRoot, authorityIdentity))) ||
+				!(await skillPathAndLinksAreCurrent(skillPath, expectedFile, linkIdentities))
 			) {
 				throw new Error(`Unsafe skill authority root for: ${skillPath}`);
 			}
@@ -754,8 +844,10 @@ export async function scanSkillsFromDir(
 	};
 	const readSkillFrontmatterSafely = async (
 		skillPath: string,
+		expectedFile: SkillFileIdentity | undefined,
+		linkIdentities: readonly SkillLinkIdentity[],
 	): Promise<{ frontmatter: SkillFrontmatter | null; size: number }> => {
-		const handle = await openSkillFileSafely(skillPath);
+		const handle = await openSkillFileSafely(skillPath, expectedFile, linkIdentities);
 		try {
 			const size = Number((await handle.stat({ bigint: true })).size);
 			const scanLimit = Math.min(size, SKILL_FRONTMATTER_SCAN_TOTAL_BYTES);
@@ -788,21 +880,55 @@ export async function scanSkillsFromDir(
 	};
 	const loadSkill = async (candidatePath: string) => {
 		try {
+			const linkIdentities = (
+				await Promise.all([
+					captureSkillLinkIdentity(path.dirname(candidatePath)),
+					captureSkillLinkIdentity(candidatePath),
+				])
+			).filter((identity): identity is SkillLinkIdentity => identity !== null);
+			await SkillDiscoveryTestHooks.afterSkillLinksCaptured?.(candidatePath);
 			const skillPath = await fs.promises.realpath(candidatePath);
-			if (!isWithinRoot(skillPath)) {
-				// Name the resolved directory and the setting that loads it, so a symlinked skills repo is fixable (#6355).
+			await SkillDiscoveryTestHooks.afterSkillPathResolved?.(candidatePath);
+			const allowOutsideRoot = options.allowExternalUserSkillSymlinks && level === "user";
+			if (!isWithinRoot(skillPath) && !allowOutsideRoot) {
+				const remedy =
+					level === "user"
+						? `add ${path.dirname(path.dirname(skillPath))} to skills.customDirectories to load it, or enable skills.trustUserSkills`
+						: "keep project skill targets inside the skills scan root";
 				warnings.push(
-					`Refusing skill path outside scan root: ${candidatePath} (resolves to ${skillPath}; add ${path.dirname(path.dirname(skillPath))} to skills.customDirectories to load it)`,
+					`Refusing skill path outside scan root: ${candidatePath} (resolves to ${skillPath}; ${remedy})`,
 				);
 				return;
 			}
-			const stat = await fs.promises.stat(skillPath);
-			if (!stat.isFile() || stat.nlink !== 1) {
+			const stat = await fs.promises.stat(skillPath, { bigint: true });
+			if (!stat.isFile() || stat.nlink !== 1n) {
 				warnings.push(`Skill path is not a regular file: ${candidatePath}`);
 				return;
 			}
+			const pinExternalTarget = !isWithinRoot(skillPath) && allowOutsideRoot;
+			const fileLink = linkIdentities.find(identity => identity.path === candidatePath);
+			const parentLink = linkIdentities.find(identity => identity.path === path.dirname(candidatePath));
+			let capturedLinkTargetPath: string | undefined;
+			if (fileLink?.target.kind === "file") {
+				capturedLinkTargetPath = fileLink.target.realPath;
+			} else if (parentLink?.target.kind === "directory") {
+				capturedLinkTargetPath = path.join(parentLink.target.realPath, path.basename(candidatePath));
+			}
+			if (
+				pinExternalTarget &&
+				(!capturedLinkTargetPath ||
+					normalizePathForComparison(skillPath) !== normalizePathForComparison(capturedLinkTargetPath))
+			) {
+				warnings.push(`Refusing skill path not bound to its captured external link target: ${candidatePath}`);
+				return;
+			}
+			const fileIdentity = pinExternalTarget ? { dev: stat.dev, ino: stat.ino, realPath: skillPath } : undefined;
+			const pinnedLinkIdentities = pinExternalTarget ? linkIdentities : [];
 			await SkillDiscoveryTestHooks.afterCandidateValidated?.(candidatePath);
-			const { frontmatter, size } = await readSkillFrontmatterSafely(skillPath);
+			const { frontmatter, size } = await readSkillFrontmatterSafely(skillPath, fileIdentity, pinnedLinkIdentities);
+			if (!(await skillPathAndLinksAreCurrent(skillPath, fileIdentity, pinnedLinkIdentities))) {
+				throw new Error(`Unsafe skill link for: ${candidatePath}`);
+			}
 			if (!frontmatter) {
 				if (size > SKILL_FRONTMATTER_SCAN_TOTAL_BYTES) {
 					warnings.push(
@@ -826,8 +952,9 @@ export async function scanSkillsFromDir(
 			items.push({
 				name,
 				path: skillPath,
+				discoveryPath: candidatePath,
 				loadContent: async () => {
-					const content = await readSkillContentSafely(skillPath);
+					const content = await readSkillContentSafely(skillPath, fileIdentity, pinnedLinkIdentities);
 					return parseFrontmatter(content, { source: skillPath }).body;
 				},
 				frontmatter: frontmatter as SkillFrontmatter,

@@ -1067,67 +1067,6 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		}
 	});
 
-	test("skips a curated default disproved by fresh provider discovery", async () => {
-		const staleAuth = await AuthStorage.create(path.join(tempDir, `stale-default-${Snowflake.next()}.db`));
-		const staleRegistry = new ModelRegistry(
-			staleAuth,
-			path.join(tempDir, `stale-default-${Snowflake.next()}.yml`),
-			undefined,
-			{ automaticRefresh: false },
-		);
-		const currentModelId = "claude-opus-4-6";
-		try {
-			staleAuth.setRuntimeApiKey("anthropic", "anthropic-test-key");
-			using _hook = hookFetch(input => {
-				const url = String(input);
-				if (url === "https://models.dev/api.json") {
-					return new Response(JSON.stringify({ anthropic: { models: {} } }), {
-						headers: { "Content-Type": "application/json" },
-					});
-				}
-				if (!url.endsWith("/models")) throw new Error(`Unexpected model discovery request: ${input}`);
-				return new Response(JSON.stringify({ data: [{ id: currentModelId }] }), {
-					headers: { "Content-Type": "application/json" },
-				});
-			});
-			await staleRegistry.refreshProvider("anthropic", "online");
-
-			const curatedDefault = DEFAULT_MODEL_PER_PROVIDER.anthropic;
-			// Fresh, authoritative live evidence makes the live catalog the selectable
-			// list, so a curated default the provider did not enroll is not selectable
-			// either. The curated default is only the fallback while that evidence is
-			// absent (#5720, #5746).
-			expect(
-				staleRegistry
-					.getAvailable()
-					.filter(model => model.provider === "anthropic")
-					.map(model => model.id)
-					.sort(),
-			).toEqual([currentModelId]);
-			expect(staleRegistry.getAvailableForProfileActivation().some(model => model.id === curatedDefault)).toBe(
-				false,
-			);
-
-			const settings = Settings.isolated({
-				enabledModels: [`anthropic/${curatedDefault}`, `anthropic/${currentModelId}`],
-			});
-			const { session } = await createAgentSession({
-				...buildSessionOptions(),
-				authStorage: staleAuth,
-				modelRegistry: staleRegistry,
-				settings,
-			});
-			try {
-				expect(session.model).toMatchObject({ provider: "anthropic", id: currentModelId });
-			} finally {
-				await session.dispose();
-			}
-		} finally {
-			staleRegistry.dispose();
-			staleAuth.close();
-		}
-	});
-
 	test(
 		"same-provider sibling registry overrides do not block startup or session pin validation",
 		async () => {

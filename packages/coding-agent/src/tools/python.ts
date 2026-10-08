@@ -22,12 +22,20 @@ export function pythonKernelOwnerId(sessionId: string): string {
 export interface SessionPythonToolInput {
 	/** Working directory for kernel execution (session cwd). */
 	cwd: string;
+	/** Resolve the current working directory for each admitted invocation. */
+	getCwd?: () => string;
 	/** Session settings used for Python runtime policy. */
 	settings?: SettingsType;
+	/** Resolve the session file associated with each admitted invocation. */
+	getSessionFile?: () => string | null;
 	/** Resolve the GJC session id used for the kernel owner and transcript paths. */
 	getSessionId: () => string | null;
 	/** Register cleanup with the current logical session lifecycle. */
-	registerSessionCleanup: (cleanup: () => Promise<void> | void) => void;
+	registerSessionCleanup: (cleanup: () => Promise<void> | void) => (() => void) | void;
+	/** Reject execution after the owning session has begun disposal. */
+	assertEvalExecutionAllowed?: () => void;
+	/** Track this whole invocation through its transcript append. */
+	trackEvalExecution?: <T>(execution: Promise<T>, abortController: AbortController) => Promise<T>;
 }
 
 const paramsSchema = z.object({
@@ -52,6 +60,25 @@ interface TranscriptExecutionResult {
 	truncated: boolean;
 }
 
+interface PythonGeneration {
+	readonly sessionId: string;
+	readonly ownerId: string;
+	readonly abortControllers: Set<AbortController>;
+	readonly completions: Set<Promise<void>>;
+	readonly transcripts: Map<string, PythonKernelTranscript>;
+	unregisterCleanup?: () => void;
+	cleanupPromise?: Promise<void>;
+}
+
+interface PythonInvocationContext {
+	readonly cwd: string;
+	readonly sessionFile: string | null;
+	readonly sessionId: string;
+	readonly ownerId: string;
+	readonly settings: SettingsType;
+	readonly generation: PythonGeneration;
+}
+
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
@@ -71,33 +98,87 @@ function appendFailureTrailer(output: string, appendFailure: string | undefined)
 }
 
 export function createSessionPythonTool(input: SessionPythonToolInput): AgentTool {
-	let armedForSession: string | null = null;
-	const seenOwnerIds = new Set<string>();
-	let currentTranscript: PythonKernelTranscript | null = null;
+	const activeGenerations = new Map<string, PythonGeneration>();
 
-	const armCleanupForSession = (sessionId: string): void => {
-		if (armedForSession === sessionId) return;
-		input.registerSessionCleanup(async () => {
-			await Promise.all([...seenOwnerIds].map(ownerId => disposeKernelSessionsByOwner(ownerId)));
-			seenOwnerIds.clear();
-			currentTranscript = null;
-			armedForSession = null;
+	const transcriptFor = (
+		generation: PythonGeneration,
+		context: Pick<PythonInvocationContext, "cwd" | "sessionId">,
+		kernelInstanceId: string,
+	): PythonKernelTranscript => {
+		const key = JSON.stringify([context.cwd, context.sessionId, kernelInstanceId]);
+		let transcript = generation.transcripts.get(key);
+		if (!transcript) {
+			transcript = openPythonKernelTranscript({
+				cwd: context.cwd,
+				sessionId: context.sessionId,
+				kernelInstanceId,
+			});
+			generation.transcripts.set(key, transcript);
+		}
+		return transcript;
+	};
+
+	const retireGeneration = (generation: PythonGeneration): Promise<void> => {
+		if (generation.cleanupPromise) return generation.cleanupPromise;
+		const cleanup = Promise.withResolvers<void>();
+		generation.cleanupPromise = cleanup.promise;
+		const completions = [...generation.completions];
+		const controllers = [...generation.abortControllers];
+		if (activeGenerations.get(generation.sessionId) === generation) {
+			activeGenerations.delete(generation.sessionId);
+		}
+
+		let ownerCleanup: Promise<void>;
+		try {
+			// Core registers pending operations by this existing owner label before
+			// availability work begins, so this synchronous call also captures work
+			// that has not acquired a kernel yet.
+			ownerCleanup = disposeKernelSessionsByOwner(generation.ownerId);
+		} catch (error) {
+			ownerCleanup = Promise.reject(error);
+		}
+		for (const controller of controllers) controller.abort();
+		void (async () => {
+			const results = await Promise.allSettled([ownerCleanup, ...completions]);
+			const coreResult = results[0]!;
+			if (coreResult.status === "rejected") throw coreResult.reason;
+			generation.unregisterCleanup?.();
+			generation.unregisterCleanup = undefined;
+			generation.transcripts.clear();
+		})().then(cleanup.resolve, error => {
+			if (generation.cleanupPromise === cleanup.promise) generation.cleanupPromise = undefined;
+			cleanup.reject(error);
 		});
-		armedForSession = sessionId;
+		return cleanup.promise;
+	};
+
+	const generationFor = (sessionId: string): PythonGeneration => {
+		const current = activeGenerations.get(sessionId);
+		if (current) return current;
+		const generation: PythonGeneration = {
+			sessionId,
+			ownerId: pythonKernelOwnerId(sessionId),
+			abortControllers: new Set(),
+			completions: new Set(),
+			transcripts: new Map(),
+		};
+		activeGenerations.set(sessionId, generation);
+		try {
+			const unregister = input.registerSessionCleanup(() => retireGeneration(generation));
+			if (typeof unregister === "function") generation.unregisterCleanup = unregister;
+		} catch (error) {
+			activeGenerations.delete(sessionId);
+			throw error;
+		}
+		return generation;
 	};
 
 	const appendTranscript = async (
-		sessionId: string,
+		context: PythonInvocationContext,
+		transcript: PythonKernelTranscript | undefined,
 		code: string,
 		result: TranscriptExecutionResult,
 	): Promise<string | undefined> => {
-		if (currentTranscript === null) {
-			currentTranscript = openPythonKernelTranscript({
-				cwd: input.cwd,
-				sessionId,
-				kernelInstanceId: crypto.randomUUID(),
-			});
-		}
 		const record: PythonTranscriptRecord = {
 			timestamp: new Date().toISOString(),
 			code,
@@ -107,11 +188,12 @@ export function createSessionPythonTool(input: SessionPythonToolInput): AgentToo
 			truncated: result.truncated,
 		};
 		try {
-			await currentTranscript.append(record);
+			const target = transcript ?? transcriptFor(context.generation, context, crypto.randomUUID());
+			await target.append(record);
 			return undefined;
 		} catch (error) {
 			const message = errorMessage(error);
-			logger.warn("Python transcript append failed", { sessionId, error: message });
+			logger.warn("Python transcript append failed", { sessionId: context.sessionId, error: message });
 			return message;
 		}
 	};
@@ -135,11 +217,9 @@ export function createSessionPythonTool(input: SessionPythonToolInput): AgentToo
 					isError: true,
 				};
 			}
-			armCleanupForSession(sessionId);
-			const ownerId = pythonKernelOwnerId(sessionId);
 			if (params.action === "clear") {
-				await disposeKernelSessionsByOwner(ownerId);
-				currentTranscript = null;
+				const generation = generationFor(sessionId);
+				await retireGeneration(generation);
 				return {
 					content: [{ type: "text", text: "Python kernel cleared; the next execute starts a fresh kernel." }],
 				};
@@ -152,48 +232,89 @@ export function createSessionPythonTool(input: SessionPythonToolInput): AgentToo
 				};
 			}
 
-			seenOwnerIds.add(ownerId);
+			const cwd = input.getCwd?.() ?? input.cwd;
+			const sessionFile = input.getSessionFile?.() ?? null;
+			const settings = input.settings ?? Settings.instance;
+			input.assertEvalExecutionAllowed?.();
+			const contextGeneration = generationFor(sessionId);
+			const context: PythonInvocationContext = {
+				cwd,
+				sessionFile,
+				sessionId,
+				ownerId: contextGeneration.ownerId,
+				settings,
+				generation: contextGeneration,
+			};
+			const abortController = new AbortController();
+			const abortFromCaller = (): void => abortController.abort(signal?.reason);
+			if (signal?.aborted) abortFromCaller();
+			else signal?.addEventListener("abort", abortFromCaller, { once: true });
+			contextGeneration.abortControllers.add(abortController);
+
+			let trackingAccepted = false;
+			const execution = Promise.resolve()
+				.then(async (): Promise<AgentToolResult> => {
+					if (!trackingAccepted) throw new Error("Python execution was not admitted by its owning session.");
+					input.assertEvalExecutionAllowed?.();
+					let transcript: PythonKernelTranscript | undefined;
+					try {
+						const result = await executePython(code, {
+							cwd: context.cwd,
+							settings: context.settings,
+							sessionFile: context.sessionFile ?? undefined,
+							kernelMode: "session",
+							sessionId: context.ownerId,
+							kernelOwnerId: context.ownerId,
+							artifactsDir: sessionIpykernelsArtifactsDir(context.cwd, context.sessionId),
+							signal: abortController.signal,
+							onKernelStart: kernelInstanceId => {
+								transcript = transcriptFor(context.generation, context, kernelInstanceId);
+							},
+						});
+						const appendFailure = await appendTranscript(context, transcript, code, {
+							output: result.output,
+							exitCode: result.exitCode ?? null,
+							cancelled: result.cancelled,
+							truncated: result.truncated,
+						});
+						const output = result.output.length > 0 ? result.output : "(no output)";
+						return { content: [{ type: "text", text: appendFailureTrailer(output, appendFailure) }] };
+					} catch (error) {
+						const output = errorMessage(error);
+						const appendFailure = await appendTranscript(context, transcript, code, {
+							output,
+							exitCode: null,
+							cancelled: isCancellationError(error, abortController.signal),
+							truncated: false,
+						});
+						return {
+							content: [{ type: "text", text: appendFailureTrailer(output, appendFailure) }],
+							isError: true,
+						};
+					}
+				})
+				.finally(() => {
+					signal?.removeEventListener("abort", abortFromCaller);
+					contextGeneration.abortControllers.delete(abortController);
+				});
+			let completion: Promise<AgentToolResult>;
 			try {
-				const activeSettings = input.settings ?? Settings.instance;
-				const result = await executePython(code, {
-					cwd: input.cwd,
-					settings: activeSettings,
-					kernelMode: "session",
-					sessionId: ownerId,
-					kernelOwnerId: ownerId,
-					artifactsDir: sessionIpykernelsArtifactsDir(input.cwd, sessionId),
-					signal,
-					onKernelStart: kernelInstanceId => {
-						if (currentTranscript?.kernelInstanceId !== kernelInstanceId) {
-							currentTranscript = openPythonKernelTranscript({
-								cwd: input.cwd,
-								sessionId,
-								kernelInstanceId,
-							});
-						}
-					},
-				});
-				const appendFailure = await appendTranscript(sessionId, code, {
-					output: result.output,
-					exitCode: result.exitCode ?? null,
-					cancelled: result.cancelled,
-					truncated: result.truncated,
-				});
-				const output = result.output.length > 0 ? result.output : "(no output)";
-				return { content: [{ type: "text", text: appendFailureTrailer(output, appendFailure) }] };
+				completion = input.trackEvalExecution ? input.trackEvalExecution(execution, abortController) : execution;
+				trackingAccepted = true;
 			} catch (error) {
-				const output = errorMessage(error);
-				const appendFailure = await appendTranscript(sessionId, code, {
-					output,
-					exitCode: null,
-					cancelled: isCancellationError(error, signal),
-					truncated: false,
-				});
-				return {
-					content: [{ type: "text", text: appendFailureTrailer(output, appendFailure) }],
-					isError: true,
-				};
+				abortController.abort(error);
+				signal?.removeEventListener("abort", abortFromCaller);
+				contextGeneration.abortControllers.delete(abortController);
+				void execution.catch(() => {});
+				throw error;
 			}
+			const settled = completion.then(
+				() => {},
+				() => {},
+			);
+			contextGeneration.completions.add(settled);
+			void settled.then(() => contextGeneration.completions.delete(settled));
+			return await completion;
 		},
 	};
 	const agentTool = {

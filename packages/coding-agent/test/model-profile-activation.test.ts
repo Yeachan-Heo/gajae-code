@@ -412,8 +412,7 @@ describe("model profile activation", () => {
 			session,
 			modelRegistry: {
 				...baseRegistry,
-				getAvailable: baseRegistry.getAll,
-				getAvailableForProfileActivation: () => available,
+				getAvailable: () => available,
 			} as unknown as ModelRegistry,
 			settings: Settings.isolated(),
 			profileName: "claude-opus",
@@ -445,7 +444,7 @@ describe("model profile activation", () => {
 		expect(prepared.defaultThinkingLevel).toBe(ThinkingLevel.Medium);
 	});
 
-	test("built-in claude-opus skips a bundled Opus 5.5 absent from fresh live catalog evidence", async () => {
+	test("built-in claude-opus keeps a bundled Opus 5.5 omitted from fresh live catalog evidence", async () => {
 		const tempDir = TempDir.createSync("@gjc-profile-live-catalog-");
 		const authStorage = await AuthStorage.create(`${tempDir.path()}/auth.db`);
 		try {
@@ -473,31 +472,17 @@ describe("model profile activation", () => {
 			await registry.refreshProvider("anthropic", "online");
 
 			expect(requests.some(url => url.endsWith("/models"))).toBe(true);
-			// Fresh, authoritative live evidence makes the live catalog the selectable
-			// list, so a bundled Opus 5.5 the provider did not enroll is not selectable
-			// either. The bundled catalog is only the fallback when that evidence is
-			// unavailable (#5720, #5746).
-			expect(
-				registry
-					.getAvailable()
-					.filter(candidate => candidate.provider === "anthropic")
-					.map(candidate => candidate.id)
-					.sort(),
-			).toEqual(["claude-opus-4-6", "claude-sonnet-5"]);
-			expect(
-				registry
-					.getAvailableForProfileActivation()
-					.filter(candidate => candidate.provider === "anthropic")
-					.map(candidate => candidate.id),
-			).not.toContain("claude-opus-5-5");
-			const expectedIds = new Set(["claude-opus-4-6", "claude-sonnet-5"]);
-			expect(
-				registry.getAvailableForProfileActivation().filter(candidate => candidate.provider === "anthropic"),
-			).toEqual(
-				registry
-					.getAvailable()
-					.filter(candidate => candidate.provider === "anthropic" && expectedIds.has(candidate.id)),
-			);
+			// Live discovery enriches the catalog but never removes a bundled entry:
+			// Opus 5.5 stays selectable even though the live response omitted it, and
+			// the provider reports its own error if the account cannot use it.
+			const anthropicIds = registry
+				.getAvailable()
+				.filter(candidate => candidate.provider === "anthropic")
+				.map(candidate => candidate.id)
+				.sort();
+			expect(anthropicIds).toContain("claude-opus-5-5");
+			expect(anthropicIds).toContain("claude-opus-4-6");
+			expect(anthropicIds).toContain("claude-sonnet-5");
 			const session = fakeSession();
 			session.model = undefined;
 			session.thinkingLevel = undefined;
@@ -509,10 +494,8 @@ describe("model profile activation", () => {
 				profileName: "claude-opus",
 			});
 
-			expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-4-6" });
-			expect(prepared.defaultResolutionSkips).toEqual([
-				{ selector: "anthropic/claude-opus-5-5:medium", reason: "unknown_model" },
-			]);
+			expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-5-5" });
+			expect(prepared.defaultResolutionSkips).toEqual([]);
 			expect(prepared.agentModelOverrides).toMatchObject({
 				executor: "anthropic/claude-sonnet-5-5",
 				planner: ["anthropic/claude-opus-5-5:medium", "anthropic/claude-opus-4-6:low"],
@@ -525,17 +508,15 @@ describe("model profile activation", () => {
 		}
 	});
 
-	test("materialization resolves a bare assignment against the profile-activation catalog, not the broadened general one", () => {
+	test("materialization resolves a bare assignment against the available catalog, not the full catalog", () => {
 		const opus5 = model("anthropic", "claude-opus-5-5");
 		const opus46 = model("anthropic", "claude-opus-4-6");
 		const baseRegistry = fakeRegistry();
 		const registry = {
 			...baseRegistry,
 			getAll: () => [opus5, opus46, ...baseRegistry.getAll()],
-			// Fresh live descriptor evidence omitted the bundled Opus 5.5, so the
-			// profile-activation catalog is narrower than the general catalog.
-			getAvailable: () => [opus5, opus46],
-			getAvailableForProfileActivation: () => [opus46],
+			// Only Opus 4.6 is usable; the full catalog still lists Opus 5.5.
+			getAvailable: () => [opus46],
 			lookupAliasExists: (alias: string) => alias === "opus",
 			resolveModelByLookupAlias: (alias: string, lookupOptions?: { candidates?: readonly Model[] }) =>
 				alias === "opus"
@@ -553,13 +534,12 @@ describe("model profile activation", () => {
 		});
 
 		expect(materialized).toBe(true);
-		// The broadened general catalog still lists Opus 5.5, but the assignment is
-		// persisted for later profile execution, so it must resolve against the
-		// catalog that fresh live profile evidence narrowed.
+		// The full catalog still lists Opus 5.5, but the assignment is persisted for
+		// later profile execution, so it must resolve against the usable catalog.
 		expect(settings.get("modelRoles")).toMatchObject({ default: "anthropic/claude-opus-4-6" });
 	});
 
-	test("durable default recovery excludes a bundled default absent from the activation catalog", async () => {
+	test("durable default recovery excludes a bundled default absent from the available catalog", async () => {
 		const profile: ModelProfileDefinition = {
 			name: "excluded-bundled-default",
 			requiredProviders: ["anthropic"],
@@ -567,14 +547,12 @@ describe("model profile activation", () => {
 			source: "builtin",
 		};
 		const baseRegistry = fakeRegistry({ profiles: [profile] });
-		const getAvailableForProfileActivation = vi.fn(() => [] as Model[]);
 		const registry = {
 			...baseRegistry,
-			getAvailable: baseRegistry.getAll,
-			getAvailableForProfileActivation,
+			getAvailable: () => baseRegistry.getAll().filter(candidate => candidate.id !== "claude-opus-5-5"),
 		} as unknown as ModelRegistry;
 
-		expect(registry.getAvailable().some(candidate => candidate.id === "claude-opus-5-5")).toBe(true);
+		expect(registry.getAvailable().some(candidate => candidate.id === "claude-opus-5-5")).toBe(false);
 		const recovery = await resolveModelProfileDefaultChain({
 			modelRegistry: registry,
 			settings: Settings.isolated(),
@@ -582,7 +560,6 @@ describe("model profile activation", () => {
 			credentialSessionId: "resume-session",
 		});
 
-		expect(getAvailableForProfileActivation).toHaveBeenCalledTimes(1);
 		expect(recovery).toMatchObject({
 			profileName: profile.name,
 			entries: ["anthropic/claude-opus-5-5"],
@@ -859,7 +836,6 @@ describe("model profile activation", () => {
 			...baseRegistry,
 			getAll: () => [...baseRegistry.getAll(), proxyModel],
 			getAvailable: () => [proxyModel],
-			getAvailableForProfileActivation: () => [proxyModel],
 			getConfiguredProviderIds: () => [],
 			isKnownProvider: (provider: string) => provider === "provider-a" || provider === "opencodex",
 			getApiKeyForProvider: async (provider: string) => (provider === "opencodex" ? kNoAuth : "key-provider-a"),
@@ -1020,18 +996,20 @@ describe("model profile activation", () => {
 			await registry.refreshProvider("anthropic", "online");
 			expect(
 				registry
-					.getAvailableForProfileActivation()
+					.getAvailable()
 					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5-5"),
 			).toBe(true);
 			const notificationsAfterNonEmpty = catalogNotifications;
 
 			await registry.refreshProvider("anthropic", "online");
 			expect(catalogNotifications).toBeGreaterThan(notificationsAfterNonEmpty);
+			// The bundled Opus 5.5 survives the now-empty live catalog, and the
+			// catalog-change notification still fires on the evidence change.
 			expect(
 				registry
-					.getAvailableForProfileActivation()
+					.getAvailable()
 					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5-5"),
-			).toBe(false);
+			).toBe(true);
 		} finally {
 			authStorage.close();
 			tempDir.removeSync();
@@ -1114,7 +1092,7 @@ describe("model profile activation", () => {
 			);
 			expect(
 				registry
-					.getAvailableForProfileActivation()
+					.getAvailable()
 					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5-5"),
 			).toBe(true);
 
@@ -1139,7 +1117,7 @@ describe("model profile activation", () => {
 			);
 			expect(
 				registry
-					.getAvailableForProfileActivation()
+					.getAvailable()
 					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5-5"),
 			).toBe(true);
 		} finally {
@@ -2920,7 +2898,6 @@ describe("model profile activation", () => {
 				getApiKeyForProvider: runtimeRegistry.getApiKeyForProvider.bind(runtimeRegistry),
 				getAll: runtimeRegistry.getAll.bind(runtimeRegistry),
 				getAvailable: runtimeRegistry.getAvailable.bind(runtimeRegistry),
-				getAvailableForProfileActivation: runtimeRegistry.getAvailableForProfileActivation.bind(runtimeRegistry),
 			} as unknown as ModelRegistry;
 
 			const prepared = await prepareModelProfileActivation({

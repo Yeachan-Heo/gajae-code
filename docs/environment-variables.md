@@ -135,14 +135,16 @@ When more than one OAuth credential is stored for the same provider (e.g. severa
 
 ### External CLI credential import roots
 
-`gjc setup credentials`, the TUI "import existing credentials" action, and the startup auto-import discover Claude Code and Codex CLI credentials on disk. Both CLIs relocate their own config root through the environment, so gjc follows the same variables instead of assuming the home-directory default. This is what makes an account selected by an external account switcher (which launches the shell with these variables set) the account gjc imports.
+`gjc setup credentials`, the TUI "import existing credentials" action, and the startup auto-import discover Claude Code, Codex CLI, and Kiro CLI social-login credentials on disk. Claude Code and Codex CLI relocate their own config root through the environment, so gjc follows the same variables instead of assuming the home-directory default. Kiro CLI stores social tokens in its local `data.sqlite3`; GJC reads only the `auth_kv` entry and never modifies that database.
 
 | Variable             | Used for                                                              | Required when                                        | Notes / precedence                                                                                                                                     |
 | -------------------- | --------------------------------------------------------------------- | ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `CLAUDE_CONFIG_DIR`  | Directory holding Claude Code's `.credentials.json`                   | Claude Code's config root is not `~/.claude`         | Read through `$credentialEnv` (project `.env` cannot redirect it). Must be absolute; relative or blank values fall back to `~/.claude`.                 |
 | `CODEX_HOME`         | Directory holding Codex CLI's `auth.json`                             | Codex CLI's home is not `~/.codex`                   | Read through `$credentialEnv` (project `.env` cannot redirect it). Must be absolute; relative or blank values fall back to `~/.codex`.                  |
+| `XDG_DATA_HOME`      | Kiro CLI data directory on Linux                                       | Kiro CLI data root is not `~/.local/share`            | Read through `$credentialEnv`; relative or blank values fall back to `~/.local/share`. GJC reads `kiro-cli/data.sqlite3` from this directory.                 |
+| `LOCALAPPDATA`       | Kiro CLI data directory on Windows                                     | Kiro CLI data root is not `%LOCALAPPDATA%`            | Read through `$credentialEnv`; relative or blank values fall back to `~/AppData/Local`. GJC reads `kiro-cli/data.sqlite3` from this directory.                  |
 
-Redacted summaries name the variable (`Claude Code ($CLAUDE_CONFIG_DIR/.credentials.json)`), never the resolved path. macOS Keychain discovery is unaffected: it is still only consulted when no credential file is found.
+Redacted summaries name environment redirects, never resolved paths. Kiro CLI's default database path is `~/Library/Application Support/kiro-cli/data.sqlite3` on macOS, `~/.local/share/kiro-cli/data.sqlite3` on Linux, and `%LOCALAPPDATA%/kiro-cli/data.sqlite3` on Windows. macOS Keychain discovery is unaffected: it is still only consulted when no Claude Code credential file is found.
 
 ---
 
@@ -397,7 +399,7 @@ OAuth host chain: `KIMI_CODE_OAUTH_HOST` → `KIMI_OAUTH_HOST` → `https://auth
 | `GJC_OPENAI_CODE_WEBSOCKET_IDLE_TIMEOUT_MS` | Positive integer override (default 300000)           |
 | `GJC_OPENAI_CODE_WEBSOCKET_RETRY_BUDGET`    | Non-negative integer override (default 5)            |
 | `GJC_OPENAI_CODE_WEBSOCKET_RETRY_DELAY_MS`  | Positive integer base backoff override (default 500) |
-| `GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS`   | Positive integer OpenAI stream idle timeout override. Unset: 120s, except xAI Grok / Grok Build providers and Grok model ids on any OpenAI-compatible host use 300s (same floor as Anthropic long-reasoning). `0` disables. LM Studio keeps the shared idle timeout, but its first-event window is 300s by default to allow local model loading/prefill; `PI_STREAM_FIRST_EVENT_TIMEOUT_MS` overrides that window. |
+| `GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS`   | Positive integer stream idle timeout override (also applies to Anthropic). Unset: 120s generally, 600s for Anthropic long-reasoning gaps, and 300s for xAI Grok / Grok Build and Grok models on OpenAI-compatible hosts. `0` disables. LM Studio keeps the shared idle timeout, but its first-event window is 300s by default to allow local model loading/prefill; `PI_STREAM_FIRST_EVENT_TIMEOUT_MS` overrides that window. |
 
 ### Cursor provider debug
 

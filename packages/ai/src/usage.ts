@@ -10,6 +10,14 @@ export type UsageUnit = "percent" | "tokens" | "requests" | "usd" | "minutes" | 
 
 export type UsageStatus = "ok" | "warning" | "exhausted" | "unknown";
 
+/** Authentication rejection, distinct from an unavailable usage report. */
+export class UsageAuthenticationError extends Error {
+	constructor(provider: Provider) {
+		super(`${provider} usage request rejected authentication (HTTP 401)`);
+		this.name = "UsageAuthenticationError";
+	}
+}
+
 /** Time window for a limit (e.g. 5h, 7d, monthly). */
 export interface UsageWindow {
 	/** Stable identifier (e.g. "5h", "7d", "monthly"). */
@@ -147,6 +155,7 @@ export interface UsageCredential {
 	projectId?: string;
 	email?: string;
 	enterpriseUrl?: string;
+	profileArn?: string;
 	mcpBinding?: UsageMCPOAuthBinding;
 	metadata?: Record<string, unknown>;
 }

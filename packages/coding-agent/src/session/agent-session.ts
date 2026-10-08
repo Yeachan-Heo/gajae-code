@@ -535,6 +535,7 @@ import type {
 	SessionEntry,
 	SessionManagerCloseOutcome,
 	SessionMemoryStats,
+	SessionArtifactPublication,
 } from "./session-manager";
 import {
 	createReadonlySessionManager,
@@ -1802,20 +1803,14 @@ function summarizeAgentBashArtifactSave(
 	};
 }
 
-export interface AgentBashArtifactStore {
-	saveArtifact(content: string, toolType: string): Promise<string | undefined>;
-	getArtifactPath(id: string): Promise<string | null>;
-}
-
 export async function saveAgentBashOriginalArtifact(
-	store: AgentBashArtifactStore,
+	publication: SessionArtifactPublication,
 	originalText: string,
 ): Promise<BashArtifactSaveResult> {
 	try {
-		const artifactId = await store.saveArtifact(originalText, "bash-original");
-		if (!artifactId) return { status: "failed", diagnostic: "storage returned no artifact id" };
-		const artifactPath = await store.getArtifactPath(artifactId);
-		return artifactPath ? summarizeAgentBashArtifactSave(artifactId, originalText) : { status: "unavailable" };
+		const artifactId = await publication(originalText, "bash-original");
+		if (!artifactId) return { status: "unavailable" };
+		return summarizeAgentBashArtifactSave(artifactId, originalText);
 	} catch (error) {
 		return { status: "failed", diagnostic: boundAgentBashArtifactSaveDiagnostic(error) };
 	}
@@ -10814,6 +10809,11 @@ export class AgentSession {
 	 * at `timeoutMs` so a wedged subprocess can't stall process exit.
 	 */
 	async disposeChildSubprocesses(timeoutMs = SIGNAL_TEARDOWN_TIMEOUT_MS): Promise<void> {
+		this.#evalExecutionDisposing = true;
+		this.abortEval();
+		const evalExecutionsSettled = this.#waitForEvalExecutionsToSettle(timeoutMs).then(settled => {
+			if (!settled) logger.warn("signal teardown: active eval executions remain unsettled");
+		});
 		const sessionId = this.sessionManager.getSessionId();
 		const kernelOwnerId = this.#evalKernelOwnerId;
 		this.#unregisterResourceGc?.();
@@ -10823,6 +10823,7 @@ export class AgentSession {
 		this.#unregisterDelegationHintSettings?.();
 		this.#unregisterDelegationHintSettings = undefined;
 		const work = Promise.allSettled([
+			evalExecutionsSettled,
 			// kill:true so a forced exit also reaps spawned-app Chrome we own (headless
 			// always closes; connected/attached browsers only disconnect — never killed).
 			releaseTabsForOwner(sessionId, { kill: true }).catch((error: unknown) =>
@@ -10851,7 +10852,8 @@ export class AgentSession {
 				logger.warn("signal teardown: tool session transition cleanups failed", { error }),
 			),
 		]);
-		await Promise.race([work, Bun.sleep(timeoutMs)]);
+		const completed = await Promise.race([work.then(() => true), Bun.sleep(timeoutMs).then(() => false)]);
+		if (!completed) logger.warn("signal teardown: cleanup exceeded its bounded caller deadline");
 	}
 
 	#rebindProviderSessionState(providerSessionState: Map<string, ProviderSessionState>): void {
@@ -15639,6 +15641,7 @@ export class AgentSession {
 					forceOneAtATime: sequential !== undefined,
 					createDisplayEntry: false,
 					trackExternalFollowUp: false,
+					sdkRunToken: this.#activeSdkRunToken,
 				});
 				if (this.#abortUnwind && !sequential) this.#abortUnwindSteerFallbacks.push(appMessage);
 				// The chip now describes follow-up work: keep its mode and identity
@@ -25596,10 +25599,6 @@ export class AgentSession {
 	// Bash Execution
 	// =========================================================================
 
-	async #saveBashOriginalArtifact(originalText: string): Promise<BashArtifactSaveResult> {
-		return saveAgentBashOriginalArtifact(this.sessionManager, originalText);
-	}
-
 	/**
 	 * Execute a bash command.
 	 * Adds result to agent context and session.
@@ -25614,6 +25613,7 @@ export class AgentSession {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; onPersisted?: () => void },
 	): Promise<BashResult> {
+		const publishArtifact = this.sessionManager.captureArtifactPublication();
 		const excludeFromContext = options?.excludeFromContext === true;
 		this.#markRetryReplayUnsafe();
 
@@ -25651,7 +25651,7 @@ export class AgentSession {
 					sessionId: this.sessionId,
 					cwd,
 				}),
-				onMinimizedSave: originalText => this.#saveBashOriginalArtifact(originalText),
+				onMinimizedSave: originalText => saveAgentBashOriginalArtifact(publishArtifact, originalText),
 			});
 
 			this.recordBashResult(command, result, options);
@@ -25755,9 +25755,18 @@ export class AgentSession {
 		this.#markRetryReplayUnsafe();
 		const cwd = this.sessionManager.getCwd();
 		this.assertEvalExecutionAllowed();
+		const sessionFile = this.sessionManager.getSessionFile();
+		const sessionId = sessionFile ? `session:${sessionFile}:cwd:${cwd}` : `cwd:${cwd}`;
+		const kernelOwnerId = this.#evalKernelOwnerId;
+		const kernelMode = this.settings.get("python.kernelMode");
+		const settings = this.settings;
 
 		const abortController = new AbortController();
-		const execution = (async (): Promise<PythonResult> => {
+		const execution = Promise.resolve().then(async (): Promise<PythonResult> => {
+			if (abortController.signal.aborted) {
+				throw abortController.signal.reason ?? new DOMException("Aborted", "AbortError");
+			}
+			this.assertEvalExecutionAllowed();
 			if (this.#extensionRunner?.hasHandlers("user_python")) {
 				const hookResult = await this.#extensionRunner.emitUserPython({
 					type: "user_python",
@@ -25765,6 +25774,9 @@ export class AgentSession {
 					excludeFromContext,
 					cwd,
 				});
+				if (abortController.signal.aborted) {
+					throw abortController.signal.reason ?? new DOMException("Aborted", "AbortError");
+				}
 				this.assertEvalExecutionAllowed();
 				if (hookResult?.result) {
 					this.recordPythonResult(code, hookResult.result, options);
@@ -25772,15 +25784,12 @@ export class AgentSession {
 				}
 			}
 
-			// Use the same session ID as eval's Python backend for kernel sharing
-			const sessionFile = this.sessionManager.getSessionFile();
-			const sessionId = sessionFile ? `session:${sessionFile}:cwd:${cwd}` : `cwd:${cwd}`;
 			const result = await executePythonCommand(code, {
 				cwd,
 				sessionId,
-				kernelOwnerId: this.#evalKernelOwnerId,
-				kernelMode: this.settings.get("python.kernelMode"),
-				settings: this.settings,
+				kernelOwnerId,
+				kernelMode,
+				settings,
 				onChunk,
 				signal: abortController.signal,
 			});
@@ -25789,7 +25798,7 @@ export class AgentSession {
 			// must not reopen a closing session to append history.
 			if (!this.#evalExecutionDisposing) this.recordPythonResult(code, result, options);
 			return result;
-		})();
+		});
 		return await this.trackEvalExecution(execution, abortController);
 	}
 

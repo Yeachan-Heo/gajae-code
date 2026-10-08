@@ -2660,8 +2660,10 @@ export function createReadonlySessionManager(manager: SessionManager): ReadonlyS
 }
 
 /** Internal artifact-writing capability. Read-only facades expose it only through a private weak-map lookup. */
+export type SessionArtifactPublication = (content: string, toolType: string) => Promise<string | undefined>;
+
 export type SessionArtifactCapability = Readonly<
-	Pick<SessionManager, "allocateArtifactPath" | "saveArtifact" | "putBlob">
+	Pick<SessionManager, "allocateArtifactPath" | "saveArtifact" | "putBlob" | "captureArtifactPublication">
 >;
 
 const sessionArtifactCapabilities = new WeakMap<SessionManager, SessionArtifactCapability>();
@@ -2679,6 +2681,7 @@ export function sessionArtifactCapability(value: unknown): SessionArtifactCapabi
 				allocateArtifactPath: value.allocateArtifactPath.bind(value),
 				saveArtifact: value.saveArtifact.bind(value),
 				putBlob: value.putBlob.bind(value),
+				captureArtifactPublication: value.captureArtifactPublication.bind(value),
 			});
 			sessionArtifactCapabilities.set(value, capability);
 		}
@@ -7684,6 +7687,7 @@ export class SessionManager {
 	#persistWriterPath: string | undefined;
 	#persistChain: Promise<void> = Promise.resolve();
 	#persistError: Error | undefined;
+	#closeRetryOriginError: Error | undefined;
 	#persistErrorReported = false;
 	/** Defense-in-depth (#4443): one-shot warn for adjacent private thinking blocks in persisted assistant transcripts. */
 	#warnedAdjacentThinkingPersist = false;
@@ -8744,6 +8748,7 @@ export class SessionManager {
 			this.#adoptedArtifactManager = issued.adoptedArtifactManager;
 			this.#artifactLifecycle = Symbol("session-artifact-rollback");
 			installed = true;
+			this.#resetCloseRetryOriginForLifecycleCommit();
 			this.#disposeResidentTextStore(predecessorStore);
 			try {
 				managedTransition?.settle();
@@ -8840,6 +8845,7 @@ export class SessionManager {
 			this.#adoptedArtifactManager = issued.adoptedArtifactManager;
 			this.#artifactLifecycle = Symbol("session-artifact-rollback");
 			this.#commitResidentTextStoreTransition(prepared);
+			this.#resetCloseRetryOriginForLifecycleCommit();
 			managedTransition?.settle();
 			if (this.#sessionFile) writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 		} catch (error) {
@@ -8879,6 +8885,7 @@ export class SessionManager {
 		if (state.adoptsLifecycleId) this.#lifecycleIdAdopted = true;
 		this.#persistChain = Promise.resolve();
 		this.#persistError = undefined;
+		this.#closeRetryOriginError = undefined;
 		this.#persistErrorReported = false;
 		this.#sessionId = state.sessionId;
 		this.#sessionName = state.header.title;
@@ -10287,6 +10294,7 @@ export class SessionManager {
 						installedSessionId = this.#sessionId;
 						installedSessionFile = this.#sessionFile;
 						this.#persistError = undefined;
+						this.#closeRetryOriginError = undefined;
 						this.#persistErrorReported = false;
 						if (!options?.deferEphemeralArtifactRetirement) this.#retireEphemeralArtifacts();
 						this.#pendingStrictAdoption = undefined;
@@ -10405,6 +10413,7 @@ export class SessionManager {
 				this.#artifactLifecycle = Symbol("session-artifact-adoption");
 				this.#commitResidentTextStoreTransition(prepared);
 				this.#persistError = undefined;
+				this.#closeRetryOriginError = undefined;
 				this.#persistErrorReported = false;
 				entries.length = 0;
 				if (!options?.deferEphemeralArtifactRetirement) this.#retireEphemeralArtifacts();
@@ -10436,6 +10445,7 @@ export class SessionManager {
 				lifecycleIdAdopted: this.#lifecycleIdAdopted,
 				persistChain: this.#persistChain,
 				persistError: this.#persistError,
+				closeRetryOriginError: this.#closeRetryOriginError,
 				persistErrorReported: this.#persistErrorReported,
 				sessionId: this.#sessionId,
 				sessionName: this.#sessionName,
@@ -10454,12 +10464,16 @@ export class SessionManager {
 				managedTransition?.adopt();
 				writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 				this.#commitResidentTextStoreTransition(prepared);
+				// A session replacement starts a new writer lifecycle; never let a
+				// certified close error from the predecessor authorize clearing its state.
+				this.#closeRetryOriginError = undefined;
 				if (!options?.deferEphemeralArtifactRetirement) this.#retireEphemeralArtifacts();
 			} catch (error) {
 				managedTransition?.rollback();
 				this.#lifecycleIdAdopted = previous.lifecycleIdAdopted;
 				this.#persistChain = previous.persistChain;
 				this.#persistError = previous.persistError;
+				this.#closeRetryOriginError = previous.closeRetryOriginError;
 				this.#persistErrorReported = previous.persistErrorReported;
 				this.#sessionId = previous.sessionId;
 				this.#sessionName = previous.sessionName;
@@ -10927,6 +10941,7 @@ export class SessionManager {
 			this.#lifecycleIdAdopted = true;
 		this.#persistChain = Promise.resolve();
 		this.#persistError = undefined;
+		this.#closeRetryOriginError = undefined;
 		this.#persistErrorReported = false;
 		this.#sessionId = stage.sessionId;
 		this.#sessionName = stage.sessionName;
@@ -11152,6 +11167,7 @@ export class SessionManager {
 		await this.#closePersistWriter();
 		this.#persistChain = Promise.resolve();
 		this.#persistError = undefined;
+		this.#closeRetryOriginError = undefined;
 		this.#persistErrorReported = false;
 		let forkArtifactPublication: ForkArtifactPublication | undefined;
 		let forkTranscriptPublication: ForkTranscriptPublication | undefined;
@@ -12075,6 +12091,7 @@ export class SessionManager {
 			}
 			this.#persistChain = Promise.resolve();
 			this.#persistError = undefined;
+			this.#closeRetryOriginError = undefined;
 			this.#persistErrorReported = false;
 
 			const oldSessionFile = this.#sessionFile;
@@ -12386,6 +12403,7 @@ export class SessionManager {
 			await this.#closePersistWriter().catch(() => {});
 			this.#persistChain = Promise.resolve();
 			this.#persistError = undefined;
+			this.#closeRetryOriginError = undefined;
 			this.#persistErrorReported = false;
 			if (rollbackManagedMove) {
 				try {
@@ -12592,6 +12610,15 @@ export class SessionManager {
 		}
 		return normalized;
 	}
+	/** A successful lifecycle commit replaces the writer/session that certified this retry origin. */
+	#resetCloseRetryOriginForLifecycleCommit(): void {
+		const closeRetryOriginError = this.#closeRetryOriginError;
+		this.#closeRetryOriginError = undefined;
+		if (closeRetryOriginError && this.#persistError === closeRetryOriginError) {
+			this.#persistError = undefined;
+			this.#persistErrorReported = false;
+		}
+	}
 
 	#queuePersistTask(task: () => Promise<void>, options?: { ignoreError?: boolean }): Promise<void> {
 		const next = this.#persistChain.then(async () => {
@@ -12678,7 +12705,19 @@ export class SessionManager {
 
 	async #closePersistWriterInternal(): Promise<void> {
 		if (this.#persistWriter) {
-			await this.#persistWriter.close();
+			const writer = this.#persistWriter;
+			try {
+				await writer.close();
+			} catch (error) {
+				if (writer.getCloseState() === "close_failed_retryable" && !this.#closeRetryOriginError) {
+					const closeError = writer.getCloseError() ?? toError(error);
+					this.#closeRetryOriginError = closeError;
+					// Record the error immediately so the identity check in close() will pass
+					// when the retry succeeds, even if toError() is called again later.
+					if (!this.#persistError) this.#persistError = closeError;
+				}
+				throw error;
+			}
 			this.#persistWriter = undefined;
 		}
 		this.#persistWriterPath = undefined;
@@ -17025,6 +17064,7 @@ export class SessionManager {
 		}
 		let closeError: unknown;
 		let taskStarted = false;
+		const closeRetryOriginError = this.#closeRetryOriginError;
 		try {
 			await this.#queuePersistTask(
 				async () => {
@@ -17037,8 +17077,19 @@ export class SessionManager {
 				},
 				{ ignoreError: this.#closeRetryPending },
 			);
-			this.#persistError = undefined;
-			this.#persistErrorReported = false;
+			if (
+				closeRetryOriginError &&
+				!this.#persistWriter &&
+				!this.#needsFullRewriteOnNextPersist &&
+				!this.#strictResumeMutationPending &&
+				this.#persistError === closeRetryOriginError
+			) {
+				// Only the original certified writer-close failure becomes obsolete
+				// after closure. Lifecycle/publication errors must remain observable.
+				this.#persistError = undefined;
+				this.#persistErrorReported = false;
+				this.#closeRetryOriginError = undefined;
+			}
 			this.#closeRetryPending = false;
 			this.#retireEphemeralArtifacts();
 			await this.#drainEphemeralArtifactCleanups();
@@ -17048,6 +17099,8 @@ export class SessionManager {
 		}
 		const terminalError = closeError ?? this.#persistError;
 		if (terminalError) throw terminalError;
+		this.#persistError = undefined;
+		this.#persistErrorReported = false;
 		this.#releaseResidentTextStore();
 		if (this.#preparedNewSessions.size === 0) this.#releaseOwnedManagedAuthority();
 		this.#releaseClosedSessionState();
@@ -17106,6 +17159,7 @@ export class SessionManager {
 			this.#strictResumeMutationPending = false;
 			this.#managedPersistExpectedIdentity = undefined;
 			this.#persistError = undefined;
+			this.#closeRetryOriginError = undefined;
 			this.#persistErrorReported = false;
 		}
 		let priorPersistError = this.#persistError;
@@ -17887,6 +17941,28 @@ export class SessionManager {
 		if (store) store.publishNoReplaceSync(filename, Buffer.from(published, "utf8"));
 		else publishManagedFileNoReplaceSync(path.join(manager.dir, filename), Buffer.from(published, "utf8"));
 		return id;
+	}
+
+	/** Capture artifact publication authority for one session lifecycle. */
+	captureArtifactPublication(): SessionArtifactPublication {
+		this.#assertArtifactOpen();
+		const lifecycle = this.#syncArtifactLifecycle();
+		const sessionId = this.#sessionId;
+		const sessionFile = this.#sessionFile;
+		const manager = this.#getOrCreateArtifactManager() ?? this.#ephemeralArtifactManager;
+		if (manager) this.#assertArtifactContinuation(lifecycle, sessionId, sessionFile, manager);
+
+		return async (content, toolType) => {
+			this.#assertArtifactOpen();
+			if (
+				lifecycle !== this.#syncArtifactLifecycle() ||
+				sessionId !== this.#sessionId ||
+				sessionFile !== this.#sessionFile
+			)
+				throw new Error("Session artifact continuation is no longer authorized.");
+			if (manager) this.#assertArtifactContinuation(lifecycle, sessionId, sessionFile, manager);
+			return this.saveArtifact(content, toolType);
+		};
 	}
 
 	async #validatedEvictedToolOutputHandle(

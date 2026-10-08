@@ -351,10 +351,14 @@ const loaders: Record<string, Loader> = {
 				cwd: session.cwd,
 				settings: session.settings,
 				getCwd: () => session.cwd,
+				getSessionFile: () => session.getSessionFile(),
 				getSessionId: () => session.getSessionId?.() ?? null,
 				registerSessionCleanup: (cleanup: () => Promise<void> | void) => {
-					session.registerSessionCleanup?.(cleanup);
+					return session.registerSessionCleanup?.(cleanup);
 				},
+				assertEvalExecutionAllowed: () => session.assertEvalExecutionAllowed?.(),
+				trackEvalExecution: <T>(execution: Promise<T>, abortController: AbortController) =>
+					session.trackEvalExecution?.(execution, abortController) ?? execution,
 			}),
 		),
 	job: session => cached("job", () => import("./job")).then(module => module.JobTool.createIf(session)),

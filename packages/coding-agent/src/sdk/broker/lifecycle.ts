@@ -6753,7 +6753,13 @@ async function executeLifecycleResponse(
 	if (requestedSourceSessionId !== undefined && !isCanonicalSessionId(requestedSourceSessionId))
 		return fail("invalid_input", "sourceSessionId must be a canonical safe identifier.");
 	if (operation === "session.create" || operation === "session.fork" || operation === "session.resume") {
-		await broker.index.refresh();
+		// Creates without managed-worktree admission have no existing session
+		// authority to reconcile, so the change-stamp fast path avoids replaying
+		// the full index under its lock on every ACP spawn. Managed-worktree creates
+		// must serialize with registrations before checking checkout occupancy.
+		if (operation === "session.create" && lifecycleWorktreeTarget(input) === undefined)
+			await broker.index.refreshIfChanged();
+		else await broker.index.refresh();
 		if (operation === "session.create") {
 			// Creation has no existing session authority to reconcile. Keep the
 			// broker's periodic/startup heartbeat checkpoint as the reaping owner,

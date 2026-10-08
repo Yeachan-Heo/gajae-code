@@ -6,6 +6,7 @@ import path from "node:path";
 import type { NativeBrokerRestartIntent, NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
 import packageJson from "../../../package.json" with { type: "json" };
+import { FileLockAcquireError } from "../../config/file-lock";
 import type { ModelProfileErrorDetails } from "../../config/model-profile-contract";
 import { planLaunchWorktree } from "../../gjc-runtime/launch-worktree";
 import { readExistingStateForMutation, withWorkflowStateLock } from "../../gjc-runtime/state-writer";
@@ -163,6 +164,8 @@ export interface BrokerSettings {
 	restartRequestId?: string;
 	/** Cancel bootstrap before retained publication when the owning CLI receives a signal. */
 	startupAbortSignal?: AbortSignal;
+	/** Monotonic checkpoint deadline, leaving time for retained publication. */
+	startupCheckpointDeadline?: number;
 	/** Called synchronously when retained publication establishes broker readiness. */
 	onStartupReady?: () => void;
 	/** Test-only delay after session checkpoint to verify unpublished discovery ownership. */
@@ -1571,6 +1574,7 @@ export class Broker {
 	#transport: BrokerTransport | null = null;
 	#heartbeatTimer: NodeJS.Timeout | null = null;
 	#startupAbortSignal: AbortSignal | undefined;
+	#startupCheckpointDeadline: number | undefined;
 	#onStartupReady: (() => void) | undefined;
 	#startupPrePublicationDelayMs: number;
 	#startupPrePublicationTestHook: (() => Promise<void>) | undefined;
@@ -1610,6 +1614,7 @@ export class Broker {
 		this.#ownsResolveModelPin = settings.resolveModelPin === undefined;
 		this.#resolveModelPin = settings.resolveModelPin ?? createDefaultSdkHostModelResolver(this.settings.agentDir);
 		this.#startupAbortSignal = settings.startupAbortSignal;
+		this.#startupCheckpointDeadline = settings.startupCheckpointDeadline;
 		this.#onStartupReady = settings.onStartupReady;
 		this.#startupPrePublicationDelayMs =
 			Number.isSafeInteger(settings.startupPrePublicationDelayMs) &&
@@ -3939,7 +3944,7 @@ export class Broker {
 			// checkpoint settles. The bootstrap watchdog owns this pre-publication
 			// interval; publishing first allowed it to kill an endpoint already handed
 			// to callers when a legitimate index-lock wait outlived the fence.
-			await this.#checkpointSessionHeartbeats();
+			await this.#checkpointSessionHeartbeats(this.#startupAbortSignal, this.#startupCheckpointDeadline);
 			this.#throwIfStartupAborted();
 			await this.#startupPrePublicationTestHook?.();
 			if (this.#startupPrePublicationDelayMs > 0) await Bun.sleep(this.#startupPrePublicationDelayMs);
@@ -4272,15 +4277,29 @@ export class Broker {
 		if (publication) await this.#writeHeartbeat(publication);
 	}
 	/** Re-observes provably live session hosts and checkpoints their liveness. */
-	async heartbeatSessions(now = Date.now()): Promise<number> {
-		return await this.index.checkpointLiveHeartbeats(now);
+	async heartbeatSessions(now = Date.now(), abortSignal?: AbortSignal, deadlineAt?: number): Promise<number> {
+		return await this.index.checkpointLiveHeartbeats(now, abortSignal, deadlineAt);
 	}
-	async #checkpointSessionHeartbeats(): Promise<void> {
+	async #checkpointSessionHeartbeats(abortSignal?: AbortSignal, startupCheckpointDeadline?: number): Promise<void> {
 		if (this.#checkpointInFlight || this.#stopping) return;
 		this.#checkpointInFlight = true;
 		try {
-			await this.heartbeatSessions();
+			// The CLI reserves publication headroom in this startup deadline.
+			// Periodic passes use their own budget, not a retired startup signal.
+			await this.heartbeatSessions(Date.now(), abortSignal, startupCheckpointDeadline);
 		} catch (error) {
+			if (
+				error instanceof FileLockAcquireError &&
+				error.orphanPath &&
+				this.#publication !== null &&
+				this.#publicationState === "healthy-owned" &&
+				this.#fenceReason === null &&
+				this.#completionTask === null &&
+				this.#provenOwnedRoot()
+			) {
+				await this.#complete("owned-root", "heartbeat-renewal-blocked", null, error.orphanPath);
+				return;
+			}
 			logger.warn(`sdk broker: session heartbeat checkpoint failed: ${String(error)}`);
 		} finally {
 			this.#checkpointInFlight = false;
@@ -4290,6 +4309,7 @@ export class Broker {
 		mode: BrokerExitMode,
 		reason: BrokerExitReason,
 		signal: BrokerExitRecord["signal"] = null,
+		blockingLockPath?: string,
 	): Promise<void> {
 		if (this.#completionTask) return this.#completionTask;
 		const now = process.hrtime.bigint();
@@ -4301,11 +4321,19 @@ export class Broker {
 			fenceReason: this.#fenceReason,
 			fencedForMs: fenceStartedAt === null ? 0 : Math.max(0, Number((now - fenceStartedAt) / 1_000_000n)),
 			uptimeMs: this.#startedAt === null ? 0 : Math.max(0, Number((now - this.#startedAt) / 1_000_000n)),
+			...(blockingLockPath === undefined ? {} : { blockingLockPath }),
 			pid: process.pid,
 			signal,
 			writtenAt: Date.now(),
 		};
-		(mode === "lost-root" ? logger.warn : logger.info)("sdk broker: exiting", exitRecord);
+		const message =
+			reason === "heartbeat-renewal-blocked" && blockingLockPath
+				? `blocked by retained removal transition ${blockingLockPath}`
+				: undefined;
+		(mode === "lost-root" || message !== undefined ? logger.warn : logger.info)("sdk broker: exiting", {
+			...exitRecord,
+			...(message === undefined ? {} : { message }),
+		});
 		this.#stopping = true;
 		this.#checkpointInFlight = false;
 		this.#publicationState = "stopping";
