@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { closeModelCache } from "@gajae-code/ai";
+import { closeModelCache } from "@gajae-code/ai/core";
 import { getBundledModel } from "@gajae-code/ai/models";
 import type { Message, ProviderSessionState } from "@gajae-code/ai/types";
 import { Snowflake, stablePathKey } from "@gajae-code/utils";
@@ -185,6 +185,14 @@ describe("task fork-context provider identity", () => {
 	const sessions: AgentSession[] = [];
 	const authStorages: AuthStorage[] = [];
 	const tempDirs: string[] = [];
+	function listTempTree(dir: string, prefix = ""): string[] {
+		return fs.readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
+			const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
+			return entry.isDirectory() && !entry.isSymbolicLink()
+				? listTempTree(path.join(dir, entry.name), relativePath)
+				: [relativePath];
+		});
+	}
 
 	afterEach(async () => {
 		while (sessions.length > 0) await sessions.pop()?.dispose();
@@ -192,8 +200,22 @@ describe("task fork-context provider identity", () => {
 		while (tempDirs.length > 0) {
 			const tempDir = tempDirs.pop();
 			if (!tempDir) continue;
-			closeModelCache(path.join(tempDir, "models.db"));
-			if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+			const modelCacheClosed = closeModelCache(path.join(tempDir, "models.db"));
+			if (!fs.existsSync(tempDir)) continue;
+			try {
+				fs.rmSync(tempDir, { recursive: true, force: true });
+			} catch (error) {
+				let remaining: string[];
+				try {
+					remaining = listTempTree(tempDir);
+				} catch {
+					remaining = ["<unreadable>"];
+				}
+				throw new Error(
+					`Failed to remove ${tempDir}; modelCacheClosed=${modelCacheClosed}; remaining=${JSON.stringify(remaining)}`,
+					{ cause: error },
+				);
+			}
 		}
 	}, 15_000);
 
