@@ -15,14 +15,14 @@ let cargoBinary: string | undefined;
 
 async function resolveCargoBinary(): Promise<string> {
 	if (cargoBinary) return cargoBinary;
-	
+
 	// Try to find rustup in common locations
 	const possibleRustupPaths = [
 		path.join(Bun.env.CARGO_HOME ?? "", "bin", "rustup"),
 		path.join(process.env.HOME ?? "/root", ".cargo", "bin", "rustup"),
 		"/mnt/offloading/.cargo/bin/rustup",
 	];
-	
+
 	for (const rustupPath of possibleRustupPaths) {
 		if (await Bun.file(rustupPath).exists()) {
 			const result = await $`${rustupPath} which cargo`.quiet().nothrow();
@@ -35,7 +35,7 @@ async function resolveCargoBinary(): Promise<string> {
 			}
 		}
 	}
-	
+
 	// Try to run rustup from PATH
 	const result = await $`rustup which cargo`.quiet().nothrow();
 	if (result.exitCode === 0) {
@@ -45,7 +45,7 @@ async function resolveCargoBinary(): Promise<string> {
 			return resolved;
 		}
 	}
-	
+
 	cargoBinary = "cargo";
 	return "cargo";
 }
