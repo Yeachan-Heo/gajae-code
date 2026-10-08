@@ -3,7 +3,6 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import * as lazyPathIdentity from "@gajae-code/natives/path-identity";
 
 import {
 	applyOwnerOnlyPathSecurity,
@@ -74,11 +73,6 @@ afterEach(async () => {
 });
 
 describe("directory case sensitivity API", () => {
-	it("loads path bindings through the lazy native subpath", () => {
-		expect(lazyPathIdentity.directoryCaseSensitive(os.tmpdir())).toBe(directoryCaseSensitive(os.tmpdir()));
-		expect(lazyPathIdentity.windowsOrdinalCaseFold("session")).toBe(windowsOrdinalCaseFold("session"));
-	});
-
 	it.skipIf(process.platform === "win32")("returns unknown off Windows", () => {
 		expect(directoryCaseSensitive(os.tmpdir())).toBeNull();
 	});

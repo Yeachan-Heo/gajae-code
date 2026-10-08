@@ -58,8 +58,6 @@
 		"native/index.d.ts",
 		"native/loader-state.js",
 		"native/loader-state.d.ts",
-		"native/path-identity.js",
-		"native/path-identity.d.ts",
 		"native/diagnostic-loader.d.ts",
 		"native/diagnostic-loader.js",
 		"native/diagnostic-artifact.json",
@@ -78,11 +76,6 @@
 			"types": "./native/index.d.ts",
 			"import": "./native/index.js",
 			"default": "./native/index.js"
-		},
-		"./path-identity": {
-			"types": "./native/path-identity.d.ts",
-			"import": "./native/path-identity.js",
-			"default": "./native/path-identity.js"
 		},
 		"./diagnostic-loader": {
 			"types": "./native/diagnostic-loader.d.ts",

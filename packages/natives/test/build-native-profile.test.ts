@@ -2,7 +2,6 @@ import { beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import * as nativePathIdentity from "@gajae-code/natives/path-identity";
 import { $ } from "bun";
 import {
 	prependPathEntry,
@@ -50,13 +49,6 @@ async function listNativeBuildDirs(): Promise<string[]> {
 		throw err;
 	}
 }
-
-describe("lazy native path identity subpath", () => {
-	it("exposes bindings without loading the native addon at import time", () => {
-		expect(typeof nativePathIdentity.directoryCaseSensitive).toBe("function");
-		expect(typeof nativePathIdentity.windowsOrdinalCaseFold).toBe("function");
-	});
-});
 
 describe("native build Cargo profiles", () => {
 	beforeAll(async () => {

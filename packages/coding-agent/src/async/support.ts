@@ -1,4 +1,4 @@
-import { stablePathKey } from "@gajae-code/utils";
+import { stablePathKey } from "@gajae-code/utils/path-identity";
 import type { Settings } from "../config/settings";
 
 export function isBackgroundJobSupportEnabled(settings: Pick<Settings, "get">): boolean {

@@ -5,7 +5,8 @@ import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { directoryCaseSensitive } from "@gajae-code/natives";
-import { resolveEquivalentPath, stablePathKey } from "../src/dirs";
+import { resolveEquivalentPath } from "../src/dirs";
+import { stablePathKey } from "../src/path-identity";
 
 describe("issue #935 path equivalence", () => {
 	afterEach(() => {
