@@ -9,6 +9,7 @@ import {
 	resourceOwnerCount,
 	spawnOwnedProcess,
 } from "@gajae-code/coding-agent/runtime/process-lifecycle";
+import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 
 const isPosix = process.platform !== "win32";
 
@@ -92,6 +93,26 @@ function processState(pid: number): string | undefined {
 }
 
 describe("process-lifecycle adversarial owned-process invariants", () => {
+	test.skipIf(process.platform !== "win32")(
+		"signals a pinned Windows root but reports an empty live-tree walk as incomplete",
+		async () => {
+			const child = Bun.spawn(longRunnerCommand(), { stdout: "ignore", stderr: "ignore" });
+			const bindings = nativeProcessBindings();
+			const root = bindings.Process.fromPid(child.pid);
+			if (!root) {
+				child.kill();
+				throw new Error("could not pin Windows fixture root");
+			}
+			try {
+				await expect(root.terminate({ gracefulMs: -1, timeoutMs: 1_000 })).rejects.toThrow();
+				expect(root.status()).toBe(bindings.ProcessStatus.Exited);
+			} finally {
+				if (root.status() === bindings.ProcessStatus.Running) root.signalRoot(9);
+				await child.exited;
+			}
+		},
+	);
+
 	test("dispose immediately after spawn wins the startup race and returns to baseline", async () => {
 		const before = liveOwnedProcessCount();
 		const owner = spawnOwnedProcess(longRunnerCommand(), {

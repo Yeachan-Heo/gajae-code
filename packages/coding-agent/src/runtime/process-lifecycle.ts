@@ -23,8 +23,10 @@
  * Windows currently pins the root handle and verifies observable ancestry;
  * it does not atomically contain the tree. A root that exits before the first
  * observation retains an incomplete owner even when it appears clean. An
- * intermediate lost before a live root's first observation can also escape;
- * full containment requires a separate owned Job Object spawn implementation.
+ * empty descendant walk while the root is live is also incomplete: a transient
+ * intermediate may already have exited and hidden a live grandchild. The
+ * native cleanup signals pinned targets but reports `identity_unverified` and
+ * keeps the owner registered; full containment requires an owned Job Object.
  *
  * This module intentionally owns only these primitives. It does not migrate
  * existing call sites; subsystem PRs adopt it incrementally.
