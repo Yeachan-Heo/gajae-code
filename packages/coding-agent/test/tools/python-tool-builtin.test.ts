@@ -5,11 +5,12 @@ import { Agent, type AgentTool, type AgentToolResult } from "@gajae-code/agent-c
 import { getBundledModel } from "@gajae-code/ai/core";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import * as pyExecutor from "@gajae-code/coding-agent/eval/py/executor";
-import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import { AgentSession, isSessionDisposalIncompleteError } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
+import * as pyExecutor from "../../src/eval/py/executor";
+import * as pythonKernel from "../../src/eval/py/kernel";
 import { sessionIpykernelsArtifactsDir, sessionIpykernelsDir } from "../../src/gjc-runtime/session-layout";
 import { BUILTIN_TOOL_DESCRIPTORS, createTools, type ToolSession } from "../../src/tools";
 import { PYTHON_TOOL_NAME, pythonKernelOwnerId } from "../../src/tools/python";
@@ -20,6 +21,24 @@ type ToolCallParams = { action?: "execute" | "clear"; code?: string };
 
 function textOf(result: AgentToolResult): string {
 	return result.content.map(block => (block.type === "text" ? block.text : "")).join("\n");
+}
+
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function waitForProcessGone(pid: number, timeoutMs = 10_000): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (!isProcessAlive(pid)) return true;
+		await Bun.sleep(25);
+	}
+	return !isProcessAlive(pid);
 }
 
 function pythonResult(overrides: Partial<pyExecutor.PythonResult> = {}): pyExecutor.PythonResult {
@@ -41,24 +60,32 @@ function pythonResult(overrides: Partial<pyExecutor.PythonResult> = {}): pyExecu
 
 function makeToolSession(options: {
 	cwd: string;
+	getCwd?: () => string;
+	getSessionFile?: () => string | null;
 	getSessionId?: () => string | null;
-	registerSessionCleanup?: (cleanup: () => Promise<void> | void) => void;
+	settings?: Settings;
+	registerSessionCleanup?: (cleanup: () => Promise<void> | void) => (() => void) | void;
+	assertEvalExecutionAllowed?: () => void;
+	trackEvalExecution?: ToolSession["trackEvalExecution"];
 }): ToolSession {
 	const session: ToolSession = {
-		cwd: options.cwd,
+		get cwd() {
+			return options.getCwd?.() ?? options.cwd;
+		},
 		hasUI: false,
-		settings: Settings.isolated(),
+		settings: options.settings ?? Settings.isolated(),
 		requireYieldTool: false,
 		enableLsp: true,
 		taskDepth: 0,
-		getSessionFile: () => null,
+		getSessionFile: options.getSessionFile ?? (() => null),
 		getSessionSpawns: () => null,
 		getSessionId: options.getSessionId ?? (() => TEST_SESSION_ID),
 	};
+	if (options.assertEvalExecutionAllowed) session.assertEvalExecutionAllowed = options.assertEvalExecutionAllowed;
+	if (options.trackEvalExecution) session.trackEvalExecution = options.trackEvalExecution;
 	if (options.registerSessionCleanup) {
 		session.registerSessionCleanup = cleanup => {
-			options.registerSessionCleanup?.(cleanup);
-			return () => {};
+			return options.registerSessionCleanup?.(cleanup) ?? (() => {});
 		};
 	}
 	return session;
@@ -66,8 +93,13 @@ function makeToolSession(options: {
 
 async function loadPythonTool(options: {
 	cwd: string;
+	getCwd?: () => string;
+	getSessionFile?: () => string | null;
 	getSessionId?: () => string | null;
-	registerSessionCleanup?: (cleanup: () => Promise<void> | void) => void;
+	settings?: Settings;
+	registerSessionCleanup?: (cleanup: () => Promise<void> | void) => (() => void) | void;
+	assertEvalExecutionAllowed?: () => void;
+	trackEvalExecution?: ToolSession["trackEvalExecution"];
 }): Promise<AgentTool> {
 	const tool = await BUILTIN_TOOL_DESCRIPTORS[PYTHON_TOOL_NAME].load(makeToolSession(options));
 	if (!tool) throw new Error("Expected the built-in Python tool to load");
@@ -109,20 +141,22 @@ async function transcriptRecords(
 async function createAgentSessionFixture(options: {
 	cwd: string;
 	toolRegistry: Map<string, AgentTool>;
+	sessionManager?: SessionManager;
+	settings?: Settings;
 }): Promise<{ session: AgentSession; sessionManager: SessionManager; cleanup: () => Promise<void> }> {
 	const authStorage = await AuthStorage.create(path.join(options.cwd, "testauth.db"));
 	authStorage.setRuntimeApiKey("anthropic", "test-key");
 	const modelRegistry = new ModelRegistry(authStorage);
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 	if (!model) throw new Error("Expected bundled anthropic model to exist");
-	const sessionManager = SessionManager.create(options.cwd, options.cwd);
+	const sessionManager = options.sessionManager ?? SessionManager.create(options.cwd, options.cwd);
 	const agent = new Agent({
 		initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
 	});
 	const session = new AgentSession({
 		agent,
 		sessionManager,
-		settings: Settings.isolated(),
+		settings: options.settings ?? Settings.isolated(),
 		modelRegistry,
 		toolRegistry: options.toolRegistry,
 		discoveryMode: "all",
@@ -131,10 +165,60 @@ async function createAgentSessionFixture(options: {
 		session,
 		sessionManager,
 		cleanup: async () => {
-			await session.dispose();
+			try {
+				await session.dispose();
+			} catch (error) {
+				if (!isSessionDisposalIncompleteError(error)) throw error;
+			}
+			await session.awaitDisposeCompletion();
 			authStorage.close();
 		},
 	};
+}
+
+async function createPythonToolSessionFixture(options: {
+	cwd: string;
+	getCwd: () => string;
+	getSessionFile: () => string | null;
+	getSessionId: () => string | null;
+	settings: Settings;
+	sessionManager?: SessionManager;
+}): Promise<{
+	session: AgentSession;
+	sessionManager: SessionManager;
+	pythonTool: AgentTool;
+	cleanup: () => Promise<void>;
+}> {
+	let fixture: Awaited<ReturnType<typeof createAgentSessionFixture>> | undefined;
+	const toolSession = makeToolSession({
+		cwd: options.cwd,
+		getCwd: options.getCwd,
+		getSessionFile: options.getSessionFile,
+		getSessionId: options.getSessionId,
+		settings: options.settings,
+	});
+	toolSession.registerSessionCleanup = cleanup => {
+		if (!fixture) throw new Error("Python cleanup was registered before SDK session construction");
+		return fixture.session.registerToolSessionTransitionCleanup(cleanup);
+	};
+	toolSession.assertEvalExecutionAllowed = () => {
+		if (!fixture) throw new Error("Python execution was admitted before SDK session construction");
+		fixture.session.assertEvalExecutionAllowed();
+	};
+	toolSession.trackEvalExecution = (execution, abortController) => {
+		if (!fixture) throw new Error("Python execution was tracked before SDK session construction");
+		return fixture.session.trackEvalExecution(execution, abortController);
+	};
+	const tools = await createTools(toolSession);
+	const pythonTool = tools.find(tool => tool.name === PYTHON_TOOL_NAME);
+	if (!pythonTool) throw new Error("Expected Python tool to be created");
+	fixture = await createAgentSessionFixture({
+		cwd: options.cwd,
+		toolRegistry: new Map([[PYTHON_TOOL_NAME, pythonTool]]),
+		sessionManager: options.sessionManager,
+		settings: options.settings,
+	});
+	return { ...fixture, pythonTool };
 }
 
 describe("builtin session Python tool", () => {
@@ -207,6 +291,252 @@ describe("builtin session Python tool", () => {
 		if (!secondOptions) throw new Error("Expected Python executor options after clear");
 		expect(secondOptions.artifactsDir).toBe(sessionIpykernelsArtifactsDir(cwd, TEST_SESSION_ID));
 	});
+
+	it("captures live cwd and session metadata before preflight and tracks through transcript append", async () => {
+		const cwdA = tempDir();
+		const cwdB = tempDir();
+		const settings = Settings.isolated();
+		const availabilityStarted = Promise.withResolvers<void>();
+		const releaseAvailability = Promise.withResolvers<void>();
+		const kernelStarted = Promise.withResolvers<void>();
+		const shutdownStarted = Promise.withResolvers<void>();
+		const shutdownCompleted = Promise.withResolvers<void>();
+		const releaseShutdown = Promise.withResolvers<void>();
+		const appendStarted = Promise.withResolvers<void>();
+		const releaseAppend = Promise.withResolvers<void>();
+		const managerA = SessionManager.create(cwdA, cwdA);
+		const managerB = SessionManager.create(cwdB, cwdB);
+		let activeManager = managerA;
+		let clearSettled = false;
+		let observedKernelStartId: string | undefined;
+		const realAvailability = pythonKernel.checkPythonKernelAvailability.bind(pythonKernel);
+		let holdAvailability = true;
+		const availabilitySpy = vi
+			.spyOn(pythonKernel, "checkPythonKernelAvailability")
+			.mockImplementation(async (...args) => {
+				if (holdAvailability) {
+					holdAvailability = false;
+					availabilityStarted.resolve();
+					await releaseAvailability.promise;
+				}
+				return await realAvailability(...args);
+			});
+		const realStart = pythonKernel.PythonKernel.start.bind(pythonKernel.PythonKernel);
+		vi.spyOn(pythonKernel.PythonKernel, "start").mockImplementation(async options => {
+			const kernel = await realStart(options);
+			const originalShutdown = kernel.shutdown.bind(kernel);
+			kernel.shutdown = async shutdownOptions => {
+				shutdownStarted.resolve();
+				await releaseShutdown.promise;
+				try {
+					return await originalShutdown(shutdownOptions);
+				} finally {
+					shutdownCompleted.resolve();
+				}
+			};
+			kernelStarted.resolve();
+			return kernel;
+		});
+		const realExecute = pyExecutor.executePython.bind(pyExecutor);
+		const executeSpy = vi.spyOn(pyExecutor, "executePython").mockImplementation((code, options) => {
+			const originalOnKernelStart = options?.onKernelStart;
+			return realExecute(code, {
+				...options,
+				onKernelStart: kernelInstanceId => {
+					observedKernelStartId = kernelInstanceId;
+					originalOnKernelStart?.(kernelInstanceId);
+				},
+			});
+		});
+		const realAppendFile = fs.appendFile.bind(fs);
+		vi.spyOn(fs, "appendFile").mockImplementation(async (filePath, data, options) => {
+			const result = await realAppendFile(filePath, data, options);
+			if (
+				String(filePath).startsWith(sessionIpykernelsDir(cwdA, managerA.getSessionId())) &&
+				String(filePath).endsWith("transcript.jsonl")
+			) {
+				appendStarted.resolve();
+				await releaseAppend.promise;
+			}
+			return result;
+		});
+		let sessionForCleanup: Awaited<ReturnType<typeof createPythonToolSessionFixture>> | undefined;
+		let executionForCleanup: Promise<AgentToolResult> | undefined;
+		let clear: Promise<AgentToolResult> | undefined;
+		let transition: Promise<boolean> | undefined;
+		let transitionSettled = false;
+		let cleanupResults: PromiseSettledResult<unknown>[] = [];
+		try {
+			const session = await createPythonToolSessionFixture({
+				cwd: cwdA,
+				getCwd: () => activeManager.getCwd(),
+				getSessionFile: () => activeManager.getSessionFile() ?? null,
+				getSessionId: () => activeManager.getSessionId(),
+				settings,
+				sessionManager: managerA,
+			});
+			sessionForCleanup = session;
+			const sessionFileA = managerA.getSessionFile();
+			const sessionIdA = managerA.getSessionId();
+			if (!sessionFileA) throw new Error("Expected an actual SDK session file");
+			const pidFile = path.join(cwdA, "python-captured.pid");
+			const executionCode = `import os\nwith open(${JSON.stringify(pidFile)}, "w") as pid_file:\n    pid_file.write(str(os.getpid()))\nprint(os.getpid())`;
+			const execution = session.pythonTool.execute("python-captured-call", { code: executionCode });
+			executionForCleanup = execution;
+			await availabilityStarted.promise;
+			expect(session.session.isEvalRunning).toBe(true);
+			activeManager = managerB;
+			releaseAvailability.resolve();
+			await kernelStarted.promise;
+			await appendStarted.promise;
+			expect(session.session.isEvalRunning).toBe(true);
+			const observedPid = Number((await Bun.file(pidFile).text()).trim());
+			expect(Number.isSafeInteger(observedPid) && observedPid > 0).toBe(true);
+			expect(isProcessAlive(observedPid)).toBe(true);
+
+			activeManager = managerA;
+			clear = session.pythonTool.execute("python-captured-clear", { action: "clear" }).then(result => {
+				clearSettled = true;
+				return result;
+			});
+			await shutdownStarted.promise;
+			await Bun.sleep(0);
+			expect(clearSettled).toBe(false);
+
+			const options = executeSpy.mock.calls[0]?.[1];
+			if (!options) throw new Error("Expected captured Python executor options");
+			expect(availabilitySpy).toHaveBeenCalled();
+			expect(options.cwd).toBe(cwdA);
+			expect(options.sessionFile).toBe(sessionFileA);
+			expect(options.sessionId).toBe(pythonKernelOwnerId(sessionIdA));
+			expect(options.settings).toBe(settings);
+			expect(options.artifactsDir).toBe(sessionIpykernelsArtifactsDir(cwdA, sessionIdA));
+			expect(observedKernelStartId).toBeString();
+			const directories = await transcriptDirectories(cwdA, sessionIdA);
+			expect(directories).toHaveLength(1);
+			expect(directories[0]).toEndWith(`-${observedKernelStartId}`);
+			const transcriptPath = path.join(sessionIpykernelsDir(cwdA, sessionIdA), directories[0]!, "transcript.jsonl");
+			const transcriptBytesWhileAppendHeld = new Uint8Array(await Bun.file(transcriptPath).arrayBuffer());
+			expect(await transcriptDirectories(cwdB, sessionIdA)).toEqual([]);
+			expect(await transcriptDirectories(cwdB, managerB.getSessionId())).toEqual([]);
+			expect(await transcriptRecords(cwdA, sessionIdA, directories[0]!)).toEqual([
+				expect.objectContaining({ code: executionCode, output: expect.stringContaining(String(observedPid)) }),
+			]);
+			expect(clearSettled).toBe(false);
+			releaseShutdown.resolve();
+			await shutdownCompleted.promise;
+			expect(await waitForProcessGone(observedPid)).toBe(true);
+			expect(clearSettled).toBe(false);
+			expect(session.session.isEvalRunning).toBe(true);
+			transition = session.session.newSession().then(result => {
+				transitionSettled = true;
+				return result;
+			});
+			await Bun.sleep(0);
+			expect(transitionSettled).toBe(false);
+			expect(session.session.isEvalRunning).toBe(true);
+			releaseAppend.resolve();
+			const result = await execution;
+			expect(result.isError).toBeUndefined();
+			expect(textOf(result)).toContain(String(observedPid));
+			expect(session.session.isEvalRunning).toBe(false);
+			const cleared = await clear;
+			expect(cleared.isError).toBeUndefined();
+			await expect(transition).resolves.toBe(true);
+			await Bun.sleep(0);
+			expect(clearSettled).toBe(true);
+			expect(transitionSettled).toBe(true);
+			expect(session.session.isEvalRunning).toBe(false);
+			expect(new Uint8Array(await Bun.file(transcriptPath).arrayBuffer())).toEqual(transcriptBytesWhileAppendHeld);
+		} finally {
+			releaseAvailability.resolve();
+			releaseShutdown.resolve();
+			releaseAppend.resolve();
+			const cleanupTasks: Promise<unknown>[] = [sessionForCleanup ? sessionForCleanup.cleanup() : managerA.close()];
+			if (executionForCleanup) cleanupTasks.push(executionForCleanup);
+			if (clear) cleanupTasks.push(clear);
+			if (transition) cleanupTasks.push(transition);
+			cleanupTasks.push(managerB.close());
+			cleanupResults = await Promise.allSettled(cleanupTasks);
+		}
+		const cleanupFailures = cleanupResults.flatMap(result => (result.status === "rejected" ? [result.reason] : []));
+		if (cleanupFailures.length === 1) throw cleanupFailures[0];
+		if (cleanupFailures.length > 1) throw new AggregateError(cleanupFailures, "Python test cleanup failed.");
+	}, 30_000);
+
+	it("clears and recreates a real Python generation under the actual session lifecycle", async () => {
+		const cwd = tempDir();
+		const settings = Settings.isolated();
+		const sessionManager = SessionManager.create(cwd, cwd);
+		const session = await createPythonToolSessionFixture({
+			cwd,
+			getCwd: () => sessionManager.getCwd(),
+			getSessionFile: () => sessionManager.getSessionFile() ?? null,
+			getSessionId: () => sessionManager.getSessionId(),
+			settings,
+			sessionManager,
+		});
+		const sessionId = sessionManager.getSessionId();
+		let pidA: number | undefined;
+		let pidB: number | undefined;
+		let disposed = false;
+		let cleanupResults: PromiseSettledResult<unknown>[] = [];
+		try {
+			const resultA = await session.pythonTool.execute("python-generation-a", {
+				code: "import os\ngeneration_a_marker = True\nprint(os.getpid())",
+			});
+			expect(resultA.isError).toBeUndefined();
+			pidA = Number(textOf(resultA).match(/\b\d+\b/)?.[0]);
+			expect(Number.isSafeInteger(pidA) && pidA > 0).toBe(true);
+			expect(isProcessAlive(pidA)).toBe(true);
+
+			const directoriesA = await transcriptDirectories(cwd, sessionId);
+			expect(directoriesA).toHaveLength(1);
+			const bytesA = new Uint8Array(
+				await Bun.file(
+					path.join(sessionIpykernelsDir(cwd, sessionId), directoriesA[0]!, "transcript.jsonl"),
+				).arrayBuffer(),
+			);
+
+			const clearResult = await session.pythonTool.execute("python-generation-clear", { action: "clear" });
+			expect(clearResult.isError).toBeUndefined();
+			expect(await waitForProcessGone(pidA)).toBe(true);
+			expect(session.session.isEvalRunning).toBe(false);
+
+			const resultB = await session.pythonTool.execute("python-generation-b", {
+				code: "import os\nprint(os.getpid())\nprint('generation_a_marker' in globals())",
+			});
+			expect(resultB.isError).toBeUndefined();
+			pidB = Number(textOf(resultB).match(/\b\d+\b/)?.[0]);
+			expect(Number.isSafeInteger(pidB) && pidB > 0).toBe(true);
+			expect(isProcessAlive(pidB)).toBe(true);
+			expect(textOf(resultB)).toContain("False");
+
+			const directoriesB = await transcriptDirectories(cwd, sessionId);
+			expect(directoriesB).toHaveLength(2);
+			const transcriptBDirectory = directoriesB.find(directory => directory !== directoriesA[0]);
+			if (!transcriptBDirectory) throw new Error("Expected a fresh transcript directory after clear");
+			const pathA = path.join(sessionIpykernelsDir(cwd, sessionId), directoriesA[0]!, "transcript.jsonl");
+			const pathB = path.join(sessionIpykernelsDir(cwd, sessionId), transcriptBDirectory, "transcript.jsonl");
+			const bytesB = new Uint8Array(await Bun.file(pathB).arrayBuffer());
+			await session.cleanup();
+			disposed = true;
+			expect(await waitForProcessGone(pidB)).toBe(true);
+			expect(new Uint8Array(await Bun.file(pathA).arrayBuffer())).toEqual(bytesA);
+			expect(new Uint8Array(await Bun.file(pathB).arrayBuffer())).toEqual(bytesB);
+		} finally {
+			cleanupResults = await Promise.allSettled([
+				...(!disposed ? [session.cleanup()] : []),
+				...(pidA !== undefined ? [waitForProcessGone(pidA)] : []),
+				...(pidB !== undefined ? [waitForProcessGone(pidB)] : []),
+			]);
+		}
+		const cleanupFailures = cleanupResults.flatMap(result => (result.status === "rejected" ? [result.reason] : []));
+		if (cleanupFailures.length === 1) throw cleanupFailures[0];
+		if (cleanupFailures.length > 1) throw new AggregateError(cleanupFailures, "Python test cleanup failed.");
+		const processResults = cleanupResults.slice(disposed ? 0 : 1);
+		expect(processResults.every(result => result.status === "fulfilled" && result.value === true)).toBe(true);
+	}, 30_000);
 
 	it("records each executor callback lifetime in its own transcript directory", async () => {
 		const cwd = tempDir();
