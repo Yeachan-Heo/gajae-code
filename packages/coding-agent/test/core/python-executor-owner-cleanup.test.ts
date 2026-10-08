@@ -190,6 +190,10 @@ const registrationSpy = vi.spyOn(lifecycle, "registerResourceOwner").mockImpleme
 );
 const kernel = await PythonKernel.start({ cwd: ${JSON.stringify(tempDir.path())} });
 let execution;
+let bodyFailed = false;
+let bodyError;
+let cleanupFailed = false;
+let cleanupError;
 try {
 const registrationsBefore = registrationSpy.mock.calls.filter(([name]) => name === "python-kernel-sessions").length;
 let executionSettled = false;
@@ -219,6 +223,9 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 	shutdownConfirmed: shutdown.confirmed,
 	resourceOwnersAfterCleanup,
 }));
+} catch (error) {
+	bodyFailed = true;
+	bodyError = error;
 } finally {
 	const shutdown = (async () => {
 		let firstFailure;
@@ -239,9 +246,14 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 		shutdown,
 		lifecycle.disposeAllResourceOwners(),
 	]);
-	const cleanupFailure = cleanupResults.find(result => result.status === "rejected");
-	if (cleanupFailure?.status === "rejected") throw cleanupFailure.reason;
+	const cleanupFailures = cleanupResults.flatMap(result => (result.status === "rejected" ? [result.reason] : []));
+	if (cleanupFailures.length > 0) {
+		cleanupFailed = true;
+		cleanupError = new AggregateError(cleanupFailures, "Cold Python resource probe cleanup failed");
+	}
 }
+if (bodyFailed) throw bodyError;
+if (cleanupFailed) throw cleanupError;
 }, 30_000);
 `;
 		const probePath = path.join(tempDir.path(), "cold-registration.test.ts");
@@ -251,11 +263,50 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({
 			stdout: "pipe",
 			stderr: "pipe",
 		});
-		const [exitCode, stdout, stderr] = await Promise.all([
-			child.exited,
-			new Response(child.stdout).text(),
-			new Response(child.stderr).text(),
-		]);
+		const childExited = child.exited;
+		const stdoutRead = new Response(child.stdout).text();
+		const stderrRead = new Response(child.stderr).text();
+		const childOutput = Promise.all([childExited, stdoutRead, stderrRead] as const);
+		let childResult: Awaited<typeof childOutput> | undefined;
+		let childFailed = false;
+		let childError: unknown;
+		const childCleanupErrors: unknown[] = [];
+		try {
+			childResult = await waitForRequest(childOutput, 20_000, "Cold Python resource probe exceeded its test budget");
+		} catch (error) {
+			childFailed = true;
+			childError = error;
+		} finally {
+			if (!childResult) {
+				if (child.exitCode === null) {
+					try {
+						child.kill("SIGTERM");
+					} catch (error) {
+						if (child.exitCode === null) childCleanupErrors.push(error);
+					}
+				}
+				if (child.exitCode === null) {
+					try {
+						await waitForRequest(childExited, 2_000, "Cold Python resource probe did not exit after SIGTERM");
+					} catch {
+						if (child.exitCode === null) {
+							try {
+								child.kill("SIGKILL");
+							} catch (error) {
+								if (child.exitCode === null) childCleanupErrors.push(error);
+							}
+						}
+					}
+				}
+			}
+			const joined = await Promise.allSettled([childExited, stdoutRead, stderrRead]);
+			childCleanupErrors.push(...joined.flatMap(result => (result.status === "rejected" ? [result.reason] : [])));
+		}
+		if (childFailed) throw childError;
+		if (childCleanupErrors.length > 0)
+			throw new AggregateError(childCleanupErrors, "Cold Python resource probe child cleanup failed");
+		if (!childResult) throw new Error("Cold Python resource probe returned no result");
+		const [exitCode, stdout, stderr] = childResult;
 		expect(exitCode, `${stdout}\n${stderr}`).toBe(0);
 		const result = JSON.parse(await Bun.file(resultPath).text()) as {
 			pid: number;

@@ -30,6 +30,36 @@ function observeSettlement(promise: Promise<unknown>): void {
 	);
 }
 
+function observeRunnerPid(cwd: string): () => number | undefined {
+	const spawn = Bun.spawn.bind(Bun);
+	let pid: number | undefined;
+	function spawnObserver<
+		const In extends Bun.SpawnOptions.Writable = "ignore",
+		const Out extends Bun.SpawnOptions.Readable = "pipe",
+		const Err extends Bun.SpawnOptions.Readable = "inherit",
+	>(options: Bun.SpawnOptions.SpawnOptions<In, Out, Err> & { cmd: string[] }): Bun.Subprocess<In, Out, Err>;
+	function spawnObserver<
+		const In extends Bun.SpawnOptions.Writable = "ignore",
+		const Out extends Bun.SpawnOptions.Readable = "pipe",
+		const Err extends Bun.SpawnOptions.Readable = "inherit",
+	>(commands: string[], options?: Bun.SpawnOptions.SpawnOptions<In, Out, Err>): Bun.Subprocess<In, Out, Err>;
+	function spawnObserver<
+		const In extends Bun.SpawnOptions.Writable = "ignore",
+		const Out extends Bun.SpawnOptions.Readable = "pipe",
+		const Err extends Bun.SpawnOptions.Readable = "inherit",
+	>(
+		command: string[] | (Bun.SpawnOptions.SpawnOptions<In, Out, Err> & { cmd: string[] }),
+		options?: Bun.SpawnOptions.SpawnOptions<In, Out, Err>,
+	): Bun.Subprocess<In, Out, Err> {
+		const proc = Array.isArray(command) ? spawn(command, options) : spawn(command);
+		const spawnOptions = Array.isArray(command) ? options : command;
+		if (spawnOptions?.cwd === cwd && spawnOptions.detached === true) pid = proc.pid;
+		return proc;
+	}
+	vi.spyOn(Bun, "spawn").mockImplementation(spawnObserver);
+	return () => pid;
+}
+
 function createCancellationError(name: "AbortError" | "TimeoutError", message: string): Error {
 	const error = new Error(message);
 	error.name = name;
@@ -280,6 +310,124 @@ describe("executePython (per-call)", () => {
 				...(execution && !executionObserved ? [execution] : []),
 				...(cleanup ? [cleanup] : []),
 				disposeKernelSessionsByOwner("per-call-cancel-cleanup-owner"),
+				disposeAllKernelSessions(),
+				...(pid !== undefined ? [waitForProcessGone(pid)] : []),
+			]);
+		}
+	}, 30_000);
+
+	it("surfaces cleanup failure when cancellation occurs after real start but before cell execution", async () => {
+		Bun.env.PI_PYTHON_SKIP_CHECK = "1";
+		using tempDir = TempDir.createSync("@gjc-python-per-call-start-cancel-cleanup-");
+		const markerFile = `${tempDir.path()}/cell-must-not-run`;
+		const getRunnerPid = observeRunnerPid(tempDir.path());
+		const controller = new AbortController();
+		const shutdownError = new Error("cleanup rejected after startup cancellation");
+		let kernel: PythonKernel | undefined;
+		let shutdownCalls = 0;
+		let execution: Promise<PythonResult> | undefined;
+		let executionObserved = false;
+		let cleanup: Promise<void> | undefined;
+		PythonKernel.start = async options => {
+			const created = await originalStart(options);
+			kernel = created;
+			const shutdown = created.shutdown.bind(created);
+			created.shutdown = async shutdownOptions => {
+				shutdownCalls += 1;
+				if (shutdownCalls === 1) throw shutdownError;
+				return await shutdown(shutdownOptions);
+			};
+			controller.abort(createCancellationError("AbortError", "cancel immediately after start"));
+			return created;
+		};
+		let pid: number | undefined;
+		try {
+			execution = executePython(`from pathlib import Path\nPath(${JSON.stringify(markerFile)}).touch()`, {
+				kernelMode: "per-call",
+				kernelOwnerId: "per-call-start-cancel-owner",
+				signal: controller.signal,
+				cwd: tempDir.path(),
+			});
+			observeSettlement(execution);
+			await expect(execution).rejects.toMatchObject({ cause: shutdownError });
+			executionObserved = true;
+			pid = getRunnerPid();
+			if (pid === undefined) throw new Error("Actual per-call runner PID was not captured");
+			expect(shutdownCalls).toBe(1);
+			expect(await Bun.file(markerFile).exists()).toBe(false);
+			expect(isProcessAlive(pid)).toBe(true);
+			expect(kernel?.isAlive()).toBe(true);
+
+			cleanup = disposeKernelSessionsByOwner("per-call-start-cancel-owner");
+			await cleanup;
+			expect(shutdownCalls).toBe(2);
+			await waitForProcessGone(pid);
+			expect(kernel?.isAlive()).toBe(false);
+		} finally {
+			controller.abort();
+			await joinCleanupTasks([
+				...(execution && !executionObserved ? [execution] : []),
+				...(cleanup ? [cleanup] : []),
+				disposeKernelSessionsByOwner("per-call-start-cancel-owner"),
+				disposeAllKernelSessions(),
+				...(pid !== undefined ? [waitForProcessGone(pid)] : []),
+			]);
+		}
+	}, 30_000);
+
+	it("does not convert thrown post-start cancellation when retained cleanup fails", async () => {
+		Bun.env.PI_PYTHON_SKIP_CHECK = "1";
+		using tempDir = TempDir.createSync("@gjc-python-per-call-thrown-cancel-cleanup-");
+		const markerFile = `${tempDir.path()}/cell-must-not-run`;
+		const getRunnerPid = observeRunnerPid(tempDir.path());
+		const controller = new AbortController();
+		const shutdownError = new Error("cleanup rejected after pre-cell cancellation");
+		let kernel: PythonKernel | undefined;
+		let shutdownCalls = 0;
+		let execution: Promise<PythonResult> | undefined;
+		let executionObserved = false;
+		let cleanup: Promise<void> | undefined;
+		PythonKernel.start = async options => {
+			const created = await originalStart(options);
+			kernel = created;
+			const shutdown = created.shutdown.bind(created);
+			created.shutdown = async shutdownOptions => {
+				shutdownCalls += 1;
+				if (shutdownCalls === 1) throw shutdownError;
+				return await shutdown(shutdownOptions);
+			};
+			controller.abort(createCancellationError("AbortError", "cancel after real startup"));
+			return created;
+		};
+		let pid: number | undefined;
+		try {
+			execution = executePython(`from pathlib import Path\nPath(${JSON.stringify(markerFile)}).touch()`, {
+				kernelMode: "per-call",
+				kernelOwnerId: "per-call-thrown-cancel-owner",
+				signal: controller.signal,
+				cwd: tempDir.path(),
+			});
+			observeSettlement(execution);
+			await expect(execution).rejects.toMatchObject({ cause: shutdownError });
+			executionObserved = true;
+			pid = getRunnerPid();
+			if (pid === undefined) throw new Error("Actual per-call runner PID was not captured");
+			expect(shutdownCalls).toBe(1);
+			expect(await Bun.file(markerFile).exists()).toBe(false);
+			expect(isProcessAlive(pid)).toBe(true);
+			expect(kernel?.isAlive()).toBe(true);
+
+			cleanup = disposeKernelSessionsByOwner("per-call-thrown-cancel-owner");
+			await cleanup;
+			expect(shutdownCalls).toBe(2);
+			await waitForProcessGone(pid);
+			expect(kernel?.isAlive()).toBe(false);
+		} finally {
+			controller.abort();
+			await joinCleanupTasks([
+				...(execution && !executionObserved ? [execution] : []),
+				...(cleanup ? [cleanup] : []),
+				disposeKernelSessionsByOwner("per-call-thrown-cancel-owner"),
 				disposeAllKernelSessions(),
 				...(pid !== undefined ? [waitForProcessGone(pid)] : []),
 			]);

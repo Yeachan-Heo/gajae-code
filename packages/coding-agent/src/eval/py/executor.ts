@@ -1390,9 +1390,7 @@ async function executePerCall(
 		cleanup = { succeeded: false, error: new PythonKernelCleanupError(createdKernel, error) };
 	}
 
-	if (!execution.succeeded && (!cleanup.succeeded || !isCancellationError(execution.error))) {
-		throw execution.error;
-	}
+	if (!execution.succeeded && !isCancellationError(execution.error)) throw execution.error;
 	if (!cleanup.succeeded) throw cleanup.error;
 	if (!execution.succeeded) throw execution.error;
 	return execution.result;
