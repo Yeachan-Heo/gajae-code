@@ -21,12 +21,17 @@ import {
 	TERMINAL,
 } from "./terminal-capabilities";
 import {
+	type CopyRowAnnotation,
 	Ellipsis,
+	extractCopyRowAnnotation,
 	extractSegments,
 	isPrintableAscii,
 	normalizeTerminalOutput,
+	retainCopyAnnotations,
 	sliceByColumn,
 	sliceWithWidth,
+	splitCopyAnnotations,
+	stripCopyApcs,
 	truncateLinesToWidth,
 	truncateToWidth,
 	visibleWidth,
@@ -105,6 +110,8 @@ const LINE_TERMINATOR = "\x1b[0m\x1b]8;;\x07";
 const MOUSE_SELECTION_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 /** Discrete mouse-wheel notch size in terminal rows (xterm/less-style). */
 export const DEFAULT_WHEEL_LINES = 3;
+/** Row step cadence while a held drag rests on the transcript edge. */
+const MOUSE_AUTO_SCROLL_INTERVAL_MS = 50;
 /**
  * Repeat clicks on the same cell within this window escalate char -> word -> line
  * selection. SGR mouse reports carry no click counter, so the escalation is timed
@@ -1151,6 +1158,14 @@ export class TUI extends Container {
 	#mouseGestureDragged = false;
 	#mousePressPoint: MouseSelectionPoint | null = null;
 	#mousePressAt = 0;
+	/** Last screen cell of a held drag; scrolling re-resolves it against the new viewport. */
+	#mouseDragPointer: { x: number; y: number } | null = null;
+	/** Edge scrolling waits until the drag leaves the press row, so a small drag on an edge row stays put. */
+	#mousePressRow = 0;
+	#mouseDragLeftPressRow = false;
+	#mouseAutoScrollTimer?: NodeJS.Timeout;
+	/** Held only while this TUI runs with mouse copying, so other render() consumers stay stock. */
+	#releaseCopyAnnotations: (() => void) | undefined;
 	#lastClickPoint: MouseSelectionPoint | null = null;
 	#lastClickAt = 0;
 	#clickCount = 0;
@@ -1330,6 +1345,9 @@ export class TUI extends Container {
 	override dispose(): void {
 		if (this.#preparationDisposed) return;
 		this.#preparationDisposed = true;
+		this.#clearMouseSelection();
+		this.#releaseCopyAnnotations?.();
+		this.#releaseCopyAnnotations = undefined;
 		this.#renderRequested = false;
 		this.#renderRequestedGeneration = 0;
 		this.#inputRenderPending = false;
@@ -2100,9 +2118,7 @@ export class TUI extends Container {
 				if (!shouldWrite) return { queueId: id, operation: op.type, status: "stale-token" };
 			}
 			if (op.type === "raster-multipart-batch" && op.prefix !== undefined && op.afterPrefix !== undefined) {
-				const prefixWritten = this.#guardTerminalOperation(() =>
-					this.terminal.write(new TextDecoder().decode(op.prefix)),
-				);
+				const prefixWritten = this.#guardTerminalOperation(() => this.#emit(new TextDecoder().decode(op.prefix)));
 				if (!prefixWritten) return failed();
 				const abortBarrier = () => {
 					// Abort/cursor-restoration bytes are terminal writes: never emit
@@ -2112,7 +2128,7 @@ export class TUI extends Container {
 					const abortSuffix = op.abortSuffix === undefined ? "" : new TextDecoder().decode(op.abortSuffix);
 					const cursorVisibility = op.restoreCursorVisibility ? this.#cursorVisibilitySequence() : "";
 					if (abortSuffix || cursorVisibility)
-						this.#guardTerminalOperation(() => this.terminal.write(abortSuffix + cursorVisibility));
+						this.#guardTerminalOperation(() => this.#emit(abortSuffix + cursorVisibility));
 				};
 				const flushed = await (this.terminal as Terminal & { flush?: () => Promise<boolean> }).flush?.();
 				// Async boundary: the terminal may have stopped while we awaited.
@@ -2166,7 +2182,7 @@ export class TUI extends Container {
 			const dependent = op.type === "generic-render" || op.type === "generic-full-redraw";
 			const ok = dependent
 				? this.#writeProtectedRenderIngress(finalBytes)
-				: this.#guardTerminalOperation(() => this.terminal.write(finalBytes));
+				: this.#guardTerminalOperation(() => this.#emit(finalBytes));
 			if (!ok && dependent) {
 				const rect = (op as { rect: CellRect }).rect;
 				const blockedBy = [...this.#rasterCleanup.entries()]
@@ -2191,7 +2207,7 @@ export class TUI extends Container {
 			lease.revoked = true;
 			this.#rasterLeases.delete(request.token.ownerId);
 			const erase = this.#cursorGuardedRasterSequence(new TextDecoder().decode(lease.erase));
-			const ok = this.#guardTerminalOperation(() => this.terminal.write(erase));
+			const ok = this.#guardTerminalOperation(() => this.#emit(erase));
 			if (!ok)
 				this.#rasterCleanup.set(request.token.ownerId, {
 					token: lease.token,
@@ -2357,7 +2373,7 @@ export class TUI extends Container {
 			)
 		)
 			return false;
-		return this.#guardTerminalOperation(() => this.terminal.write(buffer));
+		return this.#guardTerminalOperation(() => this.#emit(buffer));
 	}
 	#writeProtectedRenderIngress(buffer: string): boolean {
 		const affected = [...this.#rasterLeases.values()];
@@ -2371,7 +2387,7 @@ export class TUI extends Container {
 				...affected.map(lease => new TextDecoder().decode(lease.erase)),
 			].join(""),
 		);
-		const ok = this.#guardTerminalOperation(() => this.terminal.write(cleanup + buffer));
+		const ok = this.#guardTerminalOperation(() => this.#emit(cleanup + buffer));
 		if (!ok) {
 			this.#terminalUnavailable = true;
 			this.#previousLines = [];
@@ -2454,6 +2470,9 @@ export class TUI extends Container {
 			this.#markTerminalUnavailable();
 			throw error;
 		}
+		// Taken only once the terminal started, so a failed start never leaves annotations on.
+		if (this.options.enableMouse === true && this.options.copySelection && !this.#releaseCopyAnnotations)
+			this.#releaseCopyAnnotations = retainCopyAnnotations();
 		if (this.#pendingTerminalCleanup.length > 0 || this.#rasterCleanup.size > 0) {
 			void this.notifyTerminalLifecycle({
 				kind: "availability-restored",
@@ -2591,8 +2610,13 @@ export class TUI extends Container {
 		this.#clearSixelProbeState();
 	}
 
+	/** The only terminal write sink: copy APCs are in-process metadata and never reach the terminal. */
+	#emit(data: string): void {
+		this.terminal.write(stripCopyApcs(data));
+	}
+
 	#writeTerminal(data: string, deferRenderFailure = false): boolean {
-		return this.#guardTerminalOperation(() => this.terminal.write(data), !deferRenderFailure);
+		return this.#guardTerminalOperation(() => this.#emit(data), !deferRenderFailure);
 	}
 
 	#frameSynchronizedOutput(payload: string): string {
@@ -2631,7 +2655,7 @@ export class TUI extends Container {
 			return false;
 		}
 		try {
-			this.terminal.write(data);
+			this.#emit(data);
 		} catch {
 			this.#markTerminalUnavailable();
 			return false;
@@ -2823,6 +2847,8 @@ export class TUI extends Container {
 		this.#clearSixelProbeState();
 		this.#clearMouseSelection();
 		this.#resetClickCount();
+		this.#releaseCopyAnnotations?.();
+		this.#releaseCopyAnnotations = undefined;
 		this.#stopped = true;
 		this.#settleRenderCommitWaiters(false);
 		if (this.#renderTimer) {
@@ -3311,15 +3337,29 @@ export class TUI extends Container {
 			data = current;
 		}
 
-		const mouse = parseSgrMouseEvent(data);
+		let mouse = parseSgrMouseEvent(data);
 		if (mouse) {
+			// A held selection may leave the window; clamp it to the nearest cell so
+			// the drag keeps extending instead of being discarded.
+			if (this.#mouseButtonDown && (mouse.kind === "drag" || mouse.kind === "release" || mouse.kind === "wheel")) {
+				mouse = {
+					...mouse,
+					x: Math.min(mouse.x, this.terminal.columns),
+					y: Math.min(mouse.y, this.terminal.rows),
+				};
+			}
 			// Coordinates outside the current terminal cannot name a visible cell.
 			if (mouse.x > this.terminal.columns || mouse.y > this.terminal.rows) {
 				this.#clearMouseSelection();
 				this.#resetClickCount();
 				return;
 			}
-			if (mouse.kind === "wheel") {
+			if (mouse.kind === "wheel" && this.#mouseButtonDown && this.#mouseSelectionAnchor !== null) {
+				// Wheel during a held drag scrolls under the pointer and keeps extending.
+				this.scrollViewportBy(mouse.direction! * DEFAULT_WHEEL_LINES, { pin: "stable" });
+				this.#extendMouseSelectionAt(mouse);
+				this.#updateMouseAutoScroll();
+			} else if (mouse.kind === "wheel") {
 				this.#clearMouseSelection();
 				this.#resetClickCount();
 				this.scrollViewportBy(mouse.direction! * DEFAULT_WHEEL_LINES, { pin: "stable" });
@@ -3428,6 +3468,100 @@ export class TUI extends Container {
 			: { line, column: mouse.x - 1 };
 	}
 
+	/** Screen rows (zero-based) that currently show transcript lines. */
+	#transcriptScreenRows(): { first: number; last: number } | null {
+		this.#ensureLiveSelectionRows();
+		let first = -1;
+		let last = -1;
+		for (let row = 0; row < this.#committedTranscriptRows.length; row++) {
+			const line = this.#committedTranscriptRows[row];
+			if (line === null || line === undefined || line < 0 || line >= this.#manualTranscriptLineCount) continue;
+			if (first < 0) first = row;
+			last = row;
+		}
+		return first < 0 ? null : { first, last };
+	}
+
+	/**
+	 * A held drag over editor/status chrome or past the transcript still names a
+	 * transcript cell: the nearest visible row, at the pointer column, extended to
+	 * the row edge so a downward drag reaches the end of the last line.
+	 */
+	#mouseDragPoint(pointer: { x: number; y: number }): MouseSelectionPoint | null {
+		const rows = this.#transcriptScreenRows();
+		const direct = this.#mouseSelectionPoint({ kind: "drag", x: pointer.x, y: pointer.y });
+		if (direct !== null || rows === null) return direct;
+		const above = pointer.y - 1 < rows.first;
+		const line = this.#committedTranscriptRows[above ? rows.first : rows.last]!;
+		return { line, column: above ? 0 : Math.max(0, this.terminal.columns - 1) };
+	}
+
+	/** Following live clears the screen-row map until the next paint; rebuild it from the live viewport. */
+	#ensureLiveSelectionRows(): void {
+		if (this.#manualViewportTop !== undefined || this.#committedTranscriptRows.length > 0) return;
+		this.#refreshPaintedLiveViewportObservation(this.terminal.rows);
+	}
+
+	#extendMouseSelectionAt(pointer: { x: number; y: number }): void {
+		const anchor = this.#mouseSelectionAnchor;
+		if (this.#mouseSelectionStart === null || anchor === null) return;
+		this.#mouseDragPointer = { x: pointer.x, y: pointer.y };
+		this.#mouseGestureDragged = true;
+		if (pointer.y !== this.#mousePressRow) this.#mouseDragLeftPressRow = true;
+		const point = this.#mouseDragPoint(pointer);
+		if (point === null) return;
+		const forward = point.line > anchor.line || (point.line === anchor.line && point.column >= anchor.column);
+		// The anchor span stays whole while the far end grows, so dragging after a
+		// double click extends word by word instead of collapsing back to one cell.
+		this.#mouseSelectionStart = this.#snapSelectionPoint(anchor, forward ? "start" : "end");
+		this.#mouseSelectionEnd = this.#snapSelectionPoint(point, forward ? "end" : "start");
+		this.#mouseSelectionActive = true;
+	}
+
+	/** Edge direction for a held drag: above the first or at/below the last transcript row. */
+	#mouseAutoScrollDirection(pointer: { x: number; y: number }): -1 | 0 | 1 {
+		const rows = this.#transcriptScreenRows();
+		if (rows === null || !this.#mouseDragLeftPressRow) return 0;
+		const row = pointer.y - 1;
+		if (row <= rows.first) return -1;
+		if (row >= rows.last || row >= this.terminal.rows - 1) return 1;
+		return 0;
+	}
+
+	#updateMouseAutoScroll(): void {
+		const pointer = this.#mouseDragPointer;
+		const direction = pointer && this.#mouseButtonDown ? this.#mouseAutoScrollDirection(pointer) : 0;
+		if (direction === 0) {
+			this.#stopMouseAutoScroll();
+			return;
+		}
+		if (this.#mouseAutoScrollTimer !== undefined) return;
+		this.#mouseAutoScrollTimer = setInterval(() => {
+			const held = this.#mouseDragPointer;
+			const step = held && this.#mouseButtonDown ? this.#mouseAutoScrollDirection(held) : 0;
+			const before = this.#transcriptScreenRows();
+			const firstLine = before === null ? null : this.#committedTranscriptRows[before.first];
+			if (held === null || step === 0 || !this.scrollViewportBy(step, { pin: "stable" })) {
+				this.#stopMouseAutoScroll();
+				return;
+			}
+			// A boundary (live bottom, history top) reports success without moving.
+			const after = this.#transcriptScreenRows();
+			if (after === null || this.#committedTranscriptRows[after.first] === firstLine) {
+				this.#stopMouseAutoScroll();
+				return;
+			}
+			this.#extendMouseSelectionAt(held);
+			this.requestRender(false, "mouse");
+		}, MOUSE_AUTO_SCROLL_INTERVAL_MS);
+	}
+
+	#stopMouseAutoScroll(): void {
+		if (this.#mouseAutoScrollTimer === undefined) return;
+		clearInterval(this.#mouseAutoScrollTimer);
+		this.#mouseAutoScrollTimer = undefined;
+	}
+
 	/**
 	 * Resolve the selection granularity for this press. SGR mouse reports carry no
 	 * click counter, so repeats are inferred from the previous press: same cell and
@@ -3523,6 +3657,8 @@ export class TUI extends Container {
 		const mode = this.#nextClickMode(point, pressAt);
 		this.#mouseButtonDown = true;
 		this.#mouseGestureDragged = false;
+		this.#mousePressRow = mouse.y;
+		this.#mouseDragLeftPressRow = false;
 		this.#mousePressPoint = point;
 		this.#mousePressAt = pressAt;
 		this.#mouseSelectionMode = mode;
@@ -3539,17 +3675,8 @@ export class TUI extends Container {
 			this.#resetClickCount();
 			return;
 		}
-		const anchor = this.#mouseSelectionAnchor;
-		if (this.#mouseSelectionStart === null || anchor === null) return;
-		const point = this.#mouseSelectionPoint(mouse);
-		this.#mouseGestureDragged = true;
-		if (point === null) return;
-		const forward = point.line > anchor.line || (point.line === anchor.line && point.column >= anchor.column);
-		// The anchor span stays whole while the far end grows, so dragging after a
-		// double click extends word by word instead of collapsing back to one cell.
-		this.#mouseSelectionStart = this.#snapSelectionPoint(anchor, forward ? "start" : "end");
-		this.#mouseSelectionEnd = this.#snapSelectionPoint(point, forward ? "end" : "start");
-		this.#mouseSelectionActive = true;
+		this.#extendMouseSelectionAt(mouse);
+		this.#updateMouseAutoScroll();
 	}
 
 	#finishMouseSelection(mouse: MouseEvent): void {
@@ -3558,7 +3685,10 @@ export class TUI extends Container {
 			return;
 		}
 		this.#mouseButtonDown = false;
-		const point = this.#mouseSelectionPoint(mouse);
+		this.#stopMouseAutoScroll();
+		this.#mouseDragPointer = null;
+		const dragged = this.#mouseGestureDragged;
+		const point = dragged ? this.#mouseDragPoint(mouse) : this.#mouseSelectionPoint(mouse);
 		const pressPoint = this.#mousePressPoint;
 		const pressAt = this.#mousePressAt;
 		const completedClick =
@@ -3587,7 +3717,9 @@ export class TUI extends Container {
 			this.#clearMouseSelection();
 			return;
 		}
-		const text = this.#extractMouseSelection();
+		// Source-aware rows return original Markdown, which may carry ESC/C0 bytes from
+		// model or tool text; sanitize at the clipboard boundary (\t and \n survive).
+		const text = stripTerminalControls(this.#extractMouseSelection());
 		if (!text) {
 			this.#clearMouseSelection();
 			return;
@@ -3601,6 +3733,8 @@ export class TUI extends Container {
 	}
 
 	#clearMouseSelection(): void {
+		this.#stopMouseAutoScroll();
+		this.#mouseDragPointer = null;
 		this.#mouseSelectionStart = null;
 		this.#mouseSelectionEnd = null;
 		this.#mouseSelectionAnchor = null;
@@ -3638,23 +3772,147 @@ export class TUI extends Container {
 	#extractMouseSelection(): string {
 		const selection = this.#orderedMouseSelection();
 		if (selection === null) return "";
-		const selected: string[] = [];
+		type SelectedRow = {
+			line: number;
+			fragment: string;
+			sourceId?: string;
+			annotation?: CopyRowAnnotation;
+			covered?: boolean;
+			atContentStart?: boolean;
+		};
+		const selected: SelectedRow[] = [];
 		const selectionLines = this.#selectionSourceLines();
 		for (let lineIndex = selection.start.line; lineIndex <= selection.end.line; lineIndex++) {
 			const line = selectionLines[lineIndex];
 			if (line === undefined || TERMINAL.isImageLine(line)) {
-				selected.push("");
+				selected.push({ line: lineIndex, fragment: "" });
 				continue;
 			}
-			const plain = stripTerminalControls(line);
+			// Read renderer metadata before stripping APC/ANSI controls. The metadata is
+			// attached to this physical row, so identical text in another component can
+			// never be mistaken for this selection.
+			const copy = extractCopyRowAnnotation(line);
+			const rendered = copy?.line ?? line;
+			const plain = stripTerminalControls(rendered);
 			const columns = this.#mouseSelectionColumns(lineIndex, plain);
 			if (columns === null || columns.end <= columns.start) {
-				selected.push("");
+				selected.push({ line: lineIndex, fragment: "" });
 				continue;
 			}
-			selected.push(sliceByColumn(plain, columns.start, columns.end - columns.start, false));
+			const candidate = copy?.annotation;
+			const annotation =
+				candidate && copy.originColumn + candidate.contentEnd <= visibleWidth(plain) ? candidate : undefined;
+			const localColumns = copy
+				? { start: columns.start - copy.originColumn, end: columns.end - copy.originColumn }
+				: columns;
+			const presentationStart = annotation ? annotation.contentStart + annotation.prefixColumns : localColumns.start;
+			const start = annotation ? Math.max(localColumns.start, presentationStart) : localColumns.start;
+			const end = annotation ? Math.min(localColumns.end, annotation.contentEnd) : localColumns.end;
+			let fragment = end > start ? sliceByColumn(plain, (copy?.originColumn ?? 0) + start, end - start, false) : "";
+			if (annotation?.ranges) {
+				fragment = annotation.ranges
+					.map(([rangeStart, rangeEnd]) => {
+						const overlapStart = Math.max(start, rangeStart);
+						const overlapEnd = Math.min(end, rangeEnd);
+						return overlapEnd > overlapStart
+							? sliceByColumn(plain, (copy?.originColumn ?? 0) + overlapStart, overlapEnd - overlapStart, false)
+							: "";
+					})
+					.filter(value => value.length > 0)
+					.join("\t");
+			}
+			if (annotation?.fence) fragment = "";
+			const covered = annotation
+				? localColumns.start <= annotation.contentStart && localColumns.end >= annotation.contentEnd
+				: false;
+			// A fully covered rendered code row may restore its row-local original
+			// slice (not the whole logical line), which preserves an original tab.
+			if (covered && annotation?.kind === "code" && !annotation.fence) fragment = annotation.source;
+			selected.push({
+				line: lineIndex,
+				fragment,
+				sourceId: copy?.sourceId,
+				annotation,
+				covered,
+				atContentStart: annotation ? localColumns.start <= presentationStart : true,
+			});
 		}
-		return selected.join("\n");
+
+		const groups = new Map<string, { rows: SelectedRow[]; complete: boolean }>();
+		for (const row of selected) {
+			if (!row.annotation || !row.sourceId) continue;
+			const key = `${row.sourceId}:${row.annotation.token}`;
+			const group = groups.get(key) ?? { rows: [], complete: false };
+			group.rows.push(row);
+			groups.set(key, group);
+		}
+		// A token is complete when every selected row is covered, the selection reaches
+		// the token's last row (which carries the whole-token source), and the rows just
+		// outside the group belong to something else — rows of one token are contiguous.
+		const rowKey = (lineIndex: number): string | undefined => {
+			const line = selectionLines[lineIndex];
+			if (line === undefined || TERMINAL.isImageLine(line)) return undefined;
+			const copy = extractCopyRowAnnotation(line);
+			return copy ? `${copy.sourceId}:${copy.annotation.token}` : undefined;
+		};
+		for (const [key, group] of groups) {
+			const first = group.rows[0]!;
+			const last = group.rows[group.rows.length - 1]!;
+			group.complete =
+				group.rows.every(row => row.covered) &&
+				last.annotation?.tokenSource !== undefined &&
+				last.line - first.line + 1 === group.rows.length &&
+				rowKey(first.line - 1) !== key &&
+				rowKey(last.line + 1) !== key;
+		}
+
+		const allSemanticRowsAreComplete = selected.every(row => {
+			if (!row.annotation || !row.sourceId) return row.fragment.length === 0;
+			return groups.get(`${row.sourceId}:${row.annotation.token}`)?.complete === true;
+		});
+		if (allSemanticRowsAreComplete) {
+			const completed = [...groups.values()];
+			const codeOnly = completed.length === 1 && completed[0]?.rows[0]?.annotation?.kind === "code";
+			if (codeOnly) {
+				const rows = completed[0]!.rows;
+				const raw = rows[rows.length - 1]?.annotation?.tokenSource ?? "";
+				// Token raw keeps the block's trailing newline; drop it so the closing fence is the last line.
+				const lines = raw.replace(/\n+$/u, "").split("\n");
+				if (/^\s*(```|~~~)/u.test(lines[0] ?? "")) {
+					lines.shift();
+					if (/^\s*(```|~~~)/u.test(lines[lines.length - 1] ?? "")) lines.pop();
+				}
+				return lines.join("\n");
+			}
+			let result = "";
+			for (const row of selected) {
+				// Each complete token contributes once, from its final row.
+				if (row.annotation?.tokenSource !== undefined) result += row.annotation.tokenSource;
+			}
+			return result;
+		}
+		let result = "";
+		let previous: SelectedRow | undefined;
+		for (const row of selected) {
+			const annotation = row.annotation;
+			if (annotation?.fence || annotation?.ranges?.length === 0) continue;
+			if (previous) {
+				if (
+					annotation?.continuation &&
+					previous.annotation?.token === annotation.token &&
+					previous.sourceId === row.sourceId
+				) {
+					result += annotation.joinGap;
+				} else {
+					result += "\n";
+				}
+			}
+			if (annotation?.quoteDepth && !annotation.continuation && row.atContentStart)
+				result += "> ".repeat(annotation.quoteDepth);
+			result += row.fragment;
+			previous = row;
+		}
+		return result;
 	}
 
 	#applyMouseSelection(lines: string[]): string[] {
@@ -3665,17 +3923,28 @@ export class TUI extends Container {
 		for (let lineIndex = selection.start.line; lineIndex <= selection.end.line; lineIndex++) {
 			const line = highlighted[lineIndex];
 			if (line === undefined || TERMINAL.isImageLine(line)) continue;
-			const plain = stripTerminalControls(line);
+			// Detach copy APCs verbatim (no payload decoding on this per-frame path) and
+			// put them back around the painted row so a later copy still reads them.
+			const {
+				line: rendered,
+				origin: originMarker,
+				originColumn,
+				rows: annotationSuffix,
+			} = splitCopyAnnotations(line);
+			const plain = stripTerminalControls(rendered);
 			const width = visibleWidth(plain);
 			const columns = this.#mouseSelectionColumns(lineIndex, plain);
 			if (columns === null || columns.end <= columns.start) continue;
-			const before = sliceByColumn(line, 0, columns.start, false);
-			const selected = sliceByColumn(line, columns.start, columns.end - columns.start, false).replace(
+			const before = columns.start > 0 ? sliceByColumn(rendered, 0, columns.start, false) : "";
+			const selected = sliceByColumn(rendered, columns.start, columns.end - columns.start, false).replace(
 				/\x1b\[[0-9;]*m/gu,
 				control => `${control}\x1b[7m`,
 			);
-			const after = sliceByColumn(line, columns.end, Math.max(0, width - columns.end), false);
-			highlighted[lineIndex] = `${before}\x1b[7m${selected}\x1b[27m${after}`;
+			const after = columns.end < width ? sliceByColumn(rendered, columns.end, width - columns.end, false) : "";
+			const painted = `${before}\x1b[7m${selected}\x1b[27m${after}`;
+			const head = originColumn > 0 ? sliceByColumn(painted, 0, originColumn, false) : "";
+			const tail = originColumn < width ? sliceByColumn(painted, originColumn, width - originColumn, false) : "";
+			highlighted[lineIndex] = `${head}${originMarker}${tail}${annotationSuffix}`;
 		}
 		return highlighted;
 	}

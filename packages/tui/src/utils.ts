@@ -193,12 +193,187 @@ export interface ViewportAnchorAnnotation {
 	token: string;
 }
 
+export interface CopyRowAnnotation {
+	token: number;
+	kind: string;
+	/** Actual logical source line corresponding to this row, never a token copy. */
+	source: string;
+	/**
+	 * Present on the token's last row (also while streaming), for complete-token
+	 * reconstruction. Only the growing tail token's last row changes per delta, and
+	 * ending a stream leaves already-painted rows byte-identical.
+	 */
+	tokenSource?: string;
+	joinGap: string;
+	contentStart: number;
+	contentEnd: number;
+	continuation: boolean;
+	prefixColumns: number;
+	fence: boolean;
+	quoteDepth: number;
+	ranges?: Array<[number, number]>;
+}
+
 // APC marker for viewport anchors. Must NOT start with "\x1b_G": that is the
 // Kitty graphics prefix and TERMINAL.isImageLine() would misclassify every
 // annotated line as an image line, which skips wrapping (issue: assistant
 // prose overflowing the terminal on Kitty-protocol terminals).
 export const VIEWPORT_ANCHOR_PREFIX = "\x1b_AGJC_ANCHOR:";
 const VIEWPORT_ANCHOR_SUFFIX = "\x1b\\";
+const COPY_ANNOTATION_PREFIX = "\x1b_AGJC_COPY:";
+// Kept module-private so ordinary terminal text cannot forge semantic clipboard rows.
+const copyAnnotationNonce = crypto.randomUUID();
+const COPY_ANNOTATION_REGEX = /\x1b_AGJC_COPY:([^:]+):([^:]+):([^\x1b]*)\x1b\\/gu;
+const COPY_ORIGIN_PREFIX = "\x1b_AGJC_COPY_ORIGIN:";
+const COPY_ORIGIN_REGEX = /\x1b_AGJC_COPY_ORIGIN:([^\x1b]*)\x1b\\/gu;
+/** Every in-process copy APC (row, origin, renderer hints); none may reach a terminal. */
+const ANY_COPY_APC_MARKER = "\x1b_AGJC_COPY";
+const ANY_COPY_APC_REGEX = /\x1b_AGJC_COPY[A-Z_]*:[^\x1b]*\x1b\\/gu;
+
+let copyAnnotationRetainers = 0;
+/**
+ * Copy annotations are emitted only while a TUI that copies mouse selections is
+ * running. The switch is process-wide: while it is on, every Markdown render in
+ * the process carries zero-width copy APCs, which TUI.#emit strips at the
+ * terminal write boundary. With no such TUI running, render() output is
+ * byte-identical to the stock renderer. Returns an idempotent release.
+ */
+export function retainCopyAnnotations(): () => void {
+	copyAnnotationRetainers++;
+	let released = false;
+	return () => {
+		if (released) return;
+		released = true;
+		copyAnnotationRetainers--;
+	};
+}
+export function copyAnnotationsEnabled(): boolean {
+	return copyAnnotationRetainers > 0;
+}
+/** Remove all copy APCs; applied to bytes at the terminal write boundary. */
+export function stripCopyApcs(data: string): string {
+	return data.includes(ANY_COPY_APC_MARKER) ? data.replace(ANY_COPY_APC_REGEX, "") : data;
+}
+const COPY_ROW_KINDS = new Set([
+	"heading",
+	"paragraph",
+	"code",
+	"list",
+	"table",
+	"blockquote",
+	"hr",
+	"html",
+	"space",
+	"text",
+	"def",
+]);
+const isCopyColumn = (value: unknown): value is number =>
+	typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+
+/** Zero-width content origin; parent containers may prepend visible columns. */
+export function annotateCopyOrigin(line: string): string {
+	return `${COPY_ORIGIN_PREFIX}${copyAnnotationNonce}${VIEWPORT_ANCHOR_SUFFIX}${line}`;
+}
+
+/** Attach renderer-owned semantic copy data after a row's visible content. */
+export function annotateCopyRow(line: string, sourceId: string, annotation: CopyRowAnnotation): string {
+	return `${line}${COPY_ANNOTATION_PREFIX}${copyAnnotationNonce}:${sourceId}:${encodeURIComponent(JSON.stringify(annotation))}${VIEWPORT_ANCHOR_SUFFIX}`;
+}
+
+/** Read the annotation carried by this exact rendered row. */
+export function extractCopyRowAnnotation(
+	line: string,
+): { line: string; sourceId: string; annotation: CopyRowAnnotation; originColumn: number } | null {
+	// Assigned inside the replace callback; a holder object keeps TypeScript from narrowing it to null.
+	const found: { value: { sourceId: string; annotation: CopyRowAnnotation } | null } = { value: null };
+	let originColumn: number | undefined;
+	const withoutOrigin = line.replace(COPY_ORIGIN_REGEX, (_marker, nonce: string, offset: number) => {
+		if (nonce === copyAnnotationNonce && originColumn === undefined)
+			originColumn = visibleWidth(line.slice(0, offset));
+		return "";
+	});
+	const clean = withoutOrigin.replace(
+		COPY_ANNOTATION_REGEX,
+		(_marker, nonce: string, sourceId: string, encoded: string) => {
+			if (nonce !== copyAnnotationNonce || found.value !== null) return "";
+			try {
+				const value: unknown = JSON.parse(decodeURIComponent(encoded));
+				const annotation = value as Partial<CopyRowAnnotation>;
+				if (
+					typeof value !== "object" ||
+					value === null ||
+					!isCopyColumn(annotation.token) ||
+					typeof annotation.kind !== "string" ||
+					!COPY_ROW_KINDS.has(annotation.kind) ||
+					typeof annotation.source !== "string" ||
+					(annotation.tokenSource !== undefined && typeof annotation.tokenSource !== "string") ||
+					typeof annotation.joinGap !== "string" ||
+					!isCopyColumn(annotation.contentStart) ||
+					!isCopyColumn(annotation.contentEnd) ||
+					annotation.contentEnd < annotation.contentStart ||
+					typeof annotation.continuation !== "boolean" ||
+					!isCopyColumn(annotation.prefixColumns) ||
+					typeof annotation.fence !== "boolean" ||
+					!isCopyColumn(annotation.quoteDepth) ||
+					(annotation.ranges !== undefined &&
+						(!Array.isArray(annotation.ranges) ||
+							annotation.ranges.some(
+								range =>
+									!Array.isArray(range) ||
+									range.length !== 2 ||
+									!isCopyColumn(range[0]) ||
+									!isCopyColumn(range[1]) ||
+									range[1] < range[0],
+							)))
+				)
+					return "";
+				found.value = { sourceId, annotation: annotation as CopyRowAnnotation };
+			} catch {
+				// Terminal data is untrusted at this boundary; ignore malformed APC data.
+			}
+			return "";
+		},
+	);
+	return found.value === null ? null : { line: clean, ...found.value, originColumn: originColumn ?? 0 };
+}
+
+/**
+ * Detach copy APCs from a row without decoding payloads: the visible line, the
+ * column of this process's origin marker, and the verbatim row APCs. Re-attaching
+ * `origin` at `originColumn` and `rows` after the content restores the annotations.
+ */
+export function splitCopyAnnotations(line: string): {
+	line: string;
+	origin: string;
+	originColumn: number;
+	rows: string;
+} {
+	if (!line.includes(ANY_COPY_APC_MARKER)) return { line, origin: "", originColumn: 0, rows: "" };
+	let origin = "";
+	let originColumn = 0;
+	const withoutOrigin = line.replace(COPY_ORIGIN_REGEX, (marker, nonce: string, offset: number) => {
+		if (nonce === copyAnnotationNonce && !origin) {
+			origin = marker;
+			originColumn = visibleWidth(line.slice(0, offset));
+		}
+		return "";
+	});
+	let rows = "";
+	const clean = withoutOrigin.replace(COPY_ANNOTATION_REGEX, marker => {
+		rows += marker;
+		return "";
+	});
+	return { line: clean, origin, originColumn, rows };
+}
+
+/** Rebind cached semantic row data to the component that emitted this frame. */
+export function replaceCopyAnnotationSourceId(line: string, sourceId: string): string {
+	return line.replace(
+		COPY_ANNOTATION_REGEX,
+		(_marker, nonce: string, _oldSourceId: string, encoded: string) =>
+			`${COPY_ANNOTATION_PREFIX}${nonce}:${sourceId}:${encoded}${VIEWPORT_ANCHOR_SUFFIX}`,
+	);
+}
 
 function ansiSequenceEnd(text: string, start: number): number {
 	if (text[start] !== "\x1b" || start + 1 >= text.length) return start;
