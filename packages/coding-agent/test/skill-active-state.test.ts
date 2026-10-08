@@ -458,7 +458,7 @@ describe("GJC skill-active state", () => {
 			expect(visible?.active_skills?.map(entry => entry.skill).sort()).toEqual(["autoresearch", "ralplan"]);
 			expect(visible?.active_skills?.find(entry => entry.skill === "ralplan")?.phase).toBe("pending-approval");
 			const migratedRalplan = JSON.parse(
-				await fs.readFile(path.join(activeStateDir(cwd, sessionId), "ralplan.json"), "utf8"),
+				await Bun.file(path.join(activeStateDir(cwd, sessionId), "ralplan.json")).text(),
 			);
 			expect(migratedRalplan.source_state_revision).toBe(0);
 		});
