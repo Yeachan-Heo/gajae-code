@@ -89,10 +89,19 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		},
 	);
 
-	it("returns unknown for UNC paths without probing a share", () => {
-		expect(directoryCaseSensitive(String.raw`\\server\share\workspace`)).toBeNull();
-		expect(directoryCaseSensitive(String.raw`\\?\UNC\server\share\workspace`)).toBeNull();
-	});
+	it.skipIf(!process.env.GJC_TEST_UNC_CASE_SENSITIVE_DIRECTORY)(
+		"queries case-sensitive child names on a configured UNC share",
+		() => {
+			expect(directoryCaseSensitive(process.env.GJC_TEST_UNC_CASE_SENSITIVE_DIRECTORY!)).toBe(true);
+		},
+	);
+
+	it.skipIf(!process.env.GJC_TEST_UNC_CASE_INSENSITIVE_DIRECTORY)(
+		"queries case-insensitive child names on a configured UNC share",
+		() => {
+			expect(directoryCaseSensitive(process.env.GJC_TEST_UNC_CASE_INSENSITIVE_DIRECTORY!)).toBe(false);
+		},
+	);
 
 	it("keeps retained publication refusal structured on Windows", async () => {
 		const root = await temporaryDirectory();

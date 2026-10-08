@@ -194,6 +194,23 @@ describe("task fork-context provider identity", () => {
 		}
 	});
 
+	it("canonicalizes an existing root alias before creating a missing managed descendant", () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-managed-root-alias-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const configuredRoot = path.join(tempDir, "managed-root");
+		fs.mkdirSync(configuredRoot);
+		const root = managedDirectoryRoot(configuredRoot);
+		const rootAlias = path.join(tempDir, "managed-root-alias");
+		fs.symlinkSync(configuredRoot, rootAlias, process.platform === "win32" ? "junction" : "dir");
+
+		const store = new ManagedSessionDescendantStore(root, path.join(rootAlias, "artifacts"));
+		try {
+			expect(store.dir).toBe(path.join(root.canonicalPath, "artifacts"));
+		} finally {
+			store.close();
+		}
+	});
+
 	it("gives nested managed children distinct provider identities without rewriting logical headers", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-task-cache-key-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);

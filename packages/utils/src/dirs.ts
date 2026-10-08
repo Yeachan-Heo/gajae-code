@@ -90,21 +90,7 @@ type NativeDirectoryCaseSensitivityBindings = {
 
 let nativeDirectoryCaseSensitivityBindings: NativeDirectoryCaseSensitivityBindings | undefined;
 
-function isWindowsNetworkPath(inputPath: string): boolean {
-	const normalizedPath = path.win32.normalize(inputPath);
-	const lowerPath = normalizedPath.toLowerCase();
-	if (lowerPath.startsWith("\\\\?\\unc\\") || lowerPath.startsWith("\\\\.\\unc\\")) return true;
-	return (
-		normalizedPath.startsWith("\\\\") &&
-		!normalizedPath.startsWith("\\\\?\\") &&
-		!normalizedPath.startsWith("\\\\.\\")
-	);
-}
-
 function windowsDirectoryCaseSensitivity(directoryPath: string): boolean | undefined {
-	// The native query deliberately rejects UNC paths. Windows UNC paths use
-	// case-insensitive names by default, so fold them without probing the share.
-	if (isWindowsNetworkPath(directoryPath)) return false;
 	try {
 		nativeDirectoryCaseSensitivityBindings ??=
 			require("@gajae-code/natives") as NativeDirectoryCaseSensitivityBindings;
@@ -124,30 +110,62 @@ function windowsDirectoryCaseSensitivity(directoryPath: string): boolean | undef
 export function stablePathKey(inputPath: string): string {
 	const resolvedPath = path.resolve(inputPath);
 
-	let entryPath = resolvedPath;
-	try {
-		fs.lstatSync(entryPath);
-		// Resolve existing entries before using their name so 8.3 aliases and
-		// symlinks share the canonical entry name without depending on its inode.
-		entryPath = fs.realpathSync(entryPath);
-	} catch {}
-
-	const parentPath = path.dirname(entryPath);
-	let entryName = path.basename(entryPath);
 	if (process.platform !== "win32") {
+		let entryPath = resolvedPath;
 		try {
-			return path.join(fs.realpathSync(parentPath), entryName);
+			fs.lstatSync(entryPath);
+			// Resolve existing entries before using their name so symlinks share
+			// the canonical entry name without depending on the file's inode.
+			entryPath = fs.realpathSync(entryPath);
+		} catch {}
+		const parentPath = path.dirname(entryPath);
+		try {
+			return path.join(fs.realpathSync(parentPath), path.basename(entryPath));
 		} catch {
 			return resolvedPath;
 		}
 	}
-	const caseSensitiveDirectory = windowsDirectoryCaseSensitivity(parentPath);
-	if (caseSensitiveDirectory === false) entryName = entryName.toLowerCase();
+
+	let entryPath = resolvedPath;
+	let parentPath = path.dirname(entryPath);
+	let parentIdentity: { dev: bigint; ino: bigint } | undefined;
 	try {
-		const parentStats = fs.statSync(parentPath, { bigint: true });
-		if (parentStats.ino !== 0n)
-			return JSON.stringify(["win32-path-entry", parentStats.dev.toString(), parentStats.ino.toString(), entryName]);
+		const stats = fs.statSync(parentPath, { bigint: true });
+		parentIdentity = { dev: stats.dev, ino: stats.ino };
 	} catch {}
+	let caseSensitiveDirectory = parentIdentity ? windowsDirectoryCaseSensitivity(parentPath) : undefined;
+
+	// Unknown case semantics must stay conservative. In particular, a remote
+	// share may be case-sensitive, and resolving an existing final entry could
+	// change the key that was registered while that transcript was still missing.
+	if (caseSensitiveDirectory !== undefined && parentIdentity?.ino !== 0n) {
+		try {
+			fs.lstatSync(entryPath);
+			// Resolve existing entries so 8.3 aliases and symlinks share a canonical
+			// entry name without depending on the replaceable file's inode.
+			entryPath = fs.realpathSync(entryPath);
+		} catch {}
+		const canonicalParentPath = path.dirname(entryPath);
+		if (canonicalParentPath !== parentPath) {
+			parentPath = canonicalParentPath;
+			parentIdentity = undefined;
+			try {
+				const stats = fs.statSync(parentPath, { bigint: true });
+				parentIdentity = { dev: stats.dev, ino: stats.ino };
+			} catch {}
+			caseSensitiveDirectory = parentIdentity ? windowsDirectoryCaseSensitivity(parentPath) : undefined;
+		}
+	}
+
+	let entryName = path.basename(entryPath);
+	if (caseSensitiveDirectory === false) entryName = entryName.toLowerCase();
+	if (parentIdentity && parentIdentity.ino !== 0n)
+		return JSON.stringify([
+			"win32-path-entry",
+			parentIdentity.dev.toString(),
+			parentIdentity.ino.toString(),
+			entryName,
+		]);
 	return caseSensitiveDirectory === false ? resolvedPath.toLowerCase() : resolvedPath;
 }
 

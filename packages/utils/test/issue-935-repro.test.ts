@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -50,13 +51,21 @@ describe("issue #6446 Windows path casing", () => {
 	it("canonicalizes existing Windows short-name aliases", () => {
 		if (process.platform !== "win32") return;
 
-		const shortPath = "C:\\sessions\\SESSION~1.JSONL";
-		const canonicalPath = "C:\\sessions\\long-session-name.jsonl";
-		vi.spyOn(fs, "lstatSync").mockImplementation((() => ({})) as unknown as typeof fs.lstatSync);
-		vi.spyOn(fs, "realpathSync").mockImplementation((() => canonicalPath) as unknown as typeof fs.realpathSync);
-		vi.spyOn(fs, "statSync").mockImplementation((() => ({ dev: 1n, ino: 2n })) as unknown as typeof fs.statSync);
-
-		expect(stablePathKey(shortPath)).toBe(stablePathKey(canonicalPath));
+		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-short-name-key-"));
+		try {
+			const shortPath = path.join(directory, "SESSION~1.JSONL");
+			const canonicalPath = path.join(directory, "long-session-name.jsonl");
+			const sensitivity = directoryCaseSensitive(directory);
+			vi.spyOn(fs, "lstatSync").mockImplementation((() => ({})) as unknown as typeof fs.lstatSync);
+			vi.spyOn(fs, "realpathSync").mockImplementation((() => canonicalPath) as unknown as typeof fs.realpathSync);
+			if (sensitivity === false) {
+				expect(stablePathKey(shortPath)).toBe(stablePathKey(canonicalPath));
+			} else {
+				expect(stablePathKey(shortPath)).not.toBe(stablePathKey(canonicalPath));
+			}
+		} finally {
+			fs.rmSync(directory, { recursive: true, force: true });
+		}
 	});
 
 	it("uses the parent directory's case rule for missing transcript names", () => {
@@ -101,24 +110,64 @@ describe("issue #6446 Windows path casing", () => {
 		},
 	);
 
-	it("folds missing UNC paths without querying the remote share", () => {
+	it("preserves missing UNC name casing when share semantics are unavailable", () => {
 		if (process.platform !== "win32") return;
 
-		vi.spyOn(fs, "lstatSync").mockImplementation((() => {
+		const lstat = vi.spyOn(fs, "lstatSync").mockImplementation((() => {
 			throw new Error("ENOENT");
 		}) as unknown as typeof fs.lstatSync);
-		vi.spyOn(fs, "realpathSync").mockImplementation((() => {
+		const realpath = vi.spyOn(fs, "realpathSync").mockImplementation((() => {
 			throw new Error("ENOENT");
 		}) as unknown as typeof fs.realpathSync);
 		vi.spyOn(fs, "statSync").mockImplementation((() => {
 			throw new Error("network unavailable");
 		}) as unknown as typeof fs.statSync);
 
-		expect(stablePathKey(String.raw`\\server\share\Sessions\session.jsonl`)).toBe(
+		expect(stablePathKey(String.raw`\\server\share\Sessions\session.jsonl`)).not.toBe(
 			stablePathKey(String.raw`\\SERVER\SHARE\sessions\SESSION.JSONL`),
 		);
-		expect(stablePathKey(String.raw`\\?\UNC\server\share\Sessions\session.jsonl`)).toBe(
+		expect(stablePathKey(String.raw`\\?\UNC\server\share\Sessions\session.jsonl`)).not.toBe(
 			stablePathKey(String.raw`\\?\UNC\SERVER\SHARE\sessions\SESSION.JSONL`),
 		);
+		expect(lstat).not.toHaveBeenCalled();
+		expect(realpath).not.toHaveBeenCalled();
 	});
+
+	it.skipIf(process.platform !== "win32" || !process.env.GJC_TEST_UNC_CASE_SENSITIVE_DIRECTORY)(
+		"keeps distinct transcript entries on a case-sensitive UNC share",
+		() => {
+			const directory = process.env.GJC_TEST_UNC_CASE_SENSITIVE_DIRECTORY!;
+			expect(path.win32.normalize(directory).startsWith("\\\\")).toBe(true);
+			expect(directoryCaseSensitive(directory)).toBe(true);
+			const stem = `gjc-unc-${randomUUID()}`;
+			const firstPath = path.join(directory, `${stem}-Session.jsonl`);
+			const secondPath = path.join(directory, `${stem}-session.jsonl`);
+			try {
+				fs.writeFileSync(firstPath, "upper");
+				fs.writeFileSync(secondPath, "lower", { flag: "wx" });
+				expect(stablePathKey(firstPath)).not.toBe(stablePathKey(secondPath));
+			} finally {
+				fs.rmSync(firstPath, { force: true });
+				fs.rmSync(secondPath, { force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform !== "win32" || !process.env.GJC_TEST_UNC_CASE_INSENSITIVE_DIRECTORY)(
+		"folds transcript aliases on a case-insensitive UNC share",
+		() => {
+			const directory = process.env.GJC_TEST_UNC_CASE_INSENSITIVE_DIRECTORY!;
+			expect(path.win32.normalize(directory).startsWith("\\\\")).toBe(true);
+			expect(directoryCaseSensitive(directory)).toBe(false);
+			const stem = `gjc-unc-${randomUUID()}`;
+			const firstPath = path.join(directory, `${stem}-Session.jsonl`);
+			const aliasPath = path.join(directory, `${stem}-session.jsonl`);
+			try {
+				fs.writeFileSync(firstPath, "session");
+				expect(stablePathKey(firstPath)).toBe(stablePathKey(aliasPath));
+			} finally {
+				fs.rmSync(firstPath, { force: true });
+			}
+		},
+	);
 });

@@ -10951,7 +10951,21 @@ mod platform {
 	}
 
 	pub(super) fn directory_case_sensitive(path: &Path) -> Option<bool> {
-		let handle = open_path(path, false, FILE_READ_ATTRIBUTES).ok()?;
+		let path_wide = wide(path);
+		let handle = unsafe {
+			CreateFileW(
+				path_wide.as_ptr(),
+				FILE_READ_ATTRIBUTES,
+				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+				null(),
+				OPEN_EXISTING,
+				FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS,
+				null_mut(),
+			)
+		};
+		if handle == INVALID_HANDLE_VALUE {
+			return None;
+		}
 		let result = (|| {
 			let attributes = handle_attributes(handle).ok()?;
 			if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {

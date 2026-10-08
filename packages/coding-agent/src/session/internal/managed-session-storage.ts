@@ -1280,8 +1280,8 @@ export function retainManagedDirectoryAuthority(
 	expected?: { dev: bigint; ino: bigint },
 ): RecoveryFsRoot | undefined {
 	assertManagedDirectoryRoot(root);
-	managedRelativePath(root, directory);
-	const resolved = path.resolve(directory);
+	const resolved = canonicalizeManagedPath(directory);
+	const relative = managedRelativePath(root, resolved).join("/");
 	if (process.platform !== "linux") return undefined;
 	const named = fs.lstatSync(resolved, { bigint: true });
 	if (!named.isDirectory() || named.isSymbolicLink()) throw new Error("Managed directory authority is unavailable");
@@ -1297,7 +1297,6 @@ export function retainManagedDirectoryAuthority(
 			retainedRoot.identity.ino !== root.ino.toString()
 		)
 			throw new Error("Managed root authority changed");
-		const relative = path.relative(root.canonicalPath, resolved).split(path.sep).join("/");
 		const rootRecovery = rootAuthority.recoveryReaperMetrics();
 		const rootRecoveryUnhealthy = !rootRecovery.ok || Boolean(rootRecovery.code);
 		if (rootRecoveryUnhealthy)
@@ -1366,8 +1365,38 @@ function ensureManagedRoot(root: ManagedDirectoryRoot): void {
 	assertManagedDirectoryRoot(root);
 }
 
+function canonicalizeManagedPath(pathname: string): string {
+	const resolvedPath = path.resolve(pathname);
+	const missingSegments: string[] = [];
+	let currentPath = resolvedPath;
+	for (;;) {
+		try {
+			let canonicalPath = fs.realpathSync.native(currentPath);
+			for (let index = missingSegments.length - 1; index >= 0; index--) {
+				canonicalPath = path.join(canonicalPath, missingSegments[index]!);
+			}
+			return canonicalPath;
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code !== "ENOENT" && code !== "ENOTDIR") return resolvedPath;
+			const parentPath = path.dirname(currentPath);
+			if (parentPath === currentPath) return resolvedPath;
+			missingSegments.push(path.basename(currentPath));
+			currentPath = parentPath;
+		}
+	}
+}
+
 function managedRelativePath(root: ManagedDirectoryRoot, pathname: string): readonly string[] {
-	const relative = path.relative(root.canonicalPath, path.resolve(pathname));
+	const canonicalPath = canonicalizeManagedPath(pathname);
+	const relative = path.relative(root.canonicalPath, canonicalPath);
+	if (process.platform === "win32") {
+		const canonicalRoot = path.win32.normalize(root.canonicalPath);
+		const canonicalCandidate = path.win32.normalize(canonicalPath);
+		const rootPrefix = canonicalRoot.endsWith(path.win32.sep) ? canonicalRoot : `${canonicalRoot}${path.win32.sep}`;
+		if (canonicalCandidate !== canonicalRoot && !canonicalCandidate.startsWith(rootPrefix))
+			throw new Error(`Managed path escapes configured root: ${pathname}`);
+	}
 	if (relative === "") return [];
 	if (path.isAbsolute(relative) || relative.split(path.sep).includes(".."))
 		throw new Error(`Managed path escapes configured root: ${pathname}`);
@@ -1538,10 +1567,11 @@ export class ManagedSessionDescendantStore {
 		if (access === "read-only" && retained) throw new Error("managed_read_store_cannot_borrow_authority");
 		if (access === "read-only" && !expectedSubtreeRoot)
 			throw new Error("managed_read_store_requires_existing_identity");
-		managedRelativePath(root, baseDir);
+		const canonicalBaseDir = canonicalizeManagedPath(baseDir);
+		managedRelativePath(root, canonicalBaseDir);
 
 		this.#root = root;
-		this.#baseDir = path.resolve(baseDir);
+		this.#baseDir = canonicalBaseDir;
 		this.#policy = policy ?? "default";
 		this.#access = access;
 		this.#profileAgentDir = profileAgentDir ?? root.canonicalPath;
