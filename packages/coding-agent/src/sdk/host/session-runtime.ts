@@ -2951,6 +2951,7 @@ function createControlSurface(
 	onInvocationCompletionReconciledForTests?: (kind: InvocationKind, correlation: InvocationCorrelation) => void,
 	publishLifecycleFrame?: (frame: SdkFrame) => void,
 	acceptedQueueCancellations: Map<string, AcceptedQueueCancellation> = new Map(),
+	shouldDeferCompletion?: (kind: InvocationKind, correlation: InvocationCorrelation) => boolean,
 ): ControlSurface {
 	const normalizePromptImages = (value: unknown): ImageContent[] => {
 		if (!Array.isArray(value)) return [];
@@ -3312,6 +3313,12 @@ function createControlSurface(
 							retirePendingOwner?.(kind, correlation);
 							const attemptTerminalization = async (remaining: number): Promise<void> => {
 								try {
+									// Keep a captured deadline end private until its exact tools settle.
+									if (shouldDeferCompletion?.(kind, correlation)) {
+										retirePendingOwner?.(kind, correlation, "recover-terminal");
+										onInvocationCompletionReconciledForTests?.(kind, correlation);
+										return;
+									}
 									const before = reconciliation.lookup(kind, correlation) as {
 										status?: string;
 									};
@@ -3321,6 +3328,12 @@ function createControlSurface(
 										...(typeof result === "string" ? { content: sanitizeTurnResultContent(result) } : {}),
 									});
 									onInvocationCompletionReconciledForTests?.(kind, correlation);
+									const settledStatus = reconciliation.lookup(kind, correlation) as { status?: string };
+									// Release recovery ownership only after a confirmed terminal write.
+									if (settledStatus.status !== "terminal_ok" && settledStatus.status !== "failed") {
+										retirePendingOwner?.(kind, correlation, "recover-terminal");
+										return;
+									}
 									if (!alreadyTerminal) {
 										const settledRecord = reconciliation.lookup(kind, correlation) as {
 											status?: string;
@@ -7108,6 +7121,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				}
 			},
 			acceptedQueueCancellations,
+			(kind, correlation) => kind === "prompt" && deadlineManager.shouldDeferTerminalTransition(correlation),
 		);
 		const installProviderDefinitions = (capability: string, definitions: unknown): void => {
 			if (capability === "permission") {

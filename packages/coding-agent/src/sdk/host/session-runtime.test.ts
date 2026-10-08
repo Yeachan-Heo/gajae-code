@@ -8603,6 +8603,87 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		}
 	});
 
+	test("completion preserves recovery of a captured end while tools are unproven", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-deadline-completion-uncertain-"));
+		const sessionId = "deadline-completion-uncertain";
+		const sessionFile = path.join(cwd, ".gjc", "state", `${sessionId}.jsonl`);
+		await Bun.write(sessionFile, "");
+		const store = createReconciliationStore({ sessionFile, sessionId });
+		const completion = Promise.withResolvers<void>();
+		const completionReconciled = Promise.withResolvers<void>();
+		const activeTools = new Set(["unfenced-tool"]);
+		let boundaryWaitStarted = false;
+		let abortCalls = 0;
+		let harness: InvocationHarness | undefined;
+		try {
+			harness = await invocationHarness(sessionId, cwd, {
+				settings: {
+					get: (key: string) =>
+						key === "sdk.promptDeadlineMs" ? 150 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
+				} as unknown as Settings,
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await completion.promise;
+				},
+				onInvocationCompletionReconciled: () => completionReconciled.resolve(),
+				terminalAbortSeams: {
+					getReconciliationStore: () => store,
+					getTerminalTurnEpoch: () => 109,
+					getActivePromptHandle: () => "deadline-completion-uncertain-run",
+					pendingToolExecutions: () => {
+						if (activeTools.size > 0) boundaryWaitStarted = true;
+						return [...activeTools];
+					},
+					abortPromptAndWaitWithTerminal: async () => {
+						abortCalls += 1;
+						return { status: "unfenced" };
+					},
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "capture uncertain end" });
+			expect(accepted.ok).toBe(true);
+			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			await harness.emit("agent_start");
+			await harness.emit("tool_execution_start", {
+				type: "tool_execution_start",
+				toolCallId: "unfenced-tool",
+				toolName: "apply_patch",
+				args: {},
+			});
+			const waitDeadline = Date.now() + 2_000;
+			while (!boundaryWaitStarted && Date.now() < waitDeadline) await Bun.sleep(10);
+			expect(boundaryWaitStarted).toBe(true);
+			await harness.emit("agent_end", { stopReason: "cancelled" });
+			completion.resolve();
+			await completionReconciled.promise;
+			await Bun.sleep(0);
+			expect(abortCalls).toBe(0);
+			expect((await harness.query("turn.prompt_status", correlation)).result).toMatchObject({ status: "in_flight" });
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toEqual([]);
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toEqual([]);
+			const durable = store.snapshot().find(record => record.commandId === correlation.commandId) as
+				| (SdkOnlyInvocationRecord & { pendingOutcome?: unknown; deadlineRecoveryPending?: boolean })
+				| undefined;
+			expect(durable).toMatchObject({
+				status: "in_flight",
+				deadlineRecoveryPending: true,
+				pendingOutcome: { kind: "stopped", reason: "cancelled" },
+			});
+
+			activeTools.clear();
+			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
+				status: "terminal_ok",
+				outcome: { kind: "stopped", reason: "cancelled" },
+			});
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toHaveLength(1);
+		} finally {
+			completion.resolve();
+			await harness?.stop();
+			await Bun.sleep(10);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("an unproven real end stays private until exact settlement evidence exists", async () => {
 		// A matching lifecycle end still cannot settle a recovered deadline record
 		// when the exact run/tool observation is unavailable.
