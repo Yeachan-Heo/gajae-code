@@ -30,7 +30,7 @@ class FakeKernel {
 	alive = true;
 	executeCalls: string[] = [];
 	shutdownCalls = 0;
-	shutdownResult: KernelShutdownResult = { confirmed: true };
+	shutdownExitCode: number | null = 0;
 	private readonly executeImpl?: (code: string, options?: KernelExecuteOptions) => Promise<KernelExecuteResult>;
 
 	constructor(executeImpl?: (code: string, options?: KernelExecuteOptions) => Promise<KernelExecuteResult>) {
@@ -45,7 +45,7 @@ class FakeKernel {
 	async shutdown(): Promise<KernelShutdownResult> {
 		this.shutdownCalls += 1;
 		this.alive = false;
-		return this.shutdownResult;
+		return { confirmed: this.shutdownExitCode !== null };
 	}
 
 	isAlive(): boolean {
@@ -362,7 +362,7 @@ describe("python eval lifecycle red-team", () => {
 			Bun.env.PI_PYTHON_SKIP_CHECK = "1";
 			using tempDir = TempDir.createSync("@gjc-python-lifecycle-redteam-");
 			const controller = new AbortController();
-			const listeners = countAbortListeners(controller.signal);
+			let listeners: ReturnType<typeof countAbortListeners> | undefined;
 			const kernelStarted = Promise.withResolvers<void>();
 			let shutdown: (() => Promise<KernelShutdownResult>) | undefined;
 			let execution: Promise<PythonResult> | undefined;
@@ -371,6 +371,11 @@ describe("python eval lifecycle red-team", () => {
 					try {
 						const kernel = await originalStart({ cwd: tempDir.path() });
 						shutdown = () => kernel.shutdown({ timeoutMs: 100 });
+						const execute = kernel.execute.bind(kernel);
+						kernel.execute = (code, options) => {
+							if (!listeners && options?.signal) listeners = countAbortListeners(options.signal);
+							return execute(code, options);
+						};
 						kernelStarted.resolve();
 						return kernel;
 					} catch (error) {
@@ -392,16 +397,16 @@ describe("python eval lifecycle red-team", () => {
 				);
 				await kernelStarted.promise;
 				await waitForFile(executionReadyFile);
-				expect(listeners.count()).toBe(1);
+				expect(listeners?.count()).toBe(1);
 				if (!shutdown) throw new Error("Python kernel did not expose shutdown after startup");
 
 				await shutdown();
 				await execution;
-				expect(listeners.count()).toBe(0);
+				expect(listeners?.count()).toBe(0);
 			} finally {
 				await shutdown?.().catch(() => undefined);
 				await execution?.catch(() => undefined);
-				listeners.restore();
+				listeners?.restore();
 			}
 		},
 		LIFECYCLE_TEST_TIMEOUT_MS,
@@ -416,7 +421,7 @@ describe("python eval lifecycle red-team", () => {
 			const startup = Promise.withResolvers<void>();
 			const startupCalled = Promise.withResolvers<void>();
 			const kernel = new FakeKernel();
-			kernel.shutdownResult = { confirmed: false };
+			kernel.shutdownExitCode = null;
 			let startupFinished = false;
 			let executionSettled = false;
 			PythonKernel.start = async () => {
@@ -453,9 +458,11 @@ describe("python eval lifecycle red-team", () => {
 			}
 			expect(startupFinished).toBe(true);
 			expect(kernel.shutdownCalls).toBe(1);
-			await disposeAllKernelSessions();
+			await expect(disposeAllKernelSessions()).rejects.toMatchObject({
+				name: "PythonKernelShutdownUnconfirmedError",
+			});
 			expect(kernel.shutdownCalls).toBe(2);
-			kernel.shutdownResult = { confirmed: true };
+			kernel.shutdownExitCode = 0;
 			await disposeAllKernelSessions();
 			expect(kernel.shutdownCalls).toBe(3);
 		},
@@ -466,6 +473,7 @@ describe("python eval lifecycle red-team", () => {
 		Bun.env.PI_PYTHON_SKIP_CHECK = "1";
 		using tempDir = TempDir.createSync("@gjc-python-lifecycle-redteam-");
 		const firstKernel = new FakeKernel();
+		firstKernel.shutdownExitCode = 0;
 		const secondKernel = new FakeKernel();
 		let startCalls = 0;
 		PythonKernel.start = async () => {
