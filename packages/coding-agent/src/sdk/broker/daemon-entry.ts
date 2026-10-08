@@ -7,6 +7,7 @@ import {
 } from "./discovery";
 import {
 	type BrokerLaunchResult,
+	launchBrokerViaDetachedChild,
 	launchBrokerViaHop,
 	launchBrokerViaPosixTrampoline,
 	reapFailedBrokerLaunch,
@@ -110,18 +111,29 @@ export async function launchAuthorizedBrokerSuccessor(
 								timeoutMs,
 							},
 						)
-					: await launchBrokerViaPosixTrampoline(options.agentDir, {
-							env,
-							...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
-							timeoutMs,
-						});
+					: launchMode === "darwin-child"
+						? await launchBrokerViaDetachedChild(
+								{
+									file: command.file,
+									args: [...command.args, "--agent-dir", options.agentDir],
+								},
+								{
+									env,
+									cwd: command.kind === "bun-source" ? command.cwd : undefined,
+									timeoutMs,
+								},
+							)
+						: await launchBrokerViaPosixTrampoline(options.agentDir, {
+								env,
+								...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
+								timeoutMs,
+							});
 			if (launched.error) return await refuseFailedBrokerLaunch(launched);
 			if (launched.realBrokerPid === undefined || launched.realBrokerIncarnation === undefined)
-				return {
-					kind: "refused" as const,
-					reason: "spawn_failed" as const,
-					detail: "Broker launcher returned no verified process identity.",
-				};
+				return await refuseFailedBrokerLaunch({
+					...launched,
+					error: new Error("Broker launcher returned no verified process identity."),
+				});
 			const child: childProcess.ChildProcess = launched.process;
 			child.unref();
 			return {
@@ -176,7 +188,23 @@ export async function launchAuthorizedBrokerSuccessor(
 			discovered.restartRequestId === options.requestId
 		)
 			return { kind: "spawned", discovery: discovered };
-		if (Date.now() >= until) return { kind: "refused", reason: "publication_timeout" };
+		if (Date.now() >= until) {
+			try {
+				await reapFailedBrokerLaunch({
+					process: child,
+					realBrokerPid,
+					realBrokerIncarnation: expectedBrokerIncarnation,
+				});
+			} catch (error) {
+				const detail = error instanceof Error ? error.message : String(error);
+				return {
+					kind: "refused",
+					reason: "publication_timeout",
+					detail: `Broker successor cleanup failed: ${detail}`,
+				};
+			}
+			return { kind: "refused", reason: "publication_timeout" };
+		}
 		await Bun.sleep(SUCCESSOR_SPAWN_POLL_MS);
 	}
 }

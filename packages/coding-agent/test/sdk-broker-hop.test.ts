@@ -16,9 +16,11 @@ import {
 	brokerSpawnFailureErrorForTest,
 	brokerStartupExitStatusForTest,
 	brokerTrampolineTimeoutResultForTest,
+	launchBrokerViaDetachedChild,
 	launchBrokerViaHop,
 	parseBrokerHopReply,
 	reapDetachedBrokerPidForTest,
+	reapFailedBrokerLaunch,
 	reapSpawnedBrokerForTest,
 	signalDetachedBrokerProcessForTest,
 	signalPinnedBrokerProcessForTest,
@@ -405,38 +407,58 @@ describe("SDK broker hop protocol", () => {
 		expect(await incomplete).toBe(false);
 	});
 
-	test.skipIf(process.platform === "darwin")(
-		"failed successor handoff retries cleanup for its captured broker identity",
-		async () => {
-			const child = childProcess.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
-			const spawned = Promise.withResolvers<void>();
-			const closed = Promise.withResolvers<void>();
-			child.once("spawn", spawned.resolve);
-			child.once("close", closed.resolve);
-			await spawned.promise;
-			const pid = child.pid;
-			if (pid === undefined) throw new Error("Test broker did not expose its pid.");
-			const observation = observeProcessIncarnation(pid);
-			if (observation.status !== "present") throw new Error("Test broker process identity could not be observed.");
+	test("failed successor handoff retries cleanup for its captured broker identity", async () => {
+		const child = childProcess.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+		const spawned = Promise.withResolvers<void>();
+		const closed = Promise.withResolvers<void>();
+		child.once("spawn", spawned.resolve);
+		child.once("close", closed.resolve);
+		await spawned.promise;
+		const pid = child.pid;
+		if (pid === undefined) throw new Error("Test broker did not expose its pid.");
+		const observation = observeProcessIncarnation(pid);
+		if (observation.status !== "present") throw new Error("Test broker process identity could not be observed.");
 
-			try {
-				const result = await refuseFailedBrokerLaunchForTest({
-					process: child,
-					realBrokerPid: pid,
-					realBrokerIncarnation: observation.incarnation,
-					error: new Error("trampoline timeout cleanup failed"),
-				});
-				expect(result).toMatchObject({ kind: "refused", reason: "spawn_failed" });
-				if (result.kind !== "refused") throw new Error("Expected a failed successor refusal.");
-				expect(result.detail).toContain("trampoline timeout cleanup failed");
-				await closed.promise;
-				expect(observeProcessIncarnation(pid).status).toBe("absent");
-			} finally {
-				if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+		try {
+			const result = await refuseFailedBrokerLaunchForTest({
+				process: child,
+				realBrokerPid: pid,
+				realBrokerIncarnation: observation.incarnation,
+				error: new Error("trampoline timeout cleanup failed"),
+			});
+			expect(result).toMatchObject({ kind: "refused", reason: "spawn_failed" });
+			if (result.kind !== "refused") throw new Error("Expected a failed successor refusal.");
+			expect(result.detail).toContain("trampoline timeout cleanup failed");
+			await closed.promise;
+			expect(observeProcessIncarnation(pid).status).toBe("absent");
+		} finally {
+			if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+			await closed.promise;
+		}
+	});
+
+	test("detached discovery child cleanup uses the retained process handle", async () => {
+		const launched = await launchBrokerViaDetachedChild(
+			{ file: process.execPath, args: ["-e", "setInterval(() => {}, 1000)"] },
+			{ env: process.env },
+		);
+		if (launched.error) throw launched.error;
+		const pid = launched.realBrokerPid;
+		if (pid === undefined || pid !== launched.process.pid)
+			throw new Error("Detached broker did not retain its exact child process handle.");
+		const closed = Promise.withResolvers<void>();
+		launched.process.once("close", closed.resolve);
+		try {
+			await reapFailedBrokerLaunch(launched);
+			await closed.promise;
+			expect(observeProcessIncarnation(pid).status).toBe("absent");
+		} finally {
+			if (launched.process.exitCode === null && launched.process.signalCode === null) {
+				launched.process.kill("SIGKILL");
 				await closed.promise;
 			}
-		},
-	);
+		}
+	});
 
 	test("detached reaping does not signal a PID that was already reused", async () => {
 		const kill = spyOn(process, "kill").mockImplementation(() => true);

@@ -70,9 +70,10 @@ export class BrokerHopError extends Error {
 export function resolveBrokerLaunchMode(
 	platform: NodeJS.Platform,
 	initiator: "discovery" | "fixture-lease",
-): "windows-hop" | "posix-trampoline" | "direct" {
+): "windows-hop" | "posix-trampoline" | "darwin-child" | "direct" {
 	if (initiator === "fixture-lease") return "direct";
-	return platform === "win32" ? "windows-hop" : "posix-trampoline";
+	if (platform === "win32") return "windows-hop";
+	return platform === "darwin" ? "darwin-child" : "posix-trampoline";
 }
 
 /**
@@ -92,9 +93,7 @@ function resolveHopInvocation(hopMessage: string): { file: string; args: string[
 	}
 }
 
-/**
- * Spawn an exact broker child for test fixtures that must retain its process handle.
- */
+/** Spawn a broker as an exact child so its process handle can be retained for cleanup. */
 function spawnBrokerDirect(
 	brokerFile: string,
 	brokerArgs: readonly string[],
@@ -336,6 +335,67 @@ export function parseBrokerHopReply(
 	const incarnation = (reply as { incarnation?: unknown } | null)?.incarnation;
 	if (!isProcessIncarnation(incarnation)) return fail("hop response missing or invalid process incarnation");
 	return { realBrokerPid: pid, realBrokerIncarnation: incarnation, error: undefined };
+}
+
+function awaitBrokerChildSpawn(child: ChildProcess): Promise<Error | undefined> {
+	const { promise, resolve } = Promise.withResolvers<Error | undefined>();
+	child.once("spawn", () => resolve(undefined));
+	child.once("error", resolve);
+	return promise;
+}
+
+/** Darwin keeps the broker as a retained detached ChildProcess so cleanup never signals a reused PID. */
+export async function launchBrokerViaDetachedChild(
+	command: { file: string; args: readonly string[] },
+	options: { env: NodeJS.ProcessEnv; cwd?: string; stderrFd?: number; timeoutMs?: number },
+): Promise<BrokerLaunchResult> {
+	const timeoutMs = options.timeoutMs ?? DEFAULT_LAUNCHER_TIMEOUT_MS;
+	if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("Detached SDK broker startup deadline elapsed.");
+	const child = spawnBrokerDirect(command.file, command.args, {
+		stdioFd: options.stderrFd,
+		env: options.env,
+		...(options.cwd ? { cwd: options.cwd } : {}),
+		detached: true,
+	}).process;
+	const spawnOutcome = await Promise.race([
+		awaitBrokerChildSpawn(child).then(error => ({ kind: "spawned" as const, error })),
+		Bun.sleep(timeoutMs).then(() => ({ kind: "timeout" as const })),
+	]);
+	const realBrokerPid = child.pid;
+	const realBrokerIncarnation = realBrokerPid === undefined ? undefined : brokerProcessIncarnation(realBrokerPid);
+	if (spawnOutcome.kind === "timeout") {
+		const terminated = await terminateLauncher(child);
+		if (!terminated)
+			child.once("spawn", () => {
+				if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+			});
+		return {
+			process: child,
+			realBrokerPid,
+			...(realBrokerIncarnation !== undefined ? { realBrokerIncarnation } : {}),
+			error: new Error(
+				`Detached SDK broker spawn exceeded its ${timeoutMs}ms deadline; ${terminated ? "child terminated" : "termination was not confirmed"}.`,
+			),
+		};
+	}
+	if (spawnOutcome.error) {
+		return {
+			process: child,
+			realBrokerPid,
+			...(realBrokerIncarnation !== undefined ? { realBrokerIncarnation } : {}),
+			error: spawnOutcome.error,
+		};
+	}
+	if (realBrokerPid === undefined || realBrokerIncarnation === undefined) {
+		let detail = "Detached SDK broker did not expose a verified process identity.";
+		try {
+			await reapSpawnedBroker(child, realBrokerPid, realBrokerIncarnation);
+		} catch (error) {
+			detail = `${detail} ${error instanceof Error ? error.message : String(error)}`;
+		}
+		return { process: child, realBrokerPid, error: new Error(detail) };
+	}
+	return { process: child, realBrokerPid, realBrokerIncarnation, error: undefined };
 }
 
 /** POSIX only: a short-lived CLI trampoline detaches the broker from the client tree. */
@@ -968,11 +1028,15 @@ async function reapDetachedBrokerPid(
 	throw new Error(`Detached SDK broker (pid ${pid}) did not exit after SIGKILL during reap.`);
 }
 
-/** Reap a failed hop/trampoline launch again when a higher-level successor path owns the refusal. */
+/** Reap a failed broker launch using its retained child handle when it is the broker itself. */
 export async function reapFailedBrokerLaunch(
-	launch: Pick<BrokerLaunchResult, "realBrokerPid" | "realBrokerIncarnation">,
+	launch: Pick<BrokerLaunchResult, "process" | "realBrokerPid" | "realBrokerIncarnation">,
 ): Promise<void> {
 	if (launch.realBrokerPid === undefined) return;
+	if (launch.realBrokerPid === launch.process.pid) {
+		await reapSpawnedBroker(launch.process, launch.realBrokerPid, launch.realBrokerIncarnation);
+		return;
+	}
 	await reapDetachedBrokerPid(launch.realBrokerPid, launch.realBrokerIncarnation);
 }
 
@@ -1263,6 +1327,22 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 				realBrokerIncarnation: launched.realBrokerIncarnation,
 			};
 			spawnError = launched.error;
+		} else if (launchMode === "darwin-child") {
+			const launched = await launchBrokerViaDetachedChild(
+				{ file: command.file, args: brokerArgs },
+				{
+					env,
+					...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
+					...(spawnLog ? { stderrFd: spawnLog.handle.fd } : {}),
+					timeoutMs: Math.max(0, deadline - ensureBrokerTiming.now()),
+				},
+			);
+			spawnResult = {
+				process: launched.process,
+				realBrokerPid: launched.realBrokerPid,
+				realBrokerIncarnation: launched.realBrokerIncarnation,
+			};
+			spawnError = launched.error;
 		} else {
 			spawnResult = spawnBrokerDirect(command.file, brokerArgs, {
 				stdioFd: spawnLog?.handle.fd,
@@ -1279,7 +1359,9 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		const realBrokerPid = spawnResult.realBrokerPid;
 		let childIncarnation =
 			spawnResult.realBrokerIncarnation ??
-			(launchMode === "direct" && realBrokerPid !== undefined ? brokerProcessIncarnation(realBrokerPid) : undefined);
+			((launchMode === "direct" || launchMode === "darwin-child") && realBrokerPid !== undefined
+				? brokerProcessIncarnation(realBrokerPid)
+				: undefined);
 		let owner = registerBrokerOwner(settings.agentDir, child, realBrokerPid, childIncarnation);
 		child.unref();
 		// The child holds its own duplicate of the descriptor. Failure to close the
