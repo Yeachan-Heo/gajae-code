@@ -297,6 +297,30 @@ describe("AgentSession configuration reload", () => {
 		expect(session!.model).toMatchObject({ name: "After refresh", baseUrl: "https://after-refresh.example/v1" });
 	});
 
+	it("marks exhausted model-catalog restaging as retryable", async () => {
+		const { configPath, modelsPath } = await createSession();
+		const staged = candidate(
+			30,
+			configPath,
+			modelsPath,
+			settingsText({ todoEnabled: true, compactionEnabled: false }),
+			modelsText({ name: "After catalog churn", baseUrl: "https://after-refresh.example/v1" }),
+		);
+		const originalStage = modelRegistry!.stageModelsConfigReload.bind(modelRegistry!);
+		const stageSpy = vi.spyOn(modelRegistry!, "stageModelsConfigReload").mockImplementation(async (...args) => {
+			const stagedModels = await originalStage(...args);
+			vi.spyOn(stagedModels, "isCurrent").mockReturnValue(false);
+			return stagedModels;
+		});
+
+		await expect(session!.reloadConfiguration(staged, new AbortController().signal)).rejects.toMatchObject({
+			name: "ConfigurationReloadError",
+			code: "PUBLICATION_FAILED",
+			retryable: true,
+		});
+		expect(stageSpy).toHaveBeenCalledTimes(3);
+	});
+
 	it("rejects removing the current manually selected model before superseding pending work", async () => {
 		const { configPath, modelsPath, initialModel } = await createSession();
 		const staged = candidate(8, configPath, modelsPath, await Bun.file(configPath).text(), "providers: {}\n");
@@ -1112,7 +1136,7 @@ describe("AgentSession configuration reload", () => {
 				await session!.setThinkingLevelForControl(thinkingControlLevel, false);
 			}
 			releaseProfileRollback.resolve();
-			await expect(reload).rejects.toMatchObject({ code: "PUBLICATION_FAILED" });
+			await expect(reload).rejects.toMatchObject({ code: "PUBLICATION_FAILED", retryable: false });
 
 			expect(restoreModelSpy).toHaveBeenCalledTimes(1);
 			expect(session!.model).toMatchObject({ id: "default-model", baseUrl: "https://before.example/v1" });

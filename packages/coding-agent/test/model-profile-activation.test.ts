@@ -27,6 +27,7 @@ import { kNoAuth, ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import {
 	AgentSession,
+	type AgentSessionProfileInstalledOverrideState,
 	type DefaultFallbackRuntimeState,
 	type PreparedProfileModelSelection,
 } from "../src/session/agent-session";
@@ -3751,6 +3752,81 @@ describe("preset-equivalent profile activation", () => {
 		// The snapshot's internal closure restored the exact pre-clear sticky.
 		expect(sticky.get(session.sessionId)).toBe("provider-a/opus-real");
 		expect(restoreDefaultFallbackRuntimeState).toHaveBeenCalledWith(fallbackRuntimeState);
+	});
+
+	test("profile deletion failure and restore retain explicit same-value role ownership", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "delete-owner-profile",
+			requiredProviders: [],
+			modelMapping: { default: "provider-a/default", planner: "provider-b/executor" },
+			source: "user",
+		};
+		const initialOwnership: AgentSessionProfileInstalledOverrideState = {
+			modelRoles: new Map(),
+			agentModelOverrides: new Map([["planner", "provider-b/executor"]]),
+			installedModelRoles: new Map(),
+			installedAgentModelOverrides: new Map([["planner", "provider-b/executor"]]),
+			manualModelRoles: new Set<string>(),
+			manualAgentModelOverrides: new Set(["planner"]),
+			preProfileModel: undefined,
+		};
+		const emptyOwnership = (): AgentSessionProfileInstalledOverrideState => ({
+			modelRoles: new Map(),
+			agentModelOverrides: new Map(),
+			installedModelRoles: new Map(),
+			installedAgentModelOverrides: new Map(),
+			manualModelRoles: new Set(),
+			manualAgentModelOverrides: new Set(),
+			preProfileModel: undefined,
+		});
+		let activeProfile: string | undefined = profile.name;
+		let ownership = initialOwnership;
+		const session = Object.assign(fakeSession(), {
+			getActiveModelProfile: () => activeProfile,
+			setActiveModelProfile: (name: string | undefined) => {
+				if (name !== activeProfile) {
+					ownership = {
+						...ownership,
+						manualModelRoles: new Set(),
+						manualAgentModelOverrides: new Set(),
+					};
+				}
+				activeProfile = name;
+			},
+			getProfileInstalledOverrideKeys: () => ({ modelRoles: [], agentModelOverrides: ["planner"] }),
+			getProfileInstalledOverrideState: () => ownership,
+			restoreProfileInstalledOverrideState: (state: AgentSessionProfileInstalledOverrideState) => {
+				ownership = state;
+			},
+			clearProfileInstalledOverrides: () => {
+				ownership = emptyOwnership();
+			},
+		});
+		const registry = fakeRegistry({ profiles: [profile] });
+		const settings = Settings.isolated({
+			"modelProfile.default": profile.name,
+			"task.agentModelOverrides": { planner: "provider-b/executor" },
+		});
+		settings.override("task.agentModelOverrides", { planner: "provider-b/executor" });
+		vi.spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
+
+		await expect(
+			materializeModelProfileForDeletion({ session, modelRegistry: registry, settings, profileName: profile.name }),
+		).rejects.toThrow("flush failed");
+		expect(session.getActiveModelProfile()).toBe(profile.name);
+		expect(ownership).toEqual(initialOwnership);
+
+		const snapshot = await materializeModelProfileForDeletion({
+			session,
+			modelRegistry: registry,
+			settings,
+			profileName: profile.name,
+		});
+		expect(ownership.manualAgentModelOverrides.size).toBe(0);
+		await restoreMaterializedModelProfileForDeletion({ settings, session, snapshot });
+
+		expect(session.getActiveModelProfile()).toBe(profile.name);
+		expect(ownership).toEqual(initialOwnership);
 	});
 
 	test("successful activation leaves the new model sticky", async () => {

@@ -17,6 +17,7 @@ import { APP_NAME, adjustHsv, getAgentDir, getProjectDir, logger, postmortem, sa
 import chalk from "chalk";
 import { AsyncJobManager } from "../async";
 import { ConfigHotReloadWatcher } from "../config/config-hot-reload";
+import { isConfigHotReloadTrusted } from "../config/config-hot-reload-trust";
 import {
 	type AppKeybinding,
 	defaultMessageQueueKeysForPlatform,
@@ -1698,9 +1699,25 @@ export class InteractiveMode implements InteractiveModeContext {
 	async #startConfigHotReload(): Promise<void> {
 		const paths = this.session.getConfigurationPaths();
 		if (!paths) return;
+		if (!(await isConfigHotReloadTrusted(paths))) {
+			this.showWarning(
+				"Configuration watching could not start because directory ownership and privacy could not be verified.",
+			);
+			return;
+		}
+		const assertTrustedPaths = async (): Promise<void> => {
+			if (await isConfigHotReloadTrusted(paths)) return;
+			const error = new Error("Configuration directory ownership and privacy could not be verified");
+			Object.assign(error, { code: "EACCES" });
+			throw error;
+		};
 		const watcher = new ConfigHotReloadWatcher({
-			onValidate: candidate => this.session.validateConfiguration(candidate),
+			onValidate: async candidate => {
+				await assertTrustedPaths();
+				await this.session.validateConfiguration(candidate);
+			},
 			onCandidate: async (candidate, signal) => {
+				await assertTrustedPaths();
 				const result = await this.session.reloadConfiguration(candidate, signal);
 				if (signal.aborted || this.#stopped || this.#isShuttingDown || !result.applied) return;
 				this.#selectorController.refreshConfiguration();

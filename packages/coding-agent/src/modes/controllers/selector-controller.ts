@@ -107,7 +107,10 @@ import { ensureTelegramDaemonRunningDetailed, resolveTelegramSetupPreflight } fr
 import { TelegramDaemonController } from "../../sdk/bus/telegram-daemon-control";
 import { runTelegramSetup, type TelegramSetupPreflight } from "../../sdk/bus/telegram-setup";
 import { clearPersistentPinForRemovedRows } from "../../session/account-inventory";
-import type { DefaultFallbackRuntimeState } from "../../session/agent-session";
+import type {
+	AgentSessionProfileInstalledOverrideState,
+	DefaultFallbackRuntimeState,
+} from "../../session/agent-session";
 import { CREDENTIAL_STORE_UNREADABLE_MESSAGE } from "../../session/credential-store-errors";
 import { type SessionInfo, SessionManager } from "../../session/session-manager";
 import { getTreeForInternalRead } from "../../session/session-manager-internal";
@@ -1214,6 +1217,7 @@ interface DefaultAssignmentRollbackSnapshot {
 	profileOverride: SettingValue<"modelProfile.default"> | undefined;
 	chain: { entries: readonly string[]; origin: string; identity?: string; explicitHead?: boolean } | undefined;
 	activeProfile: string | undefined;
+	profileInstalledOverrideState: AgentSessionProfileInstalledOverrideState | undefined;
 	canonicalVariant: string | undefined;
 	resumeDefaultSelector: string | undefined;
 	fallbackRuntimeState: DefaultFallbackRuntimeState;
@@ -1281,6 +1285,7 @@ export class SelectorController {
 			profileOverride: this.ctx.settings.getOverride("modelProfile.default"),
 			chain: this.ctx.session.getConfiguredModelChainState("default"),
 			activeProfile: this.ctx.session.getActiveModelProfile?.(),
+			profileInstalledOverrideState: this.ctx.session.getProfileInstalledOverrideState?.(),
 			canonicalVariant: this.ctx.session.modelRegistry.getSessionCanonicalVariant?.(this.ctx.session.sessionId),
 			resumeDefaultSelector: this.ctx.session.sessionManager.buildSessionContext().models.default,
 			fallbackRuntimeState: this.ctx.session.getDefaultFallbackRuntimeState(),
@@ -1358,6 +1363,11 @@ export class SelectorController {
 			restore(() => this.ctx.session.recordResumeDefaultModel(snapshot.resumeDefaultSelector));
 		}
 		restore(() => this.ctx.session.setActiveModelProfile?.(snapshot.activeProfile));
+		if (snapshot.profileInstalledOverrideState) {
+			restore(() =>
+				this.ctx.session.restoreProfileInstalledOverrideState?.(snapshot.profileInstalledOverrideState!),
+			);
+		}
 		try {
 			await this.ctx.settings.flushOrThrow();
 		} catch (rollbackError) {

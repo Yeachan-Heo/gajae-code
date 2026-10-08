@@ -1796,6 +1796,10 @@ type ProviderRefreshFence = { providerId: string; generation: number } | { gener
 interface StagedConfigApiKey {
 	readonly apiKey: string;
 	readonly envSourced: boolean;
+	// The staged AuthStorage adapter needs only the first two fields; registry-owned entries
+	// also track whether the key came from config, runtime registration, or both.
+	readonly configSourced?: boolean;
+	readonly runtimeSourced?: boolean;
 }
 
 interface StagedAuthStorageState {
@@ -2185,8 +2189,20 @@ export class ModelRegistry {
 		this.#loadedModelPresetRegistryManifestSha256 = source.#loadedModelPresetRegistryManifestSha256;
 	}
 
-	#setOwnedConfigApiKey(provider: string, apiKey: string, envSourced = false): void {
-		this.#ownedConfigApiKeys.set(resolveOAuthStorageProvider(provider), { apiKey, envSourced });
+	#setOwnedConfigApiKey(
+		provider: string,
+		apiKey: string,
+		envSourced = false,
+		source: "config" | "runtime" = "config",
+	): void {
+		const key = resolveOAuthStorageProvider(provider);
+		const previous = this.#ownedConfigApiKeys.get(key);
+		this.#ownedConfigApiKeys.set(key, {
+			apiKey,
+			envSourced,
+			configSourced: source === "config" || previous?.configSourced === true,
+			runtimeSourced: source === "runtime" || previous?.runtimeSourced === true,
+		});
 		this.authStorage.setConfigApiKey(provider, apiKey, {
 			envSourced,
 			owner: this.#authStorageConfigOwner,
@@ -2212,7 +2228,7 @@ export class ModelRegistry {
 			this.#customProviderApiKeys.set(provider, resolved);
 			this.#runtimeProviderResolvedApiKeys.set(provider, resolved);
 			this.#runtimeProviderCredentialInstalled.add(provider);
-			this.#setOwnedConfigApiKey(provider, resolved);
+			this.#setOwnedConfigApiKey(provider, resolved, false, "runtime");
 		}
 	}
 
@@ -2451,7 +2467,8 @@ export class ModelRegistry {
 			diagnostics.valid = false;
 			diagnostics.errors.push(registry.getError()!);
 		}
-		for (const provider of registry.#ownedConfigApiKeys.keys()) {
+		for (const [provider, apiKey] of registry.#ownedConfigApiKeys) {
+			if (apiKey.runtimeSourced === true && apiKey.configSourced !== true) continue;
 			if (!this.authStorage.hasAnyCredentialPin(provider)) continue;
 			diagnostics.valid = false;
 			diagnostics.errors.push(
@@ -2569,7 +2586,8 @@ export class ModelRegistry {
 			if (!isCurrent()) {
 				throw new Error("Model catalog changed during configuration preflight");
 			}
-			for (const provider of registry.#ownedConfigApiKeys.keys()) {
+			for (const [provider, apiKey] of registry.#ownedConfigApiKeys) {
+				if (apiKey.runtimeSourced === true && apiKey.configSourced !== true) continue;
 				if (this.authStorage.hasAnyCredentialPin(provider)) {
 					throw new Error(
 						`Cannot configure an API key override for ${provider} while a credential pin is active or unavailable`,
@@ -3067,7 +3085,7 @@ export class ModelRegistry {
 			this.#customProviderApiKeys.set(provider, resolved);
 			this.#runtimeProviderResolvedApiKeys.set(provider, resolved);
 			this.#runtimeProviderCredentialInstalled.add(provider);
-			this.#setOwnedConfigApiKey(provider, resolved);
+			this.#setOwnedConfigApiKey(provider, resolved, false, "runtime");
 			const override = this.#runtimeProviderOverrides.get(provider);
 			if (override) this.#runtimeProviderOverrides.set(provider, { ...override, apiKey: resolved });
 			const authHeader = this.#runtimeProviderAuthHeaders.get(provider);
@@ -3104,7 +3122,7 @@ export class ModelRegistry {
 			this.#customProviderApiKeys.set(provider, resolved);
 			this.#runtimeProviderResolvedApiKeys.set(provider, resolved);
 			this.#runtimeProviderCredentialInstalled.add(provider);
-			this.#setOwnedConfigApiKey(provider, resolved);
+			this.#setOwnedConfigApiKey(provider, resolved, false, "runtime");
 		}
 		this.#lastDisabledProviderKey = disabledProviderKey;
 	}
@@ -6868,7 +6886,7 @@ export class ModelRegistry {
 				this.#runtimeProviderCredentialInstalled.add(provider);
 			}
 			if (runtimeOwned) {
-				this.#setOwnedConfigApiKey(provider, resolved);
+				this.#setOwnedConfigApiKey(provider, resolved, false, "runtime");
 			} else {
 				this.#setOwnedConfigApiKey(provider, resolved, true);
 			}
@@ -7157,7 +7175,7 @@ export class ModelRegistry {
 			this.#runtimeProviderResolvedApiKeys.set(providerName, resolved);
 			this.#runtimeProviderCredentialInstalled.add(providerName);
 			if (config.authHeader !== undefined) this.#runtimeProviderAuthHeaders.set(providerName, config.authHeader);
-			this.#setOwnedConfigApiKey(providerName, resolved);
+			this.#setOwnedConfigApiKey(providerName, resolved, false, "runtime");
 		}
 		if (config.oauth && !config.apiKey && this.#runtimeProviderApiKeys.has(providerName)) {
 			const previousApiKey = this.#runtimeProviderResolvedApiKeys.get(providerName);

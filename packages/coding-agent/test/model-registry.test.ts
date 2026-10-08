@@ -10023,6 +10023,173 @@ describe("ModelRegistry config reload", () => {
 		}
 	});
 
+	test("allows an unrelated staged reload with an inherited runtime key and active session pin", async () => {
+		const provider = "runtime-pinned-reload";
+		const sessionId = "runtime-pinned-reload-session";
+		let candidate: ModelsConfigReloadCandidate | undefined;
+		try {
+			await authStorage.set(provider, [
+				{
+					type: "oauth",
+					access: "runtime-pinned-oauth-access",
+					refresh: "runtime-pinned-oauth-refresh",
+					expires: Date.now() + 60_000,
+					email: "runtime-pinned@example.com",
+				},
+			]);
+			registry.registerProvider(provider, {
+				baseUrl: "https://runtime-pinned.example/v1",
+				api: "openai-responses",
+				apiKey: "inherited-runtime-key",
+			});
+			expect(authStorage.hasConfigApiKey(provider, registry.getAuthStorageOwner())).toBe(true);
+			authStorage.clearConfigApiKeys(registry.getAuthStorageOwner());
+			expect(authStorage.hasConfigApiKey(provider, registry.getAuthStorageOwner())).toBe(false);
+			authStorage.setSessionCredentialSelector(sessionId, provider, {
+				kind: "email",
+				value: "runtime-pinned@example.com",
+			});
+
+			candidate = await registry.stageModelsConfigReload({
+				path: modelsPath,
+				text: JSON.stringify({
+					providers: {
+						"reload-proxy": {
+							baseUrl: "https://old.example.com/v1",
+							apiKey: "old-models-key",
+							api: "openai-responses",
+							models: [{ id: "old-model", name: "Updated unrelated model" }],
+						},
+					},
+				}),
+				identity: "unrelated-reload-with-inherited-runtime-key",
+			});
+			expect(candidate.valid).toBe(true);
+			expect(candidate.diagnostics.errors).toEqual([]);
+			candidate.commit();
+			candidate.finalize();
+
+			expect(registry.find("reload-proxy", "old-model")?.name).toBe("Updated unrelated model");
+			expect(authStorage.hasConfigApiKey(provider, registry.getAuthStorageOwner())).toBe(false);
+			expect(authStorage.hasEffectiveCredentialSelector(provider, sessionId)).toBe(true);
+			await expect(authStorage.peekApiKey(provider, { sessionId })).resolves.toBe("runtime-pinned-oauth-access");
+
+			candidate = await registry.stageModelsConfigReload({
+				path: modelsPath,
+				text: JSON.stringify({
+					providers: {
+						"reload-proxy": {
+							baseUrl: "https://old.example.com/v1",
+							apiKey: "old-models-key",
+							api: "openai-responses",
+							models: [{ id: "old-model" }],
+						},
+						[provider]: {
+							baseUrl: "https://runtime-pinned.example/v1",
+							api: "openai-responses",
+							apiKey: "new-conflicting-config-key",
+							models: [{ id: "config-model" }],
+						},
+					},
+				}),
+				identity: "new-config-key-over-inherited-runtime-key",
+			});
+			expect(candidate.valid).toBe(false);
+			expect(candidate.diagnostics.errors.join(" ")).toContain("credential pin is active");
+			candidate.rollback();
+			expect(registry.find(provider, "config-model")).toBeUndefined();
+			expect(authStorage.hasConfigApiKey(provider, registry.getAuthStorageOwner())).toBe(false);
+			await expect(authStorage.peekApiKey(provider, { sessionId })).resolves.toBe("runtime-pinned-oauth-access");
+
+			candidate = await registry.stageModelsConfigReload({
+				path: modelsPath,
+				text: JSON.stringify({
+					providers: {
+						"reload-proxy": {
+							baseUrl: "https://old.example.com/v1",
+							apiKey: "old-models-key",
+							api: "openai-responses",
+							models: [{ id: "old-model", name: "Second unrelated edit" }],
+						},
+					},
+				}),
+				identity: "second-unrelated-reload-with-inherited-runtime-key",
+			});
+			expect(candidate.valid).toBe(true);
+			candidate.rollback();
+		} finally {
+			candidate?.rollback();
+			authStorage.clearSessionCredentialSelector(provider, sessionId);
+		}
+	});
+
+	test("rejects a newly pinned config key at commit without publishing it", async () => {
+		const pinnedModelsPath = path.join(tempDir, "commit-race-pinned-models.json");
+		const provider = "commit-race-pinned-provider";
+		const apiKeyEnv = `GJC_TEST_COMMIT_RACE_API_KEY_${Snowflake.next()}`;
+		const previousApiKey = Bun.env[apiKeyEnv];
+		delete Bun.env[apiKeyEnv];
+		const sessionId = "commit-race-pinned-session";
+		const initialConfig = {
+			providers: {
+				[provider]: {
+					baseUrl: "https://commit-race.example/v1",
+					api: "openai-responses",
+					apiKeyEnv,
+					models: [{ id: "old-model" }],
+				},
+			},
+		};
+		let pinnedRegistry: ModelRegistry | undefined;
+		let candidate: ModelsConfigReloadCandidate | undefined;
+		try {
+			await Bun.write(pinnedModelsPath, JSON.stringify(initialConfig));
+			pinnedRegistry = new ModelRegistry(authStorage, pinnedModelsPath, undefined, { automaticRefresh: false });
+			const candidateConfig = {
+				providers: {
+					[provider]: {
+						...initialConfig.providers[provider],
+						apiKey: "new-conflicting-config-key",
+						models: [{ id: "candidate-model" }],
+					},
+				},
+			};
+			const stagedCandidate = await pinnedRegistry.stageModelsConfigReload({
+				path: pinnedModelsPath,
+				text: JSON.stringify(candidateConfig),
+				identity: "key-before-commit-time-pin",
+			});
+			candidate = stagedCandidate;
+			expect(stagedCandidate.valid).toBe(true);
+
+			await authStorage.set(provider, [
+				{
+					type: "oauth",
+					access: "commit-race-pinned-oauth-access",
+					refresh: "commit-race-pinned-oauth-refresh",
+					expires: Date.now() + 60_000,
+					email: "commit-race-pinned@example.com",
+				},
+			]);
+			authStorage.setSessionCredentialSelector(sessionId, provider, {
+				kind: "email",
+				value: "commit-race-pinned@example.com",
+			});
+
+			expect(() => stagedCandidate.commit()).toThrow(/credential pin is active or unavailable/);
+			expect(pinnedRegistry.find(provider, "old-model")).toBeDefined();
+			expect(pinnedRegistry.find(provider, "candidate-model")).toBeUndefined();
+			expect(authStorage.hasConfigApiKey(provider, pinnedRegistry.getAuthStorageOwner())).toBe(false);
+			await expect(authStorage.peekApiKey(provider, { sessionId })).resolves.toBe("commit-race-pinned-oauth-access");
+		} finally {
+			candidate?.rollback();
+			authStorage.clearSessionCredentialSelector(provider, sessionId);
+			await pinnedRegistry?.dispose();
+			if (previousApiKey === undefined) delete Bun.env[apiKeyEnv];
+			else Bun.env[apiKeyEnv] = previousApiKey;
+		}
+	});
+
 	test("keeps a pinned session credential authoritative across offline static refresh", async () => {
 		const pinnedModelsPath = path.join(tempDir, "pinned-offline-refresh-models.json");
 		const pinnedSessionId = "pinned-offline-refresh-session";

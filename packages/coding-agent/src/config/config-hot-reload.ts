@@ -7,6 +7,8 @@ const DEBOUNCE_QUIET_MS = 45;
 const DEBOUNCE_MAX_MS = 300;
 const WATCH_RECOVERY_INITIAL_MS = 100;
 const WATCH_RECOVERY_MAX_MS = 5_000;
+const APPLY_RETRY_DELAYS_MS = [100, 400] as const;
+const TRANSIENT_APPLY_FAILURE_CODES = new Set(["EAGAIN", "EBUSY", "EINTR", "ETIMEDOUT", "ECONNRESET", "EAI_AGAIN"]);
 
 export interface ConfigHotReloadPaths {
 	readonly configPath: string;
@@ -65,6 +67,9 @@ interface Binding {
 	watcherRecoveryTimer: NodeJS.Timeout | undefined;
 	watcherRecoveryDelayMs: number;
 	watcherDirectoryDiscoveryFailed: boolean;
+	watchTargets: Set<string>;
+	applyRetryTimer: NodeJS.Timeout | undefined;
+	applyRetryCandidate: ConfigHotReloadCandidate | undefined;
 	initializing: boolean;
 	baselineIdentity: string | undefined;
 	initialReadFailed: boolean;
@@ -77,6 +82,7 @@ interface Binding {
 interface PendingCandidate {
 	readonly binding: Binding;
 	readonly candidate: ConfigHotReloadCandidate;
+	readonly applyAttempt: number;
 }
 
 interface RunningCandidate extends PendingCandidate {
@@ -93,6 +99,12 @@ function missingFile(error: unknown): boolean {
 	return error.code === "ENOENT" || error.code === "ENOTDIR";
 }
 
+function transientApplyFailure(error: unknown): boolean {
+	if (error && typeof error === "object" && "retryable" in error && error.retryable === true) return true;
+	const code = failureCode(error);
+	return code !== undefined && TRANSIENT_APPLY_FAILURE_CODES.has(code);
+}
+
 function identityFor(filePath: string, text: string | null): string {
 	const hash = createHash("sha256");
 	hash.update(filePath);
@@ -104,6 +116,10 @@ function identityFor(filePath: string, text: string | null): string {
 
 function pairIdentity(sources: FileSources): string {
 	return `${sources.config.identity}:${sources.models.identity}`;
+}
+
+function candidateIdentity(candidate: ConfigHotReloadCandidate): string {
+	return `${candidate.config.identity}:${candidate.models.identity}`;
 }
 
 function pathsIdentity(paths: ConfigHotReloadPaths): string {
@@ -134,6 +150,28 @@ async function existingDirectoryAncestors(filePath: string): Promise<Set<string>
 		if (parent === current) return directories;
 		current = parent;
 	}
+}
+
+async function canonicalWatchPath(filePath: string, visited = new Set<string>()): Promise<string> {
+	try {
+		return await fs.realpath(filePath);
+	} catch (error) {
+		if (!missingFile(error)) throw error;
+	}
+	if (visited.has(filePath)) return filePath;
+	visited.add(filePath);
+	try {
+		const stat = await fs.lstat(filePath);
+		if (stat.isSymbolicLink()) {
+			const target = await fs.readlink(filePath);
+			return canonicalWatchPath(path.resolve(path.dirname(filePath), target), visited);
+		}
+	} catch (error) {
+		if (!missingFile(error)) throw error;
+	}
+	const directory = await existingDirectory(filePath);
+	const canonicalDirectory = await fs.realpath(directory);
+	return path.join(canonicalDirectory, path.relative(directory, filePath));
 }
 
 function nextPathComponent(directory: string, filePath: string): string | undefined {
@@ -224,6 +262,9 @@ export class ConfigHotReloadWatcher {
 			watcherRecoveryTimer: undefined,
 			watcherRecoveryDelayMs: WATCH_RECOVERY_INITIAL_MS,
 			watcherDirectoryDiscoveryFailed: false,
+			watchTargets: new Set([paths.configPath, paths.modelsPath]),
+			applyRetryTimer: undefined,
+			applyRetryCandidate: undefined,
 			initializing: true,
 			baselineIdentity: undefined,
 			initialReadFailed: false,
@@ -280,9 +321,11 @@ export class ConfigHotReloadWatcher {
 		binding.debounceTimer = undefined;
 		if (binding.watcherRecoveryTimer) clearTimeout(binding.watcherRecoveryTimer);
 		binding.watcherRecoveryTimer = undefined;
+		this.#cancelApplyRetry(binding);
 		for (const watcher of binding.watchers.values()) watcher.close();
 		binding.watchers.clear();
 		binding.watcherIdentities.clear();
+		binding.watchTargets.clear();
 	}
 
 	async #readSources(binding: Binding): Promise<FileSources> {
@@ -342,37 +385,45 @@ export class ConfigHotReloadWatcher {
 
 	async #desiredWatchDirectories(binding: Binding): Promise<Map<string, Set<string>>> {
 		let lookupFailed = false;
-		const findDirectories = async (filePath: string): Promise<Set<string>> => {
+		const desired = new Map<string, Set<string>>();
+		const watchTargets = new Set<string>();
+		const addTarget = async (filePath: string): Promise<void> => {
+			const targetPaths = new Set([filePath]);
 			try {
-				return await existingDirectoryAncestors(filePath);
+				targetPaths.add(await canonicalWatchPath(filePath));
 			} catch (error) {
 				if (this.#isCurrent(binding)) {
 					lookupFailed = true;
 					this.#report("watch", error, filePath);
 				}
-				return new Set();
+			}
+			for (const targetPath of targetPaths) {
+				watchTargets.add(targetPath);
+				let directories: Set<string>;
+				try {
+					directories = await existingDirectoryAncestors(targetPath);
+				} catch (error) {
+					if (this.#isCurrent(binding)) {
+						lookupFailed = true;
+						this.#report("watch", error, targetPath);
+					}
+					continue;
+				}
+				for (const directory of directories) {
+					const component = nextPathComponent(directory, targetPath);
+					if (!component) continue;
+					const components = desired.get(directory) ?? new Set<string>();
+					components.add(component);
+					desired.set(directory, components);
+				}
 			}
 		};
-		const [configDirectories, modelsDirectories] = await Promise.all([
-			findDirectories(binding.paths.configPath),
-			findDirectories(binding.paths.modelsPath),
-		]);
+		await Promise.all([addTarget(binding.paths.configPath), addTarget(binding.paths.modelsPath)]);
+		if (!this.#isCurrent(binding)) return desired;
+		binding.watchTargets = watchTargets;
 		if (this.#isCurrent(binding)) {
 			binding.watcherDirectoryDiscoveryFailed = lookupFailed;
 			if (lookupFailed) this.#scheduleWatcherRecovery(binding);
-		}
-		const desired = new Map<string, Set<string>>();
-		for (const [targetPath, directories] of [
-			[binding.paths.configPath, configDirectories],
-			[binding.paths.modelsPath, modelsDirectories],
-		] as const) {
-			for (const directory of directories) {
-				const component = nextPathComponent(directory, targetPath);
-				if (!component) continue;
-				const components = desired.get(directory) ?? new Set<string>();
-				components.add(component);
-				desired.set(directory, components);
-			}
 		}
 		return desired;
 	}
@@ -398,7 +449,9 @@ export class ConfigHotReloadWatcher {
 				binding.watcherIdentities.delete(directory);
 			}
 			const watcher = nodeFs.watch(directory, (eventType, filename) => {
+				if (!this.#isCurrent(binding) || binding.watchers.get(directory) !== watcher) return;
 				if (filename === null) {
+					this.#invalidateDescendantWatchers(binding, directory);
 					this.#scheduleScan(binding);
 					return;
 				}
@@ -407,15 +460,19 @@ export class ConfigHotReloadWatcher {
 					binding.watchers.delete(directory);
 					binding.watcherIdentities.delete(directory);
 					watcher.close();
+					this.#invalidateDescendantWatchers(binding, directory);
 					this.#scheduleScan(binding);
 					return;
 				}
 				if (!this.#matchesWatchedPath(binding, directory, name)) return;
+				if (eventType === "rename") {
+					this.#invalidateDescendantWatchers(binding, path.join(directory, name), true);
+				}
 				this.#scheduleScan(binding);
 			});
 			watcher.unref?.();
 			watcher.on("error", error => {
-				if (!this.#isCurrent(binding)) return;
+				if (!this.#isCurrent(binding) || binding.watchers.get(directory) !== watcher) return;
 				binding.watchers.delete(directory);
 				binding.watcherIdentities.delete(directory);
 				watcher.close();
@@ -450,10 +507,27 @@ export class ConfigHotReloadWatcher {
 		binding.watcherRecoveryDelayMs = WATCH_RECOVERY_INITIAL_MS;
 	}
 
+	#cancelApplyRetry(binding: Binding): void {
+		if (binding.applyRetryTimer) clearTimeout(binding.applyRetryTimer);
+		binding.applyRetryTimer = undefined;
+		binding.applyRetryCandidate = undefined;
+	}
+
 	#matchesWatchedPath(binding: Binding, directory: string, filename: string): boolean {
-		return [binding.paths.configPath, binding.paths.modelsPath].some(
-			filePath => nextPathComponent(directory, filePath) === filename,
-		);
+		for (const filePath of binding.watchTargets) {
+			if (nextPathComponent(directory, filePath) === filename) return true;
+		}
+		return false;
+	}
+
+	#invalidateDescendantWatchers(binding: Binding, directory: string, includeDirectory = false): void {
+		for (const [watchedDirectory, watcher] of binding.watchers) {
+			if (watchedDirectory !== directory && !nextPathComponent(directory, watchedDirectory)) continue;
+			if (watchedDirectory === directory && !includeDirectory) continue;
+			watcher.close();
+			binding.watchers.delete(watchedDirectory);
+			binding.watcherIdentities.delete(watchedDirectory);
+		}
 	}
 
 	#scheduleScan(binding: Binding): void {
@@ -494,6 +568,9 @@ export class ConfigHotReloadWatcher {
 				}
 				if (!this.#isCurrent(binding)) return;
 				const identity = pairIdentity(sources);
+				if (binding.applyRetryCandidate && candidateIdentity(binding.applyRetryCandidate) !== identity) {
+					this.#cancelApplyRetry(binding);
+				}
 				const recoveringInitialRead = binding.baselineIdentity === undefined && binding.initialReadFailed;
 				if (binding.baselineIdentity === undefined) {
 					binding.baselineIdentity = identity;
@@ -531,8 +608,11 @@ export class ConfigHotReloadWatcher {
 		const pendingRevision = this.#pending?.binding === binding ? this.#pending.candidate.revision : -1;
 		const runningRevision = this.#running?.binding === binding ? this.#running.candidate.revision : -1;
 		if (candidate.revision <= Math.max(this.#highestQueuedRevision, pendingRevision, runningRevision)) return;
+		if (binding.applyRetryCandidate && candidate.revision > binding.applyRetryCandidate.revision) {
+			this.#cancelApplyRetry(binding);
+		}
 		this.#highestQueuedRevision = candidate.revision;
-		this.#pending = { binding, candidate };
+		this.#pending = { binding, candidate, applyAttempt: 0 };
 		const running = this.#running;
 		if (running && (running.binding !== binding || running.candidate.revision < candidate.revision)) {
 			running.controller.abort();
@@ -559,6 +639,7 @@ export class ConfigHotReloadWatcher {
 			.catch(error => {
 				if (!running.controller.signal.aborted && this.#isCurrent(running.binding)) {
 					this.#report("apply", error, pathsIdentity(running.binding.paths));
+					if (transientApplyFailure(error)) this.#scheduleApplyRetry(running);
 				}
 			})
 			.finally(() => {
@@ -568,6 +649,62 @@ export class ConfigHotReloadWatcher {
 				}
 				this.#pump();
 			});
+	}
+
+	#scheduleApplyRetry(running: RunningCandidate): void {
+		const { binding, candidate } = running;
+		const delay = APPLY_RETRY_DELAYS_MS[running.applyAttempt];
+		if (
+			delay === undefined ||
+			!this.#isCurrent(binding) ||
+			running.controller.signal.aborted ||
+			binding.baselineIdentity !== candidateIdentity(candidate) ||
+			this.#highestQueuedRevision > candidate.revision
+		) {
+			return;
+		}
+		this.#cancelApplyRetry(binding);
+		const nextAttempt = running.applyAttempt + 1;
+		binding.applyRetryCandidate = candidate;
+		binding.applyRetryTimer = setTimeout(() => {
+			binding.applyRetryTimer = undefined;
+			void this.#queueApplyRetry(binding, candidate, nextAttempt);
+		}, delay);
+		binding.applyRetryTimer.unref?.();
+	}
+
+	async #queueApplyRetry(binding: Binding, candidate: ConfigHotReloadCandidate, applyAttempt: number): Promise<void> {
+		if (
+			!this.#isCurrent(binding) ||
+			binding.applyRetryCandidate !== candidate ||
+			binding.baselineIdentity !== candidateIdentity(candidate) ||
+			this.#highestQueuedRevision > candidate.revision
+		) {
+			this.#cancelApplyRetry(binding);
+			return;
+		}
+		let sources: FileSources;
+		try {
+			sources = await this.#readSources(binding);
+		} catch {
+			this.#cancelApplyRetry(binding);
+			if (this.#isCurrent(binding)) this.#scheduleScan(binding);
+			return;
+		}
+		if (
+			!this.#isCurrent(binding) ||
+			binding.applyRetryCandidate !== candidate ||
+			binding.baselineIdentity !== candidateIdentity(candidate) ||
+			pairIdentity(sources) !== candidateIdentity(candidate) ||
+			this.#highestQueuedRevision > candidate.revision
+		) {
+			this.#cancelApplyRetry(binding);
+			if (this.#isCurrent(binding)) this.#scheduleScan(binding);
+			return;
+		}
+		this.#cancelApplyRetry(binding);
+		this.#pending = { binding, candidate, applyAttempt };
+		this.#pump();
 	}
 
 	#errorKey(operation: ConfigHotReloadErrorOperation, resource: string | undefined, code: string | undefined): string {

@@ -2,7 +2,11 @@ import * as util from "node:util";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import { type Api, isKnownProvider, type Model } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
-import type { AgentSession, DefaultFallbackRuntimeState } from "../session/agent-session";
+import type {
+	AgentSession,
+	AgentSessionProfileInstalledOverrideState,
+	DefaultFallbackRuntimeState,
+} from "../session/agent-session";
 import { clampExplicitThinkingLevelForModel, formatClampedModelSelector } from "../thinking";
 import { validateModelProfileName } from "./model-profile-contract";
 import {
@@ -71,16 +75,8 @@ type ModelProfileActivationSession = Pick<
 	/** Current profile-installed override keys, for deriving the activation base. */
 	getProfileInstalledOverrideKeys?: () => { modelRoles: readonly string[]; agentModelOverrides: readonly string[] };
 	/** Profile-installed baselines, preserved when a refreshed profile drops an assignment. */
-	getProfileInstalledOverrideState?: () => {
-		modelRoles: ReadonlyMap<string, ModelSelectorValue | undefined>;
-		agentModelOverrides: ReadonlyMap<string, ModelSelectorValue | undefined>;
-		installedModelRoles: ReadonlyMap<string, ModelSelectorValue>;
-		installedAgentModelOverrides: ReadonlyMap<string, ModelSelectorValue>;
-		manualModelRoles: ReadonlySet<string>;
-		manualAgentModelOverrides: ReadonlySet<string>;
-		preProfileModel: Model<Api> | undefined;
-	};
-	restoreProfileInstalledOverrideState?: (state: ProfileInstalledOverrideState) => void;
+	getProfileInstalledOverrideState?: () => AgentSessionProfileInstalledOverrideState;
+	restoreProfileInstalledOverrideState?: (state: AgentSessionProfileInstalledOverrideState) => void;
 	/** Re-apply vendor-separated delegation (task tool + prompt) after the role layer changed. */
 	syncEagerDelegation?: () => Promise<void>;
 	getSessionDefaultModelSelector?: () => string | undefined;
@@ -116,16 +112,6 @@ type ConfiguredModelChainState = {
 	explicitHead: boolean;
 };
 
-type ProfileInstalledOverrideState = {
-	modelRoles: ReadonlyMap<string, ModelSelectorValue | undefined>;
-	agentModelOverrides: ReadonlyMap<string, ModelSelectorValue | undefined>;
-	installedModelRoles: ReadonlyMap<string, ModelSelectorValue>;
-	installedAgentModelOverrides: ReadonlyMap<string, ModelSelectorValue>;
-	manualModelRoles: ReadonlySet<string>;
-	manualAgentModelOverrides: ReadonlySet<string>;
-	preProfileModel: Model<Api> | undefined;
-};
-
 type PublishedModelProfileActivationState = {
 	model: Model<Api> | undefined;
 	thinkingLevel: ThinkingLevel | undefined;
@@ -134,7 +120,7 @@ type PublishedModelProfileActivationState = {
 	defaultChainState: ConfiguredModelChainState | undefined;
 	defaultFallbackRuntimeState: DefaultFallbackRuntimeState | undefined;
 	activeModelProfile: string | undefined;
-	profileInstalledOverrideState: ProfileInstalledOverrideState | undefined;
+	profileInstalledOverrideState: AgentSessionProfileInstalledOverrideState | undefined;
 	sessionDefaultModel: string | undefined;
 	persistedModelRoles: Readonly<Record<string, ModelSelectorValue>> | undefined;
 	persistedAgentModelOverrides: Readonly<Record<string, ModelSelectorValue>> | undefined;
@@ -219,7 +205,7 @@ export interface PreparedModelProfileActivation {
 	baseModelRoles: Record<string, ModelSelectorValue>;
 	previousDefaultChain: readonly string[] | undefined;
 	previousDefaultChainState: ConfiguredModelChainState | undefined;
-	previousProfileInstalledOverrideState: ProfileInstalledOverrideState | undefined;
+	previousProfileInstalledOverrideState: AgentSessionProfileInstalledOverrideState | undefined;
 	preparedDefaultModelSelection:
 		| Awaited<ReturnType<NonNullable<ModelProfileActivationSession["prepareModelSelectionForProfileActivation"]>>>
 		| undefined;
@@ -2008,7 +1994,7 @@ export async function applyPreparedModelProfileActivation(
 	let activatedFallbackRuntimeState: DefaultFallbackRuntimeState | undefined;
 	let activatedModelRolesOverride: unknown;
 	let activatedAgentModelOverridesOverride: unknown;
-	let activatedProfileInstalledOverrideState: ProfileInstalledOverrideState | undefined;
+	let activatedProfileInstalledOverrideState: AgentSessionProfileInstalledOverrideState | undefined;
 	let activatedResumeDefaultModel: string | undefined;
 
 	try {
@@ -2578,6 +2564,7 @@ export interface MaterializeModelProfileForDeletionResult {
 	previousActiveModelProfile: string | undefined;
 	previousDefaultChainState: ConfiguredModelChainState | undefined;
 	previousDefaultFallbackRuntimeState: DefaultFallbackRuntimeState | undefined;
+	previousProfileInstalledOverrideState: AgentSessionProfileInstalledOverrideState | undefined;
 	/**
 	 * Restores the session sticky canonical variant that was snapshotted before
 	 * materialization cleared it. Internal closure capturing the registry,
@@ -2707,6 +2694,11 @@ export async function materializeModelProfileForDeletion(
 				: prepared.settings.override("modelProfile.default", prepared.previousDefaultProfileOverride),
 		);
 		restore(() => prepared.session.setActiveModelProfile?.(prepared.previousActiveModelProfile));
+		if (prepared.previousProfileInstalledOverrideState) {
+			restore(() =>
+				prepared.session.restoreProfileInstalledOverrideState?.(prepared.previousProfileInstalledOverrideState!),
+			);
+		}
 		try {
 			await prepared.settings.flushOrThrow();
 		} catch (rollbackError) {
@@ -2736,6 +2728,7 @@ export async function materializeModelProfileForDeletion(
 		previousActiveModelProfile: prepared.previousActiveModelProfile,
 		previousDefaultChainState: prepared.previousDefaultChainState,
 		previousDefaultFallbackRuntimeState: prepared.previousDefaultFallbackRuntimeState,
+		previousProfileInstalledOverrideState: prepared.previousProfileInstalledOverrideState,
 		restoreSessionCanonicalVariant: () =>
 			restoreCanonicalVariant(prepared.modelRegistry, prepared.session.sessionId, prepared.previousCanonicalVariant),
 	};
@@ -2745,7 +2738,10 @@ export async function restoreMaterializedModelProfileForDeletion(options: {
 	settings: Pick<Settings, "clearOverride" | "flushOrThrow" | "override" | "set" | "unset">;
 	session: Pick<
 		ModelProfileActivationSession,
-		"setActiveModelProfile" | "setConfiguredModelChain" | "restoreDefaultFallbackRuntimeState"
+		| "setActiveModelProfile"
+		| "setConfiguredModelChain"
+		| "restoreDefaultFallbackRuntimeState"
+		| "restoreProfileInstalledOverrideState"
 	>;
 	snapshot: MaterializeModelProfileForDeletionResult;
 }): Promise<void> {
@@ -2800,6 +2796,13 @@ export async function restoreMaterializedModelProfileForDeletion(options: {
 			: options.settings.override("modelProfile.default", options.snapshot.previousDefaultProfileOverride),
 	);
 	restore(() => options.session.setActiveModelProfile?.(options.snapshot.previousActiveModelProfile));
+	if (options.snapshot.previousProfileInstalledOverrideState) {
+		restore(() =>
+			options.session.restoreProfileInstalledOverrideState?.(
+				options.snapshot.previousProfileInstalledOverrideState!,
+			),
+		);
+	}
 	try {
 		await options.settings.flushOrThrow();
 	} catch (error) {

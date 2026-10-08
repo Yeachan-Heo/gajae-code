@@ -158,6 +158,87 @@ describe("configuration hot reload watcher", () => {
 		expect(recreated.models.text).toBe("models: parent-recreated\n");
 	});
 
+	test("reopens descendant watches after parent replacement evidence with unchanged identity", async () => {
+		const directory = await temporaryDirectory();
+		const parentDirectory = path.join(directory, "parent");
+		const configDirectory = path.join(parentDirectory, "nested");
+		const paths = await configPaths(configDirectory);
+		const candidates: ConfigHotReloadCandidate[] = [];
+		const realWatch = nodeFs.watch;
+		let parentChangeListener: ((eventType: string, filename: string | Buffer | null) => void) | undefined;
+		let descendantWatchCount = 0;
+		const watchSpy = spyOn(nodeFs, "watch").mockImplementation(
+			new Proxy(realWatch, {
+				apply(target, receiver, args) {
+					const watcher = Reflect.apply(target, receiver, args);
+					if (String(args[0]) === parentDirectory && typeof args[1] === "function") {
+						parentChangeListener = args[1] as (eventType: string, filename: string | Buffer | null) => void;
+					}
+					if (String(args[0]) === configDirectory) descendantWatchCount++;
+					return watcher;
+				},
+			}),
+		);
+		const watcher = createWatcher(candidate => {
+			candidates.push(candidate);
+		});
+		try {
+			await watcher.start(paths);
+			expect(parentChangeListener).toBeDefined();
+			expect(descendantWatchCount).toBe(1);
+
+			parentChangeListener!("rename", "nested");
+			await waitFor(() => (descendantWatchCount > 1 ? true : undefined));
+			parentChangeListener!("change", null);
+			await waitFor(() => (descendantWatchCount > 2 ? true : undefined));
+		} finally {
+			watchSpy.mockRestore();
+		}
+
+		await atomicReplace(paths.configPath, "config: descendant-reopened\n");
+		const candidate = await waitFor(() =>
+			candidates.find(item => item.config.text === "config: descendant-reopened\n"),
+		);
+		expect(candidate.config.text).toBe("config: descendant-reopened\n");
+	});
+
+	test("watches canonical config targets and follows symlink retargeting", async () => {
+		const directory = await temporaryDirectory();
+		const linkDirectory = path.join(directory, "links");
+		const firstTargetDirectory = path.join(directory, "first-target");
+		const secondTargetDirectory = path.join(directory, "second-target");
+		await Promise.all([fs.mkdir(linkDirectory), fs.mkdir(firstTargetDirectory), fs.mkdir(secondTargetDirectory)]);
+		const configPath = path.join(linkDirectory, "config.yml");
+		const firstTargetPath = path.join(firstTargetDirectory, "config.yml");
+		const secondTargetPath = path.join(secondTargetDirectory, "config.yml");
+		const modelsPath = path.join(linkDirectory, "models.yml");
+		await fs.writeFile(firstTargetPath, "config: target-one\n");
+		await fs.writeFile(modelsPath, "models: initial\n");
+		await fs.symlink(firstTargetPath, configPath);
+		const paths = { configPath, modelsPath };
+		const candidates: ConfigHotReloadCandidate[] = [];
+		const watcher = createWatcher(candidate => {
+			candidates.push(candidate);
+		});
+		await watcher.start(paths);
+
+		await atomicReplace(firstTargetPath, "config: target-one-updated\n");
+		await waitFor(() => candidates.find(candidate => candidate.config.text === "config: target-one-updated\n"));
+
+		await fs.writeFile(secondTargetPath, "config: target-two\n");
+		const replacementLink = `${configPath}.replacement`;
+		await fs.symlink(secondTargetPath, replacementLink);
+		await fs.rename(replacementLink, configPath);
+		await waitFor(() => candidates.find(candidate => candidate.config.text === "config: target-two\n"));
+
+		await atomicReplace(secondTargetPath, "config: target-two-updated\n");
+		const retargeted = await waitFor(() =>
+			candidates.find(candidate => candidate.config.text === "config: target-two-updated\n"),
+		);
+		expect(retargeted.config.path).toBe(configPath);
+		expect(retargeted.config.text).toBe("config: target-two-updated\n");
+	});
+
 	test("rebinds after rapid parent replacement and retries a transient watch failure", async () => {
 		const directory = await temporaryDirectory();
 		const configDirectory = path.join(directory, "config");
@@ -364,14 +445,156 @@ describe("configuration hot reload watcher", () => {
 		expect(first.revision).toBeLessThan(latest.revision);
 	});
 
+	test("retries a transient apply failure for the unchanged snapshot", async () => {
+		const directory = await temporaryDirectory();
+		const paths = await configPaths(path.join(directory, "config"));
+		const attempts: ConfigHotReloadCandidate[] = [];
+		const errors: ConfigHotReloadError[] = [];
+		const watcher = createWatcher(
+			candidate => {
+				attempts.push(candidate);
+				if (attempts.length === 1) {
+					throw Object.assign(new Error("temporary apply contention"), { code: "EAGAIN" });
+				}
+			},
+			error => {
+				errors.push(error);
+			},
+		);
+		await watcher.start(paths);
+
+		await atomicReplace(paths.configPath, "config: transient-recovered\n");
+		await waitFor(() => attempts[1]);
+		expect(attempts[1]?.config.text).toBe("config: transient-recovered\n");
+		expect(attempts[1]?.revision).toBe(attempts[0]?.revision);
+		expect(attempts[1]?.config.identity).toBe(attempts[0]?.config.identity);
+		await Bun.sleep(550);
+		expect(attempts).toHaveLength(2);
+		expect(errors.map(error => error.operation)).toEqual(["apply"]);
+	});
+
+	test("bounds retries for a repeatedly transient apply failure", async () => {
+		const directory = await temporaryDirectory();
+		const paths = await configPaths(path.join(directory, "config"));
+		const attempts: ConfigHotReloadCandidate[] = [];
+		const watcher = createWatcher(candidate => {
+			attempts.push(candidate);
+			throw Object.assign(new Error("temporary apply contention"), { code: "EBUSY" });
+		});
+		await watcher.start(paths);
+
+		await atomicReplace(paths.configPath, "config: retry-limit\n");
+		await waitFor(() => (attempts.length === 3 ? true : undefined));
+		await Bun.sleep(550);
+		expect(attempts).toHaveLength(3);
+		expect(new Set(attempts.map(candidate => candidate.revision)).size).toBe(1);
+	});
+
+	test("retries a publication failure only when it has an explicit retryability signal", async () => {
+		const directory = await temporaryDirectory();
+		const paths = await configPaths(path.join(directory, "config"));
+		const attempts: ConfigHotReloadCandidate[] = [];
+		const watcher = createWatcher(candidate => {
+			attempts.push(candidate);
+			if (attempts.length === 1) {
+				throw Object.assign(new Error("catalog changed during preflight"), {
+					code: "PUBLICATION_FAILED",
+					retryable: true,
+				});
+			}
+		});
+		await watcher.start(paths);
+
+		await atomicReplace(paths.configPath, "config: catalog-churn\n");
+		await waitFor(() => attempts[1]);
+		expect(attempts[1]?.revision).toBe(attempts[0]?.revision);
+		await Bun.sleep(550);
+		expect(attempts).toHaveLength(2);
+	});
+
+	test("does not retry an ordinary publication failure", async () => {
+		const directory = await temporaryDirectory();
+		const paths = await configPaths(path.join(directory, "config"));
+		const attempts: ConfigHotReloadCandidate[] = [];
+		const watcher = createWatcher(candidate => {
+			attempts.push(candidate);
+			throw Object.assign(new Error("publication rejected"), { code: "PUBLICATION_FAILED" });
+		});
+		await watcher.start(paths);
+
+		await atomicReplace(paths.configPath, "config: deterministic-publication-error\n");
+		await waitFor(() => attempts[0]);
+		await Bun.sleep(550);
+		expect(attempts).toHaveLength(1);
+	});
+
+	test("does not retry a transient failure after a newer snapshot supersedes it", async () => {
+		const directory = await temporaryDirectory();
+		const paths = await configPaths(path.join(directory, "config"));
+		const attempts: ConfigHotReloadCandidate[] = [];
+		const errors: ConfigHotReloadError[] = [];
+		const watcher = createWatcher(
+			candidate => {
+				attempts.push(candidate);
+				if (candidate.config.text === "config: superseded\n") {
+					throw Object.assign(new Error("temporary apply contention"), { code: "EAGAIN" });
+				}
+			},
+			error => {
+				errors.push(error);
+			},
+		);
+		await watcher.start(paths);
+
+		await atomicReplace(paths.configPath, "config: superseded\n");
+		await waitFor(() => errors[0]);
+		await atomicReplace(paths.configPath, "config: newest\n");
+		await waitFor(() => attempts.find(candidate => candidate.config.text === "config: newest\n"));
+		await Bun.sleep(200);
+		expect(attempts.map(candidate => candidate.config.text)).toEqual(["config: superseded\n", "config: newest\n"]);
+	});
+
+	test("does not retry an apply failure after its signal is aborted", async () => {
+		const directory = await temporaryDirectory();
+		const paths = await configPaths(path.join(directory, "config"));
+		const attempts: ConfigHotReloadCandidate[] = [];
+		const errors: ConfigHotReloadError[] = [];
+		const firstStarted = Promise.withResolvers<void>();
+		const watcher = createWatcher(
+			async (candidate, signal) => {
+				attempts.push(candidate);
+				if (candidate.config.text !== "config: abort-me\n") return;
+				firstStarted.resolve();
+				const aborted = Promise.withResolvers<void>();
+				signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+				await aborted.promise;
+				throw Object.assign(new Error("temporary apply contention"), { code: "EBUSY" });
+			},
+			error => {
+				errors.push(error);
+			},
+		);
+		await watcher.start(paths);
+
+		await atomicReplace(paths.configPath, "config: abort-me\n");
+		await firstStarted.promise;
+		await atomicReplace(paths.configPath, "config: after-abort\n");
+		await waitFor(() => attempts.find(candidate => candidate.config.text === "config: after-abort\n"));
+		await Bun.sleep(200);
+		expect(attempts.map(candidate => candidate.config.text)).toEqual(["config: abort-me\n", "config: after-abort\n"]);
+		expect(errors).toEqual([]);
+	});
+
 	test("reports safe callback errors and accepts a later repaired snapshot", async () => {
 		const directory = await temporaryDirectory();
 		const paths = await configPaths(path.join(directory, "config"));
 		const errors: ConfigHotReloadError[] = [];
 		const accepted: ConfigHotReloadCandidate[] = [];
+		let rejectedAttempts = 0;
 		const watcher = createWatcher(
 			candidate => {
 				if (candidate.config.text === "config: invalid secret-value\n") {
+					rejectedAttempts++;
 					throw new Error("private config contents: secret-value");
 				}
 				accepted.push(candidate);
@@ -386,6 +609,8 @@ describe("configuration hot reload watcher", () => {
 		const diagnostic = await waitFor(() => errors[0]);
 		expect(diagnostic.operation).toBe("apply");
 		expect(diagnostic.message).not.toContain("secret-value");
+		await Bun.sleep(550);
+		expect(rejectedAttempts).toBe(1);
 
 		await atomicReplace(paths.configPath, "config: repaired\n");
 		const candidate = await waitFor(() => accepted[0]);

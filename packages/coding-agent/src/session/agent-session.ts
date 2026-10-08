@@ -2693,6 +2693,16 @@ export interface DefaultFallbackRuntimeState {
 	exhaustedLastTurn: boolean;
 }
 
+export interface AgentSessionProfileInstalledOverrideState {
+	modelRoles: ReadonlyMap<string, ModelSelectorValue | undefined>;
+	agentModelOverrides: ReadonlyMap<string, ModelSelectorValue | undefined>;
+	installedModelRoles: ReadonlyMap<string, ModelSelectorValue>;
+	installedAgentModelOverrides: ReadonlyMap<string, ModelSelectorValue>;
+	manualModelRoles: ReadonlySet<string>;
+	manualAgentModelOverrides: ReadonlySet<string>;
+	preProfileModel: Model | undefined;
+}
+
 export interface PreparedProfileModelSelection {
 	readonly sessionId: string;
 	readonly model: Model;
@@ -2734,11 +2744,13 @@ const CONFIGURATION_RELOAD_ERROR_MESSAGES: Record<ConfigurationReloadErrorCode, 
 
 export class ConfigurationReloadError extends Error {
 	readonly code: ConfigurationReloadErrorCode;
+	readonly retryable: boolean;
 
-	constructor(code: ConfigurationReloadErrorCode, cause?: unknown) {
+	constructor(code: ConfigurationReloadErrorCode, cause?: unknown, options?: { readonly retryable?: boolean }) {
 		super(CONFIGURATION_RELOAD_ERROR_MESSAGES[code], cause === undefined ? undefined : { cause });
 		this.name = "ConfigurationReloadError";
 		this.code = code;
+		this.retryable = options?.retryable === true;
 	}
 }
 
@@ -18765,6 +18777,7 @@ export class AgentSession {
 								throw new ConfigurationReloadError(
 									"PUBLICATION_FAILED",
 									new Error("The model catalog kept changing during configuration reload preflight"),
+									{ retryable: true },
 								);
 							}
 							catalogRestages++;
@@ -19205,15 +19218,7 @@ export class AgentSession {
 		this.#activeProfileManualAgentModelOverrides = new Set(manual?.agentModelOverrides ?? []);
 	}
 
-	getProfileInstalledOverrideState(): {
-		modelRoles: ReadonlyMap<string, ModelSelectorValue | undefined>;
-		agentModelOverrides: ReadonlyMap<string, ModelSelectorValue | undefined>;
-		installedModelRoles: ReadonlyMap<string, ModelSelectorValue>;
-		installedAgentModelOverrides: ReadonlyMap<string, ModelSelectorValue>;
-		manualModelRoles: ReadonlySet<string>;
-		manualAgentModelOverrides: ReadonlySet<string>;
-		preProfileModel: Model | undefined;
-	} {
+	getProfileInstalledOverrideState(): AgentSessionProfileInstalledOverrideState {
 		return {
 			modelRoles: new Map(this.#activeProfileInstalledRoles),
 			agentModelOverrides: new Map(this.#activeProfileInstalledAgentOverrides),
@@ -19225,15 +19230,7 @@ export class AgentSession {
 		};
 	}
 
-	restoreProfileInstalledOverrideState(state: {
-		modelRoles: ReadonlyMap<string, ModelSelectorValue | undefined>;
-		agentModelOverrides: ReadonlyMap<string, ModelSelectorValue | undefined>;
-		installedModelRoles: ReadonlyMap<string, ModelSelectorValue>;
-		installedAgentModelOverrides: ReadonlyMap<string, ModelSelectorValue>;
-		manualModelRoles: ReadonlySet<string>;
-		manualAgentModelOverrides: ReadonlySet<string>;
-		preProfileModel: Model | undefined;
-	}): void {
+	restoreProfileInstalledOverrideState(state: AgentSessionProfileInstalledOverrideState): void {
 		this.#activeProfileInstalledRoles = new Map(state.modelRoles);
 		this.#activeProfileInstalledAgentOverrides = new Map(state.agentModelOverrides);
 		this.#activeProfileInstalledRoleValues = new Map(state.installedModelRoles);
