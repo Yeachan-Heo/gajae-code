@@ -307,6 +307,11 @@ export interface MarkdownTheme {
 	 * Return null to fall back to fenced code rendering.
 	 */
 	resolveMermaidAscii?: (source: string) => string | null;
+	/**
+	 * Resolve an SVG figure component by fenced block source text.
+	 * Return null or undefined to fall back to fenced code rendering.
+	 */
+	resolveSvgFigure?: (source: string) => Component | null | undefined;
 	symbols: SymbolTheme;
 }
 
@@ -915,6 +920,20 @@ export class Markdown implements Component {
 						for (const asciiLine of Bun.stripANSI(ascii).split("\n")) {
 							lines.push(asciiLine);
 						}
+						if (nextTokenType && nextTokenType !== "space") {
+							lines.push("");
+						}
+						break;
+					}
+				}
+
+				// Handle SVG figures when available
+				if (token.lang === "svg" && this.#theme.resolveSvgFigure) {
+					const figure = this.#theme.resolveSvgFigure(token.text);
+					if (figure) {
+						// SVG figures are components that render directly
+						const figureLines = figure.render(width);
+						lines.push(...figureLines);
 						if (nextTokenType && nextTokenType !== "space") {
 							lines.push("");
 						}
