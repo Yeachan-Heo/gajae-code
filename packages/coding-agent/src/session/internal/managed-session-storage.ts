@@ -2668,12 +2668,18 @@ export class ManagedSessionDescendantStore {
 				canonicalFileId(rootBefore.ino) !== this.#subtreeRoot.ino
 			)
 				throw new Error("Managed descendant root binding changed");
-			let fd: number | undefined;
+			let fd: number;
 			try {
 				fd = fs.openSync(
 					resolved,
 					fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0),
 				);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+				throw error;
+			}
+			let descriptor: SessionStorageStat;
+			try {
 				const opened = fs.fstatSync(fd, { bigint: true });
 				const named = fs.lstatSync(resolved, { bigint: true });
 				if (
@@ -2695,7 +2701,7 @@ export class ManagedSessionDescendantStore {
 				)
 					throw new Error("Managed descendant root binding changed");
 				this.#assertBound();
-				return managedAppendReceiptFromIdentity({
+				descriptor = managedAppendReceiptFromIdentity({
 					dev: canonicalFileId(opened.dev),
 					ino: canonicalFileId(opened.ino),
 					nlink: opened.nlink,
@@ -2704,11 +2710,13 @@ export class ManagedSessionDescendantStore {
 					ctimeNs: opened.ctimeNs,
 				}).descriptor;
 			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+				try {
+					fs.closeSync(fd);
+				} catch {}
 				throw error;
-			} finally {
-				if (fd !== undefined) fs.closeSync(fd);
 			}
+			fs.closeSync(fd);
+			return descriptor;
 		}
 		const stat = this.#authority.stat(this.#relative(resolved));
 		if (!stat.ok) {
@@ -2759,6 +2767,7 @@ export class ManagedSessionDescendantStore {
 			resolved,
 			fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0),
 		);
+		let snapshot: SessionStorageRangeSnapshot;
 		try {
 			const before = fs.fstatSync(fd, { bigint: true });
 			if (!before.isFile() || before.nlink > 1n) throw new Error("source_changed");
@@ -2820,7 +2829,7 @@ export class ManagedSessionDescendantStore {
 			)
 				throw new Error("Managed descendant root binding changed");
 			this.#assertBound();
-			return {
+			snapshot = {
 				bytes,
 				stat: {
 					dev: canonicalFileId(after.dev),
@@ -2834,9 +2843,14 @@ export class ManagedSessionDescendantStore {
 					isFile: true,
 				},
 			};
-		} finally {
-			fs.closeSync(fd);
+		} catch (error) {
+			try {
+				fs.closeSync(fd);
+			} catch {}
+			throw error;
 		}
+		fs.closeSync(fd);
+		return snapshot;
 	}
 
 	/** Open an identity-bound stream lease; Darwin uses exact bounded range reads per chunk. */
