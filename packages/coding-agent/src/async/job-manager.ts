@@ -276,6 +276,7 @@ interface ResumeQueueEntry {
 	ownerId?: string;
 	seq: number;
 	message?: string;
+	resumeToolCallId?: string;
 	createdAt: number;
 }
 
@@ -2031,7 +2032,17 @@ export class AsyncJobManager {
 				// transitioned away from queued). Unregister its owned tuple so a
 				// later owned abort does not see orphaned work.
 				const staleQueuedGeneration = `queued:${entry.subagentId}:${entry.seq}`;
-				const endpointId = AsyncJobManager.endpointIdOf(this);
+				// Resolve the registration with the resume lineage's ENDPOINT identity:
+				// the tuple was registered under that lineage's endpoint when admission
+				// queued the resume; if the manager was rekeyed before stale-entry
+				// cleanup, the current endpoint won't find the predecessor tuple.
+				const endpointId = entry.resumeToolCallId
+					? (resolveToolLineage(entry.resumeToolCallId, AsyncJobManager.endpointIdOf(this))?.endpointId ??
+						// The binding may have been evicted (8192-cap FIFO): fall back
+						// to the manager's own endpoint so the lookup never degrades
+						// into the cross-endpoint scan.
+						AsyncJobManager.endpointIdOf(this))
+					: AsyncJobManager.endpointIdOf(this);
 				const registration = lookupOwnedRegistration(staleQueuedGeneration, staleQueuedGeneration, endpointId);
 				if (registration) unregisterOwnedRegistration(registration);
 				// Mark the stale generation as terminal so waiters for that exact
