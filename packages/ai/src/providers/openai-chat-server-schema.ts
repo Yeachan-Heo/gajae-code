@@ -223,7 +223,7 @@ export const openaiChatRequestSchema = z.object({
 	user: nullableOptional(z.string()),
 	reasoning_effort: nullableOptional(z.enum(["minimal", "low", "medium", "high", "xhigh", "max"])),
 	parallel_tool_calls: nullableOptional(z.boolean()),
-	service_tier: nullableOptional(z.enum(["auto", "default", "flex", "scale", "priority"])),
+	service_tier: nullableOptional(z.enum(["auto", "default", "flex", "scale", "priority", "ultrafast"])),
 	metadata: nullableOptional(z.record(z.string(), z.unknown())),
 
 	// ── Accept-and-ignore passthroughs ─────────────────────────────────────
