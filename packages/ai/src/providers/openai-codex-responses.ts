@@ -802,13 +802,14 @@ async function buildTransformedCodexRequestBody(
 		params.repetition_penalty = options.repetitionPenalty;
 	}
 	const resolvedServiceTier = resolveServiceTier(options?.serviceTier, model.provider);
-	if (
-		resolvedServiceTier === "flex" ||
-		resolvedServiceTier === "scale" ||
-		resolvedServiceTier === "priority" ||
-		resolvedServiceTier === "ultrafast"
-	) {
+	if (resolvedServiceTier === "flex" || resolvedServiceTier === "scale" || resolvedServiceTier === "priority") {
 		params.service_tier = resolvedServiceTier;
+	} else if (resolvedServiceTier === "ultrafast") {
+		// Gate ultrafast to models that explicitly support it
+		if (modelSupportsUltrafastTier(model)) {
+			params.service_tier = "ultrafast";
+		}
+		// else: silently omit ultrafast if model doesn't support it (fail-closed)
 	}
 	if (context.tools && context.tools.length > 0) {
 		params.tools = convertOpenAICodexResponsesTools(context.tools, model);

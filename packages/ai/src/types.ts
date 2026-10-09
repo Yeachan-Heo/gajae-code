@@ -294,6 +294,9 @@ export function resolveServiceTier(
  * True when the (possibly scoped) tier should be sent as an OpenAI-compatible
  * `service_tier` request field. Custom providers must explicitly opt in through
  * `compat.supportsServiceTier`; unknown providers remain fail-closed.
+ *
+ * Note: ultrafast has an additional gating requirement via `modelSupportsUltrafastTier`
+ * to ensure it is only sent to models that explicitly support it.
  */
 export function shouldSendServiceTier(
 	serviceTier: ServiceTier | null | undefined,
@@ -304,6 +307,22 @@ export function shouldSendServiceTier(
 	if (provider === "deepinfra") return resolved === "priority";
 	if (provider !== "openai" && provider !== "openai-codex" && !supportsServiceTier) return false;
 	return resolved === "flex" || resolved === "scale" || resolved === "priority" || resolved === "ultrafast";
+}
+
+/**
+ * True when ultrafast tier should be sent to the API. Unlike other tiers, ultrafast
+ * requires explicit model support via `modelSupportsUltrafastTier` to gate it only
+ * to models that support it (gpt-6-astra, gpt-6.1-sol, gpt-5.6-sol preview).
+ */
+export function shouldSendUltrafastTier(
+	serviceTier: ServiceTier | null | undefined,
+	provider: Provider | undefined,
+	model: Pick<Model, "compat"> | undefined,
+): boolean {
+	const resolved = resolveServiceTier(serviceTier, provider);
+	if (resolved !== "ultrafast") return false;
+	// Only send ultrafast if the model explicitly supports it
+	return modelSupportsUltrafastTier(model);
 }
 
 /**
@@ -1174,6 +1193,12 @@ export interface OpenAICompat extends ToolChoiceCompat {
 	 */
 	supportsServiceTier?: boolean;
 	/**
+	 * Whether the model explicitly supports the ultrafast service tier (6x premium tier).
+	 * Only models that set this flag will send ultrafast tier to the API.
+	 * Models: gpt-6-astra, gpt-6.1-sol, gpt-5.6-sol (preview).
+	 */
+	supportsUltrafastTier?: boolean;
+	/**
 	 * Tool names the provider reserves for its own built-ins and refuses to
 	 * accept as custom function declarations. A colliding tool is **dropped**
 	 * from the declared tools array rather than renamed: a renamed function
@@ -1443,4 +1468,9 @@ export interface Model<TApi extends Api = any> {
 /** True when a model explicitly opts into OpenAI-compatible `service_tier` forwarding. */
 export function modelSupportsServiceTier(model: Pick<Model, "compat"> | undefined): boolean {
 	return Boolean(model?.compat && "supportsServiceTier" in model.compat && model.compat.supportsServiceTier === true);
+}
+
+/** True when a model explicitly opts into OpenAI ultrafast service tier support. */
+export function modelSupportsUltrafastTier(model: Pick<Model, "compat"> | undefined): boolean {
+	return Boolean(model?.compat && "supportsUltrafastTier" in model.compat && model.compat.supportsUltrafastTier === true);
 }
