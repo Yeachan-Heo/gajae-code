@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { AsyncJobManager, type SubagentRunOutcome } from "@gajae-code/coding-agent/async/job-manager";
+import { bindToolLineage, lookupOwnedRegistration } from "@gajae-code/coding-agent/session/terminal-abort";
 
 /** Build a manager that records every delivered completion. */
 function makeManager(opts?: { maxRunningJobs?: number; retentionMs?: number }) {
@@ -484,6 +485,76 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 		expect(completions.map(completion => completion.text)).toContain("resumed:current");
 		expect(completions.map(completion => completion.text)).not.toContain("resumed:stale");
 		expect(manager.getSubagentRecord("A", { ownerId: "owner-b" })?.status).toBe("completed");
+		await manager.dispose({ timeoutMs: 500 });
+	});
+
+	test("stale queued generation's owned registration is retired on replacement (endpoint-transition regression)", async () => {
+		// Tests that when a subagent is resumed with a tool call ID, and later
+		// a replacement owner/generation is registered, the stale registration is
+		// properly retired using its original endpoint identity, not the manager's
+		// current endpoint (which may have been rekeyed).
+		const { manager } = makeManager({ maxRunningJobs: 1 });
+		installResumeRunner(manager);
+		const a = spawnControllable(manager, "A", "owner-a");
+		expect(manager.pauseSubagent("A").ok).toBe(true);
+		a.release();
+		await manager.waitForAll();
+
+		// Set up a tool lineage for the stale resume
+		const staleToolCallId = "tool-call-stale-123";
+		const managerEndpointId = "endpoint-v1";
+		bindToolLineage(staleToolCallId, {
+			lineageIdHash: "hash-stale",
+			promptAttemptEpoch: 1,
+			endpointGeneration: 1,
+			endpointId: managerEndpointId,
+		});
+
+		const blocker = spawnControllable(manager, "BLOCK", "owner-blocker");
+		// Queue the stale resume WITH a tool call ID to exercise registration
+		expect(
+			manager.resumeSubagent("A", { ownerId: "owner-a" }, "stale", staleToolCallId).queued,
+		).toBe(true);
+		// Verify the stale queued generation has an owned registration
+		const staleGen = `queued:A:1`;
+		const staleReg = lookupOwnedRegistration(staleGen, staleGen, managerEndpointId);
+		expect(staleReg).toBeDefined();
+
+		// Replace with a new owner/record
+		manager.registerSubagentRecord({
+			subagentId: "A",
+			ownerId: "owner-b",
+			currentJobId: null,
+			historicalJobIds: ["A"],
+			status: "paused",
+			sessionFile: "/tmp/A-owner-b.jsonl",
+			resumable: true,
+		});
+		// Queue the new resume (also with tool call ID)
+		const currentToolCallId = "tool-call-current-456";
+		bindToolLineage(currentToolCallId, {
+			lineageIdHash: "hash-current",
+			promptAttemptEpoch: 2,
+			endpointGeneration: 1,
+			endpointId: managerEndpointId,
+		});
+		expect(manager.resumeSubagent("A", { ownerId: "owner-b" }, "current", currentToolCallId).queued).toBe(
+			true,
+		);
+		// The current generation should have its own registration
+		const currentGen = `queued:A:2`;
+		const currentReg = lookupOwnedRegistration(currentGen, currentGen, managerEndpointId);
+		expect(currentReg).toBeDefined();
+
+		// Drain and complete; this will clean up the stale queued entry
+		blocker.release();
+		await manager.waitForAll();
+		await manager.drainDeliveries({ timeoutMs: 500 });
+
+		// After drain, the stale registration should have been retired
+		const staleRegAfter = lookupOwnedRegistration(staleGen, staleGen, managerEndpointId);
+		expect(staleRegAfter).toBeUndefined();
+
 		await manager.dispose({ timeoutMs: 500 });
 	});
 
