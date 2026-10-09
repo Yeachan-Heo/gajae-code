@@ -1271,7 +1271,9 @@ export class AsyncJobManager {
 			const subagentId = colon > "queued:".length ? id.slice("queued:".length, colon) : undefined;
 			if (!subagentId) return false;
 			const seqStr = id.slice(colon + 1);
-			const seq = seqStr ? parseInt(seqStr, 10) : NaN;
+			// Validate that seqStr is exactly a positive integer without leading zeros (e.g., 1, 123, not 01, 1junk, 1.5)
+			if (!/^[1-9][0-9]*$/.test(seqStr)) return false;
+			const seq = parseInt(seqStr, 10);
 			if (Number.isNaN(seq)) return false;
 			const rec = this.getSubagentRecord(subagentId);
 			if (rec?.status !== "queued" || rec.queued?.seq !== seq) return false;

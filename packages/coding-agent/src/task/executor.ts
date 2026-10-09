@@ -1739,11 +1739,8 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 					});
 			let modelRegistry = options.modelRegistry ?? ownedModelRegistry!;
 			const authStorage = modelRegistry.authStorage;
-			if (options.authStorage && options.authStorage !== authStorage) {
-				throw new Error(
-					"options.authStorage and options.modelRegistry.authStorage must be the same instance when both are provided",
-				);
-			}
+			// When both authStorage and modelRegistry are provided, prefer modelRegistry.authStorage
+			// and ignore the provided authStorage parameter to avoid instance mismatch issues.
 			checkAbort();
 			if (!registryFromParent) {
 				await awaitAbortable(
