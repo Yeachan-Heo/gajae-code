@@ -5,6 +5,7 @@ import models from "../src/models.json" with { type: "json" };
 import { MODELS_DEV_PROVIDER_DESCRIPTORS, mapModelsDevToModels } from "../src/provider-models/openai-compat";
 
 const LIVE_OPENCODE_GO_MODEL_IDS = [
+	"claude-haiku-5-5",
 	"minimax-m3",
 	"minimax-m2.7",
 	"minimax-m2.5",
@@ -45,7 +46,9 @@ const LIVE_OPENCODE_GO_MODEL_IDS = [
 	"grok-4.7",
 	"muse-spark-1.2-contributor",
 	"muse-spark-1.3-contributor",
+	"space-bunny",
 	"space-bunny-free",
+	"step-5-preview-free",
 	"union-alpha",
 ] as const;
 
