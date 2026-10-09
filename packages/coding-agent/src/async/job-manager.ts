@@ -2178,6 +2178,24 @@ export class AsyncJobManager {
 			const colon = id.lastIndexOf(":");
 			const subagentId = colon > "queued:".length ? id.slice("queued:".length, colon) : undefined;
 			if (!subagentId) return undefined;
+
+			// Check for stale queued tombstone in terminal events first.
+			// If a queued generation was retired as stale, it's recorded here
+			// for owned settlement to find even if the subagent record is gone.
+			const tombstoneEvent = this.#terminalEvents.get(id);
+			if (tombstoneEvent && id.startsWith(`queued:${subagentId}:`)) {
+				return {
+					id,
+					generation: id,
+					type: "task",
+					status: tombstoneEvent.status as "cancelled" | "failed",
+					startTime: tombstoneEvent.createdAt,
+					label: `stale queued resume ${subagentId}`,
+					abortController: new AbortController(),
+					promise: Promise.resolve(),
+				};
+			}
+
 			const rec = this.getSubagentRecord(subagentId);
 			if (!rec) return undefined;
 			const liveSeq = rec.queued?.seq;
