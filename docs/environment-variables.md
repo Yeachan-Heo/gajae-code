@@ -568,8 +568,8 @@ export GJC_WORKTREE_DIR='/Volumes/dev/worktrees/{repo}'
 | `CLAUDE_BASH_NO_LOGIN`      | Legacy alias fallback for `GJC_BASH_NO_LOGIN`                                  |
 | `PI_SHELL_PREFIX`           | Optional command prefix wrapper                                                |
 | `CLAUDE_CODE_SHELL_PREFIX`  | Legacy alias fallback for `PI_SHELL_PREFIX`                                    |
-| `VISUAL`                   | Preferred external editor command                                              |
-| `EDITOR`                   | Fallback external editor command                                               |
+| `VISUAL`                   | Preferred external editor command (ignored when declared in a project `.env`)  |
+| `EDITOR`                   | Fallback external editor command (ignored when declared in a project `.env`)   |
 
 Current implementation: `GJC_BASH_NO_CI` and `GJC_BASH_NO_LOGIN` are resolved first, then the `PI_*` and `CLAUDE_*` aliases above. Both are boolean-like: only `1`/`Y`/`TRUE`/`YES`/`ON` (case-insensitive) enable them, so an explicit `GJC_BASH_NO_LOGIN=0` keeps the login shell even when a legacy alias is truthy. The shell prefix is read from `PI_SHELL_PREFIX`/`CLAUDE_CODE_SHELL_PREFIX` only; `GJC_SHELL_PREFIX` is not currently honored.
 
