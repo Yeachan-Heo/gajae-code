@@ -1470,7 +1470,17 @@ export const SETTINGS_SCHEMA = {
 
 	serviceTier: {
 		type: "enum",
-		values: ["none", "auto", "default", "flex", "scale", "priority", "ultrafast", "openai-only", "claude-only"] as const,
+		values: [
+			"none",
+			"auto",
+			"default",
+			"flex",
+			"scale",
+			"priority",
+			"ultrafast",
+			"openai-only",
+			"claude-only",
+		] as const,
 		default: "none",
 		ui: {
 			tab: "model",

@@ -1009,6 +1009,7 @@
 				"flex",
 				"scale",
 				"priority",
+				"ultrafast",
 				"openai-only",
 				"claude-only"
 			],
