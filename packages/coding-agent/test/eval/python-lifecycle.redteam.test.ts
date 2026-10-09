@@ -102,7 +102,12 @@ async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Prom
 	]);
 }
 
-function countAbortListeners(signal: AbortSignal): { readonly count: () => number; readonly restore: () => void } {
+type AbortListenerCounter = {
+	readonly count: () => number;
+	readonly restore: () => void;
+};
+
+function countAbortListeners(signal: AbortSignal): AbortListenerCounter {
 	let count = 0;
 	const originalAdd = signal.addEventListener.bind(signal);
 	const originalRemove = signal.removeEventListener.bind(signal);
@@ -362,7 +367,7 @@ describe("python eval lifecycle red-team", () => {
 			Bun.env.PI_PYTHON_SKIP_CHECK = "1";
 			using tempDir = TempDir.createSync("@gjc-python-lifecycle-redteam-");
 			const controller = new AbortController();
-			let listeners: ReturnType<typeof countAbortListeners> | undefined;
+			let listeners: AbortListenerCounter | undefined;
 			const kernelStarted = Promise.withResolvers<void>();
 			let shutdown: (() => Promise<KernelShutdownResult>) | undefined;
 			let execution: Promise<PythonResult> | undefined;
