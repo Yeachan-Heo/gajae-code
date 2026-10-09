@@ -1262,13 +1262,17 @@ export class AsyncJobManager {
 	cancel(id: string, filter?: AsyncJobFilter): boolean {
 		if (id.startsWith("queued:")) {
 			// A queued resume (no real job yet): owned settlement cancels it by
-			// removing the queued subagent record and publishing the terminal
-			// (review thread P1).
+			// removing the queued subagent record and publishing the terminal.
+			// Preserve generation identity by checking that the requested sequence
+			// matches the current record's queued sequence (review thread P2).
 			const colon = id.lastIndexOf(":");
 			const subagentId = colon > "queued:".length ? id.slice("queued:".length, colon) : undefined;
 			if (!subagentId) return false;
+			const seqStr = id.slice(colon + 1);
+			const seq = seqStr ? parseInt(seqStr, 10) : NaN;
+			if (Number.isNaN(seq)) return false;
 			const rec = this.getSubagentRecord(subagentId);
-			if (rec?.status !== "queued") return false;
+			if (rec?.status !== "queued" || rec.queued?.seq !== seq) return false;
 			return this.cancelSubagent(subagentId, filter);
 		}
 		const job = this.#jobs.get(id);
