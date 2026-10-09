@@ -1086,9 +1086,6 @@ export function createInvocationReconciliation(
 			? path.join(options.stateRoot, ".sdk-reconciliation", `${options.sessionId}.json`)
 			: undefined;
 	let persistenceChain: Promise<void> = Promise.resolve();
-	// Separate chain for terminal transitions to prevent head-of-line blocking
-	// by operations that depend on external async (like the live prompt)
-	let terminalPersistenceChain: Promise<void> = Promise.resolve();
 	let mutationRevision = 0;
 	const pendingFinalizations = new Map<
 		string,
@@ -1125,7 +1122,7 @@ export function createInvocationReconciliation(
 			if (pending.writes === 0) pendingTerminalVisibility.delete(recordKey);
 		};
 	};
-	const persist = async (isTerminalTransition = false): Promise<void> => {
+	const persist = async (): Promise<void> => {
 		const run = async (): Promise<void> => {
 			// Construct the candidate only when this serialized write starts. A
 			// pre-await full snapshot lets a later agent_start/agent_end transition
@@ -1151,22 +1148,11 @@ export function createInvocationReconciliation(
 			await fs.chmod(temporary, 0o600);
 			await fs.rename(temporary, reconciliationFile);
 		};
-		// Terminal transitions use a separate chain to prevent head-of-line blocking
-		// by operations that depend on external async (like the live prompt).
-		// This ensures durable terminal states are never blocked by transient operations.
-		const chain = isTerminalTransition ? terminalPersistenceChain : persistenceChain;
-		const pending = chain.then(run, run);
-		if (isTerminalTransition) {
-			terminalPersistenceChain = pending.then(
-				() => undefined,
-				() => undefined,
-			);
-		} else {
-			persistenceChain = pending.then(
-				() => undefined,
-				() => undefined,
-			);
-		}
+		const pending = persistenceChain.then(run, run);
+		persistenceChain = pending.then(
+			() => undefined,
+			() => undefined,
+		);
 		await pending;
 	};
 	// Retention contract (#4547): terminal records are never age-evicted; only
@@ -1740,9 +1726,7 @@ export function createInvocationReconciliation(
 				});
 			records.set(recordKey, next);
 			try {
-				// Use terminal persistence chain for truly terminal transitions
-				// to prevent head-of-line blocking by operations waiting on the live prompt
-				await persist(next.terminalAt !== undefined);
+				await persist();
 				if (isPromptEnd)
 					recordDeadlineRecoveryCheckpoint("note-transition-persisted", correlation, {
 						recordStatus: next.status,
