@@ -783,6 +783,8 @@ function getCodexServiceTierCostMultiplier(
 			return 0.5;
 		case "priority":
 			return model.id === "gpt-5.5" ? 2.5 : 2;
+		case "ultrafast":
+			return 6;
 		default:
 			return 1;
 	}
@@ -795,9 +797,10 @@ function resolveCodexCostServiceTier(res: unknown, req?: unknown): ServiceTier |
 		case "flex":
 		case "scale":
 		case "priority":
+		case "ultrafast":
 			return res;
 		default:
-			if (req === "flex" || req === "priority") {
+			if (req === "flex" || req === "priority" || req === "ultrafast") {
 				return req;
 			}
 			return "default";
@@ -986,7 +989,12 @@ async function buildTransformedCodexRequestBody(
 		params.repetition_penalty = options.repetitionPenalty;
 	}
 	const resolvedServiceTier = resolveServiceTier(options?.serviceTier, model.provider);
-	if (resolvedServiceTier === "flex" || resolvedServiceTier === "scale" || resolvedServiceTier === "priority") {
+	if (
+		resolvedServiceTier === "flex" ||
+		resolvedServiceTier === "scale" ||
+		resolvedServiceTier === "priority" ||
+		resolvedServiceTier === "ultrafast"
+	) {
 		params.service_tier = resolvedServiceTier;
 	}
 	if (context.tools && context.tools.length > 0) {

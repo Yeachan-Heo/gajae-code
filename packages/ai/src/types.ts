@@ -258,7 +258,15 @@ export type CacheRetention = "none" | "short" | "long";
  * - `"openai-only"` → `"priority"` on `openai` and `OpenAI code provider`; ignored elsewhere.
  * - `"Anthropic model-only"` → `"priority"` on direct `anthropic` (not Bedrock/Vertex Anthropic model).
  */
-export type ServiceTier = "auto" | "default" | "flex" | "scale" | "priority" | "openai-only" | "claude-only";
+export type ServiceTier =
+	| "auto"
+	| "default"
+	| "flex"
+	| "scale"
+	| "priority"
+	| "ultrafast"
+	| "openai-only"
+	| "claude-only";
 
 /** Resolved tier — one of the values that providers actually consume on the wire. */
 export type ResolvedServiceTier = Exclude<ServiceTier, "openai-only" | "claude-only">;
@@ -296,13 +304,15 @@ export function shouldSendServiceTier(
 	const resolved = resolveServiceTier(serviceTier, provider);
 	if (provider === "deepinfra") return resolved === "priority";
 	if (provider !== "openai" && provider !== "openai-codex" && !supportsServiceTier) return false;
-	return resolved === "flex" || resolved === "scale" || resolved === "priority";
+	return resolved === "flex" || resolved === "scale" || resolved === "priority" || resolved === "ultrafast";
 }
 
 /**
  * True when a priority tier is realized as a fast-mode request on the provider's
  * wire protocol. Custom OpenAI-compatible proxies opt in explicitly rather than
  * inheriting support merely because their API shape resembles OpenAI.
+ *
+ * Note: ultrafast is distinct from priority and is not considered fast-mode.
  */
 export function isFastModeEffectiveForProvider(
 	serviceTier: ServiceTier | null | undefined,

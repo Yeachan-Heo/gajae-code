@@ -1794,7 +1794,7 @@ function buildParams(
 	}
 	if (shouldSendServiceTier(options?.serviceTier, model.provider, compat.supportsServiceTier === true)) {
 		const resolved = resolveServiceTier(options?.serviceTier, model.provider);
-		if (resolved === "flex" || resolved === "scale" || resolved === "priority") {
+		if (resolved === "flex" || resolved === "scale" || resolved === "priority" || resolved === "ultrafast") {
 			params.service_tier = resolved;
 		}
 	}
