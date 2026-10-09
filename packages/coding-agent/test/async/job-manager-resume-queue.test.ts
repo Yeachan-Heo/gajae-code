@@ -512,9 +512,7 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 
 		const blocker = spawnControllable(manager, "BLOCK", "owner-blocker");
 		// Queue the stale resume WITH a tool call ID to exercise registration
-		expect(
-			manager.resumeSubagent("A", { ownerId: "owner-a" }, "stale", staleToolCallId).queued,
-		).toBe(true);
+		expect(manager.resumeSubagent("A", { ownerId: "owner-a" }, "stale", staleToolCallId).queued).toBe(true);
 		// Verify the stale queued generation has an owned registration
 		const staleGen = `queued:A:1`;
 		const staleReg = lookupOwnedRegistration(staleGen, staleGen, managerEndpointId);
@@ -538,9 +536,7 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 			endpointGeneration: 1,
 			endpointId: managerEndpointId,
 		});
-		expect(manager.resumeSubagent("A", { ownerId: "owner-b" }, "current", currentToolCallId).queued).toBe(
-			true,
-		);
+		expect(manager.resumeSubagent("A", { ownerId: "owner-b" }, "current", currentToolCallId).queued).toBe(true);
 		// The current generation should have its own registration
 		const currentGen = `queued:A:2`;
 		const currentReg = lookupOwnedRegistration(currentGen, currentGen, managerEndpointId);
@@ -649,6 +645,72 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 		manager.runOwnerCleanups({ ownerId: "owner-1" });
 		expect(manager.getSubagentRecord("A")).toBeUndefined();
 		expect(manager.getLiveHandle("A")).toBeUndefined();
+		await manager.dispose({ timeoutMs: 500 });
+	});
+
+	test("stale queued registrations are retired when manager is rekeyed (endpoint-transition regression)", async () => {
+		// Tests that when a subagent is resumed with a tool call ID at endpoint E1,
+		// queued, and then the manager is rekeyed to E2 before the queue is drained,
+		// the stale queued registration is properly retired using the saved admission
+		// endpoint (E1), not the manager's current endpoint (E2).
+		const { manager } = makeManager({ maxRunningJobs: 1 });
+		installResumeRunner(manager);
+
+		// Start with A paused, then add a blocker to fill capacity
+		const a = spawnControllable(manager, "A", "owner-a");
+		expect(manager.pauseSubagent("A").ok).toBe(true);
+		a.release();
+		await manager.waitForAll();
+
+		// Now start a blocker to fill the max capacity slot
+		const blocker = spawnControllable(manager, "BLOCK", "owner-blocker");
+
+		// Set up a tool lineage at endpoint E1
+		const staleToolCallId = "tool-call-stale-endpoint-123";
+		const endpointE1 = "endpoint-e1";
+		bindToolLineage(staleToolCallId, {
+			lineageIdHash: "hash-stale",
+			promptAttemptEpoch: 1,
+			endpointGeneration: 1,
+			endpointId: endpointE1,
+		});
+
+		// Queue the resume with the tool call ID; this saves endpointE1 as the admission endpoint
+		expect(manager.resumeSubagent("A", { ownerId: "owner-a" }, "stale", staleToolCallId).queued).toBe(true);
+		const staleGen = `queued:A:1`;
+		const staleRegBefore = lookupOwnedRegistration(staleGen, staleGen, endpointE1);
+		expect(staleRegBefore).toBeDefined();
+
+		// Replace with a new owner/record
+		manager.registerSubagentRecord({
+			subagentId: "A",
+			ownerId: "owner-b",
+			currentJobId: null,
+			historicalJobIds: ["A"],
+			status: "paused",
+			sessionFile: "/tmp/A-owner-b.jsonl",
+			resumable: true,
+		});
+		// Queue the new resume (also with tool call ID at E2)
+		const endpointE2 = "endpoint-e2";
+		const currentToolCallId = "tool-call-current-456";
+		bindToolLineage(currentToolCallId, {
+			lineageIdHash: "hash-current",
+			promptAttemptEpoch: 2,
+			endpointGeneration: 1,
+			endpointId: endpointE2,
+		});
+		expect(manager.resumeSubagent("A", { ownerId: "owner-b" }, "current", currentToolCallId).queued).toBe(true);
+
+		// Drain the queue by releasing the blocker; the stale entry should be cleaned up using the saved E1 endpoint
+		blocker.release();
+		await manager.waitForAll();
+		await manager.drainDeliveries({ timeoutMs: 500 });
+
+		// The stale registration should have been retired (using the saved E1 endpoint)
+		const staleRegAfter = lookupOwnedRegistration(staleGen, staleGen, endpointE1);
+		expect(staleRegAfter).toBeUndefined();
+
 		await manager.dispose({ timeoutMs: 500 });
 	});
 });

@@ -277,6 +277,7 @@ interface ResumeQueueEntry {
 	seq: number;
 	message?: string;
 	resumeToolCallId?: string;
+	admissionEndpointId?: string;
 	createdAt: number;
 }
 
@@ -1897,12 +1898,23 @@ export class AsyncJobManager {
 				...(resumeToolCallId ? { resumeToolCallId } : {}),
 				createdAt: Date.now(),
 			};
+			// Resolve the admission endpoint before queueing: when the manager is
+			// rekeyed before stale-entry cleanup, we need the original endpoint to
+			// unregister the queued tuple. Save it in the queue entry.
+			let admissionEndpointId: string | undefined;
+			if (resumeToolCallId) {
+				const lineage = resolveToolLineage(resumeToolCallId, AsyncJobManager.endpointIdOf(this));
+				if (lineage) {
+					admissionEndpointId = lineage.endpointId ?? AsyncJobManager.endpointIdOf(this);
+				}
+			}
 			this.#resumeQueue.push({
 				subagentId: rec.subagentId,
 				ownerId: rec.ownerId,
 				seq,
 				message,
 				...(resumeToolCallId ? { resumeToolCallId } : {}),
+				...(admissionEndpointId ? { admissionEndpointId } : {}),
 				createdAt: rec.queued.createdAt,
 			});
 			// Register the QUEUED generation as owned work of the resume request's
@@ -2032,17 +2044,11 @@ export class AsyncJobManager {
 				// transitioned away from queued). Unregister its owned tuple so a
 				// later owned abort does not see orphaned work.
 				const staleQueuedGeneration = `queued:${entry.subagentId}:${entry.seq}`;
-				// Resolve the registration with the resume lineage's ENDPOINT identity:
-				// the tuple was registered under that lineage's endpoint when admission
-				// queued the resume; if the manager was rekeyed before stale-entry
-				// cleanup, the current endpoint won't find the predecessor tuple.
-				const endpointId = entry.resumeToolCallId
-					? (resolveToolLineage(entry.resumeToolCallId, AsyncJobManager.endpointIdOf(this))?.endpointId ??
-						// The binding may have been evicted (8192-cap FIFO): fall back
-						// to the manager's own endpoint so the lookup never degrades
-						// into the cross-endpoint scan.
-						AsyncJobManager.endpointIdOf(this))
-					: AsyncJobManager.endpointIdOf(this);
+				// Use the saved admission endpoint to retire the registration:
+				// the tuple was registered under that endpoint when admission queued
+				// the resume; if the manager was rekeyed before stale-entry cleanup,
+				// the current endpoint won't find the predecessor tuple.
+				const endpointId = entry.admissionEndpointId ?? AsyncJobManager.endpointIdOf(this);
 				const registration = lookupOwnedRegistration(staleQueuedGeneration, staleQueuedGeneration, endpointId);
 				if (registration) unregisterOwnedRegistration(registration);
 				// Mark the stale generation as terminal so waiters for that exact
@@ -2164,7 +2170,43 @@ export class AsyncJobManager {
 
 	#purgeOwnerSubagentState(ownerId?: string): void {
 		for (let i = this.#resumeQueue.length - 1; i >= 0; i--) {
-			if (!ownerId || this.#resumeQueue[i].ownerId === ownerId) this.#resumeQueue.splice(i, 1);
+			const entry = this.#resumeQueue[i];
+			if (!ownerId || entry.ownerId === ownerId) {
+				// Retire stale queued registrations BEFORE removing the queue entry:
+				// the purge removes the entry with no start, cancellation, or delivery
+				// boundary, so the registration would otherwise leak into the global
+				// ownership registries and eventually make later owned aborts fail
+				// closed (review thread P2). Use the saved admission endpoint so we
+				// find the registration even if the manager was rekeyed.
+				const staleQueuedGeneration = `queued:${entry.subagentId}:${entry.seq}`;
+				const endpointId = entry.admissionEndpointId ?? AsyncJobManager.endpointIdOf(this);
+				const registration = lookupOwnedRegistration(staleQueuedGeneration, staleQueuedGeneration, endpointId);
+				if (registration) unregisterOwnedRegistration(registration);
+				// Also publish a terminal event for this generation so any waiters know it won't resume.
+				if (!this.#publishedTerminalGenerations.has(staleQueuedGeneration)) {
+					this.#publishedTerminalGenerations.add(staleQueuedGeneration);
+					this.#terminalEvents.set(staleQueuedGeneration, {
+						generation: staleQueuedGeneration,
+						jobId: null,
+						subagentId: entry.subagentId,
+						ownerId: entry.ownerId,
+						status: "cancelled",
+						createdAt: Date.now(),
+					});
+					// Notify any waiters for this exact generation.
+					for (const state of this.#terminalWaits.values()) {
+						if (
+							state.targets.some(
+								target =>
+									target.generation === staleQueuedGeneration ||
+									this.#waitGenerationAliases.get(target.generation) === staleQueuedGeneration,
+							)
+						)
+							this.#maybeResolveWait(state);
+					}
+				}
+				this.#resumeQueue.splice(i, 1);
+			}
 		}
 		for (const [sid, rec] of this.#subagentRecords) {
 			if (!ownerId || rec.ownerId === ownerId) {
