@@ -2694,6 +2694,8 @@ function createSessionId(): string {
 	return Bun.randomUUIDv7();
 }
 
+let lifecycleIdAdoptedGlobally = false;
+
 /**
  * A session id pre-allocated by the notifications lifecycle subsystem, when this
  * process was spawned by `/session_create`. Gated by `GJC_LIFECYCLE_REQUEST_ID`
@@ -2701,11 +2703,16 @@ function createSessionId(): string {
  * daemon tags the tmux session, endpoint discovery, and its `/session_recent`
  * id with this value, so the agent MUST adopt it as its header id or those ids
  * diverge (breaking close/resume-by-id after the session is gone).
+ * 
+ * Only the first SessionManager in the process can adopt the lifecycle ID to prevent
+ * multiple sessions from reusing the same ID.
  */
 function lifecyclePreallocatedSessionId(): string | undefined {
+	if (lifecycleIdAdoptedGlobally) return undefined;
 	if (!process.env.GJC_LIFECYCLE_REQUEST_ID) return undefined;
 	const id = process.env.GJC_SESSION_ID?.trim();
 	if (!id || !/^[A-Za-z0-9._-]{1,128}$/.test(id)) return undefined;
+	lifecycleIdAdoptedGlobally = true;
 	return id;
 }
 
