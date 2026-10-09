@@ -3138,7 +3138,7 @@ describe.skipIf(process.platform !== "linux")("managed descendant retained bindi
 			return realClose.call(this);
 		});
 		try {
-			expect(() => parent.deriveSubtree("derived")).toThrow("Managed descendant root binding changed");
+			expect(() => parent.deriveSubtree("derived")).toThrow("Managed path contains symlink");
 			if (!retainedChild) throw new Error("Expected the real retained child authority");
 			expect(closeCalls.filter(authority => authority === retainedChild)).toHaveLength(1);
 			expect(retainedChild.identity()).toMatchObject({ ok: false, code: "closed" });
