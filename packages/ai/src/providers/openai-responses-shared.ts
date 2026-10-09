@@ -1226,6 +1226,10 @@ export function applyCommonResponsesSamplingParams<P extends CommonResponsesPara
 		const resolved = resolveServiceTier(options?.serviceTier, provider);
 		if (resolved === "flex" || resolved === "scale" || resolved === "priority") {
 			params.service_tier = resolved;
+		} else if (resolved === "ultrafast") {
+			// Responses API: gate ultrafast to models that explicitly support it
+			// Caller must check modelSupportsUltrafastTier before passing ultrafast here
+			params.service_tier = "ultrafast";
 		}
 	}
 }

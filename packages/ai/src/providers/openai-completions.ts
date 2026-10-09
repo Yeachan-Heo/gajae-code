@@ -1794,8 +1794,14 @@ function buildParams(
 	}
 	if (shouldSendServiceTier(options?.serviceTier, model.provider, compat.supportsServiceTier === true)) {
 		const resolved = resolveServiceTier(options?.serviceTier, model.provider);
-		if (resolved === "flex" || resolved === "scale" || resolved === "priority" || resolved === "ultrafast") {
+		if (resolved === "flex" || resolved === "scale" || resolved === "priority") {
 			params.service_tier = resolved;
+		} else if (resolved === "ultrafast") {
+			// Gate ultrafast to models that explicitly support it
+			if (modelSupportsUltrafastTier(model)) {
+				params.service_tier = "ultrafast";
+			}
+			// else: silently omit ultrafast if model doesn't support it (fail-closed)
 		}
 	}
 
