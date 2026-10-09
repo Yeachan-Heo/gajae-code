@@ -298,6 +298,58 @@ describe("AgentSession context promotion", () => {
 		expect(retryStarts).toHaveLength(0);
 	});
 
+	it("keeps a total-token-only empty stop (does not promote)", async () => {
+		const sparkModel = modelRegistry.find("openai-codex", "gpt-5.3-codex-spark");
+		if (!sparkModel) throw new Error("Expected codex spark model to exist");
+
+		const agent = new Agent({
+			initialState: { model: sparkModel, systemPrompt: ["Test"], tools: [], messages: [] },
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({
+				"compaction.enabled": false,
+				"contextPromotion.enabled": true,
+				"retry.maxRetries": 3,
+			}),
+			modelRegistry,
+		});
+		const retryStarts: AgentSessionEvent[] = [];
+		const modelSwitches: string[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_retry_start") retryStarts.push(event);
+			if (event.type === "model_changed") modelSwitches.push(event.model.id);
+		});
+
+		// Empty stop with only totalTokens (OpenAI-compatible total-token-only response)
+		const totalTokenOnlyEmpty: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: sparkModel.api,
+			provider: sparkModel.provider,
+			model: sparkModel.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		session.agent.emitExternalEvent({ type: "message_end", message: totalTokenOnlyEmpty });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [totalTokenOnlyEmpty] });
+
+		// Should not promote or retry (successfulEmptyStop should be true)
+		await Bun.sleep(100);
+		expect(retryStarts).toHaveLength(0);
+		expect(modelSwitches).toHaveLength(0);
+		expect(session.model?.id).toBe(sparkModel.id);
+	});
+
 	it("does not promote or continue typed provider safety stops", async () => {
 		await expectSafetyStopToSkipContextPromotion(true);
 	});

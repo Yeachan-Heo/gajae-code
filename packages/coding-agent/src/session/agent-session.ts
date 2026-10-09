@@ -21014,7 +21014,8 @@ export class AgentSession {
 		const successfulEmptyStop =
 			assistantMessage.stopReason === "stop" &&
 			assistantMessage.content.length === 0 &&
-			emptyStopPromptTokens + assistantMessage.usage.output > 0 &&
+			(emptyStopPromptTokens + assistantMessage.usage.output > 0 ||
+				assistantMessage.usage.totalTokens > 0) &&
 			emptyStopPromptTokens <= contextWindow &&
 			!hasOverflowEvidenceBeyondEmptyStopHeuristic;
 		if (
