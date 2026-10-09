@@ -20998,9 +20998,9 @@ export class AgentSession {
 		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
 		const errorIsFromBeforeCompaction =
 			compactionEntry !== null && assistantMessage.timestamp < new Date(compactionEntry.timestamp).getTime();
-		// A successful empty stop is not overflow evidence by usage alone. Preserve
-		// typed overflow classification while disabling only the legacy empty-stop
-		// heuristic for this decision.
+		// A successful empty stop with nonzero usage is not overflow evidence by usage
+		// alone. Zero-usage empty stops stay on the legacy proxy-overflow path, and typed
+		// overflow classification is preserved; only the empty-stop heuristic is disabled.
 		const hasOverflowEvidenceBeyondEmptyStopHeuristic =
 			assistantMessage.stopReason === "stop" &&
 			assistantMessage.content.length === 0 &&
@@ -21009,11 +21009,14 @@ export class AgentSession {
 				assistantMessage.transportFailure,
 				contextWindow,
 			);
+		const emptyStopPromptTokens =
+			assistantMessage.usage.input + assistantMessage.usage.cacheRead + assistantMessage.usage.cacheWrite;
 		const successfulEmptyStop =
 			assistantMessage.stopReason === "stop" &&
 			assistantMessage.content.length === 0 &&
-			assistantMessage.usage.input + assistantMessage.usage.cacheRead + assistantMessage.usage.cacheWrite <=
-				contextWindow &&
+			(emptyStopPromptTokens + assistantMessage.usage.output > 0 ||
+				assistantMessage.usage.totalTokens > 0) &&
+			emptyStopPromptTokens <= contextWindow &&
 			!hasOverflowEvidenceBeyondEmptyStopHeuristic;
 		if (
 			!successfulEmptyStop &&
