@@ -1498,5 +1498,7 @@ export function modelSupportsServiceTier(model: Pick<Model, "compat"> | undefine
 
 /** True when a model explicitly opts into OpenAI ultrafast service tier support. */
 export function modelSupportsUltrafastTier(model: Pick<Model, "compat"> | undefined): boolean {
-	return Boolean(model?.compat && "supportsUltrafastTier" in model.compat && model.compat.supportsUltrafastTier === true);
+	return Boolean(
+		model?.compat && "supportsUltrafastTier" in model.compat && model.compat.supportsUltrafastTier === true,
+	);
 }
