@@ -2703,7 +2703,7 @@ let lifecycleIdAdoptedGlobally = false;
  * daemon tags the tmux session, endpoint discovery, and its `/session_recent`
  * id with this value, so the agent MUST adopt it as its header id or those ids
  * diverge (breaking close/resume-by-id after the session is gone).
- * 
+ *
  * Only the first SessionManager in the process can adopt the lifecycle ID to prevent
  * multiple sessions from reusing the same ID.
  */
@@ -2793,6 +2793,11 @@ function migrateToCurrentVersion(entries: FileEntry[]): boolean {
 /** Exported for testing */
 export function migrateSessionEntries(entries: FileEntry[]): void {
 	migrateToCurrentVersion(entries);
+}
+
+/** Test-only function to reset the lifecycle ID adopted flag */
+export function resetLifecycleIdAdoptedGloballyForTests(): void {
+	lifecycleIdAdoptedGlobally = false;
 }
 
 function resolveManagedSessionRoot(sessionDir: string, cwd: string): string | undefined {

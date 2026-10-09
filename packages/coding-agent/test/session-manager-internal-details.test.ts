@@ -11,11 +11,12 @@
  * fields named in `INTERNAL_DETAILS_FIELDS` are removed; anything else (even
  * `__`-prefixed fields not in the allowlist) is preserved verbatim.
  */
-import { describe, expect, it } from "bun:test";
+import { beforeEach, describe, expect, it } from "bun:test";
 import { type SkillPromptDetails, stripInternalDetailsFields } from "@gajae-code/coding-agent/session/messages";
 import {
 	type CustomMessageEntry,
 	getSessionMessageEntryId,
+	resetLifecycleIdAdoptedGloballyForTests,
 	SessionManager,
 	transferSessionMessageIdentity,
 } from "@gajae-code/coding-agent/session/session-manager";
@@ -177,6 +178,10 @@ describe("SessionManager.appendCustomMessageEntry (allowlist strip + persistence
 });
 
 describe("SessionManager lifecycle-preallocated session id", () => {
+	beforeEach(() => {
+		resetLifecycleIdAdoptedGloballyForTests();
+	});
+
 	function withEnv(vars: Record<string, string | undefined>, fn: () => void): void {
 		const prev: Record<string, string | undefined> = {};
 		for (const k of Object.keys(vars)) prev[k] = process.env[k];
