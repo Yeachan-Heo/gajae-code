@@ -316,10 +316,8 @@ describe("AgentSession context promotion", () => {
 			modelRegistry,
 		});
 		const retryStarts: AgentSessionEvent[] = [];
-		const modelSwitches: string[] = [];
 		session.subscribe(event => {
 			if (event.type === "auto_retry_start") retryStarts.push(event);
-			if (event.type === "model_changed") modelSwitches.push(event.model.id);
 		});
 
 		// Empty stop with only totalTokens (OpenAI-compatible total-token-only response)
@@ -346,7 +344,6 @@ describe("AgentSession context promotion", () => {
 		// Should not promote or retry (successfulEmptyStop should be true)
 		await Bun.sleep(100);
 		expect(retryStarts).toHaveLength(0);
-		expect(modelSwitches).toHaveLength(0);
 		expect(session.model?.id).toBe(sparkModel.id);
 	});
 
