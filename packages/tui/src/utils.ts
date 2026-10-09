@@ -204,6 +204,14 @@ export interface CopyRowAnnotation {
 	 * ending a stream leaves already-painted rows byte-identical.
 	 */
 	tokenSource?: string;
+	/**
+	 * This row's position among its token's rendered rows. A container that shows
+	 * only part of a rendered token (a clipped preview) keeps it, so a selection can
+	 * tell it does not start at the token's first row.
+	 */
+	tokenRow: number;
+	/** The token's rendered row count; present with `tokenSource` on the last row only. */
+	tokenRows?: number;
 	joinGap: string;
 	contentStart: number;
 	contentEnd: number;
@@ -307,6 +315,9 @@ export function extractCopyRowAnnotation(
 					!COPY_ROW_KINDS.has(annotation.kind) ||
 					typeof annotation.source !== "string" ||
 					(annotation.tokenSource !== undefined && typeof annotation.tokenSource !== "string") ||
+					!isCopyColumn(annotation.tokenRow) ||
+					(annotation.tokenRows !== undefined &&
+						(!isCopyColumn(annotation.tokenRows) || annotation.tokenRow >= annotation.tokenRows)) ||
 					typeof annotation.joinGap !== "string" ||
 					!isCopyColumn(annotation.contentStart) ||
 					!isCopyColumn(annotation.contentEnd) ||

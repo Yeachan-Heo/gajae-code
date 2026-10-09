@@ -510,6 +510,38 @@ describe("source-aware drag copy of tables", () => {
 	});
 });
 
+describe("source-aware drag copy of a clipped Markdown preview", () => {
+	// Tool previews render Markdown and then keep only some rows, as eval does with its tail.
+	const table = `| k | v |\n|---|---|\n${Array.from({ length: 12 }, (_, i) => `| r${i} | v${i} |`).join("\n")}`;
+	const clipped = (keep: (rows: string[]) => string[]): Component => ({
+		render: width => [...keep(new Markdown(table, 1, 0, theme).render(width)), "… more lines"],
+		invalidate: () => {},
+	});
+	const dragAll = async (component: Component): Promise<string | undefined> => {
+		const rows = component.render(40).length;
+		// Stop on the last table row, before the trailing notice.
+		return dragComponent(component, 40, [0, 0], [39, rows - 2]);
+	};
+
+	test("copies only the visible rows when the preview drops the table's head", async () => {
+		const copied = await dragAll(clipped(rows => rows.slice(-6)));
+		expect(copied).toContain("r11\tv11");
+		expect(copied).not.toContain("r0");
+		expect(copied).not.toContain("| k | v |");
+	});
+
+	test("copies only the visible rows when the preview drops the table's tail", async () => {
+		const copied = await dragAll(clipped(rows => rows.slice(0, 6)));
+		expect(copied).toContain("r1");
+		expect(copied).not.toContain("r11");
+		expect(copied).not.toContain("|---|");
+	});
+
+	test("still restores the original table when the preview shows all of it", async () => {
+		expect(await dragAll(clipped(rows => rows))).toBe(table);
+	});
+});
+
 describe("drag selection while the transcript scrolls", () => {
 	const numbered = Array.from({ length: 30 }, (_, i) => `line ${String(i).padStart(2, "0")}`);
 	const screen = { columns: 30, rows: 10 };

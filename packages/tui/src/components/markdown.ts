@@ -769,6 +769,10 @@ export class Markdown implements Component {
 			continuation: boolean;
 			joinGap: string;
 			tokenSource?: string;
+			/** Position of this row among its token's rendered rows. */
+			tokenRow: number;
+			/** The token's rendered row count, set with `tokenSource` on its last row. */
+			tokenRows?: number;
 			codeRow: "open" | "content" | "close" | null;
 			ranges?: Array<[number, number]>;
 			quoteDepth: number;
@@ -798,6 +802,8 @@ export class Markdown implements Component {
 					logical,
 					continuation: wrapIndex > 0 || continued,
 					joinGap,
+					// Filled per token once all of its rows are known.
+					tokenRow: 0,
 					codeRow,
 					ranges,
 					quoteDepth,
@@ -896,9 +902,10 @@ export class Markdown implements Component {
 			let display = "";
 			let codeOriginalCursor = 0;
 			let codeDisplayCursor = 0;
-			for (const index of indexes) {
+			for (const [position, index] of indexes.entries()) {
 				const row = wrappedCopyRows[index];
 				if (!row) continue;
+				row.tokenRow = position;
 				if (!row.continuation) {
 					if (row.codeRow === "content" && boundary.kind === "code") {
 						codeLine += 1;
@@ -946,7 +953,11 @@ export class Markdown implements Component {
 				// The whole-token source rides on the token's last row. It is attached while
 				// streaming too: only the growing tail token's last row changes per delta,
 				// and ending the stream leaves already-painted rows byte-identical.
-				if (index === indexes[indexes.length - 1]) row.tokenSource = boundary.tokenSource;
+				// The row count rides with it, so earlier rows stay stable as the token grows.
+				if (index === indexes[indexes.length - 1]) {
+					row.tokenSource = boundary.tokenSource;
+					row.tokenRows = indexes.length;
+				}
 			}
 		}
 
@@ -974,6 +985,8 @@ export class Markdown implements Component {
 						kind: copy.kind,
 						source: copy.source,
 						...(copy.tokenSource === undefined ? {} : { tokenSource: copy.tokenSource }),
+						tokenRow: copy.tokenRow,
+						...(copy.tokenRows === undefined ? {} : { tokenRows: copy.tokenRows }),
 						joinGap: copy.joinGap,
 						contentStart: 0,
 						contentEnd: visibleWidth(content),

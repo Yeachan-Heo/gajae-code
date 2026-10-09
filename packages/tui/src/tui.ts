@@ -3846,9 +3846,10 @@ export class TUI extends Container {
 			group.rows.push(row);
 			groups.set(key, group);
 		}
-		// A token is complete when every selected row is covered, the selection reaches
-		// the token's last row (which carries the whole-token source), and the rows just
-		// outside the group belong to something else — rows of one token are contiguous.
+		// A token is complete when every selected row is covered, the selection holds
+		// every rendered row of the token in order (so a preview that clipped the token's
+		// head or tail cannot restore hidden rows), the last of them carries the
+		// whole-token source, and the rows just outside the group belong to something else.
 		const rowKey = (lineIndex: number): string | undefined => {
 			const line = selectionLines[lineIndex];
 			if (line === undefined || TERMINAL.isImageLine(line)) return undefined;
@@ -3860,7 +3861,9 @@ export class TUI extends Container {
 			const last = group.rows[group.rows.length - 1]!;
 			group.complete =
 				group.rows.every(row => row.covered) &&
-				last.annotation?.tokenSource !== undefined &&
+				group.rows.every((row, index) => row.annotation?.tokenRow === index) &&
+				last.annotation?.tokenRows === group.rows.length &&
+				last.annotation.tokenSource !== undefined &&
 				last.line - first.line + 1 === group.rows.length &&
 				rowKey(first.line - 1) !== key &&
 				rowKey(last.line + 1) !== key;
