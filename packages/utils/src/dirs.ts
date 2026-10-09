@@ -839,7 +839,7 @@ export function getGpuCachePath(): string {
  * cache file without touching the rest of the config root.
  */
 export function getGithubCacheDbPath(): string {
-	const override = process.env.GJC_GITHUB_CACHE_DB;
+	const override = trustedValue("GJC_GITHUB_CACHE_DB", dirs.trustSnapshot)?.trim();
 	if (override) return override;
 	return dirs.rootSubdir(path.join("cache", "github-cache.db"), "cache");
 }
