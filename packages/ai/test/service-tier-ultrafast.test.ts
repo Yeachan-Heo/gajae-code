@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { Model } from "../src/types";
-import { resolveServiceTier, shouldSendServiceTier, modelSupportsUltrafastTier } from "../src/types";
+import { modelSupportsUltrafastTier, resolveServiceTier, shouldSendServiceTier } from "../src/types";
 
 describe("ultrafast service tier", () => {
 	test("resolveServiceTier resolves ultrafast to ultrafast", () => {
