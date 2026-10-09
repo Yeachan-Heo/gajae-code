@@ -713,4 +713,82 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 
 		await manager.dispose({ timeoutMs: 500 });
 	});
+
+	test("saturated pool: stale queued entries are retired even when all slots are full", async () => {
+		// When a queued resume is replaced by a record for a different owner while
+		// the pool is at max capacity, the stale entry must be retired immediately,
+		// not deferred until a slot becomes free. This prevents owned aborts from
+		// returning unsettled for generations that can never execute.
+		const { manager } = makeManager({ maxRunningJobs: 1 });
+		installResumeRunner(manager);
+
+		// First, spawn A, pause it to create a paused record, then set up blocker
+		const a = spawnControllable(manager, "A", "owner-a");
+		expect(manager.pauseSubagent("A").ok).toBe(true);
+		a.release();
+		await manager.waitForAll();
+
+		// Spawn a blocker to fill the single capacity slot
+		const blocker = spawnControllable(manager, "BLOCKER", "owner-blocker");
+		expect(manager.getRunningJobs().length).toBe(1);
+
+		// Queue a resume for A (owner-a); this saves the admission endpoint
+		const toolCallIdA = "tool-call-a-123";
+		const endpointA = "endpoint-a";
+		bindToolLineage(toolCallIdA, {
+			lineageIdHash: "hash-a",
+			promptAttemptEpoch: 1,
+			endpointGeneration: 1,
+			endpointId: endpointA,
+		});
+		const resumeA = manager.resumeSubagent("A", { ownerId: "owner-a" }, "A message", toolCallIdA);
+		expect(resumeA.ok).toBe(true);
+		expect(resumeA.queued).toBe(true);
+		const staleGenA = `queued:A:1`;
+		const staleRegABefore = lookupOwnedRegistration(staleGenA, staleGenA, endpointA);
+		expect(staleRegABefore).toBeDefined();
+
+		// Replace A's record with B's record (same subagent ID, different owner)
+		// This makes the queued entry stale
+		manager.registerSubagentRecord({
+			subagentId: "A",
+			ownerId: "owner-b",
+			currentJobId: null,
+			historicalJobIds: ["A"],
+			status: "paused",
+			sessionFile: "/tmp/A-owner-b.jsonl",
+			resumable: true,
+		});
+
+		// Queue the new resume for B
+		const toolCallIdB = "tool-call-b-456";
+		const endpointB = "endpoint-b";
+		bindToolLineage(toolCallIdB, {
+			lineageIdHash: "hash-b",
+			promptAttemptEpoch: 2,
+			endpointGeneration: 1,
+			endpointId: endpointB,
+		});
+		const resumeB = manager.resumeSubagent("A", { ownerId: "owner-b" }, "B message", toolCallIdB);
+		expect(resumeB.queued).toBe(true);
+		const validGenB = `queued:A:2`;
+		const validRegB = lookupOwnedRegistration(validGenB, validGenB, endpointB);
+		expect(validRegB).toBeDefined();
+
+		// Critically: A's stale entry must be retired NOW, even though the pool is
+		// still saturated. The stale registration should be unregistered and marked
+		// terminal immediately when the replacement was queued.
+		const staleRegAAfter = lookupOwnedRegistration(staleGenA, staleGenA, endpointA);
+		expect(staleRegAAfter).toBeUndefined();
+
+		// The stale generation should be marked as terminal in the manager.
+		const staleJobA = manager.getJob(staleGenA);
+		expect(staleJobA?.status).toBe("cancelled");
+
+		// Release the blocker and verify B's resume can start
+		blocker.release();
+		await manager.waitForAll();
+
+		await manager.dispose({ timeoutMs: 500 });
+	});
 });

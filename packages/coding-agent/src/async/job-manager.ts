@@ -1390,6 +1390,10 @@ export class AsyncJobManager {
 		if (currentJob && record.currentJobGeneration === undefined) record.currentJobGeneration = currentJob.generation;
 		this.#subagentRecords.set(record.subagentId, record);
 		this.#notifyChange();
+		// Drain stale entries in case this replacement invalidated queued resumes
+		// for the previous owner/generation. Stale-entry retirement is independent
+		// of capacity, so it happens immediately, not waiting for a free slot.
+		this.#drainResumeQueue();
 	}
 
 	/**
@@ -2029,8 +2033,11 @@ export class AsyncJobManager {
 	#drainResumeQueue(): void {
 		if (this.#resumeQueue.length === 0) return;
 		this.#resumeQueue.sort((a, b) => a.seq - b.seq);
+
+		// First pass: retire stale entries independently of capacity. This ensures
+		// stale registrations are cleaned up even when the pool is saturated.
 		let index = 0;
-		while (index < this.#resumeQueue.length && this.getRunningJobs().length < this.#maxRunningJobs) {
+		while (index < this.#resumeQueue.length) {
 			const entry = this.#resumeQueue[index];
 			const rec = this.#subagentRecords.get(entry.subagentId);
 			if (
@@ -2077,6 +2084,22 @@ export class AsyncJobManager {
 					}
 				}
 				this.#resumeQueue.splice(index, 1);
+				continue;
+			}
+			index += 1;
+		}
+
+		// Second pass: resume valid entries while capacity allows. By this point,
+		// all stale entries have been retired, so we only process entries that
+		// currently match their record state.
+		index = 0;
+		while (index < this.#resumeQueue.length && this.getRunningJobs().length < this.#maxRunningJobs) {
+			const entry = this.#resumeQueue[index];
+			const rec = this.#subagentRecords.get(entry.subagentId);
+			if (!rec || rec.status !== "queued" || rec.ownerId !== entry.ownerId || rec.queued?.seq !== entry.seq) {
+				// This should not happen because we cleaned up all stale entries
+				// in the first pass, but skip if we encounter an unexpected state.
+				index += 1;
 				continue;
 			}
 			if (this.#isOwnerSubagentShutdownFenced(entry.ownerId)) {
