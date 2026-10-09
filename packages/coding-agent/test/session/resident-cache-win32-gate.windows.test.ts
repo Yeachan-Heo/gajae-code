@@ -4,7 +4,7 @@ import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { EphemeralBlobStore, MemoryBlobStore } from "@gajae-code/coding-agent/session/blob-store";
-import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { resetLifecycleIdAdoptedGloballyForTests, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { getAgentDir, getResidentCacheRootDir, setAgentDir } from "@gajae-code/utils";
 
 const originalAgentDir = getAgentDir();
@@ -12,6 +12,7 @@ const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
 	vi.restoreAllMocks();
+	resetLifecycleIdAdoptedGloballyForTests();
 	setAgentDir(originalAgentDir);
 	await Promise.all(
 		temporaryDirectories.splice(0).map(directory => fsp.rm(directory, { recursive: true, force: true })),

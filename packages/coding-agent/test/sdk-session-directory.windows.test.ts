@@ -8,7 +8,7 @@ import {
 	ManagedSessionDescendantStore,
 	shouldFsyncManagedDirectory,
 } from "../src/session/internal/managed-session-storage";
-import { SessionManager } from "../src/session/session-manager";
+import { resetLifecycleIdAdoptedGloballyForTests, SessionManager } from "../src/session/session-manager";
 
 const temporaryDirectories: string[] = [];
 
@@ -17,6 +17,7 @@ afterEach(async () => {
 		temporaryDirectories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })),
 	);
 	vi.restoreAllMocks();
+	resetLifecycleIdAdoptedGloballyForTests();
 });
 
 function durableTreeEvidence(snapshot: native.NativeDirectoryTreeSnapshot): unknown[] {

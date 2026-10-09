@@ -18,6 +18,7 @@ import { type SSHHost, sshCapability } from "@gajae-code/coding-agent/capability
 import { type SystemPrompt, systemPromptCapability } from "@gajae-code/coding-agent/capability/system-prompt";
 import { toolCapability } from "@gajae-code/coding-agent/capability/tool";
 import { getAgentDir, getTrustedHomeDir, resetAgentDirFromEnvironment, setAgentDir } from "@gajae-code/utils";
+import { resetLifecycleIdAdoptedGloballyForTests } from "../src/session/session-manager";
 import { type MCPServer, mcpCapability } from "../src/capability/mcp";
 import { Settings } from "../src/config/settings";
 // Register all discovery providers as a side effect.
@@ -97,6 +98,7 @@ beforeEach(async () => {
 afterEach(async () => {
 	clearCache();
 	vi.restoreAllMocks();
+	resetLifecycleIdAdoptedGloballyForTests();
 	if (originalGjcAgentDir === undefined) delete process.env.GJC_CODING_AGENT_DIR;
 	else process.env.GJC_CODING_AGENT_DIR = originalGjcAgentDir;
 	if (originalPiAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
