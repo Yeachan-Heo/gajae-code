@@ -189,47 +189,47 @@ describe("AsyncJobManager red-team invariants", () => {
 
 	test("rejects malformed queued IDs with invalid sequence numbers", async () => {
 		const manager = new AsyncJobManager({ onJobComplete: () => {} });
-		
+
 		// Register a valid subagent to get a queued ID to test
 		const subagentRecord: SubagentRecord = {
 			subagentId: "test-sub",
 			currentJobId: "test-job",
 			historicalJobIds: [],
 			status: "queued",
-			queued: { seq: 1 },
+			queued: { seq: 1, createdAt: Date.now() },
 			sessionFile: `/tmp/test-sub.jsonl`,
 			resumable: true,
 		};
 		manager.registerSubagentRecord(subagentRecord);
 		manager.registerResumeDescriptor(descriptor("test-sub"));
-		
+
 		// Malformed IDs should return false (not cancel)
 		const malformedIds = [
-			"queued:test-sub:1junk",      // Invalid: contains non-digit suffix
-			"queued:test-sub:1.5",         // Invalid: decimal number
-			"queued:test-sub:01",          // Invalid: leading zero
-			"queued:test-sub:0",           // Invalid: zero (seq starts at 1)
-			"queued:test-sub:",            // Invalid: empty suffix
-			"queued:test-sub: 1",          // Invalid: space before number
-			"queued:test-sub:1 ",          // Invalid: space after number
+			"queued:test-sub:1junk", // Invalid: contains non-digit suffix
+			"queued:test-sub:1.5", // Invalid: decimal number
+			"queued:test-sub:01", // Invalid: leading zero
+			"queued:test-sub:0", // Invalid: zero (seq starts at 1)
+			"queued:test-sub:", // Invalid: empty suffix
+			"queued:test-sub: 1", // Invalid: space before number
+			"queued:test-sub:1 ", // Invalid: space after number
 		];
-		
+
 		for (const id of malformedIds) {
 			const result = manager.cancel(id);
-			expect(result).toBe(false, `should reject malformed ID: ${id}`);
+			expect(result).toBe(false);
 		}
-		
+
 		// Verify the subagent record still exists and was not cancelled by malformed attempts
 		let rec = manager.getSubagentRecord("test-sub");
 		expect(rec?.status).toBe("queued");
 		expect(rec?.queued?.seq).toBe(1);
-		
+
 		// Valid queued ID should now cancel successfully
 		const validId = "queued:test-sub:1";
 		expect(manager.cancel(validId)).toBe(true);
 		rec = manager.getSubagentRecord("test-sub");
 		expect(rec?.status).toBe("cancelled");
-		
+
 		await manager.dispose({ timeoutMs: 200 });
 	});
 });
