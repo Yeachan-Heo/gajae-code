@@ -446,6 +446,7 @@ export interface SdkOnlyTerminalAbortSeams {
 	getTerminalTurnEpoch: () => number | undefined;
 	getActivePromptHandle: () => string | undefined;
 	onDeadlineRecoveryCheckpointForTests?: (checkpoint: SdkOnlyDeadlineRecoveryCheckpoint) => void;
+	onPersistenceInstrumentationForTests?: (event: PersistenceInstrumentationEvent) => void;
 	/** Re-read the active prompt's owning SDK connection for the owner-mismatch
 	 *  recheck; falls back to the runtime-tracked owner when absent (review
 	 *  thread P1). */
@@ -1053,12 +1054,21 @@ function canonicalizeHydratedDiagnostics(record: InvocationRecord): InvocationRe
 	return canonical;
 }
 
+export interface PersistenceInstrumentationEvent {
+	at: number;
+	phase: "enqueued" | "started" | "completed" | "failed";
+	operation?: string;
+	substep?: string;
+	error?: string;
+}
+
 export function createInvocationReconciliation(
 	options: {
 		stateRoot?: string;
 		sessionId?: string;
 		store?: SdkOnlyReconciliationStore;
 		onDeadlineRecoveryCheckpointForTests?: (checkpoint: SdkOnlyDeadlineRecoveryCheckpoint) => void;
+		onPersistenceInstrumentationForTests?: (event: PersistenceInstrumentationEvent) => void;
 	} = {},
 ): InvocationReconciliation {
 	const ACTIVE_CAPACITY = 256;
@@ -1123,37 +1133,103 @@ export function createInvocationReconciliation(
 		};
 	};
 	const persist = async (): Promise<void> => {
+		try {
+			options.onPersistenceInstrumentationForTests?.({ at: Date.now(), phase: "enqueued" });
+		} catch {
+			// A test observer must never participate in durable reconciliation.
+		}
 		const run = async (): Promise<void> => {
+			try {
+				options.onPersistenceInstrumentationForTests?.({ at: Date.now(), phase: "started" });
+			} catch {
+				// Ignore observer errors.
+			}
 			// Construct the candidate only when this serialized write starts. A
 			// pre-await full snapshot lets a later agent_start/agent_end transition
 			// be overwritten on disk by an older queued write even though the live
 			// map has already converged.
 			const snapshot = [...records.values()].map(record => ({ ...record }));
 			if (store) {
+				try {
+					options.onPersistenceInstrumentationForTests?.({
+						at: Date.now(),
+						phase: "started",
+						operation: "store.transact",
+					});
+				} catch {}
 				await store.transact(current => [
 					...current.filter(record => record.kind !== "prompt" && record.kind !== "skill"),
 					...snapshot.map(record => ({ ...record })),
 				]);
+				try {
+					options.onPersistenceInstrumentationForTests?.({
+						at: Date.now(),
+						phase: "completed",
+						operation: "store.transact",
+					});
+				} catch {}
 				return;
 			}
 			if (!reconciliationFile) return;
 			const directory = path.dirname(reconciliationFile);
 			const temporary = `${reconciliationFile}.${process.pid}.${crypto.randomUUID()}.tmp`;
+			try {
+				options.onPersistenceInstrumentationForTests?.({ at: Date.now(), phase: "started", substep: "mkdir" });
+			} catch {}
 			await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+			try {
+				options.onPersistenceInstrumentationForTests?.({ at: Date.now(), phase: "completed", substep: "mkdir" });
+			} catch {}
+			try {
+				options.onPersistenceInstrumentationForTests?.({ at: Date.now(), phase: "started", substep: "writeFile" });
+			} catch {}
 			await fs.writeFile(
 				temporary,
 				JSON.stringify({ version: 1, sessionId: options.sessionId, records: [...snapshot] }),
 				{ encoding: "utf8", mode: 0o600 },
 			);
+			try {
+				options.onPersistenceInstrumentationForTests?.({
+					at: Date.now(),
+					phase: "completed",
+					substep: "writeFile",
+				});
+			} catch {}
+			try {
+				options.onPersistenceInstrumentationForTests?.({ at: Date.now(), phase: "started", substep: "chmod" });
+			} catch {}
 			await fs.chmod(temporary, 0o600);
+			try {
+				options.onPersistenceInstrumentationForTests?.({ at: Date.now(), phase: "completed", substep: "chmod" });
+			} catch {}
+			try {
+				options.onPersistenceInstrumentationForTests?.({ at: Date.now(), phase: "started", substep: "rename" });
+			} catch {}
 			await fs.rename(temporary, reconciliationFile);
+			try {
+				options.onPersistenceInstrumentationForTests?.({ at: Date.now(), phase: "completed", substep: "rename" });
+			} catch {}
 		};
 		const pending = persistenceChain.then(run, run);
 		persistenceChain = pending.then(
 			() => undefined,
 			() => undefined,
 		);
-		await pending;
+		try {
+			await pending;
+			try {
+				options.onPersistenceInstrumentationForTests?.({ at: Date.now(), phase: "completed" });
+			} catch {}
+		} catch (error) {
+			try {
+				options.onPersistenceInstrumentationForTests?.({
+					at: Date.now(),
+					phase: "failed",
+					error: error instanceof Error ? error.message : String(error),
+				});
+			} catch {}
+			throw error;
+		}
 	};
 	// Retention contract (#4547): terminal records are never age-evicted; only
 	// the per-kind oldest-terminal-first capacity trim removes them, so a
@@ -6513,6 +6589,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const reconciliation = createInvocationReconciliation({
 			store: reconciliationStore,
 			onDeadlineRecoveryCheckpointForTests: options.terminalAbortSeams?.onDeadlineRecoveryCheckpointForTests,
+			onPersistenceInstrumentationForTests: options.terminalAbortSeams?.onPersistenceInstrumentationForTests,
 		});
 		await reconciliation.hydrate();
 		const steerReconciliation = createKindAwareReconciliation({

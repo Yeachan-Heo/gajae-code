@@ -45,6 +45,7 @@ import {
 	createInvocationReconciliation,
 	createSdkSessionRuntimeExtension,
 	createSdkSurfaceFactory,
+	type PersistenceInstrumentationEvent,
 	RetainedTerminalBoundaryRegistry,
 	type SdkOnlyDeadlineRecoveryCheckpoint,
 	type SdkOnlyInvocationRecord,
@@ -4610,6 +4611,8 @@ async function invocationHarness(
 		}) => void;
 		branch?: unknown[];
 		onInvocationCompletionReconciled?: (kind: string, correlation: { commandId: string; turnId: string }) => void;
+		/** Test-only instrumentation of the persistence chain. */
+		onPersistenceInstrumentation?: (event: PersistenceInstrumentationEvent) => void;
 		/** Override/extend the INTERNAL terminal-abort seams the runtime is threaded. */
 		terminalAbortSeams?: Partial<SdkOnlyTerminalAbortSeams>;
 	},
@@ -4641,7 +4644,7 @@ async function invocationHarness(
 	createTestRuntimeExtension(api, {
 		agentDir: cwd,
 		...(hooks.onLifecycleDrainTimeout ? { onLifecycleDrainTimeoutForTests: hooks.onLifecycleDrainTimeout } : {}),
-		...(interceptorStore || hooks.terminalAbortSeams
+		...(interceptorStore || hooks.terminalAbortSeams || hooks.onPersistenceInstrumentation
 			? {
 					terminalAbortSeams: {
 						getTerminalTurnEpoch: () => undefined,
@@ -4649,6 +4652,9 @@ async function invocationHarness(
 						cancelPendingPreflightForTerminalAbort: () => {},
 						abortPromptAndWaitWithTerminal: async () => ({ status: "settled", terminalScope: {} }),
 						...(interceptorStore ? { getReconciliationStore: () => interceptorStore } : {}),
+						...(hooks.onPersistenceInstrumentation
+							? { onPersistenceInstrumentationForTests: hooks.onPersistenceInstrumentation }
+							: {}),
 						...hooks.terminalAbortSeams,
 					},
 				}
@@ -8536,6 +8542,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		const activeTools = new Set(["unfenced-tool"]);
 		const toolDrainObserved = Promise.withResolvers<void>();
 		const recoveryCheckpoints: SdkOnlyDeadlineRecoveryCheckpoint[] = [];
+		const persistenceLog: Array<PersistenceInstrumentationEvent & { label: string }> = [];
 		let boundaryWaitStarted = false;
 		let abortCalls = 0;
 		let harness: InvocationHarness | undefined;
@@ -8549,6 +8556,10 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				sendUserMessage: async (_content, options) => {
 					await options?.onPreflightAcceptCommit?.();
 					await neverSettlingPromise();
+				},
+				onPersistenceInstrumentation: event => {
+					const label = `${event.phase}:${event.operation ?? "main"}:${event.substep ?? ""}`;
+					persistenceLog.push({ ...event, label });
 				},
 				terminalAbortSeams: {
 					getReconciliationStore: () => store,
@@ -8623,7 +8634,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 					  })
 					| undefined;
 				throw new Error(
-					`${error instanceof Error ? error.message : String(error)}; deadline checkpoints=${JSON.stringify(recoveryCheckpoints)}; durable=${JSON.stringify(
+					`${error instanceof Error ? error.message : String(error)}; persistence_log=${JSON.stringify(persistenceLog)}; deadline checkpoints=${JSON.stringify(recoveryCheckpoints)}; durable=${JSON.stringify(
 						{
 							status: finalRecord?.status,
 							terminalAt: finalRecord?.terminalAt,
