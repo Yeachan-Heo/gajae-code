@@ -1223,7 +1223,7 @@ export function applyCommonResponsesSamplingParams<P extends CommonResponsesPara
 		} else if (resolved === "ultrafast") {
 			// Responses API: gate ultrafast to models that explicitly support it
 			// Caller must check modelSupportsUltrafastTier before passing ultrafast here
-			params.service_tier = "ultrafast";
+			(params as Record<string, unknown>).service_tier = "ultrafast";
 		}
 	}
 }

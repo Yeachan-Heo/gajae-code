@@ -32,6 +32,7 @@ import {
 	type FetchImpl,
 	type Message,
 	type MessageAttribution,
+	modelSupportsUltrafastTier,
 	type Model,
 	type OpenAICompat,
 	type ProviderSessionState,
@@ -1799,7 +1800,7 @@ function buildParams(
 		} else if (resolved === "ultrafast") {
 			// Gate ultrafast to models that explicitly support it
 			if (modelSupportsUltrafastTier(model)) {
-				params.service_tier = "ultrafast";
+				(params as Record<string, unknown>).service_tier = "ultrafast";
 			}
 			// else: silently omit ultrafast if model doesn't support it (fail-closed)
 		}

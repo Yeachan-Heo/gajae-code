@@ -29,6 +29,7 @@ import {
 	type AssistantMessage,
 	type Context,
 	type FetchImpl,
+	modelSupportsUltrafastTier,
 	type Model,
 	type ProviderSessionState,
 	resolveServiceTier,
