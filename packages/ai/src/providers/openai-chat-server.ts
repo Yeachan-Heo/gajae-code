@@ -46,7 +46,14 @@ function isReasoningEffort(value: unknown): value is ReasoningEffort {
 }
 
 function isServiceTier(value: unknown): value is ResolvedServiceTier {
-	return value === "auto" || value === "default" || value === "flex" || value === "scale" || value === "priority";
+	return (
+		value === "auto" ||
+		value === "default" ||
+		value === "flex" ||
+		value === "scale" ||
+		value === "priority" ||
+		value === "ultrafast"
+	);
 }
 
 // ---------------------------------------------------------------------------

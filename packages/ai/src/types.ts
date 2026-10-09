@@ -311,22 +311,6 @@ export function shouldSendServiceTier(
 }
 
 /**
- * True when ultrafast tier should be sent to the API. Unlike other tiers, ultrafast
- * requires explicit model support via `modelSupportsUltrafastTier` to gate it only
- * to models that support it (gpt-6-astra, gpt-6.1-sol, gpt-5.6-sol preview).
- */
-export function shouldSendUltrafastTier(
-	serviceTier: ServiceTier | null | undefined,
-	provider: Provider | undefined,
-	model: Pick<Model, "compat"> | undefined,
-): boolean {
-	const resolved = resolveServiceTier(serviceTier, provider);
-	if (resolved !== "ultrafast") return false;
-	// Only send ultrafast if the model explicitly supports it
-	return modelSupportsUltrafastTier(model);
-}
-
-/**
  * True when a priority tier is realized as a fast-mode request on the provider's
  * wire protocol. Custom OpenAI-compatible proxies opt in explicitly rather than
  * inheriting support merely because their API shape resembles OpenAI.

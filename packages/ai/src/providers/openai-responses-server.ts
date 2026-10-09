@@ -49,7 +49,14 @@ function isReasoningEffort(value: unknown): value is NonNullable<ParsedRequest["
 }
 
 function isServiceTier(value: unknown): value is NonNullable<ParsedRequest["options"]["serviceTier"]> {
-	return value === "auto" || value === "default" || value === "flex" || value === "scale" || value === "priority";
+	return (
+		value === "auto" ||
+		value === "default" ||
+		value === "flex" ||
+		value === "scale" ||
+		value === "priority" ||
+		value === "ultrafast"
+	);
 }
 
 function isObj(v: unknown): v is Record<string, unknown> {
