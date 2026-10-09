@@ -583,14 +583,19 @@ export class PromptDeadlineManager {
 		this.#clearTimer(key);
 		// Use immediate retry (0ms) if tools were pending on last check;
 		// otherwise use normal retry delay. This allows quick detection when tools drain.
-		const effectiveDelayMs = delayMs ?? (this.#toolsStillPendingOnLastCheck.has(key) ? 0 : UNCERTAINTY_RETRY_DELAY_MS);
+		const effectiveDelayMs =
+			delayMs ?? (this.#toolsStillPendingOnLastCheck.has(key) ? 0 : UNCERTAINTY_RETRY_DELAY_MS);
 		const timer = setTimeout(() => void this.#onDeadline(key), effectiveDelayMs);
 		(timer as unknown as { unref?: () => void }).unref?.();
 		this.#timers.set(key, timer);
 	}
 
 	/** Notify about termination check results to adjust retry strategy. */
-	notifyTerminationResult(correlation: InvocationCorrelation, result: PromptDeadlineTerminalization, reason: string): void {
+	notifyTerminationResult(
+		correlation: InvocationCorrelation,
+		result: PromptDeadlineTerminalization,
+		reason: string,
+	): void {
 		const key = leaseKey(correlation);
 		if (reason.includes("tools-still-pending")) {
 			this.#toolsStillPendingOnLastCheck.add(key);
