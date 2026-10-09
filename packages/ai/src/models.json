@@ -6465,84 +6465,84 @@
 	},
 	"azure-openai": {
 		"gpt-4.1": {
-			"api": "azure-openai-responses",
-			"baseUrl": "",
-			"contextWindow": 1047576,
-			"cost": {
-				"cacheRead": 0.5,
-				"cacheWrite": 0,
-				"input": 2,
-				"output": 8
-			},
 			"id": "gpt-4.1",
+			"name": "GPT-4.1",
+			"api": "azure-openai-responses",
+			"provider": "azure-openai",
+			"baseUrl": "",
+			"reasoning": false,
 			"input": [
 				"text",
 				"image"
 			],
-			"maxTokens": 32768,
-			"name": "GPT-4.1",
-			"provider": "azure-openai",
-			"reasoning": false
+			"cost": {
+				"input": 2,
+				"output": 8,
+				"cacheRead": 0.5,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1047576,
+			"maxTokens": 32768
 		},
 		"gpt-4o": {
-			"api": "azure-openai-responses",
-			"baseUrl": "",
-			"contextWindow": 128000,
-			"cost": {
-				"cacheRead": 1.25,
-				"cacheWrite": 0,
-				"input": 2.5,
-				"output": 10
-			},
 			"id": "gpt-4o",
+			"name": "GPT-4o",
+			"api": "azure-openai-responses",
+			"provider": "azure-openai",
+			"baseUrl": "",
+			"reasoning": false,
 			"input": [
 				"text",
 				"image"
 			],
-			"maxTokens": 16384,
-			"name": "GPT-4o",
-			"provider": "azure-openai",
-			"reasoning": false
+			"cost": {
+				"input": 2.5,
+				"output": 10,
+				"cacheRead": 1.25,
+				"cacheWrite": 0
+			},
+			"contextWindow": 128000,
+			"maxTokens": 16384
 		},
 		"gpt-4o-mini": {
-			"api": "azure-openai-responses",
-			"baseUrl": "",
-			"contextWindow": 128000,
-			"cost": {
-				"cacheRead": 0.075,
-				"cacheWrite": 0,
-				"input": 0.15,
-				"output": 0.6
-			},
 			"id": "gpt-4o-mini",
+			"name": "GPT-4o mini",
+			"api": "azure-openai-responses",
+			"provider": "azure-openai",
+			"baseUrl": "",
+			"reasoning": false,
 			"input": [
 				"text",
 				"image"
 			],
-			"maxTokens": 16384,
-			"name": "GPT-4o mini",
-			"provider": "azure-openai",
-			"reasoning": false
+			"cost": {
+				"input": 0.15,
+				"output": 0.6,
+				"cacheRead": 0.075,
+				"cacheWrite": 0
+			},
+			"contextWindow": 128000,
+			"maxTokens": 16384
 		},
 		"o3": {
-			"api": "azure-openai-responses",
-			"baseUrl": "",
-			"contextWindow": 200000,
-			"cost": {
-				"cacheRead": 0.5,
-				"cacheWrite": 0,
-				"input": 2,
-				"output": 8
-			},
 			"id": "o3",
+			"name": "o3",
+			"api": "azure-openai-responses",
+			"provider": "azure-openai",
+			"baseUrl": "",
+			"reasoning": true,
 			"input": [
 				"text",
 				"image"
 			],
+			"cost": {
+				"input": 2,
+				"output": 8,
+				"cacheRead": 0.5,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
 			"maxTokens": 100000,
-			"name": "o3",
-			"provider": "azure-openai",
-			"reasoning": true,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -6550,23 +6550,23 @@
 			}
 		},
 		"o3-mini": {
-			"api": "azure-openai-responses",
-			"baseUrl": "",
-			"contextWindow": 200000,
-			"cost": {
-				"cacheRead": 0.55,
-				"cacheWrite": 0,
-				"input": 1.1,
-				"output": 4.4
-			},
 			"id": "o3-mini",
+			"name": "o3-mini",
+			"api": "azure-openai-responses",
+			"provider": "azure-openai",
+			"baseUrl": "",
+			"reasoning": true,
 			"input": [
 				"text"
 			],
+			"cost": {
+				"input": 1.1,
+				"output": 4.4,
+				"cacheRead": 0.55,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
 			"maxTokens": 100000,
-			"name": "o3-mini",
-			"provider": "azure-openai",
-			"reasoning": true,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -24761,7 +24761,7 @@
 		},
 		"inclusionai/ling-3.1-flash": {
 			"id": "inclusionai/ling-3.1-flash",
-			"name": "inclusionAI: Ling 3.1 Flash (new)",
+			"name": "inclusionAI: Ling 3.1 Flash",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -74522,9 +74522,9 @@
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"contextWindow": 1048576,
 			"cost": {
-				"input": 0.15839999999999999,
-				"output": 0.4752,
-				"cacheRead": 0.00504,
+				"input": 0.1282,
+				"output": 8,
+				"cacheRead": 0.13,
 				"cacheWrite": 0
 			},
 			"id": "~deepseek/deepseek-pro-latest",
@@ -74546,9 +74546,9 @@
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"contextWindow": 1048576,
 			"cost": {
-				"input": 0.0048,
-				"output": 0.037866000000000004,
-				"cacheRead": 0.0048,
+				"input": 0.00832,
+				"output": 0.027604,
+				"cacheRead": 0.00832,
 				"cacheWrite": 0
 			},
 			"id": "~deepseek/deepseek-v4-flash-latest",
@@ -74821,7 +74821,7 @@
 			"contextWindow": 1048576,
 			"cost": {
 				"input": 0.032,
-				"output": 0.36312500000000003,
+				"output": 0.294131,
 				"cacheRead": 0.02,
 				"cacheWrite": 0
 			},
@@ -76907,9 +76907,9 @@
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"contextWindow": 1048576,
 			"cost": {
-				"input": 0.0173,
+				"input": 0.005699999999999999,
 				"output": 1.28,
-				"cacheRead": 0.0173,
+				"cacheRead": 0.005699999999999999,
 				"cacheWrite": 0
 			},
 			"id": "deepseek/deepseek-v4-flash",
@@ -76931,9 +76931,9 @@
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"contextWindow": 1048576,
 			"cost": {
-				"input": 0.006,
+				"input": 0.010400000000000001,
 				"output": 1.28,
-				"cacheRead": 0.006,
+				"cacheRead": 0.010400000000000001,
 				"cacheWrite": 0
 			},
 			"id": "deepseek/deepseek-v4-flash-0731",
@@ -77004,9 +77004,9 @@
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"contextWindow": 1048576,
 			"cost": {
-				"input": 0.29406,
-				"output": 0.58812,
-				"cacheRead": 0.024505,
+				"input": 0.2871,
+				"output": 0.5742,
+				"cacheRead": 0.023925000000000002,
 				"cacheWrite": 0
 			},
 			"id": "deepseek/deepseek-v4-pro",
@@ -80081,9 +80081,9 @@
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"contextWindow": 262144,
 			"cost": {
-				"input": 0.4375,
+				"input": 0.43570000000000003,
 				"output": 2.4499999999999997,
-				"cacheRead": 0.1211,
+				"cacheRead": 0.1205,
 				"cacheWrite": 0
 			},
 			"id": "moonshotai/kimi-k2.6",
@@ -80183,7 +80183,7 @@
 			"cost": {
 				"input": 0.5,
 				"output": 12,
-				"cacheRead": 0.3,
+				"cacheRead": 0.33,
 				"cacheWrite": 0
 			},
 			"id": "moonshotai/kimi-k3",
@@ -85066,8 +85066,8 @@
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"contextWindow": 262144,
 			"cost": {
-				"input": 0.44999999999999996,
-				"output": 2.7,
+				"input": 0.32,
+				"output": 3.1999999999999997,
 				"cacheRead": 0.15,
 				"cacheWrite": 0
 			},
@@ -85076,7 +85076,7 @@
 				"text",
 				"image"
 			],
-			"maxTokens": 65536,
+			"maxTokens": 81920,
 			"name": "Qwen: Qwen3.6 27B",
 			"provider": "openrouter",
 			"reasoning": true,
