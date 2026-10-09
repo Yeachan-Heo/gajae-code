@@ -6615,6 +6615,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						terminalCommitted: observation?.terminalCommitted,
 						pendingToolCount,
 					});
+					// Notify deadline manager about termination result to adjust retry strategy
+					deadlineManager.notifyTerminationResult(correlation, result, reason);
 					return result;
 				};
 				if (!observation || !seams || !pendingToolExecutions)
