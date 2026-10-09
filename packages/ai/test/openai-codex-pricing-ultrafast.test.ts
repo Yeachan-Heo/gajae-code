@@ -18,7 +18,7 @@ describe("OpenAI Codex ultrafast pricing", () => {
 		// priority multiplier: 2x (standard models) or 2.5x (gpt-5.5)
 		// ultrafast multiplier: 6x
 		const priorityMultiplier = 2;
-		const ultrafast Multiplier = 6;
+		const ultrafastMultiplier = 6;
 		expect(ultrafastMultiplier).toBeGreaterThan(priorityMultiplier);
 	});
 
@@ -27,7 +27,7 @@ describe("OpenAI Codex ultrafast pricing", () => {
 		// gpt-6-astra: available for ultrafast
 		// gpt-6.1-sol: available for ultrafast
 		// gpt-5.6-sol: only available for Fast (not ultrafast in current pricing)
-		const ultrafast SupportedModels = ["gpt-6-astra", "gpt-6.1-sol"];
+		const ultrafastSupportedModels = ["gpt-6-astra", "gpt-6.1-sol"];
 		expect(ultrafastSupportedModels).toContain("gpt-6-astra");
 		expect(ultrafastSupportedModels).toContain("gpt-6.1-sol");
 	});
