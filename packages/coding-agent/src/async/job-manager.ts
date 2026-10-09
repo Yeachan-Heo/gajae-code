@@ -2022,6 +2022,39 @@ export class AsyncJobManager {
 				rec.queued?.ownerId !== entry.ownerId ||
 				rec.queued?.seq !== entry.seq
 			) {
+				// Retire the stale queued registration: the entry no longer matches
+				// the current record state (owner changed, seq mismatch, or record
+				// transitioned away from queued). Unregister its owned tuple so a
+				// later owned abort does not see orphaned work.
+				const staleQueuedGeneration = `queued:${entry.subagentId}:${entry.seq}`;
+				const endpointId = AsyncJobManager.endpointIdOf(this);
+				const registration = lookupOwnedRegistration(staleQueuedGeneration, staleQueuedGeneration, endpointId);
+				if (registration) unregisterOwnedRegistration(registration);
+				// Mark the stale generation as terminal so waiters for that exact
+				// generation do not block forever; do NOT update the current record
+				// because it may belong to a different owner/generation.
+				if (!this.#publishedTerminalGenerations.has(staleQueuedGeneration)) {
+					this.#publishedTerminalGenerations.add(staleQueuedGeneration);
+					this.#terminalEvents.set(staleQueuedGeneration, {
+						generation: staleQueuedGeneration,
+						jobId: null,
+						subagentId: entry.subagentId,
+						ownerId: entry.ownerId,
+						status: "cancelled",
+						createdAt: Date.now(),
+					});
+					// Notify any waiters for this exact generation.
+					for (const state of this.#terminalWaits.values()) {
+						if (
+							state.targets.some(
+								target =>
+									target.generation === staleQueuedGeneration ||
+									this.#waitGenerationAliases.get(target.generation) === staleQueuedGeneration,
+							)
+						)
+						this.#maybeResolveWait(state);
+					}
+				}
 				this.#resumeQueue.splice(index, 1);
 				continue;
 			}
