@@ -34,7 +34,7 @@ async function makeTempDir(prefix: string): Promise<string> {
 	return dir;
 }
 
-function createModel(id = "test-model", reasoning = false): Model {
+function createModel(id = "test-model", reasoning = false, maxTokens?: number): Model {
 	return {
 		provider: "openai",
 		id,
@@ -42,7 +42,38 @@ function createModel(id = "test-model", reasoning = false): Model {
 		reasoning,
 		...(reasoning ? { thinking: { mode: "effort", minLevel: ai.Effort.Low, maxLevel: ai.Effort.High } } : {}),
 		contextWindow: 32_000,
+		...(maxTokens !== undefined ? { maxTokens } : {}),
 	} as Model;
+}
+
+async function writeRollout(fx: SessionFixture, threadId: string): Promise<void> {
+	const rows = [
+		{ type: "session", id: threadId, cwd: fx.agentDir },
+		{ type: "message", message: { role: "user", content: "summarize this rollout" } },
+	];
+	await fs.writeFile(
+		path.join(fx.sessionDir, `${threadId}.jsonl`),
+		`${rows.map(row => JSON.stringify(row)).join("\n")}\n`,
+	);
+}
+
+function stage1Response(slug: string): ai.AssistantMessage {
+	return createAssistantMessage(
+		JSON.stringify({ rollout_summary: `Summary ${slug}`, rollout_slug: slug, raw_memory: `Raw ${slug}` }),
+	);
+}
+
+function readGlobalJob(fx: SessionFixture): { status: string; last_error: string | null } | undefined {
+	const db = memoryStorage.openMemoryDb(getAgentDbPath(fx.agentDir));
+	try {
+		return db
+			.prepare("SELECT status, last_error FROM jobs WHERE kind = 'memory_consolidate_global' AND job_key = ?")
+			.get(`global:${fx.session.sessionManager.getCwd()}`) as
+			| { status: string; last_error: string | null }
+			| undefined;
+	} finally {
+		memoryStorage.closeMemoryDb(db);
+	}
 }
 
 function createModelRegistry(model: Model): any {
@@ -255,7 +286,89 @@ describe("memories runtime", () => {
 
 		await waitFor(() => expect(completeSpy).toHaveBeenCalledTimes(2));
 		expect(completeSpy.mock.calls[0]?.[2]).toMatchObject({ reasoning: ai.Effort.Low });
-		expect(completeSpy.mock.calls[1]?.[2]).toMatchObject({ reasoning: ai.Effort.Medium });
+		expect(completeSpy.mock.calls[1]?.[2]).toMatchObject({ reasoning: ai.Effort.Low });
+	});
+
+	test.each([
+		{ modelMaxTokens: 128_000, expected: 64_000 },
+		{ modelMaxTokens: 16_000, expected: 16_000 },
+	])("phase2 output budget is the model limit capped at 64k (model $modelMaxTokens)", async ({
+		modelMaxTokens,
+		expected,
+	}) => {
+		const fx = await createFixture(undefined, createModel("budget-model", true, modelMaxTokens));
+		await writeRollout(fx, "thread-budget");
+		const completeSpy = vi
+			.spyOn(ai, "completeSimple")
+			.mockResolvedValueOnce(stage1Response("budget"))
+			.mockResolvedValueOnce(
+				createAssistantMessage(JSON.stringify({ memory_md: "# Memory", memory_summary: "Summary", skills: [] })),
+			);
+
+		startMemoryStartupTask({
+			session: fx.session,
+			settings: fx.settings,
+			modelRegistry: fx.modelRegistry,
+			agentDir: fx.agentDir,
+			taskDepth: 0,
+		});
+
+		await waitFor(() => expect(completeSpy).toHaveBeenCalledTimes(2));
+		expect(completeSpy.mock.calls[1]?.[2]?.maxTokens).toBe(expected);
+	});
+
+	test("phase2 leaves the output budget to the provider default when the model limit is unknown", async () => {
+		const fx = await createFixture();
+		await writeRollout(fx, "thread-unknown-limit");
+		const completeSpy = vi
+			.spyOn(ai, "completeSimple")
+			.mockResolvedValueOnce(stage1Response("unknown"))
+			.mockResolvedValueOnce(
+				createAssistantMessage(JSON.stringify({ memory_md: "# Memory", memory_summary: "Summary", skills: [] })),
+			);
+
+		startMemoryStartupTask({
+			session: fx.session,
+			settings: fx.settings,
+			modelRegistry: fx.modelRegistry,
+			agentDir: fx.agentDir,
+			taskDepth: 0,
+		});
+
+		await waitFor(() => expect(completeSpy).toHaveBeenCalledTimes(2));
+		expect(completeSpy.mock.calls[1]?.[2]?.maxTokens).toBeUndefined();
+	});
+
+	test("phase2 reports a length-truncated response as truncation and keeps prior memory", async () => {
+		const fx = await createFixture(undefined, createModel("truncating-model", true, 128_000));
+		const memoryRoot = getMemoryRoot(fx.agentDir, fx.session.sessionManager.getCwd());
+		await fs.mkdir(memoryRoot, { recursive: true });
+		await fs.writeFile(path.join(memoryRoot, "MEMORY.md"), "prior memory");
+		await writeRollout(fx, "thread-truncated");
+
+		const truncated = createAssistantMessage('{"memory_md": "# Memory\\n\\nhalf-writ');
+		truncated.stopReason = "length";
+		truncated.usage.output = 64_000;
+		vi.spyOn(ai, "completeSimple")
+			.mockResolvedValueOnce(stage1Response("truncated"))
+			.mockResolvedValueOnce(truncated);
+
+		startMemoryStartupTask({
+			session: fx.session,
+			settings: fx.settings,
+			modelRegistry: fx.modelRegistry,
+			agentDir: fx.agentDir,
+			taskDepth: 0,
+		});
+
+		await waitFor(() => {
+			const job = readGlobalJob(fx);
+			expect(job?.status).toBe("error");
+			expect(job?.last_error).toBe(
+				"Error: phase2 output truncated at the max output token limit (64000 output tokens)",
+			);
+		});
+		expect(await fs.readFile(path.join(memoryRoot, "MEMORY.md"), "utf8")).toBe("prior memory");
 	});
 
 	test("falls back to the most recently used model instead of registry order when no role or session model is set", async () => {

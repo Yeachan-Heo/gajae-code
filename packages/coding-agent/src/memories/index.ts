@@ -74,6 +74,15 @@ const DEFAULTS: MemoryRuntimeConfig = {
 	summaryInjectionTokenLimit: 5_000,
 };
 
+const PHASE2_RAW_MEMORIES_TOKEN_LIMIT = 20_000;
+const PHASE2_ROLLOUT_SUMMARIES_TOKEN_LIMIT = 12_000;
+// Phase 2 rewrites MEMORY.md, the summary and every skill from the capped inputs
+// above in one JSON response, and on adaptive-thinking / reasoning-effort models the
+// reasoning tokens share this cap. Size it from the input caps (output cannot
+// plausibly exceed the input it compresses) with equal headroom for reasoning, so
+// growing memory can no longer outgrow a fixed small output budget.
+const PHASE2_MAX_OUTPUT_TOKENS = 2 * (PHASE2_RAW_MEMORIES_TOKEN_LIMIT + PHASE2_ROLLOUT_SUMMARIES_TOKEN_LIMIT);
+
 interface Stage1Stats {
 	claimed: number;
 	succeeded: number;
@@ -739,8 +748,8 @@ async function runConsolidationModel(options: {
 	const rawMemories = await Bun.file(path.join(memoryRoot, "raw_memories.md")).text();
 	const rolloutSummaries = await readRolloutSummaries(memoryRoot);
 	const input = prompt.render(consolidationTemplate, {
-		raw_memories: truncateByApproxTokens(rawMemories, 20_000),
-		rollout_summaries: truncateByApproxTokens(rolloutSummaries, 12_000),
+		raw_memories: truncateByApproxTokens(rawMemories, PHASE2_RAW_MEMORIES_TOKEN_LIMIT),
+		rollout_summaries: truncateByApproxTokens(rolloutSummaries, PHASE2_ROLLOUT_SUMMARIES_TOKEN_LIMIT),
 	});
 
 	const response = await completeSimple(
@@ -751,12 +760,15 @@ async function runConsolidationModel(options: {
 		{
 			apiKey,
 			metadata: options.metadata,
-			maxTokens: 8192,
-			reasoning: clampThinkingLevelForModel(model, Effort.Medium),
+			maxTokens: resolvePhase2MaxOutputTokens(model),
+			reasoning: clampThinkingLevelForModel(model, Effort.Low),
 		},
 	);
 	if (response.stopReason === "error") {
 		throw new Error(response.errorMessage || "phase2 model error");
+	}
+	if (response.stopReason === "length") {
+		throw new Error(`phase2 output truncated at the max output token limit (${response.usage.output} output tokens)`);
 	}
 	const text = response.content
 		.filter((c): c is { type: "text"; text: string } => c.type === "text")
@@ -1099,6 +1111,16 @@ function truncateByApproxTokens(text: string, tokenLimit: number): string {
 	const head = Math.floor(maxChars * 0.6);
 	const tail = maxChars - head;
 	return `${text.slice(0, head)}\n\n...[truncated]...\n\n${text.slice(-tail)}`;
+}
+
+/**
+ * Phase 2 output budget: the model's own output limit, capped at
+ * PHASE2_MAX_OUTPUT_TOKENS. An unknown limit returns undefined so the provider
+ * layer's request default applies instead of an explicit value the model may reject.
+ */
+function resolvePhase2MaxOutputTokens(model: Model): number | undefined {
+	if (!Number.isSafeInteger(model.maxTokens) || model.maxTokens <= 0) return undefined;
+	return Math.min(model.maxTokens, PHASE2_MAX_OUTPUT_TOKENS);
 }
 
 function computeModelTokenBudget(model: Model, config: MemoryRuntimeConfig): number {

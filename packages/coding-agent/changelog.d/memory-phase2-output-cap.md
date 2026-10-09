@@ -1,0 +1,3 @@
+### Fixed
+
+- Local memory consolidation (phase 2) no longer fails permanently with `phase2 JSON parse failure` once a project's memory grows. Its fixed 8192-token output cap also had to hold the reasoning of adaptive-thinking and reasoning-effort models, so the rewritten `MEMORY.md`, summary and skills were cut off and `MEMORY.md` / `memory_summary.md` silently stopped updating. The output budget is now the model's own limit capped at 64k (sized from phase 2's fixed input caps), phase 2 requests low reasoning effort like phase 1, and a length-truncated response is recorded as `phase2 output truncated …` instead of a JSON parse failure.
