@@ -788,7 +788,7 @@ test("a deferred agent end retains recovery ownership until exact finalization",
 	await reconciliation.noteTransition("prompt", correlation, { type: "agent_end", outcome });
 	expect(reconciliation.lookup("prompt", correlation)).toMatchObject({ status: "in_flight" });
 	expect(reconciliation.listDeadlineRecoveryPendingPrompts()).toEqual([
-		expect.objectContaining({ ...correlation, deadlineMaxAt: 5_000 }),
+		expect.objectContaining({ correlation, deadlineMaxAt: 5_000, pendingOutcome: outcome }),
 	]);
 	await reconciliation.finalizeOutcome("prompt", correlation, outcome, () => true);
 	expect(reconciliation.lookup("prompt", correlation)).toMatchObject({ status: "terminal_ok", outcome });
