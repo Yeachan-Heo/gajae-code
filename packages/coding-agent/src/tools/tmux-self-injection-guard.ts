@@ -25,6 +25,12 @@ interface WrapperSpec {
 	hasPositionalArg?: boolean;
 }
 
+// Options that take arguments for long-option forms (e.g., env --unset=VAR, xargs --file=FILE)
+const LONG_OPTIONS_WITH_ARG = new Set([
+	"--unset", // env --unset VAR (takes variable name)
+	"--null", // xargs --null (flag-only, no arg needed, but exists)
+]);
+
 const COMMAND_WRAPPERS_WITH_ARGS: Record<string, WrapperSpec> = {
 	env: {
 		optionsWithArg: new Set(["-u", "-C", "-S"]),
@@ -34,15 +40,16 @@ const COMMAND_WRAPPERS_WITH_ARGS: Record<string, WrapperSpec> = {
 		flagOnlyOptions: new Set(["-s", "-i"]),
 	},
 	timeout: {
-		optionsWithArg: new Set(["-s", "-v"]), // timeout supports -s SIGNAL and -v VERBOSE
+		optionsWithArg: new Set(["-s", "-k"]), // -s SIGNAL, -k KILL_SIGNAL; -v is flag-only
+		flagOnlyOptions: new Set(["-v", "-p"]), // -v flag-only, -p flag-only
 		hasPositionalArg: true, // timeout DURATION command
 	},
 	nice: {
 		optionsWithArg: new Set(["-n"]),
 	},
 	xargs: {
-		optionsWithArg: new Set(["-E", "-I", "-J", "-L", "-n", "-P", "-R", "-d"]),
-		flagOnlyOptions: new Set(["-s", "-t", "-x", "-0"]),
+		optionsWithArg: new Set(["-E", "-I", "-J", "-L", "-n", "-P", "-R", "-d", "-s", "-a"]), // -s SIZE, -a FILE
+		flagOnlyOptions: new Set(["-t", "-x", "-0"]),
 	},
 	stdbuf: {
 		optionsWithArg: new Set(["-i", "-o", "-e"]),
@@ -82,6 +89,14 @@ function isSeparator(ch: string): boolean {
 
 function isAssignment(text: string): boolean {
 	return /^[A-Za-z_][A-Za-z0-9_]*=.*/.test(text);
+}
+
+function isNegativeNumber(text: string): boolean {
+	return /^-\d+/.test(text); // e.g., -5, -10, etc.
+}
+
+function isLongOption(text: string): boolean {
+	return text.startsWith("--");
 }
 
 /** Small quote-aware lexer. Unknown shell syntax is represented conservatively. */
@@ -144,10 +159,12 @@ function tokenize(command: string): Token[] {
 			}
 		} else {
 			// Not at command start
-			if (text.startsWith("-")) {
-				// This is an option, don't touch skipNextArg yet; it will be consumed by the next argument
+			if (text.startsWith("-") && !isNegativeNumber(text)) {
+				// This is an option (but not a negative number like -5)
+				// Don't touch skipNextArg yet; it will be consumed by the next argument
 			} else if (skipNextArg) {
-				// This is an option argument, not part of wrapper logic
+				// This is an argument to an option (e.g., -n 5 or -n -5)
+				// Skip it regardless of whether it looks like an option
 				skipNextArg = false;
 			} else if (positionalsPending > 0) {
 				// This is a positional argument like timeout's DURATION
@@ -231,7 +248,8 @@ function tokenize(command: string): Token[] {
 		text += ch;
 
 		// After building a token, check if it's an option that needs an argument
-		if (!atCommandStart && wrapperCommand && text.startsWith("-")) {
+		// Skip negative numbers (e.g., -5 for nice -n -5)
+		if (!atCommandStart && wrapperCommand && text.startsWith("-") && !isNegativeNumber(text)) {
 			const nextChar = command[index + 1];
 			if (!nextChar || /\s/.test(nextChar) || isSeparator(nextChar)) {
 				// This option is complete; check if it takes an argument
@@ -239,6 +257,18 @@ function tokenize(command: string): Token[] {
 				const isFlagOnly = wrapperCommand.spec.flagOnlyOptions?.has(text) ?? false;
 				if (!isFlagOnly && wrapperCommand.spec.optionsWithArg.has(text)) {
 					skipNextArg = true;
+				}
+				// Handle long options with =VALUE (e.g., --unset=VAR)
+				if (isLongOption(text) && text.includes("=")) {
+					// Long option with embedded value doesn't consume next argument
+					skipNextArg = false;
+				}
+				// Handle long options that take an argument separately
+				const baseLongOption = text.split("=")[0];
+				if (isLongOption(baseLongOption) && !isFlagOnly) {
+					if (LONG_OPTIONS_WITH_ARG.has(baseLongOption)) {
+						skipNextArg = !text.includes("="); // Only consume next arg if no =VALUE
+					}
 				}
 			}
 		}
@@ -309,7 +339,26 @@ function collectShellPayloads(tokens: Token[]): string[] {
 
 	for (let index = 0; index < tokens.length; index++) {
 		const token = tokens[index];
-		if (!token.commandStart || !SHELL_RUNNERS.has(token.text)) continue;
+		if (!token.commandStart) continue;
+
+		// Check if this is a shell runner or busybox
+		let shellIndex = index;
+		if (token.text === "busybox") {
+			// For busybox, the next non-option token is the applet name
+			// Check if it's a shell applet
+			for (let cursor = index + 1; cursor < tokens.length && !tokens[cursor].commandStart; cursor++) {
+				const arg = tokens[cursor].text;
+				if (arg.startsWith("-")) continue; // Skip busybox options
+				// This is the applet name
+				if (SHELL_RUNNERS.has(arg)) {
+					// The applet is a shell, so we should scan from here
+					shellIndex = cursor;
+				}
+				break;
+			}
+		}
+
+		if (!SHELL_RUNNERS.has(tokens[shellIndex].text)) continue;
 
 		// Scan for -c options in the shell invocation.
 		// Look for patterns like:
@@ -323,7 +372,7 @@ function collectShellPayloads(tokens: Token[]): string[] {
 
 		let skipNextArg = false;
 
-		for (let cursor = index + 1; cursor < tokens.length && !tokens[cursor].commandStart; cursor++) {
+		for (let cursor = shellIndex + 1; cursor < tokens.length && !tokens[cursor].commandStart; cursor++) {
 			const word = tokens[cursor].text;
 
 			// If the previous option takes an argument, skip this word
@@ -397,8 +446,25 @@ function collectShellScripts(tokens: Token[], cwd: string): string[] {
 			scripts.push(path.resolve(cwd, token.text));
 			continue;
 		}
-		if (!token.commandStart || !SHELL_RUNNERS.has(token.text)) continue;
-		for (let cursor = index + 1; cursor < tokens.length && !tokens[cursor].commandStart; cursor++) {
+		if (!token.commandStart) continue;
+
+		// Handle shell runners (bash, sh, etc.) and busybox applets
+		let shellIndex = index;
+		if (token.text === "busybox") {
+			// For busybox, find the applet name
+			for (let cursor = index + 1; cursor < tokens.length && !tokens[cursor].commandStart; cursor++) {
+				const arg = tokens[cursor].text;
+				if (arg.startsWith("-")) continue; // Skip busybox options
+				// This is the applet name
+				if (SHELL_RUNNERS.has(arg)) {
+					shellIndex = cursor;
+				}
+				break;
+			}
+		}
+
+		if (!SHELL_RUNNERS.has(tokens[shellIndex].text)) continue;
+		for (let cursor = shellIndex + 1; cursor < tokens.length && !tokens[cursor].commandStart; cursor++) {
 			const argument = tokens[cursor].text;
 			if (argument === "-c") break;
 			if (argument.startsWith("-")) continue;
@@ -441,10 +507,22 @@ function sameSocket(left: string, right: string): boolean {
 }
 
 function assignedTmuxSocket(tokens: Token[], commandIndex: number): string | undefined {
-	for (let index = commandIndex - 1; index >= 0 && commandIndex - index <= 4; index--) {
-		const assignment = tokens[index].text.match(/^TMUX=([^,\s]+)/);
+	// Backtrack from the command position to find any TMUX assignment
+	// Continue through wrapper commands and their arguments (which don't have commandStart)
+	// until we find either a TMUX assignment or hit a non-wrapper command
+	for (let index = commandIndex - 1; index >= 0 && commandIndex - index <= 20; index++) {
+		const token = tokens[index];
+		const assignment = token.text.match(/^TMUX=([^,\s]+)/);
 		if (assignment) return assignment[1];
-		if (!tokens[index].commandStart) break;
+
+		// If this token starts a new command, we've gone too far
+		// unless it's a wrapper command, which we should traverse
+		if (token.commandStart) {
+			if (!COMMAND_WRAPPERS.has(token.text) && !COMMAND_WRAPPERS_WITH_ARGS[token.text]) {
+				// Not a wrapper command, stop here
+				break;
+			}
+		}
 	}
 	return undefined;
 }
