@@ -3476,7 +3476,7 @@ export class AgentSession {
 		handle: AttemptRunHandle,
 		sdkRunToken?: string,
 		sdkRunTokens?: string[],
-		predecessorScope: AttemptScope | undefined = this.#activeAttemptScope,
+		predecessorScope?: AttemptScope,
 	): void {
 		const predecessorSdkRunToken =
 			predecessorScope === undefined ? undefined : this.#sdkRunTokensByAttemptScope.get(predecessorScope);
@@ -5765,14 +5765,14 @@ export class AgentSession {
 								await this.agent.prompt(first, {
 									...this.#managedFallbackPromptOptions(),
 									onRunAccepted: (handle: AttemptRunHandle) => {
-										if (handle) this.#acceptSdkAttemptRun(handle, sdkRunToken);
+										if (handle) this.#acceptSdkAttemptRun(handle, sdkRunToken, undefined, undefined);
 									},
 								});
 							} else {
 								await this.agent.prompt(survivors, {
 									...this.#managedFallbackPromptOptions(),
 									onRunAccepted: (handle: AttemptRunHandle) => {
-										if (handle) this.#acceptSdkAttemptRun(handle, sdkRunToken);
+										if (handle) this.#acceptSdkAttemptRun(handle, sdkRunToken, undefined, undefined);
 									},
 								});
 							}
@@ -12736,7 +12736,7 @@ export class AgentSession {
 				...this.#managedFallbackPromptOptions(),
 				onRunAccepted: (handle: AttemptRunHandle) => {
 					continuationSdkRunToken = this.#activeSdkRunToken;
-					this.#acceptSdkAttemptRun(handle, continuationSdkRunToken);
+					this.#acceptSdkAttemptRun(handle, continuationSdkRunToken, undefined, undefined);
 					if (continuationSdkRunToken !== undefined) {
 						continuationSdkPublication = this.#sdkTerminalPublications.get(continuationSdkRunToken)?.promise;
 					}
