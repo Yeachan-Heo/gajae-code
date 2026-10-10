@@ -352,6 +352,11 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * these messages are added to the context before the next LLM call.
 	 */
 	getSteeringMessages?: () => Promise<AgentMessage[]>;
+	/**
+	 * Waits for consumers of the published turn_end event to commit any
+	 * canonical per-turn state before the loop admits a successor turn.
+	 */
+	afterTurnEndPublished?: () => void | Promise<void>;
 
 	/**
 	 * Returns steering messages that were dequeued for this run but cannot be
@@ -843,6 +848,14 @@ export type AgentEvent =
 			/** Present iff `AgentTelemetryConfig` was supplied on this run. */
 			telemetry?: AgentRunSummary;
 			coverage?: AgentRunCoverage;
+			/** True if the run ended with a silent abort (not shown to user). */
+			silentAbort?: boolean;
+			/** True if the run ended with a TTSR-triggered abort. */
+			ttsrAbort?: boolean;
+			/** True if terminal persistence failed for this run. */
+			terminalPersistenceFailed?: boolean;
+			/** True if the terminal projection was matched after this run. */
+			terminalProjectionMatched?: boolean;
 			scope?: AttemptScope;
 	  }
 	// Turn lifecycle - a turn is one assistant response + any tool calls/results
@@ -857,7 +870,14 @@ export type AgentEvent =
 			assistantMessageEvent: AssistantMessageEvent;
 			scope?: AttemptScope;
 	  }
-	| { type: "message_end"; message: AgentMessage; scope?: AttemptScope }
+	| {
+			type: "message_end";
+			message: AgentMessage;
+			scope?: AttemptScope;
+			terminalPersistenceFailed?: boolean;
+			ttsrAbort?: boolean;
+			silentAbort?: boolean;
+	  }
 	// Tool execution lifecycle
 	| {
 			type: "tool_execution_start";

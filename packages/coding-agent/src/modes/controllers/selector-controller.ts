@@ -1985,6 +1985,20 @@ export class SelectorController {
 							this.#refreshThemeUi();
 							return true;
 						},
+						onThinkingLevelCommit: async level => {
+							try {
+								await this.ctx.session.setThinkingLevelForControl(level as ThinkingLevel, true);
+								this.ctx.statusLine.invalidate();
+								this.ctx.updateEditorBorderColor();
+								this.ctx.updateEditorTopBorder();
+								void this.ctx.notifyConfigChanged?.();
+								this.ctx.ui.requestRender();
+								return true;
+							} catch (error) {
+								this.ctx.showError(error instanceof Error ? error.message : String(error));
+								return false;
+							}
+						},
 						onPetPreview: mode => {
 							this.ctx.previewPetMode(mode as PetMode);
 						},
@@ -3325,6 +3339,10 @@ export class SelectorController {
 							this.ctx.showStatus("Navigation cancelled");
 							return;
 						}
+
+						// Retire predecessor: clear streaming component from abandoned branch before rebuilding.
+						// This prevents the ghost of the old partial answer from appearing in the selected transcript.
+						this.#clearTransientSessionUi();
 
 						// Update UI — pass the context built by navigateTree to skip a second O(N) walk.
 						this.ctx.rebuildInitialMessages("reconcile-same-transcript", result.sessionContext);

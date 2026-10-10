@@ -12,6 +12,29 @@ describe("HTTP/2 diagnostic facts", () => {
 		expect(JSON.stringify(facts)).not.toContain("private native message");
 	});
 
+	it("drops oversized native codes from diagnostic facts", () => {
+		const facts = transportFailureFacts({ nativeErrorCode: `ERR_HTTP2_${"A".repeat(64 * 1024)}` });
+		expect(facts).toBeUndefined();
+		expect(classifyFallbackTrigger(facts)).toEqual({ class: "other" });
+	});
+
+	it("bounds provider code aliases and retained headers while preserving reset diagnostics", () => {
+		const oversizedCode = `ERR_HTTP2_${"A".repeat(64 * 1024)}`;
+		const codeAliasFacts = transportFailureFacts({ http2RstCode: 8, code: oversizedCode });
+		expect(codeAliasFacts?.http2RstCode).toBe(8);
+		expect(codeAliasFacts?.nativeErrorCode).toBeUndefined();
+		expect(codeAliasFacts?.providerCode).toBeUndefined();
+		expect(classifyFallbackTrigger(codeAliasFacts)).toEqual({ class: "other" });
+
+		const providerCodeFacts = transportFailureFacts({ http2RstCode: 8, providerCode: oversizedCode });
+		expect(providerCodeFacts?.providerCode).toBeUndefined();
+		const headerFacts = transportFailureFacts({
+			http2RstCode: 8,
+			headers: { "retry-after": "1".repeat(64 * 1024) },
+		});
+		expect(headerFacts?.headers).toBeUndefined();
+	});
+
 	it("round-trips reset diagnostics without interpreting them as HTTP status", () => {
 		const facts = transportFailureFacts({ http2RstCode: 8 });
 		expect(facts).toMatchObject({ kind: "transport", http2RstCode: 8 });

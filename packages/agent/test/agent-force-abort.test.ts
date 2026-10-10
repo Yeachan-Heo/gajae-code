@@ -116,6 +116,42 @@ describe("Agent.forceAbort", () => {
 		expect(model.calls).toHaveLength(1);
 	});
 
+	it("waits for an in-flight turn-end checkpoint before forced terminalization", async () => {
+		const model = createMockModel({ responses: [{ content: ["completed turn"] }] });
+		const checkpointStarted = Promise.withResolvers<void>();
+		const releaseCheckpoint = Promise.withResolvers<void>();
+		const order: string[] = [];
+		const agent = new Agent({
+			initialState: { model: model.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: model.stream,
+			afterTurnEndPublished: async () => {
+				order.push("checkpoint-start");
+				checkpointStarted.resolve();
+				await releaseCheckpoint.promise;
+				order.push("checkpoint-complete");
+			},
+		});
+		let forced = false;
+		agent.subscribe(event => {
+			if (event.type === "turn_end") {
+				order.push("turn_end");
+				forced = agent.forceAbort("force during turn-end publication");
+			} else if (event.type === "agent_end") {
+				order.push("agent_end");
+			}
+		});
+
+		const prompt = agent.prompt("finish then force-abort");
+		await checkpointStarted.promise;
+		expect(forced).toBe(true);
+		expect(order).toEqual(["turn_end", "checkpoint-start"]);
+
+		releaseCheckpoint.resolve();
+		await prompt;
+
+		expect(order).toEqual(["turn_end", "checkpoint-start", "checkpoint-complete", "agent_end"]);
+	});
+
 	it("terminalizes the logical owner when force-aborting a maintenance continuation", async () => {
 		const model = createMockModel();
 		const pendingContinuation = new AssistantMessageEventStream();

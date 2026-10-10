@@ -43,7 +43,6 @@ import {
 	verifyUnicodeEscapeEvidence,
 } from "@gajae-code/ai/utils/json-parse";
 import { $credentialEnv, sanitizeText } from "@gajae-code/utils";
-import { markDesignedError } from "@gajae-code/utils/error-classification";
 import * as logger from "@gajae-code/utils/logger";
 import { revokeProviderSafetyStop } from "../../ai/src/adapter-internals/provider-safety-stop";
 import type { AttemptScope } from "./attempt-scope";
@@ -2100,11 +2099,61 @@ function losslessDetachedClone<T>(value: T): T {
 					] as const) {
 						const transportDescriptor = Object.getOwnPropertyDescriptor(descriptor.value, transportKey);
 						if (!transportDescriptor || !("value" in transportDescriptor)) continue;
-						try {
-							transport[transportKey] = structuredClone(transportDescriptor.value);
-						} catch {
-							// Strip only this non-cloneable transport fact.
+						const transportValue = transportDescriptor.value;
+						if (transportKey === "kind") {
+							if (transportValue === "transport") transport.kind = transportValue;
+							continue;
 						}
+						if (transportKey === "status") {
+							const status = transportFailureFacts({ status: transportValue })?.status;
+							if (status === transportValue) transport.status = status;
+							continue;
+						}
+						if (transportKey === "http2RstCode") {
+							const code = transportFailureFacts({ http2RstCode: transportValue })?.http2RstCode;
+							if (code === transportValue) transport.http2RstCode = code;
+							continue;
+						}
+						if (transportKey === "nativeErrorCode") {
+							const code = transportFailureFacts({ nativeErrorCode: transportValue })?.nativeErrorCode;
+							if (code === transportValue) transport.nativeErrorCode = code;
+							continue;
+						}
+						if (transportKey === "code") {
+							const code = transportFailureFacts({ code: transportValue })?.providerCode;
+							if (code === transportValue) transport.code = code;
+							continue;
+						}
+						if (transportKey === "providerCode") {
+							const code = transportFailureFacts({ providerCode: transportValue })?.providerCode;
+							if (code === transportValue) transport.providerCode = code;
+							continue;
+						}
+						if (transportKey === "openaiErrorCode") {
+							const code = transportFailureFacts({ openaiErrorCode: transportValue })?.openaiErrorCode;
+							if (code === transportValue) transport.openaiErrorCode = code;
+							continue;
+						}
+						if (transportKey === "anthropicErrorType") {
+							const code = transportFailureFacts({ anthropicErrorType: transportValue })?.anthropicErrorType;
+							if (code === transportValue) transport.anthropicErrorType = code;
+							continue;
+						}
+						if (transportKey === "credentialModelUnavailable") {
+							const credentialModelUnavailable = transportFailureFacts({
+								credentialModelUnavailable: transportValue,
+							})?.credentialModelUnavailable;
+							if (credentialModelUnavailable === true) transport.credentialModelUnavailable = true;
+							continue;
+						}
+						if (transportKey === "retryAfterMs") {
+							if (typeof transportValue === "number" && Number.isFinite(transportValue) && transportValue >= 0) {
+								transport.retryAfterMs = transportValue;
+							}
+							continue;
+						}
+						const headers = transportFailureFacts({ headers: transportValue })?.headers;
+						if (headers) transport.headers = headers;
 					}
 					output[key] = transport;
 				}
@@ -4395,7 +4444,13 @@ async function runLoopBody(
 				);
 				const toolResults: ToolResultMessage[] = [];
 				for (const toolCall of toolCalls) {
-					const result = createAbortedToolResult(toolCall, stream, message.stopReason, message.errorMessage);
+					const result = createAbortedToolResult(
+						toolCall,
+						stream,
+						message.stopReason,
+						message.errorMessage,
+						attemptScope,
+					);
 					currentContext.messages.push(result);
 					newMessages.push(result);
 					toolResults.push(result);
@@ -4411,6 +4466,7 @@ async function runLoopBody(
 					});
 				}
 				stream.push({ type: "turn_end", message, toolResults, scope: attemptScope });
+				await config.afterTurnEndPublished?.();
 				publishAgentEnd(
 					stream,
 					config,
@@ -4439,6 +4495,7 @@ async function runLoopBody(
 							stream,
 							"error",
 							"Tool calls are disabled during repeated malformed tool-call recovery.",
+							attemptScope,
 						);
 						currentContext.messages.push(result);
 						newMessages.push(result);
@@ -4491,7 +4548,42 @@ async function runLoopBody(
 				pendingRecovery = undefined;
 			}
 
+			const composerRecoveryExhausted = sawComposerBashPolicyBlock && composerBashPolicyRecoveryAttempted;
+			const malformedRecoveryAvailable = repeatedMalformedToolCall && !malformedToolRecoveryAttempted;
+			const malformedRecoveryExhausted =
+				consecutiveMalformedTurns >= MAX_CONSECUTIVE_MALFORMED_TURNS && !malformedRecoveryAvailable;
+			const policyTerminalCommitted =
+				!loopSignal.aborted && (composerRecoveryExhausted || malformedRecoveryExhausted);
+			if (policyTerminalCommitted && composerRecoveryExhausted) {
+				message.stopReason = "error";
+				const recoveryLimitMessage =
+					"Composer bash policy blocked repository file I/O again after its one automatic recovery turn. Continue with dedicated repository tools.";
+				message.errorMessage = message.errorMessage
+					? `${message.errorMessage} | ${recoveryLimitMessage}`
+					: recoveryLimitMessage;
+			} else if (policyTerminalCommitted && malformedRecoveryExhausted) {
+				message.stopReason = "error";
+				const breakerMessage = `Stopping after ${consecutiveMalformedTurns} consecutive turns of malformed tool calls; the model did not produce a usable tool call or answer.`;
+				message.errorMessage = message.errorMessage
+					? `${message.errorMessage} | ${breakerMessage}`
+					: breakerMessage;
+			}
+
 			stream.push({ type: "turn_end", message, toolResults, scope: attemptScope });
+			await config.afterTurnEndPublished?.();
+			if (policyTerminalCommitted) {
+				if (steeringMessagesFromExecution && steeringMessagesFromExecution.length > 0) {
+					config.requeueSteeringMessages?.(steeringMessagesFromExecution);
+				}
+				publishAgentEnd(
+					stream,
+					config,
+					buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "completed", attemptScope),
+					attemptScope,
+				);
+				stream.end(newMessages);
+				return;
+			}
 
 			if (steeringMessagesFromExecution && steeringMessagesFromExecution.length > 0) {
 				// Same aborted-run guard as the drain below: the steer interrupt unwound
@@ -4536,44 +4628,9 @@ async function runLoopBody(
 			if (sawComposerBashPolicyBlock && !composerBashPolicyRecoveryAttempted) {
 				pendingRecovery = { kind: "composer-bash-policy", inserted: false };
 				composerBashPolicyRecoveryAttempted = true;
-			} else if (sawComposerBashPolicyBlock) {
-				message.stopReason = "error";
-				const recoveryLimitMessage =
-					"Composer bash policy blocked repository file I/O again after its one automatic recovery turn. Continue with dedicated repository tools.";
-				message.errorMessage = message.errorMessage
-					? `${message.errorMessage} | ${recoveryLimitMessage}`
-					: recoveryLimitMessage;
-				publishAgentEnd(
-					stream,
-					config,
-					buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "completed", attemptScope),
-					attemptScope,
-				);
-				stream.end(newMessages);
-				return;
 			} else if (repeatedMalformedToolCall && !malformedToolRecoveryAttempted) {
 				pendingRecovery = { kind: "malformed-tool-call", inserted: false };
 				malformedToolRecoveryAttempted = true;
-			} else if (consecutiveMalformedTurns >= MAX_CONSECUTIVE_MALFORMED_TURNS) {
-				// Deterministic terminal circuit breaker. The one-shot recovery turn
-				// above already had its chance; if the model is still emitting only
-				// malformed tool calls after it, the run cannot make progress and must
-				// stop rather than burn the provider budget. Terminates on consecutive
-				// count, not argument signatures, so rotating invalid shapes are bounded
-				// too.
-				message.stopReason = "error";
-				const breakerMessage = `Stopping after ${consecutiveMalformedTurns} consecutive turns of malformed tool calls; the model did not produce a usable tool call or answer.`;
-				message.errorMessage = message.errorMessage
-					? `${message.errorMessage} | ${breakerMessage}`
-					: breakerMessage;
-				publishAgentEnd(
-					stream,
-					config,
-					buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "completed", attemptScope),
-					attemptScope,
-				);
-				stream.end(newMessages);
-				return;
 			}
 		}
 
@@ -4905,7 +4962,9 @@ async function streamAssistantResponse(
 				const onFactoryAbort = () => resolveFactoryAbort(ABORTED);
 				requestSignal.addEventListener("abort", onFactoryAbort, { once: true });
 				try {
-					const responseOrAbort = await Promise.race([responsePromise, factoryAbort]);
+					const responseOrAbort = requestSignal.aborted
+						? ABORTED
+						: await Promise.race([responsePromise, factoryAbort]);
 					if (responseOrAbort === ABORTED) {
 						const aborted = emitAbortedAssistantMessage(null, false, context, config, stream, scope);
 						await finishChat(aborted);
@@ -4943,9 +5002,9 @@ async function streamAssistantResponse(
 				return getResponseResult();
 			};
 
-			// Keep one listener, but race a fresh promise per read so pending abort
-			// reactions do not retain every event until the request ends.
-			let settleReadAbort: (() => void) | undefined;
+			// Keep one abort listener for the stream, but give each read its own race
+			// promise so completed reads do not accumulate reactions on a pending promise.
+			let resolveCurrentAbortRace: ((value: typeof ABORTED) => void) | undefined;
 			let detachAbortListener: (() => void) | undefined;
 			if (requestSignal) {
 				if (requestSignal.aborted) {
@@ -4961,31 +5020,38 @@ async function streamAssistantResponse(
 					await finishChat(aborted);
 					return aborted;
 				}
-				const onAbort = () => settleReadAbort?.();
+				const onAbort = () => resolveCurrentAbortRace?.(ABORTED);
 				requestSignal.addEventListener("abort", onAbort, { once: true });
 				detachAbortListener = () => requestSignal.removeEventListener("abort", onAbort);
 			}
 
 			try {
 				while (true) {
+					if (requestSignal?.aborted) {
+						closeIterator();
+						const aborted = emitAbortedAssistantMessage(
+							partialMessage,
+							addedPartial,
+							context,
+							config,
+							stream,
+							scope,
+						);
+						await finishChat(aborted);
+						return aborted;
+					}
 					let next: IteratorResult<AssistantMessageEvent>;
 					if (requestSignal) {
 						const { promise, resolve } = Promise.withResolvers<typeof ABORTED>();
-						let settled = false;
-						const settleAbort = (): void => {
-							if (settled) return;
-							settled = true;
-							resolve(ABORTED);
-							config.onAbortRaceReactionChange?.(-1);
-						};
+						resolveCurrentAbortRace = resolve;
 						config.onAbortRaceReactionChange?.(1);
-						settleReadAbort = settleAbort;
 						let result: IteratorResult<AssistantMessageEvent> | typeof ABORTED;
 						try {
-							result = requestSignal.aborted ? ABORTED : await Promise.race([responseIterator.next(), promise]);
+							result = await Promise.race([responseIterator.next(), promise]);
 						} finally {
-							settleAbort();
-							settleReadAbort = undefined;
+							if (resolveCurrentAbortRace === resolve) resolveCurrentAbortRace = undefined;
+							resolve(ABORTED);
+							config.onAbortRaceReactionChange?.(-1);
 						}
 						if (result === ABORTED) {
 							closeIterator();
@@ -5136,6 +5202,15 @@ async function streamAssistantResponse(
 				: finished;
 			promoteEmptyResponseStop(trailing, finished, managedAttemptTransaction);
 			if (promptPrefix) trailing.promptPrefix = promptPrefix;
+			if (!config.fallbackManaged || (trailing.stopReason !== "error" && trailing.stopReason !== "aborted")) {
+				if (addedPartial) {
+					context.messages[context.messages.length - 1] = trailing;
+				} else {
+					context.messages.push(trailing);
+					stream.push({ type: "message_start", message: { ...trailing }, scope });
+				}
+				stream.push({ type: "message_end", message: trailing, scope });
+			}
 			await finishChat(trailing);
 			return trailing;
 		});
@@ -5277,6 +5352,7 @@ async function executeToolCalls(
 
 	const records = toolCalls.map(toolCall => {
 		const metadata = acceptedToolCallMetadata.get(toolCall) ?? escapedToolCallMetadata(toolCall);
+		const cleanupSettled = Promise.withResolvers<void>();
 		return {
 			toolCall: stripToolCallEvidence(toolCall),
 			metadata,
@@ -5290,6 +5366,9 @@ async function executeToolCalls(
 			toolResultMessage: undefined as ToolResultMessage | undefined,
 			resultEmitted: false,
 			argumentValidationFailed: false,
+			preDispatchEntered: false,
+			cleanupClaimed: false,
+			cleanupSettled,
 		};
 	});
 	const checkSteering = async (): Promise<void> => {
@@ -5448,14 +5527,85 @@ async function executeToolCalls(
 		record.started = true;
 	};
 
+	const settleDispatchedCancellationCleanup = async (record: (typeof records)[number]): Promise<void> => {
+		if (record.cleanupClaimed) {
+			await Promise.race([record.cleanupSettled.promise, Bun.sleep(1_000)]);
+			return;
+		}
+		record.cleanupClaimed = true;
+		try {
+			if (afterToolCall) {
+				await Promise.race([
+					afterToolCall(
+						{
+							assistantMessage,
+							toolCall: record.toolCall,
+							args: record.args,
+							result: {
+								content: [{ type: "text", text: "Tool call cancelled after dispatch." }],
+								isError: true,
+								details: { cancellation: "after_dispatch" },
+							},
+							isError: true,
+							context: currentContext,
+						},
+						toolSignal,
+					),
+					Bun.sleep(1_000),
+				]);
+			}
+		} catch {
+			// Cancellation is authoritative; the hook is best-effort cleanup only.
+		} finally {
+			record.cleanupSettled.resolve();
+		}
+	};
+
+	const settlePreDispatchCancellationCleanup = async (record: (typeof records)[number]): Promise<void> => {
+		if (record.cleanupClaimed) {
+			await Promise.race([record.cleanupSettled.promise, Bun.sleep(1_000)]);
+			return;
+		}
+		record.cleanupClaimed = true;
+		try {
+			if (afterToolCall) {
+				await Promise.race([
+					afterToolCall(
+						{
+							assistantMessage,
+							toolCall: record.toolCall,
+							args: record.args,
+							result: {
+								content: [{ type: "text", text: "Tool call cancelled before dispatch." }],
+								isError: true,
+								details: { cancellation: "before_dispatch" },
+							},
+							isError: true,
+							context: currentContext,
+						},
+						toolSignal,
+					),
+					Bun.sleep(1_000),
+				]);
+			}
+		} catch {
+			// Cancellation is authoritative; the hook is best-effort cleanup only.
+		} finally {
+			record.cleanupSettled.resolve();
+		}
+	};
+
 	const runTool = async (record: (typeof records)[number], index: number): Promise<void> => {
-		if (record.skipped || interruptState.triggered) {
+		if (record.skipped || interruptState.triggered || signal?.aborted) {
 			// Skip both span emission and the collector orphan record here. The
 			// scheduler-task finalizer emits the skipped result and collector record;
 			// the tail sweep below remains a defensive fallback for unexpected throws.
 			record.skipped = true;
+			record.cleanupClaimed = true;
+			record.cleanupSettled.resolve();
 			return;
 		}
+		record.preDispatchEntered = true;
 
 		record.toolCall = stripToolCallEvidence(record.toolCall);
 		const { toolCall, tool } = record;
@@ -5492,6 +5642,7 @@ async function executeToolCalls(
 		let result: AgentToolResult<any> = { content: [], details: {} };
 		let isError = false;
 		let caughtError: unknown;
+		let preDispatchCancellationResult: AgentToolResult<unknown> | undefined;
 
 		await runInActiveSpan(toolSpan, async () => {
 			try {
@@ -5514,7 +5665,7 @@ async function executeToolCalls(
 								: reason === "ambiguous"
 									? `The identity of tool call "${toolCall.name}" was ambiguous on the wire (duplicate call id or id/call_id collision), so its arguments cannot be safely attributed. Re-issue the call.`
 									: `Tool call "${toolCall.name}" was cut off before its arguments finished streaming (the response hit its output token limit). The partial arguments cannot be executed. Re-issue the call with complete arguments, splitting the work into smaller steps if needed.`;
-					throw markDesignedError(new Error(detail));
+					throw new Error(detail);
 				}
 				const displaySafeEscapedArguments =
 					escapedArgumentsGuarded &&
@@ -5542,12 +5693,10 @@ async function executeToolCalls(
 						toolRegistered: tool !== undefined,
 						displaySafeFieldsDeclared: isDisplaySafeEscapedTool(tool),
 					});
-					throw markDesignedError(
-						new Error(
-							`Tool call "${toolCall.name}" spelled printable text as \\uXXXX escapes instead of literal UTF-8 characters. ` +
-								`Escaped text cannot be verified — a single wrong hex digit silently becomes a different character — ` +
-								`so the call was not executed. Re-issue it writing every printable character literally.`,
-						),
+					throw new Error(
+						`Tool call "${toolCall.name}" spelled printable text as \\uXXXX escapes instead of literal UTF-8 characters. ` +
+							`Escaped text cannot be verified — a single wrong hex digit silently becomes a different character — ` +
+							`so the call was not executed. Re-issue it writing every printable character literally.`,
 					);
 				}
 				if (!tool) {
@@ -5566,12 +5715,10 @@ async function executeToolCalls(
 					// naming that guess hits a tool the model never asked for, which is
 					// worse than the dead end it would replace.
 					const base = `Tool ${toolCall.name} not found`;
-					throw markDesignedError(
-						new Error(
-							isToolDiscoveryCallable(tools)
-								? `${base}. If you are unsure whether this tool exists or how to use it, call \`${TOOL_DISCOVERY_NAME}\` to discover and activate the matching tool, then retry.`
-								: base,
-						),
+					throw new Error(
+						isToolDiscoveryCallable(tools)
+							? `${base}. If you are unsure whether this tool exists or how to use it, call \`${TOOL_DISCOVERY_NAME}\` to discover and activate the matching tool, then retry.`
+							: base,
 					);
 				}
 
@@ -5630,14 +5777,23 @@ async function executeToolCalls(
 					effectiveArgs,
 					toolContext,
 				);
-				// Preparation is complete. A successful publication is the only transition
-				// that marks this record dispatched; intrinsic invocation then consumes locals.
-				publishToolDispatch(record, startEvent);
-				const execution = intrinsicReflectApply(execute, tool, invocationArguments);
-				const rawResult = await execution;
-				const coerced = coerceToolResult(rawResult);
-				result = coerced.result;
-				if (coerced.malformed || result.isError) isError = true;
+				if (toolSignal.aborted) {
+					record.skipped = true;
+					preDispatchCancellationResult = {
+						content: [{ type: "text", text: "Tool call cancelled before dispatch." }],
+						isError: true,
+						details: { cancellation: "before_dispatch" },
+					};
+				} else {
+					// Preparation is complete. A successful publication is the only transition
+					// that marks this record dispatched; intrinsic invocation then consumes locals.
+					publishToolDispatch(record, startEvent);
+					const execution = intrinsicReflectApply(execute, tool, invocationArguments);
+					const rawResult = await execution;
+					const coerced = coerceToolResult(rawResult);
+					result = coerced.result;
+					if (coerced.malformed || result.isError) isError = true;
+				}
 			} catch (e) {
 				caughtError = e;
 				result = {
@@ -5646,8 +5802,18 @@ async function executeToolCalls(
 				};
 				isError = true;
 			}
+			// A pre-dispatch cleanup hook is only part of the cancellation contract.
+			// Validation failures and beforeToolCall blocks still have a real result
+			// that must flow through the normal tool-result path without invoking the
+			// post-execution hook before execution ever started.
+			if (afterToolCall && preDispatchCancellationResult && !record.started && !record.cleanupClaimed) {
+				await settlePreDispatchCancellationCleanup(record);
+			}
 
-			if (afterToolCall) {
+			if (afterToolCall && record.started && (signal?.aborted || toolSignal.aborted)) {
+				await settleDispatchedCancellationCleanup(record);
+			} else if (afterToolCall && record.started && !signal?.aborted && !toolSignal.aborted) {
+				record.cleanupClaimed = true;
 				try {
 					const after = await afterToolCall(
 						{
@@ -5675,11 +5841,17 @@ async function executeToolCalls(
 						details: {},
 					};
 					isError = true;
+				} finally {
+					record.cleanupSettled.resolve();
 				}
+			}
+			if (!record.cleanupClaimed) {
+				record.cleanupClaimed = true;
+				record.cleanupSettled.resolve();
 			}
 		});
 
-		const interrupted = interruptState.triggered;
+		const interrupted = interruptState.triggered || record.skipped;
 		if (interrupted) {
 			record.skipped = true;
 			emitToolResult(record, createSkippedToolResult(), true);
@@ -5781,6 +5953,17 @@ async function executeToolCalls(
 					record.skipped = true;
 					emitToolResult(record, createAbortedToolExecutionResult(), true);
 				}
+				for (const record of records) {
+					if (record.started || record.cleanupClaimed) continue;
+					void settlePreDispatchCancellationCleanup(record);
+				}
+				await Promise.all(
+					records.map(record =>
+						record.started
+							? settleDispatchedCancellationCleanup(record)
+							: settlePreDispatchCancellationCleanup(record),
+					),
+				);
 			}
 		} finally {
 			signal.removeEventListener("abort", onAbort);
@@ -5816,6 +5999,7 @@ function createAbortedToolResult(
 	stream: EventStream<AgentEvent, AgentMessage[]>,
 	reason: "aborted" | "error",
 	errorMessage?: string,
+	scope?: AttemptScope,
 ): ToolResultMessage {
 	toolCall = stripToolCallEvidence(toolCall);
 	const message = reason === "aborted" ? "Tool execution was aborted" : "Tool execution failed due to an error";
@@ -5836,6 +6020,7 @@ function createAbortedToolResult(
 		toolName: toolCall.name,
 		args: toolCall.arguments,
 		intent: toolCall.intent,
+		scope,
 	};
 	markNonDispatchedToolEvent(startEvent);
 	stream.push(startEvent);
@@ -5845,6 +6030,7 @@ function createAbortedToolResult(
 		toolName: toolCall.name,
 		result,
 		isError: true,
+		scope,
 	};
 	markNonDispatchedToolEvent(endEvent);
 	stream.push(endEvent);
@@ -5859,8 +6045,8 @@ function createAbortedToolResult(
 		timestamp: Date.now(),
 	};
 
-	stream.push({ type: "message_start", message: toolResultMessage });
-	stream.push({ type: "message_end", message: toolResultMessage });
+	stream.push({ type: "message_start", message: toolResultMessage, scope });
+	stream.push({ type: "message_end", message: toolResultMessage, scope });
 
 	return toolResultMessage;
 }

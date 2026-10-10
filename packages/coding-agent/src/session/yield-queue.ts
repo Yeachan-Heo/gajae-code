@@ -2,7 +2,7 @@ import type { AgentMessage } from "@gajae-code/agent-core";
 import { logger } from "@gajae-code/utils";
 
 export interface YieldDispatcher<P> {
-	/** Drop entries already delivered through another path. Called per-entry at flush time. */
+	/** Drop entries already delivered through another path or an explicit identity cleanup. */
 	isStale?(entry: P): boolean;
 	/**
 	 * Optional ownership-origin key: when provided, the flush builds ONE
@@ -11,16 +11,29 @@ export interface YieldDispatcher<P> {
 	 * another origin (review thread P2).
 	 */
 	groupKey?(entry: P): string;
+	onDrop?(entry: P): void;
+	/** Called per-entry after the built message is accepted by the injector. */
+	onDelivered?(entry: P): void;
+	preserveAcrossIdentity?: boolean;
 	/** Produce one batched AgentMessage from non-stale entries. Return null to skip. */
 	build(survivors: P[]): AgentMessage | null;
 }
 
+/** Outcome reported by an idle injector after it reaches its admission boundary. */
+export type YieldDeliveryResult = "delivered" | "retry" | "dropped";
+
 export interface YieldQueueOptions {
 	isStreaming: () => boolean;
 	injectStreaming(msg: AgentMessage): void;
-	injectIdle(messages: AgentMessage[], signal?: AbortSignal): Promise<void>;
-	scheduleIdleFlush(run: (signal?: AbortSignal) => Promise<void>, onSkip: () => void): void;
+	injectIdle(
+		messages: AgentMessage[],
+		signal?: AbortSignal,
+		identityIsCurrent?: () => boolean,
+	): Promise<YieldDeliveryResult | undefined>;
+	scheduleIdleFlush(run: (signal?: AbortSignal) => Promise<void>, onSkip: () => void, delayMs?: number): void;
 	getIdleFlushSignal?(): AbortSignal | undefined;
+	captureIdentity?(): unknown;
+	isIdentityCurrent?(identity: unknown): boolean;
 }
 
 type YieldFlushMode = "streaming" | "idle";
@@ -28,19 +41,45 @@ type YieldFlushMode = "streaming" | "idle";
 interface StoredDispatcher {
 	isStale?: (entry: unknown) => boolean;
 	groupKey?: (entry: unknown) => string;
+	onDrop?: (entry: unknown) => void;
+	onDelivered?: (entry: unknown) => void;
+	preserveAcrossIdentity: boolean;
 	build: (survivors: unknown[]) => AgentMessage | null;
+}
+
+interface StoredEntry {
+	value: unknown;
+	identity: unknown;
+}
+
+interface BuiltMessage {
+	message: AgentMessage;
+	entries: StoredEntry[];
+}
+
+interface FlushBatch {
+	kind: string;
+	dispatcher: StoredDispatcher;
+	built: BuiltMessage;
+	generation: number;
 }
 
 function formatError(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+const DISPATCH_FAILURE_RETRY_DELAY_MS = 1_000;
+
 export class YieldQueue {
 	readonly #options: YieldQueueOptions;
 	readonly #dispatchers = new Map<string, StoredDispatcher>();
-	readonly #entries = new Map<string, unknown[]>();
+	readonly #entries = new Map<string, StoredEntry[]>();
+	readonly #kindClearGenerations = new Map<string, number>();
+	#clearGeneration = 0;
 	#idleFlushPending = false;
 	#idleFlushPendingOwner: symbol | undefined;
+	#idleFlushPendingDelayMs = 0;
+	#idleFlushRetryDelayMs = 0;
 
 	constructor(options: YieldQueueOptions) {
 		this.#options = options;
@@ -50,6 +89,9 @@ export class YieldQueue {
 		const stored: StoredDispatcher = {
 			...(dispatcher.isStale ? { isStale: entry => dispatcher.isStale?.(entry as P) ?? false } : {}),
 			...(dispatcher.groupKey ? { groupKey: entry => dispatcher.groupKey?.(entry as P) ?? "default" } : {}),
+			...(dispatcher.onDrop ? { onDrop: entry => dispatcher.onDrop?.(entry as P) } : {}),
+			...(dispatcher.onDelivered ? { onDelivered: entry => dispatcher.onDelivered?.(entry as P) } : {}),
+			preserveAcrossIdentity: dispatcher.preserveAcrossIdentity === true,
 			build: survivors => dispatcher.build(survivors as P[]),
 		};
 		this.#dispatchers.set(kind, stored);
@@ -57,6 +99,7 @@ export class YieldQueue {
 			if (this.#dispatchers.get(kind) !== stored) return;
 			this.#dispatchers.delete(kind);
 			this.#entries.delete(kind);
+			this.#clearIdleFlushIfEmpty();
 		};
 	}
 
@@ -70,7 +113,7 @@ export class YieldQueue {
 			entries = [];
 			this.#entries.set(kind, entries);
 		}
-		entries.push(entry);
+		entries.push({ value: entry, identity: this.#options.captureIdentity?.() });
 		if (!this.#options.isStreaming()) {
 			this.#scheduleIdleFlush();
 		}
@@ -88,45 +131,117 @@ export class YieldQueue {
 		if (mode === "idle") {
 			this.#idleFlushPending = false;
 			this.#idleFlushPendingOwner = undefined;
+			this.#idleFlushPendingDelayMs = 0;
+			this.#idleFlushRetryDelayMs = 0;
 		}
 		const idleMessages: AgentMessage[] = [];
+		const idleBatches: FlushBatch[] = [];
+		const preservedIdleMessages: AgentMessage[] = [];
+		const preservedIdleBatches: FlushBatch[] = [];
 		for (const [kind, dispatcher] of this.#dispatchers) {
-			const entries = this.#drain(kind);
-			if (entries.length === 0) continue;
-			const messages = this.#build(kind, dispatcher, entries) ?? [];
-			for (const message of messages) {
+			const drained = this.#drain(kind);
+			const admitted = drained.filter(entry => {
+				const current =
+					dispatcher.preserveAcrossIdentity || (this.#options.isIdentityCurrent?.(entry.identity) ?? true);
+				if (!current) dispatcher.onDrop?.(entry.value);
+				return current;
+			});
+			if (admitted.length === 0) continue;
+			const builtMessages = this.#build(kind, dispatcher, admitted) ?? [];
+			for (const built of builtMessages) {
 				if (mode === "streaming") {
 					try {
-						this.#options.injectStreaming(message);
+						this.#options.injectStreaming(built.message);
 					} catch (error) {
+						this.#requeue(kind, built.entries);
+						this.rearmIdle();
 						logger.warn("Yield queue streaming dispatch failed", { kind, error: formatError(error) });
+						continue;
 					}
+					this.#notifyDelivered(dispatcher, built.entries);
 				} else {
-					idleMessages.push(message);
+					if (dispatcher.preserveAcrossIdentity) {
+						preservedIdleMessages.push(built.message);
+						preservedIdleBatches.push({ kind, dispatcher, built, generation: this.#generationFor(kind) });
+					} else {
+						idleMessages.push(built.message);
+						idleBatches.push({ kind, dispatcher, built, generation: this.#generationFor(kind) });
+					}
 				}
 			}
 		}
 		if (mode === "idle" && idleMessages.length > 0) {
 			try {
-				await this.#options.injectIdle(idleMessages, signal ?? this.#options.getIdleFlushSignal?.());
+				const result = await this.#options.injectIdle(
+					idleMessages,
+					signal ?? this.#options.getIdleFlushSignal?.(),
+					() => this.#identitiesAreCurrent(idleBatches),
+				);
+				if (!this.#batchesAreCurrent(idleBatches)) {
+					this.#notifyDroppedBatches(idleBatches);
+				} else if (result === "retry") {
+					if (this.#identitiesAreCurrent(idleBatches)) this.#requeueBatches(idleBatches);
+					else this.#notifyDroppedBatches(idleBatches);
+				} else if (result === "dropped") this.#notifyDroppedBatches(idleBatches);
+				else this.#notifyDeliveredBatches(idleBatches);
 			} catch (error) {
+				if (this.#identitiesAreCurrent(idleBatches)) this.#requeueBatches(idleBatches);
+				else this.#notifyDroppedBatches(idleBatches);
 				logger.warn("Yield queue idle dispatch failed", { error: formatError(error) });
 			}
 		}
+		if (mode === "idle" && preservedIdleMessages.length > 0) {
+			try {
+				const result = await this.#options.injectIdle(
+					preservedIdleMessages,
+					signal ?? this.#options.getIdleFlushSignal?.(),
+				);
+				if (!this.#batchesAreCurrent(preservedIdleBatches)) this.#notifyDroppedBatches(preservedIdleBatches);
+				else if (result === "retry") this.#requeueBatches(preservedIdleBatches);
+				else if (result === "dropped") this.#notifyDroppedBatches(preservedIdleBatches);
+				else this.#notifyDeliveredBatches(preservedIdleBatches);
+			} catch (error) {
+				this.#requeueBatches(preservedIdleBatches);
+				logger.warn("Yield queue preserved idle dispatch failed", { error: formatError(error) });
+			}
+		}
+		this.#clearIdleFlushIfEmpty();
 	}
 
 	clear(onDrop?: (kind: string, entries: readonly unknown[]) => void): void {
-		if (onDrop) {
-			for (const [kind, entries] of this.#entries) onDrop(kind, entries);
+		this.#clearGeneration += 1;
+		for (const [kind, entries] of this.#entries) {
+			if (onDrop) {
+				onDrop(
+					kind,
+					entries.map(entry => entry.value),
+				);
+			} else {
+				this.#notifyDropped(this.#dispatchers.get(kind), entries);
+			}
 		}
 		this.#entries.clear();
 		this.#idleFlushPending = false;
 		this.#idleFlushPendingOwner = undefined;
+		this.#idleFlushPendingDelayMs = 0;
+		this.#idleFlushRetryDelayMs = 0;
 	}
 
-	/** Drop only the queued entries of a single kind, leaving other kinds intact. */
+	/** Drop only the queued entries of a single kind, releasing their claims. */
 	clearKind(kind: string): void {
+		this.#kindClearGenerations.set(kind, this.#generationFor(kind) + 1);
+		const entries = this.#entries.get(kind);
+		if (entries) this.#notifyDropped(this.#dispatchers.get(kind), entries);
 		this.#entries.delete(kind);
+		this.#clearIdleFlushIfEmpty();
+	}
+
+	#clearIdleFlushIfEmpty(): void {
+		if (this.has()) return;
+		this.#idleFlushPending = false;
+		this.#idleFlushPendingOwner = undefined;
+		this.#idleFlushPendingDelayMs = 0;
+		this.#idleFlushRetryDelayMs = 0;
 	}
 
 	/**
@@ -134,7 +249,15 @@ export class YieldQueue {
 	 * a transition (e.g. handoff) releases a delivery fence so entries queued while
 	 * fenced are not stranded until an unrelated enqueue or agent yield.
 	 */
-	rearmIdle(): void {
+	rearmIdle(delayMs?: number): void {
+		if (delayMs !== undefined) {
+			this.#idleFlushRetryDelayMs = Math.max(this.#idleFlushRetryDelayMs, delayMs);
+			if (this.#idleFlushPending && this.#idleFlushPendingDelayMs < this.#idleFlushRetryDelayMs) {
+				this.#idleFlushPendingOwner = undefined;
+				this.#idleFlushPending = false;
+				this.#idleFlushPendingDelayMs = 0;
+			}
+		}
 		if (this.#options.isStreaming()) return;
 		for (const entries of this.#entries.values()) {
 			if (entries.length > 0) {
@@ -142,38 +265,59 @@ export class YieldQueue {
 				return;
 			}
 		}
+		this.#idleFlushRetryDelayMs = 0;
 	}
 
 	#scheduleIdleFlush(): void {
 		if (this.#idleFlushPending) return;
 		this.#idleFlushPending = true;
+		const delayMs = this.#idleFlushRetryDelayMs;
+		this.#idleFlushRetryDelayMs = 0;
+		this.#idleFlushPendingDelayMs = delayMs;
 		const owner = Symbol("idle-flush");
 		this.#idleFlushPendingOwner = owner;
 		const releaseOwner = () => {
 			if (this.#idleFlushPendingOwner !== owner) return;
 			this.#idleFlushPendingOwner = undefined;
 			this.#idleFlushPending = false;
+			this.#idleFlushPendingDelayMs = 0;
 		};
 		try {
-			this.#options.scheduleIdleFlush(async signal => {
-				releaseOwner();
-				if (this.#options.isStreaming()) return;
-				await this.flush("idle", signal);
-			}, releaseOwner);
+			this.#options.scheduleIdleFlush(
+				async signal => {
+					if (this.#idleFlushPendingOwner !== owner) return;
+					releaseOwner();
+					if (this.#options.isStreaming()) {
+						if (this.has()) this.#idleFlushRetryDelayMs = Math.max(this.#idleFlushRetryDelayMs, delayMs);
+						return;
+					}
+					await this.flush("idle", signal);
+				},
+				() => {
+					const ownsPendingFlush = this.#idleFlushPendingOwner === owner;
+					releaseOwner();
+					if (ownsPendingFlush && this.has())
+						this.#idleFlushRetryDelayMs = Math.max(this.#idleFlushRetryDelayMs, delayMs);
+				},
+				delayMs > 0 ? delayMs : undefined,
+			);
 		} catch (error) {
+			const ownsPendingFlush = this.#idleFlushPendingOwner === owner;
 			releaseOwner();
+			if (ownsPendingFlush && this.has())
+				this.#idleFlushRetryDelayMs = Math.max(this.#idleFlushRetryDelayMs, delayMs);
 			logger.warn("Yield queue idle flush scheduling failed", { error: formatError(error) });
 		}
 	}
 
-	#drain(kind: string): unknown[] {
+	#drain(kind: string): StoredEntry[] {
 		const entries = this.#entries.get(kind);
 		if (!entries || entries.length === 0) return [];
 		this.#entries.delete(kind);
 		return entries;
 	}
 
-	#build(kind: string, dispatcher: StoredDispatcher, entries: unknown[]): AgentMessage[] | null {
+	#build(kind: string, dispatcher: StoredDispatcher, entries: StoredEntry[]): BuiltMessage[] | null {
 		// Corrected turn semantics (terminal abort): turn-scope abort blocks only
 		// deliveries whose origin is a continuation of the aborted turn.
 		// Owned-completion deliveries from work deliberately left running are
@@ -183,15 +327,18 @@ export class YieldQueue {
 		// stale merely because it is closed; stale filtering below applies only
 		// to ordinary manager state (e.g. isDeliverySuppressed) or explicit
 		// blocked-continuation/owned-cleanup entries.
-		const survivors: unknown[] = [];
-		for (const entry of entries) {
+		const survivors: StoredEntry[] = [];
+		for (let entryIndex = 0; entryIndex < entries.length; entryIndex++) {
+			const entry = entries[entryIndex]!;
 			if (dispatcher.isStale) {
 				let stale: boolean;
 				try {
-					stale = dispatcher.isStale(entry);
+					stale = dispatcher.isStale(entry.value);
 				} catch (error) {
 					logger.warn("Yield queue stale check failed", { kind, error: formatError(error) });
-					continue;
+					this.#requeue(kind, entries.slice(entryIndex));
+					this.rearmIdle(DISPATCH_FAILURE_RETRY_DELAY_MS);
+					break;
 				}
 				if (stale) continue;
 			}
@@ -205,10 +352,10 @@ export class YieldQueue {
 		// entries A1, B1, A2, a map grouping every A together would deliver A2
 		// before the earlier B1, changing the observable order of async results
 		// (review thread P2).
-		const groups: unknown[][] = [];
+		const groups: StoredEntry[][] = [];
 		let currentGroupKey: string | undefined;
 		for (const entry of survivors) {
-			const key = dispatcher.groupKey ? dispatcher.groupKey(entry) : "default";
+			const key = dispatcher.groupKey ? dispatcher.groupKey(entry.value) : "default";
 			const last = groups[groups.length - 1];
 			if (last !== undefined && currentGroupKey === key) {
 				last.push(entry);
@@ -217,15 +364,86 @@ export class YieldQueue {
 				currentGroupKey = key;
 			}
 		}
-		const messages: AgentMessage[] = [];
-		for (const group of groups.values()) {
+		const messages: BuiltMessage[] = [];
+		for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+			const group = groups[groupIndex]!;
 			try {
-				const message = dispatcher.build(group);
-				if (message) messages.push(message);
+				const message = dispatcher.build(group.map(entry => entry.value));
+				if (message) messages.push({ message, entries: group });
+				else this.#notifyDropped(dispatcher, group);
 			} catch (error) {
 				logger.warn("Yield queue build failed", { kind, error: formatError(error) });
+				// Preserve FIFO by retaining the failed group and every group that
+				// has not been built yet. Requeueing each group in reverse order
+				// works with #requeue's prepend semantics without combining origins.
+				for (let pendingIndex = groups.length - 1; pendingIndex >= groupIndex; pendingIndex--) {
+					this.#requeue(kind, groups[pendingIndex]!);
+				}
+				this.rearmIdle(DISPATCH_FAILURE_RETRY_DELAY_MS);
+				break;
 			}
 		}
 		return messages.length > 0 ? messages : null;
+	}
+
+	#identitiesAreCurrent(batches: FlushBatch[]): boolean {
+		return batches.every(batch =>
+			batch.built.entries.every(
+				entry => entry.identity === undefined || (this.#options.isIdentityCurrent?.(entry.identity) ?? true),
+			),
+		);
+	}
+
+	#batchesAreCurrent(batches: FlushBatch[]): boolean {
+		return batches.every(batch => this.#isGenerationCurrent(batch));
+	}
+
+	#requeueBatches(batches: FlushBatch[]): void {
+		const retryable = batches.filter(batch => this.#isGenerationCurrent(batch));
+		for (const batch of batches) {
+			if (!this.#isGenerationCurrent(batch)) this.#notifyDropped(batch.dispatcher, batch.built.entries);
+		}
+		const entriesByKind = new Map<string, StoredEntry[]>();
+		for (const { kind, built } of retryable) {
+			const entries = entriesByKind.get(kind);
+			if (entries) entries.push(...built.entries);
+			else entriesByKind.set(kind, [...built.entries]);
+		}
+		for (const [kind, entries] of entriesByKind) this.#requeue(kind, entries);
+		this.rearmIdle();
+	}
+
+	#generationFor(kind: string): number {
+		return this.#clearGeneration + (this.#kindClearGenerations.get(kind) ?? 0);
+	}
+
+	#isGenerationCurrent(batch: FlushBatch): boolean {
+		return batch.generation === this.#generationFor(batch.kind);
+	}
+
+	#requeue(kind: string, entries: StoredEntry[]): void {
+		if (entries.length === 0) return;
+		// Put the drained entries back in front of anything enqueued while the
+		// injector was waiting so a retry cannot reorder or duplicate delivery.
+		const existing = this.#entries.get(kind);
+		this.#entries.set(kind, existing ? [...entries, ...existing] : [...entries]);
+	}
+
+	#notifyDelivered(dispatcher: StoredDispatcher | undefined, entries: StoredEntry[]): void {
+		if (!dispatcher?.onDelivered) return;
+		for (const entry of entries) dispatcher.onDelivered(entry.value);
+	}
+
+	#notifyDropped(dispatcher: StoredDispatcher | undefined, entries: StoredEntry[]): void {
+		if (!dispatcher?.onDrop) return;
+		for (const entry of entries) dispatcher.onDrop(entry.value);
+	}
+
+	#notifyDeliveredBatches(batches: Array<{ dispatcher: StoredDispatcher; built: BuiltMessage }>): void {
+		for (const { dispatcher, built } of batches) this.#notifyDelivered(dispatcher, built.entries);
+	}
+
+	#notifyDroppedBatches(batches: Array<{ dispatcher: StoredDispatcher; built: BuiltMessage }>): void {
+		for (const { dispatcher, built } of batches) this.#notifyDropped(dispatcher, built.entries);
 	}
 }

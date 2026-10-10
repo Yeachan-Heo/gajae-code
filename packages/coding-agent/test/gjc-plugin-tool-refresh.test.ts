@@ -34,7 +34,7 @@ async function writeCustomTool(fileName: string, toolName: string): Promise<stri
 	const toolsDir = path.join(tempDir.path(), ".gjc", "gjc-plugins", "refresh-plugin", "tools");
 	await fs.mkdir(toolsDir, { recursive: true });
 	const toolPath = path.join(toolsDir, fileName);
-	await fs.writeFile(
+	await Bun.write(
 		toolPath,
 		`import type { CustomToolFactory } from "@gajae-code/coding-agent/extensibility/custom-tools/types";
 
@@ -58,11 +58,11 @@ async function activateSubskill(toolPaths: string[], phase = "planner"): Promise
 	const pluginRoot = path.join(tempDir.path(), ".gjc", "gjc-plugins", "refresh-plugin");
 	const skillPath = path.join(pluginRoot, "subskills", "design", "SKILL.md");
 	await fs.mkdir(path.dirname(skillPath), { recursive: true });
-	await fs.writeFile(
+	await Bun.write(
 		skillPath,
 		`---\nname: design\ndescription: refresh fixture\nbinds_to: ralplan\nphase: ${phase}\nactivation_arg: design\ntools:\n  - tools/${path.basename(toolPaths[0]!)}\n---\nRefresh fixture skill.\n`,
 	);
-	await fs.writeFile(
+	await Bun.write(
 		path.join(pluginRoot, "gajae-plugin.json"),
 		JSON.stringify({
 			kind: "gajae-code-plugin",
@@ -129,7 +129,53 @@ afterEach(async () => {
 });
 
 describe("AgentSession GJC plugin sub-skill tool refresh", () => {
-	test("adds and removes sub-skill tools as the active phase changes", async () => {
+	test("does not publish tools from a refresh superseded by same-session deactivation", async () => {
+		const toolPath = await writeCustomTool("stale-domain-note.ts", "stale_domain_note");
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const gateKey = "__gjcSubskillRefreshGate";
+		Object.assign(globalThis, { [gateKey]: { started: started.resolve, promise: release.promise } });
+		await Bun.write(
+			toolPath,
+			`import type { CustomToolFactory } from "@gajae-code/coding-agent/extensibility/custom-tools/types";
+const gate = (globalThis as unknown as { __gjcSubskillRefreshGate: { started(): void; promise: Promise<void> } }).__gjcSubskillRefreshGate;
+gate.started();
+await gate.promise;
+const factory: CustomToolFactory = pi => ({
+	name: "stale_domain_note",
+	label: "stale_domain_note",
+	description: "stale refresh fixture tool",
+	parameters: pi.zod.object({}),
+	async execute() { return { content: [{ type: "text", text: "stale" }] }; },
+});
+export default factory;
+`,
+		);
+		try {
+			await activateSubskill([toolPath], "planner");
+			const staleRefresh = session.refreshGjcSubskillTools();
+			await started.promise;
+			await syncSkillActiveState({
+				cwd: tempDir.path(),
+				skill: "ralplan",
+				active: false,
+				phase: "planner",
+				sessionId: sessionManager.getSessionId(),
+				active_subskills: [],
+			});
+			await session.refreshGjcSubskillTools();
+			release.resolve();
+			await staleRefresh;
+
+			expect(session.getAllToolNames()).not.toContain("stale_domain_note");
+			expect(session.getActiveToolNames()).toEqual(["read", "bash"]);
+		} finally {
+			delete (globalThis as { __gjcSubskillRefreshGate?: unknown }).__gjcSubskillRefreshGate;
+			release.resolve();
+		}
+	});
+
+	test("adds, removes, and identically reactivates sub-skill tools", async () => {
 		const toolPath = await writeCustomTool("domain-note.ts", "domain_note");
 		await activateSubskill([toolPath], "planner");
 
@@ -140,7 +186,7 @@ describe("AgentSession GJC plugin sub-skill tool refresh", () => {
 		await syncSkillActiveState({
 			cwd: tempDir.path(),
 			skill: "ralplan",
-			active: true,
+			active: false,
 			phase: "critic",
 			sessionId: sessionManager.getSessionId(),
 			active_subskills: [],
@@ -150,6 +196,11 @@ describe("AgentSession GJC plugin sub-skill tool refresh", () => {
 		expect(session.getAllToolNames()).not.toContain("domain_note");
 		expect(session.getActiveToolNames()).not.toContain("domain_note");
 		expect(session.getActiveToolNames()).toEqual(["read", "bash"]);
+
+		await activateSubskill([toolPath], "planner");
+		await session.refreshGjcSubskillTools();
+		expect(session.getAllToolNames()).toContain("domain_note");
+		expect(session.getActiveToolNames()).toContain("domain_note");
 	});
 
 	test("rejects sub-skill tools whose names conflict with existing tools", async () => {

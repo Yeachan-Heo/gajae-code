@@ -132,6 +132,60 @@ it("cleans the pending abort race when the provider rejects", async () => {
 	expect(pendingAbortReactions).toBe(0);
 });
 
+it("does not miss an abort raised synchronously by the provider factory", async () => {
+	const controller = new AbortController();
+	const mock = createMockModel();
+	const responsePromise = Promise.withResolvers<AssistantMessageEventStream>();
+	const responseClosed = Promise.withResolvers<void>();
+	let closes = 0;
+	class LateResponse extends AssistantMessageEventStream {
+		[Symbol.asyncIterator](): AsyncIterator<AssistantMessageEvent> {
+			return {
+				next: async () => ({ done: true, value: undefined }),
+				return: async () => {
+					closes++;
+					responseClosed.resolve();
+					return { done: true, value: undefined };
+				},
+			};
+		}
+	}
+	const lateResponse = new LateResponse();
+	lateResponse.end(createAssistantMessage([{ type: "text", text: "answer" }]));
+	const events = agentLoop(
+		[createUserMessage("hello")],
+		{ systemPrompt: [], messages: [], tools: [] },
+		{ model: mock.model, convertToLlm: messages => messages as Message[] },
+		controller.signal,
+		() => {
+			controller.abort();
+			return responsePromise.promise;
+		},
+	);
+	let aborted = false;
+	const completed = (async () => {
+		for await (const event of events) {
+			if (event.type === "message_end" && event.message.role === "assistant")
+				aborted = event.message.stopReason === "aborted";
+		}
+	})();
+	const timedOut = Bun.sleep(250).then(() => "timed-out" as const);
+	const outcome = await Promise.race([
+		completed.then(
+			() => "completed" as const,
+			() => "failed" as const,
+		),
+		timedOut,
+	]);
+	responsePromise.resolve(lateResponse);
+	await Promise.race([responseClosed.promise, timedOut]);
+	await completed.catch(() => {});
+
+	expect(outcome).toBe("completed");
+	expect(aborted).toBe(true);
+	expect(closes).toBe(1);
+});
+
 it("appends new history and replaces same-length in-place edits", () => {
 	const manager = new AppendOnlyContextManager();
 	const messages = [createUserMessage("first")];

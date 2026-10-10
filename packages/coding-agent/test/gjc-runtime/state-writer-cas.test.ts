@@ -246,6 +246,31 @@ describe("state-writer concurrency (issue #646)", () => {
 		// flight, so the observed peak concurrency stays at 1.
 		expect(maxActive).toBe(1);
 	});
+	it("does not recreate a missing parent when a read-side workflow lock requires existing directories", async () => {
+		const root = await tempDir();
+		const gjcRoot = path.join(root, ".gjc");
+		await fs.mkdir(gjcRoot, { mode: 0o700 });
+
+		const missingDirectory = path.join(gjcRoot, "read-only-missing");
+		const target = path.relative(root, path.join(missingDirectory, "state.json"));
+		await expect(
+			withWorkflowStateLock(target, async () => {}, { cwd: root, createMissingParents: false }),
+		).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(fs.lstat(missingDirectory)).rejects.toMatchObject({ code: "ENOENT" });
+
+		if (process.platform === "linux") {
+			const privateDirectory = path.join(gjcRoot, "private-read-only-missing");
+			const privateTarget = path.relative(root, path.join(privateDirectory, "state.json"));
+			await expect(
+				withWorkflowStateLock(privateTarget, async () => {}, {
+					cwd: root,
+					createMissingParents: false,
+					privateDurable: { directory: path.dirname(privateTarget) },
+				}),
+			).rejects.toMatchObject({ code: "ENOENT" });
+			await expect(fs.lstat(privateDirectory)).rejects.toMatchObject({ code: "ENOENT" });
+		}
+	});
 	it("returns the lock-owned stamped workflow envelope without rereading the file", async () => {
 		const root = await tempDir();
 		const target = path.relative(root, path.join(sessionStateDir(root, "test-session"), "stamped-probe.json"));

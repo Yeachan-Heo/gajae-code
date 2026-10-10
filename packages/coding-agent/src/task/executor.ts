@@ -134,7 +134,9 @@ const providerStreamingUpdateTypes = new Set<string>([
 	"toolcall_end",
 ]);
 
-const isAgentEvent = (event: AgentSessionEvent): event is AgentEvent =>
+type AgentSessionProgressEvent = Extract<AgentSessionEvent, { type: AgentEvent["type"] }>;
+
+const isAgentEvent = (event: AgentSessionEvent): event is AgentSessionProgressEvent =>
 	agentEventTypes.has(event.type as AgentEvent["type"]);
 
 function normalizeModelPatterns(value: string | string[] | undefined): string[] {

@@ -964,6 +964,8 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			}
 		}
 
+		// Each session captures one initial snapshot after subscribing; a raced
+		// update is reconciled from the snapshot publication, not by rereading.
 		expect(getTools).toHaveBeenCalledTimes(3);
 		expect(disconnectAll).not.toHaveBeenCalled();
 	});

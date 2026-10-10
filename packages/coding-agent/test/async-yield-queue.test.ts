@@ -1,10 +1,22 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
+import * as path from "node:path";
 import type { AgentMessage } from "@gajae-code/agent-core";
+import { getBundledModel } from "@gajae-code/ai";
 import { type AsyncJob, AsyncJobManager } from "@gajae-code/coding-agent/async";
+import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { type CreateAgentSessionResult, createAgentSession } from "@gajae-code/coding-agent/sdk";
+import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import type { CustomMessage } from "@gajae-code/coding-agent/session/messages";
+import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import {
+	lookupOwnedRegistration,
+	registerOwnedRegistration,
+	type TurnRegistrationKey,
+} from "@gajae-code/coding-agent/session/terminal-abort";
 import { YieldQueue } from "@gajae-code/coding-agent/session/yield-queue";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { JobTool } from "@gajae-code/coding-agent/tools/job";
+import { TempDir } from "@gajae-code/utils";
 
 type AsyncEntry = {
 	jobId: string;
@@ -172,6 +184,106 @@ describe("async result yield queue delivery", () => {
 		expect(harness.prompts[0]).toHaveLength(1);
 		expect(asyncDetails(harness.prompts[0]![0]!).jobs.map(job => job.jobId)).toEqual([jobId]);
 	});
+
+	test("acknowledgement during formatting settles only the stale owned registration", async () => {
+		const tempDir = TempDir.createSync("@gjc-async-yield-race-");
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
+		let created: CreateAgentSessionResult | undefined;
+		let staleRegistration: TurnRegistrationKey | undefined;
+		let liveRegistration: TurnRegistrationKey | undefined;
+		const formattingStarted = Promise.withResolvers<void>();
+		const releaseFormatting = Promise.withResolvers<{ id?: string; path?: string }>();
+		try {
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected bundled test model to exist");
+			created = await createAgentSession({
+				cwd: tempDir.path(),
+				agentDir: tempDir.path(),
+				sessionManager: SessionManager.inMemory(tempDir.path()),
+				authStorage,
+				settings: Settings.isolated({ "async.enabled": true, "compaction.enabled": false }),
+				model,
+				disableExtensionDiscovery: true,
+				extensions: [],
+				skills: [],
+				rules: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				notificationHostModeSupported: false,
+				sdkHostModeSupported: false,
+			});
+			const manager = AsyncJobManager.instance();
+			if (!manager) throw new Error("Expected the SDK session to own an async job manager");
+			const endpointId = AsyncJobManager.endpointIdOf(manager);
+			if (!endpointId) throw new Error("Expected the async job manager endpoint to be registered");
+
+			vi.spyOn(created.session.sessionManager, "allocateArtifactPath").mockImplementation(async () => {
+				formattingStarted.resolve();
+				return await releaseFormatting.promise;
+			});
+			const staleResult = Promise.withResolvers<string>();
+			const staleJobId = manager.register("bash", "formatting race", async () => staleResult.promise);
+			const staleJob = manager.getJob(staleJobId);
+			if (!staleJob) throw new Error("Expected the formatting-race job to be registered");
+			staleRegistration = {
+				endpointId,
+				endpointGeneration: 0,
+				lineageIdHash: "formatting-race-lineage",
+				promptAttemptEpoch: 1,
+				jobId: staleJob.id,
+				jobGeneration: staleJob.generation,
+			};
+			registerOwnedRegistration(staleRegistration);
+
+			staleResult.resolve("x".repeat(12_001));
+			await formattingStarted.promise;
+			// The callback has passed its initial suppression check and is now
+			// awaiting artifact formatting. Acknowledgement suppresses the job
+			// before the callback can enqueue its async-result entry.
+			manager.acknowledgeDeliveries([staleJobId]);
+
+			const liveResult = Promise.withResolvers<string>();
+			const liveJobId = manager.register("task", "live job", async () => liveResult.promise);
+			const liveJob = manager.getJob(liveJobId);
+			if (!liveJob) throw new Error("Expected the live job to be registered");
+			liveRegistration = {
+				endpointId,
+				endpointGeneration: 0,
+				lineageIdHash: "live-lineage",
+				promptAttemptEpoch: 2,
+				jobId: liveJob.id,
+				jobGeneration: liveJob.generation,
+			};
+			registerOwnedRegistration(liveRegistration);
+
+			releaseFormatting.resolve({});
+			await waitUntil(
+				() =>
+					created!.session.yieldQueue.has("async-result") &&
+					manager.getDeliveryState().pendingJobIds.includes(staleJobId),
+				"stale completion to enqueue with its retained claim",
+			);
+			await created.session.yieldQueue.flush("streaming");
+
+			expect(manager.getDeliveryState().pendingJobIds).not.toContain(staleJobId);
+			expect(lookupOwnedRegistration(staleJob.id, staleJob.generation, endpointId)).toBeUndefined();
+			expect(lookupOwnedRegistration(liveJob.id, liveJob.generation, endpointId)).toEqual(liveRegistration);
+			expect(manager.getJob(liveJob.id)?.status).toBe("running");
+			liveResult.resolve("settle live job");
+		} finally {
+			releaseFormatting.resolve({});
+			if (staleRegistration) {
+				const manager = AsyncJobManager.forEndpoint(staleRegistration.endpointId);
+				if (manager) manager.acknowledgeDeliveries([staleRegistration.jobId]);
+			}
+			if (created) await created.session.dispose();
+			authStorage.close();
+			tempDir.removeSync();
+		}
+	});
 });
 
 test("flush builds one message per groupKey origin so owned drops cannot suppress other origins", async () => {
@@ -234,6 +346,371 @@ test("flush preserves the queued FIFO chronology across contiguous origin runs",
 	const grouped = followUps as CustomMessage<{ jobs: string[] }>[];
 	expect(grouped.map(m => m.content)).toEqual(["a1", "b1", "a2"]);
 	expect(grouped.map(m => m.details?.jobs)).toEqual([["j-1"], ["j-2"], ["j-3"]]);
+});
+
+test("build failure requeues the failed and unbuilt groups in FIFO order", async () => {
+	const { queue, followUps } = createHarness(false);
+	const buildCalls: string[] = [];
+	let failB = true;
+	queue.register<string>("test-build-failure", {
+		groupKey: value => value,
+		build: values => {
+			const [value] = values;
+			if (value === undefined) return null;
+			buildCalls.push(value);
+			if (value === "b" && failB) {
+				failB = false;
+				throw new Error("temporary build failure");
+			}
+			return {
+				role: "custom",
+				customType: "async-result",
+				content: value,
+				display: true,
+				attribution: "agent",
+				details: {},
+				timestamp: 1,
+			};
+		},
+	});
+	queue.enqueue("test-build-failure", "a");
+	queue.enqueue("test-build-failure", "b");
+	queue.enqueue("test-build-failure", "c");
+
+	await queue.flush("streaming");
+
+	expect(followUps.map(message => (message as CustomMessage).content)).toEqual(["a"]);
+	expect(buildCalls).toEqual(["a", "b"]);
+	expect(queue.has("test-build-failure")).toBe(true);
+
+	await queue.flush("streaming");
+
+	expect(followUps.map(message => (message as CustomMessage).content)).toEqual(["a", "b", "c"]);
+	expect(buildCalls).toEqual(["a", "b", "b", "c"]);
+});
+
+test("dispatcher build failures schedule a delayed idle retry", async () => {
+	const scheduled: Array<{ run: (signal?: AbortSignal) => Promise<void>; delayMs: number | undefined }> = [];
+	const queue = new YieldQueue({
+		isStreaming: () => false,
+		injectStreaming: () => {},
+		injectIdle: async () => "delivered",
+		scheduleIdleFlush: (run, _onSkip, delayMs) => scheduled.push({ run, delayMs }),
+	});
+	queue.register<string>("persistent-build-failure", {
+		build: () => {
+			throw new Error("persistent build failure");
+		},
+	});
+	queue.enqueue("persistent-build-failure", "entry");
+
+	expect(scheduled).toHaveLength(1);
+	await scheduled[0]!.run();
+
+	expect(scheduled).toHaveLength(2);
+	expect(scheduled[1]!.delayMs).toBe(1_000);
+	expect(queue.has("persistent-build-failure")).toBe(true);
+});
+
+test("stale-check failures retain the failed FIFO suffix for a delayed retry", async () => {
+	const scheduled: Array<{ run: (signal?: AbortSignal) => Promise<void>; delayMs: number | undefined }> = [];
+	const delivered: string[][] = [];
+	const staleChecks: string[] = [];
+	let failFirstCheck = true;
+	const queue = new YieldQueue({
+		isStreaming: () => false,
+		injectStreaming: () => {},
+		injectIdle: async () => "delivered",
+		scheduleIdleFlush: (run, _onSkip, delayMs) => scheduled.push({ run, delayMs }),
+	});
+	queue.register<string>("stale-check-failure", {
+		isStale: entry => {
+			staleChecks.push(entry);
+			if (entry === "A" && failFirstCheck) throw new Error("temporary stale-check failure");
+			return false;
+		},
+		build: entries => {
+			delivered.push([...entries]);
+			return {
+				role: "custom",
+				customType: "async-result",
+				content: entries.join(","),
+				display: true,
+				attribution: "agent",
+				details: {},
+				timestamp: 1,
+			};
+		},
+	});
+	queue.enqueue("stale-check-failure", "A");
+	queue.enqueue("stale-check-failure", "B");
+
+	await queue.flush("idle");
+
+	expect(staleChecks).toEqual(["A"]);
+	expect(delivered).toEqual([]);
+	expect(scheduled[1]?.delayMs).toBe(1_000);
+	expect(queue.has("stale-check-failure")).toBe(true);
+	await scheduled[0]!.run();
+	expect(staleChecks).toEqual(["A"]);
+
+	failFirstCheck = false;
+	await scheduled[1]!.run();
+
+	expect(staleChecks).toEqual(["A", "A", "B"]);
+	expect(delivered).toEqual([["A", "B"]]);
+	expect(queue.has("stale-check-failure")).toBe(false);
+});
+
+test("stale-check retry delay survives a streaming turn and preserves prefix delivery", async () => {
+	const scheduled: Array<{ run: (signal?: AbortSignal) => Promise<void>; delayMs: number | undefined }> = [];
+	const staleChecks: string[] = [];
+	const deliveries: string[] = [];
+	let streaming = true;
+	let failA = true;
+	const queue = new YieldQueue({
+		isStreaming: () => streaming,
+		injectStreaming: message => {
+			if (message.role === "custom") deliveries.push(`stream:${message.content}`);
+		},
+		injectIdle: async messages => {
+			for (const message of messages) {
+				if (message.role === "custom") deliveries.push(`idle:${message.content}`);
+			}
+			return "delivered";
+		},
+		scheduleIdleFlush: (run, _onSkip, delayMs) => scheduled.push({ run, delayMs }),
+	});
+	queue.register<string>("streaming-stale-check-failure", {
+		isStale: entry => {
+			staleChecks.push(entry);
+			if (entry === "A" && failA) throw new Error("temporary stale-check failure");
+			return false;
+		},
+		build: entries => ({
+			role: "custom",
+			customType: "async-result",
+			content: entries.join(","),
+			display: true,
+			attribution: "agent",
+			details: {},
+			timestamp: 1,
+		}),
+	});
+	queue.enqueue("streaming-stale-check-failure", "prefix");
+	queue.enqueue("streaming-stale-check-failure", "A");
+	queue.enqueue("streaming-stale-check-failure", "B");
+
+	await queue.flush("streaming");
+
+	expect(staleChecks).toEqual(["prefix", "A"]);
+	expect(deliveries).toEqual(["stream:prefix"]);
+	expect(queue.has("streaming-stale-check-failure")).toBe(true);
+	expect(scheduled).toHaveLength(0);
+
+	streaming = false;
+	queue.rearmIdle();
+	expect(scheduled[0]?.delayMs).toBe(1_000);
+	failA = false;
+	await scheduled[0]!.run();
+
+	expect(staleChecks).toEqual(["prefix", "A", "A", "B"]);
+	expect(deliveries).toEqual(["stream:prefix", "idle:A,B"]);
+	expect(queue.has("streaming-stale-check-failure")).toBe(false);
+});
+
+test("retry delay survives a scheduled wake that arrives during streaming", async () => {
+	const scheduled: Array<{ run: (signal?: AbortSignal) => Promise<void>; delayMs: number | undefined }> = [];
+	const delivered: string[] = [];
+	let streaming = false;
+	let failBuild = true;
+	const queue = new YieldQueue({
+		isStreaming: () => streaming,
+		injectStreaming: () => {},
+		injectIdle: async messages => {
+			for (const message of messages) if (message.role === "custom") delivered.push(message.content as string);
+			return "delivered";
+		},
+		scheduleIdleFlush: (run, _onSkip, delayMs) => scheduled.push({ run, delayMs }),
+	});
+	queue.register<string>("scheduled-during-streaming", {
+		build: entries => {
+			if (failBuild) throw new Error("temporary build failure");
+			return {
+				role: "custom",
+				customType: "async-result",
+				content: entries.join(","),
+				display: true,
+				attribution: "agent",
+				details: {},
+				timestamp: 1,
+			};
+		},
+	});
+	queue.enqueue("scheduled-during-streaming", "retry me");
+	await queue.flush("idle");
+	expect(scheduled[1]!.delayMs).toBe(1_000);
+
+	streaming = true;
+	await scheduled[1]!.run();
+	expect(queue.has("scheduled-during-streaming")).toBe(true);
+
+	streaming = false;
+	queue.rearmIdle();
+	expect(scheduled[2]!.delayMs).toBe(1_000);
+	failBuild = false;
+	await queue.flush("idle");
+	await scheduled[2]!.run();
+	expect(delivered).toEqual(["retry me"]);
+
+	queue.enqueue("scheduled-during-streaming", "fresh entry");
+	expect(scheduled[3]!.delayMs).toBeUndefined();
+});
+
+test("successful direct retry does not delay new work enqueued during injection", async () => {
+	const scheduled: Array<{ run: (signal?: AbortSignal) => Promise<void>; delayMs: number | undefined }> = [];
+	const injectionStarted = Promise.withResolvers<void>();
+	const releaseInjection = Promise.withResolvers<void>();
+	const delivered: string[] = [];
+	let streaming = false;
+	let failBuild = true;
+	const queue = new YieldQueue({
+		isStreaming: () => streaming,
+		injectStreaming: () => {},
+		injectIdle: async messages => {
+			for (const message of messages) if (message.role === "custom") delivered.push(message.content as string);
+			injectionStarted.resolve();
+			await releaseInjection.promise;
+			return "delivered";
+		},
+		scheduleIdleFlush: (run, _onSkip, delayMs) => scheduled.push({ run, delayMs }),
+	});
+	queue.register<string>("direct-retry-success", {
+		build: entries => {
+			if (failBuild) throw new Error("temporary build failure");
+			return {
+				role: "custom",
+				customType: "async-result",
+				content: entries.join(","),
+				display: true,
+				attribution: "agent",
+				details: {},
+				timestamp: 1,
+			};
+		},
+	});
+	queue.enqueue("direct-retry-success", "retried entry");
+	await queue.flush("idle");
+	expect(scheduled[1]!.delayMs).toBe(1_000);
+
+	streaming = true;
+	await scheduled[1]!.run();
+	streaming = false;
+	failBuild = false;
+	const directFlush = queue.flush("idle");
+	await injectionStarted.promise;
+	queue.enqueue("direct-retry-success", "fresh entry");
+	expect(scheduled[2]!.delayMs).toBeUndefined();
+	releaseInjection.resolve();
+	await directFlush;
+	await scheduled[2]!.run();
+
+	expect(delivered).toEqual(["retried entry", "fresh entry"]);
+});
+
+test("an invalidated retry onSkip cannot delay a new queue owner", async () => {
+	const scheduled: Array<{
+		run: (signal?: AbortSignal) => Promise<void>;
+		onSkip: () => void;
+		delayMs: number | undefined;
+	}> = [];
+	const delivered: string[] = [];
+	let failBuild = true;
+	const queue = new YieldQueue({
+		isStreaming: () => false,
+		injectStreaming: () => {},
+		injectIdle: async messages => {
+			for (const message of messages) if (message.role === "custom") delivered.push(message.content as string);
+			return "delivered";
+		},
+		scheduleIdleFlush: (run, onSkip, delayMs) => scheduled.push({ run, onSkip, delayMs }),
+	});
+	queue.register<string>("retry-owner", {
+		build: entries => {
+			if (failBuild) throw new Error("temporary build failure");
+			return {
+				role: "custom",
+				customType: "async-result",
+				content: entries.join(","),
+				display: true,
+				attribution: "agent",
+				details: {},
+				timestamp: 1,
+			};
+		},
+	});
+	queue.enqueue("retry-owner", "old entry");
+	await queue.flush("idle");
+	expect(scheduled[1]!.delayMs).toBe(1_000);
+
+	queue.clearKind("retry-owner");
+	failBuild = false;
+	queue.enqueue("retry-owner", "fresh entry");
+	expect(scheduled[2]!.delayMs).toBeUndefined();
+	scheduled[1]!.onSkip();
+	await scheduled[2]!.run();
+	expect(delivered).toEqual(["fresh entry"]);
+
+	queue.enqueue("retry-owner", "next entry");
+	expect(scheduled[3]!.delayMs).toBeUndefined();
+});
+
+test("idle injection rechecks queued identity after a transition clears the kind", async () => {
+	const injectionStarted = Promise.withResolvers<void>();
+	const releaseInjection = Promise.withResolvers<void>();
+	let currentIdentity = "predecessor";
+	let identityCurrentAtRelease: boolean | undefined;
+	const delivered: string[] = [];
+	const dropped: string[] = [];
+	const queue = new YieldQueue({
+		isStreaming: () => false,
+		captureIdentity: () => currentIdentity,
+		isIdentityCurrent: identity => identity === currentIdentity,
+		injectStreaming: () => {},
+		injectIdle: async (_messages, _signal, identityIsCurrent) => {
+			injectionStarted.resolve();
+			await releaseInjection.promise;
+			identityCurrentAtRelease = identityIsCurrent?.() ?? false;
+			return identityCurrentAtRelease ? "delivered" : "dropped";
+		},
+		scheduleIdleFlush: () => {},
+	});
+	queue.register<string>("identity-fence", {
+		build: values => ({
+			role: "custom",
+			customType: "async-result",
+			content: values.join("+"),
+			display: true,
+			attribution: "agent",
+			details: {},
+			timestamp: 1,
+		}),
+		onDelivered: value => delivered.push(value),
+		onDrop: value => dropped.push(value),
+	});
+	queue.enqueue("identity-fence", "predecessor result");
+
+	const flush = queue.flush("idle");
+	await injectionStarted.promise;
+	currentIdentity = "successor";
+	queue.clearKind("identity-fence");
+	releaseInjection.resolve();
+	await flush;
+
+	expect(identityCurrentAtRelease).toBe(false);
+	expect(delivered).toEqual([]);
+	expect(dropped).toEqual(["predecessor result"]);
+	expect(queue.has("identity-fence")).toBe(false);
 });
 
 test("flush without a groupKey keeps the single-batch behavior", async () => {

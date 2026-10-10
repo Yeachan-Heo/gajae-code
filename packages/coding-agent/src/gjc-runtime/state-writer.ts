@@ -139,6 +139,13 @@ export interface StateWriterOptions {
 	 * `withWorkflowStateLock`). Skip re-acquisition to avoid self-deadlock.
 	 */
 	lockHeld?: boolean;
+	/** Caller already holds the session-wide active-entry store lock. */
+	activeStateScopeLockHeld?: boolean;
+}
+
+export interface WorkflowStateLockOptions extends StateWriterOptions {
+	/** Avoid creating a missing target parent while acquiring a read-side lock. */
+	createMissingParents?: boolean;
 }
 
 export class StateWriteConflictError extends Error {
@@ -666,6 +673,7 @@ async function closePrivatePublicationContext(context: PrivatePublicationContext
 async function preparePrivateDirectory(
 	filePath: string,
 	options: StateWriterOptions,
+	createMissingParents = true,
 ): Promise<PrivatePublicationContext> {
 	if (process.platform !== "linux") throw new Error("private durable publication requires Linux");
 	const boundary = resolveGjcTarget(options.privateDurable!.directory, cwdForOptions(options));
@@ -701,11 +709,13 @@ async function preparePrivateDirectory(
 			const childPath = path.join(directoryPath(parent), segment);
 			directory = path.join(directory, segment);
 			let created = false;
-			try {
-				await fs.mkdir(childPath, { mode: 0o700 });
-				created = true;
-			} catch (error) {
-				if (!isErrno(error, "EEXIST")) throw error;
+			if (createMissingParents) {
+				try {
+					await fs.mkdir(childPath, { mode: 0o700 });
+					created = true;
+				} catch (error) {
+					if (!isErrno(error, "EEXIST")) throw error;
+				}
 			}
 			let createdIdentity: { dev: number; ino: number } | undefined;
 			if (created) {
@@ -1117,12 +1127,16 @@ export async function writeTextAtomic(targetPath: string, text: string, options?
 export async function withWorkflowStateLock<T>(
 	targetPath: string,
 	fn: () => Promise<T>,
-	options?: StateWriterOptions,
+	options?: WorkflowStateLockOptions,
 ): Promise<T> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	const privateContext = options?.privateDurable ? await preparePrivateDirectory(filePath, options) : undefined;
+	const createMissingParents = options?.createMissingParents !== false;
+	const privateContext = options?.privateDurable
+		? await preparePrivateDirectory(filePath, options, createMissingParents)
+		: undefined;
+	const lockOptions = createMissingParents ? options?.lock : { ...options?.lock, createParent: false };
 	try {
-		return await lockResolvedWorkflowTarget(filePath, fn, options?.lock);
+		return await lockResolvedWorkflowTarget(filePath, fn, lockOptions, createMissingParents);
 	} finally {
 		if (privateContext) await closePrivatePublicationContext(privateContext);
 	}
@@ -1132,10 +1146,12 @@ async function lockResolvedWorkflowTarget<T>(
 	filePath: string,
 	fn: () => Promise<T>,
 	lockOptions?: FileLockOptions,
+	createMissingParents = true,
 ): Promise<T> {
 	// `withFileLock` creates the lock dir next to the target with a non-recursive
-	// mkdir, so the parent directory must exist before the lock is acquired.
-	await fs.mkdir(path.dirname(filePath), { recursive: true });
+	// mkdir, so normal callers create the parent. Read-only callers can instead
+	// require it to remain present and let a concurrent removal fail with ENOENT.
+	if (createMissingParents) await fs.mkdir(path.dirname(filePath), { recursive: true });
 	return withFileLock(filePath, fn, lockOptions);
 }
 
@@ -1354,6 +1370,113 @@ export async function writeActiveEntry(
 	);
 	invalidateActiveStateCacheForScope(cwd, sessionScope);
 	return result;
+}
+
+export async function withActiveStateScopeLock<T>(
+	cwd: string,
+	sessionScope: string | ActiveSessionScope | undefined,
+	fn: () => Promise<T>,
+): Promise<T> {
+	const lockTarget = `${layoutActiveSnapshotPath(path.resolve(cwd), requireSessionId(sessionScope, "active state lock"))}.entries`;
+	return lockResolvedWorkflowTarget(lockTarget, fn);
+}
+
+/** Update an active entry only while it still exactly matches the observed predecessor. */
+export async function updateActiveEntryIfExact(
+	cwd: string,
+	sessionScope: string | ActiveSessionScope | undefined,
+	skill: string,
+	expected: SkillActiveEntry,
+	replacement: SkillActiveEntry,
+): Promise<GuardedWriteResult> {
+	const filePath = activeEntryPath(path.resolve(cwd), sessionScope, skill);
+	return withActiveStateScopeLock(cwd, sessionScope, () =>
+		lockResolvedWorkflowTarget(filePath, async () => {
+			const current = await readJsonIfPresent(filePath);
+			if (!Bun.deepEquals(current, expected)) {
+				return { path: filePath, written: false, reason: "stale-skip", revision: persistedStateRevision(current) };
+			}
+			const result = await writeGuardedResolvedJsonAtomic(filePath, replacement, {
+				cwd,
+				policy: "cache",
+				sourceRevision: persistedSourceRevision(current) + 1,
+				lockHeld: true,
+			});
+			invalidateActiveStateCacheForScope(cwd, sessionScope);
+			return result;
+		}),
+	);
+}
+
+/** Merge active subskills against the authoritative raw entry under the active-store transaction. */
+export async function mergeActiveEntrySubskills(
+	cwd: string,
+	sessionScope: string | ActiveSessionScope,
+	skill: string,
+	expected: SkillActiveEntry,
+	activeSubskills: SkillActiveEntry["active_subskills"],
+	updatedAt: string,
+): Promise<{ predecessor: SkillActiveEntry | undefined; result: GuardedWriteResult }> {
+	const filePath = activeEntryPath(path.resolve(cwd), sessionScope, skill);
+	return withActiveStateScopeLock(cwd, sessionScope, () =>
+		lockResolvedWorkflowTarget(filePath, async () => {
+			const current = await readJsonIfPresent(filePath);
+			const predecessor =
+				current && typeof current === "object" && !Array.isArray(current)
+					? (current as SkillActiveEntry)
+					: undefined;
+			if (!predecessor || !Bun.deepEquals(predecessor, expected)) {
+				return {
+					predecessor,
+					result: {
+						path: filePath,
+						written: false,
+						reason: "stale-skip",
+						revision: persistedStateRevision(current),
+					},
+				};
+			}
+			const replacement: SkillActiveEntry = {
+				...predecessor,
+				skill,
+				active_subskills: activeSubskills,
+				updated_at: updatedAt,
+			};
+			const result = await writeGuardedResolvedJsonAtomic(filePath, replacement, {
+				cwd,
+				policy: "cache",
+				sourceRevision: persistedSourceRevision(current) + 1,
+				lockHeld: true,
+			});
+			invalidateActiveStateCacheForScope(cwd, sessionScope);
+			return { predecessor, result };
+		}),
+	);
+}
+
+/** Replace an exact caller-owned active entry with its predecessor under one lock. */
+export async function restoreActiveEntryIfOwned(
+	cwd: string,
+	sessionScope: string | ActiveSessionScope,
+	receipt: GuardedStateWriteReceipt,
+	predecessor: SkillActiveEntry,
+): Promise<boolean> {
+	return withActiveStateScopeLock(cwd, sessionScope, () =>
+		lockResolvedWorkflowTarget(receipt.path, async () => {
+			const current = await readJsonIfPresent(receipt.path);
+			if (!matchesGuardedStateWriteReceipt(current, receipt)) return false;
+			const restored = await writeGuardedResolvedJsonAtomic(receipt.path, predecessor, {
+				cwd,
+				policy: "cache",
+				sourceRevision: persistedSourceRevision(current) + 1,
+				advanceSourceRevision: true,
+				lockHeld: true,
+			});
+			if (!restored.written) return false;
+			invalidateActiveStateCacheForScope(cwd, sessionScope);
+			return true;
+		}),
+	);
 }
 
 export async function removeActiveEntry(

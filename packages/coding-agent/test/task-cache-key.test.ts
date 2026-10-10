@@ -93,6 +93,19 @@ async function withLifecycleIdentity<T>(sessionId: string, run: () => Promise<T>
 	}
 }
 
+async function withoutLifecycleIdentity<T>(run: () => Promise<T>): Promise<T> {
+	const previousRequestId = process.env.GJC_LIFECYCLE_REQUEST_ID;
+	const previousSessionId = process.env.GJC_SESSION_ID;
+	try {
+		delete process.env.GJC_LIFECYCLE_REQUEST_ID;
+		delete process.env.GJC_SESSION_ID;
+		return await run();
+	} finally {
+		if (previousRequestId !== undefined) process.env.GJC_LIFECYCLE_REQUEST_ID = previousRequestId;
+		if (previousSessionId !== undefined) process.env.GJC_SESSION_ID = previousSessionId;
+	}
+}
+
 describe("async job endpoint id derivation", () => {
 	const tempDirs: string[] = [];
 
@@ -201,29 +214,28 @@ describe("task fork-context provider identity", () => {
 		return paths;
 	}
 	async function removeTempTree(dir: string): Promise<void> {
-		for (const entry of await fsPromises.readdir(dir, { withFileTypes: true })) {
-			const entryPath = path.join(dir, entry.name);
-			if (entry.isDirectory() && !entry.isSymbolicLink()) {
-				await removeTempTree(entryPath);
-			} else {
-				try {
-					await fsPromises.rm(entryPath, { force: true });
-				} catch (error) {
-					throw new Error(`Failed to remove entry ${entryPath}`, { cause: error });
+		// Retry recursive removal with backoff in case lock directories are still being cleaned up
+		let lastError: unknown;
+		for (let attempts = 0; attempts < 10; attempts++) {
+			try {
+				await fsPromises.rm(dir, { recursive: true, force: true });
+				return;
+			} catch (error) {
+				lastError = error;
+				if (attempts < 9) {
+					await Bun.sleep(10 * (attempts + 1));
 				}
 			}
 		}
-		try {
-			await fsPromises.rmdir(dir);
-		} catch (error) {
-			throw new Error(`Failed to remove directory ${dir}`, { cause: error });
-		}
+		throw new Error(`Failed to remove directory ${dir}`, { cause: lastError });
 	}
 
 	afterEach(async () => {
+		// Ensure all sessions are properly disposed and no writes are pending after disposal
 		while (sessions.length > 0) await sessions.pop()?.dispose();
 		while (authStorages.length > 0) authStorages.pop()?.close();
 		while (artifactStores.length > 0) artifactStores.pop()?.close();
+
 		while (tempDirs.length > 0) {
 			const tempDir = tempDirs.pop();
 			if (!tempDir) continue;
@@ -423,117 +435,125 @@ describe("task fork-context provider identity", () => {
 	});
 
 	it("keeps top-level async ownership isolated when provider affinity is shared", async () => {
-		const firstDir = await fsPromises.mkdtemp(
-			path.join(os.tmpdir(), `pi-task-shared-provider-a-${Snowflake.next()}-`),
-		);
-		const secondDir = await fsPromises.mkdtemp(
-			path.join(os.tmpdir(), `pi-task-shared-provider-b-${Snowflake.next()}-`),
-		);
-		tempDirs.push(firstDir, secondDir);
-		const [{ session: first, authStorage: firstAuth }, { session: second, authStorage: secondAuth }] =
-			await Promise.all([
-				createSession(firstDir, { providerSessionId: "shared-provider-affinity" }),
-				createSession(secondDir, { providerSessionId: "shared-provider-affinity" }),
-			]);
-		sessions.push(first, second);
-		authStorages.push(firstAuth, secondAuth);
+		await withoutLifecycleIdentity(async () => {
+			const firstDir = await fsPromises.mkdtemp(
+				path.join(os.tmpdir(), `pi-task-shared-provider-a-${Snowflake.next()}-`),
+			);
+			const secondDir = await fsPromises.mkdtemp(
+				path.join(os.tmpdir(), `pi-task-shared-provider-b-${Snowflake.next()}-`),
+			);
+			tempDirs.push(firstDir, secondDir);
+			const [{ session: first, authStorage: firstAuth }, { session: second, authStorage: secondAuth }] =
+				await Promise.all([
+					createSession(firstDir, { providerSessionId: "shared-provider-affinity" }),
+					createSession(secondDir, { providerSessionId: "shared-provider-affinity" }),
+				]);
+			sessions.push(first, second);
+			authStorages.push(firstAuth, secondAuth);
 
-		expect(first.agent.providerSessionId).toBe("shared-provider-affinity");
-		expect(second.agent.providerSessionId).toBe("shared-provider-affinity");
-		expect(first.sessionManager.getSessionId()).not.toBe(second.sessionManager.getSessionId());
+			expect(first.agent.providerSessionId).toBe("shared-provider-affinity");
+			expect(second.agent.providerSessionId).toBe("shared-provider-affinity");
+			expect(first.sessionManager.getSessionId()).not.toBe(second.sessionManager.getSessionId());
+		});
 	}, 15_000);
 
 	it("rekeys explicit provider ownership to the successor transcript and frees the predecessor", async () => {
-		const tempDir = await fsPromises.mkdtemp(
-			path.join(os.tmpdir(), `pi-task-provider-transition-${Snowflake.next()}-`),
-		);
-		tempDirs.push(tempDir);
-		const providerSessionId = "shared-provider-affinity";
-		const { session, authStorage } = await createSession(tempDir, { providerSessionId });
-		sessions.push(session);
-		authStorages.push(authStorage);
+		await withoutLifecycleIdentity(async () => {
+			const tempDir = await fsPromises.mkdtemp(
+				path.join(os.tmpdir(), `pi-task-provider-transition-${Snowflake.next()}-`),
+			);
+			tempDirs.push(tempDir);
+			const providerSessionId = "shared-provider-affinity";
+			const { session, authStorage } = await createSession(tempDir, { providerSessionId });
+			sessions.push(session);
+			authStorages.push(authStorage);
 
-		const previousSessionId = session.sessionManager.getSessionId();
-		const previousSessionFile = session.sessionManager.getSessionFile();
-		expect(previousSessionFile).toBeDefined();
-		expect(fs.existsSync(previousSessionFile!)).toBe(false);
-		const previousEndpoint = JSON.stringify([
-			"async-job-endpoint",
-			providerSessionId,
-			stablePathKey(path.resolve(previousSessionFile!)),
-		]);
-		const manager = AsyncJobManager.forEndpoint(previousEndpoint);
-		expect(manager).toBeDefined();
-		session.sessionManager.appendMessage({
-			role: "user",
-			content: "persist endpoint identity",
-			timestamp: Date.now(),
+			const previousSessionId = session.sessionManager.getSessionId();
+			const previousSessionFile = session.sessionManager.getSessionFile();
+			expect(previousSessionFile).toBeDefined();
+			expect(fs.existsSync(previousSessionFile!)).toBe(false);
+			const previousEndpoint = JSON.stringify([
+				"async-job-endpoint",
+				providerSessionId,
+				stablePathKey(path.resolve(previousSessionFile!)),
+			]);
+			const manager = AsyncJobManager.forEndpoint(previousEndpoint);
+			expect(manager).toBeDefined();
+			session.sessionManager.appendMessage({
+				role: "user",
+				content: "persist endpoint identity",
+				timestamp: Date.now(),
+			});
+			await session.sessionManager.ensureOnDisk();
+			await session.sessionManager.flush();
+			expect(fs.existsSync(previousSessionFile!)).toBe(true);
+			expect(asyncJobEndpointId(providerSessionId, previousSessionId, previousSessionFile)).toBe(previousEndpoint);
+			expect(AsyncJobManager.forEndpoint(previousEndpoint)).toBe(manager);
+
+			await session.sessionManager.rewriteEntries();
+			expect(asyncJobEndpointId(providerSessionId, previousSessionId, previousSessionFile)).toBe(previousEndpoint);
+			expect(AsyncJobManager.forEndpoint(previousEndpoint)).toBe(manager);
+
+			expect(await session.newSession()).toBe(true);
+			const successorSessionFile = session.sessionManager.getSessionFile();
+			expect(successorSessionFile).toBeDefined();
+			expect(session.sessionManager.getSessionId()).not.toBe(previousSessionId);
+			const successorEndpoint = JSON.stringify([
+				"async-job-endpoint",
+				providerSessionId,
+				stablePathKey(path.resolve(successorSessionFile!)),
+			]);
+			expect(AsyncJobManager.forEndpoint(previousEndpoint)).toBeUndefined();
+			expect(AsyncJobManager.forEndpoint(successorEndpoint)).toBe(manager);
+
+			expect(await session.switchSession(previousSessionFile!)).toBe(true);
+			expect(AsyncJobManager.forEndpoint(successorEndpoint)).toBeUndefined();
+			expect(AsyncJobManager.forEndpoint(previousEndpoint)).toBe(manager);
+
+			const { session: reopened, authStorage: reopenedAuth } = await createSession(tempDir, {
+				providerSessionId,
+				sessionManager: await SessionManager.open(successorSessionFile!),
+			});
+			sessions.push(reopened);
+			authStorages.push(reopenedAuth);
+			expect(AsyncJobManager.forEndpoint(successorEndpoint)).toBeDefined();
 		});
-		await session.sessionManager.ensureOnDisk();
-		await session.sessionManager.flush();
-		expect(fs.existsSync(previousSessionFile!)).toBe(true);
-		expect(asyncJobEndpointId(providerSessionId, previousSessionId, previousSessionFile)).toBe(previousEndpoint);
-		expect(AsyncJobManager.forEndpoint(previousEndpoint)).toBe(manager);
-
-		await session.sessionManager.rewriteEntries();
-		expect(asyncJobEndpointId(providerSessionId, previousSessionId, previousSessionFile)).toBe(previousEndpoint);
-		expect(AsyncJobManager.forEndpoint(previousEndpoint)).toBe(manager);
-
-		expect(await session.newSession()).toBe(true);
-		const successorSessionFile = session.sessionManager.getSessionFile();
-		expect(successorSessionFile).toBeDefined();
-		expect(session.sessionManager.getSessionId()).not.toBe(previousSessionId);
-		const successorEndpoint = JSON.stringify([
-			"async-job-endpoint",
-			providerSessionId,
-			stablePathKey(path.resolve(successorSessionFile!)),
-		]);
-		expect(AsyncJobManager.forEndpoint(previousEndpoint)).toBeUndefined();
-		expect(AsyncJobManager.forEndpoint(successorEndpoint)).toBe(manager);
-
-		expect(await session.switchSession(previousSessionFile!)).toBe(true);
-		expect(AsyncJobManager.forEndpoint(successorEndpoint)).toBeUndefined();
-		expect(AsyncJobManager.forEndpoint(previousEndpoint)).toBe(manager);
-
-		const { session: reopened, authStorage: reopenedAuth } = await createSession(tempDir, {
-			providerSessionId,
-			sessionManager: await SessionManager.open(successorSessionFile!),
-		});
-		sessions.push(reopened);
-		authStorages.push(reopenedAuth);
-		expect(AsyncJobManager.forEndpoint(successorEndpoint)).toBeDefined();
 	}, 15_000);
 
 	it("registers construction-time ownership under the shared canonical endpoint key", async () => {
-		const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), `pi-task-provider-alias-${Snowflake.next()}-`));
-		tempDirs.push(tempDir);
-		const providerSessionId = "aliased-provider-affinity";
-		const { session, authStorage } = await createSession(tempDir, { providerSessionId });
-		sessions.push(session);
-		authStorages.push(authStorage);
+		await withoutLifecycleIdentity(async () => {
+			const tempDir = await fsPromises.mkdtemp(
+				path.join(os.tmpdir(), `pi-task-provider-alias-${Snowflake.next()}-`),
+			);
+			tempDirs.push(tempDir);
+			const providerSessionId = "aliased-provider-affinity";
+			const { session, authStorage } = await createSession(tempDir, { providerSessionId });
+			sessions.push(session);
+			authStorages.push(authStorage);
 
-		// The constructor must register under exactly the key the transition path
-		// recomputes; any divergence strands ownership on the first transition.
-		const predecessorFile = session.sessionManager.getSessionFile();
-		expect(predecessorFile).toBeDefined();
-		const predecessorEndpoint = asyncJobEndpointId(
-			providerSessionId,
-			session.sessionManager.getSessionId(),
-			predecessorFile,
-		);
-		const manager = AsyncJobManager.forEndpoint(predecessorEndpoint);
-		expect(manager).toBeDefined();
-		expect(AsyncJobManager.endpointIdOf(manager!)).toBe(predecessorEndpoint);
+			// The constructor must register under exactly the key the transition path
+			// recomputes; any divergence strands ownership on the first transition.
+			const predecessorFile = session.sessionManager.getSessionFile();
+			expect(predecessorFile).toBeDefined();
+			const predecessorEndpoint = asyncJobEndpointId(
+				providerSessionId,
+				session.sessionManager.getSessionId(),
+				predecessorFile,
+			);
+			const manager = AsyncJobManager.forEndpoint(predecessorEndpoint);
+			expect(manager).toBeDefined();
+			expect(AsyncJobManager.endpointIdOf(manager!)).toBe(predecessorEndpoint);
 
-		expect(await session.newSession()).toBe(true);
-		const successorEndpoint = asyncJobEndpointId(
-			providerSessionId,
-			session.sessionManager.getSessionId(),
-			session.sessionManager.getSessionFile(),
-		);
-		expect(successorEndpoint).not.toBe(predecessorEndpoint);
-		expect(AsyncJobManager.forEndpoint(predecessorEndpoint)).toBeUndefined();
-		expect(AsyncJobManager.forEndpoint(successorEndpoint)).toBe(manager);
+			expect(await session.newSession()).toBe(true);
+			const successorEndpoint = asyncJobEndpointId(
+				providerSessionId,
+				session.sessionManager.getSessionId(),
+				session.sessionManager.getSessionFile(),
+			);
+			expect(successorEndpoint).not.toBe(predecessorEndpoint);
+			expect(AsyncJobManager.forEndpoint(predecessorEndpoint)).toBeUndefined();
+			expect(AsyncJobManager.forEndpoint(successorEndpoint)).toBe(manager);
+		});
 	}, 15_000);
 
 	it("does not share mutable provider state unless explicitly supplied", async () => {

@@ -19,14 +19,20 @@ import { TtsrManager } from "@gajae-code/coding-agent/export/ttsr";
 import type { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
 import { submitInteractiveInput } from "@gajae-code/coding-agent/main";
 import type { SubmittedUserInput } from "@gajae-code/coding-agent/modes/types";
-import type { QueuedInputSubmission } from "@gajae-code/coding-agent/sdk";
-import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
-import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
+import { type CustomMessage, convertToLlm, SILENT_ABORT_MARKER } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import {
+	type OwnedCompletionEnvelope,
+	registerOwnedRegistration,
+	registerTerminalTurnScope,
+	type TurnRegistrationKey,
+	unregisterOwnedRegistration,
+	unregisterTerminalScope,
+} from "@gajae-code/coding-agent/session/terminal-abort";
 import { Snowflake } from "@gajae-code/utils";
 import * as z from "zod/v4";
-import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 // Mock stream that mimics AssistantMessageEventStream
@@ -973,7 +979,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(session.queuedMessageCount).toBe(1);
 	});
 
-	it("keeps session_switch hook-queued steering deliverable after clearing pre-switch queues", async () => {
+	it("rejects untracked session_switch steering and clears pre-switch queues", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const agent = new Agent({
 			getApiKey: () => "test-key",
@@ -993,15 +999,16 @@ describe("AgentSession concurrent prompt guard", () => {
 		authStorages.push(authStorage);
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models-switch-hook.yml"));
-		let switchSubmission: QueuedInputSubmission | undefined;
+		const switchHookErrors: unknown[] = [];
 		const extensionRunner = {
 			hasHandlers: vi.fn(() => false),
 			emit: vi.fn(async (event: { type: string }) => {
 				if (event.type === "session_switch") {
-					switchSubmission = await session.submitUserMessage("queued by switch hook", {
-						deliverAs: "steer",
-						trackSubmission: true,
-					});
+					try {
+						await session.sendUserMessage("queued by switch hook", { deliverAs: "steer" });
+					} catch (error) {
+						switchHookErrors.push(error);
+					}
 				}
 			}),
 		} as unknown as ExtensionRunner;
@@ -1026,59 +1033,9 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(await session.switchSession(targetSessionFile)).toBe(true);
 		expect(appendOnly?.log.length).toBe(0);
 
-		expect(session.getQueuedMessages().followUp).toEqual(["queued by switch hook"]);
-		expect(agent.snapshotFollowUp()).toHaveLength(1);
-		expect(switchSubmission).toBeDefined();
-		const submission = switchSubmission!;
-		expect(await Promise.race([submission.terminal.then(() => "settled"), Bun.sleep(20).then(() => "pending")])).toBe(
-			"pending",
-		);
-		session.clearQueue();
-		await expect(submission.terminal).resolves.toMatchObject({ disposition: "removed", reason: "removed" });
-	});
-
-	it("admits tracked work from a committed new-session hook", async () => {
-		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
-		const currentSessionManager = SessionManager.create(tempDir, tempDir);
-		const settings = Settings.isolated();
-		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-new-hook.db"));
-		authStorages.push(authStorage);
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models-new-hook.yml"));
-		let newSessionSubmission: QueuedInputSubmission | undefined;
-		const extensionRunner = {
-			hasHandlers: vi.fn(() => false),
-			emit: vi.fn(async (event: { type: string; reason?: string }) => {
-				if (event.type === "session_switch" && event.reason === "new") {
-					newSessionSubmission = await session.submitUserMessage("queued by new hook", {
-						deliverAs: "followUp",
-						trackSubmission: true,
-					});
-				}
-			}),
-		} as unknown as ExtensionRunner;
-
-		session = new AgentSession({
-			agent: new Agent({
-				getApiKey: () => "test-key",
-				initialState: { model, systemPrompt: ["Test"], tools: [] },
-				appendOnlyContext: createAppendOnlyContextManager(model.provider),
-			}),
-			sessionManager: currentSessionManager,
-			settings,
-			modelRegistry,
-			extensionRunner,
-		});
-
-		expect(await session.newSession()).toBe(true);
-		expect(newSessionSubmission).toBeDefined();
-		expect(session.getQueuedMessages().followUp).toEqual(["queued by new hook"]);
-		const submission = newSessionSubmission!;
-		expect(await Promise.race([submission.terminal.then(() => "settled"), Bun.sleep(20).then(() => "pending")])).toBe(
-			"pending",
-		);
-		session.clearQueue();
-		await expect(submission.terminal).resolves.toMatchObject({ disposition: "removed", reason: "removed" });
+		expect(switchHookErrors).toEqual([expect.objectContaining({ code: "busy" })]);
+		expect(session.getQueuedMessages().followUp).toEqual([]);
+		expect(agent.snapshotFollowUp()).toHaveLength(0);
 	});
 
 	// Regression: a subscriber that fires the next prompt synchronously from the
@@ -1502,7 +1459,8 @@ describe("AgentSession TTSR resume gate", () => {
 			modelRegistry,
 			ttsrManager,
 		});
-
+		const terminalEvents: AgentSessionEvent[] = [];
+		session.subscribe(event => terminalEvents.push(event));
 		// prompt() must block until the TTSR continuation completes
 		await session.prompt("Write some Rust code");
 
@@ -1510,6 +1468,58 @@ describe("AgentSession TTSR resume gate", () => {
 		expect(continuationCompleted).toBe(true);
 		expect(streamCallCount).toBeGreaterThanOrEqual(2);
 		expect(session.isStreaming).toBe(false);
+		expect(
+			terminalEvents.some(
+				event =>
+					event.type === "message_end" &&
+					event.message.role === "assistant" &&
+					event.ttsrAbort === true &&
+					event.message.errorMessage === SILENT_ABORT_MARKER,
+			),
+		).toBe(true);
+	});
+
+	it("releases an interrupted TTSR continuation when repeat-state persistence fails", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let streamCallCount = 0;
+		const ttsrManager = new TtsrManager({
+			enabled: true,
+			contextMode: "discard",
+			interruptMode: "always",
+			repeatMode: "once",
+			repeatGap: 10,
+		});
+		ttsrManager.addRule(testRule);
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: (_model, _context, options) => {
+				streamCallCount++;
+				const stream = new AssistantMessageEventStream();
+				if (streamCallCount === 1) pushAbortableTtsrStream(stream, options?.signal);
+				else pushContinuationStream(stream, () => {});
+				return stream;
+			},
+		});
+		const sessionManager = SessionManager.inMemory(tempDir);
+		const appendTtsrInjection = sessionManager.appendTtsrInjection.bind(sessionManager);
+		vi.spyOn(sessionManager, "appendTtsrInjection").mockImplementation((ruleNames, records, messageCount) => {
+			if (ruleNames.length > 0) throw new Error("injected interrupt persistence failure");
+			return appendTtsrInjection(ruleNames, records, messageCount);
+		});
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-int-failure.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, ttsrManager });
+
+		await session.prompt("Write some Rust code");
+
+		expect(streamCallCount).toBe(1);
+		expect(session.isStreaming).toBe(false);
+		expect(session.isTtsrAbortPending).toBe(false);
+		expect(ttsrManager.getInjectedRuleNames()).toEqual([]);
 	});
 
 	it("prompt() blocks until TTSR deferred continuation completes", async () => {
@@ -1577,7 +1587,6 @@ describe("AgentSession TTSR resume gate", () => {
 			modelRegistry,
 			ttsrManager,
 		});
-
 		// prompt() must block until the deferred TTSR continuation completes
 		await session.prompt("Write some Rust code");
 
@@ -1648,7 +1657,6 @@ describe("AgentSession TTSR resume gate", () => {
 			modelRegistry,
 			ttsrManager,
 		});
-
 		// Start prompt (will trigger TTSR and create resume gate)
 		const promptPromise = session.prompt("Write some Rust code");
 		await waitFor(() => session.agent.state.isStreaming);
@@ -1658,94 +1666,7 @@ describe("AgentSession TTSR resume gate", () => {
 		await promptPromise;
 
 		expect(session.isStreaming).toBe(false);
-	});
-
-	it("purges deferred TTSR follow-ups during SDK terminal abort", async () => {
-		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
-		let streamCallCount = 0;
-		let staleTtsrStarted = false;
-		const ttsrManager = new TtsrManager({
-			enabled: true,
-			contextMode: "discard",
-			interruptMode: "never",
-			repeatMode: "once",
-			repeatGap: 10,
-		});
-		ttsrManager.addRule(testRule);
-
-		const agent = new Agent({
-			getApiKey: () => "test-key",
-			initialState: { model, systemPrompt: ["Test"], tools: [] },
-			streamFn: (_model, context, options) => {
-				streamCallCount += 1;
-				const stream = new AssistantMessageEventStream();
-				if (streamCallCount === 1) {
-					queueMicrotask(() => {
-						stream.push({ type: "start", partial: makeMsg("") });
-						stream.push({
-							type: "text_delta",
-							contentIndex: 0,
-							delta: "result.unwrap(",
-							partial: makeMsg("result.unwrap("),
-						});
-						stream.push({
-							type: "done",
-							reason: "stop",
-							message: makeMsg("result.unwrap()"),
-						});
-					});
-				} else if (streamCallCount === 2) {
-					queueMicrotask(() => {
-						stream.push({ type: "start", partial: makeMsg("") });
-						options?.signal?.addEventListener(
-							"abort",
-							() => {
-								stream.push({
-									type: "error",
-									reason: "aborted",
-									error: makeMsg("aborted", "aborted"),
-								});
-							},
-							{ once: true },
-						);
-					});
-				} else {
-					staleTtsrStarted = context.messages.some(message => JSON.stringify(message).includes(testRule.content));
-					queueMicrotask(() => {
-						stream.push({ type: "start", partial: makeMsg("") });
-						stream.push({ type: "done", reason: "stop", message: makeMsg("stale TTSR") });
-					});
-				}
-				return stream;
-			},
-		});
-		const sessionManager = SessionManager.inMemory(tempDir);
-		const settings = Settings.isolated();
-		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-terminal-ttsr.db"));
-		authStorages.push(authStorage);
-		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, ttsrManager });
-
-		const promptPromise = session.prompt("first turn").catch(() => {});
-		await waitFor(() => streamCallCount >= 1, 5_000);
-		await session.submitUserMessage("older SDK follow-up", {
-			deliverAs: "followUp",
-			trackSubmission: true,
-			sdkRunCapability: createSdkRunCapability("terminal-ttsr-deferred"),
-		} as never);
-		await waitFor(() => streamCallCount >= 2, 5_000);
-		await Bun.sleep(10);
-		const handle = session.agent.activeResourceRunId;
-		const abortPromise = session.abortPromptAndWait(handle ?? "run", {
-			graceMs: 1_000,
-			terminal: { scope: "turn" },
-		});
-		if (!handle) session.agent.abort();
-		await abortPromise;
-		await promptPromise;
-		await Bun.sleep(100);
-		expect(staleTtsrStarted).toBe(false);
+		expect(session.isTtsrAbortPending).toBe(false);
 	});
 
 	it("prompt() waits for TTSR continuation with tool calls to finish", async () => {
@@ -1979,6 +1900,350 @@ describe("AgentSession TTSR resume gate", () => {
 		expect(text).toContain('rule="no-unwrap"');
 		expect(text).toContain("Do not use .unwrap()");
 		expect(text.indexOf("<system-reminder")).toBeLessThan(text.indexOf("edit applied"));
+	});
+
+	it("clears a per-tool reminder bucket after pre-dispatch argument validation fails", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let streamCallCount = 0;
+		const ttsrManager = new TtsrManager({
+			enabled: true,
+			contextMode: "discard",
+			interruptMode: "never",
+			repeatMode: "once",
+			repeatGap: 10,
+		});
+		ttsrManager.addRule(testRule);
+		const mockTool: AgentTool = {
+			name: "mock_edit",
+			label: "Mock Edit",
+			description: "A mock edit tool",
+			parameters: z.object({ snippet: z.string() }),
+			execute: async () => ({ content: [{ type: "text" as const, text: "edit applied" }] }),
+		};
+		const toolCall = (snippet: unknown): ToolCall => ({
+			type: "toolCall",
+			id: "call_reused_after_validation",
+			name: "mock_edit",
+			arguments: { snippet },
+		});
+		const toolMessage = (call: ToolCall): AssistantMessage => ({
+			role: "assistant",
+			content: [call],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "mock",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: Date.now(),
+		});
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [mockTool] },
+			streamFn: () => {
+				streamCallCount++;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					if (streamCallCount === 1 || streamCallCount === 3) {
+						const call = toolCall(streamCallCount === 1 ? 7 : "value.unwrap()");
+						const partial = toolMessage(call);
+						stream.push({ type: "start", partial });
+						stream.push({ type: "toolcall_start", contentIndex: 0, partial });
+						stream.push({ type: "toolcall_delta", contentIndex: 0, delta: "value.unwrap()", partial });
+						stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: call, partial });
+						stream.push({ type: "done", reason: "toolUse", message: partial });
+					} else {
+						const done = makeMsg("done");
+						stream.push({ type: "start", partial: done });
+						stream.push({ type: "done", reason: "stop", message: done });
+					}
+				});
+				return stream;
+			},
+		});
+		const sessionManager = SessionManager.inMemory(tempDir);
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-validation-ttsr.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, ttsrManager });
+
+		await session.prompt("invalid call");
+		await session.prompt("valid retry");
+
+		const results = agent.state.messages.filter(
+			(message): message is Extract<typeof message, { role: "toolResult" }> =>
+				message.role === "toolResult" && message.toolCallId === "call_reused_after_validation",
+		);
+		const finalResult = results.at(-1);
+		const resultText = Array.isArray(finalResult?.content)
+			? finalResult.content
+					.filter((content): content is { type: "text"; text: string } => content.type === "text")
+					.map(content => content.text)
+					.join("\n")
+			: "";
+		expect(results).toHaveLength(2);
+		expect(resultText).toContain('rule="no-unwrap"');
+		expect(resultText).toContain("edit applied");
+	});
+
+	it("restores the repeat gate when per-tool TTSR persistence fails", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let streamCallCount = 0;
+		const ttsrManager = new TtsrManager({
+			enabled: true,
+			contextMode: "discard",
+			interruptMode: "never",
+			repeatMode: "once",
+			repeatGap: 10,
+		});
+		ttsrManager.addRule(testRule);
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: "call_failed_ttsr_persistence",
+			name: "mock_edit",
+			arguments: { snippet: "value.unwrap()" },
+		};
+		const mockTool: AgentTool = {
+			name: "mock_edit",
+			label: "Mock Edit",
+			description: "A mock edit tool",
+			parameters: z.object({ snippet: z.string().optional() }),
+			execute: async () => ({ content: [{ type: "text" as const, text: "edit applied" }] }),
+		};
+		const toolMessage = (): AssistantMessage => ({
+			role: "assistant",
+			content: [toolCall],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "mock",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: Date.now(),
+		});
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [mockTool] },
+			streamFn: () => {
+				streamCallCount++;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					if (streamCallCount === 1) {
+						const partial = toolMessage();
+						stream.push({ type: "start", partial });
+						stream.push({ type: "toolcall_start", contentIndex: 0, partial });
+						stream.push({
+							type: "toolcall_delta",
+							contentIndex: 0,
+							delta: "value.unwrap()",
+							partial,
+						});
+						stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial });
+						stream.push({ type: "done", reason: "toolUse", message: partial });
+					} else {
+						const done = makeMsg("done");
+						stream.push({ type: "start", partial: done });
+						stream.push({ type: "done", reason: "stop", message: done });
+					}
+				});
+				return stream;
+			},
+		});
+		const sessionManager = SessionManager.inMemory(tempDir);
+		const append = vi.spyOn(sessionManager, "appendTtsrInjection").mockImplementationOnce(() => {
+			throw new Error("injected TTSR persistence failure");
+		});
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-failed-ttsr.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, ttsrManager });
+
+		await session.prompt("Write some Rust code");
+
+		expect(append).toHaveBeenCalled();
+		expect(ttsrManager.getInjectedRuleNames()).toEqual([]);
+	});
+
+	it("reconciles a failed turn-end repeat checkpoint before the next provider call", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const order: string[] = [];
+		let streamCallCount = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"] },
+			streamFn: () => {
+				order.push(`provider-${++streamCallCount}`);
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const done = makeMsg("done");
+					stream.push({ type: "start", partial: done });
+					stream.push({ type: "done", reason: "stop", message: done });
+				});
+				return stream;
+			},
+		});
+		const sessionManager = SessionManager.inMemory(tempDir);
+		const appendTtsrInjection = sessionManager.appendTtsrInjection.bind(sessionManager);
+		let rejectNextTurnCheckpoint = true;
+		vi.spyOn(sessionManager, "appendTtsrInjection").mockImplementation((ruleNames, records, messageCount) => {
+			if (ruleNames.length === 0 && rejectNextTurnCheckpoint) {
+				rejectNextTurnCheckpoint = false;
+				order.push("persist-failed");
+				throw new Error("injected turn-end persistence failure");
+			}
+			order.push("persisted");
+			return appendTtsrInjection(ruleNames, records, messageCount);
+		});
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-turn-end-failure.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const ttsrManager = new TtsrManager({ enabled: true });
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, ttsrManager });
+
+		await expect(session.prompt("first turn")).rejects.toThrow("injected turn-end persistence failure");
+		expect(ttsrManager.getMessageCount()).toBe(0);
+		expect(() => session.newSession()).toThrow("Reconcile repeat-state persistence before changing session history.");
+		expect(order).toEqual(["provider-1", "persist-failed"]);
+
+		await session.prompt("second turn");
+
+		expect(order.slice(0, 4)).toEqual(["provider-1", "persist-failed", "persisted", "provider-2"]);
+		expect(ttsrManager.getMessageCount()).toBe(2);
+	});
+
+	it("does not promote an owned idle completion after a transition starts during reconciliation", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let streamCallCount = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"] },
+			streamFn: () => {
+				streamCallCount++;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const done = makeMsg("done");
+					stream.push({ type: "start", partial: done });
+					stream.push({ type: "done", reason: "stop", message: done });
+				});
+				return stream;
+			},
+		});
+		const sessionManager = SessionManager.inMemory(tempDir);
+		const appendTtsrInjection = sessionManager.appendTtsrInjection.bind(sessionManager);
+		let rejectInitialCheckpoint = true;
+		let startTransitionDuringReconciliation = false;
+		const transitionStarted = Promise.withResolvers<void>();
+		const releaseTransitionAbort = Promise.withResolvers<void>();
+		let transition: Promise<boolean> | undefined;
+		let transitionStartError: unknown;
+		vi.spyOn(sessionManager, "appendTtsrInjection").mockImplementation((ruleNames, records, messageCount) => {
+			if (ruleNames.length === 0 && rejectInitialCheckpoint) {
+				rejectInitialCheckpoint = false;
+				throw new Error("injected turn-end persistence failure");
+			}
+			if (ruleNames.length === 0 && startTransitionDuringReconciliation) {
+				startTransitionDuringReconciliation = false;
+				queueMicrotask(() => {
+					try {
+						transition = session.newSession();
+					} catch (error) {
+						transitionStartError = error;
+						transitionStarted.resolve();
+					}
+				});
+			}
+			return appendTtsrInjection(ruleNames, records, messageCount);
+		});
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-idle-reconcile-race.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const ttsrManager = new TtsrManager({ enabled: true });
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, ttsrManager });
+		await expect(session.prompt("first turn")).rejects.toThrow("injected turn-end persistence failure");
+		const originalEpoch = session.getTerminalTurnEpoch();
+		if (originalEpoch === undefined) throw new Error("Expected a prompt lineage before idle delivery");
+
+		const registration: TurnRegistrationKey = {
+			endpointId: `idle-reconcile-${Snowflake.next()}`,
+			endpointGeneration: 0,
+			lineageIdHash: `idle-reconcile-lineage-${Snowflake.next()}`,
+			promptAttemptEpoch: 17,
+			jobId: `idle-reconcile-job-${Snowflake.next()}`,
+			jobGeneration: "job:1",
+		};
+		const terminalScope = registerTerminalTurnScope({
+			lineageIdHash: registration.lineageIdHash,
+			promptAttemptEpoch: registration.promptAttemptEpoch,
+			ownedCompletionPolicy: "enabled",
+		});
+		if (!terminalScope) throw new Error("Expected terminal scope registration to succeed");
+		registerOwnedRegistration(registration, { isJobTerminal: () => true });
+		const ownedEnvelope: OwnedCompletionEnvelope = {
+			lineageIdHash: registration.lineageIdHash,
+			promptAttemptEpoch: registration.promptAttemptEpoch,
+			registration,
+		};
+		const ownedMessage: CustomMessage<{ ownedCompletions: OwnedCompletionEnvelope[] }> = {
+			role: "custom",
+			customType: "async-result",
+			content: "owned completion",
+			display: true,
+			attribution: "agent",
+			details: { ownedCompletions: [ownedEnvelope] },
+			timestamp: Date.now(),
+		};
+		const unregisterDispatcher = session.yieldQueue.register<string>("idle-reconcile-race", {
+			build: () => ownedMessage,
+		});
+		const abortSpy = vi.spyOn(session, "abort").mockImplementation(async () => {
+			transitionStarted.resolve();
+			await releaseTransitionAbort.promise;
+		});
+
+		try {
+			startTransitionDuringReconciliation = true;
+			session.yieldQueue.enqueue("idle-reconcile-race", "completion");
+			await session.yieldQueue.flush("idle");
+			await transitionStarted.promise;
+			if (transitionStartError !== undefined) throw transitionStartError;
+			if (!transition) throw new Error("Expected the new-session transition to start");
+
+			expect(session.getTerminalTurnEpoch()).toBe(originalEpoch);
+			expect(session.yieldQueue.has("idle-reconcile-race")).toBe(true);
+			expect(streamCallCount).toBe(1);
+
+			releaseTransitionAbort.resolve();
+			await transition;
+			await session.yieldQueue.flush("idle");
+			expect(session.yieldQueue.has("idle-reconcile-race")).toBe(false);
+		} finally {
+			releaseTransitionAbort.resolve();
+			await transition?.catch(() => {});
+			abortSpy.mockRestore();
+			unregisterDispatcher();
+			unregisterOwnedRegistration(registration);
+			unregisterTerminalScope(terminalScope.scopeId);
+		}
 	});
 
 	it("interruptMode never deduplicates the reminder across sibling tool calls in one batch", async () => {
