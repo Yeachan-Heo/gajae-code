@@ -380,6 +380,7 @@ describe("openai-completions compatibility", () => {
 			sendSessionHeaders: false,
 			supportsResponsesSessionAffinity: false,
 			supportsServiceTier: false,
+			supportsUltrafastTier: false,
 			reservedToolNames: [],
 			supportsMultipleSystemMessages: true,
 			supportsReasoningEffort: true,

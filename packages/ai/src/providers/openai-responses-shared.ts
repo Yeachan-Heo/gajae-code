@@ -437,9 +437,27 @@ function appendResponsesToolResultOutput(
 	}
 }
 
+/**
+ * Get the service tier cost multiplier for Responses API.
+ * Responses API applies the same multipliers as Codex for consistency.
+ */
+function getResponsesServiceTierCostMultiplier(serviceTier: ServiceTier | undefined): number {
+	switch (serviceTier) {
+		case "flex":
+			return 0.5;
+		case "priority":
+			return 2;
+		case "ultrafast":
+			return 6;
+		default:
+			return 1;
+	}
+}
+
 export interface ProcessResponsesStreamOptions {
 	onFirstToken?: () => void;
 	onOutputItemDone?: (item: ResponseOutputItem) => void;
+	serviceTier?: ServiceTier;
 }
 
 export async function processResponsesStream<TApi extends Api>(
@@ -973,6 +991,14 @@ export async function processResponsesStream<TApi extends Api>(
 			}
 			populateResponsesUsageFromResponse(output, response?.usage);
 			calculateCost(model, output.usage);
+			// Apply service tier cost multiplier (ultrafast = 6x, priority = 2x, flex = 0.5x)
+			const multiplier = getResponsesServiceTierCostMultiplier(options?.serviceTier);
+			if (multiplier !== 1) {
+				output.usage.cost.input *= multiplier;
+				output.usage.cost.output *= multiplier;
+				output.usage.cost.cacheRead *= multiplier;
+				output.usage.cost.cacheWrite *= multiplier;
+			}
 			// A `response.incomplete` frame is terminal because the response was cut
 			// short, so the event type itself proves truncation. Deriving `length`
 			// from the event rather than trusting `response.status` stops a relay that
@@ -1214,6 +1240,7 @@ export function applyCommonResponsesSamplingParams<P extends CommonResponsesPara
 	options: CommonSamplingOptions | undefined,
 	provider: string,
 	supportsServiceTier = false,
+	modelSupportsUltrafastTier = false,
 ): void {
 	if (options?.maxTokens) params.max_output_tokens = options.maxTokens;
 	if (options?.temperature !== undefined) params.temperature = options.temperature;
@@ -1226,6 +1253,12 @@ export function applyCommonResponsesSamplingParams<P extends CommonResponsesPara
 		const resolved = resolveServiceTier(options?.serviceTier, provider);
 		if (resolved === "flex" || resolved === "scale" || resolved === "priority") {
 			params.service_tier = resolved;
+		} else if (resolved === "ultrafast") {
+			// Responses API: gate ultrafast to models that explicitly support it
+			if (modelSupportsUltrafastTier) {
+				(params as Record<string, unknown>).service_tier = "ultrafast";
+			}
+			// else: silently omit ultrafast if model doesn't support it (fail-closed)
 		}
 	}
 }

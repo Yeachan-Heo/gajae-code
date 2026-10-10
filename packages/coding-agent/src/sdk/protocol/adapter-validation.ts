@@ -1,5 +1,15 @@
 const RELOAD_COMPONENTS = new Set(["config", "models", "skills", "extensions", "tools"]);
-const SERVICE_TIERS = new Set(["none", "auto", "default", "flex", "scale", "priority", "openai-only", "claude-only"]);
+const SERVICE_TIERS = new Set([
+	"none",
+	"auto",
+	"default",
+	"flex",
+	"scale",
+	"priority",
+	"ultrafast",
+	"openai-only",
+	"claude-only",
+]);
 
 type Input = Record<string, unknown>;
 

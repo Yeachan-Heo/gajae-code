@@ -32,6 +32,7 @@ import {
 	type Context,
 	type FetchImpl,
 	type Model,
+	modelSupportsUltrafastTier,
 	type ProviderSessionState,
 	resolveServiceTier,
 	type ServiceTier,
@@ -783,6 +784,8 @@ function getCodexServiceTierCostMultiplier(
 			return 0.5;
 		case "priority":
 			return model.id === "gpt-5.5" ? 2.5 : 2;
+		case "ultrafast":
+			return 6;
 		default:
 			return 1;
 	}
@@ -795,9 +798,10 @@ function resolveCodexCostServiceTier(res: unknown, req?: unknown): ServiceTier |
 		case "flex":
 		case "scale":
 		case "priority":
+		case "ultrafast":
 			return res;
 		default:
-			if (req === "flex" || req === "priority") {
+			if (req === "flex" || req === "priority" || req === "ultrafast") {
 				return req;
 			}
 			return "default";
@@ -988,6 +992,12 @@ async function buildTransformedCodexRequestBody(
 	const resolvedServiceTier = resolveServiceTier(options?.serviceTier, model.provider);
 	if (resolvedServiceTier === "flex" || resolvedServiceTier === "scale" || resolvedServiceTier === "priority") {
 		params.service_tier = resolvedServiceTier;
+	} else if (resolvedServiceTier === "ultrafast") {
+		// Gate ultrafast to models that explicitly support it
+		if (modelSupportsUltrafastTier(model)) {
+			params.service_tier = "ultrafast";
+		}
+		// else: silently omit ultrafast if model doesn't support it (fail-closed)
 	}
 	if (context.tools && context.tools.length > 0) {
 		params.tools = convertOpenAICodexResponsesTools(context.tools, model);

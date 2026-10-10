@@ -8821,8 +8821,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "claude-4-sonnet",
       "input": [
@@ -8840,8 +8840,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "claude-4-sonnet-thinking",
       "input": [
@@ -8859,8 +8859,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-4.5-opus-high",
       "input": [
@@ -8879,8 +8879,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-4.5-opus-high-thinking",
       "input": [
@@ -8904,8 +8904,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "claude-4.5-sonnet",
       "input": [
@@ -8924,8 +8924,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "claude-4.5-sonnet-thinking",
       "input": [
@@ -8949,8 +8949,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-4.6-opus-high",
       "input": [
@@ -8968,8 +8968,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-4.6-opus-high-thinking",
       "input": [
@@ -8987,8 +8987,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-4.6-opus-high-thinking-fast",
       "input": [
@@ -9006,8 +9006,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 6.0,
-        "output": 18.0
+        "input": 6,
+        "output": 18
       },
       "id": "claude-4.6-opus-max",
       "input": [
@@ -9025,8 +9025,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 6.0,
-        "output": 18.0
+        "input": 6,
+        "output": 18
       },
       "id": "claude-4.6-opus-max-thinking",
       "input": [
@@ -9044,8 +9044,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 6.0,
-        "output": 18.0
+        "input": 6,
+        "output": 18
       },
       "id": "claude-4.6-opus-max-thinking-fast",
       "input": [
@@ -9063,8 +9063,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "claude-4.6-sonnet-medium",
       "input": [
@@ -9082,8 +9082,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "claude-4.6-sonnet-medium-thinking",
       "input": [
@@ -9101,8 +9101,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-fable-5-high",
       "input": [
@@ -9120,8 +9120,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "claude-fable-5-low",
       "input": [
@@ -9139,8 +9139,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 6.0,
-        "output": 18.0
+        "input": 6,
+        "output": 18
       },
       "id": "claude-fable-5-max",
       "input": [
@@ -9158,8 +9158,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "claude-fable-5-medium",
       "input": [
@@ -9177,8 +9177,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-fable-5-thinking-high",
       "input": [
@@ -9196,8 +9196,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "claude-fable-5-thinking-low",
       "input": [
@@ -9215,8 +9215,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 6.0,
-        "output": 18.0
+        "input": 6,
+        "output": 18
       },
       "id": "claude-fable-5-thinking-max",
       "input": [
@@ -9234,8 +9234,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "claude-fable-5-thinking-medium",
       "input": [
@@ -9253,8 +9253,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-fable-5-thinking-xhigh",
       "input": [
@@ -9272,8 +9272,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-fable-5-xhigh",
       "input": [
@@ -9291,8 +9291,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-opus-4-7-high",
       "input": [
@@ -9310,8 +9310,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-opus-4-7-high-fast",
       "input": [
@@ -9329,8 +9329,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "claude-opus-4-7-low",
       "input": [
@@ -9348,8 +9348,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "claude-opus-4-7-low-fast",
       "input": [
@@ -9367,8 +9367,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 6.0,
-        "output": 18.0
+        "input": 6,
+        "output": 18
       },
       "id": "claude-opus-4-7-max",
       "input": [
@@ -9386,8 +9386,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 6.0,
-        "output": 18.0
+        "input": 6,
+        "output": 18
       },
       "id": "claude-opus-4-7-max-fast",
       "input": [
@@ -9405,8 +9405,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "claude-opus-4-7-medium",
       "input": [
@@ -9424,8 +9424,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "claude-opus-4-7-medium-fast",
       "input": [
@@ -9443,8 +9443,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-opus-4-7-thinking-high",
       "input": [
@@ -9462,8 +9462,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-opus-4-7-thinking-high-fast",
       "input": [
@@ -9481,8 +9481,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "claude-opus-4-7-thinking-low",
       "input": [
@@ -9500,8 +9500,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "claude-opus-4-7-thinking-low-fast",
       "input": [
@@ -9519,8 +9519,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 6.0,
-        "output": 18.0
+        "input": 6,
+        "output": 18
       },
       "id": "claude-opus-4-7-thinking-max",
       "input": [
@@ -9538,8 +9538,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 6.0,
-        "output": 18.0
+        "input": 6,
+        "output": 18
       },
       "id": "claude-opus-4-7-thinking-max-fast",
       "input": [
@@ -9557,8 +9557,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "claude-opus-4-7-thinking-medium",
       "input": [
@@ -9576,8 +9576,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "claude-opus-4-7-thinking-medium-fast",
       "input": [
@@ -9595,8 +9595,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-opus-4-7-thinking-xhigh",
       "input": [
@@ -9614,8 +9614,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-opus-4-7-thinking-xhigh-fast",
       "input": [
@@ -9633,8 +9633,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-opus-4-7-xhigh",
       "input": [
@@ -9652,8 +9652,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-opus-4-7-xhigh-fast",
       "input": [
@@ -9671,8 +9671,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-opus-4-8-high",
       "input": [
@@ -9691,8 +9691,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-opus-4-8-high-fast",
       "input": [
@@ -9711,8 +9711,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "claude-opus-4-8-low",
       "input": [
@@ -9731,8 +9731,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "claude-opus-4-8-low-fast",
       "input": [
@@ -9751,8 +9751,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 6.0,
-        "output": 18.0
+        "input": 6,
+        "output": 18
       },
       "id": "claude-opus-4-8-max",
       "input": [
@@ -9771,8 +9771,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 6.0,
-        "output": 18.0
+        "input": 6,
+        "output": 18
       },
       "id": "claude-opus-4-8-max-fast",
       "input": [
@@ -9791,8 +9791,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "claude-opus-4-8-medium",
       "input": [
@@ -9811,8 +9811,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "claude-opus-4-8-medium-fast",
       "input": [
@@ -9831,8 +9831,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-opus-4-8-thinking-high",
       "input": [
@@ -9851,8 +9851,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-opus-4-8-thinking-high-fast",
       "input": [
@@ -9871,8 +9871,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "claude-opus-4-8-thinking-low",
       "input": [
@@ -9891,8 +9891,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "claude-opus-4-8-thinking-low-fast",
       "input": [
@@ -9911,8 +9911,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 6.0,
-        "output": 18.0
+        "input": 6,
+        "output": 18
       },
       "id": "claude-opus-4-8-thinking-max",
       "input": [
@@ -9931,8 +9931,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 6.0,
-        "output": 18.0
+        "input": 6,
+        "output": 18
       },
       "id": "claude-opus-4-8-thinking-max-fast",
       "input": [
@@ -9951,8 +9951,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "claude-opus-4-8-thinking-medium",
       "input": [
@@ -9971,8 +9971,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "claude-opus-4-8-thinking-medium-fast",
       "input": [
@@ -9991,8 +9991,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-opus-4-8-thinking-xhigh",
       "input": [
@@ -10011,8 +10011,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-opus-4-8-thinking-xhigh-fast",
       "input": [
@@ -10031,8 +10031,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-opus-4-8-xhigh",
       "input": [
@@ -10051,8 +10051,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-opus-4-8-xhigh-fast",
       "input": [
@@ -10071,8 +10071,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-opus-5-high",
       "input": [
@@ -10091,8 +10091,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-opus-5-high-fast",
       "input": [
@@ -10111,8 +10111,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "claude-opus-5-low",
       "input": [
@@ -10131,8 +10131,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "claude-opus-5-low-fast",
       "input": [
@@ -10151,8 +10151,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "claude-opus-5-medium",
       "input": [
@@ -10171,8 +10171,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "claude-opus-5-medium-fast",
       "input": [
@@ -10191,8 +10191,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-opus-5-thinking-high",
       "input": [
@@ -10211,8 +10211,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-opus-5-thinking-high-fast",
       "input": [
@@ -10231,8 +10231,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "claude-opus-5-thinking-low",
       "input": [
@@ -10251,8 +10251,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "claude-opus-5-thinking-low-fast",
       "input": [
@@ -10271,8 +10271,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 6.0,
-        "output": 18.0
+        "input": 6,
+        "output": 18
       },
       "id": "claude-opus-5-thinking-max",
       "input": [
@@ -10291,8 +10291,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 6.0,
-        "output": 18.0
+        "input": 6,
+        "output": 18
       },
       "id": "claude-opus-5-thinking-max-fast",
       "input": [
@@ -10311,8 +10311,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "claude-opus-5-thinking-medium",
       "input": [
@@ -10331,8 +10331,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "claude-opus-5-thinking-medium-fast",
       "input": [
@@ -10351,8 +10351,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-opus-5-thinking-xhigh",
       "input": [
@@ -10371,8 +10371,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-opus-5-thinking-xhigh-fast",
       "input": [
@@ -10391,8 +10391,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-sonnet-5-high",
       "input": [
@@ -10410,8 +10410,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "claude-sonnet-5-low",
       "input": [
@@ -10429,8 +10429,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 6.0,
-        "output": 18.0
+        "input": 6,
+        "output": 18
       },
       "id": "claude-sonnet-5-max",
       "input": [
@@ -10448,8 +10448,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "claude-sonnet-5-medium",
       "input": [
@@ -10467,8 +10467,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-sonnet-5-thinking-high",
       "input": [
@@ -10486,8 +10486,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "claude-sonnet-5-thinking-low",
       "input": [
@@ -10505,8 +10505,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 6.0,
-        "output": 18.0
+        "input": 6,
+        "output": 18
       },
       "id": "claude-sonnet-5-thinking-max",
       "input": [
@@ -10524,8 +10524,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "claude-sonnet-5-thinking-medium",
       "input": [
@@ -10543,8 +10543,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-sonnet-5-thinking-xhigh",
       "input": [
@@ -10562,8 +10562,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "claude-sonnet-5-xhigh",
       "input": [
@@ -10581,8 +10581,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "composer-1",
       "input": [
@@ -10600,8 +10600,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "composer-1.5",
       "input": [
@@ -10638,8 +10638,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 15.0
+        "input": 3,
+        "output": 15
       },
       "id": "composer-2.5-fast",
       "input": [
@@ -10657,8 +10657,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "cursor-grok-4.5-high",
       "input": [
@@ -10676,8 +10676,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "cursor-grok-4.5-high-fast",
       "input": [
@@ -10695,8 +10695,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "cursor-grok-4.5-low",
       "input": [
@@ -10714,8 +10714,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "cursor-grok-4.5-low-fast",
       "input": [
@@ -10733,8 +10733,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "cursor-grok-4.5-medium",
       "input": [
@@ -10752,8 +10752,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "cursor-grok-4.5-medium-fast",
       "input": [
@@ -10771,8 +10771,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "cursor-grok-4.6-high",
       "input": [
@@ -10790,8 +10790,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "cursor-grok-4.6-high-fast",
       "input": [
@@ -10809,8 +10809,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "cursor-grok-4.6-low",
       "input": [
@@ -10828,8 +10828,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "cursor-grok-4.6-low-fast",
       "input": [
@@ -10847,8 +10847,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "cursor-grok-4.6-medium",
       "input": [
@@ -10866,8 +10866,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "cursor-grok-4.6-medium-fast",
       "input": [
@@ -10885,8 +10885,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "cursor-grok-4.6-xhigh",
       "input": [
@@ -10904,8 +10904,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "cursor-grok-4.6-xhigh-fast",
       "input": [
@@ -10923,8 +10923,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "default",
       "input": [
@@ -10943,8 +10943,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gemini-3-flash",
       "input": [
@@ -10968,8 +10968,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gemini-3-pro",
       "input": [
@@ -10997,8 +10997,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gemini-3.1-pro",
       "input": [
@@ -11026,8 +11026,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gemini-3.5-flash",
       "input": [
@@ -11051,8 +11051,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gemini-3.6-flash-high",
       "input": [
@@ -11070,8 +11070,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "gemini-3.6-flash-low",
       "input": [
@@ -11089,8 +11089,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gemini-3.6-flash-medium",
       "input": [
@@ -11108,8 +11108,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gemini-3.6-flash-minimal",
       "input": [
@@ -11127,8 +11127,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gemini-3.7-flash-high",
       "input": [
@@ -11146,8 +11146,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "gemini-3.7-flash-low",
       "input": [
@@ -11165,8 +11165,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gemini-3.7-flash-medium",
       "input": [
@@ -11184,8 +11184,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "glm-5.2-high",
       "input": [
@@ -11203,8 +11203,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 6.0,
-        "output": 18.0
+        "input": 6,
+        "output": 18
       },
       "id": "glm-5.2-max",
       "input": [
@@ -11222,8 +11222,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gpt-5-mini",
       "input": [
@@ -11247,8 +11247,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gpt-5.1",
       "input": [
@@ -11272,8 +11272,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 6.0,
-        "output": 18.0
+        "input": 6,
+        "output": 18
       },
       "id": "gpt-5.1-codex-max",
       "input": [
@@ -11297,8 +11297,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.1-codex-max-high",
       "input": [
@@ -11322,8 +11322,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.1-codex-max-high-fast",
       "input": [
@@ -11341,8 +11341,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "gpt-5.1-codex-max-low",
       "input": [
@@ -11360,8 +11360,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "gpt-5.1-codex-max-low-fast",
       "input": [
@@ -11379,8 +11379,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gpt-5.1-codex-max-medium",
       "input": [
@@ -11398,8 +11398,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gpt-5.1-codex-max-medium-fast",
       "input": [
@@ -11417,8 +11417,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.1-codex-max-xhigh",
       "input": [
@@ -11436,8 +11436,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.1-codex-max-xhigh-fast",
       "input": [
@@ -11455,8 +11455,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gpt-5.1-codex-mini",
       "input": [
@@ -11480,8 +11480,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.1-codex-mini-high",
       "input": [
@@ -11499,8 +11499,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "gpt-5.1-codex-mini-low",
       "input": [
@@ -11518,8 +11518,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.1-high",
       "input": [
@@ -11537,8 +11537,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "gpt-5.1-low",
       "input": [
@@ -11556,8 +11556,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gpt-5.2",
       "input": [
@@ -11581,8 +11581,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gpt-5.2-codex",
       "input": [
@@ -11606,8 +11606,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gpt-5.2-codex-fast",
       "input": [
@@ -11625,8 +11625,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.2-codex-high",
       "input": [
@@ -11644,8 +11644,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.2-codex-high-fast",
       "input": [
@@ -11663,8 +11663,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "gpt-5.2-codex-low",
       "input": [
@@ -11682,8 +11682,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "gpt-5.2-codex-low-fast",
       "input": [
@@ -11701,8 +11701,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.2-codex-xhigh",
       "input": [
@@ -11720,8 +11720,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.2-codex-xhigh-fast",
       "input": [
@@ -11739,8 +11739,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gpt-5.2-fast",
       "input": [
@@ -11758,8 +11758,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.2-high",
       "input": [
@@ -11783,8 +11783,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.2-high-fast",
       "input": [
@@ -11802,8 +11802,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "gpt-5.2-low",
       "input": [
@@ -11821,8 +11821,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "gpt-5.2-low-fast",
       "input": [
@@ -11840,8 +11840,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.2-xhigh",
       "input": [
@@ -11859,8 +11859,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.2-xhigh-fast",
       "input": [
@@ -11878,8 +11878,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gpt-5.3-codex",
       "input": [
@@ -11903,8 +11903,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gpt-5.3-codex-fast",
       "input": [
@@ -11922,8 +11922,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.3-codex-high",
       "input": [
@@ -11941,8 +11941,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.3-codex-high-fast",
       "input": [
@@ -11960,8 +11960,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "gpt-5.3-codex-low",
       "input": [
@@ -11979,8 +11979,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "gpt-5.3-codex-low-fast",
       "input": [
@@ -11998,8 +11998,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gpt-5.3-codex-spark-preview",
       "input": [
@@ -12017,8 +12017,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.3-codex-xhigh",
       "input": [
@@ -12036,8 +12036,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.3-codex-xhigh-fast",
       "input": [
@@ -12055,8 +12055,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.4-high",
       "input": [
@@ -12074,8 +12074,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.4-high-fast",
       "input": [
@@ -12093,8 +12093,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "gpt-5.4-low",
       "input": [
@@ -12112,8 +12112,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gpt-5.4-medium",
       "input": [
@@ -12131,8 +12131,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gpt-5.4-medium-fast",
       "input": [
@@ -12150,8 +12150,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.4-mini-high",
       "input": [
@@ -12169,8 +12169,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "gpt-5.4-mini-low",
       "input": [
@@ -12188,8 +12188,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gpt-5.4-mini-medium",
       "input": [
@@ -12226,8 +12226,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.4-mini-xhigh",
       "input": [
@@ -12245,8 +12245,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.4-nano-high",
       "input": [
@@ -12264,8 +12264,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "gpt-5.4-nano-low",
       "input": [
@@ -12283,8 +12283,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gpt-5.4-nano-medium",
       "input": [
@@ -12321,8 +12321,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.4-nano-xhigh",
       "input": [
@@ -12340,8 +12340,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.4-xhigh",
       "input": [
@@ -12359,8 +12359,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.4-xhigh-fast",
       "input": [
@@ -12378,8 +12378,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.5-extra-high",
       "input": [
@@ -12397,8 +12397,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.5-extra-high-fast",
       "input": [
@@ -12416,8 +12416,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.5-high",
       "input": [
@@ -12435,8 +12435,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.5-high-fast",
       "input": [
@@ -12454,8 +12454,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "gpt-5.5-low",
       "input": [
@@ -12473,8 +12473,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "gpt-5.5-low-fast",
       "input": [
@@ -12492,8 +12492,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gpt-5.5-medium",
       "input": [
@@ -12511,8 +12511,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gpt-5.5-medium-fast",
       "input": [
@@ -12568,8 +12568,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.6-luna-high",
       "input": [
@@ -12587,8 +12587,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.6-luna-high-fast",
       "input": [
@@ -12606,8 +12606,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "gpt-5.6-luna-low",
       "input": [
@@ -12625,8 +12625,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "gpt-5.6-luna-low-fast",
       "input": [
@@ -12644,8 +12644,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 6.0,
-        "output": 18.0
+        "input": 6,
+        "output": 18
       },
       "id": "gpt-5.6-luna-max",
       "input": [
@@ -12663,8 +12663,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 6.0,
-        "output": 18.0
+        "input": 6,
+        "output": 18
       },
       "id": "gpt-5.6-luna-max-fast",
       "input": [
@@ -12682,8 +12682,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gpt-5.6-luna-medium",
       "input": [
@@ -12701,8 +12701,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gpt-5.6-luna-medium-fast",
       "input": [
@@ -12758,8 +12758,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.6-luna-xhigh",
       "input": [
@@ -12777,8 +12777,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.6-luna-xhigh-fast",
       "input": [
@@ -12796,8 +12796,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.6-sol-high",
       "input": [
@@ -12815,8 +12815,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.6-sol-high-fast",
       "input": [
@@ -12834,8 +12834,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "gpt-5.6-sol-low",
       "input": [
@@ -12853,8 +12853,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "gpt-5.6-sol-low-fast",
       "input": [
@@ -12872,8 +12872,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 6.0,
-        "output": 18.0
+        "input": 6,
+        "output": 18
       },
       "id": "gpt-5.6-sol-max",
       "input": [
@@ -12891,8 +12891,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 6.0,
-        "output": 18.0
+        "input": 6,
+        "output": 18
       },
       "id": "gpt-5.6-sol-max-fast",
       "input": [
@@ -12910,8 +12910,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gpt-5.6-sol-medium",
       "input": [
@@ -12929,8 +12929,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gpt-5.6-sol-medium-fast",
       "input": [
@@ -12986,8 +12986,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.6-sol-xhigh",
       "input": [
@@ -13005,8 +13005,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.6-sol-xhigh-fast",
       "input": [
@@ -13024,8 +13024,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.6-terra-high",
       "input": [
@@ -13043,8 +13043,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.6-terra-high-fast",
       "input": [
@@ -13062,8 +13062,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "gpt-5.6-terra-low",
       "input": [
@@ -13081,8 +13081,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "gpt-5.6-terra-low-fast",
       "input": [
@@ -13100,8 +13100,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 6.0,
-        "output": 18.0
+        "input": 6,
+        "output": 18
       },
       "id": "gpt-5.6-terra-max",
       "input": [
@@ -13119,8 +13119,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 6.0,
-        "output": 18.0
+        "input": 6,
+        "output": 18
       },
       "id": "gpt-5.6-terra-max-fast",
       "input": [
@@ -13138,8 +13138,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gpt-5.6-terra-medium",
       "input": [
@@ -13157,8 +13157,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 3.0,
-        "output": 9.0
+        "input": 3,
+        "output": 9
       },
       "id": "gpt-5.6-terra-medium-fast",
       "input": [
@@ -13214,8 +13214,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.6-terra-xhigh",
       "input": [
@@ -13233,8 +13233,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "gpt-5.6-terra-xhigh-fast",
       "input": [
@@ -13252,8 +13252,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "grok-4.3",
       "input": [
@@ -13277,8 +13277,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "grok-build-0.1",
       "input": [
@@ -13326,8 +13326,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "kimi-k2.5",
       "input": [
@@ -13351,8 +13351,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "kimi-k2.7-code",
       "input": [
@@ -13376,8 +13376,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 4.0,
-        "output": 12.0
+        "input": 4,
+        "output": 12
       },
       "id": "kimi-k3-high",
       "input": [
@@ -13395,8 +13395,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 2.0,
-        "output": 6.0
+        "input": 2,
+        "output": 6
       },
       "id": "kimi-k3-low",
       "input": [
@@ -13414,8 +13414,8 @@
       "cost": {
         "cacheRead": 0,
         "cacheWrite": 0,
-        "input": 6.0,
-        "output": 18.0
+        "input": 6,
+        "output": 18
       },
       "id": "kimi-k3-max",
       "input": [
@@ -16590,6 +16590,9 @@
         "maxLevel": "max",
         "minLevel": "low",
         "mode": "effort"
+      },
+      "compat": {
+        "supportsUltrafastTier": true
       }
     },
     "gpt-5.6-terra": {
@@ -16626,7 +16629,8 @@
       "compat": {
         "supportsDeveloperRole": false,
         "supportsReasoningEffort": false,
-        "supportsStore": false
+        "supportsStore": false,
+        "supportsUltrafastTier": true
       },
       "contextWindow": 1050000,
       "cost": {
@@ -16710,7 +16714,8 @@
       "compat": {
         "supportsDeveloperRole": false,
         "supportsReasoningEffort": false,
-        "supportsStore": false
+        "supportsStore": false,
+        "supportsUltrafastTier": true
       },
       "contextWindow": 1050000,
       "cost": {
@@ -20594,6 +20599,9 @@
         "maxLevel": "max",
         "minLevel": "low",
         "mode": "effort"
+      },
+      "compat": {
+        "supportsUltrafastTier": true
       }
     },
     "gpt-5.6-terra": {
@@ -33377,6 +33385,9 @@
         "maxLevel": "max",
         "minLevel": "low",
         "mode": "effort"
+      },
+      "compat": {
+        "supportsUltrafastTier": true
       }
     },
     "gpt-5.6-terra": {
@@ -68205,6 +68216,9 @@
         "maxLevel": "max",
         "minLevel": "low",
         "mode": "effort"
+      },
+      "compat": {
+        "supportsUltrafastTier": true
       }
     },
     "gpt-5.6-terra": {
@@ -68275,6 +68289,9 @@
         "maxLevel": "max",
         "minLevel": "low",
         "mode": "effort"
+      },
+      "compat": {
+        "supportsUltrafastTier": true
       }
     },
     "gpt-6-luna": {
@@ -68377,6 +68394,9 @@
         "maxLevel": "max",
         "minLevel": "low",
         "mode": "effort"
+      },
+      "compat": {
+        "supportsUltrafastTier": true
       }
     },
     "gpt-daybreak-blue-latest": {
@@ -69243,6 +69263,9 @@
         "maxLevel": "max",
         "minLevel": "low",
         "mode": "effort"
+      },
+      "compat": {
+        "supportsUltrafastTier": true
       }
     },
     "gpt-5.6-terra": {
@@ -69317,6 +69340,9 @@
         "maxLevel": "max",
         "minLevel": "low",
         "mode": "effort"
+      },
+      "compat": {
+        "supportsUltrafastTier": true
       }
     },
     "gpt-6-luna": {
@@ -69422,6 +69448,9 @@
         "maxLevel": "max",
         "minLevel": "low",
         "mode": "effort"
+      },
+      "compat": {
+        "supportsUltrafastTier": true
       }
     },
     "gpt-daybreak-blue-latest": {
@@ -70690,6 +70719,81 @@
         "maxLevel": "xhigh",
         "minLevel": "minimal",
         "mode": "budget"
+      }
+    },
+    "claude-haiku-5-5": {
+      "id": "claude-haiku-5-5",
+      "name": "Anthropic Haiku 5.5",
+      "api": "anthropic-messages",
+      "provider": "opencode-go",
+      "baseUrl": "https://opencode.ai/zen/go",
+      "reasoning": true,
+      "input": [
+        "text",
+        "image"
+      ],
+      "cost": {
+        "input": 0.1,
+        "output": 0.5,
+        "cacheRead": 0.01,
+        "cacheWrite": 0.125
+      },
+      "contextWindow": 1000000,
+      "maxTokens": 128000,
+      "thinking": {
+        "mode": "budget",
+        "minLevel": "minimal",
+        "maxLevel": "xhigh"
+      }
+    },
+    "space-bunny": {
+      "id": "space-bunny",
+      "name": "Space Bunny",
+      "api": "openai-completions",
+      "provider": "opencode-go",
+      "baseUrl": "https://opencode.ai/zen/go/v1",
+      "reasoning": true,
+      "input": [
+        "text",
+        "image"
+      ],
+      "cost": {
+        "input": 0.15,
+        "output": 0.6,
+        "cacheRead": 0.03,
+        "cacheWrite": 0
+      },
+      "contextWindow": 1048576,
+      "maxTokens": 524288,
+      "thinking": {
+        "mode": "effort",
+        "minLevel": "minimal",
+        "maxLevel": "xhigh"
+      }
+    },
+    "step-5-preview-free": {
+      "id": "step-5-preview-free",
+      "name": "Step 5 Preview Free",
+      "api": "openai-completions",
+      "provider": "opencode-go",
+      "baseUrl": "https://opencode.ai/zen/go/v1",
+      "reasoning": true,
+      "input": [
+        "text",
+        "image"
+      ],
+      "cost": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0
+      },
+      "contextWindow": 1000000,
+      "maxTokens": 65536,
+      "thinking": {
+        "mode": "effort",
+        "minLevel": "minimal",
+        "maxLevel": "xhigh"
       }
     }
   },
@@ -72092,6 +72196,9 @@
         "maxLevel": "max",
         "minLevel": "low",
         "mode": "effort"
+      },
+      "compat": {
+        "supportsUltrafastTier": true
       }
     },
     "gpt-5.6-terra": {
@@ -72142,6 +72249,9 @@
         "maxLevel": "max",
         "minLevel": "low",
         "mode": "effort"
+      },
+      "compat": {
+        "supportsUltrafastTier": true
       }
     },
     "gpt-6-luna": {
@@ -72217,6 +72327,9 @@
         "maxLevel": "max",
         "minLevel": "low",
         "mode": "effort"
+      },
+      "compat": {
+        "supportsUltrafastTier": true
       }
     },
     "grok-4.5": {

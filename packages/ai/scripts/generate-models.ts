@@ -816,6 +816,23 @@ async function fetchCodexDiscoveryModels(): Promise<Model<"openai-codex-response
 	}
 }
 
+/**
+ * Apply ultrafast service tier support flag to models that explicitly support it.
+ * Only models that set supportsUltrafastTier will send ultrafast tier to the API.
+ * Models: gpt-6-astra, gpt-6.1-sol, gpt-5.6-sol (preview).
+ */
+function applyUltrafastTierSupport(models: Model[]): void {
+	const ultrafastSupportedIds = new Set(["gpt-6-astra", "gpt-6.1-sol", "gpt-5.6-sol"]);
+	for (const model of models) {
+		if (ultrafastSupportedIds.has(model.id)) {
+			if (!model.compat) {
+				model.compat = {};
+			}
+			(model.compat as Record<string, unknown>).supportsUltrafastTier = true;
+		}
+	}
+}
+
 async function generateModels() {
 	// Fetch models from dynamic sources
 	const modelsDevModels = await loadModelsDevData();
@@ -896,6 +913,7 @@ async function generateModels() {
 	// would otherwise overwrite known limits with unknown markers.
 	allModels = restoreSeedLimits(allModels, seedLimits);
 	applyGeneratedModelPolicies(allModels);
+	applyUltrafastTierSupport(allModels);
 	// This provider-specific correction must run after generic policy inference,
 	// which otherwise caps unknown OpenAI-compatible models at `high`.
 	injectMuseSparkModels(allModels);

@@ -33,6 +33,7 @@ import {
 	type Message,
 	type MessageAttribution,
 	type Model,
+	modelSupportsUltrafastTier,
 	type OpenAICompat,
 	type ProviderSessionState,
 	type RepetitionGuardOptions,
@@ -696,6 +697,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			);
 			let disableStrictTools = providerSessionState?.strictToolsDisabled ?? false;
 			let strictFallbackErrorMessage: string | undefined;
+			let lastServiceTier: ServiceTier | undefined;
 			const createCompletionsStream = async (toolStrictModeOverride?: ToolStrictModeOverride) => {
 				clearCapturedErrorResponse();
 				const effectiveToolStrictModeOverride = disableStrictTools ? "none" : toolStrictModeOverride;
@@ -717,6 +719,8 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				if (replacementPayload !== undefined) {
 					params = replacementPayload as typeof params;
 				}
+				// Capture the service tier for use in cost calculations
+				lastServiceTier = (params as Record<string, unknown>).service_tier as ServiceTier | undefined;
 				rawRequestDump = {
 					provider: model.provider,
 					api: output.api,
@@ -1149,7 +1153,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			let hasExplicitUsageReport = false;
 			let hasNonzeroUsageEvidence = false;
 			const applyUsage = (rawUsage: object): void => {
-				const usage = parseChunkUsage(rawUsage, model, premiumRequestsTotal);
+				const usage = parseChunkUsage(rawUsage, model, premiumRequestsTotal, lastServiceTier);
 				const hasExplicitTotal = getOptionalNumberProperty(rawUsage, "total_tokens") !== undefined;
 				const hasExplicitComponents =
 					getOptionalNumberProperty(rawUsage, "prompt_tokens") !== undefined &&
@@ -1796,6 +1800,12 @@ function buildParams(
 		const resolved = resolveServiceTier(options?.serviceTier, model.provider);
 		if (resolved === "flex" || resolved === "scale" || resolved === "priority") {
 			params.service_tier = resolved;
+		} else if (resolved === "ultrafast") {
+			// Gate ultrafast to models that explicitly support it
+			if (modelSupportsUltrafastTier(model)) {
+				(params as Record<string, unknown>).service_tier = "ultrafast";
+			}
+			// else: silently omit ultrafast if model doesn't support it (fail-closed)
 		}
 	}
 
@@ -1988,10 +1998,28 @@ function getChoiceUsage(choice: ChatCompletionChunk.Choice): object | undefined 
 	return getOptionalObjectProperty(choice, "usage");
 }
 
+/**
+ * Get the service tier cost multiplier for Completions API.
+ * Completions API applies the same multipliers as Codex for consistency.
+ */
+function getCompletionsServiceTierCostMultiplier(serviceTier: ServiceTier | undefined): number {
+	switch (serviceTier) {
+		case "flex":
+			return 0.5;
+		case "priority":
+			return 2;
+		case "ultrafast":
+			return 6;
+		default:
+			return 1;
+	}
+}
+
 export function parseChunkUsage(
 	rawUsage: object,
 	model: Model<"openai-completions">,
 	premiumRequests: number | undefined,
+	serviceTier?: ServiceTier,
 ): AssistantMessage["usage"] {
 	const promptTokenDetails = getOptionalObjectProperty(rawUsage, "prompt_tokens_details");
 	const completionTokenDetails = getOptionalObjectProperty(rawUsage, "completion_tokens_details");
@@ -2030,6 +2058,14 @@ export function parseChunkUsage(
 		...(premiumRequests !== undefined ? { premiumRequests } : {}),
 	};
 	calculateCost(model, usage);
+	// Apply service tier cost multiplier (ultrafast = 6x, priority = 2x, flex = 0.5x)
+	const multiplier = getCompletionsServiceTierCostMultiplier(serviceTier);
+	if (multiplier !== 1) {
+		usage.cost.input *= multiplier;
+		usage.cost.output *= multiplier;
+		usage.cost.cacheRead *= multiplier;
+		usage.cost.cacheWrite *= multiplier;
+	}
 	return usage;
 }
 

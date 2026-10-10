@@ -69,6 +69,9 @@
 							"supportsServiceTier": {
 								"type": "boolean"
 							},
+							"supportsUltrafastTier": {
+								"type": "boolean"
+							},
 							"supportsMultipleSystemMessages": {
 								"type": "boolean"
 							},
@@ -524,6 +527,9 @@
 										"supportsServiceTier": {
 											"type": "boolean"
 										},
+										"supportsUltrafastTier": {
+											"type": "boolean"
+										},
 										"supportsMultipleSystemMessages": {
 											"type": "boolean"
 										},
@@ -913,6 +919,9 @@
 											"type": "boolean"
 										},
 										"supportsServiceTier": {
+											"type": "boolean"
+										},
+										"supportsUltrafastTier": {
 											"type": "boolean"
 										},
 										"supportsMultipleSystemMessages": {

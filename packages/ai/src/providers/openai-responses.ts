@@ -15,6 +15,7 @@ import {
 	isKnownProvider,
 	type MessageAttribution,
 	type Model,
+	modelSupportsUltrafastTier,
 	type OpenAICompat,
 	type ProviderSessionState,
 	type ServiceTier,
@@ -491,6 +492,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 					onOutputItemDone: item => {
 						nativeOutputItems.push(structuredCloneJSON<unknown>(item) as unknown as Record<string, unknown>);
 					},
+					serviceTier: (params as unknown as Record<string, unknown>).service_tier as ServiceTier | undefined,
 				},
 			);
 			if (premiumRequestsTotal !== undefined) output.usage.premiumRequests = premiumRequestsTotal;
@@ -746,7 +748,13 @@ function buildParams(
 		stream_options: model.provider === "openai" ? { include_obfuscation: false } : undefined,
 	};
 
-	applyCommonResponsesSamplingParams(params, options, model.provider, model.compat?.supportsServiceTier === true);
+	applyCommonResponsesSamplingParams(
+		params,
+		options,
+		model.provider,
+		model.compat?.supportsServiceTier === true,
+		modelSupportsUltrafastTier(model),
+	);
 	// TODO: openai responses has no top-level `stop`/`stop_sequences`; surface via reasoning.stop?
 	// `StreamOptions.stopSequences` is intentionally dropped for this provider.
 	// TODO: openai responses has no top-level `frequency_penalty` field as of the current SDK;
