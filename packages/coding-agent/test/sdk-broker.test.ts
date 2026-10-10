@@ -49,7 +49,7 @@ import {
 	waitForChildSpawn,
 } from "../src/sdk/broker/lifecycle";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
-import { observeProcessIncarnation } from "../src/sdk/broker/process-incarnation";
+import * as processIncarnation from "../src/sdk/broker/process-incarnation";
 import { resolveSdkInternalSpawnCommand, resolveSdkInternalSpawnCommandForTest } from "../src/sdk/broker/runtime";
 import { readBrokerStartupFailureMarker, writeBrokerStartupFailureMarker } from "../src/sdk/broker/startup-failure";
 import { BROKER_RUNTIME_ABORT_CAPABILITY_FIELD } from "../src/sdk/host/control/runtime-gate";
@@ -1994,7 +1994,7 @@ describe("SDK broker identity and discovery", () => {
 			// reports such a zombie as present. Process-identity observation classifies
 			// it as absent, which is the same authority the production reap path uses.
 			expect(typeof brokerPid).toBe("number");
-			expect(observeProcessIncarnation(brokerPid!).status).toBe("absent");
+			expect(processIncarnation.observeProcessIncarnation(brokerPid!).status).toBe("absent");
 			// No owner handle leaked for the failed agent dir.
 			expect(brokerOwnerForTest(dir)).toBeUndefined();
 		} finally {
@@ -2069,7 +2069,10 @@ describe("SDK broker identity and discovery", () => {
 			},
 		});
 
-		await reapSpawnedBrokerForTest(child as unknown as ChildProcess, { gracefulMs: 1, killVerifyMs: 1 });
+		await reapSpawnedBrokerForTest(child as unknown as ChildProcess, undefined, undefined, {
+			gracefulMs: 1,
+			killVerifyMs: 1,
+		});
 
 		expect(signals).toEqual([]);
 	});
@@ -2099,7 +2102,7 @@ describe("SDK broker identity and discovery", () => {
 				return true;
 			},
 		});
-		const owner = registerBrokerOwnerForTest(dir, child as unknown as ChildProcess, {
+		const owner = registerBrokerOwnerForTest(dir, child as unknown as ChildProcess, undefined, undefined, {
 			gracefulMs: 1,
 			killVerifyMs: 1,
 		});
@@ -2169,6 +2172,47 @@ describe("SDK broker identity and discovery", () => {
 		await owner?.stop();
 		expect(brokerOwnerForTest(dir)).toBeUndefined();
 		await fs.rm(dir, { recursive: true, force: true });
+	});
+	it("adopts a reusable discovery published by a competing broker before reaping the losing spawn", async () => {
+		const dir = await temp();
+		const winner = new Broker({ agentDir: dir });
+		try {
+			const winnerDiscovery = await winner.start();
+			let hiddenReads = 0;
+			let forceAbsentObservation = false;
+			const readOriginal = brokerDiscovery.readBrokerDiscovery;
+			const observeOriginal = processIncarnation.observeProcessIncarnation;
+			const readSpy = vi.spyOn(brokerDiscovery, "readBrokerDiscovery").mockImplementation(async (agentDir, ttl) => {
+				if (agentDir === dir && hiddenReads < 2) {
+					hiddenReads += 1;
+					if (hiddenReads === 2) forceAbsentObservation = true;
+					return null;
+				}
+				if (agentDir === dir) forceAbsentObservation = false;
+				return readOriginal(agentDir, ttl);
+			});
+			const observationSpy = vi.spyOn(processIncarnation, "observeProcessIncarnation").mockImplementation(pid => {
+				if (forceAbsentObservation && pid !== winnerDiscovery.pid) {
+					forceAbsentObservation = false;
+					return { status: "absent" };
+				}
+				return observeOriginal(pid);
+			});
+			try {
+				await expect(ensureBroker({ agentDir: dir })).resolves.toMatchObject({
+					pid: winnerDiscovery.pid,
+					ownerId: winnerDiscovery.ownerId,
+				});
+				expect(hiddenReads).toBe(2);
+			} finally {
+				observationSpy.mockRestore();
+				readSpy.mockRestore();
+			}
+		} finally {
+			await brokerOwnerForTest(dir)?.stop();
+			await winner.stop();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
 	});
 	it("leaves exactly one live detached broker after concurrent process startup", async () => {
 		const dir = await temp();
