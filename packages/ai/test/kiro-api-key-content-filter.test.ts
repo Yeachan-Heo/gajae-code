@@ -1845,4 +1845,46 @@ describe("Completion event handling (probepark fix for #6451)", () => {
 		expect(textStartIdx).toBeLessThan(textEndIdx);
 		expect(textEndIdx).toBeLessThan(doneIdx);
 	});
+
+	test("incomplete JSON frame with nested object: no resync into nested (Finding #3)", async () => {
+		// Finding #3: Parser should not resync into nested objects within an incomplete outer frame.
+		// Stream incomplete frame like {"stopReason":"COMPLETED","usage": followed by EOF
+		// should error, not resync to find {inside the outer frame.
+		const emittedEvents: Array<{ type: string }> = [];
+		let errorThrown = false;
+
+		globalThis.fetch = (async () => {
+			// Incomplete outer frame: stopReason complete but usage object starts but never closes
+			const incompleteFrame = JSON.stringify({ stopReason: "COMPLETED" }).slice(0, -1) + 
+				',"usage":{"inputTokens":100'; // Incomplete, never closes
+
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					// Deliver the incomplete frame and close (EOF with incomplete data)
+					const chunk = new TextEncoder().encode(incompleteFrame);
+					controller.enqueue(chunk);
+					controller.close(); // EOF without closing the frame
+				},
+			});
+
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEvents.push({ type: event.type });
+			}
+		} catch (err) {
+			// Expect error due to incomplete JSON frame at EOF
+			errorThrown = true;
+			if (err instanceof Error) {
+				expect(err.message).toMatch(/truncated|incomplete/i);
+			}
+		}
+
+		// Verify that an error was thrown (not successful completion)
+		const errorEvent = emittedEvents.find(e => e.type === "error");
+		expect(errorThrown || errorEvent).toBeTruthy();
+	});
 });

@@ -498,38 +498,10 @@ export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[];
 		const end = findJsonEnd(buffer, start);
 		if (end < 0) {
 			// Unclosed brace at 'start'. Could be incomplete JSON waiting for more data, or junk/corruption.
-			// Resync by looking for valid JSON objects within MAX_RESCAN_DISTANCE that parse successfully.
+			// Finding #3: Do NOT resync into nested objects that might be part of the outer incomplete frame.
+			// Keep the incomplete frame as remainder for the next parse call or EOF error handling.
 			const strayBraceEnd = Math.min(start + MAX_RESCAN_DISTANCE, buffer.length);
-			let resyncPos = start + 1;
-			let found = false;
-			while (resyncPos < strayBraceEnd) {
-				const nextStart = buffer.indexOf("{", resyncPos);
-				if (nextStart < 0) break;
-
-				// Try to find the end of this candidate
-				const nextEnd = findJsonEnd(buffer, nextStart);
-				if (nextEnd >= 0) {
-					// Found a candidate that closes. Try to parse it as valid JSON.
-					try {
-						const candidate = buffer.slice(nextStart, nextEnd + 1);
-						JSON.parse(candidate);
-						// Valid JSON found. Resync to this position and continue processing.
-						pos = nextStart;
-						found = true;
-						break;
-					} catch {
-						// Not valid JSON, keep looking
-					}
-				}
-				resyncPos = nextStart + 1;
-			}
-			if (!found) {
-				// No valid JSON found within MAX_RESCAN_DISTANCE. Retain the stray brace and data up to the cap
-				// for the next parse call. Enforce the MAX_RESCAN_DISTANCE cap to prevent unbounded buffering.
-				return { events, remaining: buffer.slice(start, start + MAX_RESCAN_DISTANCE) };
-			}
-			// Loop will continue with the resynced pos
-			continue;
+			return { events, remaining: buffer.slice(start, strayBraceEnd) };
 		}
 
 		let parsed: Record<string, unknown> | undefined;
