@@ -1227,6 +1227,8 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 											});
 										}
 									}
+									// Finding #4: Emit text_end for confirmed text before error
+									stream.push({ type: "text_end", contentIndex: textIndex, content: block.text, partial: output });
 								}
 								textStartDeferred = false;
 							}

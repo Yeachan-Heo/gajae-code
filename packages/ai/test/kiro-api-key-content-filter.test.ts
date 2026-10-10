@@ -1887,4 +1887,57 @@ describe("Completion event handling (probepark fix for #6451)", () => {
 		const errorEvent = emittedEvents.find(e => e.type === "error");
 		expect(errorThrown || errorEvent).toBeTruthy();
 	});
+
+	test("content + COMPLETED, then error event: text_end emitted before error (Finding #4)", async () => {
+		// Finding #4: When a server error event is received after COMPLETED,
+		// all text events including text_end should be emitted before the error.
+		const emittedEvents: Array<{ type: string }> = [];
+
+		globalThis.fetch = (async () => {
+			const eventSequence = [
+				JSON.stringify({ content: "Hello" }),
+				JSON.stringify({ stopReason: "COMPLETED" }),
+				JSON.stringify({ error: "Server error", message: "Internal server error" }),
+			];
+			let emitted = 0;
+
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					if (emitted < eventSequence.length) {
+						const chunk = new TextEncoder().encode(eventSequence[emitted]);
+						controller.enqueue(chunk);
+						emitted++;
+					} else {
+						controller.close();
+					}
+				},
+			});
+
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEvents.push({ type: event.type });
+			}
+		} catch {
+			// Stream error handling
+		}
+
+		// Verify event sequence includes text_end before error
+		const eventTypes = emittedEvents.map(e => e.type);
+		const hasTextStart = eventTypes.includes("text_start");
+		const hasTextEnd = eventTypes.includes("text_end");
+		const hasError = eventTypes.includes("error");
+
+		expect(hasTextStart).toBe(true); // text_start should be emitted
+		expect(hasTextEnd).toBe(true); // text_end should be emitted before error
+		expect(hasError).toBe(true); // error event follows
+
+		// Verify order: text_end comes before error
+		const textEndIdx = eventTypes.indexOf("text_end");
+		const errorIdx = eventTypes.indexOf("error");
+		expect(textEndIdx).toBeLessThan(errorIdx);
+	});
 });
