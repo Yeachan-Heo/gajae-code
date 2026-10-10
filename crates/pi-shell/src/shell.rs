@@ -3524,6 +3524,33 @@ mod tests {
 
 	#[cfg(unix)]
 	#[tokio::test(flavor = "multi_thread")]
+	async fn execute_shell_length_and_substring_count_characters() {
+		// The repro from #6544; expected values are GNU bash 5.3 in a UTF-8 locale.
+		let (stdout_tx, mut stdout_rx) = mpsc::unbounded_channel::<Bytes>();
+		let options = ShellExecuteOptions {
+			command: "v='caf\u{e9}'; k='\u{c6d0}\u{b798}'; a=('\u{c6d0}\u{b798}' x); echo \"${#v} \
+			          ${#k} [${v: -1}] [${v: -2}] [${k: -1}] [${k:0:-1}] ${#a[0]}\""
+				.to_string(),
+			..Default::default()
+		};
+		let streams = StreamSinks { stdout: Some(stdout_tx), stderr: None };
+		let result = execute_shell_streams(options, streams, CancelToken::default())
+			.await
+			.expect("execute should succeed");
+		assert_eq!(result.exit_code, Some(0));
+
+		let mut stdout = Vec::new();
+		while let Some(chunk) = stdout_rx.recv().await {
+			stdout.extend_from_slice(&chunk);
+		}
+		assert_eq!(
+			String::from_utf8(stdout).unwrap(),
+			"4 2 [\u{e9}] [f\u{e9}] [\u{b798}] [\u{c6d0}] 2\n"
+		);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
 	async fn execute_shell_streams_works_when_sinks_are_none() {
 		// Both sinks `None` — pipes must still drain so the child can exit.
 		let options = ShellExecuteOptions {

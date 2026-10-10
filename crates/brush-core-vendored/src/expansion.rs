@@ -279,11 +279,9 @@ impl ExpansionPiece {
 		}
 	}
 
-	const fn len(&self) -> usize {
-		match self {
-			Self::Unsplittable(s) => s.len(),
-			Self::Splittable(s) => s.len(),
-		}
+	/// Length in characters, not UTF-8 bytes, to match `polymorphic_subslice`.
+	fn len(&self) -> usize {
+		self.as_str().chars().count()
 	}
 
 	fn make_unsplittable(self) -> Self {
