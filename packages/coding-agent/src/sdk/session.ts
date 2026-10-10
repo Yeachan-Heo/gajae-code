@@ -162,6 +162,7 @@ import {
 } from "../runtime-mcp";
 import { createMCPFormInputHandler } from "../runtime-mcp/elicitation";
 import type { MCPLoadResult } from "../runtime-mcp/manager";
+import { omitPluginMcpNameShadows, survivingPluginMcpToolNames } from "../runtime-mcp/plugin-mcp-name-filter";
 import { MCP_STARTUP_WAIT_GRACE_MS } from "../runtime-mcp/startup-policy";
 import type { MCPServerConfig } from "../runtime-mcp/types";
 import {
@@ -2814,9 +2815,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						for (const tool of result.tools) {
 							const serverName = tool.mcpServerName;
 							if (serverName === undefined) continue;
-							if (pluginNames.has(serverName)) pluginMcpToolNames.push(tool.name);
-							else conventionalMcpToolNames.push(tool.name);
+							if (!pluginNames.has(serverName)) conventionalMcpToolNames.push(tool.name);
 						}
+						pluginMcpToolNames.push(...survivingPluginMcpToolNames(result.tools as CustomTool[]));
 					}
 				} catch (error) {
 					logger.warn("Failed to recreate MCP authority after session rescope", {
@@ -3940,7 +3941,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const inlineExtensions: ExtensionFactory[] = [...(options.extensions ?? [])];
 		const discoveredHookExtensions: Array<{ factory: ExtensionFactory; name: string }> = [];
 		if (customTools.length > 0) {
-			inlineExtensions.push(createCustomToolsExtension(customTools));
+			inlineExtensions.push(createCustomToolsExtension(omitPluginMcpNameShadows(customTools)));
 		}
 		if (!options.disableExtensionDiscovery) {
 			try {
@@ -4919,6 +4920,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 			}
 		}
+		// Mandatory names follow the plugin tools that survived registration.
+		// A colliding user tool keeps the normalized name and must stay selectable.
+		pluginMcpToolNames.splice(0, pluginMcpToolNames.length, ...survivingPluginMcpToolNames(customTools));
 		const mandatoryMCPToolNameSet = new Set(pluginMcpToolNames);
 		const selectableExplicitMCPToolNames = explicitlyRequestedMCPToolNames.filter(
 			name => !mandatoryMCPToolNameSet.has(name),
@@ -5745,14 +5749,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						const previousNames = ownedMcpManagerToolNames;
 						const nextToolNames = nextTools.map(tool => tool.name);
 						const previousSet = new Set(previousNames);
-						const nextPluginToolNames = nextTools
-							.filter(tool => tool.mcpServerName && pluginServerNames.has(tool.mcpServerName))
-							.map(tool => tool.name);
+						const survivingPluginNames = survivingPluginMcpToolNames(nextTools);
+						const survivingPluginNameSet = new Set(survivingPluginNames);
+						const visibleToolNames = new Set(omitPluginMcpNameShadows(nextTools).map(tool => tool.name));
+						const nextPluginToolNames = survivingPluginNames;
 						const nextConventionalToolNames = nextTools
 							.filter(tool => tool.mcpServerName && conventionalServerNames.has(tool.mcpServerName))
 							.map(tool => tool.name);
 						const nextMandatoryMcpToolNames = [
-							...pluginMcpToolNames.filter(name => !previousSet.has(name)),
+							...pluginMcpToolNames.filter(
+								name =>
+									!previousSet.has(name) && (!visibleToolNames.has(name) || survivingPluginNameSet.has(name)),
+							),
 							...nextPluginToolNames,
 						];
 						const nextConventionalMcpToolNames = [
@@ -5865,9 +5873,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						const previousNames = inheritedMcpManagerToolNames;
 						const nextNames = snapshot.map(tool => tool.name);
 						const classifiedTools = classifyInheritedMcpToolNames(manager, snapshot);
+						const mandatoryPluginToolNames = survivingPluginMcpToolNames(snapshot);
 						try {
 							await session.replaceNamedCustomTools(previousNames, snapshot, {
-								mandatoryMCPToolNames: classifiedTools.pluginMcpToolNames,
+								mandatoryMCPToolNames: mandatoryPluginToolNames,
 								activateNewTools: false,
 							});
 						} catch (error) {
@@ -5875,7 +5884,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							throw error;
 						}
 						inheritedMcpManagerToolNames = nextNames;
-						pluginMcpToolNames.splice(0, pluginMcpToolNames.length, ...classifiedTools.pluginMcpToolNames);
+						pluginMcpToolNames.splice(0, pluginMcpToolNames.length, ...mandatoryPluginToolNames);
 						conventionalMcpToolNames.splice(
 							0,
 							conventionalMcpToolNames.length,
