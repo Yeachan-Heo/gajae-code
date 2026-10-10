@@ -104,14 +104,21 @@ function tokenize(command: string): Token[] {
 			const newWrapper = COMMAND_WRAPPERS_WITH_ARGS[text];
 			const isBuiltinWrapper = COMMAND_WRAPPERS.has(text);
 
-			if (isAssignment(text) || CONTROL_WORDS.has(text)) {
-				// Assignments and control words reset wrapper state (but not if we're already in a wrapper)
+			if (CONTROL_WORDS.has(text)) {
+				// Control words reset wrapper state (but not if we're already in a wrapper)
 				if (!wrapperCommand) {
 					wrapperCommand = undefined;
 					skipNextArg = false;
 					positionalsPending = 0;
 				}
 				atCommandStart = true;
+			} else if (isAssignment(text)) {
+				// Assignments at command start
+				if (!wrapperCommand) {
+					// Not in a wrapper - this is a simple assignment at command start
+					atCommandStart = true;
+				}
+				// If in a wrapper, keep wrapper active and don't change atCommandStart
 			} else if (newWrapper) {
 				// Track this wrapper for its arguments
 				wrapperCommand = { name: text, spec: newWrapper };
@@ -148,7 +155,8 @@ function tokenize(command: string): Token[] {
 			} else if (isAssignment(text) && wrapperCommand) {
 				// In a wrapper, assignments are arguments, not wrapped commands
 				// Keep wrapper mode active for nested wrappers like 'env sudo -E tmux ...'
-			} else if (wrapperCommand && !text.startsWith("-")) {
+				commandStart = false;
+			} else if (wrapperCommand && !text.startsWith("-") && !isAssignment(text)) {
 				// We're in a wrapper and this is not an option or assignment
 				// Check if this is itself a wrapper (nested wrappers like 'env sudo')
 				const nestedWrapper = COMMAND_WRAPPERS_WITH_ARGS[text];
@@ -227,7 +235,9 @@ function tokenize(command: string): Token[] {
 			const nextChar = command[index + 1];
 			if (!nextChar || /\s/.test(nextChar) || isSeparator(nextChar)) {
 				// This option is complete; check if it takes an argument
-				if (wrapperCommand.spec.optionsWithArg.has(text)) {
+				// Flag-only options don't consume the next argument
+				const isFlagOnly = wrapperCommand.spec.flagOnlyOptions?.has(text) ?? false;
+				if (!isFlagOnly && wrapperCommand.spec.optionsWithArg.has(text)) {
 					skipNextArg = true;
 				}
 			}
@@ -306,6 +316,8 @@ function collectShellPayloads(tokens: Token[]): string[] {
 		// - bash -c 'payload'
 		// - bash -ce 'payload' (bundled option)
 		// - bash -c -e 'payload' (separate options)
+		// - bash -O extglob -c 'payload' (shopt with operand)
+		// - bash -o pipefail -c 'payload' (shopt with operand)
 		// POSIX shells stop option parsing at the first non-option argument,
 		// so after we see a non-option word (script name), any flags are arguments to that script.
 
@@ -332,6 +344,12 @@ function collectShellPayloads(tokens: Token[]): string[] {
 				continue;
 			}
 
+			// Handle options with bundled operands (e.g., -Oextglob, -opipefail)
+			if ((word.startsWith("-O") && word.length > 2) || (word.startsWith("-o") && word.length > 2)) {
+				// The operand is bundled with the option, so skip this and check the next word for -c
+				continue;
+			}
+
 			// Check for -c option (standalone or bundled like -ce, -ec, etc.)
 			if (word === "-c" || (word.startsWith("-") && word.includes("c"))) {
 				// Found a -c option (or an option containing c)
@@ -348,6 +366,13 @@ function collectShellPayloads(tokens: Token[]): string[] {
 						// Check if this option takes an argument
 						if (optionsWithArg.has(payloadWord)) {
 							payloadCursor++; // Skip the argument
+						}
+						// Handle options with bundled operands (e.g., -Oextglob)
+						if (
+							(payloadWord.startsWith("-O") && payloadWord.length > 2) ||
+							(payloadWord.startsWith("-o") && payloadWord.length > 2)
+						) {
+							// The operand is bundled with the option, no need to skip
 						}
 						continue;
 					}
@@ -440,11 +465,6 @@ function isCommandLookup(tokens: Token[], targetIndex: number): boolean {
 		// Found a "command" token, look for -v or -V after it
 		let lookupFlagIdx = -1;
 		for (let i = commandIdx + 1; i < targetIndex; i++) {
-			// Stop if we hit another command start (command boundary) before the target
-			// This means the target is in a different command invocation
-			if (tokens[i].commandStart && i < targetIndex - 1) {
-				break;
-			}
 			const token = tokens[i].text;
 			if (token === "-v" || token === "-V") {
 				lookupFlagIdx = i;
@@ -453,14 +473,28 @@ function isCommandLookup(tokens: Token[], targetIndex: number): boolean {
 		}
 
 		// If we found the lookup flag, check if the target is the next non-option word
+		// within the same command (not after a separator)
 		if (lookupFlagIdx >= 0) {
-			// Find the wrapped command (first non-option, non-assignment after the lookup flag)
-			for (let i = lookupFlagIdx + 1; i < tokens.length; i++) {
-				// If we hit another command start, we've gone past the wrapped command
-				if (tokens[i].commandStart && i !== targetIndex) {
+			// Check if there's a separator between the lookup flag and the target
+			let hasSeparatorInBetween = false;
+			for (let sep = lookupFlagIdx + 1; sep < targetIndex; sep++) {
+				if (tokens[sep].commandStart && isSeparator(tokens[sep].text)) {
+					hasSeparatorInBetween = true;
 					break;
 				}
+			}
+			if (hasSeparatorInBetween) {
+				// Target is after a separator, so it's not part of the lookup
+				continue;
+			}
+
+			// Find the wrapped command (first non-option, non-assignment after the lookup flag)
+			for (let i = lookupFlagIdx + 1; i < tokens.length; i++) {
 				const word = tokens[i].text;
+				// Stop at any separator
+				if (isSeparator(word)) {
+					break;
+				}
 				// Skip options and assignments
 				if (word.startsWith("-") || isAssignment(word)) {
 					continue;
