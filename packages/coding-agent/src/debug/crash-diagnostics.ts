@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { canonicalEnvKey, isEnoent, projectEnvSnapshot, redactCrashSecrets } from "@gajae-code/utils";
 
 const CRASH_DIAGNOSTICS_ENV = "GJC_CRASH_DIAGNOSTICS";
 const CRASH_DIAGNOSTICS_DIR_ENV = "GJC_CRASH_DIAGNOSTICS_DIR";
@@ -64,8 +65,27 @@ export function crashDiagnosticsEnabled(env: NodeJS.ProcessEnv = process.env): b
 	return value === "1" || value === "true" || value === "yes";
 }
 
-export function getCrashDiagnosticsDirectory(env: NodeJS.ProcessEnv = process.env): string {
-	return env[CRASH_DIAGNOSTICS_DIR_ENV] ?? path.join(os.tmpdir(), "gjc-crash-diagnostics");
+/** Directory whose dotenv Bun had already loaded when this module was evaluated. */
+const environmentSourceCwd = process.cwd();
+
+function projectDeclaresEnv(envSourceCwd: string, name: string, value: string): boolean {
+	const snapshot = projectEnvSnapshot(envSourceCwd);
+	const key = canonicalEnvKey(name);
+	// A declaration Bun would expand is still a project declaration. The live
+	// value cannot be compared with the literal text.
+	if (snapshot.dynamic.has(key)) return true;
+	const declared = snapshot.values[key];
+	if (declared === undefined) return false;
+	return declared === value;
+}
+
+export function getCrashDiagnosticsDirectory(
+	env: NodeJS.ProcessEnv = process.env,
+	envSourceCwd = environmentSourceCwd,
+): string {
+	const override = env[CRASH_DIAGNOSTICS_DIR_ENV];
+	if (override && !projectDeclaresEnv(envSourceCwd, CRASH_DIAGNOSTICS_DIR_ENV, override)) return override;
+	return path.join(os.tmpdir(), "gjc-crash-diagnostics");
 }
 
 export function classifyProcessCrash(input: CrashClassificationInput): CrashClassification {
@@ -107,7 +127,7 @@ export function classifyProcessCrash(input: CrashClassificationInput): CrashClas
 			signal,
 			command,
 			protocol,
-			reason: stringifyError(input.spawnError),
+			reason: redactCrashSecrets(stringifyError(input.spawnError)),
 		};
 	}
 	if (signal) {
@@ -160,17 +180,21 @@ export function classifyProcessCrash(input: CrashClassificationInput): CrashClas
 
 export async function writeCrashReport(
 	input: CrashClassificationInput,
-	options: { cwd?: string; env?: NodeJS.ProcessEnv; now?: Date } = {},
+	options: { cwd?: string; env?: NodeJS.ProcessEnv; envSourceCwd?: string; now?: Date } = {},
 ): Promise<CrashReportWriteResult> {
 	const classification = classifyProcessCrash(input);
+	const reportCwd = options.cwd ?? process.cwd();
+	// Bun loads dotenv from the cwd at startup. A later `chdir` (`/move`) and a Bash
+	// child cwd keep that provenance instead of treating the inherited value as external.
+	const envSourceCwd = options.envSourceCwd ?? environmentSourceCwd;
 	const report: CrashReport = {
 		schemaVersion: 1,
 		createdAt: (options.now ?? new Date()).toISOString(),
 		pid: process.pid,
-		cwd: options.cwd ?? process.cwd(),
+		cwd: reportCwd,
 		...classification,
-		stderrPreview: input.stderr ? trimStartBytes(input.stderr, STDERR_PREVIEW_BYTES) : undefined,
-		spawnError: input.spawnError === undefined ? undefined : stringifyError(input.spawnError),
+		stderrPreview: input.stderr ? trimStartBytes(redactCrashSecrets(input.stderr), STDERR_PREVIEW_BYTES) : undefined,
+		spawnError: input.spawnError === undefined ? undefined : redactCrashSecrets(stringifyError(input.spawnError)),
 	};
 	const enabled = crashDiagnosticsEnabled(options.env);
 
@@ -179,7 +203,7 @@ export async function writeCrashReport(
 	}
 
 	try {
-		const dir = getCrashDiagnosticsDirectory(options.env);
+		const dir = getCrashDiagnosticsDirectory(options.env, envSourceCwd);
 		await ensurePrivateDiagnosticsDirectory(dir);
 		const filename = `${report.createdAt.replace(/[:.]/g, "-")}-${report.kind}-${report.class}-${process.pid}.json`;
 		const reportPath = path.join(dir, filename);
@@ -197,7 +221,17 @@ export function formatCrashDiagnosticNotice(result: CrashReportWriteResult): str
 }
 
 async function ensurePrivateDiagnosticsDirectory(dir: string): Promise<void> {
+	try {
+		if ((await fs.lstat(dir)).isSymbolicLink()) {
+			throw new Error("Refusing to use a symlink as the crash diagnostics directory");
+		}
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+	}
 	await fs.mkdir(dir, { recursive: true, mode: DIRECTORY_MODE });
+	if ((await fs.lstat(dir)).isSymbolicLink()) {
+		throw new Error("Refusing to use a symlink as the crash diagnostics directory");
+	}
 	await fs.chmod(dir, DIRECTORY_MODE);
 }
 

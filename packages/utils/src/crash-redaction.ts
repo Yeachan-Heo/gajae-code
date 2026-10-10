@@ -8,14 +8,26 @@
  */
 
 /**
+ * A retained stderr tail drops the `Bearer` / `Basic` / `Token` marker once the
+ * body fills the tail, so the marker rule never matches. The body then starts
+ * the text. 4096 is the persisted stderr preview; a shorter leading identifier
+ * stays, and a long run later in the text stays too.
+ */
+const RETAINED_BEARER_BODY = /^\s*[A-Za-z0-9._~+/=-]{4096,}/;
+
+/**
  * Scrub credential material from crash text before it is persisted.
  * Covers bearer/basic-style headers, key=value or JSON key forms of common
  * credential names, and well-known vendor token shapes. Normal messages and
  * stack frames are untouched; matches are replaced in place so surrounding
- * diagnostic context survives.
+ * diagnostic context survives. A retained tail that starts with a long bearer
+ * body is scrubbed too, because the tail slice can drop the marker first.
  */
 export function redactCrashSecrets(text: string): string {
 	let redacted = text;
+	// Before the other rules. An `sk-` or similar prefix inside a retained bearer
+	// body would otherwise rewrite the start and hide the rest of that body.
+	redacted = redacted.replace(RETAINED_BEARER_BODY, "«redacted-auth»");
 	redacted = redacted.replace(/\b(?:Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "«redacted-auth»");
 	redacted = redacted.replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, "«redacted-jwt»");
 	redacted = redacted.replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, "«redacted-api-key»");

@@ -9,7 +9,7 @@ export { filterProcessEnv, isSafeEnvName, isSafeEnvValue } from "./spawn-env";
 import { parseEnvFile, parseEnvFileContent, parseShellEnvFile } from "./env-file";
 
 // Re-exported so the public surface of this module is unchanged.
-export { isValidEnvName, parseEnvFile, parseShellEnvFile } from "./env-file";
+export { isValidEnvName, parseEnvFile, parseShellEnvFile, projectEnvSnapshot } from "./env-file";
 
 function loadProjectEnv(): { values: Record<string, string>; dynamic: Set<string> } {
 	const cwd = process.cwd();
