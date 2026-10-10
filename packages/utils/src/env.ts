@@ -198,17 +198,16 @@ const PROJECT_DENIED_ENV_NAMES = ["NODE_TLS_REJECT_UNAUTHORIZED"] as const;
 
 // Bun may have loaded cwd/.env before JS runs. Drop a value the project declares
 // (same provenance rule as the credential snapshot) and never copy it below.
+// Only delete if the value came from the project's dynamic env (e.g., explicitly declared in .env).
+// If the value is inherited from the shell, preserve it even if it matches the project declaration.
 // Bun reads this switch per TLS connection, so removing it here restores
 // verification for every connection the process opens afterwards.
 for (const name of PROJECT_DENIED_ENV_NAMES) {
 	const key = canonicalEnvKey(name);
 	const declared = projectEnv[key];
 	if (declared === undefined) continue;
-	const runtime = Bun.env[name];
-	if (
-		runtime !== undefined &&
-		(projectSnapshot.dynamic.has(key) || runtime === declared || runtime.trim() === declared)
-	) {
+	// Only delete if this value came from the project's dynamic set
+	if (projectSnapshot.dynamic.has(key)) {
 		delete Bun.env[name];
 	}
 }

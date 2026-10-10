@@ -19,31 +19,37 @@ const MAX_INDIRECTION_DEPTH = 4;
 interface WrapperSpec {
 	// Option flags that take exactly one argument (e.g., "-u NAME")
 	optionsWithArg: Set<string>;
+	// Flag-only options that do not consume the next argument (e.g., sudo "-s", "-i")
+	flagOnlyOptions?: Set<string>;
 	// Special positional argument handling (e.g., timeout takes a DURATION)
 	hasPositionalArg?: boolean;
 }
 
 const COMMAND_WRAPPERS_WITH_ARGS: Record<string, WrapperSpec> = {
-	"env": {
+	env: {
 		optionsWithArg: new Set(["-u", "-C", "-S"]),
 	},
-	"sudo": {
-		optionsWithArg: new Set(["-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U", "-T", "-s", "-i"]),
+	sudo: {
+		optionsWithArg: new Set(["-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U", "-T"]),
+		flagOnlyOptions: new Set(["-s", "-i"]),
 	},
-	"timeout": {
+	timeout: {
+		optionsWithArg: new Set(["-s", "-v"]), // timeout supports -s SIGNAL and -v VERBOSE
 		hasPositionalArg: true, // timeout DURATION command
 	},
-	"nice": {
+	nice: {
 		optionsWithArg: new Set(["-n"]),
 	},
-	"xargs": {
-		optionsWithArg: new Set(["-E", "-I", "-J", "-L", "-n", "-P", "-R", "-s", "-t", "-x", "-d", "-0"]),
+	xargs: {
+		optionsWithArg: new Set(["-E", "-I", "-J", "-L", "-n", "-P", "-R", "-d"]),
+		flagOnlyOptions: new Set(["-s", "-t", "-x", "-0"]),
 	},
-	"stdbuf": {
+	stdbuf: {
 		optionsWithArg: new Set(["-i", "-o", "-e"]),
 	},
-	"setsid": {
-		optionsWithArg: new Set(["-c", "-w"]),
+	setsid: {
+		optionsWithArg: new Set(),
+		flagOnlyOptions: new Set(["-c", "-w"]),
 	},
 };
 
@@ -99,10 +105,12 @@ function tokenize(command: string): Token[] {
 			const isBuiltinWrapper = COMMAND_WRAPPERS.has(text);
 
 			if (isAssignment(text) || CONTROL_WORDS.has(text)) {
-				// Assignments and control words reset wrapper state
-				wrapperCommand = undefined;
-				skipNextArg = false;
-				positionalsPending = 0;
+				// Assignments and control words reset wrapper state (but not if we're already in a wrapper)
+				if (!wrapperCommand) {
+					wrapperCommand = undefined;
+					skipNextArg = false;
+					positionalsPending = 0;
+				}
 				atCommandStart = true;
 			} else if (newWrapper) {
 				// Track this wrapper for its arguments
@@ -137,11 +145,34 @@ function tokenize(command: string): Token[] {
 			} else if (positionalsPending > 0) {
 				// This is a positional argument like timeout's DURATION
 				positionalsPending--;
+			} else if (isAssignment(text) && wrapperCommand) {
+				// In a wrapper, assignments are arguments, not wrapped commands
+				// Keep wrapper mode active for nested wrappers like 'env sudo -E tmux ...'
 			} else if (wrapperCommand && !text.startsWith("-")) {
-				// We're in a wrapper and this is not an option - it's the wrapped command
-				wrapperCommand = undefined;
-				skipNextArg = false;
-				commandStart = true; // The wrapped command is a command start
+				// We're in a wrapper and this is not an option or assignment
+				// Check if this is itself a wrapper (nested wrappers like 'env sudo')
+				const nestedWrapper = COMMAND_WRAPPERS_WITH_ARGS[text];
+				const isNestedBuiltinWrapper = COMMAND_WRAPPERS.has(text);
+
+				if (nestedWrapper) {
+					// Nested wrapper found - set it up as the new wrapper
+					wrapperCommand = { name: text, spec: nestedWrapper };
+
+					skipNextArg = false;
+					positionalsPending = nestedWrapper.hasPositionalArg ? 1 : 0;
+					commandStart = true; // The wrapper itself is still a command start
+				} else if (isNestedBuiltinWrapper) {
+					// Nested built-in wrapper found
+					wrapperCommand = { name: text, spec: { optionsWithArg: new Set() } };
+					skipNextArg = false;
+					positionalsPending = 0;
+					commandStart = true; // The wrapper itself is still a command start
+				} else {
+					// Not a wrapper - this is the final wrapped command
+					wrapperCommand = undefined;
+					skipNextArg = false;
+					commandStart = true; // The wrapped command is a command start
+				}
 			}
 		}
 
@@ -263,6 +294,9 @@ function targetFromArgs(args: string[]): string | undefined {
 
 function collectShellPayloads(tokens: Token[]): string[] {
 	const payloads: string[] = [];
+	// Options that take an argument for bash/sh/similar shells
+	const optionsWithArg = new Set(["-O", "-o"]); // bash -O extglob, bash -o pipefail, etc.
+
 	for (let index = 0; index < tokens.length; index++) {
 		const token = tokens[index];
 		if (!token.commandStart || !SHELL_RUNNERS.has(token.text)) continue;
@@ -275,27 +309,46 @@ function collectShellPayloads(tokens: Token[]): string[] {
 		// POSIX shells stop option parsing at the first non-option argument,
 		// so after we see a non-option word (script name), any flags are arguments to that script.
 
-		let seenOperand = false;
+		let skipNextArg = false;
 
 		for (let cursor = index + 1; cursor < tokens.length && !tokens[cursor].commandStart; cursor++) {
 			const word = tokens[cursor].text;
 
+			// If the previous option takes an argument, skip this word
+			if (skipNextArg) {
+				skipNextArg = false;
+				continue;
+			}
+
 			// Once we see a non-option word (not starting with -), that's the script name.
 			// Any further flags are arguments to that script, not shell options.
 			if (!word.startsWith("-")) {
-				seenOperand = true;
 				break; // Stop scanning for -c after the first operand
+			}
+
+			// Check if this option takes an argument (e.g., -O, -o for bash)
+			if (optionsWithArg.has(word)) {
+				skipNextArg = true;
+				continue;
 			}
 
 			// Check for -c option (standalone or bundled like -ce, -ec, etc.)
 			if (word === "-c" || (word.startsWith("-") && word.includes("c"))) {
 				// Found a -c option (or an option containing c)
 				// The payload is the next non-option word
-				for (let payloadCursor = cursor + 1; payloadCursor < tokens.length && !tokens[payloadCursor].commandStart; payloadCursor++) {
+				for (
+					let payloadCursor = cursor + 1;
+					payloadCursor < tokens.length && !tokens[payloadCursor].commandStart;
+					payloadCursor++
+				) {
 					const payloadWord = tokens[payloadCursor].text;
 
-					// Skip over any other options
+					// Skip over any other options or their arguments
 					if (payloadWord.startsWith("-")) {
+						// Check if this option takes an argument
+						if (optionsWithArg.has(payloadWord)) {
+							payloadCursor++; // Skip the argument
+						}
 						continue;
 					}
 
@@ -374,31 +427,47 @@ function assignedTmuxSocket(tokens: Token[], commandIndex: number): string | und
 /**
  * Check if the given index is part of a `command -v` or `command -V` lookup.
  * Such invocations are not executions, so tmux commands within them don't run.
+ * The target token must be the actual command being looked up, not a subsequent command after a separator.
  */
 function isCommandLookup(tokens: Token[], targetIndex: number): boolean {
 	// Backtrack through all tokens to find if we're in a `command -v` sequence
-	// Look for the pattern: command -v/V ... target
+	// Look for the pattern: command -v/V TARGET, where TARGET is the direct command being looked up
 	for (let commandIdx = 0; commandIdx < targetIndex; commandIdx++) {
 		if (!tokens[commandIdx].commandStart || tokens[commandIdx].text !== "command") {
 			continue;
 		}
 
-		// Found a "command" token, look for -v or -V after it and before the target
-		let hasLookupFlag = false;
+		// Found a "command" token, look for -v or -V after it
+		let lookupFlagIdx = -1;
 		for (let i = commandIdx + 1; i < targetIndex; i++) {
-			const token = tokens[i].text;
-			if (token === "-v" || token === "-V") {
-				hasLookupFlag = true;
+			// Stop if we hit another command start (command boundary) before the target
+			// This means the target is in a different command invocation
+			if (tokens[i].commandStart && i < targetIndex - 1) {
 				break;
 			}
-			// Stop if we hit another command start before finding -v/-V
-			if (tokens[i].commandStart) {
+			const token = tokens[i].text;
+			if (token === "-v" || token === "-V") {
+				lookupFlagIdx = i;
 				break;
 			}
 		}
 
-		if (hasLookupFlag) {
-			return true;
+		// If we found the lookup flag, check if the target is the next non-option word
+		if (lookupFlagIdx >= 0) {
+			// Find the wrapped command (first non-option, non-assignment after the lookup flag)
+			for (let i = lookupFlagIdx + 1; i < tokens.length; i++) {
+				// If we hit another command start, we've gone past the wrapped command
+				if (tokens[i].commandStart && i !== targetIndex) {
+					break;
+				}
+				const word = tokens[i].text;
+				// Skip options and assignments
+				if (word.startsWith("-") || isAssignment(word)) {
+					continue;
+				}
+				// This is the wrapped command; check if it matches the target
+				return i === targetIndex;
+			}
 		}
 	}
 

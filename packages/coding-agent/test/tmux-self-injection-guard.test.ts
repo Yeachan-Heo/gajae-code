@@ -151,27 +151,23 @@ describe("tmux self-injection guard", () => {
 		});
 
 		it("should block nice wrapper with -n option", async () => {
-			await expect(
-				checkTmuxSelfInjection("nice -n 10 tmux send-keys -t %47 x", options),
-			).resolves.toMatchObject({
+			await expect(checkTmuxSelfInjection("nice -n 10 tmux send-keys -t %47 x", options)).resolves.toMatchObject({
 				block: true,
 			});
 		});
 
 		it("should block xargs wrapper", async () => {
-			await expect(
-				checkTmuxSelfInjection("xargs tmux send-keys -t %47 <<< x", options),
-			).resolves.toMatchObject({
+			await expect(checkTmuxSelfInjection("xargs tmux send-keys -t %47 <<< x", options)).resolves.toMatchObject({
 				block: true,
 			});
 		});
 
 		it("should block stdbuf wrapper", async () => {
-			await expect(
-				checkTmuxSelfInjection("stdbuf -o line tmux send-keys -t %47 x", options),
-			).resolves.toMatchObject({
-				block: true,
-			});
+			await expect(checkTmuxSelfInjection("stdbuf -o line tmux send-keys -t %47 x", options)).resolves.toMatchObject(
+				{
+					block: true,
+				},
+			);
 		});
 
 		it("should block setsid wrapper", async () => {
@@ -184,25 +180,19 @@ describe("tmux self-injection guard", () => {
 	// Tests for bundled shell options (issue #6563)
 	describe("bundled shell options", () => {
 		it("should block bash with bundled -ce option", async () => {
-			await expect(
-				checkTmuxSelfInjection("bash -ce 'tmux send-keys -t %47 x'", options),
-			).resolves.toMatchObject({
+			await expect(checkTmuxSelfInjection("bash -ce 'tmux send-keys -t %47 x'", options)).resolves.toMatchObject({
 				block: true,
 			});
 		});
 
 		it("should block bash with bundled -ec option", async () => {
-			await expect(
-				checkTmuxSelfInjection("bash -ec 'tmux send-keys -t %47 x'", options),
-			).resolves.toMatchObject({
+			await expect(checkTmuxSelfInjection("bash -ec 'tmux send-keys -t %47 x'", options)).resolves.toMatchObject({
 				block: true,
 			});
 		});
 
 		it("should block bash with separate -c and -e options", async () => {
-			await expect(
-				checkTmuxSelfInjection("bash -c -e 'tmux send-keys -t %47 x'", options),
-			).resolves.toMatchObject({
+			await expect(checkTmuxSelfInjection("bash -c -e 'tmux send-keys -t %47 x'", options)).resolves.toMatchObject({
 				block: true,
 			});
 		});
@@ -226,9 +216,7 @@ describe("tmux self-injection guard", () => {
 	// Tests for must-stay-allowed cases (issue #6563)
 	describe("must-stay-allowed cases", () => {
 		it("should allow env -u tmux where tmux is the unset variable", async () => {
-			await expect(
-				checkTmuxSelfInjection("env -u tmux send-keys -t %47 x", options),
-			).resolves.toEqual({
+			await expect(checkTmuxSelfInjection("env -u tmux send-keys -t %47 x", options)).resolves.toEqual({
 				block: false,
 			});
 		});
@@ -255,12 +243,113 @@ describe("tmux self-injection guard", () => {
 
 		it("should allow quoted text sent to different pane", async () => {
 			await expect(
-				checkTmuxSelfInjection(
-					'tmux send-keys -t %99 "echo \'; tmux send-keys -t %47\'"',
-					options,
-				),
+				checkTmuxSelfInjection("tmux send-keys -t %99 \"echo '; tmux send-keys -t %47'\"", options),
 			).resolves.toEqual({
 				block: false,
+			});
+		});
+	});
+
+	// Regression tests for fix-pr-6564 blocking issues
+	describe("regression: lookup suppression boundary (issue #6564-1)", () => {
+		it("should block tmux after command -v sh with separator", async () => {
+			// Issue: lookup suppression survived simple-command boundary
+			// In `command -v sh; tmux send-keys -t %47 x`, the earlier `-v` should not suppress the tmux check
+			await expect(checkTmuxSelfInjection("command -v sh; tmux send-keys -t %47 x", options)).resolves.toMatchObject(
+				{
+					block: true,
+				},
+			);
+		});
+
+		it("should block tmux after command -v sh with pipeline", async () => {
+			// Pipeline is also a separator
+			await expect(
+				checkTmuxSelfInjection("command -v sh | tmux send-keys -t %47 x", options),
+			).resolves.toMatchObject({
+				block: true,
+			});
+		});
+	});
+
+	describe("regression: env assignments with wrappers (issue #6564-2)", () => {
+		it("should block tmux after env assignment", async () => {
+			// Issue: env FOO=bar tmux send-keys -t %47 x treated FOO=bar as wrapped command
+			await expect(checkTmuxSelfInjection("env FOO=bar tmux send-keys -t %47 x", options)).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should block tmux after nested env assignments", async () => {
+			// Nested wrapper: env sudo -E tmux ...
+			await expect(
+				checkTmuxSelfInjection("env MYVAR=x sudo -E tmux send-keys -t %47 x", options),
+			).resolves.toMatchObject({
+				block: true,
+			});
+		});
+	});
+
+	describe("regression: flag-only options (issue #6564-3)", () => {
+		it("should block tmux after setsid -w (flag-only, not argument-taking)", async () => {
+			// Issue: setsid -w tmux send-keys -t %47 x treated tmux as argument to -w
+			await expect(checkTmuxSelfInjection("setsid -w tmux send-keys -t %47 x", options)).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should block tmux after setsid -c (flag-only, not argument-taking)", async () => {
+			await expect(checkTmuxSelfInjection("setsid -c tmux send-keys -t %47 x", options)).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should block tmux after sudo -s (flag-only, not argument-taking)", async () => {
+			// sudo -s starts a login shell and shouldn't consume the next arg
+			await expect(checkTmuxSelfInjection("sudo -s tmux send-keys -t %47 x", options)).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should block tmux after sudo -i (flag-only, not argument-taking)", async () => {
+			// sudo -i starts a login shell and shouldn't consume the next arg
+			await expect(checkTmuxSelfInjection("sudo -i tmux send-keys -t %47 x", options)).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should block tmux after xargs with flag-only options", async () => {
+			// xargs -0, -t, -x are flag-only options that don't consume the next argument
+			// In 'xargs -t tmux send-keys -t %47 x', tmux is executed as a command with arguments
+			await expect(checkTmuxSelfInjection("xargs -t tmux send-keys -t %47 x", options)).resolves.toMatchObject({
+				block: true, // tmux IS executed, targeting the current pane
+			});
+		});
+	});
+
+	describe("regression: shell option operands (issue #6564-4)", () => {
+		it("should block bash -O extglob -c with injection", async () => {
+			// Issue: bash -O extglob -c 'tmux send-keys -t %47 x' stopped at extglob, never checked payload
+			await expect(
+				checkTmuxSelfInjection("bash -O extglob -c 'tmux send-keys -t %47 x'", options),
+			).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should block bash -o with option name and -c with injection", async () => {
+			await expect(
+				checkTmuxSelfInjection("bash -o pipefail -c 'tmux send-keys -t %47 x'", options),
+			).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should block bash with multiple shell options", async () => {
+			await expect(
+				checkTmuxSelfInjection("bash -O extglob -o pipefail -c 'tmux send-keys -t %47 x'", options),
+			).resolves.toMatchObject({
+				block: true,
 			});
 		});
 	});
