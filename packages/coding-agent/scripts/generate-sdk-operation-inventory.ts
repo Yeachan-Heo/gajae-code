@@ -25,6 +25,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal terminal-abort fencing seam, threaded via terminalAbortSeams; not a user-facing SDK control seam",
 	"agent_session:pendingToolExecutions":
 		"internal read-only run-resource-ledger view, threaded via terminalAbortSeams so the prompt deadline can find a tool-call boundary; not a user-facing SDK control seam",
+	"agent_session:markProfileRoleOverrideManual":
+		"internal profile role-layer ownership tracking after explicit user assignments; not a user-facing SDK control seam",
 	"slash_command:routing":
 		"visual/local-only autorouting settings toggle and smart-routing panel entry, not a user-facing SDK control seam",
 	"slash_command:mcp":
@@ -79,6 +81,26 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal terminal-abort steering snapshot cleanup, not a user-facing SDK control seam",
 	"agent_session:getConfiguredModelChainState":
 		"internal model-profile transaction snapshot, not a user-facing SDK control seam",
+	"agent_session:setUnavailableModelProfile":
+		"internal session-scoped startup-profile recovery marker, not a user-facing SDK control seam",
+	"agent_session:getUnavailableModelProfile":
+		"internal session-scoped startup-profile recovery status for UI rendering, not a public SDK operation",
+	"agent_session:getConfigurationPaths":
+		"internal config hot-reload path identity projection, not a user-facing SDK control seam",
+	"agent_session:validateConfiguration":
+		"internal read-only config hot-reload preflight, not an independent SDK operation",
+	"agent_session:reloadConfiguration":
+		"internal transactional config hot-reload publication, not a user-facing SDK control seam",
+	"agent_session:getProfileInstalledOverrideState":
+		"internal model-profile activation rollback snapshot, not a user-facing SDK control seam",
+	"agent_session:restoreProfileInstalledOverrideState":
+		"internal model-profile activation rollback restoration, not a user-facing SDK control seam",
+	"agent_session:prepareModelSelectionForProfileActivation":
+		"internal staged model-selection preparation for profile activation, not a user-facing SDK control seam",
+	"agent_session:commitPreparedProfileModelSelection":
+		"internal model-selection commit for profile activation, not a user-facing SDK control seam",
+	"agent_session:finishPreparedProfileModelSelection":
+		"internal post-commit model-selection refresh for profile activation, not a user-facing SDK control seam",
 	"agent_session:getDefaultFallbackRuntimeState":
 		"internal model-profile transaction snapshot, not a user-facing SDK control seam",
 	"agent_session:restoreDefaultFallbackRuntimeState":
@@ -327,10 +349,6 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal profile-derived eager delegation synchronization, not a user-facing SDK control seam",
 	"agent_session:submitUserMessage":
 		"public in-process embedder lifecycle API; direct handle surface, not an SDK transport operation",
-	"agent_session:setUnavailableModelProfile":
-		"internal session-scoped unavailable profile tracking; mutated by the session lifecycle on model-load failure, not a public SDK control seam",
-	"agent_session:getUnavailableModelProfile":
-		"internal session-scoped unavailable profile query for UI status rendering; not a public SDK operation",
 };
 /** Maps reviewed source seams to registry SDK operation IDs. */
 const SEAM_TO_SDK: Readonly<Record<string, string>> = {

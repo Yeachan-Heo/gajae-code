@@ -16,6 +16,8 @@ import {
 import { APP_NAME, adjustHsv, getAgentDir, getProjectDir, logger, postmortem, sanitizeText } from "@gajae-code/utils";
 import chalk from "chalk";
 import { AsyncJobManager } from "../async";
+import { ConfigHotReloadWatcher } from "../config/config-hot-reload";
+import { isConfigHotReloadTrusted } from "../config/config-hot-reload-trust";
 import {
 	type AppKeybinding,
 	defaultMessageQueueKeysForPlatform,
@@ -573,6 +575,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	// paint, which renders the full session anyway.
 	#initialTranscriptPainted = false;
 	#stopListeners = new Set<() => void>();
+	#configHotReload?: ConfigHotReloadWatcher;
 	#eventBus?: EventBus;
 	#eventBusUnsubscribers: Array<() => void> = [];
 	#welcomeComponent?: WelcomeComponent;
@@ -999,6 +1002,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.updateEditorChrome();
 		this.#syncEditorMaxHeight();
 		this.isInitialized = true;
+		await this.#startConfigHotReload();
+		if (this.#stopped) return;
 		this.syncActivityIndicator();
 		if (this.settings.get("tasksPane.defaultVisible")) this.showTasksPane();
 		this.#syncIrcSidebarAvailabilityFromSettings();
@@ -1691,6 +1696,57 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#stopped;
 	}
 
+	async #startConfigHotReload(): Promise<void> {
+		const paths = this.session.getConfigurationPaths();
+		if (!paths) return;
+		if (!(await isConfigHotReloadTrusted(paths))) {
+			this.showWarning(
+				"Configuration watching could not start because directory ownership and privacy could not be verified.",
+			);
+			return;
+		}
+		const assertTrustedPaths = async (): Promise<void> => {
+			if (await isConfigHotReloadTrusted(paths)) return;
+			const error = new Error("Configuration directory ownership and privacy could not be verified");
+			Object.assign(error, { code: "EACCES" });
+			throw error;
+		};
+		const watcher = new ConfigHotReloadWatcher({
+			onValidate: async candidate => {
+				await assertTrustedPaths();
+				await this.session.validateConfiguration(candidate);
+			},
+			onCandidate: async (candidate, signal) => {
+				await assertTrustedPaths();
+				const result = await this.session.reloadConfiguration(candidate, signal);
+				if (signal.aborted || this.#stopped || this.#isShuttingDown || !result.applied) return;
+				this.#selectorController.refreshConfiguration();
+				this.#syncEditorMaxHeight();
+				this.#syncIrcSidebarAvailabilityFromSettings();
+				this.updateEditorChrome();
+				this.showStatus(
+					result.settingsChanged
+						? "Configuration reloaded. Startup-only services require a restart."
+						: "Model configuration reloaded.",
+				);
+				this.ui.requestRender();
+			},
+			onError: error => {
+				if (!this.#stopped && !this.#isShuttingDown) {
+					this.showWarning(`${error.message}. Repair the configuration file and save again.`);
+				}
+			},
+		});
+		this.#configHotReload = watcher;
+		try {
+			await watcher.start(paths);
+		} catch {
+			watcher.dispose();
+			this.#configHotReload = undefined;
+			this.showWarning("Configuration watching could not start. Restart after repairing file access.");
+		}
+	}
+
 	onStop(callback: () => void): () => void {
 		if (this.#stopped) {
 			callback();
@@ -1703,6 +1759,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	stop(): void {
 		const wasInitialized = this.isInitialized;
 		this.#stopped = true;
+		this.#configHotReload?.dispose();
+		this.#configHotReload = undefined;
 		this.ui.setRenderPreparationLifecycleCallbacks(undefined);
 		this.#inputController.discardDeferredSubmission();
 		for (const listener of this.#stopListeners) {
@@ -1776,6 +1834,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 		this.#isShuttingDown = true;
+		this.#configHotReload?.dispose();
+		this.#configHotReload = undefined;
 
 		// `/btw` owns the shared composer while its panel is open. Never persist a
 		// side-chat draft or pending side-chat images into the main-session draft.

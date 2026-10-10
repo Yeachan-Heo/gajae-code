@@ -107,7 +107,10 @@ import { ensureTelegramDaemonRunningDetailed, resolveTelegramSetupPreflight } fr
 import { TelegramDaemonController } from "../../sdk/bus/telegram-daemon-control";
 import { runTelegramSetup, type TelegramSetupPreflight } from "../../sdk/bus/telegram-setup";
 import { clearPersistentPinForRemovedRows } from "../../session/account-inventory";
-import type { DefaultFallbackRuntimeState } from "../../session/agent-session";
+import type {
+	AgentSessionProfileInstalledOverrideState,
+	DefaultFallbackRuntimeState,
+} from "../../session/agent-session";
 import { CREDENTIAL_STORE_UNREADABLE_MESSAGE } from "../../session/credential-store-errors";
 import { type SessionInfo, SessionManager } from "../../session/session-manager";
 import { getTreeForInternalRead } from "../../session/session-manager-internal";
@@ -1214,6 +1217,7 @@ interface DefaultAssignmentRollbackSnapshot {
 	profileOverride: SettingValue<"modelProfile.default"> | undefined;
 	chain: { entries: readonly string[]; origin: string; identity?: string; explicitHead?: boolean } | undefined;
 	activeProfile: string | undefined;
+	profileInstalledOverrideState: AgentSessionProfileInstalledOverrideState | undefined;
 	canonicalVariant: string | undefined;
 	resumeDefaultSelector: string | undefined;
 	fallbackRuntimeState: DefaultFallbackRuntimeState;
@@ -1248,6 +1252,10 @@ function rawAutoroutingState(current: RawSettings): {
 
 export class SelectorController {
 	#smartRoutingInFlight?: Promise<unknown>;
+	#modelSelector?: ModelSelectorComponent;
+	#settingsSelector?: SettingsSelectorComponent;
+	#statusLinePreview?: Partial<StatusLineSettings>;
+	#statusLinePreviewActive = false;
 	#transcriptViewerOpen = false;
 	#transcriptViewer?: TranscriptViewerOverlay;
 	#sessionsDashboardOpen = false;
@@ -1277,6 +1285,7 @@ export class SelectorController {
 			profileOverride: this.ctx.settings.getOverride("modelProfile.default"),
 			chain: this.ctx.session.getConfiguredModelChainState("default"),
 			activeProfile: this.ctx.session.getActiveModelProfile?.(),
+			profileInstalledOverrideState: this.ctx.session.getProfileInstalledOverrideState?.(),
 			canonicalVariant: this.ctx.session.modelRegistry.getSessionCanonicalVariant?.(this.ctx.session.sessionId),
 			resumeDefaultSelector: this.ctx.session.sessionManager.buildSessionContext().models.default,
 			fallbackRuntimeState: this.ctx.session.getDefaultFallbackRuntimeState(),
@@ -1354,6 +1363,11 @@ export class SelectorController {
 			restore(() => this.ctx.session.recordResumeDefaultModel(snapshot.resumeDefaultSelector));
 		}
 		restore(() => this.ctx.session.setActiveModelProfile?.(snapshot.activeProfile));
+		if (snapshot.profileInstalledOverrideState) {
+			restore(() =>
+				this.ctx.session.restoreProfileInstalledOverrideState?.(snapshot.profileInstalledOverrideState!),
+			);
+		}
 		try {
 			await this.ctx.settings.flushOrThrow();
 		} catch (rollbackError) {
@@ -1401,7 +1415,15 @@ export class SelectorController {
 	 */
 	showSelector(create: (done: () => void) => { component: Component; focus: Component }): void {
 		if (this.ctx.isStopped?.()) return;
+		this.#modelSelector = undefined;
+		this.#settingsSelector = undefined;
+		this.#statusLinePreview = undefined;
+		this.#statusLinePreviewActive = false;
 		const done = () => {
+			this.#modelSelector = undefined;
+			this.#settingsSelector = undefined;
+			this.#statusLinePreview = undefined;
+			this.#statusLinePreviewActive = false;
 			if (this.ctx.isStopped?.()) return;
 			// Prefer the pet-aware composer restore (InteractiveMode.restoreComposer); fall back
 			// to a plain editor swap for contexts that predate it (e.g. lightweight test doubles).
@@ -1422,6 +1444,28 @@ export class SelectorController {
 		this.ctx.editorContainer.addChild(component);
 		this.ctx.ui.setFocus(focus);
 		this.ctx.ui.requestRender();
+	}
+
+	/** Refresh accepted disk configuration without discarding an open preview. */
+	refreshConfiguration(): void {
+		if (this.ctx.isStopped?.()) return;
+		this.#applyStatusLineSettings();
+		this.#modelSelector?.refreshRoleAssignments({
+			currentModel: this.ctx.session.model,
+			currentThinkingLevel: this.ctx.session.thinkingLevel,
+			activeModelProfile: this.ctx.session.getActiveModelProfile(),
+		});
+		this.#modelSelector?.refreshPresetProfiles();
+		this.#settingsSelector?.refreshFromConfiguration([...this.ctx.session.modelRegistry.getModelProfiles().keys()]);
+		this.ctx.updateEditorTopBorder();
+		this.ctx.ui.requestRender();
+	}
+
+	#applyStatusLineSettings(): void {
+		this.ctx.statusLine.updateSettings({
+			...buildStatusLineSettings(this.ctx.settings),
+			...(this.#statusLinePreviewActive ? this.#statusLinePreview : undefined),
+		});
 	}
 
 	showCommandPalette(
@@ -1990,11 +2034,19 @@ export class SelectorController {
 						},
 						onPetCommit: mode => this.ctx.commitPetPreviewMode(mode as PetMode),
 						onStatusLinePreview: previewSettings => {
-							// Update status line with preview settings
-							this.ctx.statusLine.updateSettings({
-								...buildStatusLineSettings(settings),
-								...previewSettings,
-							});
+							if (this.#statusLinePreviewActive) this.#statusLinePreview = previewSettings;
+							this.#applyStatusLineSettings();
+							this.ctx.updateEditorTopBorder();
+							this.ctx.ui.requestRender();
+						},
+						onStatusLinePreviewStart: () => {
+							this.#statusLinePreviewActive = true;
+							this.#statusLinePreview = undefined;
+						},
+						onStatusLinePreviewEnd: () => {
+							this.#statusLinePreviewActive = false;
+							this.#statusLinePreview = undefined;
+							this.#applyStatusLineSettings();
 							this.ctx.updateEditorTopBorder();
 							this.ctx.ui.requestRender();
 						},
@@ -2068,6 +2120,7 @@ export class SelectorController {
 					},
 					notificationsOperations,
 				);
+				this.#settingsSelector = selector;
 				return { component: selector, focus: selector };
 			});
 		});
@@ -2849,6 +2902,7 @@ export class SelectorController {
 								if (!materializedProfile) {
 									for (const targetRole of targetRoles) {
 										const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetRole];
+										this.ctx.session.markProfileRoleOverrideManual?.(target.settingsPath, targetRole);
 										if (target.settingsPath === "modelRoles") {
 											this.ctx.settings.setModelRole(targetRole, value);
 										} else {
@@ -2952,6 +3006,7 @@ export class SelectorController {
 							});
 							if (!materializedProfile) {
 								const target = GJC_MODEL_ASSIGNMENT_TARGETS[role];
+								this.ctx.session.markProfileRoleOverrideManual?.(target.settingsPath, role);
 								if (target.settingsPath === "modelRoles") {
 									this.ctx.settings.setModelRole(role, value);
 								} else {
@@ -2996,6 +3051,7 @@ export class SelectorController {
 					smartRoutingOnly: options?.smartRoutingOnly,
 				},
 			);
+			this.#modelSelector = modelSelector;
 			return { component: modelSelector, focus: modelSelector };
 		});
 	}

@@ -10,6 +10,7 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { ModelSelectorComponent } from "@gajae-code/coding-agent/modes/components/model-selector";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import type { AgentSessionProfileInstalledOverrideState } from "../src/session/agent-session";
 
 let testTheme = await getThemeByName("red-claw");
 
@@ -45,6 +46,16 @@ function createControllerContext() {
 	);
 	const markUserModelSelection = vi.fn();
 	const setDefaultFallbackRuntimeModel = vi.fn();
+	let activeModelProfile: string | undefined;
+	let profileInstalledOverrideState: AgentSessionProfileInstalledOverrideState = {
+		modelRoles: new Map(),
+		agentModelOverrides: new Map(),
+		installedModelRoles: new Map(),
+		installedAgentModelOverrides: new Map(),
+		manualModelRoles: new Set(),
+		manualAgentModelOverrides: new Set(),
+		preProfileModel: undefined,
+	};
 
 	const session = {
 		model: model("provider-a", "current") as Model | undefined,
@@ -82,6 +93,7 @@ function createControllerContext() {
 			options?.onMutationStarted?.();
 			this.model = nextModel;
 			if (options?.thinkingLevel) this.thinkingLevel = options.thinkingLevel;
+			this.markProfileRoleOverrideManual("modelRoles", role);
 		},
 		markUserModelSelection,
 		setModelTemporary,
@@ -112,8 +124,35 @@ function createControllerContext() {
 			exhaustedLastTurn: false,
 		}),
 		restoreDefaultFallbackRuntimeState: vi.fn(),
-		setActiveModelProfile: vi.fn(),
+		setActiveModelProfile(name: string | undefined) {
+			if (name !== activeModelProfile) {
+				profileInstalledOverrideState = {
+					...profileInstalledOverrideState,
+					manualModelRoles: new Set(),
+					manualAgentModelOverrides: new Set(),
+				};
+			}
+			activeModelProfile = name;
+		},
 		recordResumeDefaultModel: vi.fn(),
+		getProfileInstalledOverrideState: () => profileInstalledOverrideState,
+		restoreProfileInstalledOverrideState: (state: AgentSessionProfileInstalledOverrideState) => {
+			profileInstalledOverrideState = state;
+		},
+		markProfileRoleOverrideManual(path: "modelRoles" | "task.agentModelOverrides", role: string) {
+			if (activeModelProfile === undefined) return;
+			profileInstalledOverrideState = {
+				...profileInstalledOverrideState,
+				...(path === "modelRoles"
+					? { manualModelRoles: new Set([...profileInstalledOverrideState.manualModelRoles, role]) }
+					: {
+							manualAgentModelOverrides: new Set([
+								...profileInstalledOverrideState.manualAgentModelOverrides,
+								role,
+							]),
+						}),
+			};
+		},
 		sessionManager: {
 			buildSessionContext: (): { models: { default: string | undefined } } => ({
 				models: { default: "provider-a/original-default:medium" },
@@ -124,7 +163,7 @@ function createControllerContext() {
 		setThinkingLevel(thinkingLevel: ThinkingLevel) {
 			this.thinkingLevel = thinkingLevel;
 		},
-		getActiveModelProfile: () => undefined,
+		getActiveModelProfile: () => activeModelProfile,
 		isFastForProvider: () => false,
 		isFastForSubagentProvider: () => false,
 		isFastModeActive: () => false,
@@ -242,6 +281,25 @@ describe("SelectorController model batch assignments", () => {
 			"All model targets set to provider-a/selected for DEFAULT, EXECUTOR, ARCHITECT, PLANNER, CRITIC, IMAGE.",
 		);
 		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
+	});
+
+	test("failed default assignment restores profile-installed manual ownership", async () => {
+		const { ctx, session } = createControllerContext();
+		session.setModel = async (nextModel, role, options) => {
+			options?.onMutationStarted?.();
+			session.model = nextModel;
+			session.markProfileRoleOverrideManual("modelRoles", role);
+			throw new Error("post-selection synchronization failed");
+		};
+		const selector = await openReadySelector(ctx);
+		session.setActiveModelProfile("profile-a");
+
+		selectMenuAction(selector, 0);
+		await settleSelectorInput();
+
+		expect(ctx.showError).toHaveBeenCalledWith(expect.stringContaining("post-selection synchronization failed"));
+		expect(session.getActiveModelProfile()).toBe("profile-a");
+		expect(session.getProfileInstalledOverrideState().manualModelRoles).toEqual(new Set());
 	});
 
 	test("rolls back all targets when a later role setting write fails", async () => {

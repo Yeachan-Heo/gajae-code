@@ -14,16 +14,23 @@ import {
 	materializeActiveModelProfileAssignments,
 	materializeModelProfileForDeletion,
 	prepareModelProfileActivation,
+	publishPreparedModelProfileActivation,
 	resolveModelProfileDefaultChain,
 	restoreMaterializedModelProfileForDeletion,
 	rewriteSelectorForProxy,
+	rollbackPreparedModelProfileActivation,
 } from "../src/config/model-profile-activation";
 
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { BUILTIN_MODEL_PROFILES, mergeModelProfiles } from "../src/config/model-profiles";
 import { kNoAuth, ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
-import { AgentSession, type DefaultFallbackRuntimeState } from "../src/session/agent-session";
+import {
+	AgentSession,
+	type AgentSessionProfileInstalledOverrideState,
+	type DefaultFallbackRuntimeState,
+	type PreparedProfileModelSelection,
+} from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
 
@@ -242,6 +249,167 @@ describe("model profile activation", () => {
 		});
 	});
 
+	it("does not restore a captured model over a newer user selection during rollback", async () => {
+		const session = fakeSession();
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: fakeRegistry(),
+			settings: Settings.isolated(),
+			profileName: "profile-a",
+		});
+		const newerSelection = model("provider-c", "user-selection");
+		session.model = newerSelection;
+		prepared.defaultModelPublished = true;
+
+		await rollbackPreparedModelProfileActivation(prepared, { isCurrent: () => false });
+
+		expect(session.model).toBe(newerSelection);
+	});
+
+	test("does not restore fallback state after a newer selection during model rollback", async () => {
+		const restoreStarted = Promise.withResolvers<void>();
+		const allowRestore = Promise.withResolvers<void>();
+		let selectionRevision = 0;
+		let fallbackState = {
+			chain: {
+				role: "default",
+				entries: ["provider-c/default"],
+				origin: "model_selection",
+				explicitHead: true,
+			},
+			controller: {
+				activeIndex: 0,
+				attemptsUsed: 0,
+				totalAttemptsUsed: 0,
+				attemptStarted: false,
+				restoredEntryIndices: [],
+				tried: [],
+				skips: [],
+				exhaustedForTurn: false,
+			},
+			exhaustedLastTurn: false,
+		} satisfies DefaultFallbackRuntimeState;
+		const newerFallbackState = {
+			...fallbackState,
+			chain: { ...fallbackState.chain, entries: ["provider-b/executor"] },
+			controller: { ...fallbackState.controller, activeIndex: 1 },
+		};
+		const restoreFallback = vi.fn();
+		const session = Object.assign(fakeSession(), {
+			getUserModelSelectionRevision: () => selectionRevision,
+			getDefaultFallbackRuntimeState: () => fallbackState,
+			restoreDefaultFallbackRuntimeState: restoreFallback,
+			setModelTemporary: async (
+				_next: Model,
+				_thinkingLevel: ThinkingLevel | undefined,
+				options?: { shouldMutate?: () => boolean; onMutationStarted?: () => void },
+			) => {
+				if (options?.shouldMutate && !options.shouldMutate()) return;
+				options?.onMutationStarted?.();
+				throw new Error("profile model selection failed");
+			},
+			restoreModelSelectionForRollback: async (
+				_previousModel: Model | undefined,
+				_previousThinkingLevel: ThinkingLevel | undefined,
+			) => {
+				restoreStarted.resolve();
+				await allowRestore.promise;
+			},
+		});
+		const activation = await prepareModelProfileActivation({
+			session,
+			modelRegistry: fakeRegistry(),
+			settings: Settings.isolated(),
+			profileName: "profile-a",
+		});
+		let applying: Promise<void> | undefined;
+		try {
+			applying = applyPreparedModelProfileActivation(activation, {
+				isCurrent: () => selectionRevision === 0,
+			});
+			await restoreStarted.promise;
+			selectionRevision++;
+			fallbackState = newerFallbackState;
+			allowRestore.resolve();
+			await expect(applying).rejects.toThrow("profile model selection failed");
+
+			expect(restoreFallback).not.toHaveBeenCalled();
+			expect(fallbackState).toEqual(newerFallbackState);
+		} finally {
+			allowRestore.resolve();
+			if (applying) await Promise.allSettled([applying]);
+		}
+	});
+
+	test("keeps a same-model resume choice made during rollback model restoration", async () => {
+		const baseSession = fakeSession();
+		const restoreStarted = Promise.withResolvers<void>();
+		const allowRestore = Promise.withResolvers<void>();
+		const session = Object.assign(baseSession, {
+			prepareModelSelectionForProfileActivation: async (
+				nextModel: Model,
+				thinkingLevel: ThinkingLevel | undefined,
+				signal?: AbortSignal,
+			): Promise<PreparedProfileModelSelection> => ({
+				sessionId: baseSession.sessionId,
+				model: nextModel,
+				thinkingLevel,
+				committedThinkingLevel: thinkingLevel,
+				previousModel: baseSession.model,
+				previousThinkingLevel: baseSession.thinkingLevel,
+				previousEditMode: "default" as never,
+				signal,
+			}),
+			commitPreparedProfileModelSelection: (selection: PreparedProfileModelSelection) => {
+				baseSession.model = selection.model;
+				baseSession.thinkingLevel = selection.committedThinkingLevel;
+			},
+			restoreModelSelectionForRollback: async (
+				previousModel: Model | undefined,
+				previousThinkingLevel: ThinkingLevel | undefined,
+			) => {
+				baseSession.model = previousModel;
+				baseSession.thinkingLevel = previousThinkingLevel;
+				restoreStarted.resolve();
+				await allowRestore.promise;
+			},
+		});
+		baseSession.recordResumeDefaultModel("provider-c/previous-default");
+		const settings = Settings.isolated();
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: fakeRegistry(),
+			settings,
+			profileName: "profile-a",
+			prepareSessionModelSelection: true,
+		});
+		const profileDefault = prepared.defaultModel;
+		if (!profileDefault) throw new Error("Expected a prepared profile default model");
+		publishPreparedModelProfileActivation(prepared);
+		const publishedDefault = `${profileDefault.provider}/${profileDefault.id}`;
+		let selectionIsCurrent = true;
+		let rollback: Promise<void> | undefined;
+		try {
+			rollback = rollbackPreparedModelProfileActivation(prepared, {
+				isCurrent: () => selectionIsCurrent,
+			});
+			await restoreStarted.promise;
+			selectionIsCurrent = false;
+			baseSession.model = profileDefault;
+			baseSession.thinkingLevel = ThinkingLevel.Low;
+			baseSession.recordResumeDefaultModel(publishedDefault);
+			allowRestore.resolve();
+			await rollback;
+
+			expect(baseSession.model).toBe(profileDefault);
+			expect(baseSession.thinkingLevel).toBe(ThinkingLevel.Low);
+			expect(baseSession.getSessionDefaultModelSelector()).toBe(publishedDefault);
+		} finally {
+			allowRestore.resolve();
+			if (rollback) await Promise.allSettled([rollback]);
+		}
+	});
+
 	test("skips profile preparation when the recovery fence is already stale", async () => {
 		const session = fakeSession();
 		const registry = fakeRegistry();
@@ -353,6 +521,39 @@ describe("model profile activation", () => {
 		expect(session.getActiveModelProfile()).toBeUndefined();
 		expect(settings.getOverride("modelRoles")).toBeUndefined();
 		expect(settings.getOverride("task.agentModelOverrides")).toBeUndefined();
+	});
+
+	test("records recovered role ownership baselines for later profile reloads", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated();
+		const baselineModelRoles = { planner: "provider-c/manual-planner" };
+		const baselineAgentModelOverrides = { architect: "provider-c/manual-architect" };
+		settings.override("modelRoles", baselineModelRoles);
+		settings.override("task.agentModelOverrides", baselineAgentModelOverrides);
+		const noteProfileInstalledOverrides = vi.fn();
+		Object.assign(session, { noteProfileInstalledOverrides });
+
+		await applyModelProfileRuntimeBindings({
+			session,
+			modelRegistry: fakeRegistry() as never,
+			settings,
+			profileName: "profile-a",
+		});
+
+		expect(noteProfileInstalledOverrides).toHaveBeenCalledWith(
+			[],
+			["executor", "architect"],
+			session.model,
+			{ modelRoles: baselineModelRoles, agentModelOverrides: baselineAgentModelOverrides },
+			{
+				modelRoles: {},
+				agentModelOverrides: {
+					executor: "provider-b/executor",
+					architect: "provider-a/architect",
+				},
+			},
+			{ modelRoles: [], agentModelOverrides: [] },
+		);
 	});
 
 	test("restores recovered runtime bindings when selection changes during delegation sync", async () => {
@@ -3551,6 +3752,81 @@ describe("preset-equivalent profile activation", () => {
 		// The snapshot's internal closure restored the exact pre-clear sticky.
 		expect(sticky.get(session.sessionId)).toBe("provider-a/opus-real");
 		expect(restoreDefaultFallbackRuntimeState).toHaveBeenCalledWith(fallbackRuntimeState);
+	});
+
+	test("profile deletion failure and restore retain explicit same-value role ownership", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "delete-owner-profile",
+			requiredProviders: [],
+			modelMapping: { default: "provider-a/default", planner: "provider-b/executor" },
+			source: "user",
+		};
+		const initialOwnership: AgentSessionProfileInstalledOverrideState = {
+			modelRoles: new Map(),
+			agentModelOverrides: new Map([["planner", "provider-b/executor"]]),
+			installedModelRoles: new Map(),
+			installedAgentModelOverrides: new Map([["planner", "provider-b/executor"]]),
+			manualModelRoles: new Set<string>(),
+			manualAgentModelOverrides: new Set(["planner"]),
+			preProfileModel: undefined,
+		};
+		const emptyOwnership = (): AgentSessionProfileInstalledOverrideState => ({
+			modelRoles: new Map(),
+			agentModelOverrides: new Map(),
+			installedModelRoles: new Map(),
+			installedAgentModelOverrides: new Map(),
+			manualModelRoles: new Set(),
+			manualAgentModelOverrides: new Set(),
+			preProfileModel: undefined,
+		});
+		let activeProfile: string | undefined = profile.name;
+		let ownership = initialOwnership;
+		const session = Object.assign(fakeSession(), {
+			getActiveModelProfile: () => activeProfile,
+			setActiveModelProfile: (name: string | undefined) => {
+				if (name !== activeProfile) {
+					ownership = {
+						...ownership,
+						manualModelRoles: new Set(),
+						manualAgentModelOverrides: new Set(),
+					};
+				}
+				activeProfile = name;
+			},
+			getProfileInstalledOverrideKeys: () => ({ modelRoles: [], agentModelOverrides: ["planner"] }),
+			getProfileInstalledOverrideState: () => ownership,
+			restoreProfileInstalledOverrideState: (state: AgentSessionProfileInstalledOverrideState) => {
+				ownership = state;
+			},
+			clearProfileInstalledOverrides: () => {
+				ownership = emptyOwnership();
+			},
+		});
+		const registry = fakeRegistry({ profiles: [profile] });
+		const settings = Settings.isolated({
+			"modelProfile.default": profile.name,
+			"task.agentModelOverrides": { planner: "provider-b/executor" },
+		});
+		settings.override("task.agentModelOverrides", { planner: "provider-b/executor" });
+		vi.spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
+
+		await expect(
+			materializeModelProfileForDeletion({ session, modelRegistry: registry, settings, profileName: profile.name }),
+		).rejects.toThrow("flush failed");
+		expect(session.getActiveModelProfile()).toBe(profile.name);
+		expect(ownership).toEqual(initialOwnership);
+
+		const snapshot = await materializeModelProfileForDeletion({
+			session,
+			modelRegistry: registry,
+			settings,
+			profileName: profile.name,
+		});
+		expect(ownership.manualAgentModelOverrides.size).toBe(0);
+		await restoreMaterializedModelProfileForDeletion({ settings, session, snapshot });
+
+		expect(session.getActiveModelProfile()).toBe(profile.name);
+		expect(ownership).toEqual(initialOwnership);
 	});
 
 	test("successful activation leaves the new model sticky", async () => {

@@ -10,12 +10,14 @@ export interface ConfiguredModelBindings {
 export class ModelBindingsApplier {
 	#targetSettings: Settings | undefined;
 	#bindings: ConfiguredModelBindings | undefined;
+	#lastAppliedRoles = new Map<string, ModelSelectorValue>();
+	#lastAppliedAgentOverrides = new Map<string, ModelSelectorValue>();
+	#manualRoles = new Map<string, ModelSelectorValue | undefined>();
+	#manualAgentOverrides = new Map<string, ModelSelectorValue | undefined>();
 	#appliedRoles = new Set<string>();
 	#appliedAgentOverrides = new Set<string>();
 	#roleBaselines = new Map<string, ModelSelectorValue | undefined>();
 	#agentBaselines = new Map<string, ModelSelectorValue | undefined>();
-	#lastAppliedRoles = new Map<string, ModelSelectorValue>();
-	#lastAppliedAgentOverrides = new Map<string, ModelSelectorValue>();
 
 	/** The currently configured bindings (as installed at startup), for baseline lookup. */
 	getBindings(): ConfiguredModelBindings | undefined {
@@ -71,6 +73,8 @@ export class ModelBindingsApplier {
 		this.#targetSettings = targetSettings;
 		const bindings = this.#bindings;
 		if (!targetSettings) return;
+		for (const role of Object.keys(bindings?.modelRoles ?? {})) this.#manualRoles.delete(role);
+		for (const role of Object.keys(bindings?.agentModelOverrides ?? {})) this.#manualAgentOverrides.delete(role);
 		const modelRoles = { ...(targetSettings.get("modelRoles") ?? {}) };
 		this.#forceSync(
 			modelRoles,
@@ -98,6 +102,13 @@ export class ModelBindingsApplier {
 		baselines: Map<string, ModelSelectorValue | undefined>,
 		lastApplied: Map<string, ModelSelectorValue>,
 	): void {
+		const configuredKeys = new Set(Object.keys(configured));
+		for (const key of applied) {
+			if (configuredKeys.has(key)) continue;
+			const baseline = baselines.get(key);
+			if (baseline === undefined) delete target[key];
+			else target[key] = this.#clone(baseline)!;
+		}
 		for (const [key, value] of Object.entries(configured)) {
 			if (!baselines.has(key)) baselines.set(key, this.#clone(target[key]));
 			target[key] = this.#clone(value)!;
@@ -111,82 +122,109 @@ export class ModelBindingsApplier {
 		const targetSettings = this.#targetSettings;
 		if (!targetSettings) return;
 		const bindings = this.#bindings;
-		const nextModelRoles = { ...(targetSettings.get("modelRoles") ?? {}) };
 		this.#sync(
-			nextModelRoles,
+			targetSettings,
+			"modelRoles",
 			bindings?.modelRoles ?? {},
-			this.#appliedRoles,
-			this.#roleBaselines,
 			this.#lastAppliedRoles,
+			this.#manualRoles,
+			this.#roleBaselines,
 		);
-		targetSettings.override("modelRoles", nextModelRoles);
-
-		const nextAgentOverrides = { ...(targetSettings.get("task.agentModelOverrides") ?? {}) };
 		this.#sync(
-			nextAgentOverrides,
+			targetSettings,
+			"task.agentModelOverrides",
 			bindings?.agentModelOverrides ?? {},
-			this.#appliedAgentOverrides,
-			this.#agentBaselines,
 			this.#lastAppliedAgentOverrides,
+			this.#manualAgentOverrides,
+			this.#agentBaselines,
 		);
-		targetSettings.override("task.agentModelOverrides", nextAgentOverrides);
 	}
 
 	#restoreTarget(targetSettings: Settings): void {
-		const modelRoles = { ...(targetSettings.get("modelRoles") ?? {}) };
-		this.#sync(modelRoles, {}, this.#appliedRoles, this.#roleBaselines, this.#lastAppliedRoles);
-		targetSettings.override("modelRoles", modelRoles);
-
-		const agentOverrides = { ...(targetSettings.get("task.agentModelOverrides") ?? {}) };
 		this.#sync(
-			agentOverrides,
+			targetSettings,
+			"task.agentModelOverrides",
 			{},
-			this.#appliedAgentOverrides,
-			this.#agentBaselines,
 			this.#lastAppliedAgentOverrides,
+			this.#manualAgentOverrides,
+			this.#agentBaselines,
 		);
-		targetSettings.override("task.agentModelOverrides", agentOverrides);
+		this.#sync(targetSettings, "modelRoles", {}, this.#lastAppliedRoles, this.#manualRoles, this.#roleBaselines);
 	}
 
 	#clearTargetLifecycle(): void {
-		this.#appliedRoles.clear();
-		this.#appliedAgentOverrides.clear();
-		this.#roleBaselines.clear();
-		this.#agentBaselines.clear();
 		this.#lastAppliedRoles.clear();
 		this.#lastAppliedAgentOverrides.clear();
+		this.#manualRoles.clear();
+		this.#manualAgentOverrides.clear();
+		this.#roleBaselines.clear();
+		this.#agentBaselines.clear();
 	}
 
 	#sync(
-		target: Record<string, ModelSelectorValue>,
+		targetSettings: Settings,
+		settingPath: "modelRoles" | "task.agentModelOverrides",
 		configured: Record<string, ModelSelectorValue>,
-		applied: Set<string>,
-		baselines: Map<string, ModelSelectorValue | undefined>,
 		lastApplied: Map<string, ModelSelectorValue>,
+		manualOverrides: Map<string, ModelSelectorValue | undefined>,
+		baselines: Map<string, ModelSelectorValue | undefined>,
 	): void {
 		const configuredKeys = new Set(Object.keys(configured));
-		for (const key of applied) {
-			if (configuredKeys.has(key)) continue;
-			const previous = lastApplied.get(key);
-			if (previous !== undefined && this.#equal(target[key], previous)) {
-				const baseline = baselines.get(key);
-				if (baseline === undefined) delete target[key];
-				else target[key] = this.#clone(baseline)!;
-			}
-			baselines.delete(key);
-			lastApplied.delete(key);
+		const current = (targetSettings.get(settingPath) ?? {}) as Record<string, ModelSelectorValue>;
+		const global = (targetSettings.getGlobal(settingPath) ?? {}) as Record<string, ModelSelectorValue>;
+		const runtime = targetSettings.getOverride(settingPath) ?? {};
+		for (const key of configuredKeys) {
+			if (!lastApplied.has(key) && !baselines.has(key)) baselines.set(key, this.#clone(runtime[key]));
 		}
+
+		// Manual bindings remain authoritative, but their cached values must follow
+		// later edits and removals from the runtime override slots.
+		for (const key of manualOverrides.keys()) {
+			manualOverrides.set(key, this.#clone(runtime[key]));
+		}
+
+		// Keep existing non-global values that belong to another runtime layer.
+		for (const [key, value] of Object.entries(current)) {
+			if (configuredKeys.has(key) || lastApplied.has(key) || manualOverrides.has(key)) continue;
+			if (!this.#equal(value, global[key])) manualOverrides.set(key, this.#clone(value)!);
+		}
+
+		// A value changed while our previous overlay was active is a manual edit.
+		for (const [key, previous] of lastApplied) {
+			const currentValue = current[key];
+			if (!Object.hasOwn(runtime, key) || !Object.hasOwn(current, key)) {
+				manualOverrides.set(key, undefined);
+			} else if (!this.#equal(runtime[key], previous)) {
+				manualOverrides.set(key, this.#clone(runtime[key])!);
+			} else if (!this.#equal(currentValue, previous)) {
+				manualOverrides.set(key, this.#clone(currentValue)!);
+			}
+		}
+
+		const nextOverrides: Record<string, ModelSelectorValue> = {};
+		for (const [key, value] of Object.entries(runtime)) {
+			if (!lastApplied.has(key) && !configuredKeys.has(key)) nextOverrides[key] = this.#clone(value)!;
+		}
+		for (const [key, baseline] of baselines) {
+			if (!configuredKeys.has(key)) {
+				if (baseline !== undefined) nextOverrides[key] = this.#clone(baseline)!;
+				baselines.delete(key);
+			}
+		}
+		for (const [key, value] of manualOverrides) {
+			if (value === undefined) delete nextOverrides[key];
+			else nextOverrides[key] = this.#clone(value)!;
+		}
+		lastApplied.clear();
 		for (const [key, value] of Object.entries(configured)) {
-			const previous = lastApplied.get(key);
-			if (!baselines.has(key)) baselines.set(key, this.#clone(target[key]));
-			if (previous === undefined || this.#equal(target[key], previous)) {
-				const appliedValue = this.#clone(value)!;
-				target[key] = appliedValue;
-				lastApplied.set(key, this.#clone(appliedValue)!);
-			}
+			if (manualOverrides.has(key)) continue;
+			const appliedValue = this.#clone(value)!;
+			nextOverrides[key] = appliedValue;
+			lastApplied.set(key, this.#clone(appliedValue)!);
 		}
-		applied.clear();
-		for (const key of configuredKeys) applied.add(key);
+
+		if (Object.keys(nextOverrides).length === 0) targetSettings.clearOverride(settingPath);
+		else targetSettings.override(settingPath, nextOverrides);
 	}
 
 	#cloneBindings(
