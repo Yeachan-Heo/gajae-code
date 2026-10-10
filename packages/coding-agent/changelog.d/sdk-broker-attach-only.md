@@ -1,0 +1,3 @@
+### Added
+
+- Added attach-only SDK client mode: with `GJC_SDK_BROKER_AUTOSTART=0` or `--attach-only` (on `gjc sdk session`, `gjc sdk search`, `gjc sdk spawn` and `gjc mcp-serve`), every SDK client entry point (session CLI, search, spawn, SDK and coordinator MCP servers, ACP, session hosts) attaches only to a live broker and fails with `broker_unavailable` instead of spawning, retiring, or restarting one, so a supervisor-owned broker has a single owner.

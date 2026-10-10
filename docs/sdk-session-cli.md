@@ -54,6 +54,21 @@ results. The broker is started on demand (`ensureBroker`) when discovery is
 absent, and an unavailable broker fails closed with a typed operational error
 (exit 1).
 
+### Attach-only mode
+
+Set `GJC_SDK_BROKER_AUTOSTART=0` when a supervisor (for example a system
+service) owns the broker. Every SDK client entry point — `gjc sdk session`,
+`gjc sdk search`, `gjc sdk spawn`, the SDK and coordinator MCP servers, ACP,
+and session hosts — then only attaches to a live, reusable broker and never
+spawns, retires, or restarts one. When discovery is absent, stale, or names a
+dead process, the call fails with `broker_unavailable` (exit 1). Any other
+value, or an unset variable, keeps on-demand startup. The broker entrypoints
+ignore the variable, so it is safe for broker descendants to inherit it.
+
+`--attach-only` is the per-invocation flag form on `gjc sdk session …`,
+`gjc sdk search`, `gjc sdk spawn` and `gjc mcp-serve`. `gjc sdk serve` needs
+neither: it only reads broker discovery and never starts a broker.
+
 `--agent-dir` selects the broker state directory. It may appear at the session
 family level before the verb (`gjc sdk session --agent-dir <dir> list`) or on a
 leaf command. `--repo` selects the workspace directory for scoped listing or
