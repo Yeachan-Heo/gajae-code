@@ -235,7 +235,7 @@ describe("task fork-context provider identity", () => {
 		while (sessions.length > 0) await sessions.pop()?.dispose();
 		while (authStorages.length > 0) authStorages.pop()?.close();
 		while (artifactStores.length > 0) artifactStores.pop()?.close();
-		
+
 		while (tempDirs.length > 0) {
 			const tempDir = tempDirs.pop();
 			if (!tempDir) continue;
