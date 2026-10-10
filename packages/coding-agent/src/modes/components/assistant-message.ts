@@ -4,9 +4,13 @@ import {
 	Container,
 	Image,
 	ImageProtocol,
+	isCursorNeutralImagePermittedInFallback,
+	isTerminalGraphicsFallbackActive,
 	isViewportAnchorSourceRenderer,
 	Markdown,
+	type MarkdownTheme,
 	Spacer,
+	SvgFigure,
 	TERMINAL,
 	Text,
 	type ViewportAnchorSource,
@@ -26,6 +30,37 @@ import { resolveImageOptions } from "../../tools/render-utils";
 const THINKING_REPETITION_ELIDE_MIN_RUN = 24;
 const THINKING_REPETITION_VISIBLE_TOKENS = 3;
 const THINKING_REPETITION_TOKEN_PATTERN = /[\p{L}\p{N}_'-]{1,32}/gu;
+
+let assistantMarkdownThemeBase: MarkdownTheme | undefined;
+let cachedAssistantMarkdownTheme: MarkdownTheme | undefined;
+
+function getAssistantMarkdownTheme(): MarkdownTheme {
+	const base = getMarkdownTheme();
+	if (base === assistantMarkdownThemeBase && cachedAssistantMarkdownTheme) return cachedAssistantMarkdownTheme;
+	assistantMarkdownThemeBase = base;
+	cachedAssistantMarkdownTheme = {
+		...base,
+		resolveSvgFigure: (source, context) => {
+			const graphicsSuppressed =
+				isTerminalGraphicsFallbackActive() &&
+				!(TERMINAL.imageProtocol === ImageProtocol.Kitty && isCursorNeutralImagePermittedInFallback());
+			if (!TERMINAL.imageProtocol) return null; // Stable environment: cache the code fallback.
+			if (graphicsSuppressed) return undefined; // The suppression scope can end; retry on repaint.
+			const palette = theme.getSvgPalette();
+			const previous = context.previous instanceof SvgFigure ? context.previous : undefined;
+			const figure =
+				previous ??
+				new SvgFigure({
+					theme: { fallbackColor: (text: string) => theme.fg("toolOutput", text) },
+					palette,
+					onChange: context.onChange,
+				});
+			figure.update(source, context.closed || !context.streaming, palette);
+			return figure.failed ? null : figure;
+		},
+	};
+	return cachedAssistantMarkdownTheme;
+}
 
 interface ThinkingRepetitionToken {
 	text: string;
@@ -339,7 +374,7 @@ export class AssistantMessageComponent extends Container {
 			cached.source = content.text;
 			return cached.component;
 		}
-		const component = deepInterview ?? new Markdown(trimmed, 1, 0, getMarkdownTheme());
+		const component = deepInterview ?? new Markdown(trimmed, 1, 0, getAssistantMarkdownTheme());
 		if (component instanceof Markdown) {
 			component.setOnStaleThrottle(this.#requestRepaint);
 			component.setStreaming(streaming);

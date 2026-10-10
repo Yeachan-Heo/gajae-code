@@ -5,7 +5,7 @@ import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/
 import { AssistantMessageComponent } from "@gajae-code/coding-agent/modes/components/assistant-message";
 import { clearMermaidCache } from "@gajae-code/coding-agent/modes/theme/mermaid-cache";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
-import { ImageProtocol, setTerminalImageProtocol, TERMINAL } from "@gajae-code/tui";
+import { ImageProtocol, setTerminalImageProtocol, TERMINAL, withTerminalGraphicsFallback } from "@gajae-code/tui";
 
 const originalImageProtocol = TERMINAL.imageProtocol;
 
@@ -82,6 +82,89 @@ describe("AssistantMessageComponent mermaid markdown", () => {
 		expect(TERMINAL.imageProtocol).toBeNull();
 		expect(rendered).toContain("```mermaid");
 		expect(rendered).toContain("this is not mermaid");
+	});
+});
+
+describe("AssistantMessageComponent SVG markdown", () => {
+	it("keeps the fenced SVG source when the terminal has no graphics protocol", () => {
+		setTerminalImageProtocol(null);
+		const component = new AssistantMessageComponent(
+			createAssistantMessage('```svg\n<svg width="10" height="10"><rect/></svg>\n```'),
+		);
+		try {
+			const rendered = Bun.stripANSI(component.render(100).join("\n"));
+			expect(TERMINAL.imageProtocol).toBeNull();
+			expect(rendered).toContain("```svg");
+			expect(rendered).toContain("<svg");
+			expect(rendered).not.toContain("[Image: svg");
+		} finally {
+			component.dispose();
+		}
+	});
+
+	it("keeps the fenced SVG source in graphics-suppressed render scopes", () => {
+		setTerminalImageProtocol(ImageProtocol.Iterm2);
+		const component = new AssistantMessageComponent(
+			createAssistantMessage('```svg\n<svg width="10" height="10"><rect/></svg>\n```'),
+		);
+		try {
+			const rendered = Bun.stripANSI(
+				withTerminalGraphicsFallback(() => component.render(100).join("\n"), {
+					allowCursorNeutralImages: true,
+				}),
+			);
+			expect(TERMINAL.imageProtocol).toBe(ImageProtocol.Iterm2);
+			expect(rendered).toContain("```svg");
+			expect(rendered).toContain("<svg");
+			expect(rendered).not.toContain("[Image: svg");
+		} finally {
+			component.dispose();
+		}
+	});
+
+	it("renders SVG fences as terminal images and repaints after rasterization", async () => {
+		const originalProtocol = TERMINAL.imageProtocol;
+		setTerminalImageProtocol(ImageProtocol.Kitty);
+		const rasterized = Promise.withResolvers<void>();
+		const component = new AssistantMessageComponent(
+			createAssistantMessage(
+				'```svg\n<svg width="10" height="10" viewBox="0 0 10 10"><rect width="10" height="10" fill="#f00"/></svg>\n```',
+			),
+			false,
+			() => rasterized.resolve(),
+		);
+		try {
+			const pending = component.render(120).join("\n");
+			expect(pending).not.toContain("```svg");
+			await rasterized.promise;
+
+			const rendered = component.render(120).join("\n");
+			expect(rendered).toContain("\x1b_G");
+			expect(rendered).not.toContain("<svg");
+		} finally {
+			component.dispose();
+			setTerminalImageProtocol(originalProtocol);
+		}
+	});
+
+	it("falls back to the original fenced code after a final rasterization failure", async () => {
+		const originalProtocol = TERMINAL.imageProtocol;
+		setTerminalImageProtocol(ImageProtocol.Kitty);
+		const failed = Promise.withResolvers<void>();
+		const component = new AssistantMessageComponent(createAssistantMessage("```svg\n<svg"), false, () =>
+			failed.resolve(),
+		);
+		try {
+			component.render(100);
+			await failed.promise;
+			const rendered = Bun.stripANSI(component.render(100).join("\n"));
+			expect(rendered).toContain("```svg");
+			expect(rendered).toContain("<svg");
+			expect(rendered).not.toContain("[Image: ");
+		} finally {
+			component.dispose();
+			setTerminalImageProtocol(originalProtocol);
+		}
 	});
 });
 

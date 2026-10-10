@@ -3,6 +3,7 @@
 export * from "./animation-scheduler";
 // Autocomplete support
 export * from "./autocomplete";
+export * from "./chat/svg-figure";
 // Components
 export * from "./components/box";
 export * from "./components/cancellable-loader";

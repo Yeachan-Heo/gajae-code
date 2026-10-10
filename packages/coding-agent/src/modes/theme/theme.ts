@@ -1260,9 +1260,11 @@ const langMap: Record<string, SymbolKey> = {
 };
 
 export class Theme {
+	#svgColorValues: Record<string, string | number>;
 	#fgColors: Record<ThemeColor, string>;
 	#bgColors: Record<ThemeBg, string>;
 	#symbols: SymbolMap;
+	#svgPalette: Readonly<Record<string, string>>;
 
 	constructor(
 		fgColors: Record<ThemeColor, string | number>,
@@ -1271,10 +1273,19 @@ export class Theme {
 		private readonly symbolPreset: SymbolPreset,
 		symbolOverrides: Partial<Record<SymbolKey, string>>,
 	) {
+		this.#svgColorValues = { ...fgColors, ...bgColors };
 		this.#fgColors = {} as Record<ThemeColor, string>;
 		for (const [key, value] of Object.entries(fgColors) as [ThemeColor, string | number][]) {
 			this.#fgColors[key] = fgAnsi(value, mode);
 		}
+		const textColor = this.#svgColorValues.text;
+		const foreground = typeof textColor === "number" ? ansi256ToHex(textColor) : textColor || "#e5e5e7";
+		const svgPalette: Record<string, string> = { fg: foreground };
+		for (const color of THEME_COLOR_KEYS) {
+			const value = this.#svgColorValues[color];
+			svgPalette[color] = typeof value === "number" ? ansi256ToHex(value) : value || foreground;
+		}
+		this.#svgPalette = Object.freeze(svgPalette);
 		this.#bgColors = {} as Record<ThemeBg, string>;
 		for (const [key, value] of Object.entries(bgColors) as [ThemeBg, string | number][]) {
 			this.#bgColors[key] = bgAnsi(value, mode);
@@ -1327,6 +1338,10 @@ export class Theme {
 		const ansi = this.#fgColors[color];
 		if (!ansi) throw new Error(`Unknown theme color: ${color}`);
 		return ansi;
+	}
+
+	getSvgPalette(): Readonly<Record<string, string>> {
+		return this.#svgPalette;
 	}
 
 	getBgAnsi(color: ThemeBg): string {

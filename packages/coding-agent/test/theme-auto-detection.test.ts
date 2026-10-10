@@ -59,6 +59,18 @@ describe("theme auto-detection", () => {
 		vi.restoreAllMocks();
 	});
 
+	it("exposes active theme tokens as CSS colors for SVG rendering", async () => {
+		const blueCrab = await themeModule.getThemeByName("blue-crab");
+		if (!blueCrab) throw new Error("Failed to load blue-crab theme for SVG palette test");
+
+		expect(blueCrab.getSvgPalette()).toMatchObject({
+			fg: "#e6f7ff",
+			text: "#e6f7ff",
+			accent: "#5ec8ff",
+			userMessageBg: "#0a1d31",
+		});
+	});
+
 	it("prefers COLORFGBG before macOS fallback inside Zellij", async () => {
 		using _globals = withThemeTestGlobals({ zellij: "1", colorfgbg: "15;0" });
 		const detectSpy = vi.spyOn(nativesModule, "detectMacOSAppearance").mockReturnValue(MacOSAppearance.Light);
