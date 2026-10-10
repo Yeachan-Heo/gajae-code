@@ -1394,4 +1394,58 @@ describe("P1 Regression: content leaking across batches", () => {
 		// Content should be suppressed because refusal was in same batch
 		expect(textBeforeError).toHaveLength(0);
 	});
+
+	test("P2: unconfirmed text not in published partials when refusal follows", async () => {
+		// This test verifies the critical fix for P2: unconfirmed text should NOT appear
+		// in the published partial messages, even if text_start/text_delta events are emitted.
+		// The text block must remain empty until stream confirmation (no refusal).
+		const publishedPartials: Array<{
+			content?: Array<TextContent | ThinkingContent | ToolCall>;
+		}> = [];
+
+		globalThis.fetch = (async () => {
+			// Content followed by refusal in separate reads (simulated by stream)
+			const responseBody =
+				JSON.stringify({ content: "Harmful text here" }) +
+				JSON.stringify({
+					stopReason: "CONTENT_FILTERED",
+					stopDetails: {
+						refusal: {
+							category: "VIOLENCE",
+							explanation: "Violent content not allowed",
+						},
+					},
+				});
+			return new Response(responseBody, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				// Capture all published partials
+				if (
+					(event.type === "text_start" || event.type === "text_delta" || event.type === "text_end") &&
+					event.partial
+				) {
+					publishedPartials.push({ content: event.partial.content });
+				}
+			}
+		} catch {
+			// Error expected
+		}
+
+		// Key assertion: all published partials should have empty or no text content
+		// because the text was pending and never confirmed (refusal came instead)
+		for (const partial of publishedPartials) {
+			const textBlocks = partial.content?.filter((b): b is TextContent => b.type === "text");
+			if (textBlocks && textBlocks.length > 0) {
+				// Any text block in a published partial before confirmation is a violation
+				for (const textBlock of textBlocks) {
+					// The text block should exist (for indices) but be empty until confirmation
+					// Once refusal comes, it should never be populated
+					expect(textBlock.text).toBe("");
+				}
+			}
+		}
+	});
 });

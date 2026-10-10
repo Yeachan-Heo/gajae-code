@@ -881,6 +881,11 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			let thinkingIndex: number | undefined;
 			let textIndex: number | undefined;
 
+			// Keep pending text content separate from blocks until confirmation (no refusal)
+			let pendingTextContent = ""; // Buffer text separately from blocks
+			let pendingTextEvents: Array<{ type: "start" | "delta" | "end"; delta?: string; content?: string }> = [];
+			let textContentConfirmed = false; // Track whether text has been committed to blocks
+
 			// Add tool to blocks without emitting events (deferred until stream end)
 			const addToolToBlocks = () => {
 				if (!currentTool) return;
@@ -951,6 +956,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				}
 				if (textIndex === undefined) {
 					textIndex = blocks.length;
+					// Create block with empty text (content will be added only after confirmation)
 					blocks.push({ type: "text", text: "", index: textIndex });
 					// Defer text_start emission if thinking might come before text.
 					// thinkingAccumulated is non-empty means we've seen thinking in this or prior content events.
@@ -963,11 +969,22 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						textStartDeferred = true;
 					}
 				}
-				const block = blocks[textIndex] as TextContent;
-				block.text += delta;
+				// Buffer text content separately (don't add to blocks yet)
+				pendingTextContent += delta;
 				// Only emit text_delta if text_start was already emitted
 				if (!textStartDeferred) {
 					stream.push({ type: "text_delta", contentIndex: textIndex, delta, partial: output });
+				}
+			};
+
+			// Commit pending text to blocks (only safe at stream end when refusal is ruled out)
+			const commitPendingText = () => {
+				if (textContentConfirmed || pendingTextContent.length === 0) return; // Already committed or no text
+				textContentConfirmed = true;
+				if (textIndex !== undefined && textIndex < blocks.length) {
+					// Populate the text block that was created with empty text
+					const block = blocks[textIndex] as TextContent;
+					block.text = pendingTextContent;
 				}
 			};
 
@@ -975,24 +992,23 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			const emitDeferredTextEvents = () => {
 				if (textStartDeferred && textIndex !== undefined && textIndex < blocks.length) {
 					const block = blocks[textIndex];
-					if (block && block.type === "text") {
+					if (block && block.type === "text" && block.text.length > 0) {
+						// Emit deferred text_start and text_delta with committed content
 						stream.push({ type: "text_start", contentIndex: textIndex, partial: output });
-						if (block.text.length > 0) {
-							stream.push({
-								type: "text_delta",
-								contentIndex: textIndex,
-								delta: block.text,
-								partial: output,
-							});
-						}
-						textStartDeferred = false;
+						stream.push({
+							type: "text_delta",
+							contentIndex: textIndex,
+							delta: block.text,
+							partial: output,
+						});
 					}
+					textStartDeferred = false;
 				}
 			};
 
 			// Emit text_end if text block was opened
 			const closeTextBlock = () => {
-				if (textIndex !== undefined) {
+				if (textIndex !== undefined && textContentConfirmed) {
 					const block = blocks[textIndex] as TextContent;
 					stream.push({ type: "text_end", contentIndex: textIndex, content: block.text, partial: output });
 					textIndex = undefined;
@@ -1146,9 +1162,12 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 							stopDetails?: { refusal?: { category?: string; explanation?: string } };
 						};
 						if (refusalData.stopDetails?.refusal) {
-							// Handle refusal: clear blocks and emit error (don't emit any text/tool that came before)
+							// Handle refusal: clear pending content and emit error (don't emit any text/tool that came before)
 							consumeContent(""); // Flush any pending thinking
 							clearPendingToolCalls(); // DROP any pending tool call without emitting events
+							// Clear pending text (it was never committed to blocks, so it's safe to discard)
+							pendingTextContent = "";
+							pendingTextEvents.length = 0;
 
 							const refusal = refusalData.stopDetails.refusal;
 							const category = refusal.category;
@@ -1194,10 +1213,13 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						emitPendingToolCalls();
 
 						// Preserve any already-accumulated text in the error context
-						const accumulatedText = blocks
-							.filter((b): b is TextContent => b.type === "text")
-							.map(b => b.text)
-							.join("");
+						// Use committed blocks or pending text (if not yet committed)
+						const accumulatedText = textContentConfirmed
+							? blocks
+								.filter((b): b is TextContent => b.type === "text")
+								.map(b => b.text)
+								.join("")
+							: pendingTextContent;
 						const errorMsg = sanitizeKiroError(`${event.data.error}: ${event.data.message ?? ""}`, apiKey);
 						const fullErrorMsg = accumulatedText ? `${errorMsg}\n\nPartial output: ${accumulatedText}` : errorMsg;
 						throw new Error(fullErrorMsg);
@@ -1205,7 +1227,9 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				}
 			}
 
-			// Stream is done - add any pending tool, emit accumulated thinking, then deferred text, then close text block
+			// Stream is done - commit pending text (safe since no refusal occurred), add pending tool, emit accumulated thinking, etc.
+			// First commit pending text to blocks since stream ended without refusal
+			commitPendingText();
 			// Emit tool if explicitly completed or if stream end (implicit completion)
 			if (currentTool) addToolToBlocks();
 			emitThinking();
