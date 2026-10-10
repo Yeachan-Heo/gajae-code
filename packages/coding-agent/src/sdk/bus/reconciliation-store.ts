@@ -864,10 +864,11 @@ export function createReconciliationStore(options: {
 			} catch {}
 		};
 		const pending = chain.then(run, run);
-		chain = pending.then(
+		const settled = pending.then(
 			() => undefined,
 			() => undefined,
 		);
+		chain = settled;
 		try {
 			await pending;
 		} catch (error) {
@@ -919,10 +920,11 @@ export function createReconciliationStore(options: {
 			} catch {}
 		};
 		const pending = chain.then(run, run);
-		chain = pending.then(
+		const settled = pending.then(
 			() => undefined,
 			() => undefined,
 		);
+		chain = settled;
 		try {
 			await pending;
 		} catch (error) {
@@ -981,10 +983,11 @@ export function createReconciliationStore(options: {
 			} catch {}
 		};
 		const pending = chain.then(run, run);
-		chain = pending.then(
+		const settled = pending.then(
 			() => undefined,
 			() => undefined,
 		);
+		chain = settled;
 		try {
 			await pending;
 		} catch (error) {
@@ -1036,10 +1039,11 @@ export function createReconciliationStore(options: {
 			} catch {}
 		};
 		const pending = chain.then(run, run);
-		chain = pending.then(
+		const settled = pending.then(
 			() => undefined,
 			() => undefined,
 		);
+		chain = settled;
 		try {
 			await pending;
 		} catch (error) {
