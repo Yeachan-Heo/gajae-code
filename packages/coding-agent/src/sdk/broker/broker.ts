@@ -3891,13 +3891,34 @@ export class Broker {
 		this.#throwIfStartupAborted();
 		// Only the lock holder reaps, so concurrent brokers cannot race the removal.
 		await this.#reapLockArtifacts();
+		// For authorized successors, derive the startup deadline from the committed
+		// restart intent if no explicit deadline was provided. This ensures the
+		// successor has exactly the time window the owner prepared.
+		let effectiveStartupDeadline = this.#startupCheckpointDeadline;
+		if (
+			this.settings.restartRequestId !== undefined &&
+			effectiveStartupDeadline === undefined
+		) {
+			try {
+				const intent = await readBrokerRestartIntent(this.settings.agentDir);
+				if (
+					intent &&
+					intent.phase === "committed" &&
+					intent.requestId === this.settings.restartRequestId
+				) {
+					effectiveStartupDeadline = intent.expiresAt;
+				}
+			} catch {
+				// If intent validation fails, proceed with no deadline (best-effort).
+			}
+		}
 		try {
 			this.#throwIfStartupAborted();
 			await this.index.open(
-				this.#startupCheckpointDeadline === undefined
+				effectiveStartupDeadline === undefined
 					? undefined
 					: sessionIndexStartupLockOptions(
-							this.#startupCheckpointDeadline,
+							effectiveStartupDeadline,
 							this.#startupAbortSignal,
 							this.settings.restartRequestId === undefined ? "ordinary" : "authorized-successor",
 						),
@@ -3959,7 +3980,7 @@ export class Broker {
 			// checkpoint settles. The bootstrap watchdog owns this pre-publication
 			// interval; publishing first allowed it to kill an endpoint already handed
 			// to callers when a legitimate index-lock wait outlived the fence.
-			await this.#checkpointSessionHeartbeats(this.#startupAbortSignal, this.#startupCheckpointDeadline);
+			await this.#checkpointSessionHeartbeats(this.#startupAbortSignal, effectiveStartupDeadline);
 			this.#throwIfStartupAborted();
 			await this.#startupPrePublicationTestHook?.();
 			if (this.#startupPrePublicationDelayMs > 0) await Bun.sleep(this.#startupPrePublicationDelayMs);

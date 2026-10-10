@@ -15,7 +15,14 @@
 				"counters": {
 					"debugRedrawEnvReads": 0,
 					"debugRedrawAppendWrites": 0,
-					"differentialGuardVisibleWidthCalls": 0
+					"differentialGuardVisibleWidthCalls": 0,
+					"widthReflowScanRows": 0,
+					"widthReflowVisibleWidthCalls": 0,
+					"kittyPlacementScanRows": 0,
+					"kittyPlacementReferenceRows": 0,
+					"layoutAssemblyRows": 0,
+					"layoutOffscreenPrefixCompares": 0,
+					"layoutPrefixLineCopies": 0
 				},
 				"appendSpyCalls": 0
 			}
@@ -29,11 +36,18 @@
 				"counters": {
 					"debugRedrawEnvReads": 1,
 					"debugRedrawAppendWrites": 2,
-					"differentialGuardVisibleWidthCalls": 0
+					"differentialGuardVisibleWidthCalls": 0,
+					"widthReflowScanRows": 0,
+					"widthReflowVisibleWidthCalls": 0,
+					"kittyPlacementScanRows": 0,
+					"kittyPlacementReferenceRows": 0,
+					"layoutAssemblyRows": 0,
+					"layoutOffscreenPrefixCompares": 0,
+					"layoutPrefixLineCopies": 0
 				},
 				"writes": [
-					"[2026-07-17T07:22:55.913Z] fullRender: terminal width changed (-1 -> 20) (prev=0, new=2, height=4)\n",
-					"[2026-07-17T07:22:55.941Z] fullRender: terminal width changed (-1 -> 20) (prev=0, new=2, height=4)\n"
+					"[2026-10-10T10:22:51.068Z] fullRender: first render (new=2, height=4)\n",
+					"[2026-10-10T10:22:51.095Z] fullRender: terminal width changed without reflow (-1 -> 20) (new=2, height=4)\n"
 				]
 			}
 		},
@@ -46,7 +60,14 @@
 				"reuseCounters": {
 					"debugRedrawEnvReads": 0,
 					"debugRedrawAppendWrites": 0,
-					"differentialGuardVisibleWidthCalls": 0
+					"differentialGuardVisibleWidthCalls": 0,
+					"widthReflowScanRows": 0,
+					"widthReflowVisibleWidthCalls": 0,
+					"kittyPlacementScanRows": 0,
+					"kittyPlacementReferenceRows": 0,
+					"layoutAssemblyRows": 0,
+					"layoutOffscreenPrefixCompares": 0,
+					"layoutPrefixLineCopies": 0
 				},
 				"viewport": [
 					"界界界界界界",
@@ -63,7 +84,14 @@
 				"truncationCounters": {
 					"debugRedrawEnvReads": 0,
 					"debugRedrawAppendWrites": 0,
-					"differentialGuardVisibleWidthCalls": 0
+					"differentialGuardVisibleWidthCalls": 0,
+					"widthReflowScanRows": 0,
+					"widthReflowVisibleWidthCalls": 0,
+					"kittyPlacementScanRows": 0,
+					"kittyPlacementReferenceRows": 0,
+					"layoutAssemblyRows": 0,
+					"layoutOffscreenPrefixCompares": 0,
+					"layoutPrefixLineCopies": 0
 				},
 				"truncated": "界界界界界界",
 				"truncatedWidth": 12
@@ -75,8 +103,8 @@
 			"details": {
 				"scenario": "Legacy full normalization reference vs default cached/viewport path for append, wide line, resize",
 				"expectedBehavior": "Viewport and terminal write bytes match exactly",
-				"referenceWrites": 11,
-				"candidateWrites": 11
+				"referenceWrites": 10,
+				"candidateWrites": 10
 			}
 		},
 		{
@@ -226,7 +254,14 @@
 				"counters": {
 					"debugRedrawEnvReads": 0,
 					"debugRedrawAppendWrites": 0,
-					"differentialGuardVisibleWidthCalls": 0
+					"differentialGuardVisibleWidthCalls": 0,
+					"widthReflowScanRows": 0,
+					"widthReflowVisibleWidthCalls": 0,
+					"kittyPlacementScanRows": 0,
+					"kittyPlacementReferenceRows": 0,
+					"layoutAssemblyRows": 0,
+					"layoutOffscreenPrefixCompares": 0,
+					"layoutPrefixLineCopies": 0
 				},
 				"appendSpyCalls": 0
 			}
@@ -243,11 +278,18 @@
 				"counters": {
 					"debugRedrawEnvReads": 1,
 					"debugRedrawAppendWrites": 2,
-					"differentialGuardVisibleWidthCalls": 0
+					"differentialGuardVisibleWidthCalls": 0,
+					"widthReflowScanRows": 0,
+					"widthReflowVisibleWidthCalls": 0,
+					"kittyPlacementScanRows": 0,
+					"kittyPlacementReferenceRows": 0,
+					"layoutAssemblyRows": 0,
+					"layoutOffscreenPrefixCompares": 0,
+					"layoutPrefixLineCopies": 0
 				},
 				"writes": [
-					"[2026-07-17T07:22:55.913Z] fullRender: terminal width changed (-1 -> 20) (prev=0, new=2, height=4)\n",
-					"[2026-07-17T07:22:55.941Z] fullRender: terminal width changed (-1 -> 20) (prev=0, new=2, height=4)\n"
+					"[2026-10-10T10:22:51.068Z] fullRender: first render (new=2, height=4)\n",
+					"[2026-10-10T10:22:51.095Z] fullRender: terminal width changed without reflow (-1 -> 20) (new=2, height=4)\n"
 				]
 			}
 		},
@@ -263,7 +305,14 @@
 				"reuseCounters": {
 					"debugRedrawEnvReads": 0,
 					"debugRedrawAppendWrites": 0,
-					"differentialGuardVisibleWidthCalls": 0
+					"differentialGuardVisibleWidthCalls": 0,
+					"widthReflowScanRows": 0,
+					"widthReflowVisibleWidthCalls": 0,
+					"kittyPlacementScanRows": 0,
+					"kittyPlacementReferenceRows": 0,
+					"layoutAssemblyRows": 0,
+					"layoutOffscreenPrefixCompares": 0,
+					"layoutPrefixLineCopies": 0
 				},
 				"viewport": [
 					"界界界界界界",
@@ -283,7 +332,14 @@
 				"truncationCounters": {
 					"debugRedrawEnvReads": 0,
 					"debugRedrawAppendWrites": 0,
-					"differentialGuardVisibleWidthCalls": 0
+					"differentialGuardVisibleWidthCalls": 0,
+					"widthReflowScanRows": 0,
+					"widthReflowVisibleWidthCalls": 0,
+					"kittyPlacementScanRows": 0,
+					"kittyPlacementReferenceRows": 0,
+					"layoutAssemblyRows": 0,
+					"layoutOffscreenPrefixCompares": 0,
+					"layoutPrefixLineCopies": 0
 				},
 				"truncated": "界界界界界界",
 				"truncatedWidth": 12
@@ -298,8 +354,8 @@
 			"details": {
 				"scenario": "Legacy full normalization reference vs default cached/viewport path for append, wide line, resize",
 				"expectedBehavior": "Viewport and terminal write bytes match exactly",
-				"referenceWrites": 11,
-				"candidateWrites": 11
+				"referenceWrites": 10,
+				"candidateWrites": 10
 			}
 		},
 		{
