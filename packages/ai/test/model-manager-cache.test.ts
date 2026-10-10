@@ -177,37 +177,45 @@ describe("online-if-uncached model refresh", () => {
 		});
 	});
 
-	test.each([
-		"offline",
-		"online-if-uncached",
-		"online",
-	] as const)("repairs pre-review Muse limits during %s without changing refresh or error fallback", async strategy => {
-		const providerId = "opencode-go";
-		const id = "muse-spark-1.3-contributor";
-		const now = 1_700_000_000_000;
-		const staticModels = [getBundledModel(providerId, id)];
-		const placeholder = {
-			...model(providerId, id),
-			contextWindow: UNK_CONTEXT_WINDOW,
-			maxTokens: UNK_MAX_TOKENS,
-		};
-		const provenance = "same-credential-endpoint";
-		writeModelCache(providerId, now, [placeholder], true, fingerprint(staticModels), cacheDbPath, [id], provenance);
-		const fetchDynamicModels = vi.fn(async () => null);
-		const options = {
-			providerId,
-			staticModels,
-			cacheDbPath,
-			now: () => now,
-			cacheDynamicModelProvenance: provenance,
-			fetchDynamicModels,
-		};
-		const result = await resolveProviderModels<Api>(options, strategy);
-		expect(result.models[0]).toMatchObject(staticModels[0]!);
-		expect(fetchDynamicModels).toHaveBeenCalledTimes(strategy === "online" ? 1 : 0);
-		const reused = await resolveProviderModels<Api>(options, "offline");
-		expect(reused.models[0]).toMatchObject(staticModels[0]!);
-	});
+	test.each(["offline", "online-if-uncached", "online"] as const)(
+		"repairs pre-review Muse limits during %s without changing refresh or error fallback",
+		async strategy => {
+			const providerId = "opencode-go";
+			const id = "muse-spark-1.3-contributor";
+			const now = 1_700_000_000_000;
+			const staticModels = [getBundledModel(providerId, id)];
+			const placeholder = {
+				...model(providerId, id),
+				contextWindow: UNK_CONTEXT_WINDOW,
+				maxTokens: UNK_MAX_TOKENS,
+			};
+			const provenance = "same-credential-endpoint";
+			writeModelCache(
+				providerId,
+				now,
+				[placeholder],
+				true,
+				fingerprint(staticModels),
+				cacheDbPath,
+				[id],
+				provenance,
+			);
+			const fetchDynamicModels = vi.fn(async () => null);
+			const options = {
+				providerId,
+				staticModels,
+				cacheDbPath,
+				now: () => now,
+				cacheDynamicModelProvenance: provenance,
+				fetchDynamicModels,
+			};
+			const result = await resolveProviderModels<Api>(options, strategy);
+			expect(result.models[0]).toMatchObject(staticModels[0]!);
+			expect(fetchDynamicModels).toHaveBeenCalledTimes(strategy === "online" ? 1 : 0);
+			const reused = await resolveProviderModels<Api>(options, "offline");
+			expect(reused.models[0]).toMatchObject(staticModels[0]!);
+		},
+	);
 
 	test.each([
 		{ contextWindow: 64_000, maxTokens: 4_000 },

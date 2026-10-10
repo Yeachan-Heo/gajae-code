@@ -444,6 +444,7 @@ type KiroStreamEvent =
 	| { type: "toolUseInput"; data: { input: string } }
 	| { type: "toolUseStop"; data: { stop: boolean } }
 	| { type: "usage"; data: { inputTokens?: number; outputTokens?: number } }
+	| { type: "completion"; data: { stopReason?: string } }
 	| {
 			type: "refusal";
 			data: { stopReason?: string; stopDetails?: { refusal?: { category?: string; explanation?: string } } };
@@ -580,13 +581,20 @@ export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[];
 						stopDetails: parsed.stopDetails as { refusal?: { category?: string; explanation?: string } },
 					},
 				});
-				// Normal terminal metadata (stopReason: "COMPLETED", etc.) without refusal data is ignored
 			} else if (parsed.error || parsed.Error) {
 				events.push({
 					type: "error",
 					data: {
 						error: String(parsed.error || parsed.Error),
 						message: (parsed.message || parsed.Message) as string | undefined,
+					},
+				});
+			} else if (parsed.stopReason && typeof parsed.stopReason === "string") {
+				// Normal terminal metadata without refusal or error: emit completion event
+				events.push({
+					type: "completion",
+					data: {
+						stopReason: parsed.stopReason,
 					},
 				});
 			}
@@ -809,6 +817,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 		const pendingToolCalls: Array<{ input: string; toolCall: ToolCall; index: number }> = [];
 		// Track terminal metadata so we can emit confirmed text even if later reads fail
 		let hasReceivedTerminalMetadata = false; // Set to true when usage event is received
+		let completionSeen = false; // Set to true when completion event is received
 		let textIndex: number | undefined; // Track text block index (accessible in catch)
 		let textContentConfirmed = false; // Track whether text has been committed to blocks (accessible in catch)
 		let textStartDeferred = false; // Track if text_start is deferred (accessible in catch)
@@ -1156,6 +1165,11 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						output.usage.totalTokens = output.usage.input + output.usage.output;
 						// Mark that terminal metadata has been received - text is now confirmed safe
 						hasReceivedTerminalMetadata = true;
+					} else if (event.type === "completion") {
+						// Normal terminal metadata (stopReason: "COMPLETED", etc.) without refusal
+						// Mark completion as seen - text is now confirmed safe even without usage event
+						completionSeen = true;
+						hasReceivedTerminalMetadata = true;
 					} else if (event.type === "refusal") {
 						const refusalData = event.data as {
 							stopReason?: string;
@@ -1208,7 +1222,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 					} else if (event.type === "error") {
 						// On ordinary server errors (error event in stream), emit deferred text and tool events before error
 						// (refusals drop them, incomplete tools must not be emitted)
-						
+
 						// For server-sent errors, emit the deferred text first (it was received before the error)
 						if (textContentConfirmed === false) {
 							// Commit pending text to blocks
@@ -1237,7 +1251,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 								textStartDeferred = false;
 							}
 						}
-						
+
 						// Only emit the tool if it was explicitly completed (has stop flag)
 						if (toolComplete) addToolToBlocks();
 						emitPendingToolCalls();
@@ -1254,6 +1268,16 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						const fullErrorMsg = accumulatedText ? `${errorMsg}\n\nPartial output: ${accumulatedText}` : errorMsg;
 						throw new Error(fullErrorMsg);
 					}
+				}
+			}
+
+			// Check for incomplete JSON frame in leftover buffer at EOF
+			if (buffer.trim().length > 0) {
+				// Non-whitespace content remains in buffer
+				const openBraceIdx = buffer.indexOf("{");
+				if (openBraceIdx >= 0 && findJsonEnd(buffer, openBraceIdx) < 0) {
+					// Incomplete JSON frame at EOF (opening brace with no matching close)
+					throw new Error(`Kiro API key stream truncated: incomplete JSON frame at EOF`);
 				}
 			}
 
@@ -1303,8 +1327,8 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			// - Incomplete currentTool is NOT finalized/emitted (only completed tools in pendingToolCalls flush).
 			// - Unconfirmed text is suppressed (no deferred text emission without terminal metadata)
 
-			// Only emit confirmed text if we received terminal metadata
-			if (hasReceivedTerminalMetadata && textContentConfirmed === false) {
+			// Emit confirmed text if we received completion event or terminal metadata (usage)
+			if ((hasReceivedTerminalMetadata || completionSeen) && textContentConfirmed === false) {
 				// Commit pending text to blocks
 				if (textIndex !== undefined && textIndex < blocks.length && pendingTextContent.length > 0) {
 					const block = blocks[textIndex] as TextContent;
