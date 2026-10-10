@@ -3,8 +3,10 @@ import * as childProcess from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { PublicCommandFailure } from "../src/cli/public-command-errors";
+import { acpMcpLaunchFailure } from "../src/sdk/acp/adapter";
+import { resolveBrokerPackageGeneration } from "../src/sdk/broker/broker";
 import * as discoveryModule from "../src/sdk/broker/discovery";
-import { brokerDiscoveryPath, readBrokerDiscovery } from "../src/sdk/broker/discovery";
+import { brokerDiscoveryPath, brokerProcessIncarnation, readBrokerDiscovery } from "../src/sdk/broker/discovery";
 import {
 	brokerOwnerForTest,
 	ensureBroker,
@@ -42,6 +44,7 @@ async function agentDir(): Promise<string> {
 	return dir;
 }
 
+/** A discovery record naming this live process with its real identity and package generation. */
 async function writeDiscovery(dir: string, overrides: Record<string, unknown>): Promise<void> {
 	const file = brokerDiscoveryPath(dir);
 	await fs.mkdir(path.dirname(file), { recursive: true });
@@ -50,11 +53,13 @@ async function writeDiscovery(dir: string, overrides: Record<string, unknown>): 
 		JSON.stringify({
 			version: 1,
 			protocolVersion: 3,
+			packageGeneration: resolveBrokerPackageGeneration(),
 			host: "127.0.0.1",
 			port: 1,
+			url: "ws://127.0.0.1:1",
 			token: "t",
 			pid: process.pid,
-			incarnation: "not-this-process",
+			incarnation: brokerProcessIncarnation(process.pid),
 			heartbeatAt: Date.now(),
 			...overrides,
 		}),
@@ -95,11 +100,33 @@ it("refuses without spawning when the discovery owner pid is dead", async () => 
 	await expectUnavailableWithoutSpawn(dir);
 });
 
+it("the live-identity fixture is readable, so the stale case fails only on its heartbeat", async () => {
+	const dir = await agentDir();
+	await writeDiscovery(dir, {});
+	expect((await readBrokerDiscovery(dir))?.pid).toBe(process.pid);
+});
+
 it("refuses without spawning when the discovery heartbeat is stale", async () => {
 	process.env[SDK_BROKER_AUTOSTART_ENV] = "0";
 	const dir = await agentDir();
 	await writeDiscovery(dir, { heartbeatAt: 0 });
 	await expectUnavailableWithoutSpawn(dir);
+});
+
+it("refuses a live but incompatible owner without retiring it", async () => {
+	process.env[SDK_BROKER_AUTOSTART_ENV] = "0";
+	const dir = await agentDir();
+	await writeDiscovery(dir, { packageGeneration: "0.0.0-incompatible" });
+	const before = await fs.readFile(brokerDiscoveryPath(dir), "utf8");
+	expect((await readBrokerDiscovery(dir))?.pid).toBe(process.pid);
+	await expectUnavailableWithoutSpawn(dir);
+	// The autostart path would retire this owner; attach-only leaves its record untouched.
+	expect(await fs.readFile(brokerDiscoveryPath(dir), "utf8")).toBe(before);
+});
+
+it("ACP launches with MCP servers keep the attach-only refusal instead of blaming an MCP server", () => {
+	const refusal = new SdkClientError("broker_unavailable", "SDK broker is not running.");
+	expect(acpMcpLaunchFailure(refusal, [{ name: "docs", command: "docs-mcp", args: [] }])).toBe(refusal);
 });
 
 it("attaches to a live broker and re-attaches without spawning after it is gone", async () => {
@@ -211,7 +238,7 @@ for (const caller of PUBLIC_BROKER_CALLERS) {
 	it(`public ${caller.name} with ${SDK_BROKER_AUTOSTART_ENV}=0 refuses with broker_unavailable and spawns nothing`, async () => {
 		const dir = await agentDir();
 		const result = await runCli(caller.argv(dir), { ...process.env, [SDK_BROKER_AUTOSTART_ENV]: "0" });
-		expect(result.exitCode).not.toBe(0);
+		expect(result.exitCode).toBe(1);
 		expect(result.output).toContain("broker_unavailable");
 		await expectNoBrokerArtifacts(dir);
 	});
@@ -222,7 +249,7 @@ it("the --attach-only flag is equivalent to the environment variable", async () 
 	const env = { ...process.env };
 	delete env[SDK_BROKER_AUTOSTART_ENV];
 	const result = await runCli(["sdk", "session", "list", "--attach-only", "--agent-dir", dir, "--json"], env);
-	expect(result.exitCode).not.toBe(0);
+	expect(result.exitCode).toBe(1);
 	expect(result.output).toContain("broker_unavailable");
 	await expectNoBrokerArtifacts(dir);
 });

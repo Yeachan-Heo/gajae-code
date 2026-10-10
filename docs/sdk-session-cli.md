@@ -60,10 +60,16 @@ Set `GJC_SDK_BROKER_AUTOSTART=0` when a supervisor (for example a system
 service) owns the broker. Every SDK client entry point — `gjc sdk session`,
 `gjc sdk search`, `gjc sdk spawn`, the SDK and coordinator MCP servers, ACP,
 and session hosts — then only attaches to a live, reusable broker and never
-spawns, retires, or restarts one. When discovery is absent, stale, or names a
-dead process, the call fails with `broker_unavailable` (exit 1). Any other
-value, or an unset variable, keeps on-demand startup. The broker entrypoints
-ignore the variable, so it is safe for broker descendants to inherit it.
+spawns, retires, or restarts one. When discovery is absent, stale, names a
+dead process, or names a live broker this client cannot reuse, the call fails
+with `broker_unavailable` (exit 1) and leaves the incumbent untouched. Broker
+management refuses too, before any effect: `gjc doctor` broker restart reports
+`attach_only_refused`, and `scripts/restart-sdk-broker.ts` exits with an error
+without closing hosts or stopping the broker. Restart through the supervisor
+instead. Any other value, or an unset variable, keeps on-demand startup. The
+broker entrypoints ignore the variable, so it is safe for broker descendants to
+inherit it. A supervisor that wants its broker's session hosts to stay
+attach-only sets the variable on the broker process as well.
 
 `--attach-only` is the per-invocation flag form on `gjc sdk session …`,
 `gjc sdk search`, `gjc sdk spawn` and `gjc mcp-serve`. `gjc sdk serve` needs
