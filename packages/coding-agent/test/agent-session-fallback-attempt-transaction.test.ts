@@ -275,6 +275,34 @@ function zeroTokenEmptyStopStream(model: Model, typed = true, teardown = false):
 	});
 	return stream;
 }
+
+function typedOverflowEmptyStopStream(model: Model): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			transportFailure: { kind: "transport", status: 400, providerCode: "context_length_exceeded" },
+			timestamp: Date.now(),
+		};
+		stream.push({ type: "start", partial: message });
+		stream.push({ type: "done", reason: "stop", message });
+	});
+	return stream;
+}
+
 function toolUseStream(model: Model, toolCall: ToolCall): AssistantMessageEventStream {
 	const stream = new AssistantMessageEventStream();
 	queueMicrotask(() => {
@@ -508,6 +536,24 @@ describe("AgentSession managed fallback attempt transaction", () => {
 		]);
 	});
 
+	it("preserves typed context overflow on a zero-token empty stop", async () => {
+		const calls: string[] = [];
+		const { primary } = createSession((model, context, options) => {
+			calls.push(selector(model));
+			return calls.length === 1
+				? typedOverflowEmptyStopStream(model)
+				: createMockModel({ responses: [{ content: ["accepted"] }] }).stream(model, context, options);
+		});
+
+		await session!.prompt("recover from typed context overflow");
+		await session!.waitForIdle();
+
+		expect(calls).toEqual([selector(primary), selector(primary)]);
+		expect(session!.messages.filter(message => message.role === "assistant")).toEqual([
+			expect.objectContaining({ content: [expect.objectContaining({ type: "text", text: "accepted" })] }),
+		]);
+	});
+
 	it.each([false, true])("falls back after a clean untyped zero-token empty stop (teardown=%s)", async teardown => {
 		const calls: string[] = [];
 		const { agent, primary, fallback } = createSession((model, context, options) => {
@@ -523,7 +569,7 @@ describe("AgentSession managed fallback attempt transaction", () => {
 		await session!.waitForIdle();
 
 		expect(calls).toEqual([selector(primary), selector(fallback)]);
-		expect(session!.model).toEqual(fallback);
+		expect(session!.model && selector(session!.model)).toBe(selector(fallback));
 		expect(events.filter(event => event.type === "model_fallback_switched")).toHaveLength(1);
 		const lifecycle = assistantLifecycleEvents(events);
 		expect(lifecycle.filter(event => event.type === "message_start")).toHaveLength(1);

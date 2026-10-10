@@ -1300,7 +1300,7 @@ export class InputController {
 		});
 
 		// Stop the TUI (restore terminal to normal mode)
-		this.ctx.ui.stop();
+		this.ctx.ui.suspend();
 
 		// Send SIGTSTP to process group (pid=0 means all processes in group)
 		process.kill(0, "SIGTSTP");
@@ -2556,7 +2556,7 @@ export class InputController {
 		let ttyHandle: fs.FileHandle | null = null;
 		try {
 			ttyHandle = await this.#openEditorTerminalHandle();
-			this.ctx.ui.stop();
+			this.ctx.ui.suspend();
 
 			const stdio: [number | "inherit", number | "inherit", number | "inherit"] = ttyHandle
 				? [ttyHandle.fd, ttyHandle.fd, ttyHandle.fd]

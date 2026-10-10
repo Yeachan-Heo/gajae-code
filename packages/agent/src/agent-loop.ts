@@ -726,7 +726,7 @@ function managedContextOverflow(message: AssistantMessage, config: AgentLoopConf
 	const transportFailure = managedTransportFailure(message);
 	// Managed empty-stop responses may be repaired by the managed shell below; only
 	// typed/error overflows are discardable before that normalization boundary.
-	if (config.fallbackManaged && message.stopReason !== "error") return false;
+	if ((config.fallbackManaged || config.contextOverflowManaged) && message.stopReason !== "error") return false;
 	return classifyContextOverflow(message, transportFailure, config.model.contextWindow);
 }
 

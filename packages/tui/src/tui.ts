@@ -21,12 +21,17 @@ import {
 	TERMINAL,
 } from "./terminal-capabilities";
 import {
+	type CopyRowAnnotation,
 	Ellipsis,
+	extractCopyRowAnnotation,
 	extractSegments,
 	isPrintableAscii,
 	normalizeTerminalOutput,
+	retainCopyAnnotations,
 	sliceByColumn,
 	sliceWithWidth,
+	splitCopyAnnotations,
+	stripCopyApcs,
 	truncateLinesToWidth,
 	truncateToWidth,
 	visibleWidth,
@@ -105,6 +110,8 @@ const LINE_TERMINATOR = "\x1b[0m\x1b]8;;\x07";
 const MOUSE_SELECTION_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 /** Discrete mouse-wheel notch size in terminal rows (xterm/less-style). */
 export const DEFAULT_WHEEL_LINES = 3;
+/** Row step cadence while a held drag rests on the transcript edge. */
+const MOUSE_AUTO_SCROLL_INTERVAL_MS = 50;
 /**
  * Repeat clicks on the same cell within this window escalate char -> word -> line
  * selection. SGR mouse reports carry no click counter, so the escalation is timed
@@ -1002,6 +1009,8 @@ export class TUI extends Container {
 	#latestRenderedLines: string[] = [];
 	#latestRenderedTranscriptLineCount = 0;
 	#latestRenderedSuffixLineCount = 0;
+	// Transient live rows between transcript content and the pinned suffix.
+	#latestRenderedFrontierSpacerLineCount = 0;
 	#latestRenderedPlacementOwners = new Map<string, KittyPlacementOwner>();
 	#kittyPlacementSpans: KittyPlacementSpan[] = [];
 	#latestRaw: string[] = [];
@@ -1019,6 +1028,7 @@ export class TUI extends Container {
 	#restartDurableRawLines: string[] = [];
 	#restartDurableWidth = 0;
 	#transcriptIdentityReplaced = false;
+	#transcriptRebuildPending = false;
 	#lineNormalizationCache = new Map<string, LineNormalizationCacheEntry>();
 	#lineEmitWidthCache = new Map<string, number>();
 	#lineTruncationCache = new Map<string, string>();
@@ -1078,6 +1088,9 @@ export class TUI extends Container {
 	#forcedRenderQueued = false;
 	#restartViewportRepaintPending = false;
 	#lastObservedWidth = 0;
+	// Preserve the last committed grid before requestRender(true) invalidates diff dimensions.
+	#forcedRenderPreviousWidth = 0;
+	#forcedRenderPreviousHeight = 0;
 	// Trailing debounce for the settled width repair. Instance-local: taken from
 	// options.widthSettleMs when provided (deterministic harnesses pass 0 to
 	// disable), otherwise from GJC_TUI_WIDTH_SETTLE_MS / PI_TUI_WIDTH_SETTLE_MS,
@@ -1106,6 +1119,7 @@ export class TUI extends Container {
 	#nativeScrollbackAdmissionPending = false;
 	#transcriptIdentityResetPending = false;
 	#manualViewportTop: number | undefined;
+	#manualResumeViewportTop: number | undefined; // Preserved through temporary stop/start while manual history is active.
 	#viewportAnchorComponent: Component | null = null;
 	#viewportAnchorFrame: ViewportAnchorFrame | null = null;
 	#manualViewportAnchor: ManualViewportAnchor | null = null;
@@ -1151,6 +1165,14 @@ export class TUI extends Container {
 	#mouseGestureDragged = false;
 	#mousePressPoint: MouseSelectionPoint | null = null;
 	#mousePressAt = 0;
+	/** Last screen cell of a held drag; scrolling re-resolves it against the new viewport. */
+	#mouseDragPointer: { x: number; y: number } | null = null;
+	/** Edge scrolling waits until the drag leaves the press row, so a small drag on an edge row stays put. */
+	#mousePressRow = 0;
+	#mouseDragLeftPressRow = false;
+	#mouseAutoScrollTimer?: NodeJS.Timeout;
+	/** Held only while this TUI runs with mouse copying, so other render() consumers stay stock. */
+	#releaseCopyAnnotations: (() => void) | undefined;
 	#lastClickPoint: MouseSelectionPoint | null = null;
 	#lastClickAt = 0;
 	#clickCount = 0;
@@ -1159,6 +1181,7 @@ export class TUI extends Container {
 	#manualOutputNotice = false;
 	#manualTranscriptLineCount = 0;
 	#manualSuffixLineCount = 0;
+	#manualFrontierSpacerLineCount = 0;
 	#committedTranscriptRows: Array<number | null> = [];
 	#paintedManualOutputNotice = false;
 	#rasterGeneration = 0;
@@ -1332,6 +1355,9 @@ export class TUI extends Container {
 	override dispose(): void {
 		if (this.#preparationDisposed) return;
 		this.#preparationDisposed = true;
+		this.#clearMouseSelection();
+		this.#releaseCopyAnnotations?.();
+		this.#releaseCopyAnnotations = undefined;
 		this.#renderRequested = false;
 		this.#renderRequestedGeneration = 0;
 		this.#inputRenderPending = false;
@@ -1554,6 +1580,11 @@ export class TUI extends Container {
 	getViewportAnchorComponent(): Component | null {
 		return this.#viewportAnchorComponent;
 	}
+	#captureManualResumeViewportTop(): void {
+		if (this.#latestRenderedFrontierSpacerLineCount === 0) return;
+		const committedFrontier = this.#scrollbackResumeViewportTop ?? this.#nativeScrollbackViewportTop;
+		this.#manualResumeViewportTop = committedFrontier > 0 ? committedFrontier : undefined;
+	}
 
 	/** Clear manual viewport ownership and durable history before replacing the transcript identity. */
 	resetViewportAnchorIntent(): void {
@@ -1565,6 +1596,7 @@ export class TUI extends Container {
 		this.#scrollbackResumeViewportTop = undefined;
 		this.#nativeScrollbackViewportTop = 0;
 		this.#nativeScrollbackAdmissionPending = false;
+		this.#manualResumeViewportTop = undefined;
 		this.#transcriptIdentityResetPending = true;
 		this.#manualOutputNotice = false;
 		this.#paintedManualOutputNotice = false;
@@ -1587,6 +1619,8 @@ export class TUI extends Container {
 
 	/** Allow one semantic-neighbor reconciliation after a definitive same-transcript rebuild. */
 	prepareViewportAnchorForTranscriptRebuild(): void {
+		this.#transcriptRebuildPending = true;
+		this.#manualResumeViewportTop = undefined;
 		if (this.#manualViewportAnchor !== null) this.#reconcileMissingViewportAnchor = true;
 	}
 
@@ -1641,6 +1675,7 @@ export class TUI extends Container {
 			this.#suspendRasterLeasesForManualViewport(() => this.revealViewportAnchor(id, alignment))
 		)
 			return true;
+		if (this.#manualViewportTop === undefined) this.#captureManualResumeViewportTop();
 		this.#manualViewportAnchor = {
 			id: selected.id,
 			graphemeIndex:
@@ -1692,6 +1727,7 @@ export class TUI extends Container {
 		const previousManualViewportAnchor = this.#manualViewportAnchor;
 		const previousManualViewportFallbackAnchors = this.#manualViewportFallbackAnchors;
 		const previousReconcileMissingViewportAnchor = this.#reconcileMissingViewportAnchor;
+		const previousManualResumeViewportTop = this.#manualResumeViewportTop;
 
 		const direction: -1 | 1 = delta < 0 ? -1 : 1;
 		const pin = options?.pin ?? "stable";
@@ -1786,6 +1822,7 @@ export class TUI extends Container {
 				this.#manualViewportFallbackAnchors = fallbacks;
 			}
 		}
+		if (previousManualViewportTop === undefined) this.#captureManualResumeViewportTop();
 		this.#manualViewportTop = targetViewportTop;
 		let contentPainted = false;
 		const painted = this.#repaintViewportFromLines(
@@ -1800,13 +1837,15 @@ export class TUI extends Container {
 				contentPainted = true;
 				this.#manualTranscriptLineCount = this.#latestRenderedTranscriptLineCount;
 				this.#manualSuffixLineCount = this.#latestRenderedSuffixLineCount;
+				this.#manualFrontierSpacerLineCount = this.#latestRenderedFrontierSpacerLineCount;
 			},
 			false,
 			this.#kittyPlacementSpans,
 			this.#kittyPlacementSpansForLines(this.#previousLines, this.#latestRenderedPlacementOwners),
 			{
-				transcriptLineCount: this.#latestRenderedTranscriptLineCount,
-				suffixLineCount: this.#latestRenderedSuffixLineCount,
+				transcriptLineCount: this.#manualTranscriptLineCount,
+				suffixLineCount: this.#manualSuffixLineCount,
+				frontierSpacerLineCount: this.#manualFrontierSpacerLineCount,
 			},
 			true,
 		);
@@ -1815,6 +1854,7 @@ export class TUI extends Container {
 			this.#manualViewportAnchor = previousManualViewportAnchor;
 			this.#manualViewportFallbackAnchors = previousManualViewportFallbackAnchors;
 			this.#reconcileMissingViewportAnchor = previousReconcileMissingViewportAnchor;
+			this.#manualResumeViewportTop = previousManualResumeViewportTop;
 		}
 		return painted;
 	}
@@ -1830,14 +1870,19 @@ export class TUI extends Container {
 		if (this.#manualViewportTop === undefined) return false;
 		const height = this.terminal.rows;
 		const width = this.terminal.columns;
+		// Manual rendering can drop transient padding from the latest frame; restore the
+		// frontier captured when manual history began before rebuilding the live viewport.
+		const committedFrontier = this.#manualResumeViewportTop;
 		const paddedLiveLines = this.#padBeforeBottomPinnedComponent(
 			this.#latestRenderedLines,
-			height,
+			committedFrontier === undefined ? height : Math.max(height, committedFrontier + height),
 			this.#latestRenderedSuffixLineCount,
 		);
 		const liveLines = paddedLiveLines.lines;
 		const liveTranscriptLineCount = this.#latestRenderedTranscriptLineCount;
-		const liveSuffixLineCount = this.#latestRenderedSuffixLineCount + paddedLiveLines.insertedBlankRows;
+		const liveSuffixLineCount = this.#latestRenderedSuffixLineCount;
+		const liveFrontierSpacerLineCount =
+			this.#latestRenderedFrontierSpacerLineCount + paddedLiveLines.insertedBlankRows;
 		const liveKittyPlacementSpans = this.#kittyPlacementSpansForLines(liveLines, this.#latestRenderedPlacementOwners);
 		let liveCursorPosition = this.#lastCursorPosition;
 		if (liveCursorPosition !== null && liveCursorPosition.row >= paddedLiveLines.insertionRow) {
@@ -1863,11 +1908,14 @@ export class TUI extends Container {
 				this.#manualOutputNotice = false;
 				this.#committedTranscriptRows = [];
 				this.#paintedManualOutputNotice = false;
+				this.#manualResumeViewportTop = undefined;
 				this.#lastCursorPosition = liveCursorPosition;
 				this.#previousLines = liveLines;
 				this.#manualTranscriptLineCount = liveTranscriptLineCount;
 				this.#manualSuffixLineCount = liveSuffixLineCount;
+				this.#manualFrontierSpacerLineCount = liveFrontierSpacerLineCount;
 				this.#latestRenderedLines = liveLines.slice();
+				this.#latestRenderedFrontierSpacerLineCount = liveFrontierSpacerLineCount;
 				if (this.#scrollbackResumeViewportTop === undefined) {
 					this.#nativeScrollbackViewportTop = liveViewportTop;
 				}
@@ -1884,7 +1932,11 @@ export class TUI extends Container {
 			true,
 			this.#kittyPlacementSpans,
 			liveKittyPlacementSpans,
-			{ transcriptLineCount: liveTranscriptLineCount, suffixLineCount: liveSuffixLineCount },
+			{
+				transcriptLineCount: liveTranscriptLineCount,
+				suffixLineCount: liveSuffixLineCount,
+				frontierSpacerLineCount: liveFrontierSpacerLineCount,
+			},
 		);
 	}
 
@@ -2110,9 +2162,7 @@ export class TUI extends Container {
 			}
 			let multipartAbortBarrier: (() => void) | undefined;
 			if (op.type === "raster-multipart-batch" && op.prefix !== undefined && op.afterPrefix !== undefined) {
-				const prefixWritten = this.#guardTerminalOperation(() =>
-					this.terminal.write(new TextDecoder().decode(op.prefix)),
-				);
+				const prefixWritten = this.#guardTerminalOperation(() => this.#emit(new TextDecoder().decode(op.prefix)));
 				if (!prefixWritten) return failed();
 				const abortBarrier = () => {
 					if (this.#inFlightMultipartAbort === abortBarrier) this.#inFlightMultipartAbort = undefined;
@@ -2123,7 +2173,7 @@ export class TUI extends Container {
 					const abortSuffix = op.abortSuffix === undefined ? "" : new TextDecoder().decode(op.abortSuffix);
 					const cursorVisibility = op.restoreCursorVisibility ? this.#cursorVisibilitySequence() : "";
 					if (abortSuffix || cursorVisibility)
-						this.#guardTerminalOperation(() => this.terminal.write(abortSuffix + cursorVisibility));
+						this.#guardTerminalOperation(() => this.#emit(abortSuffix + cursorVisibility));
 				};
 				multipartAbortBarrier = abortBarrier;
 				this.#inFlightMultipartAbort = abortBarrier;
@@ -2204,7 +2254,7 @@ export class TUI extends Container {
 			const dependent = op.type === "generic-render" || op.type === "generic-full-redraw";
 			const ok = dependent
 				? this.#writeProtectedRenderIngress(finalBytes)
-				: this.#guardTerminalOperation(() => this.terminal.write(finalBytes));
+				: this.#guardTerminalOperation(() => this.#emit(finalBytes));
 			if (ok && this.#inFlightMultipartAbort === multipartAbortBarrier) {
 				this.#inFlightMultipartAbort = undefined;
 			} else if (!ok && multipartAbortBarrier) {
@@ -2234,7 +2284,7 @@ export class TUI extends Container {
 			lease.revoked = true;
 			this.#rasterLeases.delete(request.token.ownerId);
 			const erase = this.#cursorGuardedRasterSequence(new TextDecoder().decode(lease.erase));
-			const ok = this.#guardTerminalOperation(() => this.terminal.write(erase));
+			const ok = this.#guardTerminalOperation(() => this.#emit(erase));
 			if (!ok)
 				this.#rasterCleanup.set(request.token.ownerId, {
 					token: lease.token,
@@ -2418,7 +2468,7 @@ export class TUI extends Container {
 			)
 		)
 			return false;
-		return this.#guardTerminalOperation(() => this.terminal.write(buffer));
+		return this.#guardTerminalOperation(() => this.#emit(buffer));
 	}
 	#writeProtectedRenderIngress(buffer: string): boolean {
 		const affected = [...this.#rasterLeases.values()];
@@ -2432,7 +2482,7 @@ export class TUI extends Container {
 				...affected.map(lease => new TextDecoder().decode(lease.erase)),
 			].join(""),
 		);
-		const ok = this.#guardTerminalOperation(() => this.terminal.write(cleanup + buffer));
+		const ok = this.#guardTerminalOperation(() => this.#emit(cleanup + buffer));
 		if (!ok) {
 			this.#terminalUnavailable = true;
 			this.#previousLines = [];
@@ -2518,6 +2568,9 @@ export class TUI extends Container {
 			this.#markTerminalUnavailable();
 			throw error;
 		}
+		// Taken only once the terminal started, so a failed start never leaves annotations on.
+		if (this.options.enableMouse === true && this.options.copySelection && !this.#releaseCopyAnnotations)
+			this.#releaseCopyAnnotations = retainCopyAnnotations();
 		if (this.#pendingTerminalCleanup.length > 0 || this.#rasterCleanup.size > 0) {
 			void this.notifyTerminalLifecycle({
 				kind: "availability-restored",
@@ -2661,8 +2714,13 @@ export class TUI extends Container {
 		this.#clearSixelProbeState();
 	}
 
+	/** The only terminal write sink: copy APCs are in-process metadata and never reach the terminal. */
+	#emit(data: string): void {
+		this.terminal.write(stripCopyApcs(data));
+	}
+
 	#writeTerminal(data: string, deferRenderFailure = false): boolean {
-		return this.#guardTerminalOperation(() => this.terminal.write(data), !deferRenderFailure);
+		return this.#guardTerminalOperation(() => this.#emit(data), !deferRenderFailure);
 	}
 
 	#frameSynchronizedOutput(payload: string): string {
@@ -2701,7 +2759,7 @@ export class TUI extends Container {
 			return false;
 		}
 		try {
-			this.terminal.write(data);
+			this.#emit(data);
 		} catch {
 			this.#markTerminalUnavailable();
 			return false;
@@ -2882,6 +2940,15 @@ export class TUI extends Container {
 	}
 
 	stop(): void {
+		this.#stop(false);
+	}
+
+	/** Temporarily releases terminal modes for foreground handoff and preserves viewport state for restart. */
+	suspend(): void {
+		this.#stop(true);
+	}
+
+	#stop(temporary: boolean): void {
 		this.#invalidatePreparations();
 		// Invalidate every raster-queue body captured under the running epoch
 		// before any teardown: nothing queued before stop may write after
@@ -2895,6 +2962,8 @@ export class TUI extends Container {
 		this.#clearSixelProbeState();
 		this.#clearMouseSelection();
 		this.#resetClickCount();
+		this.#releaseCopyAnnotations?.();
+		this.#releaseCopyAnnotations = undefined;
 		this.#stopped = true;
 		this.#settleRenderCommitWaiters(false);
 		if (this.#renderTimer) {
@@ -2909,17 +2978,26 @@ export class TUI extends Container {
 		// An armed TIMER dies with the session, but a repair already deferred while
 		// the user was reading scrollback must survive a temporary stop/start
 		// (Ctrl-Z resume, external editor): manual viewport ownership survives
-		// restart, so followLiveViewport() still needs the pending repair. Without
-		// manual ownership the flags are moot — start() issues a forced full render.
+		// restart, so followLiveViewport() still needs the pending repair and saved
+		// frontier because teardown drops its transient spacers. Without manual
+		// ownership the flags are moot — start() issues a forced full render.
 		if (this.#manualViewportTop === undefined) {
 			this.#widthSettleRepairPending = false;
 			this.#tabWidthRepairPending = false;
+			this.#manualResumeViewportTop = undefined;
 		}
-		// Move the cursor after the frame actually displayed to prevent
-		// overwriting/artifacts on exit. The latest logical frame can differ while
-		// a semantic viewport retains the previously painted frame.
 		const displayedFrameLines = this.#previousLines.length || this.#latestRenderedLines.length;
-		if (displayedFrameLines > 0) {
+		if (displayedFrameLines > 0 && this.#manualViewportTop !== undefined) {
+			// The manual viewport's logical row is not a physical screen coordinate.
+			// Insert a blank bottom handoff row and discard the pinned row rather than
+			// scrolling committed history into native scrollback. start() redraws the
+			// pinned suffix on resume.
+			const bottomRow = Math.max(1, this.terminal.rows);
+			this.#writeTerminal(`\x1b[${bottomRow};1H\x1b[1L`);
+			this.#hardwareCursorRow = bottomRow - 1;
+		} else if (displayedFrameLines > 0) {
+			// The latest logical frame can differ from the last painted frame when a
+			// semantic viewport retains its previous image.
 			const targetRow = displayedFrameLines; // Line after the last content
 			const lineDiff = targetRow - this.#hardwareCursorRow;
 			if (lineDiff > 0) {
@@ -2928,6 +3006,7 @@ export class TUI extends Container {
 				this.#writeTerminal(`\x1b[${-lineDiff}A`);
 			}
 			this.#writeTerminal("\r\n");
+			this.#hardwareCursorRow = targetRow + 1;
 		}
 
 		if (this.#useImeBlockCursor) {
@@ -2943,7 +3022,9 @@ export class TUI extends Container {
 		// non-manual restart keeps only the durable baseline until its first render:
 		// that render can admit a raw-prefix-proven append without replaying history.
 		this.#restartViewportRepaintPending =
-			this.#manualViewportTop === undefined && (this.#previousLines.length > 0 || this.#maxLinesRendered > 0);
+			temporary &&
+			this.#manualViewportTop === undefined &&
+			(this.#previousLines.length > 0 || this.#maxLinesRendered > 0);
 		if (this.#restartViewportRepaintPending) {
 			this.#restartDurableLineCount = this.#durableLineCount;
 			this.#restartDurableRenderedLines = this.#durableRenderedLines.slice();
@@ -2972,6 +3053,11 @@ export class TUI extends Container {
 		this.#lineEmitWidthCache.clear();
 		this.#previousWidth = 0;
 		this.#previousHeight = 0;
+		this.#forcedRenderPreviousWidth = 0;
+		this.#forcedRenderPreviousHeight = 0;
+		this.#transcriptRebuildPending = false;
+		this.#latestRenderedFrontierSpacerLineCount = 0;
+		this.#manualFrontierSpacerLineCount = 0;
 		this.#resizeRenderQueued = false;
 		this.#resizeRenderMutationQueued = false;
 		this.#renderMutationQueued = false;
@@ -3278,8 +3364,14 @@ export class TUI extends Container {
 		if (force) {
 			// A forced full redraw supersedes any queued input-priority render.
 			this.#inputRenderPending = false;
-			if (!widthSettleRequest) this.#forcedRenderQueued = true;
 			if (!widthSettleRequest) {
+				if (!this.#forcedRenderQueued) {
+					this.#forcedRenderPreviousWidth =
+						this.#previousWidth < 0 ? this.#forcedRenderPreviousWidth : this.#previousWidth;
+					this.#forcedRenderPreviousHeight =
+						this.#previousHeight < 0 ? this.#forcedRenderPreviousHeight : this.#previousHeight;
+				}
+				this.#forcedRenderQueued = true;
 				this.#previousWidth = -1; // -1 triggers widthChanged
 				this.#previousHeight = -1; // -1 triggers heightChanged
 			}
@@ -3388,15 +3480,29 @@ export class TUI extends Container {
 			data = current;
 		}
 
-		const mouse = parseSgrMouseEvent(data);
+		let mouse = parseSgrMouseEvent(data);
 		if (mouse) {
+			// A held selection may leave the window; clamp it to the nearest cell so
+			// the drag keeps extending instead of being discarded.
+			if (this.#mouseButtonDown && (mouse.kind === "drag" || mouse.kind === "release" || mouse.kind === "wheel")) {
+				mouse = {
+					...mouse,
+					x: Math.min(mouse.x, this.terminal.columns),
+					y: Math.min(mouse.y, this.terminal.rows),
+				};
+			}
 			// Coordinates outside the current terminal cannot name a visible cell.
 			if (mouse.x > this.terminal.columns || mouse.y > this.terminal.rows) {
 				this.#clearMouseSelection();
 				this.#resetClickCount();
 				return;
 			}
-			if (mouse.kind === "wheel") {
+			if (mouse.kind === "wheel" && this.#mouseButtonDown && this.#mouseSelectionAnchor !== null) {
+				// Wheel during a held drag scrolls under the pointer and keeps extending.
+				this.scrollViewportBy(mouse.direction! * DEFAULT_WHEEL_LINES, { pin: "stable" });
+				this.#extendMouseSelectionAt(mouse);
+				this.#updateMouseAutoScroll();
+			} else if (mouse.kind === "wheel") {
 				this.#clearMouseSelection();
 				this.#resetClickCount();
 				this.scrollViewportBy(mouse.direction! * DEFAULT_WHEEL_LINES, { pin: "stable" });
@@ -3505,6 +3611,100 @@ export class TUI extends Container {
 			: { line, column: mouse.x - 1 };
 	}
 
+	/** Screen rows (zero-based) that currently show transcript lines. */
+	#transcriptScreenRows(): { first: number; last: number } | null {
+		this.#ensureLiveSelectionRows();
+		let first = -1;
+		let last = -1;
+		for (let row = 0; row < this.#committedTranscriptRows.length; row++) {
+			const line = this.#committedTranscriptRows[row];
+			if (line === null || line === undefined || line < 0 || line >= this.#manualTranscriptLineCount) continue;
+			if (first < 0) first = row;
+			last = row;
+		}
+		return first < 0 ? null : { first, last };
+	}
+
+	/**
+	 * A held drag over editor/status chrome or past the transcript still names a
+	 * transcript cell: the nearest visible row, at the pointer column, extended to
+	 * the row edge so a downward drag reaches the end of the last line.
+	 */
+	#mouseDragPoint(pointer: { x: number; y: number }): MouseSelectionPoint | null {
+		const rows = this.#transcriptScreenRows();
+		const direct = this.#mouseSelectionPoint({ kind: "drag", x: pointer.x, y: pointer.y });
+		if (direct !== null || rows === null) return direct;
+		const above = pointer.y - 1 < rows.first;
+		const line = this.#committedTranscriptRows[above ? rows.first : rows.last]!;
+		return { line, column: above ? 0 : Math.max(0, this.terminal.columns - 1) };
+	}
+
+	/** Following live clears the screen-row map until the next paint; rebuild it from the live viewport. */
+	#ensureLiveSelectionRows(): void {
+		if (this.#manualViewportTop !== undefined || this.#committedTranscriptRows.length > 0) return;
+		this.#refreshPaintedLiveViewportObservation(this.terminal.rows);
+	}
+
+	#extendMouseSelectionAt(pointer: { x: number; y: number }): void {
+		const anchor = this.#mouseSelectionAnchor;
+		if (this.#mouseSelectionStart === null || anchor === null) return;
+		this.#mouseDragPointer = { x: pointer.x, y: pointer.y };
+		this.#mouseGestureDragged = true;
+		if (pointer.y !== this.#mousePressRow) this.#mouseDragLeftPressRow = true;
+		const point = this.#mouseDragPoint(pointer);
+		if (point === null) return;
+		const forward = point.line > anchor.line || (point.line === anchor.line && point.column >= anchor.column);
+		// The anchor span stays whole while the far end grows, so dragging after a
+		// double click extends word by word instead of collapsing back to one cell.
+		this.#mouseSelectionStart = this.#snapSelectionPoint(anchor, forward ? "start" : "end");
+		this.#mouseSelectionEnd = this.#snapSelectionPoint(point, forward ? "end" : "start");
+		this.#mouseSelectionActive = true;
+	}
+
+	/** Edge direction for a held drag: above the first or at/below the last transcript row. */
+	#mouseAutoScrollDirection(pointer: { x: number; y: number }): -1 | 0 | 1 {
+		const rows = this.#transcriptScreenRows();
+		if (rows === null || !this.#mouseDragLeftPressRow) return 0;
+		const row = pointer.y - 1;
+		if (row <= rows.first) return -1;
+		if (row >= rows.last || row >= this.terminal.rows - 1) return 1;
+		return 0;
+	}
+
+	#updateMouseAutoScroll(): void {
+		const pointer = this.#mouseDragPointer;
+		const direction = pointer && this.#mouseButtonDown ? this.#mouseAutoScrollDirection(pointer) : 0;
+		if (direction === 0) {
+			this.#stopMouseAutoScroll();
+			return;
+		}
+		if (this.#mouseAutoScrollTimer !== undefined) return;
+		this.#mouseAutoScrollTimer = setInterval(() => {
+			const held = this.#mouseDragPointer;
+			const step = held && this.#mouseButtonDown ? this.#mouseAutoScrollDirection(held) : 0;
+			const before = this.#transcriptScreenRows();
+			const firstLine = before === null ? null : this.#committedTranscriptRows[before.first];
+			if (held === null || step === 0 || !this.scrollViewportBy(step, { pin: "stable" })) {
+				this.#stopMouseAutoScroll();
+				return;
+			}
+			// A boundary (live bottom, history top) reports success without moving.
+			const after = this.#transcriptScreenRows();
+			if (after === null || this.#committedTranscriptRows[after.first] === firstLine) {
+				this.#stopMouseAutoScroll();
+				return;
+			}
+			this.#extendMouseSelectionAt(held);
+			this.requestRender(false, "mouse");
+		}, MOUSE_AUTO_SCROLL_INTERVAL_MS);
+	}
+
+	#stopMouseAutoScroll(): void {
+		if (this.#mouseAutoScrollTimer === undefined) return;
+		clearInterval(this.#mouseAutoScrollTimer);
+		this.#mouseAutoScrollTimer = undefined;
+	}
+
 	/**
 	 * Resolve the selection granularity for this press. SGR mouse reports carry no
 	 * click counter, so repeats are inferred from the previous press: same cell and
@@ -3600,6 +3800,8 @@ export class TUI extends Container {
 		const mode = this.#nextClickMode(point, pressAt);
 		this.#mouseButtonDown = true;
 		this.#mouseGestureDragged = false;
+		this.#mousePressRow = mouse.y;
+		this.#mouseDragLeftPressRow = false;
 		this.#mousePressPoint = point;
 		this.#mousePressAt = pressAt;
 		this.#mouseSelectionMode = mode;
@@ -3616,17 +3818,8 @@ export class TUI extends Container {
 			this.#resetClickCount();
 			return;
 		}
-		const anchor = this.#mouseSelectionAnchor;
-		if (this.#mouseSelectionStart === null || anchor === null) return;
-		const point = this.#mouseSelectionPoint(mouse);
-		this.#mouseGestureDragged = true;
-		if (point === null) return;
-		const forward = point.line > anchor.line || (point.line === anchor.line && point.column >= anchor.column);
-		// The anchor span stays whole while the far end grows, so dragging after a
-		// double click extends word by word instead of collapsing back to one cell.
-		this.#mouseSelectionStart = this.#snapSelectionPoint(anchor, forward ? "start" : "end");
-		this.#mouseSelectionEnd = this.#snapSelectionPoint(point, forward ? "end" : "start");
-		this.#mouseSelectionActive = true;
+		this.#extendMouseSelectionAt(mouse);
+		this.#updateMouseAutoScroll();
 	}
 
 	#finishMouseSelection(mouse: MouseEvent): void {
@@ -3635,7 +3828,10 @@ export class TUI extends Container {
 			return;
 		}
 		this.#mouseButtonDown = false;
-		const point = this.#mouseSelectionPoint(mouse);
+		this.#stopMouseAutoScroll();
+		this.#mouseDragPointer = null;
+		const dragged = this.#mouseGestureDragged;
+		const point = dragged ? this.#mouseDragPoint(mouse) : this.#mouseSelectionPoint(mouse);
 		const pressPoint = this.#mousePressPoint;
 		const pressAt = this.#mousePressAt;
 		const completedClick =
@@ -3664,7 +3860,9 @@ export class TUI extends Container {
 			this.#clearMouseSelection();
 			return;
 		}
-		const text = this.#extractMouseSelection();
+		// Source-aware rows return original Markdown, which may carry ESC/C0 bytes from
+		// model or tool text; sanitize at the clipboard boundary (\t and \n survive).
+		const text = stripTerminalControls(this.#extractMouseSelection());
 		if (!text) {
 			this.#clearMouseSelection();
 			return;
@@ -3678,6 +3876,8 @@ export class TUI extends Container {
 	}
 
 	#clearMouseSelection(): void {
+		this.#stopMouseAutoScroll();
+		this.#mouseDragPointer = null;
 		this.#mouseSelectionStart = null;
 		this.#mouseSelectionEnd = null;
 		this.#mouseSelectionAnchor = null;
@@ -3715,23 +3915,182 @@ export class TUI extends Container {
 	#extractMouseSelection(): string {
 		const selection = this.#orderedMouseSelection();
 		if (selection === null) return "";
-		const selected: string[] = [];
+		type SelectedRow = {
+			line: number;
+			fragment: string;
+			sourceId?: string;
+			annotation?: CopyRowAnnotation;
+			covered?: boolean;
+			atContentStart?: boolean;
+			/** Selected text per table cell; empty where the selection misses the cell. */
+			cells?: string[];
+			/** Folded into the row above as the soft-wrapped tail of its cells. */
+			merged?: boolean;
+		};
+		const selected: SelectedRow[] = [];
 		const selectionLines = this.#selectionSourceLines();
 		for (let lineIndex = selection.start.line; lineIndex <= selection.end.line; lineIndex++) {
 			const line = selectionLines[lineIndex];
 			if (line === undefined || TERMINAL.isImageLine(line)) {
-				selected.push("");
+				selected.push({ line: lineIndex, fragment: "" });
 				continue;
 			}
-			const plain = stripTerminalControls(line);
+			// Read renderer metadata before stripping APC/ANSI controls. The metadata is
+			// attached to this physical row, so identical text in another component can
+			// never be mistaken for this selection.
+			const copy = extractCopyRowAnnotation(line);
+			const rendered = copy?.line ?? line;
+			const plain = stripTerminalControls(rendered);
 			const columns = this.#mouseSelectionColumns(lineIndex, plain);
 			if (columns === null || columns.end <= columns.start) {
-				selected.push("");
+				selected.push({ line: lineIndex, fragment: "" });
 				continue;
 			}
-			selected.push(sliceByColumn(plain, columns.start, columns.end - columns.start, false));
+			const candidate = copy?.annotation;
+			const annotation =
+				candidate && copy.originColumn + candidate.contentEnd <= visibleWidth(plain) ? candidate : undefined;
+			const localColumns = copy
+				? { start: columns.start - copy.originColumn, end: columns.end - copy.originColumn }
+				: columns;
+			const presentationStart = annotation ? annotation.contentStart + annotation.prefixColumns : localColumns.start;
+			const start = annotation ? Math.max(localColumns.start, presentationStart) : localColumns.start;
+			const end = annotation ? Math.min(localColumns.end, annotation.contentEnd) : localColumns.end;
+			let fragment = end > start ? sliceByColumn(plain, (copy?.originColumn ?? 0) + start, end - start, false) : "";
+			// Cell padding is presentation; Markdown cell text never keeps outer spaces.
+			const cells = annotation?.ranges?.map(([rangeStart, rangeEnd]) => {
+				const overlapStart = Math.max(start, rangeStart);
+				const overlapEnd = Math.min(end, rangeEnd);
+				return overlapEnd > overlapStart
+					? sliceByColumn(plain, (copy?.originColumn ?? 0) + overlapStart, overlapEnd - overlapStart, false).trim()
+					: "";
+			});
+			if (cells) fragment = cells.filter(cell => cell.length > 0).join("\t");
+			if (annotation?.fence) fragment = "";
+			const covered = annotation
+				? localColumns.start <= annotation.contentStart && localColumns.end >= annotation.contentEnd
+				: false;
+			// A fully covered rendered code row, nested or not, restores its row-local
+			// original slice (not the whole logical line), which preserves an original tab.
+			if (covered && annotation?.originalCode) fragment = annotation.source;
+			selected.push({
+				line: lineIndex,
+				fragment,
+				sourceId: copy?.sourceId,
+				annotation,
+				covered,
+				atContentStart: annotation ? localColumns.start <= presentationStart : true,
+				...(cells ? { cells } : {}),
+			});
 		}
-		return selected.join("\n");
+		// Nothing but decoration (quote margins, table borders, fences) was selected.
+		if (selected.every(row => row.fragment.length === 0)) return "";
+
+		const groups = new Map<string, { rows: SelectedRow[]; complete: boolean }>();
+		for (const row of selected) {
+			if (!row.annotation || !row.sourceId) continue;
+			const key = `${row.sourceId}:${row.annotation.token}`;
+			const group = groups.get(key) ?? { rows: [], complete: false };
+			group.rows.push(row);
+			groups.set(key, group);
+		}
+		// A token is complete when every selected row is covered, the selection holds
+		// every rendered row of the token in order (so a preview that clipped the token's
+		// head or tail cannot restore hidden rows), the last of them carries the
+		// whole-token source, and the rows just outside the group belong to something else.
+		const rowKey = (lineIndex: number): string | undefined => {
+			const line = selectionLines[lineIndex];
+			if (line === undefined || TERMINAL.isImageLine(line)) return undefined;
+			const copy = extractCopyRowAnnotation(line);
+			return copy ? `${copy.sourceId}:${copy.annotation.token}` : undefined;
+		};
+		for (const [key, group] of groups) {
+			const first = group.rows[0]!;
+			const last = group.rows[group.rows.length - 1]!;
+			group.complete =
+				group.rows.every(row => row.covered) &&
+				group.rows.every((row, index) => row.annotation?.tokenRow === index) &&
+				last.annotation?.tokenRows === group.rows.length &&
+				last.annotation.tokenSource !== undefined &&
+				last.line - first.line + 1 === group.rows.length &&
+				rowKey(first.line - 1) !== key &&
+				rowKey(last.line + 1) !== key;
+		}
+
+		const allSemanticRowsAreComplete = selected.every(row => {
+			if (!row.annotation || !row.sourceId) return row.fragment.length === 0;
+			return groups.get(`${row.sourceId}:${row.annotation.token}`)?.complete === true;
+		});
+		if (allSemanticRowsAreComplete) {
+			const completed = [...groups.values()];
+			const codeOnly = completed.length === 1 && completed[0]?.rows[0]?.annotation?.kind === "code";
+			if (codeOnly) {
+				const rows = completed[0]!.rows;
+				const raw = rows[rows.length - 1]?.annotation?.tokenSource ?? "";
+				// Token raw keeps the block's trailing newline; drop it so the closing fence is the last line.
+				const lines = raw.replace(/\n+$/u, "").split("\n");
+				if (/^\s*(```|~~~)/u.test(lines[0] ?? "")) {
+					lines.shift();
+					if (/^\s*(```|~~~)/u.test(lines[lines.length - 1] ?? "")) lines.pop();
+				}
+				return lines.join("\n");
+			}
+			let result = "";
+			for (const row of selected) {
+				// Each complete token contributes once, from its final row.
+				if (row.annotation?.tokenSource !== undefined) result += row.annotation.tokenSource;
+			}
+			return result;
+		}
+		// A table row that soft-wraps its cells is one source row: fold each wrapped
+		// row's cells into the row it continues, rejoined with the removed source gap.
+		let head: SelectedRow | undefined;
+		let headEnd = -1;
+		for (const row of selected) {
+			const gaps = row.annotation?.cellGaps;
+			const headCells = head?.cells;
+			if (
+				head &&
+				headCells &&
+				row.cells &&
+				gaps &&
+				head.sourceId === row.sourceId &&
+				head.annotation?.token === row.annotation?.token &&
+				headEnd + 1 === row.line
+			) {
+				for (const [cell, text] of row.cells.entries()) {
+					if (!text) continue;
+					headCells[cell] = headCells[cell] ? `${headCells[cell]}${gaps[cell] ?? ""}${text}` : text;
+				}
+				head.fragment = headCells.filter(cell => cell.length > 0).join("\t");
+				row.merged = true;
+				headEnd = row.line;
+				continue;
+			}
+			head = row.cells ? row : undefined;
+			headEnd = row.line;
+		}
+		let result = "";
+		let previous: SelectedRow | undefined;
+		for (const row of selected) {
+			const annotation = row.annotation;
+			if (row.merged || annotation?.fence || annotation?.ranges?.length === 0) continue;
+			if (previous) {
+				if (
+					annotation?.continuation &&
+					previous.annotation?.token === annotation.token &&
+					previous.sourceId === row.sourceId
+				) {
+					result += annotation.joinGap;
+				} else {
+					result += "\n";
+				}
+			}
+			if (annotation?.quoteDepth && !annotation.continuation && row.atContentStart)
+				result += "> ".repeat(annotation.quoteDepth);
+			result += row.fragment;
+			previous = row;
+		}
+		return result;
 	}
 
 	#applyMouseSelection(lines: string[]): string[] {
@@ -3742,17 +4101,28 @@ export class TUI extends Container {
 		for (let lineIndex = selection.start.line; lineIndex <= selection.end.line; lineIndex++) {
 			const line = highlighted[lineIndex];
 			if (line === undefined || TERMINAL.isImageLine(line)) continue;
-			const plain = stripTerminalControls(line);
+			// Detach copy APCs verbatim (no payload decoding on this per-frame path) and
+			// put them back around the painted row so a later copy still reads them.
+			const {
+				line: rendered,
+				origin: originMarker,
+				originColumn,
+				rows: annotationSuffix,
+			} = splitCopyAnnotations(line);
+			const plain = stripTerminalControls(rendered);
 			const width = visibleWidth(plain);
 			const columns = this.#mouseSelectionColumns(lineIndex, plain);
 			if (columns === null || columns.end <= columns.start) continue;
-			const before = sliceByColumn(line, 0, columns.start, false);
-			const selected = sliceByColumn(line, columns.start, columns.end - columns.start, false).replace(
+			const before = columns.start > 0 ? sliceByColumn(rendered, 0, columns.start, false) : "";
+			const selected = sliceByColumn(rendered, columns.start, columns.end - columns.start, false).replace(
 				/\x1b\[[0-9;]*m/gu,
 				control => `${control}\x1b[7m`,
 			);
-			const after = sliceByColumn(line, columns.end, Math.max(0, width - columns.end), false);
-			highlighted[lineIndex] = `${before}\x1b[7m${selected}\x1b[27m${after}`;
+			const after = columns.end < width ? sliceByColumn(rendered, columns.end, width - columns.end, false) : "";
+			const painted = `${before}\x1b[7m${selected}\x1b[27m${after}`;
+			const head = originColumn > 0 ? sliceByColumn(painted, 0, originColumn, false) : "";
+			const tail = originColumn < width ? sliceByColumn(painted, originColumn, width - originColumn, false) : "";
+			highlighted[lineIndex] = `${head}${originMarker}${tail}${annotationSuffix}`;
 		}
 		return highlighted;
 	}
@@ -4411,14 +4781,14 @@ export class TUI extends Container {
 
 	#padBeforeBottomPinnedComponent(
 		lines: string[],
-		height: number,
+		minimumLineCount: number,
 		pinnedLineCount: number,
 	): { lines: string[]; insertionRow: number; insertedBlankRows: number } {
-		if (pinnedLineCount <= 0 || lines.length >= height) {
+		if (pinnedLineCount <= 0 || lines.length >= minimumLineCount) {
 			return { lines, insertionRow: lines.length, insertedBlankRows: 0 };
 		}
 
-		const insertedBlankRows = height - lines.length;
+		const insertedBlankRows = minimumLineCount - lines.length;
 		const insertionRow = Math.max(0, lines.length - pinnedLineCount);
 		const padded = [...lines];
 		padded.splice(insertionRow, 0, ...Array.from({ length: insertedBlankRows }, () => ""));
@@ -4489,12 +4859,16 @@ export class TUI extends Container {
 		paintLive = false,
 		placementsToClear: KittyPlacementSpan[] = this.#kittyPlacementSpans,
 		placementsToPaint: KittyPlacementSpan[] = placementsToClear,
-		geometry?: { transcriptLineCount: number; suffixLineCount: number },
+		geometry?: { transcriptLineCount: number; suffixLineCount: number; frontierSpacerLineCount?: number },
 		avoidScrollback = true,
 	): boolean {
 		const paintManual = this.#manualViewportTop !== undefined && !paintLive;
 		const transcriptLineCount = geometry?.transcriptLineCount ?? this.#manualTranscriptLineCount;
 		const suffixLineCount = geometry?.suffixLineCount ?? this.#manualSuffixLineCount;
+		const frontierSpacerLineCount =
+			geometry?.frontierSpacerLineCount ??
+			(paintManual ? this.#manualFrontierSpacerLineCount : this.#latestRenderedFrontierSpacerLineCount);
+		const suffixStart = transcriptLineCount + frontierSpacerLineCount;
 		if (height <= 0 || width <= 0) return false;
 		const maxViewportTop = Math.max(
 			0,
@@ -4519,7 +4893,7 @@ export class TUI extends Container {
 		const emittedRegions: KittyPlacementRegion[] = paintManual
 			? [
 					{ top: nextViewportTop, bottom: nextViewportTop + transcriptCapacity },
-					{ top: transcriptLineCount, bottom: transcriptLineCount + suffixLineCount },
+					{ top: suffixStart, bottom: suffixStart + suffixLineCount },
 				]
 			: [{ top: nextViewportTop, bottom: nextViewportTop + height }];
 		const lineForScreenRow = (screenRow: number): string => {
@@ -4528,7 +4902,7 @@ export class TUI extends Container {
 			return paintManual && screenRow === transcriptCapacity && noticeRows > 0
 				? "New output — type to follow"
 				: paintManual && suffixRow >= 0
-					? (lines[transcriptLineCount + suffixRow] ?? "")
+					? (lines[suffixStart + suffixRow] ?? "")
 					: paintManual && lineIndex >= transcriptLineCount
 						? ""
 						: (lines[lineIndex] ?? "");
@@ -4619,6 +4993,9 @@ export class TUI extends Container {
 	}
 	#recordPaintedViewportObservation(viewportTop: number, height: number, paintManual: boolean): void {
 		const transcriptCapacity = this.#manualTranscriptCapacity(height);
+		const transcriptLineCount = this.#manualTranscriptLineCount;
+		const suffixStart = transcriptLineCount + this.#manualFrontierSpacerLineCount;
+		const noticeRows = this.#manualOutputNotice && height > this.#manualSuffixLineCount ? 1 : 0;
 		const anchorFrame = this.#viewportAnchorFrame;
 		const semanticAnchor =
 			anchorFrame === null
@@ -4633,9 +5010,10 @@ export class TUI extends Container {
 		const cursor = this.#lastCursorPosition;
 		let cursorRow: number | null = null;
 		if (cursor !== null) {
-			if (paintManual && cursor.row >= this.#manualTranscriptLineCount) {
-				const noticeRows = this.#manualOutputNotice && height > this.#manualSuffixLineCount ? 1 : 0;
-				cursorRow = transcriptCapacity + noticeRows + (cursor.row - this.#manualTranscriptLineCount);
+			if (paintManual && cursor.row >= suffixStart) {
+				cursorRow = transcriptCapacity + noticeRows + (cursor.row - suffixStart);
+			} else if (paintManual && cursor.row >= transcriptLineCount) {
+				cursorRow = null;
 			} else if (paintManual) {
 				cursorRow = this.#committedTranscriptRows.indexOf(cursor.row);
 			} else {
@@ -4772,6 +5150,10 @@ export class TUI extends Container {
 		const widthSettleRenderQueued = this.#widthSettleRenderQueued;
 		const tabWidthRepairPending = this.#tabWidthRepairPending;
 		const forcedRenderQueued = this.#forcedRenderQueued;
+		const frontierPreviousWidth = this.#previousWidth < 0 ? this.#forcedRenderPreviousWidth : this.#previousWidth;
+		const frontierPreviousHeight = this.#previousHeight < 0 ? this.#forcedRenderPreviousHeight : this.#previousHeight;
+		const transcriptRebuildPending = this.#transcriptRebuildPending;
+		this.#transcriptRebuildPending = false;
 		this.#resizeRenderQueued = false;
 		this.#resizeRenderMutationQueued = false;
 		this.#renderMutationQueued = false;
@@ -4807,6 +5189,8 @@ export class TUI extends Container {
 			this.#manualViewportTop === undefined &&
 			this.#latestRaw.length > 0 &&
 			this.#latestRenderedLines.length === this.#latestRaw.length &&
+			// A cached spacer count is not valid after natural rows replace the transient padding.
+			this.#latestRenderedFrontierSpacerLineCount === 0 &&
 			this.#previousLines === this.#latestRenderedLines;
 		let previousKittyPlacementSpans = this.#kittyPlacementSpans;
 		const placementOwners = new Map<string, KittyPlacementOwner>();
@@ -4920,6 +5304,7 @@ export class TUI extends Container {
 		let diffStart = 0;
 		let usedWindowNormalize = false;
 		let stitched = false;
+		let frontierSpacerLineCount = 0;
 		if (reusedAnchor !== null && layoutPrefixEligible && !layoutPrefixBlocked) {
 			const reused = this.#reuseCachedLayoutPrefix(
 				width,
@@ -4936,6 +5321,7 @@ export class TUI extends Container {
 				cursorPos = reused.cursorPos;
 				diffStart = reused.diffStart;
 				usedWindowNormalize = true;
+				frontierSpacerLineCount = this.#latestRenderedFrontierSpacerLineCount;
 			}
 		}
 		if (!stitched) {
@@ -4957,11 +5343,21 @@ export class TUI extends Container {
 			}
 			newLines = this.#constrainPinnedSuffix(renderedLines, height, renderedChildren);
 			if (hasStickySuffix && height > 0 && this.#manualViewportTop === undefined) {
-				newLines = this.#padBeforeBottomPinnedComponent(
+				// Rebuilds start at their new transcript frontier. Forced redraws use the
+				// captured rendered dimensions rather than their -1 invalidation sentinels.
+				const preserveLiveFrontier =
+					!transcriptIdentityReplaced &&
+					!transcriptRebuildPending &&
+					frontierPreviousWidth === width &&
+					(frontierPreviousHeight === height || this.#viewportRepaintHost());
+				const minimumLineCount = preserveLiveFrontier ? prevViewportTop + height : height;
+				const padded = this.#padBeforeBottomPinnedComponent(
 					newLines,
-					height,
+					minimumLineCount,
 					newLines.length - sourceTranscriptLineCount,
-				).lines;
+				);
+				newLines = padded.lines;
+				frontierSpacerLineCount = padded.insertedBlankRows;
 			}
 			// Composite overlays into the rendered lines (before differential compare)
 			if (this.overlayStack.length > 0) {
@@ -5018,7 +5414,15 @@ export class TUI extends Container {
 			}
 		}
 		const nextTranscriptLineCount = sourceTranscriptLineCount;
-		const nextSuffixLineCount = hasStickySuffix ? Math.max(0, newLines.length - nextTranscriptLineCount) : 0;
+		// Live-only frontier rows must not consume the manual viewport's pinned-suffix capacity.
+		const nextSuffixLineCount = hasStickySuffix
+			? Math.max(0, newLines.length - nextTranscriptLineCount - frontierSpacerLineCount)
+			: 0;
+		const nextFrameGeometry = {
+			transcriptLineCount: nextTranscriptLineCount,
+			suffixLineCount: nextSuffixLineCount,
+			frontierSpacerLineCount,
+		};
 		this.#lastCursorPosition = cursorPos;
 		const total = rawLines.length;
 		if (renderMetrics.enabled) {
@@ -5035,6 +5439,7 @@ export class TUI extends Container {
 		this.#latestRenderedLines = newLines;
 		this.#latestRenderedTranscriptLineCount = nextTranscriptLineCount;
 		this.#latestRenderedSuffixLineCount = nextSuffixLineCount;
+		this.#latestRenderedFrontierSpacerLineCount = frontierSpacerLineCount;
 		this.#latestRenderedPlacementOwners = placementOwners;
 		const naturalViewportTop = Math.max(0, newLines.length - height);
 		const priorLogicalLineCount = Math.max(this.#previousLines.length, this.#maxLinesRendered);
@@ -5095,11 +5500,12 @@ export class TUI extends Container {
 							this.#previousHeight = height;
 							this.#manualTranscriptLineCount = nextTranscriptLineCount;
 							this.#manualSuffixLineCount = nextSuffixLineCount;
+							this.#manualFrontierSpacerLineCount = frontierSpacerLineCount;
 						},
 						false,
 						previousKittyPlacementSpans,
 						nextKittyPlacementSpans,
-						{ transcriptLineCount: nextTranscriptLineCount, suffixLineCount: nextSuffixLineCount },
+						nextFrameGeometry,
 						true,
 					);
 					if (contentPainted) {
@@ -5151,6 +5557,9 @@ export class TUI extends Container {
 				newLines.length === this.#previousLines.length &&
 				newLines.every((line, index) => line === this.#previousLines[index])
 			) {
+				this.#manualTranscriptLineCount = nextTranscriptLineCount;
+				this.#manualSuffixLineCount = nextSuffixLineCount;
+				this.#manualFrontierSpacerLineCount = frontierSpacerLineCount;
 				return;
 			}
 			this.#manualViewportTop = nextViewportTop;
@@ -5172,11 +5581,12 @@ export class TUI extends Container {
 					this.#paintedManualOutputNotice = this.#manualOutputNotice;
 					this.#manualTranscriptLineCount = nextTranscriptLineCount;
 					this.#manualSuffixLineCount = nextSuffixLineCount;
+					this.#manualFrontierSpacerLineCount = frontierSpacerLineCount;
 				},
 				false,
 				previousKittyPlacementSpans,
 				nextKittyPlacementSpans,
-				{ transcriptLineCount: nextTranscriptLineCount, suffixLineCount: nextSuffixLineCount },
+				nextFrameGeometry,
 			);
 			if (!contentPainted) restoreManualIntent();
 			return;
@@ -5248,6 +5658,7 @@ export class TUI extends Container {
 					);
 					this.#manualTranscriptLineCount = nextTranscriptLineCount;
 					this.#manualSuffixLineCount = nextSuffixLineCount;
+					this.#manualFrontierSpacerLineCount = frontierSpacerLineCount;
 					this.#refreshPaintedLiveViewportObservation(height);
 					this.#durableLineCount = newLines.length;
 					this.#durableRenderedLines = newLines.slice();
@@ -5286,6 +5697,7 @@ export class TUI extends Container {
 					this.#previousHeight = height;
 					this.#manualTranscriptLineCount = nextTranscriptLineCount;
 					this.#manualSuffixLineCount = nextSuffixLineCount;
+					this.#manualFrontierSpacerLineCount = frontierSpacerLineCount;
 					this.#refreshPaintedLiveViewportObservation(height);
 					this.#latestRenderedLines = newLines.slice();
 					if (this.#virtualViewport) this.#latestRaw = rawLines.slice();
@@ -5293,7 +5705,7 @@ export class TUI extends Container {
 				false,
 				previousKittyPlacementSpans,
 				nextKittyPlacementSpans,
-				{ transcriptLineCount: nextTranscriptLineCount, suffixLineCount: nextSuffixLineCount },
+				nextFrameGeometry,
 				true,
 			);
 		};
@@ -5715,6 +6127,7 @@ export class TUI extends Container {
 						);
 						this.#manualTranscriptLineCount = nextTranscriptLineCount;
 						this.#manualSuffixLineCount = nextSuffixLineCount;
+						this.#manualFrontierSpacerLineCount = frontierSpacerLineCount;
 						this.#refreshPaintedLiveViewportObservation(height);
 					})
 				)
@@ -5732,6 +6145,7 @@ export class TUI extends Container {
 			this.#viewportTopRow = Math.max(0, newLines.length - height);
 			this.#manualTranscriptLineCount = nextTranscriptLineCount;
 			this.#manualSuffixLineCount = nextSuffixLineCount;
+			this.#manualFrontierSpacerLineCount = frontierSpacerLineCount;
 			this.#refreshPaintedLiveViewportObservation(height);
 			return;
 		}
@@ -6035,6 +6449,7 @@ export class TUI extends Container {
 					);
 					this.#manualTranscriptLineCount = nextTranscriptLineCount;
 					this.#manualSuffixLineCount = nextSuffixLineCount;
+					this.#manualFrontierSpacerLineCount = frontierSpacerLineCount;
 					this.#refreshPaintedLiveViewportObservation(height);
 				},
 				preserveRasterLeases,

@@ -47,13 +47,8 @@ import {
 	providerSupportsAppendOnlyAuto,
 	resolveAppendOnlyMode,
 } from "../append-only-mode";
-import {
-	type AsyncJob,
-	AsyncJobManager,
-	asyncJobEndpointId as deriveAsyncJobEndpointId,
-	isBackgroundJobSupportEnabled,
-	jobElapsedMs,
-} from "../async";
+import { type AsyncJob, AsyncJobManager, isBackgroundJobSupportEnabled, jobElapsedMs } from "../async";
+import { asyncJobEndpointId as deriveAsyncJobEndpointId } from "../async/endpoint-id";
 import { resolveBrowserBackend } from "../browser-backend";
 import { loadCapability, reset as resetCapabilities } from "../capability";
 import { type Rule, ruleCapability, setActiveRules } from "../capability/rule";
