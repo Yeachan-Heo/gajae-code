@@ -3,6 +3,6 @@
   "version": "0.18.8",
   "artifacts": {
     "pi_natives.darwin-arm64.node": "18cbb004b1fbda2d42eb8cb654d517985faa0ab305113ab4447f851c8b64820b",
-    "pi_natives.linux-x64-modern.node": "5862c33c4326673b82e9c12ae87b50cb6e2bb324908e3da5e9671775e0767036"
+    "pi_natives.linux-x64-modern.node": "4ce30236f23cfb773eac9e83a632a408b8d9af13155843ca387b6afe5fc6fe13"
   }
 }

@@ -1987,7 +1987,6 @@ export class AsyncJobManager {
 		// First pass: migrate queue entries
 		for (const queueEntry of this.#resumeQueue) {
 			if ((queueEntry.admissionEndpointId ?? predecessorEndpointId) === predecessorEndpointId) {
-				queueEntry.admissionEndpointId = successorEndpointId;
 				processedSeqs.add(queueEntry.seq);
 
 				// Migrate the owned registration from E1 to E2
@@ -2004,12 +2003,6 @@ export class AsyncJobManager {
 						jobGeneration: queuedGeneration,
 					});
 				}
-
-				// Also update the corresponding subagent record's queued field
-				const rec = this.#subagentRecords.get(queueEntry.subagentId);
-				if (rec?.queued && rec.queued.seq === queueEntry.seq) {
-					rec.queued.admissionEndpointId = successorEndpointId;
-				}
 			}
 		}
 
@@ -2018,9 +2011,6 @@ export class AsyncJobManager {
 		for (const [, rec] of this.#subagentRecords) {
 			if (rec.queued && !processedSeqs.has(rec.queued.seq)) {
 				if ((rec.queued.admissionEndpointId ?? predecessorEndpointId) === predecessorEndpointId) {
-					// Migrate the record's admission endpoint
-					rec.queued.admissionEndpointId = successorEndpointId;
-
 					// Migrate the owned registration
 					const queuedGeneration = `queued:${rec.subagentId}:${rec.queued.seq}`;
 					const oldReg = lookupOwnedRegistration(queuedGeneration, queuedGeneration, predecessorEndpointId);

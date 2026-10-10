@@ -1379,9 +1379,10 @@ describe("AsyncJobManager", () => {
 			expect(regAtE2After?.lineageIdHash).toBe(lineageIdHash);
 			expect(regAtE2After?.promptAttemptEpoch).toBe(attemptEpoch);
 
-			// Verify the queued resume's admission endpoint was updated to E2
+			// Verify the queued resume's admission endpoint was NOT updated (remains E1)
+			// so the resumed job will register at E1, not E2
 			const updatedRecord = manager.getSubagentRecord(subagentId);
-			expect(updatedRecord?.queued?.admissionEndpointId).toBe(endpointE2);
+			expect(updatedRecord?.queued?.admissionEndpointId).toBe(endpointE1);
 		} finally {
 			await manager.dispose({ timeoutMs: 100 });
 			AsyncJobManager.unregisterManager(manager);
