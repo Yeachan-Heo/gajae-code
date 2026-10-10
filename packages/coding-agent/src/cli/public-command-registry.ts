@@ -216,7 +216,7 @@ const daemonArgs = {
 export const PUBLIC_COMMANDS: readonly PublicCommandDescriptor[] = [
 	node("sdk", {
 		description: "Discover SDK transports, sessions, search, spawn and advisory guides.",
-		children: ["serve", "search", "spawn", "session", "guides"],
+		children: ["serve", "broker", "search", "spawn", "session", "guides"],
 		syntax: "<command>",
 		constraints: [
 			"A public child command is required unless requesting help or root evidence retrieval.",
@@ -245,6 +245,23 @@ export const PUBLIC_COMMANDS: readonly PublicCommandDescriptor[] = [
 			"After relay ownership, protocol frames retain their existing contract; --json controls only preflight failures.",
 		],
 		example: "gjc sdk serve --stdio",
+	}),
+	node("sdk broker", {
+		description: "Run the SDK broker under an external supervisor.",
+		children: ["run"],
+		syntax: "<command>",
+	}),
+	node("sdk broker run", {
+		description:
+			"Run the SDK broker in the foreground for a supervisor (systemd, launchd); stable contract, never detaches.",
+		flags: { "agent-dir": agentDir },
+		syntax: "[--agent-dir <dir>]",
+		risk: "Owns the broker for the agent directory; clients should run attach-only (GJC_SDK_BROKER_AUTOSTART=0) so they never start a competing one.",
+		constraints: [
+			"Stays in the foreground until SIGTERM or SIGINT, stops gracefully, then exits with the signal status (143 or 130).",
+			"Exits 1 without serving when another broker already owns the agent directory or startup fails.",
+		],
+		example: "gjc sdk broker run --agent-dir ~/.gjc/agent",
 	}),
 	node("sdk search", {
 		description: "Search broker-visible sessions in an exact repo, pwd or global scope.",
