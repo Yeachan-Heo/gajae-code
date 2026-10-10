@@ -1358,6 +1358,94 @@ describe("P1 Regression: incomplete tool emission at tool-ID rollover", () => {
 	});
 });
 
+describe("P2 Probepark findings: unconfirmed text on read rejection", () => {
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+
+	test("P2: unconfirmed text should NOT be emitted when read error occurs", async () => {
+		const emittedEvents: string[] = [];
+
+		globalThis.fetch = (async () => {
+			// Simulate a response that delivers content but then errors
+			const body = new ReadableStream<Uint8Array>({
+				start(controller) {
+					// Send only content, NO terminal metadata
+					const encoder = new TextEncoder();
+					const chunk = encoder.encode(JSON.stringify({ content: "secret_data" }));
+					controller.enqueue(chunk);
+				},
+				pull(controller) {
+					// Simulate stream error on second read
+					controller.error(new Error("Stream error"));
+				},
+			});
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEvents.push(event.type);
+			}
+		} catch {
+			// Errors captured in stream
+		}
+
+		// Content without terminal metadata should NOT be emitted when error occurs
+		const textDeltas = emittedEvents.filter(e => e === "text_delta");
+		expect(textDeltas).toHaveLength(0);
+
+		// Error event should be emitted
+		const errorIdx = emittedEvents.indexOf("error");
+		expect(errorIdx).toBeGreaterThan(-1);
+	});
+
+	test("P2: confirmed text (with terminal metadata) should be emitted even if later read errors", async () => {
+		const emittedEvents: Array<{ type: string; delta?: string }> = [];
+
+		globalThis.fetch = (async () => {
+			// Simulate a response with content AND terminal metadata, then error
+			const body = new ReadableStream<Uint8Array>({
+				start(controller) {
+					const encoder = new TextEncoder();
+					// Content + terminal metadata in first pull
+					const content = encoder.encode(JSON.stringify({ content: "confirmed" }));
+					const usage = encoder.encode(JSON.stringify({ usage: { inputTokens: 1, outputTokens: 1 } }));
+					controller.enqueue(content);
+					controller.enqueue(usage);
+				},
+				pull(controller) {
+					// Simulate error on second read (after confirmed metadata)
+					controller.error(new Error("Network error"));
+				},
+			});
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				if (event.type === "text_delta") {
+					emittedEvents.push({ type: event.type, delta: (event as any).delta });
+				} else {
+					emittedEvents.push({ type: event.type });
+				}
+			}
+		} catch {
+			// Errors captured in stream
+		}
+
+		// Text WITH terminal metadata should be emitted
+		const textDeltas = emittedEvents.filter(e => e.type === "text_delta");
+		expect(textDeltas.length).toBeGreaterThan(0);
+		if (textDeltas.length > 0) {
+			const allText = textDeltas.map(e => e.delta).join("");
+			expect(allText).toContain("confirmed");
+		}
+	});
+});
+
 describe("P1 Regression: content leaking across batches", () => {
 	afterEach(() => {
 		globalThis.fetch = originalFetch;

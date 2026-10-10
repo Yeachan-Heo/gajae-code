@@ -807,6 +807,13 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 		let toolComplete = false; // Track whether the current tool has been completed (has stop flag)
 		let toolcallIndex: number | undefined;
 		const pendingToolCalls: Array<{ input: string; toolCall: ToolCall; index: number }> = [];
+		// Track terminal metadata so we can emit confirmed text even if later reads fail
+		let hasReceivedTerminalMetadata = false; // Set to true when usage event is received
+		let textIndex: number | undefined; // Track text block index (accessible in catch)
+		let textContentConfirmed = false; // Track whether text has been committed to blocks (accessible in catch)
+		let textStartDeferred = false; // Track if text_start is deferred (accessible in catch)
+		let pendingTextContent = ""; // Text buffer (accessible in catch)
+		const pendingTextEvents: Array<{ type: "start" | "delta" | "end"; delta?: string; content?: string }> = []; // Deferred text events (accessible in catch)
 
 		try {
 			// Use validated identity snapshot from trust check if available (no second read of getters),
@@ -879,12 +886,8 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			let buffer = "";
 			let lastContent = "";
 			let thinkingIndex: number | undefined;
-			let textIndex: number | undefined;
-
-			// Keep pending text content separate from blocks until confirmation (no refusal)
-			let pendingTextContent = ""; // Buffer text separately from blocks
-			const pendingTextEvents: Array<{ type: "start" | "delta" | "end"; delta?: string; content?: string }> = [];
-			let textContentConfirmed = false; // Track whether text has been committed to blocks
+			// Note: textIndex, textContentConfirmed, textStartDeferred, pendingTextContent, pendingTextEvents
+			// are declared before the try block so they're accessible in the catch block
 
 			// Add tool to blocks without emitting events (deferred until stream end)
 			const addToolToBlocks = () => {
@@ -943,8 +946,6 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				toolComplete = false; // Reset tool completion flag
 			};
 
-			let textStartDeferred = false; // Track if text_start has been deferred pending thinking
-
 			const appendText = (delta: string) => {
 				// Set firstTokenTime on first real (non-thinking) text delta
 				if (!firstTokenEmitted) {
@@ -958,23 +959,15 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 					textIndex = blocks.length;
 					// Create block with empty text (content will be added only after confirmation)
 					blocks.push({ type: "text", text: "", index: textIndex });
-					// Defer text_start emission if thinking might come before text.
-					// thinkingAccumulated is non-empty means we've seen thinking in this or prior content events.
-					// We don't know yet if more thinking will come, so defer text_start until stream end.
-					if (thinkingAccumulated.length === 0) {
-						// No thinking yet; safe to emit text_start now
-						stream.push({ type: "text_start", contentIndex: textIndex, partial: output });
-					} else {
-						// Thinking exists; defer text_start until we know thinking position
-						textStartDeferred = true;
-					}
+					// ALWAYS defer text_start until we have terminal metadata or reach EOF without error.
+					// This ensures unconfirmed text is not exposed if an error occurs.
+					textStartDeferred = true;
 				}
 				// Buffer text content separately (don't add to blocks yet)
 				pendingTextContent += delta;
-				// Only emit text_delta if text_start was already emitted
-				if (!textStartDeferred) {
-					stream.push({ type: "text_delta", contentIndex: textIndex, delta, partial: output });
-				}
+				// Don't emit text_delta yet; defer until stream end or terminal metadata is received.
+				// Queue delta for later emission when confirmed.
+				pendingTextEvents.push({ type: "delta", delta });
 			};
 
 			// Commit pending text to blocks (only safe at stream end when refusal is ruled out)
@@ -993,14 +986,19 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				if (textStartDeferred && textIndex !== undefined && textIndex < blocks.length) {
 					const block = blocks[textIndex];
 					if (block && block.type === "text" && block.text.length > 0) {
-						// Emit deferred text_start and text_delta with committed content
+						// Emit deferred text_start
 						stream.push({ type: "text_start", contentIndex: textIndex, partial: output });
-						stream.push({
-							type: "text_delta",
-							contentIndex: textIndex,
-							delta: block.text,
-							partial: output,
-						});
+						// Emit all pending text_delta events
+						for (const evt of pendingTextEvents) {
+							if (evt.type === "delta" && evt.delta) {
+								stream.push({
+									type: "text_delta",
+									contentIndex: textIndex,
+									delta: evt.delta,
+									partial: output,
+								});
+							}
+						}
 					}
 					textStartDeferred = false;
 				}
@@ -1156,6 +1154,8 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						if (event.data.inputTokens !== undefined) output.usage.input = event.data.inputTokens;
 						if (event.data.outputTokens !== undefined) output.usage.output = event.data.outputTokens;
 						output.usage.totalTokens = output.usage.input + output.usage.output;
+						// Mark that terminal metadata has been received - text is now confirmed safe
+						hasReceivedTerminalMetadata = true;
 					} else if (event.type === "refusal") {
 						const refusalData = event.data as {
 							stopReason?: string;
@@ -1206,8 +1206,38 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 							return;
 						}
 					} else if (event.type === "error") {
-						// On ordinary errors, flush pending COMPLETED tool events before the error terminal
+						// On ordinary server errors (error event in stream), emit deferred text and tool events before error
 						// (refusals drop them, incomplete tools must not be emitted)
+						
+						// For server-sent errors, emit the deferred text first (it was received before the error)
+						if (textContentConfirmed === false) {
+							// Commit pending text to blocks
+							if (textIndex !== undefined && textIndex < blocks.length && pendingTextContent.length > 0) {
+								const block = blocks[textIndex] as TextContent;
+								block.text = pendingTextContent;
+								textContentConfirmed = true;
+							}
+							// Emit deferred text start if not yet emitted
+							if (textStartDeferred && textIndex !== undefined && textIndex < blocks.length) {
+								const block = blocks[textIndex];
+								if (block && block.type === "text" && block.text.length > 0) {
+									stream.push({ type: "text_start", contentIndex: textIndex, partial: output });
+									// Emit all pending text_delta events
+									for (const evt of pendingTextEvents) {
+										if (evt.type === "delta" && evt.delta) {
+											stream.push({
+												type: "text_delta",
+												contentIndex: textIndex,
+												delta: evt.delta,
+												partial: output,
+											});
+										}
+									}
+								}
+								textStartDeferred = false;
+							}
+						}
+						
 						// Only emit the tool if it was explicitly completed (has stop flag)
 						if (toolComplete) addToolToBlocks();
 						emitPendingToolCalls();
@@ -1267,10 +1297,41 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			stream.push({ type: "done", reason: output.stopReason as "stop" | "toolUse", message: output });
 			stream.end();
 		} catch (error) {
-			// On ordinary errors (including reader.read() throws), emit only COMPLETED tool events
-			// before the error terminal (same semantics as the ordinary-error flush in the event loop).
-			// Incomplete currentTool is NOT finalized/emitted (only completed tools in pendingToolCalls flush).
-			// Refusals drop them via clearPendingToolCalls, but ordinary errors preserve content consistency.
+			// On ordinary errors (including reader.read() throws):
+			// - Emit COMPLETED tool events (same semantics as in the event processing loop)
+			// - Emit confirmed text only if terminal metadata (usage) was received before the error
+			// - Incomplete currentTool is NOT finalized/emitted (only completed tools in pendingToolCalls flush).
+			// - Unconfirmed text is suppressed (no deferred text emission without terminal metadata)
+
+			// Only emit confirmed text if we received terminal metadata
+			if (hasReceivedTerminalMetadata && textContentConfirmed === false) {
+				// Commit pending text to blocks
+				if (textIndex !== undefined && textIndex < blocks.length && pendingTextContent.length > 0) {
+					const block = blocks[textIndex] as TextContent;
+					block.text = pendingTextContent;
+					textContentConfirmed = true;
+				}
+				// Emit deferred text start if not yet emitted
+				if (textStartDeferred && textIndex !== undefined && textIndex < blocks.length) {
+					const block = blocks[textIndex];
+					if (block && block.type === "text" && block.text.length > 0) {
+						stream.push({ type: "text_start", contentIndex: textIndex, partial: output });
+						// Emit all pending text_delta events
+						for (const evt of pendingTextEvents) {
+							if (evt.type === "delta" && evt.delta) {
+								stream.push({
+									type: "text_delta",
+									contentIndex: textIndex,
+									delta: evt.delta,
+									partial: output,
+								});
+							}
+						}
+						stream.push({ type: "text_end", contentIndex: textIndex, content: block.text, partial: output });
+					}
+					textStartDeferred = false;
+				}
+			}
 
 			// Emit all pending tool call events (inline of emitPendingToolCalls logic)
 			for (const { input, toolCall, index } of pendingToolCalls) {
