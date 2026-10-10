@@ -791,4 +791,59 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 
 		await manager.dispose({ timeoutMs: 500 });
 	});
+
+	test("valid queued resume ownership is preserved across manager rekey", async () => {
+		// Tests that when a subagent is resumed with a tool call ID at endpoint E1,
+		// queued, and then the manager is rekeyed to E2 while the entry remains VALID
+		// (not stale, still in the queue), the valid entry uses its saved admission
+		// endpoint to unregister the owned tuple when the queue is drained.
+		const { manager } = makeManager({ maxRunningJobs: 1 });
+		installResumeRunner(manager);
+
+		// Start with A paused, then add a blocker to fill capacity
+		const a = spawnControllable(manager, "A", "owner-a");
+		expect(manager.pauseSubagent("A").ok).toBe(true);
+		a.release();
+		await manager.waitForAll();
+
+		// Start a blocker to fill the single capacity slot
+		const blocker = spawnControllable(manager, "BLOCK", "owner-blocker");
+
+		// Set up a tool lineage at endpoint E1
+		const validToolCallId = "tool-call-valid-e1-123";
+		const endpointE1 = "endpoint-e1-valid";
+		bindToolLineage(validToolCallId, {
+			lineageIdHash: "hash-valid-e1",
+			promptAttemptEpoch: 1,
+			endpointGeneration: 1,
+			endpointId: endpointE1,
+		});
+
+		// Queue the resume with the tool call ID at E1; this saves endpointE1 as the admission endpoint
+		expect(manager.resumeSubagent("A", { ownerId: "owner-a" }, "valid", validToolCallId).queued).toBe(true);
+		const validGen = `queued:A:1`;
+		const validRegBefore = lookupOwnedRegistration(validGen, validGen, endpointE1);
+		expect(validRegBefore).toBeDefined();
+
+		// Rekey the manager from E1 to E2: the valid queue entry is now at a different endpoint
+		const endpointE2 = "endpoint-e2-valid";
+		const rekeySuccess = AsyncJobManager.rekeyForEndpoint(endpointE1, endpointE2, manager);
+		expect(rekeySuccess).toBe(true);
+
+		// Drain the queue by releasing the blocker; the valid entry should be cleaned up
+		// using the saved E1 endpoint, not the manager's current E2 endpoint
+		blocker.release();
+		await manager.waitForAll();
+		await manager.drainDeliveries({ timeoutMs: 500 });
+
+		// The valid registration should have been retired (using the saved E1 endpoint)
+		const validRegAfter = lookupOwnedRegistration(validGen, validGen, endpointE1);
+		expect(validRegAfter).toBeUndefined();
+
+		// The resumed job should have transitioned from queued to running/completed
+		const rec = manager.getSubagentRecord("A");
+		expect(rec?.status).not.toBe("queued");
+
+		await manager.dispose({ timeoutMs: 500 });
+	});
 });

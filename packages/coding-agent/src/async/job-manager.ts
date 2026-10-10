@@ -192,7 +192,7 @@ export interface SubagentRecord {
 	 * file, followed by a separately available runner (`no_runner` otherwise).
 	 */
 	resumable: boolean;
-	queued?: { ownerId?: string; seq: number; message?: string; resumeToolCallId?: string; createdAt: number };
+	queued?: { ownerId?: string; seq: number; message?: string; resumeToolCallId?: string; admissionEndpointId?: string; createdAt: number };
 	/** Last queued-resume seq for a CANCELLED queued resume (rec.queued is
 	 *  cleared on cancel): retained on the record so owned settlement's second
 	 *  proof can still see the generation as provably cancelled, without a
@@ -1897,16 +1897,9 @@ export class AsyncJobManager {
 			const seq = ++this.#resumeSeq;
 			rec.terminalQueuedSeq = undefined;
 			rec.status = "queued";
-			rec.queued = {
-				ownerId: rec.ownerId,
-				seq,
-				message,
-				...(resumeToolCallId ? { resumeToolCallId } : {}),
-				createdAt: Date.now(),
-			};
 			// Resolve the admission endpoint before queueing: when the manager is
-			// rekeyed before stale-entry cleanup, we need the original endpoint to
-			// unregister the queued tuple. Save it in the queue entry.
+			// rekeyed before the queue is drained or the subagent is cancelled, we
+			// need the original endpoint to unregister the queued registration.
 			let admissionEndpointId: string | undefined;
 			if (resumeToolCallId) {
 				const lineage = resolveToolLineage(resumeToolCallId, AsyncJobManager.endpointIdOf(this));
@@ -1914,6 +1907,14 @@ export class AsyncJobManager {
 					admissionEndpointId = lineage.endpointId ?? AsyncJobManager.endpointIdOf(this);
 				}
 			}
+			rec.queued = {
+				ownerId: rec.ownerId,
+				seq,
+				message,
+				...(resumeToolCallId ? { resumeToolCallId } : {}),
+				...(admissionEndpointId ? { admissionEndpointId } : {}),
+				createdAt: Date.now(),
+			};
 			this.#resumeQueue.push({
 				subagentId: rec.subagentId,
 				ownerId: rec.ownerId,
@@ -1963,17 +1964,15 @@ export class AsyncJobManager {
 		const seq = rec.queued?.seq ?? rec.terminalQueuedSeq;
 		if (seq === undefined) return;
 		const queuedGeneration = `queued:${rec.subagentId}:${seq}`;
-		// Resolve the registration with the resume lineage's ENDPOINT identity:
-		// task ids are session-scoped and each manager's resume sequence starts
-		// locally, so concurrent sessions can both register an identical
-		// queued:<subagent>:<seq> generation — an endpoint-less lookup could
-		// retrieve and unregister the OTHER session's tuple (review thread P1).
-		const endpointId = rec.queued?.resumeToolCallId
-			? (resolveToolLineage(rec.queued.resumeToolCallId, AsyncJobManager.endpointIdOf(this))?.endpointId ??
-				// Fall back to the manager's own registered endpoint when the
-				// binding itself predates endpoint keying or is not found.
-				AsyncJobManager.endpointIdOf(this))
-			: AsyncJobManager.endpointIdOf(this);
+		// Use the saved admission endpoint: if the manager was rekeyed from E1 to
+		// E2 before this queued resume was started or cancelled, we must look up
+		// the registration at E1 where it was created, not E2. Preserve endpoint
+		// isolation; do not add cross-endpoint fallback (review thread P2).
+		const endpointId =
+			rec.queued?.admissionEndpointId ??
+			(rec.queued?.resumeToolCallId
+				? resolveToolLineage(rec.queued.resumeToolCallId, AsyncJobManager.endpointIdOf(this))?.endpointId
+				: undefined);
 		const registration = lookupOwnedRegistration(queuedGeneration, queuedGeneration, endpointId);
 		if (registration) unregisterOwnedRegistration(registration);
 	}
@@ -1983,6 +1982,7 @@ export class AsyncJobManager {
 		message: string | undefined,
 		descriptor: ResumeDescriptor | undefined,
 		resumeToolCallId?: string,
+		admissionEndpointId?: string,
 	): { ok: boolean; status?: SubagentLifecycle; jobId?: string; reason?: string } {
 		if (this.#isOwnerSubagentShutdownFenced(rec.ownerId)) {
 			return { ok: false, status: rec.status, reason: "owner_shutdown_in_progress" };
@@ -2013,17 +2013,13 @@ export class AsyncJobManager {
 			// causal set has exactly one tuple per job. The EXACT stored tuple
 			// is looked up first — unregisterOwnedRegistration now verifies the
 			// full five-tuple before deleting (review thread P1). The lookup is
-			// ENDPOINT-qualified via the resume lineage: concurrent sessions
-			// mint the same queued:<subagent>:<seq> generation, and the
-			// remaining endpoint-less fallback scan could retrieve and
-			// unregister the OTHER session's tuple (review thread P1).
-			const resumeEndpoint = resumeToolCallId
-				? (resolveToolLineage(resumeToolCallId, AsyncJobManager.endpointIdOf(this))?.endpointId ??
-					// The binding may have been evicted (8192-cap FIFO): fall back
-					// to the manager's own endpoint so the lookup never degrades
-					// into the cross-endpoint scan (review thread P2).
-					AsyncJobManager.endpointIdOf(this))
-				: undefined;
+			// ENDPOINT-qualified via the saved admission endpoint: if the manager
+			// was rekeyed from E1 to E2, we must use E1 to find the registration
+			// that was created at admission, not E2. Preserve endpoint isolation;
+			// do not add cross-session fallback (review thread P2).
+			const resumeEndpoint =
+				admissionEndpointId ??
+				(resumeToolCallId ? resolveToolLineage(resumeToolCallId, AsyncJobManager.endpointIdOf(this))?.endpointId : undefined);
 			const queuedReg = lookupOwnedRegistration(queuedGeneration, queuedGeneration, resumeEndpoint);
 			if (queuedReg) unregisterOwnedRegistration(queuedReg);
 		}
@@ -2114,6 +2110,7 @@ export class AsyncJobManager {
 					entry.message,
 					this.#descriptorForRecord(rec),
 					rec.queued?.resumeToolCallId,
+					entry.admissionEndpointId,
 				);
 				if (!result.ok) {
 					if (result.reason === "owner_shutdown_in_progress") {
