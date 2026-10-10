@@ -946,7 +946,11 @@ export function createReconciliationStore(options: {
 	): Promise<void> => {
 		const run = async () => {
 			try {
-				options.onInstrumentationForTests?.({ at: Date.now(), phase: "enqueued", operation: "transactTerminalState" });
+				options.onInstrumentationForTests?.({
+					at: Date.now(),
+					phase: "enqueued",
+					operation: "transactTerminalState",
+				});
 			} catch {}
 			try {
 				options.onInstrumentationForTests?.({
@@ -1001,7 +1005,11 @@ export function createReconciliationStore(options: {
 	): Promise<void> => {
 		const run = async () => {
 			try {
-				options.onInstrumentationForTests?.({ at: Date.now(), phase: "enqueued", operation: "transactTerminalKeys" });
+				options.onInstrumentationForTests?.({
+					at: Date.now(),
+					phase: "enqueued",
+					operation: "transactTerminalKeys",
+				});
 			} catch {}
 			try {
 				options.onInstrumentationForTests?.({
