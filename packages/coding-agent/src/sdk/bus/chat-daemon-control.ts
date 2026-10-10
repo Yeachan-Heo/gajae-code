@@ -139,9 +139,12 @@ export type ChatDaemonAction = "stop" | "reload";
  * pre-upgrade owner cannot retain the queue race fixed by #5120.
  * Slack generation 80 persists and fences the inbound SDK dispatch boundary so
  * crashes, recovery, and attachment retirement cannot replay ambiguous work.
+ * Discord generation 85 fences nonce-starter thread ownership so a pre-upgrade
+ * Discord daemon cannot publish session output through a mapping or receipt
+ * saved before that check.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 84,
+	discord: 85,
 	slack: 91,
 };
 

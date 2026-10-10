@@ -76,6 +76,7 @@ class FakeDiscordProvider implements DiscordProvider {
 	readonly messageNonces = new Map<string, { id: string; threadId: string }>();
 	creates = 0;
 	failCreateAfterPersist = false;
+	failFindThread = false;
 	failUnarchive = false;
 	failPost = false;
 	failPostAfterPersist = false;
@@ -106,6 +107,7 @@ class FakeDiscordProvider implements DiscordProvider {
 	}
 
 	async findThreadByNonce(input: { guildId: string; parentId: string; nonce: string }): Promise<DiscordThread | null> {
+		if (this.failFindThread) throw new Error("Discord API request failed (500)");
 		return this.threadsByNonce.get(input.nonce) ?? null;
 	}
 
@@ -1131,9 +1133,18 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			await restarted.start();
 			expect(await store.read(`app:guild:parent:${stale.id}`)).toBeUndefined();
 			expect(await store.read(intentKey)).toBeUndefined();
-			expect(
-				(await restarted.notify({ sessionId: "session", endpointGeneration: 2, content: "current" })).threadId,
-			).toBe("replacement");
+			const conversation = await restarted.notify({
+				sessionId: "session",
+				endpointGeneration: 2,
+				content: "current",
+			});
+			if (!conversation.threadId) throw new Error("Discord notify did not bind a thread");
+			expect(conversation.threadId).not.toBe(stale.id);
+			expect(conversation.threadId).not.toBe("replacement");
+			expect(await store.read("app:guild:parent:replacement")).toBeUndefined();
+			expect(await store.read(`app:guild:parent:${stale.id}`)).toBeUndefined();
+			expect(provider.messages.map(message => message.threadId)).toEqual([conversation.threadId]);
+			expect(provider.messages[0]?.content).toBe("current");
 			await restarted.stop();
 		});
 	});
@@ -2813,6 +2824,175 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			expect(effects).toHaveLength(2);
 			expect(new Set(effects.map(effect => effect.id)).size).toBe(2);
 		});
+	});
+
+	test("keeps a verified mapping and does not publish when the nonce lookup fails", async () => {
+		await withDaemon(async (daemon, provider, agentDir) => {
+			const conversation = await daemon.notify({
+				sessionId: "session",
+				endpointGeneration: 1,
+				content: "first",
+			});
+			if (!conversation.threadId) throw new Error("Discord notify did not bind a thread");
+			const store = new ConversationStore<DiscordConversation>({ agentDir, kind: "discord" });
+			const key = `app:guild:parent:${conversation.threadId}`;
+			provider.failFindThread = true;
+			await expect(
+				daemon.notify({
+					sessionId: "session",
+					endpointGeneration: 1,
+					content: "SESSION-OUTPUT-CANARY",
+				}),
+			).rejects.toThrow("Discord API request failed (500)");
+			expect(await store.read(key)).toMatchObject({ threadId: conversation.threadId, state: "active" });
+			expect(provider.messages.map(message => message.content)).toEqual(["first"]);
+			expect(provider.creates).toBe(1);
+		});
+	});
+
+	test("does not publish a failure notice when nonce revalidation outlives the shutdown drain", async () => {
+		await withDaemon(async (daemon, provider) => {
+			await daemon.start();
+			const conversation = await daemon.notify({
+				sessionId: "session",
+				endpointGeneration: 1,
+				content: "first",
+			});
+			if (!conversation.threadId) throw new Error("Discord notify did not bind a thread");
+			const entered = Promise.withResolvers<void>();
+			const releaseLookup = Promise.withResolvers<void>();
+			const lookup = provider.findThreadByNonce.bind(provider);
+			provider.findThreadByNonce = async input => {
+				entered.resolve();
+				await releaseLookup.promise;
+				return lookup(input);
+			};
+			if (!provider.handler) throw new Error("Discord gateway handler was not installed");
+			const delivery = provider.handler({
+				id: "stale-after-stop",
+				guildId: "guild",
+				parentId: "parent",
+				threadId: conversation.threadId,
+				authorId: "member",
+				interaction: {
+					id: "interaction-stale-after-stop",
+					token: "token-stale-after-stop",
+					customId: "gjc:99:ask:00000000-0000-0000-0000-000000000000",
+					value: "yes",
+				},
+			});
+			await entered.promise;
+			await daemon.stop();
+			releaseLookup.resolve();
+			await delivery;
+			expect(provider.messages.map(message => message.content)).toEqual(["first"]);
+			expect(provider.creates).toBe(1);
+		});
+	}, 12_000);
+
+	test("does not publish session output to a persisted thread the provider cannot tie to the nonce starter", async () => {
+		await withDaemon(async (daemon, provider, agentDir) => {
+			const store = new ConversationStore<DiscordConversation>({ agentDir, kind: "discord" });
+			await store.transact("app:guild:parent:evil-thread", () => ({
+				generation: 1,
+				state: "active",
+				appId: "app",
+				guildId: "guild",
+				parentChannelId: "parent",
+				threadId: "evil-thread",
+				sessionId: "session",
+				endpointGeneration: 1,
+				createNonce: "pre-upgrade",
+				updatedAt: 1,
+				seenEventIds: [],
+				seenInteractionIds: [],
+			}));
+			const conversation = await daemon.notify({
+				sessionId: "session",
+				endpointGeneration: 1,
+				content: "SESSION-OUTPUT-CANARY",
+			});
+			expect(conversation.threadId).not.toBe("evil-thread");
+			expect(provider.messages).toEqual([
+				expect.objectContaining({ threadId: conversation.threadId, content: "SESSION-OUTPUT-CANARY" }),
+			]);
+			expect(JSON.stringify(provider.messages)).not.toContain("evil-thread");
+			expect(await store.read("app:guild:parent:evil-thread")).toBeUndefined();
+		});
+	});
+
+	test("does not commit a terminal create receipt the provider cannot tie to the nonce starter", async () => {
+		const now = 60_001;
+		await withDaemon(
+			async (_daemon, provider, agentDir) => {
+				const nonce = `gjc-${createHash("sha256").update("create:session:unverified-receipt").digest("hex").slice(0, 21)}`;
+				const journal = new ChatEffectJournal({ agentDir, transport: "discord", now: () => now });
+				const effectId = "create:session:unverified-receipt";
+				await journal.enqueue({
+					id: effectId,
+					kind: "create-thread",
+					transport: "discord",
+					sessionId: "session",
+					endpointGeneration: 1,
+					payload: { guildId: "guild", parentId: "parent", name: "GJC session", nonce },
+				});
+				const leased = await journal.claim(effectId, "crashed-owner", 1);
+				expect(leased).toBeDefined();
+				await journal.record(effectId, { owner: "crashed-owner", epoch: leased!.epoch }, "terminal", {
+					provider: "discord",
+					threadId: "evil-thread",
+					status: "created",
+				});
+				const store = new ConversationStore<DiscordConversation>({ agentDir, kind: "discord", now: () => now });
+				await store.transact("app:guild:parent:creating:session", () => ({
+					generation: 1,
+					state: "creating",
+					appId: "app",
+					guildId: "guild",
+					parentChannelId: "parent",
+					sessionId: "session",
+					endpointGeneration: 1,
+					createNonce: "unverified-receipt",
+					createOwner: "crashed-owner",
+					createLeaseExpiresAt: 1,
+					updatedAt: 1,
+					seenEventIds: [],
+					seenInteractionIds: [],
+				}));
+				const restarted = new DiscordNotificationDaemon({
+					agentDir,
+					guildId: "guild",
+					parentChannelId: "parent",
+					provider,
+					now: () => now,
+					resolveAttachment: async sessionId => ({
+						sessionId,
+						generation: 1,
+						isCurrent: () => true,
+						send: () => {},
+						sendMaintenance: () => {},
+					}),
+				});
+				await restarted.start();
+				const stored = await fs.readFile(
+					path.join(agentDir, "sdk", "daemons", "discord", "conversations.json"),
+					"utf8",
+				);
+				expect(stored).not.toContain("evil-thread");
+				expect(provider.messages).toEqual([]);
+				const conversation = await restarted.notify({
+					sessionId: "session",
+					endpointGeneration: 1,
+					content: "SESSION-OUTPUT-CANARY",
+				});
+				if (!conversation.threadId) throw new Error("Discord notify did not bind a thread");
+				expect(conversation.threadId).not.toBe("evil-thread");
+				expect(provider.messages.map(message => message.threadId)).toEqual([conversation.threadId]);
+				expect(provider.messages[0]?.content).toBe("SESSION-OUTPUT-CANARY");
+				await restarted.stop();
+			},
+			{ now: () => now },
+		);
 	});
 
 	test("uses a fresh durable archive occurrence for every archive cycle", async () => {

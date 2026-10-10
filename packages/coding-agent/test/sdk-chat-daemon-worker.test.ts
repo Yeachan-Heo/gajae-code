@@ -85,6 +85,7 @@ class FakeDiscordProvider implements DiscordProvider {
 	stopped = false;
 	threads: DiscordThread[] = [];
 	messages: Array<{ threadId: string; content: string; components?: DiscordMessageComponent[] }> = [];
+	#threadsByNonce = new Map<string, DiscordThread>();
 	#threadWaiters: Array<{ count: number; resolve: () => void }> = [];
 	#messageWaiters: Array<{
 		predicate: (message: { threadId: string; content: string; components?: DiscordMessageComponent[] }) => boolean;
@@ -149,11 +150,14 @@ class FakeDiscordProvider implements DiscordProvider {
 			archived: false,
 		};
 		this.threads.push(thread);
+		this.#threadsByNonce.set(input.nonce, thread);
 		this.#resolveThreadWaiters();
 		return thread;
 	}
-	async findThreadByNonce(): Promise<DiscordThread | null> {
-		return null;
+	async findThreadByNonce(input: { guildId: string; parentId: string; nonce: string }): Promise<DiscordThread | null> {
+		const thread = this.#threadsByNonce.get(input.nonce);
+		if (!thread || thread.guildId !== input.guildId || thread.parentId !== input.parentId) return null;
+		return thread;
 	}
 	async findMessageByNonce(): Promise<{ id: string } | null> {
 		return null;

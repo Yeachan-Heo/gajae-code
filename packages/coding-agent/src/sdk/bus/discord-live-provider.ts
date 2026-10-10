@@ -130,13 +130,10 @@ export class DiscordLiveProvider implements DiscordProvider, DiscordDiagnosticPr
 		nonce: string;
 	}): Promise<DiscordThread> {
 		return await this.#withRequestContext(undefined, async context => {
+			const botUserId = await this.#ensureBotUserId(context);
 			const marker = `${NONCE_PREFIX}${input.nonce}${NONCE_SUFFIX}`;
-			const starter = await this.#findStarterMessage(input.parentId, marker, context);
-			if (starter?.thread) {
-				const existing = this.#starterThread(starter.thread, input.guildId, input.parentId);
-				if (!existing) throw new Error("Discord returned an invalid starter-message thread");
-				return existing;
-			}
+			const starter = await this.#findStarterMessage(input.parentId, marker, input.guildId, botUserId, context);
+			if (starter?.thread) return starter.thread;
 			const messageId = starter?.id ?? (await this.#createStarterMessage(input.parentId, marker, context));
 			const body = await this.#request(
 				`/channels/${input.parentId}/messages/${messageId}/threads`,
@@ -146,7 +143,7 @@ export class DiscordLiveProvider implements DiscordProvider, DiscordDiagnosticPr
 				},
 				context,
 			);
-			return this.#thread(body, input.guildId, input.parentId);
+			return this.#thread(body, input.guildId, input.parentId, botUserId);
 		});
 	}
 
@@ -167,36 +164,56 @@ export class DiscordLiveProvider implements DiscordProvider, DiscordDiagnosticPr
 	async #findStarterMessage(
 		parentId: string,
 		marker: string,
+		guildId: string,
+		botUserId: string,
 		context: DiscordRequestContext,
-	): Promise<{ id: string; thread?: unknown } | undefined> {
+	): Promise<{ id: string; thread?: DiscordThread } | undefined> {
 		const messages = await this.#request(`/channels/${parentId}/messages?limit=100`, {}, context);
 		if (!Array.isArray(messages)) return undefined;
 		for (const message of messages) {
-			if (!this.#messageContent(message).includes(marker)) continue;
+			if (!this.#messageContent(message).includes(marker) || !this.#authoredByBot(message, botUserId)) continue;
 			const id = this.#string(message, "id");
-			if (id)
-				return {
-					id,
-					...(this.#record(message).thread === undefined ? {} : { thread: this.#record(message).thread }),
-				};
+			if (!id) continue;
+			const rawThread = this.#record(message).thread;
+			if (rawThread === undefined) return { id };
+			const thread = this.#botOwnedThread(rawThread, guildId, parentId, botUserId);
+			if (thread) return { id, thread };
 		}
 		return undefined;
 	}
 
 	async findThreadByNonce(input: { guildId: string; parentId: string; nonce: string }): Promise<DiscordThread | null> {
 		return await this.#withRequestContext(undefined, async context => {
+			const botUserId = await this.#ensureBotUserId(context);
 			const marker = `${NONCE_PREFIX}${input.nonce}${NONCE_SUFFIX}`;
 			const parentMessages = await this.#request(`/channels/${input.parentId}/messages?limit=100`, {}, context);
 			if (Array.isArray(parentMessages))
 				for (const message of parentMessages) {
-					if (!this.#messageContent(message).includes(marker)) continue;
-					const thread = this.#starterThread(this.#record(message).thread, input.guildId, input.parentId);
+					if (!this.#messageContent(message).includes(marker) || !this.#authoredByBot(message, botUserId))
+						continue;
+					const thread = this.#botOwnedThread(
+						this.#record(message).thread,
+						input.guildId,
+						input.parentId,
+						botUserId,
+					);
 					if (thread) return thread;
 				}
-			const candidates = await this.#listThreads(input.guildId, input.parentId, context);
+			const candidates = await this.#listThreads(input.guildId, input.parentId, botUserId, context);
 			for (const candidate of candidates) {
-				const messages = await this.#request(`/channels/${candidate.id}/messages?limit=25`, {}, context);
-				if (Array.isArray(messages) && messages.some(message => this.#messageContent(message).includes(marker)))
+				// A thread started from a message uses that message id. Only the parent
+				// starter counts; a later bot message that repeats the marker does not.
+				let starter: unknown;
+				try {
+					starter = await this.#request(`/channels/${input.parentId}/messages/${candidate.id}`, {}, context);
+				} catch (error) {
+					if (!(error instanceof Error) || !/^Discord API request failed \(404\)$/.test(error.message))
+						throw error;
+					continue;
+				}
+				const starterId = this.#string(starter, "id");
+				if (starterId !== undefined && starterId !== candidate.id) continue;
+				if (this.#messageContent(starter).includes(marker) && this.#authoredByBot(starter, botUserId))
 					return candidate;
 			}
 			return null;
@@ -332,10 +349,7 @@ export class DiscordLiveProvider implements DiscordProvider, DiscordDiagnosticPr
 		this.#stopped = false;
 		try {
 			await this.#withRequestContext(undefined, async context => {
-				const me = await this.#request("/users/@me", {}, context);
-				const id = this.#string(me, "id");
-				if (!id) throw new Error("Discord returned an invalid current-user response");
-				this.#botUserId = id;
+				await this.#ensureBotUserId(context);
 				const gateway = await this.#request("/gateway/bot", {}, context);
 				const url = this.#string(gateway, "url");
 				if (!url) throw new Error("Discord returned an invalid gateway response");
@@ -504,13 +518,18 @@ export class DiscordLiveProvider implements DiscordProvider, DiscordDiagnosticPr
 		);
 	}
 
-	async #listThreads(guildId: string, parentId: string, context: DiscordRequestContext): Promise<DiscordThread[]> {
+	async #listThreads(
+		guildId: string,
+		parentId: string,
+		botUserId: string,
+		context: DiscordRequestContext,
+	): Promise<DiscordThread[]> {
 		const result: DiscordThread[] = [];
 		const active = this.#record(await this.#request(`/guilds/${guildId}/threads/active`, {}, context));
 		const activeThreads = active.threads;
 		if (Array.isArray(activeThreads))
 			for (const thread of activeThreads) {
-				const parsed = this.#threadOrUndefined(thread, guildId, parentId);
+				const parsed = this.#botOwnedThread(thread, guildId, parentId, botUserId);
 				if (parsed) result.push(parsed);
 			}
 		const archived = this.#record(
@@ -519,7 +538,7 @@ export class DiscordLiveProvider implements DiscordProvider, DiscordDiagnosticPr
 		const archivedThreads = archived.threads;
 		if (Array.isArray(archivedThreads))
 			for (const thread of archivedThreads) {
-				const parsed = this.#threadOrUndefined(thread, guildId, parentId);
+				const parsed = this.#botOwnedThread(thread, guildId, parentId, botUserId);
 				if (parsed) result.push(parsed);
 			}
 		return result;
@@ -634,8 +653,8 @@ export class DiscordLiveProvider implements DiscordProvider, DiscordDiagnosticPr
 		}
 	}
 
-	#thread(value: unknown, guildId: string, parentId: string): DiscordThread {
-		const thread = this.#threadOrUndefined(value, guildId, parentId);
+	#thread(value: unknown, guildId: string, parentId: string, botUserId: string): DiscordThread {
+		const thread = this.#botOwnedThread(value, guildId, parentId, botUserId);
 		if (!thread) throw new Error("Discord returned an invalid thread response");
 		return thread;
 	}
@@ -647,12 +666,22 @@ export class DiscordLiveProvider implements DiscordProvider, DiscordDiagnosticPr
 		return { id, guildId, parentId, archived: metadata.archived === true, locked: metadata.locked === true };
 	}
 
-	#starterThread(value: unknown, guildId: string, parentId: string): DiscordThread | undefined {
-		const thread = this.#record(value);
-		const id = this.#string(thread, "id");
-		if (!id) return undefined;
-		const metadata = this.#record(thread.thread_metadata);
-		return { id, guildId, parentId, archived: metadata.archived === true, locked: metadata.locked === true };
+	async #ensureBotUserId(context: DiscordRequestContext): Promise<string> {
+		if (this.#botUserId) return this.#botUserId;
+		const me = await this.#request("/users/@me", {}, context);
+		const id = this.#string(me, "id");
+		if (!id) throw new Error("Discord returned an invalid current-user response");
+		this.#botUserId = id;
+		return id;
+	}
+	#authoredByBot(message: unknown, botUserId: string): boolean {
+		const author = this.#record(this.#record(message).author);
+		return botUserId !== "" && author.bot === true && this.#string(author, "id") === botUserId;
+	}
+	/** A starter thread counts only when Discord says this bot created it in the configured parent. */
+	#botOwnedThread(value: unknown, guildId: string, parentId: string, botUserId: string): DiscordThread | undefined {
+		if (botUserId === "" || this.#string(this.#record(value), "owner_id") !== botUserId) return undefined;
+		return this.#threadOrUndefined(value, guildId, parentId);
 	}
 	#messageContent(value: unknown): string {
 		return this.#string(this.#record(value), "content") ?? "";
