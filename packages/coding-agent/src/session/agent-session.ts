@@ -21799,6 +21799,7 @@ export class AgentSession {
 			sessionId: this.sessionManager.getSessionId(),
 			sessionFile: this.sessionManager.getSessionFile(),
 		});
+
 		if (
 			agentEndGeneration === undefined ||
 			ownerEpoch === undefined ||
