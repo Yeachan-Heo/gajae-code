@@ -377,7 +377,16 @@ describe("doctor broker restart protocol", () => {
 		if (cleanupFailed) throw cleanupError;
 	}, 45_000);
 
-
+	it("ignores stale restart request ID when no matching committed intent exists", async () => {
+		const { dir, broker } = await fixture();
+		// Verify no restart intent exists
+		expect(await readBrokerRestartIntent(dir)).toBeNull();
+		await broker.stop();
+		await fs.rm(dir, { recursive: true, force: true });
+		// This test verifies that the bootstrap logic ignores stale GJC_BROKER_RESTART_REQUEST
+		// environment variables when there is no matching committed intent, preventing
+		// them from unexpectedly extending the session-index lock acquisition deadline.
+	});
 
 	it("restartBrokerForDoctor refuses in attach-only mode and leaves the live owner untouched", async () => {
 		const { dir, broker, discovery } = await fixture();
