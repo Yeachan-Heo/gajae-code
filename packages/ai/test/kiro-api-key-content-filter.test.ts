@@ -1092,10 +1092,6 @@ describe("reader.read() error handling with pending tools #6151", () => {
 		const endIdx = emittedEventTypes.indexOf("toolcall_end");
 		const errorIdx = emittedEventTypes.indexOf("error");
 
-		if (errorIdx === -1) {
-			console.log(`ERROR: No error event. Emitted events: ${emittedEventTypes.join(", ")}`);
-		}
-
 		expect(startIdx).toBe(-1);
 		expect(endIdx).toBe(-1);
 		expect(errorIdx).toBeGreaterThan(-1);
@@ -1308,9 +1304,6 @@ describe("P1 Regression: incomplete tool emission at tool-ID rollover", () => {
 		}
 
 		// Count toolcall events
-		const tool1Start = emittedEventTypes.indexOf("toolcall_start");
-		const tool1End = emittedEventTypes.indexOf("toolcall_end");
-
 		// tool-1 was incomplete, so should NOT be emitted (both start AND end should be absent)
 		// tool-2 was complete (stop: true), so SHOULD be emitted
 		const toolcallStarts = emittedEventTypes.filter(e => e === "toolcall_start").length;
