@@ -259,7 +259,8 @@ export const PUBLIC_COMMANDS: readonly PublicCommandDescriptor[] = [
 		risk: "Owns the broker for the agent directory; clients should run attach-only (GJC_SDK_BROKER_AUTOSTART=0) so they never start a competing one.",
 		constraints: [
 			"Stays in the foreground until SIGTERM or SIGINT, stops gracefully, then exits with the signal status (143 or 130).",
-			"Exits 1 without serving when another broker already owns the agent directory or startup fails.",
+			"Exits 1 without serving when another live broker owns the agent directory (it never retires it) or startup fails.",
+			"Exits 1 if it loses its discovery root or cannot renew its heartbeat while serving; a broker.shutdown request exits 0.",
 		],
 		example: "gjc sdk broker run --agent-dir ~/.gjc/agent",
 	}),

@@ -87,9 +87,12 @@ discovery pid is the supervised process itself.
   then exits with the signal status: 143 for SIGTERM, 130 for SIGINT. Under
   systemd, set `SuccessExitStatus=143` so a normal stop is not reported as a
   failure.
-- It exits 1 without serving when another broker already owns the agent
-  directory, or when startup fails. It never yields to or retires the other
-  owner.
+- It exits 1 without serving when another live broker already owns the agent
+  directory (even one this version cannot reuse), or when startup fails. It
+  never retires the other owner.
+- It exits 1 when it stops abnormally while serving: its discovery root was
+  lost or replaced, or its heartbeat could not be renewed. A requested
+  `broker.shutdown` is a clean stop (exit 0). Use `Restart=on-failure`.
 - Pair it with attach-only clients (`GJC_SDK_BROKER_AUTOSTART=0`) so nothing
   else starts a competing broker. Set the variable on the broker unit as well
   if its session hosts should stay attach-only.
@@ -99,6 +102,7 @@ discovery pid is the supervised process itself.
 ExecStart=/path/to/gjc sdk broker run --agent-dir /home/me/.gjc/agent
 Environment=GJC_SDK_BROKER_AUTOSTART=0
 SuccessExitStatus=143
+Restart=on-failure
 ```
 
 `--agent-dir` selects the broker state directory. It may appear at the session

@@ -1944,7 +1944,11 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 				});
 			}, watchdogMs);
 			try {
-				const existing = await reconcileBrokerGenerationForStartup({ agentDir }, deadline);
+				// `gjc sdk broker run` never retires another owner, even one this generation cannot
+				// reuse: any live incumbent is a refusal. Autostart repairs unusable generations.
+				const existing = publicBrokerRun
+					? ((await readBrokerDiscovery(agentDir)) ?? undefined)
+					: await reconcileBrokerGenerationForStartup({ agentDir }, deadline);
 				if (startupAbortController.signal.aborted) return undefined;
 				if (existing) {
 					logger.info("sdk broker: startup reused an existing owner", {
@@ -2150,7 +2154,18 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 		stopSweep?.();
 		if (!pendingShutdownSignal) unregisterPostmortem();
 	}
-	if (!pendingShutdownSignal) process.exit(0);
+	if (pendingShutdownSignal) return;
+	// A supervised broker that lost its root or could not renew its heartbeat
+	// must exit as a failure, so the supervisor restarts it. A requested
+	// shutdown or a committed restart handoff is a clean stop.
+	const terminal = runningBroker.terminalExit;
+	if (publicBrokerRun && (terminal?.mode !== "owned-root" || terminal.reason === "heartbeat-renewal-blocked")) {
+		process.stderr.write(
+			`gjc sdk broker run: SDK broker stopped abnormally (${terminal?.mode ?? "unknown"}: ${terminal?.reason ?? "unknown"}).\n`,
+		);
+		process.exit(1);
+	}
+	process.exit(0);
 }
 
 /** `gjc sdk broker run` did not become the owner: another broker already serves this agent dir. */
