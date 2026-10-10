@@ -192,7 +192,14 @@ export interface SubagentRecord {
 	 * file, followed by a separately available runner (`no_runner` otherwise).
 	 */
 	resumable: boolean;
-	queued?: { ownerId?: string; seq: number; message?: string; resumeToolCallId?: string; admissionEndpointId?: string; createdAt: number };
+	queued?: {
+		ownerId?: string;
+		seq: number;
+		message?: string;
+		resumeToolCallId?: string;
+		admissionEndpointId?: string;
+		createdAt: number;
+	};
 	/** Last queued-resume seq for a CANCELLED queued resume (rec.queued is
 	 *  cleared on cancel): retained on the record so owned settlement's second
 	 *  proof can still see the generation as provably cancelled, without a
@@ -2019,7 +2026,9 @@ export class AsyncJobManager {
 			// do not add cross-session fallback (review thread P2).
 			const resumeEndpoint =
 				admissionEndpointId ??
-				(resumeToolCallId ? resolveToolLineage(resumeToolCallId, AsyncJobManager.endpointIdOf(this))?.endpointId : undefined);
+				(resumeToolCallId
+					? resolveToolLineage(resumeToolCallId, AsyncJobManager.endpointIdOf(this))?.endpointId
+					: undefined);
 			const queuedReg = lookupOwnedRegistration(queuedGeneration, queuedGeneration, resumeEndpoint);
 			if (queuedReg) unregisterOwnedRegistration(queuedReg);
 		}
