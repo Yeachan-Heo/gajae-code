@@ -164,7 +164,7 @@ function interceptNextExactConfigRead(configPath: string, afterRead: () => Promi
 	});
 }
 
-describe("standalone mcp.json oauth env expansion", () => {
+describe("standalone mcp.json env expansion", () => {
 	let tempDir = "";
 	const originalEnv = {
 		PI_OAUTH_TOKEN_URL: process.env.PI_OAUTH_TOKEN_URL,
@@ -200,60 +200,72 @@ describe("standalone mcp.json oauth env expansion", () => {
 		}
 	});
 
-	test("expands standalone auth and oauth fields alongside existing env-expanded fields", async () => {
-		await fs.writeFile(
-			path.join(tempDir, "mcp.json"),
-			JSON.stringify({
-				mcpServers: {
-					figma: {
-						url: `${envPlaceholder("PI_MCP_URL")}/mcp`,
-						headers: { Authorization: envPlaceholder("PI_MCP_HEADER") },
-						env: { MCP_VALUE: envPlaceholder("PI_MCP_ENV") },
-						auth: {
-							type: "oauth",
-							tokenUrl: envPlaceholder("PI_OAUTH_TOKEN_URL"),
-							clientId: envPlaceholder("PI_OAUTH_CLIENT_ID"),
-							clientSecret: envPlaceholder("PI_OAUTH_CLIENT_SECRET"),
-						},
-						oauth: {
-							clientId: envPlaceholder("PI_OAUTH_CLIENT_ID"),
-							clientSecret: envPlaceholder("PI_OAUTH_CLIENT_SECRET"),
-							redirectUri: envPlaceholder("PI_OAUTH_REDIRECT_URI"),
-							callbackPort: 4317,
-							callbackPath: envPlaceholder("PI_OAUTH_CALLBACK_PATH"),
-						},
+	test("leaves secret-named standalone fields literal and still expands ordinary names", async () => {
+		const config = {
+			mcpServers: {
+				figma: {
+					url: `${envPlaceholder("PI_MCP_URL")}/mcp`,
+					headers: { Authorization: envPlaceholder("PI_MCP_HEADER") },
+					env: { MCP_VALUE: envPlaceholder("PI_MCP_ENV") },
+					auth: {
+						type: "oauth",
+						tokenUrl: envPlaceholder("PI_OAUTH_TOKEN_URL"),
+						clientId: envPlaceholder("PI_OAUTH_CLIENT_ID"),
+						clientSecret: envPlaceholder("PI_OAUTH_CLIENT_SECRET"),
+					},
+					oauth: {
+						clientId: envPlaceholder("PI_OAUTH_CLIENT_ID"),
+						clientSecret: envPlaceholder("PI_OAUTH_CLIENT_SECRET"),
+						redirectUri: envPlaceholder("PI_OAUTH_REDIRECT_URI"),
+						callbackPort: 4317,
+						callbackPath: envPlaceholder("PI_OAUTH_CALLBACK_PATH"),
 					},
 				},
-			}),
-		);
+			},
+		};
+		await fs.writeFile(path.join(tempDir, "mcp.json"), JSON.stringify(config));
 
 		const [server] = await loadStandaloneMcpConfig(tempDir);
 		expect(server).toBeDefined();
-		expect(server?.url).toBe("https://mcp.example.com/mcp");
+		expect(server?.url).toBe(`${envPlaceholder("PI_MCP_URL")}/mcp`);
+		expect(server?.url).not.toContain("mcp.example.com");
 		expect(server?.headers).toEqual({ Authorization: "Bearer test-token" });
 		expect(server?.env).toEqual({ MCP_VALUE: "env-value" });
 		expect(server?.auth).toEqual({
+			type: "oauth",
+			tokenUrl: envPlaceholder("PI_OAUTH_TOKEN_URL"),
+			clientId: envPlaceholder("PI_OAUTH_CLIENT_ID"),
+			clientSecret: envPlaceholder("PI_OAUTH_CLIENT_SECRET"),
+		});
+		expect(server?.oauth).toEqual({
+			clientId: envPlaceholder("PI_OAUTH_CLIENT_ID"),
+			clientSecret: envPlaceholder("PI_OAUTH_CLIENT_SECRET"),
+			redirectUri: envPlaceholder("PI_OAUTH_REDIRECT_URI"),
+			callbackPort: 4317,
+			callbackPath: envPlaceholder("PI_OAUTH_CALLBACK_PATH"),
+		});
+		expect(JSON.stringify(server)).not.toContain("oauth-client-secret");
+
+		const exactPath = path.join(tempDir, "exact.json");
+		await fs.writeFile(exactPath, JSON.stringify(config));
+		const exact = await loadMCPJsonFile(exactPath, "project", { quiet: true, useCache: false });
+		expect(exact.items[0]?.url).toBe("https://mcp.example.com/mcp");
+		expect(exact.items[0]?.auth).toEqual({
 			type: "oauth",
 			tokenUrl: "https://provider.example/token",
 			clientId: "oauth-client-id",
 			clientSecret: "oauth-client-secret",
 		});
-		expect(server?.oauth).toEqual({
-			clientId: "oauth-client-id",
-			clientSecret: "oauth-client-secret",
-			redirectUri: "https://public.example/oauth/callback",
-			callbackPort: 4317,
-			callbackPath: "/oauth/callback",
-		});
 	});
 
-	test("expands only the standalone oauth fields that are present", async () => {
+	test("leaves only the present secret-named oauth fields literal", async () => {
 		await fs.writeFile(
 			path.join(tempDir, ".mcp.json"),
 			JSON.stringify({
 				mcpServers: {
 					slack: {
 						url: "https://slack.example.com/mcp",
+						headers: { Accept: envPlaceholder("PI_MCP_HEADER") },
 						oauth: {
 							redirectUri: envPlaceholder("PI_OAUTH_REDIRECT_URI"),
 							callbackPath: envPlaceholder("PI_OAUTH_CALLBACK_PATH"),
@@ -265,11 +277,13 @@ describe("standalone mcp.json oauth env expansion", () => {
 
 		const [server] = await loadStandaloneMcpConfig(tempDir);
 		expect(server).toBeDefined();
+		expect(server?.headers).toEqual({ Accept: "Bearer test-token" });
 		expect(server?.oauth).toEqual({
-			redirectUri: "https://public.example/oauth/callback",
-			callbackPath: "/oauth/callback",
+			redirectUri: envPlaceholder("PI_OAUTH_REDIRECT_URI"),
+			callbackPath: envPlaceholder("PI_OAUTH_CALLBACK_PATH"),
 		});
 		expect(server?.auth).toBeUndefined();
+		expect(JSON.stringify(server?.oauth)).not.toContain("public.example");
 	});
 
 	test("preserves noInheritEnv for explicit stdio runtime consumers", async () => {

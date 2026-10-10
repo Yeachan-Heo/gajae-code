@@ -69,6 +69,7 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 	await fs.mkdir(lock);
 	await Bun.write(path.join(lock, "info"), JSON.stringify({ pid: DEAD_PID, timestamp: 1000 }));
 	let nativeIdentityChanged = false;
+	const pathObservations: string[] = [];
 	const realLstat = fs.lstat;
 	const transformStat = (target: string, stat: BigIntStats): BigIntStats => {
 		const isRoot =
@@ -82,6 +83,7 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 			sameFixturePath(target, path.join(parked, "info")) ||
 			sameFixturePath(target, path.join(cleanupLock, "info")) ||
 			sameFixturePath(target, path.join(cleanupParked, "info"));
+		pathObservations.push(`stat ${String(target)} root=${isRoot} info=${isInfo} dev=${stat.dev} ino=${stat.ino}`);
 		const id = isRoot && component !== "info" ? ROOT_ID : isInfo && component !== "root" ? INFO_ID : null;
 		if (!isRoot && !isInfo) return stat;
 		return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, {
@@ -96,10 +98,11 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 	const realOpen = fs.open;
 	vi.spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
 		const handle = await realOpen(target, flags, mode);
-		if (
+		const matchesInfo =
 			sameFixturePath(String(target), path.join(lock, "info")) ||
-			sameFixturePath(String(target), path.join(cleanupLock, "info"))
-		) {
+			sameFixturePath(String(target), path.join(cleanupLock, "info"));
+		pathObservations.push(`open ${String(target)} info=${matchesInfo}`);
+		if (matchesInfo) {
 			const realStat = handle.stat.bind(handle);
 			vi.spyOn(handle, "stat").mockImplementation((async options => {
 				const stat = await realStat(options);
@@ -157,6 +160,7 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 	FileLockTestHooks.nativeExactRemovalProbe = () => !detach;
 	FileLockTestHooks.nativeQuarantineBindings = () => ({
 		snapshotDirectoryTree: target => {
+			pathObservations.push(`snapshot ${target}`);
 			const captured = snapshotDirectoryTree(target);
 			if (!captured.ok || !captured.snapshot) return captured;
 			originals.set(target, captured.snapshot);
@@ -169,6 +173,7 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 		lock,
 		parked,
 		remove,
+		pathObservations,
 		changeNativeIdentity: () => {
 			nativeIdentityChanged = true;
 		},
@@ -179,7 +184,11 @@ test.each(["root", "info"] as const)("reclaims a dead-owner lock with a signed %
 	const fixture = await signedIdentityFixture(component);
 	const observed = await readFileLockObservationForGc(fixture.lock);
 	if (!observed) throw new Error("Expected a lock observation");
-	expect(await removeFileLockDirForGc(fixture.lock, observed.info, observed.identity)).toBe("removed");
+	const result = await removeFileLockDirForGc(fixture.lock, observed.info, observed.identity);
+	if (result !== "removed")
+		throw new Error(
+			JSON.stringify({ result, identity: observed.identity, paths: fixture.pathObservations }, null, 2),
+		);
 	expect(fixture.remove).toHaveBeenCalledTimes(1);
 	expect(await fs.exists(fixture.lock)).toBe(false);
 });

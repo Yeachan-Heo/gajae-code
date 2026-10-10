@@ -424,7 +424,7 @@ import {
 	readVisibleSkillActiveState,
 	syncSkillActiveState,
 } from "../skill-state/active-state";
-import { assertWorkflowMutationAllowed } from "../skill-state/workflow-mutation-guard";
+import { assertWorkflowMutationAllowed, isWorkflowMutationTool } from "../skill-state/workflow-mutation-guard";
 import { invalidateHostMetadata } from "../ssh/connection-manager";
 import { buildVolatileProjectContext } from "../system-prompt";
 import { DelegationHintController } from "../task/delegation-hint";
@@ -449,6 +449,7 @@ import {
 import { assertEditableFile } from "../tools/auto-generated-guard";
 import { releaseTabsForOwner } from "../tools/browser/tab-supervisor";
 import type { CheckpointState } from "../tools/checkpoint";
+import { githubPermissionIntent } from "../tools/github-side-effect";
 import { outputMeta, wrapToolWithMetaNotice } from "../tools/output-meta";
 import { normalizeLocalScheme, resolveReadPath, resolveToCwd } from "../tools/path-utils";
 import { registerResourceGcSession } from "../tools/resource-gc";
@@ -2009,7 +2010,7 @@ async function discardPreparedNewSessionAfterFailure(
 // ============================================================================
 
 /** Tools that require user permission before execution when an ACP client is connected. */
-const PERMISSION_REQUIRED_TOOLS = new Set(["bash", "monitor", "eval", "edit", "delete", "move"]);
+const PERMISSION_REQUIRED_TOOLS = new Set(["bash", "monitor", "eval", "edit", "delete", "move", "github"]);
 
 function isShellExecutionPermissionTool(toolName: string): boolean {
 	return toolName === "bash" || toolName === "monitor";
@@ -2133,6 +2134,7 @@ function getPermissionIntent(
 			cacheKey: "edit:move",
 		};
 	}
+	if (toolName === "github") return githubPermissionIntent(args);
 	return undefined;
 }
 
@@ -11832,7 +11834,9 @@ export class AgentSession {
 							: undefined;
 					const commandContent = command
 						? [{ type: "content" as const, content: { type: "text" as const, text: `$ ${command}` } }]
-						: undefined;
+						: target.name === "github"
+							? [{ type: "content" as const, content: { type: "text" as const, text: permissionIntent.title } }]
+							: undefined;
 					if (this.#sdkPermissionMode === "allow") {
 						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 					}
@@ -11945,7 +11949,7 @@ export class AgentSession {
 	/**
 	/** Wrap a tool with the workflow mutation guard before permissions or execution. */
 	#wrapToolForWorkflowMutationGuard<T extends AgentTool>(tool: T): T {
-		if (!["edit", "write", "ast_edit", "bash"].includes(tool.name)) return tool;
+		if (!isWorkflowMutationTool(tool.name)) return tool;
 		return new Proxy(tool, {
 			get: (target, prop) => {
 				if (prop !== "execute") return Reflect.get(target, prop, target);
