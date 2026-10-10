@@ -512,12 +512,19 @@ function assignedTmuxSocket(tokens: Token[], commandIndex: number): string | und
 	// until we find either a TMUX assignment or hit a non-wrapper command
 	for (let index = commandIndex - 1; index >= 0 && commandIndex - index <= 20; index++) {
 		const token = tokens[index];
+
+		// Check for TMUX assignment first, regardless of commandStart
 		const assignment = token.text.match(/^TMUX=([^,\s]+)/);
 		if (assignment) return assignment[1];
 
-		// If this token starts a new command, we've gone too far
-		// unless it's a wrapper command, which we should traverse
+		// If this token starts a new command, check if it's a wrapper
+		// Continue traversing through wrappers and assignments
 		if (token.commandStart) {
+			if (isAssignment(token.text)) {
+				// This is an assignment at command start (e.g., TMUX=/tmp/other env ...)
+				// Continue searching in case there are nested assignments
+				continue;
+			}
 			if (!COMMAND_WRAPPERS.has(token.text) && !COMMAND_WRAPPERS_WITH_ARGS[token.text]) {
 				// Not a wrapper command, stop here
 				break;
