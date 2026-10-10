@@ -9330,12 +9330,6 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			});
 			expect(abortCalls).toBe(1);
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toHaveLength(1);
-			const terminalEventDeadline = Date.now() + 2_000;
-			while (
-				!correlatedFrames(harness, correlation).some(frame => frame.kind === "agent_end") &&
-				Date.now() < terminalEventDeadline
-			)
-				await Bun.sleep(5);
 			expect(
 				correlatedFrames(harness, correlation).find(frame => frame.kind === "agent_end")?.payload,
 			).toMatchObject({
