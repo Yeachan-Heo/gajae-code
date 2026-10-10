@@ -454,6 +454,36 @@ function isWorktreeDirty(worktreePath: string): boolean {
 	return runGit(worktreePath, ["status", "--porcelain"]).length > 0;
 }
 
+/** Porcelain status is clean when the only unique state is commits on this detached HEAD. */
+function isCommitAncestor(cwd: string, ancestor: string, descendant: string): boolean {
+	const result = Bun.spawnSync(["git", "merge-base", "--is-ancestor", ancestor, descendant], {
+		cwd,
+		stdout: "ignore",
+		stderr: "pipe",
+	});
+	if (result.exitCode === 0) return true;
+	if (result.exitCode === 1) return false;
+	const stderr = sanitizeWorktreeDiagnostic(result.stderr.toString().trim());
+	throw new Error(stderr || "git merge-base --is-ancestor failed");
+}
+
+function formatWorktreeDiverged(worktreePath: string, existingHead: string, baseRef: string): string {
+	return [
+		`worktree_diverged:${worktreePath}`,
+		`GJC refused to move detached launch worktree ${existingHead} onto ${baseRef} because that commit is not an ancestor of the source HEAD.`,
+		`Path: ${worktreePath}`,
+		"Checking out the source HEAD would drop that commit from this worktree. Safe remediation: create a branch at HEAD so the commit stays reachable (git branch <name>), then retarget or remove the worktree yourself if a later launch should reuse this path. GJC did not change HEAD.",
+	].join("\n");
+}
+
+function reuseDetachedLaunchHead(plan: GjcLaunchWorktreePlan, existingHead: string, dirty: boolean): void {
+	if (dirty) throw new Error(`worktree_dirty:${plan.worktreePath}`);
+	if (!isCommitAncestor(plan.worktreePath, existingHead, plan.baseRef)) {
+		throw new Error(formatWorktreeDiverged(plan.worktreePath, existingHead, plan.baseRef));
+	}
+	runGit(plan.worktreePath, ["checkout", "--detach", plan.baseRef]);
+}
+
 function resolveOptionalWorktreeName(args: string[], index: number): { name: string | null; nextIndex: number } {
 	const next = args[index + 1];
 	if (!next) return { name: null, nextIndex: index };
@@ -781,8 +811,7 @@ function ensureLaunchWorktreeSync(
 				throw new Error(formatWorktreeTargetMismatch(plan, existingAtPath));
 			}
 			if (existingAtPath.head !== plan.baseRef) {
-				if (dirty) throw new Error(`worktree_dirty:${plan.worktreePath}`);
-				runGit(plan.worktreePath, ["checkout", "--detach", plan.baseRef]);
+				reuseDetachedLaunchHead(plan, existingAtPath.head, dirty);
 				dirty = false;
 			}
 		} else if (existingAtPath.branchRef !== expectedBranchRef) {
@@ -877,8 +906,7 @@ export async function ensureLaunchWorktreeCancellable(
 				throw new Error(formatWorktreeTargetMismatch(plan, existingAtPath));
 			}
 			if (existingAtPath.head !== plan.baseRef) {
-				if (dirty) throw new Error(`worktree_dirty:${plan.worktreePath}`);
-				runGit(plan.worktreePath, ["checkout", "--detach", plan.baseRef]);
+				reuseDetachedLaunchHead(plan, existingAtPath.head, dirty);
 				dirty = false;
 			}
 		} else if (existingAtPath.branchRef !== expectedBranchRef) {

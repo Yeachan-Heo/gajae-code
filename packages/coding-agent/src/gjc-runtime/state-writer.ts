@@ -310,19 +310,33 @@ export function stampWorkflowEnvelopeChecksum<T>(value: T, filePath: string, com
 	return envelope as T;
 }
 
-export async function detectWorkflowEnvelopeIntegrityMismatch(
-	filePath: string,
-): Promise<WorkflowEnvelopeIntegrityMismatch | undefined> {
-	const current = await readJsonIfPresent(filePath);
-	if (!current || typeof current !== "object" || Array.isArray(current)) return undefined;
-	const receipt = (current as Record<string, unknown>).receipt;
+export type WorkflowEnvelopeChecksumStatus = "absent" | "match" | "mismatch";
+
+/** Compare a parsed envelope to its writer-stamped `content_sha256`, when one is present. */
+export function workflowEnvelopeChecksumStatus(value: unknown): WorkflowEnvelopeChecksumStatus {
+	const checksum = workflowEnvelopeChecksumPair(value);
+	if (!checksum) return "absent";
+	return checksum.actual === checksum.expected ? "match" : "mismatch";
+}
+
+function workflowEnvelopeChecksumPair(value: unknown): { expected: string; actual: string } | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const receipt = (value as Record<string, unknown>).receipt;
 	if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) return undefined;
 	const checksum = (receipt as Record<string, unknown>).content_sha256;
 	if (!checksum || typeof checksum !== "object" || Array.isArray(checksum)) return undefined;
 	const expected = (checksum as Record<string, unknown>).value;
 	if (typeof expected !== "string" || !expected) return undefined;
-	const actual = workflowEnvelopeContentSha256(current);
-	return actual === expected ? undefined : { path: filePath, expected, actual };
+	return { expected, actual: workflowEnvelopeContentSha256(value) };
+}
+
+export async function detectWorkflowEnvelopeIntegrityMismatch(
+	filePath: string,
+): Promise<WorkflowEnvelopeIntegrityMismatch | undefined> {
+	const current = await readJsonIfPresent(filePath);
+	const checksum = workflowEnvelopeChecksumPair(current);
+	if (!checksum || checksum.actual === checksum.expected) return undefined;
+	return { path: filePath, expected: checksum.expected, actual: checksum.actual };
 }
 
 function safeString(value: unknown): string {

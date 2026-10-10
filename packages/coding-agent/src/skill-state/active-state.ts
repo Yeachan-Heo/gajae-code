@@ -17,6 +17,7 @@ import {
 	rebuildActiveSnapshot,
 	removeActiveEntry,
 	setActiveStateCacheInvalidator,
+	workflowEnvelopeChecksumStatus,
 	writeActiveEntry,
 } from "../gjc-runtime/state-writer";
 import { getSkillManifest } from "../gjc-runtime/workflow-manifest";
@@ -519,6 +520,18 @@ async function readModeStatePhase(
 		const phase = safeString(record.current_phase).trim();
 		if (!phase) return undefined;
 		if (record.active === false && !getSkillManifest("ralplan").canonicalOverrides.includes(phase)) return undefined;
+		const claimedSession = safeString(record.session_id).trim();
+		if (claimedSession && claimedSession !== sessionId) return undefined;
+		// A mode-state phase may replace the active entry only when the writer
+		// stamp still matches. A checksum mismatch is an out-of-band edit. An
+		// unsigned releasing phase is not a seal and must not paint "complete"
+		// onto a planning entry. Non-releasing canonical phases (final, handoff)
+		// still overlay, and a matching stamp still overlays a releasing phase.
+		const checksum = workflowEnvelopeChecksumStatus(record);
+		if (checksum === "mismatch") return undefined;
+		if (checksum === "absent" && getSkillManifest(skill).stopReleasingPhases.includes(phase.trim().toLowerCase())) {
+			return undefined;
+		}
 		return phase;
 	} catch {
 		return undefined;

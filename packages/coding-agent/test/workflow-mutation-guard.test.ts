@@ -11,6 +11,7 @@ import {
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 import {
+	assertWorkflowMutationAllowed,
 	assertWorkflowMutationRawPathsAllowed,
 	DEEP_INTERVIEW_MUTATION_BLOCK_MESSAGE,
 	getWorkflowMutationDecision,
@@ -726,6 +727,26 @@ describe("workflow mutation guard", () => {
 		expect(gjcBash.blocked).toBe(false);
 	});
 
+	it("keeps an unsigned stricter phase when the active entry has left planning", async () => {
+		const cwd = await makeTempRoot();
+		const sessionId = "session-a";
+		await writeActiveSkill(cwd, "ultragoal", "active", sessionId);
+		await fs.writeFile(
+			modeStatePath(cwd, sessionId, "ultragoal"),
+			`${JSON.stringify({ active: true, current_phase: "goal-planning", session_id: sessionId }, null, 2)}\n`,
+		);
+		const edit = {
+			cwd,
+			sessionId,
+			tool: tool("edit"),
+			args: { path: "src/product.ts", edits: [{ old_text: "a", new_text: "b" }] },
+		};
+		await expect(assertWorkflowMutationAllowed(edit)).rejects.toBeInstanceOf(ToolError);
+		const decision = await getWorkflowMutationDecision(edit);
+		expect(decision.blocked).toBe(true);
+		expect(decision.reason).toBe("phase-boundary");
+	});
+
 	it("blocks product mutation only during the ultragoal goal-planning phase", async () => {
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "ultragoal", "goal-planning");
@@ -1096,6 +1117,94 @@ describe("workflow mutation guard", () => {
 		const modeAfter = await fs.readFile(modePath);
 		expect(productAfter).toBe(productBefore);
 		expect(Buffer.compare(modeBefore, modeAfter)).toBe(0);
+	});
+
+	it("keeps the planning block when mode-state is forged out of band", async () => {
+		for (const [skill, phase] of [
+			["ralplan", "planner"],
+			["deep-interview", "interviewing"],
+		] as const) {
+			const cwd = await makeTempRoot();
+			const sessionId = "session-a";
+			const written = await runNativeStateCommand(
+				[
+					"write",
+					"--mode",
+					skill,
+					"--input",
+					JSON.stringify({ current_phase: phase }),
+					"--session-id",
+					sessionId,
+					"--json",
+				],
+				cwd,
+			);
+			expect(written.status, skill).toBe(0);
+
+			const edit = {
+				cwd,
+				sessionId,
+				tool: tool("edit"),
+				args: { path: "src/product.ts", edits: [{ old_text: "a", new_text: "b" }] },
+			};
+			await expect(assertWorkflowMutationAllowed(edit)).rejects.toBeInstanceOf(ToolError);
+
+			const statePath = modeStatePath(cwd, sessionId, skill);
+			const stamped = JSON.parse(await fs.readFile(statePath, "utf8")) as Record<string, unknown>;
+			await fs.writeFile(statePath, `${JSON.stringify({ ...stamped, current_phase: "complete" }, null, 2)}\n`);
+			await expect(assertWorkflowMutationAllowed(edit)).rejects.toBeInstanceOf(ToolError);
+			const forgedPhase = await getWorkflowMutationDecision(edit);
+			expect(forgedPhase.blocked, skill).toBe(true);
+			expect(forgedPhase.reason, skill).toBe("phase-boundary");
+
+			await fs.writeFile(
+				statePath,
+				`${JSON.stringify({ ...stamped, active: false, current_phase: "complete" }, null, 2)}\n`,
+			);
+			await expect(assertWorkflowMutationAllowed(edit)).rejects.toBeInstanceOf(ToolError);
+
+			await fs.writeFile(
+				statePath,
+				`${JSON.stringify({ active: true, current_phase: "complete", session_id: sessionId }, null, 2)}\n`,
+			);
+			await expect(assertWorkflowMutationAllowed(edit)).rejects.toBeInstanceOf(ToolError);
+
+			await fs.writeFile(
+				statePath,
+				`${JSON.stringify({ active: true, current_phase: phase, session_id: "session-b" }, null, 2)}\n`,
+			);
+			await expect(assertWorkflowMutationAllowed(edit)).rejects.toBeInstanceOf(ToolError);
+			await fs.writeFile(
+				statePath,
+				`${JSON.stringify({ active: true, current_phase: "complete", session_id: "session-b" }, null, 2)}\n`,
+			);
+			await expect(assertWorkflowMutationAllowed(edit)).rejects.toBeInstanceOf(ToolError);
+
+			const restored = await runNativeStateCommand(
+				[
+					"write",
+					"--mode",
+					skill,
+					"--input",
+					JSON.stringify({ current_phase: phase }),
+					"--session-id",
+					sessionId,
+					"--force",
+					"--json",
+				],
+				cwd,
+			);
+			expect(restored.status, skill).toBe(0);
+			await expect(assertWorkflowMutationAllowed(edit)).rejects.toBeInstanceOf(ToolError);
+
+			const cleared = await runNativeStateCommand(
+				["clear", "--mode", skill, "--session-id", sessionId, "--force", "--json"],
+				cwd,
+			);
+			expect(cleared.status, skill).toBe(0);
+			await assertWorkflowMutationAllowed(edit);
+			expect((await getWorkflowMutationDecision(edit)).blocked, skill).toBe(false);
+		}
 	});
 });
 
