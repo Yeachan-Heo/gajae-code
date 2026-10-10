@@ -1304,4 +1304,87 @@ describe("AsyncJobManager", () => {
 		expect(AsyncJobManager.instance()).toBeUndefined();
 		expect(AsyncJobManager.forEndpoint("test-session")).toBeUndefined();
 	});
+
+	test("rekeyForEndpoint migrates queued resume registrations from E1 to E2", async () => {
+		// Test that when a manager is rekeyed from E1 to E2, any queued resume
+		// entries that were registered at E1 are migrated to E2. This verifies that
+		// the E1-bound lineage/admission tuple is migrated atomically during rekey
+		// so ownership resolves at E2 and retirement of the queued entry uses the
+		// same migrated identity.
+		const endpointE1 = "endpoint-1-rekey-source";
+		const endpointE2 = "endpoint-2-rekey-target";
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		try {
+			// Register the manager at E1
+			expect(AsyncJobManager.registerForEndpoint(endpointE1, manager)).toBe(true);
+			expect(AsyncJobManager.endpointIdOf(manager)).toBe(endpointE1);
+
+			const subagentId = "test-subagent-rekey";
+			const seq = 1;
+			const queuedGeneration = `queued:${subagentId}:${seq}`;
+			const lineageIdHash = "test-lineage-hash";
+			const attemptEpoch = 42;
+
+			// Register an owned registration at E1 for the queued generation
+			registerOwnedRegistration({
+				endpointId: endpointE1,
+				lineageIdHash,
+				promptAttemptEpoch: attemptEpoch,
+				endpointGeneration: 1,
+				jobId: queuedGeneration,
+				jobGeneration: queuedGeneration,
+			});
+
+			// Verify the registration exists at E1
+			const regAtE1Before = lookupOwnedRegistration(queuedGeneration, queuedGeneration, endpointE1);
+			expect(regAtE1Before).toBeDefined();
+			expect(regAtE1Before?.endpointId).toBe(endpointE1);
+
+			// Manually create a queued resume entry in the manager with the admission endpoint set to E1
+			// This simulates the state after a resume was queued at E1
+			// We create a dummy subagent record with a queued field
+			manager.registerResumeDescriptor(
+				{ subagentId, ownerId: "test-owner", data: { sessionFile: "" } },
+				() => "dummy-job-id",
+			);
+			const subagentRecord = manager.getSubagentRecord(subagentId);
+			if (subagentRecord) {
+				// Simulate the state of a queued resume by manually setting the queued field
+				subagentRecord.status = "queued";
+				subagentRecord.queued = {
+					ownerId: "test-owner",
+					seq,
+					message: "resume message",
+					admissionEndpointId: endpointE1,
+					createdAt: Date.now(),
+				};
+			}
+
+			// Rekey the manager from E1 to E2
+			const rekeySuccess = AsyncJobManager.rekeyForEndpoint(endpointE1, endpointE2, manager);
+			expect(rekeySuccess).toBe(true);
+
+			// Verify the manager is now registered at E2, not E1
+			expect(AsyncJobManager.forEndpoint(endpointE1)).toBeUndefined();
+			expect(AsyncJobManager.forEndpoint(endpointE2)).toBe(manager);
+			expect(AsyncJobManager.endpointIdOf(manager)).toBe(endpointE2);
+
+			// Verify the queued registration was migrated from E1 to E2
+			const regAtE1After = lookupOwnedRegistration(queuedGeneration, queuedGeneration, endpointE1);
+			expect(regAtE1After).toBeUndefined(); // No longer at E1
+
+			const regAtE2After = lookupOwnedRegistration(queuedGeneration, queuedGeneration, endpointE2);
+			expect(regAtE2After).toBeDefined(); // Now at E2
+			expect(regAtE2After?.endpointId).toBe(endpointE2);
+			expect(regAtE2After?.lineageIdHash).toBe(lineageIdHash);
+			expect(regAtE2After?.promptAttemptEpoch).toBe(attemptEpoch);
+
+			// Verify the queued resume's admission endpoint was updated to E2
+			const updatedRecord = manager.getSubagentRecord(subagentId);
+			expect(updatedRecord?.queued?.admissionEndpointId).toBe(endpointE2);
+		} finally {
+			await manager.dispose({ timeoutMs: 100 });
+			AsyncJobManager.unregisterManager(manager);
+		}
+	});
 });

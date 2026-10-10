@@ -644,7 +644,7 @@ export class AsyncJobManager {
 	 *  resume can neither resolve its lineage nor register its owned tuple
 	 *  (review thread P1). Returns TRUE when the mapping was moved (or no move
 	 *  was needed); returns FALSE when the successor endpoint is owned by a
-	 *  FOREIGN live manager — the transition must then abort or roll back
+	/**
 	 *  BEFORE retiring predecessor state, because leaving this manager under
 	 *  the predecessor while tools resolve the successor to the foreign
 	 *  manager sends jobs to the wrong session and owned aborts lose their
@@ -664,6 +664,12 @@ export class AsyncJobManager {
 		}
 		AsyncJobManager.#byEndpoint.delete(predecessorEndpointId);
 		AsyncJobManager.#byEndpoint.set(successorEndpointId, manager);
+		// Migrate queued resume registrations from the predecessor endpoint to the
+		// successor endpoint: if the manager was rekeyed before queue drain, we must
+		// migrate the E1-bound lineage/admission tuple to E2 atomically so ownership
+		// resolves at E2 and retirement of the queued entry uses the same migrated
+		// identity (review thread P1).
+		manager.#migrateQueuedResumeRegistrations(predecessorEndpointId, successorEndpointId);
 		return true;
 	}
 
@@ -1966,6 +1972,72 @@ export class AsyncJobManager {
 	#retireCancelledJobOwned(jobId: string, jobGeneration: string): void {
 		const registration = lookupOwnedRegistration(jobId, jobGeneration, AsyncJobManager.endpointIdOf(this));
 		if (registration) unregisterOwnedRegistration(registration);
+	}
+
+	#migrateQueuedResumeRegistrations(predecessorEndpointId: string, successorEndpointId: string): void {
+		// Migrate queued resume entries and their owned registrations from E1 to E2.
+		// When the manager is rekeyed before queue drain or resume, we must migrate
+		// the E1-bound lineage/admission tuple to E2 atomically so ownership resolves
+		// at E2 (review thread P1).
+
+		// Iterate through both the resume queue and subagent records to migrate all
+		// entries with admissionEndpointId matching the predecessor endpoint.
+		const processedSeqs = new Set<number>();
+
+		// First pass: migrate queue entries
+		for (const queueEntry of this.#resumeQueue) {
+			if ((queueEntry.admissionEndpointId ?? predecessorEndpointId) === predecessorEndpointId) {
+				queueEntry.admissionEndpointId = successorEndpointId;
+				processedSeqs.add(queueEntry.seq);
+
+				// Migrate the owned registration from E1 to E2
+				const queuedGeneration = `queued:${queueEntry.subagentId}:${queueEntry.seq}`;
+				const oldReg = lookupOwnedRegistration(queuedGeneration, queuedGeneration, predecessorEndpointId);
+				if (oldReg) {
+					unregisterOwnedRegistration(oldReg);
+					registerOwnedRegistration({
+						endpointId: successorEndpointId,
+						lineageIdHash: oldReg.lineageIdHash,
+						promptAttemptEpoch: oldReg.promptAttemptEpoch,
+						endpointGeneration: oldReg.endpointGeneration,
+						jobId: queuedGeneration,
+						jobGeneration: queuedGeneration,
+					});
+				}
+
+				// Also update the corresponding subagent record's queued field
+				const rec = this.#subagentRecords.get(queueEntry.subagentId);
+				if (rec?.queued && rec.queued.seq === queueEntry.seq) {
+					rec.queued.admissionEndpointId = successorEndpointId;
+				}
+			}
+		}
+
+		// Second pass: check subagent records for queued entries not in the queue
+		// (e.g., entries that were queued before this rekey)
+		for (const [, rec] of this.#subagentRecords) {
+			if (rec.queued && !processedSeqs.has(rec.queued.seq)) {
+				if ((rec.queued.admissionEndpointId ?? predecessorEndpointId) === predecessorEndpointId) {
+					// Migrate the record's admission endpoint
+					rec.queued.admissionEndpointId = successorEndpointId;
+
+					// Migrate the owned registration
+					const queuedGeneration = `queued:${rec.subagentId}:${rec.queued.seq}`;
+					const oldReg = lookupOwnedRegistration(queuedGeneration, queuedGeneration, predecessorEndpointId);
+					if (oldReg) {
+						unregisterOwnedRegistration(oldReg);
+						registerOwnedRegistration({
+							endpointId: successorEndpointId,
+							lineageIdHash: oldReg.lineageIdHash,
+							promptAttemptEpoch: oldReg.promptAttemptEpoch,
+							endpointGeneration: oldReg.endpointGeneration,
+							jobId: queuedGeneration,
+							jobGeneration: queuedGeneration,
+						});
+					}
+				}
+			}
+		}
 	}
 
 	#retireQueuedOwned(rec: SubagentRecord): void {
