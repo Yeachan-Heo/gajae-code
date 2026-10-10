@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { $credentialEnv, $pickCredentialEnv, $pickflag, filterProcessEnv } from "./env";
+import { canonicalEnvKey } from "./dirs";
+import { $credentialEnv, $pickCredentialEnv, $pickflag, filterProcessEnv, startupProjectEnvSnapshot } from "./env";
 import { $which } from "./which";
 
 export interface ShellConfig {
@@ -44,9 +45,34 @@ function isExecutable(path: string): boolean {
  * `PI_BASH_NO_CI` / `CLAUDE_BASH_NO_CI` aliases) is set to a canonical truthy
  * flag value.
  */
+/**
+ * Variables that make the shell or git run code on their own: bash sources
+ * `BASH_ENV` (sh: `ENV`) before every non-interactive command, and git applies
+ * `GIT_CONFIG_*` (e.g. `core.fsmonitor`) and runs `GIT_EXTERNAL_DIFF` even for
+ * `git status`/`git diff`. A repository `.env` must not be able to set them, or
+ * every bash tool command — including the read-only allowlisted `git status`
+ * of restricted role agents — would execute repository code.
+ */
+const PROJECT_DENIED_SPAWN_ENV =
+	/^(?:BASH_ENV|ENV|GIT_EXTERNAL_DIFF|GIT_CONFIG_(?:COUNT|PARAMETERS|GLOBAL|SYSTEM|KEY_\d+|VALUE_\d+))$/;
+
+/** Drop denied variables whose value came from the project `.env` (same provenance rule as credentials). */
+function dropProjectDeclaredSpawnHooks(env: Record<string, string>): void {
+	const snapshot = startupProjectEnvSnapshot();
+	for (const name of Object.keys(env)) {
+		const key = canonicalEnvKey(name);
+		if (!PROJECT_DENIED_SPAWN_ENV.test(key)) continue;
+		const declared = snapshot.values[key];
+		if (declared === undefined) continue;
+		const value = env[name];
+		if (snapshot.dynamic.has(key) || value === declared || value.trim() === declared) delete env[name];
+	}
+}
+
 function buildSpawnEnv(shell: string): Record<string, string> {
 	const noCI = $pickflag("GJC_BASH_NO_CI", "PI_BASH_NO_CI", "CLAUDE_BASH_NO_CI");
 	const inherited = filterProcessEnv(Bun.env);
+	dropProjectDeclaredSpawnHooks(inherited);
 	delete inherited.GJC_SESSION_FILE;
 	delete inherited.GJC_MANAGED_OWNER_TRANSCRIPT_PATH;
 	return {
