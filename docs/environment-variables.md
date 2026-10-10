@@ -37,6 +37,8 @@ Step 6 does not execute those files. Each is scanned line by line for literal `e
 
 Because the scan is per line and has no notion of shell block structure, it does not reflect whether an assignment would actually run. An assignment nested in an `if` or a function body is read exactly like a top-level one, so a value you guarded behind something like `if [ -n "$CI" ]` in `~/.zshrc` still reaches `$env` unconditionally. Only assignments that do not start their own line — for example one packed after `case ... in` on the same line — are missed.
 
+`NODE_TLS_REJECT_UNAUTHORIZED` is never taken from the project `.env` (step 2): a project declaration is removed from the process environment at startup, including one Bun already loaded, so a repository cannot turn off TLS certificate verification. A value exported by the launching shell or set in a user-owned file (steps 3-6) is still honored.
+
 Keys are used exactly as written. A `PI_`-prefixed key in a `.env` file is not mirrored to its `GJC_` counterpart, or the reverse — where both spellings are accepted it is because the reading code asks for both names.
 
 ---
