@@ -1112,9 +1112,9 @@ describe("AgentSession message pipeline", () => {
 		});
 		try {
 			await sdkIntegrationStarted.promise;
+			await secondAgentEnd.promise;
 			await Bun.sleep(0);
 			expect(events.filter(event => event.type === "agent_end")).toHaveLength(2);
-			await secondAgentEnd.promise;
 		} finally {
 			unsubscribe();
 		}
