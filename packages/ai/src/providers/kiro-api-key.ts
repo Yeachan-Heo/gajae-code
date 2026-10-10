@@ -1224,7 +1224,8 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						// (refusals drop them, incomplete tools must not be emitted)
 
 						// For server-sent errors, emit the deferred text first (it was received before the error)
-						if (textContentConfirmed === false) {
+						// Only emit confirmed text (text is confirmed safe only after completion or usage event)
+						if (textContentConfirmed === false && (completionSeen || hasReceivedTerminalMetadata)) {
 							// Commit pending text to blocks
 							if (textIndex !== undefined && textIndex < blocks.length && pendingTextContent.length > 0) {
 								const block = blocks[textIndex] as TextContent;
@@ -1256,14 +1257,13 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						if (toolComplete) addToolToBlocks();
 						emitPendingToolCalls();
 
-						// Preserve any already-accumulated text in the error context
-						// Use committed blocks or pending text (if not yet committed)
+						// Preserve text in the error context only if confirmed (text is confirmed safe only after completion or usage event)
 						const accumulatedText = textContentConfirmed
 							? blocks
 									.filter((b): b is TextContent => b.type === "text")
 									.map(b => b.text)
 									.join("")
-							: pendingTextContent;
+							: ""; // Discard unconfirmed pending text before error
 						const errorMsg = sanitizeKiroError(`${event.data.error}: ${event.data.message ?? ""}`, apiKey);
 						const fullErrorMsg = accumulatedText ? `${errorMsg}\n\nPartial output: ${accumulatedText}` : errorMsg;
 						throw new Error(fullErrorMsg);

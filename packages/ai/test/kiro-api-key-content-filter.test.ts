@@ -7,7 +7,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { isProviderSafetyStopModelTrusted } from "../src/adapter-internals/provider-safety-stop";
 import { kiroApiBaseUrl, kiroApiStaticModels, streamKiroApiKey } from "../src/providers/kiro-api-key";
-import type { AssistantMessage, Context, Model } from "../src/types";
+import type { AssistantMessage, Context, Model, TextContent } from "../src/types";
 
 const originalFetch = globalThis.fetch;
 
@@ -178,31 +178,31 @@ describe("Kiro API-key content filter #6150", () => {
 		);
 	});
 
-	test.each([undefined, "Request included ksk_test-secret"])(
-		"redacts secrets in structured refusal category and explanation (%s)",
-		async explanation => {
-			let finalError: AssistantMessage | undefined;
-			globalThis.fetch = (async () =>
-				new Response(
-					JSON.stringify({
-						stopReason: "CONTENT_FILTERED",
-						stopDetails: { refusal: { category: "ksk_test-secret", explanation } },
-					}),
-					{ status: 200 },
-				)) as unknown as typeof fetch;
+	test.each([
+		undefined,
+		"Request included ksk_test-secret",
+	])("redacts secrets in structured refusal category and explanation (%s)", async explanation => {
+		let finalError: AssistantMessage | undefined;
+		globalThis.fetch = (async () =>
+			new Response(
+				JSON.stringify({
+					stopReason: "CONTENT_FILTERED",
+					stopDetails: { refusal: { category: "ksk_test-secret", explanation } },
+				}),
+				{ status: 200 },
+			)) as unknown as typeof fetch;
 
-			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
-			for await (const event of stream) {
-				if (event.type === "error") finalError = event.error;
-			}
+		const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+		for await (const event of stream) {
+			if (event.type === "error") finalError = event.error;
+		}
 
-			expect(finalError?.errorMessage).toBe(
-				explanation
-					? "Kiro refused the request ([redacted]): Request included [redacted]"
-					: "Kiro refused the request ([redacted])",
-			);
-		},
-	);
+		expect(finalError?.errorMessage).toBe(
+			explanation
+				? "Kiro refused the request ([redacted]): Request included [redacted]"
+				: "Kiro refused the request ([redacted])",
+		);
+	});
 
 	test("ksk_ transport emits text_delta incrementally before stream ends", async () => {
 		const emittedEvents: Array<{ type: string }> = [];
@@ -456,12 +456,6 @@ describe("Kiro API-key content filter #6150", () => {
 		const doneEvent = emittedEvents.find(e => e.type === "done");
 		const errorEvent = emittedEvents.find(e => e.type === "error");
 
-		// Debug: If done event is missing, check what events were emitted
-		if (!doneEvent && emittedEvents.length > 0) {
-			const eventTypes = emittedEvents.map(e => e.type).join(", ");
-			console.log(`Expected done event. Emitted events: ${eventTypes}`);
-		}
-
 		expect(textDeltaEvents.length).toBeGreaterThan(0);
 		expect(toolcallStart).toBeDefined();
 		expect(toolcallEnd).toBeDefined();
@@ -578,8 +572,8 @@ describe("Kiro API-key content filter #6150", () => {
 		}
 	});
 
-	// P2: Partial output is preserved when an ordinary error occurs
-	test("P2: ordinary (non-refusal) error preserves already-emitted text content in error message", async () => {
+	// P2: Unconfirmed text is discarded when an ordinary error occurs without COMPLETED event
+	test("P2: ordinary (non-refusal) error without COMPLETED discards unconfirmed text", async () => {
 		const emittedEvents: Array<{ type: string; text?: string; message?: { errorMessage?: string } }> = [];
 		const model = {
 			id: "test-model",
@@ -600,7 +594,7 @@ describe("Kiro API-key content filter #6150", () => {
 		};
 
 		globalThis.fetch = (async () => {
-			// Response with partial content followed by an ordinary error (not a refusal)
+			// Response with partial content followed by an ordinary error (not a refusal), no COMPLETED event
 			const responseBody =
 				JSON.stringify({ content: "Hello, this is partial" }) +
 				JSON.stringify({ error: "rate_limit_exceeded", message: "Too many requests" });
@@ -622,20 +616,20 @@ describe("Kiro API-key content filter #6150", () => {
 			// Errors may be thrown; events are captured above
 		}
 
-		// Should have emitted text_delta events before the error
+		// Should NOT have emitted text_delta events (no COMPLETED event, so text is unconfirmed)
 		const textDeltaEvents = emittedEvents.filter(e => e.type === "text_delta");
-		expect(textDeltaEvents.length).toBeGreaterThan(0);
+		expect(textDeltaEvents.length).toBe(0);
 
-		// Error event should include the partial content in the message
+		// Error event should NOT include the partial content in the message (unconfirmed text is discarded)
 		const errorEvent = emittedEvents.find(e => e.type === "error");
 		expect(errorEvent).toBeDefined();
 		expect(errorEvent?.message?.errorMessage).toContain("rate_limit_exceeded");
 		expect(errorEvent?.message?.errorMessage).toContain("Too many requests");
-		expect(errorEvent?.message?.errorMessage).toContain("Partial output");
-		expect(errorEvent?.message?.errorMessage).toContain("Hello, this is partial");
+		expect(errorEvent?.message?.errorMessage).not.toContain("Partial output");
+		expect(errorEvent?.message?.errorMessage).not.toContain("Hello, this is partial");
 	});
 
-	test("P2: tool call partial output is preserved when ordinary error occurs", async () => {
+	test("P2: tool call partial output is discarded when ordinary error occurs without COMPLETED event", async () => {
 		const emittedEvents: Array<{ type: string; message?: { errorMessage?: string } }> = [];
 		const model = {
 			id: "test-model",
@@ -656,7 +650,7 @@ describe("Kiro API-key content filter #6150", () => {
 		};
 
 		globalThis.fetch = (async () => {
-			// Response with text, tool call start, and then an ordinary error
+			// Response with text, tool call start, and then an ordinary error (no COMPLETED event)
 			const responseBody =
 				JSON.stringify({ content: "I'll read that file" }) +
 				JSON.stringify({ toolUseId: "tool-123", name: "read_file", input: "{" }) +
@@ -677,13 +671,13 @@ describe("Kiro API-key content filter #6150", () => {
 			// Errors may be thrown; events are captured above
 		}
 
-		// Error should be reported but should mention accumulated partial output (text and tool)
+		// Error should be reported but should NOT mention accumulated partial output without COMPLETED
 		const errorEvent = emittedEvents.find(e => e.type === "error");
 		expect(errorEvent).toBeDefined();
 		expect(errorEvent?.message?.errorMessage).toContain("connection_timeout");
 		expect(errorEvent?.message?.errorMessage).toContain("Connection lost");
-		// Should mention partial output was accumulated
-		expect(errorEvent?.message?.errorMessage).toContain("Partial output");
+		// Should NOT mention partial output (unconfirmed text is discarded)
+		expect(errorEvent?.message?.errorMessage).not.toContain("Partial output");
 	});
 });
 
@@ -1496,7 +1490,7 @@ describe("P1 Regression: content leaking across batches", () => {
 		// in the published partial messages, even if text_start/text_delta events are emitted.
 		// The text block must remain empty until stream confirmation (no refusal).
 		const publishedPartials: Array<{
-			content?: Array<TextContent | ThinkingContent | ToolCall>;
+			content?: unknown[];
 		}> = [];
 
 		globalThis.fetch = (async () => {
@@ -1533,7 +1527,7 @@ describe("P1 Regression: content leaking across batches", () => {
 		// Key assertion: all published partials should have empty or no text content
 		// because the text was pending and never confirmed (refusal came instead)
 		for (const partial of publishedPartials) {
-			const textBlocks = partial.content?.filter((b): b is TextContent => b.type === "text");
+			const textBlocks = partial.content?.filter((b: any): b is TextContent => b.type === "text");
 			if (textBlocks && textBlocks.length > 0) {
 				// Any text block in a published partial before confirmation is a violation
 				for (const textBlock of textBlocks) {
@@ -1560,8 +1554,9 @@ describe("P1 Regression: content leaking across batches", () => {
 		try {
 			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
 			for await (const event of stream) {
-				if (event.partial?.content) {
-					const textBlocks = (event.partial.content as Array<any>)
+				const partial = "partial" in event ? event.partial : undefined;
+				if (partial?.content) {
+					const textBlocks = (partial.content as Array<any>)
 						.filter((b: any) => b.type === "text")
 						.map((b: any) => ({ text: b.text }));
 					if (textBlocks.length > 0) {
@@ -1604,7 +1599,7 @@ describe("Completion event handling (probepark fix for #6451)", () => {
 		globalThis.fetch = originalFetch;
 	});
 
-	test.skip("completion event is emitted when stopReason is present", async () => {
+	test("completion event is emitted when stopReason is present", async () => {
 		const emittedEventTypes: string[] = [];
 
 		globalThis.fetch = (async () => {
@@ -1628,7 +1623,7 @@ describe("Completion event handling (probepark fix for #6451)", () => {
 		expect(done || error).toBe(true);
 	});
 
-	test.skip("content + COMPLETED, then stream error: text block in error terminal", async () => {
+	test("content + COMPLETED, then stream error: text block in error terminal", async () => {
 		// When stream contains content followed by COMPLETED event, then reader.read() throws,
 		// the error terminal should include the confirmed text block.
 		const emittedEvents: Array<{ type: string; partial?: { content?: unknown[] } }> = [];
@@ -1691,7 +1686,7 @@ describe("Completion event handling (probepark fix for #6451)", () => {
 		}
 	});
 
-	test.skip("content without COMPLETED, then stream error: no text block in error terminal", async () => {
+	test("content without COMPLETED, then stream error: no text block in error terminal", async () => {
 		// When stream contains content but NO COMPLETED event (stream is incomplete),
 		// then reader.read() throws, the error terminal should NOT include unconfirmed text.
 		// This preserves existing P2 behavior (commit 9b23344 semantics).
