@@ -1,5 +1,6 @@
 import * as path from "node:path";
-import { resolveLocalUrlToPath } from "../internal-urls";
+import { resolveLocalRoot, resolveLocalUrlToPath } from "../internal-urls";
+import { LocalPlanPathError, resolveContainedLocalPlanPath } from "../plan-mode/contained-local-path";
 import type { ToolSession } from ".";
 import { normalizeLocalScheme, resolveToCwd } from "./path-utils";
 import { ToolError } from "./tool-errors";
@@ -65,5 +66,26 @@ export function enforcePlanModeWrite(
 
 	if (resolvedTarget !== resolvedPlan) {
 		throw new ToolError(`Plan mode: only the plan file may be modified (${state.planFilePath}).`);
+	}
+}
+
+/**
+ * Real path of a plan-mode publication. Lexical equality with the plan file is
+ * not enough: an explicit artifacts root can contain a plan symlink whose target
+ * is outside that root.
+ */
+export async function containPlanModeWritePath(session: ToolSession, absolutePath: string): Promise<string> {
+	const state = session.getPlanModeState?.();
+	if (!state?.enabled) return absolutePath;
+	const localRoot = resolveLocalRoot({
+		getArtifactsDir: session.getArtifactsDir,
+		isManagedDestination: session.isManagedSessionDestination,
+		getSessionId: session.getSessionId,
+	});
+	try {
+		return await resolveContainedLocalPlanPath(localRoot, absolutePath);
+	} catch (error) {
+		if (error instanceof LocalPlanPathError) throw new ToolError(error.message);
+		throw error;
 	}
 }

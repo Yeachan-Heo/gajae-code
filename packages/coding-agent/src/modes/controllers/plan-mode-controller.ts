@@ -5,8 +5,13 @@ import type { CompactionOutcome } from "@gajae-code/agent-core/compaction";
 import { type Model, modelsAreEqual } from "@gajae-code/ai/core";
 import { Container, type KeyId, Markdown, Spacer, Text } from "@gajae-code/tui";
 import { isEnoent, prompt } from "@gajae-code/utils";
-import { resolveLocalUrlToPath } from "../../internal-urls";
+import { resolveLocalRoot, resolveLocalUrlToPath } from "../../internal-urls";
 import { humanizePlanTitle, type PlanApprovalDetails, resolvePlanTitle } from "../../plan-mode/approved-plan";
+import {
+	containedLocalPlanUnlinkPath,
+	LocalPlanPathError,
+	resolveContainedLocalPlanPath,
+} from "../../plan-mode/contained-local-path";
 import planModeApprovedPrompt from "../../prompts/system/plan-mode-approved.md" with { type: "text" };
 import planModeCompactInstructionsPrompt from "../../prompts/system/plan-mode-compact-instructions.md" with {
 	type: "text",
@@ -221,14 +226,27 @@ export class PlanModeController {
 		await this.ctx.session.abort({ timeoutMs: ABORT_TIMEOUT_MS });
 		const planFilePath = details.planFilePath || this.#planFilePath || "local://PLAN.md";
 		this.#planFilePath = planFilePath;
-		const review = await this.ctx.showPlanPreview(await this.#readFile(planFilePath), {
+		let previewContent: string | null;
+		try {
+			previewContent = await this.#readFile(planFilePath);
+		} catch (error) {
+			if (error instanceof LocalPlanPathError) return this.ctx.showError(error.message);
+			throw error;
+		}
+		const review = await this.ctx.showPlanPreview(previewContent, {
 			externalEditorKey: this.ctx.externalEditorKey,
 			externalEditorKeys: this.ctx.externalEditorKeys,
 			onExternalEditor: () => this.#openEditor(planFilePath),
 		});
 		if (!review.action) return;
 
-		const latestPlanContent = await this.#readFile(planFilePath);
+		let latestPlanContent: string | null;
+		try {
+			latestPlanContent = await this.#readFile(planFilePath);
+		} catch (error) {
+			if (error instanceof LocalPlanPathError) return this.ctx.showError(error.message);
+			throw error;
+		}
 		if (review.snapshotHash !== planSnapshotHash(latestPlanContent ?? "")) {
 			this.ctx.showWarning(
 				"Plan changed while reviewing; comments and notes were discarded. Confirm the decision again.",
@@ -332,33 +350,51 @@ export class PlanModeController {
 
 	async #readFile(planFilePath: string): Promise<string | null> {
 		try {
-			return await Bun.file(this.#resolvePath(planFilePath)).text();
+			return await Bun.file(await this.#resolvePath(planFilePath)).text();
 		} catch (error) {
 			if (isEnoent(error)) return null;
 			throw error;
 		}
 	}
-	#resolvePath(planFilePath: string): string {
+	#localProtocolOptions() {
+		return {
+			getArtifactsDir: () => this.ctx.sessionManager.getArtifactsDir(),
+			isManagedDestination: () => this.ctx.sessionManager.isManagedDestination(),
+			getSessionId: () => this.ctx.sessionManager.getSessionId(),
+		};
+	}
+	async #containedLocalPath(planFilePath: string): Promise<string> {
+		const options = this.#localProtocolOptions();
+		const lexical = resolveLocalUrlToPath(normalizeLocalScheme(planFilePath), options);
+		return resolveContainedLocalPlanPath(resolveLocalRoot(options), lexical);
+	}
+	async #resolvePath(planFilePath: string): Promise<string> {
 		return planFilePath.startsWith("local:")
-			? resolveLocalUrlToPath(normalizeLocalScheme(planFilePath), {
-					getArtifactsDir: () => this.ctx.sessionManager.getArtifactsDir(),
-					isManagedDestination: () => this.ctx.sessionManager.isManagedDestination(),
-					getSessionId: () => this.ctx.sessionManager.getSessionId(),
-				})
+			? this.#containedLocalPath(planFilePath)
 			: path.resolve(this.ctx.sessionManager.getCwd(), planFilePath);
 	}
 	async #finalizeApprovedPlan(planContent: string, planFilePath: string, finalPlanFilePath: string): Promise<void> {
 		if (!planFilePath.startsWith("local:") || !finalPlanFilePath.startsWith("local:"))
 			throw new Error("Approved plan source and destination paths must use the local: scheme.");
-		const sourcePath = this.#resolvePath(planFilePath);
-		const destinationPath = this.#resolvePath(finalPlanFilePath);
-		const temporaryPath = `${destinationPath}.approval-${crypto.randomUUID()}`;
+		const localRoot = resolveLocalRoot(this.#localProtocolOptions());
+		const sourceLexical = resolveLocalUrlToPath(normalizeLocalScheme(planFilePath), this.#localProtocolOptions());
+		const sourcePath = await this.#containedLocalPath(planFilePath);
+		const destinationPath = await this.#containedLocalPath(finalPlanFilePath);
+		const temporaryLexical = `${destinationPath}.approval-${crypto.randomUUID()}`;
 		try {
+			const temporaryPath = await resolveContainedLocalPlanPath(localRoot, temporaryLexical);
 			await fs.writeFile(temporaryPath, planContent, { encoding: "utf8", flag: "wx" });
-			if (sourcePath === destinationPath) await fs.rename(temporaryPath, destinationPath);
-			else {
+			if (sourcePath === destinationPath) {
+				await fs.rename(
+					await resolveContainedLocalPlanPath(localRoot, temporaryLexical),
+					await this.#containedLocalPath(finalPlanFilePath),
+				);
+			} else {
 				try {
-					await fs.link(temporaryPath, destinationPath);
+					await fs.link(
+						await resolveContainedLocalPlanPath(localRoot, temporaryLexical),
+						await this.#containedLocalPath(finalPlanFilePath),
+					);
 				} catch (error) {
 					if ((error as NodeJS.ErrnoException).code === "EEXIST")
 						throw new Error(
@@ -366,15 +402,20 @@ export class PlanModeController {
 						);
 					throw error;
 				}
-				await fs.unlink(temporaryPath);
-				await fs.unlink(sourcePath);
+				await fs.unlink(await containedLocalPlanUnlinkPath(localRoot, temporaryLexical));
+				await fs.unlink(await containedLocalPlanUnlinkPath(localRoot, sourceLexical));
 			}
-			if (planSnapshotHash(await Bun.file(destinationPath).text()) !== planSnapshotHash(planContent))
+			const verifiedPath = await this.#containedLocalPath(finalPlanFilePath);
+			if (planSnapshotHash(await Bun.file(verifiedPath).text()) !== planSnapshotHash(planContent))
 				throw new Error(
 					`Approved plan destination hash did not match the reviewed snapshot at ${finalPlanFilePath}.`,
 				);
 		} finally {
-			await fs.unlink(temporaryPath).catch(() => {});
+			try {
+				await fs.unlink(await containedLocalPlanUnlinkPath(localRoot, temporaryLexical));
+			} catch {
+				// Temp cleanup is best-effort. A realpath refusal must not unlink that path.
+			}
 		}
 	}
 	#renderPreview(content: string, append = false): void {
@@ -397,12 +438,14 @@ export class PlanModeController {
 			this.ctx.showWarning("No editor configured. Set $VISUAL or $EDITOR environment variable.");
 			return null;
 		}
-		const resolved = this.#resolvePath(planFilePath);
+		let resolved: string;
 		let text: string;
 		try {
+			resolved = await this.#resolvePath(planFilePath);
 			text = await Bun.file(resolved).text();
 		} catch (error) {
 			if (isEnoent(error)) this.ctx.showError(`Plan file not found at ${planFilePath}`);
+			else if (error instanceof LocalPlanPathError) this.ctx.showError(error.message);
 			else this.ctx.showWarning(`Failed to open external editor: ${String(error)}`);
 			return null;
 		}
@@ -420,12 +463,13 @@ export class PlanModeController {
 				trimTrailingNewline: false,
 			});
 			if (result !== null) {
-				await Bun.write(resolved, result);
+				await Bun.write(await this.#resolvePath(planFilePath), result);
 				this.ctx.showStatus("Plan updated in external editor.");
 			}
 			return result;
 		} catch (error) {
-			this.ctx.showWarning(`Failed to open external editor: ${String(error)}`);
+			if (error instanceof LocalPlanPathError) this.ctx.showError(error.message);
+			else this.ctx.showWarning(`Failed to open external editor: ${String(error)}`);
 			return null;
 		} finally {
 			await tty?.close();
@@ -454,14 +498,7 @@ export class PlanModeController {
 			if (!options.preserveContext) {
 				sessionSwitchCompleted = await this.ctx.handleClearCommand();
 				if (sessionSwitchCompleted)
-					await Bun.write(
-						resolveLocalUrlToPath(options.finalPlanFilePath, {
-							getArtifactsDir: () => this.ctx.sessionManager.getArtifactsDir(),
-							isManagedDestination: () => this.ctx.sessionManager.isManagedDestination(),
-							getSessionId: () => this.ctx.sessionManager.getSessionId(),
-						}),
-						planContent,
-					);
+					await Bun.write(await this.#containedLocalPath(options.finalPlanFilePath), planContent);
 			} else if (options.compactBeforeExecute) {
 				this.ctx.session.setPlanReferencePath(options.finalPlanFilePath);
 				this.#planApprovalDispatchPending = true;
