@@ -484,10 +484,12 @@ function collectShellPayloads(tokens: Token[]): string[] {
 					payloadCursor < tokens.length && !tokens[payloadCursor].commandStart;
 					payloadCursor++
 				) {
-					const payloadWord = tokens[payloadCursor].text;
+					const payloadToken = tokens[payloadCursor];
+					const payloadWord = payloadToken.text;
 
 					// Skip over any remaining shell options or their arguments
-					if (payloadWord.startsWith("-")) {
+					// But don't skip quoted strings, even if they start with -
+					if (payloadWord.startsWith("-") && !payloadToken.quoted) {
 						// Check if this option takes an argument
 						if (optionsWithArg.has(payloadWord)) {
 							payloadCursor++; // Skip the argument
@@ -529,14 +531,31 @@ function collectShellPayloads(tokens: Token[]): string[] {
 				break;
 			}
 
-			// Check for -S or --split-string
-			if (arg === "-S" || arg === "--split-string") {
+			// Check for -S option (standalone)
+			if (arg === "-S") {
 				// The next argument is the split-string payload
 				if (cursor + 1 < tokens.length && !tokens[cursor + 1].commandStart) {
 					const payload = tokens[cursor + 1].text;
 					// env -S splits the string into arguments, which become the executed command
 					payloads.push(payload);
 					cursor++; // Skip the payload we just processed
+				}
+			}
+			// Check for --split-string option (with or without =)
+			else if (arg.startsWith("--split-string")) {
+				if (arg.includes("=")) {
+					// Handle --split-string=value format
+					const value = arg.split("=", 2)[1];
+					if (value) {
+						payloads.push(value);
+					}
+				} else if (arg === "--split-string") {
+					// Handle --split-string value format (separate argument)
+					if (cursor + 1 < tokens.length && !tokens[cursor + 1].commandStart) {
+						const payload = tokens[cursor + 1].text;
+						payloads.push(payload);
+						cursor++; // Skip the payload we just processed
+					}
 				}
 			}
 		}
@@ -714,7 +733,11 @@ function isCommandLookup(tokens: Token[], targetIndex: number): boolean {
 		for (let i = commandIdx + 1; i < targetIndex; i++) {
 			const token = tokens[i].text;
 			// Check for -v/-V standalone or bundled in short options (e.g., -pv)
-			if (token === "-v" || token === "-V" || (token.startsWith("-") && !token.startsWith("--") && (token.includes("v") || token.includes("V")))) {
+			if (
+				token === "-v" ||
+				token === "-V" ||
+				(token.startsWith("-") && !token.startsWith("--") && (token.includes("v") || token.includes("V")))
+			) {
 				lookupFlagIdx = i;
 				break;
 			}
