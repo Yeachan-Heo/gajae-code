@@ -593,7 +593,7 @@ export class PromptDeadlineManager {
 	/** Notify about termination check results to adjust retry strategy. */
 	notifyTerminationResult(
 		correlation: InvocationCorrelation,
-		result: PromptDeadlineTerminalization,
+		_result: PromptDeadlineTerminalization,
 		reason: string,
 	): void {
 		const key = leaseKey(correlation);

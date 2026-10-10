@@ -1208,7 +1208,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					manager,
 					resumeToolCallId ?? descriptor.toolCallId,
 					resumeJobId,
-					admissionEndpointId ?? (this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? undefined),
+					admissionEndpointId ?? this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? undefined,
 				);
 				return resumeJobId;
 			};

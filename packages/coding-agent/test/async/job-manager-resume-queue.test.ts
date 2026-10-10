@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { AsyncJobManager, type SubagentRunOutcome } from "@gajae-code/coding-agent/async/job-manager";
-import { bindToolLineage, lookupOwnedRegistration, registerOwnedIfLineaged } from "@gajae-code/coding-agent/session/terminal-abort";
+import {
+	bindToolLineage,
+	lookupOwnedRegistration,
+	registerOwnedIfLineaged,
+} from "@gajae-code/coding-agent/session/terminal-abort";
 
 /** Build a manager that records every delivered completion. */
 function makeManager(opts?: { maxRunningJobs?: number; retentionMs?: number }) {
@@ -53,7 +57,7 @@ function spawnControllable(manager: AsyncJobManager, subagentId: string, ownerId
 
 /** A resume runner that re-spawns a subagent which completes immediately. */
 function installResumeRunner(manager: AsyncJobManager) {
-	manager.setResumeRunner((subagentId, message, descriptor, resumeToolCallId, admissionEndpointId) => {
+	manager.setResumeRunner((subagentId, message, _descriptor, resumeToolCallId, admissionEndpointId) => {
 		const rec = manager.getSubagentRecord(subagentId);
 		const jobId = manager.register(
 			"task",
