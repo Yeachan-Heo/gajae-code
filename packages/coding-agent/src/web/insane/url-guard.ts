@@ -74,7 +74,7 @@ function isBlockedHostname(hostname: string): boolean {
 function isPrivateIPv4(address: string): boolean {
 	const parts = address.split(".").map(part => Number.parseInt(part, 10));
 	if (parts.length !== 4 || parts.some(part => !Number.isInteger(part) || part < 0 || part > 255)) return true;
-	const [a, b] = parts;
+	const [a, b, c] = parts;
 	return (
 		a === 0 || // unspecified / "this network"
 		a === 10 || // RFC1918
@@ -83,6 +83,7 @@ function isPrivateIPv4(address: string): boolean {
 		(a === 169 && b === 254) || // link-local
 		(a === 172 && b >= 16 && b <= 31) || // RFC1918
 		(a === 192 && b === 0) || // 192.0.0/24 & 192.0.2/24 (documentation/reserved)
+		(a === 192 && b === 88 && c === 99) || // 192.88.99.0/24 deprecated 6to4 anycast; 192.88.99.2/32 is not globally reachable
 		(a === 192 && b === 168) || // RFC1918
 		(a === 198 && (b === 18 || b === 19)) || // benchmarking 198.18/15
 		(a === 198 && b === 51) || // 198.51.100/24 documentation
