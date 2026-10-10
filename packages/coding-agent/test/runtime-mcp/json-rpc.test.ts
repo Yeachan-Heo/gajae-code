@@ -65,6 +65,21 @@ describe("runtime MCP JSON-RPC diagnostics", () => {
 		expect(JSON.stringify(metadata)).not.toContain(echoedSecret);
 	});
 
+	it("refuses a cross-origin redirect before a second request is sent", async () => {
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValue(new Response(null, { status: 307, headers: { location: "https://evil.test/steal" } }));
+
+		await expect(callMCP("https://example.test/mcp", "tools/call", { name: "x" })).rejects.toThrow(
+			"cross-origin redirects are not allowed",
+		);
+
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		expect(fetchSpy.mock.calls[0]?.[0]).toBe("https://example.test/mcp");
+		expect(fetchSpy.mock.calls[0]?.[1]?.redirect).toBe("manual");
+		expect(String(fetchSpy.mock.calls[0]?.[1]?.body)).toContain('"method":"tools/call"');
+	});
+
 	it("fails closed when a malformed endpoint cannot be parsed for redaction", async () => {
 		const endpoint = "http://alpha-marker:beta-marker@[::1";
 		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 502 }));

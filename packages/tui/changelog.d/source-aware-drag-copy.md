@@ -1,0 +1,3 @@
+### Added
+- With mouse support on, dragging over Markdown copies the original Markdown instead of the painted glyphs: prose is joined across soft wraps, fully selected blocks copy their original Markdown (code with its original tabs, quotes with `>`), a selection inside a single code block drops the fences and presentation indent, and a partial table selection copies tab-separated cells without box drawing.
+- A held drag keeps extending while the wheel scrolls the transcript, and auto-scrolls while the pointer rests on the top or bottom transcript edge. A drag that leaves the window or crosses editor chrome keeps its selection instead of clearing it.

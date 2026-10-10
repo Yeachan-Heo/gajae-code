@@ -496,8 +496,10 @@ async function requestWithInputHandling<T>(
 				throw options.signal.reason instanceof Error ? options.signal.reason : new Error("Aborted");
 			}
 			if (request.method === "roots/list") {
-				// roots are answered from local state without user interaction.
-				inputResponses[key] = await defaultRequestHandler("roots/list", undefined);
+				// Use the connection's request handler. Tools-only callers reject
+				// roots/list there; the default handler answers from local state.
+				const onRequest = connection.transport.onRequest ?? defaultRequestHandler;
+				inputResponses[key] = await onRequest("roots/list", undefined);
 				continue;
 			}
 			// Everything else (elicitation, sampling, ...) needs a real interactive
