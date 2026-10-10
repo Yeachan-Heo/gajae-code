@@ -31,7 +31,7 @@ export interface SessionPythonToolInput {
 	/** Resolve the GJC session id used for the kernel owner and transcript paths. */
 	getSessionId: () => string | null;
 	/** Register cleanup with the current logical session lifecycle. */
-	registerSessionCleanup: (cleanup: () => Promise<void> | void) => (() => void) | void;
+	registerSessionCleanup: (cleanup: () => Promise<void> | void) => (() => void) | undefined;
 	/** Reject execution after the owning session has begun disposal. */
 	assertEvalExecutionAllowed?: () => void;
 	/** Track this whole invocation through its transcript append. */
