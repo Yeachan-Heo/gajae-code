@@ -1,0 +1,15 @@
+{
+    "keep": {
+        "days": false,
+        "amount": 5
+    },
+    "auditLog": "/home/probe/.hermes-wtpool/Yeachan-Heo_gajae-code/p0/.tmp-test/gjc-test-logs-f0168998-f135-4773-bca3-d35aac68d83d/.ef8b6b0a7917ec4f8700488780b807018b79952a-audit.json",
+    "files": [
+        {
+            "date": 1791644577992,
+            "name": "/home/probe/.hermes-wtpool/Yeachan-Heo_gajae-code/p0/.tmp-test/gjc-test-logs-f0168998-f135-4773-bca3-d35aac68d83d/gjc.2026-10-10.log",
+            "hash": "80664fb52e5296d3f2da3d620579a5465d6e8ab01b65e7092d164600f40fd03e"
+        }
+    ],
+    "hashType": "sha256"
+}
