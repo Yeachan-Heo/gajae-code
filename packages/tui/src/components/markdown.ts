@@ -708,14 +708,14 @@ export class Markdown implements Component {
 		// instance at the same width (e.g. resize debounce, repeated redraws).
 		const copyEnabled = copyAnnotationsEnabled();
 		if (
-		!this.#hasActiveDynamicSvgFigures &&
-		!this.#hasRetryableSvgFigureFallback &&
-		this.#cachedLines &&
-		this.#cachedText === this.#text &&
-		this.#cachedWidth === width &&
-		this.#cachedImageProtocol === TERMINAL.imageProtocol &&
-		this.#cachedCopyEnabled === copyEnabled &&
-		(!includeAnchors || this.#cachedAnchorSpans !== undefined)
+			!this.#hasActiveDynamicSvgFigures &&
+			!this.#hasRetryableSvgFigureFallback &&
+			this.#cachedLines &&
+			this.#cachedText === this.#text &&
+			this.#cachedWidth === width &&
+			this.#cachedImageProtocol === TERMINAL.imageProtocol &&
+			this.#cachedCopyEnabled === copyEnabled &&
+			(!includeAnchors || this.#cachedAnchorSpans !== undefined)
 		) {
 			return { lines: this.#cachedLines, spans: this.#cachedAnchorSpans };
 		}
@@ -724,14 +724,14 @@ export class Markdown implements Component {
 		const contentWidth = Math.max(1, width - this.#paddingX * 2);
 
 		if (
-		!this.#hasActiveDynamicSvgFigures &&
-		!this.#hasRetryableSvgFigureFallback &&
-		this.#streaming &&
-		this.#cachedLines &&
-		this.#cachedWidth === width &&
-		this.#cachedImageProtocol === TERMINAL.imageProtocol &&
-		this.#cachedCopyEnabled === copyEnabled &&
-		this.#lastFullParseAt > 0 &&
+			!this.#hasActiveDynamicSvgFigures &&
+			!this.#hasRetryableSvgFigureFallback &&
+			this.#streaming &&
+			this.#cachedLines &&
+			this.#cachedWidth === width &&
+			this.#cachedImageProtocol === TERMINAL.imageProtocol &&
+			this.#cachedCopyEnabled === copyEnabled &&
+			this.#lastFullParseAt > 0 &&
 			(!includeAnchors || this.#cachedAnchorSpans !== undefined)
 		) {
 			const elapsedMs = markdownNow() - this.#lastFullParseAt;
@@ -1209,7 +1209,11 @@ export class Markdown implements Component {
 		// Update L2 module-level LRU so future instances with the same key skip
 		// the marked.lexer + highlightCode (Rust FFI) work entirely.
 		if (!this.#streaming && !this.#mayHaveDynamicSvgFigures) {
-			renderCache.set(cacheKey, { source: renderCacheSource, lines: result, ...(anchorSpans ? { anchorSpans } : {}) });
+			renderCache.set(cacheKey, {
+				source: renderCacheSource,
+				lines: result,
+				...(anchorSpans ? { anchorSpans } : {}),
+			});
 		}
 
 		return { lines: copyBoundResult, spans: anchorSpans };
