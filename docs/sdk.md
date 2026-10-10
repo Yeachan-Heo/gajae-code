@@ -477,7 +477,7 @@ grace period, which is not configurable. A controlled terminal failure reaches A
 as JSON-RPC `-32603` with `data.code` of `prompt_failed` or
 `prompt_deadline_exceeded`.
 
-`sdk.flushWorktreeOnDeadline` (default `true`) autosaves uncommitted changes in the session's linked worktree as a WIP commit when a prompt deadline retires a prompt. For a primary checkout it requires an explicit `true` opt-in, because the checkout is a directory the session does not own; without it, the flush is skipped and the prompt still terminalizes.
+`sdk.flushWorktreeOnDeadline` (default `true`) autosaves uncommitted changes in the session's linked worktree as a WIP commit when a prompt deadline retires a prompt. For a primary checkout it requires an explicit `true` opt-in written in the user/global config or a runtime override, because the checkout is a directory the session does not own. A project `.gjc/settings.json` or `.gjc/config.yml` does not count. Without that user opt-in, the flush is skipped and the prompt still terminalizes.
 
 At expiry, the SDK fences the exact accepted prompt's run and waits for its
 dispatched tools to settle before publishing `prompt_deadline_exceeded`. A
