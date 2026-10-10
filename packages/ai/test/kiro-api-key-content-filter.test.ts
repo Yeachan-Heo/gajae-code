@@ -1452,4 +1452,58 @@ describe("P1 Regression: content leaking across batches", () => {
 			}
 		}
 	});
+
+	test("P2: text block in published partial is empty until confirmation", async () => {
+		// Regression test for P2: unconfirmed text should NOT appear in published partial messages.
+		// Even though the text block exists in partials for index consistency, it must remain empty
+		// until the stream ends without refusal (confirmation).
+		const partialSnapshots: Array<{ type: string; textBlocks: Array<{ text: string }> }> = [];
+
+		globalThis.fetch = (async () => {
+			// Content followed by successful completion
+			const responseBody =
+				JSON.stringify({ content: "Test content" }) + JSON.stringify({ stopReason: "COMPLETED" });
+			return new Response(responseBody, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				if (event.partial?.content) {
+					const textBlocks = (event.partial.content as Array<any>)
+						.filter((b: any) => b.type === "text")
+						.map((b: any) => ({ text: b.text }));
+					if (textBlocks.length > 0) {
+						partialSnapshots.push({ type: event.type, textBlocks });
+					}
+				}
+			}
+		} catch {
+			// Errors may occur
+		}
+
+		// All published text blocks should remain empty until their events are emitted
+		// The critical event sequence is:
+		// 1. start event - text block exists but MUST be empty
+		// 2. text_start event - text block still empty until text_start is actually emitted
+		// 3. text_delta event - NOW text is populated (after confirmation)
+		const startEvent = partialSnapshots.find(p => p.type === "start");
+		if (startEvent) {
+			// The start event's text blocks should be empty if they exist
+			for (const block of startEvent.textBlocks) {
+				// This is the critical check: text must not appear in start event
+				expect(block.text).toBe("");
+			}
+		}
+
+		// Any text blocks in events before text_start should be empty
+		const textStartIndex = partialSnapshots.findIndex(p => p.type === "text_start");
+		if (textStartIndex > 0) {
+			for (let i = 0; i < textStartIndex; i++) {
+				for (const block of partialSnapshots[i].textBlocks) {
+					expect(block.text).toBe("");
+				}
+			}
+		}
+	});
 });
