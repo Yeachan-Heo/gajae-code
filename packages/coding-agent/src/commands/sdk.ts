@@ -34,10 +34,12 @@ import { type EndpointFileRead, readEndpointFile } from "../sdk/broker/endpoint-
 import {
 	BROKER_DISCOVERY_BUDGET,
 	emitBrokerStartupTestSignal,
+	reapBrokerTrampolineChild,
 	reconcileBrokerGenerationForStartup,
 	SDK_BROKER_AUTOSTART_ENV,
 	withBrokerStartupLock,
 } from "../sdk/broker/ensure";
+import { waitForBrokerHandoffAcknowledgement, waitForBrokerHandoffDecision } from "../sdk/broker/hop";
 import {
 	LifecycleFailurePublicationCleanupError,
 	LifecycleReadinessCleanupError,
@@ -1722,13 +1724,16 @@ export default class Sdk extends Command {
 async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false): Promise<void> {
 	if (internal.action === "broker-trampoline-internal") {
 		if (process.platform === "win32") throw new CliParseError("Broker trampoline is unavailable on Windows.");
+		const retainChildUntilPublication = process.env.GJC_BROKER_TRAMPOLINE_RETAIN_UNTIL_PUBLICATION === "1";
 		const command = resolveSdkInternalSpawnCommand("broker-internal");
+		const brokerEnvironment = { ...command.env };
+		delete brokerEnvironment.GJC_BROKER_TRAMPOLINE_RETAIN_UNTIL_PUBLICATION;
 		let child: ChildProcess;
 		try {
 			child = spawn(command.file, [...command.args, "--agent-dir", internal.agentDir], {
 				detached: true,
 				stdio: ["ignore", "ignore", "inherit"],
-				env: command.env,
+				env: brokerEnvironment,
 				...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
 			});
 		} catch (error) {
@@ -1741,11 +1746,7 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 		if (child.pid === undefined) throw new Error("Broker trampoline could not start broker.");
 		const incarnation = processIncarnation(child.pid);
 		if (!incarnation) {
-			try {
-				child.kill("SIGKILL");
-			} catch {
-				// The child may already have exited; either way identity was not established.
-			}
+			await reapBrokerTrampolineChild(child, child.pid);
 			throw new Error("Broker trampoline could not observe broker identity.");
 		}
 		if (spawnError) throw new Error("Broker trampoline could not start broker.", { cause: spawnError });
@@ -1757,12 +1758,18 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 		try {
 			await stdoutWrite.promise;
 		} catch (error) {
-			try {
-				child.kill("SIGKILL");
-			} catch {
-				// The child may already have exited; reporting failure remains authoritative.
-			}
+			await reapBrokerTrampolineChild(child, child.pid, incarnation);
 			throw error;
+		}
+		if (retainChildUntilPublication) {
+			const decision = await waitForBrokerHandoffDecision(process.stdin);
+			if (decision === "abort") {
+				await reapBrokerTrampolineChild(child, child.pid, incarnation);
+				return;
+			}
+		} else if (!(await waitForBrokerHandoffAcknowledgement(process.stdin))) {
+			await reapBrokerTrampolineChild(child, child.pid, incarnation);
+			throw new Error("Broker trampoline handoff was not acknowledged; its direct child was reaped.");
 		}
 		child.unref();
 		return;
