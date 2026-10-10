@@ -568,12 +568,14 @@ export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[];
 
 			// Check for refusal after usage so that usage is processed first and recorded before refusal terminates
 			// This check is now order-independent: stopDetails can appear at any position in the JSON object
+			// Also handle detail-free CONTENT_FILTERED as a refusal (no stopDetails.refusal needed)
 			if (
-				typeof parsed.stopDetails === "object" &&
-				parsed.stopDetails !== null &&
-				(parsed.stopDetails as Record<string, unknown>).refusal
+				(typeof parsed.stopDetails === "object" &&
+					parsed.stopDetails !== null &&
+					(parsed.stopDetails as Record<string, unknown>).refusal) ||
+				parsed.stopReason === "CONTENT_FILTERED"
 			) {
-				// Emit refusal event if stopDetails contains actual refusal data
+				// Emit refusal event if stopDetails contains actual refusal data or stopReason is CONTENT_FILTERED
 				events.push({
 					type: "refusal",
 					data: {

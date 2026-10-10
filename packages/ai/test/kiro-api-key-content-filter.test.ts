@@ -1736,4 +1736,55 @@ describe("Completion event handling (probepark fix for #6451)", () => {
 		const textBlocks = errorContent?.filter((b: any) => b.type === "text") || [];
 		expect(textBlocks).toHaveLength(0);
 	});
+
+	test("stopReason CONTENT_FILTERED without stopDetails.refusal: treated as refusal", async () => {
+		// Finding #1: detail-free CONTENT_FILTERED should trigger refusal handling
+		const emittedEvents: Array<{ type: string; partial?: { content?: unknown[]; errorMessage?: string } }> = [];
+
+		globalThis.fetch = (async () => {
+			// Stream with content followed by CONTENT_FILTERED (no stopDetails.refusal)
+			const eventSequence = [
+				JSON.stringify({ content: "Malicious content" }),
+				JSON.stringify({ stopReason: "CONTENT_FILTERED" }),
+			];
+			let emitted = 0;
+
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					if (emitted < eventSequence.length) {
+						const chunk = new TextEncoder().encode(eventSequence[emitted]);
+						controller.enqueue(chunk);
+						emitted++;
+					} else {
+						controller.close();
+					}
+				},
+			});
+
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEvents.push({
+					type: event.type,
+					partial: "partial" in event ? event.partial : undefined,
+				});
+			}
+		} catch {
+			// Stream error handling
+		}
+
+		// Verify that CONTENT_FILTERED triggers an error (refusal), not a done
+		const errorEvent = emittedEvents.find(e => e.type === "error");
+		expect(errorEvent).toBeDefined();
+		expect(errorEvent?.partial?.errorMessage).toMatch(/refuse/i);
+
+		// Verify that malicious content is not in the error output
+		const errorContent = errorEvent?.partial?.content as Array<any> | undefined;
+		const textBlocks = errorContent?.filter((b: any) => b.type === "text") || [];
+		// Content before refusal should be suppressed
+		expect(textBlocks).toHaveLength(0);
+	});
 });
