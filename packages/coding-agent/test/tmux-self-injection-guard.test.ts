@@ -738,9 +738,9 @@ describe("tmux self-injection guard", () => {
 		it("blocks env -S with option prefix before command", async () => {
 			// Finding 1: env -S '-i tmux send-keys -t %47 x'
 			// env -S splits the string, -i is env option, tmux should be detected as injection target
-			await expect(
-				checkTmuxSelfInjection("env -S '-i tmux send-keys -t %47 x'", options),
-			).resolves.toMatchObject({ block: true });
+			await expect(checkTmuxSelfInjection("env -S '-i tmux send-keys -t %47 x'", options)).resolves.toMatchObject({
+				block: true,
+			});
 		});
 
 		it("allows xargs -I with TMUX operand (not socket override)", async () => {
