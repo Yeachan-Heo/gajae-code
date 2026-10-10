@@ -10,6 +10,7 @@ import * as path from "node:path";
 const INPUT_VERBS = new Set(["send-keys", "paste-buffer", "send-prefix"]);
 const SHELL_RUNNERS = new Set(["sh", "bash", "dash", "zsh", "ksh", "busybox"]);
 const COMMAND_WRAPPERS = new Set(["eval", "exec", "command", "builtin", "nohup", "time"]);
+const ASSIGNMENT_AWARE_WRAPPERS = new Set(["env", "sudo"]); // Only these allow VAR=value at start
 const CONTROL_WORDS = new Set(["then", "do", "else", "fi", "done", "esac"]);
 const MAX_INDIRECTION_DEPTH = 4;
 
@@ -177,10 +178,15 @@ function tokenize(command: string): Token[] {
 			} else if (positionalsPending > 0) {
 				// This is a positional argument like timeout's DURATION
 				positionalsPending--;
-			} else if (isAssignment(text) && wrapperCommand) {
-				// In a wrapper, assignments are arguments, not wrapped commands
+			} else if (isAssignment(text) && wrapperCommand && ASSIGNMENT_AWARE_WRAPPERS.has(wrapperCommand.name)) {
+				// In assignment-aware wrappers (env, sudo), assignments are arguments
 				// Keep wrapper mode active for nested wrappers like 'env sudo -E tmux ...'
 				commandStart = false;
+			} else if (isAssignment(text) && wrapperCommand && !ASSIGNMENT_AWARE_WRAPPERS.has(wrapperCommand.name)) {
+				// In non-assignment-aware wrappers, VAR=value tries to be executed as a command
+				// This means we've hit the end of the wrapper and found the wrapped command
+				wrapperCommand = undefined;
+				commandStart = true;
 			} else if (wrapperCommand && !text.startsWith("-") && !isAssignment(text)) {
 				// We're in a wrapper and this is not an option or assignment
 				// Check if this is itself a wrapper (nested wrappers like 'env sudo')
@@ -429,19 +435,24 @@ function collectShellPayloads(tokens: Token[]): string[] {
 			// Check for -c option (standalone or bundled like -ce, -ec, etc.)
 			if (word === "-c" || (word.startsWith("-") && word.includes("c"))) {
 				// Found a -c option (or an option containing c)
-				// Look for the quoted payload following -c and any bundled options
+				// The command string is either quoted or the first non-option argument
+				let foundPayload = false;
 				for (
 					let payloadCursor = cursor + 1;
 					payloadCursor < tokens.length && !tokens[payloadCursor].commandStart;
 					payloadCursor++
 				) {
 					const candidate = tokens[payloadCursor];
-					// Skip any non-quoted tokens (they might be bundled options like -e in -ce)
+					// Prefer quoted tokens as they're more likely to be command strings
 					if (candidate.quoted) {
-						// Found the quoted payload
 						payloads.push(candidate.text);
+						foundPayload = true;
 						break;
 					}
+				}
+				// If no quoted string found, the first argument (even if it looks like an option) is the command
+				if (!foundPayload && cursor + 1 < tokens.length && !tokens[cursor + 1].commandStart) {
+					payloads.push(tokens[cursor + 1].text);
 				}
 				break; // -c stops option parsing
 			}
@@ -608,11 +619,12 @@ function isCommandLookup(tokens: Token[], targetIndex: number): boolean {
 			continue;
 		}
 
-		// Found a "command" token, look for -v or -V after it
+		// Found a "command" token, look for -v or -V after it (standalone or bundled)
 		let lookupFlagIdx = -1;
 		for (let i = commandIdx + 1; i < targetIndex; i++) {
 			const token = tokens[i].text;
-			if (token === "-v" || token === "-V") {
+			// Check for -v/-V standalone or bundled in short options (e.g., -pv)
+			if (token === "-v" || token === "-V" || (token.startsWith("-") && !token.startsWith("--") && (token.includes("v") || token.includes("V")))) {
 				lookupFlagIdx = i;
 				break;
 			}
