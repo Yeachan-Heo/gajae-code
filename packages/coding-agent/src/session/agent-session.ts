@@ -30,8 +30,8 @@ import {
 	type AgentLoopConfig,
 	type AgentMessage,
 	type AgentState,
-	type AgentTerminalOwnerContext,
 	type AgentTool,
+	type AgentTerminalOwnerContext,
 	assertImagePlaceholdersHavePayload,
 	type ContextMaintenanceResult,
 	canContinuePersistedHistory,
@@ -1246,7 +1246,11 @@ type SendUserMessageDispatchOptions = SendUserMessageOptions & {
 	expectedSdkRunToken?: string;
 };
 
-type InternalPromptOptions = PromptOptions & { sdkRunToken?: string };
+type InternalPromptOptions = PromptOptions & {
+	sdkRunToken?: string;
+	sdkRunTokens?: string[];
+	sdkPredecessorScope?: AttemptScope;
+};
 interface SdkContinuationOwnership {
 	scope: AttemptScope;
 	token: string;
@@ -3483,7 +3487,6 @@ export class AgentSession {
 			this.#skipPostPromptRecoveryWaitByAttemptScope.delete(predecessorScope);
 		this.#acceptRunHandle(handle);
 		this.#settleTrackedOwnRunPromotions(handle);
-		// Logical continuation lineage is causal even without an SDK submission.
 		if (predecessorScope) {
 			this.#lifecycleScopesByAttemptScope.set(
 				handle.scope,
@@ -3493,7 +3496,11 @@ export class AgentSession {
 		if (sdkRunToken !== undefined) {
 			this.#activeSdkRunToken = sdkRunToken;
 			this.#sdkRunTokensByAttemptScope.set(handle.scope, sdkRunToken);
-			this.#sdkRunCohortsByAttemptScope.set(handle.scope, sdkRunTokens ?? [sdkRunToken]);
+			const inheritedCohort =
+				predecessorScope !== undefined && predecessorSdkRunToken === sdkRunToken
+					? this.#sdkRunCohortsByAttemptScope.get(predecessorScope)
+					: undefined;
+			this.#sdkRunCohortsByAttemptScope.set(handle.scope, sdkRunTokens ?? inheritedCohort ?? [sdkRunToken]);
 			for (const token of this.#sdkRunCohortsByAttemptScope.get(handle.scope) ?? []) {
 				if (this.#sdkTerminalPublications.has(token)) continue;
 				const publication = Promise.withResolvers<void>();
@@ -4069,6 +4076,7 @@ export class AgentSession {
 	// async event handlers settle. Subscribers treat agent_end as readiness, so
 	// publishing it earlier lets a successor corrupt the prior prompt's lifecycle.
 	#pendingAgentEndEmit: AgentSessionEvent | undefined;
+	#restoredAgentEndsPendingPublication = new Set<AgentSessionEvent>();
 	#agentEndContinuationDecisions = new WeakSet<AgentSessionEvent>();
 	#pendingSdkAgentEnds = new Set<AgentSessionEvent>();
 	// A scheduled continuation owns this terminal boundary until it either starts
@@ -4778,6 +4786,7 @@ export class AgentSession {
 		if (this.#pendingAgentEndEmit && this.#pendingAgentEndEmit !== pending) {
 			throw new Error("Cannot restore a deferred agent_end over a different pending terminal event");
 		}
+		this.#restoredAgentEndsPendingPublication.delete(pending);
 		this.#pendingAgentEndEmit = pending;
 		const scope = (pending as AgentSessionEvent & { scope?: AttemptScope }).scope;
 		if (scope && this.#sdkRunTokensByAttemptScope.has(scope)) this.#pendingSdkAgentEnds.add(pending);
@@ -4791,6 +4800,7 @@ export class AgentSession {
 		if (!hold) return undefined;
 		const pending = this.#pendingAgentEndContinuationHolds.get(hold);
 		this.#pendingAgentEndContinuationHolds.delete(hold);
+		if (pending) this.#restoredAgentEndsPendingPublication.delete(pending);
 		if (pending) this.#pendingSdkAgentEnds.delete(pending);
 		this.#deferredAgentEndWorkLeases.get(hold)?.release();
 		this.#deferredAgentEndWorkLeases.delete(hold);
@@ -4810,9 +4820,18 @@ export class AgentSession {
 
 	#restoreDeferredAgentEndAfterContinuationFailure(pending: AgentSessionEvent | undefined): void {
 		const scope = (pending as (AgentSessionEvent & { scope?: AttemptScope }) | undefined)?.scope;
-		if (pending && scope && this.#sdkRunTokensByAttemptScope.has(scope)) this.#pendingSdkAgentEnds.add(pending);
-		if (pending && !this.#pendingAgentEndEmit) {
-			this.#pendingAgentEndEmit = pending;
+		if (pending) {
+			if (scope && this.#sdkRunTokensByAttemptScope.has(scope)) this.#pendingSdkAgentEnds.add(pending);
+			const hasEarlierNonSdkTerminal =
+				this.#pendingAgentEndEmit !== undefined ||
+				this.#restoredAgentEndsPendingPublication.size > 0 ||
+				this.#agentEndPublicationInFlight > 0;
+			if (!hasEarlierNonSdkTerminal) {
+				this.#pendingAgentEndEmit = pending;
+				this.#restoredAgentEndsPendingPublication.delete(pending);
+			} else if (this.#pendingAgentEndEmit !== pending && !this.#pendingSdkAgentEnds.has(pending)) {
+				this.#restoredAgentEndsPendingPublication.add(pending);
+			}
 		}
 		this.#flushPendingAgentEnd();
 	}
@@ -4822,6 +4841,7 @@ export class AgentSession {
 		pending: AgentSessionEvent | undefined,
 	): void {
 		if (!hold || !pending) return;
+		this.#restoredAgentEndsPendingPublication.delete(pending);
 		this.#pendingAgentEndEmit = pending;
 		const scope = (pending as AgentSessionEvent & { scope?: AttemptScope }).scope;
 		if (scope && this.#sdkRunTokensByAttemptScope.has(scope)) this.#pendingSdkAgentEnds.add(pending);
@@ -4838,15 +4858,11 @@ export class AgentSession {
 	}
 
 	#releaseDeferredAgentEndContinuations(): void {
-		let pending: AgentSessionEvent | undefined;
-		for (const candidate of this.#pendingAgentEndContinuationHolds.values()) {
-			pending = candidate;
-			break;
-		}
+		const pendingAgentEnds = new Set(this.#pendingAgentEndContinuationHolds.values());
 		this.#pendingAgentEndContinuationHolds.clear();
 		for (const lease of this.#deferredAgentEndWorkLeases.values()) lease.release();
 		this.#deferredAgentEndWorkLeases.clear();
-		this.#restoreDeferredAgentEndAfterContinuationFailure(pending);
+		for (const pending of pendingAgentEnds) this.#restoreDeferredAgentEndAfterContinuationFailure(pending);
 	}
 
 	#releaseDeferredAgentEndLease(pending: AgentSessionEvent | undefined): void {
@@ -4994,6 +5010,7 @@ export class AgentSession {
 			this.#agentEventHandlersInFlight > 0 ||
 			this.#agentEndPublicationInFlight > 0 ||
 			this.#pendingAgentEndContinuationHolds.size > 0 ||
+			this.#restoredAgentEndsPendingPublication.size > 0 ||
 			this.#pendingSelectionFenceDeferredContinuations(ignoreSelectionFenceGeneration) > 0 ||
 			this.#pendingAgentEndEmit !== undefined
 		);
@@ -5028,6 +5045,7 @@ export class AgentSession {
 			this.#livePromptsInFlight() > 0 ||
 			this.#agentEventHandlersInFlight > 0 ||
 			this.#pendingAgentEndEmit !== undefined ||
+			this.#restoredAgentEndsPendingPublication.size > 0 ||
 			this.#agentEndPublicationInFlight > 0
 		);
 	}
@@ -5184,7 +5202,7 @@ export class AgentSession {
 			this.#deferredAgentEndLeases.delete(sdkPending);
 			this.#startAgentEndPublication(sdkPending, sdkLease);
 		}
-		const pending = this.#pendingAgentEndEmit;
+		let pending = this.#pendingAgentEndEmit;
 		if (pending && this.#pendingSdkAgentEnds.has(pending)) return;
 		if (
 			this.#livePromptsInFlight() > 0 ||
@@ -5192,11 +5210,16 @@ export class AgentSession {
 			this.#pendingAgentEndContinuationHolds.size > 0
 		)
 			return;
+		if (this.#restoredAgentEndsPendingPublication.size > 0 && this.#agentEndPublicationInFlight > 0) return;
 		if (!pending) {
-			this.#resolveSessionSettlement();
-			return;
+			pending = this.#restoredAgentEndsPendingPublication.values().next().value;
+			if (!pending) {
+				this.#resolveSessionSettlement();
+				return;
+			}
+			this.#restoredAgentEndsPendingPublication.delete(pending);
 		}
-		this.#pendingAgentEndEmit = undefined;
+		if (this.#pendingAgentEndEmit === pending) this.#pendingAgentEndEmit = undefined;
 		const lease = this.#deferredAgentEndLeases.get(pending);
 		if (lease) this.#deferredAgentEndLeases.delete(pending);
 		this.#startAgentEndPublication(pending, lease);
@@ -5339,6 +5362,7 @@ export class AgentSession {
 			if (extensionDelivery) void extensionDelivery.then(releaseLease, releaseLease);
 			else releaseLease();
 			this.#agentEndPublicationInFlight = Math.max(0, this.#agentEndPublicationInFlight - 1);
+			this.#flushPendingAgentEnd();
 			this.#resolveSessionSettlement();
 		}
 	}
@@ -5741,14 +5765,14 @@ export class AgentSession {
 								await this.agent.prompt(first, {
 									...this.#managedFallbackPromptOptions(),
 									onRunAccepted: (handle: AttemptRunHandle) => {
-										if (handle) this.#acceptSdkAttemptRun(handle, sdkRunToken);
+										if (handle) this.#acceptSdkAttemptRun(handle, sdkRunToken, undefined, undefined);
 									},
 								});
 							} else {
 								await this.agent.prompt(survivors, {
 									...this.#managedFallbackPromptOptions(),
 									onRunAccepted: (handle: AttemptRunHandle) => {
-										if (handle) this.#acceptSdkAttemptRun(handle, sdkRunToken);
+										if (handle) this.#acceptSdkAttemptRun(handle, sdkRunToken, undefined, undefined);
 									},
 								});
 							}
@@ -7174,7 +7198,9 @@ export class AgentSession {
 					const pendingAgentEnd =
 						event.type === "agent_end" &&
 						!maintenanceCheckpoint &&
-						(this.#pendingAgentEndEmit === event || this.#pendingSdkAgentEnds.has(event))
+						(this.#pendingAgentEndEmit === event ||
+							this.#pendingSdkAgentEnds.has(event) ||
+							this.#deferredAgentEndLeases.has(event))
 							? event
 							: undefined;
 					if (pendingAgentEnd) {
@@ -7425,17 +7451,29 @@ export class AgentSession {
 		)
 			return;
 
+		if (event.type === "agent_end" && attemptScope && this.#sdkRunTokensByAttemptScope.has(attemptScope)) {
+			this.#pendingSdkAgentEnds.add(event);
+			if (eventLease) this.#deferredAgentEndLeases.set(event, eventLease);
+			this.#restoredAgentEndsPendingPublication.delete(event);
+			this.#pendingAgentEndEmit = event;
+			return;
+		}
+
 		// Hold agent_end until the prompt's finally and all earlier async event work
 		// have unwound. Subscribers treat this event as the ready signal; flushing it
 		// from abort while either barrier is active permits a successor to race the
 		// prior prompt's cleanup.
-		if (event.type === "agent_end" && attemptScope && this.#sdkRunTokensByAttemptScope.has(attemptScope)) {
-			this.#pendingSdkAgentEnds.add(event);
-			if (eventLease) this.#deferredAgentEndLeases.set(event, eventLease);
-			this.#pendingAgentEndEmit = event;
-			return;
-		}
 		if (event.type === "agent_end" && (this.#livePromptsInFlight() > 0 || this.#agentEventHandlersInFlight > 0)) {
+			// If there's already a pending agent_end from a different scope, settle its tracked
+			// inputs before replacing it. This ensures that each run's tracked SDK submissions
+			// have their terminals settled when the run ends, even if agent_end publication is deferred.
+			if (this.#pendingAgentEndEmit && this.#pendingAgentEndEmit !== event) {
+				const pendingScope = (this.#pendingAgentEndEmit as AgentSessionEvent & { scope?: AttemptScope }).scope;
+				if (pendingScope !== attemptScope) {
+					this.#settleTrackedQueuedInputTerminal(pendingScope);
+				}
+			}
+			this.#restoredAgentEndsPendingPublication.delete(event);
 			this.#pendingAgentEndEmit = event;
 			return;
 		}
@@ -8341,7 +8379,8 @@ export class AgentSession {
 
 			// Check for retryable errors first (overloaded, rate limit, server errors)
 			// Skip retry for todo reminder continuations - they should fail silently without retrying
-			const isReminderContinuationError = this.#todoReminderContinuationGeneration === agentEndGeneration && agentEndGeneration !== undefined;
+			const isReminderContinuationError =
+				this.#todoReminderContinuationGeneration === agentEndGeneration && agentEndGeneration !== undefined;
 			if (!isReminderContinuationError && this.#isRetryableError(msg)) {
 				const transportFailure = (msg as AssistantMessage & { transportFailure?: TransportFailureFacts })
 					.transportFailure;
@@ -8391,16 +8430,18 @@ export class AgentSession {
 				if (this.#enforceRewindBeforeYield()) {
 					return;
 				}
-				if (
-					(await this.#checkActiveDeepInterviewCompletion(msg, agentEndGeneration, agentEndOwnerEpoch)) !==
-					"not_applicable"
-				) {
+				// Always check the filesystem state for active deep-interview workflows.
+				// The in-memory marker may not be assigned if observational synchronization fails,
+				// but the persisted workflow state remains authoritative on disk.
+				const deepInterviewResult =
+					await this.#checkActiveDeepInterviewCompletion(msg, agentEndGeneration, agentEndOwnerEpoch);
+				if (deepInterviewResult !== "not_applicable") {
 					return;
 				}
 				if (await this.#checkGoalCompletion(msg)) {
 					return;
 				}
-				await this.#checkTodoCompletion();
+				await this.#checkTodoCompletion(terminalSdkOwnership);
 			}
 		}
 	};
@@ -8602,13 +8643,15 @@ export class AgentSession {
 		predecessorAgentEndHold?: symbol;
 		/** Internal predecessor terminal event sequestered while waiting behind selection. */
 		deferredPredecessorAgentEnd?: AgentSessionEvent;
-		/** Internal causal SDK owner captured when this continuation was scheduled. */
+		/** Internal SDK run owner carried into this continuation. */
+		sdkRunToken?: string;
 		sdkOwnership?: SdkContinuationOwnership;
 		/** Disable managed fallback retries for this continuation (used for terminal server-initiated turns). */
 		disableManagedFallback?: boolean;
 	}): Promise<void> {
 		const continuationAdmission = this.#captureScheduledContinuationAdmission();
 		const scheduledSdkOwnership = options?.sdkOwnership;
+		const scheduledSdkRunToken = scheduledSdkOwnership?.token ?? options?.sdkRunToken;
 		const selectionFenceGeneration =
 			options?.selectionFenceGeneration ??
 			this.#selectionFenceGenerationContext.getStore() ??
@@ -8619,7 +8662,9 @@ export class AgentSession {
 			const deferredPredecessorAgentEnd =
 				options?.deferredPredecessorAgentEnd ??
 				(options?.suppressPredecessorAgentEnd
-					? this.#claimDeferredAgentEndForContinuation(this.#reserveDeferredAgentEndForContinuation())
+					? this.#claimDeferredAgentEndForContinuation(
+							this.#reserveDeferredAgentEndForContinuation(scheduledSdkOwnership?.scope),
+						)
 					: undefined);
 			const precedingSelectionFence = this.#selectionFenceTail;
 			const deferredPromptGeneration = options?.generation ?? this.#promptGeneration;
@@ -8647,7 +8692,7 @@ export class AgentSession {
 			(options?.deferredPredecessorAgentEnd
 				? this.#restoreAndReserveDeferredAgentEndForContinuation(options.deferredPredecessorAgentEnd)
 				: options?.suppressPredecessorAgentEnd
-					? this.#reserveDeferredAgentEndForContinuation()
+					? this.#reserveDeferredAgentEndForContinuation(scheduledSdkOwnership?.scope)
 					: undefined);
 		let terminalized = false;
 		const skip = (
@@ -8750,21 +8795,15 @@ export class AgentSession {
 									}
 									const predecessorAgentEnd =
 										this.#claimDeferredAgentEndForContinuation(predecessorAgentEndHold);
-									const predecessorScope = (
-										predecessorAgentEnd as (AgentSessionEvent & { scope?: AttemptScope }) | undefined
-									)?.scope;
-									const predecessorSdkOwnership = this.#captureSdkContinuationOwnership(predecessorScope);
-									let predecessorAccepted = false;
-									const releasePredecessor = () => {
-										if (predecessorAccepted) return;
-										predecessorAccepted = true;
-										if (startsQueuedSuccessor)
-											this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
-										else this.#releaseDeferredAgentEndLease(predecessorAgentEnd);
+									let predecessorSettled = false;
+									const settlePredecessor = (hasSuccessorRun: boolean) => {
+										if (predecessorSettled) return;
+										predecessorSettled = true;
+										if (hasSuccessorRun) this.#releaseDeferredAgentEndLease(predecessorAgentEnd);
+										else this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
 									};
 									const hasQueuedMessages = this.agent.hasQueuedMessages();
 									const startsQueuedSuccessor =
-										options?.maintenanceContinuation !== true &&
 										hasQueuedMessages &&
 										(options?.continueQueuedOnly === true ||
 											this.agent.state.messages.at(-1)?.role === "assistant");
@@ -8773,7 +8812,9 @@ export class AgentSession {
 										: this.agent.continue.bind(this.agent);
 									try {
 										await continueQueued({
-											...(options?.disableManagedFallback ? { fallbackManaged: false } : this.#managedFallbackPromptOptions()),
+											...(options?.disableManagedFallback
+												? { fallbackManaged: false }
+												: this.#managedFallbackPromptOptions()),
 											maintenanceContinuation: options?.maintenanceContinuation,
 											// Reset only after continue() has claimed the queued turn. Skipped or stale
 											// continuations retain predecessor accounting, and resetAttemptBudget keeps
@@ -8783,21 +8824,28 @@ export class AgentSession {
 												// agent_start (review P1); their queued messages are in-run
 												// consumptions, not own-run promotions.
 												const startsOwn = options?.maintenanceContinuation !== true;
-												const inheritedSdkOwnership =
-													options?.continueQueuedOnly || startsQueuedSuccessor
-														? undefined
-														: (scheduledSdkOwnership ?? predecessorSdkOwnership);
-												const inheritedPredecessorScope =
-													options?.continueQueuedOnly || startsQueuedSuccessor
-														? undefined
-														: (inheritedSdkOwnership?.scope ?? predecessorScope);
+												const inheritedSdkRunToken =
+													scheduledSdkOwnership?.token ?? options?.sdkRunToken ?? scheduledSdkRunToken;
 												const consumedSdkRunTokens = acceptance.consumedQueuedMessages
 													.map(message => this.#sdkRunTokensByQueuedMessage.get(message))
 													.filter((token): token is string => token !== undefined);
-												const sdkRunToken = inheritedSdkOwnership?.token ?? consumedSdkRunTokens[0];
-												const sdkRunTokens = inheritedSdkOwnership
-													? [...new Set([...inheritedSdkOwnership.cohort, ...consumedSdkRunTokens])]
-													: consumedSdkRunTokens;
+												const sdkRunToken = consumedSdkRunTokens[0] ?? inheritedSdkRunToken;
+												const predecessorScope =
+													scheduledSdkOwnership?.scope ??
+													(predecessorAgentEnd &&
+														this.#agentEventAdmission.get(predecessorAgentEnd)?.scope);
+												// The accepted successor publishes the terminal boundary for the
+												// predecessor as well as for every SDK follow-up it consumes.
+												const sdkRunTokens = Array.from(
+													new Set([
+														...(scheduledSdkOwnership?.cohort ?? []),
+														...(scheduledSdkRunToken === undefined ? [] : [scheduledSdkRunToken]),
+														...(predecessorScope === undefined
+															? []
+															: (this.#sdkRunCohortsByAttemptScope.get(predecessorScope) ?? [])),
+														...consumedSdkRunTokens,
+													]),
+												);
 												this.#fireQueuedPromotionHooks(acceptance.consumedQueuedMessages, {
 													startsOwnRun: startsOwn,
 												});
@@ -8806,7 +8854,7 @@ export class AgentSession {
 													handle,
 													sdkRunToken,
 													sdkRunTokens.length > 0 ? sdkRunTokens : undefined,
-													inheritedPredecessorScope,
+													predecessorScope,
 												);
 												options?.onRunAccepted?.(handle);
 												// Keep the queued token available through the acceptance callback;
@@ -8814,8 +8862,11 @@ export class AgentSession {
 												for (const message of acceptance.consumedQueuedMessages)
 													this.#sdkRunTokensByQueuedMessage.delete(message);
 												settleLease();
-												releasePredecessor();
-												if (startsQueuedSuccessor) {
+												settlePredecessor(
+													options?.continueQueuedOnly !== true ||
+														acceptance.consumedQueuedMessages.length > 0,
+												);
+												if (startsQueuedSuccessor && startsOwn) {
 													this.#defaultFallbackChain().resetAttemptBudget();
 													this.#escapedNonAsciiManagedRetries = 0;
 													this.#escapedNonAsciiExhaustedModelKeys.clear();
@@ -8823,12 +8874,12 @@ export class AgentSession {
 												}
 											},
 										});
-										releasePredecessor();
+										settlePredecessor(options?.continueQueuedOnly !== true);
 									} catch (error) {
 										if (
 											options?.rescheduleOnBusy &&
 											this.#isAgentBusyError(error) &&
-											!predecessorAccepted &&
+											!predecessorSettled &&
 											!terminalized &&
 											canContinue()
 										) {
@@ -8852,7 +8903,7 @@ export class AgentSession {
 												error: error.message,
 											});
 										}
-										if (!predecessorAccepted) {
+										if (!predecessorSettled) {
 											this.#settleTrackedOwnRunPromotionFailures();
 											this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
 										}
@@ -8963,7 +9014,15 @@ export class AgentSession {
 
 		const compactionSettings = this.settings.getGroup("compaction");
 		if (compactionSettings.autoContinue !== false) {
-			this.#scheduleAutoContinuePrompt(generation, false, resourceRunId, undefined, undefined, sdkOwnership);
+			this.#scheduleAutoContinuePrompt(
+				generation,
+				false,
+				resourceRunId,
+				undefined,
+				undefined,
+				undefined,
+				sdkOwnership,
+			);
 			return true;
 		}
 
@@ -8977,6 +9036,7 @@ export class AgentSession {
 		resourceRunId?: string,
 		deferredSelectionFenceGeneration?: number,
 		deferredPredecessorAgentEnd?: AgentSessionEvent,
+		sdkRunToken?: string,
 		sdkOwnership?: SdkContinuationOwnership,
 	): void {
 		if (this.#sessionTransitionKind !== undefined || this.#handoffTransitionActive) {
@@ -8987,16 +9047,17 @@ export class AgentSession {
 					resourceRunId,
 					deferredSelectionFenceGeneration,
 					deferredPredecessorAgentEnd,
+					sdkRunToken,
 					sdkOwnership,
 				);
 			return;
 		}
 		const scheduledGeneration = generation;
+		const deferredScope = (deferredPredecessorAgentEnd as (AgentSessionEvent & { scope?: AttemptScope }) | undefined)
+			?.scope;
 		const scheduledSdkOwnership =
-			sdkOwnership ??
-			this.#captureSdkContinuationOwnership(
-				(deferredPredecessorAgentEnd as (AgentSessionEvent & { scope?: AttemptScope }) | undefined)?.scope,
-			);
+			sdkOwnership ?? this.#captureSdkContinuationOwnership(deferredScope ?? this.#activeAttemptScope);
+		const scheduledSdkRunToken = scheduledSdkOwnership?.token ?? sdkRunToken;
 		const continuationAuthorized = async (
 			signal: AbortSignal,
 			hasPendingNextTurnMessages = false,
@@ -9043,7 +9104,9 @@ export class AgentSession {
 		if (this.#pendingSelectionFences > 0 && selectionFenceGeneration === this.#selectionFenceGeneration) {
 			const predecessorAgentEnd =
 				deferredPredecessorAgentEnd ??
-				this.#claimDeferredAgentEndForContinuation(this.#reserveDeferredAgentEndForContinuation());
+				this.#claimDeferredAgentEndForContinuation(
+					this.#reserveDeferredAgentEndForContinuation(scheduledSdkOwnership?.scope),
+				);
 			const precedingSelectionFence = this.#selectionFenceTail;
 			const deferredScheduling = precedingSelectionFence.then(() => {
 				try {
@@ -9053,6 +9116,7 @@ export class AgentSession {
 						resourceRunId,
 						selectionFenceGeneration,
 						predecessorAgentEnd,
+						scheduledSdkRunToken,
 						scheduledSdkOwnership,
 					);
 				} finally {
@@ -9064,7 +9128,7 @@ export class AgentSession {
 		}
 		const predecessorAgentEndHold = deferredPredecessorAgentEnd
 			? this.#restoreAndReserveDeferredAgentEndForContinuation(deferredPredecessorAgentEnd)
-			: this.#reserveDeferredAgentEndForContinuation();
+			: this.#reserveDeferredAgentEndForContinuation(scheduledSdkOwnership?.scope);
 		void this.#schedulePostPromptTask(
 			async signal => {
 				try {
@@ -9101,7 +9165,7 @@ export class AgentSession {
 								promptText,
 								{
 									skipPostPromptRecoveryWait: true,
-									sdkRunToken: scheduledSdkOwnership?.token,
+									sdkRunToken: scheduledSdkRunToken,
 									sdkRunTokens: scheduledSdkOwnership?.cohort,
 									sdkPredecessorScope: scheduledSdkOwnership?.scope,
 									skipCompactionCheck: true,
@@ -10281,9 +10345,6 @@ export class AgentSession {
 		this.#abortActiveMidRunBarriers();
 		this.#compactionQueuedDeliveryArmed = false;
 		if (this.#unsubscribeAgent) {
-			// This accepted cohort cannot observe its terminal after the bridge is
-			// removed. Reject only that captured owner; queued roots and already
-			// publishing terminals retain their independently owned publication.
 			const ownership = this.#captureSdkContinuationOwnership(this.#activeAttemptScope);
 			if (ownership) {
 				const failure = Object.assign(
@@ -10457,8 +10518,11 @@ export class AgentSession {
 			const publicationFailure = Object.assign(new Error("Session disposed before SDK terminal publication."), {
 				code: "cancelled",
 			});
-			for (const publication of this.#sdkTerminalPublications.values()) publication.reject(publicationFailure);
-			this.#sdkTerminalPublications.clear();
+			for (const [token, publication] of this.#sdkTerminalPublications) {
+				if (this.#publishingSdkTerminals.has(publication)) continue;
+				publication.reject(publicationFailure);
+				this.#sdkTerminalPublications.delete(token);
+			}
 			// Invalidate every coordinator event admitted before disposal. Handlers may
 			// still unwind, but their captured generation can no longer enqueue a write.
 			this.#coordinatorPersistGeneration += 1;
@@ -11049,11 +11113,21 @@ export class AgentSession {
 			persistGeneration: this.#coordinatorPersistGeneration,
 			persistBarrier: this.#coordinatorRescopeBarrier,
 		});
+		this.#restoredAgentEndsPendingPublication.delete(event);
 		this.#pendingAgentEndEmit = event;
 	}
 
 	flushParkedAgentEndForCoordinatorPersistForTests(): void {
 		this.#flushPendingAgentEnd();
+	}
+
+	releaseDeferredAgentEndsForTests(events: readonly Extract<AgentSessionEvent, { type: "agent_end" }>[]): void {
+		for (const event of events) {
+			const hold = Symbol("test-deferred-agent-end");
+			this.#pendingAgentEndContinuationHolds.set(hold, event);
+			this.#deferredAgentEndWorkLeases.set(hold, this.#sessionWorkLease.acquire());
+		}
+		this.#releaseDeferredAgentEndContinuations();
 	}
 
 	async drainAsyncJobDeliveriesForAcp(options?: { timeoutMs?: number }): Promise<boolean> {
@@ -12615,6 +12689,7 @@ export class AgentSession {
 		const inFlightPrompt = this.#beginInFlight();
 		let hindsightRecall: string | undefined;
 		let continuationSdkRunToken: string | undefined;
+		let continuationSdkPublication: Promise<void> | undefined;
 		try {
 			const volatileProjectContextMessage = await this.#buildVolatileProjectContextMessage();
 			if (!this.#isLatestRetainedEphemeralCopy(volatileProjectContextMessage)) {
@@ -12658,7 +12733,10 @@ export class AgentSession {
 				...this.#managedFallbackPromptOptions(),
 				onRunAccepted: (handle: AttemptRunHandle) => {
 					continuationSdkRunToken = this.#activeSdkRunToken;
-					this.#acceptSdkAttemptRun(handle, continuationSdkRunToken);
+					this.#acceptSdkAttemptRun(handle, continuationSdkRunToken, undefined, undefined);
+					if (continuationSdkRunToken !== undefined) {
+						continuationSdkPublication = this.#sdkTerminalPublications.get(continuationSdkRunToken)?.promise;
+					}
 					if (hindsightRecall) hindsightState?.markRecallSnippetInjected(hindsightRecall);
 				},
 			});
@@ -12667,6 +12745,7 @@ export class AgentSession {
 			await this.#settleEndedInFlight(
 				inFlightPrompt,
 				continuationSdkRunToken === undefined ? "full" : "publication",
+				continuationSdkPublication,
 			);
 		}
 	}
@@ -13728,9 +13807,7 @@ export class AgentSession {
 						options?.preflightSignal ||
 						internalOptions?.sdkRunToken
 						? {
-								...(options?.onPreflightAccepted
-									? { onPreflightAccepted: options.onPreflightAccepted }
-									: {}),
+								...(options?.onPreflightAccepted ? { onPreflightAccepted: options.onPreflightAccepted } : {}),
 								...(options?.onPreflightAcceptCommit
 									? { onPreflightAcceptCommit: options.onPreflightAcceptCommit }
 									: {}),
@@ -14206,7 +14283,7 @@ export class AgentSession {
 			this.#promptPreflightAbortController = new AbortController();
 		}
 		const predecessorAgentEndHold =
-			options?.predecessorAgentEndHold ?? this.#reserveDeferredAgentEndForContinuation();
+			options?.predecessorAgentEndHold ?? this.#reserveDeferredAgentEndForContinuation(options?.sdkPredecessorScope);
 		const generation = this.#promptGeneration;
 		// Mint the immutable lineage identity for this prompt turn before the
 		// model runs; beforeToolCall attaches this lineage + attempt epoch to
@@ -14529,15 +14606,6 @@ export class AgentSession {
 				...(options?.sdkRunToken ? { sdkRunToken: options.sdkRunToken } : {}),
 				onRunAccepted: (handle: AttemptRunHandle) => {
 					promptAttemptScope = handle?.scope;
-					// A synthetic recovery prompt can make Agent retire the old managed
-					// run at method entry. Suppress only that captured predecessor once
-					// the replacement accepts; pre-acceptance failures still publish it.
-					if (handle && options?.sdkPredecessorScope) {
-						const predecessor = this.#claimDeferredAgentEndForContinuation(
-							this.#reserveDeferredAgentEndForContinuation(options.sdkPredecessorScope),
-						);
-						this.#releaseDeferredAgentEndLease(predecessor);
-					}
 					if (handle)
 						this.#acceptSdkAttemptRun(
 							handle,
@@ -14576,6 +14644,7 @@ export class AgentSession {
 			await this.#promptAgentWithIdleRetry(preSubmit, agentPromptOptions, predecessorAgentEndHold, {
 				signal: preflightSignal,
 				resourceRunId: this.#runResourceLeaseContext.getStore()?.resourceRunId,
+				sdkPredecessorScope: options?.sdkPredecessorScope,
 				onPreflightAccepted: async () => {
 					this.#assertExternalSessionIngress({ allowCancelAndSubmit: true });
 					this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
@@ -18886,7 +18955,7 @@ export class AgentSession {
 				this.setConfiguredModelChain(
 					"default",
 					[formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel)],
-				origin,
+					origin,
 				);
 			}
 			await this.#syncEditToolModeAfterModelChange(previousEditMode);
@@ -21069,8 +21138,8 @@ export class AgentSession {
 						}
 					},
 					resourceRunId,
-					signal: ownershipSignal,
 					sdkOwnership,
+					signal: ownershipSignal,
 				});
 				return "continuationScheduled" in status && status.continuationScheduled === true;
 			}
@@ -21122,8 +21191,8 @@ export class AgentSession {
 			if (!promoted) {
 				await this.#runAutoCompaction("threshold", false, false, {
 					resourceRunId,
-					signal: ownershipSignal,
 					sdkOwnership,
+					signal: ownershipSignal,
 				});
 			}
 		}
@@ -21728,6 +21797,7 @@ export class AgentSession {
 			sessionId: this.sessionManager.getSessionId(),
 			sessionFile: this.sessionManager.getSessionFile(),
 		});
+
 		if (
 			agentEndGeneration === undefined ||
 			ownerEpoch === undefined ||
@@ -21793,7 +21863,7 @@ export class AgentSession {
 	/**
 	 * Check if agent stopped with incomplete todos and prompt to continue.
 	 */
-	async #checkTodoCompletion(): Promise<void> {
+	async #checkTodoCompletion(sdkOwnership?: SdkContinuationOwnership): Promise<void> {
 		// Skip todo reminders when the most recent turn was driven by an explicit user force —
 		// the user wanted exactly that tool, not a follow-up nag about incomplete todos.
 		const lastServedLabel = this.#toolChoiceQueue.consumeLastServedLabel();
@@ -21889,7 +21959,12 @@ export class AgentSession {
 		// Publishing it here would settle the caller's prompt mid-reminder.
 		// Disable managed fallback to prevent indefinite retries for this server-initiated turn.
 		this.#todoReminderContinuationGeneration = this.#promptGeneration;
-		this.#scheduleAgentContinue({ skipCompactionCheck: true, suppressPredecessorAgentEnd: true, disableManagedFallback: true });
+		this.#scheduleAgentContinue({
+			skipCompactionCheck: true,
+			suppressPredecessorAgentEnd: true,
+			sdkOwnership,
+			disableManagedFallback: true,
+		});
 	}
 
 	/**
@@ -22781,6 +22856,7 @@ export class AgentSession {
 							options?.resourceRunId,
 							undefined,
 							undefined,
+							undefined,
 							options?.sdkOwnership,
 						);
 					}
@@ -22864,6 +22940,7 @@ export class AgentSession {
 							shouldContinue: () => this.agent.hasQueuedMessages(),
 							rescheduleOnBusy: true,
 							continueQueuedOnly: true,
+							sdkOwnership: options?.sdkOwnership,
 							onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
 							onError: error => this.#logCompactionContinuationError("queued_continue", error),
 							resourceRunId: options?.resourceRunId,
@@ -22886,6 +22963,7 @@ export class AgentSession {
 						shouldContinue: () => this.agent.hasQueuedMessages(),
 						rescheduleOnBusy: true,
 						continueQueuedOnly: true,
+						sdkOwnership: options?.sdkOwnership,
 						onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
 						onError: error => this.#logCompactionContinuationError("queued_continue", error),
 						resourceRunId: options?.resourceRunId,
@@ -22895,6 +22973,7 @@ export class AgentSession {
 						generation,
 						true,
 						options?.resourceRunId,
+						undefined,
 						undefined,
 						undefined,
 						options?.sdkOwnership,
@@ -23216,6 +23295,7 @@ export class AgentSession {
 					shouldContinue: () => this.agent.hasQueuedMessages(),
 					rescheduleOnBusy: true,
 					continueQueuedOnly: true,
+					sdkOwnership: options?.sdkOwnership,
 					onSkip: reason => this.#logCompactionContinuationSkipped("queued_continue", reason),
 					onError: error => this.#logCompactionContinuationError("queued_continue", error),
 					resourceRunId: options?.resourceRunId,
@@ -23225,6 +23305,7 @@ export class AgentSession {
 					generation,
 					true,
 					options?.resourceRunId,
+					undefined,
 					undefined,
 					undefined,
 					options?.sdkOwnership,
@@ -23849,7 +23930,6 @@ export class AgentSession {
 	}
 
 	async #handleManagedAttemptOutcome(outcome: ManagedAttemptOutcome): Promise<ManagedAttemptDecision> {
-		const sdkOwnership = this.#captureSdkContinuationOwnership(outcome.scope);
 		const attemptAbortEpoch = this.#abortAdmissionEpoch;
 		const attemptCancelled = () =>
 			this.#isDisposed || this.#sessionAdmissionClosing || this.#abortAdmissionEpoch !== attemptAbortEpoch;
@@ -23899,8 +23979,7 @@ export class AgentSession {
 					return {
 						type: "retry",
 						continuation: async ownership => {
-							const continuationSdkOwnership =
-								sdkOwnership ?? this.#captureSdkContinuationOwnership(ownership.handle.scope);
+							const continuationSdkOwnership = this.#captureSdkContinuationOwnership(ownership.handle.scope);
 							const restoreOwnedTransition = async () => {
 								if (this.#fallbackTransitionGeneration !== transitionGeneration) return;
 								this.#fallbackTransitionGeneration++;
@@ -23991,7 +24070,7 @@ export class AgentSession {
 										handle,
 										continuationSdkOwnership?.token,
 										continuationSdkOwnership?.cohort,
-										continuationSdkOwnership?.scope,
+										continuationSdkOwnership?.scope ?? ownership.handle.scope,
 									);
 								},
 							});
@@ -24031,8 +24110,7 @@ export class AgentSession {
 				type: "retry",
 				continuation: async ownership => {
 					if (attemptCancelled() || !ownership.isCurrent() || ownership.lease.signal.aborted) return;
-					const continuationSdkOwnership =
-						sdkOwnership ?? this.#captureSdkContinuationOwnership(ownership.handle.scope);
+					const continuationSdkOwnership = this.#captureSdkContinuationOwnership(ownership.handle.scope);
 					await this.agent.continue({
 						...this.#managedFallbackPromptOptions(),
 						transientRecoveryMessage: this.#escapedNonAsciiRecoveryMessage(),
@@ -24041,7 +24119,7 @@ export class AgentSession {
 								handle,
 								continuationSdkOwnership?.token,
 								continuationSdkOwnership?.cohort,
-								continuationSdkOwnership?.scope,
+								continuationSdkOwnership?.scope ?? ownership.handle.scope,
 							);
 						},
 					});
@@ -24057,10 +24135,7 @@ export class AgentSession {
 				type: "maintenance",
 				continuation: async ownership => {
 					if (attemptCancelled() || !ownership.isCurrent() || ownership.lease.signal.aborted) return;
-					// A discarded in-loop attempt need not have published turn_start;
-					// the Agent-supplied handle still identifies its accepted SDK cohort.
-					const continuationSdkOwnership =
-						sdkOwnership ?? this.#captureSdkContinuationOwnership(ownership.handle.scope);
+					const continuationSdkOwnership = this.#captureSdkContinuationOwnership(ownership.handle.scope);
 					const resourceRunId = String(ownership.logicalRunId);
 					const previousLease = this.#postPromptLeases.get(resourceRunId);
 					this.#postPromptLeases.set(resourceRunId, ownership.lease);
@@ -24117,10 +24192,7 @@ export class AgentSession {
 		// this discarded attempt is clean, even after earlier committed work in
 		// the same prompt. Preserve the committed failure path when this attempt
 		// itself is not replay-safe.
-		if (
-			isStatuslessTypedOverloadFacts(outcome.failure.transportFailure) &&
-			!this.#isRetryScopeClean(outcome.scope)
-		) {
+		if (isStatuslessTypedOverloadFacts(outcome.failure.transportFailure) && !this.#isRetryScopeClean(outcome.scope)) {
 			this.#defaultFallbackChain().resetAttemptBudget();
 			return this.#managedFallbackExhaustionDecision(
 				outcome.failure.message,
@@ -24768,6 +24840,10 @@ export class AgentSession {
 		// Retry/continuation terminals must remain attributed to the prompt that
 		// admitted the provider call, even when the retry starts after agent_end.
 		const retrySdkOwnership = this.#captureSdkContinuationOwnership(scope);
+		const retrySdkRunToken =
+			retrySdkOwnership?.token ??
+			(scope ? this.#sdkRunTokensByAttemptScope.get(scope) : undefined) ??
+			this.#activeSdkRunToken;
 		const retryAbortEpoch = this.#abortAdmissionEpoch;
 		const retryCancelled = () =>
 			this.#isDisposed || this.#sessionAdmissionClosing || this.#abortAdmissionEpoch !== retryAbortEpoch;
@@ -24797,9 +24873,7 @@ export class AgentSession {
 				transportFailure.openaiErrorCode === SERVER_OVERLOADED_PROVIDER_CODE) &&
 			(managedOutcome ? !scopeWasClean : !this.#hasCleanRetryReplaySafety)
 		) {
-			return managedOutcome
-				? { type: "terminal", terminal: { stopReason: "error", messages: [message] } }
-				: false;
+			return managedOutcome ? { type: "terminal", terminal: { stopReason: "error", messages: [message] } } : false;
 		}
 		// A local machinery failure must never stay charged against the provider
 		// fallback budget, no matter which local exit follows (disabled retry,
@@ -24904,9 +24978,9 @@ export class AgentSession {
 		const fallbackTrigger = this.#fallbackTriggerFor(message, !managedFallback, transportFailure);
 		const trigger:
 			| { class: FallbackTriggerClass; retryAfterMs?: number; authDisposition?: AuthDisposition }
-			| undefined = canReplayCodexProviderOverload || canReplayBareDefaultCodexFailure
-				? { class: "server" }
-				: fallbackTrigger;
+			| undefined =
+			canReplayCodexProviderOverload || canReplayBareDefaultCodexFailure ? { class: "server" } : fallbackTrigger;
+
 		if (!trigger) {
 			return managedOutcome
 				? this.#managedFallbackExhaustionDecision(message, message.errorMessage || "Model fallback attempt failed")
@@ -25164,8 +25238,6 @@ export class AgentSession {
 						: cappedExponentialWithFullJitter(retrySettings.baseDelayMs, retrySettings.maxDelayMs, attemptsUsed);
 
 		const retry = async (ownership?: ManagedAttemptContinuationOwnership): Promise<void> => {
-			const continuationSdkOwnership =
-				retrySdkOwnership ?? this.#captureSdkContinuationOwnership(ownership?.handle.scope);
 			const activePromptHandle = this.activePromptHandle;
 			const cancellationSignal =
 				ownership?.domain.signal ??
@@ -25380,12 +25452,7 @@ export class AgentSession {
 					await this.agent.continue({
 						...this.#managedFallbackPromptOptions(),
 						onRunAccepted: (handle: AttemptRunHandle) => {
-							this.#acceptSdkAttemptRun(
-								handle,
-								continuationSdkOwnership?.token,
-								continuationSdkOwnership?.cohort,
-								continuationSdkOwnership?.scope,
-							);
+							this.#acceptSdkAttemptRun(handle, retrySdkRunToken, retrySdkOwnership?.cohort, scope);
 						},
 					});
 					return;
@@ -25413,7 +25480,8 @@ export class AgentSession {
 				allowDuringCancelAndSubmit: true,
 				suppressPredecessorAgentEnd: resourceRunId !== undefined,
 				resourceRunId,
-				sdkOwnership: continuationSdkOwnership,
+				sdkRunToken: retrySdkRunToken,
+				sdkOwnership: retrySdkOwnership,
 				onError: () => this.#failRetryRecovery("Retry continuation failed to start"),
 				onSkip: () => this.#failRetryRecovery("Retry continuation was superseded"),
 			});
@@ -25479,6 +25547,7 @@ export class AgentSession {
 		seam?: {
 			signal?: AbortSignal;
 			resourceRunId?: string;
+			sdkPredecessorScope?: AttemptScope;
 			onPreflightAccepted?: () => void | Promise<void>;
 		},
 	): Promise<void> {
@@ -25491,7 +25560,7 @@ export class AgentSession {
 		for (;;) {
 			try {
 				const predecessorAgentEnd = this.#claimDeferredAgentEndForContinuation(
-					continuationHold ?? this.#reserveDeferredAgentEndForContinuation(),
+					continuationHold ?? this.#reserveDeferredAgentEndForContinuation(seam?.sdkPredecessorScope),
 				);
 				continuationHold = undefined;
 				try {

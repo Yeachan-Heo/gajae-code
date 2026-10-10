@@ -137,6 +137,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"test-only parked terminal persistence seam, not a user-facing SDK control seam",
 	"agent_session:flushParkedAgentEndForCoordinatorPersistForTests":
 		"test-only parked terminal flush seam, not a user-facing SDK control seam",
+	"agent_session:releaseDeferredAgentEndsForTests":
+		"test-only deferred terminal restoration seam, not a user-facing SDK control seam",
 	"agent_session:setCancelAndSubmitAbortOutcomeProviderForTests":
 		"test-only cancellation seam, not a user-facing SDK control seam",
 	"agent_session:awaitDisposeCompletion": "test-only disposal completion seam, not a user-facing SDK control seam",

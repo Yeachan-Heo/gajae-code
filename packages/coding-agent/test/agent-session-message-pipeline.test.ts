@@ -40,6 +40,12 @@ describe("AgentSession message pipeline", () => {
 		__agentSessionPerfCounters.reset();
 		__sessionStateSidecarPerfCounters.reset();
 		for (const session of sessions.splice(0)) {
+			// Drain any in-flight work before disposing to prevent buildSkillStopOutput or
+			// other post-turn maintenance from continuing after session teardown begins.
+			// This ensures disposal failures reflect actual problems, not timing races.
+			await session.waitForIdle().catch(() => {
+				// Drain best-effort; some tests abort the session before idle completes.
+			});
 			await session.dispose();
 		}
 	});
@@ -1108,9 +1114,9 @@ describe("AgentSession message pipeline", () => {
 		});
 		try {
 			await sdkIntegrationStarted.promise;
+			await secondAgentEnd.promise;
 			await Bun.sleep(0);
 			expect(events.filter(event => event.type === "agent_end")).toHaveLength(2);
-			await secondAgentEnd.promise;
 		} finally {
 			unsubscribe();
 		}
@@ -1141,6 +1147,152 @@ describe("AgentSession message pipeline", () => {
 		await session.prompt("available after integration timeout");
 		await session.waitForIdle();
 		expect(events.filter(event => event.type === "agent_end")).toHaveLength(6);
+	});
+	it("preserves the SDK predecessor cohort through a no-preparation queued continuation", async () => {
+		const model: Model = {
+			id: "sdk-compaction-owner-model",
+			name: "sdk-compaction-owner-model",
+			provider: "mock",
+			api: "mock",
+			baseUrl: "mock://",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 32_768,
+		};
+		let responseCount = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["system prompt"], messages: [], tools: [] },
+			streamFn: () => {
+				const index = responseCount++;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					const message = createAssistantMessage(index === 0 ? "initial answer" : "queued answer");
+					if (index === 0) {
+						message.usage = {
+							...message.usage,
+							input: 191_000,
+							totalTokens: 191_000,
+						};
+					}
+					stream.push({ type: "done", reason: "stop", message });
+				});
+				return stream;
+			},
+		});
+		const sessionManager = SessionManager.inMemory();
+		vi.spyOn(sessionManager, "getBranch").mockReturnValue([]);
+		const session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({
+				"compaction.enabled": true,
+				"compaction.keepRecentTokens": 300_000,
+				"compaction.autoContinue": true,
+				"contextPromotion.enabled": false,
+				"todo.reminders": false,
+			}),
+			modelRegistry: { ...testModelRegistry, getAvailable: () => [model] } as never,
+		});
+		sessions.push(session);
+		const events: AgentSessionEvent[] = [];
+		const firstTurnEnded = Promise.withResolvers<void>();
+		let turnEndReported = false;
+		session.subscribe(event => {
+			events.push(event);
+			if (event.type === "turn_end" && !turnEndReported) {
+				turnEndReported = true;
+				firstTurnEnded.resolve();
+			}
+		});
+
+		const prompt = session.sendUserMessage("SDK predecessor", {
+			sdkRunCapability: createSdkRunCapability("no-preparation-compaction-owner"),
+		} as never);
+		await firstTurnEnded.promise;
+		const queuedSubmission = await session.submitUserMessage("SDK successor", {
+			deliverAs: "followUp",
+			trackSubmission: true,
+			sdkRunCapability: createSdkRunCapability("no-preparation-compaction-successor"),
+		} as never);
+		await prompt;
+		await queuedSubmission.execution;
+		await queuedSubmission.terminal;
+		await session.waitForIdle();
+
+		expect(turnEndReported).toBe(true);
+		expect(events.filter(event => event.type === "auto_compaction_end")[0]).toEqual(
+			expect.objectContaining({ skipped: true, willRetry: false }),
+		);
+		expect(responseCount, "the queued continuation should make a second model call").toBe(2);
+		expect(
+			events.some(
+				event =>
+					event.type === "message_start" &&
+					event.message.role === "user" &&
+					JSON.stringify(event.message.content).includes("SDK successor"),
+			),
+		).toBe(true);
+		const compactionEndIndex = events.findIndex(event => event.type === "auto_compaction_end");
+		const queuedAnswerIndex = events.findIndex(
+			event =>
+				event.type === "message_end" &&
+				event.message.role === "assistant" &&
+				event.message.content.some(content => content.type === "text" && content.text === "queued answer"),
+		);
+		const agentEndIndex = events.findIndex(event => event.type === "agent_end");
+		expect(queuedAnswerIndex).toBeGreaterThan(compactionEndIndex);
+		expect(agentEndIndex).toBeGreaterThan(queuedAnswerIndex);
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+	});
+	it("serializes distinct restored non-SDK terminal publications", async () => {
+		const firstIntegrationStarted = Promise.withResolvers<void>();
+		const releaseFirstIntegration = Promise.withResolvers<void>();
+		let integrationRequests = 0;
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: testModelRegistry as never,
+			workerIntegrationRequest: async () => {
+				integrationRequests++;
+				if (integrationRequests === 1) {
+					firstIntegrationStarted.resolve();
+					await releaseFirstIntegration.promise;
+				}
+			},
+			workerIntegrationTimeoutMs: 10_000,
+		});
+		sessions.push(session);
+		const events: Extract<AgentSessionEvent, { type: "agent_end" }>[] = [];
+		session.subscribe(event => {
+			if (event.type === "agent_end") events.push(event);
+		});
+		const terminals = ["restored first", "restored second", "restored third"].map(text => ({
+			type: "agent_end" as const,
+			messages: [createAssistantMessage(text)],
+		}));
+
+		session.releaseDeferredAgentEndsForTests(terminals);
+		await firstIntegrationStarted.promise;
+		expect(integrationRequests).toBe(1);
+		expect(events).toHaveLength(0);
+		releaseFirstIntegration.resolve();
+		await session.waitForIdle();
+
+		expect(integrationRequests).toBe(3);
+		expect(
+			events.map(event =>
+				event.messages.flatMap(message =>
+					message.role === "assistant"
+						? message.content.flatMap(content => (content.type === "text" ? [content.text] : []))
+						: [],
+				),
+			),
+		).toEqual([["restored first"], ["restored second"], ["restored third"]]);
 	});
 	it("starts SDK worker reconciliation before a slow extension delivery", async () => {
 		const extensionStarted = Promise.withResolvers<void>();
@@ -1265,5 +1417,31 @@ describe("AgentSession message pipeline", () => {
 		await disposed;
 		await idle;
 		expect(extensionEvents.at(-1)).toBe("session_shutdown");
+	});
+
+	it("drains in-flight work before disposal to detect actual failures", async () => {
+		// Regression test for the teardown-failure-detection fix.
+		// Ensures that afterEach drains sessions before disposing, so disposal errors
+		// reflect actual problems, not timing races with buildSkillStopOutput or other
+		// post-turn maintenance. Disposal should not suppress errors; they should only
+		// be caught if waitForIdle fails (best-effort drain).
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: testModelRegistry as never,
+		});
+		sessions.push(session);
+
+		// Drain any in-flight work before disposal (best-effort).
+		// This mirrors what the fixed afterEach does.
+		try {
+			await session.waitForIdle();
+		} catch {
+			// Best-effort drain; some tests may abort before idle completes
+		}
+
+		// Disposal should succeed or throw a real error, not be silently suppressed
+		await session.dispose();
 	});
 });

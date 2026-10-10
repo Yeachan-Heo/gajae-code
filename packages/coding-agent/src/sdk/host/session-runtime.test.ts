@@ -5429,6 +5429,35 @@ function typedContextOverflowStream(model: Model, onEmitted?: () => void): Assis
 	return stream;
 }
 
+function typedServerErrorStream(model: Model): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorMessage: "Provider server error",
+			errorStatus: 503,
+			transportFailure: { kind: "transport", status: 503 },
+			timestamp: Date.now(),
+		};
+		stream.push({ type: "start", partial: message });
+		stream.push({ type: "error", reason: "error", error: message });
+	});
+	return stream;
+}
+
 function selector(model: Model): string {
 	return `${model.provider}/${model.id}`;
 }
@@ -6015,6 +6044,82 @@ describe("post-acceptance invocation terminalization", () => {
 			});
 			expect(providerCalls).toBe(2);
 		} finally {
+			await session?.dispose();
+			authStorage?.close();
+			await harness?.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("keeps an SDK prompt in flight until its retry publishes the final terminal", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-retry-final-terminal-"));
+		let harness: InvocationHarness | undefined;
+		let session: AgentSession | undefined;
+		let authStorage: AuthStorage | undefined;
+		let providerCalls = 0;
+		const retryEntered = Promise.withResolvers<void>();
+		const releaseRetry = Promise.withResolvers<void>();
+		const recoveredAttempt = createMockModel({ responses: [{ content: ["recovered"] }] });
+		try {
+			const real = await createTerminalizationSession(
+				cwd,
+				async (model, context, options) => {
+					providerCalls++;
+					if (providerCalls === 1) return typedServerErrorStream(model);
+					retryEntered.resolve();
+					await releaseRetry.promise;
+					return recoveredAttempt.stream(model, context, options);
+				},
+				{ "retry.enabled": true, "retry.maxRetries": 1, "retry.baseDelayMs": 1 },
+			);
+			session = real.session;
+			authStorage = real.authStorage;
+			session.setConfiguredModelChain("default", [selector(real.model)], "test");
+			harness = await invocationHarness("sdk-retry-final-terminal", cwd, {
+				isIdle: () => !session?.isStreaming,
+				sendUserMessage: deferredRealSendUserMessage(session),
+			});
+			session.subscribe(async event => {
+				await harness?.emit(event.type, event);
+			});
+			const accepted = await harness.control("turn.prompt", { text: "recover after a provider overload" });
+			expect(accepted.ok).toBe(true);
+			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+
+			let duringRetry = await harness.query("turn.prompt_status", correlation);
+			const retryDeadline = Date.now() + 10_000;
+			while (
+				providerCalls < 2 &&
+				duringRetry.result?.status !== "failed" &&
+				duringRetry.result?.status !== "terminal_ok" &&
+				Date.now() < retryDeadline
+			) {
+				await Bun.sleep(10);
+				duringRetry = await harness.query("turn.prompt_status", correlation);
+			}
+			expect(providerCalls).toBeGreaterThanOrEqual(2);
+			await retryEntered.promise;
+			expect(duringRetry.result?.status).not.toBe("failed");
+			expect(duringRetry.result?.status).not.toBe("terminal_ok");
+			const correlatedEnds = () =>
+				harness?.broadcasts.filter(
+					frame =>
+						frame.kind === "agent_end" &&
+						(frame.payload as { commandId?: string } | undefined)?.commandId === correlation.commandId,
+				) ?? [];
+			expect(correlatedEnds()).toHaveLength(0);
+
+			releaseRetry.resolve();
+			const terminal = await settledStatus(harness, "turn.result", { kind: "prompt", ...correlation });
+			expect(terminal).toMatchObject({
+				status: "terminal_ok",
+				commandId: correlation.commandId,
+				turnId: correlation.turnId,
+			});
+			expect(correlatedEnds()).toHaveLength(1);
+			expect(providerCalls).toBeGreaterThanOrEqual(2);
+		} finally {
+			releaseRetry.resolve();
 			await session?.dispose();
 			authStorage?.close();
 			await harness?.stop();
@@ -8224,6 +8329,75 @@ describe("post-acceptance invocation terminalization", () => {
 			await harness.stop();
 		} finally {
 			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("a fresh root does not inherit predecessor lifecycle scope when accepted before terminal extension completes", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-fresh-root-predecessor-scope-"));
+		const releaseTerminal = Promise.withResolvers<void>();
+		let harness: InvocationHarness | undefined;
+		try {
+			const scopes = createAttemptMinter();
+			const predecessorScope = scopes.mint("main");
+			const freshScope = scopes.mint("side:fresh-root");
+
+			harness = await invocationHarness("fresh-root-scope-isolation", cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					// Hold the terminal extension in flight
+					await releaseTerminal.promise;
+					return "completed";
+				},
+			});
+
+			// First prompt with explicit predecessor scope
+			const first = await harness.control("turn.prompt", { text: "first prompt" });
+			expect(first.ok).toBe(true);
+			const firstIds = { commandId: first.result?.commandId, turnId: first.result?.turnId };
+
+			// Start the first attempt with the predecessor scope
+			await harness.emit("agent_start", { lifecycleScope: predecessorScope });
+
+			// End the first attempt but hold terminal extension
+			const firstEnd = harness.emit("agent_end", {
+				messages: [{ role: "assistant", stopReason: "stop", content: "first response" }],
+			});
+
+			// Accept a fresh root before terminal extension completes
+			// This fresh root should NOT inherit the predecessor's lifecycle scope
+			const second = await harness.control("turn.prompt", { text: "fresh root" });
+			expect(second.ok).toBe(true);
+			const secondIds = { commandId: second.result?.commandId, turnId: second.result?.turnId };
+
+			// Start the second attempt with a distinct lifecycle scope
+			await harness.emit("agent_start", { lifecycleScope: freshScope });
+
+			// Complete the second attempt
+			const secondEnd = harness.emit("agent_end", {
+				messages: [{ role: "assistant", stopReason: "stop", content: "fresh response" }],
+			});
+
+			// Now release the first terminal
+			releaseTerminal.resolve();
+
+			// Wait for both to complete
+			await Promise.all([firstEnd, secondEnd]);
+
+			// Both should be terminal with their own distinct lifecycle scopes
+			const firstStatus = await settledStatus(harness, "turn.prompt_status", firstIds);
+			expect(firstStatus).toMatchObject({ status: "terminal_ok" });
+
+			const secondStatus = await settledStatus(harness, "turn.prompt_status", secondIds);
+			expect(secondStatus).toMatchObject({ status: "terminal_ok" });
+
+			// Verify we got two distinct lifecycle boundaries
+			const agentEnds = harness.broadcasts.filter(frame => frame.kind === "agent_end");
+			expect(agentEnds.length).toBeGreaterThanOrEqual(2);
+
+			await harness.stop();
+		} finally {
+			releaseTerminal.resolve();
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
