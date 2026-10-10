@@ -74,7 +74,7 @@ function makeToolSession(options: {
 	getSessionFile?: () => string | null;
 	getSessionId?: () => string | null;
 	settings?: Settings;
-	registerSessionCleanup?: (cleanup: () => Promise<void> | void) => (() => void) | void;
+	registerSessionCleanup?: (cleanup: () => Promise<void> | void) => () => void;
 	assertEvalExecutionAllowed?: () => void;
 	trackEvalExecution?: ToolSession["trackEvalExecution"];
 }): ToolSession {
@@ -107,7 +107,7 @@ async function loadPythonTool(options: {
 	getSessionFile?: () => string | null;
 	getSessionId?: () => string | null;
 	settings?: Settings;
-	registerSessionCleanup?: (cleanup: () => Promise<void> | void) => (() => void) | void;
+	registerSessionCleanup?: (cleanup: () => Promise<void> | void) => () => void;
 	assertEvalExecutionAllowed?: () => void;
 	trackEvalExecution?: ToolSession["trackEvalExecution"];
 }): Promise<AgentTool> {
@@ -472,6 +472,7 @@ describe("builtin session Python tool", () => {
 			cwd,
 			registerSessionCleanup: cleanup => {
 				registeredCleanup = cleanup;
+				return () => {};
 			},
 			trackEvalExecution: () => {
 				if (!registeredCleanup) throw new Error("Expected the Python generation cleanup to be registered");
@@ -920,7 +921,7 @@ describe("builtin session Python tool", () => {
 		const tool = await loadPythonTool({
 			cwd,
 			getSessionId: () => sessionManager?.getSessionId() ?? null,
-			registerSessionCleanup: cleanup => liveSession?.registerToolSessionTransitionCleanup(cleanup),
+			registerSessionCleanup: cleanup => liveSession?.registerToolSessionTransitionCleanup(cleanup) ?? (() => {}),
 		});
 		const fixture = await createAgentSessionFixture({ cwd, toolRegistry: new Map([[PYTHON_TOOL_NAME, tool]]) });
 		liveSession = fixture.session;

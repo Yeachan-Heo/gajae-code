@@ -30,7 +30,7 @@ function createTool(cwd: string, sessionId: string): AgentTool {
 		cwd,
 		settings: Settings.isolated(),
 		getSessionId: () => sessionId,
-		registerSessionCleanup: () => {},
+		registerSessionCleanup: () => () => {},
 	});
 }
 
