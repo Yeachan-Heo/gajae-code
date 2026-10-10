@@ -732,4 +732,40 @@ describe("tmux self-injection guard", () => {
 			).resolves.toMatchObject({ block: true });
 		});
 	});
+
+	// Regression tests for the three blocking findings from probepark review (head dcf0c87)
+	describe("regression: blocking findings from probepark review (head dcf0c87)", () => {
+		it("blocks env -S with option prefix before command", async () => {
+			// Finding 1: env -S '-i tmux send-keys -t %47 x'
+			// env -S splits the string, -i is env option, tmux should be detected as injection target
+			await expect(
+				checkTmuxSelfInjection("env -S '-i tmux send-keys -t %47 x'", options),
+			).resolves.toMatchObject({ block: true });
+		});
+
+		it("allows xargs -I with TMUX operand (not socket override)", async () => {
+			// Finding 2: printf x | xargs -I TMUX=/tmp/other tmux send-keys -t %47 x
+			// TMUX=/tmp/other is the -I replacement operand, not an env assignment
+			// Socket should not be overridden, tmux targets current pane and should be blocked
+			await expect(
+				checkTmuxSelfInjection("printf x | xargs -I TMUX=/tmp/other tmux send-keys -t %47 x", options),
+			).resolves.toMatchObject({ block: true });
+		});
+
+		it("blocks env --chdir with tmux after directory argument", async () => {
+			// Finding 3: env --chdir /tmp tmux send-keys -t %47 x
+			// --chdir takes an argument (/tmp), tmux is the actual command
+			await expect(
+				checkTmuxSelfInjection("env --chdir /tmp tmux send-keys -t %47 x", options),
+			).resolves.toMatchObject({ block: true });
+		});
+
+		it("blocks xargs --max-lines with count argument", async () => {
+			// Finding 3: xargs --max-lines 1 tmux send-keys -t %47 x
+			// --max-lines takes a numeric argument (1), tmux is the command
+			await expect(
+				checkTmuxSelfInjection("printf x | xargs --max-lines 1 tmux send-keys -t %47 x", options),
+			).resolves.toMatchObject({ block: true });
+		});
+	});
 });

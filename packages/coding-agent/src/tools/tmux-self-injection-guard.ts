@@ -41,6 +41,7 @@ const LONG_OPTIONS_WITH_ARG = new Set([
 const WRAPPER_LONG_OPTIONS: Record<string, Record<string, boolean>> = {
 	env: {
 		"--unset": true, // env --unset=VAR or --unset VAR
+		"--chdir": true, // env --chdir=DIR (takes directory)
 		"--split-string": false, // env -S/--split-string (flag-only)
 	},
 	timeout: {
@@ -60,11 +61,14 @@ const WRAPPER_LONG_OPTIONS: Record<string, Record<string, boolean>> = {
 	xargs: {
 		"--null": false, // xargs --null (flag-only)
 		"--max-args": true, // xargs --max-args N
+		"--max-lines": true, // xargs --max-lines MAX-LINES
 		"--arg-file": true, // xargs --arg-file FILE
 		"--delimiter": true, // xargs --delimiter DELIM
 		"--eof": true, // xargs --eof STRING
 		"--max-procs": true, // xargs --max-procs N
+		"--max-chars": true, // xargs --max-chars SIZE (previously --size)
 		"--size": true, // xargs --size BYTES
+		"--process-slot-var": true, // xargs --process-slot-var VAR
 		"--replace": false, // xargs --replace (flag-only, same as -I)
 		"--verbose": false, // xargs --verbose (flag-only)
 		"--no-run-if-empty": false, // xargs --no-run-if-empty (flag-only)
@@ -331,7 +335,7 @@ function tokenize(command: string): Token[] {
 					// Process each character in the bundle
 					for (let i = 1; i < text.length; i++) {
 						const opt = text[i];
-						const shortOpt = "-" + opt;
+						const shortOpt = `-${opt}`;
 
 						// Check if this short option takes an argument
 						const isFlagOnly = wrapperCommand.spec.flagOnlyOptions?.has(shortOpt) ?? false;
@@ -406,6 +410,97 @@ function targetFromArgs(args: string[]): string | undefined {
 		if (args[index].startsWith("-t") && args[index].length > 2) return args[index].slice(2);
 	}
 	return undefined;
+}
+
+/**
+ * Reconstruct the full command line from an env -S split string.
+ * env -S will split the string and process the resulting tokens as env's own arguments,
+ * consuming env's options and variable assignments before finding the actual command to execute.
+ * This returns the full command line that env will actually execute.
+ */
+function reconstructCommandFromEnvSplit(splitString: string): string | undefined {
+	// Split the string into tokens (respecting simple shell quoting)
+	const parts: string[] = [];
+	let current = "";
+	let quoted = false;
+	let quoteChar: "'" | '"' = "'";
+
+	for (let i = 0; i < splitString.length; i++) {
+		const ch = splitString[i];
+		if (!quoted && (ch === "'" || ch === '"')) {
+			quoted = true;
+			quoteChar = ch;
+		} else if (quoted && ch === quoteChar) {
+			quoted = false;
+		} else if (!quoted && /\s/.test(ch)) {
+			if (current) parts.push(current);
+			current = "";
+		} else {
+			current += ch;
+		}
+	}
+	if (current) parts.push(current);
+
+	// Process parts through env's option parsing
+	const envShortOptionsWithArg = new Set(["-u", "-C"]); // env -u VAR, env -C DIR
+	let skipNext = false;
+	let commandStartIdx = -1;
+
+	for (let i = 0; i < parts.length; i++) {
+		const part = parts[i];
+
+		if (skipNext) {
+			skipNext = false;
+			continue;
+		}
+
+		// Skip env's own options
+		if (part === "-i" || part === "--ignore-environment") {
+			continue; // flag-only
+		}
+		if (part === "-v" || part === "--debug") {
+			continue; // flag-only
+		}
+		if (envShortOptionsWithArg.has(part)) {
+			skipNext = true;
+			continue;
+		}
+		if (part.startsWith("-u") && part.length > 2) {
+			continue; // bundled form like -uVAR
+		}
+		if (part.startsWith("-C") && part.length > 2) {
+			continue; // bundled form like -CDIR
+		}
+		if (part.startsWith("--")) {
+			const eqIdx = part.indexOf("=");
+			const optName = eqIdx >= 0 ? part.substring(0, eqIdx) : part;
+
+			if (optName === "--unset" || optName === "--chdir") {
+				if (eqIdx < 0) skipNext = true; // separate argument form
+				continue;
+			}
+			// Other long options are either flag-only or not env options
+			if (optName === "--ignore-environment" || optName === "--debug") {
+				continue; // flag-only env options
+			}
+		}
+
+		// Check if it's a variable assignment (env allows VAR=value arguments)
+		if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(part)) {
+			continue; // Skip variable assignments
+		}
+
+		// This is the actual command - reconstruct from here to the end
+		commandStartIdx = i;
+		break;
+	}
+
+	if (commandStartIdx >= 0) {
+		// Reconstruct the command line from this point onward
+		return parts.slice(commandStartIdx).join(" ");
+	}
+
+	return undefined; // No command found
 }
 
 function collectShellPayloads(tokens: Token[]): string[] {
@@ -593,9 +688,13 @@ function collectShellPayloads(tokens: Token[]): string[] {
 			if (arg === "-S") {
 				// The next argument is the split-string payload
 				if (cursor + 1 < tokens.length && !tokens[cursor + 1].commandStart) {
-					const payload = tokens[cursor + 1].text;
-					// env -S splits the string into arguments, which become the executed command
-					payloads.push(payload);
+					const splitString = tokens[cursor + 1].text;
+					// env -S splits the string and processes it through env's own option parsing
+					// Extract and push the actual command that env will execute
+					const command = reconstructCommandFromEnvSplit(splitString);
+					if (command) {
+						payloads.push(command);
+					}
 					cursor++; // Skip the payload we just processed
 				}
 			}
@@ -607,13 +706,19 @@ function collectShellPayloads(tokens: Token[]): string[] {
 					const eqIndex = arg.indexOf("=");
 					const value = arg.substring(eqIndex + 1);
 					if (value) {
-						payloads.push(value);
+						const command = reconstructCommandFromEnvSplit(value);
+						if (command) {
+							payloads.push(command);
+						}
 					}
 				} else if (arg === "--split-string") {
 					// Handle --split-string value format (separate argument)
 					if (cursor + 1 < tokens.length && !tokens[cursor + 1].commandStart) {
-						const payload = tokens[cursor + 1].text;
-						payloads.push(payload);
+						const splitString = tokens[cursor + 1].text;
+						const command = reconstructCommandFromEnvSplit(splitString);
+						if (command) {
+							payloads.push(command);
+						}
 						cursor++; // Skip the payload we just processed
 					}
 				}
@@ -758,17 +863,67 @@ function sameSocket(left: string, right: string): boolean {
 }
 
 function assignedTmuxSocket(tokens: Token[], commandIndex: number): string | undefined {
-	// Backtrack from the command position to find any TMUX assignment
+	// Backtrack from the command position to find any TMUX assignment.
 	// TMUX assignments are valid if they appear before the command and any wrappers,
 	// within the same invocation (before a command boundary marked by non-wrapper commandStart).
+	// Important: we must not treat wrapper option operands as assignments.
+	// For example, in 'xargs -I TMUX=/tmp/other ...', the TMUX=/tmp/other is -I's operand, not an assignment.
+
 	for (let index = commandIndex - 1; index >= 0 && commandIndex - index <= 20; index++) {
 		const token = tokens[index];
 
-		// Check for TMUX assignment (before checking command boundaries)
+		// Check for TMUX assignment, but exclude tokens that are operands to wrapper options.
 		const assignment = token.text.match(/^TMUX=([^,\s]+)/);
+		let isOptionOperand = false;
+		// Note: assignments at commandStart are valid (e.g., 'TMUX=...');
+		// we only need to check for option operands when it's NOT at commandStart
+		if (assignment && !token.commandStart) {
+			// Before accepting this as a TMUX assignment, check if it's an operand to a preceding option
+			// Look back one position to see if there's an option that would consume this
+			if (index > 0) {
+				const precedingToken = tokens[index - 1];
+				if (precedingToken.text.startsWith("-") && !precedingToken.commandStart) {
+					// The preceding token is an option; check if it takes an argument
+					const optText = precedingToken.text;
+
+					// Handle wrapper options that take arguments
+					// This is a conservative check: if it's a flag starting with -, it might consume the next argument
+					let optionTakesArg = false;
+
+					// Look for wrapper commands near this position
+					for (let wrapIdx = index - 1; wrapIdx >= 0 && index - wrapIdx <= 5; wrapIdx--) {
+						if (tokens[wrapIdx].commandStart) {
+							const baseName = tokens[wrapIdx].text.includes("/")
+								? tokens[wrapIdx].text.split("/").pop() || tokens[wrapIdx].text
+								: tokens[wrapIdx].text;
+							const wrapper = COMMAND_WRAPPERS_WITH_ARGS[baseName];
+							if (wrapper) {
+								// Extract short option without dash
+								const optChar = optText.length > 1 ? optText[1] : "";
+								const shortOpt = `-${optChar}`;
+
+								// Check if this wrapper's options would consume the next argument
+								if (wrapper.optionsWithArg.has(shortOpt) && !wrapper.flagOnlyOptions?.has(shortOpt)) {
+									optionTakesArg = true;
+								}
+							}
+							break;
+						}
+					}
+
+					isOptionOperand = optionTakesArg;
+				}
+			}
+		}
+
 		if (assignment) {
-			// Found a TMUX assignment; it applies to this invocation
-			return assignment[1];
+			// Accept TMUX assignments that are:
+			// 1. At commandStart (e.g., 'TMUX=...' at the beginning of the command)
+			// 2. Not at commandStart but also not option operands (e.g., assignments between wrappers)
+			if (token.commandStart || !isOptionOperand) {
+				// Found a genuine TMUX assignment; it applies to this invocation
+				return assignment[1];
+			}
 		}
 
 		// Track command boundaries
