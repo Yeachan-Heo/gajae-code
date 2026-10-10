@@ -1787,4 +1787,62 @@ describe("Completion event handling (probepark fix for #6451)", () => {
 		// Content before refusal should be suppressed
 		expect(textBlocks).toHaveLength(0);
 	});
+
+	test("completion event emits all pending text events immediately (Finding #2)", async () => {
+		// When completion event arrives, all pending text events should be emitted immediately,
+		// not deferred until EOF. This includes text_start, text_delta, and text_end.
+		const emittedEvents: Array<{ type: string }> = [];
+
+		globalThis.fetch = (async () => {
+			// Stream: content event, then completion event, then more data (which should be ignored)
+			const eventSequence = [
+				JSON.stringify({ content: "Hello world" }),
+				JSON.stringify({ stopReason: "COMPLETED" }),
+				JSON.stringify({ content: "This should not appear" }), // Extra event after completion
+			];
+			let emitted = 0;
+
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					if (emitted < eventSequence.length) {
+						const chunk = new TextEncoder().encode(eventSequence[emitted]);
+						controller.enqueue(chunk);
+						emitted++;
+					} else {
+						controller.close();
+					}
+				},
+			});
+
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEvents.push({ type: event.type });
+			}
+		} catch {
+			// Stream error handling
+		}
+
+		// Verify text_start, text_delta, and text_end are emitted
+		const eventTypes = emittedEvents.map(e => e.type);
+		const hasTextStart = eventTypes.includes("text_start");
+		const hasTextDelta = eventTypes.includes("text_delta");
+		const hasTextEnd = eventTypes.includes("text_end");
+		const hasDone = eventTypes.includes("done");
+
+		expect(hasTextStart).toBe(true); // text_start must be emitted
+		expect(hasTextDelta).toBe(true); // text_delta must be emitted
+		expect(hasTextEnd).toBe(true); // text_end must be emitted after completion
+		expect(hasDone).toBe(true); // done event must follow
+
+		// Verify the order: text events should come before done
+		const textStartIdx = eventTypes.indexOf("text_start");
+		const textEndIdx = eventTypes.indexOf("text_end");
+		const doneIdx = eventTypes.indexOf("done");
+		expect(textStartIdx).toBeLessThan(textEndIdx);
+		expect(textEndIdx).toBeLessThan(doneIdx);
+	});
 });

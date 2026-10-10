@@ -1172,6 +1172,11 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						// Mark completion as seen - text is now confirmed safe even without usage event
 						completionSeen = true;
 						hasReceivedTerminalMetadata = true;
+						// Finding #2: Immediately commit and emit all pending text events on completion
+						commitPendingText();
+						emitThinking();
+						emitDeferredTextEvents();
+						closeTextBlock();
 					} else if (event.type === "refusal") {
 						const refusalData = event.data as {
 							stopReason?: string;
