@@ -231,7 +231,21 @@ const CSS_VALUE_ATTRIBUTES = new Set([
  *   of the rasterizer's Times), `xmlns`, and `xmlns:xlink` when the source
  *   uses `xlink:` attributes.
  */
+/**
+ * Reject SVGs with embedded data-URI raster images to prevent unbounded
+ * memory allocation during decoding. Embedded PNG/JPEG data URIs can declare
+ * extreme dimensions (e.g., 1×2B height) and allocate multi-gigabyte buffers
+ * before frame decode, causing OOM/abort of the local process.
+ */
+function rejectEmbeddedRasterImages(svg: string): void {
+	const dataUriPattern = /href=["']data:image\/(png|jpeg|jpg|gif|webp);[^"']*["']/gi;
+	if (dataUriPattern.test(svg)) {
+		throw new Error("SVG contains embedded raster image data URIs, which are not supported for this renderer");
+	}
+}
+
 export function prepareSvg(svg: string, palette: Readonly<Record<string, string>>): string {
+	rejectEmbeddedRasterImages(svg);
 	const fg = palette.fg ?? "currentColor";
 	const resolved = resolveSvgCssVariables(svg, palette, fg);
 	const usesXlink = resolved.includes("xlink:");

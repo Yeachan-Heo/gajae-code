@@ -8,11 +8,11 @@ import {
 	isTerminalGraphicsFallbackActive,
 	isViewportAnchorSourceRenderer,
 	Markdown,
-	SvgFigure,
+	type MarkdownTheme,
 	Spacer,
+	SvgFigure,
 	TERMINAL,
 	Text,
-	type MarkdownTheme,
 	type ViewportAnchorSource,
 } from "@gajae-code/tui";
 import { formatNumber } from "@gajae-code/utils";
