@@ -77,7 +77,7 @@ function getDb(dbPath?: string): Database {
 export function closeModelCache(dbPath?: string): boolean {
 	const resolvedPath = dbPath ?? getModelDbPath();
 	if (!sharedDb || sharedDbPath !== resolvedPath) return false;
-	sharedDb.close();
+	sharedDb.close(true);
 	sharedDb = null;
 	sharedDbPath = null;
 	return true;

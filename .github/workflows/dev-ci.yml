@@ -407,6 +407,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           bun test ./packages/natives/test/walker-pool-unavailable.windows.test.ts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          bun test ./packages/utils/test/issue-935-repro.test.ts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          bun test ./packages/coding-agent/test/task-cache-key.test.ts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          bun test ./packages/coding-agent/test/sdk-session-router-attach-scope.test.ts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Windows constrained-memory native runtime install
         shell: pwsh
         run: |

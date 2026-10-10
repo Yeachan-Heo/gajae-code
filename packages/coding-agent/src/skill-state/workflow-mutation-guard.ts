@@ -8,8 +8,10 @@ import { expandApplyPatchToEntries } from "../edit/modes/apply-patch";
 import { GJC_SESSION_PREFIX, modeStatePath as sessionModeStatePath } from "../gjc-runtime/session-layout";
 import { resolveGjcSessionForRead } from "../gjc-runtime/session-resolution";
 import { ModeStateSchema } from "../gjc-runtime/state-schema";
+import { workflowEnvelopeChecksumStatus } from "../gjc-runtime/state-writer";
 import { getSkillManifest } from "../gjc-runtime/workflow-manifest";
 import { LocalProtocolHandler, resolveLocalUrlToPath } from "../internal-urls/local-protocol";
+import { isGithubReadOnlyArgs } from "../tools/github-side-effect";
 import { resolveToCwd } from "../tools/path-utils";
 import { ToolError } from "../tools/tool-errors";
 import { listActiveSkills, readVisibleSkillActiveState, type SkillActiveEntry } from "./active-state";
@@ -38,7 +40,14 @@ function planningPhaseBlockMessage(skill: CanonicalGjcWorkflowSkill): string {
 	return DEEP_INTERVIEW_MUTATION_BLOCK_MESSAGE;
 }
 
-const BLOCKED_TOOL_NAMES = new Set(["edit", "write", "ast_edit", "bash"]);
+/** Tools whose execute path can mutate product state. `github` is included so side-effect ops share this guard. */
+export const WORKFLOW_MUTATION_TOOL_NAMES = ["edit", "write", "ast_edit", "bash", "github"] as const;
+
+const BLOCKED_TOOL_NAMES = new Set<string>(WORKFLOW_MUTATION_TOOL_NAMES);
+
+export function isWorkflowMutationTool(name: string): boolean {
+	return BLOCKED_TOOL_NAMES.has(name);
+}
 /**
  * Only `/dev/null` is exempt. `/dev/stdout`, `/dev/stderr`, and `/dev/fd/<n>` are descriptor
  * aliases: `exec 1<>src/product.ts; printf x >/dev/stdout` reaches a real repository file
@@ -317,10 +326,20 @@ function resolveCurrentWorkflowEntry(entries: SkillActiveEntry[], topLevelSkill:
  * governs, so a stale planning entry can never block while an executor runs and
  * a resumed planning phase reliably re-blocks.
  *
- * Fail-open contract: a missing or invalid durable mode-state releases the block
- * (a corrupt state file must not lock all mutation), matching the guard's
- * historical behavior — this is intentionally looser than the Stop hook, which
- * fails closed for handoff-required skills.
+ * Fail-open contract: a missing or schema-invalid durable mode-state releases
+ * the block (a corrupt state file must not lock all mutation), matching the
+ * guard's historical behavior — this is intentionally looser than the Stop
+ * hook, which fails closed for handoff-required skills. A checksum mismatch is
+ * not that case: the file is still schema-valid, and the CLI already refuses
+ * it as an out-of-band edit. The guard keeps the active entry's phase instead
+ * of letting the forged `current_phase` or `active: false` release the block.
+ * An unsigned envelope may restate that entry, but it may not release a block
+ * the entry still holds. It may still name a stricter blocking phase: the
+ * pre-fix guard honored that phase, and dropping it would allow an edit the
+ * base rejected. A `session_id` or `thread_id` that does not match this
+ * session is the same kind of claim: it does not make the file someone else's,
+ * and it does not open the block. A matching `content_sha256` whose context
+ * also matches is the existing writer stamp and is trusted.
  */
 async function getActivePlanningSkill(
 	cwd: string,
@@ -343,11 +362,73 @@ async function getActivePlanningSkill(
 	const modeState = guardContext.modeStates.get(current.skill) ?? null;
 
 	if (!modeState) return null;
-	if (modeState.active !== true) return null;
-	if (!modeStateMatchesContext(modeState, resolvedSessionId, threadId)) return null;
-	const phase = String(modeState.current_phase ?? current.phase ?? "").trim();
-	if (!isBlockingPlanningPhase(current.skill, phase)) return null;
-	return { skill: current.skill, phase };
+	const activePhase = String(current.phase ?? "").trim();
+	const posture = planningPostureFromModeState(current.skill, activePhase, modeState, resolvedSessionId, threadId);
+	if (posture.tampered) {
+		warnInvalidModeState(
+			modeStatePath(cwd, current.skill, resolvedSessionId),
+			"out-of-band edit detected (content_sha256 mismatch)",
+		);
+	}
+	if (!posture.blocking) return null;
+	return { skill: current.skill, phase: posture.phase };
+}
+
+/**
+ * Decide whether `modeState` may release the planning block.
+ *
+ * The active entry is the seal. A mode-state file releases that seal only when
+ * its writer-stamped `content_sha256` matches and its session context matches,
+ * or when an unsigned file in the same context does not claim a looser posture
+ * than the entry. An unsigned file may still impose a stricter blocking phase.
+ * Checksum mismatch ignores the file. A context mismatch does not release the
+ * entry's block: the file was read from this session's path.
+ */
+function planningPostureFromModeState(
+	skill: MutationGatedSkill,
+	activePhase: string,
+	modeState: ModeState,
+	sessionId?: string,
+	threadId?: string,
+): { blocking: boolean; phase: string; tampered: boolean } {
+	const status = workflowEnvelopeChecksumStatus(modeState);
+	if (status === "mismatch") {
+		return {
+			blocking: isBlockingPlanningPhase(skill, activePhase),
+			phase: activePhase,
+			tampered: true,
+		};
+	}
+	if (!modeStateMatchesContext(modeState, sessionId, threadId)) {
+		return {
+			blocking: isBlockingPlanningPhase(skill, activePhase),
+			phase: activePhase,
+			tampered: false,
+		};
+	}
+	if (status === "match") {
+		if (modeState.active !== true) return { blocking: false, phase: activePhase, tampered: false };
+		const phase = String(modeState.current_phase ?? activePhase).trim();
+		return { blocking: isBlockingPlanningPhase(skill, phase), phase, tampered: false };
+	}
+	if (!isBlockingPlanningPhase(skill, activePhase)) {
+		const stricterPhase = String(modeState.current_phase ?? "").trim();
+		if (modeState.active === true && stricterPhase && isBlockingPlanningPhase(skill, stricterPhase)) {
+			return { blocking: true, phase: stricterPhase, tampered: false };
+		}
+		return { blocking: false, phase: activePhase, tampered: false };
+	}
+	if (modeState.active !== true) return { blocking: true, phase: activePhase, tampered: false };
+	const modePhase = String(modeState.current_phase ?? "").trim();
+	if (
+		modePhase &&
+		!isBlockingPlanningPhase(skill, modePhase) &&
+		modePhase.trim().toLowerCase() !== activePhase.trim().toLowerCase()
+	) {
+		return { blocking: true, phase: activePhase, tampered: false };
+	}
+	const phase = modePhase || activePhase;
+	return { blocking: isBlockingPlanningPhase(skill, phase), phase, tampered: false };
 }
 
 function normalizePosix(value: string): string {
@@ -1607,11 +1688,22 @@ function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 	}
 	return targets;
 }
+/**
+ * Read-only github ops extract no mutation. Every other op fails closed during
+ * planning: remote push, PR creation, and worktree/config writes are not a
+ * filesystem path the planning allowlist can clear.
+ */
+function extractGithubTargets(args: unknown): ExtractedTargets {
+	if (isGithubReadOnlyArgs(args)) return { paths: [], unknown: false };
+	return { paths: [], unknown: true, explicitMutation: true };
+}
+
 function extractTargets(tool: ToolWithEditMode, args: unknown): ExtractedTargets {
 	if (tool.name === "write") return extractWriteTargets(args);
 	if (tool.name === "ast_edit") return extractAstEditTargets(args);
 	if (tool.name === "edit") return extractEditTargets(args, tool);
 	if (tool.name === "bash") return extractBashTargets(args);
+	if (tool.name === "github") return extractGithubTargets(args);
 	return { paths: [], unknown: true };
 }
 

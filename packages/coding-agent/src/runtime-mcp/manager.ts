@@ -34,6 +34,7 @@ import {
 	MCPPoolLeaseObsoleteError,
 	MCPPoolLeaseReleaseError,
 } from "./pool";
+import { decideUntrustedProjectConfigValue, isUntrustedProjectMcpSource } from "./project-host-values";
 import type { MCPProtocolObservation } from "./protocol";
 import { DEFAULT_MCP_STARTUP_WAIT_MS, MAX_MCP_STARTUP_WAIT_MS, MCP_STARTUP_WAIT_GRACE_MS } from "./startup-policy";
 import type { MCPToolDetails } from "./tool-bridge";
@@ -1313,8 +1314,9 @@ export class MCPManager {
 			const connectionAbort = new AbortController();
 			this.#pendingConnectionControllers.set(name, connectionAbort);
 			// Resolve auth config before connecting, but do so per-server in parallel.
+			const configSource = sources[name] ?? this.#sources.get(name);
 			const acquireInitialLease = async (): Promise<MCPPoolLease> => {
-				const resolvedConfig = await this.#resolveAuthConfig(config);
+				const resolvedConfig = await this.#resolveAuthConfig(config, false, configSource);
 				let lease: MCPPoolLease | undefined;
 				try {
 					lease = await this.#acquireLease(name, resolvedConfig, config, connectionAbort);
@@ -1371,7 +1373,7 @@ export class MCPManager {
 						// Wire auth refresh for HTTP transports, and reconnect for any transport.
 						if (connection.transport instanceof HttpTransport && config.auth?.type === "oauth") {
 							connection.transport.onAuthError = async () => {
-								const refreshed = await this.#resolveAuthConfig(config, true);
+								const refreshed = await this.#resolveAuthConfig(config, true, configSource);
 								if (refreshed.type === "http" || refreshed.type === "sse") {
 									return refreshed.headers ?? null;
 								}
@@ -2152,7 +2154,11 @@ export class MCPManager {
 		const config = this.#serverConfigs.get(name);
 		if (!config) throw new Error(`MCP server unavailable: ${name}`);
 		await this.#closePendingConnectionCleanup(name);
-		const resolved = await this.#resolveAuthConfig(config);
+		const resolved = await this.#resolveAuthConfig(
+			config,
+			false,
+			this.#sources.get(name) ?? this.#connections.get(name)?._source,
+		);
 		const abort = new AbortController();
 		this.#pendingConnectionControllers.set(name, abort);
 		let prepared:
@@ -2308,9 +2314,9 @@ export class MCPManager {
 	/**
 	 * Resolve auth and shell-command substitutions in config before connecting.
 	 */
-	async prepareConfig(config: MCPServerConfig): Promise<MCPServerConfig> {
+	async prepareConfig(config: MCPServerConfig, source?: SourceMeta): Promise<MCPServerConfig> {
 		this.#assertRawMCPAccessAllowed();
-		return this.#resolveAuthConfig(config);
+		return this.#resolveAuthConfig(config, false, source);
 	}
 
 	/** Acquire a prepared, pool-owned lease for a scoped transient operation. */
@@ -2318,7 +2324,7 @@ export class MCPManager {
 		name: string,
 		config: MCPServerConfig,
 		fn: (lease: MCPPoolLease) => Promise<T> | T,
-		options: { signal?: AbortSignal } = {},
+		options: { signal?: AbortSignal; source?: SourceMeta } = {},
 	): Promise<T> {
 		this.#assertRawMCPAccessAllowed();
 		const lifecycleEpoch = this.#assertScopedAdmission();
@@ -2347,7 +2353,7 @@ export class MCPManager {
 		operation: ScopedOperation,
 		config: MCPServerConfig,
 		fn: (lease: MCPPoolLease) => Promise<T> | T,
-		options: { signal?: AbortSignal },
+		options: { signal?: AbortSignal; source?: SourceMeta },
 	): Promise<T> {
 		const callerSignal = options.signal;
 		const onAbort = () =>
@@ -2376,7 +2382,11 @@ export class MCPManager {
 		let failed = false;
 		let primaryError: unknown;
 		try {
-			const resolvedConfigPromise = this.#resolveAuthConfig(config);
+			const resolvedConfigPromise = this.#resolveAuthConfig(
+				config,
+				false,
+				options.source ?? this.#sources.get(operation.name),
+			);
 			void resolvedConfigPromise.catch(() => {});
 			const resolvedConfig = await Promise.race([resolvedConfigPromise, abortPromise]);
 			if (operation.lifecycleEpoch !== this.#scopedLifecycleEpoch || this.#scopedLifecycle !== "open") {
@@ -2857,7 +2867,7 @@ export class MCPManager {
 			throw new MCPManagerLifecycleError(this.#scopedLifecycle === "disconnecting" ? "disconnect" : "reconnect");
 		};
 		assertLifecycle();
-		const resolvedConfig = await this.#resolveAuthConfig(config);
+		const resolvedConfig = await this.#resolveAuthConfig(config, false, source);
 		assertLifecycle();
 		const connectionAbort = new AbortController();
 		this.#pendingConnectionControllers.set(name, connectionAbort);
@@ -2909,7 +2919,7 @@ export class MCPManager {
 		// Wire auth refresh for HTTP transports, and reconnect for any transport.
 		if (connection.transport instanceof HttpTransport && config.auth?.type === "oauth") {
 			connection.transport.onAuthError = async () => {
-				const refreshed = await this.#resolveAuthConfig(config, true);
+				const refreshed = await this.#resolveAuthConfig(config, true, source);
 				if (refreshed.type === "http" || refreshed.type === "sse") {
 					return refreshed.headers ?? null;
 				}
@@ -3174,7 +3184,11 @@ export class MCPManager {
 	/**
 	 * Resolve OAuth credentials and shell commands in config.
 	 */
-	async #resolveAuthConfig(config: MCPServerConfig, forceRefresh = false): Promise<MCPServerConfig> {
+	async #resolveAuthConfig(
+		config: MCPServerConfig,
+		forceRefresh = false,
+		source?: SourceMeta,
+	): Promise<MCPServerConfig> {
 		let resolved: MCPServerConfig = { ...config };
 
 		const auth = config.auth;
@@ -3240,7 +3254,11 @@ export class MCPManager {
 			resolved = { ...resolved, noInheritEnv: true };
 		}
 
+		const untrustedProject = isUntrustedProjectMcpSource(source, this.#toolsOnly);
 		const resolveValue = async (value: string): Promise<string | undefined> => {
+			const decision = decideUntrustedProjectConfigValue(value, untrustedProject);
+			if (decision.action === "drop") return undefined;
+			if (decision.action === "literal") return decision.value;
 			try {
 				const resolvedValue = await configValue.resolveConfigValue(value);
 				if (this.#toolsOnly && !resolvedValue) throw new MCPExpectedFailure();

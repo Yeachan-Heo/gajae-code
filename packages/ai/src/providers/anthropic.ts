@@ -19,7 +19,9 @@ import {
 	isUnexpectedSocketCloseMessage,
 	logger,
 	readSseEvents,
+	startupProjectEnvSnapshot,
 } from "@gajae-code/utils";
+import { canonicalEnvKey, type ProjectEnvSnapshot } from "@gajae-code/utils/env-file";
 import {
 	anthropicProviderDiagnosticFromError,
 	anthropicProviderDiagnosticFromSseErrorData,
@@ -203,6 +205,12 @@ const sharedHeaders = {
 	"Content-Type": "application/json",
 	"Anthropic-Version": "2023-06-01",
 	"Anthropic-Dangerous-Direct-Browser-Access": "true",
+};
+
+// Claude Code client marker. Like the claude-code/oauth betas it is sent only with
+// OAuth credentials: Anthropic classifies API-key requests carrying it as Claude
+// Code usage, which excludes them from API credit grants.
+const claudeCodeAppHeaders = {
 	"X-App": "cli",
 };
 
@@ -298,6 +306,7 @@ export function buildAnthropicHeaders(options: AnthropicHeaderOptions): Record<s
 			Accept: acceptHeader,
 			Authorization: `Bearer ${options.apiKey}`,
 			...sharedHeaders,
+			...claudeCodeAppHeaders,
 			"Anthropic-Beta": betaHeader,
 			"User-Agent": userAgent,
 		};
@@ -1244,6 +1253,50 @@ function looksLikeFilePath(value: string): boolean {
 	return value.includes("/") || value.includes("\\") || /\.(pem|crt|cer|key)$/i.test(value);
 }
 
+/**
+ * Bun turns `\n` and `\r` inside double-quoted dotenv values into control
+ * characters before they reach `process.env`. The project snapshot keeps the
+ * source text, so a literal compare would miss that rewrite.
+ */
+function unescapeProjectDotenvControls(value: string): string {
+	let decoded = "";
+	for (let index = 0; index < value.length; index++) {
+		const current = value[index];
+		const next = value[index + 1];
+		if (current === "\\" && next === "n") {
+			decoded += "\n";
+			index++;
+			continue;
+		}
+		if (current === "\\" && next === "r") {
+			decoded += "\r";
+			index++;
+			continue;
+		}
+		decoded += current ?? "";
+	}
+	return decoded;
+}
+
+/**
+ * Operator environment only. `$env` already contains the project dotenv, and a
+ * value equal to that declaration — or produced from a `$` / backtick
+ * declaration — must not become the Foundry trust anchor or client identity.
+ */
+function trustedFoundryTlsValue(name: string, snapshot: ProjectEnvSnapshot): string | undefined {
+	const raw = $env[name];
+	if (!raw) return undefined;
+	const key = canonicalEnvKey(name);
+	const declared = snapshot.values[key];
+	if (
+		declared !== undefined &&
+		(snapshot.dynamic.has(key) || declared === raw || unescapeProjectDotenvControls(declared) === raw)
+	) {
+		return undefined;
+	}
+	return raw;
+}
+
 function resolvePemValue(value: string | undefined, name: string): string | undefined {
 	const trimmed = value?.trim();
 	if (!trimmed) return undefined;
@@ -1271,9 +1324,13 @@ function resolveFoundryTlsOptions(model: Model<"anthropic-messages">): FoundryTl
 	if (model.provider !== "anthropic") return undefined;
 	if (!isFoundryEnabled()) return undefined;
 
-	const ca = resolvePemValue($env.NODE_EXTRA_CA_CERTS, "NODE_EXTRA_CA_CERTS");
-	const cert = resolvePemValue($env.CLAUDE_CODE_CLIENT_CERT, "CLAUDE_CODE_CLIENT_CERT");
-	const key = resolvePemValue($env.CLAUDE_CODE_CLIENT_KEY, "CLAUDE_CODE_CLIENT_KEY");
+	const projectEnv = startupProjectEnvSnapshot();
+	const ca = resolvePemValue(trustedFoundryTlsValue("NODE_EXTRA_CA_CERTS", projectEnv), "NODE_EXTRA_CA_CERTS");
+	const cert = resolvePemValue(
+		trustedFoundryTlsValue("CLAUDE_CODE_CLIENT_CERT", projectEnv),
+		"CLAUDE_CODE_CLIENT_CERT",
+	);
+	const key = resolvePemValue(trustedFoundryTlsValue("CLAUDE_CODE_CLIENT_KEY", projectEnv), "CLAUDE_CODE_CLIENT_KEY");
 
 	if ((cert && !key) || (!cert && key)) {
 		throw new Error("Both CLAUDE_CODE_CLIENT_CERT and CLAUDE_CODE_CLIENT_KEY must be set for mTLS.");
