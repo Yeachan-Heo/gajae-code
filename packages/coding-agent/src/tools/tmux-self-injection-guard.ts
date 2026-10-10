@@ -564,10 +564,20 @@ function collectShellPayloads(tokens: Token[]): string[] {
 		const token = tokens[index];
 		if (!token.commandStart || (token.text !== "env" && !token.text.endsWith("/env"))) continue;
 
+		// Options for env that consume the next argument
+		const envOptionsWithArg = new Set(["-u", "-C", "-S"]);
+		let skipNextArg = false;
+
 		// Look for -S or --split-string option
 		let inEnv = true;
 		for (let cursor = index + 1; cursor < tokens.length && !tokens[cursor].commandStart && inEnv; cursor++) {
 			const arg = tokens[cursor].text;
+
+			// If the previous option takes an argument, skip this token
+			if (skipNextArg) {
+				skipNextArg = false;
+				continue;
+			}
 
 			// Stop at the first non-option, non-assignment
 			if (!arg.startsWith("-") && !isAssignment(arg)) {
@@ -589,7 +599,9 @@ function collectShellPayloads(tokens: Token[]): string[] {
 			else if (arg.startsWith("--split-string")) {
 				if (arg.includes("=")) {
 					// Handle --split-string=value format
-					const value = arg.split("=", 2)[1];
+					// Use substring to get everything after the first =, not just up to the second =
+					const eqIndex = arg.indexOf("=");
+					const value = arg.substring(eqIndex + 1);
 					if (value) {
 						payloads.push(value);
 					}
@@ -600,6 +612,22 @@ function collectShellPayloads(tokens: Token[]): string[] {
 						payloads.push(payload);
 						cursor++; // Skip the payload we just processed
 					}
+				}
+			}
+			// Track options that take arguments so we skip their operands
+			else if (envOptionsWithArg.has(arg)) {
+				skipNextArg = true;
+			}
+			// Check for long options with = format (--option=value)
+			else if (arg.startsWith("--") && arg.includes("=")) {
+				// Long options with = format don't consume the next argument
+			}
+			// Check for long options without = that might take arguments
+			else if (arg.startsWith("--")) {
+				// Check if this long option takes an argument
+				const wrapperLongOpts = WRAPPER_LONG_OPTIONS["env"];
+				if (wrapperLongOpts && arg in wrapperLongOpts && wrapperLongOpts[arg]) {
+					skipNextArg = true;
 				}
 			}
 		}

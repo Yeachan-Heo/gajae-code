@@ -658,6 +658,22 @@ describe("tmux self-injection guard", () => {
 			).resolves.toMatchObject({ block: true });
 		});
 
+		it("blocks env -u FOO -S with tmux in split string", async () => {
+			// Issue: env -u FOO -S 'tmux send-keys -t %47 x'
+			// The -u option takes FOO as operand; should continue to -S
+			await expect(
+				checkTmuxSelfInjection("env -u FOO -S 'tmux send-keys -t %47 x'", options),
+			).resolves.toMatchObject({ block: true });
+		});
+
+		it("blocks env --split-string with equals-form containing tmux", async () => {
+			// Issue: env --split-string='FOO=x tmux send-keys -t %47 x'
+			// The full value after = should be used, not just up to the second =
+			await expect(
+				checkTmuxSelfInjection("env --split-string='FOO=x tmux send-keys -t %47 x'", options),
+			).resolves.toMatchObject({ block: true });
+		});
+
 		// Issue 4: P1 — Socket backtracking across command boundaries
 		it("allows tmux after semicolon-separated TMUX assignment", async () => {
 			// Issue: TMUX=/tmp/other env FOO=x; tmux send-keys -t %47 x
