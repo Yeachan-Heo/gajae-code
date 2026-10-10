@@ -28,11 +28,13 @@ import {
 import { getLinterClient } from "./clients";
 import { getServersForFile, type LspConfig, loadConfig } from "./config";
 import {
-	applyTextEdits,
+	applyResourceOps,
 	applyTextEditsToString,
 	applyWorkspaceEdit,
 	flattenWorkspaceTextEdits,
 	rangesOverlap,
+	resourceOpsOf,
+	stageTextEdits,
 } from "./edits";
 import { detectLspmux } from "./lspmux";
 import { renderCall, renderResult } from "./render";
@@ -77,6 +79,15 @@ import {
 	symbolKindToIcon,
 	uriToFile,
 } from "./utils";
+import {
+	assertBatchStaysInside,
+	assertRenamePaths,
+	assertWorkspaceTarget,
+	canonicalWorkspacePath,
+	type PlannedResource,
+	renameInsideWorkspace,
+	workspaceOperand,
+} from "./workspace-path";
 
 export type { LspServerStatus } from "./client";
 export type { LspToolDetails } from "./types";
@@ -1337,9 +1348,13 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				};
 			}
 
+			await assertRenamePaths(this.session.cwd, source, dest);
+			const sourceOp = await workspaceOperand(this.session.cwd, source);
+			const destOp = await workspaceOperand(this.session.cwd, dest);
+
 			let sourceStat: fs.Stats;
 			try {
-				sourceStat = await fs.promises.stat(source);
+				sourceStat = await fs.promises.stat(sourceOp);
 			} catch {
 				return {
 					content: [
@@ -1354,7 +1369,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 
 			let destExists = false;
 			try {
-				await fs.promises.stat(dest);
+				await fs.promises.stat(destOp);
 				destExists = true;
 			} catch {
 				// expected: destination must not exist
@@ -1371,7 +1386,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				};
 			}
 
-			const enumerated = await enumerateRenamePairs(source, dest);
+			const enumerated = await enumerateRenamePairs(sourceOp, destOp);
 			if (enumerated.exceeded) {
 				return {
 					content: [
@@ -1525,9 +1540,44 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				}
 			}
 
+			const serverResourceOps: PlannedResource[] = [];
+			for (const { edit } of perServerEdits) {
+				serverResourceOps.push(...(await resourceOpsOf(edit, this.session.cwd)));
+			}
+			await assertBatchStaysInside(this.session.cwd, [
+				...serverResourceOps,
+				{ kind: "rename", oldPath: source, newPath: dest },
+			]);
+
+			const acceptedEdits: Array<{ filePath: string; bucket: AcceptedBucket }> = [];
+			const acceptedIndex = new Map<string, number>();
 			for (const [uri, bucket] of acceptedByUri) {
-				const filePath = uriToFile(uri);
-				await applyTextEdits(filePath, bucket.edits);
+				const rawPath = uriToFile(uri);
+				await assertWorkspaceTarget(this.session.cwd, rawPath);
+				const filePath = await workspaceOperand(this.session.cwd, rawPath);
+				const key = await canonicalWorkspacePath(this.session.cwd, rawPath);
+				const at = acceptedIndex.get(key);
+				if (at === undefined) {
+					acceptedIndex.set(key, acceptedEdits.length);
+					acceptedEdits.push({
+						filePath,
+						bucket: { ...bucket, edits: [...bucket.edits], conflictServers: new Set(bucket.conflictServers) },
+					});
+				} else {
+					acceptedEdits[at].bucket.edits.push(...bucket.edits);
+				}
+			}
+			const stagedEdits: Array<{ filePath: string; bucket: AcceptedBucket; next: string }> = [];
+			for (const { filePath, bucket } of acceptedEdits) {
+				stagedEdits.push({
+					filePath,
+					bucket,
+					next: await stageTextEdits(filePath, bucket.edits),
+				});
+			}
+
+			for (const { filePath, bucket, next } of stagedEdits) {
+				await Bun.write(filePath, next);
 				const rel = formatPathRelativeToCwd(filePath, this.session.cwd);
 				summary.push(`  ${bucket.primaryServer}: applied ${bucket.edits.length} edit(s) to ${rel}`);
 				if (bucket.discarded > 0) {
@@ -1541,8 +1591,9 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				}
 			}
 
-			await fs.promises.mkdir(path.dirname(dest), { recursive: true });
-			await fs.promises.rename(source, dest);
+			summary.push(...(await applyResourceOps(this.session.cwd, serverResourceOps)).map(line => `  ${line}`));
+
+			await renameInsideWorkspace(this.session.cwd, source, dest);
 			summary.push(`  Renamed ${sourceLabel} → ${destLabel}`);
 
 			for (const [serverName, serverConfig] of servers) {
