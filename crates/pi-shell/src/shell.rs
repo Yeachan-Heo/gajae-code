@@ -3551,6 +3551,55 @@ mod tests {
 
 	#[cfg(unix)]
 	#[tokio::test(flavor = "multi_thread")]
+	async fn execute_shell_negative_substring_length_ends_before_the_end() {
+		// A negative length marks where the slice ends, as in bash (#6544 review).
+		let (stdout_tx, mut stdout_rx) = mpsc::unbounded_channel::<Bytes>();
+		let options = ShellExecuteOptions {
+			command: "v=abcdefgh; w='caf\u{e9}'; echo \"${v:2:-2} ${w:1:-1} ${w:0:-1}\"".to_string(),
+			..Default::default()
+		};
+		let streams = StreamSinks { stdout: Some(stdout_tx), stderr: None };
+		let result = execute_shell_streams(options, streams, CancelToken::default())
+			.await
+			.expect("execute should succeed");
+		assert_eq!(result.exit_code, Some(0));
+
+		let mut stdout = Vec::new();
+		while let Some(chunk) = stdout_rx.recv().await {
+			stdout.extend_from_slice(&chunk);
+		}
+		assert_eq!(String::from_utf8(stdout).unwrap(), "cdef af caf\n");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn execute_shell_rejects_substring_ending_before_its_offset() {
+		let (stdout_tx, mut stdout_rx) = mpsc::unbounded_channel::<Bytes>();
+		let (stderr_tx, mut stderr_rx) = mpsc::unbounded_channel::<Bytes>();
+		let options = ShellExecuteOptions {
+			command: "v='\u{e9}x'; echo \"[${v:1:-3}]\"".to_string(),
+			..Default::default()
+		};
+		let streams = StreamSinks { stdout: Some(stdout_tx), stderr: Some(stderr_tx) };
+		let result = execute_shell_streams(options, streams, CancelToken::default())
+			.await
+			.expect("execute should succeed");
+		assert_ne!(result.exit_code, Some(0));
+
+		let mut stdout = Vec::new();
+		while let Some(chunk) = stdout_rx.recv().await {
+			stdout.extend_from_slice(&chunk);
+		}
+		let mut stderr = Vec::new();
+		while let Some(chunk) = stderr_rx.recv().await {
+			stderr.extend_from_slice(&chunk);
+		}
+		assert!(stdout.is_empty(), "nothing should be echoed, got {stdout:?}");
+		assert!(String::from_utf8_lossy(&stderr).contains("substring expression < 0"));
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
 	async fn execute_shell_streams_works_when_sinks_are_none() {
 		// Both sinks `None` — pipes must still drain so the child can exit.
 		let options = ShellExecuteOptions {

@@ -1258,14 +1258,22 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
 				let expanded_offset = min(expanded_offset, expanded_parameter_len);
 
 				let end_offset = if let Some(length) = length {
-					let mut expanded_length = length.eval(self.shell, self.params, false).await?;
+					let expanded_length = length.eval(self.shell, self.params, false).await?;
 					if expanded_length < 0 {
-						expanded_length += expanded_parameter_len;
+						// For a string, a negative length says where the slice ends, counting back
+						// from the end of the value, as in bash: `${s:2:-2}` on `abcdefgh` is `cdef`.
+						// bash rejects a negative length for an array, and an end before the offset.
+						let end_offset = expanded_parameter_len + expanded_length;
+						if expanded_parameter.from_array || end_offset < expanded_offset {
+							return Err(error::ErrorKind::CheckedExpansionError(format!(
+								"{expanded_length}: substring expression < 0"
+							))
+							.into());
+						}
+						end_offset
+					} else {
+						expanded_offset + min(expanded_length, expanded_parameter_len - expanded_offset)
 					}
-
-					let expanded_length = min(expanded_length, expanded_parameter_len - expanded_offset);
-
-					expanded_offset + expanded_length
 				} else {
 					expanded_parameter_len
 				};
