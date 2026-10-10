@@ -356,6 +356,17 @@ describe("tmux self-injection guard", () => {
 				block: true,
 			});
 		});
+
+		it("should block bash with bundled -Oc option", async () => {
+			// Issue: bash -Oc extglob 'tmux send-keys -t %47 x'
+			// -Oc means -O c (shopt option 'c') and -c (command) bundled
+			// extglob is the operand for -O, and the quoted string is the command
+			await expect(
+				checkTmuxSelfInjection("bash -Oc extglob 'tmux send-keys -t %47 x'", options),
+			).resolves.toMatchObject({
+				block: true,
+			});
+		});
 	});
 
 	// Regression tests for remaining blocking issues

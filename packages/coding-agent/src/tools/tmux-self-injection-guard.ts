@@ -484,8 +484,38 @@ function collectShellPayloads(tokens: Token[]): string[] {
 			}
 
 			// Handle options with bundled operands (e.g., -Oextglob, -opipefail)
+			// But also check if -c is in the bundle (e.g., -Oc means -O c where c is the shopt option)
 			if ((word.startsWith("-O") && word.length > 2) || (word.startsWith("-o") && word.length > 2)) {
-				// The operand is bundled with the option, so skip this and check the next word for -c
+				// The operand is bundled with the option
+				// Check if -c is also in the bundle after the operand
+				const bundledChars = word.slice(2); // e.g., "extglob" or "c"
+				if (bundledChars.includes("c")) {
+					// -c is in the bundle, so we need to find the command string
+					// The command comes after this option word
+					for (
+						let payloadCursor = cursor + 1;
+						payloadCursor < tokens.length && !tokens[payloadCursor].commandStart;
+						payloadCursor++
+					) {
+						const payloadWord = tokens[payloadCursor].text;
+						// Skip the first non-option word (it's the operand for -O)
+						if (!payloadWord.startsWith("-")) {
+							// This is the operand for -O; the next non-option is the -c operand
+							for (
+								let commandCursor = payloadCursor + 1;
+								commandCursor < tokens.length && !tokens[commandCursor].commandStart;
+								commandCursor++
+							) {
+								const commandWord = tokens[commandCursor].text;
+								if (!commandWord.startsWith("-") || tokens[commandCursor].quoted) {
+									payloads.push(commandWord);
+									break;
+								}
+							}
+							break;
+						}
+					}
+				}
 				continue;
 			}
 
