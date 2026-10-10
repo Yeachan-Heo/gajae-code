@@ -40,11 +40,13 @@ describe("AgentSession message pipeline", () => {
 		__agentSessionPerfCounters.reset();
 		__sessionStateSidecarPerfCounters.reset();
 		for (const session of sessions.splice(0)) {
-			// Suppress dispose errors that occur due to unsettled SDK terminals.
-			// With the always-check-deep-interview-filesystem change, buildSkillStopOutput
-			// may still be in flight when disposal starts, causing SDK terminals to be
-			// rejected. This is expected and not a test failure.
-			await session.dispose().catch(() => undefined);
+			// Drain any in-flight work before disposing to prevent buildSkillStopOutput or
+			// other post-turn maintenance from continuing after session teardown begins.
+			// This ensures disposal failures reflect actual problems, not timing races.
+			await session.waitForIdle().catch(() => {
+				// Drain best-effort; some tests abort the session before idle completes.
+			});
+			await session.dispose();
 		}
 	});
 	it("reports a bounded worker integration failure outcome", async () => {
@@ -1415,5 +1417,31 @@ describe("AgentSession message pipeline", () => {
 		await disposed;
 		await idle;
 		expect(extensionEvents.at(-1)).toBe("session_shutdown");
+	});
+
+	it("drains in-flight work before disposal to detect actual failures", async () => {
+		// Regression test for the teardown-failure-detection fix.
+		// Ensures that afterEach drains sessions before disposing, so disposal errors
+		// reflect actual problems, not timing races with buildSkillStopOutput or other
+		// post-turn maintenance. Disposal should not suppress errors; they should only
+		// be caught if waitForIdle fails (best-effort drain).
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: testModelRegistry as never,
+		});
+		sessions.push(session);
+
+		// Drain any in-flight work before disposal (best-effort).
+		// This mirrors what the fixed afterEach does.
+		try {
+			await session.waitForIdle();
+		} catch {
+			// Best-effort drain; some tests may abort before idle completes
+		}
+
+		// Disposal should succeed or throw a real error, not be silently suppressed
+		await session.dispose();
 	});
 });

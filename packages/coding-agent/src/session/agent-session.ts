@@ -7586,8 +7586,6 @@ export class AgentSession {
 		const attemptScope = (event as AgentEvent & { scope?: AttemptScope }).scope;
 		const terminalSdkOwnership =
 			event.type === "agent_end" ? this.#captureSdkContinuationOwnership(attemptScope) : undefined;
-		const activeDeepInterviewAtAgentEnd =
-			event.type === "agent_end" && this.getEffectiveActiveWorkflowSkillState()?.skill === "deep-interview";
 
 		// These lifecycle boundaries can be delivered without awaiting this listener.
 		// Revoke streaming-edit cache generations before any admission, spill, or
