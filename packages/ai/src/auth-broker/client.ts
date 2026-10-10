@@ -421,6 +421,7 @@ export class AuthBrokerClient {
 					headers,
 					body: payload,
 					signal,
+					redirect: "error",
 				});
 				if (!response.ok && response.status !== 304) {
 					const text = await response.text();

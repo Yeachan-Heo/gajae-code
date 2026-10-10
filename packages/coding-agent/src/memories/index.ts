@@ -3,7 +3,14 @@ import type * as fsNode from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentMessage } from "@gajae-code/agent-core";
-import { completeSimple, Effort, type Model } from "@gajae-code/ai/core";
+import { estimateTextTokensHeuristic } from "@gajae-code/agent-core/compaction";
+import {
+	ANTHROPIC_THINKING,
+	completeSimple,
+	Effort,
+	type Model,
+	resolveDefaultRequestMaxTokens,
+} from "@gajae-code/ai/core";
 import { clampThinkingLevelForModel } from "@gajae-code/ai/model-thinking";
 import { getAgentDbPath, getMemoriesDir, logger, parseJsonlLenient, prompt } from "@gajae-code/utils";
 import type { ModelRegistry } from "../config/model-registry";
@@ -73,6 +80,20 @@ const DEFAULTS: MemoryRuntimeConfig = {
 	fallbackTokenLimit: 16_000,
 	summaryInjectionTokenLimit: 5_000,
 };
+
+const PHASE2_RAW_MEMORIES_TOKEN_LIMIT = 20_000;
+const PHASE2_ROLLOUT_SUMMARIES_TOKEN_LIMIT = 12_000;
+// Ceiling for the phase 2 response. Phase 2 rewrites MEMORY.md, the summary and every
+// skill in one JSON response, and on adaptive-thinking / reasoning-effort models the
+// reasoning shares this budget. Twice the (approximate) input caps is a generous
+// practical ceiling, not a guarantee that every response fits; a response that still
+// overruns it is reported as truncation.
+const PHASE2_MAX_OUTPUT_TOKENS = 2 * (PHASE2_RAW_MEMORIES_TOKEN_LIMIT + PHASE2_ROLLOUT_SUMMARIES_TOKEN_LIMIT);
+// On a small context window phase 2 shrinks its inputs rather than let the response
+// budget drop below the previous fixed budget.
+const PHASE2_MIN_OUTPUT_TOKENS = 8_192;
+// Request framing plus estimator error when fitting input + output into the context window.
+const PHASE2_CONTEXT_SAFETY_TOKENS = 2_048;
 
 interface Stage1Stats {
 	claimed: number;
@@ -738,10 +759,8 @@ async function runConsolidationModel(options: {
 	const { memoryRoot, model, apiKey } = options;
 	const rawMemories = await Bun.file(path.join(memoryRoot, "raw_memories.md")).text();
 	const rolloutSummaries = await readRolloutSummaries(memoryRoot);
-	const input = prompt.render(consolidationTemplate, {
-		raw_memories: truncateByApproxTokens(rawMemories, 20_000),
-		rollout_summaries: truncateByApproxTokens(rolloutSummaries, 12_000),
-	});
+	const reasoning = clampThinkingLevelForModel(model, Effort.Low);
+	const { input, maxTokens } = buildPhase2Request(model, rawMemories, rolloutSummaries, reasoning);
 
 	const response = await completeSimple(
 		model,
@@ -751,18 +770,27 @@ async function runConsolidationModel(options: {
 		{
 			apiKey,
 			metadata: options.metadata,
-			maxTokens: 8192,
-			reasoning: clampThinkingLevelForModel(model, Effort.Medium),
+			maxTokens,
+			reasoning,
 		},
 	);
 	if (response.stopReason === "error") {
 		throw new Error(response.errorMessage || "phase2 model error");
+	}
+	if (response.stopReason === "length") {
+		throw new Error(`phase2 output truncated at the max output token limit (${response.usage.output} output tokens)`);
 	}
 	const text = response.content
 		.filter((c): c is { type: "text"; text: string } => c.type === "text")
 		.map(c => c.text)
 		.join("\n")
 		.trim();
+	if (!text) {
+		const thinkingBlocks = response.content.filter(c => c.type === "thinking").length;
+		throw new Error(
+			`phase2 returned no text (stopReason=${response.stopReason}, ${response.usage.output} output tokens, ${thinkingBlocks} thinking blocks)`,
+		);
+	}
 	const parsed = parseJsonObject(text);
 	if (!parsed) throw new Error("phase2 JSON parse failure");
 	const schemaOutput = parseConsolidationOutputSchema(parsed);
@@ -1099,6 +1127,59 @@ function truncateByApproxTokens(text: string, tokenLimit: number): string {
 	const head = Math.floor(maxChars * 0.6);
 	const tail = maxChars - head;
 	return `${text.slice(0, head)}\n\n...[truncated]...\n\n${text.slice(-tail)}`;
+}
+
+/**
+ * Render the phase 2 prompt and choose its response budget.
+ *
+ * The budget is the model's output limit capped at PHASE2_MAX_OUTPUT_TOKENS (or the
+ * provider layer's request default when the limit is unknown). When the context window
+ * is known, input + response + any thinking budget the provider adds on top must fit
+ * in it: the response budget is clamped to the remaining room, and the inputs are
+ * shrunk when that room would fall below PHASE2_MIN_OUTPUT_TOKENS.
+ */
+function buildPhase2Request(
+	model: Model,
+	rawMemories: string,
+	rolloutSummaries: string,
+	reasoning: Effort | undefined,
+): { input: string; maxTokens: number | undefined } {
+	const outputLimit =
+		Number.isSafeInteger(model.maxTokens) && model.maxTokens > 0
+			? Math.min(model.maxTokens, PHASE2_MAX_OUTPUT_TOKENS)
+			: undefined;
+	let rawTokens = Math.min(PHASE2_RAW_MEMORIES_TOKEN_LIMIT, Math.ceil(rawMemories.length / 4));
+	let rolloutTokens = Math.min(PHASE2_ROLLOUT_SUMMARIES_TOKEN_LIMIT, Math.ceil(rolloutSummaries.length / 4));
+	const render = () =>
+		prompt.render(consolidationTemplate, {
+			raw_memories: truncateByApproxTokens(rawMemories, rawTokens),
+			rollout_summaries: truncateByApproxTokens(rolloutSummaries, rolloutTokens),
+		});
+
+	const contextWindow =
+		Number.isSafeInteger(model.contextWindow) && model.contextWindow > 0 ? model.contextWindow : undefined;
+	if (contextWindow === undefined) return { input: render(), maxTokens: outputLimit };
+
+	const responseCeiling = resolveDefaultRequestMaxTokens(model, outputLimit);
+	const minResponse = Math.min(PHASE2_MIN_OUTPUT_TOKENS, responseCeiling);
+	// Budget-mode providers may add the thinking budget on top of maxTokens.
+	const addsThinkingBudget = model.thinking?.mode === "budget" || model.thinking?.mode === "anthropic-budget-effort";
+	const thinkingReserve = reasoning && addsThinkingBudget ? ANTHROPIC_THINKING[reasoning] : 0;
+	const inputRoom = contextWindow - PHASE2_CONTEXT_SAFETY_TOKENS - thinkingReserve - minResponse;
+
+	for (let attempt = 0; attempt < 4; attempt++) {
+		const input = render();
+		const inputTokens = estimateTextTokensHeuristic(input);
+		if (inputTokens <= inputRoom) {
+			const room = contextWindow - PHASE2_CONTEXT_SAFETY_TOKENS - thinkingReserve - inputTokens;
+			return { input, maxTokens: Math.min(responseCeiling, room) };
+		}
+		if (inputRoom <= 0 || rawTokens + rolloutTokens === 0) break;
+		const scale = (inputRoom / inputTokens) * 0.9;
+		rawTokens = Math.floor(rawTokens * scale);
+		rolloutTokens = Math.floor(rolloutTokens * scale);
+	}
+	throw new Error(`phase2 input does not fit the model context window (${contextWindow} tokens)`);
 }
 
 function computeModelTokenBudget(model: Model, config: MemoryRuntimeConfig): number {

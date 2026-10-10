@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
+import { canonicalEnvKey, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 
 /**
  * Windows psmux detection and tmux-binary resolution.
@@ -305,17 +306,40 @@ export interface ResolvedTmuxBinary {
 	viaExplicitOverride: boolean;
 }
 
+const GJC_TMUX_COMMAND_ENV = "GJC_TMUX_COMMAND";
+/** Captured when this module loads, before a later `chdir` or dotenv delete. */
+const startupTmuxCommandSnapshot = projectEnvSnapshot();
+
 /**
- * Resolve the tmux command GJC should invoke. Honors the existing
- * GJC_TMUX_COMMAND override; on Windows when no
- * override is set, psmux (installed as psmux, pmux, or tmux) is picked
+ * Operator override only. Bun has already copied the project dotenv into the
+ * environment, so a value that matches `projectEnvSnapshot` — a static hit or
+ * a dynamic declaration — must not select the binary. An operator value the
+ * project does not declare is kept.
+ */
+function trustedTmuxCommand(env: NodeJS.ProcessEnv): string | undefined {
+	const raw = env[GJC_TMUX_COMMAND_ENV];
+	if (!raw) return undefined;
+	const snapshot = startupTmuxCommandSnapshot;
+	const key = canonicalEnvKey(GJC_TMUX_COMMAND_ENV);
+	const declared = snapshot.values[key];
+	const trimmed = raw.trim();
+	if (declared !== undefined && (snapshot.dynamic.has(key) || declared === raw || declared === trimmed)) {
+		return undefined;
+	}
+	return trimmed.length > 0 ? trimmed : undefined;
+}
+
+/**
+ * Resolve the tmux command GJC should invoke. Honors an operator
+ * GJC_TMUX_COMMAND override; a project dotenv value is ignored. On Windows
+ * when no override is set, psmux (installed as psmux, pmux, or tmux) is picked
  * automatically so the default gjc --tmux flow lands on a real multiplexer.
  */
 export function resolveGjcTmuxBinary(options: ResolveGjcTmuxBinaryOptions = {}): ResolvedTmuxBinary {
 	const env = options.env ?? process.env;
 	const platform = options.platform ?? process.platform;
 	const runner = options.runner ?? readSpawnRunner();
-	const explicit = env.GJC_TMUX_COMMAND?.trim();
+	const explicit = trustedTmuxCommand(env);
 	if (explicit) {
 		const isPsmux =
 			platform === "win32"

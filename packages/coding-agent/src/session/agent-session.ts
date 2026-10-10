@@ -215,12 +215,12 @@ import {
 	type AsyncJob,
 	type AsyncJobDeliveryState,
 	AsyncJobManager,
-	asyncJobEndpointId as deriveAsyncJobEndpointId,
 	type FoldReason,
 	type JobFoldEvent,
 	type OwnerSubagentShutdownLease,
 	type SubagentLifecycle,
 } from "../async";
+import { asyncJobEndpointId as deriveAsyncJobEndpointId } from "../async/endpoint-id";
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
 import type { CasReceipt } from "../config/atomic-yaml-patch";
@@ -238,11 +238,8 @@ import {
 } from "../config/model-profile-contract";
 import {
 	commitDurableModelProfileOwnership,
-	type DurableModelProfileOwnership,
 	InvalidModelProfileOwnershipError,
 	ModelProfileOwnershipConflictError,
-	type ModelProfileOwnershipMarker,
-	modelProfileOwnershipMarkersEqual,
 	readDurableModelProfileOwnership,
 } from "../config/model-profile-ownership";
 import { resolveProfileBindings } from "../config/model-profiles";
@@ -21001,7 +20998,28 @@ export class AgentSession {
 		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
 		const errorIsFromBeforeCompaction =
 			compactionEntry !== null && assistantMessage.timestamp < new Date(compactionEntry.timestamp).getTime();
+		// A successful empty stop with nonzero usage is not overflow evidence by usage
+		// alone. Zero-usage empty stops stay on the legacy proxy-overflow path, and typed
+		// overflow classification is preserved; only the empty-stop heuristic is disabled.
+		const hasOverflowEvidenceBeyondEmptyStopHeuristic =
+			assistantMessage.stopReason === "stop" &&
+			assistantMessage.content.length === 0 &&
+			classifyContextOverflow(
+				{ ...assistantMessage, content: [{ type: "text", text: "" }] },
+				assistantMessage.transportFailure,
+				contextWindow,
+			);
+		const emptyStopPromptTokens =
+			assistantMessage.usage.input + assistantMessage.usage.cacheRead + assistantMessage.usage.cacheWrite;
+		const successfulEmptyStop =
+			assistantMessage.stopReason === "stop" &&
+			assistantMessage.content.length === 0 &&
+			(emptyStopPromptTokens + assistantMessage.usage.output > 0 ||
+				assistantMessage.usage.totalTokens > 0) &&
+			emptyStopPromptTokens <= contextWindow &&
+			!hasOverflowEvidenceBeyondEmptyStopHeuristic;
 		if (
+			!successfulEmptyStop &&
 			sameModel &&
 			!errorIsFromBeforeCompaction &&
 			classifyContextOverflow(assistantMessage, assistantMessage.transportFailure, contextWindow)
@@ -23695,6 +23713,7 @@ export class AgentSession {
 
 	#managedFallbackPromptOptions(): {
 		fallbackManaged?: boolean;
+		contextOverflowManaged?: boolean;
 		nextFallbackAttempt?: (model: Model) => FallbackAttemptToken;
 		onManagedAttemptAccepted?: () => void;
 		onManagedAttemptOutcome?: (
@@ -23702,9 +23721,10 @@ export class AgentSession {
 		) => ManagedAttemptDecision | Promise<ManagedAttemptDecision>;
 	} {
 		const controller = this.#defaultFallbackChain();
-		if (controller.chain.entries.length < 2) return {};
+		if (controller.chain.entries.length < 2) return { contextOverflowManaged: true };
 		return {
 			fallbackManaged: true,
+			contextOverflowManaged: true,
 			nextFallbackAttempt: model => {
 				controller.onAttemptStarted();
 				this.#managedFallbackProviderAttemptCount++;

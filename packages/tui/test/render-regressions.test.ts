@@ -3188,7 +3188,7 @@ describe("TUI terminal-state regressions", () => {
 				await settle(term);
 				term.clearWriteLog();
 
-				tui.stop();
+				tui.suspend();
 				term.clearWriteLog();
 				tui.start();
 				await settle(term);
@@ -3212,7 +3212,7 @@ describe("TUI terminal-state regressions", () => {
 				tui.start();
 				await settle(term);
 
-				tui.stop();
+				tui.suspend();
 				component.setLines([...initialRows, ...stoppedRows]);
 				term.clearWriteLog();
 				tui.start();
@@ -3249,7 +3249,7 @@ describe("TUI terminal-state regressions", () => {
 				tui.start();
 				await settle(backingTerminal);
 
-				tui.stop();
+				tui.suspend();
 				component.setLines([...initialRows, ...stoppedRows]);
 				tui.start();
 				// start() has completed its synchronous terminal setup. Let the suffix
