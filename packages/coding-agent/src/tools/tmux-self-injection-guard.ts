@@ -473,26 +473,26 @@ function isCommandLookup(tokens: Token[], targetIndex: number): boolean {
 		}
 
 		// If we found the lookup flag, check if the target is the next non-option word
-		// within the same command (not after a separator)
+		// within the same command (not after a command boundary)
 		if (lookupFlagIdx >= 0) {
-			// Check if there's a separator between the lookup flag and the target
-			let hasSeparatorInBetween = false;
+			// Check if there's a command boundary (commandStart token) between the lookup flag and target
+			let hasCommandBoundary = false;
 			for (let sep = lookupFlagIdx + 1; sep < targetIndex; sep++) {
-				if (tokens[sep].commandStart && isSeparator(tokens[sep].text)) {
-					hasSeparatorInBetween = true;
+				if (tokens[sep].commandStart) {
+					hasCommandBoundary = true;
 					break;
 				}
 			}
-			if (hasSeparatorInBetween) {
-				// Target is after a separator, so it's not part of the lookup
+			if (hasCommandBoundary) {
+				// Target is after a command boundary, so it's not part of the lookup
 				continue;
 			}
 
 			// Find the wrapped command (first non-option, non-assignment after the lookup flag)
 			for (let i = lookupFlagIdx + 1; i < tokens.length; i++) {
 				const word = tokens[i].text;
-				// Stop at any separator
-				if (isSeparator(word)) {
+				// Stop at any command boundary (except the target itself)
+				if (tokens[i].commandStart && i !== targetIndex && i > lookupFlagIdx + 1) {
 					break;
 				}
 				// Skip options and assignments
