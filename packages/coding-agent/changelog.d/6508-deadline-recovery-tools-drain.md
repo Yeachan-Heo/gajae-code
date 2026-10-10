@@ -1,0 +1,3 @@
+### Fixes
+
+- **SDK deadline recovery now immediately retries when pending tools drain (#6508)**. The deadline recovery loop was using a 1-second retry timer that could miss the exact moment when tools drained to zero pending. In CI environments with scheduler variation, the recovery loop could timeout waiting for the timer to fire even though tools had already drained. The fix adds immediate retry (0ms delay) when tools transition from pending to settled, ensuring the deadline recovery publishes the terminal result without waiting for the scheduled retry timer. Regression test in `session-runtime.test.ts` validates that deadline recovery completes even with pending tools that drain before timeout.

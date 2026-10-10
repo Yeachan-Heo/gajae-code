@@ -670,11 +670,20 @@ export interface ReconciliationStore {
 	delete(): Promise<void>;
 }
 
+export interface ReconciliationStoreInstrumentationEvent {
+	at: number;
+	phase: "enqueued" | "started" | "completed" | "failed";
+	operation?: string;
+	substep?: string;
+	error?: string;
+}
+
 export function createReconciliationStore(options: {
 	sessionFile: string | null | undefined;
 	sessionId: string;
 	fs?: ReconciliationStoreFs;
 	now?: () => number;
+	onInstrumentationForTests?: (event: ReconciliationStoreInstrumentationEvent) => void;
 }): ReconciliationStore {
 	const fileFs = options.fs ?? nodeFs;
 	const now = options.now ?? Date.now;
@@ -701,20 +710,56 @@ export function createReconciliationStore(options: {
 		const directory = path.dirname(filePath);
 		let temporary: string | undefined;
 		try {
+			try {
+				options.onInstrumentationForTests?.({ at: Date.now(), phase: "started", substep: "mkdir" });
+			} catch {}
 			await fileFs.mkdir(directory, { recursive: true, mode: 0o700 });
+			try {
+				options.onInstrumentationForTests?.({ at: Date.now(), phase: "completed", substep: "mkdir" });
+			} catch {}
 			temporary = `${filePath}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
+			try {
+				options.onInstrumentationForTests?.({ at: Date.now(), phase: "started", substep: "writeFile" });
+			} catch {}
 			await fileFs.writeFile(temporary, `${JSON.stringify(document)}\n`, { mode: 0o600 });
 			try {
+				options.onInstrumentationForTests?.({ at: Date.now(), phase: "completed", substep: "writeFile" });
+			} catch {}
+			try {
+				try {
+					options.onInstrumentationForTests?.({ at: Date.now(), phase: "started", substep: "open" });
+				} catch {}
 				const handle = await fileFs.open(temporary, "r+");
 				try {
+					options.onInstrumentationForTests?.({ at: Date.now(), phase: "completed", substep: "open" });
+				} catch {}
+				try {
+					try {
+						options.onInstrumentationForTests?.({ at: Date.now(), phase: "started", substep: "sync" });
+					} catch {}
 					await handle.sync();
+					try {
+						options.onInstrumentationForTests?.({ at: Date.now(), phase: "completed", substep: "sync" });
+					} catch {}
 				} finally {
+					try {
+						options.onInstrumentationForTests?.({ at: Date.now(), phase: "started", substep: "close" });
+					} catch {}
 					await handle.close();
+					try {
+						options.onInstrumentationForTests?.({ at: Date.now(), phase: "completed", substep: "close" });
+					} catch {}
 				}
 			} catch {
 				// fsync optional on some fs seams
 			}
+			try {
+				options.onInstrumentationForTests?.({ at: Date.now(), phase: "started", substep: "rename" });
+			} catch {}
 			await fileFs.rename(temporary, filePath);
+			try {
+				options.onInstrumentationForTests?.({ at: Date.now(), phase: "completed", substep: "rename" });
+			} catch {}
 		} catch (error) {
 			// Every persistence-path failure (mkdir included) is evidence a drained
 			// window must surface, never silently treat as quiescent (#4743).
@@ -723,6 +768,9 @@ export function createReconciliationStore(options: {
 				code: "reconciliation_persist_failed",
 			});
 			unreportedPersistFailures.push(coded);
+			try {
+				options.onInstrumentationForTests?.({ at: Date.now(), phase: "failed", error: coded.message });
+			} catch {}
 			throw coded;
 		}
 	};
@@ -796,6 +844,12 @@ export function createReconciliationStore(options: {
 		mutator: (records: DurableReconciliationRecord[]) => DurableReconciliationRecord[],
 	): Promise<void> => {
 		const run = async () => {
+			try {
+				options.onInstrumentationForTests?.({ at: Date.now(), phase: "enqueued", operation: "transact" });
+			} catch {}
+			try {
+				options.onInstrumentationForTests?.({ at: Date.now(), phase: "started", operation: "transact" });
+			} catch {}
 			const next = mutator(memory.map(r => ({ ...r })));
 			await writeAtomic({
 				version: RECONCILIATION_STORE_VERSION,
@@ -805,19 +859,49 @@ export function createReconciliationStore(options: {
 				...(terminalKeyMemory.length > 0 ? { evictedTerminalKeys: terminalKeyMemory } : {}),
 			});
 			memory = next;
+			try {
+				options.onInstrumentationForTests?.({ at: Date.now(), phase: "completed", operation: "transact" });
+			} catch {}
 		};
 		const pending = chain.then(run, run);
-		chain = pending.then(
+		const settled = pending.then(
 			() => undefined,
 			() => undefined,
 		);
-		await pending;
+		chain = settled;
+		try {
+			await pending;
+		} catch (error) {
+			try {
+				options.onInstrumentationForTests?.({
+					at: Date.now(),
+					phase: "failed",
+					operation: "transact",
+					error: error instanceof Error ? error.message : String(error),
+				});
+			} catch {}
+			throw error;
+		}
 	};
 
 	const transactTerminalScopes = async (
 		mutator: (scopes: DurableTerminalScopeRecord[]) => DurableTerminalScopeRecord[],
 	): Promise<void> => {
 		const run = async () => {
+			try {
+				options.onInstrumentationForTests?.({
+					at: Date.now(),
+					phase: "enqueued",
+					operation: "transactTerminalScopes",
+				});
+			} catch {}
+			try {
+				options.onInstrumentationForTests?.({
+					at: Date.now(),
+					phase: "started",
+					operation: "transactTerminalScopes",
+				});
+			} catch {}
 			const next = mutator(terminalMemory.map(s => ({ ...s })));
 			await writeAtomic({
 				version: RECONCILIATION_STORE_VERSION,
@@ -827,13 +911,33 @@ export function createReconciliationStore(options: {
 				...(terminalKeyMemory.length > 0 ? { evictedTerminalKeys: terminalKeyMemory } : {}),
 			});
 			terminalMemory = next;
+			try {
+				options.onInstrumentationForTests?.({
+					at: Date.now(),
+					phase: "completed",
+					operation: "transactTerminalScopes",
+				});
+			} catch {}
 		};
 		const pending = chain.then(run, run);
-		chain = pending.then(
+		const settled = pending.then(
 			() => undefined,
 			() => undefined,
 		);
-		await pending;
+		chain = settled;
+		try {
+			await pending;
+		} catch (error) {
+			try {
+				options.onInstrumentationForTests?.({
+					at: Date.now(),
+					phase: "failed",
+					operation: "transactTerminalScopes",
+					error: error instanceof Error ? error.message : String(error),
+				});
+			} catch {}
+			throw error;
+		}
 	};
 
 	const transactTerminalState = async (
@@ -843,6 +947,20 @@ export function createReconciliationStore(options: {
 		},
 	): Promise<void> => {
 		const run = async () => {
+			try {
+				options.onInstrumentationForTests?.({
+					at: Date.now(),
+					phase: "enqueued",
+					operation: "transactTerminalState",
+				});
+			} catch {}
+			try {
+				options.onInstrumentationForTests?.({
+					at: Date.now(),
+					phase: "started",
+					operation: "transactTerminalState",
+				});
+			} catch {}
 			const next = mutator({
 				scopes: terminalMemory.map(s => ({ ...s })),
 				keys: terminalKeyMemory.map(k => ({ ...k })),
@@ -856,19 +974,53 @@ export function createReconciliationStore(options: {
 			});
 			terminalMemory = next.scopes;
 			terminalKeyMemory = next.keys;
+			try {
+				options.onInstrumentationForTests?.({
+					at: Date.now(),
+					phase: "completed",
+					operation: "transactTerminalState",
+				});
+			} catch {}
 		};
 		const pending = chain.then(run, run);
-		chain = pending.then(
+		const settled = pending.then(
 			() => undefined,
 			() => undefined,
 		);
-		await pending;
+		chain = settled;
+		try {
+			await pending;
+		} catch (error) {
+			try {
+				options.onInstrumentationForTests?.({
+					at: Date.now(),
+					phase: "failed",
+					operation: "transactTerminalState",
+					error: error instanceof Error ? error.message : String(error),
+				});
+			} catch {}
+			throw error;
+		}
 	};
 
 	const transactTerminalKeys = async (
 		mutator: (keys: EvictedTerminalKeyEntry[]) => EvictedTerminalKeyEntry[],
 	): Promise<void> => {
 		const run = async () => {
+			try {
+				options.onInstrumentationForTests?.({
+					at: Date.now(),
+					phase: "enqueued",
+					operation: "transactTerminalKeys",
+				});
+			} catch {}
+			try {
+				options.onInstrumentationForTests?.({
+					at: Date.now(),
+					phase: "started",
+					operation: "transactTerminalKeys",
+				});
+			} catch {}
 			const next = mutator(terminalKeyMemory.map(k => ({ ...k })));
 			await writeAtomic({
 				version: RECONCILIATION_STORE_VERSION,
@@ -878,13 +1030,33 @@ export function createReconciliationStore(options: {
 				...(next.length > 0 ? { evictedTerminalKeys: next } : {}),
 			});
 			terminalKeyMemory = next;
+			try {
+				options.onInstrumentationForTests?.({
+					at: Date.now(),
+					phase: "completed",
+					operation: "transactTerminalKeys",
+				});
+			} catch {}
 		};
 		const pending = chain.then(run, run);
-		chain = pending.then(
+		const settled = pending.then(
 			() => undefined,
 			() => undefined,
 		);
-		await pending;
+		chain = settled;
+		try {
+			await pending;
+		} catch (error) {
+			try {
+				options.onInstrumentationForTests?.({
+					at: Date.now(),
+					phase: "failed",
+					operation: "transactTerminalKeys",
+					error: error instanceof Error ? error.message : String(error),
+				});
+			} catch {}
+			throw error;
+		}
 	};
 
 	const deleteStore = async (): Promise<void> => {

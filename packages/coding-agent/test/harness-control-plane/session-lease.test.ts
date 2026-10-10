@@ -39,26 +39,25 @@ describe("SessionLease", () => {
 		});
 	});
 
-	it("heals an aged scrubbed removal transition instead of wedging the lease lock", async () => {
+	it("heals a scrubbed dead-owner removal transition through the lease lock", async () => {
 		const filePath = sessionPaths(root, SID).lease;
 		const orphanPath = `${filePath}.lock.removing`;
+		const infoPath = path.join(orphanPath, "info");
 		await mkdir(orphanPath, { recursive: true });
-		await writeFile(path.join(orphanPath, "info"), "", "utf8");
-		await writeFile(filePath, JSON.stringify({ ownerId: "owner-a" }), "utf8");
-		const old = new Date(Date.now() - 120_000);
-		await utimes(path.join(orphanPath, "info"), old, old);
-		// A scrubbed transition retains the remover's sibling record. Age and
-		// zero-byte info alone cannot prove an ownerless generation abandoned.
-		const orphan = await stat(orphanPath, { bigint: true });
+		await writeFile(infoPath, "", "utf8");
+		const transition = await stat(orphanPath, { bigint: true });
+		// The remover record is kept beside the scrubbed tree so recovery can prove
+		// this exact generation is dead without treating an ownerless empty info as proof.
 		await writeFile(
 			`${orphanPath}.owner`,
 			JSON.stringify({
-				owner: { pid: 2_147_483_647, timestamp: old.getTime(), owner_token: "dead-remover" },
-				rootDev: orphan.dev.toString(),
-				rootIno: orphan.ino.toString(),
+				owner: { pid: 2_147_483_647, timestamp: Date.now(), owner_token: "dead-remover" },
+				rootDev: transition.dev.toString(),
+				rootIno: transition.ino.toString(),
 			}),
 			"utf8",
 		);
+		await writeFile(filePath, JSON.stringify({ ownerId: "owner-a" }), "utf8");
 
 		await releaseLease(root, SID, "owner-a");
 
@@ -82,20 +81,40 @@ describe("SessionLease", () => {
 		).toBe(false);
 	});
 
+	it("does not release through a scrubbed transition with a live remover", async () => {
+		const filePath = sessionPaths(root, SID).lease;
+		const orphanPath = `${filePath}.lock.removing`;
+		const infoPath = path.join(orphanPath, "info");
+		const leaseBytes = JSON.stringify({ ownerId: "owner-a" });
+		await mkdir(orphanPath, { recursive: true });
+		await writeFile(infoPath, "", "utf8");
+		const transition = await stat(orphanPath, { bigint: true });
+		const ownerRecord = JSON.stringify({
+			owner: { pid: process.pid, timestamp: Date.now(), owner_token: "live-remover" },
+			rootDev: transition.dev.toString(),
+			rootIno: transition.ino.toString(),
+		});
+		await writeFile(`${orphanPath}.owner`, ownerRecord, "utf8");
+		await writeFile(filePath, leaseBytes, "utf8");
+
+		await expect(releaseLease(root, SID, "owner-a")).rejects.toMatchObject({ code: "lease_lock_timeout" });
+		expect(await readFile(filePath, "utf8")).toBe(leaseBytes);
+		expect(await readFile(infoPath, "utf8")).toBe("");
+		expect(await readFile(`${orphanPath}.owner`, "utf8")).toBe(ownerRecord);
+	});
+
 	it("preserves a refused orphan transition diagnostic instead of mapping it to lease timeout", async () => {
 		const filePath = sessionPaths(root, SID).lease;
 		const orphanPath = `${filePath}.lock.removing`;
 		const infoPath = path.join(orphanPath, "info");
 		await mkdir(orphanPath, { recursive: true });
 		await writeFile(infoPath, "", "utf8");
-		// An unscrubbed payload keeps the transition outside the proven native
-		// scrub residue, so acquisition must refuse adoption and keep the typed
-		// diagnostic instead of folding it into a retryable lease timeout.
-		await writeFile(path.join(orphanPath, "unretired-payload"), "not scrubbed", "utf8");
+		// A zero-byte info file has no parsed owner identity. Age alone cannot
+		// prove that this ownerless transition was scrubbed, so it must remain
+		// fail-closed and retain the typed diagnostic.
 		await writeFile(filePath, JSON.stringify({ ownerId: "owner-a" }), "utf8");
 		const old = new Date(Date.now() - 120_000);
 		await utimes(infoPath, old, old);
-		await utimes(path.join(orphanPath, "unretired-payload"), old, old);
 
 		const failure = await releaseLease(root, SID, "owner-a").catch(error => error);
 		if (!(failure instanceof FileLockAcquireError)) throw new Error("Expected an orphan transition lock failure");

@@ -74,7 +74,7 @@ function makeToolSession(options: {
 	getSessionFile?: () => string | null;
 	getSessionId?: () => string | null;
 	settings?: Settings;
-	registerSessionCleanup?: (cleanup: () => Promise<void> | void) => (() => void) | void;
+	registerSessionCleanup?: (cleanup: () => Promise<void> | void) => (() => void) | undefined;
 	assertEvalExecutionAllowed?: () => void;
 	trackEvalExecution?: ToolSession["trackEvalExecution"];
 }): ToolSession {
@@ -107,7 +107,7 @@ async function loadPythonTool(options: {
 	getSessionFile?: () => string | null;
 	getSessionId?: () => string | null;
 	settings?: Settings;
-	registerSessionCleanup?: (cleanup: () => Promise<void> | void) => (() => void) | void;
+	registerSessionCleanup?: (cleanup: () => Promise<void> | void) => (() => void) | undefined;
 	assertEvalExecutionAllowed?: () => void;
 	trackEvalExecution?: ToolSession["trackEvalExecution"];
 }): Promise<AgentTool> {

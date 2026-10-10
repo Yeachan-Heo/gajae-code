@@ -107,6 +107,7 @@ export class PromptDeadlineManager {
 	readonly #deadlineDeferredTerminalTransitions = new Set<string>();
 	readonly #deadlineTerminalizationConfirmed = new Set<string>();
 	readonly #terminalPublicationPending = new Map<string, SdkPromptTerminalOutcome>();
+	readonly #toolsStillPendingOnLastCheck = new Set<string>();
 	readonly #deadlineStartCleanup = new Map<string, () => void>();
 	readonly #pendingTerminalFailureReasons = new Map<
 		string,
@@ -578,11 +579,30 @@ export class PromptDeadlineManager {
 		this.clear(correlation);
 	}
 
-	#scheduleTerminalPublicationRetry(key: string): void {
+	#scheduleTerminalPublicationRetry(key: string, delayMs?: number): void {
 		this.#clearTimer(key);
-		const timer = setTimeout(() => void this.#onDeadline(key), UNCERTAINTY_RETRY_DELAY_MS);
+		// Use immediate retry (0ms) if tools were pending on last check;
+		// otherwise use normal retry delay. This allows quick detection when tools drain.
+		const effectiveDelayMs =
+			delayMs ?? (this.#toolsStillPendingOnLastCheck.has(key) ? 0 : UNCERTAINTY_RETRY_DELAY_MS);
+		const timer = setTimeout(() => void this.#onDeadline(key), effectiveDelayMs);
 		(timer as unknown as { unref?: () => void }).unref?.();
 		this.#timers.set(key, timer);
+	}
+
+	/** Notify about termination check results to adjust retry strategy. */
+	notifyTerminationResult(
+		correlation: InvocationCorrelation,
+		_result: PromptDeadlineTerminalization,
+		reason: string,
+	): void {
+		const key = leaseKey(correlation);
+		if (reason.includes("tools-still-pending")) {
+			this.#toolsStillPendingOnLastCheck.add(key);
+		} else {
+			// Tools have settled or are no longer relevant
+			this.#toolsStillPendingOnLastCheck.delete(key);
+		}
 	}
 
 	#retry(key: string): void {
@@ -817,6 +837,7 @@ export class PromptDeadlineManager {
 		this.#terminalPublicationPending.delete(key);
 		this.#pendingTerminalFailureReasons.delete(key);
 		this.#pendingTerminalEvidence.delete(key);
+		this.#toolsStillPendingOnLastCheck.delete(key);
 	}
 
 	clearAll(): void {
@@ -839,6 +860,7 @@ export class PromptDeadlineManager {
 		this.#terminalPublicationPending.clear();
 		this.#pendingTerminalFailureReasons.clear();
 		this.#pendingTerminalEvidence.clear();
+		this.#toolsStillPendingOnLastCheck.clear();
 	}
 
 	/** For tests: current deadline or undefined if no lease. */

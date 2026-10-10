@@ -1108,9 +1108,10 @@ describe("AgentSession message pipeline", () => {
 		});
 		try {
 			await sdkIntegrationStarted.promise;
-			await Bun.sleep(0);
-			expect(events.filter(event => event.type === "agent_end")).toHaveLength(2);
+			// turn_end may start worker reconciliation before the terminal event is
+			// published, so worker-start is not a barrier for agent_end delivery.
 			await secondAgentEnd.promise;
+			expect(events.filter(event => event.type === "agent_end")).toHaveLength(2);
 		} finally {
 			unsubscribe();
 		}
