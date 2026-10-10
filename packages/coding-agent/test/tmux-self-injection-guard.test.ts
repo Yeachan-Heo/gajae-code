@@ -462,4 +462,78 @@ describe("tmux self-injection guard", () => {
 			});
 		});
 	});
+
+	// Regression tests for shell payload selection with long options (issue #6564-7)
+	describe("regression: shell payload selection with long bash options (issue #6564-7)", () => {
+		it("should find injection with bash --rcfile option before -c", async () => {
+			// Issue: bash --rcfile /dev/null -c 'tmux send-keys -t %47 x'
+			// The old code treated /dev/null as the payload instead of the quoted string after -c
+			await expect(
+				checkTmuxSelfInjection("bash --rcfile /dev/null -c 'tmux send-keys -t %47 x'", options),
+			).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should find injection with bash --init-file option before -c", async () => {
+			// Similar to --rcfile
+			await expect(
+				checkTmuxSelfInjection("bash --init-file /tmp/bashrc -c 'tmux send-keys -t %47 x'", options),
+			).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should find injection with bash --norc option before -c", async () => {
+			// Issue: bash --norc -c 'tmux send-keys -t %47 x' should find the injection
+			// The old code may have had issues with long flag-only options
+			await expect(
+				checkTmuxSelfInjection("bash --norc -c 'tmux send-keys -t %47 x'", options),
+			).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should find injection with bash --noprofile option before -c", async () => {
+			// Similar to --norc
+			await expect(
+				checkTmuxSelfInjection("bash --noprofile -c 'tmux send-keys -t %47 x'", options),
+			).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should not mistake unquoted command string for option", async () => {
+			// Issue: bash -c '-x || tmux send-keys -t %47 x'
+			// The command string starts with -, so it looks like an option
+			// But since it's unquoted, it shouldn't be accepted as a payload anyway
+			await expect(
+				checkTmuxSelfInjection("bash -c '-x || tmux send-keys -t %47 x'", options),
+			).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should find injection in script file with long option", async () => {
+			// Issue: bash --norc 'script.sh' should not treat script.sh as a payload
+			const scriptPath = "/tmp/gjc-6564-7-injection.sh";
+			await Bun.write(scriptPath, "tmux send-keys -t %47 x\n");
+			try {
+				await expect(checkTmuxSelfInjection(`bash --norc ${scriptPath}`, options)).resolves.toMatchObject({
+					block: true,
+				});
+			} finally {
+				await Bun.file(scriptPath).delete();
+			}
+		});
+
+		it("should handle long option with equals syntax", async () => {
+			// bash --rcfile=/dev/null -c 'tmux send-keys -t %47 x'
+			await expect(
+				checkTmuxSelfInjection("bash --rcfile=/dev/null -c 'tmux send-keys -t %47 x'", options),
+			).resolves.toMatchObject({
+				block: true,
+			});
+		});
+	});
 });

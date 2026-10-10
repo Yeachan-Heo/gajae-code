@@ -25,6 +25,12 @@ interface WrapperSpec {
 	hasPositionalArg?: boolean;
 }
 
+// Long options for bash/sh that take arguments (e.g., --rcfile FILE, --init-file FILE)
+const SHELL_LONG_OPTIONS_WITH_ARG = new Set([
+	"--rcfile", // bash --rcfile FILE
+	"--init-file", // bash --init-file FILE (same as --rcfile)
+]);
+
 // Options that take arguments for long-option forms (e.g., env --unset=VAR, xargs --file=FILE)
 const LONG_OPTIONS_WITH_ARG = new Set([
 	"--unset", // env --unset VAR (takes variable name)
@@ -370,6 +376,8 @@ function collectShellPayloads(tokens: Token[]): string[] {
 		// - bash -c -e 'payload' (separate options)
 		// - bash -O extglob -c 'payload' (shopt with operand)
 		// - bash -o pipefail -c 'payload' (shopt with operand)
+		// - bash --rcfile FILE -c 'payload' (long option with argument)
+		// - bash --norc -c 'payload' (long option without argument)
 		// POSIX shells stop option parsing at the first non-option argument,
 		// so after we see a non-option word (script name), any flags are arguments to that script.
 
@@ -390,6 +398,22 @@ function collectShellPayloads(tokens: Token[]): string[] {
 				break; // Stop scanning for -c after the first operand
 			}
 
+			// Check if this is a long option
+			if (word.startsWith("--")) {
+				// Handle long options with = (e.g., --rcfile=FILE)
+				if (word.includes("=")) {
+					skipNextArg = false;
+					continue;
+				}
+				// Handle long options that take an argument
+				if (SHELL_LONG_OPTIONS_WITH_ARG.has(word)) {
+					skipNextArg = true;
+					continue;
+				}
+				// All other long options are flag-only (e.g., --norc, --noprofile)
+				continue;
+			}
+
 			// Check if this option takes an argument (e.g., -O, -o for bash)
 			if (optionsWithArg.has(word)) {
 				skipNextArg = true;
@@ -405,36 +429,21 @@ function collectShellPayloads(tokens: Token[]): string[] {
 			// Check for -c option (standalone or bundled like -ce, -ec, etc.)
 			if (word === "-c" || (word.startsWith("-") && word.includes("c"))) {
 				// Found a -c option (or an option containing c)
-				// The payload is the next non-option word
+				// Look for the quoted payload following -c and any bundled options
 				for (
 					let payloadCursor = cursor + 1;
 					payloadCursor < tokens.length && !tokens[payloadCursor].commandStart;
 					payloadCursor++
 				) {
-					const payloadWord = tokens[payloadCursor].text;
-
-					// Skip over any other options or their arguments
-					if (payloadWord.startsWith("-")) {
-						// Check if this option takes an argument
-						if (optionsWithArg.has(payloadWord)) {
-							payloadCursor++; // Skip the argument
-						}
-						// Handle options with bundled operands (e.g., -Oextglob)
-						if (
-							(payloadWord.startsWith("-O") && payloadWord.length > 2) ||
-							(payloadWord.startsWith("-o") && payloadWord.length > 2)
-						) {
-							// The operand is bundled with the option, no need to skip
-						}
-						continue;
+					const candidate = tokens[payloadCursor];
+					// Skip any non-quoted tokens (they might be bundled options like -e in -ce)
+					if (candidate.quoted) {
+						// Found the quoted payload
+						payloads.push(candidate.text);
+						break;
 					}
-
-					// Found the first non-option word; this should be the payload
-					if (tokens[payloadCursor].quoted) {
-						payloads.push(payloadWord);
-					}
-					break; // Only take the first payload for this -c
 				}
+				break; // -c stops option parsing
 			}
 		}
 	}
@@ -443,6 +452,8 @@ function collectShellPayloads(tokens: Token[]): string[] {
 
 function collectShellScripts(tokens: Token[], cwd: string): string[] {
 	const scripts: string[] = [];
+	const optionsWithArg = new Set(["-O", "-o"]); // bash -O extglob, bash -o pipefail, etc.
+
 	for (let index = 0; index < tokens.length; index++) {
 		const token = tokens[index];
 		if (token.commandStart && (token.text.startsWith("./") || token.text.startsWith("/"))) {
@@ -467,10 +478,57 @@ function collectShellScripts(tokens: Token[], cwd: string): string[] {
 		}
 
 		if (!SHELL_RUNNERS.has(tokens[shellIndex].text)) continue;
+
+		// Skip past all options (short, long, and their arguments) to find the script argument
+		let skipNextArg = false;
 		for (let cursor = shellIndex + 1; cursor < tokens.length && !tokens[cursor].commandStart; cursor++) {
 			const argument = tokens[cursor].text;
+
+			// If the previous option takes an argument, skip this word
+			if (skipNextArg) {
+				skipNextArg = false;
+				continue;
+			}
+
+			// If we encounter -c, stop looking (script mode is not used)
 			if (argument === "-c") break;
-			if (argument.startsWith("-")) continue;
+
+			// Skip options and their arguments
+			if (argument.startsWith("-")) {
+				// Check if this is a long option
+				if (argument.startsWith("--")) {
+					// Handle long options with = (e.g., --rcfile=FILE)
+					if (argument.includes("=")) {
+						skipNextArg = false;
+						continue;
+					}
+					// Handle long options that take an argument
+					if (SHELL_LONG_OPTIONS_WITH_ARG.has(argument)) {
+						skipNextArg = true;
+						continue;
+					}
+					// All other long options are flag-only
+					continue;
+				}
+
+				// Check if this short option takes an argument
+				if (optionsWithArg.has(argument)) {
+					skipNextArg = true;
+					continue;
+				}
+
+				// Handle options with bundled operands (e.g., -Oextglob, -opipefail)
+				if (
+					(argument.startsWith("-O") && argument.length > 2) ||
+					(argument.startsWith("-o") && argument.length > 2)
+				) {
+					continue;
+				}
+
+				continue; // Skip all other options
+			}
+
+			// Found the first non-option word; this is the script name
 			scripts.push(path.resolve(cwd, argument));
 			break;
 		}
