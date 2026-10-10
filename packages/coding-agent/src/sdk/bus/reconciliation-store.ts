@@ -843,10 +843,10 @@ export function createReconciliationStore(options: {
 	const transact = async (
 		mutator: (records: DurableReconciliationRecord[]) => DurableReconciliationRecord[],
 	): Promise<void> => {
-		try {
-			options.onInstrumentationForTests?.({ at: Date.now(), phase: "enqueued", operation: "transact" });
-		} catch {}
 		const run = async () => {
+			try {
+				options.onInstrumentationForTests?.({ at: Date.now(), phase: "enqueued", operation: "transact" });
+			} catch {}
 			try {
 				options.onInstrumentationForTests?.({ at: Date.now(), phase: "started", operation: "transact" });
 			} catch {}
@@ -886,14 +886,14 @@ export function createReconciliationStore(options: {
 	const transactTerminalScopes = async (
 		mutator: (scopes: DurableTerminalScopeRecord[]) => DurableTerminalScopeRecord[],
 	): Promise<void> => {
-		try {
-			options.onInstrumentationForTests?.({
-				at: Date.now(),
-				phase: "enqueued",
-				operation: "transactTerminalScopes",
-			});
-		} catch {}
 		const run = async () => {
+			try {
+				options.onInstrumentationForTests?.({
+					at: Date.now(),
+					phase: "enqueued",
+					operation: "transactTerminalScopes",
+				});
+			} catch {}
 			try {
 				options.onInstrumentationForTests?.({
 					at: Date.now(),
@@ -944,10 +944,10 @@ export function createReconciliationStore(options: {
 			keys: EvictedTerminalKeyEntry[];
 		},
 	): Promise<void> => {
-		try {
-			options.onInstrumentationForTests?.({ at: Date.now(), phase: "enqueued", operation: "transactTerminalState" });
-		} catch {}
 		const run = async () => {
+			try {
+				options.onInstrumentationForTests?.({ at: Date.now(), phase: "enqueued", operation: "transactTerminalState" });
+			} catch {}
 			try {
 				options.onInstrumentationForTests?.({
 					at: Date.now(),
@@ -999,10 +999,10 @@ export function createReconciliationStore(options: {
 	const transactTerminalKeys = async (
 		mutator: (keys: EvictedTerminalKeyEntry[]) => EvictedTerminalKeyEntry[],
 	): Promise<void> => {
-		try {
-			options.onInstrumentationForTests?.({ at: Date.now(), phase: "enqueued", operation: "transactTerminalKeys" });
-		} catch {}
 		const run = async () => {
+			try {
+				options.onInstrumentationForTests?.({ at: Date.now(), phase: "enqueued", operation: "transactTerminalKeys" });
+			} catch {}
 			try {
 				options.onInstrumentationForTests?.({
 					at: Date.now(),

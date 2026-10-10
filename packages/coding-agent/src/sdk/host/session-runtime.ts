@@ -1133,12 +1133,12 @@ export function createInvocationReconciliation(
 		};
 	};
 	const persist = async (): Promise<void> => {
-		try {
-			options.onPersistenceInstrumentationForTests?.({ at: Date.now(), phase: "enqueued" });
-		} catch {
-			// A test observer must never participate in durable reconciliation.
-		}
 		const run = async (): Promise<void> => {
+			try {
+				options.onPersistenceInstrumentationForTests?.({ at: Date.now(), phase: "enqueued" });
+			} catch {
+				// A test observer must never participate in durable reconciliation.
+			}
 			try {
 				options.onPersistenceInstrumentationForTests?.({ at: Date.now(), phase: "started" });
 			} catch {
