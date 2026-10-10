@@ -522,7 +522,9 @@ describe("task fork-context provider identity", () => {
 
 	it("registers construction-time ownership under the shared canonical endpoint key", async () => {
 		await withoutLifecycleIdentity(async () => {
-			const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), `pi-task-provider-alias-${Snowflake.next()}-`));
+			const tempDir = await fsPromises.mkdtemp(
+				path.join(os.tmpdir(), `pi-task-provider-alias-${Snowflake.next()}-`),
+			);
 			tempDirs.push(tempDir);
 			const providerSessionId = "aliased-provider-affinity";
 			const { session, authStorage } = await createSession(tempDir, { providerSessionId });
