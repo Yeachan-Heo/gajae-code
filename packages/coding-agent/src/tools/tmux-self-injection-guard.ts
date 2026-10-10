@@ -28,8 +28,29 @@ interface WrapperSpec {
 // Options that take arguments for long-option forms (e.g., env --unset=VAR, xargs --file=FILE)
 const LONG_OPTIONS_WITH_ARG = new Set([
 	"--unset", // env --unset VAR (takes variable name)
-	"--null", // xargs --null (flag-only, no arg needed, but exists)
 ]);
+
+// Per-wrapper long-option specifications
+const WRAPPER_LONG_OPTIONS: Record<string, Record<string, boolean>> = {
+	env: {
+		"--unset": true, // env --unset=VAR or --unset VAR
+		"--split-string": false, // env -S/--split-string (flag-only)
+	},
+	xargs: {
+		"--null": false, // xargs --null (flag-only)
+		"--max-args": true, // xargs --max-args N
+		"--arg-file": true, // xargs --arg-file FILE
+		"--delimiter": true, // xargs --delimiter DELIM
+		"--eof": true, // xargs --eof STRING
+		"--max-procs": true, // xargs --max-procs N
+		"--size": true, // xargs --size BYTES
+		"--replace": false, // xargs --replace (flag-only, same as -I)
+		"--verbose": false, // xargs --verbose (flag-only)
+		"--no-run-if-empty": false, // xargs --no-run-if-empty (flag-only)
+		"--exit": false, // xargs --exit (flag-only)
+		"--null-input": false, // xargs --null-input (flag-only, same as -0)
+	},
+};
 
 const COMMAND_WRAPPERS_WITH_ARGS: Record<string, WrapperSpec> = {
 	env: {
@@ -256,21 +277,43 @@ function tokenize(command: string): Token[] {
 			const nextChar = command[index + 1];
 			if (!nextChar || /\s/.test(nextChar) || isSeparator(nextChar)) {
 				// This option is complete; check if it takes an argument
-				// Flag-only options don't consume the next argument
-				const isFlagOnly = wrapperCommand.spec.flagOnlyOptions?.has(text) ?? false;
-				if (!isFlagOnly && wrapperCommand.spec.optionsWithArg.has(text)) {
-					skipNextArg = true;
-				}
-				// Handle long options with =VALUE (e.g., --unset=VAR)
-				if (isLongOption(text) && text.includes("=")) {
-					// Long option with embedded value doesn't consume next argument
-					skipNextArg = false;
-				}
-				// Handle long options that take an argument separately
-				const baseLongOption = text.split("=")[0];
-				if (isLongOption(baseLongOption) && !isFlagOnly) {
-					if (LONG_OPTIONS_WITH_ARG.has(baseLongOption)) {
-						skipNextArg = !text.includes("="); // Only consume next arg if no =VALUE
+				skipNextArg = false; // Reset default
+
+				// Handle long options (--*)
+				if (isLongOption(text)) {
+					const baseLongOption = text.split("=")[0];
+					const hasEqualValue = text.includes("=");
+
+					// Check wrapper-specific long options
+					const wrapperLongOpts = WRAPPER_LONG_OPTIONS[wrapperCommand.name];
+					if (wrapperLongOpts) {
+						if (baseLongOption in wrapperLongOpts) {
+							const takesArg = wrapperLongOpts[baseLongOption];
+							if (takesArg && !hasEqualValue) {
+								skipNextArg = true; // Takes separate argument
+							}
+						} else if (LONG_OPTIONS_WITH_ARG.has(baseLongOption) && !hasEqualValue) {
+							skipNextArg = true;
+						}
+					}
+				} else {
+					// Handle short options (including bundles like -iu)
+					// Process each character in the bundle
+					for (let i = 1; i < text.length; i++) {
+						const opt = text[i];
+						const shortOpt = "-" + opt;
+
+						// Check if this short option takes an argument
+						const isFlagOnly = wrapperCommand.spec.flagOnlyOptions?.has(shortOpt) ?? false;
+						const takesArg = !isFlagOnly && wrapperCommand.spec.optionsWithArg.has(shortOpt);
+
+						if (takesArg) {
+							// If this is the last character in the bundle, the next arg is its operand
+							if (i === text.length - 1) {
+								skipNextArg = true;
+							}
+							break; // Stop processing further chars after an option with arg
+						}
 					}
 				}
 			}
@@ -405,7 +448,7 @@ function collectShellPayloads(tokens: Token[]): string[] {
 			// Check for -c option (standalone or bundled like -ce, -ec, etc.)
 			if (word === "-c" || (word.startsWith("-") && word.includes("c"))) {
 				// Found a -c option (or an option containing c)
-				// The payload is the next non-option word
+				// The payload is the actual command string executed by bash, which is the next non-option word
 				for (
 					let payloadCursor = cursor + 1;
 					payloadCursor < tokens.length && !tokens[payloadCursor].commandStart;
@@ -413,7 +456,7 @@ function collectShellPayloads(tokens: Token[]): string[] {
 				) {
 					const payloadWord = tokens[payloadCursor].text;
 
-					// Skip over any other options or their arguments
+					// Skip over any remaining shell options or their arguments
 					if (payloadWord.startsWith("-")) {
 						// Check if this option takes an argument
 						if (optionsWithArg.has(payloadWord)) {
@@ -429,15 +472,45 @@ function collectShellPayloads(tokens: Token[]): string[] {
 						continue;
 					}
 
-					// Found the first non-option word; this should be the payload
-					if (tokens[payloadCursor].quoted) {
-						payloads.push(payloadWord);
-					}
+					// Found the first non-option word after -c; this is the actual command string
+					// Add it regardless of quoting, because bash will execute it as the command
+					payloads.push(payloadWord);
 					break; // Only take the first payload for this -c
 				}
 			}
 		}
 	}
+
+	// Handle env -S/--split-string payloads
+	// env -S 'payload' splits the string and executes the result
+	for (let index = 0; index < tokens.length; index++) {
+		const token = tokens[index];
+		if (!token.commandStart || (token.text !== "env" && !token.text.endsWith("/env"))) continue;
+
+		// Look for -S or --split-string option
+		let inEnv = true;
+		for (let cursor = index + 1; cursor < tokens.length && !tokens[cursor].commandStart && inEnv; cursor++) {
+			const arg = tokens[cursor].text;
+
+			// Stop at the first non-option, non-assignment
+			if (!arg.startsWith("-") && !isAssignment(arg)) {
+				inEnv = false;
+				break;
+			}
+
+			// Check for -S or --split-string
+			if (arg === "-S" || arg === "--split-string") {
+				// The next argument is the split-string payload
+				if (cursor + 1 < tokens.length && !tokens[cursor + 1].commandStart) {
+					const payload = tokens[cursor + 1].text;
+					// env -S splits the string into arguments, which become the executed command
+					payloads.push(payload);
+					cursor++; // Skip the payload we just processed
+				}
+			}
+		}
+	}
+
 	return payloads;
 }
 
@@ -511,26 +584,32 @@ function sameSocket(left: string, right: string): boolean {
 
 function assignedTmuxSocket(tokens: Token[], commandIndex: number): string | undefined {
 	// Backtrack from the command position to find any TMUX assignment
-	// Continue through wrapper commands and their arguments (which don't have commandStart)
-	// until we find either a TMUX assignment or hit a non-wrapper command
+	// Only look for assignments that are arguments to wrappers, or at the command start
+	// Stop at the first commandStart token (which marks an invocation boundary from a separator like ;)
+	let firstWrapperIndex = -1;
 	for (let index = commandIndex - 1; index >= 0 && commandIndex - index <= 20; index++) {
 		const token = tokens[index];
 
-		// Check for TMUX assignment first, regardless of commandStart
+		// Check for TMUX assignment
 		const assignment = token.text.match(/^TMUX=([^,\s]+)/);
-		if (assignment) return assignment[1];
-
-		// If this token starts a new command, check if it's a wrapper
-		// Continue traversing through wrappers and assignments
-		if (token.commandStart) {
-			if (isAssignment(token.text)) {
-				// This is an assignment at command start (e.g., TMUX=/tmp/other env ...)
-				// Continue searching in case there are nested assignments
-				continue;
+		if (assignment) {
+			// Only return the assignment if it's within the same invocation
+			// (before any command boundary marked by commandStart)
+			if (firstWrapperIndex === -1 || index > firstWrapperIndex) {
+				return assignment[1];
 			}
+		}
+
+		// Track command boundaries
+		if (token.commandStart) {
 			if (!COMMAND_WRAPPERS.has(token.text) && !COMMAND_WRAPPERS_WITH_ARGS[token.text]) {
-				// Not a wrapper command, stop here
+				// Hit a non-wrapper command start; this marks the boundary of a previous invocation
+				// Stop searching - assignments found here belong to a different command
 				break;
+			}
+			// Track the first wrapper we encounter while backtracking
+			if (firstWrapperIndex === -1) {
+				firstWrapperIndex = index;
 			}
 		}
 	}
